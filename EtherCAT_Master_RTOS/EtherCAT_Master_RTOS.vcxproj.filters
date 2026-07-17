@@ -1,0 +1,147 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="Source Files\EtherCAT_Master">
+      <UniqueIdentifier>{76c4a213-a791-44f3-92c3-43291364de63}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\EtherCAT_Master">
+      <UniqueIdentifier>{fc15e9de-4ddf-4c4a-8f0a-5e0158191c3c}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\Motion">
+      <UniqueIdentifier>{4bdc2cd5-30a2-4d1d-8edf-d0e61141f533}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Motion">
+      <UniqueIdentifier>{db85b3d9-a186-4b6c-bb4e-d5e162c8e880}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\PLC">
+      <UniqueIdentifier>{b84ea99f-db27-4e49-984a-f15eb986353e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\PLC">
+      <UniqueIdentifier>{9a1c25ef-f362-4278-986c-2ca9445d1c84}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\Function">
+      <UniqueIdentifier>{1205fd8d-7c87-4881-af49-151f597b340e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Function">
+      <UniqueIdentifier>{160bee39-2475-43e3-b18e-f78243035e38}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\Parameter">
+      <UniqueIdentifier>{76797fcd-d900-4c59-8819-2feecd465a90}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Parameter">
+      <UniqueIdentifier>{958a8ebc-4ba2-4ddc-b22f-e471a792c45a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\System_Mode">
+      <UniqueIdentifier>{e94491a2-c149-4495-9241-6bdc01bd6d78}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\System_Mode\EXAMPLE_MODE">
+      <UniqueIdentifier>{8fa23115-8847-4f33-b06d-d857d9b2ceab}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\System_Mode\EDM_SINKER_MODE">
+      <UniqueIdentifier>{c3f6c8db-c611-4d20-983e-343904e02f81}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\EtherCAT_Master\EtherCAT_Function">
+      <UniqueIdentifier>{17927f07-0581-4ff1-89ae-6135f0eefdd6}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCAT_Master_RTOSRtTimerThread.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatEni.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCAT_Master_RTOS.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="NicDriver.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore.cpp">
+      <Filter>Source Files\Motion</Filter>
+    </ClCompile>
+    <ClCompile Include="PlcCore.cpp">
+      <Filter>Source Files\PLC</Filter>
+    </ClCompile>
+    <ClCompile Include="ConfigReader.cpp">
+      <Filter>Source Files\Function</Filter>
+    </ClCompile>
+    <ClCompile Include="GlobalConfig.cpp">
+      <Filter>Source Files\Parameter</Filter>
+    </ClCompile>
+    <ClCompile Include="tinyxml2.cpp">
+      <Filter>Source Files\Function</Filter>
+    </ClCompile>
+    <ClCompile Include="System_EXAMPLE_MODE.cpp">
+      <Filter>Source Files\System_Mode\EXAMPLE_MODE</Filter>
+    </ClCompile>
+    <ClCompile Include="System_EDM_SINKER_MODE.cpp">
+      <Filter>Source Files\System_Mode\EDM_SINKER_MODE</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCAT_Function.cpp">
+      <Filter>Source Files\EtherCAT_Master\EtherCAT_Function</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="EtherCAT_Master_RTOS.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatEni.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatFrame.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatMailbox.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatMaster.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatPdo.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatServo.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatTypes.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="NicDriver.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionCore.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="PlcCore.h">
+      <Filter>Header Files\PLC</Filter>
+    </ClInclude>
+    <ClInclude Include="ConfigReader.h">
+      <Filter>Header Files\Function</Filter>
+    </ClInclude>
+    <ClInclude Include="GlobalConfig.h">
+      <Filter>Header Files\Parameter</Filter>
+    </ClInclude>
+    <ClInclude Include="tinyxml2.h">
+      <Filter>Header Files\Function</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

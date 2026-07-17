@@ -1,0 +1,127 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="16.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="RtssDebug|x64">
+      <Configuration>RtssDebug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="RtssRelease|x64">
+      <Configuration>RtssRelease</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{E0B19889-11F2-4020-9BD2-334CD98E7810}</ProjectGuid>
+    <RootNamespace>EtherCAT_Master_RTOS</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <PlatformToolset>v142</PlatformToolset>
+    <ProjectName>EtherCAT_Master_RTOS</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <CharacterSet>Unicode</CharacterSet>
+    <DebuggerFlavor>RtxBaseDm</DebuggerFlavor>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <KS_SDK_DIR>C:\Program Files\IntervalZero\KINGSTAR SDK\4.2</KS_SDK_DIR>
+    <TargetExt>.rtss</TargetExt>
+    <LinkIncremental>false</LinkIncremental>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='RtssDebug'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(KS_SDK_DIR)\include;$(RTX64SDKDir4)include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\um;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\ucrt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_AMD64_;UNDER_RTSS;_DEBUG;_UNICODE;UNICODE;%(PreprocessorDefinitions) </PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <Optimization>Disabled</Optimization>
+      <AdditionalOptions>/openmp- /Gs99999 /Gu %(AdditionalOptions)</AdditionalOptions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(KS_SDK_DIR)\lib\rtss\x64;$(KS_SDK_DIR)\lib\amd64;$(RTX64SDKDir4)lib\$(Rtx64Platform);$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>RtNal.lib;RtTcpip.lib;startupCRT.lib;libcmtd.lib;libcpmtd.lib;libucrtd.lib;libvcruntimed.lib;rtx_rtss.lib;ksapi_rtss.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <EntryPointSymbol>_RtapiProcessEntryCRT</EntryPointSymbol>
+      <SubSystem>Native</SubSystem>
+      <Driver>Driver</Driver>
+      <AdditionalOptions>/FORCE:MULTIPLE %(AdditionalOptions)</AdditionalOptions>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+    <PostBuildEvent>
+      <Command>"%RTX64Common%\bin\StampTool.exe" "$(TargetPath)"</Command>
+      <Message>RTX64 StampTool</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='RtssRelease'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(KS_SDK_DIR)\include;$(RTX64SDKDir4)include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\um;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\ucrt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_AMD64_;UNDER_RTSS;NDEBUG;_UNICODE;UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <AdditionalOptions>/openmp- /Gs99999 /Gu %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(KS_SDK_DIR)\lib\rtss\x64;$(KS_SDK_DIR)\lib\amd64;$(RTX64SDKDir4)lib\$(Rtx64Platform);$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>RtNal.lib;RtTcpip.lib;startupCRT.lib;libcmt.lib;libcpmt.lib;libucrt.lib;libvcruntime.lib;rtx_rtss.lib;ksapi_rtss.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <EntryPointSymbol>_RtapiProcessEntryCRT</EntryPointSymbol>
+      <SubSystem>Native</SubSystem>
+      <Driver>Driver</Driver>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <AdditionalOptions>/FORCE:MULTIPLE %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+    <PostBuildEvent>
+      <Command>"%RTX64Common%\bin\StampTool.exe" "$(TargetPath)"</Command>
+      <Message>RTX64 StampTool</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='RtssDebug'">
+    <Rtx64LocalDebuggerCommand>$(TargetPath)</Rtx64LocalDebuggerCommand>
+    <LocalDebuggerCommand>$(TargetPath)</LocalDebuggerCommand>
+    <DebuggerFlavor>RtxBaseDm</DebuggerFlavor>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='RtssRelease'">
+    <Rtx64LocalDebuggerCommand>$(TargetPath)</Rtx64LocalDebuggerCommand>
+    <LocalDebuggerCommand>$(TargetPath)</LocalDebuggerCommand>
+    <DebuggerFlavor>RtxBaseDm</DebuggerFlavor>
+  </PropertyGroup>
+  <ItemGroup>
+    <ClInclude Include="ConfigReader.h" />
+    <ClInclude Include="EtherCatEni.h" />
+    <ClInclude Include="EtherCatFrame.h" />
+    <ClInclude Include="EtherCatMailbox.h" />
+    <ClInclude Include="EtherCatMaster.h" />
+    <ClInclude Include="EtherCatPdo.h" />
+    <ClInclude Include="EtherCatServo.h" />
+    <ClInclude Include="EtherCatTypes.h" />
+    <ClInclude Include="EtherCAT_Master_RTOS.h" />
+    <ClInclude Include="GlobalConfig.h" />
+    <ClInclude Include="MotionCore.h" />
+    <ClInclude Include="NicDriver.h" />
+    <ClInclude Include="PlcCore.h" />
+    <ClInclude Include="tinyxml2.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="ConfigReader.cpp" />
+    <ClCompile Include="EtherCatEni.cpp" />
+    <ClCompile Include="EtherCatMaster.cpp" />
+    <ClCompile Include="EtherCAT_Function.cpp" />
+    <ClCompile Include="EtherCAT_Master_RTOS.cpp" />
+    <ClCompile Include="EtherCAT_Master_RTOSRtTimerThread.cpp" />
+    <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp" />
+    <ClCompile Include="GlobalConfig.cpp" />
+    <ClCompile Include="MotionCore.cpp" />
+    <ClCompile Include="NicDriver.cpp" />
+    <ClCompile Include="PlcCore.cpp" />
+    <ClCompile Include="System_EDM_SINKER_MODE.cpp" />
+    <ClCompile Include="System_EXAMPLE_MODE.cpp" />
+    <ClCompile Include="tinyxml2.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Import Project="$(RTX64Common)\DebuggerExtensions\IntervalZero.targets" Condition="exists('$(RTX64Common)\DebuggerExtensions\IntervalZero.targets')" />
+</Project>

@@ -1,0 +1,520 @@
+﻿#pragma once
+#include <vector>
+#include "EtherCatTypes.h" // 必須包含這個，才能認識 ServoDrive
+#include <cmath>
+#include <cstdint>
+#include <queue> // 引入佇列函式庫
+#include <deque>
+constexpr int MAX_AXES = 8;//最大軸數宣告
+const double CYCLE_TIME_SEC = 0.00025;// EtherCAT 通訊週期 (250us)
+
+
+//列舉定義--------------------------------------------------------------------
+enum class FeedbackSource// 回授訊號來源
+{
+    MOTOR_ENCODER,  // 半閉迴路：馬達編碼器 (剛性好，適合高速)
+    LINEAR_SCALE    // 全閉迴路：外部光學尺 (精度高，消除背隙)
+};
+
+enum class MotionState// 運動狀態機
+{
+    MotionState_IDLE,       // 閒置 (位置鎖定中)
+    MotionState_MOVING,     // 移動中 (P2P 定位)
+    MotionState_STOPPING,   // 減速停止中
+    MotionState_ERROR ,     // 警報狀態
+    MotionState_VELOCITY,   // 速度模式移動中
+    MotionState_INTERPOLATING ,//多軸插補中
+    MotionState_ESTOP,//緊急狀態
+};
+
+enum class BufferMode
+{
+    BUFFERED, // 排隊模式 (依序執行佇列命令)
+    ABORTING  // 覆寫模式 (清空佇列，打斷當前運動，立刻執行)
+};
+
+
+//資料結構-----------------------------------------------------------------------------------------------
+
+
+struct AxisCommand // 軌跡規劃層算出的「瞬間理論值」，PID 負責追隨這兩個值
+{
+    double instantCmdPos; // 瞬間理論位置 (Pulse)
+    double instantCmdVel; // 瞬間理論速度 (Pulse/Sec) - 用於前饋
+};
+
+
+struct PidConfig// PID 參數與保護設定
+{
+    // 增益參數
+    double Kp = 0.0;           // 比例增益 (剛性)
+    double Ki = 0.0;           // 積分增益 (消除靜差)
+    double Kd = 0.0;           // 微分增益 (阻尼，通常 CSV 設 0)
+
+    // 限制保護
+    bool EnableLagCheck = true; //是否啟用跟隨誤差(Lag)跳機保護
+    double MaxIntegral = 0.0;  // 積分上限 (抗飽和)
+    double MaxLag = 0.0;       // 最大允許跟隨誤差 (Lag Limit) -> 超過跳機
+
+    // 內部運算狀態
+    double prevError = 0.0;    // 上一次的誤差
+    double integralAcc = 0.0;  // 積分累積值
+};
+
+
+struct AxisContext//軸參數與狀態
+{
+    //參數-------------------------------------------------------------------------------------------------------------
+    
+    //硬體物理參數-------------------------------------------------
+    double resolution_PPR = 16777216.0;// 編碼器解析度
+    double maxVel_PPS = 0.0;// 最高轉速 (Pulse/sec)
+   
+
+    //雙閉環/全閉環設定-------------------------------------------------
+    FeedbackSource fbMode = FeedbackSource::MOTOR_ENCODER;//回授設定 
+    double scaleToMotorRatio = 1.0;// 光學尺與馬達的解析度比例
+    double maxDeviation = 0.0;// 雙閉環最大容許偏差
+
+    //預設運動參數-------------------------------------------------
+    double smoothTime_ms; // S曲線濾波時間 (例如 50ms) -> 決定機台有多「柔」
+
+
+    //PID-------------------------------------------------
+    PidConfig pid;
+
+
+    //狀態與指令-------------------------------------------------------------------------------------------------------------
+
+    //當次運動指令-------------------------------------------------
+    double cruiseVel_PPS;// 本次移動的目標巡航速度
+    double acc_PPS2 = 0.0;// 本次移動的加速度
+    double dec_PPS2 = 0.0;// 本次移動的減速度
+
+
+    double finalTargetPos = 0.0;// 本次移動的最終目標位置 (定位模式)
+
+    
+    double targetVelocity;// 目標速度 (速度模式)
+    double VelocityMove_Acc;// 速度模式專用的切換加速度
+    double targetEndVel = 0.0;// 終點速度 (連續軌跡過彎時，預留的不降速值)
+
+    double feedrateOverride = 1.00; // 進給倍率控制 (預設 1.0 = 100%)
+
+
+
+    //即時動態座標-------------------------------------------------
+    double planningPos;// 虛擬大腦的理想位置 (未經 S-Curve 濾波的粗糙折線)
+    double currentCmdPos = 0.0;// 濾波後的最終命令位置 (要餵給 PID 的理論位置)
+    double currentCmdVel = 0.0;// 濾波後的最終命令速度 (要餵給驅動器的前饋速度)
+    double currentActPos = 0.0;// 實際馬達回授的真實位置
+
+    // 🟢 [新增] 大腦專用的邏輯座標與速度 (G68 計算用)
+    double logicalCmdPos = 0.0;
+    double logicalCmdVel = 0.0;
+
+    //機台狀態旗標-------------------------------------------------
+    MotionState state = MotionState::MotionState_IDLE;// 當前狀態機 (預設閒置)
+    bool inPosition = true;// 是否已到達終點 (剛開機視為已到位)
+    bool isFault = false;// 是否發生硬體或軟體警報
+
+
+    //運算記憶體緩衝區-------------------------------------------------
+    
+    //S-Curve 移動平均濾波器--------
+    std::vector<double> velBuffer;// 儲存歷史速度的環形陣列
+    int bufferIndex=0;// 目前陣列寫入的指標位置
+    double bufferSum=0.0;// 陣列內所有速度的總和 (加速計算用)
+
+
+    //硬體綁定指標-------------------------------------------------
+    int32_t* pScaleActualPos = nullptr; // 光學尺的實體記憶體位址 (未接時必須是 nullptr)
+
+
+    //單軸專用的變數
+    double startCmdPos = 0.0;  // 紀錄這段移動的「起點」
+    double motionTime = 0.0;   // 紀錄這段移動「走了幾秒」
+    double moveDir = 1.0;      // 移動方向 (1.0 或 -1.0)
+    double programmedVel_PPS = 0.0; // 🟢 [新增] 紀錄下單時的原始目標速度
+};
+
+enum class InterpolationMode//插補群組的導航模式
+{
+    LINEAR,       // 直線插補
+    CIRCULAR_CW,  // 圓弧插補 - 順時針
+    CIRCULAR_CCW  // 圓弧插補 - 逆時針
+};
+
+
+enum class PathMode// 軌跡的連續模式 
+{
+    EXACT_STOP,// 精確停止 (每段終點速度降到 0)
+    CONTINUOUS,// 連續軌跡 (速度融合提前預讀下一個速度)
+    PATH_SERVO,//  路徑伺服模式：由外部即時給予路徑進給速度
+    JUMP_TRACKING//跳躍排渣模式
+};
+
+struct MotionCommand//運動指令包裹 (使用在塞進佇列)
+{
+    InterpolationMode mode;      //插補群組的導航模式
+    int axisCount;               // 參與的軸數
+    int axisIndices[MAX_AXES];          // 參與的軸編號
+    double targetPos[MAX_AXES];         // 各軸的終點座標
+
+    // 圓弧專用參數
+    double centerPos[2];         // 圓心 (X, Y)
+
+    // 🟢 [新增] 螺線專用
+    double startRadius;
+    double endRadius;
+
+    int dir;                     // 方向 (1=CCW, -1=CW)
+
+    // 運動參數
+    double targetVel;            // 目標速度
+    double accTime;              // 加速時間
+    double decTime;              // 減速時間
+
+
+
+   
+    //時光機專用快照記憶體
+   
+    double mem_startPos[8];
+    double mem_ratio[8];
+    double mem_radius;
+    double mem_startAngle;
+    double mem_centerX;
+    double mem_centerY;
+    double mem_totalDist; // 這條線的總長度
+    double mem_totalAngle; // 🟢 [補上這行] 記憶 3D 螺旋總角度
+
+    // 🟢 [新增] 時光機專用：記憶當時的空間旋轉狀態！
+    bool   mem_enableTransform;
+    double mem_transformOrigin[3];
+    double mem_transformMatrix[3][3];
+
+   
+};
+
+
+// 放電排渣模式
+enum class JumpMode {
+    B0_REVERSE,        // B0: 單節反向排渣
+    B1_SPECIFIC_AXIS,  // B1: 強制沿特定單軸排渣 (例如 Z 軸)
+    B2_PATH_REVERSE,   // B2: 原軌跡路徑退刀 (我們已完成的時光機模式)
+    B3_CENTER,         // B3: 回中心再排渣 放電點開始執行跳躍腳本
+    B3_CENTER_AUTO,    // B3: 回中心再排渣 回中心點在開始執行跳躍腳本
+    B4_ORBITAL_DIAGONAL // B4: 搖動/行星加工斜角跳刀
+
+
+
+};
+
+
+
+// 1. 定義單段跳刀參數
+struct JumpSegment {
+    double distance;   // 該段要移動的距離
+    double velocity;   // 最高速度
+    double accTime;    // 🟢 加速時間 (秒)，例如 0.2
+    double decTime;    // 🟢 減速時間 (秒)，例如 0.2
+};
+
+// 2. 定義跳刀的四個階段
+enum class JumpState {
+    IDLE,              // 沒事，正常放電中
+    RETRACTING,        // 階段一：正在原路徑往後退 (可包含多段)
+    DWELL,             // 階段二：退到頂點，停留排渣
+    APPROACHING,        // 階段三：正在原路徑往前衝回放電點 (可包含多段)
+
+
+    B3_TO_CENTER, B3_TO_APEX, B3_DWELL, B3_FROM_APEX, B3_TO_WORKPIECE, // 🌟 B3 專用的 5 個狀態
+
+    B4_TO_UPPER_CENTER, // 1. 斜向退回上中心
+    B4_TO_APEX,         // 2. 沿主軸垂直拔高
+    B4_DWELL,           // 3. 頂點停留排渣
+    B4_FROM_APEX,       // 4. 沿主軸垂直降落
+    B4_TO_WORKPIECE,     // 5. 斜向摸回放電點
+
+
+
+    PAUSED_HOLD,          // 暫停中 (停在空中)
+    RESUME_ALIGN_PRIMARY, // 復歸對齊：優先軸
+    RESUME_ALIGN_OTHERS,  // 復歸對齊：其他軸
+    RESUME_ALIGN_ALL      // 復歸對齊：全同動
+};
+
+// 3. 跳刀管理器
+struct PathJumpManager {
+    JumpState state = JumpState::IDLE;
+    JumpMode mode = JumpMode::B2_PATH_REVERSE; // 🟢 新增：記錄當前是哪個模式
+    int b1_AxisIndex = 2; // 🟢 新增：B1專用，要跳躍的實體軸編號 (通常 2 代表 Z 軸)
+
+    double b1_dir = 1.0;            // 👈 就是漏了這行！記錄 B1 退刀是正向(+1)還是負向(-1)
+
+    // 🟢 新增：用來儲存 B0 模式的反向單位向量 (Unit Vector)
+    double b0_Vector[3] = { 0.0, 0.0, 0.0 };
+
+    // 🟢 [新增這行]：用來儲存跳刀瞬間的實體絕對位置 (完美降落的家)
+    double frozenPos[8] = { 0.0 };
+
+    double triggerPos = 0.0;
+    double currentOffset = 0.0;
+    double targetOffset = 0.0;
+    std::vector<JumpSegment> retractSteps;
+    std::vector<JumpSegment> approachSteps;
+    int currentStepIdx = 0;
+    double dwellTimer = 0.0;
+    double dwellTimeTarget = 0.0;
+    double jumpVel = 0.0;
+
+    // 🟢 [新增這行]：用來標記「剛跳完刀，正在軟著陸中」
+    bool isRecovering = false;
+
+
+
+    // ==========================================
+    // 🌟 B3 模式專屬幾何變數 (請在這裡加回來)
+    // ==========================================
+    double b3_centerPos[3] = { 0.0, 0.0, 0.0 };     // 記住使用者指定的「安全中心點」(X, Y, Z)
+    double b3_retractVector[3] = { 0.0, 0.0, 1.0 }; // 記住使用者指定的「拔高 3D 向量」 (預設純Z軸向上)
+    double b3_distToCenter = 0.0;                 // 算出來的「放電點到中心點」的真實幾何距離
+    double b3_xyVector[3] = { 0.0, 0.0, 0.0 };      // 從放電點指向中心點的「逃脫方向向量」
+
+    std::vector<JumpSegment> b3_toCenterSteps;
+    std::vector<JumpSegment> b3_toApexSteps;
+    std::vector<JumpSegment> b3_fromApexSteps;
+    std::vector<JumpSegment> b3_toWorkpieceSteps;
+    double b3_distToApex; // 頂點總距離
+
+
+    // ===================================
+    // 🌟 B4 專屬參數區
+    // ===================================
+    double b4_upperCenterPos[3]; // 使用者指定的「上中心點」
+    double b4_retractVector[3];  // 垂直拔高的方向向量 (例如 Z軸 就是 0,0,1)
+
+    double b4_distToUpper;       // 放電點 -> 上中心點 的斜線距離
+    double b4_distToApex;        // 上中心點 -> 頂點 的垂直距離
+
+    std::vector<JumpSegment> b4_toUpperSteps;
+    std::vector<JumpSegment> b4_toApexSteps;
+    std::vector<JumpSegment> b4_fromApexSteps;
+    std::vector<JumpSegment> b4_toWorkpieceSteps;
+
+
+
+
+
+
+
+    // 🌟 暫停與復歸專用變數
+    bool isPauseMode = false;
+    int resumeAlignMode = 0;
+    // 🌟 新增這行：記錄第一階段要動哪些軸 (位元遮罩)
+    int firstStageMask = 0;
+    double alignVel = 0.0;
+
+    // 🌟 獨立的對齊進度 (不干擾原本的 currentOffset)
+    double alignOffset = 0.0;
+    double alignDist = 0.0;
+
+    // 🌟 座標快照
+    double apexPos[8] = { 0 };        // 頂點快照
+    double joggedStartPos[8] = { 0 }; // Jog後的起點快照
+
+
+   
+};
+
+
+struct InterpolationGroup// 插補群組
+{
+    //運行狀態與模式------------------------------------------------------
+    bool isActive=false;// 插補引擎運作標記 (true: 正在計算路徑位移, false: 停止)
+    InterpolationMode mode = InterpolationMode::LINEAR;// 當前幾何模式 (預設直線)
+ 
+
+    //參與軸與投影參數 (用於直線插補)------------------------------------------------------
+
+    int  axisCount=0;// 參與聯動的實體軸總數 (例如 2 軸或 3 軸)
+    int  axisIndices[MAX_AXES];// 記錄參與軸的編號清單 (例如 {0, 1} 代表 X, Y 軸)
+    double startPos[MAX_AXES];// 記錄各段路徑開始時，各實體軸的起點位置 (Snapshot)
+    double ratio[MAX_AXES];// 方向向量/分量比例 (單位路徑位移時，各軸應分配的比例)
+
+
+
+    //圓弧插補專用幾何參數------------------------------------------------------
+    double centerX = 0.0;// 圓心 X 座標 (絕對座標或相對距離，依演算法定義)
+    double centerY = 0.0;// 圓心 Y 座標
+    double radius = 0.0;// 圓弧半徑
+    double startAngle = 0.0;// 起始角度 (弧度 Radian)
+
+
+    //螺旋插補專用記憶體
+    double totalAngle = 0.0;   // 記錄總共要轉多少角度 (包含正負號)
+    double totalDist3D = 0.0;  // 記錄真實的 3D 總路徑長度
+
+
+
+    // ==========================================
+    // 🟢 [新增] 空間座標旋轉矩陣 (G68 功能)
+    // ==========================================
+    bool enableTransform = false;         // 旋轉開關
+    double transformOrigin[3] = { 0, 0, 0 }; // 旋轉中心點 (X, Y, Z)
+    double transformMatrix[3][3] = {       // 3x3 旋轉矩陣 (預設為不旋轉的單位矩陣)
+        {1.0, 0.0, 0.0},
+        {0.0, 1.0, 0.0},
+        {0.0, 0.0, 1.0}
+    };
+
+    //運動規劃核心------------------------------------------------------
+    AxisContext virtualAxis;// 這是「虛擬主軸」，負責跑總路徑長度 (s)，實體軸再依比例跟隨
+
+
+   //速度與進給控制------------------------------------------------------
+    double feedrateOverride =0.01;// 插補整體的進給速度倍率控制 (0.0 ~ 1.0+)
+
+
+
+    //任務緩衝管理------------------------------------------------------
+    std::deque<MotionCommand> cmdQueue;
+
+
+   
+    //時光機專用擴充套件 ------------------------------------------------------
+  
+    bool enableHistory = false;             // 時光機模式開關
+    std::deque<MotionCommand> historyQueue; // 歷史軌跡 (跑完的麵包屑)
+    MotionCommand currentCmd;               // 當前指令 (備份用，退刀時才知道這條線長怎樣)
+
+    //路徑連接模式------------------------------------------------------
+    PathMode pathMode = PathMode::EXACT_STOP;// 決定兩段指令之間要「精確停止」還是「連續轉彎不降速」
+
+
+    //路徑模式------------------------------------------------------
+    double pathServoVel = 0.0;// 外部路徑伺服速度輸入 (單位: Pulse/sec)
+    
+    //跳刀管理器------------------------------------------------------
+   
+    PathJumpManager jumpManager;
+};
+
+
+
+
+
+//核心類別宣告--------------------------------------------------------------------
+// ==========================================
+// 核心運動控制類別 (MotionCore Class)
+// 職責：處理單軸運動、多軸插補、PID 閉迴路、以及 EDM 路徑伺服
+// ==========================================
+class MotionCore
+{
+public:
+    MotionCore();
+
+    //系統關聯與連結--------------------------------------------------------------------
+    
+    void Link(std::vector<ENI_ServoDrive>* pAxisList);// 連結實體驅動器列表 (EtherCAT 映射資料)
+    void Link(std::vector<ENI_ServoDrive>* pDriveList, std::vector<AxisContext>* pContextList);// 連結實體驅動器與邏輯參數上下文 (Context)
+
+
+
+    //單軸運動 API--------------------------------------------------------------------
+    
+    
+    void InitAxis(AxisContext& axis, double resolution = 16777216.0);// 初始化軸參數 (如解析度、預設極限、PID)
+    void InitSmoothBuffer(AxisContext& axis, double smoothTime_ms);// 初始化 S-Curve 平滑濾波緩衝區
+    void MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time);// 下達 P2P 絕對位置移動指令 (Trapezoidal 梯形加減速)
+    void VelocityMove(AxisContext& axis, double velocity, double acc_time = 0.0);// 下達速度模式指令 (用於放電或手動連續移動)
+    void StopMove(AxisContext& axis, double dec_time = 0.0);// 正常減速停止單軸
+    void EmergencyStop(AxisContext& axis);// 單軸急停 (瞬間鎖死，清空緩衝區)
+    void ResetFault(AxisContext& axis);// 清除單軸故障狀態 (Reset Error)
+    void SetAxisFeedrateOverride(int axisIndex, double overrideRatio);// 設定單軸的進給倍率 (0.0 ~ 1.0)
+    void Stop(AxisContext& axis);// 簡易停止 API
+
+
+
+    //核心運算更新--------------------------------------------------------------------
+    // 單軸運動狀態機更新 (必須在即時迴圈 1ms/250us 中呼叫)
+    template <typename DriveType>
+    void UpdateMotion(DriveType& servo, AxisContext& axis);
+
+
+    //輔助工具--------------------------------------------------------------------
+    static double RpmToPps(double rpm, double resolution); // RPM 轉 Pulse/Sec
+    static double PpsToRpm(double pps, double resolution); // Pulse/Sec 轉 RPM
+
+
+
+    //多軸插補功能區塊--------------------------------------------------------------------
+   
+    void LineMove(const std::vector<int>& axes, const std::vector<double>& targetPos, double targetVel, double acc_time, double dec_time, BufferMode mode = BufferMode::ABORTING);// 直線插補指令
+    void ArcMove(const std::vector<int>& axes, const std::vector<double>& targetPos, const std::vector<double>& centerPos, int dir, double targetVel, double acc_time, double dec_time, BufferMode mode = BufferMode::ABORTING);// 圓弧插補指令
+    void UpdateInterpolation();// 插補群組更新 (計算虛擬主軸並分配位移給實體軸)
+    void InitVirtualAxisSmooth(int windowSize); // 初始化虛擬主軸的 S-Curve 平滑設定
+    void LoadNextCommand();// 從指令佇列 (Queue) 載入下一段任務  
+    void GetDirectionVector(const MotionCommand& cmd, double startX, double startY, double& vx, double& vy);// 取得當前路徑的方向向量
+    void StopGroup(std::vector<AxisContext>& axes, double decTime);// 插補群組整體停止與急停
+    void EmergencyStopGroup();//緊急停止
+
+    // 插補群組進給倍率與路徑模式設定 (Exact Stop / Continuous)
+    void SetGroupFeedrateOverride(double overrideRatio);// 設定當前插補群組進給倍率
+    void SetGroupPathMode(PathMode mode);// 設定當前插補群組與路徑模式
+    PathMode GetGroupPathMode() const;// 取得當前插補群組與路徑模式
+    void UpdatePathServoVelocity(double velocity_pps);//更新外部速度  
+    void EnableHistoryBuffer(bool enable);//時光機模式開關
+
+    //設定空間座標旋轉 (參數：開關, 旋轉中心X,Y,Z, 繞Z軸旋轉角度, 繞Y軸旋轉角度, 繞X軸旋轉角度)
+    void SetCoordinateTransform(bool enable, double ox, double oy, double oz, double yaw_deg, double pitch_deg, double roll_deg);
+
+
+
+    //跳躍排渣區塊--------------------------------------------------------------------
+    void TriggerPathJump(JumpMode mode, const std::vector<JumpSegment>& retract, const std::vector<JumpSegment>& approach, double dwellTime_ms, int b1_axis = 2);
+  
+    void TriggerCenterJump_B3(double targetCenterX, double targetCenterY, double targetCenterZ,double jumpVecX, double jumpVecY, double jumpVecZ,const std::vector<JumpSegment>& toCenter,const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex,const std::vector<JumpSegment>& toWorkpiece,double dwellTime_ms);
+    void TriggerOrbitalJump_B4(double upperCx, double upperCy, double upperCz, double vx, double vy, double vz, const std::vector<JumpSegment>& toUpper, const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece, double dwellTime_ms);
+    void FinalizeSafePath(const std::vector<JumpSegment>& retract, std::vector<JumpSegment>& approach);//腳本安全保護控制
+
+
+    void TriggerPause_B0(const std::vector<JumpSegment>& retractScript, const std::vector<JumpSegment>& approachScript);//觸發 B0 暫停 
+    void TriggerPause_B1(const std::vector<JumpSegment>& retractScript, const std::vector<JumpSegment>& approachScript, int axisIndex, double dir); //觸發 B1 暫停(指定單一軸與方向)
+    void TriggerPause_B2(const std::vector<JumpSegment>& retractScript, const std::vector<JumpSegment>& approachScript); // 觸發 B2 暫停 (沿原路徑倒退嚕)
+    void TriggerPause_B3(double cx, double cy, double cz, double vx, double vy, double vz, const std::vector<JumpSegment>& toCenter, const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece);
+    void TriggerPause_B4(double upperCx, double upperCy, double upperCz, double vx, double vy, double vz, const std::vector<JumpSegment>& toUpper, const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece);
+
+   
+    
+    
+    void Process_B2_Approach_Planner(double dt);
+    void Process_Forward_Crossing();
+    void TriggerPauseResume(int alignMode, double alignVel, int firstStageMask);//觸發復歸 (只需給對齊模式和速度)
+   
+private:
+   
+   
+    void Calc_Trajectory_Trapezoidal(AxisContext& axis, AxisCommand& outCmd); // 計算定位模式的梯形速度規劃 (S-Curve 前置)
+    void Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd); // 計算速度模式的斜坡變速規劃
+
+   
+    // 執行 PID 運算、前饋控制以及安全 Lag 監控--------------------------------------------------------------------
+    template <typename DriveType>
+    void Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd);
+
+
+    double PlanTrapezoidal(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
+    double PlanTrapezoidal_B2(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
+   
+    int Sgn(double val); // 符號函數
+
+    // 指向實體資料的指標列表--------------------------------------------------------------------
+    std::vector<ENI_ServoDrive>* m_pAxes = nullptr;   // 舊有的驅動器關聯 (保留相容性)
+    std::vector<ENI_ServoDrive>* m_pDrives = nullptr;  // 實體驅動器列表 (PDO 對接)
+    std::vector<AxisContext>* m_pContexts = nullptr;   // 軸參數與狀態列表 (邏輯計算)
+
+    // 多軸插補管理器 (單一實體群組)--------------------------------------------------------------------
+    InterpolationGroup m_Group;
+};

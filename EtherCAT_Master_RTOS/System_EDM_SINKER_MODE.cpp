@@ -97,13 +97,13 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         timer_10ms += 10;
         timer_100ms += 10;
         timer_1000ms += 10;
-        Debug_test_timer += 10; // 測試專用時間軸
+        Debug_test_timer += 10; // 測試專用時間軸 
 
        
         //1s
         if (tickCount_RunRealTimeCycle % 4000 == 0)
         {
-
+           
         }
 
     

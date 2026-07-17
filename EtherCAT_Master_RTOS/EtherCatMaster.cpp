@@ -1391,6 +1391,12 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         // 如果沒在跑插補，這行會直接跳過，不影響效能
         pMaster->m_Motion.UpdateInterpolation();
 
+
+        // 2.優化後的寫法：一行搞定激磁、PID、伺服控制
+        // 這裡面已經包含了你 UpdateServoState 的邏輯
+        pMaster->m_Motion.UpdateAllMotion();
+
+
         // 確保有馬達且軸參數已建立
         size_t servoCount = pMaster->m_ServoList.size();
         size_t axisCount = pMaster->m_Axes.size();

@@ -34,6 +34,8 @@ enum class BufferMode
 };
 
 
+
+
 //資料結構-----------------------------------------------------------------------------------------------
 
 
@@ -60,6 +62,7 @@ struct PidConfig// PID 參數與保護設定
     double prevError = 0.0;    // 上一次的誤差
     double integralAcc = 0.0;  // 積分累積值
 };
+
 
 
 struct AxisContext//軸參數與狀態
@@ -118,6 +121,8 @@ struct AxisContext//軸參數與狀態
     bool inPosition = true;// 是否已到達終點 (剛開機視為已到位)
     bool isFault = false;// 是否發生硬體或軟體警報
 
+    bool isServoOn = false;      //激磁狀態 只有這變成 true，NC 軌跡規劃器才允許下指令 
+    int8_t targetMode = 9;       // 預設 CSV 模式 (9)，方便之後想改模式時設定
 
     //運算記憶體緩衝區-------------------------------------------------
     
@@ -422,6 +427,10 @@ public:
 
 
 
+    //軸狀態
+    void UpdateAllMotion();//更新全部軸狀態 逐步激磁
+    void UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis);//更新單軸狀態 逐步激磁
+    
     //單軸運動 API--------------------------------------------------------------------
     
     

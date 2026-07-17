@@ -63,6 +63,9 @@ void MotionCore::InitAxis(AxisContext& axis, double resolution)
     axis.inPosition = true;
     axis.isFault = false;
 
+    axis.isServoOn = false;   // 開機必須強制為 false，直到 CiA 402 狀態機建立激磁
+    axis.targetMode = 9;      // 預設 CSV
+
     // 5. PID 參數 (自動依解析度縮放)
     // 基準: 16777216 解析度下, Kp = 20
     double ratio = axis.resolution_PPR / 16777216.0;
@@ -92,6 +95,76 @@ void MotionCore::InitSmoothBuffer(AxisContext& axis, double smoothTime_ms)
     axis.bufferIndex = 0;
     axis.bufferSum = 0.0;
     axis.smoothTime_ms = smoothTime_ms;
+}
+
+// 檔案：MotionCore.cpp
+void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
+{
+    // 1. 防呆：確保指標沒丟失
+    if (m_pDrives == nullptr || m_pContexts == nullptr) {
+        return;
+    }
+
+    // 2. 防呆：確保兩個清單長度一致
+    if (m_pDrives->size() != m_pContexts->size()) {
+        // 這裡可以丟個錯誤 log
+        return;
+    }
+
+    // 3. 迴圈迭代每一軸
+    for (size_t i = 0; i < m_pDrives->size(); ++i)
+    {
+        // 呼叫原本寫好的單軸更新邏輯
+        UpdateMotion((*m_pDrives)[i], (*m_pContexts)[i]);
+    }
+}
+void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更新單軸狀態 逐步激磁
+{
+    if (servo.pInput == nullptr || servo.pOutput == nullptr) return;
+
+    uint16_t statusWord = servo.pInput->StatusWord;
+
+    // 1. 強制設定 CSV 模式 (Mode 9)
+    servo.pOutput->ModesOfOperation = 9;
+
+    // 2. [CiA 402 狀態機]
+    // 遮罩與值定義 (為了可讀性)
+    const uint16_t MASK_STATE = 0x006F;
+    const uint16_t MASK_FAULT = 0x0008;
+
+    // A. 檢查故障 (Fault)
+    if ((statusWord & MASK_FAULT) != 0)
+    {
+        servo.pOutput->ControlWord = 0x0080; // Fault Reset
+        axis.isServoOn = false;
+        axis.state = MotionState::MotionState_ERROR;
+    }
+    // B. Switch On Disabled (驅動器剛上電，未準備好)
+    else if ((statusWord & 0x004F) == 0x0040)
+    {
+        servo.pOutput->ControlWord = 0x0006; // Shutdown
+    }
+    // C. Ready to Switch On (準備就緒)
+    else if ((statusWord & MASK_STATE) == 0x0021)
+    {
+        servo.pOutput->ControlWord = 0x0007; // Switch On
+    }
+    // D. Switched On (電路已接通，等待最後一指令)
+    else if ((statusWord & MASK_STATE) == 0x0023)
+    {
+        servo.pOutput->ControlWord = 0x000F; // Enable Operation (激磁！)
+    }
+    // E. Operation Enabled (已成功激磁)
+    else if ((statusWord & MASK_STATE) == 0x0027)
+    {
+        servo.pOutput->ControlWord = 0x000F; // 維持激磁狀態
+        axis.isServoOn = true;
+    }
+    else
+    {
+        // 若狀態未知或正在切換中，維持原本指令或歸零
+        axis.isServoOn = false;
+    }
 }
 
 void MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time)
@@ -2219,6 +2292,23 @@ void MotionCore::UpdateInterpolation()
 {
     // 1. 基本防呆
     if (m_pContexts == nullptr) return;
+
+
+    // [安全門] 檢查參與群組的所有實體軸是否全部激磁
+    // 如果有任何一軸沒激磁，嚴禁進行任何插補計算，直接跳出。
+    for (int i = 0; i < m_Group.axisCount; i++)
+    {
+        int axisIdx = m_Group.axisIndices[i];
+        if (!(*m_pContexts)[axisIdx].isServoOn)
+        {
+            m_Group.isActive = false; // 強制將群組設為非運作狀態
+            return; // 這裡不執行任何插補計算，也不輸出任何位置
+        }
+    }
+
+
+
+
     AxisContext& vAxis = m_Group.virtualAxis; // 先取得 vAxis 的引用
     double dt = CYCLE_TIME_SEC;
     PathJumpManager& jm = m_Group.jumpManager;

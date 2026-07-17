@@ -352,6 +352,10 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
                                         m_Motion.InitSmoothBuffer(m_Axes[2], 100 * 1);//加加速度來開啟 100ms 的平滑功能
                                         m_Motion.InitVirtualAxisSmooth(100 * 1);
 
+                                        m_Axes[0].isServoOn = true;
+                                        m_Axes[1].isServoOn = true;
+                                        m_Axes[2].isServoOn = true;
+                                        
                                         //選項 1
                                         //優點：定位最準，反應最快，絕不過衝。
                                         //缺點：起步和煞車會比較硬 (Jerk 無限大)。

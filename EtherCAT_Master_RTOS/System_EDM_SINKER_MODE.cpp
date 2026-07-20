@@ -81,12 +81,33 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     }
 
 
+
+
+    // 🌟 組合完整路徑： D:\EtherCAT_Master_Data\NC_Program\test.nc
+    std::string fullNcPath = GlobalConfig::GetInstance().NCProgramDir + "test.nc";
+    DEBUG_PRINT("[NC] Preparing to load file: %s\n", fullNcPath.c_str());
+
+    // 🌟 交給 NCManager 去讀檔
+    if (m_NC->LoadProgram(fullNcPath))
+    {
+        // 載入成功，啟動加工
+        m_NC->CycleStart();
+    }
+    else
+    {
+        DEBUG_PRINT("[Error] Failed to load NC file; please check if %s exists!\n", fullNcPath.c_str());
+    }
+
+
     
     //主控迴圈-------------------------------------------------------------
     while (1)
     {
+      
         // 1. 睡 10ms (更省資源)
         RtSleep(10);
+        m_NC->ProcessTask();//NC系統作業呼叫
+
 
         // 2. 補償 Tick
         // 10ms = 10,000us = 40 * 250us
@@ -100,6 +121,9 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         Debug_test_timer += 10; // 測試專用時間軸 
 
        
+
+
+
         //1s
         if (tickCount_RunRealTimeCycle % 4000 == 0)
         {

@@ -5,6 +5,7 @@
 #include <windows.h> 
 #include <rtapi.h>
 
+
 bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion)
 {
     //讀取參數確定軸數量-----------------------------------------------------------------

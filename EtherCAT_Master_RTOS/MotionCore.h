@@ -420,6 +420,8 @@ class MotionCore
 public:
     MotionCore();
 
+
+
     //系統關聯與連結--------------------------------------------------------------------
     
     void Link(std::vector<ENI_ServoDrive>* pAxisList);// 連結實體驅動器列表 (EtherCAT 映射資料)
@@ -501,6 +503,10 @@ public:
     void Process_B2_Approach_Planner(double dt);
     void Process_Forward_Crossing();
     void TriggerPauseResume(int alignMode, double alignVel, int firstStageMask);//觸發復歸 (只需給對齊模式和速度)
+
+    // 🌟 新增：讓 NC 系統查詢底層插補狀態
+    bool IsGroupQueueFull() const { return m_Group.cmdQueue.size() >= 100; } // 預讀 100 行
+    bool IsGroupDone() const { return !m_Group.isActive && m_Group.cmdQueue.empty(); }
    
 private:
    

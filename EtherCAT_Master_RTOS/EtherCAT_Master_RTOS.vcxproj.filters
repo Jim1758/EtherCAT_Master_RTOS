@@ -55,6 +55,12 @@
     <Filter Include="Source Files\EtherCAT_Master\EtherCAT_Function">
       <UniqueIdentifier>{17927f07-0581-4ff1-89ae-6135f0eefdd6}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\NC">
+      <UniqueIdentifier>{9fc2e5a2-2d7a-4b61-8050-6f6b235cf47b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NC">
+      <UniqueIdentifier>{8193ac67-c673-43dc-92e7-c7cd1289c5ca}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
@@ -99,6 +105,21 @@
     <ClCompile Include="EtherCAT_Function.cpp">
       <Filter>Source Files\EtherCAT_Master\EtherCAT_Function</Filter>
     </ClCompile>
+    <ClCompile Include="NCManager.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="MacroEngine.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="MacroParser.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="GCodeParser.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="CoordinateManager.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -142,6 +163,24 @@
     </ClInclude>
     <ClInclude Include="tinyxml2.h">
       <Filter>Header Files\Function</Filter>
+    </ClInclude>
+    <ClInclude Include="NCManager.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NC_Types.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="CoordinateManager.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="MacroEngine.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="MacroParser.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="GCodeParser.h">
+      <Filter>Header Files\NC</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

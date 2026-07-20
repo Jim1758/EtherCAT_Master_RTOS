@@ -5,7 +5,7 @@
 #include <vector>
 #include "PlcCore.h"       // 引用 PLC 核心
 #include "MotionCore.h"       // 引用 MotionCore 核心
-
+#include "NCManager.h"
 
 #pragma pack(push, 1)
 
@@ -259,5 +259,9 @@ public:
      void Get_TotalSlave_WKC_Count();//取得從站WKC 分數
      
      int RunRealTimeCycle_EDM_SINKER_MODE();//主要程式迴圈執行 EDM 雕磨模式
+
+
+
+     NCManager* m_NC = nullptr;
 };
 

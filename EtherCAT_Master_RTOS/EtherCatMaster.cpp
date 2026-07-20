@@ -12,9 +12,16 @@ EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m
     // 清空傳送與接收緩衝區
     memset(m_txBuffer, 0, sizeof(m_txBuffer));
     memset(m_rxBuffer, 0, sizeof(m_rxBuffer));
+
+    m_NC = new NCManager(m_Motion);
 }
 EtherCatMaster::~EtherCatMaster() 
 {
+    if (m_NC != nullptr)
+    {
+        delete m_NC;
+        m_NC = nullptr;
+    }
 }
 void EtherCatMaster::AttachNic(CNicDriver* pNic)// 綁定網卡驅動程式
 {

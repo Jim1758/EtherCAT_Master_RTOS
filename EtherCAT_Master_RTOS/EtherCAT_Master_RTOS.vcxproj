@@ -92,6 +92,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ClInclude Include="ConfigReader.h" />
+    <ClInclude Include="CoordinateManager.h" />
     <ClInclude Include="EtherCatEni.h" />
     <ClInclude Include="EtherCatFrame.h" />
     <ClInclude Include="EtherCatMailbox.h" />
@@ -100,22 +101,32 @@
     <ClInclude Include="EtherCatServo.h" />
     <ClInclude Include="EtherCatTypes.h" />
     <ClInclude Include="EtherCAT_Master_RTOS.h" />
+    <ClInclude Include="GCodeParser.h" />
     <ClInclude Include="GlobalConfig.h" />
+    <ClInclude Include="MacroEngine.h" />
+    <ClInclude Include="MacroParser.h" />
     <ClInclude Include="MotionCore.h" />
+    <ClInclude Include="NCManager.h" />
+    <ClInclude Include="NC_Types.h" />
     <ClInclude Include="NicDriver.h" />
     <ClInclude Include="PlcCore.h" />
     <ClInclude Include="tinyxml2.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ConfigReader.cpp" />
+    <ClCompile Include="CoordinateManager.cpp" />
     <ClCompile Include="EtherCatEni.cpp" />
     <ClCompile Include="EtherCatMaster.cpp" />
     <ClCompile Include="EtherCAT_Function.cpp" />
     <ClCompile Include="EtherCAT_Master_RTOS.cpp" />
     <ClCompile Include="EtherCAT_Master_RTOSRtTimerThread.cpp" />
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp" />
+    <ClCompile Include="GCodeParser.cpp" />
     <ClCompile Include="GlobalConfig.cpp" />
+    <ClCompile Include="MacroEngine.cpp" />
+    <ClCompile Include="MacroParser.cpp" />
     <ClCompile Include="MotionCore.cpp" />
+    <ClCompile Include="NCManager.cpp" />
     <ClCompile Include="NicDriver.cpp" />
     <ClCompile Include="PlcCore.cpp" />
     <ClCompile Include="System_EDM_SINKER_MODE.cpp" />

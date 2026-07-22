@@ -5,8 +5,9 @@
 #include <rtapi.h> 
 #include <rtssapi.h> 
 #include <stdio.h>
-
-
+#include "SHMManager.h"
+#include "HMI_Bridge.h"    // 🌟 1. 引入橋接器
+#include "AlarmManager.h"
 
 
 int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行 EDM模式
@@ -81,47 +82,34 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     }
 
 
-
-
-    // 🌟 組合完整路徑： D:\EtherCAT_Master_Data\NC_Program\test.nc
-    std::string fullNcPath = GlobalConfig::GetInstance().NCProgramDir + "test.nc";
-    DEBUG_PRINT("[NC] Preparing to load file: %s\n", fullNcPath.c_str());
-
-    // 🌟 交給 NCManager 去讀檔
-    if (m_NC->LoadProgram(fullNcPath))
-    {
-        // 載入成功，啟動加工
-        m_NC->CycleStart();
-    }
-    else
-    {
-        DEBUG_PRINT("[Error] Failed to load NC file; please check if %s exists!\n", fullNcPath.c_str());
-    }
-
-
     
+    //共享記憶體初始化-------------------------------------------
+    SHMManager::GetInstance().Initialize("EDM_SINKER_MODE");
+    SHM_Data* pShm = SHMManager::GetInstance().GetData();// 把指針交給 NCManager
+
+
+    //載入初始NC檔案---------------------------------------------------------------------
+    std::string Initial_NcPath = GlobalConfig::GetInstance().NCProgramDir + "Null.nc";
+    m_NC->LoadProgram(Initial_NcPath);
+   
+
+    AlarmManager::GetInstance().Trigger((int)AlarmManager::NCAlarm::SYNTAX_ERROR);
+
     //主控迴圈-------------------------------------------------------------
     while (1)
     {
       
-        // 1. 睡 10ms (更省資源)
+       
         RtSleep(10);
+        HMI_Bridge::ProcessTask(m_NC);//共享記憶體作業
         m_NC->ProcessTask();//NC系統作業呼叫
 
 
-        // 2. 補償 Tick
-        // 10ms = 10,000us = 40 * 250us
-        // 所以一次加 40
         tickCount_RunRealTimeCycle += 40;
-
-
         timer_10ms += 10;
         timer_100ms += 10;
         timer_1000ms += 10;
         Debug_test_timer += 10; // 測試專用時間軸 
-
-       
-
 
 
         //1s

@@ -9,6 +9,14 @@
 #include <queue>
 #include <vector>
 #include <string>
+#include <map>                 // 🌟 補上 map，因為跳躍表 m_jumpTable 會用到
+
+class NCManager;
+
+// 🌟 終極解法：定義一個「檢查條件」的函數指標。
+// 回傳 true 代表條件滿足 (等待結束)，false 代表繼續等
+using WaitConditionFunc = bool (*)(NCManager* nc);
+
 class NCManager {
 public:
     NCManager(MotionCore& motion);
@@ -31,13 +39,33 @@ public:
     // 4. 核心執行緒 (放在 Main Loop 執行)
     void ProcessTask();
 
+    // ======================================================
+    // 🌟 5. 新增：資源存取介面 (讓外部的 Handler 檔案可以操作系統資源)
+    // ======================================================
+    MotionCore& GetMotion() { return m_motion; }
+
+    // 開放 Ticks 讓外部檢查函式可以使用
+    int GetDwellTicks() const { return m_dwellTicks; }
+    void SetDwellTicks(int ticks) { m_dwellTicks = ticks; }
+
+    int GetSimulatedTicks() const { return m_simulatedTicks; }
+    void SetSimulatedTicks(int ticks) { m_simulatedTicks = ticks; }
+
+    CoordinateManager& GetCoordSys() { return CoordSys; }
+
     // --- 子系統 ---
     CoordinateManager CoordSys;
     MacroEngine MacroSys;       // 變數引擎
     MacroParser MathParser;     // 🌟 2. 補上數學解譯器 (夾在中間)
     GCodeParser Parser;         // 字串翻譯官
 
-private:
+    // ⚠️ 註解掉舊的 ExecState，因為我們已經全面採用頂端的 WaitState 來做狀態機了
+    // enum class ExecState { RUNNING, WAITING_DWELL, WAITING_SYNC };
+    // ExecState m_execState = ExecState::RUNNING;
+
+public:
+    uint32_t NC_RunCount;//NC執行迴圈數
+    uint32_t API_RunCount;//API執行迴圈數
     MotionCore& m_motion;
 
     NCOperationMode m_mode = NCOperationMode::MANUAL;
@@ -51,10 +79,15 @@ private:
     std::map<int, int> m_jumpTable;
     int m_programPC = 0;                  // Program Counter (目前跑到第幾行)
 
-
     // NC 指令緩衝區
     std::queue<NCBlock> m_blockQueue;
 
     // 內部執行功能
     void ExecuteBlock(const NCBlock& block);
+
+    // 🌟 替換：捨棄 Enum，改用統一的檢查回呼函式
+    WaitConditionFunc m_waitCallback = nullptr;
+
+    int m_simulatedTicks = 0; // (測試用) 模擬馬達跑了多久
+    int m_dwellTicks = 0;     // (測試用) G04 的倒數計時器
 };

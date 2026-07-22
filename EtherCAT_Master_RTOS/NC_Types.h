@@ -17,7 +17,8 @@ enum class NCState {
     RUN,        // 執行中
     P_END,      // 程式結束 (M30)
     HOLD,       // 暫停狀態 (Feed Hold)
-    RESET_STATE // 系統重置中
+    RESET_STATE, // 系統重置中
+    ALARM        //系統錯誤
 };
 
 // 3. EDM 設備狀態

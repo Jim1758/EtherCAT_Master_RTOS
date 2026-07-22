@@ -1,4 +1,5 @@
 ﻿#include "GCodeParser.h"
+#include "AlarmManager.h"
 #include <cctype>
 
 GCodeParser::GCodeParser(MacroParser& macroParser) : m_macroParser(macroParser) {}
@@ -76,6 +77,13 @@ NCBlock GCodeParser::ParseLine(const std::string& line) {
 
         block.isEmpty = false;
         double val = m_macroParser.Evaluate(currentValueStr);
+
+        // 🌟 檢查解析是否失敗 (這需要你在 MacroParser 加入簡單的驗證)
+        if (val == 0.0 && currentValueStr != "0") {
+            AlarmManager::GetInstance().Trigger((int)AlarmManager::NCAlarm::SYNTAX_ERROR);
+            return; // 終止處理這行
+        }
+
 
         if (currentAddress == 'G') {
             // 限制：只有第一個 G 碼會被收錄

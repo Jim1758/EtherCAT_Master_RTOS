@@ -61,6 +61,24 @@
     <Filter Include="Source Files\NC">
       <UniqueIdentifier>{8193ac67-c673-43dc-92e7-c7cd1289c5ca}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\Alarm">
+      <UniqueIdentifier>{a60dc271-a96d-4a53-868e-3b0225c871a7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Alarm">
+      <UniqueIdentifier>{e177f209-749c-4f19-9d1d-565a3dece765}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NC\GM_Code">
+      <UniqueIdentifier>{c61de2a5-913d-4d5a-b6f2-b055e706b554}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\NC\GM_Code">
+      <UniqueIdentifier>{dbd845fc-d7e5-49d8-94c2-100c1b5fbaad}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\API">
+      <UniqueIdentifier>{54575cae-57b4-4a68-af3b-36a1be2a4c24}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\API">
+      <UniqueIdentifier>{6177dcb1-e0c8-41e5-92bf-1fa6605b9283}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
@@ -119,6 +137,27 @@
     </ClCompile>
     <ClCompile Include="CoordinateManager.cpp">
       <Filter>Source Files\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="AlarmManager.cpp">
+      <Filter>Source Files\Alarm</Filter>
+    </ClCompile>
+    <ClCompile Include="G00.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="G04.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="MCode.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="GCode.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="SHMManager.cpp">
+      <Filter>Source Files\API</Filter>
+    </ClCompile>
+    <ClCompile Include="HMI_Bridge.cpp">
+      <Filter>Source Files\API</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -181,6 +220,21 @@
     </ClInclude>
     <ClInclude Include="GCodeParser.h">
       <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="AlarmManager.h">
+      <Filter>Header Files\Alarm</Filter>
+    </ClInclude>
+    <ClInclude Include="GMCodeHandlers.h">
+      <Filter>Header Files\NC\GM_Code</Filter>
+    </ClInclude>
+    <ClInclude Include="SHM_Types.h">
+      <Filter>Header Files\API</Filter>
+    </ClInclude>
+    <ClInclude Include="SHMManager.h">
+      <Filter>Header Files\API</Filter>
+    </ClInclude>
+    <ClInclude Include="HMI_Bridge.h">
+      <Filter>Header Files\API</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

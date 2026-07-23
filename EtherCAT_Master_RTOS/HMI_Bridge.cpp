@@ -21,7 +21,17 @@ namespace HMI_Bridge
         pShm->NC_Status.SHM_NC_RunCount = nc->NC_RunCount;//NC執行迴圈數
         pShm->NC_Status.SHM_NC_State = static_cast<int32_t>(nc->m_state);//NC狀態
         pShm->NC_Status.SHM_EDM_State = static_cast<int32_t>(nc->m_edmState);//EDM設備狀態
-        pShm->NC_Status.SHM_CurrentLine = nc->m_programPC;//目前NC執行到第幾行
+      
+
+        // 🌟 主程式狀態同步 (使用 strncpy 確保不會記憶體溢位)
+        std::strncpy(pShm->NC_Status.mainProgName, nc->m_mainProgramName.c_str(), 63);
+        pShm->NC_Status.mainProgName[63] = '\0'; // 保證結尾安全
+        pShm->NC_Status.mainCurrentLine = nc->m_programPC;
+
+        // 🌟 副程式狀態同步
+        std::strncpy(pShm->NC_Status.macroProgName, nc->m_macroProgramName.c_str(), 63);
+        pShm->NC_Status.macroProgName[63] = '\0'; // 保證結尾安全
+        pShm->NC_Status.macroCurrentLine = nc->m_macroProgramPC;
 
 
        //警報區塊-----------------------------------------------------------
@@ -42,6 +52,29 @@ namespace HMI_Bridge
 
             // 最後才更新計數器，確保 C# 讀到新計數器時，陣列已經拷貝完畢
             pShm->Alarm_Status.alarmUpdateCount = currentUpdateCount;
+        }
+
+
+        // ==========================================
+    // 1. 處理 C# HMI 的「寫入變數」請求
+    // ==========================================
+        if (pShm->varCmd.writeReq) {
+            nc->MacroSys.SetVar(pShm->varCmd.prefix, pShm->varCmd.index, pShm->varCmd.writeValue);
+            pShm->varCmd.writeReq = false; // 處理完畢，降下旗標
+        }
+
+        // ==========================================
+        // 2. 狀態全廣播：把 18KB 資料直接 memcpy 倒進去
+        // ==========================================
+        pShm->macroStatus.currentCallDepth = nc->MacroSys.GetCurrentDepth();
+
+        // 複製全域與系統變數 (直接用 sizeof 算出大小，極速複製)
+        memcpy(pShm->macroStatus.globalVars, nc->MacroSys.GetGlobalVarsArray(), sizeof(pShm->macroStatus.globalVars));
+        memcpy(pShm->macroStatus.sysVars, nc->MacroSys.GetSysVarsArray(), sizeof(pShm->macroStatus.sysVars));
+
+        // 複製目前的 8 層區域變數
+        for (int i = 0; i < 8; i++) {
+            memcpy(pShm->macroStatus.localVars[i], nc->MacroSys.GetLocalVarsArray(i), sizeof(double) * 101);
         }
       
         // 命令區塊-----------------------------------------------------------
@@ -92,6 +125,17 @@ namespace HMI_Bridge
             std::memset(pShm->NC_Command.loadprogramName, 0, sizeof(pShm->NC_Command.loadprogramName));//清空
             
         }
+
+        if (pShm->NC_Command.Close_System)//關閉核心系統命令
+        {
+            if (nc != nullptr)
+            {
+                nc->Close_System_Com_flag = true;       
+            }
+            pShm->NC_Command.Close_System = false;//收到命令後清除
+        }
+
+       
     }
 
 }

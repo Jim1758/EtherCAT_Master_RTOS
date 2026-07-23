@@ -1,7 +1,7 @@
 ﻿#include "GCodeParser.h"
 #include "AlarmManager.h"
 #include <cctype>
-
+#include <cstdlib> // 🌟 新增：為了使用標準且安全的 strtod
 GCodeParser::GCodeParser(MacroParser& macroParser) : m_macroParser(macroParser) {}
 
 bool GCodeParser::IsMathKeyword(const std::string& str, size_t pos) {
@@ -21,7 +21,7 @@ NCBlock GCodeParser::ParseLine(const std::string& line) {
         return block;
     }
 
-    // 2. 清除註解與空白 (利用你寫好的 MacroParser 功能)
+    // 2. 清除註解與空白
     std::string clean = MacroParser::CleanExpression(line);
     if (clean.empty()) return block;
 
@@ -34,83 +34,99 @@ NCBlock GCodeParser::ParseLine(const std::string& line) {
     }
 
     // ==========================================
-    // 🌟 新增：攔截 GOTO 與 IF 指令
+    // 🌟 攔截 GOTO 與 IF 指令
     // ==========================================
     size_t gotoPos = clean.find("GOTO");
     if (gotoPos != std::string::npos) {
         bool shouldJump = true;
         size_t ifPos = clean.find("IF");
 
-        // 處理 IF 條件判斷，例如：IF(#1<30)GOTO10
+        // 處理 IF 條件判斷
         if (ifPos != std::string::npos && ifPos < gotoPos) {
-            // 擷取 IF 和 GOTO 中間的算式： "(#1<30)"
             std::string condition = clean.substr(ifPos + 2, gotoPos - (ifPos + 2));
-
-            // 丟給算術大腦計算，如果結果為 0 代表 false，就不跳躍
             if (m_macroParser.Evaluate(condition) == 0.0) {
                 shouldJump = false;
             }
         }
 
-        // 如果條件成立 (或是純 GOTO 指令)
+        // 條件成立或純 GOTO
         if (shouldJump) {
             std::string targetStr = clean.substr(gotoPos + 4);
             block.isGoto = true;
             block.gotoTarget = (int)m_macroParser.Evaluate(targetStr);
             block.isEmpty = false;
-            return block; // 這是跳躍指令，後面的 G 碼不看了，直接回傳
+            return block;
         }
         else {
-            return block; // 條件不成立，忽略這行
+            return block;
         }
     }
 
-
     // 4. 字碼掃描與解析 (Lexer)
-    char currentAddress = '\0';
+    char currentAddress = '�';
     std::string currentValueStr = "";
-    int parenDepth = 0; // 追蹤括號深度
+    int parenDepth = 0;
 
     // Lambda 函數：結算當前的 Word
     auto ProcessWord = [&]() {
-        if (currentAddress == '\0' || currentValueStr.empty()) return;
-
-        block.isEmpty = false;
-        double val = m_macroParser.Evaluate(currentValueStr);
-
-        // 🌟 檢查解析是否失敗 (這需要你在 MacroParser 加入簡單的驗證)
-        if (val == 0.0 && currentValueStr != "0") {
-            AlarmManager::GetInstance().Trigger((int)AlarmManager::NCAlarm::SYNTAX_ERROR);
-            return; // 終止處理這行
+        // 清除字串尾部的隱形字元
+        while (!currentValueStr.empty() && std::isspace(currentValueStr.back())) {
+            currentValueStr.pop_back();
         }
 
+        if (currentAddress == '�' || currentValueStr.empty()) return;
 
+        block.isEmpty = false;
+        double val = 0.0;
+
+        // 智慧分流：是純數字，還是巨集算式？
+        bool isMacro = (currentValueStr.find('[') != std::string::npos ||
+            currentValueStr.find('#') != std::string::npos ||
+            std::isalpha(currentValueStr[0]));
+
+        if (!isMacro) {
+            // 純數值：使用 RTOS 最安全的 strtod 進行解析與防呆
+            char* endPtr = nullptr;
+            val = std::strtod(currentValueStr.c_str(), &endPtr);
+
+            if (endPtr == currentValueStr.c_str()) {
+                AlarmManager::GetInstance().Trigger(AlarmManager::SYNTAX_ERROR);
+                return;
+            }
+        }
+        else {
+            // 巨集算式：交給巨集大腦去解
+            val = m_macroParser.Evaluate(currentValueStr);
+        }
+
+        // 🌟 處理 G 碼 (重點修改區)
         if (currentAddress == 'G') {
-            // 限制：只有第一個 G 碼會被收錄
-            if (!block.hasG) {
+            if (block.gCount < 10) {
+                block.gCodes[block.gCount] = (int)val;
+            }
+
+            // 記錄這行的第一個 G 碼為主要 gCode
+            if (block.gCount == 0) {
                 block.hasG = true;
                 block.gCode = (int)val;
             }
-            else {
-                // 你可以在這裡加入警告，例如：
-                // DEBUG_PRINT("格式錯誤：同一行只能有一個 G 碼！\n");
-            }
+            block.gCount++; // 每次讀到 'G'，計數器就 +1
         }
+        // 處理 M 碼
         else if (currentAddress == 'M') {
-            // 限制：最多收 3 個 M 碼
             if (block.mCount < 3) {
                 block.mCode[block.mCount] = (int)val;
                 block.mCount++;
             }
         }
+        // 處理 A~Z
         else if (currentAddress >= 'A' && currentAddress <= 'Z') {
-            // A~Z (包含 X, Y, Z, F, E, B 等等) 全部自動存入陣列
             int index = currentAddress - 'A';
             block.hasParam[index] = true;
             block.param[index] = val;
         }
 
-        currentAddress = '\0';
+        currentAddress = '�';
         currentValueStr = "";
     };
 
@@ -121,21 +137,17 @@ NCBlock GCodeParser::ParseLine(const std::string& line) {
         if (c == '(' || c == '[') parenDepth++;
         if (c == ')' || c == ']') parenDepth--;
 
-        // 如果我們不在括號內，且遇到英文字母
         if (parenDepth == 0 && std::isalpha(c)) {
-            // 檢查它是不是數學函數 (例如 SIN)，如果是，它屬於 Value 的一部分
             if (IsMathKeyword(clean, i)) {
                 currentValueStr += c;
             }
             else {
-                // 發現新的控制字母 (例如 X, Y, G)
-                ProcessWord(); // 先結算上一個收集完的 Word
+                ProcessWord();
                 currentAddress = c;
             }
         }
         else {
-            // 數字、符號、括號內的字母，通通塞進 Value 裡面
-            if (currentAddress != '\0') {
+            if (currentAddress != '�') {
                 currentValueStr += c;
             }
         }

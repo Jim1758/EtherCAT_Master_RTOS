@@ -39,6 +39,10 @@ struct NCBlock {
     bool isGoto = false;
     int gotoTarget = -1;
 
+    // 🌟 2. 擴充：支援多個 G 碼檢查
+    int gCount = 0;
+    int gCodes[10] = { 0 }; // 預留空間存這行出現的所有 G 碼
+
     bool hasG = false;
     int gCode = -1;
 

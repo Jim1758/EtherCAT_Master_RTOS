@@ -30,7 +30,12 @@ public:
     enum NCAlarm {
         SYNTAX_ERROR = NC_BASE + 1,  // 2001: 語法錯誤
         MATH_ERROR = NC_BASE + 2,  // 2002: 數學或巨集計算錯誤
-        GOTO_NOT_FOUND = NC_BASE + 3   // 2003: 找不到跳躍的 N 行號
+        GOTO_NOT_FOUND = NC_BASE + 3,   // 2003: 找不到跳躍的 N 行號
+        MACRO_OVERFLOW = NC_BASE + 4,   // 2004:超過最大層數
+        Macro_File_Not_Found = NC_BASE + 5,   // 2005:Macro找不到 檔案
+        Unable_to_recognize_G_code = NC_BASE + 6,   // 2006:無法辨識G碼
+        G_code_Count_Error = NC_BASE + 7,   // 2007:單行G碼超過1個
+        M_code_Count_Error = NC_BASE + 8,   // 2008:單行M碼超過1個
     };
 
     // 🌟 4. 運動軸控警報 (3000 ~ 3999)

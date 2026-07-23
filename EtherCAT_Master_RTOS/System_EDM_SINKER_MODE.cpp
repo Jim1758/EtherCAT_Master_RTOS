@@ -93,12 +93,17 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     m_NC->LoadProgram(Initial_NcPath);
    
 
-    AlarmManager::GetInstance().Trigger((int)AlarmManager::NCAlarm::SYNTAX_ERROR);
-
+  
     //主控迴圈-------------------------------------------------------------
     while (1)
     {
       
+        if (m_NC->Close_System_Com_flag == true)//關閉核心命令
+        {
+            SHMManager::GetInstance().Shutdown();//關閉共享記憶體
+            DEBUG_PRINT("Close System！\n");
+            return 0;
+        }
        
         RtSleep(10);
         HMI_Bridge::ProcessTask(m_NC);//共享記憶體作業

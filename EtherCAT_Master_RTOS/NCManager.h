@@ -10,7 +10,7 @@
 #include <vector>
 #include <string>
 #include <map>                 // 🌟 補上 map，因為跳躍表 m_jumpTable 會用到
-
+#include <stack>               // 🌟 新增：為了支援副程式返回堆疊
 class NCManager;
 
 // 🌟 終極解法：定義一個「檢查條件」的函數指標。
@@ -27,6 +27,10 @@ public:
 
     // 🌟 新增功能：載入 NC 程式檔
     bool LoadProgram(const std::string& filepath);
+
+    // 🌟 新增：呼叫與返回副程式的介面
+    bool CallMacro(const std::string& filename);
+    void ReturnMacro();
 
     // 2. 指令交握介面 (給 HMI 人機介面呼叫的)
     void CycleStart();  // 按下啟動鍵
@@ -45,8 +49,9 @@ public:
     MotionCore& GetMotion() { return m_motion; }
 
     // 開放 Ticks 讓外部檢查函式可以使用
-    int GetDwellTicks() const { return m_dwellTicks; }
-    void SetDwellTicks(int ticks) { m_dwellTicks = ticks; }
+    void SetG04TimeMs(double ms) { m_G04_TimeMs = ms; }
+    double GetG04TimeMs() const { return m_G04_TimeMs; }
+
 
     int GetSimulatedTicks() const { return m_simulatedTicks; }
     void SetSimulatedTicks(int ticks) { m_simulatedTicks = ticks; }
@@ -72,6 +77,30 @@ public:
     NCState m_state = NCState::NOT_READY;
     EDMState m_edmState = EDMState::NOT_READY;
 
+    bool Close_System_Com_flag = 0;//關閉核心命令
+
+    // 🌟 新增：主程式與副程式追蹤變數
+    std::string m_mainProgramName = "";
+    std::string m_macroProgramName = "";
+    int m_macroProgramPC = -1; // -1 代表目前沒有在執行副程式
+ 
+
+  // ==========================================
+    // 🌟 新增：多層副程式 (Macro) 執行框架結構
+    // ==========================================
+    struct MacroFrame {
+        std::string programName;            // 這層副程式的檔名 (例如 O1234.nc)
+        std::vector<std::string> memory;    // 這層副程式的程式碼內容
+        int currentPC;                      // 這層目前跑到第幾行
+        int returnPC;                       // 執行完 M99 要回傳給上一層的行號
+    };
+
+    // 🌟 這是解決錯誤的關鍵：用來儲存最多 8 層的副程式堆疊
+    // (請把舊的 m_macroMemory 和 m_returnStack 刪掉，換成這個)
+    std::vector<MacroFrame> m_macroStack;
+
+    bool m_programChanged = false;          // 🌟 標記是否發生了程式跳轉 (M98/M99)
+
     // 🌟 修改：現在記憶體存的是「原始字串」，以支援執行時動態計算
     std::vector<std::string> m_programMemory;
 
@@ -89,5 +118,6 @@ public:
     WaitConditionFunc m_waitCallback = nullptr;
 
     int m_simulatedTicks = 0; // (測試用) 模擬馬達跑了多久
-    int m_dwellTicks = 0;     // (測試用) G04 的倒數計時器
+    double m_G04_TimeMs = 0.0;
+
 };

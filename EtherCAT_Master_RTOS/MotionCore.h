@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <queue> // 引入佇列函式庫
 #include <deque>
+#include "CoordinateManager.h"
 constexpr int MAX_AXES = 8;//最大軸數宣告
 const double CYCLE_TIME_SEC = 0.00025;// EtherCAT 通訊週期 (250us)
 
@@ -62,7 +63,14 @@ struct PidConfig// PID 參數與保護設定
     double prevError = 0.0;    // 上一次的誤差
     double integralAcc = 0.0;  // 積分累積值
 };
-
+// ==========================================
+// 🌟 1. 新增：軸型態列舉
+// ==========================================
+enum class AxisType {
+    LINEAR=0,           // 直線軸 (單位 mm)
+    ROTARY=1,       // 旋轉軸 (單位 Degree，0~360 循環，走最短路徑)
+    ROTARY_CONTINUOUS=2 // 連續旋轉軸 (例如主軸，一直累加不歸零)
+};
 
 
 struct AxisContext//軸參數與狀態
@@ -108,12 +116,12 @@ struct AxisContext//軸參數與狀態
 
     //即時動態座標-------------------------------------------------
     double planningPos;// 虛擬大腦的理想位置 (未經 S-Curve 濾波的粗糙折線)
-    double currentCmdPos = 0.0;// 濾波後的最終命令位置 (要餵給 PID 的理論位置)
+    double currentCmdPos = 0.0;// 濾波後的最終命令位置 (要餵給 PID 的理論位置)  是給底層 PID 追隨用的（經過加減速濾波的最終點）。
     double currentCmdVel = 0.0;// 濾波後的最終命令速度 (要餵給驅動器的前饋速度)
     double currentActPos = 0.0;// 實際馬達回授的真實位置
 
     // 🟢 [新增] 大腦專用的邏輯座標與速度 (G68 計算用)
-    double logicalCmdPos = 0.0;
+    double logicalCmdPos = 0.0;//是給上層 NC 大腦思考用的（它是還原了 G68 空間旋轉、補正後的純邏輯點）。
     double logicalCmdVel = 0.0;
 
     //機台狀態旗標-------------------------------------------------
@@ -141,6 +149,13 @@ struct AxisContext//軸參數與狀態
     double motionTime = 0.0;   // 紀錄這段移動「走了幾秒」
     double moveDir = 1.0;      // 移動方向 (1.0 或 -1.0)
     double programmedVel_PPS = 0.0; // 🟢 [新增] 紀錄下單時的原始目標速度
+
+    // ==========================================
+    // 🌟 2. 新增：軸型態與物理特性設定
+    // ==========================================
+    AxisType axisType = AxisType::LINEAR; // 預設為直線軸
+    double rotaryModulo = 360.0;          // 旋轉一圈的單位 (預設 360度)
+    bool useShortestPath = true;          // 旋轉軸是否走最短路徑 (0=否, 1=是)
 };
 
 enum class InterpolationMode//插補群組的導航模式
@@ -420,13 +435,16 @@ class MotionCore
 public:
     MotionCore();
 
-
+    
+    
+ 
 
     //系統關聯與連結--------------------------------------------------------------------
-    
+    CoordinateManager* m_pCoordMgr = nullptr;
+
     void Link(std::vector<ENI_ServoDrive>* pAxisList);// 連結實體驅動器列表 (EtherCAT 映射資料)
     void Link(std::vector<ENI_ServoDrive>* pDriveList, std::vector<AxisContext>* pContextList);// 連結實體驅動器與邏輯參數上下文 (Context)
-
+    void LinkCoordinateManager(CoordinateManager* pCoord);
 
 
     //軸狀態
@@ -507,6 +525,10 @@ public:
     // 🌟 新增：讓 NC 系統查詢底層插補狀態
     bool IsGroupQueueFull() const { return m_Group.cmdQueue.size() >= 100; } // 預讀 100 行
     bool IsGroupDone() const { return !m_Group.isActive && m_Group.cmdQueue.empty(); }
+
+
+
+    double CalculateShortestTarget(double currentPos, double targetPos, double modulo);
    
 private:
    

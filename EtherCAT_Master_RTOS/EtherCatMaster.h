@@ -133,7 +133,7 @@ int Motor_Start_Index = -1;
 // 這樣所有 #include "EtherCatMaster.h" 的 .cpp 檔案，都會知道有這兩個函數存在！
 void RTAPI GlobalTimerHandler_PDO(void* nContext);
 void RTAPI GlobalTimerHandler_PLC(void* nContext);
-
+class CoordinateManager;
 class EtherCatMaster
 {
 public:
@@ -141,7 +141,11 @@ public:
     ~EtherCatMaster();
 
    
-    
+    // 🌟 2. 新增綁定 API
+    void LinkCoordinateManager(CoordinateManager* pCoord);
+
+    // 🌟 3. 新增指標變數 (預設設為 nullptr 防呆)
+    CoordinateManager* pCoordMgr = nullptr;
   
 
     //EtherCAT  Function

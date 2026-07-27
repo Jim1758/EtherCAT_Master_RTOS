@@ -96,8 +96,8 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
    
     //坐標系初始化
     m_NC->CoordSys.SetWCS(m_NC->CoordSys.GetCurrentWCSGCode(), m_NC);
-  
-
+    this->pCoordMgr = &(m_NC->CoordSys);
+    m_Motion.LinkCoordinateManager(&(m_NC->CoordSys));
   
     //主控迴圈-------------------------------------------------------------
     while (1)

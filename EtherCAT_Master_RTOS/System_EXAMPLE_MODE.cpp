@@ -279,48 +279,8 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
                     {
                         uint16_t statusWord = servo.pInput->StatusWord;
 
-                        // --- 設定運作模式 (CSV 速度模式) ---
-                        servo.pOutput->ModesOfOperation = 9;
-                        //servo.pOutput->TargetVelocity = 0;   // 安全起見，速度先設為 0
-
-                        // ==========================================
-                        // CiA 402 自動激磁流程 (Auto Servo On Logic)
-                        // ==========================================
-
-                        // 1. 檢查是否有 Fault (Bit 3)
-                        if ((statusWord & 0x0008) != 0)
-                        {
-                            // 有故障，發送 Fault Reset
-                            servo.pOutput->ControlWord = 0x0080;
-                            DEBUG_PRINT("State: Fault -> Resetting...\n");
-                        }
-                        // 2. 檢查是否 "Switch On Disabled" (還沒準備好)
-                        // Mask: 0x004F, Value: 0x0040
-                        else if ((statusWord & 0x004F) == 0x0040)
-                        {
-                            // 發送 Shutdown -> 進入 Ready to Switch On
-                            servo.pOutput->ControlWord = 0x0006;
-                            DEBUG_PRINT("State: Switch On Disabled -> Sending 0x0006\n");
-                        }
-                        // 3. 檢查是否 "Ready to Switch On" (準備好了)
-                        // Mask: 0x006F, Value: 0x0021
-                        else if ((statusWord & 0x006F) == 0x0021)
-                        {
-                            // 發送 Switch On -> 進入 Switched On
-                            servo.pOutput->ControlWord = 0x0007;
-                            DEBUG_PRINT("State: Ready to Switch On -> Sending 0x0007\n");
-                        }
-                        // 4. 檢查是否 "Switched On" (電路已開，等待激磁)
-                        // Mask: 0x006F, Value: 0x0023
-                        else if ((statusWord & 0x006F) == 0x0023)
-                        {
-                            // 發送 Enable Operation -> 激磁！
-                            servo.pOutput->ControlWord = 0x000F;
-                            DEBUG_PRINT("State: Switched On -> Sending 0x000F (Enable!)\n");
-                        }
-                        // 5. 檢查是否 "Operation Enabled" (已激磁成功)
-                        // Mask: 0x006F, Value: 0x0027
-                        else if ((statusWord & 0x006F) == 0x0027)
+                     
+                        if ((statusWord & 0x006F) == 0x0027)
                         {
                             // 已經激磁成功，維持 0x000F
                             servo.pOutput->ControlWord = 0x000F;

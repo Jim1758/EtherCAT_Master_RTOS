@@ -2,6 +2,7 @@
 #include <algorithm> // for std::abs, std::sqrt, std::max, std::min
 #include <iostream>  // for debug prints if needed
 #include "EtherCatMaster.h"
+#include "CoordinateManager.h"
 MotionCore::MotionCore() {}
 
 
@@ -96,7 +97,11 @@ void MotionCore::InitSmoothBuffer(AxisContext& axis, double smoothTime_ms)
     axis.bufferSum = 0.0;
     axis.smoothTime_ms = smoothTime_ms;
 }
-
+// 🌟 實作綁定函式
+void MotionCore::LinkCoordinateManager(CoordinateManager* pCoord)
+{
+    m_pCoordMgr = pCoord;
+}
 // 檔案：MotionCore.cpp
 void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 {
@@ -116,7 +121,35 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     {
         // 呼叫原本寫好的單軸更新邏輯
         UpdateMotion((*m_pDrives)[i], (*m_pContexts)[i]);
+        UpdateServoState((*m_pDrives)[i], (*m_pContexts)[i]);
+
+
     }
+
+
+    //座標轉換：直接使用內部的 m_pCoordMgr 指標
+  
+    if (m_pCoordMgr != nullptr)
+    {
+        double tempMCS[8] = { 0.0 };
+
+        for (size_t i = 0; i < 8; ++i)
+        {
+            if (i < m_pContexts->size())
+            {
+                double rawPulse = (*m_pContexts)[i].currentActPos;
+                double pulsePerMm = (*m_pContexts)[i].resolution_PPR / 10.0;
+                tempMCS[i] = rawPulse / pulsePerMm;
+            }
+            else
+            {
+                tempMCS[i] = 0.0;
+            }
+        }
+
+        m_pCoordMgr->UpdateActualMCS(tempMCS);
+    }
+    // ========================================================
 }
 void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更新單軸狀態 逐步激磁
 {
@@ -165,6 +198,23 @@ void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更
         // 若狀態未知或正在切換中，維持原本指令或歸零
         axis.isServoOn = false;
     }
+}
+
+double MotionCore::CalculateShortestTarget(double currentPos, double targetPos, double modulo)
+{
+    // 1. 計算目標與當前的純差值
+    double diff = fmod(targetPos - currentPos, modulo);
+
+    // 2. 處理 C++ fmod 負數的問題
+    if (diff < -modulo / 2.0) {
+        diff += modulo;
+    }
+    else if (diff > modulo / 2.0) {
+        diff -= modulo;
+    }
+
+    // 3. 回傳展開後的「絕對連續目標位置」
+    return currentPos + diff;
 }
 
 void MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time)
@@ -683,24 +733,43 @@ template <typename DriveType>
 void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
 {
 
-
     // 0. 檢查 EtherCAT 狀態 (必須 Servo On 且 Mode 9)
+
     // 0x0027 = Operation Enabled
+
+
+    axis.currentActPos = (double)servo.pInput->ActualPosition;
+
     bool isServoOn = (servo.pInput->StatusWord & 0x0027) == 0x0027;
+
     int opMode = servo.pInput->ModesOfOperationDisplay;
 
+
+
     // 若未激磁或不在 CSV 模式，只做狀態追隨，不運算
+
     if (!isServoOn || opMode != 9) {
+
         // 將規劃位置重置為實際位置，避免下次啟動暴衝
-        axis.currentCmdPos = (double)servo.pInput->ActualPosition;
-        axis.logicalCmdPos = axis.currentCmdPos; // 🟢 同步邏輯座標
+
+        axis.currentCmdPos = axis.currentActPos;//是給底層 PID 追隨用的（經過加減速濾波的最終點）。
+
+        axis.logicalCmdPos = axis.currentCmdPos; //給上層 NC 大腦思考用的（它是還原了 G68 空間旋轉、補正後的純邏輯點）。
+
         axis.currentCmdVel = 0.0;
+
         axis.logicalCmdVel = 0.0; // 🟢 同步邏輯速度
+
         axis.pid.integralAcc = 0.0;
+
         axis.state = MotionState::MotionState_IDLE;
+
         servo.pOutput->TargetVelocity = 0;
+
         return;
+
     }
+
 
     // 若故障，鎖死輸出
     if (axis.isFault) {

@@ -1292,7 +1292,10 @@ void EtherCatMaster::Set_O(int ioListIdx, int bitIdx, bool val)
         m_IoList[ioListIdx].outBuffer[bytePos] &= ~(1 << bitPos); // Clear
 }
 
-
+void EtherCatMaster::LinkCoordinateManager(CoordinateManager* pCoord)
+{
+    pCoordMgr = pCoord;
+}
 
 //PDO 中斷作業----------------------------------------------------------
 void RTAPI GlobalTimerHandler_PDO(void* nContext)
@@ -1402,44 +1405,6 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         // 2.優化後的寫法：一行搞定激磁、PID、伺服控制
         // 這裡面已經包含了你 UpdateServoState 的邏輯
         pMaster->m_Motion.UpdateAllMotion();
-
-
-        // 確保有馬達且軸參數已建立
-        size_t servoCount = pMaster->m_ServoList.size();
-        size_t axisCount = pMaster->m_Axes.size();
-
-        // 取兩者最小值，防止當機 (Safety)
-        size_t count = (servoCount < axisCount) ? servoCount : axisCount;
-
-        // [核心] 多軸同步控制迴圈
-        
-        for (size_t i = 0; i < count; ++i)
-        {
-
-            // --- [新增監視點] ---
-    // 我們只看正在插補的軸 (State == 4)
-            if (pMaster->m_Axes[i].state == MotionState::MotionState_INTERPOLATING)
-            {
-                static int div_main = 0;
-                if (div_main++ % 100 == 0)
-                {
-                    /*
-                    DEBUG_PRINT("[MAIN_LOOP] Axis %d | State: %d | CmdPos: %d | Vel: %d\n",
-                        (int)i,
-                        (int)pMaster->m_Axes[i].state,
-                        (int)pMaster->m_Axes[i].currentCmdPos,
-                        (int)pMaster->m_Axes[i].currentCmdVel);
-                        */
-                }
-            }
-            // -------------------
-
-
-
-
-            // 自動對應：第 i 顆馬達 <-> 第 i 組參數
-            pMaster->m_Motion.UpdateMotion(pMaster->m_ServoList[i], pMaster->m_Axes[i]);
-        }
 
 
    

@@ -37,6 +37,8 @@ public:
 
     std::string BaseDataDir = "D:\\EtherCAT_Master_Data\\";
     std::string NCProgramDir = BaseDataDir + "NC_Program\\";
+    std::string NCMacroProgramDir = BaseDataDir + "NC_Macro\\";
+    std::string NCDataDir = BaseDataDir + "Data\\";
     // ==========================================
     // 載入函數：負責去讀取 txt 檔並填滿變數
     // ==========================================

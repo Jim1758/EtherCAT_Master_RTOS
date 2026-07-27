@@ -243,11 +243,13 @@ public:
 
       int timer_10ms = 0;
      int timer_100ms = 0;
+     int timer_500ms = 0;
      int timer_1000ms = 0;
      int Debug_test_timer = 0;
 
      int timer_10ms_Count = 0;
      int timer_100ms_Count = 0;
+     int timer_500ms_Count = 0;
      int timer_1000ms_Count = 0;
      int Debug_test_timer_Count = 0;
 

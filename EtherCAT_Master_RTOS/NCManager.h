@@ -68,6 +68,29 @@ public:
     // enum class ExecState { RUNNING, WAITING_DWELL, WAITING_SYNC };
     // ExecState m_execState = ExecState::RUNNING;
 
+    // ======================================================
+    // 🌟 動態軸對應系統 (Dynamic Axis Mapping)
+    // ======================================================
+    char m_axisNames[8]; // 開機時從 ini 讀入：{'X','Y','Z','C','U','V','A','W'}
+
+    // 從 D 槽讀取 AXIS_CFG.ini
+    void LoadAxisConfiguration();
+
+    // 🌟 核心 API：傳入英文字母 (如 'X')，回傳它是 0~7 的哪一軸。找不到回傳 -1。
+    int GetAxisIndex(char gcodeLetter) const;
+
+
+    const size_t MAX_MDI_LINES = 20;                        // MDI 模式最大行數
+    const size_t MAX_MANUAL_AUTO_BYTES = 1024 * 1024;       // MANUAL 自動模式最大字串 (1024KB = 1MB)
+
+    // 🌟 模式專用 API
+    bool LoadMDI(const std::string& mdiContent);
+    bool LoadManualAuto(const std::string& manualContent);
+
+    // 🌟 任務分流函式
+    void ProcessExecutionEngine();
+    void ProcessManualMode(); // 只保留純手動 JOG 的部分
+
 public:
     uint32_t NC_RunCount;//NC執行迴圈數
     uint32_t API_RunCount;//API執行迴圈數
@@ -120,4 +143,25 @@ public:
     int m_simulatedTicks = 0; // (測試用) 模擬馬達跑了多久
     double m_G04_TimeMs = 0.0;
 
+
+    // 🌟 MDI 專屬變數
+    std::vector<std::string> m_mdiMemory;
+    int m_mdiPC = 0;
+
+    // 🌟 MANUAL (輕量自動) 專屬變數
+    std::vector<std::string> m_manualMemory;
+    int m_manualPC = 0;
+    bool m_manualAutoRunning = false; // 標記目前是否正在跑 MANUAL 的自動指令
+
+
+    // 🌟 核心設計：動態獲取當前模式的「基準行號」與「基準記憶體」
+    int& GetBasePC();
+    std::vector<std::string>& GetBaseMemory();
+
+    bool LoadDynamicCode(const std::string& content);
+
+    // 🌟 新增：提供給 HMI 狀態廣播用的動態指標
+    int GetActivePC() {
+        return GetBasePC();
+    }
 };

@@ -36,6 +36,7 @@ public:
         Unable_to_recognize_G_code = NC_BASE + 6,   // 2006:無法辨識G碼
         G_code_Count_Error = NC_BASE + 7,   // 2007:單行G碼超過1個
         M_code_Count_Error = NC_BASE + 8,   // 2008:單行M碼超過1個
+        G_Code_Invalid_parameter = NC_BASE + 9,   // 2009:不正確G碼參數
     };
 
     // 🌟 4. 運動軸控警報 (3000 ~ 3999)

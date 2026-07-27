@@ -33,7 +33,7 @@ namespace GCodeHandlers
         }
 
         // 🌟 G04 結束！取得當下的硬體 Ticks
-        /*
+        
         LARGE_INTEGER endTime;
         RtQueryPerformanceCounter(&endTime);
 
@@ -67,7 +67,7 @@ namespace GCodeHandlers
         DEBUG_PRINT(" Actual Elapsed : %d.%03d ms\n", i_elapsed, f_elapsed);
         DEBUG_PRINT(" System Jitter  : %s%d.%03d ms\n", sign, i_error, f_error);
         DEBUG_PRINT("========================================\n");
-        */
+        
         return true;
     }
 

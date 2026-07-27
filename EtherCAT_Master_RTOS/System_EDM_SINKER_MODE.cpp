@@ -87,11 +87,16 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     SHMManager::GetInstance().Initialize("EDM_SINKER_MODE");
     SHM_Data* pShm = SHMManager::GetInstance().GetData();// 把指針交給 NCManager
 
+    //初始化Macro 系統變數
+
 
     //載入初始NC檔案---------------------------------------------------------------------
     std::string Initial_NcPath = GlobalConfig::GetInstance().NCProgramDir + "Null.nc";
     m_NC->LoadProgram(Initial_NcPath);
    
+    //坐標系初始化
+    m_NC->CoordSys.SetWCS(m_NC->CoordSys.GetCurrentWCSGCode(), m_NC);
+  
 
   
     //主控迴圈-------------------------------------------------------------
@@ -100,19 +105,21 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
       
         if (m_NC->Close_System_Com_flag == true)//關閉核心命令
         {
+            m_NC->CoordSys.SaveAllParameters();//儲存座標系統相關參數
             SHMManager::GetInstance().Shutdown();//關閉共享記憶體
             DEBUG_PRINT("Close System！\n");
             return 0;
         }
        
         RtSleep(10);
-        HMI_Bridge::ProcessTask(m_NC);//共享記憶體作業
+        HMI_Bridge::ProcessTask(m_NC);//高速API共享記憶體作業任務
         m_NC->ProcessTask();//NC系統作業呼叫
 
 
         tickCount_RunRealTimeCycle += 40;
         timer_10ms += 10;
         timer_100ms += 10;
+        timer_500ms += 10;   // 🌟 增加 500ms 的計時器累加
         timer_1000ms += 10;
         Debug_test_timer += 10; // 測試專用時間軸 
 
@@ -139,7 +146,16 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         {
             timer_100ms = 0; // 執行完立刻歸零
             timer_100ms_Count += 1;
+            HMI_Bridge::ProcessTask_100ms(m_NC); // 呼叫 100ms 任務
             //DEBUG_PRINT("100ms\n");
+        }
+
+        // 🌟 500ms 新增區塊
+        if (timer_500ms >= 500)
+        {
+            timer_500ms = 0;
+            timer_500ms_Count += 1;
+            HMI_Bridge::ProcessTask_500ms(m_NC); // 呼叫 500ms 任務
         }
 
         //1000ms
@@ -147,6 +163,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         {
             timer_1000ms = 0; // 執行完立刻歸零
             timer_1000ms_Count += 1;
+            HMI_Bridge::ProcessTask_1000ms(m_NC); // 呼叫 1000ms 任務
             //DEBUG_PRINT("1000ms\n");
         }
 

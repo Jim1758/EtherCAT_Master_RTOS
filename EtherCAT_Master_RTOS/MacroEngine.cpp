@@ -3,11 +3,12 @@
 MacroEngine::MacroEngine()
 {
     // 初始化全域與系統變數 (通常只在開機時執行一次)
-    m_globalVars.assign(MAX_GLOBAL_VARS + 1, MACRO_NULL);
+    m_globalVars.assign(MAX_GLOBAL_VARS + 1, 0.0);
     m_sysVars.assign(MAX_SYS_VARS + 1, 0.0); // 系統變數預設為 0
 
     // 初始化區域變數與堆疊
     Reset();
+    InitializeSystemDefaults();//初始化系統 $變數
 }
 
 // 🌟 新增：系統重置 (給 NCManager::Reset 呼叫)
@@ -78,25 +79,32 @@ double MacroEngine::GetVar(char prefix, int index)
 // 寫入變數
 void MacroEngine::SetVar(char prefix, int index, double value)
 {
+    // 🌟 # 前綴：嚴格限制為本地變數 (不允許存取 @ 的區域)
     if (prefix == '#')
     {
-        if (index >= 1 && index <= MAX_LOCAL_VARS) {
+        if (index >= 1 && index <= 100) {
             m_localStack[m_callDepth][index] = value;
         }
-        // 🌟 修正：將 #101 ~ #600 映射到 m_globalVars[1 ~ 500]
-        else if (index >= 101 && index <= 100 + MAX_GLOBAL_VARS) {
-            m_globalVars[index - 100] = value;
-        }
+        // [已移除] 原本對應 globalVars 的判斷
     }
+    // 🌟 @ 前綴：嚴格限制為全域變數 (@1 ~ @1000)
     else if (prefix == '@')
     {
-        if (index >= 1 && index <= MAX_GLOBAL_VARS) m_globalVars[index] = value;
+        if (index >= 1 && index <= 1000) {
+            m_globalVars[index] = value;
+        }
     }
+    // 🌟 $ 前綴：系統變數 ($1 ~ $1000)
     else if (prefix == '$')
     {
-        // 系統變數通常是唯讀的，但如果你允許 $ 變數可寫入，就放行：
-        if (index >= 1 && index <= MAX_SYS_VARS) m_sysVars[index] = value;
+        if (index >= 1 && index <= 1000) {
+            m_sysVars[index] = value;
+        }
     }
+}
+void MacroEngine::InitializeSystemDefaults()//初始化系統 $變數
+{ 
+    SetVar('$', 3, 90);//群組3 
 }
 
 // ==========================================

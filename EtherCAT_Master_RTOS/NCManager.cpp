@@ -8,9 +8,17 @@
 #include "GMCodeHandlers.h" // 🌟 引入 G 碼處理器總表
 #include <fstream>
 #include <iostream>
-
+#include <sstream>
 NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys), Parser(MathParser)
 {
+    // 初始化軸名稱為空白字元 (防呆)
+    for (int i = 0; i < 8; i++) {
+        m_axisNames[i] = ' ';
+    }
+
+    // 🌟 開機立刻載入軸定義檔！
+    LoadAxisConfiguration();
+
     // 初始化設定
     m_state = NCState::IDLE;
     m_mode = NCOperationMode::MEMORY; // 預設記憶體模式
@@ -75,6 +83,11 @@ void NCManager::CycleStart()
 {
     if (m_state == NCState::READY || m_state == NCState::HOLD)
     {
+        // 🌟 如果在 MANUAL 模式按下啟動，豎起自動執行旗標
+        if (m_mode == NCOperationMode::MANUAL && !m_manualMemory.empty()) {
+            m_manualAutoRunning = true;
+        }
+
         m_state = NCState::RUN;
         DEBUG_PRINT("[NC] Cycle Start!\n");
     }
@@ -92,36 +105,25 @@ void NCManager::FeedHold()
 
 void NCManager::Reset()
 {
-    AlarmManager::GetInstance().Clear();//清除Alarm訊息
-
-    // 🌟 新增：重置巨集引擎，把堆疊清空退回主程式，並銷毀所有副程式的區域變數
+    AlarmManager::GetInstance().Clear();
     MacroSys.Reset();
 
-    // 🌟 確保主程式的狀態也完全重置
     m_macroStack.clear();
     m_programPC = 0;
     m_macroProgramName = "";
     m_macroProgramPC = -1;
 
+    // 🌟 清空 MDI 與 MANUAL 執行狀態
+    m_mdiPC = 0;
+    m_manualPC = 0;
+    m_manualAutoRunning = false;
+
     m_state = NCState::RESET_STATE;
     std::queue<NCBlock> empty;
-
-    // 將指令佇列清空
     std::swap(m_blockQueue, empty);
-
-    // m_motion.EmergencyStopGroup(); 
-
-
-
-    // 2. 🌟 解決卡住的元凶：清空所有等待中的回呼！
     m_waitCallback = nullptr;
-
-    // 3. 🌟 清空計時器
-    GCodeHandlers::Reset_G04(this); // 將 G04 相關參數歸零
-
-
-
-
+    GCodeHandlers::Reset_G04(this);
+    CoordSys.isAbsoluteMode = true;
 
     m_state = NCState::READY;
 }
@@ -137,8 +139,8 @@ bool NCManager::CallMacro(const std::string& filename) {
         m_state = NCState::HOLD;
         return false;
     }
-
-    std::string fullPath = "D:\\EtherCAT_Master_Data\\NC_Macro\\" + filename;
+   
+    std::string fullPath = GlobalConfig::GetInstance().NCMacroProgramDir + filename;
     std::ifstream file(fullPath);
     if (!file.is_open()) {
         DEBUG_PRINT("[Alarm] Macro File Not Found: %s\n", fullPath.c_str());
@@ -152,8 +154,8 @@ bool NCManager::CallMacro(const std::string& filename) {
     newFrame.programName = filename;
     newFrame.currentPC = 0;
 
-    // 計算 M99 返回時的行號 (如果是第1層副程式就取主程式 PC+1，如果是第2層就取第1層 PC+1)
-    newFrame.returnPC = m_macroStack.empty() ? (m_programPC + 1) : (m_macroStack.back().currentPC + 1);
+    // 🌟 關鍵修改：將 m_programPC 換成 GetBasePC()
+    newFrame.returnPC = m_macroStack.empty() ? (GetBasePC() + 1) : (m_macroStack.back().currentPC + 1);
 
     std::string line;
     while (std::getline(file, line)) {
@@ -171,26 +173,23 @@ bool NCManager::CallMacro(const std::string& filename) {
 // ==========================================
 // 🌟 2. 實作返回主程式邏輯
 // ==========================================
-void NCManager::ReturnMacro() 
+void NCManager::ReturnMacro()
 {
-    if (m_macroStack.empty()) return; // 防呆
+    if (m_macroStack.empty()) return;
 
-    // 取出這一層原本預定要回傳的行號
     int retPC = m_macroStack.back().returnPC;
-
-    // 🌟 彈出副程式堆疊，並同時銷毀這一層專屬的 #1~#100 區域變數
     m_macroStack.pop_back();
     MacroSys.PopCallStack();
 
-    // 將行號還給上一層 (如果堆疊空了代表回到主程式)
+    // 🌟 關鍵修改：將 m_programPC 換成 GetBasePC()
     if (m_macroStack.empty()) {
-        m_programPC = retPC;
+        GetBasePC() = retPC;
     }
     else {
         m_macroStack.back().currentPC = retPC;
     }
 
-    m_programChanged = true; // 告訴系統發生了跳轉
+    m_programChanged = true;
 }
 
 void NCManager::PushBlock(const NCBlock& block) {
@@ -214,177 +213,202 @@ static bool CheckMCodeDone(NCManager* nc) {
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
-    NC_RunCount++; // NC執行迴圈數
-    // 1. 檢查警報狀態
-    if (AlarmManager::GetInstance().HasAlarm())
-    {
+    NC_RunCount++;
+
+    if (AlarmManager::GetInstance().HasAlarm()) {
         m_state = NCState::ALARM;
         return;
     }
+    if (m_state == NCState::ALARM) return;
 
-    if (m_state == NCState::ALARM || m_state != NCState::RUN) return;
-
-    if (m_mode == NCOperationMode::MEMORY)
+    // 🌟 極度乾淨的任務分流
+    switch (m_mode)
     {
-        // ==========================================
-        // 🌟 智慧判斷：目前是在跑主程式，還是副程式？
-        // ==========================================
-        bool isMacro = !m_macroStack.empty();
+    case NCOperationMode::MEMORY:
+        if (m_state == NCState::RUN) {
+            ProcessExecutionEngine();
+        }
+        break;
 
-        // 永遠將指標綁定在「最頂層」的 PC 與記憶體
-        int& activePC = isMacro ? m_macroStack.back().currentPC : m_programPC;
-        std::vector<std::string>& activeMemory = isMacro ? m_macroStack.back().memory : m_programMemory;
-
-        // 同步 HMI 雙視窗需要的變數
-        if (isMacro) {
-            m_macroProgramName = m_macroStack.back().programName;
-            m_macroProgramPC = activePC;
+    case NCOperationMode::MDI:
+        // 🌟 關鍵修改：MDI 模式現在也支援手動操作了！
+        if (m_state == NCState::RUN) {
+            ProcessExecutionEngine(); // 如果按下 Cycle Start，執行 MDI 字串
         }
         else {
-            m_macroProgramName = "";
-            m_macroProgramPC = -1;
+            ProcessManualMode();      // 閒置時，允許操作員直接使用手輪或 JOG
         }
+        break;
 
-        // ==========================================
-        // 🌟 階段 A：萬用等待條件檢查 
-        // ==========================================
-        if (m_waitCallback != nullptr) {
-            if (m_waitCallback(this) == false) return; // 繼續等
-
-            m_waitCallback = nullptr;
-
-            // 🌟 安全防護：確保等待結束時沒有被觸發警報，才往下走
-            if (m_state != NCState::ALARM && m_state != NCState::HOLD) {
-                activePC++;
-            }
+    case NCOperationMode::MANUAL:
+        if (m_state == NCState::RUN && m_manualAutoRunning) {
+            ProcessExecutionEngine();
         }
+        else {
+            ProcessManualMode();
+        }
+        break;
 
-        // ==========================================
-        // 🌟 階段 B & C：結束判斷與讀取執行
-        // ==========================================
-        if (m_waitCallback == nullptr)
+    case NCOperationMode::EDIT:
+        break;
+    }
+
+   
+}
+
+
+// ==========================================
+// 🚀 終極統一執行引擎 (支援所有模式、GOTO、M98)
+// ==========================================
+void NCManager::ProcessExecutionEngine()
+{
+    bool isMacro = !m_macroStack.empty();
+
+    // 🌟 動態綁定：根據目前的模式，抓出對應的底層資料
+    int& basePC = GetBasePC();
+    std::vector<std::string>& baseMemory = GetBaseMemory();
+
+    // 判斷現在是在跑最上層的字串，還是在跑副程式
+    int& activePC = isMacro ? m_macroStack.back().currentPC : basePC;
+    std::vector<std::string>& activeMemory = isMacro ? m_macroStack.back().memory : baseMemory;
+
+    // 同步 HMI 雙視窗需要的變數 (MDI/MANUAL 時也能顯示目前的副程式名稱)
+    if (isMacro) {
+        m_macroProgramName = m_macroStack.back().programName;
+        m_macroProgramPC = activePC;
+    }
+    else {
+        m_macroProgramName = "";
+        m_macroProgramPC = -1;
+    }
+
+    // --- 階段 A：萬用等待條件檢查 ---
+    if (m_waitCallback != nullptr) {
+        if (m_waitCallback(this) == false) return; // 繼續等
+
+        m_waitCallback = nullptr;
+        if (m_state != NCState::ALARM && m_state != NCState::HOLD) {
+            activePC++;
+        }
+    }
+
+    // --- 階段 B & C：讀取與結束判斷 ---
+    if (m_waitCallback == nullptr)
+    {
+        // 結束判斷
+        if (activePC >= activeMemory.size())
         {
-            // 階段 C：結束判斷
-            if (activePC >= activeMemory.size())
-            {
-                if (isMacro) {
-                    ReturnMacro(); // 防呆：副程式如果沒寫 M99，跑到底自動返回
-                }
-                else
-                {
-                    m_state = NCState::P_END;
-                    DEBUG_PRINT("[NC] Program Finished (M30)\n");
-
-                    // ==========================================
-                    // 🌟 測試驗證：印出 #501, #502, #503 的最終結果
-                    // ==========================================
-                    double v501 = MacroSys.GetVar('#', 501);
-                    double v502 = MacroSys.GetVar('#', 502);
-                    double v503 = MacroSys.GetVar('#', 503);
-
-                    DEBUG_PRINT("========================================\n");
-                    DEBUG_PRINT(" --- Macro Stack Isolation Test ---\n");
-
-                    // 🛠️ RTX64 安全寫法：拆解浮點數為整數與小數 (精準到小數後兩位)
-                    int i501 = (int)v501;
-                    int f501 = (int)((v501 - i501) * 100);
-                    f501 = f501 < 0 ? -f501 : f501; // 防止負數印出 -X.-XX
-
-                    int i502 = (int)v502;
-                    int f502 = (int)((v502 - i502) * 100);
-                    f502 = f502 < 0 ? -f502 : f502;
-
-                    int i503 = (int)v503;
-                    int f503 = (int)((v503 - i503) * 100);
-                    f503 = f503 < 0 ? -f503 : f503;
-
-                    DEBUG_PRINT("  #501 (Main Level)   = %d.%02d \n", i501, f501);
-                    DEBUG_PRINT("  #502 (Macro Level 1)= %d.%02d \n", i502, f502);
-                    DEBUG_PRINT("  #503 (Macro Level 2)= %d.%02d \n", i503, f503);
-                    DEBUG_PRINT("========================================\n");
-
-                    m_programPC = 0;
-                }
-                return;
+            if (isMacro) {
+                ReturnMacro(); // 副程式結束返回
             }
-
-            // 階段 B：讀取指令
-            std::string rawLine = activeMemory[activePC];
-            NCBlock block = Parser.ParseLine(rawLine);
-
-            if (!block.isEmpty)
-            {
-                if (block.isGoto)
-                {
-                    // ==========================================
-                     // 🌟 巨集跳躍邏輯 (GOTO)
-                     // ==========================================
-                    int targetN = block.gotoTarget;
-                    bool found = false;
-
-                    // 尋找目前執行的程式 (主程式或副程式) 內的所有行
-                    for (int i = 0; i < (int)activeMemory.size(); i++) {
-
-                        // 🚀 效能優化：字串裡面有 'N' 才去解析它，節省 1ms 迴圈的 CPU 資源
-                        if (activeMemory[i].find('N') != std::string::npos || activeMemory[i].find('n') != std::string::npos) {
-
-                            NCBlock checkBlock = Parser.ParseLine(activeMemory[i]);
-
-                            // 檢查解析出來的這行，是否有 N 碼，且數值等於我們要的 targetN
-                            if (checkBlock.has('N') && (int)checkBlock.val('N') == targetN) {
-                                activePC = i; // 🎯 關鍵：將程式指標直接跳轉到該行
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    // 防呆防護：如果整支程式都找不到這個 N 碼
-                    if (!found) {
-                        DEBUG_PRINT("[Alarm] GOTO target N%d not found!\n", targetN);
-                        AlarmManager::GetInstance().Trigger(AlarmManager::SYNTAX_ERROR); // 或新增 MACRO_ERROR
-                        m_state = NCState::ALARM;
-                        return; // 鎖死機台，結束執行
-                    }
+            else {
+                // 最頂層程式結束了，依照模式決定去留
+                if (m_mode == NCOperationMode::MANUAL) {
+                    m_state = NCState::READY;
+                    m_manualAutoRunning = false;
+                }
+                // 🌟 關鍵修改：MDI 跑完後也直接退回 READY，無縫接軌手動 JOG！
+                else if (m_mode == NCOperationMode::MDI) {
+                    m_state = NCState::READY;
                 }
                 else {
-                    m_programChanged = false;
-                    ExecuteBlock(block);
+                    // 只有 MEMORY 主程式跑完才會進入 P_END (需按 Reset)
+                    m_state = NCState::P_END;
+                }
 
-                    // ==========================================
-                    // 🌟 防護 1：真正的異常 (語法錯誤)
-                    // 如果觸發了警報，立刻鎖死離開，絕對不加 PC，讓畫面停在錯誤行！
-                    // ==========================================
-                    if (AlarmManager::GetInstance().HasAlarm()) {
-                        m_state = NCState::ALARM;
-                        return;
-                    }
+                basePC = 0; // 執行完畢指標歸零
+                DEBUG_PRINT("[NC] Execution Finished.\n");
+            }
+            return;
+        }
 
-                    // ==========================================
-                    // 🌟 正常過關：執行成功 (包含 M00 也算成功執行完畢)
-                    // 如果瞬間完成，且沒有跳轉，就把目前行號 + 1
-                    // ==========================================
-                    if (m_waitCallback == nullptr && !m_programChanged) {
-                        activePC++;
-                    }
+        std::string rawLine = activeMemory[activePC];
+        NCBlock block = Parser.ParseLine(rawLine);
 
-                    // ==========================================
-                    // 🌟 防護 2：正常的暫停 (M00)
-                    // 雖然指標已經走到下一行了，但我們必須在這裡「凍結」迴圈，
-                    // 讓機台停下來，等待操作員按下 Cycle Start。
-                    // ==========================================
-                    if (m_state == NCState::HOLD) {
-                        return;
+        if (!block.isEmpty)
+        {
+            if (block.isGoto)
+            {
+                // 🌟 GOTO 跳躍邏輯 (完全相容所有模式)
+                int targetN = block.gotoTarget;
+                bool found = false;
+
+                for (int i = 0; i < (int)activeMemory.size(); i++) {
+                    if (activeMemory[i].find('N') != std::string::npos || activeMemory[i].find('n') != std::string::npos) {
+                        NCBlock checkBlock = Parser.ParseLine(activeMemory[i]);
+                        if (checkBlock.has('N') && (int)checkBlock.val('N') == targetN) {
+                            activePC = i;
+                            found = true;
+                            break;
+                        }
                     }
+                }
+
+                if (!found) {
+                    DEBUG_PRINT("[Alarm] GOTO target N%d not found!\n", targetN);
+                    AlarmManager::GetInstance().Trigger(AlarmManager::SYNTAX_ERROR);
+                    m_state = NCState::ALARM;
+                    return;
                 }
             }
             else {
-                activePC++; // 空行直接跳過
+                m_programChanged = false;
+                ExecuteBlock(block); // 執行 G 碼與 M 碼
+
+                if (AlarmManager::GetInstance().HasAlarm()) {
+                    m_state = NCState::ALARM;
+                    if (m_mode == NCOperationMode::MANUAL) m_manualAutoRunning = false;
+                    return;
+                }
+
+                if (m_waitCallback == nullptr && !m_programChanged) {
+                    activePC++;
+                }
+
+                if (m_state == NCState::HOLD) {
+                    return;
+                }
             }
+        }
+        else {
+            activePC++; // 空行跳過
         }
     }
 }
 
+
+// ==========================================
+// 🌟 MANUAL 模式專屬邏輯 (自動指令優先，JOG 墊後)
+// ==========================================
+void NCManager::ProcessManualMode()
+{
+    // ==========================================
+    // 🕹️ 正常處理：純硬體 JOG / MPG
+    // ==========================================
+    // SHM_Data* pShm = SHMManager::GetInstance().GetData();
+    // if (pShm == nullptr) return;
+
+    // (將你原本讀取 pShm 按鈕，呼叫 m_motion.Jog(...) 的邏輯寫在這裡)
+}
+// ==========================================
+// 🌟 動態獲取當前模式的 PC 指標
+// ==========================================
+int& NCManager::GetBasePC()
+{
+    if (m_mode == NCOperationMode::MDI) return m_mdiPC;
+    if (m_mode == NCOperationMode::MANUAL) return m_manualPC;
+    return m_programPC; // 預設為 MEMORY 主程式
+}
+
+// ==========================================
+// 🌟 動態獲取當前模式的記憶體緩衝區
+// ==========================================
+std::vector<std::string>& NCManager::GetBaseMemory()
+{
+    if (m_mode == NCOperationMode::MDI) return m_mdiMemory;
+    if (m_mode == NCOperationMode::MANUAL) return m_manualMemory;
+    return m_programMemory; // 預設為 MEMORY 主程式
+}
 void NCManager::ExecuteBlock(const NCBlock& block)
 {
     // 預設不等待
@@ -446,9 +470,21 @@ void NCManager::ExecuteBlock(const NCBlock& block)
             m_waitCallback = GCodeHandlers::Handle_G04(block, this);
             break;
 
-        case 90: case 91:
-        case 65: // 
         case 54: case 55: case 56: case 57: case 58: case 59:
+        case 154: case 155: case 156: case 157: case 158: case 159:
+        case 254: case 255: case 256: case 257: case 258: case 259:
+        case 354: case 355: case 356: case 357: case 358: case 359:
+        case 454: case 455: case 456: case 457: case 458: case 459:
+        case 554: case 555: case 556: case 557: case 558: case 559:
+        case 654: case 655: case 656: case 657: case 658: case 659:
+        case 754: case 755: case 756: case 757: case 758: case 759:
+        case 854: case 855: case 856: case 857: case 858: case 859:
+        case 954: case 955: case 956: case 957: case 958: case 959:
+            m_waitCallback = GCodeHandlers::Handle_GCode(block, this);
+            break;
+        case 90: case 91:case 92:
+        case 65: // 
+        
             // 狀態設定回傳的一定是 nullptr (不需等待)
             m_waitCallback = GCodeHandlers::Handle_GCode(block, this);
             break;
@@ -488,4 +524,153 @@ void NCManager::ExecuteBlock(const NCBlock& block)
             m_waitCallback = GCodeHandlers::Handle_MCode(block, this);
         }
     }
+}
+
+// =========================================================
+// 🌟 2. 實作讀取 AXIS_CFG.ini
+// =========================================================
+void NCManager::LoadAxisConfiguration()
+{
+    
+    std::string filepath = GlobalConfig::GetInstance().NCDataDir +"AXIS_CFG.ini";
+    std::ifstream inFile(filepath);
+
+    if (!inFile.is_open()) {
+        //printf("[Error] 無法開啟 AXIS_CFG.ini！將套用預設 X, Y, Z, A, B, C, U, V\n");
+        // 如果找不到檔案，塞一組預設值給機台保命
+        const char defaultAxes[8] = { 'X', 'Y', 'Z', 'A', 'B', 'C', 'U', 'V' };
+        for (int i = 0; i < 8; i++) m_axisNames[i] = defaultAxes[i];
+        return;
+    }
+
+    std::string line;
+    while (std::getline(inFile, line)) {
+        if (line.empty() || line[0] == ';') continue; // 略過空白與註解
+
+        std::stringstream ss(line);
+        std::string key, value;
+
+        // 以 '=' 切割字串 (例如 "Axis0=X")
+        if (std::getline(ss, key, '=') && std::getline(ss, value)) {
+            // 解析 Axis0 ~ Axis7
+            if (key.length() >= 5 && key.substr(0, 4) == "Axis") {
+                int index = key[4] - '0'; // 把字元 '0' 轉成整數 0
+                if (index >= 0 && index < 8) {
+                    // 只取等號後面的第一個字元，如果寫 NONE 或空，就會抓不到英文字母
+                    if (value.length() > 0 && value != "NONE") {
+                        m_axisNames[index] = value[0];
+                        //printf("[Config] 軸 %d 對應字元: %c\n", index, m_axisNames[index]);
+                    }
+                }
+            }
+        }
+    }
+    inFile.close();
+}
+
+// =========================================================
+// 🌟 3. 提供給直譯器 (Parser) 搜尋用的 API
+// =========================================================
+int NCManager::GetAxisIndex(char gcodeLetter) const
+{
+    for (int i = 0; i < 8; i++) {
+        if (m_axisNames[i] == gcodeLetter) {
+            return i; // 找到對應的陣列 Index 了！
+        }
+    }
+    return -1; // -1 代表這台機器沒有設定這個軸！
+}
+
+
+// ==========================================
+// 🌟 載入 MDI 字串
+// ==========================================
+bool NCManager::LoadMDI(const std::string& mdiContent)
+{
+    m_mdiMemory.clear();
+    m_mdiPC = 0;
+
+    std::stringstream ss(mdiContent);
+    std::string line;
+    int lineCount = 0;
+
+    while (std::getline(ss, line, '\n')) {
+        if (!line.empty() && line.find_first_not_of("\r\t ") != std::string::npos) {
+            m_mdiMemory.push_back(line);
+            lineCount++;
+        }
+        // 使用我們在 .h 檔設定的常數來限制
+        if (lineCount >= MAX_MDI_LINES) {
+            DEBUG_PRINT("[NC Warning] MDI Input truncated to %zu lines.\n", MAX_MDI_LINES);
+            break;
+        }
+    }
+    return !m_mdiMemory.empty();
+}
+
+// ==========================================
+// 🌟 載入 MANUAL 模式輕量自動指令
+// ==========================================
+bool NCManager::LoadManualAuto(const std::string& manualContent)
+{
+    // 使用我們在 .h 檔設定的常數來檢查 (1024KB)
+    if (manualContent.length() > MAX_MANUAL_AUTO_BYTES) {
+        DEBUG_PRINT("[Alarm] Manual Auto string exceeds %zu bytes limit!\n", MAX_MANUAL_AUTO_BYTES);
+        return false;
+    }
+
+    m_manualMemory.clear();
+    m_manualPC = 0;
+    m_manualAutoRunning = false; // 載入後預設不啟動，等待 Cycle Start
+
+    std::stringstream ss(manualContent);
+    std::string line;
+
+    while (std::getline(ss, line, '\n')) {
+        if (!line.empty() && line.find_first_not_of("\r\t ") != std::string::npos) {
+            m_manualMemory.push_back(line);
+        }
+    }
+    return !m_manualMemory.empty();
+}
+
+// ==========================================
+// 🌟 整合版：動態載入短程式碼 (自動判斷 MDI 還是 MANUAL)
+// ==========================================
+bool NCManager::LoadDynamicCode(const std::string& content)
+{
+    std::vector<std::string>* targetMemory = nullptr;
+    int* targetPC = nullptr;
+
+    // 1. 根據目前模式，動態綁定目標記憶體
+    if (m_mode == NCOperationMode::MDI) {
+        targetMemory = &m_mdiMemory;
+        targetPC = &m_mdiPC;
+    }
+    else if (m_mode == NCOperationMode::MANUAL) {
+        targetMemory = &m_manualMemory;
+        targetPC = &m_manualPC;
+        m_manualAutoRunning = false; // 載入時先關閉自動執行
+    }
+    else {
+        DEBUG_PRINT("[NC Warning] Cannot load dynamic code in current OP mode!\n");
+        return false; // 只有在 MDI 和 MANUAL 模式下才允許載入
+    }
+
+    // 2. 清空舊資料
+    targetMemory->clear();
+    *targetPC = 0;
+
+    // 3. 解析並塞入記憶體
+    std::stringstream ss(content);
+    std::string line;
+
+    while (std::getline(ss, line, '\n')) {
+        if (!line.empty() && line.find_first_not_of("\r\t ") != std::string::npos) {
+            targetMemory->push_back(line);
+        }
+    }
+
+    DEBUG_PRINT("[NC] Dynamic Code Loaded, Lines: %d\n", (int)targetMemory->size());
+    return !targetMemory->empty();
 }

@@ -9,7 +9,7 @@
 // 預設最大呼叫層數
 constexpr int MAX_MACRO_DEPTH = 8;
 constexpr int MAX_LOCAL_VARS = 100;   // 區域變數 #1~#100
-constexpr int MAX_GLOBAL_VARS = 500;  // 全域變數 @1~@500 (或 #501~#1000)
+constexpr int MAX_GLOBAL_VARS = 1000;  // 全域變數 @1~@500 (或 #501~#1000)
 constexpr int MAX_SYS_VARS = 1000;    // 系統變數 $1~$1000
 
 class MacroEngine {
@@ -45,6 +45,8 @@ public:
     const double* GetSysVarsArray() const;
     const double* GetLocalVarsArray(int depth) const;
 
+
+    void InitializeSystemDefaults();//初始化系統 $變數
 private:
     // --- 記憶體區塊 ---
 

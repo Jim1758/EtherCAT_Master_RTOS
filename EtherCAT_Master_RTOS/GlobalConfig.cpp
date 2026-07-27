@@ -72,17 +72,27 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
             axes[i].pid.MaxLag = ConfigUtil::ReadParam(filePath, prefix + "MaxLag", 100000.0);// 最大允許跟隨誤差
 
            
-           // ----------------------------------------------------
+         // ----------------------------------------------------
             // 🌟 [新增] 讀取軸型態與旋轉參數
             // ----------------------------------------------------
-            // 0=直線軸(預設), 1=旋轉軸
+            // 0=直線軸(預設), 1=旋轉軸(0~360度), 2=連續旋轉軸(累加不歸零)
             int typeVal = (int)ConfigUtil::ReadParam(filePath, prefix + "AxisType", 0.0);
-            axes[i].axisType = (typeVal == 1) ? AxisType::ROTARY : AxisType::LINEAR;
+
+            if (typeVal == 1) {
+                axes[i].axisType = AxisType::ROTARY;
+            }
+            else if (typeVal == 2) {
+                axes[i].axisType = AxisType::ROTARY_CONTINUOUS;
+            }
+            else {
+                axes[i].axisType = AxisType::LINEAR;
+            }
 
             // 旋轉軸一圈的度數 (預設 360)
             axes[i].rotaryModulo = ConfigUtil::ReadParam(filePath, prefix + "RotaryModulo", 360.0);
 
             // 旋轉軸是否啟用最短路徑 (1=啟用, 0=不啟用)
+            // 💡 只有當軸型態是 ROTARY 的時候，這個設定才有意義
             int shortestVal = (int)ConfigUtil::ReadParam(filePath, prefix + "ShortestPath", 0.0);
             axes[i].useShortestPath = (shortestVal == 1);
         }

@@ -68,12 +68,29 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     m_Motion.Link(&m_ServoList, &m_Axes);//綁定硬體指標
 
     // 2. 🌟 一鍵載入參數並初始化所有軸！
-    std::string axisConfigPath = GlobalConfig::GetInstance().BaseDataDir + "Data\\Parameter\\AxisConfig.txt";
+    std::string axisConfigPath = GlobalConfig::GetInstance().ParameterDir + "AxisConfig.txt";
     if (!GlobalConfig::GetInstance().LoadAxisConfig(axisConfigPath, m_Axes, m_Motion)) 
     {
-        DEBUG_PRINT("LoadAxisConfig Error！\n");
+        DEBUG_PRINT("LoadConfig Error！>>AxisConfig.txt\n");
         return -1;
     }
+
+    std::string pidConfigPath = GlobalConfig::GetInstance().ParameterDir + "PIDConfig.txt";
+    if (!GlobalConfig::GetInstance().LoadPIDConfig(pidConfigPath, m_Axes, m_Motion))
+    {
+        DEBUG_PRINT("LoadConfig Error！>>PIDConfig.txt\n");
+        return -1;
+    }
+
+    std::string speedConfigPath = GlobalConfig::GetInstance().ParameterDir + "SpeedConfig.txt";
+    if (!GlobalConfig::GetInstance().LoadSpeedConfig(speedConfigPath, m_Axes, m_Motion))
+    {
+        DEBUG_PRINT("LoadConfigPathConfig Error！>>SpeedConfig.txt\n");
+        return -1;
+    }
+
+    // 2. 🌟 讀取螺距誤差表，並寫入 CompensationEngine
+    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE.txt", m_Motion.m_CompEngine);
 
     // 檢查硬體數量與設定檔是否一致
     if (m_ServoList.size() != m_Axes.size())

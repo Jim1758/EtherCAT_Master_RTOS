@@ -92,6 +92,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ClInclude Include="AlarmManager.h" />
+    <ClInclude Include="CompensationEngine.h" />
     <ClInclude Include="ConfigReader.h" />
     <ClInclude Include="CoordinateManager.h" />
     <ClInclude Include="EtherCatEni.h" />
@@ -119,6 +120,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="AlarmManager.cpp" />
+    <ClCompile Include="CompensationEngine.cpp" />
     <ClCompile Include="ConfigReader.cpp" />
     <ClCompile Include="CoordinateManager.cpp" />
     <ClCompile Include="EtherCatEni.cpp" />
@@ -137,6 +139,7 @@
     <ClCompile Include="MacroParser.cpp" />
     <ClCompile Include="MCode.cpp" />
     <ClCompile Include="MotionCore.cpp" />
+    <ClCompile Include="MotionCore_GCode.cpp" />
     <ClCompile Include="NCManager.cpp" />
     <ClCompile Include="NicDriver.cpp" />
     <ClCompile Include="PlcCore.cpp" />

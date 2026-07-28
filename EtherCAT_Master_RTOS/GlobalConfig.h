@@ -1,7 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
-
+#include "CompensationEngine.h" // ゲ斗まま篮挡篶
 
 
 enum class SystemMode //╰参家Α
@@ -34,8 +34,10 @@ public:
     int Debug_ShowMessage = 0;       // 箇砞闽超
     double Global_Override = 1.0; // ㄒ办秈倒瞯
 
+    int System_axisCount = 0;
 
     std::string BaseDataDir = "D:\\EtherCAT_Master_Data\\";
+    std::string ParameterDir = "D:\\EtherCAT_Master_Data\\Data\\Parameter\\";
     std::string NCProgramDir = BaseDataDir + "NC_Program\\";
     std::string NCMacroProgramDir = BaseDataDir + "NC_Macro\\";
     std::string NCDataDir = BaseDataDir + "Data\\";
@@ -44,6 +46,9 @@ public:
     // ==========================================
     void LoadFromFile(const std::string& filePath);
     bool LoadAxisConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion);//更禸把计
+    bool LoadPIDConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion);//更PID把计
+    bool LoadSpeedConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion);//更Speed把计
+    static bool LoadPitchTable(const std::string& filePath, CompensationEngine& compEngine);
 
 private:
     // 玛篶窽ゎ new GlobalConfig()

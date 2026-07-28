@@ -237,3 +237,9 @@ void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targe
         }
     }
 }
+
+void CoordinateManager::GetActualMCS(double* outMCS) const {
+    for (int i = 0; i < 8; i++) {
+        outMCS[i] = actualMCS[i];
+    }
+}

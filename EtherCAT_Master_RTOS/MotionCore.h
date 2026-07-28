@@ -6,6 +6,7 @@
 #include <queue> // 引入佇列函式庫
 #include <deque>
 #include "CoordinateManager.h"
+#include "CompensationEngine.h" // 引入剛寫好的標頭檔
 constexpr int MAX_AXES = 8;//最大軸數宣告
 const double CYCLE_TIME_SEC = 0.00025;// EtherCAT 通訊週期 (250us)
 
@@ -76,11 +77,12 @@ enum class AxisType {
 struct AxisContext//軸參數與狀態
 {
     //參數-------------------------------------------------------------------------------------------------------------
-    
+    int axisIndex = 0;//第幾軸
+
     //硬體物理參數-------------------------------------------------
     double resolution_PPR = 16777216.0;// 編碼器解析度
     double maxVel_PPS = 0.0;// 最高轉速 (Pulse/sec)
-   
+    double G00_PPS=0.0;// G00 速度 (Pulse/sec)
 
     //雙閉環/全閉環設定-------------------------------------------------
     FeedbackSource fbMode = FeedbackSource::MOTOR_ENCODER;//回授設定 
@@ -92,8 +94,11 @@ struct AxisContext//軸參數與狀態
 
 
     //PID-------------------------------------------------
-    PidConfig pid;
-
+    PidConfig pid;//當下使用參數
+    // 🌟 新增：兩組獨立的 PID 參數
+    PidConfig Pid_IDLE;//閒置狀態PID
+    PidConfig Pid_G00;      // 專屬：定位移動專用 (G00, G01)
+ 
 
     //狀態與指令-------------------------------------------------------------------------------------------------------------
 
@@ -156,6 +161,38 @@ struct AxisContext//軸參數與狀態
     AxisType axisType = AxisType::LINEAR; // 預設為直線軸
     double rotaryModulo = 360.0;          // 旋轉一圈的單位 (預設 360度)
     bool useShortestPath = true;          // 旋轉軸是否走最短路徑 (0=否, 1=是)
+
+
+    // ==========================================
+    // 🌟 補償功能開關與基礎參數
+    // ==========================================
+    bool enableBacklash = false;     // 是否啟用背隙補償
+    double backlashAmount_mm = 0.0;  // 背隙大小 (mm)
+
+    bool enablePitch = false;        // 是否啟用螺距補償
+    double pitchStartPos_mm = 0.0;   // 螺距補償起點 (例如從機械座標 0.0 開始)
+    double pitchStep_mm = 10.0;      // 每一格的間距 (例如每 10mm 補一格)
+
+
+
+    // --- 1. 馬達/編碼器參數 ---
+    
+    bool isReverse = false;             // 方向反轉 (1=反轉, 0=正轉)
+
+   // --- 2. 🌟 機構齒輪/皮帶比例 (Gear/Pulley Ratio) ---
+    // 例如：馬達接 20 齒，負載接 60 齒
+    double reduction_MotorSide = 1.0; // 驅動輪齒數/直徑
+    double reduction_LoadSide = 1.0;  // 負載輪齒數/直徑
+
+    // --- 3. 傳動元件參數 (Pitch/Circumference) ---
+    // 螺桿：填導程 (Lead, 例如 10.0 mm)
+    // 皮帶：填 (齒數 * 齒距) (例如 20齒 * 3mm = 60.0 mm)
+    // 直驅：填 1.0 (直線) 或 360.0 (旋轉)
+    double mechanicalPitch = 5.0;
+
+    // --- 🌟 自動計算出的最終導程 (系統自己算) ---
+    // 這一行不需要在設定檔讀取，在 InitAxis 時自動算出
+    double finalLead = 10.0;
 };
 
 enum class InterpolationMode//插補群組的導航模式
@@ -441,6 +478,8 @@ public:
 
     //系統關聯與連結--------------------------------------------------------------------
     CoordinateManager* m_pCoordMgr = nullptr;
+    CompensationEngine m_CompEngine; // 🌟 宣告補償引擎
+
 
     void Link(std::vector<ENI_ServoDrive>* pAxisList);// 連結實體驅動器列表 (EtherCAT 映射資料)
     void Link(std::vector<ENI_ServoDrive>* pDriveList, std::vector<AxisContext>* pContextList);// 連結實體驅動器與邏輯參數上下文 (Context)
@@ -476,7 +515,8 @@ public:
     static double RpmToPps(double rpm, double resolution); // RPM 轉 Pulse/Sec
     static double PpsToRpm(double pps, double resolution); // Pulse/Sec 轉 RPM
 
-
+    // 🌟 [新增] 將使用者直覺的 mm/min 或 deg/min 轉換為 PPS
+    static double UnitPerMinToPps(double unitPerMin, double resolution, double finalLead);
 
     //多軸插補功能區塊--------------------------------------------------------------------
    
@@ -526,7 +566,7 @@ public:
     bool IsGroupQueueFull() const { return m_Group.cmdQueue.size() >= 100; } // 預讀 100 行
     bool IsGroupDone() const { return !m_Group.isActive && m_Group.cmdQueue.empty(); }
 
-
+  
 
     double CalculateShortestTarget(double currentPos, double targetPos, double modulo);
    
@@ -539,8 +579,9 @@ private:
    
     // 執行 PID 運算、前饋控制以及安全 Lag 監控--------------------------------------------------------------------
     template <typename DriveType>
-    void Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd);
 
+    void Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd);
+    void DetermineActiveGainSet(AxisContext& axis); // 👈 必須要有這行宣告
 
     double PlanTrapezoidal(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
     double PlanTrapezoidal_B2(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
@@ -554,4 +595,11 @@ private:
 
     // 多軸插補管理器 (單一實體群組)--------------------------------------------------------------------
     InterpolationGroup m_Group;
+
+    // 動態 PID 切換副程式
+    
+  public:
+
+    //G碼使用-------------------------------------------------------------- 
+    void G00_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G00 快速定位 API
 };

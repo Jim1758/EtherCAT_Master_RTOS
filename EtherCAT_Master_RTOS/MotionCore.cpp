@@ -31,6 +31,21 @@ double MotionCore::PpsToRpm(double pps, double resolution) {
     return (pps * 60.0) / resolution;
 }
 
+double MotionCore::UnitPerMinToPps(double unitPerMin, double resolution, double finalLead)
+{
+    // 防呆：避免導程設定為 0 導致除以零崩潰
+    if (std::abs(finalLead) < 0.000001) return 0.0;
+
+    // 1. 每分鐘多少單位 -> 每秒多少單位 (mm/sec 或 deg/sec)
+    double unitPerSec = unitPerMin / 60.0;
+
+    // 2. 移動 1 單位需要多少 Pulse
+    double pulsePerUnit = resolution / finalLead;
+
+    // 3. 兩者相乘，得到每秒需要發出多少 Pulse (PPS)
+    return unitPerSec * pulsePerUnit;
+}
+
 // ==========================================
 // [API] 初始化與設定
 // ==========================================
@@ -137,9 +152,24 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         {
             if (i < m_pContexts->size())
             {
-                double rawPulse = (*m_pContexts)[i].currentActPos;
-                double pulsePerMm = (*m_pContexts)[i].resolution_PPR / 10.0;
-                tempMCS[i] = rawPulse / pulsePerMm;
+                AxisContext& axis = (*m_pContexts)[i];
+                double rawPulse = axis.currentActPos;
+                double unitsPerPulse = (axis.resolution_PPR > 0) ? (axis.finalLead / axis.resolution_PPR) : 0.0;
+
+                double physicalPos = rawPulse * unitsPerPulse;
+
+                // 🌟 [新增顯示過濾] 如果是標準旋轉軸，顯示時強制 Modulo 360
+                if (axis.axisType == AxisType::ROTARY)
+                {
+                    // 使用 fmod 取餘數
+                    physicalPos = std::fmod(physicalPos, axis.rotaryModulo);
+
+                    // 處理負數 (fmod 在 C++ 對負數取餘仍為負，需轉為正數)
+                    if (physicalPos < 0.0) physicalPos += axis.rotaryModulo;
+                }
+
+                // 處理方向 (isReverse)
+                tempMCS[i] = axis.isReverse ? -physicalPos : physicalPos;
             }
             else
             {
@@ -219,6 +249,18 @@ double MotionCore::CalculateShortestTarget(double currentPos, double targetPos, 
 
 void MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time)
 {
+
+    // =========================================================
+    // 🌟 [新增] 旋轉軸最短路徑展開
+    // =========================================================
+    if (axis.axisType == AxisType::ROTARY && axis.useShortestPath)
+    {
+        // 將指令的目標度數 (例如 10度)，依據現在的絕對度數 (例如 350度)
+        // 轉換為真實要走的物理連續度數 (變成 370度，往前走 20度)
+        targetPos = CalculateShortestTarget(axis.currentCmdPos, targetPos, axis.rotaryModulo);
+    }
+
+
     // =========================================================
     //  1. 【起跑線對齊 (Bumpless Transfer)】
     // 防止 PID 瞬間爆衝，消除高達上億的 Lag Error！
@@ -645,7 +687,29 @@ void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd
 
 
 
+void MotionCore::DetermineActiveGainSet(AxisContext& axis)// PID 依照狀態切換
+{
 
+
+    axis.pid.Kp = axis.Pid_IDLE.Kp;
+    axis.pid.Ki = axis.Pid_IDLE.Ki;
+    axis.pid.Kd = axis.Pid_IDLE.Kd;
+
+    /*
+    if (m_Group.pathMode == PathMode::PATH_SERVO || m_Group.pathMode == PathMode::JUMP_TRACKING)
+    {
+        //axis.pid.Kp = axis.sparkPid.Kp;
+        //axis.pid.Ki = axis.sparkPid.Ki;
+        //axis.pid.Kd = axis.sparkPid.Kd;
+    }
+    else
+    {
+        // G00, 閒置鎖定時，使用高剛性的定位 PID
+        axis.pid.Kp = axis.Pid_G00.Kp;
+        axis.pid.Ki = axis.Pid_G00.Ki;
+        axis.pid.Kd = axis.Pid_G00.Kd;
+    }*/
+}
 
 // ==========================================
 // [Layer 2] 伺服迴路 (Servo Loop)
@@ -653,6 +717,14 @@ void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd
 template <typename DriveType>
 void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd)
 {
+
+
+    DetermineActiveGainSet(axis);// PID 依照狀態切換
+ 
+  
+
+
+
     // 1. [Feedback Selection] 雙回授處理
     double rawMotorPos = (double)servo.pInput->ActualPosition;
 
@@ -725,6 +797,8 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     // 6. [Write PDO] 寫入 EtherCAT
     servo.pOutput->TargetVelocity = (int32_t)finalVel;
 }
+
+
 
 // ==========================================
 // [Core] 主更新迴圈
@@ -862,6 +936,13 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
         axis.logicalCmdPos = axis.currentCmdPos; // 🟢 閒置時邏輯跟隨物理
         break;
     }
+
+    // ==========================================
+    // 🌟 2. [Layer 2.5] 進入補償層 (動態加入螺距與背隙誤差)
+    // ==========================================
+    // 將大腦算出來的純淨理論座標 (cmd.instantCmdPos) 丟進去查表
+    // 引擎會自動將背隙與螺距誤差疊加上去，保護 PID 與機構
+    m_CompEngine.ApplyCompensation(axis.axisIndex, axis, cmd, CYCLE_TIME_SEC);
 
     // ==========================================
     // 2. [Layer 2] 執行伺服控制
@@ -1013,6 +1094,22 @@ void MotionCore::LoadNextCommand()
             // 1. 🟢 核心修正：起點一律抓取「邏輯座標」
             // 這樣連續下 LineMove 時，大腦才會從「邏輯終點」接續下去
             m_Group.startPos[i] = realAxis.logicalCmdPos;
+
+
+            // ======================================================
+            // 🌟 [新增] 多軸同動：旋轉軸最短路徑展開
+            // ======================================================
+            double actualTarget = cmd.targetPos[i];
+
+            if (realAxis.axisType == AxisType::ROTARY && realAxis.useShortestPath)
+            {
+                actualTarget = CalculateShortestTarget(m_Group.startPos[i], actualTarget, realAxis.rotaryModulo);
+
+                // ⚠️ 極度重要防呆：必須將展開後的絕對度數寫回 cmd，
+                // 否則 B2 模式 (時光機原路退刀) 讀取歷史紀錄時，座標會發生錯亂瞬移！
+                cmd.targetPos[i] = actualTarget;
+                m_Group.currentCmd.targetPos[i] = actualTarget;
+            }
 
             // 2. 計算邏輯位移 (Delta)
             double delta = cmd.targetPos[i] - m_Group.startPos[i];
@@ -3464,6 +3561,7 @@ void MotionCore::UpdateInterpolation()
     }
     last_log_VelX = current_log_VelX;
 }
+
 
 
 

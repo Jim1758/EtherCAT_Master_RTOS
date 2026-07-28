@@ -65,6 +65,8 @@ public:
   
     // 🌟 新增：G92 相關 API
     void ApplyG92(const bool* axisProgrammed, const double* targetPos);
+
+    void GetActualMCS(double* outMCS) const; // 取出當前的真實機械座標
    
 private:
     // 底層輔助函式：負責讀寫 8 軸二維陣列，並確保原子寫入防護

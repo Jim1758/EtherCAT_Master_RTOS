@@ -159,6 +159,12 @@
     <ClCompile Include="HMI_Bridge.cpp">
       <Filter>Source Files\API</Filter>
     </ClCompile>
+    <ClCompile Include="CompensationEngine.cpp">
+      <Filter>Source Files\Motion</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_GCode.cpp">
+      <Filter>Source Files\Motion</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -235,6 +241,9 @@
     </ClInclude>
     <ClInclude Include="HMI_Bridge.h">
       <Filter>Header Files\API</Filter>
+    </ClInclude>
+    <ClInclude Include="CompensationEngine.h">
+      <Filter>Header Files\Motion</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

@@ -4,12 +4,15 @@
 #include <algorithm>
 #include <windows.h> 
 #include <rtapi.h>
-
-
+#include "CompensationEngine.h" // 必須引入引擎結構
+#include <fstream>
+#include <sstream>
+#include <vector>
 bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion)
 {
     //讀取參數確定軸數量-----------------------------------------------------------------
     int axisCount = (int)ConfigUtil::ReadParam(filePath, "AxisCount", 0.0);
+    System_axisCount = axisCount;
     DEBUG_PRINT("LoadAxisConfig Axis Count>>%d\n", axisCount);
     if (axisCount == 0) 
     {
@@ -22,79 +25,145 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
        
         for (int i = 0; i < axisCount; i++)//開始填入軸參數
         {
-            std::string prefix = std::to_string(i) + "_"; // 產生 "0_", "1_" 等前綴
+            std::string prefix = std::to_string(i) + "_";
 
+            axes[i].axisIndex = (int)ConfigUtil::ReadParam(filePath, prefix + "axisIndex", i);
+
+            // ----------------------------------------------------
+            // 1. 基礎初始化
+            // ----------------------------------------------------
+            double res = ConfigUtil::ReadParam(filePath, prefix + "Resolution", 16777216.0);
+            motion.InitAxis(axes[i], res);
+
+            // ----------------------------------------------------
+            // 2. 🌟 [新增] 機械機構參數 (由參數檔讀取)
+            // ----------------------------------------------------
+            axes[i].reduction_MotorSide = ConfigUtil::ReadParam(filePath, prefix + "Reduction_MotorSide", 1.0);
+            axes[i].reduction_LoadSide = ConfigUtil::ReadParam(filePath, prefix + "Reduction_LoadSide", 1.0);
+            axes[i].mechanicalPitch = ConfigUtil::ReadParam(filePath, prefix + "MechanicalPitch", 10.0);
+            axes[i].isReverse = (ConfigUtil::ReadParam(filePath, prefix + "IsReverse", 0.0) == 1.0);
+
+            // 🌟 自動計算最終導程 (Final Lead)
+            // 確保 LoadSide 不為 0 以防除以零錯誤
+            if (axes[i].reduction_LoadSide > 0.0001) {
+                axes[i].finalLead = (axes[i].mechanicalPitch * axes[i].reduction_MotorSide) / axes[i].reduction_LoadSide;
+            }
+            else {
+                axes[i].finalLead = axes[i].mechanicalPitch; // 防呆
+            }
+
+            // ----------------------------------------------------
+            // 3. 讀取物理與運動參數
+            // ----------------------------------------------------
            
-              
-            // ----------------------------------------------------
-            //基礎初始化
-            // ----------------------------------------------------
-            double res = ConfigUtil::ReadParam(filePath, prefix + "Resolution", 16777216.0);//解析度
-            motion.InitAxis(axes[i], res); // InitAxis 會幫你把 currentCmdPos 等動態變數歸零
 
-            // ----------------------------------------------------
-            //讀取物理與運動參數
-            // ----------------------------------------------------
-            double rpm = ConfigUtil::ReadParam(filePath, prefix + "MaxVel_RPM", 3000.0);
-            axes[i].maxVel_PPS = MotionCore::RpmToPps(rpm, axes[i].resolution_PPR);      // 最高轉速 (Pulse/sec)
+            double accTime = ConfigUtil::ReadParam(filePath, prefix + "Acc_Time", 1);
+            double decTime = ConfigUtil::ReadParam(filePath, prefix + "Dec_Time", 1);
 
-            // 讀取加減速所需的時間(秒)，然後換算成加速度(PPS2)
-            // 加速度 = 目標速度 / 加速時間
-            double accTime = ConfigUtil::ReadParam(filePath, prefix + "Acc_Time", 1);// 加速到滿速所需時間(秒)
-            double decTime = ConfigUtil::ReadParam(filePath, prefix + "Dec_Time", 1);// 減速所需時間(秒)
-
-            // 防呆：避免除以零
-            axes[i].acc_PPS2 = (accTime > 0.0) ? (axes[i].maxVel_PPS / accTime) : (axes[i].maxVel_PPS * 2.0);// 加速到滿速所需時間(秒)
+            axes[i].acc_PPS2 = (accTime > 0.0) ? (axes[i].maxVel_PPS / accTime) : (axes[i].maxVel_PPS * 2.0);
             axes[i].dec_PPS2 = (decTime > 0.0) ? (axes[i].maxVel_PPS / decTime) : (axes[i].maxVel_PPS * 2.0);
 
-            double smoothTime = ConfigUtil::ReadParam(filePath, prefix + "SmoothTime", 100.0);//平滑時間(ms)
-
-            motion.InitSmoothBuffer(axes[i], smoothTime);//加加速度來開啟 100ms 的平滑功能
+            double smoothTime = ConfigUtil::ReadParam(filePath, prefix + "SmoothTime", 100.0);
+            motion.InitSmoothBuffer(axes[i], smoothTime);
             motion.InitVirtualAxisSmooth(smoothTime);
 
             // ----------------------------------------------------
-            // 雙閉環參數
+            // 4. 雙閉環與 PID 參數
             // ----------------------------------------------------
-            int fbVal = (int)ConfigUtil::ReadParam(filePath, prefix + "FbMode", 0.0);// 0=馬達編碼器, 1=外部光學尺
+            int fbVal = (int)ConfigUtil::ReadParam(filePath, prefix + "FbMode", 0.0);
             axes[i].fbMode = (fbVal == 1) ? FeedbackSource::LINEAR_SCALE : FeedbackSource::MOTOR_ENCODER;
 
-            axes[i].scaleToMotorRatio = ConfigUtil::ReadParam(filePath, prefix + "ScaleRatio", 1.0);// 光學尺與馬達的解析度比例
-            axes[i].maxDeviation = ConfigUtil::ReadParam(filePath, prefix + "MaxDev", 1677721.6);// 雙閉環最大容許偏差
+            axes[i].scaleToMotorRatio = ConfigUtil::ReadParam(filePath, prefix + "ScaleRatio", 1.0);
+            axes[i].maxDeviation = ConfigUtil::ReadParam(filePath, prefix + "MaxDev", 1677721.6);
+
+            
+            axes[i].pid.EnableLagCheck = (ConfigUtil::ReadParam(filePath, prefix + "EnableLagCheck", 1.0) == 1.0);
+            axes[i].pid.MaxLag = ConfigUtil::ReadParam(filePath, prefix + "MaxLag", 100000.0);
 
             // ----------------------------------------------------
-            // D. PID 參數與保護
+            // 5. 軸型態與補償參數
             // ----------------------------------------------------
-            axes[i].pid.Kp = ConfigUtil::ReadParam(filePath, prefix + "Kp", 20.0);// 比例增益 (剛性)
-            axes[i].pid.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki", 10.0);// 積分增益 (消除靜差)
-            axes[i].pid.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd", 0.0);// 微分增益 (阻尼)
-
-            axes[i].pid.EnableLagCheck = (ConfigUtil::ReadParam(filePath, prefix + "EnableLagCheck", 1.0) == 1.0);//跟隨誤差保護 0不啟用 1啟用
-            axes[i].pid.MaxLag = ConfigUtil::ReadParam(filePath, prefix + "MaxLag", 100000.0);// 最大允許跟隨誤差
-
-           
-         // ----------------------------------------------------
-            // 🌟 [新增] 讀取軸型態與旋轉參數
-            // ----------------------------------------------------
-            // 0=直線軸(預設), 1=旋轉軸(0~360度), 2=連續旋轉軸(累加不歸零)
             int typeVal = (int)ConfigUtil::ReadParam(filePath, prefix + "AxisType", 0.0);
-
-            if (typeVal == 1) {
-                axes[i].axisType = AxisType::ROTARY;
-            }
-            else if (typeVal == 2) {
-                axes[i].axisType = AxisType::ROTARY_CONTINUOUS;
-            }
-            else {
-                axes[i].axisType = AxisType::LINEAR;
-            }
-
-            // 旋轉軸一圈的度數 (預設 360)
+            axes[i].axisType = (typeVal == 1) ? AxisType::ROTARY : (typeVal == 2 ? AxisType::ROTARY_CONTINUOUS : AxisType::LINEAR);
             axes[i].rotaryModulo = ConfigUtil::ReadParam(filePath, prefix + "RotaryModulo", 360.0);
+            axes[i].useShortestPath = (ConfigUtil::ReadParam(filePath, prefix + "ShortestPath", 0.0) == 1.0);
 
-            // 旋轉軸是否啟用最短路徑 (1=啟用, 0=不啟用)
-            // 💡 只有當軸型態是 ROTARY 的時候，這個設定才有意義
-            int shortestVal = (int)ConfigUtil::ReadParam(filePath, prefix + "ShortestPath", 0.0);
-            axes[i].useShortestPath = (shortestVal == 1);
+            axes[i].enableBacklash = (ConfigUtil::ReadParam(filePath, prefix + "EnableBacklash", 0.0) == 1.0);
+            axes[i].backlashAmount_mm = ConfigUtil::ReadParam(filePath, prefix + "BacklashAmount", 0.0);
+            axes[i].enablePitch = (ConfigUtil::ReadParam(filePath, prefix + "EnablePitch", 0.0) == 1.0);
+            axes[i].pitchStartPos_mm = ConfigUtil::ReadParam(filePath, prefix + "PitchStartPos", 0.0);
+            axes[i].pitchStep_mm = ConfigUtil::ReadParam(filePath, prefix + "PitchStep", 10.0);
+
+            motion.m_CompEngine.InitAxisCompensation(i, axes[i].enableBacklash, axes[i].backlashAmount_mm, axes[i].enablePitch, axes[i].pitchStep_mm);
+        }
+    }
+
+
+    return true;
+}
+
+
+bool GlobalConfig::LoadPIDConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion)
+{
+    //讀取參數確定軸數量-----------------------------------------------------------------
+    int axisCount = System_axisCount;
+    DEBUG_PRINT("LoadPIDConfig Axis Count>>%d\n", axisCount);
+    if (axisCount == 0)
+    {
+
+    }
+    else
+    {
+        axes.resize(axisCount);//調整 m_Axes 陣列的大小
+
+
+        for (int i = 0; i < axisCount; i++)//開始填入軸參數
+        {
+            std::string prefix = std::to_string(i) + "_";
+
+            axes[i].pid.Kp = ConfigUtil::ReadParam(filePath, prefix + "Kp_IDLE", 20.0);
+            axes[i].pid.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki_IDLE", 10.0);
+            axes[i].pid.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_IDLE", 0.0);
+     
+            //閒置時PID---------------------------
+            axes[i].Pid_IDLE.Kp = ConfigUtil::ReadParam(filePath, prefix + "Kp_IDLE", 20.0);
+            axes[i].Pid_IDLE.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki_IDLE", 10.0);
+            axes[i].Pid_IDLE.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_IDLE", 0.0);
+            //G00時PID---------------------------
+            axes[i].Pid_IDLE.Kp = ConfigUtil::ReadParam(filePath, prefix + "Kp_G00", 20.0);
+            axes[i].Pid_IDLE.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki_G00", 10.0);
+            axes[i].Pid_IDLE.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_G00", 0.0);
+        }
+    }
+
+
+    return true;
+}
+
+
+bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion)
+{
+    //讀取參數確定軸數量-----------------------------------------------------------------
+    int axisCount = System_axisCount;
+    DEBUG_PRINT("LoadPIDConfig Axis Count>>%d\n", axisCount);
+    if (axisCount == 0)
+    {
+
+    }
+    else
+    {
+        axes.resize(axisCount);//調整 m_Axes 陣列的大小
+
+
+        for (int i = 0; i < axisCount; i++)//開始填入軸參數
+        {
+            std::string prefix = std::to_string(i) + "_";
+
+            double Max_speed = ConfigUtil::ReadParam(filePath, prefix + "MAX_Speed", 5000.0);
+            axes[i].maxVel_PPS = MotionCore::UnitPerMinToPps(Max_speed, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double g00_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G00_Speed", 5000.0);
+            axes[i].G00_PPS = MotionCore::UnitPerMinToPps(g00_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
         }
     }
 
@@ -146,3 +215,47 @@ void GlobalConfig::LoadFromFile(const std::string& filePath)
    
    
 }
+bool GlobalConfig::LoadPitchTable(const std::string& filePath, CompensationEngine& compEngine)
+{
+    std::ifstream in(filePath);
+    if (!in.is_open()) {
+        DEBUG_PRINT("[WARN] PITCH_TABLE.txt not found at: %s\n", filePath.c_str());
+        return false;
+    }
+
+    std::string line;
+    // 建立 8 個暫存陣列，用來收集 8 軸各自的整排資料
+    std::vector<double> pitchData[8];
+
+    while (std::getline(in, line)) {
+        // 過濾空白行與註解 (分號或雙斜線開頭)
+        if (line.empty() || line[0] == ';' || line[0] == '/' || line[0] == '#') {
+            continue;
+        }
+
+        std::stringstream ss(line);
+        double val;
+
+        // 橫向讀取這一行的 8 個數值
+        for (int i = 0; i < 8; ++i) {
+            if (ss >> val) {
+                pitchData[i].push_back(val);
+            }
+            else {
+                pitchData[i].push_back(0.0); // 防呆：如果檔案少寫欄位，自動補 0
+            }
+        }
+    }
+    in.close();
+
+    // 將收集好的直向陣列，一軸一軸餵給 CompensationEngine
+    for (int i = 0; i < 8; ++i) {
+        if (!pitchData[i].empty()) {
+            compEngine.SetPitchTable(i, pitchData[i]);
+            // DEBUG_PRINT("[INFO] Axis %d Loaded Pitch Table, Size: %d\n", i, (int)pitchData[i].size());
+        }
+    }
+
+    return true;
+}
+

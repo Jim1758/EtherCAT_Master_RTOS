@@ -27,10 +27,7 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
         {
             std::string prefix = std::to_string(i) + "_";
 
-            axes[i].axisIndex = (int)ConfigUtil::ReadParam(filePath, prefix + "axisIndex", i);
-
-
-            axes[i].isExist = (ConfigUtil::ReadParam(filePath, prefix + "isExist", 1.0) == 1.0);
+          
           
 
             // ----------------------------------------------------
@@ -38,6 +35,12 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
             // ----------------------------------------------------
             double res = ConfigUtil::ReadParam(filePath, prefix + "Resolution", 16777216.0);
             motion.InitAxis(axes[i], res);
+
+
+            axes[i].axisIndex = (int)ConfigUtil::ReadParam(filePath, prefix + "axisIndex", i);
+
+
+            axes[i].isExist = (ConfigUtil::ReadParam(filePath, prefix + "isExist", 1.0) == 1.0);
 
             // ----------------------------------------------------
             // 2. 🌟 [新增] 機械機構參數 (由參數檔讀取)

@@ -17,7 +17,7 @@ namespace GCodeHandlers
     {
         if (nc != nullptr) {
             nc->SetG04TimeMs(0.0); // 歸零
-            DEBUG_PRINT("[NC] G04 Timer Reset\n");
+            //DEBUG_PRINT("[NC] G04 Timer Reset\n");
         }
     }
     // 🌟 專屬的檢查邏輯

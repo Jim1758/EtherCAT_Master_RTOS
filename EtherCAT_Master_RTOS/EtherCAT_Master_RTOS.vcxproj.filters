@@ -165,6 +165,9 @@
     <ClCompile Include="MotionCore_GCode.cpp">
       <Filter>Source Files\Motion</Filter>
     </ClCompile>
+    <ClCompile Include="G53.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">

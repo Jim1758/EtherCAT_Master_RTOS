@@ -12,6 +12,8 @@ constexpr int MAX_AXES = 8;//最大軸數宣告
 const double CYCLE_TIME_SEC = 0.00025;// EtherCAT 通訊週期 (250us)
 
 
+
+
 //列舉定義--------------------------------------------------------------------
 enum class FeedbackSource// 回授訊號來源
 {
@@ -90,7 +92,9 @@ struct AxisContext//軸參數與狀態
     double G00_PPS=0.0;// G00 速度 (Pulse/sec)
     double G00_acc_time;  // 🌟 [新增] G00 的加速時間 (秒)
     double G00_dec_time;  // 🌟 [新增] G00 的減速時間 (秒)
+   
 
+   
     double Stop_dec_time;  //滑行停止減速度 單位(秒)(幾秒內減速完成)
 
     //雙閉環/全閉環設定-------------------------------------------------
@@ -228,6 +232,12 @@ struct AxisContext//軸參數與狀態
     int32_t lastRawActPos = 0;    // 紀錄上一次的原始 32-bit 數值
     double  unwrappedActPos = 0.0;// 展開後、永遠不會溢位的絕對真實位置 (Pulse)
     bool    isFirstCycle = true;  // 開機第一圈對齊旗標
+
+
+
+
+
+
 };
 
 enum class InterpolationMode//插補群組的導航模式
@@ -613,6 +623,10 @@ public:
   
 
     double CalculateShortestTarget(double currentPos, double targetPos, double modulo);
+
+
+    //G碼參數專區------------------------------------------------------------
+    double G00_overrideRatio = 1;//G00 專屬速度比例
    
 private:
    

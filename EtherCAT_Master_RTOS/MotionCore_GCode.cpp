@@ -1,5 +1,6 @@
 ﻿#include "MotionCore.h"
 #include <algorithm> // 為了使用 std::min
+#include "AlarmManager.h" 
 void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double>& targetPos_mm, BufferMode mode)
 {
     // 防呆檢查
@@ -19,6 +20,18 @@ void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double
     for (size_t i = 0; i < axes.size(); ++i) {
         int idx = axes[i];
         AxisContext& axis = (*m_pContexts)[idx];
+
+
+        // =========================================================
+        // 🌟 【新增底層防呆】如果有未啟用的軸被派單，直接拒絕執行！
+        // =========================================================
+        if (!axis.isExist) 
+        {
+            //RtPrintf(">>> [FATAL] MotionCore: Try to move disabled axis index %d!\n", idx);
+            // 這裡可以考慮設定 axis.isFault = true; 來鎖死系統
+            AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_enabledr);
+            return; // 立即跳出，不發車！
+        }
 
         // 1-1. 取加減速最大值 (最安全的煞車距離)
         groupAccTime = std::max(groupAccTime, axis.G00_acc_time);
@@ -43,9 +56,13 @@ void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double
         distancePulse = std::abs(targetPulse - startPulse);
         sum_sq += (distancePulse * distancePulse);
 
+        // =========================================================
+        // 🌟 解決速度問題的核心：將原本的極速 乘上 Override 倍率！
+        // =========================================================
+        double currentAxisMaxPPS = axis.G00_PPS * G00_overrideRatio;
         // 1-4. 🌟 解決速度問題的核心：算出這根軸如果全速跑，要花幾秒？
         if (axis.G00_PPS > 1.0) {
-            double timeNeeded = distancePulse / axis.G00_PPS;
+            double timeNeeded = distancePulse / currentAxisMaxPPS;
             maxTimeNeeded = std::max(maxTimeNeeded, timeNeeded); // 抓出拖慢全隊的「瓶頸時間」
         }
     }
@@ -76,56 +93,3 @@ void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double
 
     SetGroupPathMode(prevMode);
 }
-/*
-void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double>& targetPos_mm, BufferMode mode)
-{
-    // 防呆檢查
-    if (m_pContexts == nullptr || axes.empty() || axes.size() != targetPos_mm.size()) return;
-
-    // =========================================================
-    // 🌟 1. 計算該次移動的群組速度與加減速時間 (木桶效應)
-    // =========================================================
-    double groupG00Vel = 999999999.0;
-    double groupAccTime = 0.0; // 初始設為最小
-    double groupDecTime = 0.0; // 初始設為最小
-
-    for (size_t i = 0; i < axes.size(); ++i) {
-        int idx = axes[i];
-        AxisContext& axis = (*m_pContexts)[idx];
-
-        // 速度取「最小」：牽就跑得最慢的軸
-        groupG00Vel = std::min(groupG00Vel, axis.G00_PPS);
-
-        // 時間取「最大」：牽就加速最慢、需要最長煞車距離的軸
-        groupAccTime = std::max(groupAccTime, axis.G00_acc_time);
-        groupDecTime = std::max(groupDecTime, axis.G00_dec_time);
-    }
-
-    // 🛡️ 防呆保護：如果沒有設定參數，給予一個基本安全值 (0.2秒)
-    if (groupAccTime < 0.001) groupAccTime = 0.2;
-    if (groupDecTime < 0.001) groupDecTime = 0.2;
-
-    // =========================================================
-    // 🌟 2. [轉換引擎]：將 mm 轉為 Pulse
-    // =========================================================
-    std::vector<double> targetPos_Pulse;
-    for (size_t i = 0; i < axes.size(); ++i) {
-        int idx = axes[i];
-        double lead = (*m_pContexts)[idx].finalLead;
-        if (lead < 1e-6) lead = 1.0; // 防呆
-
-        double pulsePerUnit = (*m_pContexts)[idx].resolution_PPR / lead;
-        targetPos_Pulse.push_back(targetPos_mm[i] * pulsePerUnit);
-    }
-
-    // =========================================================
-    // 🌟 3. 執行移動
-    // =========================================================
-    PathMode prevMode = GetGroupPathMode();
-    SetGroupPathMode(PathMode::EXACT_STOP); // G00 一定是精準定位
-
-    // 將算好的群組安全時間傳給 LineMove
-    LineMove(axes, targetPos_Pulse, groupG00Vel, groupAccTime, groupDecTime, BufferMode::ABORTING); // ⚠️ 注意 mode 不要寫死 ABORTING，聽使用者的
-
-    SetGroupPathMode(prevMode);
-}*/

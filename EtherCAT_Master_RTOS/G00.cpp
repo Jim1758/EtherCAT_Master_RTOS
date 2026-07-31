@@ -2,6 +2,8 @@
 #include "EtherCatMaster.h"
 #include "GlobalConfig.h" 
 #include <vector>
+#include "AlarmManager.h" 
+#include "MotionCore.h"
 
 namespace GCodeHandlers
 {
@@ -29,6 +31,9 @@ namespace GCodeHandlers
     // ==========================================================
     WaitConditionFunc Handle_G00(const NCBlock& block, NCManager* nc)
     {
+        nc->MacroSys.SetVar('$', 1, 0);//設定群組1變數
+
+
         // 1. 準備空陣列給 CoordinateManager
         bool axisProgrammed[8] = { false };
         double axisTarget[8] = { 0.0 };
@@ -45,6 +50,20 @@ namespace GCodeHandlers
             // 利用 NCBlock API 抓取數值
             if (block.has(axisLetter))
             {
+              
+            
+                if (!nc->m_motion.GetAxisContext(i).isExist)
+                {
+                    // 1. 印出錯誤 Log，方便除錯
+                    //RtPrintf(">>> [ALARM] G-Code Error: Axis '%c' is disabled but commanded!\n", axisLetter);
+
+                    // 2. 觸發系統警報 (請換成你系統實際跳 Alarm 的 API)
+                    AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_enabledr);
+
+                    // 3. 強制中斷，直接回傳 true 結束這行，絕對不准派單給底層！
+                    return [](NCManager*) { return true; };
+                }
+
                 axisProgrammed[i] = true;
                 axisTarget[i] = block.val(axisLetter); // 這裡是工作座標(WCS)或增量值
                 hasAnyAxis = true;
@@ -57,12 +76,49 @@ namespace GCodeHandlers
         }
 
         // =========================================================
+             // 🌟 【神級修復】：在轉換 "前"，強迫綁定 XYZ，並補齊未下達的 WCS 座標！
+             // =========================================================
+        bool isG168Active = nc->CoordSys.isWorkpieceRotationActive;
+        bool isG68Active = nc->CoordSys.isG68Active;
+        bool isG16Active = nc->CoordSys.isPolarCoordinateActive; // 👈 新增 G16 狀態
+
+        bool moveXYZ = axisProgrammed[0] || axisProgrammed[1] || axisProgrammed[2];
+
+        // 🌟 條件加入 isG16Active
+        if ((isG168Active || isG68Active || isG16Active) && moveXYZ)
+        {
+            double currentWCS[8] = { 0.0 };
+            nc->CoordSys.GetActualWCS(currentWCS);
+
+            // =========================================================
+            // 🌟 針對 G16 的極座標逆運算：把 (X, Y) 轉回 (半徑, 角度)
+            // =========================================================
+            if (isG16Active) {
+                int p1 = 0, p2 = 1; // 預設 G17 (XY 平面)
+                if (nc->CoordSys.activePlane == 18) { p1 = 0; p2 = 2; }
+                if (nc->CoordSys.activePlane == 19) { p1 = 1; p2 = 2; }
+
+                // 利用目前所在位置，逆推算回現在的 半徑(r) 與 角度(a)
+                double r = std::sqrt(currentWCS[p1] * currentWCS[p1] + currentWCS[p2] * currentWCS[p2]);
+                double a = std::atan2(currentWCS[p2], currentWCS[p1]) * (180.0 / 3.14159265359);
+
+                currentWCS[p1] = r; // 將補齊用的座標替換成 半徑
+                currentWCS[p2] = a; // 將補齊用的座標替換成 角度
+            }
+
+            for (int i = 0; i < 3; i++) {
+                if (!axisProgrammed[i]) {
+                    axisProgrammed[i] = true;
+                    axisTarget[i] = currentWCS[i];
+                }
+            }
+        }
+
+        // =========================================================
         // 🌟 4. 座標轉換 (WCS -> MCS)
+        // 此時 axisProgrammed 的 XYZ 絕對都是 true 了！轉換引擎才會真的去算旋轉！
         // =========================================================
         double targetMCS[8] = { 0.0 };
-
-        // 執行轉換：將工作座標 (包含 G90/G91、G54-G59、G92 偏移) 轉為真實的絕對機械座標
-        // ⚠️ 這裡只傳入 3 個參數，與你的 CoordinateManager 實作對齊
         nc->CoordSys.Transform_WCS_to_MCS(axisTarget, axisProgrammed, targetMCS);
 
         // =========================================================
@@ -75,9 +131,30 @@ namespace GCodeHandlers
         {
             if (axisProgrammed[i])
             {
-                activeAxes.push_back(i);           // 記錄軸號
-                targetPos.push_back(targetMCS[i]); // 放入轉換後純淨的「機械絕對座標」
+                activeAxes.push_back(i);
+                targetPos.push_back(targetMCS[i]); // 這裡拿到的 Y 軸，就會是完美旋轉後的 7.0711 了！
             }
+        }
+
+
+        // =========================================================
+        // 🌟 【新增邏輯】讀取 G00 的專屬倍率
+        // =========================================================
+        double rapidOverride = 1.0; // 預設 100%
+
+        // 檢查有沒有下達 F 參數 (例如 G00 X100 F20)
+        if (block.has('F'))
+        {
+            double f_val = block.val('F');
+            nc->GetMotion().G00_overrideRatio= f_val / 100.0;
+          
+           
+        }
+        else
+        {
+            // 💡 實務擴充建議：
+            // 如果這行沒有寫 F，就去讀取人機介面上的「G00 旋鈕」變數
+            // rapidOverride = nc->GetGlobalRapidOverride(); 
         }
        
         // 6. 下達移動命令！(底層會自動套用 G00 的快速定位 PID 與速度)

@@ -89,7 +89,7 @@ void NCManager::CycleStart()
         // 🌟 恢復原本的進給倍率 (這裡寫死 1.0 代表 100%，如果有倍率旋鈕可以從 UI 讀取)
         m_motion.SetGroupFeedrateOverride(1.0);
 
-        DEBUG_PRINT("[NC] Resuming from Feed Hold!\n");
+        //DEBUG_PRINT("[NC] Resuming from Feed Hold!\n");
     }
     // 如果是正常 READY 狀態，代表我們要「全新啟動」
     else if (m_state == NCState::READY)
@@ -100,7 +100,7 @@ void NCManager::CycleStart()
         }
 
         m_state = NCState::RUN;
-        DEBUG_PRINT("[NC] Cycle Start!\n");
+        //DEBUG_PRINT("[NC] Cycle Start!\n");
     }
 }
 
@@ -114,46 +114,69 @@ void NCManager::FeedHold()
         // 🌟 神奇魔法：將倍率設為 0.0，底層的軌跡規劃器就會沿著原路徑平滑煞車！
         m_motion.SetGroupFeedrateOverride(0.0);
 
-        DEBUG_PRINT("[NC] Feed Hold Triggered!\n");
+        //DEBUG_PRINT("[NC] Feed Hold Triggered!\n");
     }
 }
 
 void NCManager::Reset()
 {
 
-   
+    //重置馬達區塊--------------------------------------------------
     m_motion.StopGroup();//滑行停止
     //m_motion.EmergencyStopGroup();//急停
     //m_motion.ResetAllFaults();//軸清除錯誤
     
-    // ⚠️ 極度重要：把進給倍率恢復成 1.0 (100%)
-    // 如果剛剛是在 Hold (0.0) 的狀態下按 Reset，沒加這行下次啟動機台就不會動了！
-    m_motion.SetGroupFeedrateOverride(1.0);
+   
+    m_motion.SetGroupFeedrateOverride(1.0);//進給倍率回到100%
 
-    AlarmManager::GetInstance().Clear();
-    MacroSys.Reset();
+    //重置G碼區塊--------------------------------------------------
+    Reset_Gode();       // 重置G碼相關
+   
+    //重置NC區塊--------------------------------------------------
+    MacroSys.Reset();//重置Macro變數
 
     m_macroStack.clear();
     m_programPC = 0;
     m_macroProgramName = "";
     m_macroProgramPC = -1;
 
-    // 🌟 清空 MDI 與 MANUAL 執行狀態
+    //清空 MDI 與 MANUAL 執行狀態
     m_mdiPC = 0;
     m_manualPC = 0;
     m_manualAutoRunning = false;
 
-    m_state = NCState::RESET_STATE;
+
     std::queue<NCBlock> empty;
     std::swap(m_blockQueue, empty);
     m_waitCallback = nullptr;
-    GCodeHandlers::Reset_G04(this);
-    CoordSys.isAbsoluteMode = true;
 
+
+
+    //重置Alarm--------------------------------------------------
+    AlarmManager::GetInstance().Clear();
+
+
+    m_state = NCState::RESET_STATE;
     m_state = NCState::READY;
 
 
 
+
+
+}
+void NCManager::Reset_Gode()       // 重置G碼相關
+{
+    GCodeHandlers::Reset_G04(this);
+    CoordSys.Set_G90G91(90, this);//重置G90 絕對模式
+    CoordSys.CancelToolLengthCompensation(this);//取消刀常補正
+    CoordSys.CancelWorkpieceRotation(this);//工件補償取消
+    CoordSys.SetActivePlane(17, this);//平面選擇
+    CoordSys.isCAxisOffsetRotationEnabled = true;//C 軸電極偏心旋轉補償
+    CoordSys.CancelScaling(this);//關閉縮放功能
+    bool hasAxis[8] = { false };
+    CoordSys.CancelMirror(hasAxis,this);//關閉鏡像功能
+    CoordSys.CancelPolarCoordinate(this);//關閉極座標
+    CoordSys.CancelToolRadiusCompensation(this);//關閉刀徑補償
 }
 
 // ==========================================
@@ -345,17 +368,21 @@ void NCManager::ProcessExecutionEngine()
         // 結束判斷
         if (activePC >= activeMemory.size())
         {
-            if (isMacro) {
+            if (isMacro) 
+            {
                 ReturnMacro(); // 副程式結束返回
             }
-            else {
+            else 
+            {
                 // 最頂層程式結束了，依照模式決定去留
-                if (m_mode == NCOperationMode::MANUAL) {
+                if (m_mode == NCOperationMode::MANUAL) 
+                {
                     m_state = NCState::READY;
                     m_manualAutoRunning = false;
                 }
                 // 🌟 關鍵修改：MDI 跑完後也直接退回 READY，無縫接軌手動 JOG！
-                else if (m_mode == NCOperationMode::MDI) {
+                else if (m_mode == NCOperationMode::MDI) 
+                {
                     m_state = NCState::READY;
                 }
                 else {
@@ -365,6 +392,10 @@ void NCManager::ProcessExecutionEngine()
 
                 basePC = 0; // 執行完畢指標歸零
                 DEBUG_PRINT("[NC] Execution Finished.\n");
+
+
+                //重置G碼區塊--------------------------------------------------
+                Reset_Gode();// 重置G碼相關
             }
             return;
         }
@@ -507,13 +538,18 @@ void NCManager::ExecuteBlock(const NCBlock& block)
         switch (block.gCode)
         {
         case 0:
-        case 1:
-            // 轉接給直線移動部門，並把他們回傳的「檢查函式」存起來
+      
+            
             m_waitCallback = GCodeHandlers::Handle_G00(block, this);
+            break;
+        case 53:
+
+       
+            m_waitCallback = GCodeHandlers::Handle_G53(block, this);
             break;
 
         case 4:
-            // 轉接給延遲部門，並存下他們專屬的檢查函式
+          
             m_waitCallback = GCodeHandlers::Handle_G04(block, this);
             break;
 
@@ -529,11 +565,59 @@ void NCManager::ExecuteBlock(const NCBlock& block)
         case 954: case 955: case 956: case 957: case 958: case 959:
             m_waitCallback = GCodeHandlers::Handle_GCode(block, this);
             break;
+        case 10:
+            m_waitCallback = GCodeHandlers::Handle_G10(block, this);
+            break;
+        case 160:
+            m_waitCallback = GCodeHandlers::Handle_G160(block, this);
+            break;
+        case 68:
+            m_waitCallback = GCodeHandlers::Handle_G68(block, this);
+            break;
+        case 69:
+            m_waitCallback = GCodeHandlers::Handle_G69(block, this);
+            break;
         case 90: case 91:case 92:
+        case 43: case 44: case 49:
+        case 17: case 18:case 19:
         case 65: // 
+        case 162: case 163:
         
             // 狀態設定回傳的一定是 nullptr (不需等待)
             m_waitCallback = GCodeHandlers::Handle_GCode(block, this);
+            break;
+        case 168:
+            m_waitCallback = GCodeHandlers::Handle_G168(block, this);
+                break;
+        case 169:
+            m_waitCallback = GCodeHandlers::Handle_G169(block, this);
+            break;
+        case 40:
+            m_waitCallback = GCodeHandlers::Handle_G40(block, this);
+            break;
+        case 41:
+            m_waitCallback = GCodeHandlers::Handle_G41(block, this);
+            break;
+        case 42:
+            m_waitCallback = GCodeHandlers::Handle_G42(block, this);
+            break;
+        case 50:
+            m_waitCallback = GCodeHandlers::Handle_G50(block, this);
+            break;
+        case 51:
+            m_waitCallback = GCodeHandlers::Handle_G51(block, this);
+            break;
+        case 150:
+            m_waitCallback = GCodeHandlers::Handle_G150(block, this);
+            break;
+        case 151:
+            m_waitCallback = GCodeHandlers::Handle_G151(block, this);
+            break;
+        case 15:
+            m_waitCallback = GCodeHandlers::Handle_G15(block, this);
+            break;
+        case 16:
+            m_waitCallback = GCodeHandlers::Handle_G16(block, this);
             break;
 
         default:

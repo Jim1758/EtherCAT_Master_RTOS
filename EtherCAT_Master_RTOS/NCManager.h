@@ -36,6 +36,7 @@ public:
     void CycleStart();  // 按下啟動鍵
     void FeedHold();    // 按下暫停鍵
     void Reset();       // 按下重置鍵
+    void Reset_Gode();       // 重置G碼相關
     bool IsFeedHoldActive() const {
         return m_state == NCState::HOLD;
     }

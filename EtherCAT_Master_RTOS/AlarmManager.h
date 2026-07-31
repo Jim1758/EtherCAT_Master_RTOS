@@ -1,11 +1,12 @@
 ﻿#pragma once
 #include <array>
 #include <stdint.h> // 🌟 為了支援 uint32_t
-
+#include <atomic> // 🌟 確保多執行緒安全
 // 簡單的警報項目結構 (無 std::string，保證 RTOS 安全)
 struct AlarmItem {
     int code;
     int lineNo;
+    int axisIndex; // 🌟 新增：哪一軸發生的錯誤 (-1 表示無關)
 };
 
 class AlarmManager {
@@ -43,7 +44,11 @@ public:
     enum AxisAlarm {
         OVER_TRAVEL = AXIS_BASE + 1,   // 3001: 軟體極限過行程
         HARD_LIMIT = AXIS_BASE + 2,   // 3002: 硬體極限開關觸發
-        SERVO_ERROR = AXIS_BASE + 3    // 3003: 伺服驅動器異常 (ALM)
+        SERVO_ERROR = AXIS_BASE + 3,    // 3003: 伺服驅動器異常 (ALM)
+        AXIS_LAG_ERROR = AXIS_BASE + 4,    // 3004: 追隨誤差過大 (Lag Error)
+        AXIS_Fault = AXIS_BASE + 5 ,   // 3005: 驅動器硬體內部報警 (Fault)
+
+     
     };
 
     // 🌟 5. EDM 放電警報 (4000 ~ 4999)
@@ -57,25 +62,26 @@ public:
     static AlarmManager& GetInstance();
 
     // 觸發與查詢函式
-    void Trigger(int code, int lineNo = 0);
+    void Trigger(int code, int lineNo = 0, int axisIndex = -1);
     bool HasAlarm() const;
     int GetAlarmCount() const;
     void Clear();
 
     // 🌟 新增：讓外部可以撈取特定索引的警報代碼
     int GetAlarmId(int index) const;
-
+    int GetAlarmAxisIndex(int index) const; // 🌟 新增：撈取軸編號
     // 🌟 新增：取得警報更新計數器 (給 HMI_Bridge 判斷用的)
     uint32_t GetUpdateCount() const;
 
 private:
     static constexpr int MAX_ALARMS = 64;
     std::array<AlarmItem, MAX_ALARMS> m_alarms;
-    int m_alarmCount;
-    bool m_hasAlarm;
 
-    // 🌟 新增：紀錄狀態改變次數的變數
-    uint32_t m_updateCount;
+    // 🌟 改用 atomic，RTOS 寫、HMI 讀才不會崩潰
+    std::atomic<int> m_alarmCount{ 0 };
+    std::atomic<bool> m_hasAlarm{ false };
+    std::atomic<uint32_t> m_updateCount{ 0 };
 
-    AlarmManager(); // 私有建構子 (單例模式)
+    AlarmManager();
+    AlarmManager(const AlarmManager&) = delete; // 禁止複製
 };

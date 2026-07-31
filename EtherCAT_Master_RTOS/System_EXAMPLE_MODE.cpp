@@ -896,8 +896,11 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
                                     // B3加工暫停----------------------------------------------------
                                     // 2. 讓 X, Y, Z 三軸一起走斜線
 
-                                    std::vector<int> axes = { 0, 1, 2 };
-                                    m_Motion.LineMove(axes, { ONE_REV * 5.0, ONE_REV * 5.0, ONE_REV * 5.0 }, ONE_REV, 0.2, 0.2, BufferMode::BUFFERED);
+                                    //std::vector<int> axes = { 0, 1, 2 };
+                                    //m_Motion.LineMove(axes, { ONE_REV * 5.0, ONE_REV * 5.0, ONE_REV * 5.0 }, ONE_REV, 0.2, 0.2, BufferMode::BUFFERED);
+
+                                    std::vector<int> axes = { 2 };
+                                    m_Motion.LineMove(axes, { ONE_REV * 5.0 }, ONE_REV, 0.2, 0.2, BufferMode::BUFFERED);
 
 
 
@@ -1315,6 +1318,8 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
 
 
                                 //B4 加工暫停--------------------------------------------------------------------------------
+
+                                /*
                                 if (test_timer == 20) // 觸發 B4 加工暫停測試
                                 {
                                     // ====================================================================
@@ -1405,7 +1410,7 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
                                     // 參數1為0(名單內的先動)，參數3為3(X和Y)
                                     m_Motion.TriggerPauseResume(0, ONE_REV * 1.0, 3);
 
-                                }
+                                }*/
 
 
                                 test_timer++;

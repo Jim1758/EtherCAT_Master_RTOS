@@ -21,13 +21,14 @@ enum class NCState {
     ALARM        //系統錯誤
 };
 
-// 3. EDM 設備狀態
+// 🌟 機台綜合狀態 (給 UI 或放電產生器看的)
 enum class EDMState {
-    NOT_READY,
-    READY,
-    START,      // 放電執行中
-    HOLD,       // 放電暫停
-    STOP        // 放電停止
+    NOT_READY,  // 未就緒 (未激磁、有警報、急停中)
+    READY,      // 就緒 (已激磁、無警報、待命中)
+    START,      // 執行中 (NC 正在跑 G 碼)
+    HOLD,       // 暫停 (Feed Hold 暫停中)
+    STOP,       // 停止 (M30 結束，或按下 Reset)
+    ALARM       // 🚨 警報狀態 (硬體報警、軟體語法錯誤、急停)
 };
 
 // 4. 單行指令結構 (GCode 預先解碼後的樣子)

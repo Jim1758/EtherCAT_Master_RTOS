@@ -81,9 +81,20 @@ void NCManager::ChangeState(NCState newState) {
 
 void NCManager::CycleStart()
 {
-    if (m_state == NCState::READY || m_state == NCState::HOLD)
+    // 如果目前是 HOLD 狀態，代表我們要「解除暫停」
+    if (m_state == NCState::HOLD)
     {
-        // 🌟 如果在 MANUAL 模式按下啟動，豎起自動執行旗標
+        m_state = NCState::RUN;
+
+        // 🌟 恢復原本的進給倍率 (這裡寫死 1.0 代表 100%，如果有倍率旋鈕可以從 UI 讀取)
+        m_motion.SetGroupFeedrateOverride(1.0);
+
+        DEBUG_PRINT("[NC] Resuming from Feed Hold!\n");
+    }
+    // 如果是正常 READY 狀態，代表我們要「全新啟動」
+    else if (m_state == NCState::READY)
+    {
+        // 如果在 MANUAL 模式按下啟動，豎起自動執行旗標
         if (m_mode == NCOperationMode::MANUAL && !m_manualMemory.empty()) {
             m_manualAutoRunning = true;
         }
@@ -95,16 +106,30 @@ void NCManager::CycleStart()
 
 void NCManager::FeedHold()
 {
+    // 只有在運行中 (RUN) 按下暫停才有效
     if (m_state == NCState::RUN)
     {
-        m_state = NCState::HOLD;
-        // 呼叫 MotionCore 的群組減速停止
-        // m_motion.StopGroup(..., 0.5); 
+        m_state = NCState::HOLD; // 鎖住 NC，讓它停在現在的 G 碼，不要讀下一行
+
+        // 🌟 神奇魔法：將倍率設為 0.0，底層的軌跡規劃器就會沿著原路徑平滑煞車！
+        m_motion.SetGroupFeedrateOverride(0.0);
+
+        DEBUG_PRINT("[NC] Feed Hold Triggered!\n");
     }
 }
 
 void NCManager::Reset()
 {
+
+   
+    m_motion.StopGroup();//滑行停止
+    //m_motion.EmergencyStopGroup();//急停
+    //m_motion.ResetAllFaults();//軸清除錯誤
+    
+    // ⚠️ 極度重要：把進給倍率恢復成 1.0 (100%)
+    // 如果剛剛是在 Hold (0.0) 的狀態下按 Reset，沒加這行下次啟動機台就不會動了！
+    m_motion.SetGroupFeedrateOverride(1.0);
+
     AlarmManager::GetInstance().Clear();
     MacroSys.Reset();
 
@@ -126,6 +151,9 @@ void NCManager::Reset()
     CoordSys.isAbsoluteMode = true;
 
     m_state = NCState::READY;
+
+
+
 }
 
 // ==========================================
@@ -215,13 +243,32 @@ void NCManager::ProcessTask()
 {
     NC_RunCount++;
 
-    if (AlarmManager::GetInstance().HasAlarm()) {
-        m_state = NCState::ALARM;
-        return;
-    }
-    if (m_state == NCState::ALARM) return;
 
-    // 🌟 極度乾淨的任務分流
+  
+    // =========================================================
+    // 🌟 1. 【最高優先】每一圈都重新結算並更新機台總合狀態！
+    // =========================================================
+    m_edmState = GetMachineEDMState();
+
+
+    // =========================================================
+    // 🚨 2. 【絕對防禦攔截網】警報與急停鎖死區
+    // =========================================================
+    // 不論是軟體觸發的 Alarm，或是從 UI 傳下來的 Alarm 狀態
+    if (AlarmManager::GetInstance().HasAlarm() || m_state == NCState::ALARM) 
+    {
+        m_state = NCState::ALARM; // 確保 NC 大腦確實進入警報狀態
+
+        // 🌟 [關鍵新增]：只要在警報狀態，每一毫秒都強制下達急停！
+        // (底層的 EmergencyStop 有防重複機制，所以這樣寫既安全又暴力)
+        m_motion.EmergencyStopGroup();
+
+        // ⚠️ 立刻退出迴圈，絕對不准往下執行任何軌跡運算或 G 碼解析！
+        return; 
+    }
+    // =========================================================
+    // 🌟 3. 正常任務分流 (只有在無警報時才會走到這裡)
+    // =========================================================
     switch (m_mode)
     {
     case NCOperationMode::MEMORY:
@@ -673,4 +720,79 @@ bool NCManager::LoadDynamicCode(const std::string& content)
 
     DEBUG_PRINT("[NC] Dynamic Code Loaded, Lines: %d\n", (int)targetMemory->size());
     return !targetMemory->empty();
+}
+
+// ==========================================
+// 🌟 獲取機台綜合狀態 (結算 NC 大腦與馬達硬體)
+// ==========================================
+EDMState NCManager::GetMachineEDMState()
+{
+    // ----------------------------------------------------
+    // 🚨 1. [最高優先權] 警報與急停檢查 (回傳 ALARM)
+    // ----------------------------------------------------
+    // 檢查軟體警報 (AlarmManager 或是 NC 狀態為 ALARM)
+    if (AlarmManager::GetInstance().HasAlarm() || m_state == NCState::ALARM) {
+        return EDMState::ALARM;
+    }
+
+    // 檢查硬體馬達是否報警或處於急停狀態
+    for (int i = 0; i < 8; ++i) {
+        auto& axis = m_motion.GetAxisContext(i);
+        // 只要有一軸急停、錯誤 (Fault) 或追隨誤差警報 (LagAlarm)
+        if (axis.state == MotionState::MotionState_ESTOP ||
+            axis.state == MotionState::MotionState_ERROR ||
+            axis.isFault || axis.isLagAlarm)
+        {
+
+            if (axis.isFault)
+            {
+                AlarmManager::GetInstance().Trigger(AlarmManager::AXIS_Fault, 0, axis.axisIndex);
+            }
+            if (axis.isLagAlarm)
+            {
+                AlarmManager::GetInstance().Trigger(AlarmManager::AXIS_LAG_ERROR, 0, axis.axisIndex);
+            }
+       
+
+            return EDMState::ALARM;
+        }
+    }
+
+    // ----------------------------------------------------
+      // 🔌 2. [次高優先權] 激磁 (Servo On) 檢查 (回傳 NOT_READY)
+      // ----------------------------------------------------
+    for (int i = 0; i < 8; ++i) {
+        auto& axis = m_motion.GetAxisContext(i);
+
+        // 🌟 只檢查「物理上確實存在（或被啟用）」的軸！
+        // 這樣就算跳號 (例如有 0,1,2，跳過 3，有 4)，也不會卡死！
+        if (axis.isExist) {
+            if (!axis.isServoOn) {
+                return EDMState::NOT_READY;
+            }
+        }
+    }
+
+    // ----------------------------------------------------
+    // 🧠 3. [邏輯判斷] 根據 NC 大腦狀態推導機台狀態
+    // ----------------------------------------------------
+    switch (m_state)
+    {
+    case NCState::RUN:
+        return EDMState::START;  // 🟢 正在跑程式
+
+    case NCState::HOLD:
+        return EDMState::HOLD;   // 🟡 操作員按下了暫停 (Feed Hold)
+
+    case NCState::RESET_STATE:
+    case NCState::P_END:
+        return EDMState::STOP;   // ⚪ 程式結束或剛被 Reset 斬斷
+
+    case NCState::IDLE:
+    case NCState::READY:
+        return EDMState::READY;  // 🔵 一切正常，等待 Cycle Start
+
+    default:
+        return EDMState::NOT_READY;
+    }
 }

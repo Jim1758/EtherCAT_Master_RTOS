@@ -3,6 +3,8 @@
 #include <iostream>  // for debug prints if needed
 #include "EtherCatMaster.h"
 #include "CoordinateManager.h"
+#include "SHM_Types.h"
+
 MotionCore::MotionCore() {}
 
 
@@ -51,6 +53,7 @@ double MotionCore::UnitPerMinToPps(double unitPerMin, double resolution, double 
 // ==========================================
 void MotionCore::InitAxis(AxisContext& axis, double resolution)
 {
+    axis.isExist = false; // 🌟 預設為不存在，直到掃描到 EtherCAT 實體站點才開啟
     // 1. 物理參數
     axis.resolution_PPR = resolution;
 
@@ -97,6 +100,12 @@ void MotionCore::InitAxis(AxisContext& axis, double resolution)
 
     // 在你初始化 AxisContext 的地方
     axis.targetEndVel = 0.0;
+
+    // 在 InitAxis 初始化時，把它轉成 Pulse 存起來
+    double pulsePerUnit = axis.resolution_PPR / axis.finalLead;
+    axis.inPositionWindow_Pulse = axis.inPositionWindow_mm * pulsePerUnit;
+    // 把算好的 Pulse 寫入 PID 的 MaxLag 供伺服迴圈檢查
+    axis.pid.MaxLag = axis.maxLag_mm * pulsePerUnit;
 }
 
 void MotionCore::InitSmoothBuffer(AxisContext& axis, double smoothTime_ms)
@@ -131,10 +140,11 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         return;
     }
 
-    // 3. 迴圈迭代每一軸
+   
     for (size_t i = 0; i < m_pDrives->size(); ++i)
     {
         // 呼叫原本寫好的單軸更新邏輯
+     
         UpdateMotion((*m_pDrives)[i], (*m_pContexts)[i]);
         UpdateServoState((*m_pDrives)[i], (*m_pContexts)[i]);
 
@@ -168,8 +178,11 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                     if (physicalPos < 0.0) physicalPos += axis.rotaryModulo;
                 }
 
-                // 處理方向 (isReverse)
-                tempMCS[i] = axis.isReverse ? -physicalPos : physicalPos;
+               // ========================================================
+        // 🌟 [神級修復]：直接把 physicalPos 給 tempMCS！
+        // 因為大腦 (currentActPos) 早就已經是完美的邏輯方向了，絕對不要再反轉它！
+        // ========================================================
+        tempMCS[i] = physicalPos;
             }
             else
             {
@@ -179,7 +192,50 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 
         m_pCoordMgr->UpdateActualMCS(tempMCS);
     }
-    // ========================================================
+
+
+
+   
+       
+}
+
+void MotionCore::ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputInMM)
+{
+    if (m_pContexts == nullptr || outDebugArray == nullptr) return;
+
+    for (size_t i = 0; i < m_pContexts->size() && i < 8; ++i)
+    {
+        AxisContext& axis = (*m_pContexts)[i];
+
+        // 1. 取得解析度與導程 (防止除零)
+        double resolution = (axis.resolution_PPR > 0.0) ? axis.resolution_PPR : 1.0;
+        double lead = (axis.finalLead > 0.0) ? axis.finalLead : 1.0;
+        double unitsPerPulse = lead / resolution; // 1 Pulse = 多少 mm
+
+        // 2. 基礎數值匯出
+        outDebugArray[i].CmdPos = axis.currentCmdPos * (outputInMM ? unitsPerPulse : 1.0);
+        outDebugArray[i].ActPos = axis.currentActPos * (outputInMM ? unitsPerPulse : 1.0);
+        outDebugArray[i].LagError = (axis.currentCmdPos - axis.currentActPos) * (outputInMM ? unitsPerPulse : 1.0);
+        outDebugArray[i].CmdVel = axis.currentCmdVel * (outputInMM ? unitsPerPulse : 1.0);
+        outDebugArray[i].ActVel = axis.currentActVel * (outputInMM ? unitsPerPulse : 1.0);
+        outDebugArray[i].MaxLagLimit = axis.pid.MaxLag * (outputInMM ? unitsPerPulse : 1.0);
+
+        // 🌟 3. 計算 RPM (實際轉速)
+        // 公式：(Pulse/sec * 60秒) / 每轉 Pulse 數
+        outDebugArray[i].ActualRPM = (axis.currentActVel * 60.0) / resolution;
+
+        // 🌟 4. 計算 m/min (米/分鐘)
+        // 計算邏輯： (PPS * (mm/Pulse) * 60秒) / 1000 (轉為米)
+        // 只有當單位是 mm 時這個才有意義
+        double mm_per_min = (axis.currentActVel * unitsPerPulse) * 60.0;
+        outDebugArray[i].ActualMpm = mm_per_min / 1000.0;
+
+        // 狀態
+        outDebugArray[i].State = (int)axis.state;
+        outDebugArray[i].IsServoOn = axis.isServoOn ? 1 : 0;
+        outDebugArray[i].IsFault = axis.isFault ? 1 : 0;
+        outDebugArray[i].IsLagAlarm = axis.isLagAlarm ? 1 : 0;
+    }
 }
 void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更新單軸狀態 逐步激磁
 {
@@ -232,21 +288,33 @@ void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更
 
 double MotionCore::CalculateShortestTarget(double currentPos, double targetPos, double modulo)
 {
-    // 1. 計算目標與當前的純差值
-    double diff = fmod(targetPos - currentPos, modulo);
+    // 防呆
+    if (modulo <= 0.0) return targetPos;
 
-    // 2. 處理 C++ fmod 負數的問題
-    if (diff < -modulo / 2.0) {
-        diff += modulo;
+    // 1. 將「目前絕對位置」轉換到 0 ~ 360 的真實角度
+    double curMod = std::fmod(currentPos, modulo);
+    if (curMod < 0.0) curMod += modulo;
+
+    // 2. 將「指令目標位置」轉換到 0 ~ 360 的真實角度
+    double tgtMod = std::fmod(targetPos, modulo);
+    if (tgtMod < 0.0) tgtMod += modulo;
+
+    // 3. 計算兩者的「最小角度差」
+    double diff = tgtMod - curMod;
+
+    // 4. 判斷最短路徑：如果差距超過半圈 (180度)，就反過來走！
+    double halfModulo = modulo / 2.0;
+    if (diff > halfModulo) {
+        diff -= modulo; // 原本要正轉超過180度 -> 改成逆轉
     }
-    else if (diff > modulo / 2.0) {
-        diff -= modulo;
+    else if (diff < -halfModulo) {
+        diff += modulo; // 原本要逆轉超過180度 -> 改成正轉
     }
 
-    // 3. 回傳展開後的「絕對連續目標位置」
+    // 5. 🌟 關鍵：將算出來的「真實角度差」，加上原本龐大的絕對累積座標！
+    // 範例： 7696.0 + diff
     return currentPos + diff;
 }
-
 void MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time)
 {
 
@@ -392,41 +460,59 @@ void MotionCore::VelocityMove(AxisContext& axis, double velocity, double acc_tim
         // 如果你要從運動中無縫切換，保留原本的速度是正確的。
     }
 }
-void  MotionCore::StopMove(AxisContext& axis, double dec_time)
+void MotionCore::StopMove(AxisContext& axis, double dec_time)
 {
+    // 如果是 IDLE 直接離開
     if (axis.state == MotionState::MotionState_IDLE) return;
 
-    // 安全保護：避免除以零
-    if (dec_time < 0.001) dec_time = 0.001;
-
-    // 【核心邏輯：固定斜率煞車】
-    // 減速度 = 最高速度 / 減速時間常數
-    // 這保證了不管當前速度多少，煞車的「陡度」永遠一致
+    // 設定減速斜率
     double max_v = (axis.maxVel_PPS > 0.1) ? axis.maxVel_PPS : 1000.0;
     axis.dec_PPS2 = max_v / dec_time;
 
-    // 強制進入煞車狀態，交給 Calc_Trajectory_Velocity 處理
-    axis.state = MotionState::MotionState_STOPPING;
+    // 🌟 [關鍵修復]：區分模式
+    if (axis.state == MotionState::MotionState_MOVING)
+    {
+        // 如果是 G00 定位中，不要切換狀態！直接把終點改為「減速後的預計停靠點」
+        // 讓原本的 Calc_Trajectory_Trapezoidal 繼續執行煞車，這樣永遠不會亂掉座標！
+        double currentSpeed = std::abs(axis.currentCmdVel);
+        double stopDist = (currentSpeed * currentSpeed) / (2.0 * axis.dec_PPS2);
 
-    // RtPrintf("[DEBUG] Stop Triggered. DecRate: %.1f PPS2\n", axis.dec_PPS2);
+        // 將終點強行拉到煞車後的停車點
+        if (axis.currentCmdVel > 0) axis.finalTargetPos = axis.currentCmdPos + stopDist;
+        else axis.finalTargetPos = axis.currentCmdPos - stopDist;
+    }
+    else
+    {
+        // 只有在速度模式 (VelocityMove) 才使用 STOPPING 狀態
+        axis.state = MotionState::MotionState_STOPPING;
+    }
 }
 void MotionCore::EmergencyStop(AxisContext& axis)
 {
-    if (axis.state == MotionState::MotionState_ERROR) return;
+    // 如果已經在 ERROR 或 ESTOP 狀態，就不需要重複觸發
+    if (axis.state == MotionState::MotionState_ERROR ||
+        axis.state == MotionState::MotionState_ESTOP) return;
 
-    // 1. 狀態強制切換為 ERROR (或設計一個專屬的 ESTOP 狀態)
+    // 1. 狀態強制切換為 ESTOP
     axis.state = MotionState::MotionState_ESTOP;
 
-    // 2. 瞬間掐斷大腦所有的速度與目標
+    // 2. 瞬間掐斷大腦所有的速度
     axis.currentCmdVel = 0.0;
     axis.targetVelocity = 0.0;
-    axis.planningPos = axis.currentCmdPos;
+    axis.logicalCmdVel = 0.0; // 🌟 [新增] 同步清空邏輯速度，避免空間轉換矩陣產生突波
 
-    // 3. 暴力清空 S-Curve 緩衝區！
+    // 3. 強制截斷所有「未來的目標」
+    // 🌟 [新增] 把終點和規劃點都死鎖在「發生急停的這一瞬間」
+    // 這樣就算急停解除，大腦也不會企圖去追趕原本沒跑完的路線
+    axis.planningPos = axis.currentCmdPos;
+    axis.finalTargetPos = axis.currentCmdPos;
+
+    // 4. 暴力清空 S-Curve 緩衝區！
     // 絕對不能讓煞車前的餘速留在 Buffer 裡，否則解除急停時機台會抖一下
     if (axis.velBuffer.size() > 0) {
         std::fill(axis.velBuffer.begin(), axis.velBuffer.end(), 0.0);
         axis.bufferSum = 0.0;
+        axis.bufferIndex = 0; // 🌟 [新增] 緩衝區指針也要歸零，確保下次從頭開始填寫
     }
 
     // RtPrintf(">>> [ALARM] Axis E-STOP Triggered! Velocity Killed Instantly.\n");
@@ -444,13 +530,63 @@ void MotionCore::Stop(AxisContext& axis)
 
 void MotionCore::ResetFault(AxisContext& axis)
 {
+    // 🌟 1. 先把「有沒有發生過嚴重脫節」的狀態記下來
+    // 只有這些情況，大腦才需要放棄尊嚴，去跟實體座標對齊
+    bool needPhysicalSnap = axis.isFault ||
+        axis.isLagAlarm ||
+        (axis.state == MotionState::MotionState_ESTOP);
+
+    // 2. 清除所有異常旗標與 PID 歷史
     axis.isFault = false;
+    axis.isLagAlarm = false;
     axis.pid.integralAcc = 0.0;
     axis.pid.prevError = 0.0;
     axis.state = MotionState::MotionState_IDLE;
-    //RtPrintf("Axis Fault Reset.\n");
-}
 
+    // =========================================================
+    // 🌟 3. [神級修復] 條件式座標對齊 (消滅無謂的座標飄移)
+    // =========================================================
+    if (axis.isVirtualAxis)
+    {
+        // 【虛擬軸】：它是大腦的幽靈，沒有實體。直接清空進度就好。
+        axis.currentCmdPos = 0.0;
+        axis.logicalCmdPos = 0.0;
+        axis.planningPos = 0.0;
+        axis.currentCmdVel = 0.0;
+    }
+    else if (needPhysicalSnap)
+    {
+        // 【嚴重脫節的實體軸】：大腦必須向實體馬達低頭，重新對齊起跑線
+        // 否則下次一 Servo On，就會瞬間衝向原本的 CmdPos 造成撞機！
+        axis.currentCmdPos = axis.currentActPos;
+        axis.logicalCmdPos = axis.currentActPos;
+        axis.planningPos = axis.currentActPos;
+        axis.currentCmdVel = 0.0;
+    }
+    // else 
+    // {
+    //      【健康的實體軸】：例如只是普通 NC Reset，沒有報警。
+    //      🌟 絕對不要動大腦座標！保留最完美的數學理論精度！
+    // }
+}
+void MotionCore::ResetAllFaults()//全軸 清除異常狀態
+{
+    if (m_pContexts == nullptr) return;
+
+    for (size_t i = 0; i < m_pContexts->size(); ++i) {
+        ResetFault((*m_pContexts)[i]);
+    }
+
+    m_Group.isActive = false;
+    m_Group.cmdQueue.clear();
+    ResetFault(m_Group.virtualAxis); // 👈 現在有了 isVirtualAxis 保護，這裡也安全了！
+
+    if (m_Group.jumpManager.state != JumpState::IDLE) {
+        m_Group.jumpManager.state = JumpState::IDLE;
+        m_Group.jumpManager.currentOffset = 0.0;
+        m_Group.jumpManager.jumpVel = 0.0;
+    }
+}
 // ==========================================
 // [Layer 3] 軌跡規劃 (Trajectory Generator)
 // ==========================================
@@ -463,30 +599,42 @@ void MotionCore::Calc_Trajectory_Trapezoidal(AxisContext& axis, AxisCommand& out
         return;
     }
 
+
+
     double dt = CYCLE_TIME_SEC;
     double planDistErr = axis.finalTargetPos - axis.planningPos;
-
-    // 🟢 [新增] 判斷當前的移動方向 (1.0 代表正向，-1.0 代表負向)
     double dir = (planDistErr >= 0.0) ? 1.0 : -1.0;
     double planDist = std::abs(planDistErr);
 
-    // 捕獲式到站偵測
-    bool isPlanDone = (planDist <= std::abs(axis.currentCmdVel * dt)) || (planDist < 1.0);
+    // 🌟 1. 預判：現在的速度 1ms 跨出去會走多遠？
+    double stepDist = std::abs(axis.currentCmdVel * dt);
+
+    // 🌟 2. 完美吸附邏輯：如果這 1ms 跨出去會超過終點，或者距離已經微小到可以忽略 (<0.001)
+    bool isPlanDone = (planDist <= stepDist) || (planDist < 0.001);
 
     if (isPlanDone)
     {
+        // 把剩餘的微小距離，化為這最後 1ms 的「微小速度」，推入 S-Curve 緩衝區
+        axis.currentCmdVel = dir * (planDist / dt);
+
+        // 🎯 大腦強制精準對齊目標點！(消滅浮點數殘留，保證不飄移！)
         axis.planningPos = axis.finalTargetPos;
 
+        // 考慮交接速度 (G01 連續加工時用到)
         if (std::abs(axis.targetEndVel) > 0.1) {
-            axis.currentCmdVel = dir * std::abs(axis.targetEndVel); // 帶上方向
-        }
-        else {
-            axis.currentCmdVel = 0.0;
+            axis.currentCmdVel = dir * std::abs(axis.targetEndVel);
         }
     }
     else
     {
-        double max_v = (axis.cruiseVel_PPS > 0.1) ? axis.cruiseVel_PPS : axis.maxVel_PPS;
+        //double max_v = (axis.cruiseVel_PPS > 0.1) ? axis.cruiseVel_PPS : axis.maxVel_PPS;
+        // 完全信任倍率算出來的速度，就算是 0 也要乖乖接受！
+        double max_v = axis.cruiseVel_PPS;
+
+        // 防呆：防止出現負數，造成稍後開根號 (std::sqrt) 變成 NaN 崩潰
+        if (max_v < 0.0) max_v = 0.0;
+
+
         double dec = axis.dec_PPS2;
         double v_end = std::abs(axis.targetEndVel);
         if (v_end > max_v) v_end = max_v;
@@ -568,12 +716,26 @@ void MotionCore::Calc_Trajectory_Trapezoidal(AxisContext& axis, AxisCommand& out
 
     // [到位判斷]
     bool isBufferDry = (std::abs(finalOutputVel) < 1.0);
+    // 2. 指令到站條件 (大腦算完)
     bool isHandoverReady = (std::abs(axis.targetEndVel) > 0.1) ? isPlanDone : (isPlanDone && isBufferDry);
 
-    if (isHandoverReady && axis.state == MotionState::MotionState_MOVING)
+    // ========================================================
+    // 🌟 3. [修正] 區分大腦(虛擬軸)與手腳(實體軸)的到位判定
+    // ========================================================
+    bool isPhysicalInPos = true; // 預設為 true (讓虛擬軸無條件通過)
+
+    // 只有「實體軸」才需要嚴格檢查實體誤差！
+    if (!axis.isVirtualAxis)
+    {
+        double currentLag = std::abs(axis.currentCmdPos - axis.currentActPos);
+        isPhysicalInPos = (currentLag <= axis.inPositionWindow_Pulse);
+    }
+
+    // 必須大腦算完，且實體也擠進視窗了，才算結束！
+    if (isHandoverReady && isPhysicalInPos && axis.state == MotionState::MotionState_MOVING)
     {
         if (std::abs(axis.targetEndVel) <= 0.1) {
-            axis.state = MotionState::MotionState_IDLE; // 完美進入閒置
+            axis.state = MotionState::MotionState_IDLE;
         }
         axis.inPosition = true;
     }
@@ -607,6 +769,8 @@ void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd
             axis.currentCmdVel += axis.dec_PPS2 * dt;
             if (axis.currentCmdVel > 0.0) axis.currentCmdVel = 0.0; // 完美截斷
         }
+
+
     }
     else // MotionState::MotionState_MOVING
     {
@@ -718,15 +882,13 @@ template <typename DriveType>
 void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd)
 {
 
+    DetermineActiveGainSet(axis); // PID 依照狀態切換
 
-    DetermineActiveGainSet(axis);// PID 依照狀態切換
- 
-  
-
-
-
-    // 1. [Feedback Selection] 雙回授處理
-    double rawMotorPos = (double)servo.pInput->ActualPosition;
+        // =========================================================
+        // 🌟 1. [Feedback Selection] 雙回授處理
+        // ⚠️ 絕對不要在這裡重新讀取 servo.pInput->ActualPosition！
+        // 因為 UpdateMotion 已經算好「不會溢位、完美展開」的 axis.currentActPos 了！
+        // =========================================================
 
     if (axis.fbMode == FeedbackSource::LINEAR_SCALE && axis.pScaleActualPos != nullptr)
     {
@@ -734,39 +896,54 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         double rawScalePos = (double)(*axis.pScaleActualPos);
         double convertedScalePos = rawScalePos * axis.scaleToMotorRatio;
 
-        axis.currentActPos = convertedScalePos;
-
         // [Safety] 斷帶保護 (Slip Detection)
-        // 檢查馬達與光學尺是否偏差過大
-        if (std::abs(rawMotorPos - convertedScalePos) > axis.maxDeviation) {
+        // 🌟 改用展開後的馬達座標 (axis.currentActPos) 跟光學尺比對
+        if (std::abs(axis.currentActPos - convertedScalePos) > axis.maxDeviation) {
             axis.isFault = true;
             servo.pOutput->TargetVelocity = 0;
             RtPrintf("ALARM: Dual Loop Deviation Error!\n");
             return;
         }
+
+        // 檢查完畢後，才把大腦認知的實際位置改為光學尺位置
+        axis.currentActPos = convertedScalePos;
     }
-    else
-    {
-        // 半閉迴路：只看馬達
-        axis.currentActPos = rawMotorPos;
-    }
+    // =========================================================
+    // ⚠️ 原本的 else { axis.currentActPos = rawMotorPos; } 已經整塊刪除！
+    // 如果是半閉迴路 (馬達編碼器)，直接沿用 UpdateMotion 傳進來的完美 axis.currentActPos！
+    // =========================================================
+
+
+    // ==========================================
+    // 🌟 [新增] 實體速度差分計算 (ActVel)
+    // 速度 = (現在位置 - 上次位置) / 週期時間
+    // ==========================================
+    axis.currentActVel = (axis.currentActPos - axis.lastActPos) / CYCLE_TIME_SEC;
+    axis.lastActPos = axis.currentActPos; // 記錄本次位置，供下 1ms 使用
 
 
 
 
-    // 2. [Lag Monitor] 跟隨誤差檢查
+    // 2. [Lag Monitor] 跟隨誤差檢查 (此時的 ActPos 絕對不會溢位)
     double error = cmd.instantCmdPos - axis.currentActPos;
 
     if (axis.pid.EnableLagCheck == true)
     {
+
         if (std::abs(error) > axis.pid.MaxLag)
         {
             axis.isFault = true;
+            axis.isLagAlarm = true;
             servo.pOutput->TargetVelocity = 0;
             axis.state = MotionState::MotionState_ERROR;
+
+            // 🌟 修正：不要再轉 (int) 了，直接印 double
             RtPrintf("ALARM! Lag:%d | Cmd:%d | Act:%d\n", (int)error, (int)cmd.instantCmdPos, (int)axis.currentActPos);
             return;
         }
+
+
+       
     }
 
 
@@ -794,6 +971,17 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     if (finalVel > limit) finalVel = limit;
     if (finalVel < -limit) finalVel = -limit;
 
+    // 🌟 輸出給硬體前，根據硬體方向翻轉速度
+    if (axis.isReverse)
+    {
+        finalVel = -finalVel;
+    }
+
+    if (axis.Axis_Reverse)
+    {
+        finalVel = -finalVel;
+    }
+
     // 6. [Write PDO] 寫入 EtherCAT
     servo.pOutput->TargetVelocity = (int32_t)finalVel;
 }
@@ -806,13 +994,38 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
 template <typename DriveType>
 void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
 {
+    
+    // =========================================================
+      // 🌟 [神級修復] 絕對安全的 32-bit 展開寫法 (過濾編譯器 UB)
+      // =========================================================
+      // 1. 強制轉為無號整數 (uint32_t)，不管怎麼翻轉，相減絕對是正確的微小正負差
+    uint32_t currentRawAct = (uint32_t)servo.pInput->ActualPosition;
 
-    // 0. 檢查 EtherCAT 狀態 (必須 Servo On 且 Mode 9)
+    if (axis.isFirstCycle) {
+        axis.lastRawActPos = currentRawAct;
+        axis.unwrappedActPos = (double)(int32_t)currentRawAct;
+        axis.isFirstCycle = false;
+    }
 
-    // 0x0027 = Operation Enabled
+    // 2. 無號相減後，再強制轉回有號整數 (int32_t)，取得真實移動的 Pulse 數量
+    int32_t pulseDelta = (int32_t)(currentRawAct - (uint32_t)axis.lastRawActPos);
+
+    // 3. 記錄歷史與累加到無限大的 double 容器中
+    axis.lastRawActPos = currentRawAct;
+    axis.unwrappedActPos += (double)pulseDelta;
 
 
-    axis.currentActPos = (double)servo.pInput->ActualPosition;
+    // =========================================================
+      // 🌟 核心邏輯：只針對硬體方向做翻轉，這才是 PID 和規劃器需要的「純淨邏輯座標」
+      // =========================================================
+    axis.currentActPos = axis.isReverse ?  -axis.unwrappedActPos : axis.unwrappedActPos;
+    if (axis.Axis_Reverse == true)
+    {
+        axis.currentActPos = -axis.currentActPos;
+    }
+  
+    // =========================================================
+
 
     bool isServoOn = (servo.pInput->StatusWord & 0x0027) == 0x0027;
 
@@ -820,40 +1033,25 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
 
 
 
-    // 若未激磁或不在 CSV 模式，只做狀態追隨，不運算
-
+    // 🌟 1. [優先權最高] 只要還沒 Servo On，大腦就必須一直盯著實體馬達，保持座標同步
     if (!isServoOn || opMode != 9) {
-
-        // 將規劃位置重置為實際位置，避免下次啟動暴衝
-
-        axis.currentCmdPos = axis.currentActPos;//是給底層 PID 追隨用的（經過加減速濾波的最終點）。
-
-        axis.logicalCmdPos = axis.currentCmdPos; //給上層 NC 大腦思考用的（它是還原了 G68 空間旋轉、補正後的純邏輯點）。
-
+        axis.currentCmdPos = axis.currentActPos;
+        axis.logicalCmdPos = axis.currentActPos;
         axis.currentCmdVel = 0.0;
-
-        axis.logicalCmdVel = 0.0; // 🟢 同步邏輯速度
-
+        axis.logicalCmdVel = 0.0;
         axis.pid.integralAcc = 0.0;
-
         axis.state = MotionState::MotionState_IDLE;
-
         servo.pOutput->TargetVelocity = 0;
-
-        return;
-
+        return; // 這裡 Return 就好，不用管 Fault
     }
 
-
-    // 若故障，鎖死輸出
+    // 🌟 2. 已經 Servo On 的情況下，才檢查軟體警報
     if (axis.isFault) {
         servo.pOutput->TargetVelocity = 0;
         return;
     }
 
-
-
-
+    
 
 
     // ==========================================
@@ -937,6 +1135,7 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
         break;
     }
 
+  
     // ==========================================
     // 🌟 2. [Layer 2.5] 進入補償層 (動態加入螺距與背隙誤差)
     // ==========================================
@@ -949,6 +1148,10 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
     // ==========================================
     // 無論是 "定位" 還是 "速度" 模式，算出來的 cmd 
     // 最後都統一進 PID 迴圈算出 TargetVelocity
+   
+
+
+  
     Run_Servo_Loop(servo, axis, cmd);
 }
 
@@ -971,6 +1174,7 @@ void MotionCore::InitVirtualAxisSmooth(int windowSize)
     // 2. 初始化虛擬主軸 (Virtual Axis) 的位置與狀態
     // ==========================================
     AxisContext& vAxis = m_Group.virtualAxis;
+    vAxis.isVirtualAxis = true; // 🌟 [新增] 發放免死金牌！我是幽靈，不要檢查我的物理誤差！
     vAxis.state = MotionState::MotionState_IDLE; // 確保一開機是閒置狀態
     vAxis.currentCmdPos = 0.0;
     vAxis.currentCmdVel = 0.0;
@@ -1005,9 +1209,14 @@ void MotionCore::LineMove(const std::vector<int>& axes, const std::vector<double
         cmd.axisIndices[i] = axes[i];
         cmd.targetPos[i] = targetPos[i];
     }
+
     cmd.targetVel = std::abs(targetVel);
     cmd.accTime = acc_time;
     cmd.decTime = dec_time;
+
+
+    // 🔍 [加入這行] 確認收到指令
+    //RtPrintf("[DBG-1] LineMove Queueing! AxisCnt:%d | FirstAxis:%d | TargetPulse:%d\n",cmd.axisCount, cmd.axisIndices[0], (int)cmd.targetPos[0]);
 
     // 2. 判斷是「乖乖排隊」還是「緊急覆寫」？
     if (mode == BufferMode::ABORTING)
@@ -1100,19 +1309,25 @@ void MotionCore::LoadNextCommand()
             // 🌟 [新增] 多軸同動：旋轉軸最短路徑展開
             // ======================================================
             double actualTarget = cmd.targetPos[i];
-
+            double originalTarget = cmd.targetPos[i]; // 偷記下原始目標
             if (realAxis.axisType == AxisType::ROTARY && realAxis.useShortestPath)
             {
                 actualTarget = CalculateShortestTarget(m_Group.startPos[i], actualTarget, realAxis.rotaryModulo);
 
-                // ⚠️ 極度重要防呆：必須將展開後的絕對度數寫回 cmd，
-                // 否則 B2 模式 (時光機原路退刀) 讀取歷史紀錄時，座標會發生錯亂瞬移！
                 cmd.targetPos[i] = actualTarget;
                 m_Group.currentCmd.targetPos[i] = actualTarget;
+                // 🌟 RTX64 RtPrintf: English + %d
+                RtPrintf("[ROTARY DEBUG] Axis:%d | OrigCmd:%d | CurStart:%d | NewTgt:%d | Delta:%d\n",
+                    idx,
+                    (int)originalTarget,
+                    (int)m_Group.startPos[i],
+                    (int)actualTarget,
+                    (int)(actualTarget - m_Group.startPos[i]));
             }
 
             // 2. 計算邏輯位移 (Delta)
-            double delta = cmd.targetPos[i] - m_Group.startPos[i];
+           // double delta = cmd.targetPos[i] - m_Group.startPos[i];
+            double delta = actualTarget - m_Group.startPos[i];
 
             // 3. 累加平方和 (用於計算 3D 直線總長度)
             sum_sq += (delta * delta);
@@ -1125,11 +1340,23 @@ void MotionCore::LoadNextCommand()
         }
 
         double totalDist = std::sqrt(sum_sq);
+
+        /*
         if (totalDist < 1.0) {
             LoadNextCommand();
             return;
+        }*/
+
+        // 🌟 修正點 2：防呆門檻降到 1e-5 (0.00001)，避免 1度 的旋轉被吃掉！
+        if (totalDist < 1e-5) {
+            LoadNextCommand();
+            return;
         }
-        for (int i = 0; i < m_Group.axisCount; ++i) m_Group.ratio[i] /= totalDist;
+
+        // 正規化 ratio
+        for (int i = 0; i < m_Group.axisCount; ++i) {
+            m_Group.ratio[i] /= totalDist;
+        }
 
         // 🟢 【扣除殘留】：讓下一段大腦少跑一點，因為 S-Curve 稍後會自動幫忙吐出來補上！
         vAxis.finalTargetPos = totalDist; // 🟢 恢復成原本的 totalDist
@@ -1398,15 +1625,37 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
     m_Group.cmdQueue.push_back(cmd);
 }
 
-void MotionCore::StopGroup(std::vector<AxisContext>& axes, double decTime)
+void MotionCore::StopGroup()
 {
     if (!m_Group.isActive) return;
 
-    // 只叫領頭羊(虛擬軸)煞車
-    StopMove(m_Group.virtualAxis, decTime);
+    // =========================================================
+    // 🌟 自動計算群組的「最小減速度」 (即尋找最長的減速時間)
+    // =========================================================
+    double safeDecTime = 0.0;
 
-    // 實體軸不要動狀態，讓它們繼續留在 INTERPOLATING 
-    // 這樣它們才會繼續接收 UpdateInterpolation 分配的位置
+    if (m_pContexts != nullptr && m_Group.axisCount > 0)
+    {
+        for (int i = 0; i < m_Group.axisCount; ++i)
+        {
+            int idx = m_Group.axisIndices[i];
+            AxisContext& axis = (*m_pContexts)[idx];
+
+            // 取最大時間 (牽就煞車最慢、最需要保護的那個軸)
+            safeDecTime = (std::max)(safeDecTime, axis.Stop_dec_time);
+        }
+    }
+
+    // 防呆保護：避免參數沒設導致除以零崩潰，給予最低安全值 0.2 秒
+    if (safeDecTime < 0.001) {
+        safeDecTime = 0.2;
+    }
+
+    // 將算出的最安全時間，交給虛擬主軸執行平滑煞車
+    StopMove(m_Group.virtualAxis, safeDecTime);
+
+    // 清空後面還沒跑的軌跡包裹
+    m_Group.cmdQueue.clear();
 }
 
 void MotionCore::EmergencyStopGroup()
@@ -2467,6 +2716,7 @@ void MotionCore::UpdateInterpolation()
         int axisIdx = m_Group.axisIndices[i];
         if (!(*m_pContexts)[axisIdx].isServoOn)
         {
+            RtPrintf("[DBG-3] BLOCKED! Axis %d is NOT ServoOn. Group aborted.\n", axisIdx);
             m_Group.isActive = false; // 強制將群組設為非運作狀態
             return; // 這裡不執行任何插補計算，也不輸出任何位置
         }
@@ -2723,10 +2973,38 @@ void MotionCore::UpdateInterpolation()
     // ======================================================
     else if (m_Group.pathMode == PathMode::PATH_SERVO)
     {
-        // 拆包裹邏輯
-        if ((!m_Group.isActive || vAxis.inPosition) && !m_Group.cmdQueue.empty()) {
+    // ❌ 這是你原本的拆包裹邏輯：
+    // if ((!m_Group.isActive || vAxis.inPosition) && !m_Group.cmdQueue.empty()) {
+    //     LoadNextCommand();
+    // }
+
+    // ✅ 換成這段 [工業級 G00/G61 準停檢查邏輯]：
+    if (!m_Group.isActive || vAxis.inPosition)
+    {
+        bool allAxesInPos = true;
+
+        // 如果是 G00 快速定位 或 G61 準停模式，必須確認實體馬達有跟上
+        if (m_Group.isActive && m_Group.pathMode == PathMode::EXACT_STOP)
+        {
+            for (int i = 0; i < m_Group.axisCount; ++i) {
+                int idx = m_Group.axisIndices[i];
+                AxisContext& realAxis = (*m_pContexts)[idx];
+
+                double lag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
+
+                // 只要有一軸還沒擠進視窗 (例如 0.005mm)，就不准換下一行！
+                if (lag > realAxis.inPositionWindow_Pulse) {
+                    allAxesInPos = false;
+                    break;
+                }
+            }
+        }
+
+        // 大腦算完了，且實體馬達也都擠進視窗了，才准拆下一個包裹！
+        if (allAxesInPos && !m_Group.cmdQueue.empty()) {
             LoadNextCommand();
         }
+    }
         if (!m_Group.isActive) return;
 
         vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
@@ -2833,9 +3111,34 @@ void MotionCore::UpdateInterpolation()
     else
     {
         // 拆包裹邏輯
-        if ((!m_Group.isActive || vAxis.inPosition) && !m_Group.cmdQueue.empty()) {
-            LoadNextCommand();
-        }
+      // ✅ 換成這段 [工業級 G00/G61 準停檢查邏輯]：
+      if (!m_Group.isActive || vAxis.inPosition)
+      {
+          bool allAxesInPos = true;
+
+          // 如果是 G00 快速定位 或 G61 準停模式，必須確認實體馬達有跟上
+          if (m_Group.isActive && m_Group.pathMode == PathMode::EXACT_STOP)
+          {
+              for (int i = 0; i < m_Group.axisCount; ++i) {
+                  int idx = m_Group.axisIndices[i];
+                  AxisContext& realAxis = (*m_pContexts)[idx];
+
+                  double lag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
+
+                  // 只要有一軸還沒擠進視窗 (例如 0.005mm)，就不准換下一行！
+                  if (lag > realAxis.inPositionWindow_Pulse) {
+                      allAxesInPos = false;
+                      break;
+                  }
+              }
+          }
+
+          // 大腦算完了，且實體馬達也都擠進視窗了，才准拆下一個包裹！
+          if (allAxesInPos && !m_Group.cmdQueue.empty()) {
+              LoadNextCommand();
+          }
+      }
+
         if (!m_Group.isActive) return;
 
         vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
@@ -3556,8 +3859,7 @@ void MotionCore::UpdateInterpolation()
     if (std::abs(current_log_VelX - last_log_VelX) > 500000.0)
     {
         // 在這行下斷點 (F9)，程式就會停在速度驟降的那一瞬間
-        RtPrintf(">>> [HIT] Velocity Spike Detected! Before: %d | After: %d | Gap: %d\n",
-            (int)last_log_VelX, (int)current_log_VelX, (int)(current_log_VelX - last_log_VelX));
+        //RtPrintf(">>> [HIT] Velocity Spike Detected! Before: %d | After: %d | Gap: %d\n",(int)last_log_VelX, (int)current_log_VelX, (int)(current_log_VelX - last_log_VelX));
     }
     last_log_VelX = current_log_VelX;
 }

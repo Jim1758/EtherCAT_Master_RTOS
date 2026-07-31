@@ -36,6 +36,11 @@ public:
     void CycleStart();  // 按下啟動鍵
     void FeedHold();    // 按下暫停鍵
     void Reset();       // 按下重置鍵
+    bool IsFeedHoldActive() const {
+        return m_state == NCState::HOLD;
+    }
+
+
 
     // 3. 接收解碼器傳來的單節指令 (MDI 或 自動模式)
     void PushBlock(const NCBlock& block);
@@ -90,6 +95,8 @@ public:
     // 🌟 任務分流函式
     void ProcessExecutionEngine();
     void ProcessManualMode(); // 只保留純手動 JOG 的部分
+
+
 
 public:
     uint32_t NC_RunCount;//NC執行迴圈數
@@ -164,4 +171,8 @@ public:
     int GetActivePC() {
         return GetBasePC();
     }
+
+    EDMState GetMachineEDMState();
+    // 取得已經存好的狀態變數
+    EDMState GetCurrentEDMState() const { return m_edmState; }
 };

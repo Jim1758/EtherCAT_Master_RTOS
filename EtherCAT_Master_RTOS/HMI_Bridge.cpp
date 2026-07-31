@@ -29,10 +29,41 @@ namespace HMI_Bridge
         // --- 即時座標廣播 ---
         double currentWCS[8] = { 0.0 };
         nc->CoordSys.GetActualWCS(currentWCS);
+
         for (int i = 0; i < 8; i++)
         {
-            pShm->NC_Status.actualMCS[i] = nc->CoordSys.actualMCS[i];
-            pShm->NC_Status.actualWCS[i] = currentWCS[i];
+            // 取得軸的 Context，方便後續讀取參數
+            auto& axis = nc->m_motion.GetAxisContext(i);
+
+            // 🌟 1. 取得這根軸當下的補償總量
+            double currentComp = nc->m_motion.GetAxisContext(i).currentCompOffset_unit;
+
+            // 🌟 2. 扣除補償量，還原成操作員眼中的「真實邏輯座標」
+            double displayMCS = nc->CoordSys.actualMCS[i] - currentComp;
+            double displayWCS = currentWCS[i] - currentComp;
+
+          
+          
+            // ========================================================
+            // 🌟 3. 旋轉軸的 0~360 度顯示處理
+            // ========================================================
+            AxisType type = nc->m_motion.GetAxisContext(i).axisType;
+
+            // 如果是旋轉軸 (包含連續旋轉軸)
+            if (type == AxisType::ROTARY || type == AxisType::ROTARY_CONTINUOUS)
+            {
+                // 對 360 取餘數 (折疊座標)
+                displayMCS = std::fmod(displayMCS, 360.0);
+                displayWCS = std::fmod(displayWCS, 360.0);
+
+                // 防呆：如果是負角度 (例如 -10 度)，轉回正的 350 度
+                if (displayMCS < 0.0) displayMCS += 360.0;
+                if (displayWCS < 0.0) displayWCS += 360.0;
+            }
+
+            // 寫入 Shared Memory 廣播給人機
+            pShm->NC_Status.actualMCS[i] = displayMCS;
+            pShm->NC_Status.actualWCS[i] = displayWCS;
         }
 
 
@@ -68,13 +99,31 @@ namespace HMI_Bridge
 
 
         // --- 警報檢查 (自帶條件判斷，極快) ---
+       // 1. 取得最新狀態
         uint32_t currentUpdateCount = AlarmManager::GetInstance().GetUpdateCount();
-        if (pShm->Alarm_Status.alarmUpdateCount != currentUpdateCount) {
-            pShm->Alarm_Status.activeAlarmCount = AlarmManager::GetInstance().GetAlarmCount();
+
+        // 2. 如果計數器有變，代表有新警報或警報剛被清除
+        if (pShm->Alarm_Status.alarmUpdateCount != currentUpdateCount)
+        {
+            auto& am = AlarmManager::GetInstance();
+
+            // 更新數量
+            pShm->Alarm_Status.activeAlarmCount = am.GetAlarmCount();
+
+            // 清空舊資料
             std::memset(pShm->Alarm_Status.activeAlarms, 0, sizeof(pShm->Alarm_Status.activeAlarms));
+
+            // 🌟 將軸索引預設填滿 -1
+            std::fill(std::begin(pShm->Alarm_Status.activeAlarmAxes),
+                std::end(pShm->Alarm_Status.activeAlarmAxes), -1);
+
+            // 🌟 把錯誤碼和軸號，一對一打包送進 SHM
             for (int i = 0; i < pShm->Alarm_Status.activeAlarmCount; i++) {
-                pShm->Alarm_Status.activeAlarms[i] = AlarmManager::GetInstance().GetAlarmId(i);
+                pShm->Alarm_Status.activeAlarms[i] = am.GetAlarmId(i);
+                pShm->Alarm_Status.activeAlarmAxes[i] = am.GetAlarmAxisIndex(i); // 抓取軸號
             }
+
+            // 更新完成
             pShm->Alarm_Status.alarmUpdateCount = currentUpdateCount;
         }
 
@@ -155,6 +204,17 @@ namespace HMI_Bridge
             }
             pShm->Coord_Command.reqSave = false;
         }
+
+
+        
+      
+      
+        //軸狀態-------------------------------------------------------
+        // =======================================================
+        // 🌟 [修改這裡] 軸狀態：直接請 MotionCore 把資料填入 pShm 
+        // =======================================================
+        // 取代你原本手寫的 for 迴圈與 m_pContexts
+        nc->GetMotion().ExportDebugInfo(pShm->axisDebug,true);
     }
 
     // =========================================================================

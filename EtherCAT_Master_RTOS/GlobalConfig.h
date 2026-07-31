@@ -48,7 +48,7 @@ public:
     bool LoadAxisConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion);//更禸把计
     bool LoadPIDConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion);//更PID把计
     bool LoadSpeedConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion);//更Speed把计
-    static bool LoadPitchTable(const std::string& filePath, CompensationEngine& compEngine);
+    static bool LoadPitchTable(const std::string& filePath, CompensationEngine& compEngine , bool isPositive);
 
 private:
     // 玛篶窽ゎ new GlobalConfig()

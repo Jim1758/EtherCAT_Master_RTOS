@@ -49,6 +49,11 @@ struct SHM_Alarm_Status
     int32_t  activeAlarmCount;     // 目前發生中的警報數量
     int32_t  activeAlarms[64];     // 發生中的警報代碼陣列 (最多支援同時 64 個警報)
 
+    // ==========================================
+    // 🌟 [請補上這行] 存軸編號的陣列，長度要跟 activeAlarms 一樣！
+    // ==========================================
+    int32_t activeAlarmAxes[64];
+
     int32_t  reserved[16];         // 預留擴充空間
 };
 
@@ -61,7 +66,26 @@ struct SHM_Coord_Table
     double workOffset[100][8];      // 工件補償 (100行 x 8軸)
 };
 
+//軸狀態區
+struct SHM_AxisDebugInfo {
+    double CmdPos;     // 大腦命令位置 (Pulse)
+    double ActPos;     // 實際編碼器位置 (Pulse)
+    double LagError;   // 跟隨誤差 (Cmd - Act)
+    double CmdVel;     // 當前命令速度 (PPS)
+    double ActVel;       // 🌟 [新增] 實際編碼器回授速度 (PPS)
+    double MaxLagLimit;  // 🌟 [新增] 目前設定的容許最大誤差 (Pulse)
 
+    // 🌟 [新增] 轉速與單位速度
+    double ActualRPM;    // 實際馬達轉速 (RPM)
+    double ActualMpm;    // 實際速度 (m/min)
+
+
+    int    State;      // 運動狀態 (IDLE=0, MOVING=1...)
+    bool   IsServoOn;  // 是否激磁
+    bool   IsFault;    // 是否報警
+    uint8_t IsLagAlarm;  // 🌟 [新增] 是否觸發「追隨誤差過大」專屬警報
+    uint8_t Reserved;    // 🌟 [新增] 保留位元，湊滿 4 bytes 讓記憶體完美對齊
+};
 
 //NC命令區塊-----------------------------------------------------------
 
@@ -142,7 +166,10 @@ struct SHM_Data
     SHM_Macro_Status macroStatus;  // 新增：變數全廣播區
     SHM_Coord_Command Coord_Command;//
     SHM_Coord_Table Coord_Table;  // 🌟 新增這行：將表格加入總結構！
+    
     SHM_String_Command String_Command; // 加入這個新區塊
+    SHM_AxisDebugInfo axisDebug[8]; // 🌟 給 HMI 看的 8 軸除錯資訊
+   
 };
 
 #pragma pack(pop)

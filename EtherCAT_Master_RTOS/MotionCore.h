@@ -7,6 +7,7 @@
 #include <deque>
 #include "CoordinateManager.h"
 #include "CompensationEngine.h" // 引入剛寫好的標頭檔
+#include "SHM_Types.h"
 constexpr int MAX_AXES = 8;//最大軸數宣告
 const double CYCLE_TIME_SEC = 0.00025;// EtherCAT 通訊週期 (250us)
 
@@ -77,12 +78,20 @@ enum class AxisType {
 struct AxisContext//軸參數與狀態
 {
     //參數-------------------------------------------------------------------------------------------------------------
+    bool isExist; // 🌟 [新增] 實體馬達是否存在 / 是否啟用
     int axisIndex = 0;//第幾軸
+
+    bool isHomed = true;
 
     //硬體物理參數-------------------------------------------------
     double resolution_PPR = 16777216.0;// 編碼器解析度
     double maxVel_PPS = 0.0;// 最高轉速 (Pulse/sec)
+
     double G00_PPS=0.0;// G00 速度 (Pulse/sec)
+    double G00_acc_time;  // 🌟 [新增] G00 的加速時間 (秒)
+    double G00_dec_time;  // 🌟 [新增] G00 的減速時間 (秒)
+
+    double Stop_dec_time;  //滑行停止減速度 單位(秒)(幾秒內減速完成)
 
     //雙閉環/全閉環設定-------------------------------------------------
     FeedbackSource fbMode = FeedbackSource::MOTOR_ENCODER;//回授設定 
@@ -99,6 +108,8 @@ struct AxisContext//軸參數與狀態
     PidConfig Pid_IDLE;//閒置狀態PID
     PidConfig Pid_G00;      // 專屬：定位移動專用 (G00, G01)
  
+
+
 
     //狀態與指令-------------------------------------------------------------------------------------------------------------
 
@@ -167,17 +178,21 @@ struct AxisContext//軸參數與狀態
     // 🌟 補償功能開關與基礎參數
     // ==========================================
     bool enableBacklash = false;     // 是否啟用背隙補償
-    double backlashAmount_mm = 0.0;  // 背隙大小 (mm)
-
+    double backlashAmount_Pos_mm = 0; // 正向移動時的補償量 (例如 15um)
+    double backlashAmount_Neg_mm = 0; // 負向移動時的補償量 (例如 5um)
+    double backlashSpeed = 3.0;           // 背隙 補償漸變速度 設為 3.0 (代表每秒慢慢補進 3.0 mm)
     bool enablePitch = false;        // 是否啟用螺距補償
     double pitchStartPos_mm = 0.0;   // 螺距補償起點 (例如從機械座標 0.0 開始)
     double pitchStep_mm = 10.0;      // 每一格的間距 (例如每 10mm 補一格)
-
-
+    double pitchSpeed_mm_s = 3.0;   // 節距 補償漸變速度 設為 3.0 (代表每秒慢慢補進 3.0 mm)
+    // 🌟 [新增] 紀錄當前總共加上了多少補償 (mm/deg)
+    double currentCompOffset_unit = 0.0;
 
     // --- 1. 馬達/編碼器參數 ---
     
     bool isReverse = false;             // 方向反轉 (1=反轉, 0=正轉)
+    // --- 🌟 新增的顯示參數 ---
+    bool Axis_Reverse = false;  // 軸方向 反向
 
    // --- 2. 🌟 機構齒輪/皮帶比例 (Gear/Pulley Ratio) ---
     // 例如：馬達接 20 齒，負載接 60 齒
@@ -193,6 +208,26 @@ struct AxisContext//軸參數與狀態
     // --- 🌟 自動計算出的最終導程 (系統自己算) ---
     // 這一行不需要在設定檔讀取，在 InitAxis 時自動算出
     double finalLead = 10.0;
+
+
+    // 在 AxisContext 結構中加入這兩個變數
+    double inPositionWindow_mm = 0.005; // 預設 5um 到位視窗
+    double inPositionWindow_Pulse = 0.0; // 底層實際判斷用的 Pulse
+
+    // 🌟 [新增] 允許的最大跟隨誤差設定
+    double maxLag_mm=2.0;              // 人機設定值 (例如 2.0 mm，超過就 Alarm)
+
+    bool isVirtualAxis = false;  // 🌟 [新增] 預設為一般實體軸
+
+    // 🌟 [新增] 計算實際速度與紀錄 Lag 警報用
+    double lastActPos = 0.0;    // 上一個 Cycle 的實體位置
+    double currentActVel = 0.0; // 目前計算出的實際速度 (PPS)
+    bool   isLagAlarm = false;  // 追隨誤差專屬警報旗標
+
+    // 🌟 [新增] 解決 32-bit 溢位用的座標展開變數
+    int32_t lastRawActPos = 0;    // 紀錄上一次的原始 32-bit 數值
+    double  unwrappedActPos = 0.0;// 展開後、永遠不會溢位的絕對真實位置 (Pulse)
+    bool    isFirstCycle = true;  // 開機第一圈對齊旗標
 };
 
 enum class InterpolationMode//插補群組的導航模式
@@ -484,12 +519,19 @@ public:
     void Link(std::vector<ENI_ServoDrive>* pAxisList);// 連結實體驅動器列表 (EtherCAT 映射資料)
     void Link(std::vector<ENI_ServoDrive>* pDriveList, std::vector<AxisContext>* pContextList);// 連結實體驅動器與邏輯參數上下文 (Context)
     void LinkCoordinateManager(CoordinateManager* pCoord);
-
+    AxisContext& GetAxisContext(int index)
+    {
+        static AxisContext dummy; // 防呆：避免指標為空時引發崩潰
+        if (m_pContexts == nullptr || index < 0 || index >= m_pContexts->size()) {
+            return dummy;
+        }
+        return (*m_pContexts)[index];
+    }
 
     //軸狀態
     void UpdateAllMotion();//更新全部軸狀態 逐步激磁
     void UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis);//更新單軸狀態 逐步激磁
-    
+    void ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputInMM = false);
     //單軸運動 API--------------------------------------------------------------------
     
     
@@ -500,6 +542,8 @@ public:
     void StopMove(AxisContext& axis, double dec_time = 0.0);// 正常減速停止單軸
     void EmergencyStop(AxisContext& axis);// 單軸急停 (瞬間鎖死，清空緩衝區)
     void ResetFault(AxisContext& axis);// 清除單軸故障狀態 (Reset Error)
+    // 🌟 [新增] 全部軸警報解除與群組重置
+    void ResetAllFaults();
     void SetAxisFeedrateOverride(int axisIndex, double overrideRatio);// 設定單軸的進給倍率 (0.0 ~ 1.0)
     void Stop(AxisContext& axis);// 簡易停止 API
 
@@ -526,7 +570,7 @@ public:
     void InitVirtualAxisSmooth(int windowSize); // 初始化虛擬主軸的 S-Curve 平滑設定
     void LoadNextCommand();// 從指令佇列 (Queue) 載入下一段任務  
     void GetDirectionVector(const MotionCommand& cmd, double startX, double startY, double& vx, double& vy);// 取得當前路徑的方向向量
-    void StopGroup(std::vector<AxisContext>& axes, double decTime);// 插補群組整體停止與急停
+    void StopGroup();// 插補群組整體停止與急停
     void EmergencyStopGroup();//緊急停止
 
     // 插補群組進給倍率與路徑模式設定 (Exact Stop / Continuous)

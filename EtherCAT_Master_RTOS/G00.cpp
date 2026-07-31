@@ -10,12 +10,18 @@ namespace GCodeHandlers
     // ==========================================================
     static bool CheckMotionDone(NCManager* nc)
     {
-        // 檢查插補群組是否已清空且停止
-        if (nc->GetMotion().IsGroupDone()) {
-            return true;  // 走完了，通知 NC 系統可以執行下一行 G 碼
+        // 🌟 1. 【新增攔截】如果系統處於 Hold (暫停) 狀態，強迫等待！
+          // 假設你在 NCManager 中新增了一個 bool m_isFeedHold 的狀態
+        if (nc->IsFeedHoldActive()) {
+            return false; // 告訴 NC 系統：別動，繼續等！
         }
 
-        return false; // 還沒走完，請 NC 系統繼續等
+        // 2. 正常的結束判斷
+        if (nc->GetMotion().IsGroupDone()) {
+            return true;  // 走完了，通知 NC 系統可以執行下一行
+        }
+
+        return false;
     }
 
     // ==========================================================
@@ -73,7 +79,7 @@ namespace GCodeHandlers
                 targetPos.push_back(targetMCS[i]); // 放入轉換後純淨的「機械絕對座標」
             }
         }
-
+       
         // 6. 下達移動命令！(底層會自動套用 G00 的快速定位 PID 與速度)
         nc->GetMotion().G00_Move(activeAxes, targetPos);
 

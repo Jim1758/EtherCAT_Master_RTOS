@@ -29,6 +29,10 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
 
             axes[i].axisIndex = (int)ConfigUtil::ReadParam(filePath, prefix + "axisIndex", i);
 
+
+            axes[i].isExist = (ConfigUtil::ReadParam(filePath, prefix + "isExist", 1.0) == 1.0);
+          
+
             // ----------------------------------------------------
             // 1. 基礎初始化
             // ----------------------------------------------------
@@ -41,7 +45,10 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
             axes[i].reduction_MotorSide = ConfigUtil::ReadParam(filePath, prefix + "Reduction_MotorSide", 1.0);
             axes[i].reduction_LoadSide = ConfigUtil::ReadParam(filePath, prefix + "Reduction_LoadSide", 1.0);
             axes[i].mechanicalPitch = ConfigUtil::ReadParam(filePath, prefix + "MechanicalPitch", 10.0);
-            axes[i].isReverse = (ConfigUtil::ReadParam(filePath, prefix + "IsReverse", 0.0) == 1.0);
+            axes[i].isReverse = (ConfigUtil::ReadParam(filePath, prefix + "isReverse", 0.0) == 1.0);
+            axes[i].Axis_Reverse = (ConfigUtil::ReadParam(filePath, prefix + "Axis_Reverse", 0.0) == 1.0);
+
+       
 
             // 🌟 自動計算最終導程 (Final Lead)
             // 確保 LoadSide 不為 0 以防除以零錯誤
@@ -51,6 +58,8 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
             else {
                 axes[i].finalLead = axes[i].mechanicalPitch; // 防呆
             }
+
+            double pulsePerUnit = axes[i].resolution_PPR / axes[i].finalLead;
 
             // ----------------------------------------------------
             // 3. 讀取物理與運動參數
@@ -78,7 +87,16 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
 
             
             axes[i].pid.EnableLagCheck = (ConfigUtil::ReadParam(filePath, prefix + "EnableLagCheck", 1.0) == 1.0);
-            axes[i].pid.MaxLag = ConfigUtil::ReadParam(filePath, prefix + "MaxLag", 100000.0);
+            double maxLag_mm = ConfigUtil::ReadParam(filePath, prefix + "maxLag_mm", 2.0);
+            axes[i].maxLag_mm = maxLag_mm;
+            axes[i].pid.MaxLag = axes[i].maxLag_mm * pulsePerUnit;
+          
+
+            //到位視窗判定
+            double  inPositionWindow_mm= ConfigUtil::ReadParam(filePath, prefix + "inPositionWindow_mm", 0.005);
+            axes[i].inPositionWindow_mm = inPositionWindow_mm;
+            axes[i].inPositionWindow_Pulse= axes[i].inPositionWindow_mm * pulsePerUnit;
+       
 
             // ----------------------------------------------------
             // 5. 軸型態與補償參數
@@ -89,12 +107,25 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
             axes[i].useShortestPath = (ConfigUtil::ReadParam(filePath, prefix + "ShortestPath", 0.0) == 1.0);
 
             axes[i].enableBacklash = (ConfigUtil::ReadParam(filePath, prefix + "EnableBacklash", 0.0) == 1.0);
-            axes[i].backlashAmount_mm = ConfigUtil::ReadParam(filePath, prefix + "BacklashAmount", 0.0);
+            axes[i].backlashAmount_Pos_mm = ConfigUtil::ReadParam(filePath, prefix + "backlashAmount_Pos_mm", 0.0);
+            axes[i].backlashAmount_Neg_mm = ConfigUtil::ReadParam(filePath, prefix + "backlashAmount_Neg_mm", 0.0);
+            axes[i].backlashSpeed = ConfigUtil::ReadParam(filePath, prefix + "backlashSpeed", 3);
+
+
             axes[i].enablePitch = (ConfigUtil::ReadParam(filePath, prefix + "EnablePitch", 0.0) == 1.0);
             axes[i].pitchStartPos_mm = ConfigUtil::ReadParam(filePath, prefix + "PitchStartPos", 0.0);
             axes[i].pitchStep_mm = ConfigUtil::ReadParam(filePath, prefix + "PitchStep", 10.0);
+            axes[i].pitchSpeed_mm_s = ConfigUtil::ReadParam(filePath, prefix + "PitchSpeed_mm_s", 3);
+           
+           
 
-            motion.m_CompEngine.InitAxisCompensation(i, axes[i].enableBacklash, axes[i].backlashAmount_mm, axes[i].enablePitch, axes[i].pitchStep_mm);
+            motion.m_CompEngine.InitAxisCompensation(i, axes[i].enableBacklash, axes[i].backlashAmount_Pos_mm, axes[i].backlashAmount_Neg_mm,  axes[i].backlashSpeed, axes[i].enablePitch, axes[i].pitchStartPos_mm,axes[i].pitchStep_mm, axes[i].pitchSpeed_mm_s);
+
+
+
+
+
+        
         }
     }
 
@@ -130,9 +161,9 @@ bool GlobalConfig::LoadPIDConfig(const std::string& filePath, std::vector<AxisCo
             axes[i].Pid_IDLE.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki_IDLE", 10.0);
             axes[i].Pid_IDLE.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_IDLE", 0.0);
             //G00時PID---------------------------
-            axes[i].Pid_IDLE.Kp = ConfigUtil::ReadParam(filePath, prefix + "Kp_G00", 20.0);
-            axes[i].Pid_IDLE.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki_G00", 10.0);
-            axes[i].Pid_IDLE.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_G00", 0.0);
+            axes[i].Pid_G00.Kp = ConfigUtil::ReadParam(filePath, prefix + "Kp_G00", 20.0);
+            axes[i].Pid_G00.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki_G00", 10.0);
+            axes[i].Pid_G00.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_G00", 0.0);
         }
     }
 
@@ -164,6 +195,15 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
 
             double g00_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G00_Speed", 5000.0);
             axes[i].G00_PPS = MotionCore::UnitPerMinToPps(g00_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double G00_acc_time= ConfigUtil::ReadParam(filePath, prefix + "G00_acc_time", 0);
+            axes[i].G00_acc_time = G00_acc_time;
+           
+            double G00_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G00_dec_time", 0);
+            axes[i].G00_dec_time = G00_acc_time;
+
+            double Stop_dec_time = ConfigUtil::ReadParam(filePath, prefix + "Stop_dec_time", 0);
+            axes[i].Stop_dec_time = Stop_dec_time;
         }
     }
 
@@ -215,44 +255,35 @@ void GlobalConfig::LoadFromFile(const std::string& filePath)
    
    
 }
-bool GlobalConfig::LoadPitchTable(const std::string& filePath, CompensationEngine& compEngine)
+// 🌟 增加一個 bool isPositive 參數
+bool GlobalConfig::LoadPitchTable(const std::string& filePath, CompensationEngine& compEngine, bool isPositive)
 {
     std::ifstream in(filePath);
     if (!in.is_open()) {
-        DEBUG_PRINT("[WARN] PITCH_TABLE.txt not found at: %s\n", filePath.c_str());
+        DEBUG_PRINT("[WARN] File not found: %s\n", filePath.c_str());
         return false;
     }
 
     std::string line;
-    // 建立 8 個暫存陣列，用來收集 8 軸各自的整排資料
-    std::vector<double> pitchData[8];
+    std::vector<double> pitchData[8]; // 暫存 8 軸的資料
 
     while (std::getline(in, line)) {
-        // 過濾空白行與註解 (分號或雙斜線開頭)
-        if (line.empty() || line[0] == ';' || line[0] == '/' || line[0] == '#') {
-            continue;
-        }
+        if (line.empty() || line[0] == ';' || line[0] == '/' || line[0] == '#') continue;
 
         std::stringstream ss(line);
         double val;
-
-        // 橫向讀取這一行的 8 個數值
         for (int i = 0; i < 8; ++i) {
-            if (ss >> val) {
-                pitchData[i].push_back(val);
-            }
-            else {
-                pitchData[i].push_back(0.0); // 防呆：如果檔案少寫欄位，自動補 0
-            }
+            if (ss >> val) pitchData[i].push_back(val);
+            else pitchData[i].push_back(0.0);
         }
     }
     in.close();
 
-    // 將收集好的直向陣列，一軸一軸餵給 CompensationEngine
+    // 🌟 根據 isPositive 決定呼叫哪一個 Setter
     for (int i = 0; i < 8; ++i) {
         if (!pitchData[i].empty()) {
-            compEngine.SetPitchTable(i, pitchData[i]);
-            // DEBUG_PRINT("[INFO] Axis %d Loaded Pitch Table, Size: %d\n", i, (int)pitchData[i].size());
+            if (isPositive) compEngine.SetPitchTablePos(i, pitchData[i]);
+            else compEngine.SetPitchTableNeg(i, pitchData[i]);
         }
     }
 

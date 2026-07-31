@@ -90,7 +90,10 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     }
 
     // 2. 🌟 讀取螺距誤差表，並寫入 CompensationEngine
-    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE.txt", m_Motion.m_CompEngine);
+    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE_Pos.txt", m_Motion.m_CompEngine, true);
+
+    // 2. 🌟 讀取螺距誤差表，並寫入 CompensationEngine
+    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE_Neg.txt", m_Motion.m_CompEngine, false);
 
     // 檢查硬體數量與設定檔是否一致
     if (m_ServoList.size() != m_Axes.size())
@@ -116,6 +119,11 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     this->pCoordMgr = &(m_NC->CoordSys);
     m_Motion.LinkCoordinateManager(&(m_NC->CoordSys));
   
+
+    m_Motion.ResetAllFaults();//全軸 清除異常狀態
+
+   
+
     //主控迴圈-------------------------------------------------------------
     while (1)
     {

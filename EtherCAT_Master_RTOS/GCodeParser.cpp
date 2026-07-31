@@ -62,62 +62,76 @@ NCBlock GCodeParser::ParseLine(const std::string& line) {
         }
     }
 
-    // 4. 字碼掃描與解析 (Lexer)
-    char currentAddress = '�';
+
+
+    // Lambda 函數：結算當前的 Word
+ // Lambda 函數：結算當前的 Word (🌟 加上 -> bool)
+
+    // ==========================================
+    // 🌟 1. 宣告時，絕對用數字 0，不要用 '\0'
+    // ==========================================
+    char currentAddress = 0;
     std::string currentValueStr = "";
     int parenDepth = 0;
 
-    // Lambda 函數：結算當前的 Word
-    auto ProcessWord = [&]() {
+
+    // Lambda 函數：結算當前的 Word (加上 -> bool)
+    auto ProcessWord = [&]() -> bool {
         // 清除字串尾部的隱形字元
         while (!currentValueStr.empty() && std::isspace(currentValueStr.back())) {
             currentValueStr.pop_back();
         }
 
-        if (currentAddress == '�' || currentValueStr.empty()) return;
+        // =======================================================
+        // 🌟 這裡所有的判斷，都改用數字 0
+        // =======================================================
+        // 狀況 A：正常的空狀態 (直接略過)
+        if (currentAddress == 0 && currentValueStr.empty()) return true;
+
+        // 狀況 B：有字母卻沒數字 (例如 gred)
+        if (currentAddress != 0 && currentValueStr.empty()) {
+            AlarmManager::GetInstance().Trigger(AlarmManager::SYNTAX_ERROR);
+            return false; // ❌ 報警並回傳失敗
+        }
+
+        // 狀況 C：只有數字卻沒字母
+        if (currentAddress == 0 && !currentValueStr.empty()) {
+            AlarmManager::GetInstance().Trigger(AlarmManager::SYNTAX_ERROR);
+            return false; // ❌ 報警並回傳失敗
+        }
 
         block.isEmpty = false;
         double val = 0.0;
 
-        // 智慧分流：是純數字，還是巨集算式？
         bool isMacro = (currentValueStr.find('[') != std::string::npos ||
             currentValueStr.find('#') != std::string::npos ||
+            currentValueStr.find('@') != std::string::npos ||
+            currentValueStr.find('$') != std::string::npos ||
             std::isalpha(currentValueStr[0]));
 
         if (!isMacro) {
-            // 純數值：使用 RTOS 最安全的 strtod 進行解析與防呆
             char* endPtr = nullptr;
             val = std::strtod(currentValueStr.c_str(), &endPtr);
 
+            // 轉換數字失敗 (格式怪異)
             if (endPtr == currentValueStr.c_str()) {
                 AlarmManager::GetInstance().Trigger(AlarmManager::SYNTAX_ERROR);
-                return;
+                return false;
             }
         }
         else {
-            // 巨集算式：交給巨集大腦去解
             val = m_macroParser.Evaluate(currentValueStr);
         }
 
-        // 🌟 處理 G 碼 (重點修改區)
+        // 處理 G 碼
         if (currentAddress == 'G') {
-            if (block.gCount < 10) {
-                block.gCodes[block.gCount] = (int)val;
-            }
-
-            // 記錄這行的第一個 G 碼為主要 gCode
-            if (block.gCount == 0) {
-                block.hasG = true;
-                block.gCode = (int)val;
-            }
-            block.gCount++; // 每次讀到 'G'，計數器就 +1
+            if (block.gCount < 10) block.gCodes[block.gCount] = (int)val;
+            if (block.gCount == 0) { block.hasG = true; block.gCode = (int)val; }
+            block.gCount++;
         }
         // 處理 M 碼
         else if (currentAddress == 'M') {
-            if (block.mCount < 3) {
-                block.mCode[block.mCount] = (int)val;
-                block.mCount++;
-            }
+            if (block.mCount < 3) { block.mCode[block.mCount] = (int)val; block.mCount++; }
         }
         // 處理 A~Z
         else if (currentAddress >= 'A' && currentAddress <= 'Z') {
@@ -126,11 +140,17 @@ NCBlock GCodeParser::ParseLine(const std::string& line) {
             block.param[index] = val;
         }
 
-        currentAddress = '�';
+        // ==========================================
+        // 🌟 2. 結算完畢後，安全歸零 (用數字 0)
+        // ==========================================
+        currentAddress = 0;
         currentValueStr = "";
-    };
 
-    // 逐字元掃描字串
+        return true;
+    };
+    // ==========================================
+     // 字串掃描迴圈
+     // ==========================================
     for (size_t i = startIdx; i < clean.length(); i++) {
         char c = clean[i];
 
@@ -142,19 +162,29 @@ NCBlock GCodeParser::ParseLine(const std::string& line) {
                 currentValueStr += c;
             }
             else {
-                ProcessWord();
-                currentAddress = c;
+                // 如果解析失敗，立刻中斷
+                if (!ProcessWord()) {
+                    return block;
+                }
+
+                // 轉大寫
+                currentAddress = std::toupper(c);
             }
         }
         else {
-            if (currentAddress != '�') {
+            // ==========================================
+            // 🌟 3. 確保這裡也是用數字 0
+            // ==========================================
+            if (currentAddress != 0) {
                 currentValueStr += c;
             }
         }
     }
 
     // 結算最後一個 Word
-    ProcessWord();
+    if (!ProcessWord()) {
+        return block;
+    }
 
     return block;
 }

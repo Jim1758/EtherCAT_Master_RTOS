@@ -15,7 +15,7 @@ constexpr int MAX_SYS_VARS = 1000;    // 系統變數 $1~$1000
 class MacroEngine {
 public:
     MacroEngine();
-
+    const double MACRO_NULL = 999999999.0;
     // ==========================================
     // 1. 變數存取 API (支援 #, @, $)
     // ==========================================
@@ -63,5 +63,5 @@ private:
     // 定義「空值」(Null/Vacant)。
     // 根據 CNC 規範，未初始化的變數是「空值」，它在加法中視為 0，但在某些運算中有特殊意義。
     // 我們可以用極大值來代表 NULL
-    const double MACRO_NULL = 999999999.0;
+
 };

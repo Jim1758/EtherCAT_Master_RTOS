@@ -79,6 +79,9 @@
     <Filter Include="Source Files\API">
       <UniqueIdentifier>{6177dcb1-e0c8-41e5-92bf-1fa6605b9283}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\Motion\MotionCore_GCode">
+      <UniqueIdentifier>{75857113-1470-41a3-9eb6-df8a09ef7a9e}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
@@ -162,14 +165,44 @@
     <ClCompile Include="CompensationEngine.cpp">
       <Filter>Source Files\Motion</Filter>
     </ClCompile>
-    <ClCompile Include="MotionCore_GCode.cpp">
-      <Filter>Source Files\Motion</Filter>
-    </ClCompile>
     <ClCompile Include="G53.cpp">
       <Filter>Source Files\NC\GM_Code</Filter>
     </ClCompile>
     <ClCompile Include="G30.cpp">
       <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G00.cpp">
+      <Filter>Source Files\Motion\MotionCore_GCode</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G53.cpp">
+      <Filter>Source Files\Motion\MotionCore_GCode</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G30.cpp">
+      <Filter>Source Files\Motion\MotionCore_GCode</Filter>
+    </ClCompile>
+    <ClCompile Include="G28.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G28.cpp">
+      <Filter>Source Files\Motion\MotionCore_GCode</Filter>
+    </ClCompile>
+    <ClCompile Include="G32.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G32.cpp">
+      <Filter>Source Files\Motion\MotionCore_GCode</Filter>
+    </ClCompile>
+    <ClCompile Include="G07.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G07.cpp">
+      <Filter>Source Files\Motion\MotionCore_GCode</Filter>
+    </ClCompile>
+    <ClCompile Include="G161.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G161.cpp">
+      <Filter>Source Files\Motion\MotionCore_GCode</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

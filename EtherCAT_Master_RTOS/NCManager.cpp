@@ -537,18 +537,28 @@ void NCManager::ExecuteBlock(const NCBlock& block)
     if (block.hasG) {
         switch (block.gCode)
         {
-        case 0:
-      
-            
+        case 0:        
             m_waitCallback = GCodeHandlers::Handle_G00(block, this);
+            break;
+        case 7:
+            m_waitCallback = GCodeHandlers::Handle_G07(block, this);
+            break;
+        case 161:
+            m_waitCallback = GCodeHandlers::Handle_G161(block, this);
             break;
         case 53:
             m_waitCallback = GCodeHandlers::Handle_G53(block, this);
             break;
+        case 28:
+            m_waitCallback = GCodeHandlers::Handle_G28(block, this);
+            break;
+      
         case 30:
             m_waitCallback = GCodeHandlers::Handle_G30(block, this);
             break;
-
+        case 32:
+            m_waitCallback = GCodeHandlers::Handle_G32(block, this);
+            break;
         case 4:
           
             m_waitCallback = GCodeHandlers::Handle_G04(block, this);

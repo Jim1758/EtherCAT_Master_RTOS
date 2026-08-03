@@ -93,6 +93,28 @@ struct AxisContext//軸參數與狀態
     double G00_acc_time;  // 🌟 [新增] G00 的加速時間 (秒)
     double G00_dec_time;  // 🌟 [新增] G00 的減速時間 (秒)
    
+
+    double G07_PPS = 0.0;// 
+    double G07_acc_time;  // 
+    double G07_dec_time;  // 
+
+    double G161_PPS = 0.0;// 
+    double G161_acc_time;  // 
+    double G161_dec_time;  //
+
+    double G28_PPS = 0.0;
+    double G28_acc_time;
+    double G28_dec_time;
+
+    double G30_PPS = 0.0;
+    double G30_acc_time;
+    double G30_dec_time;
+
+    double G32_PPS = 0.0;
+    double G32_acc_time;
+    double G32_dec_time;
+
+
     double G53_PPS = 0.0;
     double G53_acc_time;  
     double G53_dec_time;  
@@ -663,7 +685,11 @@ private:
 
     //G碼使用-------------------------------------------------------------- 
     void G00_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G00 快速定位 API
+    void G07_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G07 快速定位 API
+    void G161_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G161 快速定位 API
     void G53_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G53 機械定位 API
-    void G30_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm,const std::vector<double>* intermediatePos_mm, BufferMode mode);// G30 參考點賦歸 API
-    
+    void G28_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm,const std::vector<double>* intermediatePos_mm, BufferMode mode);// G28 參考點賦歸 API
+    void G30_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm, const std::vector<double>* intermediatePos_mm, BufferMode mode);// G30 參考點賦歸 API
+    void G32_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm, const std::vector<double>* intermediatePos_mm, BufferMode mode);// G32 參考點賦歸 API
+
 };

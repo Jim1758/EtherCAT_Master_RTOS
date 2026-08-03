@@ -7,9 +7,11 @@ namespace GCodeHandlers
 
     // 🌟 更改回傳型別：如果不需等待就回傳 nullptr，需要等待就回傳「專屬檢查函式」
     WaitConditionFunc Handle_G00(const NCBlock& block, NCManager* nc);
-
+    WaitConditionFunc Handle_G07(const NCBlock& block, NCManager* nc);
+    WaitConditionFunc Handle_G161(const NCBlock& block, NCManager* nc);
+    WaitConditionFunc Handle_G28(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G30(const NCBlock& block, NCManager* nc);
-
+    WaitConditionFunc Handle_G32(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G53(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G04(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G68(const NCBlock& block, NCManager* nc);

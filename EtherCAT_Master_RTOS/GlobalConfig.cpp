@@ -193,10 +193,10 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
         {
             std::string prefix = std::to_string(i) + "_";
 
-            double Max_speed = ConfigUtil::ReadParam(filePath, prefix + "MAX_Speed", 5000.0);
+            double Max_speed = ConfigUtil::ReadParam(filePath, prefix + "MAX_Speed", 0);
             axes[i].maxVel_PPS = MotionCore::UnitPerMinToPps(Max_speed, axes[i].resolution_PPR, axes[i].finalLead);
 
-            double g00_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G00_Speed", 5000.0);
+            double g00_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G00_Speed", 0);
             axes[i].G00_PPS = MotionCore::UnitPerMinToPps(g00_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
 
             double G00_acc_time= ConfigUtil::ReadParam(filePath, prefix + "G00_acc_time", 0);
@@ -205,12 +205,65 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             double G00_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G00_dec_time", 0);
             axes[i].G00_dec_time = G00_acc_time;
 
+
+            double g07_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G07_Speed", 0);
+            axes[i].G07_PPS = MotionCore::UnitPerMinToPps(g00_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double G07_acc_time = ConfigUtil::ReadParam(filePath, prefix + "G07_acc_time", 0);
+            axes[i].G07_acc_time = G07_acc_time;
+
+            double G07_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G07_dec_time", 0);
+            axes[i].G07_dec_time = G07_acc_time;
+
+            double g161_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G161_Speed", 0);
+            axes[i].G161_PPS = MotionCore::UnitPerMinToPps(g161_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double G161_acc_time = ConfigUtil::ReadParam(filePath, prefix + "G161_acc_time", 0);
+            axes[i].G161_acc_time = G161_acc_time;
+
+            double G161_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G161_dec_time", 0);
+            axes[i].G161_dec_time = G161_acc_time;
+
+
             double Stop_dec_time = ConfigUtil::ReadParam(filePath, prefix + "Stop_dec_time", 0);
             axes[i].Stop_dec_time = Stop_dec_time;
 
 
 
-            double g53_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G53_Speed", 5000.0);
+
+            double g28_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G28_Speed", 500.0);
+            axes[i].G28_PPS = MotionCore::UnitPerMinToPps(g28_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double G28_acc_time = ConfigUtil::ReadParam(filePath, prefix + "G28_acc_time", 0);
+            axes[i].G28_acc_time = G28_acc_time;
+
+            double G28_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G28_dec_time", 0);
+            axes[i].G28_dec_time = G28_acc_time;
+
+
+
+            double g30_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G30_Speed", 0);
+            axes[i].G30_PPS = MotionCore::UnitPerMinToPps(g30_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double G30_acc_time = ConfigUtil::ReadParam(filePath, prefix + "G30_acc_time", 0);
+            axes[i].G30_acc_time = G30_acc_time;
+
+            double G30_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G30_dec_time", 0);
+            axes[i].G30_dec_time = G30_acc_time;
+
+
+            double g32_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G32_Speed", 0);
+            axes[i].G32_PPS = MotionCore::UnitPerMinToPps(g32_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double G32_acc_time = ConfigUtil::ReadParam(filePath, prefix + "G32_acc_time", 0);
+            axes[i].G32_acc_time = G32_acc_time;
+
+            double G32_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G32_dec_time", 0);
+            axes[i].G32_dec_time = G32_acc_time;
+
+
+
+            double g53_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G53_Speed", 0);
             axes[i].G53_PPS = MotionCore::UnitPerMinToPps(g53_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
 
             double G53_acc_time = ConfigUtil::ReadParam(filePath, prefix + "G53_acc_time", 0);

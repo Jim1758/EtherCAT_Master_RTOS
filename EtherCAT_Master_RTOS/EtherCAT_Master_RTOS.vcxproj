@@ -131,7 +131,11 @@
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp" />
     <ClCompile Include="G00.cpp" />
     <ClCompile Include="G04.cpp" />
+    <ClCompile Include="G07.cpp" />
+    <ClCompile Include="G161.cpp" />
+    <ClCompile Include="G28.cpp" />
     <ClCompile Include="G30.cpp" />
+    <ClCompile Include="G32.cpp" />
     <ClCompile Include="G53.cpp" />
     <ClCompile Include="GCode.cpp" />
     <ClCompile Include="GCodeParser.cpp" />
@@ -141,7 +145,13 @@
     <ClCompile Include="MacroParser.cpp" />
     <ClCompile Include="MCode.cpp" />
     <ClCompile Include="MotionCore.cpp" />
-    <ClCompile Include="MotionCore_GCode.cpp" />
+    <ClCompile Include="MotionCore_G00.cpp" />
+    <ClCompile Include="MotionCore_G07.cpp" />
+    <ClCompile Include="MotionCore_G161.cpp" />
+    <ClCompile Include="MotionCore_G28.cpp" />
+    <ClCompile Include="MotionCore_G30.cpp" />
+    <ClCompile Include="MotionCore_G32.cpp" />
+    <ClCompile Include="MotionCore_G53.cpp" />
     <ClCompile Include="NCManager.cpp" />
     <ClCompile Include="NicDriver.cpp" />
     <ClCompile Include="PlcCore.cpp" />

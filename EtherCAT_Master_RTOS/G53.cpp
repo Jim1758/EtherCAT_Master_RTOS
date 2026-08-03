@@ -53,6 +53,15 @@ namespace GCodeHandlers
                     AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_enabledr);
                     return [](NCManager*) { return true; };
                 }
+                else
+                {
+                    if (nc->m_motion.GetAxisContext(i).isHomed==false)
+                    {
+                        AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_enabledr);
+                        return [](NCManager*) { return true; };
+                    }
+                    
+                }
 
                 activeAxes.push_back(i);
                 targetPos.push_back(block.val(axisLetter)); // 🌟 直接拿值，不加偏移！
@@ -65,7 +74,7 @@ namespace GCodeHandlers
         }
 
         // 4. 下達移動指令 (G53 通常視為快速定位，所以走 G00 通道)
-        nc->GetMotion().G00_Move(activeAxes, targetPos);
+        nc->GetMotion().G53_Move(activeAxes, targetPos);
 
         // 5. 等待結束
         return CheckMotionDone;

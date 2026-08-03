@@ -13,7 +13,8 @@ CoordinateManager::CoordinateManager()
     m_ToolOffset.resize(100, std::vector<double>(8, 0.0));
     m_ToolRadius.resize(100, std::vector<double>(8, 0.0));
     m_WorkOffset.resize(100, std::vector<double>(8, 0.0));
-
+    m_RefPoints.resize(100, std::vector<double>(8, 0.0));
+   
     // 2. 開機自動載入所有檔案
   
     LoadAllParameters();
@@ -225,7 +226,7 @@ void CoordinateManager::LoadAllParameters() {
     LoadTableFromFile("TOOL_OFFSET.txt", m_ToolOffset, 100);
     LoadTableFromFile("TOOL_RADIUS.txt", m_ToolRadius, 100);
     LoadTableFromFile("WORK_OFFSET.txt", m_WorkOffset, 100);
-
+    LoadTableFromFile("REFPOINTS.txt", m_RefPoints, 100);
 
 }
 
@@ -235,6 +236,8 @@ void CoordinateManager::SaveAllParameters() {
     SaveWCSTable();
     SaveToolOffset();
     SaveWorkOffset();
+    SaveToolRadius();
+    SaveRefPoints();
 }
 
 // ==========================================
@@ -263,6 +266,8 @@ void CoordinateManager::SaveExtOffset() {
 void CoordinateManager::SaveWCSTable() { SaveTableToFile("WCS_TABLE.txt", m_WCSTable); }
 void CoordinateManager::SaveToolOffset() { SaveTableToFile("TOOL_OFFSET.txt", m_ToolOffset); }
 void CoordinateManager::SaveWorkOffset() { SaveTableToFile("WORK_OFFSET.txt", m_WorkOffset); }
+void CoordinateManager::SaveToolRadius() { SaveTableToFile("TOOL_RADIUS.txt", m_ToolRadius); }
+void CoordinateManager::SaveRefPoints() { SaveTableToFile("TOOL_REFPOINTS.txt", m_RefPoints); }
 
 // ==========================================
 // 🌟 共用底層：表格陣列讀寫引擎
@@ -783,4 +788,11 @@ double CoordinateManager::GetActiveToolRadius() const
     const int RADIUS_INDEX = 3;
 
     return  m_ToolRadius[arrayIndex][RADIUS_INDEX];
+}
+bool CoordinateManager::GetRefPoint(int pCode, double* outPos) const {
+    int index = pCode - 1; // P1 對應 index 0
+    if (index < 0 || index >= m_RefPoints.size()) return false;
+
+    for (int i = 0; i < 8; i++) outPos[i] = m_RefPoints[index][i];
+    return true;
 }

@@ -52,7 +52,7 @@ int _tmain(int argc, _TCHAR* argv[])//
         }
       
         //Master.RunRealTimeCycle_EXAMPLE_MODE();//主要程式迴圈執行_測試模式
-        //DEBUG_PRINT("EDM_SINKER_MODE Start !\n");
+        DEBUG_PRINT("EDM_SINKER_MODE Start !\n");
         if (Master.RunRealTimeCycle_EDM_SINKER_MODE() == -1)
         {
             DEBUG_PRINT("RunRealTimeCycle_EDM Error !\n");

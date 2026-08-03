@@ -207,6 +207,17 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
 
             double Stop_dec_time = ConfigUtil::ReadParam(filePath, prefix + "Stop_dec_time", 0);
             axes[i].Stop_dec_time = Stop_dec_time;
+
+
+
+            double g53_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G53_Speed", 5000.0);
+            axes[i].G53_PPS = MotionCore::UnitPerMinToPps(g53_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double G53_acc_time = ConfigUtil::ReadParam(filePath, prefix + "G53_acc_time", 0);
+            axes[i].G53_acc_time = G53_acc_time;
+
+            double G53_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G53_dec_time", 0);
+            axes[i].G53_dec_time = G53_acc_time;
         }
     }
 

@@ -131,6 +131,7 @@
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp" />
     <ClCompile Include="G00.cpp" />
     <ClCompile Include="G04.cpp" />
+    <ClCompile Include="G30.cpp" />
     <ClCompile Include="G53.cpp" />
     <ClCompile Include="GCode.cpp" />
     <ClCompile Include="GCodeParser.cpp" />

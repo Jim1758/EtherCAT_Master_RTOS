@@ -563,11 +563,11 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
                                     if (test_timer == 0)
                                     {
 
-                                        /*
+                                        
                                         m_Motion.LineMove({ 0, 1 }, { 0, 0 }, targetVel, accTime, decTime, BufferMode::BUFFERED);
                                         m_Motion.LineMove({ 0, 1 }, { ONE_REV * 5.0, ONE_REV * 5.0 }, targetVel, accTime, decTime, BufferMode::BUFFERED);
                                         m_Motion.LineMove({ 0, 1 }, { ONE_REV * -5.0, ONE_REV * -5.0 }, targetVel, accTime, decTime, BufferMode::BUFFERED);
-                                        */
+                                        
 
 
                                         /*
@@ -789,15 +789,15 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
                               //Jump 跳躍排渣---------------------------------------------------------
 
 
-                                targetVel = 8388608.0 * 1;  // 用 0.5 圈/秒 的速度跑 (30 RPM)
-                                accTime = 0.2;
-                                decTime = 0.2;
+                                //targetVel = 8388608.0 * 1;  // 用 0.5 圈/秒 的速度跑 (30 RPM)
+                               // accTime = 0.2;
+                               // decTime = 0.2;
 
                                 if (test_timer == 0)
                                 {
 
 
-                                    m_Motion.LineMove({ 0,1,2 }, { 0.0 ,0.0,0.0 }, targetVel * 15, accTime, decTime, BufferMode::ABORTING);
+                                   // m_Motion.LineMove({ 0,1,2 }, { 0.0 ,0.0,0.0 }, targetVel * 15, accTime, decTime, BufferMode::ABORTING);
 
                                 }
 
@@ -807,16 +807,16 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
                                 if (test_timer == 10)
                                 {
                                     // 開啟時光機引擎
-                                    m_Motion.EnableHistoryBuffer(true);
+                                   // m_Motion.EnableHistoryBuffer(true);
 
                                     // 切換到 PATH_SERVO 模式 (上帝模式，由外部給定正負速度)
-                                    targetVel = 8388608.0 * 1;  // 用 0.5 圈/秒 的速度跑 (30 RPM)
-                                    m_Motion.SetGroupPathMode(PathMode::PATH_SERVO);
-                                    m_Motion.UpdatePathServoVelocity(targetVel * 2);
-                                    ONE_REV = 16777216.0;
+                                    //targetVel = 8388608.0 * 1;  // 用 0.5 圈/秒 的速度跑 (30 RPM)
+                                   // m_Motion.SetGroupPathMode(PathMode::PATH_SERVO);
+                                    //m_Motion.UpdatePathServoVelocity(targetVel * 2);
+                                  //  ONE_REV = 16777216.0;
 
-                                    accTime = 0.2;
-                                    decTime = 0.2;
+                                   // accTime = 0.2;
+                                   // decTime = 0.2;
 
                                     // 🟢 給它「真正有距離」的指令！
                                     // 第一段：X軸往右走 10 圈
@@ -900,7 +900,7 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
                                     //m_Motion.LineMove(axes, { ONE_REV * 5.0, ONE_REV * 5.0, ONE_REV * 5.0 }, ONE_REV, 0.2, 0.2, BufferMode::BUFFERED);
 
                                     std::vector<int> axes = { 2 };
-                                    m_Motion.LineMove(axes, { ONE_REV * 5.0 }, ONE_REV, 0.2, 0.2, BufferMode::BUFFERED);
+                                    //m_Motion.LineMove(axes, { ONE_REV * 5.0 }, ONE_REV, 0.2, 0.2, BufferMode::BUFFERED);
 
 
 

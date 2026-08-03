@@ -543,9 +543,10 @@ void NCManager::ExecuteBlock(const NCBlock& block)
             m_waitCallback = GCodeHandlers::Handle_G00(block, this);
             break;
         case 53:
-
-       
             m_waitCallback = GCodeHandlers::Handle_G53(block, this);
+            break;
+        case 30:
+            m_waitCallback = GCodeHandlers::Handle_G30(block, this);
             break;
 
         case 4:

@@ -93,6 +93,9 @@ struct AxisContext//軸參數與狀態
     double G00_acc_time;  // 🌟 [新增] G00 的加速時間 (秒)
     double G00_dec_time;  // 🌟 [新增] G00 的減速時間 (秒)
    
+    double G53_PPS = 0.0;
+    double G53_acc_time;  
+    double G53_dec_time;  
 
    
     double Stop_dec_time;  //滑行停止減速度 單位(秒)(幾秒內減速完成)
@@ -660,4 +663,7 @@ private:
 
     //G碼使用-------------------------------------------------------------- 
     void G00_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G00 快速定位 API
+    void G53_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G53 機械定位 API
+    void G30_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm,const std::vector<double>* intermediatePos_mm, BufferMode mode);// G30 參考點賦歸 API
+    
 };

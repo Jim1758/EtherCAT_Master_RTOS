@@ -39,6 +39,7 @@ public:
         M_code_Count_Error = NC_BASE + 8,   // 2008:單行M碼超過1個
         G_Code_Invalid_parameter = NC_BASE + 9,   // 2009:不正確G碼參數
         axis_is_not_enabledr = NC_BASE + 10,   // 2010:下達不存在的軸指令
+        axis_is_not_Homed = NC_BASE + 11,   // 2011:軸尚未尋原點
     };
 
     // 🌟 4. 運動軸控警報 (3000 ~ 3999)

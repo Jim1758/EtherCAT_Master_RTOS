@@ -136,6 +136,9 @@ public:
     std::vector<std::vector<double>> m_ToolOffset;
     std::vector<std::vector<double>> m_ToolRadius;
     std::vector<std::vector<double>> m_WorkOffset;
+    // 儲存 100 組參考點 (P1~P100)，每組 8 軸
+    std::vector<std::vector<double>> m_RefPoints;
+
 
     // ==========================================
     // 核心操作函式
@@ -162,7 +165,10 @@ public:
     void SaveWCSStatus();   // 🌟 改名：讓函式名稱更明確
     void SaveExtOffset();
     void SaveToolOffset();
+    void SaveToolRadius();
+    void SaveRefPoints();
     void SaveWorkOffset();
+ 
     void SaveWCSTable();
     int GetCurrentWCSGCode() const;
 
@@ -180,6 +186,8 @@ public:
     void SetWorkpieceRotation(int wCode, const bool* hasAxis, const double* targetWCS, NCManager* nc);
     void CancelWorkpieceRotation(NCManager* nc);
    
+
+    bool GetRefPoint(int pCode, double* outPos) const;
 private:
     // 底層輔助函式：負責讀寫 8 軸二維陣列，並確保原子寫入防護
     void SaveTableToFile(const std::string& filename, const std::vector<std::vector<double>>& table);

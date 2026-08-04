@@ -321,7 +321,45 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     double mem_transformOrigin[3];
     double mem_transformMatrix[3][3];
 
-   
+    // 🌟 新增：這張單子是從哪一行 G 碼來的？
+    int sourceLinePC;
+
+    // 🌟 1. 新增：這張單子打包當下，大腦的座標系是什麼？
+    int sourceWCS;
+
+    // 🌟 新增：刀具狀態標籤！
+    int sourceToolLengthMode; // G43, G44, 還是 G49?
+    int sourceHCode;          // H 碼是多少?
+
+    // 🌟 1. 新增包裹標籤：刀徑狀態
+    int sourceToolRadiusMode;
+    int sourceDCode;
+
+    // 🌟 沿用你的命名：這行是絕對還是增量？
+    bool sourceIsAbsoluteMode;
+
+    // 🌟 1. 新增包裹標籤：G68 狀態
+    bool sourceG68Active;
+    double sourceG68Angle; // 🌟 1. 新增包裹標籤：打單時的旋轉角度
+
+
+    // 🌟 1. 新增包裹標籤：G168 工件補償狀態
+    bool sourceG168Active;
+    int sourceWCode; // 🌟 1. 新增包裹標籤：打單時的 W 碼
+    // 🌟 1. 新增包裹標籤：G51 狀態與倍率
+    bool sourceG51Active;
+    double sourceScaleRatio;
+
+
+
+    // 🌟 1. 新增包裹標籤：這張單子打包時，哪幾個軸正在鏡像？
+    uint8_t sourceMirrorMask;
+
+    // 🌟 1. 新增包裹標籤：極座標狀態
+    bool sourceG16Active;
+
+    bool sourceG162Active; // 🌟 G162 標籤
+    int sourcePlaneMode;   // 🌟 平面標籤 (17, 18, 19)
 };
 
 
@@ -507,9 +545,40 @@ struct InterpolationGroup// 插補群組
 
     //任務緩衝管理------------------------------------------------------
     std::deque<MotionCommand> cmdQueue;
-
-
+    int currentExecutionPC = 0; // 馬達當下的行號
+    // 🌟 2. 新增：實體馬達當下正在跑的座標系
+    int currentExecutionWCS = 54;
    
+    // 🌟 2. 擴充實體狀態：實體馬達當下正在用的刀具狀態
+    int currentExecutionToolMode = 49; // 預設 G49 (無補正)
+    int currentExecutionHCode = 0;     // 預設 H0
+
+    // 🌟 2. 新增實體狀態：馬達當下的刀徑狀態
+    int currentExecutionToolRadiusMode = 40;
+    int currentExecutionDCode = 0;
+
+    // 🌟 沿用你的命名：馬達當下的 G90/G91 狀態
+    bool currentExecutionIsAbsoluteMode = true; // 預設 G90(true)
+
+    // 🌟 2. 實體狀態：馬達當下的 G68 狀態
+    bool currentExecutionG68Active = false;
+    double currentExecutionG68Angle = 0.0; // 🌟 2. 實體狀態：馬達當下的角度
+    // 🌟 2. 實體狀態：馬達當下的 G168 狀態
+    bool currentExecutionG168Active = false;
+    int currentExecutionWCode = 0; // 🌟 2. 實體狀態：馬達當下的 W 碼
+    // 🌟 2. 實體狀態：馬達當下的 G51 狀態
+    bool currentExecutionG51Active = false;
+    double currentExecutionScaleRatio = 1.0;
+
+    // 🌟 2. 實體狀態：馬達當下的鏡像狀態
+    uint8_t currentExecutionMirrorMask = 0;
+
+    // 🌟 2. 實體狀態：馬達當下的極座標狀態
+    bool currentExecutionG16Active = false;
+
+    bool currentExecutionG162Active = true;
+    int currentExecutionPlaneMode = 17; // 預設 G17
+
     //時光機專用擴充套件 ------------------------------------------------------
   
     bool enableHistory = false;             // 時光機模式開關
@@ -544,8 +613,7 @@ public:
 
     
     
- 
-
+   
     //系統關聯與連結--------------------------------------------------------------------
     CoordinateManager* m_pCoordMgr = nullptr;
     CompensationEngine m_CompEngine; // 🌟 宣告補償引擎
@@ -645,7 +713,139 @@ public:
     bool IsGroupQueueFull() const { return m_Group.cmdQueue.size() >= 100; } // 預讀 100 行
     bool IsGroupDone() const { return !m_Group.isActive && m_Group.cmdQueue.empty(); }
 
-  
+    size_t GetQueueSize() const {
+        return m_Group.cmdQueue.size();
+    }
+    // 🌟 新增：讓外部讀取「實體馬達正在執行的行號」
+    int GetPhysicalExecutionPC() const {
+        return m_Group.currentExecutionPC;
+    }
+
+    // 🌟 3. 新增：讓外部讀取實體馬達的 WCS
+    int GetPhysicalExecutionWCS() const { return m_Group.currentExecutionWCS; }
+    // 🌟 新增：貼標籤機，設定下一個進入佇列的指令是屬於哪一行的
+    void SetNextCommandSourcePC(int pc) {
+        m_pendingSourcePC = pc;
+    }
+
+    void ResetPhysicalPC() {
+        m_Group.currentExecutionPC = 0;
+        m_pendingSourcePC = 0;
+    }
+
+ 
+
+    // 🌟 3. 新增：讓外部 (HMI) 讀取實體馬達的刀具狀態
+    int GetPhysicalExecutionToolMode() const { return m_Group.currentExecutionToolMode; }
+    int GetPhysicalExecutionHCode() const { return m_Group.currentExecutionHCode; }
+
+    // 🌟 3. 新增 Get 函式
+    int GetPhysicalExecutionToolRadiusMode() const { return m_Group.currentExecutionToolRadiusMode; }
+    int GetPhysicalExecutionDCode() const { return m_Group.currentExecutionDCode; }
+
+    // 取得實體狀態
+    bool GetPhysicalExecutionIsAbsoluteMode() const { return m_Group.currentExecutionIsAbsoluteMode; }
+
+    // 🌟 3. 取得實體狀態
+    bool GetPhysicalExecutionG68Active() const { return m_Group.currentExecutionG68Active; }
+    double GetPhysicalExecutionG68Angle() const { return m_Group.currentExecutionG68Angle; } // 🌟 3. 新增 Get 函式
+    // 🌟 3. 取得實體狀態
+    bool GetPhysicalExecutionG168Active() const { return m_Group.currentExecutionG168Active; }
+    int GetPhysicalExecutionWCode() const { return m_Group.currentExecutionWCode; } // 🌟 3. 新增 Get 函式
+    // 🌟 3. 取得實體狀態
+    bool GetPhysicalExecutionG51Active() const { return m_Group.currentExecutionG51Active; }
+    double GetPhysicalExecutionScaleRatio() const { return m_Group.currentExecutionScaleRatio; }
+
+    // 🌟 3. 取得實體狀態
+    uint8_t GetPhysicalExecutionMirrorMask() const { return m_Group.currentExecutionMirrorMask; }
+
+    // 🌟 3. 取得實體狀態
+    bool GetPhysicalExecutionG16Active() const { return m_Group.currentExecutionG16Active; }
+
+    bool GetPhysicalExecutionG162Active() const { return m_Group.currentExecutionG162Active; }
+    int GetPhysicalExecutionPlaneMode() const { return m_Group.currentExecutionPlaneMode; }
+
+    // 🌟 4. 終極標籤機：現在一次貼 6 張標籤！
+    void SetNextCommandState(int pc, int wcs, int tLenMode, int hCode, int tRadMode, int dCode, bool isAbsMode, bool isG68, double g68Angle, bool isG168, int wCode, bool isG51, double scaleRatio, uint8_t mirrorMask, bool isG16, bool isG162, int planeMode) {
+        m_pendingSourcePC = pc;
+        m_pendingSourceWCS = wcs;
+        m_pendingToolMode = tLenMode;
+        m_pendingHCode = hCode;
+
+        m_pendingToolRadMode = tRadMode; // 新增
+        m_pendingDCode = dCode;          // 新增
+
+        m_pendingIsAbsoluteMode = isAbsMode;
+        m_pendingG68Active = isG68;
+        m_pendingG68Angle = g68Angle;
+
+        m_pendingG168Active = isG168; // 🌟 放入標籤機暫存
+        m_pendingWCode = wCode;
+
+
+        m_pendingG51Active = isG51;
+        m_pendingScaleRatio = scaleRatio;
+
+        m_pendingMirrorMask = mirrorMask;
+        m_pendingG16Active = isG16;
+
+        m_pendingG162Active = isG162;
+        m_pendingPlaneMode = planeMode;
+    }
+
+    // 🌟 5. 升級重置函式：防殘影
+    void ResetPhysicalTags(int currentBrainWCS, int currentBrainToolMode, int currentBrainHCode ,int curTRadMode, int curDCode, bool curIsAbsMode, bool curG68, double curG68Angle, bool isG168, int curWCode, bool curG51, double curScaleRatio, uint8_t curMirrorMask, bool curG16, bool curG162, int curPlaneMode) {
+        m_Group.currentExecutionPC = 0;
+        m_pendingSourcePC = 0;
+
+        m_Group.currentExecutionWCS = currentBrainWCS;
+        m_pendingSourceWCS = currentBrainWCS;
+
+        // 刀具狀態同步
+        m_Group.currentExecutionToolMode = currentBrainToolMode;
+        m_pendingToolMode = currentBrainToolMode;
+
+        m_Group.currentExecutionHCode = currentBrainHCode;
+        m_pendingHCode = currentBrainHCode;
+
+        // 刀徑狀態同步
+        m_Group.currentExecutionToolRadiusMode = curTRadMode;
+        m_pendingToolRadMode = curTRadMode;
+
+        m_Group.currentExecutionDCode = curDCode;
+        m_pendingDCode = curDCode;
+        //G90G91 模式
+        m_Group.currentExecutionIsAbsoluteMode = curIsAbsMode;
+        m_pendingIsAbsoluteMode = curIsAbsMode;
+
+        m_Group.currentExecutionG68Active = curG68;
+        m_pendingG68Active = curG68;
+
+        m_Group.currentExecutionG68Angle = curG68Angle;
+        m_pendingG68Angle = curG68Angle;
+
+        m_pendingG168Active = isG168; // 🌟 放入標籤機暫存
+
+        m_Group.currentExecutionWCode = curWCode;
+        m_pendingWCode = curWCode;
+
+        m_Group.currentExecutionG51Active = curG51;
+        m_pendingG51Active = curG51;
+
+        m_Group.currentExecutionScaleRatio = curScaleRatio;
+        m_pendingScaleRatio = curScaleRatio;
+
+        m_pendingMirrorMask = curMirrorMask;
+
+        m_Group.currentExecutionG16Active = curG16;
+        m_pendingG16Active = curG16;
+
+        m_Group.currentExecutionG162Active = curG162;
+        m_pendingG162Active = curG162;
+
+        m_Group.currentExecutionPlaneMode = curPlaneMode;
+        m_pendingPlaneMode = curPlaneMode;
+    }
 
     double CalculateShortestTarget(double currentPos, double targetPos, double modulo);
 
@@ -654,8 +854,34 @@ public:
     double G00_overrideRatio = 1;//G00 專屬速度比例
    
 private:
-   
-   
+    int m_pendingSourcePC = 0;
+    int m_pendingSourceWCS = 54; // 預設 G54
+
+    // 新增暫存變數
+    int m_pendingToolMode = 49;
+    int m_pendingHCode = 0;
+
+    int m_pendingToolRadMode = 40;
+    int m_pendingDCode = 0;
+
+    bool m_pendingIsAbsoluteMode = true;
+
+    bool m_pendingG68Active = false;
+    double m_pendingG68Angle = 0.0; // 預設 0 度
+
+    bool m_pendingG168Active = false;
+    int m_pendingWCode = 0; // 預設 W0
+
+    bool m_pendingG51Active = false;
+    double m_pendingScaleRatio = 1.0;
+
+    uint8_t m_pendingMirrorMask = 0;
+
+    bool m_pendingG16Active = false;
+
+    bool m_pendingG162Active = true;
+    int m_pendingPlaneMode = 17;
+
     void Calc_Trajectory_Trapezoidal(AxisContext& axis, AxisCommand& outCmd); // 計算定位模式的梯形速度規劃 (S-Curve 前置)
     void Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd); // 計算速度模式的斜坡變速規劃
 

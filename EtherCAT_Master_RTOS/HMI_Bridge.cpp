@@ -23,8 +23,9 @@ namespace HMI_Bridge
 
         pShm->NC_Status.SHM_NC_State = static_cast<int32_t>(nc->m_state);
         pShm->NC_Status.SHM_EDM_State = static_cast<int32_t>(nc->m_edmState);
-        pShm->NC_Status.currentWCS_GCode = nc->CoordSys.GetCurrentWCSGCode();
-        pShm->NC_Status.isAbsoluteMode = nc->CoordSys.isAbsoluteMode ? 1 : 0;
+
+
+     
 
         // --- 即時座標廣播 ---
         double currentWCS[8] = { 0.0 };
@@ -136,10 +137,152 @@ namespace HMI_Bridge
         pShm->NC_Status.mainCurrentLine = nc->GetActivePC();
         std::strncpy(pShm->NC_Status.macroProgName, nc->m_macroProgramName.c_str(), 63);
         pShm->NC_Status.macroProgName[63] = '\0';
-        pShm->NC_Status.macroCurrentLine = nc->m_macroProgramPC;
 
 
+        // ==========================================================
+            // 🌟 雙指標神同步 (Dual PC Synchronization) - 智慧混合版
+            // ==========================================================
+
+            // 1. 取得大腦的指標 (Interpreter PC)
+        int interpreterMainPC = nc->GetBasePC();
+        int interpreterMacroPC = nc->m_macroProgramPC;
+
+        // 2. 取得實體馬達的指標 (Motion PC)
+        int physicalPC = nc->GetMotion().GetPhysicalExecutionPC();
+
+        // 3. 🌟 【神級判斷】：手腳追上大腦了嗎？
+        // 如果 IsGroupDone() 為 true，代表底層倉庫全空，馬達完全靜止。
+        // 這意味著目前的指令是「非運動指令」(如 M00, G04, 巨集變數)，機台正在執行大腦的狀態！
+        bool isMachineIdle = nc->GetMotion().IsGroupDone();
+
+        // 4. 判斷目前這張單子是屬於主程式還是副程式
+        bool isMacroRunning = !nc->m_macroStack.empty();
+
+        if (isMacroRunning) {
+            // 在跑副程式
+            // 🌟 如果機台靜止，游標顯示大腦卡住的地方(如 M00)；如果機台在動，顯示馬達正在跑的路徑
+            pShm->NC_Status.macroCurrentLine = isMachineIdle ? interpreterMacroPC : physicalPC;
+            pShm->NC_Status.mainCurrentLine = interpreterMainPC; // 主程式永遠顯示呼叫副程式的那一行
+        }
+        else {
+            // 在跑主程式
+            pShm->NC_Status.mainCurrentLine = isMachineIdle ? interpreterMainPC : physicalPC;
+            pShm->NC_Status.macroCurrentLine = -1;
+        }
+
+        int interpreterWCS = nc->CoordSys.GetCurrentWCSGCode(); // 大腦的座標系
+        int physicalWCS = nc->GetMotion().GetPhysicalExecutionWCS(); // 馬達的座標系
        
+        pShm->NC_Status.currentWCS_GCode = isMachineIdle ? interpreterWCS : physicalWCS;//坐標系
+
+
+        // 3. 🌟 刀具長度補正顯示 (Tool Length Comp)
+        int interpreterToolMode = nc->CoordSys.toolLengthMode;
+        int physicalToolMode = nc->GetMotion().GetPhysicalExecutionToolMode();
+
+        int interpreterHCode = nc->CoordSys.currentHCode;
+        int physicalHCode = nc->GetMotion().GetPhysicalExecutionHCode();
+
+        // 如果機台靜止(大腦卡住)，顯示大腦狀態；如果機台在跑，顯示馬達標籤狀態！
+        // 假設 pShm->NC_Status 有這兩個變數供 UI 綁定
+        pShm->NC_Status.currentToolLengthMode = isMachineIdle ? interpreterToolMode : physicalToolMode;
+        pShm->NC_Status.currentHCode = isMachineIdle ? interpreterHCode : physicalHCode;
+
+        // 4. 🌟 刀徑補正顯示 (Tool Radius Comp)
+        int interpreterTRadMode = nc->CoordSys.toolRadiusMode;
+        int physicalTRadMode = nc->GetMotion().GetPhysicalExecutionToolRadiusMode();
+
+        int interpreterDCode = nc->CoordSys.currentDCode;
+        int physicalDCode = nc->GetMotion().GetPhysicalExecutionDCode();
+
+        // 🌟 取得大腦與馬達的 isAbsoluteMode
+        bool interpreterAbs = nc->CoordSys.isAbsoluteMode;
+        bool physicalAbs = nc->GetMotion().GetPhysicalExecutionIsAbsoluteMode();
+
+        // 根據機台是否靜止，決定 UI 要聽誰的，然後轉成 1 或 0 傳給 HMI
+        bool finalAbs = isMachineIdle ? interpreterAbs : physicalAbs;
+        pShm->NC_Status.isAbsoluteMode = finalAbs ? 1 : 0;
+
+
+        // 寫入 SHM 供 HMI 讀取
+        pShm->NC_Status.currentToolRadiusMode = isMachineIdle ? interpreterTRadMode : physicalTRadMode;
+        pShm->NC_Status.currentDCode = isMachineIdle ? interpreterDCode : physicalDCode;
+
+
+        // 🌟 G68 旋轉狀態與角度顯示
+        bool interpreterG68 = nc->CoordSys.isG68Active;
+        bool physicalG68 = nc->GetMotion().GetPhysicalExecutionG68Active();
+
+        double interpreterG68Angle = nc->CoordSys.g68Angle;
+        double physicalG68Angle = nc->GetMotion().GetPhysicalExecutionG68Angle();
+
+        // 寫入 SHM 供 HMI 讀取
+        pShm->NC_Status.currentG68State = (isMachineIdle ? interpreterG68 : physicalG68) ? 1 : 0;
+        pShm->NC_Status.currentG68Angle = isMachineIdle ? interpreterG68Angle : physicalG68Angle;
+
+
+
+        // 🌟 G168 狀態與 W 碼顯示
+        bool interpreterG168 = nc->CoordSys.isWorkpieceRotationActive;
+        bool physicalG168 = nc->GetMotion().GetPhysicalExecutionG168Active();
+
+        int interpreterWCode = nc->CoordSys.currentWCode;
+        int physicalWCode = nc->GetMotion().GetPhysicalExecutionWCode();
+
+        // 寫入 SHM 供 HMI 讀取
+        pShm->NC_Status.currentG168State = (isMachineIdle ? interpreterG168 : physicalG168) ? 1 : 0;
+        pShm->NC_Status.currentWCode = isMachineIdle ? interpreterWCode : physicalWCode;
+
+
+        // 🌟 7. G51 縮放狀態顯示
+        bool interpreterG51 = nc->CoordSys.isScalingActive;
+        bool physicalG51 = nc->GetMotion().GetPhysicalExecutionG51Active();
+
+        double interpreterScale = nc->CoordSys.scaleFactor;
+        double physicalScale = nc->GetMotion().GetPhysicalExecutionScaleRatio();
+
+        // 🌟 8. G151 / G150 鏡像狀態顯示
+
+        // 算出大腦目前的 Mask
+        uint8_t interpreterMirrorMask = 0;
+        for (int i = 0; i < 8; i++) {
+            if (nc->CoordSys.isMirrorActive[i]) {
+                interpreterMirrorMask |= (1 << i);
+            }
+        }
+
+        // 拿取馬達目前的 Mask
+        uint8_t physicalMirrorMask = nc->GetMotion().GetPhysicalExecutionMirrorMask();
+
+        // 寫入 SHM 供 HMI 讀取
+        pShm->NC_Status.currentMirrorMask = isMachineIdle ? interpreterMirrorMask : physicalMirrorMask;
+
+        // 寫入 SHM 供 HMI 讀取
+        pShm->NC_Status.currentG51State = (isMachineIdle ? interpreterG51 : physicalG51) ? 1 : 0;
+        pShm->NC_Status.currentScaleRatio = isMachineIdle ? interpreterScale : physicalScale;
+
+        // 🌟 9. G16 極座標狀態顯示
+        bool interpreterG16 = nc->CoordSys.isPolarCoordinateActive;
+        bool physicalG16 = nc->GetMotion().GetPhysicalExecutionG16Active();
+
+        // 寫入 SHM 供 HMI 讀取燈號
+        bool finalG16 = isMachineIdle ? interpreterG16 : physicalG16;
+        pShm->NC_Status.currentG16State = finalG16 ? 1 : 0;
+
+
+        // 🌟 G162 偏心補償與 G17/18/19 平面顯示
+        bool interpreterG162 = nc->CoordSys.isCAxisOffsetRotationEnabled;
+        bool physicalG162 = nc->GetMotion().GetPhysicalExecutionG162Active();
+
+        int interpreterPlane = nc->CoordSys.activePlane;
+        int physicalPlane = nc->GetMotion().GetPhysicalExecutionPlaneMode();
+
+        // 寫入 SHM 供 HMI 讀取
+        pShm->NC_Status.currentG162State = (isMachineIdle ? interpreterG162 : physicalG162) ? 1 : 0;
+        pShm->NC_Status.currentPlaneMode = isMachineIdle ? interpreterPlane : physicalPlane;
+
+
+
         if (pShm->NC_Command.reqChangeMode)//處理 OP 模式切換請求 (來自 NC_Command)
         {
             nc->ChangeMode(static_cast<NCOperationMode>(pShm->NC_Command.targetMode));

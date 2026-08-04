@@ -44,6 +44,40 @@ bool NCManager::LoadProgram(const std::string& filepath)
     m_programMemory.clear();
     m_jumpTable.clear(); // 清空舊的跳躍表
     m_programPC = 0;
+    m_motion.ResetPhysicalPC(); // 🌟 載入新程式，實體行號歸零
+   
+    // 🌟 取得大腦目前的狀態，並同步給馬達標籤機
+    int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
+    int currentBrainToolMode = CoordSys.toolLengthMode;
+    int currentBrainHCode = CoordSys.currentHCode;
+    int currentBraintoolRadiusMode = CoordSys.toolRadiusMode;
+    int currentBraintoolDCode = CoordSys.currentDCode;
+    bool curIsAbs = CoordSys.isAbsoluteMode;
+    bool curG68 = CoordSys.isG68Active;
+    double curG68Angle = CoordSys.g68Angle; // 讀取你存的 R 參數角度
+    bool curG168 = CoordSys.isWorkpieceRotationActive; // 讀取你原本寫好的狀態
+    int curWCode = CoordSys.currentWCode; // 讀取你存的 W 碼
+    bool curG51 = CoordSys.isScalingActive;
+    double curScale = CoordSys.scaleFactor;
+
+    uint8_t curMirrorMask = 0;
+    for (int i = 0; i < 8; i++) {
+        if (CoordSys.isMirrorActive[i]) {
+            curMirrorMask |= (1 << i); // 如果這軸有鏡像，就把對應的 bit 設為 1
+        }
+    }
+
+    // 🌟 讀取大腦的極座標狀態 (你原本應該就有這個變數)
+    bool curG16 = CoordSys.isPolarCoordinateActive;
+
+    // 🌟 讀取大腦的狀態 (變數名稱請對應你的 CoordSys)
+    bool curG162 = CoordSys.isCAxisOffsetRotationEnabled;
+    int curPlane = CoordSys.activePlane; // 17, 18 或是 19
+
+    // 🌟 拿大腦最乾淨的狀態強制洗掉馬達的殘影
+    m_motion.ResetPhysicalTags(CoordSys.GetCurrentWCSGCode(),CoordSys.toolLengthMode, CoordSys.currentHCode,CoordSys.toolRadiusMode, CoordSys.currentDCode, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+
+
     std::string line;
 
     int lineIndex = 0;
@@ -123,6 +157,41 @@ void NCManager::Reset()
 
     //重置馬達區塊--------------------------------------------------
     m_motion.StopGroup();//滑行停止
+    m_motion.ResetPhysicalPC(); // 🌟 按下 Reset，實體行號歸零
+    
+    
+
+    // 🌟 2. 取得大腦洗乾淨後的 3 大狀態
+    int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
+    int currentBrainToolMode = CoordSys.toolLengthMode;
+    int currentBrainHCode = CoordSys.currentHCode;
+    int currentBraintoolRadiusMode = CoordSys.toolRadiusMode;
+    int currentBraintoolDCode = CoordSys.currentDCode;
+    bool curIsAbs = CoordSys.isAbsoluteMode;
+    // 🌟 讀取大腦的 G68 狀態 (假設你在 CoordSys 有這個變數)
+    bool curG68 = CoordSys.isG68Active;
+    double curG68Angle = CoordSys.g68Angle; // 讀取你存的 R 參數角度
+    bool curG168 = CoordSys.isWorkpieceRotationActive; // 讀取你原本寫好的狀態
+    int curWCode = CoordSys.currentWCode; // 讀取你存的 W 碼
+    bool curG51 = CoordSys.isScalingActive;
+    double curScale = CoordSys.scaleFactor;
+
+    uint8_t curMirrorMask = 0;
+    for (int i = 0; i < 8; i++) {
+        if (CoordSys.isMirrorActive[i]) {
+            curMirrorMask |= (1 << i); // 如果這軸有鏡像，就把對應的 bit 設為 1
+        }
+    }
+    // 🌟 讀取大腦的極座標狀態 (你原本應該就有這個變數)
+    bool curG16 = CoordSys.isPolarCoordinateActive;
+
+    // 🌟 讀取大腦的狀態 (變數名稱請對應你的 CoordSys)
+    bool curG162 = CoordSys.isCAxisOffsetRotationEnabled;
+    int curPlane = CoordSys.activePlane; // 17, 18 或是 19
+
+    // 🌟 3. 強制同步給馬達！撕掉舊標籤，貼上乾淨狀態，徹底消滅殘影！
+    m_motion.ResetPhysicalTags(currentBrainWCS, currentBrainToolMode, currentBrainHCode, currentBraintoolRadiusMode, currentBraintoolDCode, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+
     //m_motion.EmergencyStopGroup();//急停
     //m_motion.ResetAllFaults();//軸清除錯誤
     
@@ -339,6 +408,7 @@ void NCManager::ProcessExecutionEngine()
     std::vector<std::string>& baseMemory = GetBaseMemory();
 
     // 判斷現在是在跑最上層的字串，還是在跑副程式
+
     int& activePC = isMacro ? m_macroStack.back().currentPC : basePC;
     std::vector<std::string>& activeMemory = isMacro ? m_macroStack.back().memory : baseMemory;
 
@@ -352,14 +422,25 @@ void NCManager::ProcessExecutionEngine()
         m_macroProgramPC = -1;
     }
 
-    // --- 階段 A：萬用等待條件檢查 ---
+    // ==========================================================
+    // --- 階段 A：萬用等待條件檢查 (物理卡點) ---
+    // 如果這裡有值(例如遇到 G12 或是 G00)，大腦就會停止預讀，直到馬達走完
+    // ==========================================================
     if (m_waitCallback != nullptr) {
-        if (m_waitCallback(this) == false) return; // 繼續等
+        if (m_waitCallback(this) == false) return; // 繼續等馬達跑完
 
         m_waitCallback = nullptr;
         if (m_state != NCState::ALARM && m_state != NCState::HOLD) {
-            activePC++;
+            activePC++; // 解除等待，準備讀下一行
         }
+    }
+
+    // ==========================================================
+    // 🌟 預讀閘門：容量限制 (Look-Ahead Buffer Limit)
+    // 如果 MotionCore 的倉庫已經塞了 50 條路徑，大腦這回合就先休息！
+    // ==========================================================
+    if (m_motion.GetQueueSize() >= 50) {
+        return; // 下一個 Tick 再來看看倉庫有沒有空位
     }
 
     // --- 階段 B & C：讀取與結束判斷 ---
@@ -430,8 +511,91 @@ void NCManager::ProcessExecutionEngine()
                 }
             }
             else {
+                // ==========================================================
+                  // 🌟 【神級預讀屏障 (Look-Ahead Barrier)】
+                  // 這些 G 碼必須在「機台完全靜止、且底層倉庫為空」時才能下達！
+                  // ==========================================================
+                bool isBarrier = 
+                    (
+                        block.gCode == 0 || block.gCode == 12 ||
+                        block.gCode == 4 ||
+                        block.gCode == 7 ||
+                        block.gCode == 28 || block.gCode == 30||
+                        block.gCode == 32 ||
+                        block.gCode == 53 || block.gCode == 161||
+                        block.gCode == 65 ||
+                        block.gCode == 92 ||   
+                        ((block.gCode >= 54 && block.gCode <= 59))||
+                        ((block.gCode >= 154 && block.gCode <= 159)) ||
+                        ((block.gCode >= 254 && block.gCode <= 259)) ||
+                        ((block.gCode >= 354 && block.gCode <= 359)) ||
+                        ((block.gCode >= 454 && block.gCode <= 459)) ||
+                        ((block.gCode >= 554 && block.gCode <= 559)) ||
+                        ((block.gCode >= 654 && block.gCode <= 659)) ||
+                        ((block.gCode >= 754 && block.gCode <= 759)) ||
+                        ((block.gCode >= 854 && block.gCode <= 859)) ||
+                        ((block.gCode >= 954 && block.gCode <= 959)) 
+                    );
+             
+                if (block.gCode == 0 && block.has('P') == 1)//G00 P1模式為可預讀路徑
+                {
+                    isBarrier = false;
+                }
+
+                
+                // 如果這行是 G00/G28/G30，且底層還在跑 (倉庫有東西，或馬達還沒到位)
+                if (isBarrier && (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupDone())) {
+                    // 大腦立刻罷工！
+                    // 不執行 ExecuteBlock，也不把 activePC++，
+                    // 等下一毫秒再回來問：「馬達停了沒？」直到完全靜止才放行！
+                    return;
+                }
+
+                // 只有在機台完全靜止時，G00 才會走到這裡被執行！
                 m_programChanged = false;
-                ExecuteBlock(block); // 執行 G 碼與 M 碼
+
+
+              
+            
+
+                // 🌟 【貼標籤】：大腦瞬間讀取自己當下的狀態
+                int currentBrainWCS = CoordSys.GetCurrentWCSGCode();  // 🌟 【貼標籤】：把大腦當下的「行號」和「座標系」印成標籤！
+                int currentBrainToolMode = CoordSys.toolLengthMode; // 從 CoordSys 讀取
+                int currentBrainHCode = CoordSys.currentHCode;      // 從 CoordSys 讀取
+                int curTRad = CoordSys.toolRadiusMode; // 🌟 刀徑
+                int curD = CoordSys.currentDCode;      // 🌟 D碼
+                // 🌟 直接讀取你原本就寫好的 CoordSys.isAbsoluteMode
+                bool curIsAbs = CoordSys.isAbsoluteMode;
+                // 🌟 讀取大腦的 G68 狀態 (假設你在 CoordSys 有這個變數)
+                bool curG68 = CoordSys.isG68Active;
+                double curG68Angle = CoordSys.g68Angle; // 讀取你存的 R 參數角度
+
+                bool curG168 = CoordSys.isWorkpieceRotationActive; // 讀取你原本寫好的狀態
+                int curWCode = CoordSys.currentWCode; // 讀取你存的 W 碼
+                // 🌟 讀取大腦的 G51 狀態 (假設你在 CoordSys 有這兩個變數)
+                bool curG51 = CoordSys.isScalingActive;
+                double curScale = CoordSys.scaleFactor;
+
+                // 🌟 讀取大腦的鏡像狀態，並打包成一個 byte (Bitmask)
+                uint8_t curMirrorMask = 0;
+                for (int i = 0; i < 8; i++) {
+                    if (CoordSys.isMirrorActive[i]) {
+                        curMirrorMask |= (1 << i); // 如果這軸有鏡像，就把對應的 bit 設為 1
+                    }
+                }
+
+                // 🌟 讀取大腦的極座標狀態 (你原本應該就有這個變數)
+                bool curG16 = CoordSys.isPolarCoordinateActive;
+
+                // 🌟 讀取大腦的狀態 (變數名稱請對應你的 CoordSys)
+                bool curG162 = CoordSys.isCAxisOffsetRotationEnabled;
+                int curPlane = CoordSys.activePlane; // 17, 18 或是 19
+
+                // 🌟 印出標籤並貼到標籤機上
+                m_motion.SetNextCommandState(activePC, currentBrainWCS, currentBrainToolMode, currentBrainHCode, curTRad, curD, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+
+
+                ExecuteBlock(block); // 執行 G 碼
 
                 if (AlarmManager::GetInstance().HasAlarm()) {
                     m_state = NCState::ALARM;
@@ -542,6 +706,9 @@ void NCManager::ExecuteBlock(const NCBlock& block)
             break;
         case 7:
             m_waitCallback = GCodeHandlers::Handle_G07(block, this);
+            break;
+        case 12:
+            m_waitCallback = GCodeHandlers::Handle_G12(block, this);
             break;
         case 161:
             m_waitCallback = GCodeHandlers::Handle_G161(block, this);
@@ -802,6 +969,40 @@ bool NCManager::LoadDynamicCode(const std::string& content)
     // 2. 清空舊資料
     targetMemory->clear();
     *targetPC = 0;
+    m_motion.ResetPhysicalPC(); // 🌟 載入 MDI，實體行號歸零
+
+   
+
+    // 🌟 取得大腦目前的狀態，並同步給馬達標籤機
+    int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
+    int currentBrainToolMode = CoordSys.toolLengthMode;
+    int currentBrainHCode = CoordSys.currentHCode;
+    int currentBraintoolRadiusMode = CoordSys.toolRadiusMode;
+    int currentBraintoolDCode = CoordSys.currentDCode;
+    // 🌟 直接讀取你原本就寫好的 CoordSys.isAbsoluteMode
+    bool curIsAbs = CoordSys.isAbsoluteMode;
+    bool curG68 = CoordSys.isG68Active;
+    double curG68Angle = CoordSys.g68Angle; // 讀取你存的 R 參數角度
+    bool curG168 = CoordSys.isWorkpieceRotationActive; // 讀取你原本寫好的狀態
+    int curWCode = CoordSys.currentWCode; // 讀取你存的 W 碼
+    bool curG51 = CoordSys.isScalingActive;
+    double curScale = CoordSys.scaleFactor;
+    // 🌟 讀取大腦的鏡像狀態，並打包成一個 byte (Bitmask)
+    uint8_t curMirrorMask = 0;
+    for (int i = 0; i < 8; i++) {
+        if (CoordSys.isMirrorActive[i]) {
+            curMirrorMask |= (1 << i); // 如果這軸有鏡像，就把對應的 bit 設為 1
+        }
+    }
+    // 🌟 讀取大腦的極座標狀態 (你原本應該就有這個變數)
+    bool curG16 = CoordSys.isPolarCoordinateActive;
+
+    // 🌟 讀取大腦的狀態 (變數名稱請對應你的 CoordSys)
+    bool curG162 = CoordSys.isCAxisOffsetRotationEnabled;
+    int curPlane = CoordSys.activePlane; // 17, 18 或是 19
+
+    m_motion.ResetPhysicalTags(currentBrainWCS, currentBrainToolMode, currentBrainHCode, currentBraintoolRadiusMode, currentBraintoolDCode, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+    
 
     // 3. 解析並塞入記憶體
     std::stringstream ss(content);

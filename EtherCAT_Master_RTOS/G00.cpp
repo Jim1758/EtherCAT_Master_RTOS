@@ -158,7 +158,25 @@ namespace GCodeHandlers
         }
        
         // 6. 下達移動命令！(底層會自動套用 G00 的快速定位 PID 與速度)
-        nc->GetMotion().G00_Move(activeAxes, targetPos);
+
+        if (block.has('P')==1)
+        {
+           
+            nc->GetMotion().G00_Move(activeAxes, targetPos, BufferMode::BUFFERED);//連續路徑
+           
+
+             // 🔓 解開第二道鎖：
+             // 回傳 nullptr 代表「不要等我走完，大腦請立刻去讀下一行！」
+             // 這個 G00 包裹會乖乖排在倉庫裡，第二個 G00 也會馬上被送進來排隊。
+
+            return nullptr;
+        }
+        else
+        {
+            nc->GetMotion().G00_Move(activeAxes, targetPos,BufferMode::ABORTING);//不連續
+        }
+       
+      
 
         // 7. 回傳檢查函式，交給 NC 系統去輪詢 (Polling)
         return CheckMotionDone;

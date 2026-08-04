@@ -92,7 +92,10 @@ public:
     bool isMirrorActive[8] = { false };     // 紀錄哪幾個軸開啟了鏡像
     double mirrorCenterWCS[8] = { 0.0 };    // 鏡像對稱中心
 
-
+    bool IsMirrorActive(int axisIndex) const {
+        if (axisIndex >= 0 && axisIndex < 8) return isMirrorActive[axisIndex];
+        return false;
+    }
     // ==========================================
     // 🌟 G15 / G16 極座標 (群組 17)
     // ==========================================

@@ -91,12 +91,22 @@ void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double
     // 🌟 3. 丟給 LineMove
     // =========================================================
     PathMode prevMode = GetGroupPathMode();
-    SetGroupPathMode(PathMode::EXACT_STOP);
+
+    SetGroupPathMode(PathMode::EXACT_STOP);//路徑模式
+    if (mode == BufferMode::ABORTING)
+    {
+        SetGroupPathMode(PathMode::EXACT_STOP);
+    }
+    else
+    {
+        SetGroupPathMode(PathMode::CONTINUOUS);
+    }
+   
 
     // 完美傳入 Pulse 陣列與計算好的 PPS 速度
-    LineMove(axes, targetPos_Pulse, groupG00Vel_PPS, groupAccTime, groupDecTime, BufferMode::ABORTING);
+    LineMove(axes, targetPos_Pulse, groupG00Vel_PPS, groupAccTime, groupDecTime, mode);
 
-    
+    //RtPrintf("G00>>> %d !\n", mode);
 }
 
 

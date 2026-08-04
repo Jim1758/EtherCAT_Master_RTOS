@@ -32,6 +32,39 @@ struct SHM_NC_Status
     // 🌟 新增：人機 UI 專用的模態狀態 (Modal Status)
     int currentWCS_GCode;  // 目前的座標系 (54~959)
     int isAbsoluteMode=true;    // 1 = G90 (絕對), 0 = G91 (增量)
+    // 🌟 新增：給 HMI 畫面綁定刀具狀態用的變數
+    int currentToolLengthMode; // 目前的刀長補正模式 (49=G49, 43=G43, 44=G44)
+    int currentHCode;          // 目前的 H 碼 (0~100)
+
+    // 🌟 新增：刀徑狀態變數
+    int currentToolRadiusMode; // 40=G40(取消), 41=G41(左), 42=G42(右)
+    int currentDCode;          // 目前的 D 碼 (0~100)
+
+    // 🌟 新增：G68 旋轉狀態 (1 = 開啟, 0 = 關閉)
+    int currentG68State;
+    double currentG68Angle;          // 🌟 新增：目前的旋轉角度 (給 HMI 顯示用)
+
+
+    int currentG168State;
+
+    int currentWCode;            // 🌟 新增：目前的 W 碼 (給 HMI 顯示用，例如 W1, W2)
+    // 🌟 新增：G51 縮放狀態與倍率
+    int currentG51State;  // 1 = 開啟縮放, 0 = 關閉縮放
+    double currentScaleRatio; // 目前的縮放倍率 (給 HMI 顯示用，例如 0.5)
+
+
+    // 🌟 新增：鏡像狀態遮罩 (Bitmask: 第 0 bit 代表 X 軸，第 1 bit 代表 Y 軸...)
+    uint8_t currentMirrorMask;
+
+    // 🌟 新增：G16 極座標狀態 (1 = 開啟, 0 = 關閉)
+    int  currentG16State;
+
+
+    // 🌟 新增：G162 偏心補償狀態 (1=開啟, 0=關閉)
+    int currentG162State;
+
+    // 🌟 新增：目前插補平面 (17=G17, 18=G18, 19=G19)
+    int currentPlaneMode;
 
     // 🌟 新增：即時座標廣播區 (8軸)
     double actualMCS[8]; // 機械座標 (Machine Coordinate System)

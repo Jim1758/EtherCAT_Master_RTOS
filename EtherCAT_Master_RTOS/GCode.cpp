@@ -7,7 +7,17 @@
 
 namespace GCodeHandlers
 {
+    WaitConditionFunc Handle_G12(const NCBlock& block, NCManager* nc)
+    {
+        // 程式能進到這裡，代表 isBarrier 已經成功攔截，
+        // 底層倉庫 (cmdQueue) 已清空，馬達完全靜止。
 
+        //DEBUG_PRINT("[NC] Executing G12: Buffer Flushed & Exact Stop.\n");
+
+        // 既然只是為了中斷預讀，這裡不需要做任何事，
+        // 直接回傳 nullptr，讓大腦繼續讀下一行。
+        return nullptr;
+    }
     WaitConditionFunc Handle_GCode(const NCBlock& block, NCManager* nc)
     {
         SHM_Data* pShm = SHMManager::GetInstance().GetData();
@@ -58,7 +68,9 @@ namespace GCodeHandlers
         case 43:
         case 44:
         case 49:
-        {  int hCode = block.val('H');
+        {  
+            int hCode = block.val('H');
+           
         nc->CoordSys.SetToolLengthCompensation(block.gCode, hCode, nc); // 設定模式為 43，H碼為1
         }
           

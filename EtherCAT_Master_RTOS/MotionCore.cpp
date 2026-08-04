@@ -1214,6 +1214,35 @@ void MotionCore::LineMove(const std::vector<int>& axes, const std::vector<double
     cmd.accTime = acc_time;
     cmd.decTime = dec_time;
 
+    // 🌟 貼上標籤！記錄這條路徑是來自哪一行 G-Code
+    cmd.sourceLinePC = m_pendingSourcePC;
+    cmd.sourceWCS = m_pendingSourceWCS;
+
+    // 🌟 貼上刀具標籤！
+    cmd.sourceToolLengthMode = m_pendingToolMode;
+    cmd.sourceHCode = m_pendingHCode;
+
+    cmd.sourceToolRadiusMode = m_pendingToolRadMode; // 刀徑 G 碼
+    cmd.sourceDCode = m_pendingDCode;                // D 碼
+
+    cmd.sourceIsAbsoluteMode = m_pendingIsAbsoluteMode;
+
+    cmd.sourceG68Active = m_pendingG68Active; // 🌟 印上 G68 標籤
+    cmd.sourceG68Angle = m_pendingG68Angle; // 🌟 印上角度標籤
+
+    cmd.sourceG168Active = m_pendingG168Active; // 🌟 把 G168 狀態印在包裹上
+    cmd.sourceWCode = m_pendingWCode; // 🌟 印上 W 碼標籤
+
+
+    cmd.sourceG51Active = m_pendingG51Active;
+    cmd.sourceScaleRatio = m_pendingScaleRatio; // 🌟 印上縮放標籤
+
+    cmd.sourceMirrorMask = m_pendingMirrorMask; // 🌟 印上鏡像標籤
+
+    cmd.sourceG16Active = m_pendingG16Active; // 🌟 印上極座標標籤
+
+    cmd.sourceG162Active = m_pendingG162Active;
+    cmd.sourcePlaneMode = m_pendingPlaneMode;
 
     // 🔍 [加入這行] 確認收到指令
     //RtPrintf("[DBG-1] LineMove Queueing! AxisCnt:%d | FirstAxis:%d | TargetPulse:%d\n",cmd.axisCount, cmd.axisIndices[0], (int)cmd.targetPos[0]);
@@ -1239,7 +1268,6 @@ void MotionCore::LoadNextCommand()
     if (m_Group.cmdQueue.empty()) return;
 
     // 🔴 關鍵：如果正在動，且「還沒」舉手要交接，才阻擋。
-    // 這代表只要虛擬軸跑到終點舉手 (inPosition == true)，就可以進來拿新指令！
     if (m_Group.isActive && !m_Group.virtualAxis.inPosition) return;
 
     // ======================================================
@@ -1259,6 +1287,8 @@ void MotionCore::LoadNextCommand()
 
 
 
+
+
     // 2. 從倉庫拿出最前面的一個包裹 (正式取件)
     MotionCommand cmd = m_Group.cmdQueue.front();
     m_Group.cmdQueue.pop_front();
@@ -1266,6 +1296,38 @@ void MotionCore::LoadNextCommand()
     // 🔴 【時光機：緊緊抓在手上】
     // 把拿出來的新包裹，存進大腦的 currentCmd 變數裡
     m_Group.currentCmd = cmd;
+
+    // ======================================================
+    // 🌟 【雙指標同步核心】：實體馬達正式宣告它正在跑這一行！
+    // ======================================================
+    m_Group.currentExecutionPC = cmd.sourceLinePC;
+    m_Group.currentExecutionWCS = cmd.sourceWCS; // 🌟 實體馬達正式切換座標系廣播！
+
+    // 🌟 實體馬達正式切換刀補狀態廣播！
+    m_Group.currentExecutionToolMode = cmd.sourceToolLengthMode;
+    m_Group.currentExecutionHCode = cmd.sourceHCode;
+
+    // 🌟 實體馬達切換刀徑狀態廣播！
+    m_Group.currentExecutionToolRadiusMode = cmd.sourceToolRadiusMode;
+    m_Group.currentExecutionDCode = cmd.sourceDCode;
+
+    m_Group.currentExecutionIsAbsoluteMode = cmd.sourceIsAbsoluteMode;
+
+    m_Group.currentExecutionG68Active = cmd.sourceG68Active; // 🌟 撕下標籤更新
+    m_Group.currentExecutionG68Angle = cmd.sourceG68Angle; // 🌟 撕下標籤更新
+
+    m_Group.currentExecutionG168Active = cmd.sourceG168Active; // 🌟 撕下標籤，更新馬達狀態
+    m_Group.currentExecutionWCode = cmd.sourceWCode; // 🌟 撕下標籤更新馬達狀態
+
+    m_Group.currentExecutionG51Active = cmd.sourceG51Active;
+    m_Group.currentExecutionScaleRatio = cmd.sourceScaleRatio; // 🌟 撕下標籤更新
+
+    m_Group.currentExecutionMirrorMask = cmd.sourceMirrorMask; // 🌟 撕下標籤更新
+
+    m_Group.currentExecutionG16Active = cmd.sourceG16Active; // 🌟 撕下標籤更新馬達狀態
+
+    m_Group.currentExecutionG162Active = cmd.sourceG162Active;
+    m_Group.currentExecutionPlaneMode = cmd.sourcePlaneMode;
 
     // 3. 更新群組目前的運動模式與軸清單
     m_Group.mode = cmd.mode;
@@ -1611,6 +1673,33 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
     cmd.targetVel = std::abs(targetVel);
     cmd.accTime = acc_time;
     cmd.decTime = dec_time;
+
+    // 🌟 貼上標籤！記錄這條路徑是來自哪一行 G-Code
+    cmd.sourceLinePC = m_pendingSourcePC;
+    cmd.sourceWCS = m_pendingSourceWCS; // 🌟 貼上 WCS 標籤！
+    // 🌟 貼上刀具標籤！
+    cmd.sourceToolLengthMode = m_pendingToolMode;
+    cmd.sourceHCode = m_pendingHCode;
+
+    cmd.sourceToolRadiusMode = m_pendingToolRadMode; // 刀徑 G 碼
+    cmd.sourceDCode = m_pendingDCode;                // D 碼
+
+    cmd.sourceIsAbsoluteMode = m_pendingIsAbsoluteMode;
+
+    cmd.sourceG68Active = m_pendingG68Active; // 🌟 印上 G68 標籤
+    cmd.sourceG68Angle = m_pendingG68Angle; // 🌟 印上角度標籤
+    cmd.sourceG168Active = m_pendingG168Active; // 🌟 把 G168 狀態印在包裹上
+    cmd.sourceWCode = m_pendingWCode; // 🌟 印上 W 碼標籤
+
+    cmd.sourceG51Active = m_pendingG51Active;
+    cmd.sourceScaleRatio = m_pendingScaleRatio; // 🌟 印上縮放標籤
+
+    cmd.sourceMirrorMask = m_pendingMirrorMask; // 🌟 印上鏡像標籤
+
+    cmd.sourceG16Active = m_pendingG16Active; // 🌟 印上極座標標籤
+
+    cmd.sourceG162Active = m_pendingG162Active;
+    cmd.sourcePlaneMode = m_pendingPlaneMode;
 
     // 2. 判斷插隊或排隊
     if (mode == BufferMode::ABORTING)

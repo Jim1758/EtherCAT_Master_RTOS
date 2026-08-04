@@ -109,7 +109,14 @@ void CoordinateManager::Transform_WCS_to_MCS(const double* targetWCS, const bool
     {
         for (int i = 0; i < 8; i++) {
             if (isMirrorActive[i] && hasAxis[i]) {
-                finalTargetWCS[i] = mirrorCenterWCS[i] - (finalTargetWCS[i] - mirrorCenterWCS[i]);
+                if (isAbsoluteMode) {
+                    // G90：絕對座標對稱翻轉
+                    finalTargetWCS[i] = mirrorCenterWCS[i] - (finalTargetWCS[i] - mirrorCenterWCS[i]);
+                }
+                else {
+                    // G91：增量距離直接加負號！(走 +10 變成走 -10)
+                    finalTargetWCS[i] = -finalTargetWCS[i];
+                }
             }
         }
     }
@@ -431,12 +438,12 @@ void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targe
         if (axisProgrammed[i]) {
             double ext = extOffset[i];
 
-            // 公式：新 G54 表格偏移 = 機械座標 - EXT - 使用者要求的目標座標
-            // 直接把算出來的結果塞進目前的 WCS 表格中 (例如 G54 就是 currentWCSIndex = 0)
-            m_WCSTable[currentWCSIndex][i] = actualMCS[i] - ext - targetPos[i];
+            // 🌟 正確公式：新 WCS 表格偏移 = 指令機械座標 (commandedMCS) - EXT - 使用者要求的目標座標 (WCS)
+            // 使用 commandedMCS 代替 actualMCS，確保理論幾何精度絕對不飄移！
+            m_WCSTable[currentWCSIndex][i] = commandedMCS[i] - ext - targetPos[i];
 
-            DEBUG_PRINT("[Coordinate] G92 Overwrites WCS %d on Axis %d, New Offset: %f\n",
-                currentWCSIndex, i, m_WCSTable[currentWCSIndex][i]);
+            DEBUG_PRINT("[Coordinate] G92 Overwrites WCS %d on Axis %d, New Offset: %f (based on CommandedMCS: %f)\n",
+                currentWCSIndex, i, m_WCSTable[currentWCSIndex][i], commandedMCS[i]);
         }
     }
 }
@@ -490,9 +497,8 @@ void CoordinateManager::SetToolLengthCompensation(int gCode, int hCode, NCManage
 void CoordinateManager::CancelToolLengthCompensation(NCManager* nc)
 {
     toolLengthMode = 49; // 強制切換為 G49
-
-    // H 碼可以保留在畫面上，但不發生作用
-    // currentHCode = 0; 
+    currentHCode = 0;
+   
 
     // 更新系統巨集變數 (群組 8 的狀態改為 49)
     if (nc) nc->MacroSys.SetVar('$', 8, 49.0);
@@ -769,7 +775,7 @@ void CoordinateManager::SetToolRadiusCompensation(int gCode, int dCode, NCManage
 void CoordinateManager::CancelToolRadiusCompensation(NCManager* nc)
 {
     toolRadiusMode = 40;
-    // currentDCode = 0; // 通常 D 碼保留，只改狀態
+     currentDCode = 0; // 通常 D 碼保留，只改狀態
     if (nc) nc->MacroSys.SetVar('$', 7, 40.0);
     RtPrintf("[G40] Tool Radius Comp OFF.\n");
 }

@@ -133,6 +133,13 @@ void NCManager::CycleStart()
             m_manualAutoRunning = true;
         }
 
+        // =========================================================
+        // 🌟 【新增 API 呼叫】全新啟動前的終極防護！
+        // 不管操作員剛剛手搖到哪裡，啟動瞬間，強制把預讀起點拉回現在位置！
+        // =========================================================
+        m_motion.SyncVirtualEndPosition();
+
+
         m_state = NCState::RUN;
         //DEBUG_PRINT("[NC] Cycle Start!\n");
     }
@@ -159,7 +166,8 @@ void NCManager::Reset()
     m_motion.StopGroup();//滑行停止
     m_motion.ResetPhysicalPC(); // 🌟 按下 Reset，實體行號歸零
     
-    
+   
+  
 
     // 🌟 2. 取得大腦洗乾淨後的 3 大狀態
     int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
@@ -226,8 +234,7 @@ void NCManager::Reset()
 
 
     m_state = NCState::RESET_STATE;
-    m_state = NCState::READY;
-
+   
 
 
 
@@ -343,6 +350,9 @@ void NCManager::ProcessTask()
     m_edmState = GetMachineEDMState();
 
 
+
+
+
     // =========================================================
     // 🚨 2. 【絕對防禦攔截網】警報與急停鎖死區
     // =========================================================
@@ -358,6 +368,34 @@ void NCManager::ProcessTask()
         // ⚠️ 立刻退出迴圈，絕對不准往下執行任何軌跡運算或 G 碼解析！
         return; 
     }
+
+    // =========================================================
+    // 🌟 2.5 【新增：滑行煞車攔截網】等待 Reset 後的馬達完全靜止
+    // =========================================================
+    if (m_state == NCState::RESET_STATE)
+    {
+        // 檢查硬體馬達是否「完全靜止」？
+        if (m_motion.IsGroupStandstill())
+        {
+            // 🛑 馬達完全靜止了！現在才是同步的完美時機！
+
+            // 1. 同步大腦的數學座標 (把實體座標拉回大腦)
+            CoordSys.SyncMachinePosition(CoordSys.actualMCS);
+
+            // 2. 同步手腳的虛擬預讀起點 (徹底消滅幽靈座標！)
+            m_motion.SyncVirtualEndPosition();
+
+            // 3. 正式宣告機台準備就緒，可以接受下一個指令了！
+            m_state = NCState::READY;
+
+            // DEBUG_PRINT("[NC] Reset Complete. Machine completely stopped.\n");
+        }
+
+        // ⚠️ 只要還在滑行，就立刻 return，不准執行下面的 G 碼解析與模式分流！
+        return;
+    }
+
+
     // =========================================================
     // 🌟 3. 正常任務分流 (只有在無警報時才會走到這裡)
     // =========================================================
@@ -537,9 +575,14 @@ void NCManager::ProcessExecutionEngine()
                         ((block.gCode >= 954 && block.gCode <= 959)) 
                     );
              
-                if (block.gCode == 0 && block.has('P') == 1)//G00 P1模式為可預讀路徑
+                if (block.gCode == 0 )//G00 P1模式為可預讀路徑
                 {
-                    isBarrier = false;
+                    // 🌟 正確寫法：確保真的有 P，而且值是 1.0
+                    if (block.has('P') && block.val('P') == 1)
+                    {
+                        isBarrier = false;
+                    }
+                  
                 }
 
                 

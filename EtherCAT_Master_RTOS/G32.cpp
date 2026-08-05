@@ -110,7 +110,11 @@ namespace GCodeHandlers
             // 無中間點：傳入 nullptr
             nc->GetMotion().G32_Move(refAxes, refPos, nullptr, BufferMode::BUFFERED);
         }
-
+        // 🌟 一樣要手動更新大腦！
+        for (size_t i = 0; i < refAxes.size(); ++i) {
+            int axisIdx = refAxes[i];
+            nc->CoordSys.commandedMCS[axisIdx] = refPos[i]; // 更新到最終參考點
+        }
         // 回傳檢查函式，監控整個 G30 的移動過程
         return CheckMotionDone;
     }

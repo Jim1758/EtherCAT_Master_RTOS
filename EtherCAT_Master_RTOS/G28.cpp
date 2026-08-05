@@ -109,6 +109,14 @@ namespace GCodeHandlers
             nc->GetMotion().G30_Move(refAxes, refPos, nullptr, BufferMode::BUFFERED);
         }
 
+        // 🌟 一樣要手動更新大腦！
+        for (size_t i = 0; i < refAxes.size(); ++i) {
+            int axisIdx = refAxes[i];
+            nc->CoordSys.commandedMCS[axisIdx] = refPos[i]; // 更新到最終參考點
+        }
+
+
+
         // 回傳檢查函式，監控整個 G28 的移動過程
         return CheckMotionDone;
     }

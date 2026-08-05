@@ -88,7 +88,10 @@ namespace GCodeHandlers
         if ((isG168Active || isG68Active || isG16Active) && moveXYZ)
         {
             double currentWCS[8] = { 0.0 };
-            nc->CoordSys.GetActualWCS(currentWCS);
+            // =========================================================
+             // 🌟 終極修復：絕對不能吃 Actual！改吃 Commanded 理論座標！
+             // =========================================================
+            nc->CoordSys.GetCommandedWCS(currentWCS);
 
             // =========================================================
             // 🌟 針對 G16 的極座標逆運算：把 (X, Y) 轉回 (半徑, 角度)
@@ -159,7 +162,7 @@ namespace GCodeHandlers
        
         // 6. 下達移動命令！(底層會自動套用 G00 的快速定位 PID 與速度)
 
-        if (block.has('P')==1)
+        if (block.has('P') && block.val('P') == 1.0)
         {
            
             nc->GetMotion().G00_Move(activeAxes, targetPos, BufferMode::BUFFERED);//連續路徑

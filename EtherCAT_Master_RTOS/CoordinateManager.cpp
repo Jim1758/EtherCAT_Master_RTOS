@@ -432,18 +432,118 @@ void CoordinateManager::GetActualWCS(double* outWCS) const {
     }
 }
 
+// 🌟 1.5 核心公式：算回最簡單的 絕對座標 = 虛擬命令機械座標 - EXT - 表格偏移
+void CoordinateManager::GetCommandedWCS(double* outWCS) const {
+    // 1. 複製一份大腦的理論命令機械座標 (Commanded MCS)
+    double tempMCS[8];
+    for (int i = 0; i < 8; i++) tempMCS[i] = commandedMCS[i]; // 🌟 唯一差別：吃 commandedMCS
+
+    // ==========================================================
+    // 🌟 2. 逆矩陣運算：把「歪掉的實體座標」轉回「方正的邏輯座標」
+    // 在旋轉矩陣中，反矩陣 (Inverse) 剛好等於轉置矩陣 (Transpose)！
+    // ==========================================================
+    if (isWorkpieceRotationActive && currentWCode > 0 && currentWCode <= m_WorkOffset.size())
+    {
+        int idx = currentWCode - 1;
+
+        // 取得角度轉成弧度
+        double a = m_WorkOffset[idx][WO_ANGLE_XY_YAW] * (3.14159265359 / 180.0);
+        double b = m_WorkOffset[idx][WO_ANGLE_XZ_PITCH] * (3.14159265359 / 180.0);
+        double c = m_WorkOffset[idx][WO_ANGLE_YZ_ROLL] * (3.14159265359 / 180.0);
+
+        double ca = std::cos(a), sa = std::sin(a);
+        double cb = std::cos(b), sb = std::sin(b);
+        double cc = std::cos(c), sc = std::sin(c);
+
+        // 建立原本的正向旋轉矩陣 R
+        double R[3][3];
+        R[0][0] = ca * cb;
+        R[0][1] = ca * sb * sc - sa * cc;
+        R[0][2] = ca * sb * cc + sa * sc;
+        R[1][0] = sa * cb;
+        R[1][1] = sa * sb * sc + ca * cc;
+        R[1][2] = sa * sb * cc - ca * sc;
+        R[2][0] = -sb;
+        R[2][1] = cb * sc;
+        R[2][2] = cb * cc;
+
+        // 計算距離旋轉圓心的位移 (Delta)
+        // ⚠️ 這裡的圓心還是用實體擷取的 rotationCenterMCS，這沒問題，因為 G168 是在靜止時啟動的
+        double dx = tempMCS[0] - rotationCenterMCS[0];
+        double dy = tempMCS[1] - rotationCenterMCS[1];
+        double dz = tempMCS[2] - rotationCenterMCS[2];
+
+        // 矩陣乘法，但注意這裡是 [col][row] 轉置相乘 (等於逆旋轉)！
+        tempMCS[0] = rotationCenterMCS[0] + (R[0][0] * dx + R[1][0] * dy + R[2][0] * dz);
+        tempMCS[1] = rotationCenterMCS[1] + (R[0][1] * dx + R[1][1] * dy + R[2][1] * dz);
+        tempMCS[2] = rotationCenterMCS[2] + (R[0][2] * dx + R[1][2] * dy + R[2][2] * dz);
+    }
+
+    // 1. 扣除線性偏移量，得到「包含 G68 旋轉的 WCS」
+    double tempWCS[8];
+    for (int i = 0; i < 8; i++) {
+        double ext = extOffset[i];
+        double wcsOffset = m_WCSTable[currentWCSIndex][i];
+
+        // 🌟 傳入大腦記錄的理論 C 軸角度
+        double toolOffset = GetActiveToolOffset(i, commandedMCS[C_AXIS_INDEX]); // 🌟 唯一差別：吃 commandedMCS
+
+        double workOffset = GetActiveWorkOffset(i);
+
+        tempWCS[i] = tempMCS[i] - (ext + wcsOffset + toolOffset + workOffset);
+    }
+
+    // ==========================================================
+    // 🌟 2. 顯示反轉：把 G68 的 2D 旋轉逆轉回來！
+    // ==========================================================
+    for (int i = 0; i < 8; i++) outWCS[i] = tempWCS[i];
+
+    if (isG68Active)
+    {
+        double rad = g68Angle * (3.14159265359 / 180.0);
+        double c = std::cos(rad);
+        double s = -std::sin(rad); // 🌟 逆矩陣，sin 變負的
+        double dx, dy;
+
+        if (activePlane == 17) {
+            dx = tempWCS[0] - g68CenterWCS[0];
+            dy = tempWCS[1] - g68CenterWCS[1];
+            outWCS[0] = g68CenterWCS[0] + (dx * c - dy * s);
+            outWCS[1] = g68CenterWCS[1] + (dx * s + dy * c);
+        }
+        else if (activePlane == 18) {
+            dx = tempWCS[0] - g68CenterWCS[0];
+            double dz = tempWCS[2] - g68CenterWCS[2];
+            outWCS[0] = g68CenterWCS[0] + (dx * c - dz * s);
+            outWCS[2] = g68CenterWCS[2] + (dx * s + dz * c);
+        }
+        else if (activePlane == 19) {
+            dy = tempWCS[1] - g68CenterWCS[1];
+            double dz = tempWCS[2] - g68CenterWCS[2];
+            outWCS[1] = g68CenterWCS[1] + (dy * c - dz * s);
+            outWCS[2] = g68CenterWCS[2] + (dy * s + dz * c);
+        }
+    }
+}
 // 🌟 2. 實作 ApplyG92 (直接覆寫當前表格！)
 void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targetPos) {
+
+    // 1. 取得「當下」包含所有補正(刀長、旋轉等)的純粹命令工作座標
+    double currentCmdWCS[8] = { 0.0 };
+
+    // 🌟 呼叫剛剛寫好的神級函式！不吃實際位置！
+    GetCommandedWCS(currentCmdWCS);
+
     for (int i = 0; i < 8; i++) {
         if (axisProgrammed[i]) {
-            double ext = extOffset[i];
 
-            // 🌟 正確公式：新 WCS 表格偏移 = 指令機械座標 (commandedMCS) - EXT - 使用者要求的目標座標 (WCS)
-            // 使用 commandedMCS 代替 actualMCS，確保理論幾何精度絕對不飄移！
-            m_WCSTable[currentWCSIndex][i] = commandedMCS[i] - ext - targetPos[i];
+            // 2. 算出差值 (你現在理應顯示的數字 - 你想變成的數字)
+            double shift = currentCmdWCS[i] - targetPos[i];
 
-            DEBUG_PRINT("[Coordinate] G92 Overwrites WCS %d on Axis %d, New Offset: %f (based on CommandedMCS: %f)\n",
-                currentWCSIndex, i, m_WCSTable[currentWCSIndex][i], commandedMCS[i]);
+            // 3. 將差值疊加到目前的 WCS 表格上
+            m_WCSTable[currentWCSIndex][i] += shift;
+
+            //DEBUG_PRINT("[Coordinate] G92 Shift on Axis %d: Shift %f (CmdWCS %f -> Target %f)\n",i, shift, currentCmdWCS[i], targetPos[i]);
         }
     }
 }

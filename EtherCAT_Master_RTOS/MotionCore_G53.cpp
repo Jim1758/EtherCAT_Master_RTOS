@@ -20,56 +20,49 @@ void MotionCore::G53_Move(const std::vector<int>& axes, const std::vector<double
     std::vector<double> targetPos_Pulse;
     targetPos_Pulse.resize(axes.size());
 
-    // =========================================================
-    // 🌟 1. 將 mm 轉為 Pulse，並計算出「誰花的時間最長」
-    // =========================================================
+    // 🌟 1. 一視同仁地判斷預讀狀態 (雖然 G53 通常是 false，但統一架構最安全)
+    bool isLookAheadActive = (!m_Group.cmdQueue.empty() || !IsGroupDone());
+
     for (size_t i = 0; i < axes.size(); ++i) {
         int idx = axes[i];
         AxisContext& axis = (*m_pContexts)[idx];
 
-
-        // =========================================================
-        // 🌟 【新增底層防呆】如果有未啟用的軸被派單，直接拒絕執行！
-        // =========================================================
-        if (!axis.isExist)
-        {
-            //RtPrintf(">>> [FATAL] MotionCore: Try to move disabled axis index %d!\n", idx);
-            // 這裡可以考慮設定 axis.isFault = true; 來鎖死系統
+        if (!axis.isExist) {
             AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_enabledr);
-            return; // 立即跳出，不發車！
+            return;
         }
 
-        // 1-1. 取加減速最大值 (最安全的煞車距離)
         groupAccTime = std::max<double>(groupAccTime, axis.G53_acc_time);
         groupDecTime = std::max<double>(groupDecTime, axis.G53_dec_time);
 
-        // 1-2. mm 轉 Pulse (你原本的正確邏輯)
         double lead = axis.finalLead;
         if (lead < 1e-6) lead = 1.0;
         double pulsePerUnit = axis.resolution_PPR / lead;
         double targetPulse = targetPos_mm[i] * pulsePerUnit;
 
-        // 1-3. 計算這根軸要走多少 Pulse
-        double startPulse = axis.logicalCmdPos;
-        double distancePulse = 0.0;
+        // =========================================================
+        // 🌟 2. 統一使用虛擬終點作為起點！
+        // =========================================================
+        double startPulse = isLookAheadActive ? axis.lastQueuedPulse : axis.logicalCmdPos;
 
-        // 【保留旋轉軸最短路徑判斷】
         if (axis.axisType == AxisType::ROTARY && axis.useShortestPath) {
             targetPulse = CalculateShortestTarget(startPulse, targetPulse, axis.rotaryModulo);
         }
 
-        targetPos_Pulse[i] = targetPulse; // 存入給 LineMove 用的陣列
-        distancePulse = std::abs(targetPulse - startPulse);
+        targetPos_Pulse[i] = targetPulse;
+        double distancePulse = std::abs(targetPulse - startPulse);
         sum_sq += (distancePulse * distancePulse);
 
         // =========================================================
-        // 🌟 解決速度問題的核心：將原本的極速 乘上 Override 倍率！
+        // 🌟 3. 極度重要：把這次的 G53 終點存起來，給未來的指令當起點！
         // =========================================================
+        axis.lastQueuedPulse = targetPulse;
+
         double currentAxisMaxPPS = axis.G53_PPS;
-        // 1-4. 🌟 解決速度問題的核心：算出這根軸如果全速跑，要花幾秒？
-        if (axis.G00_PPS > 1.0) {
+        // 修正你的筆誤：這裡應該是看 currentAxisMaxPPS 而不是 G00_PPS
+        if (currentAxisMaxPPS > 1.0) {
             double timeNeeded = distancePulse / currentAxisMaxPPS;
-            maxTimeNeeded = std::max<double>(maxTimeNeeded, timeNeeded); // 抓出拖慢全隊的「瓶頸時間」
+            maxTimeNeeded = std::max<double>(maxTimeNeeded, timeNeeded);
         }
     }
 

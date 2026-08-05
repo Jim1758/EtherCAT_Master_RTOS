@@ -8,105 +8,88 @@
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double>& targetPos_mm, BufferMode mode)
 {
-    // 防呆檢查
     if (m_pContexts == nullptr || axes.empty() || axes.size() != targetPos_mm.size()) return;
 
     double groupAccTime = 0.0;
     double groupDecTime = 0.0;
-    double maxTimeNeeded = 0.0; // 紀錄跑最久的那軸需要幾秒
-    double sum_sq = 0.0;        // 3D Pulse 距離平方和
+    double maxTimeNeeded = 0.0;
+    double sum_sq = 0.0;
 
-    std::vector<double> targetPos_Pulse;
-    targetPos_Pulse.resize(axes.size());
+    std::vector<double> targetPos_Pulse(axes.size());
 
-    // =========================================================
-    // 🌟 1. 將 mm 轉為 Pulse，並計算出「誰花的時間最長」
-    // =========================================================
+    // 🌟 判斷大腦現在是不是在「連續預讀」狀態？
+    // 如果倉庫裡有東西，或者馬達正在跑，大腦就必須使用「虛擬終點」！
+    bool isLookAheadActive = (!m_Group.cmdQueue.empty() || !IsGroupDone());
+
     for (size_t i = 0; i < axes.size(); ++i) {
         int idx = axes[i];
         AxisContext& axis = (*m_pContexts)[idx];
 
-
-        // =========================================================
-        // 🌟 【新增底層防呆】如果有未啟用的軸被派單，直接拒絕執行！
-        // =========================================================
-        if (!axis.isExist) 
-        {
-            //RtPrintf(">>> [FATAL] MotionCore: Try to move disabled axis index %d!\n", idx);
-            // 這裡可以考慮設定 axis.isFault = true; 來鎖死系統
+        if (!axis.isExist) {
             AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_enabledr);
-            return; // 立即跳出，不發車！
+            return;
         }
 
-        // 1-1. 取加減速最大值 (最安全的煞車距離)
         groupAccTime = std::max<double>(groupAccTime, axis.G00_acc_time);
         groupDecTime = std::max<double>(groupDecTime, axis.G00_dec_time);
 
-        // 1-2. mm 轉 Pulse (你原本的正確邏輯)
         double lead = axis.finalLead;
         if (lead < 1e-6) lead = 1.0;
         double pulsePerUnit = axis.resolution_PPR / lead;
         double targetPulse = targetPos_mm[i] * pulsePerUnit;
 
-        // 1-3. 計算這根軸要走多少 Pulse
-        double startPulse = axis.logicalCmdPos;
-        double distancePulse = 0.0;
+        // =========================================================
+        // 🌟 終極修復：決定正確的起點！
+        // 如果正在預讀，起點 = 上一張訂單的終點；否則 = 馬達現在位置
+        // =========================================================
+        double startPulse = isLookAheadActive ? axis.lastQueuedPulse : axis.logicalCmdPos;
 
-        // 【保留旋轉軸最短路徑判斷】
         if (axis.axisType == AxisType::ROTARY && axis.useShortestPath) {
             targetPulse = CalculateShortestTarget(startPulse, targetPulse, axis.rotaryModulo);
         }
 
-        targetPos_Pulse[i] = targetPulse; // 存入給 LineMove 用的陣列
-        distancePulse = std::abs(targetPulse - startPulse);
+        targetPos_Pulse[i] = targetPulse;
+
+        // 使用正確的起點計算距離
+        double distancePulse = std::abs(targetPulse - startPulse);
         sum_sq += (distancePulse * distancePulse);
 
-        // =========================================================
-        // 🌟 解決速度問題的核心：將原本的極速 乘上 Override 倍率！
-        // =========================================================
+        // 🌟 算完之後，把這次的終點存起來，給下一行預讀當作起點！
+        axis.lastQueuedPulse = targetPulse;
+
         double currentAxisMaxPPS = axis.G00_PPS * G00_overrideRatio;
-        // 1-4. 🌟 解決速度問題的核心：算出這根軸如果全速跑，要花幾秒？
         if (axis.G00_PPS > 1.0) {
             double timeNeeded = distancePulse / currentAxisMaxPPS;
-            maxTimeNeeded = std::max<double>(maxTimeNeeded, timeNeeded); // 抓出拖慢全隊的「瓶頸時間」
+            maxTimeNeeded = std::max<double>(maxTimeNeeded, timeNeeded);
         }
     }
 
-    // 防呆保護
     if (groupAccTime < 0.001) groupAccTime = 0.2;
     if (groupDecTime < 0.001) groupDecTime = 0.2;
 
-    // =========================================================
-    // 🌟 2. 算出最終群組速度 (PPS)
-    // =========================================================
     double totalDist_Pulse = std::sqrt(sum_sq);
-    double groupG00Vel_PPS = 1000.0; // 預設底速
+    double groupG00Vel_PPS = 0;
 
-    // 將總 Pulse 距離 / 瓶頸時間 = 完美的群組 PPS 速度
     if (maxTimeNeeded > 0.0001) {
         groupG00Vel_PPS = totalDist_Pulse / maxTimeNeeded;
     }
 
     // =========================================================
-    // 🌟 3. 丟給 LineMove
+    // 🌟 呼叫硬體 API (放回這裡就對了！)
     // =========================================================
-    PathMode prevMode = GetGroupPathMode();
-
-    SetGroupPathMode(PathMode::EXACT_STOP);//路徑模式
+    
     if (mode == BufferMode::ABORTING)
     {
         SetGroupPathMode(PathMode::EXACT_STOP);
     }
-    else
-    {
+    else {
         SetGroupPathMode(PathMode::CONTINUOUS);
     }
-   
 
     // 完美傳入 Pulse 陣列與計算好的 PPS 速度
     LineMove(axes, targetPos_Pulse, groupG00Vel_PPS, groupAccTime, groupDecTime, mode);
 
-    //RtPrintf("G00>>> %d !\n", mode);
+    //RtPrintf("G00>>> %d (LookAhead: %d)\n", mode, isLookAheadActive);
 }
 
 

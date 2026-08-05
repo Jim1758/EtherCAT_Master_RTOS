@@ -180,9 +180,11 @@ public:
     void ApplyG92(const bool* axisProgrammed, const double* targetPos);
 
     void GetActualMCS(double* outMCS) const; // 取出當前的真實機械座標
+     // 🌟 新增：獲取當前純粹的數學命令座標 (Commanded WCS) - 供 G92 等內部數學計算用
+    void GetCommandedWCS(double* outWCS) const;
 
     void Set_G90G91(int value, NCManager* nc);//設定90絕對模式 91增量模式
-
+   
     // ==========================================
     // 🌟 旋轉控制 API
     // ==========================================

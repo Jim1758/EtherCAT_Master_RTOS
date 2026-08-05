@@ -74,7 +74,16 @@ namespace GCodeHandlers
         }
 
         // 4. 下達移動指令 (G53 通常視為快速定位，所以走 G00 通道)
-        nc->GetMotion().G53_Move(activeAxes, targetPos);
+        nc->GetMotion().G53_Move(activeAxes, targetPos, BufferMode::ABORTING);
+
+        // =========================================================
+        // 🌟 終極修復：手動把大腦的 commandedMCS 更新到 Gxx 的目標點！
+        // =========================================================
+        for (size_t i = 0; i < activeAxes.size(); ++i) {
+            int axisIdx = activeAxes[i];
+            nc->CoordSys.commandedMCS[axisIdx] = targetPos[i];
+        }
+
 
         // 5. 等待結束
         return CheckMotionDone;

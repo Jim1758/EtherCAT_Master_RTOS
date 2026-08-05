@@ -259,7 +259,8 @@ struct AxisContext//軸參數與狀態
     bool    isFirstCycle = true;  // 開機第一圈對齊旗標
 
 
-
+    // 🌟 新增：用來給預讀引擎追蹤的「虛擬最後位置」
+    double lastQueuedPulse = 0.0;
 
 
 
@@ -713,6 +714,9 @@ public:
     bool IsGroupQueueFull() const { return m_Group.cmdQueue.size() >= 100; } // 預讀 100 行
     bool IsGroupDone() const { return !m_Group.isActive && m_Group.cmdQueue.empty(); }
 
+    // 🌟 [新增]：檢查群組是否「完全靜止」(包含煞車滑行結束)
+    bool IsGroupStandstill() const;
+
     size_t GetQueueSize() const {
         return m_Group.cmdQueue.size();
     }
@@ -849,6 +853,8 @@ public:
 
     double CalculateShortestTarget(double currentPos, double targetPos, double modulo);
 
+    // 🌟 消滅幽靈座標專用 API：將大腦預讀起點，強制同步為馬達當下真實位置
+    void SyncVirtualEndPosition();
 
     //G碼參數專區------------------------------------------------------------
     double G00_overrideRatio = 1;//G00 專屬速度比例

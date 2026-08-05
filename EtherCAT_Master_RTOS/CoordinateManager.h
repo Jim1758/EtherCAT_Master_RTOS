@@ -42,6 +42,18 @@ public:
     int toolLengthMode = 49; // 預設 G49 關閉
     int currentHCode = 0;    // 預設 H 碼為 0
 
+    // ==========================================
+    // 🌟 刀具與工件補正號碼狀態紀錄
+    // ==========================================
+    int currentTCode = 0;    // 🌟 新增：當前主軸上的刀具號碼 (T 碼，預設 0)
+
+    // 🌟 新增：設定刀號 API
+    void SetToolNumber(int tCode, NCManager* nc = nullptr);
+
+    //目前工件號碼
+    int currentWorkpieceNum = 0; // 🌟 新增：獨立的工件編號 (非 G168，生產管理用)
+
+    void SetWorkpieceNumber(int num, NCManager* nc = nullptr); // 🌟 新增：設定獨立工件號 API
 
     // ==========================================
     // 🌟 定義 m_WorkOffset 陣列的 8 個欄位名稱
@@ -177,7 +189,7 @@ public:
 
   
     // 🌟 新增：G92 相關 API
-    void ApplyG92(const bool* axisProgrammed, const double* targetPos);
+    void ApplyG92(const bool* axisProgrammed, const double* targetPos , NCManager* nc);
 
     void GetActualMCS(double* outMCS) const; // 取出當前的真實機械座標
      // 🌟 新增：獲取當前純粹的數學命令座標 (Commanded WCS) - 供 G92 等內部數學計算用

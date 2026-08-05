@@ -139,6 +139,8 @@ void NCManager::CycleStart()
         // =========================================================
         m_motion.SyncVirtualEndPosition();
 
+        // 🌟 清理完成後刷新變數
+        UpdateSystemVariables();
 
         m_state = NCState::RUN;
         //DEBUG_PRINT("[NC] Cycle Start!\n");
@@ -209,6 +211,9 @@ void NCManager::Reset()
     //重置G碼區塊--------------------------------------------------
     Reset_Gode();       // 重置G碼相關
    
+    // 🌟 清理完成後刷新變數
+    UpdateSystemVariables();
+
     //重置NC區塊--------------------------------------------------
     MacroSys.Reset();//重置Macro變數
 
@@ -342,7 +347,11 @@ void NCManager::ProcessTask()
 {
     NC_RunCount++;
 
-
+    if (UpdateSystemVariables_initialize_flag == 0)//第一次初始更新Macro變數
+    {
+        UpdateSystemVariables();
+        UpdateSystemVariables_initialize_flag = 1;//
+    }
   
     // =========================================================
     // 🌟 1. 【最高優先】每一圈都重新結算並更新機台總合狀態！
@@ -387,7 +396,8 @@ void NCManager::ProcessTask()
 
             // 3. 正式宣告機台準備就緒，可以接受下一個指令了！
             m_state = NCState::READY;
-
+            // 🌟 清理完成後刷新變數
+            UpdateSystemVariables();
             // DEBUG_PRINT("[NC] Reset Complete. Machine completely stopped.\n");
         }
 
@@ -485,36 +495,49 @@ void NCManager::ProcessExecutionEngine()
     if (m_waitCallback == nullptr)
     {
         // 結束判斷
+      // 結束判斷
         if (activePC >= activeMemory.size())
         {
-            if (isMacro) 
+            // 🌟 關鍵防線：文字檔雖然讀完了，但馬達停了沒？
+            if (!m_motion.IsGroupDone())
+            {
+                return; // 還沒跑完，下一個 Tick 再來檢查一次！
+            }
+
+            if (isMacro)
             {
                 ReturnMacro(); // 副程式結束返回
             }
-            else 
+            else
             {
                 // 最頂層程式結束了，依照模式決定去留
-                if (m_mode == NCOperationMode::MANUAL) 
+                if (m_mode == NCOperationMode::MANUAL)
                 {
                     m_state = NCState::READY;
                     m_manualAutoRunning = false;
                 }
                 // 🌟 關鍵修改：MDI 跑完後也直接退回 READY，無縫接軌手動 JOG！
-                else if (m_mode == NCOperationMode::MDI) 
+                else if (m_mode == NCOperationMode::MDI)
                 {
                     m_state = NCState::READY;
                 }
-                else {
+                else
+                {
                     // 只有 MEMORY 主程式跑完才會進入 P_END (需按 Reset)
                     m_state = NCState::P_END;
                 }
 
                 basePC = 0; // 執行完畢指標歸零
-                DEBUG_PRINT("[NC] Execution Finished.\n");
-
+                //DEBUG_PRINT("[NC] Execution Finished.\n");
 
                 //重置G碼區塊--------------------------------------------------
                 Reset_Gode();// 重置G碼相關
+
+                // =========================================================
+                // 🌟 【新增】程式結束、G 碼重置後，立刻刷新一次系統變數！
+                // 確保下一支程式或操作員看到的都是最乾淨的初始狀態。
+                // =========================================================
+                UpdateSystemVariables();
             }
             return;
         }
@@ -729,13 +752,20 @@ void NCManager::ExecuteBlock(const NCBlock& block)
     // ==========================================
     // 1. 瞬間完成的設定 (不需等待)
     // ==========================================
-    if (block.has('E')) {
+    if (block.has('E')) 
+    {
         // m_edmManager.ApplyE(block.val('E'));
     }
-    if (block.has('B')) {
+    if (block.has('B')) 
+    {
         // m_edmManager.ApplyB(block.val('B'));
     }
-
+    // 範例：在處理單節含 T 碼時呼叫
+    if (block.has('T'))
+    {
+        int tVal = (int)block.val('T');
+        CoordSys.SetToolNumber(tVal, this);
+    }
   
 
     // ==========================================
@@ -876,6 +906,11 @@ void NCManager::ExecuteBlock(const NCBlock& block)
             m_waitCallback = GCodeHandlers::Handle_MCode(block, this);
         }
     }
+
+   
+
+    // 🌟 在單節解單/發包完成後，立刻刷一次系統變數！
+    UpdateSystemVariables();
 }
 
 // =========================================================

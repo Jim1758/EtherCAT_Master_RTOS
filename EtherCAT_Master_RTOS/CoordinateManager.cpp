@@ -526,7 +526,7 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
     }
 }
 // 🌟 2. 實作 ApplyG92 (直接覆寫當前表格！)
-void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targetPos) {
+void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targetPos , NCManager* nc) {
 
     // 1. 取得「當下」包含所有補正(刀長、旋轉等)的純粹命令工作座標
     double currentCmdWCS[8] = { 0.0 };
@@ -546,6 +546,9 @@ void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targe
             //DEBUG_PRINT("[Coordinate] G92 Shift on Axis %d: Shift %f (CmdWCS %f -> Target %f)\n",i, shift, currentCmdWCS[i], targetPos[i]);
         }
     }
+
+    // 🌟 覆寫完畢後，如果能取得 NCManager 指標，建議在這裡也刷新一次（或靠 ExecuteBlock 刷）：
+    nc->UpdateSystemVariables();
 }
 
 void CoordinateManager::GetActualMCS(double* outMCS) const {
@@ -901,4 +904,31 @@ bool CoordinateManager::GetRefPoint(int pCode, double* outPos) const {
 
     for (int i = 0; i < 8; i++) outPos[i] = m_RefPoints[index][i];
     return true;
+}
+// 🌟 實作設定刀號 API
+void CoordinateManager::SetToolNumber(int tCode, NCManager* nc)
+{
+    currentTCode = tCode;
+
+    // (選配) 如果需要將 T 碼狀態寫入巨集變數或觸發狀態廣播
+    if (nc) {
+        // 例如更新系統巨集變數
+         nc->MacroSys.SetVar('$', 48, (double)tCode);
+    }
+
+    //DEBUG_PRINT("[Coordinate] Tool Number Updated: T%d\n", currentTCode);
+}
+
+// 🌟 實作設定獨立工件號 API
+void CoordinateManager::SetWorkpieceNumber(int num, NCManager* nc)
+{
+    currentWorkpieceNum = num;
+
+    // (選配) 如果你有需要，也可以在這裡直接即時更新 $49
+     if (nc)
+     {
+         nc->MacroSys.SetVar('$', 49, (double)num);
+     }
+
+    // DEBUG_PRINT("[Coordinate] Independent Workpiece Number Updated: %d\n", currentWorkpieceNum);
 }

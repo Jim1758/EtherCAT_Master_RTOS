@@ -176,4 +176,10 @@ public:
     EDMState GetMachineEDMState();
     // 取得已經存好的狀態變數
     EDMState GetCurrentEDMState() const { return m_edmState; }
+
+
+    // 🌟 集中更新所有 $ 變數 (供 G00, G01, G92, Reset 結束時即時呼叫)
+    void UpdateSystemVariables();
+
+    int UpdateSystemVariables_initialize_flag = 0;
 };

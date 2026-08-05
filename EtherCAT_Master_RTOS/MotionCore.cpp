@@ -3979,23 +3979,25 @@ bool MotionCore::IsGroupStandstill() const
     }
 
     // 2. 硬體物理狀態檢查：檢查每一根啟用的實體軸是否真的停下來了
-    if (m_pContexts != nullptr) {
-        for (int i = 0; i < 8; i++) {
+    // 🌟 修正：防呆加上 !empty() 檢查，避免對空指標或空陣列操作
+    if (m_pContexts != nullptr && !m_pContexts->empty()) {
+
+        // 🌟 修正：動態取得 vector 實際的大小，絕對不寫死 8！
+        for (size_t i = 0; i < m_pContexts->size(); i++) {
             const AxisContext& axis = (*m_pContexts)[i];
+
             if (axis.isExist) {
 
                 // 檢查物理速度是否逼近於零 (設定一個極小的 Deadband，例如 1 Pulse/sec)
                 // 這裡使用 currentActVel (實際速度) 或是 currentCmdVel (命令速度) 都可以。
-                // 為了最嚴格的物理同步，建議檢查實際速度 (如果有讀回傳的話)；
-                // 若沒有實體速度回傳，檢查 currentCmdVel 也行。
                 if (std::abs(axis.currentCmdVel) > 1.0) {
                     return false; // 只要有一軸還在滑行，就代表還沒靜止！
                 }
 
-                // 🌟 (擴充準備) 未來如果你有接 EtherCAT，可以把註解打開：
-                if ( axis.state != MotionState::MotionState_IDLE) 
+                // 🌟 檢查軸的狀態機是否已經切換回 IDLE
+                if (axis.state != MotionState::MotionState_IDLE)
                 {
-                     return false;
+                    return false;
                 }
             }
         }

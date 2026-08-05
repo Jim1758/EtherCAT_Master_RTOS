@@ -204,6 +204,9 @@
     <ClCompile Include="MotionCore_G161.cpp">
       <Filter>Source Files\Motion\MotionCore_GCode</Filter>
     </ClCompile>
+    <ClCompile Include="NCManager_SysVars.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">

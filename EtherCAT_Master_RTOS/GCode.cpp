@@ -114,7 +114,7 @@ namespace GCodeHandlers
             // 4. 如果有讀到至少一個軸，就呼叫底層計算並覆寫表格
             if (hasAnyAxis)
             {
-                nc->CoordSys.ApplyG92(axisProgrammed, axisTarget);
+                nc->CoordSys.ApplyG92(axisProgrammed, axisTarget,nc);
 
                 // 💡 提示：如果需要，可以在這裡補上觸發 HMI 存檔的旗標
                  //pShm->Coord_Command.reqSave = 1;

@@ -153,6 +153,7 @@
     <ClCompile Include="MotionCore_G32.cpp" />
     <ClCompile Include="MotionCore_G53.cpp" />
     <ClCompile Include="NCManager.cpp" />
+    <ClCompile Include="NCManager_SysVars.cpp" />
     <ClCompile Include="NicDriver.cpp" />
     <ClCompile Include="PlcCore.cpp" />
     <ClCompile Include="SHMManager.cpp" />

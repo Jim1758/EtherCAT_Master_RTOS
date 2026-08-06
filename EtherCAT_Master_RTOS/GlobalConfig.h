@@ -41,6 +41,7 @@ public:
     std::string NCProgramDir = BaseDataDir + "NC_Program\\";
     std::string NCMacroProgramDir = BaseDataDir + "NC_Macro\\";
     std::string NCDataDir = BaseDataDir + "Data\\";
+    std::string PLC_Dir = "D:\\EtherCAT_Master_Data\\PLC\\";
 
 
 

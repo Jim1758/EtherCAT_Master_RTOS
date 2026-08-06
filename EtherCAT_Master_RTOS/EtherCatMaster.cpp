@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdio.h>
 #include "GlobalConfig.h"
+#include "PLCManager.h" // 🌟 1. 記得 include PLCManager 標頭檔
 #define MAX_MBX_SIZE 1024
 
 EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m_mboxCnt(0) 
@@ -14,6 +15,9 @@ EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m
     memset(m_rxBuffer, 0, sizeof(m_rxBuffer));
 
     m_NC = new NCManager(m_Motion);
+
+    // 🌟 將全域指標指向這顆唯一真正有在跑的 PLC 大腦！
+    g_PLC = &this->m_plcManager;
 }
 EtherCatMaster::~EtherCatMaster() 
 {
@@ -1423,18 +1427,40 @@ void RTAPI GlobalTimerHandler_PLC(void* nContext)
         return;
     }
 
-    
 
+    // =========================================================
+    // 🌟 步驟 1：Read Inputs (讀取輸入)
+    // 將 EtherCAT 實體的 RxPDO 狀態，透過 Mapping 表抄寫到 PLC 的 I 點
+    // =========================================================
+    pMaster->m_Plc.SyncPhysicalToVirtual();
+
+     // =========================================================
+     // 🌟 步驟 2：Execute Logic (執行虛擬機邏輯)
+     // PLC 大腦進行 1ms 的運算 (階梯圖掃描、Timer 累加)
+     // =========================================================
+    
+    if (g_PLC != nullptr) {
+        g_PLC->RunCycle(1);
+    }
+
+
+    // =========================================================
+    // 🌟 步驟 3：Write Outputs (準備輸出)
+    // 將 PLC 算好的 O 點狀態，透過 Mapping 表抄寫回實體的影子記憶體
+    // =========================================================
+    pMaster->m_Plc.SyncVirtualToPhysical();
+
+    // 將影子記憶體 (outBuffer) 正式刷入硬體地圖 (pOutputLoc) 發給網卡
+    pMaster->m_Plc.FlushOutputs();
+
+   
+    //跑馬燈測試----------------------------------------
+    /*
     if (pMaster->tickCount_PLC % 50 == 0)
     {
-        pMaster->m_Plc.Update();
+         pMaster->m_Plc.Update_Debug();
+    }*/
 
-
-       
-         
-        // DEBUG_PRINT("PLC>>%d\n",pMaster->tickCount_PLC); 
-    }
-    pMaster->m_Plc.FlushOutputs();
     pMaster->tickCount_PLC++;
 }
 

@@ -717,6 +717,47 @@ public:
     // 🌟 [新增]：檢查群組是否「完全靜止」(包含煞車滑行結束)
     bool IsGroupStandstill() const;
 
+    // 🌟 修正版：精準對應軸索引的目標座標抓取 API
+    bool GetExecutingTargetMCS(double* outTarget_mm) const {
+        // 如果機台靜止或插補器未啟用，回傳 false
+        if (IsGroupStandstill() || !m_Group.isActive) {
+            return false;
+        }
+
+        // 1. 先將 8 個軸的目標全部預設為「當前真實位置」
+        // 這樣沒有參與移動的軸相減時，DTG 才會是完美的 0.0！
+        for (int i = 0; i < 8; i++) {
+            if (m_pContexts != nullptr && i < m_pContexts->size() && (*m_pContexts)[i].isExist) {
+                const AxisContext& axis = (*m_pContexts)[i];
+                double pulsePerUnit = axis.resolution_PPR / axis.finalLead;
+                outTarget_mm[i] = axis.currentActPos / pulsePerUnit;
+            }
+            else {
+                outTarget_mm[i] = 0.0;
+            }
+        }
+
+        // 2. 走訪當前這張單子 (currentCmd) 裡面「真正有參與移動」的軸
+        for (int j = 0; j < m_Group.currentCmd.axisCount; j++) {
+            // 取出第 j 個參與軸的物理編號 (例如: j=0 時, axisIdx可能是 1 (Y軸))
+            int axisIdx = m_Group.currentCmd.axisIndices[j];
+
+            // 安全邊界檢查：確保軸編號在合法範圍內
+            if (m_pContexts != nullptr && axisIdx >= 0 && axisIdx < m_pContexts->size() && (*m_pContexts)[axisIdx].isExist) {
+                const AxisContext& axis = (*m_pContexts)[axisIdx];
+
+                // 單位換算：Pulse -> mm (或 deg)
+                double pulsePerUnit = axis.resolution_PPR / axis.finalLead;
+
+                // 🌟 關鍵修復點 🌟
+                // 必須用 j 去拿 currentCmd.targetPos[j]，然後存到 outTarget_mm[axisIdx]！
+                outTarget_mm[axisIdx] = m_Group.currentCmd.targetPos[j] / pulsePerUnit;
+            }
+        }
+
+        return true;
+    }
+
     size_t GetQueueSize() const {
         return m_Group.cmdQueue.size();
     }

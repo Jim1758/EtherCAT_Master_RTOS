@@ -1,30 +1,34 @@
-#include "PlcCore.h"
+ï»¿#include "PlcCore.h"
 #include <cstring> // for memset
+#include "PLCManager.h"
+
+
 
 PlcCore::PlcCore()
 {
     m_loopCount = 0;
     m_marqueeLed = 0;
+
+  
 }
-
-
 
 void PlcCore::Link(std::vector<ENI_GenericIO>* pList)
 {
+    
     m_pIo = pList;
 }
 
 // ============================================================================
-//  ©³¼h«Ê¸Ë°Ï (ª½±µ¾Ş§@«ü¼Ğ¡A¤£¥Î¦b Update ¸Ìºâ¦ì§})
+//  åº•å±¤å°è£å€ (ç›´æ¥æ“ä½œæŒ‡æ¨™ï¼Œä¸ç”¨åœ¨ Update è£¡ç®—ä½å€)
 // ============================================================================
 
 bool PlcCore::Get_I(int moduleIdx, int bitIdx)
 {
-    // 1. ¨¾§b
+    // 1. é˜²å‘†
     if (!m_pIo || moduleIdx < 0 || moduleIdx >= (int)m_pIo->size()) return false;
     ENI_GenericIO& mod = (*m_pIo)[moduleIdx];
 
-    // [­×§ïÂI] ÀË¬d inBuffer ¬O§_¦³®Ä (¦Ó¤£¬O¥uÀË¬d pInputLoc)
+    // [ä¿®æ”¹é»] æª¢æŸ¥ inBuffer æ˜¯å¦æœ‰æ•ˆ (è€Œä¸æ˜¯åªæª¢æŸ¥ pInputLoc)
     if (mod.inBuffer.empty()) return false;
 
     int bytePos = bitIdx / 8;
@@ -32,57 +36,58 @@ bool PlcCore::Get_I(int moduleIdx, int bitIdx)
 
     if (bytePos >= (int)mod.inBuffer.size()) return false;
 
-    // [­×§ïÂI] ±q inBuffer Åª¨ú¡A¦Ó¤£¬O pInputLoc
-    // ³o¼Ë¥i¥H½T«O¦b¦P¤@­Ó PLC ¶g´Á¤º¡AÅª¨ìªº­È¬O«í©wªº
+    // [ä¿®æ”¹é»] å¾ inBuffer è®€å–ï¼Œè€Œä¸æ˜¯ pInputLoc
+    // é€™æ¨£å¯ä»¥ç¢ºä¿åœ¨åŒä¸€å€‹ PLC é€±æœŸå…§ï¼Œè®€åˆ°çš„å€¼æ˜¯æ†å®šçš„
     return (mod.inBuffer[bytePos] & (1 << bitPos)) != 0;
+
 }
 
 
-void PlcCore::FlushOutputs()// ±NÅŞ¿èª¬ºA¦P¨B¨ìµwÅé¦a¹Ï
+void PlcCore::FlushOutputs()// å°‡é‚è¼¯ç‹€æ…‹åŒæ­¥åˆ°ç¡¬é«”åœ°åœ–
 {
     if (!m_pIo) return;
 
     for (auto& mod : *m_pIo)
     {
-        // ¥u¦³·í Output ¦s¦b¥B¦³ Buffer ®É¤~½Æ»s
+        // åªæœ‰ç•¶ Output å­˜åœ¨ä¸”æœ‰ Buffer æ™‚æ‰è¤‡è£½
         if (mod.pOutputLoc != nullptr && !mod.outBuffer.empty())
         {
-            // [ÃöÁä] ¤@¦¸©Ê°O¾ĞÅé½Æ»s (Memcpy)
-            // ±N outBuffer (ÅŞ¿è­È) -> ÂĞ»\¨ì -> pOutputLoc (µwÅéµo°e°Ï)
+            // [é—œéµ] ä¸€æ¬¡æ€§è¨˜æ†¶é«”è¤‡è£½ (Memcpy)
+            // å°‡ outBuffer (é‚è¼¯å€¼) -> è¦†è“‹åˆ° -> pOutputLoc (ç¡¬é«”ç™¼é€å€)
             memcpy(mod.pOutputLoc, mod.outBuffer.data(), mod.outBuffer.size());
         }
     }
 }
 void PlcCore::Set_O(int moduleIdx, int bitIdx, bool val)
 {
-    // 1. [¨¾§b] ÀË¬d IO ²M³æ¬O§_¦s¦b¤Î¯Á¤Ş¬O§_¦Xªk
+    // 1. [é˜²å‘†] æª¢æŸ¥ IO æ¸…å–®æ˜¯å¦å­˜åœ¨åŠç´¢å¼•æ˜¯å¦åˆæ³•
     if (!m_pIo || moduleIdx < 0 || moduleIdx >= (int)m_pIo->size()) return;
 
     ENI_GenericIO& mod = (*m_pIo)[moduleIdx];
 
-    // 2. [¨¾§b] ÀË¬d¬O§_¬°¦³®Äªº¿é¥X¼Ò²Õ
-    // ¦pªG pOutputLoc ¬O nullptr¡A¥Nªí³o¬O Input ¼Ò²Õ©Î¥¼¹ï¬M¡A¤£¯à¼g¤J
+    // 2. [é˜²å‘†] æª¢æŸ¥æ˜¯å¦ç‚ºæœ‰æ•ˆçš„è¼¸å‡ºæ¨¡çµ„
+    // å¦‚æœ pOutputLoc æ˜¯ nullptrï¼Œä»£è¡¨é€™æ˜¯ Input æ¨¡çµ„æˆ–æœªå°æ˜ ï¼Œä¸èƒ½å¯«å…¥
     if (mod.pOutputLoc == nullptr) return;
 
-    // 3. ­pºâ Byte »P Bit ¦ì¸m
+    // 3. è¨ˆç®— Byte èˆ‡ Bit ä½ç½®
     int bytePos = bitIdx / 8;
     int bitPos = bitIdx % 8;
 
-    // 4. [¨¾§b] ÀË¬d¬O§_¶W¥X¸Ó¼Ò²Õªº Buffer ¤j¤p
+    // 4. [é˜²å‘†] æª¢æŸ¥æ˜¯å¦è¶…å‡ºè©²æ¨¡çµ„çš„ Buffer å¤§å°
     if (bytePos >= (int)mod.outBuffer.size()) return;
 
     // ==========================================================
-    // 5. [®Ö¤ßÅŞ¿è] ¥u­×§ï¼v¤l°O¾ĞÅé (Shadow Buffer)
+    // 5. [æ ¸å¿ƒé‚è¼¯] åªä¿®æ”¹å½±å­è¨˜æ†¶é«” (Shadow Buffer)
     // ==========================================================
-    // §Ú­Ì¥u­×§ï outBuffer¡A³o¬O³nÅé¼h­±ªºª¬ºA¡C
-    // ¦¹®É¦¹¨è¡AEtherCAT ºô¥dÁÙ¤£ª¾¹D³o­Ó§ïÅÜ¡A¿O¤]¤£·|«G¡C
-    // ¥²¶·µ¥¨ì 1ms ¶g´Á¨ìªº FlushOutputs() °õ¦æ«á¡A¤~·|¥Í®Ä¡C
+    // æˆ‘å€‘åªä¿®æ”¹ outBufferï¼Œé€™æ˜¯è»Ÿé«”å±¤é¢çš„ç‹€æ…‹ã€‚
+    // æ­¤æ™‚æ­¤åˆ»ï¼ŒEtherCAT ç¶²å¡é‚„ä¸çŸ¥é“é€™å€‹æ”¹è®Šï¼Œç‡ˆä¹Ÿä¸æœƒäº®ã€‚
+    // å¿…é ˆç­‰åˆ° 1ms é€±æœŸåˆ°çš„ FlushOutputs() åŸ·è¡Œå¾Œï¼Œæ‰æœƒç”Ÿæ•ˆã€‚
 
     if (val) {
-        mod.outBuffer[bytePos] |= (1 << bitPos);  // Set bit (¸m 1)
+        mod.outBuffer[bytePos] |= (1 << bitPos);  // Set bit (ç½® 1)
     }
     else {
-        mod.outBuffer[bytePos] &= ~(1 << bitPos); // Clear bit (²M 0)
+        mod.outBuffer[bytePos] &= ~(1 << bitPos); // Clear bit (æ¸… 0)
     }
 }
 
@@ -91,8 +96,8 @@ bool PlcCore::Get_O(int moduleIdx, int bitIdx)
     if (!m_pIo || moduleIdx < 0 || moduleIdx >= (int)m_pIo->size()) return false;
     ENI_GenericIO& mod = (*m_pIo)[moduleIdx];
 
-    // ³o¸Ì¨ä¹ê¤£»İ­nÀË¬d pOutputLoc¡A¥u­n¦³ outBuffer ´N¥i¥HÅªª¬ºA
-    // ¦ı¬°¤F«O«ùÅŞ¿è¤@­P¡AÀË¬d¤@¤U¤]µL§«
+    // é€™è£¡å…¶å¯¦ä¸éœ€è¦æª¢æŸ¥ pOutputLocï¼Œåªè¦æœ‰ outBuffer å°±å¯ä»¥è®€ç‹€æ…‹
+    // ä½†ç‚ºäº†ä¿æŒé‚è¼¯ä¸€è‡´ï¼Œæª¢æŸ¥ä¸€ä¸‹ä¹Ÿç„¡å¦¨
     if (mod.outBuffer.empty()) return false;
 
     int bytePos = bitIdx / 8;
@@ -100,8 +105,8 @@ bool PlcCore::Get_O(int moduleIdx, int bitIdx)
     if (bytePos >= (int)mod.outBuffer.size()) return false;
 
     // ==========================================================
-    // [ÃöÁä­×§ï] ±q "¼v¤l°O¾ĞÅé(outBuffer)" Åª¨ú
-    // ¤£­nÅª pOutputLoc¡A¦]¬°¥¦¥i¯à¤w¸g³Q receive ¨ç¦¡²M¹s¤F
+    // [é—œéµä¿®æ”¹] å¾ "å½±å­è¨˜æ†¶é«”(outBuffer)" è®€å–
+    // ä¸è¦è®€ pOutputLocï¼Œå› ç‚ºå®ƒå¯èƒ½å·²ç¶“è¢« receive å‡½å¼æ¸…é›¶äº†
     // ==========================================================
     return (mod.outBuffer[bytePos] & (1 << bitPos)) != 0;
 }
@@ -113,52 +118,52 @@ void PlcCore::Clear_Module_O(int moduleIdx)
 
     if (mod.pOutputLoc != nullptr && mod.outBuffer.size() > 0) {
 
-        // 1. [­ì¦³] ²M°£ IO Map (³o¬Oµ¹ºô¥d°e¥X¥h¥Îªº)
+        // 1. [åŸæœ‰] æ¸…é™¤ IO Map (é€™æ˜¯çµ¦ç¶²å¡é€å‡ºå»ç”¨çš„)
         memset(mod.pOutputLoc, 0, mod.outBuffer.size());
 
-        // 2. [·s¼W] ²M°£¼v¤l°O¾ĞÅé (³o¬Oµ¹ Set_O ¹Bºâ¥Îªº)
-        // ¥²¶·§â³o¸Ì¤]Âk¹s¡A¤U¤@¦¸ Set_O ¤~·|¬O°®²bªº¶}©l¡I
+        // 2. [æ–°å¢] æ¸…é™¤å½±å­è¨˜æ†¶é«” (é€™æ˜¯çµ¦ Set_O é‹ç®—ç”¨çš„)
+        // å¿…é ˆæŠŠé€™è£¡ä¹Ÿæ­¸é›¶ï¼Œä¸‹ä¸€æ¬¡ Set_O æ‰æœƒæ˜¯ä¹¾æ·¨çš„é–‹å§‹ï¼
         std::fill(mod.outBuffer.begin(), mod.outBuffer.end(), 0);
     }
 }
 
 // ============================================================================
-//  ÅŞ¿è±±¨î°Ï (°®²bªº¶]°¨¿OÅŞ¿è)
+//  é‚è¼¯æ§åˆ¶å€ (ä¹¾æ·¨çš„è·‘é¦¬ç‡ˆé‚è¼¯)
 // ============================================================================
 
-void PlcCore::Update()
+void PlcCore::Update_Debug()
 {
     if (!m_pIo) return;
     for (size_t i = 0; i < m_pIo->size(); ++i)
     {
         auto& mod = (*m_pIo)[i];
 
-        // °w¹ï 7062 ¿é¥X¼Ò²Õ
+        // é‡å° 7062 è¼¸å‡ºæ¨¡çµ„
         if (mod.pOutputLoc != nullptr && mod.productCode == 0x00007062)
         {
-            // [­×§ïÂI 1] ²¾°£ Clear_Module_O¡A«O¯dÂÂªº«G¿Oª¬ºA
+            // [ä¿®æ”¹é» 1] ç§»é™¤ Clear_Module_Oï¼Œä¿ç•™èˆŠçš„äº®ç‡ˆç‹€æ…‹
 
-            // [­×§ïÂI 2] ÂI«G·í«e³o¤@Áû (²Ö¿n)
+            // [ä¿®æ”¹é» 2] é»äº®ç•¶å‰é€™ä¸€é¡† (ç´¯ç©)
             Set_O((int)i, m_marqueeLed, true);
         }
 
         if (mod.pOutputLoc != nullptr && mod.productCode == 0x00000003)
         {
-            // [­×§ïÂI 1] ²¾°£ Clear_Module_O¡A«O¯dÂÂªº«G¿Oª¬ºA
+            // [ä¿®æ”¹é» 1] ç§»é™¤ Clear_Module_Oï¼Œä¿ç•™èˆŠçš„äº®ç‡ˆç‹€æ…‹
 
-            // [­×§ïÂI 2] ÂI«G·í«e³o¤@Áû (²Ö¿n)
+            // [ä¿®æ”¹é» 2] é»äº®ç•¶å‰é€™ä¸€é¡† (ç´¯ç©)
             Set_O((int)i, m_marqueeLed, true);
         }
     }
 
-    // ²¾°Ê¯Á¤Ş
+    // ç§»å‹•ç´¢å¼•
     m_marqueeLed++;
 
-    // [­×§ïÂI 3] ¥u¦³·í­p¼Æ¶W¹L 15 (¶]§¹¤@°é) ®É¡A¤~¤@¦¸¥ş³¡²MªÅ¨ÃÂk¹s
+    // [ä¿®æ”¹é» 3] åªæœ‰ç•¶è¨ˆæ•¸è¶…é 15 (è·‘å®Œä¸€åœˆ) æ™‚ï¼Œæ‰ä¸€æ¬¡å…¨éƒ¨æ¸…ç©ºä¸¦æ­¸é›¶
     if (m_marqueeLed > 15)
     {
 
-        // ¶]§¹¤@°é¤F¡A§â©Ò¦³ 7062 ¼Ò²Õ¥şÃö
+        // è·‘å®Œä¸€åœˆäº†ï¼ŒæŠŠæ‰€æœ‰ 7062 æ¨¡çµ„å…¨é—œ
         for (size_t k = 0; k < m_pIo->size(); ++k)
         {
             if ((*m_pIo)[k].productCode == 0x00007062)
@@ -167,7 +172,7 @@ void PlcCore::Update()
             }
         }
 
-        // ¶]§¹¤@°é¤F¡A§â©Ò¦³ 7062 ¼Ò²Õ¥şÃö
+        // è·‘å®Œä¸€åœˆäº†ï¼ŒæŠŠæ‰€æœ‰ 7062 æ¨¡çµ„å…¨é—œ
         for (size_t k = 0; k < m_pIo->size(); ++k)
         {
             if ((*m_pIo)[k].productCode == 0x00000003)
@@ -176,6 +181,52 @@ void PlcCore::Update()
             }
         }
 
-        m_marqueeLed = 0; // Âk¹s­«¨Ó
+        m_marqueeLed = 0; // æ­¸é›¶é‡ä¾†
+    }
+}
+
+
+// ============================================================================
+// ğŸŒŸ IO å°æ˜ è¡¨è¨­å®š
+// ============================================================================
+void PlcCore::AddInputMapping(int moduleIdx, int plcStartIndex, int bitCount) {
+    m_inputMaps.push_back({ moduleIdx, plcStartIndex, bitCount });
+}
+
+void PlcCore::AddOutputMapping(int moduleIdx, int plcStartIndex, int bitCount) {
+    m_outputMaps.push_back({ moduleIdx, plcStartIndex, bitCount });
+}
+
+// ============================================================================
+// ğŸŒŸ æ ¸å¿ƒæ©‹æ¥é‚è¼¯ï¼šæ¥µé€Ÿè³‡æ–™æ¬ç§»
+// ============================================================================
+
+void PlcCore::SyncPhysicalToVirtual()
+{
+    if (!g_PLC || !m_pIo) return;
+
+    // æƒææ‰€æœ‰çš„ Input å°æ˜ è¦å‰‡
+    for (const auto& map : m_inputMaps) {
+        for (int i = 0; i < map.bitCount; i++) {
+            // è®€å–å¯¦é«”è…³ä½
+            bool physicalVal = Get_I(map.moduleIdx, i);
+            // å¯«å…¥ PLC è™›æ“¬ I é»
+            g_PLC->SetBit_I(map.plcStartIndex + i, physicalVal);
+        }
+    }
+}
+
+void PlcCore::SyncVirtualToPhysical()
+{
+    if (!g_PLC || !m_pIo) return;
+
+    // æƒææ‰€æœ‰çš„ Output å°æ˜ è¦å‰‡
+    for (const auto& map : m_outputMaps) {
+        for (int i = 0; i < map.bitCount; i++) {
+            // è®€å– PLC è™›æ“¬ O é»
+            bool plcVal = g_PLC->GetBit_O(map.plcStartIndex + i);
+            // å¯«å…¥å¯¦é«”è…³ä½ (å½±å­è¨˜æ†¶é«”)
+            Set_O(map.moduleIdx, i, plcVal);
+        }
     }
 }

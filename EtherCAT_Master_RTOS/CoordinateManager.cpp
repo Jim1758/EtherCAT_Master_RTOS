@@ -932,3 +932,27 @@ void CoordinateManager::SetWorkpieceNumber(int num, NCManager* nc)
 
     // DEBUG_PRINT("[Coordinate] Independent Workpiece Number Updated: %d\n", currentWorkpieceNum);
 }
+
+// =========================================================
+// 🌟 取得機台當下的剩餘移動量 (Distance To Go)
+// =========================================================
+void CoordinateManager::GetDistanceToGo(double* outDTG, NCManager* nc) const
+{
+    for (int i = 0; i < 8; i++) outDTG[i] = 0.0;
+    if (!nc) return;
+
+    double targetMCS_mm[8] = { 0.0 };
+
+    // 這裡拿到的 targetMCS_mm 已經是正確的釐米 (mm) 單位了
+    if (nc->GetMotion().GetExecutingTargetMCS(targetMCS_mm))
+    {
+        for (int i = 0; i < 8; i++) {
+            // mm 減去 mm，結果完美！
+            outDTG[i] = targetMCS_mm[i] - actualMCS[i];
+
+            if (std::abs(outDTG[i]) < 0.001) {
+                outDTG[i] = 0.0;
+            }
+        }
+    }
+}

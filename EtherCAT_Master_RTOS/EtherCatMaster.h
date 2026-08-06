@@ -6,7 +6,7 @@
 #include "PlcCore.h"       // 引用 PLC 核心
 #include "MotionCore.h"       // 引用 MotionCore 核心
 #include "NCManager.h"
-
+#include "PLCManager.h" // 🌟 1. 記得 include PLCManager 標頭檔
 #pragma pack(push, 1)
 
 // 標準 Mailbox 標頭 (6 Bytes)
@@ -146,7 +146,8 @@ public:
 
     // 🌟 3. 新增指標變數 (預設設為 nullptr 防呆)
     CoordinateManager* pCoordMgr = nullptr;
-  
+    // 🌟 2. 新增 PLCManager 成員變數（名稱必須是 m_plcManager）
+    PLCManager m_plcManager;
 
     //EtherCAT  Function
     void AttachNic(CNicDriver* pNic);// 綁定網卡驅動程式

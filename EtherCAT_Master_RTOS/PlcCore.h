@@ -1,38 +1,49 @@
-#pragma once
-#include "EtherCatTypes.h" // ¤Ş¥Î¤W­±ªº¿W¥ß«¬§OÀÉ
+ï»¿#pragma once
+#include "EtherCatTypes.h"
 #include <vector>
+
+// ğŸŒŸ æ–°å¢ï¼šIO å°æ˜ è¡¨çµæ§‹
+struct IOMapping {
+    int moduleIdx;     // ç‰©ç†æ¨¡çµ„ç«™è™Ÿ (ä¾‹å¦‚ 0 ä»£è¡¨ç¬¬ä¸€ç«™)
+    int plcStartIndex; // PLC é™£åˆ—çš„èµ·å§‹é» (ä¾‹å¦‚ 10 ä»£è¡¨å¾ I10 æˆ– O10 é–‹å§‹)
+    int bitCount;      // è©²æ¨¡çµ„è¦å°æ˜ å¹¾å€‹é» (ä¾‹å¦‚ 8 æˆ– 16)
+};
 
 class PlcCore {
 public:
     PlcCore();
 
-    // 1. ³sµ²¸ê®Æ («O¯d±zªº Link ¤¶­±)
     void Link(std::vector<ENI_GenericIO>* pList);
+    void SetIoList(std::vector<ENI_GenericIO>* pList) { m_pIo = pList; }
 
-    // 2. ³o¬O±z¬°¤F°t¦X EtherCatMaster.cpp ©I¥s¦Ó¥[ªº¡A«O¯d¥¦¡I
-    void SetIoList(std::vector<ENI_GenericIO>* pList) 
-    {
-        m_pIo = pList;
-    }
+    // ===============================================
+    // ğŸŒŸ 1. å°æ˜ è¡¨è¨­å®š API (å•Ÿå‹•æ™‚è¨­å®š)
+    // ===============================================
+    void AddInputMapping(int moduleIdx, int plcStartIndex, int bitCount);
+    void AddOutputMapping(int moduleIdx, int plcStartIndex, int bitCount);
 
-    // 3. ®Ö¤ßÅŞ¿è
-    void Update();
+    // ===============================================
+    // ğŸŒŸ 2. æ ¸å¿ƒæ©‹æ¥ API (åœ¨ 1ms ä¸­æ–·è£¡å‘¼å«)
+    // ===============================================
+    void SyncPhysicalToVirtual(); // å°‡ EtherCAT å¯¦é«” Input å¯«å…¥ PLC I é»
+    void SyncVirtualToPhysical(); // å°‡ PLC O é»å¯«å…¥ EtherCAT å¯¦é«” Output
 
-    // 4. API (±±¨î¤¶­±)
+    void Update_Debug();
+
+    // åº•å±¤æ§åˆ¶ä»‹é¢
     bool Get_I(int moduleIdx, int bitIdx);
     void Set_O(int moduleIdx, int bitIdx, bool val);
     bool Get_O(int moduleIdx, int bitIdx);
-
-    // [·s¼W] ¬°¤FÅı Update ¶]°¨¿O§óÂ²¼ä¡A§Ú¥[¤F³o­Ó helper
     void Clear_Module_O(int moduleIdx);
-
-    
-    void FlushOutputs();// ±NÅŞ¿èª¬ºA¦P¨B¨ìµwÅé¦a¹Ï
+    void FlushOutputs();
 
 private:
     std::vector<ENI_GenericIO>* m_pIo = nullptr;
 
-    // ¤º³¡ÅÜ¼Æ
+    // ğŸŒŸ æ–°å¢ï¼šå­˜æ”¾å°æ˜ è¦å‰‡çš„é™£åˆ—
+    std::vector<IOMapping> m_inputMaps;
+    std::vector<IOMapping> m_outputMaps;
+
     int m_loopCount = 0;
     int m_marqueeLed = 0;
 };

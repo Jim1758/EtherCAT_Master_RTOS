@@ -8,7 +8,7 @@
 #include "SHMManager.h"
 #include "HMI_Bridge.h"    // 🌟 1. 引入橋接器
 #include "AlarmManager.h"
-
+#include "PLCManager.h" // 🌟 1. 引入 PLC 管理器標頭檔
 
 int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行 EDM模式
 {
@@ -34,6 +34,15 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     }
 
     //PLC 中斷宣告---------------------------------------------------------------
+
+    if (m_plcManager.LoadLogicProgram(GlobalConfig::GetInstance().PLC_Dir + "logic.bin") == false)
+    {
+        DEBUG_PRINT("LoadLogicProgram PLC Error!\n");
+        return -1;
+    }
+   
+
+
     HANDLE hTimer_PLC = NULL;// 用來存放計時器的 Handle
     LARGE_INTEGER liPeriod_PLC;
     liPeriod_PLC.QuadPart = 10000; // 1ms
@@ -131,6 +140,8 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         if (m_NC->Close_System_Com_flag == true)//關閉核心命令
         {
             m_NC->CoordSys.SaveAllParameters();//儲存座標系統相關參數
+
+            g_PLC->Close_PLC();//關閉PLC作業
             SHMManager::GetInstance().Shutdown();//關閉共享記憶體
             DEBUG_PRINT("Close System！\n");
             return 0;

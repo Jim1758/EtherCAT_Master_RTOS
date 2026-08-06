@@ -205,6 +205,9 @@ public:
    
 
     bool GetRefPoint(int pCode, double* outPos) const;
+
+    // 🌟 新增：取得機台當下的剩餘移動量 (Distance To Go)
+    void GetDistanceToGo(double* outDTG, NCManager* nc) const;
 private:
     // 底層輔助函式：負責讀寫 8 軸二維陣列，並確保原子寫入防護
     void SaveTableToFile(const std::string& filename, const std::vector<std::vector<double>>& table);

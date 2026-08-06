@@ -114,6 +114,7 @@
     <ClInclude Include="NC_Types.h" />
     <ClInclude Include="NicDriver.h" />
     <ClInclude Include="PlcCore.h" />
+    <ClInclude Include="PLCManager.h" />
     <ClInclude Include="SHMManager.h" />
     <ClInclude Include="SHM_Types.h" />
     <ClInclude Include="tinyxml2.h" />
@@ -156,6 +157,7 @@
     <ClCompile Include="NCManager_SysVars.cpp" />
     <ClCompile Include="NicDriver.cpp" />
     <ClCompile Include="PlcCore.cpp" />
+    <ClCompile Include="PLCManager.cpp" />
     <ClCompile Include="SHMManager.cpp" />
     <ClCompile Include="System_EDM_SINKER_MODE.cpp" />
     <ClCompile Include="System_EXAMPLE_MODE.cpp" />

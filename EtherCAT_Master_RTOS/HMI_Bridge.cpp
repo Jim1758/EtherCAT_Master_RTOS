@@ -4,6 +4,7 @@
 #include "NCManager.h"
 #include "AlarmManager.h"
 #include <cstring> 
+#include "PLCManager.h"
 
 namespace HMI_Bridge
 {
@@ -23,7 +24,7 @@ namespace HMI_Bridge
 
         pShm->NC_Status.SHM_NC_State = static_cast<int32_t>(nc->m_state);
         pShm->NC_Status.SHM_EDM_State = static_cast<int32_t>(nc->m_edmState);
-
+       
 
      
 
@@ -43,6 +44,16 @@ namespace HMI_Bridge
             double displayMCS = nc->CoordSys.actualMCS[i] - currentComp;
             double displayWCS = currentWCS[i] - currentComp;
 
+            // 準備一個陣列接資料
+            double currentDTG[8];
+
+            // 呼叫 CoordSys 裡我們剛寫好的 API (傳入 this 給它)
+            nc->CoordSys.GetDistanceToGo(currentDTG, nc);
+
+            // 把結果塞進共享記憶體，給 HMI 顯示！
+            for (int i = 0; i < 8; i++) {
+                 pShm->NC_Status.DistanceToGo[i] = currentDTG[i];
+            }
           
           
             // ========================================================
@@ -182,6 +193,11 @@ namespace HMI_Bridge
 
         int interpreterHCode = nc->CoordSys.currentHCode;
         int physicalHCode = nc->GetMotion().GetPhysicalExecutionHCode();
+
+        //刀具號
+        pShm->NC_Status.currentTCode = nc->CoordSys.currentTCode;
+        //工件號
+        pShm->NC_Status.currentWorkpieceNum = nc->CoordSys.currentWorkpieceNum;
 
         // 如果機台靜止(大腦卡住)，顯示大腦狀態；如果機台在跑，顯示馬達標籤狀態！
         // 假設 pShm->NC_Status 有這兩個變數供 UI 綁定
@@ -358,6 +374,42 @@ namespace HMI_Bridge
         // =======================================================
         // 取代你原本手寫的 for 迴圈與 m_pContexts
         nc->GetMotion().ExportDebugInfo(pShm->axisDebug,true);
+
+
+
+        //PLC----------------------------------------------------------------------
+        pShm->PLC_Status.SHM_PLC_RunCount = g_PLC->PLC_RunCount;
+      // 🌟 PLC 狀態全廣播
+        if (g_PLC != nullptr) 
+        {
+            g_PLC->ExportPLCStatus(&pShm->PLC_Status);
+        }
+
+        // 🌟 處理 PLC 點位寫入
+        if (pShm->PLC_Command.writeReq)
+        {
+            if (g_PLC != nullptr) {
+                g_PLC->SetMemory(
+                    pShm->PLC_Command.regionPrefix,
+                    pShm->PLC_Command.index,
+                    pShm->PLC_Command.writeValue
+                );
+            }
+            pShm->PLC_Command.writeReq = false;
+        }
+
+        // 🌟 處理 PLC 變數名稱直接寫入
+        if (pShm->PLC_Command.writeByNameReq)
+        {
+            pShm->PLC_Command.varName[63] = '\0';
+            if (g_PLC != nullptr) {
+                g_PLC->SetVar(
+                    std::string(pShm->PLC_Command.varName),
+                    pShm->PLC_Command.writeValue
+                );
+            }
+            pShm->PLC_Command.writeByNameReq = false;
+        }
     }
 
     // =========================================================================

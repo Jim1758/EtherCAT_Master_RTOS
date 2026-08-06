@@ -66,10 +66,14 @@ struct SHM_NC_Status
     // 🌟 新增：目前插補平面 (17=G17, 18=G18, 19=G19)
     int currentPlaneMode;
 
+
+    int currentTCode;//當下刀號
+    int currentWorkpieceNum;//當下工件號
+
     // 🌟 新增：即時座標廣播區 (8軸)
     double actualMCS[8]; // 機械座標 (Machine Coordinate System)
     double actualWCS[8]; // 絕對座標/工件座標 (Work Coordinate System)
-
+    double DistanceToGo[8];//剩餘座標
    
     int32_t reserved[30];// 預留擴充空間
 };
@@ -188,6 +192,40 @@ struct SHM_Coord_Command {
     char saveType;       // 0=全部, 1=Status, 2=EXT, 3=WCS, 4=Tool, 5=Work
 };
 
+// PLC狀態區塊 (全廣播，供 HMI 讀取顯示) --------------------------------
+struct SHM_PLC_Status
+{
+    uint32_t SHM_PLC_RunCount;//PLC執行迴圈數
+    // 標準點位與暫存器
+    uint8_t I[1000];
+    uint8_t O[1000];
+    uint8_t A[4000];
+    uint8_t S[4000];
+    uint8_t C[4000];
+    int32_t R[1000];
+    int32_t DR[1000];
+
+    // 🌟 Timer (T) 專屬區塊：拆分當前值與目標值，讓人機可以顯示進度 (例如 5/10)
+    int32_t T_acc[1000];    // 目前累積時間 (ms)
+    int32_t T_preset[1000]; // 目標設定時間 (ms)
+    uint8_t T_done[1000];   // 是否已經到達 (1=ON, 0=OFF)
+    int32_t T_base[1000];   // 🌟 新增這行：把時基傳給 HMI
+};
+
+// PLC命令區塊 (供 HMI 寫入/設定點位) -----------------------------------
+struct SHM_PLC_Command
+{
+    // 方式 A：透過區域代號與索引寫入 (例如寫入 M_O[5])
+    bool writeReq;          // 寫入請求旗標 (HMI 設 true，C++ 執行完設 false)
+    char regionPrefix[4];   // 變數前綴 (填入 "I", "O", "A", "S", "R", "DR")
+    int index;              // 陣列索引 (如 5)
+    double writeValue;      // 欲寫入的值 (如果是 BOOL，請傳 1.0 或 0.0)
+
+    // 方式 B：透過字串名稱寫入 (如果 HMI 想要直接用變數名稱寫入 VAR)
+    bool writeByNameReq;    // 名稱寫入請求旗標
+    char varName[64];       // 變數名稱字串 (例如 "TARGET_SPEED")
+};
+
 //總記憶體區塊-------------------------------------------------------
 struct SHM_Data 
 {
@@ -203,6 +241,9 @@ struct SHM_Data
     SHM_String_Command String_Command; // 加入這個新區塊
     SHM_AxisDebugInfo axisDebug[8]; // 🌟 給 HMI 看的 8 軸除錯資訊
    
+    // 🌟 補上這兩行：PLC 專用讀寫區
+    SHM_PLC_Status PLC_Status;
+    SHM_PLC_Command PLC_Command;
 };
 
 #pragma pack(pop)

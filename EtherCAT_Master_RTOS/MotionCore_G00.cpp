@@ -89,7 +89,7 @@ void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double
     // 完美傳入 Pulse 陣列與計算好的 PPS 速度
     LineMove(axes, targetPos_Pulse, groupG00Vel_PPS, groupAccTime, groupDecTime, mode);
 
-    //RtPrintf("G00>>> %d (LookAhead: %d)\n", mode, isLookAheadActive);
+    RtPrintf("G00>>> %d (LookAhead: %d)\n", mode, isLookAheadActive);
 }
 
 

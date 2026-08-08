@@ -29,6 +29,10 @@ struct SHM_NC_Status
     int32_t  macroCurrentLine;  // 副程式行號
 
 
+    bool m_isSingleBlockEnabled ;   // 單步執行
+    bool m_isOptionalStopEnabled;  // 選擇性暫停 (M01)
+    bool m_isBlockSkipEnabled;     // 選擇性跳躍 (/)
+
     // 🌟 新增：人機 UI 專用的模態狀態 (Modal Status)
     int currentWCS_GCode;  // 目前的座標系 (54~959)
     int isAbsoluteMode=true;    // 1 = G90 (絕對), 0 = G91 (增量)
@@ -144,6 +148,14 @@ struct SHM_NC_Command
     int32_t targetMode; // 0: MEMORY, 1: MDI, 2: MANUAL, 3: EDIT
 
     
+
+    bool Set_isSingleBlockEnabled_ON;   // 單步執行
+    bool Set_isSingleBlockEnabled_OFF;   // 單步執行
+    bool Set_isOptionalStopEnabled_ON;  // 選擇性暫停 (M01)
+    bool Set_isOptionalStopEnabled_OFF;  // 選擇性暫停 (M01)
+    bool Set_isBlockSkipEnabled_ON;     // 選擇性跳躍 (/)
+    bool Set_isBlockSkipEnabled_OFF;     // 選擇性跳躍 (/)
+
     int32_t reserved[16];// 預留擴充空間
 };
 
@@ -217,6 +229,7 @@ struct SHM_PLC_Command
 {
     // 方式 A：透過區域代號與索引寫入 (例如寫入 M_O[5])
     bool writeReq;          // 寫入請求旗標 (HMI 設 true，C++ 執行完設 false)
+    bool ReloadLogicProgram;//重置PLC邏輯檔案
     char regionPrefix[4];   // 變數前綴 (填入 "I", "O", "A", "S", "R", "DR")
     int index;              // 陣列索引 (如 5)
     double writeValue;      // 欲寫入的值 (如果是 BOOL，請傳 1.0 或 0.0)

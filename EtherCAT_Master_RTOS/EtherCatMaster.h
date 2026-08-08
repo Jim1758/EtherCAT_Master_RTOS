@@ -176,7 +176,7 @@ public:
   
 
   
-    void ConfigureSlaveGeneric_INIT(int slaveIdx);//從站配置INIT
+    void ConfigureSlaveGeneric_INIT(int slaveIdx, uint64_t unifiedStartTime);//從站配置INIT
     void ConfigureSlaveGeneric_PRE_OP(int slaveIdx);//從站配置PRE_OP
     void ConfigureSlaveGeneric_SAFE_OP(int slaveIdx);//從站配置SAFE_OP
     uint64_t GetCurrentMasterTimeNs();// 取得 RTX64 系統時間 (單位: 奈秒)

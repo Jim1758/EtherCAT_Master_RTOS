@@ -8,7 +8,7 @@
 #include "PLCManager.h" // 🌟 1. 記得 include PLCManager 標頭檔
 #define MAX_MBX_SIZE 1024
 
-EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m_mboxCnt(0) 
+EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m_mboxCnt(0)
 {
     // 清空傳送與接收緩衝區
     memset(m_txBuffer, 0, sizeof(m_txBuffer));
@@ -19,7 +19,7 @@ EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m
     // 🌟 將全域指標指向這顆唯一真正有在跑的 PLC 大腦！
     g_PLC = &this->m_plcManager;
 }
-EtherCatMaster::~EtherCatMaster() 
+EtherCatMaster::~EtherCatMaster()
 {
     if (m_NC != nullptr)
     {
@@ -49,7 +49,7 @@ void EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//手動設定從站Mail
         switch (m_slaveInfo[slave_idx].Product_Code)
         {
         case 0x60380000: //A6B
-            
+
             if (Motor_Start_Index == -1)//紀錄第一站馬達 位置
             {
                 Motor_Start_Index = slave_idx;
@@ -58,7 +58,7 @@ void EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//手動設定從站Mail
             m_slaveInfo[slave_idx].mbxOutAddr = 0x1000;   // 注意！不是 0x1800
             m_slaveInfo[slave_idx].mbxOutLength = 0x100;  // 256 bytes
 
-         
+
             m_slaveInfo[slave_idx].mbxInAddr = 0x1200;    // 注意！不是 0x18F6 或 0x1C00
             m_slaveInfo[slave_idx].mbxInLength = 0x100;   // 256 bytes
             break;
@@ -94,14 +94,14 @@ void EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//手動設定從站Mail
         switch (m_slaveInfo[slave_idx].Product_Code)
         {
         case 0x00000003: //
-        
+
             break;
 
-      
+
         default:
             break;
         }
-       
+
         break;
     case 0x000001dd:
         switch (m_slaveInfo[slave_idx].Product_Code)
@@ -124,7 +124,7 @@ void EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//手動設定從站Mail
             m_slaveInfo[slave_idx].mbxOutAddr = 0x1000;
             m_slaveInfo[slave_idx].mbxOutLength = 128;
             m_slaveInfo[slave_idx].mbxInAddr = 0x1080;
-            m_slaveInfo[slave_idx].mbxInLength = 128;  
+            m_slaveInfo[slave_idx].mbxInLength = 128;
             break;
         default:
             break;
@@ -143,9 +143,9 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
     const auto& slaves = m_pEni->GetSlaves();
     int total_slaves = (int)slaves.size();
     int WK = 0;
-    
-    LARGE_INTEGER wait; wait.QuadPart =5 * 10000;// 等待 單位ms
-    
+
+    LARGE_INTEGER wait; wait.QuadPart = 5 * 10000;// 等待 單位ms
+
 
     uint16_t state_INIT = 0x0001;//INIT (初始化)	這才是您要找的代碼。通訊重置，無 Mailbox。
     uint16_t state_INIT_ClearError = 0x0010;//清除錯誤 0x0010
@@ -154,7 +154,7 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
     uint16_t state_SAFE_OP = 0x0004;//SAFE-OP (安全操作)	輸入更新，輸出鎖定。
     uint16_t state_OP = 0x0008;//OP(操作)	全速運轉，輸入輸出都更新。
 
- 
+
     // ---------------------------------------------------------
     //  關閉看門狗
     // ---------------------------------------------------------
@@ -174,26 +174,33 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
     // ---------------------------------------------------------
     for (int i = 0; i < total_slaves; i++)
     {
-        
-        WK = ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0120, 2, &state_INIT_ClearError, 20); 
-        WK = ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0120, 2, &state_INIT, 20);  
+
+        WK = ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0120, 2, &state_INIT_ClearError, 20);
+        WK = ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0120, 2, &state_INIT, 20);
     }
     RtSleepFt(&wait);//等待
     Printf_Slaves_State();//印出從站狀態
     // ---------------------------------------------------------
     //  INIT 狀態
     // ---------------------------------------------------------
-   
+   // 🌟 關鍵修改：在進入迴圈前，先計算一個「全域統一的 Start Time」
+    uint64_t base_master_time = GetCurrentMasterTimeNs();
+    uint32_t cycle_time_ns = 250000; // 250us
+
+    // 設定 50ms 的緩衝讓所有從站初始化完畢，並強制對齊 250us 的整數倍
+    uint64_t unified_start_time = base_master_time + 50000000;
+    unified_start_time = ((unified_start_time / cycle_time_ns) + 1) * cycle_time_ns;
+
     for (int i = 0; i < total_slaves; i++)
     {
-       
+
 
         WK = ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0120, 2, &state_INIT, 20);
 
 
-     
+        // 🌟 將計算好的 unified_start_time 傳遞進去
 
-        ConfigureSlaveGeneric_INIT(i);////SM配置 從站配置_INIT
+        ConfigureSlaveGeneric_INIT(i, unified_start_time);////SM配置 從站配置_INIT
         //Sleep(1000);
     }
     RtSleepFt(&wait);//等待
@@ -204,7 +211,7 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
     for (int i = 0; i < total_slaves; i++)
     {
         ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0120, 2, &state_PRE_OP, 20);
-       
+
     }
     RtSleepFt(&wait);//等待
     Printf_Slaves_State();//印出從站狀態
@@ -229,7 +236,7 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
         //uint16_t wd_pdi_time = 0x0032;
         //ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0410, 2, &wd_pdi_time, 20);
 
-     
+
     }
 
 
@@ -237,10 +244,10 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
     // ----------------------------------------------------------------
     // SAFE_OP
     // ----------------------------------------------------------------
-    for (int i = 0; i < total_slaves; i++) 
+    for (int i = 0; i < total_slaves; i++)
     {
         WK = ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0120, 2, &state_SAFE_OP, 20);
-      
+
     }
     RtSleepFt(&wait);//等待
     Printf_Slaves_State();//印出從站狀態
@@ -254,7 +261,7 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
 
     Printf_Slaves_State();//印出從站狀態
 
-  
+
 
     return 0;
 }
@@ -285,37 +292,37 @@ void EtherCatMaster::Config_Slave_FMMU(int slaveIdx)//設定 FMMU(告訴 Slave �
                     {
                         uint32_t logicalAddr = (uint32_t)((uint8_t*)axis.pOutput - (uint8_t*)m_IoMap);
                         uint16_t len = sizeof(ServoOutput); // 假設您有定義結構大小，或動態計算
-                        
+
                         // 馬達標準 RxPDO 位址通常是 0x1100 (CoE)
                         // 如果是特殊的馬達，可在這裡 switch(vendorID)
-                        WK = WriteFmmuRegister(slaveIdx, fmmuCount++, logicalAddr, len, 0x1180, 0x02,20);
+                        WK = WriteFmmuRegister(slaveIdx, fmmuCount++, logicalAddr, len, 0x1180, 0x02, 20);
                         RtSleepFt(&wait);//等待
-                   
-                      
+
+
                     }
-                    
+
                     // 2. 設定 Input (TxPDO) -> FMMU 1
                     if (axis.pInput != nullptr)
                     {
                         uint32_t logicalAddr = (uint32_t)((uint8_t*)axis.pInput - (uint8_t*)m_IoMap);
                         uint16_t len = sizeof(ServoInput);
-                      
+
                         // 馬達標準 TxPDO 位址通常是 0x11C0 或 0x1180
                         // Delta A2/A3 常用 0x1180 或 0x11C0，視 SM3 設定而定
                         // 這裡暫定 0x11C0 (因為您之前 AD 模組也是用這個)
                         WK = WriteFmmuRegister(slaveIdx, fmmuCount++, logicalAddr, len, 0x1480, 0x01, 20);
                         RtSleepFt(&wait);//等待
-                      
+
                     }
                     break;
                 }
                 break;
             }
-           
+
             return;
         }
     }
-    
+
     //AD模組--------------------------------------
     for (auto& ad : m_AdList)
     {
@@ -340,7 +347,7 @@ void EtherCatMaster::Config_Slave_FMMU(int slaveIdx)//設定 FMMU(告訴 Slave �
                     break;
                 }
 
-             
+
             }
             return;
         }
@@ -386,7 +393,7 @@ void EtherCatMaster::Config_Slave_FMMU(int slaveIdx)//設定 FMMU(告訴 Slave �
             case 0x000001dd: // 台達 Delta
                 switch (m_slaveInfo[slaveIdx].Product_Code)
                 {
-                
+
                 case 0x00006002: //           
                 case 0x00007062: //   
                      // 1. 設定 Output
@@ -414,14 +421,14 @@ void EtherCatMaster::Config_Slave_FMMU(int slaveIdx)//設定 FMMU(告訴 Slave �
                 }
                 break;
             }
-           
+
             return;
         }
     }
 }
 
 
-void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
+void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx, uint64_t unifiedStartTime)//從站配置_INIT
 {
 
     //0x0800 - 0x0807	SyncManager 0 (SM0)	Mailbox Output (MbxOut) 主站 -> 從站 (寫信)
@@ -433,14 +440,14 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
 
     LARGE_INTEGER wait; wait.QuadPart = 5 * 10000;// 等待 ms
 
-  
+
 
     uint8_t SyncManager_0[8];
     uint8_t SyncManager_1[8];
     uint8_t SyncManager_2[8];
     uint8_t SyncManager_3[8];
 
-    
+
 
     //DC Set--------------------------------------------------------
     uint64_t slave_time_ns = 0;
@@ -452,7 +459,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
     uint16_t DC_Disable_Value = 0x0000;//
 
     uint32_t shift_time;
-
+    uint64_t final_start_time;
 
     uint64_t DC_zero_time = 0;
     switch (m_slaveInfo[slaveIdx].Vendor_ID)
@@ -473,7 +480,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
         switch (m_slaveInfo[slaveIdx].Product_Code)
         {
         case 0x00000005: //E1
-        
+
             break;
 
 
@@ -535,12 +542,12 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
             //DC 同預先關閉------------------------------------------------------------------
             WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0920, &DC_zero_time, 8, 20);
             WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0910, &DC_zero_time, 8, 20);
-           
 
 
 
-          //0x0800 - 0x0807	SyncManager 0 (SM0)	Mailbox Output (MbxOut) 主站 -> 從站 (寫信)
-           
+
+            //0x0800 - 0x0807	SyncManager 0 (SM0)	Mailbox Output (MbxOut) 主站 -> 從站 (寫信)
+
             SyncManager_0[1] = 0x10;// 設定實體起始位址 (Physical Start Address)
             SyncManager_0[0] = 0x00;
             SyncManager_0[2] = 0x80;//設定記憶體長度 (Length)
@@ -555,7 +562,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
 
 
                //0x0808 - 0x080F	SyncManager 1 (SM1)	Mailbox Input (MbxIn)   從站 -> 主站 (收信)
-         
+
             SyncManager_1[1] = 0x10;//設定實體起始位址 (Physical Start Address)
             SyncManager_1[0] = 0xC0;
             SyncManager_1[2] = 0x80;//設定記憶體長度 (Length)
@@ -622,45 +629,40 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
             time_offset = master_time_ns - slave_time_ns;
 
             // 寫入 Offset (0x0920)
-            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0920,  &time_offset, 8, 20);
+            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0920, &time_offset, 8, 20);
 
 
             // =========================================================================
-            // 2. 設定 Sync0 週期 (0x09A0)定頻
-            // =========================================================================
-            
+             // 2. 設定 Sync0 週期 (0x09A0)定頻
+             // =========================================================================
 
-        
-
-            // 您的 RTX64 Timer 是 250us，所以硬體的 Sync0 週期也必須嚴格等於 250us！
+             // 您的 RTX64 Timer 是 250us，所以硬體的 Sync0 週期也必須嚴格等於 250us！
             cycle_time = 250000; // 1,000,000 ns = 1 ms
             WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x09A0, &cycle_time, 4, 20);
 
 
-            // =========================================================================
-            // 3. 設定 Start Time (0x0990) - 設定鬧鐘
-            // =========================================================================
-            // 我們希望 Sync0 在「未來」某個整數時刻開始跳動
-            // 這裡簡單設定為：現在的主站時間 + 50ms (給予足夠的緩衝)
+
+            //DC設定版本1 各軸DC時間會變-----------------------------------------------------------------------------------目前不知道哪個是對的
+            
+            
             start_time = master_time_ns + 50000000;
-
-            // 超級關鍵：時間對齊 Alignment
-            // 我們不能隨便在某個奈秒啟動 Sync0，它必須是 cycle_time (250000) 的「完美整數倍」。
-            // 這樣才能保證主站的 RTX64 Timer 跟從站的 Sync0 脈衝在同一條時間線上跳動！
             start_time = ((start_time / cycle_time) + 1) * cycle_time;
-
-            // 進階：Shift Time (偏移時間)
-            // 通常我們會讓主站的資料「提早」送到，然後馬達的 Sync0 才觸發去讀取。
-            // 提早的時間通常抓週期的 30% ~ 50%。我們這裡設定讓 Sync0 延後 125µs (半個週期) 觸發。
             shift_time = cycle_time / 2;
             start_time = start_time + shift_time;
+            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0990, &start_time, 8, 20);
+            
+           
+
+            //DC設定版本2 各軸DC時間固定--------------------------------------------------------目前不知道哪個是對的
+            /*
+            cycle_time = 250000; // 250us
+            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x09A0, &cycle_time, 4, 20);
+            shift_time = cycle_time / 2;
+            final_start_time = unifiedStartTime + shift_time;
+            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0990, &final_start_time, 8, 20);
+            */
 
 
-            // 【進階技巧】為了更精準，通常會做對齊 (Alignment)
-            // 確保 StartTime 是 CycleTime 的整數倍
-            // start_time = ((start_time / cycle_time) + 1) * cycle_time;
-
-            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0990,  &start_time, 8,20);
 
 
             // =========================================================================
@@ -672,11 +674,11 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
             //先關閉0x981 硬體層面：熄滅 DC 引擎 (0x0981)
             ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0981, &DC_Disable_Value, 2, 20);
 
-            
+
             DC_Enable_Value = 0x03;
             // 有些驅動器需要寫入 0x07 (Sync0 + Sync1)，但 Delta A3 用 0x03 即可
             WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0981, &DC_Enable_Value, 2, 20);
-         
+
             // =========================================================================
             // 設定完成！現在硬體 Sync0 應該已經開始在內部產生 1ms 的脈衝了。
             // 接下去就可以寫入 0x1C32 告訴韌體準備好了。
@@ -689,7 +691,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
         case 0x00006002: // Delta R1-EC6002 (Digital Input)
         {
             //0x0800 - 0x0807	SyncManager 0 (SM0)	Mailbox Output (MbxOut) 主站 -> 從站 (寫信)
-      
+
             SyncManager_0[1] = 0x10;// 設定實體起始位址 (Physical Start Address)
             SyncManager_0[0] = 0x00;
             SyncManager_0[2] = 0x02;//設定記憶體長度 (Length)
@@ -706,11 +708,11 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
 
         case 0x00007062: // Delta R1-EC7062 (Digital Output)
         {
-          
-         
-            
+
+
+
             //0x0800 - 0x0807	SyncManager 0 (SM0)	Mailbox Output (MbxOut) 主站 -> 從站 (寫信)
-          
+
             SyncManager_0[1] = 0x0F;// 設定實體起始位址 (Physical Start Address)
             SyncManager_0[0] = 0x00;
             SyncManager_0[2] = 0x01;//設定記憶體長度 (Length)
@@ -720,13 +722,13 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
             SyncManager_0[6] = 0x01;//啟用 SyncManager (Activate) Bit 0 = 1 代表啟用 (Enable)
             SyncManager_0[7] = 0x00;//PDI 控制(PDI Control) 對於 Mailbox 通常設為 0
 
-          
+
 
             WK = ecx_APWR(m_slaveInfo[slaveIdx].APRDAPWR_Addr, 0x0800, 8, SyncManager_0, 20);
             RtSleepFt(&wait);//等待
 
             //0x0808 - 0x080F	SyncManager 1 (SM1)	Mailbox Input (MbxIn)   從站 -> 主站 (收信)
-          
+
             SyncManager_1[1] = 0x0F;//設定實體起始位址 (Physical Start Address)
             SyncManager_1[0] = 0x01;
             SyncManager_1[2] = 0x01;//設定記憶體長度 (Length)
@@ -744,7 +746,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
         case 0x00008124: // Delta R1-EC8124
         {
             //0x0800 - 0x0807	SyncManager 0 (SM0)	Mailbox Output (MbxOut) 主站 -> 從站 (寫信)
-       
+
             SyncManager_0[1] = 0x10;// 設定實體起始位址 (Physical Start Address)
             SyncManager_0[0] = 0x00;
             SyncManager_0[2] = 0x80;//設定記憶體長度 (Length)
@@ -758,7 +760,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
             RtSleepFt(&wait);//等待
 
              //0x0808 - 0x080F	SyncManager 1 (SM1)	Mailbox Input (MbxIn)   從站 -> 主站 (收信)
-          
+
             SyncManager_1[1] = 0x10;//設定實體起始位址 (Physical Start Address)
             SyncManager_1[0] = 0x80;
             SyncManager_1[2] = 0x80;//設定記憶體長度 (Length)
@@ -767,12 +769,12 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
             SyncManager_1[5] = 0x00;//狀態暫存器 (Status Register)
             SyncManager_1[6] = 0x01;//啟用 SyncManager (Activate)
             SyncManager_1[7] = 0x00;//PDI 控制 (PDI Control)
-         
+
             WK = ecx_APWR(m_slaveInfo[slaveIdx].APRDAPWR_Addr, 0x0808, 8, SyncManager_1, 20);
             RtSleepFt(&wait);//等待
 
             //0x0810 - 0x0817	SyncManager 2 (SM2)	Process Data Output (RxPDO)
-          
+
             SyncManager_2[1] = 0x11;//設定實體起始位址 (Physical Start Address)
             SyncManager_2[0] = 0x00;
             SyncManager_2[2] = 0x00;//設定記憶體長度 (Length)
@@ -785,10 +787,10 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
             WK = ecx_APWR(m_slaveInfo[slaveIdx].APRDAPWR_Addr, 0x0810, 8, SyncManager_2, 20); // Outputs (Disable)
             RtSleepFt(&wait);//等待
 
-          
+
 
             //0x0818 - 0x081F	SyncManager 3 (SM3)	Process Data Input (TxPDO)
-           
+
             SyncManager_3[1] = 0x11;//設定實體起始位址 (Physical Start Address)
             SyncManager_3[0] = 0xC0;
             SyncManager_3[2] = 0x08;//設定記憶體長度 (Length)
@@ -800,7 +802,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
 
             WK = ecx_APWR(m_slaveInfo[slaveIdx].APRDAPWR_Addr, 0x0818, 8, SyncManager_3, 20); // Inputs
             RtSleepFt(&wait);//等待
-          
+
 
         }
         break;
@@ -813,11 +815,11 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx)//從站配置_INIT
     }
 
 
-   
+
 }
 
 // 取得 RTX64 系統時間 (單位: 奈秒)
-uint64_t  EtherCatMaster:: GetCurrentMasterTimeNs()
+uint64_t  EtherCatMaster::GetCurrentMasterTimeNs()
 {
     LARGE_INTEGER current_time;
 
@@ -842,10 +844,10 @@ void EtherCatMaster::ConfigureSlaveGeneric_PRE_OP(int slaveIdx)//從站配置_PR
     uint32_t DC_cycleTimeNs = 1000000; // 1ms (與您的 RTX Timer 一致)
     uint16_t DC_syncMode = 2;          // DC Sync0 Mode
     uint16_t DC_freeRunMode = 0; // 0 = Free Run
-    
-    
+
+
     int WK = 0;
-  
+
     switch (m_slaveInfo[slaveIdx].Vendor_ID)
     {
     case 0x0000066F://松下
@@ -853,7 +855,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_PRE_OP(int slaveIdx)//從站配置_PR
         {
         case 0x60380000: //A6B
 
-          
+
             break;
 
 
@@ -907,14 +909,14 @@ void EtherCatMaster::ConfigureSlaveGeneric_PRE_OP(int slaveIdx)//從站配置_PR
             WK = ecx_SDOwrite(slaveIdx, 0x1601, 0x04, FALSE, 4, &u32val, 20);
 
 
-        
+
 
             // 設定 RxPDO 映射數目 = 4
             u8val = 4;
             WK = ecx_SDOwrite(slaveIdx, 0x1601, 0x00, FALSE, 1, &u8val, 20);
 
             //設定 TxPDO(0x1A01)----------------------------------------------------------------------
-      
+
             // Sub1: 6041h (StatusWord) 16-bit
             u32val = 0x60410010;
             WK = ecx_SDOwrite(slaveIdx, 0x1A01, 0x01, FALSE, 4, &u32val, 20);
@@ -945,13 +947,13 @@ void EtherCatMaster::ConfigureSlaveGeneric_PRE_OP(int slaveIdx)//從站配置_PR
             u32val = 0x60610008;
             WK = ecx_SDOwrite(slaveIdx, 0x1A01, 0x07, FALSE, 4, &u32val, 20);
 
-           
+
             // Sub8: 2510h (Vendor Specific) 32-bit [新增]
             // 圖片中最後一個是 0x25100020
             u32val = 0x25100020;
             WK = ecx_SDOwrite(slaveIdx, 0x1A01, 0x08, FALSE, 4, &u32val, 20);
 
-          
+
             // 設定 TxPDO 映射數目
             u8val = 8;
             WK = ecx_SDOwrite(slaveIdx, 0x1A01, 0x00, FALSE, 1, &u8val, 20);
@@ -973,7 +975,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_PRE_OP(int slaveIdx)//從站配置_PR
 
             //關閉DC同步---------------------------------------------------------------------------
             DC_freeRunMode = 0; // 0 = Free Run
-           
+
             // 1. SDO 層面：將同步模式設為 0 (Free Run)
             ecx_SDOwrite(slaveIdx, 0x1C32, 0x01, FALSE, 2, &DC_freeRunMode, 20);
             ecx_SDOwrite(slaveIdx, 0x1C33, 0x01, FALSE, 2, &DC_freeRunMode, 20);
@@ -981,7 +983,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_PRE_OP(int slaveIdx)//從站配置_PR
 
             //開啟DC 同步 設定 DC Sync 參數 1C32 & 1C33--------------------------------------------------------
 
-           
+
             DC_cycleTimeNs = 250000; // 250us (與您的 RTX Timer 一致)
             DC_syncMode = 2;          // DC Sync0 Mode
 
@@ -1017,7 +1019,7 @@ void EtherCatMaster::ConfigureSlaveGeneric_PRE_OP(int slaveIdx)//從站配置_PR
 
         case 0x00008124: // Delta R1-EC8124
         {
-          
+
         }
         break;
         default:
@@ -1068,20 +1070,20 @@ void EtherCatMaster::ConfigureSlaveGeneric_SAFE_OP(int slaveIdx)//從站配置_S
         {
         case 0x00006010: //A3E  
 
-          
+
             break;
         case 0x00005500: // Delta R1-EC5500 (Coupler)
 
             break;
         case 0x00006002: // Delta R1-EC6002 (Digital Input)
         {
-           
+
         }
         break;
 
         case 0x00007062: // Delta R1-EC7062 (Digital Output)
         {
-          
+
         }
         break;
 
@@ -1093,9 +1095,9 @@ void EtherCatMaster::ConfigureSlaveGeneric_SAFE_OP(int slaveIdx)//從站配置_S
             R1_EC8124_Channel_Enable[1] = 1;
             R1_EC8124_Channel_Enable[2] = 1;
             R1_EC8124_Channel_Enable[3] = 1;
-            for (uint8_t ch = 1; ch <= 4; ch++) 
+            for (uint8_t ch = 1; ch <= 4; ch++)
             {
-                WK=ecx_SDOwrite(slaveIdx, 0x2002, ch, 0, 2, &R1_EC8124_Channel_Enable[ch - 1], 20);
+                WK = ecx_SDOwrite(slaveIdx, 0x2002, ch, 0, 2, &R1_EC8124_Channel_Enable[ch - 1], 20);
                 RtSleepFt(&wait);//等待
             }
         }
@@ -1137,18 +1139,18 @@ int EtherCatMaster::BuildIoMap() //// 自動掃描並建立清單
             newAxis.productCode = slave.productCode;
 
             // 設定 Output 指標 (若有)
-            if (outBytes > 0) 
+            if (outBytes > 0)
             {
                 newAxis.pOutput = (ServoOutput*)&m_IoMap[currentOffset];
                 currentOffset += outBytes;
             }
-            else 
+            else
             {
                 newAxis.pOutput = nullptr;
             }
 
             // 設定 Input 指標 (若有)
-            if (inBytes > 0) 
+            if (inBytes > 0)
             {
                 newAxis.pInput = (ServoInput*)&m_IoMap[currentOffset];
                 currentOffset += inBytes;
@@ -1184,7 +1186,7 @@ int EtherCatMaster::BuildIoMap() //// 自動掃描並建立清單
                     mod.pInputLoc = nullptr;
 
                     // 設定 Output
-                    if (outBytes > 0) 
+                    if (outBytes > 0)
                     {
                         mod.pOutputLoc = (void*)&m_IoMap[currentOffset];
                         mod.outBuffer.resize(outBytes, 0);
@@ -1210,7 +1212,7 @@ int EtherCatMaster::BuildIoMap() //// 自動掃描並建立清單
                     ad.pInputLoc = nullptr;
 
                     // AD 只有 Input
-                    if (inBytes > 0) 
+                    if (inBytes > 0)
                     {
                         ad.pInputLoc = (void*)&m_IoMap[currentOffset];
                         ad.channelValues.resize(inBytes / 2, 0); // 假設每個通道 2 bytes
@@ -1230,8 +1232,8 @@ int EtherCatMaster::BuildIoMap() //// 自動掃描並建立清單
                 return -1;
 
             }
-          
-        } 
+
+        }
         else//未知設備-------------------------------------
         {
             DEBUG_PRINT("[Warning] Unknown Device (Idx:%d)\n", i);
@@ -1239,7 +1241,11 @@ int EtherCatMaster::BuildIoMap() //// 自動掃描並建立清單
         }
     }
     m_IoMapSize = currentOffset;
-    m_Plc.SetIoList(&m_IoList); // 如果 PLC 只需要 IO 清單
+    // 🌟 1. 將 IO 和 AD 清單都傳給 PlcCore
+    m_Plc.SetIoLists(&m_IoList, &m_AdList);
+
+    // 🌟 2. 觸發一鍵自動排列 (Auto Mapping)
+    m_Plc.AutoMapIO();
 
     DEBUG_PRINT(">>> Mapping Done. Total Map Size: %d Bytes\n", m_IoMapSize);
     return 0;
@@ -1277,7 +1283,7 @@ bool EtherCatMaster::Get_O(int moduleIdx, int bitIdx)
     // 4. 讀取 Bit (檢查該位元是否為 1)
     return (m_IoList[moduleIdx].outBuffer[bytePos] & (1 << bitPos)) != 0;
 }
-void EtherCatMaster::Set_O(int ioListIdx, int bitIdx, bool val) 
+void EtherCatMaster::Set_O(int ioListIdx, int bitIdx, bool val)
 {
     if (ioListIdx < 0 || ioListIdx >= m_IoList.size()) return;
 
@@ -1307,7 +1313,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     EtherCatMaster* pMaster = (EtherCatMaster*)nContext;
     uint16_t state;
     if (pMaster != nullptr)
-    {        
+    {
         // 1. [最優先] 執行 PDO 通訊 (Tick 0 邏輯)
         pMaster->m_Plc.FlushOutputs();
         int wkc = pMaster->ecx_LRW(0x00000000, pMaster->m_IoMapSize, pMaster->m_IoMap, 50); // Timeout 建議縮短
@@ -1319,7 +1325,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         if (subTick == 1)
         {
             // [Tick 1] DC 讀取 (保持原樣)
-          
+
             if (Motor_Start_Index >= 0)
             {
                 pMaster->wk_read = pMaster->ecx_APRD(m_slaveInfo[Motor_Start_Index].APRDAPWR_Addr, 0x0910, 8, &pMaster->DC_reference_time, 5);
@@ -1329,7 +1335,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
                 }
             }
-          
+
         }
         else if (subTick == 2)
         {
@@ -1411,11 +1417,11 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         pMaster->m_Motion.UpdateAllMotion();
 
 
-   
+
     }
 
 
-  
+
 }
 
 //PLC 中斷作業----------------------------------------------------------
@@ -1428,39 +1434,33 @@ void RTAPI GlobalTimerHandler_PLC(void* nContext)
     }
 
 
-    // =========================================================
-    // 🌟 步驟 1：Read Inputs (讀取輸入)
-    // 將 EtherCAT 實體的 RxPDO 狀態，透過 Mapping 表抄寫到 PLC 的 I 點
-    // =========================================================
+    // 🌟 步驟 0：將網卡底層記憶體拷貝到影子緩衝區 (修復輸入全為 0 的 Bug)
+    pMaster->m_Plc.FetchInputs();
+
+    // 🌟 步驟 1：實體轉虛擬 (影子緩衝區 -> PLC I 點/DR)
     pMaster->m_Plc.SyncPhysicalToVirtual();
 
-     // =========================================================
-     // 🌟 步驟 2：Execute Logic (執行虛擬機邏輯)
-     // PLC 大腦進行 1ms 的運算 (階梯圖掃描、Timer 累加)
-     // =========================================================
-    
+    // 🌟 步驟 2：執行大腦運算
     if (g_PLC != nullptr) {
         g_PLC->RunCycle(1);
     }
 
-
-    // =========================================================
-    // 🌟 步驟 3：Write Outputs (準備輸出)
-    // 將 PLC 算好的 O 點狀態，透過 Mapping 表抄寫回實體的影子記憶體
-    // =========================================================
+    // 🌟 步驟 3：虛擬轉實體 (PLC O 點 -> 影子緩衝區)
     pMaster->m_Plc.SyncVirtualToPhysical();
 
-    // 將影子記憶體 (outBuffer) 正式刷入硬體地圖 (pOutputLoc) 發給網卡
+    // 🌟 步驟 4：刷出硬體訊號
     pMaster->m_Plc.FlushOutputs();
 
-   
+    pMaster->tickCount_PLC++;
+
+
     //跑馬燈測試----------------------------------------
-    /*
+
     if (pMaster->tickCount_PLC % 50 == 0)
     {
-         pMaster->m_Plc.Update_Debug();
-    }*/
+        //pMaster->m_Plc.Update_Debug();
+    }
 
-    pMaster->tickCount_PLC++;
+
 }
 

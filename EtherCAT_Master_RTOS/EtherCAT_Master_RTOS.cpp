@@ -29,6 +29,39 @@ bool InitEtherCATMaster();//初始化 EtherCAT 主站
 int _tmain(int argc, _TCHAR* argv[])//
 {
   
+    // ==============================================================
+    // 🌟 1. 設定 CPU 核心親和性 (自動偵測安全版)
+    // ==============================================================
+    DWORD_PTR currentProcessMask = 0;
+    DWORD_PTR availableSystemMask = 0; // 這個變數會裝載這台機台所有 RTSS 核心的遮罩
+    HANDLE hCurrentProcess = GetCurrentProcess();
+
+    // 步驟 A: 取得當前 RTSS 系統開放給您的可用核心遮罩
+    if (!RtGetProcessAffinityMask(hCurrentProcess, &currentProcessMask, &availableSystemMask))
+    {
+        DEBUG_PRINT("[Error] RtGetProcessAffinityMask Failed! Error: %lu\n", GetLastError());
+        return -1;
+    }
+
+    // 假設機台 RTSS 分配在 Core 2 與 Core 3，availableSystemMask 就會是 0x0C (二進位 1100)
+    DEBUG_PRINT("[System] RTSS Available Core Mask is: 0x%llX\n", availableSystemMask);
+
+    // 步驟 B: 從可用的核心中，抓出最低位的第一顆核心
+    // (這是一招位元運算魔法: X & ~(X-1) 能精準提取最低位的 1)
+    // 如果 availableSystemMask 是 0x0C (1100)，算出來的 targetMask 就會是 0x04 (0100)，也就是 Core 2
+    DWORD_PTR targetMask = availableSystemMask & ~(availableSystemMask - 1);
+
+    // 步驟 C: 將程式綁定到這顆核心
+    if (!RtSetProcessAffinityMask(hCurrentProcess, targetMask))
+    {
+        DEBUG_PRINT("[Error] Failed to set CPU Affinity to Mask 0x%llX. Error: %lu\n", targetMask, GetLastError());
+        return -1;
+    }
+
+    DEBUG_PRINT("[System] Successfully bound process to RTSS Core Mask: 0x%llX\n", targetMask);
+    // ==============================================================
+
+
     std::string configPath = GlobalConfig::GetInstance().BaseDataDir + "SystemConfig.txt";
     GlobalConfig::GetInstance().LoadFromFile(configPath);//讀取系統檔案
   

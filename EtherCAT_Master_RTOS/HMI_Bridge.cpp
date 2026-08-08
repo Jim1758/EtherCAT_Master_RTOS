@@ -26,6 +26,9 @@ namespace HMI_Bridge
         pShm->NC_Status.SHM_EDM_State = static_cast<int32_t>(nc->m_edmState);
        
 
+        pShm->NC_Status.m_isSingleBlockEnabled = nc->m_isSingleBlockEnabled;
+        pShm->NC_Status.m_isOptionalStopEnabled = nc->m_isOptionalStopEnabled;
+        pShm->NC_Status.m_isBlockSkipEnabled = nc->m_isBlockSkipEnabled;
      
 
         // --- 即時座標廣播 ---
@@ -89,6 +92,42 @@ namespace HMI_Bridge
         if (pShm->NC_Command.feedHold) { nc->FeedHold(); pShm->NC_Command.feedHold = false; }
         if (pShm->NC_Command.reset) { nc->Reset(); pShm->NC_Command.reset = false; }
         if (pShm->NC_Command.Close_System) { nc->Close_System_Com_flag = true; pShm->NC_Command.Close_System = false; }
+
+
+        //單步執行切換
+        if (pShm->NC_Command.Set_isSingleBlockEnabled_ON)
+        { 
+            nc->m_isSingleBlockEnabled = true;
+            pShm->NC_Command.Set_isSingleBlockEnabled_ON = false;
+        }
+        if (pShm->NC_Command.Set_isSingleBlockEnabled_OFF)
+        {
+            nc->m_isSingleBlockEnabled = false;
+            pShm->NC_Command.Set_isSingleBlockEnabled_OFF = false;
+        }
+        //選擇性暫停切換
+        if (pShm->NC_Command.Set_isOptionalStopEnabled_ON)
+        {
+            nc->m_isOptionalStopEnabled = true;
+            pShm->NC_Command.Set_isOptionalStopEnabled_ON = false;
+        }
+        if (pShm->NC_Command.Set_isOptionalStopEnabled_OFF)
+        {
+            nc->m_isOptionalStopEnabled = false;
+            pShm->NC_Command.Set_isOptionalStopEnabled_OFF = false;
+        }
+        //選擇性跳躍切換
+        if (pShm->NC_Command.Set_isBlockSkipEnabled_ON)
+        {
+            nc->m_isBlockSkipEnabled = true;
+            pShm->NC_Command.Set_isBlockSkipEnabled_ON = false;
+        }
+        if (pShm->NC_Command.Set_isBlockSkipEnabled_OFF)
+        {
+            nc->m_isBlockSkipEnabled = false;
+            pShm->NC_Command.Set_isBlockSkipEnabled_OFF = false;
+        }
+
 
        
         if (pShm->Coord_Command.reqSwitchWCS)
@@ -409,6 +448,13 @@ namespace HMI_Bridge
                 );
             }
             pShm->PLC_Command.writeByNameReq = false;
+        }
+
+        //重置PLC邏輯檔案
+        if (pShm->PLC_Command.ReloadLogicProgram)
+        {
+            g_PLC->ReloadLogicProgram();//重置PLC邏輯檔案
+            pShm->PLC_Command.ReloadLogicProgram = false;
         }
     }
 

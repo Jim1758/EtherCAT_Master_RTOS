@@ -97,8 +97,23 @@ public:
     void ProcessExecutionEngine();
     void ProcessManualMode(); // 只保留純手動 JOG 的部分
 
+    // 🌟 新增：將 NC 狀態同步給 PLC
+    void SyncNCStateToPLC();
 
 
+    // 🌟 1. 新增：面板操作功能開關 (可由 HMI 或 PLC 同步設定)
+    bool m_isSingleBlockEnabled = false;   // 單步執行
+    bool m_isOptionalStopEnabled = false;  // 選擇性暫停 (M01)
+    bool m_isBlockSkipEnabled = false;     // 選擇性跳躍 (/)
+
+    static bool WaitAndHoldCallback(NCManager* nc);
+    static bool WaitAndClearQueueCallback(NCManager* nc);
+    static bool WaitForCycleStartCallback(NCManager* nc); // 新增：專等 CycleStart 按鈕
+private:
+    // 🌟 新增：統一暫停旗標 (用來標記這行跑完後是否需要停下來)
+    bool m_pauseAfterBlock = false;
+    // 🌟 判斷這行單節是否為「真的會產生機台移動」的指令
+    bool IsRealMotionBlock(const NCBlock& block);
 public:
     uint32_t NC_RunCount;//NC執行迴圈數
     uint32_t API_RunCount;//API執行迴圈數
@@ -124,6 +139,9 @@ public:
         std::vector<std::string> memory;    // 這層副程式的程式碼內容
         int currentPC;                      // 這層目前跑到第幾行
         int returnPC;                       // 執行完 M99 要回傳給上一層的行號
+
+        // 🌟 新增：為了支援 G65/G66/M98 的 L 次數準備
+        int repeatCount = 1;
     };
 
     // 🌟 這是解決錯誤的關鍵：用來儲存最多 8 層的副程式堆疊
@@ -182,4 +200,11 @@ public:
     void UpdateSystemVariables();
 
     int UpdateSystemVariables_initialize_flag = 0;
+
+    // 🌟 G66 模態巨集專用狀態
+    bool m_isG66Active = false; // G66 開關
+    int m_g66P = 0;             // 記住呼叫的副程式名稱 (P)
+    int m_g66L = 1;             // 記住重複次數 (L)
+    NCBlock m_g66Block;         // 記住 G66 當下夾帶的所有變數 (A, B, C...)
+
 };

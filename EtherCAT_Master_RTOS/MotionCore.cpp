@@ -493,6 +493,8 @@ void MotionCore::EmergencyStop(AxisContext& axis)
     if (axis.state == MotionState::MotionState_ERROR ||
         axis.state == MotionState::MotionState_ESTOP) return;
 
+
+
     // 1. 狀態強制切換為 ESTOP
     axis.state = MotionState::MotionState_ESTOP;
 

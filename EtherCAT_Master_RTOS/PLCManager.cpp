@@ -8,15 +8,36 @@
 #include "SHM_Types.h"
 
 
+// ============================================================================
+// 🌟 專為 RTX64 設計的「自動解鎖」防呆機制 (RAII)
+// ============================================================================
+class AutoLockCS {
+public:
+    AutoLockCS(CRITICAL_SECTION* cs) : m_cs(cs) {
+        EnterCriticalSection(m_cs); // 建構時自動上鎖
+    }
+    ~AutoLockCS() {
+        LeaveCriticalSection(m_cs); // 離開範圍時 (包含 return) 自動解鎖
+    }
+private:
+    CRITICAL_SECTION* m_cs;
+};
+
 // 🌟 定義全域指標 (預設為空)
 PLCManager* g_PLC = nullptr;
 
 PLCManager::PLCManager()
 {
+    // 🌟 1. 初始化臨界區段鎖 (RTX64 支援)
+    InitializeCriticalSection(&m_logicCS);
     Init();
 }
 
-PLCManager::~PLCManager() {}
+PLCManager::~PLCManager() 
+{
+    // 🌟 2. 程式關閉時銷毀鎖
+    DeleteCriticalSection(&m_logicCS);
+}
 
 void PLCManager::Init()
 {
@@ -265,6 +286,10 @@ void PLCManager::RunCycle(int delta_ms)
         return;
     }
     PLC_RunCount += 1;
+
+    // 🌟 使用我們自己寫的 AutoLockCS，傳入 m_logicCS 的記憶體位址
+    AutoLockCS lock(&m_logicCS);
+
     // Process all Timers
     for (int i = 0; i < MAX_PLC_T; i++) {
         if (m_T[i].enable) {
@@ -464,6 +489,8 @@ double PLCManager::GetVar(const std::string& name) const {
 
     // 1. 嘗試以自定義變數 (VAR) 名稱查詢
     int32_t hashId = GetStableHashCpp(name);
+    // 🌟 字串查詢時也換成這把鎖
+    AutoLockCS lock(&m_logicCS);
     auto it = m_customVars.find(hashId);
     if (it != m_customVars.end()) {
         const auto& var = it->second;
@@ -493,6 +520,7 @@ void PLCManager::SetVar(const std::string& name, double value) {
 
     // 1. 嘗試以自定義變數 (VAR) 名稱寫入
     int32_t hashId = GetStableHashCpp(name);
+    AutoLockCS lock(&m_logicCS);
     auto it = m_customVars.find(hashId);
     if (it != m_customVars.end()) {
         auto& var = it->second;
@@ -550,4 +578,104 @@ void PLCManager::ExportPLCStatus(SHM_PLC_Status* pStatus) const
         pStatus->T_done[i] = m_T[i].done ? 1 : 0;
         pStatus->T_base[i] = m_T[i].timeBase; // 🌟 補上這行
     }
+}
+
+// ============================================================================
+// 🌟 動態重載 PLC 邏輯程式 (Hot-Reload) - 完整實作版
+// ============================================================================
+bool PLCManager::ReloadLogicProgram()
+{
+    const std::string& filepath = GlobalConfig::GetInstance().PLC_Dir + "logic.bin";
+ 
+
+    // 1. 【非即時端安全區】宣告「暫時的」容器，避免在讀檔時污染運行中的記憶體
+    std::vector<PLCTask> tempTasks;
+    std::unordered_map<int32_t, PLCCustomVar> tempVars;
+
+    // 開始慢慢讀取與解析檔案 (這段可能耗時幾毫秒，但不影響即時運算)
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        //std::cerr << "[PLC Error] 無法開啟要重載的邏輯檔: " << filepath << std::endl;
+        return false;
+    }
+
+    char header[9] = { 0 };
+    file.read(header, 8);
+    if (std::string(header) != "RTOS_PLC") {
+        //std::cerr << "[PLC Error] 無效的 PLC 邏輯檔格式!" << std::endl;
+        return false;
+    }
+
+    while (file.good() && !file.eof()) {
+        uint8_t tag;
+        file.read(reinterpret_cast<char*>(&tag), 1);
+        if (file.eof()) break;
+
+        if (tag == 253) {
+            int32_t varCount;
+            file.read(reinterpret_cast<char*>(&varCount), 4);
+            for (int i = 0; i < varCount; i++) {
+                int32_t hashId; uint8_t dataType;
+                file.read(reinterpret_cast<char*>(&hashId), 4);
+                file.read(reinterpret_cast<char*>(&dataType), 1);
+
+                PLCCustomVar newVar;
+                newVar.dataType = dataType;
+                std::memset(newVar.value.raw, 0, 8);
+                tempVars[hashId] = newVar; // 寫入暫存容器
+            }
+        }
+        else if (tag == 254) {
+            PLCTask newTask;
+            file.read(reinterpret_cast<char*>(&newTask.type), 1);
+            file.read(reinterpret_cast<char*>(&newTask.priority), 1);
+            file.read(reinterpret_cast<char*>(&newTask.cycleTimeMs), 4);
+            newTask.currentTimerMs = newTask.cycleTimeMs;
+
+            while (true) {
+                uint8_t nextByte = file.peek();
+                if (nextByte == 253 || nextByte == 254 || nextByte == 255 || file.eof()) {
+                    break;
+                }
+                PLCInstruction inst;
+                file.read(reinterpret_cast<char*>(&inst), sizeof(PLCInstruction));
+                newTask.instructions.push_back(inst);
+            }
+            tempTasks.push_back(newTask); // 寫入暫存容器
+        }
+        else if (tag == 255) {
+            break;
+        }
+    }
+    file.close();
+
+    // 依照 Task Priority 進行排序
+    std::sort(tempTasks.begin(), tempTasks.end(), [](const PLCTask& a, const PLCTask& b) {
+        return a.priority < b.priority;
+        });
+
+    // =========================================================
+    // 2. 【即時安全交接區】檔案解析完畢，瞬間加鎖並替換記憶體！
+    // =========================================================
+    {
+        // 🌟 瞬間取得鎖 (等待 RunCycle 結束)
+        AutoLockCS lock(&m_logicCS);
+
+        // 使用 std::move 瞬間轉移記憶體所有權 (耗時不到 1 微秒)
+        m_tasks = std::move(tempTasks);
+        m_customVars = std::move(tempVars);
+
+        // 🌟 防呆：重載邏輯時，建議把所有 Timer 歸零！
+        // 避免舊程式計時到一半的 Timer，在換了新程式後突然錯誤觸發
+        for (int i = 0; i < MAX_PLC_T; i++) {
+            m_T[i].enable = false;
+            m_T[i].done = false;
+            m_T[i].acc = 0;
+        }
+
+        // 注意：這裡不清除 I, O, R 等點位，因為機台還在運轉，保持現有的物理狀態最安全
+    }
+
+    std::cout << "[PLC] 成功動態重載邏輯檔案 (Hot-Reload): " << filepath << std::endl;
+    return true;
 }

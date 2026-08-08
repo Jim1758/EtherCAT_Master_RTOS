@@ -4,7 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <algorithm> // 包含演算法標頭檔
-
+#include <windows.h> // 🌟 引入 Windows 標頭檔以支援 CRITICAL_SECTION
 // ==========================================
 // Define PLC Capacity
 // ==========================================
@@ -140,7 +140,14 @@ public:
     // 🌟 新增：DR 斷電保持暫存器的二進位讀取與儲存 API
     bool SaveDRValues(const std::string& filepath);
     bool LoadDRValues(const std::string& filepath);
+
+    // 🌟 新增：動態重載 PLC 邏輯程式的 API
+    bool ReloadLogicProgram();
 private:
+
+    // 🌟 移除 std::mutex，改用 RTX64 支援的臨界區段
+    mutable CRITICAL_SECTION m_logicCS;
+
     // Memory Maps
     uint8_t m_I[MAX_PLC_I];
     uint8_t m_O[MAX_PLC_O];

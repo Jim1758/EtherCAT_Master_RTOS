@@ -210,6 +210,9 @@
     <ClCompile Include="PLCManager.cpp">
       <Filter>Source Files\PLC</Filter>
     </ClCompile>
+    <ClCompile Include="NCManager_PLCSync.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">

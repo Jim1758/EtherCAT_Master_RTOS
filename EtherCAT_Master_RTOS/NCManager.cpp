@@ -104,8 +104,13 @@ bool NCManager::LoadProgram(const std::string& filepath)
 void NCManager::ChangeMode(NCOperationMode newMode)
 {
     // 只有在 IDLE 或 READY 狀態才能切換模式
-    if (m_state == NCState::IDLE || m_state == NCState::READY) {
+    if (m_state == NCState::IDLE || m_state == NCState::READY|| m_state == NCState::P_END) {
         m_mode = newMode;
+    }
+
+    if (m_state == NCState::P_END)
+    {
+        Reset();
     }
 }
 
@@ -113,37 +118,37 @@ void NCManager::ChangeState(NCState newState) {
     m_state = newState;
 }
 
+// ==========================================
+// 🌟 升級版 CycleStart (支援 M30 P_END 乾淨重啟)
+// ==========================================
 void NCManager::CycleStart()
 {
     // 如果目前是 HOLD 狀態，代表我們要「解除暫停」
     if (m_state == NCState::HOLD)
     {
         m_state = NCState::RUN;
-
-        // 🌟 恢復原本的進給倍率 (這裡寫死 1.0 代表 100%，如果有倍率旋鈕可以從 UI 讀取)
-        m_motion.SetGroupFeedrateOverride(1.0);
-
-        //DEBUG_PRINT("[NC] Resuming from Feed Hold!\n");
+        m_motion.SetGroupFeedrateOverride(1.0); // 恢復進給倍率
+        m_pauseAfterBlock = false; // 🌟 核心防護：只要按下啟動，強制清除當前行的暫停要求，消滅雙重卡點！
     }
-    // 如果是正常 READY 狀態，代表我們要「全新啟動」
-    else if (m_state == NCState::READY)
+    // 如果是正常 READY 或 P_END (程式結束)，代表我們要「全新啟動」
+    else if (m_state == NCState::READY || m_state == NCState::P_END)
     {
-        // 如果在 MANUAL 模式按下啟動，豎起自動執行旗標
+        // 🌟 從 P_END 重新啟動，強制行號為 0，洗乾淨狀態
+        if (m_state == NCState::P_END) {
+            GetBasePC() = 0;
+            Reset_Gode();
+            m_macroStack.clear();
+        }
+
         if (m_mode == NCOperationMode::MANUAL && !m_manualMemory.empty()) {
             m_manualAutoRunning = true;
         }
 
-        // =========================================================
-        // 🌟 【新增 API 呼叫】全新啟動前的終極防護！
-        // 不管操作員剛剛手搖到哪裡，啟動瞬間，強制把預讀起點拉回現在位置！
-        // =========================================================
+        m_pauseAfterBlock = false; // 確保乾淨啟動
         m_motion.SyncVirtualEndPosition();
-
-        // 🌟 清理完成後刷新變數
         UpdateSystemVariables();
 
-        m_state = NCState::RUN;
-        //DEBUG_PRINT("[NC] Cycle Start!\n");
+        m_state = NCState::RUN; // 狀態轉為 RUN，正式出發！
     }
 }
 
@@ -168,8 +173,23 @@ void NCManager::Reset()
     m_motion.StopGroup();//滑行停止
     m_motion.ResetPhysicalPC(); // 🌟 按下 Reset，實體行號歸零
     
+    /*
+    if ()
+    {
+        ResetFault
+    }*/
    
-  
+    // 🌟 [新增] 如果有放電跳刀/排渣，必須強制解鎖跳刀狀態機！
+    // m_motion.ResetAllFaults(); // (如果您有寫清除跳刀狀態的 API，建議在這裡呼叫)
+
+    // ==========================================================
+    // 2. 【順序修正】：先洗乾淨大腦的 G 碼與 M 碼！
+    // ==========================================================
+    Reset_Gode();       // 🌟 必須先執行！將 G90, G49, G50, 平面等全部洗回預設值
+
+    // 🌟 [強烈建議新增]：通知 PLC 關閉主軸與切削水 (相當於執行 M05, M09)
+    // PLCManager::GetInstance().SetSpindleStop();
+    // PLCManager::GetInstance().SetCoolantOff();
 
     // 🌟 2. 取得大腦洗乾淨後的 3 大狀態
     int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
@@ -208,8 +228,7 @@ void NCManager::Reset()
    
     m_motion.SetGroupFeedrateOverride(1.0);//進給倍率回到100%
 
-    //重置G碼區塊--------------------------------------------------
-    Reset_Gode();       // 重置G碼相關
+   
    
     // 🌟 清理完成後刷新變數
     UpdateSystemVariables();
@@ -226,6 +245,11 @@ void NCManager::Reset()
     m_mdiPC = 0;
     m_manualPC = 0;
     m_manualAutoRunning = false;
+
+    // 🌟 [新增]：清理我們為了單步與暫停所加的防暴衝旗標
+    m_pauseAfterBlock = false;
+    m_programChanged = false;
+    m_waitCallback = nullptr;
 
 
     std::queue<NCBlock> empty;
@@ -258,25 +282,39 @@ void NCManager::Reset_Gode()       // 重置G碼相關
     CoordSys.CancelMirror(hasAxis,this);//關閉鏡像功能
     CoordSys.CancelPolarCoordinate(this);//關閉極座標
     CoordSys.CancelToolRadiusCompensation(this);//關閉刀徑補償
+
+    m_isG66Active = false; // 🌟 Reset 必須強制取消 G66
 }
 
 // ==========================================
-// 🌟 1. 實作呼叫副程式邏輯 (升級為 8 層架構)
+// 🌟 1. 標準且安全的實作呼叫副程式邏輯
 // ==========================================
 bool NCManager::CallMacro(const std::string& filename) {
-    // 🌟 嘗試推入變數堆疊，如果失敗代表超過 8 層！
+
+    // 🌟 檢查堆疊層數是否超過 8 層
     if (MacroSys.PushCallStack() == false) {
         DEBUG_PRINT("[Alarm] Macro Call Depth Exceeded 8 Layers!\n");
         AlarmManager::GetInstance().Trigger(AlarmManager::MACRO_OVERFLOW);
         m_state = NCState::HOLD;
         return false;
     }
-   
-    std::string fullPath = GlobalConfig::GetInstance().NCMacroProgramDir + filename;
+
+    // 🌟 【路徑自動補斜線】
+    std::string macroDir = GlobalConfig::GetInstance().NCMacroProgramDir;
+    if (!macroDir.empty() && macroDir.back() != '/' && macroDir.back() != '\\') {
+        macroDir += "/";
+    }
+
+    std::string fullPath = macroDir + filename;
+    DEBUG_PRINT("[NC Macro] Attempting to open macro file: %s\n", fullPath.c_str());
+
     std::ifstream file(fullPath);
     if (!file.is_open()) {
         DEBUG_PRINT("[Alarm] Macro File Not Found: %s\n", fullPath.c_str());
         AlarmManager::GetInstance().Trigger(AlarmManager::Macro_File_Not_Found);
+
+        // 檔案找不到時，必須把變數堆疊 Pop 掉，避免記憶體錯亂！
+        MacroSys.PopCallStack();
         m_state = NCState::HOLD;
         return false;
     }
@@ -286,8 +324,9 @@ bool NCManager::CallMacro(const std::string& filename) {
     newFrame.programName = filename;
     newFrame.currentPC = 0;
 
-    // 🌟 關鍵修改：將 m_programPC 換成 GetBasePC()
+    // 紀錄返回的主程式行號 (如果是從主程式呼叫，記住下一行；如果是從副程式呼叫，記住上一層的 PC + 1)
     newFrame.returnPC = m_macroStack.empty() ? (GetBasePC() + 1) : (m_macroStack.back().currentPC + 1);
+    newFrame.repeatCount = 1; // 預設重複 1 次
 
     std::string line;
     while (std::getline(file, line)) {
@@ -295,13 +334,15 @@ bool NCManager::CallMacro(const std::string& filename) {
     }
     file.close();
 
+    DEBUG_PRINT("[NC Macro] Successfully loaded macro: %s, Total Lines: %d, ReturnPC: %d\n",
+        filename.c_str(), (int)newFrame.memory.size(), newFrame.returnPC);
+
     // 🌟 將這層副程式推入堆疊頂端
     m_macroStack.push_back(newFrame);
 
-    m_programChanged = true; // 告訴系統剛切換了程式，不要把舊 PC + 1
+    m_programChanged = true; // 告訴大腦剛切換程式，不要把舊 PC + 1
     return true;
 }
-
 // ==========================================
 // 🌟 2. 實作返回主程式邏輯
 // ==========================================
@@ -309,11 +350,22 @@ void NCManager::ReturnMacro()
 {
     if (m_macroStack.empty()) return;
 
+    // =========================================================
+    // 🌟 【L 重複次數核心】：如果 repeatCount 還大於 1，PC 歸零重跑！
+    // =========================================================
+    if (m_macroStack.back().repeatCount > 1) {
+        m_macroStack.back().repeatCount--;  // 次數減 1
+        m_macroStack.back().currentPC = 0;  // PC 歸零，回到副程式第一行
+        m_programChanged = true;
+        m_waitCallback = WaitAndClearQueueCallback; // 等待馬達清空後再跑下一輪
+        return; // ⚠️ 不彈出堆疊，繼續留在副程式內重跑！
+    }
+
+    // --- 標準返回主程式邏輯 ---
     int retPC = m_macroStack.back().returnPC;
     m_macroStack.pop_back();
     MacroSys.PopCallStack();
 
-    // 🌟 關鍵修改：將 m_programPC 換成 GetBasePC()
     if (m_macroStack.empty()) {
         GetBasePC() = retPC;
     }
@@ -354,6 +406,11 @@ void NCManager::ProcessTask()
     }
   
     // =========================================================
+    // 🌟 4. 【結尾動作】將最新的 NC 狀態刷給 PLC S 點！
+    // =========================================================
+    SyncNCStateToPLC();
+
+    // =========================================================
     // 🌟 1. 【最高優先】每一圈都重新結算並更新機台總合狀態！
     // =========================================================
     m_edmState = GetMachineEDMState();
@@ -372,6 +429,7 @@ void NCManager::ProcessTask()
 
         // 🌟 [關鍵新增]：只要在警報狀態，每一毫秒都強制下達急停！
         // (底層的 EmergencyStop 有防重複機制，所以這樣寫既安全又暴力)
+      
         m_motion.EmergencyStopGroup();
 
         // ⚠️ 立刻退出迴圈，絕對不准往下執行任何軌跡運算或 G 碼解析！
@@ -445,25 +503,28 @@ void NCManager::ProcessTask()
 
 
 // ==========================================
-// 🚀 終極統一執行引擎 (支援所有模式、GOTO、M98)
+// 🚀 終極統一執行引擎 (完美 M30 歸零卡住、M00 單擊解鎖)
 // ==========================================
 void NCManager::ProcessExecutionEngine()
 {
+    // 只有 RUN 狀態才能進來執行
+    if (m_state != NCState::RUN) return;
+
+    // 安全的 PC 控制器
+    auto advancePC = [&]() {
+        if (!m_macroStack.empty()) m_macroStack.back().currentPC++;
+        else GetBasePC()++;
+    };
+
+    auto setPC = [&](int newPC) {
+        if (!m_macroStack.empty()) m_macroStack.back().currentPC = newPC;
+        else GetBasePC() = newPC;
+    };
+
     bool isMacro = !m_macroStack.empty();
-
-    // 🌟 動態綁定：根據目前的模式，抓出對應的底層資料
-    int& basePC = GetBasePC();
-    std::vector<std::string>& baseMemory = GetBaseMemory();
-
-    // 判斷現在是在跑最上層的字串，還是在跑副程式
-
-    int& activePC = isMacro ? m_macroStack.back().currentPC : basePC;
-    std::vector<std::string>& activeMemory = isMacro ? m_macroStack.back().memory : baseMemory;
-
-    // 同步 HMI 雙視窗需要的變數 (MDI/MANUAL 時也能顯示目前的副程式名稱)
     if (isMacro) {
         m_macroProgramName = m_macroStack.back().programName;
-        m_macroProgramPC = activePC;
+        m_macroProgramPC = m_macroStack.back().currentPC;
     }
     else {
         m_macroProgramName = "";
@@ -471,197 +532,167 @@ void NCManager::ProcessExecutionEngine()
     }
 
     // ==========================================================
-    // --- 階段 A：萬用等待條件檢查 (物理卡點) ---
-    // 如果這裡有值(例如遇到 G12 或是 G00)，大腦就會停止預讀，直到馬達走完
+    // --- 階段 A：等待條件檢查與【神級任務接力】 ---
     // ==========================================================
     if (m_waitCallback != nullptr) {
-        if (m_waitCallback(this) == false) return; // 繼續等馬達跑完
+        bool wasWaitingForStart = (m_waitCallback == WaitForCycleStartCallback);
 
-        m_waitCallback = nullptr;
-        if (m_state != NCState::ALARM && m_state != NCState::HOLD) {
-            activePC++; // 解除等待，準備讀下一行
+        if (m_waitCallback(this) == false) return; // 繼續等馬達或按鈕
+
+        m_waitCallback = nullptr; // 任務完成
+
+        // 🌟 如果剛才是在「等按鈕」(Cycle Start)，現在按鈕解開了，
+        // 代表操作員要開始跑這行了，直接 return 進入底下解析派發！
+        if (wasWaitingForStart) {
+            return;
         }
+
+        // 🌟 動作跑完了 (例如 G00 移動到位或 M00 完成)
+        // 1. 先安全推進 PC 到下一行 (讓 UI 畫面精準亮起下一行)
+        if (m_state != NCState::ALARM && m_state != NCState::P_END && !m_programChanged) {
+            advancePC();
+        }
+
+        // 2. 如果這行有暫停要求 (M00/M01 或 單步模式)
+        if (m_pauseAfterBlock && m_state != NCState::ALARM && m_state != NCState::P_END) {
+            m_pauseAfterBlock = false;
+            m_state = NCState::HOLD;                    // 切換為暫停
+            m_waitCallback = WaitForCycleStartCallback; // 掛上「等待 Start 按鈕」
+            return; // 結束本回合，定格在下一行！
+        }
+
+        return; // 防暴衝：本回合結束，下一毫秒才處理下一行
     }
 
-    // ==========================================================
-    // 🌟 預讀閘門：容量限制 (Look-Ahead Buffer Limit)
-    // 如果 MotionCore 的倉庫已經塞了 50 條路徑，大腦這回合就先休息！
-    // ==========================================================
-    if (m_motion.GetQueueSize() >= 50) {
-        return; // 下一個 Tick 再來看看倉庫有沒有空位
-    }
+    // 預讀閘門：容量限制
+    if (m_motion.GetQueueSize() >= 50) return;
 
-    // --- 階段 B & C：讀取與結束判斷 ---
     if (m_waitCallback == nullptr)
     {
-        // 結束判斷
-      // 結束判斷
-        if (activePC >= activeMemory.size())
+        bool currentIsMacro = !m_macroStack.empty();
+        int currentPC = currentIsMacro ? m_macroStack.back().currentPC : GetBasePC();
+        const std::vector<std::string>& currentMemory = currentIsMacro ? m_macroStack.back().memory : GetBaseMemory();
+
+        // ==========================================================
+        // --- 結束判斷 (檔尾到達) ---
+        // ==========================================================
+        if (currentPC >= currentMemory.size())
         {
-            // 🌟 關鍵防線：文字檔雖然讀完了，但馬達停了沒？
-            if (!m_motion.IsGroupDone())
-            {
-                return; // 還沒跑完，下一個 Tick 再來檢查一次！
+            if (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupStandstill()) return;
+
+            if (currentIsMacro) {
+                ReturnMacro(); // 副程式結束，返回主程式
             }
-
-            if (isMacro)
-            {
-                ReturnMacro(); // 副程式結束返回
-            }
-            else
-            {
-                // 最頂層程式結束了，依照模式決定去留
-                if (m_mode == NCOperationMode::MANUAL)
-                {
-                    m_state = NCState::READY;
-                    m_manualAutoRunning = false;
-                }
-                // 🌟 關鍵修改：MDI 跑完後也直接退回 READY，無縫接軌手動 JOG！
-                else if (m_mode == NCOperationMode::MDI)
-                {
-                    m_state = NCState::READY;
-                }
-                else
-                {
-                    // 只有 MEMORY 主程式跑完才會進入 P_END (需按 Reset)
-                    m_state = NCState::P_END;
-                }
-
-                basePC = 0; // 執行完畢指標歸零
-                //DEBUG_PRINT("[NC] Execution Finished.\n");
-
-                //重置G碼區塊--------------------------------------------------
-                Reset_Gode();// 重置G碼相關
-
-                // =========================================================
-                // 🌟 【新增】程式結束、G 碼重置後，立刻刷新一次系統變數！
-                // 確保下一支程式或操作員看到的都是最乾淨的初始狀態。
-                // =========================================================
+            else {
+                // 🌟 主程式結束：行號歸 0，設定 P_END，徹底卡住！
+                m_macroStack.clear();
+                GetBasePC() = 0;
+                Reset_Gode();
                 UpdateSystemVariables();
+                m_state = NCState::P_END;
             }
             return;
         }
 
-        std::string rawLine = activeMemory[activePC];
+        m_programChanged = false;
+        m_pauseAfterBlock = false;
+        std::string rawLine = currentMemory[currentPC];
+
         NCBlock block = Parser.ParseLine(rawLine);
 
-        if (!block.isEmpty)
+        // 選擇性跳躍 (Block Skip '/')
+        if (block.isBlockSkip && m_isBlockSkipEnabled) {
+            // 直接略過
+        }
+        else
         {
             if (block.isGoto)
             {
-                // 🌟 GOTO 跳躍邏輯 (完全相容所有模式)
                 int targetN = block.gotoTarget;
                 bool found = false;
-
-                for (int i = 0; i < (int)activeMemory.size(); i++) {
-                    if (activeMemory[i].find('N') != std::string::npos || activeMemory[i].find('n') != std::string::npos) {
-                        NCBlock checkBlock = Parser.ParseLine(activeMemory[i]);
+                for (int i = 0; i < (int)currentMemory.size(); i++) {
+                    if (currentMemory[i].find('N') != std::string::npos || currentMemory[i].find('n') != std::string::npos) {
+                        NCBlock checkBlock = Parser.ParseLine(currentMemory[i]);
                         if (checkBlock.has('N') && (int)checkBlock.val('N') == targetN) {
-                            activePC = i;
+                            setPC(i);
                             found = true;
                             break;
                         }
                     }
                 }
-
                 if (!found) {
-                    DEBUG_PRINT("[Alarm] GOTO target N%d not found!\n", targetN);
                     AlarmManager::GetInstance().Trigger(AlarmManager::SYNTAX_ERROR);
                     m_state = NCState::ALARM;
                     return;
                 }
+                m_programChanged = true;
+                if (m_isSingleBlockEnabled) m_pauseAfterBlock = true;
             }
-            else {
-                // ==========================================================
-                  // 🌟 【神級預讀屏障 (Look-Ahead Barrier)】
-                  // 這些 G 碼必須在「機台完全靜止、且底層倉庫為空」時才能下達！
-                  // ==========================================================
-                bool isBarrier = 
-                    (
-                        block.gCode == 0 || block.gCode == 12 ||
-                        block.gCode == 4 ||
-                        block.gCode == 7 ||
-                        block.gCode == 28 || block.gCode == 30||
-                        block.gCode == 32 ||
-                        block.gCode == 53 || block.gCode == 161||
-                        block.gCode == 65 ||
-                        block.gCode == 92 ||   
-                        ((block.gCode >= 54 && block.gCode <= 59))||
-                        ((block.gCode >= 154 && block.gCode <= 159)) ||
-                        ((block.gCode >= 254 && block.gCode <= 259)) ||
-                        ((block.gCode >= 354 && block.gCode <= 359)) ||
-                        ((block.gCode >= 454 && block.gCode <= 459)) ||
-                        ((block.gCode >= 554 && block.gCode <= 559)) ||
-                        ((block.gCode >= 654 && block.gCode <= 659)) ||
-                        ((block.gCode >= 754 && block.gCode <= 759)) ||
-                        ((block.gCode >= 854 && block.gCode <= 859)) ||
-                        ((block.gCode >= 954 && block.gCode <= 959)) 
-                    );
-             
-                if (block.gCode == 0 )//G00 P1模式為可預讀路徑
-                {
-                    // 🌟 正確寫法：確保真的有 P，而且值是 1.0
-                    if (block.has('P') && block.val('P') == 1)
-                    {
-                        isBarrier = false;
-                    }
-                  
+            else
+            {
+                bool isBarrier = false;
+                if (block.mCount > 0) {
+                    int m = block.mCode[0];
+                    if (m == 98 || m == 99 || m == 0 || m == 1 || m == 2 || m == 30) isBarrier = true;
                 }
 
-                
-                // 如果這行是 G00/G28/G30，且底層還在跑 (倉庫有東西，或馬達還沒到位)
-                if (isBarrier && (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupDone())) {
-                    // 大腦立刻罷工！
-                    // 不執行 ExecuteBlock，也不把 activePC++，
-                    // 等下一毫秒再回來問：「馬達停了沒？」直到完全靜止才放行！
+                isBarrier = isBarrier || (block.hasG && (
+                    block.gCode == 0 || block.gCode == 12 || block.gCode == 4 ||
+                    block.gCode == 7 || block.gCode == 28 || block.gCode == 30 ||
+                    block.gCode == 32 || block.gCode == 53 || block.gCode == 161 ||
+                    block.gCode == 65 || block.gCode == 66 || block.gCode == 67 || block.gCode == 92 ||
+                    (block.gCode >= 54 && block.gCode <= 59) ||
+                    (block.gCode >= 154 && block.gCode <= 159) ||
+                    (block.gCode >= 254 && block.gCode <= 259) ||
+                    (block.gCode >= 354 && block.gCode <= 359) ||
+                    (block.gCode >= 454 && block.gCode <= 459) ||
+                    (block.gCode >= 554 && block.gCode <= 559) ||
+                    (block.gCode >= 654 && block.gCode <= 659) ||
+                    (block.gCode >= 754 && block.gCode <= 759) ||
+                    (block.gCode >= 854 && block.gCode <= 859) ||
+                    (block.gCode >= 954 && block.gCode <= 959)
+                    ));
+
+                if (block.hasG && block.gCode == 0 && block.has('P') && block.val('P') == 1) {
+                    isBarrier = false;
+                }
+
+                if (m_isSingleBlockEnabled && (block.hasG || block.mCount > 0 || block.has('X') || block.has('Y') || block.has('Z'))) {
+                    isBarrier = true;
+                }
+
+                if (isBarrier && (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupStandstill())) {
                     return;
                 }
 
-                // 只有在機台完全靜止時，G00 才會走到這裡被執行！
-                m_programChanged = false;
+                bool wasMainProgram = m_macroStack.empty();
 
-
-              
-            
-
-                // 🌟 【貼標籤】：大腦瞬間讀取自己當下的狀態
-                int currentBrainWCS = CoordSys.GetCurrentWCSGCode();  // 🌟 【貼標籤】：把大腦當下的「行號」和「座標系」印成標籤！
-                int currentBrainToolMode = CoordSys.toolLengthMode; // 從 CoordSys 讀取
-                int currentBrainHCode = CoordSys.currentHCode;      // 從 CoordSys 讀取
-                int curTRad = CoordSys.toolRadiusMode; // 🌟 刀徑
-                int curD = CoordSys.currentDCode;      // 🌟 D碼
-                // 🌟 直接讀取你原本就寫好的 CoordSys.isAbsoluteMode
+                // 貼標籤邏輯
+                int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
+                int currentBrainToolMode = CoordSys.toolLengthMode;
+                int currentBrainHCode = CoordSys.currentHCode;
+                int curTRad = CoordSys.toolRadiusMode;
+                int curD = CoordSys.currentDCode;
                 bool curIsAbs = CoordSys.isAbsoluteMode;
-                // 🌟 讀取大腦的 G68 狀態 (假設你在 CoordSys 有這個變數)
                 bool curG68 = CoordSys.isG68Active;
-                double curG68Angle = CoordSys.g68Angle; // 讀取你存的 R 參數角度
-
-                bool curG168 = CoordSys.isWorkpieceRotationActive; // 讀取你原本寫好的狀態
-                int curWCode = CoordSys.currentWCode; // 讀取你存的 W 碼
-                // 🌟 讀取大腦的 G51 狀態 (假設你在 CoordSys 有這兩個變數)
+                double curG68Angle = CoordSys.g68Angle;
+                bool curG168 = CoordSys.isWorkpieceRotationActive;
+                int curWCode = CoordSys.currentWCode;
                 bool curG51 = CoordSys.isScalingActive;
                 double curScale = CoordSys.scaleFactor;
-
-                // 🌟 讀取大腦的鏡像狀態，並打包成一個 byte (Bitmask)
                 uint8_t curMirrorMask = 0;
                 for (int i = 0; i < 8; i++) {
-                    if (CoordSys.isMirrorActive[i]) {
-                        curMirrorMask |= (1 << i); // 如果這軸有鏡像，就把對應的 bit 設為 1
-                    }
+                    if (CoordSys.isMirrorActive[i]) curMirrorMask |= (1 << i);
                 }
-
-                // 🌟 讀取大腦的極座標狀態 (你原本應該就有這個變數)
                 bool curG16 = CoordSys.isPolarCoordinateActive;
-
-                // 🌟 讀取大腦的狀態 (變數名稱請對應你的 CoordSys)
                 bool curG162 = CoordSys.isCAxisOffsetRotationEnabled;
-                int curPlane = CoordSys.activePlane; // 17, 18 或是 19
+                int curPlane = CoordSys.activePlane;
 
-                // 🌟 印出標籤並貼到標籤機上
-                m_motion.SetNextCommandState(activePC, currentBrainWCS, currentBrainToolMode, currentBrainHCode, curTRad, curD, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+                m_motion.SetNextCommandState(currentPC, currentBrainWCS, currentBrainToolMode, currentBrainHCode, curTRad, curD, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
 
-
-                ExecuteBlock(block); // 執行 G 碼
+                if (!block.isEmpty) {
+                    ExecuteBlock(block);
+                }
 
                 if (AlarmManager::GetInstance().HasAlarm()) {
                     m_state = NCState::ALARM;
@@ -669,21 +700,88 @@ void NCManager::ProcessExecutionEngine()
                     return;
                 }
 
-                if (m_waitCallback == nullptr && !m_programChanged) {
-                    activePC++;
+                // ==========================================================
+                 // 🌟 【國際標準】：G66 模態巨集自動攔截網 
+                 // ==========================================================
+                if (m_isG66Active && block.gCode != 66 && block.gCode != 67)
+                {
+                    // 🌟 一句話呼叫過濾器，取代原本又臭又長的判斷式！
+                    bool isRealMotion = IsRealMotionBlock(block);
+
+                    // 【防無限遞迴護城河】：必須確保目前在大腦的主程式層級
+                    if (isRealMotion && m_macroStack.empty())
+                    {
+                        std::string macroFile = "O" + std::to_string(m_g66P) + ".nc";
+
+                        if (CallMacro(macroFile))
+                        {
+                            // 設定 L 重複次數
+                            m_macroStack.back().repeatCount = m_g66L;
+
+                            // 傳遞區域變數
+                            for (int i = 0; i < 26; i++) {
+                                char c = 'A' + i;
+                                if (c != 'P' && c != 'G' && c != 'L' && m_g66Block.has(c)) {
+                                    MacroSys.SetVar('#', i + 1, m_g66Block.val(c));
+                                }
+                            }
+                        }
+                    }
                 }
 
-                if (m_state == NCState::HOLD) {
-                    return;
+                // 🌟 M 碼暫停與結束旗標設定
+                if (block.mCount > 0) {
+                    int m = block.mCode[0];
+                    if (m == 99 && wasMainProgram) {
+                        GetBasePC() = 0;
+                        m_programChanged = true;
+                    }
+                    // 🌟 【關鍵修正】：移除了 m == 0！
+                    // M00 已經由底層 PLC 完美暫停了，大腦不需要再多管閒事掛上第二道鎖！
+                    else if (m == 1 && m_isOptionalStopEnabled) {
+                        m_pauseAfterBlock = true; // 只有 M01 是大腦自己攔截
+                    }
+                    else if (m == 2 || m == 30) {
+                        // 🌟 M02/M30：主程式結束！直接行號歸 0，切換 P_END 並立刻 return 斬斷！
+                        m_macroStack.clear();
+                        GetBasePC() = 0;
+                        Reset_Gode();
+                        UpdateSystemVariables();
+
+                        // 🌟 依據模式決定去留
+                        if (m_mode == NCOperationMode::MANUAL) {
+                            m_manualAutoRunning = false;
+                            m_state = NCState::READY; // 手動巨集結束，回到 READY
+                        }
+                        else if (m_mode == NCOperationMode::MDI) {
+                            m_state = NCState::READY; // MDI 結束，回到 READY
+                        }
+                        else {
+                            m_state = NCState::P_END; // 主程式結束，才卡在 P_END
+                        }
+                        return; // 斬斷本回合！
+                    }
                 }
             }
         }
-        else {
-            activePC++; // 空行跳過
+
+        // 單步模式，要求這行跑完後暫停
+        if (m_isSingleBlockEnabled && m_state != NCState::P_END) {
+            m_pauseAfterBlock = true;
+        }
+
+        // 🌟 派發後收網處理
+        if (m_waitCallback == nullptr) {
+            if (m_pauseAfterBlock || m_programChanged) {
+                // 掛上等待馬達清空的 Callback，下一毫秒就會回到階段 A 放行並定格
+                m_waitCallback = WaitAndClearQueueCallback;
+            }
+            else {
+                advancePC(); // 沒事，直接推進下一行
+            }
         }
     }
 }
-
 
 // ==========================================
 // 🌟 MANUAL 模式專屬邏輯 (自動指令優先，JOG 墊後)
@@ -831,12 +929,13 @@ void NCManager::ExecuteBlock(const NCBlock& block)
         case 90: case 91:case 92:
         case 43: case 44: case 49:
         case 17: case 18:case 19:
-        case 65: // 
+        case 65:  case 66: case 67:
         case 162: case 163:
         
             // 狀態設定回傳的一定是 nullptr (不需等待)
             m_waitCallback = GCodeHandlers::Handle_GCode(block, this);
             break;
+    
         case 168:
             m_waitCallback = GCodeHandlers::Handle_G168(block, this);
                 break;
@@ -1169,4 +1268,58 @@ EDMState NCManager::GetMachineEDMState()
     default:
         return EDMState::NOT_READY;
     }
+}
+
+
+
+// 1. 等待馬達靜止
+bool NCManager::WaitAndHoldCallback(NCManager* nc) {
+    if (nc->m_motion.GetQueueSize() > 0 || !nc->m_motion.IsGroupStandstill()) return false;
+    return true;
+}
+
+// 2. 🌟 專門等待操作員按下 Cycle Start 的卡點
+bool NCManager::WaitForCycleStartCallback(NCManager* nc) {
+    if (nc->m_state == NCState::RUN) {
+        return true; // 操作員按下 Start 了！解除卡點！
+    }
+    return false; // 還沒按，繼續乖乖卡住
+}
+
+// 3. 只等待馬達靜止 (清空預讀)
+bool NCManager::WaitAndClearQueueCallback(NCManager* nc) {
+    if (nc->m_motion.GetQueueSize() > 0 || !nc->m_motion.IsGroupStandstill()) return false;
+    return true;
+}
+// ==========================================================
+// 🌟 G 碼屬性過濾器：判斷是否為真實的移動指令
+// ==========================================================
+bool NCManager::IsRealMotionBlock(const NCBlock& block)
+{
+    // 1. 如果根本沒有座標字元，絕對不可能是移動
+    if (!block.has('X') && !block.has('Y') && !block.has('Z')) {
+        return false;
+    }
+
+    // 2. 如果單節裡面有明確的 G 碼，我們來過濾「非移動」的特例
+    if (block.hasG) {
+        switch (block.gCode) {
+        case 4:   // G04 暫留 (X 代表時間)
+        case 10:  // G10 參數寫入 (X 代表寫入數值)
+        case 50:
+        case 51:  // G51 縮放 (X 代表縮放中心)
+        case 52:  // G52 局部座標系設定 (X 代表偏移量)
+        case 68:
+        case 69:  // G68 座標旋轉 (X 代表旋轉中心)
+        case 92:  // G92 座標設定 (X 代表指定座標)
+        case 65:
+        case 66:
+        case 67:  // 巨集呼叫本身
+            return false; // 🛑 這些是「帶有座標參數但不會移動」的 G 碼，攔截！
+        }
+    }
+
+    // 3. 排除上面的例外後，只要帶有 XYZ，我們就視為真正的移動指令！
+    // (例如 G00, G01, 或是單純只有 X10. 的模態移動)
+    return true;
 }

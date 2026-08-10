@@ -15,6 +15,7 @@ constexpr int MAX_PLC_S = 4000;
 constexpr int MAX_PLC_C = 4000;
 constexpr int MAX_PLC_T = 1000;
 constexpr int MAX_PLC_CNT = 1000; // V7.4.6 dedicated Counter Device: CNT0..CNT999
+constexpr int MAX_PLC_FLOW_ROWS = 4096; // V7.4.9.1 runtime-only Ladder flow rows
 constexpr int MAX_PLC_R = 1000;
 constexpr int MAX_PLC_DR = 1000;
 constexpr int MAX_PLC_F = 1000;  // REAL (Float)
@@ -107,6 +108,10 @@ struct PLCTask {
     // Used by OUT_UP / OUT_DOWN, CTU / CTD, and V7.4.9 R_TRIG / F_TRIG.
     // 不寫入 logic.bin，因此不改變既有 Binary Protocol。
     std::vector<uint8_t> edgeMemory;
+
+    // V7.4.9.1 True Ladder Logic Core: runtime-only power state for Ladder rows.
+    // Not serialized into logic.bin; hidden FLOW opcodes initialize/update it every scan.
+    std::vector<uint8_t> flowRows;
 };
 
 // ==========================================

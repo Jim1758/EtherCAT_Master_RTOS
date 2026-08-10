@@ -153,6 +153,7 @@ bool PLCManager::LoadLogicProgram(const std::string& filepath)
                 newTask.instructions.push_back(inst);
             }
             newTask.edgeMemory.assign(newTask.instructions.size(), 0);
+            newTask.flowRows.assign(MAX_PLC_FLOW_ROWS, 0); // allocate outside real-time scan
             m_tasks.push_back(newTask);
             std::cout << "[PLC] Successfully loaded Task, containing " << newTask.instructions.size() << " instructions.\n";
         }
@@ -442,6 +443,14 @@ void PLCManager::ExecuteTask(PLCTask& task)
         task.edgeMemory.assign(task.instructions.size(), 0);
     }
 
+    // V7.4.9.1 True Ladder Logic Core.
+    // flowRows is runtime-only and grows only to the row indices emitted by Studio.
+    auto ensureFlowRow = [&](int row) -> bool {
+        // No heap allocation is allowed here: flowRows is allocated during Load/Reload.
+        if (row < 0 || row >= MAX_PLC_FLOW_ROWS) return false;
+        return task.flowRows.size() == static_cast<size_t>(MAX_PLC_FLOW_ROWS);
+    };
+
     for (size_t instIndex = 0; instIndex < task.instructions.size(); ++instIndex)
     {
         const auto& inst = task.instructions[instIndex];
@@ -714,6 +723,68 @@ void PLCManager::ExecuteTask(PLCTask& task)
             const bool current = ACC;
             ACC = !current && previous;
             task.edgeMemory[instIndex] = current ? 1 : 0;
+            break;
+        }
+
+        // =========================================================
+        // V7.4.9.1 True Ladder Logic Core - internal FLOW opcodes
+        // 72..79 are compiler-internal; they are not user PLC instructions.
+        // =========================================================
+        case 72: // FLOW_ROW_TRUE  op1=#row
+        {
+            const int row = GetOperandAsInt(inst.op1);
+            if (ensureFlowRow(row)) task.flowRows[row] = 1;
+            break;
+        }
+
+        case 73: // FLOW_ROW_FALSE op1=#row
+        {
+            const int row = GetOperandAsInt(inst.op1);
+            if (ensureFlowRow(row)) task.flowRows[row] = 0;
+            break;
+        }
+
+        case 74: // FLOW_AND op1=BOOL operand, op2=#row
+        {
+            const int row = GetOperandAsInt(inst.op2);
+            if (ensureFlowRow(row))
+                task.flowRows[row] = (task.flowRows[row] != 0 && GetOperandAsBool(inst.op1)) ? 1 : 0;
+            break;
+        }
+
+        case 75: // FLOW_AND_NOT op1=BOOL operand, op2=#row
+        {
+            const int row = GetOperandAsInt(inst.op2);
+            if (ensureFlowRow(row))
+                task.flowRows[row] = (task.flowRows[row] != 0 && !GetOperandAsBool(inst.op1)) ? 1 : 0;
+            break;
+        }
+
+        case 76: // FLOW_LOAD_ROW op1=#row
+        {
+            const int row = GetOperandAsInt(inst.op1);
+            ACC = ensureFlowRow(row) ? (task.flowRows[row] != 0) : false;
+            break;
+        }
+
+        case 77: // FLOW_OR_ROW op1=#row
+        {
+            const int row = GetOperandAsInt(inst.op1);
+            if (ensureFlowRow(row)) ACC = ACC || (task.flowRows[row] != 0);
+            break;
+        }
+
+        case 78: // FLOW_STORE_ROW op1=#row
+        {
+            const int row = GetOperandAsInt(inst.op1);
+            if (ensureFlowRow(row)) task.flowRows[row] = ACC ? 1 : 0;
+            break;
+        }
+
+        case 79: // FLOW_AND_ACC op1=#row: gate current ACC by incoming row power
+        {
+            const int row = GetOperandAsInt(inst.op1);
+            ACC = ensureFlowRow(row) ? (ACC && task.flowRows[row] != 0) : false;
             break;
         }
 
@@ -1056,6 +1127,7 @@ bool PLCManager::ReloadLogicProgram()
                 newTask.instructions.push_back(inst);
             }
             newTask.edgeMemory.assign(newTask.instructions.size(), 0);
+            newTask.flowRows.assign(MAX_PLC_FLOW_ROWS, 0); // allocate outside real-time scan
             tempTasks.push_back(newTask); // 寫入暫存容器
         }
         else if (tag == 255) {

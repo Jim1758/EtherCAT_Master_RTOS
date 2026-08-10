@@ -11,6 +11,10 @@
 // 🌟 注意這裡：只要掛上 NCManager::，它就還是 NCManager 的一部分！
 void NCManager::UpdateSystemVariables()
 {
+   
+    // 🌟 新增：取得目前的顯示單位倍率 (公制=1.0, 英制=1/25.4)
+    double unitScale = CoordSys.isInchMode ? (1.0 / 25.4) : 1.0;
+
     // =========================================================
     // 1. 軸啟用狀態 ($30 ~ $37)
     // =========================================================
@@ -40,8 +44,8 @@ void NCManager::UpdateSystemVariables()
     CoordSys.GetCommandedWCS(cmdWCS); // 取得包含所有補償後的純理論 WCS
 
     for (int i = 0; i < 8; i++) {
-        MacroSys.SetVar('$', 100 + i, cmdWCS[i]);                 // $100~$107
-        MacroSys.SetVar('$', 110 + i, CoordSys.commandedMCS[i]);  // $110~$117
+        MacroSys.SetVar('$', 100 + i, cmdWCS[i] * unitScale);         // $100~$107
+        MacroSys.SetVar('$', 110 + i, CoordSys.commandedMCS[i] * unitScale);  // $110~$117
     }
 
     // =========================================================
@@ -52,7 +56,8 @@ void NCManager::UpdateSystemVariables()
         double rawWCS = CoordSys.commandedMCS[i]
             - CoordSys.extOffset[i]
             - CoordSys.m_WCSTable[CoordSys.currentWCSIndex][i];
-        MacroSys.SetVar('$', 120 + i, rawWCS);
+        // 🌟 修改：乘上 unitScale
+        MacroSys.SetVar('$', 120 + i, rawWCS * unitScale);
     }
 
     // =========================================================
@@ -61,17 +66,17 @@ void NCManager::UpdateSystemVariables()
     double cAngleMCS = CoordSys.commandedMCS[CoordSys.C_AXIS_INDEX];
     for (int i = 0; i < 8; i++) {
         double activeToolLen = CoordSys.GetActiveToolOffset(i, cAngleMCS);
-        MacroSys.SetVar('$', 130 + i, activeToolLen);
+        MacroSys.SetVar('$', 130 + i, activeToolLen * unitScale);
     }
     double activeToolRad = CoordSys.GetActiveToolRadius();
-    MacroSys.SetVar('$', 138, activeToolRad);
+    MacroSys.SetVar('$', 138, activeToolRad * unitScale); // 🌟 修改
 
     // =========================================================
     // 6. G68 旋轉參數 ($150 ~ $153)
     // =========================================================
-    MacroSys.SetVar('$', 150, CoordSys.g68CenterWCS[0]);
-    MacroSys.SetVar('$', 151, CoordSys.g68CenterWCS[1]);
-    MacroSys.SetVar('$', 152, CoordSys.g68CenterWCS[2]);
+    MacroSys.SetVar('$', 150, CoordSys.g68CenterWCS[0] * unitScale);
+    MacroSys.SetVar('$', 151, CoordSys.g68CenterWCS[1] * unitScale);
+    MacroSys.SetVar('$', 152, CoordSys.g68CenterWCS[2] * unitScale);
     MacroSys.SetVar('$', 153, CoordSys.isG68Active ? CoordSys.g68Angle : 0.0);
 
     // =========================================================

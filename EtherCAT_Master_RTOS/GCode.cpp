@@ -82,6 +82,12 @@ namespace GCodeHandlers
         }
         break;
 
+        case 20:  case 21:  
+        {
+            nc->CoordSys.SetUnitMode(block.gCode, nc);
+        }
+        break;
+
         case 43:
         case 44:
         case 49:

@@ -96,7 +96,7 @@ bool NCManager::LoadProgram(const std::string& filepath)
     }
     file.close();
 
-    DEBUG_PRINT("[NC] Program Loaded, Lines: %d\n", (int)m_programMemory.size());
+    //DEBUG_PRINT("[NC] Program Loaded, Lines: %d\n", (int)m_programMemory.size());
     m_state = NCState::READY;
     return true;
 }
@@ -293,7 +293,7 @@ bool NCManager::CallMacro(const std::string& filename) {
 
     // 🌟 檢查堆疊層數是否超過 8 層
     if (MacroSys.PushCallStack() == false) {
-        DEBUG_PRINT("[Alarm] Macro Call Depth Exceeded 8 Layers!\n");
+        //DEBUG_PRINT("[Alarm] Macro Call Depth Exceeded 8 Layers!\n");
         AlarmManager::GetInstance().Trigger(AlarmManager::MACRO_OVERFLOW);
         m_state = NCState::HOLD;
         return false;
@@ -306,11 +306,11 @@ bool NCManager::CallMacro(const std::string& filename) {
     }
 
     std::string fullPath = macroDir + filename;
-    DEBUG_PRINT("[NC Macro] Attempting to open macro file: %s\n", fullPath.c_str());
+   // DEBUG_PRINT("[NC Macro] Attempting to open macro file: %s\n", fullPath.c_str());
 
     std::ifstream file(fullPath);
     if (!file.is_open()) {
-        DEBUG_PRINT("[Alarm] Macro File Not Found: %s\n", fullPath.c_str());
+        //DEBUG_PRINT("[Alarm] Macro File Not Found: %s\n", fullPath.c_str());
         AlarmManager::GetInstance().Trigger(AlarmManager::Macro_File_Not_Found);
 
         // 檔案找不到時，必須把變數堆疊 Pop 掉，避免記憶體錯亂！
@@ -334,8 +334,7 @@ bool NCManager::CallMacro(const std::string& filename) {
     }
     file.close();
 
-    DEBUG_PRINT("[NC Macro] Successfully loaded macro: %s, Total Lines: %d, ReturnPC: %d\n",
-        filename.c_str(), (int)newFrame.memory.size(), newFrame.returnPC);
+    //DEBUG_PRINT("[NC Macro] Successfully loaded macro: %s, Total Lines: %d, ReturnPC: %d\n",filename.c_str(), (int)newFrame.memory.size(), newFrame.returnPC);
 
     // 🌟 將這層副程式推入堆疊頂端
     m_macroStack.push_back(newFrame);
@@ -388,7 +387,7 @@ static bool CheckMCodeDone(NCManager* nc) {
     int ticks = nc->GetSimulatedTicks() - 1;
     nc->SetSimulatedTicks(ticks);
     if (ticks > 0) {
-        DEBUG_PRINT("    -> [Waiting] IO processing M codes... Ticks left: %d\n", ticks);
+        //DEBUG_PRINT("    -> [Waiting] IO processing M codes... Ticks left: %d\n", ticks);
         return false;
     }
     return true;
@@ -565,7 +564,10 @@ void NCManager::ProcessExecutionEngine()
     }
 
     // 預讀閘門：容量限制
-    if (m_motion.GetQueueSize() >= 50) return;
+    if (m_motion.GetQueueSize() >= 50)
+    {
+        return;
+    }
 
     if (m_waitCallback == nullptr)
     {
@@ -638,7 +640,9 @@ void NCManager::ProcessExecutionEngine()
 
                 isBarrier = isBarrier || (block.hasG && (
                     block.gCode == 0 || block.gCode == 12 || block.gCode == 4 ||
-                    block.gCode == 7 || block.gCode == 28 || block.gCode == 30 ||
+                    block.gCode == 7 || 
+                    block.gCode == 20 || block.gCode == 21 ||
+                    block.gCode == 28 || block.gCode == 30 ||
                     block.gCode == 32 || block.gCode == 53 || block.gCode == 161 ||
                     block.gCode == 65 || block.gCode == 66 || block.gCode == 67 || block.gCode == 92 ||
                     (block.gCode >= 54 && block.gCode <= 59) ||
@@ -827,7 +831,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
     // ==========================================
     if (block.gCount > 1) 
     {
-        DEBUG_PRINT("[Alarm] Multiple G-Codes in a single block! Found: %d\n", block.gCount);
+        //DEBUG_PRINT("[Alarm] Multiple G-Codes in a single block! Found: %d\n", block.gCount);
         AlarmManager::GetInstance().Trigger(AlarmManager::G_code_Count_Error);
         m_state = NCState::HOLD;
         return; // 直接中止
@@ -837,7 +841,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
     // 🌟 安全性檢查 2：單節是否包含多個 M 碼
     // ==========================================
     if (block.mCount > 1) {
-        DEBUG_PRINT("[Alarm] Multiple M-Codes in a single block! Found: %d\n", block.mCount);
+        //DEBUG_PRINT("[Alarm] Multiple M-Codes in a single block! Found: %d\n", block.mCount);
 
         // 建議未來可以在 AlarmManager 新增一個 M_CODE_CONFLICT 警報
         // 目前先借用 SYNTAX_ERROR
@@ -927,6 +931,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
             m_waitCallback = GCodeHandlers::Handle_G69(block, this);
             break;
         case 90: case 91:case 92:
+        case 20: case 21:
         case 43: case 44: case 49:
         case 17: case 18:case 19:
         case 65:  case 66: case 67:
@@ -972,7 +977,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
 
         default:
             // 🌟 關鍵修改：不支援的 G 碼，立刻觸發警報並鎖機！
-            DEBUG_PRINT("[Alarm] Unsupported G-Code: G%02d\n", block.gCode);
+            //DEBUG_PRINT("[Alarm] Unsupported G-Code: G%02d\n", block.gCode);
             AlarmManager::GetInstance().Trigger(AlarmManager::Unable_to_recognize_G_code);
             m_state = NCState::HOLD;
             break;
@@ -1087,7 +1092,7 @@ bool NCManager::LoadMDI(const std::string& mdiContent)
         }
         // 使用我們在 .h 檔設定的常數來限制
         if (lineCount >= MAX_MDI_LINES) {
-            DEBUG_PRINT("[NC Warning] MDI Input truncated to %zu lines.\n", MAX_MDI_LINES);
+            //DEBUG_PRINT("[NC Warning] MDI Input truncated to %zu lines.\n", MAX_MDI_LINES);
             break;
         }
     }
@@ -1101,7 +1106,7 @@ bool NCManager::LoadManualAuto(const std::string& manualContent)
 {
     // 使用我們在 .h 檔設定的常數來檢查 (1024KB)
     if (manualContent.length() > MAX_MANUAL_AUTO_BYTES) {
-        DEBUG_PRINT("[Alarm] Manual Auto string exceeds %zu bytes limit!\n", MAX_MANUAL_AUTO_BYTES);
+        //DEBUG_PRINT("[Alarm] Manual Auto string exceeds %zu bytes limit!\n", MAX_MANUAL_AUTO_BYTES);
         return false;
     }
 
@@ -1139,7 +1144,7 @@ bool NCManager::LoadDynamicCode(const std::string& content)
         m_manualAutoRunning = false; // 載入時先關閉自動執行
     }
     else {
-        DEBUG_PRINT("[NC Warning] Cannot load dynamic code in current OP mode!\n");
+        //DEBUG_PRINT("[NC Warning] Cannot load dynamic code in current OP mode!\n");
         return false; // 只有在 MDI 和 MANUAL 模式下才允許載入
     }
 
@@ -1191,7 +1196,7 @@ bool NCManager::LoadDynamicCode(const std::string& content)
         }
     }
 
-    DEBUG_PRINT("[NC] Dynamic Code Loaded, Lines: %d\n", (int)targetMemory->size());
+    //DEBUG_PRINT("[NC] Dynamic Code Loaded, Lines: %d\n", (int)targetMemory->size());
     return !targetMemory->empty();
 }
 

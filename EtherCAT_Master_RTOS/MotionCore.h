@@ -57,7 +57,7 @@ struct PidConfig// PID 參數與保護設定
     double Kp = 0.0;           // 比例增益 (剛性)
     double Ki = 0.0;           // 積分增益 (消除靜差)
     double Kd = 0.0;           // 微分增益 (阻尼，通常 CSV 設 0)
-
+    double Kvff = 1.0;              // 🌟 [新增] 速度前饋增益 (預設 1.0 = 100%)
     // 限制保護
     bool EnableLagCheck = true; //是否啟用跟隨誤差(Lag)跳機保護
     double MaxIntegral = 0.0;  // 積分上限 (抗飽和)
@@ -157,7 +157,7 @@ struct AxisContext//軸參數與狀態
 
     double feedrateOverride = 1.00; // 進給倍率控制 (預設 1.0 = 100%)
 
-
+  
 
     //即時動態座標-------------------------------------------------
     double planningPos;// 虛擬大腦的理想位置 (未經 S-Curve 濾波的粗糙折線)
@@ -262,8 +262,7 @@ struct AxisContext//軸參數與狀態
     // 🌟 新增：用來給預讀引擎追蹤的「虛擬最後位置」
     double lastQueuedPulse = 0.0;
 
-
-
+    int servoOffCounter = 0;
 };
 
 enum class InterpolationMode//插補群組的導航模式
@@ -899,6 +898,9 @@ public:
 
     //G碼參數專區------------------------------------------------------------
     double G00_overrideRatio = 1;//G00 專屬速度比例
+
+
+
    
 private:
     int m_pendingSourcePC = 0;
@@ -952,7 +954,7 @@ private:
     // 多軸插補管理器 (單一實體群組)--------------------------------------------------------------------
     InterpolationGroup m_Group;
 
-    // 動態 PID 切換副程式
+    
     
   public:
 

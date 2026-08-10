@@ -158,15 +158,21 @@ bool GlobalConfig::LoadPIDConfig(const std::string& filePath, std::vector<AxisCo
             axes[i].pid.Kp = ConfigUtil::ReadParam(filePath, prefix + "Kp_IDLE", 20.0);
             axes[i].pid.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki_IDLE", 10.0);
             axes[i].pid.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_IDLE", 0.0);
+            axes[i].pid.Kvff = ConfigUtil::ReadParam(filePath, prefix + "Kvff_IDLE", 1.0);
      
-            //閒置時PID---------------------------
+            //閒置靜止時PID---------------------------
             axes[i].Pid_IDLE.Kp = ConfigUtil::ReadParam(filePath, prefix + "Kp_IDLE", 20.0);
+            //axes[i].Pid_IDLE.Kp = 200;//測試用
             axes[i].Pid_IDLE.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki_IDLE", 10.0);
             axes[i].Pid_IDLE.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_IDLE", 0.0);
+            axes[i].Pid_IDLE.Kvff = ConfigUtil::ReadParam(filePath, prefix + "Kvff_IDLE", 0.0);
             //G00時PID---------------------------
             axes[i].Pid_G00.Kp = ConfigUtil::ReadParam(filePath, prefix + "Kp_G00", 20.0);
+            //axes[i].Pid_G00.Kp = 20;//測試用
             axes[i].Pid_G00.Ki = ConfigUtil::ReadParam(filePath, prefix + "Ki_G00", 10.0);
+            //axes[i].Pid_G00.Ki = 10;
             axes[i].Pid_G00.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_G00", 0.0);
+            axes[i].Pid_G00.Kvff = ConfigUtil::ReadParam(filePath, prefix + "Kvff_G00", 1.0);
         }
     }
 

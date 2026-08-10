@@ -31,7 +31,11 @@ namespace GCodeHandlers
     // ==========================================================
     WaitConditionFunc Handle_G07(const NCBlock& block, NCManager* nc)
     {
-        nc->MacroSys.SetVar('$', 1, 0);//設定群組1變數
+        nc->MacroSys.SetVar('$', 1, 7);//設定群組1變數
+
+        // 🌟 1. 判斷公英制倍率 (G20英制 = 25.4, G21公制 = 1.0)
+        // 因為底層引擎一律吃 mm，所以讀到英制數值要放大 25.4 倍轉回 mm
+        double unitScale = nc->CoordSys.isInchMode ? 25.4 : 1.0;
 
 
         // 1. 準備空陣列給 CoordinateManager
@@ -50,22 +54,33 @@ namespace GCodeHandlers
             // 利用 NCBlock API 抓取數值
             if (block.has(axisLetter))
             {
-
-
                 if (!nc->m_motion.GetAxisContext(i).isExist)
                 {
-                    // 1. 印出錯誤 Log，方便除錯
-                    //RtPrintf(">>> [ALARM] G-Code Error: Axis '%c' is disabled but commanded!\n", axisLetter);
-
-                    // 2. 觸發系統警報 (請換成你系統實際跳 Alarm 的 API)
                     AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_enabledr);
-
-                    // 3. 強制中斷，直接回傳 true 結束這行，絕對不准派單給底層！
                     return [](NCManager*) { return true; };
                 }
 
+                // 🌟 取得對應軸的屬性，旋轉軸(度數)絕對不套用英制轉換！
+                AxisType type = nc->m_motion.GetAxisContext(i).axisType;
+                double axisScale = (type == AxisType::ROTARY || type == AxisType::ROTARY_CONTINUOUS) ? 1.0 : unitScale;
+
+                // 🌟 [神級防呆] 針對 G16 極座標模式的特殊處理
+                // 在極座標下，第二軸是「角度」，角度不能變成英制！
+                if (nc->CoordSys.isPolarCoordinateActive) {
+                    int angleAxisIdx = 1; // 預設 G17 的 Y 軸 (Index 1) 是角度
+                    if (nc->CoordSys.activePlane == 18) angleAxisIdx = 2; // G18: Z 軸
+                    if (nc->CoordSys.activePlane == 19) angleAxisIdx = 2; // G19: Z 軸
+
+                    if (i == angleAxisIdx) {
+                        axisScale = 1.0; // 強制角度維持度數，不乘 25.4
+                    }
+                }
+
                 axisProgrammed[i] = true;
-                axisTarget[i] = block.val(axisLetter); // 這裡是工作座標(WCS)或增量值
+
+                // 🌟 關鍵：將 G 碼讀到的數值 (可能為 inch) 乘上 axisScale，轉回底層標準的 mm
+                axisTarget[i] = block.val(axisLetter) * axisScale;
+
                 hasAnyAxis = true;
             }
         }

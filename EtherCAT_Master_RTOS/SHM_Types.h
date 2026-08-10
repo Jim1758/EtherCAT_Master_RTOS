@@ -70,6 +70,8 @@ struct SHM_NC_Status
     // 🌟 新增：目前插補平面 (17=G17, 18=G18, 19=G19)
     int currentPlaneMode;
 
+   
+    int currentG20State;
 
     int currentTCode;//當下刀號
     int currentWorkpieceNum;//當下工件號
@@ -222,6 +224,13 @@ struct SHM_PLC_Status
     int32_t T_preset[1000]; // 目標設定時間 (ms)
     uint8_t T_done[1000];   // 是否已經到達 (1=ON, 0=OFF)
     int32_t T_base[1000];   // 🌟 新增這行：把時基傳給 HMI
+
+     // =========================================================
+    // Counter (CNT0 ~ CNT999) 狀態廣播
+    // =========================================================
+    int32_t CNT_acc[1000];       // 目前計數值
+    int32_t CNT_preset[1000];    // 目標計數值
+    uint8_t CNT_done[1000];      // 1 = Done, 0 = Not Done
 };
 
 // PLC命令區塊 (供 HMI 寫入/設定點位) -----------------------------------

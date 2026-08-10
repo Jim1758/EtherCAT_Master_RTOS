@@ -71,9 +71,19 @@ void MotionCore::G07_Move(const std::vector<int>& axes, const std::vector<double
         // 解決速度問題的核心：算出這根軸如果全速跑，要花幾秒？
         // =========================================================
         double currentAxisMaxPPS = axis.G07_PPS;
-        if (currentAxisMaxPPS > 1.0) {
-            double timeNeeded = distancePulse / currentAxisMaxPPS;
-            maxTimeNeeded = std::max<double>(maxTimeNeeded, timeNeeded); // 抓出拖慢全隊的「瓶頸時間」
+        // =========================================================
+ // 防呆：真正當分母的是乘完 Override 後的速度
+ // =========================================================
+        if (currentAxisMaxPPS > 1.0)
+        {
+            double timeNeeded =
+                distancePulse /
+                currentAxisMaxPPS;
+
+            maxTimeNeeded =
+                std::max<double>(
+                    maxTimeNeeded,
+                    timeNeeded);
         }
     }
 

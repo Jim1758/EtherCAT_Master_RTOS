@@ -33,7 +33,7 @@ PLCManager::PLCManager()
     Init();
 }
 
-PLCManager::~PLCManager() 
+PLCManager::~PLCManager()
 {
     // 🌟 2. 程式關閉時銷毀鎖
     DeleteCriticalSection(&m_logicCS);
@@ -56,6 +56,18 @@ void PLCManager::Init()
         m_T[i].done = false;
         m_T[i].preset = 0;
         m_T[i].acc = 0;
+        m_T[i].timeBase = 0;
+        m_T[i].mode = 0;
+        m_T[i].input = false;
+        m_T[i].prevInput = false;
+    }
+
+    for (int i = 0; i < MAX_PLC_CNT; i++) {
+        m_CNT[i].preset = 0;
+        m_CNT[i].acc = 0;
+        m_CNT[i].done = false;
+        m_CNT[i].initialized = false;
+        m_CNT[i].mode = 0;
     }
 
     LoadDRValues(GlobalConfig::GetInstance().PLC_Dir + "PLC_DR.txt");
@@ -74,8 +86,9 @@ void PLCManager::Close_PLC()
     std::memset(m_DR, 0, sizeof(m_DR));
     std::memset(m_F, 0, sizeof(m_F));
     std::memset(m_L, 0, sizeof(m_L));
+    std::memset(m_CNT, 0, sizeof(m_CNT));
 
-  
+
 }
 
 // =========================================================
@@ -139,6 +152,7 @@ bool PLCManager::LoadLogicProgram(const std::string& filepath)
                 file.read(reinterpret_cast<char*>(&inst), sizeof(PLCInstruction));
                 newTask.instructions.push_back(inst);
             }
+            newTask.edgeMemory.assign(newTask.instructions.size(), 0);
             m_tasks.push_back(newTask);
             std::cout << "[PLC] Successfully loaded Task, containing " << newTask.instructions.size() << " instructions.\n";
         }
@@ -207,27 +221,65 @@ bool PLCManager::LoadDRValues(const std::string& filepath)
 // =========================================================
 // 2. High-Speed Virtual Machine Operand Parser
 // =========================================================
+bool PLCManager::IsValidTimerIndex(int index) const {
+    return index >= 0 && index < MAX_PLC_T;
+}
+
+bool PLCManager::IsValidCounterIndex(int index) const {
+    return index >= 0 && index < MAX_PLC_CNT;
+}
+
+bool PLCManager::IsValidOperandAddress(const PLCOperand& op) const {
+    if (op.region == 8) return true; // #Constant has no memory address.
+    if (op.region == 11) return true; // VAR uses stable hash as payload.address.
+
+    const int addr = op.payload.address;
+    switch (op.region) {
+    case 0: return addr >= 0 && addr < MAX_PLC_I;
+    case 1: return addr >= 0 && addr < MAX_PLC_O;
+    case 2: return addr >= 0 && addr < MAX_PLC_C;
+    case 3: return addr >= 0 && addr < MAX_PLC_S;
+    case 4: return addr >= 0 && addr < MAX_PLC_A;
+    case 5: return addr >= 0 && addr < MAX_PLC_T;
+    case 6: return addr >= 0 && addr < MAX_PLC_R;
+    case 7: return addr >= 0 && addr < MAX_PLC_DR;
+    case 9: return addr >= 0 && addr < MAX_PLC_F;
+    case 10: return addr >= 0 && addr < MAX_PLC_L;
+    case 12: return addr >= 0 && addr < MAX_PLC_CNT;
+    default: return false;
+    }
+}
+
 double PLCManager::GetOperandAsDouble(const PLCOperand& op) {
     if (op.region == 8) { // Constant (#)
         if (op.dataType == 4) return op.payload.realValue;
         if (op.dataType == 5) return op.payload.lrealValue;
         return op.payload.intValue;
     }
+
     if (op.region == 11) { // Custom VAR
-        if (op.dataType == 4) return m_customVars[op.payload.address].value.fVal;
-        if (op.dataType == 5) return m_customVars[op.payload.address].value.dVal;
-        return m_customVars[op.payload.address].value.iVal;
+        auto it = m_customVars.find(op.payload.address);
+        if (it == m_customVars.end()) return 0.0;
+        if (op.dataType == 4) return it->second.value.fVal;
+        if (op.dataType == 5) return it->second.value.dVal;
+        return it->second.value.iVal;
     }
 
-    int addr = op.payload.address;
+    if (!IsValidOperandAddress(op)) return 0.0;
+
+    const int addr = op.payload.address;
     switch (op.region) {
+    case 0: return m_I[addr];
+    case 1: return m_O[addr];
+    case 2: return m_C[addr];
+    case 3: return m_S[addr]; // V7.4.3: restore S as readable operand.
+    case 4: return m_A[addr]; // V7.4.3: restore A as readable operand.
+    case 5: return m_T[addr].done ? 1.0 : 0.0;
     case 6: return m_R[addr];
     case 7: return m_DR[addr];
     case 9: return m_F[addr];
     case 10: return m_L[addr];
-    case 0: return m_I[addr];
-    case 1: return m_O[addr];
-    case 2: return m_C[addr];
+    case 12: return m_CNT[addr].acc;
     default: return 0.0;
     }
 }
@@ -237,21 +289,32 @@ int32_t PLCManager::GetOperandAsInt(const PLCOperand& op) {
 }
 
 bool PLCManager::GetOperandAsBool(const PLCOperand& op) {
-    if (op.region == 5) return m_T[op.payload.address].done; // T Timer Done
+    if (op.region == 5) {
+        const int index = op.payload.address;
+        return IsValidTimerIndex(index) ? m_T[index].done : false;
+    }
+    if (op.region == 12) {
+        const int index = op.payload.address;
+        return IsValidCounterIndex(index) ? m_CNT[index].done : false;
+    }
     return GetOperandAsInt(op) != 0;
 }
 
 void PLCManager::SetOperandFromDouble(const PLCOperand& op, double val) {
-    if (op.region == 8) return; // Cannot write to constant
+    if (op.region == 8) return; // Cannot write to constant.
 
     if (op.region == 11) { // Custom VAR
-        if (op.dataType == 4) m_customVars[op.payload.address].value.fVal = static_cast<float>(val);
-        else if (op.dataType == 5) m_customVars[op.payload.address].value.dVal = val;
-        else m_customVars[op.payload.address].value.iVal = static_cast<int32_t>(val);
+        auto it = m_customVars.find(op.payload.address);
+        if (it == m_customVars.end()) return;
+        if (op.dataType == 4) it->second.value.fVal = static_cast<float>(val);
+        else if (op.dataType == 5) it->second.value.dVal = val;
+        else it->second.value.iVal = static_cast<int32_t>(val);
         return;
     }
 
-    int addr = op.payload.address;
+    if (!IsValidOperandAddress(op)) return;
+
+    const int addr = op.payload.address;
     switch (op.region) {
     case 6: m_R[addr] = static_cast<int32_t>(val); break;
     case 7: m_DR[addr] = static_cast<int32_t>(val); break;
@@ -261,6 +324,8 @@ void PLCManager::SetOperandFromDouble(const PLCOperand& op, double val) {
     case 2: m_C[addr] = (val != 0); break;
     case 3: m_S[addr] = (val != 0); break;
     case 4: m_A[addr] = (val != 0); break;
+    case 12: break; // CNT is owned by Counter instructions; generic writes are blocked.
+    default: break;
     }
 }
 
@@ -290,20 +355,66 @@ void PLCManager::RunCycle(int delta_ms)
     // 🌟 使用我們自己寫的 AutoLockCS，傳入 m_logicCS 的記憶體位址
     AutoLockCS lock(&m_logicCS);
 
-    // Process all Timers
+    // Process all Timers. RunCycle is treated as a 1ms base call by system contract.
+    // Existing TON behavior is preserved; V7.4.5 adds TOF / TP / RTO modes.
     for (int i = 0; i < MAX_PLC_T; i++) {
-        if (m_T[i].enable) {
-            if (!m_T[i].done) {
-                m_T[i].acc += delta_ms;
-                if (m_T[i].acc >= m_T[i].preset) {
-                    m_T[i].acc = m_T[i].preset;
-                    m_T[i].done = true;
+        PLCTimer& timer = m_T[i];
+
+        switch (timer.mode) {
+        case 1: // TOF - done stays ON during OFF-delay timing.
+            if (timer.input) {
+                timer.enable = false;
+                timer.acc = 0;
+                timer.done = true;
+            }
+            else if (timer.enable && timer.done) {
+                timer.acc += delta_ms;
+                if (timer.acc >= timer.preset) {
+                    timer.acc = timer.preset;
+                    timer.done = false;
+                    timer.enable = false;
                 }
             }
-        }
-        else {
-            m_T[i].acc = 0;
-            m_T[i].done = false;
+            break;
+
+        case 2: // TP - fixed pulse after rising edge, independent of later input state.
+            if (timer.enable && timer.done) {
+                timer.acc += delta_ms;
+                if (timer.acc >= timer.preset) {
+                    timer.acc = timer.preset;
+                    timer.done = false;
+                    timer.enable = false;
+                }
+            }
+            break;
+
+        case 3: // RTO - retain acc/done while input is OFF; TMR_RST clears it.
+            if (timer.enable && !timer.done) {
+                timer.acc += delta_ms;
+                if (timer.acc >= timer.preset) {
+                    timer.acc = timer.preset;
+                    timer.done = true;
+                    timer.enable = false;
+                }
+            }
+            break;
+
+        case 0:
+        default: // Existing TON / TMR behavior.
+            if (timer.enable) {
+                if (!timer.done) {
+                    timer.acc += delta_ms;
+                    if (timer.acc >= timer.preset) {
+                        timer.acc = timer.preset;
+                        timer.done = true;
+                    }
+                }
+            }
+            else {
+                timer.acc = 0;
+                timer.done = false;
+            }
+            break;
         }
     }
 
@@ -326,85 +437,379 @@ void PLCManager::ExecuteTask(PLCTask& task)
 {
     bool ACC = false; // Accumulator
 
-    for (const auto& inst : task.instructions)
+    // Old logic.bin files do not contain edgeMemory. Build it at runtime if needed.
+    if (task.edgeMemory.size() != task.instructions.size()) {
+        task.edgeMemory.assign(task.instructions.size(), 0);
+    }
+
+    for (size_t instIndex = 0; instIndex < task.instructions.size(); ++instIndex)
     {
+        const auto& inst = task.instructions[instIndex];
+
         switch (inst.opCode)
         {
         case 1:  // LD
-            ACC = GetOperandAsBool(inst.op1); break;
+            ACC = GetOperandAsBool(inst.op1);
+            break;
+
         case 2:  // LDI
-            ACC = !GetOperandAsBool(inst.op1); break;
-        case 3:  // LDT 
-            ACC = m_T[inst.op1.payload.address].done; break;
-        case 4:  // LDIT 
-            ACC = !m_T[inst.op1.payload.address].done; break;
+            ACC = !GetOperandAsBool(inst.op1);
+            break;
+
+        case 3:  // LDT
+            ACC = IsValidTimerIndex(inst.op1.payload.address)
+                ? m_T[inst.op1.payload.address].done
+                : false;
+            break;
+
+        case 4:  // LDIT
+            ACC = IsValidTimerIndex(inst.op1.payload.address)
+                ? !m_T[inst.op1.payload.address].done
+                : false;
+            break;
+
         case 5:  // OR
-            ACC = ACC || GetOperandAsBool(inst.op1); break;
+            ACC = ACC || GetOperandAsBool(inst.op1);
+            break;
+
         case 6:  // ORI
-            ACC = ACC || !GetOperandAsBool(inst.op1); break;
+            ACC = ACC || !GetOperandAsBool(inst.op1);
+            break;
 
         case 7:  // OUT
-            SetOperandFromBool(inst.op1, ACC); break;
-        case 8:  // OUT_NOT
-            SetOperandFromBool(inst.op1, !ACC); break;
-        case 11: // OUT_L (SET)
-            if (ACC) SetOperandFromBool(inst.op1, true); break;
-        case 12: // OUT_UL (RST)
-            if (ACC) SetOperandFromBool(inst.op1, false); break;
+            SetOperandFromBool(inst.op1, ACC);
+            break;
 
-        case 13: // TMR_10 (10ms Base)
+        case 8:  // OUT_NOT
+            SetOperandFromBool(inst.op1, !ACC);
+            break;
+
+        case 9:  // OUT_UP - one PLC-task-scan pulse on ACC rising edge
+        {
+            const bool previous = task.edgeMemory[instIndex] != 0;
+            const bool pulse = ACC && !previous;
+            SetOperandFromBool(inst.op1, pulse);
+            task.edgeMemory[instIndex] = ACC ? 1 : 0;
+            break;
+        }
+
+        case 10: // OUT_DOWN - one PLC-task-scan pulse on ACC falling edge
+        {
+            const bool previous = task.edgeMemory[instIndex] != 0;
+            const bool pulse = !ACC && previous;
+            SetOperandFromBool(inst.op1, pulse);
+            task.edgeMemory[instIndex] = ACC ? 1 : 0;
+            break;
+        }
+
+        case 11: // OUT_L (SET)
+            if (ACC) SetOperandFromBool(inst.op1, true);
+            break;
+
+        case 12: // OUT_UL (RST)
+            if (ACC) SetOperandFromBool(inst.op1, false);
+            break;
+
+        case 17: // TMR_1MS (1ms Base) - V7.4.3
+        case 13: // TMR_10  (10ms Base)
         case 14: // TMR_100 (100ms Base)
-        case 15: // TMR_1S (1s Base)
+        case 15: // TMR_1S  (1000ms Base)
+        {
+            const int tIdx = inst.op1.payload.address;
+            if (!IsValidTimerIndex(tIdx)) break;
+
             if (ACC) {
-                int tIdx = inst.op1.payload.address;
-                int base = (inst.opCode == 13) ? 10 : (inst.opCode == 14) ? 100 : 1000;
+                const int base =
+                    (inst.opCode == 17) ? 1 :
+                    (inst.opCode == 13) ? 10 :
+                    (inst.opCode == 14) ? 100 : 1000;
+
+                const int32_t presetValue = GetOperandAsInt(inst.op2);
+                m_T[tIdx].mode = 0;
+                m_T[tIdx].input = true;
+                m_T[tIdx].prevInput = true;
                 m_T[tIdx].enable = true;
-                m_T[tIdx].timeBase = base; // 🌟 補上這行：記下它的時基
-                m_T[tIdx].preset = GetOperandAsInt(inst.op2) * base;
+                m_T[tIdx].timeBase = base;
+                m_T[tIdx].preset = (presetValue > 0) ? presetValue * base : 0;
             }
             else {
-                m_T[inst.op1.payload.address].enable = false;
+                m_T[tIdx].mode = 0;
+                m_T[tIdx].input = false;
+                m_T[tIdx].prevInput = false;
+                m_T[tIdx].enable = false;
             }
             break;
+        }
 
-        case 16: // TMR_RST 
+        case 50: // TOF_1MS - OFF Delay Timer, 1ms base
+        {
+            const int tIdx = inst.op1.payload.address;
+            if (!IsValidTimerIndex(tIdx)) break;
+
+            PLCTimer& timer = m_T[tIdx];
+            const bool previousInput = timer.prevInput;
+            const int32_t presetValue = GetOperandAsInt(inst.op2);
+
+            timer.mode = 1;
+            timer.timeBase = 1;
+            timer.preset = (presetValue > 0) ? presetValue : 0;
+            timer.input = ACC;
+
             if (ACC) {
-                m_T[inst.op1.payload.address].enable = false;
-                m_T[inst.op1.payload.address].acc = 0;
-                m_T[inst.op1.payload.address].done = false;
+                timer.enable = false;
+                timer.acc = 0;
+                timer.done = true;
+            }
+            else if (previousInput) {
+                // Falling edge: start OFF-delay and keep Q/DN ON until preset expires.
+                timer.enable = true;
+                timer.acc = 0;
+                timer.done = true;
+            }
+
+            timer.prevInput = ACC;
+            break;
+        }
+
+        case 51: // TP_1MS - Pulse Timer, 1ms base
+        {
+            const int tIdx = inst.op1.payload.address;
+            if (!IsValidTimerIndex(tIdx)) break;
+
+            PLCTimer& timer = m_T[tIdx];
+            const bool previousInput = timer.prevInput;
+            const int32_t presetValue = GetOperandAsInt(inst.op2);
+
+            timer.mode = 2;
+            timer.timeBase = 1;
+            timer.preset = (presetValue > 0) ? presetValue : 0;
+            timer.input = ACC;
+
+            if (ACC && !previousInput && !timer.enable) {
+                timer.enable = true;
+                timer.acc = 0;
+                timer.done = true;
+            }
+
+            timer.prevInput = ACC;
+            break;
+        }
+
+        case 52: // RTO_1MS - Retentive ON Delay, 1ms base
+        {
+            const int tIdx = inst.op1.payload.address;
+            if (!IsValidTimerIndex(tIdx)) break;
+
+            PLCTimer& timer = m_T[tIdx];
+            const int32_t presetValue = GetOperandAsInt(inst.op2);
+
+            timer.mode = 3;
+            timer.timeBase = 1;
+            timer.preset = (presetValue > 0) ? presetValue : 0;
+            timer.input = ACC;
+            timer.enable = ACC && !timer.done;
+            timer.prevInput = ACC;
+            break;
+        }
+
+        case 16: // TMR_RST
+        {
+            const int tIdx = inst.op1.payload.address;
+            if (ACC && IsValidTimerIndex(tIdx)) {
+                m_T[tIdx].enable = false;
+                m_T[tIdx].acc = 0;
+                m_T[tIdx].done = false;
+                m_T[tIdx].preset = 0;
+                m_T[tIdx].timeBase = 0;
+                m_T[tIdx].mode = 0;
+                m_T[tIdx].input = false;
+                m_T[tIdx].prevInput = false;
             }
             break;
+        }
+
+        case 60: // CTU - Counter Up, count on ACC rising edge
+        {
+            const int cIdx = inst.op1.payload.address;
+            if (!IsValidCounterIndex(cIdx)) break;
+
+            PLCCounter& counter = m_CNT[cIdx];
+            const int32_t presetValue = GetOperandAsInt(inst.op2);
+            const int32_t preset = presetValue > 0 ? presetValue : 1;
+            const bool previous = task.edgeMemory[instIndex] != 0;
+            const bool rising = ACC && !previous;
+
+            if (!counter.initialized) {
+                counter.acc = 0;
+                counter.initialized = true;
+            }
+
+            counter.mode = 1;
+            counter.preset = preset;
+
+            if (rising&& counter.acc < INT32_MAX) {
+                ++counter.acc;
+            }
+
+            counter.done = counter.acc >= counter.preset;
+            task.edgeMemory[instIndex] = ACC ? 1 : 0;
+            break;
+        }
+
+        case 61: // CTD - Counter Down, count on ACC rising edge
+        {
+            const int cIdx = inst.op1.payload.address;
+            if (!IsValidCounterIndex(cIdx)) break;
+
+            PLCCounter& counter = m_CNT[cIdx];
+            const int32_t presetValue = GetOperandAsInt(inst.op2);
+            const int32_t preset = presetValue > 0 ? presetValue : 1;
+            const bool previous = task.edgeMemory[instIndex] != 0;
+            const bool rising = ACC && !previous;
+
+            // Standalone CTD starts from Preset after Init/CNT_RST.
+            // Repeated scans do not reload the counter.
+            if (!counter.initialized) {
+                counter.acc = preset;
+                counter.initialized = true;
+            }
+
+            counter.mode = 2;
+            counter.preset = preset;
+
+            if (rising && counter.acc > 0) {
+                --counter.acc;
+            }
+
+            counter.done = counter.acc <= 0;
+            task.edgeMemory[instIndex] = ACC ? 1 : 0;
+            break;
+        }
+
+        case 63: // CNT_RST - Counter Reset
+        {
+            const int cIdx = inst.op1.payload.address;
+            if (ACC && IsValidCounterIndex(cIdx)) {
+                m_CNT[cIdx].preset = 0;
+                m_CNT[cIdx].acc = 0;
+                m_CNT[cIdx].done = false;
+                m_CNT[cIdx].initialized = false;
+                m_CNT[cIdx].mode = 0;
+            }
+            break;
+        }
+
+        case 70: // R_TRIG - transform ACC rising edge into a one-task-scan pulse
+        {
+            const bool previous = task.edgeMemory[instIndex] != 0;
+            const bool current = ACC;
+            ACC = current && !previous;
+            task.edgeMemory[instIndex] = current ? 1 : 0;
+            break;
+        }
+
+        case 71: // F_TRIG - transform ACC falling edge into a one-task-scan pulse
+        {
+            const bool previous = task.edgeMemory[instIndex] != 0;
+            const bool current = ACC;
+            ACC = !current && previous;
+            task.edgeMemory[instIndex] = current ? 1 : 0;
+            break;
+        }
 
         case 20: // ADD
-            if (ACC) SetOperandFromDouble(inst.op1, GetOperandAsDouble(inst.op1) + GetOperandAsDouble(inst.op2)); break;
+            if (ACC) SetOperandFromDouble(inst.op1,
+                GetOperandAsDouble(inst.op1) + GetOperandAsDouble(inst.op2));
+            break;
+
         case 21: // SUB
-            if (ACC) SetOperandFromDouble(inst.op1, GetOperandAsDouble(inst.op1) - GetOperandAsDouble(inst.op2)); break;
+            if (ACC) SetOperandFromDouble(inst.op1,
+                GetOperandAsDouble(inst.op1) - GetOperandAsDouble(inst.op2));
+            break;
+
         case 22: // MUL
-            if (ACC) SetOperandFromDouble(inst.op1, GetOperandAsDouble(inst.op1) * GetOperandAsDouble(inst.op2)); break;
+            if (ACC) SetOperandFromDouble(inst.op1,
+                GetOperandAsDouble(inst.op1) * GetOperandAsDouble(inst.op2));
+            break;
+
         case 23: // DIV
             if (ACC) {
-                double div = GetOperandAsDouble(inst.op2);
-                if (div != 0.0) SetOperandFromDouble(inst.op1, GetOperandAsDouble(inst.op1) / div);
+                const double divisor = GetOperandAsDouble(inst.op2);
+                if (divisor != 0.0) {
+                    SetOperandFromDouble(inst.op1,
+                        GetOperandAsDouble(inst.op1) / divisor);
+                }
             }
             break;
-        case 24: // MOV 
-            if (ACC) SetOperandFromDouble(inst.op1, GetOperandAsDouble(inst.op2)); break;
+
+        case 24: // MOV
+            if (ACC) SetOperandFromDouble(inst.op1, GetOperandAsDouble(inst.op2));
+            break;
+
+        case 25: // MOD
+            if (ACC) {
+                const int32_t divisor = GetOperandAsInt(inst.op2);
+                if (divisor != 0) {
+                    SetOperandFromInt(inst.op1, GetOperandAsInt(inst.op1) % divisor);
+                }
+            }
+            break;
+
+        case 26: // ABS
+            if (ACC) {
+                const double value = GetOperandAsDouble(inst.op1);
+                SetOperandFromDouble(inst.op1, std::fabs(value));
+            }
+            break;
+
+        case 27: // NEG
+            if (ACC) {
+                SetOperandFromDouble(inst.op1, -GetOperandAsDouble(inst.op1));
+            }
+            break;
 
         case 30: // CMP >
-            ACC = (GetOperandAsDouble(inst.op1) > GetOperandAsDouble(inst.op2)); break;
+            ACC = (GetOperandAsDouble(inst.op1) > GetOperandAsDouble(inst.op2));
+            break;
+
         case 31: // CMP <
-            ACC = (GetOperandAsDouble(inst.op1) < GetOperandAsDouble(inst.op2)); break;
+            ACC = (GetOperandAsDouble(inst.op1) < GetOperandAsDouble(inst.op2));
+            break;
+
         case 32: // CMP =
-            ACC = (GetOperandAsDouble(inst.op1) == GetOperandAsDouble(inst.op2)); break;
+            ACC = (GetOperandAsDouble(inst.op1) == GetOperandAsDouble(inst.op2));
+            break;
+
+        case 33: // CMP >=
+            ACC = (GetOperandAsDouble(inst.op1) >= GetOperandAsDouble(inst.op2));
+            break;
+
+        case 34: // CMP <=
+            ACC = (GetOperandAsDouble(inst.op1) <= GetOperandAsDouble(inst.op2));
+            break;
+
+        case 35: // CMP !=
+            ACC = (GetOperandAsDouble(inst.op1) != GetOperandAsDouble(inst.op2));
+            break;
 
         case 40: // AND
-            if (ACC) SetOperandFromInt(inst.op1, GetOperandAsInt(inst.op1) & GetOperandAsInt(inst.op2)); break;
+            if (ACC) SetOperandFromInt(inst.op1,
+                GetOperandAsInt(inst.op1) & GetOperandAsInt(inst.op2));
+            break;
+
         case 41: // LOGIC_OR
-            if (ACC) SetOperandFromInt(inst.op1, GetOperandAsInt(inst.op1) | GetOperandAsInt(inst.op2)); break;
+            if (ACC) SetOperandFromInt(inst.op1,
+                GetOperandAsInt(inst.op1) | GetOperandAsInt(inst.op2));
+            break;
+
         case 42: // XOR
-            if (ACC) SetOperandFromInt(inst.op1, GetOperandAsInt(inst.op1) ^ GetOperandAsInt(inst.op2)); break;
+            if (ACC) SetOperandFromInt(inst.op1,
+                GetOperandAsInt(inst.op1) ^ GetOperandAsInt(inst.op2));
+            break;
 
         default:
+            // Unknown opcodes are ignored here. The Studio compiler is responsible
+            // for blocking unsupported instructions before logic.bin is generated.
             break;
         }
     }
@@ -430,10 +835,10 @@ void PLCManager::SetReg_DR(int index, int32_t value) { if (index >= 0 && index <
 // 🌟 A 點與 S 點專屬高速讀寫 API 實作
 // =========================================================
 void PLCManager::Set_A(int index, bool value) {
-        if (index >= 0 && index < MAX_PLC_A) {
-            m_A[index] = value ? 1 : 0;
-        }
+    if (index >= 0 && index < MAX_PLC_A) {
+        m_A[index] = value ? 1 : 0;
     }
+}
 
 bool PLCManager::Get_A(int index) const {
     if (index >= 0 && index < MAX_PLC_A) {
@@ -466,6 +871,7 @@ double PLCManager::GetMemory(const std::string& prefix, int index) const {
     if (prefix == "F" && index >= 0 && index < MAX_PLC_F) return m_F[index];
     if (prefix == "L" && index >= 0 && index < MAX_PLC_L) return m_L[index];
     if (prefix == "T" && index >= 0 && index < MAX_PLC_T) return m_T[index].done ? 1.0 : 0.0;
+    if (prefix == "CNT" && index >= 0 && index < MAX_PLC_CNT) return static_cast<double>(m_CNT[index].acc);
     return 0.0;
 }
 
@@ -503,7 +909,11 @@ double PLCManager::GetVar(const std::string& name) const {
     std::string prefix = "";
     int index = 0;
 
-    if (name.rfind("DR", 0) == 0) {
+    if (name.rfind("CNT", 0) == 0) {
+        prefix = "CNT";
+        index = std::stoi(name.substr(3));
+    }
+    else if (name.rfind("DR", 0) == 0) {
         prefix = "DR";
         index = std::stoi(name.substr(2));
     }
@@ -534,7 +944,11 @@ void PLCManager::SetVar(const std::string& name, double value) {
     std::string prefix = "";
     int index = 0;
 
-    if (name.rfind("DR", 0) == 0) {
+    if (name.rfind("CNT", 0) == 0) {
+        prefix = "CNT";
+        index = std::stoi(name.substr(3));
+    }
+    else if (name.rfind("DR", 0) == 0) {
         prefix = "DR";
         index = std::stoi(name.substr(2));
     }
@@ -558,7 +972,7 @@ int32_t PLCManager::GetStableHashCpp(const std::string& str) const {
 // =========================================================
 // 🌟 匯出全域狀態給 HMI (極速記憶體拷貝)
 // =========================================================
-void PLCManager::ExportPLCStatus(SHM_PLC_Status* pStatus) const 
+void PLCManager::ExportPLCStatus(SHM_PLC_Status* pStatus) const
 {
     if (!pStatus) return;
 
@@ -586,7 +1000,7 @@ void PLCManager::ExportPLCStatus(SHM_PLC_Status* pStatus) const
 bool PLCManager::ReloadLogicProgram()
 {
     const std::string& filepath = GlobalConfig::GetInstance().PLC_Dir + "logic.bin";
- 
+
 
     // 1. 【非即時端安全區】宣告「暫時的」容器，避免在讀檔時污染運行中的記憶體
     std::vector<PLCTask> tempTasks;
@@ -641,6 +1055,7 @@ bool PLCManager::ReloadLogicProgram()
                 file.read(reinterpret_cast<char*>(&inst), sizeof(PLCInstruction));
                 newTask.instructions.push_back(inst);
             }
+            newTask.edgeMemory.assign(newTask.instructions.size(), 0);
             tempTasks.push_back(newTask); // 寫入暫存容器
         }
         else if (tag == 255) {
@@ -671,6 +1086,19 @@ bool PLCManager::ReloadLogicProgram()
             m_T[i].enable = false;
             m_T[i].done = false;
             m_T[i].acc = 0;
+            m_T[i].preset = 0;
+            m_T[i].timeBase = 0;
+            m_T[i].mode = 0;
+            m_T[i].input = false;
+            m_T[i].prevInput = false;
+        }
+
+        for (int i = 0; i < MAX_PLC_CNT; i++) {
+            m_CNT[i].preset = 0;
+            m_CNT[i].acc = 0;
+            m_CNT[i].done = false;
+            m_CNT[i].initialized = false;
+            m_CNT[i].mode = 0;
         }
 
         // 注意：這裡不清除 I, O, R 等點位，因為機台還在運轉，保持現有的物理狀態最安全

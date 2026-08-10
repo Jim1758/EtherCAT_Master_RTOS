@@ -57,10 +57,22 @@ void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double
         // 🌟 算完之後，把這次的終點存起來，給下一行預讀當作起點！
         axis.lastQueuedPulse = targetPulse;
 
-        double currentAxisMaxPPS = axis.G00_PPS * G00_overrideRatio;
-        if (axis.G00_PPS > 1.0) {
-            double timeNeeded = distancePulse / currentAxisMaxPPS;
-            maxTimeNeeded = std::max<double>(maxTimeNeeded, timeNeeded);
+        double currentAxisMaxPPS =
+            axis.G00_PPS * G00_overrideRatio;
+
+        // =========================================================
+        // 防呆：真正當分母的是乘完 Override 後的速度
+        // =========================================================
+        if (currentAxisMaxPPS > 1.0)
+        {
+            double timeNeeded =
+                distancePulse /
+                currentAxisMaxPPS;
+
+            maxTimeNeeded =
+                std::max<double>(
+                    maxTimeNeeded,
+                    timeNeeded);
         }
     }
 
@@ -89,7 +101,7 @@ void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double
     // 完美傳入 Pulse 陣列與計算好的 PPS 速度
     LineMove(axes, targetPos_Pulse, groupG00Vel_PPS, groupAccTime, groupDecTime, mode);
 
-    RtPrintf("G00>>> %d (LookAhead: %d)\n", mode, isLookAheadActive);
+   // RtPrintf("G00>>> %d (LookAhead: %d)\n", mode, isLookAheadActive);
 }
 
 

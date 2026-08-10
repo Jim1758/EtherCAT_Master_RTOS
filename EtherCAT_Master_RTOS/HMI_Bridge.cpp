@@ -16,6 +16,10 @@ namespace HMI_Bridge
         SHM_Data* pShm = SHMManager::GetInstance().GetData();
         if (pShm == nullptr || nc == nullptr) return;
 
+        // 🌟 [新增] 1. 取得當前的公英制倍率 (公制=1.0, 英制=1/25.4)
+        double unitScale = nc->CoordSys.isInchMode ? (1.0 / 25.4) : 1.0;
+
+
         // --- 狀態迴圈更新 ---
         pShm->API_Status.SHM_API_RunCount = nc->API_RunCount++;
         pShm->NC_Status.SHM_NC_RunCount = nc->NC_RunCount;
@@ -35,36 +39,31 @@ namespace HMI_Bridge
         double currentWCS[8] = { 0.0 };
         nc->CoordSys.GetActualWCS(currentWCS);
 
+        // 🌟 [神級修復] 2. 將 DTG 的計算提拔到迴圈外部！避免重複運算與變數遮蔽(Shadowing) Bug
+        double currentDTG[8] = { 0.0 };
+        nc->CoordSys.GetDistanceToGo(currentDTG, nc);
+
         for (int i = 0; i < 8; i++)
         {
-            // 取得軸的 Context，方便後續讀取參數
+            // 取得軸的 Context
             auto& axis = nc->m_motion.GetAxisContext(i);
+            AxisType type = axis.axisType;
 
-            // 🌟 1. 取得這根軸當下的補償總量
-            double currentComp = nc->m_motion.GetAxisContext(i).currentCompOffset_unit;
+            // 🌟 3. 判斷是否為旋轉軸 (旋轉軸永遠是度數 deg，絕對不可以套用 inch 轉換)
+            double axisScale = (type == AxisType::ROTARY || type == AxisType::ROTARY_CONTINUOUS) ? 1.0 : unitScale;
 
-            // 🌟 2. 扣除補償量，還原成操作員眼中的「真實邏輯座標」
-            double displayMCS = nc->CoordSys.actualMCS[i] - currentComp;
-            double displayWCS = currentWCS[i] - currentComp;
+            double currentComp = axis.currentCompOffset_unit;
 
-            // 準備一個陣列接資料
-            double currentDTG[8];
+            // 🌟 4. 扣除補償量，並套用公英制倍率
+            double displayMCS = (nc->CoordSys.actualMCS[i] - currentComp) * axisScale;
+            double displayWCS = (currentWCS[i] - currentComp) * axisScale;
 
-            // 呼叫 CoordSys 裡我們剛寫好的 API (傳入 this 給它)
-            nc->CoordSys.GetDistanceToGo(currentDTG, nc);
+            // 把 DTG 塞進共享記憶體，同樣套用倍率
+            pShm->NC_Status.DistanceToGo[i] = currentDTG[i] * axisScale;
 
-            // 把結果塞進共享記憶體，給 HMI 顯示！
-            for (int i = 0; i < 8; i++) {
-                 pShm->NC_Status.DistanceToGo[i] = currentDTG[i];
-            }
-          
-          
             // ========================================================
-            // 🌟 3. 旋轉軸的 0~360 度顯示處理
+            // 🌟 旋轉軸的 0~360 度顯示處理
             // ========================================================
-            AxisType type = nc->m_motion.GetAxisContext(i).axisType;
-
-            // 如果是旋轉軸 (包含連續旋轉軸)
             if (type == AxisType::ROTARY || type == AxisType::ROTARY_CONTINUOUS)
             {
                 // 對 360 取餘數 (折疊座標)
@@ -336,7 +335,7 @@ namespace HMI_Bridge
         pShm->NC_Status.currentG162State = (isMachineIdle ? interpreterG162 : physicalG162) ? 1 : 0;
         pShm->NC_Status.currentPlaneMode = isMachineIdle ? interpreterPlane : physicalPlane;
 
-
+        pShm->NC_Status.currentG20State= nc->CoordSys.isInchMode;
 
         if (pShm->NC_Command.reqChangeMode)//處理 OP 模式切換請求 (來自 NC_Command)
         {
@@ -368,21 +367,37 @@ namespace HMI_Bridge
             std::memset(pShm->String_Command.codeContent, 0, sizeof(pShm->String_Command.codeContent));
         }
 
+        // =========================================================
+             // 🌟 處理 HMI 寫入座標偏移量 (reqWriteOffset)
+             // =========================================================
         if (pShm->Coord_Command.reqWriteOffset)
         {
+            // 🌟 宣告 unitScale 讓這個區塊也能用公英制轉換
+            double unitScale = nc->CoordSys.isInchMode ? (1.0 / 25.4) : 1.0;
+
             int row = pShm->Coord_Command.rowIndex;
             int axis = pShm->Coord_Command.axisIndex;
             double val = pShm->Coord_Command.writeValue;
+
             if (axis >= 0 && axis < 8)
             {
+                // 🌟 取得對應軸的屬性，旋轉軸(度數)不套用英制轉換
+                AxisType type = nc->m_motion.GetAxisContext(axis).axisType;
+                double axisScale = (type == AxisType::ROTARY || type == AxisType::ROTARY_CONTINUOUS) ? 1.0 : unitScale;
+
+                // 🌟 關鍵：將 HMI 輸入的數值 (可能為 inch) 除以倍率，還原回系統底層的公制 (mm)
+                double systemVal = val / axisScale;
+
                 switch (pShm->Coord_Command.offsetType)
                 {
-                case 0: nc->CoordSys.extOffset[axis] = val; break;
-                case 1: if (row >= 0 && row < 60)  nc->CoordSys.m_WCSTable[row][axis] = val; break;
-                case 2: if (row >= 0 && row < 100) nc->CoordSys.m_ToolOffset[row][axis] = val; break;
-                case 3: if (row >= 0 && row < 100) nc->CoordSys.m_WorkOffset[row][axis] = val; break;
+                case 0: nc->CoordSys.extOffset[axis] = systemVal; break;
+                case 1: if (row >= 0 && row < 60)  nc->CoordSys.m_WCSTable[row][axis] = systemVal; break;
+                case 2: if (row >= 0 && row < 100) nc->CoordSys.m_ToolOffset[row][axis] = systemVal; break;
+                case 3: if (row >= 0 && row < 100) nc->CoordSys.m_WorkOffset[row][axis] = systemVal; break;
                 case 10:
-                    nc->CoordSys.m_WCSTable[nc->CoordSys.currentWCSIndex][axis] = nc->CoordSys.actualMCS[axis] - nc->CoordSys.extOffset[axis] - val;
+                    // G54 等原點設定功能：此處 systemVal 是從 HMI 傳入的期望座標
+                    nc->CoordSys.m_WCSTable[nc->CoordSys.currentWCSIndex][axis] =
+                        nc->CoordSys.actualMCS[axis] - nc->CoordSys.extOffset[axis] - systemVal;
                     break;
                 }
             }
@@ -417,11 +432,15 @@ namespace HMI_Bridge
 
 
         //PLC----------------------------------------------------------------------
-        pShm->PLC_Status.SHM_PLC_RunCount = g_PLC->PLC_RunCount;
-      // 🌟 PLC 狀態全廣播
-        if (g_PLC != nullptr) 
+        if (g_PLC != nullptr)
         {
-            g_PLC->ExportPLCStatus(&pShm->PLC_Status);
+            pShm->PLC_Status.SHM_PLC_RunCount =
+                g_PLC->PLC_RunCount;
+
+            // PLC 狀態全廣播
+            g_PLC->ExportPLCStatus(
+                &pShm->PLC_Status
+            );
         }
 
         // 🌟 處理 PLC 點位寫入
@@ -466,6 +485,9 @@ namespace HMI_Bridge
         SHM_Data* pShm = SHMManager::GetInstance().GetData();
         if (pShm == nullptr || nc == nullptr) return;
 
+
+        // 🌟 [新增] 1. 取得當前的公英制倍率
+        double unitScale = nc->CoordSys.isInchMode ? (1.0 / 25.4) : 1.0;
        
 
         // --- Macro 變數全廣播 (約 18KB) ---
@@ -492,17 +514,32 @@ namespace HMI_Bridge
             pShm->varCmd.refresh_local= false;
         }
       
+        // =====================================================================
+                // 🌟 2. 座標與補償表格拷貝 (捨棄 memcpy，改用迴圈逐軸套用單位轉換)
+                // =====================================================================
+        for (int col = 0; col < 8; col++)
+        {
+            // 判斷是否為旋轉軸
+            AxisType type = nc->m_motion.GetAxisContext(col).axisType;
+            double axisScale = (type == AxisType::ROTARY || type == AxisType::ROTARY_CONTINUOUS) ? 1.0 : unitScale;
 
-        // --- 座標與補償表格拷貝 (約 16KB) ---
-        memcpy(pShm->Coord_Table.extOffset, nc->CoordSys.extOffset, sizeof(double) * 8);
-        for (size_t row = 0; row < 60 && row < nc->CoordSys.m_WCSTable.size(); ++row) {
-            memcpy(pShm->Coord_Table.wcsTable[row], nc->CoordSys.m_WCSTable[row].data(), sizeof(double) * 8);
-        }
-        for (size_t row = 0; row < 100 && row < nc->CoordSys.m_ToolOffset.size(); ++row) {
-            memcpy(pShm->Coord_Table.toolOffset[row], nc->CoordSys.m_ToolOffset[row].data(), sizeof(double) * 8);
-        }
-        for (size_t row = 0; row < 100 && row < nc->CoordSys.m_WorkOffset.size(); ++row) {
-            memcpy(pShm->Coord_Table.workOffset[row], nc->CoordSys.m_WorkOffset[row].data(), sizeof(double) * 8);
+            // A. 外部偏移 (EXT)
+            pShm->Coord_Table.extOffset[col] = nc->CoordSys.extOffset[col] * axisScale;
+
+            // B. G54 ~ G59 表格
+            for (size_t row = 0; row < 60 && row < nc->CoordSys.m_WCSTable.size(); ++row) {
+                pShm->Coord_Table.wcsTable[row][col] = nc->CoordSys.m_WCSTable[row][col] * axisScale;
+            }
+
+            // C. 刀具長度/半徑補正表
+            for (size_t row = 0; row < 100 && row < nc->CoordSys.m_ToolOffset.size(); ++row) {
+                pShm->Coord_Table.toolOffset[row][col] = nc->CoordSys.m_ToolOffset[row][col] * axisScale;
+            }
+
+            // D. G168 獨立工件補正表
+            for (size_t row = 0; row < 100 && row < nc->CoordSys.m_WorkOffset.size(); ++row) {
+                pShm->Coord_Table.workOffset[row][col] = nc->CoordSys.m_WorkOffset[row][col] * axisScale;
+            }
         }
 
 

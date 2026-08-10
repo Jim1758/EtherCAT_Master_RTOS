@@ -956,3 +956,50 @@ void CoordinateManager::GetDistanceToGo(double* outDTG, NCManager* nc) const
         }
     }
 }
+
+// 🌟 設定 G20 / G21
+void CoordinateManager::SetUnitMode(int gCode, NCManager* nc)
+{
+    if (gCode == 20) {
+        isInchMode = true;
+        if (nc) nc->MacroSys.SetVar('$', 6, 20.0); // 更新群組 6 巨集變數
+        // RtPrintf("[G20] Inch Mode Active.\n");
+    }
+    else if (gCode == 21) {
+        isInchMode = false;
+        if (nc) nc->MacroSys.SetVar('$', 6, 21.0);
+        // RtPrintf("[G21] Metric Mode Active.\n");
+    }
+}
+
+// 🌟 出口閘門：將底層純公制數值，轉換為「當下單位」準備顯示或存入系統變數
+double CoordinateManager::ToDisplayUnit(double internalMmValue, bool isRotaryAxis) const
+{
+    // 鐵則：旋轉軸 (角度) 絕對不轉換！
+    if (isRotaryAxis) {
+        return internalMmValue;
+    }
+
+    // 若為英制模式，除以 25.4 送出去
+    if (isInchMode) {
+        return internalMmValue / 25.4;
+    }
+
+    return internalMmValue; // 公制模式，原封不動送出去
+}
+
+// 🌟 入口閘門：將外部 (G碼或 HMI 畫面) 輸入的數值，洗成「純公制」準備存入表格或給底層
+double CoordinateManager::ToInternalUnit(double externalValue, bool isRotaryAxis) const
+{
+    // 鐵則：旋轉軸 (角度) 絕對不轉換！
+    if (isRotaryAxis) {
+        return externalValue;
+    }
+
+    // 若為英制模式，乘以 25.4 洗成公制再進入大腦
+    if (isInchMode) {
+        return externalValue * 25.4;
+    }
+
+    return externalValue; // 公制模式，原封不動進入
+}

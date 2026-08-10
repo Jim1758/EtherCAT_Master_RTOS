@@ -55,6 +55,9 @@ public:
 
     void SetWorkpieceNumber(int num, NCManager* nc = nullptr); // 🌟 新增：設定獨立工件號 API
 
+
+
+
     // ==========================================
     // 🌟 定義 m_WorkOffset 陣列的 8 個欄位名稱
     // ==========================================
@@ -208,6 +211,25 @@ public:
 
     // 🌟 新增：取得機台當下的剩餘移動量 (Distance To Go)
     void GetDistanceToGo(double* outDTG, NCManager* nc) const;
+
+
+    // ==========================================
+// 🌟 公英制狀態紀錄 (G20 / G21, 群組 6)
+// ==========================================
+    bool isInchMode = false; // 預設為 false (G21 公制 mm)
+
+    // 設定公英制 API
+    void SetUnitMode(int gCode, NCManager* nc = nullptr);
+
+    // ==========================================
+    // 🌟 海關翻譯閘門 API (最核心的轉換工具)
+    // ==========================================
+    // 出去給別人看時呼叫 (底層 mm -> 畫面/巨集)
+    double ToDisplayUnit(double internalMmValue, bool isRotaryAxis) const;
+
+    // 從外面收進來時呼叫 (畫面/G碼輸入 -> 轉為底層 mm)
+    double ToInternalUnit(double externalValue, bool isRotaryAxis) const;
+
 private:
     // 底層輔助函式：負責讀寫 8 軸二維陣列，並確保原子寫入防護
     void SaveTableToFile(const std::string& filename, const std::vector<std::vector<double>>& table);

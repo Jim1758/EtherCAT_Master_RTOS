@@ -10,7 +10,7 @@ namespace GCodeHandlers {
         int ticks = nc->GetSimulatedTicks() - 1;
         nc->SetSimulatedTicks(ticks);
         if (ticks > 0) {
-            DEBUG_PRINT("    -> [Waiting] IO processing M codes... Ticks left: %d\n", ticks);
+            //DEBUG_PRINT("    -> [Waiting] IO processing M codes... Ticks left: %d\n", ticks);
             return false;
         }
         return true;
@@ -34,18 +34,18 @@ namespace GCodeHandlers {
         switch (m)
         {
         case 0: // 🌟 M00 程式暫停
-            DEBUG_PRINT("[NC] -> M00 Program Stop\n");
+            //DEBUG_PRINT("[NC] -> M00 Program Stop\n");
             nc->ChangeState(NCState::HOLD);
             // 🌟 關鍵修改：不要回傳 nullptr，改回傳 Callback，讓系統「掛起」這行指令
             return CheckM00Done;
 
         case 30: // 🌟 M30 程式結束
-            DEBUG_PRINT("[NC_SIM] M30 Read\n");
+            //DEBUG_PRINT("[NC_SIM] M30 Read\n");
             // M30 不需要 IO 模擬，直接回傳 nullptr
             return nullptr;
 
         default: // 🌟 其他 IO 型 M 碼 (如 M03, M08)
-            DEBUG_PRINT("[NC_SIM] Triggering M%02d\n", m);
+            //DEBUG_PRINT("[NC_SIM] Triggering M%02d\n", m);
 
             // 模擬 IO 需要 2 個 Ticks 處理
             nc->SetSimulatedTicks(2);

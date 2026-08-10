@@ -14,6 +14,7 @@ constexpr int MAX_PLC_A = 4000;
 constexpr int MAX_PLC_S = 4000;
 constexpr int MAX_PLC_C = 4000;
 constexpr int MAX_PLC_T = 1000;
+constexpr int MAX_PLC_CNT = 1000; // V7.4.6 dedicated Counter Device: CNT0..CNT999
 constexpr int MAX_PLC_R = 1000;
 constexpr int MAX_PLC_DR = 1000;
 constexpr int MAX_PLC_F = 1000;  // REAL (Float)
@@ -23,11 +24,27 @@ constexpr int MAX_PLC_L = 1000;  // LREAL (Double)
 // Timer Structure
 // ==========================================
 struct PLCTimer {
-    bool enable;      // EN
-    bool done;        // DN
+    bool enable;      // Timer engine active / timing
+    bool done;        // DN / Q
     int32_t preset;   // Target time (ms)
     int32_t acc;      // Accumulated time (ms)
-    int32_t timeBase; // 🌟 新增這行：記錄這個 Timer 的時基 (10, 100, 1000)
+    int32_t timeBase; // Timer 時基 (1, 10, 100, 1000 ms)
+
+    // V7.4.5 runtime-only timer state. SHM / logic.bin layout is unchanged.
+    uint8_t mode;     // 0=TON(existing TMR), 1=TOF, 2=TP, 3=RTO
+    bool input;       // latest ACC input for this timer instruction
+    bool prevInput;   // previous scan input, used by TP/TOF edge detection
+};
+
+// ==========================================
+// Counter Structure - V7.4.6
+// ==========================================
+struct PLCCounter {
+    int32_t preset;   // Counter preset / threshold
+    int32_t acc;      // Current accumulated count
+    bool done;        // Counter done bit (instruction-mode dependent)
+    bool initialized; // Runtime-only initialization state
+    uint8_t mode;     // 0=unused/reset, 1=CTU, 2=CTD
 };
 
 // ==========================================
@@ -56,7 +73,7 @@ struct PLCCustomVar {
 
 // Operand Structure (10 Bytes)
 struct PLCOperand {
-    uint8_t region;   // 0=I, 1=O, 2=C, 3=S, 4=A, 5=T, 6=R, 7=DR, 8=#Const, 9=F, 10=L, 11=VAR
+    uint8_t region;   // 0=I,1=O,2=C,3=S,4=A,5=T,6=R,7=DR,8=#,9=F,10=L,11=VAR,12=CNT
     uint8_t dataType; // 1=BOOL, 2=INT, 3=DINT, 4=REAL, 5=LREAL
     union {
         int32_t address;
@@ -85,6 +102,11 @@ struct PLCTask {
     int32_t cycleTimeMs;
     int32_t currentTimerMs; // Scheduler Timer
     std::vector<PLCInstruction> instructions;
+
+    // Runtime-only per-instruction previous-scan state.
+    // Used by OUT_UP / OUT_DOWN, CTU / CTD, and V7.4.9 R_TRIG / F_TRIG.
+    // 不寫入 logic.bin，因此不改變既有 Binary Protocol。
+    std::vector<uint8_t> edgeMemory;
 };
 
 // ==========================================
@@ -96,7 +118,7 @@ public:
     PLCManager();
     ~PLCManager();
 
-    uint32_t PLC_RunCount=0;
+    uint32_t PLC_RunCount = 0;
     int Init_flag = 0;
     int Close_flag = 0;
 
@@ -160,7 +182,8 @@ private:
     float   m_F[MAX_PLC_F];
     double  m_L[MAX_PLC_L];
 
-    PLCTimer m_T[MAX_PLC_T];
+    PLCTimer   m_T[MAX_PLC_T];
+    PLCCounter m_CNT[MAX_PLC_CNT];
 
     // Static Allocation Table for VARs
     std::unordered_map<int32_t, PLCCustomVar> m_customVars;
@@ -176,6 +199,11 @@ private:
     void    SetOperandFromDouble(const PLCOperand& op, double val);
     void    SetOperandFromInt(const PLCOperand& op, int32_t val);
     void    SetOperandFromBool(const PLCOperand& op, bool val);
+
+    // Runtime safety guards. Normal valid PLC programs are unaffected.
+    bool    IsValidOperandAddress(const PLCOperand& op) const;
+    bool    IsValidTimerIndex(int index) const;
+    bool    IsValidCounterIndex(int index) const;
 
     void    ExecuteTask(PLCTask& task);
 };

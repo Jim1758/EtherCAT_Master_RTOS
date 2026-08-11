@@ -431,50 +431,9 @@ namespace HMI_Bridge
 
 
 
-        //PLC----------------------------------------------------------------------
-        if (g_PLC != nullptr)
-        {
-            pShm->PLC_Status.SHM_PLC_RunCount =
-                g_PLC->PLC_RunCount;
+       
+       
 
-            // PLC 狀態全廣播
-            g_PLC->ExportPLCStatus(
-                &pShm->PLC_Status
-            );
-        }
-
-        // 🌟 處理 PLC 點位寫入
-        if (pShm->PLC_Command.writeReq)
-        {
-            if (g_PLC != nullptr) {
-                g_PLC->SetMemory(
-                    pShm->PLC_Command.regionPrefix,
-                    pShm->PLC_Command.index,
-                    pShm->PLC_Command.writeValue
-                );
-            }
-            pShm->PLC_Command.writeReq = false;
-        }
-
-        // 🌟 處理 PLC 變數名稱直接寫入
-        if (pShm->PLC_Command.writeByNameReq)
-        {
-            pShm->PLC_Command.varName[63] = '\0';
-            if (g_PLC != nullptr) {
-                g_PLC->SetVar(
-                    std::string(pShm->PLC_Command.varName),
-                    pShm->PLC_Command.writeValue
-                );
-            }
-            pShm->PLC_Command.writeByNameReq = false;
-        }
-
-        //重置PLC邏輯檔案
-        if (pShm->PLC_Command.ReloadLogicProgram)
-        {
-            g_PLC->ReloadLogicProgram();//重置PLC邏輯檔案
-            pShm->PLC_Command.ReloadLogicProgram = false;
-        }
     }
 
     // =========================================================================
@@ -542,6 +501,98 @@ namespace HMI_Bridge
             }
         }
 
+
+
+        //PLC----------------------------------------------------------------------
+        if (g_PLC != nullptr)
+        {
+            pShm->PLC_Status.SHM_PLC_RunCount =
+                g_PLC->PLC_RunCount;
+
+            // PLC 狀態全廣播
+            g_PLC->ExportPLCStatus(
+                &pShm->PLC_Status
+            );
+        }
+
+        // 🌟 處理 PLC 點位寫入
+        if (pShm->PLC_Command.writeReq)
+        {
+            if (g_PLC != nullptr) {
+                g_PLC->SetMemory(
+                    pShm->PLC_Command.regionPrefix,
+                    pShm->PLC_Command.index,
+                    pShm->PLC_Command.writeValue
+                );
+            }
+            pShm->PLC_Command.writeReq = false;
+        }
+
+        // 🌟 處理 PLC 變數名稱直接寫入
+        if (pShm->PLC_Command.writeByNameReq)
+        {
+            pShm->PLC_Command.varName[63] = '\0';
+            if (g_PLC != nullptr) {
+                g_PLC->SetVar(
+                    std::string(pShm->PLC_Command.varName),
+                    pShm->PLC_Command.writeValue
+                );
+            }
+            pShm->PLC_Command.writeByNameReq = false;
+        }
+
+        //重置PLC邏輯檔案
+        if (pShm->PLC_Command.ReloadLogicProgram)
+        {
+            g_PLC->ReloadLogicProgram();//重置PLC邏輯檔案
+            pShm->PLC_Command.ReloadLogicProgram = false;
+        }
+
+        // V7.5.3 - PLC Runtime Diagnostics read-only broadcast.
+        // Kept outside SHM_PLC_Status so PLC_Command offset remains unchanged.
+        if (g_PLC != nullptr)
+        {
+            const PLCRuntimeDiagnostics diag = g_PLC->GetRuntimeDiagnostics();
+
+            pShm->PLC_Diagnostics.RuntimeFault = diag.faultActive ? 1 : 0;
+            pShm->PLC_Diagnostics.LastFaultCode = diag.lastFaultCode;
+            pShm->PLC_Diagnostics.LastOpcode = diag.lastOpcode;
+            pShm->PLC_Diagnostics.LastOperandRegion = diag.lastOperandRegion;
+            pShm->PLC_Diagnostics.LastTaskIndex = diag.lastTaskIndex;
+            pShm->PLC_Diagnostics.LastInstructionIndex = diag.lastInstructionIndex;
+            pShm->PLC_Diagnostics.LastOperandAddress = diag.lastOperandAddress;
+            pShm->PLC_Diagnostics.LastFaultRunCount = diag.lastFaultRunCount;
+            pShm->PLC_Diagnostics.TotalFaultCount = diag.totalFaultCount;
+            pShm->PLC_Diagnostics.InvalidOperandCount = diag.invalidOperandCount;
+            pShm->PLC_Diagnostics.InvalidTimerIndexCount = diag.invalidTimerIndexCount;
+            pShm->PLC_Diagnostics.InvalidCounterIndexCount = diag.invalidCounterIndexCount;
+            pShm->PLC_Diagnostics.UnknownOpcodeCount = diag.unknownOpcodeCount;
+            pShm->PLC_Diagnostics.RuntimeStateMismatchCount = diag.runtimeStateMismatchCount;
+            pShm->PLC_Diagnostics.InvalidFlowRowCount = diag.invalidFlowRowCount;
+
+            // V7.6.0 - actual accepted logic.bin identity.
+            const PLCLogicVerificationState logicState = g_PLC->GetLogicVerificationState();
+            pShm->PLC_Diagnostics.LoadedLogicCrc32 = logicState.loadedLogicCrc32;
+            pShm->PLC_Diagnostics.LoadedLogicSize = logicState.loadedLogicSize;
+            pShm->PLC_Diagnostics.LogicLoadGeneration = logicState.logicLoadGeneration;
+            pShm->PLC_Diagnostics.LastLogicLoadResult = logicState.lastLogicLoadResult;
+
+            // V7.6.4.1 Runtime Scan Health
+            const PLCScanHealth scanHealth =g_PLC->GetScanHealth();
+            pShm->PLC_Diagnostics.ScanLastCycleUs = scanHealth.lastCycleUs;
+            pShm->PLC_Diagnostics.ScanWorstCycleUs =  scanHealth.worstCycleUs;
+            pShm->PLC_Diagnostics.ScanCycleBudgetUs = scanHealth.cycleBudgetUs;
+            pShm->PLC_Diagnostics.ScanCycleOverrunCount = scanHealth.cycleOverrunCount;
+            pShm->PLC_Diagnostics.ScanLastTaskUs =  scanHealth.lastTaskUs;
+            pShm->PLC_Diagnostics.ScanWorstTaskUs =scanHealth.worstTaskUs;
+            pShm->PLC_Diagnostics.ScanLastTaskBudgetUs =scanHealth.lastTaskBudgetUs;
+            pShm->PLC_Diagnostics.ScanLastTaskIndex = scanHealth.lastTaskIndex;
+            pShm->PLC_Diagnostics.ScanWorstTaskIndex = scanHealth.worstTaskIndex;
+            pShm->PLC_Diagnostics.ScanTaskOverrunCount = scanHealth.taskOverrunCount;
+            pShm->PLC_Diagnostics.ScanMeasuredCycleCount = scanHealth.measuredCycleCount;
+            pShm->PLC_Diagnostics.ScanLastOverrunRunCount =scanHealth.lastOverrunRunCount;
+            pShm->PLC_Diagnostics.ScanLastOverrunTaskIndex = scanHealth.lastOverrunTaskIndex;
+        }
 
 
     }

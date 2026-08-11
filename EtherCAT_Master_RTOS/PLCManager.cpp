@@ -3,6 +3,7 @@
 #include <iostream>
 #include <cstring>
 #include <cmath>
+#include <limits>
 #include <algorithm> // 🌟 加入此列修正 std::sort 找不到的錯誤
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 #include "SHM_Types.h"
@@ -39,6 +40,717 @@ PLCManager::~PLCManager()
     DeleteCriticalSection(&m_logicCS);
 }
 
+
+
+// ============================================================================
+// V7.6.0 Loaded Logic Verification
+// ============================================================================
+
+void PLCManager::ResetLogicVerificationUnsafe()
+{
+    m_loadedLogicCrc32 = 0;
+    m_loadedLogicSize = 0;
+    m_logicLoadGeneration = 0;
+    m_lastLogicLoadResult =
+        static_cast<uint32_t>(PLCLogicLoadResult::None);
+}
+
+void PLCManager::MarkLogicLoadFailed()
+{
+    AutoLockCS lock(&m_logicCS);
+
+    // Preserve the metadata of the logic that is still ACTUALLY running.
+    // Only the result of the most recent load/reload attempt changes.
+    m_lastLogicLoadResult =
+        static_cast<uint32_t>(PLCLogicLoadResult::Failed);
+}
+
+void PLCManager::CommitLoadedLogicVerificationUnsafe(
+    uint32_t crc32,
+    uint32_t fileSize)
+{
+    m_loadedLogicCrc32 = crc32;
+    m_loadedLogicSize = fileSize;
+
+    // Saturate instead of wrapping after an extremely long controller lifetime.
+    if (m_logicLoadGeneration < 0xFFFFFFFFu)
+        ++m_logicLoadGeneration;
+
+    m_lastLogicLoadResult =
+        static_cast<uint32_t>(PLCLogicLoadResult::Success);
+}
+
+PLCLogicVerificationState PLCManager::GetLogicVerificationState() const
+{
+    AutoLockCS lock(&m_logicCS);
+
+    PLCLogicVerificationState state{};
+    state.loadedLogicCrc32 = m_loadedLogicCrc32;
+    state.loadedLogicSize = m_loadedLogicSize;
+    state.logicLoadGeneration = m_logicLoadGeneration;
+    state.lastLogicLoadResult = m_lastLogicLoadResult;
+    return state;
+}
+
+
+// ============================================================================
+// V7.6.3 Runtime Scan Health
+// ============================================================================
+
+
+bool PLCManager::ReadScanCounter(int64_t& valueOut) const
+{
+    LARGE_INTEGER counter{};
+
+    if (!QueryPerformanceCounter(&counter))
+        return false;
+
+    valueOut = static_cast<int64_t>(counter.QuadPart);
+    return true;
+}
+
+uint32_t PLCManager::ScanCounterDeltaToUs(
+    int64_t startCounter,
+    int64_t endCounter) const
+{
+    if (m_scanCounterFrequency <= 0 ||
+        startCounter < 0 ||
+        endCounter < startCounter)
+        return 0;
+
+    const uint64_t ticks =
+        static_cast<uint64_t>(endCounter - startCounter);
+
+    const uint64_t frequency =
+        static_cast<uint64_t>(m_scanCounterFrequency);
+
+    const uint64_t wholeSeconds =
+        ticks / frequency;
+
+    const uint64_t remainder =
+        ticks % frequency;
+
+    if (wholeSeconds > 4294ull)
+        return 0xFFFFFFFFu;
+
+    uint64_t microseconds =
+        wholeSeconds * 1000000ull;
+
+    microseconds +=
+        (remainder * 1000000ull) / frequency;
+
+    return microseconds > 0xFFFFFFFFull
+        ? 0xFFFFFFFFu
+        : static_cast<uint32_t>(microseconds);
+}
+
+void PLCManager::ResetScanHealthUnsafe()
+{
+    m_scanHealth = PLCScanHealth{};
+}
+
+void PLCManager::UpdateTaskScanHealthUnsafe(
+    int32_t taskIndex,
+    uint32_t elapsedUs,
+    uint32_t budgetUs)
+{
+    m_scanHealth.lastTaskUs = elapsedUs;
+    m_scanHealth.lastTaskBudgetUs = budgetUs;
+    m_scanHealth.lastTaskIndex = taskIndex;
+
+    if (elapsedUs > m_scanHealth.worstTaskUs)
+    {
+        m_scanHealth.worstTaskUs = elapsedUs;
+        m_scanHealth.worstTaskIndex = taskIndex;
+    }
+
+    if (budgetUs > 0 && elapsedUs > budgetUs)
+    {
+        if (m_scanHealth.taskOverrunCount < 0xFFFFFFFFu)
+            ++m_scanHealth.taskOverrunCount;
+
+        m_scanHealth.lastOverrunRunCount = PLC_RunCount;
+        m_scanHealth.lastOverrunTaskIndex = taskIndex;
+    }
+}
+
+void PLCManager::UpdateCycleScanHealthUnsafe(
+    uint32_t elapsedUs,
+    uint32_t budgetUs)
+{
+    m_scanHealth.lastCycleUs = elapsedUs;
+    m_scanHealth.cycleBudgetUs = budgetUs;
+
+    if (elapsedUs > m_scanHealth.worstCycleUs)
+        m_scanHealth.worstCycleUs = elapsedUs;
+
+    if (m_scanHealth.measuredCycleCount < 0xFFFFFFFFu)
+        ++m_scanHealth.measuredCycleCount;
+
+    if (budgetUs > 0 && elapsedUs > budgetUs)
+    {
+        if (m_scanHealth.cycleOverrunCount < 0xFFFFFFFFu)
+            ++m_scanHealth.cycleOverrunCount;
+
+        // If a task already overran in this same RunCycle, keep the specific
+        // task index instead of overwriting it with the cycle-level marker.
+        if (m_scanHealth.lastOverrunRunCount != PLC_RunCount)
+        {
+            m_scanHealth.lastOverrunRunCount = PLC_RunCount;
+            m_scanHealth.lastOverrunTaskIndex = -1;
+        }
+    }
+}
+
+PLCScanHealth PLCManager::GetScanHealth() const
+{
+    AutoLockCS lock(&m_logicCS);
+    return m_scanHealth;
+}
+
+// ============================================================================
+// V7.5.2 Runtime Diagnostics & Safety Guard
+// ============================================================================
+
+void PLCManager::IncrementRuntimeFaultCounter(uint32_t& counter)
+{
+    if (counter < 0xFFFFFFFFu)
+        ++counter;
+}
+
+void PLCManager::ResetRuntimeDiagnosticsUnsafe()
+{
+    m_runtimeDiagnostics = PLCRuntimeDiagnostics{};
+    m_activeTaskIndex = -1;
+    m_activeInstructionIndex = -1;
+    m_activeOpcode = 0;
+}
+
+void PLCManager::RecordRuntimeFault(
+    PLCRuntimeFaultCode code,
+    int32_t operandRegion,
+    int32_t operandAddress)
+{
+    const bool duplicateSameInstruction =
+        m_runtimeDiagnostics.faultActive &&
+        m_runtimeDiagnostics.lastFaultRunCount == PLC_RunCount &&
+        m_runtimeDiagnostics.lastTaskIndex == m_activeTaskIndex &&
+        m_runtimeDiagnostics.lastInstructionIndex == m_activeInstructionIndex &&
+        m_runtimeDiagnostics.lastFaultCode == static_cast<uint8_t>(code);
+
+    m_runtimeDiagnostics.faultActive = true;
+    m_runtimeDiagnostics.lastFaultCode = static_cast<uint8_t>(code);
+    m_runtimeDiagnostics.lastOpcode = m_activeOpcode;
+    m_runtimeDiagnostics.lastTaskIndex = m_activeTaskIndex;
+    m_runtimeDiagnostics.lastInstructionIndex = m_activeInstructionIndex;
+    m_runtimeDiagnostics.lastFaultRunCount = PLC_RunCount;
+    m_runtimeDiagnostics.lastOperandRegion =
+        (operandRegion >= 0 && operandRegion <= 255)
+        ? static_cast<uint8_t>(operandRegion)
+        : static_cast<uint8_t>(0xFF);
+    m_runtimeDiagnostics.lastOperandAddress = operandAddress;
+
+    if (duplicateSameInstruction)
+        return;
+
+    IncrementRuntimeFaultCounter(m_runtimeDiagnostics.totalFaultCount);
+
+    switch (code) {
+    case PLCRuntimeFaultCode::InvalidOperand:
+        IncrementRuntimeFaultCounter(m_runtimeDiagnostics.invalidOperandCount); break;
+    case PLCRuntimeFaultCode::InvalidTimerIndex:
+        IncrementRuntimeFaultCounter(m_runtimeDiagnostics.invalidTimerIndexCount); break;
+    case PLCRuntimeFaultCode::InvalidCounterIndex:
+        IncrementRuntimeFaultCounter(m_runtimeDiagnostics.invalidCounterIndexCount); break;
+    case PLCRuntimeFaultCode::UnknownOpcode:
+        IncrementRuntimeFaultCounter(m_runtimeDiagnostics.unknownOpcodeCount); break;
+    case PLCRuntimeFaultCode::RuntimeStateMismatch:
+        IncrementRuntimeFaultCounter(m_runtimeDiagnostics.runtimeStateMismatchCount); break;
+    case PLCRuntimeFaultCode::InvalidFlowRow:
+        IncrementRuntimeFaultCounter(m_runtimeDiagnostics.invalidFlowRowCount); break;
+
+        // Extended V7.5.5+ faults intentionally reuse TotalFaultCount only.
+        // This keeps the V7.5.3 SHM_PLC_Diagnostics binary layout unchanged.
+    case PLCRuntimeFaultCode::ArithmeticDomain:
+    case PLCRuntimeFaultCode::IntegerOverflow:
+    case PLCRuntimeFaultCode::InvalidBitIndex:
+    case PLCRuntimeFaultCode::InvalidTaskConfig:
+        break;
+
+    case PLCRuntimeFaultCode::None:
+    default:
+        break;
+    }
+}
+
+PLCRuntimeDiagnostics PLCManager::GetRuntimeDiagnostics() const
+{
+    AutoLockCS lock(&m_logicCS);
+    return m_runtimeDiagnostics;
+}
+
+void PLCManager::ClearRuntimeDiagnostics()
+{
+    AutoLockCS lock(&m_logicCS);
+    ResetRuntimeDiagnosticsUnsafe();
+}
+
+
+// ============================================================================
+// V7.5.4 ~ V7.5.7 Data / Instruction / Loader Safety Helpers
+// ============================================================================
+
+bool PLCManager::IsSupportedOpcode(uint8_t opcode) const
+{
+    switch (opcode)
+    {
+    case 1: case 2: case 3: case 4: case 5: case 6:
+    case 7: case 8: case 9: case 10: case 11: case 12:
+    case 13: case 14: case 15: case 16: case 17:
+    case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27:
+    case 30: case 31: case 32: case 33: case 34: case 35:
+    case 40: case 41: case 42:
+    case 50: case 51: case 52:
+    case 60: case 61: case 62: case 63:
+    case 70: case 71:
+    case 72: case 73: case 74: case 75: case 76: case 77: case 78: case 79:
+    case 80: case 81:
+    case 83: case 84:
+        // V7.5.4 Advanced PLC Instruction Pack
+    case 85: case 86: case 87: case 88: case 89: case 90:
+    case 91: case 92: case 93: case 94: case 95: case 96: case 97:
+        // V7.6.1 PLC System Contacts
+    case 98: case 99: case 100: case 101: case 102: case 103:
+        // V7.6.2 Process Math
+    case 104: case 105: case 106: case 107:
+    case 108: case 109: case 110: case 111: case 112:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool PLCManager::IsNumericWritableOperand(const PLCOperand& op) const
+{
+    if (!IsValidOperandAddress(op)) return false;
+
+    switch (op.region)
+    {
+    case 6:  // R
+    case 7:  // DR
+    case 9:  // F
+    case 10: // L
+        return true;
+
+    case 11: // VAR
+    {
+        auto it = m_customVars.find(op.payload.address);
+        if (it == m_customVars.end()) return false;
+        return it->second.dataType >= 2 && it->second.dataType <= 5;
+    }
+
+    default:
+        return false;
+    }
+}
+
+bool PLCManager::IsIntegerWritableOperand(const PLCOperand& op) const
+{
+    if (!IsValidOperandAddress(op)) return false;
+
+    if (op.region == 6 || op.region == 7)
+        return true;
+
+    if (op.region == 11)
+    {
+        auto it = m_customVars.find(op.payload.address);
+        if (it == m_customVars.end()) return false;
+        return it->second.dataType == 2 || it->second.dataType == 3;
+    }
+
+    return false;
+}
+
+bool PLCManager::IsNumericReadableOperand(const PLCOperand& op) const
+{
+    if (op.region == 8) // constant
+        return op.dataType >= 2 && op.dataType <= 5;
+
+    if (!IsValidOperandAddress(op))
+        return false;
+
+    if (op.region == 6 || op.region == 7 || op.region == 9 || op.region == 10)
+        return true;
+
+    if (op.region == 11)
+    {
+        auto it = m_customVars.find(op.payload.address);
+        if (it == m_customVars.end()) return false;
+        return it->second.dataType >= 2 && it->second.dataType <= 5;
+    }
+
+    return false;
+}
+
+bool PLCManager::IsIntegerReadableOperand(const PLCOperand& op) const
+{
+    if (op.region == 8)
+        return op.dataType == 2 || op.dataType == 3;
+
+    if (!IsValidOperandAddress(op))
+        return false;
+
+    if (op.region == 6 || op.region == 7)
+        return true;
+
+    if (op.region == 11)
+    {
+        auto it = m_customVars.find(op.payload.address);
+        if (it == m_customVars.end()) return false;
+        return it->second.dataType == 2 || it->second.dataType == 3;
+    }
+
+    return false;
+}
+
+int32_t PLCManager::ClampDoubleToInt32(double value)
+{
+    if (!std::isfinite(value))
+    {
+        RecordRuntimeFault(PLCRuntimeFaultCode::ArithmeticDomain);
+        return 0;
+    }
+
+    const double hi = static_cast<double>((std::numeric_limits<int32_t>::max)());
+    const double lo = static_cast<double>((std::numeric_limits<int32_t>::min)());
+
+    if (value > hi)
+    {
+        RecordRuntimeFault(PLCRuntimeFaultCode::IntegerOverflow);
+        return (std::numeric_limits<int32_t>::max)();
+    }
+
+    if (value < lo)
+    {
+        RecordRuntimeFault(PLCRuntimeFaultCode::IntegerOverflow);
+        return (std::numeric_limits<int32_t>::min)();
+    }
+
+    return static_cast<int32_t>(value);
+}
+
+float PLCManager::ClampDoubleToFloat(double value)
+{
+    if (!std::isfinite(value))
+    {
+        RecordRuntimeFault(PLCRuntimeFaultCode::ArithmeticDomain);
+        return 0.0f;
+    }
+
+    const double hi = static_cast<double>((std::numeric_limits<float>::max)());
+
+    if (value > hi)
+    {
+        RecordRuntimeFault(PLCRuntimeFaultCode::IntegerOverflow);
+        return (std::numeric_limits<float>::max)();
+    }
+
+    if (value < -hi)
+    {
+        RecordRuntimeFault(PLCRuntimeFaultCode::IntegerOverflow);
+        return -(std::numeric_limits<float>::max)();
+    }
+
+    return static_cast<float>(value);
+}
+
+int32_t PLCManager::NormalizePositivePreset(int32_t value)
+{
+    if (value > 0)
+        return value;
+
+    RecordRuntimeFault(PLCRuntimeFaultCode::ArithmeticDomain);
+    return 1;
+}
+
+int32_t PLCManager::BuildTimerPresetMs(int32_t presetValue, int32_t timeBase)
+{
+    const int32_t safePreset = NormalizePositivePreset(presetValue);
+    const int32_t safeBase = timeBase > 0 ? timeBase : 1;
+
+    const int64_t value =
+        static_cast<int64_t>(safePreset) *
+        static_cast<int64_t>(safeBase);
+
+    if (value > (std::numeric_limits<int32_t>::max)())
+    {
+        RecordRuntimeFault(PLCRuntimeFaultCode::IntegerOverflow);
+        return (std::numeric_limits<int32_t>::max)();
+    }
+
+    return static_cast<int32_t>(value);
+}
+
+bool PLCManager::ParseLogicProgramFile(
+    const std::string& filepath,
+    std::vector<PLCTask>& tasksOut,
+    std::unordered_map<int32_t, PLCCustomVar>& varsOut,
+    uint32_t& crc32Out,
+    uint32_t& fileSizeOut)
+{
+    tasksOut.clear();
+    varsOut.clear();
+    crc32Out = 0;
+    fileSizeOut = 0;
+
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open())
+        return false;
+
+    uint32_t crcState = 0xFFFFFFFFu;
+    uint32_t byteCount = 0;
+
+    auto consumeBytesForCrc = [&](const void* buffer, std::streamsize bytes) -> bool
+    {
+        if (buffer == nullptr || bytes < 0)
+            return false;
+
+        const uint64_t bytes64 = static_cast<uint64_t>(bytes);
+        if (bytes64 > static_cast<uint64_t>(0xFFFFFFFFu - byteCount))
+            return false;
+
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(buffer);
+
+        for (std::streamsize i = 0; i < bytes; ++i)
+        {
+            crcState ^= ptr[i];
+
+            for (int bit = 0; bit < 8; ++bit)
+            {
+                crcState =
+                    (crcState >> 1) ^
+                    (0xEDB88320u & (0u - (crcState & 1u)));
+            }
+        }
+
+        byteCount += static_cast<uint32_t>(bytes);
+        return true;
+    };
+
+    auto readExact = [&](void* buffer, std::streamsize bytes) -> bool
+    {
+        if (bytes < 0)
+            return false;
+
+        file.read(reinterpret_cast<char*>(buffer), bytes);
+
+        if (file.gcount() != bytes)
+            return false;
+
+        return consumeBytesForCrc(buffer, bytes);
+    };
+
+    char header[8] = {};
+    if (!readExact(header, 8))
+        return false;
+
+    if (std::memcmp(header, "RTOS_PLC", 8) != 0)
+        return false;
+
+    bool sawEndTag = false;
+    bool sawAllocationTable = false;
+    bool sawTask = false;
+
+    while (true)
+    {
+        uint8_t tag = 0;
+        if (!readExact(&tag, 1))
+            return false;
+
+        if (tag == 255)
+        {
+            sawEndTag = true;
+            break;
+        }
+
+        if (tag == 253)
+        {
+            // V7.6.4 final format: exactly one allocation table and it must
+            // appear before every Task block.
+            if (sawAllocationTable || sawTask)
+                return false;
+
+            sawAllocationTable = true;
+
+            int32_t varCount = 0;
+            if (!readExact(&varCount, 4))
+                return false;
+
+            if (varCount < 0 || varCount > MAX_PLC_VAR_ALLOCATIONS)
+                return false;
+
+            for (int32_t i = 0; i < varCount; ++i)
+            {
+                int32_t hashId = 0;
+                uint8_t dataType = 0;
+
+                if (!readExact(&hashId, 4) ||
+                    !readExact(&dataType, 1))
+                    return false;
+
+                if (dataType < 1 || dataType > 5)
+                    return false;
+
+                if (varsOut.find(hashId) != varsOut.end())
+                    return false;
+
+                PLCCustomVar newVar{};
+                newVar.dataType = dataType;
+                std::memset(newVar.value.raw, 0, sizeof(newVar.value.raw));
+                varsOut.emplace(hashId, newVar);
+            }
+
+            continue;
+        }
+
+        if (tag != 254)
+            return false;
+
+        if (!sawAllocationTable)
+            return false;
+
+        sawTask = true;
+
+        if (tasksOut.size() >= static_cast<size_t>(MAX_PLC_TASKS))
+            return false;
+
+        PLCTask newTask{};
+
+        if (!readExact(&newTask.type, 1) ||
+            !readExact(&newTask.priority, 1) ||
+            !readExact(&newTask.cycleTimeMs, 4))
+            return false;
+
+        if (newTask.type < 1 || newTask.type > 4 ||
+            newTask.priority > 31 ||
+            (newTask.type == 1 && newTask.cycleTimeMs < 1))
+            return false;
+
+        newTask.currentTimerMs = newTask.cycleTimeMs;
+
+        while (true)
+        {
+            const int next = file.peek();
+            if (next == EOF)
+                return false;
+
+            if (next == 253 || next == 254 || next == 255)
+                break;
+
+            if (newTask.instructions.size() >=
+                static_cast<size_t>(MAX_PLC_INSTRUCTIONS_PER_TASK))
+                return false;
+
+            PLCInstruction inst{};
+            if (!readExact(&inst, sizeof(PLCInstruction)))
+                return false;
+
+            if (!IsSupportedOpcode(inst.opCode))
+                return false;
+
+            newTask.instructions.push_back(inst);
+        }
+
+        PrepareTaskRuntimeState(newTask);
+        tasksOut.push_back(std::move(newTask));
+    }
+
+    if (!sawEndTag || !sawAllocationTable || !sawTask)
+        return false;
+
+    // V7.6.4 final binary contract:
+    // tag 255 is followed by exactly 5 zero bytes:
+    //     byte 0 + int32 0
+    // No extra bytes are accepted.
+    uint8_t trailer[5] = {};
+    if (!readExact(trailer, 5))
+        return false;
+
+    for (uint8_t value : trailer)
+    {
+        if (value != 0)
+            return false;
+    }
+
+    if (file.peek() != EOF)
+        return false;
+
+    std::sort(
+        tasksOut.begin(),
+        tasksOut.end(),
+        [](const PLCTask& a, const PLCTask& b)
+        {
+            return a.priority < b.priority;
+        });
+
+    crc32Out = ~crcState;
+    fileSizeOut = byteCount;
+    return true;
+}
+
+// ============================================================================
+// V7.5.0 Stateful Runtime Foundation
+// ============================================================================
+
+void PLCManager::PrepareTaskRuntimeState(PLCTask& task)
+{
+    // IMPORTANT:
+    // This function is called only from LoadLogicProgram / ReloadLogicProgram.
+    // Heap allocation here is intentionally outside the 1ms ExecuteTask path.
+    task.edgeMemory.assign(task.instructions.size(), 0);
+    task.flowRows.assign(MAX_PLC_FLOW_ROWS, 0);
+    task.firstScanPending = true;
+}
+
+bool PLCManager::IsTaskRuntimeStateReady(const PLCTask& task) const
+{
+    return
+        task.edgeMemory.size() == task.instructions.size() &&
+        task.flowRows.size() == static_cast<size_t>(MAX_PLC_FLOW_ROWS);
+}
+
+void PLCManager::ResetTimerRuntimeState(PLCTimer& timer)
+{
+    timer.enable = false;
+    timer.done = false;
+    timer.preset = 0;
+    timer.acc = 0;
+    timer.timeBase = 0;
+    timer.mode = 0;
+    timer.input = false;
+    timer.prevInput = false;
+}
+
+void PLCManager::ResetCounterRuntimeState(PLCCounter& counter)
+{
+    counter.preset = 0;
+    counter.acc = 0;
+    counter.done = false;
+    counter.zero = true;
+    counter.initialized = false;
+    counter.mode = 0;
+}
+
+void PLCManager::ResetAllStatefulDevices()
+{
+    for (int i = 0; i < MAX_PLC_T; ++i)
+        ResetTimerRuntimeState(m_T[i]);
+
+    for (int i = 0; i < MAX_PLC_CNT; ++i)
+        ResetCounterRuntimeState(m_CNT[i]);
+}
+
+
 void PLCManager::Init()
 {
     std::memset(m_I, 0, sizeof(m_I));
@@ -51,23 +763,24 @@ void PLCManager::Init()
     std::memset(m_F, 0, sizeof(m_F));
     std::memset(m_L, 0, sizeof(m_L));
 
-    for (int i = 0; i < MAX_PLC_T; i++) {
-        m_T[i].enable = false;
-        m_T[i].done = false;
-        m_T[i].preset = 0;
-        m_T[i].acc = 0;
-        m_T[i].timeBase = 0;
-        m_T[i].mode = 0;
-        m_T[i].input = false;
-        m_T[i].prevInput = false;
-    }
+    // Stateful devices are reset through one shared implementation so Init and
+    // Hot Reload cannot silently diverge.
+    ResetAllStatefulDevices();
+    ResetRuntimeDiagnosticsUnsafe();
+    ResetScanHealthUnsafe();
+    ResetLogicVerificationUnsafe();
 
-    for (int i = 0; i < MAX_PLC_CNT; i++) {
-        m_CNT[i].preset = 0;
-        m_CNT[i].acc = 0;
-        m_CNT[i].done = false;
-        m_CNT[i].initialized = false;
-        m_CNT[i].mode = 0;
+    LARGE_INTEGER scanFrequency{};
+    if (QueryPerformanceFrequency(&scanFrequency) &&
+        scanFrequency.QuadPart > 0)
+    {
+        m_scanCounterFrequency =
+            static_cast<int64_t>(scanFrequency.QuadPart);
+    }
+    else
+    {
+        // Measurement unavailable must never stop PLC execution.
+        m_scanCounterFrequency = 0;
     }
 
     LoadDRValues(GlobalConfig::GetInstance().PLC_Dir + "PLC_DR.txt");
@@ -96,79 +809,52 @@ void PLCManager::Close_PLC()
 // =========================================================
 bool PLCManager::LoadLogicProgram(const std::string& filepath)
 {
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << "[PLC] Failed to open logic file: " << filepath << std::endl;
+    std::vector<PLCTask> tempTasks;
+    std::unordered_map<int32_t, PLCCustomVar> tempVars;
+    uint32_t parsedCrc32 = 0;
+    uint32_t parsedFileSize = 0;
+
+    if (!ParseLogicProgramFile(
+        filepath,
+        tempTasks,
+        tempVars,
+        parsedCrc32,
+        parsedFileSize))
+    {
+        MarkLogicLoadFailed();
+
+        std::cerr << "[PLC] Invalid or incomplete PLC logic file: "
+            << filepath << std::endl;
         return false;
     }
 
-    char header[9] = { 0 };
-    file.read(header, 8);
-    if (std::string(header) != "RTOS_PLC") {
-        std::cerr << "[PLC] Invalid PLC logic file format!" << std::endl;
-        return false;
+    // Atomic ownership handoff. Existing memory points are not changed.
+    {
+        AutoLockCS lock(&m_logicCS);
+        m_tasks.swap(tempTasks);
+        m_customVars.swap(tempVars);
+        ResetAllStatefulDevices();
+        ResetRuntimeDiagnosticsUnsafe();
+        ResetScanHealthUnsafe();
+
+        // Commit verification metadata ONLY after the new logic has been
+        // accepted and swapped into the runtime.
+        CommitLoadedLogicVerificationUnsafe(
+            parsedCrc32,
+            parsedFileSize);
     }
 
-    m_tasks.clear();
-    m_customVars.clear();
-
-    while (file.good() && !file.eof()) {
-        uint8_t tag;
-        file.read(reinterpret_cast<char*>(&tag), 1);
-        if (file.eof()) break;
-
-        // Parse Tag 253: Static Allocation Table for VAR
-        if (tag == 253) {
-            int32_t varCount;
-            file.read(reinterpret_cast<char*>(&varCount), 4);
-
-            for (int i = 0; i < varCount; i++) {
-                int32_t hashId; uint8_t dataType;
-                file.read(reinterpret_cast<char*>(&hashId), 4);
-                file.read(reinterpret_cast<char*>(&dataType), 1);
-
-                PLCCustomVar newVar;
-                newVar.dataType = dataType;
-                std::memset(newVar.value.raw, 0, 8);
-                m_customVars[hashId] = newVar;
-            }
-            std::cout << "[PLC] Statically allocated " << varCount << " custom variable spaces.\n";
-        }
-        // Parse Tag 254: Task and Instructions
-        else if (tag == 254) {
-            PLCTask newTask;
-            file.read(reinterpret_cast<char*>(&newTask.type), 1);
-            file.read(reinterpret_cast<char*>(&newTask.priority), 1);
-            file.read(reinterpret_cast<char*>(&newTask.cycleTimeMs), 4);
-
-            newTask.currentTimerMs = newTask.cycleTimeMs; // Initialize timer
-
-            while (true) {
-                uint8_t nextByte = file.peek();
-                if (nextByte == 253 || nextByte == 254 || nextByte == 255 || file.eof()) {
-                    break;
-                }
-                PLCInstruction inst;
-                file.read(reinterpret_cast<char*>(&inst), sizeof(PLCInstruction));
-                newTask.instructions.push_back(inst);
-            }
-            newTask.edgeMemory.assign(newTask.instructions.size(), 0);
-            newTask.flowRows.assign(MAX_PLC_FLOW_ROWS, 0); // allocate outside real-time scan
-            m_tasks.push_back(newTask);
-            std::cout << "[PLC] Successfully loaded Task, containing " << newTask.instructions.size() << " instructions.\n";
-        }
-        // Parse Tag 255: EOF
-        else if (tag == 255) {
-            break;
-        }
-    }
-
-    file.close();
-
-    // 🌟 依照 Task Priority 進行排序 (Priority 數字越小越優先執行)
-    std::sort(m_tasks.begin(), m_tasks.end(), [](const PLCTask& a, const PLCTask& b) {
-        return a.priority < b.priority;
-        });
+    std::cout << "[PLC] Loaded "
+        << m_tasks.size()
+        << " PLC task(s). CRC32="
+        << std::hex << std::uppercase
+        << m_loadedLogicCrc32
+        << std::dec
+        << ", Size="
+        << m_loadedLogicSize
+        << " bytes, Generation="
+        << m_logicLoadGeneration
+        << std::endl;
 
     return true;
 }
@@ -260,13 +946,19 @@ double PLCManager::GetOperandAsDouble(const PLCOperand& op) {
 
     if (op.region == 11) { // Custom VAR
         auto it = m_customVars.find(op.payload.address);
-        if (it == m_customVars.end()) return 0.0;
+        if (it == m_customVars.end()) {
+            RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, op.region, op.payload.address);
+            return 0.0;
+        }
         if (op.dataType == 4) return it->second.value.fVal;
         if (op.dataType == 5) return it->second.value.dVal;
         return it->second.value.iVal;
     }
 
-    if (!IsValidOperandAddress(op)) return 0.0;
+    if (!IsValidOperandAddress(op)) {
+        RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, op.region, op.payload.address);
+        return 0.0;
+    }
 
     const int addr = op.payload.address;
     switch (op.region) {
@@ -286,47 +978,87 @@ double PLCManager::GetOperandAsDouble(const PLCOperand& op) {
 }
 
 int32_t PLCManager::GetOperandAsInt(const PLCOperand& op) {
-    return static_cast<int32_t>(GetOperandAsDouble(op));
+    return ClampDoubleToInt32(GetOperandAsDouble(op));
 }
 
 bool PLCManager::GetOperandAsBool(const PLCOperand& op) {
     if (op.region == 5) {
         const int index = op.payload.address;
-        return IsValidTimerIndex(index) ? m_T[index].done : false;
+        if (!IsValidTimerIndex(index)) {
+            RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTimerIndex, op.region, index);
+            return false;
+        }
+        return m_T[index].done;
     }
     if (op.region == 12) {
         const int index = op.payload.address;
-        return IsValidCounterIndex(index) ? m_CNT[index].done : false;
+        if (!IsValidCounterIndex(index)) {
+            RecordRuntimeFault(PLCRuntimeFaultCode::InvalidCounterIndex, op.region, index);
+            return false;
+        }
+        return m_CNT[index].done;
     }
     return GetOperandAsInt(op) != 0;
 }
 
 void PLCManager::SetOperandFromDouble(const PLCOperand& op, double val) {
-    if (op.region == 8) return; // Cannot write to constant.
-
-    if (op.region == 11) { // Custom VAR
-        auto it = m_customVars.find(op.payload.address);
-        if (it == m_customVars.end()) return;
-        if (op.dataType == 4) it->second.value.fVal = static_cast<float>(val);
-        else if (op.dataType == 5) it->second.value.dVal = val;
-        else it->second.value.iVal = static_cast<int32_t>(val);
+    if (op.region == 8) {
+        RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, op.region, op.payload.intValue);
         return;
     }
 
-    if (!IsValidOperandAddress(op)) return;
+    if (op.region == 11) { // Custom VAR
+        auto it = m_customVars.find(op.payload.address);
+        if (it == m_customVars.end()) {
+            RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, op.region, op.payload.address);
+            return;
+        }
+        if (op.dataType == 4)
+            it->second.value.fVal = ClampDoubleToFloat(val);
+        else if (op.dataType == 5)
+        {
+            if (!std::isfinite(val)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::ArithmeticDomain, op.region, op.payload.address);
+                it->second.value.dVal = 0.0;
+            }
+            else {
+                it->second.value.dVal = val;
+            }
+        }
+        else
+            it->second.value.iVal = ClampDoubleToInt32(val);
+        return;
+    }
+
+    if (!IsValidOperandAddress(op)) {
+        RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, op.region, op.payload.address);
+        return;
+    }
 
     const int addr = op.payload.address;
     switch (op.region) {
-    case 6: m_R[addr] = static_cast<int32_t>(val); break;
-    case 7: m_DR[addr] = static_cast<int32_t>(val); break;
-    case 9: m_F[addr] = static_cast<float>(val); break;
-    case 10: m_L[addr] = val; break;
+    case 6: m_R[addr] = ClampDoubleToInt32(val); break;
+    case 7: m_DR[addr] = ClampDoubleToInt32(val); break;
+    case 9: m_F[addr] = ClampDoubleToFloat(val); break;
+    case 10:
+        if (!std::isfinite(val)) {
+            RecordRuntimeFault(PLCRuntimeFaultCode::ArithmeticDomain, op.region, addr);
+            m_L[addr] = 0.0;
+        }
+        else {
+            m_L[addr] = val;
+        }
+        break;
     case 1: m_O[addr] = (val != 0); break;
     case 2: m_C[addr] = (val != 0); break;
     case 3: m_S[addr] = (val != 0); break;
     case 4: m_A[addr] = (val != 0); break;
-    case 12: break; // CNT is owned by Counter instructions; generic writes are blocked.
-    default: break;
+    case 0:
+    case 5:
+    case 12:
+    default:
+        RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, op.region, addr);
+        break;
     }
 }
 
@@ -343,6 +1075,11 @@ void PLCManager::SetOperandFromBool(const PLCOperand& op, bool val) {
 // =========================================================
 void PLCManager::RunCycle(int delta_ms)
 {
+    if (delta_ms <= 0) {
+        RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTaskConfig);
+        return;
+    }
+
     if (Init_flag != 1)
     {
         return;
@@ -351,6 +1088,11 @@ void PLCManager::RunCycle(int delta_ms)
     {
         return;
     }
+
+    int64_t cycleStartCounter = 0;
+    const bool cycleTimingReady =
+        ReadScanCounter(cycleStartCounter);
+
     PLC_RunCount += 1;
 
     // 🌟 使用我們自己寫的 AutoLockCS，傳入 m_logicCS 的記憶體位址
@@ -369,9 +1111,13 @@ void PLCManager::RunCycle(int delta_ms)
                 timer.done = true;
             }
             else if (timer.enable && timer.done) {
-                timer.acc += delta_ms;
+                const int64_t nextAcc =
+                    static_cast<int64_t>(timer.acc) +
+                    static_cast<int64_t>(delta_ms);
+                timer.acc = nextAcc >= timer.preset
+                    ? timer.preset
+                    : static_cast<int32_t>(nextAcc);
                 if (timer.acc >= timer.preset) {
-                    timer.acc = timer.preset;
                     timer.done = false;
                     timer.enable = false;
                 }
@@ -380,9 +1126,13 @@ void PLCManager::RunCycle(int delta_ms)
 
         case 2: // TP - fixed pulse after rising edge, independent of later input state.
             if (timer.enable && timer.done) {
-                timer.acc += delta_ms;
+                const int64_t nextAcc =
+                    static_cast<int64_t>(timer.acc) +
+                    static_cast<int64_t>(delta_ms);
+                timer.acc = nextAcc >= timer.preset
+                    ? timer.preset
+                    : static_cast<int32_t>(nextAcc);
                 if (timer.acc >= timer.preset) {
-                    timer.acc = timer.preset;
                     timer.done = false;
                     timer.enable = false;
                 }
@@ -391,9 +1141,13 @@ void PLCManager::RunCycle(int delta_ms)
 
         case 3: // RTO - retain acc/done while input is OFF; TMR_RST clears it.
             if (timer.enable && !timer.done) {
-                timer.acc += delta_ms;
+                const int64_t nextAcc =
+                    static_cast<int64_t>(timer.acc) +
+                    static_cast<int64_t>(delta_ms);
+                timer.acc = nextAcc >= timer.preset
+                    ? timer.preset
+                    : static_cast<int32_t>(nextAcc);
                 if (timer.acc >= timer.preset) {
-                    timer.acc = timer.preset;
                     timer.done = true;
                     timer.enable = false;
                 }
@@ -404,9 +1158,13 @@ void PLCManager::RunCycle(int delta_ms)
         default: // Existing TON / TMR behavior.
             if (timer.enable) {
                 if (!timer.done) {
-                    timer.acc += delta_ms;
+                    const int64_t nextAcc =
+                        static_cast<int64_t>(timer.acc) +
+                        static_cast<int64_t>(delta_ms);
+                    timer.acc = nextAcc >= timer.preset
+                        ? timer.preset
+                        : static_cast<int32_t>(nextAcc);
                     if (timer.acc >= timer.preset) {
-                        timer.acc = timer.preset;
                         timer.done = true;
                     }
                 }
@@ -420,40 +1178,127 @@ void PLCManager::RunCycle(int delta_ms)
     }
 
     // RTOS Task Scheduler based on Cycle Time
-    for (auto& task : m_tasks) {
-        if (task.type == 1) { // Cyclic
-            task.currentTimerMs += delta_ms;
+    for (size_t taskIndex = 0; taskIndex < m_tasks.size(); ++taskIndex) {
+        PLCTask& task = m_tasks[taskIndex];
+        if (task.type == 1) {
+            if (task.cycleTimeMs < 1) {
+                m_activeTaskIndex = static_cast<int32_t>(taskIndex);
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTaskConfig);
+                m_activeTaskIndex = -1;
+                continue;
+            }
+
+            const int64_t nextTaskTimer =
+                static_cast<int64_t>(task.currentTimerMs) +
+                static_cast<int64_t>(delta_ms);
+
+            task.currentTimerMs =
+                nextTaskTimer > (std::numeric_limits<int32_t>::max)()
+                ? task.cycleTimeMs
+                : static_cast<int32_t>(nextTaskTimer);
+
             if (task.currentTimerMs >= task.cycleTimeMs) {
                 task.currentTimerMs -= task.cycleTimeMs;
-                ExecuteTask(task);
+
+                int64_t taskStartCounter = 0;
+                const bool taskTimingReady =
+                    ReadScanCounter(taskStartCounter);
+
+                ExecuteTask(task, static_cast<int32_t>(taskIndex));
+
+                int64_t taskEndCounter = 0;
+
+                if (taskTimingReady &&
+                    ReadScanCounter(taskEndCounter))
+                {
+                    const uint32_t taskUs =
+                        ScanCounterDeltaToUs(
+                            taskStartCounter,
+                            taskEndCounter);
+
+                    const uint64_t rawBudgetUs =
+                        static_cast<uint64_t>(task.cycleTimeMs) * 1000ull;
+
+                    const uint32_t taskBudgetUs =
+                        rawBudgetUs > 0xFFFFFFFFull
+                        ? 0xFFFFFFFFu
+                        : static_cast<uint32_t>(rawBudgetUs);
+
+                    UpdateTaskScanHealthUnsafe(
+                        static_cast<int32_t>(taskIndex),
+                        taskUs,
+                        taskBudgetUs);
+                }
             }
         }
+    }
+
+    int64_t cycleEndCounter = 0;
+
+    if (cycleTimingReady &&
+        ReadScanCounter(cycleEndCounter))
+    {
+        const uint32_t cycleUs =
+            ScanCounterDeltaToUs(
+                cycleStartCounter,
+                cycleEndCounter);
+
+        const uint64_t rawCycleBudgetUs =
+            static_cast<uint64_t>(delta_ms) * 1000ull;
+
+        const uint32_t cycleBudgetUs =
+            rawCycleBudgetUs > 0xFFFFFFFFull
+            ? 0xFFFFFFFFu
+            : static_cast<uint32_t>(rawCycleBudgetUs);
+
+        UpdateCycleScanHealthUnsafe(
+            cycleUs,
+            cycleBudgetUs);
     }
 }
 
 // =========================================================
 // 4. Virtual Machine: Instruction Decoding & Execution
 // =========================================================
-void PLCManager::ExecuteTask(PLCTask& task)
+void PLCManager::ExecuteTask(PLCTask& task, int32_t taskIndex)
 {
-    bool ACC = false; // Accumulator
+    bool ACC = false;
 
-    // Old logic.bin files do not contain edgeMemory. Build it at runtime if needed.
-    if (task.edgeMemory.size() != task.instructions.size()) {
-        task.edgeMemory.assign(task.instructions.size(), 0);
+    m_activeTaskIndex = taskIndex;
+    m_activeInstructionIndex = -1;
+    m_activeOpcode = 0;
+
+    if (!IsTaskRuntimeStateReady(task)) {
+        RecordRuntimeFault(PLCRuntimeFaultCode::RuntimeStateMismatch);
+        m_activeTaskIndex = -1;
+        return;
     }
 
-    // V7.4.9.1 True Ladder Logic Core.
-    // flowRows is runtime-only and grows only to the row indices emitted by Studio.
     auto ensureFlowRow = [&](int row) -> bool {
-        // No heap allocation is allowed here: flowRows is allocated during Load/Reload.
-        if (row < 0 || row >= MAX_PLC_FLOW_ROWS) return false;
-        return task.flowRows.size() == static_cast<size_t>(MAX_PLC_FLOW_ROWS);
+        if (row < 0 || row >= MAX_PLC_FLOW_ROWS) {
+            RecordRuntimeFault(PLCRuntimeFaultCode::InvalidFlowRow, -1, row);
+            return false;
+        }
+        return true;
     };
+
+    // First Scan is task-local so slower cyclic tasks cannot miss the pulse.
+    // Every instruction in this first task execution sees the same TRUE state.
+    const bool taskFirstScan = task.firstScanPending;
+
+    // V7.6.2 SCALE staging: scan-local only, no heap, no FB instance.
+    bool scaleSequenceValid = false;
+    bool scaleClampInput = false;
+    double scaleInputValue = 0.0;
+    double scaleInputLow = 0.0;
+    double scaleInputHigh = 0.0;
+    double scaleOutputLow = 0.0;
 
     for (size_t instIndex = 0; instIndex < task.instructions.size(); ++instIndex)
     {
         const auto& inst = task.instructions[instIndex];
+        m_activeInstructionIndex = static_cast<int32_t>(instIndex);
+        m_activeOpcode = inst.opCode;
 
         switch (inst.opCode)
         {
@@ -466,16 +1311,28 @@ void PLCManager::ExecuteTask(PLCTask& task)
             break;
 
         case 3:  // LDT
-            ACC = IsValidTimerIndex(inst.op1.payload.address)
-                ? m_T[inst.op1.payload.address].done
-                : false;
+        {
+            const int tIdx = inst.op1.payload.address;
+            if (!IsValidTimerIndex(tIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTimerIndex, inst.op1.region, tIdx);
+                ACC = false;
+                break;
+            }
+            ACC = m_T[tIdx].done;
             break;
+        }
 
         case 4:  // LDIT
-            ACC = IsValidTimerIndex(inst.op1.payload.address)
-                ? !m_T[inst.op1.payload.address].done
-                : false;
+        {
+            const int tIdx = inst.op1.payload.address;
+            if (!IsValidTimerIndex(tIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTimerIndex, inst.op1.region, tIdx);
+                ACC = false;
+                break;
+            }
+            ACC = !m_T[tIdx].done;
             break;
+        }
 
         case 5:  // OR
             ACC = ACC || GetOperandAsBool(inst.op1);
@@ -525,7 +1382,10 @@ void PLCManager::ExecuteTask(PLCTask& task)
         case 15: // TMR_1S  (1000ms Base)
         {
             const int tIdx = inst.op1.payload.address;
-            if (!IsValidTimerIndex(tIdx)) break;
+            if (!IsValidTimerIndex(tIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTimerIndex, inst.op1.region, tIdx);
+                break;
+            }
 
             if (ACC) {
                 const int base =
@@ -539,7 +1399,7 @@ void PLCManager::ExecuteTask(PLCTask& task)
                 m_T[tIdx].prevInput = true;
                 m_T[tIdx].enable = true;
                 m_T[tIdx].timeBase = base;
-                m_T[tIdx].preset = (presetValue > 0) ? presetValue * base : 0;
+                m_T[tIdx].preset = BuildTimerPresetMs(presetValue, base);
             }
             else {
                 m_T[tIdx].mode = 0;
@@ -553,7 +1413,10 @@ void PLCManager::ExecuteTask(PLCTask& task)
         case 50: // TOF_1MS - OFF Delay Timer, 1ms base
         {
             const int tIdx = inst.op1.payload.address;
-            if (!IsValidTimerIndex(tIdx)) break;
+            if (!IsValidTimerIndex(tIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTimerIndex, inst.op1.region, tIdx);
+                break;
+            }
 
             PLCTimer& timer = m_T[tIdx];
             const bool previousInput = timer.prevInput;
@@ -561,7 +1424,7 @@ void PLCManager::ExecuteTask(PLCTask& task)
 
             timer.mode = 1;
             timer.timeBase = 1;
-            timer.preset = (presetValue > 0) ? presetValue : 0;
+            timer.preset = NormalizePositivePreset(presetValue);
             timer.input = ACC;
 
             if (ACC) {
@@ -583,7 +1446,10 @@ void PLCManager::ExecuteTask(PLCTask& task)
         case 51: // TP_1MS - Pulse Timer, 1ms base
         {
             const int tIdx = inst.op1.payload.address;
-            if (!IsValidTimerIndex(tIdx)) break;
+            if (!IsValidTimerIndex(tIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTimerIndex, inst.op1.region, tIdx);
+                break;
+            }
 
             PLCTimer& timer = m_T[tIdx];
             const bool previousInput = timer.prevInput;
@@ -591,7 +1457,7 @@ void PLCManager::ExecuteTask(PLCTask& task)
 
             timer.mode = 2;
             timer.timeBase = 1;
-            timer.preset = (presetValue > 0) ? presetValue : 0;
+            timer.preset = NormalizePositivePreset(presetValue);
             timer.input = ACC;
 
             if (ACC && !previousInput && !timer.enable) {
@@ -607,14 +1473,17 @@ void PLCManager::ExecuteTask(PLCTask& task)
         case 52: // RTO_1MS - Retentive ON Delay, 1ms base
         {
             const int tIdx = inst.op1.payload.address;
-            if (!IsValidTimerIndex(tIdx)) break;
+            if (!IsValidTimerIndex(tIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTimerIndex, inst.op1.region, tIdx);
+                break;
+            }
 
             PLCTimer& timer = m_T[tIdx];
             const int32_t presetValue = GetOperandAsInt(inst.op2);
 
             timer.mode = 3;
             timer.timeBase = 1;
-            timer.preset = (presetValue > 0) ? presetValue : 0;
+            timer.preset = NormalizePositivePreset(presetValue);
             timer.input = ACC;
             timer.enable = ACC && !timer.done;
             timer.prevInput = ACC;
@@ -624,27 +1493,25 @@ void PLCManager::ExecuteTask(PLCTask& task)
         case 16: // TMR_RST
         {
             const int tIdx = inst.op1.payload.address;
-            if (ACC && IsValidTimerIndex(tIdx)) {
-                m_T[tIdx].enable = false;
-                m_T[tIdx].acc = 0;
-                m_T[tIdx].done = false;
-                m_T[tIdx].preset = 0;
-                m_T[tIdx].timeBase = 0;
-                m_T[tIdx].mode = 0;
-                m_T[tIdx].input = false;
-                m_T[tIdx].prevInput = false;
+            if (!IsValidTimerIndex(tIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidTimerIndex, inst.op1.region, tIdx);
+                break;
             }
+            if (ACC) ResetTimerRuntimeState(m_T[tIdx]);
             break;
         }
 
         case 60: // CTU - Counter Up, count on ACC rising edge
         {
             const int cIdx = inst.op1.payload.address;
-            if (!IsValidCounterIndex(cIdx)) break;
+            if (!IsValidCounterIndex(cIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidCounterIndex, inst.op1.region, cIdx);
+                break;
+            }
 
             PLCCounter& counter = m_CNT[cIdx];
             const int32_t presetValue = GetOperandAsInt(inst.op2);
-            const int32_t preset = presetValue > 0 ? presetValue : 1;
+            const int32_t preset = NormalizePositivePreset(presetValue);
             const bool previous = task.edgeMemory[instIndex] != 0;
             const bool rising = ACC && !previous;
 
@@ -656,11 +1523,12 @@ void PLCManager::ExecuteTask(PLCTask& task)
             counter.mode = 1;
             counter.preset = preset;
 
-            if (rising&& counter.acc < INT32_MAX) {
+            if (rising && counter.acc < INT32_MAX) {
                 ++counter.acc;
             }
 
             counter.done = counter.acc >= counter.preset;
+            counter.zero = counter.acc <= 0;
             task.edgeMemory[instIndex] = ACC ? 1 : 0;
             break;
         }
@@ -668,11 +1536,14 @@ void PLCManager::ExecuteTask(PLCTask& task)
         case 61: // CTD - Counter Down, count on ACC rising edge
         {
             const int cIdx = inst.op1.payload.address;
-            if (!IsValidCounterIndex(cIdx)) break;
+            if (!IsValidCounterIndex(cIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidCounterIndex, inst.op1.region, cIdx);
+                break;
+            }
 
             PLCCounter& counter = m_CNT[cIdx];
             const int32_t presetValue = GetOperandAsInt(inst.op2);
-            const int32_t preset = presetValue > 0 ? presetValue : 1;
+            const int32_t preset = NormalizePositivePreset(presetValue);
             const bool previous = task.edgeMemory[instIndex] != 0;
             const bool rising = ACC && !previous;
 
@@ -691,20 +1562,120 @@ void PLCManager::ExecuteTask(PLCTask& task)
             }
 
             counter.done = counter.acc <= 0;
+            counter.zero = counter.acc <= 0;
             task.edgeMemory[instIndex] = ACC ? 1 : 0;
+            break;
+        }
+
+
+        case 62: // CTUD_CU - visible CTUD phase 1: CU=current Ladder ACC, op1=CNT, op2=PV
+        {
+            const int cIdx = inst.op1.payload.address;
+            if (!IsValidCounterIndex(cIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidCounterIndex, inst.op1.region, cIdx);
+                break;
+            }
+
+            PLCCounter& counter = m_CNT[cIdx];
+            const int32_t presetValue = GetOperandAsInt(inst.op2);
+            const int32_t preset = NormalizePositivePreset(presetValue);
+            const bool previousCU = task.edgeMemory[instIndex] != 0;
+            const bool risingCU = ACC && !previousCU;
+
+            if (!counter.initialized) {
+                counter.acc = 0;
+                counter.initialized = true;
+            }
+
+            counter.mode = 3;
+            counter.preset = preset;
+            if (risingCU && counter.acc < INT32_MAX) ++counter.acc;
+
+            counter.done = counter.acc >= counter.preset; // QU
+            counter.zero = counter.acc <= 0;              // QD
+            task.edgeMemory[instIndex] = ACC ? 1 : 0;
+            break;
+        }
+
+        case 80: // CTUD_CD - compiler-internal phase 2: op1=CNT, op2=CD BOOL
+        {
+            const int cIdx = inst.op1.payload.address;
+            if (!IsValidCounterIndex(cIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidCounterIndex, inst.op1.region, cIdx);
+                break;
+            }
+
+            PLCCounter& counter = m_CNT[cIdx];
+            const bool cd = GetOperandAsBool(inst.op2);
+            const bool previousCD = task.edgeMemory[instIndex] != 0;
+            const bool risingCD = cd && !previousCD;
+
+            if (!counter.initialized) {
+                counter.acc = 0;
+                counter.initialized = true;
+            }
+
+            counter.mode = 3;
+            if (risingCD && counter.acc > INT32_MIN) --counter.acc;
+
+            counter.done = counter.acc >= counter.preset; // QU
+            counter.zero = counter.acc <= 0;              // QD
+            task.edgeMemory[instIndex] = cd ? 1 : 0;
+            break;
+        }
+
+        case 81: // CTUD_RST - compiler-internal phase 3: op1=CNT, op2=RST BOOL
+        {
+            const int cIdx = inst.op1.payload.address;
+            if (!IsValidCounterIndex(cIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidCounterIndex, inst.op1.region, cIdx);
+                break;
+            }
+
+            PLCCounter& counter = m_CNT[cIdx];
+            if (GetOperandAsBool(inst.op2)) {
+                // Reset is emitted last, therefore it has highest priority.
+                counter.acc = 0;
+                counter.done = false;
+                counter.zero = true;
+                counter.initialized = true;
+                counter.mode = 3;
+            }
+            break;
+        }
+
+        case 83: // LDCNT_QD - QD = CV <= 0
+        {
+            const int cIdx = inst.op1.payload.address;
+            if (!IsValidCounterIndex(cIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidCounterIndex, inst.op1.region, cIdx);
+                ACC = false;
+                break;
+            }
+            ACC = m_CNT[cIdx].zero;
+            break;
+        }
+
+        case 84: // LDICNT_QD - inverted QD
+        {
+            const int cIdx = inst.op1.payload.address;
+            if (!IsValidCounterIndex(cIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidCounterIndex, inst.op1.region, cIdx);
+                ACC = false;
+                break;
+            }
+            ACC = !m_CNT[cIdx].zero;
             break;
         }
 
         case 63: // CNT_RST - Counter Reset
         {
             const int cIdx = inst.op1.payload.address;
-            if (ACC && IsValidCounterIndex(cIdx)) {
-                m_CNT[cIdx].preset = 0;
-                m_CNT[cIdx].acc = 0;
-                m_CNT[cIdx].done = false;
-                m_CNT[cIdx].initialized = false;
-                m_CNT[cIdx].mode = 0;
+            if (!IsValidCounterIndex(cIdx)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidCounterIndex, inst.op1.region, cIdx);
+                break;
             }
+            if (ACC) ResetCounterRuntimeState(m_CNT[cIdx]);
             break;
         }
 
@@ -726,10 +1697,330 @@ void PLCManager::ExecuteTask(PLCTask& task)
             break;
         }
 
+
         // =========================================================
-        // V7.4.9.1 True Ladder Logic Core - internal FLOW opcodes
-        // 72..79 are compiler-internal; they are not user PLC instructions.
+        // V7.6.1 PLC System Contacts
+        //
+        // These are zero-operand condition instructions.
+        // They do NOT add a memory region and do NOT modify PLCInstruction.
+        //
+        // Clock contract:
+        // PLC_RunCount advances once per RunCycle().
+        // The controller integration calls RunCycle(1) every 1ms.
+        // 10ms clock  = 5ms ON / 5ms OFF
+        // 100ms clock = 50ms ON / 50ms OFF
+        // 1s clock    = 500ms ON / 500ms OFF
         // =========================================================
+        case 98: // SYS_ALWAYS_ON
+            ACC = true;
+            break;
+
+        case 99: // SYS_ALWAYS_OFF
+            ACC = false;
+            break;
+
+        case 100: // SYS_FIRST_SCAN - first execution of each task after Load/Reload
+            ACC = taskFirstScan;
+            break;
+
+        case 101: // SYS_CLK_10MS - 10ms full period, 50% duty
+            ACC = (PLC_RunCount % 10u) < 5u;
+            break;
+
+        case 102: // SYS_CLK_100MS - 100ms full period, 50% duty
+            ACC = (PLC_RunCount % 100u) < 50u;
+            break;
+
+        case 103: // SYS_CLK_1S - 1000ms full period, 50% duty
+            ACC = (PLC_RunCount % 1000u) < 500u;
+            break;
+
+
+            // =========================================================
+            // V7.6.2 Process Math
+            //
+            // SCALE Target InLow InHigh OutLow OutHigh
+            // -> 104 Target/InLow
+            // -> 105 InHigh/OutLow
+            // -> 106 Target/OutHigh
+            //
+            // SCALE_LIMIT shares 105/106 but starts with 107.
+            // Target is written only in COMMIT so invalid parameters cannot
+            // leave a partially transformed value.
+            // =========================================================
+        case 104: // SCALE_BEGIN
+        case 107: // SCALE_LIMIT_BEGIN
+        {
+            scaleSequenceValid = false;
+            scaleClampInput = (inst.opCode == 107);
+
+            if (!ACC)
+                break;
+
+            if (!IsNumericWritableOperand(inst.op1) ||
+                !IsNumericReadableOperand(inst.op2))
+            {
+                const PLCOperand& bad =
+                    !IsNumericWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                RecordRuntimeFault(
+                    PLCRuntimeFaultCode::InvalidOperand,
+                    bad.region,
+                    bad.payload.address);
+                break;
+            }
+
+            const double source = GetOperandAsDouble(inst.op1);
+            const double inputLow = GetOperandAsDouble(inst.op2);
+
+            if (!std::isfinite(source) || !std::isfinite(inputLow))
+            {
+                RecordRuntimeFault(
+                    PLCRuntimeFaultCode::ArithmeticDomain,
+                    inst.op1.region,
+                    inst.op1.payload.address);
+                break;
+            }
+
+            scaleInputValue = source;
+            scaleInputLow = inputLow;
+            scaleSequenceValid = true;
+            break;
+        }
+
+        case 105: // SCALE_RANGE: InHigh, OutLow
+        {
+            if (!ACC || !scaleSequenceValid)
+                break;
+
+            if (!IsNumericReadableOperand(inst.op1) ||
+                !IsNumericReadableOperand(inst.op2))
+            {
+                const PLCOperand& bad =
+                    !IsNumericReadableOperand(inst.op1) ? inst.op1 : inst.op2;
+                RecordRuntimeFault(
+                    PLCRuntimeFaultCode::InvalidOperand,
+                    bad.region,
+                    bad.payload.address);
+                scaleSequenceValid = false;
+                break;
+            }
+
+            const double inputHigh = GetOperandAsDouble(inst.op1);
+            const double outputLow = GetOperandAsDouble(inst.op2);
+
+            if (!std::isfinite(inputHigh) ||
+                !std::isfinite(outputLow) ||
+                inputHigh <= scaleInputLow)
+            {
+                RecordRuntimeFault(
+                    PLCRuntimeFaultCode::ArithmeticDomain,
+                    inst.op1.region,
+                    inst.op1.payload.address);
+                scaleSequenceValid = false;
+                break;
+            }
+
+            scaleInputHigh = inputHigh;
+            scaleOutputLow = outputLow;
+            break;
+        }
+
+        case 106: // SCALE_COMMIT: Target, OutHigh
+        {
+            if (!ACC || !scaleSequenceValid)
+            {
+                scaleSequenceValid = false;
+                break;
+            }
+
+            if (!IsNumericWritableOperand(inst.op1) ||
+                !IsNumericReadableOperand(inst.op2))
+            {
+                const PLCOperand& bad =
+                    !IsNumericWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                RecordRuntimeFault(
+                    PLCRuntimeFaultCode::InvalidOperand,
+                    bad.region,
+                    bad.payload.address);
+                scaleSequenceValid = false;
+                break;
+            }
+
+            const double outputHigh = GetOperandAsDouble(inst.op2);
+            if (!std::isfinite(outputHigh))
+            {
+                RecordRuntimeFault(
+                    PLCRuntimeFaultCode::ArithmeticDomain,
+                    inst.op2.region,
+                    inst.op2.payload.address);
+                scaleSequenceValid = false;
+                break;
+            }
+
+            double source = scaleInputValue;
+            if (scaleClampInput)
+            {
+                source = (std::max)(
+                    scaleInputLow,
+                    (std::min)(source, scaleInputHigh));
+            }
+
+            const double inputSpan = scaleInputHigh - scaleInputLow;
+            const double outputSpan = outputHigh - scaleOutputLow;
+            const double normalized =
+                (source - scaleInputLow) / inputSpan;
+            const double result =
+                scaleOutputLow + normalized * outputSpan;
+
+            if (!std::isfinite(result))
+            {
+                RecordRuntimeFault(
+                    PLCRuntimeFaultCode::ArithmeticDomain,
+                    inst.op1.region,
+                    inst.op1.payload.address);
+                scaleSequenceValid = false;
+                break;
+            }
+
+            SetOperandFromDouble(inst.op1, result);
+            scaleSequenceValid = false;
+            break;
+        }
+
+        case 108: // SQRT
+            if (ACC)
+            {
+                if (!IsNumericWritableOperand(inst.op1))
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::InvalidOperand,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                const double value = GetOperandAsDouble(inst.op1);
+                if (!std::isfinite(value) || value < 0.0)
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::ArithmeticDomain,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                SetOperandFromDouble(inst.op1, std::sqrt(value));
+            }
+            break;
+
+        case 109: // ROUND - halfway away from zero
+            if (ACC)
+            {
+                if (!IsNumericWritableOperand(inst.op1))
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::InvalidOperand,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                const double value = GetOperandAsDouble(inst.op1);
+                if (!std::isfinite(value))
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::ArithmeticDomain,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                SetOperandFromDouble(inst.op1, std::round(value));
+            }
+            break;
+
+        case 110: // TRUNC
+            if (ACC)
+            {
+                if (!IsNumericWritableOperand(inst.op1))
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::InvalidOperand,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                const double value = GetOperandAsDouble(inst.op1);
+                if (!std::isfinite(value))
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::ArithmeticDomain,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                SetOperandFromDouble(inst.op1, std::trunc(value));
+            }
+            break;
+
+        case 111: // FLOOR
+            if (ACC)
+            {
+                if (!IsNumericWritableOperand(inst.op1))
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::InvalidOperand,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                const double value = GetOperandAsDouble(inst.op1);
+                if (!std::isfinite(value))
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::ArithmeticDomain,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                SetOperandFromDouble(inst.op1, std::floor(value));
+            }
+            break;
+
+        case 112: // CEIL
+            if (ACC)
+            {
+                if (!IsNumericWritableOperand(inst.op1))
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::InvalidOperand,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                const double value = GetOperandAsDouble(inst.op1);
+                if (!std::isfinite(value))
+                {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::ArithmeticDomain,
+                        inst.op1.region,
+                        inst.op1.payload.address);
+                    break;
+                }
+
+                SetOperandFromDouble(inst.op1, std::ceil(value));
+            }
+            break;
+
+            // =========================================================
+            // V7.4.9.1 True Ladder Logic Core - internal FLOW opcodes
+            // 72..79 are compiler-internal; they are not user PLC instructions.
+            // =========================================================
         case 72: // FLOW_ROW_TRUE  op1=#row
         {
             const int row = GetOperandAsInt(inst.op1);
@@ -789,45 +2080,94 @@ void PLCManager::ExecuteTask(PLCTask& task)
         }
 
         case 20: // ADD
-            if (ACC) SetOperandFromDouble(inst.op1,
-                GetOperandAsDouble(inst.op1) + GetOperandAsDouble(inst.op2));
-            break;
-
         case 21: // SUB
-            if (ACC) SetOperandFromDouble(inst.op1,
-                GetOperandAsDouble(inst.op1) - GetOperandAsDouble(inst.op2));
-            break;
-
         case 22: // MUL
-            if (ACC) SetOperandFromDouble(inst.op1,
-                GetOperandAsDouble(inst.op1) * GetOperandAsDouble(inst.op2));
+            if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1) ||
+                    !IsNumericReadableOperand(inst.op2)) {
+                    const PLCOperand& bad =
+                        !IsNumericWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                    break;
+                }
+
+                const double left = GetOperandAsDouble(inst.op1);
+                const double right = GetOperandAsDouble(inst.op2);
+                const double result =
+                    inst.opCode == 20 ? (left + right) :
+                    inst.opCode == 21 ? (left - right) :
+                    (left * right);
+
+                SetOperandFromDouble(inst.op1, result);
+            }
             break;
 
         case 23: // DIV
             if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1) ||
+                    !IsNumericReadableOperand(inst.op2)) {
+                    const PLCOperand& bad =
+                        !IsNumericWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                    break;
+                }
+
                 const double divisor = GetOperandAsDouble(inst.op2);
                 if (divisor != 0.0) {
                     SetOperandFromDouble(inst.op1,
                         GetOperandAsDouble(inst.op1) / divisor);
                 }
+                else {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::ArithmeticDomain,
+                        inst.op2.region,
+                        inst.op2.payload.address);
+                }
             }
             break;
 
         case 24: // MOV
-            if (ACC) SetOperandFromDouble(inst.op1, GetOperandAsDouble(inst.op2));
+            if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1) ||
+                    !IsNumericReadableOperand(inst.op2)) {
+                    const PLCOperand& bad =
+                        !IsNumericWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                    break;
+                }
+                SetOperandFromDouble(inst.op1, GetOperandAsDouble(inst.op2));
+            }
             break;
 
         case 25: // MOD
             if (ACC) {
+                if (!IsIntegerWritableOperand(inst.op1) ||
+                    !IsIntegerReadableOperand(inst.op2)) {
+                    const PLCOperand& bad =
+                        !IsIntegerWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                    break;
+                }
+
                 const int32_t divisor = GetOperandAsInt(inst.op2);
                 if (divisor != 0) {
                     SetOperandFromInt(inst.op1, GetOperandAsInt(inst.op1) % divisor);
+                }
+                else {
+                    RecordRuntimeFault(
+                        PLCRuntimeFaultCode::ArithmeticDomain,
+                        inst.op2.region,
+                        inst.op2.payload.address);
                 }
             }
             break;
 
         case 26: // ABS
             if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1)) {
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, inst.op1.region, inst.op1.payload.address);
+                    break;
+                }
                 const double value = GetOperandAsDouble(inst.op1);
                 SetOperandFromDouble(inst.op1, std::fabs(value));
             }
@@ -835,6 +2175,10 @@ void PLCManager::ExecuteTask(PLCTask& task)
 
         case 27: // NEG
             if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1)) {
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, inst.op1.region, inst.op1.payload.address);
+                    break;
+                }
                 SetOperandFromDouble(inst.op1, -GetOperandAsDouble(inst.op1));
             }
             break;
@@ -864,26 +2208,250 @@ void PLCManager::ExecuteTask(PLCTask& task)
             break;
 
         case 40: // AND
-            if (ACC) SetOperandFromInt(inst.op1,
-                GetOperandAsInt(inst.op1) & GetOperandAsInt(inst.op2));
-            break;
-
         case 41: // LOGIC_OR
-            if (ACC) SetOperandFromInt(inst.op1,
-                GetOperandAsInt(inst.op1) | GetOperandAsInt(inst.op2));
+        case 42: // XOR
+            if (ACC) {
+                if (!IsIntegerWritableOperand(inst.op1) ||
+                    !IsIntegerReadableOperand(inst.op2)) {
+                    const PLCOperand& bad =
+                        !IsIntegerWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                    break;
+                }
+
+                const int32_t left = GetOperandAsInt(inst.op1);
+                const int32_t right = GetOperandAsInt(inst.op2);
+                const int32_t result =
+                    inst.opCode == 40 ? (left & right) :
+                    inst.opCode == 41 ? (left | right) :
+                    (left ^ right);
+
+                SetOperandFromInt(inst.op1, result);
+            }
             break;
 
-        case 42: // XOR
-            if (ACC) SetOperandFromInt(inst.op1,
-                GetOperandAsInt(inst.op1) ^ GetOperandAsInt(inst.op2));
+
+            // =========================================================
+            // V7.5.4 Advanced PLC Instruction Pack
+            // =========================================================
+
+        case 85: // MIN destination, source
+            if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1) ||
+                    !IsNumericReadableOperand(inst.op2)) {
+                    const PLCOperand& bad =
+                        !IsNumericWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                    break;
+                }
+
+                const double current = GetOperandAsDouble(inst.op1);
+                const double candidate = GetOperandAsDouble(inst.op2);
+                SetOperandFromDouble(inst.op1, (std::min)(current, candidate));
+            }
+            break;
+
+        case 86: // MAX destination, source
+            if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1) ||
+                    !IsNumericReadableOperand(inst.op2)) {
+                    const PLCOperand& bad =
+                        !IsNumericWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                    break;
+                }
+
+                const double current = GetOperandAsDouble(inst.op1);
+                const double candidate = GetOperandAsDouble(inst.op2);
+                SetOperandFromDouble(inst.op1, (std::max)(current, candidate));
+            }
+            break;
+
+        case 87: // LIMIT_LOW destination, lower bound
+            if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1) ||
+                    !IsNumericReadableOperand(inst.op2)) {
+                    const PLCOperand& bad =
+                        !IsNumericWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                    break;
+                }
+
+                const double current = GetOperandAsDouble(inst.op1);
+                const double lower = GetOperandAsDouble(inst.op2);
+                if (current < lower)
+                    SetOperandFromDouble(inst.op1, lower);
+            }
+            break;
+
+        case 88: // LIMIT_HIGH destination, upper bound (compiler internal)
+            if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1) ||
+                    !IsNumericReadableOperand(inst.op2)) {
+                    const PLCOperand& bad =
+                        !IsNumericWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                    break;
+                }
+
+                const double current = GetOperandAsDouble(inst.op1);
+                const double upper = GetOperandAsDouble(inst.op2);
+                if (current > upper)
+                    SetOperandFromDouble(inst.op1, upper);
+            }
+            break;
+
+        case 89: // INC destination
+            if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1)) {
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, inst.op1.region, inst.op1.payload.address);
+                    break;
+                }
+
+                SetOperandFromDouble(
+                    inst.op1,
+                    GetOperandAsDouble(inst.op1) + 1.0);
+            }
+            break;
+
+        case 90: // DEC destination
+            if (ACC) {
+                if (!IsNumericWritableOperand(inst.op1)) {
+                    RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, inst.op1.region, inst.op1.payload.address);
+                    break;
+                }
+
+                SetOperandFromDouble(
+                    inst.op1,
+                    GetOperandAsDouble(inst.op1) - 1.0);
+            }
+            break;
+
+        case 91: // SHL destination, bit count (logical left shift)
+        case 92: // SHR destination, bit count (logical right shift)
+        {
+            if (!ACC) break;
+
+            if (!IsIntegerWritableOperand(inst.op1) ||
+                !IsIntegerReadableOperand(inst.op2)) {
+                const PLCOperand& bad =
+                    !IsIntegerWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                break;
+            }
+
+            const int32_t bitCount = GetOperandAsInt(inst.op2);
+            if (bitCount < 0 || bitCount > 31) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidBitIndex, inst.op2.region, bitCount);
+                break;
+            }
+
+            const uint32_t value =
+                static_cast<uint32_t>(GetOperandAsInt(inst.op1));
+
+            const uint32_t result =
+                inst.opCode == 91
+                ? (value << static_cast<uint32_t>(bitCount))
+                : (value >> static_cast<uint32_t>(bitCount));
+
+            SetOperandFromInt(inst.op1, static_cast<int32_t>(result));
+            break;
+        }
+
+        case 93: // BIT_TEST source, bit index -> ACC
+        {
+            if (!IsIntegerReadableOperand(inst.op1) ||
+                !IsIntegerReadableOperand(inst.op2)) {
+                const PLCOperand& bad =
+                    !IsIntegerReadableOperand(inst.op1) ? inst.op1 : inst.op2;
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                ACC = false;
+                break;
+            }
+
+            const int32_t bitIndex = GetOperandAsInt(inst.op2);
+            if (bitIndex < 0 || bitIndex > 31) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidBitIndex, inst.op2.region, bitIndex);
+                ACC = false;
+                break;
+            }
+
+            const uint32_t value =
+                static_cast<uint32_t>(GetOperandAsInt(inst.op1));
+            ACC = ((value >> static_cast<uint32_t>(bitIndex)) & 0x1u) != 0;
+            break;
+        }
+
+        case 94: // BIT_SET destination, bit index
+        case 95: // BIT_RESET destination, bit index
+        {
+            if (!ACC) break;
+
+            if (!IsIntegerWritableOperand(inst.op1) ||
+                !IsIntegerReadableOperand(inst.op2)) {
+                const PLCOperand& bad =
+                    !IsIntegerWritableOperand(inst.op1) ? inst.op1 : inst.op2;
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                break;
+            }
+
+            const int32_t bitIndex = GetOperandAsInt(inst.op2);
+            if (bitIndex < 0 || bitIndex > 31) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidBitIndex, inst.op2.region, bitIndex);
+                break;
+            }
+
+            uint32_t value =
+                static_cast<uint32_t>(GetOperandAsInt(inst.op1));
+            const uint32_t mask =
+                (1u << static_cast<uint32_t>(bitIndex));
+
+            if (inst.opCode == 94)
+                value |= mask;
+            else
+                value &= ~mask;
+
+            SetOperandFromInt(inst.op1, static_cast<int32_t>(value));
+            break;
+        }
+
+        case 96: // RANGE_LOW value, lower -> ACC = value >= lower
+            if (!IsNumericReadableOperand(inst.op1) ||
+                !IsNumericReadableOperand(inst.op2)) {
+                const PLCOperand& bad =
+                    !IsNumericReadableOperand(inst.op1) ? inst.op1 : inst.op2;
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                ACC = false;
+                break;
+            }
+            ACC = GetOperandAsDouble(inst.op1) >= GetOperandAsDouble(inst.op2);
+            break;
+
+        case 97: // RANGE_HIGH value, upper -> ACC = ACC && value <= upper
+            if (!IsNumericReadableOperand(inst.op1) ||
+                !IsNumericReadableOperand(inst.op2)) {
+                const PLCOperand& bad =
+                    !IsNumericReadableOperand(inst.op1) ? inst.op1 : inst.op2;
+                RecordRuntimeFault(PLCRuntimeFaultCode::InvalidOperand, bad.region, bad.payload.address);
+                ACC = false;
+                break;
+            }
+            ACC = ACC &&
+                (GetOperandAsDouble(inst.op1) <= GetOperandAsDouble(inst.op2));
             break;
 
         default:
-            // Unknown opcodes are ignored here. The Studio compiler is responsible
-            // for blocking unsupported instructions before logic.bin is generated.
+            RecordRuntimeFault(PLCRuntimeFaultCode::UnknownOpcode);
             break;
         }
     }
+
+    // Only a successfully executed task consumes its First Scan state.
+    task.firstScanPending = false;
+
+    m_activeInstructionIndex = -1;
+    m_activeOpcode = 0;
+    m_activeTaskIndex = -1;
 }
 
 
@@ -952,10 +2520,18 @@ void PLCManager::SetMemory(const std::string& prefix, int index, double value) {
     else if (prefix == "A" && index >= 0 && index < MAX_PLC_A) m_A[index] = (value != 0); // 🌟 A 點
     else if (prefix == "S" && index >= 0 && index < MAX_PLC_S) m_S[index] = (value != 0); // 🌟 S 點
     else if (prefix == "C" && index >= 0 && index < MAX_PLC_C) m_C[index] = (value != 0);
-    else if (prefix == "R" && index >= 0 && index < MAX_PLC_R) m_R[index] = static_cast<int32_t>(value);
-    else if (prefix == "DR" && index >= 0 && index < MAX_PLC_DR) m_DR[index] = static_cast<int32_t>(value);
-    else if (prefix == "F" && index >= 0 && index < MAX_PLC_F) m_F[index] = static_cast<float>(value);
-    else if (prefix == "L" && index >= 0 && index < MAX_PLC_L) m_L[index] = value;
+    else if (prefix == "R" && index >= 0 && index < MAX_PLC_R) m_R[index] = ClampDoubleToInt32(value);
+    else if (prefix == "DR" && index >= 0 && index < MAX_PLC_DR) m_DR[index] = ClampDoubleToInt32(value);
+    else if (prefix == "F" && index >= 0 && index < MAX_PLC_F) m_F[index] = ClampDoubleToFloat(value);
+    else if (prefix == "L" && index >= 0 && index < MAX_PLC_L) {
+        if (!std::isfinite(value)) {
+            RecordRuntimeFault(PLCRuntimeFaultCode::ArithmeticDomain);
+            m_L[index] = 0.0;
+        }
+        else {
+            m_L[index] = value;
+        }
+    }
 }
 
 // =========================================================
@@ -1005,9 +2581,20 @@ void PLCManager::SetVar(const std::string& name, double value) {
     auto it = m_customVars.find(hashId);
     if (it != m_customVars.end()) {
         auto& var = it->second;
-        if (var.dataType == 4) var.value.fVal = static_cast<float>(value);
-        else if (var.dataType == 5) var.value.dVal = value;
-        else var.value.iVal = static_cast<int32_t>(value);
+        if (var.dataType == 4)
+            var.value.fVal = ClampDoubleToFloat(value);
+        else if (var.dataType == 5)
+        {
+            if (!std::isfinite(value)) {
+                RecordRuntimeFault(PLCRuntimeFaultCode::ArithmeticDomain);
+                var.value.dVal = 0.0;
+            }
+            else {
+                var.value.dVal = value;
+            }
+        }
+        else
+            var.value.iVal = ClampDoubleToInt32(value);
         return;
     }
 
@@ -1061,7 +2648,15 @@ void PLCManager::ExportPLCStatus(SHM_PLC_Status* pStatus) const
         pStatus->T_acc[i] = m_T[i].acc;
         pStatus->T_preset[i] = m_T[i].preset;
         pStatus->T_done[i] = m_T[i].done ? 1 : 0;
-        pStatus->T_base[i] = m_T[i].timeBase; // 🌟 補上這行
+        pStatus->T_base[i] = m_T[i].timeBase;
+    }
+
+    // V7.5.0: restore the Counter Online export chain that V7.4.8 Studio/API expects.
+    // SHM layout itself is NOT changed here.
+    for (int i = 0; i < MAX_PLC_CNT; i++) {
+        pStatus->CNT_acc[i] = m_CNT[i].acc;
+        pStatus->CNT_preset[i] = m_CNT[i].preset;
+        pStatus->CNT_done[i] = m_CNT[i].done ? 1 : 0;
     }
 }
 
@@ -1070,112 +2665,58 @@ void PLCManager::ExportPLCStatus(SHM_PLC_Status* pStatus) const
 // ============================================================================
 bool PLCManager::ReloadLogicProgram()
 {
-    const std::string& filepath = GlobalConfig::GetInstance().PLC_Dir + "logic.bin";
+    const std::string filepath =
+        GlobalConfig::GetInstance().PLC_Dir + "logic.bin";
 
-
-    // 1. 【非即時端安全區】宣告「暫時的」容器，避免在讀檔時污染運行中的記憶體
     std::vector<PLCTask> tempTasks;
     std::unordered_map<int32_t, PLCCustomVar> tempVars;
+    uint32_t parsedCrc32 = 0;
+    uint32_t parsedFileSize = 0;
 
-    // 開始慢慢讀取與解析檔案 (這段可能耗時幾毫秒，但不影響即時運算)
-    std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        //std::cerr << "[PLC Error] 無法開啟要重載的邏輯檔: " << filepath << std::endl;
-        return false;
-    }
-
-    char header[9] = { 0 };
-    file.read(header, 8);
-    if (std::string(header) != "RTOS_PLC") {
-        //std::cerr << "[PLC Error] 無效的 PLC 邏輯檔格式!" << std::endl;
-        return false;
-    }
-
-    while (file.good() && !file.eof()) {
-        uint8_t tag;
-        file.read(reinterpret_cast<char*>(&tag), 1);
-        if (file.eof()) break;
-
-        if (tag == 253) {
-            int32_t varCount;
-            file.read(reinterpret_cast<char*>(&varCount), 4);
-            for (int i = 0; i < varCount; i++) {
-                int32_t hashId; uint8_t dataType;
-                file.read(reinterpret_cast<char*>(&hashId), 4);
-                file.read(reinterpret_cast<char*>(&dataType), 1);
-
-                PLCCustomVar newVar;
-                newVar.dataType = dataType;
-                std::memset(newVar.value.raw, 0, 8);
-                tempVars[hashId] = newVar; // 寫入暫存容器
-            }
-        }
-        else if (tag == 254) {
-            PLCTask newTask;
-            file.read(reinterpret_cast<char*>(&newTask.type), 1);
-            file.read(reinterpret_cast<char*>(&newTask.priority), 1);
-            file.read(reinterpret_cast<char*>(&newTask.cycleTimeMs), 4);
-            newTask.currentTimerMs = newTask.cycleTimeMs;
-
-            while (true) {
-                uint8_t nextByte = file.peek();
-                if (nextByte == 253 || nextByte == 254 || nextByte == 255 || file.eof()) {
-                    break;
-                }
-                PLCInstruction inst;
-                file.read(reinterpret_cast<char*>(&inst), sizeof(PLCInstruction));
-                newTask.instructions.push_back(inst);
-            }
-            newTask.edgeMemory.assign(newTask.instructions.size(), 0);
-            newTask.flowRows.assign(MAX_PLC_FLOW_ROWS, 0); // allocate outside real-time scan
-            tempTasks.push_back(newTask); // 寫入暫存容器
-        }
-        else if (tag == 255) {
-            break;
-        }
-    }
-    file.close();
-
-    // 依照 Task Priority 進行排序
-    std::sort(tempTasks.begin(), tempTasks.end(), [](const PLCTask& a, const PLCTask& b) {
-        return a.priority < b.priority;
-        });
-
-    // =========================================================
-    // 2. 【即時安全交接區】檔案解析完畢，瞬間加鎖並替換記憶體！
-    // =========================================================
+    // Slow file I/O and all vector allocations happen outside the RT lock.
+    if (!ParseLogicProgramFile(
+        filepath,
+        tempTasks,
+        tempVars,
+        parsedCrc32,
+        parsedFileSize))
     {
-        // 🌟 瞬間取得鎖 (等待 RunCycle 結束)
+        // IMPORTANT:
+        // Keep the CRC/Size/Generation of the program that is STILL RUNNING.
+        MarkLogicLoadFailed();
+        return false;
+    }
+
+    {
         AutoLockCS lock(&m_logicCS);
 
-        // 使用 std::move 瞬間轉移記憶體所有權 (耗時不到 1 微秒)
-        m_tasks = std::move(tempTasks);
-        m_customVars = std::move(tempVars);
+        // O(1)-style ownership swap; old containers are released after lock exit.
+        m_tasks.swap(tempTasks);
+        m_customVars.swap(tempVars);
 
-        // 🌟 防呆：重載邏輯時，建議把所有 Timer 歸零！
-        // 避免舊程式計時到一半的 Timer，在換了新程式後突然錯誤觸發
-        for (int i = 0; i < MAX_PLC_T; i++) {
-            m_T[i].enable = false;
-            m_T[i].done = false;
-            m_T[i].acc = 0;
-            m_T[i].preset = 0;
-            m_T[i].timeBase = 0;
-            m_T[i].mode = 0;
-            m_T[i].input = false;
-            m_T[i].prevInput = false;
-        }
+        // A new program must not inherit half-completed stateful devices.
+        ResetAllStatefulDevices();
+        ResetRuntimeDiagnosticsUnsafe();
+        ResetScanHealthUnsafe();
 
-        for (int i = 0; i < MAX_PLC_CNT; i++) {
-            m_CNT[i].preset = 0;
-            m_CNT[i].acc = 0;
-            m_CNT[i].done = false;
-            m_CNT[i].initialized = false;
-            m_CNT[i].mode = 0;
-        }
+        // Verification metadata becomes visible in the SAME critical section
+        // as the runtime program ownership swap.
+        CommitLoadedLogicVerificationUnsafe(
+            parsedCrc32,
+            parsedFileSize);
 
-        // 注意：這裡不清除 I, O, R 等點位，因為機台還在運轉，保持現有的物理狀態最安全
+        // I/O and R/DR memory intentionally keep their current values.
     }
 
-    std::cout << "[PLC] 成功動態重載邏輯檔案 (Hot-Reload): " << filepath << std::endl;
+    std::cout << "[PLC] Reloaded validated logic.bin. CRC32="
+        << std::hex << std::uppercase
+        << m_loadedLogicCrc32
+        << std::dec
+        << ", Size="
+        << m_loadedLogicSize
+        << " bytes, Generation="
+        << m_logicLoadGeneration
+        << std::endl;
     return true;
 }
+

@@ -248,6 +248,53 @@ struct SHM_PLC_Command
     char varName[64];       // 變數名稱字串 (例如 "TARGET_SPEED")
 };
 
+// PLC Runtime Diagnostics (V7.5.3, read-only broadcast) -----------------------
+struct SHM_PLC_Diagnostics
+{
+    uint8_t RuntimeFault;              // 0 = healthy, 1 = sticky runtime fault
+    uint8_t LastFaultCode;             // PLCRuntimeFaultCode
+    uint8_t LastOpcode;                // faulting VM opcode
+    uint8_t LastOperandRegion;         // PLC operand region, 0xFF = N/A
+
+    int32_t LastTaskIndex;             // runtime sorted task index
+    int32_t LastInstructionIndex;      // instruction index inside task
+    int32_t LastOperandAddress;        // address/index related to last fault
+
+    uint32_t LastFaultRunCount;         // PLC_RunCount when last fault occurred
+    uint32_t TotalFaultCount;
+
+    uint32_t InvalidOperandCount;
+    uint32_t InvalidTimerIndexCount;
+    uint32_t InvalidCounterIndexCount;
+    uint32_t UnknownOpcodeCount;
+    uint32_t RuntimeStateMismatchCount;
+    uint32_t InvalidFlowRowCount;
+
+    // V7.6.0 - actual accepted logic.bin identity.
+    uint32_t LoadedLogicCrc32;
+    uint32_t LoadedLogicSize;
+    uint32_t LogicLoadGeneration;
+    uint32_t LastLogicLoadResult; // 0=None, 1=Success, 2=Failed
+
+    // V7.6.4.1 Runtime Scan Health (read-only)
+    uint32_t ScanLastCycleUs;
+    uint32_t ScanWorstCycleUs;
+    uint32_t ScanCycleBudgetUs;
+    uint32_t ScanCycleOverrunCount;
+
+    uint32_t ScanLastTaskUs;
+    uint32_t ScanWorstTaskUs;
+    uint32_t ScanLastTaskBudgetUs;
+    int32_t ScanLastTaskIndex;
+    int32_t ScanWorstTaskIndex;
+    uint32_t ScanTaskOverrunCount;
+
+    uint32_t ScanMeasuredCycleCount;
+    uint32_t ScanLastOverrunRunCount;
+    int32_t ScanLastOverrunTaskIndex;
+};
+static_assert(sizeof(SHM_PLC_Diagnostics) == 116,"SHM_PLC_Diagnostics must stay 64 bytes (Pack=1).");
+
 //總記憶體區塊-------------------------------------------------------
 struct SHM_Data 
 {
@@ -266,6 +313,8 @@ struct SHM_Data
     // 🌟 補上這兩行：PLC 專用讀寫區
     SHM_PLC_Status PLC_Status;
     SHM_PLC_Command PLC_Command;
+
+    SHM_PLC_Diagnostics PLC_Diagnostics;
 };
 
 #pragma pack(pop)

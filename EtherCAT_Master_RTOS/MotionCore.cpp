@@ -659,33 +659,21 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     // 1. 基本路徑資訊
     // =========================================================
-    double dt =
-        CYCLE_TIME_SEC;
+    double dt =CYCLE_TIME_SEC;
 
-    double planDistErr =
-        axis.finalTargetPos -
-        axis.planningPos;
+    double planDistErr =axis.finalTargetPos -axis.planningPos;
 
-    double dir =
-        (planDistErr >= 0.0)
-        ? 1.0
-        : -1.0;
+    double dir =(planDistErr >= 0.0)? 1.0: -1.0;
 
-    double planDist =
-        std::abs(planDistErr);
+    double planDist =std::abs(planDistErr);
 
 
     // 本 Cycle 依目前速度理論上能走多少距離
-    double stepDist =
-        std::abs(
-            axis.currentCmdVel *
-            dt);
+    double stepDist =std::abs(axis.currentCmdVel *dt);
 
 
     // 規劃器是否已經到最後一個 Cycle
-    bool isPlanDone =
-        (planDist <= stepDist) ||
-        (planDist < 0.001);
+    bool isPlanDone =(planDist <= stepDist) ||(planDist < 0.001);
 
 
     // =========================================================
@@ -693,8 +681,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     if (isPlanDone)
     {
-        axis.planningPos =
-            axis.finalTargetPos;
+        axis.planningPos =axis.finalTargetPos;
 
 
         // -----------------------------------------------------
@@ -703,10 +690,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // -----------------------------------------------------
         if (std::abs(axis.targetEndVel) > 0.1)
         {
-            axis.currentCmdVel =
-                dir *
-                std::abs(
-                    axis.targetEndVel);
+            axis.currentCmdVel = dir * std::abs(axis.targetEndVel);
         }
 
         // -----------------------------------------------------
@@ -715,9 +699,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // -----------------------------------------------------
         else
         {
-            axis.currentCmdVel =
-                dir *
-                (planDist / dt);
+            axis.currentCmdVel =dir *(planDist / dt);
         }
     }
 
@@ -730,8 +712,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // -----------------------------------------------------
         // 最大巡航速度
         // -----------------------------------------------------
-        double max_v =
-            axis.cruiseVel_PPS;
+        double max_v =axis.cruiseVel_PPS;
 
         if (max_v < 0.0)
         {
@@ -742,16 +723,13 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // -----------------------------------------------------
         // 減速度
         // -----------------------------------------------------
-        double dec =
-            axis.dec_PPS2;
+        double dec =axis.dec_PPS2;
 
 
         // -----------------------------------------------------
         // 終點速度
         // -----------------------------------------------------
-        double v_end =
-            std::abs(
-                axis.targetEndVel);
+        double v_end =std::abs(axis.targetEndVel);
 
         if (v_end > max_v)
         {
@@ -764,25 +742,17 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         //
         // v² = u² + 2as
         // -----------------------------------------------------
-        double max_allowable_vel =
-            std::sqrt(
-                v_end * v_end +
-                2.0 *
-                dec *
-                planDist);
+        double max_allowable_vel =std::sqrt(v_end * v_end +2.0 * dec *planDist);
 
 
         if (max_allowable_vel > max_v)
         {
-            max_allowable_vel =
-                max_v;
+            max_allowable_vel =max_v;
         }
 
 
         // 加入運動方向
-        double target_v =
-            dir *
-            max_allowable_vel;
+        double target_v =dir *max_allowable_vel;
 
 
         // =====================================================
@@ -803,17 +773,14 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             // -------------------------------------------------
             if (axis.currentCmdVel < target_v)
             {
-                axis.currentCmdVel +=
-                    axis.acc_PPS2 *
-                    dt;
+                axis.currentCmdVel +=axis.acc_PPS2 *dt;
 
 
                 // 🌟 新增 Clamp
                 // 防止 90 -> 140，而 target_v 只有 100
                 if (axis.currentCmdVel > target_v)
                 {
-                    axis.currentCmdVel =
-                        target_v;
+                    axis.currentCmdVel =target_v;
                 }
             }
 
@@ -823,17 +790,14 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             // -------------------------------------------------
             else if (axis.currentCmdVel > target_v)
             {
-                axis.currentCmdVel -=
-                    axis.dec_PPS2 *
-                    dt;
+                axis.currentCmdVel -=axis.dec_PPS2 * dt;
 
 
                 // 🌟 新增 Clamp
                 // 防止 140 -> 80，而 target_v 是 100
                 if (axis.currentCmdVel < target_v)
                 {
-                    axis.currentCmdVel =
-                        target_v;
+                    axis.currentCmdVel = target_v;
                 }
             }
 
@@ -841,8 +805,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             // 正方向規劃不允許跑出負速度
             if (axis.currentCmdVel < 0.0)
             {
-                axis.currentCmdVel =
-                    0.0;
+                axis.currentCmdVel = 0.0;
             }
         }
 
@@ -866,9 +829,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             // -------------------------------------------------
             if (axis.currentCmdVel > target_v)
             {
-                axis.currentCmdVel -=
-                    axis.acc_PPS2 *
-                    dt;
+                axis.currentCmdVel -= axis.acc_PPS2 * dt;
 
 
                 // 🌟 新增 Clamp
@@ -880,8 +841,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
                 // 必須拉回 -100
                 if (axis.currentCmdVel < target_v)
                 {
-                    axis.currentCmdVel =
-                        target_v;
+                    axis.currentCmdVel =target_v;
                 }
             }
 
@@ -891,9 +851,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             // -------------------------------------------------
             else if (axis.currentCmdVel < target_v)
             {
-                axis.currentCmdVel +=
-                    axis.dec_PPS2 *
-                    dt;
+                axis.currentCmdVel += axis.dec_PPS2 *dt;
 
 
                 // 🌟 新增 Clamp
@@ -906,8 +864,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
                 // 必須拉回 -100
                 if (axis.currentCmdVel > target_v)
                 {
-                    axis.currentCmdVel =
-                        target_v;
+                    axis.currentCmdVel =target_v;
                 }
             }
 
@@ -915,8 +872,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             // 負方向規劃不允許跑出正速度
             if (axis.currentCmdVel > 0.0)
             {
-                axis.currentCmdVel =
-                    0.0;
+                axis.currentCmdVel = 0.0;
             }
         }
 
@@ -924,145 +880,80 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // =====================================================
         // 更新規劃位置
         // =====================================================
-        axis.planningPos +=
-            axis.currentCmdVel *
-            dt;
+        axis.planningPos += axis.currentCmdVel * dt;
     }
 
 
     // =========================================================
     // 4. S-Curve 濾波
     // =========================================================
-    double finalOutputVel =
-        axis.currentCmdVel;
+    double finalOutputVel =axis.currentCmdVel;
 
 
     if (axis.velBuffer.size() > 1)
     {
-        axis.bufferSum -=
-            axis.velBuffer[
-                axis.bufferIndex];
-
-
-        axis.velBuffer[
-            axis.bufferIndex] =
-            axis.currentCmdVel;
-
-
-            axis.bufferSum +=
-                axis.currentCmdVel;
-
-
-            axis.bufferIndex =
-                (
-                    axis.bufferIndex +
-                    1
-                    )
-                %
-                (int)axis.velBuffer.size();
-
-
-            finalOutputVel =
-                axis.bufferSum /
-                (double)
-                axis.velBuffer.size();
+        axis.bufferSum -= axis.velBuffer[axis.bufferIndex];
+        axis.velBuffer[axis.bufferIndex] = axis.currentCmdVel;
+        axis.bufferSum += axis.currentCmdVel;
+        axis.bufferIndex = (axis.bufferIndex + 1) % (int)axis.velBuffer.size();
+        finalOutputVel = axis.bufferSum / (double)axis.velBuffer.size();
     }
 
 
     // =========================================================
     // 5. S-Curve Output Position 積分
     // =========================================================
-    double stepPos =
-        finalOutputVel *
-        dt;
+    double stepPos =finalOutputVel * dt;
 
 
     // ---------------------------------------------------------
     // P0 / 最後一行：
     // 才允許精準夾到終點
     // ---------------------------------------------------------
-    bool isStopping =
-        (
-            std::abs(
-                axis.targetEndVel)
-            <= 0.1
-            )
-        ||
-        (
-            axis.isVirtualAxis &&
-            m_Group.cmdQueue.empty()
-            );
+    bool isStopping =(std::abs(axis.targetEndVel) <= 0.1)||(axis.isVirtualAxis &&m_Group.cmdQueue.empty());
 
 
     // =========================================================
     // 6. 正方向終點 Clamp
     // =========================================================
-    if (isStopping &&
-        dir > 0.0 &&
-        (axis.currentCmdPos + stepPos) >=
-        axis.finalTargetPos)
+    if (isStopping &&dir > 0.0 && (axis.currentCmdPos + stepPos) >= axis.finalTargetPos)
     {
-        stepPos =
-            axis.finalTargetPos -
-            axis.currentCmdPos;
+        stepPos = axis.finalTargetPos -axis.currentCmdPos;
+
+        finalOutputVel =stepPos /dt;
 
 
-        finalOutputVel =
-            stepPos /
-            dt;
-
-
-        axis.currentCmdPos =
-            axis.finalTargetPos;
+        axis.currentCmdPos = axis.finalTargetPos;
 
 
         // 清空 S-Curve Buffer
-        for (size_t i = 0;
-            i < axis.velBuffer.size();
-            ++i)
+        for (size_t i = 0;i < axis.velBuffer.size();++i)
         {
-            axis.velBuffer[i] =
-                0.0;
+            axis.velBuffer[i] =0.0;
         }
-
-
-        axis.bufferSum =
-            0.0;
+        axis.bufferSum = 0.0;
     }
 
 
     // =========================================================
     // 7. 負方向終點 Clamp
     // =========================================================
-    else if (
-        isStopping &&
-        dir < 0.0 &&
-        (axis.currentCmdPos + stepPos) <=
-        axis.finalTargetPos)
+    else if (isStopping && dir < 0.0 &&(axis.currentCmdPos + stepPos) <=axis.finalTargetPos)
     {
-        stepPos =
-            axis.finalTargetPos -
-            axis.currentCmdPos;
+        stepPos =axis.finalTargetPos -axis.currentCmdPos;
 
 
-        finalOutputVel =
-            stepPos /
-            dt;
+        finalOutputVel =stepPos /dt;
 
 
-        axis.currentCmdPos =
-            axis.finalTargetPos;
+        axis.currentCmdPos =axis.finalTargetPos;
 
 
         // 清空 S-Curve Buffer
-        for (size_t i = 0;
-            i < axis.velBuffer.size();
-            ++i)
+        for (size_t i = 0;i < axis.velBuffer.size(); ++i)
         {
-            axis.velBuffer[i] =
-                0.0;
+            axis.velBuffer[i] = 0.0;
         }
-
 
         axis.bufferSum =
             0.0;
@@ -1074,34 +965,23 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     else
     {
-        axis.currentCmdPos +=
-            stepPos;
+        axis.currentCmdPos +=stepPos;
     }
 
 
     // =========================================================
     // 9. 輸出 Command
     // =========================================================
-    outCmd.instantCmdVel =
-        finalOutputVel;
+    outCmd.instantCmdVel =finalOutputVel;
 
-    outCmd.instantCmdPos =
-        axis.currentCmdPos;
+    outCmd.instantCmdPos =axis.currentCmdPos;
 
 
     // =========================================================
     // 10. 到位 / P1 交接判斷
     // =========================================================
-    bool isBufferDry =
-        (
-            std::abs(
-                finalOutputVel)
-            < 1.0
-            );
-
-
-    bool isHandoverReady =
-        false;
+    bool isBufferDry =(std::abs( finalOutputVel) < 1.0 );
+    bool isHandoverReady = false;
 
 
     // ---------------------------------------------------------
@@ -1109,11 +989,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // ---------------------------------------------------------
     if (isStopping)
     {
-        isHandoverReady =
-            (
-                isPlanDone &&
-                isBufferDry
-                );
+        isHandoverReady =(isPlanDone &&isBufferDry);
     }
 
 
@@ -1124,19 +1000,11 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     {
         if (dir > 0.0)
         {
-            isHandoverReady =
-                (
-                    axis.currentCmdPos >=
-                    axis.finalTargetPos
-                    );
+            isHandoverReady =(axis.currentCmdPos >=axis.finalTargetPos);
         }
         else
         {
-            isHandoverReady =
-                (
-                    axis.currentCmdPos <=
-                    axis.finalTargetPos
-                    );
+            isHandoverReady = (axis.currentCmdPos <=axis.finalTargetPos);
         }
     }
 
@@ -1145,46 +1013,29 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // 11. 實體軸到位確認
     // Virtual Axis 不檢查 Physical Lag
     // =========================================================
-    bool isPhysicalInPos =
-        true;
+    bool isPhysicalInPos =true;
 
 
     if (!axis.isVirtualAxis)
     {
-        double currentLag =
-            std::abs(
-                axis.currentCmdPos -
-                axis.currentActPos);
-
-
-        isPhysicalInPos =
-            (
-                currentLag <=
-                axis.inPositionWindow_Pulse
-                );
+        double currentLag = std::abs(axis.currentCmdPos - axis.currentActPos);
+        isPhysicalInPos = (currentLag <= axis.inPositionWindow_Pulse);
     }
 
 
     // =========================================================
     // 12. 正式完成 / 交接
     // =========================================================
-    if (isHandoverReady &&
-        isPhysicalInPos &&
-        axis.state ==
-        MotionState::MotionState_MOVING)
+    if (isHandoverReady &&isPhysicalInPos &&axis.state ==MotionState::MotionState_MOVING)
     {
         if (isStopping)
         {
-            axis.state =
-                MotionState::
-                MotionState_IDLE;
+            axis.state = MotionState:: MotionState_IDLE;
         }
-
 
         // P0 = 完成
         // P1 = 可以交下一段
-        axis.inPosition =
-            true;
+        axis.inPosition =true;
     }
 }
 
@@ -1300,10 +1151,6 @@ void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd
 
 void MotionCore::DetermineActiveGainSet(AxisContext& axis)// PID 依照狀態切換
 {
-
-
-  
-
     switch (axis.state)
     {
     case MotionState::MotionState_IDLE:
@@ -1796,12 +1643,7 @@ void MotionCore::LineMove(const std::vector<int>& axes, const std::vector<double
 // 2. 半徑方向
 // 3. Z 軸方向
 // =========================================================
-static double CalcSpiralArcLengthAtProgress(
-    double progress,
-    double startRadius,
-    double endRadius,
-    double totalAngle,
-    double deltaZ)
+static double CalcSpiralArcLengthAtProgress(double progress,double startRadius, double endRadius, double totalAngle,double deltaZ)
 {
     // -----------------------------------------------------
     // Clamp Progress
@@ -1817,11 +1659,9 @@ static double CalcSpiralArcLengthAtProgress(
     }
 
 
-    const double deltaRadius =
-        endRadius - startRadius;
+    const double deltaRadius =endRadius - startRadius;
 
-    const double absAngle =
-        std::abs(totalAngle);
+    const double absAngle =std::abs(totalAngle);
 
 
     // =====================================================
@@ -1832,13 +1672,9 @@ static double CalcSpiralArcLengthAtProgress(
     // =====================================================
     if (absAngle < 1e-12)
     {
-        const double totalLinearLength =
-            std::sqrt(
-                deltaRadius * deltaRadius +
-                deltaZ * deltaZ);
+        const double totalLinearLength =std::sqrt(deltaRadius * deltaRadius +deltaZ * deltaZ);
 
-        return totalLinearLength *
-            progress;
+        return totalLinearLength *progress;
     }
 
 
@@ -1857,17 +1693,11 @@ static double CalcSpiralArcLengthAtProgress(
     // =====================================================
     if (std::abs(deltaRadius) < 1e-12)
     {
-        const double planarLength =
-            startRadius *
-            absAngle;
+        const double planarLength = startRadius * absAngle;
 
-        const double totalLength =
-            std::sqrt(
-                planarLength * planarLength +
-                deltaZ * deltaZ);
+        const double totalLength = std::sqrt( planarLength * planarLength + deltaZ * deltaZ);
 
-        return totalLength *
-            progress;
+        return totalLength * progress;
     }
 
 
@@ -1886,53 +1716,25 @@ static double CalcSpiralArcLengthAtProgress(
     // 對 p 積分得到真正路徑長度。
     // =====================================================
 
-    const double A2 =
-        deltaRadius * deltaRadius +
-        deltaZ * deltaZ;
+    const double A2 =deltaRadius * deltaRadius + deltaZ * deltaZ;
 
-    const double A =
-        std::sqrt(A2);
+    const double A =std::sqrt(A2);
 
-    const double B =
-        absAngle;
+    const double B =absAngle;
 
 
-    auto Primitive =
-        [A, A2, B](double radius) -> double
+    auto Primitive = [A, A2, B](double radius) -> double
     {
-        const double root =
-            std::sqrt(
-                A2 +
-                B * B *
-                radius * radius);
+        const double root = std::sqrt( A2 +B * B * radius * radius);
 
-        return
-            0.5 *
-            (
-                radius * root +
-                (A2 / B) *
-                std::asinh(
-                    (B * radius) / A)
-                );
+        return    0.5 * ( radius * root + (A2 / B) * std::asinh((B * radius) / A) );
     };
 
 
-    const double currentRadius =
-        startRadius +
-        deltaRadius *
-        progress;
-
-
-    const double f0 =
-        Primitive(startRadius);
-
-    const double f1 =
-        Primitive(currentRadius);
-
-
-    double length =
-        (f1 - f0) /
-        deltaRadius;
+    const double currentRadius =startRadius + deltaRadius *progress;
+    const double f0 = Primitive(startRadius);
+    const double f1 =Primitive(currentRadius);
+    double length =(f1 - f0) /deltaRadius;
 
 
     // Numerical safety
@@ -1958,13 +1760,7 @@ static double CalcSpiralArcLengthAtProgress(
 //
 // 使用 Newton iteration 反求 p。
 // =========================================================
-static double CalcSpiralProgressFromPathLength(
-    double pathLength,
-    double totalLength,
-    double startRadius,
-    double endRadius,
-    double totalAngle,
-    double deltaZ)
+static double CalcSpiralProgressFromPathLength(double pathLength,double totalLength,double startRadius, double endRadius,double totalAngle, double deltaZ)
 {
     if (totalLength <= 1e-12)
     {
@@ -1983,9 +1779,7 @@ static double CalcSpiralProgressFromPathLength(
     }
 
 
-    const double deltaRadius =
-        endRadius -
-        startRadius;
+    const double deltaRadius =endRadius - startRadius;
 
 
     // =====================================================
@@ -1995,16 +1789,12 @@ static double CalcSpiralProgressFromPathLength(
     // =====================================================
     if (std::abs(deltaRadius) < 1e-12)
     {
-        return
-            pathLength /
-            totalLength;
+        return pathLength /totalLength;
     }
 
 
     // 初始猜測
-    double progress =
-        pathLength /
-        totalLength;
+    double progress =pathLength /totalLength;
 
 
     // =====================================================
@@ -2013,37 +1803,14 @@ static double CalcSpiralProgressFromPathLength(
     // 通常 3~4 次就會非常接近。
     // 固定使用 4 次，避免 RT Thread 不確定迴圈。
     // =====================================================
-    for (int iteration = 0;
-        iteration < 4;
-        ++iteration)
+    for (int iteration = 0;iteration < 4;++iteration)
     {
-        const double currentLength =
-            CalcSpiralArcLengthAtProgress(
-                progress,
-                startRadius,
-                endRadius,
-                totalAngle,
-                deltaZ);
-
-
-        const double currentRadius =
-            startRadius +
-            deltaRadius *
-            progress;
+        const double currentLength =CalcSpiralArcLengthAtProgress( progress, startRadius, endRadius,  totalAngle,   deltaZ);
+        const double currentRadius =startRadius + deltaRadius * progress;
 
 
         // dS / dp
-        const double metric =
-            std::sqrt(
-                deltaRadius *
-                deltaRadius +
-                deltaZ *
-                deltaZ +
-                currentRadius *
-                currentRadius *
-                totalAngle *
-                totalAngle);
-
+        const double metric =std::sqrt(deltaRadius *deltaRadius +deltaZ *deltaZ +currentRadius *currentRadius *totalAngle *totalAngle);
 
         if (metric < 1e-12)
         {
@@ -2051,10 +1818,7 @@ static double CalcSpiralProgressFromPathLength(
         }
 
 
-        progress -=
-            (currentLength -
-                pathLength) /
-            metric;
+        progress -= (currentLength - pathLength) / metric;
 
 
         // Clamp
@@ -2080,8 +1844,7 @@ void MotionCore::LoadNextCommand()
         return;
 
     // 群組還在跑，而且虛擬軸尚未允許交接
-    if (m_Group.isActive &&
-        !m_Group.virtualAxis.inPosition)
+    if (m_Group.isActive &&!m_Group.virtualAxis.inPosition)
     {
         return;
     }
@@ -2090,11 +1853,9 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // 2. 將剛完成的指令寫入 History
     // ======================================================
-    if (m_Group.isActive &&
-        m_Group.enableHistory)
+    if (m_Group.isActive && m_Group.enableHistory)
     {
-        m_Group.historyQueue.push_back(
-            m_Group.currentCmd);
+        m_Group.historyQueue.push_back(m_Group.currentCmd);
 
         if (m_Group.historyQueue.size() > 1000)
         {
@@ -2106,8 +1867,7 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // 3. 取得下一條 Motion Command
     // ======================================================
-    MotionCommand cmd =
-        m_Group.cmdQueue.front();
+    MotionCommand cmd =m_Group.cmdQueue.front();
 
     m_Group.cmdQueue.pop_front();
 
@@ -2118,77 +1878,37 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // 4. 更新 NC 執行資訊
     // ======================================================
-    m_Group.currentExecutionPC =
-        cmd.sourceLinePC;
-
-    m_Group.currentExecutionWCS =
-        cmd.sourceWCS;
-
-    m_Group.currentExecutionToolMode =
-        cmd.sourceToolLengthMode;
-
-    m_Group.currentExecutionHCode =
-        cmd.sourceHCode;
-
-    m_Group.currentExecutionToolRadiusMode =
-        cmd.sourceToolRadiusMode;
-
-    m_Group.currentExecutionDCode =
-        cmd.sourceDCode;
-
-    m_Group.currentExecutionIsAbsoluteMode =
-        cmd.sourceIsAbsoluteMode;
-
-    m_Group.currentExecutionG68Active =
-        cmd.sourceG68Active;
-
-    m_Group.currentExecutionG68Angle =
-        cmd.sourceG68Angle;
-
-    m_Group.currentExecutionG168Active =
-        cmd.sourceG168Active;
-
-    m_Group.currentExecutionWCode =
-        cmd.sourceWCode;
-
-    m_Group.currentExecutionG51Active =
-        cmd.sourceG51Active;
-
-    m_Group.currentExecutionScaleRatio =
-        cmd.sourceScaleRatio;
-
-    m_Group.currentExecutionMirrorMask =
-        cmd.sourceMirrorMask;
-
-    m_Group.currentExecutionG16Active =
-        cmd.sourceG16Active;
-
-    m_Group.currentExecutionG162Active =
-        cmd.sourceG162Active;
-
-    m_Group.currentExecutionPlaneMode =
-        cmd.sourcePlaneMode;
+    m_Group.currentExecutionPC =cmd.sourceLinePC;
+    m_Group.currentExecutionWCS =cmd.sourceWCS;
+    m_Group.currentExecutionToolMode =cmd.sourceToolLengthMode;
+    m_Group.currentExecutionHCode =cmd.sourceHCode;
+    m_Group.currentExecutionToolRadiusMode =cmd.sourceToolRadiusMode;
+    m_Group.currentExecutionDCode = cmd.sourceDCode;
+    m_Group.currentExecutionIsAbsoluteMode = cmd.sourceIsAbsoluteMode;
+    m_Group.currentExecutionG68Active = cmd.sourceG68Active;
+    m_Group.currentExecutionG68Angle = cmd.sourceG68Angle;
+    m_Group.currentExecutionG168Active = cmd.sourceG168Active;
+    m_Group.currentExecutionWCode = cmd.sourceWCode;
+    m_Group.currentExecutionG51Active = cmd.sourceG51Active;
+    m_Group.currentExecutionScaleRatio = cmd.sourceScaleRatio;
+    m_Group.currentExecutionMirrorMask = cmd.sourceMirrorMask;
+    m_Group.currentExecutionG16Active =cmd.sourceG16Active;
+    m_Group.currentExecutionG162Active =cmd.sourceG162Active;
+    m_Group.currentExecutionPlaneMode = cmd.sourcePlaneMode;
 
 
     // ======================================================
     // 5. 更新群組模式
     // ======================================================
-    m_Group.mode =
-        cmd.mode;
-
-    m_Group.axisCount =
-        cmd.axisCount;
-
-    AxisContext& vAxis =
-        m_Group.virtualAxis;
+    m_Group.mode =cmd.mode;
+    m_Group.axisCount = cmd.axisCount;
+    AxisContext& vAxis = m_Group.virtualAxis;
 
 
     // ======================================================
     // 6. S-Curve 殘留距離
     // ======================================================
-    double trappedDist =
-        vAxis.planningPos -
-        vAxis.currentCmdPos;
+    double trappedDist =vAxis.planningPos - vAxis.currentCmdPos;
 
     if (trappedDist < 0.0)
     {
@@ -2220,18 +1940,13 @@ void MotionCore::LoadNextCommand()
         // ----------------------------------------------
         // 先更新所有邏輯座標
         // ----------------------------------------------
-        for (int i = 0;
-            i < m_Group.axisCount;
-            ++i)
+        for (int i = 0; i < m_Group.axisCount; ++i)
         {
-            int idx =
-                m_Group.axisIndices[i];
+            int idx = m_Group.axisIndices[i];
 
-            AxisContext& realAxis =
-                (*m_pContexts)[idx];
+            AxisContext& realAxis = (*m_pContexts)[idx];
 
-            realAxis.logicalCmdPos =
-                m_Group.currentCmd.targetPos[i];
+            realAxis.logicalCmdPos = m_Group.currentCmd.targetPos[i];
 
             realAxis.logicalCmdVel = 0.0;
             realAxis.currentCmdVel = 0.0;
@@ -2243,70 +1958,37 @@ void MotionCore::LoadNextCommand()
         // Logical 不能直接等於 Physical
         // 必須套矩陣
         // ----------------------------------------------
-        if (m_Group.enableTransform &&
-            m_Group.axisCount >= 2)
+        if (m_Group.enableTransform && m_Group.axisCount >= 2)
         {
-            int idxX =
-                m_Group.axisIndices[0];
+            int idxX = m_Group.axisIndices[0];
 
-            int idxY =
-                m_Group.axisIndices[1];
+            int idxY = m_Group.axisIndices[1];
 
-            int idxZ =
-                (m_Group.axisCount >= 3)
-                ? m_Group.axisIndices[2]
-                : -1;
+            int idxZ = (m_Group.axisCount >= 3) ? m_Group.axisIndices[2] : -1;
 
-            AxisContext& realX =
-                (*m_pContexts)[idxX];
+            AxisContext& realX = (*m_pContexts)[idxX];
+            AxisContext& realY =(*m_pContexts)[idxY];
 
-            AxisContext& realY =
-                (*m_pContexts)[idxY];
-
-            double logP[3] =
-            {
-                realX.logicalCmdPos,
-                realY.logicalCmdPos,
-                0.0
-            };
+            double logP[3] ={realX.logicalCmdPos,realY.logicalCmdPos, 0.0  };
 
             if (idxZ != -1)
             {
-                logP[2] =
-                    (*m_pContexts)[idxZ]
-                    .logicalCmdPos;
+                logP[2] = (*m_pContexts)[idxZ]   .logicalCmdPos;
             }
 
-            double physP[3] =
-            {
-                0.0,
-                0.0,
-                0.0
-            };
+            double physP[3] ={0.0,0.0, 0.0};
 
-            for (int r = 0;
-                r < 3;
-                ++r)
+            for (int r = 0; r < 3;   ++r)
             {
-                physP[r] =
-                    m_Group.transformOrigin[r];
+                physP[r] =m_Group.transformOrigin[r];
 
-                for (int c = 0;
-                    c < 3;
-                    ++c)
+                for (int c = 0; c < 3; ++c)
                 {
-                    physP[r] +=
-                        m_Group.transformMatrix[r][c]
-                        *
-                        (
-                            logP[c] -
-                            m_Group.transformOrigin[c]
-                            );
+                    physP[r] += m_Group.transformMatrix[r][c]  * ( logP[c] - m_Group.transformOrigin[c] );
                 }
             }
 
-            realX.currentCmdPos =
-                physP[0];
+            realX.currentCmdPos = physP[0];
 
             realY.currentCmdPos =
                 physP[1];

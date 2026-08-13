@@ -1307,6 +1307,7 @@ void EtherCatMaster::LinkCoordinateManager(CoordinateManager* pCoord)
     pCoordMgr = pCoord;
 }
 
+
 //PDO 中斷作業----------------------------------------------------------
 void RTAPI GlobalTimerHandler_PDO(void* nContext)
 {

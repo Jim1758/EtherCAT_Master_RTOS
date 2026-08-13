@@ -230,8 +230,96 @@ public:
     // 從外面收進來時呼叫 (畫面/G碼輸入 -> 轉為底層 mm)
     double ToInternalUnit(double externalValue, bool isRotaryAxis) const;
 
+    // ==========================================================
+ // Manual Frame
+ //
+ // 只影響手動運動：
+ //
+ //   Normal JOG
+ //   Fine JOG
+ //   INCH JOG
+ //   MPG
+ //
+ // 不影響：
+ //
+ //   NC Program
+ //   G00 / G01 / G02 / G03
+ //   HOME
+ //   G68
+ //   G168
+ //   Mirror
+ //
+ // Rotation:
+ //
+ //   R = Rz(Yaw) * Ry(Pitch) * Rx(Roll)
+ //
+ // Angle unit:
+ //   Degree
+ //
+ // Default:
+ //   Disabled
+ //   Yaw   = 0.0
+ //   Pitch = 0.0
+ //   Roll  = 0.0
+ // ==========================================================
+
+ // 開關
+    void SetManualFrameEnabled(bool enabled);
+
+    bool IsManualFrameEnabled() const;
+
+
+    // ----------------------------------------------------------
+    // 一次設定三個角度
+    //
+    // HMI 正式建議使用這個 API。
+    // ----------------------------------------------------------
+
+    void SetManualFrameAngles( double yawDeg, double pitchDeg, double rollDeg);
+
+
+    // ----------------------------------------------------------
+    // 個別設定
+    // ----------------------------------------------------------
+
+    void SetManualFrameYaw( double yawDeg);
+    void SetManualFramePitch(double pitchDeg);
+    void SetManualFrameRoll( double rollDeg);
+
+
+    // ----------------------------------------------------------
+    // 讀取
+    // ----------------------------------------------------------
+
+    double GetManualFrameYaw() const;
+
+    double GetManualFramePitch() const;
+
+    double GetManualFrameRoll() const;
+
+
+    // ----------------------------------------------------------
+    // Manual Vector -> Machine Vector
+    //
+    // 內部直接使用 CoordinateManager 保存的
+    // Yaw / Pitch / Roll。
+    //
+    // NCPLCManager 不需要知道角度來源。
+    // ----------------------------------------------------------
+
+    void TransformManualVector(const double* manualVector,double* machineVector) const;
+
 private:
     // 底層輔助函式：負責讀寫 8 軸二維陣列，並確保原子寫入防護
     void SaveTableToFile(const std::string& filename, const std::vector<std::vector<double>>& table);
     void LoadTableFromFile(const std::string& filename, std::vector<std::vector<double>>& table, int maxRows);
+
+    // ==========================================================
+// Manual Frame State
+// ==========================================================
+
+    bool m_manualFrameEnabled =false;
+    double m_manualFrameYawDeg =0.0;
+    double m_manualFramePitchDeg = 0.0;
+    double m_manualFrameRollDeg =0.0;
 };

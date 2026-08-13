@@ -111,6 +111,8 @@
     <ClInclude Include="MacroParser.h" />
     <ClInclude Include="MotionCore.h" />
     <ClInclude Include="NCManager.h" />
+    <ClInclude Include="NCPLCManager.h" />
+    <ClInclude Include="NCPLCMap.h" />
     <ClInclude Include="NC_Types.h" />
     <ClInclude Include="NicDriver.h" />
     <ClInclude Include="PlcCore.h" />
@@ -156,6 +158,7 @@
     <ClCompile Include="NCManager.cpp" />
     <ClCompile Include="NCManager_PLCSync.cpp" />
     <ClCompile Include="NCManager_SysVars.cpp" />
+    <ClCompile Include="NCPLCManager.cpp" />
     <ClCompile Include="NicDriver.cpp" />
     <ClCompile Include="PlcCore.cpp" />
     <ClCompile Include="PLCManager.cpp" />

@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <cmath>
 #include "GlobalConfig.h"
 #include "EtherCatMaster.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
@@ -1002,4 +1003,330 @@ double CoordinateManager::ToInternalUnit(double externalValue, bool isRotaryAxis
     }
 
     return externalValue; // 公制模式，原封不動進入
+}
+
+void CoordinateManager::TransformManualVector(
+    const double* manualVector,
+    double* machineVector) const
+{
+    // ======================================================
+    // Pointer Guard
+    // ======================================================
+
+    if (manualVector == nullptr ||
+        machineVector == nullptr)
+    {
+        return;
+    }
+
+
+    // ======================================================
+    // Copy Input
+    //
+    // 保證允許：
+    //
+    // TransformManualVector(vector, vector);
+    // ======================================================
+
+    double input[8] =
+    {
+        manualVector[0],
+        manualVector[1],
+        manualVector[2],
+        manualVector[3],
+        manualVector[4],
+        manualVector[5],
+        manualVector[6],
+        manualVector[7]
+    };
+
+
+    // ======================================================
+    // Manual Frame OFF
+    //
+    // 完全 1:1 通過。
+    //
+    // 這樣 NCPLCManager 之後可以永遠呼叫這個 API，
+    // 不需要自己判斷 Enabled。
+    // ======================================================
+
+    if (!m_manualFrameEnabled)
+    {
+        for (int i = 0;
+            i < 8;
+            ++i)
+        {
+            machineVector[i] =
+                input[i];
+        }
+
+        return;
+    }
+
+
+    // ======================================================
+    // Degree -> Radian
+    // ======================================================
+
+    constexpr double DEG_TO_RAD =
+        0.01745329251994329576923690768489;
+
+
+    const double yaw =
+        m_manualFrameYawDeg *
+        DEG_TO_RAD;
+
+    const double pitch =
+        m_manualFramePitchDeg *
+        DEG_TO_RAD;
+
+    const double roll =
+        m_manualFrameRollDeg *
+        DEG_TO_RAD;
+
+
+    const double cy =
+        std::cos(yaw);
+
+    const double sy =
+        std::sin(yaw);
+
+    const double cp =
+        std::cos(pitch);
+
+    const double sp =
+        std::sin(pitch);
+
+    const double cr =
+        std::cos(roll);
+
+    const double sr =
+        std::sin(roll);
+
+
+    // ======================================================
+    // Manual XYZ Vector
+    // ======================================================
+
+    const double x =
+        input[0];
+
+    const double y =
+        input[1];
+
+    const double z =
+        input[2];
+
+
+    // ======================================================
+    // 1. Rx(Roll)
+    // ======================================================
+
+    const double x1 =
+        x;
+
+    const double y1 =
+        cr * y -
+        sr * z;
+
+    const double z1 =
+        sr * y +
+        cr * z;
+
+
+    // ======================================================
+    // 2. Ry(Pitch)
+    // ======================================================
+
+    const double x2 =
+        cp * x1 +
+        sp * z1;
+
+    const double y2 =
+        y1;
+
+    const double z2 =
+        -sp * x1 +
+        cp * z1;
+
+
+    // ======================================================
+    // 3. Rz(Yaw)
+    // ======================================================
+
+    const double x3 =
+        cy * x2 -
+        sy * y2;
+
+    const double y3 =
+        sy * x2 +
+        cy * y2;
+
+    const double z3 =
+        z2;
+
+
+    // ======================================================
+    // Output XYZ
+    // ======================================================
+
+    machineVector[0] =
+        x3;
+
+    machineVector[1] =
+        y3;
+
+    machineVector[2] =
+        z3;
+
+
+    // ======================================================
+    // A / B / C / U / V
+    //
+    // Manual Frame 不作用。
+    // ======================================================
+
+    machineVector[3] =
+        input[3];
+
+    machineVector[4] =
+        input[4];
+
+    machineVector[5] =
+        input[5];
+
+    machineVector[6] =
+        input[6];
+
+    machineVector[7] =
+        input[7];
+}
+
+
+// ==========================================================
+// Manual Frame
+//
+// 只供 Manual Motion 使用：
+//
+//   Normal JOG
+//   Fine JOG
+//   INCH JOG
+//   MPG
+//
+// 不影響 NC Program / WCS / G68 / G168 / HOME。
+// ==========================================================
+
+
+// ==========================================================
+// Enable / Disable
+// ==========================================================
+
+void CoordinateManager::SetManualFrameEnabled(
+    bool enabled)
+{
+    m_manualFrameEnabled =
+        enabled;
+}
+
+
+bool CoordinateManager::IsManualFrameEnabled() const
+{
+    return m_manualFrameEnabled;
+}
+
+
+// ==========================================================
+// Set All Angles
+//
+// Angle Unit:
+//     Degree
+//
+// 非有限數值不接受，避免 NaN / INF 進入 Motion。
+// ==========================================================
+
+void CoordinateManager::SetManualFrameAngles(
+    double yawDeg,
+    double pitchDeg,
+    double rollDeg)
+{
+    if (!std::isfinite(yawDeg) ||
+        !std::isfinite(pitchDeg) ||
+        !std::isfinite(rollDeg))
+    {
+        return;
+    }
+
+    m_manualFrameYawDeg =
+        yawDeg;
+
+    m_manualFramePitchDeg =
+        pitchDeg;
+
+    m_manualFrameRollDeg =
+        rollDeg;
+}
+
+
+// ==========================================================
+// Individual Angle Set
+// ==========================================================
+
+void CoordinateManager::SetManualFrameYaw(
+    double yawDeg)
+{
+    if (!std::isfinite(yawDeg))
+    {
+        return;
+    }
+
+    m_manualFrameYawDeg =
+        yawDeg;
+}
+
+
+void CoordinateManager::SetManualFramePitch(
+    double pitchDeg)
+{
+    if (!std::isfinite(pitchDeg))
+    {
+        return;
+    }
+
+    m_manualFramePitchDeg =
+        pitchDeg;
+}
+
+
+void CoordinateManager::SetManualFrameRoll(
+    double rollDeg)
+{
+    if (!std::isfinite(rollDeg))
+    {
+        return;
+    }
+
+    m_manualFrameRollDeg =
+        rollDeg;
+}
+
+
+// ==========================================================
+// Angle Get
+// ==========================================================
+
+double CoordinateManager::GetManualFrameYaw() const
+{
+    return m_manualFrameYawDeg;
+}
+
+
+double CoordinateManager::GetManualFramePitch() const
+{
+    return m_manualFramePitchDeg;
+}
+
+
+double CoordinateManager::GetManualFrameRoll() const
+{
+    return m_manualFrameRollDeg;
 }

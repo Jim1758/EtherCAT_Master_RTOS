@@ -264,6 +264,10 @@ public:
     void    Set_A(int index, bool value);
     bool    Get_A(int index) const;
 
+    // C Point
+    void    Set_C(int index, bool value);
+    bool    Get_C(int index) const;
+
     void    Set_S(int index, bool value);
     bool    Get_S(int index) const;
 

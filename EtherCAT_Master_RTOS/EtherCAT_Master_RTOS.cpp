@@ -73,6 +73,30 @@ int _tmain(int argc, _TCHAR* argv[])//
 
 
 
+    // ==========================================================
+    // Main Real-Time Loop Priority
+    //
+    // RTX64：
+    // 數字越大，Priority 越高
+    //
+    // PDO  = 64
+    // PLC  = 63
+    // MAIN = 50
+    //
+    // Main Loop 必須低於 PDO / PLC
+    // ==========================================================
+
+    HANDLE hMainThread = GetCurrentThread();
+
+    if (!RtSetThreadPriority(hMainThread, 50))
+    {
+        DEBUG_PRINT("[RTSS] Set Main Thread Priority Error >> %d\n", GetLastError());
+        return -1;
+    }
+
+    DEBUG_PRINT("[RTSS] Main Thread Priority = %d\n", RtGetThreadPriority(hMainThread));
+
+
     switch (GlobalConfig::GetInstance().systemMode)
     {
     case SystemMode::EDM_SINKER_MODE://EDM 雕磨模式

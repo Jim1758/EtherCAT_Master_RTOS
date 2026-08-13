@@ -213,6 +213,9 @@
     <ClCompile Include="NCManager_PLCSync.cpp">
       <Filter>Source Files\NC</Filter>
     </ClCompile>
+    <ClCompile Include="NCPLCManager.cpp">
+      <Filter>Source Files\NC</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -295,6 +298,12 @@
     </ClInclude>
     <ClInclude Include="PLCManager.h">
       <Filter>Header Files\PLC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPLCMap.h">
+      <Filter>Header Files\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPLCManager.h">
+      <Filter>Header Files\NC</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

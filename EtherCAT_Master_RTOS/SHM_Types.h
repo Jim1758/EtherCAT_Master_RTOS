@@ -81,7 +81,15 @@ struct SHM_NC_Status
     double actualWCS[8]; // 絕對座標/工件座標 (Work Coordinate System)
     double DistanceToGo[8];//剩餘座標
    
-    int32_t reserved[30];// 預留擴充空間
+    int32_t manualFrameEnabled;
+    // Rotation around Machine Z
+    double manualFrameYawDeg;
+    // Rotation around Machine Y
+    double manualFramePitchDeg;
+    // Rotation around Machine X
+    double manualFrameRollDeg;
+
+    int32_t reserved[23];// 預留擴充空間
 };
 
 
@@ -204,6 +212,14 @@ struct SHM_Coord_Command {
     // 儲存檔案命令
     bool reqSave;        // 觸發旗標 (true=執行, false=待機)
     char saveType;       // 0=全部, 1=Status, 2=EXT, 3=WCS, 4=Tool, 5=Work
+
+    bool reqSetManualFrame;
+
+    bool manualFrameEnabled;
+
+    double manualFrameYawDeg;
+    double manualFramePitchDeg;
+    double manualFrameRollDeg;
 };
 
 // PLC狀態區塊 (全廣播，供 HMI 讀取顯示) --------------------------------

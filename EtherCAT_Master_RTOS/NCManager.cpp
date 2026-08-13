@@ -462,6 +462,18 @@ void NCManager::ProcessTask()
         return;
     }
 
+    // =========================================================
+// Machine Ready Interlock
+// =========================================================
+    if (m_edmState == EDMState::NOT_READY)
+    {
+        if (m_state == NCState::RUN)
+        {
+            FeedHold();
+        }
+
+        return;
+    }
 
     // =========================================================
     // 🌟 3. 正常任務分流 (只有在無警報時才會走到這裡)
@@ -1236,6 +1248,23 @@ EDMState NCManager::GetMachineEDMState()
         }
     }
 
+
+    // ----------------------------------------------------
+ // 🔌 2. External Machine Ready Interlock
+ //
+ // NCManager 不知道來源是 PLC C11。
+ // 它只知道外部條件目前是否允許機台 Ready。
+ //
+ // false:
+ //     Machine / Servo Power 條件尚未成立
+ //
+ // true:
+ //     才繼續檢查各實體軸 Servo On
+ // ----------------------------------------------------
+    if (!m_externalReadyInterlock)
+    {
+        return EDMState::NOT_READY;
+    }
     // ----------------------------------------------------
       // 🔌 2. [次高優先權] 激磁 (Servo On) 檢查 (回傳 NOT_READY)
       // ----------------------------------------------------

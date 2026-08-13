@@ -264,7 +264,7 @@ public:
      //主系統區塊-----------------------------------------------------------------------------------
      int TotalSlave_WKC_Count = 0;//從站統計WKC 分數 判斷是否失聯
      void Get_TotalSlave_WKC_Count();//取得從站WKC 分數
-     
+    
      int RunRealTimeCycle_EDM_SINKER_MODE();//主要程式迴圈執行 EDM 雕磨模式
 
 

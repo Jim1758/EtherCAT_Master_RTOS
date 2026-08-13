@@ -9,10 +9,11 @@
 #include "HMI_Bridge.h"    // 🌟 1. 引入橋接器
 #include "AlarmManager.h"
 #include "PLCManager.h" // 🌟 1. 引入 PLC 管理器標頭檔
-
+#include "NCPLCManager.h"
 int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行 EDM模式
 {
     Get_TotalSlave_WKC_Count();//取得從站WKC 分數
+
 
      //PDO 中斷宣告---------------------------------------------------------------
     HANDLE hTimer_PDO = NULL;
@@ -131,12 +132,27 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
 
     m_Motion.ResetAllFaults();//全軸 清除異常狀態
 
-   
+   // =========================================================
+// PLC <-> NC Interface Manager
+//
+// 獨立於 NCManager。
+// 專門負責：
+//
+// PLC C Point -> NC / Motion
+// NC / Motion -> PLC S Point
+// JOG
+// MPG
+// HOME
+// Safety
+// M/S/T Handshake
+// =========================================================
+    NCPLCManager ncPLCManager(*m_NC, m_Motion,m_plcManager);
+
 
     //主控迴圈-------------------------------------------------------------
     while (1)
     {
-      
+       
         if (m_NC->Close_System_Com_flag == true)//關閉核心命令
         {
             m_NC->CoordSys.SaveAllParameters();//儲存座標系統相關參數
@@ -149,6 +165,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
        
         RtSleep(10);
         HMI_Bridge::ProcessTask(m_NC);//高速API共享記憶體作業任務
+        ncPLCManager.Process();
         m_NC->ProcessTask();//NC系統作業呼叫
 
 
@@ -163,7 +180,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         //1s
         if (tickCount_RunRealTimeCycle % 4000 == 0)
         {
-           
+            DEBUG_PRINT(">>> [1s] WKC:%d | Timeouts:%d | Err:%d |\n", wkc_PDO, timeout_count_PDO, wkc_error_count_PDO);
         }
 
     

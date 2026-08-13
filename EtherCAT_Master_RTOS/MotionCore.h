@@ -30,6 +30,13 @@ enum class MotionState// 運動狀態機
     MotionState_VELOCITY,   // 速度模式移動中
     MotionState_INTERPOLATING ,//多軸插補中
     MotionState_ESTOP,//緊急狀態
+
+     // =====================================================
+    // MPG Handwheel Position Following
+    //
+    // 放最後面避免改變前面既有 Enum 數值。
+    // =====================================================
+    MotionState_MPG,
 };
 
 enum class BufferMode
@@ -88,6 +95,85 @@ struct AxisContext//軸參數與狀態
     //硬體物理參數-------------------------------------------------
     double resolution_PPR = 16777216.0;// 編碼器解析度
     double maxVel_PPS = 0.0;// 最高轉速 (Pulse/sec)
+
+   
+    double JOG_MAX_PPS = 0.0;
+    double JOG_acc_time = 0.2;
+    double JOG_dec_time = 0.2;
+    double JOG_RAPID_PERCENT = 100.0;
+
+
+    // =========================================================
+// MPG / Manual Pulse Generator
+//
+// C21 = MPG Mode
+//
+// C210~217 = Axis Select
+//
+// C220 = x1
+// C221 = x10
+// C222 = x100
+// C223 = x1000
+//
+// DR200 = Handwheel accumulated encoder count
+//
+// MPG_BASE_DISTANCE：
+//     每 1 個 Handwheel Count 在 x1 時的移動距離
+//
+// Linear Axis：mm / count
+// Rotary Axis：degree / count
+//
+// MPG_MAX_PPS：
+//     MPG 追趕目標時允許的最高速度
+//
+// 加減速直接共用：
+//     JOG_acc_time
+//     JOG_dec_time
+// =========================================================
+
+    double MPG_BASE_DISTANCE = 0.001;
+
+    double MPG_MAX_PPS = 0.0;
+
+    // =========================================================
+    // FINE CONTINUOUS JOG
+    //
+    // C23 = Fine JOG Mode
+    //
+    // 四段速度由各軸自行設定。
+    // 單位：Pulse/sec
+    //
+    // 加減速直接共用：
+    // JOG_acc_time
+    // JOG_dec_time
+    // =========================================================
+
+    double FINE_JOG_0001_PPS = 0.0;
+    double FINE_JOG_0010_PPS = 0.0;
+    double FINE_JOG_0100_PPS = 0.0;
+    double FINE_JOG_1000_PPS = 0.0;
+
+   
+
+    // =========================================================
+// INCH JOG Parameters
+//
+// 距離單位：
+// Linear = mm
+// Rotary = degree
+// =========================================================
+
+    double INCH_0001_DISTANCE = 0.001;
+    double INCH_0010_DISTANCE = 0.010;
+    double INCH_0100_DISTANCE = 0.100;
+    double INCH_1000_DISTANCE = 1.000;
+
+
+    // INCH 移動速度
+    double INCH_JOG_PPS = 0.0;
+
+    double INCH_acc_time = 0.2;
+    double INCH_dec_time = 0.2;
 
     double G00_PPS=0.0;// G00 速度 (Pulse/sec)
     double G00_acc_time;  // 🌟 [新增] G00 的加速時間 (秒)
@@ -642,6 +728,7 @@ public:
     void InitSmoothBuffer(AxisContext& axis, double smoothTime_ms);// 初始化 S-Curve 平滑濾波緩衝區
     void MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time);// 下達 P2P 絕對位置移動指令 (Trapezoidal 梯形加減速)
     void VelocityMove(AxisContext& axis, double velocity, double acc_time = 0.0);// 下達速度模式指令 (用於放電或手動連續移動)
+    void MPGMove(AxisContext& axis,double targetPos,double maxVel, double acc_time,double dec_time);
     void StopMove(AxisContext& axis, double dec_time = 0.0);// 正常減速停止單軸
     void EmergencyStop(AxisContext& axis);// 單軸急停 (瞬間鎖死，清空緩衝區)
     void ResetFault(AxisContext& axis);// 清除單軸故障狀態 (Reset Error)
@@ -650,6 +737,23 @@ public:
     void SetAxisFeedrateOverride(int axisIndex, double overrideRatio);// 設定單軸的進給倍率 (0.0 ~ 1.0)
     void Stop(AxisContext& axis);// 簡易停止 API
 
+    // 所有存在的實體軸立即急停
+//
+// 與 EmergencyStopGroup() 不同：
+//
+// EmergencyStopGroup()
+//     只處理目前 interpolation group
+//
+// EmergencyStopAllAxes()
+//     不管目前 Group 如何設定，
+//     直接掃描所有 AxisContext，
+//     只要 axis.isExist == true 就 EmergencyStop。
+//
+// 用於：
+//     PLC C5 Emergency Stop
+//     全機安全急停
+// =========================================================
+    void EmergencyStopAllAxes();
 
 
     //核心運算更新--------------------------------------------------------------------
@@ -933,7 +1037,7 @@ private:
 
     void Calc_Trajectory_Trapezoidal(AxisContext& axis, AxisCommand& outCmd); // 計算定位模式的梯形速度規劃 (S-Curve 前置)
     void Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd); // 計算速度模式的斜坡變速規劃
-
+    void Calc_Trajectory_MPG(AxisContext& axis, AxisCommand& outCmd);
    
     // 執行 PID 運算、前饋控制以及安全 Lag 監控--------------------------------------------------------------------
     template <typename DriveType>

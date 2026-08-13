@@ -202,6 +202,66 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             double Max_speed = ConfigUtil::ReadParam(filePath, prefix + "MAX_Speed", 0);
             axes[i].maxVel_PPS = MotionCore::UnitPerMinToPps(Max_speed, axes[i].resolution_PPR, axes[i].finalLead);
 
+
+
+            double Stop_dec_time = ConfigUtil::ReadParam(filePath, prefix + "Stop_dec_time", 0);
+            axes[i].Stop_dec_time = Stop_dec_time;
+
+
+            double Jog_speed_user = ConfigUtil::ReadParam(filePath, prefix + "JOG_MAX_PPS", 0);
+            axes[i].JOG_MAX_PPS = MotionCore::UnitPerMinToPps(Jog_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double Jog_acc_time = ConfigUtil::ReadParam(filePath, prefix + "JOG_acc_time", 0);
+            axes[i].JOG_acc_time = Jog_acc_time;
+
+            double Jog_dec_time = ConfigUtil::ReadParam(filePath, prefix + "JOG_dec_time", 0);
+            axes[i].JOG_dec_time = Jog_acc_time;
+
+
+            double FINE_JOG_0001_PPS_user = ConfigUtil::ReadParam(filePath, prefix + "FINE_JOG_0001_PPS", 0);
+            axes[i].FINE_JOG_0001_PPS = MotionCore::UnitPerMinToPps(FINE_JOG_0001_PPS_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double FINE_JOG_0010_PPS_user = ConfigUtil::ReadParam(filePath, prefix + "FINE_JOG_0010_PPS", 0);
+            axes[i].FINE_JOG_0010_PPS = MotionCore::UnitPerMinToPps(FINE_JOG_0010_PPS_user, axes[i].resolution_PPR, axes[i].finalLead);
+            double FINE_JOG_0100_PPS_user = ConfigUtil::ReadParam(filePath, prefix + "FINE_JOG_0100_PPS", 0);
+            axes[i].FINE_JOG_0100_PPS = MotionCore::UnitPerMinToPps(FINE_JOG_0100_PPS_user, axes[i].resolution_PPR, axes[i].finalLead);
+            double FINE_JOG_1000_PPS_user = ConfigUtil::ReadParam(filePath, prefix + "FINE_JOG_1000_PPS", 0);
+            axes[i].FINE_JOG_1000_PPS = MotionCore::UnitPerMinToPps(FINE_JOG_1000_PPS_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+
+            double MPG_BASE_DISTANCE = ConfigUtil::ReadParam(filePath, prefix + "MPG_BASE_DISTANCE", 0);
+            axes[i].MPG_BASE_DISTANCE = MPG_BASE_DISTANCE;
+
+
+            double MPG_MAX_PPS = ConfigUtil::ReadParam(filePath, prefix + "MPG_MAX_PPS", 0);
+            axes[i].MPG_MAX_PPS = MotionCore::UnitPerMinToPps(MPG_MAX_PPS, axes[i].resolution_PPR, axes[i].finalLead);
+
+
+
+
+            double INCH_0001_DISTANCE_user = ConfigUtil::ReadParam(filePath, prefix + "INCH_0001_DISTANCE", 0);
+            axes[i].INCH_0001_DISTANCE = INCH_0001_DISTANCE_user;
+
+            double INCH_0010_DISTANCE_user = ConfigUtil::ReadParam(filePath, prefix + "INCH_0010_DISTANCE", 0);
+            axes[i].INCH_0010_DISTANCE = INCH_0010_DISTANCE_user;
+
+            double INCH_0100_DISTANCE_user = ConfigUtil::ReadParam(filePath, prefix + "INCH_0100_DISTANCE", 0);
+            axes[i].INCH_0100_DISTANCE = INCH_0100_DISTANCE_user;
+
+            double INCH_1000_DISTANCE_user = ConfigUtil::ReadParam(filePath, prefix + "INCH_1000_DISTANCE", 0);
+            axes[i].INCH_1000_DISTANCE = INCH_1000_DISTANCE_user;
+
+
+            double INCH_JOG_PPS_user = ConfigUtil::ReadParam(filePath, prefix + "INCH_JOG_PPS", 0);
+            axes[i].INCH_JOG_PPS = MotionCore::UnitPerMinToPps(INCH_JOG_PPS_user, axes[i].resolution_PPR, axes[i].finalLead);
+
+            double INCH_acc_time = ConfigUtil::ReadParam(filePath, prefix + "INCH_acc_time", 0);
+            axes[i].INCH_acc_time = INCH_acc_time;
+
+            double INCH_dec_time = ConfigUtil::ReadParam(filePath, prefix + "INCH_dec_time", 0);
+            axes[i].INCH_dec_time = INCH_dec_time;
+
+
             double g00_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G00_Speed", 0);
             axes[i].G00_PPS = MotionCore::UnitPerMinToPps(g00_speed_user, axes[i].resolution_PPR, axes[i].finalLead);
 
@@ -231,8 +291,6 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             axes[i].G161_dec_time = G161_acc_time;
 
 
-            double Stop_dec_time = ConfigUtil::ReadParam(filePath, prefix + "Stop_dec_time", 0);
-            axes[i].Stop_dec_time = Stop_dec_time;
 
 
 

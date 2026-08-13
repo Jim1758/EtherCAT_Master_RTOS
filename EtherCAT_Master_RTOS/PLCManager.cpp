@@ -2499,6 +2499,24 @@ bool PLCManager::Get_S(int index) const {
     return false;
 }
 
+void PLCManager::Set_C(int index, bool value)
+{
+    if (index >= 0 && index < MAX_PLC_C)
+    {
+        m_C[index] = value ? 1 : 0;
+    }
+}
+
+bool PLCManager::Get_C(int index) const
+{
+    if (index >= 0 && index < MAX_PLC_C)
+    {
+        return m_C[index] != 0;
+    }
+
+    return false;
+}
+
 double PLCManager::GetMemory(const std::string& prefix, int index) const {
     if (prefix == "I" && index >= 0 && index < MAX_PLC_I) return m_I[index];
     if (prefix == "O" && index >= 0 && index < MAX_PLC_O) return m_O[index];

@@ -505,31 +505,330 @@ void MotionCore::VelocityMove(AxisContext& axis, double velocity, double acc_tim
         // 如果你要從運動中無縫切換，保留原本的速度是正確的。
     }
 }
+// =========================================================
+// MPG Move
+//
+// Handwheel Position Following
+//
+// 第一次進入 MPG：
+//     初始化 MPG 狀態
+//
+// 已經在 MPG：
+//     只更新 finalTargetPos
+//     不重新初始化
+//     不重新清 S-Curve
+//
+// targetPos:
+//     Absolute Pulse Target
+//
+// maxVel:
+//     MPG Maximum Following Velocity
+// =========================================================
+
+void MotionCore::MPGMove(
+    AxisContext& axis,
+    double targetPos,
+    double maxVel,
+    double acc_time,
+    double dec_time)
+{
+    // =====================================================
+    // Basic Parameter Validation
+    // =====================================================
+
+    if (axis.maxVel_PPS <= 0.0)
+    {
+        return;
+    }
+
+
+    double safeMaxVel =
+        std::abs(maxVel);
+
+
+    if (safeMaxVel <= 0.0)
+    {
+        return;
+    }
+
+
+    if (safeMaxVel >
+        axis.maxVel_PPS)
+    {
+        safeMaxVel =
+            axis.maxVel_PPS;
+    }
+
+
+    // =====================================================
+    // Safe Acc / Dec Time
+    // =====================================================
+
+    double safeAccTime =
+        acc_time;
+
+
+    if (safeAccTime < 0.001)
+    {
+        safeAccTime =
+            0.2;
+    }
+
+
+    double safeDecTime =
+        dec_time;
+
+
+    if (safeDecTime < 0.001)
+    {
+        safeDecTime =
+            safeAccTime;
+    }
+
+
+    const double acc =
+        safeMaxVel /
+        safeAccTime;
+
+
+    const double dec =
+        safeMaxVel /
+        safeDecTime;
+
+
+    // =====================================================
+    // Already MPG
+    //
+    // Handwheel 每增加一格，只更新 Target。
+    //
+    // 絕對不能：
+    //
+    // - Reset currentCmdPos
+    // - Reset currentCmdVel
+    // - Clear S-Curve
+    // - Reset motionTime
+    //
+    // 否則手輪快速旋轉會一直重新起步。
+    // =====================================================
+
+    if (axis.state ==
+        MotionState::MotionState_MPG)
+    {
+        axis.finalTargetPos =
+            targetPos;
+
+        axis.cruiseVel_PPS =
+            safeMaxVel;
+
+        axis.acc_PPS2 =
+            acc;
+
+        axis.dec_PPS2 =
+            dec;
+
+
+        if (std::abs(
+            axis.finalTargetPos -
+            axis.currentCmdPos) > 0.01)
+        {
+            axis.inPosition =
+                false;
+        }
+
+
+        return;
+    }
+
+
+    // =====================================================
+    // MPG 只能從 IDLE 接管
+    //
+    // 不允許搶：
+    //
+    // P2P
+    // Continuous JOG
+    // Fine JOG
+    // Interpolation
+    // STOPPING
+    // =====================================================
+
+    if (axis.state !=
+        MotionState::MotionState_IDLE)
+    {
+        return;
+    }
+
+
+    // =====================================================
+    // First MPG Entry
+    // =====================================================
+
+    axis.finalTargetPos =
+        targetPos;
+
+    axis.cruiseVel_PPS =
+        safeMaxVel;
+
+    axis.acc_PPS2 =
+        acc;
+
+    axis.dec_PPS2 =
+        dec;
+
+    axis.targetEndVel =
+        0.0;
+
+    axis.targetVelocity =
+        0.0;
+
+
+    // IDLE 起點保持 Command Position。
+    axis.planningPos =
+        axis.currentCmdPos;
+
+    axis.currentCmdVel =
+        0.0;
+
+
+    // =====================================================
+    // S-Curve
+    //
+    // 只在「第一次進入 MPG」清一次。
+    //
+    // 後續 Handwheel Count 更新不可再清。
+    // =====================================================
+
+    for (size_t i = 0;
+        i < axis.velBuffer.size();
+        ++i)
+    {
+        axis.velBuffer[i] =
+            0.0;
+    }
+
+
+    axis.bufferSum =
+        0.0;
+
+    axis.bufferIndex =
+        0;
+
+
+    axis.inPosition =
+        std::abs(
+            axis.finalTargetPos -
+            axis.currentCmdPos) <= 0.01;
+
+
+    axis.state =
+        MotionState::MotionState_MPG;
+}
 void MotionCore::StopMove(AxisContext& axis, double dec_time)
 {
-    // 如果是 IDLE 直接離開
-    if (axis.state == MotionState::MotionState_IDLE) return;
+    // =========================================================
+    // 1. 已經停止就不需要再次處理
+    // =========================================================
+    if (axis.state == MotionState::MotionState_IDLE)
+        return;
 
-    // 設定減速斜率
-    double max_v = (axis.maxVel_PPS > 0.1) ? axis.maxVel_PPS : 1000.0;
-    axis.dec_PPS2 = max_v / dec_time;
 
-    // 🌟 [關鍵修復]：區分模式
+    // =========================================================
+    // 2. 減速時間安全防呆
+    //
+    // Header 允許 StopMove(axis) 不帶 dec_time，
+    // 因此 dec_time 可能是 0。
+    //
+    // 絕對不能直接：
+    //
+    //     max_v / dec_time
+    //
+    // 否則會發生除以 0。
+    //
+    // 未設定時預設使用 0.2 秒。
+    // =========================================================
+    double safeDecTime = dec_time;
+
+    if (safeDecTime < 0.001)
+    {
+        safeDecTime = 0.2;
+    }
+
+
+    // =========================================================
+    // 3. 取得安全的最大速度
+    // =========================================================
+    double max_v =
+        (axis.maxVel_PPS > 0.1)
+        ? axis.maxVel_PPS
+        : 1000.0;
+
+
+    // =========================================================
+    // 4. 計算減速度
+    // =========================================================
+    axis.dec_PPS2 = max_v / safeDecTime;
+
+
+    // =========================================================
+    // 5. 依目前運動模式進行停止
+    // =========================================================
+
+    // ---------------------------------------------------------
+    // A. P2P 定位移動
+    //
+    // 不直接切換 STOPPING，
+    // 而是修改最後停止位置，
+    // 讓原本梯形軌跡規劃器自己完成減速。
+    // ---------------------------------------------------------
     if (axis.state == MotionState::MotionState_MOVING)
     {
-        // 如果是 G00 定位中，不要切換狀態！直接把終點改為「減速後的預計停靠點」
-        // 讓原本的 Calc_Trajectory_Trapezoidal 繼續執行煞車，這樣永遠不會亂掉座標！
-        double currentSpeed = std::abs(axis.currentCmdVel);
-        double stopDist = (currentSpeed * currentSpeed) / (2.0 * axis.dec_PPS2);
+        double currentSpeed =
+            std::abs(axis.currentCmdVel);
 
-        // 將終點強行拉到煞車後的停車點
-        if (axis.currentCmdVel > 0) axis.finalTargetPos = axis.currentCmdPos + stopDist;
-        else axis.finalTargetPos = axis.currentCmdPos - stopDist;
+        double stopDist =
+            (currentSpeed * currentSpeed) /
+            (2.0 * axis.dec_PPS2);
+
+        if (axis.currentCmdVel > 0.0)
+        {
+            axis.finalTargetPos =
+                axis.currentCmdPos + stopDist;
+        }
+        else if (axis.currentCmdVel < 0.0)
+        {
+            axis.finalTargetPos =
+                axis.currentCmdPos - stopDist;
+        }
+        else
+        {
+            axis.finalTargetPos =
+                axis.currentCmdPos;
+        }
     }
+
+    // ---------------------------------------------------------
+    // B. Velocity Mode
+    //
+    // 未來 JOG 就會走這裡。
+    //
+    // C120 X+ 放開：
+    //
+    // VelocityMove
+    //      ↓
+    // StopMove
+    //      ↓
+    // STOPPING
+    //      ↓
+    // Calc_Trajectory_Velocity()
+    //      ↓
+    // 速度逐漸降至 0
+    //      ↓
+    // IDLE
+    // ---------------------------------------------------------
     else
     {
-        // 只有在速度模式 (VelocityMove) 才使用 STOPPING 狀態
-        axis.state = MotionState::MotionState_STOPPING;
+        axis.state =
+            MotionState::MotionState_STOPPING;
     }
 }
 void MotionCore::EmergencyStop(AxisContext& axis)
@@ -563,6 +862,68 @@ void MotionCore::EmergencyStop(AxisContext& axis)
     }
 
     // RtPrintf(">>> [ALARM] Axis E-STOP Triggered! Velocity Killed Instantly.\n");
+}
+void MotionCore::EmergencyStopAllAxes()
+{
+    // =========================================================
+    // 1. 先關閉插補群組
+    //
+    // 防止 UpdateInterpolation 繼續對實體軸寫入新的命令。
+    // =========================================================
+    m_Group.isActive = false;
+
+
+    // =========================================================
+    // 2. 急停虛擬主軸
+    //
+    // 即使真正需要停的是所有實體軸，
+    // interpolation virtual axis 也必須一起停止。
+    // =========================================================
+    EmergencyStop(m_Group.virtualAxis);
+
+
+    // =========================================================
+    // 3. 清除尚未執行的群組運動命令
+    //
+    // Emergency Reset 後不能讓舊的路徑繼續被取出執行。
+    // =========================================================
+    m_Group.cmdQueue.clear();
+
+
+    // =========================================================
+    // 4. Context 尚未 Link 時直接離開
+    // =========================================================
+    if (m_pContexts == nullptr)
+    {
+        return;
+    }
+
+
+    // =========================================================
+    // 5. 掃描所有實體 AxisContext
+    //
+    // 不使用：
+    //
+    //     m_Group.axisCount
+    //
+    // 因為 C5 是「全機 Emergency」，
+    // 不管該軸目前是否參與 G-code interpolation，
+    // 只要 axis.isExist == true 就必須停止。
+    // =========================================================
+    for (size_t i = 0;
+        i < m_pContexts->size();
+        ++i)
+    {
+        AxisContext& axis =
+            (*m_pContexts)[i];
+
+        if (!axis.isExist)
+        {
+            continue;
+        }
+
+        EmergencyStop(axis);
+    }
 }
 void MotionCore::SetAxisFeedrateOverride(int axisIndex, double overrideRatio)
 {
@@ -1039,7 +1400,445 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     }
 }
 
+// =========================================================
+// MPG Trajectory Planner
+//
+// Dynamic Position Following
+//
+// 特性：
+//
+// 1. finalTargetPos 可隨時更新
+// 2. 不重新初始化軌跡
+// 3. 根據剩餘距離自動算煞車速度
+// 4. 手輪反轉時先減速到 0，再反向
+// 5. 到達 Target 後仍保持 MPG State
+//
+// 因為 C21 還可能保持 ON，下一個 Handwheel Count
+// 隨時可能再更新 Target。
+// =========================================================
 
+void MotionCore::Calc_Trajectory_MPG(
+    AxisContext& axis,
+    AxisCommand& outCmd)
+{
+    // =====================================================
+    // Guard
+    // =====================================================
+
+    if (axis.state !=
+        MotionState::MotionState_MPG)
+    {
+        outCmd.instantCmdPos =
+            axis.currentCmdPos;
+
+        outCmd.instantCmdVel =
+            0.0;
+
+        return;
+    }
+
+
+    const double dt =
+        CYCLE_TIME_SEC;
+
+
+    // =====================================================
+    // Parameter
+    // =====================================================
+
+    double maxVel =
+        std::abs(
+            axis.cruiseVel_PPS);
+
+
+    if (axis.maxVel_PPS > 0.0 &&
+        maxVel > axis.maxVel_PPS)
+    {
+        maxVel =
+            axis.maxVel_PPS;
+    }
+
+
+    double acc =
+        axis.acc_PPS2;
+
+
+    double dec =
+        axis.dec_PPS2;
+
+
+    if (acc <= 0.0)
+    {
+        acc =
+            1.0;
+    }
+
+
+    if (dec <= 0.0)
+    {
+        dec =
+            acc;
+    }
+
+
+    // =====================================================
+    // Position Error
+    // =====================================================
+
+    const double error =
+        axis.finalTargetPos -
+        axis.currentCmdPos;
+
+
+    const double distance =
+        std::abs(error);
+
+
+    constexpr double POSITION_TOLERANCE =
+        0.01;
+
+
+    // =====================================================
+    // Dynamic Target Velocity
+    //
+    // v = sqrt(2as)
+    //
+    // 距離越靠近 Target，
+    // 允許速度自然下降。
+    // =====================================================
+
+    double desiredVelocity =
+        0.0;
+
+
+    if (distance >
+        POSITION_TOLERANCE &&
+        maxVel > 0.0)
+    {
+        double brakingVelocity =
+            std::sqrt(
+                2.0 *
+                dec *
+                distance);
+
+
+        if (brakingVelocity >
+            maxVel)
+        {
+            brakingVelocity =
+                maxVel;
+        }
+
+
+        if (error > 0.0)
+        {
+            desiredVelocity =
+                brakingVelocity;
+        }
+        else
+        {
+            desiredVelocity =
+                -brakingVelocity;
+        }
+
+
+        axis.inPosition =
+            false;
+    }
+
+
+    axis.targetVelocity =
+        desiredVelocity;
+
+
+    // =====================================================
+    // Velocity Ramp Helper
+    // =====================================================
+
+    auto MoveToward =
+        [](
+            double current,
+            double target,
+            double step)
+    {
+        if (step <= 0.0)
+        {
+            return target;
+        }
+
+
+        if (current < target)
+        {
+            current += step;
+
+            if (current > target)
+            {
+                current =
+                    target;
+            }
+        }
+        else if (current > target)
+        {
+            current -= step;
+
+            if (current < target)
+            {
+                current =
+                    target;
+            }
+        }
+
+
+        return current;
+    };
+
+
+    // =====================================================
+    // Direction Reversal
+    //
+    // 正在往 +，但 Handwheel 已經要求 -
+    //
+    // 或
+    //
+    // 正在往 -，但 Handwheel 已經要求 +
+    //
+    // 必須先減速至 0。
+    // 不允許瞬間反向。
+    // =====================================================
+
+    const bool reversing =
+        (
+            axis.currentCmdVel > 0.0 &&
+            desiredVelocity < 0.0
+            )
+        ||
+        (
+            axis.currentCmdVel < 0.0 &&
+            desiredVelocity > 0.0
+            );
+
+
+    if (reversing)
+    {
+        axis.currentCmdVel =
+            MoveToward(
+                axis.currentCmdVel,
+                0.0,
+                dec * dt);
+    }
+    else
+    {
+        // =================================================
+        // Speed Increasing
+        // =================================================
+
+        if (std::abs(desiredVelocity) >
+            std::abs(axis.currentCmdVel))
+        {
+            axis.currentCmdVel =
+                MoveToward(
+                    axis.currentCmdVel,
+                    desiredVelocity,
+                    acc * dt);
+        }
+
+        // =================================================
+        // Speed Decreasing
+        // =================================================
+
+        else
+        {
+            axis.currentCmdVel =
+                MoveToward(
+                    axis.currentCmdVel,
+                    desiredVelocity,
+                    dec * dt);
+        }
+    }
+
+
+    // =====================================================
+    // S-Curve Moving Average
+    // =====================================================
+
+    double finalOutputVel =
+        axis.currentCmdVel;
+
+
+    if (axis.velBuffer.size() > 1)
+    {
+        axis.bufferSum -=
+            axis.velBuffer[
+                axis.bufferIndex];
+
+        axis.velBuffer[
+            axis.bufferIndex] =
+            axis.currentCmdVel;
+
+            axis.bufferSum +=
+                axis.currentCmdVel;
+
+            axis.bufferIndex =
+                (
+                    axis.bufferIndex +
+                    1
+                    )
+                %
+                static_cast<int>(
+                    axis.velBuffer.size());
+
+
+            finalOutputVel =
+                axis.bufferSum /
+                static_cast<double>(
+                    axis.velBuffer.size());
+    }
+
+
+    // =====================================================
+    // Position Integration
+    // =====================================================
+
+    const double nextPosition =
+        axis.currentCmdPos +
+        finalOutputVel *
+        dt;
+
+
+    // =====================================================
+    // Target Crossing Clamp
+    //
+    // 避免因最後一點 S-Curve 餘速穿過目標。
+    // =====================================================
+
+    const bool crossPositive =
+        error > 0.0 &&
+        finalOutputVel > 0.0 &&
+        nextPosition >=
+        axis.finalTargetPos;
+
+
+    const bool crossNegative =
+        error < 0.0 &&
+        finalOutputVel < 0.0 &&
+        nextPosition <=
+        axis.finalTargetPos;
+
+
+    if (crossPositive ||
+        crossNegative)
+    {
+        axis.currentCmdPos =
+            axis.finalTargetPos;
+
+        axis.planningPos =
+            axis.finalTargetPos;
+
+        axis.currentCmdVel =
+            0.0;
+
+        axis.targetVelocity =
+            0.0;
+
+
+        // ---------------------------------------------
+        // 到 Target 時 S-Curve 已沒有繼續追趕的意義。
+        // 清除剩餘速度，避免越過後又反拉。
+        // ---------------------------------------------
+
+        for (size_t i = 0;
+            i < axis.velBuffer.size();
+            ++i)
+        {
+            axis.velBuffer[i] =
+                0.0;
+        }
+
+
+        axis.bufferSum =
+            0.0;
+
+        axis.bufferIndex =
+            0;
+
+
+        finalOutputVel =
+            0.0;
+
+        axis.inPosition =
+            true;
+    }
+    else
+    {
+        axis.currentCmdPos =
+            nextPosition;
+
+        axis.planningPos =
+            axis.currentCmdPos;
+
+
+        // =================================================
+        // Completely Arrived
+        // =================================================
+
+        const double remaining =
+            std::abs(
+                axis.finalTargetPos -
+                axis.currentCmdPos);
+
+
+        if (remaining <=
+            POSITION_TOLERANCE &&
+            std::abs(
+                axis.currentCmdVel) <
+            0.1 &&
+            std::abs(
+                finalOutputVel) <
+            0.1)
+        {
+            axis.currentCmdPos =
+                axis.finalTargetPos;
+
+            axis.planningPos =
+                axis.finalTargetPos;
+
+            axis.currentCmdVel =
+                0.0;
+
+            axis.targetVelocity =
+                0.0;
+
+            finalOutputVel =
+                0.0;
+
+            axis.inPosition =
+                true;
+        }
+        else
+        {
+            axis.inPosition =
+                false;
+        }
+    }
+
+
+    // =====================================================
+    // Output
+    //
+    // 注意：
+    // 到位後仍保持 MotionState_MPG。
+    //
+    // 下一個 DR200 Count 一來，
+    // MPGMove() 只更新 finalTargetPos，
+    // 馬上可以繼續追。
+    // =====================================================
+
+    outCmd.instantCmdPos =
+        axis.currentCmdPos;
+
+    outCmd.instantCmdVel =
+        finalOutputVel;
+}
 void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd)
 {
     if (axis.state == MotionState::MotionState_IDLE || axis.state == MotionState::MotionState_ERROR) {
@@ -1167,7 +1966,7 @@ void MotionCore::DetermineActiveGainSet(AxisContext& axis)// PID 依照狀態切
     case MotionState::MotionState_INTERPOLATING:
     case MotionState::MotionState_STOPPING:
     case MotionState::MotionState_VELOCITY:
-      
+    case MotionState::MotionState_MPG:
         axis.pid.Kp = axis.Pid_G00.Kp;
         axis.pid.Ki = axis.Pid_G00.Ki;
         axis.pid.Kd = axis.Pid_G00.Kd;
@@ -1456,6 +2255,13 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
         break;
 
 
+    case MotionState::MotionState_MPG:
+
+        Calc_Trajectory_MPG(
+            axis,
+            cmd);
+
+        break;
 
         // =========================================================
     // [新增] 模式 C: 多軸插補

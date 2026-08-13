@@ -25,6 +25,22 @@ public:
     void ChangeMode(NCOperationMode newMode);
     void ChangeState(NCState newState);
 
+    // =========================================================
+// NC State Query
+//
+// 提供給外部控制層（例如 NCPLCManager）判斷
+// NC 當前狀態。
+// =========================================================
+    NCState GetState() const
+    {
+        return m_state;
+    }
+
+    NCOperationMode GetMode() const
+    {
+        return m_mode;
+    }
+
     // 🌟 新增功能：載入 NC 程式檔
     bool LoadProgram(const std::string& filepath);
 
@@ -36,6 +52,26 @@ public:
     void CycleStart();  // 按下啟動鍵
     void FeedHold();    // 按下暫停鍵
     void Reset();       // 按下重置鍵
+    // =========================================================
+// External Machine Ready Interlock
+//
+// NCManager 不知道這個訊號來自 PLC C11、Safety PLC、
+// EtherCAT 或其他來源。
+//
+// true  = 外部條件允許 NC 運轉
+// false = 外部條件尚未 Ready
+// =========================================================
+
+    void SetExternalReadyInterlock(bool ready)
+    {
+        m_externalReadyInterlock = ready;
+    }
+
+    bool IsExternalReadyInterlock() const
+    {
+        return m_externalReadyInterlock;
+    }
+
     void Reset_Gode();       // 重置G碼相關
     bool IsFeedHoldActive() const {
         return m_state == NCState::HOLD;
@@ -106,6 +142,51 @@ public:
     bool m_isOptionalStopEnabled = false;  // 選擇性暫停 (M01)
     bool m_isBlockSkipEnabled = false;     // 選擇性跳躍 (/)
 
+
+    // =========================================================
+// Single Block
+// =========================================================
+
+    void SetSingleBlockEnabled(bool enabled)
+    {
+        m_isSingleBlockEnabled = enabled;
+    }
+
+    bool IsSingleBlockEnabled() const
+    {
+        return m_isSingleBlockEnabled;
+    }
+
+
+    // =========================================================
+    // Optional Stop
+    // =========================================================
+
+    void SetOptionalStopEnabled(bool enabled)
+    {
+        m_isOptionalStopEnabled = enabled;
+    }
+
+    bool IsOptionalStopEnabled() const
+    {
+        return m_isOptionalStopEnabled;
+    }
+
+
+    // =========================================================
+    // Block Skip
+    // =========================================================
+
+    void SetBlockSkipEnabled(bool enabled)
+    {
+        m_isBlockSkipEnabled = enabled;
+    }
+
+    bool IsBlockSkipEnabled() const
+    {
+        return m_isBlockSkipEnabled;
+    }
+
     static bool WaitAndHoldCallback(NCManager* nc);
     static bool WaitAndClearQueueCallback(NCManager* nc);
     static bool WaitForCycleStartCallback(NCManager* nc); // 新增：專等 CycleStart 按鈕
@@ -122,6 +203,12 @@ public:
     NCOperationMode m_mode = NCOperationMode::MANUAL;
     NCState m_state = NCState::NOT_READY;
     EDMState m_edmState = EDMState::NOT_READY;
+
+
+    // =========================================================
+// External Machine Ready Interlock
+// =========================================================
+    bool m_externalReadyInterlock = false;
 
     bool Close_System_Com_flag = 0;//關閉核心命令
 

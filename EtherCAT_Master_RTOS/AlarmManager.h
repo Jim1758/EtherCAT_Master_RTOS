@@ -49,7 +49,7 @@ public:
         SERVO_ERROR = AXIS_BASE + 3,    // 3003: 伺服驅動器異常 (ALM)
         AXIS_LAG_ERROR = AXIS_BASE + 4,    // 3004: 追隨誤差過大 (Lag Error)
         AXIS_Fault = AXIS_BASE + 5 ,   // 3005: 驅動器硬體內部報警 (Fault)
-
+        MANUAL_AXIS_PROTECT = AXIS_BASE + 6         // 3006: 手動軸保護輸入觸發
      
     };
 

@@ -158,11 +158,19 @@ public:
     int ecx_APRD(uint16_t ADP, uint16_t ADO, uint16_t length, void* data, int timeout);//自動增量物理讀取
     int ecx_APWR(uint16_t ADP, uint16_t ADO, uint16_t length, const void* data, int timeout);//自動增量物理寫入
     int ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int timeout);//邏輯讀寫
+    int ecx_LRW_FRMW(
+        uint32_t LogAddr,
+        uint16_t length,
+        void* data,
+        uint16_t dcSlaveAddr,
+        uint64_t* dcReferenceTime,
+        int* dcWkc,
+        int timeout);
     int ecx_FPWR(uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout);//指定位址物理寫入
     int ecx_FPRD(uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout);//指定位址物理讀取
     int ecx_SDOwrite(int slave_pos, uint16_t index, uint8_t subindex, int CA, int size, void* data, int timeout);//服務資料物件寫入 (SDO Write / 寫入物件字典)
     int ecx_SDOread(int slave_pos, uint16_t index, uint8_t subindex, int CA, int* size, void* data, int timeout);//服務資料物件讀取 (SDO Read / 讀取物件字典)
-    bool SendAndReceiveRegister(uint8_t cmd, uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout);//暫存器底層收發核心
+    int SendAndReceiveRegister(uint8_t cmd, uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout);//暫存器底層收發核心
 
     bool PDO_SendCommandAndWait(EcatCmdType type, uint16_t slave, uint16_t index, uint8_t sub, uint32_t value, int len, int timeoutMs);//非同步指令發送與同步等待 (執行緒安全指令)
 
@@ -173,9 +181,21 @@ public:
     uint32_t ReadSII_Uint32(int slave_idx, uint16_t word_addr);
     // 流程: PRE-OP -> Config -> SAFE-OP -> OP
     int Initialize_Slaves();//初始化所有從站 INIT>>PRE-OP>>SAFE-OP>>OP
-  
+    void MeasureDCPortTimestamps();// Distributed Clock 分散式時鐘 診斷DC使用
+    bool MeasureDCPropagationDelay(uint32_t& delaySlave4,uint32_t& delaySlave5, uint32_t& delaySlave6);
 
-  
+    bool ConfigureDCPropagationDelay( uint32_t delaySlave4, uint32_t delaySlave5, uint32_t delaySlave6);
+
+    void UpdateDCMasterClockEstimator(
+        uint64_t masterBeforeNs,
+        uint64_t masterAfterNs,
+        uint64_t dcReferenceNs,
+        int dcWkc);
+
+    void UpdateDCPdoPhaseController(
+        uint64_t pdoStartMasterNs);
+
+
     void ConfigureSlaveGeneric_INIT(int slaveIdx, uint64_t unifiedStartTime);//從站配置INIT
     void ConfigureSlaveGeneric_PRE_OP(int slaveIdx);//從站配置PRE_OP
     void ConfigureSlaveGeneric_SAFE_OP(int slaveIdx);//從站配置SAFE_OP
@@ -250,12 +270,16 @@ public:
      int timer_100ms = 0;
      int timer_500ms = 0;
      int timer_1000ms = 0;
+     int timer_5000ms = 0;
+     int timer_10000ms = 0;
      int Debug_test_timer = 0;
 
      int timer_10ms_Count = 0;
      int timer_100ms_Count = 0;
      int timer_500ms_Count = 0;
      int timer_1000ms_Count = 0;
+     int timer_5000ms_Count = 0;
+     int timer_10000ms_Count = 0;
      int Debug_test_timer_Count = 0;
 
 
@@ -267,8 +291,60 @@ public:
     
      int RunRealTimeCycle_EDM_SINKER_MODE();//主要程式迴圈執行 EDM 雕磨模式
 
+     int StartDcPdoRuntime();//啟動PDO作業 DC同步
+     void PrintDcRuntimeDiagnostics();//DC診斷訊息
 
+     int StartPLCRuntime();//啟動PLC作業
 
      NCManager* m_NC = nullptr;
+
+     // =========================================================
+// Master <-> DC Estimator State
+//
+// Offset definition:
+//
+// CLOCK_2 - DC Reference
+// =========================================================
+
+     bool m_dcEstimatorValid =false;
+     int64_t m_dcEstimatorOffsetNs =0;
+     int64_t m_dcEstimatorDriftPpb =0;
+     uint64_t m_dcEstimatorMasterTimeNs = 0;
+     uint64_t m_dcEstimatorSequence = 0;
+
+     bool m_dcHalDitherEnabled = false;
+     uint32_t m_dcHalBaseCounts = 0;
+     uint32_t m_dcHalAlternateCounts = 0;
+     uint64_t m_dcHalDitherAccumulator = 0;
+     uint64_t m_dcHalDitherStep = 0;
+     uint64_t m_dcHalDitherThreshold =1000000000ULL;
+     uint64_t m_dcHalBaseCycleCount = 0;
+
+     uint64_t m_dcHalAlternateCycleCount = 0;
+
+     bool m_dcHalFrequencyCommandValid = false;
+     int64_t m_dcHalFrequencyCommandPpb = 0;
+     int64_t m_dcHalCalibrationSumPpb = 0;
+
+     uint32_t m_dcHalCalibrationSamples = 0;
+     uint32_t m_dcHalCalibrationRequiredSamples = 2;
+
+     int64_t m_dcHalTrimSumPpb = 0;
+
+     int64_t m_dcHalTrimMinPpb = 0;
+
+     int64_t m_dcHalTrimMaxPpb = 0;
+
+     uint32_t m_dcHalTrimSamples = 0;
+
+     uint32_t m_dcHalTrimRequiredSamples = 8;
+
+     int64_t m_dcHalTrimMaxStepPpb = 500;
+
+     uint32_t m_dcHalTrimHoldoffRemaining = 0;
+
+     uint32_t m_dcHalTrimHoldoffWindows = 2;
+
+     uint64_t m_dcHalTrimUpdateCount = 0;
 };
 

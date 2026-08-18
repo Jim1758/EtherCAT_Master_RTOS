@@ -259,7 +259,7 @@ struct AxisContext//軸參數與狀態
     MotionState state = MotionState::MotionState_IDLE;// 當前狀態機 (預設閒置)
     bool inPosition = true;// 是否已到達終點 (剛開機視為已到位)
     bool isFault = false;// 是否發生硬體或軟體警報
-
+    bool resetRequest = false;   // 🌟 [新增] 系統是否正在要求解除警報
     bool isServoOn = false;      //激磁狀態 只有這變成 true，NC 軌跡規劃器才允許下指令 
     int8_t targetMode = 9;       // 預設 CSV 模式 (9)，方便之後想改模式時設定
 
@@ -819,6 +819,18 @@ public:
 
     // 🌟 [新增]：檢查群組是否「完全靜止」(包含煞車滑行結束)
     bool IsGroupStandstill() const;
+
+
+    // ========================================================
+    // 🌟 [新增] 軸警報檢查 API
+    // ========================================================
+
+    // 檢查「全系統」所有啟用的實體軸，是否有任何一軸發生錯誤 (Fault)
+    bool IsAnyAxisFaulted() const;
+
+    // 檢查「當前插補群組」內正在參與同動的軸，是否有發生錯誤 (Fault)
+    bool IsGroupFaulted() const;
+
 
     // 🌟 修正版：精準對應軸索引的目標座標抓取 API
     bool GetExecutingTargetMCS(double* outTarget_mm) const {

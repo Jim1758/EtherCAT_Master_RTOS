@@ -238,7 +238,7 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
     }
 
 
-
+    m_Motion.ResetAllFaults();//全軸 清除異常狀態
 
     //主控迴圈-------------------------------------------------------------
 

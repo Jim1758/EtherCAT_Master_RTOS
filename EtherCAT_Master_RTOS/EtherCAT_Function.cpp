@@ -1,13 +1,47 @@
-// ÀÉ®×¡GEtherCatMaster_Run.cpp
+ï»¿/*
+ * æª”æ¡ˆï¼šEtherCAT_Function.cpp
+ * ç‰ˆæœ¬ï¼šEtherCAT DC Release Candidate RC1
+ *
+ * ä¸»è¦è²¬ä»»ï¼š
+ * 1. å»ºç«‹ EtherCAT Ethernet Header èˆ‡ Datagramã€‚
+ * 2. æä¾› BRD/BWR/APRD/APWR/LRW/FPWR/FPRD åŸºæœ¬é€šè¨Šå‘½ä»¤ã€‚
+ * 3. æä¾› CoE SDOã€EEPROMã€FMMU èˆ‡å¾ç«™ç‹€æ…‹æ“ä½œã€‚
+ * 4. æ¸¬é‡ä¸¦è¨­å®š Distributed Clocks propagation delayã€‚
+ * 5. åœ¨ PDO å³æ™‚å¾ªç’°ä»¥ LRW + FRMW åŒä¸€ Frame äº¤æ› process image èˆ‡ DC timeã€‚
+ * 6. ç™¼å¸ƒ TX timing èˆ‡ RX Soft/Hard Deadline è¨ºæ–·å¿«ç…§ã€‚
+ *
+ * åŸ·è¡Œç·’åˆ†å·¥ï¼š
+ * - åˆå§‹åŒ–/SDO/ç‹€æ…‹å‘½ä»¤ï¼šé PDO å³æ™‚æµç¨‹ä½¿ç”¨ã€‚
+ * - ecx_LRW_FRMW()ï¼šPriority 64 PDO è·¯å¾‘ä½¿ç”¨ï¼Œä¸å¯åŠ å…¥ RtPrintfã€‚
+ * - PrintDcRuntimeDiagnostics()ï¼šPriority 50 è®€å–æœ¬æª”æ¡ˆç™¼å¸ƒçš„å¿«ç…§ã€‚
+ *
+ * æ­£å¼å€™é¸ç‰ˆé—œéµåƒæ•¸ï¼š
+ * - PDO cycleï¼š250 usï¼ˆ4 kHzï¼‰ã€‚
+ * - RX Soft Deadlineï¼š205 usã€‚
+ * - RX Hard Deadlineï¼š210 usã€‚
+ * - RX coarse wait requestï¼š50 usï¼Œæœ€å¤šå…©æ¬¡ã€‚
+ * - RTX64 HALï¼š25 usï¼›NAL interrupt/TX complete priorityï¼š70/70ã€‚
+ *
+ * å®‰å…¨åŸå‰‡ï¼š
+ * - Hard Deadline å¾Œæ‰å›åˆ°è»Ÿé«”çš„ Frame å³ä½¿å…§å®¹æ­£ç¢ºä¹Ÿä¸æ¡ç”¨ã€‚
+ * - Timeout å¾Œä¸‹ä¸€é€±æœŸå…ˆ drain æœ€å¤š 8 å€‹æ®˜ç•™ RX Frameï¼Œé¿å…è³‡æ–™éŒ¯é€±æœŸã€‚
+ * - æ‰€æœ‰ Priority 64 è¨ºæ–·åªåšè¨ˆæ•¸èˆ‡ seqlock publishï¼Œä¸åšæ ¼å¼åŒ–è¼¸å‡ºã€‚
+ */
 #include "EtherCatMaster.h"
-#include "GlobalConfig.h" // ¦pªG§A¦³¥Î¨ì DEBUG_PRINT µ¥¥\¯à
+#include "GlobalConfig.h" // å¦‚æœä½ æœ‰ç”¨åˆ° DEBUG_PRINT ç­‰åŠŸèƒ½
 #include <windows.h> 
 #include <rtapi.h> 
 #include <rtssapi.h> 
 #include <stdio.h>
 #define MAX_MBX_SIZE 1024
 
-int EtherCatMaster::ScanSlaves() //±½´y©Ò¦³±q¯¸
+
+
+/*
+ * æƒæ EtherCAT å¾ç«™ä¸¦é…ç½® station addressã€‚
+ * å›å‚³å»£æ’­è®€å–å–å¾—çš„å¾ç«™/WKC æ•¸ï¼›0 è¡¨ç¤ºç¸½ç·šæ²’æœ‰æœ‰æ•ˆå›æ‡‰ã€‚
+ */
+int EtherCatMaster::ScanSlaves()
 {
     int wkc = ecx_BRD(0x0000, REG_AL_STATUS, 2, 200);
     if (wkc <= 0)
@@ -15,13 +49,13 @@ int EtherCatMaster::ScanSlaves() //±½´y©Ò¦³±q¯¸
         return 0;
     }
 
-    // ¼s¼½­«¸m (Åı¤j®a¦^¨ì INIT ª¬ºA¡A²MªÅ¿ù»~)
+    // å»£æ’­é‡ç½® (è®“å¤§å®¶å›åˆ° INIT ç‹€æ…‹ï¼Œæ¸…ç©ºéŒ¯èª¤)
     uint16_t resetCmd = 0x0011; // Error Ack + Init State
     ecx_BWR(0x0000, REG_AL_CONTROL, 2, &resetCmd, 50);
-    RtSleep(100); // µ¥¤@¤UÅıµwÅé­«¸m
+    RtSleep(100); // ç­‰ä¸€ä¸‹è®“ç¡¬é«”é‡ç½®
 
 
-    //¤À°tª«²z¦a§}
+    //åˆ†é…ç‰©ç†åœ°å€
     for (int i = 1; i <= wkc; i++)
     {
         uint16_t adp = (uint16_t)(1 - i);
@@ -30,7 +64,7 @@ int EtherCatMaster::ScanSlaves() //±½´y©Ò¦³±q¯¸
         int ret = ecx_APWR(adp, 0x0010, 2, &new_addr, 200);
         if (ret > 0)
         {
-            // Àx¦s¨ì§Ú­Ìªºµ²ºc¤¤
+            // å„²å­˜åˆ°æˆ‘å€‘çš„çµæ§‹ä¸­
             m_slaveInfo[i - 1].configAddr = new_addr;
             m_slaveInfo[i - 1].APRDAPWR_Addr = adp;
             InitSlaveMailboxInfo(i - 1);
@@ -47,21 +81,25 @@ int EtherCatMaster::ScanSlaves() //±½´y©Ò¦³±q¯¸
     return wkc;
 }
 
-int EtherCatMaster::ecx_BRD(uint16_t ADP, uint16_t ADO, uint16_t length, int timeout)//¼s¼½Åª¨ú
+/*
+ * BRDï¼šå»£æ’­è®€å–æ‰€æœ‰å¾ç«™çš„åŒä¸€æš«å­˜å™¨ã€‚
+ * ADP/ADO æŒ‡å®š EtherCAT ä½å€ï¼Œå›å‚³ WKCï¼›timeout ä¿ç•™æ—¢æœ‰å‘¼å«ä»‹é¢ã€‚
+ */
+int EtherCatMaster::ecx_BRD(uint16_t ADP, uint16_t ADO, uint16_t length, int timeout)
 {
     if (!m_pNic) return 0;
 
     uint8_t* frame = m_txBuffer;
 
     // --- 1. Ethernet Header (14 bytes) ---
-    uint8_t dec_mac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }; // ¼s¼½ MAC
+    uint8_t dec_mac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }; // å»£æ’­ MAC
     uint8_t src_mac[6];
 
-    // [ÃöÁä] ±q NIC Driver ¨ú±o¯u¹ê MAC¡AÁ×§K³Q Switch ªı¾×
+    // [é—œéµ] å¾ NIC Driver å–å¾—çœŸå¯¦ MACï¼Œé¿å…è¢« Switch é˜»æ“‹
     m_pNic->GetMacAddress(src_mac);
 
-    memcpy(&frame[0], dec_mac, 6); // ¥Øªº MAC
-    memcpy(&frame[6], src_mac, 6); // ¨Ó·½ MAC
+    memcpy(&frame[0], dec_mac, 6); // ç›®çš„ MAC
+    memcpy(&frame[6], src_mac, 6); // ä¾†æº MAC
     frame[12] = 0x88; // EtherType: EtherCAT
     frame[13] = 0xA4;
 
@@ -74,16 +112,16 @@ int EtherCatMaster::ecx_BRD(uint16_t ADP, uint16_t ADO, uint16_t length, int tim
     frame[15] = (ec_header >> 8) & 0xFF;
 
     // --- 3. Datagram Header (10 bytes) ---
-    uint8_t currentIdx = m_idx++; // ¨ú±o¨Ã»¼¼W Index
+    uint8_t currentIdx = m_idx++; // å–å¾—ä¸¦éå¢ Index
 
-    frame[16] = 0x07; // Command: BRD (¼s¼½Åª¨ú)
+    frame[16] = 0x07; // Command: BRD (å»£æ’­è®€å–)
     frame[17] = currentIdx;
     frame[18] = ADP & 0xFF;
     frame[19] = (ADP >> 8) & 0xFF;
-    frame[20] = ADO & 0xFF; // ¼È¦s¾¹¦ì§}
+    frame[20] = ADO & 0xFF; // æš«å­˜å™¨ä½å€
     frame[21] = (ADO >> 8) & 0xFF;
 
-    // ¸ê®Æªø«× (11 bits)
+    // è³‡æ–™é•·åº¦ (11 bits)
     uint16_t len_field = length & 0x7FF;
     frame[22] = len_field & 0xFF;
     frame[23] = (len_field >> 8) & 0xFF;
@@ -92,18 +130,18 @@ int EtherCatMaster::ecx_BRD(uint16_t ADP, uint16_t ADO, uint16_t length, int tim
     frame[25] = 0x00;
 
     // --- 4. Data & WKC ---
-    // ¸ê®Æ°Ï²M¹s (µ¥«İ±q¯¸¶ñ¼g)
+    // è³‡æ–™å€æ¸…é›¶ (ç­‰å¾…å¾ç«™å¡«å¯«)
     if (length > 0) memset(&frame[26], 0, length);
 
-    // WKC ªì©l¬° 0
+    // WKC åˆå§‹ç‚º 0
     frame[26 + length] = 0x00;
     frame[26 + length + 1] = 0x00;
 
-    // --- 5. µo°e«Ê¥] ---
+    // --- 5. ç™¼é€å°åŒ… ---
     int total_send_len = 14 + 2 + 10 + length + 2;
     m_pNic->SendPacket(frame, total_send_len);
 
-    // --- 6. ±µ¦¬¦^À³ (Receive Loop) ---
+    // --- 6. æ¥æ”¶å›æ‡‰ (Receive Loop) ---
     int max_retries = timeout * 100;
     LARGE_INTEGER wait; wait.QuadPart = 10;
 
@@ -112,27 +150,28 @@ int EtherCatMaster::ecx_BRD(uint16_t ADP, uint16_t ADO, uint16_t length, int tim
         int rxLen = m_pNic->ReceivePacket(m_rxBuffer);
         if (rxLen > 0)
         {
-            // ÀË¬d¬O§_¬° EtherCAT «Ê¥] (0x88A4)
+            // æª¢æŸ¥æ˜¯å¦ç‚º EtherCAT å°åŒ… (0x88A4)
             if (m_rxBuffer[12] == 0x88 && m_rxBuffer[13] == 0xA4)
             {
-                // ÀË¬d Index ¬O§_§k¦X
+                // æª¢æŸ¥ Index æ˜¯å¦å»åˆ
                 if (m_rxBuffer[17] == currentIdx)
                 {
-                    // ­pºâ WKC ¦ì¸m¨ÃÅª¨ú
+                    // è¨ˆç®— WKC ä½ç½®ä¸¦è®€å–
                     int wkc_offset = 26 + length;
                     if (rxLen >= wkc_offset + 2)
                     {
                         uint16_t wkc = m_rxBuffer[wkc_offset] | (m_rxBuffer[wkc_offset + 1] << 8);
-                        return wkc; // ¦^¶Ç WKC (ÅTÀ³ªº±q¯¸¼Æ¶q)
+                        return wkc; // å›å‚³ WKC (éŸ¿æ‡‰çš„å¾ç«™æ•¸é‡)
                     }
                 }
             }
         }
         RtSleepFt(&wait);
     }
-    return 0; // ¶W®É
+    return 0; // è¶…æ™‚
 }
-int EtherCatMaster::ecx_BWR(uint16_t ADP, uint16_t ADO, uint16_t length, const void* data, int timeout)//¼s¼½¼g¤J
+/* BWRï¼šå°‡åŒä¸€ä»½è³‡æ–™å»£æ’­å¯«å…¥æ‰€æœ‰å¾ç«™ï¼Œå›å‚³ WKCã€‚ */
+int EtherCatMaster::ecx_BWR(uint16_t ADP, uint16_t ADO, uint16_t length, const void* data, int timeout)
 {
     if (!m_pNic) return 0;
 
@@ -158,7 +197,7 @@ int EtherCatMaster::ecx_BWR(uint16_t ADP, uint16_t ADO, uint16_t length, const v
     // --- 3. Datagram Header ---
     uint8_t currentIdx = m_idx++;
 
-    frame[16] = 0x08; // Command: BWR (¼s¼½¼g¤J)
+    frame[16] = 0x08; // Command: BWR (å»£æ’­å¯«å…¥)
     frame[17] = currentIdx;
     frame[18] = ADP & 0xFF;
     frame[19] = (ADP >> 8) & 0xFF;
@@ -173,7 +212,7 @@ int EtherCatMaster::ecx_BWR(uint16_t ADP, uint16_t ADO, uint16_t length, const v
     frame[25] = 0x00;
 
     // --- 4. Data Copy ---
-    // ±N­n¼g¤Jªº¸ê®Æ½Æ»s¨ì«Ê¥]¤¤
+    // å°‡è¦å¯«å…¥çš„è³‡æ–™è¤‡è£½åˆ°å°åŒ…ä¸­
     if (length > 0 && data != nullptr) {
         memcpy(&frame[26], data, length);
     }
@@ -182,11 +221,11 @@ int EtherCatMaster::ecx_BWR(uint16_t ADP, uint16_t ADO, uint16_t length, const v
     frame[26 + length] = 0x00;
     frame[26 + length + 1] = 0x00;
 
-    // --- 5. µo°e ---
+    // --- 5. ç™¼é€ ---
     int total_send_len = 14 + 2 + 10 + length + 2;
     m_pNic->SendPacket(frame, total_send_len);
 
-    // --- 6. ±µ¦¬¦^À³ ---
+    // --- 6. æ¥æ”¶å›æ‡‰ ---
     int max_retries = timeout * 100;
     LARGE_INTEGER wait; wait.QuadPart = 10;
 
@@ -210,9 +249,10 @@ int EtherCatMaster::ecx_BWR(uint16_t ADP, uint16_t ADO, uint16_t length, const v
         }
         RtSleepFt(&wait);
     }
-    return 0; // ¶W®É
+    return 0; // è¶…æ™‚
 }
-int EtherCatMaster::ecx_APRD(uint16_t ADP, uint16_t ADO, uint16_t length, void* data, int timeout)//¦Û°Ê¼W¶qª«²zÅª¨ú
+/* APRDï¼šä»¥ auto-increment physical address è®€å–æŒ‡å®šå¾ç«™æš«å­˜å™¨ã€‚ */
+int EtherCatMaster::ecx_APRD(uint16_t ADP, uint16_t ADO, uint16_t length, void* data, int timeout)
 {
     if (!m_pNic) return 0;
 
@@ -221,7 +261,7 @@ int EtherCatMaster::ecx_APRD(uint16_t ADP, uint16_t ADO, uint16_t length, void* 
     // --- Ethernet Header ---
     uint8_t dec_mac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
     uint8_t src_mac[6];
-    m_pNic->GetMacAddress(src_mac); // ¨Ï¥Î¯u¹ê MAC
+    m_pNic->GetMacAddress(src_mac); // ä½¿ç”¨çœŸå¯¦ MAC
 
     memcpy(&frame[0], dec_mac, 6);
     memcpy(&frame[6], src_mac, 6);
@@ -235,13 +275,13 @@ int EtherCatMaster::ecx_APRD(uint16_t ADP, uint16_t ADO, uint16_t length, void* 
     frame[15] = (ec_header >> 8) & 0xFF;
 
     // --- Datagram Header ---
-    uint8_t currentIdx = m_idx++; // ¨ú±o¨Ã»¼¼W Index
+    uint8_t currentIdx = m_idx++; // å–å¾—ä¸¦éå¢ Index
 
     frame[16] = 0x01; // Command: APRD
     frame[17] = currentIdx;
 
-    // [¦ì§}³B²z] ADP ª½±µ¶ñ¤J
-    // ¨Ò¦p¶Ç¤J (uint16_t)-1 ·|ÅÜ¦¨ 0xFFFF (¥NªíÃì¸ô¤Wªº²Ä 2 ­Ó¸Ë¸m)
+    // [ä½å€è™•ç†] ADP ç›´æ¥å¡«å…¥
+    // ä¾‹å¦‚å‚³å…¥ (uint16_t)-1 æœƒè®Šæˆ 0xFFFF (ä»£è¡¨éˆè·¯ä¸Šçš„ç¬¬ 2 å€‹è£ç½®)
     frame[18] = ADP & 0xFF;
     frame[19] = (ADP >> 8) & 0xFF;
 
@@ -255,18 +295,18 @@ int EtherCatMaster::ecx_APRD(uint16_t ADP, uint16_t ADO, uint16_t length, void* 
     frame[24] = 0x00;
     frame[25] = 0x00;
 
-    // Data °Ï¶ô²M¹s (µ¥«İ±q¯¸¶ñ¼g)
+    // Data å€å¡Šæ¸…é›¶ (ç­‰å¾…å¾ç«™å¡«å¯«)
     if (length > 0) memset(&frame[26], 0, length);
 
     // WKC
     frame[26 + length] = 0x00;
     frame[26 + length + 1] = 0x00;
 
-    // µo°e
+    // ç™¼é€
     int total_send_len = 14 + 2 + 10 + length + 2;
     m_pNic->SendPacket(frame, total_send_len);
 
-    // ±µ¦¬°j°é (Index Matching)
+    // æ¥æ”¶è¿´åœˆ (Index Matching)
     int max_retries = timeout * 100;
     LARGE_INTEGER wait; wait.QuadPart = 10;
 
@@ -285,7 +325,7 @@ int EtherCatMaster::ecx_APRD(uint16_t ADP, uint16_t ADO, uint16_t length, void* 
                     {
                         uint16_t wkc = m_rxBuffer[wkc_offset] | (m_rxBuffer[wkc_offset + 1] << 8);
 
-                        // ¦pªG WKC > 0¡A¥NªíÅª¨ú¦¨¥\¡A§â¸ê®Æ½Æ»s¦^ data «ü¼Ğ
+                        // å¦‚æœ WKC > 0ï¼Œä»£è¡¨è®€å–æˆåŠŸï¼ŒæŠŠè³‡æ–™è¤‡è£½å› data æŒ‡æ¨™
                         if (wkc > 0 && data != nullptr) {
                             memcpy(data, &m_rxBuffer[26], length);
                         }
@@ -298,7 +338,8 @@ int EtherCatMaster::ecx_APRD(uint16_t ADP, uint16_t ADO, uint16_t length, void* 
     }
     return 0; // Timeout
 }
-int EtherCatMaster::ecx_APWR(uint16_t ADP, uint16_t ADO, uint16_t length, const void* data, int timeout)//¦Û°Ê¼W¶qª«²z¼g¤J
+/* APWRï¼šä»¥ auto-increment physical address å¯«å…¥æŒ‡å®šå¾ç«™æš«å­˜å™¨ã€‚ */
+int EtherCatMaster::ecx_APWR(uint16_t ADP, uint16_t ADO, uint16_t length, const void* data, int timeout)
 {
     if (!m_pNic) return 0;
 
@@ -347,11 +388,11 @@ int EtherCatMaster::ecx_APWR(uint16_t ADP, uint16_t ADO, uint16_t length, const 
     frame[26 + length] = 0x00;
     frame[26 + length + 1] = 0x00;
 
-    // µo°e
+    // ç™¼é€
     int total_send_len = 14 + 2 + 10 + length + 2;
     m_pNic->SendPacket(frame, total_send_len);
 
-    // ±µ¦¬°j°é
+    // æ¥æ”¶è¿´åœˆ
     int max_retries = timeout * 100;
     LARGE_INTEGER wait; wait.QuadPart = 10;
 
@@ -377,7 +418,8 @@ int EtherCatMaster::ecx_APWR(uint16_t ADP, uint16_t ADO, uint16_t length, const 
     }
     return 0; // Timeout
 }
-int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int timeout)//ÅŞ¿èÅª¼g
+/* LRWï¼šä»¥ logical address åŒæ™‚å¯«å‡º Output PDO ä¸¦è®€å› Input PDOã€‚ */
+int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int timeout)
 {
     if (!m_pNic) return 0;
 
@@ -403,12 +445,12 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
     // --- 3. Datagram Header (10 bytes) ---
     uint8_t currentIdx = m_idx++;
 
-    // [­×§ï 1] Command: 12 = LRW (Logical Read Write)
+    // [ä¿®æ”¹ 1] Command: 12 = LRW (Logical Read Write)
     frame[16] = 12;
     frame[17] = currentIdx;
 
-    // [­×§ï 2] Logical Address (32-bit)
-    // ±N 32¦ì¤¸¦ì§}©î¦¨ 4­Ó Byte (Little Endian)
+    // [ä¿®æ”¹ 2] Logical Address (32-bit)
+    // å°‡ 32ä½å…ƒä½å€æ‹†æˆ 4å€‹ Byte (Little Endian)
     frame[18] = LogAddr & 0xFF;         // Byte 0
     frame[19] = (LogAddr >> 8) & 0xFF;  // Byte 1
     frame[20] = (LogAddr >> 16) & 0xFF; // Byte 2
@@ -424,22 +466,22 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
 
     // --- 4. Data & WKC ---
 
-    // [­×§ï 3-A] µo°e Payload (Output)
-    // ¤£¦A¬O memset ²M¹s¡A¦Ó¬O§â m_IoMap ªº¤º®e½Æ»s¶i¥h¡I
+    // [ä¿®æ”¹ 3-A] ç™¼é€ Payload (Output)
+    // ä¸å†æ˜¯ memset æ¸…é›¶ï¼Œè€Œæ˜¯æŠŠ m_IoMap çš„å…§å®¹è¤‡è£½é€²å»ï¼
     if (length > 0 && data != nullptr) {
         memcpy(&frame[26], data, length);
     }
 
-    // WKC ªì©l¬° 0
+    // WKC åˆå§‹ç‚º 0
     frame[26 + length] = 0x00;
     frame[26 + length + 1] = 0x00;
 
-    // --- 5. µo°e«Ê¥] ---
+    // --- 5. ç™¼é€å°åŒ… ---
     int total_send_len = 14 + 2 + 10 + length + 2;
     m_pNic->SendPacket(frame, total_send_len);
 
-    // --- 6. ±µ¦¬¦^À³ (Receive Loop) ---
-    int max_retries = timeout * 100; // µø±zªº timer ¸ÑªR«×¦Ó©w
+    // --- 6. æ¥æ”¶å›æ‡‰ (Receive Loop) ---
+    int max_retries = timeout * 100; // è¦–æ‚¨çš„ timer è§£æåº¦è€Œå®š
     LARGE_INTEGER wait; wait.QuadPart = 10; // 1us (RTX64 sleep ft)
 
     while (max_retries-- > 0)
@@ -447,23 +489,23 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
         int rxLen = m_pNic->ReceivePacket(m_rxBuffer);
         if (rxLen > 0)
         {
-            // ÀË¬d EtherType
+            // æª¢æŸ¥ EtherType
             if (m_rxBuffer[12] == 0x88 && m_rxBuffer[13] == 0xA4)
             {
-                // ÀË¬d Index
+                // æª¢æŸ¥ Index
                 if (m_rxBuffer[17] == currentIdx)
                 {
-                    // ÀË¬d Command ¬O§_¬° 12 (¦³¨Ç slave ¿ù»~·|¦^¶Ç§Oªº)
+                    // æª¢æŸ¥ Command æ˜¯å¦ç‚º 12 (æœ‰äº› slave éŒ¯èª¤æœƒå›å‚³åˆ¥çš„)
                     if (m_rxBuffer[16] == 12)
                     {
-                        // [­×§ï 3-B] ±µ¦¬ Payload (Input)
-                        // §â¦¬¨ìªº¸ê®Æ½Æ»s¦^¨Ï¥ÎªÌªº m_IoMap
-                        // ³o¼Ë±zªº DI ©M AD ¼Æ­È´N·|§ó·s¤F
+                        // [ä¿®æ”¹ 3-B] æ¥æ”¶ Payload (Input)
+                        // æŠŠæ”¶åˆ°çš„è³‡æ–™è¤‡è£½å›ä½¿ç”¨è€…çš„ m_IoMap
+                        // é€™æ¨£æ‚¨çš„ DI å’Œ AD æ•¸å€¼å°±æœƒæ›´æ–°äº†
                         if (length > 0 && data != nullptr) {
                             memcpy(data, &m_rxBuffer[26], length);
                         }
 
-                        // Åª¨ú WKC
+                        // è®€å– WKC
                         int wkc_offset = 26 + length;
                         if (rxLen >= wkc_offset + 2)
                         {
@@ -476,34 +518,38 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
         }
         RtSleepFt(&wait);
     }
-    return -1; // -1 ¥Nªí¶W®É/¥¢±Ñ (°Ï¤À WKC=0 ªº±¡ªp)
+    return -1; // -1 ä»£è¡¨è¶…æ™‚/å¤±æ•— (å€åˆ† WKC=0 çš„æƒ…æ³)
 }
-int EtherCatMaster::ecx_SDOwrite(int slave_pos, uint16_t index, uint8_t subindex, int CA, int size, void* data, int timeout)//ªA°È¸ê®Æª«¥ó¼g¤J (SDO Write / ¼g¤Jª«¥ó¦r¨å)
+/*
+ * CoE SDO Writeï¼šé€é Mailbox å¯«å…¥æŒ‡å®šå¾ç«™ Object Dictionaryã€‚
+ * åƒ…ç”¨æ–¼åˆå§‹åŒ–æˆ–éå³æ™‚å‘½ä»¤ï¼Œä¸æ‡‰æ”¾å…¥ 4 kHz PDO è·¯å¾‘ã€‚
+ */
+int EtherCatMaster::ecx_SDOwrite(int slave_pos, uint16_t index, uint8_t subindex, int CA, int size, void* data, int timeout)
 {
     // ========================================================================
-    // 1. ·Ç³Æ°Ñ¼Æ»P¦a§}
+    // 1. æº–å‚™åƒæ•¸èˆ‡åœ°å€
     // ========================================================================
     uint16_t mbxOutAddr = m_slaveInfo[slave_pos].mbxOutAddr;
     uint16_t mbxInAddr = m_slaveInfo[slave_pos].mbxInAddr;
-    uint8_t mbx_req[MAX_MBX_SIZE] = { 0 }; // ½Ğ¨D«Ê¥]
-    uint8_t mbx_res[MAX_MBX_SIZE] = { 0 }; // ¦^À³½w½Ä°Ï
+    uint8_t mbx_req[MAX_MBX_SIZE] = { 0 }; // è«‹æ±‚å°åŒ…
+    uint8_t mbx_res[MAX_MBX_SIZE] = { 0 }; // å›æ‡‰ç·©è¡å€
 
-    // ¨¾¤î buffer overflow (®Ú¾Ú«H½c³Ì¤jªø«×ºIÂ_)
-    if (size > (MAX_MBX_SIZE - 32)) return 0; // ¹w¯d Header ªÅ¶¡
+    // é˜²æ­¢ buffer overflow (æ ¹æ“šä¿¡ç®±æœ€å¤§é•·åº¦æˆªæ–·)
+    if (size > (MAX_MBX_SIZE - 32)) return 0; // é ç•™ Header ç©ºé–“
 
     // ========================================================================
-    // 2. ¼É¤O¯}¸Ñ Loop (¹Á¸Õ¤£¦P Counter)
+    // 2. æš´åŠ›ç ´è§£ Loop (å˜—è©¦ä¸åŒ Counter)
     // ========================================================================
     for (int try_cnt = 0; try_cnt < 8; try_cnt++) {
 
-        // §ó·s Counter (¨C¦¸­«¸Õ³£´«¤@­Ó¸¹½X)
+        // æ›´æ–° Counter (æ¯æ¬¡é‡è©¦éƒ½æ›ä¸€å€‹è™Ÿç¢¼)
         m_mboxCnt++;
         uint8_t current_cnt = m_mboxCnt & 0x7;
 
-        // --- A. «Øºc½Ğ¨D«Ê¥] (Request) ---
+        // --- A. å»ºæ§‹è«‹æ±‚å°åŒ… (Request) ---
 
         // 1. Mailbox Header
-        // Byte 2-3: Station Address (©T©w 0)
+        // Byte 2-3: Station Address (å›ºå®š 0)
         *(uint16_t*)(&mbx_req[2]) = 0x0000;
         // Byte 4: Channel(0) + Priority(0)
         mbx_req[4] = 0x00;
@@ -514,27 +560,27 @@ int EtherCatMaster::ecx_SDOwrite(int slave_pos, uint16_t index, uint8_t subindex
         // Byte 6-7: 0x2000 (CoE Service)
         *(uint16_t*)(&mbx_req[6]) = 0x2000;
 
-        // 3. SDO Header & Data ³B²z
-        // ³o¬O»P Read ³Ì¤jªº¤£¦PÂI¡A­n§PÂ_¼Æ¾Ú¤j¤p
+        // 3. SDO Header & Data è™•ç†
+        // é€™æ˜¯èˆ‡ Read æœ€å¤§çš„ä¸åŒé»ï¼Œè¦åˆ¤æ–·æ•¸æ“šå¤§å°
 
-        uint16_t ethercat_data_len = 0; // ¥Î¨Ó¶ñ¼g Byte 0-1 ªºªø«×
+        uint16_t ethercat_data_len = 0; // ç”¨ä¾†å¡«å¯« Byte 0-1 çš„é•·åº¦
 
-        // [¼Ò¦¡ A] Complete Access (CA) - Åª¼g¾ã­Óª«¥ó
+        // [æ¨¡å¼ A] Complete Access (CA) - è®€å¯«æ•´å€‹ç‰©ä»¶
         if (CA) {
             mbx_req[8] = 0x31; // Command: Download Complete Access + Size Indicator
             mbx_req[9] = index & 0xFF;
             mbx_req[10] = (index >> 8) & 0xFF;
             mbx_req[11] = subindex;
 
-            // CA ¼Ò¦¡¤U¡A³q±`¨Ï¥Î Normal Transfer ®æ¦¡ (ªø«×©ñ Byte 12-15)
+            // CA æ¨¡å¼ä¸‹ï¼Œé€šå¸¸ä½¿ç”¨ Normal Transfer æ ¼å¼ (é•·åº¦æ”¾ Byte 12-15)
             *(uint32_t*)(&mbx_req[12]) = (uint32_t)size;
 
-            // ¼Æ¾Ú©ñ¦b Byte 16 ¤§«á
+            // æ•¸æ“šæ”¾åœ¨ Byte 16 ä¹‹å¾Œ
             memcpy(&mbx_req[16], data, size);
 
             ethercat_data_len = 16 + size; // 10(Mbx) + 2(CoE) + 4(SDO header) + 4(Size) + Data
         }
-        // [¼Ò¦¡ B] Expedited Transfer (<= 4 Bytes) - ³Ì±`¥Îªº¼Ò¦¡
+        // [æ¨¡å¼ B] Expedited Transfer (<= 4 Bytes) - æœ€å¸¸ç”¨çš„æ¨¡å¼
         else if (size <= 4) {
             // Command 0x20: Download Request
             // Bit 1=1 (Expedited)
@@ -546,51 +592,51 @@ int EtherCatMaster::ecx_SDOwrite(int slave_pos, uint16_t index, uint8_t subindex
             mbx_req[10] = (index >> 8) & 0xFF;
             mbx_req[11] = subindex;
 
-            // ¼Æ¾Úª½±µ©ñ¦b Byte 12-15
+            // æ•¸æ“šç›´æ¥æ”¾åœ¨ Byte 12-15
             memcpy(&mbx_req[12], data, size);
 
-            // Á`ªø«×©T©w (¦]¬°§Y¨Ï¼g 1 byte¡A«Ê¥]ÁÙ¬O­n¸Éº¡¨ì 4 byte ¦ì¸m)
+            // ç¸½é•·åº¦å›ºå®š (å› ç‚ºå³ä½¿å¯« 1 byteï¼Œå°åŒ…é‚„æ˜¯è¦è£œæ»¿åˆ° 4 byte ä½ç½®)
             ethercat_data_len = 16; // 10(Mbx) + 2(CoE) + 4(SDO header+Data)
         }
-        // [¼Ò¦¡ C] Normal Transfer (> 4 Bytes)
+        // [æ¨¡å¼ C] Normal Transfer (> 4 Bytes)
         else {
             mbx_req[8] = 0x21; // Download Normal + Size Indicator
             mbx_req[9] = index & 0xFF;
             mbx_req[10] = (index >> 8) & 0xFF;
             mbx_req[11] = subindex;
 
-            // Á`¼Æ¾Ú¤j¤p©ñ¦b Byte 12-15
+            // ç¸½æ•¸æ“šå¤§å°æ”¾åœ¨ Byte 12-15
             *(uint32_t*)(&mbx_req[12]) = (uint32_t)size;
 
-            // ¼Æ¾Ú©ñ¦b Byte 16 ¤§«á
+            // æ•¸æ“šæ”¾åœ¨ Byte 16 ä¹‹å¾Œ
             memcpy(&mbx_req[16], data, size);
 
             ethercat_data_len = 16 + size;
         }
 
-        // 4. ¶ñ¼g EtherCAT Header ªø«× (Byte 0-1)
-        // ª`·N¡Gªø«× = ¾ã­Ó Mailbox Payload ªø«× (¤£§t³o¨â­Ó byte ¤]¤£§t Station Addr)
-        // ³o¸Ì§Ú­Ì¥Î­pºâ¥X¨ÓªºÁ`ªø«× - 2 (¦]¬° Length Äæ¦ì¤£¥]§t¦Û¤v) 
-        // ¦ı¼Ğ·Ç¼gªk³q±`¬O¶ñ¤J Mailbox Data ªºªø«×
+        // 4. å¡«å¯« EtherCAT Header é•·åº¦ (Byte 0-1)
+        // æ³¨æ„ï¼šé•·åº¦ = æ•´å€‹ Mailbox Payload é•·åº¦ (ä¸å«é€™å…©å€‹ byte ä¹Ÿä¸å« Station Addr)
+        // é€™è£¡æˆ‘å€‘ç”¨è¨ˆç®—å‡ºä¾†çš„ç¸½é•·åº¦ - 2 (å› ç‚º Length æ¬„ä½ä¸åŒ…å«è‡ªå·±) 
+        // ä½†æ¨™æº–å¯«æ³•é€šå¸¸æ˜¯å¡«å…¥ Mailbox Data çš„é•·åº¦
         // Mailbox Data = (CoE Header + SDO Header + Data)
-        *(uint16_t*)(&mbx_req[0]) = ethercat_data_len - 6; // ´î¥h MbxHeader(6 bytes) ? 
-        // §ó¥¿¡GEtherCAT Length (Byte0-1) ¬O«üÀH«á¼Æ¾Úªºªø«×¡C
+        *(uint16_t*)(&mbx_req[0]) = ethercat_data_len - 6; // æ¸›å» MbxHeader(6 bytes) ? 
+        // æ›´æ­£ï¼šEtherCAT Length (Byte0-1) æ˜¯æŒ‡éš¨å¾Œæ•¸æ“šçš„é•·åº¦ã€‚
         // Mailbox Frame = [Length(2)][Addr(2)][MbxHeader(2)][CoE(2)][SDO(4)][Data...]
-        // ecx_APWR ¨ç¼Æ·|À°§Ú­Ì³B²z¥~¼hªº datagram header¡A§Ú­Ì³o¸Ì¥u»İ­n¶ñ Mailbox ¤º³¡ªºªø«×¡C
-        // Wait, ecx_APWR ªº length °Ñ¼Æ¨M©w¤F datagram ªºªø«×¡C
-        // Mailbox ¨óÄ³¸Ìªº Byte 0-1 ¬O "Length"¡A¥¦«üªº¬O Mailbox Service Data ªºªø«× (Counter Byte ¤§«áªº©Ò¦³ªF¦è)
-        // ³q±`¬O: CoE Header(2) + SDO Header(4) + Data
+        // ecx_APWR å‡½æ•¸æœƒå¹«æˆ‘å€‘è™•ç†å¤–å±¤çš„ datagram headerï¼Œæˆ‘å€‘é€™è£¡åªéœ€è¦å¡« Mailbox å…§éƒ¨çš„é•·åº¦ã€‚
+        // Wait, ecx_APWR çš„ length åƒæ•¸æ±ºå®šäº† datagram çš„é•·åº¦ã€‚
+        // Mailbox å”è­°è£¡çš„ Byte 0-1 æ˜¯ "Length"ï¼Œå®ƒæŒ‡çš„æ˜¯ Mailbox Service Data çš„é•·åº¦ (Counter Byte ä¹‹å¾Œçš„æ‰€æœ‰æ±è¥¿)
+        // é€šå¸¸æ˜¯: CoE Header(2) + SDO Header(4) + Data
         *(uint16_t*)(&mbx_req[0]) = ethercat_data_len - 6;
 
-        // --- B. µo°e½Ğ¨D (APWR) ---
-        // ª`·N¡G¶Ç¤J APWR ªºªø«×¥²¶·¬O§Ú­Ì­pºâ¥Xªº§¹¾ã«Ê¥]ªø«×
+        // --- B. ç™¼é€è«‹æ±‚ (APWR) ---
+        // æ³¨æ„ï¼šå‚³å…¥ APWR çš„é•·åº¦å¿…é ˆæ˜¯æˆ‘å€‘è¨ˆç®—å‡ºçš„å®Œæ•´å°åŒ…é•·åº¦
         int wkc = ecx_APWR(m_slaveInfo[slave_pos].APRDAPWR_Addr, mbxOutAddr, m_slaveInfo[slave_pos].mbxOutLength, mbx_req, timeout);
 
         if (wkc <= 0) {
-            continue; // ¼g¤J¥¢±Ñ¡A­«¸Õ
+            continue; // å¯«å…¥å¤±æ•—ï¼Œé‡è©¦
         }
 
-        // --- C. ±µ¦¬¦^À³ (APRD) ---
+        // --- C. æ¥æ”¶å›æ‡‰ (APRD) ---
         int quick_retries = 20;
         LARGE_INTEGER sleepTime; sleepTime.QuadPart = 100 * 10; // 100us
 
@@ -598,27 +644,27 @@ int EtherCatMaster::ecx_SDOwrite(int slave_pos, uint16_t index, uint8_t subindex
             wkc = ecx_APRD(m_slaveInfo[slave_pos].APRDAPWR_Addr, mbxInAddr, m_slaveInfo[slave_pos].mbxInLength, mbx_res, 500);
 
             if (wkc > 0) {
-                // ¸ÑªR¦^À³
+                // è§£æå›æ‡‰
                 uint8_t  res_header_type = mbx_res[5] & 0x0F;
                 uint8_t  res_cmd = mbx_res[8];
                 uint16_t res_index = mbx_res[9] | (mbx_res[10] << 8);
 
                 if (res_header_type == 0x03) { // CoE
 
-                    // ÀË¬d Index ¬O§_¤Ç°t
+                    // æª¢æŸ¥ Index æ˜¯å¦åŒ¹é…
                     if (res_index == index) {
 
-                        // ±¡ªp A: ¼g¤J¦¨¥\ (Success)
-                        // ¤U¸ü¦¨¥\ªº¦^À³½X³q±`¬O 0x60
+                        // æƒ…æ³ A: å¯«å…¥æˆåŠŸ (Success)
+                        // ä¸‹è¼‰æˆåŠŸçš„å›æ‡‰ç¢¼é€šå¸¸æ˜¯ 0x60
                         if (res_cmd == 0x60) {
-                            return 1; // ¦¨¥\¡I
+                            return 1; // æˆåŠŸï¼
                         }
 
-                        // ±¡ªp B: µo¥Í¿ù»~ (Abort 0x80)
+                        // æƒ…æ³ B: ç™¼ç”ŸéŒ¯èª¤ (Abort 0x80)
                         if (res_cmd == 0x80) {
                             uint32_t abortCode = *(uint32_t*)&mbx_res[12];
                             DEBUG_PRINT("[SDO Write Abort] Index:0x%X, Error: 0x%08X\n", index, abortCode);
-                            return 0; // ¥¢±Ñ
+                            return 0; // å¤±æ•—
                         }
                     }
                 }
@@ -627,52 +673,56 @@ int EtherCatMaster::ecx_SDOwrite(int slave_pos, uint16_t index, uint8_t subindex
         }
     }
 
-    return 0; // ¥ş³¡¹Á¸Õ¥¢±Ñ
+    return 0; // å…¨éƒ¨å˜—è©¦å¤±æ•—
 }
-int EtherCatMaster::ecx_SDOread(int slave_pos, uint16_t index, uint8_t subindex, int CA, int* size, void* data, int timeout)//ªA°È¸ê®Æª«¥óÅª¨ú (SDO Read / Åª¨úª«¥ó¦r¨å)
+/*
+ * CoE SDO Readï¼šé€é Mailbox è®€å–æŒ‡å®šå¾ç«™ Object Dictionaryã€‚
+ * size åŒæ™‚æ˜¯è¼¸å…¥ç·©è¡å€å¤§å°èˆ‡è¼¸å‡ºå¯¦éš›è³‡æ–™é•·åº¦ã€‚
+ */
+int EtherCatMaster::ecx_SDOread(int slave_pos, uint16_t index, uint8_t subindex, int CA, int* size, void* data, int timeout)
 {
     // ========================================================================
-    // 1. ·Ç³Æ°Ñ¼Æ»P¦a§}
+    // 1. æº–å‚™åƒæ•¸èˆ‡åœ°å€
     // ========================================================================
-    // ¦pªG slave_pos ¬O¶¶§Ç¯Á¤Ş (0=²Ä1¥x, -1=²Ä2¥x...)¡Aª½±µÂà¦¨ uint16_t ¨Ï¥Î
+    // å¦‚æœ slave_pos æ˜¯é †åºç´¢å¼• (0=ç¬¬1å°, -1=ç¬¬2å°...)ï¼Œç›´æ¥è½‰æˆ uint16_t ä½¿ç”¨
     //uint16_t adp = (uint16_t)slave_pos;
 
-    // ¨M©w Mailbox ¦a§}
-    // ¤@¯ë CoE ÅX°Ê¾¹: Out=0x1800, In=0x1880
-    // ¯S®í IO ¼Ò²Õ (¦p±z¤§«e¥Îªº): Out=0x1000, In=0x1080 (®Ú¾Ú Index §PÂ_)
+    // æ±ºå®š Mailbox åœ°å€
+    // ä¸€èˆ¬ CoE é©…å‹•å™¨: Out=0x1800, In=0x1880
+    // ç‰¹æ®Š IO æ¨¡çµ„ (å¦‚æ‚¨ä¹‹å‰ç”¨çš„): Out=0x1000, In=0x1080 (æ ¹æ“š Index åˆ¤æ–·)
     uint16_t mbxOutAddr = m_slaveInfo[slave_pos].mbxOutAddr;
     uint16_t mbxInAddr = m_slaveInfo[slave_pos].mbxInAddr;
-    uint8_t mbx_req[MAX_MBX_SIZE] = { 0 }; // ½Ğ¨D«Ê¥]
-    uint8_t mbx_res[MAX_MBX_SIZE] = { 0 }; // ¦^À³½w½Ä°Ï
+    uint8_t mbx_req[MAX_MBX_SIZE] = { 0 }; // è«‹æ±‚å°åŒ…
+    uint8_t mbx_res[MAX_MBX_SIZE] = { 0 }; // å›æ‡‰ç·©è¡å€
 
     // ========================================================================
-    // 2. ¼É¤O¯}¸Ñ Loop (¹Á¸Õ¤£¦P Counter¡A½T«O¦³¤@­Ó¯à¹ï¤W)
+    // 2. æš´åŠ›ç ´è§£ Loop (å˜—è©¦ä¸åŒ Counterï¼Œç¢ºä¿æœ‰ä¸€å€‹èƒ½å°ä¸Š)
     // ========================================================================
     for (int try_cnt = 0; try_cnt < 8; try_cnt++) {
 
-        // --- A. «Øºc½Ğ¨D«Ê¥] (Request) ---
+        // --- A. å»ºæ§‹è«‹æ±‚å°åŒ… (Request) ---
         *(uint16_t*)(&mbx_req[0]) = 0x000A; // Length (10 bytes)
         *(uint16_t*)(&mbx_req[2]) = 0x0000; // Station Address
 
-        // §ó·s Counter
+        // æ›´æ–° Counter
         m_mboxCnt++;
         uint8_t current_cnt = m_mboxCnt & 0x7;
 
-        // [ÃöÁä­×¥¿ !!!] -----------------------------------------------------
-        // ¤§«e¶ñ¤Ï¤F¡A¾É­P Type=0 µL®Ä¡C²{¦b­×¥¿¬°¡G
-        // Byte 4: Channel(0) + Priority(0) -> ¥²¶·¬O 0x00
+        // [é—œéµä¿®æ­£ !!!] -----------------------------------------------------
+        // ä¹‹å‰å¡«åäº†ï¼Œå°è‡´ Type=0 ç„¡æ•ˆã€‚ç¾åœ¨ä¿®æ­£ç‚ºï¼š
+        // Byte 4: Channel(0) + Priority(0) -> å¿…é ˆæ˜¯ 0x00
         mbx_req[4] = 0x00;
 
         // Byte 5: Type(3=CoE) + Counter
-        // ®æ¦¡: (Counter << 4) | 0x03
+        // æ ¼å¼: (Counter << 4) | 0x03
         mbx_req[5] = 0x03 | (current_cnt << 4);
         // --------------------------------------------------------------------
 
         *(uint16_t*)(&mbx_req[6]) = 0x2000; // CoE Header (SDO Req)
         if (CA) {
             mbx_req[8] = 0x50; // Upload Request + Complete Access
-            // ª`·N¡GCA ¼Ò¦¡¤U¡A³q±` subindex «ØÄ³¬° 0 (Åª¥ş³¡) ©Î 1 (¤£§t count)
-            // ³o¸Ì«O¯d±z¶Ç¤Jªº subindex¡A¦ı½Ğ¯d·N³W½d
+            // æ³¨æ„ï¼šCA æ¨¡å¼ä¸‹ï¼Œé€šå¸¸ subindex å»ºè­°ç‚º 0 (è®€å…¨éƒ¨) æˆ– 1 (ä¸å« count)
+            // é€™è£¡ä¿ç•™æ‚¨å‚³å…¥çš„ subindexï¼Œä½†è«‹ç•™æ„è¦ç¯„
 
         }
         else {
@@ -687,213 +737,566 @@ int EtherCatMaster::ecx_SDOread(int slave_pos, uint16_t index, uint8_t subindex,
 
 
 
-        // --- B. µo°e½Ğ¨D (APWR) ---
-        // ¨Ï¥Î ecx_APWR ¼g¤J Mailbox Out
+        // --- B. ç™¼é€è«‹æ±‚ (APWR) ---
+        // ä½¿ç”¨ ecx_APWR å¯«å…¥ Mailbox Out
         int wkc = ecx_APWR(m_slaveInfo[slave_pos].APRDAPWR_Addr, mbxOutAddr, m_slaveInfo[slave_pos].mbxOutLength, mbx_req, timeout);
 
         if (wkc <= 0) {
-            // ¦pªG³s¼g³£¥¢±Ñ (WKC=0)¡A¥Nªí¸Ó¦ì¸m¨S¦³ Slave ©Î Mailbox ¨S¶}
-            // ³o¸Ì¥i¥H¿ï¾Ü continue ­«¸Õ¡A©Îª½±µ¦^¶Ç¥¢±Ñ
+            // å¦‚æœé€£å¯«éƒ½å¤±æ•— (WKC=0)ï¼Œä»£è¡¨è©²ä½ç½®æ²’æœ‰ Slave æˆ– Mailbox æ²’é–‹
+            // é€™è£¡å¯ä»¥é¸æ“‡ continue é‡è©¦ï¼Œæˆ–ç›´æ¥å›å‚³å¤±æ•—
             continue;
         }
 
-        // --- C. ±µ¦¬¦^À³ (APRD) ---
-        // Slave »İ­n¤@ÂI®É¶¡³B²z¡A©Ò¥H§Ú­Ì¤p°j°é½ü¸ß
+        // --- C. æ¥æ”¶å›æ‡‰ (APRD) ---
+        // Slave éœ€è¦ä¸€é»æ™‚é–“è™•ç†ï¼Œæ‰€ä»¥æˆ‘å€‘å°è¿´åœˆè¼ªè©¢
         int quick_retries = 20;
         LARGE_INTEGER sleepTime; sleepTime.QuadPart = 100 * 10; // 100us
 
         for (int i = 0; i < quick_retries; i++) {
 
-            // ¨Ï¥Î ecx_APRD Åª¨ú Mailbox In
-            // ª`·N¡GÅª¨ú®Éªø«×³q±`«ØÄ³µ¹¨¬ (¨Ò¦p 16 ©Î§ó¤j¡A¬İ¦^¶Ç¼Æ¾Ú¶q)
+            // ä½¿ç”¨ ecx_APRD è®€å– Mailbox In
+            // æ³¨æ„ï¼šè®€å–æ™‚é•·åº¦é€šå¸¸å»ºè­°çµ¦è¶³ (ä¾‹å¦‚ 16 æˆ–æ›´å¤§ï¼Œçœ‹å›å‚³æ•¸æ“šé‡)
             wkc = ecx_APRD(m_slaveInfo[slave_pos].APRDAPWR_Addr, mbxInAddr, m_slaveInfo[slave_pos].mbxInLength, mbx_res, 500);
 
             if (wkc > 0) {
-                // ¸ÑªR¦^À³
-                uint8_t  res_header_type = mbx_res[5] & 0x0F; // À³¸Ó¬O 3 (CoE)
+                // è§£æå›æ‡‰
+                uint8_t  res_header_type = mbx_res[5] & 0x0F; // æ‡‰è©²æ˜¯ 3 (CoE)
                 uint8_t  res_cmd = mbx_res[8];               // SDO Command
                 uint16_t res_index = mbx_res[9] | (mbx_res[10] << 8);
 
-                // ÀË¬d 1: ¥²¶·¬O CoE «Ê¥]
+                // æª¢æŸ¥ 1: å¿…é ˆæ˜¯ CoE å°åŒ…
                 if (res_header_type == 0x03) {
 
-                    // ÀË¬d 2: Index ¥²¶·¤Ç°t (½T»{¤£¬OÂÂªº¦^À³)
+                    // æª¢æŸ¥ 2: Index å¿…é ˆåŒ¹é… (ç¢ºèªä¸æ˜¯èˆŠçš„å›æ‡‰)
                     if (res_index == index) {
 
-                        // ±¡ªp A: Åª¨ú¦¨¥\ (0x4x)
+                        // æƒ…æ³ A: è®€å–æˆåŠŸ (0x4x)
                         if ((res_cmd & 0xE0) == 0x40) {
                             int valid_bytes = 4;
-                            // ­pºâ¹ê»Ú¼Æ¾Úªø«× (expedited transfer)
+                            // è¨ˆç®—å¯¦éš›æ•¸æ“šé•·åº¦ (expedited transfer)
                             if (res_cmd & 0x02) {
                                 int empty_bytes = (res_cmd >> 2) & 0x03;
                                 valid_bytes = 4 - empty_bytes;
                             }
 
-                            // ½Æ»s¼Æ¾Ú¦^¶Çµ¹¨Ï¥ÎªÌ
+                            // è¤‡è£½æ•¸æ“šå›å‚³çµ¦ä½¿ç”¨è€…
                             if (data != NULL && size != NULL) {
                                 int copy_size = (*size < valid_bytes) ? *size : valid_bytes;
                                 memcpy(data, &mbx_res[12], copy_size);
                                 *size = copy_size;
                             }
-                            return 1; // ¦¨¥\¡I
+                            return 1; // æˆåŠŸï¼
                         }
 
-                        // ±¡ªp B: µo¥Í¿ù»~ (Abort 0x80)
+                        // æƒ…æ³ B: ç™¼ç”ŸéŒ¯èª¤ (Abort 0x80)
                         if (res_cmd == 0x80) {
                             uint32_t abortCode = *(uint32_t*)&mbx_res[12];
                             DEBUG_PRINT("[SDO Abort] Error Code: 0x%08X\n", abortCode);
-                            return 0; // ¥¢±Ñ
+                            return 0; // å¤±æ•—
                         }
                     }
                 }
             }
-            // ¨SÅª¨ì©ÎÁÙ¨S·Ç³Æ¦n¡Aµyµ¥¤@¤U¦A¸Õ
+            // æ²’è®€åˆ°æˆ–é‚„æ²’æº–å‚™å¥½ï¼Œç¨ç­‰ä¸€ä¸‹å†è©¦
             RtSleepFt(&sleepTime);
         }
     }
 
-    return 0; // ¸Õ¤F©Ò¦³ Counter ³£¨S¦^À³¡A«Å§i¥¢±Ñ
+    return 0; // è©¦äº†æ‰€æœ‰ Counter éƒ½æ²’å›æ‡‰ï¼Œå®£å‘Šå¤±æ•—
 }
-int EtherCatMaster::ecx_FPWR(uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout)//«ü©w¦ì§}ª«²z¼g¤J
+/* FPWRï¼šä»¥å·²é…ç½®çš„ station address å¯«å…¥å¾ç«™æš«å­˜å™¨ã€‚ */
+int EtherCatMaster::ecx_FPWR(uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout)
 {
-    // Command 5 = FPWR (¼g¤J«ü©wª«²z¦ì§})
+    // Command 5 = FPWR (å¯«å…¥æŒ‡å®šç‰©ç†ä½å€)
     return SendAndReceiveRegister(0x05, slaveAddr, regAddr, data, len, timeout);
 }
-int EtherCatMaster::ecx_FPRD(uint16_t slaveAddr, uint16_t regAddr, void* buffer, int len, int timeout)//«ü©w¦ì§}ª«²zÅª¨ú
+/* FPRDï¼šä»¥å·²é…ç½®çš„ station address è®€å–å¾ç«™æš«å­˜å™¨ã€‚ */
+int EtherCatMaster::ecx_FPRD(uint16_t slaveAddr, uint16_t regAddr, void* buffer, int len, int timeout)
 {
-    // Command 4 = FPRD (Åª¨ú«ü©wª«²z¦ì§})
+    // Command 4 = FPRD (è®€å–æŒ‡å®šç‰©ç†ä½å€)
     return SendAndReceiveRegister(0x04, slaveAddr, regAddr, buffer, len, timeout);
 }
 
-bool EtherCatMaster::SendAndReceiveRegister(uint8_t cmd, uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout)//¼È¦s¾¹©³¼h¦¬µo®Ö¤ß
+/*
+ * å»ºç«‹å–®ä¸€ register datagramã€é€å‡ºã€æ¯”å° EtherType/Index/Command å¾Œå–å›è³‡æ–™èˆ‡ WKCã€‚
+ * FPWR/FPRD å…±ç”¨æ­¤å‡½å¼ï¼Œå›å‚³å€¼æ²¿ç”¨ EtherCatMaster.h çš„ int å®£å‘Šã€‚
+ */
+int EtherCatMaster::SendAndReceiveRegister(
+    uint8_t cmd,
+    uint16_t slaveAddr,
+    uint16_t regAddr,
+    void* data,
+    int len,
+    int timeout)
 {
+    // =========================================================
+    // EtherCAT Register Send / Receive Core
+    //
+    // 0x04 = FPRD
+    // 0x05 = FPWR
+    // 0x0E = FRMW
+    //
+    // æœ¬ç‰ˆæœ¬é‡é»ï¼š
+    //
+    // 1. æ¯å€‹ Datagram ä½¿ç”¨å”¯ä¸€ Index
+    // 2. RX å¿…é ˆæ¯”å° Cmd
+    // 3. RX å¿…é ˆæ¯”å° Index
+    // 4. é˜²æ­¢ä¸Šä¸€å€‹ Cycle çš„ Late Response
+    //    è¢«ä¸‹ä¸€æ¬¡ Register Access èª¤æ”¶
+    // =========================================================
+
+
+    // ---------------------------------------------------------
+    // åŸºæœ¬é˜²å‘†
+    // ---------------------------------------------------------
+    if (m_pNic == nullptr)
+    {
+        return 0;
+    }
+
+    if (len <= 0 ||
+        len > 1480)
+    {
+        return 0;
+    }
+
+
+    // =========================================================
+    // 1. Buffer
+    // =========================================================
     uint8_t sendBuf[1518];
     uint8_t recvBuf[1518];
-    memset(sendBuf, 0, sizeof(sendBuf));
 
-    // --- A. ²Õ¸Ë Ethernet Header ---
-    // Dest MAC: Broadcast (FF-FF-FF-FF-FF-FF) ©Îª½±µ¥Ñ NIC Driver ³B²z
-    // Src MAC: NIC Driver ·|¦Û¤v¶ñ
-    // EtherType: 0x88A4 (EtherCAT)
+    memset(
+        sendBuf,
+        0,
+        sizeof(sendBuf));
+
+    memset(
+        recvBuf,
+        0,
+        sizeof(recvBuf));
+
+
     int idx = 0;
 
-    // ¬°¤FÂ²³æ¡A°²³] NIC Driver ·|À°¦£¶ñ MAC Header (14 bytes)
-    // ¦pªG±zªº NIC Driver ¥u°e Payload¡A½Ğ±q EtherCAT Header ¶}©l¶ñ
-    // ³o¸Ì¥Ü½d¥]§t MAC Header ªº¼gªk:
-    for (int i = 0; i < 6; i++) sendBuf[idx++] = 0xFF; // Dest
-    for (int i = 0; i < 6; i++) sendBuf[idx++] = 0x00; // Src (Placeholder)
-    sendBuf[idx++] = 0x88; // EtherType High
-    sendBuf[idx++] = 0xA4; // EtherType Low
 
-    // --- B. ²Õ¸Ë EtherCAT Header (2 Bytes) ---
-    // Length: PDU Header(10) + Data(len) + WKC(2)
-    uint16_t totalLen = 10 + len + 2;
-    uint16_t ecHeader = (totalLen & 0x7FF) | (0x1000); // Type 1 = EtherCAT Command
-    memcpy(&sendBuf[idx], &ecHeader, 2);
-    idx += 2;
+    // =========================================================
+    // 2. Ethernet Header
+    // =========================================================
 
-    // --- C. ²Õ¸Ë PDU Header (10 Bytes) ---
-    sendBuf[idx++] = cmd;       // Command (4=Read, 5=Write)
-    sendBuf[idx++] = 0x00;      // Index («Ê¥]½s¸¹¡A³o¸ÌÂ²³æ³]0)
-
-    memcpy(&sendBuf[idx], &slaveAddr, 2); // Address (Physical)
-    idx += 2;
-
-    memcpy(&sendBuf[idx], &regAddr, 2);   // Register Offset
-    idx += 2;
-
-    uint16_t lenInfo = (uint16_t)len & 0x7FF; // Length (11 bits)
-    memcpy(&sendBuf[idx], &lenInfo, 2);
-    idx += 2;
-
-    uint16_t irqInfo = 0x0000;  // Interrupt info
-    memcpy(&sendBuf[idx], &irqInfo, 2);
-    idx += 2;
-
-    // --- D. ¶ñ¤J¸ê®Æ (¦pªG¬O Write) ---
-    if (cmd == 0x05 && data != nullptr) {
-        memcpy(&sendBuf[idx], data, len);
+    // Destination MAC = Broadcast
+    for (int i = 0; i < 6; i++)
+    {
+        sendBuf[idx++] = 0xFF;
     }
-    // ¦pªG¬O Read¡A³o¸Ì¯dªÅ (0x00)
+
+
+    // Source MAC
+    //
+    // ä¿ç•™ç›®å‰ NIC Driver æ¶æ§‹ã€‚
+    // ä½ çš„åŸç¨‹å¼åœ¨é€™è£¡ä½¿ç”¨ 0 Placeholderã€‚
+    for (int i = 0; i < 6; i++)
+    {
+        sendBuf[idx++] = 0x00;
+    }
+
+
+    // EtherType = EtherCAT 0x88A4
+    sendBuf[idx++] = 0x88;
+    sendBuf[idx++] = 0xA4;
+
+
+    // =========================================================
+    // 3. EtherCAT Header
+    // =========================================================
+    //
+    // Datagram Header = 10 Bytes
+    // Data            = len
+    // WKC             = 2 Bytes
+    // =========================================================
+
+    uint16_t totalLen =
+        (uint16_t)(
+            10 +
+            len +
+            2);
+
+
+    uint16_t ecHeader =
+        (totalLen & 0x07FF) |
+        0x1000;
+
+
+    sendBuf[idx++] =
+        (uint8_t)(
+            ecHeader & 0xFF);
+
+
+    sendBuf[idx++] =
+        (uint8_t)(
+            (ecHeader >> 8) & 0xFF);
+
+
+    // =========================================================
+    // 4. EtherCAT Datagram Header
+    // =========================================================
+
+
+    // ---------------------------------------------------------
+    // Command
+    // ---------------------------------------------------------
+    sendBuf[idx++] =
+        cmd;
+
+
+    // ---------------------------------------------------------
+    // Datagram Index
+    //
+    // é‡è¦ï¼š
+    //
+    // åŸæœ¬å›ºå®š = 0ã€‚
+    //
+    // ç¾åœ¨æ¯ä¸€æ¬¡ EtherCAT Register Access
+    // éƒ½å–å¾—æ–°çš„ Indexã€‚
+    //
+    // uint8_t è‡ªç„¶æœƒï¼š
+    //
+    // 0 ... 255 -> 0
+    //
+    // Wrap æ˜¯æ­£å¸¸çš„ã€‚
+    // ---------------------------------------------------------
+    uint8_t currentIdx =
+        m_idx++;
+
+
+    sendBuf[idx++] =
+        currentIdx;
+
+
+    // ---------------------------------------------------------
+    // Configured Station Address
+    // ---------------------------------------------------------
+    sendBuf[idx++] =
+        (uint8_t)(
+            slaveAddr & 0xFF);
+
+
+    sendBuf[idx++] =
+        (uint8_t)(
+            (slaveAddr >> 8) & 0xFF);
+
+
+    // ---------------------------------------------------------
+    // Register Address
+    // ---------------------------------------------------------
+    sendBuf[idx++] =
+        (uint8_t)(
+            regAddr & 0xFF);
+
+
+    sendBuf[idx++] =
+        (uint8_t)(
+            (regAddr >> 8) & 0xFF);
+
+
+    // ---------------------------------------------------------
+    // Length
+    // ---------------------------------------------------------
+    uint16_t lenInfo =
+        (uint16_t)len &
+        0x07FF;
+
+
+    sendBuf[idx++] =
+        (uint8_t)(
+            lenInfo & 0xFF);
+
+
+    sendBuf[idx++] =
+        (uint8_t)(
+            (lenInfo >> 8) & 0xFF);
+
+
+    // ---------------------------------------------------------
+    // IRQ
+    // ---------------------------------------------------------
+    sendBuf[idx++] = 0x00;
+    sendBuf[idx++] = 0x00;
+
+
+    // =========================================================
+    // 5. Datagram Data
+    // =========================================================
+
+    // FPWRï¼š
+    // Data = è¦å¯«å…¥çš„å…§å®¹
+    if (cmd == 0x05 &&
+        data != nullptr)
+    {
+        memcpy(
+            &sendBuf[idx],
+            data,
+            len);
+    }
+
+
+    // FPRD / FRMWï¼š
+    //
+    // sendBuf å·²ç¶“ memset = 0ï¼Œ
+    // æ‰€ä»¥ Data Area ä¿æŒ 0 å³å¯ã€‚
     idx += len;
 
-    // --- E. WKC (Working Counter) ¹w¯d 2 Bytes ---
+
+    // =========================================================
+    // 6. WKC Initial Value
+    // =========================================================
     sendBuf[idx++] = 0x00;
     sendBuf[idx++] = 0x00;
 
-    // --- F. µo°e«Ê¥] ---
-    // ª`·N¡G©I¥s±zªººô¥dÅX°Ê
-    // ³o¸Ì°²³]±zªº MyNic «ü¼Ğ¥s°µ m_pNic
-    if (!m_pNic) return false;
-    m_pNic->SendPacket(sendBuf, idx);
 
-    // --- G. µ¥«İ±µ¦¬ (Â²³æªº Polling ¾÷¨î) ---
-    // ¦]¬°³o¬O¦b ConfigDC ªì©l¤Æ¶¥¬q¡A¥i¥H¥Î Busy Wait
-    // ¹ê»Ú RTX Àô¹Ò½Ğª`·N¤£­n¥d¦º¤Ó¤[
-    //int retry = 100; // ¹Á¸Õ 100 ¦¸
-
-    // ±µ¦¬°j°é (Index Matching)
-    int max_retries = timeout * 100;
-    LARGE_INTEGER wait; wait.QuadPart = 10;
+    // =========================================================
+    // 7. Send
+    // =========================================================
+    m_pNic->SendPacket(
+        sendBuf,
+        idx);
 
 
-    while (max_retries-- > 0)
+    // =========================================================
+    // 8. RX Polling Configuration
+    // =========================================================
+
+    int maxRetries =
+        timeout * 100;
+
+
+    LARGE_INTEGER wait;
+
+    // åŸæœ¬è¨­è¨ˆï¼š
+    // 10 x 100ns = 1us
+    //
+    // å¯¦éš› timing å¯èƒ½å—åˆ° RTX64 / NIC RX Path å½±éŸ¿ï¼Œ
+    // ä½†é€™ä¸€æ­¥å…ˆä»¥ Correctness ç‚ºä¸»ã€‚
+    wait.QuadPart =
+        10;
+
+
+    // =========================================================
+    // 9. RX Loop
+    // =========================================================
+    while (maxRetries-- > 0)
     {
-        int recvLen = m_pNic->ReceivePacket(recvBuf); // °²³]¦^¶Ç±µ¦¬ªø«×
+        int recvLen =
+            m_pNic->ReceivePacket(
+                recvBuf);
+
+
         if (recvLen > 0)
         {
-            // Â²³æÀË¬d EtherType ¬O§_¬° 0x88A4
-            if (recvBuf[12] == 0x88 && recvBuf[13] == 0xA4)
+            // =================================================
+            // æœ€ä½åŸºæœ¬é•·åº¦
+            // =================================================
+            if (recvLen < 28)
             {
-                // ÀË¬d WKC (¦b«Ê¥]³Ì«á 2 bytes)
-                // Offset ­pºâ: MAC(14) + EC(2) + PDU(10) + Data(len)
-                int wkcOffset = 14 + 2 + 10 + len;
-                uint16_t wkc = *(uint16_t*)&recvBuf[wkcOffset];
+                RtSleepFt(
+                    &wait);
 
-                if (wkc >= 1) { // ¦Ü¤Ö¦³¤@­Ó±q¯¸³B²z¦¨¥\
-                    // ¦pªG¬O Read «ü¥O¡A§â¸ê®Æ½Æ»s¥X¨Ó
-                    if (cmd == 0x04 && data != nullptr) {
-                        // Data Offset = 14 + 2 + 10 = 26
-                        memcpy(data, &recvBuf[26], len);
-                    }
-                    return true; // ¦¨¥\¡I
-                }
+                continue;
             }
+
+
+            // =================================================
+            // A. EtherType Matching
+            // =================================================
+            if (recvBuf[12] != 0x88 ||
+                recvBuf[13] != 0xA4)
+            {
+                RtSleepFt(
+                    &wait);
+
+                continue;
+            }
+
+
+            // =================================================
+            // B. Command Matching
+            //
+            // Offset 16 = EtherCAT Command
+            // =================================================
+            uint8_t recvCmd =
+                recvBuf[16];
+
+
+            if (recvCmd != cmd)
+            {
+                // ä¸æ˜¯é€™ä¸€æ¬¡ Register Access çš„å°åŒ…
+                //
+                // ç›´æ¥å¿½ç•¥ã€‚
+                RtSleepFt(
+                    &wait);
+
+                continue;
+            }
+
+
+            // =================================================
+            // C. Datagram Index Matching
+            //
+            // Offset 17 = Datagram Index
+            //
+            // â˜… é€™æ˜¯é€™æ¬¡çœŸæ­£è¦ä¿®çš„æ ¸å¿ƒ
+            // =================================================
+            uint8_t recvIdx =
+                recvBuf[17];
+
+
+            if (recvIdx != currentIdx)
+            {
+                // -------------------------------------------------
+                // é€™ä»£è¡¨å¯èƒ½æ˜¯ï¼š
+                //
+                // - å‰ä¸€å€‹ Cycle çš„ Late Response
+                // - å…¶ä»– EtherCAT Datagram
+                //
+                // çµ•å°ä¸èƒ½æŠŠå®ƒç•¶æˆæœ¬æ¬¡å›æ‡‰ã€‚
+                // -------------------------------------------------
+
+                RtSleepFt(
+                    &wait);
+
+                continue;
+            }
+
+
+            // =================================================
+            // D. WKC Offset
+            // =================================================
+            int wkcOffset =
+                14 +
+                2 +
+                10 +
+                len;
+
+
+            if (recvLen <
+                (wkcOffset + 2))
+            {
+                RtSleepFt(
+                    &wait);
+
+                continue;
+            }
+
+
+            // =================================================
+            // E. Read WKC
+            // =================================================
+            uint16_t wkc =
+                (uint16_t)recvBuf[wkcOffset] |
+                ((uint16_t)recvBuf[wkcOffset + 1]
+                    << 8);
+
+
+            if (wkc < 1)
+            {
+                RtSleepFt(
+                    &wait);
+
+                continue;
+            }
+
+
+            // =================================================
+            // F. Copy Return Data
+            //
+            // FPRD / FRMW
+            // =================================================
+            if ((cmd == 0x04 ||
+                cmd == 0x0E) &&
+                data != nullptr)
+            {
+                const int dataOffset =
+                    26;
+
+
+                if (recvLen <
+                    (dataOffset + len))
+                {
+                    return 0;
+                }
+
+
+                memcpy(
+                    data,
+                    &recvBuf[dataOffset],
+                    len);
+            }
+
+
+            // =================================================
+            // Success
+            // =================================================
+            return (int)wkc;
         }
-        RtSleepFt(&wait);
+
+
+        // =====================================================
+        // å°šæœªæ”¶åˆ° Response
+        // =====================================================
+        RtSleepFt(
+            &wait);
     }
 
-    DEBUG_PRINT("Register R/W Timeout! Addr: 0x%X Reg: 0x%X\n", slaveAddr, regAddr);
-    return false;
+
+    // =========================================================
+    // 10. Timeout
+    // =========================================================
+
+    // FRMW æ¯ 250us éƒ½åŸ·è¡Œï¼Œ
+    // ä¸è¦åœ¨ RT Thread æ¯æ¬¡ Timeout éƒ½æ´— Logã€‚
+    if (cmd != 0x0E)
+    {
+        DEBUG_PRINT(
+            "Register R/W Timeout! Cmd:0x%02X Addr:0x%X Reg:0x%X Idx:%u\n",
+            cmd,
+            slaveAddr,
+            regAddr,
+            (unsigned int)currentIdx);
+    }
+
+
+    return 0;
 }
 
 
-uint16_t EtherCatMaster::ReadSII_Word16(int slave_idx, uint16_t word_addr)//Åª¨ú±q¯¸EEPROM ¥\¯à
+/* å¾ Slave Information Interface EEPROM è®€å–ä¸€å€‹ 16-bit wordã€‚ */
+uint16_t EtherCatMaster::ReadSII_Word16(int slave_idx, uint16_t word_addr)
 {
     uint16_t adp = m_slaveInfo[slave_idx].APRDAPWR_Addr;
 
     // =================================================================
-    // 1. ·Ç³Æ 6 Bytes ªº¡u²Õ¦X¥]¡v
+    // 1. æº–å‚™ 6 Bytes çš„ã€Œçµ„åˆåŒ…ã€
     // =================================================================
-    // µ²ºc: [Control(2 Bytes)] + [Address(4 Bytes)]
+    // çµæ§‹: [Control(2 Bytes)] + [Address(4 Bytes)]
     uint8_t req_data[6];
 
-    // Byte 0-1: ¶ñ¤J©R¥O 0x0100 (Read Command)
+    // Byte 0-1: å¡«å…¥å‘½ä»¤ 0x0100 (Read Command)
     // Little Endian: 00 01
     *(uint16_t*)&req_data[0] = 0x0100;
 
-    // Byte 2-5: ¶ñ¤J EEPROM Word ¦a§}
-    // ¨Ò¦p­nÅª 0x001C -> 1C 00 00 00
+    // Byte 2-5: å¡«å…¥ EEPROM Word åœ°å€
+    // ä¾‹å¦‚è¦è®€ 0x001C -> 1C 00 00 00
     *(uint32_t*)&req_data[2] = word_addr;
 
     // =================================================================
-    // 2. µo°e¡u²Õ¦X§Ş¡v (¼g¤J 0x0502¡Aªø«× 6)
+    // 2. ç™¼é€ã€Œçµ„åˆæŠ€ã€ (å¯«å…¥ 0x0502ï¼Œé•·åº¦ 6)
     // =================================================================
-    // ³o¸Ì§Ú­Ì¥u©I¥s¤@¦¸ APWR¡A´N§¹¦¨¤F­ì¥»¨â¦¸ªº¤u§@¡I
+    // é€™è£¡æˆ‘å€‘åªå‘¼å«ä¸€æ¬¡ APWRï¼Œå°±å®Œæˆäº†åŸæœ¬å…©æ¬¡çš„å·¥ä½œï¼
     ecx_APWR(adp, 0x0502, 6, req_data, 200);
 
     // =================================================================
-    // 3. ½ü¸ßª¬ºA (³o³¡¤ÀÁÙ¬O­n¨Ä¨Äµ¥¡A¤£¯à¬Ù)
+    // 3. è¼ªè©¢ç‹€æ…‹ (é€™éƒ¨åˆ†é‚„æ˜¯è¦ä¹–ä¹–ç­‰ï¼Œä¸èƒ½çœ)
     // =================================================================
     uint16_t status = 0;
     int timeout = 200;
@@ -902,13 +1305,13 @@ uint16_t EtherCatMaster::ReadSII_Word16(int slave_idx, uint16_t word_addr)//Åª¨ú
     do {
         ecx_APRD(adp, 0x0502, 2, &status, 200);
 
-        // ÀË¬d Error
+        // æª¢æŸ¥ Error
         if (status & 0x7800) {
             DEBUG_PRINT("EEPROM Error Slave[%d]: 0x%04X\n", slave_idx, status);
             return 0;
         }
 
-        // ÀË¬d Busy (Bit 15)
+        // æª¢æŸ¥ Busy (Bit 15)
         if ((status & 0x8000) == 0) {
             success = true;
             break;
@@ -922,7 +1325,7 @@ uint16_t EtherCatMaster::ReadSII_Word16(int slave_idx, uint16_t word_addr)//Åª¨ú
     }
 
     // =================================================================
-    // 4. Åª¨ú¼Æ¾Ú (³o³¡¤À¤]¨SÅÜ)
+    // 4. è®€å–æ•¸æ“š (é€™éƒ¨åˆ†ä¹Ÿæ²’è®Š)
     // =================================================================
     uint32_t raw_data = 0;
     ecx_APRD(adp, 0x0508, 4, &raw_data, 200);
@@ -930,13 +1333,14 @@ uint16_t EtherCatMaster::ReadSII_Word16(int slave_idx, uint16_t word_addr)//Åª¨ú
     return (uint16_t)(raw_data & 0xFFFF);
 }
 
-// §ï¦^¶Ç«¬§O¬° uint32_t
+// æ”¹å›å‚³å‹åˆ¥ç‚º uint32_t
+/* é€£çºŒè®€å–å…©å€‹ SII word ä¸¦çµ„æˆ 32-bit little-endian æ•¸å€¼ã€‚ */
 uint32_t EtherCatMaster::ReadSII_Uint32(int slave_idx, uint16_t word_addr)
 {
     uint16_t adp = m_slaveInfo[slave_idx].APRDAPWR_Addr;
 
     // =================================================================
-    // 1. ·Ç³Æ 6 Bytes ªº¡u²Õ¦X¥]¡v
+    // 1. æº–å‚™ 6 Bytes çš„ã€Œçµ„åˆåŒ…ã€
     // =================================================================
     uint8_t req_data[6];
 
@@ -944,16 +1348,16 @@ uint32_t EtherCatMaster::ReadSII_Uint32(int slave_idx, uint16_t word_addr)
     *(uint16_t*)&req_data[0] = 0x0100;
 
     // Byte 2-5: EEPROM Word Address
-    // ª`·N¡G³o¸ÌÁÙ¬O¶Ç¤J Word Address (¨Ò¦p 0x0008)¡A¦Ó¤£¬O Byte Address
+    // æ³¨æ„ï¼šé€™è£¡é‚„æ˜¯å‚³å…¥ Word Address (ä¾‹å¦‚ 0x0008)ï¼Œè€Œä¸æ˜¯ Byte Address
     *(uint32_t*)&req_data[2] = word_addr;
 
     // =================================================================
-    // 2. µo°e½Ğ¨D
+    // 2. ç™¼é€è«‹æ±‚
     // =================================================================
     ecx_APWR(adp, 0x0502, 6, req_data, 200);
 
     // =================================================================
-    // 3. ½ü¸ßª¬ºA (µ¥«İ Busy Bit ²M°£)
+    // 3. è¼ªè©¢ç‹€æ…‹ (ç­‰å¾… Busy Bit æ¸…é™¤)
     // =================================================================
     uint16_t status = 0;
     int timeout = 200;
@@ -963,20 +1367,20 @@ uint32_t EtherCatMaster::ReadSII_Uint32(int slave_idx, uint16_t word_addr)
     {
         ecx_APRD(adp, 0x0502, 2, &status, 200);
 
-        // ÀË¬d Error (Bit 14-11 ³q±`«O¯d©Î¯S©w¿ù»~¡AÀË¬d 0x7800 ½d³ò)
-        // µù¡G¦³¨Ç¤â¥U©w¸q Error ¬° Bit 11-13 (0x3800)¡A¦ı 0x7800 ¤]¥]§t¤F°ª¦ìÀË¬d¡A³q±`¨S°İÃD
+        // æª¢æŸ¥ Error (Bit 14-11 é€šå¸¸ä¿ç•™æˆ–ç‰¹å®šéŒ¯èª¤ï¼Œæª¢æŸ¥ 0x7800 ç¯„åœ)
+        // è¨»ï¼šæœ‰äº›æ‰‹å†Šå®šç¾© Error ç‚º Bit 11-13 (0x3800)ï¼Œä½† 0x7800 ä¹ŸåŒ…å«äº†é«˜ä½æª¢æŸ¥ï¼Œé€šå¸¸æ²’å•é¡Œ
         if (status & 0x7800)
         {
             DEBUG_PRINT("EEPROM Error Slave[%d]: 0x%04X\n", slave_idx, status);
             return 0;
         }
 
-        // ÀË¬d Busy (Bit 15) - 0ªí¥Ü§¹¦¨
-        if ((status & 0x8100) == 0x0100) { // ¥[±jÀË¬d¡GBusy=0 ¥B Command=1(Read)ÁÙ¦b¤~ºâ¥¿±`µ²§ô
+        // æª¢æŸ¥ Busy (Bit 15) - 0è¡¨ç¤ºå®Œæˆ
+        if ((status & 0x8100) == 0x0100) { // åŠ å¼·æª¢æŸ¥ï¼šBusy=0 ä¸” Command=1(Read)é‚„åœ¨æ‰ç®—æ­£å¸¸çµæŸ
             success = true;
             break;
         }
-        // Â²³æª©ÀË¬d (±z­ì¥»ªº¼gªk)
+        // ç°¡å–®ç‰ˆæª¢æŸ¥ (æ‚¨åŸæœ¬çš„å¯«æ³•)
         if ((status & 0x8000) == 0) {
             success = true;
             break;
@@ -991,31 +1395,32 @@ uint32_t EtherCatMaster::ReadSII_Uint32(int slave_idx, uint16_t word_addr)
     }
 
     // =================================================================
-    // 4. Åª¨ú¼Æ¾Ú (ÃöÁä­×§ï³B)
+    // 4. è®€å–æ•¸æ“š (é—œéµä¿®æ”¹è™•)
     // =================================================================
     uint32_t raw_data = 0;
 
-    // ±q 0x0508 Åª¨ú 4 Bytes (32 bits)
-    // ESC ·|§â [Word_Addr] ©M [Word_Addr + 1] ³£©ñ¶i¨Ó
+    // å¾ 0x0508 è®€å– 4 Bytes (32 bits)
+    // ESC æœƒæŠŠ [Word_Addr] å’Œ [Word_Addr + 1] éƒ½æ”¾é€²ä¾†
     ecx_APRD(adp, 0x0508, 4, &raw_data, 200);
 
-    // ª½±µ¦^¶Ç 32-bit ¼Æ¾Ú¡A¤£­nÂà«¬¦¨ uint16_t
+    // ç›´æ¥å›å‚³ 32-bit æ•¸æ“šï¼Œä¸è¦è½‰å‹æˆ uint16_t
     return raw_data;
 }
 
-int EtherCatMaster::WriteFmmuRegister(int slaveIdx, int fmmuIdx, uint32_t logAddr, uint16_t len, uint16_t physAddr, uint8_t type, int timeout)//»²§U¨ç¦¡¡G¼g¤J³æ¤@ FMMU ³]©w
+/* å¯«å…¥å–®ä¸€ FMMU entryï¼Œå»ºç«‹ Logical Address èˆ‡ Slave Process RAM çš„æ˜ å°„ã€‚ */
+int EtherCatMaster::WriteFmmuRegister(int slaveIdx, int fmmuIdx, uint32_t logAddr, uint16_t len, uint16_t physAddr, uint8_t type, int timeout)
 {
-    // »²§U¨ç¦¡¡G¼g¤J³æ¤@ FMMU ³]©w
-    // slaveIdx: ±q¯¸¯Á¤Ş
-    // fmmuIdx:  ²Ä´X¸¹ FMMU (0, 1, 2...)
-    // logAddr:  ÅŞ¿è¦ì§} (±q IoMap ºâ¥X¨Óªº)
-    // len:      ªø«×
-    // physAddr: ª«²z¦ì§} (0x1000, 0x1100...)
+    // è¼”åŠ©å‡½å¼ï¼šå¯«å…¥å–®ä¸€ FMMU è¨­å®š
+    // slaveIdx: å¾ç«™ç´¢å¼•
+    // fmmuIdx:  ç¬¬å¹¾è™Ÿ FMMU (0, 1, 2...)
+    // logAddr:  é‚è¼¯ä½å€ (å¾ IoMap ç®—å‡ºä¾†çš„)
+    // len:      é•·åº¦
+    // physAddr: ç‰©ç†ä½å€ (0x1000, 0x1100...)
     // type:     1=Read(Input), 2=Write(Output)
     uint8_t fmmu[16];
     memset(fmmu, 0, 16);
 
-    // ¶ñ¼g FMMU ¤º®e
+    // å¡«å¯« FMMU å…§å®¹
     fmmu[0] = logAddr & 0xFF;
     fmmu[1] = (logAddr >> 8) & 0xFF;
     fmmu[2] = (logAddr >> 16) & 0xFF;
@@ -1035,34 +1440,34 @@ int EtherCatMaster::WriteFmmuRegister(int slaveIdx, int fmmuIdx, uint32_t logAdd
 
     fmmu[12] = 0x01; // Enable FMMU
 
-    // ­pºâ FMMU ¼È¦s¾¹¦ì¸m: 0x0600 + (Index * 16)
+    // è¨ˆç®— FMMU æš«å­˜å™¨ä½ç½®: 0x0600 + (Index * 16)
     // FMMU0 = 0x0600, FMMU1 = 0x0610
     uint16_t regAddr = 0x0600 + (fmmuIdx * 16);
 
-    // --- ¥H¤U¬°­×§ï°Ï¶ô¡G¥[¤J WKC ÀË¬d»P­«¸Õ¾÷¨î ---
+    // --- ä»¥ä¸‹ç‚ºä¿®æ”¹å€å¡Šï¼šåŠ å…¥ WKC æª¢æŸ¥èˆ‡é‡è©¦æ©Ÿåˆ¶ ---
     int wkc = 0;
     int retry = 0;
-    const int MAX_RETRY = 5; // ³Ì¦h­«¸Õ 5 ¦¸
+    const int MAX_RETRY = 5; // æœ€å¤šé‡è©¦ 5 æ¬¡
 
-    // ¨Ï¥Î while °j°é½T«O¼g¤J¦¨¥\
+    // ä½¿ç”¨ while è¿´åœˆç¢ºä¿å¯«å…¥æˆåŠŸ
     while (retry < MAX_RETRY)
     {
-        // §ì¨ú ecx_APWR ªº¦^¶Ç­È (§Y WKC)
-        // °Ñ¼Æ¤¤ªº 20 ¬O Timeout¡A³q±`³æ¦ì¬O²@¬í(ms)©Î·L¬í(us)¡Aµø±zªº©³¼h API ¹ê§@¦Ó©w
+        // æŠ“å– ecx_APWR çš„å›å‚³å€¼ (å³ WKC)
+        // åƒæ•¸ä¸­çš„ 20 æ˜¯ Timeoutï¼Œé€šå¸¸å–®ä½æ˜¯æ¯«ç§’(ms)æˆ–å¾®ç§’(us)ï¼Œè¦–æ‚¨çš„åº•å±¤ API å¯¦ä½œè€Œå®š
         wkc = ecx_APWR(m_slaveInfo[slaveIdx].APRDAPWR_Addr, regAddr, 16, fmmu, timeout);
 
-        // ¹ï³æ¤@±q¯¸¼g¤J®É¡A­Y¦¨¥\¡AWKC ·|¤j©ó©Îµ¥©ó 1
+        // å°å–®ä¸€å¾ç«™å¯«å…¥æ™‚ï¼Œè‹¥æˆåŠŸï¼ŒWKC æœƒå¤§æ–¼æˆ–ç­‰æ–¼ 1
         if (wkc >= 1)
         {
-            break; // ¼g¤J¦¨¥\¡A¸õ¥X°j°é
+            break; // å¯«å…¥æˆåŠŸï¼Œè·³å‡ºè¿´åœˆ
         }
 
-        // ­Y WKC == 0¡A¥Nªí±q¯¸¨S¦¬¨ì©Î¨Ó¤£¤Î³B²z¡A·Ç³Æ­«¸Õ
+        // è‹¥ WKC == 0ï¼Œä»£è¡¨å¾ç«™æ²’æ”¶åˆ°æˆ–ä¾†ä¸åŠè™•ç†ï¼Œæº–å‚™é‡è©¦
         retry++;
-        Sleep(1); // µ¹¤©ºô¥d»P±q¯¸ 1 ²@¬íªº½w½Ä®É¶¡¦A­«¸Õ
+        Sleep(1); // çµ¦äºˆç¶²å¡èˆ‡å¾ç«™ 1 æ¯«ç§’çš„ç·©è¡æ™‚é–“å†é‡è©¦
     }
 
-    // ¨¾§b³B²z¡G¦pªG­«¸Õ 5 ¦¸³£¥¢±Ñ¡A¦L¥X¿ù»~°T®§¤è«K°£¿ù
+    // é˜²å‘†è™•ç†ï¼šå¦‚æœé‡è©¦ 5 æ¬¡éƒ½å¤±æ•—ï¼Œå°å‡ºéŒ¯èª¤è¨Šæ¯æ–¹ä¾¿é™¤éŒ¯
     if (wkc == 0)
     {
         //DEBUG_PRINT("[Error] FMMU Write Failed! Slave: %d, FMMU: %d\n", slaveIdx, fmmuIdx);
@@ -1072,7 +1477,8 @@ int EtherCatMaster::WriteFmmuRegister(int slaveIdx, int fmmuIdx, uint32_t logAdd
 
 }
 
-void EtherCatMaster::Printf_Slaves_State()//¦L¥X±q¯¸ª¬ºA
+/* åˆ—å°æ‰€æœ‰å¾ç«™ AL stateï¼›åƒ…ä¾›éå³æ™‚è¨ºæ–·ä½¿ç”¨ã€‚ */
+void EtherCatMaster::Printf_Slaves_State()
 {
     int WK = 0;
     const auto& slaves = m_pEni->GetSlaves();
@@ -1088,7 +1494,8 @@ void EtherCatMaster::Printf_Slaves_State()//¦L¥X±q¯¸ª¬ºA
     DEBUG_PRINT("--------------------------------\n");
 }
 
-void EtherCatMaster::Printf_AL_Status_Code()////¦L¥X±q¯¸ª¬ºA0x134 code
+/* åˆ—å° AL Status Code register 0x0134ï¼Œå”åŠ©å®šä½ç‹€æ…‹è½‰æ›éŒ¯èª¤ã€‚ */
+void EtherCatMaster::Printf_AL_Status_Code()
 {
     int WK = 0;
     const auto& slaves = m_pEni->GetSlaves();
@@ -1097,7 +1504,7 @@ void EtherCatMaster::Printf_AL_Status_Code()////¦L¥X±q¯¸ª¬ºA0x134 code
     for (int i = 0; i < total_slaves; i++)
     {
         uint16_t al_status_code = 0;
-        // Åª¨ú 0x0134 ¼È¦s¾¹ (AL Status Code)
+        // è®€å– 0x0134 æš«å­˜å™¨ (AL Status Code)
         int wkc = ecx_APRD(m_slaveInfo[i].APRDAPWR_Addr, 0x0134, 2, &al_status_code, 20);
 
         DEBUG_PRINT("State Code 0x134>>Slave>>0x%04X>>State Code>>0x%04X\n", m_slaveInfo[i].Product_Code, al_status_code);
@@ -1106,51 +1513,55 @@ void EtherCatMaster::Printf_AL_Status_Code()////¦L¥X±q¯¸ª¬ºA0x134 code
     DEBUG_PRINT("--------------------------------\n");
 }
 
-bool EtherCatMaster::PDO_SendCommandAndWait(EcatCmdType type, uint16_t slave, uint16_t index, uint8_t sub, uint32_t value, int len, int timeoutMs)//«D¦P¨B«ü¥Oµo°e»P¦P¨Bµ¥«İ (°õ¦æºü¦w¥ş«ü¥O)
+/*
+ * å°‡é PDO å‘½ä»¤äº¤çµ¦ PDO command channelï¼Œä¸¦ç­‰å¾…å®Œæˆæˆ– timeoutã€‚
+ * ç”¨ä¾†é¿å…ä¸€èˆ¬åŸ·è¡Œç·’ç›´æ¥èˆ‡ 4 kHz EtherCAT äº¤æ›æµç¨‹ç«¶çˆ­ NICã€‚
+ */
+bool EtherCatMaster::PDO_SendCommandAndWait(EcatCmdType type, uint16_t slave, uint16_t index, uint8_t sub, uint32_t value, int len, int timeoutMs)
 {
-    // 1. [Retry ¾÷¨î] ¦pªG RT ¥¿¦b¦£¤W¤@¥ó¨Æ¡A§Ú­Ìµyµ¥¤@¤U¡A¤£­nª½±µ³ø¿ù
+    // 1. [Retry æ©Ÿåˆ¶] å¦‚æœ RT æ­£åœ¨å¿™ä¸Šä¸€ä»¶äº‹ï¼Œæˆ‘å€‘ç¨ç­‰ä¸€ä¸‹ï¼Œä¸è¦ç›´æ¥å ±éŒ¯
     int retry = 0;
     while (m_asyncCmd.status != (int)EcatCmdStatus::ECAT_STATUS_IDLE && m_asyncCmd.status != (int)EcatCmdStatus::ECAT_STATUS_DONE)
     {
         Sleep(1);
         retry++;
         if (retry > 100)
-        { // µ¥¤F 100ms ÁÙ¦b¦£¡A¤~¯uªº©ñ±ó
+        { // ç­‰äº† 100ms é‚„åœ¨å¿™ï¼Œæ‰çœŸçš„æ”¾æ£„
             DEBUG_PRINT("[Timeout] RT Layer is busy.\n");
             return false;
         }
     }
 
-    // 2. [¶ñ¼g­q³æ]
+    // 2. [å¡«å¯«è¨‚å–®]
     m_asyncCmd.type = (int)type;
     m_asyncCmd.slaveAddr = slave;
     m_asyncCmd.index = index;
     m_asyncCmd.subIndex = sub;
     m_asyncCmd.dataValue = value;
 
-    // [­×¥¿ÂI 2] ¤£­n¼g¦º 4¡A¦Ó¬O¨Ï¥Î¶Ç¤Jªº len
+    // [ä¿®æ­£é» 2] ä¸è¦å¯«æ­» 4ï¼Œè€Œæ˜¯ä½¿ç”¨å‚³å…¥çš„ len
     m_asyncCmd.dataSize = len;
 
-    // ²M°£ÂÂµ²ªG
+    // æ¸…é™¤èˆŠçµæœ
     m_asyncCmd.resultWKC = 0;
 
-    // 3. [µo®g] (Thread Barrier)
+    // 3. [ç™¼å°„] (Thread Barrier)
     //std::atomic_thread_fence(std::memory_order_release);
     m_asyncCmd.status = (int)EcatCmdStatus::ECAT_STATUS_PENDING;
 
-    // 4. [¦P¨Bµ¥«İ] (³o¬O°Ó·~³nÅé³ÌÃöÁäªº¤@¨B)
-    // §Ú­Ì¤£¯à®g«á¤£²z¡AUI ·|¥d¦b³o¸Ìµ¥µ²ªG (Blocking Call)
+    // 4. [åŒæ­¥ç­‰å¾…] (é€™æ˜¯å•†æ¥­è»Ÿé«”æœ€é—œéµçš„ä¸€æ­¥)
+    // æˆ‘å€‘ä¸èƒ½å°„å¾Œä¸ç†ï¼ŒUI æœƒå¡åœ¨é€™è£¡ç­‰çµæœ (Blocking Call)
     auto startTime = GetTickCount64();
 
     while (true)
     {
-        // ÀË¬d RT ¬O§_°µ§¹¤F (DONE)
+        // æª¢æŸ¥ RT æ˜¯å¦åšå®Œäº† (DONE)
         if (m_asyncCmd.status == (int)EcatCmdStatus::ECAT_STATUS_DONE)
         {
-            // ÀË¬dµ²ªG¡GWKC > 0 ¤~ºâ¦¨¥\
+            // æª¢æŸ¥çµæœï¼šWKC > 0 æ‰ç®—æˆåŠŸ
             if (m_asyncCmd.resultWKC > 0)
             {
-                m_asyncCmd.status = (int)EcatCmdStatus::ECAT_STATUS_IDLE; // ­«¸m¡A·Ç³Æ±µ¤U¤@³æ
+                m_asyncCmd.status = (int)EcatCmdStatus::ECAT_STATUS_IDLE; // é‡ç½®ï¼Œæº–å‚™æ¥ä¸‹ä¸€å–®
                 return true;
             }
             else
@@ -1161,15 +1572,15 @@ bool EtherCatMaster::PDO_SendCommandAndWait(EcatCmdType type, uint16_t slave, ui
             }
         }
 
-        // ÀË¬d¶W®É
+        // æª¢æŸ¥è¶…æ™‚
         if (GetTickCount64() - startTime > timeoutMs)
         {
             DEBUG_PRINT("[Timeout] Cmd Ignored by RT Layer!\n");
-            m_asyncCmd.status = (int)EcatCmdStatus::ECAT_STATUS_IDLE; // ±j¨î­«¸m
+            m_asyncCmd.status = (int)EcatCmdStatus::ECAT_STATUS_IDLE; // å¼·åˆ¶é‡ç½®
             return false;
         }
 
-        Sleep(1); // Åı¥X CPU
+        Sleep(1); // è®“å‡º CPU
     }
 
 }
@@ -1177,28 +1588,29 @@ bool EtherCatMaster::PDO_SendCommandAndWait(EcatCmdType type, uint16_t slave, ui
 
 
 
-void EtherCatMaster::Get_TotalSlave_WKC_Count()//¨ú±o±q¯¸WKC ¤À¼Æ
+/* è¨ˆç®—ç›®å‰æ‹“æ’²é æœŸ LRW/DC WKCï¼Œä¾›æ¯é€±æœŸå®Œæ•´æ€§æª¢æŸ¥ã€‚ */
+void EtherCatMaster::Get_TotalSlave_WKC_Count()
 {
-    //WKC §PÂ_-----------------------------------------------
+    //WKC åˆ¤æ–·-----------------------------------------------
     const auto& slaves = m_pEni->GetSlaves();
     int total_slaves = (int)slaves.size();
     for (int i = 0; i < total_slaves; i++)
     {
         int slaveWKC = 0;
 
-        // ÀË¬d¬O§_¦³ Input (TxPDO)
+        // æª¢æŸ¥æ˜¯å¦æœ‰ Input (TxPDO)
         if (slaves[i].inputBitLength > 0)
         {
             slaveWKC += 1;
         }
 
-        // ÀË¬d¬O§_¦³ Output (RxPDO)
+        // æª¢æŸ¥æ˜¯å¦æœ‰ Output (RxPDO)
         if (slaves[i].outputBitLength > 0)
         {
             slaveWKC += 2;
         }
 
-        // ²Ö¥[¨ìÁ`¤À
+        // ç´¯åŠ åˆ°ç¸½åˆ†
         EXPECTED_WKC_PDO += slaveWKC;
 
         // 
@@ -1208,6 +1620,4348 @@ void EtherCatMaster::Get_TotalSlave_WKC_Count()//¨ú±o±q¯¸WKC ¤À¼Æ
 
     TotalSlave_WKC_Count = EXPECTED_WKC_PDO;
     DEBUG_PRINT("TotalSlave_WKC_Count>>%d\n", TotalSlave_WKC_Count);
+}
+
+/* è®€å–å„å¾ç«™ DC receive-port timestampï¼Œä½œç‚º propagation delay è¨ˆç®—è¼¸å…¥ã€‚ */
+void EtherCatMaster::MeasureDCPortTimestamps()
+{
+    // =========================================================
+    // EtherCAT DC Port Timestamp + Link Status Measurement
+    //
+    // Diagnostic Only
+    //
+    // ç›®çš„ï¼š
+    //
+    // 1. BWR 0x0900
+    //    è§¸ç™¼æ‰€æœ‰ ESC è¨˜éŒ„ Port Receive Timestamp
+    //
+    // 2. æ¯é¡† Slave è®€ï¼š
+    //
+    //    0x0900 ~ 0x090F
+    //
+    //    Port 0 = 0x0900 ~ 0x0903
+    //    Port 1 = 0x0904 ~ 0x0907
+    //    Port 2 = 0x0908 ~ 0x090B
+    //    Port 3 = 0x090C ~ 0x090F
+    //
+    // 3. æ¯é¡† Slave å†è®€ï¼š
+    //
+    //    0x0110 ~ 0x0111
+    //
+    //    EtherCAT DL Status
+    //
+    // 4. ç›®å‰åªåš Diagnostic
+    //
+    // å°šæœªï¼š
+    //
+    // - è¨ˆç®— Propagation Delay
+    // - å¯«å…¥ 0x0928
+    // =========================================================
+
+
+    // ---------------------------------------------------------
+    // Safety
+    // ---------------------------------------------------------
+    if (m_pEni == nullptr)
+    {
+        RtPrintf(
+            "[DC-TS] ERROR: ENI not initialized.\n");
+
+        return;
+    }
+
+
+    const auto& slaves =
+        m_pEni->GetSlaves();
+
+
+    int totalSlaves =
+        (int)slaves.size();
+
+
+    if (totalSlaves <= 0)
+    {
+        RtPrintf(
+            "[DC-TS] ERROR: No EtherCAT slaves.\n");
+
+        return;
+    }
+
+
+    RtPrintf(
+        "\n"
+        "============================================================\n"
+        "[DC-TS] Starting DC Port Timestamp Measurement\n"
+        "============================================================\n");
+
+
+    // =========================================================
+    // Step 1
+    //
+    // Broadcast Write 0x0900
+    //
+    // è§¸ç™¼æ‰€æœ‰ ESC Latch Receive Timestamp
+    // =========================================================
+
+    uint32_t dcTimestampTrigger =
+        0;
+
+
+    int dcTimestampBwrWkc =
+        ecx_BWR(
+            0x0000,
+            0x0900,
+            4,
+            &dcTimestampTrigger,
+            20);
+
+
+    RtPrintf(
+        "[DC-TS] BWR 0x0900 WKC:%d\n",
+        dcTimestampBwrWkc);
+
+
+    if (dcTimestampBwrWkc <= 0)
+    {
+        RtPrintf(
+            "[DC-TS] ERROR: Timestamp trigger failed.\n");
+
+
+        RtPrintf(
+            "============================================================\n"
+            "[DC-TS] Timestamp Measurement FAILED\n"
+            "============================================================\n\n");
+
+
+        return;
+    }
+
+
+    // =========================================================
+    // Step 2
+    //
+    // æ¯é¡† Slaveï¼š
+    //
+    // A. Read DC Port Timestamp
+    // B. Read DL Status
+    // =========================================================
+
+    for (int slaveIndex = 0;
+        slaveIndex < totalSlaves;
+        slaveIndex++)
+    {
+        // =====================================================
+        // A. DC Port Receive Timestamp
+        // =====================================================
+
+        uint32_t dcPortTimestamp[4] =
+        {
+            0,
+            0,
+            0,
+            0
+        };
+
+
+        int dcTimestampReadWkc =
+            ecx_FPRD(
+                m_slaveInfo[slaveIndex].configAddr,
+                0x0900,
+                dcPortTimestamp,
+                16,
+                20);
+
+
+        if (dcTimestampReadWkc > 0)
+        {
+            // -------------------------------------------------
+            // Decimal
+            // -------------------------------------------------
+            RtPrintf(
+                "[DC-TS] Slave:%d "
+                "Cfg:0x%04X "
+                "WKC:%d | "
+                "P0:%u "
+                "P1:%u "
+                "P2:%u "
+                "P3:%u\n",
+
+                slaveIndex,
+
+                (unsigned int)
+                m_slaveInfo[slaveIndex].configAddr,
+
+                dcTimestampReadWkc,
+
+                (unsigned int)
+                dcPortTimestamp[0],
+
+                (unsigned int)
+                dcPortTimestamp[1],
+
+                (unsigned int)
+                dcPortTimestamp[2],
+
+                (unsigned int)
+                dcPortTimestamp[3]);
+
+
+            // -------------------------------------------------
+            // Hex
+            // -------------------------------------------------
+            RtPrintf(
+                "[DC-TS-HEX] Slave:%d | "
+                "P0:0x%08X "
+                "P1:0x%08X "
+                "P2:0x%08X "
+                "P3:0x%08X\n",
+
+                slaveIndex,
+
+                (unsigned int)
+                dcPortTimestamp[0],
+
+                (unsigned int)
+                dcPortTimestamp[1],
+
+                (unsigned int)
+                dcPortTimestamp[2],
+
+                (unsigned int)
+                dcPortTimestamp[3]);
+        }
+        else
+        {
+            RtPrintf(
+                "[DC-TS] Slave:%d "
+                "Cfg:0x%04X "
+                "READ FAILED WKC:%d\n",
+
+                slaveIndex,
+
+                (unsigned int)
+                m_slaveInfo[slaveIndex].configAddr,
+
+                dcTimestampReadWkc);
+        }
+
+
+        // =====================================================
+        // B. EtherCAT DL Status
+        //
+        // Register:
+        //
+        // 0x0110 ~ 0x0111
+        //
+        // Bit 4  = Physical Link Port 0
+        // Bit 5  = Physical Link Port 1
+        // Bit 6  = Physical Link Port 2
+        // Bit 7  = Physical Link Port 3
+        //
+        // Bit 8  = Loop Port 0
+        // Bit 9  = Communication Port 0
+        //
+        // Bit 10 = Loop Port 1
+        // Bit 11 = Communication Port 1
+        //
+        // Bit 12 = Loop Port 2
+        // Bit 13 = Communication Port 2
+        //
+        // Bit 14 = Loop Port 3
+        // Bit 15 = Communication Port 3
+        //
+        // Loop:
+        // 0 = Open
+        // 1 = Closed
+        //
+        // Communication:
+        // 0 = No stable communication
+        // 1 = Communication established
+        // =====================================================
+
+        uint16_t dlStatus =
+            0;
+
+
+        int dlStatusWkc =
+            ecx_FPRD(
+                m_slaveInfo[slaveIndex].configAddr,
+                0x0110,
+                &dlStatus,
+                2,
+                20);
+
+
+        if (dlStatusWkc > 0)
+        {
+            // -------------------------------------------------
+            // Physical Link
+            // -------------------------------------------------
+
+            bool linkP0 =
+                (dlStatus & (1U << 4)) != 0;
+
+            bool linkP1 =
+                (dlStatus & (1U << 5)) != 0;
+
+            bool linkP2 =
+                (dlStatus & (1U << 6)) != 0;
+
+            bool linkP3 =
+                (dlStatus & (1U << 7)) != 0;
+
+
+            // -------------------------------------------------
+            // Loop
+            //
+            // 0 = Open
+            // 1 = Closed
+            // -------------------------------------------------
+
+            bool closedP0 =
+                (dlStatus & (1U << 8)) != 0;
+
+            bool closedP1 =
+                (dlStatus & (1U << 10)) != 0;
+
+            bool closedP2 =
+                (dlStatus & (1U << 12)) != 0;
+
+            bool closedP3 =
+                (dlStatus & (1U << 14)) != 0;
+
+
+            // -------------------------------------------------
+            // Communication
+            // -------------------------------------------------
+
+            bool commP0 =
+                (dlStatus & (1U << 9)) != 0;
+
+            bool commP1 =
+                (dlStatus & (1U << 11)) != 0;
+
+            bool commP2 =
+                (dlStatus & (1U << 13)) != 0;
+
+            bool commP3 =
+                (dlStatus & (1U << 15)) != 0;
+
+
+            RtPrintf(
+                "[DC-LINK] Slave:%d "
+                "DL:0x%04X "
+                "WKC:%d | "
+                "P0[L:%d C:%d Loop:%s] "
+                "P1[L:%d C:%d Loop:%s] "
+                "P2[L:%d C:%d Loop:%s] "
+                "P3[L:%d C:%d Loop:%s]\n",
+
+                slaveIndex,
+
+                (unsigned int)
+                dlStatus,
+
+                dlStatusWkc,
+
+                linkP0 ? 1 : 0,
+                commP0 ? 1 : 0,
+                closedP0 ? "Closed" : "Open",
+
+                linkP1 ? 1 : 0,
+                commP1 ? 1 : 0,
+                closedP1 ? "Closed" : "Open",
+
+                linkP2 ? 1 : 0,
+                commP2 ? 1 : 0,
+                closedP2 ? "Closed" : "Open",
+
+                linkP3 ? 1 : 0,
+                commP3 ? 1 : 0,
+                closedP3 ? "Closed" : "Open");
+        }
+        else
+        {
+            RtPrintf(
+                "[DC-LINK] Slave:%d "
+                "Cfg:0x%04X "
+                "READ FAILED WKC:%d\n",
+
+                slaveIndex,
+
+                (unsigned int)
+                m_slaveInfo[slaveIndex].configAddr,
+
+                dlStatusWkc);
+        }
+    }
+
+
+    RtPrintf(
+        "============================================================\n"
+        "[DC-TS] Timestamp Measurement Finished\n"
+        "============================================================\n\n");
+}
+
+/*
+ * æ ¹æ“š DC port timestamps èˆ‡æ‹“æ’²æ–¹å‘ä¼°ç®—å–®ä¸€å¾ç«™çš„ propagation delayã€‚
+ * å›å‚³ false è¡¨ç¤ºæ¨£æœ¬ç„¡æ•ˆæˆ–æš«å­˜å™¨è®€å–å¤±æ•—ï¼Œä¸æ‡‰å¥—ç”¨è©²æ¬¡çµæœã€‚
+ */
+bool EtherCatMaster::MeasureDCPropagationDelay(
+    uint32_t& delaySlave4,
+    uint32_t& delaySlave5,
+    uint32_t& delaySlave6)
+{
+    // =========================================================
+    // EtherCAT DC Propagation Delay Measurement
+    //
+    // Current confirmed topology:
+    //
+    //                  +-- Slave1 -- Slave2 -- Slave3
+    // Master -- Slave0 |
+    //                  +-- Slave4 -- Slave5 -- Slave6
+    //                      ^
+    //                      |
+    //                  Reference Clock
+    //
+    //
+    // åŠŸèƒ½ï¼š
+    //
+    // 1. é‡è¤‡é‡æ¸¬ 10 æ¬¡
+    // 2. æ ¹æ“š Port Timestamp è¨ˆç®— propagation delay
+    // 3. ä¿ç•™æ‰€æœ‰æœ‰æ•ˆ sample
+    // 4. ä½¿ç”¨ Median é¸å‡ºç©©å®šçµæœ
+    // 5. å°‡çµæœç”± reference parameter å‚³å›
+    //
+    // æ³¨æ„ï¼š
+    //
+    // æœ¬å‡½å¼åªè¨ˆç®—ã€‚
+    // ä¸å¯« 0x0928ã€‚
+    // =========================================================
+
+
+    // ---------------------------------------------------------
+    // Default output
+    // ---------------------------------------------------------
+    delaySlave4 = 0;
+    delaySlave5 = 0;
+    delaySlave6 = 0;
+
+
+    // ---------------------------------------------------------
+    // Safety
+    // ---------------------------------------------------------
+    if (m_pEni == nullptr)
+    {
+        RtPrintf(
+            "[DC-DELAY] ERROR: ENI not initialized.\n");
+
+        return false;
+    }
+
+
+    const auto& slaves =
+        m_pEni->GetSlaves();
+
+
+    int totalSlaves =
+        (int)slaves.size();
+
+
+    if (totalSlaves < 7)
+    {
+        RtPrintf(
+            "[DC-DELAY] ERROR: Current topology requires Slave0~Slave6.\n");
+
+        return false;
+    }
+
+
+    // =========================================================
+    // Current topology constants
+    //
+    // ç›®å‰å…ˆæ˜ç¢ºç¶å®šä½ çš„ EDM_SINKER_MODEã€‚
+    //
+    // å¾Œé¢å†é€²ä¸€æ­¥ Generic åŒ–ã€‚
+    // =========================================================
+
+    const int SLAVE_BRANCH =
+        0;
+
+    const int SLAVE_REF =
+        4;
+
+    const int SLAVE_SERVO_2 =
+        5;
+
+    const int SLAVE_SERVO_3 =
+        6;
+
+
+    // =========================================================
+    // Step 1
+    //
+    // Validate topology using DL Status 0x0110
+    // =========================================================
+
+    uint16_t dlStatus0 = 0;
+    uint16_t dlStatus4 = 0;
+    uint16_t dlStatus5 = 0;
+    uint16_t dlStatus6 = 0;
+
+
+    int wkcDl0 =
+        ecx_FPRD(
+            m_slaveInfo[SLAVE_BRANCH].configAddr,
+            0x0110,
+            &dlStatus0,
+            2,
+            20);
+
+
+    int wkcDl4 =
+        ecx_FPRD(
+            m_slaveInfo[SLAVE_REF].configAddr,
+            0x0110,
+            &dlStatus4,
+            2,
+            20);
+
+
+    int wkcDl5 =
+        ecx_FPRD(
+            m_slaveInfo[SLAVE_SERVO_2].configAddr,
+            0x0110,
+            &dlStatus5,
+            2,
+            20);
+
+
+    int wkcDl6 =
+        ecx_FPRD(
+            m_slaveInfo[SLAVE_SERVO_3].configAddr,
+            0x0110,
+            &dlStatus6,
+            2,
+            20);
+
+
+    if (wkcDl0 <= 0 ||
+        wkcDl4 <= 0 ||
+        wkcDl5 <= 0 ||
+        wkcDl6 <= 0)
+    {
+        RtPrintf(
+            "[DC-DELAY] ERROR: Failed to read DL Status.\n");
+
+        return false;
+    }
+
+
+    // =========================================================
+    // Physical Link bits
+    //
+    // Bit4 = P0
+    // Bit5 = P1
+    // Bit6 = P2
+    // Bit7 = P3
+    // =========================================================
+
+    bool s0p1 =
+        (dlStatus0 & (1U << 5)) != 0;
+
+    bool s0p2 =
+        (dlStatus0 & (1U << 6)) != 0;
+
+
+    bool s4p0 =
+        (dlStatus4 & (1U << 4)) != 0;
+
+    bool s4p1 =
+        (dlStatus4 & (1U << 5)) != 0;
+
+
+    bool s5p0 =
+        (dlStatus5 & (1U << 4)) != 0;
+
+    bool s5p1 =
+        (dlStatus5 & (1U << 5)) != 0;
+
+
+    bool s6p0 =
+        (dlStatus6 & (1U << 4)) != 0;
+
+    bool s6p1 =
+        (dlStatus6 & (1U << 5)) != 0;
+
+
+    // ---------------------------------------------------------
+    // Expected Servo branch:
+    //
+    // Slave0 P2
+    //    â†“
+    // Slave4
+    //    â†“
+    // Slave5
+    //    â†“
+    // Slave6 End Point
+    // ---------------------------------------------------------
+
+    if (!s0p1 ||
+        !s0p2 ||
+        !s4p0 ||
+        !s4p1 ||
+        !s5p0 ||
+        !s5p1 ||
+        !s6p0 ||
+        s6p1)
+    {
+        RtPrintf(
+            "[DC-DELAY] ERROR: Servo branch topology mismatch.\n");
+
+        RtPrintf(
+            "[DC-DELAY] DL S0:0x%04X "
+            "S4:0x%04X "
+            "S5:0x%04X "
+            "S6:0x%04X\n",
+            (unsigned int)dlStatus0,
+            (unsigned int)dlStatus4,
+            (unsigned int)dlStatus5,
+            (unsigned int)dlStatus6);
+
+        return false;
+    }
+
+
+    RtPrintf(
+        "\n"
+        "============================================================\n"
+        "[DC-DELAY] Starting Propagation Delay Measurement\n"
+        "============================================================\n");
+
+
+    // =========================================================
+    // Measurement configuration
+    // =========================================================
+
+    const int MEASURE_COUNT =
+        10;
+
+
+    // è‡³å°‘ä¸€åŠä»¥ä¸Š Sample æœ‰æ•ˆæ‰æ¥å—çµæœã€‚
+    const int MIN_VALID_SAMPLES =
+        5;
+
+
+    // =========================================================
+    // Sample storage
+    //
+    // ä½¿ç”¨å›ºå®šé™£åˆ—ï¼Œé¿å…å‹•æ…‹ allocationã€‚
+    // =========================================================
+
+    uint32_t sampleLink04[MEASURE_COUNT] =
+    {
+        0
+    };
+
+    uint32_t sampleLink45[MEASURE_COUNT] =
+    {
+        0
+    };
+
+    uint32_t sampleLink56[MEASURE_COUNT] =
+    {
+        0
+    };
+
+    uint32_t sampleDelay5[MEASURE_COUNT] =
+    {
+        0
+    };
+
+    uint32_t sampleDelay6[MEASURE_COUNT] =
+    {
+        0
+    };
+
+
+    int validSamples =
+        0;
+
+
+    // =========================================================
+    // Statistics
+    // =========================================================
+
+    uint64_t sumLink04 = 0;
+    uint64_t sumLink45 = 0;
+    uint64_t sumLink56 = 0;
+
+    uint64_t sumDelay5 = 0;
+    uint64_t sumDelay6 = 0;
+
+
+    uint32_t minLink04 =
+        0xFFFFFFFFU;
+
+    uint32_t maxLink04 =
+        0;
+
+
+    uint32_t minLink45 =
+        0xFFFFFFFFU;
+
+    uint32_t maxLink45 =
+        0;
+
+
+    uint32_t minLink56 =
+        0xFFFFFFFFU;
+
+    uint32_t maxLink56 =
+        0;
+
+
+    uint32_t minDelay5 =
+        0xFFFFFFFFU;
+
+    uint32_t maxDelay5 =
+        0;
+
+
+    uint32_t minDelay6 =
+        0xFFFFFFFFU;
+
+    uint32_t maxDelay6 =
+        0;
+
+
+    // =========================================================
+    // Step 2
+    //
+    // Repeated measurements
+    // =========================================================
+
+    for (int sampleIndex = 0;
+        sampleIndex < MEASURE_COUNT;
+        sampleIndex++)
+    {
+        // -----------------------------------------------------
+        // Trigger fresh DC Receive Timestamp latch
+        // -----------------------------------------------------
+
+        uint32_t trigger =
+            0;
+
+
+        int triggerWkc =
+            ecx_BWR(
+                0x0000,
+                0x0900,
+                4,
+                &trigger,
+                20);
+
+
+        if (triggerWkc <= 0)
+        {
+            RtPrintf(
+                "[DC-DELAY] Sample:%d "
+                "Trigger FAILED WKC:%d\n",
+                sampleIndex,
+                triggerWkc);
+
+            continue;
+        }
+
+
+        // =====================================================
+        // Read required Port timestamps
+        // =====================================================
+
+        uint32_t ts0[4] =
+        {
+            0, 0, 0, 0
+        };
+
+
+        uint32_t ts4[4] =
+        {
+            0, 0, 0, 0
+        };
+
+
+        uint32_t ts5[4] =
+        {
+            0, 0, 0, 0
+        };
+
+
+        int wkc0 =
+            ecx_FPRD(
+                m_slaveInfo[SLAVE_BRANCH].configAddr,
+                0x0900,
+                ts0,
+                16,
+                20);
+
+
+        int wkc4 =
+            ecx_FPRD(
+                m_slaveInfo[SLAVE_REF].configAddr,
+                0x0900,
+                ts4,
+                16,
+                20);
+
+
+        int wkc5 =
+            ecx_FPRD(
+                m_slaveInfo[SLAVE_SERVO_2].configAddr,
+                0x0900,
+                ts5,
+                16,
+                20);
+
+
+        if (wkc0 <= 0 ||
+            wkc4 <= 0 ||
+            wkc5 <= 0)
+        {
+            RtPrintf(
+                "[DC-DELAY] Sample:%d "
+                "READ FAILED "
+                "S0:%d S4:%d S5:%d\n",
+                sampleIndex,
+                wkc0,
+                wkc4,
+                wkc5);
+
+            continue;
+        }
+
+
+        // =====================================================
+        // Step 3
+        //
+        // Round-trip intervals
+        //
+        // åªä½¿ç”¨ã€ŒåŒä¸€é¡† ESCã€çš„ timestamp differenceã€‚
+        //
+        // uint32_t subtraction ä¹Ÿèƒ½è‡ªç„¶è™•ç†
+        // 32-bit timestamp wrap-aroundã€‚
+        // =====================================================
+
+
+        // Slave0 P1 -> P2
+        //
+        // Servo branch total round-trip interval
+        uint32_t branchRoundTrip =
+            ts0[2] -
+            ts0[1];
+
+
+        // Slave4 P0 -> P1
+        //
+        // Slave4 downstream subtree
+        uint32_t slave4RoundTrip =
+            ts4[1] -
+            ts4[0];
+
+
+        // Slave5 P0 -> P1
+        //
+        // Slave5 downstream subtree
+        uint32_t slave5RoundTrip =
+            ts5[1] -
+            ts5[0];
+
+
+        // =====================================================
+        // Sanity check
+        // =====================================================
+
+        if (branchRoundTrip <
+            slave4RoundTrip)
+        {
+            RtPrintf(
+                "[DC-DELAY] Sample:%d INVALID "
+                "BranchRT:%u < S4RT:%u\n",
+                sampleIndex,
+                (unsigned int)branchRoundTrip,
+                (unsigned int)slave4RoundTrip);
+
+            continue;
+        }
+
+
+        if (slave4RoundTrip <
+            slave5RoundTrip)
+        {
+            RtPrintf(
+                "[DC-DELAY] Sample:%d INVALID "
+                "S4RT:%u < S5RT:%u\n",
+                sampleIndex,
+                (unsigned int)slave4RoundTrip,
+                (unsigned int)slave5RoundTrip);
+
+            continue;
+        }
+
+
+        // =====================================================
+        // Step 4
+        //
+        // One-way Link Delay
+        // =====================================================
+
+        uint32_t link04 =
+            (branchRoundTrip -
+                slave4RoundTrip)
+            / 2U;
+
+
+        uint32_t link45 =
+            (slave4RoundTrip -
+                slave5RoundTrip)
+            / 2U;
+
+
+        uint32_t link56 =
+            slave5RoundTrip /
+            2U;
+
+
+        // =====================================================
+        // Delay relative to Reference Slave4
+        // =====================================================
+
+        uint32_t currentDelay5 =
+            link45;
+
+
+        uint32_t currentDelay6 =
+            link45 +
+            link56;
+
+
+        // =====================================================
+        // Store sample
+        // =====================================================
+
+        sampleLink04[validSamples] =
+            link04;
+
+        sampleLink45[validSamples] =
+            link45;
+
+        sampleLink56[validSamples] =
+            link56;
+
+        sampleDelay5[validSamples] =
+            currentDelay5;
+
+        sampleDelay6[validSamples] =
+            currentDelay6;
+
+
+        // =====================================================
+        // Statistics
+        // =====================================================
+
+        sumLink04 +=
+            link04;
+
+        sumLink45 +=
+            link45;
+
+        sumLink56 +=
+            link56;
+
+        sumDelay5 +=
+            currentDelay5;
+
+        sumDelay6 +=
+            currentDelay6;
+
+
+        if (link04 < minLink04)
+            minLink04 = link04;
+
+        if (link04 > maxLink04)
+            maxLink04 = link04;
+
+
+        if (link45 < minLink45)
+            minLink45 = link45;
+
+        if (link45 > maxLink45)
+            maxLink45 = link45;
+
+
+        if (link56 < minLink56)
+            minLink56 = link56;
+
+        if (link56 > maxLink56)
+            maxLink56 = link56;
+
+
+        if (currentDelay5 < minDelay5)
+            minDelay5 = currentDelay5;
+
+        if (currentDelay5 > maxDelay5)
+            maxDelay5 = currentDelay5;
+
+
+        if (currentDelay6 < minDelay6)
+            minDelay6 = currentDelay6;
+
+        if (currentDelay6 > maxDelay6)
+            maxDelay6 = currentDelay6;
+
+
+        validSamples++;
+
+
+        // =====================================================
+        // Log
+        // =====================================================
+
+        RtPrintf(
+            "[DC-DELAY] Sample:%d | "
+            "RT Branch:%u S4:%u S5:%u | "
+            "Link 0-4:%u 4-5:%u 5-6:%u | "
+            "RefDelay S4:0 S5:%u S6:%u ns\n",
+
+            sampleIndex,
+
+            (unsigned int)branchRoundTrip,
+            (unsigned int)slave4RoundTrip,
+            (unsigned int)slave5RoundTrip,
+
+            (unsigned int)link04,
+            (unsigned int)link45,
+            (unsigned int)link56,
+
+            (unsigned int)currentDelay5,
+            (unsigned int)currentDelay6);
+    }
+
+
+    // =========================================================
+    // Step 5
+    //
+    // Validate measurement quality
+    // =========================================================
+
+    if (validSamples <
+        MIN_VALID_SAMPLES)
+    {
+        RtPrintf(
+            "[DC-DELAY] ERROR: "
+            "Only %d / %d valid samples.\n",
+            validSamples,
+            MEASURE_COUNT);
+
+
+        RtPrintf(
+            "============================================================\n"
+            "[DC-DELAY] Measurement FAILED\n"
+            "============================================================\n\n");
+
+
+        return false;
+    }
+
+
+    // =========================================================
+    // Step 6
+    //
+    // Average - Diagnostic only
+    // =========================================================
+
+    uint32_t avgLink04 =
+        (uint32_t)(
+            sumLink04 /
+            (uint64_t)validSamples);
+
+
+    uint32_t avgLink45 =
+        (uint32_t)(
+            sumLink45 /
+            (uint64_t)validSamples);
+
+
+    uint32_t avgLink56 =
+        (uint32_t)(
+            sumLink56 /
+            (uint64_t)validSamples);
+
+
+    uint32_t avgDelay5 =
+        (uint32_t)(
+            sumDelay5 /
+            (uint64_t)validSamples);
+
+
+    uint32_t avgDelay6 =
+        (uint32_t)(
+            sumDelay6 /
+            (uint64_t)validSamples);
+
+
+    // =========================================================
+    // Step 7
+    //
+    // Sort samples for Median
+    //
+    // åªæœ‰æœ€å¤š 10 ç­†ï¼Œ
+    // ç”¨ç°¡å–®æ’åºå³å¯ï¼Œä¸éœ€è¦ STL / allocationã€‚
+    // =========================================================
+
+    for (int i = 0;
+        i < validSamples - 1;
+        i++)
+    {
+        for (int j = i + 1;
+            j < validSamples;
+            j++)
+        {
+            if (sampleDelay5[j] <
+                sampleDelay5[i])
+            {
+                uint32_t temp =
+                    sampleDelay5[i];
+
+                sampleDelay5[i] =
+                    sampleDelay5[j];
+
+                sampleDelay5[j] =
+                    temp;
+            }
+
+
+            if (sampleDelay6[j] <
+                sampleDelay6[i])
+            {
+                uint32_t temp =
+                    sampleDelay6[i];
+
+                sampleDelay6[i] =
+                    sampleDelay6[j];
+
+                sampleDelay6[j] =
+                    temp;
+            }
+        }
+    }
+
+
+    // =========================================================
+    // Step 8
+    //
+    // Median
+    // =========================================================
+
+    uint32_t medianDelay5 =
+        0;
+
+
+    uint32_t medianDelay6 =
+        0;
+
+
+    if ((validSamples % 2) != 0)
+    {
+        // Odd number
+        int middle =
+            validSamples / 2;
+
+
+        medianDelay5 =
+            sampleDelay5[middle];
+
+
+        medianDelay6 =
+            sampleDelay6[middle];
+    }
+    else
+    {
+        // Even number
+        int upper =
+            validSamples / 2;
+
+        int lower =
+            upper - 1;
+
+
+        medianDelay5 =
+            (uint32_t)(
+                (
+                    (uint64_t)sampleDelay5[lower] +
+                    (uint64_t)sampleDelay5[upper]
+                    )
+                / 2ULL);
+
+
+        medianDelay6 =
+            (uint32_t)(
+                (
+                    (uint64_t)sampleDelay6[lower] +
+                    (uint64_t)sampleDelay6[upper]
+                    )
+                / 2ULL);
+    }
+
+
+    // =========================================================
+    // Step 9
+    //
+    // Final selected values
+    //
+    // Reference Slave = 4
+    // =========================================================
+
+    delaySlave4 =
+        0;
+
+
+    delaySlave5 =
+        medianDelay5;
+
+
+    delaySlave6 =
+        medianDelay6;
+
+
+    // =========================================================
+    // Statistics Print
+    // =========================================================
+
+    RtPrintf(
+        "\n"
+        "[DC-DELAY-STAT] Valid Samples:%d / %d\n",
+        validSamples,
+        MEASURE_COUNT);
+
+
+    RtPrintf(
+        "[DC-DELAY-STAT] Link S0->S4 "
+        "Avg:%u Min:%u Max:%u ns\n",
+        (unsigned int)avgLink04,
+        (unsigned int)minLink04,
+        (unsigned int)maxLink04);
+
+
+    RtPrintf(
+        "[DC-DELAY-STAT] Link S4->S5 "
+        "Avg:%u Min:%u Max:%u ns\n",
+        (unsigned int)avgLink45,
+        (unsigned int)minLink45,
+        (unsigned int)maxLink45);
+
+
+    RtPrintf(
+        "[DC-DELAY-STAT] Link S5->S6 "
+        "Avg:%u Min:%u Max:%u ns\n",
+        (unsigned int)avgLink56,
+        (unsigned int)minLink56,
+        (unsigned int)maxLink56);
+
+
+    RtPrintf(
+        "[DC-DELAY-STAT] Reference Slave4 | "
+        "S4:0 ns | "
+        "S5 Avg:%u Min:%u Max:%u | "
+        "S6 Avg:%u Min:%u Max:%u ns\n",
+
+        (unsigned int)avgDelay5,
+        (unsigned int)minDelay5,
+        (unsigned int)maxDelay5,
+
+        (unsigned int)avgDelay6,
+        (unsigned int)minDelay6,
+        (unsigned int)maxDelay6);
+
+
+    // =========================================================
+    // â˜… Actual result that will be written to 0x0928
+    // =========================================================
+
+    RtPrintf(
+        "[DC-DELAY-RESULT] "
+        "Median Selected | "
+        "S4:%u ns "
+        "S5:%u ns "
+        "S6:%u ns\n",
+
+        (unsigned int)delaySlave4,
+        (unsigned int)delaySlave5,
+        (unsigned int)delaySlave6);
+
+
+    RtPrintf(
+        "============================================================\n"
+        "[DC-DELAY] Propagation Delay Measurement Finished\n"
+        "============================================================\n\n");
+
+
+    return true;
+}
+
+/* å°‡å·²é©—è­‰çš„ propagation delay å¯«å…¥å¾ç«™ DC registerã€‚ */
+bool EtherCatMaster::ConfigureDCPropagationDelay(
+    uint32_t delaySlave4,
+    uint32_t delaySlave5,
+    uint32_t delaySlave6)
+{
+    // =========================================================
+    // EtherCAT DC Propagation Delay Configuration
+    //
+    // Register:
+    //
+    // 0x0928 ~ 0x092B
+    // System Time Delay
+    //
+    // Delay values are supplied by
+    // MeasureDCPropagationDelay().
+    //
+    // ä¸å† Hard Codeã€‚
+    // =========================================================
+
+
+    if (m_pEni == nullptr)
+    {
+        RtPrintf(
+            "[DC-CONFIG] ERROR: ENI not initialized.\n");
+
+        return false;
+    }
+
+
+    const auto& slaves =
+        m_pEni->GetSlaves();
+
+
+    if (slaves.size() < 7)
+    {
+        RtPrintf(
+            "[DC-CONFIG] ERROR: Slave4~Slave6 unavailable.\n");
+
+        return false;
+    }
+
+
+    RtPrintf(
+        "\n"
+        "============================================================\n"
+        "[DC-CONFIG] Configure DC Propagation Delay\n"
+        "============================================================\n");
+
+
+    RtPrintf(
+        "[DC-CONFIG] Requested | "
+        "S4:%u ns "
+        "S5:%u ns "
+        "S6:%u ns\n",
+        (unsigned int)delaySlave4,
+        (unsigned int)delaySlave5,
+        (unsigned int)delaySlave6);
+
+
+    // =========================================================
+    // Write 0x0928
+    // =========================================================
+
+    int wkc4 =
+        ecx_FPWR(
+            m_slaveInfo[4].configAddr,
+            0x0928,
+            &delaySlave4,
+            4,
+            20);
+
+
+    int wkc5 =
+        ecx_FPWR(
+            m_slaveInfo[5].configAddr,
+            0x0928,
+            &delaySlave5,
+            4,
+            20);
+
+
+    int wkc6 =
+        ecx_FPWR(
+            m_slaveInfo[6].configAddr,
+            0x0928,
+            &delaySlave6,
+            4,
+            20);
+
+
+    RtPrintf(
+        "[DC-CONFIG] Write 0x0928 | "
+        "S4 WKC:%d | "
+        "S5 WKC:%d | "
+        "S6 WKC:%d\n",
+        wkc4,
+        wkc5,
+        wkc6);
+
+
+    // =========================================================
+    // Write check
+    // =========================================================
+
+    if (wkc4 <= 0 ||
+        wkc5 <= 0 ||
+        wkc6 <= 0)
+    {
+        RtPrintf(
+            "[DC-CONFIG] ERROR: "
+            "0x0928 Write FAILED.\n");
+
+        return false;
+    }
+
+
+    // =========================================================
+    // ReadBack
+    // =========================================================
+
+    uint32_t readDelay4 =
+        0;
+
+
+    uint32_t readDelay5 =
+        0;
+
+
+    uint32_t readDelay6 =
+        0;
+
+
+    int readWkc4 =
+        ecx_FPRD(
+            m_slaveInfo[4].configAddr,
+            0x0928,
+            &readDelay4,
+            4,
+            20);
+
+
+    int readWkc5 =
+        ecx_FPRD(
+            m_slaveInfo[5].configAddr,
+            0x0928,
+            &readDelay5,
+            4,
+            20);
+
+
+    int readWkc6 =
+        ecx_FPRD(
+            m_slaveInfo[6].configAddr,
+            0x0928,
+            &readDelay6,
+            4,
+            20);
+
+
+    RtPrintf(
+        "[DC-CONFIG] ReadBack 0x0928 | "
+        "S4:%u WKC:%d | "
+        "S5:%u WKC:%d | "
+        "S6:%u WKC:%d\n",
+
+        (unsigned int)readDelay4,
+        readWkc4,
+
+        (unsigned int)readDelay5,
+        readWkc5,
+
+        (unsigned int)readDelay6,
+        readWkc6);
+
+
+    // =========================================================
+    // Read check
+    // =========================================================
+
+    if (readWkc4 <= 0 ||
+        readWkc5 <= 0 ||
+        readWkc6 <= 0)
+    {
+        RtPrintf(
+            "[DC-CONFIG] ERROR: "
+            "0x0928 ReadBack FAILED.\n");
+
+        return false;
+    }
+
+
+    // =========================================================
+    // Value verification
+    // =========================================================
+
+    if (readDelay4 != delaySlave4 ||
+        readDelay5 != delaySlave5 ||
+        readDelay6 != delaySlave6)
+    {
+        RtPrintf(
+            "[DC-CONFIG] ERROR: "
+            "0x0928 Verification FAILED.\n");
+
+
+        RtPrintf(
+            "[DC-CONFIG] Expected "
+            "S4:%u S5:%u S6:%u | "
+            "Actual "
+            "S4:%u S5:%u S6:%u\n",
+
+            (unsigned int)delaySlave4,
+            (unsigned int)delaySlave5,
+            (unsigned int)delaySlave6,
+
+            (unsigned int)readDelay4,
+            (unsigned int)readDelay5,
+            (unsigned int)readDelay6);
+
+
+        return false;
+    }
+
+
+    RtPrintf(
+        "[DC-CONFIG] "
+        "Propagation Delay Configuration SUCCESS.\n");
+
+
+    RtPrintf(
+        "============================================================\n"
+        "[DC-CONFIG] DC Propagation Delay Configuration Finished\n"
+        "============================================================\n\n");
+
+
+    return true;
+}
+
+
+// =============================================================
+// DC Diagnostic Snapshot V1 - Producer Side
+//
+// ç”¨é€”ï¼š
+// 1. UpdateDCMasterClockEstimator() ä¿ç•™ estimator è¨ˆç®—ï¼Œä½†å®Œå…¨ä¸ RtPrintfã€‚
+// 2. UpdateDCPdoPhaseController() æ”¹æˆ Monitor Onlyã€‚
+// 3. ä¸ä¿®æ”¹ PDO Timerã€‚
+// 4. ä¸ä¿®æ”¹ RTX64 HALã€‚
+// 5. ä¸ä¿®æ”¹ Sync0ã€‚
+// 6. ä¸ä¿®æ”¹ EtherCAT Slave DCã€‚
+// 7. Priority-64 åªå¯« Snapshotï¼Œä¸è¼¸å‡ºæ–‡å­—ã€‚
+// =============================================================
+
+
+// =============================================================
+// DC PLL Diagnostic Snapshot
+//
+// Definition åªæ”¾ä¸€ä»½ã€‚
+// ä¸‹ä¸€æ­¥æœƒåœ¨ Main Thread .cpp ä½¿ç”¨ extern è®€å–ã€‚
+// =============================================================
+
+volatile LONG
+g_dcPllDiagSequence =
+0;
+
+volatile LONGLONG
+g_dcPllDiagEstimatorSequence =
+0;
+
+volatile LONGLONG
+g_dcPllDiagEstimatorOffsetNs =
+0;
+
+volatile LONGLONG
+g_dcPllDiagDriftPpb =
+0;
+
+volatile LONGLONG
+g_dcPllDiagPdoPhaseNs =
+0;
+
+volatile LONGLONG
+g_dcPllDiagTargetPhaseNs =
+0;
+
+volatile LONGLONG
+g_dcPllDiagPhaseStepNs =
+0;
+
+volatile LONGLONG
+g_dcPllDiagWrappedErrorNs =
+0;
+
+volatile LONGLONG
+g_dcPllDiagUnwrappedErrorNs =
+0;
+
+volatile LONGLONG
+g_dcPllDiagSync0MarginNs =
+0;
+
+volatile LONG
+g_dcPllDiagTargetCaptured =
+0;
+
+volatile LONG
+g_dcPllDiagStableWindows =
+0;
+volatile LONGLONG
+g_dcPllDiagPCommandNs =
+0;
+
+volatile LONGLONG
+g_dcPllDiagPeriodCorrectionPs =
+0;
+
+// =============================================================
+// Master <-> EtherCAT DC Clock Estimator
+//
+// â˜… Priority-64 safe version
+//
+// - NO RtPrintf
+// - NO Timer modification
+// - NO HAL modification
+// - NO Sync0 modification
+// - NO Slave DC modification
+// =============================================================
+
+/*
+ * æ›´æ–° Master QPC èˆ‡ EtherCAT reference DC time çš„ offset/drift estimatorã€‚
+ * æ­¤å±¤æä¾›æ™‚åŸºä¼°æ¸¬ï¼Œä¸ç›´æ¥åŸ·è¡Œ Motion/NC å‘½ä»¤ã€‚
+ */
+void EtherCatMaster::UpdateDCMasterClockEstimator(
+    uint64_t masterBeforeNs,
+    uint64_t masterAfterNs,
+    uint64_t dcReferenceNs,
+    int dcWkc)
+{
+    const uint32_t WINDOW_SAMPLES =
+        4000U;
+
+    const uint64_t MAX_RTT_NS =
+        500000ULL;
+
+
+    // =========================================================
+    // Local Estimator State
+    // =========================================================
+
+    static uint32_t validSamples =
+        0;
+
+    static uint32_t rejectedSamples =
+        0;
+
+    static int64_t offsetSum =
+        0;
+
+    static uint64_t rttSum =
+        0;
+
+    static uint64_t windowStartMasterNs =
+        0;
+
+    static uint64_t windowEndMasterNs =
+        0;
+
+
+    // =========================================================
+    // Previous Window
+    // =========================================================
+
+    static bool hasPreviousWindow =
+        false;
+
+    static int64_t previousAverageOffsetNs =
+        0;
+
+    static uint64_t previousWindowCenterNs =
+        0;
+
+
+    // =========================================================
+    // Step 1 - Basic Validation
+    // =========================================================
+
+    if (dcWkc <= 0)
+    {
+        rejectedSamples++;
+
+        return;
+    }
+
+
+    if (dcReferenceNs == 0)
+    {
+        rejectedSamples++;
+
+        return;
+    }
+
+
+    if (masterAfterNs <
+        masterBeforeNs)
+    {
+        rejectedSamples++;
+
+        return;
+    }
+
+
+    // =========================================================
+    // Step 2 - Combined LRW + FRMW Round Trip Time
+    // =========================================================
+
+    uint64_t rttNs =
+        masterAfterNs -
+        masterBeforeNs;
+
+
+    if (rttNs >
+        MAX_RTT_NS)
+    {
+        rejectedSamples++;
+
+        return;
+    }
+
+
+    // =========================================================
+    // Step 3 - Estimate CLOCK_2 time at DC capture
+    //
+    // Absolute offset contains deterministic frame/capture bias.
+    // Slope is what we use for frequency drift.
+    // =========================================================
+
+    uint64_t masterMidpointNs =
+        masterBeforeNs +
+        (rttNs / 2ULL);
+
+
+    // Offset definition:
+    //
+    //     CLOCK_2 - DC Reference
+    //
+    int64_t offsetNs =
+        (int64_t)
+        masterMidpointNs -
+        (int64_t)
+        dcReferenceNs;
+
+
+    // =========================================================
+    // Step 4 - Accumulate Window
+    // =========================================================
+
+    if (validSamples == 0)
+    {
+        windowStartMasterNs =
+            masterMidpointNs;
+    }
+
+
+    windowEndMasterNs =
+        masterMidpointNs;
+
+
+    offsetSum +=
+        offsetNs;
+
+
+    rttSum +=
+        rttNs;
+
+
+    validSamples++;
+
+
+    if (validSamples <
+        WINDOW_SAMPLES)
+    {
+        return;
+    }
+
+
+    // =========================================================
+    // Step 5 - Window Average
+    // =========================================================
+
+    int64_t averageOffsetNs =
+        offsetSum /
+        (int64_t)
+        validSamples;
+
+
+    uint64_t averageRttNs =
+        rttSum /
+        (uint64_t)
+        validSamples;
+
+
+    uint64_t windowCenterNs =
+        windowStartMasterNs +
+        (
+            (
+                windowEndMasterNs -
+                windowStartMasterNs
+                )
+            / 2ULL
+            );
+
+
+    // =========================================================
+    // Publish latest estimator reference point
+    // =========================================================
+
+    m_dcEstimatorOffsetNs =
+        averageOffsetNs;
+
+
+    m_dcEstimatorMasterTimeNs =
+        windowCenterNs;
+
+
+    // averageRttNs ç›®å‰åªä¿ç•™è¨ˆç®—ï¼Œé¿å… unused warningã€‚
+    // Main Thread å·²ç¶“æœ‰ PDO-COMBINED snapshot å¯è§€å¯Ÿ RTTã€‚
+    (void)
+        averageRttNs;
+
+
+    // =========================================================
+    // Step 6 - Frequency Drift
+    //
+    // Drift =
+    //
+    //     deltaOffset / elapsed
+    //
+    // ppb:
+    //
+    //     + = CLOCK_2 faster than DC
+    //     - = CLOCK_2 slower than DC
+    // =========================================================
+
+    if (hasPreviousWindow &&
+        windowCenterNs >
+        previousWindowCenterNs)
+    {
+        int64_t deltaOffsetNs =
+            averageOffsetNs -
+            previousAverageOffsetNs;
+
+
+        uint64_t elapsedNs =
+            windowCenterNs -
+            previousWindowCenterNs;
+
+
+        int64_t driftPpb =
+            (
+                deltaOffsetNs *
+                1000000000LL
+                )
+            /
+            (int64_t)
+            elapsedNs;
+
+
+        m_dcEstimatorDriftPpb =
+            driftPpb;
+
+
+        m_dcEstimatorValid =
+            true;
+
+
+        m_dcEstimatorSequence++;
+    }
+
+
+    // =========================================================
+    // Step 7 - Save Current Window
+    // =========================================================
+
+    previousAverageOffsetNs =
+        averageOffsetNs;
+
+
+    previousWindowCenterNs =
+        windowCenterNs;
+
+
+    hasPreviousWindow =
+        true;
+
+
+    // =========================================================
+    // Step 8 - Reset Window
+    // =========================================================
+
+    validSamples =
+        0;
+
+
+    rejectedSamples =
+        0;
+
+
+    offsetSum =
+        0;
+
+
+    rttSum =
+        0;
+
+
+    windowStartMasterNs =
+        0;
+
+
+    windowEndMasterNs =
+        0;
+}
+
+
+// =============================================================
+// DC PDO Phase Monitor V1 - Snapshot Version
+//
+// â˜… MONITOR ONLY
+//
+// - NO RtPrintf
+// - NO RtSetTimer
+// - NO RtSetTimerRelative
+// - NO RtSetHalTimerPeriodCounts
+// - NO HAL calibration / dither preparation
+//
+// ç›®çš„ï¼š
+// 1. ä½¿ç”¨å·²ä¿®æ­£çš„ uint64 modulo phase algorithmã€‚
+// 2. ç­‰å…©å€‹æœ‰æ•ˆ estimator drift window å¾Œè‡ªå‹• Capture targetã€‚
+// 3. è§€å¯Ÿ Phase / Step / ErrWrap / ErrUnwrapã€‚
+// 4. å°‡çµæœå¯«å…¥ snapshotï¼Œä¸‹ä¸€æ­¥ç”± Priority-50 Main Thread å°ã€‚
+// =============================================================
+
+/*
+ * æ›´æ–° PDO send phase ç›¸å°æ–¼ Sync0 çš„ç›£æ¸¬èˆ‡æ§åˆ¶è³‡æ–™ã€‚
+ * è¨ˆç®—çµæœé€é seqlock snapshot äº¤çµ¦ Priority 50 è¨ºæ–·è¼¸å‡ºã€‚
+ */
+void EtherCatMaster::UpdateDCPdoPhaseController(
+    uint64_t pdoStartMasterNs)
+{
+    if (!m_dcEstimatorValid)
+    {
+        return;
+    }
+
+
+    // =========================================================
+    // æ¯å€‹æ–°çš„ Estimator Window åªåŸ·è¡Œä¸€æ¬¡
+    // =========================================================
+
+    static uint64_t lastEstimatorSequence =
+        0;
+
+
+    if (m_dcEstimatorSequence ==
+        lastEstimatorSequence)
+    {
+        return;
+    }
+
+
+    lastEstimatorSequence =
+        m_dcEstimatorSequence;
+
+
+    // =========================================================
+    // Constants
+    // =========================================================
+
+    const int64_t DC_CYCLE_NS =
+        250000LL;
+
+    const int64_t SYNC0_PHASE_NS =
+        125000LL;
+
+    const int64_t DC_PLL_MONITOR_MAX_DRIFT_PPB =
+        100000LL;
+
+
+    // =========================================================
+    // Estimate current CLOCK_2 - DC offset
+    // =========================================================
+
+    int64_t deltaMasterNs =
+        0;
+
+
+    if (pdoStartMasterNs >=
+        m_dcEstimatorMasterTimeNs)
+    {
+        deltaMasterNs =
+            (int64_t)
+            (
+                pdoStartMasterNs -
+                m_dcEstimatorMasterTimeNs
+                );
+    }
+    else
+    {
+        deltaMasterNs =
+            -(int64_t)
+            (
+                m_dcEstimatorMasterTimeNs -
+                pdoStartMasterNs
+                );
+    }
+
+
+    int64_t offsetDriftNs =
+        (
+            deltaMasterNs *
+            m_dcEstimatorDriftPpb
+            )
+        /
+        1000000000LL;
+
+
+    int64_t estimatedOffsetNowNs =
+        m_dcEstimatorOffsetNs +
+        offsetDriftNs;
+
+
+    // =========================================================
+    // DC Phase = Master Phase - Offset Phase
+    //
+    // â˜… IMPORTANT
+    //
+    // pdoStartMasterNs æ˜¯ uint64_t absolute timeã€‚
+    // ç¦æ­¢å…ˆ cast æˆ int64_tã€‚
+    //
+    // å…ˆåœ¨ uint64_t ä¸–ç•Œåš moduloï¼Œé¿å… absolute-time overflowã€‚
+    // =========================================================
+
+    uint64_t masterPhaseNs =
+        pdoStartMasterNs %
+        (uint64_t)
+        DC_CYCLE_NS;
+
+
+    int64_t offsetPhaseNs =
+        estimatedOffsetNowNs %
+        DC_CYCLE_NS;
+
+
+    int64_t pdoPhaseNs =
+        (int64_t)
+        masterPhaseNs -
+        offsetPhaseNs;
+
+
+    pdoPhaseNs %=
+        DC_CYCLE_NS;
+
+
+    if (pdoPhaseNs < 0)
+    {
+        pdoPhaseNs +=
+            DC_CYCLE_NS;
+    }
+
+
+    // =========================================================
+    // Monitor State
+    // =========================================================
+
+    static bool targetCaptured =
+        false;
+
+    static uint32_t stableWindows =
+        0;
+
+    static int64_t targetPhaseNs =
+        0;
+
+    static int64_t previousPhaseNs =
+        0;
+
+    static int64_t unwrappedErrorNs =
+        0;
+
+
+    bool capturedThisWindow =
+        false;
+
+
+    // =========================================================
+    // Capture target after two sane estimator windows
+    // =========================================================
+
+    if (!targetCaptured)
+    {
+        if (m_dcEstimatorDriftPpb != 0 &&
+            m_dcEstimatorDriftPpb >=
+            -DC_PLL_MONITOR_MAX_DRIFT_PPB &&
+            m_dcEstimatorDriftPpb <=
+            DC_PLL_MONITOR_MAX_DRIFT_PPB)
+        {
+            stableWindows++;
+
+
+            if (stableWindows >=
+                2U)
+            {
+                targetPhaseNs =
+                    pdoPhaseNs;
+
+
+                previousPhaseNs =
+                    pdoPhaseNs;
+
+
+                unwrappedErrorNs =
+                    0;
+
+
+                targetCaptured =
+                    true;
+
+
+                capturedThisWindow =
+                    true;
+            }
+        }
+    }
+
+
+    // =========================================================
+    // Phase Monitor
+    // =========================================================
+
+    int64_t phaseStepNs =
+        0;
+
+    int64_t wrappedPhaseErrorNs =
+        0;
+
+
+    if (targetCaptured)
+    {
+        if (!capturedThisWindow)
+        {
+            phaseStepNs =
+                pdoPhaseNs -
+                previousPhaseNs;
+
+
+            if (phaseStepNs >
+                (DC_CYCLE_NS / 2))
+            {
+                phaseStepNs -=
+                    DC_CYCLE_NS;
+            }
+            else if (phaseStepNs <
+                -(DC_CYCLE_NS / 2))
+            {
+                phaseStepNs +=
+                    DC_CYCLE_NS;
+            }
+
+
+            unwrappedErrorNs +=
+                phaseStepNs;
+
+
+            previousPhaseNs =
+                pdoPhaseNs;
+        }
+
+
+        wrappedPhaseErrorNs =
+            pdoPhaseNs -
+            targetPhaseNs;
+
+
+        while (wrappedPhaseErrorNs >
+            (DC_CYCLE_NS / 2))
+        {
+            wrappedPhaseErrorNs -=
+                DC_CYCLE_NS;
+        }
+
+
+        while (wrappedPhaseErrorNs <
+            -(DC_CYCLE_NS / 2))
+        {
+            wrappedPhaseErrorNs +=
+                DC_CYCLE_NS;
+        }
+    }
+
+    // =============================================================
+// PDO PLL Actuator V1A
+//
+// DRY RUN ONLY
+//
+// åªè¨ˆç®— Commandã€‚
+// ä¸ä¿®æ”¹ä»»ä½• Timer / HALã€‚
+// =============================================================
+
+    const int64_t PDO_PLL_P_DIVISOR =
+        8LL;
+
+    const int64_t PDO_PLL_MAX_P_COMMAND_NS =
+        5000LL;
+
+
+    // -------------------------------------------------------------
+    // P Command
+    //
+    // ErrWrap > 0
+    //     PDO phase æ¯” Target å¾€æ­£æ–¹å‘æ¼‚
+    //
+    // Command < 0
+    //     é æœŸ scheduler å¾€ EARLIER ä¿®æ­£
+    // -------------------------------------------------------------
+
+    int64_t pCommandNs =
+        0;
+
+
+    if (targetCaptured)
+    {
+        pCommandNs =
+            -(
+                wrappedPhaseErrorNs /
+                PDO_PLL_P_DIVISOR
+                );
+
+
+        if (pCommandNs >
+            PDO_PLL_MAX_P_COMMAND_NS)
+        {
+            pCommandNs =
+                PDO_PLL_MAX_P_COMMAND_NS;
+        }
+        else if (pCommandNs <
+            -PDO_PLL_MAX_P_COMMAND_NS)
+        {
+            pCommandNs =
+                -PDO_PLL_MAX_P_COMMAND_NS;
+        }
+    }
+
+
+    // -------------------------------------------------------------
+    // Frequency Feed-Forward Diagnostic
+    //
+    // Drift:
+    //     ppb
+    //
+    // Result:
+    //     ps / PDO cycle
+    //
+    // 250000 ns Ã— -8400 ppb
+    // â‰ˆ -2100 ps / cycle
+    // -------------------------------------------------------------
+
+    int64_t periodCorrectionPs =
+        (
+            DC_CYCLE_NS *
+            m_dcEstimatorDriftPpb
+            )
+        /
+        1000000LL;
+    // =========================================================
+    // Sync0 margin diagnostic
+    // =========================================================
+
+    int64_t sync0MarginNs =
+        SYNC0_PHASE_NS -
+        pdoPhaseNs;
+
+
+    if (sync0MarginNs < 0)
+    {
+        sync0MarginNs +=
+            DC_CYCLE_NS;
+    }
+
+
+    // =========================================================
+    // Publish DC PLL Diagnostic Snapshot
+    //
+    // odd  = writer updating
+    // even = complete
+    // =========================================================
+
+    InterlockedIncrement(
+        &g_dcPllDiagSequence);
+
+
+    g_dcPllDiagEstimatorSequence =
+        (LONGLONG)
+        m_dcEstimatorSequence;
+
+
+    g_dcPllDiagEstimatorOffsetNs =
+        (LONGLONG)
+        estimatedOffsetNowNs;
+
+
+    g_dcPllDiagDriftPpb =
+        (LONGLONG)
+        m_dcEstimatorDriftPpb;
+
+
+    g_dcPllDiagPdoPhaseNs =
+        (LONGLONG)
+        pdoPhaseNs;
+
+
+    g_dcPllDiagTargetPhaseNs =
+        (LONGLONG)
+        targetPhaseNs;
+
+
+    g_dcPllDiagPhaseStepNs =
+        (LONGLONG)
+        phaseStepNs;
+
+
+    g_dcPllDiagWrappedErrorNs =
+        (LONGLONG)
+        wrappedPhaseErrorNs;
+
+
+    g_dcPllDiagUnwrappedErrorNs =
+        (LONGLONG)
+        unwrappedErrorNs;
+
+
+    g_dcPllDiagSync0MarginNs =
+        (LONGLONG)
+        sync0MarginNs;
+
+
+    // =============================================================
+    // PDO PLL V1A Dry Run Command
+    // =============================================================
+
+    g_dcPllDiagPCommandNs =
+        (LONGLONG)
+        pCommandNs;
+
+
+    g_dcPllDiagPeriodCorrectionPs =
+        (LONGLONG)
+        periodCorrectionPs;
+
+
+    // =============================================================
+    // Monitor State
+    // =============================================================
+
+    g_dcPllDiagTargetCaptured =
+        targetCaptured
+        ? 1L
+        : 0L;
+
+
+    g_dcPllDiagStableWindows =
+        (LONG)
+        stableWindows;
+
+
+    MemoryBarrier();
+
+
+    InterlockedIncrement(
+        &g_dcPllDiagSequence);
+
+    g_dcPllDiagStableWindows =
+        (LONG)
+        stableWindows;
+
+
+    MemoryBarrier();
+
+
+    InterlockedIncrement(
+        &g_dcPllDiagSequence);
+
+
+    // =========================================================
+    // CONTROL OFF
+    //
+    // é€™è£¡æ•…æ„çµæŸã€‚
+    //
+    // ä¸å†é€²å…¥èˆŠçš„ï¼š
+    // - HAL calibration
+    // - residual trim
+    // - dither preparation
+    // - HAL raw diagnostic
+    //
+    // çœŸæ­£çš„ PDO-only PLL actuator æœƒåœ¨ Monitor é©—è­‰å¾Œå¦åšã€‚
+    // =========================================================
+
+    return;
+}
+
+
+
+
+
+
+
+
+
+
+// =============================================================
+// EtherCAT Send Point Diagnostic Snapshot
+//
+// Producerï¼šecx_LRW_FRMW() / Priority 64ã€‚
+// Consumerï¼šPrintDcRuntimeDiagnostics() / Priority 50ã€‚
+// Publishï¼šæ¯ 4000 å€‹æœ‰æ•ˆ QPC æ¨£æœ¬ä¸€æ¬¡ã€‚
+//
+// Buildï¼šå¾é–‹å§‹å»ºç«‹ LRW+FRMW Frame åˆ°å‘¼å« SendPacket() å‰çš„æ™‚é–“ã€‚
+// SendCallï¼šSendPacket() API æœ¬èº«çš„åŸ·è¡Œæ™‚é–“ï¼›ä¸ä»£è¡¨ç·šä¸Šå‚³è¼¸å®Œæˆæ™‚é–“ã€‚
+// Sequence æ¡ seqlockï¼špublish å‰å¾Œå„éå¢ä¸€æ¬¡ï¼Œè®€å–ç«¯åªæ¥å— even snapshotã€‚
+// =============================================================
+
+volatile LONG
+    g_ecatSendDiagSequence =
+    0;
+
+volatile LONGLONG
+    g_ecatSendBuildAvgNs =
+    0;
+
+volatile LONGLONG
+    g_ecatSendBuildMinNs =
+    0;
+
+volatile LONGLONG
+    g_ecatSendBuildMaxNs =
+    0;
+
+volatile LONGLONG
+    g_ecatSendCallAvgNs =
+    0;
+
+volatile LONGLONG
+    g_ecatSendCallMinNs =
+    0;
+
+volatile LONGLONG
+    g_ecatSendCallMaxNs =
+    0;
+
+volatile LONG
+    g_ecatSendQpcValid =
+    0;
+
+
+// =============================================================
+// EtherCAT RX Soft/Hard Deadline Diagnostic Snapshot
+//
+// Producer: ecx_LRW_FRMW() / Priority 64
+// Consumer: System main reader / Priority 50
+//
+// SoftLateAcceptedï¼š205 us å¾Œã€210 us å‰æ”¶åˆ°ä¸”é©—è­‰æˆåŠŸçš„ Frameã€‚
+// HardTimeoutï¼šæœ¬ 4000-cycle è¦–çª—å…§è¶…é 210 us çš„æ¬¡æ•¸ã€‚
+// TotalHardTimeoutï¼šç¨‹åºå•Ÿå‹•å¾Œç´¯ç©ï¼Œæ°¸ä¸å›  snapshot publish æ­¸é›¶ã€‚
+// PostReceiveLateï¼šReceivePacket() è¿”å›æ™‚æ‰ç™¼ç¾å·²è·¨è¶Š Hard Deadlineã€‚
+// RecoveryAfterTimeoutï¼šTimeout å¾Œä¸‹ä¸€æ¬¡æœ‰æ•ˆ Frame æ¢å¾©çš„äº‹ä»¶æ•¸ã€‚
+//
+// æœ¬å€åªå®£å‘Šè¨ºæ–·å¿«ç…§ï¼Œä¸ä¿®æ”¹ HALã€Timerã€DCã€Motion æˆ– NC æ§åˆ¶ã€‚
+// Priority 64 è·¯å¾‘ç¦æ­¢ RtPrintfã€‚
+// =============================================================
+
+volatile LONG g_ecatRxDiagSequence = 0;
+volatile LONG g_ecatRxDiagCalls = 0;
+volatile LONG g_ecatRxDiagFirstRxSuccess = 0;
+volatile LONG g_ecatRxDiagEmptyRx = 0;
+volatile LONG g_ecatRxDiagInvalidFrame = 0;
+volatile LONG g_ecatRxDiagSoftLateAccepted = 0;
+volatile LONGLONG g_ecatRxDiagTotalSoftLateAccepted = 0;
+volatile LONGLONG g_ecatRxDiagSoftLateElapsedMaxNs = 0;
+volatile LONG g_ecatRxDiagHardTimeout = 0;
+volatile LONG g_ecatRxDiagPostReceiveLate = 0;
+volatile LONG g_ecatRxDiagCurrentConsecutiveTimeout = 0;
+volatile LONG g_ecatRxDiagMaxConsecutiveTimeout = 0;
+volatile LONGLONG g_ecatRxDiagTotalHardTimeout = 0;
+volatile LONG g_ecatRxDiagRecoveryAfterTimeout = 0;
+volatile LONG g_ecatRxDiagQpcFail = 0;
+volatile LONG g_ecatRxDiagSleepCount = 0;
+volatile LONG g_ecatRxDiagElapsedValid = 0;
+volatile LONGLONG g_ecatRxDiagElapsedAvgNs = 0;
+volatile LONGLONG g_ecatRxDiagElapsedMaxNs = 0;
+volatile LONG g_ecatRxDiagTimeoutPreReceive = 0;
+volatile LONG g_ecatRxDiagTimeoutSleep0 = 0;
+volatile LONG g_ecatRxDiagTimeoutSleep1 = 0;
+volatile LONG g_ecatRxDiagTimeoutSleep2 = 0;
+volatile LONG g_ecatRxDiagTimeoutAttemptAvg = 0;
+volatile LONG g_ecatRxDiagTimeoutAttemptMax = 0;
+volatile LONGLONG g_ecatRxDiagReceiveCallMaxNs = 0;
+volatile LONGLONG g_ecatRxDiagTimeoutReceiveCallMaxNs = 0;
+volatile LONG g_ecatRxDiagSoftDeadlineNs = 205000;
+volatile LONG g_ecatRxDiagHardDeadlineNs = 210000;
+
+
+/*
+ * 4 kHz PDO æ ¸å¿ƒäº¤æ›å‡½å¼ã€‚
+ *
+ * å–®ä¸€ Ethernet Frame å…§åŒ…å«ï¼š
+ * - Datagram #1ï¼šLRWï¼Œäº¤æ› Output/Input process imageã€‚
+ * - Datagram #2ï¼šFRMWï¼Œè®€å– reference slave System Time 0x0910ã€‚
+ *
+ * æˆåŠŸæ™‚ï¼š
+ * - data æ›´æ–°ç‚º Slave å›å‚³çš„ Input PDOã€‚
+ * - dcReferenceTime æ›´æ–°ç‚º 64-bit DC System Timeã€‚
+ * - dcWkc æ›´æ–°ç‚º FRMW WKCã€‚
+ * - å›å‚³ LRW WKCã€‚
+ *
+ * å¤±æ•—æ™‚ï¼š
+ * - å›å‚³ -1ã€‚
+ * - Hard Timeout æœƒè¨­å®š rxResyncPendingï¼Œä¸‹ä¸€é€±æœŸå…ˆæ¸…é™¤æ®˜ç•™ RX Frameã€‚
+ *
+ * å³æ™‚é™åˆ¶ï¼š
+ * - ä¸å¯åœ¨æ­¤å‡½å¼åŠ å…¥ RtPrintfã€æª”æ¡ˆ I/O æˆ–éå›ºå®šæ™‚é–“çš„é•·ç­‰å¾…ã€‚
+ * - è¨ºæ–·æ¡å›ºå®šå¤§å°çµ±è¨ˆè¦–çª—èˆ‡ seqlock snapshotã€‚
+ */
+int EtherCatMaster::ecx_LRW_FRMW(
+    uint32_t LogAddr,
+    uint16_t length,
+    void* data,
+    uint16_t dcSlaveAddr,
+    uint64_t* dcReferenceTime,
+    int* dcWkc,
+    int timeout)
+{
+    // =====================================================
+    // 0. Parameter Check
+    // =====================================================
+
+    if (m_pNic == nullptr)
+    {
+        return -1;
+    }
+
+
+    if (data == nullptr)
+    {
+        return -1;
+    }
+
+
+    if (dcReferenceTime == nullptr)
+    {
+        return -1;
+    }
+
+
+    if (dcWkc == nullptr)
+    {
+        return -1;
+    }
+
+
+    // é è¨­ FRMW WKC = 0
+    *dcWkc = 0;
+
+
+    // =============================================================
+    // EtherCAT Send Point Diagnostic
+    //
+    // QPC frequency åªåˆå§‹åŒ–ä¸€æ¬¡ã€‚
+    // æœ¬æ®µåªé‡æ¸¬ frame build èˆ‡ SendPacket() å‘¼å«æ™‚é–“ï¼Œæ²’æœ‰ç­‰å¾…ã€
+    // æ²’æœ‰ä¿®æ”¹ timerï¼Œä¹Ÿä¸æœƒæ”¹è®Šå¯¦éš›é€å‡ºæ™‚é»ã€‚
+    // =============================================================
+
+    static bool sendQpcInitAttempted =
+        false;
+
+    static bool sendQpcValid =
+        false;
+
+    static uint64_t sendQpcFrequency =
+        0;
+
+
+    if (!sendQpcInitAttempted)
+    {
+        LARGE_INTEGER frequency = {};
+
+        if (RtQueryPerformanceFrequency(
+            &frequency) &&
+            frequency.QuadPart > 0)
+        {
+            sendQpcFrequency =
+                (uint64_t)
+                frequency.QuadPart;
+
+            sendQpcValid =
+                true;
+        }
+
+        sendQpcInitAttempted =
+            true;
+    }
+
+
+    LARGE_INTEGER qpcBuildStart = {};
+
+    bool qpcBuildStartValid =
+        false;
+
+
+    if (sendQpcValid)
+    {
+        if (RtQueryPerformanceCounter(
+            &qpcBuildStart))
+        {
+            qpcBuildStartValid =
+                true;
+        }
+    }
+
+
+    // =====================================================
+    // Frame Layout
+    //
+    // Ethernet Header     14
+    // EtherCAT Header      2
+    //
+    // Datagram #1 LRW:
+    //     Header           10
+    //     Data             length
+    //     WKC               2
+    //
+    // Datagram #2 FRMW:
+    //     Header           10
+    //     Data               8
+    //     WKC               2
+    //
+    // Total:
+    //
+    //     14 + 2
+    //     + 10 + length + 2
+    //     + 10 + 8 + 2
+    //
+    //   = 48 + length
+    //
+    // =====================================================
+
+    const int DC_DATA_LENGTH =
+        8;
+
+
+    const int totalFrameLength =
+        48 +
+        (int)length;
+
+
+    // Ethernet æœ€å¤§ Frame Buffer
+    if (totalFrameLength >
+        1518)
+    {
+        return -1;
+    }
+
+
+    uint8_t* frame =
+        m_txBuffer;
+
+
+    // =====================================================
+    // Clear TX Frame
+    // =====================================================
+
+    memset(
+        frame,
+        0,
+        totalFrameLength);
+
+
+    // =====================================================
+    // 1. Ethernet Header
+    // =====================================================
+
+    uint8_t destMac[6] =
+    {
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF
+    };
+
+
+    uint8_t srcMac[6];
+
+
+    m_pNic->
+        GetMacAddress(
+            srcMac);
+
+
+    memcpy(
+        &frame[0],
+        destMac,
+        6);
+
+
+    memcpy(
+        &frame[6],
+        srcMac,
+        6);
+
+
+    // EtherCAT EtherType = 0x88A4
+    frame[12] =
+        0x88;
+
+    frame[13] =
+        0xA4;
+
+
+    // =====================================================
+    // 2. EtherCAT Header
+    //
+    // EtherCAT Lengthï¼š
+    //
+    // Datagram1:
+    //      10 + length + 2
+    //
+    // Datagram2:
+    //      10 + 8 + 2
+    //
+    // =====================================================
+
+    uint16_t etherCatDataLength =
+        (uint16_t)(
+            (10 + length + 2) +
+            (10 + DC_DATA_LENGTH + 2));
+
+
+    // Type = 0x1
+    //
+    // bits 0..10 = Length
+    // bit 12..15 = Type
+    uint16_t etherCatHeader =
+        (etherCatDataLength &
+         0x07FF)
+        |
+        0x1000;
+
+
+    frame[14] =
+        (uint8_t)(
+            etherCatHeader &
+            0xFF);
+
+
+    frame[15] =
+        (uint8_t)(
+            (etherCatHeader >>
+             8)
+            &
+            0xFF);
+
+
+    // =====================================================
+    // Datagram Index
+    //
+    // æ¯å€‹ Datagram ä½¿ç”¨ä¸åŒ Idxã€‚
+    // =====================================================
+
+    uint8_t lrwIdx =
+        m_idx++;
+
+
+    uint8_t frmwIdx =
+        m_idx++;
+
+
+    // =====================================================
+    // 3. Datagram #1
+    //
+    // LRW
+    //
+    // Offset:
+    //
+    // 16 = Cmd
+    // 17 = Idx
+    // 18 = Logical Address
+    // 22 = Len
+    // 24 = IRQ
+    // 26 = Data
+    // =====================================================
+
+    int lrwOffset =
+        16;
+
+
+    // -----------------------------------------------------
+    // Command
+    //
+    // 0x0C = LRW
+    // -----------------------------------------------------
+
+    frame[
+        lrwOffset + 0] =
+        0x0C;
+
+
+    // -----------------------------------------------------
+    // Index
+    // -----------------------------------------------------
+
+    frame[
+        lrwOffset + 1] =
+        lrwIdx;
+
+
+    // -----------------------------------------------------
+    // Logical Address
+    // -----------------------------------------------------
+
+    frame[
+        lrwOffset + 2] =
+        (uint8_t)(
+            LogAddr &
+            0xFF);
+
+
+    frame[
+        lrwOffset + 3] =
+        (uint8_t)(
+            (LogAddr >>
+             8)
+            &
+            0xFF);
+
+
+    frame[
+        lrwOffset + 4] =
+        (uint8_t)(
+            (LogAddr >>
+             16)
+            &
+            0xFF);
+
+
+    frame[
+        lrwOffset + 5] =
+        (uint8_t)(
+            (LogAddr >>
+             24)
+            &
+            0xFF);
+
+
+    // =====================================================
+    // LRW Length Field
+    //
+    // Bit 0..10:
+    //     Data Length
+    //
+    // M Bit:
+    //     1 = é‚„æœ‰ä¸‹ä¸€å€‹ Datagram
+    //
+    // å› ç‚ºå¾Œé¢é‚„æœ‰ FRMWï¼š
+    //
+    //     M = 1
+    //
+    // =====================================================
+
+    uint16_t lrwLengthField =
+        (length &
+         0x07FF)
+        |
+        0x8000;
+
+
+    frame[
+        lrwOffset + 6] =
+        (uint8_t)(
+            lrwLengthField &
+            0xFF);
+
+
+    frame[
+        lrwOffset + 7] =
+        (uint8_t)(
+            (lrwLengthField >>
+             8)
+            &
+            0xFF);
+
+
+    // -----------------------------------------------------
+    // IRQ
+    // -----------------------------------------------------
+
+    frame[
+        lrwOffset + 8] =
+        0x00;
+
+
+    frame[
+        lrwOffset + 9] =
+        0x00;
+
+
+    // =====================================================
+    // LRW Data
+    //
+    // Output Process Image
+    // =====================================================
+
+    int lrwDataOffset =
+        lrwOffset +
+        10;
+
+
+    memcpy(
+        &frame[
+            lrwDataOffset],
+        data,
+        length);
+
+
+    // =====================================================
+    // LRW WKC
+    //
+    // TX å¿…é ˆåˆå§‹åŒ– 0ã€‚
+    // =====================================================
+
+    int lrwWkcOffset =
+        lrwDataOffset +
+        length;
+
+
+    frame[
+        lrwWkcOffset] =
+        0x00;
+
+
+    frame[
+        lrwWkcOffset + 1] =
+        0x00;
+
+
+    // =====================================================
+    // 4. Datagram #2
+    //
+    // FRMW
+    //
+    // Datagram #2 ç·Šæ¥åœ¨
+    // Datagram #1 WKC å¾Œé¢ã€‚
+    // =====================================================
+
+    int frmwOffset =
+        lrwWkcOffset +
+        2;
+
+
+    // -----------------------------------------------------
+    // Command
+    //
+    // 0x0E = FRMW
+    // -----------------------------------------------------
+
+    frame[
+        frmwOffset + 0] =
+        0x0E;
+
+
+    // -----------------------------------------------------
+    // Index
+    // -----------------------------------------------------
+
+    frame[
+        frmwOffset + 1] =
+        frmwIdx;
+
+
+    // -----------------------------------------------------
+    // Configured Station Address
+    // -----------------------------------------------------
+
+    frame[
+        frmwOffset + 2] =
+        (uint8_t)(
+            dcSlaveAddr &
+            0xFF);
+
+
+    frame[
+        frmwOffset + 3] =
+        (uint8_t)(
+            (dcSlaveAddr >>
+             8)
+            &
+            0xFF);
+
+
+    // -----------------------------------------------------
+    // Register Address
+    //
+    // 0x0910 = System Time
+    // -----------------------------------------------------
+
+    const uint16_t dcRegister =
+        0x0910;
+
+
+    frame[
+        frmwOffset + 4] =
+        (uint8_t)(
+            dcRegister &
+            0xFF);
+
+
+    frame[
+        frmwOffset + 5] =
+        (uint8_t)(
+            (dcRegister >>
+             8)
+            &
+            0xFF);
+
+
+    // =====================================================
+    // FRMW Length Field
+    //
+    // Length = 8
+    //
+    // M = 0
+    //
+    // å› ç‚º FRMW æ˜¯æœ€å¾Œä¸€å€‹ Datagramã€‚
+    // =====================================================
+
+    uint16_t frmwLengthField =
+        (uint16_t)
+        DC_DATA_LENGTH;
+
+
+    frame[
+        frmwOffset + 6] =
+        (uint8_t)(
+            frmwLengthField &
+            0xFF);
+
+
+    frame[
+        frmwOffset + 7] =
+        (uint8_t)(
+            (frmwLengthField >>
+             8)
+            &
+            0xFF);
+
+
+    // -----------------------------------------------------
+    // IRQ
+    // -----------------------------------------------------
+
+    frame[
+        frmwOffset + 8] =
+        0x00;
+
+
+    frame[
+        frmwOffset + 9] =
+        0x00;
+
+
+    // =====================================================
+    // FRMW Data
+    //
+    // TX åˆå§‹å¿…é ˆ 0ã€‚
+    //
+    // Reference Slave è®€å– 0x0910 å¾Œï¼Œ
+    // æœƒæŠŠ System Time æ”¾é€²é€™ 8 bytesã€‚
+    // =====================================================
+
+    int frmwDataOffset =
+        frmwOffset +
+        10;
+
+
+    memset(
+        &frame[
+            frmwDataOffset],
+        0,
+        DC_DATA_LENGTH);
+
+
+    // =====================================================
+    // FRMW WKC
+    // =====================================================
+
+    int frmwWkcOffset =
+        frmwDataOffset +
+        DC_DATA_LENGTH;
+
+
+    frame[
+        frmwWkcOffset] =
+        0x00;
+
+
+    frame[
+        frmwWkcOffset + 1] =
+        0x00;
+
+
+    // =====================================================
+    // Sanity Check
+    //
+    // æœ€å¾Œæ‡‰è©²å‰›å¥½ï¼š
+    //
+    // frmwWkcOffset + 2
+    //
+    // = totalFrameLength
+    // =====================================================
+
+    int calculatedFrameLength =
+        frmwWkcOffset +
+        2;
+
+
+    if (calculatedFrameLength !=
+        totalFrameLength)
+    {
+        return -1;
+    }
+
+
+    // =====================================================
+    // 5. Send
+    // =====================================================
+
+    // ä¸Šä¸€é€±æœŸ Hard Timeout å¾Œï¼ŒRX Queue å¯èƒ½æ®˜ç•™éæœŸ Frameã€‚
+    // ä¸‹ä¸€æ¬¡é€å‡ºå‰æœ€å¤š drain 8 ç­†ï¼Œé¿å…èˆŠ Index è¢«èª¤åˆ¤ç‚ºæœ¬é€±æœŸè³‡æ–™ã€‚
+    static bool rxResyncPending =
+        false;
+
+
+    if (rxResyncPending)
+    {
+        const int RX_RESYNC_DRAIN_LIMIT =
+            8;
+
+
+        for (int drainIndex = 0;
+             drainIndex < RX_RESYNC_DRAIN_LIMIT;
+             drainIndex++)
+        {
+            int staleLength =
+                (int)m_pNic->
+                ReceivePacket(
+                    m_rxBuffer);
+
+
+            if (staleLength <= 0)
+            {
+                break;
+            }
+        }
+
+
+        rxResyncPending =
+            false;
+    }
+
+    // =============================================================
+    // Exact software send point timing
+    // =============================================================
+
+    LARGE_INTEGER qpcBeforeSend = {};
+    LARGE_INTEGER qpcAfterSend = {};
+
+    bool qpcBeforeSendValid =
+        false;
+
+    bool qpcAfterSendValid =
+        false;
+
+
+    if (qpcBuildStartValid)
+    {
+        if (RtQueryPerformanceCounter(
+            &qpcBeforeSend))
+        {
+            if (qpcBeforeSend.QuadPart >=
+                qpcBuildStart.QuadPart)
+            {
+                qpcBeforeSendValid =
+                    true;
+            }
+        }
+    }
+
+
+    // =============================================================
+    // Actual NIC Send API
+    // =============================================================
+
+    m_pNic->
+        SendPacket(
+            frame,
+            totalFrameLength);
+
+
+    if (qpcBeforeSendValid)
+    {
+        if (RtQueryPerformanceCounter(
+            &qpcAfterSend))
+        {
+            if (qpcAfterSend.QuadPart >=
+                qpcBeforeSend.QuadPart)
+            {
+                qpcAfterSendValid =
+                    true;
+            }
+        }
+    }
+
+
+    // =============================================================
+    // Send Point Statistics
+    // =============================================================
+
+    static uint64_t buildSumNs =
+        0;
+
+    static uint64_t buildMinNs =
+        0;
+
+    static uint64_t buildMaxNs =
+        0;
+
+    static uint64_t sendCallSumNs =
+        0;
+
+    static uint64_t sendCallMinNs =
+        0;
+
+    static uint64_t sendCallMaxNs =
+        0;
+
+    static uint32_t sendDiagSamples =
+        0;
+
+
+    if (qpcBuildStartValid &&
+        qpcBeforeSendValid &&
+        qpcAfterSendValid &&
+        sendQpcFrequency > 0)
+    {
+        uint64_t buildCounts =
+            (uint64_t)
+            (
+                qpcBeforeSend.QuadPart -
+                qpcBuildStart.QuadPart
+            );
+
+
+        uint64_t sendCallCounts =
+            (uint64_t)
+            (
+                qpcAfterSend.QuadPart -
+                qpcBeforeSend.QuadPart
+            );
+
+
+        uint64_t buildNs =
+            (
+                buildCounts *
+                1000000000ULL
+            )
+            /
+            sendQpcFrequency;
+
+
+        uint64_t sendCallNs =
+            (
+                sendCallCounts *
+                1000000000ULL
+            )
+            /
+            sendQpcFrequency;
+
+
+        if (sendDiagSamples == 0)
+        {
+            buildMinNs =
+                buildNs;
+
+            buildMaxNs =
+                buildNs;
+
+            sendCallMinNs =
+                sendCallNs;
+
+            sendCallMaxNs =
+                sendCallNs;
+        }
+
+
+        if (buildNs <
+            buildMinNs)
+        {
+            buildMinNs =
+                buildNs;
+        }
+
+
+        if (buildNs >
+            buildMaxNs)
+        {
+            buildMaxNs =
+                buildNs;
+        }
+
+
+        if (sendCallNs <
+            sendCallMinNs)
+        {
+            sendCallMinNs =
+                sendCallNs;
+        }
+
+
+        if (sendCallNs >
+            sendCallMaxNs)
+        {
+            sendCallMaxNs =
+                sendCallNs;
+        }
+
+
+        buildSumNs +=
+            buildNs;
+
+        sendCallSumNs +=
+            sendCallNs;
+
+        sendDiagSamples++;
+
+
+        if (sendDiagSamples >=
+            4000U)
+        {
+            InterlockedIncrement(
+                &g_ecatSendDiagSequence);
+
+
+            g_ecatSendBuildAvgNs =
+                (LONGLONG)
+                (
+                    buildSumNs /
+                    sendDiagSamples
+                );
+
+            g_ecatSendBuildMinNs =
+                (LONGLONG)
+                buildMinNs;
+
+            g_ecatSendBuildMaxNs =
+                (LONGLONG)
+                buildMaxNs;
+
+
+            g_ecatSendCallAvgNs =
+                (LONGLONG)
+                (
+                    sendCallSumNs /
+                    sendDiagSamples
+                );
+
+            g_ecatSendCallMinNs =
+                (LONGLONG)
+                sendCallMinNs;
+
+            g_ecatSendCallMaxNs =
+                (LONGLONG)
+                sendCallMaxNs;
+
+
+            g_ecatSendQpcValid =
+                1L;
+
+
+            MemoryBarrier();
+
+
+            InterlockedIncrement(
+                &g_ecatSendDiagSequence);
+
+
+            buildSumNs =
+                0;
+
+            buildMinNs =
+                0;
+
+            buildMaxNs =
+                0;
+
+
+            sendCallSumNs =
+                0;
+
+            sendCallMinNs =
+                0;
+
+            sendCallMaxNs =
+                0;
+
+
+            sendDiagSamples =
+                0;
+        }
+    }
+
+
+    // =============================================================
+    // RX Deadline è¨ºæ–·è¦–çª—
+    //
+    // æ¯ 4000 æ¬¡å®Œæˆçš„ RX phase ç™¼å¸ƒä¸€æ¬¡ï¼Œç´„ç­‰æ–¼ 4 kHz ä¸‹çš„ä¸€ç§’ã€‚
+    // *Window æ¬„ä½åœ¨ publish å¾Œæ­¸é›¶ï¼›Total æ¬„ä½æŒçºŒç´¯ç©ã€‚
+    // é€™äº›è¨ˆæ•¸åªç”¨æ–¼è¨ºæ–·ï¼Œä¸æœƒç›´æ¥è§¸ç™¼ä¼ºæœæ§åˆ¶å‹•ä½œã€‚
+    // =============================================================
+
+    static uint64_t rxDiagCallsWindow = 0;
+    static uint64_t rxDiagFirstRxSuccessWindow = 0;
+    static uint64_t rxDiagEmptyRxWindow = 0;
+    static uint64_t rxDiagInvalidFrameWindow = 0;
+    static uint64_t rxDiagSoftLateAcceptedWindow = 0;
+    static uint64_t rxDiagTotalSoftLateAccepted = 0;
+    static uint64_t rxDiagSoftLateElapsedMaxNsWindow = 0;
+    static uint64_t rxDiagHardTimeoutWindow = 0;
+    static uint64_t rxDiagPostReceiveLateWindow = 0;
+
+    static uint64_t rxDiagCurrentConsecutiveTimeout = 0;
+    static uint64_t rxDiagMaxConsecutiveTimeoutWindow = 0;
+    static uint64_t rxDiagTotalHardTimeout = 0;
+    static uint64_t rxDiagRecoveryAfterTimeoutWindow = 0;
+
+    static uint64_t rxDiagQpcFailWindow = 0;
+    static uint64_t rxDiagSleepCountWindow = 0;
+    static uint64_t rxDiagElapsedValidWindow = 0;
+    static uint64_t rxDiagElapsedSumNsWindow = 0;
+    static uint64_t rxDiagElapsedMaxNsWindow = 0;
+    static uint64_t rxDiagTimeoutPreReceiveWindow = 0;
+    static uint64_t rxDiagTimeoutSleep0Window = 0;
+    static uint64_t rxDiagTimeoutSleep1Window = 0;
+    static uint64_t rxDiagTimeoutSleep2Window = 0;
+    static uint64_t rxDiagTimeoutAttemptSumWindow = 0;
+    static uint64_t rxDiagTimeoutAttemptMaxWindow = 0;
+    static uint64_t rxDiagReceiveCallMaxNsWindow = 0;
+    static uint64_t rxDiagTimeoutReceiveCallMaxNsWindow = 0;
+
+
+    // =============================================================
+    // 6. Receive - RX Soft/Hard Deadline
+    //
+    // èˆŠç‰ˆæœ¬ä½¿ç”¨ timeout * 100 æ¬¡é‡è©¦ï¼Œå¯èƒ½æŠŠä¸€æ¬¡å°åŒ…éºå¤±æ“´å¼µæˆ
+    // æ¯«ç§’ç´šé˜»å¡ï¼Œå° 250 us PDO cycle ä¸å¯æ¥å—ã€‚
+    //
+    // RC1 è¡Œç‚ºï¼š
+    // - Soft Deadline = 205 usï¼šæ™šæ–¼æ­¤æ™‚é–“ä½†æ—©æ–¼ Hard çš„æœ‰æ•ˆ Frame
+    //   ä»å¯æ¥å—ï¼Œä¸¦ç´¯åŠ  SoftLateAcceptedã€‚
+    // - Hard Deadline = 210 usï¼šåˆ°é”æˆ–è¶…éæ­¤æ™‚é–“ç«‹å³å¤±æ•—ï¼ŒFrame ä¸æ¡ç”¨ã€‚
+    // - æ¯æ¬¡ RX phase æœ€å¤šåŸ·è¡Œå…©æ¬¡ 50 us coarse wait requestã€‚
+    // - ç¬¬äºŒæ¬¡ wait å¾Œä½¿ç”¨ bounded pollingï¼Œç›´åˆ° Frame æˆ– Hard Deadlineã€‚
+    // - QPC ç„¡æ•ˆæ™‚æ¡å›ºå®š 4 æ¬¡ ReceivePacket() fallbackï¼Œé¿å…ç„¡ç•Œç­‰å¾…ã€‚
+    //
+    // RTX64 HAL ç›®å‰è¨­å®š 25 usï¼›RX_COARSE_SLEEP_NS æ˜¯è¦æ±‚ç­‰å¾… 50 usï¼Œ
+    // å…©è€…ç”¨é€”ä¸åŒï¼Œä¸æ‡‰æŠŠæ­¤å¸¸æ•¸æ”¹æˆ HAL å€¼ã€‚
+    // timeout åƒæ•¸åªç‚ºç¶­æŒæ—¢æœ‰å‡½å¼ä»‹é¢ï¼Œä¸å†æ§åˆ¶ RX ç­‰å¾…é•·åº¦ã€‚
+    // =============================================================
+
+    (void)timeout;
+
+
+    // RX Deadline èª¿æ•´è¦å‰‡ï¼š
+    // - å¿…é ˆä¿æŒ Soft < Hard < PDO cycle(250000 ns)ï¼Œä¸¦ä¿ç•™ Handler å¾Œæ®µé‹ç®—æ™‚é–“ã€‚
+    // - Soft èª¿å¤§ï¼šSoftLate è¼ƒå°‘ï¼Œä½†åªæ˜¯æŠŠè­¦æˆ’ç·šå¾€å¾Œç§»ï¼Œä¸æœƒæ”¹å–„çœŸæ­£ RX å»¶é²ã€‚
+    // - Hard èª¿å¤§ï¼šHardTimeout å¯èƒ½ä¸‹é™ï¼Œä½†æœƒæ¥å—æ›´èˆŠçš„ frameï¼Œä¸”å£“ç¸® Motion/DC æ™‚é–“ã€‚
+    // - Hard èª¿å°ï¼šæ›´å¿«åˆ¤å®šå¤±æ•—ï¼Œä½†å¶ç™¼ NALï¼interrupt å»¶é²æ›´å®¹æ˜“è¢«ç®— Timeoutã€‚
+    // - å»ºè­°ä¸€æ¬¡åªç§»å‹• 5000 nsï¼Œå…ˆçœ‹ RxElapsed Maxã€PostReceiveLate èˆ‡ PDO-EXEC Maxã€‚
+    // - Soft èˆ‡ Hard å»ºè­°è‡³å°‘ä¿ç•™ 5000 ns é–“éš”ï¼Œè®“ SoftLate èƒ½æˆç‚ºæå‰è­¦å ±ã€‚
+    // - RX_COARSE_SLEEP_NS ä¸æ˜¯ deadlineï¼›å®ƒæ˜¯ coarse wait requestï¼Œä¸è¦è·Ÿ HAL å€¼æ··ç”¨ã€‚
+    //
+    // èª¿æ•´å‰å¾Œéƒ½å¿…é ˆé‡æ–°åŸ·è¡Œé•·æ™‚é–“æ¿€ç£ä¸‰è»¸åŒå‹•æ¸¬è©¦ï¼›æ­£å¼åŸºæº–å…ˆä¿æŒ 205/210 usã€‚
+    const uint64_t RX_SOFT_DEADLINE_NS =
+        205000ULL;
+
+    const uint64_t RX_HARD_DEADLINE_NS =
+        210000ULL;
+
+    const uint64_t RX_COARSE_SLEEP_NS =
+        50000ULL;       // 50 us
+
+
+    LARGE_INTEGER wait;
+
+    wait.QuadPart =
+        500;            // 50 us in 100 ns units
+
+
+    LARGE_INTEGER rxStartQpc =
+        {};
+
+    bool rxDeadlineValid =
+        false;
+
+    LONGLONG rxSoftDeadlineQpc =
+        0;
+
+    LONGLONG rxHardDeadlineQpc =
+        0;
+
+    uint64_t rxSleepCounts =
+        0;
+
+
+    if (sendQpcValid &&
+        sendQpcFrequency > 0 &&
+        RtQueryPerformanceCounter(
+            &rxStartQpc))
+    {
+        uint64_t rxSoftDeadlineCounts =
+            (
+                RX_SOFT_DEADLINE_NS *
+                sendQpcFrequency
+            )
+            /
+            1000000000ULL;
+
+
+        uint64_t rxHardDeadlineCounts =
+            (
+                RX_HARD_DEADLINE_NS *
+                sendQpcFrequency
+            )
+            /
+            1000000000ULL;
+
+
+        rxSleepCounts =
+            (
+                RX_COARSE_SLEEP_NS *
+                sendQpcFrequency
+            )
+            /
+            1000000000ULL;
+
+
+        if (rxSoftDeadlineCounts > 0 &&
+            rxHardDeadlineCounts >
+            rxSoftDeadlineCounts &&
+            rxSleepCounts > 0)
+        {
+            rxSoftDeadlineQpc =
+                rxStartQpc.QuadPart +
+                (LONGLONG)
+                rxSoftDeadlineCounts;
+
+            rxHardDeadlineQpc =
+                rxStartQpc.QuadPart +
+                (LONGLONG)
+                rxHardDeadlineCounts;
+
+            rxDeadlineValid =
+                true;
+        }
+    }
+
+
+    // =============================================================
+    // V1A diagnostic: one call entered the receive phase.
+    // =============================================================
+
+    rxDiagCallsWindow++;
+
+
+    if (!rxDeadlineValid)
+    {
+        // Existing bounded fallback behavior remains unchanged.
+        rxDiagQpcFailWindow++;
+    }
+
+
+    uint32_t rxAttemptNumber =
+        0;
+
+    uint32_t rxCoarseSleepCount =
+        0U;
+
+
+    // é›†ä¸­è¨˜éŒ„ä¸€æ¬¡ Hard Timeoutï¼Œé¿å…ä¸åŒ timeout å‡ºå£æ¼æ‰æ¬„ä½ã€‚
+    auto MarkRxHardTimeoutDiagnostic =
+        [&](bool preReceiveDeadline,
+            uint64_t timeoutReceiveCallNs)
+    {
+        rxResyncPending =
+            true;
+
+        rxDiagHardTimeoutWindow++;
+        rxDiagTotalHardTimeout++;
+        rxDiagCurrentConsecutiveTimeout++;
+
+
+        if (preReceiveDeadline)
+        {
+            rxDiagTimeoutPreReceiveWindow++;
+        }
+
+
+        if (rxCoarseSleepCount == 0U)
+        {
+            rxDiagTimeoutSleep0Window++;
+        }
+        else if (rxCoarseSleepCount == 1U)
+        {
+            rxDiagTimeoutSleep1Window++;
+        }
+        else
+        {
+            rxDiagTimeoutSleep2Window++;
+        }
+
+
+        rxDiagTimeoutAttemptSumWindow +=
+            rxAttemptNumber;
+
+
+        if (rxAttemptNumber >
+            rxDiagTimeoutAttemptMaxWindow)
+        {
+            rxDiagTimeoutAttemptMaxWindow =
+                rxAttemptNumber;
+        }
+
+
+        if (timeoutReceiveCallNs >
+            rxDiagTimeoutReceiveCallMaxNsWindow)
+        {
+            rxDiagTimeoutReceiveCallMaxNsWindow =
+                timeoutReceiveCallNs;
+        }
+
+
+        if (rxDiagCurrentConsecutiveTimeout >
+            rxDiagMaxConsecutiveTimeoutWindow)
+        {
+            rxDiagMaxConsecutiveTimeoutWindow =
+                rxDiagCurrentConsecutiveTimeout;
+        }
+    };
+
+
+    // å®Œæˆæœ¬é€±æœŸçµ±è¨ˆï¼›é”åˆ° 4000 calls æ™‚ä»¥ seqlock ç™¼å¸ƒä¸€ç§’å¿«ç…§ã€‚
+    auto FinalizeRxDiagnostic =
+        [&]()
+    {
+        // Receive-phase elapsed time.
+        if (rxDeadlineValid &&
+            sendQpcFrequency > 0)
+        {
+            LARGE_INTEGER rxEndQpc =
+                {};
+
+
+            if (RtQueryPerformanceCounter(
+                &rxEndQpc) &&
+                rxEndQpc.QuadPart >=
+                rxStartQpc.QuadPart)
+            {
+                uint64_t rxElapsedCounts =
+                    (uint64_t)
+                    (
+                        rxEndQpc.QuadPart -
+                        rxStartQpc.QuadPart
+                    );
+
+
+                uint64_t rxElapsedNs =
+                    (
+                        rxElapsedCounts *
+                        1000000000ULL
+                    )
+                    /
+                    sendQpcFrequency;
+
+
+                rxDiagElapsedSumNsWindow +=
+                    rxElapsedNs;
+
+                rxDiagElapsedValidWindow++;
+
+
+                if (rxElapsedNs >
+                    rxDiagElapsedMaxNsWindow)
+                {
+                    rxDiagElapsedMaxNsWindow =
+                        rxElapsedNs;
+                }
+            }
+            else
+            {
+                rxDiagQpcFailWindow++;
+            }
+        }
+
+
+        // Publish every 4000 completed RX calls.
+        if (rxDiagCallsWindow >=
+            4000ULL)
+        {
+            uint64_t rxElapsedAvgNs =
+                rxDiagElapsedValidWindow > 0
+                ?
+                (
+                    rxDiagElapsedSumNsWindow /
+                    rxDiagElapsedValidWindow
+                )
+                :
+                0ULL;
+
+            uint64_t rxTimeoutAttemptAvg =
+                rxDiagHardTimeoutWindow > 0
+                ?
+                (
+                    rxDiagTimeoutAttemptSumWindow /
+                    rxDiagHardTimeoutWindow
+                )
+                :
+                0ULL;
+
+
+            InterlockedIncrement(
+                &g_ecatRxDiagSequence);
+
+
+            g_ecatRxDiagCalls =
+                (LONG)rxDiagCallsWindow;
+
+            g_ecatRxDiagFirstRxSuccess =
+                (LONG)rxDiagFirstRxSuccessWindow;
+
+            g_ecatRxDiagEmptyRx =
+                (LONG)rxDiagEmptyRxWindow;
+
+            g_ecatRxDiagInvalidFrame =
+                (LONG)rxDiagInvalidFrameWindow;
+
+            g_ecatRxDiagSoftLateAccepted =
+                (LONG)rxDiagSoftLateAcceptedWindow;
+
+            g_ecatRxDiagTotalSoftLateAccepted =
+                (LONGLONG)rxDiagTotalSoftLateAccepted;
+
+            g_ecatRxDiagSoftLateElapsedMaxNs =
+                (LONGLONG)rxDiagSoftLateElapsedMaxNsWindow;
+
+            g_ecatRxDiagHardTimeout =
+                (LONG)rxDiagHardTimeoutWindow;
+
+            g_ecatRxDiagPostReceiveLate =
+                (LONG)rxDiagPostReceiveLateWindow;
+
+            g_ecatRxDiagCurrentConsecutiveTimeout =
+                (LONG)rxDiagCurrentConsecutiveTimeout;
+
+            g_ecatRxDiagMaxConsecutiveTimeout =
+                (LONG)rxDiagMaxConsecutiveTimeoutWindow;
+
+            g_ecatRxDiagTotalHardTimeout =
+                (LONGLONG)rxDiagTotalHardTimeout;
+
+            g_ecatRxDiagRecoveryAfterTimeout =
+                (LONG)rxDiagRecoveryAfterTimeoutWindow;
+
+            g_ecatRxDiagQpcFail =
+                (LONG)rxDiagQpcFailWindow;
+
+            g_ecatRxDiagSleepCount =
+                (LONG)rxDiagSleepCountWindow;
+
+            g_ecatRxDiagElapsedValid =
+                (LONG)rxDiagElapsedValidWindow;
+
+            g_ecatRxDiagElapsedAvgNs =
+                (LONGLONG)rxElapsedAvgNs;
+
+            g_ecatRxDiagElapsedMaxNs =
+                (LONGLONG)rxDiagElapsedMaxNsWindow;
+
+            g_ecatRxDiagTimeoutPreReceive =
+                (LONG)rxDiagTimeoutPreReceiveWindow;
+
+            g_ecatRxDiagTimeoutSleep0 =
+                (LONG)rxDiagTimeoutSleep0Window;
+
+            g_ecatRxDiagTimeoutSleep1 =
+                (LONG)rxDiagTimeoutSleep1Window;
+
+            g_ecatRxDiagTimeoutSleep2 =
+                (LONG)rxDiagTimeoutSleep2Window;
+
+            g_ecatRxDiagTimeoutAttemptAvg =
+                (LONG)rxTimeoutAttemptAvg;
+
+            g_ecatRxDiagTimeoutAttemptMax =
+                (LONG)rxDiagTimeoutAttemptMaxWindow;
+
+            g_ecatRxDiagReceiveCallMaxNs =
+                (LONGLONG)rxDiagReceiveCallMaxNsWindow;
+
+            g_ecatRxDiagTimeoutReceiveCallMaxNs =
+                (LONGLONG)rxDiagTimeoutReceiveCallMaxNsWindow;
+
+            g_ecatRxDiagSoftDeadlineNs =
+                (LONG)RX_SOFT_DEADLINE_NS;
+
+            g_ecatRxDiagHardDeadlineNs =
+                (LONG)RX_HARD_DEADLINE_NS;
+
+
+            MemoryBarrier();
+
+
+            InterlockedIncrement(
+                &g_ecatRxDiagSequence);
+
+
+            rxDiagCallsWindow = 0;
+            rxDiagFirstRxSuccessWindow = 0;
+            rxDiagEmptyRxWindow = 0;
+            rxDiagInvalidFrameWindow = 0;
+            rxDiagSoftLateAcceptedWindow = 0;
+            rxDiagSoftLateElapsedMaxNsWindow = 0;
+            rxDiagHardTimeoutWindow = 0;
+            rxDiagPostReceiveLateWindow = 0;
+            rxDiagMaxConsecutiveTimeoutWindow = 0;
+            rxDiagRecoveryAfterTimeoutWindow = 0;
+            rxDiagQpcFailWindow = 0;
+            rxDiagSleepCountWindow = 0;
+            rxDiagElapsedValidWindow = 0;
+            rxDiagElapsedSumNsWindow = 0;
+            rxDiagElapsedMaxNsWindow = 0;
+            rxDiagTimeoutPreReceiveWindow = 0;
+            rxDiagTimeoutSleep0Window = 0;
+            rxDiagTimeoutSleep1Window = 0;
+            rxDiagTimeoutSleep2Window = 0;
+            rxDiagTimeoutAttemptSumWindow = 0;
+            rxDiagTimeoutAttemptMaxWindow = 0;
+            rxDiagReceiveCallMaxNsWindow = 0;
+            rxDiagTimeoutReceiveCallMaxNsWindow = 0;
+        }
+    };
+
+
+    // æœ¬æ©Ÿæ­£å¸¸æƒ…æ³å¿…é ˆæœ‰æœ‰æ•ˆ QPCã€‚fallback åªé˜²æ­¢ QPC ç•°å¸¸æ™‚å›åˆ°
+    // èˆŠç‰ˆæ•¸åƒæ¬¡é‡è©¦çš„é˜»å¡è¡Œç‚ºï¼Œä¸æ˜¯æ­£å¸¸ RX ç­‰å¾…ç­–ç•¥ã€‚
+    int fallbackReceiveAttempts =
+        4;
+
+    while (true)
+    {
+        LONGLONG rxAttemptStartQpc =
+            0;
+
+        bool rxAttemptStartQpcValid =
+            false;
+
+        bool rxAttemptSoftLate =
+            false;
+
+        uint64_t rxAttemptElapsedNs =
+            0ULL;
+
+
+        // æ¯æ¬¡å‘¼å« ReceivePacket() å‰å…ˆæª¢æŸ¥ Hard Deadlineï¼Œé¿å…æ˜çŸ¥é€¾æ™‚
+        // ä»é€²å…¥å¯èƒ½è€—æ™‚çš„ driver callã€‚
+        if (rxDeadlineValid)
+        {
+            LARGE_INTEGER rxNowQpc =
+                {};
+
+
+            if (!RtQueryPerformanceCounter(
+                &rxNowQpc))
+            {
+                rxDiagQpcFailWindow++;
+                MarkRxHardTimeoutDiagnostic(
+                    false,
+                    0ULL);
+
+                FinalizeRxDiagnostic();
+
+                return -1;
+            }
+
+
+            if (rxNowQpc.QuadPart >=
+                rxHardDeadlineQpc)
+            {
+                MarkRxHardTimeoutDiagnostic(
+                    true,
+                    0ULL);
+
+                FinalizeRxDiagnostic();
+
+                return -1;
+            }
+
+
+            rxAttemptStartQpc =
+                rxNowQpc.QuadPart;
+
+            rxAttemptStartQpcValid =
+                true;
+        }
+        else
+        {
+            if (fallbackReceiveAttempts-- <=
+                0)
+            {
+                MarkRxHardTimeoutDiagnostic(
+                    true,
+                    0ULL);
+
+                FinalizeRxDiagnostic();
+
+                return -1;
+            }
+        }
+
+
+        rxAttemptNumber++;
+
+
+        int rxLen =
+            m_pNic->
+            ReceivePacket(
+                m_rxBuffer);
+
+
+        // =============================================================
+        // ReceivePacket() å¾Œçš„ Hard Deadline å¼·åˆ¶æª¢æŸ¥
+        //
+        // åªåœ¨å‘¼å«å‰æª¢æŸ¥ä»ä¸å¤ ï¼Œå› ç‚º driver call æœ¬èº«å¯èƒ½å¶ç™¼å»¶é²ã€‚
+        // å› æ­¤ ReceivePacket() è¿”å›å¾Œç«‹åˆ»è®€ QPCï¼š
+        // - æœªè¶…æ™‚ï¼šç¹¼çºŒé©—è­‰ EtherTypeã€Datagram Index èˆ‡ WKCã€‚
+        // - å·²è¶…æ™‚ï¼šå³ä½¿ Frame å…§å®¹æ­£ç¢ºä¹Ÿä¸Ÿæ£„ï¼Œè¨˜éŒ„ PostReceiveLateã€‚
+        //
+        // æ­¤æª¢æŸ¥ä¸ä¿®æ”¹ HAL æˆ– Timerã€‚
+        // =============================================================
+
+        if (rxDeadlineValid)
+        {
+            LARGE_INTEGER rxAfterReceiveQpc =
+                {};
+
+            uint64_t rxReceiveCallNs =
+                0ULL;
+
+
+            if (!RtQueryPerformanceCounter(
+                &rxAfterReceiveQpc))
+            {
+                rxDiagQpcFailWindow++;
+                MarkRxHardTimeoutDiagnostic(
+                    false,
+                    0ULL);
+
+                FinalizeRxDiagnostic();
+
+                return -1;
+            }
+
+
+            if (rxAttemptStartQpcValid &&
+                rxAfterReceiveQpc.QuadPart >=
+                rxAttemptStartQpc)
+            {
+                uint64_t rxReceiveCallCounts =
+                    (uint64_t)
+                    (
+                        rxAfterReceiveQpc.QuadPart -
+                        rxAttemptStartQpc
+                    );
+
+
+                rxReceiveCallNs =
+                    (
+                        rxReceiveCallCounts *
+                        1000000000ULL
+                    )
+                    /
+                    sendQpcFrequency;
+
+
+                if (rxReceiveCallNs >
+                    rxDiagReceiveCallMaxNsWindow)
+                {
+                    rxDiagReceiveCallMaxNsWindow =
+                        rxReceiveCallNs;
+                }
+            }
+
+
+            if (rxAfterReceiveQpc.QuadPart >=
+                rxStartQpc.QuadPart)
+            {
+                uint64_t rxAttemptElapsedCounts =
+                    (uint64_t)
+                    (
+                        rxAfterReceiveQpc.QuadPart -
+                        rxStartQpc.QuadPart
+                    );
+
+
+                rxAttemptElapsedNs =
+                    (
+                        rxAttemptElapsedCounts *
+                        1000000000ULL
+                    )
+                    /
+                    sendQpcFrequency;
+
+
+                rxAttemptSoftLate =
+                    rxAfterReceiveQpc.QuadPart >=
+                    rxSoftDeadlineQpc;
+            }
+
+
+            if (rxAfterReceiveQpc.QuadPart >=
+                rxHardDeadlineQpc)
+            {
+                // Count the actual ReceivePacket result as well.
+                if (rxLen <= 0)
+                {
+                    rxDiagEmptyRxWindow++;
+                }
+
+
+                rxDiagPostReceiveLateWindow++;
+                MarkRxHardTimeoutDiagnostic(
+                    false,
+                    rxReceiveCallNs);
+
+                // IMPORTANT:
+                // Even if rxLen contains a valid matching EtherCAT
+                // frame, it is intentionally NOT accepted because it
+                // arrived back to software after the hard deadline.
+                FinalizeRxDiagnostic();
+
+                return -1;
+            }
+        }
+
+
+        if (rxLen <= 0)
+        {
+            rxDiagEmptyRxWindow++;
+
+            if (rxCoarseSleepCount <
+                2U)
+            {
+                if (rxDeadlineValid)
+                {
+                    LARGE_INTEGER rxBeforeSleepQpc =
+                        {};
+
+
+                    if (!RtQueryPerformanceCounter(
+                        &rxBeforeSleepQpc))
+                    {
+                        rxDiagQpcFailWindow++;
+                        MarkRxHardTimeoutDiagnostic(
+                            false,
+                            0ULL);
+
+                        FinalizeRxDiagnostic();
+
+                        return -1;
+                    }
+
+
+                    if (rxBeforeSleepQpc.QuadPart >=
+                        rxHardDeadlineQpc)
+                    {
+                        MarkRxHardTimeoutDiagnostic(
+                            true,
+                            0ULL);
+
+                        FinalizeRxDiagnostic();
+
+                        return -1;
+                    }
+
+
+                    uint64_t remainingCounts =
+                        (uint64_t)
+                        (
+                            rxHardDeadlineQpc -
+                            rxBeforeSleepQpc.QuadPart
+                        );
+
+
+                    if (remainingCounts <=
+                        rxSleepCounts)
+                    {
+                        continue;
+                    }
+                }
+
+
+                rxCoarseSleepCount++;
+
+                rxDiagSleepCountWindow++;
+
+
+                RtSleepFt(
+                    &wait);
+            }
+
+            continue;
+        }
+
+
+        // =================================================
+        // EtherType Check
+        // =================================================
+
+        if (rxLen <
+            totalFrameLength)
+        {
+            rxDiagInvalidFrameWindow++;
+
+            continue;
+        }
+
+
+        if (m_rxBuffer[12] !=
+                0x88 ||
+            m_rxBuffer[13] !=
+                0xA4)
+        {
+            rxDiagInvalidFrameWindow++;
+
+            continue;
+        }
+
+
+        // =================================================
+        // Datagram #1 Check
+        //
+        // LRW
+        // =================================================
+
+        if (m_rxBuffer[
+                lrwOffset + 0] !=
+            0x0C)
+        {
+            rxDiagInvalidFrameWindow++;
+
+            continue;
+        }
+
+
+        if (m_rxBuffer[
+                lrwOffset + 1] !=
+            lrwIdx)
+        {
+            rxDiagInvalidFrameWindow++;
+
+            continue;
+        }
+
+
+        // =================================================
+        // Datagram #2 Check
+        //
+        // FRMW
+        // =================================================
+
+        if (m_rxBuffer[
+                frmwOffset + 0] !=
+            0x0E)
+        {
+            rxDiagInvalidFrameWindow++;
+
+            continue;
+        }
+
+
+        if (m_rxBuffer[
+                frmwOffset + 1] !=
+            frmwIdx)
+        {
+            rxDiagInvalidFrameWindow++;
+
+            continue;
+        }
+
+
+        // =================================================
+        // 7. Copy LRW Input Process Image
+        //
+        // EtherCAT Slave å·²ç¶“ä¿®æ”¹ LRW Dataã€‚
+        // =================================================
+
+        memcpy(
+            data,
+            &m_rxBuffer[
+                lrwDataOffset],
+            length);
+
+
+        // =================================================
+        // 8. LRW WKC
+        // =================================================
+
+        uint16_t lrwWkc =
+            (uint16_t)
+            m_rxBuffer[
+                lrwWkcOffset]
+            |
+            (
+                (uint16_t)
+                m_rxBuffer[
+                    lrwWkcOffset +
+                    1]
+                <<
+                8
+            );
+
+
+        // =================================================
+        // 9. DC Reference Time
+        //
+        // FRMW Data 8 Bytes
+        // =================================================
+
+        uint64_t receivedDcTime =
+            0;
+
+
+        memcpy(
+            &receivedDcTime,
+            &m_rxBuffer[
+                frmwDataOffset],
+            sizeof(
+                uint64_t));
+
+
+        *dcReferenceTime =
+            receivedDcTime;
+
+
+        // =================================================
+        // 10. FRMW WKC
+        // =================================================
+
+        uint16_t receivedDcWkc =
+            (uint16_t)
+            m_rxBuffer[
+                frmwWkcOffset]
+            |
+            (
+                (uint16_t)
+                m_rxBuffer[
+                    frmwWkcOffset +
+                    1]
+                <<
+                8
+            );
+
+
+        *dcWkc =
+            (int)
+            receivedDcWkc;
+
+
+        if (rxAttemptSoftLate)
+        {
+            rxDiagSoftLateAcceptedWindow++;
+            rxDiagTotalSoftLateAccepted++;
+
+            if (rxAttemptElapsedNs >
+                rxDiagSoftLateElapsedMaxNsWindow)
+            {
+                rxDiagSoftLateElapsedMaxNsWindow =
+                    rxAttemptElapsedNs;
+            }
+        }
+
+
+        // =============================================================
+        // V1A RX diagnostic success.
+        // =============================================================
+
+        if (rxAttemptNumber ==
+            1U)
+        {
+            rxDiagFirstRxSuccessWindow++;
+        }
+
+
+        // =============================================================
+        // Consecutive Timeout Diagnostic
+        //
+        // A successful matching EtherCAT response after one or more
+        // timed-out calls counts as one recovery and clears the streak.
+        // =============================================================
+
+        if (rxDiagCurrentConsecutiveTimeout >
+            0)
+        {
+            rxDiagRecoveryAfterTimeoutWindow++;
+            rxDiagCurrentConsecutiveTimeout = 0;
+        }
+
+
+        FinalizeRxDiagnostic();
+
+
+        // =================================================
+        // Success
+        //
+        // Return LRW Working Counter
+        // =================================================
+
+        return (int)
+            lrwWkc;
+    }
+
+
+    // =====================================================
+    // Timeout / no matching EtherCAT response before RX deadline
+    // =====================================================
+
+    return -1;
 }
 
 

@@ -170,14 +170,15 @@ void NCManager::Reset()
 {
 
     //重置馬達區塊--------------------------------------------------
+    if (m_motion.IsAnyAxisFaulted())
+    {
+        m_motion.ResetAllFaults();//有錯誤才清除
+
+    }
     m_motion.StopGroup();//滑行停止
     m_motion.ResetPhysicalPC(); // 🌟 按下 Reset，實體行號歸零
     
-    /*
-    if ()
-    {
-        ResetFault
-    }*/
+  
    
     // 🌟 [新增] 如果有放電跳刀/排渣，必須強制解鎖跳刀狀態機！
     // m_motion.ResetAllFaults(); // (如果您有寫清除跳刀狀態的 API，建議在這裡呼叫)
@@ -440,9 +441,12 @@ void NCManager::ProcessTask()
     // =========================================================
     if (m_state == NCState::RESET_STATE)
     {
+    
         // 檢查硬體馬達是否「完全靜止」？
         if (m_motion.IsGroupStandstill())
         {
+           
+            
             // 🛑 馬達完全靜止了！現在才是同步的完美時機！
 
             // 1. 同步大腦的數學座標 (把實體座標拉回大腦)
@@ -457,6 +461,8 @@ void NCManager::ProcessTask()
             UpdateSystemVariables();
             // DEBUG_PRINT("[NC] Reset Complete. Machine completely stopped.\n");
         }
+
+        
 
         // ⚠️ 只要還在滑行，就立刻 return，不准執行下面的 G 碼解析與模式分流！
         return;

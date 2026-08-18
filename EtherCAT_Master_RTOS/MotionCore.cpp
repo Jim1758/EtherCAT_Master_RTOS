@@ -251,38 +251,60 @@ void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更
     const uint16_t MASK_STATE = 0x006F;
     const uint16_t MASK_FAULT = 0x0008;
 
-    // A. 檢查故障 (Fault)
+    // =========================================================
+      // A. 檢查故障 (Fault)
+      // =========================================================
     if ((statusWord & MASK_FAULT) != 0)
     {
-        servo.pOutput->ControlWord = 0x0080; // Fault Reset
         axis.isServoOn = false;
-        axis.state = MotionState::MotionState_ERROR;
-    }
-    // B. Switch On Disabled (驅動器剛上電，未準備好)
-    else if ((statusWord & 0x004F) == 0x0040)
-    {
-        servo.pOutput->ControlWord = 0x0006; // Shutdown
-    }
-    // C. Ready to Switch On (準備就緒)
-    else if ((statusWord & MASK_STATE) == 0x0021)
-    {
-        servo.pOutput->ControlWord = 0x0007; // Switch On
-    }
-    // D. Switched On (電路已接通，等待最後一指令)
-    else if ((statusWord & MASK_STATE) == 0x0023)
-    {
-        servo.pOutput->ControlWord = 0x000F; // Enable Operation (激磁！)
-    }
-    // E. Operation Enabled (已成功激磁)
-    else if ((statusWord & MASK_STATE) == 0x0027)
-    {
-        servo.pOutput->ControlWord = 0x000F; // 維持激磁狀態
-        axis.isServoOn = true;
+
+        if (axis.resetRequest)
+        {
+            // 🌟 情況 1：系統正在嘗試復歸 (開機初始化，或是手動按了 Reset)
+            servo.pOutput->ControlWord = 0x0080; // 送出 Fault Reset
+            // 💡 故意不把 axis.isFault 設為 true，保護 NC 不跳機
+        }
+        else
+        {
+            // 🌟 情況 2：非預期的真實警報 (例如加工中過載、撞到極限)
+            axis.isFault = true;
+            axis.state = MotionState::MotionState_ERROR;
+            servo.pOutput->ControlWord = 0x0000; // 停止送出指令
+        }
     }
     else
     {
-        // 若狀態未知或正在切換中，維持原本指令或歸零
-        axis.isServoOn = false;
+        // =========================================================
+        // 只要脫離了 FAULT 狀態，立刻清除復歸旗標
+        // =========================================================
+        axis.resetRequest = false;
+
+        // B. Switch On Disabled (驅動器剛上電，未準備好)
+        if ((statusWord & 0x004F) == 0x0040)
+        {
+            servo.pOutput->ControlWord = 0x0006; // Shutdown
+        }
+        // C. Ready to Switch On (準備就緒)
+        else if ((statusWord & MASK_STATE) == 0x0021)
+        {
+            servo.pOutput->ControlWord = 0x0007; // Switch On
+        }
+        // D. Switched On (電路已接通，等待最後一指令)
+        else if ((statusWord & MASK_STATE) == 0x0023)
+        {
+            servo.pOutput->ControlWord = 0x000F; // Enable Operation (激磁！)
+        }
+        // E. Operation Enabled (已成功激磁)
+        else if ((statusWord & MASK_STATE) == 0x0027)
+        {
+            servo.pOutput->ControlWord = 0x000F; // 維持激磁狀態
+            axis.isServoOn = true;
+        }
+        else
+        {
+            // 狀態未知或正在切換中
+            axis.isServoOn = false;
+        }
     }
 }
 
@@ -945,6 +967,7 @@ void MotionCore::ResetFault(AxisContext& axis)
         (axis.state == MotionState::MotionState_ESTOP);
 
     // 2. 清除所有異常旗標與 PID 歷史
+    axis.resetRequest = true;
     axis.isFault = false;
     axis.isLagAlarm = false;
     axis.pid.integralAcc = 0.0;
@@ -6113,7 +6136,62 @@ bool MotionCore::IsGroupStandstill() const
     return true;
 }
 
+// 🌟 檢查全系統所有存在的實體軸是否有警報
+bool MotionCore::IsAnyAxisFaulted() const
+{
+    // 防呆：指標尚未初始化則回傳無錯誤
+    if (m_pContexts == nullptr) {
+        return false;
+    }
 
+    // 掃描所有軸
+    for (size_t i = 0; i < m_pContexts->size(); i++)
+    {
+        const AxisContext& axis = (*m_pContexts)[i];
+
+        // 條件：軸實體存在，且狀態為 isFault (硬體或軟體跳機)
+        if (axis.isExist && axis.isFault)
+        {
+            return true; // 只要有一軸異常，就回傳 true
+        }
+    }
+
+    return false;
+}
+
+// 🌟 檢查當前插補群組內參與的軸是否有警報
+bool MotionCore::IsGroupFaulted() const
+{
+    // 防呆：如果沒有掛載實體，或是群組根本沒在動，直接當作無異常
+    if (m_pContexts == nullptr) {
+        return false;
+    }
+
+    // 如果佇列沒在跑，就用全域檢查代替 (或是直接回傳 false，依您的系統邏輯而定)
+    if (!m_Group.isActive) {
+        return false;
+    }
+
+    // 掃描當前正在執行的那張單子 (currentCmd) 裡面有參與的軸
+    for (int j = 0; j < m_Group.currentCmd.axisCount; j++)
+    {
+        int axisIdx = m_Group.currentCmd.axisIndices[j];
+
+        // 確保軸編號在合法範圍內
+        if (axisIdx >= 0 && axisIdx < m_pContexts->size())
+        {
+            const AxisContext& axis = (*m_pContexts)[axisIdx];
+
+            // 如果這個群組內的軸發生錯誤
+            if (axis.isExist && axis.isFault)
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
 
 // ==========================================
 // [樣板實例化] (Explicit Instantiation)

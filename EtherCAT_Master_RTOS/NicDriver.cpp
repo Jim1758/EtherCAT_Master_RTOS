@@ -1,110 +1,201 @@
-#include "NicDriver.h"
-#include <stdio.h>
+﻿#include "NicDriver.h"
 #include "GlobalConfig.h"
-unsigned char CNicDriver::s_RxBuffer[MAX_ETHER_FRAME_SIZE];
-volatile int  CNicDriver::s_RxLen = 0;
 
-// ���b Buffer (�����X�ʦ]�����Ь� NULL �ӳ���)
+#include <string.h>
+
+/*
+ * 檔案：NicDriver.cpp
+ * 版本：EtherCAT DC Release Candidate RC1
+ *
+ * 此檔案只負責 RTX64 NAL Queue、Frame ownership 與封包搬移。
+ * 不處理 EtherCAT Datagram、DC 控制、Motion 或 NC 邏輯。
+ *
+ * 正式候選測試設定：
+ * - RTX64 NAL Interrupt thread priority：70
+ * - RTX64 NAL Transmit complete thread priority：70
+ * - RX Mode：STANDARD_BUFFER_V2
+ * - EtherType filter：0x88A4
+ */
+
+#if defined(_MSC_VER)
+#pragma message("Compiling NicDriver.cpp - ETHERCAT_DC_RELEASE_CANDIDATE_RC1")
+#endif
+
+ // TX Queue callback 的保底緩衝區；zero-copy RtNalTransmitEx() 不使用它傳資料。
 static unsigned char g_DummyBuffer[MAX_ETHER_FRAME_SIZE];
 
-CNicDriver::CNicDriver() {
-    m_hTxQueue = NULL; m_hRxQueue = NULL; m_pTxFrame = NULL;
+// 所有計數都只增加或在 Open() 成功時歸零，供低優先權診斷執行緒讀取。
+volatile LONGLONG g_nicTxCalls = 0;
+volatile LONGLONG g_nicTxSuccess = 0;
+volatile LONGLONG g_nicTxFrameBusy = 0;
+volatile LONGLONG g_nicTxNotOwner = 0;
+volatile LONGLONG g_nicTxSubmitFail = 0;
+volatile LONGLONG g_nicTxSubmitted0 = 0;
+volatile LONG g_nicTxLastError = ERROR_SUCCESS;
+
+CNicDriver::CNicDriver()
+    : m_hTxQueue(NULL),
+    m_hRxQueue(NULL),
+    m_pTxFrame(NULL)
+{
     memset(m_pTxFrameArray, 0, sizeof(m_pTxFrameArray));
-    memset(m_MacAddress, 0, 6);
+    memset(m_MacAddress, 0, sizeof(m_MacAddress));
+    memset(&m_RxPacket, 0, sizeof(m_RxPacket));
+    m_RxPacket.Owner = this;
 }
 
-CNicDriver::~CNicDriver() { Close(); }
+CNicDriver::~CNicDriver()
+{
+    Close();
+}
 
-// ---------------------------------------------------------
-// �з� Callback (��Ʊ����֤�)
-// ---------------------------------------------------------
-BOOL CNicDriver::RxCallback(PRTNAL_FRAME pFrame) {
-    if (pFrame && pFrame->frameSize > 0) {
-        int len = pFrame->frameSize;
-        if (len > MAX_ETHER_FRAME_SIZE) len = MAX_ETHER_FRAME_SIZE;
-
-        // �N��ƽƻs���R�A�w�İ�
-        memcpy(s_RxBuffer, pFrame->frameBufferVirtualAddr, len);
-        s_RxLen = len;
+PVOID CNicDriver::RxGetPacket(PVOID pContext, LONG length)
+{
+    // NAL 要求一個可寫入的應用層 Packet；長度異常時拒絕接收。
+    CNicDriver* driver = static_cast<CNicDriver*>(pContext);
+    if (driver == NULL ||
+        length <= 0 ||
+        length > MAX_ETHER_RX_BUFFER_SIZE)
+    {
+        return NULL;
     }
 
-    // ���� Frame�A�����d�i�H���ƧQ�γo���O����
-    if (pFrame) RtNalFreeFrame(pFrame);
-    return TRUE;
+    driver->m_RxPacket.Length = static_cast<ULONG>(length);
+    return &driver->m_RxPacket;
 }
 
-PVOID CNicDriver::StubGetPacket(PVOID pContext, LONG length) { return g_DummyBuffer; }
-VOID CNicDriver::StubDecodePacket(PVOID pAppPacket, PVOID* ppContext, PULONG* ppData, PULONG pLength) {}
+VOID CNicDriver::RxDecodePacket(
+    PVOID pAppPacket,
+    PVOID* ppContext,
+    PULONG* ppData,
+    PULONG pLength)
+{
+    // 將 RxPacket 轉換成 NAL 需要的 context、資料位址與有效長度。
+    if (pAppPacket == NULL ||
+        ppContext == NULL ||
+        ppData == NULL ||
+        pLength == NULL)
+    {
+        return;
+    }
 
-// ---------------------------------------------------------
-// Open: ��l�ƨö}�Һ��d
-// ---------------------------------------------------------
+    RxPacket* packet = static_cast<RxPacket*>(pAppPacket);
+    *ppContext = packet->Owner;
+    *ppData = reinterpret_cast<PULONG>(packet->Data);
+    *pLength = packet->Length;
+}
+
+PVOID CNicDriver::StubGetPacket(PVOID pContext, LONG length)
+{
+    // TX Queue 的 ConfigureQueue 相容 callback；實際 TX 使用 NAL Frame。
+    UNREFERENCED_PARAMETER(pContext);
+    UNREFERENCED_PARAMETER(length);
+    return g_DummyBuffer;
+}
+
+VOID CNicDriver::StubDecodePacket(
+    PVOID pAppPacket,
+    PVOID* ppContext,
+    PULONG* ppData,
+    PULONG pLength)
+{
+    UNREFERENCED_PARAMETER(pAppPacket);
+    UNREFERENCED_PARAMETER(ppContext);
+    UNREFERENCED_PARAMETER(ppData);
+    UNREFERENCED_PARAMETER(pLength);
+}
+
 bool CNicDriver::Open()
 {
-    // 1. ��l�� NAL
-    if (!RtNalInit(RTNAL_API_VERSION)) 
+    // RtNalInit 必須在任何 Queue/Frame API 之前成功。
+    if (!RtNalInit(RTNAL_API_VERSION))
     {
-      
-        DEBUG_PRINT("CNicDriver Error: RtNalInit failed (0x%X)\n", GetLastError());//
+        DEBUG_PRINT("CNicDriver Error: RtNalInit failed (0x%X)\n", GetLastError());
         return false;
     }
 
-    DEBUG_PRINT("Initializing Network Interface !\n");//
- 
+    DEBUG_PRINT("Initializing Network Interface !\n");
 
+    // 先取得 TX，再取得 RX；RX 失敗時統一由 Close() 回收 TX。
+    if (!AcquireTxQueueInternal())
+        return false;
 
-    // 2. �j�M����� TX/RX Queue
-    if (!AcquireTxQueueInternal()) return false;
-    if (!AcquireRxQueueInternal()) return false;
+    if (!AcquireRxQueueInternal())
+    {
+        Close();
+        return false;
+    }
 
+    // TX Queue 採 RtNalTransmitEx() zero-copy，callbacks 只供 Queue 設定相容。
     RTNAL_QUEUE_CAPABILITIES caps;
-
-    // 3. �t�m TX Queue
     memset(&caps, 0, sizeof(caps));
     caps.fpRtnDecodePacket = StubDecodePacket;
     caps.fpRtnGetPacket = StubGetPacket;
 
-    if (!RtNalConfigureQueue(m_hTxQueue, (PVOID)this, &caps)) 
+    if (!RtNalConfigureQueue(m_hTxQueue, static_cast<PVOID>(this), &caps))
     {
         DEBUG_PRINT("CNicDriver Error: Configure TX failed (0x%X)\n", GetLastError());
-        Close(); return false;
+        Close();
+        return false;
     }
+
     DEBUG_PRINT("CNicDriver: TX Configuration [OK]\n");
+    DEBUG_PRINT("CNicDriver: TX Diagnostic [RELEASE_CANDIDATE_RC1]\n");
 
-    // 4. �t�m RX Queue
-    if (m_hRxQueue) {
-        memset(&caps, 0, sizeof(caps));
-        caps.fpRtnReceiveCallback = RxCallback; // ���U Callback
-        caps.fpRtnGetPacket = StubGetPacket;
-        caps.fpRtnDecodePacket = StubDecodePacket;
+    // RX Queue 採 STANDARD_BUFFER_V2：NAL 將資料寫入 m_RxPacket.Data。
+    memset(&caps, 0, sizeof(caps));
+    caps.fpRtnGetPacket = RxGetPacket;
+    caps.fpRtnDecodePacket = RxDecodePacket;
 
-        if (!RtNalConfigureQueue(m_hRxQueue, (PVOID)this, &caps))
-        {
-            DEBUG_PRINT("CNicDriver Error: Configure RX failed (0x%X)\n", GetLastError());
-            Close(); return false;
-        }
-        DEBUG_PRINT("CNicDriver: RX Configuration [OK]\n");
-
-        // 5. �]�w EtherCAT �L�o�� (0x88A4)
-        // ���M���Ҧ��³W�h
-        for (int i = 0; i < 32; i++) RtNalClearReceiveFilterEntryEthertype(m_hRxQueue, i);
-
-        // �[�J 0x88A4 �զW��
-        if (!RtNalSetReceiveFilterEntryEthertype(m_hRxQueue, 0, 0x88A4, FALSE, TRUE)) {
-            DEBUG_PRINT("CNicDriver Warning: Failed to set EtherCAT filter (Optional)\n");
-        }
-        else {
-            DEBUG_PRINT("CNicDriver: EtherCAT Filter (0x88A4) Applied.\n");
-        }
+    if (!RtNalConfigureQueue(m_hRxQueue, static_cast<PVOID>(this), &caps))
+    {
+        DEBUG_PRINT("CNicDriver Error: Configure RX failed (0x%X)\n", GetLastError());
+        Close();
+        return false;
     }
 
-    // 6. ���t TX Frame �O����
+    DEBUG_PRINT("CNicDriver: RX Configuration [OK]\n");
+    DEBUG_PRINT("CNicDriver: RX Mode [STANDARD_BUFFER_V2]\n");
+
+    // 清除舊 filter，再只接受 EtherCAT EtherType 0x88A4。
+    for (int i = 0; i < 32; ++i)
+        RtNalClearReceiveFilterEntryEthertype(m_hRxQueue, i);
+
+    if (!RtNalSetReceiveFilterEntryEthertype(
+        m_hRxQueue,
+        0,
+        0x88A4,
+        FALSE,
+        TRUE))
+    {
+        DEBUG_PRINT("CNicDriver Warning: Failed to set EtherCAT filter (Optional)\n");
+    }
+    else
+    {
+        DEBUG_PRINT("CNicDriver: EtherCAT Filter (0x88A4) Applied.\n");
+    }
+
+    // 配置一個由 NAL 管理 ownership 的 zero-copy TX Frame。
     m_pTxFrame = RtNalAllocateFrame(MAX_ETHER_FRAME_SIZE);
-    if (!m_pTxFrame) {
+    if (m_pTxFrame == NULL)
+    {
         DEBUG_PRINT("CNicDriver Error: Failed to allocate TX frame.\n");
-        Close(); return false;
+        Close();
+        return false;
     }
+
     m_pTxFrameArray[0] = m_pTxFrame;
+    m_RxPacket.Owner = this;
+    m_RxPacket.Length = 0;
+
+    // 每次 Open() 成功都開始一組新的 TX 診斷統計。
+    InterlockedExchange64(&g_nicTxCalls, 0);
+    InterlockedExchange64(&g_nicTxSuccess, 0);
+    InterlockedExchange64(&g_nicTxFrameBusy, 0);
+    InterlockedExchange64(&g_nicTxNotOwner, 0);
+    InterlockedExchange64(&g_nicTxSubmitFail, 0);
+    InterlockedExchange64(&g_nicTxSubmitted0, 0);
+    InterlockedExchange(&g_nicTxLastError, ERROR_SUCCESS);
 
     DEBUG_PRINT("--- Network Interface Ready ---\n");
     return true;
@@ -112,112 +203,214 @@ bool CNicDriver::Open()
 
 void CNicDriver::Close()
 {
-    if (m_pTxFrame) { RtNalFreeFrame(m_pTxFrame); m_pTxFrame = NULL; }
-    if (m_hTxQueue) { RtNalReleaseQueue(m_hTxQueue); m_hTxQueue = NULL; }
-    if (m_hRxQueue) { RtNalReleaseQueue(m_hRxQueue); m_hRxQueue = NULL; }
+    // RtNalFreeFrame() 會等待 NAL 歸還尚在傳送中的 Frame。
+    if (m_pTxFrame != NULL)
+    {
+        RtNalFreeFrame(m_pTxFrame);
+        m_pTxFrame = NULL;
+        m_pTxFrameArray[0] = NULL;
+    }
+
+    if (m_hTxQueue != NULL)
+    {
+        RtNalReleaseQueue(m_hTxQueue);
+        m_hTxQueue = NULL;
+    }
+
+    if (m_hRxQueue != NULL)
+    {
+        RtNalReleaseQueue(m_hRxQueue);
+        m_hRxQueue = NULL;
+    }
+
+    m_RxPacket.Length = 0;
 }
 
-bool CNicDriver::SendPacket(unsigned char* pData, unsigned int length) {
-    if (!m_hTxQueue || !m_pTxFrame) return false;
+bool CNicDriver::SendPacket(unsigned char* pData, unsigned int length)
+{
+    // Calls 包含成功、輸入錯誤、ownership busy 與提交失敗。
+    InterlockedIncrement64(&g_nicTxCalls);
 
-    // �N��ƽƻs�� DMA �w�İ�
+    // 在接觸 NAL Frame 前先驗證 Handle、資料位址與長度。
+    if (m_hTxQueue == NULL ||
+        m_pTxFrame == NULL ||
+        pData == NULL ||
+        length == 0 ||
+        length > MAX_ETHER_FRAME_SIZE)
+    {
+        InterlockedIncrement64(&g_nicTxSubmitFail);
+        InterlockedExchange(&g_nicTxLastError, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    // 只有 Application 擁有 Frame 時才能修改 frameSize 與資料緩衝區。
+    // 若 NAL 尚未完成上一筆 TX，直接回傳 false，絕不覆寫使用中的 Frame。
+    if (!RtNalIsApplicationFrame(m_pTxFrame))
+    {
+        const DWORD error = GetLastError();
+        InterlockedIncrement64(&g_nicTxFrameBusy);
+        InterlockedExchange(&g_nicTxLastError, static_cast<LONG>(error));
+        return false;
+    }
+
+    // Ownership 已確認，現在才可安全填入 Ethernet Frame。
     memcpy(m_pTxFrame->frameBufferVirtualAddr, pData, length);
     m_pTxFrame->frameSize = length;
 
     ULONG submitted = 0;
-    return RtNalTransmitEx(m_hTxQueue, m_pTxFrameArray, 1, &submitted);
-}
+    // RtNalTransmitEx() 成功後 ownership 交給 NAL，直到 TX complete 歸還。
+    const BOOL result = RtNalTransmitEx(
+        m_hTxQueue,
+        m_pTxFrameArray,
+        1,
+        &submitted);
 
-unsigned int CNicDriver::ReceivePacket(unsigned char* pBuffer) {
-    if (!m_hRxQueue) return 0;
-    s_RxLen = 0;
+    // API 失敗時保留 submitted 與 GetLastError()，供長時間測試定位。
+    if (result != TRUE)
+    {
+        const DWORD error = GetLastError();
+        InterlockedIncrement64(&g_nicTxSubmitFail);
 
-    // �D��Ĳ�o�����ˬd (�зǼҦ�)
-    RtNalReceive(m_hRxQueue);
+        if (submitted == 0)
+            InterlockedIncrement64(&g_nicTxSubmitted0);
 
-    // �p�G Callback ���Q�I�s�As_RxLen �|�j�� 0
-    if (s_RxLen > 0 && pBuffer != NULL) {
-        memcpy(pBuffer, s_RxBuffer, s_RxLen);
-        return s_RxLen;
+        if (error == ERROR_NOT_OWNER)
+            InterlockedIncrement64(&g_nicTxNotOwner);
+
+        InterlockedExchange(&g_nicTxLastError, static_cast<LONG>(error));
+        return false;
     }
-    return 0;
+
+    // 本版本一次只提交一個 Frame，成功條件必須嚴格等於 1。
+    if (submitted != 1)
+    {
+        const DWORD error = GetLastError();
+        InterlockedIncrement64(&g_nicTxSubmitFail);
+
+        if (submitted == 0)
+            InterlockedIncrement64(&g_nicTxSubmitted0);
+
+        InterlockedExchange(&g_nicTxLastError, static_cast<LONG>(error));
+        return false;
+    }
+
+    InterlockedIncrement64(&g_nicTxSuccess);
+    return true;
 }
 
-// ---------------------------------------------------------
-// �j�M����� TX Queue (�q�Ϊ�)
-// ---------------------------------------------------------
+unsigned int CNicDriver::ReceivePacket(unsigned char* pBuffer)
+{
+    // 非阻塞式嘗試接收；無資料時回傳 0，由上層 deadline loop 決定重試。
+    if (m_hRxQueue == NULL || pBuffer == NULL)
+        return 0;
+
+    m_RxPacket.Length = 0;
+
+    // RtNalReceive() 會透過 RxGetPacket/RxDecodePacket 填入 m_RxPacket。
+    if (!RtNalReceive(m_hRxQueue))
+        return 0;
+
+    ULONG length = m_RxPacket.Length;
+    if (length == 0 || length > MAX_ETHER_RX_BUFFER_SIZE)
+        return 0;
+
+    if (length > MAX_ETHER_FRAME_SIZE)
+        length = MAX_ETHER_FRAME_SIZE;
+
+    memcpy(pBuffer, m_RxPacket.Data, length);
+    return static_cast<unsigned int>(length);
+}
+
 bool CNicDriver::AcquireTxQueueInternal()
 {
-    INT num = RtNalGetNumberOfQueues();
-    RTNAL_QUEUE info; RTNAL_QUEUE_CRITERIA cri; RTNAL_QUEUE_EVENTS evt;
+    // 掃描 NAL Queue，取得第一個可用 TX Queue。
+    const INT queueCount = RtNalGetNumberOfQueues();
+    RTNAL_QUEUE info;
+    RTNAL_QUEUE_CRITERIA criteria;
+    RTNAL_QUEUE_EVENTS events;
 
-    // �M���Ҧ� Queue�A���Ĥ@�ӥi�Ϊ� TX Queue
-    for (int i = 0; i < num; i++) {
-        if (RtNalGetQueueInfoByIndex(i, &info)) {
-            if (info.queueInfo.queueType == RTNAL_QUEUE_TYPE_TX) {
+    for (int i = 0; i < queueCount; ++i)
+    {
+        if (!RtNalGetQueueInfoByIndex(i, &info))
+            continue;
 
-                memset(&cri, 0, sizeof(cri)); memset(&evt, 0, sizeof(evt));
-                cri.method = RTNAL_DEVICE_NAME_QUEUE_EXACT;
-                cri.deviceQueueNumber = info.queueInfo.deviceQueueNumber;
-                cri.queueType = RTNAL_QUEUE_TYPE_TX;
-                memcpy(cri.deviceName, info.deviceInfo.deviceName, RTNAL_DEVICE_NAME_LENGTH);
+        if (info.queueInfo.queueType != RTNAL_QUEUE_TYPE_TX)
+            continue;
 
-                // �з� TX Flag
-                cri.flags = RTNAL_USE_TX_COMPLETE_EVENT_FLAG;
+        memset(&criteria, 0, sizeof(criteria));
+        memset(&events, 0, sizeof(events));
 
-                m_hTxQueue = RtNalAcquireQueue(&cri, &info, &evt);
-                if (m_hTxQueue) {
-                    DEBUG_PRINT("CNicDriver: [TX] Queue Acquired\n");
-                    DEBUG_PRINT("    > Name: %s\n", info.deviceInfo.deviceName);
+        criteria.method = RTNAL_DEVICE_NAME_QUEUE_EXACT;
+        criteria.deviceQueueNumber = info.queueInfo.deviceQueueNumber;
+        criteria.queueType = RTNAL_QUEUE_TYPE_TX;
+        // TX complete thread 負責在硬體送出完成後歸還 NAL Frame ownership。
+        criteria.flags = RTNAL_USE_TX_COMPLETE_EVENT_FLAG;
+        memcpy(
+            criteria.deviceName,
+            info.deviceInfo.deviceName,
+            RTNAL_DEVICE_NAME_LENGTH);
 
-                    // �x�s�æL�X MAC ��}
-                    memcpy(m_MacAddress, info.deviceInfo.macAddress, 6);
-                    DEBUG_PRINT("    > MAC : %02X-%02X-%02X-%02X-%02X-%02X\n",
-                        m_MacAddress[0], m_MacAddress[1], m_MacAddress[2],
-                        m_MacAddress[3], m_MacAddress[4], m_MacAddress[5]);
+        m_hTxQueue = RtNalAcquireQueue(&criteria, &info, &events);
+        if (m_hTxQueue == NULL)
+            continue;
 
-                    return true;
-                }
-            }
-        }
+        memcpy(m_MacAddress, info.deviceInfo.macAddress, 6);
+
+        DEBUG_PRINT("CNicDriver: [TX] Queue Acquired\n");
+        DEBUG_PRINT("    > Name: %s\n", info.deviceInfo.deviceName);
+        DEBUG_PRINT(
+            "    > MAC : %02X-%02X-%02X-%02X-%02X-%02X\n",
+            m_MacAddress[0],
+            m_MacAddress[1],
+            m_MacAddress[2],
+            m_MacAddress[3],
+            m_MacAddress[4],
+            m_MacAddress[5]);
+        return true;
     }
 
     DEBUG_PRINT("CNicDriver Error: No available RTX64 TX Queue found!\n");
     return false;
 }
 
-// ---------------------------------------------------------
-// �j�M����� RX Queue (�q�Ϊ�)
-// ---------------------------------------------------------
 bool CNicDriver::AcquireRxQueueInternal()
 {
-    INT num = RtNalGetNumberOfQueues();
-    RTNAL_QUEUE info; RTNAL_QUEUE_CRITERIA cri; RTNAL_QUEUE_EVENTS evt;
+    // 掃描 NAL Queue，取得第一個可用 RX Queue。
+    const INT queueCount = RtNalGetNumberOfQueues();
+    RTNAL_QUEUE info;
+    RTNAL_QUEUE_CRITERIA criteria;
+    RTNAL_QUEUE_EVENTS events;
 
-    // �M���Ҧ� Queue�A���Ĥ@�ӥi�Ϊ� RX Queue
-    for (int i = 0; i < num; i++) {
-        if (RtNalGetQueueInfoByIndex(i, &info)) {
-            if (info.queueInfo.queueType == RTNAL_QUEUE_TYPE_RX) {
+    for (int i = 0; i < queueCount; ++i)
+    {
+        if (!RtNalGetQueueInfoByIndex(i, &info))
+            continue;
 
-                memset(&cri, 0, sizeof(cri)); memset(&evt, 0, sizeof(evt));
-                cri.method = RTNAL_DEVICE_NAME_QUEUE_EXACT;
-                cri.deviceQueueNumber = info.queueInfo.deviceQueueNumber;
-                cri.queueType = RTNAL_QUEUE_TYPE_RX;
-                memcpy(cri.deviceName, info.deviceInfo.deviceName, RTNAL_DEVICE_NAME_LENGTH);
+        if (info.queueInfo.queueType != RTNAL_QUEUE_TYPE_RX)
+            continue;
 
-                // ������ �з� RX Flag (�ҥα����ƥ�) ������
-                cri.flags = RTNAL_USE_RX_EVENT_FLAG;
+        memset(&criteria, 0, sizeof(criteria));
+        memset(&events, 0, sizeof(events));
 
-                m_hRxQueue = RtNalAcquireQueue(&cri, &info, &evt);
-                if (m_hRxQueue) {
-                    RtPrintf("CNicDriver: [RX] Queue Acquired\n");
-                    RtPrintf("    > Name: %s\n", info.deviceInfo.deviceName);
-                    return true;
-                }
-            }
-        }
+        criteria.method = RTNAL_DEVICE_NAME_QUEUE_EXACT;
+        criteria.deviceQueueNumber = info.queueInfo.deviceQueueNumber;
+        criteria.queueType = RTNAL_QUEUE_TYPE_RX;
+        // 保留目前已驗證可掃描從站的 RX event 設定，不在 RC1 改變模式。
+        criteria.flags = RTNAL_USE_RX_EVENT_FLAG;
+        memcpy(
+            criteria.deviceName,
+            info.deviceInfo.deviceName,
+            RTNAL_DEVICE_NAME_LENGTH);
+
+        m_hRxQueue = RtNalAcquireQueue(&criteria, &info, &events);
+        if (m_hRxQueue == NULL)
+            continue;
+
+        DEBUG_PRINT("CNicDriver: [RX] Queue Acquired\n");
+        DEBUG_PRINT("    > Name: %s\n", info.deviceInfo.deviceName);
+        return true;
     }
 
-    RtPrintf("CNicDriver Error: No available RTX64 RX Queue found!\n");
+    DEBUG_PRINT("CNicDriver Error: No available RTX64 RX Queue found!\n");
     return false;
 }

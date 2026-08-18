@@ -73,18 +73,7 @@ int _tmain(int argc, _TCHAR* argv[])//
 
 
 
-    // ==========================================================
     // Main Real-Time Loop Priority
-    //
-    // RTX64：
-    // 數字越大，Priority 越高
-    //
-    // PDO  = 64
-    // PLC  = 63
-    // MAIN = 50
-    //
-    // Main Loop 必須低於 PDO / PLC
-    // ==========================================================
 
     HANDLE hMainThread = GetCurrentThread();
 
@@ -102,6 +91,12 @@ int _tmain(int argc, _TCHAR* argv[])//
     case SystemMode::EDM_SINKER_MODE://EDM 雕磨模式
       
         
+        if (GlobalConfig::GetInstance().InitSystemParameters(Master) == false)
+        {
+            DEBUG_PRINT("InitSystemParameters Error !\n");
+            goto Exit;
+        }
+        
         if (InitEtherCATMaster() == false)//初始化 主站
         {
             DEBUG_PRINT("InitEtherCATMaster Error !\n");
@@ -116,7 +111,7 @@ int _tmain(int argc, _TCHAR* argv[])//
             goto Exit;
         }
       
-        //Master.RunRealTimeCycle_EXAMPLE_MODE();//主要程式迴圈執行_測試模式
+       
 
         break;
     case SystemMode::EXAMPLE_MODE://範例模式 debug使用

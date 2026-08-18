@@ -7,7 +7,6 @@
 #include "GlobalConfig.h"
 #include "PLCManager.h" // 🌟 1. 記得 include PLCManager 標頭檔
 #define MAX_MBX_SIZE 1024
-
 EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m_mboxCnt(0)
 {
     // 清空傳送與接收緩衝區
@@ -180,12 +179,94 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
     }
     RtSleepFt(&wait);//等待
     Printf_Slaves_State();//印出從站狀態
+
+
+
+   // =========================================================
+// DC Topology Diagnostic
+// =========================================================
+    MeasureDCPortTimestamps();
+
+
+    // =========================================================
+    // DC Propagation Delay
+    //
+    // Measure
+    //      ↓
+    // Select Median
+    //      ↓
+    // Configure 0x0928
+    //      ↓
+    // ReadBack Verify
+    // =========================================================
+
+    uint32_t dcDelaySlave4 =
+        0;
+
+    uint32_t dcDelaySlave5 =
+        0;
+
+    uint32_t dcDelaySlave6 =
+        0;
+
+
+    bool dcDelayMeasured =
+        MeasureDCPropagationDelay(
+            dcDelaySlave4,
+            dcDelaySlave5,
+            dcDelaySlave6);
+
+
+    if (dcDelayMeasured)
+    {
+        RtPrintf(
+            "[DC-INIT] Propagation Delay measured. "
+            "S4:%u S5:%u S6:%u ns\n",
+
+            (unsigned int)dcDelaySlave4,
+            (unsigned int)dcDelaySlave5,
+            (unsigned int)dcDelaySlave6);
+
+
+        bool dcDelayConfigured =
+            ConfigureDCPropagationDelay(
+                dcDelaySlave4,
+                dcDelaySlave5,
+                dcDelaySlave6);
+
+
+        if (!dcDelayConfigured)
+        {
+            RtPrintf(
+                "[DC-INIT] WARNING: "
+                "Propagation Delay configuration FAILED.\n");
+        }
+    }
+    else
+    {
+        RtPrintf(
+            "[DC-INIT] WARNING: "
+            "Propagation Delay measurement FAILED.\n");
+    }
+
+
+    // =========================================================
+    // Existing DC initialization continues
+    // =========================================================
+
+    uint64_t base_master_time =
+        GetCurrentMasterTimeNs();
+
+    uint32_t cycle_time_ns =
+        250000;
+
+
     // ---------------------------------------------------------
     //  INIT 狀態
     // ---------------------------------------------------------
    // 🌟 關鍵修改：在進入迴圈前，先計算一個「全域統一的 Start Time」
-    uint64_t base_master_time = GetCurrentMasterTimeNs();
-    uint32_t cycle_time_ns = 250000; // 250us
+
+    //uint32_t cycle_time_ns = 250000; // 250us
 
     // 設定 50ms 的緩衝讓所有從站初始化完畢，並強制對齊 250us 的整數倍
     uint64_t unified_start_time = base_master_time + 50000000;
@@ -455,13 +536,16 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx, uint64_t unifiedSt
     uint64_t master_time_ns = GetCurrentMasterTimeNs();
     uint32_t cycle_time = 250000; // 250000 ns = 250 us
     uint64_t start_time = master_time_ns + 50000000;
-    uint16_t DC_Enable_Value = 0x03;
-    uint16_t DC_Disable_Value = 0x0000;//
+    uint8_t DC_Enable_Value = 0x03;
+    uint8_t DC_Disable_Value = 0x00;
+    uint8_t DC_Cyclic_Control = 0x00;
 
     uint32_t shift_time;
     uint64_t final_start_time;
 
     uint64_t DC_zero_time = 0;
+
+    uint16_t dcSpeedCounterStart = 0x1000;
     switch (m_slaveInfo[slaveIdx].Vendor_ID)
     {
     case 0x0000066F://松下
@@ -614,75 +698,199 @@ void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx, uint64_t unifiedSt
 
 
 
-           //DC同步設定
-           //計算並寫入 System Time Offset (0x0920) - 對時
+        // =========================================================
+// DC Sync0 Configuration
+//
+// Delta A3E
+//
+// 0x0910 : DC System Time
+// 0x0920 : System Time Offset
+// 0x0980 : Cyclic Unit Control
+// 0x0981 : Sync Activation
+// 0x0990 : Sync0 Start Time
+// 0x09A0 : Sync0 Cycle Time
+// =========================================================
+
+
+// ---------------------------------------------------------
+// 1. 先停止 Sync0
+//
+// 0x0981 是 1 Byte Register。
+// ---------------------------------------------------------
+            DC_Disable_Value = 0x00;
+
+            WK = ecx_FPWR(
+                m_slaveInfo[slaveIdx].configAddr,
+                0x0981,
+                &DC_Disable_Value,
+                1,
+                20);
+
+
+            // ---------------------------------------------------------
+            // 2. DC Cyclic Unit 交由 EtherCAT 控制
+            //
+            // 0x0980 = 0
+            // ---------------------------------------------------------
+            DC_Cyclic_Control = 0x00;
+
+            WK = ecx_FPWR(
+                m_slaveInfo[slaveIdx].configAddr,
+                0x0980,
+                &DC_Cyclic_Control,
+                1,
+                20);
+
+
+            // ---------------------------------------------------------
+            // 3. 讀取目前 Slave DC System Time
+            // ---------------------------------------------------------
             slave_time_ns = 0;
-            time_offset = 0;
-            master_time_ns = GetCurrentMasterTimeNs();//系統時間 (奈秒)
-            // 先讀取從站目前的 System Time (0x0910)
-            WK = ecx_FPRD(m_slaveInfo[slaveIdx].configAddr, 0x0910, &slave_time_ns, 8, 20);
 
-            // 計算差值：Offset = 主站時間 - 從站時間
-            // 注意：這裡假設主站時間是標準。如果有延遲補償 (Prop Delay)，要扣掉。
-            // 簡易版 (單軸) 可以忽略傳輸延遲。
-
-            time_offset = master_time_ns - slave_time_ns;
-
-            // 寫入 Offset (0x0920)
-            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0920, &time_offset, 8, 20);
+            WK = ecx_FPRD(
+                m_slaveInfo[slaveIdx].configAddr,
+                0x0910,
+                &slave_time_ns,
+                8,
+                20);
 
 
-            // =========================================================================
-             // 2. 設定 Sync0 週期 (0x09A0)定頻
-             // =========================================================================
+            // ---------------------------------------------------------
+            // 4. 將 Slave DC Time 對到目前 Master Time
+            //
+            // 這一階段先保留原本架構。
+            // Reference Clock / Propagation Delay
+            // 下一階段再正式整理。
+            // ---------------------------------------------------------
+            master_time_ns =
+                GetCurrentMasterTimeNs();
 
-             // 您的 RTX64 Timer 是 250us，所以硬體的 Sync0 週期也必須嚴格等於 250us！
-            cycle_time = 250000; // 1,000,000 ns = 1 ms
-            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x09A0, &cycle_time, 4, 20);
+            time_offset =
+                master_time_ns -
+                slave_time_ns;
+
+            WK = ecx_FPWR(
+                m_slaveInfo[slaveIdx].configAddr,
+                0x0920,
+                &time_offset,
+                8,
+                20);
+            // ---------------------------------------------------------
+// DC Time Control Loop Reset
+//
+// 修改 System Time Offset (0x0920) 後，
+// 必須重新初始化 DC 的：
+//
+// 1. System Time Difference Filter
+// 2. Speed Counter Filter
+//
+// 0x0930 = Speed Counter Start
+//
+// Beckhoff ESC Default = 0x1000
+// Valid Range = 0x0080 ~ 0x3FFF
+//
+// 寫入 0x0930 本身就會觸發 Filter Reset。
+// ---------------------------------------------------------
+            dcSpeedCounterStart = 0x1000;
+
+            WK = ecx_FPWR(
+                m_slaveInfo[slaveIdx].configAddr,
+                0x0930,
+                &dcSpeedCounterStart,
+                2,
+                20);
+
+            // ---------------------------------------------------------
+            // 5. 非常重要
+            //
+            // 寫完 0x0920 後重新讀一次 0x0910。
+            //
+            // 後面的 Sync0 Start Time 必須以
+            // 「目前真正的 DC System Time」為基準，
+            // 不能繼續使用 Offset 前的舊時間。
+            // ---------------------------------------------------------
+            slave_time_ns = 0;
+
+            WK = ecx_FPRD(
+                m_slaveInfo[slaveIdx].configAddr,
+                0x0910,
+                &slave_time_ns,
+                8,
+                20);
 
 
-
-            //DC設定版本1 各軸DC時間會變-----------------------------------------------------------------------------------目前不知道哪個是對的
-            
-            
-            start_time = master_time_ns + 50000000;
-            start_time = ((start_time / cycle_time) + 1) * cycle_time;
-            shift_time = cycle_time / 2;
-            start_time = start_time + shift_time;
-            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0990, &start_time, 8, 20);
-            
-           
-
-            //DC設定版本2 各軸DC時間固定--------------------------------------------------------目前不知道哪個是對的
-            /*
-            cycle_time = 250000; // 250us
-            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x09A0, &cycle_time, 4, 20);
-            shift_time = cycle_time / 2;
-            final_start_time = unifiedStartTime + shift_time;
-            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0990, &final_start_time, 8, 20);
-            */
+            // ---------------------------------------------------------
+            // 6. Sync0 Cycle = 250 us
+            // ---------------------------------------------------------
+            cycle_time =
+                250000;
 
 
+            // ---------------------------------------------------------
+            // 7. 計算第一個 Sync0 Start Time
+            //
+            // 使用 Slave 自己目前的 DC System Time。
+            //
+            // 預留 100 ms，避免 Start Time 在設定完成以前
+            // 就已經變成 Past Time。
+            //
+            // Shift 先維持你原本的 1/2 Cycle：125 us。
+            // Master PDO Phase 下一階段再處理。
+            // ---------------------------------------------------------
+            shift_time =
+                cycle_time / 2;
+
+            start_time =
+                slave_time_ns +
+                100000000ULL;
+
+            start_time =
+                ((start_time / cycle_time) + 1) *
+                cycle_time;
+
+            start_time +=
+                shift_time;
 
 
-            // =========================================================================
-            // 4. 啟用 Sync0 (0x0981) - 開關
-            // =========================================================================
-            // Bit 0 = 1 (Enable Sync0)
-            // Bit 1 = 1 (Enable Sync Out - 通常需要讓信號輸出到外部引腳或內部中斷)
+            // ---------------------------------------------------------
+            // 8. 寫入 Sync0 Start Time
+            // ---------------------------------------------------------
+            WK = ecx_FPWR(
+                m_slaveInfo[slaveIdx].configAddr,
+                0x0990,
+                &start_time,
+                8,
+                20);
 
-            //先關閉0x981 硬體層面：熄滅 DC 引擎 (0x0981)
-            ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0981, &DC_Disable_Value, 2, 20);
+
+            // ---------------------------------------------------------
+            // 9. 寫入 Sync0 Cycle Time
+            // ---------------------------------------------------------
+            WK = ecx_FPWR(
+                m_slaveInfo[slaveIdx].configAddr,
+                0x09A0,
+                &cycle_time,
+                4,
+                20);
 
 
-            DC_Enable_Value = 0x03;
-            // 有些驅動器需要寫入 0x07 (Sync0 + Sync1)，但 Delta A3 用 0x03 即可
-            WK = ecx_FPWR(m_slaveInfo[slaveIdx].configAddr, 0x0981, &DC_Enable_Value, 2, 20);
+            // ---------------------------------------------------------
+            // 10. 啟用 Cyclic Unit + Sync0
+            //
+            // Bit 0 = Cyclic Unit
+            // Bit 1 = Sync0
+            //
+            // 0x03
+            // ---------------------------------------------------------
+            DC_Enable_Value =
+                0x03;
 
-            // =========================================================================
-            // 設定完成！現在硬體 Sync0 應該已經開始在內部產生 1ms 的脈衝了。
-            // 接下去就可以寫入 0x1C32 告訴韌體準備好了。
-            // =========================================================================
+            WK = ecx_FPWR(
+                m_slaveInfo[slaveIdx].configAddr,
+                0x0981,
+                &DC_Enable_Value,
+                1,
+                20);
 
             break;
         case 0x00005500: // Delta R1-EC5500 (Coupler)
@@ -1308,160 +1516,4 @@ void EtherCatMaster::LinkCoordinateManager(CoordinateManager* pCoord)
 }
 
 
-//PDO 中斷作業----------------------------------------------------------
-void RTAPI GlobalTimerHandler_PDO(void* nContext)
-{
-    EtherCatMaster* pMaster = (EtherCatMaster*)nContext;
-    uint16_t state;
-    if (pMaster != nullptr)
-    {
-        // 1. [最優先] 執行 PDO 通訊 (Tick 0 邏輯)
-        pMaster->m_Plc.FlushOutputs();
-        int wkc = pMaster->ecx_LRW(0x00000000, pMaster->m_IoMapSize, pMaster->m_IoMap, 50); // Timeout 建議縮短
-        pMaster->wkc_PDO = wkc;
-
-        // 2. 時間分片處理 (Time Slicing)
-        int subTick = pMaster->tickCount_PDO % 4;
-
-        if (subTick == 1)
-        {
-            // [Tick 1] DC 讀取 (保持原樣)
-
-            if (Motor_Start_Index >= 0)
-            {
-                pMaster->wk_read = pMaster->ecx_APRD(m_slaveInfo[Motor_Start_Index].APRDAPWR_Addr, 0x0910, 8, &pMaster->DC_reference_time, 5);
-                if (pMaster->wk_read != 1)
-                {
-                    /* 錯誤處理... */
-
-                }
-            }
-
-        }
-        else if (subTick == 2)
-        {
-            // [Tick 2] 處理外部指令 (Async Command)
-            // 這裡是用來處理 "切換 OP"、"SDO" 等非週期性任務的完美空檔
-
-            if (pMaster->m_asyncCmd.status == (int)EcatCmdStatus::ECAT_STATUS_PENDING)
-            {
-                int cmdWKC = 0;
-
-                switch (pMaster->m_asyncCmd.type)
-                {
-                case (int)EcatCmdType::CMD_SET_STATE:
-                    // 執行狀態切換 (例如你的 Set_All_OP_Com 邏輯)
-                    // dataValue 存放目標狀態 (如 0x0008)
-                    state = (uint16_t)pMaster->m_asyncCmd.dataValue;
-                    // 注意：這裡使用 dataValue 傳入的目標狀態，增加彈性
-                    cmdWKC = pMaster->ecx_BWR(0x0000, 0x0120, 2, &state, 20);
-
-                    DEBUG_PRINT("COMCOM\n");
-                    break;
-
-                case (int)EcatCmdType::CMD_SDO_WRITE:
-                    // 範例：處理 SDO 寫入
-                    cmdWKC = pMaster->ecx_SDOwrite(
-                        pMaster->m_asyncCmd.slaveAddr,
-                        pMaster->m_asyncCmd.index,
-                        pMaster->m_asyncCmd.subIndex,
-                        FALSE,
-                        pMaster->m_asyncCmd.dataSize, // <--- 關鍵！這裡要讀取變數，不能寫死 4
-                        &pMaster->m_asyncCmd.dataValue,
-                        200
-                    );
-                    break;
-                }
-
-                // 回填結果並標記完成
-                pMaster->m_asyncCmd.resultWKC = cmdWKC;
-                pMaster->m_asyncCmd.status = (int)EcatCmdStatus::ECAT_STATUS_DONE; // 告訴 UI 做完了
-            }
-        }
-        else if (subTick == 3)
-        {
-            // [Tick 3] DC 寫入 (保持原樣)
-            pMaster->wk_write = pMaster->ecx_BWR(0x0000, 0x0910, 8, &pMaster->DC_reference_time, 5);
-            if (pMaster->wk_write != 6) { /* 錯誤處理... */ }
-        }
-
-        // 檢查通訊狀態
-        if (wkc < 0)
-        {
-            // 回傳 -1 代表網卡完全沒收到封包 (Timeout)
-            pMaster->timeout_count_PDO++;
-        }
-        else if (wkc != pMaster->EXPECTED_WKC_PDO)
-        {
-            // WKC 不對，代表有模組沒回應 (例如線斷了，或 FMMU 跑掉)
-            pMaster->wkc_error_count_PDO++;
-        }
-
-        pMaster->tickCount_PDO++;
-
-
-
-
-
-
-
-        //Motion---------------------------------------------------
-
-        // 1. [新增] 先執行多軸插補運算 (大腦)
-        // 如果現在是 LineMove 狀態，這行會算出所有軸的新位置 (CurrentCmdPos)
-        // 如果沒在跑插補，這行會直接跳過，不影響效能
-        pMaster->m_Motion.UpdateInterpolation();
-
-
-        // 2.優化後的寫法：一行搞定激磁、PID、伺服控制
-        // 這裡面已經包含了你 UpdateServoState 的邏輯
-        pMaster->m_Motion.UpdateAllMotion();
-
-
-
-    }
-
-
-
-}
-
-//PLC 中斷作業----------------------------------------------------------
-void RTAPI GlobalTimerHandler_PLC(void* nContext)
-{
-    EtherCatMaster* pMaster = (EtherCatMaster*)nContext;
-    if (pMaster == nullptr)
-    {
-        return;
-    }
-
-
-    // 🌟 步驟 0：將網卡底層記憶體拷貝到影子緩衝區 (修復輸入全為 0 的 Bug)
-    pMaster->m_Plc.FetchInputs();
-
-    // 🌟 步驟 1：實體轉虛擬 (影子緩衝區 -> PLC I 點/DR)
-    pMaster->m_Plc.SyncPhysicalToVirtual();
-
-    // 🌟 步驟 2：執行大腦運算
-    if (g_PLC != nullptr) {
-        g_PLC->RunCycle(1);
-    }
-
-    // 🌟 步驟 3：虛擬轉實體 (PLC O 點 -> 影子緩衝區)
-    pMaster->m_Plc.SyncVirtualToPhysical();
-
-    // 🌟 步驟 4：刷出硬體訊號
-    pMaster->m_Plc.FlushOutputs();
-
-    pMaster->tickCount_PLC++;
-
-
-    //跑馬燈測試----------------------------------------
-
-    if (pMaster->tickCount_PLC % 50 == 0)
-    {
-        //pMaster->m_Plc.Update_Debug();
-    }
-
-
-}
 

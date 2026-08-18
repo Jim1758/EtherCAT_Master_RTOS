@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 #include "CompensationEngine.h" // ゲ斗まま篮挡篶
+#include "MotionCore.h"
+#include "EtherCatMaster.h"
 
 
 enum class SystemMode //╰参家Α
@@ -64,6 +66,8 @@ public:
     bool LoadPIDConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion);//更PID把计
     bool LoadSpeedConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion);//更Speed把计
     static bool LoadPitchTable(const std::string& filePath, CompensationEngine& compEngine , bool isPositive);
+    bool InitSystemParameters(EtherCatMaster& master);
+
 
 private:
     // 玛篶窽ゎ new GlobalConfig()

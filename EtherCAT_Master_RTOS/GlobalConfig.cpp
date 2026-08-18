@@ -8,6 +8,9 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include "EtherCatMaster.h" // 🌟 必須在這裡引入，才能操作 master 的成員
+#include "SHMManager.h" 
+
 bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion)
 {
     //讀取參數確定軸數量-----------------------------------------------------------------
@@ -421,3 +424,52 @@ bool GlobalConfig::LoadPitchTable(const std::string& filePath, CompensationEngin
     return true;
 }
 
+bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
+{
+    DEBUG_PRINT("========== Starting system parameter loading and initialization ==========\n");
+
+    // 1. 綁定硬體指標 (必須最先做，後面的參數載入才會寫入正確的實體)
+    master.m_Motion.Link(&master.m_ServoList, &master.m_Axes);
+
+    // 2. 🌟 一鍵載入參數並初始化所有軸！
+    std::string axisConfigPath = GlobalConfig::GetInstance().ParameterDir + "AxisConfig.txt";
+    if (!GlobalConfig::GetInstance().LoadAxisConfig(axisConfigPath, master.m_Axes, master.m_Motion))
+    {
+        DEBUG_PRINT("LoadConfig Error！>>AxisConfig.txt\n");
+        return -1;
+    }
+
+   
+    std::string pidConfigPath = GlobalConfig::GetInstance().ParameterDir + "PIDConfig.txt";
+    if (!GlobalConfig::GetInstance().LoadPIDConfig(pidConfigPath, master.m_Axes, master.m_Motion))
+    {
+        DEBUG_PRINT("LoadConfig Error！>>PIDConfig.txt\n");
+        return -1;
+    }
+
+    std::string speedConfigPath = GlobalConfig::GetInstance().ParameterDir + "SpeedConfig.txt";
+    if (!GlobalConfig::GetInstance().LoadSpeedConfig(speedConfigPath, master.m_Axes, master.m_Motion))
+    {
+        DEBUG_PRINT("LoadConfigPathConfig Error！>>SpeedConfig.txt\n");
+        return -1;
+    }
+
+    // 2. 🌟 讀取螺距誤差表，並寫入 CompensationEngine
+    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE_Pos.txt", master.m_Motion.m_CompEngine, true);
+
+    // 2. 🌟 讀取螺距誤差表，並寫入 CompensationEngine
+    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE_Neg.txt", master.m_Motion.m_CompEngine, false);
+
+
+    //坐標系初始化
+    master.m_NC->CoordSys.SetWCS(master.m_NC->CoordSys.GetCurrentWCSGCode(), master.m_NC);
+    master.pCoordMgr = &(master.m_NC->CoordSys); // 指向目前的座標系
+    master.m_Motion.LinkCoordinateManager(&(master.m_NC->CoordSys));
+
+
+   //載入初始NC檔案---------------------------------------------------------------------
+    std::string Initial_NcPath = GlobalConfig::GetInstance().NCProgramDir + "Null.nc";
+    master.m_NC->LoadProgram(Initial_NcPath);
+
+    return true;
+}

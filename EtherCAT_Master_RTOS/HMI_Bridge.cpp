@@ -5,6 +5,8 @@
 #include "AlarmManager.h"
 #include <cstring> 
 #include "PLCManager.h"
+#include "NCPLCMap.h"
+
 #include <cmath>
 namespace HMI_Bridge
 {
@@ -101,34 +103,41 @@ namespace HMI_Bridge
 
         //單步執行切換
         if (pShm->NC_Command.Set_isSingleBlockEnabled_ON)
-        { 
+        {
+            g_PLC->Set_C(NCPLC::C::SINGLE_BLOCK, true);
+            
             nc->m_isSingleBlockEnabled = true;
             pShm->NC_Command.Set_isSingleBlockEnabled_ON = false;
         }
         if (pShm->NC_Command.Set_isSingleBlockEnabled_OFF)
         {
+            g_PLC->Set_C(NCPLC::C::SINGLE_BLOCK, false);
             nc->m_isSingleBlockEnabled = false;
             pShm->NC_Command.Set_isSingleBlockEnabled_OFF = false;
         }
         //選擇性暫停切換
         if (pShm->NC_Command.Set_isOptionalStopEnabled_ON)
         {
+            g_PLC->Set_C(NCPLC::C::OPTIONAL_STOP, true);
             nc->m_isOptionalStopEnabled = true;
             pShm->NC_Command.Set_isOptionalStopEnabled_ON = false;
         }
         if (pShm->NC_Command.Set_isOptionalStopEnabled_OFF)
         {
+            g_PLC->Set_C(NCPLC::C::OPTIONAL_STOP, false);
             nc->m_isOptionalStopEnabled = false;
             pShm->NC_Command.Set_isOptionalStopEnabled_OFF = false;
         }
         //選擇性跳躍切換
         if (pShm->NC_Command.Set_isBlockSkipEnabled_ON)
         {
+            g_PLC->Set_C(NCPLC::C::BLOCK_SKIP, true);
             nc->m_isBlockSkipEnabled = true;
             pShm->NC_Command.Set_isBlockSkipEnabled_ON = false;
         }
         if (pShm->NC_Command.Set_isBlockSkipEnabled_OFF)
         {
+            g_PLC->Set_C(NCPLC::C::BLOCK_SKIP, false);
             nc->m_isBlockSkipEnabled = false;
             pShm->NC_Command.Set_isBlockSkipEnabled_OFF = false;
         }
@@ -143,209 +152,74 @@ namespace HMI_Bridge
 
         if (pShm->Coord_Command.reqSetManualFrame)
         {
-            // =====================================================
             // 1. Read Requested Values
-            // =====================================================
+            const bool requestedEnabled = pShm->Coord_Command.manualFrameEnabled;
+            const double requestedYawDeg = pShm->Coord_Command.manualFrameYawDeg;
+            const double requestedPitchDeg = pShm->Coord_Command.manualFramePitchDeg;
+            const double requestedRollDeg = pShm->Coord_Command.manualFrameRollDeg;
 
-            const bool requestedEnabled =
-                pShm->Coord_Command.manualFrameEnabled;
-
-
-            const double requestedYawDeg =
-                pShm->Coord_Command.manualFrameYawDeg;
-
-
-            const double requestedPitchDeg =
-                pShm->Coord_Command.manualFramePitchDeg;
-
-
-            const double requestedRollDeg =
-                pShm->Coord_Command.manualFrameRollDeg;
-
-
-            // =====================================================
-            // 2. Parameter Validation
-            //
-            // Shared Memory 是外部輸入邊界。
-            // NaN / INF 絕對不能進 CoordinateManager。
-            // =====================================================
-
-            const bool parameterValid =
-                std::isfinite(requestedYawDeg) &&
-                std::isfinite(requestedPitchDeg) &&
-                std::isfinite(requestedRollDeg);
-
+            // 2. Parameter Validation (Shared Memory 是外部輸入邊界。NaN/INF 絕對不能進 CoordinateManager)
+            const bool parameterValid = std::isfinite(requestedYawDeg) && std::isfinite(requestedPitchDeg) && std::isfinite(requestedRollDeg);
 
             if (!parameterValid)
             {
-                // 無效命令直接丟棄。
-                pShm->Coord_Command.reqSetManualFrame =
-                    false;
+                pShm->Coord_Command.reqSetManualFrame = false; // 無效命令直接丟棄
             }
             else
             {
-                // =================================================
                 // 3. Determine Whether Manual XYZ May Be Moving
-                //
-                // NCPLCManager 的 Manual Motion Gate 只允許
-                // IDLE / READY。
-                //
-                // 因此只有在 IDLE / READY 時，
-                // VELOCITY / MOVING / MPG 才需要視為
-                // Manual Motion 並安全停止。
-                //
-                // RUN 中的 NC Program 不受 Manual Frame 影響，
-                // 不可以因為修改 Manual Frame 而停止加工。
-                // =================================================
-
-                const NCState ncState =
-                    nc->GetState();
-
-
-                const bool manualOperationState =
-                    ncState == NCState::IDLE ||
-                    ncState == NCState::READY;
-
-
-                bool waitingForManualStop =
-                    false;
-
+                // NCPLCManager 的 Manual Motion Gate 只允許 IDLE / READY。
+                // 因此只有在 IDLE / READY 時，VELOCITY / MOVING / MPG 才需要視為 Manual Motion 並安全停止。
+                // RUN 中的 NC Program 不受 Manual Frame 影響，不可以因為修改 Manual Frame 而停止加工。
+                const NCState ncState = nc->GetState();
+                const bool manualOperationState = (ncState == NCState::IDLE || ncState == NCState::READY);
+                bool waitingForManualStop = false;
 
                 if (manualOperationState)
                 {
-                    // =============================================
-                    // Manual Frame 只作用 XYZ，
-                    // 所以只處理 Machine X/Y/Z。
-                    // =============================================
-
-                    for (int axisIndex = 0;
-                        axisIndex < 3;
-                        ++axisIndex)
+                    // Manual Frame 只作用 XYZ，所以只處理 Machine X/Y/Z。
+                    for (int axisIndex = 0; axisIndex < 3; ++axisIndex)
                     {
-                        AxisContext& axis =
-                            nc->GetMotion()
-                            .GetAxisContext(
-                                axisIndex);
+                        AxisContext& axis = nc->GetMotion().GetAxisContext(axisIndex);
+                        if (!axis.isExist) continue;
 
-
-                        if (!axis.isExist)
+                        if (axis.state == MotionState::MotionState_VELOCITY) // Continuous / Fine JOG
                         {
+                            nc->GetMotion().StopMove(axis, axis.JOG_dec_time);
+                            waitingForManualStop = true;
                             continue;
                         }
 
-
-                        // =========================================
-                        // Continuous / Fine JOG
-                        // =========================================
-
-                        if (axis.state ==
-                            MotionState::
-                            MotionState_VELOCITY)
+                        if (axis.state == MotionState::MotionState_MOVING) // INCH JOG
                         {
-                            nc->GetMotion().StopMove(
-                                axis,
-                                axis.JOG_dec_time);
-
-                            waitingForManualStop =
-                                true;
-
+                            nc->GetMotion().StopMove(axis, axis.INCH_dec_time);
+                            waitingForManualStop = true;
                             continue;
                         }
 
-
-                        // =========================================
-                        // INCH JOG
-                        // =========================================
-
-                        if (axis.state ==
-                            MotionState::
-                            MotionState_MOVING)
+                        if (axis.state == MotionState::MotionState_MPG) // MPG
                         {
-                            nc->GetMotion()
-                                .StopMove(
-                                    axis,
-                                    axis.INCH_dec_time);
-
-                            waitingForManualStop =
-                                true;
-
+                            nc->GetMotion().StopMove(axis, axis.JOG_dec_time);
+                            waitingForManualStop = true;
                             continue;
                         }
 
-
-                        // =========================================
-                        // MPG
-                        // =========================================
-
-                        if (axis.state ==
-                            MotionState::
-                            MotionState_MPG)
+                        if (axis.state == MotionState::MotionState_STOPPING) // Stop still in progress
                         {
-                            nc->GetMotion()
-                                .StopMove(
-                                    axis,
-                                    axis.JOG_dec_time);
-
-                            waitingForManualStop =
-                                true;
-
-                            continue;
-                        }
-
-
-                        // =========================================
-                        // Stop still in progress
-                        // =========================================
-
-                        if (axis.state ==
-                            MotionState::
-                            MotionState_STOPPING)
-                        {
-                            waitingForManualStop =
-                                true;
-
+                            waitingForManualStop = true;
                             continue;
                         }
                     }
                 }
 
-
-                // =================================================
                 // 4. Apply Manual Frame
-                //
-                // Manual Motion 尚未完全停止：
-                //
-                //     Request 保持 true
-                //
-                // 下一個 ProcessTask Scan 再檢查。
-                //
-                // 全部停止：
-                //
-                //     正式套用。
-                // =================================================
-
+                // Manual Motion 尚未完全停止: Request 保持 true，下一個 ProcessTask Scan 再檢查。
+                // 全部停止: 正式套用。
                 if (!waitingForManualStop)
                 {
-                    nc->CoordSys
-                        .SetManualFrameAngles(
-                            requestedYawDeg,
-                            requestedPitchDeg,
-                            requestedRollDeg);
-
-
-                    // Enabled 最後才更新。
-                    //
-                    // 避免先 Enable，
-                    // 但 Angle 尚未完整更新的短暫狀態。
-                    nc->CoordSys
-                        .SetManualFrameEnabled(
-                            requestedEnabled);
-
-
-                    // Request 最後清除。
-                    pShm->Coord_Command
-                        .reqSetManualFrame =
-                        false;
+                    nc->CoordSys.SetManualFrameAngles(requestedYawDeg, requestedPitchDeg, requestedRollDeg);
+                    nc->CoordSys.SetManualFrameEnabled(requestedEnabled); // Enabled 最後才更新，避免先 Enable 但 Angle 尚未完整更新的短暫狀態
+                    pShm->Coord_Command.reqSetManualFrame = false; // Request 最後清除
                 }
             }
         }
@@ -353,24 +227,18 @@ namespace HMI_Bridge
         //PLC----------------------------------------------------------------------
         if (g_PLC != nullptr)
         {
-            pShm->PLC_Status.SHM_PLC_RunCount =
-                g_PLC->PLC_RunCount;
+            pShm->PLC_Status.SHM_PLC_RunCount = g_PLC->PLC_RunCount;
 
             // PLC 狀態全廣播
-            g_PLC->ExportPLCStatus(
-                &pShm->PLC_Status
-            );
+            g_PLC->ExportPLCStatus( &pShm->PLC_Status );
         }
 
         // 🌟 處理 PLC 點位寫入
         if (pShm->PLC_Command.writeReq)
         {
-            if (g_PLC != nullptr) {
-                g_PLC->SetMemory(
-                    pShm->PLC_Command.regionPrefix,
-                    pShm->PLC_Command.index,
-                    pShm->PLC_Command.writeValue
-                );
+            if (g_PLC != nullptr) 
+            { 
+                g_PLC->SetMemory(pShm->PLC_Command.regionPrefix, pShm->PLC_Command.index, pShm->PLC_Command.writeValue );
             }
             pShm->PLC_Command.writeReq = false;
         }
@@ -379,11 +247,9 @@ namespace HMI_Bridge
         if (pShm->PLC_Command.writeByNameReq)
         {
             pShm->PLC_Command.varName[63] = '\0';
-            if (g_PLC != nullptr) {
-                g_PLC->SetVar(
-                    std::string(pShm->PLC_Command.varName),
-                    pShm->PLC_Command.writeValue
-                );
+            if (g_PLC != nullptr) 
+            {
+                g_PLC->SetVar( std::string(pShm->PLC_Command.varName),  pShm->PLC_Command.writeValue );
             }
             pShm->PLC_Command.writeByNameReq = false;
         }

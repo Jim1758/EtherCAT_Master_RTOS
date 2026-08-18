@@ -1,0 +1,213 @@
+EtherCAT DC RC1.4 參數與 Debug 判讀指南
+日期：2026-08-18
+
+一、目前正式基準
+
+PDO：250 us / 4 kHz
+Sync0 Shift：125000 ns
+RTX64 HAL：25 us
+NAL Interrupt priority：70
+NAL Transmit complete priority：70
+RX Soft / Hard：205000 / 210000 ns
+One-Shot：ON
+Fine Wait：OFF
+Runtime HAL Actuator：OFF
+目前三軸 WKC：LRW 13 / DC 7
+
+如果長時間 LOG 已穩定，不需要為了讓數字更漂亮而調參數。
+
+Startup 啟動基準：
+ENABLE_COARSE_FINE_QPC_STARTUP_PROBE：true（預設啟用）
+Probe callbacks：4000（約 1 秒）
+Probe coarse guard：100000 ns
+DC alignment samples：8
+最佳樣本 RTT 上限：1000000 ns
+DC start guard：20000000 ns
+RtSetTimer 最低 lead：5000000 ns
+正式 PDO timer priority：80
+
+Startup Probe 開關：
+true：建立 Priority 62 disposable Probe、執行 warm-up 與 4000 次量測。
+false：完全不建立 Probe Timer、不執行 Probe callback 與 QPC busy-wait。
+false 不會關閉正式 Priority 80 PDO Timer、PDO warm-up、DC Alignment 或 fallback。
+關閉後啟動 LOG 會顯示：[COARSE-FINE-QPC-PROBE] DISABLED。
+
+Startup 參數說明：
+ALIGN_SAMPLE_COUNT 增大可提高找到低 RTT 樣本的機會，但會增加啟動時間。
+MAX_ALIGN_RTT_NS 放寬只會接受較差的 clock mapping，不會改善同步品質。
+START_GUARD_NS 是初次 target 的規劃餘裕；MIN_TIMER_LEAD_NS 是實際 arm 前的安全餘裕。
+Warm-up/Probe timeout 只限制啟動等待，不是 Runtime 的 RX HardTimeout。
+PDO cycle、Target phase、Sync0、timer priority 與 coarse guard 屬於整體時序設計，
+正式版不要用它們掩蓋 RX Timeout、WKC 或網卡 interrupt 延遲。
+
+Startup Debug 快速判讀：
+[DC-HAL-STARTUP]：Current 最後應等於 Base；恢復失敗會記錄但仍繼續。
+[COARSE-FINE-QPC-PROBE]：理想為 PASS、Callbacks 4000/4000、
+RearmOK 3999/3999，RearmFail/FineMiss/NextCoarsePast 都是 0。
+[PDO-ONESHOT-WARMUP]：必須 PASS；FAIL 會在正式 PDO 前回傳 -1。
+[PDO-DC-SAMPLE]：有效樣本 WKC>0，RTT 越小越適合估算 offset。
+[PDO-DC-BEST-SAMPLE]：Direction/Offset 是 Master/DC absolute clock epoch 映射，
+不是瞬間同步誤差，因此 Offset 很大本身不代表 DC 同步失敗。
+[PDO-DC-ALIGN-V2.1]：正式路徑應為 SUCCESS、TargetPhase 0、Sync0 125000 ns，
+Remaining 通常至少約 5 ms。
+[PDO-DC-ALIGN-FALLBACK]：relative timer 已啟動，但首個 callback 不保證 DC phase 0。
+
+二、第一優先可調參數
+
+1. PHASE_P_ACT_DIVISOR（Runtime，目前 8）
+
+用途：Phase-P 強度，實際 P=1/Divisor。
+調小：修正更強、收斂更快，也更容易來回震盪。
+調大：修正更柔和，但 ActualErr 回到 0 會更慢。
+建議：一次只測 8->10 或 8->6。
+
+2. PHASE_P_ACT_DEADBAND_NS（Runtime，目前 500 ns）
+
+用途：誤差小於此值時停止修正。
+調大：減少 Step 正負切換與微小抖動。
+調小：可更貼近 0，但會對雜訊更敏感。
+建議：Step 頻繁反向先試 750/1000；長期停在 500~1000 才試 250。
+
+3. PHASE_P_ACT_MAX_STEP_NS（Runtime，目前 250 ns/window）
+
+用途：每個觀測窗允許的最大 offset 改變。
+調大：收斂快、相位變動較大。
+調小：收斂慢、較平滑。
+建議：每次只改 50 ns。
+
+4. REAL_FF_V0_MAX_STEP_PPB（Runtime，目前 10 ppb/window）
+
+用途：Applied drift 接近 observer 建議值的速度。
+調大：追蹤快，也較容易追到短期雜訊。
+調小：較穩定，但殘餘相位漂移會維持較久。
+建議：只有 ActualErr 長期單方向漂移、PhaseGood/MAD/RX 都正常時才試 15 或 20。
+
+5. RX_SOFT_DEADLINE_NS / RX_HARD_DEADLINE_NS
+   （EtherCAT_Function.cpp，目前 205000 / 210000 ns）
+
+規則：必須 Soft < Hard < 250000 ns，並保留 DC/Motion 後段執行時間。
+Hard 調大：Timeout 可能下降，但會接受更舊的 frame，且壓縮 Handler 餘裕。
+Hard 調小：較快失敗，但 NIC interrupt 偶發延遲更容易算 Timeout。
+建議：一次最多 5000 ns，並同時看 RxElapsed Max、PostReceiveLate、PDO-EXEC Max。
+
+三、第二優先安全參數
+
+PHASE_P_ACT_MAX_OFFSET_NS（目前 120000 ns）
+只有 OffsetSat:YES 才需要檢討。半個 PDO 週期是 125000 ns，目前已接近上限，
+不要再增大；要更保守可改 100000 或 50000 ns。
+
+REAL_FF_V0_MIN/MAX_PPB（目前 -10000 / -7800）
+ClampActive:YES 表示建議值超出安全範圍。先查 V1A slope/MAD、RX 與排程，
+不要直接放寬限幅。
+
+ARM/HOLD/RECOVERY/BAD Windows
+增大會更保守但恢復慢；減小反應快但容易受單一視窗雜訊影響。
+它們改的是狀態機速度，不是 P 增益。
+
+TIMEOUT_RECENT_RESET_SECONDS（Diagnostics，目前 300 秒）
+只影響 Recent_Timeout 顯示，不影響真正 RX/DC 控制。
+調小會更快恢復 STABLE，但可能把低頻重複 Timeout 太早視為雜訊。
+
+四、正式版先不要調
+
+PDO_ONESHOT_COARSE_GUARD_NS = 100000 ns
+PDO_MIN_REARM_LEAD_NS = 50000 ns
+PDO_RUNTIME_RECOVERY_TARGET_LEAD_NS = 200000 ns
+PDO_BOOTSTRAP_DELAY_NS = 250000 ns
+PHASE_P_ACT_CYCLE_NS = 250000 ns
+QPC_LIVE_FF_SYNC0_PHASE_NS = 125000 ns
+
+這些參數會改真正 wake/send/Sync0 相位或 fallback 行為，不能用來掩蓋 RX Timeout。
+
+五、Debug 最快判讀順序
+
+1. [DC-HEALTH-SUMMARY]
+
+正常：
+ACTIVE + PhaseGood:YES + ActualErr 接近 0 + OffsetSat:NO +
+TripMask:0x00 + Recover:0/Skip:0 + Recent_Timeout:0 + WKC:13/7 + RESULT:STABLE
+
+Total Timeout 是永久歷史；Recent_Timeout 才是最近五分鐘狀態。
+ActualErr 的 NEAR_ZERO 是正負 1000 ns；Phase-P deadband 則是正負 500 ns。
+
+2. [ECAT-RX-DEADLINE-MAIN]
+
+FirstRx 接近 Calls：大多第一次就收到。
+EmptyRx：輪詢當下沒有 frame，不等於 Timeout。
+Invalid：收到不符合本次交易的 frame。
+SoftLateAccepted：205~210 us 的有效 frame，屬於提前警報。
+HardTimeout：本視窗事件。
+TotalHardTimeout：啟動後永久累積。
+CurrentConsecutive：回到 0 表示後續已恢復。
+PostReceiveLate：ReceivePacket 回來時才發現超過 Hard。
+RxElapsed Max：越接近 210000 ns，deadline 壓力越大。
+
+3. [ECAT-RX-STAGE-MAIN]
+
+PreDeadline 增加：進 RX 前就太晚，查 TX、PDO 前段、Motion/NC 負載。
+SleepAtTimeout 0/1/2：Timeout 前經過幾次 coarse sleep。
+ReceiveCallMax 突增：查 NIC interrupt、NAL priority、CPU 綁定。
+TimeoutCallMax：只看 Timeout 當次 ReceivePacket 最長時間。
+
+4. [ECAT-TX-ROOT-RC1-MAIN]
+
+TxFrameBusy、TxNotOwner、TxSubmitFail、TxSubmitted0 應全部維持 0。
+全部為 0 但 Timeout 增加，較可能是 RX interrupt／ReceivePacket／排程問題。
+
+5. [ECAT-WKC-MAIN]
+
+目前三軸應為 13/7。WKC 變小代表 frame 有回覆但 datagram 未完整處理，
+優先查從站狀態、線路、PDO mapping，不要先調 DC P 參數。
+
+6. [QPC-REAL-FF-V0C-MAIN]
+
+正常：State:ACTIVE、PhaseGood:YES、Reject:0、TripMask:0。
+Rec：observer 建議。
+Desired：限幅後目標。
+Applied：真正 scheduler 使用值。
+Step：本窗真正改變量。
+TripMask 0x01：phase observer fallback；0x02：RX consecutive timeout。
+LATCHED 是正式警報，本次程式執行會退回 -8300 ppb。
+
+7. [QPC-PHASE-P-ACT-V0-MAIN]
+
+正常：State:ACTIVE、Gate:YES、OffsetSat:NO、Improve:YES。
+BaseErr：Real FF 後尚未加 Phase-P offset 的誤差。
+ActualErr：目前 offset 套用後的誤差。
+Wrap：P 控制器使用的正負 125 us 等價相位。
+Step<0 EARLIER；Step>0 LATER。
+Step 正負頻繁切換：P 太強或 deadband 太小。
+Offset 長期單方向增加：Real FF 尚有 frequency residual。
+OffsetSat:YES：先查頻率與 phase 基準，不要先增加 MaxOffset。
+
+8. [PDO-ONESHOT-INFRA-MAIN] / [PDO-BOOTSTRAP-REASON-MAIN]
+
+正常：Control:ON、FineWait:OFF、WarmupDone:YES、RearmFail:0。
+啟動初期少量 NotReady/Bootstrap 可接受。
+穩定運轉後 RuntimeRecover、Skip、RearmFail 持續增加，表示 callback/re-arm 太晚。
+Recover/Skip 是 scheduler 自救，不等於 RX HardTimeout。
+
+9. [PDO-TIMER-MAIN] / [PDO-COMBINED-MAIN] / [PDO-EXEC-MAIN]
+
+Timer Avg 應接近 250000 ns。
+Combined 是 LRW+FRMW round trip。
+Exec 是整個正式 PDO Handler；Over250 理想為 0。
+若 Exec Over250 增加，先查非循環命令、Motion/NC 與診斷工作，不要先放寬 Deadline。
+
+六、現象對照
+
+Timeout 增加 + TX 異常全 0 + ReceiveCallMax 高：NIC RX interrupt/NAL 排程。
+Timeout 增加 + PreDeadline 增加：PDO 前段或 CPU 負載，可能和 Motion/NC 有關。
+Timeout 0 + Recover/Skip 增加：One-Shot scheduler 醒來或 re-arm 落後。
+ActualErr 單方向漂移 + Offset 單方向累積：Real FF frequency 尚未完全對齊。
+ActualErr 來回震盪 + Step 正負切換：Phase-P 太強或 deadband 太小。
+TripMask 0x02：RX Timeout 已觸發 Real FF 安全鎖定。
+WKC 不為 13/7：先處理 EtherCAT/從站，不做 DC 調參。
+
+七、每次調參測試方式
+
+1. 一次只改一個參數，記錄舊值與新值。
+2. 先測 10~15 分鐘，確認無 WKC、Trip、Servo Alarm。
+3. 再測 2~3 小時，觀察 Timeout/Recover/ActualErr 趨勢。
+4. 正式凍結前，激磁三軸來回同動至少 12 小時。
+5. HAL、NAL priority、RX Deadline、Phase-P 不可同一輪一起改。

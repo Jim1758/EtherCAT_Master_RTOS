@@ -82,6 +82,15 @@
     <Filter Include="Source Files\Motion\MotionCore_GCode">
       <UniqueIdentifier>{75857113-1470-41a3-9eb6-df8a09ef7a9e}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\EtherCAT_Master\DC">
+      <UniqueIdentifier>{6d395306-0dac-4ac1-b2f7-da32c4e4d459}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\EtherCAT_Master\DC">
+      <UniqueIdentifier>{37fcd49a-435c-41e4-a591-3faf0a4b6eaf}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\EtherCAT_Master\PLC">
+      <UniqueIdentifier>{ab1ebd9b-ad82-4496-9e3a-6a679186233f}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
@@ -216,6 +225,21 @@
     <ClCompile Include="NCPLCManager.cpp">
       <Filter>Source Files\NC</Filter>
     </ClCompile>
+    <ClCompile Include="EtherCatMaster_DC_Diagnostics.cpp">
+      <Filter>Source Files\EtherCAT_Master\DC</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_DC_Runtime.cpp">
+      <Filter>Source Files\EtherCAT_Master\DC</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_DC_Startup.cpp">
+      <Filter>Source Files\EtherCAT_Master\DC</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_PLC_Startup.cpp">
+      <Filter>Source Files\EtherCAT_Master\PLC</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_PLC_Runtime.cpp">
+      <Filter>Source Files\EtherCAT_Master\PLC</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -305,5 +329,13 @@
     <ClInclude Include="NCPLCManager.h">
       <Filter>Header Files\NC</Filter>
     </ClInclude>
+    <ClInclude Include="EtherCatMaster_DC_Internal.h">
+      <Filter>Header Files\EtherCAT_Master\DC</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <Text Include="DC同步_相關設定說明.txt">
+      <Filter>Source Files\EtherCAT_Master\DC</Filter>
+    </Text>
   </ItemGroup>
 </Project>

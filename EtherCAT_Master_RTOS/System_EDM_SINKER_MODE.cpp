@@ -10,61 +10,30 @@
 #include "AlarmManager.h"
 #include "PLCManager.h" // 🌟 1. 引入 PLC 管理器標頭檔
 #include "NCPLCManager.h"
+
 int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行 EDM模式
 {
+    GlobalConfig& globalConfig = GlobalConfig::GetInstance();
+
     Get_TotalSlave_WKC_Count();//取得從站WKC 分數
 
-
-     //PDO 中斷宣告---------------------------------------------------------------
-    HANDLE hTimer_PDO = NULL;
-    LARGE_INTEGER liPeriod_PDO;
-    liPeriod_PDO.QuadPart = 2500; // 250us
-    hTimer_PDO = RtCreateTimer(NULL, 0, GlobalTimerHandler_PDO, this, 64, CLOCK_2);//PSECURITY_ATTRIBUTES,StackSize,pRoutine,Context,Priority (請填入一個優先權數值，0~127),Clock
-    if (hTimer_PDO == NULL)
+    if (StartDcPdoRuntime() != 0)//啟動PDO作業 DC同步
     {
-        DEBUG_PRINT("GlobalTimerHandler_PDO Error>>%d\n", GetLastError());
         return -1;
     }
-    else
-    {
-        if (RtSetTimerRelative(hTimer_PDO, &liPeriod_PDO, &liPeriod_PDO) == false)
-        {
-            DEBUG_PRINT("GlobalTimerHandler_PDO Error>>RtSetTimerRelative\n");
-            return -1;
-        }
-    }
 
-    //PLC 中斷宣告---------------------------------------------------------------
 
-    if (m_plcManager.LoadLogicProgram(GlobalConfig::GetInstance().PLC_Dir + "logic.bin") == false)
+    if (StartPLCRuntime() != 0)//啟動PLC作業 
     {
-        DEBUG_PRINT("LoadLogicProgram PLC Error!\n");
         return -1;
     }
+
+
    
 
+    bool isSuccess = PDO_SendCommandAndWait(EcatCmdType::CMD_SET_STATE, 0x0000, 0x0000, 0x00, 0x0008, 2, 1000);//廣播切換OP狀態 PDO傳送
 
-    HANDLE hTimer_PLC = NULL;// 用來存放計時器的 Handle
-    LARGE_INTEGER liPeriod_PLC;
-    liPeriod_PLC.QuadPart = 10000; // 1ms
-    hTimer_PLC = RtCreateTimer(NULL, 0, GlobalTimerHandler_PLC, this, 63, CLOCK_2);//PSECURITY_ATTRIBUTES,StackSize,pRoutine,Context,Priority (請填入一個優先權數值，0~127),Clock
-
-    if (hTimer_PLC == NULL)
-    {
-        DEBUG_PRINT("GlobalTimerHandler_PLC Error>>%d\n", GetLastError());
-        return -1;
-    }
-    else
-    {
-        if (!RtSetTimerRelative(hTimer_PLC, &liPeriod_PLC, &liPeriod_PLC))
-        {
-            DEBUG_PRINT("GlobalTimerHandler_PLC Error>>RtSetTimerRelative\n");
-        }
-    }
-
-    bool isSuccess = PDO_SendCommandAndWait(EcatCmdType::CMD_SET_STATE, 0x0000,0x0000,0x00,0x0008,2,1000);//廣播切換OP狀態 PDO傳送
-
-    if (isSuccess==true)
+    if (isSuccess == true)
     {
         DEBUG_PRINT("[System] System is now in OP Mode. (Success)\n");
     }
@@ -73,86 +42,33 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         DEBUG_PRINT("[Error] Failed to switch to OP Mode! (Timeout or Error)\n");
     }
 
-   
-    
+
+
     m_Motion.Link(&m_ServoList, &m_Axes);//綁定硬體指標
 
-    // 2. 🌟 一鍵載入參數並初始化所有軸！
-    std::string axisConfigPath = GlobalConfig::GetInstance().ParameterDir + "AxisConfig.txt";
-    if (!GlobalConfig::GetInstance().LoadAxisConfig(axisConfigPath, m_Axes, m_Motion)) 
-    {
-        DEBUG_PRINT("LoadConfig Error！>>AxisConfig.txt\n");
-        return -1;
-    }
-
-    std::string pidConfigPath = GlobalConfig::GetInstance().ParameterDir + "PIDConfig.txt";
-    if (!GlobalConfig::GetInstance().LoadPIDConfig(pidConfigPath, m_Axes, m_Motion))
-    {
-        DEBUG_PRINT("LoadConfig Error！>>PIDConfig.txt\n");
-        return -1;
-    }
-
-    std::string speedConfigPath = GlobalConfig::GetInstance().ParameterDir + "SpeedConfig.txt";
-    if (!GlobalConfig::GetInstance().LoadSpeedConfig(speedConfigPath, m_Axes, m_Motion))
-    {
-        DEBUG_PRINT("LoadConfigPathConfig Error！>>SpeedConfig.txt\n");
-        return -1;
-    }
-
-    // 2. 🌟 讀取螺距誤差表，並寫入 CompensationEngine
-    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE_Pos.txt", m_Motion.m_CompEngine, true);
-
-    // 2. 🌟 讀取螺距誤差表，並寫入 CompensationEngine
-    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE_Neg.txt", m_Motion.m_CompEngine, false);
 
     // 檢查硬體數量與設定檔是否一致
     if (m_ServoList.size() != m_Axes.size())
     {
-        DEBUG_PRINT("Error Servo Count !>>m_ServoList>>%d>>m_Axes>>%d\n",m_ServoList.size(), m_Axes.size());
+        DEBUG_PRINT("Error Servo Count !>>m_ServoList>>%d>>m_Axes>>%d\n", m_ServoList.size(), m_Axes.size());
     }
 
 
-    
     //共享記憶體初始化-------------------------------------------
     SHMManager::GetInstance().Initialize("EDM_SINKER_MODE");
     SHM_Data* pShm = SHMManager::GetInstance().GetData();// 把指針交給 NCManager
 
-    //初始化Macro 系統變數
 
-
-    //載入初始NC檔案---------------------------------------------------------------------
-    std::string Initial_NcPath = GlobalConfig::GetInstance().NCProgramDir + "Null.nc";
-    m_NC->LoadProgram(Initial_NcPath);
-   
-    //坐標系初始化
-    m_NC->CoordSys.SetWCS(m_NC->CoordSys.GetCurrentWCSGCode(), m_NC);
-    this->pCoordMgr = &(m_NC->CoordSys);
-    m_Motion.LinkCoordinateManager(&(m_NC->CoordSys));
-  
 
     m_Motion.ResetAllFaults();//全軸 清除異常狀態
 
-   // =========================================================
-// PLC <-> NC Interface Manager
-//
-// 獨立於 NCManager。
-// 專門負責：
-//
-// PLC C Point -> NC / Motion
-// NC / Motion -> PLC S Point
-// JOG
-// MPG
-// HOME
-// Safety
-// M/S/T Handshake
-// =========================================================
-    NCPLCManager ncPLCManager(*m_NC, m_Motion,m_plcManager);
+    NCPLCManager ncPLCManager(*m_NC, m_Motion, m_plcManager);// PLC <-> NC Interface Manager
 
 
     //主控迴圈-------------------------------------------------------------
     while (1)
     {
-       
+
         if (m_NC->Close_System_Com_flag == true)//關閉核心命令
         {
             m_NC->CoordSys.SaveAllParameters();//儲存座標系統相關參數
@@ -162,7 +78,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
             DEBUG_PRINT("Close System！\n");
             return 0;
         }
-       
+
         RtSleep(10);
         HMI_Bridge::ProcessTask(m_NC);//高速API共享記憶體作業任務
         ncPLCManager.Process();
@@ -174,16 +90,18 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         timer_100ms += 10;
         timer_500ms += 10;   // 🌟 增加 500ms 的計時器累加
         timer_1000ms += 10;
+        timer_5000ms += 10;
+        timer_10000ms += 10;
         Debug_test_timer += 10; // 測試專用時間軸 
 
 
         //1s
         if (tickCount_RunRealTimeCycle % 4000 == 0)
         {
-            DEBUG_PRINT(">>> [1s] WKC:%d | Timeouts:%d | Err:%d |\n", wkc_PDO, timeout_count_PDO, wkc_error_count_PDO);
+            //DEBUG_PRINT(">>> [1s] WKC:%d | Timeouts:%d | Err:%d |\n", wkc_PDO, timeout_count_PDO, wkc_error_count_PDO);
         }
 
-    
+
 
 
         //10ms
@@ -218,8 +136,34 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
             timer_1000ms_Count += 1;
             HMI_Bridge::ProcessTask_1000ms(m_NC); // 呼叫 1000ms 任務
             //DEBUG_PRINT("1000ms\n");
+
+
+            PrintDcRuntimeDiagnostics();//DC診斷訊息
         }
 
+        //5000ms
+        if (timer_5000ms >= 5000)
+        {
+            timer_5000ms = 0; // 執行完立刻歸零
+            timer_5000ms_Count += 1;
+            
+            //DEBUG_PRINT("5000ms\n");
+
+
+            //PrintDcRuntimeDiagnostics();//DC診斷訊息
+        }
+
+        //10000ms
+        if (timer_10000ms >= 10000)
+        {
+            timer_10000ms = 0; // 執行完立刻歸零
+            timer_10000ms_Count += 1;
+
+            //DEBUG_PRINT("5000ms\n");
+
+
+           
+        }
 
         if (Debug_test_timer >= 1000)
         {
@@ -229,9 +173,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         }
 
     }
-  
+
 
 
 }
-
-

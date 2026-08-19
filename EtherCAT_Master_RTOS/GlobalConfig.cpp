@@ -129,9 +129,37 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
 
 
 
+            //極限設定-------------------------------------------------------------
 
-
+            // 第 1 組軟體行程 G22 / G23 -------------------------------------------------------------
         
+            axes[i].travelLimit1Enable =(ConfigUtil::ReadParam( filePath,prefix + "TravelLimit1Enable",0.0) == 1.0);
+            axes[i].travelLimit1Positive_unit =ConfigUtil::ReadParam(filePath,prefix + "TravelLimit1Positive",0.0);
+            axes[i].travelLimit1Negative_unit = ConfigUtil::ReadParam(filePath,prefix + "TravelLimit1Negative",0.0);
+
+            // Unit -> Pulse
+            axes[i].travelLimit1Positive_Pulse =axes[i].travelLimit1Positive_unit *pulsePerUnit;
+            axes[i].travelLimit1Negative_Pulse = axes[i].travelLimit1Negative_unit *pulsePerUnit;
+
+
+            // 第 2 組軟體行程 系統參數決定是否開啟-------------------------------------------------------------
+            axes[i].travelLimit2Enable =(ConfigUtil::ReadParam( filePath,  prefix + "TravelLimit2Enable",    0.0) == 1.0);
+            axes[i].travelLimit2Positive_unit = ConfigUtil::ReadParam(  filePath,  prefix + "TravelLimit2Positive",   0.0);
+            axes[i].travelLimit2Negative_unit = ConfigUtil::ReadParam( filePath,   prefix + "TravelLimit2Negative",   0.0);
+
+            // Unit -> Pulse
+            axes[i].travelLimit2Positive_Pulse = axes[i].travelLimit2Positive_unit * pulsePerUnit;
+            axes[i].travelLimit2Negative_Pulse =  axes[i].travelLimit2Negative_unit * pulsePerUnit;
+
+            // 第 3 組軟體行程 系統參數決定是否開啟-------------------------------------------------------------
+
+            axes[i].travelLimit3Enable =(ConfigUtil::ReadParam( filePath, prefix + "TravelLimit3Enable", 0.0) == 1.0);
+            axes[i].travelLimit3Positive_unit =  ConfigUtil::ReadParam(   filePath, prefix + "TravelLimit3Positive", 0.0);
+            axes[i].travelLimit3Negative_unit = ConfigUtil::ReadParam( filePath,  prefix + "TravelLimit3Negative",  0.0);
+
+            // Unit -> Pulse
+            axes[i].travelLimit3Positive_Pulse = axes[i].travelLimit3Positive_unit * pulsePerUnit;
+            axes[i].travelLimit3Negative_Pulse = axes[i].travelLimit3Negative_unit *  pulsePerUnit;
         }
     }
 
@@ -344,6 +372,21 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
 
     return true;
 }
+
+
+bool GlobalConfig::LoadNCConfig(const std::string& filePath, std::vector<AxisContext>& axes, MotionCore& motion)
+{
+    
+    //第一軟體極限保護G22 G23 啟動時預設 0為G23 1為G22
+    bool programmableTravelLimitEnabled = (ConfigUtil::ReadParam(filePath, "ProgrammableTravelLimitEnabled", 0.0) == 1.0);
+    motion.m_pCoordMgr->SetProgrammableTravelLimitEnabled(programmableTravelLimitEnabled);
+
+
+   
+
+
+    return true;
+}
 void GlobalConfig::LoadFromFile(const std::string& filePath)
 {
     //----------系統模式
@@ -465,6 +508,15 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
     master.m_NC->CoordSys.SetWCS(master.m_NC->CoordSys.GetCurrentWCSGCode(), master.m_NC);
     master.pCoordMgr = &(master.m_NC->CoordSys); // 指向目前的座標系
     master.m_Motion.LinkCoordinateManager(&(master.m_NC->CoordSys));
+
+
+    //載入NC設定
+    std::string NCConfigPath = GlobalConfig::GetInstance().ParameterDir + "NCConfig.txt";
+    if (!GlobalConfig::GetInstance().LoadNCConfig(NCConfigPath, master.m_Axes, master.m_Motion))
+    {
+        DEBUG_PRINT("LoadConfig Error！>>NCConfig.txt\n");
+        return -1;
+    }
 
 
    //載入初始NC檔案---------------------------------------------------------------------

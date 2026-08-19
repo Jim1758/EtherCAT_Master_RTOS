@@ -13,7 +13,7 @@
  * 執行緒分工：
  * - 初始化/SDO/狀態命令：非 PDO 即時流程使用。
  * - ecx_LRW_FRMW()：Priority 64 PDO 路徑使用，不可加入 RtPrintf。
- * - PrintDcRuntimeDiagnostics()：Priority 50 讀取本檔案發布的快照。
+ * - PrintDcRuntimeDiagnostics1000ms()：Priority 50 讀取本檔案發布的快照。
  *
  * 正式候選版關鍵參數：
  * - PDO cycle：250 us（4 kHz）。
@@ -28,11 +28,15 @@
  * - 所有 Priority 64 診斷只做計數與 seqlock publish，不做格式化輸出。
  */
 #include "EtherCatMaster.h"
+#include "ConfigReader.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 #include <windows.h> 
 #include <rtapi.h> 
 #include <rtssapi.h> 
 #include <stdio.h>
+#include <algorithm>
+#include <cctype>
+#include <string>
 #define MAX_MBX_SIZE 1024
 
 
@@ -3148,6 +3152,950 @@ bool EtherCatMaster::ConfigureDCPropagationDelay(
 }
 
 
+namespace
+{
+    const int DC_AUTO_MEASURE_COUNT =
+        10;
+
+    const int DC_AUTO_MIN_VALID_SAMPLES =
+        5;
+
+    std::string ToUpperDcAutoMode(
+        std::string value)
+    {
+        std::transform(
+            value.begin(),
+            value.end(),
+            value.begin(),
+            [](unsigned char ch)
+            {
+                return (char)std::toupper(ch);
+            });
+
+        return value;
+    }
+
+    bool GetDcAutoPropagationReference(
+        const int* servoSlaveIndices,
+        int servoCount,
+        int& referenceSlaveIndex,
+        std::string& referenceMode)
+    {
+        referenceSlaveIndex =
+            -1;
+
+        referenceMode =
+            "AUTO";
+
+        if (servoSlaveIndices == nullptr ||
+            servoCount <= 0)
+        {
+            return false;
+        }
+
+        const std::string configPath =
+            GlobalConfig::GetInstance().BaseDataDir +
+            "SystemConfig.txt";
+
+        referenceMode =
+            ToUpperDcAutoMode(
+                ConfigUtil::ReadConfigString(
+                    configPath,
+                    "DC_Reference_Mode",
+                    "AUTO"));
+
+        if (referenceMode == "FIXED")
+        {
+            referenceSlaveIndex =
+                (int)ConfigUtil::ReadParam(
+                    configPath,
+                    "DC_Reference_Slave_Index",
+                    -1.0);
+        }
+        else
+        {
+            if (referenceMode != "AUTO")
+            {
+                RtPrintf(
+                    "[DC-DELAY-AUTO] WARNING | "
+                    "Unknown DC_Reference_Mode:%s | Using AUTO.\n",
+
+                    referenceMode.c_str());
+
+                referenceMode =
+                    "AUTO";
+            }
+
+            referenceSlaveIndex =
+                servoSlaveIndices[0];
+        }
+
+        // V1 的 propagation 公式以 Servo 鏈第一台為相對 delay 0。
+        // FIXED 指到鏈中間時不可直接產生負 delay，因此安全拒絕、不寫 0x0928。
+        return
+            referenceSlaveIndex ==
+            servoSlaveIndices[0];
+    }
+
+    uint32_t SelectDcAutoMedian(
+        uint32_t* values,
+        int count)
+    {
+        if (values == nullptr ||
+            count <= 0)
+        {
+            return 0;
+        }
+
+        std::sort(
+            values,
+            values + count);
+
+        if ((count % 2) != 0)
+        {
+            return values[count / 2];
+        }
+
+        const int upper =
+            count / 2;
+
+        const int lower =
+            upper - 1;
+
+        return
+            (uint32_t)(
+                (
+                    (uint64_t)values[lower] +
+                    (uint64_t)values[upper]
+                    ) /
+                2ULL);
+    }
+
+    bool RollbackDcAutoPropagationDelay(
+        EtherCatMaster* pMaster,
+        const DCAutoPropagationTable& delayTable,
+        const uint32_t* previousDelay)
+    {
+        if (pMaster == nullptr ||
+            previousDelay == nullptr)
+        {
+            return false;
+        }
+
+        bool rollbackOk =
+            true;
+
+        for (int i = 0;
+            i < delayTable.count;
+            i++)
+        {
+            const int slaveIndex =
+                delayTable.entries[i].slaveIndex;
+
+            uint32_t restoreValue =
+                previousDelay[i];
+
+            const int rollbackWkc =
+                pMaster->ecx_FPWR(
+                    m_slaveInfo[slaveIndex].configAddr,
+                    0x0928,
+                    &restoreValue,
+                    4,
+                    20);
+
+            if (rollbackWkc <= 0)
+            {
+                rollbackOk =
+                    false;
+            }
+
+            RtPrintf(
+                "[DC-CONFIG-AUTO] ROLLBACK | "
+                "SlaveIndex:%d | Delay:%u ns | WKC:%d\n",
+
+                slaveIndex,
+                (unsigned int)restoreValue,
+                rollbackWkc);
+        }
+
+        return rollbackOk;
+    }
+}
+
+/*
+ * AUTO propagation-delay measurement V1。
+ * 支援 1~8 台連續 Servo；非 Servo 可位於 Servo 鏈之前或之後。
+ * 本函式只量測並建立 table，不寫入 0x0928。
+ */
+bool EtherCatMaster::MeasureDCPropagationDelayAuto(
+    DCAutoPropagationTable& delayTable)
+{
+    delayTable =
+        DCAutoPropagationTable{};
+
+    if (m_pEni == nullptr)
+    {
+        RtPrintf(
+            "[DC-DELAY-AUTO] FAILED | "
+            "Reason:ENI not initialized | Write0928:NO\n");
+
+        return false;
+    }
+
+    const auto& slaves =
+        m_pEni->GetSlaves();
+
+    const int totalSlaves =
+        (int)slaves.size();
+
+    const int servoCount =
+        (int)m_ServoList.size();
+
+    RtPrintf(
+        "\n"
+        "============================================================\n"
+        "[DC-DELAY-AUTO] BEGIN | "
+        "SlaveCount:%d | ServoCount:%d | Limit:%d | Write0928:NO\n"
+        "============================================================\n",
+
+        totalSlaves,
+        servoCount,
+        DC_AUTO_MAX_SERVO_COUNT);
+
+    if (totalSlaves <= 0 ||
+        servoCount <= 0 ||
+        servoCount > DC_AUTO_MAX_SERVO_COUNT)
+    {
+        RtPrintf(
+            "[DC-DELAY-AUTO] FAILED | "
+            "Reason:Invalid slave or servo count | Write0928:NO\n");
+
+        return false;
+    }
+
+    int servoSlaveIndices[DC_AUTO_MAX_SERVO_COUNT] = {};
+
+    for (int i = 0;
+        i < servoCount;
+        i++)
+    {
+        servoSlaveIndices[i] =
+            m_ServoList[(size_t)i].slaveIndex;
+    }
+
+    std::sort(
+        servoSlaveIndices,
+        servoSlaveIndices + servoCount);
+
+    for (int i = 0;
+        i < servoCount;
+        i++)
+    {
+        if (servoSlaveIndices[i] < 0 ||
+            servoSlaveIndices[i] >= totalSlaves)
+        {
+            RtPrintf(
+                "[DC-DELAY-AUTO] FAILED | "
+                "Reason:Servo index out of range | Order:%d | SlaveIndex:%d\n",
+
+                i,
+                servoSlaveIndices[i]);
+
+            return false;
+        }
+
+        if (i > 0 &&
+            servoSlaveIndices[i - 1] + 1 !=
+            servoSlaveIndices[i])
+        {
+            RtPrintf(
+                "[DC-DELAY-AUTO] FAILED | "
+                "Reason:Servo chain is not consecutive | "
+                "Previous:S%d | Current:S%d | Write0928:NO\n",
+
+                servoSlaveIndices[i - 1],
+                servoSlaveIndices[i]);
+
+            return false;
+        }
+    }
+
+    int referenceSlaveIndex =
+        -1;
+
+    std::string referenceMode;
+
+    if (!GetDcAutoPropagationReference(
+        servoSlaveIndices,
+        servoCount,
+        referenceSlaveIndex,
+        referenceMode))
+    {
+        RtPrintf(
+            "[DC-DELAY-AUTO] FAILED | "
+            "Reason:Reference must be first Servo in V1 | "
+            "Mode:%s | RequestedReference:S%d | FirstServo:S%d | "
+            "Write0928:NO\n",
+
+            referenceMode.c_str(),
+            referenceSlaveIndex,
+            servoSlaveIndices[0]);
+
+        return false;
+    }
+
+    uint16_t dlStatus[DC_AUTO_MAX_SERVO_COUNT] = {};
+    uint16_t physicalPortMask[DC_AUTO_MAX_SERVO_COUNT] = {};
+
+    for (int i = 0;
+        i < servoCount;
+        i++)
+    {
+        const int slaveIndex =
+            servoSlaveIndices[i];
+
+        const uint16_t configAddr =
+            m_slaveInfo[slaveIndex].configAddr;
+
+        if (configAddr == 0)
+        {
+            RtPrintf(
+                "[DC-DELAY-AUTO] FAILED | "
+                "Reason:Config address is zero | SlaveIndex:%d\n",
+
+                slaveIndex);
+
+            return false;
+        }
+
+        const int dlWkc =
+            ecx_FPRD(
+                configAddr,
+                0x0110,
+                &dlStatus[i],
+                2,
+                20);
+
+        uint64_t dcSystemTime =
+            0;
+
+        const int dcWkc =
+            ecx_FPRD(
+                configAddr,
+                0x0910,
+                &dcSystemTime,
+                8,
+                20);
+
+        physicalPortMask[i] =
+            (uint16_t)(
+                (dlStatus[i] >> 4) &
+                0x000FU);
+
+        const bool p0Linked =
+            (physicalPortMask[i] & 0x01U) != 0;
+
+        const bool p1Linked =
+            (physicalPortMask[i] & 0x02U) != 0;
+
+        const bool branchOnP2OrP3 =
+            (physicalPortMask[i] & 0x0CU) != 0;
+
+        const bool isLastServo =
+            i == servoCount - 1;
+
+        const bool nodeValid =
+            dlWkc > 0 &&
+            dcWkc > 0 &&
+            dcSystemTime > 0 &&
+            p0Linked &&
+            !branchOnP2OrP3 &&
+            (isLastServo || p1Linked);
+
+        RtPrintf(
+            "[DC-DELAY-AUTO] NODE | "
+            "Order:%d | SlaveIndex:%d | Role:%s | "
+            "ConfigAddr:0x%04X | DL:0x%04X | PortMask:0x%X | "
+            "DC:%llu WKC:%d | Valid:%s\n",
+
+            i,
+            slaveIndex,
+            i == 0 ? "REFERENCE" : "FOLLOWER",
+            (unsigned int)configAddr,
+            (unsigned int)dlStatus[i],
+            (unsigned int)physicalPortMask[i],
+            (unsigned long long)dcSystemTime,
+            dcWkc,
+            nodeValid ? "YES" : "NO");
+
+        if (!nodeValid)
+        {
+            RtPrintf(
+                "[DC-DELAY-AUTO] FAILED | "
+                "Reason:DC or linear Port validation failed | "
+                "SlaveIndex:%d | Write0928:NO\n",
+
+                slaveIndex);
+
+            return false;
+        }
+    }
+
+    uint32_t delaySamples
+        [DC_AUTO_MAX_SERVO_COUNT]
+        [DC_AUTO_MEASURE_COUNT] = {};
+
+    uint64_t delaySum[DC_AUTO_MAX_SERVO_COUNT] = {};
+    uint32_t delayMin[DC_AUTO_MAX_SERVO_COUNT] = {};
+    uint32_t delayMax[DC_AUTO_MAX_SERVO_COUNT] = {};
+
+    for (int i = 0;
+        i < servoCount;
+        i++)
+    {
+        delayMin[i] =
+            0xFFFFFFFFU;
+    }
+
+    int validSamples =
+        0;
+
+    for (int sampleIndex = 0;
+        sampleIndex < DC_AUTO_MEASURE_COUNT;
+        sampleIndex++)
+    {
+        uint32_t trigger =
+            0;
+
+        const int triggerWkc =
+            ecx_BWR(
+                0x0000,
+                0x0900,
+                4,
+                &trigger,
+                20);
+
+        if (triggerWkc <= 0)
+        {
+            RtPrintf(
+                "[DC-DELAY-AUTO] Sample:%d REJECT | "
+                "Reason:Timestamp trigger failed | WKC:%d\n",
+
+                sampleIndex,
+                triggerWkc);
+
+            continue;
+        }
+
+        uint32_t timestamps
+            [DC_AUTO_MAX_SERVO_COUNT]
+            [4] = {};
+
+        bool sampleValid =
+            true;
+
+        for (int i = 0;
+            i < servoCount;
+            i++)
+        {
+            const int slaveIndex =
+                servoSlaveIndices[i];
+
+            const int timestampWkc =
+                ecx_FPRD(
+                    m_slaveInfo[slaveIndex].configAddr,
+                    0x0900,
+                    timestamps[i],
+                    16,
+                    20);
+
+            if (timestampWkc <= 0)
+            {
+                RtPrintf(
+                    "[DC-DELAY-AUTO] Sample:%d REJECT | "
+                    "Reason:Timestamp read failed | SlaveIndex:%d | WKC:%d\n",
+
+                    sampleIndex,
+                    slaveIndex,
+                    timestampWkc);
+
+                sampleValid =
+                    false;
+
+                break;
+            }
+        }
+
+        if (!sampleValid)
+        {
+            continue;
+        }
+
+        uint32_t downstreamRoundTrip[DC_AUTO_MAX_SERVO_COUNT] = {};
+        uint32_t currentDelay[DC_AUTO_MAX_SERVO_COUNT] = {};
+
+        for (int i = 0;
+            i < servoCount;
+            i++)
+        {
+            const bool p1Linked =
+                (physicalPortMask[i] & 0x02U) != 0;
+
+            if (p1Linked)
+            {
+                downstreamRoundTrip[i] =
+                    timestamps[i][1] -
+                    timestamps[i][0];
+
+                if (downstreamRoundTrip[i] == 0)
+                {
+                    sampleValid =
+                        false;
+
+                    break;
+                }
+            }
+        }
+
+        currentDelay[0] =
+            0;
+
+        for (int i = 0;
+            sampleValid &&
+            i < servoCount - 1;
+            i++)
+        {
+            if (downstreamRoundTrip[i] <=
+                downstreamRoundTrip[i + 1])
+            {
+                sampleValid =
+                    false;
+
+                break;
+            }
+
+            const uint32_t linkDelay =
+                (
+                    downstreamRoundTrip[i] -
+                    downstreamRoundTrip[i + 1]
+                    ) /
+                2U;
+
+            const uint64_t cumulativeDelay =
+                (uint64_t)currentDelay[i] +
+                (uint64_t)linkDelay;
+
+            if (linkDelay == 0 ||
+                cumulativeDelay > 0xFFFFFFFFULL)
+            {
+                sampleValid =
+                    false;
+
+                break;
+            }
+
+            currentDelay[i + 1] =
+                (uint32_t)cumulativeDelay;
+        }
+
+        if (!sampleValid)
+        {
+            RtPrintf(
+                "[DC-DELAY-AUTO] Sample:%d REJECT | "
+                "Reason:Round-trip hierarchy invalid\n",
+
+                sampleIndex);
+
+            continue;
+        }
+
+        RtPrintf(
+            "[DC-DELAY-AUTO] Sample:%d VALID | ",
+            sampleIndex);
+
+        for (int i = 0;
+            i < servoCount;
+            i++)
+        {
+            delaySamples[i][validSamples] =
+                currentDelay[i];
+
+            delaySum[i] +=
+                currentDelay[i];
+
+            if (currentDelay[i] < delayMin[i])
+            {
+                delayMin[i] =
+                    currentDelay[i];
+            }
+
+            if (currentDelay[i] > delayMax[i])
+            {
+                delayMax[i] =
+                    currentDelay[i];
+            }
+
+            RtPrintf(
+                "%sS%d:%u",
+                i == 0 ? "" : " ",
+                servoSlaveIndices[i],
+                (unsigned int)currentDelay[i]);
+        }
+
+        RtPrintf(" ns\n");
+
+        validSamples++;
+    }
+
+    if (validSamples <
+        DC_AUTO_MIN_VALID_SAMPLES)
+    {
+        RtPrintf(
+            "[DC-DELAY-AUTO] FAILED | "
+            "Reason:Insufficient valid samples | Valid:%d/%d | "
+            "Required:%d | Write0928:NO\n",
+
+            validSamples,
+            DC_AUTO_MEASURE_COUNT,
+            DC_AUTO_MIN_VALID_SAMPLES);
+
+        return false;
+    }
+
+    delayTable.count =
+        servoCount;
+
+    delayTable.referenceSlaveIndex =
+        referenceSlaveIndex;
+
+    for (int i = 0;
+        i < servoCount;
+        i++)
+    {
+        uint32_t sortedDelay[DC_AUTO_MEASURE_COUNT] = {};
+
+        for (int sample = 0;
+            sample < validSamples;
+            sample++)
+        {
+            sortedDelay[sample] =
+                delaySamples[i][sample];
+        }
+
+        const uint32_t medianDelay =
+            SelectDcAutoMedian(
+                sortedDelay,
+                validSamples);
+
+        const uint32_t averageDelay =
+            (uint32_t)(
+                delaySum[i] /
+                (uint64_t)validSamples);
+
+        delayTable.entries[i].slaveIndex =
+            servoSlaveIndices[i];
+
+        delayTable.entries[i].delayNs =
+            medianDelay;
+
+        RtPrintf(
+            "[DC-DELAY-AUTO-STAT] "
+            "Order:%d | SlaveIndex:%d | "
+            "Median:%u Avg:%u Min:%u Max:%u ns | Samples:%d\n",
+
+            i,
+            servoSlaveIndices[i],
+            (unsigned int)medianDelay,
+            (unsigned int)averageDelay,
+            (unsigned int)delayMin[i],
+            (unsigned int)delayMax[i],
+            validSamples);
+    }
+
+    RtPrintf(
+        "[DC-DELAY-AUTO-RESULT] "
+        "Reference:S%d | ServoCount:%d | ",
+
+        delayTable.referenceSlaveIndex,
+        delayTable.count);
+
+    for (int i = 0;
+        i < delayTable.count;
+        i++)
+    {
+        RtPrintf(
+            "%sS%d:%u",
+            i == 0 ? "" : " ",
+            delayTable.entries[i].slaveIndex,
+            (unsigned int)delayTable.entries[i].delayNs);
+    }
+
+    RtPrintf(
+        " ns | ValidSamples:%d/%d | Result:PASS | Write0928:NO\n",
+        validSamples,
+        DC_AUTO_MEASURE_COUNT);
+
+    RtPrintf(
+        "============================================================\n"
+        "[DC-DELAY-AUTO] END | Result:PASS | Write0928:NO\n"
+        "============================================================\n\n");
+
+    return true;
+}
+
+/* 將 AUTO table 寫入各 Servo 0x0928，逐站 ReadBack；失敗時回復原值。 */
+bool EtherCatMaster::ConfigureDCPropagationDelayAuto(
+    const DCAutoPropagationTable& delayTable)
+{
+    if (m_pEni == nullptr)
+    {
+        RtPrintf(
+            "[DC-CONFIG-AUTO] FAILED | Reason:ENI not initialized\n");
+
+        return false;
+    }
+
+    const auto& slaves =
+        m_pEni->GetSlaves();
+
+    const int totalSlaves =
+        (int)slaves.size();
+
+    if (delayTable.count <= 0 ||
+        delayTable.count > DC_AUTO_MAX_SERVO_COUNT ||
+        delayTable.count != (int)m_ServoList.size() ||
+        delayTable.referenceSlaveIndex !=
+        delayTable.entries[0].slaveIndex ||
+        delayTable.entries[0].delayNs != 0)
+    {
+        RtPrintf(
+            "[DC-CONFIG-AUTO] FAILED | Reason:Invalid delay table header\n");
+
+        return false;
+    }
+
+    int currentServoIndices[DC_AUTO_MAX_SERVO_COUNT] = {};
+
+    for (int i = 0;
+        i < delayTable.count;
+        i++)
+    {
+        currentServoIndices[i] =
+            m_ServoList[(size_t)i].slaveIndex;
+    }
+
+    std::sort(
+        currentServoIndices,
+        currentServoIndices + delayTable.count);
+
+    for (int i = 0;
+        i < delayTable.count;
+        i++)
+    {
+        const int slaveIndex =
+            delayTable.entries[i].slaveIndex;
+
+        if (slaveIndex < 0 ||
+            slaveIndex >= totalSlaves ||
+            m_slaveInfo[slaveIndex].configAddr == 0 ||
+            currentServoIndices[i] != slaveIndex)
+        {
+            RtPrintf(
+                "[DC-CONFIG-AUTO] FAILED | "
+                "Reason:Servo order changed or invalid | Order:%d | SlaveIndex:%d\n",
+
+                i,
+                slaveIndex);
+
+            return false;
+        }
+
+        if (i > 0 &&
+            (
+                delayTable.entries[i - 1].slaveIndex + 1 !=
+                slaveIndex ||
+                delayTable.entries[i].delayNs <
+                delayTable.entries[i - 1].delayNs
+                ))
+        {
+            RtPrintf(
+                "[DC-CONFIG-AUTO] FAILED | "
+                "Reason:Non-consecutive order or decreasing delay | Order:%d\n",
+
+                i);
+
+            return false;
+        }
+    }
+
+    RtPrintf(
+        "\n"
+        "============================================================\n"
+        "[DC-CONFIG-AUTO] BEGIN | Reference:S%d | ServoCount:%d\n"
+        "============================================================\n",
+
+        delayTable.referenceSlaveIndex,
+        delayTable.count);
+
+    uint32_t previousDelay[DC_AUTO_MAX_SERVO_COUNT] = {};
+
+    for (int i = 0;
+        i < delayTable.count;
+        i++)
+    {
+        const int slaveIndex =
+            delayTable.entries[i].slaveIndex;
+
+        const int preflightWkc =
+            ecx_FPRD(
+                m_slaveInfo[slaveIndex].configAddr,
+                0x0928,
+                &previousDelay[i],
+                4,
+                20);
+
+        RtPrintf(
+            "[DC-CONFIG-AUTO] PREFLIGHT | "
+            "Order:%d | SlaveIndex:%d | Previous:%u ns | WKC:%d\n",
+
+            i,
+            slaveIndex,
+            (unsigned int)previousDelay[i],
+            preflightWkc);
+
+        if (preflightWkc <= 0)
+        {
+            RtPrintf(
+                "[DC-CONFIG-AUTO] FAILED | "
+                "Reason:Preflight read failed | No value was written\n");
+
+            return false;
+        }
+    }
+
+    for (int i = 0;
+        i < delayTable.count;
+        i++)
+    {
+        const int slaveIndex =
+            delayTable.entries[i].slaveIndex;
+
+        uint32_t requestedDelay =
+            delayTable.entries[i].delayNs;
+
+        const int writeWkc =
+            ecx_FPWR(
+                m_slaveInfo[slaveIndex].configAddr,
+                0x0928,
+                &requestedDelay,
+                4,
+                20);
+
+        RtPrintf(
+            "[DC-CONFIG-AUTO] WRITE | "
+            "Order:%d | SlaveIndex:%d | Delay:%u ns | WKC:%d\n",
+
+            i,
+            slaveIndex,
+            (unsigned int)requestedDelay,
+            writeWkc);
+
+        if (writeWkc <= 0)
+        {
+            const bool rollbackOk =
+                RollbackDcAutoPropagationDelay(
+                    this,
+                    delayTable,
+                    previousDelay);
+
+            RtPrintf(
+                "[DC-CONFIG-AUTO] FAILED | "
+                "Reason:Write failed | Rollback:%s\n",
+
+                rollbackOk ? "SUCCESS" : "FAILED");
+
+            return false;
+        }
+    }
+
+    bool verificationOk =
+        true;
+
+    for (int i = 0;
+        i < delayTable.count;
+        i++)
+    {
+        const int slaveIndex =
+            delayTable.entries[i].slaveIndex;
+
+        uint32_t readBackDelay =
+            0;
+
+        const int readBackWkc =
+            ecx_FPRD(
+                m_slaveInfo[slaveIndex].configAddr,
+                0x0928,
+                &readBackDelay,
+                4,
+                20);
+
+        const bool valueMatch =
+            readBackWkc > 0 &&
+            readBackDelay ==
+            delayTable.entries[i].delayNs;
+
+        RtPrintf(
+            "[DC-CONFIG-AUTO] READBACK | "
+            "Order:%d | SlaveIndex:%d | Expected:%u | Actual:%u ns | "
+            "WKC:%d | Match:%s\n",
+
+            i,
+            slaveIndex,
+            (unsigned int)delayTable.entries[i].delayNs,
+            (unsigned int)readBackDelay,
+            readBackWkc,
+            valueMatch ? "YES" : "NO");
+
+        if (!valueMatch)
+        {
+            verificationOk =
+                false;
+        }
+    }
+
+    if (!verificationOk)
+    {
+        const bool rollbackOk =
+            RollbackDcAutoPropagationDelay(
+                this,
+                delayTable,
+                previousDelay);
+
+        RtPrintf(
+            "[DC-CONFIG-AUTO] FAILED | "
+            "Reason:ReadBack verification failed | Rollback:%s\n",
+
+            rollbackOk ? "SUCCESS" : "FAILED");
+
+        return false;
+    }
+
+    RtPrintf(
+        "[DC-CONFIG-AUTO-RESULT] "
+        "Reference:S%d | ServoCount:%d | Result:PASS\n",
+
+        delayTable.referenceSlaveIndex,
+        delayTable.count);
+
+    RtPrintf(
+        "============================================================\n"
+        "[DC-CONFIG-AUTO] END | Result:PASS\n"
+        "============================================================\n\n");
+
+    return true;
+}
+
+
 // =============================================================
 // DC Diagnostic Snapshot V1 - Producer Side
 //
@@ -4030,7 +4978,7 @@ void EtherCatMaster::UpdateDCPdoPhaseController(
 // EtherCAT Send Point Diagnostic Snapshot
 //
 // Producer：ecx_LRW_FRMW() / Priority 64。
-// Consumer：PrintDcRuntimeDiagnostics() / Priority 50。
+// Consumer：PrintDcRuntimeDiagnostics1000ms() / Priority 50。
 // Publish：每 4000 個有效 QPC 樣本一次。
 //
 // Build：從開始建立 LRW+FRMW Frame 到呼叫 SendPacket() 前的時間。
@@ -5963,5 +6911,3 @@ int EtherCatMaster::ecx_LRW_FRMW(
 
     return -1;
 }
-
-

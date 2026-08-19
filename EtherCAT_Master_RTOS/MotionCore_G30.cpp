@@ -8,7 +8,6 @@
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 
 
-
 // 🌟 預防性裝甲：強制 8-Byte 對齊，保護 std::vector 不受 EtherCAT PDO 污染
 #pragma pack(push, 8)
 struct MoveResult {
@@ -35,7 +34,7 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
     for (size_t i = 0; i < axes.size(); ++i) {
         AxisContext& axis = (*m_pContexts)[axes[i]];
 
-        // 🌟 2. 初始起點：改吃虛擬終點！
+        // 初始起點：改吃虛擬終點！
         simulatedStartPulse[i] = isLookAheadActive ? axis.lastQueuedPulse : axis.logicalCmdPos;
     }
 
@@ -48,7 +47,12 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
 
         if (target_mm.size() != axes.size()) return result;
 
-        double groupAccTime = 0.0, groupDecTime = 0.0, maxTimeNeeded = 0.0, sum_sq = 0.0;
+        double groupAccTime = 0.0, groupDecTime = 0.0, maxTimeNeeded = 0.0;
+
+        // 🌟 對齊 G00/G28 架構：準備 Pulse 與 mm 雙軌計算
+        double sum_sq_pulse = 0.0;
+        double sum_sq_mm = 0.0;
+
         std::vector<double> target_Pulse(axes.size());
 
         for (size_t i = 0; i < axes.size(); ++i) {
@@ -63,9 +67,9 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
             groupDecTime = std::max<double>(groupDecTime, safe_dec);
 
             double lead = (axis.finalLead < 1e-6) ? 1.0 : axis.finalLead;
-            double targetPulse = target_mm[i] * (axis.resolution_PPR / lead);
+            double pulsePerUnit = axis.resolution_PPR / lead;
 
-            // 這裡吃到的會是迴圈外準備好的 simulatedStartPulse
+            double targetPulse = target_mm[i] * pulsePerUnit;
             double startPulse = simulatedStartPulse[i];
 
             if (axis.axisType == AxisType::ROTARY && axis.useShortestPath) {
@@ -73,18 +77,28 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
             }
 
             target_Pulse[i] = targetPulse;
-            double dist = std::abs(targetPulse - startPulse);
-            sum_sq += (dist * dist);
 
-            double safe_PPS = (axis.G30_PPS > 10.0) ? axis.G30_PPS : 0;
-            maxTimeNeeded = std::max<double>(maxTimeNeeded, dist / safe_PPS);
+            // 🌟 幾何距離雙計算
+            double distPulse = std::abs(targetPulse - startPulse);
+            double dist_mm = distPulse / pulsePerUnit;
 
-            // 🌟 這裡你原本寫的非常好！把算完的終點存起來，當作下一段(如果有)的起點
+            sum_sq_pulse += (distPulse * distPulse);
+            sum_sq_mm += (dist_mm * dist_mm);
+
+            // 🌟 【神級修復】防止除以零的防呆寫法 (讀取 G30 專屬極速)
+            double safe_PPS = axis.G30_PPS;
+            if (safe_PPS > 1.0) {
+                maxTimeNeeded = std::max<double>(maxTimeNeeded, distPulse / safe_PPS);
+            }
+
+            // 把算完的終點存起來，當作下一段(如果有)的起點
             simulatedStartPulse[i] = targetPulse;
         }
 
-        double totalDist = std::sqrt(sum_sq);
-        double vel = (maxTimeNeeded > 0.0001) ? (totalDist / maxTimeNeeded) : 0;
+        double totalDist_Pulse = std::sqrt(sum_sq_pulse);
+
+        // 用最慢軸的時間去牽制全部，計算群組虛擬速度
+        double vel = (maxTimeNeeded > 0.0001) ? (totalDist_Pulse / maxTimeNeeded) : 0;
 
         result.success = true;
         result.targetPulse = target_Pulse;
@@ -101,19 +115,19 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
     PathMode prevMode = GetGroupPathMode();
     SetGroupPathMode(PathMode::EXACT_STOP);
 
+    // 🌟 宣告一個游標模式，防止 ABORTING 誤刪中間點
+    BufferMode currentMode = mode;
+
     // 1. 跑第一段 (中間點)
     if (intermediatePos_mm != nullptr)
     {
         MoveResult res = processMove(*intermediatePos_mm);
         if (res.success)
         {
-            std::vector<double> res_pos = res.targetPulse;
-            double res_vel = res.vel;
-            double res_acc = res.acc;
-            double res_dec = res.dec;
+            LineMove(axes, res.targetPulse, res.vel, res.acc, res.dec, currentMode);
 
-            // 🌟 將 mode (BufferMode) 當作標籤傳進去，取代原本的全域設定
-            LineMove(axes, res_pos, res_vel, res_acc, res_dec, mode);
+            // 🌟 【神級修復】只要第一段出車了，後續強制轉為「排隊模式 (BUFFERED)」
+            currentMode = BufferMode::BUFFERED;
         }
     }
 
@@ -121,13 +135,8 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
     MoveResult resRef = processMove(refPos_mm);
     if (resRef.success)
     {
-        std::vector<double> resRef_pos = resRef.targetPulse;
-        double resRef_vel = resRef.vel;
-        double resRef_acc = resRef.acc;
-        double resRef_dec = resRef.dec;
-
-        // 🌟 同樣交給標籤系統
-        LineMove(axes, resRef_pos, resRef_vel, resRef_acc, resRef_dec, mode);
+        // 這裡的 currentMode 可能已經因為上面的 if 變成了 BUFFERED
+        LineMove(axes, resRef.targetPulse, resRef.vel, resRef.acc, resRef.dec, currentMode);
     }
 
     // =========================================================
@@ -139,6 +148,4 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
         int idx = axes[i];
         (*m_pContexts)[idx].lastQueuedPulse = simulatedStartPulse[i];
     }
-
-   
 }

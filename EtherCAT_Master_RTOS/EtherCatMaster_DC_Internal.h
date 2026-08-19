@@ -3,7 +3,7 @@
 
 /*
  * 檔案：EtherCatMaster_DC_Internal.h
- * 版本：EtherCAT DC Release Candidate RC1
+ * 版本：EtherCAT DC Release Candidate RC1.7
  *
  * 此檔案是 EtherCAT/DC 各模組之間的內部診斷快照介面。
  * 它只宣告 extern 變數，不建立控制物件，也不執行控制演算法。
@@ -26,20 +26,76 @@
  */
 
  // =============================================================
- // PDO RT Diagnostic Snapshot
+ // 啟動 Drift 設定與自動校正快照
  //
- // 實體變數定義在 EtherCatMaster.cpp
- // 這裡 Main Thread 只讀取。
+ // ConfigReady/ConfiguredMode/ConfiguredFixedPpb 由 Startup 在正式 PDO timer
+ // 啟動前寫入。其餘欄位由 Priority 64 Runtime 發布，Priority 50 只讀取。
+ // Mode：0=AUTO、1=FIXED。State：0=WARMUP、1=LOCKED、2=FIXED。
  // =============================================================
- // =============================================================
- // DC PLL Diagnostic Snapshot
- //
- // Definition:
- //     UpdateDCPdoPhaseController() 所在 .cpp
- //
- // Reader:
- //     System_EDM_SINKER_MODE.cpp
- // =============================================================
+
+extern volatile LONG
+g_dcDriftConfigReady;
+
+extern volatile LONG
+g_dcDriftConfiguredMode;
+
+extern volatile LONGLONG
+g_dcDriftConfiguredFixedPpb;
+
+extern volatile LONG
+g_dcDriftCalibrationDiagSequence;
+
+extern volatile LONG
+g_dcDriftCalibrationMode;
+
+extern volatile LONG
+g_dcDriftCalibrationState;
+
+extern volatile LONG
+g_dcDriftCalibrationCandidateGood;
+
+extern volatile LONG
+g_dcDriftCalibrationGoodWindows;
+
+extern volatile LONG
+g_dcDriftCalibrationRequiredWindows;
+
+extern volatile LONG
+g_dcDriftCalibrationRobustSequence;
+
+extern volatile LONGLONG
+g_dcDriftCalibrationRawPpb;
+
+extern volatile LONGLONG
+g_dcDriftCalibrationMedianPpb;
+
+extern volatile LONGLONG
+g_dcDriftCalibrationMadPpb;
+
+extern volatile LONGLONG
+g_dcDriftCalibrationRawMedianDeviationPpb;
+
+extern volatile LONGLONG
+g_dcDriftCalibrationBaselinePpb;
+
+extern volatile LONG
+g_dcDriftCalibrationLockCount;
+
+// =============================================================
+// PDO RT Diagnostic Snapshot
+//
+// 實體變數定義在 EtherCatMaster.cpp
+// 這裡 Main Thread 只讀取。
+// =============================================================
+// =============================================================
+// DC PLL Diagnostic Snapshot
+//
+// Definition:
+//     UpdateDCPdoPhaseController() 所在 .cpp
+//
+// Reader:
+//     System_EDM_SINKER_MODE.cpp
+// =============================================================
 
 extern volatile LONG
 g_dcPllDiagSequence;

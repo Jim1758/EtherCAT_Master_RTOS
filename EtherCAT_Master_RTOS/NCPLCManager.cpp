@@ -104,7 +104,7 @@ void NCPLCManager::ProcessGlobalInputs()
             }
         }
 
-        const bool cycleStartAllowed = m_servoReady && !hardLimitActive ; // Final Cycle Start Permission
+        const bool cycleStartAllowed = m_servoReady && !hardLimitActive; // Final Cycle Start Permission
         if (cycleStartAllowed)
         {
             m_nc.CycleStart();
@@ -276,7 +276,7 @@ void NCPLCManager::ProcessManualInputs()
         m_manualMoveMode = ManualMoveMode::NONE;
     }
 
-    
+
 
     int jogSpeedPercent = static_cast<int>(m_plc.GetMemory("R", NCPLC::R::JOG_SPEED_PERCENT)); // R200 Continuous JOG Speed % (0 ~ 100)
     if (jogSpeedPercent < 0) jogSpeedPercent = 0;
@@ -441,17 +441,54 @@ void NCPLCManager::ProcessManualInputs()
 
                     const bool positiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, machineAxis)); // Hard Limit uses MACHINE direction.
                     const bool negativeLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::NEGATIVE_LIMIT_BASE, machineAxis));
+
                     if (positiveLimit && negativeLimit)
                     {
                         manualFrameXYZValid = false;
                         break;
                     }
+
                     if (component > 0.0 && positiveLimit)
                     {
                         manualFrameXYZValid = false;
                         break;
                     }
+
                     if (component < 0.0 && negativeLimit)
+                    {
+                        manualFrameXYZValid = false;
+                        break;
+                    }
+
+                    // =====================================================
+                    // Software Travel Limit
+                    //
+                    // Manual Frame 經過旋轉後，必須依照真正的
+                    // Physical Machine Axis Direction 判斷。
+                    //
+                    // 例如：
+                    // Logical X+ 經過旋轉後可能成為：
+                    //
+                    //     Physical X +
+                    //     Physical Y -
+                    //
+                    // 所以 Software Limit 必須看 component 正負方向，
+                    // 不能只看原本按下的是哪一個 Logical Axis。
+                    // =====================================================
+
+                    const bool softwarePositiveAllowed =
+                        m_nc.GetCoordSys().CanMoveSoftwarePositive(physicalAxis);
+
+                    const bool softwareNegativeAllowed =
+                        m_nc.GetCoordSys().CanMoveSoftwareNegative(physicalAxis);
+
+                    if (component > 0.0 && !softwarePositiveAllowed)
+                    {
+                        manualFrameXYZValid = false;
+                        break;
+                    }
+
+                    if (component < 0.0 && !softwareNegativeAllowed)
                     {
                         manualFrameXYZValid = false;
                         break;
@@ -745,6 +782,7 @@ void NCPLCManager::ProcessManualInputs()
                 if (groupAccTime < 0.001) groupAccTime = 0.2;
                 if (groupDecTime < 0.001) groupDecTime = groupAccTime;
                 bool groupValid = true;
+                bool softwareTargetRejected = false;
 
                 for (int machineAxis = 0; machineAxis < 3; ++machineAxis) // Validate Physical Machine XYZ (Limit 要依照旋轉後實際方向判斷)
                 {
@@ -774,7 +812,42 @@ void NCPLCManager::ProcessManualInputs()
                     if (physicalDeltaUnit > 0.0 && positiveLimit) { groupValid = false; break; }
                     if (physicalDeltaUnit < 0.0 && negativeLimit) { groupValid = false; break; }
 
+                    const bool softwarePositiveAllowed = m_nc.GetCoordSys().CanMoveSoftwarePositive(physicalAxis);
+                    const bool softwareNegativeAllowed = m_nc.GetCoordSys().CanMoveSoftwareNegative(physicalAxis);
+
+                    if (physicalDeltaUnit > 0.0 && !softwarePositiveAllowed)
+                    {
+                        groupValid = false;
+                        softwareTargetRejected = true;
+                        break;
+                    }
+
+                    if (physicalDeltaUnit < 0.0 && !softwareNegativeAllowed)
+                    {
+                        groupValid = false;
+                        softwareTargetRejected = true;
+                        break;
+                    }
+
                     const double pulsePerUnit = physicalAxis.resolution_PPR / physicalAxis.finalLead; // Physical Axis MPG Speed Capacity
+                    const double deltaPulse = physicalDeltaUnit * pulsePerUnit;
+                    const double baseTarget = (physicalAxis.state == MotionState::MotionState_MPG) ? physicalAxis.finalTargetPos : physicalAxis.currentCmdPos;
+                    const double targetPosition = baseTarget + deltaPulse;
+                    const double targetMCS = targetPosition / pulsePerUnit;
+
+                    const bool targetWithinSoftwareLimit = m_nc.GetCoordSys().IsTargetWithinSoftwareTravelLimit(physicalAxis, targetMCS);
+                    const bool positiveSoftwareLimitActive = physicalAxis.travelLimit1PositiveActive || physicalAxis.travelLimit2PositiveActive || physicalAxis.travelLimit3PositiveActive;
+                    const bool negativeSoftwareLimitActive = physicalAxis.travelLimit1NegativeActive || physicalAxis.travelLimit2NegativeActive || physicalAxis.travelLimit3NegativeActive;
+                    const bool recoveringFromPositiveLimit = positiveSoftwareLimitActive && physicalDeltaUnit < 0.0;
+                    const bool recoveringFromNegativeLimit = negativeSoftwareLimitActive && physicalDeltaUnit > 0.0;
+
+                    if (!targetWithinSoftwareLimit && !recoveringFromPositiveLimit && !recoveringFromNegativeLimit)
+                    {
+                        groupValid = false;
+                        softwareTargetRejected = true;
+                        break;
+                    }
+
                     double physicalMaxPPS = physicalAxis.MPG_MAX_PPS;
                     if (physicalAxis.maxVel_PPS > 0.0 && physicalMaxPPS > physicalAxis.maxVel_PPS) physicalMaxPPS = physicalAxis.maxVel_PPS;
                     const double physicalMaxUnitPerSec = physicalMaxPPS / pulsePerUnit;
@@ -795,7 +868,7 @@ void NCPLCManager::ProcessManualInputs()
 
                 if (!groupValid || pathMaxUnitPerSec <= 0.0)
                 {
-                    StopManualFrameMPGXYZ();
+                    if (!softwareTargetRejected) StopManualFrameMPGXYZ();
                     continue;
                 }
 
@@ -862,6 +935,16 @@ void NCPLCManager::ProcessManualInputs()
                 continue;
             }
 
+            const bool softwarePositiveAllowed = m_nc.GetCoordSys().CanMoveSoftwarePositive(axis);
+            const bool softwareNegativeAllowed = m_nc.GetCoordSys().CanMoveSoftwareNegative(axis);
+            const bool softwareBlockedPositive = mpgDeltaCount > 0 && !softwarePositiveAllowed;
+            const bool softwareBlockedNegative = mpgDeltaCount < 0 && !softwareNegativeAllowed;
+
+            if (softwareBlockedPositive || softwareBlockedNegative)
+            {
+                continue;
+            }
+
             if (axis.MPG_BASE_DISTANCE <= 0.0 || axis.MPG_MAX_PPS <= 0.0 || axis.resolution_PPR <= 0.0 || axis.finalLead <= 0.0) continue; // Axis Parameters
 
             const double pulsePerUnit = axis.resolution_PPR / axis.finalLead;
@@ -871,6 +954,18 @@ void NCPLCManager::ProcessManualInputs()
 
             const double baseTarget = (axis.state == MotionState::MotionState_MPG) ? axis.finalTargetPos : axis.currentCmdPos; // Dynamic Absolute Target
             const double targetPosition = baseTarget + deltaPulse;
+            const double targetMCS = targetPosition / pulsePerUnit;
+
+            const bool targetWithinSoftwareLimit = m_nc.GetCoordSys().IsTargetWithinSoftwareTravelLimit(axis, targetMCS);
+            const bool positiveSoftwareLimitActive = axis.travelLimit1PositiveActive || axis.travelLimit2PositiveActive || axis.travelLimit3PositiveActive;
+            const bool negativeSoftwareLimitActive = axis.travelLimit1NegativeActive || axis.travelLimit2NegativeActive || axis.travelLimit3NegativeActive;
+            const bool recoveringFromPositiveLimit = positiveSoftwareLimitActive && deltaDistance < 0.0;
+            const bool recoveringFromNegativeLimit = negativeSoftwareLimitActive && deltaDistance > 0.0;
+
+            if (!targetWithinSoftwareLimit && !recoveringFromPositiveLimit && !recoveringFromNegativeLimit)
+            {
+                continue;
+            }
 
             m_motion.MPGMove(axis, targetPosition, axis.MPG_MAX_PPS, axis.JOG_acc_time, axis.JOG_dec_time); // Original MPG MotionCore
             if (axis.state == MotionState::MotionState_MPG) m_jogActive[i] = true;
@@ -913,14 +1008,74 @@ void NCPLCManager::ProcessManualInputs()
             continue;
         }
 
-        const bool positiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, i)); // Hard Limit
+        // =====================================================
+ // Physical Hard Limit
+ //
+ // +OT / -OT
+ //
+ // Physical Limit 永遠有效。
+ // =====================================================
+
+        const bool positiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, i));
         const bool negativeLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::NEGATIVE_LIMIT_BASE, i));
-        const bool allowPositive = rawPositive && !positiveLimit; // Direction Permission
-        const bool allowNegative = rawNegative && !negativeLimit;
+
+
+        // =====================================================
+        // Software Travel Limit
+        //
+        // CoordinateManager 已經在 Motion Runtime
+        // 更新每軸 Software Limit 1 / 2 / 3 狀態。
+        //
+        // 這裡只詢問：
+        //
+        //     正方向現在能不能走？
+        //     負方向現在能不能走？
+        //
+        // 不需要知道到底是 Limit 1 / 2 / 3 哪一組觸發。
+        // =====================================================
+
+        const bool softwarePositiveAllowed = m_nc.GetCoordSys().CanMoveSoftwarePositive(axis);
+        const bool softwareNegativeAllowed = m_nc.GetCoordSys().CanMoveSoftwareNegative(axis);
+
+
+        // =====================================================
+        // Final Manual Direction Permission
+        //
+        // 必須同時通過：
+        //
+        // 1. Operator 有按該方向
+        // 2. Physical Hard Limit 沒擋
+        // 3. Software Travel Limit 沒擋
+        //
+        // 例如到達 +Software Limit：
+        //
+        //     JOG+ = Block
+        //     JOG- = Allow
+        //
+        // 所以可以反方向退出。
+        // =====================================================
+
+        const bool allowPositive = rawPositive && !positiveLimit && softwarePositiveAllowed;
+        const bool allowNegative = rawNegative && !negativeLimit && softwareNegativeAllowed;
+
+
+        // =====================================================
+        // Physical +OT 與 -OT 同時 ON
+        //
+        // 這屬於異常 Hardware Input State。
+        //
+        // Software Limit 不使用這個判斷，
+        // 因為 Software + / - Block 理論上可能因 Parameter
+        // 設定問題而另外處理。
+        // =====================================================
 
         if (positiveLimit && negativeLimit)
         {
-            if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
+            if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY)
+            {
+                m_motion.StopMove(axis, axis.JOG_dec_time);
+            }
+
             continue;
         }
 
@@ -1101,7 +1256,29 @@ void NCPLCManager::ProcessManualInputs()
                     if (deltaUnit > 0.0 && physicalPositiveLimit) { groupValid = false; break; }
                     if (deltaUnit < 0.0 && physicalNegativeLimit) { groupValid = false; break; }
 
+                    const bool softwarePositiveAllowed = m_nc.GetCoordSys().CanMoveSoftwarePositive(physicalAxis);
+                    const bool softwareNegativeAllowed = m_nc.GetCoordSys().CanMoveSoftwareNegative(physicalAxis);
+
+                    if (deltaUnit > 0.0 && !softwarePositiveAllowed) { groupValid = false; break; }
+                    if (deltaUnit < 0.0 && !softwareNegativeAllowed) { groupValid = false; break; }
+
                     const double pulsePerUnit = physicalAxis.resolution_PPR / physicalAxis.finalLead; // Physical Axis Speed Capacity
+                    const double deltaPulse = deltaUnit * pulsePerUnit;
+                    const double targetPosition = physicalAxis.currentActPos + deltaPulse;
+                    const double targetMCS = targetPosition / pulsePerUnit;
+
+                    const bool targetWithinSoftwareLimit = m_nc.GetCoordSys().IsTargetWithinSoftwareTravelLimit(physicalAxis, targetMCS);
+                    const bool positiveSoftwareLimitActive = physicalAxis.travelLimit1PositiveActive || physicalAxis.travelLimit2PositiveActive || physicalAxis.travelLimit3PositiveActive;
+                    const bool negativeSoftwareLimitActive = physicalAxis.travelLimit1NegativeActive || physicalAxis.travelLimit2NegativeActive || physicalAxis.travelLimit3NegativeActive;
+                    const bool recoveringFromPositiveLimit = positiveSoftwareLimitActive && deltaUnit < 0.0;
+                    const bool recoveringFromNegativeLimit = negativeSoftwareLimitActive && deltaUnit > 0.0;
+
+                    if (!targetWithinSoftwareLimit && !recoveringFromPositiveLimit && !recoveringFromNegativeLimit)
+                    {
+                        groupValid = false;
+                        break;
+                    }
+
                     double physicalMaxPPS = physicalAxis.INCH_JOG_PPS;
                     if (physicalAxis.maxVel_PPS > 0.0 && physicalMaxPPS > physicalAxis.maxVel_PPS) physicalMaxPPS = physicalAxis.maxVel_PPS;
 
@@ -1162,21 +1339,113 @@ void NCPLCManager::ProcessManualInputs()
 
             if (inchDistance <= 0.0) continue;
 
-            const bool inchPositive = positiveRising && !positiveLimit; // Rising Edge
-            const bool inchNegative = negativeRising && !negativeLimit;
-            if (!inchPositive && !inchNegative) continue;
-            if (inchPositive && inchNegative) continue;
+            // =====================================================
+     // INCH Direction Permission
+     //
+     // allowPositive / allowNegative 前面已經整合：
+     //
+     // 1. Physical +OT / -OT
+     // 2. Software Travel Limit 1 / 2 / 3
+     //
+     // 所以 INCH 直接沿用相同 Direction Permission。
+     // =====================================================
 
-            if (axis.resolution_PPR <= 0.0 || axis.finalLead <= 0.0) continue; // Mechanical Conversion
+            const bool inchPositive = positiveRising && allowPositive;
+            const bool inchNegative = negativeRising && allowNegative;
+
+            if (!inchPositive && !inchNegative)
+            {
+                continue;
+            }
+
+            if (inchPositive && inchNegative)
+            {
+                continue;
+            }
+
+
+            // =====================================================
+            // Mechanical Conversion
+            // =====================================================
+
+            if (axis.resolution_PPR <= 0.0 || axis.finalLead <= 0.0)
+            {
+                continue;
+            }
+
             const double pulsePerUnit = axis.resolution_PPR / axis.finalLead;
             const double inchDistancePulse = inchDistance * pulsePerUnit;
-            if (inchDistancePulse <= 0.0) continue;
 
-            double targetPosition = axis.currentActPos; // Relative Target
-            if (inchPositive) targetPosition += inchDistancePulse;
-            else targetPosition -= inchDistancePulse;
+            if (inchDistancePulse <= 0.0)
+            {
+                continue;
+            }
 
-            double inchVelocity = axis.INCH_JOG_PPS; // INCH Speed
+
+            // =====================================================
+            // Calculate Relative INCH Target
+            //
+            // MotionCore Position:
+            //     Pulse
+            // =====================================================
+
+            double targetPosition = axis.currentActPos;
+
+            if (inchPositive)
+            {
+                targetPosition += inchDistancePulse;
+            }
+            else
+            {
+                targetPosition -= inchDistancePulse;
+            }
+
+
+            // =====================================================
+            // Software Travel Limit Target Pre-Check
+            //
+            // CoordinateManager 的 Target Check 使用：
+            //
+            // Linear Axis:
+            //     mm
+            //
+            // Rotary Axis:
+            //     degree
+            //
+            // 所以把 Pulse Target 轉回 Machine Unit。
+            //
+            // 例如：
+            //
+            // Current X = 99.999
+            // INCH     = +0.010
+            // Limit    = +100.000
+            //
+            // Target   = 100.009
+            //
+            // => Reject
+            //
+            // 不讓 MotionCore 收到這一筆 MoveToPosition。
+            // =====================================================
+
+            const double targetMCS = targetPosition / pulsePerUnit;
+            const bool targetWithinSoftwareLimit = m_nc.GetCoordSys().IsTargetWithinSoftwareTravelLimit(axis, targetMCS);
+            const bool positiveSoftwareLimitActive = axis.travelLimit1PositiveActive || axis.travelLimit2PositiveActive || axis.travelLimit3PositiveActive;
+            const bool negativeSoftwareLimitActive = axis.travelLimit1NegativeActive || axis.travelLimit2NegativeActive || axis.travelLimit3NegativeActive;
+            const bool recoveringFromPositiveLimit = positiveSoftwareLimitActive && inchNegative;
+            const bool recoveringFromNegativeLimit = negativeSoftwareLimitActive && inchPositive;
+
+            if (!targetWithinSoftwareLimit && !recoveringFromPositiveLimit && !recoveringFromNegativeLimit)
+            {
+                continue;
+            }
+
+
+            // =====================================================
+            // INCH Speed
+            // =====================================================
+
+            double inchVelocity = axis.INCH_JOG_PPS;
+
             if (inchVelocity <= 0.0) continue;
             if (axis.maxVel_PPS > 0.0 && inchVelocity > axis.maxVel_PPS) inchVelocity = axis.maxVel_PPS;
 
@@ -1221,5 +1490,5 @@ void NCPLCManager::ProcessAuxiliaryHandshake()
 // =========================================================
 void NCPLCManager::SyncNCStateToPLC()
 {
-   
+
 }

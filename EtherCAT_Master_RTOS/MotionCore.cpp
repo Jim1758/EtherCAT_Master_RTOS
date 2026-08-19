@@ -148,7 +148,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         UpdateMotion((*m_pDrives)[i], (*m_pContexts)[i]);
         UpdateServoState((*m_pDrives)[i], (*m_pContexts)[i]);
 
-
+       
     }
 
 
@@ -2048,7 +2048,26 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     axis.currentActVel = (axis.currentActPos - axis.lastActPos) / CYCLE_TIME_SEC;
     axis.lastActPos = axis.currentActPos; // 記錄本次位置，供下 1ms 使用
 
+        // =========================================================
+    // Software Travel Limit Runtime Update
+    //
+    // 這裡已經完成 Feedback Selection：
+    //
+    // Motor Encoder
+    // 或
+    // Linear Scale
+    //
+    // 所以此時的 currentActPos 才是本 Cycle
+    // 真正採用的 Machine Position。
+    //
+    // Software Limit 1 / 2 / 3
+    // 全部由 CoordinateManager 統一判斷。
+    // =========================================================
 
+    if (m_pCoordMgr != nullptr)
+    {
+        m_pCoordMgr->UpdateSoftwareTravelLimitState(axis);
+    }
 
 
     // 2. [Lag Monitor] 跟隨誤差檢查 (此時的 ActPos 絕對不會溢位)
@@ -2142,6 +2161,157 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     double limit = axis.maxVel_PPS * 1.2;
     if (finalVel > limit) finalVel = limit;
     if (finalVel < -limit) finalVel = -limit;
+
+
+    // =========================================================
+// Software Travel Limit - 250us Fast Guard
+//
+// 最後一道 Runtime Protection。
+//
+// 注意：
+//
+// 這裡的 finalVel 還沒有經過：
+//
+//     axis.isReverse
+//     axis.Axis_Reverse
+//
+// 所以 finalVel 正負號仍然代表「邏輯 Machine Direction」：
+//
+//     finalVel > 0  = Machine +
+//     finalVel < 0  = Machine -
+//
+// 正好可以直接與 Software Travel Limit 的
+// Positive / Negative Direction Permission 比較。
+// =========================================================
+
+    if (m_pCoordMgr != nullptr)
+    {
+        const bool softwarePositiveAllowed =
+            m_pCoordMgr->CanMoveSoftwarePositive(axis);
+
+        const bool softwareNegativeAllowed =
+            m_pCoordMgr->CanMoveSoftwareNegative(axis);
+
+
+        const bool blockedPositiveMotion =
+            finalVel > 0.0 &&
+            !softwarePositiveAllowed;
+
+        const bool blockedNegativeMotion =
+            finalVel < 0.0 &&
+            !softwareNegativeAllowed;
+
+
+        if (blockedPositiveMotion ||
+            blockedNegativeMotion)
+        {
+            // =================================================
+            // A. Interpolation Group
+            //
+            // 多軸插補不能只停其中一軸。
+            //
+            // 若 Runtime Guard 已經真的抓到越界方向，
+            // 代表前面的 Target Pre-Check 沒有攔住，
+            // 此時屬於最後一道 Backstop。
+            //
+            // 必須整組停止。
+            // =================================================
+
+            if (m_Group.isActive &&
+                axis.state ==
+                MotionState::MotionState_INTERPOLATING)
+            {
+                EmergencyStopGroup();
+
+                servo.pOutput->TargetVelocity = 0;
+
+                return;
+            }
+
+
+            // =================================================
+            // B. Single Axis / Manual Motion
+            //
+            // Runtime Guard 已經到達 Software Boundary，
+            // 這時不能再做一般減速，否則煞車距離本身
+            // 還會繼續穿過 Limit。
+            //
+            // 所以這是「立即停止」的最後一道保護。
+            // =================================================
+
+            finalVel = 0.0;
+
+            axis.currentCmdVel = 0.0;
+            axis.logicalCmdVel = 0.0;
+            axis.targetVelocity = 0.0;
+
+
+            // =================================================
+            // Command Position Snap
+            //
+            // 不可以只把 PDO Velocity 歸零，
+            // 否則 Command Position 還留在 Limit 外，
+            // PID Error 會持續變大，最後可能造成 Lag Alarm。
+            //
+            // 因此 Runtime Guard 觸發時，
+            // Command / Planning / Target 全部同步到
+            // 此刻實際 Machine Position。
+            // =================================================
+
+            axis.currentCmdPos =
+                axis.currentActPos;
+
+            axis.logicalCmdPos =
+                axis.currentActPos;
+
+            axis.planningPos =
+                axis.currentActPos;
+
+            axis.finalTargetPos =
+                axis.currentActPos;
+
+
+            // =================================================
+            // Clear PID / S-Curve History
+            //
+            // 防止下一次反方向 Recovery 時，
+            // 還帶著之前往 Limit 方向的殘留速度。
+            // =================================================
+
+            axis.pid.integralAcc = 0.0;
+
+            for (size_t i = 0;
+                i < axis.velBuffer.size();
+                ++i)
+            {
+                axis.velBuffer[i] = 0.0;
+            }
+
+            axis.bufferSum = 0.0;
+            axis.bufferIndex = 0;
+
+
+            // =================================================
+            // 回到 IDLE
+            //
+            // 不設 ERROR / ESTOP。
+            //
+            // Software Limit 的 Manual Recovery
+            // 必須仍然允許往反方向離開。
+            // =================================================
+
+            axis.state =
+                MotionState::MotionState_IDLE;
+
+            axis.inPosition = true;
+
+
+            // 本 Cycle 直接輸出 0。
+            servo.pOutput->TargetVelocity = 0;
+
+            return;
+        }
+    }
 
     // 🌟 輸出給硬體前，根據硬體方向翻轉速度
     if (axis.isReverse)

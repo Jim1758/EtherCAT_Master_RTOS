@@ -1,114 +1,281 @@
-EtherCAT DC RC1.4 參數與 Debug 判讀指南
-日期：2026-08-18
+EtherCAT DC AUTO 參數與 Debug 判讀指南
+更新日期：2026-08-19
+狀態：正式版本候選，AUTO Reference／AUTO Propagation Delay 已實機驗證
 
+============================================================
 一、目前正式基準
+============================================================
 
-PDO：250 us / 4 kHz
+PDO Cycle：250 us / 4 kHz
 Sync0 Shift：125000 ns
 RTX64 HAL：25 us
-NAL Interrupt priority：70
-NAL Transmit complete priority：70
-RX Soft / Hard：205000 / 210000 ns
+NAL Interrupt priority：126
+NAL Transmit complete priority：125
+RX Soft Deadline：205000 ns
+RX Hard Deadline：210000 ns
+RX Mode：STANDARD_BUFFER_V2
 One-Shot：ON
 Fine Wait：OFF
 Runtime HAL Actuator：OFF
+正式 PDO Timer Priority：80
 目前三軸 WKC：LRW 13 / DC 7
 
-如果長時間 LOG 已穩定，不需要為了讓數字更漂亮而調參數。
+DC Reference 設定：
+DC_Reference_Mode=AUTO
+DC_Reference_Slave_Index=-1
 
-Startup 啟動基準：
-ENABLE_COARSE_FINE_QPC_STARTUP_PROBE：true（預設啟用）
-Probe callbacks：4000（約 1 秒）
+目前實機結果：
+AUTO Reference：S4
+AUTO Servo Order：S4 -> S5 -> S6
+AUTO Propagation Delay：S4=0 ns、S5=600 ns、S6=1220 ns
+AUTO Measurement：ValidSamples 10/10
+AUTO Configure：WRITE WKC=1、READBACK Match=YES
+AUTO Topology：Result=PASS
+Runtime：後續已進入 ACTIVE、PhaseGood:YES
+
+只要長時間 LOG 穩定，不需要為了讓數字更漂亮而調整參數。
+參數變更一次只改一項，不能同時修改 HAL、NAL priority、RX Deadline 與 Phase-P。
+
+============================================================
+二、DC Reference AUTO 設定
+============================================================
+
+1. AUTO 模式
+
+DC_Reference_Mode=AUTO
+DC_Reference_Slave_Index=-1
+
+程式依 BuildIoMap() 建立的 m_ServoList 掃描伺服。
+候選伺服必須能成功讀取 DC System Time 0x0910，且讀值不可為 0。
+第一台通過驗證的伺服會成為 DC Reference。
+
+正常 LOG：
+[DC-REFERENCE] SELECTED | Mode:AUTO | SlaveIndex:4 | ... | WKC:1 | DC:非零
+
+2. FIXED 模式
+
+DC_Reference_Mode=FIXED
+DC_Reference_Slave_Index=指定的零起算 Slave Index
+
+FIXED 指定站若不存在、0x0910 讀取失敗或 DC 時間為 0，程式會直接失敗，
+不會偷偷改選其他站。
+
+AUTO Propagation V1 要求 Reference 必須是連續伺服鏈的第一台。
+FIXED 若指定到伺服鏈中間，程式會安全拒絕，不寫入 0x0928。
+
+============================================================
+三、AUTO Propagation Delay 支援範圍
+============================================================
+
+目前 V1 支援：
+
+1. 1～8 台伺服。
+2. 依實體 Slave Index 排序伺服順序。
+3. 非伺服從站可以位於整段伺服鏈之前或之後。
+4. 馬達可以是第一站，也可以位於其他非伺服站之後。
+5. 伺服站號或軸數改變時，只要 m_ServoList、實體連線與 ENI 正確，AUTO 會重新掃描。
+6. Reference 必須是伺服鏈第一台。
+7. 伺服之間必須是連續 Slave Index。
+8. 伺服鏈必須為線型 P0/P1 結構，不接受 P2/P3 分支。
+
+目前 V1 不支援：
+
+1. 伺服鏈中間插入非伺服設備。
+2. 伺服站號不連續。
+3. Reference 位於伺服鏈中間。
+4. 伺服鏈有 P2/P3 分支或環狀拓撲。
+5. 超過 8 台伺服。
+
+不符合條件時，AUTO Gate 會失敗並停止寫入 0x0928，避免寫入錯誤延遲。
+
+============================================================
+四、AUTO Propagation Delay 執行流程
+============================================================
+
+1. [DC-DELAY-AUTO]
+
+先驗證：
+
+- SlaveCount 與 ServoCount。
+- Servo Index 範圍及連續性。
+- Reference 是否為伺服鏈第一台。
+- 每台伺服的 0x0110 DL Status。
+- 每台伺服的 0x0910 DC System Time。
+- P0/P1 線型 Port 結構。
+
+接著量測 10 次 DC Port Timestamp 0x0900。
+至少需要 5 次有效樣本，最後使用 Median 作為正式延遲值。
+
+第一台 Reference Delay 固定為 0。
+後續各站使用相鄰 Downstream Round Trip 差值的一半，累加成 Propagation Delay。
+
+正常結果：
+[DC-DELAY-AUTO-RESULT] ... ValidSamples:10/10 | Result:PASS | Write0928:NO
+
+Write0928:NO 表示這個階段只量測、不寫入，不是 AUTO 功能沒有作用。
+
+2. [DC-CONFIG-AUTO]
+
+PREFLIGHT：先讀取並保存各 Servo 原本的 0x0928。
+WRITE：逐站寫入新的 Propagation Delay。
+READBACK：重新讀取 0x0928，比對 Expected 與 Actual。
+
+正常結果：
+[DC-CONFIG-AUTO] WRITE ... WKC:1
+[DC-CONFIG-AUTO] READBACK ... Match:YES
+[DC-CONFIG-AUTO-RESULT] ... Result:PASS
+
+若 WRITE 或 READBACK 失敗，程式會執行 ROLLBACK，回復 PREFLIGHT 保存的舊值。
+
+3. [DC-TOPOLOGY-AUTO]
+
+這是啟動後的唯讀 Dry-Run 驗證，不再修改 0x0928。
+
+正常結果：
+ReferenceInOrder:YES
+ReferenceIsFirstServo:YES
+AllServoReadable:YES
+Consecutive:YES
+LinearPortShape:YES
+Result:PASS
+
+SUMMARY 內的 Write0928:NO 是正常的，因為實際寫入已在 [DC-CONFIG-AUTO] 完成。
+
+4. 延遲值允許小幅變動
+
+例如不同次啟動可能得到：
+0 / 600 / 1220 ns
+或
+0 / 620 / 1240 ns
+
+20 ns 等級的差異通常來自 Timestamp 量化與量測抖動。
+判斷重點是有效樣本數、Median 分布、WRITE WKC 與 READBACK Match，
+不是要求每次啟動得到完全相同的數字。
+
+============================================================
+五、Startup 啟動基準與診斷開關
+============================================================
+
+ENABLE_COARSE_FINE_QPC_STARTUP_PROBE：true
+Probe callbacks：4000，約 1 秒
+Probe Timer Priority：62
 Probe coarse guard：100000 ns
 DC alignment samples：8
 最佳樣本 RTT 上限：1000000 ns
 DC start guard：20000000 ns
 RtSetTimer 最低 lead：5000000 ns
-正式 PDO timer priority：80
 
-Startup Probe 開關：
-true：建立 Priority 62 disposable Probe、執行 warm-up 與 4000 次量測。
-false：完全不建立 Probe Timer、不執行 Probe callback 與 QPC busy-wait。
-false 不會關閉正式 Priority 80 PDO Timer、PDO warm-up、DC Alignment 或 fallback。
-關閉後啟動 LOG 會顯示：[COARSE-FINE-QPC-PROBE] DISABLED。
+開關為 true：
+建立一次性 Priority 62 Probe，執行 warm-up 與 4000 次量測。
 
-Startup 參數說明：
-ALIGN_SAMPLE_COUNT 增大可提高找到低 RTT 樣本的機會，但會增加啟動時間。
-MAX_ALIGN_RTT_NS 放寬只會接受較差的 clock mapping，不會改善同步品質。
-START_GUARD_NS 是初次 target 的規劃餘裕；MIN_TIMER_LEAD_NS 是實際 arm 前的安全餘裕。
-Warm-up/Probe timeout 只限制啟動等待，不是 Runtime 的 RX HardTimeout。
-PDO cycle、Target phase、Sync0、timer priority 與 coarse guard 屬於整體時序設計，
-正式版不要用它們掩蓋 RX Timeout、WKC 或網卡 interrupt 延遲。
+開關為 false：
+不建立 Probe Timer、不執行 Probe callback 與 QPC busy-wait。
+不會關閉正式 Priority 80 PDO Timer、PDO warm-up、DC Alignment 或 fallback。
+LOG 會顯示：[COARSE-FINE-QPC-PROBE] DISABLED。
 
-Startup Debug 快速判讀：
-[DC-HAL-STARTUP]：Current 最後應等於 Base；恢復失敗會記錄但仍繼續。
-[COARSE-FINE-QPC-PROBE]：理想為 PASS、Callbacks 4000/4000、
-RearmOK 3999/3999，RearmFail/FineMiss/NextCoarsePast 都是 0。
-[PDO-ONESHOT-WARMUP]：必須 PASS；FAIL 會在正式 PDO 前回傳 -1。
-[PDO-DC-SAMPLE]：有效樣本 WKC>0，RTT 越小越適合估算 offset。
-[PDO-DC-BEST-SAMPLE]：Direction/Offset 是 Master/DC absolute clock epoch 映射，
-不是瞬間同步誤差，因此 Offset 很大本身不代表 DC 同步失敗。
-[PDO-DC-ALIGN-V2.1]：正式路徑應為 SUCCESS、TargetPhase 0、Sync0 125000 ns，
-Remaining 通常至少約 5 ms。
-[PDO-DC-ALIGN-FALLBACK]：relative timer 已啟動，但首個 callback 不保證 DC phase 0。
+Probe 主要是啟動診斷，不直接參與正式 4 kHz PDO 控制。
+若正式版本不需要每次量測 RTX64 Timer 特性，可以關閉以減少啟動工作。
 
-二、第一優先可調參數
+Startup Debug 正常條件：
 
-1. PHASE_P_ACT_DIVISOR（Runtime，目前 8）
+[DC-HAL-STARTUP]
+Current 最後應等於 Base；恢復失敗會記錄，但程式仍會繼續。
+
+[COARSE-FINE-QPC-PROBE]
+Result:PASS
+Callbacks:4000/4000
+RearmOK:3999/3999
+RearmFail:0
+FineMiss:0
+NextCoarsePast:0
+
+[PDO-ONESHOT-WARMUP]
+必須 Result:PASS；FAIL 會在正式 PDO Timer 啟動前回傳失敗。
+
+[PDO-DC-SAMPLE]
+有效樣本必須 WKC>0；RTT 越小，越適合估算 Master/DC Clock Offset。
+
+[PDO-DC-BEST-SAMPLE]
+Direction/Offset 是兩套絕對 Clock Epoch 的映射，不是瞬間同步誤差。
+Offset 很大本身不表示 DC 同步失敗。
+
+[PDO-DC-ALIGN-V2.1]
+正常應為 SUCCESS、TargetPhase:0、Sync0:125000 ns。
+
+[PDO-DC-ALIGN-FALLBACK]
+代表 Absolute Alignment 未採用，改以 Relative Timer 啟動；
+首個 PDO callback 不保證落在 DC Phase 0。
+
+============================================================
+六、第一優先可調參數
+============================================================
+
+1. PHASE_P_ACT_DIVISOR，目前 8
 
 用途：Phase-P 強度，實際 P=1/Divisor。
-調小：修正更強、收斂更快，也更容易來回震盪。
-調大：修正更柔和，但 ActualErr 回到 0 會更慢。
+調小：修正更強、收斂更快，但較容易來回震盪。
+調大：修正較柔和，但 ActualErr 回到 0 較慢。
 建議：一次只測 8->10 或 8->6。
 
-2. PHASE_P_ACT_DEADBAND_NS（Runtime，目前 500 ns）
+2. PHASE_P_ACT_DEADBAND_NS，目前 500 ns
 
-用途：誤差小於此值時停止修正。
-調大：減少 Step 正負切換與微小抖動。
-調小：可更貼近 0，但會對雜訊更敏感。
-建議：Step 頻繁反向先試 750/1000；長期停在 500~1000 才試 250。
+用途：誤差小於此值時停止 Phase-P 修正。
+調大：減少 Step 正負切換及微小抖動。
+調小：可更接近 0，但對雜訊更敏感。
+建議：Step 頻繁反向先試 750 或 1000；長期停在 500～1000 ns 才考慮 250。
 
-3. PHASE_P_ACT_MAX_STEP_NS（Runtime，目前 250 ns/window）
+3. PHASE_P_ACT_MAX_STEP_NS，目前 250 ns/window
 
-用途：每個觀測窗允許的最大 offset 改變。
-調大：收斂快、相位變動較大。
-調小：收斂慢、較平滑。
+用途：每個觀測窗允許的最大 Offset 改變。
+調大：收斂較快，相位變動也較大。
+調小：收斂較慢，但比較平滑。
 建議：每次只改 50 ns。
 
-4. REAL_FF_V0_MAX_STEP_PPB（Runtime，目前 10 ppb/window）
+4. REAL_FF_V0_MAX_STEP_PPB，目前 10 ppb/window
 
-用途：Applied drift 接近 observer 建議值的速度。
-調大：追蹤快，也較容易追到短期雜訊。
-調小：較穩定，但殘餘相位漂移會維持較久。
-建議：只有 ActualErr 長期單方向漂移、PhaseGood/MAD/RX 都正常時才試 15 或 20。
+用途：Applied Drift 接近 Observer 建議值的速度。
+調大：追蹤較快，也較容易追到短期雜訊。
+調小：較穩定，但殘餘相位漂移可能維持較久。
+建議：只有 ActualErr 長期單方向漂移，且 PhaseGood/MAD/RX 均正常時才試 15 或 20。
 
 5. RX_SOFT_DEADLINE_NS / RX_HARD_DEADLINE_NS
-   （EtherCAT_Function.cpp，目前 205000 / 210000 ns）
 
-規則：必須 Soft < Hard < 250000 ns，並保留 DC/Motion 後段執行時間。
-Hard 調大：Timeout 可能下降，但會接受更舊的 frame，且壓縮 Handler 餘裕。
-Hard 調小：較快失敗，但 NIC interrupt 偶發延遲更容易算 Timeout。
-建議：一次最多 5000 ns，並同時看 RxElapsed Max、PostReceiveLate、PDO-EXEC Max。
+目前：205000 / 210000 ns
 
-三、第二優先安全參數
+規則：Soft < Hard < 250000 ns，並保留 Motion、NC 與後段控制的執行時間。
+Hard 調大：Timeout 可能下降，但會接受更舊的 Frame，並壓縮 Handler 餘裕。
+Hard 調小：較快判定失敗，但 NIC Interrupt 偶發延遲更容易被算成 Timeout。
+建議：一次最多改 5000 ns，並同時觀察 RxElapsed Max、PostReceiveLate 與 PDO-EXEC Max。
 
-PHASE_P_ACT_MAX_OFFSET_NS（目前 120000 ns）
-只有 OffsetSat:YES 才需要檢討。半個 PDO 週期是 125000 ns，目前已接近上限，
-不要再增大；要更保守可改 100000 或 50000 ns。
+============================================================
+七、第二優先安全參數
+============================================================
 
-REAL_FF_V0_MIN/MAX_PPB（目前 -10000 / -7800）
-ClampActive:YES 表示建議值超出安全範圍。先查 V1A slope/MAD、RX 與排程，
-不要直接放寬限幅。
+PHASE_P_ACT_MAX_OFFSET_NS，目前 120000 ns
+
+只有 OffsetSat:YES 才需要檢討。
+半個 PDO 週期是 125000 ns，目前已接近上限，不要再增大。
+若要更保守，可改為 100000 或 50000 ns。
+
+REAL_FF_V0_MIN/MAX_PPB，目前有效範圍 -12000 ～ -7800 ppb
+
+ClampActive:YES 代表建議值超出安全範圍。
+先檢查 V1A Slope/MAD、RX 與排程，不要直接放寬限幅。
 
 ARM/HOLD/RECOVERY/BAD Windows
-增大會更保守但恢復慢；減小反應快但容易受單一視窗雜訊影響。
-它們改的是狀態機速度，不是 P 增益。
 
-TIMEOUT_RECENT_RESET_SECONDS（Diagnostics，目前 300 秒）
+增大會更保守，但鎖定與恢復較慢；減小會反應較快，但容易受到單一視窗雜訊影響。
+這些參數調整的是狀態機速度，不是 Phase-P 增益。
+
+TIMEOUT_RECENT_RESET_SECONDS，目前 300 秒
+
 只影響 Recent_Timeout 顯示，不影響真正 RX/DC 控制。
-調小會更快恢復 STABLE，但可能把低頻重複 Timeout 太早視為雜訊。
+單次 Timeout 後若 300 秒內沒有新的 Timeout，Recent_Timeout 會歸零並回到 CLEAR。
+TotalHardTimeout 是永久累積歷史，不會因此歸零。
 
-四、正式版先不要調
+============================================================
+八、正式版先不要調整
+============================================================
 
 PDO_ONESHOT_COARSE_GUARD_NS = 100000 ns
 PDO_MIN_REARM_LEAD_NS = 50000 ns
@@ -117,97 +284,172 @@ PDO_BOOTSTRAP_DELAY_NS = 250000 ns
 PHASE_P_ACT_CYCLE_NS = 250000 ns
 QPC_LIVE_FF_SYNC0_PHASE_NS = 125000 ns
 
-這些參數會改真正 wake/send/Sync0 相位或 fallback 行為，不能用來掩蓋 RX Timeout。
+這些參數會改變真正 Wake、Send、Sync0 Phase 或 Fallback 行為，
+不能拿來掩蓋 RX Timeout、WKC 或網卡 Interrupt 延遲。
 
-五、Debug 最快判讀順序
+============================================================
+九、Debug 最快判讀順序
+============================================================
 
 1. [DC-HEALTH-SUMMARY]
 
-正常：
-ACTIVE + PhaseGood:YES + ActualErr 接近 0 + OffsetSat:NO +
-TripMask:0x00 + Recover:0/Skip:0 + Recent_Timeout:0 + WKC:13/7 + RESULT:STABLE
+穩定狀態：
+Drift:LOCKED + ACTIVE + PhaseGood:YES + ActualErr:NEAR_ZERO:YES +
+OffsetSat:NO + TripMask:0x00 + Recover:0/Skip:0 +
+Recent_Timeout:0 + WKC:13/7 + RESULT:STABLE
 
-Total Timeout 是永久歷史；Recent_Timeout 才是最近五分鐘狀態。
-ActualErr 的 NEAR_ZERO 是正負 1000 ns；Phase-P deadband 則是正負 500 ns。
+啟動初期出現 WARMUP、WAIT、PhaseGood:NO、RESULT:CHECK 是正常的。
+必須等待 Drift Observer 與 Phase FF 完成有效視窗後再判斷。
+
+Total Timeout：本次啟動後永久歷史。
+Recent_Timeout：最近 300 秒的 Timeout 狀態。
+ActualErr 的 NEAR_ZERO：正負 1000 ns。
+Phase-P Deadband：正負 500 ns。
 
 2. [ECAT-RX-DEADLINE-MAIN]
 
-FirstRx 接近 Calls：大多第一次就收到。
-EmptyRx：輪詢當下沒有 frame，不等於 Timeout。
-Invalid：收到不符合本次交易的 frame。
-SoftLateAccepted：205~210 us 的有效 frame，屬於提前警報。
-HardTimeout：本視窗事件。
-TotalHardTimeout：啟動後永久累積。
-CurrentConsecutive：回到 0 表示後續已恢復。
-PostReceiveLate：ReceivePacket 回來時才發現超過 Hard。
-RxElapsed Max：越接近 210000 ns，deadline 壓力越大。
+FirstRx：第一輪 ReceivePacket 就成功收到的次數。
+EmptyRx：輪詢當下沒有 Frame，不等於 Timeout。
+Invalid：收到不符合本次交易的 Frame。
+SoftLateAccepted：205～210 us 才收到的有效 Frame，屬於提前警報。
+HardTimeout：本視窗發生的 Deadline Timeout。
+TotalHardTimeout：本次啟動後永久累積。
+CurrentConsecutive：回到 0 代表後續已恢復。
+PostReceiveLate：ReceivePacket 返回時才發現已超過 Hard Deadline。
+RxElapsed Max：越接近 210000 ns，Deadline 壓力越大。
+
+目前實機良好範例：
+RxElapsed Avg 約 48 us
+RxElapsed Max 約 85 us
+HardTimeout:0
+PostReceiveLate:0
 
 3. [ECAT-RX-STAGE-MAIN]
 
-PreDeadline 增加：進 RX 前就太晚，查 TX、PDO 前段、Motion/NC 負載。
-SleepAtTimeout 0/1/2：Timeout 前經過幾次 coarse sleep。
-ReceiveCallMax 突增：查 NIC interrupt、NAL priority、CPU 綁定。
-TimeoutCallMax：只看 Timeout 當次 ReceivePacket 最長時間。
+PreDeadline 增加：進入 RX 前就已經太晚，檢查 TX、PDO 前段、Motion/NC 負載。
+SleepAtTimeout 0/1/2：Timeout 前經過幾次 Coarse Sleep。
+ReceiveCallMax 突增：檢查 NIC Interrupt、NAL Priority、CPU 綁定。
+TimeoutCallMax：只統計 Timeout 當次 ReceivePacket 的最長時間。
 
 4. [ECAT-TX-ROOT-RC1-MAIN]
 
-TxFrameBusy、TxNotOwner、TxSubmitFail、TxSubmitted0 應全部維持 0。
-全部為 0 但 Timeout 增加，較可能是 RX interrupt／ReceivePacket／排程問題。
+TxFrameBusy、TxNotOwner、TxSubmitFail、TxSubmitted0 應維持 0。
+TX 全為 0 但 Timeout 增加，比較可能是 RX Interrupt、ReceivePacket 或排程問題。
 
 5. [ECAT-WKC-MAIN]
 
-目前三軸應為 13/7。WKC 變小代表 frame 有回覆但 datagram 未完整處理，
-優先查從站狀態、線路、PDO mapping，不要先調 DC P 參數。
+目前三軸正常為 13/7。
+WKC 變小代表 Frame 有回覆，但 Datagram 未被完整處理。
+優先檢查從站狀態、線路與 PDO Mapping，不要先調 DC Phase 參數。
 
-6. [QPC-REAL-FF-V0C-MAIN]
+6. [QPC-DRIFT-CAL-MAIN]
 
-正常：State:ACTIVE、PhaseGood:YES、Reject:0、TripMask:0。
-Rec：observer 建議。
-Desired：限幅後目標。
-Applied：真正 scheduler 使用值。
-Step：本窗真正改變量。
-TripMask 0x01：phase observer fallback；0x02：RX consecutive timeout。
-LATCHED 是正式警報，本次程式執行會退回 -8300 ppb。
+啟動時會經過 WARMUP。
+Good 達到設定視窗數後應進入 LOCKED。
+目前實機鎖定範例：Baseline 約 -8413 ppb。
+每次開機可能略有差異，重點是 LOCKED、MAD 正常且不反覆 Unlock。
 
-7. [QPC-PHASE-P-ACT-V0-MAIN]
+7. [QPC-REAL-FF-V0C-MAIN]
 
-正常：State:ACTIVE、Gate:YES、OffsetSat:NO、Improve:YES。
-BaseErr：Real FF 後尚未加 Phase-P offset 的誤差。
-ActualErr：目前 offset 套用後的誤差。
-Wrap：P 控制器使用的正負 125 us 等價相位。
-Step<0 EARLIER；Step>0 LATER。
-Step 正負頻繁切換：P 太強或 deadband 太小。
-Offset 長期單方向增加：Real FF 尚有 frequency residual。
-OffsetSat:YES：先查頻率與 phase 基準，不要先增加 MaxOffset。
+正常：State:ACTIVE、PhaseGood:YES、Reject:0、TripMask:0x00。
+Rec：Observer 建議值。
+Desired：經限幅後的目標值。
+Applied：Scheduler 實際使用值。
+Step：本視窗實際改變量。
+TripMask 0x01：Phase Observer Fallback。
+TripMask 0x02：RX Consecutive Timeout。
+LATCHED 是正式警報，系統會退回目前設定的安全 Fixed/Bootstrap Baseline；目前為 -9500 ppb。
 
-8. [PDO-ONESHOT-INFRA-MAIN] / [PDO-BOOTSTRAP-REASON-MAIN]
+8. [QPC-PHASE-P-ACT-V0-MAIN]
+
+正常：State:ACTIVE、Gate:YES、OffsetSat:NO。
+BaseErr：Real FF 後、尚未套用 Phase-P Offset 的誤差。
+ActualErr：套用目前 Offset 後的誤差。
+Wrap：P Controller 使用的正負 125 us 等價相位。
+Step<0：EARLIER。
+Step>0：LATER。
+Step 正負頻繁切換：P 太強或 Deadband 太小。
+Offset 長期單方向增加：Real FF 仍有 Frequency Residual。
+OffsetSat:YES：先檢查頻率與 Phase 基準，不要先增加 MaxOffset。
+
+9. [PDO-ONESHOT-INFRA-MAIN] / [PDO-BOOTSTRAP-REASON-MAIN]
 
 正常：Control:ON、FineWait:OFF、WarmupDone:YES、RearmFail:0。
-啟動初期少量 NotReady/Bootstrap 可接受。
-穩定運轉後 RuntimeRecover、Skip、RearmFail 持續增加，表示 callback/re-arm 太晚。
-Recover/Skip 是 scheduler 自救，不等於 RX HardTimeout。
+啟動初期少量 NotReady/Bootstrap 可以接受。
+穩定運行後 RuntimeRecover、Skip 或 RearmFail 持續增加，代表 Callback/Re-arm 太晚。
+Recover/Skip 是 Scheduler 自救，不等於 RX HardTimeout。
 
-9. [PDO-TIMER-MAIN] / [PDO-COMBINED-MAIN] / [PDO-EXEC-MAIN]
+10. [PDO-TIMER-MAIN] / [PDO-COMBINED-MAIN] / [PDO-EXEC-MAIN]
 
 Timer Avg 應接近 250000 ns。
-Combined 是 LRW+FRMW round trip。
+Combined 是 LRW+FRMW Round Trip。
 Exec 是整個正式 PDO Handler；Over250 理想為 0。
-若 Exec Over250 增加，先查非循環命令、Motion/NC 與診斷工作，不要先放寬 Deadline。
+若 Exec Over250 增加，先檢查非循環命令、Motion/NC 與診斷工作，不要先放寬 RX Deadline。
 
-六、現象對照
+============================================================
+十、常見現象對照
+============================================================
 
-Timeout 增加 + TX 異常全 0 + ReceiveCallMax 高：NIC RX interrupt/NAL 排程。
-Timeout 增加 + PreDeadline 增加：PDO 前段或 CPU 負載，可能和 Motion/NC 有關。
-Timeout 0 + Recover/Skip 增加：One-Shot scheduler 醒來或 re-arm 落後。
-ActualErr 單方向漂移 + Offset 單方向累積：Real FF frequency 尚未完全對齊。
-ActualErr 來回震盪 + Step 正負切換：Phase-P 太強或 deadband 太小。
-TripMask 0x02：RX Timeout 已觸發 Real FF 安全鎖定。
-WKC 不為 13/7：先處理 EtherCAT/從站，不做 DC 調參。
+Timeout 增加 + TX 異常全 0 + ReceiveCallMax 高：
+優先檢查 NIC RX Interrupt、NAL 排程及 CPU 綁定。
 
-七、每次調參測試方式
+Timeout 增加 + PreDeadline 增加：
+PDO 前段或 CPU 負載偏高，可能與 Motion/NC 迴圈有關。
+
+Timeout 0 + Recover/Skip 增加：
+One-Shot Scheduler 醒來或 Re-arm 落後。
+
+ActualErr 單方向漂移 + Offset 單方向累積：
+Real FF Frequency 尚未完全對齊。
+
+ActualErr 來回震盪 + Step 正負切換：
+Phase-P 太強或 Deadband 太小。
+
+TripMask 0x02：
+RX Timeout 已觸發 Real FF 安全鎖定。
+
+WKC 不為 13/7：
+先處理 EtherCAT 通訊、從站狀態或 PDO Mapping，不做 DC 調參。
+
+AUTO Measurement PASS，但 CONFIG 失敗：
+檢查 [DC-CONFIG-AUTO] PREFLIGHT/WRITE/READBACK/ROLLBACK。
+
+AUTO Topology CHECK：
+檢查 ReferenceIsFirstServo、Consecutive、LinearPortShape 與 AllServoReadable。
+
+============================================================
+十一、每次調參與正式測試方式
+============================================================
 
 1. 一次只改一個參數，記錄舊值與新值。
-2. 先測 10~15 分鐘，確認無 WKC、Trip、Servo Alarm。
-3. 再測 2~3 小時，觀察 Timeout/Recover/ActualErr 趨勢。
-4. 正式凍結前，激磁三軸來回同動至少 12 小時。
-5. HAL、NAL priority、RX Deadline、Phase-P 不可同一輪一起改。
+2. 先空載測試 2～3 分鐘，確認能進入 ACTIVE、PhaseGood:YES。
+3. 再激磁並執行三軸來回同動 10～15 分鐘。
+4. 確認沒有 WKC 異常、TripMask、Servo Alarm 或連續 Timeout。
+5. 再測試 2～3 小時，觀察 Timeout、Recover、ActualErr 與 Offset 趨勢。
+6. 正式凍結前，激磁三軸來回同動至少 8～12 小時。
+7. AUTO 配置變更後，先確認三個 PASS：
+   [DC-DELAY-AUTO-RESULT] Result:PASS
+   [DC-CONFIG-AUTO-RESULT] Result:PASS
+   [DC-TOPOLOGY-AUTO] Result:PASS
+8. HAL、NAL Priority、RX Deadline、Phase-P 不可在同一輪一起修改。
+
+============================================================
+十二、目前正式判定
+============================================================
+
+目前已完成並實機驗證：
+
+- DC Reference AUTO 選擇。
+- 1～8 軸 AUTO 結構，實機已驗證 3 軸。
+- 自動伺服順序 S4 -> S5 -> S6。
+- 自動量測 0x0900 Port Timestamp。
+- Median Propagation Delay 計算。
+- 自動寫入 0x0928。
+- 0x0928 ReadBack Match 驗證。
+- 寫入失敗時 Rollback 保護。
+- AUTO Topology Dry-Run。
+- Master CLOCK_2 對齊 DC Reference。
+- Runtime Drift LOCKED、ACTIVE、PhaseGood:YES。
+- WKC 13/7 與 RX Timeout 診斷。
+
+因此 AUTO 功能已完成，可進入長時間正式候選版本測試。

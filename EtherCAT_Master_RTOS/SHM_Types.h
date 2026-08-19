@@ -73,6 +73,8 @@ struct SHM_NC_Status
    
     int currentG20State;
 
+    bool  m_programmableTravelLimitEnabled;//G22 G23
+
     int currentTCode;//當下刀號
     int currentWorkpieceNum;//當下工件號
 
@@ -88,6 +90,8 @@ struct SHM_NC_Status
     double manualFramePitchDeg;
     // Rotation around Machine X
     double manualFrameRollDeg;
+
+   
 
     int32_t reserved[23];// 預留擴充空間
 };

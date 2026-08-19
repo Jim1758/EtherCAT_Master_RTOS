@@ -64,7 +64,7 @@ struct SlaveInfo {
     uint16_t mbxInLength;   // SM1 Len
     uint32_t Vendor_ID;
     uint32_t Product_Code;
-   
+
 };
 
 
@@ -99,7 +99,7 @@ enum class EcatCmdStatus : int
     ECAT_STATUS_ERROR = -1
 };
 
-struct AsyncCommandSlot 
+struct AsyncCommandSlot
 {
     // --- 控制旗標 ---
     volatile int status = (int)EcatCmdStatus::ECAT_STATUS_IDLE; // [關鍵] volatile 防止編譯器優化順序
@@ -124,6 +124,22 @@ SlaveInfo m_slaveInfo[128];
 int Motor_Start_Index = -1;
 #pragma pack(pop)
 
+constexpr int DC_AUTO_MAX_SERVO_COUNT =
+8;
+
+struct DCAutoPropagationEntry
+{
+    int slaveIndex = -1;
+    uint32_t delayNs = 0;
+};
+
+struct DCAutoPropagationTable
+{
+    int count = 0;
+    int referenceSlaveIndex = -1;
+    DCAutoPropagationEntry entries[DC_AUTO_MAX_SERVO_COUNT];
+};
+
 // ============================================================================
 // EtherCAT 主站類別 (EtherCatMaster)
 // 負責底層封包收發、狀態機管理與從站配置
@@ -140,7 +156,7 @@ public:
     EtherCatMaster();
     ~EtherCatMaster();
 
-   
+
     // 🌟 2. 新增綁定 API
     void LinkCoordinateManager(CoordinateManager* pCoord);
 
@@ -182,9 +198,17 @@ public:
     // 流程: PRE-OP -> Config -> SAFE-OP -> OP
     int Initialize_Slaves();//初始化所有從站 INIT>>PRE-OP>>SAFE-OP>>OP
     void MeasureDCPortTimestamps();// Distributed Clock 分散式時鐘 診斷DC使用
-    bool MeasureDCPropagationDelay(uint32_t& delaySlave4,uint32_t& delaySlave5, uint32_t& delaySlave6);
 
-    bool ConfigureDCPropagationDelay( uint32_t delaySlave4, uint32_t delaySlave5, uint32_t delaySlave6);
+    // 舊版固定 S4/S5/S6 介面暫時保留但不再由初始化流程呼叫。
+    bool MeasureDCPropagationDelay(uint32_t& delaySlave4, uint32_t& delaySlave5, uint32_t& delaySlave6);
+    bool ConfigureDCPropagationDelay(uint32_t delaySlave4, uint32_t delaySlave5, uint32_t delaySlave6);
+
+    // AUTO：依 m_ServoList 實體順序量測並設定最多 8 軸 propagation delay。
+    bool MeasureDCPropagationDelayAuto(
+        DCAutoPropagationTable& delayTable);
+
+    bool ConfigureDCPropagationDelayAuto(
+        const DCAutoPropagationTable& delayTable);
 
     void UpdateDCMasterClockEstimator(
         uint64_t masterBeforeNs,
@@ -202,7 +226,7 @@ public:
     uint64_t GetCurrentMasterTimeNs();// 取得 RTX64 系統時間 (單位: 奈秒)
     void  Printf_Slaves_State();//印出從站狀態
     void  Printf_AL_Status_Code();//印出從站狀態0x134 code
- 
+
     // IO  Function
     bool Get_I(int moduleIdx, int bitIdx);
     bool Get_O(int moduleIdx, int bitIdx);
@@ -222,7 +246,7 @@ public:
 
      //範例區塊-----------------------------------------------------------------------------------
     void RunRealTimeCycle_EXAMPLE_MODE();//主要程式迴圈執行_測試模式
-   
+
     // System par
     CNicDriver* m_pNic;         // 網卡指標
     EtherCatEni* m_pEni;        // ENI 設定指標
@@ -231,7 +255,7 @@ public:
     uint8_t m_txBuffer[1514];
     uint8_t m_rxBuffer[1514];
     PlcCore    m_Plc;
-   
+
     char m_IoMap[4096];
     int m_IoMapSize = 0;
 
@@ -249,7 +273,7 @@ public:
     int wk_read = 0;
     int wk_write = 0;
 
-    
+
 
 
     AsyncCommandSlot m_asyncCmd;
@@ -260,45 +284,45 @@ public:
     std::vector<AxisContext> m_Axes;
 
     int test_timer = 0;
-     int test_dir = 1; // 1: 正向, -1: 反向
+    int test_dir = 1; // 1: 正向, -1: 反向
 
-     int debug_EDM = 1;
-   
-
-
-      int timer_10ms = 0;
-     int timer_100ms = 0;
-     int timer_500ms = 0;
-     int timer_1000ms = 0;
-     int timer_5000ms = 0;
-     int timer_10000ms = 0;
-     int Debug_test_timer = 0;
-
-     int timer_10ms_Count = 0;
-     int timer_100ms_Count = 0;
-     int timer_500ms_Count = 0;
-     int timer_1000ms_Count = 0;
-     int timer_5000ms_Count = 0;
-     int timer_10000ms_Count = 0;
-     int Debug_test_timer_Count = 0;
+    int debug_EDM = 1;
 
 
 
+    int timer_10ms = 0;
+    int timer_100ms = 0;
+    int timer_500ms = 0;
+    int timer_1000ms = 0;
+    int timer_5000ms = 0;
+    int timer_10000ms = 0;
+    int Debug_test_timer = 0;
 
-     //主系統區塊-----------------------------------------------------------------------------------
-     int TotalSlave_WKC_Count = 0;//從站統計WKC 分數 判斷是否失聯
-     void Get_TotalSlave_WKC_Count();//取得從站WKC 分數
-    
-     int RunRealTimeCycle_EDM_SINKER_MODE();//主要程式迴圈執行 EDM 雕磨模式
+    int timer_10ms_Count = 0;
+    int timer_100ms_Count = 0;
+    int timer_500ms_Count = 0;
+    int timer_1000ms_Count = 0;
+    int timer_5000ms_Count = 0;
+    int timer_10000ms_Count = 0;
+    int Debug_test_timer_Count = 0;
 
-     int StartDcPdoRuntime();//啟動PDO作業 DC同步
-     void PrintDcRuntimeDiagnostics();//DC診斷訊息
 
-     int StartPLCRuntime();//啟動PLC作業
 
-     NCManager* m_NC = nullptr;
 
-     // =========================================================
+    //主系統區塊-----------------------------------------------------------------------------------
+    int TotalSlave_WKC_Count = 0;//從站統計WKC 分數 判斷是否失聯
+    void Get_TotalSlave_WKC_Count();//取得從站WKC 分數
+
+    int RunRealTimeCycle_EDM_SINKER_MODE();//主要程式迴圈執行 EDM 雕磨模式
+
+    int StartDcPdoRuntime();//啟動PDO作業 DC同步
+    void PrintDcRuntimeDiagnostics();//DC診斷訊息
+
+    int StartPLCRuntime();//啟動PLC作業
+
+    NCManager* m_NC = nullptr;
+
+    // =========================================================
 // Master <-> DC Estimator State
 //
 // Offset definition:
@@ -306,45 +330,45 @@ public:
 // CLOCK_2 - DC Reference
 // =========================================================
 
-     bool m_dcEstimatorValid =false;
-     int64_t m_dcEstimatorOffsetNs =0;
-     int64_t m_dcEstimatorDriftPpb =0;
-     uint64_t m_dcEstimatorMasterTimeNs = 0;
-     uint64_t m_dcEstimatorSequence = 0;
+    bool m_dcEstimatorValid = false;
+    int64_t m_dcEstimatorOffsetNs = 0;
+    int64_t m_dcEstimatorDriftPpb = 0;
+    uint64_t m_dcEstimatorMasterTimeNs = 0;
+    uint64_t m_dcEstimatorSequence = 0;
 
-     bool m_dcHalDitherEnabled = false;
-     uint32_t m_dcHalBaseCounts = 0;
-     uint32_t m_dcHalAlternateCounts = 0;
-     uint64_t m_dcHalDitherAccumulator = 0;
-     uint64_t m_dcHalDitherStep = 0;
-     uint64_t m_dcHalDitherThreshold =1000000000ULL;
-     uint64_t m_dcHalBaseCycleCount = 0;
+    bool m_dcHalDitherEnabled = false;
+    uint32_t m_dcHalBaseCounts = 0;
+    uint32_t m_dcHalAlternateCounts = 0;
+    uint64_t m_dcHalDitherAccumulator = 0;
+    uint64_t m_dcHalDitherStep = 0;
+    uint64_t m_dcHalDitherThreshold = 1000000000ULL;
+    uint64_t m_dcHalBaseCycleCount = 0;
 
-     uint64_t m_dcHalAlternateCycleCount = 0;
+    uint64_t m_dcHalAlternateCycleCount = 0;
 
-     bool m_dcHalFrequencyCommandValid = false;
-     int64_t m_dcHalFrequencyCommandPpb = 0;
-     int64_t m_dcHalCalibrationSumPpb = 0;
+    bool m_dcHalFrequencyCommandValid = false;
+    int64_t m_dcHalFrequencyCommandPpb = 0;
+    int64_t m_dcHalCalibrationSumPpb = 0;
 
-     uint32_t m_dcHalCalibrationSamples = 0;
-     uint32_t m_dcHalCalibrationRequiredSamples = 2;
+    uint32_t m_dcHalCalibrationSamples = 0;
+    uint32_t m_dcHalCalibrationRequiredSamples = 2;
 
-     int64_t m_dcHalTrimSumPpb = 0;
+    int64_t m_dcHalTrimSumPpb = 0;
 
-     int64_t m_dcHalTrimMinPpb = 0;
+    int64_t m_dcHalTrimMinPpb = 0;
 
-     int64_t m_dcHalTrimMaxPpb = 0;
+    int64_t m_dcHalTrimMaxPpb = 0;
 
-     uint32_t m_dcHalTrimSamples = 0;
+    uint32_t m_dcHalTrimSamples = 0;
 
-     uint32_t m_dcHalTrimRequiredSamples = 8;
+    uint32_t m_dcHalTrimRequiredSamples = 8;
 
-     int64_t m_dcHalTrimMaxStepPpb = 500;
+    int64_t m_dcHalTrimMaxStepPpb = 500;
 
-     uint32_t m_dcHalTrimHoldoffRemaining = 0;
+    uint32_t m_dcHalTrimHoldoffRemaining = 0;
 
-     uint32_t m_dcHalTrimHoldoffWindows = 2;
+    uint32_t m_dcHalTrimHoldoffWindows = 2;
 
-     uint64_t m_dcHalTrimUpdateCount = 0;
+    uint64_t m_dcHalTrimUpdateCount = 0;
 };
 

@@ -1,5 +1,6 @@
 ﻿#include "EtherCatMaster.h"
 #include "EtherCatMaster_DC_Internal.h"
+#include "EtherCatMaster_DC_Tuning.h"
 #include "NicDriver.h"
 #include <windows.h>
 #include <rtapi.h>
@@ -8,7 +9,7 @@
 
 /*
  * 檔案：EtherCatMaster_DC_Diagnostics.cpp
- * 版本：EtherCAT DC Release Candidate RC1.2（調參與 Debug 判讀註解版）
+ * 版本：EtherCAT DC Release Candidate RC1.7（啟動 Drift 自動校正版）
  *
  * 功能：
  * - 由 Priority 50 的 1000 ms 工作讀取 Priority 64 發布的診斷快照。
@@ -32,45 +33,49 @@
  *
  * Debug 快速判讀順序：
  *
- * 1. 先看 [DC-HEALTH-SUMMARY]
+ * 1. 先看 [DC-DRIFT-CAL-MAIN]
+ *    AUTO 正常會由 WARMUP 逐步到 Good:5/5、State:LOCKED、Locks:1。
+ *    LOCKED 前 REAL-FF WAIT 與 PhaseGood:NO 是預期行為。
+ *
+ * 2. 再看 [DC-HEALTH-SUMMARY]
  *    正常目標：ACTIVE、PhaseGood:YES、ActualErr 接近 0、OffsetSat:NO、
  *    TripMask:0x00、Recover/Skip=0、Recent_Timeout=0、WKC=13/7、RESULT:STABLE。
  *    ActualErr 的 NEAR_ZERO 門檻是 ±1000 ns；這是顯示門檻，不是 Phase-P 的
  *    500 ns deadband。Snapshot:BUSY 偶爾一行可忽略，連續出現才要查 snapshot writer。
  *
- * 2. 若 Timeout 增加，看 [ECAT-RX-DEADLINE-MAIN]
+ * 3. 若 Timeout 增加，看 [ECAT-RX-DEADLINE-MAIN]
  *    FirstRx 接近 Calls 表示大多第一次 ReceivePacket 就收到；EmptyRx 只是輪詢時
  *    暫時無 frame，不等同 HardTimeout。HardTimeout 是本視窗新事件，TotalHardTimeout
  *    是啟動後永久累積；CurrentConsecutive 回到 0 表示後續已恢復。
  *    RxElapsed Max 接近／超過 Hard deadline，才是 deadline 壓力的直接證據。
  *
- * 3. 再看 [ECAT-RX-STAGE-MAIN] 判斷卡在哪一階段
+ * 4. 再看 [ECAT-RX-STAGE-MAIN] 判斷卡在哪一階段
  *    PreDeadline：進入 receive 前已無時間；PostReceive：ReceivePacket 返回後才超時；
  *    SleepAtTimeout 0/1/2：timeout 發生前走過幾次 coarse sleep；
  *    ReceiveCallMax：單次 NIC receive 呼叫最久時間；TimeoutCallMax：timeout 當次最久值。
  *    若 ReceiveCallMax 突增，優先查 NAL interrupt／CPU priority；若 PreDeadline 增加，
  *    優先查 TX、Motion、NC 或前段 Handler 執行時間。
  *
- * 4. 看 [ECAT-TX-ROOT-RC1-MAIN] 與 [ECAT-WKC-MAIN]
+ * 5. 看 [ECAT-TX-ROOT-RC1-MAIN] 與 [ECAT-WKC-MAIN]
  *    TxFrameBusy、TxNotOwner、TxSubmitFail、TxSubmitted0 正常都應維持 0。
  *    四者都為 0 但 RX timeout 增加，問題較可能在 RX interrupt／receive／排程。
  *    目前 3 軸拓撲 WKC 正常值是 LRW=13、DC=7；拓撲或 PDO mapping 改變後要重算，
  *    不能把 13/7 當成所有機台的固定標準。
  *
- * 5. 看正式 DC 控制
+ * 6. 看正式 DC 控制
  *    [QPC-REAL-FF-V0C-MAIN]：State=ACTIVE、PhaseGood=YES、TripMask=0、Reject=0。
  *    Applied 是真正使用的 drift；Step 應小且緩慢。LATCHED 或 TripMask 非 0 是正式警報。
  *    [QPC-PHASE-P-ACT-V0-MAIN]：State=ACTIVE、Gate=YES、ActualErr 接近 0、
  *    OffsetSat=NO、Improve=YES。Step 正負頻繁切換代表 deadband／P 強度可能過敏；
  *    Offset 長期往單方向累積代表 Real FF 尚有 residual frequency error。
  *
- * 6. 看 One-Shot 排程
+ * 7. 看 One-Shot 排程
  *    [PDO-ONESHOT-INFRA-MAIN]：Control=ON、FineWait=OFF、RearmFail=0。
  *    [PDO-BOOTSTRAP-REASON-MAIN]：啟動初期少量 NotReady 可接受；穩定運轉後
  *    Bootstrap、RuntimeRecover、Skip 持續增加，表示 callback 醒來或 re-arm 太晚。
  *    Recover/Skip 是 scheduler 自救事件，不等同 EtherCAT RX HardTimeout。
  *
- * 7. 看即時負載
+ * 8. 看即時負載
  *    [PDO-TIMER-MAIN] Avg 應接近 250000 ns；Short/Long 代表 callback 抖動分布。
  *    [PDO-COMBINED-MAIN] 是 LRW+FRMW round trip；[PDO-EXEC-MAIN] 是整個 Handler。
  *    PDO-EXEC Over250 理想為 0；若增加，先縮短非循環工作，不要先放寬 RX deadline。
@@ -164,6 +169,7 @@ namespace
             LONG recoverySeqBefore = g_pdoBootstrapDiagSequence;
             LONG timeoutSeqBefore = g_ecatRxDiagSequence;
             LONG wkcSeqBefore = g_pdoRtDiagSequence;
+            LONG driftSeqBefore = g_dcDriftCalibrationDiagSequence;
 
             if (realSeqBefore == 0 ||
                 phaseSeqBefore == 0 ||
@@ -174,7 +180,8 @@ namespace
                 (phaseSeqBefore & 1) != 0 ||
                 (recoverySeqBefore & 1) != 0 ||
                 (timeoutSeqBefore & 1) != 0 ||
-                (wkcSeqBefore & 1) != 0)
+                (wkcSeqBefore & 1) != 0 ||
+                (driftSeqBefore & 1) != 0)
             {
                 continue;
             }
@@ -194,6 +201,8 @@ namespace
             LONGLONG totalTimeout = g_ecatRxDiagTotalHardTimeout;
             LONG lrwWkc = g_pdoRtLrwWkc;
             LONG dcWkc = g_pdoRtDcWkc;
+            LONG driftState = g_dcDriftCalibrationState;
+            LONGLONG driftBaselinePpb = g_dcDriftCalibrationBaselinePpb;
 
             MemoryBarrier();
 
@@ -202,17 +211,20 @@ namespace
             LONG recoverySeqAfter = g_pdoBootstrapDiagSequence;
             LONG timeoutSeqAfter = g_ecatRxDiagSequence;
             LONG wkcSeqAfter = g_pdoRtDiagSequence;
+            LONG driftSeqAfter = g_dcDriftCalibrationDiagSequence;
 
             if (realSeqBefore != realSeqAfter ||
                 phaseSeqBefore != phaseSeqAfter ||
                 recoverySeqBefore != recoverySeqAfter ||
                 timeoutSeqBefore != timeoutSeqAfter ||
                 wkcSeqBefore != wkcSeqAfter ||
+                driftSeqBefore != driftSeqAfter ||
                 (realSeqAfter & 1) != 0 ||
                 (phaseSeqAfter & 1) != 0 ||
                 (recoverySeqAfter & 1) != 0 ||
                 (timeoutSeqAfter & 1) != 0 ||
-                (wkcSeqAfter & 1) != 0)
+                (wkcSeqAfter & 1) != 0 ||
+                (driftSeqAfter & 1) != 0)
             {
                 continue;
             }
@@ -222,6 +234,10 @@ namespace
                 realState == 1 ? "ARMING" :
                 realState == 3 ? "HOLD" :
                 realState == 4 ? "LATCHED" : "WAIT";
+
+            const char* driftStateText =
+                driftState == 2 ? "FIXED" :
+                driftState == 1 ? "LOCKED" : "WARMUP";
 
             // 正式候選版將 ActualErr 絕對值 <= 1000 ns 視為接近零。
             bool nearZero =
@@ -243,6 +259,7 @@ namespace
             // 因此單次孤立事件安靜滿五分鐘後可恢復 STABLE；
             // Total 仍保留在同一行，方便日後統計與追查。
             bool stable =
+                (driftState == 1 || driftState == 2) &&
                 realState == 2 &&
                 phaseGood != 0 &&
                 phasePState == 2 &&
@@ -262,6 +279,7 @@ namespace
             // 最後才看 ActualErr。Total 是歷史證據，單獨不會阻止五分鐘後恢復 STABLE。
             RtPrintf(
                 "[DC-HEALTH-SUMMARY] "
+                "Drift:%s(%+lldppb) + "
                 "%s + PhaseGood:%s + "
                 "ActualErr:%+lldns(NEAR_ZERO:%s) + "
                 "OffsetSat:%s + "
@@ -271,6 +289,8 @@ namespace
                 "Timeout Total:%lld Recent_Timeout:%lld "
                 "Quiet:%ld/%lds State:%s + "
                 "WKC:%ld/%ld => RESULT:%s\n",
+                driftStateText,
+                (long long)driftBaselinePpb,
                 realStateText,
                 phaseGood ? "YES" : "NO",
                 (long long)actualErrNs,
@@ -302,6 +322,114 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
 {
     // 本函式只能在非 PDO 即時路徑呼叫。
     // 所有 RtPrintf 都集中於此，避免 Priority 64 因格式化輸出被阻塞。
+
+    // =============================================================
+    // 啟動 Drift 自動校正
+    //
+    // AUTO 正常順序：WARMUP 0/5 -> 5/5 -> LOCKED，Locks 固定為 1。
+    // FIXED 直接顯示 State:FIXED。Baseline 是本次執行所有 fallback
+    // 與 residual observer 共用的值，不是只改 LOG 顯示。
+    // =============================================================
+    static LONG lastDriftCalibrationPrintedSequence = 0;
+
+    LONG driftCalibrationSequenceBefore =
+        g_dcDriftCalibrationDiagSequence;
+
+    if (driftCalibrationSequenceBefore != 0 &&
+        (driftCalibrationSequenceBefore & 1) == 0 &&
+        driftCalibrationSequenceBefore !=
+        lastDriftCalibrationPrintedSequence)
+    {
+        MemoryBarrier();
+
+        LONG calibrationMode =
+            g_dcDriftCalibrationMode;
+
+        LONG calibrationState =
+            g_dcDriftCalibrationState;
+
+        LONG calibrationCandidateGood =
+            g_dcDriftCalibrationCandidateGood;
+
+        LONG calibrationGoodWindows =
+            g_dcDriftCalibrationGoodWindows;
+
+        LONG calibrationRequiredWindows =
+            g_dcDriftCalibrationRequiredWindows;
+
+        LONG calibrationRobustSequence =
+            g_dcDriftCalibrationRobustSequence;
+
+        LONGLONG calibrationRawPpb =
+            g_dcDriftCalibrationRawPpb;
+
+        LONGLONG calibrationMedianPpb =
+            g_dcDriftCalibrationMedianPpb;
+
+        LONGLONG calibrationMadPpb =
+            g_dcDriftCalibrationMadPpb;
+
+        LONGLONG calibrationRawMedianDeviationPpb =
+            g_dcDriftCalibrationRawMedianDeviationPpb;
+
+        LONGLONG calibrationBaselinePpb =
+            g_dcDriftCalibrationBaselinePpb;
+
+        LONG calibrationLockCount =
+            g_dcDriftCalibrationLockCount;
+
+        MemoryBarrier();
+
+        LONG driftCalibrationSequenceAfter =
+            g_dcDriftCalibrationDiagSequence;
+
+        if (driftCalibrationSequenceBefore ==
+            driftCalibrationSequenceAfter &&
+            (driftCalibrationSequenceAfter & 1) == 0)
+        {
+            lastDriftCalibrationPrintedSequence =
+                driftCalibrationSequenceAfter;
+
+            const char* calibrationStateText =
+                calibrationState == 2 ? "FIXED" :
+                calibrationState == 1 ? "LOCKED" : "WARMUP";
+
+            const char* calibrationCandidateText =
+                calibrationMode == 1 ? "N/A" :
+                calibrationCandidateGood != 0 ? "GOOD" : "REJECT";
+
+            RtPrintf(
+                "[DC-DRIFT-CAL-MAIN] "
+                "Mode:%s | "
+                "State:%s | "
+                "Candidate:%s | "
+                "Good:%ld/%ld | "
+                "Raw:%+lld Median:%+lld MAD:%lld "
+                "RawDev:%+lld ppb | "
+                "Baseline:%+lld ppb | "
+                "Range:%+lld..%+lld ppb | "
+                "Locks:%ld | "
+                "RobustSeq:%ld | "
+                "OneShot:YES | "
+                "Snap:%ld\n",
+                calibrationMode == 1 ? "FIXED" : "AUTO",
+                calibrationStateText,
+                calibrationCandidateText,
+                (long)calibrationGoodWindows,
+                (long)calibrationRequiredWindows,
+                (long long)calibrationRawPpb,
+                (long long)calibrationMedianPpb,
+                (long long)calibrationMadPpb,
+                (long long)calibrationRawMedianDeviationPpb,
+                (long long)calibrationBaselinePpb,
+                (long long)EtherCatDcTuning::RealFfMinimumDriftPpb,
+                (long long)EtherCatDcTuning::RealFfMaximumDriftPpb,
+                (long)calibrationLockCount,
+                (long)calibrationRobustSequence,
+                (long)driftCalibrationSequenceAfter);
+        }
+    }
+
     // =============================================================
     // QPC <-> S4 Trusted Drift V1A
     // Reject / Transition Reason Diagnostic Reader
@@ -586,7 +714,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
     // This is the control-grade candidate layer, but still:
     //
     //     Control:OFF
-    //     SchedulerUsed:-8300 ppb
+    //     SchedulerBaseline:SEE-DC-DRIFT-CAL
     //
     // State:
     //     WARMUP / TRACK / HOLD / UNTRUSTED
@@ -721,7 +849,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "Unlocks:%ld Relocks:%ld | "
                 "GateDev:1200 RawMedian:2000 "
                 "MAD:800 SlewMax:50 ppb/window | "
-                "SchedulerUsed:-8300 ppb | "
+                "SchedulerBaseline:SEE-DC-DRIFT-CAL | "
                 "Control:OFF | "
                 "Snap:%ld\n",
 
@@ -792,7 +920,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
     // SHADOW ONLY.
     //
     // FixedErr:
-    //   Actual real wake - real fixed -8300 target.
+    //   Actual real wake - real startup baseline target.
     //
     // ShadowErr:
     //   Same actual wake - incremental Trusted/Fallback shadow target.
@@ -948,7 +1076,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "TrustedSnapshot:%s "
                 "TrustedValid:%s "
                 "TrustedState:%s | "
-                "FixedDrift:-8300 "
+                "Baseline:SEE-DC-DRIFT-CAL "
                 "TrustedDrift:%+lld "
                 "AppliedDrift:%+lld ppb | "
                 "AppliedFF:%+lld ps/cycle | "
@@ -965,7 +1093,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "TotalModeSwitch:%ld | "
                 "Samples:%ld | "
                 "Incremental:YES Retroactive:NO | "
-                "SchedulerUsed:-8300 ppb | "
+                "SchedulerBaseline:SEE-DC-DRIFT-CAL | "
                 "Control:OFF | "
                 "Snap:%ld\n",
 
@@ -1345,7 +1473,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
     //   rolling accepted residual slopes, ring = 16.
     //
     // Recommended:
-    //   -8300 - MedianResidual
+    //   Startup Baseline - MedianResidual
     //
     // This is frequency observation only.
     // No scheduler control.
@@ -1464,7 +1592,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "Buffer:%ld/16 "
                 "Lock:%s | "
                 "RingMin:%+lld RingMax:%+lld ppb | "
-                "FixedScheduler:-8300 ppb | "
+                "Baseline:SEE-DC-DRIFT-CAL | "
                 "Recommended:%+lld ppb | "
                 "Trusted:%+lld ppb "
                 "TrustedMinusRecommended:%+lld ppb | "
@@ -1688,7 +1816,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "SlopeMin:%+lld SlopeMax:%+lld ppb | "
                 "TimeSpan:%lld ns | "
                 "Lock:%s | "
-                "FixedScheduler:-8300 ppb | "
+                "Baseline:SEE-DC-DRIFT-CAL | "
                 "Recommended:%+lld ppb | "
                 "Trusted:%+lld ppb "
                 "TrustedMinusRecommended:%+lld ppb | "
@@ -1956,10 +2084,10 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "H2F:%ld F2T:%ld "
                 "WindowSwitch:%ld TotalSwitch:%ld | "
                 "ObserverSeq:%ld Samples:%ld | "
-                "GateMAD:150 ppb GateDev:1000 ppb "
+                "GateMAD:150 ppb GateDev:1800 ppb "
                 "SlewMax:25 ppb/window | "
                 "Incremental:YES Retroactive:NO | "
-                "SchedulerUsed:-8300 ppb | "
+                "SchedulerBaseline:SEE-DC-DRIFT-CAL | "
                 "Control:OFF | "
                 "Snap:%ld\n",
 
@@ -2162,7 +2290,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "BetterThanTrusted:%ld/4000 | "
                 "Samples:%ld | "
                 "TargetDomain:YES SendPoint:NO | "
-                "SchedulerUsed:-8300 ppb | "
+                "SchedulerBaseline:SEE-DC-DRIFT-CAL | "
                 "Control:OFF | "
                 "Snap:%ld\n",
 
@@ -2806,7 +2934,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
     //     print here.
     //
     // DRY-RUN ONLY:
-    //     scheduler still uses fixed -8300 ppb.
+    //     scheduler still uses startup-calibrated baseline.
     // =============================================================
 
     static LONG
@@ -2880,8 +3008,8 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "Lock:%s | "
                 "FF:%+lld ps/cycle | "
                 "Accepted:%ld Rejected:%ld | "
-                "SchedulerUsed:-8300 ppb | "
-                "Control:OFF | "
+                "SchedulerBaseline:SEE-DC-DRIFT-CAL | "
+                "StartupCal:SOURCE | "
                 "Snap:%ld\n",
 
                 (long long)
@@ -3773,6 +3901,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
             // 正式 Real FF 判讀：ACTIVE + PhaseGood:YES + Reject:0 + TripMask:0。
             // Rec 是 observer 建議；Desired 是限幅後目標；Applied 才是真正排程使用值；
             // Step 是本觀測窗實際變化。ClampActive:YES 時不要直接放寬上下限。
+            // Reject 0x80 只表示啟動 Drift 尚未 LOCKED，WARMUP 期間屬正常。
             RtPrintf(
                 "[QPC-REAL-FF-V0C-MAIN] "
                 "State:%s PhaseGood:%s Arm:%ld/3 | "

@@ -1,4 +1,6 @@
 ﻿#include "EtherCatMaster.h"
+#include "EtherCatMaster_DC_Topology.h"
+#include "EtherCatMaster_DC_Tuning.h"
 #include <windows.h> 
 #include <rtapi.h> 
 #include <rtssapi.h> 
@@ -10,12 +12,12 @@
 
 // ============================================================================
 // EtherCatMaster_DC_Runtime.cpp
-// EtherCAT DC 即時循環正式版候選 RC1.2（完整調參／Debug 維護註解版）
+// EtherCAT DC 即時循環正式版候選 RC1.7（啟動 Drift 自動校正版）
 //
 // 本檔責任：
 //   1. 執行 4 kHz／250 us PDO 即時循環。
-//   2. 用 LRW + FRMW 在同一個 Ethernet frame 交換 PDO，並擷取 S4 DC 時間。
-//   3. 維護 QPC <-> S4 DC 對映、漂移觀測器、Real FF 與 Phase-P 控制器。
+//   2. 用 LRW + FRMW 在同一個 Ethernet frame 交換 PDO，並擷取所選 Reference DC 時間。
+//   3. 維護 QPC <-> DC Reference 對映、漂移觀測器、Real FF 與 Phase-P 控制器。
 //   4. 在 EtherCAT 通訊有效時更新 PLC Input、Motion 與非同步命令。
 //   5. 只把統計結果發布到 snapshot，實際文字輸出交給 Priority 50 主執行緒。
 //
@@ -42,9 +44,9 @@
 // 重要基準：
 //   - PDO 週期：250000 ns（4 kHz）。
 //   - Sync0 目標相位：125000 ns。
-//   - 固定安全漂移基準：-8300 ppb。
+//   - AUTO 啟動校正前 Bootstrap：-9500 ppb；校正後採本次量測 Baseline。
 //   - One-Shot coarse guard：100000 ns；Fine Wait 仍為 OFF。
-//   - Real FF 範圍：-10000..-7800 ppb，每個觀測窗最多變更 10 ppb。
+//   - Real FF 範圍：-12000..-7800 ppb，每個觀測窗最多變更 10 ppb。
 //   - Phase-P：P=1/8、deadband=500 ns、每次最多 250 ns、總 offset ±120000 ns。
 //
 // 即時路徑禁止事項：
@@ -75,7 +77,7 @@
 //     - Phase-P 可累積的總 offset；若 OffsetSat:YES 才有理由檢討此值。
 //     - 不能超過半個 250 us 週期的 125000 ns；目前 120000 ns 已接近上限，
 //       正式機不建議再增大。若希望更保守可降到 100000 或 50000 ns。
-//   REAL_FF_V0_MIN_PPB / MAX_PPB = -10000 / -7800 ppb
+//   REAL_FF_V0_MIN_PPB / MAX_PPB = -12000 / -7800 ppb
 //     - Real FF 絕對限幅；ClampActive:YES 表示 observer 建議超出此安全範圍。
 //     - 不要為了消除 ClampActive 就直接放寬，應先檢查 V1A slope/MAD 與 RX timeout。
 //   *_ARM_WINDOWS、*_HOLD_RECOVERY_WINDOWS、*_HOLD_BAD_LIMIT
@@ -98,6 +100,34 @@
 //   RTX64 HAL = 25 us；NAL Interrupt priority = 70；TX complete priority = 70。
 //   這三項會影響 wake／RX 最大延遲，正式測試期間應固定，不要和程式參數同時改。
 // ============================================================================
+
+// =============================================================
+// 啟動 Drift 設定與校正快照
+//
+// Startup 只在正式 PDO timer 建立前寫 Config 欄位。Runtime 以 Robust Drift
+// 的連續五個合格視窗鎖定 AUTO Baseline；鎖定後本次執行不再重校。
+// =============================================================
+
+volatile LONG g_dcDriftConfigReady = 0;
+volatile LONG g_dcDriftConfiguredMode = 0;
+volatile LONGLONG g_dcDriftConfiguredFixedPpb =
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
+
+volatile LONG g_dcDriftCalibrationDiagSequence = 0;
+volatile LONG g_dcDriftCalibrationMode = 0;
+volatile LONG g_dcDriftCalibrationState = 0;
+volatile LONG g_dcDriftCalibrationCandidateGood = 0;
+volatile LONG g_dcDriftCalibrationGoodWindows = 0;
+volatile LONG g_dcDriftCalibrationRequiredWindows =
+(LONG)EtherCatDcTuning::DriftCalibrationGoodWindows;
+volatile LONG g_dcDriftCalibrationRobustSequence = 0;
+volatile LONGLONG g_dcDriftCalibrationRawPpb = 0;
+volatile LONGLONG g_dcDriftCalibrationMedianPpb = 0;
+volatile LONGLONG g_dcDriftCalibrationMadPpb = 0;
+volatile LONGLONG g_dcDriftCalibrationRawMedianDeviationPpb = 0;
+volatile LONGLONG g_dcDriftCalibrationBaselinePpb =
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
+volatile LONG g_dcDriftCalibrationLockCount = 0;
 
 // =============================================================
 // PDO 即時診斷快照
@@ -145,9 +175,9 @@ volatile LONG g_pdoRtDcWkc = 0;
 
 
 // =============================================================
-// QPC <-> EtherCAT S4 DC 頻率估測快照（僅診斷）
+// QPC <-> EtherCAT DC Reference 頻率估測快照（僅診斷）
 //
-// 用 EtherCAT 呼叫前後 QPC 中點對應 S4 DC time，降低固定通訊延遲的影響。
+// 用 EtherCAT 呼叫前後 QPC 中點對應 DC Reference time，降低固定通訊延遲的影響。
 // Delta = DC elapsed - QPC elapsed；DriftPpb 是長時間斜率，不是單次相位誤差。
 // RTT 過大或時間倒退的樣本會列入 rejected，不會餵入觀測器。
 // =============================================================
@@ -331,7 +361,7 @@ extern volatile LONG g_ecatRxDiagCurrentConsecutiveTimeout;
 // Real FF 狀態：0=WAIT、1=ARM、2=ACTIVE、3=HOLD、4=TRIP/FALLBACK。
 //   - ACTIVE 時把合格的 Frequency FF V2 建議值，限幅與限速後套入 QPC period。
 //   - TripMask 0x01 表示相位觀測器進入 FALLBACK；0x02 表示連續 RX timeout。
-//   - 一旦進入 state 4，本次執行期間維持固定 -8300 ppb 安全值。
+//   - 一旦進入 state 4，本次執行期間維持已鎖定的啟動 Baseline。
 //
 // Phase-P 狀態：0=WAIT、1=ARM、2=ACTIVE、3=HOLD、4=TRIP。
 //   - 只有 Real FF ACTIVE、phase gate 合格、TripMask=0 時才修正 offset。
@@ -343,9 +373,9 @@ volatile LONG g_qpcRealFfV0PhaseGood = 0;
 volatile LONG g_qpcRealFfV0ArmGood = 0;
 volatile LONG g_qpcRealFfV0TripMask = 0;
 volatile LONG g_qpcRealFfV0TripCount = 0;
-volatile LONGLONG g_qpcRealFfV0RecommendedPpb = -8300;
-volatile LONGLONG g_qpcRealFfV0DesiredPpb = -8300;
-volatile LONGLONG g_qpcRealFfV0AppliedPpb = -8300;
+volatile LONGLONG g_qpcRealFfV0RecommendedPpb = EtherCatDcTuning::SchedulerBootstrapDriftPpb;
+volatile LONGLONG g_qpcRealFfV0DesiredPpb = EtherCatDcTuning::SchedulerBootstrapDriftPpb;
+volatile LONGLONG g_qpcRealFfV0AppliedPpb = EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 volatile LONGLONG g_qpcRealFfV0LastStepPpb = 0;
 volatile LONGLONG g_qpcRealFfV0TargetVsFixedNs = 0;
 volatile LONGLONG g_qpcRealFfV0DcErrEstNs = 0;
@@ -446,7 +476,7 @@ g_qpcSchedulerLateCount =
 
 
 // =============================================================
-// QPC <-> S4 Robust Drift V1 快照（僅觀測）
+// QPC <-> DC Reference Robust Drift V1 快照（僅觀測）
 //
 // 對最近 9 個約一秒的 drift 樣本計算 median 與 MAD；CurrentAccepted 表示
 // 本窗通過 RTT／幅度門檻，Locked 表示樣本數與 MAD 已達可信條件。
@@ -495,11 +525,11 @@ g_qpcDcRobustRejectedTotal =
 
 
 // =============================================================
-// QPC <-> S4 Trusted Drift V1A 快照（僅觀測）
+// QPC <-> DC Reference Trusted Drift V1A 快照（僅觀測）
 //
 // 狀態：0=WARMUP、1=TRACK、2=HOLD、3=UNTRUSTED。
 // WARMUP 需連續合格窗；TRACK 以受限 slew 更新；HOLD 保留最後可信值；
-// UNTRUSTED 回到 -8300 ppb 並等待重新鎖定。本觀測器不直接修改 timer/HAL。
+// UNTRUSTED 回到啟動 Baseline 並等待重新鎖定。本觀測器不直接修改 timer/HAL。
 // =============================================================
 
 volatile LONG
@@ -520,7 +550,7 @@ g_qpcDcTrustedRobustMadPpb =
 
 volatile LONGLONG
 g_qpcDcTrustedDriftPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcDcTrustedCandidateDeviationPpb =
@@ -669,13 +699,13 @@ g_qpcDcTrustedLastTransitionMadPpb =
 
 volatile LONGLONG
 g_qpcDcTrustedLastTransitionTrustedPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 
 // =============================================================
 // Trusted Drift -> QPC Live Feed-Forward V1 Shadow 快照
 //
-// 使用獨立 target accumulator，比較 Trusted 與固定 -8300 ppb 的長期差異。
+// 使用獨立 target accumulator，比較 Trusted 與本次啟動 Baseline 的長期差異。
 // Mode 0=FIXED_FALLBACK，1=TRUSTED。此 timeline 不寫入真正 scheduler target，
 // 不重算既有 anchor，也不改 timer re-arm 或 PDO 送出時間。
 // =============================================================
@@ -706,15 +736,15 @@ g_qpcLiveFfTrustedState =
 
 volatile LONGLONG
 g_qpcLiveFfTrustedDriftPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcLiveFfAppliedDriftPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcLiveFfAppliedPeriodFfPs =
--2075;
+EtherCatDcTuning::SchedulerBootstrapPeriodFfPs;
 
 volatile LONGLONG
 g_qpcLiveFfFixedErrorNs =
@@ -796,7 +826,7 @@ g_qpcLiveFfSamples =
 // =============================================================
 // Trusted Live-FF DC Phase Predictor V1 快照（僅診斷）
 //
-// 把 Fixed target 與 Trusted shadow target 都投影到 S4 DC 時域，比較 wrapped／
+// 把 Fixed target 與 Trusted shadow target 都投影到 DC Reference 時域，比較 wrapped／
 // unwrapped phase、Sync0 margin、平均絕對誤差與優劣次數。對映使用當前有效的
 // QPC midpoint / DC_reference_time pair；結果不直接驅動 timer。
 // =============================================================
@@ -935,11 +965,11 @@ g_qpcLiveFfDcPhaseSamples =
 
 
 // =============================================================
-// S4 DC Phase Residual Drift Observer V1 快照（僅診斷）
+// DC Reference Phase Residual Drift Observer V1 快照（僅診斷）
 //
-// 以固定 -8300 ppb timeline 的相位在約一秒內的變化估算 residual drift；
+// 以本次啟動 Baseline timeline 的相位在約一秒內的變化估算 residual drift；
 // RobustResidualPpb 是通過門檻樣本的 rolling median；建議排程值為
-// -8300 - RobustResidualPpb。此 V1 結果不直接控制 scheduler。
+// Baseline - RobustResidualPpb。此 V1 結果不直接控制 scheduler。
 // =============================================================
 
 volatile LONG
@@ -968,11 +998,11 @@ g_qpcDcPhaseResidualMadPpb =
 
 volatile LONGLONG
 g_qpcDcPhaseResidualRecommendedSchedulerPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcDcPhaseResidualTrustedDriftPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcDcPhaseResidualTrustedMinusRecommendedPpb =
@@ -1032,7 +1062,7 @@ g_qpcDcPhaseResidualRingMaxPpb =
 
 
 // =============================================================
-// S4 DC Phase Residual Drift Observer V1A 快照（僅診斷）
+// DC Reference Phase Residual Drift Observer V1A 快照（僅診斷）
 //
 // 每個約一秒／4000 sample 視窗先產生一個平均相位點，再以最近 16 個合格點
 // 的所有 pair slope（最多 120 組）計算 Theil-Sen median 與 slope MAD。
@@ -1097,11 +1127,11 @@ g_qpcDcPhaseResidualV1ALocked =
 
 volatile LONGLONG
 g_qpcDcPhaseResidualV1ARecommendedSchedulerPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcDcPhaseResidualV1ATrustedDriftPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcDcPhaseResidualV1ATrustedMinusRecommendedPpb =
@@ -1201,15 +1231,15 @@ g_qpcPhaseFfV2ObserverSequence =
 
 volatile LONGLONG
 g_qpcPhaseFfV2RecommendedPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcPhaseFfV2DesiredPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcPhaseFfV2AppliedPpb =
--8300;
+EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
 volatile LONGLONG
 g_qpcPhaseFfV2SlewAppliedPpb =
@@ -1301,7 +1331,7 @@ g_qpcPhaseFfV2Samples =
 
 
 // =============================================================
-// Frequency FF V2 與 S4 DC 相位比較快照（V2 shadow 效果驗證）
+// Frequency FF V2 與 DC Reference 相位比較快照（V2 shadow 效果驗證）
 // =============================================================
 
 volatile LONG
@@ -1635,7 +1665,7 @@ g_pdoOneShotInfraFinalLateCount =
 //   1. 驗證 one-shot startup gate，讀取 QPC wake time。
 //   2. 更新 QPC scheduler／Real FF／Phase-P，先 re-arm 下一次 callback。
 //   3. Flush PLC outputs，送出 LRW+FRMW，驗證 PDO/DC WKC。
-//   4. 更新 QPC<->S4 DC 與各種 shadow observer snapshot。
+//   4. 更新 QPC<->DC Reference 與各種 shadow observer snapshot。
 //   5. Fetch PLC inputs，更新 DC 軟體估測器／控制器。
 //   6. 處理低頻 async command，更新 Motion，發布執行時間快照。
 //
@@ -1885,8 +1915,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     static LONG realFfV0State = 0;
     static uint32_t realFfV0ArmGood = 0;
     static LONG realFfV0LastPhaseSeq = 0;
-    static int64_t realFfV0DesiredPpb = -8300LL;
-    static int64_t realFfV0AppliedPpb = -8300LL;
+    static int64_t realFfV0DesiredPpb = EtherCatDcTuning::SchedulerBootstrapDriftPpb;
+    static int64_t realFfV0AppliedPpb = EtherCatDcTuning::SchedulerBootstrapDriftPpb;
     static int64_t realFfV0LastStepPpb = 0;
     static LONG realFfV0TripMask = 0;
     static uint32_t realFfV0TripCount = 0;
@@ -1906,6 +1936,18 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     static uint32_t phasePActV0TripCount = 0;
     static int64_t phasePActV0OffsetNs = 0;
     static int64_t phasePActV0LastStepNs = 0;
+
+    // 啟動校正只在本次 process 執行一次。AUTO 以五個連續合格 Robust
+    // median 的平均值鎖定；FIXED 在第一個有效 callback 直接鎖定指定值。
+    static bool driftCalibrationInitialized = false;
+    static bool driftCalibrationLocked = false;
+    static LONG driftCalibrationMode = 0;
+    static LONG driftCalibrationLastRobustSequence = 0;
+    static uint32_t driftCalibrationGoodWindows = 0;
+    static int64_t driftCalibrationMedianSumPpb = 0;
+    static int64_t driftBaselinePpb =
+        EtherCatDcTuning::SchedulerBootstrapDriftPpb;
+    static uint32_t driftCalibrationLockCount = 0;
 
 
     // =============================================================
@@ -2027,11 +2069,11 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
     static int64_t
         qpcPhaseFfV2DesiredPpb =
-        -8300LL;
+        EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
     static int64_t
         qpcPhaseFfV2AppliedPpb =
-        -8300LL;
+        EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
     static int64_t
         qpcPhaseFfV2LastAppliedStepPpb =
@@ -2137,25 +2179,298 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
     // ---------------------------------------------------------------------
+    // 啟動 Drift 校正
+    //
+    // AUTO：Robust snapshot 必須已鎖定、Buffer=9、MAD 與 Raw/Median 差值
+    // 都通過門檻，且沒有連續 RX timeout。連續五窗後取 median 平均並鎖定。
+    // FIXED：第一個 callback 直接採用 Startup 已驗證的設定值。
+    // 校正只改「後續週期的頻率」，不重算既有 target，因此沒有相位突跳。
+    // ---------------------------------------------------------------------
+    bool driftCalibrationPublish = false;
+    bool driftCalibrationLockedThisCycle = false;
+    bool driftCalibrationCandidateGood = false;
+    LONG driftCalibrationRobustSequence = 0;
+    int64_t driftCalibrationRawPpb = 0;
+    int64_t driftCalibrationMedianPpb = 0;
+    int64_t driftCalibrationMadPpb = 0;
+    int64_t driftCalibrationRawMedianDeviationPpb = 0;
+
+    if (!driftCalibrationInitialized)
+    {
+        driftCalibrationMode =
+            g_dcDriftConfigReady != 0
+            ? g_dcDriftConfiguredMode
+            : 0;
+
+        driftBaselinePpb =
+            EtherCatDcTuning::SchedulerBootstrapDriftPpb;
+
+        if (driftCalibrationMode == 1)
+        {
+            int64_t fixedPpb =
+                (int64_t)g_dcDriftConfiguredFixedPpb;
+
+            if (fixedPpb >= EtherCatDcTuning::RealFfMinimumDriftPpb &&
+                fixedPpb <= EtherCatDcTuning::RealFfMaximumDriftPpb)
+            {
+                driftBaselinePpb = fixedPpb;
+                driftCalibrationLocked = true;
+                driftCalibrationLockCount = 1;
+                driftCalibrationCandidateGood = true;
+                driftCalibrationLockedThisCycle = true;
+                driftCalibrationPublish = true;
+            }
+            else
+            {
+                driftCalibrationMode = 0;
+            }
+        }
+
+        driftCalibrationInitialized = true;
+    }
+
+    if (driftCalibrationMode == 0 &&
+        !driftCalibrationLocked)
+    {
+        LONG robustSequenceBefore =
+            g_qpcDcRobustDiagSequence;
+
+        if (robustSequenceBefore != 0 &&
+            (robustSequenceBefore & 1) == 0 &&
+            robustSequenceBefore != driftCalibrationLastRobustSequence)
+        {
+            MemoryBarrier();
+
+            driftCalibrationRawPpb =
+                (int64_t)g_qpcDcRobustRawDriftPpb;
+
+            driftCalibrationMedianPpb =
+                (int64_t)g_qpcDcRobustMedianDriftPpb;
+
+            driftCalibrationMadPpb =
+                (int64_t)g_qpcDcRobustMadPpb;
+
+            LONG robustBufferCount =
+                g_qpcDcRobustBufferCount;
+
+            LONG robustCurrentAccepted =
+                g_qpcDcRobustCurrentAccepted;
+
+            LONG robustLocked =
+                g_qpcDcRobustLocked;
+
+            MemoryBarrier();
+
+            LONG robustSequenceAfter =
+                g_qpcDcRobustDiagSequence;
+
+            if (robustSequenceBefore == robustSequenceAfter &&
+                (robustSequenceAfter & 1) == 0)
+            {
+                driftCalibrationLastRobustSequence =
+                    robustSequenceAfter;
+
+                driftCalibrationRobustSequence =
+                    robustSequenceAfter;
+
+                driftCalibrationRawMedianDeviationPpb =
+                    driftCalibrationRawPpb -
+                    driftCalibrationMedianPpb;
+
+                int64_t rawMedianAbsPpb =
+                    driftCalibrationRawMedianDeviationPpb >= 0
+                    ? driftCalibrationRawMedianDeviationPpb
+                    : -driftCalibrationRawMedianDeviationPpb;
+
+                driftCalibrationCandidateGood =
+                    robustCurrentAccepted != 0 &&
+                    robustLocked != 0 &&
+                    robustBufferCount >= 9 &&
+                    driftCalibrationMedianPpb >=
+                    EtherCatDcTuning::RealFfMinimumDriftPpb &&
+                    driftCalibrationMedianPpb <=
+                    EtherCatDcTuning::RealFfMaximumDriftPpb &&
+                    driftCalibrationMadPpb <=
+                    EtherCatDcTuning::DriftCalibrationMaximumMadPpb &&
+                    rawMedianAbsPpb <=
+                    EtherCatDcTuning::DriftCalibrationMaximumRawMedianDeviationPpb &&
+                    g_ecatRxDiagCurrentConsecutiveTimeout == 0;
+
+                if (driftCalibrationCandidateGood)
+                {
+                    driftCalibrationMedianSumPpb +=
+                        driftCalibrationMedianPpb;
+
+                    driftCalibrationGoodWindows++;
+
+                    if (driftCalibrationGoodWindows >=
+                        EtherCatDcTuning::DriftCalibrationGoodWindows)
+                    {
+                        const int64_t calibrationDivisor =
+                            (int64_t)EtherCatDcTuning::DriftCalibrationGoodWindows;
+
+                        driftBaselinePpb =
+                            driftCalibrationMedianSumPpb >= 0
+                            ? (driftCalibrationMedianSumPpb +
+                                calibrationDivisor / 2LL) /
+                            calibrationDivisor
+                            : (driftCalibrationMedianSumPpb -
+                                calibrationDivisor / 2LL) /
+                            calibrationDivisor;
+
+                        if (driftBaselinePpb <
+                            EtherCatDcTuning::RealFfMinimumDriftPpb)
+                        {
+                            driftBaselinePpb =
+                                EtherCatDcTuning::RealFfMinimumDriftPpb;
+                        }
+
+                        if (driftBaselinePpb >
+                            EtherCatDcTuning::RealFfMaximumDriftPpb)
+                        {
+                            driftBaselinePpb =
+                                EtherCatDcTuning::RealFfMaximumDriftPpb;
+                        }
+
+                        driftCalibrationLocked = true;
+                        driftCalibrationLockCount++;
+                        driftCalibrationLockedThisCycle = true;
+                    }
+                }
+                else
+                {
+                    driftCalibrationGoodWindows = 0;
+                    driftCalibrationMedianSumPpb = 0;
+                }
+
+                driftCalibrationPublish = true;
+            }
+        }
+    }
+
+    if (driftCalibrationLockedThisCycle)
+    {
+        realFfV0State = 0;
+        realFfV0ArmGood = 0;
+        realFfV0LastPhaseSeq = 0;
+        realFfV0DesiredPpb = driftBaselinePpb;
+        realFfV0AppliedPpb = driftBaselinePpb;
+        realFfV0LastStepPpb = 0;
+        realFfV0TripMask = 0;
+        realFfV0HoldGood = 0;
+        realFfV0HoldBad = 0;
+
+        phasePActV0State = 0;
+        phasePActV0ArmGood = 0;
+        phasePActV0HoldGood = 0;
+        phasePActV0OffsetNs = 0;
+        phasePActV0LastStepNs = 0;
+
+        qpcPhaseFfV2Initialized = false;
+        qpcPhaseFfV2State = 0;
+        qpcPhaseFfV2DesiredPpb = driftBaselinePpb;
+        qpcPhaseFfV2AppliedPpb = driftBaselinePpb;
+        qpcPhaseFfV2LastAppliedStepPpb = 0;
+        qpcPhaseFfV2LastObserverSequence = 0;
+        qpcPhaseFfV2WarmupGoodCount = 0;
+        qpcPhaseFfV2BadCount = 0;
+        qpcPhaseFfV2RecoveryGoodCount = 0;
+        qpcPhaseFfV2WindowSamples = 0;
+        qpcPhaseFfV2TargetDeltaWindowStartNs = 0;
+        qpcPhaseFfV2TargetDeltaWindowEndNs = 0;
+        qpcPhaseFfV2TrackCyclesWindow = 0;
+        qpcPhaseFfV2HoldCyclesWindow = 0;
+        qpcPhaseFfV2FallbackCyclesWindow = 0;
+        qpcPhaseFfV2StateSwitchesWindow = 0;
+
+        // 讓所有 residual observer 經由 Live-FF init generation 自動重新綁定。
+        qpcLiveFfInitialized = false;
+        qpcLiveFfHasPreviousMode = false;
+        qpcLiveFfWindowSamples = 0;
+        qpcLiveFfShadowWindowStartErrorNs = 0;
+        qpcLiveFfShadowWindowEndErrorNs = 0;
+        qpcLiveFfShadowWindowMinErrorNs = 0;
+        qpcLiveFfShadowWindowMaxErrorNs = 0;
+        qpcLiveFfTargetDeltaWindowStartNs = 0;
+        qpcLiveFfTargetDeltaWindowEndNs = 0;
+        qpcLiveFfTrustedCyclesWindow = 0;
+        qpcLiveFfFallbackCyclesWindow = 0;
+        qpcLiveFfModeSwitchesWindow = 0;
+    }
+
+    if (driftCalibrationPublish)
+    {
+        InterlockedIncrement(
+            &g_dcDriftCalibrationDiagSequence);
+
+        g_dcDriftCalibrationMode =
+            driftCalibrationMode;
+
+        g_dcDriftCalibrationState =
+            driftCalibrationMode == 1
+            ? 2L
+            : driftCalibrationLocked ? 1L : 0L;
+
+        g_dcDriftCalibrationCandidateGood =
+            driftCalibrationCandidateGood ? 1L : 0L;
+
+        g_dcDriftCalibrationGoodWindows =
+            (LONG)driftCalibrationGoodWindows;
+
+        g_dcDriftCalibrationRequiredWindows =
+            (LONG)EtherCatDcTuning::DriftCalibrationGoodWindows;
+
+        g_dcDriftCalibrationRobustSequence =
+            driftCalibrationRobustSequence;
+
+        g_dcDriftCalibrationRawPpb =
+            (LONGLONG)driftCalibrationRawPpb;
+
+        g_dcDriftCalibrationMedianPpb =
+            (LONGLONG)driftCalibrationMedianPpb;
+
+        g_dcDriftCalibrationMadPpb =
+            (LONGLONG)driftCalibrationMadPpb;
+
+        g_dcDriftCalibrationRawMedianDeviationPpb =
+            (LONGLONG)driftCalibrationRawMedianDeviationPpb;
+
+        g_dcDriftCalibrationBaselinePpb =
+            (LONGLONG)driftBaselinePpb;
+
+        g_dcDriftCalibrationLockCount =
+            (LONG)driftCalibrationLockCount;
+
+        MemoryBarrier();
+
+        InterlockedIncrement(
+            &g_dcDriftCalibrationDiagSequence);
+    }
+
+    // ---------------------------------------------------------------------
     // 正式控制參數集中區
     //
     // QPC_SCHEDULER_ASSUMED_DRIFT_PPB 是啟動、Trip 與觀測不可信時的安全基準。
     // Real FF 必須連續 3 個合格觀測窗才能 ACTIVE；ACTIVE 每窗最多走 10 ppb，
-    // 並限制在 -10000..-7800 ppb，避免單一估測異常直接改變週期。
+    // 並限制在 -12000..-7800 ppb，避免單一估測異常直接改變週期。
     // Phase-P 每次使用 wrapped phase error 的 1/8；小於 500 ns 不動作；
     // command、step、累積 offset 各有獨立飽和，防止相位迴路突跳。
     // ---------------------------------------------------------------------
     const int64_t QPC_SCHEDULER_ASSUMED_DRIFT_PPB =
-        -8300LL;
+        driftBaselinePpb;
 
-    const int64_t REAL_FF_V0_MIN_PPB = -10000LL; // 安全下限；更負代表目標週期更短。
-    const int64_t REAL_FF_V0_MAX_PPB = -7800LL;  // 安全上限；不可只為消除 Clamp 而放寬。
+    const int64_t REAL_FF_V0_MIN_PPB =
+        EtherCatDcTuning::RealFfMinimumDriftPpb;
+
+    const int64_t REAL_FF_V0_MAX_PPB =
+        EtherCatDcTuning::RealFfMaximumDriftPpb;
     const int64_t REAL_FF_V0_MAX_STEP_PPB = 10LL; // 每個約一秒觀測窗最大頻率變更。
     const uint32_t REAL_FF_V0_ARM_WINDOWS = 3U;   // 連續合格 3 窗才進入 ACTIVE。
     const uint32_t REAL_FF_V0_HOLD_RECOVERY_WINDOWS = 3U; // HOLD 連續合格 3 窗才恢復。
     const uint32_t REAL_FF_V0_HOLD_BAD_LIMIT = 5U; // HOLD 連續失敗 5 窗即 LATCHED。
 
-    const int64_t PHASE_P_ACT_CYCLE_NS = 250000LL; // PDO 週期；不可單獨調整。
+    const int64_t PHASE_P_ACT_CYCLE_NS =
+        EtherCatDcTuning::PdoCycleNs;
     const int64_t PHASE_P_ACT_DIVISOR = 8LL;       // P=1/8；值越小修正越強。
     const int64_t PHASE_P_ACT_MAX_COMMAND_NS = 5000LL; // 原始 P command 絕對限幅。
     const int64_t PHASE_P_ACT_MAX_STEP_NS = 250LL; // 每觀測窗實際 offset 最大變更量。
@@ -2167,10 +2482,22 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     if (!realFfClampSelfTestDone)
     {
         const int64_t rec[5] =
-        { -8750LL, -10044LL, -7600LL, -10000LL, -7800LL };
+        {
+            EtherCatDcTuning::SchedulerBootstrapDriftPpb,
+            EtherCatDcTuning::RealFfMinimumDriftPpb - 44LL,
+            EtherCatDcTuning::RealFfMaximumDriftPpb + 200LL,
+            EtherCatDcTuning::RealFfMinimumDriftPpb,
+            EtherCatDcTuning::RealFfMaximumDriftPpb
+        };
 
         const int64_t expectedDesired[5] =
-        { -8750LL, -10000LL, -7800LL, -10000LL, -7800LL };
+        {
+            EtherCatDcTuning::SchedulerBootstrapDriftPpb,
+            EtherCatDcTuning::RealFfMinimumDriftPpb,
+            EtherCatDcTuning::RealFfMaximumDriftPpb,
+            EtherCatDcTuning::RealFfMinimumDriftPpb,
+            EtherCatDcTuning::RealFfMaximumDriftPpb
+        };
 
         const bool expectedClamp[5] =
         { false, true, true, false, false };
@@ -2271,6 +2598,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         //   0x10=點數不是 16
         //   0x20=pair 數不是 120
         //   0x40=slope MAD > 150 ppb
+        //   0x80=啟動 Drift 尚未鎖定
         // 只有 mask=0 才能累積 ARM 或在 ACTIVE 中更新 drift。
         // -----------------------------------------------------------------
         LONG realPhaseSeq1 = g_qpcPhaseFfV2DiagSequence;
@@ -2281,7 +2609,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         LONG realPhasePoints = 0;
         LONG realPhasePairs = 0;
         LONGLONG realPhaseMad = 0;
-        LONGLONG realPhaseRecommended = -8300;
+        LONGLONG realPhaseRecommended = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
         bool realPhaseSnapshot = false;
 
         if (realPhaseSeq1 != 0 && !(realPhaseSeq1 & 1))
@@ -2320,6 +2648,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             if (realPhasePoints != 16) phaseReject |= 0x10;
             if (realPhasePairs != 120) phaseReject |= 0x20;
             if (realPhaseMad > 150) phaseReject |= 0x40;
+            if (!driftCalibrationLocked) phaseReject |= 0x80;
         }
 
         realFfV0PhaseRejectMask = phaseReject;
@@ -2329,7 +2658,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             g_ecatRxDiagCurrentConsecutiveTimeout != 0)
         {
             // ACTIVE/HOLD 期間只要看到連續 RX timeout 非零，立即永久 Trip 到
-            // 本次執行的固定 -8300 ppb fallback，避免錯誤時間樣本影響 FF。
+            // 退回本次啟動已鎖定的 Baseline，避免錯誤時間樣本影響 FF。
             realFfV0State = 4;
             realFfV0AppliedPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
             realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
@@ -2352,6 +2681,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             else if (realFfV0State == 0 || realFfV0State == 1)
             {
                 if (realPhaseGood &&
+                    driftCalibrationLocked &&
                     realFfV0OneShotHealthy &&
                     qpcSchedulerInitialized &&
                     g_ecatRxDiagCurrentConsecutiveTimeout == 0)
@@ -2449,8 +2779,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         // At 3 GHz:
         //     750000 counts
         //
-        // With frozen -8300 ppb:
-        //     749993.775 counts
+        // 實際修正由本次啟動 Baseline 或 Real FF Applied 值決定。
         // ---------------------------------------------------------
 
         uint64_t nominalPeriodCounts =
@@ -2582,10 +2911,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 0;
 
             qpcPhaseFfV2DesiredPpb =
-                -8300LL;
+                QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
 
             qpcPhaseFfV2AppliedPpb =
-                -8300LL;
+                QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
 
             qpcPhaseFfV2LastObserverSequence =
                 0;
@@ -3369,6 +3698,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
             bool phaseFfCandidateGood =
                 (
+                    driftCalibrationLocked &&
                     phaseFfObserverSnapshotValid &&
                     phaseFfObserverLocked != 0 &&
                     phaseFfPointAccepted != 0 &&
@@ -3917,7 +4247,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             // Existing raw error:
             //     errorNs = actual wake - DC-equivalent target
             //
-            // The current -8300 ppb target is intentionally untouched.
+            // The current calibrated baseline target is intentionally untouched.
             // This model only asks whether periodic 50 us coarse phase
             // advances could keep the virtual final margin bounded.
             // =============================================================
@@ -4434,7 +4764,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 // ---------------------------------------------------------
                 // Phase-P 正式控制器
                 //
-                // BaseErr 是 FF timeline 對 S4 DC 的未包絡誤差；ActualErr 再加上
+                // BaseErr 是 FF timeline 對 DC Reference 的未包絡誤差；ActualErr 再加上
                 // 已套用 offset。WrappedErr 映射到一個 250 us 週期的 ±125 us，
                 // 避免跨週期時把等價相位誤認為巨幅誤差。
                 // Gate 連續合格 3 窗後 ACTIVE；暫時不合格進 HOLD；Real FF Trip
@@ -7167,7 +7497,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         }
     }
     // =============================================================
-// QPC <-> S4 DC estimator 的 call 前時間戳；call 後再取一次，兩者中點
+// QPC <-> DC Reference estimator 的 call 前時間戳；call 後再取一次，兩者中點
 // 近似 DC_reference_time 被讀回的主站時刻，RTT 則用於樣本品質門檻。
 // =============================================================
 
@@ -7186,7 +7516,11 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 true;
         }
     }
-    if (Motor_Start_Index >= 0)
+    // DC Reference 已在 StartDcPdoRuntime() 啟動階段選定；即時路徑只讀一次索引。
+    const int dcReferenceSlaveIndex =
+        GetDcReferenceSlaveIndex();
+
+    if (dcReferenceSlaveIndex >= 0)
     {
         wkc =
             pMaster->ecx_LRW_FRMW(
@@ -7195,7 +7529,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 pMaster->m_IoMapSize,
                 pMaster->m_IoMap,
                 m_slaveInfo[
-                    Motor_Start_Index
+                    dcReferenceSlaveIndex
                 ].configAddr,
                 &pMaster->
                         DC_reference_time,
@@ -7244,7 +7578,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         wkc == pMaster->EXPECTED_WKC_PDO;
 
     const bool dcWkcValid =
-        Motor_Start_Index < 0 ||
+        dcReferenceSlaveIndex < 0 ||
         dcWkc > 0;
 
     const bool pdoCycleValid =
@@ -7264,7 +7598,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     }
 
     // =============================================================
-// QPC <-> S4 DC Frequency Estimator V1（約一秒視窗）
+// QPC <-> DC Reference Frequency Estimator V1（約一秒視窗）
 //
 // 固定 capture bias 會在 elapsed 差分中抵消，因此此處只比較長時間 slope/frequency。
 //
@@ -7433,7 +7767,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
     // =============================================================
-    // Frequency FF V2 - S4 DC phase 比較內部狀態（shadow）
+    // Frequency FF V2 - DC Reference phase 比較內部狀態（shadow）
     // =============================================================
 
     static bool
@@ -7485,7 +7819,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         0;
 
 
-    // Actual S4 DC elapsed span for each 4000-sample phase window.
+    // Actual DC Reference elapsed span for each 4000-sample phase window.
     static uint64_t
         qpcLiveFfDcPhaseWindowStartDcNs =
         0;
@@ -7496,7 +7830,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
     // =============================================================
-    // S4 DC Phase Residual Drift Observer V1（僅診斷）
+    // DC Reference Phase Residual Drift Observer V1（僅診斷）
     //
     // Ring=16；單窗需 0.5..1.5 s、RTT <=250 us、|residual|<=5000 ppb。
     // 至少 8 筆且 MAD<=1000 ppb 才 Locked。拒絕樣本只累加原因，不入 ring。
@@ -7574,7 +7908,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
             // =============================================================
-            // S4 DC Phase Residual Drift Observer V1A（僅診斷）
+            // DC Reference Phase Residual Drift Observer V1A（僅診斷）
             //
             // 每窗至少 3900 個有效 phase sample 才形成 point；保存 16 points，
             // 以最多 120 個 pair slopes 求 Theil-Sen。鎖定另要求至少 7 s 跨度、
@@ -7762,14 +8096,18 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             // =============================================================
                             // Trusted Drift V1 - Dry Run
                             //
-                            // The current -8300 ppb scheduler value is used ONLY as the
+                            // The calibrated scheduler baseline is used ONLY as the
                             // bootstrap safety reference. Trusted Drift still has no control
                             // authority in this revision.
                             // =============================================================
 
                             static int64_t
                                 qpcDcTrustedDriftPpb =
-                                -8300LL;
+                                EtherCatDcTuning::SchedulerBootstrapDriftPpb;
+
+                            static bool
+                                qpcDcTrustedCalibrationBound =
+                                false;
 
                             static bool
                                 qpcDcTrustedValid =
@@ -7889,12 +8227,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
                             static int64_t
                                 qpcDcTrustedLastTransitionTrustedPpb =
-                                -8300LL;
-
-
-                            const int64_t
-                                QPC_DC_TRUSTED_BOOTSTRAP_PPB =
-                                -8300LL;
+                                EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 
                             const uint32_t
                                 QPC_DC_TRUSTED_WARMUP_GOOD_WINDOWS =
@@ -7945,7 +8278,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             // =============================================================
 
                             if (pdoCycleValid &&
-                                Motor_Start_Index >= 0 &&
+                                dcReferenceSlaveIndex >= 0 &&
                                 qpcDcBeforeValid &&
                                 qpcDcAfterValid &&
                                 qpcFrequency > 0 &&
@@ -7997,7 +8330,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 // =========================================================
                                 // Trusted Live-FF DC Phase Predictor Dry Run V1
                                 //
-                                // Map BOTH scheduler targets into the SAME current S4 DC
+                                // Map BOTH scheduler targets into the SAME current DC Reference
                                 // coordinate system.
                                 //
                                 // TargetDc ~= DC_reference_time
@@ -8982,12 +9315,12 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
                                         // =====================================================
-                                        // S4 DC Phase Residual Drift Observer V1
+                                        // DC Reference Phase Residual Drift Observer V1
                                         //
                                         // Frequency error is inferred from the slope of the
-                                        // FIXED target's unwrapped S4 DC phase.
+                                        // FIXED target's unwrapped DC Reference phase.
                                         //
-                                        // Use the actual S4 DC elapsed time rather than assuming
+                                        // Use the actual DC Reference elapsed time rather than assuming
                                         // the 4000-sample window is exactly one second.
                                         // =====================================================
 
@@ -9328,7 +9661,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
                                                 const int64_t
                                                     RESIDUAL_FIXED_SCHEDULER_PPB =
-                                                    -8300LL;
+                                                    driftBaselinePpb;
 
 
                                                 int64_t residualRecommendedSchedulerPpb =
@@ -9482,7 +9815,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
                                                 // =====================================================
-                                                // S4 DC Phase Residual Drift Observer V1A
+                                                // DC Reference Phase Residual Drift Observer V1A
                                                 // Mean Phase + Theil-Sen Robust Long-Slope
                                                 //
                                                 // V1 remains above for comparison only.
@@ -9666,7 +9999,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                                 // Build all pair slopes.
                                                 //
                                                 // Ring storage order does not matter because each
-                                                // point carries its own absolute S4 DC timestamp.
+                                                // point carries its own absolute DC Reference timestamp.
                                                 // -------------------------------------------------
 
                                                 int64_t residualV1ASlopes[
@@ -9985,7 +10318,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
                                                         const int64_t
                                                             RESIDUAL_V1A_FIXED_SCHEDULER_PPB =
-                                                            -8300LL;
+                                                            driftBaselinePpb;
 
 
                                                         int64_t residualV1ARecommendedSchedulerPpb =
@@ -10518,7 +10851,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                     //
                                     // IMPORTANT:
                                     //     The result is diagnostic only.
-                                    //     The real scheduler still uses fixed -8300 ppb.
+                                    //     The real scheduler uses the startup baseline.
                                     // =====================================================
 
                                     if (windowValid)
@@ -10772,13 +11105,31 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                             1000000LL;
 
 
+                                        // Calibration 鎖定後只綁定一次新 Baseline；先前以
+                                        // Bootstrap 建立的 WARMUP/HOLD 狀態不得沿用。
+                                        if (driftCalibrationLocked &&
+                                            !qpcDcTrustedCalibrationBound)
+                                        {
+                                            qpcDcTrustedDriftPpb =
+                                                driftBaselinePpb;
+
+                                            qpcDcTrustedValid = false;
+                                            qpcDcTrustedState = 0;
+                                            qpcDcTrustedWarmupGoodCount = 0;
+                                            qpcDcTrustedBadCount = 0;
+                                            qpcDcTrustedRecoveryGoodCount = 0;
+                                            qpcDcTrustedLastTransitionTrustedPpb =
+                                                driftBaselinePpb;
+                                            qpcDcTrustedCalibrationBound = true;
+                                        }
+
                                         // =====================================================
                                         // Trusted Drift V1 - DRY RUN STATE MACHINE
                                         //
                                         // This layer intentionally treats the existing robust
                                         // median as a CANDIDATE, not automatically as truth.
                                         //
-                                        // The real scheduler remains fixed at -8300 ppb.
+                                        // The real scheduler uses the startup baseline.
                                         // =====================================================
 
                                         int64_t trustedCandidateDeviationPpb =
@@ -10805,6 +11156,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
                                         bool trustedCandidateGood =
                                             (
+                                                driftCalibrationLocked &&
                                                 robustCurrentAccepted &&
                                                 robustLocked &&
                                                 qpcDcRobustRingCount >=
@@ -10927,7 +11279,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                             // 0 = WARMUP
                                             //
                                             // Require a full robust buffer plus 8 consecutive
-                                            // clean windows near the known-safe -8300 baseline.
+                                            // clean windows near the locked startup baseline.
                                             // A startup local cluster around -5.x ppm therefore
                                             // cannot become trusted merely because MAD is small.
                                             // -------------------------------------------------
@@ -11879,7 +12231,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             // EtherCAT DC Estimator / Controller（目前啟用）
                             // =========================================================
 
-                            if (Motor_Start_Index >= 0)
+                            if (dcReferenceSlaveIndex >= 0)
                             {
                                 pMaster->wk_read =
                                     dcWkc;

@@ -88,6 +88,14 @@ namespace GCodeHandlers
         }
         break;
 
+        case 22:
+        case 23:
+        {
+
+            nc->CoordSys.SetStoredStrokeCheckMode(block.gCode,nc);
+        }
+        break;
+
         case 43:
         case 44:
         case 49:

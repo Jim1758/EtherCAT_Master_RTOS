@@ -15,12 +15,16 @@ void MotionCore::G53_Move(const std::vector<int>& axes, const std::vector<double
     double groupAccTime = 0.0;
     double groupDecTime = 0.0;
     double maxTimeNeeded = 0.0; // 紀錄跑最久的那軸需要幾秒
-    double sum_sq = 0.0;        // 3D Pulse 距離平方和
 
-    std::vector<double> targetPos_Pulse;
-    targetPos_Pulse.resize(axes.size());
+    // =========================================================
+    // 🌟 對齊完美架構：準備 Pulse 與 mm 雙軌計算
+    // =========================================================
+    double sum_sq_pulse = 0.0;  // 給底層大腦算虛擬脈衝用的
+    double sum_sq_mm = 0.0;     // 給精準空間牽制算法用的
 
-    // 🌟 1. 一視同仁地判斷預讀狀態 (雖然 G53 通常是 false，但統一架構最安全)
+    std::vector<double> targetPos_Pulse(axes.size());
+
+    // 🌟 1. 一視同仁地判斷預讀狀態 (雖然 G53 通常是獨立執行，但統一架構最安全)
     bool isLookAheadActive = (!m_Group.cmdQueue.empty() || !IsGroupDone());
 
     for (size_t i = 0; i < axes.size(); ++i) {
@@ -38,6 +42,7 @@ void MotionCore::G53_Move(const std::vector<int>& axes, const std::vector<double
         double lead = axis.finalLead;
         if (lead < 1e-6) lead = 1.0;
         double pulsePerUnit = axis.resolution_PPR / lead;
+
         double targetPulse = targetPos_mm[i] * pulsePerUnit;
 
         // =========================================================
@@ -50,16 +55,21 @@ void MotionCore::G53_Move(const std::vector<int>& axes, const std::vector<double
         }
 
         targetPos_Pulse[i] = targetPulse;
+
+        // 🌟 幾何距離雙計算 (精準防變形)
         double distancePulse = std::abs(targetPulse - startPulse);
-        sum_sq += (distancePulse * distancePulse);
+        double distance_mm = distancePulse / pulsePerUnit;
+
+        sum_sq_pulse += (distancePulse * distancePulse);
+        sum_sq_mm += (distance_mm * distance_mm);
 
         // =========================================================
         // 🌟 3. 極度重要：把這次的 G53 終點存起來，給未來的指令當起點！
         // =========================================================
         axis.lastQueuedPulse = targetPulse;
 
+        // 🌟 【神級修復】防止除以零的防呆寫法，讀取 G53 專屬極速
         double currentAxisMaxPPS = axis.G53_PPS;
-        // 修正你的筆誤：這裡應該是看 currentAxisMaxPPS 而不是 G00_PPS
         if (currentAxisMaxPPS > 1.0) {
             double timeNeeded = distancePulse / currentAxisMaxPPS;
             maxTimeNeeded = std::max<double>(maxTimeNeeded, timeNeeded);
@@ -71,25 +81,29 @@ void MotionCore::G53_Move(const std::vector<int>& axes, const std::vector<double
     if (groupDecTime < 0.001) groupDecTime = 0.2;
 
     // =========================================================
-    // 🌟 2. 算出最終群組速度 (PPS)
+    // 🌟 4. 算出最終群組速度 (PPS)
     // =========================================================
-    double totalDist_Pulse = std::sqrt(sum_sq);
-    double groupG53Vel_PPS = 1000.0; // 預設底速
+    double totalDist_Pulse = std::sqrt(sum_sq_pulse);
+    double totalDist_mm = std::sqrt(sum_sq_mm);
+    double groupG53Vel_PPS = 0.0;
 
-    // 將總 Pulse 距離 / 瓶頸時間 = 完美的群組 PPS 速度
+    // 💡 G53 通常以機台極限速度移動 (與 G00 類似)，以最慢軸牽制時間為主
     if (maxTimeNeeded > 0.0001) {
         groupG53Vel_PPS = totalDist_Pulse / maxTimeNeeded;
     }
 
     // =========================================================
-    // 🌟 3. 丟給 LineMove
+    // 🌟 5. 丟給 LineMove (動態決定準停與連續模式)
     // =========================================================
-    PathMode prevMode = GetGroupPathMode();
-    SetGroupPathMode(PathMode::EXACT_STOP);
+    // 配合你傳入的 mode，動態切換群組行為，不再死寫 EXACT_STOP
+    if (mode == BufferMode::ABORTING) {
+        SetGroupPathMode(PathMode::EXACT_STOP);
+    }
+    else {
+        SetGroupPathMode(PathMode::CONTINUOUS);
+    }
 
-    // 完美傳入 Pulse 陣列與計算好的 PPS 速度
-    LineMove(axes, targetPos_Pulse, groupG53Vel_PPS, groupAccTime, groupDecTime, BufferMode::ABORTING);
-
-   
+    // 🌟 【關鍵修正】把死寫的 BufferMode::ABORTING 換成上層傳進來的 mode
+    LineMove(axes, targetPos_Pulse, groupG53Vel_PPS, groupAccTime, groupDecTime, mode);
 }
 

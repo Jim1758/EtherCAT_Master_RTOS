@@ -454,6 +454,10 @@ namespace HMI_Bridge
 
         pShm->NC_Status.currentG20State= nc->CoordSys.isInchMode;
 
+        bool m_programmableTravelLimitEnabled = nc->CoordSys.m_programmableTravelLimitEnabled;
+        pShm->NC_Status.m_programmableTravelLimitEnabled = m_programmableTravelLimitEnabled;
+      
+
         if (pShm->NC_Command.reqChangeMode)//處理 OP 模式切換請求 (來自 NC_Command)
         {
             nc->ChangeMode(static_cast<NCOperationMode>(pShm->NC_Command.targetMode));

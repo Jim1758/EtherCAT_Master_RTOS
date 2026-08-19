@@ -349,6 +349,56 @@ struct AxisContext//軸參數與狀態
     double lastQueuedPulse = 0.0;
 
     int servoOffCounter = 0;
+
+
+
+    // 真實硬體極限 +OT / -OT。
+    bool hardLimitPositive = false;
+    bool hardLimitNegative = false;
+
+
+    // 第 1 組軟體行程 G22 / G23 再決定目前是否啟用
+    bool travelLimit1Enable = false;
+
+    double travelLimit1Positive_unit = 0.0;
+    double travelLimit1Negative_unit = 0.0;
+
+    double travelLimit1Positive_Pulse = 0.0;
+    double travelLimit1Negative_Pulse = 0.0;
+
+    bool travelLimit1PositiveActive = false;
+    bool travelLimit1NegativeActive = false;
+
+
+    // 第 2 組軟體行程 系統參數決定是否開啟
+    bool travelLimit2Enable = false;
+
+    double travelLimit2Positive_unit = 0.0;
+    double travelLimit2Negative_unit = 0.0;
+
+    double travelLimit2Positive_Pulse = 0.0;
+    double travelLimit2Negative_Pulse = 0.0;
+
+    bool travelLimit2PositiveActive = false;
+    bool travelLimit2NegativeActive = false;
+
+
+    // 第 3 組軟體行程 系統參數決定是否開啟
+    bool travelLimit3Enable = false;
+
+    double travelLimit3Positive_unit = 0.0;
+    double travelLimit3Negative_unit = 0.0;
+
+    double travelLimit3Positive_Pulse = 0.0;
+    double travelLimit3Negative_Pulse = 0.0;
+
+    bool travelLimit3PositiveActive = false;
+    bool travelLimit3NegativeActive = false;
+
+    
+    //總極限結果判斷此點是否碰到極限即可--------------------------------------
+    bool positiveTravelBlocked = false;
+    bool negativeTravelBlocked = false;
 };
 
 enum class InterpolationMode//插補群組的導航模式

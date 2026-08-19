@@ -189,64 +189,45 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
 
 
     // =========================================================
-    // DC Propagation Delay
+    // DC Propagation Delay AUTO
     //
-    // Measure
-    //      ↓
-    // Select Median
-    //      ↓
-    // Configure 0x0928
-    //      ↓
-    // ReadBack Verify
+    // 依 BuildIoMap() 的 Servo 實體順序建立最多 8 軸 delay table，
+    // 使用 10 次有效樣本 Median，成功後才逐站寫入並 ReadBack 0x0928。
+    // AUTO Gate 失敗時不寫入任何 propagation-delay 值。
     // =========================================================
 
-    uint32_t dcDelaySlave4 =
-        0;
-
-    uint32_t dcDelaySlave5 =
-        0;
-
-    uint32_t dcDelaySlave6 =
-        0;
-
+    DCAutoPropagationTable dcDelayTable = {};
 
     bool dcDelayMeasured =
-        MeasureDCPropagationDelay(
-            dcDelaySlave4,
-            dcDelaySlave5,
-            dcDelaySlave6);
-
+        MeasureDCPropagationDelayAuto(
+            dcDelayTable);
 
     if (dcDelayMeasured)
     {
         RtPrintf(
-            "[DC-INIT] Propagation Delay measured. "
-            "S4:%u S5:%u S6:%u ns\n",
+            "[DC-INIT-AUTO] Propagation Delay measured | "
+            "Reference:S%d | ServoCount:%d\n",
 
-            (unsigned int)dcDelaySlave4,
-            (unsigned int)dcDelaySlave5,
-            (unsigned int)dcDelaySlave6);
-
+            dcDelayTable.referenceSlaveIndex,
+            dcDelayTable.count);
 
         bool dcDelayConfigured =
-            ConfigureDCPropagationDelay(
-                dcDelaySlave4,
-                dcDelaySlave5,
-                dcDelaySlave6);
-
+            ConfigureDCPropagationDelayAuto(
+                dcDelayTable);
 
         if (!dcDelayConfigured)
         {
             RtPrintf(
-                "[DC-INIT] WARNING: "
+                "[DC-INIT-AUTO] WARNING: "
                 "Propagation Delay configuration FAILED.\n");
         }
     }
     else
     {
         RtPrintf(
-            "[DC-INIT] WARNING: "
-            "Propagation Delay measurement FAILED.\n");
+            "[DC-INIT-AUTO] WARNING: "
+            "Propagation Delay measurement FAILED. "
+            "0x0928 was not changed by AUTO.\n");
     }
 
 

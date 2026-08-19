@@ -294,4 +294,7 @@ public:
     int m_g66L = 1;             // 記住重複次數 (L)
     NCBlock m_g66Block;         // 記住 G66 當下夾帶的所有變數 (A, B, C...)
 
+
+
+   
 };

@@ -4,7 +4,7 @@
 #include <string>
 
 class NCManager;
-
+struct AxisContext;
 class CoordinateManager {
 public:
     CoordinateManager();
@@ -230,6 +230,153 @@ public:
     // 從外面收進來時呼叫 (畫面/G碼輸入 -> 轉為底層 mm)
     double ToInternalUnit(double externalValue, bool isRotaryAxis) const;
 
+
+
+
+    //G22 G23  軟體極限 及系統軟體極限-----------------------------------------------------
+
+// ==========================================================
+// Software Travel Limit / Stored Stroke Check
+//
+// 軟體行程保護歸 CoordinateManager 管理。
+//
+// 判斷基準：Machine Coordinate System (MCS)
+//
+// ----------------------------------------------------------
+// Travel Limit 1
+//
+// Parameter Enable
+// +
+// G22 / G23
+//
+// G22 = Enable
+// G23 = Disable
+//
+// ----------------------------------------------------------
+// Travel Limit 2
+//
+// Parameter Enable Only
+// 不受 G22 / G23 影響。
+//
+// ----------------------------------------------------------
+// Travel Limit 3
+//
+// Parameter Enable Only
+// 不受 G22 / G23 影響。
+//
+// ----------------------------------------------------------
+// Physical +OT / -OT 不屬於這裡。
+// Physical Limit 由 NCPLCManager / Motion Layer 處理。
+// ==========================================================
+
+
+// ----------------------------------------------------------
+// G22 / G23
+//
+// Group 04 Stored Stroke Check Mode
+//
+// gCode:
+//      22 = Enable
+//      23 = Disable
+//
+// nc:
+//      預留給後續 Alarm / System Variable / 狀態同步。
+// ----------------------------------------------------------
+    void SetStoredStrokeCheckMode(int gCode,NCManager* nc = nullptr);
+
+
+    // ----------------------------------------------------------
+    // 直接設定 Runtime State
+    //
+    // 主要提供：
+    //      Power-On Parameter
+    //      Reset 初始化
+    //
+    // 使用。
+    //
+    // false = G23 狀態
+    // true  = G22 狀態
+    // ----------------------------------------------------------
+    void SetProgrammableTravelLimitEnabled(bool enabled, NCManager* nc = nullptr);
+
+
+    // ----------------------------------------------------------
+    // 取得目前 G22 / G23 狀態
+    // ----------------------------------------------------------
+    bool IsProgrammableTravelLimitEnabled() const;
+
+
+    // ----------------------------------------------------------
+    // 更新單軸 Software Travel Limit 狀態
+    //
+    // 根據：
+    //      axis.currentActPos / Machine Position
+    //      Travel Limit 1 Parameter
+    //      Travel Limit 2 Parameter
+    //      Travel Limit 3 Parameter
+    //      G22 / G23 State
+    //
+    // 更新：
+    //
+    // travelLimit1PositiveActive
+    // travelLimit1NegativeActive
+    //
+    // travelLimit2PositiveActive
+    // travelLimit2NegativeActive
+    //
+    // travelLimit3PositiveActive
+    // travelLimit3NegativeActive
+    //
+    // 注意：
+    // 不處理 Physical +OT / -OT。
+    // 不產生 Alarm。
+    // 不直接停止 Motion。
+    // ----------------------------------------------------------
+    void UpdateSoftwareTravelLimitState( AxisContext& axis) const;
+
+
+    // ----------------------------------------------------------
+    // Automatic Target Pre-Check
+    //
+    // 給未來：
+    //      G00
+    //      G01
+    //      MDI
+    //      MEMORY
+    //
+    // 在運動真正開始以前先判斷 Target 是否合法。
+    //
+    // targetMCS:
+    //
+    //      Machine Coordinate
+    //      Linear Axis = mm
+    //      Rotary Axis = degree
+    //
+    // true  = Target 合法
+    // false = Target 超出啟用中的 Software Travel Limit
+    // ----------------------------------------------------------
+    bool IsTargetWithinSoftwareTravelLimit( const AxisContext& axis,  double targetMCS) const;
+
+
+    // ----------------------------------------------------------
+    // Manual Direction Permission
+    //
+    // 只判斷 Software Travel Limit。
+    //
+    // Physical +OT / -OT 之後再與這個結果做 OR。
+    //
+    // 例如：
+    //
+    // 已到達 Software +Limit
+    //
+    //      CanMoveSoftwarePositive() = false
+    //      CanMoveSoftwareNegative() = true
+    //
+    // 所以 JOG 可以反方向離開。
+    // ----------------------------------------------------------
+    bool CanMoveSoftwarePositive( const AxisContext& axis) const;
+    bool CanMoveSoftwareNegative(const AxisContext& axis) const;
+
     // ==========================================================
  // Manual Frame
  //
@@ -279,7 +426,7 @@ public:
 
 
     // ----------------------------------------------------------
-    // 個別設定
+    // 各別設定
     // ----------------------------------------------------------
 
     void SetManualFrameYaw( double yawDeg);
@@ -309,6 +456,22 @@ public:
 
     void TransformManualVector(const double* manualVector,double* machineVector) const;
 
+
+    // ==========================================================
+// Software Travel Limit Modal State
+// ==========================================================
+//
+// false = G23
+//         Programmable Travel Limit 1 OFF
+//
+// true  = G22
+//         Programmable Travel Limit 1 ON
+//
+// Power-On 預設先使用 G23。
+// 後續再接 Parameter 決定開機是否直接進入 G22。
+// ==========================================================
+
+    bool m_programmableTravelLimitEnabled = false;
 private:
     // 底層輔助函式：負責讀寫 8 軸二維陣列，並確保原子寫入防護
     void SaveTableToFile(const std::string& filename, const std::vector<std::vector<double>>& table);
@@ -322,4 +485,6 @@ private:
     double m_manualFrameYawDeg =0.0;
     double m_manualFramePitchDeg = 0.0;
     double m_manualFrameRollDeg =0.0;
+
+
 };

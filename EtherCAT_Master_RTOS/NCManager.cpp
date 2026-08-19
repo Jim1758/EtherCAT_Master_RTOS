@@ -660,6 +660,7 @@ void NCManager::ProcessExecutionEngine()
                     block.gCode == 0 || block.gCode == 12 || block.gCode == 4 ||
                     block.gCode == 7 || 
                     block.gCode == 20 || block.gCode == 21 ||
+                    block.gCode == 22 || block.gCode == 23 ||
                     block.gCode == 28 || block.gCode == 30 ||
                     block.gCode == 32 || block.gCode == 53 || block.gCode == 161 ||
                     block.gCode == 65 || block.gCode == 66 || block.gCode == 67 || block.gCode == 92 ||
@@ -950,6 +951,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
             break;
         case 90: case 91:case 92:
         case 20: case 21:
+        case 22: case 23:
         case 43: case 44: case 49:
         case 17: case 18:case 19:
         case 65:  case 66: case 67:

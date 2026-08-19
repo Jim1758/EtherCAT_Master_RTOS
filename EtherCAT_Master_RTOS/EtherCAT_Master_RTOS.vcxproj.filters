@@ -91,6 +91,30 @@
     <Filter Include="Source Files\EtherCAT_Master\PLC">
       <UniqueIdentifier>{ab1ebd9b-ad82-4496-9e3a-6a679186233f}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\NC\PLC">
+      <UniqueIdentifier>{2a62dd9a-452c-446d-b5cc-4b63c1ccde96}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NC\PLC">
+      <UniqueIdentifier>{175d49f4-3858-4aaa-9a3f-0c21319a3e13}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NC\Macro">
+      <UniqueIdentifier>{fe16f565-345b-4fd9-bd08-fee615878ed4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\NC\Macro">
+      <UniqueIdentifier>{efcff09c-27a8-410c-b08c-55a8708631d9}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\NC\NC">
+      <UniqueIdentifier>{1342f76f-5783-4b89-a57e-e5aa42c4c130}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NC\NC">
+      <UniqueIdentifier>{71a38832-9b80-4b39-ba4b-c30bc3483399}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NC\Coordinate">
+      <UniqueIdentifier>{0cab1bf3-22c6-42fe-aa76-30a4779307ff}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\NC\Coordinate">
+      <UniqueIdentifier>{7ad4bc7e-2b5b-47b9-8297-2a63580b0e2b}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
@@ -135,19 +159,7 @@
     <ClCompile Include="EtherCAT_Function.cpp">
       <Filter>Source Files\EtherCAT_Master\EtherCAT_Function</Filter>
     </ClCompile>
-    <ClCompile Include="NCManager.cpp">
-      <Filter>Source Files\NC</Filter>
-    </ClCompile>
-    <ClCompile Include="MacroEngine.cpp">
-      <Filter>Source Files\NC</Filter>
-    </ClCompile>
-    <ClCompile Include="MacroParser.cpp">
-      <Filter>Source Files\NC</Filter>
-    </ClCompile>
     <ClCompile Include="GCodeParser.cpp">
-      <Filter>Source Files\NC</Filter>
-    </ClCompile>
-    <ClCompile Include="CoordinateManager.cpp">
       <Filter>Source Files\NC</Filter>
     </ClCompile>
     <ClCompile Include="AlarmManager.cpp">
@@ -213,17 +225,8 @@
     <ClCompile Include="MotionCore_G161.cpp">
       <Filter>Source Files\Motion\MotionCore_GCode</Filter>
     </ClCompile>
-    <ClCompile Include="NCManager_SysVars.cpp">
-      <Filter>Source Files\NC</Filter>
-    </ClCompile>
     <ClCompile Include="PLCManager.cpp">
       <Filter>Source Files\PLC</Filter>
-    </ClCompile>
-    <ClCompile Include="NCManager_PLCSync.cpp">
-      <Filter>Source Files\NC</Filter>
-    </ClCompile>
-    <ClCompile Include="NCPLCManager.cpp">
-      <Filter>Source Files\NC</Filter>
     </ClCompile>
     <ClCompile Include="EtherCatMaster_DC_Diagnostics.cpp">
       <Filter>Source Files\EtherCAT_Master\DC</Filter>
@@ -239,6 +242,33 @@
     </ClCompile>
     <ClCompile Include="EtherCatMaster_PLC_Runtime.cpp">
       <Filter>Source Files\EtherCAT_Master\PLC</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_DC_Topology.cpp">
+      <Filter>Source Files\EtherCAT_Master\DC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_PLCSync.cpp">
+      <Filter>Source Files\NC\PLC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPLCManager.cpp">
+      <Filter>Source Files\NC\PLC</Filter>
+    </ClCompile>
+    <ClCompile Include="MacroEngine.cpp">
+      <Filter>Source Files\NC\Macro</Filter>
+    </ClCompile>
+    <ClCompile Include="MacroParser.cpp">
+      <Filter>Source Files\NC\Macro</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_SysVars.cpp">
+      <Filter>Source Files\NC\Macro</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="CoordinateManager.cpp">
+      <Filter>Source Files\NC\Coordinate</Filter>
+    </ClCompile>
+    <ClCompile Include="CoordinateManager_TravelLimit.cpp">
+      <Filter>Source Files\NC\Coordinate</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -284,21 +314,6 @@
     <ClInclude Include="tinyxml2.h">
       <Filter>Header Files\Function</Filter>
     </ClInclude>
-    <ClInclude Include="NCManager.h">
-      <Filter>Header Files\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NC_Types.h">
-      <Filter>Header Files\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="CoordinateManager.h">
-      <Filter>Header Files\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="MacroEngine.h">
-      <Filter>Header Files\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="MacroParser.h">
-      <Filter>Header Files\NC</Filter>
-    </ClInclude>
     <ClInclude Include="GCodeParser.h">
       <Filter>Header Files\NC</Filter>
     </ClInclude>
@@ -323,18 +338,42 @@
     <ClInclude Include="PLCManager.h">
       <Filter>Header Files\PLC</Filter>
     </ClInclude>
-    <ClInclude Include="NCPLCMap.h">
-      <Filter>Header Files\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCPLCManager.h">
-      <Filter>Header Files\NC</Filter>
-    </ClInclude>
     <ClInclude Include="EtherCatMaster_DC_Internal.h">
       <Filter>Header Files\EtherCAT_Master\DC</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatMaster_DC_Topology.h">
+      <Filter>Header Files\EtherCAT_Master\DC</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatMaster_DC_Tuning.h">
+      <Filter>Header Files\EtherCAT_Master\DC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPLCManager.h">
+      <Filter>Header Files\NC\PLC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPLCMap.h">
+      <Filter>Header Files\NC\PLC</Filter>
+    </ClInclude>
+    <ClInclude Include="MacroEngine.h">
+      <Filter>Header Files\NC\Macro</Filter>
+    </ClInclude>
+    <ClInclude Include="MacroParser.h">
+      <Filter>Header Files\NC\Macro</Filter>
+    </ClInclude>
+    <ClInclude Include="NC_Types.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCManager.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="CoordinateManager.h">
+      <Filter>Header Files\NC\Coordinate</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="DC同步_相關設定說明.txt">
+      <Filter>Source Files\EtherCAT_Master\DC</Filter>
+    </Text>
+    <Text Include="DC同步流程.txt">
       <Filter>Source Files\EtherCAT_Master\DC</Filter>
     </Text>
   </ItemGroup>

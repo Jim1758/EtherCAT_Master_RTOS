@@ -100,6 +100,8 @@
     <ClInclude Include="EtherCatMailbox.h" />
     <ClInclude Include="EtherCatMaster.h" />
     <ClInclude Include="EtherCatMaster_DC_Internal.h" />
+    <ClInclude Include="EtherCatMaster_DC_Topology.h" />
+    <ClInclude Include="EtherCatMaster_DC_Tuning.h" />
     <ClInclude Include="EtherCatPdo.h" />
     <ClInclude Include="EtherCatServo.h" />
     <ClInclude Include="EtherCatTypes.h" />
@@ -127,11 +129,13 @@
     <ClCompile Include="CompensationEngine.cpp" />
     <ClCompile Include="ConfigReader.cpp" />
     <ClCompile Include="CoordinateManager.cpp" />
+    <ClCompile Include="CoordinateManager_TravelLimit.cpp" />
     <ClCompile Include="EtherCatEni.cpp" />
     <ClCompile Include="EtherCatMaster.cpp" />
     <ClCompile Include="EtherCatMaster_DC_Diagnostics.cpp" />
     <ClCompile Include="EtherCatMaster_DC_Runtime.cpp" />
     <ClCompile Include="EtherCatMaster_DC_Startup.cpp" />
+    <ClCompile Include="EtherCatMaster_DC_Topology.cpp" />
     <ClCompile Include="EtherCatMaster_PLC_Runtime.cpp" />
     <ClCompile Include="EtherCatMaster_PLC_Startup.cpp" />
     <ClCompile Include="EtherCAT_Function.cpp" />
@@ -175,6 +179,7 @@
   </ItemGroup>
   <ItemGroup>
     <Text Include="DC同步_相關設定說明.txt" />
+    <Text Include="DC同步流程.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Import Project="$(RTX64Common)\DebuggerExtensions\IntervalZero.targets" Condition="exists('$(RTX64Common)\DebuggerExtensions\IntervalZero.targets')" />

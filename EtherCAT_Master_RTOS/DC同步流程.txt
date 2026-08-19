@@ -1,0 +1,246 @@
+﻿EtherCAT 主站與從站 DC AUTO 同步流程
+更新日期：2026-08-19
+
+目前程式的 DC 同步可以分成「啟動配置」與「Runtime 維持同步」兩個階段。
+
+============================================================
+一、啟動配置階段
+============================================================
+
+1. 掃描 EtherCAT 從站
+
+主站載入 ENI，掃描所有從站並建立 I/O Mapping。
+BuildIoMap() 會建立 m_ServoList，記錄目前有哪些伺服及其實體 Slave Index。
+
+因此軸數或馬達所在站號改變時，不需要再把 S4、S5、S6 寫死在 DC 程式內。
+目前 AUTO V1 支援 1～8 台伺服。
+
+2. 自動選擇 DC Reference Clock
+
+SystemConfig.txt：
+
+DC_Reference_Mode=AUTO
+DC_Reference_Slave_Index=-1
+
+AUTO 會依 m_ServoList 掃描伺服候選站。
+候選站必須能讀取 0x0910 DC System Time，且 WKC>0、DC Time 不為 0。
+第一台通過驗證的伺服會成為 DC Reference。
+
+目前實機結果：
+
+S4：DC Reference
+S5、S6：DC Follower
+
+正常 LOG：
+[DC-REFERENCE] SELECTED | Mode:AUTO | SlaveIndex:4 | ... | WKC:1
+
+3. 驗證 AUTO 伺服拓撲
+
+程式依實體 Slave Index 排序 Servo：
+
+S4 -> S5 -> S6
+
+AUTO V1 要求：
+
+- Servo 數量為 1～8 台。
+- Servo Index 必須連續。
+- DC Reference 必須是 Servo 鏈第一台。
+- Servo 鏈必須是 P0/P1 線型連接。
+- 不可在 Servo 中間插入非 Servo 從站。
+- 非 Servo 從站可以位於整段 Servo 鏈之前或之後。
+
+不符合條件時會安全停止，不寫入 0x0928。
+
+4. 自動量測 Propagation Delay
+
+主站觸發並讀取各伺服的 DC Port Timestamp 0x0900。
+總共量測 10 次，至少需要 5 次有效樣本，最後使用 Median 作為正式值。
+
+計算方式：
+
+- 第一台 Reference Delay 固定為 0。
+- 比較相鄰 Servo 的 Downstream Round Trip。
+- 相鄰 Round Trip 差值除以 2，得到 Link Delay。
+- Link Delay 逐站累加，得到每台 Servo 相對於 Reference 的 Propagation Delay。
+
+目前實機結果：
+
+S4：0 ns
+S5：600 ns
+S6：1220 ns
+ValidSamples：10/10
+Result：PASS
+
+不同次啟動可能出現約 20 ns 的小幅差異，例如 600/1220 或 620/1240。
+這屬於 Timestamp 量化與量測抖動，重點是樣本分布穩定且 Median 合理。
+
+量測結果中的 Write0928:NO 代表本階段只計算、不寫入。
+
+5. 寫入並驗證 0x0928
+
+主站執行三個步驟：
+
+PREFLIGHT：讀取並保存每台 Servo 原本的 0x0928。
+WRITE：寫入新的 Propagation Delay。
+READBACK：重新讀取並比對 Expected 與 Actual。
+
+正常 LOG：
+
+[DC-CONFIG-AUTO] WRITE ... WKC:1
+[DC-CONFIG-AUTO] READBACK ... Match:YES
+[DC-CONFIG-AUTO-RESULT] ... Result:PASS
+
+若任何 WRITE 或 READBACK 失敗，程式會執行 ROLLBACK，回復原本的 0x0928。
+
+6. 設定從站 Sync0
+
+目前正式設定：
+
+DC Cycle：250000 ns，等於 250 us / 4 kHz
+Sync0 Shift：125000 ns
+
+S4、S5、S6 依同一套 EtherCAT DC 時間軸產生 Sync0。
+Propagation Delay 已寫入各 Servo，因此各站可以補償 Frame 傳播時間差。
+
+7. 建立 Master CLOCK_2 與 DC Reference 的時間映射
+
+主站連續讀取 DC Reference 的 0x0910 共 8 次。
+每次同時記錄 RTX64 CLOCK_2 的送出與返回時間，計算 RTT。
+程式選擇 RTT 最短的有效樣本，估算：
+
+RTX64 CLOCK_2 Master Time
+        <->
+EtherCAT DC Reference Time
+
+這一步取得兩套絕對時鐘的 Offset 與方向。
+Offset 數字很大是正常的，因為兩套 Clock Epoch 不同；它不是瞬間相位誤差。
+
+8. 對齊第一個 PDO One-Shot Timer
+
+主站找出未來的 DC Phase 0：
+
+TargetDC % 250000 ns = 0
+
+再把 TargetDC 轉換成 RTX64 CLOCK_2 絕對時間，使用 RtSetTimer() 啟動正式 PDO Timer。
+
+因此第一個正式週期的設計為：
+
+PDO Send Phase：0 ns
+Servo Sync0：125000 ns
+
+也就是主站先在 DC Phase 0 傳送 PDO，伺服約在 125 us 後的 Sync0 使用該筆資料。
+
+============================================================
+二、Runtime 維持同步階段
+============================================================
+
+正式運行後，每 250 us 執行一次：
+
+1. One-Shot Timer 喚醒 PDO Handler。
+2. 主站傳送 LRW PDO。
+3. 主站執行 FRMW，維持 EtherCAT DC 從站時間關係。
+4. S5、S6 持續跟隨 S4 DC Reference。
+5. 主站監看 DC Reference Phase。
+6. Drift Observer 估算 CLOCK_2 與 DC 的長期頻率差。
+7. Real FF 修正長期 Frequency Drift。
+8. Phase-P 修正剩餘 ActualErr。
+9. One-Shot Timer 重新安排下一個 250 us 週期。
+
+Runtime 狀態通常依序為：
+
+WARMUP
+-> LOCKED
+-> WAIT / PhaseGood:NO
+-> TRACK
+-> ACTIVE / PhaseGood:YES
+
+啟動初期看到 WAIT、PhaseGood:NO、RESULT:CHECK 是正常的。
+必須等待 Observer 累積足夠有效視窗，不能只看啟動前幾秒就判定失敗。
+
+============================================================
+三、同步成功的判斷方式
+============================================================
+
+AUTO 啟動配置必須看到：
+
+[DC-DELAY-AUTO-RESULT] Result:PASS
+[DC-CONFIG-AUTO-RESULT] Result:PASS
+[DC-TOPOLOGY-AUTO] ... Result:PASS
+
+Runtime 穩定狀態應看到：
+
+Drift:LOCKED
+ACTIVE
+PhaseGood:YES
+ActualErr:NEAR_ZERO:YES
+OffsetSat:NO
+TripMask:0x00
+Recover:0/Skip:0
+Recent_Timeout:0
+WKC:13/7
+RESULT:STABLE
+
+目前實機已確認後續進入 ACTIVE、PhaseGood:YES，表示 AUTO 配置完成後，
+Master 排程也成功對齊 DC Reference 的時間軸。
+
+============================================================
+四、主站與從站「同步」的正確意思
+============================================================
+
+EtherCAT DC 的核心關係是：
+
+S5、S6 跟隨 S4 DC Reference Clock。
+
+RTX64 主站本身不會變成 EtherCAT DC Slave。
+主站是透過讀取 S4 的 DC Time，建立 CLOCK_2 與 S4 DC 的映射，
+再調整 PDO One-Shot 排程，使 PDO 傳送相位長期對齊 S4 的 DC 時間軸。
+
+因此目前完成的是：
+
+從站之間：由 EtherCAT DC 同步。
+主站與從站：由 CLOCK_2/DC Mapping、Real FF 與 Phase-P 對齊排程。
+
+這就是目前程式所實現的「主站排程與從站 DC 同步」。
+
+============================================================
+五、配置改變時的適用條件
+============================================================
+
+以下情況可以自動處理：
+
+- 馬達變成第一站。
+- 馬達前面有其他非 Servo 從站。
+- Servo 軸數在 1～8 軸之間改變。
+- Servo Slave Index 改變。
+- Servo 後面增加其他非 Servo 從站。
+
+前提是：
+
+- ENI 與實際連線一致。
+- BuildIoMap() 能正確建立 m_ServoList。
+- Servo 在實體 Slave Index 上保持連續。
+- Servo 鏈為 P0/P1 線型結構。
+- AUTO 選到的 Reference 是 Servo 鏈第一台。
+
+若 Servo 中間插入 I/O、Servo 不連續或出現分支，AUTO V1 會回報 CHECK/FAILED，
+不會勉強計算或寫入錯誤的 0x0928。
+
+============================================================
+六、目前完成狀態
+============================================================
+
+已完成：
+
+- DC Reference AUTO。
+- Servo Order AUTO。
+- 1～8 軸資料結構。
+- Propagation Delay 自動量測。
+- 10 次取樣與 Median。
+- 0x0928 PREFLIGHT／WRITE／READBACK。
+- 寫入失敗 Rollback。
+- AUTO Topology Dry-Run。
+- Master CLOCK_2 對齊 DC Reference。
+- Runtime Drift LOCKED、ACTIVE、PhaseGood:YES。
+- WKC、RX Timeout、Recover、TripMask 診斷。
+
+目前 AUTO 功能已完成並通過三軸實機測試，下一階段只需進行長時間穩定性驗證。

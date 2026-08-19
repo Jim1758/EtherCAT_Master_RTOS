@@ -1,23 +1,32 @@
 ﻿#include "EtherCatMaster.h"
 #include "EtherCatMaster_DC_Internal.h"
+#include "EtherCatMaster_DC_Topology.h"
+#include "EtherCatMaster_DC_Tuning.h"
+#include "ConfigReader.h"
 #include "GlobalConfig.h"
 #include <windows.h>
 #include <rtapi.h>
 #include <rtssapi.h>
 #include <stdio.h>
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <string>
 
 // ============================================================================
 // EtherCatMaster_DC_Startup.cpp
-// EtherCAT DC 啟動與 PDO One-Shot 建立流程 RC1.4（Startup Probe 開關版）
+// EtherCAT DC 啟動與 PDO One-Shot 建立流程 RC1.7 + AUTO Topology Dry-Run V1
 //
 // 本檔責任：
 //   1. 啟動時確認 RTX64 HAL period counts 回到系統 base 值。
-//   2. 用隔離的 disposable timer 驗證 coarse one-shot + QPC fine wait 能力。
-//   3. 建立真正 Priority 80 PDO timer，並先做同一 timer 的一次 warm-up。
-//   4. 從 DC Reference（目前 S4／Motor_Start_Index）讀取 0x0910 System Time。
-//   5. 以最低 RTT 樣本估算 CLOCK_2 Master time 與 EtherCAT DC time 的 offset。
-//   6. 找出未來的 DC phase 0 目標，換算成 CLOCK_2 absolute expiration 後啟動 PDO。
-//   7. 若 DC 量測或 absolute arm 失敗，以 250 us relative one-shot 安全啟動。
+//   2. 依 AUTO／FIXED 規則選擇獨立 DC Reference，讀取其 0x0910 System Time。
+//   3. 唯讀檢查 AUTO Servo 順序、DC 能力、Port Link 與既有 0x0928。
+//   4. 讀取 AUTO／FIXED Drift 設定，於正式 timer 前發布唯讀設定快照。
+//   5. 用隔離的 disposable timer 驗證 coarse one-shot + QPC fine wait 能力。
+//   6. 建立真正 Priority 80 PDO timer，並先做同一 timer 的一次 warm-up。
+//   7. 以最低 RTT 樣本估算 CLOCK_2 Master time 與 EtherCAT DC time 的 offset。
+//   8. 找出未來的 DC phase 0 目標，換算成 CLOCK_2 absolute expiration 後啟動 PDO。
+//   9. 若 DC 量測或 absolute arm 失敗，以 250 us relative one-shot 安全啟動。
 //
 // 啟動完成後的責任分工：
 //   - 本檔只負責建立／warm-up／第一次 arm。
@@ -72,6 +81,113 @@
 // ============================================================================
 
 // ============================================================================
+// 啟動 Drift 模式
+//
+// SystemConfig.txt：
+//   DC_Drift_Mode=AUTO
+//   DC_Drift_Fixed_Ppb=-9500
+//
+// AUTO 會在 Runtime 以 Robust Drift 的連續合格視窗決定本次啟動 Baseline。
+// FIXED 只供比對或特殊機台使用，數值仍必須位於 Real FF 安全範圍。
+// ============================================================================
+
+static std::string ToUpperDcDriftMode(
+    std::string value)
+{
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char ch)
+        {
+            return (char)std::toupper(ch);
+        });
+
+    return value;
+}
+
+static void LoadDcDriftCalibrationConfig()
+{
+    const std::string configPath =
+        GlobalConfig::GetInstance().BaseDataDir +
+        "SystemConfig.txt";
+
+    std::string mode =
+        ToUpperDcDriftMode(
+            ConfigUtil::ReadConfigString(
+                configPath,
+                "DC_Drift_Mode",
+                "AUTO"));
+
+    int64_t fixedPpb =
+        (int64_t)ConfigUtil::ReadParam(
+            configPath,
+            "DC_Drift_Fixed_Ppb",
+            (double)EtherCatDcTuning::SchedulerBootstrapDriftPpb);
+
+    LONG configuredMode = 0;
+
+    if (mode == "FIXED")
+    {
+        if (fixedPpb >= EtherCatDcTuning::RealFfMinimumDriftPpb &&
+            fixedPpb <= EtherCatDcTuning::RealFfMaximumDriftPpb)
+        {
+            configuredMode = 1;
+        }
+        else
+        {
+            RtPrintf(
+                "[DC-DRIFT-CONFIG] WARNING | "
+                "Fixed:%+lld ppb outside range:%+lld..%+lld | "
+                "Using AUTO.\n",
+                (long long)fixedPpb,
+                (long long)EtherCatDcTuning::RealFfMinimumDriftPpb,
+                (long long)EtherCatDcTuning::RealFfMaximumDriftPpb);
+
+            fixedPpb =
+                EtherCatDcTuning::SchedulerBootstrapDriftPpb;
+        }
+    }
+    else if (mode != "AUTO")
+    {
+        RtPrintf(
+            "[DC-DRIFT-CONFIG] WARNING | "
+            "Unknown mode:%s | Using AUTO.\n",
+            mode.c_str());
+    }
+
+    g_dcDriftConfiguredFixedPpb =
+        (LONGLONG)fixedPpb;
+
+    g_dcDriftConfiguredMode =
+        configuredMode;
+
+    MemoryBarrier();
+
+    InterlockedExchange(
+        &g_dcDriftConfigReady,
+        1L);
+
+    RtPrintf(
+        "[DC-DRIFT-CONFIG] "
+        "Mode:%s | "
+        "Bootstrap:%+lld ppb | "
+        "Fixed:%+lld ppb | "
+        "Range:%+lld..%+lld ppb | "
+        "GoodWindows:%lu | "
+        "MADMax:%lld ppb | "
+        "RawMedianMax:%lld ppb\n",
+        configuredMode == 1 ? "FIXED" : "AUTO",
+        (long long)EtherCatDcTuning::SchedulerBootstrapDriftPpb,
+        (long long)fixedPpb,
+        (long long)EtherCatDcTuning::RealFfMinimumDriftPpb,
+        (long long)EtherCatDcTuning::RealFfMaximumDriftPpb,
+        (unsigned long)EtherCatDcTuning::DriftCalibrationGoodWindows,
+        (long long)EtherCatDcTuning::DriftCalibrationMaximumMadPpb,
+        (long long)EtherCatDcTuning::DriftCalibrationMaximumRawMedianDeviationPpb);
+}
+
+// ============================================================================
 // Startup Probe 總開關
 //
 // true ：執行約一秒的 Coarse + Fine QPC 排程診斷，並輸出
@@ -81,7 +197,7 @@
 // 此開關只控制啟動診斷，不會關閉：
 //   - 正式 Priority 80 PDO Timer。
 //   - [PDO-ONESHOT-WARMUP] 正式 timer warm-up。
-//   - S4 DC 取樣、absolute DC Alignment 與 relative fallback。
+//   - Selected DC Reference 取樣、absolute DC Alignment 與 relative fallback。
 //
 // 建議：調機／正式版驗收設為 true；正式量產且已完成驗收後可設為 false。
 // ============================================================================
@@ -897,15 +1013,15 @@ WarmedCoarseFineQpcSchedulerProbeHandler(
     }
 }
 
-
-
 int EtherCatMaster::StartDcPdoRuntime()
 {
     // ========================================================================
     // DC/PDO 啟動總入口
     //
-    // 執行順序：HAL base recovery -> disposable QPC probe -> 建立真正 PDO timer
-    // -> 同 timer warm-up -> S4 DC 對齊 -> absolute arm；失敗則 relative fallback。
+    // 執行順序：HAL base recovery -> 選擇 DC Reference -> 讀取 Drift 設定
+    // -> disposable QPC probe -> 建立真正 PDO timer -> 同 timer warm-up
+    // -> DC 對齊 -> absolute arm；
+    // absolute 啟動失敗時改用 relative fallback。
     // 本函式由非即時啟動執行緒呼叫，因此允許 RtPrintf 與 bounded RtSleep 等待。
     // ========================================================================
     HANDLE hTimer_PDO = NULL;
@@ -994,6 +1110,24 @@ int EtherCatMaster::StartDcPdoRuntime()
                 GetLastError());
         }
     }
+
+    // ========================================================================
+    // Step 1B：選擇獨立 DC Reference
+    //
+    // AUTO 依 m_ServoList 實體順序驗證 0x0910；FIXED 使用 SystemConfig 指定站。
+    // 結果在正式 PDO timer 建立前固定，Runtime 只讀取索引，不在 4 kHz 重新掃描。
+    // 選擇失敗時保留 -1，後續退回普通 LRW 與 relative PDO timer。
+    // ========================================================================
+    ResolveDcReferenceSlave(
+        this);
+
+    // AUTO Topology V1 僅做啟動期 Dry-Run：讀取順序、0x0110、0x0910、0x0928
+    // 並輸出驗證結果，不寫任何從站暫存器，也不影響失敗時的既有啟動流程。
+    DiagnoseDcAutoTopologyDryRun(
+        this);
+
+    // Drift 設定必須在建立正式 PDO timer 前固定；Runtime 只讀取記憶體快照。
+    LoadDcDriftCalibrationConfig();
 
     // ============================================================
     // Step 2：RTX64 Warmed Coarse + Fine QPC Scheduler Probe V6
@@ -1907,7 +2041,10 @@ int EtherCatMaster::StartDcPdoRuntime()
     //    避免直接做 signed subtraction 造成溢位。
     // ============================================================
 
-    if (Motor_Start_Index >= 0)
+    const int dcReferenceSlaveIndex =
+        GetDcReferenceSlaveIndex();
+
+    if (dcReferenceSlaveIndex >= 0)
     {
         const int ALIGN_SAMPLE_COUNT =
             8;                 // 增加樣本可提高選到低 RTT 的機會，但會延長啟動。
@@ -1960,7 +2097,7 @@ int EtherCatMaster::StartDcPdoRuntime()
             int dcWkc =
                 ecx_FPRD(
                     m_slaveInfo[
-                        Motor_Start_Index
+                        dcReferenceSlaveIndex
                     ].configAddr,
                     0x0910,
                             &dcReferenceNs,
@@ -2537,9 +2674,9 @@ int EtherCatMaster::StartDcPdoRuntime()
     {
         RtPrintf(
             "[PDO-DC-ALIGN-V2] "
-            "Motor_Start_Index invalid:%d\n",
+            "DC Reference Slave Index invalid:%d\n",
 
-            Motor_Start_Index);
+            dcReferenceSlaveIndex);
     }
 
 

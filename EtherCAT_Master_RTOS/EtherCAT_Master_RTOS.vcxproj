@@ -110,6 +110,9 @@
     <ClInclude Include="GlobalConfig.h" />
     <ClInclude Include="GMCodeHandlers.h" />
     <ClInclude Include="HMI_Bridge.h" />
+    <ClInclude Include="HomePersistenceManager.h" />
+    <ClInclude Include="HomeTypes.h" />
+    <ClInclude Include="HomingManager.h" />
     <ClInclude Include="MacroEngine.h" />
     <ClInclude Include="MacroParser.h" />
     <ClInclude Include="MotionCore.h" />
@@ -150,10 +153,13 @@
     <ClCompile Include="G30.cpp" />
     <ClCompile Include="G32.cpp" />
     <ClCompile Include="G53.cpp" />
+    <ClCompile Include="G81.cpp" />
     <ClCompile Include="GCode.cpp" />
     <ClCompile Include="GCodeParser.cpp" />
     <ClCompile Include="GlobalConfig.cpp" />
     <ClCompile Include="HMI_Bridge.cpp" />
+    <ClCompile Include="HomePersistenceManager.cpp" />
+    <ClCompile Include="HomingManager.cpp" />
     <ClCompile Include="MacroEngine.cpp" />
     <ClCompile Include="MacroParser.cpp" />
     <ClCompile Include="MCode.cpp" />

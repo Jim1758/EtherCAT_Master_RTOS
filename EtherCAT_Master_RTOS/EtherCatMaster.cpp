@@ -15,6 +15,24 @@ EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m
 
     m_NC = new NCManager(m_Motion);
 
+    // =========================================================
+    // G81 HOME Manager Link
+    //
+    // 將 EtherCatMaster 內真正運行中的 PLCManager
+    // 交給 HomingManager。
+    //
+    // 之後 HOME 才能讀取：
+    //
+    // C100~107 HOME DOG
+    // C108~115 HOME INDEX
+    // External Reference C Point
+    //
+    // 目前只建立連結，不會啟動任何 HOME Motion。
+    // =========================================================
+
+    m_NC->Homing.LinkPLCManager(
+        &m_plcManager);
+
     // 🌟 將全域指標指向這顆唯一真正有在跑的 PLC 大腦！
     g_PLC = &this->m_plcManager;
 }

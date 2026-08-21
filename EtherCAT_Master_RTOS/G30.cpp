@@ -45,6 +45,26 @@ namespace GCodeHandlers
             return [](NCManager*) { return true; };
         }
 
+        for (int i = 0; i < 8; i++)
+        {
+            // 檢查軸是否存在
+            if (!nc->m_motion.GetAxisContext(i).isExist) {
+                AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_enabledr);
+                return [](NCManager*) { return true; };
+            }
+            else
+            {
+                if (nc->m_motion.GetAxisContext(i).isHomed == false)
+                {
+                    AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_Homed);
+                    return [](NCManager*) { return true; };
+                }
+
+            }
+
+
+        }
+
         // ---------------------------------------------------------
         // 2. 預先檢查：這行指令是否有帶任何中間點座標？
         // ---------------------------------------------------------
@@ -54,6 +74,9 @@ namespace GCodeHandlers
                 hasIntermediate = true;
                 break;
             }
+
+
+
         }
 
         // ---------------------------------------------------------
@@ -99,6 +122,70 @@ namespace GCodeHandlers
             }
         }
 
+        // =========================================================
+// Software Travel Limit - G30 Target Pre-Check
+//
+// G30 可能包含兩段移動：
+//
+// 1. Intermediate Point
+// 2. Reference Point
+//
+// 所以兩段都必須在送入 MotionCore 前先檢查。
+//
+// 任一 Target 超過 Software Travel Limit：
+//
+// 1. 不送入 MotionCore
+// 2. Trigger OVER_TRAVEL
+// 3. NC 進入 ALARM
+// =========================================================
+
+        for (size_t i = 0; i < refAxes.size(); ++i)
+        {
+            const int axisIndex = refAxes[i];
+
+            AxisContext& axis = nc->m_motion.GetAxisContext( axisIndex);
+
+
+            // =====================================================
+            // A. Intermediate Point
+            // =====================================================
+
+            if (hasIntermediate)
+            {
+                const bool intermediateTargetValid =  nc->CoordSys.IsTargetWithinSoftwareTravelLimit(axis, intPos[i]);
+
+                if (!intermediateTargetValid)
+                {
+                    AlarmManager::GetInstance().Trigger( AlarmManager::PROGRAMMED_OVER_TRAVEL,  0, axis.axisIndex);
+
+                    nc->ChangeState( NCState::ALARM);
+
+                    return [](NCManager*)
+                    {
+                        return true;
+                    };
+                }
+            }
+
+
+            // =====================================================
+            // B. Final Reference Point
+            // =====================================================
+
+            const bool referenceTargetValid = nc->CoordSys.IsTargetWithinSoftwareTravelLimit(axis, refPos[i]);
+
+            if (!referenceTargetValid)
+            {
+                AlarmManager::GetInstance().Trigger( AlarmManager::PROGRAMMED_OVER_TRAVEL, 0,axis.axisIndex);
+
+                nc->ChangeState( NCState::ALARM);
+
+                return [](NCManager*)
+                {
+                    return true;
+                };
+            }
+        }
         // ---------------------------------------------------------
         // 4. 一次性發送給 MotionCore
         // ---------------------------------------------------------

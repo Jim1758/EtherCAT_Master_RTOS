@@ -3,7 +3,7 @@
 
 /*
  * 檔案：EtherCatMaster_DC_Internal.h
- * 版本：EtherCAT DC Release Candidate RC1.7
+ * 版本：EtherCAT DC Release Candidate RC1.8
  *
  * 此檔案是 EtherCAT/DC 各模組之間的內部診斷快照介面。
  * 它只宣告 extern 變數，不建立控制物件，也不執行控制演算法。

@@ -57,10 +57,42 @@ namespace GCodeHandlers
                 {
                     if (nc->m_motion.GetAxisContext(i).isHomed==false)
                     {
-                        AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_enabledr);
+                        AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_Homed);
                         return [](NCManager*) { return true; };
                     }
                     
+                }
+
+
+                // =====================================================
+               // Software Travel Limit - G53 Target Pre-Check
+               //
+               // G53 使用 Machine Coordinate，
+               // 所以 block.val(axisLetter) 本身就是 Target MCS。
+               //
+               // 任一軸 Target 超過 Software Travel Limit：
+               //
+               // 1. 不送入 MotionCore
+               // 2. Trigger OVER_TRAVEL
+               // 3. NC 進入 ALARM
+               // =====================================================
+
+                AxisContext& axis =nc->m_motion.GetAxisContext(i);
+
+                const double targetMCS =block.val(axisLetter);
+
+                const bool targetWithinSoftwareLimit =nc->CoordSys.IsTargetWithinSoftwareTravelLimit( axis, targetMCS);
+
+                if (!targetWithinSoftwareLimit)
+                {
+                    AlarmManager::GetInstance().Trigger( AlarmManager::PROGRAMMED_OVER_TRAVEL,   0, axis.axisIndex);
+
+                    nc->ChangeState(  NCState::ALARM);
+
+                    return [](NCManager*)
+                    {
+                        return true;
+                    };
                 }
 
                 activeAxes.push_back(i);

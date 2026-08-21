@@ -11,6 +11,11 @@ MacroEngine::MacroEngine()
     InitializeSystemDefaults();//初始化系統 $變數
 
 
+   
+}
+
+void MacroEngine::InitializeSystemDefaults()//初始化系統 $變數
+{
     //初始化G碼群駔--------------
     SetVar('$', 1, 0);//設定群組1變數
     SetVar('$', 2, 17);//設定群組2變數
@@ -115,10 +120,7 @@ void MacroEngine::SetVar(char prefix, int index, double value)
         }
     }
 }
-void MacroEngine::InitializeSystemDefaults()//初始化系統 $變數
-{ 
-    SetVar('$', 3, 90);//群組3 
-}
+
 
 // ==========================================
 // 🌟 實作：取得底層記憶體陣列指標供 HMI_Bridge 複製

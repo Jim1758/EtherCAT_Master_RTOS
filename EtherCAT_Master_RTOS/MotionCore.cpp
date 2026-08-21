@@ -4,7 +4,7 @@
 #include "EtherCatMaster.h"
 #include "CoordinateManager.h"
 #include "SHM_Types.h"
-
+#include "AlarmManager.h"
 MotionCore::MotionCore() {}
 
 
@@ -48,12 +48,120 @@ double MotionCore::UnitPerMinToPps(double unitPerMin, double resolution, double 
     return unitPerSec * pulsePerUnit;
 }
 
+// ============================================================
+// G81 HOME Helpers
+// ============================================================
+
+double MotionCore::GetRawLogicalPositionPulse(const AxisContext& axis) const
+{
+    return axis.currentActPos + axis.machineCoordinateOffsetPulse;
+}
+
+bool MotionCore::GetDriveTouchProbeFunction(int axisIndex, uint16_t& functionValue) const
+{
+    functionValue = 0;
+
+    if (m_pDrives == nullptr ||
+        axisIndex < 0 ||
+        axisIndex >= static_cast<int>(m_pDrives->size()))
+    {
+        return false;
+    }
+
+    const ENI_ServoDrive& drive =
+        (*m_pDrives)[axisIndex];
+
+    if (drive.pOutput == nullptr)
+    {
+        return false;
+    }
+
+    functionValue =
+        drive.pOutput->TouchProbeFunc;
+
+    return true;
+}
+
+bool MotionCore::GetDriveTouchProbeData(int axisIndex, uint16_t& status, int32_t& capturedPosition) const
+{
+    status = 0;
+    capturedPosition = 0;
+    if (m_pDrives == nullptr || axisIndex < 0 || axisIndex >= static_cast<int>(m_pDrives->size())) return false;
+    const ENI_ServoDrive& drive = (*m_pDrives)[axisIndex];
+    if (drive.pInput == nullptr) return false;
+    status = drive.pInput->TouchProbeStatus;
+    capturedPosition = drive.pInput->TouchProbePos1;
+    return true;
+}
+
+bool MotionCore::SetDriveTouchProbeFunction(int axisIndex, uint16_t value)
+{
+    if (m_pDrives == nullptr || axisIndex < 0 || axisIndex >= static_cast<int>(m_pDrives->size())) return false;
+    ENI_ServoDrive& drive = (*m_pDrives)[axisIndex];
+    if (drive.pOutput == nullptr) return false;
+    drive.pOutput->TouchProbeFunc = value;
+    return true;
+}
+
+double MotionCore::ConvertDriveCaptureToRawLogicalPulse(int axisIndex, int32_t capturedPosition, HomeReferenceSource source) const
+{
+    if (m_pContexts == nullptr || axisIndex < 0 || axisIndex >= static_cast<int>(m_pContexts->size())) return 0.0;
+    const AxisContext& axis = (*m_pContexts)[axisIndex];
+
+    if (source == HomeReferenceSource::LINEAR_SCALE_INDEX_DRIVE && axis.fbMode == FeedbackSource::LINEAR_SCALE)
+        return static_cast<double>(capturedPosition) * axis.scaleToMotorRatio;
+
+    const uint32_t currentRaw = static_cast<uint32_t>(axis.lastRawActPos);
+    const uint32_t capturedRaw = static_cast<uint32_t>(capturedPosition);
+    const int32_t delta = static_cast<int32_t>(capturedRaw - currentRaw);
+    double logical = axis.unwrappedActPos + static_cast<double>(delta);
+    if (axis.isReverse) logical = -logical;
+    if (axis.Axis_Reverse) logical = -logical;
+    return logical;
+}
+
+bool MotionCore::ApplyMachineHome(AxisContext& axis, double capturedReferencePulse, double homeOffsetUnit)
+{
+    if (!axis.isExist || axis.state != MotionState::MotionState_IDLE || !std::isfinite(capturedReferencePulse) || !std::isfinite(homeOffsetUnit) || axis.resolution_PPR <= 0.0 || std::abs(axis.finalLead) < 1.0e-12) return false;
+
+    const double pulsePerUnit = axis.resolution_PPR / std::abs(axis.finalLead);
+    const double homeOffsetPulse = homeOffsetUnit * pulsePerUnit;
+    const double oldOffset = axis.machineCoordinateOffsetPulse;
+    const double newOffset = capturedReferencePulse - homeOffsetPulse;
+    const double shift = oldOffset - newOffset;
+
+    axis.machineCoordinateOffsetPulse = newOffset;
+    axis.currentActPos += shift;
+    axis.currentCmdPos += shift;
+    axis.logicalCmdPos += shift;
+    axis.planningPos += shift;
+    axis.finalTargetPos += shift;
+    axis.startCmdPos += shift;
+    axis.lastQueuedPulse += shift;
+    axis.lastActPos += shift;
+
+    axis.currentCmdVel = 0.0;
+    axis.logicalCmdVel = 0.0;
+    axis.currentActVel = 0.0;
+    axis.targetVelocity = 0.0;
+    axis.targetEndVel = 0.0;
+    axis.motionTime = 0.0;
+    axis.pid.prevError = 0.0;
+    axis.pid.integralAcc = 0.0;
+    for (size_t i = 0; i < axis.velBuffer.size(); ++i) axis.velBuffer[i] = 0.0;
+    axis.bufferSum = 0.0;
+    axis.bufferIndex = 0;
+    axis.inPosition = true;
+    return true;
+}
+
 // ==========================================
 // [API] 初始化與設定
 // ==========================================
 void MotionCore::InitAxis(AxisContext& axis, double resolution)
 {
     axis.isExist = false; // 🌟 預設為不存在，直到掃描到 EtherCAT 實體站點才開啟
+    axis.machineCoordinateOffsetPulse = 0.0;
     // 1. 物理參數
     axis.resolution_PPR = resolution;
 
@@ -76,7 +184,7 @@ void MotionCore::InitAxis(AxisContext& axis, double resolution)
     axis.currentCmdVel = 0.0;
     axis.currentActPos = 0.0;
     axis.logicalCmdPos = 0.0; // 🟢 確保同步
-    
+
 
     axis.state = MotionState::MotionState_IDLE;
     axis.inPosition = true;
@@ -140,20 +248,20 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         return;
     }
 
-   
+
     for (size_t i = 0; i < m_pDrives->size(); ++i)
     {
         // 呼叫原本寫好的單軸更新邏輯
-     
+
         UpdateMotion((*m_pDrives)[i], (*m_pContexts)[i]);
         UpdateServoState((*m_pDrives)[i], (*m_pContexts)[i]);
 
-       
+
     }
 
 
     //座標轉換：直接使用內部的 m_pCoordMgr 指標
-  
+
     if (m_pCoordMgr != nullptr)
     {
         double tempMCS[8] = { 0.0 };
@@ -178,11 +286,11 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                     if (physicalPos < 0.0) physicalPos += axis.rotaryModulo;
                 }
 
-               // ========================================================
-        // 🌟 [神級修復]：直接把 physicalPos 給 tempMCS！
-        // 因為大腦 (currentActPos) 早就已經是完美的邏輯方向了，絕對不要再反轉它！
-        // ========================================================
-        tempMCS[i] = physicalPos;
+                // ========================================================
+         // 🌟 [神級修復]：直接把 physicalPos 給 tempMCS！
+         // 因為大腦 (currentActPos) 早就已經是完美的邏輯方向了，絕對不要再反轉它！
+         // ========================================================
+                tempMCS[i] = physicalPos;
             }
             else
             {
@@ -195,8 +303,8 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 
 
 
-   
-       
+
+
 }
 
 void MotionCore::ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputInMM)
@@ -235,6 +343,37 @@ void MotionCore::ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputIn
         outDebugArray[i].IsServoOn = axis.isServoOn ? 1 : 0;
         outDebugArray[i].IsFault = axis.isFault ? 1 : 0;
         outDebugArray[i].IsLagAlarm = axis.isLagAlarm ? 1 : 0;
+        outDebugArray[i].IsHomed = axis.isHomed ? 1 : 0;
+
+        // =====================================================
+        // Drive Touch Probe Raw Monitor
+        // =====================================================
+
+        outDebugArray[i].TouchProbeFunction = 0;
+        outDebugArray[i].TouchProbeStatus = 0;
+        outDebugArray[i].TouchProbePosition = 0;
+
+        if (m_pDrives != nullptr &&
+            i < m_pDrives->size())
+        {
+            const ENI_ServoDrive& drive =
+                (*m_pDrives)[i];
+
+            if (drive.pOutput != nullptr)
+            {
+                outDebugArray[i].TouchProbeFunction =
+                    drive.pOutput->TouchProbeFunc;
+            }
+
+            if (drive.pInput != nullptr)
+            {
+                outDebugArray[i].TouchProbeStatus =
+                    drive.pInput->TouchProbeStatus;
+
+                outDebugArray[i].TouchProbePosition =
+                    drive.pInput->TouchProbePos1;
+            }
+        }
     }
 }
 void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更新單軸狀態 逐步激磁
@@ -777,18 +916,49 @@ void MotionCore::StopMove(AxisContext& axis, double dec_time)
 
 
     // =========================================================
-    // 3. 取得安全的最大速度
+    // 3. 以「目前真正命令速度」計算減速度
+    //
+    // HOME DOG / INDEX 通常使用低速搜尋。
+    // 若用 axis.maxVel_PPS 計算 dec_PPS2，低速 HOME 也可能
+    // 接近瞬間停車，造成馬達或機構震動。
+    //
+    // 所以 StopMove(dec_time) 的語意固定為：
+    //
+    //     從目前命令速度，在 dec_time 秒內平順降到 0。
     // =========================================================
-    double max_v =
-        (axis.maxVel_PPS > 0.1)
-        ? axis.maxVel_PPS
-        : 1000.0;
+
+    double currentSpeed =
+        std::abs(axis.currentCmdVel);
+
+    if (currentSpeed < 0.1)
+    {
+        currentSpeed =
+            std::abs(axis.logicalCmdVel);
+    }
+
+    if (currentSpeed < 0.1)
+    {
+        currentSpeed =
+            std::abs(axis.targetVelocity);
+    }
+
+    if (currentSpeed < 0.1)
+    {
+        axis.currentCmdVel = 0.0;
+        axis.logicalCmdVel = 0.0;
+        axis.targetVelocity = 0.0;
+        axis.finalTargetPos = axis.currentCmdPos;
+        axis.state = MotionState::MotionState_IDLE;
+        return;
+    }
 
 
     // =========================================================
     // 4. 計算減速度
     // =========================================================
-    axis.dec_PPS2 = max_v / safeDecTime;
+
+    axis.dec_PPS2 =
+        currentSpeed / safeDecTime;
 
 
     // =========================================================
@@ -1043,21 +1213,21 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     // 1. 基本路徑資訊
     // =========================================================
-    double dt =CYCLE_TIME_SEC;
+    double dt = CYCLE_TIME_SEC;
 
-    double planDistErr =axis.finalTargetPos -axis.planningPos;
+    double planDistErr = axis.finalTargetPos - axis.planningPos;
 
-    double dir =(planDistErr >= 0.0)? 1.0: -1.0;
+    double dir = (planDistErr >= 0.0) ? 1.0 : -1.0;
 
-    double planDist =std::abs(planDistErr);
+    double planDist = std::abs(planDistErr);
 
 
     // 本 Cycle 依目前速度理論上能走多少距離
-    double stepDist =std::abs(axis.currentCmdVel *dt);
+    double stepDist = std::abs(axis.currentCmdVel * dt);
 
 
     // 規劃器是否已經到最後一個 Cycle
-    bool isPlanDone =(planDist <= stepDist) ||(planDist < 0.001);
+    bool isPlanDone = (planDist <= stepDist) || (planDist < 0.001);
 
 
     // =========================================================
@@ -1065,7 +1235,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     if (isPlanDone)
     {
-        axis.planningPos =axis.finalTargetPos;
+        axis.planningPos = axis.finalTargetPos;
 
 
         // -----------------------------------------------------
@@ -1083,7 +1253,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // -----------------------------------------------------
         else
         {
-            axis.currentCmdVel =dir *(planDist / dt);
+            axis.currentCmdVel = dir * (planDist / dt);
         }
     }
 
@@ -1096,7 +1266,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // -----------------------------------------------------
         // 最大巡航速度
         // -----------------------------------------------------
-        double max_v =axis.cruiseVel_PPS;
+        double max_v = axis.cruiseVel_PPS;
 
         if (max_v < 0.0)
         {
@@ -1107,13 +1277,13 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // -----------------------------------------------------
         // 減速度
         // -----------------------------------------------------
-        double dec =axis.dec_PPS2;
+        double dec = axis.dec_PPS2;
 
 
         // -----------------------------------------------------
         // 終點速度
         // -----------------------------------------------------
-        double v_end =std::abs(axis.targetEndVel);
+        double v_end = std::abs(axis.targetEndVel);
 
         if (v_end > max_v)
         {
@@ -1126,17 +1296,17 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         //
         // v² = u² + 2as
         // -----------------------------------------------------
-        double max_allowable_vel =std::sqrt(v_end * v_end +2.0 * dec *planDist);
+        double max_allowable_vel = std::sqrt(v_end * v_end + 2.0 * dec * planDist);
 
 
         if (max_allowable_vel > max_v)
         {
-            max_allowable_vel =max_v;
+            max_allowable_vel = max_v;
         }
 
 
         // 加入運動方向
-        double target_v =dir *max_allowable_vel;
+        double target_v = dir * max_allowable_vel;
 
 
         // =====================================================
@@ -1157,14 +1327,14 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             // -------------------------------------------------
             if (axis.currentCmdVel < target_v)
             {
-                axis.currentCmdVel +=axis.acc_PPS2 *dt;
+                axis.currentCmdVel += axis.acc_PPS2 * dt;
 
 
                 // 🌟 新增 Clamp
                 // 防止 90 -> 140，而 target_v 只有 100
                 if (axis.currentCmdVel > target_v)
                 {
-                    axis.currentCmdVel =target_v;
+                    axis.currentCmdVel = target_v;
                 }
             }
 
@@ -1174,7 +1344,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             // -------------------------------------------------
             else if (axis.currentCmdVel > target_v)
             {
-                axis.currentCmdVel -=axis.dec_PPS2 * dt;
+                axis.currentCmdVel -= axis.dec_PPS2 * dt;
 
 
                 // 🌟 新增 Clamp
@@ -1225,7 +1395,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
                 // 必須拉回 -100
                 if (axis.currentCmdVel < target_v)
                 {
-                    axis.currentCmdVel =target_v;
+                    axis.currentCmdVel = target_v;
                 }
             }
 
@@ -1235,7 +1405,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             // -------------------------------------------------
             else if (axis.currentCmdVel < target_v)
             {
-                axis.currentCmdVel += axis.dec_PPS2 *dt;
+                axis.currentCmdVel += axis.dec_PPS2 * dt;
 
 
                 // 🌟 新增 Clamp
@@ -1248,7 +1418,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
                 // 必須拉回 -100
                 if (axis.currentCmdVel > target_v)
                 {
-                    axis.currentCmdVel =target_v;
+                    axis.currentCmdVel = target_v;
                 }
             }
 
@@ -1271,7 +1441,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     // 4. S-Curve 濾波
     // =========================================================
-    double finalOutputVel =axis.currentCmdVel;
+    double finalOutputVel = axis.currentCmdVel;
 
 
     if (axis.velBuffer.size() > 1)
@@ -1287,33 +1457,33 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     // 5. S-Curve Output Position 積分
     // =========================================================
-    double stepPos =finalOutputVel * dt;
+    double stepPos = finalOutputVel * dt;
 
 
     // ---------------------------------------------------------
     // P0 / 最後一行：
     // 才允許精準夾到終點
     // ---------------------------------------------------------
-    bool isStopping =(std::abs(axis.targetEndVel) <= 0.1)||(axis.isVirtualAxis &&m_Group.cmdQueue.empty());
+    bool isStopping = (std::abs(axis.targetEndVel) <= 0.1) || (axis.isVirtualAxis && m_Group.cmdQueue.empty());
 
 
     // =========================================================
     // 6. 正方向終點 Clamp
     // =========================================================
-    if (isStopping &&dir > 0.0 && (axis.currentCmdPos + stepPos) >= axis.finalTargetPos)
+    if (isStopping && dir > 0.0 && (axis.currentCmdPos + stepPos) >= axis.finalTargetPos)
     {
-        stepPos = axis.finalTargetPos -axis.currentCmdPos;
+        stepPos = axis.finalTargetPos - axis.currentCmdPos;
 
-        finalOutputVel =stepPos /dt;
+        finalOutputVel = stepPos / dt;
 
 
         axis.currentCmdPos = axis.finalTargetPos;
 
 
         // 清空 S-Curve Buffer
-        for (size_t i = 0;i < axis.velBuffer.size();++i)
+        for (size_t i = 0; i < axis.velBuffer.size(); ++i)
         {
-            axis.velBuffer[i] =0.0;
+            axis.velBuffer[i] = 0.0;
         }
         axis.bufferSum = 0.0;
     }
@@ -1322,19 +1492,19 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     // 7. 負方向終點 Clamp
     // =========================================================
-    else if (isStopping && dir < 0.0 &&(axis.currentCmdPos + stepPos) <=axis.finalTargetPos)
+    else if (isStopping && dir < 0.0 && (axis.currentCmdPos + stepPos) <= axis.finalTargetPos)
     {
-        stepPos =axis.finalTargetPos -axis.currentCmdPos;
+        stepPos = axis.finalTargetPos - axis.currentCmdPos;
 
 
-        finalOutputVel =stepPos /dt;
+        finalOutputVel = stepPos / dt;
 
 
-        axis.currentCmdPos =axis.finalTargetPos;
+        axis.currentCmdPos = axis.finalTargetPos;
 
 
         // 清空 S-Curve Buffer
-        for (size_t i = 0;i < axis.velBuffer.size(); ++i)
+        for (size_t i = 0; i < axis.velBuffer.size(); ++i)
         {
             axis.velBuffer[i] = 0.0;
         }
@@ -1349,22 +1519,22 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     else
     {
-        axis.currentCmdPos +=stepPos;
+        axis.currentCmdPos += stepPos;
     }
 
 
     // =========================================================
     // 9. 輸出 Command
     // =========================================================
-    outCmd.instantCmdVel =finalOutputVel;
+    outCmd.instantCmdVel = finalOutputVel;
 
-    outCmd.instantCmdPos =axis.currentCmdPos;
+    outCmd.instantCmdPos = axis.currentCmdPos;
 
 
     // =========================================================
     // 10. 到位 / P1 交接判斷
     // =========================================================
-    bool isBufferDry =(std::abs( finalOutputVel) < 1.0 );
+    bool isBufferDry = (std::abs(finalOutputVel) < 1.0);
     bool isHandoverReady = false;
 
 
@@ -1373,7 +1543,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // ---------------------------------------------------------
     if (isStopping)
     {
-        isHandoverReady =(isPlanDone &&isBufferDry);
+        isHandoverReady = (isPlanDone && isBufferDry);
     }
 
 
@@ -1384,11 +1554,11 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     {
         if (dir > 0.0)
         {
-            isHandoverReady =(axis.currentCmdPos >=axis.finalTargetPos);
+            isHandoverReady = (axis.currentCmdPos >= axis.finalTargetPos);
         }
         else
         {
-            isHandoverReady = (axis.currentCmdPos <=axis.finalTargetPos);
+            isHandoverReady = (axis.currentCmdPos <= axis.finalTargetPos);
         }
     }
 
@@ -1397,7 +1567,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // 11. 實體軸到位確認
     // Virtual Axis 不檢查 Physical Lag
     // =========================================================
-    bool isPhysicalInPos =true;
+    bool isPhysicalInPos = true;
 
 
     if (!axis.isVirtualAxis)
@@ -1410,16 +1580,16 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     // 12. 正式完成 / 交接
     // =========================================================
-    if (isHandoverReady &&isPhysicalInPos &&axis.state ==MotionState::MotionState_MOVING)
+    if (isHandoverReady && isPhysicalInPos && axis.state == MotionState::MotionState_MOVING)
     {
         if (isStopping)
         {
-            axis.state = MotionState:: MotionState_IDLE;
+            axis.state = MotionState::MotionState_IDLE;
         }
 
         // P0 = 完成
         // P1 = 可以交下一段
-        axis.inPosition =true;
+        axis.inPosition = true;
     }
 }
 
@@ -1973,32 +2143,139 @@ void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd
 
 void MotionCore::DetermineActiveGainSet(AxisContext& axis)// PID 依照狀態切換
 {
+    // =========================================================
+    // G81 HOME Dedicated Gain
+    //
+    // MotionState 只表示「軸現在怎麼動」：
+    //
+    // VELOCITY
+    // STOPPING
+    // MOVING
+    //
+    // HomeState 才表示「這次運動屬於 HOME 的哪一階段」。
+    //
+    // 因此 HOME 專用 Gain 必須比一般 MotionState Gain
+    // 更高優先權，否則 SEARCH_SWITCH 使用 VelocityMove() 時，
+    // 會被下面的一般規則套成 Pid_G00。
+    // =========================================================
+
+    if (axis.homeRuntime.active)
+    {
+        switch (axis.homeRuntime.state)
+        {
+            // -----------------------------------------------------
+            // HOME Search Gain
+            //
+            // 尋找 DOG / LIMIT、碰到後滑行停止，以及 Backoff，
+            // 都使用 HOME Search 專用增益。
+            // -----------------------------------------------------
+
+        case HomeState::SEARCH_SWITCH:
+        case HomeState::SWITCH_DECEL_STOP:
+        case HomeState::BACK_OFF:
+
+            axis.pid.Kp =
+                axis.home.searchGain.Kp;
+
+            axis.pid.Ki =
+                axis.home.searchGain.Ki;
+
+            axis.pid.Kd =
+                axis.home.searchGain.Kd;
+
+            axis.pid.Kvff =
+                axis.home.searchGain.Kvff;
+
+            return;
+
+
+            // -----------------------------------------------------
+            // HOME INDEX Gain
+            //
+            // 搜尋 INDEX 與 INDEX 捕捉後的滑行停止，
+            // 使用 HOME INDEX 專用增益。
+            // -----------------------------------------------------
+
+        case HomeState::SEARCH_INDEX:
+        case HomeState::INDEX_CAPTURED:
+        case HomeState::INDEX_DECEL_STOP:
+
+            axis.pid.Kp =
+                axis.home.indexGain.Kp;
+
+            axis.pid.Ki =
+                axis.home.indexGain.Ki;
+
+            axis.pid.Kd =
+                axis.home.indexGain.Kd;
+
+            axis.pid.Kvff =
+                axis.home.indexGain.Kvff;
+
+            return;
+
+
+            // -----------------------------------------------------
+            // 其他 HOME State
+            //
+            // PREPARE / WAIT / APPLY_HOME：
+            //     軸通常是 IDLE，沿用 Pid_IDLE。
+            //
+            // MOVE_TO_ZERO：
+            //     後續使用一般 P2P Move，沿用 Pid_G00。
+            // -----------------------------------------------------
+
+        default:
+            break;
+        }
+    }
+
+
+    // =========================================================
+    // Existing General Motion Gain
+    // =========================================================
+
     switch (axis.state)
     {
     case MotionState::MotionState_IDLE:
     case MotionState::MotionState_ERROR:
     case MotionState::MotionState_ESTOP:
     default:
-        axis.pid.Kp = axis.Pid_IDLE.Kp;
-        axis.pid.Ki = axis.Pid_IDLE.Ki;
-        axis.pid.Kd = axis.Pid_IDLE.Kd;
-        axis.pid.Kvff = axis.Pid_IDLE.Kvff;
+
+        axis.pid.Kp =
+            axis.Pid_IDLE.Kp;
+
+        axis.pid.Ki =
+            axis.Pid_IDLE.Ki;
+
+        axis.pid.Kd =
+            axis.Pid_IDLE.Kd;
+
+        axis.pid.Kvff =
+            axis.Pid_IDLE.Kvff;
+
         break;
+
 
     case MotionState::MotionState_MOVING:
     case MotionState::MotionState_INTERPOLATING:
     case MotionState::MotionState_STOPPING:
     case MotionState::MotionState_VELOCITY:
     case MotionState::MotionState_MPG:
-        axis.pid.Kp = axis.Pid_G00.Kp;
-        axis.pid.Ki = axis.Pid_G00.Ki;
-        axis.pid.Kd = axis.Pid_G00.Kd;
-        axis.pid.Kvff = axis.Pid_G00.Kvff;
+
+        axis.pid.Kp =
+            axis.Pid_G00.Kp;
+
+        axis.pid.Ki =
+            axis.Pid_G00.Ki;
+
+        axis.pid.Kd =
+            axis.Pid_G00.Kd;
+
+        axis.pid.Kvff =
+            axis.Pid_G00.Kvff;
+
         break;
-
-  
-
-   
     }
 }
 
@@ -2024,21 +2301,63 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         double convertedScalePos = rawScalePos * axis.scaleToMotorRatio;
 
         // [Safety] 斷帶保護 (Slip Detection)
-        // 🌟 改用展開後的馬達座標 (axis.currentActPos) 跟光學尺比對
-        if (std::abs(axis.currentActPos - convertedScalePos) > axis.maxDeviation) {
+        // currentActPos 已扣除 Machine Offset，比對 Raw Scale 前先加回。
+        const double motorRawLogicalPos = axis.currentActPos + axis.machineCoordinateOffsetPulse;
+        if (std::abs(motorRawLogicalPos - convertedScalePos) > axis.maxDeviation) {
             axis.isFault = true;
             servo.pOutput->TargetVelocity = 0;
             RtPrintf("ALARM: Dual Loop Deviation Error!\n");
             return;
         }
 
-        // 檢查完畢後，才把大腦認知的實際位置改為光學尺位置
-        axis.currentActPos = convertedScalePos;
+        // 檢查完畢後，套用 HOME Machine Coordinate Offset。
+        axis.currentActPos = convertedScalePos - axis.machineCoordinateOffsetPulse;
     }
     // =========================================================
     // ⚠️ 原本的 else { axis.currentActPos = rawMotorPos; } 已經整塊刪除！
     // 如果是半閉迴路 (馬達編碼器)，直接沿用 UpdateMotion 傳進來的完美 axis.currentActPos！
     // =========================================================
+
+
+      // =========================================================
+    // Software Travel Limit - Runtime State Update
+    //
+    // 必須放在 Feedback Selection 完成之後，
+    // 確保使用的是本 Cycle 最終有效的 Actual Position。
+    //
+    // !isHomed 時 CoordinateManager 會自動 bypass，
+    // 所以尚未尋原點時 Software Limit 不生效。
+    //
+    // Physical +OT / -OT 不在這裡處理。
+    // =========================================================
+
+    if (m_pCoordMgr != nullptr)
+    {
+        m_pCoordMgr->UpdateSoftwareTravelLimitState(
+            axis);
+    }
+
+
+    // =========================================================
+    // Automatic Motion - Runtime Software Overtravel
+    // =========================================================
+
+    if (m_pCoordMgr != nullptr && m_Group.isActive && axis.state == MotionState::MotionState_INTERPOLATING && axis.resolution_PPR > 0.0)
+    {
+        const double actualMCS = axis.currentActPos * (axis.finalLead / axis.resolution_PPR);
+
+        const bool actualWithinSoftwareLimit = m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, actualMCS);
+        if (!actualWithinSoftwareLimit)
+        {
+            if (!AlarmManager::GetInstance().HasAlarm())
+            {
+                AlarmManager::GetInstance().Trigger(AlarmManager::OVER_TRAVEL, 0, axis.axisIndex);
+                EmergencyStopGroup();
+            }
+
+            return;
+        }
+    }
 
 
     // ==========================================
@@ -2089,7 +2408,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         }
 
 
-       
+
     }
 
 
@@ -2336,7 +2655,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
 template <typename DriveType>
 void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
 {
-    
+
     // =========================================================
       // 🌟 [神級修復] 絕對安全的 32-bit 展開寫法 (過濾編譯器 UB)
       // =========================================================
@@ -2360,12 +2679,14 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
     // =========================================================
       // 🌟 核心邏輯：只針對硬體方向做翻轉，這才是 PID 和規劃器需要的「純淨邏輯座標」
       // =========================================================
-    axis.currentActPos = axis.isReverse ?  -axis.unwrappedActPos : axis.unwrappedActPos;
+    double rawLogicalActPos = axis.isReverse ? -axis.unwrappedActPos : axis.unwrappedActPos;
     if (axis.Axis_Reverse == true)
     {
-        axis.currentActPos = -axis.currentActPos;
+        rawLogicalActPos = -rawLogicalActPos;
     }
-  
+
+    axis.currentActPos = rawLogicalActPos - axis.machineCoordinateOffsetPulse;
+
     // =========================================================
 
 
@@ -2409,7 +2730,7 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
         return;
     }
 
-    
+
 
 
     // ==========================================
@@ -2500,7 +2821,7 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
         break;
     }
 
-  
+
     // ==========================================
     // 🌟 2. [Layer 2.5] 進入補償層 (動態加入螺距與背隙誤差)
     // ==========================================
@@ -2513,10 +2834,10 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
     // ==========================================
     // 無論是 "定位" 還是 "速度" 模式，算出來的 cmd 
     // 最後都統一進 PID 迴圈算出 TargetVelocity
-   
 
 
-  
+
+
     Run_Servo_Loop(servo, axis, cmd);
 }
 
@@ -2642,7 +2963,7 @@ void MotionCore::LineMove(const std::vector<int>& axes, const std::vector<double
 // 2. 半徑方向
 // 3. Z 軸方向
 // =========================================================
-static double CalcSpiralArcLengthAtProgress(double progress,double startRadius, double endRadius, double totalAngle,double deltaZ)
+static double CalcSpiralArcLengthAtProgress(double progress, double startRadius, double endRadius, double totalAngle, double deltaZ)
 {
     // -----------------------------------------------------
     // Clamp Progress
@@ -2658,9 +2979,9 @@ static double CalcSpiralArcLengthAtProgress(double progress,double startRadius, 
     }
 
 
-    const double deltaRadius =endRadius - startRadius;
+    const double deltaRadius = endRadius - startRadius;
 
-    const double absAngle =std::abs(totalAngle);
+    const double absAngle = std::abs(totalAngle);
 
 
     // =====================================================
@@ -2671,9 +2992,9 @@ static double CalcSpiralArcLengthAtProgress(double progress,double startRadius, 
     // =====================================================
     if (absAngle < 1e-12)
     {
-        const double totalLinearLength =std::sqrt(deltaRadius * deltaRadius +deltaZ * deltaZ);
+        const double totalLinearLength = std::sqrt(deltaRadius * deltaRadius + deltaZ * deltaZ);
 
-        return totalLinearLength *progress;
+        return totalLinearLength * progress;
     }
 
 
@@ -2694,7 +3015,7 @@ static double CalcSpiralArcLengthAtProgress(double progress,double startRadius, 
     {
         const double planarLength = startRadius * absAngle;
 
-        const double totalLength = std::sqrt( planarLength * planarLength + deltaZ * deltaZ);
+        const double totalLength = std::sqrt(planarLength * planarLength + deltaZ * deltaZ);
 
         return totalLength * progress;
     }
@@ -2715,25 +3036,25 @@ static double CalcSpiralArcLengthAtProgress(double progress,double startRadius, 
     // 對 p 積分得到真正路徑長度。
     // =====================================================
 
-    const double A2 =deltaRadius * deltaRadius + deltaZ * deltaZ;
+    const double A2 = deltaRadius * deltaRadius + deltaZ * deltaZ;
 
-    const double A =std::sqrt(A2);
+    const double A = std::sqrt(A2);
 
-    const double B =absAngle;
+    const double B = absAngle;
 
 
     auto Primitive = [A, A2, B](double radius) -> double
     {
-        const double root = std::sqrt( A2 +B * B * radius * radius);
+        const double root = std::sqrt(A2 + B * B * radius * radius);
 
-        return    0.5 * ( radius * root + (A2 / B) * std::asinh((B * radius) / A) );
+        return    0.5 * (radius * root + (A2 / B) * std::asinh((B * radius) / A));
     };
 
 
-    const double currentRadius =startRadius + deltaRadius *progress;
+    const double currentRadius = startRadius + deltaRadius * progress;
     const double f0 = Primitive(startRadius);
-    const double f1 =Primitive(currentRadius);
-    double length =(f1 - f0) /deltaRadius;
+    const double f1 = Primitive(currentRadius);
+    double length = (f1 - f0) / deltaRadius;
 
 
     // Numerical safety
@@ -2759,7 +3080,7 @@ static double CalcSpiralArcLengthAtProgress(double progress,double startRadius, 
 //
 // 使用 Newton iteration 反求 p。
 // =========================================================
-static double CalcSpiralProgressFromPathLength(double pathLength,double totalLength,double startRadius, double endRadius,double totalAngle, double deltaZ)
+static double CalcSpiralProgressFromPathLength(double pathLength, double totalLength, double startRadius, double endRadius, double totalAngle, double deltaZ)
 {
     if (totalLength <= 1e-12)
     {
@@ -2778,7 +3099,7 @@ static double CalcSpiralProgressFromPathLength(double pathLength,double totalLen
     }
 
 
-    const double deltaRadius =endRadius - startRadius;
+    const double deltaRadius = endRadius - startRadius;
 
 
     // =====================================================
@@ -2788,12 +3109,12 @@ static double CalcSpiralProgressFromPathLength(double pathLength,double totalLen
     // =====================================================
     if (std::abs(deltaRadius) < 1e-12)
     {
-        return pathLength /totalLength;
+        return pathLength / totalLength;
     }
 
 
     // 初始猜測
-    double progress =pathLength /totalLength;
+    double progress = pathLength / totalLength;
 
 
     // =====================================================
@@ -2802,14 +3123,14 @@ static double CalcSpiralProgressFromPathLength(double pathLength,double totalLen
     // 通常 3~4 次就會非常接近。
     // 固定使用 4 次，避免 RT Thread 不確定迴圈。
     // =====================================================
-    for (int iteration = 0;iteration < 4;++iteration)
+    for (int iteration = 0; iteration < 4; ++iteration)
     {
-        const double currentLength =CalcSpiralArcLengthAtProgress( progress, startRadius, endRadius,  totalAngle,   deltaZ);
-        const double currentRadius =startRadius + deltaRadius * progress;
+        const double currentLength = CalcSpiralArcLengthAtProgress(progress, startRadius, endRadius, totalAngle, deltaZ);
+        const double currentRadius = startRadius + deltaRadius * progress;
 
 
         // dS / dp
-        const double metric =std::sqrt(deltaRadius *deltaRadius +deltaZ *deltaZ +currentRadius *currentRadius *totalAngle *totalAngle);
+        const double metric = std::sqrt(deltaRadius * deltaRadius + deltaZ * deltaZ + currentRadius * currentRadius * totalAngle * totalAngle);
 
         if (metric < 1e-12)
         {
@@ -2843,7 +3164,7 @@ void MotionCore::LoadNextCommand()
         return;
 
     // 群組還在跑，而且虛擬軸尚未允許交接
-    if (m_Group.isActive &&!m_Group.virtualAxis.inPosition)
+    if (m_Group.isActive && !m_Group.virtualAxis.inPosition)
     {
         return;
     }
@@ -2866,7 +3187,7 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // 3. 取得下一條 Motion Command
     // ======================================================
-    MotionCommand cmd =m_Group.cmdQueue.front();
+    MotionCommand cmd = m_Group.cmdQueue.front();
 
     m_Group.cmdQueue.pop_front();
 
@@ -2877,11 +3198,11 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // 4. 更新 NC 執行資訊
     // ======================================================
-    m_Group.currentExecutionPC =cmd.sourceLinePC;
-    m_Group.currentExecutionWCS =cmd.sourceWCS;
-    m_Group.currentExecutionToolMode =cmd.sourceToolLengthMode;
-    m_Group.currentExecutionHCode =cmd.sourceHCode;
-    m_Group.currentExecutionToolRadiusMode =cmd.sourceToolRadiusMode;
+    m_Group.currentExecutionPC = cmd.sourceLinePC;
+    m_Group.currentExecutionWCS = cmd.sourceWCS;
+    m_Group.currentExecutionToolMode = cmd.sourceToolLengthMode;
+    m_Group.currentExecutionHCode = cmd.sourceHCode;
+    m_Group.currentExecutionToolRadiusMode = cmd.sourceToolRadiusMode;
     m_Group.currentExecutionDCode = cmd.sourceDCode;
     m_Group.currentExecutionIsAbsoluteMode = cmd.sourceIsAbsoluteMode;
     m_Group.currentExecutionG68Active = cmd.sourceG68Active;
@@ -2891,15 +3212,15 @@ void MotionCore::LoadNextCommand()
     m_Group.currentExecutionG51Active = cmd.sourceG51Active;
     m_Group.currentExecutionScaleRatio = cmd.sourceScaleRatio;
     m_Group.currentExecutionMirrorMask = cmd.sourceMirrorMask;
-    m_Group.currentExecutionG16Active =cmd.sourceG16Active;
-    m_Group.currentExecutionG162Active =cmd.sourceG162Active;
+    m_Group.currentExecutionG16Active = cmd.sourceG16Active;
+    m_Group.currentExecutionG162Active = cmd.sourceG162Active;
     m_Group.currentExecutionPlaneMode = cmd.sourcePlaneMode;
 
 
     // ======================================================
     // 5. 更新群組模式
     // ======================================================
-    m_Group.mode =cmd.mode;
+    m_Group.mode = cmd.mode;
     m_Group.axisCount = cmd.axisCount;
     AxisContext& vAxis = m_Group.virtualAxis;
 
@@ -2907,7 +3228,7 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // 6. S-Curve 殘留距離
     // ======================================================
-    double trappedDist =vAxis.planningPos - vAxis.currentCmdPos;
+    double trappedDist = vAxis.planningPos - vAxis.currentCmdPos;
 
     if (trappedDist < 0.0)
     {
@@ -2966,34 +3287,34 @@ void MotionCore::LoadNextCommand()
             int idxZ = (m_Group.axisCount >= 3) ? m_Group.axisIndices[2] : -1;
 
             AxisContext& realX = (*m_pContexts)[idxX];
-            AxisContext& realY =(*m_pContexts)[idxY];
+            AxisContext& realY = (*m_pContexts)[idxY];
 
-            double logP[3] ={realX.logicalCmdPos,realY.logicalCmdPos, 0.0  };
+            double logP[3] = { realX.logicalCmdPos,realY.logicalCmdPos, 0.0 };
 
             if (idxZ != -1)
             {
-                logP[2] = (*m_pContexts)[idxZ]   .logicalCmdPos;
+                logP[2] = (*m_pContexts)[idxZ].logicalCmdPos;
             }
 
-            double physP[3] ={0.0,0.0, 0.0};
+            double physP[3] = { 0.0,0.0, 0.0 };
 
-            for (int r = 0; r < 3;   ++r)
+            for (int r = 0; r < 3; ++r)
             {
-                physP[r] =m_Group.transformOrigin[r];
+                physP[r] = m_Group.transformOrigin[r];
 
                 for (int c = 0; c < 3; ++c)
                 {
-                    physP[r] += m_Group.transformMatrix[r][c]  * ( logP[c] - m_Group.transformOrigin[c] );
+                    physP[r] += m_Group.transformMatrix[r][c] * (logP[c] - m_Group.transformOrigin[c]);
                 }
             }
 
             realX.currentCmdPos = physP[0];
 
-            realY.currentCmdPos =physP[1];
+            realY.currentCmdPos = physP[1];
 
             if (idxZ != -1)
             {
-                (*m_pContexts)[idxZ] .currentCmdPos =physP[2];
+                (*m_pContexts)[idxZ].currentCmdPos = physP[2];
             }
         }
         else
@@ -3002,13 +3323,13 @@ void MotionCore::LoadNextCommand()
             // 沒有 Transform：
             // Physical Command = Logical Command
             // ------------------------------------------
-            for (int i = 0;i < m_Group.axisCount; ++i)
+            for (int i = 0; i < m_Group.axisCount; ++i)
             {
                 int idx = m_Group.axisIndices[i];
 
                 AxisContext& realAxis = (*m_pContexts)[idx];
 
-                realAxis.currentCmdPos =realAxis.logicalCmdPos;
+                realAxis.currentCmdPos = realAxis.logicalCmdPos;
             }
         }
 
@@ -3016,9 +3337,9 @@ void MotionCore::LoadNextCommand()
         // ----------------------------------------------
         // 實體軸安全完成
         // ----------------------------------------------
-        for (int i = 0;  i < m_Group.axisCount; ++i)
+        for (int i = 0; i < m_Group.axisCount; ++i)
         {
-            int idx =m_Group.axisIndices[i];
+            int idx = m_Group.axisIndices[i];
 
             AxisContext& realAxis = (*m_pContexts)[idx];
 
@@ -3027,7 +3348,7 @@ void MotionCore::LoadNextCommand()
 
             realAxis.inPosition = true;
 
-            realAxis.state = MotionState:: MotionState_IDLE;
+            realAxis.state = MotionState::MotionState_IDLE;
         }
 
 
@@ -3070,7 +3391,7 @@ void MotionCore::LoadNextCommand()
 
         vAxis.inPosition = true;
 
-        vAxis.state =MotionState:: MotionState_ERROR;
+        vAxis.state = MotionState::MotionState_ERROR;
 
         vAxis.isFault = true;
 
@@ -3099,13 +3420,13 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // LINEAR
     // ======================================================
-    if (m_Group.mode ==InterpolationMode::LINEAR)
+    if (m_Group.mode == InterpolationMode::LINEAR)
     {
         double sum_sq = 0.0;
         bool alreadyAtTarget = true;
 
 
-        for (int i = 0;i < m_Group.axisCount;++i)
+        for (int i = 0; i < m_Group.axisCount; ++i)
         {
             int idx = cmd.axisIndices[i];
 
@@ -3117,35 +3438,35 @@ void MotionCore::LoadNextCommand()
             // ----------------------------------------------
             // 起點使用 Logical Command Position
             // ----------------------------------------------
-            m_Group.startPos[i] =realAxis.logicalCmdPos;
+            m_Group.startPos[i] = realAxis.logicalCmdPos;
 
 
             // ----------------------------------------------
             // 目標
             // ----------------------------------------------
-            double actualTarget =cmd.targetPos[i];
+            double actualTarget = cmd.targetPos[i];
 
 
             // ----------------------------------------------
             // Rotary shortest path
             // ----------------------------------------------
-            if (realAxis.axisType ==AxisType::ROTARY &&realAxis.useShortestPath)
+            if (realAxis.axisType == AxisType::ROTARY && realAxis.useShortestPath)
             {
-                actualTarget = CalculateShortestTarget( m_Group.startPos[i], actualTarget,realAxis.rotaryModulo);
+                actualTarget = CalculateShortestTarget(m_Group.startPos[i], actualTarget, realAxis.rotaryModulo);
 
 
                 // local cmd
-                cmd.targetPos[i] =actualTarget;
+                cmd.targetPos[i] = actualTarget;
 
                 // current command
-                m_Group.currentCmd .targetPos[i] =actualTarget;
+                m_Group.currentCmd.targetPos[i] = actualTarget;
             }
 
 
             // ----------------------------------------------
             // 距離
             // ----------------------------------------------
-            double delta =actualTarget - m_Group.startPos[i];
+            double delta = actualTarget - m_Group.startPos[i];
 
             sum_sq += delta * delta;
 
@@ -3156,7 +3477,7 @@ void MotionCore::LoadNextCommand()
             // 只要命令差距超過到位視窗
             // 就真的需要運動
             // ----------------------------------------------
-            if (std::abs(delta) >realAxis.inPositionWindow_Pulse)
+            if (std::abs(delta) > realAxis.inPositionWindow_Pulse)
             {
                 alreadyAtTarget = false;
             }
@@ -3167,9 +3488,9 @@ void MotionCore::LoadNextCommand()
             // 如果實體馬達自己還沒追進視窗
             // 也不能直接宣告完成
             // ----------------------------------------------
-            double physicalLag =std::abs(realAxis.currentCmdPos -realAxis.currentActPos);
+            double physicalLag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
 
-            if (physicalLag >realAxis.inPositionWindow_Pulse)
+            if (physicalLag > realAxis.inPositionWindow_Pulse)
             {
                 alreadyAtTarget = false;
             }
@@ -3217,13 +3538,13 @@ void MotionCore::LoadNextCommand()
         // ==================================================
         // 實體軸正式切 INTERPOLATING
         // ==================================================
-        for (int i = 0;i < m_Group.axisCount; ++i)
+        for (int i = 0; i < m_Group.axisCount; ++i)
         {
-            int idx =m_Group.axisIndices[i];
+            int idx = m_Group.axisIndices[i];
 
-            AxisContext& realAxis =(*m_pContexts)[idx];
+            AxisContext& realAxis = (*m_pContexts)[idx];
 
-            realAxis.state = MotionState:: MotionState_INTERPOLATING;
+            realAxis.state = MotionState::MotionState_INTERPOLATING;
 
             realAxis.inPosition = false;
         }
@@ -3247,7 +3568,7 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // CIRCULAR
     // ======================================================
-    else if ( m_Group.mode == InterpolationMode::CIRCULAR_CW || m_Group.mode ==InterpolationMode::CIRCULAR_CCW)
+    else if (m_Group.mode == InterpolationMode::CIRCULAR_CW || m_Group.mode == InterpolationMode::CIRCULAR_CCW)
     {
         int axisX = cmd.axisIndices[0];
 
@@ -3262,9 +3583,9 @@ void MotionCore::LoadNextCommand()
         // ----------------------------------------------
         // 起點
         // ----------------------------------------------
-        m_Group.startPos[0] = (*m_pContexts)[axisX]  .logicalCmdPos;
+        m_Group.startPos[0] = (*m_pContexts)[axisX].logicalCmdPos;
 
-        m_Group.startPos[1] =  (*m_pContexts)[axisY] .logicalCmdPos;
+        m_Group.startPos[1] = (*m_pContexts)[axisY].logicalCmdPos;
 
 
         // ----------------------------------------------
@@ -3278,11 +3599,11 @@ void MotionCore::LoadNextCommand()
         if (m_Group.axisCount >= 3)
         {
             axisZ = cmd.axisIndices[2];
-            m_Group.axisIndices[2] =axisZ;
+            m_Group.axisIndices[2] = axisZ;
 
-            m_Group.startPos[2] =(*m_pContexts)[axisZ] .logicalCmdPos;
+            m_Group.startPos[2] = (*m_pContexts)[axisZ].logicalCmdPos;
 
-            deltaZ =cmd.targetPos[2] - m_Group.startPos[2];
+            deltaZ = cmd.targetPos[2] - m_Group.startPos[2];
         }
 
 
@@ -3291,10 +3612,10 @@ void MotionCore::LoadNextCommand()
         // ----------------------------------------------
         double sx = m_Group.startPos[0];
         double sy = m_Group.startPos[1];
-        double cx =cmd.centerPos[0];
-        double cy =cmd.centerPos[1];
-        double ex =cmd.targetPos[0];
-        double ey =cmd.targetPos[1];
+        double cx = cmd.centerPos[0];
+        double cy = cmd.centerPos[1];
+        double ex = cmd.targetPos[0];
+        double ey = cmd.targetPos[1];
 
 
         m_Group.centerX = cx;
@@ -3304,9 +3625,9 @@ void MotionCore::LoadNextCommand()
         // ----------------------------------------------
         // 起始 / 結束角
         // ----------------------------------------------
-        m_Group.startAngle = std::atan2( sy - cy,   sx - cx);
+        m_Group.startAngle = std::atan2(sy - cy, sx - cx);
 
-        double endAngle = std::atan2(  ey - cy,  ex - cx);
+        double endAngle = std::atan2(ey - cy, ex - cx);
 
 
         double totalAngle = endAngle - m_Group.startAngle;
@@ -3323,7 +3644,7 @@ void MotionCore::LoadNextCommand()
         {
             if (totalAngle >= 0.0)
             {
-                totalAngle -=  2.0 *  3.14159265359;
+                totalAngle -= 2.0 * 3.14159265359;
             }
         }
 
@@ -3335,18 +3656,18 @@ void MotionCore::LoadNextCommand()
         // Radius
         // ----------------------------------------------
         double startRadius = std::sqrt((sx - cx) * (sx - cx) + (sy - cy) * (sy - cy));
-        double endRadius =  std::sqrt( (ex - cx) * (ex - cx) +  (ey - cy) * (ey - cy));
+        double endRadius = std::sqrt((ex - cx) * (ex - cx) + (ey - cy) * (ey - cy));
         m_Group.currentCmd.startRadius = startRadius;
         m_Group.currentCmd.endRadius = endRadius;
-        m_Group.radius =  startRadius;
+        m_Group.radius = startRadius;
 
 
         // ----------------------------------------------
         // 3D Arc Distance
         // ----------------------------------------------
-        double avgRadius =(startRadius + endRadius) /2.0;
+        double avgRadius = (startRadius + endRadius) / 2.0;
 
-        double arcLength =avgRadius *std::abs(totalAngle);
+        double arcLength = avgRadius * std::abs(totalAngle);
 
 
         // ----------------------------------------------
@@ -3358,7 +3679,7 @@ void MotionCore::LoadNextCommand()
         // 3. Variable Radius Spiral
         // 4. Variable Radius + Z
         // ----------------------------------------------
-        double totalDist3D =CalcSpiralArcLengthAtProgress( 1.0, startRadius,  endRadius,  totalAngle,   deltaZ);
+        double totalDist3D = CalcSpiralArcLengthAtProgress(1.0, startRadius, endRadius, totalAngle, deltaZ);
 
 
         // ==================================================
@@ -3396,21 +3717,21 @@ void MotionCore::LoadNextCommand()
         AxisContext& realY = (*m_pContexts)[axisY];
 
 
-        realX.state =  MotionState:: MotionState_INTERPOLATING;
+        realX.state = MotionState::MotionState_INTERPOLATING;
 
         realX.inPosition = false;
 
 
-        realY.state =  MotionState:: MotionState_INTERPOLATING;
+        realY.state = MotionState::MotionState_INTERPOLATING;
 
         realY.inPosition = false;
 
 
         if (axisZ != -1)
         {
-            AxisContext& realZ =(*m_pContexts)[axisZ];
+            AxisContext& realZ = (*m_pContexts)[axisZ];
 
-            realZ.state =MotionState:: MotionState_INTERPOLATING;
+            realZ.state = MotionState::MotionState_INTERPOLATING;
 
             realZ.inPosition = false;
         }
@@ -3432,7 +3753,7 @@ void MotionCore::LoadNextCommand()
         vAxis.currentCmdVel = 0.0;
         vAxis.inPosition = true;
 
-        vAxis.state = MotionState:: MotionState_ERROR;
+        vAxis.state = MotionState::MotionState_ERROR;
 
         vAxis.isFault = true;
 
@@ -3447,7 +3768,7 @@ void MotionCore::LoadNextCommand()
     // ======================================================
 
     // S-Curve 前一段殘留距離
-    vAxis.planningPos =trappedDist;
+    vAxis.planningPos = trappedDist;
 
     // 新路徑 Virtual Position 從 0 開始
     vAxis.currentCmdPos = 0.0;
@@ -3456,26 +3777,26 @@ void MotionCore::LoadNextCommand()
     // EXACT_STOP 必須從 0 速度起跑
     if (m_Group.pathMode == PathMode::EXACT_STOP)
     {
-        vAxis.currentCmdVel =  0.0;
+        vAxis.currentCmdVel = 0.0;
     }
 
 
     // ======================================================
     // 9. 速度 / 加減速參數
     // ======================================================
-    vAxis.maxVel_PPS =std::abs( cmd.targetVel);
+    vAxis.maxVel_PPS = std::abs(cmd.targetVel);
 
 
-    vAxis.cruiseVel_PPS = vAxis.maxVel_PPS *m_Group.feedrateOverride;
+    vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
 
 
-    vAxis.acc_PPS2 =(cmd.accTime < 0.0001)? 1e10 : ( vAxis.maxVel_PPS / cmd.accTime   );
+    vAxis.acc_PPS2 = (cmd.accTime < 0.0001) ? 1e10 : (vAxis.maxVel_PPS / cmd.accTime);
 
 
-    double f_dec = (cmd.decTime < 0.0)? cmd.accTime: cmd.decTime;
+    double f_dec = (cmd.decTime < 0.0) ? cmd.accTime : cmd.decTime;
 
 
-    vAxis.dec_PPS2 = (f_dec < 0.0001) ? 1e10: ( vAxis.maxVel_PPS / f_dec  );
+    vAxis.dec_PPS2 = (f_dec < 0.0001) ? 1e10 : (vAxis.maxVel_PPS / f_dec);
 
     /*
     RtPrintf(
@@ -3486,10 +3807,10 @@ void MotionCore::LoadNextCommand()
         (int)cmd.targetVel);
         */
 
-    // ======================================================
-    // 10. CONTINUOUS 智能轉角速度
-    // ======================================================
-    if (m_Group.pathMode == PathMode::CONTINUOUS &&!m_Group.cmdQueue.empty())
+        // ======================================================
+        // 10. CONTINUOUS 智能轉角速度
+        // ======================================================
+    if (m_Group.pathMode == PathMode::CONTINUOUS && !m_Group.cmdQueue.empty())
     {
         MotionCommand& nextCmd = m_Group.cmdQueue.front();
 
@@ -3514,23 +3835,23 @@ void MotionCore::LoadNextCommand()
                 double& vx,
                 double& vy)
         {
-            if (c.mode ==InterpolationMode::LINEAR)
+            if (c.mode == InterpolationMode::LINEAR)
             {
-                vx =c.targetPos[0] - startX;
+                vx = c.targetPos[0] - startX;
 
                 vy = c.targetPos[1] - startY;
             }
             else
             {
-                double px = isExit? c.targetPos[0] : startX;
-                double py =  isExit ? c.targetPos[1]  : startY;
+                double px = isExit ? c.targetPos[0] : startX;
+                double py = isExit ? c.targetPos[1] : startY;
                 double cx = c.centerPos[0];
-                double cy =c.centerPos[1];
+                double cy = c.centerPos[1];
                 double rx = px - cx;
-                double ry =  py - cy;
+                double ry = py - cy;
 
 
-                if (c.mode ==InterpolationMode::CIRCULAR_CCW)
+                if (c.mode == InterpolationMode::CIRCULAR_CCW)
                 {
                     vx = -ry;
                     vy = rx;
@@ -3543,7 +3864,7 @@ void MotionCore::LoadNextCommand()
             }
 
 
-            double len =std::sqrt( vx * vx + vy * vy);
+            double len = std::sqrt(vx * vx + vy * vy);
 
 
             if (len > 1e-6)
@@ -3562,13 +3883,13 @@ void MotionCore::LoadNextCommand()
         // ----------------------------------------------
         // Current command exit tangent
         // ----------------------------------------------
-        getTangent(cmd, m_Group.startPos[0],m_Group.startPos[1],true,curVx, curVy);
+        getTangent(cmd, m_Group.startPos[0], m_Group.startPos[1], true, curVx, curVy);
 
 
         // ----------------------------------------------
         // Next command entry tangent
         // ----------------------------------------------
-        getTangent(nextCmd,cmd.targetPos[0], cmd.targetPos[1],false,nextVx,nextVy);
+        getTangent(nextCmd, cmd.targetPos[0], cmd.targetPos[1], false, nextVx, nextVy);
 
 
         // ----------------------------------------------
@@ -3584,13 +3905,13 @@ void MotionCore::LoadNextCommand()
 
         // 1 = 直線通過
         // 0 = 180度反轉
-        double angleFactor = (1.0 + dot) /2.0;
+        double angleFactor = (1.0 + dot) / 2.0;
 
 
-        double nextV = std::abs( nextCmd.targetVel *  m_Group.feedrateOverride);
+        double nextV = std::abs(nextCmd.targetVel * m_Group.feedrateOverride);
 
 
-        vAxis.targetEndVel =(std::min)(vAxis.cruiseVel_PPS, nextV) *angleFactor;
+        vAxis.targetEndVel = (std::min)(vAxis.cruiseVel_PPS, nextV) * angleFactor;
         /*
         RtPrintf(
             "[P1 ANGLE] PC:%d Next:%d "
@@ -3613,13 +3934,13 @@ void MotionCore::LoadNextCommand()
     }
     else
     {
-    vAxis.targetEndVel = 0.0;
+        vAxis.targetEndVel = 0.0;
 
-    /*
-    RtPrintf(
-        "[P1 NO NEXT] PC:%d | CurTarget:%d | Queue EMPTY\n",
-        cmd.sourceLinePC,
-        (int)cmd.targetPos[0]);*/
+        /*
+        RtPrintf(
+            "[P1 NO NEXT] PC:%d | CurTarget:%d | Queue EMPTY\n",
+            cmd.sourceLinePC,
+            (int)cmd.targetPos[0]);*/
     }
 
 
@@ -3637,14 +3958,14 @@ void MotionCore::LoadNextCommand()
         vAxis.bufferSum = 0.0;
         vAxis.bufferIndex = 0;
 
-        std::fill(  vAxis.velBuffer.begin(),  vAxis.velBuffer.end(),   0.0);
+        std::fill(vAxis.velBuffer.begin(), vAxis.velBuffer.end(), 0.0);
     }
 
 
     // ======================================================
     // 12. 正式啟動 Virtual Axis
     // ======================================================
-    vAxis.state =MotionState:: MotionState_MOVING;
+    vAxis.state = MotionState::MotionState_MOVING;
     vAxis.inPosition = false;
     m_Group.isActive = true;
 
@@ -3656,15 +3977,15 @@ void MotionCore::LoadNextCommand()
     {
         for (int i = 0; i < 8; ++i)
         {
-            m_Group.currentCmd   .mem_startPos[i] = m_Group.startPos[i];
-            m_Group.currentCmd .mem_ratio[i] = m_Group.ratio[i];
+            m_Group.currentCmd.mem_startPos[i] = m_Group.startPos[i];
+            m_Group.currentCmd.mem_ratio[i] = m_Group.ratio[i];
 
             m_Group.currentCmd.axisIndices[i] = m_Group.axisIndices[i];
         }
 
 
-        m_Group.currentCmd .mem_radius =m_Group.radius;
-        m_Group.currentCmd .mem_startAngle = m_Group.startAngle;
+        m_Group.currentCmd.mem_radius = m_Group.radius;
+        m_Group.currentCmd.mem_startAngle = m_Group.startAngle;
         m_Group.currentCmd.mem_centerX = m_Group.centerX;
         m_Group.currentCmd.mem_centerY = m_Group.centerY;
 
@@ -3673,11 +3994,11 @@ void MotionCore::LoadNextCommand()
         m_Group.currentCmd.mem_totalDist = vAxis.finalTargetPos;
 
 
-        m_Group.currentCmd .mem_totalAngle =  m_Group.totalAngle;
+        m_Group.currentCmd.mem_totalAngle = m_Group.totalAngle;
 
 
         // Transform Snapshot
-        m_Group.currentCmd .mem_enableTransform =  m_Group.enableTransform;
+        m_Group.currentCmd.mem_enableTransform = m_Group.enableTransform;
 
 
         for (int i = 0; i < 3; ++i)
@@ -3686,7 +4007,7 @@ void MotionCore::LoadNextCommand()
 
             for (int j = 0; j < 3; ++j)
             {
-                m_Group.currentCmd .mem_transformMatrix[i][j] = m_Group.transformMatrix[i][j];
+                m_Group.currentCmd.mem_transformMatrix[i][j] = m_Group.transformMatrix[i][j];
             }
         }
     }
@@ -3712,7 +4033,7 @@ void MotionCore::LoadNextCommand()
 }
 // 計算指令的方向向量 (Normalized)
 void MotionCore::GetDirectionVector(const MotionCommand& cmd, double startX, double startY, double& vx, double& vy) {
-    if (cmd.mode == InterpolationMode::LINEAR) 
+    if (cmd.mode == InterpolationMode::LINEAR)
     {
         double dx = cmd.targetPos[0] - startX;
         double dy = cmd.targetPos[1] - startY;
@@ -3727,11 +4048,11 @@ void MotionCore::GetDirectionVector(const MotionCommand& cmd, double startX, dou
         double ry = cmd.targetPos[1] - cmd.centerPos[1];
         double len = std::sqrt(rx * rx + ry * ry);
         // 切線向量 (CCW: [-y, x], CW: [y, -x])
-        if (cmd.mode == InterpolationMode::CIRCULAR_CCW) 
+        if (cmd.mode == InterpolationMode::CIRCULAR_CCW)
         {
             vx = -ry / len; vy = rx / len;
         }
-        else 
+        else
         {
             vx = ry / len; vy = -rx / len;
         }
@@ -3979,7 +4300,7 @@ void MotionCore::TriggerPathJump(JumpMode mode, const std::vector<JumpSegment>& 
     jm.mode = mode;
 
 
- 
+
 
 
     // =========================================================
@@ -4026,7 +4347,7 @@ void MotionCore::TriggerPathJump(JumpMode mode, const std::vector<JumpSegment>& 
     m_Group.jumpManager.currentStepIdx = 0;
 
 
- 
+
 
 
     // =========================================================
@@ -4244,15 +4565,15 @@ void MotionCore::FinalizeSafePath(const std::vector<JumpSegment>& retract, std::
     double currentReturnSum = 0;
     size_t count = approach.size();
 
-    if (count==1)
+    if (count == 1)
     {
         approach[0].distance = totalOutbound;
     }
-    else  
+    else
     {
         double total_Back_dir = 0;
 
-        for (size_t i = 0; i < count; ++i) 
+        for (size_t i = 0; i < count; ++i)
         {
             total_Back_dir += approach[i].distance;
         }
@@ -4261,15 +4582,15 @@ void MotionCore::FinalizeSafePath(const std::vector<JumpSegment>& retract, std::
         double Sum = totalOutbound - total_Back_dir;
         if (Sum == 0)
         {
-          
+
         }
         else if (Sum > 0)
         {
             approach[0].distance += Sum;
         }
-        else 
+        else
         {
-            if (approach[0].distance <std::abs(Sum))
+            if (approach[0].distance < std::abs(Sum))
             {
                 //通常不會
             }
@@ -4277,11 +4598,11 @@ void MotionCore::FinalizeSafePath(const std::vector<JumpSegment>& retract, std::
             {
                 approach[0].distance -= Sum;
             }
-          
+
         }
     }
-  
-   
+
+
 
     // 3. 再次檢查：如果債務已經還完但還有多餘段落，將多餘段落距離設為 0
     // (這對應你說的「刪除或修改中間段落導致變長」的情況)
@@ -4370,7 +4691,7 @@ void MotionCore::TriggerPause_B2(const std::vector<JumpSegment>& retractScript, 
 {
     if (m_Group.jumpManager.state != JumpState::IDLE) return;
 
-   
+
 
     PathJumpManager& jm = m_Group.jumpManager;
     AxisContext& vAxis = m_Group.virtualAxis;
@@ -4505,7 +4826,7 @@ void MotionCore::Process_B2_Approach_Planner(double dt)
 }
 
 
-void MotionCore::TriggerPause_B3(double cx, double cy, double cz, double vx, double vy, double vz,const std::vector<JumpSegment>& toCenter, const std::vector<JumpSegment>& toApex,const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece)
+void MotionCore::TriggerPause_B3(double cx, double cy, double cz, double vx, double vy, double vz, const std::vector<JumpSegment>& toCenter, const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece)
 {
     if (m_Group.jumpManager.state != JumpState::IDLE) return;
     PathJumpManager& jm = m_Group.jumpManager;
@@ -4568,7 +4889,7 @@ void MotionCore::TriggerPause_B3(double cx, double cy, double cz, double vx, dou
     RtPrintf("[PAUSE_B3_MATH] DistCenter:%d, DistApex:%d, TriggerPos:%d\n",
         (int)(jm.b3_distToCenter * 1000.0), (int)(jm.b3_distToApex * 1000.0), (int)jm.triggerPos);*/
 
-    // 4. 啟動 B3 狀態機
+        // 4. 啟動 B3 狀態機
     jm.currentStepIdx = 0;
     jm.currentOffset = 0.0;
     jm.jumpVel = 0.0;
@@ -4579,7 +4900,7 @@ void MotionCore::TriggerPause_B3(double cx, double cy, double cz, double vx, dou
     vAxis.currentCmdVel = 0.0;
 }
 
-void MotionCore::TriggerPause_B4(double upperCx, double upperCy, double upperCz,double vx, double vy, double vz,const std::vector<JumpSegment>& toUpper,const std::vector<JumpSegment>& toApex,const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece)
+void MotionCore::TriggerPause_B4(double upperCx, double upperCy, double upperCz, double vx, double vy, double vz, const std::vector<JumpSegment>& toUpper, const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece)
 {
     if (m_Group.jumpManager.state != JumpState::IDLE) return;
 
@@ -4643,7 +4964,7 @@ void MotionCore::TriggerPause_B4(double upperCx, double upperCy, double upperCz,
         (int)(jm.b4_distToUpper * 1000.0), (int)(jm.b4_distToApex * 1000.0));
         */
 
-    // 7. 啟動狀態機
+        // 7. 啟動狀態機
     jm.currentStepIdx = 0;
     jm.currentOffset = 0.0;
     jm.jumpVel = 0.0;
@@ -4898,7 +5219,7 @@ void MotionCore::UpdateInterpolation()
             if (logCnt5++ % 500 == 0) {
                 //RtPrintf("[DBG-3] BLOCKED! Axis %d is NOT ServoOn. Group aborted.\\n", axisIdx);
             }
-          
+
             m_Group.isActive = false;
 
             // 🚨 新增：宣告群組與虛擬主軸進入錯誤狀態，防止 G-code 繼續下單！
@@ -4984,7 +5305,7 @@ void MotionCore::UpdateInterpolation()
                             for (int i = 0; i < m_Group.axisCount; ++i) {
                                 jm.apexPos[i] = (*m_pContexts)[m_Group.axisIndices[i]].logicalCmdPos;
                             }
-                           // RtPrintf("[B2] 成功抵達物理頂點，切換至 PAUSED_HOLD\n");
+                            // RtPrintf("[B2] 成功抵達物理頂點，切換至 PAUSED_HOLD\n");
                         }
                         else {
                             jm.state = JumpState::DWELL;
@@ -4993,7 +5314,7 @@ void MotionCore::UpdateInterpolation()
                     }
                 }
             }
-            else 
+            else
             {
                 // B0, B1 等其他模式，走原本的規劃器 (完全不影響舊功能)
                 jm.currentOffset = PlanTrapezoidal(jm.currentOffset, finalTarget, seg.velocity, realAcc, realDec, jm.jumpVel, dt);
@@ -5001,7 +5322,7 @@ void MotionCore::UpdateInterpolation()
             // =========================================================
 
             // 🌟 4. 動態換檔：只要跨越了邊界，立刻切換下一段的速度 (不要求速度降到 0)
-            
+
             if (jm.currentOffset <= stepBoundary && jm.currentStepIdx < (int)jm.retractSteps.size() - 1) {
                 jm.currentStepIdx++;
             }
@@ -5067,12 +5388,12 @@ void MotionCore::UpdateInterpolation()
         else if (jm.state == JumpState::APPROACHING)
         {
             // 🌟 [防爆衝護欄] 防止 Idx 越界崩潰 (Access Violation 殺手)
-            if (jm.approachSteps.empty() || jm.currentStepIdx >= (int)jm.approachSteps.size() || jm.currentStepIdx < 0) 
+            if (jm.approachSteps.empty() || jm.currentStepIdx >= (int)jm.approachSteps.size() || jm.currentStepIdx < 0)
             {
-            RtPrintf("!!! ERROR !!! Approach Index Out of Range!\n");
-            jm.state = JumpState::IDLE;
-            m_Group.pathMode = PathMode::PATH_SERVO;
-            return;
+                RtPrintf("!!! ERROR !!! Approach Index Out of Range!\n");
+                jm.state = JumpState::IDLE;
+                m_Group.pathMode = PathMode::PATH_SERVO;
+                return;
             }
 
             // =========================================================
@@ -5109,9 +5430,9 @@ void MotionCore::UpdateInterpolation()
                 }
             }
 
-          
 
-          
+
+
             // 🌟 5. 真正降落完畢 (這段保留)
             double finalTarget = 0.0;
             // 🌟 5. 真正降落完畢 (這段是共用的，但判斷門檻放寬到 5.0 Pulse)
@@ -5139,13 +5460,13 @@ void MotionCore::UpdateInterpolation()
         // ======================================================
         // 🔴 核心分流：B2 是倒退嚕，B1/B3/B4 是凍結放電進度！
         // ======================================================
-        if (jm.mode == JumpMode::B2_PATH_REVERSE) 
+        if (jm.mode == JumpMode::B2_PATH_REVERSE)
         {
             // B2：把跳刀 Offset 套用到虛擬主軸上 (原路徑倒退)
             vAxis.currentCmdPos = jm.triggerPos + jm.currentOffset;
             vAxis.currentCmdVel = jm.jumpVel;
         }
-        else 
+        else
         {
             // B1, B0, B3, B4：【凍結】虛擬主軸！讓放電軌跡停在半空中
             vAxis.currentCmdPos = jm.triggerPos;
@@ -5160,65 +5481,65 @@ void MotionCore::UpdateInterpolation()
     // ======================================================
     else if (m_Group.pathMode == PathMode::PATH_SERVO)
     {
-   
 
-    // ✅ 換成這段 [工業級 G00/G61 準停檢查邏輯]：
-    if (!m_Group.isActive || vAxis.inPosition)
-    {
-        bool allAxesInPos = true;
 
-        // 如果是 G00 快速定位 或 G61 準停模式，必須確認實體馬達有跟上
-        if (m_Group.isActive && m_Group.pathMode == PathMode::EXACT_STOP)
+        // ✅ 換成這段 [工業級 G00/G61 準停檢查邏輯]：
+        if (!m_Group.isActive || vAxis.inPosition)
         {
-            for (int i = 0; i < m_Group.axisCount; ++i) {
-                int idx = m_Group.axisIndices[i];
-                AxisContext& realAxis = (*m_pContexts)[idx];
+            bool allAxesInPos = true;
 
-                double lag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
+            // 如果是 G00 快速定位 或 G61 準停模式，必須確認實體馬達有跟上
+            if (m_Group.isActive && m_Group.pathMode == PathMode::EXACT_STOP)
+            {
+                for (int i = 0; i < m_Group.axisCount; ++i) {
+                    int idx = m_Group.axisIndices[i];
+                    AxisContext& realAxis = (*m_pContexts)[idx];
 
-                // 只要有一軸還沒擠進視窗 (例如 0.005mm)，就不准換下一行！
-                if (lag > realAxis.inPositionWindow_Pulse) {
-                    allAxesInPos = false;
-                    // 🟢 [加入 LOG 2]：觀察實體馬達的誤差是不是卡住了
-                    if (m_Group.cmdQueue.empty() && vAxis.inPosition) {
-                        static int logCnt2 = 0;
-                        if (logCnt2++ % 500 == 0) {
-                            //RtPrintf("[LOG 2] Axis %d STUCK! Lag: %d > Window: %d\n",idx, (int)lag, (int)realAxis.inPositionWindow_Pulse);
+                    double lag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
+
+                    // 只要有一軸還沒擠進視窗 (例如 0.005mm)，就不准換下一行！
+                    if (lag > realAxis.inPositionWindow_Pulse) {
+                        allAxesInPos = false;
+                        // 🟢 [加入 LOG 2]：觀察實體馬達的誤差是不是卡住了
+                        if (m_Group.cmdQueue.empty() && vAxis.inPosition) {
+                            static int logCnt2 = 0;
+                            if (logCnt2++ % 500 == 0) {
+                                //RtPrintf("[LOG 2] Axis %d STUCK! Lag: %d > Window: %d\n",idx, (int)lag, (int)realAxis.inPositionWindow_Pulse);
+                            }
                         }
+                        break;
                     }
-                    break;
                 }
             }
-        }
 
-        // 大腦算完了，且實體馬達也都擠進視窗了，才准拆下一個包裹！
-        if (allAxesInPos && !m_Group.cmdQueue.empty()) {
-            LoadNextCommand();
+            // 大腦算完了，且實體馬達也都擠進視窗了，才准拆下一個包裹！
+            if (allAxesInPos && !m_Group.cmdQueue.empty()) {
+                LoadNextCommand();
+            }
         }
-    }
         if (!m_Group.isActive) return;
 
         vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
 
-        
-
-       // 🟢 [修復]：把外部速度當作「目標」，交給速度規劃器去產生平滑的斜坡與 S-Curve！
-        //vAxis.targetVelocity = m_Group.pathServoVel;
-        //Calc_Trajectory_Velocity(vAxis, vCmd);
 
 
+        // 🟢 [修復]：把外部速度當作「目標」，交給速度規劃器去產生平滑的斜坡與 S-Curve！
+         //vAxis.targetVelocity = m_Group.pathServoVel;
+         //Calc_Trajectory_Velocity(vAxis, vCmd);
 
 
-        // =========================================================
-        // 🟢 智慧分流：排渣回來的那一次 (S-Curve) vs 正常放電 (即時速度)
-        // =========================================================
+
+
+         // =========================================================
+         // 🟢 智慧分流：排渣回來的那一次 (S-Curve) vs 正常放電 (即時速度)
+         // =========================================================
         if (jm.isRecovering)
         {
             // 【狀態 1：軟著陸中】交給規劃器，畫出平滑起步的斜坡，避免突刺！
             vAxis.targetVelocity = m_Group.pathServoVel;
             Calc_Trajectory_Velocity(vAxis, vCmd);
 
-         
+
             //jm.isRecovering = false;//
         }
         else
@@ -5242,12 +5563,12 @@ void MotionCore::UpdateInterpolation()
         // =========================================================
         if (vAxis.currentCmdPos >= vAxis.finalTargetPos)
         {
-            vAxis.currentCmdPos =vAxis.finalTargetPos;
+            vAxis.currentCmdPos = vAxis.finalTargetPos;
             vAxis.inPosition = true;
         }
 
         vCmd.instantCmdPos = vAxis.currentCmdPos;
-        vCmd.instantCmdVel =vAxis.currentCmdVel;
+        vCmd.instantCmdVel = vAxis.currentCmdVel;
         vCmd.instantCmdPos = vAxis.currentCmdPos;
         vCmd.instantCmdVel = vAxis.currentCmdVel;
     }
@@ -5256,46 +5577,46 @@ void MotionCore::UpdateInterpolation()
     // ======================================================
     else
     {
-    // 拆包裹邏輯
-    // ✅ 換成這段 [工業級 G00/G61 準停檢查邏輯]：
-    if (!m_Group.isActive || vAxis.inPosition)
-    {
-        bool allAxesInPos = true;
-
-        // 如果是 G00 快速定位 或 G61 準停模式，必須確認實體馬達有跟上
-        if (m_Group.isActive && m_Group.pathMode == PathMode::EXACT_STOP)
+        // 拆包裹邏輯
+        // ✅ 換成這段 [工業級 G00/G61 準停檢查邏輯]：
+        if (!m_Group.isActive || vAxis.inPosition)
         {
-            for (int i = 0; i < m_Group.axisCount; ++i) {
-                int idx = m_Group.axisIndices[i];
-                AxisContext& realAxis = (*m_pContexts)[idx];
+            bool allAxesInPos = true;
 
-                double lag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
+            // 如果是 G00 快速定位 或 G61 準停模式，必須確認實體馬達有跟上
+            if (m_Group.isActive && m_Group.pathMode == PathMode::EXACT_STOP)
+            {
+                for (int i = 0; i < m_Group.axisCount; ++i) {
+                    int idx = m_Group.axisIndices[i];
+                    AxisContext& realAxis = (*m_pContexts)[idx];
 
-                // 只要有一軸還沒擠進視窗 (例如 0.005mm)，就不准換下一行！
-                if (lag > realAxis.inPositionWindow_Pulse)
-                {
-                    allAxesInPos = false;
+                    double lag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
 
-                    // 🟢 [加入 LOG 2]：觀察實體馬達的誤差是不是卡住了
-                    if (m_Group.cmdQueue.empty() && vAxis.inPosition)
+                    // 只要有一軸還沒擠進視窗 (例如 0.005mm)，就不准換下一行！
+                    if (lag > realAxis.inPositionWindow_Pulse)
                     {
-                        static int logCnt2 = 0;
-                        if (logCnt2++ % 500 == 0)
+                        allAxesInPos = false;
+
+                        // 🟢 [加入 LOG 2]：觀察實體馬達的誤差是不是卡住了
+                        if (m_Group.cmdQueue.empty() && vAxis.inPosition)
                         {
-                            //RtPrintf("[LOG 2] Axis %d STUCK! Lag: %d > Window: %d\n",idx, (int)lag, (int)realAxis.inPositionWindow_Pulse);
+                            static int logCnt2 = 0;
+                            if (logCnt2++ % 500 == 0)
+                            {
+                                //RtPrintf("[LOG 2] Axis %d STUCK! Lag: %d > Window: %d\n",idx, (int)lag, (int)realAxis.inPositionWindow_Pulse);
+                            }
                         }
+                        break;
                     }
-                    break;
                 }
             }
-        }
 
-        // 大腦算完了，且實體馬達也都擠進視窗了，才准拆下一個包裹！
-        if (allAxesInPos && !m_Group.cmdQueue.empty())
-        {
-            LoadNextCommand();
+            // 大腦算完了，且實體馬達也都擠進視窗了，才准拆下一個包裹！
+            if (allAxesInPos && !m_Group.cmdQueue.empty())
+            {
+                LoadNextCommand();
+            }
         }
-    }
 
         if (!m_Group.isActive) return;
         vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
@@ -5304,7 +5625,7 @@ void MotionCore::UpdateInterpolation()
         {
             Calc_Trajectory_Velocity(vAxis, vCmd);
         }
-        else 
+        else
         {
             Calc_Trajectory_Trapezoidal(vAxis, vCmd);
         }
@@ -5326,7 +5647,7 @@ void MotionCore::UpdateInterpolation()
             // 恢復大腦的幾何狀態
             m_Group.mode = m_Group.currentCmd.mode;
             m_Group.axisCount = m_Group.currentCmd.axisCount;
-            for (int i = 0; i < 8; i++) 
+            for (int i = 0; i < 8; i++)
             {
                 m_Group.startPos[i] = m_Group.currentCmd.mem_startPos[i];
                 m_Group.ratio[i] = m_Group.currentCmd.mem_ratio[i];
@@ -5356,7 +5677,7 @@ void MotionCore::UpdateInterpolation()
             vAxis.currentCmdVel = 0.0;
         }
     }
-    
+
     // =========================================================
     // 🔴 Jump / B2 專用：向前跨節
     //
@@ -5375,7 +5696,7 @@ void MotionCore::UpdateInterpolation()
     vCmd.instantCmdPos = vAxis.currentCmdPos;
     vCmd.instantCmdVel = vAxis.currentCmdVel;
 
-   
+
 
 
 
@@ -5391,7 +5712,7 @@ void MotionCore::UpdateInterpolation()
             realAxis.logicalCmdVel = vCmd.instantCmdVel * m_Group.ratio[i];
         }
     }
-    else if ( m_Group.mode == InterpolationMode::CIRCULAR_CW || m_Group.mode ==InterpolationMode::CIRCULAR_CCW)
+    else if (m_Group.mode == InterpolationMode::CIRCULAR_CW || m_Group.mode == InterpolationMode::CIRCULAR_CCW)
     {
         // =====================================================
         // 1. Axis
@@ -5399,7 +5720,7 @@ void MotionCore::UpdateInterpolation()
         int idxX = m_Group.axisIndices[0];
         int idxY = m_Group.axisIndices[1];
 
-        AxisContext& realX =(*m_pContexts)[idxX];
+        AxisContext& realX = (*m_pContexts)[idxX];
         AxisContext& realY = (*m_pContexts)[idxY];
 
 
@@ -5408,9 +5729,9 @@ void MotionCore::UpdateInterpolation()
         // =====================================================
         const double startRadius = m_Group.currentCmd.startRadius;
         const double endRadius = m_Group.currentCmd.endRadius;
-        const double deltaRadius = endRadius -startRadius;
-        const double totalAngle =m_Group.totalAngle;
-        double deltaZ =  0.0;
+        const double deltaRadius = endRadius - startRadius;
+        const double totalAngle = m_Group.totalAngle;
+        double deltaZ = 0.0;
 
 
         if (m_Group.axisCount >= 3)
@@ -5429,15 +5750,15 @@ void MotionCore::UpdateInterpolation()
         //
         // 因為 Spiral 每個 progress 的實際距離不同。
         // =====================================================
-        double progressRatio =CalcSpiralProgressFromPathLength( vCmd.instantCmdPos, m_Group.totalDist3D, startRadius,  endRadius,   totalAngle,  deltaZ);
+        double progressRatio = CalcSpiralProgressFromPathLength(vCmd.instantCmdPos, m_Group.totalDist3D, startRadius, endRadius, totalAngle, deltaZ);
 
 
         // =====================================================
         // 4. Current Radius / Angle
         // =====================================================
-        const double currentRadius =  startRadius + deltaRadius *progressRatio;
-        const double currentAngle = m_Group.startAngle +totalAngle * progressRatio;
-        const double cosAngle =  std::cos(currentAngle);
+        const double currentRadius = startRadius + deltaRadius * progressRatio;
+        const double currentAngle = m_Group.startAngle + totalAngle * progressRatio;
+        const double cosAngle = std::cos(currentAngle);
         const double sinAngle = std::sin(currentAngle);
 
 
@@ -5446,14 +5767,14 @@ void MotionCore::UpdateInterpolation()
         //
         // 這裡才是真正 Variable Radius。
         // =====================================================
-        realX.logicalCmdPos =m_Group.centerX + currentRadius *cosAngle;
-        realY.logicalCmdPos = m_Group.centerY + currentRadius *  sinAngle;
+        realX.logicalCmdPos = m_Group.centerX + currentRadius * cosAngle;
+        realY.logicalCmdPos = m_Group.centerY + currentRadius * sinAngle;
 
 
         // =====================================================
         // 6. Z Position
         // =====================================================
-        AxisContext* realZ =  nullptr;
+        AxisContext* realZ = nullptr;
 
         if (m_Group.axisCount >= 3)
         {
@@ -5482,7 +5803,7 @@ void MotionCore::UpdateInterpolation()
         //
         // dp/dt = vPath / (ds/dp)
         // =====================================================
-        const double pathMetric =std::sqrt(deltaRadius *deltaRadius +currentRadius *currentRadius *totalAngle *totalAngle +  deltaZ *  deltaZ);
+        const double pathMetric = std::sqrt(deltaRadius * deltaRadius + currentRadius * currentRadius * totalAngle * totalAngle + deltaZ * deltaZ);
 
 
         double progressVelocity = 0.0;
@@ -5490,7 +5811,7 @@ void MotionCore::UpdateInterpolation()
 
         if (pathMetric > 1e-12)
         {
-            progressVelocity = vCmd.instantCmdVel /pathMetric;
+            progressVelocity = vCmd.instantCmdVel / pathMetric;
         }
 
 
@@ -5512,8 +5833,8 @@ void MotionCore::UpdateInterpolation()
         // + r*cos(theta)*dTheta
         //
         // =====================================================
-        const double dx_dp = deltaRadius * cosAngle - currentRadius *sinAngle * totalAngle;
-        const double dy_dp = deltaRadius * sinAngle +currentRadius *cosAngle *totalAngle;
+        const double dx_dp = deltaRadius * cosAngle - currentRadius * sinAngle * totalAngle;
+        const double dy_dp = deltaRadius * sinAngle + currentRadius * cosAngle * totalAngle;
 
 
         // =====================================================
@@ -5528,7 +5849,7 @@ void MotionCore::UpdateInterpolation()
         // CW / CCW 不用另外反轉，
         // 因為 totalAngle 本身已經帶正負號。
         // =====================================================
-        realX.logicalCmdVel =dx_dp * progressVelocity;
+        realX.logicalCmdVel = dx_dp * progressVelocity;
         realY.logicalCmdVel = dy_dp * progressVelocity;
 
 
@@ -5537,7 +5858,7 @@ void MotionCore::UpdateInterpolation()
         // =====================================================
         if (realZ != nullptr)
         {
-            realZ->logicalCmdVel =  deltaZ * progressVelocity;
+            realZ->logicalCmdVel = deltaZ * progressVelocity;
         }
     }
 
@@ -5740,7 +6061,7 @@ void MotionCore::UpdateInterpolation()
                         if (m_Group.axisCount >= 3) {
                             jm.apexPos[2] = jm.b3_centerPos[2] + jm.b3_distToApex * jm.b3_retractVector[2];
                         }
-                       // RtPrintf("[PAUSE_B3] Safely Holding at Math Apex.\n");
+                        // RtPrintf("[PAUSE_B3] Safely Holding at Math Apex.\n");
                     }
                     else {
                         // 正常的排渣模式，或者是 B3 的其他階段，就順順切換到下一個狀態
@@ -5796,7 +6117,7 @@ void MotionCore::UpdateInterpolation()
                 }
                 else if (jm.state == JumpState::B3_TO_APEX || jm.state == JumpState::B3_DWELL || jm.state == JumpState::PAUSED_HOLD)
                 {
-                 
+
                     if (offset > jm.b3_distToApex) offset = jm.b3_distToApex; // 🛡️ 絕對夾死
 
                     // 🛡️ DWELL 或 PAUSED_HOLD 期間強制鎖死在頂點，絕不跟著 offset 歸零亂跑！
@@ -5867,205 +6188,205 @@ void MotionCore::UpdateInterpolation()
             }
 
 
-          
+
         }
         // ======================================================
         // 🌟 B4 搖動/行星加工：專屬 5 階段狀態機與座標映射
         // ======================================================
-        else if (jm.mode == JumpMode::B4_ORBITAL_DIAGONAL &&((jm.state >= JumpState::B4_TO_UPPER_CENTER && jm.state <= JumpState::B4_TO_WORKPIECE) || jm.state == JumpState::PAUSED_HOLD))
+        else if (jm.mode == JumpMode::B4_ORBITAL_DIAGONAL && ((jm.state >= JumpState::B4_TO_UPPER_CENTER && jm.state <= JumpState::B4_TO_WORKPIECE) || jm.state == JumpState::PAUSED_HOLD))
         {
-        // --------------------------------------------------
-        // 【第一部分：大腦 (狀態機與速度規劃)】
-        // --------------------------------------------------
-        std::vector<JumpSegment>* currentScript = nullptr;
-        double finalTarget = 0.0;
-        JumpState nextState = JumpState::IDLE;
+            // --------------------------------------------------
+            // 【第一部分：大腦 (狀態機與速度規劃)】
+            // --------------------------------------------------
+            std::vector<JumpSegment>* currentScript = nullptr;
+            double finalTarget = 0.0;
+            JumpState nextState = JumpState::IDLE;
 
-        // 1. 選擇腳本與目標
-        if (jm.state == JumpState::B4_TO_UPPER_CENTER)
-        {
-            currentScript = &jm.b4_toUpperSteps;
-            finalTarget = jm.b4_distToUpper;
-            nextState = JumpState::B4_TO_APEX;
-        }
-        else if (jm.state == JumpState::B4_TO_APEX) 
-        {
-            currentScript = &jm.b4_toApexSteps;
-            finalTarget = jm.b4_distToApex;
-            nextState = JumpState::B4_DWELL;
-        }
-        else if (jm.state == JumpState::B4_FROM_APEX)
-        {
-            currentScript = &jm.b4_fromApexSteps;
-            finalTarget = jm.b4_distToApex;
-            nextState = JumpState::B4_TO_WORKPIECE;
-        }
-        else if (jm.state == JumpState::B4_TO_WORKPIECE) 
-        {
-            currentScript = &jm.b4_toWorkpieceSteps;
-            finalTarget = jm.b4_distToUpper;
-            nextState = JumpState::IDLE;
-        }
-
-        // 2. 執行 DWELL 或 移動
-        if (jm.state == JumpState::B4_DWELL)
-        {
-            jm.dwellTimer += dt * 1000.0;
-            if (jm.dwellTimer >= jm.dwellTimeTarget) 
-            {
-                jm.state = JumpState::B4_FROM_APEX;
-                jm.currentStepIdx = 0; jm.currentOffset = 0.0; jm.jumpVel = 0.0;
-            }
-        }
-        else if (currentScript != nullptr && !currentScript->empty())
-        {
-            JumpSegment& seg = (*currentScript)[jm.currentStepIdx];
-            double realAcc = (seg.accTime > 0.0001) ? (seg.velocity / seg.accTime) : 1e10;
-            double realDec = (seg.decTime > 0.0001) ? (seg.velocity / seg.decTime) : 1e10;
-
-            double stepBoundary = 0.0;
-            for (int i = 0; i <= jm.currentStepIdx; ++i) stepBoundary += (*currentScript)[i].distance;
-
-            // 呼叫梯形規劃器
-            jm.currentOffset = PlanTrapezoidal(jm.currentOffset, finalTarget, seg.velocity, realAcc, realDec, jm.jumpVel, dt);
-
-            // 內部換檔
-            if (jm.currentOffset >= stepBoundary && jm.currentStepIdx < (int)currentScript->size() - 1)
-            {
-                jm.currentStepIdx++;
-            }
-
-            if (jm.currentOffset >= finalTarget - 1e-5) 
-            {
-
-                jm.currentStepIdx = 0;
-                jm.currentOffset = 0.0;
-                jm.jumpVel = 0.0;
-                jm.dwellTimer = 0.0;
-
-                // ==========================================================
-                // 🌟 [絕對關鍵：B4 暫停空中攔截網 (純數學真頂點)]
-                // ==========================================================
-                if (jm.state == JumpState::B4_TO_APEX && jm.isPauseMode)
-                {
-                    jm.state = JumpState::PAUSED_HOLD;
-
-                    jm.apexPos[0] = jm.b4_upperCenterPos[0] + jm.b4_distToApex * jm.b4_retractVector[0];
-                    jm.apexPos[1] = jm.b4_upperCenterPos[1] + jm.b4_distToApex * jm.b4_retractVector[1];
-                    if (m_Group.axisCount >= 3)
-                    {
-                        jm.apexPos[2] = jm.b4_upperCenterPos[2] + jm.b4_distToApex * jm.b4_retractVector[2];
-                    }
-                    //RtPrintf("[PAUSE_B4] Safely Holding at Math Apex.\n");
-                }
-                else
-                {
-                    jm.state = nextState;
-                }
-
-                // 🚨 PATH_SERVO 交接！
-                if (jm.state == JumpState::IDLE) 
-                {
-                    m_Group.pathMode = PathMode::PATH_SERVO;
-                    jm.isRecovering = true; // 啟動軟著陸
-
-                    int idxX = m_Group.axisIndices[0], idxY = m_Group.axisIndices[1];
-                    int idxZ = (m_Group.axisCount >= 3) ? m_Group.axisIndices[2] : -1;
-                    (*m_pContexts)[idxX].logicalCmdPos = jm.frozenPos[0];
-                    (*m_pContexts)[idxY].logicalCmdPos = jm.frozenPos[1];
-                    if (idxZ != -1) (*m_pContexts)[idxZ].logicalCmdPos = jm.frozenPos[2];
-                }
-            }
-        }
-
-        // --------------------------------------------------
-        // 【第二部分：手腳 (3D 座標映射與無敵夾鉗)】
-        // --------------------------------------------------
-        if (jm.state != JumpState::IDLE)
-        {
-            double curX = jm.frozenPos[0], curY = jm.frozenPos[1], curZ = jm.frozenPos[2];
-            double velX = 0, velY = 0, velZ = 0;
-            double offset = jm.currentOffset;
-            double jVel = jm.jumpVel;
-
-            int idxX = m_Group.axisIndices[0], idxY = m_Group.axisIndices[1];
-            int idxZ = (m_Group.axisCount >= 3) ? m_Group.axisIndices[2] : -1;
-
+            // 1. 選擇腳本與目標
             if (jm.state == JumpState::B4_TO_UPPER_CENTER)
             {
-                if (offset > jm.b4_distToUpper) offset = jm.b4_distToUpper; // 🛡️ 絕對夾死
-                if (jm.b4_distToUpper > 1e-6) {
-                    double dirX = (jm.b4_upperCenterPos[0] - jm.frozenPos[0]) / jm.b4_distToUpper;
-                    double dirY = (jm.b4_upperCenterPos[1] - jm.frozenPos[1]) / jm.b4_distToUpper;
-                    double dirZ = (jm.b4_upperCenterPos[2] - jm.frozenPos[2]) / jm.b4_distToUpper;
-
-                    curX = jm.frozenPos[0] + offset * dirX;
-                    curY = jm.frozenPos[1] + offset * dirY;
-                    curZ = jm.frozenPos[2] + offset * dirZ;
-                    velX = jVel * dirX; velY = jVel * dirY; velZ = jVel * dirZ;
-                }
+                currentScript = &jm.b4_toUpperSteps;
+                finalTarget = jm.b4_distToUpper;
+                nextState = JumpState::B4_TO_APEX;
             }
-            else if (jm.state == JumpState::B4_TO_APEX || jm.state == JumpState::B4_DWELL || jm.state == JumpState::PAUSED_HOLD)
+            else if (jm.state == JumpState::B4_TO_APEX)
             {
-                if (offset > jm.b4_distToApex) offset = jm.b4_distToApex; // 🛡️ 絕對夾死
-                double tempOffset = (jm.state == JumpState::B4_DWELL || jm.state == JumpState::PAUSED_HOLD) ? jm.b4_distToApex : offset;
-
-                curX = jm.b4_upperCenterPos[0] + tempOffset * jm.b4_retractVector[0];
-                curY = jm.b4_upperCenterPos[1] + tempOffset * jm.b4_retractVector[1];
-                curZ = jm.b4_upperCenterPos[2] + tempOffset * jm.b4_retractVector[2];
-
-                if (jm.state == JumpState::B4_DWELL || jm.state == JumpState::PAUSED_HOLD) {
-                    velX = 0; velY = 0; velZ = 0;
-                }
-                else {
-                    velX = jVel * jm.b4_retractVector[0];
-                    velY = jVel * jm.b4_retractVector[1];
-                    velZ = jVel * jm.b4_retractVector[2];
-                }
+                currentScript = &jm.b4_toApexSteps;
+                finalTarget = jm.b4_distToApex;
+                nextState = JumpState::B4_DWELL;
             }
             else if (jm.state == JumpState::B4_FROM_APEX)
             {
-                if (offset > jm.b4_distToApex) offset = jm.b4_distToApex; // 🛡️ 絕對夾死
-                double dropOffset = jm.b4_distToApex - offset;
-
-                curX = jm.b4_upperCenterPos[0] + dropOffset * jm.b4_retractVector[0];
-                curY = jm.b4_upperCenterPos[1] + dropOffset * jm.b4_retractVector[1];
-                curZ = jm.b4_upperCenterPos[2] + dropOffset * jm.b4_retractVector[2];
-
-                velX = -jVel * jm.b4_retractVector[0];
-                velY = -jVel * jm.b4_retractVector[1];
-                velZ = -jVel * jm.b4_retractVector[2];
+                currentScript = &jm.b4_fromApexSteps;
+                finalTarget = jm.b4_distToApex;
+                nextState = JumpState::B4_TO_WORKPIECE;
             }
             else if (jm.state == JumpState::B4_TO_WORKPIECE)
             {
-                if (offset > jm.b4_distToUpper) offset = jm.b4_distToUpper; // 🛡️ 絕對夾死
-                if (jm.b4_distToUpper > 1e-6) {
-                    // 方向：從「上中心」指回「放電點」
-                    double dirX = (jm.frozenPos[0] - jm.b4_upperCenterPos[0]) / jm.b4_distToUpper;
-                    double dirY = (jm.frozenPos[1] - jm.b4_upperCenterPos[1]) / jm.b4_distToUpper;
-                    double dirZ = (jm.frozenPos[2] - jm.b4_upperCenterPos[2]) / jm.b4_distToUpper;
+                currentScript = &jm.b4_toWorkpieceSteps;
+                finalTarget = jm.b4_distToUpper;
+                nextState = JumpState::IDLE;
+            }
 
-                    curX = jm.b4_upperCenterPos[0] + offset * dirX;
-                    curY = jm.b4_upperCenterPos[1] + offset * dirY;
-                    curZ = jm.b4_upperCenterPos[2] + offset * dirZ;
-                    velX = jVel * dirX; velY = jVel * dirY; velZ = jVel * dirZ;
+            // 2. 執行 DWELL 或 移動
+            if (jm.state == JumpState::B4_DWELL)
+            {
+                jm.dwellTimer += dt * 1000.0;
+                if (jm.dwellTimer >= jm.dwellTimeTarget)
+                {
+                    jm.state = JumpState::B4_FROM_APEX;
+                    jm.currentStepIdx = 0; jm.currentOffset = 0.0; jm.jumpVel = 0.0;
+                }
+            }
+            else if (currentScript != nullptr && !currentScript->empty())
+            {
+                JumpSegment& seg = (*currentScript)[jm.currentStepIdx];
+                double realAcc = (seg.accTime > 0.0001) ? (seg.velocity / seg.accTime) : 1e10;
+                double realDec = (seg.decTime > 0.0001) ? (seg.velocity / seg.decTime) : 1e10;
+
+                double stepBoundary = 0.0;
+                for (int i = 0; i <= jm.currentStepIdx; ++i) stepBoundary += (*currentScript)[i].distance;
+
+                // 呼叫梯形規劃器
+                jm.currentOffset = PlanTrapezoidal(jm.currentOffset, finalTarget, seg.velocity, realAcc, realDec, jm.jumpVel, dt);
+
+                // 內部換檔
+                if (jm.currentOffset >= stepBoundary && jm.currentStepIdx < (int)currentScript->size() - 1)
+                {
+                    jm.currentStepIdx++;
+                }
+
+                if (jm.currentOffset >= finalTarget - 1e-5)
+                {
+
+                    jm.currentStepIdx = 0;
+                    jm.currentOffset = 0.0;
+                    jm.jumpVel = 0.0;
+                    jm.dwellTimer = 0.0;
+
+                    // ==========================================================
+                    // 🌟 [絕對關鍵：B4 暫停空中攔截網 (純數學真頂點)]
+                    // ==========================================================
+                    if (jm.state == JumpState::B4_TO_APEX && jm.isPauseMode)
+                    {
+                        jm.state = JumpState::PAUSED_HOLD;
+
+                        jm.apexPos[0] = jm.b4_upperCenterPos[0] + jm.b4_distToApex * jm.b4_retractVector[0];
+                        jm.apexPos[1] = jm.b4_upperCenterPos[1] + jm.b4_distToApex * jm.b4_retractVector[1];
+                        if (m_Group.axisCount >= 3)
+                        {
+                            jm.apexPos[2] = jm.b4_upperCenterPos[2] + jm.b4_distToApex * jm.b4_retractVector[2];
+                        }
+                        //RtPrintf("[PAUSE_B4] Safely Holding at Math Apex.\n");
+                    }
+                    else
+                    {
+                        jm.state = nextState;
+                    }
+
+                    // 🚨 PATH_SERVO 交接！
+                    if (jm.state == JumpState::IDLE)
+                    {
+                        m_Group.pathMode = PathMode::PATH_SERVO;
+                        jm.isRecovering = true; // 啟動軟著陸
+
+                        int idxX = m_Group.axisIndices[0], idxY = m_Group.axisIndices[1];
+                        int idxZ = (m_Group.axisCount >= 3) ? m_Group.axisIndices[2] : -1;
+                        (*m_pContexts)[idxX].logicalCmdPos = jm.frozenPos[0];
+                        (*m_pContexts)[idxY].logicalCmdPos = jm.frozenPos[1];
+                        if (idxZ != -1) (*m_pContexts)[idxZ].logicalCmdPos = jm.frozenPos[2];
+                    }
                 }
             }
 
-            // 🌟 寫入實體軸
-            (*m_pContexts)[idxX].logicalCmdPos = curX;
-            (*m_pContexts)[idxX].logicalCmdVel = velX;
-            (*m_pContexts)[idxY].logicalCmdPos = curY;
-            (*m_pContexts)[idxY].logicalCmdVel = velY;
-            if (idxZ != -1) {
-                (*m_pContexts)[idxZ].logicalCmdPos = curZ;
-                (*m_pContexts)[idxZ].logicalCmdVel = velZ;
-            }
+            // --------------------------------------------------
+            // 【第二部分：手腳 (3D 座標映射與無敵夾鉗)】
+            // --------------------------------------------------
+            if (jm.state != JumpState::IDLE)
+            {
+                double curX = jm.frozenPos[0], curY = jm.frozenPos[1], curZ = jm.frozenPos[2];
+                double velX = 0, velY = 0, velZ = 0;
+                double offset = jm.currentOffset;
+                double jVel = jm.jumpVel;
 
-            // 凍結虛擬主軸 (保持放電進度)
-            vAxis.currentCmdPos = jm.triggerPos;
-            vAxis.currentCmdVel = 0.0;
-        }
+                int idxX = m_Group.axisIndices[0], idxY = m_Group.axisIndices[1];
+                int idxZ = (m_Group.axisCount >= 3) ? m_Group.axisIndices[2] : -1;
+
+                if (jm.state == JumpState::B4_TO_UPPER_CENTER)
+                {
+                    if (offset > jm.b4_distToUpper) offset = jm.b4_distToUpper; // 🛡️ 絕對夾死
+                    if (jm.b4_distToUpper > 1e-6) {
+                        double dirX = (jm.b4_upperCenterPos[0] - jm.frozenPos[0]) / jm.b4_distToUpper;
+                        double dirY = (jm.b4_upperCenterPos[1] - jm.frozenPos[1]) / jm.b4_distToUpper;
+                        double dirZ = (jm.b4_upperCenterPos[2] - jm.frozenPos[2]) / jm.b4_distToUpper;
+
+                        curX = jm.frozenPos[0] + offset * dirX;
+                        curY = jm.frozenPos[1] + offset * dirY;
+                        curZ = jm.frozenPos[2] + offset * dirZ;
+                        velX = jVel * dirX; velY = jVel * dirY; velZ = jVel * dirZ;
+                    }
+                }
+                else if (jm.state == JumpState::B4_TO_APEX || jm.state == JumpState::B4_DWELL || jm.state == JumpState::PAUSED_HOLD)
+                {
+                    if (offset > jm.b4_distToApex) offset = jm.b4_distToApex; // 🛡️ 絕對夾死
+                    double tempOffset = (jm.state == JumpState::B4_DWELL || jm.state == JumpState::PAUSED_HOLD) ? jm.b4_distToApex : offset;
+
+                    curX = jm.b4_upperCenterPos[0] + tempOffset * jm.b4_retractVector[0];
+                    curY = jm.b4_upperCenterPos[1] + tempOffset * jm.b4_retractVector[1];
+                    curZ = jm.b4_upperCenterPos[2] + tempOffset * jm.b4_retractVector[2];
+
+                    if (jm.state == JumpState::B4_DWELL || jm.state == JumpState::PAUSED_HOLD) {
+                        velX = 0; velY = 0; velZ = 0;
+                    }
+                    else {
+                        velX = jVel * jm.b4_retractVector[0];
+                        velY = jVel * jm.b4_retractVector[1];
+                        velZ = jVel * jm.b4_retractVector[2];
+                    }
+                }
+                else if (jm.state == JumpState::B4_FROM_APEX)
+                {
+                    if (offset > jm.b4_distToApex) offset = jm.b4_distToApex; // 🛡️ 絕對夾死
+                    double dropOffset = jm.b4_distToApex - offset;
+
+                    curX = jm.b4_upperCenterPos[0] + dropOffset * jm.b4_retractVector[0];
+                    curY = jm.b4_upperCenterPos[1] + dropOffset * jm.b4_retractVector[1];
+                    curZ = jm.b4_upperCenterPos[2] + dropOffset * jm.b4_retractVector[2];
+
+                    velX = -jVel * jm.b4_retractVector[0];
+                    velY = -jVel * jm.b4_retractVector[1];
+                    velZ = -jVel * jm.b4_retractVector[2];
+                }
+                else if (jm.state == JumpState::B4_TO_WORKPIECE)
+                {
+                    if (offset > jm.b4_distToUpper) offset = jm.b4_distToUpper; // 🛡️ 絕對夾死
+                    if (jm.b4_distToUpper > 1e-6) {
+                        // 方向：從「上中心」指回「放電點」
+                        double dirX = (jm.frozenPos[0] - jm.b4_upperCenterPos[0]) / jm.b4_distToUpper;
+                        double dirY = (jm.frozenPos[1] - jm.b4_upperCenterPos[1]) / jm.b4_distToUpper;
+                        double dirZ = (jm.frozenPos[2] - jm.b4_upperCenterPos[2]) / jm.b4_distToUpper;
+
+                        curX = jm.b4_upperCenterPos[0] + offset * dirX;
+                        curY = jm.b4_upperCenterPos[1] + offset * dirY;
+                        curZ = jm.b4_upperCenterPos[2] + offset * dirZ;
+                        velX = jVel * dirX; velY = jVel * dirY; velZ = jVel * dirZ;
+                    }
+                }
+
+                // 🌟 寫入實體軸
+                (*m_pContexts)[idxX].logicalCmdPos = curX;
+                (*m_pContexts)[idxX].logicalCmdVel = velX;
+                (*m_pContexts)[idxY].logicalCmdPos = curY;
+                (*m_pContexts)[idxY].logicalCmdVel = velY;
+                if (idxZ != -1) {
+                    (*m_pContexts)[idxZ].logicalCmdPos = curZ;
+                    (*m_pContexts)[idxZ].logicalCmdVel = velZ;
+                }
+
+                // 凍結虛擬主軸 (保持放電進度)
+                vAxis.currentCmdPos = jm.triggerPos;
+                vAxis.currentCmdVel = 0.0;
+            }
         }
     }
 
@@ -6096,7 +6417,7 @@ void MotionCore::UpdateInterpolation()
         {
             physP[r] = m_Group.transformOrigin[r];
             physV[r] = 0.0;
-            for (int c = 0; c < 3; ++c) 
+            for (int c = 0; c < 3; ++c)
             {
                 physP[r] += m_Group.transformMatrix[r][c] * (logP[c] - m_Group.transformOrigin[c]);
                 physV[r] += m_Group.transformMatrix[r][c] * logV[c];
@@ -6107,7 +6428,7 @@ void MotionCore::UpdateInterpolation()
         realX.currentCmdVel = physV[0];
         realY.currentCmdPos = physP[1];
         realY.currentCmdVel = physV[1];
-        if (idxZ != -1) 
+        if (idxZ != -1)
         {
             (*m_pContexts)[idxZ].currentCmdPos = physP[2];
             (*m_pContexts)[idxZ].currentCmdVel = physV[2];
@@ -6119,14 +6440,14 @@ void MotionCore::UpdateInterpolation()
         realX.currentCmdVel = realX.logicalCmdVel;
         realY.currentCmdPos = realY.logicalCmdPos;
         realY.currentCmdVel = realY.logicalCmdVel;
-        if (idxZ != -1) 
+        if (idxZ != -1)
         {
             (*m_pContexts)[idxZ].currentCmdPos = (*m_pContexts)[idxZ].logicalCmdPos;
             (*m_pContexts)[idxZ].currentCmdVel = (*m_pContexts)[idxZ].logicalCmdVel;
         }
     }
 
-  
+
     // 3. 結束檢查 (G00 / G01 實體馬達準停確認)
     // =========================================================
     if (vAxis.state == MotionState::MotionState_IDLE)
@@ -6168,7 +6489,7 @@ void MotionCore::UpdateInterpolation()
     static double lastRealVelX = 0;
     double currentRealVelX = (*m_pContexts)[m_Group.axisIndices[0]].logicalCmdVel;
 
-   
+
     lastRealVelX = currentRealVelX;
 
 
@@ -6193,7 +6514,7 @@ void MotionCore::SyncVirtualEndPosition()
     if (m_pContexts == nullptr || m_pContexts->empty()) return;
 
     // 🌟 修正：動態取得 vector 實際的大小，絕對不寫死 8！
-    for (size_t i = 0; i < m_pContexts->size(); i++) 
+    for (size_t i = 0; i < m_pContexts->size(); i++)
     {
         if ((*m_pContexts)[i].isExist)
         {
@@ -6357,6 +6678,39 @@ bool MotionCore::IsGroupFaulted() const
             {
                 return true;
             }
+        }
+    }
+
+    return false;
+}
+
+bool MotionCore::IsGroupEmergencyStopped() const
+{
+    if (m_Group.virtualAxis.state ==
+        MotionState::MotionState_ESTOP)
+    {
+        return true;
+    }
+
+    if (m_pContexts == nullptr)
+    {
+        return false;
+    }
+
+    for (int i = 0;
+        i < m_Group.axisCount;
+        ++i)
+    {
+        const int axisIndex =
+            m_Group.axisIndices[i];
+
+        const AxisContext& axis =
+            (*m_pContexts)[axisIndex];
+
+        if (axis.state ==
+            MotionState::MotionState_ESTOP)
+        {
+            return true;
         }
     }
 

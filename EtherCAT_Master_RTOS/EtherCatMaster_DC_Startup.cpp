@@ -15,18 +15,17 @@
 
 // ============================================================================
 // EtherCatMaster_DC_Startup.cpp
-// EtherCAT DC 啟動與 PDO One-Shot 建立流程 RC1.7 + AUTO Topology Dry-Run V1
+// EtherCAT DC 啟動與 PDO One-Shot 建立流程 RC1.8
 //
 // 本檔責任：
 //   1. 啟動時確認 RTX64 HAL period counts 回到系統 base 值。
 //   2. 依 AUTO／FIXED 規則選擇獨立 DC Reference，讀取其 0x0910 System Time。
-//   3. 唯讀檢查 AUTO Servo 順序、DC 能力、Port Link 與既有 0x0928。
-//   4. 讀取 AUTO／FIXED Drift 設定，於正式 timer 前發布唯讀設定快照。
-//   5. 用隔離的 disposable timer 驗證 coarse one-shot + QPC fine wait 能力。
-//   6. 建立真正 Priority 80 PDO timer，並先做同一 timer 的一次 warm-up。
-//   7. 以最低 RTT 樣本估算 CLOCK_2 Master time 與 EtherCAT DC time 的 offset。
-//   8. 找出未來的 DC phase 0 目標，換算成 CLOCK_2 absolute expiration 後啟動 PDO。
-//   9. 若 DC 量測或 absolute arm 失敗，以 250 us relative one-shot 安全啟動。
+//   3. 讀取 AUTO／FIXED Drift 設定，於正式 timer 前發布唯讀設定快照。
+//   4. 用隔離的 disposable timer 驗證 coarse one-shot + QPC fine wait 能力。
+//   5. 建立真正 Priority 80 PDO timer，並先做同一 timer 的一次 warm-up。
+//   6. 以最低 RTT 樣本估算 CLOCK_2 Master time 與 EtherCAT DC time 的 offset。
+//   7. 找出未來的 DC phase 0 目標，換算成 CLOCK_2 absolute expiration 後啟動 PDO。
+//   8. 若 DC 量測或 absolute arm 失敗，以 250 us relative one-shot 安全啟動。
 //
 // 啟動完成後的責任分工：
 //   - 本檔只負責建立／warm-up／第一次 arm。
@@ -173,13 +172,16 @@ static void LoadDcDriftCalibrationConfig()
         "Mode:%s | "
         "Bootstrap:%+lld ppb | "
         "Fixed:%+lld ppb | "
-        "Range:%+lld..%+lld ppb | "
+        "CaptureRange:%+lld..%+lld ppb | "
+        "RealFfRange:%+lld..%+lld ppb | "
         "GoodWindows:%lu | "
         "MADMax:%lld ppb | "
         "RawMedianMax:%lld ppb\n",
         configuredMode == 1 ? "FIXED" : "AUTO",
         (long long)EtherCatDcTuning::SchedulerBootstrapDriftPpb,
         (long long)fixedPpb,
+        (long long)EtherCatDcTuning::DriftCalibrationMinimumPpb,
+        (long long)EtherCatDcTuning::DriftCalibrationMaximumPpb,
         (long long)EtherCatDcTuning::RealFfMinimumDriftPpb,
         (long long)EtherCatDcTuning::RealFfMaximumDriftPpb,
         (unsigned long)EtherCatDcTuning::DriftCalibrationGoodWindows,
@@ -1119,11 +1121,6 @@ int EtherCatMaster::StartDcPdoRuntime()
     // 選擇失敗時保留 -1，後續退回普通 LRW 與 relative PDO timer。
     // ========================================================================
     ResolveDcReferenceSlave(
-        this);
-
-    // AUTO Topology V1 僅做啟動期 Dry-Run：讀取順序、0x0110、0x0910、0x0928
-    // 並輸出驗證結果，不寫任何從站暫存器，也不影響失敗時的既有啟動流程。
-    DiagnoseDcAutoTopologyDryRun(
         this);
 
     // Drift 設定必須在建立正式 PDO timer 前固定；Runtime 只讀取記憶體快照。

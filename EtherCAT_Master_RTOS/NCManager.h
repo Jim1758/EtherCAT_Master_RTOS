@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include "NC_Types.h"
 #include "MotionCore.h"
+#include "HomingManager.h"
 #include "CoordinateManager.h"
 #include "MacroEngine.h"       // 必須要有
 #include "MacroParser.h"       // 必須要有
@@ -122,6 +123,16 @@ public:
     int GetAxisIndex(char gcodeLetter) const;
 
 
+    // ======================================================
+    // Dynamic Axis Mapping Query
+    //
+    // 回傳 AXIS_CFG.ini 對應的軸代號。
+    // 例如 Axis3=C -> GetAxisName(3) == 'C'。
+    // 無效或未設定則回傳 '?'。
+    // ======================================================
+    char GetAxisName(int axisIndex) const;
+
+
     const size_t MAX_MDI_LINES = 20;                        // MDI 模式最大行數
     const size_t MAX_MANUAL_AUTO_BYTES = 1024 * 1024;       // MANUAL 自動模式最大字串 (1024KB = 1MB)
 
@@ -200,6 +211,23 @@ public:
     uint32_t API_RunCount;//API執行迴圈數
     MotionCore& m_motion;
 
+    // =========================================================
+    // G81 HOME Manager
+    //
+    // NCManager 擁有一個 HomingManager。
+    //
+    // HomingManager：
+    //     負責 G81 HOME 流程 / 狀態機 / 多軸排程。
+    //
+    // MotionCore：
+    //     仍負責真正的軸運動。
+    //
+    // 這裡直接使用 m_motion 建立，
+    // 所以不需要另外 new / delete。
+    // =========================================================
+
+    HomingManager Homing{ m_motion };
+
     NCOperationMode m_mode = NCOperationMode::MANUAL;
     NCState m_state = NCState::NOT_READY;
     EDMState m_edmState = EDMState::NOT_READY;
@@ -216,7 +244,7 @@ public:
     std::string m_mainProgramName = "";
     std::string m_macroProgramName = "";
     int m_macroProgramPC = -1; // -1 代表目前沒有在執行副程式
- 
+
 
   // ==========================================
     // 🌟 新增：多層副程式 (Macro) 執行框架結構
@@ -296,5 +324,5 @@ public:
 
 
 
-   
+
 };

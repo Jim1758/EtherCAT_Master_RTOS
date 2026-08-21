@@ -10,6 +10,7 @@
 #include "AlarmManager.h"
 #include "PLCManager.h" // 🌟 1. 引入 PLC 管理器標頭檔
 #include "NCPLCManager.h"
+#include "HomePersistenceManager.h"
 
 int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行 EDM模式
 {
@@ -29,7 +30,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     }
 
 
-   
+
 
     bool isSuccess = PDO_SendCommandAndWait(EcatCmdType::CMD_SET_STATE, 0x0000, 0x0000, 0x00, 0x0008, 2, 1000);//廣播切換OP狀態 PDO傳送
 
@@ -72,6 +73,9 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         if (m_NC->Close_System_Com_flag == true)//關閉核心命令
         {
             m_NC->CoordSys.SaveAllParameters();//儲存座標系統相關參數
+
+            // 關機前最後 Flush 一次 HOME Snapshot / History。
+            HomePersistenceManager::GetInstance().FlushPending();
 
             g_PLC->Close_PLC();//關閉PLC作業
             SHMManager::GetInstance().Shutdown();//關閉共享記憶體
@@ -135,10 +139,14 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
             timer_1000ms = 0; // 執行完立刻歸零
             timer_1000ms_Count += 1;
             HMI_Bridge::ProcessTask_1000ms(m_NC); // 呼叫 1000ms 任務
+
+         
+
             //DEBUG_PRINT("1000ms\n");
 
 
             PrintDcRuntimeDiagnostics();//DC診斷訊息
+            HomePersistenceManager::GetInstance().FlushPending();//低平率寫入檔案(HOME)
         }
 
         //5000ms
@@ -146,7 +154,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         {
             timer_5000ms = 0; // 執行完立刻歸零
             timer_5000ms_Count += 1;
-            
+
             //DEBUG_PRINT("5000ms\n");
 
 
@@ -162,7 +170,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
             //DEBUG_PRINT("5000ms\n");
 
 
-           
+
         }
 
         if (Debug_test_timer >= 1000)

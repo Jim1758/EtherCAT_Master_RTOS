@@ -48,9 +48,33 @@ public:
         HARD_LIMIT = AXIS_BASE + 2,   // 3002: 硬體極限開關觸發
         SERVO_ERROR = AXIS_BASE + 3,    // 3003: 伺服驅動器異常 (ALM)
         AXIS_LAG_ERROR = AXIS_BASE + 4,    // 3004: 追隨誤差過大 (Lag Error)
-        AXIS_Fault = AXIS_BASE + 5 ,   // 3005: 驅動器硬體內部報警 (Fault)
-        MANUAL_AXIS_PROTECT = AXIS_BASE + 6         // 3006: 手動軸保護輸入觸發
-     
+        AXIS_Fault = AXIS_BASE + 5,   // 3005: 驅動器硬體內部報警 (Fault)
+        MANUAL_AXIS_PROTECT = AXIS_BASE + 6,   // 3006: 手動軸保護輸入觸發
+        PROGRAMMED_OVER_TRAVEL = AXIS_BASE + 7, // 3007: NC 路徑預測會碰觸軟體極限
+
+        // =====================================================
+        // G81 HOME 尋原點警報
+        //
+        // 只要進入 AlarmManager：
+        //
+        //     NC -> ALARM
+        //     Motion -> Emergency Stop
+        //
+        // 正常 DOG / INDEX 找到後的滑行停止不是 Alarm。
+        // =====================================================
+
+        HOME_INVALID_CONFIG = AXIS_BASE + 8,        // 3008: HOME 參數或方法設定錯誤
+        HOME_SEARCH_NOT_FOUND = AXIS_BASE + 9,      // 3009: 超過距離或時間仍找不到 DOG / 預期 LIMIT
+        HOME_SWITCH_STOP_DISTANCE = AXIS_BASE + 10, // 3010: DOG / LIMIT 觸發後滑行停止距離過大
+        HOME_BACKOFF_FAILED = AXIS_BASE + 11,       // 3011: Backoff 超過最大距離或時間仍未完成
+        HOME_DOG_NOT_RELEASED = AXIS_BASE + 12,     // 3012: Backoff 完成後 HOME DOG 仍未解除
+        HOME_LIMIT_NOT_RELEASED = AXIS_BASE + 13,   // 3013: Backoff 完成後硬體極限仍未解除
+        HOME_INDEX_NOT_FOUND = AXIS_BASE + 14,      // 3014: 超過距離或時間仍找不到 INDEX
+        HOME_REFERENCE_INVALID = AXIS_BASE + 15,    // 3015: INDEX / Absolute Reference 資料無效
+        HOME_OPPOSITE_LIMIT = AXIS_BASE + 16,       // 3016: HOME 過程觸發相反方向硬體極限
+        HOME_BOTH_LIMITS = AXIS_BASE + 17,          // 3017: 正負硬體極限同時觸發
+        HOME_MOTION_FAULT = AXIS_BASE + 18          // 3018: HOME 過程發生 Servo / Motion Fault
+
     };
 
     // 🌟 5. EDM 放電警報 (4000 ~ 4999)

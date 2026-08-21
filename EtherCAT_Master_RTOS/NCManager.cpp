@@ -9,8 +9,24 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+namespace GCodeHandlers
+{
+    WaitConditionFunc Handle_G81(const NCBlock& block, NCManager* nc);
+}
+
 NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys), Parser(MathParser)
 {
+    // =========================================================
+    // G81 HOME Manager Link
+    //
+    // NCManager 建立完成後，將自己交給 HomingManager。
+    //
+    // 目前只建立 NC <-> HomingManager 連結，
+    // 不會啟動任何 HOME Motion。
+    // =========================================================
+
+    Homing.LinkNCManager(this);
+
     // 初始化軸名稱為空白字元 (防呆)
     for (int i = 0; i < 8; i++) {
         m_axisNames[i] = ' ';
@@ -45,7 +61,7 @@ bool NCManager::LoadProgram(const std::string& filepath)
     m_jumpTable.clear(); // 清空舊的跳躍表
     m_programPC = 0;
     m_motion.ResetPhysicalPC(); // 🌟 載入新程式，實體行號歸零
-   
+
     // 🌟 取得大腦目前的狀態，並同步給馬達標籤機
     int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
     int currentBrainToolMode = CoordSys.toolLengthMode;
@@ -75,7 +91,7 @@ bool NCManager::LoadProgram(const std::string& filepath)
     int curPlane = CoordSys.activePlane; // 17, 18 或是 19
 
     // 🌟 拿大腦最乾淨的狀態強制洗掉馬達的殘影
-    m_motion.ResetPhysicalTags(CoordSys.GetCurrentWCSGCode(),CoordSys.toolLengthMode, CoordSys.currentHCode,CoordSys.toolRadiusMode, CoordSys.currentDCode, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+    m_motion.ResetPhysicalTags(CoordSys.GetCurrentWCSGCode(), CoordSys.toolLengthMode, CoordSys.currentHCode, CoordSys.toolRadiusMode, CoordSys.currentDCode, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
 
 
     std::string line;
@@ -104,7 +120,7 @@ bool NCManager::LoadProgram(const std::string& filepath)
 void NCManager::ChangeMode(NCOperationMode newMode)
 {
     // 只有在 IDLE 或 READY 狀態才能切換模式
-    if (m_state == NCState::IDLE || m_state == NCState::READY|| m_state == NCState::P_END) {
+    if (m_state == NCState::IDLE || m_state == NCState::READY || m_state == NCState::P_END) {
         m_mode = newMode;
     }
 
@@ -123,63 +139,141 @@ void NCManager::ChangeState(NCState newState) {
 // ==========================================
 void NCManager::CycleStart()
 {
-    // 如果目前是 HOLD 狀態，代表我們要「解除暫停」
+    // =========================================================
+    // G81 HOME Resume
+    //
+    // HOME Feed Hold 不再 Cancel Request。
+    // m_active 保持 true，G81 Wait Callback 仍卡在原行。
+    // =========================================================
+
+    if (m_state == NCState::HOLD &&
+        Homing.IsActive())
+    {
+        const bool resumeAccepted =
+            Homing.Resume();
+
+        if (!resumeAccepted)
+        {
+            return;
+        }
+
+
+        // 已完全 PAUSED 時 Resume() 會立即恢復 RUNNING。
+        // 若仍在 HOLD_DECEL_STOP，Resume Request 先排隊，
+        // HomingManager 會在真正停妥後把 NC 切回 RUN。
+        if (!Homing.IsHoldDecelerating())
+        {
+            m_state =
+                NCState::RUN;
+        }
+
+        m_pauseAfterBlock =
+            false;
+
+        return;
+    }
+
+
+    // 一般 NC Program Feed Hold Resume。
     if (m_state == NCState::HOLD)
     {
-        m_state = NCState::RUN;
-        m_motion.SetGroupFeedrateOverride(1.0); // 恢復進給倍率
-        m_pauseAfterBlock = false; // 🌟 核心防護：只要按下啟動，強制清除當前行的暫停要求，消滅雙重卡點！
+        m_state =
+            NCState::RUN;
+
+        m_motion.SetGroupFeedrateOverride(
+            1.0);
+
+        m_pauseAfterBlock =
+            false;
+
+        return;
     }
-    // 如果是正常 READY 或 P_END (程式結束)，代表我們要「全新啟動」
-    else if (m_state == NCState::READY || m_state == NCState::P_END)
+
+
+    // 正常 READY 或 P_END：全新啟動。
+    if (m_state == NCState::READY ||
+        m_state == NCState::P_END)
     {
-        // 🌟 從 P_END 重新啟動，強制行號為 0，洗乾淨狀態
-        if (m_state == NCState::P_END) {
-            GetBasePC() = 0;
+        if (m_state == NCState::P_END)
+        {
+            GetBasePC() =
+                0;
+
             Reset_Gode();
             m_macroStack.clear();
         }
 
-        if (m_mode == NCOperationMode::MANUAL && !m_manualMemory.empty()) {
-            m_manualAutoRunning = true;
+
+        if (m_mode == NCOperationMode::MANUAL &&
+            !m_manualMemory.empty())
+        {
+            m_manualAutoRunning =
+                true;
         }
 
-        m_pauseAfterBlock = false; // 確保乾淨啟動
+
+        m_pauseAfterBlock =
+            false;
+
         m_motion.SyncVirtualEndPosition();
         UpdateSystemVariables();
 
-        m_state = NCState::RUN; // 狀態轉為 RUN，正式出發！
+        m_state =
+            NCState::RUN;
     }
 }
 
 void NCManager::FeedHold()
 {
-    // 只有在運行中 (RUN) 按下暫停才有效
+    // =========================================================
+    // G81 HOME Feed Hold
+    //
+    // Hold：可 Resume。
+    // Reset / Alarm：不可 Resume。
+    // =========================================================
+
+    if (Homing.IsActive())
+    {
+        if (Homing.RequestHold())
+        {
+            m_state =
+                NCState::HOLD;
+        }
+
+        return;
+    }
+
+
     if (m_state == NCState::RUN)
     {
-        m_state = NCState::HOLD; // 鎖住 NC，讓它停在現在的 G 碼，不要讀下一行
+        m_state =
+            NCState::HOLD;
 
-        // 🌟 神奇魔法：將倍率設為 0.0，底層的軌跡規劃器就會沿著原路徑平滑煞車！
-        m_motion.SetGroupFeedrateOverride(0.0);
+        m_motion.SetGroupFeedrateOverride(
+            0.0);
 
-        //DEBUG_PRINT("[NC] Feed Hold Triggered!\n");
+        m_pauseAfterBlock =
+            false;
     }
 }
 
 void NCManager::Reset()
 {
+    if (Homing.IsActive()) Homing.Cancel();
+
 
     //重置馬達區塊--------------------------------------------------
-    if (m_motion.IsAnyAxisFaulted())
+    if (m_motion.IsAnyAxisFaulted() || m_motion.IsGroupFaulted() || m_motion.IsGroupEmergencyStopped())
     {
         m_motion.ResetAllFaults();//有錯誤才清除
 
     }
+
     m_motion.StopGroup();//滑行停止
     m_motion.ResetPhysicalPC(); // 🌟 按下 Reset，實體行號歸零
-    
-  
-   
+
+
+
     // 🌟 [新增] 如果有放電跳刀/排渣，必須強制解鎖跳刀狀態機！
     // m_motion.ResetAllFaults(); // (如果您有寫清除跳刀狀態的 API，建議在這裡呼叫)
 
@@ -225,12 +319,12 @@ void NCManager::Reset()
 
     //m_motion.EmergencyStopGroup();//急停
     //m_motion.ResetAllFaults();//軸清除錯誤
-    
-   
+
+
     m_motion.SetGroupFeedrateOverride(1.0);//進給倍率回到100%
 
-   
-   
+
+
     // 🌟 清理完成後刷新變數
     UpdateSystemVariables();
 
@@ -264,7 +358,7 @@ void NCManager::Reset()
 
 
     m_state = NCState::RESET_STATE;
-   
+
 
 
 
@@ -280,7 +374,7 @@ void NCManager::Reset_Gode()       // 重置G碼相關
     CoordSys.isCAxisOffsetRotationEnabled = true;//C 軸電極偏心旋轉補償
     CoordSys.CancelScaling(this);//關閉縮放功能
     bool hasAxis[8] = { false };
-    CoordSys.CancelMirror(hasAxis,this);//關閉鏡像功能
+    CoordSys.CancelMirror(hasAxis, this);//關閉鏡像功能
     CoordSys.CancelPolarCoordinate(this);//關閉極座標
     CoordSys.CancelToolRadiusCompensation(this);//關閉刀徑補償
 
@@ -307,7 +401,7 @@ bool NCManager::CallMacro(const std::string& filename) {
     }
 
     std::string fullPath = macroDir + filename;
-   // DEBUG_PRINT("[NC Macro] Attempting to open macro file: %s\n", fullPath.c_str());
+    // DEBUG_PRINT("[NC Macro] Attempting to open macro file: %s\n", fullPath.c_str());
 
     std::ifstream file(fullPath);
     if (!file.is_open()) {
@@ -404,7 +498,7 @@ void NCManager::ProcessTask()
         UpdateSystemVariables();
         UpdateSystemVariables_initialize_flag = 1;//
     }
-  
+
     // =========================================================
     // 🌟 4. 【結尾動作】將最新的 NC 狀態刷給 PLC S 點！
     // =========================================================
@@ -423,17 +517,17 @@ void NCManager::ProcessTask()
     // 🚨 2. 【絕對防禦攔截網】警報與急停鎖死區
     // =========================================================
     // 不論是軟體觸發的 Alarm，或是從 UI 傳下來的 Alarm 狀態
-    if (AlarmManager::GetInstance().HasAlarm() || m_state == NCState::ALARM) 
+    if (AlarmManager::GetInstance().HasAlarm() || m_state == NCState::ALARM)
     {
         m_state = NCState::ALARM; // 確保 NC 大腦確實進入警報狀態
 
         // 🌟 [關鍵新增]：只要在警報狀態，每一毫秒都強制下達急停！
         // (底層的 EmergencyStop 有防重複機制，所以這樣寫既安全又暴力)
-      
-        m_motion.EmergencyStopGroup();
+
+        m_motion.EmergencyStopAllAxes();
 
         // ⚠️ 立刻退出迴圈，絕對不准往下執行任何軌跡運算或 G 碼解析！
-        return; 
+        return;
     }
 
     // =========================================================
@@ -441,12 +535,12 @@ void NCManager::ProcessTask()
     // =========================================================
     if (m_state == NCState::RESET_STATE)
     {
-    
+
         // 檢查硬體馬達是否「完全靜止」？
         if (m_motion.IsGroupStandstill())
         {
-           
-            
+
+
             // 🛑 馬達完全靜止了！現在才是同步的完美時機！
 
             // 1. 同步大腦的數學座標 (把實體座標拉回大腦)
@@ -462,7 +556,7 @@ void NCManager::ProcessTask()
             // DEBUG_PRINT("[NC] Reset Complete. Machine completely stopped.\n");
         }
 
-        
+
 
         // ⚠️ 只要還在滑行，就立刻 return，不准執行下面的 G 碼解析與模式分流！
         return;
@@ -515,7 +609,7 @@ void NCManager::ProcessTask()
         break;
     }
 
-   
+
 }
 
 
@@ -658,11 +752,11 @@ void NCManager::ProcessExecutionEngine()
 
                 isBarrier = isBarrier || (block.hasG && (
                     block.gCode == 0 || block.gCode == 12 || block.gCode == 4 ||
-                    block.gCode == 7 || 
+                    block.gCode == 7 ||
                     block.gCode == 20 || block.gCode == 21 ||
                     block.gCode == 22 || block.gCode == 23 ||
                     block.gCode == 28 || block.gCode == 30 ||
-                    block.gCode == 32 || block.gCode == 53 || block.gCode == 161 ||
+                    block.gCode == 32 || block.gCode == 53 || block.gCode == 81 || block.gCode == 161 ||
                     block.gCode == 65 || block.gCode == 66 || block.gCode == 67 || block.gCode == 92 ||
                     (block.gCode >= 54 && block.gCode <= 59) ||
                     (block.gCode >= 154 && block.gCode <= 159) ||
@@ -848,7 +942,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
     // ==========================================
     // 🌟 安全性檢查：單節是否包含多個 G 碼
     // ==========================================
-    if (block.gCount > 1) 
+    if (block.gCount > 1)
     {
         //DEBUG_PRINT("[Alarm] Multiple G-Codes in a single block! Found: %d\n", block.gCount);
         AlarmManager::GetInstance().Trigger(AlarmManager::G_code_Count_Error);
@@ -873,11 +967,11 @@ void NCManager::ExecuteBlock(const NCBlock& block)
     // ==========================================
     // 1. 瞬間完成的設定 (不需等待)
     // ==========================================
-    if (block.has('E')) 
+    if (block.has('E'))
     {
         // m_edmManager.ApplyE(block.val('E'));
     }
-    if (block.has('B')) 
+    if (block.has('B'))
     {
         // m_edmManager.ApplyB(block.val('B'));
     }
@@ -887,7 +981,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
         int tVal = (int)block.val('T');
         CoordSys.SetToolNumber(tVal, this);
     }
-  
+
 
     // ==========================================
     // 2. G 碼轉接中心 (Routing Hub)
@@ -895,7 +989,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
     if (block.hasG) {
         switch (block.gCode)
         {
-        case 0:        
+        case 0:
             m_waitCallback = GCodeHandlers::Handle_G00(block, this);
             break;
         case 7:
@@ -910,10 +1004,13 @@ void NCManager::ExecuteBlock(const NCBlock& block)
         case 53:
             m_waitCallback = GCodeHandlers::Handle_G53(block, this);
             break;
+        case 81:
+            m_waitCallback = GCodeHandlers::Handle_G81(block, this);
+            break;
         case 28:
             m_waitCallback = GCodeHandlers::Handle_G28(block, this);
             break;
-      
+
         case 30:
             m_waitCallback = GCodeHandlers::Handle_G30(block, this);
             break;
@@ -921,7 +1018,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
             m_waitCallback = GCodeHandlers::Handle_G32(block, this);
             break;
         case 4:
-          
+
             m_waitCallback = GCodeHandlers::Handle_G04(block, this);
             break;
 
@@ -956,14 +1053,14 @@ void NCManager::ExecuteBlock(const NCBlock& block)
         case 17: case 18:case 19:
         case 65:  case 66: case 67:
         case 162: case 163:
-        
+
             // 狀態設定回傳的一定是 nullptr (不需等待)
             m_waitCallback = GCodeHandlers::Handle_GCode(block, this);
             break;
-    
+
         case 168:
             m_waitCallback = GCodeHandlers::Handle_G168(block, this);
-                break;
+            break;
         case 169:
             m_waitCallback = GCodeHandlers::Handle_G169(block, this);
             break;
@@ -1031,7 +1128,7 @@ void NCManager::ExecuteBlock(const NCBlock& block)
         }
     }
 
-   
+
 
     // 🌟 在單節解單/發包完成後，立刻刷一次系統變數！
     UpdateSystemVariables();
@@ -1042,8 +1139,8 @@ void NCManager::ExecuteBlock(const NCBlock& block)
 // =========================================================
 void NCManager::LoadAxisConfiguration()
 {
-    
-    std::string filepath = GlobalConfig::GetInstance().NCDataDir +"AXIS_CFG.ini";
+
+    std::string filepath = GlobalConfig::GetInstance().NCDataDir + "AXIS_CFG.ini";
     std::ifstream inFile(filepath);
 
     if (!inFile.is_open()) {
@@ -1090,6 +1187,35 @@ int NCManager::GetAxisIndex(char gcodeLetter) const
         }
     }
     return -1; // -1 代表這台機器沒有設定這個軸！
+}
+
+
+// =========================================================
+// Dynamic Axis Mapping Query
+// =========================================================
+char NCManager::GetAxisName(
+    int axisIndex) const
+{
+    if (axisIndex < 0 ||
+        axisIndex >= 8)
+    {
+        return '?';
+    }
+
+
+    const char axisName =
+        m_axisNames[axisIndex];
+
+
+    if (axisName == '\0' ||
+        axisName == ' ')
+    {
+        return '?';
+    }
+
+
+    return
+        axisName;
 }
 
 
@@ -1173,7 +1299,7 @@ bool NCManager::LoadDynamicCode(const std::string& content)
     *targetPC = 0;
     m_motion.ResetPhysicalPC(); // 🌟 載入 MDI，實體行號歸零
 
-   
+
 
     // 🌟 取得大腦目前的狀態，並同步給馬達標籤機
     int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
@@ -1204,7 +1330,7 @@ bool NCManager::LoadDynamicCode(const std::string& content)
     int curPlane = CoordSys.activePlane; // 17, 18 或是 19
 
     m_motion.ResetPhysicalTags(currentBrainWCS, currentBrainToolMode, currentBrainHCode, currentBraintoolRadiusMode, currentBraintoolDCode, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
-    
+
 
     // 3. 解析並塞入記憶體
     std::stringstream ss(content);
@@ -1250,7 +1376,7 @@ EDMState NCManager::GetMachineEDMState()
             {
                 AlarmManager::GetInstance().Trigger(AlarmManager::AXIS_LAG_ERROR, 0, axis.axisIndex);
             }
-       
+
 
             return EDMState::ALARM;
         }

@@ -21,13 +21,13 @@
 #define REG_AL_STATUS    0x0130
 
 #pragma pack(push, 1)
-typedef struct 
+typedef struct
 {
     uint16_t Length;
     uint16_t Type;
 } EtherCatHeader;
 
-typedef struct 
+typedef struct
 {
     uint8_t  Cmd;
     uint8_t  Index;
@@ -47,18 +47,18 @@ typedef struct
 // 對應 RxPDO (1601h): 總長度 9 Bytes
 struct ServoOutput
 {
-    
+
     uint16_t ControlWord;      // [0-1] 控制字 (6040h) - 16 bit
     int32_t  TargetVelocity;   // [2-5] 目標速度 (60FFh) - 32 bit
     uint16_t TouchProbeFunc;   // [6-7] 探針功能 (60B8h) - 16 bit
     int8_t   ModesOfOperation; // [8]   操作模式 (6060h) - 8 bit (1 Byte)
-   
+
 };
 
 // 對應 TxPDO (1A01h): 總長度 23 Bytes
 struct ServoInput
 {
-   
+
     uint16_t StatusWord;              // [0-1]   狀態字 (6041h) - 16 bit
     int32_t  ActualPosition;          // [2-5]   實際位置 (6064h) - 32 bit
     int32_t  ActualVelocity;          // [6-9]   實際速度 (606Ch) - 32 bit
@@ -68,7 +68,7 @@ struct ServoInput
     int8_t   ModesOfOperationDisplay; // [18]    目前模式顯示 (6061h) - 8 bit (1 Byte)
     uint32_t Object_2510;             // [19-22] 廠商自定義參數 (2510h) - 32 bit
 
-   
+
 };
 #pragma pack(pop)
 
@@ -125,7 +125,7 @@ struct ENI_AnalogModule
 // ============================================================================
 
 // [保留] 結構名稱必須是 EtherCatSlave
-struct EtherCatSlave 
+struct EtherCatSlave
 {
     char name[128];
     char type[128];

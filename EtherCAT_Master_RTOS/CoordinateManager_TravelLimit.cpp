@@ -125,7 +125,7 @@ void CoordinateManager::SetStoredStrokeCheckMode( int gCode,NCManager* nc)
         //
         // Enable Programmable Travel Limit 1
         m_programmableTravelLimitEnabled = true;
-        nc->MacroSys.SetVar('$', 6, 22.0);
+        nc->MacroSys.SetVar('$', 4, 22.0);
         break;
 
 
@@ -135,7 +135,7 @@ void CoordinateManager::SetStoredStrokeCheckMode( int gCode,NCManager* nc)
         //
         // Disable Programmable Travel Limit 1
         m_programmableTravelLimitEnabled = false;
-        nc->MacroSys.SetVar('$', 6, 23.0);
+        nc->MacroSys.SetVar('$', 4, 23.0);
         break;
 
 
@@ -166,11 +166,11 @@ void CoordinateManager::SetProgrammableTravelLimitEnabled(
 
     if (enabled == true)
     {
-        //nc->MacroSys.SetVar('$', 6, 22.0);
+        nc->MacroSys.SetVar('$', 4, 22.0);
     }
     else
     {
-        //nc->MacroSys.SetVar('$', 6, 23.0);
+        nc->MacroSys.SetVar('$', 4, 23.0);
     }
 
 

@@ -115,6 +115,12 @@
     <Filter Include="Header Files\NC\Coordinate">
       <UniqueIdentifier>{7ad4bc7e-2b5b-47b9-8297-2a63580b0e2b}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\NC\Home">
+      <UniqueIdentifier>{5e5515dd-d7be-4779-be73-3941a490a766}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\NC\Home">
+      <UniqueIdentifier>{476d704f-4d73-426b-9ace-b46a6499f3c8}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
@@ -270,6 +276,15 @@
     <ClCompile Include="CoordinateManager_TravelLimit.cpp">
       <Filter>Source Files\NC\Coordinate</Filter>
     </ClCompile>
+    <ClCompile Include="HomingManager.cpp">
+      <Filter>Source Files\NC\Home</Filter>
+    </ClCompile>
+    <ClCompile Include="G81.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
+    <ClCompile Include="HomePersistenceManager.cpp">
+      <Filter>Source Files\NC\Home</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -367,6 +382,15 @@
     </ClInclude>
     <ClInclude Include="CoordinateManager.h">
       <Filter>Header Files\NC\Coordinate</Filter>
+    </ClInclude>
+    <ClInclude Include="HomeTypes.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="HomingManager.h">
+      <Filter>Header Files\NC\Home</Filter>
+    </ClInclude>
+    <ClInclude Include="HomePersistenceManager.h">
+      <Filter>Header Files\NC\Home</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

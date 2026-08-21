@@ -50,8 +50,8 @@ void NCPLCManager::Process()
 
     // 3. PLC -> NC
     ProcessGlobalInputs();
-    ProcessManualInputs();
     ProcessHomeInputs();
+    ProcessManualInputs();
     ProcessAuxiliaryHandshake();
 
     // 4. NC -> PLC
@@ -74,14 +74,59 @@ void NCPLCManager::ProcessGlobalInputs()
 
     if (cycleStart && !m_prevCycleStart)
     {
-        bool hardLimitActive = false; // Hard Limit Check
-        for (int i = 0; i < NCPLC::AXIS_COUNT; ++i)
+        // =================================================
+        // HOME Resume Gate
+        //
+        // 一般 Cycle Start：任何 Hard Limit 都禁止。
+        //
+        // LIMIT_ONLY / LIMIT_INDEX HOME 暫停時：
+        // 預期方向 Limit 可能仍然 ON，必須允許 C12 Resume，
+        // 讓軸繼續 Backoff 離開 Limit。
+        // =================================================
+
+        const bool homingResume =
+            m_nc.Homing.IsActive() &&
+            (m_nc.Homing.IsPaused() ||
+                m_nc.Homing.IsHoldDecelerating());
+
+
+        bool hardLimitActive =
+            false;
+
+        for (int i = 0;
+            i < NCPLC::AXIS_COUNT;
+            ++i)
         {
-            const bool positiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, i));
-            const bool negativeLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::NEGATIVE_LIMIT_BASE, i));
-            if (positiveLimit || negativeLimit)
+            const bool positiveLimit =
+                m_plc.Get_C(
+                    NCPLC::C::AxisPoint(
+                        NCPLC::C::POSITIVE_LIMIT_BASE,
+                        i));
+
+            const bool negativeLimit =
+                m_plc.Get_C(
+                    NCPLC::C::AxisPoint(
+                        NCPLC::C::NEGATIVE_LIMIT_BASE,
+                        i));
+
+
+            const bool expectedPositive =
+                homingResume &&
+                m_nc.Homing.IsExpectedPositiveHardLimit(i);
+
+            const bool expectedNegative =
+                homingResume &&
+                m_nc.Homing.IsExpectedNegativeHardLimit(i);
+
+
+            if ((positiveLimit &&
+                !expectedPositive) ||
+                (negativeLimit &&
+                    !expectedNegative))
             {
-                hardLimitActive = true;
+                hardLimitActive =
+                    true;
+
                 break;
             }
         }
@@ -104,7 +149,17 @@ void NCPLCManager::ProcessGlobalInputs()
             }
         }
 
-        const bool cycleStartAllowed = m_servoReady && !hardLimitActive; // Final Cycle Start Permission
+        const bool noHomeOwnershipConflict =
+            !m_nc.Homing.IsActive() ||
+            homingResume;
+
+
+        const bool cycleStartAllowed =
+            m_servoReady &&
+            !hardLimitActive &&
+            !manualMoveModeActive &&
+            !jogAxisActive &&
+            noHomeOwnershipConflict;
         if (cycleStartAllowed)
         {
             m_nc.CycleStart();
@@ -210,18 +265,116 @@ void NCPLCManager::ProcessSafetyInputs()
         const int alarmAxisIndex = axis.isExist ? axis.axisIndex : i;
 
         const bool positiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, i)); // +OT
-        if (positiveLimit && !m_prevPositiveLimit[i])
-        {
-            AlarmManager::GetInstance().Trigger(AlarmManager::HARD_LIMIT, 0, alarmAxisIndex);
-            hardLimitTriggered = true;
-        }
-
         const bool negativeLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::NEGATIVE_LIMIT_BASE, i)); // -OT
-        if (negativeLimit && !m_prevNegativeLimit[i])
+
+        axis.hardLimitPositive = positiveLimit;
+        axis.hardLimitNegative = negativeLimit;
+
+        // =====================================================
+        // G81 HOME Expected Hard Limit
+        //
+        // 一般情況：
+        //
+        //     +OT / -OT Rising Edge
+        //         -> 3002 HARD_LIMIT
+        //         -> Emergency Stop
+        //
+        // LIMIT_INDEX / LIMIT_ONLY 尋原點時：
+        //
+        // 只有「正在 HOME 的軸」
+        // +
+        // 「正確 HomeDirection」
+        // +
+        // 「允許接觸 Hard Limit 的 HomeState」
+        //
+        // 才能把該方向 Hard Limit 視為正常 HOME Event。
+        //
+        // 相反方向 Hard Limit：永遠 Alarm。
+        // +OT / -OT 同時 ON：永遠異常。
+        // =====================================================
+
+        const bool bothHardLimits =
+            positiveLimit &&
+            negativeLimit;
+
+        const bool expectedPositiveHomeLimit =
+            !bothHardLimits &&
+            m_nc.Homing.IsExpectedPositiveHardLimit(i);
+
+        const bool expectedNegativeHomeLimit =
+            !bothHardLimits &&
+            m_nc.Homing.IsExpectedNegativeHardLimit(i);
+
+        const bool positiveLimitRising =
+            positiveLimit &&
+            !m_prevPositiveLimit[i];
+
+        const bool negativeLimitRising =
+            negativeLimit &&
+            !m_prevNegativeLimit[i];
+
+        const bool axisHoming =
+            m_nc.Homing.IsAxisHoming(i);
+
+        // HOME 中正負極限同時 ON，使用專用 HOME Alarm，
+        // 避免同一 Scan 重複建立兩筆一般 HARD_LIMIT。
+        if (bothHardLimits &&
+            (positiveLimitRising || negativeLimitRising))
         {
-            AlarmManager::GetInstance().Trigger(AlarmManager::HARD_LIMIT, 0, alarmAxisIndex);
+            AlarmManager::GetInstance().Trigger(
+                axisHoming
+                ? AlarmManager::HOME_BOTH_LIMITS
+                : AlarmManager::HARD_LIMIT,
+                0,
+                alarmAxisIndex);
+
             hardLimitTriggered = true;
         }
+        else
+        {
+            if (positiveLimitRising &&
+                !expectedPositiveHomeLimit)
+            {
+                AlarmManager::GetInstance().Trigger(
+                    axisHoming
+                    ? AlarmManager::HOME_OPPOSITE_LIMIT
+                    : AlarmManager::HARD_LIMIT,
+                    0,
+                    alarmAxisIndex);
+
+                hardLimitTriggered = true;
+            }
+
+            if (negativeLimitRising &&
+                !expectedNegativeHomeLimit)
+            {
+                AlarmManager::GetInstance().Trigger(
+                    axisHoming
+                    ? AlarmManager::HOME_OPPOSITE_LIMIT
+                    : AlarmManager::HARD_LIMIT,
+                    0,
+                    alarmAxisIndex);
+
+                hardLimitTriggered = true;
+            }
+        }
+        // =====================================================
+        // Final Travel Direction Block State
+        //
+        // Physical +OT / -OT 永遠有效。
+        // Software Limit 只有 CoordinateManager 判定 Active 時生效。
+        //
+        // 這兩個欄位只代表「該方向目前能不能再繼續走」，
+        // 不代表 Alarm。
+        // =====================================================
+
+        axis.positiveTravelBlocked =
+            axis.hardLimitPositive ||
+            !m_nc.GetCoordSys().CanMoveSoftwarePositive(axis);
+
+        axis.negativeTravelBlocked =
+            axis.hardLimitNegative ||
+            !m_nc.GetCoordSys().CanMoveSoftwareNegative(axis);
 
         m_prevPositiveLimit[i] = positiveLimit; // Edge Memory
         m_prevNegativeLimit[i] = negativeLimit;
@@ -271,7 +424,7 @@ void NCPLCManager::ProcessManualInputs()
     const bool ncStateAllowed = ncState == NCState::IDLE || ncState == NCState::READY;
     const bool alarmActive = AlarmManager::GetInstance().HasAlarm();
 
-    if (!operationModeAllowed || !ncStateAllowed || !m_servoReady || alarmActive)
+    if (!operationModeAllowed || !ncStateAllowed || !m_servoReady || alarmActive || m_nc.Homing.IsActive())
     {
         m_manualMoveMode = ManualMoveMode::NONE;
     }
@@ -439,56 +592,25 @@ void NCPLCManager::ProcessManualInputs()
                         break;
                     }
 
-                    const bool positiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, machineAxis)); // Hard Limit uses MACHINE direction.
-                    const bool negativeLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::NEGATIVE_LIMIT_BASE, machineAxis));
-
-                    if (positiveLimit && negativeLimit)
-                    {
-                        manualFrameXYZValid = false;
-                        break;
-                    }
-
-                    if (component > 0.0 && positiveLimit)
-                    {
-                        manualFrameXYZValid = false;
-                        break;
-                    }
-
-                    if (component < 0.0 && negativeLimit)
-                    {
-                        manualFrameXYZValid = false;
-                        break;
-                    }
-
                     // =====================================================
-                    // Software Travel Limit
+                    // Final Travel Direction Block
                     //
-                    // Manual Frame 經過旋轉後，必須依照真正的
-                    // Physical Machine Axis Direction 判斷。
+                    // Manual Frame 經過旋轉後，必須看真正的
+                    // Physical Machine Axis Direction。
                     //
-                    // 例如：
-                    // Logical X+ 經過旋轉後可能成為：
-                    //
-                    //     Physical X +
-                    //     Physical Y -
-                    //
-                    // 所以 Software Limit 必須看 component 正負方向，
-                    // 不能只看原本按下的是哪一個 Logical Axis。
+                    // positiveTravelBlocked / negativeTravelBlocked
+                    // 已經整合 Physical Hard Limit + Software Limit。
                     // =====================================================
 
-                    const bool softwarePositiveAllowed =
-                        m_nc.GetCoordSys().CanMoveSoftwarePositive(physicalAxis);
-
-                    const bool softwareNegativeAllowed =
-                        m_nc.GetCoordSys().CanMoveSoftwareNegative(physicalAxis);
-
-                    if (component > 0.0 && !softwarePositiveAllowed)
+                    if (component > 0.0 &&
+                        physicalAxis.positiveTravelBlocked)
                     {
                         manualFrameXYZValid = false;
                         break;
                     }
 
-                    if (component < 0.0 && !softwareNegativeAllowed)
+                    if (component < 0.0 &&
+                        physicalAxis.negativeTravelBlocked)
                     {
                         manualFrameXYZValid = false;
                         break;
@@ -805,27 +927,36 @@ void NCPLCManager::ProcessManualInputs()
                     }
 
                     const double physicalDeltaUnit = deltaDistance * component; // Rotated Physical Delta
-                    const bool positiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, machineAxis)); // Hard Limit
-                    const bool negativeLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::NEGATIVE_LIMIT_BASE, machineAxis));
-
-                    if (positiveLimit && negativeLimit) { groupValid = false; break; }
-                    if (physicalDeltaUnit > 0.0 && positiveLimit) { groupValid = false; break; }
-                    if (physicalDeltaUnit < 0.0 && negativeLimit) { groupValid = false; break; }
-
-                    const bool softwarePositiveAllowed = m_nc.GetCoordSys().CanMoveSoftwarePositive(physicalAxis);
-                    const bool softwareNegativeAllowed = m_nc.GetCoordSys().CanMoveSoftwareNegative(physicalAxis);
-
-                    if (physicalDeltaUnit > 0.0 && !softwarePositiveAllowed)
+                    if (physicalAxis.hardLimitPositive &&
+                        physicalAxis.hardLimitNegative)
                     {
                         groupValid = false;
-                        softwareTargetRejected = true;
                         break;
                     }
 
-                    if (physicalDeltaUnit < 0.0 && !softwareNegativeAllowed)
+                    if (physicalDeltaUnit > 0.0 &&
+                        physicalAxis.positiveTravelBlocked)
                     {
                         groupValid = false;
-                        softwareTargetRejected = true;
+
+                        if (!physicalAxis.hardLimitPositive)
+                        {
+                            softwareTargetRejected = true;
+                        }
+
+                        break;
+                    }
+
+                    if (physicalDeltaUnit < 0.0 &&
+                        physicalAxis.negativeTravelBlocked)
+                    {
+                        groupValid = false;
+
+                        if (!physicalAxis.hardLimitNegative)
+                        {
+                            softwareTargetRejected = true;
+                        }
+
                         break;
                     }
 
@@ -920,28 +1051,39 @@ void NCPLCManager::ProcessManualInputs()
             if (axis.state != MotionState::MotionState_IDLE && axis.state != MotionState::MotionState_MPG) continue; // MPG cannot steal another Motion owner.
             if (mpgDeltaCount == 0) continue; // No new handwheel count
 
-            const bool positiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, i)); // Hard Limit Direction Gate
-            const bool negativeLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::NEGATIVE_LIMIT_BASE, i));
-            const bool blockedPositive = mpgDeltaCount > 0 && positiveLimit;
-            const bool blockedNegative = mpgDeltaCount < 0 && negativeLimit;
+            const bool blockedPositive =
+                mpgDeltaCount > 0 &&
+                axis.positiveTravelBlocked;
 
-            if ((positiveLimit && negativeLimit) || blockedPositive || blockedNegative)
+            const bool blockedNegative =
+                mpgDeltaCount < 0 &&
+                axis.negativeTravelBlocked;
+
+            if (axis.hardLimitPositive &&
+                axis.hardLimitNegative)
             {
                 if (axis.state == MotionState::MotionState_MPG)
                 {
                     m_motion.StopMove(axis, axis.JOG_dec_time);
                     m_jogActive[i] = true;
                 }
+
                 continue;
             }
 
-            const bool softwarePositiveAllowed = m_nc.GetCoordSys().CanMoveSoftwarePositive(axis);
-            const bool softwareNegativeAllowed = m_nc.GetCoordSys().CanMoveSoftwareNegative(axis);
-            const bool softwareBlockedPositive = mpgDeltaCount > 0 && !softwarePositiveAllowed;
-            const bool softwareBlockedNegative = mpgDeltaCount < 0 && !softwareNegativeAllowed;
-
-            if (softwareBlockedPositive || softwareBlockedNegative)
+            if (blockedPositive || blockedNegative)
             {
+                const bool blockedByPhysicalLimit =
+                    (blockedPositive && axis.hardLimitPositive) ||
+                    (blockedNegative && axis.hardLimitNegative);
+
+                if (blockedByPhysicalLimit &&
+                    axis.state == MotionState::MotionState_MPG)
+                {
+                    m_motion.StopMove(axis, axis.JOG_dec_time);
+                    m_jogActive[i] = true;
+                }
+
                 continue;
             }
 
@@ -1016,47 +1158,25 @@ void NCPLCManager::ProcessManualInputs()
  // Physical Limit 永遠有效。
  // =====================================================
 
-        const bool positiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, i));
-        const bool negativeLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::NEGATIVE_LIMIT_BASE, i));
-
-
         // =====================================================
-        // Software Travel Limit
+        // Final Travel Direction Block
         //
-        // CoordinateManager 已經在 Motion Runtime
-        // 更新每軸 Software Limit 1 / 2 / 3 狀態。
+        // axis.positiveTravelBlocked / negativeTravelBlocked
+        // 已經整合：
         //
-        // 這裡只詢問：
+        // 1. Physical +OT / -OT
+        // 2. Software Travel Limit 1 / 2 / 3
         //
-        //     正方向現在能不能走？
-        //     負方向現在能不能走？
-        //
-        // 不需要知道到底是 Limit 1 / 2 / 3 哪一組觸發。
+        // 這裡只需要套用 Operator Direction。
         // =====================================================
 
-        const bool softwarePositiveAllowed = m_nc.GetCoordSys().CanMoveSoftwarePositive(axis);
-        const bool softwareNegativeAllowed = m_nc.GetCoordSys().CanMoveSoftwareNegative(axis);
+        const bool allowPositive =
+            rawPositive &&
+            !axis.positiveTravelBlocked;
 
-
-        // =====================================================
-        // Final Manual Direction Permission
-        //
-        // 必須同時通過：
-        //
-        // 1. Operator 有按該方向
-        // 2. Physical Hard Limit 沒擋
-        // 3. Software Travel Limit 沒擋
-        //
-        // 例如到達 +Software Limit：
-        //
-        //     JOG+ = Block
-        //     JOG- = Allow
-        //
-        // 所以可以反方向退出。
-        // =====================================================
-
-        const bool allowPositive = rawPositive && !positiveLimit && softwarePositiveAllowed;
-        const bool allowNegative = rawNegative && !negativeLimit && softwareNegativeAllowed;
+        const bool allowNegative =
+            rawNegative &&
+            !axis.negativeTravelBlocked;
 
 
         // =====================================================
@@ -1069,7 +1189,8 @@ void NCPLCManager::ProcessManualInputs()
         // 設定問題而另外處理。
         // =====================================================
 
-        if (positiveLimit && negativeLimit)
+        if (axis.hardLimitPositive &&
+            axis.hardLimitNegative)
         {
             if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY)
             {
@@ -1249,18 +1370,26 @@ void NCPLCManager::ProcessManualInputs()
                         break;
                     }
 
-                    const bool physicalPositiveLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::POSITIVE_LIMIT_BASE, machineAxis)); // Physical Machine Hard Limit (看旋轉後真正會動的實體軸方向)
-                    const bool physicalNegativeLimit = m_plc.Get_C(NCPLC::C::AxisPoint(NCPLC::C::NEGATIVE_LIMIT_BASE, machineAxis));
+                    if (physicalAxis.hardLimitPositive &&
+                        physicalAxis.hardLimitNegative)
+                    {
+                        groupValid = false;
+                        break;
+                    }
 
-                    if (physicalPositiveLimit && physicalNegativeLimit) { groupValid = false; break; }
-                    if (deltaUnit > 0.0 && physicalPositiveLimit) { groupValid = false; break; }
-                    if (deltaUnit < 0.0 && physicalNegativeLimit) { groupValid = false; break; }
+                    if (deltaUnit > 0.0 &&
+                        physicalAxis.positiveTravelBlocked)
+                    {
+                        groupValid = false;
+                        break;
+                    }
 
-                    const bool softwarePositiveAllowed = m_nc.GetCoordSys().CanMoveSoftwarePositive(physicalAxis);
-                    const bool softwareNegativeAllowed = m_nc.GetCoordSys().CanMoveSoftwareNegative(physicalAxis);
-
-                    if (deltaUnit > 0.0 && !softwarePositiveAllowed) { groupValid = false; break; }
-                    if (deltaUnit < 0.0 && !softwareNegativeAllowed) { groupValid = false; break; }
+                    if (deltaUnit < 0.0 &&
+                        physicalAxis.negativeTravelBlocked)
+                    {
+                        groupValid = false;
+                        break;
+                    }
 
                     const double pulsePerUnit = physicalAxis.resolution_PPR / physicalAxis.finalLead; // Physical Axis Speed Capacity
                     const double deltaPulse = deltaUnit * pulsePerUnit;
@@ -1473,7 +1602,206 @@ void NCPLCManager::ProcessManualInputs()
 // =========================================================
 void NCPLCManager::ProcessHomeInputs()
 {
-    // Future: C100~107 DOG, C108~115 INDEX, C150~157 HOME Request, C15 HOME ALL
+    // =====================================================
+    // 1. HOME Request Input Decode
+    //
+    // C15：
+    //     HOME_ALL
+    //
+    // C150~157：
+    //     Axis 0~7 單軸 HOME Request
+    //
+    // 所有輸入都只接受 OFF -> ON Rising Edge。
+    //
+    // 同一個 Scan 若有多個單軸 HOME Request，
+    // 會合併成同一個 axisMask，一次送給 HomingManager。
+    //
+    // PLC / Panel HOME 預設使用：
+    //
+    // P0 = SIMULTANEOUS
+    //
+    // P1 = BY_ORDER
+    // 之後由 G81 P1 或未來專用 PLC Mode 再提供。
+    // =====================================================
+
+    const bool homeAll =
+        m_plc.Get_C(
+            NCPLC::C::HOME_ALL);
+
+    const bool homeAllRising =
+        homeAll &&
+        !m_prevHomeAll;
+
+    m_prevHomeAll =
+        homeAll;
+
+
+    uint8_t axisHomeRequestMask =
+        0;
+
+    for (int i = 0;
+        i < NCPLC::AXIS_COUNT;
+        ++i)
+    {
+        const bool homeRequest =
+            m_plc.Get_C(
+                NCPLC::C::AxisPoint(
+                    NCPLC::C::HOME_REQUEST_BASE,
+                    i));
+
+        const bool homeRequestRising =
+            homeRequest &&
+            !m_prevHomeRequest[i];
+
+        m_prevHomeRequest[i] =
+            homeRequest;
+
+
+        if (homeRequestRising)
+        {
+            axisHomeRequestMask |=
+                static_cast<uint8_t>(
+                    1u << i);
+        }
+    }
+
+
+    // =====================================================
+    // 2. PLC / Panel HOME Permission Gate
+    //
+    // 這裡只限制 PLC 面板入口。
+    //
+    // 未來 G81 是 NC Program Command，
+    // 會直接從 GCode Handler 呼叫 HomingManager，
+    // 不受這個 Manual Panel Gate 限制。
+    //
+    // PLC HOME 允許：
+    //
+    // Mode：
+    //     MANUAL
+    //     MDI
+    //
+    // State：
+    //     IDLE
+    //     READY
+    //
+    // 並且：
+    //
+    // Servo Ready
+    // No Alarm
+    // HomingManager 目前沒有正在執行其他 HOME
+    // =====================================================
+
+    const NCOperationMode ncMode =
+        m_nc.GetMode();
+
+    const NCState ncState =
+        m_nc.GetState();
+
+    const bool operationModeAllowed =
+        ncMode == NCOperationMode::MANUAL ||
+        ncMode == NCOperationMode::MDI;
+
+    const bool ncStateAllowed =
+        ncState == NCState::IDLE ||
+        ncState == NCState::READY;
+
+    const bool alarmActive =
+        AlarmManager::GetInstance().HasAlarm();
+
+    const bool panelHomeAllowed =
+        operationModeAllowed &&
+        ncStateAllowed &&
+        m_servoReady &&
+        !alarmActive &&
+        !m_nc.Homing.IsActive();
+
+
+    // =====================================================
+    // 3. Build HomeRequest
+    //
+    // HOME_ALL Rising：
+    //
+    //     axisMask = 0
+    //
+    // HomingManager 會自動選取：
+    //
+    //     axis.isExist
+    //     &&
+    //     axis.home.enabled
+    //
+    // 單軸 / 多軸 Rising：
+    //
+    //     axisMask = 對應 Bit Mask
+    //
+    // 若 HOME_ALL 與單軸 Request 同 Scan 發生，
+    // HOME_ALL 優先。
+    // =====================================================
+
+    if (panelHomeAllowed)
+    {
+        if (homeAllRising)
+        {
+            HomeRequest request{};
+
+            request.axisMask =
+                0;
+
+            request.sequenceMode =
+                HomeSequenceMode::SIMULTANEOUS;
+
+            const bool started = m_nc.Homing.Start(request);
+            if (!started)
+            {
+                const HomeErrorReason reason = m_nc.Homing.GetLastError();
+                const int alarmCode = (reason == HomeErrorReason::SERVO_NOT_READY || reason == HomeErrorReason::MOTION_BUSY || reason == HomeErrorReason::SERVO_FAULT || reason == HomeErrorReason::MOTION_FAULT)
+                    ? AlarmManager::HOME_MOTION_FAULT : AlarmManager::HOME_INVALID_CONFIG;
+                if (!AlarmManager::GetInstance().HasAlarm())
+                    AlarmManager::GetInstance().Trigger(alarmCode, 0, m_nc.Homing.GetLastErrorAxis());
+                m_motion.EmergencyStopAllAxes();
+                m_nc.ChangeState(NCState::ALARM);
+            }
+        }
+        else if (axisHomeRequestMask != 0)
+        {
+            HomeRequest request{};
+
+            request.axisMask =
+                axisHomeRequestMask;
+
+            request.sequenceMode =
+                HomeSequenceMode::SIMULTANEOUS;
+
+            const bool started = m_nc.Homing.Start(request);
+            if (!started)
+            {
+                const HomeErrorReason reason = m_nc.Homing.GetLastError();
+                const int alarmCode = (reason == HomeErrorReason::SERVO_NOT_READY || reason == HomeErrorReason::MOTION_BUSY || reason == HomeErrorReason::SERVO_FAULT || reason == HomeErrorReason::MOTION_FAULT)
+                    ? AlarmManager::HOME_MOTION_FAULT : AlarmManager::HOME_INVALID_CONFIG;
+                if (!AlarmManager::GetInstance().HasAlarm())
+                    AlarmManager::GetInstance().Trigger(alarmCode, 0, m_nc.Homing.GetLastErrorAxis());
+                m_motion.EmergencyStopAllAxes();
+                m_nc.ChangeState(NCState::ALARM);
+            }
+        }
+    }
+
+
+    // =====================================================
+    // 4. G81 HOME State Machine Cyclic Process
+    //
+    // NCPLCManager::Process() 目前由系統 10ms 週期呼叫，
+    // 因此 HomingManager 使用 0.010 秒更新 Runtime Timer。
+    //
+    // HomingManager::Process() 會執行完整 HOME 狀態機；
+    // 實機測試前必須先使用低速與單軸參數驗證。
+    // =====================================================
+
+    constexpr double HOME_PROCESS_CYCLE_SEC =
+        0.010;
+
+    m_nc.Homing.Process(
+        HOME_PROCESS_CYCLE_SEC);
 }
 
 // =========================================================

@@ -141,6 +141,51 @@ namespace GCodeHandlers
         nc->CoordSys.Transform_WCS_to_MCS(axisTarget, axisProgrammed, targetMCS);
 
         // =========================================================
+// Software Travel Limit - G161 Target Pre-Check
+//
+// 此時 targetMCS 已經是最後的 Machine Coordinate。
+//
+// 任一軸 Target 超出 Software Travel Limit：
+//
+// 1. 不送入 MotionCore
+// 2. Trigger OVER_TRAVEL
+// 3. NC 進入 ALARM
+//
+// Travel Limit 1：
+//     travelLimit1Enable && G22
+//
+// Travel Limit 2：
+//     travelLimit2Enable
+//
+// Travel Limit 3：
+//     travelLimit3Enable
+// =========================================================
+
+        for (int i = 0; i < 8; i++)
+        {
+            if (!axisProgrammed[i])
+            {
+                continue;
+            }
+
+            AxisContext& axis =nc->m_motion.GetAxisContext(i);
+
+            const bool targetWithinSoftwareLimit =nc->CoordSys.IsTargetWithinSoftwareTravelLimit( axis, targetMCS[i]);
+
+            if (!targetWithinSoftwareLimit)
+            {
+                AlarmManager::GetInstance().Trigger( AlarmManager::PROGRAMMED_OVER_TRAVEL, 0, axis.axisIndex);
+
+                nc->ChangeState( NCState::ALARM);
+
+                return [](NCManager*)
+                {
+                    return true;
+                };
+            }
+        }
+
+        // =========================================================
         // 🌟 5. 打包派單給 MotionCore
         // =========================================================
         std::vector<int> activeAxes;

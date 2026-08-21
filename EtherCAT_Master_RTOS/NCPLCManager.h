@@ -58,6 +58,27 @@ private:
     bool m_prevControlledStop = false;  // C4 Controlled Stop 前一 Scan 狀態
     bool m_prevEmergencyStop = false;   // C5 Emergency Stop 前一 Scan 狀態
 
+    // =========================================================
+    // HOME Request Edge Memory
+    //
+    // C15：
+    //     HOME_ALL
+    //
+    // C150~157：
+    //     Axis 0~7 單軸 HOME Request
+    //
+    // 只在 OFF -> ON Rising Edge 建立一次 HomeRequest，
+    // 避免 PLC Contact 持續 ON 時每個 Scan 重複啟動 G81 HOME。
+    // =========================================================
+
+    bool m_prevHomeAll = false;
+
+    bool m_prevHomeRequest[NCPLC::AXIS_COUNT] =
+    {
+        false, false, false, false,
+        false, false, false, false
+    };
+
     // Safety Edge Memory (主要用來讓 Alarm 只在 Rising Edge 建立一次)
     bool m_prevAxisProtect[NCPLC::AXIS_COUNT] = { false, false, false, false, false, false, false, false }; // C140~147 Axis Protection 前一 Scan 狀態
     bool m_prevPositiveLimit[NCPLC::AXIS_COUNT] = { false, false, false, false, false, false, false, false }; // C180~187 Positive Hard Limit 前一 Scan 狀態

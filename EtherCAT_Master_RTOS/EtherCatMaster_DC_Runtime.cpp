@@ -12,7 +12,7 @@
 
 // ============================================================================
 // EtherCatMaster_DC_Runtime.cpp
-// EtherCAT DC 即時循環正式版候選 RC1.7（啟動 Drift 自動校正版）
+// EtherCAT DC 即時循環正式版候選 RC1.8（冷／溫機 Drift 自動捕獲版）
 //
 // 本檔責任：
 //   1. 執行 4 kHz／250 us PDO 即時循環。
@@ -46,7 +46,8 @@
 //   - Sync0 目標相位：125000 ns。
 //   - AUTO 啟動校正前 Bootstrap：-9500 ppb；校正後採本次量測 Baseline。
 //   - One-Shot coarse guard：100000 ns；Fine Wait 仍為 OFF。
-//   - Real FF 範圍：-12000..-7800 ppb，每個觀測窗最多變更 10 ppb。
+//   - AUTO 開機捕獲與 Real FF 安全範圍：-16000..-5000 ppb。
+//   - Real FF 每個觀測窗最多變更 10 ppb。
 //   - Phase-P：P=1/8、deadband=500 ns、每次最多 250 ns、總 offset ±120000 ns。
 //
 // 即時路徑禁止事項：
@@ -77,7 +78,7 @@
 //     - Phase-P 可累積的總 offset；若 OffsetSat:YES 才有理由檢討此值。
 //     - 不能超過半個 250 us 週期的 125000 ns；目前 120000 ns 已接近上限，
 //       正式機不建議再增大。若希望更保守可降到 100000 或 50000 ns。
-//   REAL_FF_V0_MIN_PPB / MAX_PPB = -12000 / -7800 ppb
+//   REAL_FF_V0_MIN_PPB / MAX_PPB = -16000 / -5000 ppb
 //     - Real FF 絕對限幅；ClampActive:YES 表示 observer 建議超出此安全範圍。
 //     - 不要為了消除 ClampActive 就直接放寬，應先檢查 V1A slope/MAD 與 RX timeout。
 //   *_ARM_WINDOWS、*_HOLD_RECOVERY_WINDOWS、*_HOLD_BAD_LIMIT
@@ -2182,7 +2183,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     // 啟動 Drift 校正
     //
     // AUTO：Robust snapshot 必須已鎖定、Buffer=9、MAD 與 Raw/Median 差值
-    // 都通過門檻，且沒有連續 RX timeout。連續五窗後取 median 平均並鎖定。
+    // 都通過門檻，且沒有連續 RX timeout。冷機與溫機不需要
+    // 接近 Bootstrap，只要在絕對捕獲範圍內連續五窗穩定，就取 median 平均鎖定。
     // FIXED：第一個 callback 直接採用 Startup 已驗證的設定值。
     // 校正只改「後續週期的頻率」，不重算既有 target，因此沒有相位突跳。
     // ---------------------------------------------------------------------
@@ -2287,9 +2289,9 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     robustLocked != 0 &&
                     robustBufferCount >= 9 &&
                     driftCalibrationMedianPpb >=
-                    EtherCatDcTuning::RealFfMinimumDriftPpb &&
+                    EtherCatDcTuning::DriftCalibrationMinimumPpb &&
                     driftCalibrationMedianPpb <=
-                    EtherCatDcTuning::RealFfMaximumDriftPpb &&
+                    EtherCatDcTuning::DriftCalibrationMaximumPpb &&
                     driftCalibrationMadPpb <=
                     EtherCatDcTuning::DriftCalibrationMaximumMadPpb &&
                     rawMedianAbsPpb <=
@@ -2452,7 +2454,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     //
     // QPC_SCHEDULER_ASSUMED_DRIFT_PPB 是啟動、Trip 與觀測不可信時的安全基準。
     // Real FF 必須連續 3 個合格觀測窗才能 ACTIVE；ACTIVE 每窗最多走 10 ppb，
-    // 並限制在 -12000..-7800 ppb，避免單一估測異常直接改變週期。
+    // 並限制在 -16000..-5000 ppb，避免單一估測異常直接改變週期。
     // Phase-P 每次使用 wrapped phase error 的 1/8；小於 500 ns 不動作；
     // command、step、累積 offset 各有獨立飽和，防止相位迴路突跳。
     // ---------------------------------------------------------------------

@@ -9,7 +9,7 @@
 
 /*
  * 檔案：EtherCatMaster_DC_Diagnostics.cpp
- * 版本：EtherCAT DC Release Candidate RC1.7（啟動 Drift 自動校正版）
+ * 版本：EtherCAT DC Release Candidate RC1.8（冷／溫機 Drift 自動捕獲版）
  *
  * 功能：
  * - 由 Priority 50 的 1000 ms 工作讀取 Priority 64 發布的診斷快照。
@@ -407,7 +407,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "Raw:%+lld Median:%+lld MAD:%lld "
                 "RawDev:%+lld ppb | "
                 "Baseline:%+lld ppb | "
-                "Range:%+lld..%+lld ppb | "
+                "CaptureRange:%+lld..%+lld ppb | "
                 "Locks:%ld | "
                 "RobustSeq:%ld | "
                 "OneShot:YES | "
@@ -422,8 +422,8 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 (long long)calibrationMadPpb,
                 (long long)calibrationRawMedianDeviationPpb,
                 (long long)calibrationBaselinePpb,
-                (long long)EtherCatDcTuning::RealFfMinimumDriftPpb,
-                (long long)EtherCatDcTuning::RealFfMaximumDriftPpb,
+                (long long)EtherCatDcTuning::DriftCalibrationMinimumPpb,
+                (long long)EtherCatDcTuning::DriftCalibrationMaximumPpb,
                 (long)calibrationLockCount,
                 (long)calibrationRobustSequence,
                 (long)driftCalibrationSequenceAfter);

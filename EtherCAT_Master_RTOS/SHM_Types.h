@@ -19,7 +19,7 @@ struct SHM_NC_Status
     int32_t SHM_NC_State;//NC狀態
     int32_t SHM_EDM_State;//EDM設備狀態
 
-  
+
      // 🌟 1. 主程式追蹤
     char     mainProgName[64];  // 當前主程式名稱
     int32_t  mainCurrentLine;   // 主程式行號
@@ -29,13 +29,13 @@ struct SHM_NC_Status
     int32_t  macroCurrentLine;  // 副程式行號
 
 
-    bool m_isSingleBlockEnabled ;   // 單步執行
+    bool m_isSingleBlockEnabled;   // 單步執行
     bool m_isOptionalStopEnabled;  // 選擇性暫停 (M01)
     bool m_isBlockSkipEnabled;     // 選擇性跳躍 (/)
 
     // 🌟 新增：人機 UI 專用的模態狀態 (Modal Status)
     int currentWCS_GCode;  // 目前的座標系 (54~959)
-    int isAbsoluteMode=true;    // 1 = G90 (絕對), 0 = G91 (增量)
+    int isAbsoluteMode = true;    // 1 = G90 (絕對), 0 = G91 (增量)
     // 🌟 新增：給 HMI 畫面綁定刀具狀態用的變數
     int currentToolLengthMode; // 目前的刀長補正模式 (49=G49, 43=G43, 44=G44)
     int currentHCode;          // 目前的 H 碼 (0~100)
@@ -70,7 +70,7 @@ struct SHM_NC_Status
     // 🌟 新增：目前插補平面 (17=G17, 18=G18, 19=G19)
     int currentPlaneMode;
 
-   
+
     int currentG20State;
 
     bool  m_programmableTravelLimitEnabled;//G22 G23
@@ -82,7 +82,7 @@ struct SHM_NC_Status
     double actualMCS[8]; // 機械座標 (Machine Coordinate System)
     double actualWCS[8]; // 絕對座標/工件座標 (Work Coordinate System)
     double DistanceToGo[8];//剩餘座標
-   
+
     int32_t manualFrameEnabled;
     // Rotation around Machine Z
     double manualFrameYawDeg;
@@ -91,7 +91,7 @@ struct SHM_NC_Status
     // Rotation around Machine X
     double manualFrameRollDeg;
 
-   
+
 
     int32_t reserved[23];// 預留擴充空間
 };
@@ -136,11 +136,29 @@ struct SHM_AxisDebugInfo {
 
 
     int    State;      // 運動狀態 (IDLE=0, MOVING=1...)
-    bool   IsServoOn;  // 是否激磁
-    bool   IsFault;    // 是否報警
-    uint8_t IsLagAlarm;  // 🌟 [新增] 是否觸發「追隨誤差過大」專屬警報
-    uint8_t Reserved;    // 🌟 [新增] 保留位元，湊滿 4 bytes 讓記憶體完美對齊
+    bool    IsServoOn;   // 是否激磁
+    bool    IsFault;     // 是否報警
+    uint8_t IsLagAlarm;  // 追隨誤差過大
+    uint8_t IsHomed;     // 0=尚未尋原點，1=已完成 Machine Home
+
+    // ========================================================
+    // Drive Touch Probe Raw Monitor
+    //
+    // 由 MotionCore::ExportDebugInfo() 填入：
+    //
+    // TouchProbeFunction = RxPDO 0x60B8
+    // TouchProbeStatus   = TxPDO 0x60B9
+    // TouchProbePosition = TxPDO 0x60BA
+    // ========================================================
+
+    uint16_t TouchProbeFunction;
+    uint16_t TouchProbeStatus;
+    int32_t  TouchProbePosition;
 };
+
+static_assert(
+    sizeof(SHM_AxisDebugInfo) == 80,
+    "SHM_AxisDebugInfo must stay 80 bytes (Pack=1).");
 
 //NC命令區塊-----------------------------------------------------------
 
@@ -161,7 +179,7 @@ struct SHM_NC_Command
     bool reqChangeMode;
     int32_t targetMode; // 0: MEMORY, 1: MDI, 2: MANUAL, 3: EDIT
 
-    
+
 
     bool Set_isSingleBlockEnabled_ON;   // 單步執行
     bool Set_isSingleBlockEnabled_OFF;   // 單步執行
@@ -313,10 +331,10 @@ struct SHM_PLC_Diagnostics
     uint32_t ScanLastOverrunRunCount;
     int32_t ScanLastOverrunTaskIndex;
 };
-static_assert(sizeof(SHM_PLC_Diagnostics) == 116,"SHM_PLC_Diagnostics must stay 64 bytes (Pack=1).");
+static_assert(sizeof(SHM_PLC_Diagnostics) == 116, "SHM_PLC_Diagnostics must stay 64 bytes (Pack=1).");
 
 //總記憶體區塊-------------------------------------------------------
-struct SHM_Data 
+struct SHM_Data
 {
     SHM_API_Status API_Status;//API狀態區塊
     SHM_NC_Status  NC_Status;//NC狀態區塊
@@ -326,10 +344,10 @@ struct SHM_Data
     SHM_Macro_Status macroStatus;  // 新增：變數全廣播區
     SHM_Coord_Command Coord_Command;//
     SHM_Coord_Table Coord_Table;  // 🌟 新增這行：將表格加入總結構！
-    
+
     SHM_String_Command String_Command; // 加入這個新區塊
     SHM_AxisDebugInfo axisDebug[8]; // 🌟 給 HMI 看的 8 軸除錯資訊
-   
+
     // 🌟 補上這兩行：PLC 專用讀寫區
     SHM_PLC_Status PLC_Status;
     SHM_PLC_Command PLC_Command;

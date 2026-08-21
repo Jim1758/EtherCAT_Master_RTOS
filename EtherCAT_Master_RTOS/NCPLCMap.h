@@ -265,6 +265,28 @@ namespace NCPLC
         constexpr int MPG_ACTIVE = 201;                            // S201 MPG Mode Active
         constexpr int EDM_PROTECTION_BYPASS_ACTIVE = 202;          // S202 EDM Protection Bypass Active
 
+        // --------------------------------------------------------
+        // G81 HOME Global Run Control
+        // --------------------------------------------------------
+
+        constexpr int HOME_ACTIVE = 203;                           // S203 HOME Request Active（Running / Hold / Paused 都保持 ON）
+        constexpr int HOME_HOLD_DECEL = 204;                       // S204 HOME Feed Hold Controlled Stop 進行中
+        constexpr int HOME_PAUSED = 205;                           // S205 HOME 已完全停止，等待 C12 Resume
+
+        // --------------------------------------------------------
+        // Software Travel Limit State
+        //
+        // Axis 0~7
+        //
+        // Level Signal / Warning State
+        //
+        // 這不是 Alarm。
+        // 給 PLC / HMI 顯示目前該方向已到 Software Limit。
+        // --------------------------------------------------------
+
+        constexpr int SOFTWARE_POSITIVE_LIMIT_BASE = 210;           // S210~217 Software + Limit Active
+        constexpr int SOFTWARE_NEGATIVE_LIMIT_BASE = 220;           // S220~227 Software - Limit Active
+
 
         // --------------------------------------------------------
         // Helper

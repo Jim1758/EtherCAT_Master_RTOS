@@ -6,6 +6,7 @@
 #include "NCManager.h"
 #include "MotionCore.h"
 #include "PLCManager.h"
+#include "NCPLCMap.h"
 #include "AlarmManager.h"
 
 extern PLCManager* g_PLC; // 引入 PLC 大腦
@@ -35,10 +36,10 @@ void NCManager::SyncNCStateToPLC()
     // =========================================================
     // 3. NC 功能啟用狀態 (S20 ~ S26) - 這些您可以之後再接上 UI 變數
     // =========================================================
-     g_PLC->Set_S(20, m_isSingleBlockEnabled);
+    g_PLC->Set_S(20, m_isSingleBlockEnabled);
     // g_PLC->Set_S(21, m_isDryRunEnabled);
-     g_PLC->Set_S(22, m_isOptionalStopEnabled);
-     g_PLC->Set_S(23, m_isBlockSkipEnabled);
+    g_PLC->Set_S(22, m_isOptionalStopEnabled);
+    g_PLC->Set_S(23, m_isBlockSkipEnabled);
     // g_PLC->Set_S(24, m_isMachineLockEnabled);
     // g_PLC->Set_S(25, m_isZAxisLockEnabled);
     // g_PLC->Set_S(26, false); // 預留
@@ -57,26 +58,100 @@ void NCManager::SyncNCStateToPLC()
     // g_PLC->Set_S(34, m_isM01Active);
 
     // =========================================================
-    // 5. 各軸獨立狀態 (S100 ~ S157)
+    // 5. G81 HOME 全域執行狀態
+    //
+    // S203 = HOME Request 還存在
+    // S204 = Feed Hold 正在 Controlled Stop
+    // S205 = 已完全停止，等待 Cycle Start Resume
     // =========================================================
-    for (int i = 0; i < 8; i++) {
+
+    g_PLC->Set_S(
+        NCPLC::S::HOME_ACTIVE,
+        Homing.IsActive());
+
+    g_PLC->Set_S(
+        NCPLC::S::HOME_HOLD_DECEL,
+        Homing.IsHoldDecelerating());
+
+    g_PLC->Set_S(
+        NCPLC::S::HOME_PAUSED,
+        Homing.IsPaused());
+
+
+    // =========================================================
+    // 6. 各軸獨立狀態 (S100 ~ S157)
+    // =========================================================
+    for (int i = 0; i < 8; i++)
+    {
         auto& axis = m_motion.GetAxisContext(i);
 
         // 只有該軸存在時才更新，否則填 0
-        if (axis.isExist) {
+        if (axis.isExist)
+        {
             g_PLC->Set_S(100 + i, axis.isServoOn);      // S100~107: 軸啟用狀態
             g_PLC->Set_S(110 + i, axis.isHomed);        // S110~117: 尋原點完成 (需要您在 AxisContext 加這變數)
             g_PLC->Set_S(150 + i, axis.isLagAlarm);     // S150~157: 追隨誤差錯誤
 
-            // 行程保護預留 (需在 AxisContext 新增 OT1, OT2, OT3 變數)
-            // g_PLC->Set_S(120 + i, axis.isOverTravel1);
-            // g_PLC->Set_S(130 + i, axis.isOverTravel2);
-            // g_PLC->Set_S(140 + i, axis.isOverTravel3);
+            const HomeState homeState = axis.homeRuntime.state;
+            const bool homeSearchSwitch = axis.homeRuntime.active &&
+                (homeState == HomeState::SEARCH_SWITCH || homeState == HomeState::SWITCH_DECEL_STOP || homeState == HomeState::BACK_OFF || homeState == HomeState::VALIDATE_RELEASE || homeState == HomeState::WAIT_GROUP_BACKOFF);
+            const bool homeSearchIndex = axis.homeRuntime.active &&
+                (homeState == HomeState::ARM_REFERENCE || homeState == HomeState::SEARCH_INDEX || homeState == HomeState::INDEX_CAPTURED || homeState == HomeState::INDEX_DECEL_STOP || homeState == HomeState::WAIT_GROUP_INDEX_STOP);
+
+            g_PLC->Set_S(NCPLC::S::AxisPoint(NCPLC::S::HOME_SEARCH_DOG_BASE, i), homeSearchSwitch);
+            g_PLC->Set_S(NCPLC::S::AxisPoint(NCPLC::S::HOME_SEARCH_INDEX_BASE, i), homeSearchIndex);
+
+            // =====================================================
+            // Software Travel Limit Warning State
+            //
+            // S210~217 = +Software Limit
+            // S220~227 = -Software Limit
+            //
+            // 只提供 PLC / HMI 顯示警訊。
+            // 不進 AlarmManager。
+            // =====================================================
+
+            const bool softwarePositiveLimit =
+                axis.travelLimit1PositiveActive ||
+                axis.travelLimit2PositiveActive ||
+                axis.travelLimit3PositiveActive;
+
+            const bool softwareNegativeLimit =
+                axis.travelLimit1NegativeActive ||
+                axis.travelLimit2NegativeActive ||
+                axis.travelLimit3NegativeActive;
+
+            g_PLC->Set_S(
+                NCPLC::S::AxisPoint(
+                    NCPLC::S::SOFTWARE_POSITIVE_LIMIT_BASE,
+                    i),
+                softwarePositiveLimit);
+
+            g_PLC->Set_S(
+                NCPLC::S::AxisPoint(
+                    NCPLC::S::SOFTWARE_NEGATIVE_LIMIT_BASE,
+                    i),
+                softwareNegativeLimit);
         }
-        else {
+        else
+        {
             g_PLC->Set_S(100 + i, false);
             g_PLC->Set_S(110 + i, false);
             g_PLC->Set_S(150 + i, false);
+            g_PLC->Set_S(NCPLC::S::AxisPoint(NCPLC::S::HOME_SEARCH_DOG_BASE, i), false);
+            g_PLC->Set_S(NCPLC::S::AxisPoint(NCPLC::S::HOME_SEARCH_INDEX_BASE, i), false);
+
+            g_PLC->Set_S(
+                NCPLC::S::AxisPoint(
+                    NCPLC::S::SOFTWARE_POSITIVE_LIMIT_BASE,
+                    i),
+                false);
+
+            g_PLC->Set_S(
+                NCPLC::S::AxisPoint(
+                    NCPLC::S::SOFTWARE_NEGATIVE_LIMIT_BASE,
+                    i),
+                false);
         }
     }
 }

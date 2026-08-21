@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <vector>
 #include "EtherCatTypes.h" // 必須包含這個，才能認識 ServoDrive
+#include "HomeTypes.h"
 #include <cmath>
 #include <cstdint>
 #include <queue> // 引入佇列函式庫
@@ -26,9 +27,9 @@ enum class MotionState// 運動狀態機
     MotionState_IDLE,       // 閒置 (位置鎖定中)
     MotionState_MOVING,     // 移動中 (P2P 定位)
     MotionState_STOPPING,   // 減速停止中
-    MotionState_ERROR ,     // 警報狀態
+    MotionState_ERROR,     // 警報狀態
     MotionState_VELOCITY,   // 速度模式移動中
-    MotionState_INTERPOLATING ,//多軸插補中
+    MotionState_INTERPOLATING,//多軸插補中
     MotionState_ESTOP,//緊急狀態
 
      // =====================================================
@@ -78,9 +79,9 @@ struct PidConfig// PID 參數與保護設定
 // 🌟 1. 新增：軸型態列舉
 // ==========================================
 enum class AxisType {
-    LINEAR=0,           // 直線軸 (單位 mm)
-    ROTARY=1,       // 旋轉軸 (單位 Degree，0~360 循環，走最短路徑)
-    ROTARY_CONTINUOUS=2 // 連續旋轉軸 (例如主軸，一直累加不歸零)
+    LINEAR = 0,           // 直線軸 (單位 mm)
+    ROTARY = 1,       // 旋轉軸 (單位 Degree，0~360 循環，走最短路徑)
+    ROTARY_CONTINUOUS = 2 // 連續旋轉軸 (例如主軸，一直累加不歸零)
 };
 
 
@@ -90,13 +91,20 @@ struct AxisContext//軸參數與狀態
     bool isExist; // 🌟 [新增] 實體馬達是否存在 / 是否啟用
     int axisIndex = 0;//第幾軸
 
-    bool isHomed = true;
+    bool isHomed = false;
+
+    // G81 HOME 參數、Runtime 與 Machine Coordinate Offset。
+    HomeConfig home;
+    HomeRuntime homeRuntime;
+
+    // Machine Position = Raw Logical Position - machineCoordinateOffsetPulse
+    double machineCoordinateOffsetPulse = 0.0;
 
     //硬體物理參數-------------------------------------------------
     double resolution_PPR = 16777216.0;// 編碼器解析度
     double maxVel_PPS = 0.0;// 最高轉速 (Pulse/sec)
 
-   
+
     double JOG_MAX_PPS = 0.0;
     double JOG_acc_time = 0.2;
     double JOG_dec_time = 0.2;
@@ -153,7 +161,7 @@ struct AxisContext//軸參數與狀態
     double FINE_JOG_0100_PPS = 0.0;
     double FINE_JOG_1000_PPS = 0.0;
 
-   
+
 
     // =========================================================
 // INCH JOG Parameters
@@ -175,10 +183,10 @@ struct AxisContext//軸參數與狀態
     double INCH_acc_time = 0.2;
     double INCH_dec_time = 0.2;
 
-    double G00_PPS=0.0;// G00 速度 (Pulse/sec)
+    double G00_PPS = 0.0;// G00 速度 (Pulse/sec)
     double G00_acc_time;  // 🌟 [新增] G00 的加速時間 (秒)
     double G00_dec_time;  // 🌟 [新增] G00 的減速時間 (秒)
-   
+
 
     double G07_PPS = 0.0;// 
     double G07_acc_time;  // 
@@ -202,10 +210,10 @@ struct AxisContext//軸參數與狀態
 
 
     double G53_PPS = 0.0;
-    double G53_acc_time;  
-    double G53_dec_time;  
+    double G53_acc_time;
+    double G53_dec_time;
 
-   
+
     double Stop_dec_time;  //滑行停止減速度 單位(秒)(幾秒內減速完成)
 
     //雙閉環/全閉環設定-------------------------------------------------
@@ -222,7 +230,7 @@ struct AxisContext//軸參數與狀態
     // 🌟 新增：兩組獨立的 PID 參數
     PidConfig Pid_IDLE;//閒置狀態PID
     PidConfig Pid_G00;      // 專屬：定位移動專用 (G00, G01)
- 
+
 
 
 
@@ -236,14 +244,14 @@ struct AxisContext//軸參數與狀態
 
     double finalTargetPos = 0.0;// 本次移動的最終目標位置 (定位模式)
 
-    
+
     double targetVelocity;// 目標速度 (速度模式)
     double VelocityMove_Acc;// 速度模式專用的切換加速度
     double targetEndVel = 0.0;// 終點速度 (連續軌跡過彎時，預留的不降速值)
 
     double feedrateOverride = 1.00; // 進給倍率控制 (預設 1.0 = 100%)
 
-  
+
 
     //即時動態座標-------------------------------------------------
     double planningPos;// 虛擬大腦的理想位置 (未經 S-Curve 濾波的粗糙折線)
@@ -264,11 +272,11 @@ struct AxisContext//軸參數與狀態
     int8_t targetMode = 9;       // 預設 CSV 模式 (9)，方便之後想改模式時設定
 
     //運算記憶體緩衝區-------------------------------------------------
-    
+
     //S-Curve 移動平均濾波器--------
     std::vector<double> velBuffer;// 儲存歷史速度的環形陣列
-    int bufferIndex=0;// 目前陣列寫入的指標位置
-    double bufferSum=0.0;// 陣列內所有速度的總和 (加速計算用)
+    int bufferIndex = 0;// 目前陣列寫入的指標位置
+    double bufferSum = 0.0;// 陣列內所有速度的總和 (加速計算用)
 
 
     //硬體綁定指標-------------------------------------------------
@@ -304,7 +312,7 @@ struct AxisContext//軸參數與狀態
     double currentCompOffset_unit = 0.0;
 
     // --- 1. 馬達/編碼器參數 ---
-    
+
     bool isReverse = false;             // 方向反轉 (1=反轉, 0=正轉)
     // --- 🌟 新增的顯示參數 ---
     bool Axis_Reverse = false;  // 軸方向 反向
@@ -330,7 +338,7 @@ struct AxisContext//軸參數與狀態
     double inPositionWindow_Pulse = 0.0; // 底層實際判斷用的 Pulse
 
     // 🌟 [新增] 允許的最大跟隨誤差設定
-    double maxLag_mm=2.0;              // 人機設定值 (例如 2.0 mm，超過就 Alarm)
+    double maxLag_mm = 2.0;              // 人機設定值 (例如 2.0 mm，超過就 Alarm)
 
     bool isVirtualAxis = false;  // 🌟 [新增] 預設為一般實體軸
 
@@ -395,7 +403,7 @@ struct AxisContext//軸參數與狀態
     bool travelLimit3PositiveActive = false;
     bool travelLimit3NegativeActive = false;
 
-    
+
     //總極限結果判斷此點是否碰到極限即可--------------------------------------
     bool positiveTravelBlocked = false;
     bool negativeTravelBlocked = false;
@@ -440,9 +448,9 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
 
 
 
-   
+
     //時光機專用快照記憶體
-   
+
     double mem_startPos[8];
     double mem_ratio[8];
     double mem_radius;
@@ -626,20 +634,20 @@ struct PathJumpManager {
     double joggedStartPos[8] = { 0 }; // Jog後的起點快照
 
 
-   
+
 };
 
 
 struct InterpolationGroup// 插補群組
 {
     //運行狀態與模式------------------------------------------------------
-    bool isActive=false;// 插補引擎運作標記 (true: 正在計算路徑位移, false: 停止)
+    bool isActive = false;// 插補引擎運作標記 (true: 正在計算路徑位移, false: 停止)
     InterpolationMode mode = InterpolationMode::LINEAR;// 當前幾何模式 (預設直線)
- 
+
 
     //參與軸與投影參數 (用於直線插補)------------------------------------------------------
 
-    int  axisCount=0;// 參與聯動的實體軸總數 (例如 2 軸或 3 軸)
+    int  axisCount = 0;// 參與聯動的實體軸總數 (例如 2 軸或 3 軸)
     int  axisIndices[MAX_AXES];// 記錄參與軸的編號清單 (例如 {0, 1} 代表 X, Y 軸)
     double startPos[MAX_AXES];// 記錄各段路徑開始時，各實體軸的起點位置 (Snapshot)
     double ratio[MAX_AXES];// 方向向量/分量比例 (單位路徑位移時，各軸應分配的比例)
@@ -675,7 +683,7 @@ struct InterpolationGroup// 插補群組
 
 
    //速度與進給控制------------------------------------------------------
-    double feedrateOverride =0.01;// 插補整體的進給速度倍率控制 (0.0 ~ 1.0+)
+    double feedrateOverride = 0.01;// 插補整體的進給速度倍率控制 (0.0 ~ 1.0+)
 
 
 
@@ -684,7 +692,7 @@ struct InterpolationGroup// 插補群組
     int currentExecutionPC = 0; // 馬達當下的行號
     // 🌟 2. 新增：實體馬達當下正在跑的座標系
     int currentExecutionWCS = 54;
-   
+
     // 🌟 2. 擴充實體狀態：實體馬達當下正在用的刀具狀態
     int currentExecutionToolMode = 49; // 預設 G49 (無補正)
     int currentExecutionHCode = 0;     // 預設 H0
@@ -716,7 +724,7 @@ struct InterpolationGroup// 插補群組
     int currentExecutionPlaneMode = 17; // 預設 G17
 
     //時光機專用擴充套件 ------------------------------------------------------
-  
+
     bool enableHistory = false;             // 時光機模式開關
     std::deque<MotionCommand> historyQueue; // 歷史軌跡 (跑完的麵包屑)
     MotionCommand currentCmd;               // 當前指令 (備份用，退刀時才知道這條線長怎樣)
@@ -727,9 +735,9 @@ struct InterpolationGroup// 插補群組
 
     //路徑模式------------------------------------------------------
     double pathServoVel = 0.0;// 外部路徑伺服速度輸入 (單位: Pulse/sec)
-    
+
     //跳刀管理器------------------------------------------------------
-   
+
     PathJumpManager jumpManager;
 };
 
@@ -747,9 +755,9 @@ class MotionCore
 public:
     MotionCore();
 
-    
-    
-   
+
+
+
     //系統關聯與連結--------------------------------------------------------------------
     CoordinateManager* m_pCoordMgr = nullptr;
     CompensationEngine m_CompEngine; // 🌟 宣告補償引擎
@@ -772,13 +780,13 @@ public:
     void UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis);//更新單軸狀態 逐步激磁
     void ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputInMM = false);
     //單軸運動 API--------------------------------------------------------------------
-    
-    
+
+
     void InitAxis(AxisContext& axis, double resolution = 16777216.0);// 初始化軸參數 (如解析度、預設極限、PID)
     void InitSmoothBuffer(AxisContext& axis, double smoothTime_ms);// 初始化 S-Curve 平滑濾波緩衝區
     void MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time);// 下達 P2P 絕對位置移動指令 (Trapezoidal 梯形加減速)
     void VelocityMove(AxisContext& axis, double velocity, double acc_time = 0.0);// 下達速度模式指令 (用於放電或手動連續移動)
-    void MPGMove(AxisContext& axis,double targetPos,double maxVel, double acc_time,double dec_time);
+    void MPGMove(AxisContext& axis, double targetPos, double maxVel, double acc_time, double dec_time);
     void StopMove(AxisContext& axis, double dec_time = 0.0);// 正常減速停止單軸
     void EmergencyStop(AxisContext& axis);// 單軸急停 (瞬間鎖死，清空緩衝區)
     void ResetFault(AxisContext& axis);// 清除單軸故障狀態 (Reset Error)
@@ -819,8 +827,16 @@ public:
     // 🌟 [新增] 將使用者直覺的 mm/min 或 deg/min 轉換為 PPS
     static double UnitPerMinToPps(double unitPerMin, double resolution, double finalLead);
 
+    // G81 HOME Feedback / Machine Coordinate Helpers
+    double GetRawLogicalPositionPulse(const AxisContext& axis) const;
+    bool GetDriveTouchProbeFunction(int axisIndex, uint16_t& functionValue) const;
+    bool GetDriveTouchProbeData(int axisIndex, uint16_t& status, int32_t& capturedPosition) const;
+    bool SetDriveTouchProbeFunction(int axisIndex, uint16_t value);
+    double ConvertDriveCaptureToRawLogicalPulse(int axisIndex, int32_t capturedPosition, HomeReferenceSource source) const;
+    bool ApplyMachineHome(AxisContext& axis, double capturedReferencePulse, double homeOffsetUnit);
+
     //多軸插補功能區塊--------------------------------------------------------------------
-   
+
     void LineMove(const std::vector<int>& axes, const std::vector<double>& targetPos, double targetVel, double acc_time, double dec_time, BufferMode mode = BufferMode::ABORTING);// 直線插補指令
     void ArcMove(const std::vector<int>& axes, const std::vector<double>& targetPos, const std::vector<double>& centerPos, int dir, double targetVel, double acc_time, double dec_time, BufferMode mode = BufferMode::ABORTING);// 圓弧插補指令
     void UpdateInterpolation();// 插補群組更新 (計算虛擬主軸並分配位移給實體軸)
@@ -844,8 +860,8 @@ public:
 
     //跳躍排渣區塊--------------------------------------------------------------------
     void TriggerPathJump(JumpMode mode, const std::vector<JumpSegment>& retract, const std::vector<JumpSegment>& approach, double dwellTime_ms, int b1_axis = 2);
-  
-    void TriggerCenterJump_B3(double targetCenterX, double targetCenterY, double targetCenterZ,double jumpVecX, double jumpVecY, double jumpVecZ,const std::vector<JumpSegment>& toCenter,const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex,const std::vector<JumpSegment>& toWorkpiece,double dwellTime_ms);
+
+    void TriggerCenterJump_B3(double targetCenterX, double targetCenterY, double targetCenterZ, double jumpVecX, double jumpVecY, double jumpVecZ, const std::vector<JumpSegment>& toCenter, const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece, double dwellTime_ms);
     void TriggerOrbitalJump_B4(double upperCx, double upperCy, double upperCz, double vx, double vy, double vz, const std::vector<JumpSegment>& toUpper, const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece, double dwellTime_ms);
     void FinalizeSafePath(const std::vector<JumpSegment>& retract, std::vector<JumpSegment>& approach);//腳本安全保護控制
 
@@ -856,9 +872,9 @@ public:
     void TriggerPause_B3(double cx, double cy, double cz, double vx, double vy, double vz, const std::vector<JumpSegment>& toCenter, const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece);
     void TriggerPause_B4(double upperCx, double upperCy, double upperCz, double vx, double vy, double vz, const std::vector<JumpSegment>& toUpper, const std::vector<JumpSegment>& toApex, const std::vector<JumpSegment>& fromApex, const std::vector<JumpSegment>& toWorkpiece);
 
-   
-    
-    
+
+
+
     void Process_B2_Approach_Planner(double dt);
     void Process_Forward_Crossing();
     void TriggerPauseResume(int alignMode, double alignVel, int firstStageMask);//觸發復歸 (只需給對齊模式和速度)
@@ -881,7 +897,7 @@ public:
     // 檢查「當前插補群組」內正在參與同動的軸，是否有發生錯誤 (Fault)
     bool IsGroupFaulted() const;
 
-
+    bool IsGroupEmergencyStopped() const;
     // 🌟 修正版：精準對應軸索引的目標座標抓取 API
     bool GetExecutingTargetMCS(double* outTarget_mm) const {
         // 如果機台靜止或插補器未啟用，回傳 false
@@ -943,7 +959,7 @@ public:
         m_pendingSourcePC = 0;
     }
 
- 
+
 
     // 🌟 3. 新增：讓外部 (HMI) 讀取實體馬達的刀具狀態
     int GetPhysicalExecutionToolMode() const { return m_Group.currentExecutionToolMode; }
@@ -1004,7 +1020,7 @@ public:
     }
 
     // 🌟 5. 升級重置函式：防殘影
-    void ResetPhysicalTags(int currentBrainWCS, int currentBrainToolMode, int currentBrainHCode ,int curTRadMode, int curDCode, bool curIsAbsMode, bool curG68, double curG68Angle, bool isG168, int curWCode, bool curG51, double curScaleRatio, uint8_t curMirrorMask, bool curG16, bool curG162, int curPlaneMode) {
+    void ResetPhysicalTags(int currentBrainWCS, int currentBrainToolMode, int currentBrainHCode, int curTRadMode, int curDCode, bool curIsAbsMode, bool curG68, double curG68Angle, bool isG168, int curWCode, bool curG51, double curScaleRatio, uint8_t curMirrorMask, bool curG16, bool curG162, int curPlaneMode) {
         m_Group.currentExecutionPC = 0;
         m_pendingSourcePC = 0;
 
@@ -1067,7 +1083,7 @@ public:
 
 
 
-   
+
 private:
     int m_pendingSourcePC = 0;
     int m_pendingSourceWCS = 54; // 預設 G54
@@ -1100,7 +1116,7 @@ private:
     void Calc_Trajectory_Trapezoidal(AxisContext& axis, AxisCommand& outCmd); // 計算定位模式的梯形速度規劃 (S-Curve 前置)
     void Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd); // 計算速度模式的斜坡變速規劃
     void Calc_Trajectory_MPG(AxisContext& axis, AxisCommand& outCmd);
-   
+
     // 執行 PID 運算、前饋控制以及安全 Lag 監控--------------------------------------------------------------------
     template <typename DriveType>
 
@@ -1109,7 +1125,7 @@ private:
 
     double PlanTrapezoidal(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
     double PlanTrapezoidal_B2(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
-   
+
     int Sgn(double val); // 符號函數
 
     // 指向實體資料的指標列表--------------------------------------------------------------------
@@ -1120,16 +1136,16 @@ private:
     // 多軸插補管理器 (單一實體群組)--------------------------------------------------------------------
     InterpolationGroup m_Group;
 
-    
-    
-  public:
+
+
+public:
 
     //G碼使用-------------------------------------------------------------- 
     void G00_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G00 快速定位 API
     void G07_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G07 快速定位 API
     void G161_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G161 快速定位 API
     void G53_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G53 機械定位 API
-    void G28_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm,const std::vector<double>* intermediatePos_mm, BufferMode mode);// G28 參考點賦歸 API
+    void G28_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm, const std::vector<double>* intermediatePos_mm, BufferMode mode);// G28 參考點賦歸 API
     void G30_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm, const std::vector<double>* intermediatePos_mm, BufferMode mode);// G30 參考點賦歸 API
     void G32_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm, const std::vector<double>* intermediatePos_mm, BufferMode mode);// G32 參考點賦歸 API
 

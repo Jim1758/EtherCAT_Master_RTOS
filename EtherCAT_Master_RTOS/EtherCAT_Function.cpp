@@ -71,7 +71,32 @@ int EtherCatMaster::ScanSlaves()
             // 儲存到我們的結構中
             m_slaveInfo[i - 1].configAddr = new_addr;
             m_slaveInfo[i - 1].APRDAPWR_Addr = adp;
-            InitSlaveMailboxInfo(i - 1);
+
+
+            // =====================================================
+            // Stage 6B - Runtime Mailbox Cutover Gate
+            //
+            // If Runtime XML explicitly declares Mailbox transport,
+            // it must be complete and valid.
+            //
+            // Never continue into SDO/PRE-OP with an invalid
+            // Runtime Mailbox definition.
+            // =====================================================
+
+            if (!InitSlaveMailboxInfo(
+                i - 1))
+            {
+                RtPrintf(
+                    "[ECAT-SCAN] ABORTED | "
+                    "Reason:Runtime Mailbox configuration invalid | "
+                    "SlaveIndex:%d\n",
+
+                    i - 1);
+
+
+                return
+                    0;
+            }
 
 
         }
@@ -427,6 +452,32 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
 {
     if (!m_pNic) return 0;
 
+    // =========================================================
+    // Stage 3B - Final Frame Guard
+    //
+    // LRW Frame = 28 + length
+    //
+    // 必須在任何依 length 存取 m_txBuffer / m_rxBuffer 前完成。
+    // =========================================================
+    const int total_send_len =
+        28 +
+        (int)length;
+
+    if (total_send_len >
+            (int)sizeof(m_txBuffer) ||
+        total_send_len >
+            (int)sizeof(m_rxBuffer))
+    {
+        return -1;
+    }
+
+    // EtherCAT Datagram Length 欄位為 11 bits。
+    if (length >
+        0x07FFU)
+    {
+        return -1;
+    }
+
     uint8_t* frame = m_txBuffer;
 
     // --- 1. Ethernet Header (14 bytes) ---
@@ -481,7 +532,6 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
     frame[26 + length + 1] = 0x00;
 
     // --- 5. 發送封包 ---
-    int total_send_len = 14 + 2 + 10 + length + 2;
     m_pNic->SendPacket(frame, total_send_len);
 
     // --- 6. 接收回應 (Receive Loop) ---
@@ -5219,9 +5269,32 @@ int EtherCatMaster::ecx_LRW_FRMW(
         (int)length;
 
 
-    // Ethernet 最大 Frame Buffer
+    // =====================================================
+    // Stage 3B - Final Frame Guard
+    //
+    // 實際 member buffer 都是 1514 Bytes。
+    // 舊版 1518 判斷會讓 1515~1518 Bytes 越界風險被放行。
+    //
+    // Priority 64 路徑只增加固定時間 integer compare。
+    // =====================================================
     if (totalFrameLength >
-        1518)
+            (int)sizeof(m_txBuffer) ||
+        totalFrameLength >
+            (int)sizeof(m_rxBuffer))
+    {
+        return -1;
+    }
+
+
+    // Combined LRW + FRMW 的 EtherCAT payload：
+    // 32 + length，EtherCAT Header Length 欄位為 11 bits。
+    const int etherCatPayloadLength =
+        32 +
+        (int)length;
+
+
+    if (etherCatPayloadLength >
+        0x07FF)
     {
         return -1;
     }

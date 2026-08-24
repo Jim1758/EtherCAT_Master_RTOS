@@ -9,6 +9,8 @@
 #include "CoordinateManager.h"
 #include "CompensationEngine.h" // 引入剛寫好的標頭檔
 #include "SHM_Types.h"
+
+class EtherCatMaster;
 constexpr int MAX_AXES = 8;//最大軸數宣告
 const double CYCLE_TIME_SEC = 0.00025;// EtherCAT 通訊週期 (250us)
 
@@ -745,6 +747,41 @@ struct InterpolationGroup// 插補群組
 
 
 
+// ============================================================================
+// Stage 11E.4 - Servo OUTPUT Command Seam Field Identity
+//
+// Axis identity remains AxisContext.axisIndex.
+//
+// This enum describes which of the four Servo command fields was written
+// through the active LEGACY command seam.
+// ============================================================================
+
+enum class MotionServoOutputCommandField : uint8_t
+{
+    ControlWord = 0,
+    TargetVelocity = 1,
+    TouchProbeFunction = 2,
+    ModesOfOperation = 3
+};
+
+
+// ============================================================================
+// Stage 11D.6 - Motion Servo INPUT Consumer Seam
+//
+// Active source in this stage remains LEGACY ENI_ServoDrive::pInput.
+// Motion algorithms consume this POD snapshot instead of direct pInput reads.
+// ============================================================================
+
+struct MotionServoInputSnapshot
+{
+    uint16_t StatusWord = 0U;
+    int32_t ActualPosition = 0;
+    int8_t ModesOfOperationDisplay = 0;
+    uint16_t TouchProbeStatus = 0U;
+    int32_t TouchProbePosition = 0;
+};
+
+
 //核心類別宣告--------------------------------------------------------------------
 // ==========================================
 // 核心運動控制類別 (MotionCore Class)
@@ -765,6 +802,13 @@ public:
 
     void Link(std::vector<ENI_ServoDrive>* pAxisList);// 連結實體驅動器列表 (EtherCAT 映射資料)
     void Link(std::vector<ENI_ServoDrive>* pDriveList, std::vector<AxisContext>* pContextList);// 連結實體驅動器與邏輯參數上下文 (Context)
+
+    // Stage 11D.3:
+    // Bind the owning EtherCatMaster only for SHADOW comparison.
+    // Actual Motion input/output consumers remain ENI_ServoDrive.
+    void BindStructuredServoReadShadowMaster(
+        EtherCatMaster* pMaster);
+
     void LinkCoordinateManager(CoordinateManager* pCoord);
     AxisContext& GetAxisContext(int index)
     {
@@ -777,7 +821,15 @@ public:
 
     //軸狀態
     void UpdateAllMotion();//更新全部軸狀態 逐步激磁
-    void UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis);//更新單軸狀態 逐步激磁
+
+    // Stage 11D.6:
+    // Input arrives through MotionServoInputSnapshot.
+    // Output remains the original ENI_ServoDrive.
+    void UpdateServoState(
+        ENI_ServoDrive& servo,
+        AxisContext& axis,
+        const MotionServoInputSnapshot& input);
+
     void ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputInMM = false);
     //單軸運動 API--------------------------------------------------------------------
 
@@ -817,7 +869,10 @@ public:
     //核心運算更新--------------------------------------------------------------------
     // 單軸運動狀態機更新 (必須在即時迴圈 1ms/250us 中呼叫)
     template <typename DriveType>
-    void UpdateMotion(DriveType& servo, AxisContext& axis);
+    void UpdateMotion(
+        DriveType& servo,
+        AxisContext& axis,
+        const MotionServoInputSnapshot& input);
 
 
     //輔助工具--------------------------------------------------------------------
@@ -1128,10 +1183,80 @@ private:
 
     int Sgn(double val); // 符號函數
 
+    // =========================================================
+    // Stage 11E.5 - centralized Servo OUTPUT command seam.
+    //
+    // Before E4 runtime qualification:
+    //     legacy pOutput producer.
+    //
+    // After E4 runtime qualification:
+    //     structured AxisIndex producer.
+    //
+    // Any structured fault boot-latches rollback to legacy.
+    // =========================================================
+
+    void WriteServoControlWordCommand(
+        ServoOutput* output,
+        int axisIndex,
+        uint16_t value);
+
+    void WriteServoTargetVelocityCommand(
+        ServoOutput* output,
+        int axisIndex,
+        int32_t value);
+
+    void WriteServoTouchProbeFunctionCommand(
+        ServoOutput* output,
+        int axisIndex,
+        uint16_t value);
+
+    void WriteServoModesOfOperationCommand(
+        ServoOutput* output,
+        int axisIndex,
+        int8_t value);
+
+
+    // =========================================================
+    // Stage 11D.6 - centralized active LEGACY input seam.
+    // =========================================================
+
+    bool ReadLegacyMotionServoInputSnapshot(
+        const ENI_ServoDrive& servo,
+        MotionServoInputSnapshot& snapshot) const;
+
+    bool ReadLegacyMotionServoInputSnapshotBySlot(
+        int motionSlot,
+        MotionServoInputSnapshot& snapshot) const;
+
+
+    // =========================================================
+    // Stage 11D.8 - controlled compatibility input seam.
+    //
+    // motionSlot is converted to AxisContext.axisIndex.
+    //
+    // After D7 full qualification:
+    //     published Motion semantic snapshot
+    //
+    // Before D7 qualification / on D8 read failure:
+    //     legacy compatibility fallback
+    // =========================================================
+
+    bool ReadMotionServoInputCompatibilitySnapshotBySlot(
+        int motionSlot,
+        MotionServoInputSnapshot& snapshot) const;
+
+
     // 指向實體資料的指標列表--------------------------------------------------------------------
     std::vector<ENI_ServoDrive>* m_pAxes = nullptr;   // 舊有的驅動器關聯 (保留相容性)
     std::vector<ENI_ServoDrive>* m_pDrives = nullptr;  // 實體驅動器列表 (PDO 對接)
     std::vector<AxisContext>* m_pContexts = nullptr;   // 軸參數與狀態列表 (邏輯計算)
+
+
+    // Stage 11D.3 shadow-only bridge back to the owning Master.
+    // Never used to command a Servo in this stage.
+    EtherCatMaster* m_pStructuredServoReadShadowMaster =
+        nullptr;
+
 
     // 多軸插補管理器 (單一實體群組)--------------------------------------------------------------------
     InterpolationGroup m_Group;

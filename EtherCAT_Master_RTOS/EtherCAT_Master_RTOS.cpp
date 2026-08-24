@@ -28,7 +28,7 @@ bool InitEtherCATMaster();//初始化 EtherCAT 主站
 
 int _tmain(int argc, _TCHAR* argv[])//
 {
-  
+
     // ==============================================================
     // 🌟 1. 設定 CPU 核心親和性 (自動偵測安全版)
     // ==============================================================
@@ -64,8 +64,8 @@ int _tmain(int argc, _TCHAR* argv[])//
 
     std::string configPath = GlobalConfig::GetInstance().BaseDataDir + "SystemConfig.txt";
     GlobalConfig::GetInstance().LoadFromFile(configPath);//讀取系統檔案
-  
-    if (GlobalConfig::GetInstance().systemMode== SystemMode::UNKNOWN_MODE)
+
+    if (GlobalConfig::GetInstance().systemMode == SystemMode::UNKNOWN_MODE)
     {
         DEBUG_PRINT("Error System_Mode !\n");//錯誤系統模式
         return -1;
@@ -89,20 +89,20 @@ int _tmain(int argc, _TCHAR* argv[])//
     switch (GlobalConfig::GetInstance().systemMode)
     {
     case SystemMode::EDM_SINKER_MODE://EDM 雕磨模式
-      
-        
+
+
         if (GlobalConfig::GetInstance().InitSystemParameters(Master) == false)
         {
             DEBUG_PRINT("InitSystemParameters Error !\n");
             goto Exit;
         }
-        
+
         if (InitEtherCATMaster() == false)//初始化 主站
         {
             DEBUG_PRINT("InitEtherCATMaster Error !\n");
             goto Exit;
         }
-      
+
         //Master.RunRealTimeCycle_EXAMPLE_MODE();//主要程式迴圈執行_測試模式
         DEBUG_PRINT("EDM_SINKER_MODE Start !\n");
         if (Master.RunRealTimeCycle_EDM_SINKER_MODE() == -1)
@@ -110,8 +110,8 @@ int _tmain(int argc, _TCHAR* argv[])//
             DEBUG_PRINT("RunRealTimeCycle_EDM Error !\n");
             goto Exit;
         }
-      
-       
+
+
 
         break;
     case SystemMode::EXAMPLE_MODE://範例模式 debug使用
@@ -131,69 +131,36 @@ int _tmain(int argc, _TCHAR* argv[])//
         goto Exit;
 
     }
-   
 
- 
+
+
 Exit:
     DEBUG_PRINT("EtherCAT_Master Close !\n");
-    MyNic.Close();   
+    MyNic.Close();
     return 0;
 }
+
+
+// ============================================================================
+// InitEtherCATMaster
+//
+// RTOS Entry 只負責組出 Runtime Config 路徑。
+// 真正 Master Startup 流程已搬到 EtherCatMaster_Startup.cpp。
+// ============================================================================
 
 bool InitEtherCATMaster()//初始化 EtherCAT 主站
 {
     DEBUG_PRINT("InitEtherCATMaster !\n");
 
 
-    if (MyNic.Open()==false) //初始化開啟網卡
-    {
-        DEBUG_PRINT("Failed to open NIC.\n");
-        return  false;
-    }
+    const std::string eniPath =
+        GlobalConfig::GetInstance().BaseDataDir +
+        "ENI\\EtherCAT_Runtime.xml";
 
 
-    std::string eniPath = GlobalConfig::GetInstance().BaseDataDir + "ENI\\ENI.xml";
-  
-    if (MyEni.LoadXml(eniPath.c_str())==false)//載入ENI
-    {
-        DEBUG_PRINT("Error>>LoadXml\n");
-        return  false;
-    }
-
-  
-
-    Master.AttachNic(&MyNic);// 綁定網卡驅動程式
-    Master.AttachEni(&MyEni);// 綁定 ENI 設定檔解析器
-
-    int SlavesCount = Master.ScanSlaves(); //ScanSlaves(掃描從站)
-    if (SlavesCount == 0)
-    {
-        DEBUG_PRINT("Error>>ScanSlaves>>SlavesCount>>%d\n", SlavesCount);
-        return  false;
-    }
-    else
-    {
-        DEBUG_PRINT("SlavesCount>>%d\n", SlavesCount);
-    }
-
-
-    if (Master.BuildIoMap() != 0)//自動建構 IO 地圖
-    {
-        DEBUG_PRINT("BuildIoMap Error !\n");
-       
-        return  false;
-    }
-
-
-   
-    if (Master.Initialize_Slaves() != 0)//初始化所有從站 INIT>>PRE-OP>>SAFE-OP>>OP
-    {
-        DEBUG_PRINT("BInitialize_Slaves Error !\n");
-    
-        return  false;
-    }
-
-    return true;
+    return
+        Master.InitializeMaster(
+            MyNic,
+            MyEni,
+            eniPath.c_str());
 }
-
-

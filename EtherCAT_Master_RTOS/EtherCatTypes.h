@@ -1,10 +1,11 @@
-#pragma once
+ï»¿#pragma once
 #include <stdint.h>
+#include <cstddef>
 #include <vector>
 #include <string>
 
 // ============================================================================
-//  1. EtherCAT °òÂ¦©w¸q (©R¥O»P¼ĞÀY)
+//  1. EtherCAT åŸºç¤å®šç¾© (å‘½ä»¤èˆ‡æ¨™é ­)
 // ============================================================================
 #define EC_CMD_APRD 0x01
 #define EC_CMD_APWR 0x02
@@ -39,45 +40,124 @@ typedef struct
 #pragma pack(pop)
 
 // ============================================================================
-//  2. CiA402 ¦øªAÅX°Ê¾¹¸ê®Æµ²ºc (¹ïÀ³ RxPDO ©M TxPDO)
-//  [·s¼W] ³o¬O¬°¤F Delta A3-E ©w¸qªºµwÅé¬M®gµ²ºc
+//  2. CiA402 ä¼ºæœé©…å‹•å™¨è³‡æ–™çµæ§‹ (å°æ‡‰ RxPDO å’Œ TxPDO)
+//  [æ–°å¢] é€™æ˜¯ç‚ºäº† Delta A3-E å®šç¾©çš„ç¡¬é«”æ˜ å°„çµæ§‹
 // ============================================================================
 #pragma pack(push, 1)
 
-// ¹ïÀ³ RxPDO (1601h): Á`ªø«× 9 Bytes
+// å°æ‡‰ RxPDO (1601h): ç¸½é•·åº¦ 9 Bytes
 struct ServoOutput
 {
 
-    uint16_t ControlWord;      // [0-1] ±±¨î¦r (6040h) - 16 bit
-    int32_t  TargetVelocity;   // [2-5] ¥Ø¼Ğ³t«× (60FFh) - 32 bit
-    uint16_t TouchProbeFunc;   // [6-7] ±´°w¥\¯à (60B8h) - 16 bit
-    int8_t   ModesOfOperation; // [8]   ¾Ş§@¼Ò¦¡ (6060h) - 8 bit (1 Byte)
+    uint16_t ControlWord;      // [0-1] æ§åˆ¶å­— (6040h) - 16 bit
+    int32_t  TargetVelocity;   // [2-5] ç›®æ¨™é€Ÿåº¦ (60FFh) - 32 bit
+    uint16_t TouchProbeFunc;   // [6-7] æ¢é‡åŠŸèƒ½ (60B8h) - 16 bit
+    int8_t   ModesOfOperation; // [8]   æ“ä½œæ¨¡å¼ (6060h) - 8 bit (1 Byte)
 
 };
 
-// ¹ïÀ³ TxPDO (1A01h): Á`ªø«× 23 Bytes
+// å°æ‡‰ TxPDO (1A01h): ç¸½é•·åº¦ 23 Bytes
 struct ServoInput
 {
 
-    uint16_t StatusWord;              // [0-1]   ª¬ºA¦r (6041h) - 16 bit
-    int32_t  ActualPosition;          // [2-5]   ¹ê»Ú¦ì¸m (6064h) - 32 bit
-    int32_t  ActualVelocity;          // [6-9]   ¹ê»Ú³t«× (606Ch) - 32 bit
-    int16_t  ActualTorque;            // [10-11] ¹ê»Ú§á¤O (6077h) - 16 bit
-    uint16_t TouchProbeStatus;        // [12-13] ±´°wª¬ºA (60B9h) - 16 bit
-    int32_t  TouchProbePos1;          // [14-17] ±´°w§ì¨ú¦ì¸m (60BAh) - 32 bit
-    int8_t   ModesOfOperationDisplay; // [18]    ¥Ø«e¼Ò¦¡Åã¥Ü (6061h) - 8 bit (1 Byte)
-    uint32_t Object_2510;             // [19-22] ¼t°Ó¦Û©w¸q°Ñ¼Æ (2510h) - 32 bit
+    uint16_t StatusWord;              // [0-1]   ç‹€æ…‹å­— (6041h) - 16 bit
+    int32_t  ActualPosition;          // [2-5]   å¯¦éš›ä½ç½® (6064h) - 32 bit
+    int32_t  ActualVelocity;          // [6-9]   å¯¦éš›é€Ÿåº¦ (606Ch) - 32 bit
+    int16_t  ActualTorque;            // [10-11] å¯¦éš›æ‰­åŠ› (6077h) - 16 bit
+    uint16_t TouchProbeStatus;        // [12-13] æ¢é‡ç‹€æ…‹ (60B9h) - 16 bit
+    int32_t  TouchProbePos1;          // [14-17] æ¢é‡æŠ“å–ä½ç½® (60BAh) - 32 bit
+    int8_t   ModesOfOperationDisplay; // [18]    ç›®å‰æ¨¡å¼é¡¯ç¤º (6061h) - 8 bit (1 Byte)
+    uint32_t Object_2510;             // [19-22] å» å•†è‡ªå®šç¾©åƒæ•¸ (2510h) - 32 bit
 
 
 };
 #pragma pack(pop)
 
+// ============================================================
+// Servo PDO Compile-Time Safety Guard
+//
+// ç›®å‰æ­£å¼ A3E Runtime Profileï¼š
+//
+// RxPDO = 72 bits  = 9 Bytes
+// TxPDO = 184 bits = 23 Bytes
+//
+// è‹¥æœªä¾†æœ‰äººä¿®æ”¹ ServoOutput / ServoInput æ¬„ä½ã€å‹åˆ¥æˆ– Packingï¼Œ
+// é€ æˆ PDO Layout æ”¹è®Šï¼Œç›´æ¥åœ¨ç·¨è­¯éšæ®µåœæ­¢ï¼Œè€Œä¸æ˜¯ç­‰åˆ°å¯¦æ©Ÿ WKC
+// æˆ– Servo è³‡æ–™éŒ¯ä½æ‰ç™¼ç¾ã€‚
+// ============================================================
+
+static_assert(
+    sizeof(ServoOutput) == 9,
+    "ServoOutput PDO layout mismatch. Expected 9 bytes.");
+
+static_assert(
+    sizeof(ServoInput) == 23,
+    "ServoInput PDO layout mismatch. Expected 23 bytes.");
+
+
+// ============================================================
+// Stage 11D.1 - ServoPDO_9_23 exact field ABI guards
+//
+// Size-only checks are not enough for a structured Generic
+// adapter.  Every field byte offset must remain exact.
+// ============================================================
+
+static_assert(
+    offsetof(ServoOutput, ControlWord) == 0,
+    "ServoOutput.ControlWord offset mismatch.");
+
+static_assert(
+    offsetof(ServoOutput, TargetVelocity) == 2,
+    "ServoOutput.TargetVelocity offset mismatch.");
+
+static_assert(
+    offsetof(ServoOutput, TouchProbeFunc) == 6,
+    "ServoOutput.TouchProbeFunc offset mismatch.");
+
+static_assert(
+    offsetof(ServoOutput, ModesOfOperation) == 8,
+    "ServoOutput.ModesOfOperation offset mismatch.");
+
+
+static_assert(
+    offsetof(ServoInput, StatusWord) == 0,
+    "ServoInput.StatusWord offset mismatch.");
+
+static_assert(
+    offsetof(ServoInput, ActualPosition) == 2,
+    "ServoInput.ActualPosition offset mismatch.");
+
+static_assert(
+    offsetof(ServoInput, ActualVelocity) == 6,
+    "ServoInput.ActualVelocity offset mismatch.");
+
+static_assert(
+    offsetof(ServoInput, ActualTorque) == 10,
+    "ServoInput.ActualTorque offset mismatch.");
+
+static_assert(
+    offsetof(ServoInput, TouchProbeStatus) == 12,
+    "ServoInput.TouchProbeStatus offset mismatch.");
+
+static_assert(
+    offsetof(ServoInput, TouchProbePos1) == 14,
+    "ServoInput.TouchProbePos1 offset mismatch.");
+
+static_assert(
+    offsetof(ServoInput, ModesOfOperationDisplay) == 18,
+    "ServoInput.ModesOfOperationDisplay offset mismatch.");
+
+static_assert(
+    offsetof(ServoInput, Object_2510) == 19,
+    "ServoInput.Object_2510 offset mismatch.");
+
+
 
 // ============================================================================
-//  3. ¼Ò²Õª«¥ó©w¸q (¦øªA¡BIO¡BÃş¤ñ)
+//  3. æ¨¡çµ„ç‰©ä»¶å®šç¾© (ä¼ºæœã€IOã€é¡æ¯”)
 // ============================================================================
 
-// ¦øªAª«¥ó
+// ä¼ºæœç‰©ä»¶
 struct ENI_ServoDrive
 {
     int slaveIndex;
@@ -88,7 +168,7 @@ struct ENI_ServoDrive
     ServoInput* pInput = nullptr;
 };
 
-// [«O¯d] ¼Æ¦ì¼Ò²Õ (Generic IO)
+// [ä¿ç•™] æ•¸ä½æ¨¡çµ„ (Generic IO)
 struct ENI_GenericIO
 {
     int slaveIndex;
@@ -99,12 +179,12 @@ struct ENI_GenericIO
     uint16_t outputAddr;
     std::vector<uint8_t> outBuffer;
 
-    // PDO ¸ê®Æ«ü¼Ğ
-    void* pOutputLoc = nullptr; // «ü¦V Output (¿O¸¹)
-    void* pInputLoc = nullptr;  // «ü¦V Input («ö¶s)
+    // PDO è³‡æ–™æŒ‡æ¨™
+    void* pOutputLoc = nullptr; // æŒ‡å‘ Output (ç‡ˆè™Ÿ)
+    void* pInputLoc = nullptr;  // æŒ‡å‘ Input (æŒ‰éˆ•)
 };
 
-// [«O¯d] Ãş¤ñ¼Ò²Õ (Analog / Special)
+// [ä¿ç•™] é¡æ¯”æ¨¡çµ„ (Analog / Special)
 struct ENI_AnalogModule
 {
     int slaveIndex;
@@ -113,18 +193,378 @@ struct ENI_AnalogModule
     int channelCount;
     uint16_t configAddr;
 
-    // ¸ÑªR«áªº¼Æ­È
+    // è§£æå¾Œçš„æ•¸å€¼
     std::vector<int16_t> channelValues;
 
-    // PDO ¸ê®Æ«ü¼Ğ
+    // PDO è³‡æ–™æŒ‡æ¨™
     void* pInputLoc = nullptr;
 };
 
 // ============================================================================
-//  4. ENI XML ¸ÑªRµ²ºc
+//  4. ENI XML è§£æçµæ§‹
 // ============================================================================
 
-// [«O¯d] µ²ºc¦WºÙ¥²¶·¬O EtherCatSlave
+// ============================================================================
+// Stage 5A - Runtime XML V2 Metadata
+//
+// Configurator ç¾åœ¨å·²ç¶“è¼¸å‡ºçš„ Profile / PDO Summary / DC / Watchdog
+// åœ¨æœ¬éšæ®µæ­£å¼ä¿å­˜åˆ° EtherCatSlaveã€‚
+// Stage 5A åª Parse / Store / Diagnosticï¼Œä¸å–ä»£æ—¢æœ‰ç¡¬é«”è¨­å®šæµç¨‹ã€‚
+// ============================================================================
+
+struct EtherCatRuntimeProfileConfig
+{
+    bool present = false;
+
+    char name[128] = {};
+    char pdoMappingMode[32] = {};
+
+    uint16_t rxPdoAssignIndex = 0;
+    uint16_t txPdoAssignIndex = 0;
+
+    uint8_t outputSmControl = 0;
+    uint8_t inputSmControl = 0;
+
+    bool hasPdoMappingMode = false;
+    bool hasRxPdoAssignIndex = false;
+    bool hasTxPdoAssignIndex = false;
+    bool hasOutputSmControl = false;
+    bool hasInputSmControl = false;
+
+    std::vector<uint16_t> rxPdoIndexes;
+    std::vector<uint16_t> txPdoIndexes;
+};
+
+
+struct EtherCatRuntimeDcConfig
+{
+    bool present = false;
+
+    char mode[32] = {};
+
+    uint32_t cycleTimeNs = 0;
+    int64_t shiftTimeNs = 0;
+    bool referenceClock = false;
+
+    bool hasCycleTimeNs = false;
+    bool hasShiftTimeNs = false;
+    bool hasReferenceClock = false;
+};
+
+
+struct EtherCatRuntimeWatchdogConfig
+{
+    bool present = false;
+
+    uint32_t processDataTimeoutMs = 0;
+
+    bool hasProcessDataTimeoutMs = false;
+};
+
+
+// ============================================================================
+// Stage 5B - Executable Runtime Schema
+//
+// Complete SyncManager / PDO / InitCommand data is stored here.
+// Stage 5B still does NOT apply this data to EtherCAT hardware.
+// ============================================================================
+
+struct EtherCatRuntimeSyncManagerConfig
+{
+    int index = -1;
+
+    char name[64] = {};
+
+    uint16_t startAddress = 0;
+    uint16_t length = 0;
+
+    uint16_t minimumSize = 0;
+    uint16_t maximumSize = 0;
+
+    uint8_t controlByte = 0;
+
+    bool enabled = false;
+    bool opOnly = false;
+};
+
+
+struct EtherCatRuntimePdoEntryConfig
+{
+    uint16_t index = 0;
+    uint8_t subIndex = 0;
+    uint8_t bitLength = 0;
+    uint32_t mappingValue = 0;
+
+    char name[96] = {};
+    char dataType[32] = {};
+};
+
+
+struct EtherCatRuntimePdoConfig
+{
+    uint16_t index = 0;
+
+    char name[96] = {};
+
+    int syncManagerIndex = -1;
+
+    uint16_t bitSize = 0;
+    uint16_t byteSize = 0;
+
+    std::vector<EtherCatRuntimePdoEntryConfig> entries;
+};
+
+
+struct EtherCatRuntimeInitCommandConfig
+{
+    char source[32] = {};
+    bool apply = false;
+    bool hasApply = false;
+
+    char transition[16] = {};
+
+    uint16_t index = 0;
+    uint8_t subIndex = 0;
+
+    std::vector<uint8_t> data;
+
+    char comment[128] = {};
+};
+
+
+// ============================================================================
+// Stage 6A - Runtime Transport Schema
+//
+// Parse / audit only.
+// No EtherCAT hardware write is performed by these data structures.
+// ============================================================================
+
+struct EtherCatRuntimeMailboxDirectionConfig
+{
+    bool present = false;
+
+    int smIndex = -1;
+
+    uint16_t startAddress = 0;
+    uint16_t length = 0;
+
+    uint8_t controlByte = 0;
+    bool enabled = false;
+};
+
+
+struct EtherCatRuntimeMailboxConfig
+{
+    bool present = false;
+
+    EtherCatRuntimeMailboxDirectionConfig out;
+    EtherCatRuntimeMailboxDirectionConfig in;
+};
+
+
+struct EtherCatRuntimeFmmuConfig
+{
+    int index = -1;
+
+    char direction[16] = {};
+
+    uint32_t logicalStartAddress = 0;
+    uint16_t logicalLength = 0;
+
+    uint8_t logicalStartBit = 0;
+    uint8_t logicalEndBit = 0;
+
+    uint16_t physicalStartAddress = 0;
+    uint8_t physicalStartBit = 0;
+
+    uint8_t type = 0;
+    bool enabled = false;
+};
+
+
+// ============================================================================
+// Stage 7A - Runtime Process Image Binding Schema
+//
+// Describes the application-side binding currently produced by BuildIoMap().
+//
+// Stage 7A is parse / shadow-audit only.
+// ============================================================================
+
+struct EtherCatRuntimeProcessImageBindingConfig
+{
+    bool present = false;
+
+    char kind[32] = {};
+    char abi[32] = {};
+
+    int32_t outputOffset = -1;
+    uint32_t outputBytes = 0;
+
+    int32_t inputOffset = -1;
+    uint32_t inputBytes = 0;
+
+    uint16_t elementBytes = 0;
+    uint16_t channelCount = 0;
+};
+
+
+// ============================================================================
+// Stage 11A - Composite Multi-Binding Runtime Schema
+//
+// ProcessImageBinding remains the current compatibility envelope.
+//
+// ApplicationBindings adds a future-capable 0..N list of application
+// functions inside one EtherCAT Slave.
+//
+// Bit-level offsets are used so a future custom EDM card may contain:
+// - DigitalInput / DigitalOutput
+// - AnalogInput / AnalogOutput
+// - PositionFeedback
+// - Status / Command
+//
+// Stage 11A is parse + shadow audit only.
+// ============================================================================
+
+// ============================================================================
+// Stage 11C.2 - Generic Composite Application Descriptor
+//
+// Shadow application view over m_IoMap.
+// Supports byte-aligned and bit-oriented fields.
+// ============================================================================
+
+struct EtherCatCompositeApplicationDescriptor
+{
+    int32_t slaveIndex = -1;
+    int32_t bindingIndex = -1;
+    int32_t sortOrder = 0;
+
+    char id[64] = {};
+    char name[64] = {};
+
+    char kind[32] = {};
+    char legacyKind[32] = {};
+    char abi[32] = {};
+    char interfaceType[32] = {};
+    char dataType[32] = {};
+    char sampleMode[32] = {};
+    char unit[32] = {};
+    char axisRef[16] = {};
+
+    int32_t outputBitOffset = -1;
+    uint32_t outputBitLength = 0;
+
+    int32_t inputBitOffset = -1;
+    uint32_t inputBitLength = 0;
+
+    uint16_t elementBits = 0;
+    uint16_t channelCount = 0;
+
+    int32_t outputByteOffset = -1;
+    uint8_t outputBitShift = 0;
+    uint32_t outputByteSpan = 0;
+    bool outputByteAligned = true;
+    uint8_t* pOutputByteBase = nullptr;
+
+    int32_t inputByteOffset = -1;
+    uint8_t inputBitShift = 0;
+    uint32_t inputByteSpan = 0;
+    bool inputByteAligned = true;
+    uint8_t* pInputByteBase = nullptr;
+};
+
+
+// ============================================================================
+// Stage 11D.1 - Structured ServoDrive Field Descriptor
+//
+// Child field view under one parent ServoDrive Composite descriptor.
+//
+// Example parent:
+//
+//     ServoDrive / Primary / ServoPDO_9_23
+//
+// Child fields:
+//
+//     ControlWord
+//     TargetVelocity
+//     TouchProbeFunction
+//     ModesOfOperation
+//     StatusWord
+//     ActualPosition
+//     ActualVelocity
+//     ActualTorque
+//     TouchProbeStatus
+//     TouchProbePosition
+//     ModesOfOperationDisplay
+//     Object2510
+//
+// Shadow only in Stage11D.1.
+// ============================================================================
+
+struct EtherCatStructuredServoFieldDescriptor
+{
+    int32_t slaveIndex = -1;
+    int32_t parentBindingIndex = -1;
+
+    char parentBindingId[64] = {};
+    char parentAbi[32] = {};
+
+    char fieldId[64] = {};
+    char semanticKind[32] = {};
+    char direction[16] = {};
+    char interfaceType[32] = {};
+    char dataType[32] = {};
+    char unit[32] = {};
+    char axisRef[16] = {};
+
+    uint32_t relativeBitOffset = 0;
+    int32_t absoluteBitOffset = -1;
+    uint32_t bitLength = 0;
+
+    int32_t byteOffset = -1;
+    uint32_t byteSpan = 0;
+    bool byteAligned = true;
+
+    uint8_t* pByteBase = nullptr;
+};
+
+
+
+struct EtherCatRuntimeApplicationBindingConfig
+{
+    char id[64] = {};
+    char name[64] = {};
+
+    int32_t sortOrder = 0;
+
+    char kind[32] = {};
+    char legacyKind[32] = {};
+    char abi[32] = {};
+    char interfaceType[32] = {};
+    char dataType[32] = {};
+    char sampleMode[32] = {};
+    char unit[32] = {};
+    char axisRef[16] = {};
+
+    // Stage11C.1 persisted-project relative position.
+    int32_t outputRelativeBitOffset = -1;
+
+    // Absolute Process Image position.
+    int32_t outputBitOffset = -1;
+    uint32_t outputBitLength = 0;
+
+    // Stage11C.1 persisted-project relative position.
+    int32_t inputRelativeBitOffset = -1;
+
+    // Absolute Process Image position.
+    int32_t inputBitOffset = -1;
+    uint32_t inputBitLength = 0;
+
+    uint16_t elementBits = 0;
+    uint16_t channelCount = 0;
+};
+
+
+// [ä¿ç•™] çµæ§‹åç¨±å¿…é ˆæ˜¯ EtherCatSlave
 struct EtherCatSlave
 {
     char name[128];
@@ -133,17 +573,95 @@ struct EtherCatSlave
     uint32_t vendorId;
     uint32_t productCode;
 
+    // Runtime Config Identity
+    //
+    // Revision / ConfiguredAddress ç”± EtherCAT_Runtime.xml è¼‰å…¥ï¼Œ
+    // ç”¨æ–¼å•Ÿå‹•éšæ®µ Topology / Identity Verificationã€‚
+    //
+    // hasRevision / hasConfiguredAddress ç”¨ä¾†ä¿æŒèˆŠ Runtime XML ç›¸å®¹ï¼š
+    // èˆŠæª”æ¡ˆè‹¥æ²’æœ‰é€™äº›æ¬„ä½ï¼Œå°±åªè·³éè©²é …é©—è­‰ã€‚
+    uint32_t revision = 0;
+    uint16_t configuredAddress = 0;
+    bool hasRevision = false;
+    bool hasConfiguredAddress = false;
+
     uint16_t configAddrIn;
     uint16_t configAddrOut;
     uint32_t bitSize;
 
-    // Input ¸ê°T
-    uint16_t config_addr_in;   // ¿é¤J¦ì§} (PhysAddr)
-    uint32_t inputBitLength;   // ¿é¤Jªø«× (BitSize)
+    // Input è³‡è¨Š
+    uint16_t config_addr_in;   // è¼¸å…¥ä½å€ (PhysAddr)
+    uint32_t inputBitLength;   // è¼¸å…¥é•·åº¦ (BitSize)
 
-    // Output ¸ê°T
-    uint16_t config_addr_out;  // ¿é¥X¦ì§} (PhysAddr)
-    uint32_t outputBitLength;  // ¿é¥Xªø«× (BitSize)
+    // Output è³‡è¨Š
+    uint16_t config_addr_out;  // è¼¸å‡ºä½å€ (PhysAddr)
+    uint32_t outputBitLength;  // è¼¸å‡ºé•·åº¦ (BitSize)
+
+    // Stage 5A Runtime Metadata
+    EtherCatRuntimeProfileConfig runtimeProfile;
+    EtherCatRuntimeDcConfig runtimeDc;
+    EtherCatRuntimeWatchdogConfig runtimeWatchdog;
+
+    // Stage 5B complete executable schema.
+    std::vector<EtherCatRuntimeSyncManagerConfig> runtimeSyncManagers;
+    std::vector<EtherCatRuntimePdoConfig> runtimeRxPdos;
+    std::vector<EtherCatRuntimePdoConfig> runtimeTxPdos;
+    std::vector<EtherCatRuntimeInitCommandConfig> runtimeInitCommands;
+
+    // Stage 6A / 6C Runtime Transport Schema.
+    EtherCatRuntimeMailboxConfig runtimeMailbox;
+
+    // true:
+    //     Runtime XML contains an explicit <Fmmus> section.
+    //
+    // false:
+    //     legacy Runtime XML; Stage 6C may use old C++ fallback.
+    bool runtimeFmmuSchemaPresent = false;
+
+    std::vector<EtherCatRuntimeFmmuConfig> runtimeFmmus;
+
+
+    // Stage 7A application-side Process Image binding.
+    EtherCatRuntimeProcessImageBindingConfig runtimeProcessImageBinding;
+
+
+    // Stage 11A composite application binding schema.
+    bool runtimeApplicationBindingsSchemaPresent =
+        false;
+
+    char runtimeApplicationBindingsMode[32] =
+    {
+        0
+    };
+
+    std::vector<EtherCatRuntimeApplicationBindingConfig>
+        runtimeApplicationBindings;
+
+
+    // ================================================================
+    // Stage 11C.1 persisted Composite Runtime Shadow Schema
+    //
+    // Separate from active Stage11A <ApplicationBindings>.
+    // Parse/audit only; no Runtime cutover.
+    // ================================================================
+
+    bool runtimeCompositeBindingsShadowSchemaPresent =
+        false;
+
+    char runtimeCompositeBindingsShadowMode[32] =
+    {
+        0
+    };
+
+    int32_t runtimeCompositeBindingsShadowOutputBaseBit =
+        -1;
+
+    int32_t runtimeCompositeBindingsShadowInputBaseBit =
+        -1;
+
+    std::vector<EtherCatRuntimeApplicationBindingConfig>
+        runtimeCompositeBindingsShadow;
+
 
     struct InitCmd
     {

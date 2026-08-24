@@ -14,22 +14,87 @@
 
 int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行 EDM模式
 {
+    DEBUG_PRINT(
+        "[MASTER-RUNTIME] ENTRY RunRealTimeCycle_EDM_SINKER_MODE\n");
+
+
     GlobalConfig& globalConfig = GlobalConfig::GetInstance();
+
+
+    // =========================================================
+    // Stage 4B - Runtime Lifecycle
+    // =========================================================
+
+    ResetRuntimeState();
+
+
+    // =========================================================
+    // PREPARE
+    // =========================================================
+
+    BeginRuntimeStage(
+        EtherCatRuntimeStage::Prepare);
+
 
     Get_TotalSlave_WKC_Count();//取得從站WKC 分數
 
+
+    PassRuntimeStage(
+        EtherCatRuntimeStage::Prepare);
+
+
+    // =========================================================
+    // START_PDO_RUNTIME
+    // =========================================================
+
+    BeginRuntimeStage(
+        EtherCatRuntimeStage::StartPdoRuntime);
+
+
     if (StartDcPdoRuntime() != 0)//啟動PDO作業 DC同步
     {
+        FailRuntimeStage(
+            EtherCatRuntimeStage::StartPdoRuntime,
+            EcatRuntimeErrorPdoStart,
+            "PDO_RUNTIME_START_FAILED");
+
         return -1;
     }
+
+
+    PassRuntimeStage(
+        EtherCatRuntimeStage::StartPdoRuntime);
+
+
+    // =========================================================
+    // START_PLC_RUNTIME
+    // =========================================================
+
+    BeginRuntimeStage(
+        EtherCatRuntimeStage::StartPlcRuntime);
 
 
     if (StartPLCRuntime() != 0)//啟動PLC作業 
     {
+        FailRuntimeStage(
+            EtherCatRuntimeStage::StartPlcRuntime,
+            EcatRuntimeErrorPlcStart,
+            "PLC_RUNTIME_START_FAILED");
+
         return -1;
     }
 
 
+    PassRuntimeStage(
+        EtherCatRuntimeStage::StartPlcRuntime);
+
+
+    // =========================================================
+    // ENTER_OP
+    // =========================================================
+
+    BeginRuntimeStage(
+        EtherCatRuntimeStage::EnterOp);
 
 
     bool isSuccess = PDO_SendCommandAndWait(EcatCmdType::CMD_SET_STATE, 0x0000, 0x0000, 0x00, 0x0008, 2, 1000);//廣播切換OP狀態 PDO傳送
@@ -37,12 +102,29 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     if (isSuccess == true)
     {
         DEBUG_PRINT("[System] System is now in OP Mode. (Success)\n");
+
+        PassRuntimeStage(
+            EtherCatRuntimeStage::EnterOp);
     }
     else
     {
         DEBUG_PRINT("[Error] Failed to switch to OP Mode! (Timeout or Error)\n");
+
+        FailRuntimeStage(
+            EtherCatRuntimeStage::EnterOp,
+            EcatRuntimeErrorEnterOp,
+            "ENTER_OP_FAILED");
+
+        return -1;
     }
 
+
+    // =========================================================
+    // LINK_MOTION
+    // =========================================================
+
+    BeginRuntimeStage(
+        EtherCatRuntimeStage::LinkMotion);
 
 
     m_Motion.Link(&m_ServoList, &m_Axes);//綁定硬體指標
@@ -52,12 +134,56 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     if (m_ServoList.size() != m_Axes.size())
     {
         DEBUG_PRINT("Error Servo Count !>>m_ServoList>>%d>>m_Axes>>%d\n", m_ServoList.size(), m_Axes.size());
+
+        FailRuntimeStage(
+            EtherCatRuntimeStage::LinkMotion,
+            EcatRuntimeErrorServoAxisCount,
+            "SERVO_AXIS_COUNT_MISMATCH");
+
+        return -1;
     }
 
 
+    PassRuntimeStage(
+        EtherCatRuntimeStage::LinkMotion);
+
+
+    // =========================================================
+    // INIT_SHARED_MEMORY
+    // =========================================================
+
+    BeginRuntimeStage(
+        EtherCatRuntimeStage::InitSharedMemory);
+
+
     //共享記憶體初始化-------------------------------------------
-    SHMManager::GetInstance().Initialize("EDM_SINKER_MODE");
+    if (!SHMManager::GetInstance().Initialize("EDM_SINKER_MODE"))
+    {
+        FailRuntimeStage(
+            EtherCatRuntimeStage::InitSharedMemory,
+            EcatRuntimeErrorSharedMemory,
+            "SHARED_MEMORY_INITIALIZE_FAILED");
+
+        return -1;
+    }
+
+
     SHM_Data* pShm = SHMManager::GetInstance().GetData();// 把指針交給 NCManager
+
+
+    if (pShm == nullptr)
+    {
+        FailRuntimeStage(
+            EtherCatRuntimeStage::InitSharedMemory,
+            EcatRuntimeErrorSharedMemory,
+            "SHARED_MEMORY_POINTER_NULL");
+
+        return -1;
+    }
+
+
+    PassRuntimeStage(
+        EtherCatRuntimeStage::InitSharedMemory);
 
 
 
@@ -66,12 +192,22 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
     NCPLCManager ncPLCManager(*m_NC, m_Motion, m_plcManager);// PLC <-> NC Interface Manager
 
 
+    // =========================================================
+    // RUNNING
+    // =========================================================
+
+    MarkRuntimeRunning();
+
+
     //主控迴圈-------------------------------------------------------------
     while (1)
     {
 
         if (m_NC->Close_System_Com_flag == true)//關閉核心命令
         {
+            MarkRuntimeStopping();
+
+
             m_NC->CoordSys.SaveAllParameters();//儲存座標系統相關參數
 
             // 關機前最後 Flush 一次 HOME Snapshot / History。
@@ -79,6 +215,11 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
 
             g_PLC->Close_PLC();//關閉PLC作業
             SHMManager::GetInstance().Shutdown();//關閉共享記憶體
+
+
+            MarkRuntimeStopped();
+
+
             DEBUG_PRINT("Close System！\n");
             return 0;
         }
@@ -140,13 +281,23 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
             timer_1000ms_Count += 1;
             HMI_Bridge::ProcessTask_1000ms(m_NC); // 呼叫 1000ms 任務
 
-         
+            // HOME 成功時 HomingManager 只 Queue 記憶體資料。
+            // 這裡以 1000ms 低頻率寫入 Snapshot / History，
+            // 避免在 HOME State Machine 當下直接做磁碟 I/O。
+            HomePersistenceManager::GetInstance().FlushPending();
 
             //DEBUG_PRINT("1000ms\n");
 
 
-            PrintDcRuntimeDiagnostics();//DC診斷訊息
-            HomePersistenceManager::GetInstance().FlushPending();//低平率寫入檔案(HOME)
+            //PrintDcRuntimeDiagnostics();//DC診斷訊息
+
+
+            // Stage 11C.9:
+            // Low-frequency compatibility retirement diagnostics.
+            //
+            // This is the existing 1000ms supervisory loop, NOT the
+            // 250us PDO loop and NOT PlcCore's 1ms input bridge.
+            m_Plc.PrintGenericInputCompatibilityRetirementShadow();
         }
 
         //5000ms

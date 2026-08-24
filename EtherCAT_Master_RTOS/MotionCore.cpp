@@ -18,6 +18,310 @@ void MotionCore::Link(std::vector<ENI_ServoDrive>* pDriveList, std::vector<AxisC
     m_pDrives = pDriveList;
     m_pContexts = pContextList;
 }
+
+
+void MotionCore::BindStructuredServoReadShadowMaster(
+    EtherCatMaster* pMaster)
+{
+    m_pStructuredServoReadShadowMaster =
+        pMaster;
+}
+
+
+// ============================================================================
+// Stage 11E.5 - Centralized Servo OUTPUT Command Seam
+//
+// Before E4 qualification:
+//     legacy pOutput producer.
+//
+// After E4 qualification:
+//     structured AxisIndex producer writes the SAME m_IoMap field.
+//
+// If structured write fails:
+//     this same call immediately falls back to legacy pOutput.
+// ============================================================================
+
+void MotionCore::WriteServoControlWordCommand(
+    ServoOutput* output,
+    int axisIndex,
+    uint16_t value)
+{
+    if (output == nullptr)
+    {
+        return;
+    }
+
+    bool structuredWritten = false;
+
+    if (m_pStructuredServoReadShadowMaster != nullptr)
+    {
+        structuredWritten =
+            m_pStructuredServoReadShadowMaster->
+            TryWriteMotionServoOutputCommandStructured(
+                axisIndex,
+                MotionServoOutputCommandField::ControlWord,
+                static_cast<int64_t>(value),
+                output);
+    }
+
+    if (!structuredWritten)
+    {
+        output->ControlWord = value;
+    }
+
+    if (m_pStructuredServoReadShadowMaster != nullptr)
+    {
+        m_pStructuredServoReadShadowMaster->
+            ObserveMotionServoOutputCommandSeamWriteShadow(
+                axisIndex,
+                MotionServoOutputCommandField::ControlWord,
+                static_cast<int64_t>(value));
+    }
+}
+
+
+void MotionCore::WriteServoTargetVelocityCommand(
+    ServoOutput* output,
+    int axisIndex,
+    int32_t value)
+{
+    if (output == nullptr)
+    {
+        return;
+    }
+
+    bool structuredWritten = false;
+
+    if (m_pStructuredServoReadShadowMaster != nullptr)
+    {
+        structuredWritten =
+            m_pStructuredServoReadShadowMaster->
+            TryWriteMotionServoOutputCommandStructured(
+                axisIndex,
+                MotionServoOutputCommandField::TargetVelocity,
+                static_cast<int64_t>(value),
+                output);
+    }
+
+    if (!structuredWritten)
+    {
+        output->TargetVelocity = value;
+    }
+
+    if (m_pStructuredServoReadShadowMaster != nullptr)
+    {
+        m_pStructuredServoReadShadowMaster->
+            ObserveMotionServoOutputCommandSeamWriteShadow(
+                axisIndex,
+                MotionServoOutputCommandField::TargetVelocity,
+                static_cast<int64_t>(value));
+    }
+}
+
+
+void MotionCore::WriteServoTouchProbeFunctionCommand(
+    ServoOutput* output,
+    int axisIndex,
+    uint16_t value)
+{
+    if (output == nullptr)
+    {
+        return;
+    }
+
+    bool structuredWritten = false;
+
+    if (m_pStructuredServoReadShadowMaster != nullptr)
+    {
+        structuredWritten =
+            m_pStructuredServoReadShadowMaster->
+            TryWriteMotionServoOutputCommandStructured(
+                axisIndex,
+                MotionServoOutputCommandField::TouchProbeFunction,
+                static_cast<int64_t>(value),
+                output);
+    }
+
+    if (!structuredWritten)
+    {
+        output->TouchProbeFunc = value;
+    }
+
+    if (m_pStructuredServoReadShadowMaster != nullptr)
+    {
+        m_pStructuredServoReadShadowMaster->
+            ObserveMotionServoOutputCommandSeamWriteShadow(
+                axisIndex,
+                MotionServoOutputCommandField::TouchProbeFunction,
+                static_cast<int64_t>(value));
+    }
+}
+
+
+void MotionCore::WriteServoModesOfOperationCommand(
+    ServoOutput* output,
+    int axisIndex,
+    int8_t value)
+{
+    if (output == nullptr)
+    {
+        return;
+    }
+
+    bool structuredWritten = false;
+
+    if (m_pStructuredServoReadShadowMaster != nullptr)
+    {
+        structuredWritten =
+            m_pStructuredServoReadShadowMaster->
+            TryWriteMotionServoOutputCommandStructured(
+                axisIndex,
+                MotionServoOutputCommandField::ModesOfOperation,
+                static_cast<int64_t>(value),
+                output);
+    }
+
+    if (!structuredWritten)
+    {
+        output->ModesOfOperation = value;
+    }
+
+    if (m_pStructuredServoReadShadowMaster != nullptr)
+    {
+        m_pStructuredServoReadShadowMaster->
+            ObserveMotionServoOutputCommandSeamWriteShadow(
+                axisIndex,
+                MotionServoOutputCommandField::ModesOfOperation,
+                static_cast<int64_t>(value));
+    }
+}
+
+
+// ============================================================================
+// Stage 11D.6 - centralized active LEGACY Servo input snapshot.
+// ============================================================================
+
+bool MotionCore::ReadLegacyMotionServoInputSnapshot(
+    const ENI_ServoDrive& servo,
+    MotionServoInputSnapshot& snapshot) const
+{
+    snapshot =
+        MotionServoInputSnapshot{};
+
+    if (servo.pInput ==
+        nullptr)
+    {
+        return false;
+    }
+
+    snapshot.StatusWord =
+        servo.pInput->StatusWord;
+
+    snapshot.ActualPosition =
+        servo.pInput->ActualPosition;
+
+    snapshot.ModesOfOperationDisplay =
+        servo.pInput->ModesOfOperationDisplay;
+
+    snapshot.TouchProbeStatus =
+        servo.pInput->TouchProbeStatus;
+
+    snapshot.TouchProbePosition =
+        servo.pInput->TouchProbePos1;
+
+    return true;
+}
+
+
+bool MotionCore::ReadLegacyMotionServoInputSnapshotBySlot(
+    int motionSlot,
+    MotionServoInputSnapshot& snapshot) const
+{
+    snapshot =
+        MotionServoInputSnapshot{};
+
+    if (m_pDrives ==
+        nullptr ||
+        motionSlot <
+        0 ||
+        motionSlot >=
+        static_cast<int>(
+            m_pDrives->size()))
+    {
+        return false;
+    }
+
+    return
+        ReadLegacyMotionServoInputSnapshot(
+            (*m_pDrives)[
+                static_cast<size_t>(
+                    motionSlot)],
+            snapshot);
+}
+
+
+// ============================================================================
+// Stage 11D.8 - Compatibility input seam
+//
+// Normal compatibility path after D7 qualification:
+//
+//     motionSlot
+//         -> AxisContext.axisIndex
+//         -> published Motion input snapshot
+//
+// Legacy pInput remains only as warmup / emergency compatibility fallback.
+// ============================================================================
+
+bool MotionCore::ReadMotionServoInputCompatibilitySnapshotBySlot(
+    int motionSlot,
+    MotionServoInputSnapshot& snapshot) const
+{
+    snapshot =
+        MotionServoInputSnapshot{};
+
+
+    if (motionSlot <
+        0 ||
+        m_pContexts ==
+        nullptr ||
+        motionSlot >=
+        static_cast<int>(
+            m_pContexts->size()))
+    {
+        return
+            false;
+    }
+
+
+    if (m_pStructuredServoReadShadowMaster !=
+        nullptr)
+    {
+        const int semanticAxisIndex =
+            (*m_pContexts)[
+                static_cast<size_t>(
+                    motionSlot)]
+            .axisIndex;
+
+
+                if (m_pStructuredServoReadShadowMaster->
+                    TryReadMotionServoPublishedInputCompatibility(
+                        semanticAxisIndex,
+                        snapshot))
+                {
+                    return
+                        true;
+                }
+    }
+
+
+    // D7 warmup or D8 compatibility fallback.
+    return
+        ReadLegacyMotionServoInputSnapshotBySlot(
+            motionSlot,
+            snapshot);
+}
+
+
 // 輔助函式: 符號判斷
 int MotionCore::Sgn(double val) {
     return (0.0 < val) - (val < 0.0);
@@ -84,23 +388,65 @@ bool MotionCore::GetDriveTouchProbeFunction(int axisIndex, uint16_t& functionVal
 
 bool MotionCore::GetDriveTouchProbeData(int axisIndex, uint16_t& status, int32_t& capturedPosition) const
 {
-    status = 0;
-    capturedPosition = 0;
-    if (m_pDrives == nullptr || axisIndex < 0 || axisIndex >= static_cast<int>(m_pDrives->size())) return false;
-    const ENI_ServoDrive& drive = (*m_pDrives)[axisIndex];
-    if (drive.pInput == nullptr) return false;
-    status = drive.pInput->TouchProbeStatus;
-    capturedPosition = drive.pInput->TouchProbePos1;
+    status =
+        0U;
+
+    capturedPosition =
+        0;
+
+    MotionServoInputSnapshot
+        input;
+
+    if (!ReadMotionServoInputCompatibilitySnapshotBySlot(
+        axisIndex,
+        input))
+    {
+        return false;
+    }
+
+    status =
+        input.TouchProbeStatus;
+
+    capturedPosition =
+        input.TouchProbePosition;
+
     return true;
 }
 
 bool MotionCore::SetDriveTouchProbeFunction(int axisIndex, uint16_t value)
 {
-    if (m_pDrives == nullptr || axisIndex < 0 || axisIndex >= static_cast<int>(m_pDrives->size())) return false;
-    ENI_ServoDrive& drive = (*m_pDrives)[axisIndex];
-    if (drive.pOutput == nullptr) return false;
-    drive.pOutput->TouchProbeFunc = value;
-    return true;
+    if (m_pDrives == nullptr ||
+        axisIndex < 0 ||
+        axisIndex >= static_cast<int>(
+            m_pDrives->size()))
+    {
+        return
+            false;
+    }
+
+
+    ENI_ServoDrive& drive =
+        (*m_pDrives)[
+            static_cast<size_t>(
+                axisIndex)];
+
+
+    if (drive.pOutput ==
+        nullptr)
+    {
+        return
+            false;
+    }
+
+
+    WriteServoTouchProbeFunctionCommand(
+        drive.pOutput,
+        axisIndex,
+        value);
+
+
+    return
+        true;
 }
 
 double MotionCore::ConvertDriveCaptureToRawLogicalPulse(int axisIndex, int32_t capturedPosition, HomeReferenceSource source) const
@@ -249,14 +595,226 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     }
 
 
+    // =========================================================
+    // Stage 11D.3 - Motion Servo Input Consumer Bridge SHADOW
+    //
+    // This runs inside the existing Motion phase after the PDO
+    // Process Image has been refreshed.
+    //
+    // No allocation.
+    // No logging.
+    // No write.
+    // Actual UpdateMotion / UpdateServoState below remain legacy.
+    // =========================================================
+
+    bool legacyNormalPathRetired =
+        false;
+
+
+    if (m_pStructuredServoReadShadowMaster !=
+        nullptr)
+    {
+        // =====================================================
+        // Historical D3/D5 comparisons are required only until
+        // Stage11D.9 retirement.
+        // =====================================================
+
+        if (!m_pStructuredServoReadShadowMaster->
+            IsLegacyMotionServoInputNormalPathRetired())
+        {
+            m_pStructuredServoReadShadowMaster->
+                SampleMotionServoInputConsumerBridgeShadow();
+        }
+
+
+        // Stage 11D.7 source gate.
+        m_pStructuredServoReadShadowMaster->
+            UpdateControlledMotionServoInputCutoverGate();
+
+
+        // =====================================================
+        // Stage 11D.9
+        //
+        // This gate may transition to retired state only after
+        // Stage11D.8 is fully qualified.
+        // =====================================================
+
+        m_pStructuredServoReadShadowMaster->
+            UpdateLegacyMotionServoInputNormalPathRetirementGate();
+
+
+        // =====================================================
+        // Stage 11D.10 - final Servo INPUT release gate.
+        //
+        // Once D9 and D2 are qualified this retires the final
+        // D2 1ms legacy comparison sampler.
+        // =====================================================
+
+        m_pStructuredServoReadShadowMaster->
+            UpdateServoInputReleaseGate();
+
+
+        legacyNormalPathRetired =
+            m_pStructuredServoReadShadowMaster->
+            IsLegacyMotionServoInputNormalPathRetired();
+    }
+
+
     for (size_t i = 0; i < m_pDrives->size(); ++i)
     {
-        // 呼叫原本寫好的單軸更新邏輯
-
-        UpdateMotion((*m_pDrives)[i], (*m_pContexts)[i]);
-        UpdateServoState((*m_pDrives)[i], (*m_pContexts)[i]);
+        MotionServoInputSnapshot
+            input;
 
 
+        if (legacyNormalPathRetired &&
+            m_pStructuredServoReadShadowMaster !=
+            nullptr)
+        {
+            // =================================================
+            // Stage 11D.9 NORMAL PATH
+            //
+            // No legacy pInput snapshot is read here.
+            //
+            // Semantic input is now the first and normal source.
+            // =================================================
+
+            const bool semanticPass =
+                m_pStructuredServoReadShadowMaster->
+                TryReadRetiredMotionServoInputByAxisIndex(
+                    (*m_pContexts)[i].axisIndex,
+                    input);
+
+
+            if (!semanticPass)
+            {
+                // =============================================
+                // Emergency only:
+                //
+                // Read legacy pInput ON DEMAND after a semantic
+                // failure.  This is no longer the normal path.
+                // =============================================
+
+                if (!ReadLegacyMotionServoInputSnapshot(
+                    (*m_pDrives)[i],
+                    input))
+                {
+                    continue;
+                }
+
+
+                m_pStructuredServoReadShadowMaster->
+                    ReportLegacyMotionServoInputEmergencyFallback();
+
+
+                // One semantic route failure ends retirement for
+                // the remainder of this boot.
+                legacyNormalPathRetired =
+                    false;
+            }
+        }
+        else
+        {
+            // =================================================
+            // Pre-retirement compatibility path.
+            //
+            // Required for D3/D5/D6/D7/D8 current-boot
+            // qualification.
+            // =================================================
+
+            MotionServoInputSnapshot
+                legacyInput;
+
+
+            if (!ReadLegacyMotionServoInputSnapshot(
+                (*m_pDrives)[i],
+                legacyInput))
+            {
+                continue;
+            }
+
+
+            if (m_pStructuredServoReadShadowMaster !=
+                nullptr)
+            {
+                m_pStructuredServoReadShadowMaster->
+                    ObserveMotionServoInputConsumerSeamShadow(
+                        (*m_pContexts)[i].axisIndex,
+                        legacyInput.StatusWord,
+                        legacyInput.ActualPosition,
+                        legacyInput.ModesOfOperationDisplay,
+                        legacyInput.TouchProbeStatus,
+                        legacyInput.TouchProbePosition);
+            }
+
+
+            input =
+                legacyInput;
+
+
+            if (m_pStructuredServoReadShadowMaster !=
+                nullptr)
+            {
+                m_pStructuredServoReadShadowMaster->
+                    TryReadControlledMotionServoInputByAxisIndex(
+                        (*m_pContexts)[i].axisIndex,
+                        input);
+            }
+        }
+
+
+        if (m_pStructuredServoReadShadowMaster !=
+            nullptr)
+        {
+            // Stage 11D.8 publication remains active in both
+            // warmup and retired modes.
+            m_pStructuredServoReadShadowMaster->
+                PublishMotionServoInputConsumerSnapshot(
+                    (*m_pContexts)[i].axisIndex,
+                    input);
+        }
+
+
+        UpdateMotion(
+            (*m_pDrives)[i],
+            (*m_pContexts)[i],
+            input);
+
+
+        UpdateServoState(
+            (*m_pDrives)[i],
+            (*m_pContexts)[i],
+            input);
+
+
+        // =====================================================
+        // Stage 11E.6 - Servo OUTPUT final-command dispatcher.
+        //
+        // Before E5 release:
+        //   runs the historical E1->E5 qualification chain.
+        //
+        // After E5 release:
+        //   freezes historical output qualification and directly
+        //   validates the structured output mainline.
+        // =====================================================
+
+        if (m_pStructuredServoReadShadowMaster !=
+            nullptr &&
+            (*m_pDrives)[i].pOutput !=
+            nullptr)
+        {
+            const ENI_ServoDrive&
+                commandServo =
+                (*m_pDrives)[i];
+
+
+            m_pStructuredServoReadShadowMaster->
+                ObserveMotionServoOutputFinalCommandRuntime(
+                    (*m_pContexts)[i].axisIndex,
+                    commandServo.pOutput->ControlWord,
+                    commandServo.pOutput->TargetVelocity,
+                    commandServo.pOutput->TouchProbeFunc,
+                    commandServo.pOutput->ModesOfOperation);
+        }
     }
 
 
@@ -365,25 +923,42 @@ void MotionCore::ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputIn
                     drive.pOutput->TouchProbeFunc;
             }
 
-            if (drive.pInput != nullptr)
+            MotionServoInputSnapshot
+                input;
+
+            if (ReadMotionServoInputCompatibilitySnapshotBySlot(
+                static_cast<int>(
+                    i),
+                input))
             {
                 outDebugArray[i].TouchProbeStatus =
-                    drive.pInput->TouchProbeStatus;
+                    input.TouchProbeStatus;
 
                 outDebugArray[i].TouchProbePosition =
-                    drive.pInput->TouchProbePos1;
+                    input.TouchProbePosition;
             }
         }
     }
 }
-void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更新單軸狀態 逐步激磁
+void MotionCore::UpdateServoState(
+    ENI_ServoDrive& servo,
+    AxisContext& axis,
+    const MotionServoInputSnapshot& input)//更新單軸狀態 逐步激磁
 {
-    if (servo.pInput == nullptr || servo.pOutput == nullptr) return;
+    if (servo.pOutput ==
+        nullptr)
+    {
+        return;
+    }
 
-    uint16_t statusWord = servo.pInput->StatusWord;
+    const uint16_t statusWord =
+        input.StatusWord;
 
     // 1. 強制設定 CSV 模式 (Mode 9)
-    servo.pOutput->ModesOfOperation = 9;
+    WriteServoModesOfOperationCommand(
+        servo.pOutput,
+        axis.axisIndex,
+        9);
 
     // 2. [CiA 402 狀態機]
     // 遮罩與值定義 (為了可讀性)
@@ -400,7 +975,10 @@ void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更
         if (axis.resetRequest)
         {
             // 🌟 情況 1：系統正在嘗試復歸 (開機初始化，或是手動按了 Reset)
-            servo.pOutput->ControlWord = 0x0080; // 送出 Fault Reset
+            WriteServoControlWordCommand(
+                servo.pOutput,
+                axis.axisIndex,
+                0x0080); // 送出 Fault Reset
             // 💡 故意不把 axis.isFault 設為 true，保護 NC 不跳機
         }
         else
@@ -408,7 +986,10 @@ void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更
             // 🌟 情況 2：非預期的真實警報 (例如加工中過載、撞到極限)
             axis.isFault = true;
             axis.state = MotionState::MotionState_ERROR;
-            servo.pOutput->ControlWord = 0x0000; // 停止送出指令
+            WriteServoControlWordCommand(
+                servo.pOutput,
+                axis.axisIndex,
+                0x0000); // 停止送出指令
         }
     }
     else
@@ -421,22 +1002,34 @@ void MotionCore::UpdateServoState(ENI_ServoDrive& servo, AxisContext& axis)//更
         // B. Switch On Disabled (驅動器剛上電，未準備好)
         if ((statusWord & 0x004F) == 0x0040)
         {
-            servo.pOutput->ControlWord = 0x0006; // Shutdown
+            WriteServoControlWordCommand(
+                servo.pOutput,
+                axis.axisIndex,
+                0x0006); // Shutdown
         }
         // C. Ready to Switch On (準備就緒)
         else if ((statusWord & MASK_STATE) == 0x0021)
         {
-            servo.pOutput->ControlWord = 0x0007; // Switch On
+            WriteServoControlWordCommand(
+                servo.pOutput,
+                axis.axisIndex,
+                0x0007); // Switch On
         }
         // D. Switched On (電路已接通，等待最後一指令)
         else if ((statusWord & MASK_STATE) == 0x0023)
         {
-            servo.pOutput->ControlWord = 0x000F; // Enable Operation (激磁！)
+            WriteServoControlWordCommand(
+                servo.pOutput,
+                axis.axisIndex,
+                0x000F); // Enable Operation (激磁！)
         }
         // E. Operation Enabled (已成功激磁)
         else if ((statusWord & MASK_STATE) == 0x0027)
         {
-            servo.pOutput->ControlWord = 0x000F; // 維持激磁狀態
+            WriteServoControlWordCommand(
+                servo.pOutput,
+                axis.axisIndex,
+                0x000F); // 維持激磁狀態
             axis.isServoOn = true;
         }
         else
@@ -2305,7 +2898,10 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         const double motorRawLogicalPos = axis.currentActPos + axis.machineCoordinateOffsetPulse;
         if (std::abs(motorRawLogicalPos - convertedScalePos) > axis.maxDeviation) {
             axis.isFault = true;
-            servo.pOutput->TargetVelocity = 0;
+            WriteServoTargetVelocityCommand(
+                servo.pOutput,
+                axis.axisIndex,
+                0);
             RtPrintf("ALARM: Dual Loop Deviation Error!\n");
             return;
         }
@@ -2399,7 +2995,10 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         {
             axis.isFault = true;
             axis.isLagAlarm = true;
-            servo.pOutput->TargetVelocity = 0;
+            WriteServoTargetVelocityCommand(
+                servo.pOutput,
+                axis.axisIndex,
+                0);
             axis.state = MotionState::MotionState_ERROR;
 
             // 🌟 修正：不要再轉 (int) 了，直接印 double
@@ -2542,7 +3141,10 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
             {
                 EmergencyStopGroup();
 
-                servo.pOutput->TargetVelocity = 0;
+                WriteServoTargetVelocityCommand(
+                    servo.pOutput,
+                    axis.axisIndex,
+                    0);
 
                 return;
             }
@@ -2626,7 +3228,10 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
 
 
             // 本 Cycle 直接輸出 0。
-            servo.pOutput->TargetVelocity = 0;
+            WriteServoTargetVelocityCommand(
+                servo.pOutput,
+                axis.axisIndex,
+                0);
 
             return;
         }
@@ -2644,7 +3249,11 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     }
 
     // 6. [Write PDO] 寫入 EtherCAT
-    servo.pOutput->TargetVelocity = (int32_t)finalVel;
+    WriteServoTargetVelocityCommand(
+        servo.pOutput,
+        axis.axisIndex,
+        static_cast<int32_t>(
+            finalVel));
 }
 
 
@@ -2653,14 +3262,17 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
 // [Core] 主更新迴圈
 // ==========================================
 template <typename DriveType>
-void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
+void MotionCore::UpdateMotion(
+    DriveType& servo,
+    AxisContext& axis,
+    const MotionServoInputSnapshot& input)
 {
 
     // =========================================================
       // 🌟 [神級修復] 絕對安全的 32-bit 展開寫法 (過濾編譯器 UB)
       // =========================================================
       // 1. 強制轉為無號整數 (uint32_t)，不管怎麼翻轉，相減絕對是正確的微小正負差
-    uint32_t currentRawAct = (uint32_t)servo.pInput->ActualPosition;
+    uint32_t currentRawAct = (uint32_t)input.ActualPosition;
 
     if (axis.isFirstCycle) {
         axis.lastRawActPos = currentRawAct;
@@ -2691,7 +3303,7 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
 
 
     // 🟢 修改為：防抖動濾波寫法 (Debounce)
-    bool rawServoOn = (servo.pInput->StatusWord & 0x0027) == 0x0027;
+    bool rawServoOn = (input.StatusWord & 0x0027) == 0x0027;
 
     if (!rawServoOn) {
         axis.servoOffCounter++;
@@ -2704,7 +3316,7 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
     // 連續 5 個 Cycle (5 毫秒) 確實沒有激磁，才認定真的斷電了
     bool isServoOn = (axis.servoOffCounter < 5);
 
-    int opMode = servo.pInput->ModesOfOperationDisplay;
+    int opMode = input.ModesOfOperationDisplay;
 
 
     // 🌟 [優先權最高] 大腦監視實體馬達
@@ -2720,13 +3332,19 @@ void MotionCore::UpdateMotion(DriveType& servo, AxisContext& axis)
         axis.logicalCmdVel = 0.0;
         axis.pid.integralAcc = 0.0;
         // axis.state = MotionState::MotionState_IDLE; // ❌ 不要直接設為 IDLE
-        servo.pOutput->TargetVelocity = 0;
+        WriteServoTargetVelocityCommand(
+            servo.pOutput,
+            axis.axisIndex,
+            0);
         return;
     }
 
     // 🌟 2. 已經 Servo On 的情況下，才檢查軟體警報
     if (axis.isFault) {
-        servo.pOutput->TargetVelocity = 0;
+        WriteServoTargetVelocityCommand(
+            servo.pOutput,
+            axis.axisIndex,
+            0);
         return;
     }
 
@@ -6726,5 +7344,8 @@ bool MotionCore::IsGroupEmergencyStopped() const
 
 // 假設你的結構叫 ENI_ServoDrive (請根據你的專案修改)
 
-template void MotionCore::UpdateMotion<ENI_ServoDrive>(ENI_ServoDrive&, AxisContext&);
+template void MotionCore::UpdateMotion<ENI_ServoDrive>(
+    ENI_ServoDrive&,
+    AxisContext&,
+    const MotionServoInputSnapshot&);
 template void MotionCore::Run_Servo_Loop<ENI_ServoDrive>(ENI_ServoDrive&, AxisContext&, const AxisCommand&);

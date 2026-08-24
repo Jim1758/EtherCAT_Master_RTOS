@@ -285,6 +285,48 @@
     <ClCompile Include="HomePersistenceManager.cpp">
       <Filter>Source Files\NC\Home</Filter>
     </ClCompile>
+    <ClCompile Include="EtherCatMaster_Startup.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_RuntimeState.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_RuntimeEquivalence.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_RuntimeConfigurator.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_TransportAudit.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_RuntimeFmmu.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_ProcessImageBindingAudit.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_RuntimeBinding.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_RuntimeConfigVerify.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_RuntimeContractAudit.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_CompositeBindingAudit.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_CompositeRuntimeShadowAudit.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_CompositeAdapterShadow.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
+    <ClCompile Include="EtherCatMaster_CompositeAccessShadow.cpp">
+      <Filter>Source Files\EtherCAT_Master</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">

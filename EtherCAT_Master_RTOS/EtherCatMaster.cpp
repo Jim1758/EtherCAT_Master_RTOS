@@ -55,10 +55,199 @@ void EtherCatMaster::AttachEni(EtherCatEni* pEni) // 綁定 ENI 設定檔解析�
 
 
 
-void EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//手動設定從站Mailbox
+bool EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//Stage 6B Runtime Mailbox Cutover
 {
-    m_slaveInfo[slave_idx].Vendor_ID = ReadSII_Uint32(slave_idx, 0x0008);
-    m_slaveInfo[slave_idx].Product_Code = ReadSII_Uint32(slave_idx, 0x000A);
+    // ========================================================================
+    // Identity is still read from SII.
+    //
+    // Stage 1B topology verification continues to use these fields.
+    // ========================================================================
+
+    m_slaveInfo[slave_idx].Vendor_ID =
+        ReadSII_Uint32(
+            slave_idx,
+            0x0008);
+
+
+    m_slaveInfo[slave_idx].Product_Code =
+        ReadSII_Uint32(
+            slave_idx,
+            0x000A);
+
+
+    m_slaveInfo[slave_idx].Revision_No =
+        ReadSII_Uint32(
+            slave_idx,
+            0x000C);
+
+
+    // ========================================================================
+    // Stage 6B - Runtime Mailbox Cutover
+    //
+    // If Runtime XML explicitly contains Mailbox data, it becomes the source
+    // for the software Mailbox routing used by ecx_SDOread/ecx_SDOwrite.
+    //
+    // IMPORTANT:
+    // - This does NOT write SyncManager hardware.
+    // - SM hardware is already Runtime-driven by Stage 5D.
+    // - Stage 6A already proved Runtime Mailbox == Software == ESC readback.
+    // - If Runtime Mailbox is present but invalid, Startup must fail.
+    //   We do NOT silently fall back after a partial Runtime definition.
+    //
+    // Legacy Vendor/ProductCode mapping remains only for:
+    // - old Runtime XML with no <Mailbox>
+    // - device families not yet represented by the Runtime schema
+    // ========================================================================
+
+    if (m_pEni != nullptr)
+    {
+        const auto& runtimeSlaves =
+            m_pEni->GetSlaves();
+
+
+        if (slave_idx >= 0 &&
+            slave_idx <
+            (int)runtimeSlaves.size())
+        {
+            const EtherCatSlave& runtimeSlave =
+                runtimeSlaves[(size_t)slave_idx];
+
+
+            if (runtimeSlave.runtimeMailbox.present)
+            {
+                const EtherCatRuntimeMailboxDirectionConfig& out =
+                    runtimeSlave.runtimeMailbox.out;
+
+
+                const EtherCatRuntimeMailboxDirectionConfig& in =
+                    runtimeSlave.runtimeMailbox.in;
+
+
+                const bool valid =
+                    out.present &&
+                    in.present &&
+                    out.smIndex >= 0 &&
+                    out.smIndex <= 15 &&
+                    in.smIndex >= 0 &&
+                    in.smIndex <= 15 &&
+                    out.startAddress != 0 &&
+                    in.startAddress != 0 &&
+                    out.length > 0 &&
+                    in.length > 0 &&
+                    out.length <= MAX_MBX_SIZE &&
+                    in.length <= MAX_MBX_SIZE;
+
+
+                if (!valid)
+                {
+                    RtPrintf(
+                        "[RUNTIME-MAILBOX-CUTOVER] "
+                        "S%d | Runtime Mailbox present but invalid | "
+                        "Out Present:%d SM:%d Addr:0x%04X Len:%u | "
+                        "In Present:%d SM:%d Addr:0x%04X Len:%u | "
+                        "Result:FAIL\n",
+
+                        slave_idx,
+
+                        out.present
+                        ? 1
+                        : 0,
+
+                        out.smIndex,
+
+                        (unsigned int)
+                        out.startAddress,
+
+                        (unsigned int)
+                        out.length,
+
+                        in.present
+                        ? 1
+                        : 0,
+
+                        in.smIndex,
+
+                        (unsigned int)
+                        in.startAddress,
+
+                        (unsigned int)
+                        in.length);
+
+
+                    return
+                        false;
+                }
+
+
+                m_slaveInfo[slave_idx].mbxOutAddr =
+                    out.startAddress;
+
+
+                m_slaveInfo[slave_idx].mbxOutLength =
+                    out.length;
+
+
+                m_slaveInfo[slave_idx].mbxInAddr =
+                    in.startAddress;
+
+
+                m_slaveInfo[slave_idx].mbxInLength =
+                    in.length;
+
+
+                // Preserve current first-servo discovery semantics without
+                // depending on a specific ProductCode.
+                if (strcmp(
+                    runtimeSlave.type,
+                    "Servo") ==
+                    0 &&
+                    Motor_Start_Index ==
+                    -1)
+                {
+                    Motor_Start_Index =
+                        slave_idx;
+                }
+
+
+                RtPrintf(
+                    "[RUNTIME-MAILBOX-CUTOVER] "
+                    "S%d | Source:RUNTIME_XML | "
+                    "Out SM%d 0x%04X/%u | "
+                    "In SM%d 0x%04X/%u | "
+                    "Result:PASS\n",
+
+                    slave_idx,
+
+                    out.smIndex,
+
+                    (unsigned int)
+                    m_slaveInfo[slave_idx].mbxOutAddr,
+
+                    (unsigned int)
+                    m_slaveInfo[slave_idx].mbxOutLength,
+
+                    in.smIndex,
+
+                    (unsigned int)
+                    m_slaveInfo[slave_idx].mbxInAddr,
+
+                    (unsigned int)
+                    m_slaveInfo[slave_idx].mbxInLength);
+
+
+                return
+                    true;
+            }
+        }
+    }
+
+
+    // ========================================================================
+    // Legacy fallback
+    //
+    // Runtime XML has no explicit Mailbox section for this slave.
+    // Keep original behavior unchanged.
+    // ========================================================================
 
     switch (m_slaveInfo[slave_idx].Vendor_ID)
     {
@@ -72,12 +261,11 @@ void EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//手動設定從站Mail
                 Motor_Start_Index = slave_idx;
             }
 
-            m_slaveInfo[slave_idx].mbxOutAddr = 0x1000;   // 注意！不是 0x1800
-            m_slaveInfo[slave_idx].mbxOutLength = 0x100;  // 256 bytes
+            m_slaveInfo[slave_idx].mbxOutAddr = 0x1000;
+            m_slaveInfo[slave_idx].mbxOutLength = 0x100;
 
-
-            m_slaveInfo[slave_idx].mbxInAddr = 0x1200;    // 注意！不是 0x18F6 或 0x1C00
-            m_slaveInfo[slave_idx].mbxInLength = 0x100;   // 256 bytes
+            m_slaveInfo[slave_idx].mbxInAddr = 0x1200;
+            m_slaveInfo[slave_idx].mbxInLength = 0x100;
             break;
 
 
@@ -85,20 +273,22 @@ void EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//手動設定從站Mail
             break;
         }
         break;
+
+
     case 0xAAAA://上銀
         switch (m_slaveInfo[slave_idx].Product_Code)
         {
         case 0x00000005: //E1
 
-            if (Motor_Start_Index == -1)//紀錄第一站馬達 位置
+            if (Motor_Start_Index == -1)
             {
                 Motor_Start_Index = slave_idx;
             }
 
             m_slaveInfo[slave_idx].mbxOutAddr = 0x1800;
-            m_slaveInfo[slave_idx].mbxOutLength = 20;//
+            m_slaveInfo[slave_idx].mbxOutLength = 20;
             m_slaveInfo[slave_idx].mbxInAddr = 0x18F6;
-            m_slaveInfo[slave_idx].mbxInLength = 20;//
+            m_slaveInfo[slave_idx].mbxInLength = 20;
             break;
 
 
@@ -106,12 +296,12 @@ void EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//手動設定從站Mail
             break;
         }
         break;
+
 
     case 0x00278606://OSCARMAX
         switch (m_slaveInfo[slave_idx].Product_Code)
         {
-        case 0x00000003: //
-
+        case 0x00000003:
             break;
 
 
@@ -120,37 +310,1568 @@ void EtherCatMaster::InitSlaveMailboxInfo(int slave_idx)//手動設定從站Mail
         }
 
         break;
+
+
     case 0x000001dd:
         switch (m_slaveInfo[slave_idx].Product_Code)
         {
-        case 0x00006010: //A3E   
+            // --------------------------------------------------------------------
+            // These current Delta cases remain as LEGACY XML fallback only.
+            //
+            // With the Stage 6A Runtime XML used by the current machine,
+            // A3E / 8124 return from the Runtime branch above and never execute
+            // these constants.
+            // --------------------------------------------------------------------
 
-            if (Motor_Start_Index == -1)//紀錄第一站馬達 位置
+        case 0x00006010: //A3E legacy fallback
+
+            if (Motor_Start_Index == -1)
             {
                 Motor_Start_Index = slave_idx;
             }
 
-
             m_slaveInfo[slave_idx].mbxOutAddr = 0x1000;
-            m_slaveInfo[slave_idx].mbxOutLength = 128;//128
+            m_slaveInfo[slave_idx].mbxOutLength = 128;
             m_slaveInfo[slave_idx].mbxInAddr = 0x10C0;
-            m_slaveInfo[slave_idx].mbxInLength = 128;//128
+            m_slaveInfo[slave_idx].mbxInLength = 128;
             break;
 
-        case 0x00008124:
+
+        case 0x00008124: //8124 legacy fallback
             m_slaveInfo[slave_idx].mbxOutAddr = 0x1000;
             m_slaveInfo[slave_idx].mbxOutLength = 128;
             m_slaveInfo[slave_idx].mbxInAddr = 0x1080;
             m_slaveInfo[slave_idx].mbxInLength = 128;
             break;
+
+
         default:
             break;
         }
         break;
+
+
     default:
         break;
     }
 
+
+    RtPrintf(
+        "[RUNTIME-MAILBOX-CUTOVER] "
+        "S%d | RuntimeMailbox:NO | "
+        "Action:LEGACY_FALLBACK | "
+        "Out:0x%04X/%u | In:0x%04X/%u | Result:PASS\n",
+
+        slave_idx,
+
+        (unsigned int)
+        m_slaveInfo[slave_idx].mbxOutAddr,
+
+        (unsigned int)
+        m_slaveInfo[slave_idx].mbxOutLength,
+
+        (unsigned int)
+        m_slaveInfo[slave_idx].mbxInAddr,
+
+        (unsigned int)
+        m_slaveInfo[slave_idx].mbxInLength);
+
+
+    return
+        true;
+}
+
+
+// ============================================================================
+// Stage 1B - EtherCAT Topology / Identity Verification
+//
+// 目的：
+//
+// 在任何 Watchdog / SM / PDO / DC 設定寫入之前，先確認：
+//
+// 1. Runtime XML 期待的從站數量
+// 2. EtherCAT Bus 實際回應的從站數量
+// 3. 每個實體 Position 的 Vendor ID
+// 4. 每個實體 Position 的 Product Code
+// 5. Revision
+// 6. Runtime XML ConfiguredAddress
+//
+// 這個函式只有 Read / Compare / Log。
+// 不改 AL State、不寫 PDO、不寫 SM、不寫 DC。
+//
+// Stage 1B:
+// Runtime XML Revision / ConfiguredAddress 已正式納入比對。
+// 實體 Revision 由 SII Identity Word Address 0x000C 讀取。
+// ============================================================================
+bool EtherCatMaster::VerifyTopologyAgainstRuntimeConfig()
+{
+    // ------------------------------------------------------------------------
+    // Basic safety
+    // ------------------------------------------------------------------------
+
+    if (m_pEni == nullptr)
+    {
+        RtPrintf(
+            "\n"
+            "============================================================\n"
+            "[ECAT-TOPOLOGY-VERIFY] FAILED\n"
+            "[ECAT-TOPOLOGY-VERIFY] Reason:Runtime Config is not attached.\n"
+            "============================================================\n\n");
+
+        return false;
+    }
+
+
+    if (m_pNic == nullptr)
+    {
+        RtPrintf(
+            "\n"
+            "============================================================\n"
+            "[ECAT-TOPOLOGY-VERIFY] FAILED\n"
+            "[ECAT-TOPOLOGY-VERIFY] Reason:NIC is not attached.\n"
+            "============================================================\n\n");
+
+        return false;
+    }
+
+
+    const auto& expectedSlaves =
+        m_pEni->GetSlaves();
+
+
+    const int expectedCount =
+        (int)expectedSlaves.size();
+
+
+    const int slaveInfoCapacity =
+        (int)(
+            sizeof(m_slaveInfo) /
+            sizeof(m_slaveInfo[0]));
+
+
+    RtPrintf(
+        "\n"
+        "============================================================\n"
+        "[ECAT-TOPOLOGY-VERIFY] BEGIN | Stage:1B\n"
+        "============================================================\n");
+
+
+    RtPrintf(
+        "[ECAT-TOPOLOGY-VERIFY] RuntimeExpected:%d | SlaveInfoCapacity:%d\n",
+        expectedCount,
+        slaveInfoCapacity);
+
+
+    if (expectedCount <= 0)
+    {
+        RtPrintf(
+            "[ECAT-TOPOLOGY-VERIFY] FAILED | "
+            "Reason:Runtime Config contains no slaves.\n");
+
+        RtPrintf(
+            "============================================================\n"
+            "[ECAT-TOPOLOGY-VERIFY] END | Result:FAIL\n"
+            "============================================================\n\n");
+
+        return false;
+    }
+
+
+    if (expectedCount > slaveInfoCapacity)
+    {
+        RtPrintf(
+            "[ECAT-TOPOLOGY-VERIFY] FAILED | "
+            "Reason:Expected slave count exceeds m_slaveInfo capacity | "
+            "Expected:%d Capacity:%d\n",
+            expectedCount,
+            slaveInfoCapacity);
+
+        RtPrintf(
+            "============================================================\n"
+            "[ECAT-TOPOLOGY-VERIFY] END | Result:FAIL\n"
+            "============================================================\n\n");
+
+        return false;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Physical slave count
+    //
+    // BRD 0x0130 is read-only.
+    // ------------------------------------------------------------------------
+
+    const int detectedCount =
+        ecx_BRD(
+            0x0000,
+            0x0130,
+            2,
+            20);
+
+
+    RtPrintf(
+        "[ECAT-TOPOLOGY-VERIFY] SlaveCount | "
+        "Expected:%d | Detected:%d | Match:%s\n",
+        expectedCount,
+        detectedCount,
+        detectedCount == expectedCount
+        ? "YES"
+        : "NO");
+
+
+    if (detectedCount <= 0)
+    {
+        RtPrintf(
+            "[ECAT-TOPOLOGY-VERIFY] FAILED | "
+            "Reason:BRD 0x0130 returned no EtherCAT slaves.\n");
+
+        RtPrintf(
+            "============================================================\n"
+            "[ECAT-TOPOLOGY-VERIFY] END | Result:FAIL\n"
+            "============================================================\n\n");
+
+        return false;
+    }
+
+
+    if (detectedCount > slaveInfoCapacity)
+    {
+        RtPrintf(
+            "[ECAT-TOPOLOGY-VERIFY] FAILED | "
+            "Reason:Detected slave count exceeds m_slaveInfo capacity | "
+            "Detected:%d Capacity:%d\n",
+            detectedCount,
+            slaveInfoCapacity);
+
+        RtPrintf(
+            "============================================================\n"
+            "[ECAT-TOPOLOGY-VERIFY] END | Result:FAIL\n"
+            "============================================================\n\n");
+
+        return false;
+    }
+
+
+    bool result =
+        true;
+
+
+    int errorCount =
+        0;
+
+
+    int skippedRevisionCount =
+        0;
+
+
+    int skippedConfiguredAddressCount =
+        0;
+
+
+    if (detectedCount !=
+        expectedCount)
+    {
+        result =
+            false;
+
+        errorCount++;
+    }
+
+
+    const int compareCount =
+        expectedCount < detectedCount
+        ? expectedCount
+        : detectedCount;
+
+
+    // ------------------------------------------------------------------------
+    // Per-position Identity Verification
+    //
+    // Physical:
+    //   Vendor      = SII 0x0008
+    //   Product     = SII 0x000A
+    //   Revision    = SII 0x000C
+    //   ConfigAddr  = ESC Station Address after ScanSlaves()
+    //
+    // Runtime:
+    //   VendorId
+    //   ProductCode
+    //   Revision
+    //   ConfiguredAddress
+    //
+    // Older Runtime XML:
+    // If Revision / ConfiguredAddress are absent, only that field is SKIP.
+    // ------------------------------------------------------------------------
+
+    for (int i = 0;
+        i < compareCount;
+        i++)
+    {
+        const EtherCatSlave& expected =
+            expectedSlaves[(size_t)i];
+
+
+        const uint32_t actualVendor =
+            m_slaveInfo[i].Vendor_ID;
+
+
+        const uint32_t actualProduct =
+            m_slaveInfo[i].Product_Code;
+
+
+        const uint32_t actualRevision =
+            m_slaveInfo[i].Revision_No;
+
+
+        const uint16_t actualConfigAddr =
+            m_slaveInfo[i].configAddr;
+
+
+        const bool vendorMatch =
+            actualVendor ==
+            expected.vendorId;
+
+
+        const bool productMatch =
+            actualProduct ==
+            expected.productCode;
+
+
+        bool revisionMatch =
+            true;
+
+
+        if (expected.hasRevision)
+        {
+            revisionMatch =
+                actualRevision ==
+                expected.revision;
+        }
+        else
+        {
+            skippedRevisionCount++;
+        }
+
+
+        bool addressMatch =
+            true;
+
+
+        if (expected.hasConfiguredAddress)
+        {
+            addressMatch =
+                actualConfigAddr ==
+                expected.configuredAddress;
+        }
+        else
+        {
+            skippedConfiguredAddressCount++;
+        }
+
+
+        const bool identityMatch =
+            vendorMatch &&
+            productMatch &&
+            revisionMatch;
+
+
+        const bool slavePass =
+            identityMatch &&
+            addressMatch;
+
+
+        RtPrintf(
+            "[ECAT-TOPOLOGY-VERIFY] "
+            "S%d | "
+            "Cfg Exp:0x%04X Act:0x%04X %s | "
+            "Vendor Exp:0x%08X Act:0x%08X %s | "
+            "Product Exp:0x%08X Act:0x%08X %s | "
+            "Revision Exp:0x%08X Act:0x%08X %s | "
+            "Result:%s\n",
+
+            i,
+
+            (unsigned int)
+            expected.configuredAddress,
+
+            (unsigned int)
+            actualConfigAddr,
+
+            expected.hasConfiguredAddress
+            ? (addressMatch
+                ? "MATCH"
+                : "MISMATCH")
+            : "SKIP",
+
+            (unsigned int)
+            expected.vendorId,
+
+            (unsigned int)
+            actualVendor,
+
+            vendorMatch
+            ? "MATCH"
+            : "MISMATCH",
+
+            (unsigned int)
+            expected.productCode,
+
+            (unsigned int)
+            actualProduct,
+
+            productMatch
+            ? "MATCH"
+            : "MISMATCH",
+
+            (unsigned int)
+            expected.revision,
+
+            (unsigned int)
+            actualRevision,
+
+            expected.hasRevision
+            ? (revisionMatch
+                ? "MATCH"
+                : "MISMATCH")
+            : "SKIP",
+
+            slavePass
+            ? "PASS"
+            : "FAIL");
+
+
+        if (!slavePass)
+        {
+            result =
+                false;
+
+            errorCount++;
+        }
+
+
+        if (!vendorMatch)
+        {
+            RtPrintf(
+                "[ECAT-TOPOLOGY-ERROR] S%d Vendor mismatch | "
+                "Expected:0x%08X Actual:0x%08X\n",
+
+                i,
+
+                (unsigned int)
+                expected.vendorId,
+
+                (unsigned int)
+                actualVendor);
+        }
+
+
+        if (!productMatch)
+        {
+            RtPrintf(
+                "[ECAT-TOPOLOGY-ERROR] S%d Product mismatch | "
+                "Expected:0x%08X Actual:0x%08X\n",
+
+                i,
+
+                (unsigned int)
+                expected.productCode,
+
+                (unsigned int)
+                actualProduct);
+        }
+
+
+        if (expected.hasRevision &&
+            !revisionMatch)
+        {
+            RtPrintf(
+                "[ECAT-TOPOLOGY-ERROR] S%d Revision mismatch | "
+                "Expected:0x%08X Actual:0x%08X\n",
+
+                i,
+
+                (unsigned int)
+                expected.revision,
+
+                (unsigned int)
+                actualRevision);
+        }
+
+
+        if (expected.hasConfiguredAddress &&
+            !addressMatch)
+        {
+            RtPrintf(
+                "[ECAT-TOPOLOGY-ERROR] S%d Configured Address mismatch | "
+                "Expected:0x%04X Actual:0x%04X\n",
+
+                i,
+
+                (unsigned int)
+                expected.configuredAddress,
+
+                (unsigned int)
+                actualConfigAddr);
+        }
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Count mismatch detail
+    // ------------------------------------------------------------------------
+
+    if (expectedCount >
+        detectedCount)
+    {
+        for (int i = detectedCount;
+            i < expectedCount;
+            i++)
+        {
+            RtPrintf(
+                "[ECAT-TOPOLOGY-ERROR] "
+                "Missing physical slave at S%d | "
+                "Expected:0x%08X:0x%08X Rev:0x%08X | Name:%s\n",
+
+                i,
+
+                (unsigned int)
+                expectedSlaves[(size_t)i].vendorId,
+
+                (unsigned int)
+                expectedSlaves[(size_t)i].productCode,
+
+                (unsigned int)
+                expectedSlaves[(size_t)i].revision,
+
+                expectedSlaves[(size_t)i].name);
+        }
+    }
+    else if (detectedCount >
+        expectedCount)
+    {
+        RtPrintf(
+            "[ECAT-TOPOLOGY-ERROR] "
+            "Detected %d extra physical slave(s) after Runtime Config S%d.\n",
+
+            detectedCount -
+            expectedCount,
+
+            expectedCount -
+            1);
+    }
+
+
+    RtPrintf(
+        "[ECAT-TOPOLOGY-VERIFY-RESULT] "
+        "Expected:%d | Detected:%d | Compared:%d | "
+        "SkipRevision:%d | SkipCfgAddr:%d | "
+        "Errors:%d | Result:%s\n",
+
+        expectedCount,
+        detectedCount,
+        compareCount,
+        skippedRevisionCount,
+        skippedConfiguredAddressCount,
+        errorCount,
+
+        result
+        ? "PASS"
+        : "FAIL");
+
+
+    RtPrintf(
+        "============================================================\n"
+        "[ECAT-TOPOLOGY-VERIFY] END | Result:%s\n"
+        "============================================================\n\n",
+
+        result
+        ? "PASS"
+        : "FAIL");
+
+
+    return result;
+}
+
+
+// ============================================================================
+// Stage 2 - PRE-OP SM / PDO Readback Verification
+//
+// 目的：
+//
+// 目前 Master 仍使用既有的 Vendor / Product hard-code 寫入 SM 與 A3E PDO。
+// 在未改成 Runtime Config data-driven 之前，先建立一層可靠的 Readback Gate。
+//
+// 執行時機：
+//
+// PRE-OP
+//   -> Config_Slave_FMMU()
+//   -> ConfigureSlaveGeneric_PRE_OP()
+//   -> Watchdog
+//   -> VerifyPreOpSmAndPdoConfiguration()   <-- HERE
+//   -> PASS 才允許 SAFE-OP
+//
+// 這個函式只做：
+//
+// FPRD 讀 ESC SyncManager Register
+// SDO Upload 讀 CoE PDO Mapping / Assignment
+// Compare
+// Log
+//
+// 不會寫入 SM / PDO / DC。
+// ============================================================================
+bool EtherCatMaster::VerifyPreOpSmAndPdoConfiguration()
+{
+    if (m_pEni == nullptr)
+    {
+        RtPrintf(
+            "\n"
+            "============================================================\n"
+            "[ECAT-CONFIG-VERIFY] FAILED\n"
+            "[ECAT-CONFIG-VERIFY] Reason:Runtime Config is not attached.\n"
+            "============================================================\n\n");
+
+        return false;
+    }
+
+
+    const auto& runtimeSlaves =
+        m_pEni->GetSlaves();
+
+
+    int errorCount =
+        0;
+
+
+    int smCheckCount =
+        0;
+
+
+    int pdoCheckCount =
+        0;
+
+
+    int skipCount =
+        0;
+
+
+    RtPrintf(
+        "\n"
+        "============================================================\n"
+        "[ECAT-CONFIG-VERIFY] BEGIN | Stage:2 | State:PRE-OP\n"
+        "============================================================\n");
+
+
+    // ========================================================================
+    // SyncManager Readback Helper
+    //
+    // ESC SM Register Layout:
+    //
+    // +0..1 Physical Start Address
+    // +2..3 Length
+    // +4    Control
+    // +5    Status       (dynamic, do not compare)
+    // +6    Activate     (compare Bit0 only)
+    // +7    PDI Control  (not used in this Stage)
+    // ========================================================================
+
+    auto verifySm =
+        [this,
+        &errorCount,
+        &smCheckCount]
+    (
+        int slaveIdx,
+        int smIndex,
+        uint16_t expectedStart,
+        uint16_t expectedLength,
+        uint8_t expectedControl,
+        bool expectedEnable
+        ) -> bool
+    {
+        smCheckCount++;
+
+
+        uint8_t raw[8] =
+        {
+            0
+        };
+
+
+        const uint16_t registerAddress =
+            (uint16_t)(
+                0x0800 +
+                (smIndex * 8));
+
+
+        const int wkc =
+            ecx_FPRD(
+                m_slaveInfo[slaveIdx].configAddr,
+                registerAddress,
+                raw,
+                8,
+                20);
+
+
+        if (wkc <= 0)
+        {
+            errorCount++;
+
+            RtPrintf(
+                "[SM-VERIFY] S%d SM%d | "
+                "Reg:0x%04X | ReadWKC:%d | Result:FAIL\n",
+
+                slaveIdx,
+                smIndex,
+                (unsigned int)
+                registerAddress,
+                wkc);
+
+            return false;
+        }
+
+
+        const uint16_t actualStart =
+            (uint16_t)(
+                ((uint16_t)raw[0]) |
+                ((uint16_t)raw[1] << 8));
+
+
+        const uint16_t actualLength =
+            (uint16_t)(
+                ((uint16_t)raw[2]) |
+                ((uint16_t)raw[3] << 8));
+
+
+        const uint8_t actualControl =
+            raw[4];
+
+
+        const bool actualEnable =
+            (raw[6] & 0x01U) != 0;
+
+
+        const bool startMatch =
+            actualStart ==
+            expectedStart;
+
+
+        const bool lengthMatch =
+            actualLength ==
+            expectedLength;
+
+
+        const bool controlMatch =
+            actualControl ==
+            expectedControl;
+
+
+        const bool enableMatch =
+            actualEnable ==
+            expectedEnable;
+
+
+        const bool pass =
+            startMatch &&
+            lengthMatch &&
+            controlMatch &&
+            enableMatch;
+
+
+        RtPrintf(
+            "[SM-VERIFY] S%d SM%d | "
+            "Start Exp:0x%04X Act:0x%04X %s | "
+            "Len Exp:%u Act:%u %s | "
+            "Ctrl Exp:0x%02X Act:0x%02X %s | "
+            "Enable Exp:%d Act:%d %s | "
+            "WKC:%d | Result:%s\n",
+
+            slaveIdx,
+            smIndex,
+
+            (unsigned int)
+            expectedStart,
+
+            (unsigned int)
+            actualStart,
+
+            startMatch
+            ? "MATCH"
+            : "MISMATCH",
+
+            (unsigned int)
+            expectedLength,
+
+            (unsigned int)
+            actualLength,
+
+            lengthMatch
+            ? "MATCH"
+            : "MISMATCH",
+
+            (unsigned int)
+            expectedControl,
+
+            (unsigned int)
+            actualControl,
+
+            controlMatch
+            ? "MATCH"
+            : "MISMATCH",
+
+            expectedEnable
+            ? 1
+            : 0,
+
+            actualEnable
+            ? 1
+            : 0,
+
+            enableMatch
+            ? "MATCH"
+            : "MISMATCH",
+
+            wkc,
+
+            pass
+            ? "PASS"
+            : "FAIL");
+
+
+        if (!pass)
+        {
+            errorCount++;
+        }
+
+
+        return pass;
+    };
+
+
+    // ========================================================================
+    // SDO Readback Helpers
+    // ========================================================================
+
+    auto verifySdoU8 =
+        [this,
+        &errorCount,
+        &pdoCheckCount]
+    (
+        int slaveIdx,
+        uint16_t index,
+        uint8_t subIndex,
+        uint8_t expected
+        ) -> bool
+    {
+        pdoCheckCount++;
+
+
+        uint8_t actual =
+            0;
+
+
+        int size =
+            1;
+
+
+        const int result =
+            ecx_SDOread(
+                slaveIdx,
+                index,
+                subIndex,
+                FALSE,
+                &size,
+                &actual,
+                20);
+
+
+        const bool readOk =
+            result > 0 &&
+            size == 1;
+
+
+        const bool match =
+            readOk &&
+            actual == expected;
+
+
+        RtPrintf(
+            "[PDO-VERIFY] S%d %04X:%02X | "
+            "Size:U8 | Exp:0x%02X | Act:0x%02X | "
+            "Read:%s | Result:%s\n",
+
+            slaveIdx,
+
+            (unsigned int)
+            index,
+
+            (unsigned int)
+            subIndex,
+
+            (unsigned int)
+            expected,
+
+            (unsigned int)
+            actual,
+
+            readOk
+            ? "OK"
+            : "FAIL",
+
+            match
+            ? "PASS"
+            : "FAIL");
+
+
+        if (!match)
+        {
+            errorCount++;
+        }
+
+
+        return match;
+    };
+
+
+    auto verifySdoU16 =
+        [this,
+        &errorCount,
+        &pdoCheckCount]
+    (
+        int slaveIdx,
+        uint16_t index,
+        uint8_t subIndex,
+        uint16_t expected
+        ) -> bool
+    {
+        pdoCheckCount++;
+
+
+        uint16_t actual =
+            0;
+
+
+        int size =
+            2;
+
+
+        const int result =
+            ecx_SDOread(
+                slaveIdx,
+                index,
+                subIndex,
+                FALSE,
+                &size,
+                &actual,
+                20);
+
+
+        const bool readOk =
+            result > 0 &&
+            size == 2;
+
+
+        const bool match =
+            readOk &&
+            actual == expected;
+
+
+        RtPrintf(
+            "[PDO-VERIFY] S%d %04X:%02X | "
+            "Size:U16 | Exp:0x%04X | Act:0x%04X | "
+            "Read:%s | Result:%s\n",
+
+            slaveIdx,
+
+            (unsigned int)
+            index,
+
+            (unsigned int)
+            subIndex,
+
+            (unsigned int)
+            expected,
+
+            (unsigned int)
+            actual,
+
+            readOk
+            ? "OK"
+            : "FAIL",
+
+            match
+            ? "PASS"
+            : "FAIL");
+
+
+        if (!match)
+        {
+            errorCount++;
+        }
+
+
+        return match;
+    };
+
+
+    auto verifySdoU32 =
+        [this,
+        &errorCount,
+        &pdoCheckCount]
+    (
+        int slaveIdx,
+        uint16_t index,
+        uint8_t subIndex,
+        uint32_t expected
+        ) -> bool
+    {
+        pdoCheckCount++;
+
+
+        uint32_t actual =
+            0;
+
+
+        int size =
+            4;
+
+
+        const int result =
+            ecx_SDOread(
+                slaveIdx,
+                index,
+                subIndex,
+                FALSE,
+                &size,
+                &actual,
+                20);
+
+
+        const bool readOk =
+            result > 0 &&
+            size == 4;
+
+
+        const bool match =
+            readOk &&
+            actual == expected;
+
+
+        RtPrintf(
+            "[PDO-VERIFY] S%d %04X:%02X | "
+            "Size:U32 | Exp:0x%08X | Act:0x%08X | "
+            "Read:%s | Result:%s\n",
+
+            slaveIdx,
+
+            (unsigned int)
+            index,
+
+            (unsigned int)
+            subIndex,
+
+            (unsigned int)
+            expected,
+
+            (unsigned int)
+            actual,
+
+            readOk
+            ? "OK"
+            : "FAIL",
+
+            match
+            ? "PASS"
+            : "FAIL");
+
+
+        if (!match)
+        {
+            errorCount++;
+        }
+
+
+        return match;
+    };
+
+
+    // ========================================================================
+    // A3E PDO Mapping / Assignment Readback
+    //
+    // RxPDO 0x1601:
+    //
+    // 6040:00 16
+    // 60FF:00 32
+    // 60B8:00 16
+    // 6060:00 8
+    //
+    // TxPDO 0x1A01:
+    //
+    // 6041:00 16
+    // 6064:00 32
+    // 606C:00 32
+    // 6077:00 16
+    // 60B9:00 16
+    // 60BA:00 32
+    // 6061:00 8
+    // 2510:00 32
+    // ========================================================================
+
+    auto verifyA3EPdo =
+        [&verifySdoU8,
+        &verifySdoU16,
+        &verifySdoU32]
+    (
+        int slaveIdx
+        ) -> void
+    {
+        RtPrintf(
+            "[PDO-VERIFY] S%d A3E | RxPDO Assignment / Mapping\n",
+            slaveIdx);
+
+
+        verifySdoU8(
+            slaveIdx,
+            0x1C12,
+            0x00,
+            1);
+
+
+        verifySdoU16(
+            slaveIdx,
+            0x1C12,
+            0x01,
+            0x1601);
+
+
+        verifySdoU8(
+            slaveIdx,
+            0x1601,
+            0x00,
+            4);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1601,
+            0x01,
+            0x60400010);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1601,
+            0x02,
+            0x60FF0020);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1601,
+            0x03,
+            0x60B80010);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1601,
+            0x04,
+            0x60600008);
+
+
+        RtPrintf(
+            "[PDO-VERIFY] S%d A3E | TxPDO Assignment / Mapping\n",
+            slaveIdx);
+
+
+        verifySdoU8(
+            slaveIdx,
+            0x1C13,
+            0x00,
+            1);
+
+
+        verifySdoU16(
+            slaveIdx,
+            0x1C13,
+            0x01,
+            0x1A01);
+
+
+        verifySdoU8(
+            slaveIdx,
+            0x1A01,
+            0x00,
+            8);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1A01,
+            0x01,
+            0x60410010);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1A01,
+            0x02,
+            0x60640020);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1A01,
+            0x03,
+            0x606C0020);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1A01,
+            0x04,
+            0x60770010);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1A01,
+            0x05,
+            0x60B90010);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1A01,
+            0x06,
+            0x60BA0020);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1A01,
+            0x07,
+            0x60610008);
+
+
+        verifySdoU32(
+            slaveIdx,
+            0x1A01,
+            0x08,
+            0x25100020);
+    };
+
+
+    // ========================================================================
+    // Per-Slave Verification
+    //
+    // 目前只比對「現有 Master 確實有設定」的配置。
+    //
+    // 5500:
+    //   Coupler，現有程式未配置 Process Data SM -> explicit N/A
+    //
+    // 6002:
+    //   SM0 Input 0x1000 / 2 B
+    //
+    // 7062:
+    //   SM0 Output 0x0F00 / 1 B
+    //   SM1 Output 0x0F01 / 1 B
+    //
+    // 8124 / 8124D0:
+    //   SM0 Mailbox Out
+    //   SM1 Mailbox In
+    //   SM2 Output Disabled
+    //   SM3 Input 8 B
+    //
+    // A3E:
+    //   SM0..SM3 + complete 1601/1A01/1C12/1C13 readback
+    // ========================================================================
+
+    for (int i = 0;
+        i < (int)runtimeSlaves.size();
+        i++)
+    {
+        const uint32_t vendor =
+            m_slaveInfo[i].Vendor_ID;
+
+
+        const uint32_t product =
+            m_slaveInfo[i].Product_Code;
+
+
+        RtPrintf(
+            "[ECAT-CONFIG-VERIFY] S%d | "
+            "Vendor:0x%08X Product:0x%08X\n",
+
+            i,
+
+            (unsigned int)
+            vendor,
+
+            (unsigned int)
+            product);
+
+
+        if (vendor ==
+            0x000001DD)
+        {
+            switch (product)
+            {
+            case 0x00005500:
+                // ------------------------------------------------------------
+                // R1-EC5500 Coupler
+                //
+                // 現有 Master 沒有對它建立 Process Data SM。
+                // 這不是未驗證錯誤，而是明確 N/A。
+                // ------------------------------------------------------------
+
+                skipCount++;
+
+                RtPrintf(
+                    "[SM-VERIFY] S%d R1-EC5500 | "
+                    "No active Process Data SM in current runtime profile | "
+                    "Result:N/A\n",
+
+                    i);
+
+                break;
+
+
+            case 0x00006002:
+                // ------------------------------------------------------------
+                // R1-EC6002
+                // SM0 Input
+                // ------------------------------------------------------------
+
+                verifySm(
+                    i,
+                    0,
+                    0x1000,
+                    2,
+                    0x00,
+                    true);
+
+                break;
+
+
+            case 0x00007062:
+                // ------------------------------------------------------------
+                // R1-EC7062
+                // 16 outputs are split across two 1-byte SMs.
+                // ------------------------------------------------------------
+
+                verifySm(
+                    i,
+                    0,
+                    0x0F00,
+                    1,
+                    0x44,
+                    true);
+
+
+                verifySm(
+                    i,
+                    1,
+                    0x0F01,
+                    1,
+                    0x44,
+                    true);
+
+                break;
+
+
+            case 0x00008124:
+                // ------------------------------------------------------------
+                // R1-EC8124 / 8124D0
+                // ------------------------------------------------------------
+
+                verifySm(
+                    i,
+                    0,
+                    0x1000,
+                    128,
+                    0x26,
+                    true);
+
+
+                verifySm(
+                    i,
+                    1,
+                    0x1080,
+                    128,
+                    0x22,
+                    true);
+
+
+                verifySm(
+                    i,
+                    2,
+                    0x1100,
+                    0,
+                    0x24,
+                    false);
+
+
+                verifySm(
+                    i,
+                    3,
+                    0x11C0,
+                    8,
+                    0x20,
+                    true);
+
+                break;
+
+
+            case 0x00006010:
+                // ------------------------------------------------------------
+                // Delta ASDA-A3-E
+                // ------------------------------------------------------------
+
+                verifySm(
+                    i,
+                    0,
+                    0x1000,
+                    128,
+                    0x36,
+                    true);
+
+
+                verifySm(
+                    i,
+                    1,
+                    0x10C0,
+                    128,
+                    0x32,
+                    true);
+
+
+                verifySm(
+                    i,
+                    2,
+                    0x1180,
+                    9,
+                    0x24,
+                    true);
+
+
+                verifySm(
+                    i,
+                    3,
+                    0x1480,
+                    23,
+                    0x00,
+                    true);
+
+
+                verifyA3EPdo(
+                    i);
+
+                break;
+
+
+            default:
+                // ------------------------------------------------------------
+                // Stage 2 safety policy:
+                //
+                // 新裝置若有 Process Data，但還沒有 Readback Profile，
+                // 不允許默默跳過後進 SAFE-OP。
+                // ------------------------------------------------------------
+
+                if (runtimeSlaves[(size_t)i].inputBitLength > 0 ||
+                    runtimeSlaves[(size_t)i].outputBitLength > 0)
+                {
+                    errorCount++;
+
+                    RtPrintf(
+                        "[ECAT-CONFIG-VERIFY-ERROR] S%d | "
+                        "No Stage-2 verification profile for "
+                        "Vendor:0x%08X Product:0x%08X | Result:FAIL\n",
+
+                        i,
+
+                        (unsigned int)
+                        vendor,
+
+                        (unsigned int)
+                        product);
+                }
+                else
+                {
+                    skipCount++;
+
+                    RtPrintf(
+                        "[ECAT-CONFIG-VERIFY] S%d | "
+                        "No Process Data | Result:N/A\n",
+
+                        i);
+                }
+
+                break;
+            }
+        }
+        else
+        {
+            if (runtimeSlaves[(size_t)i].inputBitLength > 0 ||
+                runtimeSlaves[(size_t)i].outputBitLength > 0)
+            {
+                errorCount++;
+
+                RtPrintf(
+                    "[ECAT-CONFIG-VERIFY-ERROR] S%d | "
+                    "Unsupported Stage-2 Vendor:0x%08X Product:0x%08X | "
+                    "Result:FAIL\n",
+
+                    i,
+
+                    (unsigned int)
+                    vendor,
+
+                    (unsigned int)
+                    product);
+            }
+            else
+            {
+                skipCount++;
+
+                RtPrintf(
+                    "[ECAT-CONFIG-VERIFY] S%d | "
+                    "No Process Data | Result:N/A\n",
+
+                    i);
+            }
+        }
+    }
+
+
+    const bool result =
+        errorCount == 0;
+
+
+    RtPrintf(
+        "[ECAT-CONFIG-VERIFY-RESULT] "
+        "SMChecks:%d | PDOChecks:%d | Skips:%d | "
+        "Errors:%d | Result:%s\n",
+
+        smCheckCount,
+        pdoCheckCount,
+        skipCount,
+        errorCount,
+
+        result
+        ? "PASS"
+        : "FAIL");
+
+
+    RtPrintf(
+        "============================================================\n"
+        "[ECAT-CONFIG-VERIFY] END | Result:%s\n"
+        "============================================================\n\n",
+
+        result
+        ? "PASS"
+        : "FAIL");
+
+
+    return result;
 }
 
 
@@ -160,6 +1881,28 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
     const auto& slaves = m_pEni->GetSlaves();
     int total_slaves = (int)slaves.size();
     int WK = 0;
+
+    // =========================================================
+    // Stage 1 - Startup Safety Gate
+    //
+    // 在任何 EtherCAT 設定寫入前先確認：
+    //
+    // Runtime Config
+    //      vs
+    // Physical EtherCAT Topology
+    //
+    // 若站數 / 站序 / Vendor / Product / Station Address
+    // 任一不一致，直接中止初始化。
+    // =========================================================
+
+    if (!VerifyTopologyAgainstRuntimeConfig())
+    {
+        RtPrintf(
+            "[ECAT-STARTUP] ABORTED | "
+            "Reason:Topology / Identity verification failed.\n");
+
+        return -2;
+    }
 
     LARGE_INTEGER wait; wait.QuadPart = 5 * 10000;// 等待 單位ms
 
@@ -278,9 +2021,41 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
         WK = ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0120, 2, &state_INIT, 20);
 
 
-        // 🌟 將計算好的 unified_start_time 傳遞進去
+        // =====================================================
+        // Stage 5D - Complete Runtime INIT Cutover
+        //
+        // Equivalence Gate OPEN:
+        // - Runtime SM
+        // - Runtime DC / Sync0
+        //
+        // Gate CLOSED:
+        // - existing C++ hard-code fallback
+        // =====================================================
 
-        ConfigureSlaveGeneric_INIT(i, unified_start_time);////SM配置 從站配置_INIT
+        if (ShouldUseRuntimeConfiguration(
+            i))
+        {
+            if (!ConfigureRuntimeInitStage(
+                i,
+                unified_start_time))
+            {
+                RtPrintf(
+                    "[ECAT-STARTUP] ABORTED | "
+                    "Reason:Runtime INIT configuration failed | "
+                    "SlaveIndex:%d\n",
+
+                    i);
+
+
+                return -4;
+            }
+        }
+        else
+        {
+            // 🌟 將計算好的 unified_start_time 傳遞進去
+
+            ConfigureSlaveGeneric_INIT(i, unified_start_time);////SM配置 從站配置_INIT
+        }
         //Sleep(1000);
     }
     RtSleepFt(&wait);//等待
@@ -295,28 +2070,239 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
     }
     RtSleepFt(&wait);//等待
     Printf_Slaves_State();//印出從站狀態
+
+
+    // =========================================================
+    // Stage 6C - Runtime FMMU Preflight
+    //
+    // The complete Runtime FMMU plan is validated against the
+    // actual Process Image layout BEFORE the first Runtime FMMU
+    // register write.
+    // =========================================================
+
+    if (!PreflightRuntimeFmmuConfiguration())
+    {
+        RtPrintf(
+            "[ECAT-STARTUP] ABORTED | "
+            "Reason:Runtime FMMU preflight failed.\n");
+
+
+        return
+            -7;
+    }
+
+
     //PRE-OP狀態下的設定
     for (int i = 0; i < total_slaves; i++)
     {
-        Config_Slave_FMMU(i); //設定 FMMU
-        ConfigureSlaveGeneric_PRE_OP(i);////從站配置_PRE_OP  
+        // =====================================================
+        // Stage 6C - Runtime FMMU Cutover
+        //
+        // New Runtime XML:
+        //     use <Fmmus> -> APWR -> immediate APRD readback.
+        //
+        // Old Runtime XML:
+        //     preserve legacy Config_Slave_FMMU().
+        // =====================================================
 
-        //看門狗設定
-        uint16_t div = 2498;// 1. 設定頻率：每 100us 跳一次
-        ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0400, 2, &div, 20);
+        if (ShouldUseRuntimeFmmuConfiguration(
+            i))
+        {
+            if (!ConfigureRuntimeFmmus(
+                i))
+            {
+                RtPrintf(
+                    "[ECAT-STARTUP] ABORTED | "
+                    "Reason:Runtime FMMU configuration failed | "
+                    "SlaveIndex:%d\n",
 
-        //開啟看門狗
-        // 設定 Process Data Watchdog (0x0420) 為 50 個 ticks 50 *100us = 5ms
-        // 如果除頻器單位是 100us，設定 1000 就等於 100ms
-        // 對於 250us 的通訊週期來說，100ms 是非常安全的緩衝區
-        uint16_t wd_pd_time = 20000; // 十進位的 50
-        ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0420, 2, &wd_pd_time, 20);
-
-        //如果 PDI (通訊晶片內部) 的看門狗也想設為 5ms
-        //uint16_t wd_pdi_time = 0x0032;
-        //ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0410, 2, &wd_pdi_time, 20);
+                    i);
 
 
+                return
+                    -8;
+            }
+        }
+        else
+        {
+            Config_Slave_FMMU(i); // Legacy XML fallback
+        }
+
+
+        // =====================================================
+        // Stage 5D - Complete Runtime PRE-OP Cutover
+        //
+        // Runtime path:
+        // - Configurable PDO Mapping
+        // - DC 1C32 / 1C33
+        // - Watchdog
+        // - PRE_OP InitCommands
+        //
+        // FMMU stays on the existing verified path.
+        // =====================================================
+
+        if (ShouldUseRuntimeConfiguration(
+            i))
+        {
+            if (!ConfigureRuntimePreOpStage(
+                i))
+            {
+                RtPrintf(
+                    "[ECAT-STARTUP] ABORTED | "
+                    "Reason:Runtime PRE-OP configuration failed | "
+                    "SlaveIndex:%d\n",
+
+                    i);
+
+
+                return -5;
+            }
+        }
+        else
+        {
+            ConfigureSlaveGeneric_PRE_OP(i);////從站配置_PRE_OP  
+
+            //看門狗設定
+            uint16_t div = 2498;// 1. 設定頻率：每 100us 跳一次
+            ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0400, 2, &div, 20);
+
+            //開啟看門狗
+            // 設定 Process Data Watchdog (0x0420) 為 50 個 ticks 50 *100us = 5ms
+            // 如果除頻器單位是 100us，設定 1000 就等於 100ms
+            // 對於 250us 的通訊週期來說，100ms 是非常安全的緩衝區
+            uint16_t wd_pd_time = 20000; // 十進位的 50
+            ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0420, 2, &wd_pd_time, 20);
+
+            //如果 PDI (通訊晶片內部) 的看門狗也想設為 5ms
+            //uint16_t wd_pdi_time = 0x0032;
+            //ecx_APWR(m_slaveInfo[i].APRDAPWR_Addr, 0x0410, 2, &wd_pdi_time, 20);
+        }
+
+
+    }
+
+
+    // =========================================================
+    // Stage 8B - PRE-OP Verification Safety-Gate Cutover
+    //
+    // Verification routing is now schema-driven.
+    //
+    // ALL Runtime slaves have an explicit Runtime Profile with
+    // PdoMappingMode:
+    //     -> Runtime generic verifier is the REAL safety gate.
+    //
+    // ZERO Runtime slaves have that schema:
+    //     -> old Runtime XML compatibility:
+    //        legacy ProductCode Stage-2 verifier remains fallback.
+    //
+    // PARTIAL Runtime schema:
+    //     -> hard FAIL.
+    //
+    // We never mix Runtime-driven and ProductCode-driven
+    // verification in one Startup.
+    // =========================================================
+
+    if (m_pEni ==
+        nullptr)
+    {
+        RtPrintf(
+            "[PREOP-VERIFY-ROUTE] "
+            "Runtime Config is not attached | Result:FAIL\n");
+
+
+        return
+            -3;
+    }
+
+
+    const auto& runtimeVerifySlaves =
+        m_pEni->GetSlaves();
+
+
+    int runtimeVerifySchemaCount =
+        0;
+
+
+    for (const auto& slave :
+        runtimeVerifySlaves)
+    {
+        if (slave.runtimeProfile.present &&
+            slave.runtimeProfile.hasPdoMappingMode)
+        {
+            runtimeVerifySchemaCount++;
+        }
+    }
+
+
+    if (!runtimeVerifySlaves.empty() &&
+        runtimeVerifySchemaCount ==
+        (int)runtimeVerifySlaves.size())
+    {
+        RtPrintf(
+            "[PREOP-VERIFY-ROUTE] "
+            "RuntimeSchema:%d/%u | "
+            "Source:RUNTIME_XML | "
+            "SafetyGate:GENERIC_STAGE8B | "
+            "Result:SELECTED\n",
+
+            runtimeVerifySchemaCount,
+
+            (unsigned int)
+            runtimeVerifySlaves.size());
+
+
+        if (!AuditRuntimePreOpConfigurationGeneric())
+        {
+            RtPrintf(
+                "[ECAT-STARTUP] ABORTED | "
+                "Reason:Runtime generic PRE-OP verification failed.\n");
+
+
+            return
+                -3;
+        }
+    }
+    else if (runtimeVerifySchemaCount ==
+        0)
+    {
+        RtPrintf(
+            "[PREOP-VERIFY-ROUTE] "
+            "RuntimeSchema:0/%u | "
+            "Source:LEGACY_PRODUCT_PROFILE | "
+            "SafetyGate:LEGACY_STAGE2 | "
+            "Result:SELECTED\n",
+
+            (unsigned int)
+            runtimeVerifySlaves.size());
+
+
+        if (!VerifyPreOpSmAndPdoConfiguration())
+        {
+            RtPrintf(
+                "[ECAT-STARTUP] ABORTED | "
+                "Reason:Legacy PRE-OP SM / PDO verification failed.\n");
+
+
+            return
+                -3;
+        }
+    }
+    else
+    {
+        RtPrintf(
+            "[PREOP-VERIFY-ROUTE] "
+            "RuntimeSchema:%d/%u | "
+            "Partial Runtime verification schema is forbidden | "
+            "Result:FAIL\n",
+
+            runtimeVerifySchemaCount,
+
+            (unsigned int)
+            runtimeVerifySlaves.size());
+
+
+        return
+            -3;
     }
 
 
@@ -334,7 +2320,35 @@ int EtherCatMaster::Initialize_Slaves()//初始化所有從站 INIT>>PRE-OP>>SAF
      //SAFE_OP狀態下的設定
     for (int i = 0; i < total_slaves; i++)
     {
-        ConfigureSlaveGeneric_SAFE_OP(i);////從站配置_SAFE_OP   
+        // =====================================================
+        // Stage 5D - Complete Runtime SAFE-OP Cutover
+        //
+        // Apply=1 + Transition=SAFE_OP commands are executed
+        // from Runtime XML. Current example:
+        // R1-EC8124D0 0x2002:01..04 = UINT16(1).
+        // =====================================================
+
+        if (ShouldUseRuntimeConfiguration(
+            i))
+        {
+            if (!ConfigureRuntimeSafeOpStage(
+                i))
+            {
+                RtPrintf(
+                    "[ECAT-STARTUP] ABORTED | "
+                    "Reason:Runtime SAFE-OP configuration failed | "
+                    "SlaveIndex:%d\n",
+
+                    i);
+
+
+                return -6;
+            }
+        }
+        else
+        {
+            ConfigureSlaveGeneric_SAFE_OP(i);////從站配置_SAFE_OP   
+        }
     }
 
 
@@ -510,6 +2524,22 @@ void EtherCatMaster::Config_Slave_FMMU(int slaveIdx)//設定 FMMU(告訴 Slave �
 
 void EtherCatMaster::ConfigureSlaveGeneric_INIT(int slaveIdx, uint64_t unifiedStartTime)//從站配置_INIT
 {
+
+    // =========================================================
+    // Stage 5D.1
+    //
+    // Fixed IO SMs may already have been configured from Runtime XML
+    // by Initialize_Slaves().
+    //
+    // Do not write the legacy per-ProductCode SM constants a second time.
+    // =========================================================
+
+    if (ShouldUseRuntimeSyncManagerConfiguration(
+        slaveIdx))
+    {
+        return;
+    }
+
 
     //0x0800 - 0x0807	SyncManager 0 (SM0)	Mailbox Output (MbxOut) 主站 -> 從站 (寫信)
     //0x0808 - 0x080F	SyncManager 1 (SM1)	Mailbox Input (MbxIn)   從站 -> 主站 (收信)
@@ -1320,6 +3350,379 @@ void EtherCatMaster::ConfigureSlaveGeneric_SAFE_OP(int slaveIdx)//從站配置_S
 int EtherCatMaster::BuildIoMap() //// 自動掃描並建立清單
 {
 
+    // =========================================================
+    // Stage 3 - Process Image / Frame Preflight Safety Guard
+    //
+    // 重要：
+    //
+    // 所有容量檢查都在真正建立任何 m_IoMap Pointer 之前完成。
+    //
+    // 因此如果 Runtime XML 異常、裝置數量過多、Process Image
+    // 超過固定 Buffer，會直接 Fail，不會先寫越界才發現。
+    // =========================================================
+
+    if (m_pEni == nullptr)
+    {
+        DEBUG_PRINT(
+            "[PROCESS-IMAGE-GUARD] ERROR: ENI / Runtime Config is not attached.\n");
+
+        return -1;
+    }
+
+
+    const auto& slaves =
+        m_pEni->GetSlaves();
+
+
+    uint64_t totalOutputBytes =
+        0;
+
+
+    uint64_t totalInputBytes =
+        0;
+
+
+    bool servoLayoutPass =
+        true;
+
+
+    for (int i = 0;
+        i < (int)slaves.size();
+        i++)
+    {
+        const auto& slave =
+            slaves[(size_t)i];
+
+
+        const uint64_t outBytes =
+            ((uint64_t)slave.outputBitLength + 7ULL) /
+            8ULL;
+
+
+        const uint64_t inBytes =
+            ((uint64_t)slave.inputBitLength + 7ULL) /
+            8ULL;
+
+
+        totalOutputBytes +=
+            outBytes;
+
+
+        totalInputBytes +=
+            inBytes;
+
+
+        // -----------------------------------------------------
+        // Current Servo Runtime ABI Guard
+        //
+        // Type == "Servo" 目前會直接 cast 到：
+        //
+        // ServoOutput / ServoInput
+        //
+        // 因此 Runtime XML 的 PDO Byte Size 必須與 C++ struct 完全一致。
+        // -----------------------------------------------------
+
+        if (strcmp(slave.type, "Servo") == 0)
+        {
+            const bool outputMatch =
+                outBytes ==
+                sizeof(ServoOutput);
+
+
+            const bool inputMatch =
+                inBytes ==
+                sizeof(ServoInput);
+
+
+            const bool pass =
+                outputMatch &&
+                inputMatch;
+
+
+            DEBUG_PRINT(
+                "[SERVO-PDO-SIZE-GUARD] S%d | "
+                "XML Out:%llu B Struct:%u B %s | "
+                "XML In:%llu B Struct:%u B %s | "
+                "Result:%s\n",
+
+                i,
+
+                (unsigned long long)
+                outBytes,
+
+                (unsigned int)
+                sizeof(ServoOutput),
+
+                outputMatch
+                ? "MATCH"
+                : "MISMATCH",
+
+                (unsigned long long)
+                inBytes,
+
+                (unsigned int)
+                sizeof(ServoInput),
+
+                inputMatch
+                ? "MATCH"
+                : "MISMATCH",
+
+                pass
+                ? "PASS"
+                : "FAIL");
+
+
+            if (!pass)
+            {
+                servoLayoutPass =
+                    false;
+            }
+        }
+    }
+
+
+    const uint64_t totalProcessImageBytes =
+        totalOutputBytes +
+        totalInputBytes;
+
+
+    const uint64_t ioMapCapacity =
+        sizeof(m_IoMap);
+
+
+    // ---------------------------------------------------------
+    // Current Combined LRW + FRMW Frame Estimation
+    //
+    // 目前 Configurator 與 Runtime 使用同一估算：
+    //
+    // Ethernet + EtherCAT + LRW + FRMW fixed overhead = 48 B
+    //
+    // Current NIC TX Buffer = 1514 B.
+    //
+    // 這是 Stage 3 的安全上限，不是用來取代實際 Frame Builder
+    // 最後的 Length Guard；之後 Stage 3B 會在送出前再做一次 final guard。
+    // ---------------------------------------------------------
+
+    const uint64_t combinedFrameFixedOverheadBytes =
+        48ULL;
+
+
+    const uint64_t estimatedFrameBytes =
+        totalProcessImageBytes +
+        combinedFrameFixedOverheadBytes;
+
+
+    const uint64_t txFrameLimit =
+        sizeof(m_txBuffer);
+
+
+    const uint64_t rxFrameLimit =
+        sizeof(m_rxBuffer);
+
+
+    const bool processImagePass =
+        totalProcessImageBytes <=
+        ioMapCapacity;
+
+
+    const bool txFramePass =
+        estimatedFrameBytes <=
+        txFrameLimit;
+
+
+    const bool rxFramePass =
+        estimatedFrameBytes <=
+        rxFrameLimit;
+
+
+    const bool preflightPass =
+        processImagePass &&
+        txFramePass &&
+        rxFramePass &&
+        servoLayoutPass;
+
+
+    const uint64_t frameMargin =
+        estimatedFrameBytes <= txFrameLimit
+        ? txFrameLimit - estimatedFrameBytes
+        : 0ULL;
+
+
+    DEBUG_PRINT(
+        "\n"
+        "============================================================\n"
+        "[PROCESS-IMAGE-GUARD] BEGIN | Stage:3\n"
+        "============================================================\n");
+
+
+    DEBUG_PRINT(
+        "[PROCESS-IMAGE-GUARD] "
+        "Out:%llu B | In:%llu B | Total:%llu / %llu B | "
+        "Result:%s\n",
+
+        (unsigned long long)
+        totalOutputBytes,
+
+        (unsigned long long)
+        totalInputBytes,
+
+        (unsigned long long)
+        totalProcessImageBytes,
+
+        (unsigned long long)
+        ioMapCapacity,
+
+        processImagePass
+        ? "PASS"
+        : "FAIL");
+
+
+    DEBUG_PRINT(
+        "[FRAME-GUARD] "
+        "Estimated:%llu B | FixedOverhead:%llu B | "
+        "TXLimit:%llu B | RXLimit:%llu B | Margin:%llu B | "
+        "Result:%s\n",
+
+        (unsigned long long)
+        estimatedFrameBytes,
+
+        (unsigned long long)
+        combinedFrameFixedOverheadBytes,
+
+        (unsigned long long)
+        txFrameLimit,
+
+        (unsigned long long)
+        rxFrameLimit,
+
+        (unsigned long long)
+        frameMargin,
+
+        txFramePass &&
+        rxFramePass
+        ? "PASS"
+        : "FAIL");
+
+
+    DEBUG_PRINT(
+        "[PROCESS-IMAGE-GUARD-RESULT] "
+        "ProcessImage:%s | Frame:%s | ServoPDO:%s | Result:%s\n",
+
+        processImagePass
+        ? "PASS"
+        : "FAIL",
+
+        txFramePass &&
+        rxFramePass
+        ? "PASS"
+        : "FAIL",
+
+        servoLayoutPass
+        ? "PASS"
+        : "FAIL",
+
+        preflightPass
+        ? "PASS"
+        : "FAIL");
+
+
+    DEBUG_PRINT(
+        "============================================================\n"
+        "[PROCESS-IMAGE-GUARD] END | Result:%s\n"
+        "============================================================\n\n",
+
+        preflightPass
+        ? "PASS"
+        : "FAIL");
+
+
+    if (!preflightPass)
+    {
+        DEBUG_PRINT(
+            "[Map] ABORTED: Process Image / Frame / Servo PDO preflight failed.\n");
+
+        return -1;
+    }
+
+
+    // =========================================================
+    // Stage 7B - Runtime Process Image Binding Cutover Gate
+    //
+    // 0 Runtime binding sections:
+    //     legacy XML -> preserve existing ProductCode fallback.
+    //
+    // ALL Runtime slaves have binding sections:
+    //     Runtime XML becomes authoritative for application
+    //     classification and m_IoMap pointer binding.
+    //
+    // Partial schema:
+    //     hard failure. Never mix Runtime and legacy classification.
+    // =========================================================
+
+    int runtimeBindingPresentCount =
+        0;
+
+
+    for (const auto& slave :
+        slaves)
+    {
+        if (slave.runtimeProcessImageBinding.present)
+        {
+            runtimeBindingPresentCount++;
+        }
+    }
+
+
+    if (runtimeBindingPresentCount ==
+        (int)slaves.size())
+    {
+        DEBUG_PRINT(
+            "[RUNTIME-BINDING-ROUTE] "
+            "Schema:%d/%u | Source:RUNTIME_XML | Result:SELECTED\n",
+
+            runtimeBindingPresentCount,
+
+            (unsigned int)
+            slaves.size());
+
+
+        return
+            BuildRuntimeProcessImageBindings();
+    }
+
+
+    if (runtimeBindingPresentCount !=
+        0)
+    {
+        DEBUG_PRINT(
+            "[RUNTIME-BINDING-ROUTE] "
+            "Schema:%d/%u | Partial schema is forbidden | Result:FAIL\n",
+
+            runtimeBindingPresentCount,
+
+            (unsigned int)
+            slaves.size());
+
+
+        return
+            -1;
+    }
+
+
+    DEBUG_PRINT(
+        "[RUNTIME-BINDING-ROUTE] "
+        "Schema:0/%u | Source:LEGACY_PRODUCT_FALLBACK | Result:SELECTED\n",
+
+        (unsigned int)
+        slaves.size());
+
+
+    // =========================================================
+    // Legacy BuildIoMap fallback
+    //
+    // Kept unchanged for old Runtime XML with no binding schema.
+    // =========================================================
+
     // 1. 初始化
     m_IoList.clear();
     m_AdList.clear();
@@ -1329,7 +3732,6 @@ int EtherCatMaster::BuildIoMap() //// 自動掃描並建立清單
     memset(m_IoMap, 0, sizeof(m_IoMap));
 
     int currentOffset = 0;
-    const auto& slaves = m_pEni->GetSlaves();
 
     for (int i = 0; i < slaves.size(); i++)
     {
@@ -1447,6 +3849,44 @@ int EtherCatMaster::BuildIoMap() //// 自動掃描並建立清單
             return -1;
         }
     }
+
+
+    // =========================================================
+    // Stage 3 Post-Build Consistency Check
+    //
+    // Preflight 計算的 Process Image 與實際 Mapping Offset
+    // 必須完全一致。
+    // =========================================================
+
+    if ((uint64_t)currentOffset !=
+        totalProcessImageBytes)
+    {
+        DEBUG_PRINT(
+            "[PROCESS-IMAGE-GUARD] ERROR: "
+            "Post-build mapping size mismatch | "
+            "Preflight:%llu B Actual:%d B\n",
+
+            (unsigned long long)
+            totalProcessImageBytes,
+
+            currentOffset);
+
+        m_IoList.clear();
+        m_AdList.clear();
+        m_ServoList.clear();
+
+        memset(
+            m_IoMap,
+            0,
+            sizeof(m_IoMap));
+
+        m_IoMapSize =
+            0;
+
+        return -1;
+    }
+
+
     m_IoMapSize = currentOffset;
     // 🌟 1. 將 IO 和 AD 清單都傳給 PlcCore
     m_Plc.SetIoLists(&m_IoList, &m_AdList);

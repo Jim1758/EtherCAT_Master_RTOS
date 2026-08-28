@@ -1,11 +1,1527 @@
 ﻿#include "MotionCore.h"
 #include <algorithm> // for std::abs, std::sqrt, std::max, std::min
 #include <iostream>  // for debug prints if needed
+#include <limits>
 #include "EtherCatMaster.h"
 #include "CoordinateManager.h"
 #include "SHM_Types.h"
 #include "AlarmManager.h"
 MotionCore::MotionCore() {}
+
+
+// ============================================================================
+// Stage NC-0.1E - Motion Owner + Generation Lease Arbitration
+// ============================================================================
+
+std::uint64_t MotionCore::PackMotionOwnerState(
+    MotionOwner owner,
+    MotionOwnerGeneration generation) noexcept
+{
+    return
+        (static_cast<std::uint64_t>(generation) << 32U) |
+        static_cast<std::uint64_t>(
+            static_cast<std::uint8_t>(owner));
+}
+
+
+MotionOwnerLease MotionCore::UnpackMotionOwnerState(
+    std::uint64_t packed) noexcept
+{
+    MotionOwnerLease lease{};
+
+    lease.owner =
+        static_cast<MotionOwner>(
+            static_cast<std::uint8_t>(
+                packed & 0xFFULL));
+
+    lease.generation =
+        static_cast<MotionOwnerGeneration>(
+            packed >> 32U);
+
+    return lease;
+}
+
+
+MotionOwnerGeneration MotionCore::NextMotionOwnerGeneration(
+    MotionOwnerGeneration current) noexcept
+{
+    if (current ==
+        (std::numeric_limits<MotionOwnerGeneration>::max)())
+    {
+        return 1U;
+    }
+
+    const MotionOwnerGeneration next =
+        static_cast<MotionOwnerGeneration>(
+            current + 1U);
+
+    return
+        next == MOTION_OWNER_GENERATION_INVALID
+        ? 1U
+        : next;
+}
+
+
+MotionOwnerLease MotionCore::GetMotionOwnerLease() const noexcept
+{
+    return
+        UnpackMotionOwnerState(
+            m_motionOwnerState.load(
+                std::memory_order_acquire));
+}
+
+
+bool MotionCore::IsMotionOwnerLeaseCurrent(
+    const MotionOwnerLease& lease) const noexcept
+{
+    if (!lease.IsValid())
+    {
+        return false;
+    }
+
+    return
+        m_motionOwnerState.load(
+            std::memory_order_acquire) ==
+        PackMotionOwnerState(
+            lease.owner,
+            lease.generation);
+}
+
+
+bool MotionCore::TryAcquireMotionOwner(
+    MotionOwner requestedOwner,
+    MotionOwnerLease& outLease) noexcept
+{
+    outLease = MotionOwnerLease{};
+
+    const std::uint8_t requestedValue =
+        static_cast<std::uint8_t>(requestedOwner);
+
+    if (requestedOwner == MotionOwner::NONE ||
+        requestedValue >
+        static_cast<std::uint8_t>(MotionOwner::SAFETY))
+    {
+        return false;
+    }
+
+    std::uint64_t currentPacked =
+        m_motionOwnerState.load(
+            std::memory_order_acquire);
+
+    for (;;)
+    {
+        const MotionOwnerLease currentLease =
+            UnpackMotionOwnerState(currentPacked);
+
+        // 同一個邏輯 Owner 重複 Acquire 視為冪等操作，不產生新世代。
+        if (currentLease.owner == requestedOwner &&
+            currentLease.generation != MOTION_OWNER_GENERATION_INVALID)
+        {
+            outLease = currentLease;
+            return true;
+        }
+
+        if (currentLease.owner != MotionOwner::NONE)
+        {
+            return false;
+        }
+
+        MotionOwnerLease requestedLease{};
+        requestedLease.owner = requestedOwner;
+        requestedLease.generation =
+            NextMotionOwnerGeneration(currentLease.generation);
+
+        const std::uint64_t requestedPacked =
+            PackMotionOwnerState(
+                requestedLease.owner,
+                requestedLease.generation);
+
+        if (m_motionOwnerState.compare_exchange_weak(
+            currentPacked,
+            requestedPacked,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            outLease = requestedLease;
+            return true;
+        }
+    }
+}
+
+
+bool MotionCore::TryTransferMotionOwner(
+    const MotionOwnerLease& currentLease,
+    MotionOwner requestedOwner,
+    MotionOwnerLease& outLease) noexcept
+{
+    outLease = MotionOwnerLease{};
+
+    const std::uint8_t requestedValue =
+        static_cast<std::uint8_t>(requestedOwner);
+
+    if (!currentLease.IsValid() ||
+        requestedOwner == MotionOwner::NONE ||
+        requestedValue >
+        static_cast<std::uint8_t>(MotionOwner::SAFETY))
+    {
+        return false;
+    }
+
+    if (requestedOwner == currentLease.owner)
+    {
+        if (!IsMotionOwnerLeaseCurrent(currentLease))
+        {
+            return false;
+        }
+
+        outLease = currentLease;
+        return true;
+    }
+
+    std::uint64_t expectedPacked =
+        PackMotionOwnerState(
+            currentLease.owner,
+            currentLease.generation);
+
+    MotionOwnerLease requestedLease{};
+    requestedLease.owner = requestedOwner;
+    requestedLease.generation =
+        NextMotionOwnerGeneration(currentLease.generation);
+
+    const std::uint64_t requestedPacked =
+        PackMotionOwnerState(
+            requestedLease.owner,
+            requestedLease.generation);
+
+    if (!m_motionOwnerState.compare_exchange_strong(
+        expectedPacked,
+        requestedPacked,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    outLease = requestedLease;
+    return true;
+}
+
+
+bool MotionCore::ReleaseMotionOwner(
+    const MotionOwnerLease& lease) noexcept
+{
+    if (!lease.IsValid())
+    {
+        return false;
+    }
+
+    std::uint64_t expectedPacked =
+        PackMotionOwnerState(
+            lease.owner,
+            lease.generation);
+
+    const std::uint64_t releasedPacked =
+        PackMotionOwnerState(
+            MotionOwner::NONE,
+            NextMotionOwnerGeneration(lease.generation));
+
+    return
+        m_motionOwnerState.compare_exchange_strong(
+            expectedPacked,
+            releasedPacked,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+}
+
+
+MotionOwnerLease MotionCore::TakeSafetyMotionOwner() noexcept
+{
+    std::uint64_t currentPacked =
+        m_motionOwnerState.load(
+            std::memory_order_acquire);
+
+    for (;;)
+    {
+        const MotionOwnerLease currentLease =
+            UnpackMotionOwnerState(currentPacked);
+
+        // Alarm 狀態可能每個 Scan 都重複呼叫；Safety 已持有時不遞增。
+        if (currentLease.owner == MotionOwner::SAFETY &&
+            currentLease.generation != MOTION_OWNER_GENERATION_INVALID)
+        {
+            return currentLease;
+        }
+
+        MotionOwnerLease safetyLease{};
+        safetyLease.owner = MotionOwner::SAFETY;
+        safetyLease.generation =
+            NextMotionOwnerGeneration(currentLease.generation);
+
+        const std::uint64_t safetyPacked =
+            PackMotionOwnerState(
+                safetyLease.owner,
+                safetyLease.generation);
+
+        if (m_motionOwnerState.compare_exchange_weak(
+            currentPacked,
+            safetyPacked,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            return safetyLease;
+        }
+    }
+}
+
+
+// ============================================================================
+// Stage NC-0.1F - Axis Command Mailbox / RT-only state mutation
+// ============================================================================
+
+MotionAxisCommandSequence MotionCore::AllocateAxisCommandSequence() noexcept
+{
+    MotionAxisCommandSequence sequence =
+        m_nextAxisCommandSequence.fetch_add(1ULL, std::memory_order_relaxed);
+
+    if (sequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID)
+    {
+        sequence =
+            m_nextAxisCommandSequence.fetch_add(1ULL, std::memory_order_relaxed);
+    }
+
+    return sequence;
+}
+
+bool MotionCore::SubmitAxisCommand(
+    MotionAxisCommand command,
+    MotionAxisCommandSequence* outSequence) noexcept
+{
+    if (outSequence != nullptr)
+    {
+        *outSequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+    }
+
+    const MotionOwner expectedOwner =
+        ResolveMotionOwnerForSource(command.source);
+
+    if (command.type == MotionAxisCommandType::NONE ||
+        command.axisIndex < 0 ||
+        expectedOwner == MotionOwner::NONE ||
+        command.ownerLease.owner != expectedOwner ||
+        !IsMotionOwnerLeaseCurrent(command.ownerLease))
+    {
+        return false;
+    }
+
+    command.sequence = AllocateAxisCommandSequence();
+
+    if (!m_axisCommandChannel.ControlTrySubmit(command))
+    {
+        m_axisCommandQueueFullCount.fetch_add(1ULL, std::memory_order_relaxed);
+        return false;
+    }
+
+    if (outSequence != nullptr)
+    {
+        *outSequence = command.sequence;
+    }
+
+    return true;
+}
+
+bool MotionCore::SubmitAxisMoveToPosition(
+    int axisIndex,
+    double targetPosition,
+    double targetVelocity,
+    double accelerationTime,
+    double decelerationTime,
+    bool useShortestPath,
+    MotionCommandSource source,
+    const MotionOwnerLease& ownerLease,
+    MotionAxisCommandSequence* outSequence) noexcept
+{
+    MotionAxisCommand command{};
+    command.type = MotionAxisCommandType::MOVE_TO_POSITION;
+    command.axisIndex = axisIndex;
+    command.source = source;
+    command.ownerLease = ownerLease;
+    command.value0 = targetPosition;
+    command.value1 = targetVelocity;
+    command.value2 = accelerationTime;
+    command.value3 = decelerationTime;
+    command.flags = useShortestPath
+        ? MOTION_AXIS_COMMAND_FLAG_USE_SHORTEST_PATH
+        : MOTION_AXIS_COMMAND_FLAG_NONE;
+    return SubmitAxisCommand(command, outSequence);
+}
+
+bool MotionCore::SubmitAxisVelocityMove(
+    int axisIndex,
+    double targetVelocity,
+    double accelerationTime,
+    MotionCommandSource source,
+    const MotionOwnerLease& ownerLease,
+    MotionAxisCommandSequence* outSequence) noexcept
+{
+    MotionAxisCommand command{};
+    command.type = MotionAxisCommandType::VELOCITY_MOVE;
+    command.axisIndex = axisIndex;
+    command.source = source;
+    command.ownerLease = ownerLease;
+    command.value0 = targetVelocity;
+    command.value1 = accelerationTime;
+    return SubmitAxisCommand(command, outSequence);
+}
+
+bool MotionCore::SubmitAxisMPGMove(
+    int axisIndex,
+    double targetPosition,
+    double maximumVelocity,
+    double accelerationTime,
+    double decelerationTime,
+    MotionCommandSource source,
+    const MotionOwnerLease& ownerLease,
+    MotionAxisCommandSequence* outSequence) noexcept
+{
+    MotionAxisCommand command{};
+    command.type = MotionAxisCommandType::MPG_MOVE;
+    command.axisIndex = axisIndex;
+    command.source = source;
+    command.ownerLease = ownerLease;
+    command.value0 = targetPosition;
+    command.value1 = maximumVelocity;
+    command.value2 = accelerationTime;
+    command.value3 = decelerationTime;
+    return SubmitAxisCommand(command, outSequence);
+}
+
+bool MotionCore::SubmitAxisStopMove(
+    int axisIndex,
+    double decelerationTime,
+    MotionCommandSource source,
+    const MotionOwnerLease& ownerLease,
+    MotionAxisCommandSequence* outSequence) noexcept
+{
+    MotionAxisCommand command{};
+    command.type = MotionAxisCommandType::STOP_MOVE;
+    command.axisIndex = axisIndex;
+    command.source = source;
+    command.ownerLease = ownerLease;
+    command.value0 = decelerationTime;
+    return SubmitAxisCommand(command, outSequence);
+}
+
+bool MotionCore::SubmitApplyMachineHome(
+    int axisIndex,
+    double capturedReferencePulse,
+    double homeOffsetUnit,
+    const MotionOwnerLease& ownerLease,
+    MotionAxisCommandSequence& outSequence) noexcept
+{
+    MotionAxisCommand command{};
+    command.type = MotionAxisCommandType::APPLY_MACHINE_HOME;
+    command.axisIndex = axisIndex;
+    command.source = MotionCommandSource::HOME;
+    command.ownerLease = ownerLease;
+    command.value0 = capturedReferencePulse;
+    command.value1 = homeOffsetUnit;
+    return SubmitAxisCommand(command, &outSequence);
+}
+
+bool MotionCore::SubmitDriveTouchProbeFunction(
+    int axisIndex,
+    std::uint16_t value,
+    const MotionOwnerLease& ownerLease,
+    MotionAxisCommandSequence* outSequence) noexcept
+{
+    MotionAxisCommand command{};
+    command.type = MotionAxisCommandType::SET_TOUCH_PROBE_FUNCTION;
+    command.axisIndex = axisIndex;
+    command.source = ResolveMotionCommandSourceForOwner(ownerLease.owner);
+    command.ownerLease = ownerLease;
+    command.wordValue = value;
+    return SubmitAxisCommand(command, outSequence);
+}
+
+void MotionCore::ProcessAxisCommandResults() noexcept
+{
+    for (std::size_t i = 0U;
+        i < MOTION_AXIS_RESULT_DRAIN_LIMIT_PER_CONTROL_PASS;
+        ++i)
+    {
+        MotionAxisCommandResult result{};
+        if (!m_axisCommandChannel.ControlTryConsumeResult(result))
+        {
+            break;
+        }
+
+        if (result.sequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID)
+        {
+            continue;
+        }
+
+        const std::size_t index = static_cast<std::size_t>(
+            result.sequence % static_cast<MotionAxisCommandSequence>(
+                MOTION_AXIS_RESULT_CAPACITY));
+        m_axisCommandResultLedger[index] = result;
+    }
+}
+
+bool MotionCore::TryGetAxisCommandResult(
+    MotionAxisCommandSequence sequence,
+    MotionAxisCommandResult& outResult) const noexcept
+{
+    outResult = MotionAxisCommandResult{};
+    if (sequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID)
+    {
+        return false;
+    }
+
+    const std::size_t index = static_cast<std::size_t>(
+        sequence % static_cast<MotionAxisCommandSequence>(
+            MOTION_AXIS_RESULT_CAPACITY));
+    const MotionAxisCommandResult& candidate =
+        m_axisCommandResultLedger[index];
+
+    if (candidate.sequence != sequence)
+    {
+        return false;
+    }
+
+    outResult = candidate;
+    return true;
+}
+
+void MotionCore::RequestEmergencyStopAllAxes() noexcept
+{
+    TakeSafetyMotionOwner();
+    m_emergencyStopAllPending.store(true, std::memory_order_release);
+}
+
+void MotionCore::RequestAxisFaultReset(int axisIndex) noexcept
+{
+    if (axisIndex < 0 || axisIndex >= 32)
+    {
+        return;
+    }
+
+    const std::uint32_t mask =
+        static_cast<std::uint32_t>(1U << static_cast<unsigned>(axisIndex));
+    m_axisFaultResetPendingMask.fetch_or(mask, std::memory_order_release);
+}
+
+void MotionCore::RequestResetAllFaults() noexcept
+{
+    TakeSafetyMotionOwner();
+    m_resetAllFaultsPending.store(true, std::memory_order_release);
+}
+
+void MotionCore::RequestStopGroup() noexcept
+{
+    TakeSafetyMotionOwner();
+    m_stopGroupPending.store(true, std::memory_order_release);
+}
+
+bool MotionCore::HasPendingSafetyOrRecoveryRequests() const noexcept
+{
+    return
+        m_safetyRecoveryRequestInProgress.load(std::memory_order_acquire) ||
+        m_emergencyStopAllPending.load(std::memory_order_acquire) ||
+        m_resetAllFaultsPending.load(std::memory_order_acquire) ||
+        m_stopGroupPending.load(std::memory_order_acquire) ||
+        m_axisFaultResetPendingMask.load(std::memory_order_acquire) != 0U;
+}
+
+void MotionCore::PublishAxisCommandResult(
+    const MotionAxisCommand& command,
+    MotionAxisCommandResultType resultType,
+    MotionRejectReason rejectReason) noexcept
+{
+    MotionAxisCommandResult result{};
+    result.sequence = command.sequence;
+    result.commandType = command.type;
+    result.resultType = resultType;
+    result.axisIndex = command.axisIndex;
+    result.rejectReason = rejectReason;
+    result.owner = command.ownerLease.owner;
+    result.ownerGeneration = command.ownerLease.generation;
+
+    if (!m_axisCommandChannel.RuntimeTryPublishResult(result))
+    {
+        m_axisCommandResultOverflowCount.fetch_add(1ULL, std::memory_order_relaxed);
+    }
+}
+
+void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
+{
+    const bool hasPendingRequest =
+        m_emergencyStopAllPending.load(std::memory_order_acquire) ||
+        m_resetAllFaultsPending.load(std::memory_order_acquire) ||
+        m_stopGroupPending.load(std::memory_order_acquire) ||
+        m_axisFaultResetPendingMask.load(std::memory_order_acquire) != 0U;
+
+    if (!hasPendingRequest)
+    {
+        return;
+    }
+
+    // Keep the Safety lease held until the 250 us owner has actually
+    // consumed and applied every request. A pending bit may be cleared by
+    // exchange before the underlying AxisContext mutation has completed.
+    m_safetyRecoveryRequestInProgress.store(true, std::memory_order_release);
+
+    if (m_emergencyStopAllPending.exchange(false, std::memory_order_acq_rel))
+    {
+        m_resetAllFaultsPending.store(false, std::memory_order_release);
+        m_stopGroupPending.store(false, std::memory_order_release);
+        m_axisFaultResetPendingMask.store(0U, std::memory_order_release);
+        EmergencyStopAllAxes();
+        m_safetyRecoveryRequestInProgress.store(false, std::memory_order_release);
+        return;
+    }
+
+    if (m_resetAllFaultsPending.exchange(false, std::memory_order_acq_rel))
+    {
+        ResetAllFaults();
+    }
+
+    const std::uint32_t resetMask =
+        m_axisFaultResetPendingMask.exchange(0U, std::memory_order_acq_rel);
+
+    if (resetMask != 0U && m_pContexts != nullptr)
+    {
+        const std::size_t axisCount = (std::min)(
+            m_pContexts->size(), static_cast<std::size_t>(32U));
+        for (std::size_t i = 0U; i < axisCount; ++i)
+        {
+            if ((resetMask & (1U << static_cast<unsigned>(i))) != 0U)
+            {
+                ResetFault((*m_pContexts)[i]);
+            }
+        }
+    }
+
+    if (m_stopGroupPending.exchange(false, std::memory_order_acq_rel))
+    {
+        StopGroup();
+    }
+
+    m_safetyRecoveryRequestInProgress.store(false, std::memory_order_release);
+}
+
+void MotionCore::DrainAxisCommandMailbox() noexcept
+{
+    for (std::size_t i = 0U;
+        i < MOTION_AXIS_COMMAND_DRAIN_LIMIT_PER_RUNTIME_PASS;
+        ++i)
+    {
+        MotionAxisCommand command{};
+        if (!m_axisCommandChannel.RuntimeTryConsume(command))
+        {
+            break;
+        }
+
+        const MotionOwner expectedOwner =
+            ResolveMotionOwnerForSource(command.source);
+
+        if (expectedOwner == MotionOwner::NONE ||
+            command.ownerLease.owner != expectedOwner ||
+            !IsMotionOwnerLeaseCurrent(command.ownerLease))
+        {
+            PublishAxisCommandResult(
+                command,
+                MotionAxisCommandResultType::REJECTED,
+                MotionRejectReason::OWNER_CONFLICT);
+            continue;
+        }
+
+        if (m_pContexts == nullptr ||
+            command.axisIndex < 0 ||
+            command.axisIndex >= static_cast<int>(m_pContexts->size()))
+        {
+            PublishAxisCommandResult(
+                command,
+                MotionAxisCommandResultType::REJECTED,
+                MotionRejectReason::INVALID_AXIS);
+            continue;
+        }
+
+        AxisContext& axis = (*m_pContexts)[
+            static_cast<std::size_t>(command.axisIndex)];
+
+        if (!axis.isExist)
+        {
+            PublishAxisCommandResult(
+                command,
+                MotionAxisCommandResultType::REJECTED,
+                MotionRejectReason::INVALID_AXIS);
+            continue;
+        }
+
+        bool applied = true;
+        MotionRejectReason rejectReason = MotionRejectReason::NONE;
+
+        switch (command.type)
+        {
+        case MotionAxisCommandType::MOVE_TO_POSITION:
+        {
+            const bool originalShortestPath = axis.useShortestPath;
+            axis.useShortestPath =
+                (command.flags & MOTION_AXIS_COMMAND_FLAG_USE_SHORTEST_PATH) != 0U;
+            MoveToPosition(
+                axis, command.value0, command.value1, command.value2, command.value3);
+            axis.useShortestPath = originalShortestPath;
+            break;
+        }
+
+        case MotionAxisCommandType::VELOCITY_MOVE:
+            VelocityMove(axis, command.value0, command.value1);
+            break;
+
+        case MotionAxisCommandType::MPG_MOVE:
+            MPGMove(
+                axis, command.value0, command.value1, command.value2, command.value3);
+            break;
+
+        case MotionAxisCommandType::STOP_MOVE:
+            StopMove(axis, command.value0);
+            break;
+
+        case MotionAxisCommandType::APPLY_MACHINE_HOME:
+            applied = ApplyMachineHome(axis, command.value0, command.value1);
+            if (!applied) rejectReason = MotionRejectReason::NOT_READY;
+            break;
+
+        case MotionAxisCommandType::SET_TOUCH_PROBE_FUNCTION:
+            applied = SetDriveTouchProbeFunction(command.axisIndex, command.wordValue);
+            if (!applied) rejectReason = MotionRejectReason::NOT_READY;
+            break;
+
+        case MotionAxisCommandType::NONE:
+        default:
+            applied = false;
+            rejectReason = MotionRejectReason::INVALID_GEOMETRY;
+            break;
+        }
+
+        PublishAxisCommandResult(
+            command,
+            applied
+            ? MotionAxisCommandResultType::APPLIED
+            : MotionAxisCommandResultType::REJECTED,
+            rejectReason);
+    }
+}
+
+// ============================================================================
+// Stage NC-0.1B - Active Execution Epoch / Segment Identity
+// ============================================================================
+
+MotionExecutionEpoch MotionCore::BeginNewExecutionEpoch(
+    MotionCommandSource source) noexcept
+{
+    MotionExecutionEpoch currentEpoch =
+        m_executionEpoch.load(
+            std::memory_order_relaxed);
+
+    MotionExecutionEpoch nextEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+
+    for (;;)
+    {
+        // Epoch 0 永遠保留為 INVALID。
+        nextEpoch =
+            (currentEpoch ==
+                (std::numeric_limits<MotionExecutionEpoch>::max)())
+            ? 1U
+            : static_cast<MotionExecutionEpoch>(
+                currentEpoch + 1U);
+
+        if (m_executionEpoch.compare_exchange_weak(
+            currentEpoch,
+            nextEpoch,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+        {
+            break;
+        }
+    }
+
+    m_pendingCommandSource.store(
+        source,
+        std::memory_order_release);
+
+    // 只發布請求，不在 NC / HMI 執行緒直接碰 Queue / History。
+    m_executionEpochChangePending.store(
+        true,
+        std::memory_order_release);
+
+    return
+        nextEpoch;
+}
+
+
+void MotionCore::BeginProgramBlockMotionCapture() noexcept
+{
+    m_programBlockMotionCapture = MotionProgramBlockCapture{};
+    m_programBlockMotionCaptureActive = true;
+}
+
+
+MotionProgramBlockCapture MotionCore::EndProgramBlockMotionCapture() noexcept
+{
+    m_programBlockMotionCaptureActive = false;
+    return m_programBlockMotionCapture;
+}
+
+
+void MotionCore::RecordProgramBlockMotionSubmission(
+    const MotionExecutionIdentity& identity,
+    bool producerAccepted,
+    MotionRejectReason immediateRejectReason) noexcept
+{
+    if (!m_programBlockMotionCaptureActive)
+    {
+        return;
+    }
+
+    if (m_programBlockMotionCapture.count >=
+        MOTION_PROGRAM_BLOCK_CAPTURE_CAPACITY)
+    {
+        m_programBlockMotionCapture.overflow = true;
+        return;
+    }
+
+    MotionProgramBlockSubmission& submission =
+        m_programBlockMotionCapture.submissions[
+            m_programBlockMotionCapture.count++];
+    submission.identity = identity;
+    submission.producerAccepted = producerAccepted;
+    submission.immediateRejectReason = immediateRejectReason;
+}
+
+
+MotionSegmentId MotionCore::AllocateMotionSegmentId() noexcept
+{
+    MotionSegmentId segmentId =
+        m_nextSegmentId.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+
+    // SegmentId 0 保留為 INVALID。
+    if (segmentId == MOTION_SEGMENT_ID_INVALID)
+    {
+        segmentId =
+            m_nextSegmentId.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+    }
+
+    return
+        segmentId;
+}
+
+
+void MotionCore::AssignExecutionIdentity(
+    MotionCommand& command) noexcept
+{
+    command.execution.epoch =
+        m_executionEpoch.load(
+            std::memory_order_acquire);
+
+    command.execution.segmentId =
+        AllocateMotionSegmentId();
+
+    command.execution.sourceBlockId =
+        static_cast<MotionSourceBlockId>(
+            command.sourceLinePC);
+
+    command.execution.source =
+        m_pendingCommandSource.load(
+            std::memory_order_acquire);
+
+    // Owner + Generation 必須和 Identity 同時封存在命令中。
+    command.ownerLease =
+        GetMotionOwnerLease();
+}
+
+
+bool MotionCore::IsCommandFromCurrentEpoch(
+    const MotionCommand& command) const noexcept
+{
+    return
+        command.execution.IsAssigned() &&
+        command.execution.epoch ==
+        m_executionEpoch.load(
+            std::memory_order_acquire);
+}
+
+
+bool MotionCore::IsCommandOwnerLeaseCurrent(
+    const MotionCommand& command) const noexcept
+{
+    const MotionOwner expectedOwner =
+        ResolveMotionOwnerForSource(
+            command.execution.source);
+
+    return
+        expectedOwner != MotionOwner::NONE &&
+        command.ownerLease.owner == expectedOwner &&
+        IsMotionOwnerLeaseCurrent(command.ownerLease);
+}
+
+
+MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
+    const MotionCommand& command) const noexcept
+{
+    if (!IsCommandFromCurrentEpoch(command))
+    {
+        return MotionRejectReason::STALE_EPOCH;
+    }
+
+    if (!IsCommandOwnerLeaseCurrent(command))
+    {
+        return MotionRejectReason::OWNER_CONFLICT;
+    }
+
+    return MotionRejectReason::NONE;
+}
+
+
+namespace
+{
+    double ClampMotionProgress(
+        double progress) noexcept
+    {
+        if (!std::isfinite(progress))
+        {
+            return 0.0;
+        }
+
+        if (progress < 0.0)
+        {
+            return 0.0;
+        }
+
+        if (progress > 1.0)
+        {
+            return 1.0;
+        }
+
+        return progress;
+    }
+}
+
+
+MotionFeedbackSequence MotionCore::AllocateMotionFeedbackSequence() noexcept
+{
+    MotionFeedbackSequence sequence =
+        m_nextMotionFeedbackSequence;
+
+    if (sequence == MOTION_FEEDBACK_SEQUENCE_INVALID)
+    {
+        sequence = 1ULL;
+    }
+
+    m_nextMotionFeedbackSequence =
+        (sequence ==
+            (std::numeric_limits<MotionFeedbackSequence>::max)())
+        ? 1ULL
+        : static_cast<MotionFeedbackSequence>(
+            sequence + 1ULL);
+
+    return sequence;
+}
+
+
+bool MotionCore::TryQueueProducerFeedbackNotice(
+    const MotionCommand& command,
+    MotionFeedbackType type,
+    MotionRejectReason rejectReason,
+    std::uint32_t errorCode,
+    double progress) noexcept
+{
+    MotionFeedbackEvent event{};
+    event.identity = command.execution;
+    event.type = type;
+    event.rejectReason = rejectReason;
+    event.owner = command.ownerLease.owner;
+    event.ownerGeneration = command.ownerLease.generation;
+    event.errorCode = errorCode;
+    event.progress = ClampMotionProgress(progress);
+
+    if (m_motionFeedbackChannel.
+        CommandProducerTryPublishNotice(event))
+    {
+        return true;
+    }
+
+    m_motionFeedbackProducerNoticeOverflowCount.fetch_add(
+        1ULL,
+        std::memory_order_relaxed);
+
+    m_lastDroppedMotionFeedbackSegmentId.store(
+        command.execution.segmentId,
+        std::memory_order_relaxed);
+
+    m_lastDroppedMotionFeedbackType.store(
+        type,
+        std::memory_order_relaxed);
+
+    return false;
+}
+
+
+void MotionCore::DrainProducerFeedbackNotices() noexcept
+{
+    MotionFeedbackEvent event{};
+
+    // 固定上限，避免 Producer Notice Burst 壟斷單一 250 us Cycle。
+    // 未讀 Notice 留在 Ring，下一個 Runtime Cycle 繼續轉送。
+    for (std::size_t i = 0U;
+        i <
+        MOTION_FEEDBACK_PRODUCER_NOTICE_DRAIN_LIMIT_PER_RUNTIME_CYCLE;
+        ++i)
+    {
+        if (!m_motionFeedbackChannel.
+            RuntimeTryConsumeProducerNotice(event))
+        {
+            break;
+        }
+
+        PublishMotionFeedback(event);
+    }
+}
+
+
+bool MotionCore::PublishMotionFeedback(
+    MotionFeedbackEvent event) noexcept
+{
+    event.sequence =
+        AllocateMotionFeedbackSequence();
+
+    if (!m_motionFeedbackChannel.
+        RuntimeTryPublishFeedback(event))
+    {
+        m_motionFeedbackOverflowCount.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+
+        m_lastDroppedMotionFeedbackSegmentId.store(
+            event.identity.segmentId,
+            std::memory_order_relaxed);
+
+        m_lastDroppedMotionFeedbackType.store(
+            event.type,
+            std::memory_order_relaxed);
+
+        return false;
+    }
+
+    m_lastPublishedMotionFeedbackSequence.store(
+        event.sequence,
+        std::memory_order_release);
+
+    return true;
+}
+
+
+bool MotionCore::PublishMotionFeedbackForCommand(
+    const MotionCommand& command,
+    MotionFeedbackType type,
+    MotionRejectReason rejectReason,
+    std::uint32_t errorCode,
+    double progress) noexcept
+{
+    MotionFeedbackEvent event{};
+    event.identity = command.execution;
+    event.type = type;
+    event.rejectReason = rejectReason;
+    event.owner = command.ownerLease.owner;
+    event.ownerGeneration = command.ownerLease.generation;
+    event.errorCode = errorCode;
+    event.progress = ClampMotionProgress(progress);
+
+    return
+        PublishMotionFeedback(event);
+}
+
+
+double MotionCore::GetTrackedMotionProgress() const noexcept
+{
+    const double totalDistance =
+        m_Group.virtualAxis.finalTargetPos;
+
+    if (!std::isfinite(totalDistance) ||
+        std::abs(totalDistance) <= 1e-12)
+    {
+        return 0.0;
+    }
+
+    const double progress =
+        m_Group.virtualAxis.currentCmdPos /
+        totalDistance;
+
+    return
+        ClampMotionProgress(progress);
+}
+
+
+void MotionCore::TrackMotionCommandAccepted(
+    const MotionCommand& command) noexcept
+{
+    // 正常情況下，上一段會在 LoadNextCommand 入口先 COMPLETED。
+    // 若未來其他路徑直接換段，這裡仍保證上一段不會無聲消失。
+    if (m_feedbackTrackedAccepted &&
+        !m_feedbackTrackedTerminal &&
+        !m_feedbackTrackedIdentity.Matches(
+            command.execution))
+    {
+        AbortTrackedMotionCommand();
+    }
+
+    m_feedbackTrackedIdentity =
+        command.execution;
+
+    m_feedbackTrackedOwnerLease =
+        command.ownerLease;
+
+    m_feedbackTrackedAccepted = true;
+    m_feedbackTrackedStarted = false;
+    m_feedbackTrackedTerminal = false;
+
+    PublishMotionFeedbackForCommand(
+        command,
+        MotionFeedbackType::ACCEPTED,
+        MotionRejectReason::NONE,
+        0U,
+        0.0);
+}
+
+
+void MotionCore::TrackMotionCommandStarted(
+    const MotionCommand& command) noexcept
+{
+    if (!m_feedbackTrackedAccepted ||
+        m_feedbackTrackedTerminal ||
+        m_feedbackTrackedStarted ||
+        !m_feedbackTrackedIdentity.Matches(
+            command.execution))
+    {
+        return;
+    }
+
+    m_feedbackTrackedStarted = true;
+
+    PublishMotionFeedbackForCommand(
+        command,
+        MotionFeedbackType::STARTED,
+        MotionRejectReason::NONE,
+        0U,
+        0.0);
+}
+
+
+void MotionCore::CompleteTrackedMotionCommand(
+    const MotionCommand& command) noexcept
+{
+    if (!m_feedbackTrackedAccepted ||
+        m_feedbackTrackedTerminal ||
+        !m_feedbackTrackedIdentity.Matches(
+            command.execution))
+    {
+        return;
+    }
+
+    PublishMotionFeedbackForCommand(
+        command,
+        MotionFeedbackType::COMPLETED,
+        MotionRejectReason::NONE,
+        0U,
+        1.0);
+
+    m_feedbackTrackedTerminal = true;
+}
+
+
+void MotionCore::AbortTrackedMotionCommand() noexcept
+{
+    if (!m_feedbackTrackedAccepted ||
+        m_feedbackTrackedTerminal ||
+        !m_feedbackTrackedIdentity.IsAssigned())
+    {
+        return;
+    }
+
+    MotionFeedbackEvent event{};
+    event.identity = m_feedbackTrackedIdentity;
+    event.type = MotionFeedbackType::ABORTED;
+    event.rejectReason = MotionRejectReason::NONE;
+    event.owner = m_feedbackTrackedOwnerLease.owner;
+    event.ownerGeneration = m_feedbackTrackedOwnerLease.generation;
+    event.errorCode = 0U;
+    event.progress = GetTrackedMotionProgress();
+
+    PublishMotionFeedback(event);
+
+    m_feedbackTrackedTerminal = true;
+}
+
+
+void MotionCore::FaultTrackedMotionCommand(
+    std::uint32_t errorCode,
+    MotionRejectReason reason) noexcept
+{
+    if (!m_feedbackTrackedAccepted ||
+        m_feedbackTrackedTerminal ||
+        !m_feedbackTrackedIdentity.IsAssigned())
+    {
+        return;
+    }
+
+    MotionFeedbackEvent event{};
+    event.identity = m_feedbackTrackedIdentity;
+    event.type = MotionFeedbackType::FAULTED;
+    event.rejectReason = reason;
+    event.owner = m_feedbackTrackedOwnerLease.owner;
+    event.ownerGeneration = m_feedbackTrackedOwnerLease.generation;
+    event.errorCode = errorCode;
+    event.progress = GetTrackedMotionProgress();
+
+    PublishMotionFeedback(event);
+
+    m_feedbackTrackedTerminal = true;
+}
+
+
+void MotionCore::RejectMotionCommand(
+    const MotionCommand& command,
+    MotionRejectReason reason,
+    std::uint32_t errorCode) noexcept
+{
+    PublishMotionFeedbackForCommand(
+        command,
+        MotionFeedbackType::REJECTED,
+        reason,
+        errorCode,
+        0.0);
+}
+
+
+bool MotionCore::TryEnqueueMotionCommand(
+    const MotionCommand& command) noexcept
+{
+    const MotionRejectReason authorizationFailure =
+        GetCommandAuthorizationFailure(command);
+
+    if (authorizationFailure != MotionRejectReason::NONE)
+    {
+        if (authorizationFailure == MotionRejectReason::STALE_EPOCH)
+        {
+            m_staleCommandDiscardCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+        else
+        {
+            m_motionOwnerConflictRejectCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+
+        m_lastRejectedSegmentId.store(
+            command.execution.segmentId,
+            std::memory_order_relaxed);
+
+        TryQueueProducerFeedbackNotice(
+            command,
+            MotionFeedbackType::REJECTED,
+            authorizationFailure,
+            0U,
+            0.0);
+
+        RecordProgramBlockMotionSubmission(
+            command.execution,
+            false,
+            authorizationFailure);
+        return false;
+    }
+
+    if (m_Group.cmdQueue.ProducerTryPush(command))
+    {
+        RecordProgramBlockMotionSubmission(
+            command.execution,
+            true,
+            MotionRejectReason::NONE);
+        return true;
+    }
+
+    // 固定容量 Queue 不配置記憶體，也不覆寫尚未執行的命令。
+    // 正常 NC 預讀在 50 筆就會節流，因此這個計數應維持 0。
+    m_commandQueueFullRejectCount.fetch_add(
+        1ULL,
+        std::memory_order_relaxed);
+
+    m_lastRejectedSegmentId.store(
+        command.execution.segmentId,
+        std::memory_order_relaxed);
+
+    // Queue Full 發生在 NC Producer 執行緒，不能直接寫入由 Runtime
+    // 單一 Producer 擁有的 Final Feedback Ring。先送入 Producer Notice Ring。
+    TryQueueProducerFeedbackNotice(
+        command,
+        MotionFeedbackType::REJECTED,
+        MotionRejectReason::QUEUE_FULL,
+        static_cast<std::uint32_t>(
+            AlarmManager::MOTION_COMMAND_QUEUE_FULL),
+        0.0);
+
+    RecordProgramBlockMotionSubmission(
+        command.execution,
+        false,
+        MotionRejectReason::QUEUE_FULL);
+
+    AlarmManager::GetInstance().Trigger(
+        AlarmManager::MOTION_COMMAND_QUEUE_FULL,
+        command.sourceLinePC);
+
+    return false;
+}
+
+
+bool MotionCore::TryPeekNextMotionCommand(
+    MotionCommand& command) const noexcept
+{
+    return
+        m_Group.cmdQueue.ConsumerTryPeek(
+            command);
+}
+
+
+bool MotionCore::TryPeekQueuedMotionCommandAt(
+    std::size_t offset,
+    MotionCommand& command) const noexcept
+{
+    return
+        m_Group.cmdQueue.ConsumerTryPeekAt(
+            offset,
+            command);
+}
+
+
+bool MotionCore::TryDequeueNextMotionCommand(
+    MotionCommand& command) noexcept
+{
+    // Peek 與 Pop 之間可能剛好發生 RESET / GOTO / Owner Transfer。
+    // 每一筆真正移除的命令都必須再次驗證 Epoch + Owner Lease。
+    while (m_staleCommandDiscardBudgetRemaining > 0U)
+    {
+        if (!m_Group.cmdQueue.ConsumerTryPop(
+            command))
+        {
+            return false;
+        }
+
+        const MotionRejectReason authorizationFailure =
+            GetCommandAuthorizationFailure(command);
+
+        if (authorizationFailure == MotionRejectReason::NONE)
+        {
+            return true;
+        }
+
+        --m_staleCommandDiscardBudgetRemaining;
+
+        if (authorizationFailure == MotionRejectReason::STALE_EPOCH)
+        {
+            m_staleCommandDiscardCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+        else
+        {
+            m_motionOwnerConflictRejectCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+
+        m_lastRejectedSegmentId.store(
+            command.execution.segmentId,
+            std::memory_order_relaxed);
+
+        RejectMotionCommand(
+            command,
+            authorizationFailure,
+            0U);
+    }
+
+    // Front 若仍未通過授權，留給下一個 250 us Cycle 繼續淘汰。
+    return false;
+}
+
+bool MotionCore::TryRequeueMotionCommandFront(
+    const MotionCommand& command) noexcept
+{
+    if (m_Group.cmdQueue.ConsumerTryPushFront(
+        command))
+    {
+        return true;
+    }
+
+    m_commandReplayOverflowCount.fetch_add(
+        1ULL,
+        std::memory_order_relaxed);
+
+    m_lastRejectedSegmentId.store(
+        command.execution.segmentId,
+        std::memory_order_relaxed);
+
+    // Replay Overflow 代表目前整體路徑執行已無法安全繼續。
+    // B2 倒退跨節時 command 可能是歷史段，但 NC 正在等待的 Active
+    // Segment 仍是原觸發段；優先以 Active Identity 結案，避免把 Fault
+    // 錯記到暫時回放的歷史 Segment。
+    if (m_feedbackTrackedAccepted &&
+        !m_feedbackTrackedTerminal)
+    {
+        FaultTrackedMotionCommand(
+            static_cast<std::uint32_t>(
+                AlarmManager::MOTION_REPLAY_QUEUE_FULL),
+            MotionRejectReason::TRANSPORT_OVERFLOW);
+    }
+    else
+    {
+        PublishMotionFeedbackForCommand(
+            command,
+            MotionFeedbackType::FAULTED,
+            MotionRejectReason::TRANSPORT_OVERFLOW,
+            static_cast<std::uint32_t>(
+                AlarmManager::MOTION_REPLAY_QUEUE_FULL),
+            0.0);
+    }
+
+    AlarmManager::GetInstance().Trigger(
+        AlarmManager::MOTION_REPLAY_QUEUE_FULL,
+        command.sourceLinePC);
+
+    return false;
+}
+
+
+void MotionCore::RequestAbortingExecutionEpoch(
+    MotionCommandSource source) noexcept
+{
+    // 先發布 Abort Policy，再發布 Epoch Change。RT Consumer 看到
+    // m_executionEpochChangePending 時，一定也能看到此旗標。
+    m_abortActiveCommandPending.store(
+        true,
+        std::memory_order_release);
+
+    BeginNewExecutionEpoch(
+        source);
+}
+
+
+void MotionCore::DiscardStaleQueuedCommands()
+{
+    MotionCommand queuedCommand{};
+
+    while (m_staleCommandDiscardBudgetRemaining > 0U)
+    {
+        if (!TryPeekNextMotionCommand(
+            queuedCommand))
+        {
+            return;
+        }
+
+        const MotionRejectReason authorizationFailure =
+            GetCommandAuthorizationFailure(queuedCommand);
+
+        if (authorizationFailure == MotionRejectReason::NONE)
+        {
+            return;
+        }
+
+        MotionCommand discardedCommand{};
+
+        // Peek 已證明 Front 無效，因此使用 Raw Pop；不可呼叫會持續過濾的
+        // TryDequeueNextMotionCommand()，以免多取第一筆有效命令。
+        if (!m_Group.cmdQueue.ConsumerTryPop(
+            discardedCommand))
+        {
+            return;
+        }
+
+        --m_staleCommandDiscardBudgetRemaining;
+
+        if (authorizationFailure == MotionRejectReason::STALE_EPOCH)
+        {
+            m_staleCommandDiscardCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+        else
+        {
+            m_motionOwnerConflictRejectCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+
+        m_lastRejectedSegmentId.store(
+            discardedCommand.execution.segmentId,
+            std::memory_order_relaxed);
+
+        RejectMotionCommand(
+            discardedCommand,
+            authorizationFailure,
+            0U);
+    }
+
+    // 本 Runtime Pass 的固定額度已用完；下一個 250 us Cycle 再處理。
+}
+
+void MotionCore::ApplyPendingExecutionEpochChange()
+{
+    if (!m_executionEpochChangePending.exchange(
+        false,
+        std::memory_order_acq_rel))
+    {
+        return;
+    }
+
+    const bool abortActiveCommand =
+        m_abortActiveCommandPending.exchange(
+            false,
+            std::memory_order_acq_rel);
+
+    // 目前已 ACCEPTED / STARTED、但尚未終止的 Active Segment，
+    // 只要跨 Epoch 就必須以 ABORTED 結案，不能被誤報為 COMPLETED。
+    AbortTrackedMotionCommand();
+
+    // Replay 與 Ingress 共用同一個 Consumer View。先依 Epoch 逐筆淘汰，
+    // 不會誤刪已經由 Producer 發布的新 Epoch 第一筆命令。
+    DiscardStaleQueuedCommands();
+
+    // 不允許 B2 / History 跨越 RESET、GOTO 或不同程式執行世代。
+    m_Group.historyQueue.clear();
+
+    // ABORTING 以前由 Producer 直接改 isActive。NC-0.1C 改由 250 us
+    // Consumer 套用，避免 NC 執行緒寫入 Motion Runtime 狀態。
+    if (abortActiveCommand)
+    {
+        m_Group.isActive = false;
+        m_Group.virtualAxis.state =
+            MotionState::MotionState_IDLE;
+    }
+
+    if (!m_Group.isActive)
+    {
+        m_Group.currentCmd.execution =
+            MotionExecutionIdentity{};
+
+        m_Group.currentCmd.ownerLease =
+            MotionOwnerLease{};
+    }
+}
 
 
 // [修正] 改用 ServoDrive
@@ -1650,11 +3166,26 @@ void MotionCore::EmergencyStop(AxisContext& axis)
 }
 void MotionCore::EmergencyStopAllAxes()
 {
+    // Safety 以新 Generation 搶占控制權；重複急停時保持同一份 Lease。
+    TakeSafetyMotionOwner();
+
     // =========================================================
-    // 1. 先關閉插補群組
+    // 1. 使目前執行世代失效
     //
-    // 防止 UpdateInterpolation 繼續對實體軸寫入新的命令。
+    // Emergency 訊號可能每個 Scan 都持續呼叫本函式。只有仍有
+    // Active / Queued Motion 時才切換 Epoch，避免空機時無限遞增。
     // =========================================================
+    const bool hadExecutionToInvalidate =
+        m_Group.isActive ||
+        !m_Group.cmdQueue.empty();
+
+    if (hadExecutionToInvalidate)
+    {
+        BeginNewExecutionEpoch(
+            MotionCommandSource::SAFETY);
+    }
+
+    // 防止 UpdateInterpolation 繼續對實體軸寫入新的命令。
     m_Group.isActive = false;
 
 
@@ -1668,11 +3199,11 @@ void MotionCore::EmergencyStopAllAxes()
 
 
     // =========================================================
-    // 3. 清除尚未執行的群組運動命令
+    // 3. 尚未執行的命令已由新 Epoch 取消。
     //
-    // Emergency Reset 後不能讓舊的路徑繼續被取出執行。
+    // 固定 SPSC Ring 只允許 250 us Consumer 移除命令；
+    // ApplyPendingExecutionEpochChange() 會淘汰舊世代。
     // =========================================================
-    m_Group.cmdQueue.clear();
 
 
     // =========================================================
@@ -1771,8 +3302,18 @@ void MotionCore::ResetAllFaults()//全軸 清除異常狀態
         ResetFault((*m_pContexts)[i]);
     }
 
+    const bool hadExecutionToInvalidate =
+        m_Group.isActive ||
+        !m_Group.cmdQueue.empty();
+
+    if (hadExecutionToInvalidate)
+    {
+        BeginNewExecutionEpoch(
+            MotionCommandSource::SAFETY);
+    }
+
     m_Group.isActive = false;
-    m_Group.cmdQueue.clear();
+    // Future Command 由新 Epoch 在 250 us Consumer 端淘汰。
     ResetFault(m_Group.virtualAxis); // 👈 現在有了 isVirtualAxis 保護，這裡也安全了！
 
     if (m_Group.jumpManager.state != JumpState::IDLE) {
@@ -3504,7 +5045,7 @@ void MotionCore::LineMove(const std::vector<int>& axes, const std::vector<double
     if (m_pContexts == nullptr || axes.empty()) return;
 
     // 1. 建立一個全新的任務包裹
-    MotionCommand cmd;
+    MotionCommand cmd{};
     cmd.mode = InterpolationMode::LINEAR;
     cmd.axisCount = (int)axes.size();
 
@@ -3554,16 +5095,20 @@ void MotionCore::LineMove(const std::vector<int>& axes, const std::vector<double
     // 2. 判斷是「乖乖排隊」還是「緊急覆寫」？
     if (mode == BufferMode::ABORTING)
     {
-        // 舊的清空 queue 的寫法可以刪掉，改用 deque 內建的 clear()
-        m_Group.cmdQueue.clear();     // 清空未來
-        m_Group.historyQueue.clear(); // 清空歷史 (新增這行)
+        const MotionCommandSource commandSource =
+            m_pendingCommandSource.load(
+                std::memory_order_acquire);
 
-        m_Group.isActive = false;
-        m_Group.virtualAxis.state = MotionState::MotionState_IDLE;
+        RequestAbortingExecutionEpoch(
+            commandSource);
+
+        // Future Queue / History 與 Active Abort 都由 250 us Consumer
+        // 在 Epoch 邊界套用；Producer 不再修改 Motion Runtime 容器。
     }
 
-    // 3. 把包裹推入倉庫
-    m_Group.cmdQueue.push_back(cmd);
+    // 3. 在最終 Epoch 確定後配置 Identity，再把包裹推入倉庫。
+    AssignExecutionIdentity(cmd);
+    TryEnqueueMotionCommand(cmd);
 }
 // =========================================================
 // Spiral / Variable Radius Arc Helpers
@@ -3789,13 +5334,24 @@ void MotionCore::LoadNextCommand()
 
 
     // ======================================================
-    // 2. 將剛完成的指令寫入 History
+    // 2. 將剛完成的指令結案並寫入 History
     // ======================================================
-    if (m_Group.isActive && m_Group.enableHistory)
+    if (m_Group.isActive &&
+        m_Group.virtualAxis.inPosition)
+    {
+        CompleteTrackedMotionCommand(
+            m_Group.currentCmd);
+    }
+
+    if (m_Group.isActive &&
+        m_Group.enableHistory &&
+        GetCommandAuthorizationFailure(m_Group.currentCmd) ==
+        MotionRejectReason::NONE)
     {
         m_Group.historyQueue.push_back(m_Group.currentCmd);
 
-        if (m_Group.historyQueue.size() > 1000)
+        if (m_Group.historyQueue.size() >
+            MOTION_COMMAND_HISTORY_LIMIT)
         {
             m_Group.historyQueue.pop_front();
         }
@@ -3803,18 +5359,72 @@ void MotionCore::LoadNextCommand()
 
 
     // ======================================================
-    // 3. 取得下一條 Motion Command
+    // 3. 淘汰舊 Epoch 命令
     // ======================================================
-    MotionCommand cmd = m_Group.cmdQueue.front();
+    DiscardStaleQueuedCommands();
 
-    m_Group.cmdQueue.pop_front();
+    if (m_Group.cmdQueue.empty())
+    {
+        return;
+    }
+
+    // 本次固定額度若尚未清完舊 Epoch，下一個 250 us Cycle 再處理。
+    MotionCommand frontCommand{};
+    if (TryPeekNextMotionCommand(frontCommand) &&
+        GetCommandAuthorizationFailure(frontCommand) !=
+        MotionRejectReason::NONE)
+    {
+        return;
+    }
+
+
+    // ======================================================
+    // 4. 由 250 us Consumer 取得下一條 Motion Command
+    // ======================================================
+    MotionCommand cmd{};
+
+    if (!TryDequeueNextMotionCommand(cmd))
+    {
+        return;
+    }
+
+    // Epoch 或 Owner Lease 可能在 Pop 後、切入 Current Command 前改變。
+    const MotionRejectReason postPopAuthorizationFailure =
+        GetCommandAuthorizationFailure(cmd);
+
+    if (postPopAuthorizationFailure != MotionRejectReason::NONE)
+    {
+        if (postPopAuthorizationFailure == MotionRejectReason::STALE_EPOCH)
+        {
+            m_staleCommandDiscardCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+        else
+        {
+            m_motionOwnerConflictRejectCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+
+        m_lastRejectedSegmentId.store(
+            cmd.execution.segmentId,
+            std::memory_order_relaxed);
+
+        RejectMotionCommand(
+            cmd,
+            postPopAuthorizationFailure,
+            0U);
+
+        return;
+    }
 
     // 保存目前執行指令
     m_Group.currentCmd = cmd;
 
 
     // ======================================================
-    // 4. 更新 NC 執行資訊
+    // 5. 更新 NC 執行資訊
     // ======================================================
     m_Group.currentExecutionPC = cmd.sourceLinePC;
     m_Group.currentExecutionWCS = cmd.sourceWCS;
@@ -3978,6 +5588,14 @@ void MotionCore::LoadNextCommand()
         vAxis.inPosition = true;
         vAxis.state = MotionState::MotionState_IDLE;
         m_Group.isActive = false;
+
+        // 合法但不需要實際位移的 Segment，仍有完整生命週期：
+        // ACCEPTED -> COMPLETED；不發布 STARTED。
+        TrackMotionCommandAccepted(
+            m_Group.currentCmd);
+
+        CompleteTrackedMotionCommand(
+            m_Group.currentCmd);
     };
 
 
@@ -4014,6 +5632,11 @@ void MotionCore::LoadNextCommand()
         vAxis.isFault = true;
 
         m_Group.isActive = false;
+
+        RejectMotionCommand(
+            m_Group.currentCmd,
+            MotionRejectReason::INVALID_GEOMETRY,
+            0U);
 
 
         // 相關實體軸停留原地
@@ -4377,6 +6000,11 @@ void MotionCore::LoadNextCommand()
 
         m_Group.isActive = false;
 
+        RejectMotionCommand(
+            m_Group.currentCmd,
+            MotionRejectReason::INVALID_GEOMETRY,
+            0U);
+
         return;
     }
 
@@ -4428,11 +6056,15 @@ void MotionCore::LoadNextCommand()
         // ======================================================
         // 10. CONTINUOUS 智能轉角速度
         // ======================================================
-    if (m_Group.pathMode == PathMode::CONTINUOUS && !m_Group.cmdQueue.empty())
+    DiscardStaleQueuedCommands();
+
+    MotionCommand nextCmd{};
+
+    if (m_Group.pathMode == PathMode::CONTINUOUS &&
+        TryPeekNextMotionCommand(nextCmd) &&
+        GetCommandAuthorizationFailure(nextCmd) ==
+        MotionRejectReason::NONE)
     {
-        MotionCommand& nextCmd = m_Group.cmdQueue.front();
-
-
         //RtPrintf( "[P1 NEXT] PC:%d | NextPC:%d | NextTarget:%d | NextVel:%d\n",cmd.sourceLinePC,nextCmd.sourceLinePC,(int)nextCmd.targetPos[0],(int)nextCmd.targetVel);
         double curVx = 0.0;
         double curVy = 0.0;
@@ -4583,9 +6215,15 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // 12. 正式啟動 Virtual Axis
     // ======================================================
+    TrackMotionCommandAccepted(
+        m_Group.currentCmd);
+
     vAxis.state = MotionState::MotionState_MOVING;
     vAxis.inPosition = false;
     m_Group.isActive = true;
+
+    TrackMotionCommandStarted(
+        m_Group.currentCmd);
 
 
     // ======================================================
@@ -4683,7 +6321,7 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
     if (m_pContexts == nullptr || axes.size() < 2 || targetPos.size() < 2 || centerPos.size() < 2) return;
 
     // 1. 打包包裹
-    MotionCommand cmd;
+    MotionCommand cmd{};
     cmd.mode = (dir == 1) ? InterpolationMode::CIRCULAR_CCW : InterpolationMode::CIRCULAR_CW;
 
     // 🟢 動態打包軸數
@@ -4731,19 +6369,41 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
     // 2. 判斷插隊或排隊
     if (mode == BufferMode::ABORTING)
     {
-        m_Group.cmdQueue.clear();     // deque 內建的清空語法
-        m_Group.historyQueue.clear(); // 順便把歷史也清掉
-        m_Group.isActive = false;
-        m_Group.virtualAxis.state = MotionState::MotionState_IDLE;
+        const MotionCommandSource commandSource =
+            m_pendingCommandSource.load(
+                std::memory_order_acquire);
+
+        RequestAbortingExecutionEpoch(
+            commandSource);
+
+        // Future Queue / History 與 Active Abort 都由 250 us Consumer
+        // 在 Epoch 邊界套用。
     }
 
-    // 3. 推入佇列
-    m_Group.cmdQueue.push_back(cmd);
+    // 3. 在最終 Epoch 確定後配置 Identity，再推入佇列。
+    AssignExecutionIdentity(cmd);
+    TryEnqueueMotionCommand(cmd);
 }
 
 void MotionCore::StopGroup()
 {
-    if (!m_Group.isActive) return;
+    const bool hadExecutionToInvalidate =
+        m_Group.isActive ||
+        !m_Group.cmdQueue.empty();
+
+    if (hadExecutionToInvalidate)
+    {
+        BeginNewExecutionEpoch(
+            MotionCommandSource::SAFETY);
+    }
+
+    // 尚未開始的 Future Queue 已由新 Epoch 取消；
+    // 實際淘汰由 250 us Consumer 執行。
+
+    if (!m_Group.isActive)
+    {
+        return;
+    }
 
     // =========================================================
     // 🌟 自動計算群組的「最小減速度」 (即尋找最長的減速時間)
@@ -4769,13 +6429,25 @@ void MotionCore::StopGroup()
 
     // 將算出的最安全時間，交給虛擬主軸執行平滑煞車
     StopMove(m_Group.virtualAxis, safeDecTime);
-
-    // 清空後面還沒跑的軌跡包裹
-    m_Group.cmdQueue.clear();
 }
 
 void MotionCore::EmergencyStopGroup()
 {
+    // Group E-Stop 也必須使先前 Owner Lease 失效。
+    TakeSafetyMotionOwner();
+
+    const bool hadExecutionToInvalidate =
+        m_Group.isActive ||
+        !m_Group.cmdQueue.empty();
+
+    if (hadExecutionToInvalidate)
+    {
+        BeginNewExecutionEpoch(
+            MotionCommandSource::SAFETY);
+    }
+
+    // Future Queue 已由新 Epoch 取消，等待 250 us Consumer 淘汰。
+
     // 1. 關閉群組插補引擎，防止 UpdateInterpolation 繼續寫入位置
     m_Group.isActive = false;
 
@@ -5349,19 +7021,42 @@ void MotionCore::Process_B2_Approach_Planner(double dt)
     double accumulatedDist = m_Group.currentCmd.mem_totalDist;
     bool needToStop = false;
 
+    DiscardStaleQueuedCommands();
+
     if (!m_Group.cmdQueue.empty())
     {
         double curRatio[8];
         for (int i = 0; i < m_Group.axisCount; i++) curRatio[i] = m_Group.ratio[i];
         InterpolationMode curMode = m_Group.mode;
 
-        // ⚠️ 修正：直接掃描整個幾何軌跡 Queue，不要被 approachSteps 的段數限制！
-        for (auto it_cmd = m_Group.cmdQueue.begin(); it_cmd != m_Group.cmdQueue.end(); ++it_cmd)
+        // Stage NC-0.1C：以 Consumer Snapshot 逐筆查看 Replay + Ingress。
+        // 不暴露 Ring Slot，也不讓 RT Runtime 使用 deque iterator。
+        const std::size_t queuedCommandCount =
+            m_Group.cmdQueue.size();
+
+        for (std::size_t queueOffset = 0U;
+            queueOffset < queuedCommandCount;
+            ++queueOffset)
         {
+            MotionCommand futureCommand{};
+
+            if (!TryPeekQueuedMotionCommandAt(
+                queueOffset,
+                futureCommand))
+            {
+                break;
+            }
+
+            if (GetCommandAuthorizationFailure(
+                futureCommand) != MotionRejectReason::NONE)
+            {
+                break;
+            }
+
             bool isTurn = false;
 
             // 條件 A：模式改變 (直線變圓弧，或圓弧變直線)，絕對要煞車
-            if (curMode != it_cmd->mode) {
+            if (curMode != futureCommand.mode) {
                 isTurn = true;
             }
             // 條件 B：都是直線，用內積檢查折角
@@ -5370,7 +7065,7 @@ void MotionCore::Process_B2_Approach_Planner(double dt)
                 double dotProduct = 0.0, len1 = 0.0, len2 = 0.0;
                 for (int a = 0; a < m_Group.axisCount; a++) {
                     double cR = curRatio[a];
-                    double nR = it_cmd->mem_ratio[a];
+                    double nR = futureCommand.mem_ratio[a];
                     dotProduct += cR * nR;
                     len1 += cR * cR;
                     len2 += nR * nR;
@@ -5391,11 +7086,11 @@ void MotionCore::Process_B2_Approach_Planner(double dt)
             }
 
             // 如果是直走，累加距離
-            accumulatedDist += it_cmd->mem_totalDist;
+            accumulatedDist += futureCommand.mem_totalDist;
 
             // 更新比較基準，繼續看下一段
-            curMode = it_cmd->mode;
-            for (int a = 0; a < m_Group.axisCount; a++) curRatio[a] = it_cmd->mem_ratio[a];
+            curMode = futureCommand.mode;
+            for (int a = 0; a < m_Group.axisCount; a++) curRatio[a] = futureCommand.mem_ratio[a];
         }
     }
 
@@ -5598,27 +7293,88 @@ void MotionCore::Process_Forward_Crossing()
     AxisContext& vAxis = m_Group.virtualAxis;
     PathJumpManager& jm = m_Group.jumpManager;
 
-    // 檢查有沒有下一段，沒有就不需要換檔
+    // 檢查有沒有同一 Epoch 的下一段，沒有就不需要換檔。
+    DiscardStaleQueuedCommands();
+
     if (m_Group.cmdQueue.empty()) return;
+
+    MotionCommand frontCommand{};
+    if (TryPeekNextMotionCommand(frontCommand) &&
+        GetCommandAuthorizationFailure(frontCommand) !=
+        MotionRejectReason::NONE)
+    {
+        return;
+    }
 
     double lastDist = m_Group.currentCmd.mem_totalDist;
 
     // ==========================================
-    // 🌟 核心 A：物理座標補償 (身體跨步)
+    // 🌟 核心 A：先取得下一個包裹
+    //
+    // Queue 理論上不會在 Consumer 端突然消失；仍先完成 Pop，
+    // 確保失敗時不會提前改動 startPos 或 History。
+    // ==========================================
+    MotionCommand nextCommand{};
+
+    if (!TryDequeueNextMotionCommand(
+        nextCommand))
+    {
+        return;
+    }
+
+    // Epoch 或 Owner Lease 可能在 Pop 後、切換 Current Command 前改變。
+    const MotionRejectReason postPopAuthorizationFailure =
+        GetCommandAuthorizationFailure(nextCommand);
+
+    if (postPopAuthorizationFailure != MotionRejectReason::NONE)
+    {
+        if (postPopAuthorizationFailure == MotionRejectReason::STALE_EPOCH)
+        {
+            m_staleCommandDiscardCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+        else
+        {
+            m_motionOwnerConflictRejectCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+
+        m_lastRejectedSegmentId.store(
+            nextCommand.execution.segmentId,
+            std::memory_order_relaxed);
+
+        RejectMotionCommand(
+            nextCommand,
+            postPopAuthorizationFailure,
+            0U);
+
+        return;
+    }
+
+    // ==========================================
+    // 🌟 核心 B：物理座標補償 (身體跨步)
     // ==========================================
     for (int i = 0; i < m_Group.axisCount; i++) {
         m_Group.startPos[i] += (lastDist * m_Group.ratio[i]);
     }
 
     // ==========================================
-    // 🌟 核心 B：換包裹 (時光機切換)
+    // 🌟 核心 C：保存舊包裹並切換
     // ==========================================
     m_Group.historyQueue.push_back(m_Group.currentCmd);
-    m_Group.currentCmd = m_Group.cmdQueue.front();
-    m_Group.cmdQueue.pop_front();
+
+    if (m_Group.historyQueue.size() >
+        MOTION_COMMAND_HISTORY_LIMIT)
+    {
+        m_Group.historyQueue.pop_front();
+    }
+
+    m_Group.currentCmd = nextCommand;
 
     // ==========================================
-    // 🌟 核心 C：虛擬進度同步縮放 (維持連續性)
+    // 🌟 核心 D：虛擬進度同步縮放 (維持連續性)
     // ==========================================
     vAxis.currentCmdPos -= lastDist;
     if (jm.state != JumpState::IDLE) {
@@ -5626,7 +7382,7 @@ void MotionCore::Process_Forward_Crossing()
     }
 
     // ==========================================
-    // 🌟 核心 D：大腦索引同步 (通知 Planner 換下一段)
+    // 🌟 核心 E：大腦索引同步 (通知 Planner 換下一段)
     // ==========================================
     /*
     if (jm.state == JumpState::APPROACHING && jm.mode == JumpMode::B2_PATH_REVERSE) {
@@ -5636,7 +7392,7 @@ void MotionCore::Process_Forward_Crossing()
     }*/
 
     // ==========================================
-    // 🌟 核心 E：更新方向盤 (Ratio)
+    // 🌟 核心 F：更新方向盤 (Ratio)
     // ==========================================
     m_Group.mode = m_Group.currentCmd.mode;
     for (int i = 0; i < 8; i++) {
@@ -5824,6 +7580,20 @@ double MotionCore::PlanTrapezoidal_B2(double currentPos, double targetPos, doubl
 }
 void MotionCore::UpdateInterpolation()
 {
+    // 所有 Stale 清理 Helper 共用這一份 250 us Pass 額度。
+    m_staleCommandDiscardBudgetRemaining =
+        MOTION_COMMAND_STALE_DISCARD_LIMIT_PER_RUNTIME_PASS;
+
+    // Stage NC-0.1D：Final Feedback Ring 只有 250 us Runtime 能發布。
+    // 先轉送 NC Producer 產生的 Queue-Full Notice，再套用 Epoch 變更。
+    DrainProducerFeedbackNotices();
+
+    ApplyPendingExecutionEpochChange();
+
+    // Safety requests have priority over manual/home mailbox commands.
+    ApplyPendingSafetyAndRecoveryRequests();
+    DrainAxisCommandMailbox();
+
     // 1. 基本防呆
     if (m_pContexts == nullptr) return;
 
@@ -5837,6 +7607,11 @@ void MotionCore::UpdateInterpolation()
             if (logCnt5++ % 500 == 0) {
                 //RtPrintf("[DBG-3] BLOCKED! Axis %d is NOT ServoOn. Group aborted.\\n", axisIdx);
             }
+
+            FaultTrackedMotionCommand(
+                static_cast<std::uint32_t>(
+                    AlarmManager::SERVO_ERROR),
+                MotionRejectReason::NOT_READY);
 
             m_Group.isActive = false;
 
@@ -6258,35 +8033,48 @@ void MotionCore::UpdateInterpolation()
     {
         if (m_Group.enableHistory && !m_Group.historyQueue.empty())
         {
-            m_Group.cmdQueue.push_front(m_Group.currentCmd);
-            m_Group.currentCmd = m_Group.historyQueue.back();
-            m_Group.historyQueue.pop_back();
-
-            // 恢復大腦的幾何狀態
-            m_Group.mode = m_Group.currentCmd.mode;
-            m_Group.axisCount = m_Group.currentCmd.axisCount;
-            for (int i = 0; i < 8; i++)
+            // SPSC Ingress 不允許 RT Consumer push_front。
+            // 離開的 Current Segment 放入 RT-only Replay Front，正向返回時
+            // 會優先於 NC 新發布的 Ingress Command 被取出。
+            if (TryRequeueMotionCommandFront(
+                m_Group.currentCmd))
             {
-                m_Group.startPos[i] = m_Group.currentCmd.mem_startPos[i];
-                m_Group.ratio[i] = m_Group.currentCmd.mem_ratio[i];
-                m_Group.axisIndices[i] = m_Group.currentCmd.axisIndices[i];
-            }
-            m_Group.radius = m_Group.currentCmd.mem_radius; m_Group.startAngle = m_Group.currentCmd.mem_startAngle;
-            m_Group.centerX = m_Group.currentCmd.mem_centerX; m_Group.centerY = m_Group.currentCmd.mem_centerY;
-            m_Group.totalDist3D = m_Group.currentCmd.mem_totalDist; m_Group.totalAngle = m_Group.currentCmd.mem_totalAngle;
+                m_Group.currentCmd = m_Group.historyQueue.back();
+                m_Group.historyQueue.pop_back();
 
-            m_Group.enableTransform = m_Group.currentCmd.mem_enableTransform;
-            for (int i = 0; i < 3; ++i)
+                // 恢復大腦的幾何狀態
+                m_Group.mode = m_Group.currentCmd.mode;
+                m_Group.axisCount = m_Group.currentCmd.axisCount;
+                for (int i = 0; i < 8; i++)
+                {
+                    m_Group.startPos[i] = m_Group.currentCmd.mem_startPos[i];
+                    m_Group.ratio[i] = m_Group.currentCmd.mem_ratio[i];
+                    m_Group.axisIndices[i] = m_Group.currentCmd.axisIndices[i];
+                }
+                m_Group.radius = m_Group.currentCmd.mem_radius; m_Group.startAngle = m_Group.currentCmd.mem_startAngle;
+                m_Group.centerX = m_Group.currentCmd.mem_centerX; m_Group.centerY = m_Group.currentCmd.mem_centerY;
+                m_Group.totalDist3D = m_Group.currentCmd.mem_totalDist; m_Group.totalAngle = m_Group.currentCmd.mem_totalAngle;
+
+                m_Group.enableTransform = m_Group.currentCmd.mem_enableTransform;
+                for (int i = 0; i < 3; ++i)
+                {
+                    m_Group.transformOrigin[i] = m_Group.currentCmd.mem_transformOrigin[i];
+                    for (int j = 0; j < 3; ++j) m_Group.transformMatrix[i][j] = m_Group.currentCmd.mem_transformMatrix[i][j];
+                }
+
+                // 🌟 終極修復：跨節後，必須把剩餘的負數距離，灌給新的線條長度！
+                vAxis.currentCmdPos += m_Group.currentCmd.mem_totalDist;
+
+                // 🌟 如果是 B2 模式，必須同步平移起點，才不會無限閃退！
+                if (jm.state != JumpState::IDLE) jm.triggerPos += m_Group.currentCmd.mem_totalDist;
+            }
+            else
             {
-                m_Group.transformOrigin[i] = m_Group.currentCmd.mem_transformOrigin[i];
-                for (int j = 0; j < 3; ++j) m_Group.transformMatrix[i][j] = m_Group.currentCmd.mem_transformMatrix[i][j];
+                // Replay 固定容量理論上大於 History 上限；若仍失敗，
+                // 不可丟失 Current Segment，只能鎖在本段起點等待 Alarm。
+                vAxis.currentCmdPos = 0.0;
+                vAxis.currentCmdVel = 0.0;
             }
-
-            // 🌟 終極修復：跨節後，必須把剩餘的負數距離，灌給新的線條長度！
-            vAxis.currentCmdPos += m_Group.currentCmd.mem_totalDist;
-
-            // 🌟 如果是 B2 模式，必須同步平移起點，才不會無限閃退！
-            if (jm.state != JumpState::IDLE) jm.triggerPos += m_Group.currentCmd.mem_totalDist;
         }
         else
         {
@@ -7092,6 +8880,9 @@ void MotionCore::UpdateInterpolation()
         // 🌟 神級收尾：大腦算完，且實體馬達"全部"都擠進視窗後，才准切換為 IDLE！
         if (allPhysicalInPos)
         {
+            CompleteTrackedMotionCommand(
+                m_Group.currentCmd);
+
             m_Group.isActive = false;
             for (int i = 0; i < m_Group.axisCount; ++i)
             {
@@ -7243,6 +9034,117 @@ bool MotionCore::IsGroupStandstill() const
     // 才是真正 Standstill
     // =========================================================
     return true;
+}
+
+
+MotionFeedHoldStopSnapshot MotionCore::GetFeedHoldStopSnapshot() const noexcept
+{
+    MotionFeedHoldStopSnapshot snapshot{};
+
+    const double commandVelocityDeadbandPps = 1.0;
+    const double actualVelocityDeadbandPps = 1.0 / CYCLE_TIME_SEC;
+    const double overrideZeroDeadband = 1.0e-9;
+
+    snapshot.feedrateOverride = m_Group.feedrateOverride;
+    snapshot.virtualCommandVelocityPps =
+        (std::max)(
+            std::abs(m_Group.virtualAxis.currentCmdVel),
+            std::abs(m_Group.virtualAxis.logicalCmdVel));
+    snapshot.groupActive = m_Group.isActive;
+    snapshot.groupDone = IsGroupDone();
+    snapshot.groupFaulted = IsGroupFaulted();
+    snapshot.groupEmergencyStopped = IsGroupEmergencyStopped();
+    snapshot.safetyOrRecoveryPending =
+        HasPendingSafetyOrRecoveryRequests();
+    snapshot.overrideZero =
+        std::abs(snapshot.feedrateOverride) <= overrideZeroDeadband;
+    snapshot.virtualCommandStopped =
+        snapshot.virtualCommandVelocityPps <= commandVelocityDeadbandPps;
+
+    snapshot.commandQueueDepth =
+        static_cast<std::uint32_t>(GetQueueSize());
+    snapshot.commandIngressDepth =
+        static_cast<std::uint32_t>(GetCommandIngressSize());
+    snapshot.commandReplayDepth =
+        static_cast<std::uint32_t>(GetCommandReplaySize());
+
+    bool seenAxis[MAX_AXES] = { false };
+
+    if (m_pContexts != nullptr)
+    {
+        for (int slot = 0; slot < m_Group.axisCount; ++slot)
+        {
+            const int axisIndex = m_Group.axisIndices[slot];
+            if (axisIndex < 0 ||
+                axisIndex >= MAX_AXES ||
+                axisIndex >= static_cast<int>(m_pContexts->size()) ||
+                seenAxis[axisIndex])
+            {
+                continue;
+            }
+
+            seenAxis[axisIndex] = true;
+            const AxisContext& axis = (*m_pContexts)[axisIndex];
+            if (!axis.isExist)
+            {
+                continue;
+            }
+
+            ++snapshot.groupAxisCount;
+
+            const double commandVelocity =
+                (std::max)(
+                    std::abs(axis.currentCmdVel),
+                    std::abs(axis.logicalCmdVel));
+            const double actualVelocity =
+                std::abs(axis.currentActVel);
+
+            snapshot.maxAxisCommandVelocityPps =
+                (std::max)(
+                    snapshot.maxAxisCommandVelocityPps,
+                    commandVelocity);
+            snapshot.maxAxisActualVelocityPps =
+                (std::max)(
+                    snapshot.maxAxisActualVelocityPps,
+                    actualVelocity);
+
+            if (commandVelocity > commandVelocityDeadbandPps)
+            {
+                ++snapshot.commandMovingAxes;
+            }
+
+            if (actualVelocity > actualVelocityDeadbandPps)
+            {
+                ++snapshot.actualMovingAxes;
+            }
+
+            if (axis.isFault ||
+                axis.state == MotionState::MotionState_ERROR ||
+                axis.state == MotionState::MotionState_ESTOP)
+            {
+                ++snapshot.faultedAxes;
+            }
+        }
+    }
+
+    snapshot.axisCommandStopped =
+        snapshot.commandMovingAxes == 0U;
+    snapshot.axisActualStopped =
+        snapshot.actualMovingAxes == 0U;
+    snapshot.commandStopped =
+        snapshot.virtualCommandStopped &&
+        snapshot.axisCommandStopped;
+    snapshot.actualStopped =
+        snapshot.axisActualStopped;
+    snapshot.motionStopped =
+        snapshot.commandStopped &&
+        snapshot.actualStopped &&
+        snapshot.faultedAxes == 0U &&
+        !snapshot.groupFaulted &&
+        !snapshot.groupEmergencyStopped &&
+        !snapshot.safetyOrRecoveryPending;
+
+    return snapshot;
 }
 
 // 🌟 檢查全系統所有存在的實體軸是否有警報

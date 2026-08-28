@@ -15,6 +15,75 @@
 
 extern PLCManager* g_PLC; // 引用全域 PLC 指標
 
+
+// ============================================================================
+// Stage 11G.5 - PLC semantic DI map helper
+//
+// A GenericIO compatibility envelope may contain more than DigitalInput data.
+// Example: AX58100 E-IOT has one 29-byte input envelope, but only the first
+// 24 bits are DigitalInput; the remainder is Status / PositionFeedback /
+// LatchCapture / TouchProbe.
+//
+// PLC I mapping therefore resolves DigitalInput ownership by SlaveIndex rather
+// than assuming that the complete GenericIO input envelope is DI.
+// ============================================================================
+namespace
+{
+    const EtherCatCompositeApplicationDescriptor*
+        ResolveDigitalInputConsumerForSlave(
+            EtherCatMaster* pMaster,
+            int slaveIndex,
+            int& semanticOccurrence)
+    {
+        semanticOccurrence =
+            -1;
+
+
+        if (pMaster ==
+            nullptr)
+        {
+            return
+                nullptr;
+        }
+
+
+        // 256 is a startup-only safety bound.  ResolveCompositeReadConsumer()
+        // returns nullptr once there are no more DigitalInput descriptors.
+        for (int occurrence = 0;
+            occurrence < 256;
+            ++occurrence)
+        {
+            const auto* descriptor =
+                pMaster->ResolveCompositeReadConsumer(
+                    "DigitalInput",
+                    "",
+                    occurrence);
+
+
+            if (descriptor ==
+                nullptr)
+            {
+                break;
+            }
+
+
+            if (descriptor->slaveIndex ==
+                slaveIndex)
+            {
+                semanticOccurrence =
+                    occurrence;
+
+                return
+                    descriptor;
+            }
+        }
+
+
+        return
+            nullptr;
+    }
+}
+
 PlcCore::PlcCore()
 {
     m_marqueeLed = 0;
@@ -1287,6 +1356,228 @@ void PlcCore::SetGenericReadMaster(
 {
     m_pGenericReadMaster =
         pMaster;
+
+
+    // ========================================================================
+    // Stage 11G.5 - Normalize PLC DI maps to the DigitalInput semantic subset.
+    //
+    // AutoMapIO() runs earlier because it also supports the legacy route.  At
+    // that time ENI_GenericIO exposes the complete compatibility envelope.
+    // A Composite device can therefore look like a very large DI module even
+    // when only part of its input is actually DigitalInput.
+    //
+    // Example AX58100:
+    //     GenericIO input envelope : 232 bits
+    //     DigitalInput semantic    :  24 bits
+    //
+    // Once Stage11C.6 has made the semantic consumer API available, rebuild
+    // only the DI bit counts and PLC I start addresses from DigitalInput
+    // descriptors.  This does NOT change Process Image / FMMU / PDO routing.
+    //
+    // Safety rule:
+    //     normalize only when EVERY existing PLC DI map has a compatible
+    //     byte-aligned DigitalInput descriptor at the same Process Image base.
+    //     Otherwise keep the legacy AutoMapIO result unchanged so startup
+    //     diagnostics can block the cutover rather than silently remapping.
+    // ========================================================================
+
+    if (m_pGenericReadMaster ==
+        nullptr ||
+        m_pIo ==
+        nullptr ||
+        m_inputMaps.empty())
+    {
+        return;
+    }
+
+
+    std::vector<DigitalMapItem>
+        normalizedInputMaps;
+
+
+    normalizedInputMaps.reserve(
+        m_inputMaps.size());
+
+
+    int nextPlcInputBit =
+        0;
+
+
+    bool normalizationPass =
+        true;
+
+
+    for (const auto& originalMap :
+        m_inputMaps)
+    {
+        if (originalMap.listIdx < 0 ||
+            originalMap.listIdx >=
+            static_cast<int>(
+                m_pIo->size()))
+        {
+            normalizationPass =
+                false;
+
+            break;
+        }
+
+
+        const auto& io =
+            (*m_pIo)[
+                static_cast<size_t>(
+                    originalMap.listIdx)];
+
+
+        int semanticOccurrence =
+            -1;
+
+
+        const auto* descriptor =
+            ResolveDigitalInputConsumerForSlave(
+                m_pGenericReadMaster,
+                io.slaveIndex,
+                semanticOccurrence);
+
+
+        const uint8_t* legacyInputBase =
+            static_cast<const uint8_t*>(
+                io.pInputLoc);
+
+
+        const bool descriptorCompatible =
+            descriptor != nullptr &&
+            descriptor->inputBitLength > 0U &&
+            descriptor->inputBitLength <= 64U &&
+            descriptor->inputBitShift == 0U &&
+            descriptor->pInputByteBase != nullptr &&
+            legacyInputBase != nullptr &&
+            descriptor->pInputByteBase ==
+            legacyInputBase;
+
+
+        if (!descriptorCompatible)
+        {
+            normalizationPass =
+                false;
+
+
+            DEBUG_PRINT(
+                "[PLC-SEMANTIC-DI-MAP-NORMALIZE] "
+                "LegacyList:%d | Slave:S%d | "
+                "EnvelopeBits:%d | SemanticOccurrence:%d | "
+                "SemanticBits:%u | Pointer:%s | "
+                "Result:KEEP_LEGACY_MAP\n",
+
+                originalMap.listIdx,
+
+                io.slaveIndex,
+
+                originalMap.bitCount,
+
+                semanticOccurrence,
+
+                descriptor != nullptr
+                ? (unsigned int)
+                descriptor->inputBitLength
+                : 0U,
+
+                descriptor != nullptr &&
+                legacyInputBase != nullptr &&
+                descriptor->pInputByteBase ==
+                legacyInputBase
+                ? "MATCH"
+                : "N/A");
+
+
+            break;
+        }
+
+
+        DigitalMapItem normalizedMap =
+            originalMap;
+
+
+        normalizedMap.bitCount =
+            static_cast<int>(
+                descriptor->inputBitLength);
+
+
+        normalizedMap.plcStartIndex =
+            nextPlcInputBit;
+
+
+        nextPlcInputBit +=
+            normalizedMap.bitCount;
+
+
+        normalizedInputMaps.push_back(
+            normalizedMap);
+
+
+        DEBUG_PRINT(
+            "[PLC-SEMANTIC-DI-MAP-NORMALIZE] "
+            "LegacyList:%d | Slave:S%d | UserOrder:%d | "
+            "EnvelopeBits:%d -> DigitalInputBits:%d | "
+            "SemanticOccurrence:%d | Resolved:%s | "
+            "PLC:I%d..I%d | Pointer:MATCH | Result:PASS\n",
+
+            originalMap.listIdx,
+
+            io.slaveIndex,
+
+            originalMap.userOrder,
+
+            originalMap.bitCount,
+
+            normalizedMap.bitCount,
+
+            semanticOccurrence,
+
+            descriptor->id[0] != '\0'
+            ? descriptor->id
+            : "N/A",
+
+            normalizedMap.plcStartIndex,
+
+            normalizedMap.plcStartIndex +
+            normalizedMap.bitCount -
+            1);
+    }
+
+
+    if (normalizationPass &&
+        normalizedInputMaps.size() ==
+        m_inputMaps.size())
+    {
+        m_inputMaps.swap(
+            normalizedInputMaps);
+
+
+        DEBUG_PRINT(
+            "[PLC-SEMANTIC-DI-MAP-NORMALIZE-RESULT] "
+            "Maps:%u | PLCBits:%d | Result:PASS | "
+            "Source:DIGITALINPUT_SEMANTIC | "
+            "ProcessImage:NO_CHANGE | FMMU:NO_CHANGE\n",
+
+            (unsigned int)
+            m_inputMaps.size(),
+
+            nextPlcInputBit);
+    }
+    else
+    {
+        DEBUG_PRINT(
+            "[PLC-SEMANTIC-DI-MAP-NORMALIZE-RESULT] "
+            "Maps:%u/%u | Result:SKIP | "
+            "LegacyAutoMap:PRESERVED | "
+            "ProcessImage:NO_CHANGE | FMMU:NO_CHANGE\n",
+
+            (unsigned int)
+            normalizedInputMaps.size(),
+
+            (unsigned int)
+            m_inputMaps.size());
+    }
 }
 
 
@@ -1376,44 +1667,25 @@ bool PlcCore::AuditGenericReadConsumerMapShadow()
             }
 
 
+            const auto& io =
+                (*m_pIo)[
+                    static_cast<size_t>(
+                        map.listIdx)];
+
+
             int semanticOccurrence =
-                0;
+                -1;
 
 
-            bool targetFound =
-                false;
+            const auto* descriptor =
+                ResolveDigitalInputConsumerForSlave(
+                    m_pGenericReadMaster,
+                    io.slaveIndex,
+                    semanticOccurrence);
 
 
-            for (int ioIndex = 0;
-                ioIndex <
-                static_cast<int>(
-                    m_pIo->size());
-                ++ioIndex)
-            {
-                const auto& io =
-                    (*m_pIo)[
-                        static_cast<size_t>(
-                            ioIndex)];
-
-
-                if (io.inBuffer.empty())
-                {
-                    continue;
-                }
-
-
-                if (ioIndex ==
-                    map.listIdx)
-                {
-                    targetFound =
-                        true;
-
-                    break;
-                }
-
-
-                semanticOccurrence++;
-            }
+            const bool targetFound =
+                descriptor != nullptr;
 
 
             if (!targetFound ||
@@ -1423,14 +1695,6 @@ bool PlcCore::AuditGenericReadConsumerMapShadow()
                 errors++;
                 continue;
             }
-
-
-            const auto* descriptor =
-                m_pGenericReadMaster->
-                ResolveCompositeReadConsumer(
-                    "DigitalInput",
-                    "",
-                    semanticOccurrence);
 
 
             uint64_t genericValue =
@@ -1856,54 +2120,36 @@ bool PlcCore::PrepareGenericInputLiveRoute()
         for (const auto& map :
             m_inputMaps)
         {
-            int semanticOccurrence =
-                0;
-
-
-            bool targetFound =
-                false;
-
-
-            for (int ioIndex = 0;
-                ioIndex <
+            if (map.listIdx < 0 ||
+                map.listIdx >=
                 static_cast<int>(
-                    m_pIo->size());
-                ++ioIndex)
+                    m_pIo->size()))
             {
-                const auto& io =
-                    (*m_pIo)[
-                        static_cast<size_t>(
-                            ioIndex)];
+                errors++;
 
-
-                if (io.inBuffer.empty())
-                {
-                    continue;
-                }
-
-
-                if (ioIndex ==
-                    map.listIdx)
-                {
-                    targetFound =
-                        true;
-
-                    break;
-                }
-
-
-                semanticOccurrence++;
+                break;
             }
 
 
+            const auto& io =
+                (*m_pIo)[
+                    static_cast<size_t>(
+                        map.listIdx)];
+
+
+            int semanticOccurrence =
+                -1;
+
+
             const auto* descriptor =
-                targetFound
-                ? m_pGenericReadMaster->
-                ResolveCompositeReadConsumer(
-                    "DigitalInput",
-                    "",
-                    semanticOccurrence)
-                : nullptr;
+                ResolveDigitalInputConsumerForSlave(
+                    m_pGenericReadMaster,
+                    io.slaveIndex,
+                    semanticOccurrence);
+
+
+            const bool targetFound =
+                descriptor != nullptr;
 
 
             if (!targetFound ||

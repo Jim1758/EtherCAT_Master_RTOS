@@ -182,6 +182,203 @@ void HomingManager::LinkPLCManager(
     m_plc = plc;
 }
 
+// ============================================================================
+// Stage NC-0.1F - HOME Motion Owner and RT Axis Command Mailbox
+// ============================================================================
+bool HomingManager::AcquireHomeMotionOwner() noexcept
+{
+    m_homeMotionLease = MotionOwnerLease{};
+    m_returnMotionOwner = MotionOwner::NONE;
+
+    const MotionOwnerLease currentLease = m_motion.GetMotionOwnerLease();
+
+    if (currentLease.owner == MotionOwner::NONE)
+    {
+        return m_motion.TryAcquireMotionOwner(
+            MotionOwner::HOME, m_homeMotionLease);
+    }
+
+    if (currentLease.owner == MotionOwner::HOME &&
+        m_motion.IsMotionOwnerLeaseCurrent(currentLease))
+    {
+        m_homeMotionLease = currentLease;
+        return true;
+    }
+
+    if (currentLease.owner == MotionOwner::AUTO ||
+        currentLease.owner == MotionOwner::MDI ||
+        currentLease.owner == MotionOwner::MANUAL_AUTO)
+    {
+        MotionOwnerLease homeLease{};
+        if (!m_motion.TryTransferMotionOwner(
+            currentLease, MotionOwner::HOME, homeLease))
+        {
+            return false;
+        }
+
+        m_returnMotionOwner = currentLease.owner;
+        m_homeMotionLease = homeLease;
+        return true;
+    }
+
+    return false;
+}
+
+void HomingManager::RestoreOrReleaseHomeMotionOwner() noexcept
+{
+    const MotionOwnerLease homeLease = m_homeMotionLease;
+    const MotionOwner returnOwner = m_returnMotionOwner;
+
+    if (!homeLease.IsValid())
+    {
+        m_homeMotionLease = MotionOwnerLease{};
+        m_returnMotionOwner = MotionOwner::NONE;
+        return;
+    }
+
+    if (!m_motion.IsMotionOwnerLeaseCurrent(homeLease))
+    {
+        // Safety / Reset already owns a newer Generation.
+        m_homeMotionLease = MotionOwnerLease{};
+        m_returnMotionOwner = MotionOwner::NONE;
+        for (int i = 0; i < HOME_AXIS_COUNT; ++i)
+        {
+            m_pendingProbeDisarmSequence[i] =
+                MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        }
+        return;
+    }
+
+    // A zero queue depth is not sufficient: RT may already have popped the
+    // command but not yet applied it. Wait for each exact result before
+    // changing Owner Generation.
+    for (int i = 0; i < HOME_AXIS_COUNT; ++i)
+    {
+        const MotionAxisCommandSequence sequence =
+            m_pendingProbeDisarmSequence[i];
+
+        if (sequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID)
+        {
+            continue;
+        }
+
+        MotionAxisCommandResult result{};
+        if (!m_motion.TryGetAxisCommandResult(sequence, result))
+        {
+            return;
+        }
+
+        m_pendingProbeDisarmSequence[i] =
+            MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+
+        if (result.resultType != MotionAxisCommandResultType::APPLIED)
+        {
+            m_hasError = true;
+            m_completed = false;
+            m_lastError = HomeErrorReason::REFERENCE_INVALID;
+            m_lastErrorAxis = result.axisIndex;
+
+            if (!AlarmManager::GetInstance().HasAlarm())
+            {
+                AlarmManager::GetInstance().Trigger(
+                    AlarmManager::HOME_MOTION_FAULT, 0, result.axisIndex);
+            }
+
+            m_motion.RequestEmergencyStopAllAxes();
+            if (m_nc != nullptr)
+            {
+                m_nc->ChangeState(NCState::ALARM);
+            }
+
+            m_homeMotionLease = MotionOwnerLease{};
+            m_returnMotionOwner = MotionOwner::NONE;
+            return;
+        }
+    }
+
+    if (returnOwner == MotionOwner::AUTO ||
+        returnOwner == MotionOwner::MDI ||
+        returnOwner == MotionOwner::MANUAL_AUTO)
+    {
+        MotionOwnerLease restoredLease{};
+        if (m_motion.TryTransferMotionOwner(
+            homeLease, returnOwner, restoredLease))
+        {
+            const bool adopted =
+                m_nc != nullptr &&
+                m_nc->AdoptProgramMotionLease(restoredLease);
+
+            if (!adopted)
+            {
+                // Do not leave an owner with no corresponding NC program lease.
+                m_motion.ReleaseMotionOwner(restoredLease);
+            }
+        }
+    }
+    else
+    {
+        m_motion.ReleaseMotionOwner(homeLease);
+    }
+
+    m_homeMotionLease = MotionOwnerLease{};
+    m_returnMotionOwner = MotionOwner::NONE;
+}
+
+
+MotionOwnerLease HomingManager::GetProbeCommandLease() const noexcept
+{
+    if (m_motion.IsMotionOwnerLeaseCurrent(m_homeMotionLease))
+    {
+        return m_homeMotionLease;
+    }
+
+    const MotionOwnerLease currentLease = m_motion.GetMotionOwnerLease();
+    if (currentLease.owner == MotionOwner::SAFETY &&
+        m_motion.IsMotionOwnerLeaseCurrent(currentLease))
+    {
+        return currentLease;
+    }
+
+    return MotionOwnerLease{};
+}
+
+bool HomingManager::QueueHomeStop(
+    int axisIndex, double decelerationTime) noexcept
+{
+    return m_motion.SubmitAxisStopMove(
+        axisIndex, decelerationTime, MotionCommandSource::HOME,
+        m_homeMotionLease);
+}
+
+bool HomingManager::QueueHomeVelocity(
+    int axisIndex, double velocity, double accelerationTime) noexcept
+{
+    return m_motion.SubmitAxisVelocityMove(
+        axisIndex, velocity, accelerationTime, MotionCommandSource::HOME,
+        m_homeMotionLease);
+}
+
+bool HomingManager::QueueHomeMove(
+    int axisIndex, double targetPosition, double targetVelocity,
+    double accelerationTime, double decelerationTime,
+    bool useShortestPath) noexcept
+{
+    return m_motion.SubmitAxisMoveToPosition(
+        axisIndex, targetPosition, targetVelocity, accelerationTime,
+        decelerationTime, useShortestPath, MotionCommandSource::HOME,
+        m_homeMotionLease);
+}
+
+bool HomingManager::QueueHomeProbeFunction(
+    int axisIndex, uint16_t value,
+    MotionAxisCommandSequence* outSequence) noexcept
+{
+    const MotionOwnerLease lease = GetProbeCommandLease();
+    if (!lease.IsValid()) return false;
+    return m_motion.SubmitDriveTouchProbeFunction(
+        axisIndex, value, lease, outSequence);
+}
+
 
 // ============================================================
 // Start HOME Request
@@ -230,6 +427,14 @@ bool HomingManager::Start(
     m_currentOrder =
         -1;
 
+    for (int i = 0; i < HOME_AXIS_COUNT; ++i)
+    {
+        m_pendingApplyHomeSequence[i] =
+            MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        m_pendingProbeDisarmSequence[i] =
+            MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+    }
+
 
     // --------------------------------------------------------
     // axisMask == 0
@@ -265,10 +470,17 @@ bool HomingManager::Start(
     // 驗證並初始化全部 Selected Axis。
     // --------------------------------------------------------
 
+    if (!AcquireHomeMotionOwner())
+    {
+        m_lastError = HomeErrorReason::MOTION_BUSY;
+        return false;
+    }
+
     if (!ValidateAndInitializeRequest(
         request,
         selectedAxisMask))
     {
+        RestoreOrReleaseHomeMotionOwner();
         return false;
     }
 
@@ -312,6 +524,7 @@ bool HomingManager::Start(
         m_lastError =
             HomeErrorReason::INVALID_CONFIG;
 
+        RestoreOrReleaseHomeMotionOwner();
         return false;
     }
 
@@ -332,6 +545,12 @@ void HomingManager::Process(
 {
     if (!m_active)
     {
+        // Completion may leave the final Probe Disarm in the mailbox.
+        // Retry the owner hand-off on each 10 ms pass until RT consumes it.
+        if (m_homeMotionLease.IsValid())
+        {
+            RestoreOrReleaseHomeMotionOwner();
+        }
         return;
     }
 
@@ -535,6 +754,15 @@ void HomingManager::Cancel()
 
 void HomingManager::Reset()
 {
+    RestoreOrReleaseHomeMotionOwner();
+    for (int i = 0; i < HOME_AXIS_COUNT; ++i)
+    {
+        m_pendingApplyHomeSequence[i] =
+            MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        m_pendingProbeDisarmSequence[i] =
+            MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+    }
+
     m_sequenceMode =
         HomeSequenceMode::SIMULTANEOUS;
 
@@ -1631,9 +1859,7 @@ void HomingManager::ProcessCancel()
             if (axis.state !=
                 MotionState::MotionState_STOPPING)
             {
-                m_motion.StopMove(
-                    axis,
-                    dec);
+                QueueHomeStop(i, dec);
             }
         }
     }
@@ -1644,6 +1870,8 @@ void HomingManager::ProcessCancel()
         return;
     }
 
+
+    bool allDisarmQueued = true;
 
     for (int i = 0;
         i < HOME_AXIS_COUNT;
@@ -1664,9 +1892,14 @@ void HomingManager::ProcessCancel()
             continue;
         }
 
-        DisarmDriveProbe(
+        if (!DisarmDriveProbe(
             i,
-            axis);
+            axis,
+            true))
+        {
+            allDisarmQueued = false;
+            continue;
+        }
 
         axis.homeRuntime.active =
             false;
@@ -1691,6 +1924,11 @@ void HomingManager::ProcessCancel()
     }
 
 
+    if (!allDisarmQueued)
+    {
+        return;
+    }
+
     m_activeAxisMask =
         0;
 
@@ -1714,6 +1952,8 @@ void HomingManager::ProcessCancel()
 
     m_currentOrder =
         -1;
+
+    RestoreOrReleaseHomeMotionOwner();
 }
 
 
@@ -1787,9 +2027,7 @@ void HomingManager::ProcessHold(
             if (axis.state !=
                 MotionState::MotionState_STOPPING)
             {
-                m_motion.StopMove(
-                    axis,
-                    GetHoldDecTime(axis));
+                QueueHomeStop(i, GetHoldDecTime(axis));
             }
         }
     }
@@ -2419,31 +2657,56 @@ void HomingManager::ResetDriveProbeRuntime(
 }
 
 
-void HomingManager::DisarmDriveProbe(
+bool HomingManager::DisarmDriveProbe(
     int axisIndex,
-    AxisContext& axis)
+    AxisContext& axis,
+    bool trackForOwnerRelease)
 {
     if (!UsesDriveTouchProbe(axis))
     {
-        return;
+        return true;
     }
 
     if (axis.home.driveProbeArmMode !=
         HomeDriveProbeArmMode::CONTROLLER_60B8)
     {
-        return;
+        return true;
     }
 
-    if (m_motion.SetDriveTouchProbeFunction(
-        axisIndex,
-        axis.home.driveProbeDisarmValue))
+    if (trackForOwnerRelease &&
+        axisIndex >= 0 &&
+        axisIndex < HOME_AXIS_COUNT &&
+        m_pendingProbeDisarmSequence[axisIndex] !=
+        MOTION_AXIS_COMMAND_SEQUENCE_INVALID)
     {
-        axis.homeRuntime.driveProbeLastFunction =
-            axis.home.driveProbeDisarmValue;
-
-        axis.homeRuntime.driveProbeDisarmedAfterCapture =
-            true;
+        return true;
     }
+
+    MotionAxisCommandSequence sequence =
+        MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+
+    if (!QueueHomeProbeFunction(
+        axisIndex,
+        axis.home.driveProbeDisarmValue,
+        trackForOwnerRelease ? &sequence : nullptr))
+    {
+        return false;
+    }
+
+    if (trackForOwnerRelease &&
+        axisIndex >= 0 &&
+        axisIndex < HOME_AXIS_COUNT)
+    {
+        m_pendingProbeDisarmSequence[axisIndex] = sequence;
+    }
+
+    axis.homeRuntime.driveProbeLastFunction =
+        axis.home.driveProbeDisarmValue;
+
+    axis.homeRuntime.driveProbeDisarmedAfterCapture =
+        true;
+
+    return true;
 }
 
 
@@ -2575,7 +2838,7 @@ bool HomingManager::ProcessDriveProbeArm(
 
     case HomeDriveProbePhase::WRITE_DISARM:
 
-        if (!m_motion.SetDriveTouchProbeFunction(
+        if (!QueueHomeProbeFunction(
             axisIndex,
             axis.home.driveProbeDisarmValue))
         {
@@ -2648,7 +2911,7 @@ bool HomingManager::ProcessDriveProbeArm(
 
     case HomeDriveProbePhase::WRITE_ARM:
 
-        if (!m_motion.SetDriveTouchProbeFunction(
+        if (!QueueHomeProbeFunction(
             axisIndex,
             axis.home.driveProbeArmValue))
         {
@@ -3757,9 +4020,7 @@ void HomingManager::ProcessAxis(
             if (axis.state ==
                 MotionState::MotionState_VELOCITY)
             {
-                m_motion.StopMove(
-                    axis,
-                    axis.home.switchStopDecTime);
+                QueueHomeStop(axisIndex, axis.home.switchStopDecTime);
             }
 
 
@@ -3881,10 +4142,8 @@ void HomingManager::ProcessAxis(
         }
 
 
-        m_motion.VelocityMove(
-            axis,
-            searchVelocity,
-            axis.home.searchAccTime);
+        QueueHomeVelocity(
+            axisIndex, searchVelocity, axis.home.searchAccTime);
 
 
         return;
@@ -3898,7 +4157,7 @@ void HomingManager::ProcessAxis(
     {
         if (axis.state == MotionState::MotionState_VELOCITY)
         {
-            m_motion.StopMove(axis, axis.home.switchStopDecTime);
+            QueueHomeStop(axisIndex, axis.home.switchStopDecTime);
             return;
         }
 
@@ -3979,12 +4238,13 @@ void HomingManager::ProcessAxis(
                     return;
                 }
 
-                m_motion.MoveToPosition(
-                    axis,
-                    axis.homeRuntime.stateTargetPulse,
-                    axis.home.backoffSpeed_PPS,
-                    axis.home.backoffAccTime,
-                    axis.home.backoffDecTime);
+                if (!QueueHomeMove(
+                    axisIndex, axis.homeRuntime.stateTargetPulse,
+                    axis.home.backoffSpeed_PPS, axis.home.backoffAccTime,
+                    axis.home.backoffDecTime, axis.useShortestPath))
+                {
+                    return;
+                }
 
                 axis.homeRuntime.motionCommandIssued =
                     true;
@@ -4034,19 +4294,19 @@ void HomingManager::ProcessAxis(
                     SetAxisError(axisIndex, axis, HomeErrorReason::MOTION_FAULT);
                     return;
                 }
-                m_motion.VelocityMove(axis, dir * axis.home.backoffSpeed_PPS, axis.home.backoffAccTime);
+                QueueHomeVelocity(axisIndex, dir * axis.home.backoffSpeed_PPS, axis.home.backoffAccTime);
                 return;
             }
 
             axis.homeRuntime.dogReleased = true;
             axis.homeRuntime.hardLimitReleased = !axis.hardLimitPositive && !axis.hardLimitNegative;
-            if (axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.home.backoffDecTime);
+            if (axis.state == MotionState::MotionState_VELOCITY) QueueHomeStop(axisIndex, axis.home.backoffDecTime);
             return;
         }
 
         if (axis.state != MotionState::MotionState_IDLE)
         {
-            if (axis.state != MotionState::MotionState_STOPPING) m_motion.StopMove(axis, axis.home.backoffDecTime);
+            if (axis.state != MotionState::MotionState_STOPPING) QueueHomeStop(axisIndex, axis.home.backoffDecTime);
             return;
         }
 
@@ -4071,12 +4331,13 @@ void HomingManager::ProcessAxis(
 
         if (!axis.homeRuntime.motionCommandIssued)
         {
-            m_motion.MoveToPosition(
-                axis,
-                axis.homeRuntime.stateTargetPulse,
-                axis.home.backoffSpeed_PPS,
-                axis.home.backoffAccTime,
-                axis.home.backoffDecTime);
+            if (!QueueHomeMove(
+                axisIndex, axis.homeRuntime.stateTargetPulse,
+                axis.home.backoffSpeed_PPS, axis.home.backoffAccTime,
+                axis.home.backoffDecTime, axis.useShortestPath))
+            {
+                return;
+            }
 
             axis.homeRuntime.motionCommandIssued =
                 true;
@@ -4249,7 +4510,7 @@ void HomingManager::ProcessAxis(
         {
             axis.homeRuntime.capturedReferencePulse = captured;
             axis.homeRuntime.referenceDetected = true;
-            if (axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.home.indexStopDecTime);
+            if (axis.state == MotionState::MotionState_VELOCITY) QueueHomeStop(axisIndex, axis.home.indexStopDecTime);
             EnterState(axis, HomeState::INDEX_DECEL_STOP);
             return;
         }
@@ -4290,8 +4551,8 @@ void HomingManager::ProcessAxis(
         }
 
 
-        m_motion.VelocityMove(
-            axis,
+        QueueHomeVelocity(
+            axisIndex,
             axis.home.indexSearchSpeed_PPS *
             static_cast<double>(indexDirection),
             axis.home.indexSearchAccTime);
@@ -4310,7 +4571,7 @@ void HomingManager::ProcessAxis(
     {
         if (axis.state == MotionState::MotionState_VELOCITY)
         {
-            m_motion.StopMove(axis, axis.home.indexStopDecTime);
+            QueueHomeStop(axisIndex, axis.home.indexStopDecTime);
             return;
         }
         if (axis.state == MotionState::MotionState_STOPPING) return;
@@ -4333,11 +4594,34 @@ void HomingManager::ProcessAxis(
             SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
             return;
         }
-        if (!m_motion.ApplyMachineHome(axis, axis.homeRuntime.capturedReferencePulse, axis.home.homeOffset_unit))
+        MotionAxisCommandSequence& pendingSequence =
+            m_pendingApplyHomeSequence[axisIndex];
+
+        if (pendingSequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID)
+        {
+            if (!m_motion.SubmitApplyMachineHome(
+                axisIndex, axis.homeRuntime.capturedReferencePulse,
+                axis.home.homeOffset_unit, m_homeMotionLease,
+                pendingSequence))
+            {
+                SetAxisError(axisIndex, axis, HomeErrorReason::MOTION_FAULT);
+            }
+            return;
+        }
+
+        MotionAxisCommandResult applyResult{};
+        if (!m_motion.TryGetAxisCommandResult(pendingSequence, applyResult))
+        {
+            return;
+        }
+
+        pendingSequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        if (applyResult.resultType != MotionAxisCommandResultType::APPLIED)
         {
             SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
             return;
         }
+
         axis.isHomed = true;
         if (m_nc != nullptr)
             m_nc->CoordSys.commandedMCS[axisIndex] = axis.currentActPos * (axis.finalLead / axis.resolution_PPR);
@@ -4397,12 +4681,13 @@ void HomingManager::ProcessAxis(
                 return;
             }
 
-            m_motion.MoveToPosition(
-                axis,
-                axis.homeRuntime.stateTargetPulse,
-                axis.home.moveToZeroSpeed_PPS,
-                axis.home.moveToZeroAccTime,
-                axis.home.moveToZeroDecTime);
+            if (!QueueHomeMove(
+                axisIndex, axis.homeRuntime.stateTargetPulse,
+                axis.home.moveToZeroSpeed_PPS, axis.home.moveToZeroAccTime,
+                axis.home.moveToZeroDecTime, axis.useShortestPath))
+            {
+                return;
+            }
 
             axis.homeRuntime.motionCommandIssued =
                 true;
@@ -4429,9 +4714,14 @@ void HomingManager::CompleteAxis(
     int axisIndex,
     AxisContext& axis)
 {
-    DisarmDriveProbe(
+    if (!DisarmDriveProbe(
         axisIndex,
-        axis);
+        axis,
+        true))
+    {
+        // Mailbox full: keep this axis at the completion point and retry.
+        return;
+    }
 
 
     axis.homeRuntime.active =
@@ -4498,6 +4788,11 @@ void HomingManager::SetAxisError(
         m_lastError ==
         HomeErrorReason::NONE;
 
+    const int immediateAlarmCode = GetHomeAlarmCode(error);
+    if (immediateAlarmCode != 0)
+    {
+        m_motion.RequestEmergencyStopAllAxes();
+    }
 
     DisarmDriveProbe(
         axisIndex,
@@ -4660,9 +4955,11 @@ void HomingManager::SetAxisError(
     // 只要是 Alarm 類型錯誤，一律全軸急停。
     if (alarmCode != 0)
     {
-        m_motion.EmergencyStopAllAxes();
+        m_motion.RequestEmergencyStopAllAxes();
         if (m_nc != nullptr) m_nc->ChangeState(NCState::ALARM);
     }
+
+    RestoreOrReleaseHomeMotionOwner();
 }
 
 
@@ -4703,6 +5000,8 @@ void HomingManager::CompleteRequest()
 
     m_currentOrder =
         -1;
+
+    RestoreOrReleaseHomeMotionOwner();
 }
 
 

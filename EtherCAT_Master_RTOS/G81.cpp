@@ -26,7 +26,7 @@ namespace GCodeHandlers
             if ((sequence != 0 && sequence != 1) || std::abs(p - static_cast<double>(sequence)) > 1.0e-9)
             {
                 AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
-                nc->GetMotion().EmergencyStopAllAxes();
+                nc->GetMotion().RequestEmergencyStopAllAxes();
                 nc->ChangeState(NCState::ALARM);
                 return [](NCManager*) { return true; };
             }
@@ -47,7 +47,7 @@ namespace GCodeHandlers
         if (hasAxisWord && axisMask == 0)
         {
             AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
-            nc->GetMotion().EmergencyStopAllAxes();
+            nc->GetMotion().RequestEmergencyStopAllAxes();
             nc->ChangeState(NCState::ALARM);
             return [](NCManager*) { return true; };
         }
@@ -64,7 +64,7 @@ namespace GCodeHandlers
                 : AlarmManager::HOME_INVALID_CONFIG;
             if (!AlarmManager::GetInstance().HasAlarm())
                 AlarmManager::GetInstance().Trigger(alarmCode, 0, nc->Homing.GetLastErrorAxis());
-            nc->GetMotion().EmergencyStopAllAxes();
+            nc->GetMotion().RequestEmergencyStopAllAxes();
             nc->ChangeState(NCState::ALARM);
             return [](NCManager*) { return true; };
         }

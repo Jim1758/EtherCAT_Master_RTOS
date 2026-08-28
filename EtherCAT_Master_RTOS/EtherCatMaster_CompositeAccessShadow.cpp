@@ -2950,19 +2950,21 @@ bool EtherCatMaster::AuditRuntimeCompositeReadConsumerBridgeShadow()
 
 
     // ------------------------------------------------------------------------
-    // 3. Future semantic key not present on current hardware:
+    // 3. Negative semantic lookup:
     //
-    //     PositionFeedback / X / 0
+    //     __OSCARMAX_NEGATIVE_LOOKUP__ / __NO_AXIS__ / 9999
     //
-    // A clean "not found" is correct.  No fallback to ProductCode.
+    // Use a reserved test-only key that can never collide with a real future
+    // EtherCAT application binding.  A clean "not found" is correct.
+    // No fallback to ProductCode is allowed.
     // ------------------------------------------------------------------------
 
     {
         const auto* future =
             ResolveCompositeReadConsumerShadow(
-                "PositionFeedback",
-                "X",
-                0);
+                "__OSCARMAX_NEGATIVE_LOOKUP__",
+                "__NO_AXIS__",
+                9999);
 
 
         semanticLookups++;
@@ -2978,7 +2980,7 @@ bool EtherCatMaster::AuditRuntimeCompositeReadConsumerBridgeShadow()
 
         DEBUG_PRINT(
             "[COMPOSITE-CONSUMER-BRIDGE-FUTURE] "
-            "Key:PositionFeedback/X/0 | "
+            "Key:__OSCARMAX_NEGATIVE_LOOKUP__/__NO_AXIS__/9999 | "
             "Present:%s | Expected:NOT_PRESENT | Result:%s\n",
 
             future != nullptr
@@ -3730,15 +3732,17 @@ bool EtherCatMaster::AuditRuntimeCompositeReadConsumerLiveRoute()
 
 
     // ------------------------------------------------------------------------
-    // Future PositionFeedback must cleanly remain absent.
+    // Negative semantic lookup must cleanly remain absent.
+    // Use the same reserved test-only key as the Stage11C.5 shadow audit so
+    // future real bindings cannot invalidate this safety check.
     // ------------------------------------------------------------------------
 
     {
         const auto* future =
             ResolveCompositeReadConsumer(
-                "PositionFeedback",
-                "X",
-                0);
+                "__OSCARMAX_NEGATIVE_LOOKUP__",
+                "__NO_AXIS__",
+                9999);
 
 
         semanticLookups++;
@@ -3754,7 +3758,7 @@ bool EtherCatMaster::AuditRuntimeCompositeReadConsumerLiveRoute()
 
         DEBUG_PRINT(
             "[COMPOSITE-CONSUMER-LIVE-FUTURE] "
-            "Key:PositionFeedback/X/0 | Present:%s | "
+            "Key:__OSCARMAX_NEGATIVE_LOOKUP__/__NO_AXIS__/9999 | Present:%s | "
             "Expected:NOT_PRESENT | Result:%s\n",
 
             future != nullptr

@@ -8,9 +8,29 @@
 
 // 預設最大呼叫層數
 constexpr int MAX_MACRO_DEPTH = 8;
-constexpr int MAX_LOCAL_VARS = 100;   // 區域變數 #1~#100
-constexpr int MAX_GLOBAL_VARS = 1000;  // 全域變數 @1~@500 (或 #501~#1000)
-constexpr int MAX_SYS_VARS = 1000;    // 系統變數 $1~$1000
+constexpr int MAX_LOCAL_VARS = 100;    // 區域變數 #1~#100
+constexpr int MAX_GLOBAL_VARS = 1000;  // 全域變數 @1~@1000
+constexpr int MAX_SYS_VARS = 1000;     // 系統變數 $1~$1000
+
+namespace MacroVariableRules
+{
+    inline bool IsValidIndex(char prefix, int index) noexcept
+    {
+        if (prefix == '#')
+        {
+            return index >= 1 && index <= MAX_LOCAL_VARS;
+        }
+        if (prefix == '@')
+        {
+            return index >= 1 && index <= MAX_GLOBAL_VARS;
+        }
+        if (prefix == '$')
+        {
+            return index >= 1 && index <= MAX_SYS_VARS;
+        }
+        return false;
+    }
+}
 
 class MacroEngine {
 public:
@@ -54,7 +74,7 @@ private:
     std::vector<std::vector<double>> m_localStack;
     int m_callDepth = 0; // 目前深度 (0 = 主程式)
 
-    // 全域變數 (@)
+    // 全域變數 (@1~@1000)
     std::vector<double> m_globalVars;
 
     // 系統變數 ($)

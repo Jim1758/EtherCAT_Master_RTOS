@@ -355,4 +355,311 @@ struct SHM_Data
     SHM_PLC_Diagnostics PLC_Diagnostics;
 };
 
+
+// ============================================================================
+// Stage 12A.1 - OSCARMAX EtherCAT Online Diagnosis Shared Memory Contract
+// ============================================================================
+//
+// 目的：
+//     提供 ENI Tool / Commissioning Tool 一條「獨立於 EDM HMI」的唯讀診斷通道。
+//
+// Shared Memory 名稱（Stage 12A.2 建立）：
+//     OSCARMAX_ECAT_DIAG
+//
+// 設計原則：
+//   1. 不加入 SHM_Data，避免改變既有 EDM_SINKER_MODE Shared Memory ABI。
+//   2. 這個區塊只做 Master -> Windows 診斷廣播；Stage 12A 不接受控制命令。
+//   3. 全部使用固定寬度型別，不使用 bool / pointer / STL，方便 C# 精確對齊。
+//   4. 使用 Sequence 做簡單 seqlock：
+//        Producer 寫入前 Sequence++（變奇數）
+//        Producer 完成後 Sequence++（變偶數）
+//      Reader 只有在前後 Sequence 相同且為偶數時才採用 snapshot。
+//   5. ProcessImage 為 Master 當下完整 Logical Process Image snapshot，
+//      ENI Tool 依 Runtime XML / Composite Binding 自己解碼 Semantic Value。
+//
+// 注意：
+//     這裡只定義 ABI；Stage 12A.1 不建立 Shared Memory、不改 Runtime 行為。
+// ============================================================================
+
+static constexpr uint32_t SHM_ECAT_DIAG_MAGIC = 0x54414345u; // little-endian "ECAT"
+static constexpr uint16_t SHM_ECAT_DIAG_VERSION_MAJOR = 1;
+static constexpr uint16_t SHM_ECAT_DIAG_VERSION_MINOR = 0;
+static constexpr uint32_t SHM_ECAT_DIAG_MAX_SLAVES = 128;
+static constexpr uint32_t SHM_ECAT_DIAG_PROCESS_IMAGE_CAPACITY = 4096;
+
+// Master / Runtime 即時健康狀態。
+struct SHM_ECAT_DiagMasterStatus
+{
+    uint32_t Magic;               // SHM_ECAT_DIAG_MAGIC
+    uint16_t VersionMajor;        // ABI major
+    uint16_t VersionMinor;        // ABI minor
+    uint32_t StructSize;          // sizeof(SHM_ECAT_DiagData)
+
+    uint32_t Sequence;            // seqlock sequence，偶數=穩定 snapshot
+    uint32_t Heartbeat;           // 每次 publish +1
+    uint64_t PublishCount;        // 64-bit 累積 publish 次數
+
+    uint32_t CycleTimeNs;         // EtherCAT cycle，例如 250000 ns
+    uint32_t ProcessImageBytes;   // 當下有效 Process Image bytes
+    uint32_t ProcessImageCapacity;// 固定 = 4096
+
+    uint16_t SlaveCount;          // 實際在線 / Runtime slave count
+    uint16_t MasterState;         // EtherCAT AL state，例如 0x0008 = OP
+    uint16_t RuntimeStage;        // EtherCatRuntimeStage（原始 enum 數值）
+    uint16_t RuntimeErrorCode;    // Runtime lifecycle error code
+
+    int32_t ExpectedWkc;          // Runtime XML / topology 計算值
+    int32_t ActualLrwWkc;         // 最近一次 LRW WKC
+    int32_t DcWkc;                // 最近一次 DC datagram WKC
+
+    uint32_t RxRecentTimeout;     // Recent timeout window
+    uint32_t RxTotalHardTimeout;  // 累積 hard timeout
+    uint32_t RxConsecutiveTimeout;// current consecutive timeout
+    uint32_t RxRecoveryCount;     // recovery after timeout
+    uint32_t RxSkipCount;         // skipped cycle / receive
+    uint32_t RxSoftLateCount;     // soft late count
+    uint32_t QpcFailCount;        // QPC / timer failure count
+
+    int64_t DcPhaseErrorNs;       // 最近一次 phase error
+    int32_t DcDriftState;         // DC drift controller state
+    int32_t DcRealFfState;        // Real FF state
+    int32_t DcPhasePState;        // Phase-P state
+
+    uint16_t DcReferenceSlave;    // 0-based slave index，0xFFFF = none
+    uint16_t DcReferenceConfigAddr;
+
+    uint8_t MasterReady;          // startup READY
+    uint8_t RuntimeRunning;       // runtime lifecycle RUNNING
+    uint8_t ProcessImageValid;    // Process Image snapshot valid
+    uint8_t LrwHealthy;           // ActualLrwWkc == ExpectedWkc
+    uint8_t RxHealthy;            // RX gate healthy
+    uint8_t DcHealthy;            // DC gate healthy
+    uint8_t DcPhaseGood;          // phase good
+    uint8_t DcGateOpen;           // DC gate open
+    uint8_t DcOffsetSaturated;    // offset saturation
+    uint8_t DcTripMask;           // existing DC trip mask
+    uint8_t UnifiedRcReady;       // Stage 11F.1 Ready
+    uint8_t UnifiedRcReleased;    // Stage 11F.1 Released
+
+    uint8_t Reserved8[20];
+    uint32_t Reserved32[16];
+};
+
+// 每一顆 EtherCAT Slave 的 Online snapshot。
+struct SHM_ECAT_DiagSlaveStatus
+{
+    uint16_t Position;            // 0-based topology position
+    uint16_t ConfiguredAddress;   // station / configured address
+
+    uint32_t VendorId;
+    uint32_t ProductCode;
+    uint32_t Revision;
+
+    uint16_t AlState;             // INIT/PREOP/SAFEOP/OP
+    uint16_t AlStatusCode;        // ESC AL Status Code，0 = no error
+
+    int32_t OutputOffset;         // Logical Process Image byte offset，-1 = none
+    uint16_t OutputBytes;
+    int32_t InputOffset;          // Logical Process Image byte offset，-1 = none
+    uint16_t InputBytes;
+
+    uint16_t SmCount;
+    uint16_t FmmuCount;
+
+    uint8_t HasMailbox;
+    uint8_t DcEnabled;
+    uint8_t IsDcReference;
+    uint8_t LinkUp;
+
+    uint32_t RxErrorCount;        // Stage 12E 可填 ESC error counters
+    uint32_t LostLinkCount;       // Stage 12E 可填 ESC lost-link counters
+
+    // Runtime XML / topology 顯示名稱。
+    // UTF-8 / ASCII；未使用區域必須為 0。
+    char Name[64];
+
+    uint8_t Reserved[16];
+};
+
+// 獨立 Shared Memory 的完整資料區。
+struct SHM_ECAT_DiagData
+{
+    SHM_ECAT_DiagMasterStatus Master;
+
+    SHM_ECAT_DiagSlaveStatus Slaves[SHM_ECAT_DIAG_MAX_SLAVES];
+
+    // 完整 Logical Process Image。
+    // ENI Tool 不依賴 C++ 特定 Device struct，直接依 Runtime XML Descriptor 解碼。
+    uint8_t ProcessImage[SHM_ECAT_DIAG_PROCESS_IMAGE_CAPACITY];
+};
+
+// ABI 安全檢查。
+//
+// Visual Studio IntelliSense 有時會在 #pragma pack(push, 1) 的大型 ABI
+// 結構上錯誤計算 sizeof，產生 E1574 假錯誤。
+// __INTELLISENSE__ 只在 IntelliSense parser 中定義；真正 MSVC Build
+// 仍會執行以下 static_assert，因此 ABI 保護完全保留。
+#if !defined(__INTELLISENSE__)
+static_assert(
+    sizeof(SHM_ECAT_DiagMasterStatus) == 208,
+    "SHM_ECAT_DiagMasterStatus ABI changed; update ENI Tool C# contract.");
+
+static_assert(
+    sizeof(SHM_ECAT_DiagSlaveStatus) == 128,
+    "SHM_ECAT_DiagSlaveStatus ABI changed; update ENI Tool C# contract.");
+
+static_assert(
+    sizeof(SHM_ECAT_DiagData) == 20688,
+    "SHM_ECAT_DiagData ABI changed; update ENI Tool C# contract.");
+#endif
+
+static_assert(
+    SHM_ECAT_DIAG_PROCESS_IMAGE_CAPACITY >= 1514,
+    "Diagnostic Process Image capacity must cover at least one full EtherCAT frame budget.");
+
+
+// ============================================================================
+// Stage 12F.3B1 - OSCARMAX EtherCAT Service Shared Memory Contract
+// ============================================================================
+//
+// Shared Memory name (created in Stage 12F.3B2):
+//     OSCARMAX_ECAT_SERVICE
+//
+// Purpose:
+//     Windows ENI Tool <-> RTX64 Master request / response channel for
+//     non-cyclic EtherCAT engineering services such as CoE / SDO.
+//
+// Design rules:
+//   1. This contract is NOT part of SHM_Data and therefore does not change the
+//      existing EDM_SINKER_MODE ABI.
+//   2. It is also separate from OSCARMAX_ECAT_DIAG, which remains read-only.
+//   3. Windows never sends EtherCAT frames directly. The RTX64 service bridge
+//      validates the request and forwards it to the existing PDO-owner async
+//      command slot.
+//   4. One outstanding command at a time. This is intentional for engineering
+//      / commissioning use and keeps mailbox ownership deterministic.
+//   5. Request publication protocol:
+//        - Client writes all request fields first.
+//        - Client publishes RequestId LAST.
+//        - Server processes a RequestId different from LastProcessedRequestId.
+//      Response publication protocol:
+//        - Server writes all response fields first.
+//        - Server publishes ResponseId LAST.
+//        - Client accepts a response only when ResponseId == RequestId.
+//   6. No bool / pointer / STL types. Pack=1 and fixed-width integers only.
+//   7. Stage 12F.3B starts with SDO READ. SDO WRITE is reserved in this same
+//      ABI so Safe Write can be added later without another shared-memory ABI
+//      change.
+//
+// IMPORTANT:
+//     SlavePosition is ZERO-BASED and matches EtherCatMaster::ecx_SDOread /
+//     ecx_SDOwrite slave_pos semantics (S4 in an 8-slave topology => 4).
+// ============================================================================
+
+static constexpr uint32_t SHM_ECAT_SERVICE_MAGIC = 0x53414345u; // "ECAS"
+static constexpr uint16_t SHM_ECAT_SERVICE_VERSION_MAJOR = 1;
+static constexpr uint16_t SHM_ECAT_SERVICE_VERSION_MINOR = 1;
+
+// Operation values shared with the C# client.
+static constexpr uint32_t SHM_ECAT_SERVICE_OP_NONE = 0u;
+static constexpr uint32_t SHM_ECAT_SERVICE_OP_SDO_READ = 1u;
+static constexpr uint32_t SHM_ECAT_SERVICE_OP_SDO_WRITE = 2u;
+
+// Stage 12F.3D.1 - Safe SDO Write authorization contract.
+//
+// SDO WRITE is accepted by the RTX64 bridge only when BOTH conditions are met:
+//   1) Flags contains SHM_ECAT_SERVICE_FLAG_EXPERT_WRITE
+//   2) RequestReserved[0] equals SHM_ECAT_SERVICE_WRITE_CONFIRM_MAGIC
+//
+// This is intentionally separate from the Windows UI unlock timer.  The UI
+// still performs the human-facing Expert Write unlock / confirmation, while
+// this token prevents an accidental or stale request from becoming a mailbox
+// write merely because Operation happens to contain SDO_WRITE.
+//
+// The ABI size does not change.  Existing v1.0 reserved fields are promoted
+// to defined v1.1 semantics.
+static constexpr uint32_t SHM_ECAT_SERVICE_FLAG_EXPERT_WRITE = 0x00000001u;
+static constexpr uint32_t SHM_ECAT_SERVICE_ALLOWED_FLAGS =
+SHM_ECAT_SERVICE_FLAG_EXPERT_WRITE;
+
+// ASCII-ish guard token: "SDOW" in little-endian memory representation.
+static constexpr uint32_t SHM_ECAT_SERVICE_WRITE_CONFIRM_MAGIC = 0x574F4453u;
+
+// ResultCode values. WKC is reported separately.
+static constexpr int32_t SHM_ECAT_SERVICE_RESULT_NONE = 0;
+static constexpr int32_t SHM_ECAT_SERVICE_RESULT_SUCCESS = 1;
+static constexpr int32_t SHM_ECAT_SERVICE_RESULT_INVALID_REQUEST = -1;
+static constexpr int32_t SHM_ECAT_SERVICE_RESULT_BUSY = -2;
+static constexpr int32_t SHM_ECAT_SERVICE_RESULT_TIMEOUT = -3;
+static constexpr int32_t SHM_ECAT_SERVICE_RESULT_WKC_ERROR = -4;
+static constexpr int32_t SHM_ECAT_SERVICE_RESULT_UNSUPPORTED = -5;
+static constexpr int32_t SHM_ECAT_SERVICE_RESULT_NO_MAILBOX = -6;
+static constexpr int32_t SHM_ECAT_SERVICE_RESULT_RUNTIME_NOT_READY = -7;
+
+// Service-server state exposed to ENI Tool.
+static constexpr uint32_t SHM_ECAT_SERVICE_SERVER_OFFLINE = 0u;
+static constexpr uint32_t SHM_ECAT_SERVICE_SERVER_READY = 1u;
+static constexpr uint32_t SHM_ECAT_SERVICE_SERVER_PROCESSING = 2u;
+static constexpr uint32_t SHM_ECAT_SERVICE_SERVER_FAULT = 3u;
+
+struct SHM_ECAT_ServiceData
+{
+    // ---------------------------------------------------------------------
+    // Server-owned header / statistics (48 B)
+    // ---------------------------------------------------------------------
+    uint32_t Magic;                  // SHM_ECAT_SERVICE_MAGIC
+    uint16_t VersionMajor;
+    uint16_t VersionMinor;
+    uint32_t StructSize;             // sizeof(SHM_ECAT_ServiceData)
+
+    uint32_t ServerHeartbeat;        // supervisory service loop heartbeat
+    uint32_t ServerState;            // SHM_ECAT_SERVICE_SERVER_*
+    uint32_t LastProcessedRequestId; // last request consumed by RTX64
+
+    uint32_t SdoReadCount;           // completed SDO read requests
+    uint32_t SdoWriteCount;          // future Safe Write requests
+    uint32_t ErrorCount;             // rejected / failed service requests
+
+    uint32_t HeaderReserved[3];
+
+    // ---------------------------------------------------------------------
+    // Client-owned request (48 B)
+    // ---------------------------------------------------------------------
+    // RequestId MUST be published last by the Windows client.
+    uint32_t RequestId;
+    uint32_t Operation;              // SHM_ECAT_SERVICE_OP_*
+
+    uint16_t SlavePosition;          // zero-based topology position
+    uint16_t Index;                  // CoE object index, e.g. 0x6041
+    uint8_t  SubIndex;               // CoE object sub-index
+    uint8_t  CompleteAccess;         // 0 = normal; non-zero reserved/future
+    uint8_t  DataSize;               // requested scalar size: 1 / 2 / 4 B
+    uint8_t  RequestReserved8;
+
+    uint32_t DataValue;              // write payload; ignored by SDO READ
+    uint32_t TimeoutMs;              // requested service timeout (server clamps)
+    uint32_t Flags;                  // SHM_ECAT_SERVICE_FLAG_*
+    uint32_t RequestReserved[5];     // [0] = WRITE_CONFIRM_MAGIC for SDO WRITE
+
+    // ---------------------------------------------------------------------
+    // Server-owned response (32 B)
+    // ---------------------------------------------------------------------
+    // ResponseId MUST be published last by the RTX64 server.
+    uint32_t ResponseId;
+    int32_t  ResultCode;             // SHM_ECAT_SERVICE_RESULT_*
+    int32_t  ResultWkc;              // mailbox operation WKC / result
+    uint32_t ResponseDataValue;      // little-endian scalar, up to 4 B
+    uint32_t ResponseDataSize;       // actual returned data bytes: 1 / 2 / 4
+    uint32_t AbortCode;              // 0 until lower SDO layer exposes abort code
+    uint32_t DurationUs;             // end-to-end RTX64 service duration
+    uint32_t ResponseReserved;
+};
+
+#if !defined(__INTELLISENSE__)
+static_assert(
+    sizeof(SHM_ECAT_ServiceData) == 128,
+    "SHM_ECAT_ServiceData ABI changed; update ENI Tool C# service contract.");
+#endif
+
+
 #pragma pack(pop)

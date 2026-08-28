@@ -1,0 +1,1288 @@
+OSCARMAX EtherCAT Master C++ API 快速使用手冊
+============================================================
+版本基準：EtherCAT_Master_RTOS(7) / Stage 11F.1 COMPLETE
+日期：2026-08-24
+用途：提供 C++ / HMI / EDM 應用程式快速存取 EtherCAT 軸、I/O、AD、感測器、SDO、Runtime 狀態。
+
+※ 本文件以目前專案實際存在的 API 為準，不是泛用 EtherCAT 範例。
+※ 主程式目前全域 Master 物件：
+
+    EtherCatMaster Master;
+
+  定義於 EtherCAT_Master_RTOS.cpp。
+
+
+======================================================================
+0. 最常用 API 一頁速查
+======================================================================
+
+【Generic EtherCAT Input】
+
+    Master.ReadCompositeConsumerBits(...)
+    Master.ReadCompositeConsumerInt16(...)
+    Master.ReadCompositeConsumerInt32(...)
+    Master.ReadCompositeConsumerInt64(...)
+
+Semantic 身分：
+
+    Kind + AxisRef + occurrence
+
+例如：
+
+    DigitalInput / "" / 0
+    AnalogInput  / "" / 0
+    AnalogInput  / "" / 1
+    PositionFeedback / "X" / 0
+    TemperatureInput / "" / 0
+
+
+【PLC Mapping】
+
+    Master.m_plcManager.GetBit_I(index);       // 讀 DI 對應的 PLC I
+    Master.m_plcManager.SetBit_O(index, value);// 寫 DO 對應的 PLC O
+    Master.m_plcManager.GetBit_O(index);       // 讀 PLC O 命令值
+    Master.m_plcManager.GetReg_DR(index);      // 讀 AD 對應的 PLC DR
+    Master.m_plcManager.SetReg_DR(index, value);
+
+
+【Motion / Servo】
+
+    AxisContext& axis = nc->GetMotion().GetAxisContext(0); // 第一軸
+
+    nc->GetMotion().MoveToPosition(...);
+    nc->GetMotion().VelocityMove(...);
+    nc->GetMotion().StopMove(...);
+    nc->GetMotion().EmergencyStop(...);
+    nc->GetMotion().ResetFault(...);
+
+
+【Master 狀態】
+
+    Master.GetStartupSnapshot();
+    Master.GetRuntimeSnapshot();
+
+
+【SDO】
+
+    Master.ecx_SDOread(...);
+    Master.ecx_SDOwrite(...);
+
+
+======================================================================
+1. Generic Semantic Input API — 最推薦的 EtherCAT 資料抓法
+======================================================================
+
+正式 Live Input API：
+
+    bool ReadCompositeConsumerBits(
+        const char* kind,
+        const char* axisRef,
+        int occurrence,
+        uint64_t& value) const;
+
+    bool ReadCompositeConsumerInt16(
+        const char* kind,
+        const char* axisRef,
+        int occurrence,
+        int16_t& value) const;
+
+    bool ReadCompositeConsumerInt32(
+        const char* kind,
+        const char* axisRef,
+        int occurrence,
+        int32_t& value) const;
+
+    bool ReadCompositeConsumerInt64(
+        const char* kind,
+        const char* axisRef,
+        int occurrence,
+        int64_t& value) const;
+
+
+------------------------------------------------------------
+1.1 三個主要參數怎麼理解？
+------------------------------------------------------------
+
+1) kind
+
+    ENI Application Binding 的功能種類。
+
+    例如：
+
+        "DigitalInput"
+        "AnalogInput"
+        "PositionFeedback"
+        "VelocityFeedback"
+        "TemperatureInput"
+        "PressureInput"
+        "VoltageInput"
+        "CurrentInput"
+        "FrequencyInput"
+        "Status"
+        "Timestamp"
+        "TouchProbe"
+
+2) axisRef
+
+    有軸語意時填軸名稱，例如：
+
+        "X"
+        "Y"
+        "Z"
+
+    一般 I/O / AD 沒有軸關聯時填：
+
+        ""
+
+3) occurrence
+
+    第幾個「符合 Kind + AxisRef」的 Binding。
+    從 0 開始。
+
+    注意：occurrence 不是 SlaveIndex。
+
+例如：
+
+    AnalogInput / "" / 0   = 第一個 AnalogInput Channel
+    AnalogInput / "" / 1   = 第二個 AnalogInput Channel
+    AnalogInput / "" / 2   = 第三個 AnalogInput Channel
+
+目前專案的 AnalogInput Composite Binding 是「每個 Channel 一個 occurrence」。
+
+DigitalInput 則通常是一個 Binding 對應一整組 bit，因此：
+
+    DigitalInput / "" / 0
+
+可能一次讀回 8 / 16 / 32 / 64 個 DI bit。
+
+
+------------------------------------------------------------
+1.2 回傳值
+------------------------------------------------------------
+
+所有 ReadCompositeConsumer*() 都回傳 bool：
+
+    true  = 找到 Binding，型別/BitLength 正確，讀取成功
+    false = 找不到 Binding、DataType 不符、BitLength 不符或 Route 未建立
+
+不要忽略回傳值。
+
+正確：
+
+    int16_t value = 0;
+
+    if (Master.ReadCompositeConsumerInt16(
+            "AnalogInput", "", 0, value))
+    {
+        // value 可用
+    }
+    else
+    {
+        // Binding / DataType / Runtime Route 有問題
+    }
+
+
+======================================================================
+2. 抓 Digital Input（DI）
+======================================================================
+
+假設 ENI 有第一組 DigitalInput：
+
+    Kind       = DigitalInput
+    AxisRef    = ""
+    occurrence = 0
+
+讀整組 bit：
+
+    uint64_t diRaw = 0;
+
+    bool ok = Master.ReadCompositeConsumerBits(
+        "DigitalInput",
+        "",
+        0,
+        diRaw);
+
+    if (ok)
+    {
+        bool DI0 = (diRaw & (1ULL << 0)) != 0;
+        bool DI1 = (diRaw & (1ULL << 1)) != 0;
+        bool DI2 = (diRaw & (1ULL << 2)) != 0;
+    }
+
+
+若有第二組 DigitalInput Binding：
+
+    uint64_t diGroup2 = 0;
+
+    Master.ReadCompositeConsumerBits(
+        "DigitalInput",
+        "",
+        1,
+        diGroup2);
+
+
+【重要】
+
+    occurrence = 第幾組 DigitalInput Binding
+    bit        = 該 Binding 內第幾點 DI
+
+不要把 occurrence 當 DI 點號。
+
+
+======================================================================
+3. 抓 Analog Input / AD
+======================================================================
+
+目前正式 Analog Input Contract 為 Int16 Channel。
+
+第一個 AD：
+
+    int16_t ad1 = 0;
+
+    bool ok = Master.ReadCompositeConsumerInt16(
+        "AnalogInput",
+        "",
+        0,
+        ad1);
+
+第二個 AD：
+
+    int16_t ad2 = 0;
+
+    Master.ReadCompositeConsumerInt16(
+        "AnalogInput",
+        "",
+        1,
+        ad2);
+
+第三個 AD：
+
+    int16_t ad3 = 0;
+
+    Master.ReadCompositeConsumerInt16(
+        "AnalogInput",
+        "",
+        2,
+        ad3);
+
+
+一次讀 4 Channel：
+
+    int16_t ad[4] = {};
+
+    for (int ch = 0; ch < 4; ++ch)
+    {
+        if (!Master.ReadCompositeConsumerInt16(
+                "AnalogInput",
+                "",
+                ch,
+                ad[ch]))
+        {
+            // 此 Channel 讀取失敗
+        }
+    }
+
+
+【注意】
+
+ReadCompositeConsumerInt16() 得到的是 Raw 值。
+
+例如 0~10V、+/-10V、4~20mA 的工程值換算，必須依 AD 板的實際 Raw Range 處理。
+
+例如（僅示意，比例需依板卡規格）：
+
+    double voltage = (double)ad1 * 10.0 / 32767.0;
+
+不要在不知道 AD 板規格時直接套這個比例。
+
+
+======================================================================
+4. 抓其他感測器 / Feedback
+======================================================================
+
+Generic Consumer API 不只用於 DI / AD。
+
+目前 Master Generic Live Read 已允許下列 Semantic Kind：
+
+【一般狀態】
+    Status
+    Diagnostic
+    Timestamp
+
+【標準 I/O】
+    DigitalInput
+    DigitalIO
+    AnalogInput
+    AnalogIO
+
+【Feedback】
+    EncoderFeedback
+    PositionFeedback
+    VelocityFeedback
+    AccelerationFeedback
+    JerkFeedback
+    TorqueFeedback
+    ForceFeedback
+    CurrentFeedback
+
+【Counter / Capture】
+    HighSpeedCounter
+    FrequencyInput
+    LatchCapture
+    TouchProbe
+
+【機台 Input】
+    HomeSensor
+    LimitSwitch
+
+【量測】
+    TemperatureInput
+    PressureInput
+    DisplacementInput
+    LoadCellInput
+    StrainGaugeInput
+    VoltageInput
+    CurrentInput
+
+【其他】
+    SafetyInput
+    SafetyStatus
+    DriveStatus
+
+※ SafetyInput / SafetyStatus 在目前程式只是 Semantic / 描述性資料，
+  不代表 FSoE 或任何認證安全功能。
+
+
+------------------------------------------------------------
+4.1 Position Feedback 範例
+------------------------------------------------------------
+
+如果 ENI 定義：
+
+    Kind     = PositionFeedback
+    AxisRef  = X
+    DataType = Int32
+
+則：
+
+    int32_t xPosRaw = 0;
+
+    bool ok = Master.ReadCompositeConsumerInt32(
+        "PositionFeedback",
+        "X",
+        0,
+        xPosRaw);
+
+
+如果 Y 軸：
+
+    int32_t yPosRaw = 0;
+
+    Master.ReadCompositeConsumerInt32(
+        "PositionFeedback",
+        "Y",
+        0,
+        yPosRaw);
+
+
+------------------------------------------------------------
+4.2 Temperature 範例
+------------------------------------------------------------
+
+假設 ENI DataType = Int16：
+
+    int16_t tempRaw = 0;
+
+    bool ok = Master.ReadCompositeConsumerInt16(
+        "TemperatureInput",
+        "",
+        0,
+        tempRaw);
+
+
+------------------------------------------------------------
+4.3 Pressure 範例
+------------------------------------------------------------
+
+假設 ENI DataType = Int32：
+
+    int32_t pressureRaw = 0;
+
+    bool ok = Master.ReadCompositeConsumerInt32(
+        "PressureInput",
+        "",
+        0,
+        pressureRaw);
+
+
+------------------------------------------------------------
+4.4 Timestamp 範例
+------------------------------------------------------------
+
+若 ENI DataType = Int64 / 64 bit：
+
+    int64_t timestamp = 0;
+
+    bool ok = Master.ReadCompositeConsumerInt64(
+        "Timestamp",
+        "",
+        0,
+        timestamp);
+
+
+======================================================================
+5. 不知道該用 Int16 / Int32 / Int64？先查 Descriptor
+======================================================================
+
+可以先解析 Semantic Binding：
+
+    const EtherCatCompositeApplicationDescriptor* desc =
+        Master.ResolveCompositeReadConsumer(
+            "AnalogInput",
+            "",
+            0);
+
+    if (desc != nullptr)
+    {
+        printf("SlaveIndex = %d\n", desc->slaveIndex);
+        printf("BindingId  = %s\n", desc->id);
+        printf("Kind       = %s\n", desc->kind);
+        printf("AxisRef    = %s\n", desc->axisRef);
+        printf("DataType   = %s\n", desc->dataType);
+        printf("Unit       = %s\n", desc->unit);
+        printf("InputBits  = %u\n", desc->inputBitLength);
+        printf("InputByteOffset = %d\n", desc->inputByteOffset);
+    }
+
+
+這個 API 很適合除錯：
+
+    ResolveCompositeReadConsumer(kind, axisRef, occurrence)
+
+如果回傳 nullptr，先不要懷疑 EtherCAT LRW。
+先檢查 ENI Application Binding 是否真的存在、Kind / AxisRef / occurrence 是否正確。
+
+
+======================================================================
+6. Typed API 的規則
+======================================================================
+
+ReadCompositeConsumerInt16()：
+
+    descriptor->dataType 必須為 "Int16"
+    inputBitLength 必須為 16
+
+ReadCompositeConsumerInt32()：
+
+    descriptor->dataType 必須為 "Int32"
+    inputBitLength 必須為 32
+
+ReadCompositeConsumerInt64()：
+
+    descriptor->dataType 必須為 "Int64"
+    inputBitLength 必須為 64
+
+ReadCompositeConsumerBits()：
+
+    可讀 1~64 bit 的 Input Binding。
+
+所以若 ENI 定義為 Int32，卻呼叫 Int16 API，會直接回 false。
+
+
+======================================================================
+7. 從 PLC Mapping 抓 DI / AD（另一種方式）
+======================================================================
+
+如果裝置已透過 PlcCore 映射成 PLC I / O / DR，
+HMI 或 PLC 邏輯可以直接使用 PLCManager。
+
+
+------------------------------------------------------------
+7.1 讀 PLC I
+------------------------------------------------------------
+
+    bool input0 = Master.m_plcManager.GetBit_I(0);
+    bool input1 = Master.m_plcManager.GetBit_I(1);
+
+PLC I 編號由 ENI / IoMapConfig Mapping 決定。
+
+
+------------------------------------------------------------
+7.2 讀 PLC DR（AD）
+------------------------------------------------------------
+
+假設 AD 被配置到 DR100~DR103：
+
+    int32_t ad1 = Master.m_plcManager.GetReg_DR(100);
+    int32_t ad2 = Master.m_plcManager.GetReg_DR(101);
+    int32_t ad3 = Master.m_plcManager.GetReg_DR(102);
+    int32_t ad4 = Master.m_plcManager.GetReg_DR(103);
+
+目前 PlcCore 會把 Generic AnalogInput Int16 Raw 值轉成 int32_t 存入 DR。
+
+
+------------------------------------------------------------
+7.3 Generic API 與 PLC API 該選哪一個？
+------------------------------------------------------------
+
+EDM / C++ 功能直接讀 EtherCAT Semantic：
+
+    建議 ReadCompositeConsumer*()
+
+PLC / HMI 已經依 PLC address 工作：
+
+    使用 GetBit_I() / GetReg_DR()
+
+兩者不是互斥。
+
+
+======================================================================
+8. 控制 Digital Output（DO）
+======================================================================
+
+目前正式 Generic PLC Output 路徑是：
+
+    PLC O
+      -> PlcCore
+      -> Generic DigitalOutput Semantic
+      -> Process Image
+      -> LRW
+      -> EtherCAT Slave
+
+因此應用程式要開 DO，使用 PLC O API：
+
+    Master.m_plcManager.SetBit_O(0, true);   // O0 ON
+    Master.m_plcManager.SetBit_O(0, false);  // O0 OFF
+
+讀目前命令：
+
+    bool command = Master.m_plcManager.GetBit_O(0);
+
+
+【重要】
+
+目前沒有提供給一般應用層使用的正式：
+
+    WriteCompositeConsumerInt16(...)
+    WriteCompositeConsumerBits(...)
+
+這種 Generic Live Output API。
+
+不要自己去寫 m_IoMap，也不要直接寫 Slave PDO Buffer。
+
+Digital Output 請走 PLC O。
+Servo Output 請走 MotionCore。
+
+
+======================================================================
+9. 抓第一軸 / Servo 狀態
+======================================================================
+
+Axis Index 為 0-based：
+
+    0 = 第一軸
+    1 = 第二軸
+    2 = 第三軸
+    ...
+
+在 NC / Handler 內：
+
+    AxisContext& axis1 =
+        nc->GetMotion().GetAxisContext(0);
+
+若直接使用 Master 物件：
+
+    AxisContext& axis1 =
+        Master.m_Motion.GetAxisContext(0);
+
+
+------------------------------------------------------------
+9.1 常用軸狀態
+------------------------------------------------------------
+
+    axis1.isExist;       // 軸是否存在
+    axis1.isServoOn;     // 是否激磁
+    axis1.isFault;       // 是否 Fault
+    axis1.isHomed;       // 是否已 Home
+    axis1.inPosition;    // 是否到位
+    axis1.currentActPos; // 實際位置，Pulse
+    axis1.currentActVel; // 實際速度，PPS
+    axis1.currentCmdPos; // 命令位置，Pulse
+    axis1.currentCmdVel; // 命令速度，PPS
+    axis1.resolution_PPR;
+    axis1.finalLead;
+
+
+------------------------------------------------------------
+9.2 實際位置 Pulse -> mm / unit
+------------------------------------------------------------
+
+    AxisContext& axis =
+        nc->GetMotion().GetAxisContext(0);
+
+    double pulsePerUnit =
+        axis.resolution_PPR /
+        axis.finalLead;
+
+    double actualPosition =
+        axis.currentActPos /
+        pulsePerUnit;
+
+等價寫法：
+
+    double actualPosition =
+        axis.currentActPos *
+        axis.finalLead /
+        axis.resolution_PPR;
+
+線性軸通常為 mm；旋轉軸則依目前軸設定代表對應 unit。
+
+
+======================================================================
+10. 第一軸下移動命令
+======================================================================
+
+------------------------------------------------------------
+10.1 P2P 絕對位置
+------------------------------------------------------------
+
+例如第一軸移到 10 mm，速度 100 mm/min：
+
+    MotionCore& motion = nc->GetMotion();
+    AxisContext& axis = motion.GetAxisContext(0);
+
+    double pulsePerMM =
+        axis.resolution_PPR /
+        axis.finalLead;
+
+    double targetPulse =
+        10.0 * pulsePerMM;
+
+    double velocityPPS =
+        MotionCore::UnitPerMinToPps(
+            100.0,
+            axis.resolution_PPR,
+            axis.finalLead);
+
+    motion.MoveToPosition(
+        axis,
+        targetPulse,
+        velocityPPS,
+        0.2,   // acc_time
+        0.2);  // dec_time
+
+
+------------------------------------------------------------
+10.2 Velocity / JOG
+------------------------------------------------------------
+
+正方向 100 mm/min：
+
+    double velocityPPS =
+        MotionCore::UnitPerMinToPps(
+            100.0,
+            axis.resolution_PPR,
+            axis.finalLead);
+
+    motion.VelocityMove(
+        axis,
+        velocityPPS,
+        0.2);
+
+反方向：
+
+    motion.VelocityMove(
+        axis,
+        -velocityPPS,
+        0.2);
+
+
+------------------------------------------------------------
+10.3 停止 / 急停 / Reset Fault
+------------------------------------------------------------
+
+正常減速：
+
+    motion.StopMove(axis, 0.2);
+
+單軸急停：
+
+    motion.EmergencyStop(axis);
+
+全部存在的實體軸急停：
+
+    motion.EmergencyStopAllAxes();
+
+Reset Fault：
+
+    motion.ResetFault(axis);
+
+全部軸 Reset Fault：
+
+    motion.ResetAllFaults();
+
+
+【重要架構規則】
+
+HMI / EDM Application 不要直接寫：
+
+    servo.pOutput->ControlWord
+    servo.pOutput->TargetVelocity
+    servo.pOutput->...
+
+正式 Servo 命令應走：
+
+    Application
+      -> MotionCore
+      -> AxisIndex
+      -> Generic Servo Structured Producer
+      -> Process Image
+      -> LRW
+
+
+======================================================================
+11. Servo Touch Probe API
+======================================================================
+
+目前 MotionCore 有正式 helper：
+
+    bool GetDriveTouchProbeFunction(
+        int axisIndex,
+        uint16_t& functionValue) const;
+
+    bool GetDriveTouchProbeData(
+        int axisIndex,
+        uint16_t& status,
+        int32_t& capturedPosition) const;
+
+    bool SetDriveTouchProbeFunction(
+        int axisIndex,
+        uint16_t value);
+
+
+讀第一軸 Touch Probe：
+
+    uint16_t probeStatus = 0;
+    int32_t capturedPos = 0;
+
+    bool ok = nc->GetMotion().GetDriveTouchProbeData(
+        0,
+        probeStatus,
+        capturedPos);
+
+設定第一軸 Probe Function：
+
+    bool ok = nc->GetMotion().SetDriveTouchProbeFunction(
+        0,
+        functionValue);
+
+
+======================================================================
+12. Master Startup / Runtime 狀態
+======================================================================
+
+------------------------------------------------------------
+12.1 Startup Snapshot
+------------------------------------------------------------
+
+    EtherCatStartupSnapshot startup =
+        Master.GetStartupSnapshot();
+
+可以搭配：
+
+    Master.GetStartupStageName(startup.stage)
+
+用於確認 Startup 卡在哪一個 Stage。
+
+
+------------------------------------------------------------
+12.2 Runtime Snapshot
+------------------------------------------------------------
+
+    EtherCatRuntimeSnapshot runtime =
+        Master.GetRuntimeSnapshot();
+
+    if (runtime.stage == EtherCatRuntimeStage::Running &&
+        runtime.result == EtherCatRuntimeResult::Pass)
+    {
+        // Master Runtime 正常 RUNNING
+    }
+
+顯示名稱：
+
+    const char* stageName =
+        Master.GetRuntimeStageName(runtime.stage);
+
+Runtime 發生 Fault 時：
+
+    runtime.failedStage
+    runtime.errorCode
+
+可直接協助 HMI 顯示問題發生在哪一階段。
+
+
+======================================================================
+13. Generic Binding 查詢 / 除錯 API
+======================================================================
+
+------------------------------------------------------------
+13.1 用 Semantic 找 Binding
+------------------------------------------------------------
+
+    const auto* desc =
+        Master.ResolveCompositeReadConsumer(
+            "VoltageInput",
+            "",
+            0);
+
+    if (desc == nullptr)
+    {
+        // ENI 沒有這個 Binding，或 Runtime route 尚未建立
+    }
+
+
+------------------------------------------------------------
+13.2 Descriptor 可看的重要資料
+------------------------------------------------------------
+
+    desc->slaveIndex
+    desc->id
+    desc->name
+    desc->kind
+    desc->dataType
+    desc->unit
+    desc->axisRef
+    desc->inputBitOffset
+    desc->inputBitLength
+    desc->inputByteOffset
+    desc->inputBitShift
+    desc->inputByteSpan
+    desc->channelCount
+
+這是「我到底抓到哪一塊 EtherCAT 板、哪個 Binding」最實用的 Debug 資訊。
+
+
+======================================================================
+14. SDO Read / Write（物件字典）
+======================================================================
+
+Public API：
+
+    int ecx_SDOread(
+        int slave_pos,
+        uint16_t index,
+        uint8_t subindex,
+        int CA,
+        int* size,
+        void* data,
+        int timeout);
+
+    int ecx_SDOwrite(
+        int slave_pos,
+        uint16_t index,
+        uint8_t subindex,
+        int CA,
+        int size,
+        void* data,
+        int timeout);
+
+目前專案 SlaveIndex 為 0-based。
+
+
+------------------------------------------------------------
+14.1 讀 CiA402 StatusWord 0x6041:00 範例
+------------------------------------------------------------
+
+    uint16_t statusWord = 0;
+    int size = sizeof(statusWord);
+
+    int result = Master.ecx_SDOread(
+        0,          // 第一個 Slave / SlaveIndex 0
+        0x6041,
+        0x00,
+        FALSE,
+        &size,
+        &statusWord,
+        20);
+
+    if (result > 0 && size == sizeof(statusWord))
+    {
+        // SDO Read 成功
+    }
+
+
+------------------------------------------------------------
+14.2 SDO Write 範例
+------------------------------------------------------------
+
+假設某裝置物件 0x2000:01 為 uint16_t：
+
+    uint16_t value = 123;
+
+    int result = Master.ecx_SDOwrite(
+        0,
+        0x2000,
+        0x01,
+        FALSE,
+        sizeof(value),
+        &value,
+        20);
+
+    if (result > 0)
+    {
+        // Write 成功
+    }
+
+
+【重要】
+
+SDO 是 Mailbox / Service Data Object，不是 Cyclic PDO。
+不要把 SDO Read/Write 塞進 250us 即時循環當一般 I/O 使用。
+
+正常即時資料：使用 Process Image / PDO / ReadCompositeConsumer*()。
+設定參數、診斷、初始化：才使用 SDO。
+
+
+======================================================================
+15. ESC Register / 低階 EtherCAT 存取
+======================================================================
+
+Public API：
+
+    Master.ecx_FPRD(...); // Configured Station Address 實體讀取
+    Master.ecx_FPWR(...); // Configured Station Address 實體寫入
+
+    Master.ecx_APRD(...); // Auto Increment Physical Read
+    Master.ecx_APWR(...); // Auto Increment Physical Write
+
+    Master.ecx_BRD(...);  // Broadcast Read
+    Master.ecx_BWR(...);  // Broadcast Write
+
+    Master.ecx_LRW(...);  // Logical Read Write
+
+
+FPRD 範例（只示意 ESC Register Debug）：
+
+    uint16_t alStatus = 0;
+
+    int wkc = Master.ecx_FPRD(
+        0x1001,     // Configured Station Address
+        0x0130,     // AL Status Register
+        &alStatus,
+        sizeof(alStatus),
+        20);
+
+
+【原則】
+
+一般 HMI / EDM 功能不要直接使用 APRD/APWR/FPRD/FPWR/LRW。
+這些屬於 Master / Startup / Debug 底層 API。
+
+應用功能優先順序：
+
+    1. MotionCore
+    2. ReadCompositeConsumer*()
+    3. PLCManager I/O / DR
+    4. SDO（設定/診斷）
+    5. ESC Register / LRW（底層除錯）
+
+
+======================================================================
+16. WKC / Process Image / Runtime 健康資訊
+======================================================================
+
+目前 EtherCatMaster 內可看到：
+
+    Master.EXPECTED_WKC_PDO
+    Master.wkc_PDO
+    Master.wkc_error_count_PDO
+    Master.timeout_count_PDO
+    Master.m_IoMapSize
+    Master.DC_reference_time
+    Master.TotalSlave_WKC_Count
+
+例如 Debug：
+
+    printf("PDO WKC = %d / %d\n",
+        Master.wkc_PDO,
+        Master.EXPECTED_WKC_PDO);
+
+
+但應用層不要自己利用這些變數重做 Release Gate。
+目前 Console 已有完整：
+
+    [GENERIC-IO-RC-GATE] Stage:11F.1
+
+其整合：
+
+    PLC
+    Servo
+    Process Image
+    LRW WKC
+    DCWKC
+    RX Health
+    DC Health
+    Runtime Snapshot
+
+正常完成標誌：
+
+    Release:UNIFIED_GENERIC_IO_RC_COMPLETE
+    Ready:YES
+    Result:PASS
+
+
+======================================================================
+17. 常見「抓不到」時怎麼查
+======================================================================
+
+------------------------------------------------------------
+17.1 ReadCompositeConsumer... 回 false
+------------------------------------------------------------
+
+依序查：
+
+1. ENI Tool Application Binding 有沒有建立？
+2. Kind 拼字是否完全相同？
+3. AxisRef 是否正確？
+4. occurrence 是否正確？
+5. ResolveCompositeReadConsumer() 是否回 nullptr？
+6. descriptor->dataType 是否符合你用的 API？
+7. descriptor->inputBitLength 是否 16 / 32 / 64？
+8. Startup 的 Composite / Process Image Audit 是否 PASS？
+9. Unified RC Gate 是否 PASS？
+
+
+------------------------------------------------------------
+17.2 DI 抓到，但點號不對
+------------------------------------------------------------
+
+記住：
+
+    occurrence = 第幾組 DigitalInput Binding
+    bit        = Binding 裡第幾點 DI
+
+例如：
+
+    uint64_t raw;
+    Master.ReadCompositeConsumerBits("DigitalInput", "", 0, raw);
+
+    bool point7 = ((raw >> 7) & 1ULL) != 0;
+
+
+------------------------------------------------------------
+17.3 AD 抓錯 Channel
+------------------------------------------------------------
+
+目前 AnalogInput occurrence 是依實體 AD module scan order 展開 Channel。
+每個 Channel 佔一個 occurrence。
+
+可用 ResolveCompositeReadConsumer() 印出 slaveIndex / id / occurrence 逐一確認。
+
+
+------------------------------------------------------------
+17.4 軸讀得到但馬達不動
+------------------------------------------------------------
+
+查：
+
+    axis.isExist
+    axis.isServoOn
+    axis.isFault
+    Runtime = RUNNING / PASS
+    SERVO-GENERIC-IO-RELEASE = PASS
+    GENERIC-IO-RC-GATE = PASS
+
+不要直接改 Servo PDO 來繞過 MotionCore。
+
+
+------------------------------------------------------------
+17.5 SDO 失敗但 PDO 正常
+------------------------------------------------------------
+
+SDO 和 Cyclic PDO 是兩條不同路徑。
+檢查 Mailbox / PRE-OP / Slave object support / Index/SubIndex / Data Size。
+不要因為 SDO 失敗就直接判定 LRW/WKC 壞掉。
+
+
+======================================================================
+18. 同事以後做新 EtherCAT 板時，C++ 怎麼保持不變
+======================================================================
+
+理想流程：
+
+    新板 ESI
+      -> ENI Tool 匯入
+      -> Network / PDO / DC
+      -> Application Binding
+      -> Export EtherCAT_Runtime.xml
+      -> Master 啟動
+      -> Generic API 使用
+
+例如同事做一張新的 8CH AD 板，只要 ENI Binding 建立成：
+
+    AnalogInput / Int16 / occurrence 0..7
+
+你的 C++ 仍然只是：
+
+    int16_t value = 0;
+
+    Master.ReadCompositeConsumerInt16(
+        "AnalogInput",
+        "",
+        channel,
+        value);
+
+不需要知道：
+
+    Vendor ID
+    Product Code
+    Slave 是第幾站
+    Process Image Byte Offset
+    FMMU Address
+
+這就是 Generic Semantic API 的目的。
+
+
+======================================================================
+19. 建議給應用程式統一包一層 Helper（未來可做）
+======================================================================
+
+目前 API 已可直接用，但大量 HMI / EDM 程式若一直重複寫字串，
+未來可再做一層 OSCARMAX Application API，例如：
+
+    EcatReadDI(group, bit)
+    EcatReadAD(channel)
+    EcatReadInt16(kind, axis, occurrence)
+    EcatReadInt32(kind, axis, occurrence)
+    EcatGetAxis(axisIndex)
+    EcatGetAxisPosition(axisIndex)
+    EcatMoveAxis(...)
+
+這只是便利 Wrapper；底層仍然呼叫本文件的正式 API。
+目前不需要為了使用 Generic Master 而修改底層控制路徑。
+
+
+======================================================================
+20. 可直接複製的綜合範例
+======================================================================
+
+// ---------------------------------------------------------
+// 1. DI
+// ---------------------------------------------------------
+uint64_t di = 0;
+if (Master.ReadCompositeConsumerBits(
+        "DigitalInput", "", 0, di))
+{
+    bool sensor0 = (di & (1ULL << 0)) != 0;
+}
+
+
+// ---------------------------------------------------------
+// 2. AD
+// ---------------------------------------------------------
+int16_t ad0 = 0;
+if (Master.ReadCompositeConsumerInt16(
+        "AnalogInput", "", 0, ad0))
+{
+    // 使用 ad0 Raw Value
+}
+
+
+// ---------------------------------------------------------
+// 3. 其他 Int32 Feedback
+// ---------------------------------------------------------
+int32_t posFeedback = 0;
+if (Master.ReadCompositeConsumerInt32(
+        "PositionFeedback", "X", 0, posFeedback))
+{
+    // 使用 Position Feedback
+}
+
+
+// ---------------------------------------------------------
+// 4. DO
+// ---------------------------------------------------------
+Master.m_plcManager.SetBit_O(0, true);
+
+
+// ---------------------------------------------------------
+// 5. 第一軸狀態
+// ---------------------------------------------------------
+AxisContext& axis = nc->GetMotion().GetAxisContext(0);
+
+if (axis.isExist)
+{
+    double posUnit =
+        axis.currentActPos *
+        axis.finalLead /
+        axis.resolution_PPR;
+}
+
+
+// ---------------------------------------------------------
+// 6. 第一軸 P2P
+// ---------------------------------------------------------
+MotionCore& motion = nc->GetMotion();
+AxisContext& axis0 = motion.GetAxisContext(0);
+
+double targetPulse =
+    10.0 *
+    axis0.resolution_PPR /
+    axis0.finalLead;
+
+double velPPS =
+    MotionCore::UnitPerMinToPps(
+        100.0,
+        axis0.resolution_PPR,
+        axis0.finalLead);
+
+motion.MoveToPosition(
+    axis0,
+    targetPulse,
+    velPPS,
+    0.2,
+    0.2);
+
+
+// ---------------------------------------------------------
+// 7. Runtime 是否正常
+// ---------------------------------------------------------
+EtherCatRuntimeSnapshot rt = Master.GetRuntimeSnapshot();
+
+bool masterReady =
+    rt.stage == EtherCatRuntimeStage::Running &&
+    rt.result == EtherCatRuntimeResult::Pass;
+
+
+======================================================================
+21. 最後記住這 5 條
+======================================================================
+
+1. 一般 EtherCAT Input：
+
+       ReadCompositeConsumer*()
+
+2. 軸 / Servo：
+
+       MotionCore + GetAxisContext()
+
+3. Digital Output：
+
+       PLC O -> Generic DigitalOutput
+       SetBit_O()
+
+4. 設備參數 / Object Dictionary：
+
+       ecx_SDOread() / ecx_SDOwrite()
+
+5. 不要讓 Application 直接碰：
+
+       m_IoMap
+       Servo pInput/pOutput
+       LRW buffer
+       FMMU offset
+
+   除非你正在開發 / 除錯 Master 底層。
+
+
+======================== END OF FILE ========================

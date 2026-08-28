@@ -2,19 +2,147 @@
 #include "MacroEngine.h"
 #include "MacroParser.h"
 #include "GCodeParser.h"
-#include "EtherCatMaster.h"
+#include "NCGCodeSemantics.h"
+#include "NCExpressionResolver.h"
+#include "NCProgramCache.h"
+#include "NCBlockLifecycleLedger.h"
+#include "NCBlockCompletionBoundary.h"
+#include "NCProgramEndBoundary.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 #include "AlarmManager.h"
 #include "GMCodeHandlers.h" // 🌟 引入 G 碼處理器總表
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <limits>
+#include <utility>
+#include <cmath>
 namespace GCodeHandlers
 {
     WaitConditionFunc Handle_G81(const NCBlock& block, NCManager* nc);
 }
 
-NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys), Parser(MathParser)
+namespace
+{
+    MotionCommandSource GetMotionCommandSourceForMode(
+        NCOperationMode mode)
+    {
+        switch (mode)
+        {
+        case NCOperationMode::MEMORY:
+            return MotionCommandSource::NC_MEMORY;
+
+        case NCOperationMode::MDI:
+            return MotionCommandSource::NC_MDI;
+
+        case NCOperationMode::MANUAL:
+            return MotionCommandSource::NC_MANUAL_AUTO;
+
+        case NCOperationMode::EDIT:
+        default:
+            return MotionCommandSource::UNKNOWN;
+        }
+    }
+
+
+    MotionOwner GetMotionOwnerForMode(
+        NCOperationMode mode)
+    {
+        return
+            ResolveMotionOwnerForSource(
+                GetMotionCommandSourceForMode(mode));
+    }
+
+
+    bool TryGetPositiveIntegerAddress(
+        const NCBlock& block,
+        char address,
+        int& value) noexcept
+    {
+        if (!block.has(address))
+        {
+            return false;
+        }
+
+        const double rawValue = block.val(address);
+        if (!std::isfinite(rawValue))
+        {
+            return false;
+        }
+
+        const double roundedValue = std::round(rawValue);
+        if (std::fabs(rawValue - roundedValue) > 1.0e-9 ||
+            roundedValue < 1.0 ||
+            roundedValue >
+            static_cast<double>(
+                (std::numeric_limits<int>::max)()))
+        {
+            return false;
+        }
+
+        value = static_cast<int>(roundedValue);
+        return true;
+    }
+}
+
+
+bool NCManager::AcquireProgramMotionOwner() noexcept
+{
+    const MotionOwner requestedOwner =
+        GetMotionOwnerForMode(m_mode);
+
+    if (requestedOwner == MotionOwner::NONE)
+    {
+        return false;
+    }
+
+    if (m_programMotionLease.owner == requestedOwner &&
+        m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))
+    {
+        return true;
+    }
+
+    m_programMotionLease = MotionOwnerLease{};
+
+    return
+        m_motion.TryAcquireMotionOwner(
+            requestedOwner,
+            m_programMotionLease);
+}
+
+
+void NCManager::ReleaseProgramMotionOwner() noexcept
+{
+    if (m_programMotionLease.IsValid())
+    {
+        // Generation 不符時 Release 會安全失敗，不會釋放新 Owner。
+        m_motion.ReleaseMotionOwner(
+            m_programMotionLease);
+    }
+
+    m_programMotionLease = MotionOwnerLease{};
+}
+
+
+bool NCManager::AdoptProgramMotionLease(
+    const MotionOwnerLease& lease) noexcept
+{
+    const MotionOwner expectedOwner =
+        GetMotionOwnerForMode(m_mode);
+
+    if (expectedOwner == MotionOwner::NONE ||
+        lease.owner != expectedOwner ||
+        !m_motion.IsMotionOwnerLeaseCurrent(lease))
+    {
+        return false;
+    }
+
+    m_programMotionLease = lease;
+    return true;
+}
+
+
+NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys), Parser()
 {
     // =========================================================
     // G81 HOME Manager Link
@@ -38,29 +166,63 @@ NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys
     // 初始化設定
     m_state = NCState::IDLE;
     m_mode = NCOperationMode::MEMORY; // 預設記憶體模式
+
+    m_motion.SetPendingCommandSource(
+        MotionCommandSource::NC_MEMORY);
 }
 
 bool NCManager::LoadProgram(const std::string& filepath)
 {
     std::ifstream file(filepath);
-    if (!file.is_open()) return false;
+    if (!file.is_open())
+    {
+        return false;
+    }
 
-    //自動萃取檔名 (去掉資料夾路徑，只留 test.nc)
-    size_t pos = filepath.find_last_of("/\\");
-    m_mainProgramName = (pos != std::string::npos) ? filepath.substr(pos + 1) : filepath;
+    std::vector<std::string> rawLines;
+    std::string line;
+    while (std::getline(file, line))
+    {
+        rawLines.push_back(line);
+    }
+    file.close();
 
-    // 🌟 載入新主程式時，清空所有的副程式與區域變數
+    // Build the new immutable image first. A failed build must not destroy
+    // the currently loaded program or its execution boundary.
+    NCProgramCache newProgramCache;
+    if (!newProgramCache.Build(std::move(rawLines), Parser))
+    {
+        return false;
+    }
+
+    // Only after a complete image exists do we invalidate the old execution.
+    CancelProgramEndBoundary();
+    ClearCompletionWaitBoundary(true);
+    CancelGMBlockTransaction(true);
+    CancelSingleBlockShadow(true);
+    CancelFeedHoldBoundaryShadow(true);
+    m_waitCallback = nullptr;
+    ReleaseProgramMotionOwner();
+    m_motion.BeginNewExecutionEpoch(
+        MotionCommandSource::NC_MEMORY);
+
+    const std::size_t pos = filepath.find_last_of("/\\");
+    m_mainProgramName =
+        pos != std::string::npos
+        ? filepath.substr(pos + 1U)
+        : filepath;
+
     m_macroStack.clear();
+    m_macroProgramCaches.clear();
     MacroSys.Reset();
 
-    // UI 顯示歸零
     m_macroProgramName = "";
     m_macroProgramPC = -1;
 
-    m_programMemory.clear();
-    m_jumpTable.clear(); // 清空舊的跳躍表
+    m_programCache = std::move(newProgramCache);
     m_programPC = 0;
-    m_motion.ResetPhysicalPC(); // 🌟 載入新程式，實體行號歸零
+    ResetAllProgramCommitBoundaries();
+    m_motion.ResetPhysicalPC();
 
     // 🌟 取得大腦目前的狀態，並同步給馬達標籤機
     int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
@@ -91,28 +253,25 @@ bool NCManager::LoadProgram(const std::string& filepath)
     int curPlane = CoordSys.activePlane; // 17, 18 或是 19
 
     // 🌟 拿大腦最乾淨的狀態強制洗掉馬達的殘影
-    m_motion.ResetPhysicalTags(CoordSys.GetCurrentWCSGCode(), CoordSys.toolLengthMode, CoordSys.currentHCode, CoordSys.toolRadiusMode, CoordSys.currentDCode, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+    m_motion.ResetPhysicalTags(
+        currentBrainWCS,
+        currentBrainToolMode,
+        currentBrainHCode,
+        currentBraintoolRadiusMode,
+        currentBraintoolDCode,
+        curIsAbs,
+        curG68,
+        curG68Angle,
+        curG168,
+        curWCode,
+        curG51,
+        curScale,
+        curMirrorMask,
+        curG16,
+        curG162,
+        curPlane);
 
 
-    std::string line;
-
-    int lineIndex = 0;
-    while (std::getline(file, line)) {
-        m_programMemory.push_back(line);
-
-        // 🌟 快速掃描 N 碼，建立跳躍表
-        std::string clean = MacroParser::CleanExpression(line);
-        size_t nPos = clean.find('N');
-        if (nPos != std::string::npos) {
-            // 將 N 後面的數字轉為整數 (例如 N10 -> 10)
-            int nVal = std::atoi(clean.c_str() + nPos + 1);
-            m_jumpTable[nVal] = lineIndex;
-        }
-        lineIndex++;
-    }
-    file.close();
-
-    //DEBUG_PRINT("[NC] Program Loaded, Lines: %d\n", (int)m_programMemory.size());
     m_state = NCState::READY;
     return true;
 }
@@ -121,7 +280,17 @@ void NCManager::ChangeMode(NCOperationMode newMode)
 {
     // 只有在 IDLE 或 READY 狀態才能切換模式
     if (m_state == NCState::IDLE || m_state == NCState::READY || m_state == NCState::P_END) {
+        CancelProgramEndBoundary();
+        ClearCompletionWaitBoundary(true);
+        CancelGMBlockTransaction(true);
+        CancelSingleBlockShadow(true);
+        CancelFeedHoldBoundaryShadow(true);
+        m_waitCallback = nullptr;
+        ReleaseProgramMotionOwner();
         m_mode = newMode;
+
+        m_motion.SetPendingCommandSource(
+            GetMotionCommandSourceForMode(m_mode));
     }
 
     if (m_state == NCState::P_END)
@@ -157,6 +326,8 @@ void NCManager::CycleStart()
             return;
         }
 
+        ObserveFeedHoldResumeRequestedShadow();
+
 
         // 已完全 PAUSED 時 Resume() 會立即恢復 RUNNING。
         // 若仍在 HOLD_DECEL_STOP，Resume Request 先排隊，
@@ -165,6 +336,7 @@ void NCManager::CycleStart()
         {
             m_state =
                 NCState::RUN;
+            ObserveFeedHoldResumeAppliedShadow();
         }
 
         m_pauseAfterBlock =
@@ -177,11 +349,21 @@ void NCManager::CycleStart()
     // 一般 NC Program Feed Hold Resume。
     if (m_state == NCState::HOLD)
     {
+        m_singleBlockBoundaryShadow.ObserveLegacyResume();
+        m_legacySingleBlockPausePending = false;
+        ObserveFeedHoldResumeRequestedShadow();
+
+        if (!AcquireProgramMotionOwner())
+        {
+            return;
+        }
+
         m_state =
             NCState::RUN;
 
         m_motion.SetGroupFeedrateOverride(
             1.0);
+        ObserveFeedHoldResumeAppliedShadow();
 
         m_pauseAfterBlock =
             false;
@@ -194,6 +376,19 @@ void NCManager::CycleStart()
     if (m_state == NCState::READY ||
         m_state == NCState::P_END)
     {
+        CancelSingleBlockShadow(false);
+        CancelFeedHoldBoundaryShadow(false);
+        m_legacySingleBlockPausePending = false;
+
+        if (!AcquireProgramMotionOwner())
+        {
+            return;
+        }
+
+        // READY / P_END 都代表一個新的 Program Run。上一輪的
+        // Semantic Commit Boundary 不可被新 Execution Epoch 沿用。
+        ResetActiveProgramCommitBoundary();
+
         if (m_state == NCState::P_END)
         {
             GetBasePC() =
@@ -205,7 +400,7 @@ void NCManager::CycleStart()
 
 
         if (m_mode == NCOperationMode::MANUAL &&
-            !m_manualMemory.empty())
+            !m_manualProgramCache.Empty())
         {
             m_manualAutoRunning =
                 true;
@@ -214,6 +409,24 @@ void NCManager::CycleStart()
 
         m_pauseAfterBlock =
             false;
+
+        // READY / P_END 的 Cycle Start 是全新的執行世代；
+        // HOLD Resume 不會走到這裡，所以不會誤殺暫停中的路徑。
+        const MotionExecutionEpoch executionEpoch =
+            m_motion.BeginNewExecutionEpoch(
+                GetMotionCommandSourceForMode(m_mode));
+
+        // Stage NC-0.2G：新 Program Run 只能從乾淨的 Lifecycle / Transport
+        // 邊界開始，避免把上一輪殘留算進新的 Cycle End。
+        if (!BeginProgramRunBoundary(executionEpoch))
+        {
+            if (m_mode == NCOperationMode::MANUAL)
+            {
+                m_manualAutoRunning = false;
+            }
+            ReleaseProgramMotionOwner();
+            return;
+        }
 
         m_motion.SyncVirtualEndPosition();
         UpdateSystemVariables();
@@ -236,8 +449,15 @@ void NCManager::FeedHold()
     {
         if (Homing.RequestHold())
         {
+            if (!m_feedHoldBoundaryShadow.IsActive())
+            {
+                BeginFeedHoldBoundaryShadow(
+                    NCFeedHoldSource::HOME);
+            }
+
             m_state =
                 NCState::HOLD;
+            ObserveFeedHoldLegacyHoldShadow();
         }
 
         return;
@@ -246,6 +466,9 @@ void NCManager::FeedHold()
 
     if (m_state == NCState::RUN)
     {
+        BeginFeedHoldBoundaryShadow(
+            NCFeedHoldSource::PROGRAM);
+
         m_state =
             NCState::HOLD;
 
@@ -254,22 +477,37 @@ void NCManager::FeedHold()
 
         m_pauseAfterBlock =
             false;
+
+        ObserveFeedHoldLegacyHoldShadow();
     }
 }
 
 void NCManager::Reset()
 {
+    CancelProgramEndBoundary();
     if (Homing.IsActive()) Homing.Cancel();
+
+    // Safety 取得新的 Generation，讓舊 AUTO / MDI 命令與晚到 Release 失效。
+    m_safetyMotionLease =
+        m_motion.TakeSafetyMotionOwner();
+
+    m_programMotionLease =
+        MotionOwnerLease{};
+
+    // Stage NC-0.1B：先切換 Epoch。即使舊 Producer 晚一步派單，
+    // 250 us Motion Runtime 也會依 Epoch 拒絕載入。
+    m_motion.BeginNewExecutionEpoch(
+        MotionCommandSource::SAFETY);
 
 
     //重置馬達區塊--------------------------------------------------
     if (m_motion.IsAnyAxisFaulted() || m_motion.IsGroupFaulted() || m_motion.IsGroupEmergencyStopped())
     {
-        m_motion.ResetAllFaults();//有錯誤才清除
+        m_motion.RequestResetAllFaults();//由 250 us Runtime 清除錯誤
 
     }
 
-    m_motion.StopGroup();//滑行停止
+    m_motion.RequestStopGroup();//由 250 us Runtime 執行滑行停止
     m_motion.ResetPhysicalPC(); // 🌟 按下 Reset，實體行號歸零
 
 
@@ -332,6 +570,7 @@ void NCManager::Reset()
     MacroSys.Reset();//重置Macro變數
 
     m_macroStack.clear();
+    m_macroProgramCaches.clear();
     m_programPC = 0;
     m_macroProgramName = "";
     m_macroProgramPC = -1;
@@ -340,10 +579,15 @@ void NCManager::Reset()
     m_mdiPC = 0;
     m_manualPC = 0;
     m_manualAutoRunning = false;
+    ResetAllProgramCommitBoundaries();
 
     // 🌟 [新增]：清理我們為了單步與暫停所加的防暴衝旗標
     m_pauseAfterBlock = false;
     m_programChanged = false;
+    ClearCompletionWaitBoundary(true);
+    CancelGMBlockTransaction(true);
+    CancelSingleBlockShadow(true);
+    CancelFeedHoldBoundaryShadow(true);
     m_waitCallback = nullptr;
 
 
@@ -384,63 +628,73 @@ void NCManager::Reset_Gode()       // 重置G碼相關
 // ==========================================
 // 🌟 1. 標準且安全的實作呼叫副程式邏輯
 // ==========================================
-bool NCManager::CallMacro(const std::string& filename) {
-
-    // 🌟 檢查堆疊層數是否超過 8 層
-    if (MacroSys.PushCallStack() == false) {
-        //DEBUG_PRINT("[Alarm] Macro Call Depth Exceeded 8 Layers!\n");
+bool NCManager::CallMacro(const std::string& filename)
+{
+    if (MacroSys.PushCallStack() == false)
+    {
         AlarmManager::GetInstance().Trigger(AlarmManager::MACRO_OVERFLOW);
         m_state = NCState::HOLD;
         return false;
     }
 
-    // 🌟 【路徑自動補斜線】
-    std::string macroDir = GlobalConfig::GetInstance().NCMacroProgramDir;
-    if (!macroDir.empty() && macroDir.back() != '/' && macroDir.back() != '\\') {
-        macroDir += "/";
+    auto cacheIt = m_macroProgramCaches.find(filename);
+    if (cacheIt == m_macroProgramCaches.end())
+    {
+        std::string macroDir = GlobalConfig::GetInstance().NCMacroProgramDir;
+        if (!macroDir.empty() && macroDir.back() != '/' && macroDir.back() != '\\')
+        {
+            macroDir += "/";
+        }
+
+        const std::string fullPath = macroDir + filename;
+        std::ifstream file(fullPath);
+        if (!file.is_open())
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::Macro_File_Not_Found);
+            MacroSys.PopCallStack();
+            m_state = NCState::HOLD;
+            return false;
+        }
+
+        std::vector<std::string> rawLines;
+        std::string line;
+        while (std::getline(file, line))
+        {
+            rawLines.push_back(line);
+        }
+        file.close();
+
+        NCProgramCache cache;
+        if (!cache.Build(std::move(rawLines), Parser))
+        {
+            MacroSys.PopCallStack();
+            AlarmManager::GetInstance().Trigger(AlarmManager::SYNTAX_ERROR);
+            m_state = NCState::HOLD;
+            return false;
+        }
+
+        cacheIt = m_macroProgramCaches.emplace(filename, std::move(cache)).first;
     }
 
-    std::string fullPath = macroDir + filename;
-    // DEBUG_PRINT("[NC Macro] Attempting to open macro file: %s\n", fullPath.c_str());
-
-    std::ifstream file(fullPath);
-    if (!file.is_open()) {
-        //DEBUG_PRINT("[Alarm] Macro File Not Found: %s\n", fullPath.c_str());
-        AlarmManager::GetInstance().Trigger(AlarmManager::Macro_File_Not_Found);
-
-        // 檔案找不到時，必須把變數堆疊 Pop 掉，避免記憶體錯亂！
-        MacroSys.PopCallStack();
-        m_state = NCState::HOLD;
-        return false;
-    }
-
-    // 🌟 建立這層副程式的專屬執行框架 (Frame)
-    MacroFrame newFrame;
+    MacroFrame newFrame{};
     newFrame.programName = filename;
+    newFrame.program = &cacheIt->second;
+    newFrame.frameId = AllocateMacroFrameId();
     newFrame.currentPC = 0;
+    newFrame.committedPC = -1;
+    newFrame.returnPC = m_macroStack.empty()
+        ? (GetBasePC() + 1)
+        : (m_macroStack.back().currentPC + 1);
+    newFrame.repeatCount = 1;
 
-    // 紀錄返回的主程式行號 (如果是從主程式呼叫，記住下一行；如果是從副程式呼叫，記住上一層的 PC + 1)
-    newFrame.returnPC = m_macroStack.empty() ? (GetBasePC() + 1) : (m_macroStack.back().currentPC + 1);
-    newFrame.repeatCount = 1; // 預設重複 1 次
-
-    std::string line;
-    while (std::getline(file, line)) {
-        newFrame.memory.push_back(line);
-    }
-    file.close();
-
-    //DEBUG_PRINT("[NC Macro] Successfully loaded macro: %s, Total Lines: %d, ReturnPC: %d\n",filename.c_str(), (int)newFrame.memory.size(), newFrame.returnPC);
-
-    // 🌟 將這層副程式推入堆疊頂端
-    m_macroStack.push_back(newFrame);
-
-    m_programChanged = true; // 告訴大腦剛切換程式，不要把舊 PC + 1
+    m_macroStack.push_back(std::move(newFrame));
+    m_programChanged = true;
     return true;
 }
 // ==========================================
 // 🌟 2. 實作返回主程式邏輯
 // ==========================================
-void NCManager::ReturnMacro()
+void NCManager::ReturnMacro(bool queueAlreadyDrained)
 {
     if (m_macroStack.empty()) return;
 
@@ -450,8 +704,12 @@ void NCManager::ReturnMacro()
     if (m_macroStack.back().repeatCount > 1) {
         m_macroStack.back().repeatCount--;  // 次數減 1
         m_macroStack.back().currentPC = 0;  // PC 歸零，回到副程式第一行
+        m_macroStack.back().committedPC = -1;
         m_programChanged = true;
-        m_waitCallback = WaitAndClearQueueCallback; // 等待馬達清空後再跑下一輪
+        if (!queueAlreadyDrained)
+        {
+            m_waitCallback = WaitAndClearQueueCallback;
+        }
         return; // ⚠️ 不彈出堆疊，繼續留在副程式內重跑！
     }
 
@@ -488,10 +746,111 @@ static bool CheckMCodeDone(NCManager* nc) {
     return true;
 }
 
+// ============================================================================
+// Stage NC-0.1D - NC Motion Feedback Snapshot / Counters
+// ============================================================================
+void NCManager::ProcessMotionFeedback() noexcept
+{
+    MotionFeedbackEvent event{};
+
+    // 每個 NC Cycle 最多處理固定筆數，避免異常事件 Burst 讓
+    // 10 ms NC Task 出現過大的單圈負擔。2048 筆 Ring 可容納完整
+    // Epoch 淘汰 Burst，未讀事件由後續 Cycle 繼續 Drain。
+    for (std::size_t i = 0U;
+        i < MOTION_FEEDBACK_NC_DRAIN_LIMIT_PER_TASK;
+        ++i)
+    {
+        if (!m_motion.TryReadMotionFeedback(event))
+        {
+            break;
+        }
+
+        // Runtime Sequence 必須單調連續（UINT64_MAX 後回到 1）。
+        // 發現不連續不在此處改變 NC 行為；先留下診斷計數，後續
+        // Alarm Policy / HMI Snapshot 階段再決定是否升級處置。
+        if (event.sequence !=
+            MOTION_FEEDBACK_SEQUENCE_INVALID)
+        {
+            if (m_lastConsumedMotionFeedbackSequence !=
+                MOTION_FEEDBACK_SEQUENCE_INVALID)
+            {
+                const MotionFeedbackSequence expectedSequence =
+                    (m_lastConsumedMotionFeedbackSequence ==
+                        (std::numeric_limits<MotionFeedbackSequence>::max)())
+                    ? 1ULL
+                    : static_cast<MotionFeedbackSequence>(
+                        m_lastConsumedMotionFeedbackSequence + 1ULL);
+
+                if (event.sequence != expectedSequence)
+                {
+                    ++m_motionFeedbackSequenceGapCount;
+                }
+            }
+
+            m_lastConsumedMotionFeedbackSequence =
+                event.sequence;
+        }
+
+        m_lastMotionFeedback = event;
+        ++m_processedMotionFeedbackCount;
+
+        // Stage NC-0.2D：只做觀察式 Lifecycle 更新，不改變既有 NC PC、
+        // Wait Callback、Single Block 或 Motion 執行結果。
+        m_blockLifecycleLedger.ApplyMotionFeedback(event);
+
+        switch (event.type)
+        {
+        case MotionFeedbackType::ACCEPTED:
+            m_lastAcceptedMotionIdentity = event.identity;
+            ++m_acceptedMotionFeedbackCount;
+            break;
+
+        case MotionFeedbackType::STARTED:
+            m_lastStartedMotionIdentity = event.identity;
+            ++m_startedMotionFeedbackCount;
+            break;
+
+        case MotionFeedbackType::COMPLETED:
+            m_lastCompletedMotionIdentity = event.identity;
+            ++m_completedMotionFeedbackCount;
+            break;
+
+        case MotionFeedbackType::REJECTED:
+            m_lastRejectedMotionIdentity = event.identity;
+            ++m_rejectedMotionFeedbackCount;
+            break;
+
+        case MotionFeedbackType::ABORTED:
+            m_lastAbortedMotionIdentity = event.identity;
+            ++m_abortedMotionFeedbackCount;
+            break;
+
+        case MotionFeedbackType::FAULTED:
+            m_lastFaultedMotionIdentity = event.identity;
+            ++m_faultedMotionFeedbackCount;
+            break;
+
+        case MotionFeedbackType::NONE:
+        case MotionFeedbackType::PROGRESS:
+        case MotionFeedbackType::HELD:
+        case MotionFeedbackType::RESUMED:
+        case MotionFeedbackType::CANCELLED:
+        default:
+            break;
+        }
+    }
+}
+
+
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
     NC_RunCount++;
+
+    // 即使 NC 正處於 Alarm / Reset / Not Ready，也必須先 Drain Feedback，
+    // 否則 Runtime Terminal Event 可能在上層長時間停住時累積。
+    ProcessMotionFeedback();
+    ObserveFeedHoldBoundaryShadow();
 
     if (UpdateSystemVariables_initialize_flag == 0)//第一次初始更新Macro變數
     {
@@ -520,11 +879,12 @@ void NCManager::ProcessTask()
     if (AlarmManager::GetInstance().HasAlarm() || m_state == NCState::ALARM)
     {
         m_state = NCState::ALARM; // 確保 NC 大腦確實進入警報狀態
+        CancelFeedHoldBoundaryShadow(false);
 
         // 🌟 [關鍵新增]：只要在警報狀態，每一毫秒都強制下達急停！
         // (底層的 EmergencyStop 有防重複機制，所以這樣寫既安全又暴力)
 
-        m_motion.EmergencyStopAllAxes();
+        m_motion.RequestEmergencyStopAllAxes();
 
         // ⚠️ 立刻退出迴圈，絕對不准往下執行任何軌跡運算或 G 碼解析！
         return;
@@ -537,7 +897,8 @@ void NCManager::ProcessTask()
     {
 
         // 檢查硬體馬達是否「完全靜止」？
-        if (m_motion.IsGroupStandstill())
+        if (!m_motion.HasPendingSafetyOrRecoveryRequests() &&
+            m_motion.IsGroupStandstill())
         {
 
 
@@ -549,7 +910,16 @@ void NCManager::ProcessTask()
             // 2. 同步手腳的虛擬預讀起點 (徹底消滅幽靈座標！)
             m_motion.SyncVirtualEndPosition();
 
-            // 3. 正式宣告機台準備就緒，可以接受下一個指令了！
+            // 3. 只有原 Safety Generation 才能釋放；舊 Lease 不會誤放新 Owner。
+            if (m_safetyMotionLease.IsValid())
+            {
+                m_motion.ReleaseMotionOwner(
+                    m_safetyMotionLease);
+            }
+
+            m_safetyMotionLease = MotionOwnerLease{};
+
+            // 4. 正式宣告機台準備就緒，可以接受下一個指令了！
             m_state = NCState::READY;
             // 🌟 清理完成後刷新變數
             UpdateSystemVariables();
@@ -618,8 +988,22 @@ void NCManager::ProcessTask()
 // ==========================================
 void NCManager::ProcessExecutionEngine()
 {
-    // 只有 RUN 狀態才能進來執行
+    // 只有 RUN 狀態才會解析 / 預讀。
     if (m_state != NCState::RUN) return;
+
+    // Stage NC-0.2G：一旦遇到 M02 / M30 / Natural EOF，就停止派送
+    // 新 Block，只執行 Cycle End Drain Gate。
+    if (m_programEndBoundary.IsEndPending())
+    {
+        ProcessProgramEndBoundary();
+        return;
+    }
+
+    if (!m_motion.IsMotionOwnerLeaseCurrent(
+        m_programMotionLease))
+    {
+        return;
+    }
 
     // 安全的 PC 控制器
     auto advancePC = [&]() {
@@ -646,11 +1030,56 @@ void NCManager::ProcessExecutionEngine()
     // --- 階段 A：等待條件檢查與【神級任務接力】 ---
     // ==========================================================
     if (m_waitCallback != nullptr) {
-        bool wasWaitingForStart = (m_waitCallback == WaitForCycleStartCallback);
+        const WaitConditionFunc activeWaitCallback = m_waitCallback;
+        const bool wasWaitingForStart =
+            (activeWaitCallback == WaitForCycleStartCallback);
+        const bool wasGMBlockTransaction =
+            (activeWaitCallback == WaitForGMBlockTransactionCallback);
 
-        if (m_waitCallback(this) == false) return; // 繼續等馬達或按鈕
+        const bool legacyReady = activeWaitCallback(this);
+        bool effectiveReady = legacyReady;
+        if (!wasWaitingForStart)
+        {
+            effectiveReady =
+                ApplyCompletionWaitBoundaryGuard(legacyReady);
 
-        m_waitCallback = nullptr; // 任務完成
+            // Stage NC-0.2I.1：只觀察目前 Single Block 的正確完成點。
+            // callbackComplete 使用 Legacy 子條件；Motion / Transaction
+            // 由 Shadow 自己再與 Ledger / NC-0.2H 狀態合併。
+            EvaluateSingleBlockShadow(legacyReady);
+        }
+
+        if (!effectiveReady) return; // Legacy + Ledger 雙鑰尚未同時完成
+
+        // 先卸下已完成的舊 Callback / Binding；交易 Finalize 可能建立
+        // Macro Flow 或 Program End 等下一個狀態，不可再被舊指標覆蓋。
+        m_waitCallback = nullptr;
+        if (!wasWaitingForStart)
+        {
+            ClearCompletionWaitBoundary(false);
+        }
+
+        if (wasGMBlockTransaction)
+        {
+            const bool transactionFinalized =
+                FinalizeGMBlockTransaction();
+
+            // Post Action 成功或失敗都要留下 Single Block Shadow 證據。
+            // 成功時可判斷 Transaction Boundary 已完整；失敗時則記錄
+            // TXN_FAILED，仍然不改變既有 Alarm / Flow Control 行為。
+            EvaluateSingleBlockShadow(true);
+
+            if (!transactionFinalized)
+            {
+                return;
+            }
+
+            // 某些 Program Flow Post Action 可能合法建立新的等待條件。
+            if (m_waitCallback != nullptr)
+            {
+                return;
+            }
+        }
 
         // 🌟 如果剛才是在「等按鈕」(Cycle Start)，現在按鈕解開了，
         // 代表操作員要開始跑這行了，直接 return 進入底下解析派發！
@@ -665,7 +1094,11 @@ void NCManager::ProcessExecutionEngine()
         }
 
         // 2. 如果這行有暫停要求 (M00/M01 或 單步模式)
-        if (m_pauseAfterBlock && m_state != NCState::ALARM && m_state != NCState::P_END) {
+        if (m_pauseAfterBlock &&
+            !m_programEndBoundary.IsEndPending() &&
+            m_state != NCState::ALARM &&
+            m_state != NCState::P_END) {
+            ObserveLegacySingleBlockHold();
             m_pauseAfterBlock = false;
             m_state = NCState::HOLD;                    // 切換為暫停
             m_waitCallback = WaitForCycleStartCallback; // 掛上「等待 Start 按鈕」
@@ -683,208 +1116,424 @@ void NCManager::ProcessExecutionEngine()
 
     if (m_waitCallback == nullptr)
     {
-        bool currentIsMacro = !m_macroStack.empty();
-        int currentPC = currentIsMacro ? m_macroStack.back().currentPC : GetBasePC();
-        const std::vector<std::string>& currentMemory = currentIsMacro ? m_macroStack.back().memory : GetBaseMemory();
+        const bool currentIsMacro = !m_macroStack.empty();
+        const int currentPC =
+            currentIsMacro
+            ? m_macroStack.back().currentPC
+            : GetBasePC();
+
+        const NCProgramCache* currentProgram =
+            currentIsMacro
+            ? m_macroStack.back().program
+            : &GetBaseProgramCache();
+
+        if (currentProgram == nullptr)
+        {
+            AlarmManager::GetInstance().Trigger(
+                AlarmManager::SYNTAX_ERROR,
+                currentPC + 1);
+            m_state = NCState::ALARM;
+            return;
+        }
 
         // ==========================================================
         // --- 結束判斷 (檔尾到達) ---
         // ==========================================================
-        if (currentPC >= currentMemory.size())
+        if (currentPC < 0 ||
+            static_cast<std::size_t>(currentPC) >= currentProgram->Size())
         {
-            if (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupStandstill()) return;
-
-            if (currentIsMacro) {
-                ReturnMacro(); // 副程式結束，返回主程式
+            if (currentIsMacro)
+            {
+                // Macro EOF 仍是返回邊界，不是整份 Program End。
+                if (m_motion.GetQueueSize() > 0 ||
+                    !m_motion.IsGroupStandstill())
+                {
+                    return;
+                }
+                ReturnMacro(true);
             }
-            else {
-                // 🌟 主程式結束：行號歸 0，設定 P_END，徹底卡住！
-                m_macroStack.clear();
-                GetBasePC() = 0;
-                Reset_Gode();
-                UpdateSystemVariables();
-                m_state = NCState::P_END;
+            else
+            {
+                // Stage NC-0.2G：自然檔尾不再直接 Release Owner / P_END。
+                // 由統一 Gate 等待所有預讀 Segment、Feedback 與實體停止。
+                RequestProgramEnd(
+                    NCProgramEndCause::NATURAL_EOF,
+                    currentPC,
+                    static_cast<int>(currentProgram->Size()) + 1,
+                    NC_BLOCK_DISPATCH_ID_INVALID);
             }
             return;
         }
 
         m_programChanged = false;
         m_pauseAfterBlock = false;
-        std::string rawLine = currentMemory[currentPC];
+        m_legacySingleBlockPausePending = false;
 
-        NCBlock block = Parser.ParseLine(rawLine);
+        const NCProgramCacheLine* cachedLine =
+            currentProgram->TryGetLine(currentPC);
+        if (cachedLine == nullptr)
+        {
+            AlarmManager::GetInstance().Trigger(
+                AlarmManager::SYNTAX_ERROR,
+                currentPC + 1);
+            m_state = NCState::ALARM;
+            return;
+        }
 
-        // 選擇性跳躍 (Block Skip '/')
-        if (block.isBlockSkip && m_isBlockSkipEnabled) {
-            // 直接略過
+        // Runtime 只讀取 Load Time 建立的 Pure Parsed Cache。
+        const NCParsedBlock& parsedBlock = cachedLine->parsedBlock;
+        const int sourceLineNumber = cachedLine->sourceLineNumber;
+        const NCProgramCommitSnapshot commitTarget =
+            MakeCurrentProgramCommitTarget(currentPC);
+        NCBlockDispatchId blockDispatchId =
+            NC_BLOCK_DISPATCH_ID_INVALID;
+        bool lineCommitted = false;
+        bool blockSkippedBySwitch = false;
+        NCSingleBlockCandidateKind singleBlockCandidateKind =
+            NCSingleBlockCandidateKind::NONE;
+
+        const auto ensureBlockLifecycle = [&]() -> NCBlockDispatchId
+        {
+            if (blockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID)
+            {
+                blockDispatchId = m_blockLifecycleLedger.BeginBlock(
+                    commitTarget,
+                    sourceLineNumber);
+            }
+            return blockDispatchId;
+        };
+
+        const auto markDispatchFailed = [&](std::uint32_t errorCode)
+        {
+            const NCBlockDispatchId dispatchId = ensureBlockLifecycle();
+            m_blockLifecycleLedger.MarkNCDispatchFailed(
+                dispatchId,
+                errorCode);
+        };
+
+        const auto commitCurrentLine = [&]()
+        {
+            if (!lineCommitted)
+            {
+                const NCBlockDispatchId dispatchId = ensureBlockLifecycle();
+                NCProgramCommitSnapshot committedSnapshot{};
+                if (CommitProgramBlock(
+                    commitTarget,
+                    committedSnapshot))
+                {
+                    m_blockLifecycleLedger.MarkProgramCommitted(
+                        dispatchId,
+                        committedSnapshot);
+                }
+                else
+                {
+                    // 只影響 Ledger 診斷；不改變既有 NC 行為。
+                    m_blockLifecycleLedger.MarkNCDispatchFailed(
+                        dispatchId,
+                        0x020D0001U);
+                }
+                lineCommitted = true;
+            }
+        };
+
+        if (parsedBlock.error != NCParseError::NONE)
+        {
+            markDispatchFailed(
+                static_cast<std::uint32_t>(
+                    AlarmManager::SYNTAX_ERROR));
+            AlarmManager::GetInstance().Trigger(
+                AlarmManager::SYNTAX_ERROR,
+                sourceLineNumber);
+            m_state = NCState::ALARM;
+            return;
+        }
+
+        // 選擇性跳躍開啟時，整行不求值、不 Commit 任何 Macro Side Effect。
+        if (parsedBlock.isBlockSkip && m_isBlockSkipEnabled)
+        {
+            blockSkippedBySwitch = true;
+            // 直接略過，由共用收網邏輯推進 PC。
+        }
+        else if (parsedBlock.controlType == NCParsedControlType::ASSIGNMENT)
+        {
+            // Macro 指派是 Program Commit Barrier。前段運動完整結束後，
+            // 才能改變後續 Block 會讀到的變數狀態。
+            if (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupStandstill())
+            {
+                return;
+            }
+
+            NCMacroAssignmentCommit assignment{};
+            NCExpressionResolveError resolveError =
+                NCExpressionResolveError::NONE;
+            if (!NCExpressionResolver::ResolveAssignment(
+                parsedBlock,
+                MathParser,
+                assignment,
+                resolveError))
+            {
+                const int alarmCode =
+                    resolveError == NCExpressionResolveError::INVALID_VARIABLE_INDEX
+                    ? AlarmManager::MACRO_VARIABLE_INDEX_OUT_OF_RANGE
+                    : AlarmManager::MATH_ERROR;
+                markDispatchFailed(
+                    static_cast<std::uint32_t>(alarmCode));
+                AlarmManager::GetInstance().Trigger(
+                    alarmCode,
+                    sourceLineNumber);
+                m_state = NCState::ALARM;
+                return;
+            }
+
+            // 唯一 Side Effect Commit 點。
+            MacroSys.SetVar(
+                assignment.prefix,
+                assignment.index,
+                assignment.value);
+
+            singleBlockCandidateKind =
+                NCSingleBlockCandidateKind::PROGRAM_CONTROL;
+        }
+        else if (parsedBlock.controlType == NCParsedControlType::GOTO)
+        {
+            // IF / GOTO 是控制流程 Barrier。條件也只在真正到達此 PC、
+            // 且前段 Motion 已完成後才求值。
+            if (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupStandstill())
+            {
+                return;
+            }
+
+            NCGotoDecision decision{};
+            NCExpressionResolveError resolveError =
+                NCExpressionResolveError::NONE;
+            if (!NCExpressionResolver::ResolveGoto(
+                parsedBlock,
+                MathParser,
+                decision,
+                resolveError))
+            {
+                int alarmCode = AlarmManager::MATH_ERROR;
+                if (resolveError == NCExpressionResolveError::INVALID_VARIABLE_INDEX)
+                {
+                    alarmCode = AlarmManager::MACRO_VARIABLE_INDEX_OUT_OF_RANGE;
+                }
+                else if (resolveError == NCExpressionResolveError::INVALID_GOTO_TARGET)
+                {
+                    alarmCode = AlarmManager::SYNTAX_ERROR;
+                }
+                markDispatchFailed(
+                    static_cast<std::uint32_t>(alarmCode));
+                AlarmManager::GetInstance().Trigger(
+                    alarmCode,
+                    sourceLineNumber);
+                m_state = NCState::ALARM;
+                return;
+            }
+
+            if (decision.shouldJump)
+            {
+                int targetPC = -1;
+                if (!TryGetCurrentJumpTarget(
+                    decision.targetSequence,
+                    targetPC))
+                {
+                    markDispatchFailed(
+                        static_cast<std::uint32_t>(
+                            AlarmManager::GOTO_NOT_FOUND));
+                    AlarmManager::GetInstance().Trigger(
+                        AlarmManager::GOTO_NOT_FOUND,
+                        sourceLineNumber);
+                    m_state = NCState::ALARM;
+                    return;
+                }
+
+                setPC(targetPC);
+                m_motion.BeginNewExecutionEpoch(
+                    GetMotionCommandSourceForMode(m_mode));
+                m_motion.SyncVirtualEndPosition();
+                m_programChanged = true;
+            }
+
+            singleBlockCandidateKind =
+                NCSingleBlockCandidateKind::PROGRAM_CONTROL;
         }
         else
         {
-            if (block.isGoto)
+            // G/M/Address Expression 只要讀取 #/@/$，就必須等前段
+            // Motion 完整 Commit 後才求值。這也涵蓋會隨 Runtime
+            // 更新的 $ System Variable，避免 Lookahead 提早取樣。
+            if (parsedBlock.dependsOnMacroState &&
+                (m_motion.GetQueueSize() > 0 ||
+                    !m_motion.IsGroupStandstill()))
             {
-                int targetN = block.gotoTarget;
-                bool found = false;
-                for (int i = 0; i < (int)currentMemory.size(); i++) {
-                    if (currentMemory[i].find('N') != std::string::npos || currentMemory[i].find('n') != std::string::npos) {
-                        NCBlock checkBlock = Parser.ParseLine(currentMemory[i]);
-                        if (checkBlock.has('N') && (int)checkBlock.val('N') == targetN) {
-                            setPC(i);
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if (!found) {
-                    AlarmManager::GetInstance().Trigger(AlarmManager::SYNTAX_ERROR);
-                    m_state = NCState::ALARM;
-                    return;
-                }
-                m_programChanged = true;
-                if (m_isSingleBlockEnabled) m_pauseAfterBlock = true;
+                return;
             }
-            else
+
+            NCBlock block{};
+            NCExpressionResolveError resolveError =
+                NCExpressionResolveError::NONE;
+            if (!NCExpressionResolver::ResolveBlock(
+                parsedBlock,
+                MathParser,
+                block,
+                resolveError))
             {
-                bool isBarrier = false;
-                if (block.mCount > 0) {
-                    int m = block.mCode[0];
-                    if (m == 98 || m == 99 || m == 0 || m == 1 || m == 2 || m == 30) isBarrier = true;
+                int alarmCode = AlarmManager::MATH_ERROR;
+                if (resolveError == NCExpressionResolveError::TOO_MANY_G_CODES)
+                {
+                    alarmCode = AlarmManager::G_code_Count_Error;
+                }
+                else if (resolveError == NCExpressionResolveError::TOO_MANY_M_CODES)
+                {
+                    alarmCode = AlarmManager::M_code_Count_Error;
+                }
+                else if (resolveError == NCExpressionResolveError::INVALID_VARIABLE_INDEX)
+                {
+                    alarmCode = AlarmManager::MACRO_VARIABLE_INDEX_OUT_OF_RANGE;
+                }
+                else if (resolveError == NCExpressionResolveError::INVALID_CODE_VALUE ||
+                    resolveError == NCExpressionResolveError::INVALID_PARSED_BLOCK)
+                {
+                    alarmCode = AlarmManager::SYNTAX_ERROR;
                 }
 
-                isBarrier = isBarrier || (block.hasG && (
-                    block.gCode == 0 || block.gCode == 12 || block.gCode == 4 ||
-                    block.gCode == 7 ||
-                    block.gCode == 20 || block.gCode == 21 ||
-                    block.gCode == 22 || block.gCode == 23 ||
-                    block.gCode == 28 || block.gCode == 30 ||
-                    block.gCode == 32 || block.gCode == 53 || block.gCode == 81 || block.gCode == 161 ||
-                    block.gCode == 65 || block.gCode == 66 || block.gCode == 67 || block.gCode == 92 ||
-                    (block.gCode >= 54 && block.gCode <= 59) ||
-                    (block.gCode >= 154 && block.gCode <= 159) ||
-                    (block.gCode >= 254 && block.gCode <= 259) ||
-                    (block.gCode >= 354 && block.gCode <= 359) ||
-                    (block.gCode >= 454 && block.gCode <= 459) ||
-                    (block.gCode >= 554 && block.gCode <= 559) ||
-                    (block.gCode >= 654 && block.gCode <= 659) ||
-                    (block.gCode >= 754 && block.gCode <= 759) ||
-                    (block.gCode >= 854 && block.gCode <= 859) ||
-                    (block.gCode >= 954 && block.gCode <= 959)
-                    ));
+                markDispatchFailed(
+                    static_cast<std::uint32_t>(alarmCode));
+                AlarmManager::GetInstance().Trigger(
+                    alarmCode,
+                    sourceLineNumber);
+                m_state = NCState::ALARM;
+                return;
+            }
 
-                if (block.hasG && block.gCode == 0 && block.has('P') && block.val('P') == 1) {
-                    isBarrier = false;
-                }
+            singleBlockCandidateKind =
+                ClassifySingleBlockCandidate(block);
 
-                if (m_isSingleBlockEnabled && (block.hasG || block.mCount > 0 || block.has('X') || block.has('Y') || block.has('Z'))) {
+            bool isBarrier = false;
+            if (block.mCount > 0)
+            {
+                const int m = block.mCode[0];
+                if (m == 98 || m == 99 || m == 0 || m == 1 ||
+                    m == 2 || m == 30)
+                {
                     isBarrier = true;
                 }
+            }
 
-                if (isBarrier && (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupStandstill())) {
-                    return;
-                }
+            isBarrier =
+                isBarrier ||
+                NCGCodeSemantics::IsBlockBarrier(block);
 
-                bool wasMainProgram = m_macroStack.empty();
+            if (m_isSingleBlockEnabled &&
+                (block.hasG || block.mCount > 0 ||
+                    block.has('X') || block.has('Y') || block.has('Z')))
+            {
+                isBarrier = true;
+            }
 
-                // 貼標籤邏輯
-                int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
-                int currentBrainToolMode = CoordSys.toolLengthMode;
-                int currentBrainHCode = CoordSys.currentHCode;
-                int curTRad = CoordSys.toolRadiusMode;
-                int curD = CoordSys.currentDCode;
-                bool curIsAbs = CoordSys.isAbsoluteMode;
-                bool curG68 = CoordSys.isG68Active;
-                double curG68Angle = CoordSys.g68Angle;
-                bool curG168 = CoordSys.isWorkpieceRotationActive;
-                int curWCode = CoordSys.currentWCode;
-                bool curG51 = CoordSys.isScalingActive;
-                double curScale = CoordSys.scaleFactor;
-                uint8_t curMirrorMask = 0;
-                for (int i = 0; i < 8; i++) {
-                    if (CoordSys.isMirrorActive[i]) curMirrorMask |= (1 << i);
-                }
-                bool curG16 = CoordSys.isPolarCoordinateActive;
-                bool curG162 = CoordSys.isCAxisOffsetRotationEnabled;
-                int curPlane = CoordSys.activePlane;
+            if (isBarrier &&
+                (m_motion.GetQueueSize() > 0 ||
+                    !m_motion.IsGroupStandstill()))
+            {
+                return;
+            }
 
-                m_motion.SetNextCommandState(currentPC, currentBrainWCS, currentBrainToolMode, currentBrainHCode, curTRad, curD, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+            const NCBlockDispatchId dispatchId = ensureBlockLifecycle();
 
-                if (!block.isEmpty) {
-                    ExecuteBlock(block);
-                }
+            // Stage NC-0.2D：只在 NC Producer 執行緒收集此 Block 建立的
+            // Segment Identity；不把 NC 型別帶入 250 us Motion Runtime。
+            m_motion.BeginProgramBlockMotionCapture();
 
-                if (AlarmManager::GetInstance().HasAlarm()) {
-                    m_state = NCState::ALARM;
-                    if (m_mode == NCOperationMode::MANUAL) m_manualAutoRunning = false;
-                    return;
-                }
+            // Stage NC-0.2A：同一 Block 的 Modal 已先 Commit，才擷取 Snapshot。
+            if (!block.isEmpty)
+            {
+                ExecuteBlock(
+                    block,
+                    currentPC,
+                    sourceLineNumber,
+                    dispatchId);
+            }
 
-                // ==========================================================
-                 // 🌟 【國際標準】：G66 模態巨集自動攔截網 
-                 // ==========================================================
-                if (m_isG66Active && block.gCode != 66 && block.gCode != 67)
+            const MotionProgramBlockCapture motionCapture =
+                m_motion.EndProgramBlockMotionCapture();
+            BindProgramBlockMotionCapture(
+                dispatchId,
+                motionCapture);
+
+            if (AlarmManager::GetInstance().HasAlarm())
+            {
+                m_blockLifecycleLedger.MarkNCDispatchFailed(
+                    dispatchId,
+                    0U);
+                m_state = NCState::ALARM;
+                if (m_mode == NCOperationMode::MANUAL)
                 {
-                    // 🌟 一句話呼叫過濾器，取代原本又臭又長的判斷式！
-                    bool isRealMotion = IsRealMotionBlock(block);
+                    m_manualAutoRunning = false;
+                }
+                return;
+            }
 
-                    // 【防無限遞迴護城河】：必須確保目前在大腦的主程式層級
-                    if (isRealMotion && m_macroStack.empty())
+            // G66 模態巨集自動攔截。
+            if (m_isG66Active &&
+                !NCGCodeSemantics::Contains(block, 66) &&
+                !NCGCodeSemantics::Contains(block, 67))
+            {
+                const bool isRealMotion = IsRealMotionBlock(block);
+                if (isRealMotion && m_macroStack.empty())
+                {
+                    const std::string macroFile =
+                        "O" + std::to_string(m_g66P) + ".nc";
+
+                    if (CallMacro(macroFile))
                     {
-                        std::string macroFile = "O" + std::to_string(m_g66P) + ".nc";
-
-                        if (CallMacro(macroFile))
+                        m_macroStack.back().repeatCount = m_g66L;
+                        for (int i = 0; i < 26; ++i)
                         {
-                            // 設定 L 重複次數
-                            m_macroStack.back().repeatCount = m_g66L;
-
-                            // 傳遞區域變數
-                            for (int i = 0; i < 26; i++) {
-                                char c = 'A' + i;
-                                if (c != 'P' && c != 'G' && c != 'L' && m_g66Block.has(c)) {
-                                    MacroSys.SetVar('#', i + 1, m_g66Block.val(c));
-                                }
+                            const char c = static_cast<char>('A' + i);
+                            if (c != 'P' && c != 'G' && c != 'L' &&
+                                m_g66Block.has(c))
+                            {
+                                MacroSys.SetVar(
+                                    '#',
+                                    i + 1,
+                                    m_g66Block.val(c));
                             }
                         }
                     }
                 }
-
-                // 🌟 M 碼暫停與結束旗標設定
-                if (block.mCount > 0) {
-                    int m = block.mCode[0];
-                    if (m == 99 && wasMainProgram) {
-                        GetBasePC() = 0;
-                        m_programChanged = true;
-                    }
-                    // 🌟 【關鍵修正】：移除了 m == 0！
-                    // M00 已經由底層 PLC 完美暫停了，大腦不需要再多管閒事掛上第二道鎖！
-                    else if (m == 1 && m_isOptionalStopEnabled) {
-                        m_pauseAfterBlock = true; // 只有 M01 是大腦自己攔截
-                    }
-                    else if (m == 2 || m == 30) {
-                        // 🌟 M02/M30：主程式結束！直接行號歸 0，切換 P_END 並立刻 return 斬斷！
-                        m_macroStack.clear();
-                        GetBasePC() = 0;
-                        Reset_Gode();
-                        UpdateSystemVariables();
-
-                        // 🌟 依據模式決定去留
-                        if (m_mode == NCOperationMode::MANUAL) {
-                            m_manualAutoRunning = false;
-                            m_state = NCState::READY; // 手動巨集結束，回到 READY
-                        }
-                        else if (m_mode == NCOperationMode::MDI) {
-                            m_state = NCState::READY; // MDI 結束，回到 READY
-                        }
-                        else {
-                            m_state = NCState::P_END; // 主程式結束，才卡在 P_END
-                        }
-                        return; // 斬斷本回合！
-                    }
-                }
             }
+
+            // G66 可能在這裡建立 Macro Frame；失敗時不可提交本行。
+            if (AlarmManager::GetInstance().HasAlarm())
+            {
+                m_blockLifecycleLedger.MarkNCDispatchFailed(
+                    dispatchId,
+                    0U);
+                m_state = NCState::ALARM;
+                if (m_mode == NCOperationMode::MANUAL)
+                {
+                    m_manualAutoRunning = false;
+                }
+                return;
+            }
+
+            // 本行已完成 Runtime Resolve 與 NC Side Effect / Downstream Dispatch。
+            // Motion 實際完成仍由 Feedback / Physical PC 表示。
+            commitCurrentLine();
+
+            // Stage NC-0.2H：M00/M01/M98/M99/M02/M30 的 Post Action
+            // 由 G/M Transaction 在所有同行動作與 Motion Ledger 完成後套用。
+            // 此處不可再提前改變 PC、HOLD 或 Program End 狀態。
         }
 
-        // 單步模式，要求這行跑完後暫停
+        // Block Skip、Assignment、GOTO 與空白行會在這裡提交；
+        // 一般 G/M Block 已先提交，重複呼叫由 lambda 保護。
+        commitCurrentLine();
+
+        // Legacy Single Block 行為保持不變；NC-0.2I.1 只在旁邊比對。
         if (m_isSingleBlockEnabled && m_state != NCState::P_END) {
             m_pauseAfterBlock = true;
+            m_legacySingleBlockPausePending = true;
         }
 
         // 🌟 派發後收網處理
@@ -896,6 +1545,39 @@ void NCManager::ProcessExecutionEngine()
             else {
                 advancePC(); // 沒事，直接推進下一行
             }
+        }
+
+        if (m_isSingleBlockEnabled)
+        {
+            const NCBlockDispatchId dispatchId =
+                ensureBlockLifecycle();
+
+            if (!blockSkippedBySwitch &&
+                singleBlockCandidateKind !=
+                NCSingleBlockCandidateKind::NONE)
+            {
+                ArmSingleBlockShadow(
+                    singleBlockCandidateKind,
+                    dispatchId,
+                    commitTarget,
+                    sourceLineNumber);
+            }
+            else
+            {
+                m_singleBlockBoundaryShadow.NoteNotEligible(
+                    dispatchId,
+                    commitTarget,
+                    sourceLineNumber);
+            }
+        }
+
+        if (m_waitCallback != nullptr &&
+            m_waitCallback != WaitForCycleStartCallback &&
+            blockDispatchId != NC_BLOCK_DISPATCH_ID_INVALID)
+        {
+            BindCompletionWaitBoundary(
+                blockDispatchId,
+                m_waitCallback);
         }
     }
 }
@@ -914,59 +1596,510 @@ void NCManager::ProcessManualMode()
     // (將你原本讀取 pShm 按鈕，呼叫 m_motion.Jog(...) 的邏輯寫在這裡)
 }
 // ==========================================
-// 🌟 動態獲取當前模式的 PC 指標
+// Base Program Cache / Dispatch PC / Commit PC
 // ==========================================
 int& NCManager::GetBasePC()
 {
     if (m_mode == NCOperationMode::MDI) return m_mdiPC;
     if (m_mode == NCOperationMode::MANUAL) return m_manualPC;
-    return m_programPC; // 預設為 MEMORY 主程式
+    return m_programPC;
 }
 
-// ==========================================
-// 🌟 動態獲取當前模式的記憶體緩衝區
-// ==========================================
-std::vector<std::string>& NCManager::GetBaseMemory()
+int NCManager::GetBasePCValue() const noexcept
 {
-    if (m_mode == NCOperationMode::MDI) return m_mdiMemory;
-    if (m_mode == NCOperationMode::MANUAL) return m_manualMemory;
-    return m_programMemory; // 預設為 MEMORY 主程式
+    if (m_mode == NCOperationMode::MDI) return m_mdiPC;
+    if (m_mode == NCOperationMode::MANUAL) return m_manualPC;
+    return m_programPC;
 }
-void NCManager::ExecuteBlock(const NCBlock& block)
+
+NCProgramCache& NCManager::GetBaseProgramCache() noexcept
 {
-    // 預設不等待
-    m_waitCallback = nullptr;
+    if (m_mode == NCOperationMode::MDI) return m_mdiProgramCache;
+    if (m_mode == NCOperationMode::MANUAL) return m_manualProgramCache;
+    return m_programCache;
+}
 
+const NCProgramCache& NCManager::GetBaseProgramCache() const noexcept
+{
+    if (m_mode == NCOperationMode::MDI) return m_mdiProgramCache;
+    if (m_mode == NCOperationMode::MANUAL) return m_manualProgramCache;
+    return m_programCache;
+}
 
+int& NCManager::GetBaseCommittedPC() noexcept
+{
+    if (m_mode == NCOperationMode::MDI) return m_mdiCommittedPC;
+    if (m_mode == NCOperationMode::MANUAL) return m_manualCommittedPC;
+    return m_programCommittedPC;
+}
 
-    // ==========================================
-    // 🌟 安全性檢查：單節是否包含多個 G 碼
-    // ==========================================
-    if (block.gCount > 1)
+int NCManager::GetBaseCommittedPCValue() const noexcept
+{
+    if (m_mode == NCOperationMode::MDI) return m_mdiCommittedPC;
+    if (m_mode == NCOperationMode::MANUAL) return m_manualCommittedPC;
+    return m_programCommittedPC;
+}
+
+NCProgramScope NCManager::GetBaseProgramScope() const noexcept
+{
+    switch (m_mode)
     {
-        //DEBUG_PRINT("[Alarm] Multiple G-Codes in a single block! Found: %d\n", block.gCount);
-        AlarmManager::GetInstance().Trigger(AlarmManager::G_code_Count_Error);
-        m_state = NCState::HOLD;
-        return; // 直接中止
+    case NCOperationMode::MDI:
+        return NCProgramScope::MDI;
+    case NCOperationMode::MANUAL:
+        return NCProgramScope::MANUAL_AUTO;
+    case NCOperationMode::MEMORY:
+    case NCOperationMode::EDIT:
+    default:
+        return NCProgramScope::MEMORY;
+    }
+}
+
+bool NCManager::TryGetCurrentJumpTarget(
+    int sequenceNumber,
+    int& targetPC) const
+{
+    if (!m_macroStack.empty())
+    {
+        const NCProgramCache* program = m_macroStack.back().program;
+        return program != nullptr &&
+            program->TryFindSequence(sequenceNumber, targetPC);
     }
 
-    // ==========================================
-    // 🌟 安全性檢查 2：單節是否包含多個 M 碼
-    // ==========================================
-    if (block.mCount > 1) {
-        //DEBUG_PRINT("[Alarm] Multiple M-Codes in a single block! Found: %d\n", block.mCount);
+    return GetBaseProgramCache().TryFindSequence(sequenceNumber, targetPC);
+}
 
-        // 建議未來可以在 AlarmManager 新增一個 M_CODE_CONFLICT 警報
-        // 目前先借用 SYNTAX_ERROR
-        AlarmManager::GetInstance().Trigger(AlarmManager::M_code_Count_Error);
+NCProgramCommitSnapshot NCManager::MakeCurrentProgramCommitTarget(
+    int sourcePC) const noexcept
+{
+    NCProgramCommitSnapshot target{};
+    target.sourcePC = sourcePC;
+
+    if (!m_macroStack.empty())
+    {
+        const MacroFrame& frame = m_macroStack.back();
+        target.scope = NCProgramScope::MACRO;
+        target.frameId = frame.frameId;
+        if (frame.program != nullptr)
+        {
+            target.cacheGeneration = frame.program->GetGeneration();
+        }
+        return target;
+    }
+
+    target.scope = GetBaseProgramScope();
+    target.cacheGeneration = GetBaseProgramCache().GetGeneration();
+    return target;
+}
+
+bool NCManager::CommitProgramBlock(
+    const NCProgramCommitSnapshot& target,
+    NCProgramCommitSnapshot& committedSnapshot) noexcept
+{
+    committedSnapshot = NCProgramCommitSnapshot{};
+
+    if (target.scope == NCProgramScope::NONE ||
+        target.cacheGeneration == NC_PROGRAM_CACHE_GENERATION_INVALID ||
+        target.sourcePC < 0)
+    {
+        return false;
+    }
+
+    // Cache Generation 是 Commit 的最後一道防線。
+    // 若程式在 Resolve / Dispatch 期間已被重新載入或 Reset，舊 Target
+    // 不可更新 Committed PC，也不可覆蓋 Last Commit Snapshot。
+    bool targetIsCurrent = false;
+    switch (target.scope)
+    {
+    case NCProgramScope::MEMORY:
+        targetIsCurrent =
+            m_programCache.GetGeneration() == target.cacheGeneration &&
+            static_cast<std::size_t>(target.sourcePC) < m_programCache.Size();
+        break;
+    case NCProgramScope::MDI:
+        targetIsCurrent =
+            m_mdiProgramCache.GetGeneration() == target.cacheGeneration &&
+            static_cast<std::size_t>(target.sourcePC) < m_mdiProgramCache.Size();
+        break;
+    case NCProgramScope::MANUAL_AUTO:
+        targetIsCurrent =
+            m_manualProgramCache.GetGeneration() == target.cacheGeneration &&
+            static_cast<std::size_t>(target.sourcePC) < m_manualProgramCache.Size();
+        break;
+    case NCProgramScope::MACRO:
+        if (target.frameId != NC_PROGRAM_FRAME_ID_INVALID)
+        {
+            // M99 會先 Pop Frame，再回到此 Commit 點；因此允許 Frame 已離開
+            // Stack，但其 Parsed Cache 必須仍屬於目前主程式 Session。
+            for (const auto& entry : m_macroProgramCaches)
+            {
+                if (entry.second.GetGeneration() == target.cacheGeneration &&
+                    static_cast<std::size_t>(target.sourcePC) < entry.second.Size())
+                {
+                    targetIsCurrent = true;
+                    break;
+                }
+            }
+        }
+        break;
+    case NCProgramScope::NONE:
+    default:
+        break;
+    }
+
+    if (!targetIsCurrent)
+    {
+        return false;
+    }
+
+    NCProgramCommitSequence sequence =
+        NC_PROGRAM_COMMIT_SEQUENCE_INVALID;
+    do
+    {
+        sequence = m_nextProgramCommitSequence++;
+    } while (sequence == NC_PROGRAM_COMMIT_SEQUENCE_INVALID);
+
+    m_lastProgramCommit = target;
+    m_lastProgramCommit.sequence = sequence;
+
+    switch (target.scope)
+    {
+    case NCProgramScope::MEMORY:
+        m_programCommittedPC = target.sourcePC;
+        break;
+    case NCProgramScope::MDI:
+        m_mdiCommittedPC = target.sourcePC;
+        break;
+    case NCProgramScope::MANUAL_AUTO:
+        m_manualCommittedPC = target.sourcePC;
+        break;
+    case NCProgramScope::MACRO:
+        for (MacroFrame& frame : m_macroStack)
+        {
+            if (frame.frameId == target.frameId &&
+                frame.program != nullptr &&
+                frame.program->GetGeneration() == target.cacheGeneration)
+            {
+                frame.committedPC = target.sourcePC;
+                break;
+            }
+        }
+        break;
+    case NCProgramScope::NONE:
+    default:
+        break;
+    }
+
+    committedSnapshot = m_lastProgramCommit;
+    return true;
+}
+
+void NCManager::BindProgramBlockMotionCapture(
+    NCBlockDispatchId dispatchId,
+    const MotionProgramBlockCapture& capture) noexcept
+{
+    if (dispatchId == NC_BLOCK_DISPATCH_ID_INVALID)
+    {
+        return;
+    }
+
+    for (std::size_t i = 0U; i < capture.count; ++i)
+    {
+        const MotionProgramBlockSubmission& submission =
+            capture.submissions[i];
+
+        m_blockLifecycleLedger.BindMotionSegment(
+            dispatchId,
+            submission.identity,
+            submission.producerAccepted,
+            submission.immediateRejectReason);
+    }
+
+    if (capture.overflow)
+    {
+        m_blockLifecycleLedger.MarkMotionCaptureOverflow(
+            dispatchId);
+    }
+}
+
+void NCManager::ResetActiveProgramCommitBoundary() noexcept
+{
+    if (!m_macroStack.empty())
+        m_macroStack.back().committedPC = -1;
+    else
+        GetBaseCommittedPC() = -1;
+
+    m_lastProgramCommit = NCProgramCommitSnapshot{};
+}
+
+void NCManager::ResetAllProgramCommitBoundaries() noexcept
+{
+    m_programCommittedPC = -1;
+    m_mdiCommittedPC = -1;
+    m_manualCommittedPC = -1;
+    for (MacroFrame& frame : m_macroStack)
+        frame.committedPC = -1;
+    m_lastProgramCommit = NCProgramCommitSnapshot{};
+}
+
+NCProgramFrameId NCManager::AllocateMacroFrameId() noexcept
+{
+    NCProgramFrameId frameId = m_nextMacroFrameId++;
+    if (frameId == NC_PROGRAM_FRAME_ID_INVALID)
+        frameId = m_nextMacroFrameId++;
+    return frameId;
+}
+
+int NCManager::GetActiveDispatchPC() const noexcept
+{
+    if (!m_macroStack.empty()) return m_macroStack.back().currentPC;
+    return GetBasePCValue();
+}
+
+int NCManager::GetActiveCommittedPC() const noexcept
+{
+    if (!m_macroStack.empty()) return m_macroStack.back().committedPC;
+    return GetBaseCommittedPCValue();
+}
+void NCManager::CapturePendingCommandState(int sourcePC)
+{
+    const int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
+    const int currentBrainToolMode = CoordSys.toolLengthMode;
+    const int currentBrainHCode = CoordSys.currentHCode;
+    const int currentToolRadiusMode = CoordSys.toolRadiusMode;
+    const int currentDCode = CoordSys.currentDCode;
+    const bool currentIsAbsolute = CoordSys.isAbsoluteMode;
+    const bool currentG68 = CoordSys.isG68Active;
+    const double currentG68Angle = CoordSys.g68Angle;
+    const bool currentG168 = CoordSys.isWorkpieceRotationActive;
+    const int currentWCode = CoordSys.currentWCode;
+    const bool currentG51 = CoordSys.isScalingActive;
+    const double currentScale = CoordSys.scaleFactor;
+
+    std::uint8_t currentMirrorMask = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        if (CoordSys.isMirrorActive[i])
+        {
+            currentMirrorMask |=
+                static_cast<std::uint8_t>(1u << i);
+        }
+    }
+
+    const bool currentG16 = CoordSys.isPolarCoordinateActive;
+    const bool currentG162 = CoordSys.isCAxisOffsetRotationEnabled;
+    const int currentPlane = CoordSys.activePlane;
+
+    m_motion.SetPendingCommandSource(
+        GetMotionCommandSourceForMode(m_mode));
+
+    m_motion.SetNextCommandState(
+        sourcePC,
+        currentBrainWCS,
+        currentBrainToolMode,
+        currentBrainHCode,
+        currentToolRadiusMode,
+        currentDCode,
+        currentIsAbsolute,
+        currentG68,
+        currentG68Angle,
+        currentG168,
+        currentWCode,
+        currentG51,
+        currentScale,
+        currentMirrorMask,
+        currentG16,
+        currentG162,
+        currentPlane);
+}
+
+WaitConditionFunc NCManager::DispatchSingleGCode(
+    const NCBlock& sourceBlock,
+    int gCode)
+{
+    NCBlock block = sourceBlock;
+    block.hasG = true;
+    block.gCode = gCode;
+    block.gCount = 1;
+    for (int i = 0; i < NC_MAX_G_CODES_PER_BLOCK; ++i)
+    {
+        block.gCodes[i] = 0;
+    }
+    block.gCodes[0] = gCode;
+
+    switch (gCode)
+    {
+    case 0:
+        return GCodeHandlers::Handle_G00(block, this);
+    case 7:
+        return GCodeHandlers::Handle_G07(block, this);
+    case 12:
+        return GCodeHandlers::Handle_G12(block, this);
+    case 161:
+        return GCodeHandlers::Handle_G161(block, this);
+    case 53:
+        return GCodeHandlers::Handle_G53(block, this);
+    case 81:
+        return GCodeHandlers::Handle_G81(block, this);
+    case 28:
+        return GCodeHandlers::Handle_G28(block, this);
+    case 30:
+        return GCodeHandlers::Handle_G30(block, this);
+    case 32:
+        return GCodeHandlers::Handle_G32(block, this);
+    case 4:
+        return GCodeHandlers::Handle_G04(block, this);
+
+    case 54: case 55: case 56: case 57: case 58: case 59:
+    case 154: case 155: case 156: case 157: case 158: case 159:
+    case 254: case 255: case 256: case 257: case 258: case 259:
+    case 354: case 355: case 356: case 357: case 358: case 359:
+    case 454: case 455: case 456: case 457: case 458: case 459:
+    case 554: case 555: case 556: case 557: case 558: case 559:
+    case 654: case 655: case 656: case 657: case 658: case 659:
+    case 754: case 755: case 756: case 757: case 758: case 759:
+    case 854: case 855: case 856: case 857: case 858: case 859:
+    case 954: case 955: case 956: case 957: case 958: case 959:
+        return GCodeHandlers::Handle_GCode(block, this);
+
+    case 10:
+        return GCodeHandlers::Handle_G10(block, this);
+    case 160:
+        return GCodeHandlers::Handle_G160(block, this);
+    case 68:
+        return GCodeHandlers::Handle_G68(block, this);
+    case 69:
+        return GCodeHandlers::Handle_G69(block, this);
+
+    case 90: case 91: case 92:
+    case 20: case 21:
+    case 22: case 23:
+    case 43: case 44: case 49:
+    case 17: case 18: case 19:
+    case 65: case 66: case 67:
+    case 162: case 163:
+        return GCodeHandlers::Handle_GCode(block, this);
+
+    case 168:
+        return GCodeHandlers::Handle_G168(block, this);
+    case 169:
+        return GCodeHandlers::Handle_G169(block, this);
+    case 40:
+        return GCodeHandlers::Handle_G40(block, this);
+    case 41:
+        return GCodeHandlers::Handle_G41(block, this);
+    case 42:
+        return GCodeHandlers::Handle_G42(block, this);
+    case 50:
+        return GCodeHandlers::Handle_G50(block, this);
+    case 51:
+        return GCodeHandlers::Handle_G51(block, this);
+    case 150:
+        return GCodeHandlers::Handle_G150(block, this);
+    case 151:
+        return GCodeHandlers::Handle_G151(block, this);
+    case 15:
+        return GCodeHandlers::Handle_G15(block, this);
+    case 16:
+        return GCodeHandlers::Handle_G16(block, this);
+
+    default:
+        AlarmManager::GetInstance().Trigger(
+            AlarmManager::Unable_to_recognize_G_code);
+        m_state = NCState::HOLD;
+        return nullptr;
+    }
+}
+
+void NCManager::ExecuteBlock(
+    const NCBlock& block,
+    int sourcePC,
+    int sourceLineNumber,
+    NCBlockDispatchId dispatchId)
+{
+    m_waitCallback = nullptr;
+    const bool blockStartedInMainProgram = m_macroStack.empty();
+
+    NCGCodeExecutionPlan plan{};
+    NCGCodePlanError planError = NCGCodePlanError::NONE;
+    int firstConflictCode = -1;
+    int secondConflictCode = -1;
+
+    if (!NCGCodeSemantics::BuildExecutionPlan(
+        block,
+        plan,
+        planError,
+        firstConflictCode,
+        secondConflictCode))
+    {
+        (void)firstConflictCode;
+        (void)secondConflictCode;
+
+        const int alarmCode =
+            planError == NCGCodePlanError::UNSUPPORTED_G_CODE
+            ? AlarmManager::Unable_to_recognize_G_code
+            : AlarmManager::G_code_Count_Error;
+
+        AlarmManager::GetInstance().Trigger(alarmCode);
         m_state = NCState::HOLD;
         return;
     }
 
+    // 單一 Block 目前仍只允許一個 M-code。
+    if (block.mCount > 1)
+    {
+        AlarmManager::GetInstance().Trigger(
+            AlarmManager::M_code_Count_Error);
+        m_state = NCState::HOLD;
+        return;
+    }
 
-    // ==========================================
-    // 1. 瞬間完成的設定 (不需等待)
-    // ==========================================
+    // G65 本身會建立新的 Macro Program Scope。同行的普通 Auxiliary M
+    // 可以由 Transaction 等待，但不可再搭配另一個 Program Flow M。
+    if (block.mCount > 0 &&
+        NCGCodeSemantics::Contains(block, 65))
+    {
+        const int m = block.mCode[0];
+        if (m == 98 || m == 99 || m == 2 || m == 30)
+        {
+            AlarmManager::GetInstance().Trigger(
+                AlarmManager::G_Code_Invalid_parameter,
+                sourceLineNumber);
+            m_state = NCState::HOLD;
+            return;
+        }
+    }
+
+    int validatedM98P = 0;
+    int validatedM98L = 1;
+    if (block.mCount > 0 && block.mCode[0] == 98)
+    {
+        // M98 的 P/L 參數由 M-code 擁有。為避免與同行 Primary G
+        // Action 共用 P/L 產生歧義，M98 目前只允許搭配純設定型 G。
+        const bool validP =
+            TryGetPositiveIntegerAddress(
+                block,
+                'P',
+                validatedM98P);
+
+        const bool validL =
+            !block.has('L') ||
+            TryGetPositiveIntegerAddress(
+                block,
+                'L',
+                validatedM98L);
+
+        if (!validP || !validL || plan.hasPrimaryAction)
+        {
+            AlarmManager::GetInstance().Trigger(
+                AlarmManager::G_Code_Invalid_parameter,
+                sourceLineNumber);
+            m_state = NCState::HOLD;
+            return;
+        }
+    }
+
+    // 瞬間完成的設定。
     if (block.has('E'))
     {
         // m_edmManager.ApplyE(block.val('E'));
@@ -975,162 +2108,125 @@ void NCManager::ExecuteBlock(const NCBlock& block)
     {
         // m_edmManager.ApplyB(block.val('B'));
     }
-    // 範例：在處理單節含 T 碼時呼叫
     if (block.has('T'))
     {
-        int tVal = (int)block.val('T');
-        CoordSys.SetToolNumber(tVal, this);
+        CoordSys.SetToolNumber(
+            static_cast<int>(block.val('T')),
+            this);
     }
 
+    WaitConditionFunc lastSettingCallback = nullptr;
+    WaitConditionFunc primaryActionCallback = nullptr;
 
-    // ==========================================
-    // 2. G 碼轉接中心 (Routing Hub)
-    // ==========================================
-    if (block.hasG) {
-        switch (block.gCode)
+    for (int i = 0; i < plan.count; ++i)
+    {
+        const int gCode = plan.orderedCodes[i];
+        NCGCodeDescriptor descriptor{};
+        if (!NCGCodeSemantics::TryGetDescriptor(
+            gCode,
+            descriptor))
+        {
+            AlarmManager::GetInstance().Trigger(
+                AlarmManager::Unable_to_recognize_G_code);
+            m_state = NCState::HOLD;
+            return;
+        }
+
+        // 關鍵順序：同一 Block 的 G20/G17/G90/G54/G43/G40... 已先 Commit，
+        // 再擷取 Motion Frame Snapshot，最後才派送唯一 Primary Action。
+        if (descriptor.role == NCGCodeRole::PRIMARY_ACTION)
+        {
+            CapturePendingCommandState(sourcePC);
+        }
+
+        WaitConditionFunc callback =
+            DispatchSingleGCode(block, gCode);
+
+        if (AlarmManager::GetInstance().HasAlarm())
+        {
+            m_waitCallback = callback;
+            return;
+        }
+
+        if (descriptor.role == NCGCodeRole::PRIMARY_ACTION)
+        {
+            primaryActionCallback = callback;
+        }
+        else if (callback != nullptr)
+        {
+            lastSettingCallback = callback;
+        }
+    }
+
+    // 有 Primary Action 時，其 Callback 是 G 子動作的唯一等待來源。
+    // G00 P1 可合法回傳 nullptr；Motion Ledger 仍會提供第二把鑰匙。
+    const WaitConditionFunc gWaitCallback =
+        plan.hasPrimaryAction
+        ? primaryActionCallback
+        : lastSettingCallback;
+
+    if (block.mCount > 0)
+    {
+        const int m = block.mCode[0];
+        WaitConditionFunc mWaitCallback = nullptr;
+        NCGMBlockPostAction postAction = NCGMBlockPostAction::NONE;
+        int pValue = 0;
+        int repeatCount = 1;
+        const bool fromMainProgram = blockStartedInMainProgram;
+
+        switch (m)
         {
         case 0:
-            m_waitCallback = GCodeHandlers::Handle_G00(block, this);
+            postAction = NCGMBlockPostAction::PROGRAM_STOP_M00;
             break;
-        case 7:
-            m_waitCallback = GCodeHandlers::Handle_G07(block, this);
+
+        case 1:
+            mWaitCallback = GCodeHandlers::Handle_MCode(block, this);
+            postAction = NCGMBlockPostAction::OPTIONAL_STOP_M01;
             break;
-        case 12:
-            m_waitCallback = GCodeHandlers::Handle_G12(block, this);
-            break;
-        case 161:
-            m_waitCallback = GCodeHandlers::Handle_G161(block, this);
-            break;
-        case 53:
-            m_waitCallback = GCodeHandlers::Handle_G53(block, this);
-            break;
-        case 81:
-            m_waitCallback = GCodeHandlers::Handle_G81(block, this);
-            break;
-        case 28:
-            m_waitCallback = GCodeHandlers::Handle_G28(block, this);
+
+        case 2:
+            postAction = NCGMBlockPostAction::PROGRAM_END_M02;
             break;
 
         case 30:
-            m_waitCallback = GCodeHandlers::Handle_G30(block, this);
-            break;
-        case 32:
-            m_waitCallback = GCodeHandlers::Handle_G32(block, this);
-            break;
-        case 4:
-
-            m_waitCallback = GCodeHandlers::Handle_G04(block, this);
+            postAction = NCGMBlockPostAction::PROGRAM_END_M30;
             break;
 
-        case 54: case 55: case 56: case 57: case 58: case 59:
-        case 154: case 155: case 156: case 157: case 158: case 159:
-        case 254: case 255: case 256: case 257: case 258: case 259:
-        case 354: case 355: case 356: case 357: case 358: case 359:
-        case 454: case 455: case 456: case 457: case 458: case 459:
-        case 554: case 555: case 556: case 557: case 558: case 559:
-        case 654: case 655: case 656: case 657: case 658: case 659:
-        case 754: case 755: case 756: case 757: case 758: case 759:
-        case 854: case 855: case 856: case 857: case 858: case 859:
-        case 954: case 955: case 956: case 957: case 958: case 959:
-            m_waitCallback = GCodeHandlers::Handle_GCode(block, this);
-            break;
-        case 10:
-            m_waitCallback = GCodeHandlers::Handle_G10(block, this);
-            break;
-        case 160:
-            m_waitCallback = GCodeHandlers::Handle_G160(block, this);
-            break;
-        case 68:
-            m_waitCallback = GCodeHandlers::Handle_G68(block, this);
-            break;
-        case 69:
-            m_waitCallback = GCodeHandlers::Handle_G69(block, this);
-            break;
-        case 90: case 91:case 92:
-        case 20: case 21:
-        case 22: case 23:
-        case 43: case 44: case 49:
-        case 17: case 18:case 19:
-        case 65:  case 66: case 67:
-        case 162: case 163:
-
-            // 狀態設定回傳的一定是 nullptr (不需等待)
-            m_waitCallback = GCodeHandlers::Handle_GCode(block, this);
+        case 98:
+            pValue = validatedM98P;
+            repeatCount = validatedM98L;
+            postAction = NCGMBlockPostAction::CALL_M98;
             break;
 
-        case 168:
-            m_waitCallback = GCodeHandlers::Handle_G168(block, this);
-            break;
-        case 169:
-            m_waitCallback = GCodeHandlers::Handle_G169(block, this);
-            break;
-        case 40:
-            m_waitCallback = GCodeHandlers::Handle_G40(block, this);
-            break;
-        case 41:
-            m_waitCallback = GCodeHandlers::Handle_G41(block, this);
-            break;
-        case 42:
-            m_waitCallback = GCodeHandlers::Handle_G42(block, this);
-            break;
-        case 50:
-            m_waitCallback = GCodeHandlers::Handle_G50(block, this);
-            break;
-        case 51:
-            m_waitCallback = GCodeHandlers::Handle_G51(block, this);
-            break;
-        case 150:
-            m_waitCallback = GCodeHandlers::Handle_G150(block, this);
-            break;
-        case 151:
-            m_waitCallback = GCodeHandlers::Handle_G151(block, this);
-            break;
-        case 15:
-            m_waitCallback = GCodeHandlers::Handle_G15(block, this);
-            break;
-        case 16:
-            m_waitCallback = GCodeHandlers::Handle_G16(block, this);
+        case 99:
+            postAction = NCGMBlockPostAction::RETURN_M99;
             break;
 
         default:
-            // 🌟 關鍵修改：不支援的 G 碼，立刻觸發警報並鎖機！
-            //DEBUG_PRINT("[Alarm] Unsupported G-Code: G%02d\n", block.gCode);
-            AlarmManager::GetInstance().Trigger(AlarmManager::Unable_to_recognize_G_code);
-            m_state = NCState::HOLD;
+            mWaitCallback = GCodeHandlers::Handle_MCode(block, this);
             break;
         }
-    }
 
-    // ==========================================
-    // 3. 需要等待的動作：M 碼
-    // ==========================================
-    if (block.mCount > 0)
+        BeginGMBlockTransaction(
+            gWaitCallback,
+            mWaitCallback,
+            postAction,
+            sourcePC,
+            sourceLineNumber,
+            dispatchId,
+            m,
+            pValue,
+            repeatCount,
+            fromMainProgram);
+
+        m_waitCallback = WaitForGMBlockTransactionCallback;
+    }
+    else
     {
-        int m = block.mCode[0];
-
-        // 🌟 流程控制類 M 碼 (自己處理)
-
-        if (m == 98)
-        {
-            int pVal = block.has('P') ? (int)block.val('P') : 0;
-            std::string macroFile = "O" + std::to_string(pVal) + ".nc";
-            CallMacro(macroFile);
-        }
-        else if (m == 99)
-        {
-            ReturnMacro();
-        }
-        else
-        {
-            // 🌟 IO / 狀態類 M 碼 (丟給 GCodeHandlers)
-            // 這會處理 M00, M30, M03, M08 等等
-            m_waitCallback = GCodeHandlers::Handle_MCode(block, this);
-        }
+        m_waitCallback = gWaitCallback;
     }
 
-
-
-    // 🌟 在單節解單/發包完成後，立刻刷一次系統變數！
     UpdateSystemVariables();
 }
 
@@ -1224,25 +2320,56 @@ char NCManager::GetAxisName(
 // ==========================================
 bool NCManager::LoadMDI(const std::string& mdiContent)
 {
-    m_mdiMemory.clear();
-    m_mdiPC = 0;
-
+    std::vector<std::string> rawLines;
     std::stringstream ss(mdiContent);
     std::string line;
     int lineCount = 0;
 
-    while (std::getline(ss, line, '\n')) {
-        if (!line.empty() && line.find_first_not_of("\r\t ") != std::string::npos) {
-            m_mdiMemory.push_back(line);
-            lineCount++;
+    while (std::getline(ss, line, '\n'))
+    {
+        if (!line.empty() &&
+            line.find_first_not_of("\r\t ") != std::string::npos)
+        {
+            rawLines.push_back(line);
+            ++lineCount;
         }
-        // 使用我們在 .h 檔設定的常數來限制
-        if (lineCount >= MAX_MDI_LINES) {
-            //DEBUG_PRINT("[NC Warning] MDI Input truncated to %zu lines.\n", MAX_MDI_LINES);
+
+        if (lineCount >= static_cast<int>(MAX_MDI_LINES))
+        {
             break;
         }
     }
-    return !m_mdiMemory.empty();
+
+    NCProgramCache newProgramCache;
+    if (!newProgramCache.Build(std::move(rawLines), Parser))
+    {
+        return false;
+    }
+
+    CancelProgramEndBoundary();
+    ClearCompletionWaitBoundary(true);
+    CancelGMBlockTransaction(true);
+    CancelSingleBlockShadow(true);
+    CancelFeedHoldBoundaryShadow(true);
+    m_waitCallback = nullptr;
+    ReleaseProgramMotionOwner();
+    m_motion.BeginNewExecutionEpoch(
+        MotionCommandSource::NC_MDI);
+
+    // 新的 Base Program Source 不可沿用上一份 MDI 的 Macro Frame / Cache。
+    // 先清 Frame 再清 Cache，避免任何 Frame 指標懸空。
+    m_macroStack.clear();
+    m_macroProgramCaches.clear();
+    MacroSys.Reset();
+    m_macroProgramName = "";
+    m_macroProgramPC = -1;
+
+    m_mdiProgramCache = std::move(newProgramCache);
+    m_mdiPC = 0;
+    m_mdiCommittedPC = -1;
+    m_lastProgramCommit = NCProgramCommitSnapshot{};
+
+    return !m_mdiProgramCache.Empty();
 }
 
 // ==========================================
@@ -1250,25 +2377,54 @@ bool NCManager::LoadMDI(const std::string& mdiContent)
 // ==========================================
 bool NCManager::LoadManualAuto(const std::string& manualContent)
 {
-    // 使用我們在 .h 檔設定的常數來檢查 (1024KB)
-    if (manualContent.length() > MAX_MANUAL_AUTO_BYTES) {
-        //DEBUG_PRINT("[Alarm] Manual Auto string exceeds %zu bytes limit!\n", MAX_MANUAL_AUTO_BYTES);
+    if (manualContent.length() > MAX_MANUAL_AUTO_BYTES)
+    {
         return false;
     }
 
-    m_manualMemory.clear();
-    m_manualPC = 0;
-    m_manualAutoRunning = false; // 載入後預設不啟動，等待 Cycle Start
-
+    std::vector<std::string> rawLines;
     std::stringstream ss(manualContent);
     std::string line;
 
-    while (std::getline(ss, line, '\n')) {
-        if (!line.empty() && line.find_first_not_of("\r\t ") != std::string::npos) {
-            m_manualMemory.push_back(line);
+    while (std::getline(ss, line, '\n'))
+    {
+        if (!line.empty() &&
+            line.find_first_not_of("\r\t ") != std::string::npos)
+        {
+            rawLines.push_back(line);
         }
     }
-    return !m_manualMemory.empty();
+
+    NCProgramCache newProgramCache;
+    if (!newProgramCache.Build(std::move(rawLines), Parser))
+    {
+        return false;
+    }
+
+    CancelProgramEndBoundary();
+    ClearCompletionWaitBoundary(true);
+    CancelGMBlockTransaction(true);
+    CancelSingleBlockShadow(true);
+    CancelFeedHoldBoundaryShadow(true);
+    m_waitCallback = nullptr;
+    ReleaseProgramMotionOwner();
+    m_motion.BeginNewExecutionEpoch(
+        MotionCommandSource::NC_MANUAL_AUTO);
+
+    // 新的 Manual-Auto Source 建立全新的 Macro Session。
+    m_macroStack.clear();
+    m_macroProgramCaches.clear();
+    MacroSys.Reset();
+    m_macroProgramName = "";
+    m_macroProgramPC = -1;
+
+    m_manualProgramCache = std::move(newProgramCache);
+    m_manualPC = 0;
+    m_manualCommittedPC = -1;
+    m_manualAutoRunning = false;
+    m_lastProgramCommit = NCProgramCommitSnapshot{};
+
+    return !m_manualProgramCache.Empty();
 }
 
 // ==========================================
@@ -1276,74 +2432,98 @@ bool NCManager::LoadManualAuto(const std::string& manualContent)
 // ==========================================
 bool NCManager::LoadDynamicCode(const std::string& content)
 {
-    std::vector<std::string>* targetMemory = nullptr;
+    NCProgramCache* targetProgram = nullptr;
     int* targetPC = nullptr;
+    int* targetCommittedPC = nullptr;
 
-    // 1. 根據目前模式，動態綁定目標記憶體
-    if (m_mode == NCOperationMode::MDI) {
-        targetMemory = &m_mdiMemory;
+    if (m_mode == NCOperationMode::MDI)
+    {
+        targetProgram = &m_mdiProgramCache;
         targetPC = &m_mdiPC;
+        targetCommittedPC = &m_mdiCommittedPC;
     }
-    else if (m_mode == NCOperationMode::MANUAL) {
-        targetMemory = &m_manualMemory;
+    else if (m_mode == NCOperationMode::MANUAL)
+    {
+        targetProgram = &m_manualProgramCache;
         targetPC = &m_manualPC;
-        m_manualAutoRunning = false; // 載入時先關閉自動執行
+        targetCommittedPC = &m_manualCommittedPC;
+        m_manualAutoRunning = false;
     }
-    else {
-        //DEBUG_PRINT("[NC Warning] Cannot load dynamic code in current OP mode!\n");
-        return false; // 只有在 MDI 和 MANUAL 模式下才允許載入
+    else
+    {
+        return false;
     }
 
-    // 2. 清空舊資料
-    targetMemory->clear();
+    // The source is parsed below before the current dynamic image is replaced.
+
+    std::vector<std::string> rawLines;
+    std::stringstream ss(content);
+    std::string line;
+    while (std::getline(ss, line, '\n'))
+    {
+        if (!line.empty() &&
+            line.find_first_not_of("\r\t ") != std::string::npos)
+        {
+            rawLines.push_back(line);
+        }
+    }
+
+    NCProgramCache newProgramCache;
+    if (!newProgramCache.Build(std::move(rawLines), Parser))
+    {
+        return false;
+    }
+
+    CancelProgramEndBoundary();
+    ClearCompletionWaitBoundary(true);
+    CancelGMBlockTransaction(true);
+    CancelSingleBlockShadow(true);
+    CancelFeedHoldBoundaryShadow(true);
+    m_waitCallback = nullptr;
+    ReleaseProgramMotionOwner();
+    m_motion.BeginNewExecutionEpoch(
+        GetMotionCommandSourceForMode(m_mode));
+
+    // Dynamic Code 也是新的 Base Program Source；先摧毀所有指向 Macro
+    // Cache 的 Frame，再清除 Cache，避免保留舊檔案或懸空指標。
+    m_macroStack.clear();
+    m_macroProgramCaches.clear();
+    MacroSys.Reset();
+    m_macroProgramName = "";
+    m_macroProgramPC = -1;
+
+    *targetProgram = std::move(newProgramCache);
     *targetPC = 0;
-    m_motion.ResetPhysicalPC(); // 🌟 載入 MDI，實體行號歸零
+    *targetCommittedPC = -1;
+    m_lastProgramCommit = NCProgramCommitSnapshot{};
+    m_motion.ResetPhysicalPC();
 
-
-
-    // 🌟 取得大腦目前的狀態，並同步給馬達標籤機
     int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
     int currentBrainToolMode = CoordSys.toolLengthMode;
     int currentBrainHCode = CoordSys.currentHCode;
     int currentBraintoolRadiusMode = CoordSys.toolRadiusMode;
     int currentBraintoolDCode = CoordSys.currentDCode;
-    // 🌟 直接讀取你原本就寫好的 CoordSys.isAbsoluteMode
     bool curIsAbs = CoordSys.isAbsoluteMode;
     bool curG68 = CoordSys.isG68Active;
-    double curG68Angle = CoordSys.g68Angle; // 讀取你存的 R 參數角度
-    bool curG168 = CoordSys.isWorkpieceRotationActive; // 讀取你原本寫好的狀態
-    int curWCode = CoordSys.currentWCode; // 讀取你存的 W 碼
+    double curG68Angle = CoordSys.g68Angle;
+    bool curG168 = CoordSys.isWorkpieceRotationActive;
+    int curWCode = CoordSys.currentWCode;
     bool curG51 = CoordSys.isScalingActive;
     double curScale = CoordSys.scaleFactor;
-    // 🌟 讀取大腦的鏡像狀態，並打包成一個 byte (Bitmask)
     uint8_t curMirrorMask = 0;
-    for (int i = 0; i < 8; i++) {
-        if (CoordSys.isMirrorActive[i]) {
-            curMirrorMask |= (1 << i); // 如果這軸有鏡像，就把對應的 bit 設為 1
-        }
-    }
-    // 🌟 讀取大腦的極座標狀態 (你原本應該就有這個變數)
+    for (int i = 0; i < 8; ++i)
+        if (CoordSys.isMirrorActive[i]) curMirrorMask |= (1 << i);
     bool curG16 = CoordSys.isPolarCoordinateActive;
-
-    // 🌟 讀取大腦的狀態 (變數名稱請對應你的 CoordSys)
     bool curG162 = CoordSys.isCAxisOffsetRotationEnabled;
-    int curPlane = CoordSys.activePlane; // 17, 18 或是 19
+    int curPlane = CoordSys.activePlane;
 
-    m_motion.ResetPhysicalTags(currentBrainWCS, currentBrainToolMode, currentBrainHCode, currentBraintoolRadiusMode, currentBraintoolDCode, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+    m_motion.ResetPhysicalTags(
+        currentBrainWCS, currentBrainToolMode, currentBrainHCode,
+        currentBraintoolRadiusMode, currentBraintoolDCode, curIsAbs,
+        curG68, curG68Angle, curG168, curWCode, curG51, curScale,
+        curMirrorMask, curG16, curG162, curPlane);
 
-
-    // 3. 解析並塞入記憶體
-    std::stringstream ss(content);
-    std::string line;
-
-    while (std::getline(ss, line, '\n')) {
-        if (!line.empty() && line.find_first_not_of("\r\t ") != std::string::npos) {
-            targetMemory->push_back(line);
-        }
-    }
-
-    //DEBUG_PRINT("[NC] Dynamic Code Loaded, Lines: %d\n", (int)targetMemory->size());
-    return !targetMemory->empty();
+    return !targetProgram->Empty();
 }
 
 // ==========================================
@@ -1440,6 +2620,818 @@ EDMState NCManager::GetMachineEDMState()
 
 
 
+// =============================================================================
+// Stage NC-0.2G - Program End / Cycle End Completion Gate
+// =============================================================================
+NCProgramEndGateSample NCManager::BuildProgramEndGateSample() const noexcept
+{
+    NCProgramEndGateSample sample{};
+    const NCBlockLifecycleCounters lifecycle =
+        m_blockLifecycleLedger.GetCounters();
+
+    sample.executionEpoch = m_motion.GetCurrentExecutionEpoch();
+    const MotionOwnerLease currentOwnerLease =
+        m_motion.GetMotionOwnerLease();
+    sample.currentOwner = currentOwnerLease.owner;
+    sample.currentOwnerGeneration = currentOwnerLease.generation;
+
+    sample.activeBlocks = lifecycle.activeBlocks;
+    sample.axisCommandDepth = m_motion.GetAxisCommandMailboxDepth();
+    sample.axisResultDepth = m_motion.GetAxisCommandResultDepth();
+    sample.commandQueueDepth = m_motion.GetQueueSize();
+    sample.commandIngressDepth = m_motion.GetCommandIngressSize();
+    sample.commandReplayDepth = m_motion.GetCommandReplaySize();
+    sample.feedbackDepth = m_motion.GetMotionFeedbackDepth();
+    sample.feedbackNoticeDepth =
+        m_motion.GetMotionFeedbackProducerNoticeDepth();
+    sample.lastPublishedFeedbackSequence =
+        m_motion.GetLastPublishedMotionFeedbackSequence();
+    sample.lastConsumedFeedbackSequence =
+        m_lastConsumedMotionFeedbackSequence;
+
+    sample.ownerLeaseCurrent =
+        m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease);
+    sample.safetyOrRecoveryPending =
+        m_motion.HasPendingSafetyOrRecoveryRequests();
+    sample.waitCallbackActive = m_waitCallback != nullptr;
+    sample.completionBindingActive =
+        m_blockCompletionBoundaryObserver.HasActiveBinding();
+    sample.groupStandstill = m_motion.IsGroupStandstill();
+
+    sample.integrity.blockFailed = lifecycle.blockFailed;
+    sample.integrity.ncDispatchFailed = lifecycle.ncDispatchFailed;
+    sample.integrity.motionCaptureOverflow =
+        lifecycle.motionCaptureOverflow;
+    sample.integrity.orphanFeedback = lifecycle.orphanFeedback;
+    sample.integrity.duplicateTerminalFeedback =
+        lifecycle.duplicateTerminalFeedback;
+    sample.integrity.terminalFeedbackConflict =
+        lifecycle.terminalFeedbackConflict;
+    sample.integrity.activeBlockOverwrite =
+        lifecycle.activeBlockOverwrite;
+    sample.integrity.activeSegmentIndexOverwrite =
+        lifecycle.activeSegmentIndexOverwrite;
+
+    sample.integrity.axisCommandQueueFull =
+        m_motion.GetAxisCommandQueueFullCount();
+    sample.integrity.axisCommandResultOverflow =
+        m_motion.GetAxisCommandResultOverflowCount();
+    sample.integrity.staleCommandDiscard =
+        m_motion.GetStaleCommandDiscardCount();
+    sample.integrity.ownerConflictReject =
+        m_motion.GetMotionOwnerConflictRejectCount();
+    sample.integrity.commandQueueFullReject =
+        m_motion.GetCommandQueueFullRejectCount();
+    sample.integrity.commandReplayOverflow =
+        m_motion.GetCommandReplayOverflowCount();
+    sample.integrity.feedbackOverflow =
+        m_motion.GetMotionFeedbackOverflowCount();
+    sample.integrity.feedbackNoticeOverflow =
+        m_motion.GetMotionFeedbackProducerNoticeOverflowCount();
+    sample.integrity.feedbackSequenceGap =
+        m_motionFeedbackSequenceGapCount;
+
+    return sample;
+}
+
+bool NCManager::BeginProgramRunBoundary(
+    MotionExecutionEpoch executionEpoch) noexcept
+{
+    m_programEndAlarmRaised = false;
+    return m_programEndBoundary.BeginRun(
+        GetBaseProgramScope(),
+        GetBaseProgramCache().GetGeneration(),
+        executionEpoch,
+        m_programMotionLease,
+        BuildProgramEndGateSample());
+}
+
+bool NCManager::RequestProgramEnd(
+    NCProgramEndCause cause,
+    int sourcePC,
+    int sourceLineNumber,
+    NCBlockDispatchId markerDispatchId) noexcept
+{
+    m_pauseAfterBlock = false;
+    m_legacySingleBlockPausePending = false;
+    m_singleBlockBoundaryShadow.SuppressForProgramEnd();
+    m_programChanged = false;
+
+    const MotionExecutionEpoch requestExecutionEpoch =
+        m_motion.GetCurrentExecutionEpoch();
+    const MotionOwnerLease requestOwnerLease =
+        m_programMotionLease;
+
+    if (m_programEndBoundary.RequestEnd(
+        cause,
+        sourcePC,
+        sourceLineNumber,
+        markerDispatchId,
+        requestExecutionEpoch,
+        requestOwnerLease))
+    {
+        return true;
+    }
+
+    if (!m_programEndAlarmRaised)
+    {
+        AlarmManager::GetInstance().Trigger(
+            AlarmManager::PROGRAM_END_GATE_ERROR,
+            sourceLineNumber);
+        m_programEndAlarmRaised = true;
+    }
+    m_state = NCState::ALARM;
+    return false;
+}
+
+void NCManager::ProcessProgramEndBoundary()
+{
+    if (!m_programEndBoundary.IsEndPending())
+    {
+        return;
+    }
+
+    // M02 / M30 may legally share a Block with an action that returned a
+    // repeated Wait Callback. Drain that callback through the already proven
+    // NC-0.2F Dual-Key Guard, but never advance the PC beyond the End marker.
+    if (m_waitCallback != nullptr &&
+        m_waitCallback != WaitForCycleStartCallback)
+    {
+        const bool legacyReady = m_waitCallback(this);
+        const bool callbackReady =
+            ApplyCompletionWaitBoundaryGuard(legacyReady);
+        if (callbackReady)
+        {
+            m_waitCallback = nullptr;
+            ClearCompletionWaitBoundary(false);
+        }
+    }
+
+    const NCProgramEndGateSample sample =
+        BuildProgramEndGateSample();
+
+    if (m_programEndBoundary.Evaluate(sample))
+    {
+        FinalizeProgramEnd();
+        return;
+    }
+
+    if (m_programEndBoundary.IsFailClosed() &&
+        !m_programEndAlarmRaised)
+    {
+        const NCProgramEndGateSnapshot snapshot =
+            m_programEndBoundary.GetSnapshot();
+        AlarmManager::GetInstance().Trigger(
+            AlarmManager::PROGRAM_END_GATE_ERROR,
+            snapshot.sourceLineNumber);
+        m_programEndAlarmRaised = true;
+        m_state = NCState::ALARM;
+    }
+}
+
+void NCManager::FinalizeProgramEnd()
+{
+    if (!m_programEndBoundary.MarkFinalized())
+    {
+        return;
+    }
+
+    m_waitCallback = nullptr;
+    ClearCompletionWaitBoundary(false);
+    CancelGMBlockTransaction(false);
+    CancelFeedHoldBoundaryShadow(false);
+    m_singleBlockBoundaryShadow.SuppressForProgramEnd();
+    m_pauseAfterBlock = false;
+    m_legacySingleBlockPausePending = false;
+    m_programChanged = false;
+
+    m_macroStack.clear();
+    m_macroProgramName.clear();
+    m_macroProgramPC = -1;
+    GetBasePC() = 0;
+
+    Reset_Gode();
+    UpdateSystemVariables();
+    ReleaseProgramMotionOwner();
+
+    if (m_mode == NCOperationMode::MANUAL)
+    {
+        m_manualAutoRunning = false;
+        m_state = NCState::READY;
+    }
+    else if (m_mode == NCOperationMode::MDI)
+    {
+        m_state = NCState::READY;
+    }
+    else
+    {
+        m_state = NCState::P_END;
+    }
+}
+
+void NCManager::CancelProgramEndBoundary() noexcept
+{
+    m_programEndBoundary.Cancel();
+    m_programEndAlarmRaised = false;
+}
+
+// =============================================================================
+// Stage NC-0.2H - G/M Same-Block Transaction Barrier
+// =============================================================================
+std::uint64_t NCManager::AllocateGMBlockTransactionSequence() noexcept
+{
+    std::uint64_t sequence = m_nextGMBlockTransactionSequence++;
+    if (sequence == 0ULL)
+    {
+        sequence = m_nextGMBlockTransactionSequence++;
+    }
+    return sequence;
+}
+
+void NCManager::BeginGMBlockTransaction(
+    WaitConditionFunc gCallback,
+    WaitConditionFunc mCallback,
+    NCGMBlockPostAction postAction,
+    int sourcePC,
+    int sourceLineNumber,
+    NCBlockDispatchId dispatchId,
+    int mCode,
+    int pValue,
+    int repeatCount,
+    bool fromMainProgram) noexcept
+{
+    if (m_gmBlockTransaction.snapshot.active)
+    {
+        CancelGMBlockTransaction(true);
+    }
+
+    NCGMBlockTransactionSnapshot snapshot{};
+    snapshot.sequence = AllocateGMBlockTransactionSequence();
+    snapshot.dispatchId = dispatchId;
+    snapshot.phase = NCGMBlockTransactionPhase::WAITING;
+    snapshot.postAction = postAction;
+    snapshot.sourcePC = sourcePC;
+    snapshot.sourceLineNumber = sourceLineNumber;
+    snapshot.mCode = mCode;
+    snapshot.pValue = pValue;
+    snapshot.repeatCount = repeatCount > 0 ? repeatCount : 1;
+    snapshot.active = true;
+    snapshot.gWaitRequired = gCallback != nullptr;
+    snapshot.gWaitComplete = gCallback == nullptr;
+    snapshot.mWaitRequired = mCallback != nullptr;
+    snapshot.mWaitComplete = mCallback == nullptr;
+    snapshot.fromMainProgram = fromMainProgram;
+
+    m_gmBlockTransaction.snapshot = snapshot;
+    m_gmBlockTransaction.gCallback = gCallback;
+    m_gmBlockTransaction.mCallback = mCallback;
+
+    ++m_gmBlockTransactionCounters.started;
+    if (snapshot.gWaitRequired)
+    {
+        ++m_gmBlockTransactionCounters.gWaitComponents;
+    }
+    if (snapshot.mWaitRequired)
+    {
+        ++m_gmBlockTransactionCounters.mWaitComponents;
+    }
+    if (snapshot.gWaitRequired && snapshot.mWaitRequired)
+    {
+        ++m_gmBlockTransactionCounters.dualComponentTransactions;
+    }
+}
+
+bool NCManager::WaitForGMBlockTransactionCallback(NCManager* nc)
+{
+    return nc != nullptr && nc->EvaluateGMBlockTransaction();
+}
+
+bool NCManager::EvaluateGMBlockTransaction() noexcept
+{
+    NCGMBlockTransactionSnapshot& snapshot =
+        m_gmBlockTransaction.snapshot;
+
+    if (!snapshot.active)
+    {
+        return true;
+    }
+
+    ++m_gmBlockTransactionCounters.evaluations;
+
+    if (!snapshot.gWaitComplete)
+    {
+        if (m_gmBlockTransaction.gCallback == nullptr ||
+            m_gmBlockTransaction.gCallback(this))
+        {
+            snapshot.gWaitComplete = true;
+        }
+        else
+        {
+            ++m_gmBlockTransactionCounters.gWaitSamples;
+        }
+    }
+
+    if (!snapshot.mWaitComplete)
+    {
+        if (m_gmBlockTransaction.mCallback == nullptr ||
+            m_gmBlockTransaction.mCallback(this))
+        {
+            snapshot.mWaitComplete = true;
+        }
+        else
+        {
+            ++m_gmBlockTransactionCounters.mWaitSamples;
+        }
+    }
+
+    const bool ready =
+        snapshot.gWaitComplete &&
+        snapshot.mWaitComplete;
+
+    if (ready &&
+        snapshot.phase == NCGMBlockTransactionPhase::WAITING)
+    {
+        snapshot.phase =
+            NCGMBlockTransactionPhase::READY_TO_FINALIZE;
+        ++m_gmBlockTransactionCounters.readyTransitions;
+    }
+
+    return ready;
+}
+
+bool NCManager::FinalizeGMBlockTransaction()
+{
+    NCGMBlockTransactionSnapshot& snapshot =
+        m_gmBlockTransaction.snapshot;
+
+    if (!snapshot.active ||
+        snapshot.phase !=
+        NCGMBlockTransactionPhase::READY_TO_FINALIZE)
+    {
+        return false;
+    }
+
+    bool success = true;
+
+    switch (snapshot.postAction)
+    {
+    case NCGMBlockPostAction::PROGRAM_STOP_M00:
+        ++m_gmBlockTransactionCounters.m00Stops;
+        m_pauseAfterBlock = true;
+        snapshot.postActionApplied = true;
+        break;
+
+    case NCGMBlockPostAction::OPTIONAL_STOP_M01:
+        ++m_gmBlockTransactionCounters.m01Stops;
+        if (m_isOptionalStopEnabled)
+        {
+            m_pauseAfterBlock = true;
+        }
+        snapshot.postActionApplied = true;
+        break;
+
+    case NCGMBlockPostAction::CALL_M98:
+    {
+        ++m_gmBlockTransactionCounters.m98Calls;
+        const std::string macroFile =
+            "O" + std::to_string(snapshot.pValue) + ".nc";
+        success = CallMacro(macroFile);
+        if (success)
+        {
+            m_macroStack.back().repeatCount =
+                snapshot.repeatCount > 0
+                ? snapshot.repeatCount
+                : 1;
+            snapshot.postActionApplied = true;
+        }
+        break;
+    }
+
+    case NCGMBlockPostAction::RETURN_M99:
+        ++m_gmBlockTransactionCounters.m99Returns;
+        if (snapshot.fromMainProgram)
+        {
+            GetBasePC() = 0;
+            m_programChanged = true;
+        }
+        else
+        {
+            // Transaction + Completion Guard 已證明同行 G/M 動作完成。
+            ReturnMacro(true);
+        }
+        snapshot.postActionApplied = true;
+        break;
+
+    case NCGMBlockPostAction::PROGRAM_END_M02:
+    case NCGMBlockPostAction::PROGRAM_END_M30:
+    {
+        const bool isM02 =
+            snapshot.postAction ==
+            NCGMBlockPostAction::PROGRAM_END_M02;
+
+        if (isM02)
+        {
+            ++m_gmBlockTransactionCounters.m02Ends;
+        }
+        else
+        {
+            ++m_gmBlockTransactionCounters.m30Ends;
+        }
+
+        // Program End 不可再被 Single Block / Optional Stop 改成 HOLD。
+        m_pauseAfterBlock = false;
+        success = RequestProgramEnd(
+            isM02
+            ? NCProgramEndCause::M02
+            : NCProgramEndCause::M30,
+            snapshot.sourcePC,
+            snapshot.sourceLineNumber,
+            snapshot.dispatchId);
+
+        if (success)
+        {
+            m_programChanged = true;
+            snapshot.postActionApplied = true;
+        }
+        else
+        {
+            AlarmManager::GetInstance().Trigger(
+                AlarmManager::PROGRAM_END_GATE_ERROR,
+                snapshot.sourceLineNumber);
+            m_state = NCState::ALARM;
+        }
+        break;
+    }
+
+    case NCGMBlockPostAction::NONE:
+    default:
+        break;
+    }
+
+    m_gmBlockTransaction.gCallback = nullptr;
+    m_gmBlockTransaction.mCallback = nullptr;
+    snapshot.active = false;
+
+    if (success)
+    {
+        // M98/M99 可能改變 Macro Frame，M00/M01/M02/M30 可能改變
+        // NC Flow；沿用舊 ExecuteBlock 的時序，在正式 Post Action
+        // Commit 後刷新 System Variable Snapshot。
+        UpdateSystemVariables();
+
+        snapshot.phase = NCGMBlockTransactionPhase::FINALIZED;
+        ++m_gmBlockTransactionCounters.finalized;
+    }
+    else
+    {
+        snapshot.phase = NCGMBlockTransactionPhase::FAILED;
+        ++m_gmBlockTransactionCounters.finalizeFailed;
+    }
+
+    return success;
+}
+
+void NCManager::CancelGMBlockTransaction(bool superseded) noexcept
+{
+    (void)superseded;
+
+    if (!m_gmBlockTransaction.snapshot.active)
+    {
+        return;
+    }
+
+    m_gmBlockTransaction.gCallback = nullptr;
+    m_gmBlockTransaction.mCallback = nullptr;
+    m_gmBlockTransaction.snapshot.active = false;
+    m_gmBlockTransaction.snapshot.phase =
+        NCGMBlockTransactionPhase::CANCELLED;
+    ++m_gmBlockTransactionCounters.cancelled;
+}
+
+// =============================================================================
+// Stage NC-0.2I.1 - Single Block Completion Boundary Shadow
+// =============================================================================
+NCSingleBlockCandidateKind NCManager::ClassifySingleBlockCandidate(
+    const NCBlock& block) noexcept
+{
+    if (block.gCount > 0 || block.mCount > 0)
+    {
+        return NCSingleBlockCandidateKind::G_M_BLOCK;
+    }
+
+    // N/O-only lines are labels / program identifiers.  They are not an
+    // executable Single Block boundary.  All other address words are.
+    for (int index = 0; index < 26; ++index)
+    {
+        if (!block.hasParam[index])
+        {
+            continue;
+        }
+
+        const char address =
+            static_cast<char>('A' + index);
+        if (address != 'N' && address != 'O')
+        {
+            return NCSingleBlockCandidateKind::ADDRESS_BLOCK;
+        }
+    }
+
+    return NCSingleBlockCandidateKind::NONE;
+}
+
+void NCManager::ArmSingleBlockShadow(
+    NCSingleBlockCandidateKind candidateKind,
+    NCBlockDispatchId dispatchId,
+    const NCProgramCommitSnapshot& target,
+    int sourceLineNumber) noexcept
+{
+    if (!m_isSingleBlockEnabled ||
+        candidateKind == NCSingleBlockCandidateKind::NONE ||
+        dispatchId == NC_BLOCK_DISPATCH_ID_INVALID)
+    {
+        return;
+    }
+
+    const NCGMBlockTransactionSnapshot transaction =
+        m_gmBlockTransaction.snapshot;
+    const bool transactionRequired =
+        transaction.active &&
+        transaction.dispatchId == dispatchId;
+
+    NCSingleBlockShadowArmRequest request{};
+    request.dispatchId = dispatchId;
+    request.programTarget = target;
+    request.sourceLineNumber = sourceLineNumber;
+    request.candidateKind = candidateKind;
+    request.transactionRequired = transactionRequired;
+    request.callbackRequired =
+        !transactionRequired &&
+        m_waitCallback != nullptr &&
+        m_waitCallback != WaitForCycleStartCallback;
+    request.legacyPausePending =
+        m_legacySingleBlockPausePending;
+
+    m_singleBlockBoundaryShadow.Arm(request);
+}
+
+void NCManager::EvaluateSingleBlockShadow(
+    bool callbackComplete) noexcept
+{
+    if (!m_singleBlockBoundaryShadow.HasActiveBoundary())
+    {
+        return;
+    }
+
+    const NCSingleBlockShadowSnapshot shadow =
+        m_singleBlockBoundaryShadow.GetSnapshot();
+
+    NCSingleBlockShadowSample sample{};
+    sample.lifecycleFound =
+        m_blockLifecycleLedger.GetMotionBoundarySnapshot(
+            shadow.dispatchId,
+            sample.motionBoundary);
+    sample.callbackComplete = callbackComplete;
+    sample.programEndPending =
+        m_programEndBoundary.IsEndPending();
+
+    if (shadow.transactionRequired)
+    {
+        const NCGMBlockTransactionSnapshot transaction =
+            m_gmBlockTransaction.snapshot;
+
+        if (transaction.dispatchId == shadow.dispatchId)
+        {
+            sample.transactionComplete =
+                !transaction.active &&
+                transaction.phase ==
+                NCGMBlockTransactionPhase::FINALIZED;
+
+            sample.transactionFailed =
+                transaction.phase ==
+                NCGMBlockTransactionPhase::FAILED;
+        }
+    }
+    else
+    {
+        sample.transactionComplete = true;
+    }
+
+    m_singleBlockBoundaryShadow.Evaluate(sample);
+}
+
+void NCManager::ObserveLegacySingleBlockHold() noexcept
+{
+    // Refresh once more after NC-0.2H Post Action finalization.  This is still
+    // observation-only; the return value is intentionally ignored.
+    EvaluateSingleBlockShadow(true);
+    m_singleBlockBoundaryShadow.ObserveLegacyHold(
+        m_legacySingleBlockPausePending);
+    m_legacySingleBlockPausePending = false;
+}
+
+void NCManager::CancelSingleBlockShadow(
+    bool superseded) noexcept
+{
+    m_singleBlockBoundaryShadow.Cancel(superseded);
+    m_legacySingleBlockPausePending = false;
+}
+
+// =============================================================================
+// Stage NC-0.2I.2 - Feed Hold Request / Acknowledge Boundary Shadow
+// =============================================================================
+NCFeedHoldBoundarySample NCManager::BuildFeedHoldBoundarySample() const noexcept
+{
+    NCFeedHoldBoundarySample sample{};
+    sample.executionEpoch =
+        m_motion.GetCurrentExecutionEpoch();
+    sample.ownerLease =
+        m_motion.GetMotionOwnerLease();
+    sample.motion =
+        m_motion.GetFeedHoldStopSnapshot();
+    sample.activePC =
+        GetActiveDispatchPC();
+    sample.legacyHoldState =
+        m_state == NCState::HOLD;
+    sample.homeActive =
+        Homing.IsActive();
+    sample.homeHoldDecelerating =
+        Homing.IsHoldDecelerating();
+    sample.homePaused =
+        Homing.IsPaused();
+    sample.homeResumeRequested =
+        Homing.IsResumeRequested();
+
+    const NCGMBlockTransactionSnapshot transaction =
+        m_gmBlockTransaction.snapshot;
+    if (transaction.active &&
+        transaction.dispatchId != NC_BLOCK_DISPATCH_ID_INVALID)
+    {
+        sample.dispatchId = transaction.dispatchId;
+        sample.activePC = transaction.sourcePC;
+        return sample;
+    }
+
+    if (m_waitingBlockDispatchId != NC_BLOCK_DISPATCH_ID_INVALID)
+    {
+        sample.dispatchId = m_waitingBlockDispatchId;
+
+        NCBlockLifecycleSnapshot lifecycle{};
+        if (m_blockLifecycleLedger.TryGetSnapshot(
+            sample.dispatchId,
+            lifecycle))
+        {
+            sample.activePC = lifecycle.programTarget.sourcePC;
+        }
+        return sample;
+    }
+
+    NCBlockLifecycleSnapshot lifecycle{};
+    if (m_blockLifecycleLedger.GetLastDispatchedSnapshot(lifecycle))
+    {
+        sample.dispatchId = lifecycle.dispatchId;
+        sample.activePC = lifecycle.programTarget.sourcePC;
+    }
+
+    return sample;
+}
+
+void NCManager::BeginFeedHoldBoundaryShadow(
+    NCFeedHoldSource source) noexcept
+{
+    m_feedHoldBoundaryShadow.BeginRequest(
+        source,
+        BuildFeedHoldBoundarySample());
+}
+
+void NCManager::ObserveFeedHoldBoundaryShadow() noexcept
+{
+    if (!m_feedHoldBoundaryShadow.IsActive())
+    {
+        return;
+    }
+
+    NCFeedHoldBoundarySample sample =
+        BuildFeedHoldBoundarySample();
+    m_feedHoldBoundaryShadow.Observe(sample);
+
+    const NCFeedHoldBoundarySnapshot snapshot =
+        m_feedHoldBoundaryShadow.GetSnapshot();
+
+    // HOME permits Cycle Start while controlled deceleration is still active.
+    // HomingManager queues the request and later changes NC back to RUN after
+    // it has internally reached PAUSED. Record that asynchronous apply point.
+    if (snapshot.active &&
+        snapshot.source == NCFeedHoldSource::HOME &&
+        snapshot.resumeRequested &&
+        m_state == NCState::RUN &&
+        !Homing.IsHoldDecelerating() &&
+        !Homing.IsPaused())
+    {
+        sample = BuildFeedHoldBoundarySample();
+        m_feedHoldBoundaryShadow.ObserveResumeApplied(sample);
+    }
+}
+
+void NCManager::ObserveFeedHoldLegacyHoldShadow() noexcept
+{
+    m_feedHoldBoundaryShadow.ObserveLegacyHoldEntered(
+        BuildFeedHoldBoundarySample());
+}
+
+void NCManager::ObserveFeedHoldResumeRequestedShadow() noexcept
+{
+    m_feedHoldBoundaryShadow.ObserveResumeRequested(
+        BuildFeedHoldBoundarySample());
+}
+
+void NCManager::ObserveFeedHoldResumeAppliedShadow() noexcept
+{
+    m_feedHoldBoundaryShadow.ObserveResumeApplied(
+        BuildFeedHoldBoundarySample());
+}
+
+void NCManager::CancelFeedHoldBoundaryShadow(
+    bool superseded) noexcept
+{
+    m_feedHoldBoundaryShadow.Cancel(superseded);
+}
+
+// =============================================================================
+// Stage NC-0.2F - Motion Completion Dual-Key Guard
+// =============================================================================
+void NCManager::BindCompletionWaitBoundary(
+    NCBlockDispatchId dispatchId,
+    WaitConditionFunc callback) noexcept
+{
+    if (dispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        callback == nullptr ||
+        callback == WaitForCycleStartCallback)
+    {
+        return;
+    }
+
+    NCBlockMotionBoundarySnapshot boundary{};
+    const bool hasBoundary =
+        m_blockLifecycleLedger.GetMotionBoundarySnapshot(
+            dispatchId,
+            boundary);
+
+    NCBlockWaitKind waitKind = NCBlockWaitKind::AUXILIARY_CALLBACK;
+    const bool isQueueDrain =
+        callback == WaitAndClearQueueCallback ||
+        callback == WaitAndHoldCallback;
+
+    if (hasBoundary &&
+        boundary.state != NCBlockMotionBoundaryState::NOT_TRACKED &&
+        boundary.state != NCBlockMotionBoundaryState::NONE)
+    {
+        waitKind = isQueueDrain
+            ? NCBlockWaitKind::MOTION_QUEUE_DRAIN
+            : NCBlockWaitKind::MOTION_HANDLER;
+    }
+    else if (isQueueDrain)
+    {
+        waitKind = NCBlockWaitKind::PROGRAM_FLOW_DRAIN;
+    }
+
+    if (m_waitingBlockDispatchId != dispatchId)
+    {
+        ClearCompletionWaitBoundary(true);
+    }
+
+    m_waitingBlockDispatchId = dispatchId;
+    m_blockCompletionBoundaryObserver.Bind(
+        dispatchId,
+        waitKind);
+}
+
+bool NCManager::ApplyCompletionWaitBoundaryGuard(
+    bool legacyReady) noexcept
+{
+    if (m_waitingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID)
+    {
+        return legacyReady;
+    }
+
+    NCBlockMotionBoundarySnapshot boundary{};
+    const bool hasBoundary =
+        m_blockLifecycleLedger.GetMotionBoundarySnapshot(
+            m_waitingBlockDispatchId,
+            boundary);
+
+    return m_blockCompletionBoundaryObserver.ObserveAndGate(
+        hasBoundary,
+        boundary,
+        legacyReady);
+}
+
+void NCManager::ClearCompletionWaitBoundary(
+    bool superseded) noexcept
+{
+    m_blockCompletionBoundaryObserver.ClearBinding(superseded);
+    m_waitingBlockDispatchId = NC_BLOCK_DISPATCH_ID_INVALID;
+}
+
 // 1. 等待馬達靜止
 bool NCManager::WaitAndHoldCallback(NCManager* nc) {
     if (nc->m_motion.GetQueueSize() > 0 || !nc->m_motion.IsGroupStandstill()) return false;
@@ -1464,30 +3456,28 @@ bool NCManager::WaitAndClearQueueCallback(NCManager* nc) {
 // ==========================================================
 bool NCManager::IsRealMotionBlock(const NCBlock& block)
 {
-    // 1. 如果根本沒有座標字元，絕對不可能是移動
-    if (!block.has('X') && !block.has('Y') && !block.has('Z')) {
+    // 保留目前 G66 觸發規則：至少要有 XYZ 字元。
+    if (!block.has('X') &&
+        !block.has('Y') &&
+        !block.has('Z'))
+    {
         return false;
     }
 
-    // 2. 如果單節裡面有明確的 G 碼，我們來過濾「非移動」的特例
-    if (block.hasG) {
-        switch (block.gCode) {
-        case 4:   // G04 暫留 (X 代表時間)
-        case 10:  // G10 參數寫入 (X 代表寫入數值)
-        case 50:
-        case 51:  // G51 縮放 (X 代表縮放中心)
-        case 52:  // G52 局部座標系設定 (X 代表偏移量)
-        case 68:
-        case 69:  // G68 座標旋轉 (X 代表旋轉中心)
-        case 92:  // G92 座標設定 (X 代表指定座標)
-        case 65:
-        case 66:
-        case 67:  // 巨集呼叫本身
-            return false; // 🛑 這些是「帶有座標參數但不會移動」的 G 碼，攔截！
-        }
+    const int primaryActionCode =
+        NCGCodeSemantics::GetPrimaryActionCode(block);
+
+    if (primaryActionCode >= 0)
+    {
+        return NCGCodeSemantics::IsMotionAction(
+            primaryActionCode);
     }
 
-    // 3. 排除上面的例外後，只要帶有 XYZ，我們就視為真正的移動指令！
-    // (例如 G00, G01, 或是單純只有 X10. 的模態移動)
+    if (NCGCodeSemantics::BlockSuppressesImplicitMotion(block))
+    {
+        return false;
+    }
+
+    // 沒有 Exclusive Action 時，保留未來 Modal Motion 的可能性。
     return true;
 }

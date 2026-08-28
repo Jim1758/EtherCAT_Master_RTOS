@@ -4,11 +4,19 @@
 #include "HomeTypes.h"
 #include <cmath>
 #include <cstdint>
+#include <atomic>
+#include <array>
+#include <cstddef>
 #include <queue> // 引入佇列函式庫
+#include <type_traits>
 #include <deque>
 #include "CoordinateManager.h"
 #include "CompensationEngine.h" // 引入剛寫好的標頭檔
 #include "SHM_Types.h"
+#include "MotionExecutionContract.h"
+#include "MotionCommandRing.h"
+#include "MotionFeedbackRing.h"
+#include "MotionAxisCommandMailbox.h"
 
 class EtherCatMaster;
 constexpr int MAX_AXES = 8;//最大軸數宣告
@@ -429,85 +437,119 @@ enum class PathMode// 軌跡的連續模式
 
 struct MotionCommand//運動指令包裹 (使用在塞進佇列)
 {
-    InterpolationMode mode;      //插補群組的導航模式
-    int axisCount;               // 參與的軸數
-    int axisIndices[MAX_AXES];          // 參與的軸編號
-    double targetPos[MAX_AXES];         // 各軸的終點座標
+    // Stage NC-0.1B：命令進入 Motion Queue 前正式取得執行識別。
+    // Epoch 淘汰舊世代命令；SegmentId 唯一追蹤每一段路徑。
+    MotionExecutionIdentity execution{};
+
+    // Stage NC-0.1E：命令建立當下的 Motion 控制權快照。
+    // Consumer 會在真正執行前再次比對 Owner + Generation。
+    MotionOwnerLease ownerLease{};
+
+    InterpolationMode mode = InterpolationMode::LINEAR;
+    int axisCount = 0;
+    int axisIndices[MAX_AXES] = { 0 };
+    double targetPos[MAX_AXES] = { 0.0 };
 
     // 圓弧專用參數
-    double centerPos[2];         // 圓心 (X, Y)
+    double centerPos[2] = { 0.0, 0.0 };
 
-    // 🟢 [新增] 螺線專用
-    double startRadius;
-    double endRadius;
+    // 螺線專用
+    double startRadius = 0.0;
+    double endRadius = 0.0;
 
-    int dir;                     // 方向 (1=CCW, -1=CW)
+    int dir = 0; // 方向 (1=CCW, -1=CW)
 
     // 運動參數
-    double targetVel;            // 目標速度
-    double accTime;              // 加速時間
-    double decTime;              // 減速時間
+    double targetVel = 0.0;
+    double accTime = 0.0;
+    double decTime = 0.0;
 
+    // 時光機專用快照記憶體
+    double mem_startPos[MAX_AXES] = { 0.0 };
+    double mem_ratio[MAX_AXES] = { 0.0 };
+    double mem_radius = 0.0;
+    double mem_startAngle = 0.0;
+    double mem_centerX = 0.0;
+    double mem_centerY = 0.0;
+    double mem_totalDist = 0.0;
+    double mem_totalAngle = 0.0;
 
+    // 時光機專用：記憶當時的空間旋轉狀態
+    bool mem_enableTransform = false;
+    double mem_transformOrigin[3] = { 0.0, 0.0, 0.0 };
+    double mem_transformMatrix[3][3] = {
+        { 1.0, 0.0, 0.0 },
+        { 0.0, 1.0, 0.0 },
+        { 0.0, 0.0, 1.0 }
+    };
 
+    // 這張單子是從哪一行 G-Code 產生。
+    // 既有相容欄位；入列時同步鏡射到 execution.sourceBlockId。
+    int sourceLinePC = 0;
 
-    //時光機專用快照記憶體
+    // 打包當下的座標與 Modal 狀態
+    int sourceWCS = 54;
+    int sourceToolLengthMode = 49;
+    int sourceHCode = 0;
+    int sourceToolRadiusMode = 40;
+    int sourceDCode = 0;
+    bool sourceIsAbsoluteMode = true;
 
-    double mem_startPos[8];
-    double mem_ratio[8];
-    double mem_radius;
-    double mem_startAngle;
-    double mem_centerX;
-    double mem_centerY;
-    double mem_totalDist; // 這條線的總長度
-    double mem_totalAngle; // 🟢 [補上這行] 記憶 3D 螺旋總角度
+    bool sourceG68Active = false;
+    double sourceG68Angle = 0.0;
 
-    // 🟢 [新增] 時光機專用：記憶當時的空間旋轉狀態！
-    bool   mem_enableTransform;
-    double mem_transformOrigin[3];
-    double mem_transformMatrix[3][3];
+    bool sourceG168Active = false;
+    int sourceWCode = 0;
 
-    // 🌟 新增：這張單子是從哪一行 G 碼來的？
-    int sourceLinePC;
+    bool sourceG51Active = false;
+    double sourceScaleRatio = 1.0;
 
-    // 🌟 1. 新增：這張單子打包當下，大腦的座標系是什麼？
-    int sourceWCS;
-
-    // 🌟 新增：刀具狀態標籤！
-    int sourceToolLengthMode; // G43, G44, 還是 G49?
-    int sourceHCode;          // H 碼是多少?
-
-    // 🌟 1. 新增包裹標籤：刀徑狀態
-    int sourceToolRadiusMode;
-    int sourceDCode;
-
-    // 🌟 沿用你的命名：這行是絕對還是增量？
-    bool sourceIsAbsoluteMode;
-
-    // 🌟 1. 新增包裹標籤：G68 狀態
-    bool sourceG68Active;
-    double sourceG68Angle; // 🌟 1. 新增包裹標籤：打單時的旋轉角度
-
-
-    // 🌟 1. 新增包裹標籤：G168 工件補償狀態
-    bool sourceG168Active;
-    int sourceWCode; // 🌟 1. 新增包裹標籤：打單時的 W 碼
-    // 🌟 1. 新增包裹標籤：G51 狀態與倍率
-    bool sourceG51Active;
-    double sourceScaleRatio;
-
-
-
-    // 🌟 1. 新增包裹標籤：這張單子打包時，哪幾個軸正在鏡像？
-    uint8_t sourceMirrorMask;
-
-    // 🌟 1. 新增包裹標籤：極座標狀態
-    bool sourceG16Active;
-
-    bool sourceG162Active; // 🌟 G162 標籤
-    int sourcePlaneMode;   // 🌟 平面標籤 (17, 18, 19)
+    std::uint8_t sourceMirrorMask = 0U;
+    bool sourceG16Active = false;
+    bool sourceG162Active = true;
+    int sourcePlaneMode = 17;
 };
 
+static_assert(
+    std::is_trivially_copyable<MotionCommand>::value,
+    "MotionCommand must remain trivially copyable for the fixed SPSC ring.");
+
+// Stage NC-0.2D：NC Producer 在單一 Program Block 派送期間，
+// 固定容量收集該 Block 建立的 Segment Identity。它只存在 Producer
+// 執行緒，不進入 250 us Runtime，也不改變 Command / Feedback ABI。
+constexpr std::size_t MOTION_PROGRAM_BLOCK_CAPTURE_CAPACITY = 32U;
+
+struct MotionProgramBlockSubmission
+{
+    MotionExecutionIdentity identity{};
+    bool producerAccepted = false;
+    MotionRejectReason immediateRejectReason = MotionRejectReason::NONE;
+};
+
+struct MotionProgramBlockCapture
+{
+    std::array<MotionProgramBlockSubmission,
+        MOTION_PROGRAM_BLOCK_CAPTURE_CAPACITY> submissions{};
+    std::size_t count = 0U;
+    bool overflow = false;
+};
+
+// Stage NC-0.1C：
+// - 256 筆 SPSC Ingress：NC / MDI Producer -> 250 us Motion Consumer
+// - 1024 筆 RT Replay：B2 倒退跨節後，保存稍後要正向重播的路段
+// - NC 預讀高水位仍維持 100，Ring 保留額外空間給 Epoch 切換
+//
+// Transport capacity constants are declared in MotionCommandRing.h.
+constexpr std::size_t MOTION_COMMAND_HISTORY_LIMIT = 1000U;
+
+static_assert(
+    MOTION_COMMAND_REPLAY_CAPACITY >= MOTION_COMMAND_HISTORY_LIMIT,
+    "B2 replay capacity must cover the retained Motion history depth.");
+
+using MotionCommandQueue = FixedCapacitySpscCommandChannel<
+    MotionCommand,
+    MOTION_COMMAND_INGRESS_CAPACITY,
+    MOTION_COMMAND_REPLAY_CAPACITY>;
 
 // 放電排渣模式
 enum class JumpMode {
@@ -690,7 +732,10 @@ struct InterpolationGroup// 插補群組
 
 
     //任務緩衝管理------------------------------------------------------
-    std::deque<MotionCommand> cmdQueue;
+    // Stage NC-0.1C：固定容量 SPSC Command Channel。
+    // Producer 只寫 Ingress；250 us Runtime 是唯一 Consumer。
+    // B2 push-front 由 Channel 內部的 RT-only Replay 區處理。
+    MotionCommandQueue cmdQueue;
     int currentExecutionPC = 0; // 馬達當下的行號
     // 🌟 2. 新增：實體馬達當下正在跑的座標系
     int currentExecutionWCS = 54;
@@ -780,6 +825,51 @@ struct MotionServoInputSnapshot
     uint16_t TouchProbeStatus = 0U;
     int32_t TouchProbePosition = 0;
 };
+
+
+
+// =============================================================================
+// Stage NC-0.2I.2 - Read-only Feed Hold Motion Stop Snapshot
+//
+// IsGroupStandstill() intentionally requires the active segment and all queued
+// commands to be finished. Feed Hold pauses inside the current segment and
+// preserves that segment plus future queue data. This snapshot therefore
+// reports velocity-based controlled-stop conditions without requiring Group
+// Done or an empty command queue.
+// =============================================================================
+struct MotionFeedHoldStopSnapshot
+{
+    double feedrateOverride = 1.0;
+    double virtualCommandVelocityPps = 0.0;
+    double maxAxisCommandVelocityPps = 0.0;
+    double maxAxisActualVelocityPps = 0.0;
+
+    std::uint32_t groupAxisCount = 0U;
+    std::uint32_t commandMovingAxes = 0U;
+    std::uint32_t actualMovingAxes = 0U;
+    std::uint32_t faultedAxes = 0U;
+
+    std::uint32_t commandQueueDepth = 0U;
+    std::uint32_t commandIngressDepth = 0U;
+    std::uint32_t commandReplayDepth = 0U;
+
+    bool groupActive = false;
+    bool groupDone = false;
+    bool groupFaulted = false;
+    bool groupEmergencyStopped = false;
+    bool safetyOrRecoveryPending = false;
+    bool overrideZero = false;
+    bool virtualCommandStopped = true;
+    bool axisCommandStopped = true;
+    bool axisActualStopped = true;
+    bool commandStopped = true;
+    bool actualStopped = true;
+    bool motionStopped = true;
+};
+
+static_assert(
+    std::is_trivially_copyable<MotionFeedHoldStopSnapshot>::value,
+    "MotionFeedHoldStopSnapshot must remain trivially copyable.");
 
 
 //核心類別宣告--------------------------------------------------------------------
@@ -908,6 +998,229 @@ public:
     void UpdatePathServoVelocity(double velocity_pps);//更新外部速度  
     void EnableHistoryBuffer(bool enable);//時光機模式開關
 
+    // ========================================================================
+    // Stage NC-0.1B / NC-0.1C - Execution Epoch + Fixed SPSC Command Ring
+    //
+    // BeginNewExecutionEpoch() 只發布新的執行世代，不讓 NC 執行緒清除
+    // Command Queue。舊世代淘汰由 250 us Motion Runtime 完成。
+    //
+    // NC-0.1C 已將跨執行緒 std::deque 替換為固定容量 SPSC Ingress。
+    // B2 push-front 行為由 RT 專用固定 Replay 區承接。
+    // ========================================================================
+    MotionExecutionEpoch BeginNewExecutionEpoch(MotionCommandSource source) noexcept;
+
+    MotionExecutionEpoch GetCurrentExecutionEpoch() const noexcept
+    {
+        return m_executionEpoch.load(std::memory_order_acquire);
+    }
+
+    // ====================================================================
+    // Stage NC-0.1E - Motion Owner Lease Arbitration
+    //
+    // 所有權狀態使用單一 64-bit Atomic Packed State，避免 Owner 與
+    // Generation 分開讀取時產生撕裂快照。
+    // ====================================================================
+    bool TryAcquireMotionOwner(
+        MotionOwner requestedOwner,
+        MotionOwnerLease& outLease) noexcept;
+
+    bool TryTransferMotionOwner(
+        const MotionOwnerLease& currentLease,
+        MotionOwner requestedOwner,
+        MotionOwnerLease& outLease) noexcept;
+
+    bool ReleaseMotionOwner(
+        const MotionOwnerLease& lease) noexcept;
+
+    MotionOwnerLease TakeSafetyMotionOwner() noexcept;
+
+    MotionOwnerLease GetMotionOwnerLease() const noexcept;
+
+    bool IsMotionOwnerLeaseCurrent(
+        const MotionOwnerLease& lease) const noexcept;
+
+    MotionOwner GetMotionOwner() const noexcept
+    {
+        return GetMotionOwnerLease().owner;
+    }
+
+    // ====================================================================
+    // Stage NC-0.1F - 10 ms Control -> 250 us RT Axis Command Mailbox
+    //
+    // These producer APIs never mutate AxisContext. They only publish a
+    // fixed-size command carrying the current Owner + Generation lease.
+    // ====================================================================
+    bool SubmitAxisMoveToPosition(
+        int axisIndex,
+        double targetPosition,
+        double targetVelocity,
+        double accelerationTime,
+        double decelerationTime,
+        bool useShortestPath,
+        MotionCommandSource source,
+        const MotionOwnerLease& ownerLease,
+        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+
+    bool SubmitAxisVelocityMove(
+        int axisIndex,
+        double targetVelocity,
+        double accelerationTime,
+        MotionCommandSource source,
+        const MotionOwnerLease& ownerLease,
+        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+
+    bool SubmitAxisMPGMove(
+        int axisIndex,
+        double targetPosition,
+        double maximumVelocity,
+        double accelerationTime,
+        double decelerationTime,
+        MotionCommandSource source,
+        const MotionOwnerLease& ownerLease,
+        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+
+    bool SubmitAxisStopMove(
+        int axisIndex,
+        double decelerationTime,
+        MotionCommandSource source,
+        const MotionOwnerLease& ownerLease,
+        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+
+    bool SubmitApplyMachineHome(
+        int axisIndex,
+        double capturedReferencePulse,
+        double homeOffsetUnit,
+        const MotionOwnerLease& ownerLease,
+        MotionAxisCommandSequence& outSequence) noexcept;
+
+    bool SubmitDriveTouchProbeFunction(
+        int axisIndex,
+        std::uint16_t value,
+        const MotionOwnerLease& ownerLease,
+        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+
+    // Single consumer: NCPLC 10 ms task.
+    void ProcessAxisCommandResults() noexcept;
+    bool TryGetAxisCommandResult(
+        MotionAxisCommandSequence sequence,
+        MotionAxisCommandResult& outResult) const noexcept;
+
+    // Safety / recovery producers publish atomic requests. The actual
+    // AxisContext mutation is applied by UpdateInterpolation().
+    void RequestEmergencyStopAllAxes() noexcept;
+    void RequestAxisFaultReset(int axisIndex) noexcept;
+    void RequestResetAllFaults() noexcept;
+    void RequestStopGroup() noexcept;
+    bool HasPendingSafetyOrRecoveryRequests() const noexcept;
+
+    std::size_t GetAxisCommandMailboxDepth() const noexcept
+    {
+        return m_axisCommandChannel.command_size();
+    }
+
+    std::size_t GetAxisCommandResultDepth() const noexcept
+    {
+        return m_axisCommandChannel.result_size();
+    }
+
+    std::uint64_t GetAxisCommandQueueFullCount() const noexcept
+    {
+        return m_axisCommandQueueFullCount.load(std::memory_order_relaxed);
+    }
+
+    std::uint64_t GetAxisCommandResultOverflowCount() const noexcept
+    {
+        return m_axisCommandResultOverflowCount.load(std::memory_order_relaxed);
+    }
+
+    std::uint64_t GetStaleCommandDiscardCount() const noexcept
+    {
+        return m_staleCommandDiscardCount.load(std::memory_order_relaxed);
+    }
+
+    std::uint64_t GetMotionOwnerConflictRejectCount() const noexcept
+    {
+        return m_motionOwnerConflictRejectCount.load(
+            std::memory_order_relaxed);
+    }
+
+    // --------------------------------------------------------------------
+    // Stage NC-0.1D - Motion Feedback Consumer API
+    //
+    // 僅允許 NC 10 ms Task 作為單一 Consumer 呼叫 TryReadMotionFeedback。
+    // HMI / API 不可另外 Pop Ring；正式跨執行緒 Snapshot 會在後續
+    // SHM / Diagnostics 階段建立。
+    // --------------------------------------------------------------------
+    bool TryReadMotionFeedback(
+        MotionFeedbackEvent& event) noexcept
+    {
+        return
+            m_motionFeedbackChannel.NcTryConsumeFeedback(event);
+    }
+
+    std::size_t GetMotionFeedbackDepth() const noexcept
+    {
+        return
+            m_motionFeedbackChannel.feedback_size();
+    }
+
+    std::size_t GetMotionFeedbackProducerNoticeDepth() const noexcept
+    {
+        return
+            m_motionFeedbackChannel.producer_notice_size();
+    }
+
+    static constexpr std::size_t GetMotionFeedbackCapacity() noexcept
+    {
+        return
+            MOTION_FEEDBACK_EVENT_CAPACITY;
+    }
+
+    std::uint64_t GetMotionFeedbackOverflowCount() const noexcept
+    {
+        return
+            m_motionFeedbackOverflowCount.load(
+                std::memory_order_relaxed);
+    }
+
+    std::uint64_t GetMotionFeedbackProducerNoticeOverflowCount() const noexcept
+    {
+        return
+            m_motionFeedbackProducerNoticeOverflowCount.load(
+                std::memory_order_relaxed);
+    }
+
+    MotionFeedbackSequence GetLastPublishedMotionFeedbackSequence() const noexcept
+    {
+        return
+            m_lastPublishedMotionFeedbackSequence.load(
+                std::memory_order_acquire);
+    }
+
+    MotionSegmentId GetLastDroppedMotionFeedbackSegmentId() const noexcept
+    {
+        return
+            m_lastDroppedMotionFeedbackSegmentId.load(
+                std::memory_order_relaxed);
+    }
+
+    MotionFeedbackType GetLastDroppedMotionFeedbackType() const noexcept
+    {
+        return
+            m_lastDroppedMotionFeedbackType.load(
+                std::memory_order_relaxed);
+    }
+
+    void SetPendingCommandSource(MotionCommandSource source) noexcept
+    {
+        m_pendingCommandSource.store(
+            source,
+            std::memory_order_release);
+    }
+
+    void BeginProgramBlockMotionCapture() noexcept;
+    MotionProgramBlockCapture EndProgramBlockMotionCapture() noexcept;
+
     //設定空間座標旋轉 (參數：開關, 旋轉中心X,Y,Z, 繞Z軸旋轉角度, 繞Y軸旋轉角度, 繞X軸旋轉角度)
     void SetCoordinateTransform(bool enable, double ox, double oy, double oz, double yaw_deg, double pitch_deg, double roll_deg);
 
@@ -934,12 +1247,28 @@ public:
     void Process_Forward_Crossing();
     void TriggerPauseResume(int alignMode, double alignVel, int firstStageMask);//觸發復歸 (只需給對齊模式和速度)
 
-    // 🌟 新增：讓 NC 系統查詢底層插補狀態
-    bool IsGroupQueueFull() const { return m_Group.cmdQueue.size() >= 100; } // 預讀 100 行
-    bool IsGroupDone() const { return !m_Group.isActive && m_Group.cmdQueue.empty(); }
+    // 🌟 讓 NC 系統查詢底層插補狀態
+    bool IsGroupQueueFull() const noexcept
+    {
+        return
+            m_Group.cmdQueue.producer_full() ||
+            m_Group.cmdQueue.ingress_size() >=
+            MOTION_COMMAND_PREREAD_HIGH_WATERMARK;
+    }
+
+    bool IsGroupDone() const noexcept
+    {
+        return
+            !m_Group.isActive &&
+            m_Group.cmdQueue.empty();
+    }
 
     // 🌟 [新增]：檢查群組是否「完全靜止」(包含煞車滑行結束)
     bool IsGroupStandstill() const;
+
+    // Stage NC-0.2I.2：Feed Hold 保留目前 Segment 與 Future Queue，
+    // 因此使用速度型停止快照，不要求 IsGroupDone()。
+    MotionFeedHoldStopSnapshot GetFeedHoldStopSnapshot() const noexcept;
 
 
     // ========================================================
@@ -994,8 +1323,49 @@ public:
         return true;
     }
 
-    size_t GetQueueSize() const {
-        return m_Group.cmdQueue.size();
+    size_t GetQueueSize() const noexcept
+    {
+        return
+            m_Group.cmdQueue.size();
+    }
+
+    size_t GetCommandIngressSize() const noexcept
+    {
+        return
+            m_Group.cmdQueue.ingress_size();
+    }
+
+    size_t GetCommandReplaySize() const noexcept
+    {
+        return
+            m_Group.cmdQueue.replay_size();
+    }
+
+    static constexpr size_t GetCommandIngressCapacity() noexcept
+    {
+        return
+            MOTION_COMMAND_INGRESS_CAPACITY;
+    }
+
+    std::uint64_t GetCommandQueueFullRejectCount() const noexcept
+    {
+        return
+            m_commandQueueFullRejectCount.load(
+                std::memory_order_relaxed);
+    }
+
+    std::uint64_t GetCommandReplayOverflowCount() const noexcept
+    {
+        return
+            m_commandReplayOverflowCount.load(
+                std::memory_order_relaxed);
+    }
+
+    MotionSegmentId GetLastRejectedSegmentId() const noexcept
+    {
+        return
+            m_lastRejectedSegmentId.load(
+                std::memory_order_relaxed);
     }
     // 🌟 新增：讓外部讀取「實體馬達正在執行的行號」
     int GetPhysicalExecutionPC() const {
@@ -1140,6 +1510,153 @@ public:
 
 
 private:
+    // ========================================================================
+    // Stage NC-0.1D - Execution Identity + Command / Feedback Transport State
+    //
+    // m_executionEpoch：
+    //     RESET / GOTO / 新程式 / 新 Cycle Start 時遞增。
+    //
+    // m_nextSegmentId：
+    //     全系統單調遞增，避免不同 Epoch 之間重複使用 SegmentId。
+    //
+    // m_executionEpochChangePending：
+    //     NC 執行緒只設旗標；Queue / History 的清理由 Motion Runtime 執行。
+    // ========================================================================
+    // Stage NC-0.1F - Axis command mailbox and RT-only mutation requests.
+    // ========================================================================
+    MotionAxisCommandChannel m_axisCommandChannel{};
+    std::atomic<MotionAxisCommandSequence> m_nextAxisCommandSequence{ 1ULL };
+    std::array<MotionAxisCommandResult, MOTION_AXIS_RESULT_CAPACITY>
+        m_axisCommandResultLedger{};
+    std::atomic<std::uint64_t> m_axisCommandQueueFullCount{ 0ULL };
+    std::atomic<std::uint64_t> m_axisCommandResultOverflowCount{ 0ULL };
+
+    std::atomic<bool> m_emergencyStopAllPending{ false };
+    std::atomic<bool> m_resetAllFaultsPending{ false };
+    std::atomic<bool> m_stopGroupPending{ false };
+    std::atomic<std::uint32_t> m_axisFaultResetPendingMask{ 0U };
+    std::atomic<bool> m_safetyRecoveryRequestInProgress{ false };
+
+    MotionAxisCommandSequence AllocateAxisCommandSequence() noexcept;
+    bool SubmitAxisCommand(
+        MotionAxisCommand command,
+        MotionAxisCommandSequence* outSequence) noexcept;
+    void ApplyPendingSafetyAndRecoveryRequests() noexcept;
+    void DrainAxisCommandMailbox() noexcept;
+    void PublishAxisCommandResult(
+        const MotionAxisCommand& command,
+        MotionAxisCommandResultType resultType,
+        MotionRejectReason rejectReason) noexcept;
+
+    // ========================================================================
+    // Stage NC-0.1E：Owner + Generation 打包成單一 atomic state。
+    // Layout：bits 0..7 = MotionOwner，bits 32..63 = Generation。
+    std::atomic<std::uint64_t> m_motionOwnerState{ 0ULL };
+
+    std::atomic<MotionExecutionEpoch> m_executionEpoch{ 1U };
+    std::atomic<MotionSegmentId> m_nextSegmentId{ 1ULL };
+    std::atomic<std::uint64_t> m_staleCommandDiscardCount{ 0ULL };
+    std::atomic<std::uint64_t> m_motionOwnerConflictRejectCount{ 0ULL };
+
+    // 250 us Runtime 單一擁有者。UpdateInterpolation 每圈重設，
+    // 所有 Stale 清理入口共用同一份額度，確保整個 Runtime Pass
+    // 最多只淘汰固定筆數，而不是每個 Helper 各自再淘汰一批。
+    std::size_t m_staleCommandDiscardBudgetRemaining =
+        MOTION_COMMAND_STALE_DISCARD_LIMIT_PER_RUNTIME_PASS;
+
+    std::atomic<std::uint64_t> m_commandQueueFullRejectCount{ 0ULL };
+    std::atomic<std::uint64_t> m_commandReplayOverflowCount{ 0ULL };
+    std::atomic<MotionSegmentId> m_lastRejectedSegmentId{ MOTION_SEGMENT_ID_INVALID };
+    std::atomic<bool> m_executionEpochChangePending{ false };
+    std::atomic<bool> m_abortActiveCommandPending{ false };
+
+    std::atomic<MotionCommandSource> m_pendingCommandSource{ MotionCommandSource::UNKNOWN };
+
+    // Stage NC-0.2D：只由 Motion Command Producer 使用。
+    MotionProgramBlockCapture m_programBlockMotionCapture{};
+    bool m_programBlockMotionCaptureActive = false;
+
+    void RecordProgramBlockMotionSubmission(
+        const MotionExecutionIdentity& identity,
+        bool producerAccepted,
+        MotionRejectReason immediateRejectReason) noexcept;
+
+    // --------------------------------------------------------------------
+    // Final Feedback Ring：Runtime Producer -> NC Consumer
+    // Producer Notice Ring：NC Producer -> Runtime Consumer
+    // --------------------------------------------------------------------
+    MotionFeedbackChannel m_motionFeedbackChannel{};
+
+    // 只有 250 us Runtime 會修改 next sequence 與 Tracking State。
+    MotionFeedbackSequence m_nextMotionFeedbackSequence{ 1ULL };
+    MotionExecutionIdentity m_feedbackTrackedIdentity{};
+    MotionOwnerLease m_feedbackTrackedOwnerLease{};
+    bool m_feedbackTrackedAccepted = false;
+    bool m_feedbackTrackedStarted = false;
+    bool m_feedbackTrackedTerminal = true;
+
+    std::atomic<std::uint64_t> m_motionFeedbackOverflowCount{ 0ULL };
+    std::atomic<std::uint64_t> m_motionFeedbackProducerNoticeOverflowCount{ 0ULL };
+    std::atomic<MotionFeedbackSequence> m_lastPublishedMotionFeedbackSequence{ MOTION_FEEDBACK_SEQUENCE_INVALID };
+    std::atomic<MotionSegmentId> m_lastDroppedMotionFeedbackSegmentId{ MOTION_SEGMENT_ID_INVALID };
+    std::atomic<MotionFeedbackType> m_lastDroppedMotionFeedbackType{ MotionFeedbackType::NONE };
+
+    MotionSegmentId AllocateMotionSegmentId() noexcept;
+    void AssignExecutionIdentity(MotionCommand& command) noexcept;
+    bool IsCommandFromCurrentEpoch(const MotionCommand& command) const noexcept;
+    bool IsCommandOwnerLeaseCurrent(const MotionCommand& command) const noexcept;
+    MotionRejectReason GetCommandAuthorizationFailure(
+        const MotionCommand& command) const noexcept;
+
+    static std::uint64_t PackMotionOwnerState(
+        MotionOwner owner,
+        MotionOwnerGeneration generation) noexcept;
+    static MotionOwnerLease UnpackMotionOwnerState(
+        std::uint64_t packed) noexcept;
+    static MotionOwnerGeneration NextMotionOwnerGeneration(
+        MotionOwnerGeneration current) noexcept;
+
+    MotionFeedbackSequence AllocateMotionFeedbackSequence() noexcept;
+    bool TryQueueProducerFeedbackNotice(
+        const MotionCommand& command,
+        MotionFeedbackType type,
+        MotionRejectReason rejectReason,
+        std::uint32_t errorCode,
+        double progress) noexcept;
+    void DrainProducerFeedbackNotices() noexcept;
+    bool PublishMotionFeedback(MotionFeedbackEvent event) noexcept;
+    bool PublishMotionFeedbackForCommand(
+        const MotionCommand& command,
+        MotionFeedbackType type,
+        MotionRejectReason rejectReason,
+        std::uint32_t errorCode,
+        double progress) noexcept;
+    void TrackMotionCommandAccepted(const MotionCommand& command) noexcept;
+    void TrackMotionCommandStarted(const MotionCommand& command) noexcept;
+    void CompleteTrackedMotionCommand(
+        const MotionCommand& command) noexcept;
+    void AbortTrackedMotionCommand() noexcept;
+    void FaultTrackedMotionCommand(
+        std::uint32_t errorCode,
+        MotionRejectReason reason) noexcept;
+    void RejectMotionCommand(
+        const MotionCommand& command,
+        MotionRejectReason reason,
+        std::uint32_t errorCode) noexcept;
+    double GetTrackedMotionProgress() const noexcept;
+
+    bool TryEnqueueMotionCommand(const MotionCommand& command) noexcept;
+    bool TryPeekNextMotionCommand(MotionCommand& command) const noexcept;
+    bool TryPeekQueuedMotionCommandAt(
+        std::size_t offset,
+        MotionCommand& command) const noexcept;
+    bool TryDequeueNextMotionCommand(MotionCommand& command) noexcept;
+    bool TryRequeueMotionCommandFront(const MotionCommand& command) noexcept;
+    void RequestAbortingExecutionEpoch(MotionCommandSource source) noexcept;
+
+    void DiscardStaleQueuedCommands();
+    void ApplyPendingExecutionEpochChange();
+
     int m_pendingSourcePC = 0;
     int m_pendingSourceWCS = 54; // 預設 G54
 

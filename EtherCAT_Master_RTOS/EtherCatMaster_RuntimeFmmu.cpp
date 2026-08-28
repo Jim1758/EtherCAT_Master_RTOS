@@ -11,7 +11,7 @@
 
 
 // ============================================================================
-// Stage 6C - Runtime FMMU Cutover
+// Stage 6C / Stage 11G.3 - Runtime FMMU Cutover
 //
 // Runtime XML is now the FMMU configuration source.
 //
@@ -33,6 +33,8 @@
 // 5. Every APWR is followed immediately by APRD readback.
 // 6. Any failure aborts Startup in PRE-OP.
 // 7. Old XML with no <Fmmus> keeps legacy Config_Slave_FMMU() fallback.
+// 8. Stage 11G.3 allows 1..N FMMUs per Input/Output direction when the
+//    Runtime PDOs span multiple physical SyncManagers.
 //
 // No code here runs inside the 250 us cyclic PDO path.
 // ============================================================================
@@ -155,6 +157,193 @@ namespace
             actualEnabled ==
             expected.enabled;
     }
+
+    // ========================================================================
+    // Stage 11G.3 - Multi-SyncManager / Multi-FMMU Runtime Helpers
+    //
+    // A single logical Process Image direction may be backed by 1..N
+    // physical SyncManagers. The logical image remains compact/contiguous;
+    // only the ESC physical side is segmented.
+    // ========================================================================
+
+    const EtherCatRuntimeSyncManagerConfig* FindRuntimeSm(
+        const EtherCatSlave& slave,
+        int smIndex)
+    {
+        for (const auto& sm :
+            slave.runtimeSyncManagers)
+        {
+            if (sm.index ==
+                smIndex)
+            {
+                return
+                    &sm;
+            }
+        }
+
+
+        return
+            nullptr;
+    }
+
+
+    struct RuntimeFmmuExpectedSegment
+    {
+        int smIndex = -1;
+        uint16_t physicalStartAddress = 0;
+        uint32_t bitSize = 0;
+    };
+
+
+    std::vector<RuntimeFmmuExpectedSegment>
+        BuildExpectedFmmuSegments(
+            const EtherCatSlave& slave,
+            const std::vector<EtherCatRuntimePdoConfig>& pdos)
+    {
+        std::vector<RuntimeFmmuExpectedSegment> result;
+
+
+        for (const auto& pdo :
+            pdos)
+        {
+            if (pdo.syncManagerIndex <
+                0 ||
+                pdo.bitSize ==
+                0U)
+            {
+                continue;
+            }
+
+
+            RuntimeFmmuExpectedSegment* existing =
+                nullptr;
+
+
+            for (auto& segment :
+                result)
+            {
+                if (segment.smIndex ==
+                    pdo.syncManagerIndex)
+                {
+                    existing =
+                        &segment;
+
+                    break;
+                }
+            }
+
+
+            if (existing !=
+                nullptr)
+            {
+                existing->bitSize +=
+                    pdo.bitSize;
+
+                continue;
+            }
+
+
+            const EtherCatRuntimeSyncManagerConfig* sm =
+                FindRuntimeSm(
+                    slave,
+                    pdo.syncManagerIndex);
+
+
+            if (sm ==
+                nullptr)
+            {
+                continue;
+            }
+
+
+            RuntimeFmmuExpectedSegment segment;
+
+            segment.smIndex =
+                pdo.syncManagerIndex;
+
+            segment.physicalStartAddress =
+                sm->startAddress;
+
+            segment.bitSize =
+                pdo.bitSize;
+
+
+            result.push_back(
+                segment);
+        }
+
+
+        return
+            result;
+    }
+
+
+    bool RuntimeFmmuMatchesExpectedSegment(
+        const EtherCatRuntimeFmmuConfig& fmmu,
+        uint64_t logicalBitOffset,
+        uint32_t bitSize,
+        uint16_t physicalStartAddress,
+        uint8_t expectedType)
+    {
+        if (bitSize ==
+            0U)
+        {
+            return
+                false;
+        }
+
+
+        const uint32_t expectedLogicalStartAddress =
+            (uint32_t)(
+                logicalBitOffset /
+                8U);
+
+
+        const uint8_t expectedLogicalStartBit =
+            (uint8_t)(
+                logicalBitOffset %
+                8U);
+
+
+        const uint16_t expectedLogicalLength =
+            (uint16_t)(
+                (
+                    (uint32_t)
+                    expectedLogicalStartBit +
+                    bitSize +
+                    7U
+                    ) /
+                8U);
+
+
+        const uint8_t expectedLogicalEndBit =
+            (uint8_t)(
+                (
+                    (uint32_t)
+                    expectedLogicalStartBit +
+                    bitSize -
+                    1U
+                    ) %
+                8U);
+
+
+        return
+            fmmu.type ==
+            expectedType &&
+            fmmu.logicalStartAddress ==
+            expectedLogicalStartAddress &&
+            fmmu.logicalLength ==
+            expectedLogicalLength &&
+            fmmu.logicalStartBit ==
+            expectedLogicalStartBit &&
+            fmmu.logicalEndBit ==
+            expectedLogicalEndBit &&
+            fmmu.physicalStartAddress ==
+            physicalStartAddress &&
+            fmmu.physicalStartBit ==
+            0U;
+    }
+
 }
 
 
@@ -200,6 +389,13 @@ bool EtherCatMaster::ShouldUseRuntimeFmmuConfiguration(
 
 // ============================================================================
 // PreflightRuntimeFmmuConfiguration
+//
+// Stage 11G.3:
+// - Accept 1..N Runtime FMMUs per direction.
+// - Validate each FMMU against the PDO -> SyncManager physical segment plan.
+// - Keep the application Process Image compact and contiguous.
+// - Physical ESC addresses may be non-contiguous.
+// - No hardware writes are performed here.
 // ============================================================================
 
 bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
@@ -252,6 +448,10 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
         0;
 
 
+    int segmentedDirectionCount =
+        0;
+
+
     int errors =
         0;
 
@@ -260,7 +460,8 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
         "\n"
         "============================================================\n"
         "[RUNTIME-FMMU-PREFLIGHT] BEGIN | "
-        "Stage:6C | Source:RUNTIME_XML | HardwareWrite:NO\n"
+        "Stage:11G.3 | Source:RUNTIME_XML | "
+        "MultiFMMU:YES | HardwareWrite:NO\n"
         "============================================================\n");
 
 
@@ -390,12 +591,92 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
         }
 
 
+        std::vector<RuntimeFmmuExpectedSegment> expectedOutputSegments =
+            BuildExpectedFmmuSegments(
+                slave,
+                slave.runtimeRxPdos);
+
+
+        std::vector<RuntimeFmmuExpectedSegment> expectedInputSegments =
+            BuildExpectedFmmuSegments(
+                slave,
+                slave.runtimeTxPdos);
+
+
+        // Compatibility fallback for older/custom Runtime profiles that
+        // expose ProcessData but no PDO -> SyncManager ownership.
+        if (slave.outputBitLength >
+            0U &&
+            expectedOutputSegments.empty())
+        {
+            RuntimeFmmuExpectedSegment segment;
+
+            segment.smIndex =
+                -1;
+
+            segment.physicalStartAddress =
+                slave.configAddrOut;
+
+            segment.bitSize =
+                slave.outputBitLength;
+
+            expectedOutputSegments.push_back(
+                segment);
+        }
+
+
+        if (slave.inputBitLength >
+            0U &&
+            expectedInputSegments.empty())
+        {
+            RuntimeFmmuExpectedSegment segment;
+
+            segment.smIndex =
+                -1;
+
+            segment.physicalStartAddress =
+                slave.configAddrIn;
+
+            segment.bitSize =
+                slave.inputBitLength;
+
+            expectedInputSegments.push_back(
+                segment);
+        }
+
+
+        if (expectedOutputSegments.size() >
+            1U)
+        {
+            segmentedDirectionCount++;
+        }
+
+
+        if (expectedInputSegments.size() >
+            1U)
+        {
+            segmentedDirectionCount++;
+        }
+
+
         int outputCount =
             0;
 
 
         int inputCount =
             0;
+
+
+        uint64_t outputLogicalBitCursor =
+            (uint64_t)
+            expectedOutputOffset *
+            8U;
+
+
+        uint64_t inputLogicalBitCursor =
+            (uint64_t)
+            expectedInputOffset *
+            8U;
 
 
         bool usedIndex[16] =
@@ -450,87 +731,111 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
             }
 
 
+            int expectedSmIndex =
+                -1;
+
+
+            uint16_t expectedPhysicalAddress =
+                0U;
+
+
+            uint32_t expectedSegmentBits =
+                0U;
+
+
             if (IsOutputFmmu(
                 fmmu))
             {
-                outputCount++;
-
-
-                const uint8_t expectedEndBit =
-                    slave.outputBitLength >
-                    0U
-                    ? (uint8_t)(
-                        (
-                            slave.outputBitLength -
-                            1U
-                            ) %
-                        8U)
-                    : 0U;
-
-
-                if (fmmu.type !=
-                    2U ||
-                    slave.outputBitLength ==
-                    0U ||
-                    outputCount >
-                    1 ||
-                    fmmu.logicalStartAddress !=
-                    expectedOutputOffset ||
-                    fmmu.logicalLength !=
-                    outputBytes ||
-                    fmmu.logicalStartBit !=
-                    0U ||
-                    fmmu.logicalEndBit !=
-                    expectedEndBit ||
-                    fmmu.physicalStartAddress !=
-                    slave.configAddrOut ||
-                    fmmu.physicalStartBit !=
-                    0U)
+                if (outputCount >=
+                    (int)
+                    expectedOutputSegments.size())
                 {
                     pass =
                         false;
                 }
+                else
+                {
+                    const RuntimeFmmuExpectedSegment& expected =
+                        expectedOutputSegments[
+                            (size_t)
+                                outputCount];
+
+
+                    expectedSmIndex =
+                        expected.smIndex;
+
+                    expectedPhysicalAddress =
+                        expected.physicalStartAddress;
+
+                    expectedSegmentBits =
+                        expected.bitSize;
+
+
+                    if (!RuntimeFmmuMatchesExpectedSegment(
+                        fmmu,
+                        outputLogicalBitCursor,
+                        expected.bitSize,
+                        expected.physicalStartAddress,
+                        2U))
+                    {
+                        pass =
+                            false;
+                    }
+
+
+                    outputLogicalBitCursor +=
+                        expected.bitSize;
+                }
+
+
+                outputCount++;
             }
             else if (IsInputFmmu(
                 fmmu))
             {
-                inputCount++;
-
-
-                const uint8_t expectedEndBit =
-                    slave.inputBitLength >
-                    0U
-                    ? (uint8_t)(
-                        (
-                            slave.inputBitLength -
-                            1U
-                            ) %
-                        8U)
-                    : 0U;
-
-
-                if (fmmu.type !=
-                    1U ||
-                    slave.inputBitLength ==
-                    0U ||
-                    inputCount >
-                    1 ||
-                    fmmu.logicalStartAddress !=
-                    expectedInputOffset ||
-                    fmmu.logicalLength !=
-                    inputBytes ||
-                    fmmu.logicalStartBit !=
-                    0U ||
-                    fmmu.logicalEndBit !=
-                    expectedEndBit ||
-                    fmmu.physicalStartAddress !=
-                    slave.configAddrIn ||
-                    fmmu.physicalStartBit !=
-                    0U)
+                if (inputCount >=
+                    (int)
+                    expectedInputSegments.size())
                 {
                     pass =
                         false;
                 }
+                else
+                {
+                    const RuntimeFmmuExpectedSegment& expected =
+                        expectedInputSegments[
+                            (size_t)
+                                inputCount];
+
+
+                    expectedSmIndex =
+                        expected.smIndex;
+
+                    expectedPhysicalAddress =
+                        expected.physicalStartAddress;
+
+                    expectedSegmentBits =
+                        expected.bitSize;
+
+
+                    if (!RuntimeFmmuMatchesExpectedSegment(
+                        fmmu,
+                        inputLogicalBitCursor,
+                        expected.bitSize,
+                        expected.physicalStartAddress,
+                        1U))
+                    {
+                        pass =
+                            false;
+                    }
+
+
+                    inputLogicalBitCursor +=
+                        expected.bitSize;
+                }
+
+
+                inputCount++;
             }
             else
             {
@@ -566,8 +871,8 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
                 "Logical:0x%08X/%u [%u..%u] | "
                 "Physical:0x%04X.%u | "
                 "Type:%u Enable:%d | "
-                "ExpectedOutOff:%u ExpectedInOff:%u | "
-                "Result:%s\n",
+                "ExpectedSM:%d ExpectedPhys:0x%04X "
+                "SegmentBits:%u | Result:%s\n",
 
                 slaveIdx,
                 fmmu.index,
@@ -601,11 +906,13 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
                 ? 1
                 : 0,
 
-                (unsigned int)
-                expectedOutputOffset,
+                expectedSmIndex,
 
                 (unsigned int)
-                expectedInputOffset,
+                expectedPhysicalAddress,
+
+                (unsigned int)
+                expectedSegmentBits,
 
                 pass
                 ? "PASS"
@@ -614,17 +921,13 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
 
 
         const int expectedOutputCount =
-            slave.outputBitLength >
-            0U
-            ? 1
-            : 0;
+            (int)
+            expectedOutputSegments.size();
 
 
         const int expectedInputCount =
-            slave.inputBitLength >
-            0U
-            ? 1
-            : 0;
+            (int)
+            expectedInputSegments.size();
 
 
         if (outputCount !=
@@ -637,7 +940,7 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
 
             RtPrintf(
                 "[RUNTIME-FMMU-PREFLIGHT] "
-                "S%d | DirectionCount "
+                "S%d | SegmentCount "
                 "Out:%d/%d In:%d/%d | Result:FAIL\n",
 
                 slaveIdx,
@@ -648,6 +951,106 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
                 inputCount,
                 expectedInputCount);
         }
+
+
+        const uint64_t expectedOutputLogicalEndBits =
+            (
+                (uint64_t)
+                expectedOutputOffset *
+                8U
+                ) +
+            slave.outputBitLength;
+
+
+        const uint64_t expectedInputLogicalEndBits =
+            (
+                (uint64_t)
+                expectedInputOffset *
+                8U
+                ) +
+            slave.inputBitLength;
+
+
+        if (slave.outputBitLength >
+            0U &&
+            outputLogicalBitCursor !=
+            expectedOutputLogicalEndBits)
+        {
+            errors++;
+
+
+            RtPrintf(
+                "[RUNTIME-FMMU-PREFLIGHT] "
+                "S%d | Output logical coverage "
+                "ActualEndBit:%llu ExpectedEndBit:%llu | Result:FAIL\n",
+
+                slaveIdx,
+
+                (unsigned long long)
+                outputLogicalBitCursor,
+
+                (unsigned long long)
+                expectedOutputLogicalEndBits);
+        }
+
+
+        if (slave.inputBitLength >
+            0U &&
+            inputLogicalBitCursor !=
+            expectedInputLogicalEndBits)
+        {
+            errors++;
+
+
+            RtPrintf(
+                "[RUNTIME-FMMU-PREFLIGHT] "
+                "S%d | Input logical coverage "
+                "ActualEndBit:%llu ExpectedEndBit:%llu | Result:FAIL\n",
+
+                slaveIdx,
+
+                (unsigned long long)
+                inputLogicalBitCursor,
+
+                (unsigned long long)
+                expectedInputLogicalEndBits);
+        }
+
+
+        RtPrintf(
+            "[RUNTIME-FMMU-PREFLIGHT-SLAVE] "
+            "S%d | OutSegments:%u InSegments:%u | "
+            "OutBits:%u InBits:%u | "
+            "LogicalOut:%u LogicalIn:%u | Result:%s\n",
+
+            slaveIdx,
+
+            (unsigned int)
+            expectedOutputSegments.size(),
+
+            (unsigned int)
+            expectedInputSegments.size(),
+
+            (unsigned int)
+            slave.outputBitLength,
+
+            (unsigned int)
+            slave.inputBitLength,
+
+            (unsigned int)
+            expectedOutputOffset,
+
+            (unsigned int)
+            expectedInputOffset,
+
+            (
+                outputCount ==
+                expectedOutputCount &&
+                inputCount ==
+                expectedInputCount
+                )
+            ? "CHECKED"
+            : "FAIL");
     }
 
 
@@ -677,13 +1080,14 @@ bool EtherCatMaster::PreflightRuntimeFmmuConfiguration()
     RtPrintf(
         "[RUNTIME-FMMU-PREFLIGHT-RESULT] "
         "RuntimeSlaves:%d | LegacySlaves:%d | "
-        "FmmuEntries:%d | "
+        "FmmuEntries:%d | SegmentedDirections:%d | "
         "ProcessImage:%u/%d B | "
         "Errors:%d | Result:%s | HardwareWrite:NO\n",
 
         runtimeSlaveCount,
         legacySlaveCount,
         runtimeFmmuCount,
+        segmentedDirectionCount,
 
         (unsigned int)
         expectedLogicalOffsetBytes,

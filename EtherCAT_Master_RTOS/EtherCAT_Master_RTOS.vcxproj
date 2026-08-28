@@ -95,7 +95,10 @@
     <ClInclude Include="CompensationEngine.h" />
     <ClInclude Include="ConfigReader.h" />
     <ClInclude Include="CoordinateManager.h" />
+    <ClInclude Include="EtherCatDcQualificationDiagContract.h" />
+    <ClInclude Include="EtherCatDcV1aDiagContract.h" />
     <ClInclude Include="EtherCatEni.h" />
+    <ClInclude Include="EtherCatFmmuDiagContract.h" />
     <ClInclude Include="EtherCatFrame.h" />
     <ClInclude Include="EtherCatMailbox.h" />
     <ClInclude Include="EtherCatMaster.h" />
@@ -103,8 +106,12 @@
     <ClInclude Include="EtherCatMaster_DC_Topology.h" />
     <ClInclude Include="EtherCatMaster_DC_Tuning.h" />
     <ClInclude Include="EtherCatPdo.h" />
+    <ClInclude Include="EtherCatRxCorrelationDiagContract.h" />
     <ClInclude Include="EtherCatServo.h" />
+    <ClInclude Include="EtherCatSmDiagContract.h" />
     <ClInclude Include="EtherCatTypes.h" />
+    <ClInclude Include="EtherCatWatchdogDiagContract.h" />
+    <ClInclude Include="EtherCatWatchdogDiagPublisher.h" />
     <ClInclude Include="EtherCAT_Master_RTOS.h" />
     <ClInclude Include="GCodeParser.h" />
     <ClInclude Include="GlobalConfig.h" />
@@ -115,10 +122,22 @@
     <ClInclude Include="HomingManager.h" />
     <ClInclude Include="MacroEngine.h" />
     <ClInclude Include="MacroParser.h" />
+    <ClInclude Include="MotionAxisCommandMailbox.h" />
+    <ClInclude Include="MotionCommandRing.h" />
     <ClInclude Include="MotionCore.h" />
+    <ClInclude Include="MotionExecutionContract.h" />
+    <ClInclude Include="MotionFeedbackRing.h" />
+    <ClInclude Include="NCBlockCompletionBoundary.h" />
+    <ClInclude Include="NCBlockLifecycleLedger.h" />
+    <ClInclude Include="NCExpressionResolver.h" />
+    <ClInclude Include="NCFeedHoldBoundary.h" />
+    <ClInclude Include="NCGCodeSemantics.h" />
     <ClInclude Include="NCManager.h" />
     <ClInclude Include="NCPLCManager.h" />
     <ClInclude Include="NCPLCMap.h" />
+    <ClInclude Include="NCProgramCache.h" />
+    <ClInclude Include="NCProgramEndBoundary.h" />
+    <ClInclude Include="NCSingleBlockBoundary.h" />
     <ClInclude Include="NC_Types.h" />
     <ClInclude Include="NicDriver.h" />
     <ClInclude Include="PlcCore.h" />
@@ -185,10 +204,18 @@
     <ClCompile Include="MotionCore_G30.cpp" />
     <ClCompile Include="MotionCore_G32.cpp" />
     <ClCompile Include="MotionCore_G53.cpp" />
+    <ClCompile Include="NCBlockCompletionBoundary.cpp" />
+    <ClCompile Include="NCBlockLifecycleLedger.cpp" />
+    <ClCompile Include="NCExpressionResolver.cpp" />
+    <ClCompile Include="NCFeedHoldBoundary.cpp" />
+    <ClCompile Include="NCGCodeSemantics.cpp" />
     <ClCompile Include="NCManager.cpp" />
     <ClCompile Include="NCManager_PLCSync.cpp" />
     <ClCompile Include="NCManager_SysVars.cpp" />
     <ClCompile Include="NCPLCManager.cpp" />
+    <ClCompile Include="NCProgramCache.cpp" />
+    <ClCompile Include="NCProgramEndBoundary.cpp" />
+    <ClCompile Include="NCSingleBlockBoundary.cpp" />
     <ClCompile Include="NicDriver.cpp" />
     <ClCompile Include="PlcCore.cpp" />
     <ClCompile Include="PLCManager.cpp" />
@@ -200,6 +227,7 @@
   <ItemGroup>
     <Text Include="DC同步_相關設定說明.txt" />
     <Text Include="DC同步流程.txt" />
+    <Text Include="EtherCAT_Master_API_使用方式.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Import Project="$(RTX64Common)\DebuggerExtensions\IntervalZero.targets" Condition="exists('$(RTX64Common)\DebuggerExtensions\IntervalZero.targets')" />

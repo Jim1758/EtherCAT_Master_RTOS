@@ -31,7 +31,11 @@ enum class EDMState {
     ALARM       // 🚨 警報狀態 (硬體報警、軟體語法錯誤、急停)
 };
 
-// 4. 單行指令結構 (GCode 預先解碼後的樣子)
+// 4. 單行指令固定容量
+constexpr int NC_MAX_G_CODES_PER_BLOCK = 10;
+constexpr int NC_MAX_M_CODES_PER_BLOCK = 3;
+
+// 5. 單行指令結構 (GCode 預先解碼後的樣子)
 struct NCBlock {
     bool isEmpty = true;
     bool isBlockSkip = false;
@@ -42,13 +46,13 @@ struct NCBlock {
 
     // 🌟 2. 擴充：支援多個 G 碼檢查
     int gCount = 0;
-    int gCodes[10] = { 0 }; // 預留空間存這行出現的所有 G 碼
+    int gCodes[NC_MAX_G_CODES_PER_BLOCK] = { 0 }; // 預留空間存這行出現的所有 G 碼
 
     bool hasG = false;
     int gCode = -1;
 
     int mCount = 0;
-    int mCode[3] = { -1, -1, -1 };
+    int mCode[NC_MAX_M_CODES_PER_BLOCK] = { -1, -1, -1 };
 
     bool hasParam[26] = { false };
     double param[26] = { 0.0 };

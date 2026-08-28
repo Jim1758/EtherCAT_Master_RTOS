@@ -102,6 +102,3042 @@
 //   這三項會影響 wake／RX 最大延遲，正式測試期間應固定，不要和程式參數同時改。
 // ============================================================================
 
+// ============================================================================
+// Stage 12B.1B - Owner-Safe RT Process Image Shadow Snapshot
+// ============================================================================
+//
+// Purpose:
+//     Capture one coherent Logical Process Image snapshot for the Windows
+//     commissioning/diagnosis path without letting a lower-priority thread
+//     touch EtherCatMaster::m_IoMap directly.
+//
+// Ownership:
+//     Writer  : Priority-64 PDO owner thread only.
+//     Reader  : Priority-50 supervisory publisher through the bounded
+//               OSCARMAX_ECAT_DiagRtShadow_Read() copy API below.
+//
+// Cadence:
+//     One capture attempt every 40 PDO cycles.
+//     At 250 us/cycle this is 10 ms (100 Hz).
+//
+// Real-time rules:
+//     - fixed-size static storage only;
+//     - no allocation / lock / sleep / file I/O / printf;
+//     - one bounded memcpy of the active Process Image only;
+//     - invalid PDO cycles do NOT overwrite the last known-good image;
+//     - odd/even Sequence protects the lower-priority reader from torn data.
+//
+// Stage boundary:
+//     This stage does NOT write OSCARMAX_ECAT_DIAG Shared Memory.
+//     Stage 12B.1C will copy this RT shadow into that Shared Memory from
+//     Priority 50, keeping the hard real-time PDO owner free of UI/SHM work.
+// ============================================================================
+
+namespace
+{
+    constexpr uint32_t OSCARMAX_ECAT_DIAG_RT_PROCESS_IMAGE_CAPACITY = 4096u;
+    constexpr uint64_t OSCARMAX_ECAT_DIAG_RT_CAPTURE_DIVISOR = 40ULL;
+
+    struct OSCARMAX_ECAT_DiagRtShadow
+    {
+        // First field intentionally naturally aligned for InterlockedIncrement.
+        volatile LONG Sequence = 0;
+
+        uint32_t ProcessImageBytes = 0;
+        uint32_t ProcessImageValid = 0;
+
+        int32_t ActualLrwWkc = 0;
+        int32_t DcWkc = 0;
+
+        uint64_t SourcePdoTick = 0;
+        uint64_t LastValidPdoTick = 0;
+
+        uint64_t CaptureAttempts = 0;
+        uint64_t ValidSnapshots = 0;
+        uint64_t InvalidSkips = 0;
+
+        uint64_t LastCostNs = 0;
+        uint64_t MaxCostNs = 0;
+        uint64_t TotalCostNs = 0;
+
+        uint8_t ProcessImage[OSCARMAX_ECAT_DIAG_RT_PROCESS_IMAGE_CAPACITY] = {};
+    };
+
+    OSCARMAX_ECAT_DiagRtShadow g_ecatDiagRtShadow;
+
+    void CaptureEtherCatDiagRtShadow(
+        EtherCatMaster* pMaster,
+        int currentLrwWkc,
+        int currentDcWkc,
+        bool pdoCycleValid)
+    {
+        if (pMaster == nullptr)
+        {
+            return;
+        }
+
+        // 250 us * 40 = 10 ms. This branch is false for 97.5% of PDO cycles.
+        if ((pMaster->tickCount_PDO % OSCARMAX_ECAT_DIAG_RT_CAPTURE_DIVISOR) != 0ULL)
+        {
+            return;
+        }
+
+        const uint64_t costStartNs =
+            pMaster->GetCurrentMasterTimeNs();
+
+        uint32_t imageBytes = 0u;
+
+        if (pMaster->m_IoMapSize > 0)
+        {
+            imageBytes =
+                static_cast<uint32_t>(pMaster->m_IoMapSize);
+
+            if (imageBytes > OSCARMAX_ECAT_DIAG_RT_PROCESS_IMAGE_CAPACITY)
+            {
+                imageBytes = OSCARMAX_ECAT_DIAG_RT_PROCESS_IMAGE_CAPACITY;
+            }
+        }
+
+        // Begin seqlock write. Odd Sequence means writer active.
+        InterlockedIncrement(&g_ecatDiagRtShadow.Sequence);
+        MemoryBarrier();
+
+        g_ecatDiagRtShadow.ProcessImageBytes = imageBytes;
+        g_ecatDiagRtShadow.ProcessImageValid = pdoCycleValid ? 1u : 0u;
+        g_ecatDiagRtShadow.ActualLrwWkc = static_cast<int32_t>(currentLrwWkc);
+        g_ecatDiagRtShadow.DcWkc = static_cast<int32_t>(currentDcWkc);
+        g_ecatDiagRtShadow.SourcePdoTick = pMaster->tickCount_PDO;
+        g_ecatDiagRtShadow.CaptureAttempts++;
+
+        if (pdoCycleValid &&
+            pMaster->m_IoMap != nullptr &&
+            imageBytes > 0u)
+        {
+            std::memcpy(
+                g_ecatDiagRtShadow.ProcessImage,
+                pMaster->m_IoMap,
+                imageBytes);
+
+            g_ecatDiagRtShadow.LastValidPdoTick = pMaster->tickCount_PDO;
+            g_ecatDiagRtShadow.ValidSnapshots++;
+        }
+        else
+        {
+            // Keep the previous known-good bytes. The validity flag lets the
+            // Windows side distinguish "last good image" from current health.
+            g_ecatDiagRtShadow.InvalidSkips++;
+        }
+
+        const uint64_t costEndNs =
+            pMaster->GetCurrentMasterTimeNs();
+
+        uint64_t costNs = 0u;
+
+        if (costEndNs >= costStartNs)
+        {
+            costNs = costEndNs - costStartNs;
+        }
+
+        g_ecatDiagRtShadow.LastCostNs = costNs;
+
+        if (costNs > g_ecatDiagRtShadow.MaxCostNs)
+        {
+            g_ecatDiagRtShadow.MaxCostNs = costNs;
+        }
+
+        // Saturating accumulation keeps long-running diagnostic statistics
+        // well-defined even if a machine remains online for a very long time.
+        if (0xFFFFFFFFFFFFFFFFULL - g_ecatDiagRtShadow.TotalCostNs >= costNs)
+        {
+            g_ecatDiagRtShadow.TotalCostNs += costNs;
+        }
+        else
+        {
+            g_ecatDiagRtShadow.TotalCostNs = 0xFFFFFFFFFFFFFFFFULL;
+        }
+
+        MemoryBarrier();
+        InterlockedIncrement(&g_ecatDiagRtShadow.Sequence);
+        // Even Sequence means one complete snapshot is available.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 12B.1B reader seam for Priority-50 publisher.
+//
+// No retry loop is used here. If the 100 Hz writer happens to overlap this
+// copy, the reader returns false and simply tries again on its next 10 ms
+// supervisory iteration. This keeps behavior bounded and lock-free.
+// ---------------------------------------------------------------------------
+extern "C" bool OSCARMAX_ECAT_DiagRtShadow_Read(
+    uint8_t * destination,
+    uint32_t destinationCapacity,
+    uint32_t * processImageBytes,
+    uint32_t * processImageValid,
+    int32_t * actualLrwWkc,
+    int32_t * dcWkc,
+    uint64_t * sourcePdoTick,
+    uint64_t * lastValidPdoTick,
+    uint64_t * captureAttempts,
+    uint64_t * validSnapshots,
+    uint64_t * invalidSkips,
+    uint64_t * lastCostNs,
+    uint64_t * maxCostNs,
+    uint64_t * averageCostNs)
+{
+    if (destination == nullptr ||
+        processImageBytes == nullptr ||
+        processImageValid == nullptr ||
+        actualLrwWkc == nullptr ||
+        dcWkc == nullptr ||
+        sourcePdoTick == nullptr ||
+        lastValidPdoTick == nullptr ||
+        captureAttempts == nullptr ||
+        validSnapshots == nullptr ||
+        invalidSkips == nullptr ||
+        lastCostNs == nullptr ||
+        maxCostNs == nullptr ||
+        averageCostNs == nullptr)
+    {
+        return false;
+    }
+
+    const LONG sequenceBegin =
+        g_ecatDiagRtShadow.Sequence;
+
+    if ((sequenceBegin & 1L) != 0L)
+    {
+        return false;
+    }
+
+    MemoryBarrier();
+
+    const uint32_t bytes =
+        g_ecatDiagRtShadow.ProcessImageBytes;
+
+    if (bytes > destinationCapacity ||
+        bytes > OSCARMAX_ECAT_DIAG_RT_PROCESS_IMAGE_CAPACITY)
+    {
+        return false;
+    }
+
+    const uint32_t valid =
+        g_ecatDiagRtShadow.ProcessImageValid;
+
+    const int32_t lrw =
+        g_ecatDiagRtShadow.ActualLrwWkc;
+
+    const int32_t dc =
+        g_ecatDiagRtShadow.DcWkc;
+
+    const uint64_t tick =
+        g_ecatDiagRtShadow.SourcePdoTick;
+
+    const uint64_t validTick =
+        g_ecatDiagRtShadow.LastValidPdoTick;
+
+    const uint64_t attempts =
+        g_ecatDiagRtShadow.CaptureAttempts;
+
+    const uint64_t snapshots =
+        g_ecatDiagRtShadow.ValidSnapshots;
+
+    const uint64_t skips =
+        g_ecatDiagRtShadow.InvalidSkips;
+
+    const uint64_t lastNs =
+        g_ecatDiagRtShadow.LastCostNs;
+
+    const uint64_t maxNs =
+        g_ecatDiagRtShadow.MaxCostNs;
+
+    const uint64_t totalNs =
+        g_ecatDiagRtShadow.TotalCostNs;
+
+    if (bytes > 0u)
+    {
+        std::memcpy(
+            destination,
+            g_ecatDiagRtShadow.ProcessImage,
+            bytes);
+    }
+
+    MemoryBarrier();
+
+    const LONG sequenceEnd =
+        g_ecatDiagRtShadow.Sequence;
+
+    if (sequenceBegin != sequenceEnd ||
+        (sequenceEnd & 1L) != 0L)
+    {
+        return false;
+    }
+
+    *processImageBytes = bytes;
+    *processImageValid = valid;
+    *actualLrwWkc = lrw;
+    *dcWkc = dc;
+    *sourcePdoTick = tick;
+    *lastValidPdoTick = validTick;
+    *captureAttempts = attempts;
+    *validSnapshots = snapshots;
+    *invalidSkips = skips;
+    *lastCostNs = lastNs;
+    *maxCostNs = maxNs;
+    *averageCostNs =
+        (attempts > 0u)
+        ? (totalNs / attempts)
+        : 0u;
+
+    return true;
+}
+
+
+// ============================================================================
+// Stage 12F.3E.1 - Runtime-Safe Non-Blocking CoE / SDO Mailbox State Machine
+// Stage 12F.3E.5 - Mailbox counter sequence fix: numbered requests use 1..7 only.
+// Stage 12F.3E.11 - Fixed-address mailbox transport + response-match correction
+//                    + explicit SM0-consumed / SM1-response timeout classifier.
+// ============================================================================
+//
+// Why this exists:
+//     The legacy ecx_SDOread()/ecx_SDOwrite() helpers are synchronous mailbox
+//     routines.  They poll repeatedly and call RtSleepFt(), which is acceptable
+//     during startup/configuration but is NOT acceptable inside the 250 us
+//     Priority-64 PDO owner thread.
+//
+// Runtime policy:
+//     - The PDO owner remains the ONLY thread that touches the EtherCAT NIC.
+//     - Online SDO is split across many PDO cycles as a small state machine.
+//     - One mailbox transport step is attempted at most once per 1 ms
+//       (subTick == 2 in the existing async-command seam).
+//     - Each FPWR/FPRD transport step is one frame only, has NO Sleep/retry
+//       loop, and is capped by a 55 us hard deadline.
+//     - If the PDO cycle is unhealthy, or the handler has already consumed too
+//       much of its 250 us budget, the SDO step is simply DEFERRED.
+//     - Mailbox processing latency is therefore allowed to span milliseconds
+//       while cyclic PDO continues every 250 us.
+//
+// Supported online service scope for this stage:
+//     - CoE expedited SDO Read/Write only (1, 2, or 4 byte scalar).
+//     - Complete Access and segmented transfers remain unsupported online.
+//     - Startup/configuration code may continue using the legacy blocking SDO
+//       helpers because that path runs before the 4 kHz PDO runtime.
+//
+// Safety objective:
+//     No RtSleepFt(), no 20x poll loop, no 8x retry loop and no synchronous
+//     ecx_SDOread()/ecx_SDOwrite() call remains in the live PDO async path.
+// ============================================================================
+namespace
+{
+    // Source fingerprint for field verification.
+    constexpr char OSCARMAX_ECAT_SDO_RT_BUILD_TAG[] =
+        "OSCARMAX_SDO_RT_12F3E11_20260826";
+    static_assert(
+        OSCARMAX_ECAT_SDO_RT_BUILD_TAG[0] == 'O',
+        "SDO RT source fingerprint missing.");
+
+    constexpr uint64_t OSCARMAX_ECAT_SDO_RT_STEP_DEADLINE_NS = 55000ULL;
+
+    // Stage 12F.3E.4 - mailbox-ready check before destructive fetch.
+    constexpr uint64_t OSCARMAX_ECAT_SDO_RT_FETCH_DEADLINE_NS = 120000ULL;
+    constexpr uint64_t OSCARMAX_ECAT_SDO_RT_FETCH_HANDLER_GATE_NS = 70000ULL;
+    constexpr uint16_t OSCARMAX_ECAT_SDO_RT_MBX_IN_SM_STATUS_REG = 0x080Du; // SM1 status
+
+    // Stage 12F.3E.6/11 - mailbox-out EMPTY gate before FPWR.
+    // SM0 status bit 3: 0 = mailbox empty / writable, 1 = mailbox full.
+    // Keep this as a separate bounded RT step so the 250 us PDO cycle never
+    // performs both the status FPRD and the mailbox FPWR in one callback.
+    constexpr uint16_t OSCARMAX_ECAT_SDO_RT_MBX_OUT_SM_STATUS_REG = 0x0805u; // SM0 status fallback
+
+    constexpr uint64_t OSCARMAX_ECAT_SDO_RT_HANDLER_BUDGET_GATE_NS = 120000ULL;
+    constexpr uint64_t OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES = 4ULL;      // 1 ms
+    constexpr uint64_t OSCARMAX_ECAT_SDO_RT_OPERATION_TIMEOUT_CYCLES = 8000ULL; // 2 s
+    constexpr uint16_t OSCARMAX_ECAT_SDO_RT_MAX_MAILBOX_BYTES = 1024u;
+
+    enum class RuntimeSafeSdoPhase : uint8_t
+    {
+        Idle = 0,
+        SendRequest = 1,
+        PollResponse = 2
+    };
+
+    enum class RuntimeSafeSdoFailureReason : uint32_t
+    {
+        None = 0u,
+        InvalidStart = 1u,
+        SlotMismatch = 2u,
+        OperationTimeout = 3u,
+        SendDeadline = 4u,
+        SendWkcZero = 5u,
+        SendTransportFailure = 6u,
+        SdoAbort = 7u,
+        InvalidResponse = 8u,
+        InvalidPhase = 9u,
+        MailboxOutNotConsumed = 10u,
+        MailboxInNoResponse = 11u
+    };
+
+    struct RuntimeSafeSdoState
+    {
+        bool active = false;
+        RuntimeSafeSdoPhase phase = RuntimeSafeSdoPhase::Idle;
+
+        int commandType = (int)EcatCmdType::CMD_NONE;
+        uint16_t slave = 0u;
+        uint16_t index = 0u;
+        uint8_t subIndex = 0u;
+        int dataSize = 0;
+        uint32_t dataValue = 0u;
+        uint8_t mailboxCounter = 0u;
+
+        // Runtime Mailbox schema is authoritative when available.  These are
+        // status-byte addresses (SM base + 5), with conventional SM0/SM1
+        // values retained only as the legacy fallback.
+        uint16_t mailboxOutStatusReg = OSCARMAX_ECAT_SDO_RT_MBX_OUT_SM_STATUS_REG;
+        uint16_t mailboxInStatusReg = OSCARMAX_ECAT_SDO_RT_MBX_IN_SM_STATUS_REG;
+
+        // Stage 12F.3E.6:
+        // Latched only after the non-destructive SM0 status check reports
+        // mailbox EMPTY.  The actual FPWR is intentionally deferred to the
+        // next PDO callback so one RT step still contains only one frame.
+        bool mailboxOutReadyLatched = false;
+
+        // Stage 12F.3E.11 handshake classifier.
+        // requestWriteIssued is set after an acknowledged FPWR or an
+        // acknowledgement-deadline miss (delivery uncertain, so never resend).
+        // requestConsumed becomes true only after SM0 is observed EMPTY again,
+        // proving that the slave-side PDI consumed the mailbox request.
+        bool requestWriteIssued = false;
+        bool requestConsumed = false;
+
+        // Latched only after the non-destructive SM1 status check reports
+        // mailbox FULL.  A later bounded step then fetches mailbox data.
+        bool mailboxInReadyLatched = false;
+
+        uint64_t startTick = 0ULL;
+        uint64_t nextStepTick = 0ULL;
+        uint64_t deadlineTick = 0ULL;
+        uint64_t operationStartNs = 0ULL;
+
+        // Last terminal/transport details are intentionally NOT cleared by
+        // ResetRuntimeSafeSdoState().  The Priority-50 engineering publisher
+        // can therefore explain why the most recent request failed.
+        uint32_t lastAbortCode = 0u;
+        RuntimeSafeSdoFailureReason lastFailureReason =
+            RuntimeSafeSdoFailureReason::None;
+        int32_t lastTransportResult = 0;
+        int32_t lastTerminalResult = 0; // 0=None, 1=Success, -1=Error
+
+        int lastCommandType = (int)EcatCmdType::CMD_NONE;
+        uint16_t lastSlave = 0u;
+        uint16_t lastIndex = 0u;
+        uint8_t lastSubIndex = 0u;
+        uint8_t lastDataSize = 0u;
+
+        uint64_t lastOperationDurationUs = 0ULL;
+        uint64_t maxOperationDurationUs = 0ULL;
+
+        // Runtime diagnostics.  These counters are observational only and do
+        // not alter mailbox scheduling or PDO ownership.
+        uint64_t operationsStarted = 0ULL;
+        uint64_t operationsCompleted = 0ULL;
+        uint64_t operationsFailed = 0ULL;
+        uint64_t operationTimeouts = 0ULL;
+        uint64_t invalidStartCount = 0ULL;
+        uint64_t slotMismatchCount = 0ULL;
+
+        uint64_t sendAttempts = 0ULL;
+        uint64_t sendSuccess = 0ULL;
+        uint64_t sendWkcZero = 0ULL;
+        uint64_t sendDeadlineMiss = 0ULL;
+        uint64_t sendTransportFailure = 0ULL;
+
+        uint64_t pollAttempts = 0ULL;
+        uint64_t pollWkcPositive = 0ULL;
+        uint64_t pollWkcZero = 0ULL;
+        uint64_t pollDeadlineMiss = 0ULL;
+        uint64_t pollTransportFailure = 0ULL;
+        uint64_t pollNotReady = 0ULL;
+        uint64_t responseMismatchCount = 0ULL;
+        uint64_t invalidResponseCount = 0ULL;
+
+        uint64_t stepsExecuted = 0ULL;
+        uint64_t stepsDeferredPdo = 0ULL;
+        uint64_t stepsDeferredBudget = 0ULL;
+        uint64_t transportDeadlineMisses = 0ULL;
+        uint64_t abortCount = 0ULL;
+
+        uint64_t stepCostLastNs = 0ULL;
+        uint64_t stepCostMaxNs = 0ULL;
+        uint64_t stepCostTotalNs = 0ULL;
+    };
+
+    struct OSCARMAX_ECAT_SdoRtDiagSnapshot
+    {
+        volatile LONG Sequence = 0;
+
+        uint32_t StructSize = 0u;
+        uint32_t Version = 1u;
+
+        uint32_t Active = 0u;
+        uint32_t Phase = 0u;
+
+        int32_t LastTerminalResult = 0;
+        uint32_t LastFailureReason = 0u;
+        int32_t LastTransportResult = 0;
+        uint32_t LastAbortCode = 0u;
+
+        int32_t LastCommandType = 0;
+        uint32_t LastSlave = 0u;
+        uint32_t LastIndex = 0u;
+        uint32_t LastSubIndex = 0u;
+        uint32_t LastDataSize = 0u;
+
+        uint64_t LastOperationDurationUs = 0ULL;
+        uint64_t MaxOperationDurationUs = 0ULL;
+
+        uint64_t OperationsStarted = 0ULL;
+        uint64_t OperationsCompleted = 0ULL;
+        uint64_t OperationsFailed = 0ULL;
+        uint64_t OperationTimeouts = 0ULL;
+        uint64_t InvalidStartCount = 0ULL;
+        uint64_t SlotMismatchCount = 0ULL;
+
+        uint64_t SendAttempts = 0ULL;
+        uint64_t SendSuccess = 0ULL;
+        uint64_t SendWkcZero = 0ULL;
+        uint64_t SendDeadlineMiss = 0ULL;
+        uint64_t SendTransportFailure = 0ULL;
+
+        uint64_t PollAttempts = 0ULL;
+        uint64_t PollWkcPositive = 0ULL;
+        uint64_t PollWkcZero = 0ULL;
+        uint64_t PollDeadlineMiss = 0ULL;
+        uint64_t PollTransportFailure = 0ULL;
+        uint64_t PollNotReady = 0ULL;
+        uint64_t ResponseMismatchCount = 0ULL;
+        uint64_t InvalidResponseCount = 0ULL;
+
+        uint64_t StepsExecuted = 0ULL;
+        uint64_t StepsDeferredPdo = 0ULL;
+        uint64_t StepsDeferredBudget = 0ULL;
+        uint64_t TransportDeadlineMisses = 0ULL;
+        uint64_t AbortCount = 0ULL;
+
+        uint64_t StepCostLastNs = 0ULL;
+        uint64_t StepCostMaxNs = 0ULL;
+        uint64_t StepCostAverageNs = 0ULL;
+    };
+
+    static_assert(
+        sizeof(OSCARMAX_ECAT_SdoRtDiagSnapshot) == 288,
+        "OSCARMAX_ECAT_SdoRtDiagSnapshot ABI changed.");
+
+    RuntimeSafeSdoState g_runtimeSafeSdo;
+    OSCARMAX_ECAT_SdoRtDiagSnapshot g_runtimeSafeSdoDiag;
+
+    void PublishRuntimeSafeSdoDiagSnapshot()
+    {
+        InterlockedIncrement(&g_runtimeSafeSdoDiag.Sequence);
+        MemoryBarrier();
+
+        g_runtimeSafeSdoDiag.StructSize =
+            static_cast<uint32_t>(sizeof(OSCARMAX_ECAT_SdoRtDiagSnapshot));
+        g_runtimeSafeSdoDiag.Version = 1u;
+
+        g_runtimeSafeSdoDiag.Active =
+            g_runtimeSafeSdo.active ? 1u : 0u;
+        g_runtimeSafeSdoDiag.Phase =
+            static_cast<uint32_t>(g_runtimeSafeSdo.phase);
+
+        g_runtimeSafeSdoDiag.LastTerminalResult =
+            g_runtimeSafeSdo.lastTerminalResult;
+        g_runtimeSafeSdoDiag.LastFailureReason =
+            static_cast<uint32_t>(g_runtimeSafeSdo.lastFailureReason);
+        g_runtimeSafeSdoDiag.LastTransportResult =
+            g_runtimeSafeSdo.lastTransportResult;
+        g_runtimeSafeSdoDiag.LastAbortCode =
+            g_runtimeSafeSdo.lastAbortCode;
+
+        g_runtimeSafeSdoDiag.LastCommandType =
+            g_runtimeSafeSdo.lastCommandType;
+        g_runtimeSafeSdoDiag.LastSlave =
+            static_cast<uint32_t>(g_runtimeSafeSdo.lastSlave);
+        g_runtimeSafeSdoDiag.LastIndex =
+            static_cast<uint32_t>(g_runtimeSafeSdo.lastIndex);
+        g_runtimeSafeSdoDiag.LastSubIndex =
+            static_cast<uint32_t>(g_runtimeSafeSdo.lastSubIndex);
+        g_runtimeSafeSdoDiag.LastDataSize =
+            static_cast<uint32_t>(g_runtimeSafeSdo.lastDataSize);
+
+        g_runtimeSafeSdoDiag.LastOperationDurationUs =
+            g_runtimeSafeSdo.lastOperationDurationUs;
+        g_runtimeSafeSdoDiag.MaxOperationDurationUs =
+            g_runtimeSafeSdo.maxOperationDurationUs;
+
+        g_runtimeSafeSdoDiag.OperationsStarted =
+            g_runtimeSafeSdo.operationsStarted;
+        g_runtimeSafeSdoDiag.OperationsCompleted =
+            g_runtimeSafeSdo.operationsCompleted;
+        g_runtimeSafeSdoDiag.OperationsFailed =
+            g_runtimeSafeSdo.operationsFailed;
+        g_runtimeSafeSdoDiag.OperationTimeouts =
+            g_runtimeSafeSdo.operationTimeouts;
+        g_runtimeSafeSdoDiag.InvalidStartCount =
+            g_runtimeSafeSdo.invalidStartCount;
+        g_runtimeSafeSdoDiag.SlotMismatchCount =
+            g_runtimeSafeSdo.slotMismatchCount;
+
+        g_runtimeSafeSdoDiag.SendAttempts =
+            g_runtimeSafeSdo.sendAttempts;
+        g_runtimeSafeSdoDiag.SendSuccess =
+            g_runtimeSafeSdo.sendSuccess;
+        g_runtimeSafeSdoDiag.SendWkcZero =
+            g_runtimeSafeSdo.sendWkcZero;
+        g_runtimeSafeSdoDiag.SendDeadlineMiss =
+            g_runtimeSafeSdo.sendDeadlineMiss;
+        g_runtimeSafeSdoDiag.SendTransportFailure =
+            g_runtimeSafeSdo.sendTransportFailure;
+
+        g_runtimeSafeSdoDiag.PollAttempts =
+            g_runtimeSafeSdo.pollAttempts;
+        g_runtimeSafeSdoDiag.PollWkcPositive =
+            g_runtimeSafeSdo.pollWkcPositive;
+        g_runtimeSafeSdoDiag.PollWkcZero =
+            g_runtimeSafeSdo.pollWkcZero;
+        g_runtimeSafeSdoDiag.PollDeadlineMiss =
+            g_runtimeSafeSdo.pollDeadlineMiss;
+        g_runtimeSafeSdoDiag.PollTransportFailure =
+            g_runtimeSafeSdo.pollTransportFailure;
+        g_runtimeSafeSdoDiag.PollNotReady =
+            g_runtimeSafeSdo.pollNotReady;
+        g_runtimeSafeSdoDiag.ResponseMismatchCount =
+            g_runtimeSafeSdo.responseMismatchCount;
+        g_runtimeSafeSdoDiag.InvalidResponseCount =
+            g_runtimeSafeSdo.invalidResponseCount;
+
+        g_runtimeSafeSdoDiag.StepsExecuted =
+            g_runtimeSafeSdo.stepsExecuted;
+        g_runtimeSafeSdoDiag.StepsDeferredPdo =
+            g_runtimeSafeSdo.stepsDeferredPdo;
+        g_runtimeSafeSdoDiag.StepsDeferredBudget =
+            g_runtimeSafeSdo.stepsDeferredBudget;
+        g_runtimeSafeSdoDiag.TransportDeadlineMisses =
+            g_runtimeSafeSdo.transportDeadlineMisses;
+        g_runtimeSafeSdoDiag.AbortCount =
+            g_runtimeSafeSdo.abortCount;
+
+        g_runtimeSafeSdoDiag.StepCostLastNs =
+            g_runtimeSafeSdo.stepCostLastNs;
+        g_runtimeSafeSdoDiag.StepCostMaxNs =
+            g_runtimeSafeSdo.stepCostMaxNs;
+
+        if (g_runtimeSafeSdo.stepsExecuted > 0ULL)
+        {
+            g_runtimeSafeSdoDiag.StepCostAverageNs =
+                g_runtimeSafeSdo.stepCostTotalNs /
+                g_runtimeSafeSdo.stepsExecuted;
+        }
+        else
+        {
+            g_runtimeSafeSdoDiag.StepCostAverageNs = 0ULL;
+        }
+
+        MemoryBarrier();
+        InterlockedIncrement(&g_runtimeSafeSdoDiag.Sequence);
+    }
+
+    // ------------------------------------------------------------------------
+    // One bounded Fixed-Position Physical transaction.
+    //
+    // Runtime mailbox traffic uses the slave Configured Station Address
+    // (FPRD/FPWR).  This intentionally does NOT call the generic blocking
+    // helpers because they contain timeout retry loops + RtSleepFt().
+    // This helper sends one frame, polls ReceivePacket() without sleeping,
+    // and returns at the hard deadline.  It is used only by the online SDO
+    // runtime state machine.
+    //
+    // Return:
+    //     >0  EtherCAT WKC
+    //      0  WKC 0 / invalid response
+    //     -1  hard deadline expired
+    //     -2  TX submission failed / invalid argument
+    // ------------------------------------------------------------------------
+    int RuntimeSafeSdoFpTransaction(
+        EtherCatMaster* pMaster,
+        uint8_t command,
+        uint16_t adp,
+        uint16_t ado,
+        uint16_t length,
+        const uint8_t* writeData,
+        uint8_t* readData,
+        uint64_t deadlineNs)
+    {
+        if (pMaster == nullptr ||
+            pMaster->m_pNic == nullptr ||
+            length == 0u ||
+            length > OSCARMAX_ECAT_SDO_RT_MAX_MAILBOX_BYTES ||
+            (28u + static_cast<uint32_t>(length)) > 1514u)
+        {
+            return -2;
+        }
+
+        static uint8_t txFrame[1514];
+        static uint8_t rxFrame[1514];
+
+        const int totalFrameBytes =
+            28 + static_cast<int>(length);
+
+        std::memset(txFrame, 0, static_cast<size_t>(totalFrameBytes));
+
+        // Ethernet header.
+        for (int i = 0; i < 6; ++i)
+        {
+            txFrame[i] = 0xFFu;
+        }
+
+        uint8_t sourceMac[6] = {};
+        pMaster->m_pNic->GetMacAddress(sourceMac);
+        std::memcpy(&txFrame[6], sourceMac, 6u);
+
+        txFrame[12] = 0x88u;
+        txFrame[13] = 0xA4u;
+
+        // EtherCAT header: one datagram, Type 1.
+        const uint16_t ecatPayloadLength =
+            static_cast<uint16_t>(10u + length + 2u);
+
+        const uint16_t ecatHeader =
+            static_cast<uint16_t>((ecatPayloadLength & 0x07FFu) | 0x1000u);
+
+        txFrame[14] = static_cast<uint8_t>(ecatHeader & 0xFFu);
+        txFrame[15] = static_cast<uint8_t>((ecatHeader >> 8) & 0xFFu);
+
+        const uint8_t datagramIndex =
+            pMaster->m_idx++;
+
+        txFrame[16] = command;
+        txFrame[17] = datagramIndex;
+        txFrame[18] = static_cast<uint8_t>(adp & 0xFFu);
+        txFrame[19] = static_cast<uint8_t>((adp >> 8) & 0xFFu);
+        txFrame[20] = static_cast<uint8_t>(ado & 0xFFu);
+        txFrame[21] = static_cast<uint8_t>((ado >> 8) & 0xFFu);
+
+        const uint16_t lengthInfo =
+            static_cast<uint16_t>(length & 0x07FFu);
+
+        txFrame[22] = static_cast<uint8_t>(lengthInfo & 0xFFu);
+        txFrame[23] = static_cast<uint8_t>((lengthInfo >> 8) & 0xFFu);
+        txFrame[24] = 0x00u;
+        txFrame[25] = 0x00u;
+
+        if (command == 0x05u && writeData != nullptr) // FPWR
+        {
+            std::memcpy(&txFrame[26], writeData, length);
+        }
+        else
+        {
+            std::memset(&txFrame[26], 0, length);
+        }
+
+        txFrame[26 + length] = 0x00u;
+        txFrame[27 + length] = 0x00u;
+
+        const uint64_t startNs =
+            pMaster->GetCurrentMasterTimeNs();
+
+        if (!pMaster->m_pNic->SendPacket(
+            txFrame,
+            static_cast<unsigned int>(totalFrameBytes)))
+        {
+            return -2;
+        }
+
+        int fallbackAttempts = 64;
+
+        while (true)
+        {
+            const uint64_t beforeRxNs =
+                pMaster->GetCurrentMasterTimeNs();
+
+            if (startNs != 0u &&
+                beforeRxNs >= startNs &&
+                (beforeRxNs - startNs) >= deadlineNs)
+            {
+                return -1;
+            }
+
+            if (startNs == 0u && fallbackAttempts-- <= 0)
+            {
+                return -1;
+            }
+
+            const int rxLength =
+                static_cast<int>(pMaster->m_pNic->ReceivePacket(rxFrame));
+
+            const uint64_t afterRxNs =
+                pMaster->GetCurrentMasterTimeNs();
+
+            if (startNs != 0u &&
+                afterRxNs >= startNs &&
+                (afterRxNs - startNs) >= deadlineNs)
+            {
+                // A frame arriving after the bounded mailbox step deadline is
+                // deliberately rejected.  Cyclic PDO owns the timing budget.
+                return -1;
+            }
+
+            if (rxLength <= 0)
+            {
+                continue;
+            }
+
+            if (rxLength < totalFrameBytes ||
+                rxFrame[12] != 0x88u ||
+                rxFrame[13] != 0xA4u ||
+                rxFrame[16] != command ||
+                rxFrame[17] != datagramIndex)
+            {
+                // Late/unrelated frame.  Consume and continue until deadline.
+                continue;
+            }
+
+            const int wkcOffset =
+                26 + static_cast<int>(length);
+
+            const uint16_t wkc =
+                static_cast<uint16_t>(rxFrame[wkcOffset]) |
+                static_cast<uint16_t>(
+                    static_cast<uint16_t>(rxFrame[wkcOffset + 1]) << 8);
+
+            if (wkc > 0u &&
+                command == 0x04u &&
+                readData != nullptr) // FPRD
+            {
+                std::memcpy(readData, &rxFrame[26], length);
+            }
+
+            return static_cast<int>(wkc);
+        }
+    }
+
+    uint16_t ResolveRuntimeSafeSdoMailboxStatusRegister(
+        EtherCatMaster* pMaster,
+        uint16_t slave,
+        bool mailboxOut)
+    {
+        const uint16_t fallbackRegister =
+            mailboxOut
+            ? OSCARMAX_ECAT_SDO_RT_MBX_OUT_SM_STATUS_REG
+            : OSCARMAX_ECAT_SDO_RT_MBX_IN_SM_STATUS_REG;
+
+        if (pMaster == nullptr || pMaster->m_pEni == nullptr)
+        {
+            return fallbackRegister;
+        }
+
+        const auto& runtimeSlaves =
+            pMaster->m_pEni->GetSlaves();
+
+        if (static_cast<size_t>(slave) >= runtimeSlaves.size())
+        {
+            return fallbackRegister;
+        }
+
+        const EtherCatSlave& runtimeSlave =
+            runtimeSlaves[static_cast<size_t>(slave)];
+
+        if (!runtimeSlave.runtimeMailbox.present)
+        {
+            return fallbackRegister;
+        }
+
+        const EtherCatRuntimeMailboxDirectionConfig& direction =
+            mailboxOut
+            ? runtimeSlave.runtimeMailbox.out
+            : runtimeSlave.runtimeMailbox.in;
+
+        if (!direction.present ||
+            direction.smIndex < 0 ||
+            direction.smIndex > 15)
+        {
+            return fallbackRegister;
+        }
+
+        return static_cast<uint16_t>(
+            0x0805u +
+            static_cast<uint16_t>(direction.smIndex * 8));
+    }
+
+    bool RuntimeSafeSdoCommandMatchesSlot(
+        EtherCatMaster* pMaster)
+    {
+        if (pMaster == nullptr || !g_runtimeSafeSdo.active)
+        {
+            return false;
+        }
+
+        return
+            g_runtimeSafeSdo.commandType == pMaster->m_asyncCmd.type &&
+            g_runtimeSafeSdo.slave == pMaster->m_asyncCmd.slaveAddr &&
+            g_runtimeSafeSdo.index == pMaster->m_asyncCmd.index &&
+            g_runtimeSafeSdo.subIndex == pMaster->m_asyncCmd.subIndex;
+    }
+
+    void ResetRuntimeSafeSdoState()
+    {
+        g_runtimeSafeSdo.active = false;
+        g_runtimeSafeSdo.phase = RuntimeSafeSdoPhase::Idle;
+        g_runtimeSafeSdo.commandType = (int)EcatCmdType::CMD_NONE;
+        g_runtimeSafeSdo.slave = 0u;
+        g_runtimeSafeSdo.index = 0u;
+        g_runtimeSafeSdo.subIndex = 0u;
+        g_runtimeSafeSdo.dataSize = 0;
+        g_runtimeSafeSdo.dataValue = 0u;
+        g_runtimeSafeSdo.mailboxCounter = 0u;
+        g_runtimeSafeSdo.mailboxOutStatusReg =
+            OSCARMAX_ECAT_SDO_RT_MBX_OUT_SM_STATUS_REG;
+        g_runtimeSafeSdo.mailboxInStatusReg =
+            OSCARMAX_ECAT_SDO_RT_MBX_IN_SM_STATUS_REG;
+        g_runtimeSafeSdo.mailboxOutReadyLatched = false;
+        g_runtimeSafeSdo.requestWriteIssued = false;
+        g_runtimeSafeSdo.requestConsumed = false;
+        g_runtimeSafeSdo.mailboxInReadyLatched = false;
+        g_runtimeSafeSdo.startTick = 0ULL;
+        g_runtimeSafeSdo.nextStepTick = 0ULL;
+        g_runtimeSafeSdo.deadlineTick = 0ULL;
+        g_runtimeSafeSdo.operationStartNs = 0ULL;
+    }
+
+    bool BeginRuntimeSafeSdoCommand(
+        EtherCatMaster* pMaster)
+    {
+        if (pMaster == nullptr)
+        {
+            return false;
+        }
+
+        const int type =
+            pMaster->m_asyncCmd.type;
+
+        if (type != (int)EcatCmdType::CMD_SDO_READ &&
+            type != (int)EcatCmdType::CMD_SDO_WRITE)
+        {
+            return false;
+        }
+
+        const int size =
+            pMaster->m_asyncCmd.dataSize;
+
+        if (size != 1 && size != 2 && size != 4)
+        {
+            pMaster->m_asyncCmd.resultWKC = 0;
+            g_runtimeSafeSdo.invalidStartCount++;
+            g_runtimeSafeSdo.lastFailureReason =
+                RuntimeSafeSdoFailureReason::InvalidStart;
+            g_runtimeSafeSdo.lastTerminalResult = -1;
+            PublishRuntimeSafeSdoDiagSnapshot();
+            return false;
+        }
+
+        const uint16_t slave =
+            pMaster->m_asyncCmd.slaveAddr;
+
+        if (slave >= 128u ||
+            m_slaveInfo[slave].configAddr == 0u ||
+            m_slaveInfo[slave].mbxOutAddr == 0u ||
+            m_slaveInfo[slave].mbxInAddr == 0u ||
+            m_slaveInfo[slave].mbxOutLength < 16u ||
+            m_slaveInfo[slave].mbxInLength < 16u ||
+            m_slaveInfo[slave].mbxOutLength > OSCARMAX_ECAT_SDO_RT_MAX_MAILBOX_BYTES ||
+            m_slaveInfo[slave].mbxInLength > OSCARMAX_ECAT_SDO_RT_MAX_MAILBOX_BYTES)
+        {
+            pMaster->m_asyncCmd.resultWKC = 0;
+            g_runtimeSafeSdo.invalidStartCount++;
+            g_runtimeSafeSdo.lastFailureReason =
+                RuntimeSafeSdoFailureReason::InvalidStart;
+            g_runtimeSafeSdo.lastTerminalResult = -1;
+            g_runtimeSafeSdo.lastSlave = slave;
+            g_runtimeSafeSdo.lastIndex = pMaster->m_asyncCmd.index;
+            g_runtimeSafeSdo.lastSubIndex = pMaster->m_asyncCmd.subIndex;
+            PublishRuntimeSafeSdoDiagSnapshot();
+            return false;
+        }
+
+        g_runtimeSafeSdo.active = true;
+        g_runtimeSafeSdo.phase = RuntimeSafeSdoPhase::SendRequest;
+        g_runtimeSafeSdo.commandType = type;
+        g_runtimeSafeSdo.slave = slave;
+        g_runtimeSafeSdo.index = pMaster->m_asyncCmd.index;
+        g_runtimeSafeSdo.subIndex = pMaster->m_asyncCmd.subIndex;
+        g_runtimeSafeSdo.dataSize = size;
+        g_runtimeSafeSdo.dataValue = pMaster->m_asyncCmd.dataValue;
+        g_runtimeSafeSdo.mailboxOutStatusReg =
+            ResolveRuntimeSafeSdoMailboxStatusRegister(
+                pMaster,
+                slave,
+                true);
+        g_runtimeSafeSdo.mailboxInStatusReg =
+            ResolveRuntimeSafeSdoMailboxStatusRegister(
+                pMaster,
+                slave,
+                false);
+        g_runtimeSafeSdo.mailboxOutReadyLatched = false;
+        g_runtimeSafeSdo.requestWriteIssued = false;
+        g_runtimeSafeSdo.requestConsumed = false;
+        g_runtimeSafeSdo.mailboxInReadyLatched = false;
+        g_runtimeSafeSdo.startTick = pMaster->tickCount_PDO;
+        g_runtimeSafeSdo.nextStepTick = pMaster->tickCount_PDO;
+        g_runtimeSafeSdo.deadlineTick =
+            pMaster->tickCount_PDO + OSCARMAX_ECAT_SDO_RT_OPERATION_TIMEOUT_CYCLES;
+        g_runtimeSafeSdo.operationStartNs =
+            pMaster->GetCurrentMasterTimeNs();
+
+        g_runtimeSafeSdo.lastCommandType = type;
+        g_runtimeSafeSdo.lastSlave = slave;
+        g_runtimeSafeSdo.lastIndex = pMaster->m_asyncCmd.index;
+        g_runtimeSafeSdo.lastSubIndex = pMaster->m_asyncCmd.subIndex;
+        g_runtimeSafeSdo.lastDataSize =
+            static_cast<uint8_t>(size);
+        g_runtimeSafeSdo.lastAbortCode = 0u;
+        g_runtimeSafeSdo.lastTransportResult = 0;
+        g_runtimeSafeSdo.lastTerminalResult = 0;
+        g_runtimeSafeSdo.operationsStarted++;
+
+        PublishRuntimeSafeSdoDiagSnapshot();
+        return true;
+    }
+
+    void FinalizeRuntimeSafeSdoOperation(
+        EtherCatMaster* pMaster,
+        bool success,
+        RuntimeSafeSdoFailureReason failureReason)
+    {
+        uint64_t durationUs = 0ULL;
+
+        if (pMaster != nullptr &&
+            g_runtimeSafeSdo.operationStartNs != 0ULL)
+        {
+            const uint64_t endNs =
+                pMaster->GetCurrentMasterTimeNs();
+
+            if (endNs >= g_runtimeSafeSdo.operationStartNs)
+            {
+                durationUs =
+                    (endNs - g_runtimeSafeSdo.operationStartNs + 500ULL) /
+                    1000ULL;
+            }
+        }
+
+        g_runtimeSafeSdo.lastOperationDurationUs = durationUs;
+
+        if (durationUs > g_runtimeSafeSdo.maxOperationDurationUs)
+        {
+            g_runtimeSafeSdo.maxOperationDurationUs = durationUs;
+        }
+
+        g_runtimeSafeSdo.lastTerminalResult =
+            success ? 1 : -1;
+
+        g_runtimeSafeSdo.lastFailureReason =
+            success ?
+            RuntimeSafeSdoFailureReason::None :
+            failureReason;
+    }
+
+    void BuildRuntimeSafeSdoRequest(
+        EtherCatMaster* pMaster,
+        uint8_t* request,
+        uint16_t requestCapacity)
+    {
+        if (pMaster == nullptr ||
+            request == nullptr ||
+            requestCapacity == 0u)
+        {
+            return;
+        }
+
+        std::memset(request, 0, requestCapacity);
+
+        // Expedited upload/download request uses 10 bytes of Mailbox Service
+        // Data after the 6-byte EtherCAT mailbox header.
+        request[0] = 0x0Au;
+        request[1] = 0x00u;
+        request[2] = 0x00u;
+        request[3] = 0x00u;
+        request[4] = 0x00u;
+
+        // Stage 12F.3E.5 - EtherCAT mailbox counter must cycle 1..7.
+        //
+        // Counter value 0 is not used for normal numbered mailbox sessions.
+        // The previous implementation used `++counter & 0x07`, which emitted
+        // 0 once every eight requests.  Some slaves (including the tested
+        // Delta drive) can then ignore the request and never publish an SM1
+        // response, producing an OPERATION_TIMEOUT even though cyclic PDO is
+        // completely healthy.
+        //
+        // Keep the existing master-owned counter, but wrap 7 -> 1 explicitly.
+        uint8_t nextCounter =
+            static_cast<uint8_t>(pMaster->m_mboxCnt & 0x07u);
+
+        nextCounter++;
+
+        if (nextCounter == 0u || nextCounter > 7u)
+        {
+            nextCounter = 1u;
+        }
+
+        pMaster->m_mboxCnt = nextCounter;
+        g_runtimeSafeSdo.mailboxCounter = nextCounter;
+
+        request[5] =
+            static_cast<uint8_t>(0x03u | (g_runtimeSafeSdo.mailboxCounter << 4));
+
+        request[6] = 0x00u;
+        request[7] = 0x20u; // CoE SDO request (0x2000 LE)
+
+        if (g_runtimeSafeSdo.commandType == (int)EcatCmdType::CMD_SDO_READ)
+        {
+            request[8] = 0x40u; // Upload request
+        }
+        else
+        {
+            const int emptyBytes =
+                4 - g_runtimeSafeSdo.dataSize;
+
+            request[8] =
+                static_cast<uint8_t>(0x23u | ((emptyBytes & 0x03) << 2));
+        }
+
+        request[9] =
+            static_cast<uint8_t>(g_runtimeSafeSdo.index & 0xFFu);
+        request[10] =
+            static_cast<uint8_t>((g_runtimeSafeSdo.index >> 8) & 0xFFu);
+        request[11] =
+            g_runtimeSafeSdo.subIndex;
+
+        if (g_runtimeSafeSdo.commandType == (int)EcatCmdType::CMD_SDO_WRITE)
+        {
+            std::memcpy(
+                &request[12],
+                &g_runtimeSafeSdo.dataValue,
+                static_cast<size_t>(g_runtimeSafeSdo.dataSize));
+        }
+    }
+
+    enum class RuntimeSafeSdoStepDisposition : uint8_t
+    {
+        InProgress = 0,
+        Done = 1,
+        Error = 2
+    };
+
+    RuntimeSafeSdoStepDisposition ProcessRuntimeSafeSdoStep(
+        EtherCatMaster* pMaster,
+        uint64_t pdoCycleStartMasterNs,
+        bool pdoCycleValid,
+        int* terminalWkc)
+    {
+        if (terminalWkc != nullptr)
+        {
+            *terminalWkc = 0;
+        }
+
+        if (pMaster == nullptr)
+        {
+            return RuntimeSafeSdoStepDisposition::Error;
+        }
+
+        if (!g_runtimeSafeSdo.active)
+        {
+            if (!BeginRuntimeSafeSdoCommand(pMaster))
+            {
+                return RuntimeSafeSdoStepDisposition::Error;
+            }
+        }
+        else if (!RuntimeSafeSdoCommandMatchesSlot(pMaster))
+        {
+            g_runtimeSafeSdo.operationsFailed++;
+            g_runtimeSafeSdo.slotMismatchCount++;
+            FinalizeRuntimeSafeSdoOperation(
+                pMaster,
+                false,
+                RuntimeSafeSdoFailureReason::SlotMismatch);
+            ResetRuntimeSafeSdoState();
+            PublishRuntimeSafeSdoDiagSnapshot();
+            return RuntimeSafeSdoStepDisposition::Error;
+        }
+
+        if (pMaster->tickCount_PDO >= g_runtimeSafeSdo.deadlineTick)
+        {
+            g_runtimeSafeSdo.operationsFailed++;
+            g_runtimeSafeSdo.operationTimeouts++;
+
+            RuntimeSafeSdoFailureReason timeoutReason =
+                RuntimeSafeSdoFailureReason::OperationTimeout;
+
+            if (g_runtimeSafeSdo.requestWriteIssued &&
+                !g_runtimeSafeSdo.requestConsumed)
+            {
+                timeoutReason =
+                    RuntimeSafeSdoFailureReason::MailboxOutNotConsumed;
+            }
+            else if (g_runtimeSafeSdo.requestConsumed)
+            {
+                timeoutReason =
+                    RuntimeSafeSdoFailureReason::MailboxInNoResponse;
+            }
+
+            FinalizeRuntimeSafeSdoOperation(
+                pMaster,
+                false,
+                timeoutReason);
+            ResetRuntimeSafeSdoState();
+            PublishRuntimeSafeSdoDiagSnapshot();
+            return RuntimeSafeSdoStepDisposition::Error;
+        }
+
+        if (!pdoCycleValid)
+        {
+            g_runtimeSafeSdo.stepsDeferredPdo++;
+            PublishRuntimeSafeSdoDiagSnapshot();
+            return RuntimeSafeSdoStepDisposition::InProgress;
+        }
+
+        if (pMaster->tickCount_PDO < g_runtimeSafeSdo.nextStepTick)
+        {
+            return RuntimeSafeSdoStepDisposition::InProgress;
+        }
+
+        const uint64_t nowNs =
+            pMaster->GetCurrentMasterTimeNs();
+
+        if (pdoCycleStartMasterNs != 0u &&
+            nowNs >= pdoCycleStartMasterNs &&
+            (nowNs - pdoCycleStartMasterNs) >=
+            OSCARMAX_ECAT_SDO_RT_HANDLER_BUDGET_GATE_NS)
+        {
+            g_runtimeSafeSdo.stepsDeferredBudget++;
+            g_runtimeSafeSdo.nextStepTick =
+                pMaster->tickCount_PDO + OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+            PublishRuntimeSafeSdoDiagSnapshot();
+            return RuntimeSafeSdoStepDisposition::InProgress;
+        }
+
+        const uint64_t stepStartNs =
+            pMaster->GetCurrentMasterTimeNs();
+
+        RuntimeSafeSdoStepDisposition disposition =
+            RuntimeSafeSdoStepDisposition::InProgress;
+
+        if (g_runtimeSafeSdo.phase == RuntimeSafeSdoPhase::SendRequest)
+        {
+            // =============================================================
+            // Stage 12F.3E.6 - Mailbox Link Layer TX availability gate.
+            //
+            // Before writing a CoE request into the master->slave mailbox,
+            // first read the configured Mailbox-Out SM Status byte and require
+            // mailbox bit 3 = 0 (SM0/0x0805 on the standard layout).
+            //
+            // Why this matters:
+            // - FPWR WKC>0 only proves that the EtherCAT write transaction
+            //   reached the ESC; it does not replace mailbox ownership rules.
+            // - Writing while SM0 is still FULL can overwrite / fail to create
+            //   the mailbox hand-off edge expected by the slave application.
+            // - The observed failure pattern was exactly: SEND transport alive,
+            //   SM1 never became FULL, then the 2 s operation timeout expired.
+            //
+            // RT rule:
+            // The SM0 status FPRD and the real mailbox FPWR are deliberately
+            // split across two PDO callbacks.  This preserves the one-frame,
+            // bounded-step rule and does not expand the Priority-64 critical
+            // section.
+            // =============================================================
+            if (!g_runtimeSafeSdo.mailboxOutReadyLatched)
+            {
+                uint8_t sm0Status = 0u;
+
+                const int wkc =
+                    RuntimeSafeSdoFpTransaction(
+                        pMaster,
+                        0x04u, // FPRD - Mailbox-Out SM status, non-destructive
+                        m_slaveInfo[g_runtimeSafeSdo.slave].configAddr,
+                        g_runtimeSafeSdo.mailboxOutStatusReg,
+                        1u,
+                        nullptr,
+                        &sm0Status,
+                        OSCARMAX_ECAT_SDO_RT_STEP_DEADLINE_NS);
+
+                g_runtimeSafeSdo.lastTransportResult = wkc;
+                g_runtimeSafeSdo.stepsExecuted++;
+
+                if (wkc > 0)
+                {
+                    const bool mailboxFull =
+                        (sm0Status & 0x08u) != 0u;
+
+                    if (!mailboxFull)
+                    {
+                        g_runtimeSafeSdo.mailboxOutReadyLatched = true;
+                        g_runtimeSafeSdo.nextStepTick =
+                            pMaster->tickCount_PDO + 1ULL;
+                    }
+                    else
+                    {
+                        // Normal mailbox back-pressure.  Do not write and do
+                        // not fail the request; retry the status check later.
+                        g_runtimeSafeSdo.nextStepTick =
+                            pMaster->tickCount_PDO +
+                            OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+                    }
+                }
+                else
+                {
+                    // This is a SEND-path availability check, so reuse the
+                    // existing compact SEND transport counters.  The operation
+                    // itself remains pending until its normal 2 s deadline.
+                    if (wkc == -1)
+                    {
+                        g_runtimeSafeSdo.transportDeadlineMisses++;
+                        g_runtimeSafeSdo.sendDeadlineMiss++;
+                    }
+                    else if (wkc == 0)
+                    {
+                        g_runtimeSafeSdo.sendWkcZero++;
+                    }
+                    else
+                    {
+                        g_runtimeSafeSdo.sendTransportFailure++;
+                    }
+
+                    g_runtimeSafeSdo.nextStepTick =
+                        pMaster->tickCount_PDO +
+                        OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+                }
+            }
+            else
+            {
+                static uint8_t request[OSCARMAX_ECAT_SDO_RT_MAX_MAILBOX_BYTES];
+
+                const uint16_t mailboxLength =
+                    m_slaveInfo[g_runtimeSafeSdo.slave].mbxOutLength;
+
+                BuildRuntimeSafeSdoRequest(
+                    pMaster,
+                    request,
+                    mailboxLength);
+
+                // The EMPTY observation belongs only to this one FPWR attempt.
+                // Never carry it across a failed/late send or into another
+                // engineering request.
+                g_runtimeSafeSdo.mailboxOutReadyLatched = false;
+
+                g_runtimeSafeSdo.sendAttempts++;
+
+                const int wkc =
+                    RuntimeSafeSdoFpTransaction(
+                        pMaster,
+                        0x05u, // FPWR
+                        m_slaveInfo[g_runtimeSafeSdo.slave].configAddr,
+                        m_slaveInfo[g_runtimeSafeSdo.slave].mbxOutAddr,
+                        mailboxLength,
+                        request,
+                        nullptr,
+                        OSCARMAX_ECAT_SDO_RT_STEP_DEADLINE_NS);
+
+                g_runtimeSafeSdo.lastTransportResult = wkc;
+                g_runtimeSafeSdo.stepsExecuted++;
+
+                if (wkc > 0)
+                {
+                    g_runtimeSafeSdo.sendSuccess++;
+                    g_runtimeSafeSdo.requestWriteIssued = true;
+                    g_runtimeSafeSdo.requestConsumed = false;
+                    g_runtimeSafeSdo.phase = RuntimeSafeSdoPhase::PollResponse;
+                    g_runtimeSafeSdo.nextStepTick =
+                        pMaster->tickCount_PDO + OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+                }
+                else
+                {
+                    RuntimeSafeSdoFailureReason failureReason =
+                        RuntimeSafeSdoFailureReason::SendTransportFailure;
+
+                    if (wkc == -1)
+                    {
+                        // -----------------------------------------------------
+                        // Stage 12F.3E.3 - Uncertain SEND acknowledgement recovery
+                        // -----------------------------------------------------
+                        // A hard-deadline miss after SendPacket() does NOT prove
+                        // that the FPWR request failed to reach the slave.  The
+                        // frame may already be on the wire / accepted by the ESC,
+                        // while only the returning EtherCAT acknowledgement arrived
+                        // later than our bounded RT step window.
+                        //
+                        // DO NOT resend: a duplicate SDO download may apply twice.
+                        // Instead, treat the SEND result as "delivery uncertain"
+                        // and move to the normal response-poll state.
+                        // -----------------------------------------------------
+                        g_runtimeSafeSdo.transportDeadlineMisses++;
+                        g_runtimeSafeSdo.sendDeadlineMiss++;
+                        g_runtimeSafeSdo.requestWriteIssued = true;
+                        g_runtimeSafeSdo.requestConsumed = false;
+
+                        g_runtimeSafeSdo.phase =
+                            RuntimeSafeSdoPhase::PollResponse;
+
+                        g_runtimeSafeSdo.nextStepTick =
+                            pMaster->tickCount_PDO +
+                            OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+
+                        disposition =
+                            RuntimeSafeSdoStepDisposition::InProgress;
+                    }
+                    else
+                    {
+                        if (wkc == 0)
+                        {
+                            // WKC=0 is a completed FPWR frame for which no slave
+                            // accepted the write.  Unlike a deadline miss, this is
+                            // not an ambiguous acknowledgement and is therefore a
+                            // terminal transport failure in this stage.
+                            g_runtimeSafeSdo.sendWkcZero++;
+                            failureReason =
+                                RuntimeSafeSdoFailureReason::SendWkcZero;
+                        }
+                        else
+                        {
+                            g_runtimeSafeSdo.sendTransportFailure++;
+                        }
+
+                        g_runtimeSafeSdo.operationsFailed++;
+                        g_runtimeSafeSdo.lastFailureReason = failureReason;
+                        disposition = RuntimeSafeSdoStepDisposition::Error;
+                    }
+                }
+            }
+        }
+        else if (g_runtimeSafeSdo.phase == RuntimeSafeSdoPhase::PollResponse)
+        {
+            // =============================================================
+            // Stage 12F.3E.11 - Mailbox handshake classifier.
+            //
+            // First prove that the just-written master->slave mailbox was
+            // consumed by the slave PDI: after FPWR, SM0 bit 3 must return
+            // to EMPTY.  Only then start waiting for the slave->master SM1
+            // response.  This cleanly separates:
+            //   REASON 10 = request was issued but SM0 was not consumed.
+            //   REASON 11 = SM0 was consumed but SM1 never produced response.
+            // =============================================================
+
+            g_runtimeSafeSdo.pollAttempts++;
+
+            if (g_runtimeSafeSdo.requestWriteIssued &&
+                !g_runtimeSafeSdo.requestConsumed)
+            {
+                uint8_t sm0Status = 0u;
+
+                const int wkc =
+                    RuntimeSafeSdoFpTransaction(
+                        pMaster,
+                        0x04u, // FPRD - SM0 status, non-destructive
+                        m_slaveInfo[g_runtimeSafeSdo.slave].configAddr,
+                        g_runtimeSafeSdo.mailboxOutStatusReg,
+                        1u,
+                        nullptr,
+                        &sm0Status,
+                        OSCARMAX_ECAT_SDO_RT_STEP_DEADLINE_NS);
+
+                g_runtimeSafeSdo.lastTransportResult = wkc;
+                g_runtimeSafeSdo.stepsExecuted++;
+
+                if (wkc <= 0)
+                {
+                    if (wkc == -1)
+                    {
+                        g_runtimeSafeSdo.transportDeadlineMisses++;
+                        g_runtimeSafeSdo.pollDeadlineMiss++;
+                    }
+                    else if (wkc == 0)
+                    {
+                        g_runtimeSafeSdo.pollWkcZero++;
+                    }
+                    else
+                    {
+                        g_runtimeSafeSdo.pollTransportFailure++;
+                    }
+
+                    g_runtimeSafeSdo.pollNotReady++;
+                    g_runtimeSafeSdo.nextStepTick =
+                        pMaster->tickCount_PDO +
+                        OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+                }
+                else
+                {
+                    g_runtimeSafeSdo.pollWkcPositive++;
+
+                    const bool requestStillFull =
+                        (sm0Status & 0x08u) != 0u;
+
+                    if (requestStillFull)
+                    {
+                        g_runtimeSafeSdo.pollNotReady++;
+                        g_runtimeSafeSdo.nextStepTick =
+                            pMaster->tickCount_PDO +
+                            OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+                    }
+                    else
+                    {
+                        g_runtimeSafeSdo.requestConsumed = true;
+                        g_runtimeSafeSdo.nextStepTick =
+                            pMaster->tickCount_PDO + 1ULL;
+                    }
+                }
+            }
+            else if (!g_runtimeSafeSdo.mailboxInReadyLatched)
+            {
+                // =========================================================
+                // Stage 12F.3E.4 - Check mailbox FULL before fetching data.
+                // =========================================================
+                uint8_t sm1Status = 0u;
+
+                const int wkc =
+                    RuntimeSafeSdoFpTransaction(
+                        pMaster,
+                        0x04u, // FPRD - SM1 status, non-destructive
+                        m_slaveInfo[g_runtimeSafeSdo.slave].configAddr,
+                        g_runtimeSafeSdo.mailboxInStatusReg,
+                        1u,
+                        nullptr,
+                        &sm1Status,
+                        OSCARMAX_ECAT_SDO_RT_STEP_DEADLINE_NS);
+
+                g_runtimeSafeSdo.lastTransportResult = wkc;
+                g_runtimeSafeSdo.stepsExecuted++;
+
+                if (wkc <= 0)
+                {
+                    if (wkc == -1)
+                    {
+                        g_runtimeSafeSdo.transportDeadlineMisses++;
+                        g_runtimeSafeSdo.pollDeadlineMiss++;
+                    }
+                    else if (wkc == 0)
+                    {
+                        g_runtimeSafeSdo.pollWkcZero++;
+                    }
+                    else
+                    {
+                        g_runtimeSafeSdo.pollTransportFailure++;
+                    }
+
+                    g_runtimeSafeSdo.pollNotReady++;
+                    g_runtimeSafeSdo.nextStepTick =
+                        pMaster->tickCount_PDO +
+                        OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+                }
+                else
+                {
+                    g_runtimeSafeSdo.pollWkcPositive++;
+
+                    const bool mailboxFull =
+                        (sm1Status & 0x08u) != 0u;
+
+                    if (!mailboxFull)
+                    {
+                        g_runtimeSafeSdo.pollNotReady++;
+                        g_runtimeSafeSdo.nextStepTick =
+                            pMaster->tickCount_PDO +
+                            OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+                    }
+                    else
+                    {
+                        g_runtimeSafeSdo.mailboxInReadyLatched = true;
+                        g_runtimeSafeSdo.nextStepTick =
+                            pMaster->tickCount_PDO + 1ULL;
+                    }
+                }
+            }
+            else
+            {
+                const uint64_t fetchGateNowNs =
+                    pMaster->GetCurrentMasterTimeNs();
+
+                if (pdoCycleStartMasterNs != 0u &&
+                    fetchGateNowNs >= pdoCycleStartMasterNs &&
+                    (fetchGateNowNs - pdoCycleStartMasterNs) >=
+                    OSCARMAX_ECAT_SDO_RT_FETCH_HANDLER_GATE_NS)
+                {
+                    g_runtimeSafeSdo.stepsDeferredBudget++;
+                    g_runtimeSafeSdo.nextStepTick =
+                        pMaster->tickCount_PDO + 1ULL;
+                }
+                else
+                {
+                    static uint8_t response[OSCARMAX_ECAT_SDO_RT_MAX_MAILBOX_BYTES];
+                    std::memset(response, 0, sizeof(response));
+
+                    const uint16_t mailboxLength =
+                        m_slaveInfo[g_runtimeSafeSdo.slave].mbxInLength;
+
+                    const int wkc =
+                        RuntimeSafeSdoFpTransaction(
+                            pMaster,
+                            0x04u, // FPRD - mailbox data fetch
+                            m_slaveInfo[g_runtimeSafeSdo.slave].configAddr,
+                            m_slaveInfo[g_runtimeSafeSdo.slave].mbxInAddr,
+                            mailboxLength,
+                            nullptr,
+                            response,
+                            OSCARMAX_ECAT_SDO_RT_FETCH_DEADLINE_NS);
+
+                    g_runtimeSafeSdo.lastTransportResult = wkc;
+                    g_runtimeSafeSdo.stepsExecuted++;
+                    g_runtimeSafeSdo.mailboxInReadyLatched = false;
+
+                    if (wkc <= 0)
+                    {
+                        if (wkc == -1)
+                        {
+                            g_runtimeSafeSdo.transportDeadlineMisses++;
+                            g_runtimeSafeSdo.pollDeadlineMiss++;
+                        }
+                        else if (wkc == 0)
+                        {
+                            g_runtimeSafeSdo.pollWkcZero++;
+                        }
+                        else
+                        {
+                            g_runtimeSafeSdo.pollTransportFailure++;
+                        }
+
+                        g_runtimeSafeSdo.pollNotReady++;
+                        g_runtimeSafeSdo.nextStepTick =
+                            pMaster->tickCount_PDO +
+                            OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+                    }
+                    else
+                    {
+                        g_runtimeSafeSdo.pollWkcPositive++;
+
+                        const uint8_t mailboxType =
+                            static_cast<uint8_t>(response[5] & 0x0Fu);
+
+                        // The mailbox counter is sender-local sequencing; a
+                        // slave response is NOT required to echo the master's
+                        // request counter.  Match the response by protocol +
+                        // CoE SDO service + object identity instead.
+                        const uint16_t coeHeader =
+                            static_cast<uint16_t>(response[6]) |
+                            static_cast<uint16_t>(
+                                static_cast<uint16_t>(response[7]) << 8);
+
+                        const uint8_t coeService =
+                            static_cast<uint8_t>((coeHeader >> 12) & 0x0Fu);
+
+                        const uint8_t command = response[8];
+                        const uint16_t responseIndex =
+                            static_cast<uint16_t>(response[9]) |
+                            static_cast<uint16_t>(
+                                static_cast<uint16_t>(response[10]) << 8);
+                        const uint8_t responseSubIndex = response[11];
+
+                        const bool belongsToCurrentRequest =
+                            mailboxType == 0x03u &&
+                            coeService == 0x03u &&
+                            responseIndex == g_runtimeSafeSdo.index &&
+                            responseSubIndex == g_runtimeSafeSdo.subIndex;
+
+                        if (!belongsToCurrentRequest)
+                        {
+                            g_runtimeSafeSdo.responseMismatchCount++;
+                            g_runtimeSafeSdo.pollNotReady++;
+                            g_runtimeSafeSdo.nextStepTick =
+                                pMaster->tickCount_PDO +
+                                OSCARMAX_ECAT_SDO_RT_NEXT_POLL_CYCLES;
+                        }
+                        else if (command == 0x80u)
+                        {
+                            uint32_t abortCode = 0u;
+                            std::memcpy(&abortCode, &response[12], sizeof(abortCode));
+                            g_runtimeSafeSdo.lastAbortCode = abortCode;
+                            g_runtimeSafeSdo.abortCount++;
+                            g_runtimeSafeSdo.operationsFailed++;
+                            g_runtimeSafeSdo.lastFailureReason =
+                                RuntimeSafeSdoFailureReason::SdoAbort;
+                            disposition = RuntimeSafeSdoStepDisposition::Error;
+                        }
+                        else if (g_runtimeSafeSdo.commandType == (int)EcatCmdType::CMD_SDO_WRITE)
+                        {
+                            if (command == 0x60u)
+                            {
+                                if (terminalWkc != nullptr)
+                                {
+                                    *terminalWkc = wkc;
+                                }
+
+                                pMaster->m_asyncCmd.dataValue =
+                                    g_runtimeSafeSdo.dataValue;
+                                pMaster->m_asyncCmd.dataSize =
+                                    g_runtimeSafeSdo.dataSize;
+
+                                g_runtimeSafeSdo.operationsCompleted++;
+                                disposition = RuntimeSafeSdoStepDisposition::Done;
+                            }
+                            else
+                            {
+                                g_runtimeSafeSdo.operationsFailed++;
+                                g_runtimeSafeSdo.invalidResponseCount++;
+                                g_runtimeSafeSdo.lastFailureReason =
+                                    RuntimeSafeSdoFailureReason::InvalidResponse;
+                                disposition = RuntimeSafeSdoStepDisposition::Error;
+                            }
+                        }
+                        else // CMD_SDO_READ
+                        {
+                            const bool uploadResponse =
+                                (command & 0xE0u) == 0x40u;
+
+                            const bool expedited =
+                                (command & 0x02u) != 0u;
+
+                            if (!uploadResponse || !expedited)
+                            {
+                                g_runtimeSafeSdo.operationsFailed++;
+                                g_runtimeSafeSdo.invalidResponseCount++;
+                                g_runtimeSafeSdo.lastFailureReason =
+                                    RuntimeSafeSdoFailureReason::InvalidResponse;
+                                disposition = RuntimeSafeSdoStepDisposition::Error;
+                            }
+                            else
+                            {
+                                int validBytes = 4;
+
+                                if ((command & 0x01u) != 0u)
+                                {
+                                    const int emptyBytes =
+                                        static_cast<int>((command >> 2) & 0x03u);
+                                    validBytes = 4 - emptyBytes;
+                                }
+
+                                if (validBytes != 1 &&
+                                    validBytes != 2 &&
+                                    validBytes != 4)
+                                {
+                                    g_runtimeSafeSdo.operationsFailed++;
+                                    g_runtimeSafeSdo.invalidResponseCount++;
+                                    g_runtimeSafeSdo.lastFailureReason =
+                                        RuntimeSafeSdoFailureReason::InvalidResponse;
+                                    disposition = RuntimeSafeSdoStepDisposition::Error;
+                                }
+                                else
+                                {
+                                    uint32_t value = 0u;
+                                    std::memcpy(
+                                        &value,
+                                        &response[12],
+                                        static_cast<size_t>(validBytes));
+
+                                    pMaster->m_asyncCmd.dataValue = value;
+                                    pMaster->m_asyncCmd.dataSize = validBytes;
+
+                                    if (terminalWkc != nullptr)
+                                    {
+                                        *terminalWkc = wkc;
+                                    }
+
+                                    g_runtimeSafeSdo.operationsCompleted++;
+                                    disposition = RuntimeSafeSdoStepDisposition::Done;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            g_runtimeSafeSdo.operationsFailed++;
+            g_runtimeSafeSdo.invalidResponseCount++;
+            g_runtimeSafeSdo.lastFailureReason =
+                RuntimeSafeSdoFailureReason::InvalidPhase;
+            disposition = RuntimeSafeSdoStepDisposition::Error;
+        }
+
+        const uint64_t stepEndNs =
+            pMaster->GetCurrentMasterTimeNs();
+
+        uint64_t stepCostNs = 0ULL;
+
+        if (stepEndNs >= stepStartNs)
+        {
+            stepCostNs = stepEndNs - stepStartNs;
+        }
+
+        g_runtimeSafeSdo.stepCostLastNs = stepCostNs;
+
+        if (stepCostNs > g_runtimeSafeSdo.stepCostMaxNs)
+        {
+            g_runtimeSafeSdo.stepCostMaxNs = stepCostNs;
+        }
+
+        if (0xFFFFFFFFFFFFFFFFULL - g_runtimeSafeSdo.stepCostTotalNs >= stepCostNs)
+        {
+            g_runtimeSafeSdo.stepCostTotalNs += stepCostNs;
+        }
+        else
+        {
+            g_runtimeSafeSdo.stepCostTotalNs = 0xFFFFFFFFFFFFFFFFULL;
+        }
+
+        if (disposition == RuntimeSafeSdoStepDisposition::Done)
+        {
+            FinalizeRuntimeSafeSdoOperation(
+                pMaster,
+                true,
+                RuntimeSafeSdoFailureReason::None);
+            ResetRuntimeSafeSdoState();
+            PublishRuntimeSafeSdoDiagSnapshot();
+        }
+        else if (disposition == RuntimeSafeSdoStepDisposition::Error)
+        {
+            RuntimeSafeSdoFailureReason reason =
+                g_runtimeSafeSdo.lastFailureReason;
+
+            if (reason == RuntimeSafeSdoFailureReason::None)
+            {
+                reason = RuntimeSafeSdoFailureReason::InvalidResponse;
+            }
+
+            FinalizeRuntimeSafeSdoOperation(
+                pMaster,
+                false,
+                reason);
+            ResetRuntimeSafeSdoState();
+            PublishRuntimeSafeSdoDiagSnapshot();
+        }
+        else
+        {
+            PublishRuntimeSafeSdoDiagSnapshot();
+        }
+
+        return disposition;
+    }
+}
+
+// ============================================================================
+// Stage 12F.3E.3 - Priority-50 readable SDO RT diagnostics snapshot
+// ============================================================================
+//
+// This is an in-process C ABI only; it does not touch Shared Memory and does
+// not change the live SDO state machine.  A lower-priority publisher can copy
+// the most recent bounded-mailbox statistics without reading P64-owned state
+// directly.  Read attempts are bounded to three seqlock checks and never wait.
+// ============================================================================
+extern "C" bool OSCARMAX_ECAT_SdoRtDiag_Read(
+    void* output,
+    uint32_t outputBytes)
+{
+    if (output == nullptr ||
+        outputBytes < sizeof(OSCARMAX_ECAT_SdoRtDiagSnapshot))
+    {
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const LONG sequenceBefore =
+            g_runtimeSafeSdoDiag.Sequence;
+
+        if ((sequenceBefore & 1L) != 0L)
+        {
+            continue;
+        }
+
+        MemoryBarrier();
+
+        OSCARMAX_ECAT_SdoRtDiagSnapshot local = {};
+        std::memcpy(
+            &local,
+            &g_runtimeSafeSdoDiag,
+            sizeof(local));
+
+        MemoryBarrier();
+
+        const LONG sequenceAfter =
+            g_runtimeSafeSdoDiag.Sequence;
+
+        if (sequenceBefore == sequenceAfter &&
+            (sequenceAfter & 1L) == 0L)
+        {
+            std::memcpy(
+                output,
+                &local,
+                sizeof(local));
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// Stage 12E.3A - Owner-Safe Per-Slave ESC Live Diagnostic RT Shadow
+// Stage 12E.4A - Owner-Safe SyncManager Live Register Snapshot
+// Stage 12E.5A - Owner-Safe FMMU Live Register Snapshot
+// ============================================================================
+//
+// Purpose:
+//     Complete the data foundation behind the ENI Tool Expert Diagnostics
+//     without allowing the Priority-50 publisher or Windows UI to touch the
+//     EtherCAT NIC directly.
+//
+// Runtime policy:
+//     - Priority 64 remains the ONLY live EtherCAT NIC owner.
+//     - One bounded FPRD probe is attempted at most once every 80 PDO cycles
+//       (20 ms at 250 us/cycle).
+//     - The probe runs only on subTick 0, while async SDO/state commands use
+//       subTick 2, so a callback never stacks an SDO frame and an ESC probe.
+//     - SDO active/pending always has priority; ESC diagnostics simply defer.
+//     - No Sleep, allocation, file I/O, lock or retry loop is added.
+//     - The existing 55 us bounded single-frame transport is reused.
+//
+// Probe set per slave:
+//     1) 0x0130..0x0135 : AL Status + AL Status Code
+//     2) 0x0110..0x0111 : ESC DL Status / physical + communication links
+//     3) 0x0300..0x0313 : RX error counters + Lost Link counters
+//     4) One 8-byte FPRD for EACH configured Runtime SyncManager:
+//            0x0800 + SM * 8
+//        returning Start Address, Length, Control, Status, Activate and
+//        PDI-Control exactly as the ESC currently exposes them.
+//     5) One 16-byte FPRD for EACH configured Runtime FMMU:
+//            0x0600 + FMMU * 16
+//        returning Logical Start/Length/Bits, Physical Start/Bit, Type and
+//        Activate exactly as the ESC currently exposes them.
+//     6) One bounded 67-byte FPRD per slave beginning at 0x0400:
+//            0x0400:0x0401  Watchdog Divider
+//            0x0420:0x0421  Watchdog Time Process Data
+//            0x0440:0x0441  Watchdog Status Process Data
+//            0x0442         Watchdog Counter Process Data
+//        The read is diagnostic-only and never acknowledges/clears a counter.
+//
+// Scheduling note:
+//     SM, FMMU and Watchdog probes extend the SAME low-rate diagnostic sweep;
+//     they do not create another diagnostic timer or add a second diagnostic
+//     frame to the same callback. One additional Watchdog probe is added per
+//     slave, so the commissioning refresh remains low-rate and bounded.
+//
+// Existing Stage 12E.3A / 12E.4A / 12E.5A reader ABIs remain unchanged.
+// Stage 12E.7A adds OSCARMAX_ECAT_WatchdogDiagRt_Read() for Priority-50 only.
+// No Shared Memory ABI is changed in this file.
+//
+// Source fingerprints:
+//     OSCARMAX_ESC_DIAG_RT_12E3A_20260826
+//     OSCARMAX_SM_DIAG_RT_12E4A_20260826
+//     OSCARMAX_FMMU_DIAG_RT_12E5A_20260826
+//     OSCARMAX_WATCHDOG_DIAG_RT_12E7A_20260827
+// ============================================================================
+namespace
+{
+    constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES = 128u;
+    constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_MAX_SYNC_MANAGERS = 16u;
+    constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_MAX_FMMUS = 16u;
+    constexpr uint64_t OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES = 80ULL;
+    constexpr uint64_t OSCARMAX_ECAT_ESC_DIAG_HANDLER_BUDGET_GATE_NS = 120000ULL;
+    constexpr uint64_t OSCARMAX_ECAT_ESC_DIAG_STEP_DEADLINE_NS = 55000ULL;
+
+    constexpr uint16_t OSCARMAX_ECAT_ESC_REG_DL_STATUS = 0x0110u;
+    constexpr uint16_t OSCARMAX_ECAT_ESC_REG_AL_STATUS = 0x0130u;
+    constexpr uint16_t OSCARMAX_ECAT_ESC_REG_ERROR_COUNTERS = 0x0300u;
+    constexpr uint16_t OSCARMAX_ECAT_ESC_REG_WATCHDOG_BASE = 0x0400u;
+    constexpr uint16_t OSCARMAX_ECAT_ESC_REG_FMMU_BASE = 0x0600u;
+    constexpr uint16_t OSCARMAX_ECAT_ESC_REG_SM_BASE = 0x0800u;
+
+    constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_VALID_AL = 0x00000001u;
+    constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_VALID_DL = 0x00000002u;
+    constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_VALID_ERRORS = 0x00000004u;
+    constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_VALID_WATCHDOG = 0x00000008u;
+
+    struct OSCARMAX_ECAT_SmDiagRtEntry
+    {
+        uint32_t Present = 0u;
+        uint32_t Valid = 0u;
+        uint16_t RegisterAddress = 0u;
+        uint16_t StartAddress = 0u;
+        uint16_t Length = 0u;
+        uint8_t ControlByte = 0u;
+        uint8_t StatusByte = 0u;
+        uint8_t ActivateByte = 0u;
+        uint8_t PdiControlByte = 0u;
+        int32_t LastTransportResult = 0;
+        uint64_t LastUpdateTick = 0ULL;
+        uint64_t ProbeSuccess = 0ULL;
+        uint64_t ProbeFailure = 0ULL;
+    };
+
+    struct OSCARMAX_ECAT_FmmuDiagRtEntry
+    {
+        uint32_t Present = 0u;
+        uint32_t Valid = 0u;
+        uint16_t RegisterAddress = 0u;
+
+        uint32_t LogicalStartAddress = 0u;
+        uint16_t LogicalLength = 0u;
+        uint8_t LogicalStartBit = 0u;
+        uint8_t LogicalEndBit = 0u;
+
+        uint16_t PhysicalStartAddress = 0u;
+        uint8_t PhysicalStartBit = 0u;
+        uint8_t Type = 0u;
+        uint8_t Activate = 0u;
+
+        int32_t LastTransportResult = 0;
+        uint64_t LastUpdateTick = 0ULL;
+        uint64_t ProbeSuccess = 0ULL;
+        uint64_t ProbeFailure = 0ULL;
+    };
+
+    struct OSCARMAX_ECAT_EscDiagRtSlaveShadow
+    {
+        uint32_t ValidMask = 0u;
+        uint16_t AlState = 0u;
+        uint16_t AlStatusCode = 0u;
+        uint16_t DlStatus = 0u;
+        uint8_t PhysicalLinkMask = 0u;
+        uint8_t CommunicationMask = 0u;
+        uint32_t RxErrorCount = 0u;
+        uint32_t LostLinkCount = 0u;
+
+        // Stage 12E.7A - raw ESC Process Data Watchdog registers.
+        uint16_t WatchdogDivider = 0u;           // 0x0400
+        uint16_t WatchdogTimeProcessData = 0u;   // 0x0420
+        uint16_t WatchdogStatusProcessData = 0u; // 0x0440
+        uint8_t WatchdogCounterProcessData = 0u; // 0x0442
+        uint8_t WatchdogReserved = 0u;
+
+        int32_t LastTransportResult = 0;
+        uint64_t LastUpdateTick = 0ULL;
+        uint64_t ProbeSuccess = 0ULL;
+        uint64_t ProbeFailure = 0ULL;
+
+        uint32_t SyncManagerPresentMask = 0u;
+        uint32_t SyncManagerValidMask = 0u;
+        OSCARMAX_ECAT_SmDiagRtEntry
+            SyncManagers[OSCARMAX_ECAT_ESC_DIAG_MAX_SYNC_MANAGERS] = {};
+
+        uint32_t FmmuPresentMask = 0u;
+        uint32_t FmmuValidMask = 0u;
+        OSCARMAX_ECAT_FmmuDiagRtEntry
+            Fmmus[OSCARMAX_ECAT_ESC_DIAG_MAX_FMMUS] = {};
+    };
+
+    struct OSCARMAX_ECAT_EscDiagRtShadow
+    {
+        volatile LONG Sequence = 0;
+        uint32_t SlaveCount = 0u;
+        uint32_t CurrentSlave = 0u;
+        uint32_t CurrentField = 0u;
+        uint64_t SweepCount = 0ULL;
+        uint64_t ProbeAttempts = 0ULL;
+        uint64_t ProbeSuccess = 0ULL;
+        uint64_t ProbeFailure = 0ULL;
+        uint64_t DeferredSdo = 0ULL;
+        uint64_t DeferredPdo = 0ULL;
+        uint64_t DeferredBudget = 0ULL;
+        OSCARMAX_ECAT_EscDiagRtSlaveShadow Slaves[OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES] = {};
+    };
+
+    OSCARMAX_ECAT_EscDiagRtShadow g_ecatEscDiagRtShadow;
+
+    uint8_t DecodeEscCommunicationMask(uint16_t dlStatus)
+    {
+        uint8_t mask = 0u;
+
+        if ((dlStatus & (1u << 9)) != 0u)  mask |= 0x01u;
+        if ((dlStatus & (1u << 11)) != 0u) mask |= 0x02u;
+        if ((dlStatus & (1u << 13)) != 0u) mask |= 0x04u;
+        if ((dlStatus & (1u << 15)) != 0u) mask |= 0x08u;
+
+        return mask;
+    }
+
+    uint32_t CountRuntimeEscDiagSyncManagers(
+        const EtherCatSlave& slave)
+    {
+        uint32_t count = 0u;
+
+        for (const auto& sm : slave.runtimeSyncManagers)
+        {
+            if (sm.index >= 0 &&
+                sm.index < static_cast<int>(OSCARMAX_ECAT_ESC_DIAG_MAX_SYNC_MANAGERS))
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    const EtherCatRuntimeSyncManagerConfig* FindRuntimeEscDiagSyncManagerByOrdinal(
+        const EtherCatSlave& slave,
+        uint32_t ordinal)
+    {
+        uint32_t current = 0u;
+
+        for (const auto& sm : slave.runtimeSyncManagers)
+        {
+            if (sm.index < 0 ||
+                sm.index >= static_cast<int>(OSCARMAX_ECAT_ESC_DIAG_MAX_SYNC_MANAGERS))
+            {
+                continue;
+            }
+
+            if (current == ordinal)
+            {
+                return &sm;
+            }
+
+            current++;
+        }
+
+        return nullptr;
+    }
+
+    uint32_t BuildRuntimeEscDiagSyncManagerPresentMask(
+        const EtherCatSlave& slave)
+    {
+        uint32_t mask = 0u;
+
+        for (const auto& sm : slave.runtimeSyncManagers)
+        {
+            if (sm.index >= 0 &&
+                sm.index < static_cast<int>(OSCARMAX_ECAT_ESC_DIAG_MAX_SYNC_MANAGERS))
+            {
+                mask |= (1u << static_cast<uint32_t>(sm.index));
+            }
+        }
+
+        return mask;
+    }
+
+    uint32_t CountRuntimeEscDiagFmmus(
+        const EtherCatSlave& slave)
+    {
+        uint32_t count = 0u;
+
+        for (const auto& fmmu : slave.runtimeFmmus)
+        {
+            if (fmmu.index >= 0 &&
+                fmmu.index < static_cast<int>(OSCARMAX_ECAT_ESC_DIAG_MAX_FMMUS))
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    const EtherCatRuntimeFmmuConfig* FindRuntimeEscDiagFmmuByOrdinal(
+        const EtherCatSlave& slave,
+        uint32_t ordinal)
+    {
+        uint32_t current = 0u;
+
+        for (const auto& fmmu : slave.runtimeFmmus)
+        {
+            if (fmmu.index < 0 ||
+                fmmu.index >= static_cast<int>(OSCARMAX_ECAT_ESC_DIAG_MAX_FMMUS))
+            {
+                continue;
+            }
+
+            if (current == ordinal)
+            {
+                return &fmmu;
+            }
+
+            current++;
+        }
+
+        return nullptr;
+    }
+
+    uint32_t BuildRuntimeEscDiagFmmuPresentMask(
+        const EtherCatSlave& slave)
+    {
+        uint32_t mask = 0u;
+
+        for (const auto& fmmu : slave.runtimeFmmus)
+        {
+            if (fmmu.index >= 0 &&
+                fmmu.index < static_cast<int>(OSCARMAX_ECAT_ESC_DIAG_MAX_FMMUS))
+            {
+                mask |= (1u << static_cast<uint32_t>(fmmu.index));
+            }
+        }
+
+        return mask;
+    }
+
+    void ProcessRuntimeEscDiagProbe(
+        EtherCatMaster* pMaster,
+        uint64_t pdoCycleStartMasterNs,
+        bool pdoCycleValid)
+    {
+        static uint32_t nextSlave = 0u;
+        static uint32_t nextField = 0u;
+        static uint64_t nextProbeTick = 0ULL;
+
+        if (pMaster == nullptr || pMaster->m_pEni == nullptr)
+        {
+            return;
+        }
+
+        // Async commands execute on subTick 2. ESC diagnostic probes are
+        // restricted to subTick 0 so the same callback never performs both.
+        if ((pMaster->tickCount_PDO % 4ULL) != 0ULL)
+        {
+            return;
+        }
+
+        if (pMaster->tickCount_PDO < nextProbeTick)
+        {
+            return;
+        }
+
+        if (!pdoCycleValid)
+        {
+            g_ecatEscDiagRtShadow.DeferredPdo++;
+            nextProbeTick =
+                pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
+            return;
+        }
+
+        if (g_runtimeSafeSdo.active ||
+            pMaster->m_asyncCmd.status == (int)EcatCmdStatus::ECAT_STATUS_PENDING)
+        {
+            g_ecatEscDiagRtShadow.DeferredSdo++;
+            nextProbeTick =
+                pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
+            return;
+        }
+
+        const uint64_t nowNs = pMaster->GetCurrentMasterTimeNs();
+
+        if (pdoCycleStartMasterNs != 0ULL &&
+            nowNs >= pdoCycleStartMasterNs &&
+            (nowNs - pdoCycleStartMasterNs) >=
+            OSCARMAX_ECAT_ESC_DIAG_HANDLER_BUDGET_GATE_NS)
+        {
+            g_ecatEscDiagRtShadow.DeferredBudget++;
+            nextProbeTick =
+                pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
+            return;
+        }
+
+        const auto& runtimeSlaves = pMaster->m_pEni->GetSlaves();
+        uint32_t slaveCount = static_cast<uint32_t>(runtimeSlaves.size());
+
+        if (slaveCount > OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES)
+        {
+            slaveCount = OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES;
+        }
+
+        if (slaveCount == 0u)
+        {
+            return;
+        }
+
+        if (nextSlave >= slaveCount)
+        {
+            nextSlave = 0u;
+            nextField = 0u;
+        }
+
+        const EtherCatSlave& runtimeSlave =
+            runtimeSlaves[static_cast<size_t>(nextSlave)];
+
+        const uint32_t syncManagerProbeCount =
+            CountRuntimeEscDiagSyncManagers(runtimeSlave);
+
+        const uint32_t fmmuProbeCount =
+            CountRuntimeEscDiagFmmus(runtimeSlave);
+
+        const uint32_t fieldCount =
+            4u +
+            syncManagerProbeCount +
+            fmmuProbeCount;
+
+        if (nextField >= fieldCount)
+        {
+            nextField = 0u;
+            nextSlave++;
+
+            if (nextSlave >= slaveCount)
+            {
+                nextSlave = 0u;
+                g_ecatEscDiagRtShadow.SweepCount++;
+            }
+
+            nextProbeTick =
+                pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
+            return;
+        }
+
+        const uint16_t configuredAddress =
+            m_slaveInfo[nextSlave].configAddr;
+
+        if (configuredAddress == 0u)
+        {
+            nextField++;
+            if (nextField >= fieldCount)
+            {
+                nextField = 0u;
+                nextSlave++;
+                if (nextSlave >= slaveCount)
+                {
+                    nextSlave = 0u;
+                    g_ecatEscDiagRtShadow.SweepCount++;
+                }
+            }
+
+            nextProbeTick =
+                pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
+            return;
+        }
+
+        // Largest diagnostic request is the Stage 12E.7A Watchdog block:
+        // 0x0400..0x0442 inclusive = 67 bytes.
+        uint8_t readBuffer[68] = {};
+        uint16_t registerAddress = 0u;
+        uint16_t readLength = 0u;
+        int selectedSmIndex = -1;
+        int selectedFmmuIndex = -1;
+
+        if (nextField == 0u)
+        {
+            registerAddress = OSCARMAX_ECAT_ESC_REG_AL_STATUS;
+            readLength = 6u;
+        }
+        else if (nextField == 1u)
+        {
+            registerAddress = OSCARMAX_ECAT_ESC_REG_DL_STATUS;
+            readLength = 2u;
+        }
+        else if (nextField == 2u)
+        {
+            registerAddress = OSCARMAX_ECAT_ESC_REG_ERROR_COUNTERS;
+            readLength = 20u;
+        }
+        else if (nextField == 3u)
+        {
+            // One read captures all Process Data Watchdog registers needed
+            // for diagnosis without a second frame in this callback:
+            //   offset  0 = 0x0400 Watchdog Divider
+            //   offset 32 = 0x0420 Watchdog Time Process Data
+            //   offset 64 = 0x0440 Watchdog Status Process Data
+            //   offset 66 = 0x0442 Watchdog Counter Process Data
+            registerAddress = OSCARMAX_ECAT_ESC_REG_WATCHDOG_BASE;
+            readLength = 67u;
+        }
+        else
+        {
+            const uint32_t configuredOrdinal =
+                nextField - 4u;
+
+            if (configuredOrdinal < syncManagerProbeCount)
+            {
+                const EtherCatRuntimeSyncManagerConfig* sm =
+                    FindRuntimeEscDiagSyncManagerByOrdinal(
+                        runtimeSlave,
+                        configuredOrdinal);
+
+                if (sm == nullptr ||
+                    sm->index < 0 ||
+                    sm->index >= static_cast<int>(OSCARMAX_ECAT_ESC_DIAG_MAX_SYNC_MANAGERS))
+                {
+                    nextField++;
+                    nextProbeTick =
+                        pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
+                    return;
+                }
+
+                selectedSmIndex = sm->index;
+                registerAddress = static_cast<uint16_t>(
+                    OSCARMAX_ECAT_ESC_REG_SM_BASE +
+                    static_cast<uint16_t>(selectedSmIndex * 8));
+                readLength = 8u;
+            }
+            else
+            {
+                const uint32_t fmmuOrdinal =
+                    configuredOrdinal -
+                    syncManagerProbeCount;
+
+                const EtherCatRuntimeFmmuConfig* fmmu =
+                    FindRuntimeEscDiagFmmuByOrdinal(
+                        runtimeSlave,
+                        fmmuOrdinal);
+
+                if (fmmu == nullptr ||
+                    fmmu->index < 0 ||
+                    fmmu->index >= static_cast<int>(OSCARMAX_ECAT_ESC_DIAG_MAX_FMMUS))
+                {
+                    nextField++;
+                    nextProbeTick =
+                        pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
+                    return;
+                }
+
+                selectedFmmuIndex = fmmu->index;
+                registerAddress = static_cast<uint16_t>(
+                    OSCARMAX_ECAT_ESC_REG_FMMU_BASE +
+                    static_cast<uint16_t>(selectedFmmuIndex * 16));
+                readLength = 16u;
+            }
+        }
+
+        const int transportResult =
+            RuntimeSafeSdoFpTransaction(
+                pMaster,
+                0x04u, // FPRD
+                configuredAddress,
+                registerAddress,
+                readLength,
+                nullptr,
+                readBuffer,
+                OSCARMAX_ECAT_ESC_DIAG_STEP_DEADLINE_NS);
+
+        InterlockedIncrement(&g_ecatEscDiagRtShadow.Sequence);
+        MemoryBarrier();
+
+        g_ecatEscDiagRtShadow.SlaveCount = slaveCount;
+        g_ecatEscDiagRtShadow.CurrentSlave = nextSlave;
+        g_ecatEscDiagRtShadow.CurrentField = nextField;
+        g_ecatEscDiagRtShadow.ProbeAttempts++;
+
+        OSCARMAX_ECAT_EscDiagRtSlaveShadow& target =
+            g_ecatEscDiagRtShadow.Slaves[nextSlave];
+
+        target.SyncManagerPresentMask =
+            BuildRuntimeEscDiagSyncManagerPresentMask(runtimeSlave);
+
+        target.FmmuPresentMask =
+            BuildRuntimeEscDiagFmmuPresentMask(runtimeSlave);
+
+        // If the Runtime schema is ever refreshed, do not retain validity
+        // for an SM/FMMU that is no longer present in the configuration.
+        target.SyncManagerValidMask &= target.SyncManagerPresentMask;
+        target.FmmuValidMask &= target.FmmuPresentMask;
+
+        target.LastTransportResult = transportResult;
+        target.LastUpdateTick = pMaster->tickCount_PDO;
+
+        if (selectedSmIndex >= 0)
+        {
+            OSCARMAX_ECAT_SmDiagRtEntry& smTarget =
+                target.SyncManagers[static_cast<uint32_t>(selectedSmIndex)];
+
+            smTarget.Present = 1u;
+            smTarget.RegisterAddress = registerAddress;
+            smTarget.LastTransportResult = transportResult;
+            smTarget.LastUpdateTick = pMaster->tickCount_PDO;
+
+            if (transportResult > 0)
+            {
+                smTarget.StartAddress =
+                    static_cast<uint16_t>(readBuffer[0]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[1]) << 8);
+
+                smTarget.Length =
+                    static_cast<uint16_t>(readBuffer[2]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[3]) << 8);
+
+                smTarget.ControlByte = readBuffer[4];
+                smTarget.StatusByte = readBuffer[5];
+                smTarget.ActivateByte = readBuffer[6];
+                smTarget.PdiControlByte = readBuffer[7];
+                smTarget.Valid = 1u;
+                smTarget.ProbeSuccess++;
+
+                target.SyncManagerValidMask |=
+                    (1u << static_cast<uint32_t>(selectedSmIndex));
+            }
+            else
+            {
+                smTarget.Valid = 0u;
+                smTarget.ProbeFailure++;
+                target.SyncManagerValidMask &=
+                    ~(1u << static_cast<uint32_t>(selectedSmIndex));
+            }
+        }
+        else if (selectedFmmuIndex >= 0)
+        {
+            OSCARMAX_ECAT_FmmuDiagRtEntry& fmmuTarget =
+                target.Fmmus[static_cast<uint32_t>(selectedFmmuIndex)];
+
+            fmmuTarget.Present = 1u;
+            fmmuTarget.RegisterAddress = registerAddress;
+            fmmuTarget.LastTransportResult = transportResult;
+            fmmuTarget.LastUpdateTick = pMaster->tickCount_PDO;
+
+            if (transportResult > 0)
+            {
+                fmmuTarget.LogicalStartAddress =
+                    static_cast<uint32_t>(readBuffer[0]) |
+                    (static_cast<uint32_t>(readBuffer[1]) << 8) |
+                    (static_cast<uint32_t>(readBuffer[2]) << 16) |
+                    (static_cast<uint32_t>(readBuffer[3]) << 24);
+
+                fmmuTarget.LogicalLength =
+                    static_cast<uint16_t>(readBuffer[4]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[5]) << 8);
+
+                fmmuTarget.LogicalStartBit = readBuffer[6];
+                fmmuTarget.LogicalEndBit = readBuffer[7];
+
+                fmmuTarget.PhysicalStartAddress =
+                    static_cast<uint16_t>(readBuffer[8]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[9]) << 8);
+
+                fmmuTarget.PhysicalStartBit = readBuffer[10];
+                fmmuTarget.Type = readBuffer[11];
+                fmmuTarget.Activate = readBuffer[12];
+
+                fmmuTarget.Valid = 1u;
+                fmmuTarget.ProbeSuccess++;
+
+                target.FmmuValidMask |=
+                    (1u << static_cast<uint32_t>(selectedFmmuIndex));
+            }
+            else
+            {
+                fmmuTarget.Valid = 0u;
+                fmmuTarget.ProbeFailure++;
+
+                target.FmmuValidMask &=
+                    ~(1u << static_cast<uint32_t>(selectedFmmuIndex));
+            }
+        }
+
+        if (transportResult > 0)
+        {
+            target.ProbeSuccess++;
+            g_ecatEscDiagRtShadow.ProbeSuccess++;
+
+            if (nextField == 0u)
+            {
+                target.AlState =
+                    static_cast<uint16_t>(readBuffer[0]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[1]) << 8);
+
+                target.AlStatusCode =
+                    static_cast<uint16_t>(readBuffer[4]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[5]) << 8);
+
+                target.ValidMask |= OSCARMAX_ECAT_ESC_DIAG_VALID_AL;
+            }
+            else if (nextField == 1u)
+            {
+                target.DlStatus =
+                    static_cast<uint16_t>(readBuffer[0]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[1]) << 8);
+
+                target.PhysicalLinkMask =
+                    static_cast<uint8_t>((target.DlStatus >> 4) & 0x0Fu);
+
+                target.CommunicationMask =
+                    DecodeEscCommunicationMask(target.DlStatus);
+
+                target.ValidMask |= OSCARMAX_ECAT_ESC_DIAG_VALID_DL;
+            }
+            else if (nextField == 2u)
+            {
+                uint32_t rxErrorTotal = 0u;
+                uint32_t lostLinkTotal = 0u;
+
+                // 0x0300..0x0307 contain the per-port CRC/RX error bytes.
+                for (uint32_t i = 0u; i < 8u; ++i)
+                {
+                    rxErrorTotal += static_cast<uint32_t>(readBuffer[i]);
+                }
+
+                // 0x0310..0x0313 are one-byte Lost Link counters per port.
+                for (uint32_t i = 16u; i < 20u; ++i)
+                {
+                    lostLinkTotal += static_cast<uint32_t>(readBuffer[i]);
+                }
+
+                target.RxErrorCount = rxErrorTotal;
+                target.LostLinkCount = lostLinkTotal;
+                target.ValidMask |= OSCARMAX_ECAT_ESC_DIAG_VALID_ERRORS;
+            }
+            else if (nextField == 3u)
+            {
+                target.WatchdogDivider =
+                    static_cast<uint16_t>(readBuffer[0]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[1]) << 8);
+
+                target.WatchdogTimeProcessData =
+                    static_cast<uint16_t>(readBuffer[32]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[33]) << 8);
+
+                target.WatchdogStatusProcessData =
+                    static_cast<uint16_t>(readBuffer[64]) |
+                    static_cast<uint16_t>(
+                        static_cast<uint16_t>(readBuffer[65]) << 8);
+
+                target.WatchdogCounterProcessData =
+                    readBuffer[66];
+
+                target.ValidMask |=
+                    OSCARMAX_ECAT_ESC_DIAG_VALID_WATCHDOG;
+            }
+        }
+        else
+        {
+            target.ProbeFailure++;
+            g_ecatEscDiagRtShadow.ProbeFailure++;
+        }
+
+        nextField++;
+        if (nextField >= fieldCount)
+        {
+            nextField = 0u;
+            nextSlave++;
+
+            if (nextSlave >= slaveCount)
+            {
+                nextSlave = 0u;
+                g_ecatEscDiagRtShadow.SweepCount++;
+            }
+        }
+
+        g_ecatEscDiagRtShadow.CurrentSlave = nextSlave;
+        g_ecatEscDiagRtShadow.CurrentField = nextField;
+
+        MemoryBarrier();
+        InterlockedIncrement(&g_ecatEscDiagRtShadow.Sequence);
+
+        nextProbeTick =
+            pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Priority-50 reader seam for one slave's most recent ESC diagnostic snapshot.
+// Existing Stage 12E.3A ABI is intentionally unchanged.
+// ---------------------------------------------------------------------------
+extern "C" __declspec(dllexport) bool OSCARMAX_ECAT_EscDiagRt_Read(
+    uint16_t slavePosition,
+    uint32_t * validMask,
+    uint16_t * alState,
+    uint16_t * alStatusCode,
+    uint16_t * dlStatus,
+    uint8_t * physicalLinkMask,
+    uint8_t * communicationMask,
+    uint32_t * rxErrorCount,
+    uint32_t * lostLinkCount,
+    int32_t * lastTransportResult,
+    uint64_t * lastUpdateTick,
+    uint64_t * probeSuccess,
+    uint64_t * probeFailure)
+{
+    if (validMask == nullptr ||
+        alState == nullptr ||
+        alStatusCode == nullptr ||
+        dlStatus == nullptr ||
+        physicalLinkMask == nullptr ||
+        communicationMask == nullptr ||
+        rxErrorCount == nullptr ||
+        lostLinkCount == nullptr ||
+        lastTransportResult == nullptr ||
+        lastUpdateTick == nullptr ||
+        probeSuccess == nullptr ||
+        probeFailure == nullptr ||
+        slavePosition >= OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES)
+    {
+        return false;
+    }
+
+    const LONG sequenceBegin = g_ecatEscDiagRtShadow.Sequence;
+
+    if ((sequenceBegin & 1L) != 0L)
+    {
+        return false;
+    }
+
+    MemoryBarrier();
+
+    if (static_cast<uint32_t>(slavePosition) >=
+        g_ecatEscDiagRtShadow.SlaveCount)
+    {
+        return false;
+    }
+
+    const OSCARMAX_ECAT_EscDiagRtSlaveShadow local =
+        g_ecatEscDiagRtShadow.Slaves[slavePosition];
+
+    MemoryBarrier();
+
+    const LONG sequenceEnd = g_ecatEscDiagRtShadow.Sequence;
+
+    if (sequenceBegin != sequenceEnd ||
+        (sequenceEnd & 1L) != 0L)
+    {
+        return false;
+    }
+
+    *validMask = local.ValidMask;
+    *alState = local.AlState;
+    *alStatusCode = local.AlStatusCode;
+    *dlStatus = local.DlStatus;
+    *physicalLinkMask = local.PhysicalLinkMask;
+    *communicationMask = local.CommunicationMask;
+    *rxErrorCount = local.RxErrorCount;
+    *lostLinkCount = local.LostLinkCount;
+    *lastTransportResult = local.LastTransportResult;
+    *lastUpdateTick = local.LastUpdateTick;
+    *probeSuccess = local.ProbeSuccess;
+    *probeFailure = local.ProbeFailure;
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 12E.7A - Priority-50 reader seam for ESC Process Data Watchdog.
+//
+// Raw live values:
+//   0x0400:0x0401  Watchdog Divider
+//   0x0420:0x0421  Watchdog Time Process Data
+//   0x0440:0x0441  Watchdog Status Process Data
+//   0x0442         Watchdog Counter Process Data
+//
+// enabledSmMask is derived from the most recent live SM Control bytes.
+// Bit N = SyncManager N has ControlByte[6] Watchdog Trigger Enable set.
+//
+// No register is written or acknowledged by this path.
+// ---------------------------------------------------------------------------
+extern "C" __declspec(dllexport) bool OSCARMAX_ECAT_WatchdogDiagRt_Read(
+    uint16_t slavePosition,
+    uint32_t * valid,
+    uint16_t * watchdogDivider,
+    uint16_t * watchdogTimeProcessData,
+    uint16_t * watchdogStatusProcessData,
+    uint8_t * watchdogCounterProcessData,
+    uint16_t * enabledSmMask,
+    int32_t * lastTransportResult,
+    uint64_t * lastUpdateTick)
+{
+    if (valid == nullptr ||
+        watchdogDivider == nullptr ||
+        watchdogTimeProcessData == nullptr ||
+        watchdogStatusProcessData == nullptr ||
+        watchdogCounterProcessData == nullptr ||
+        enabledSmMask == nullptr ||
+        lastTransportResult == nullptr ||
+        lastUpdateTick == nullptr ||
+        slavePosition >= OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES)
+    {
+        return false;
+    }
+
+    const LONG sequenceBegin =
+        g_ecatEscDiagRtShadow.Sequence;
+
+    if ((sequenceBegin & 1L) != 0L)
+    {
+        return false;
+    }
+
+    MemoryBarrier();
+
+    if (static_cast<uint32_t>(slavePosition) >=
+        g_ecatEscDiagRtShadow.SlaveCount)
+    {
+        return false;
+    }
+
+    const OSCARMAX_ECAT_EscDiagRtSlaveShadow local =
+        g_ecatEscDiagRtShadow.Slaves[slavePosition];
+
+    MemoryBarrier();
+
+    const LONG sequenceEnd =
+        g_ecatEscDiagRtShadow.Sequence;
+
+    if (sequenceBegin != sequenceEnd ||
+        (sequenceEnd & 1L) != 0L)
+    {
+        return false;
+    }
+
+    uint16_t localEnabledSmMask = 0u;
+
+    for (uint32_t smIndex = 0u;
+        smIndex < OSCARMAX_ECAT_ESC_DIAG_MAX_SYNC_MANAGERS;
+        ++smIndex)
+    {
+        const OSCARMAX_ECAT_SmDiagRtEntry& sm =
+            local.SyncManagers[smIndex];
+
+        if (sm.Present != 0u &&
+            sm.Valid != 0u &&
+            (sm.ControlByte & 0x40u) != 0u)
+        {
+            localEnabledSmMask |=
+                static_cast<uint16_t>(1u << smIndex);
+        }
+    }
+
+    *valid =
+        ((local.ValidMask &
+            OSCARMAX_ECAT_ESC_DIAG_VALID_WATCHDOG) != 0u)
+        ? 1u
+        : 0u;
+
+    *watchdogDivider =
+        local.WatchdogDivider;
+
+    *watchdogTimeProcessData =
+        local.WatchdogTimeProcessData;
+
+    *watchdogStatusProcessData =
+        local.WatchdogStatusProcessData;
+
+    *watchdogCounterProcessData =
+        local.WatchdogCounterProcessData;
+
+    *enabledSmMask =
+        localEnabledSmMask;
+
+    *lastTransportResult =
+        local.LastTransportResult;
+
+    *lastUpdateTick =
+        local.LastUpdateTick;
+
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// Stage 12E.4A - Priority-50 reader seam for one live SyncManager register.
+//
+// smIndex is the physical ESC SyncManager number (0..15), not an ordinal in
+// the Runtime XML vector. The call is lock-free and wait-free; read collision
+// simply returns false and the 10 ms publisher retries on its next pass.
+// ---------------------------------------------------------------------------
+extern "C" __declspec(dllexport) bool OSCARMAX_ECAT_SmDiagRt_Read(
+    uint16_t slavePosition,
+    uint8_t smIndex,
+    uint32_t * present,
+    uint32_t * valid,
+    uint16_t * registerAddress,
+    uint16_t * startAddress,
+    uint16_t * length,
+    uint8_t * controlByte,
+    uint8_t * statusByte,
+    uint8_t * activateByte,
+    uint8_t * pdiControlByte,
+    int32_t * lastTransportResult,
+    uint64_t * lastUpdateTick,
+    uint64_t * probeSuccess,
+    uint64_t * probeFailure)
+{
+    if (present == nullptr ||
+        valid == nullptr ||
+        registerAddress == nullptr ||
+        startAddress == nullptr ||
+        length == nullptr ||
+        controlByte == nullptr ||
+        statusByte == nullptr ||
+        activateByte == nullptr ||
+        pdiControlByte == nullptr ||
+        lastTransportResult == nullptr ||
+        lastUpdateTick == nullptr ||
+        probeSuccess == nullptr ||
+        probeFailure == nullptr ||
+        slavePosition >= OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES ||
+        smIndex >= OSCARMAX_ECAT_ESC_DIAG_MAX_SYNC_MANAGERS)
+    {
+        return false;
+    }
+
+    const LONG sequenceBegin = g_ecatEscDiagRtShadow.Sequence;
+
+    if ((sequenceBegin & 1L) != 0L)
+    {
+        return false;
+    }
+
+    MemoryBarrier();
+
+    if (static_cast<uint32_t>(slavePosition) >=
+        g_ecatEscDiagRtShadow.SlaveCount)
+    {
+        return false;
+    }
+
+    const OSCARMAX_ECAT_EscDiagRtSlaveShadow& slave =
+        g_ecatEscDiagRtShadow.Slaves[slavePosition];
+
+    const OSCARMAX_ECAT_SmDiagRtEntry local =
+        slave.SyncManagers[smIndex];
+
+    const uint32_t presentMaskBit =
+        (slave.SyncManagerPresentMask >> smIndex) & 0x01u;
+
+    const uint32_t validMaskBit =
+        (slave.SyncManagerValidMask >> smIndex) & 0x01u;
+
+    MemoryBarrier();
+
+    const LONG sequenceEnd = g_ecatEscDiagRtShadow.Sequence;
+
+    if (sequenceBegin != sequenceEnd ||
+        (sequenceEnd & 1L) != 0L)
+    {
+        return false;
+    }
+
+    *present = presentMaskBit != 0u ? 1u : 0u;
+    *valid = (validMaskBit != 0u && local.Valid != 0u) ? 1u : 0u;
+    *registerAddress = local.RegisterAddress;
+    *startAddress = local.StartAddress;
+    *length = local.Length;
+    *controlByte = local.ControlByte;
+    *statusByte = local.StatusByte;
+    *activateByte = local.ActivateByte;
+    *pdiControlByte = local.PdiControlByte;
+    *lastTransportResult = local.LastTransportResult;
+    *lastUpdateTick = local.LastUpdateTick;
+    *probeSuccess = local.ProbeSuccess;
+    *probeFailure = local.ProbeFailure;
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 12E.5A - Priority-50 reader seam for one live FMMU register.
+//
+// fmmuIndex is the physical ESC FMMU number (0..15).  This accessor is
+// lock-free and wait-free and follows the same RT shadow seqlock as AL/DL/SM.
+// ---------------------------------------------------------------------------
+extern "C" __declspec(dllexport) bool OSCARMAX_ECAT_FmmuDiagRt_Read(
+    uint16_t slavePosition,
+    uint8_t fmmuIndex,
+    uint32_t * present,
+    uint32_t * valid,
+    uint16_t * registerAddress,
+    uint32_t * logicalStartAddress,
+    uint16_t * logicalLength,
+    uint8_t * logicalStartBit,
+    uint8_t * logicalEndBit,
+    uint16_t * physicalStartAddress,
+    uint8_t * physicalStartBit,
+    uint8_t * type,
+    uint8_t * activate,
+    int32_t * lastTransportResult,
+    uint64_t * lastUpdateTick,
+    uint64_t * probeSuccess,
+    uint64_t * probeFailure)
+{
+    if (present == nullptr ||
+        valid == nullptr ||
+        registerAddress == nullptr ||
+        logicalStartAddress == nullptr ||
+        logicalLength == nullptr ||
+        logicalStartBit == nullptr ||
+        logicalEndBit == nullptr ||
+        physicalStartAddress == nullptr ||
+        physicalStartBit == nullptr ||
+        type == nullptr ||
+        activate == nullptr ||
+        lastTransportResult == nullptr ||
+        lastUpdateTick == nullptr ||
+        probeSuccess == nullptr ||
+        probeFailure == nullptr ||
+        slavePosition >= OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES ||
+        fmmuIndex >= OSCARMAX_ECAT_ESC_DIAG_MAX_FMMUS)
+    {
+        return false;
+    }
+
+    const LONG sequenceBegin =
+        g_ecatEscDiagRtShadow.Sequence;
+
+    if ((sequenceBegin & 1L) != 0L)
+    {
+        return false;
+    }
+
+    MemoryBarrier();
+
+    if (static_cast<uint32_t>(slavePosition) >=
+        g_ecatEscDiagRtShadow.SlaveCount)
+    {
+        return false;
+    }
+
+    const OSCARMAX_ECAT_EscDiagRtSlaveShadow& slave =
+        g_ecatEscDiagRtShadow.Slaves[slavePosition];
+
+    const OSCARMAX_ECAT_FmmuDiagRtEntry local =
+        slave.Fmmus[fmmuIndex];
+
+    const uint32_t presentMaskBit =
+        (slave.FmmuPresentMask >> fmmuIndex) & 0x01u;
+
+    const uint32_t validMaskBit =
+        (slave.FmmuValidMask >> fmmuIndex) & 0x01u;
+
+    MemoryBarrier();
+
+    const LONG sequenceEnd =
+        g_ecatEscDiagRtShadow.Sequence;
+
+    if (sequenceBegin != sequenceEnd ||
+        (sequenceEnd & 1L) != 0L)
+    {
+        return false;
+    }
+
+    *present =
+        presentMaskBit != 0u ? 1u : 0u;
+
+    *valid =
+        (validMaskBit != 0u &&
+            local.Valid != 0u)
+        ? 1u
+        : 0u;
+
+    *registerAddress = local.RegisterAddress;
+    *logicalStartAddress = local.LogicalStartAddress;
+    *logicalLength = local.LogicalLength;
+    *logicalStartBit = local.LogicalStartBit;
+    *logicalEndBit = local.LogicalEndBit;
+    *physicalStartAddress = local.PhysicalStartAddress;
+    *physicalStartBit = local.PhysicalStartBit;
+    *type = local.Type;
+    *activate = local.Activate;
+    *lastTransportResult = local.LastTransportResult;
+    *lastUpdateTick = local.LastUpdateTick;
+    *probeSuccess = local.ProbeSuccess;
+    *probeFailure = local.ProbeFailure;
+
+    return true;
+}
+
 // =============================================================
 // 啟動 Drift 設定與校正快照
 //
@@ -362,11 +3398,16 @@ extern volatile LONG g_ecatRxDiagCurrentConsecutiveTimeout;
 // Real FF 狀態：0=WAIT、1=ARM、2=ACTIVE、3=HOLD、4=TRIP/FALLBACK。
 //   - ACTIVE 時把合格的 Frequency FF V2 建議值，限幅與限速後套入 QPC period。
 //   - TripMask 0x01 表示相位觀測器進入 FALLBACK；0x02 表示連續 RX timeout。
-//   - 一旦進入 state 4，本次執行期間維持已鎖定的啟動 Baseline。
+//   - 0x01 是可恢復的 soft observer trip：V2 回到穩定 TRACK 後可重新 ARM。
+//   - 0x02/0x04/0x08/0x10 為 hard safety trip，本次執行期間維持 Baseline。
 //
 // Phase-P 狀態：0=WAIT、1=ARM、2=ACTIVE、3=HOLD、4=TRIP。
 //   - 只有 Real FF ACTIVE、phase gate 合格、TripMask=0 時才修正 offset。
+//   - soft observer trip 恢復後 Phase-P 重新由 WAIT/ARM 進入，不直接 ACTIVE。
 //   - ActualErr/Offset/Step 都是 ns；offset 會真正加到 One-Shot final target。
+//
+// Stage 11F.2A-R1 fingerprint:
+//   OSCARMAX_DC_SOFT_OBSERVER_REARM_11F2A_R1_20260827
 // ============================================================================
 volatile LONG g_qpcRealFfV0Seq = 0;
 volatile LONG g_qpcRealFfV0State = 0;
@@ -1927,6 +4968,11 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     static uint32_t realFfV0HoldGood = 0;
     static uint32_t realFfV0HoldBad = 0;
     static uint32_t realFfV0HoldEntries = 0;
+
+    // Stage 11F.2A-R1:
+    // Only TripMask == 0x01 may accumulate this recovery counter.
+    static uint32_t realFfV0SoftRearmGood = 0;
+
     static bool realFfV0ClampActive = false;
     static bool realFfClampSelfTestDone = false;
 
@@ -2361,6 +5407,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         realFfV0TripMask = 0;
         realFfV0HoldGood = 0;
         realFfV0HoldBad = 0;
+        realFfV0SoftRearmGood = 0;
 
         phasePActV0State = 0;
         phasePActV0ArmGood = 0;
@@ -2470,6 +5517,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     const uint32_t REAL_FF_V0_ARM_WINDOWS = 3U;   // 連續合格 3 窗才進入 ACTIVE。
     const uint32_t REAL_FF_V0_HOLD_RECOVERY_WINDOWS = 3U; // HOLD 連續合格 3 窗才恢復。
     const uint32_t REAL_FF_V0_HOLD_BAD_LIMIT = 5U; // HOLD 連續失敗 5 窗即 LATCHED。
+
+    // V2 自己從 FALLBACK 回 TRACK 後，再額外要求 5 個完整合格窗，
+    // 才允許 Real FF 的 soft observer trip (0x01 only) 重新進 ARM。
+    const uint32_t REAL_FF_V0_SOFT_REARM_WINDOWS = 5U;
 
     const int64_t PHASE_P_ACT_CYCLE_NS =
         EtherCatDcTuning::PdoCycleNs;
@@ -2667,6 +5718,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             realFfV0LastStepPpb = 0;
             realFfV0TripMask |= 0x02;
             realFfV0TripCount++;
+            realFfV0SoftRearmGood = 0;
         }
 
         if (realPhaseSnapshot &&
@@ -2678,7 +5730,53 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
             if (realFfV0State == 4)
             {
+                // Always stay on the startup baseline while latched.
                 realFfV0AppliedPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                realFfV0LastStepPpb = 0;
+
+                // Stage 11F.2A-R1:
+                // Recover ONLY an observer-only trip. Any hard-safety bit
+                // keeps state 4 latched until the RTOS process restarts.
+                bool softObserverTripOnly =
+                    realFfV0TripMask == 0x01;
+
+                bool softObserverRecoveryGood =
+                    softObserverTripOnly &&
+                    realPhaseGood &&
+                    realPhaseState == 1 &&
+                    driftCalibrationLocked &&
+                    realFfV0OneShotHealthy &&
+                    qpcSchedulerInitialized &&
+                    g_ecatRxDiagCurrentConsecutiveTimeout == 0;
+
+                if (softObserverRecoveryGood)
+                {
+                    realFfV0SoftRearmGood++;
+
+                    if (realFfV0SoftRearmGood >=
+                        REAL_FF_V0_SOFT_REARM_WINDOWS)
+                    {
+                        // Never jump from TRIP directly to ACTIVE.
+                        // Clear only the recoverable observer bit and
+                        // re-enter normal ARM qualification from Baseline.
+                        realFfV0TripMask &= ~0x01;
+                        realFfV0State = 1;
+                        realFfV0ArmGood = 0;
+                        realFfV0HoldGood = 0;
+                        realFfV0HoldBad = 0;
+                        realFfV0SoftRearmGood = 0;
+                        realFfV0DesiredPpb =
+                            QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                        realFfV0AppliedPpb =
+                            QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                        realFfV0LastStepPpb = 0;
+                    }
+                }
+                else
+                {
+                    realFfV0SoftRearmGood = 0;
+                }
             }
             else if (realFfV0State == 0 || realFfV0State == 1)
             {
@@ -2714,6 +5812,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                         realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
                         realFfV0TripMask |= 0x01;
                         realFfV0TripCount++;
+                        realFfV0SoftRearmGood = 0;
                     }
                     else
                     {
@@ -2770,6 +5869,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                         realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
                         realFfV0TripMask |= 0x01;
                         realFfV0TripCount++;
+                        realFfV0SoftRearmGood = 0;
                     }
                 }
             }
@@ -4826,6 +7926,22 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                         phasePActV0HoldGood = 0;
                     }
                 }
+                else if (phasePActV0State == 4)
+                {
+                    // Parent hard trips never leave Real FF state 4.
+                    // This release is reachable only after an observer-only
+                    // soft trip passed the conservative re-arm gate.
+                    //
+                    // Preserve phasePActV0OffsetNs to avoid a phase jump.
+                    if (realFfV0State != 4 &&
+                        realFfV0TripMask == 0)
+                    {
+                        phasePActV0State = 0;
+                        phasePActV0ArmGood = 0;
+                        phasePActV0HoldGood = 0;
+                        phasePActV0LastStepNs = 0;
+                    }
+                }
 
                 int64_t pRawCorrectionNs = 0;
                 int64_t pCommandNs = 0;
@@ -6254,6 +9370,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             realFfV0LastStepPpb = 0;
             realFfV0TripMask |= mask;
             realFfV0TripCount++;
+            realFfV0SoftRearmGood = 0;
         }
 
         realFfV0OneShotHealthy = realFfCycleSafe;
@@ -12217,6 +15334,22 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
                             // =========================================================
+                            // Stage 12B.1B - Owner-safe RT Process Image snapshot
+                            //
+                            // This is the only place where Online Diagnosis copies the
+                            // live m_IoMap. It executes in the PDO owner thread and only
+                            // once per 40 cycles (10 ms at 250 us). No Shared Memory,
+                            // formatting or UI work is performed here.
+                            // =========================================================
+
+                            CaptureEtherCatDiagRtShadow(
+                                pMaster,
+                                wkc,
+                                dcWkc,
+                                pdoCycleValid);
+
+
+                            // =========================================================
                             // PLC INPUT：EtherCAT IO Map -> Shadow Input
                             //
                             // 只有 pdoCycleValid 才更新 shadow input，避免應用層讀到
@@ -12422,110 +15555,152 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                     4ULL);
 
 
-                            if (pdoCycleValid &&
-                                subTick == 2)
+                            // =========================================================
+                            // Stage 11G.6 - State Transition Command Decoupling
+                            //
+                            // CMD_SET_STATE 必須能在 PDO WKC 尚未完整有效時執行。
+                            // 典型情境是 SAFE-OP -> OP：部分從站的 Output SM 在
+                            // OP 前可能尚未貢獻完整 LRW WKC。若把進 OP 指令本身
+                            // 綁在 pdoCycleValid，會形成死結：
+                            //
+                            //   PDO WKC 未完整 -> 不送 OP -> 永遠無法進 OP
+                            //
+                            // 安全策略：
+                            // - CMD_SET_STATE：允許在 pdoCycleValid == false 時執行。
+                            // - 其他 Async Command（例如 SDO）：仍要求 PDO cycle valid。
+                            // - 仍只在 subTick == 2 處理，維持既有 NIC 單一執行路徑。
+                            // =========================================================
+
+                            const bool asyncCmdPending =
+                                pMaster->m_asyncCmd.status ==
+                                (int)EcatCmdStatus::ECAT_STATUS_PENDING;
+
+                            const bool stateTransitionPending =
+                                asyncCmdPending &&
+                                pMaster->m_asyncCmd.type ==
+                                (int)EcatCmdType::CMD_SET_STATE;
+
+                            const bool asyncCmdAllowed =
+                                pdoCycleValid ||
+                                stateTransitionPending;
+
+                            if (subTick == 2 &&
+                                asyncCmdPending &&
+                                asyncCmdAllowed)
                             {
-                                if (pMaster->
-                                    m_asyncCmd.status ==
-                                    (int)
-                                    EcatCmdStatus::
-                                    ECAT_STATUS_PENDING)
+                                int cmdWKC = 0;
+                                bool commandTerminal = true;
+                                bool commandError = false;
+
+                                if (!pdoCycleValid &&
+                                    stateTransitionPending)
                                 {
-                                    int cmdWKC =
-                                        0;
+                                    RtPrintf(
+                                        "[ASYNC-STATE-TRANSITION] "
+                                        "Policy:ALLOW_WITHOUT_FULL_PDO_WKC | "
+                                        "RequestedState:0x%04X | "
+                                        "LRW:%d/%d | DCWKC:%d | "
+                                        "PDOValid:NO\n",
+                                        (unsigned int)
+                                        ((uint16_t)pMaster->m_asyncCmd.dataValue),
+                                        wkc,
+                                        pMaster->EXPECTED_WKC_PDO,
+                                        dcWkc);
+                                }
 
+                                switch (pMaster->m_asyncCmd.type)
+                                {
+                                case (int)EcatCmdType::CMD_SET_STATE:
+                                {
+                                    state =
+                                        (uint16_t)pMaster->m_asyncCmd.dataValue;
 
-                                    switch (
-                                        pMaster->
-                                        m_asyncCmd.type)
+                                    cmdWKC =
+                                        pMaster->ecx_BWR(
+                                            0x0000,
+                                            0x0120,
+                                            2,
+                                            &state,
+                                            20);
+
+                                    break;
+                                }
+
+                                // =================================================
+                                // Stage 12F.3E.1 - Runtime-Safe Online SDO
+                                //
+                                // IMPORTANT:
+                                //     Do NOT call ecx_SDOread/ecx_SDOwrite here.
+                                //     Those legacy helpers are intentionally blocking
+                                //     and remain startup/configuration-only.
+                                //
+                                // The state machine executes at most one bounded
+                                // FPWR/FPRD step on this 1 ms async slot, then returns
+                                // immediately to the 250 us cyclic runtime.
+                                // =================================================
+                                case (int)EcatCmdType::CMD_SDO_READ:
+                                case (int)EcatCmdType::CMD_SDO_WRITE:
+                                {
+                                    int terminalSdoWkc = 0;
+
+                                    const RuntimeSafeSdoStepDisposition disposition =
+                                        ProcessRuntimeSafeSdoStep(
+                                            pMaster,
+                                            pdoCycleStartMasterNs,
+                                            pdoCycleValid,
+                                            &terminalSdoWkc);
+
+                                    if (disposition ==
+                                        RuntimeSafeSdoStepDisposition::InProgress)
                                     {
-                                        case (int)
-                                            EcatCmdType::
-                                        CMD_SET_STATE:
-                                        {
-                                            state =
-                                                (uint16_t)
-                                                pMaster->
-                                                m_asyncCmd.
-                                                dataValue;
-
-
-                                            cmdWKC =
-                                                pMaster->ecx_BWR(
-                                                    0x0000,
-                                                    0x0120,
-                                                    2,
-                                                    &state,
-                                                    20);
-
-
-                                            // DEBUG_PRINT("COMCOM\n");
-
-
-                                            break;
-                                        }
-
-
-                                        case (int)
-                                            EcatCmdType::
-                                        CMD_SDO_WRITE:
-                                        {
-                                            cmdWKC =
-                                                pMaster->
-                                                ecx_SDOwrite(
-                                                    pMaster->
-                                                    m_asyncCmd.
-                                                    slaveAddr,
-
-                                                    pMaster->
-                                                    m_asyncCmd.
-                                                    index,
-
-                                                    pMaster->
-                                                    m_asyncCmd.
-                                                    subIndex,
-
-                                                    FALSE,
-
-                                                    pMaster->
-                                                    m_asyncCmd.
-                                                    dataSize,
-
-                                                    &pMaster->
-                                                    m_asyncCmd.
-                                                    dataValue,
-
-                                                    200);
-
-
-                                            break;
-                                        }
-
-
-                                        default:
-                                        {
-                                            cmdWKC =
-                                                0;
-
-
-                                            break;
-                                        }
+                                        commandTerminal = false;
+                                    }
+                                    else if (disposition ==
+                                        RuntimeSafeSdoStepDisposition::Done)
+                                    {
+                                        cmdWKC = terminalSdoWkc;
+                                    }
+                                    else
+                                    {
+                                        cmdWKC = 0;
+                                        commandError = true;
                                     }
 
+                                    break;
+                                }
 
-                                    pMaster->
-                                        m_asyncCmd.resultWKC =
-                                        cmdWKC;
+                                default:
+                                {
+                                    cmdWKC = 0;
+                                    commandError = true;
+                                    break;
+                                }
+                                }
 
+                                if (commandTerminal)
+                                {
+                                    pMaster->m_asyncCmd.resultWKC = cmdWKC;
 
-                                    pMaster->
-                                        m_asyncCmd.status =
-                                        (int)
-                                        EcatCmdStatus::
-                                        ECAT_STATUS_DONE;
+                                    MemoryBarrier();
+
+                                    pMaster->m_asyncCmd.status =
+                                        commandError
+                                        ? (int)EcatCmdStatus::ECAT_STATUS_ERROR
+                                        : (int)EcatCmdStatus::ECAT_STATUS_DONE;
                                 }
                             }
 
+
+                            // =========================================================
+                            // Stage 12E.3A - owner-safe ESC live diagnostic probe
+                            //
+                            // One bounded FPRD at most every 20 ms, only on subTick 0.
+                            // SDO/state commands keep priority and run on subTick 2.
+                            // =========================================================
+                            ProcessRuntimeEscDiagProbe(
+                                pMaster,
+                                pdoCycleStartMasterNs,
+                                pdoCycleValid);
 
                             // =========================================================
                             // PDO 通訊結果分類：wkc<0 算 timeout；frame 有回覆但 PDO/DC

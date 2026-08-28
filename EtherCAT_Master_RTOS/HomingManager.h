@@ -1,6 +1,8 @@
 #pragma once
 
 #include "HomeTypes.h"
+#include "MotionExecutionContract.h"
+#include "MotionAxisCommandMailbox.h"
 #include <cstdint>
 
 class MotionCore;
@@ -269,6 +271,24 @@ public:
 
 private:
     // ========================================================
+    // Stage NC-0.1F - HOME ownership and RT command mailbox
+    // ========================================================
+    bool AcquireHomeMotionOwner() noexcept;
+    void RestoreOrReleaseHomeMotionOwner() noexcept;
+    MotionOwnerLease GetProbeCommandLease() const noexcept;
+
+    bool QueueHomeStop(int axisIndex, double decelerationTime) noexcept;
+    bool QueueHomeVelocity(
+        int axisIndex, double velocity, double accelerationTime) noexcept;
+    bool QueueHomeMove(
+        int axisIndex, double targetPosition, double targetVelocity,
+        double accelerationTime, double decelerationTime,
+        bool useShortestPath) noexcept;
+    bool QueueHomeProbeFunction(
+        int axisIndex, uint16_t value,
+        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+
+    // ========================================================
     // Basic Validation
     // ========================================================
 
@@ -351,7 +371,9 @@ private:
     bool ProcessDriveProbeArm(int axisIndex, AxisContext& axis, double cycleTimeSec);
     bool TryCaptureDriveProbe(int axisIndex, AxisContext& axis, bool& detected, double& capturedPulse);
     bool IsDriveProbeSourceStatusValid(const AxisContext& axis, uint16_t status) const;
-    void DisarmDriveProbe(int axisIndex, AxisContext& axis);
+    bool DisarmDriveProbe(
+        int axisIndex, AxisContext& axis,
+        bool trackForOwnerRelease = false);
     void ResetDriveProbeRuntime(AxisContext& axis);
 
     double GetPulsePerUnit(const AxisContext& axis) const;
@@ -405,6 +427,15 @@ private:
     PLCManager* m_plc =
         nullptr;
 
+
+    // Stage NC-0.1F ownership snapshot.  G81 may transfer AUTO / MDI /
+    // MANUAL_AUTO to HOME and restore a new generation when HOME finishes.
+    MotionOwnerLease m_homeMotionLease{};
+    MotionOwner m_returnMotionOwner = MotionOwner::NONE;
+    MotionAxisCommandSequence
+        m_pendingApplyHomeSequence[HOME_AXIS_COUNT]{};
+    MotionAxisCommandSequence
+        m_pendingProbeDisarmSequence[HOME_AXIS_COUNT]{};
 
     // ========================================================
     // Request State

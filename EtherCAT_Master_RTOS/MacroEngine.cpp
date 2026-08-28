@@ -11,7 +11,7 @@ MacroEngine::MacroEngine()
     InitializeSystemDefaults();//初始化系統 $變數
 
 
-   
+
 }
 
 void MacroEngine::InitializeSystemDefaults()//初始化系統 $變數
@@ -37,8 +37,8 @@ void MacroEngine::Reset()
     m_localStack.push_back(std::vector<double>(MAX_LOCAL_VARS + 1, MACRO_NULL));
     m_callDepth = 0;
 
-    // 備註：全域變數 (#501以上) 與系統變數 ($) 
-    // 在工業控制器中，按下 Reset 是「不會」被清空的，所以這裡不清 m_globalVars！
+    // 備註：全域變數 (@1~@1000) 與系統變數 ($1~$1000)
+    // 按下 NC Reset 時不清除；# 只保留 #1~#100 的 Local 語意。
 }
 
 // 進入下一層巨集 (G65 / M98)
@@ -71,53 +71,48 @@ bool MacroEngine::PopCallStack()
 // 讀取變數
 double MacroEngine::GetVar(char prefix, int index)
 {
-    if (prefix == '#')
+    if (!MacroVariableRules::IsValidIndex(prefix, index))
     {
-        if (index >= 1 && index <= MAX_LOCAL_VARS) {
-            return m_localStack[m_callDepth][index];
-        }
-        // 🌟 修正：將 #101 ~ #600 映射到 m_globalVars[1 ~ 500]
-        else if (index >= 101 && index <= 100 + MAX_GLOBAL_VARS) {
-            return m_globalVars[index - 100];
-        }
-    }
-    else if (prefix == '@')
-    {
-        if (index >= 1 && index <= MAX_GLOBAL_VARS) return m_globalVars[index];
-    }
-    else if (prefix == '$')
-    {
-        if (index >= 1 && index <= MAX_SYS_VARS) return m_sysVars[index];
+        return MACRO_NULL;
     }
 
-    // 🌟 修正：越界或無效變數，應該統一回傳 MACRO_NULL，交給 Parser 決定當 0 算還是報錯
+    if (prefix == '#')
+    {
+        return m_localStack[m_callDepth][index];
+    }
+    if (prefix == '@')
+    {
+        return m_globalVars[index];
+    }
+    if (prefix == '$')
+    {
+        return m_sysVars[index];
+    }
+
     return MACRO_NULL;
 }
 
 // 寫入變數
 void MacroEngine::SetVar(char prefix, int index, double value)
 {
-    // 🌟 # 前綴：嚴格限制為本地變數 (不允許存取 @ 的區域)
+    if (!MacroVariableRules::IsValidIndex(prefix, index))
+    {
+        return;
+    }
+
     if (prefix == '#')
     {
-        if (index >= 1 && index <= 100) {
-            m_localStack[m_callDepth][index] = value;
-        }
-        // [已移除] 原本對應 globalVars 的判斷
+        m_localStack[m_callDepth][index] = value;
+        return;
     }
-    // 🌟 @ 前綴：嚴格限制為全域變數 (@1 ~ @1000)
-    else if (prefix == '@')
+    if (prefix == '@')
     {
-        if (index >= 1 && index <= 1000) {
-            m_globalVars[index] = value;
-        }
+        m_globalVars[index] = value;
+        return;
     }
-    // 🌟 $ 前綴：系統變數 ($1 ~ $1000)
-    else if (prefix == '$')
+    if (prefix == '$')
     {
-        if (index >= 1 && index <= 1000) {
-            m_sysVars[index] = value;
-        }
+        m_sysVars[index] = value;
     }
 }
 

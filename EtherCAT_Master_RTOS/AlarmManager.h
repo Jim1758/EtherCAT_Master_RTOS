@@ -35,11 +35,13 @@ public:
         MACRO_OVERFLOW = NC_BASE + 4,   // 2004:超過最大層數
         Macro_File_Not_Found = NC_BASE + 5,   // 2005:Macro找不到 檔案
         Unable_to_recognize_G_code = NC_BASE + 6,   // 2006:無法辨識G碼
-        G_code_Count_Error = NC_BASE + 7,   // 2007:單行G碼超過1個
+        G_code_Count_Error = NC_BASE + 7,   // 2007:同一 Modal Group 衝突或單節含多個 Primary Action
         M_code_Count_Error = NC_BASE + 8,   // 2008:單行M碼超過1個
         G_Code_Invalid_parameter = NC_BASE + 9,   // 2009:不正確G碼參數
         axis_is_not_enabledr = NC_BASE + 10,   // 2010:下達不存在的軸指令
         axis_is_not_Homed = NC_BASE + 11,   // 2011:軸尚未尋原點
+        PROGRAM_END_GATE_ERROR = NC_BASE + 12, // 2012:程式結束完整性閘門失敗
+        MACRO_VARIABLE_INDEX_OUT_OF_RANGE = NC_BASE + 13, // 2013:Macro變數索引超出允許範圍
     };
 
     // 🌟 4. 運動軸控警報 (3000 ~ 3999)
@@ -73,7 +75,11 @@ public:
         HOME_REFERENCE_INVALID = AXIS_BASE + 15,    // 3015: INDEX / Absolute Reference 資料無效
         HOME_OPPOSITE_LIMIT = AXIS_BASE + 16,       // 3016: HOME 過程觸發相反方向硬體極限
         HOME_BOTH_LIMITS = AXIS_BASE + 17,          // 3017: 正負硬體極限同時觸發
-        HOME_MOTION_FAULT = AXIS_BASE + 18          // 3018: HOME 過程發生 Servo / Motion Fault
+        HOME_MOTION_FAULT = AXIS_BASE + 18,         // 3018: HOME 過程發生 Servo / Motion Fault
+
+        // Stage NC-0.1C：固定容量 Motion Command Transport
+        MOTION_COMMAND_QUEUE_FULL = AXIS_BASE + 19, // 3019: NC -> Motion SPSC Ingress 已滿
+        MOTION_REPLAY_QUEUE_FULL = AXIS_BASE + 20   // 3020: B2 RT Replay 固定緩衝區已滿
 
     };
 

@@ -75,9 +75,9 @@ void RTAPI GlobalTimerHandler_PLC(void* nContext)
     //¶]°¨¿O´ú¸Õ----------------------------------------
 
 
-    if (pMaster->tickCount_PLC % 50 == 0)
+    if (pMaster->tickCount_PLC % 30 == 0)//50
     {
-        pMaster->m_Plc.Update_Debug();
+       // pMaster->m_Plc.Update_Debug();
     }
 }
 

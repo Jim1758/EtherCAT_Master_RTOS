@@ -16,11 +16,82 @@ NCPLCManager::NCPLCManager(NCManager& nc, MotionCore& motion, PLCManager& plc)
     m_lastMPGCount = static_cast<int32_t>(m_plc.GetMemory("DR", NCPLC::DR::MPG_ENCODER_COUNT)); // MPG DR200 baseline. Avoid a startup jump if DR200 is already non-zero.
 }
 
+// ============================================================================
+// Stage NC-0.1F - Manual Motion Owner / Axis Command Mailbox Helpers
+// ============================================================================
+MotionCommandSource NCPLCManager::GetManualCommandSource() const noexcept
+{
+    return ResolveMotionCommandSourceForOwner(m_manualMotionLease.owner);
+}
+
+bool NCPLCManager::QueueManualStop(
+    int axisIndex, double decelerationTime) noexcept
+{
+    return m_motion.SubmitAxisStopMove(
+        axisIndex, decelerationTime, GetManualCommandSource(),
+        m_manualMotionLease);
+}
+
+bool NCPLCManager::QueueManualVelocity(
+    int axisIndex, double velocity, double accelerationTime) noexcept
+{
+    return m_motion.SubmitAxisVelocityMove(
+        axisIndex, velocity, accelerationTime, GetManualCommandSource(),
+        m_manualMotionLease);
+}
+
+bool NCPLCManager::QueueManualMPG(
+    int axisIndex, double targetPosition, double maximumVelocity,
+    double accelerationTime, double decelerationTime) noexcept
+{
+    return m_motion.SubmitAxisMPGMove(
+        axisIndex, targetPosition, maximumVelocity, accelerationTime,
+        decelerationTime, GetManualCommandSource(), m_manualMotionLease);
+}
+
+bool NCPLCManager::QueueManualMove(
+    int axisIndex, double targetPosition, double targetVelocity,
+    double accelerationTime, double decelerationTime,
+    bool useShortestPath) noexcept
+{
+    return m_motion.SubmitAxisMoveToPosition(
+        axisIndex, targetPosition, targetVelocity, accelerationTime,
+        decelerationTime, useShortestPath, GetManualCommandSource(),
+        m_manualMotionLease);
+}
+
+bool NCPLCManager::HasActiveManualAxis() const noexcept
+{
+    for (int i = 0; i < NCPLC::AXIS_COUNT; ++i)
+    {
+        if (m_jogActive[i]) return true;
+    }
+    return false;
+}
+
+void NCPLCManager::ReleaseManualMotionOwnerIfStopped() noexcept
+{
+    if (m_manualMoveMode != ManualMoveMode::NONE ||
+        HasActiveManualAxis())
+    {
+        return;
+    }
+
+    if (m_manualMotionLease.IsValid())
+    {
+        m_motion.ReleaseMotionOwner(m_manualMotionLease);
+    }
+    m_manualMotionLease = MotionOwnerLease{};
+}
+
 // =========================================================
 // Main Cyclic Process
 // =========================================================
 void NCPLCManager::Process()
 {
+    // Single control-side consumer for RT mailbox results.
+    m_motion.ProcessAxisCommandResults();
+
     ProcessSafetyInputs(); // 1. Safety First
 
     // =====================================================
@@ -187,7 +258,7 @@ void NCPLCManager::ProcessGlobalInputs()
                 const bool needsReset = axis.isFault || axis.isLagAlarm || axis.state == MotionState::MotionState_ERROR || axis.state == MotionState::MotionState_ESTOP;
                 if (!needsReset) continue;
 
-                m_motion.ResetFault(axis);
+                m_motion.RequestAxisFaultReset(i);
             }
         }
     }
@@ -220,7 +291,7 @@ void NCPLCManager::ProcessSafetyInputs()
     const bool emergencyStop = m_plc.Get_C(NCPLC::C::EMERGENCY_STOP); // C5 - Emergency Stop (Level Sensitive Stop, Alarm only Rising Edge)
     if (emergencyStop)
     {
-        m_motion.EmergencyStopAllAxes(); // 每 Scan 維持全軸停止
+        m_motion.RequestEmergencyStopAllAxes(); // 每 Scan 維持全軸停止
         m_nc.ChangeState(NCState::ALARM);
 
         if (!m_prevEmergencyStop) // Alarm 只建立一次
@@ -249,7 +320,7 @@ void NCPLCManager::ProcessSafetyInputs()
 
     if (axisProtectionActive) // C140~147 持續 ON，就持續維持全機 Emergency Stop。
     {
-        m_motion.EmergencyStopAllAxes();
+        m_motion.RequestEmergencyStopAllAxes();
         m_nc.ChangeState(NCState::ALARM);
     }
 
@@ -382,7 +453,7 @@ void NCPLCManager::ProcessSafetyInputs()
 
     if (hardLimitTriggered) // 本 Scan 有新的 Hard Limit
     {
-        m_motion.EmergencyStopAllAxes();
+        m_motion.RequestEmergencyStopAllAxes();
         m_nc.ChangeState(NCState::ALARM);
     }
 }
@@ -430,6 +501,39 @@ void NCPLCManager::ProcessManualInputs()
     }
 
 
+
+    MotionOwner requestedManualOwner = MotionOwner::NONE;
+    if (m_manualMoveMode == ManualMoveMode::MPG)
+    {
+        requestedManualOwner = MotionOwner::MPG;
+    }
+    else if (m_manualMoveMode != ManualMoveMode::NONE)
+    {
+        requestedManualOwner = MotionOwner::JOG;
+    }
+
+    if (m_manualMotionLease.IsValid() &&
+        !m_motion.IsMotionOwnerLeaseCurrent(m_manualMotionLease))
+    {
+        m_manualMotionLease = MotionOwnerLease{};
+    }
+
+    // JOG <-> MPG is a real ownership transfer. Stop the old mode first;
+    // release occurs only after every owned axis reaches IDLE.
+    if (m_manualMotionLease.IsValid() &&
+        m_manualMotionLease.owner != requestedManualOwner)
+    {
+        m_manualMoveMode = ManualMoveMode::NONE;
+    }
+    else if (requestedManualOwner != MotionOwner::NONE &&
+        !m_manualMotionLease.IsValid())
+    {
+        if (!m_motion.TryAcquireMotionOwner(
+            requestedManualOwner, m_manualMotionLease))
+        {
+            m_manualMoveMode = ManualMoveMode::NONE;
+        }
+    }
 
     int jogSpeedPercent = static_cast<int>(m_plc.GetMemory("R", NCPLC::R::JOG_SPEED_PERCENT)); // R200 Continuous JOG Speed % (0 ~ 100)
     if (jogSpeedPercent < 0) jogSpeedPercent = 0;
@@ -793,9 +897,9 @@ void NCPLCManager::ProcessManualInputs()
         {
             if (m_jogActive[i])
             {
-                if (axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
-                else if (axis.state == MotionState::MotionState_MOVING) m_motion.StopMove(axis, axis.INCH_dec_time);
-                else if (axis.state == MotionState::MotionState_MPG) m_motion.StopMove(axis, axis.JOG_dec_time);
+                if (axis.state == MotionState::MotionState_VELOCITY) QueueManualStop(i, axis.JOG_dec_time);
+                else if (axis.state == MotionState::MotionState_MOVING) QueueManualStop(i, axis.INCH_dec_time);
+                else if (axis.state == MotionState::MotionState_MPG) QueueManualStop(i, axis.JOG_dec_time);
             }
             continue;
         }
@@ -804,21 +908,21 @@ void NCPLCManager::ProcessManualInputs()
         const bool velocityJogModeActive = m_manualMoveMode == ManualMoveMode::CONTINUOUS_JOG || m_manualMoveMode == ManualMoveMode::FINE_JOG;
         if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY && !velocityJogModeActive)
         {
-            m_motion.StopMove(axis, axis.JOG_dec_time);
+            QueueManualStop(i, axis.JOG_dec_time);
             continue;
         }
 
         // INCH 還在 P2P，卻切離 INCH Mode：做 Controlled Stop。
         if (m_jogActive[i] && axis.state == MotionState::MotionState_MOVING && m_manualMoveMode != ManualMoveMode::INCH_JOG)
         {
-            m_motion.StopMove(axis, axis.INCH_dec_time);
+            QueueManualStop(i, axis.INCH_dec_time);
             continue;
         }
 
         // MPG Mode Change Stop
         if (m_jogActive[i] && axis.state == MotionState::MotionState_MPG && m_manualMoveMode != ManualMoveMode::MPG)
         {
-            m_motion.StopMove(axis, axis.JOG_dec_time);
+            QueueManualStop(i, axis.JOG_dec_time);
             continue;
         }
 
@@ -840,7 +944,7 @@ void NCPLCManager::ProcessManualInputs()
                 {
                     if (axis.state == MotionState::MotionState_MPG)
                     {
-                        m_motion.StopMove(axis, axis.JOG_dec_time);
+                        QueueManualStop(i, axis.JOG_dec_time);
                         m_jogActive[i] = true;
                     }
                     continue;
@@ -855,7 +959,7 @@ void NCPLCManager::ProcessManualInputs()
                         AxisContext& physicalAxis = m_motion.GetAxisContext(machineAxis);
                         if (physicalAxis.state == MotionState::MotionState_MPG)
                         {
-                            m_motion.StopMove(physicalAxis, physicalAxis.JOG_dec_time);
+                            QueueManualStop(machineAxis, physicalAxis.JOG_dec_time);
                             m_jogActive[machineAxis] = true;
                         }
                     }
@@ -1012,7 +1116,7 @@ void NCPLCManager::ProcessManualInputs()
                     {
                         if (physicalAxis.state == MotionState::MotionState_MPG)
                         {
-                            m_motion.StopMove(physicalAxis, physicalAxis.JOG_dec_time);
+                            QueueManualStop(machineAxis, physicalAxis.JOG_dec_time);
                             m_jogActive[machineAxis] = true;
                         }
                         continue;
@@ -1031,7 +1135,7 @@ void NCPLCManager::ProcessManualInputs()
                     if (physicalAxis.maxVel_PPS > 0.0 && physicalMPGMaxPPS > physicalAxis.maxVel_PPS) physicalMPGMaxPPS = physicalAxis.maxVel_PPS;
                     if (physicalMPGMaxPPS <= 0.0) continue;
 
-                    m_motion.MPGMove(physicalAxis, targetPosition, physicalMPGMaxPPS, groupAccTime, groupDecTime); // MPG Motion
+                    QueueManualMPG(machineAxis, targetPosition, physicalMPGMaxPPS, groupAccTime, groupDecTime); // MPG Motion
                     if (physicalAxis.state == MotionState::MotionState_MPG) m_jogActive[machineAxis] = true;
                 }
                 continue;
@@ -1042,7 +1146,7 @@ void NCPLCManager::ProcessManualInputs()
             {
                 if (axis.state == MotionState::MotionState_MPG)
                 {
-                    m_motion.StopMove(axis, axis.JOG_dec_time);
+                    QueueManualStop(i, axis.JOG_dec_time);
                     m_jogActive[i] = true;
                 }
                 continue;
@@ -1064,7 +1168,7 @@ void NCPLCManager::ProcessManualInputs()
             {
                 if (axis.state == MotionState::MotionState_MPG)
                 {
-                    m_motion.StopMove(axis, axis.JOG_dec_time);
+                    QueueManualStop(i, axis.JOG_dec_time);
                     m_jogActive[i] = true;
                 }
 
@@ -1080,7 +1184,7 @@ void NCPLCManager::ProcessManualInputs()
                 if (blockedByPhysicalLimit &&
                     axis.state == MotionState::MotionState_MPG)
                 {
-                    m_motion.StopMove(axis, axis.JOG_dec_time);
+                    QueueManualStop(i, axis.JOG_dec_time);
                     m_jogActive[i] = true;
                 }
 
@@ -1109,7 +1213,7 @@ void NCPLCManager::ProcessManualInputs()
                 continue;
             }
 
-            m_motion.MPGMove(axis, targetPosition, axis.MPG_MAX_PPS, axis.JOG_acc_time, axis.JOG_dec_time); // Original MPG MotionCore
+            QueueManualMPG(i, targetPosition, axis.MPG_MAX_PPS, axis.JOG_acc_time, axis.JOG_dec_time); // Original MPG MotionCore
             if (axis.state == MotionState::MotionState_MPG) m_jogActive[i] = true;
 
             continue;
@@ -1122,21 +1226,21 @@ void NCPLCManager::ProcessManualInputs()
         {
             if (!manualFrameXYZHasCommand || !manualFrameXYZValid || manualFrameXYZGroupStop) // No command / Invalid / Coordinated Stop
             {
-                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
+                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) QueueManualStop(i, axis.JOG_dec_time);
                 continue;
             }
 
             const double targetVelocity = manualFrameTargetVelocityPPS[i];
             if (std::abs(targetVelocity) <= 0.01) // This physical axis does not participate in the rotated vector.
             {
-                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
+                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) QueueManualStop(i, axis.JOG_dec_time);
                 continue;
             }
 
             if (axis.state == MotionState::MotionState_STOPPING) continue; // STOPPING must finish first.
             if (axis.state != MotionState::MotionState_IDLE && axis.state != MotionState::MotionState_VELOCITY) continue; // Do not steal P2P / Interpolation / MPG.
 
-            m_motion.VelocityMove(axis, targetVelocity, axis.JOG_acc_time); // Execute physical machine-axis velocity.
+            QueueManualVelocity(i, targetVelocity, axis.JOG_acc_time); // Execute physical machine-axis velocity.
             m_jogActive[i] = true;
             continue;
         }
@@ -1146,7 +1250,7 @@ void NCPLCManager::ProcessManualInputs()
         // =====================================================
         if (rawPositive && rawNegative)
         {
-            if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
+            if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) QueueManualStop(i, axis.JOG_dec_time);
             continue;
         }
 
@@ -1194,7 +1298,7 @@ void NCPLCManager::ProcessManualInputs()
         {
             if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY)
             {
-                m_motion.StopMove(axis, axis.JOG_dec_time);
+                QueueManualStop(i, axis.JOG_dec_time);
             }
 
             continue;
@@ -1210,7 +1314,7 @@ void NCPLCManager::ProcessManualInputs()
         {
             if (!allowPositive && !allowNegative) // 沒有方向
             {
-                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
+                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) QueueManualStop(i, axis.JOG_dec_time);
                 continue;
             }
 
@@ -1221,7 +1325,7 @@ void NCPLCManager::ProcessManualInputs()
 
             if (jogVelocity <= 0.0) // R200 = 0
             {
-                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
+                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) QueueManualStop(i, axis.JOG_dec_time);
                 continue;
             }
 
@@ -1237,12 +1341,12 @@ void NCPLCManager::ProcessManualInputs()
                 const bool reversing = (axis.currentCmdVel > 0.0 && targetVelocity < 0.0) || (axis.currentCmdVel < 0.0 && targetVelocity > 0.0);
                 if (reversing)
                 {
-                    m_motion.StopMove(axis, axis.JOG_dec_time);
+                    QueueManualStop(i, axis.JOG_dec_time);
                     continue;
                 }
             }
 
-            m_motion.VelocityMove(axis, targetVelocity, axis.JOG_acc_time); // Velocity Move
+            QueueManualVelocity(i, targetVelocity, axis.JOG_acc_time); // Velocity Move
             m_jogActive[i] = true;
             continue;
         }
@@ -1254,13 +1358,13 @@ void NCPLCManager::ProcessManualInputs()
         {
             if (!allowPositive && !allowNegative)
             {
-                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
+                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) QueueManualStop(i, axis.JOG_dec_time);
                 continue;
             }
 
             if (fineJogSpeedSelectCount != 1) // Fine Speed Selector 必須 One-Hot。
             {
-                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
+                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) QueueManualStop(i, axis.JOG_dec_time);
                 continue;
             }
 
@@ -1272,7 +1376,7 @@ void NCPLCManager::ProcessManualInputs()
 
             if (fineJogVelocity <= 0.0)
             {
-                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) m_motion.StopMove(axis, axis.JOG_dec_time);
+                if (m_jogActive[i] && axis.state == MotionState::MotionState_VELOCITY) QueueManualStop(i, axis.JOG_dec_time);
                 continue;
             }
 
@@ -1290,12 +1394,12 @@ void NCPLCManager::ProcessManualInputs()
                 const bool reversing = (axis.currentCmdVel > 0.0 && targetVelocity < 0.0) || (axis.currentCmdVel < 0.0 && targetVelocity > 0.0);
                 if (reversing)
                 {
-                    m_motion.StopMove(axis, axis.JOG_dec_time);
+                    QueueManualStop(i, axis.JOG_dec_time);
                     continue;
                 }
             }
 
-            m_motion.VelocityMove(axis, targetVelocity, axis.JOG_acc_time); // Fine JOG 與 Normal JOG 共用加減速。C200~C203 切換時可直接更新 targetVelocity。
+            QueueManualVelocity(i, targetVelocity, axis.JOG_acc_time); // Fine JOG 與 Normal JOG 共用加減速。C200~C203 切換時可直接更新 targetVelocity。
             m_jogActive[i] = true;
             continue;
         }
@@ -1446,7 +1550,7 @@ void NCPLCManager::ProcessManualInputs()
                     if (axisVelocity <= 0.0) continue;
                     if (physicalAxis.maxVel_PPS > 0.0 && axisVelocity > physicalAxis.maxVel_PPS) axisVelocity = physicalAxis.maxVel_PPS;
 
-                    m_motion.MoveToPosition(physicalAxis, targetPosition, axisVelocity, groupAccTime, groupDecTime); // XYZ 是 Linear Axis，不需要 Rotary Shortest Path 處理。
+                    QueueManualMove(machineAxis, targetPosition, axisVelocity, groupAccTime, groupDecTime, false); // XYZ 是 Linear Axis，不需要 Rotary Shortest Path 處理。
                     m_jogActive[machineAxis] = true;
                 }
 
@@ -1583,18 +1687,15 @@ void NCPLCManager::ProcessManualInputs()
             if (inchAccTime < 0.001) inchAccTime = 0.2;
             if (inchDecTime < 0.001) inchDecTime = inchAccTime;
 
-            const bool originalShortestPath = axis.useShortestPath; // Rotary Relative INCH
-            if (axis.axisType == AxisType::ROTARY)
-            {
-                axis.useShortestPath = false;
-            }
-
-            m_motion.MoveToPosition(axis, targetPosition, inchVelocity, inchAccTime, inchDecTime); // Execute Original Single Axis INCH
-            axis.useShortestPath = originalShortestPath;
+            QueueManualMove(
+                i, targetPosition, inchVelocity, inchAccTime, inchDecTime,
+                axis.axisType == AxisType::ROTARY ? false : axis.useShortestPath);
             m_jogActive[i] = true;
             continue;
         }
     }
+
+    ReleaseManualMotionOwnerIfStopped();
 }
 
 // =========================================================
@@ -1758,7 +1859,7 @@ void NCPLCManager::ProcessHomeInputs()
                     ? AlarmManager::HOME_MOTION_FAULT : AlarmManager::HOME_INVALID_CONFIG;
                 if (!AlarmManager::GetInstance().HasAlarm())
                     AlarmManager::GetInstance().Trigger(alarmCode, 0, m_nc.Homing.GetLastErrorAxis());
-                m_motion.EmergencyStopAllAxes();
+                m_motion.RequestEmergencyStopAllAxes();
                 m_nc.ChangeState(NCState::ALARM);
             }
         }
@@ -1780,7 +1881,7 @@ void NCPLCManager::ProcessHomeInputs()
                     ? AlarmManager::HOME_MOTION_FAULT : AlarmManager::HOME_INVALID_CONFIG;
                 if (!AlarmManager::GetInstance().HasAlarm())
                     AlarmManager::GetInstance().Trigger(alarmCode, 0, m_nc.Homing.GetLastErrorAxis());
-                m_motion.EmergencyStopAllAxes();
+                m_motion.RequestEmergencyStopAllAxes();
                 m_nc.ChangeState(NCState::ALARM);
             }
         }

@@ -6,17 +6,107 @@
 #include "MacroEngine.h"       // 必須要有
 #include "MacroParser.h"       // 必須要有
 #include "GCodeParser.h"       // 🌟 解決 Parser 找不到的關鍵！
+#include "NCProgramCache.h"    // Stage NC-0.2C：Parsed Program Cache
+#include "NCBlockLifecycleLedger.h" // Stage NC-0.2D：Block / Motion Lifecycle
+#include "NCBlockCompletionBoundary.h" // Stage NC-0.2F：Motion Completion Dual-Key Guard
+#include "NCProgramEndBoundary.h" // Stage NC-0.2G：Program End / Cycle End Gate
+#include "NCSingleBlockBoundary.h" // Stage NC-0.2I.1：Single Block Shadow Boundary
+#include "NCFeedHoldBoundary.h" // Stage NC-0.2I.2：Feed Hold Request/Ack Shadow
 
 #include <queue>
 #include <vector>
 #include <string>
-#include <map>                 // 🌟 補上 map，因為跳躍表 m_jumpTable 會用到
+#include <map>                 // Parsed Macro Cache 使用穩定節點位址
 #include <stack>               // 🌟 新增：為了支援副程式返回堆疊
+#include <cstdint>
+#include <type_traits>
 class NCManager;
 
 // 🌟 終極解法：定義一個「檢查條件」的函數指標。
 // 回傳 true 代表條件滿足 (等待結束)，false 代表繼續等
 using WaitConditionFunc = bool (*)(NCManager* nc);
+
+// =============================================================================
+// Stage NC-0.2H - G/M Same-Block Transaction Barrier
+//
+// A single NC block may contain one G action and one M action.  Their wait
+// callbacks must never overwrite each other.  The transaction waits for both
+// sub-actions, then applies the deferred control action (M00/M01/M98/M99/M02/
+// M30) only after the existing NC-0.2F Motion Completion Guard has released the
+// block.  Transaction bookkeeping is fixed-size; existing Macro file loading
+// remains on the non-servo 10 ms supervisory path.
+// =============================================================================
+enum class NCGMBlockPostAction : std::uint8_t
+{
+    NONE = 0,
+    PROGRAM_STOP_M00,
+    OPTIONAL_STOP_M01,
+    CALL_M98,
+    RETURN_M99,
+    PROGRAM_END_M02,
+    PROGRAM_END_M30
+};
+
+enum class NCGMBlockTransactionPhase : std::uint8_t
+{
+    IDLE = 0,
+    WAITING,
+    READY_TO_FINALIZE,
+    FINALIZED,
+    CANCELLED,
+    FAILED
+};
+
+struct NCGMBlockTransactionSnapshot
+{
+    std::uint64_t sequence = 0ULL;
+    NCBlockDispatchId dispatchId = NC_BLOCK_DISPATCH_ID_INVALID;
+    NCGMBlockTransactionPhase phase = NCGMBlockTransactionPhase::IDLE;
+    NCGMBlockPostAction postAction = NCGMBlockPostAction::NONE;
+
+    int sourcePC = -1;
+    int sourceLineNumber = 0;
+    int mCode = -1;
+    int pValue = 0;
+    int repeatCount = 1;
+
+    bool active = false;
+    bool gWaitRequired = false;
+    bool gWaitComplete = true;
+    bool mWaitRequired = false;
+    bool mWaitComplete = true;
+    bool fromMainProgram = false;
+    bool postActionApplied = false;
+};
+
+struct NCGMBlockTransactionCounters
+{
+    std::uint64_t started = 0ULL;
+    std::uint64_t gWaitComponents = 0ULL;
+    std::uint64_t mWaitComponents = 0ULL;
+    std::uint64_t dualComponentTransactions = 0ULL;
+    std::uint64_t evaluations = 0ULL;
+    std::uint64_t gWaitSamples = 0ULL;
+    std::uint64_t mWaitSamples = 0ULL;
+    std::uint64_t readyTransitions = 0ULL;
+    std::uint64_t finalized = 0ULL;
+    std::uint64_t cancelled = 0ULL;
+    std::uint64_t finalizeFailed = 0ULL;
+    std::uint64_t m00Stops = 0ULL;
+    std::uint64_t m01Stops = 0ULL;
+    std::uint64_t m98Calls = 0ULL;
+    std::uint64_t m99Returns = 0ULL;
+    std::uint64_t m02Ends = 0ULL;
+    std::uint64_t m30Ends = 0ULL;
+};
+
+static_assert(
+    std::is_trivially_copyable<NCGMBlockTransactionSnapshot>::value,
+    "NCGMBlockTransactionSnapshot must remain trivially copyable.");
+
+static_assert(
+    std::is_trivially_copyable<NCGMBlockTransactionCounters>::value,
+    "NCGMBlockTransactionCounters must remain trivially copyable.");
 
 class NCManager {
 public:
@@ -47,7 +137,7 @@ public:
 
     // 🌟 新增：呼叫與返回副程式的介面
     bool CallMacro(const std::string& filename);
-    void ReturnMacro();
+    void ReturnMacro(bool queueAlreadyDrained = false);
 
     // 2. 指令交握介面 (給 HMI 人機介面呼叫的)
     void CycleStart();  // 按下啟動鍵
@@ -160,7 +250,17 @@ public:
 
     void SetSingleBlockEnabled(bool enabled)
     {
+        if (m_isSingleBlockEnabled == enabled)
+        {
+            return;
+        }
+
         m_isSingleBlockEnabled = enabled;
+        if (!enabled)
+        {
+            m_legacySingleBlockPausePending = false;
+            m_singleBlockBoundaryShadow.Cancel(false);
+        }
     }
 
     bool IsSingleBlockEnabled() const
@@ -198,14 +298,363 @@ public:
         return m_isBlockSkipEnabled;
     }
 
+    // =========================================================
+    // Stage NC-0.1D - NC Motion Feedback Snapshot / Counters
+    //
+    // NCManager 是 Final Feedback Ring 的唯一 Consumer。
+    // 這些欄位由 NC 10 ms Task 更新；外部執行緒不可直接競爭讀取。
+    // HMI / API 應透過既有 SHM / Snapshot 邊界複製後查詢，
+    // 且不可直接從 MotionCore 再 Pop 一次。
+    // =========================================================
+    bool GetLastMotionFeedback(
+        MotionFeedbackEvent& event) const noexcept
+    {
+        if (m_lastMotionFeedback.sequence ==
+            MOTION_FEEDBACK_SEQUENCE_INVALID)
+        {
+            return false;
+        }
+
+        event = m_lastMotionFeedback;
+        return true;
+    }
+
+    MotionExecutionIdentity GetLastAcceptedMotionIdentity() const noexcept
+    {
+        return m_lastAcceptedMotionIdentity;
+    }
+
+    MotionExecutionIdentity GetLastStartedMotionIdentity() const noexcept
+    {
+        return m_lastStartedMotionIdentity;
+    }
+
+    MotionExecutionIdentity GetLastCompletedMotionIdentity() const noexcept
+    {
+        return m_lastCompletedMotionIdentity;
+    }
+
+    MotionExecutionIdentity GetLastRejectedMotionIdentity() const noexcept
+    {
+        return m_lastRejectedMotionIdentity;
+    }
+
+    MotionExecutionIdentity GetLastAbortedMotionIdentity() const noexcept
+    {
+        return m_lastAbortedMotionIdentity;
+    }
+
+    MotionExecutionIdentity GetLastFaultedMotionIdentity() const noexcept
+    {
+        return m_lastFaultedMotionIdentity;
+    }
+
+    MotionFeedbackSequence GetLastConsumedMotionFeedbackSequence() const noexcept
+    {
+        return m_lastConsumedMotionFeedbackSequence;
+    }
+
+    std::uint64_t GetMotionFeedbackSequenceGapCount() const noexcept
+    {
+        return m_motionFeedbackSequenceGapCount;
+    }
+
+    std::uint64_t GetProcessedMotionFeedbackCount() const noexcept
+    {
+        return m_processedMotionFeedbackCount;
+    }
+
+    std::uint64_t GetAcceptedMotionFeedbackCount() const noexcept
+    {
+        return m_acceptedMotionFeedbackCount;
+    }
+
+    std::uint64_t GetStartedMotionFeedbackCount() const noexcept
+    {
+        return m_startedMotionFeedbackCount;
+    }
+
+    std::uint64_t GetCompletedMotionFeedbackCount() const noexcept
+    {
+        return m_completedMotionFeedbackCount;
+    }
+
+    std::uint64_t GetRejectedMotionFeedbackCount() const noexcept
+    {
+        return m_rejectedMotionFeedbackCount;
+    }
+
+    std::uint64_t GetAbortedMotionFeedbackCount() const noexcept
+    {
+        return m_abortedMotionFeedbackCount;
+    }
+
+    std::uint64_t GetFaultedMotionFeedbackCount() const noexcept
+    {
+        return m_faultedMotionFeedbackCount;
+    }
+
+    // Stage NC-0.2C：Dispatch PC 與 Program Commit PC 明確分離。
+    // Commit 表示 Pure Parse -> Runtime Resolve -> NC Side Effect / Downstream
+    // Dispatch 已完成；它不等同馬達 COMPLETED，後者仍由 Motion Feedback 表示。
+    int GetActiveDispatchPC() const noexcept;
+    int GetActiveCommittedPC() const noexcept;
+
+    NCProgramCommitSnapshot GetLastProgramCommitSnapshot() const noexcept
+    {
+        return m_lastProgramCommit;
+    }
+
+
+    bool GetLastBlockLifecycleSnapshot(
+        NCBlockLifecycleSnapshot& snapshot) const noexcept
+    {
+        return m_blockLifecycleLedger.GetLastDispatchedSnapshot(snapshot);
+    }
+
+    bool GetLastProgramCommittedBlockLifecycleSnapshot(
+        NCBlockLifecycleSnapshot& snapshot) const noexcept
+    {
+        return m_blockLifecycleLedger.GetLastProgramCommittedSnapshot(snapshot);
+    }
+
+    bool GetLastMotionCompletedBlockLifecycleSnapshot(
+        NCBlockLifecycleSnapshot& snapshot) const noexcept
+    {
+        return m_blockLifecycleLedger.GetLastMotionCompletedSnapshot(snapshot);
+    }
+
+    bool GetLastTerminalBlockLifecycleSnapshot(
+        NCBlockLifecycleSnapshot& snapshot) const noexcept
+    {
+        return m_blockLifecycleLedger.GetLastTerminalSnapshot(snapshot);
+    }
+
+    NCBlockLifecycleCounters GetBlockLifecycleCounters() const noexcept
+    {
+        return m_blockLifecycleLedger.GetCounters();
+    }
+
+    NCBlockCompletionBoundarySnapshot
+        GetLastBlockCompletionBoundarySnapshot() const noexcept
+    {
+        return m_blockCompletionBoundaryObserver.GetLastSnapshot();
+    }
+
+    NCBlockCompletionBoundaryCounters
+        GetBlockCompletionBoundaryCounters() const noexcept
+    {
+        return m_blockCompletionBoundaryObserver.GetCounters();
+    }
+
+    NCProgramEndGateSnapshot GetProgramEndGateSnapshot() const noexcept
+    {
+        return m_programEndBoundary.GetSnapshot();
+    }
+
+    NCProgramEndGateCounters GetProgramEndGateCounters() const noexcept
+    {
+        return m_programEndBoundary.GetCounters();
+    }
+
+    NCGMBlockTransactionSnapshot
+        GetGMBlockTransactionSnapshot() const noexcept
+    {
+        return m_gmBlockTransaction.snapshot;
+    }
+
+    NCGMBlockTransactionCounters
+        GetGMBlockTransactionCounters() const noexcept
+    {
+        return m_gmBlockTransactionCounters;
+    }
+
+    NCSingleBlockShadowSnapshot
+        GetSingleBlockShadowSnapshot() const noexcept
+    {
+        return m_singleBlockBoundaryShadow.GetSnapshot();
+    }
+
+    NCSingleBlockShadowCounters
+        GetSingleBlockShadowCounters() const noexcept
+    {
+        return m_singleBlockBoundaryShadow.GetCounters();
+    }
+
+
+    NCFeedHoldBoundarySnapshot
+        GetFeedHoldBoundarySnapshot() const noexcept
+    {
+        return m_feedHoldBoundaryShadow.GetSnapshot();
+    }
+
+    NCFeedHoldBoundaryCounters
+        GetFeedHoldBoundaryCounters() const noexcept
+    {
+        return m_feedHoldBoundaryShadow.GetCounters();
+    }
+
+    static bool WaitForGMBlockTransactionCallback(NCManager* nc);
     static bool WaitAndHoldCallback(NCManager* nc);
     static bool WaitAndClearQueueCallback(NCManager* nc);
     static bool WaitForCycleStartCallback(NCManager* nc); // 新增：專等 CycleStart 按鈕
+
+    // Stage NC-0.1F：G81 HOME 完成後，接回 HOME 交還的新一代 Program Lease。
+    bool AdoptProgramMotionLease(
+        const MotionOwnerLease& lease) noexcept;
 private:
+    // Stage NC-0.1E：NC Program Owner Lease 生命週期。
+    bool AcquireProgramMotionOwner() noexcept;
+    void ReleaseProgramMotionOwner() noexcept;
+
+    MotionOwnerLease m_programMotionLease{};
+    MotionOwnerLease m_safetyMotionLease{};
+
+    // Stage NC-0.1D：每個 NC 10 ms Cycle 先 Drain Motion Feedback Ring。
+    void ProcessMotionFeedback() noexcept;
+
+    // Stage NC-0.2D：Program Commit 與 Motion Segment Feedback 的對照表。
+    NCBlockLifecycleLedger m_blockLifecycleLedger{};
+
+    // Stage NC-0.2F：已追蹤 Motion Block 的 Wait Callback 採 Dual-Key
+    // Guard；非 Motion Callback 維持 Legacy 行為。
+    NCBlockCompletionBoundaryObserver m_blockCompletionBoundaryObserver{};
+    NCBlockDispatchId m_waitingBlockDispatchId =
+        NC_BLOCK_DISPATCH_ID_INVALID;
+
+    // Stage NC-0.2G：M02 / M30 / Natural EOF 共用同一個 Cycle End Gate。
+    NCProgramEndBoundary m_programEndBoundary{};
+    bool m_programEndAlarmRaised = false;
+
+    struct NCGMBlockTransactionState
+    {
+        NCGMBlockTransactionSnapshot snapshot{};
+        WaitConditionFunc gCallback = nullptr;
+        WaitConditionFunc mCallback = nullptr;
+    };
+
+    NCGMBlockTransactionState m_gmBlockTransaction{};
+    NCGMBlockTransactionCounters m_gmBlockTransactionCounters{};
+    std::uint64_t m_nextGMBlockTransactionSequence = 1ULL;
+
+    // Stage NC-0.2I.1：只觀察 Single Block 正確完成點，不改變控制。
+    NCSingleBlockBoundaryShadow m_singleBlockBoundaryShadow{};
+    bool m_legacySingleBlockPausePending = false;
+
+
+    // Stage NC-0.2I.2：區分 Feed Hold Request、Legacy HOLD 顯示與
+    // 命令／實際速度真正停止 Acknowledge；本階段仍不接管控制。
+    NCFeedHoldBoundaryShadowObserver m_feedHoldBoundaryShadow{};
+
+    MotionFeedbackEvent m_lastMotionFeedback{};
+    MotionExecutionIdentity m_lastAcceptedMotionIdentity{};
+    MotionExecutionIdentity m_lastStartedMotionIdentity{};
+    MotionExecutionIdentity m_lastCompletedMotionIdentity{};
+    MotionExecutionIdentity m_lastRejectedMotionIdentity{};
+    MotionExecutionIdentity m_lastAbortedMotionIdentity{};
+    MotionExecutionIdentity m_lastFaultedMotionIdentity{};
+
+    MotionFeedbackSequence m_lastConsumedMotionFeedbackSequence =
+        MOTION_FEEDBACK_SEQUENCE_INVALID;
+    std::uint64_t m_motionFeedbackSequenceGapCount = 0ULL;
+
+    std::uint64_t m_processedMotionFeedbackCount = 0ULL;
+    std::uint64_t m_acceptedMotionFeedbackCount = 0ULL;
+    std::uint64_t m_startedMotionFeedbackCount = 0ULL;
+    std::uint64_t m_completedMotionFeedbackCount = 0ULL;
+    std::uint64_t m_rejectedMotionFeedbackCount = 0ULL;
+    std::uint64_t m_abortedMotionFeedbackCount = 0ULL;
+    std::uint64_t m_faultedMotionFeedbackCount = 0ULL;
+
     // 🌟 新增：統一暫停旗標 (用來標記這行跑完後是否需要停下來)
     bool m_pauseAfterBlock = false;
     // 🌟 判斷這行單節是否為「真的會產生機台移動」的指令
     bool IsRealMotionBlock(const NCBlock& block);
+
+    // Stage NC-0.2A：同一 Block 先 Commit 相容 Modal，再擷取 Motion 標籤。
+    void CapturePendingCommandState(int sourcePC);
+    WaitConditionFunc DispatchSingleGCode(
+        const NCBlock& sourceBlock,
+        int gCode);
+
+    void BeginGMBlockTransaction(
+        WaitConditionFunc gCallback,
+        WaitConditionFunc mCallback,
+        NCGMBlockPostAction postAction,
+        int sourcePC,
+        int sourceLineNumber,
+        NCBlockDispatchId dispatchId,
+        int mCode,
+        int pValue,
+        int repeatCount,
+        bool fromMainProgram) noexcept;
+    bool EvaluateGMBlockTransaction() noexcept;
+    bool FinalizeGMBlockTransaction();
+    void CancelGMBlockTransaction(bool superseded) noexcept;
+    std::uint64_t AllocateGMBlockTransactionSequence() noexcept;
+
+    static NCSingleBlockCandidateKind ClassifySingleBlockCandidate(
+        const NCBlock& block) noexcept;
+    void ArmSingleBlockShadow(
+        NCSingleBlockCandidateKind candidateKind,
+        NCBlockDispatchId dispatchId,
+        const NCProgramCommitSnapshot& target,
+        int sourceLineNumber) noexcept;
+    void EvaluateSingleBlockShadow(bool callbackComplete) noexcept;
+    void ObserveLegacySingleBlockHold() noexcept;
+    void CancelSingleBlockShadow(bool superseded) noexcept;
+
+
+    NCFeedHoldBoundarySample BuildFeedHoldBoundarySample() const noexcept;
+    void BeginFeedHoldBoundaryShadow(NCFeedHoldSource source) noexcept;
+    void ObserveFeedHoldBoundaryShadow() noexcept;
+    void ObserveFeedHoldLegacyHoldShadow() noexcept;
+    void ObserveFeedHoldResumeRequestedShadow() noexcept;
+    void ObserveFeedHoldResumeAppliedShadow() noexcept;
+    void CancelFeedHoldBoundaryShadow(bool superseded) noexcept;
+
+    // Stage NC-0.2C：Parsed Program Cache / Program Commit Boundary。
+    NCProgramCache& GetBaseProgramCache() noexcept;
+    const NCProgramCache& GetBaseProgramCache() const noexcept;
+
+    int GetBasePCValue() const noexcept;
+    int& GetBaseCommittedPC() noexcept;
+    int GetBaseCommittedPCValue() const noexcept;
+    NCProgramScope GetBaseProgramScope() const noexcept;
+
+    bool TryGetCurrentJumpTarget(
+        int sequenceNumber,
+        int& targetPC) const;
+
+    NCProgramCommitSnapshot MakeCurrentProgramCommitTarget(
+        int sourcePC) const noexcept;
+    bool CommitProgramBlock(
+        const NCProgramCommitSnapshot& target,
+        NCProgramCommitSnapshot& committedSnapshot) noexcept;
+    void BindProgramBlockMotionCapture(
+        NCBlockDispatchId dispatchId,
+        const MotionProgramBlockCapture& capture) noexcept;
+
+    void BindCompletionWaitBoundary(
+        NCBlockDispatchId dispatchId,
+        WaitConditionFunc callback) noexcept;
+    bool ApplyCompletionWaitBoundaryGuard(bool legacyReady) noexcept;
+    void ClearCompletionWaitBoundary(bool superseded) noexcept;
+
+    NCProgramEndGateSample BuildProgramEndGateSample() const noexcept;
+    bool BeginProgramRunBoundary(MotionExecutionEpoch executionEpoch) noexcept;
+    bool RequestProgramEnd(
+        NCProgramEndCause cause,
+        int sourcePC,
+        int sourceLineNumber,
+        NCBlockDispatchId markerDispatchId) noexcept;
+    void ProcessProgramEndBoundary();
+    void FinalizeProgramEnd();
+    void CancelProgramEndBoundary() noexcept;
+
+    void ResetActiveProgramCommitBoundary() noexcept;
+    void ResetAllProgramCommitBoundaries() noexcept;
+    NCProgramFrameId AllocateMacroFrameId() noexcept;
 public:
     uint32_t NC_RunCount;//NC執行迴圈數
     uint32_t API_RunCount;//API執行迴圈數
@@ -251,11 +700,11 @@ public:
     // ==========================================
     struct MacroFrame {
         std::string programName;            // 這層副程式的檔名 (例如 O1234.nc)
-        std::vector<std::string> memory;    // 這層副程式的程式碼內容
-        int currentPC;                      // 這層目前跑到第幾行
-        int returnPC;                       // 執行完 M99 要回傳給上一層的行號
-
-        // 🌟 新增：為了支援 G65/G66/M98 的 L 次數準備
+        const NCProgramCache* program = nullptr; // 指向穩定的 Parsed Macro Cache
+        NCProgramFrameId frameId = NC_PROGRAM_FRAME_ID_INVALID;
+        int currentPC = 0;                  // 下一個要 Dispatch 的 PC
+        int committedPC = -1;               // 最近完成 Program Commit 的 PC
+        int returnPC = 0;                   // M99 返回上一層的 PC
         int repeatCount = 1;
     };
 
@@ -265,18 +714,24 @@ public:
 
     bool m_programChanged = false;          // 🌟 標記是否發生了程式跳轉 (M98/M99)
 
-    // 🌟 修改：現在記憶體存的是「原始字串」，以支援執行時動態計算
-    std::vector<std::string> m_programMemory;
+    // Stage NC-0.2C：主程式只在 LoadProgram 時 Parse 一次。
+    NCProgramCache m_programCache;
+    int m_programPC = 0;                  // 下一個要 Dispatch 的 PC
+    int m_programCommittedPC = -1;        // 最近完成 Program Commit 的 PC
 
-    // 🌟 新增：跳躍表 (紀錄 N 碼對應的陣列索引)
-    std::map<int, int> m_jumpTable;
-    int m_programPC = 0;                  // Program Counter (目前跑到第幾行)
+    // 同一主程式執行期間，Macro 第一次載入後共用 Parsed Cache。
+    // Reset / 載入新主程式會清除，避免編輯後沿用舊內容。
+    std::map<std::string, NCProgramCache> m_macroProgramCaches;
 
     // NC 指令緩衝區
     std::queue<NCBlock> m_blockQueue;
 
     // 內部執行功能
-    void ExecuteBlock(const NCBlock& block);
+    void ExecuteBlock(
+        const NCBlock& block,
+        int sourcePC,
+        int sourceLineNumber,
+        NCBlockDispatchId dispatchId);
 
     // 🌟 替換：捨棄 Enum，改用統一的檢查回呼函式
     WaitConditionFunc m_waitCallback = nullptr;
@@ -286,18 +741,22 @@ public:
 
 
     // 🌟 MDI 專屬變數
-    std::vector<std::string> m_mdiMemory;
+    NCProgramCache m_mdiProgramCache;
     int m_mdiPC = 0;
+    int m_mdiCommittedPC = -1;
 
     // 🌟 MANUAL (輕量自動) 專屬變數
-    std::vector<std::string> m_manualMemory;
+    NCProgramCache m_manualProgramCache;
     int m_manualPC = 0;
-    bool m_manualAutoRunning = false; // 標記目前是否正在跑 MANUAL 的自動指令
+    int m_manualCommittedPC = -1;
+    bool m_manualAutoRunning = false;
 
+    NCProgramCommitSnapshot m_lastProgramCommit{};
+    NCProgramCommitSequence m_nextProgramCommitSequence = 1ULL;
+    NCProgramFrameId m_nextMacroFrameId = 1ULL;
 
-    // 🌟 核心設計：動態獲取當前模式的「基準行號」與「基準記憶體」
+    // 動態獲取目前模式的 Base Dispatch PC。
     int& GetBasePC();
-    std::vector<std::string>& GetBaseMemory();
 
     bool LoadDynamicCode(const std::string& content);
 

@@ -327,6 +327,30 @@
     <ClCompile Include="EtherCatMaster_CompositeAccessShadow.cpp">
       <Filter>Source Files\EtherCAT_Master</Filter>
     </ClCompile>
+    <ClCompile Include="NCGCodeSemantics.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCExpressionResolver.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCProgramCache.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCBlockLifecycleLedger.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCBlockCompletionBoundary.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCProgramEndBoundary.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCSingleBlockBoundary.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCFeedHoldBoundary.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -434,6 +458,63 @@
     <ClInclude Include="HomePersistenceManager.h">
       <Filter>Header Files\NC\Home</Filter>
     </ClInclude>
+    <ClInclude Include="EtherCatSmDiagContract.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatFmmuDiagContract.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionExecutionContract.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionCommandRing.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionFeedbackRing.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatWatchdogDiagContract.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatWatchdogDiagPublisher.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionAxisCommandMailbox.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="NCGCodeSemantics.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCExpressionResolver.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCProgramCache.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCBlockLifecycleLedger.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCBlockCompletionBoundary.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatDcQualificationDiagContract.h">
+      <Filter>Header Files\EtherCAT_Master\DC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCProgramEndBoundary.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatDcV1aDiagContract.h">
+      <Filter>Header Files\EtherCAT_Master\DC</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatRxCorrelationDiagContract.h">
+      <Filter>Header Files\EtherCAT_Master\DC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCSingleBlockBoundary.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCFeedHoldBoundary.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="DC同步_相關設定說明.txt">
@@ -441,6 +522,9 @@
     </Text>
     <Text Include="DC同步流程.txt">
       <Filter>Source Files\EtherCAT_Master\DC</Filter>
+    </Text>
+    <Text Include="EtherCAT_Master_API_使用方式.txt">
+      <Filter>Source Files\EtherCAT_Master</Filter>
     </Text>
   </ItemGroup>
 </Project>

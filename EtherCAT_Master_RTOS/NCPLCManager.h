@@ -1,5 +1,6 @@
 #pragma once
 #include "NCPLCMap.h"
+#include "MotionExecutionContract.h"
 #include <cstdint>
 
 class NCManager;
@@ -40,6 +41,21 @@ private:
 
     // NC -> PLC 
     void SyncNCStateToPLC();          // 將 NC / Motion 目前狀態同步回 PLC S Point。
+
+    // Stage NC-0.1F manual ownership and mailbox helpers.
+    MotionCommandSource GetManualCommandSource() const noexcept;
+    bool QueueManualStop(int axisIndex, double decelerationTime) noexcept;
+    bool QueueManualVelocity(
+        int axisIndex, double velocity, double accelerationTime) noexcept;
+    bool QueueManualMPG(
+        int axisIndex, double targetPosition, double maximumVelocity,
+        double accelerationTime, double decelerationTime) noexcept;
+    bool QueueManualMove(
+        int axisIndex, double targetPosition, double targetVelocity,
+        double accelerationTime, double decelerationTime,
+        bool useShortestPath) noexcept;
+    bool HasActiveManualAxis() const noexcept;
+    void ReleaseManualMotionOwnerIfStopped() noexcept;
 
 private:
     // References (NCPLCManager 不擁有這些物件，僅保存 Reference 並呼叫其功能)
@@ -83,6 +99,8 @@ private:
     bool m_prevAxisProtect[NCPLC::AXIS_COUNT] = { false, false, false, false, false, false, false, false }; // C140~147 Axis Protection 前一 Scan 狀態
     bool m_prevPositiveLimit[NCPLC::AXIS_COUNT] = { false, false, false, false, false, false, false, false }; // C180~187 Positive Hard Limit 前一 Scan 狀態
     bool m_prevNegativeLimit[NCPLC::AXIS_COUNT] = { false, false, false, false, false, false, false, false }; // C190~197 Negative Hard Limit 前一 Scan 狀態
+
+    MotionOwnerLease m_manualMotionLease{}; // JOG / MPG generation lease
 
     ManualMoveMode m_manualMoveMode = ManualMoveMode::NONE; // 目前有效的 Manual Move Mode (C19, C23, C24, C21)
 

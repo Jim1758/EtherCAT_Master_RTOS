@@ -15728,6 +15728,22 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
                             // =========================================================
+                            // NC-0.2J.5 - NC settle PDO continuity seam
+                            //
+                            // The settle dwell is valid only across consecutive valid
+                            // PDO cycles.  Notify MotionCore before the Motion branch so
+                            // the first invalid cycle resets the proof even though that
+                            // cycle intentionally skips UpdateAllMotion().
+                            // =========================================================
+
+                            pMaster->
+                                m_Motion.
+                                ObserveNCSettleRuntimeCycle(
+                                    pMaster->tickCount_PDO,
+                                    pdoCycleValid);
+
+
+                            // =========================================================
                             // Motion
                             //
                             // 有效週期才更新插補與軸控制；第一個無效週期先保留狀態，

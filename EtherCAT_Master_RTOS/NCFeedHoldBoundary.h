@@ -22,13 +22,11 @@
 //       -> stable confirmation
 //       -> Hold Acknowledged
 //
-// This stage is diagnostic-only. Existing NCManager behavior still changes
-// NCState to HOLD immediately. The observer records whether that legacy HOLD
-// indication occurred before the physical stop acknowledgement and whether
-// Cycle Start resumed before or after acknowledgement.
-//
-// No Program Counter, Motion command, Feed Hold, Cycle Start, Owner, Epoch,
-// Queue, HOME, Single Block or Program End control behavior is changed here.
+// NC-0.2J.5 controlled cutover: PROGRAM acknowledgement now requires the
+// matching 250 us RT settle request and continuous proof.  NCState still
+// changes to HOLD immediately, while Cycle Start remains deferred until this
+// boundary acknowledges.  HOME continues to use HomingManager::PAUSED and is
+// deliberately independent of the NC settle request.
 // =============================================================================
 
 enum class NCFeedHoldSource : std::uint8_t
@@ -80,6 +78,12 @@ struct NCFeedHoldBoundarySample
     MotionOwnerLease ownerLease{};
     MotionFeedHoldStopSnapshot motion{};
 
+    // NC-0.2J.5: PROGRAM Feed Hold may only consume the RT proof created for
+    // this exact request.  HOME keeps the legacy HomingManager PAUSED proof
+    // and therefore leaves this sequence invalid.
+    MotionNCSettleRequestSequence expectedSettleRequestSequence =
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+
     NCBlockDispatchId dispatchId = NC_BLOCK_DISPATCH_ID_INVALID;
     int activePC = -1;
 
@@ -103,6 +107,9 @@ struct NCFeedHoldBoundarySnapshot
     MotionOwnerGeneration requestOwnerGeneration = MOTION_OWNER_GENERATION_INVALID;
     MotionOwner currentOwner = MotionOwner::NONE;
     MotionOwnerGeneration currentOwnerGeneration = MOTION_OWNER_GENERATION_INVALID;
+
+    MotionNCSettleRequestSequence expectedSettleRequestSequence =
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
 
     NCBlockDispatchId dispatchId = NC_BLOCK_DISPATCH_ID_INVALID;
     int requestPC = -1;

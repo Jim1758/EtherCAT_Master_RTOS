@@ -11,7 +11,11 @@
 #include "NCBlockCompletionBoundary.h" // Stage NC-0.2F：Motion Completion Dual-Key Guard
 #include "NCProgramEndBoundary.h" // Stage NC-0.2G：Program End / Cycle End Gate
 #include "NCSingleBlockBoundary.h" // Stage NC-0.2I.1：Single Block Shadow Boundary
+#include "NCSingleBlockHoldGate.h" // Stage NC-0.2I.4：Single Block Controlled HOLD Cutover
 #include "NCFeedHoldBoundary.h" // Stage NC-0.2I.2：Feed Hold Request/Ack Shadow
+#include "NCFeedHoldResumeGate.h" // Stage NC-0.2I.3：Feed Hold ACK-Gated Resume Cutover
+#include "NCLifecycleInterruptionBoundary.h" // Stage NC-0.2J.1：Failure / Epoch Cancellation Shadow
+#include "NCResetReleaseGate.h" // Stage NC-0.2J.3：Reset Stable-Standstill Release Gate
 
 #include <queue>
 #include <vector>
@@ -107,6 +111,64 @@ static_assert(
 static_assert(
     std::is_trivially_copyable<NCGMBlockTransactionCounters>::value,
     "NCGMBlockTransactionCounters must remain trivially copyable.");
+
+// =============================================================================
+// Stage NC-0.2J.4 - Pre-dispatch Stop / Settle Barrier Shadow
+//
+// M00/M01/M02/M30, macro flow and other barrier blocks may wait before a
+// lifecycle block or Program-End request exists.  This fixed-size observer
+// makes that otherwise invisible wait explicit without changing the barrier.
+// =============================================================================
+enum class NCPreDispatchBarrierKind : std::uint8_t
+{
+    NONE = 0,
+    MACRO_EOF,
+    ASSIGNMENT,
+    GOTO_CONTROL,
+    MACRO_DEPENDENCY,
+    M00,
+    M01,
+    M02,
+    M30,
+    M98,
+    M99,
+    G_CODE_BARRIER,
+    SINGLE_BLOCK_BARRIER,
+    BLOCK_BARRIER
+};
+
+struct NCPreDispatchBarrierSnapshot
+{
+    std::uint64_t sequence = 0ULL;
+    NCPreDispatchBarrierKind kind = NCPreDispatchBarrierKind::NONE;
+
+    int sourcePC = -1;
+    int sourceLineNumber = 0;
+    int mCode = -1;
+
+    std::uint64_t waitSamples = 0ULL;
+    std::uint64_t commandQueueDepth = 0ULL;
+
+    bool active = false;
+    bool commandQueuePending = false;
+    bool groupStandstill = false;
+};
+
+struct NCPreDispatchBarrierCounters
+{
+    std::uint64_t activations = 0ULL;
+    std::uint64_t evaluations = 0ULL;
+    std::uint64_t waitCommandQueue = 0ULL;
+    std::uint64_t waitGroupStandstill = 0ULL;
+    std::uint64_t cleared = 0ULL;
+};
+
+static_assert(
+    std::is_trivially_copyable<NCPreDispatchBarrierSnapshot>::value,
+    "NCPreDispatchBarrierSnapshot must remain trivially copyable.");
+static_assert(
+    std::is_trivially_copyable<NCPreDispatchBarrierCounters>::value,
+    "NCPreDispatchBarrierCounters must remain trivially copyable.");
 
 class NCManager {
 public:
@@ -248,20 +310,7 @@ public:
 // Single Block
 // =========================================================
 
-    void SetSingleBlockEnabled(bool enabled)
-    {
-        if (m_isSingleBlockEnabled == enabled)
-        {
-            return;
-        }
-
-        m_isSingleBlockEnabled = enabled;
-        if (!enabled)
-        {
-            m_legacySingleBlockPausePending = false;
-            m_singleBlockBoundaryShadow.Cancel(false);
-        }
-    }
+    void SetSingleBlockEnabled(bool enabled);
 
     bool IsSingleBlockEnabled() const
     {
@@ -344,6 +393,11 @@ public:
         return m_lastAbortedMotionIdentity;
     }
 
+    MotionExecutionIdentity GetLastCancelledMotionIdentity() const noexcept
+    {
+        return m_lastCancelledMotionIdentity;
+    }
+
     MotionExecutionIdentity GetLastFaultedMotionIdentity() const noexcept
     {
         return m_lastFaultedMotionIdentity;
@@ -387,6 +441,11 @@ public:
     std::uint64_t GetAbortedMotionFeedbackCount() const noexcept
     {
         return m_abortedMotionFeedbackCount;
+    }
+
+    std::uint64_t GetCancelledMotionFeedbackCount() const noexcept
+    {
+        return m_cancelledMotionFeedbackCount;
     }
 
     std::uint64_t GetFaultedMotionFeedbackCount() const noexcept
@@ -469,6 +528,18 @@ public:
         return m_gmBlockTransactionCounters;
     }
 
+    NCPreDispatchBarrierSnapshot
+        GetPreDispatchBarrierSnapshot() const noexcept
+    {
+        return m_preDispatchBarrierSnapshot;
+    }
+
+    NCPreDispatchBarrierCounters
+        GetPreDispatchBarrierCounters() const noexcept
+    {
+        return m_preDispatchBarrierCounters;
+    }
+
     NCSingleBlockShadowSnapshot
         GetSingleBlockShadowSnapshot() const noexcept
     {
@@ -479,6 +550,32 @@ public:
         GetSingleBlockShadowCounters() const noexcept
     {
         return m_singleBlockBoundaryShadow.GetCounters();
+    }
+
+    // =========================================================
+    // Stage NC-0.2I.4 - Single Block Completion-Gated HOLD
+    //
+    // Default is enabled. Set false to return subsequent Single
+    // Block execution to the legacy m_pauseAfterBlock path.
+    // Disabling never creates an automatic RUN transition.
+    // =========================================================
+    void SetSingleBlockCompletionGateEnabled(bool enabled) noexcept;
+
+    bool IsSingleBlockCompletionGateEnabled() const noexcept
+    {
+        return m_singleBlockHoldGate.IsEnabled();
+    }
+
+    NCSingleBlockHoldGateSnapshot
+        GetSingleBlockHoldGateSnapshot() const noexcept
+    {
+        return m_singleBlockHoldGate.GetSnapshot();
+    }
+
+    NCSingleBlockHoldGateCounters
+        GetSingleBlockHoldGateCounters() const noexcept
+    {
+        return m_singleBlockHoldGate.GetCounters();
     }
 
 
@@ -494,9 +591,73 @@ public:
         return m_feedHoldBoundaryShadow.GetCounters();
     }
 
+    // =========================================================
+    // Stage NC-0.2I.3 - Program Feed Hold ACK-Gated Resume
+    //
+    // Default is enabled.  Set false to return Cycle Start to the
+    // legacy immediate-resume path.  Disabling while a resume is
+    // deferred leaves the machine in HOLD; it never auto-runs.
+    // =========================================================
+    void SetFeedHoldAckGateEnabled(bool enabled) noexcept
+    {
+        m_feedHoldResumeGate.SetEnabled(enabled);
+    }
+
+    bool IsFeedHoldAckGateEnabled() const noexcept
+    {
+        return m_feedHoldResumeGate.IsEnabled();
+    }
+
+    NCFeedHoldResumeGateSnapshot
+        GetFeedHoldResumeGateSnapshot() const noexcept
+    {
+        return m_feedHoldResumeGate.GetSnapshot();
+    }
+
+    NCFeedHoldResumeGateCounters
+        GetFeedHoldResumeGateCounters() const noexcept
+    {
+        return m_feedHoldResumeGate.GetCounters();
+    }
+
+    // =========================================================
+    // Stage NC-0.2J.1 - Lifecycle Failure / Epoch Cancellation
+    // Shadow Boundary. Diagnostics only; no SHM ABI expansion and
+    // no Reset / Alarm / Motion behavior cutover in this stage.
+    // =========================================================
+    NCLifecycleInterruptionSnapshot
+        GetLifecycleInterruptionSnapshot() const noexcept
+    {
+        return m_lifecycleInterruptionShadow.GetSnapshot();
+    }
+
+    NCLifecycleInterruptionCounters
+        GetLifecycleInterruptionCounters() const noexcept
+    {
+        return m_lifecycleInterruptionShadow.GetCounters();
+    }
+
+    // =========================================================
+    // Stage NC-0.2J.3 - Reset Stable-Standstill Release Gate.
+    // READY and SAFETY-owner release require an exact matching
+    // QUIESCENT_PROVED boundary with the full stable sample count.
+    // =========================================================
+    NCResetReleaseGateSnapshot
+        GetResetReleaseGateSnapshot() const noexcept
+    {
+        return m_resetReleaseGate.GetSnapshot();
+    }
+
+    NCResetReleaseGateCounters
+        GetResetReleaseGateCounters() const noexcept
+    {
+        return m_resetReleaseGate.GetCounters();
+    }
+
     static bool WaitForGMBlockTransactionCallback(NCManager* nc);
     static bool WaitAndHoldCallback(NCManager* nc);
     static bool WaitAndClearQueueCallback(NCManager* nc);
+    static bool WaitForSingleBlockControlledHoldCallback(NCManager* nc);
     static bool WaitForCycleStartCallback(NCManager* nc); // 新增：專等 CycleStart 按鈕
 
     // Stage NC-0.1F：G81 HOME 完成後，接回 HOME 交還的新一代 Program Lease。
@@ -516,6 +677,12 @@ private:
     // Stage NC-0.2D：Program Commit 與 Motion Segment Feedback 的對照表。
     NCBlockLifecycleLedger m_blockLifecycleLedger{};
 
+    // Stage NC-0.2J.1：Reset / Alarm / Epoch replacement and failed
+    // terminal feedback share one fixed-size diagnostic interruption chain.
+    NCLifecycleInterruptionBoundaryShadow m_lifecycleInterruptionShadow{};
+    NCResetReleaseGate m_resetReleaseGate{};
+    bool m_lifecycleInterruptionAlarmLatched = false;
+
     // Stage NC-0.2F：已追蹤 Motion Block 的 Wait Callback 採 Dual-Key
     // Guard；非 Motion Callback 維持 Legacy 行為。
     NCBlockCompletionBoundaryObserver m_blockCompletionBoundaryObserver{};
@@ -525,6 +692,22 @@ private:
     // Stage NC-0.2G：M02 / M30 / Natural EOF 共用同一個 Cycle End Gate。
     NCProgramEndBoundary m_programEndBoundary{};
     bool m_programEndAlarmRaised = false;
+
+    // NC-0.2J.5.3: Cycle Start publishes a fresh Execution Epoch before the
+    // Program Run boundary is opened.  The 250 us Motion consumer must first
+    // acknowledge that publication; otherwise the run-start safety sample
+    // sees its own Epoch PENDING bit and rejects every start as START_DIRTY.
+    // Keep the exact Epoch latched so a newer Reset/Stop/Fault publication
+    // can only cancel this start, never accidentally authorize it.
+    bool m_programRunStartPending = false;
+    MotionExecutionEpoch m_pendingProgramRunExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionOwnerLease m_pendingProgramRunOwnerLease{};
+    NCOperationMode m_pendingProgramRunMode = NCOperationMode::EDIT;
+    NCState m_pendingProgramRunOriginState = NCState::NOT_READY;
+    NCProgramScope m_pendingProgramRunScope = NCProgramScope::NONE;
+    NCProgramCacheGeneration m_pendingProgramRunCacheGeneration =
+        NC_PROGRAM_CACHE_GENERATION_INVALID;
 
     struct NCGMBlockTransactionState
     {
@@ -537,20 +720,40 @@ private:
     NCGMBlockTransactionCounters m_gmBlockTransactionCounters{};
     std::uint64_t m_nextGMBlockTransactionSequence = 1ULL;
 
-    // Stage NC-0.2I.1：只觀察 Single Block 正確完成點，不改變控制。
+    NCPreDispatchBarrierSnapshot m_preDispatchBarrierSnapshot{};
+    NCPreDispatchBarrierCounters m_preDispatchBarrierCounters{};
+    std::uint64_t m_nextPreDispatchBarrierSequence = 1ULL;
+
+    // Stage NC-0.2I.1：只觀察 Single Block 正確完成點。
     NCSingleBlockBoundaryShadow m_singleBlockBoundaryShadow{};
     bool m_legacySingleBlockPausePending = false;
 
+    // Stage NC-0.2I.4：已通過 Shadow 驗證的 Boundary 正式接管
+    // Program Single Block HOLD，並保留 Runtime Legacy 回退。
+    NCSingleBlockHoldGate m_singleBlockHoldGate{};
 
-    // Stage NC-0.2I.2：區分 Feed Hold Request、Legacy HOLD 顯示與
-    // 命令／實際速度真正停止 Acknowledge；本階段仍不接管控制。
+
+    // NC-0.2J.5：區分 Feed Hold Request、Legacy HOLD 顯示與正式的
+    // RT 連續 Settle Acknowledge。
     NCFeedHoldBoundaryShadowObserver m_feedHoldBoundaryShadow{};
+    MotionNCSettleRequestSequence m_feedHoldNCSettleRequestSequence =
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+
+    // Stage NC-0.2J.5：Reset release is tied to one RT-owned settle/rebase
+    // transaction.  Sequence zero is never a valid request.
+    MotionNCSettleRequestSequence m_resetNCSettleRequestSequence =
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+
+    // Stage NC-0.2I.3：PROGRAM Feed Hold 的 Cycle Start 在 ACK 前只
+    // 先鎖存；ACK 成立後才允許真正恢復。保留 Runtime Legacy 回退開關。
+    NCFeedHoldResumeGate m_feedHoldResumeGate{};
 
     MotionFeedbackEvent m_lastMotionFeedback{};
     MotionExecutionIdentity m_lastAcceptedMotionIdentity{};
     MotionExecutionIdentity m_lastStartedMotionIdentity{};
     MotionExecutionIdentity m_lastCompletedMotionIdentity{};
     MotionExecutionIdentity m_lastRejectedMotionIdentity{};
+    MotionExecutionIdentity m_lastCancelledMotionIdentity{};
     MotionExecutionIdentity m_lastAbortedMotionIdentity{};
     MotionExecutionIdentity m_lastFaultedMotionIdentity{};
 
@@ -563,6 +766,7 @@ private:
     std::uint64_t m_startedMotionFeedbackCount = 0ULL;
     std::uint64_t m_completedMotionFeedbackCount = 0ULL;
     std::uint64_t m_rejectedMotionFeedbackCount = 0ULL;
+    std::uint64_t m_cancelledMotionFeedbackCount = 0ULL;
     std::uint64_t m_abortedMotionFeedbackCount = 0ULL;
     std::uint64_t m_faultedMotionFeedbackCount = 0ULL;
 
@@ -593,6 +797,15 @@ private:
     void CancelGMBlockTransaction(bool superseded) noexcept;
     std::uint64_t AllocateGMBlockTransactionSequence() noexcept;
 
+    void ObservePreDispatchBarrier(
+        NCPreDispatchBarrierKind kind,
+        int sourcePC,
+        int sourceLineNumber,
+        int mCode,
+        std::uint64_t commandQueueDepth,
+        bool groupStandstill) noexcept;
+    void ClearPreDispatchBarrier() noexcept;
+
     static NCSingleBlockCandidateKind ClassifySingleBlockCandidate(
         const NCBlock& block) noexcept;
     void ArmSingleBlockShadow(
@@ -601,6 +814,9 @@ private:
         const NCProgramCommitSnapshot& target,
         int sourceLineNumber) noexcept;
     void EvaluateSingleBlockShadow(bool callbackComplete) noexcept;
+    void ObserveSingleBlockHoldGate() noexcept;
+    bool ApplyControlledSingleBlockHold() noexcept;
+    bool ApplyControlledSingleBlockResume() noexcept;
     void ObserveLegacySingleBlockHold() noexcept;
     void CancelSingleBlockShadow(bool superseded) noexcept;
 
@@ -612,6 +828,24 @@ private:
     void ObserveFeedHoldResumeRequestedShadow() noexcept;
     void ObserveFeedHoldResumeAppliedShadow() noexcept;
     void CancelFeedHoldBoundaryShadow(bool superseded) noexcept;
+
+    bool IsProgramFeedHoldResumeCandidate() const noexcept;
+    bool ApplyProgramHoldResume(bool gateControlled) noexcept;
+    bool ProcessFeedHoldResumeGate() noexcept;
+
+    NCLifecycleInterruptionSample
+        BuildLifecycleInterruptionSample() const noexcept;
+    void BeginLifecycleInterruptionShadow(
+        NCLifecycleInterruptionCause cause,
+        bool expectsEpochChange) noexcept;
+    void RecordLifecycleInterruptionEpochPublished(
+        MotionExecutionEpoch executionEpoch) noexcept;
+    void ObserveLifecycleInterruptionShadow() noexcept;
+    static bool IsLifecycleFailureFeedback(
+        MotionFeedbackType type) noexcept;
+    static NCLifecycleInterruptionCause
+        LifecycleInterruptionCauseFromFeedback(
+            MotionFeedbackType type) noexcept;
 
     // Stage NC-0.2C：Parsed Program Cache / Program Commit Boundary。
     NCProgramCache& GetBaseProgramCache() noexcept;
@@ -643,6 +877,10 @@ private:
 
     NCProgramEndGateSample BuildProgramEndGateSample() const noexcept;
     bool BeginProgramRunBoundary(MotionExecutionEpoch executionEpoch) noexcept;
+    bool IsPendingProgramRunStartIdentityCurrent() const noexcept;
+    void ReleasePendingProgramRunMotionOwner() noexcept;
+    void ClearPendingProgramRunStart(bool cancelled) noexcept;
+    bool ProcessPendingProgramRunStart() noexcept;
     bool RequestProgramEnd(
         NCProgramEndCause cause,
         int sourcePC,

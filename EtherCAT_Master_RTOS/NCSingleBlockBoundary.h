@@ -39,7 +39,8 @@ enum class NCSingleBlockShadowPhase : std::uint8_t
     LEGACY_HOLD_CONFIRMED = 4,
     LEGACY_HOLD_MISMATCH = 5,
     PROGRAM_END_SUPPRESSED = 6,
-    CANCELLED = 7
+    CONTROLLED_HOLD_CONFIRMED = 7,
+    CANCELLED = 8
 };
 
 enum class NCSingleBlockShadowDecision : std::uint8_t
@@ -60,7 +61,10 @@ enum class NCSingleBlockShadowDecision : std::uint8_t
     TRACKING_OVERFLOW = 13,
     TRANSACTION_FAILED = 14,
     RESUMED = 15,
-    CANCELLED = 16
+    CANCELLED = 16,
+    CONTROLLED_HOLD_APPLIED = 17,
+    CONTROLLED_HOLD_BEFORE_BOUNDARY = 18,
+    CONTROLLED_RESUMED = 19
 };
 
 struct NCSingleBlockShadowArmRequest
@@ -120,6 +124,7 @@ struct NCSingleBlockShadowSnapshot
     bool boundaryReady = false;
     bool legacyPausePending = false;
     bool legacyHoldObserved = false;
+    bool controlledHoldObserved = false;
     bool programEndSuppressed = false;
 };
 
@@ -142,6 +147,11 @@ struct NCSingleBlockShadowCounters
     std::uint64_t legacyEarlyHolds = 0ULL;
     std::uint64_t legacyHoldWithoutArm = 0ULL;
     std::uint64_t legacyMissingHold = 0ULL;
+
+    std::uint64_t controlledHolds = 0ULL;
+    std::uint64_t controlledAgreeHolds = 0ULL;
+    std::uint64_t controlledEarlyHoldAttempts = 0ULL;
+    std::uint64_t controlledResumed = 0ULL;
 
     std::uint64_t motionFailures = 0ULL;
     std::uint64_t trackingOverflow = 0ULL;
@@ -185,6 +195,8 @@ public:
 
     void ObserveLegacyHold(bool causedBySingleBlock) noexcept;
     void ObserveLegacyResume() noexcept;
+    void ObserveControlledHold() noexcept;
+    void ObserveControlledResume() noexcept;
     void SuppressForProgramEnd() noexcept;
     void Cancel(bool superseded) noexcept;
 

@@ -173,6 +173,13 @@ NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys
 
 bool NCManager::LoadProgram(const std::string& filepath)
 {
+    // NC-0.2J.3：Reset release 尚未完成時不得以 Program Replace
+    // 發布新 Epoch 或提早把 NC 狀態改回 READY。
+    if (m_state == NCState::RESET_STATE)
+    {
+        return false;
+    }
+
     std::ifstream file(filepath);
     if (!file.is_open())
     {
@@ -196,6 +203,9 @@ bool NCManager::LoadProgram(const std::string& filepath)
     }
 
     // Only after a complete image exists do we invalidate the old execution.
+    BeginLifecycleInterruptionShadow(
+        NCLifecycleInterruptionCause::PROGRAM_REPLACED,
+        true);
     CancelProgramEndBoundary();
     ClearCompletionWaitBoundary(true);
     CancelGMBlockTransaction(true);
@@ -203,8 +213,10 @@ bool NCManager::LoadProgram(const std::string& filepath)
     CancelFeedHoldBoundaryShadow(true);
     m_waitCallback = nullptr;
     ReleaseProgramMotionOwner();
-    m_motion.BeginNewExecutionEpoch(
-        MotionCommandSource::NC_MEMORY);
+    const MotionExecutionEpoch replacementEpoch =
+        m_motion.BeginNewExecutionEpoch(
+            MotionCommandSource::NC_MEMORY);
+    RecordLifecycleInterruptionEpochPublished(replacementEpoch);
 
     const std::size_t pos = filepath.find_last_of("/\\");
     m_mainProgramName =
@@ -346,28 +358,65 @@ void NCManager::CycleStart()
     }
 
 
-    // 一般 NC Program Feed Hold Resume。
+    // =========================================================
+    // NC-0.2I.4 Controlled Single Block HOLD Resume
+    //
+    // 只有由 Completion-Gated Single Block 建立的 HOLD 才走此路徑。
+    // Feed Hold、M00/M01 與 HOME 的 Resume 語意保持完全分離。
+    // =========================================================
+    if (m_state == NCState::HOLD &&
+        m_singleBlockHoldGate.IsHoldApplied())
+    {
+        (void)ApplyControlledSingleBlockResume();
+        return;
+    }
+
+
+    // =========================================================
+    // 一般 NC Program HOLD Resume
+    //
+    // NC-0.2I.3：只有真正由 PROGRAM Feed Hold 建立的 HOLD 才進入
+    // ACK Gate。M00/M01、Single Block 及其他 HOLD 原因仍走 Legacy。
+    // =========================================================
     if (m_state == NCState::HOLD)
     {
-        m_singleBlockBoundaryShadow.ObserveLegacyResume();
-        m_legacySingleBlockPausePending = false;
+        const bool programFeedHoldCandidate =
+            IsProgramFeedHoldResumeCandidate();
+
+        // Shadow Observer 仍保留完整 Request/Ack/Resume 證據。
+        // 非 Feed Hold HOLD 時這個呼叫會被 Observer 安全忽略。
         ObserveFeedHoldResumeRequestedShadow();
 
-        if (!AcquireProgramMotionOwner())
+        if (programFeedHoldCandidate)
         {
-            return;
+            const NCFeedHoldResumeGateRequestResult gateResult =
+                m_feedHoldResumeGate.RequestResume(
+                    m_feedHoldBoundaryShadow.GetSnapshot());
+
+            if (gateResult ==
+                NCFeedHoldResumeGateRequestResult::DEFERRED ||
+                gateResult ==
+                NCFeedHoldResumeGateRequestResult::BLOCKED)
+            {
+                // ACK 前只鎖存 Cycle Start。保持 HOLD、Override=0、
+                // Callback/PC/Queue 全部原封不動。
+                m_pauseAfterBlock = false;
+                return;
+            }
+
+            if (gateResult ==
+                NCFeedHoldResumeGateRequestResult::APPLY_NOW)
+            {
+                // 已 ACK：同一個 Gate 立即套用 Resume。
+                (void)ApplyProgramHoldResume(true);
+                return;
+            }
+
+            // BYPASS_LEGACY 只可能發生在 Runtime 回退或 Boundary 已
+            // 不再是 PROGRAM Feed Hold，沿用既有 Resume 行為。
         }
 
-        m_state =
-            NCState::RUN;
-
-        m_motion.SetGroupFeedrateOverride(
-            1.0);
-        ObserveFeedHoldResumeAppliedShadow();
-
-        m_pauseAfterBlock =
-            false;
-
+        (void)ApplyProgramHoldResume(false);
         return;
     }
 
@@ -376,6 +425,15 @@ void NCManager::CycleStart()
     if (m_state == NCState::READY ||
         m_state == NCState::P_END)
     {
+        // NC-0.2J.5.3: a second button edge while the exact same start is
+        // waiting for its RT Epoch acknowledgement is idempotent.  Publishing
+        // another Epoch here would make the first pending start superseded and
+        // can create an endless START_DIRTY loop under repeated HMI polling.
+        if (m_programRunStartPending)
+        {
+            return;
+        }
+
         CancelSingleBlockShadow(false);
         CancelFeedHoldBoundaryShadow(false);
         m_legacySingleBlockPausePending = false;
@@ -399,14 +457,6 @@ void NCManager::CycleStart()
         }
 
 
-        if (m_mode == NCOperationMode::MANUAL &&
-            !m_manualProgramCache.Empty())
-        {
-            m_manualAutoRunning =
-                true;
-        }
-
-
         m_pauseAfterBlock =
             false;
 
@@ -416,23 +466,19 @@ void NCManager::CycleStart()
             m_motion.BeginNewExecutionEpoch(
                 GetMotionCommandSourceForMode(m_mode));
 
-        // Stage NC-0.2G：新 Program Run 只能從乾淨的 Lifecycle / Transport
-        // 邊界開始，避免把上一輪殘留算進新的 Cycle End。
-        if (!BeginProgramRunBoundary(executionEpoch))
-        {
-            if (m_mode == NCOperationMode::MANUAL)
-            {
-                m_manualAutoRunning = false;
-            }
-            ReleaseProgramMotionOwner();
-            return;
-        }
-
-        m_motion.SyncVirtualEndPosition();
-        UpdateSystemVariables();
-
-        m_state =
-            NCState::RUN;
+        // Do not classify this run until the 250 us consumer has observed the
+        // exact Epoch publication.  HasPendingSafetyOrRecoveryRequests() must
+        // continue to include Epoch PENDING for Reset/Stop/Fault fail-closed
+        // protection, so the supervisory side waits instead of weakening the
+        // admission predicate.
+        m_pendingProgramRunExecutionEpoch = executionEpoch;
+        m_pendingProgramRunOwnerLease = m_programMotionLease;
+        m_pendingProgramRunMode = m_mode;
+        m_pendingProgramRunOriginState = m_state;
+        m_pendingProgramRunScope = GetBaseProgramScope();
+        m_pendingProgramRunCacheGeneration =
+            GetBaseProgramCache().GetGeneration();
+        m_programRunStartPending = true;
     }
 }
 
@@ -451,6 +497,10 @@ void NCManager::FeedHold()
         {
             if (!m_feedHoldBoundaryShadow.IsActive())
             {
+                // HOME owns its stop/PAUSED contract.  It must not inherit a
+                // PROGRAM Feed Hold RT settle request from an older run.
+                m_feedHoldNCSettleRequestSequence =
+                    MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
                 BeginFeedHoldBoundaryShadow(
                     NCFeedHoldSource::HOME);
             }
@@ -466,6 +516,14 @@ void NCManager::FeedHold()
 
     if (m_state == NCState::RUN)
     {
+        // NC-0.2J.5: arm one fresh RT proof before publishing the PROGRAM
+        // Feed Hold boundary.  The observer will only accept a settled proof
+        // carrying this exact request sequence, Epoch and Program lease.
+        m_feedHoldNCSettleRequestSequence =
+            m_motion.RequestFeedHoldNCSettle(
+                m_motion.GetCurrentExecutionEpoch(),
+                m_programMotionLease);
+
         BeginFeedHoldBoundaryShadow(
             NCFeedHoldSource::PROGRAM);
 
@@ -484,6 +542,30 @@ void NCManager::FeedHold()
 
 void NCManager::Reset()
 {
+    // Stage NC-0.2J.5.1：Reset safety batch 尚未完成時，重複 Reset 必須
+    // 保持冪等。只有 release gate 已進入 terminal BLOCKED，操作員再次
+    // 明確按 Reset 才建立新的 Epoch / request / gate transaction。
+    if (m_state == NCState::RESET_STATE)
+    {
+        const NCResetReleaseGateSnapshot resetGate =
+            m_resetReleaseGate.GetSnapshot();
+        const bool terminalBlockedReset =
+            !resetGate.active &&
+            resetGate.blocked &&
+            resetGate.phase == NCResetReleaseGatePhase::BLOCKED;
+        if (!terminalBlockedReset)
+        {
+            return;
+        }
+    }
+
+    m_resetNCSettleRequestSequence =
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+
+    BeginLifecycleInterruptionShadow(
+        NCLifecycleInterruptionCause::RESET,
+        true);
+
     CancelProgramEndBoundary();
     if (Homing.IsActive()) Homing.Cancel();
 
@@ -496,21 +578,24 @@ void NCManager::Reset()
 
     // Stage NC-0.1B：先切換 Epoch。即使舊 Producer 晚一步派單，
     // 250 us Motion Runtime 也會依 Epoch 拒絕載入。
-    m_motion.BeginNewExecutionEpoch(
-        MotionCommandSource::SAFETY);
+    const MotionExecutionEpoch resetEpoch =
+        m_motion.BeginNewExecutionEpoch(
+            MotionCommandSource::SAFETY);
+    RecordLifecycleInterruptionEpochPublished(resetEpoch);
 
 
     //重置馬達區塊--------------------------------------------------
-    if (m_motion.IsAnyAxisFaulted() || m_motion.IsGroupFaulted() || m_motion.IsGroupEmergencyStopped())
-    {
-        m_motion.RequestResetAllFaults();//由 250 us Runtime 清除錯誤
+    const bool requestResetAllFaults =
+        m_motion.IsAnyAxisFaulted() ||
+        m_motion.IsGroupFaulted() ||
+        m_motion.IsGroupEmergencyStopped();
 
-    }
-
-    m_motion.RequestStopGroup();//由 250 us Runtime 執行滑行停止
-    m_motion.ResetPhysicalPC(); // 🌟 按下 Reset，實體行號歸零
-
-
+    // Stage NC-0.2J.2：Reset 是唯一的頂層 Epoch owner。
+    // ResetAllFaults + controlled Stop 由 250 us Runtime 當成同一個
+    // correlated safety batch 執行，不允許每個 leaf 再各自發布 Epoch。
+    m_motion.RequestResetSafetyBatch(
+        resetEpoch,
+        requestResetAllFaults);
 
     // 🌟 [新增] 如果有放電跳刀/排渣，必須強制解鎖跳刀狀態機！
     // m_motion.ResetAllFaults(); // (如果您有寫清除跳刀狀態的 API，建議在這裡呼叫)
@@ -552,16 +637,55 @@ void NCManager::Reset()
     bool curG162 = CoordSys.isCAxisOffsetRotationEnabled;
     int curPlane = CoordSys.activePlane; // 17, 18 或是 19
 
-    // 🌟 3. 強制同步給馬達！撕掉舊標籤，貼上乾淨狀態，徹底消滅殘影！
-    m_motion.ResetPhysicalTags(currentBrainWCS, currentBrainToolMode, currentBrainHCode, currentBraintoolRadiusMode, currentBraintoolDCode, curIsAbs, curG68, curG68Angle, curG168, curWCode, curG51, curScale, curMirrorMask, curG16, curG162, curPlane);
+    // NC-0.2J.5: NC only captures the clean post-Reset modal image.  The
+    // 250 us Motion owner applies both these physical tags and the actual-
+    // position rebase as one correlated transaction; the 10 ms task no
+    // longer writes RT-owned Group/axis state directly.
+    MotionNCResetExecutionState resetExecutionState{};
+    resetExecutionState.physicalExecutionPC = 0;
+    resetExecutionState.physicalExecutionWCS = currentBrainWCS;
+    resetExecutionState.physicalToolMode = currentBrainToolMode;
+    resetExecutionState.physicalHCode = currentBrainHCode;
+    resetExecutionState.physicalToolRadiusMode =
+        currentBraintoolRadiusMode;
+    resetExecutionState.physicalDCode = currentBraintoolDCode;
+    resetExecutionState.physicalWCode = curWCode;
+    resetExecutionState.physicalPlaneMode = curPlane;
+    resetExecutionState.physicalMirrorMask = curMirrorMask;
+    resetExecutionState.physicalIsAbsoluteMode = curIsAbs;
+    resetExecutionState.physicalG68Active = curG68;
+    resetExecutionState.physicalG168Active = curG168;
+    resetExecutionState.physicalG51Active = curG51;
+    resetExecutionState.physicalG16Active = curG16;
+    resetExecutionState.physicalG162Active = curG162;
+    resetExecutionState.physicalG68Angle = curG68Angle;
+    resetExecutionState.physicalScaleRatio = curScale;
+
+    // Producer-side pending tags belong to the 10 ms NC producer and may be
+    // updated here.  Current-execution tags remain exclusively RT-owned and
+    // are applied later by the correlated rebase transaction.
+    m_motion.SetPendingResetExecutionState(
+        resetExecutionState);
+
+    m_resetNCSettleRequestSequence =
+        m_motion.RequestResetNCSettleAndRebase(
+            resetEpoch,
+            m_safetyMotionLease,
+            resetExecutionState,
+            requestResetAllFaults);
+
+    // The release gate is armed only after the exact RT transaction sequence
+    // exists.  A zero/rejected request therefore remains fail-closed in
+    // RESET_STATE and cannot fall back to legacy standstill.
+    m_resetReleaseGate.Arm(
+        m_lifecycleInterruptionShadow.GetSnapshot(),
+        resetEpoch,
+        m_safetyMotionLease,
+        m_resetNCSettleRequestSequence,
+        m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease));
 
     //m_motion.EmergencyStopGroup();//急停
     //m_motion.ResetAllFaults();//軸清除錯誤
-
-
-    m_motion.SetGroupFeedrateOverride(1.0);//進給倍率回到100%
-
-
 
     // 🌟 清理完成後刷新變數
     UpdateSystemVariables();
@@ -746,6 +870,168 @@ static bool CheckMCodeDone(NCManager* nc) {
     return true;
 }
 
+// =============================================================================
+// Stage NC-0.2J.1 - Lifecycle Failure / Epoch Cancellation Shadow Boundary
+// =============================================================================
+bool NCManager::IsLifecycleFailureFeedback(
+    MotionFeedbackType type) noexcept
+{
+    return
+        type == MotionFeedbackType::REJECTED ||
+        type == MotionFeedbackType::CANCELLED ||
+        type == MotionFeedbackType::ABORTED ||
+        type == MotionFeedbackType::FAULTED;
+}
+
+NCLifecycleInterruptionCause
+NCManager::LifecycleInterruptionCauseFromFeedback(
+    MotionFeedbackType type) noexcept
+{
+    switch (type)
+    {
+    case MotionFeedbackType::REJECTED:
+        return NCLifecycleInterruptionCause::MOTION_REJECTED;
+    case MotionFeedbackType::CANCELLED:
+        return NCLifecycleInterruptionCause::MOTION_CANCELLED;
+    case MotionFeedbackType::ABORTED:
+        return NCLifecycleInterruptionCause::MOTION_ABORTED;
+    case MotionFeedbackType::FAULTED:
+        return NCLifecycleInterruptionCause::MOTION_FAULTED;
+    default:
+        return NCLifecycleInterruptionCause::NONE;
+    }
+}
+
+NCLifecycleInterruptionSample
+NCManager::BuildLifecycleInterruptionSample() const noexcept
+{
+    NCLifecycleInterruptionSample sample{};
+    const NCBlockLifecycleCounters lifecycle =
+        m_blockLifecycleLedger.GetCounters();
+
+    sample.executionEpoch = m_motion.GetCurrentExecutionEpoch();
+    sample.ownerLease = m_motion.GetMotionOwnerLease();
+    sample.activePC = GetActiveDispatchPC();
+    sample.activeBlocks = lifecycle.activeBlocks;
+
+    NCBlockLifecycleSnapshot lastLifecycle{};
+    if (m_blockLifecycleLedger.GetLastDispatchedSnapshot(lastLifecycle))
+    {
+        sample.lastDispatchId = lastLifecycle.dispatchId;
+    }
+
+    sample.axisCommandDepth = m_motion.GetAxisCommandMailboxDepth();
+    sample.axisResultDepth = m_motion.GetAxisCommandResultDepth();
+    sample.commandQueueDepth = m_motion.GetQueueSize();
+    sample.commandIngressDepth = m_motion.GetCommandIngressSize();
+    sample.commandReplayDepth = m_motion.GetCommandReplaySize();
+    sample.feedbackDepth = m_motion.GetMotionFeedbackDepth();
+    sample.feedbackNoticeDepth =
+        m_motion.GetMotionFeedbackProducerNoticeDepth();
+    sample.lastPublishedFeedbackSequence =
+        m_motion.GetLastPublishedMotionFeedbackSequence();
+    sample.lastConsumedFeedbackSequence =
+        m_lastConsumedMotionFeedbackSequence;
+
+    sample.blockFailed = lifecycle.blockFailed;
+    sample.blocksDispatched = lifecycle.dispatched;
+    sample.feedbackRejected = lifecycle.feedbackRejected;
+    sample.feedbackCancelled = lifecycle.feedbackCancelled;
+    sample.feedbackAborted = lifecycle.feedbackAborted;
+    sample.feedbackFaulted = lifecycle.feedbackFaulted;
+    sample.motionCaptureOverflow = lifecycle.motionCaptureOverflow;
+    sample.orphanFeedback = lifecycle.orphanFeedback;
+    sample.duplicateTerminalFeedback =
+        lifecycle.duplicateTerminalFeedback;
+    sample.terminalFeedbackConflict =
+        lifecycle.terminalFeedbackConflict;
+    sample.activeBlockOverwrite = lifecycle.activeBlockOverwrite;
+    sample.activeSegmentIndexOverwrite =
+        lifecycle.activeSegmentIndexOverwrite;
+
+    sample.feedbackOverflow =
+        m_motion.GetMotionFeedbackOverflowCount();
+    sample.feedbackNoticeOverflow =
+        m_motion.GetMotionFeedbackProducerNoticeOverflowCount();
+    sample.feedbackSequenceGap = m_motionFeedbackSequenceGapCount;
+
+    sample.safetyOrRecoveryPending =
+        m_motion.HasPendingSafetyOrRecoveryRequests();
+    sample.waitCallbackActive = m_waitCallback != nullptr;
+    sample.completionBindingActive =
+        m_blockCompletionBoundaryObserver.HasActiveBinding();
+
+    // NC-0.2J.5: lifecycle causes have different completion contracts.
+    // Reset requires its exact RT settle/rebase acknowledgement; Alarm keeps
+    // the legacy physical diagnostic; replacement/GOTO/failure paths need
+    // only a coherent transport/group drain.
+    const NCLifecycleInterruptionCause interruptionCause =
+        m_lifecycleInterruptionShadow.GetSnapshot().cause;
+    if (interruptionCause == NCLifecycleInterruptionCause::RESET)
+    {
+        const MotionNCResetRebaseAck resetAck =
+            m_motion.GetNCResetRebaseAck();
+        sample.groupStandstill =
+            m_resetNCSettleRequestSequence !=
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
+            resetAck.requestSequence ==
+            m_resetNCSettleRequestSequence &&
+            resetAck.executionEpoch == sample.executionEpoch &&
+            resetAck.owner == MotionOwner::SAFETY &&
+            m_safetyMotionLease.IsValid() &&
+            sample.ownerLease.owner == MotionOwner::SAFETY &&
+            sample.ownerLease.generation ==
+            m_safetyMotionLease.generation &&
+            resetAck.ownerGeneration ==
+            m_safetyMotionLease.generation &&
+            resetAck.requestedAxisMask != 0U &&
+            resetAck.requestedAxisMask == resetAck.appliedAxisMask &&
+            resetAck.requestAccepted &&
+            resetAck.rebaseApplied &&
+            resetAck.postVerifyPassed &&
+            resetAck.acknowledged &&
+            resetAck.acked &&
+            !resetAck.blocked &&
+            !resetAck.superseded;
+    }
+    else if (interruptionCause == NCLifecycleInterruptionCause::ALARM)
+    {
+        sample.groupStandstill = m_motion.IsGroupStandstill();
+    }
+    else
+    {
+        sample.groupStandstill = m_motion.IsGroupNCDrained();
+    }
+    return sample;
+}
+
+void NCManager::BeginLifecycleInterruptionShadow(
+    NCLifecycleInterruptionCause cause,
+    bool expectsEpochChange) noexcept
+{
+    m_lifecycleInterruptionShadow.Begin(
+        cause,
+        expectsEpochChange,
+        BuildLifecycleInterruptionSample());
+}
+
+void NCManager::RecordLifecycleInterruptionEpochPublished(
+    MotionExecutionEpoch executionEpoch) noexcept
+{
+    m_lifecycleInterruptionShadow.RecordEpochPublished(executionEpoch);
+}
+
+void NCManager::ObserveLifecycleInterruptionShadow() noexcept
+{
+    if (!m_lifecycleInterruptionShadow.IsActive())
+    {
+        return;
+    }
+
+    m_lifecycleInterruptionShadow.Observe(
+        BuildLifecycleInterruptionSample());
+}
+
 // ============================================================================
 // Stage NC-0.1D - NC Motion Feedback Snapshot / Counters
 // ============================================================================
@@ -763,6 +1049,20 @@ void NCManager::ProcessMotionFeedback() noexcept
         if (!m_motion.TryReadMotionFeedback(event))
         {
             break;
+        }
+
+        const bool lifecycleFailureFeedback =
+            IsLifecycleFailureFeedback(event.type);
+
+        // Capture the pre-event state. This must happen before the sequence
+        // check and Ledger apply so a gap revealed by this terminal event and
+        // the active Block that it is expected to close remain observable.
+        if (lifecycleFailureFeedback &&
+            !m_lifecycleInterruptionShadow.IsActive())
+        {
+            BeginLifecycleInterruptionShadow(
+                LifecycleInterruptionCauseFromFeedback(event.type),
+                false);
         }
 
         // Runtime Sequence 必須單調連續（UINT64_MAX 後回到 1）。
@@ -796,7 +1096,15 @@ void NCManager::ProcessMotionFeedback() noexcept
 
         // Stage NC-0.2D：只做觀察式 Lifecycle 更新，不改變既有 NC PC、
         // Wait Callback、Single Block 或 Motion 執行結果。
-        m_blockLifecycleLedger.ApplyMotionFeedback(event);
+        const bool ledgerAccepted =
+            m_blockLifecycleLedger.ApplyMotionFeedback(event);
+
+        if (lifecycleFailureFeedback)
+        {
+            m_lifecycleInterruptionShadow.RecordTerminalFeedback(
+                event,
+                ledgerAccepted);
+        }
 
         switch (event.type)
         {
@@ -825,6 +1133,11 @@ void NCManager::ProcessMotionFeedback() noexcept
             ++m_abortedMotionFeedbackCount;
             break;
 
+        case MotionFeedbackType::CANCELLED:
+            m_lastCancelledMotionIdentity = event.identity;
+            ++m_cancelledMotionFeedbackCount;
+            break;
+
         case MotionFeedbackType::FAULTED:
             m_lastFaultedMotionIdentity = event.identity;
             ++m_faultedMotionFeedbackCount;
@@ -834,7 +1147,6 @@ void NCManager::ProcessMotionFeedback() noexcept
         case MotionFeedbackType::PROGRESS:
         case MotionFeedbackType::HELD:
         case MotionFeedbackType::RESUMED:
-        case MotionFeedbackType::CANCELLED:
         default:
             break;
         }
@@ -868,6 +1180,11 @@ void NCManager::ProcessTask()
     // =========================================================
     m_edmState = GetMachineEDMState();
 
+    if (m_state != NCState::RUN)
+    {
+        ClearPreDispatchBarrier();
+    }
+
 
 
 
@@ -876,15 +1193,50 @@ void NCManager::ProcessTask()
     // 🚨 2. 【絕對防禦攔截網】警報與急停鎖死區
     // =========================================================
     // 不論是軟體觸發的 Alarm，或是從 UI 傳下來的 Alarm 狀態
-    if (AlarmManager::GetInstance().HasAlarm() || m_state == NCState::ALARM)
+    const bool alarmActive =
+        AlarmManager::GetInstance().HasAlarm() ||
+        m_state == NCState::ALARM;
+
+    if (alarmActive && !m_lifecycleInterruptionAlarmLatched)
     {
+        BeginLifecycleInterruptionShadow(
+            NCLifecycleInterruptionCause::ALARM,
+            false);
+        m_lifecycleInterruptionAlarmLatched = true;
+    }
+    else if (!alarmActive)
+    {
+        m_lifecycleInterruptionAlarmLatched = false;
+    }
+
+    if (alarmActive)
+    {
+        ClearPreDispatchBarrier();
         m_state = NCState::ALARM; // 確保 NC 大腦確實進入警報狀態
         CancelFeedHoldBoundaryShadow(false);
+
+        // A latched READY/P_END Cycle Start must never auto-run after an
+        // alarm is cleared.  The operator must Reset and press Cycle Start
+        // again from a newly verified ready state.
+        if (m_programRunStartPending)
+        {
+            ReleasePendingProgramRunMotionOwner();
+            CancelProgramEndBoundary();
+        }
 
         // 🌟 [關鍵新增]：只要在警報狀態，每一毫秒都強制下達急停！
         // (底層的 EmergencyStop 有防重複機制，所以這樣寫既安全又暴力)
 
         m_motion.RequestEmergencyStopAllAxes();
+
+        ObserveLifecycleInterruptionShadow();
+
+        // Alarm 或其他 lifecycle event 若取代進行中的 Reset，立即把
+        // Reset release gate 標成 blocked；不可保留過期的放行資格。
+        m_resetReleaseGate.ObserveBoundary(
+            m_lifecycleInterruptionShadow.GetSnapshot(),
+            m_motion.GetNCResetRebaseAck(),
+            m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease));
 
         // ⚠️ 立刻退出迴圈，絕對不准往下執行任何軌跡運算或 G 碼解析！
         return;
@@ -895,38 +1247,69 @@ void NCManager::ProcessTask()
     // =========================================================
     if (m_state == NCState::RESET_STATE)
     {
+        // NC-0.2J.3：先完成本圈 interruption evidence 觀察，再讓
+        // release gate 判斷。Legacy 的單次 IsGroupStandstill() 不再能
+        // 提早釋放 SAFETY owner 或將 NC 宣告為 READY。
+        ObserveLifecycleInterruptionShadow();
 
-        // 檢查硬體馬達是否「完全靜止」？
-        if (!m_motion.HasPendingSafetyOrRecoveryRequests() &&
-            m_motion.IsGroupStandstill())
+        const NCLifecycleInterruptionSnapshot resetBoundary =
+            m_lifecycleInterruptionShadow.GetSnapshot();
+        const MotionNCResetRebaseAck resetRebaseAck =
+            m_motion.GetNCResetRebaseAck();
+        m_resetReleaseGate.ObserveBoundary(
+            resetBoundary,
+            resetRebaseAck,
+            m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease));
+
+        if (m_resetReleaseGate.ShouldReleaseSafetyOwner())
         {
-
-
-            // 🛑 馬達完全靜止了！現在才是同步的完美時機！
-
-            // 1. 同步大腦的數學座標 (把實體座標拉回大腦)
-            CoordSys.SyncMachinePosition(CoordSys.actualMCS);
-
-            // 2. 同步手腳的虛擬預讀起點 (徹底消滅幽靈座標！)
-            m_motion.SyncVirtualEndPosition();
-
-            // 3. 只有原 Safety Generation 才能釋放；舊 Lease 不會誤放新 Owner。
-            if (m_safetyMotionLease.IsValid())
-            {
-                m_motion.ReleaseMotionOwner(
+            // NC-0.2J.5: close the proof-to-release window with one fresh ACK
+            // and one fresh exact-lease observation.  The second gate pass
+            // must still grant permission; release never consumes the older
+            // ACK that made the first pass ready.
+            const MotionNCResetRebaseAck releaseResetRebaseAck =
+                m_motion.GetNCResetRebaseAck();
+            const bool releaseSafetyLeaseCurrent =
+                m_motion.IsMotionOwnerLeaseCurrent(
                     m_safetyMotionLease);
+
+            m_resetReleaseGate.ObserveBoundary(
+                resetBoundary,
+                releaseResetRebaseAck,
+                releaseSafetyLeaseCurrent);
+
+            if (!m_resetReleaseGate.ShouldReleaseSafetyOwner())
+            {
+                return;
             }
 
-            m_safetyMotionLease = MotionOwnerLease{};
+            bool releaseSucceeded = false;
+            if (releaseSafetyLeaseCurrent)
+            {
+                // Use the exact RT Actual snapshot that was rebased and
+                // post-verified.  A later supervisory read must not create a
+                // different NC/Motion coordinate boundary.
+                CoordSys.SyncMachinePosition(
+                    releaseResetRebaseAck.actualMcsUnit);
+                releaseSucceeded =
+                    m_motion.ReleaseMotionOwner(
+                        m_safetyMotionLease);
+            }
 
-            // 4. 正式宣告機台準備就緒，可以接受下一個指令了！
-            m_state = NCState::READY;
-            // 🌟 清理完成後刷新變數
-            UpdateSystemVariables();
-            // DEBUG_PRINT("[NC] Reset Complete. Machine completely stopped.\n");
+            m_resetReleaseGate.MarkReleaseResult(
+                resetBoundary,
+                releaseResetRebaseAck,
+                releaseSafetyLeaseCurrent,
+                releaseSucceeded);
+
+            if (releaseSucceeded &&
+                m_resetReleaseGate.GetSnapshot().releaseApplied)
+            {
+                m_safetyMotionLease = MotionOwnerLease{};
+                m_state = NCState::READY;
+                UpdateSystemVariables();
+            }
         }
-
-
 
         // ⚠️ 只要還在滑行，就立刻 return，不准執行下面的 G 碼解析與模式分流！
         return;
@@ -937,11 +1320,45 @@ void NCManager::ProcessTask()
 // =========================================================
     if (m_edmState == EDMState::NOT_READY)
     {
+        ClearPreDispatchBarrier();
+
+        // Do not turn a temporary external/servo interlock recovery into an
+        // implicit Cycle Start.  Cancel the exact pending request and require
+        // a fresh operator edge after the machine is READY again.
+        if (m_programRunStartPending)
+        {
+            ReleasePendingProgramRunMotionOwner();
+            CancelProgramEndBoundary();
+        }
+
         if (m_state == NCState::RUN)
         {
             FeedHold();
         }
 
+        ObserveLifecycleInterruptionShadow();
+        return;
+    }
+
+    // =========================================================
+    // NC-0.2J.5.3：Fresh Program Run 必須等本次 Execution Epoch 已由
+    // 250 us Motion Runtime 消費後才能建立 Program-End baseline。
+    // 等待或套用的當圈一律 return，禁止同一個 10 ms scan 立刻 Dispatch。
+    // =========================================================
+    if (ProcessPendingProgramRunStart())
+    {
+        ObserveLifecycleInterruptionShadow();
+        return;
+    }
+
+    // =========================================================
+    // NC-0.2I.3：Deferred Feed Hold Resume 只能在 Alarm / Reset / Machine
+    // Ready Interlock 全部通過後套用。套用當圈直接 return，避免同一
+    // 10 ms 週期內又立刻 Dispatch 下一個 Block。
+    // =========================================================
+    if (ProcessFeedHoldResumeGate())
+    {
+        ObserveLifecycleInterruptionShadow();
         return;
     }
 
@@ -979,7 +1396,7 @@ void NCManager::ProcessTask()
         break;
     }
 
-
+    ObserveLifecycleInterruptionShadow();
 }
 
 
@@ -1035,18 +1452,24 @@ void NCManager::ProcessExecutionEngine()
             (activeWaitCallback == WaitForCycleStartCallback);
         const bool wasGMBlockTransaction =
             (activeWaitCallback == WaitForGMBlockTransactionCallback);
+        const bool wasControlledSingleBlockWait =
+            (activeWaitCallback ==
+                WaitForSingleBlockControlledHoldCallback);
 
         const bool legacyReady = activeWaitCallback(this);
         bool effectiveReady = legacyReady;
         if (!wasWaitingForStart)
         {
-            effectiveReady =
-                ApplyCompletionWaitBoundaryGuard(legacyReady);
+            if (!wasControlledSingleBlockWait)
+            {
+                effectiveReady =
+                    ApplyCompletionWaitBoundaryGuard(legacyReady);
+            }
 
-            // Stage NC-0.2I.1：只觀察目前 Single Block 的正確完成點。
-            // callbackComplete 使用 Legacy 子條件；Motion / Transaction
-            // 由 Shadow 自己再與 Ledger / NC-0.2H 狀態合併。
+            // Stage NC-0.2I.1 / I.4：先由 Shadow 證明完成點，再讓
+            // Controlled Gate 決定是否可建立真正的 Single Block HOLD。
             EvaluateSingleBlockShadow(legacyReady);
+            ObserveSingleBlockHoldGate();
         }
 
         if (!effectiveReady) return; // Legacy + Ledger 雙鑰尚未同時完成
@@ -1054,7 +1477,8 @@ void NCManager::ProcessExecutionEngine()
         // 先卸下已完成的舊 Callback / Binding；交易 Finalize 可能建立
         // Macro Flow 或 Program End 等下一個狀態，不可再被舊指標覆蓋。
         m_waitCallback = nullptr;
-        if (!wasWaitingForStart)
+        if (!wasWaitingForStart &&
+            !wasControlledSingleBlockWait)
         {
             ClearCompletionWaitBoundary(false);
         }
@@ -1068,6 +1492,7 @@ void NCManager::ProcessExecutionEngine()
             // 成功時可判斷 Transaction Boundary 已完整；失敗時則記錄
             // TXN_FAILED，仍然不改變既有 Alarm / Flow Control 行為。
             EvaluateSingleBlockShadow(true);
+            ObserveSingleBlockHoldGate();
 
             if (!transactionFinalized)
             {
@@ -1087,13 +1512,40 @@ void NCManager::ProcessExecutionEngine()
             return;
         }
 
+        // Controlled Gate 若仍在等待 Completion Boundary，接手成為
+        // 下一個等待條件。PC 不前進，NC 也不會先進入 HOLD。
+        if (m_singleBlockHoldGate.HasPendingControl() &&
+            !m_singleBlockHoldGate.ShouldApplyHold())
+        {
+            m_waitCallback =
+                WaitForSingleBlockControlledHoldCallback;
+            return;
+        }
+
+        // Boundary Failure 採 Fail-Closed。既有 Motion / Transaction Alarm
+        // 路徑會負責復歸；此處絕不前進到下一個 Block。
+        const NCSingleBlockHoldGateSnapshot singleBlockGateSnapshot =
+            m_singleBlockHoldGate.GetSnapshot();
+        if (singleBlockGateSnapshot.blocked &&
+            !singleBlockGateSnapshot.holdApplied)
+        {
+            return;
+        }
+
         // 🌟 動作跑完了 (例如 G00 移動到位或 M00 完成)
         // 1. 先安全推進 PC 到下一行 (讓 UI 畫面精準亮起下一行)
         if (m_state != NCState::ALARM && m_state != NCState::P_END && !m_programChanged) {
             advancePC();
         }
 
-        // 2. 如果這行有暫停要求 (M00/M01 或 單步模式)
+        // NC-0.2I.4：只有在完整 Boundary Ready 後才真正 HOLD。
+        if (m_singleBlockHoldGate.ShouldApplyHold())
+        {
+            (void)ApplyControlledSingleBlockHold();
+            return;
+        }
+
+        // 2. 如果這行有暫停要求 (M00/M01 或 Legacy 單步模式)
         if (m_pauseAfterBlock &&
             !m_programEndBoundary.IsEndPending() &&
             m_state != NCState::ALARM &&
@@ -1145,15 +1597,27 @@ void NCManager::ProcessExecutionEngine()
             if (currentIsMacro)
             {
                 // Macro EOF 仍是返回邊界，不是整份 Program End。
-                if (m_motion.GetQueueSize() > 0 ||
-                    !m_motion.IsGroupStandstill())
+                const std::uint64_t commandQueueDepth =
+                    static_cast<std::uint64_t>(m_motion.GetQueueSize());
+                const bool groupStandstill =
+                    m_motion.IsGroupNCDrained();
+                if (commandQueueDepth > 0ULL || !groupStandstill)
                 {
+                    ObservePreDispatchBarrier(
+                        NCPreDispatchBarrierKind::MACRO_EOF,
+                        currentPC,
+                        static_cast<int>(currentProgram->Size()) + 1,
+                        -1,
+                        commandQueueDepth,
+                        groupStandstill);
                     return;
                 }
+                ClearPreDispatchBarrier();
                 ReturnMacro(true);
             }
             else
             {
+                ClearPreDispatchBarrier();
                 // Stage NC-0.2G：自然檔尾不再直接 Release Owner / P_END。
                 // 由統一 Gate 等待所有預讀 Segment、Feedback 與實體停止。
                 RequestProgramEnd(
@@ -1191,6 +1655,7 @@ void NCManager::ProcessExecutionEngine()
         bool blockSkippedBySwitch = false;
         NCSingleBlockCandidateKind singleBlockCandidateKind =
             NCSingleBlockCandidateKind::NONE;
+        bool singleBlockExplicitStopBypass = false;
 
         const auto ensureBlockLifecycle = [&]() -> NCBlockDispatchId
         {
@@ -1258,10 +1723,22 @@ void NCManager::ProcessExecutionEngine()
         {
             // Macro 指派是 Program Commit Barrier。前段運動完整結束後，
             // 才能改變後續 Block 會讀到的變數狀態。
-            if (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupStandstill())
+            const std::uint64_t commandQueueDepth =
+                static_cast<std::uint64_t>(m_motion.GetQueueSize());
+            const bool groupStandstill =
+                m_motion.IsGroupNCDrained();
+            if (commandQueueDepth > 0ULL || !groupStandstill)
             {
+                ObservePreDispatchBarrier(
+                    NCPreDispatchBarrierKind::ASSIGNMENT,
+                    currentPC,
+                    sourceLineNumber,
+                    -1,
+                    commandQueueDepth,
+                    groupStandstill);
                 return;
             }
+            ClearPreDispatchBarrier();
 
             NCMacroAssignmentCommit assignment{};
             NCExpressionResolveError resolveError =
@@ -1298,10 +1775,22 @@ void NCManager::ProcessExecutionEngine()
         {
             // IF / GOTO 是控制流程 Barrier。條件也只在真正到達此 PC、
             // 且前段 Motion 已完成後才求值。
-            if (m_motion.GetQueueSize() > 0 || !m_motion.IsGroupStandstill())
+            const std::uint64_t commandQueueDepth =
+                static_cast<std::uint64_t>(m_motion.GetQueueSize());
+            const bool groupStandstill =
+                m_motion.IsGroupNCDrained();
+            if (commandQueueDepth > 0ULL || !groupStandstill)
             {
+                ObservePreDispatchBarrier(
+                    NCPreDispatchBarrierKind::GOTO_CONTROL,
+                    currentPC,
+                    sourceLineNumber,
+                    -1,
+                    commandQueueDepth,
+                    groupStandstill);
                 return;
             }
+            ClearPreDispatchBarrier();
 
             NCGotoDecision decision{};
             NCExpressionResolveError resolveError =
@@ -1347,9 +1836,14 @@ void NCManager::ProcessExecutionEngine()
                     return;
                 }
 
+                BeginLifecycleInterruptionShadow(
+                    NCLifecycleInterruptionCause::GOTO_EPOCH,
+                    true);
                 setPC(targetPC);
-                m_motion.BeginNewExecutionEpoch(
-                    GetMotionCommandSourceForMode(m_mode));
+                const MotionExecutionEpoch gotoEpoch =
+                    m_motion.BeginNewExecutionEpoch(
+                        GetMotionCommandSourceForMode(m_mode));
+                RecordLifecycleInterruptionEpochPublished(gotoEpoch);
                 m_motion.SyncVirtualEndPosition();
                 m_programChanged = true;
             }
@@ -1362,11 +1856,24 @@ void NCManager::ProcessExecutionEngine()
             // G/M/Address Expression 只要讀取 #/@/$，就必須等前段
             // Motion 完整 Commit 後才求值。這也涵蓋會隨 Runtime
             // 更新的 $ System Variable，避免 Lookahead 提早取樣。
-            if (parsedBlock.dependsOnMacroState &&
-                (m_motion.GetQueueSize() > 0 ||
-                    !m_motion.IsGroupStandstill()))
+            if (parsedBlock.dependsOnMacroState)
             {
-                return;
+                const std::uint64_t commandQueueDepth =
+                    static_cast<std::uint64_t>(m_motion.GetQueueSize());
+                const bool groupStandstill =
+                    m_motion.IsGroupNCDrained();
+                if (commandQueueDepth > 0ULL || !groupStandstill)
+                {
+                    ObservePreDispatchBarrier(
+                        NCPreDispatchBarrierKind::MACRO_DEPENDENCY,
+                        currentPC,
+                        sourceLineNumber,
+                        -1,
+                        commandQueueDepth,
+                        groupStandstill);
+                    return;
+                }
+                ClearPreDispatchBarrier();
             }
 
             NCBlock block{};
@@ -1409,6 +1916,15 @@ void NCManager::ProcessExecutionEngine()
             singleBlockCandidateKind =
                 ClassifySingleBlockCandidate(block);
 
+            if (block.mCount > 0)
+            {
+                const int singleBlockMCode = block.mCode[0];
+                singleBlockExplicitStopBypass =
+                    singleBlockMCode == 0 ||
+                    (singleBlockMCode == 1 &&
+                        m_isOptionalStopEnabled);
+            }
+
             bool isBarrier = false;
             if (block.mCount > 0)
             {
@@ -1431,11 +1947,57 @@ void NCManager::ProcessExecutionEngine()
                 isBarrier = true;
             }
 
-            if (isBarrier &&
-                (m_motion.GetQueueSize() > 0 ||
-                    !m_motion.IsGroupStandstill()))
+            if (isBarrier)
             {
-                return;
+                const std::uint64_t commandQueueDepth =
+                    static_cast<std::uint64_t>(m_motion.GetQueueSize());
+                const bool groupStandstill =
+                    m_motion.IsGroupNCDrained();
+                if (commandQueueDepth > 0ULL || !groupStandstill)
+                {
+                    NCPreDispatchBarrierKind barrierKind =
+                        NCPreDispatchBarrierKind::BLOCK_BARRIER;
+                    int barrierMCode = -1;
+
+                    if (block.mCount > 0)
+                    {
+                        barrierMCode = block.mCode[0];
+                        switch (barrierMCode)
+                        {
+                        case 0: barrierKind = NCPreDispatchBarrierKind::M00; break;
+                        case 1: barrierKind = NCPreDispatchBarrierKind::M01; break;
+                        case 2: barrierKind = NCPreDispatchBarrierKind::M02; break;
+                        case 30: barrierKind = NCPreDispatchBarrierKind::M30; break;
+                        case 98: barrierKind = NCPreDispatchBarrierKind::M98; break;
+                        case 99: barrierKind = NCPreDispatchBarrierKind::M99; break;
+                        default: break;
+                        }
+                    }
+                    else if (m_isSingleBlockEnabled)
+                    {
+                        barrierKind =
+                            NCPreDispatchBarrierKind::SINGLE_BLOCK_BARRIER;
+                    }
+                    else if (block.hasG)
+                    {
+                        barrierKind =
+                            NCPreDispatchBarrierKind::G_CODE_BARRIER;
+                    }
+
+                    ObservePreDispatchBarrier(
+                        barrierKind,
+                        currentPC,
+                        sourceLineNumber,
+                        barrierMCode,
+                        commandQueueDepth,
+                        groupStandstill);
+                    return;
+                }
+                ClearPreDispatchBarrier();
+            }
+            else
+            {
+                ClearPreDispatchBarrier();
             }
 
             const NCBlockDispatchId dispatchId = ensureBlockLifecycle();
@@ -1530,37 +2092,65 @@ void NCManager::ProcessExecutionEngine()
         // 一般 G/M Block 已先提交，重複呼叫由 lambda 保護。
         commitCurrentLine();
 
-        // Legacy Single Block 行為保持不變；NC-0.2I.1 只在旁邊比對。
-        if (m_isSingleBlockEnabled && m_state != NCState::P_END) {
-            m_pauseAfterBlock = true;
-            m_legacySingleBlockPausePending = true;
-        }
-
-        // 🌟 派發後收網處理
-        if (m_waitCallback == nullptr) {
-            if (m_pauseAfterBlock || m_programChanged) {
-                // 掛上等待馬達清空的 Callback，下一毫秒就會回到階段 A 放行並定格
-                m_waitCallback = WaitAndClearQueueCallback;
-            }
-            else {
-                advancePC(); // 沒事，直接推進下一行
-            }
-        }
-
-        if (m_isSingleBlockEnabled)
+        // NC-0.2I.4 Single Block Controlled Cutover。
+        //
+        // Gate Enabled:
+        //   只有真正可執行的 Block 才消耗一次 Cycle Start；完成點由
+        //   Program Commit + Callback/Transaction + Motion Ledger 證明。
+        //
+        // Gate Disabled：
+        //   完整回到原本 m_pauseAfterBlock 行為，包含空白/Label/Skip
+        //   可能產生的 Legacy HOLD，作為可驗證的 Rollback。
+        bool controlledSingleBlockRequested = false;
+        if (m_isSingleBlockEnabled &&
+            m_state != NCState::P_END)
         {
             const NCBlockDispatchId dispatchId =
                 ensureBlockLifecycle();
-
-            if (!blockSkippedBySwitch &&
+            const bool singleBlockEligible =
+                !blockSkippedBySwitch &&
                 singleBlockCandidateKind !=
-                NCSingleBlockCandidateKind::NONE)
+                NCSingleBlockCandidateKind::NONE;
+
+            if (singleBlockEligible)
             {
+                const bool legacyGateDisabled =
+                    !m_singleBlockHoldGate.IsEnabled();
+
+                // M00 與 Enabled M01 已有自己的 Explicit Stop。它們仍
+                // 由既有 Post Action 建立唯一 HOLD，不再疊加第二個
+                // Controlled Single Block HOLD。
+                m_legacySingleBlockPausePending =
+                    legacyGateDisabled ||
+                    singleBlockExplicitStopBypass;
+
+                if (legacyGateDisabled)
+                {
+                    m_pauseAfterBlock = true;
+                }
+
                 ArmSingleBlockShadow(
                     singleBlockCandidateKind,
                     dispatchId,
                     commitTarget,
                     sourceLineNumber);
+
+                const NCSingleBlockHoldGateRequestResult gateResult =
+                    m_singleBlockHoldGate.RequestControl(
+                        m_singleBlockBoundaryShadow.GetSnapshot(),
+                        singleBlockExplicitStopBypass);
+
+                controlledSingleBlockRequested =
+                    gateResult ==
+                    NCSingleBlockHoldGateRequestResult::CONTROLLED;
+
+                if (gateResult ==
+                    NCSingleBlockHoldGateRequestResult::BYPASS_LEGACY &&
+                    !singleBlockExplicitStopBypass)
+                {
+                    m_pauseAfterBlock = true;
+                    m_legacySingleBlockPausePending = true;
+                }
             }
             else
             {
@@ -1568,11 +2158,40 @@ void NCManager::ProcessExecutionEngine()
                     dispatchId,
                     commitTarget,
                     sourceLineNumber);
+
+                if (!m_singleBlockHoldGate.IsEnabled())
+                {
+                    // Legacy Rollback 必須保留原本的 Phantom-Hold 行為。
+                    m_pauseAfterBlock = true;
+                    m_legacySingleBlockPausePending = true;
+                }
+            }
+        }
+
+        // 🌟 派發後收網處理
+        if (m_waitCallback == nullptr)
+        {
+            if (controlledSingleBlockRequested)
+            {
+                // 不使用 Queue Empty 當作 Single Block 完成依據。
+                // Dedicated Callback 只等待已驗證的 Completion Boundary。
+                m_waitCallback =
+                    WaitForSingleBlockControlledHoldCallback;
+            }
+            else if (m_pauseAfterBlock || m_programChanged)
+            {
+                m_waitCallback = WaitAndClearQueueCallback;
+            }
+            else
+            {
+                advancePC();
             }
         }
 
         if (m_waitCallback != nullptr &&
             m_waitCallback != WaitForCycleStartCallback &&
+            m_waitCallback !=
+            WaitForSingleBlockControlledHoldCallback &&
             blockDispatchId != NC_BLOCK_DISPATCH_ID_INVALID)
         {
             BindCompletionWaitBoundary(
@@ -2320,6 +2939,11 @@ char NCManager::GetAxisName(
 // ==========================================
 bool NCManager::LoadMDI(const std::string& mdiContent)
 {
+    if (m_state == NCState::RESET_STATE)
+    {
+        return false;
+    }
+
     std::vector<std::string> rawLines;
     std::stringstream ss(mdiContent);
     std::string line;
@@ -2346,6 +2970,9 @@ bool NCManager::LoadMDI(const std::string& mdiContent)
         return false;
     }
 
+    BeginLifecycleInterruptionShadow(
+        NCLifecycleInterruptionCause::MDI_REPLACED,
+        true);
     CancelProgramEndBoundary();
     ClearCompletionWaitBoundary(true);
     CancelGMBlockTransaction(true);
@@ -2353,8 +2980,10 @@ bool NCManager::LoadMDI(const std::string& mdiContent)
     CancelFeedHoldBoundaryShadow(true);
     m_waitCallback = nullptr;
     ReleaseProgramMotionOwner();
-    m_motion.BeginNewExecutionEpoch(
-        MotionCommandSource::NC_MDI);
+    const MotionExecutionEpoch replacementEpoch =
+        m_motion.BeginNewExecutionEpoch(
+            MotionCommandSource::NC_MDI);
+    RecordLifecycleInterruptionEpochPublished(replacementEpoch);
 
     // 新的 Base Program Source 不可沿用上一份 MDI 的 Macro Frame / Cache。
     // 先清 Frame 再清 Cache，避免任何 Frame 指標懸空。
@@ -2377,6 +3006,11 @@ bool NCManager::LoadMDI(const std::string& mdiContent)
 // ==========================================
 bool NCManager::LoadManualAuto(const std::string& manualContent)
 {
+    if (m_state == NCState::RESET_STATE)
+    {
+        return false;
+    }
+
     if (manualContent.length() > MAX_MANUAL_AUTO_BYTES)
     {
         return false;
@@ -2401,6 +3035,9 @@ bool NCManager::LoadManualAuto(const std::string& manualContent)
         return false;
     }
 
+    BeginLifecycleInterruptionShadow(
+        NCLifecycleInterruptionCause::MANUAL_AUTO_REPLACED,
+        true);
     CancelProgramEndBoundary();
     ClearCompletionWaitBoundary(true);
     CancelGMBlockTransaction(true);
@@ -2408,8 +3045,10 @@ bool NCManager::LoadManualAuto(const std::string& manualContent)
     CancelFeedHoldBoundaryShadow(true);
     m_waitCallback = nullptr;
     ReleaseProgramMotionOwner();
-    m_motion.BeginNewExecutionEpoch(
-        MotionCommandSource::NC_MANUAL_AUTO);
+    const MotionExecutionEpoch replacementEpoch =
+        m_motion.BeginNewExecutionEpoch(
+            MotionCommandSource::NC_MANUAL_AUTO);
+    RecordLifecycleInterruptionEpochPublished(replacementEpoch);
 
     // 新的 Manual-Auto Source 建立全新的 Macro Session。
     m_macroStack.clear();
@@ -2432,6 +3071,11 @@ bool NCManager::LoadManualAuto(const std::string& manualContent)
 // ==========================================
 bool NCManager::LoadDynamicCode(const std::string& content)
 {
+    if (m_state == NCState::RESET_STATE)
+    {
+        return false;
+    }
+
     NCProgramCache* targetProgram = nullptr;
     int* targetPC = nullptr;
     int* targetCommittedPC = nullptr;
@@ -2474,6 +3118,9 @@ bool NCManager::LoadDynamicCode(const std::string& content)
         return false;
     }
 
+    BeginLifecycleInterruptionShadow(
+        NCLifecycleInterruptionCause::DYNAMIC_CODE_REPLACED,
+        true);
     CancelProgramEndBoundary();
     ClearCompletionWaitBoundary(true);
     CancelGMBlockTransaction(true);
@@ -2481,8 +3128,10 @@ bool NCManager::LoadDynamicCode(const std::string& content)
     CancelFeedHoldBoundaryShadow(true);
     m_waitCallback = nullptr;
     ReleaseProgramMotionOwner();
-    m_motion.BeginNewExecutionEpoch(
-        GetMotionCommandSourceForMode(m_mode));
+    const MotionExecutionEpoch replacementEpoch =
+        m_motion.BeginNewExecutionEpoch(
+            GetMotionCommandSourceForMode(m_mode));
+    RecordLifecycleInterruptionEpochPublished(replacementEpoch);
 
     // Dynamic Code 也是新的 Base Program Source；先摧毀所有指向 Macro
     // Cache 的 Frame，再清除 Cache，避免保留舊檔案或懸空指標。
@@ -2656,7 +3305,48 @@ NCProgramEndGateSample NCManager::BuildProgramEndGateSample() const noexcept
     sample.waitCallbackActive = m_waitCallback != nullptr;
     sample.completionBindingActive =
         m_blockCompletionBoundaryObserver.HasActiveBinding();
-    sample.groupStandstill = m_motion.IsGroupStandstill();
+
+    // NC-0.2J.5: acquire truth, publication identity and proof sequence from
+    // one coherent atomic-bank read.  ProgramEndBoundary can then require two
+    // distinct RT publications instead of counting one stale image twice.
+    MotionNCSettleSnapshot settleSnapshot{};
+    MotionNCSettleCounters settleCounters{};
+    const bool settleRead =
+        m_motion.TryGetNCSettleEvidence(
+            MotionNCSettleProfile::GROUP_COMPLETION,
+            settleSnapshot,
+            settleCounters);
+    sample.ncSettlePublicationGeneration =
+        settleRead ? settleSnapshot.publicationGeneration : 0ULL;
+    sample.ncSettleProofSequence =
+        settleRead ? settleSnapshot.proofSequence : 0ULL;
+
+    const bool exactProgramOwner =
+        m_programMotionLease.IsValid() &&
+        currentOwnerLease.Matches(m_programMotionLease);
+    const bool exactSettleIdentity =
+        settleSnapshot.executionEpoch == sample.executionEpoch &&
+        settleSnapshot.owner == currentOwnerLease.owner &&
+        settleSnapshot.ownerGeneration == currentOwnerLease.generation;
+
+    sample.groupStandstill =
+        settleRead &&
+        settleSnapshot.profile ==
+        MotionNCSettleProfile::GROUP_COMPLETION &&
+        sample.ownerLeaseCurrent &&
+        exactProgramOwner &&
+        exactSettleIdentity &&
+        settleSnapshot.publicationGeneration != 0ULL &&
+        settleSnapshot.proofSequence != 0ULL &&
+        settleSnapshot.scopeMask != 0U &&
+        settleSnapshot.runtimeObserved &&
+        settleSnapshot.runtimeCycleValid &&
+        settleSnapshot.runtimeCycleContiguous &&
+        settleSnapshot.requiredCycles ==
+        MOTION_NC_SETTLE_REQUIRED_CYCLES &&
+        settleSnapshot.dwellCycles >= settleSnapshot.requiredCycles &&
+        settleSnapshot.groupDrained &&
+        settleSnapshot.settled;
 
     sample.integrity.blockFailed = lifecycle.blockFailed;
     sample.integrity.ncDispatchFailed = lifecycle.ncDispatchFailed;
@@ -2706,6 +3396,134 @@ bool NCManager::BeginProgramRunBoundary(
         BuildProgramEndGateSample());
 }
 
+bool NCManager::IsPendingProgramRunStartIdentityCurrent() const noexcept
+{
+    return
+        m_programRunStartPending &&
+        m_pendingProgramRunExecutionEpoch !=
+        MOTION_EXECUTION_EPOCH_INVALID &&
+        (m_pendingProgramRunOriginState == NCState::READY ||
+            m_pendingProgramRunOriginState == NCState::P_END) &&
+        m_state == m_pendingProgramRunOriginState &&
+        m_mode == m_pendingProgramRunMode &&
+        GetBaseProgramScope() == m_pendingProgramRunScope &&
+        GetBaseProgramCache().GetGeneration() ==
+        m_pendingProgramRunCacheGeneration &&
+        m_programMotionLease.Matches(
+            m_pendingProgramRunOwnerLease) &&
+        m_motion.IsMotionOwnerLeaseCurrent(
+            m_pendingProgramRunOwnerLease) &&
+        m_motion.GetCurrentExecutionEpoch() ==
+        m_pendingProgramRunExecutionEpoch;
+}
+
+void NCManager::ReleasePendingProgramRunMotionOwner() noexcept
+{
+    const MotionOwnerLease pendingLease =
+        m_pendingProgramRunOwnerLease;
+
+    if (pendingLease.IsValid())
+    {
+        // Release only the lease captured by this button edge.  If HOME,
+        // Reset or another lifecycle path has already installed a newer lease,
+        // the generation guard makes this a harmless failed release.
+        (void)m_motion.ReleaseMotionOwner(pendingLease);
+    }
+
+    if (m_programMotionLease.Matches(pendingLease))
+    {
+        m_programMotionLease = MotionOwnerLease{};
+    }
+}
+
+void NCManager::ClearPendingProgramRunStart(bool cancelled) noexcept
+{
+    if (cancelled &&
+        m_programRunStartPending &&
+        m_pendingProgramRunMode == NCOperationMode::MANUAL)
+    {
+        m_manualAutoRunning = false;
+    }
+
+    m_programRunStartPending = false;
+    m_pendingProgramRunExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    m_pendingProgramRunOwnerLease = MotionOwnerLease{};
+    m_pendingProgramRunMode = NCOperationMode::EDIT;
+    m_pendingProgramRunOriginState = NCState::NOT_READY;
+    m_pendingProgramRunScope = NCProgramScope::NONE;
+    m_pendingProgramRunCacheGeneration =
+        NC_PROGRAM_CACHE_GENERATION_INVALID;
+}
+
+bool NCManager::ProcessPendingProgramRunStart() noexcept
+{
+    if (!m_programRunStartPending)
+    {
+        return false;
+    }
+
+    // Any state transition or newer lifecycle Epoch supersedes this exact
+    // button request.  Never retarget a pending start to whatever Epoch happens
+    // to be current after Reset/Stop/Fault.
+    if (!IsPendingProgramRunStartIdentityCurrent())
+    {
+        ReleasePendingProgramRunMotionOwner();
+        ClearPendingProgramRunStart(true);
+        m_programEndBoundary.Cancel();
+        m_programEndAlarmRaised = false;
+        return true;
+    }
+
+    const MotionExecutionEpoch pendingEpoch =
+        m_pendingProgramRunExecutionEpoch;
+
+    // This includes the start's own Epoch PENDING bit.  It can clear only in
+    // the 250 us consumer.  Real safety/recovery requests use the same wait and
+    // therefore remain fail-closed without being confused with START_DIRTY.
+    if (m_motion.HasPendingSafetyOrRecoveryRequests())
+    {
+        return true;
+    }
+
+    // Stage NC-0.2G：新 Program Run 只能從乾淨的 Lifecycle / Transport
+    // 邊界開始，避免把上一輪殘留算進新的 Cycle End。
+    if (!BeginProgramRunBoundary(pendingEpoch))
+    {
+        ReleasePendingProgramRunMotionOwner();
+        ClearPendingProgramRunStart(true);
+        return true;
+    }
+
+    // Close the sample-to-RUN seam.  A newer lifecycle publication or owner
+    // transfer after BeginRun invalidates the just-created baseline.
+    if (!IsPendingProgramRunStartIdentityCurrent() ||
+        m_motion.HasPendingSafetyOrRecoveryRequests())
+    {
+        ReleasePendingProgramRunMotionOwner();
+        ClearPendingProgramRunStart(true);
+        m_programEndBoundary.Cancel();
+        return true;
+    }
+
+    const bool startManualAuto =
+        m_pendingProgramRunMode == NCOperationMode::MANUAL &&
+        !m_manualProgramCache.Empty();
+    ClearPendingProgramRunStart(false);
+
+    if (m_mode == NCOperationMode::MANUAL)
+    {
+        m_manualAutoRunning = startManualAuto;
+    }
+
+    m_motion.SyncVirtualEndPosition();
+    UpdateSystemVariables();
+    m_state = NCState::RUN;
+
+    // The first block is intentionally dispatched on the next NC task.
+    return true;
+}
+
 bool NCManager::RequestProgramEnd(
     NCProgramEndCause cause,
     int sourcePC,
@@ -2715,6 +3533,7 @@ bool NCManager::RequestProgramEnd(
     m_pauseAfterBlock = false;
     m_legacySingleBlockPausePending = false;
     m_singleBlockBoundaryShadow.SuppressForProgramEnd();
+    ObserveSingleBlockHoldGate();
     m_programChanged = false;
 
     const MotionExecutionEpoch requestExecutionEpoch =
@@ -2791,6 +3610,27 @@ void NCManager::ProcessProgramEndBoundary()
 
 void NCManager::FinalizeProgramEnd()
 {
+    // NC-0.2J.5: rebuild and re-evaluate every formal input immediately
+    // before the permission action.  Do not finalize from the earlier scan's
+    // READY_TO_FINALIZE snapshot.
+    const NCProgramEndGateSample releaseSample =
+        BuildProgramEndGateSample();
+    if (!m_programEndBoundary.Evaluate(releaseSample))
+    {
+        return;
+    }
+
+    // CAS-release the exact Program lease before any modal, queue, callback,
+    // or NC state cleanup.  On failure retain both the lease and pending End
+    // boundary; the next Evaluate observes the current owner and fails closed.
+    if (!m_programMotionLease.IsValid() ||
+        !m_motion.ReleaseMotionOwner(m_programMotionLease))
+    {
+        return;
+    }
+
+    m_programMotionLease = MotionOwnerLease{};
+
     if (!m_programEndBoundary.MarkFinalized())
     {
         return;
@@ -2801,6 +3641,7 @@ void NCManager::FinalizeProgramEnd()
     CancelGMBlockTransaction(false);
     CancelFeedHoldBoundaryShadow(false);
     m_singleBlockBoundaryShadow.SuppressForProgramEnd();
+    ObserveSingleBlockHoldGate();
     m_pauseAfterBlock = false;
     m_legacySingleBlockPausePending = false;
     m_programChanged = false;
@@ -2812,7 +3653,6 @@ void NCManager::FinalizeProgramEnd()
 
     Reset_Gode();
     UpdateSystemVariables();
-    ReleaseProgramMotionOwner();
 
     if (m_mode == NCOperationMode::MANUAL)
     {
@@ -2833,6 +3673,72 @@ void NCManager::CancelProgramEndBoundary() noexcept
 {
     m_programEndBoundary.Cancel();
     m_programEndAlarmRaised = false;
+    ClearPendingProgramRunStart(true);
+}
+
+// =============================================================================
+// Stage NC-0.2J.4 - Pre-dispatch Stop / Settle Barrier Shadow
+// =============================================================================
+void NCManager::ObservePreDispatchBarrier(
+    NCPreDispatchBarrierKind kind,
+    int sourcePC,
+    int sourceLineNumber,
+    int mCode,
+    std::uint64_t commandQueueDepth,
+    bool groupStandstill) noexcept
+{
+    const bool sameBarrier =
+        m_preDispatchBarrierSnapshot.active &&
+        m_preDispatchBarrierSnapshot.kind == kind &&
+        m_preDispatchBarrierSnapshot.sourcePC == sourcePC &&
+        m_preDispatchBarrierSnapshot.sourceLineNumber == sourceLineNumber &&
+        m_preDispatchBarrierSnapshot.mCode == mCode;
+
+    if (!sameBarrier)
+    {
+        NCPreDispatchBarrierSnapshot snapshot{};
+        snapshot.sequence = m_nextPreDispatchBarrierSequence++;
+        if (snapshot.sequence == 0ULL)
+        {
+            snapshot.sequence = m_nextPreDispatchBarrierSequence++;
+        }
+        snapshot.kind = kind;
+        snapshot.sourcePC = sourcePC;
+        snapshot.sourceLineNumber = sourceLineNumber;
+        snapshot.mCode = mCode;
+        snapshot.active = true;
+        m_preDispatchBarrierSnapshot = snapshot;
+        ++m_preDispatchBarrierCounters.activations;
+    }
+
+    ++m_preDispatchBarrierSnapshot.waitSamples;
+    m_preDispatchBarrierSnapshot.commandQueueDepth = commandQueueDepth;
+    m_preDispatchBarrierSnapshot.commandQueuePending =
+        commandQueueDepth != 0ULL;
+    m_preDispatchBarrierSnapshot.groupStandstill = groupStandstill;
+
+    ++m_preDispatchBarrierCounters.evaluations;
+    if (commandQueueDepth != 0ULL)
+    {
+        ++m_preDispatchBarrierCounters.waitCommandQueue;
+    }
+    else if (!groupStandstill)
+    {
+        ++m_preDispatchBarrierCounters.waitGroupStandstill;
+    }
+}
+
+void NCManager::ClearPreDispatchBarrier() noexcept
+{
+    if (!m_preDispatchBarrierSnapshot.active)
+    {
+        return;
+    }
+
+    m_preDispatchBarrierSnapshot.active = false;
+    m_preDispatchBarrierSnapshot.commandQueueDepth = 0ULL;
+    m_preDispatchBarrierSnapshot.commandQueuePending = false;
+    ++m_preDispatchBarrierCounters.cleared;
 }
 
 // =============================================================================
@@ -3109,6 +4015,103 @@ void NCManager::CancelGMBlockTransaction(bool superseded) noexcept
 }
 
 // =============================================================================
+// Single Block panel mode
+// =============================================================================
+void NCManager::SetSingleBlockEnabled(bool enabled)
+{
+    if (m_isSingleBlockEnabled == enabled)
+    {
+        return;
+    }
+
+    const bool pendingControlledBoundary =
+        m_singleBlockHoldGate.HasPendingControl();
+    const bool controlledHoldApplied =
+        m_singleBlockHoldGate.IsHoldApplied();
+    const NCSingleBlockShadowSnapshot shadow =
+        m_singleBlockBoundaryShadow.GetSnapshot();
+
+    m_isSingleBlockEnabled = enabled;
+
+    if (enabled)
+    {
+        return;
+    }
+
+    m_pauseAfterBlock = false;
+    m_legacySingleBlockPausePending = false;
+
+    // Turning Single Block OFF while already stopped must not auto-run. Keep
+    // the applied HOLD until the operator presses Cycle Start once.
+    if (controlledHoldApplied)
+    {
+        return;
+    }
+
+    m_singleBlockBoundaryShadow.Cancel(false);
+    m_singleBlockHoldGate.Cancel(false);
+
+    // If the dedicated gate callback was the only current wait, convert it to
+    // the legacy completion drain without re-arming a HOLD. The current Block
+    // still completes safely, then continuous execution continues.
+    if (pendingControlledBoundary &&
+        m_waitCallback ==
+        WaitForSingleBlockControlledHoldCallback)
+    {
+        m_waitCallback = WaitAndClearQueueCallback;
+        if (shadow.dispatchId != NC_BLOCK_DISPATCH_ID_INVALID)
+        {
+            BindCompletionWaitBoundary(
+                shadow.dispatchId,
+                m_waitCallback);
+        }
+    }
+}
+
+// =============================================================================
+// Stage NC-0.2I.4 - Single Block Completion-Gated HOLD Controlled Cutover
+// =============================================================================
+void NCManager::SetSingleBlockCompletionGateEnabled(
+    bool enabled) noexcept
+{
+    if (m_singleBlockHoldGate.IsEnabled() == enabled)
+    {
+        return;
+    }
+
+    const bool hadPendingControl =
+        m_singleBlockHoldGate.HasPendingControl();
+    const NCSingleBlockShadowSnapshot shadow =
+        m_singleBlockBoundaryShadow.GetSnapshot();
+
+    m_singleBlockHoldGate.SetEnabled(enabled);
+
+    if (!enabled &&
+        hadPendingControl &&
+        m_isSingleBlockEnabled &&
+        m_state == NCState::RUN)
+    {
+        // Runtime Rollback：目前尚未完成的 Controlled Boundary 轉回
+        // Legacy Pause，不改變 PC、Motion Queue 或已派送 Segment。
+        m_pauseAfterBlock = true;
+        m_legacySingleBlockPausePending = true;
+
+        if (m_waitCallback == nullptr ||
+            m_waitCallback ==
+            WaitForSingleBlockControlledHoldCallback)
+        {
+            m_waitCallback = WaitAndClearQueueCallback;
+            if (shadow.dispatchId != NC_BLOCK_DISPATCH_ID_INVALID)
+            {
+                BindCompletionWaitBoundary(
+                    shadow.dispatchId,
+                    m_waitCallback);
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Stage NC-0.2I.1 - Single Block Completion Boundary Shadow
 // =============================================================================
 NCSingleBlockCandidateKind NCManager::ClassifySingleBlockCandidate(
@@ -3219,6 +4222,68 @@ void NCManager::EvaluateSingleBlockShadow(
     m_singleBlockBoundaryShadow.Evaluate(sample);
 }
 
+void NCManager::ObserveSingleBlockHoldGate() noexcept
+{
+    m_singleBlockHoldGate.ObserveBoundary(
+        m_singleBlockBoundaryShadow.GetSnapshot());
+}
+
+bool NCManager::ApplyControlledSingleBlockHold() noexcept
+{
+    if (m_state != NCState::RUN ||
+        !m_singleBlockHoldGate.ShouldApplyHold() ||
+        m_programEndBoundary.IsEndPending())
+    {
+        return false;
+    }
+
+    const NCSingleBlockShadowSnapshot boundary =
+        m_singleBlockBoundaryShadow.GetSnapshot();
+    if (!boundary.boundaryReady ||
+        boundary.motionFailed)
+    {
+        return false;
+    }
+
+    m_singleBlockBoundaryShadow.ObserveControlledHold();
+    m_singleBlockHoldGate.MarkHoldApplied(
+        m_singleBlockBoundaryShadow.GetSnapshot());
+
+    if (!m_singleBlockHoldGate.IsHoldApplied())
+    {
+        return false;
+    }
+
+    m_pauseAfterBlock = false;
+    m_legacySingleBlockPausePending = false;
+    m_state = NCState::HOLD;
+    m_waitCallback = WaitForCycleStartCallback;
+    return true;
+}
+
+bool NCManager::ApplyControlledSingleBlockResume() noexcept
+{
+    if (m_state != NCState::HOLD ||
+        !m_singleBlockHoldGate.IsHoldApplied())
+    {
+        return false;
+    }
+
+    if (!AcquireProgramMotionOwner())
+    {
+        return false;
+    }
+
+    m_singleBlockBoundaryShadow.ObserveControlledResume();
+    m_singleBlockHoldGate.MarkResumeApplied();
+
+    m_state = NCState::RUN;
+    m_motion.SetGroupFeedrateOverride(1.0);
+    m_pauseAfterBlock = false;
+    m_legacySingleBlockPausePending = false;
+    return true;
+}
+
 void NCManager::ObserveLegacySingleBlockHold() noexcept
 {
     // Refresh once more after NC-0.2H Post Action finalization.  This is still
@@ -3233,6 +4298,7 @@ void NCManager::CancelSingleBlockShadow(
     bool superseded) noexcept
 {
     m_singleBlockBoundaryShadow.Cancel(superseded);
+    m_singleBlockHoldGate.Cancel(superseded);
     m_legacySingleBlockPausePending = false;
 }
 
@@ -3248,6 +4314,8 @@ NCFeedHoldBoundarySample NCManager::BuildFeedHoldBoundarySample() const noexcept
         m_motion.GetMotionOwnerLease();
     sample.motion =
         m_motion.GetFeedHoldStopSnapshot();
+    sample.expectedSettleRequestSequence =
+        m_feedHoldNCSettleRequestSequence;
     sample.activePC =
         GetActiveDispatchPC();
     sample.legacyHoldState =
@@ -3298,6 +4366,16 @@ NCFeedHoldBoundarySample NCManager::BuildFeedHoldBoundarySample() const noexcept
 void NCManager::BeginFeedHoldBoundaryShadow(
     NCFeedHoldSource source) noexcept
 {
+    if (source != NCFeedHoldSource::PROGRAM)
+    {
+        m_feedHoldNCSettleRequestSequence =
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+    }
+
+    // A new Feed Hold Request supersedes any deferred Resume belonging to an
+    // older Request sequence.  Terminal Gate diagnostics remain untouched.
+    m_feedHoldResumeGate.Cancel(true);
+
     m_feedHoldBoundaryShadow.BeginRequest(
         source,
         BuildFeedHoldBoundarySample());
@@ -3305,31 +4383,43 @@ void NCManager::BeginFeedHoldBoundaryShadow(
 
 void NCManager::ObserveFeedHoldBoundaryShadow() noexcept
 {
-    if (!m_feedHoldBoundaryShadow.IsActive())
+    if (m_feedHoldBoundaryShadow.IsActive())
     {
+        NCFeedHoldBoundarySample sample =
+            BuildFeedHoldBoundarySample();
+        m_feedHoldBoundaryShadow.Observe(sample);
+
+        NCFeedHoldBoundarySnapshot snapshot =
+            m_feedHoldBoundaryShadow.GetSnapshot();
+
+        // HOME permits Cycle Start while controlled deceleration is still
+        // active. HomingManager queues the request and later changes NC back
+        // to RUN after it has internally reached PAUSED. Record that
+        // asynchronous apply point. NC-0.2I.3 does not gate HOME yet.
+        if (snapshot.active &&
+            snapshot.source == NCFeedHoldSource::HOME &&
+            snapshot.resumeRequested &&
+            m_state == NCState::RUN &&
+            !Homing.IsHoldDecelerating() &&
+            !Homing.IsPaused())
+        {
+            sample = BuildFeedHoldBoundarySample();
+            m_feedHoldBoundaryShadow.ObserveResumeApplied(sample);
+            snapshot = m_feedHoldBoundaryShadow.GetSnapshot();
+        }
+
+        // The control gate observes the exact same immutable Boundary
+        // snapshot that is published to diagnostics.  It never samples Axis
+        // data independently and therefore cannot disagree with the ACK
+        // observer about Request identity or stop completion.
+        m_feedHoldResumeGate.ObserveBoundary(snapshot);
         return;
     }
 
-    NCFeedHoldBoundarySample sample =
-        BuildFeedHoldBoundarySample();
-    m_feedHoldBoundaryShadow.Observe(sample);
-
-    const NCFeedHoldBoundarySnapshot snapshot =
-        m_feedHoldBoundaryShadow.GetSnapshot();
-
-    // HOME permits Cycle Start while controlled deceleration is still active.
-    // HomingManager queues the request and later changes NC back to RUN after
-    // it has internally reached PAUSED. Record that asynchronous apply point.
-    if (snapshot.active &&
-        snapshot.source == NCFeedHoldSource::HOME &&
-        snapshot.resumeRequested &&
-        m_state == NCState::RUN &&
-        !Homing.IsHoldDecelerating() &&
-        !Homing.IsPaused())
-    {
-        sample = BuildFeedHoldBoundarySample();
-        m_feedHoldBoundaryShadow.ObserveResumeApplied(sample);
-    }
+    // Keep a pending Gate synchronized with a terminal FAILED/CANCELLED/
+    // RESUMED Boundary snapshot even after the observer itself became inactive.
+    m_feedHoldResumeGate.ObserveBoundary(
+        m_feedHoldBoundaryShadow.GetSnapshot());
 }
 
 void NCManager::ObserveFeedHoldLegacyHoldShadow() noexcept
@@ -3354,6 +4444,82 @@ void NCManager::CancelFeedHoldBoundaryShadow(
     bool superseded) noexcept
 {
     m_feedHoldBoundaryShadow.Cancel(superseded);
+    m_feedHoldResumeGate.Cancel(superseded);
+}
+
+// =============================================================================
+// Stage NC-0.2I.3 - Program Feed Hold ACK-Gated Resume Controlled Cutover
+// =============================================================================
+bool NCManager::IsProgramFeedHoldResumeCandidate() const noexcept
+{
+    const NCFeedHoldBoundarySnapshot snapshot =
+        m_feedHoldBoundaryShadow.GetSnapshot();
+
+    return
+        snapshot.sequence != 0ULL &&
+        snapshot.source == NCFeedHoldSource::PROGRAM &&
+        snapshot.requestLatched &&
+        !snapshot.resumeApplied &&
+        !snapshot.cancelled;
+}
+
+bool NCManager::ApplyProgramHoldResume(
+    bool gateControlled) noexcept
+{
+    if (m_state != NCState::HOLD)
+    {
+        return false;
+    }
+
+    if (!AcquireProgramMotionOwner())
+    {
+        // The Gate remains RELEASE_READY and will retry from ProcessTask after
+        // the current Owner arbitration becomes valid.  No state or Override
+        // is changed on this failed attempt.
+        return false;
+    }
+
+    // A Cycle Start is considered applied only here.  Early button presses do
+    // not consume Single Block state and do not clear the current Wait Callback.
+    m_singleBlockBoundaryShadow.ObserveLegacyResume();
+    m_legacySingleBlockPausePending = false;
+
+    m_state = NCState::RUN;
+    m_motion.SetGroupFeedrateOverride(1.0);
+    m_pauseAfterBlock = false;
+
+    ObserveFeedHoldResumeAppliedShadow();
+
+    if (gateControlled)
+    {
+        m_feedHoldResumeGate.MarkResumeApplied(
+            m_feedHoldBoundaryShadow.GetSnapshot());
+    }
+
+    return true;
+}
+
+bool NCManager::ProcessFeedHoldResumeGate() noexcept
+{
+    // Refresh terminal failure / ACK information before deciding whether the
+    // deferred button request may become a real Resume.
+    m_feedHoldResumeGate.ObserveBoundary(
+        m_feedHoldBoundaryShadow.GetSnapshot());
+
+    if (!m_feedHoldResumeGate.ShouldApplyResume())
+    {
+        return false;
+    }
+
+    // Fail closed: an ACK release can only be applied while the legacy NC flow
+    // is still frozen in HOLD.  Alarm/Reset/Not-Ready paths return earlier and
+    // cancel or preserve the request without starting motion.
+    if (m_state != NCState::HOLD)
+    {
+        return false;
+    }
+
+    return ApplyProgramHoldResume(true);
 }
 
 // =============================================================================
@@ -3434,8 +4600,21 @@ void NCManager::ClearCompletionWaitBoundary(
 
 // 1. 等待馬達靜止
 bool NCManager::WaitAndHoldCallback(NCManager* nc) {
-    if (nc->m_motion.GetQueueSize() > 0 || !nc->m_motion.IsGroupStandstill()) return false;
+    if (nc->m_motion.GetQueueSize() > 0 || !nc->m_motion.IsGroupNCDrained()) return false;
     return true;
+}
+
+// NC-0.2I.4：只等待已驗證的 Single Block Completion Boundary。
+bool NCManager::WaitForSingleBlockControlledHoldCallback(NCManager* nc)
+{
+    if (nc == nullptr)
+    {
+        return false;
+    }
+
+    nc->EvaluateSingleBlockShadow(true);
+    nc->ObserveSingleBlockHoldGate();
+    return nc->m_singleBlockHoldGate.ShouldApplyHold();
 }
 
 // 2. 🌟 專門等待操作員按下 Cycle Start 的卡點
@@ -3448,7 +4627,7 @@ bool NCManager::WaitForCycleStartCallback(NCManager* nc) {
 
 // 3. 只等待馬達靜止 (清空預讀)
 bool NCManager::WaitAndClearQueueCallback(NCManager* nc) {
-    if (nc->m_motion.GetQueueSize() > 0 || !nc->m_motion.IsGroupStandstill()) return false;
+    if (nc->m_motion.GetQueueSize() > 0 || !nc->m_motion.IsGroupNCDrained()) return false;
     return true;
 }
 // ==========================================================

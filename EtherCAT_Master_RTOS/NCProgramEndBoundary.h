@@ -155,6 +155,12 @@ struct NCProgramEndGateSample
     MotionFeedbackSequence lastConsumedFeedbackSequence =
         MOTION_FEEDBACK_SEQUENCE_INVALID;
 
+    // Stage NC-0.2J.5: two supervisory confirmations must consume two
+    // different RT publications carrying the same nonzero proof sequence.
+    // A stopped Runtime or a new proof episode cannot complete an older one.
+    std::uint64_t ncSettlePublicationGeneration = 0ULL;
+    std::uint64_t ncSettleProofSequence = 0ULL;
+
     bool ownerLeaseCurrent = false;
     bool safetyOrRecoveryPending = false;
     bool waitCallbackActive = false;
@@ -201,6 +207,9 @@ struct NCProgramEndGateSnapshot
         MOTION_FEEDBACK_SEQUENCE_INVALID;
     MotionFeedbackSequence lastConsumedFeedbackSequence =
         MOTION_FEEDBACK_SEQUENCE_INVALID;
+
+    std::uint64_t ncSettlePublicationGeneration = 0ULL;
+    std::uint64_t ncSettleProofSequence = 0ULL;
 
     std::uint64_t integrityDelta = 0ULL;
     std::uint32_t stablePasses = 0U;
@@ -361,6 +370,8 @@ private:
         MOTION_EXECUTION_EPOCH_INVALID;
     MotionOwnerLease m_requestOwnerLease{};
     std::uint32_t m_stablePasses = 0U;
+    std::uint64_t m_lastStableSettlePublicationGeneration = 0ULL;
+    std::uint64_t m_stableSettleProofSequence = 0ULL;
 
     bool m_runActive = false;
     bool m_endPending = false;

@@ -692,9 +692,9 @@ struct InterpolationGroup// 插補群組
     //參與軸與投影參數 (用於直線插補)------------------------------------------------------
 
     int  axisCount = 0;// 參與聯動的實體軸總數 (例如 2 軸或 3 軸)
-    int  axisIndices[MAX_AXES];// 記錄參與軸的編號清單 (例如 {0, 1} 代表 X, Y 軸)
-    double startPos[MAX_AXES];// 記錄各段路徑開始時，各實體軸的起點位置 (Snapshot)
-    double ratio[MAX_AXES];// 方向向量/分量比例 (單位路徑位移時，各軸應分配的比例)
+    int  axisIndices[MAX_AXES] = { 0 };// 記錄參與軸的編號清單 (例如 {0, 1} 代表 X, Y 軸)
+    double startPos[MAX_AXES] = { 0.0 };// 記錄各段路徑開始時，各實體軸的起點位置 (Snapshot)
+    double ratio[MAX_AXES] = { 0.0 };// 方向向量/分量比例 (單位路徑位移時，各軸應分配的比例)
 
 
 
@@ -865,11 +865,338 @@ struct MotionFeedHoldStopSnapshot
     bool commandStopped = true;
     bool actualStopped = true;
     bool motionStopped = true;
+
+    // Stage NC-0.2J.5: formal Feed Hold settle proof.  The legacy raw
+    // encoder velocity fields above remain diagnostic-only; NC release gates
+    // correlate this request identity with the 250 us continuous proof.
+    std::uint64_t settleRequestSequence = 0ULL;
+    std::uint64_t settleProofSequence = 0ULL;
+    std::uint32_t settleScopeMask = 0U;
+    std::uint32_t settleDwellCycles = 0U;
+    std::uint32_t settleRequiredCycles = 0U;
+    bool settleRequestAccepted = false;
+    bool settleProofValid = false;
+    bool ncSettled = false;
 };
 
 static_assert(
     std::is_trivially_copyable<MotionFeedHoldStopSnapshot>::value,
     "MotionFeedHoldStopSnapshot must remain trivially copyable.");
+
+
+// =============================================================================
+// Stage NC-0.2J.4 - Motion Stop / Settle Evidence Shadow
+//
+// This is diagnostic evidence only.  It mirrors the existing
+// IsGroupStandstill() predicate without granting permission to release any
+// NC gate.  The 250 us Motion owner publishes a fixed-size snapshot; readers
+// never inspect AxisContext directly.
+// =============================================================================
+enum class MotionStopSettlePrimaryBlocker : std::uint8_t
+{
+    NONE = 0,
+    GROUP_ACTIVE = 1,
+    COMMAND_QUEUE = 2,
+    AXIS_NOT_IDLE = 3,
+    AXIS_COMMAND_VELOCITY = 4,
+    AXIS_ACTUAL_VELOCITY = 5
+};
+
+
+struct MotionStopSettleCounters
+{
+    std::uint64_t sampleCount = 0ULL;
+    std::uint64_t standstillSampleCount = 0ULL;
+    std::uint64_t blockedSampleCount = 0ULL;
+
+    std::uint64_t noneBlockerCount = 0ULL;
+    std::uint64_t groupActiveBlockerCount = 0ULL;
+    std::uint64_t commandQueueBlockerCount = 0ULL;
+    std::uint64_t axisNotIdleBlockerCount = 0ULL;
+    std::uint64_t axisCommandVelocityBlockerCount = 0ULL;
+    std::uint64_t axisActualVelocityBlockerCount = 0ULL;
+
+    std::uint64_t primaryBlockerTransitionCount = 0ULL;
+    std::uint64_t standstillTransitionCount = 0ULL;
+    std::uint64_t transitionIntoStandstillCount = 0ULL;
+    std::uint64_t transitionOutOfStandstillCount = 0ULL;
+};
+
+
+struct MotionStopSettleSnapshot
+{
+    std::uint64_t publicationGeneration = 0ULL;
+    std::uint64_t sampleSequence = 0ULL;
+
+    MotionStopSettlePrimaryBlocker primaryBlocker =
+        MotionStopSettlePrimaryBlocker::NONE;
+    std::int32_t primaryAxisIndex = -1;
+    MotionState primaryAxisState = MotionState::MotionState_IDLE;
+
+    bool standstill = false;
+    bool groupActive = false;
+
+    std::uint32_t commandQueueDepth = 0U;
+    std::uint32_t commandIngressDepth = 0U;
+    std::uint32_t commandReplayDepth = 0U;
+    std::uint32_t groupAxisCount = 0U;
+
+    std::uint32_t existingAxisCount = 0U;
+    std::uint32_t nonIdleAxisCount = 0U;
+    std::uint32_t commandMovingAxisCount = 0U;
+    std::uint32_t actualMovingAxisCount = 0U;
+    std::uint32_t outsideInPositionWindowAxisCount = 0U;
+    std::uint32_t groupOutsideInPositionWindowAxisCount = 0U;
+    std::uint32_t pdoTargetVelocitySampledAxisCount = 0U;
+    std::uint32_t pdoTargetVelocityNonzeroAxisCount = 0U;
+
+    double commandVelocityDeadbandPps = 1.0;
+    double actualVelocityDeadbandPps = 1.0 / CYCLE_TIME_SEC;
+
+    std::int32_t worstCommandVelocityAxisIndex = -1;
+    double maxAxisCommandVelocityAbsPps = 0.0;
+
+    std::int32_t worstActualVelocityAxisIndex = -1;
+    double maxAxisActualVelocityAbsPps = 0.0;
+
+    std::int32_t worstFinalPdoTargetVelocityAxisIndex = -1;
+    std::int32_t worstFinalPdoTargetVelocity = 0;
+    std::uint32_t maxFinalPdoTargetVelocityAbs = 0U;
+
+    // Worst following-error axis is selected by Error / Window ratio across
+    // all enabled physical axes.  Values are absolute observer evidence and
+    // are not part of IsGroupStandstill().
+    std::int32_t worstFollowingErrorAxisIndex = -1;
+    double worstFollowingErrorAbsMm = 0.0;
+    double worstFollowingErrorWindowMm = 0.0;
+    double worstFollowingErrorWindowRatio = 0.0;
+
+    // Same evidence restricted to the current interpolation group.  This is
+    // the useful explanation while GROUP_ACTIVE is waiting for G00/G01
+    // endpoint pull-in.
+    std::int32_t worstGroupFollowingErrorAxisIndex = -1;
+    double worstGroupFollowingErrorAbsMm = 0.0;
+    double worstGroupFollowingErrorWindowMm = 0.0;
+    double worstGroupFollowingErrorWindowRatio = 0.0;
+
+    std::int32_t maxStopDecTimeAxisIndex = -1;
+    double maxConfiguredStopDecTimeSec = 0.0;
+};
+
+
+static_assert(
+    std::is_trivially_copyable<MotionStopSettleCounters>::value,
+    "MotionStopSettleCounters must remain trivially copyable.");
+
+static_assert(
+    std::is_trivially_copyable<MotionStopSettleSnapshot>::value,
+    "MotionStopSettleSnapshot must remain trivially copyable.");
+
+
+// =============================================================================
+// Stage NC-0.2J.5 - NC Settle Truth Model
+//
+// A gate receives permission only after 200 adjacent, valid 250 us Runtime
+// samples (50 ms).  Encoder-derived currentActVel and final PDO velocity stay
+// in the J.4 shadow above as advisory evidence and are deliberately absent
+// from the formal predicate.
+// =============================================================================
+using MotionNCSettleRequestSequence = std::uint64_t;
+
+constexpr MotionNCSettleRequestSequence
+MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID = 0ULL;
+
+constexpr std::uint32_t MOTION_NC_SETTLE_REQUIRED_CYCLES = 200U;
+
+enum class MotionNCSettleProfile : std::uint8_t
+{
+    GROUP_COMPLETION = 0,
+    FEED_HOLD_GROUP = 1,
+    RESET_ALL = 2,
+    COUNT = 3
+};
+
+enum class MotionNCSettleBlocker : std::uint8_t
+{
+    NONE = 0,
+    RUNTIME_NOT_OBSERVED = 1,
+    RUNTIME_INVALID = 2,
+    RUNTIME_GAP = 3,
+    REQUEST_MISSING = 4,
+    EXECUTION_EPOCH_MISMATCH = 5,
+    OWNER_LEASE_MISMATCH = 6,
+    SCOPE_CHANGED = 7,
+    GROUP_ACTIVE = 8,
+    COMMAND_QUEUE = 9,
+    FEED_OVERRIDE_NONZERO = 10,
+    SAFETY_OR_RECOVERY_PENDING = 11,
+    AXIS_FAULT_OR_ESTOP = 12,
+    AXIS_SERVO_OFF = 13,
+    AXIS_STATE = 14,
+    COMMAND_VELOCITY = 15,
+    COMMAND_POSITION_CHANGED = 16,
+    IN_POSITION_WINDOW_INVALID = 17,
+    FOLLOWING_ERROR = 18,
+    ACTUAL_EXCURSION = 19,
+    RESET_UNSUPPORTED = 20,
+    COMPENSATION_ACTIVE = 21,
+    PATH_RUNTIME_UNSUPPORTED = 22,
+    REBASE_IN_PROGRESS = 23,
+    REBASE_VERIFY_FAILED = 24,
+    PUBLICATION_BUSY = 25,
+    SCOPE_EMPTY = 26
+};
+
+struct MotionNCSettleCounters
+{
+    std::uint64_t sampleCount = 0ULL;
+    std::uint64_t candidateStartCount = 0ULL;
+    std::uint64_t candidateResetCount = 0ULL;
+    std::uint64_t proofRiseCount = 0ULL;
+    std::uint64_t proofRevokeCount = 0ULL;
+    std::uint64_t invalidRuntimeCycleCount = 0ULL;
+    std::uint64_t runtimeGapCount = 0ULL;
+    std::uint64_t identityResetCount = 0ULL;
+    std::uint64_t scopeResetCount = 0ULL;
+    std::uint64_t requestRejectCount = 0ULL;
+    std::uint64_t publicationReadFailureCount = 0ULL;
+};
+
+struct MotionNCSettleSnapshot
+{
+    std::uint64_t publicationGeneration = 0ULL;
+    std::uint64_t sampleSequence = 0ULL;
+    std::uint64_t runtimeCycleTick = 0ULL;
+    MotionNCSettleRequestSequence requestSequence =
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+    std::uint64_t proofSequence = 0ULL;
+
+    MotionNCSettleProfile profile =
+        MotionNCSettleProfile::GROUP_COMPLETION;
+    MotionNCSettleBlocker blocker =
+        MotionNCSettleBlocker::RUNTIME_NOT_OBSERVED;
+    std::int32_t blockerAxisIndex = -1;
+
+    MotionExecutionEpoch executionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionOwner owner = MotionOwner::NONE;
+    MotionOwnerGeneration ownerGeneration =
+        MOTION_OWNER_GENERATION_INVALID;
+
+    std::uint32_t scopeMask = 0U;
+    std::uint32_t dwellCycles = 0U;
+    std::uint32_t requiredCycles = MOTION_NC_SETTLE_REQUIRED_CYCLES;
+
+    bool runtimeObserved = false;
+    bool runtimeCycleValid = false;
+    bool runtimeCycleContiguous = false;
+    bool requestAccepted = false;
+    bool groupActive = false;
+    bool groupDrained = false;
+    bool safetyOrRecoveryPending = false;
+    bool anyAxisFaultOrEstop = false;
+    bool overrideZero = false;
+    bool virtualCommandStopped = false;
+    bool allAxisCommandStopped = false;
+    bool candidate = false;
+    bool settled = false;
+    bool rebasePreProofPassed = false;
+    bool rebasePostProofPassed = false;
+
+    std::uint32_t commandQueueDepth = 0U;
+    std::uint32_t commandIngressDepth = 0U;
+    std::uint32_t commandReplayDepth = 0U;
+
+    double maxCommandVelocityAbsPps = 0.0;
+    double feedrateOverride = 1.0;
+    double virtualCommandVelocityAbsPps = 0.0;
+    std::int32_t worstCommandVelocityAxisIndex = -1;
+    double worstFollowingErrorAbsPulse = 0.0;
+    double worstFollowingWindowPulse = 0.0;
+    std::int32_t worstFollowingErrorAxisIndex = -1;
+    double worstActualExcursionPulse = 0.0;
+    double worstActualExcursionLimitPulse = 0.0;
+    std::int32_t worstActualExcursionAxisIndex = -1;
+
+    // Advisory only.  Neither value can block or revoke settled=true.
+    double advisoryMaxActualVelocityAbsPps = 0.0;
+    std::uint32_t advisoryMaxPdoTargetVelocityAbs = 0U;
+};
+
+// Modal/physical tags captured by NC when Reset starts.  The RT rebase ACK
+// returns the same POD, proving the acknowledgement belongs to that exact
+// lifecycle transaction rather than to an older reset.
+struct MotionNCResetExecutionState
+{
+    std::int32_t physicalExecutionPC = 0;
+    std::int32_t physicalExecutionWCS = 54;
+    std::int32_t physicalToolMode = 49;
+    std::int32_t physicalHCode = 0;
+    std::int32_t physicalToolRadiusMode = 40;
+    std::int32_t physicalDCode = 0;
+    std::int32_t physicalWCode = 0;
+    std::int32_t physicalPlaneMode = 17;
+    std::uint8_t physicalMirrorMask = 0U;
+    bool physicalIsAbsoluteMode = true;
+    bool physicalG68Active = false;
+    bool physicalG168Active = false;
+    bool physicalG51Active = false;
+    bool physicalG16Active = false;
+    bool physicalG162Active = true;
+    double physicalG68Angle = 0.0;
+    double physicalScaleRatio = 1.0;
+};
+
+enum class MotionNCResetRebasePhase : std::uint8_t
+{
+    IDLE = 0,
+    WAIT_PREPROOF = 1,
+    CLEARING_BUFFERS = 2,
+    WAIT_POSTPROOF = 3,
+    ACKNOWLEDGED = 4,
+    BLOCKED = 5,
+    SUPERSEDED = 6
+};
+
+struct MotionNCResetRebaseAck
+{
+    MotionNCSettleRequestSequence requestSequence =
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+    MotionExecutionEpoch executionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionOwner owner = MotionOwner::NONE;
+    MotionOwnerGeneration ownerGeneration =
+        MOTION_OWNER_GENERATION_INVALID;
+    std::uint32_t requestedAxisMask = 0U;
+    std::uint32_t appliedAxisMask = 0U;
+    MotionNCResetRebasePhase phase = MotionNCResetRebasePhase::IDLE;
+    MotionNCSettleBlocker failureBlocker = MotionNCSettleBlocker::NONE;
+    bool requestAccepted = false;
+    bool rebaseApplied = false;
+    bool postVerifyPassed = false;
+    bool acknowledged = false;
+    bool acked = false;
+    bool blocked = false;
+    bool superseded = false;
+    bool unsupportedFaultOrEstop = false;
+    bool compensationBlocked = false;
+    MotionNCResetExecutionState executionState{};
+    double actualPulse[MAX_AXES] = { 0.0 };
+    double actualMcsUnit[MAX_AXES] = { 0.0 };
+};
+
+static_assert(
+    std::is_trivially_copyable<MotionNCSettleCounters>::value,
+    "MotionNCSettleCounters must remain trivially copyable.");
+static_assert(
+    std::is_trivially_copyable<MotionNCSettleSnapshot>::value,
+    "MotionNCSettleSnapshot must remain trivially copyable.");
+static_assert(
+    std::is_trivially_copyable<MotionNCResetExecutionState>::value,
+    "MotionNCResetExecutionState must remain trivially copyable.");
+static_assert(
+    std::is_trivially_copyable<MotionNCResetRebaseAck>::value,
+    "MotionNCResetRebaseAck must remain trivially copyable.");
 
 
 //核心類別宣告--------------------------------------------------------------------
@@ -1008,11 +1335,7 @@ public:
     // B2 push-front 行為由 RT 專用固定 Replay 區承接。
     // ========================================================================
     MotionExecutionEpoch BeginNewExecutionEpoch(MotionCommandSource source) noexcept;
-
-    MotionExecutionEpoch GetCurrentExecutionEpoch() const noexcept
-    {
-        return m_executionEpoch.load(std::memory_order_acquire);
-    }
+    MotionExecutionEpoch GetCurrentExecutionEpoch() const noexcept;
 
     // ====================================================================
     // Stage NC-0.1E - Motion Owner Lease Arbitration
@@ -1111,6 +1434,16 @@ public:
     void RequestAxisFaultReset(int axisIndex) noexcept;
     void RequestResetAllFaults() noexcept;
     void RequestStopGroup() noexcept;
+
+    // Stage NC-0.2J.2:
+    // NC Reset already owns and publishes one execution Epoch before it
+    // submits the deferred safety work. Correlate ResetAllFaults + StopGroup
+    // as one RT-consumed batch so the leaf operations do not publish a
+    // second Epoch for the same lifecycle interruption.
+    void RequestResetSafetyBatch(
+        MotionExecutionEpoch publishedEpoch,
+        bool requestResetAllFaults) noexcept;
+
     bool HasPendingSafetyOrRecoveryRequests() const noexcept;
 
     std::size_t GetAxisCommandMailboxDepth() const noexcept
@@ -1269,6 +1602,39 @@ public:
     // Stage NC-0.2I.2：Feed Hold 保留目前 Segment 與 Future Queue，
     // 因此使用速度型停止快照，不要求 IsGroupDone()。
     MotionFeedHoldStopSnapshot GetFeedHoldStopSnapshot() const noexcept;
+
+    // Stage NC-0.2J.4：跨執行緒讀取只碰 Atomic Publication Bank，
+    // 不直接讀取 250 us Motion owner 的 AxisContext / Group 狀態。
+    MotionStopSettleSnapshot GetStopSettleSnapshot() const noexcept;
+    MotionStopSettleCounters GetStopSettleCounters() const noexcept;
+    void GetStopSettleEvidence(
+        MotionStopSettleSnapshot& snapshot,
+        MotionStopSettleCounters& counters) const noexcept;
+
+    // Stage NC-0.2J.5 Runtime validity seam.  EtherCAT Runtime calls this
+    // exactly once for every PDO cycle, including the first invalid cycle.
+    void ObserveNCSettleRuntimeCycle(
+        std::uint64_t runtimeCycleTick,
+        bool pdoCycleValid) noexcept;
+
+    MotionNCSettleRequestSequence RequestFeedHoldNCSettle(
+        MotionExecutionEpoch executionEpoch,
+        const MotionOwnerLease& ownerLease) noexcept;
+
+    MotionNCSettleRequestSequence RequestResetNCSettleAndRebase(
+        MotionExecutionEpoch executionEpoch,
+        const MotionOwnerLease& ownerLease,
+        const MotionNCResetExecutionState& executionState,
+        bool unsupportedFaultOrEstop) noexcept;
+
+    bool TryGetNCSettleEvidence(
+        MotionNCSettleProfile profile,
+        MotionNCSettleSnapshot& snapshot,
+        MotionNCSettleCounters& counters) const noexcept;
+
+    bool IsGroupNCSettled() const noexcept;
+    bool IsGroupNCDrained() const noexcept;
+    MotionNCResetRebaseAck GetNCResetRebaseAck() const noexcept;
 
 
     // ========================================================
@@ -1498,6 +1864,12 @@ public:
         m_pendingPlaneMode = curPlaneMode;
     }
 
+    // Stage NC-0.2J.5: P50 producer-owned half of Reset tag rebasing.
+    // This deliberately does not mutate m_Group; the matching physical tags
+    // are applied later by the 250 us Reset rebase transaction.
+    void SetPendingResetExecutionState(
+        const MotionNCResetExecutionState& executionState) noexcept;
+
     double CalculateShortestTarget(double currentPos, double targetPos, double modulo);
 
     // 🌟 消滅幽靈座標專用 API：將大腦預讀起點，強制同步為馬達當下真實位置
@@ -1511,16 +1883,183 @@ public:
 
 private:
     // ========================================================================
+    // Stage NC-0.2J.4 - Atomic Stop / Settle Evidence Publication
+    //
+    // A complete POD payload is copied into one of two banks of 64-bit atomic
+    // words.  The producer publishes the selected bank with one Generation.
+    // A reader retries if Generation changes while copying.  Therefore the
+    // reader never races a plain AxisContext read and no mutex or atomic large
+    // structure is required.
+    // ========================================================================
+    struct MotionStopSettlePublicationPayload
+    {
+        MotionStopSettleSnapshot snapshot{};
+        MotionStopSettleCounters counters{};
+        std::array<MotionNCSettleSnapshot,
+            static_cast<std::size_t>(MotionNCSettleProfile::COUNT)>
+            ncSettleSnapshots{};
+        std::array<MotionNCSettleCounters,
+            static_cast<std::size_t>(MotionNCSettleProfile::COUNT)>
+            ncSettleCounters{};
+        MotionNCResetRebaseAck resetRebaseAck{};
+    };
+
+    static_assert(
+        std::is_trivially_copyable<MotionStopSettlePublicationPayload>::value,
+        "Motion stop/settle publication payload must remain trivially copyable.");
+
+    static constexpr std::size_t MOTION_STOP_SETTLE_PUBLICATION_WORD_COUNT =
+        (sizeof(MotionStopSettlePublicationPayload) +
+            sizeof(std::uint64_t) - 1U) /
+        sizeof(std::uint64_t);
+
+    static_assert(
+        MOTION_STOP_SETTLE_PUBLICATION_WORD_COUNT <= 192U,
+        "J.5 settle publication must remain a small fixed RT payload.");
+
+    struct MotionStopSettleAtomicBank
+    {
+        // Even = stable bank, odd = the 250 us producer is rewriting it.
+        // This per-bank sequence closes the two-generation bank-reuse window.
+        std::atomic<std::uint64_t> writeSequence{ 0ULL };
+        std::array<
+            std::atomic<std::uint64_t>,
+            MOTION_STOP_SETTLE_PUBLICATION_WORD_COUNT> words;
+
+        MotionStopSettleAtomicBank() noexcept
+        {
+            for (std::size_t i = 0U; i < words.size(); ++i)
+            {
+                words[i].store(0ULL, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::array<MotionStopSettleAtomicBank, 2U>
+        m_stopSettlePublicationBanks{};
+    std::atomic<std::uint64_t> m_stopSettlePublicationGeneration{ 0ULL };
+
+    // The fields below are owned only by the 250 us Motion runtime.
+    std::uint64_t m_stopSettleNextPublicationGeneration = 0ULL;
+    MotionStopSettleCounters m_stopSettleProducerCounters{};
+    MotionStopSettlePrimaryBlocker m_stopSettlePreviousPrimaryBlocker =
+        MotionStopSettlePrimaryBlocker::NONE;
+    bool m_stopSettlePreviousStandstill = false;
+    bool m_stopSettleHasPreviousSample = false;
+
+    struct MotionNCSettleRequest
+    {
+        MotionNCSettleRequestSequence requestSequence =
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+        MotionNCSettleProfile profile =
+            MotionNCSettleProfile::GROUP_COMPLETION;
+        MotionExecutionEpoch executionEpoch =
+            MOTION_EXECUTION_EPOCH_INVALID;
+        MotionOwnerLease ownerLease{};
+        MotionNCResetExecutionState resetExecutionState{};
+        bool unsupportedFaultOrEstop = false;
+    };
+
+    static_assert(
+        std::is_trivially_copyable<MotionNCSettleRequest>::value,
+        "NC settle request ring payload must remain trivially copyable.");
+
+    struct MotionNCSettleTracker
+    {
+        MotionNCSettleRequestSequence requestSequence =
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+        MotionExecutionEpoch executionEpoch =
+            MOTION_EXECUTION_EPOCH_INVALID;
+        MotionOwnerLease ownerLease{};
+        MotionExecutionIdentity executionIdentity{};
+        std::uint32_t scopeMask = 0U;
+        std::uint32_t dwellCycles = 0U;
+        std::uint64_t proofSequence = 0ULL;
+        bool requestAccepted = false;
+        bool candidate = false;
+        bool settled = false;
+        std::array<double, MAX_AXES> commandAnchorPulse{};
+        std::array<double, MAX_AXES> actualMinimumPulse{};
+        std::array<double, MAX_AXES> actualMaximumPulse{};
+    };
+
+    static constexpr std::size_t MOTION_NC_SETTLE_PROFILE_COUNT =
+        static_cast<std::size_t>(MotionNCSettleProfile::COUNT);
+    static constexpr std::size_t MOTION_NC_SETTLE_REQUEST_CAPACITY = 8U;
+    static constexpr std::size_t MOTION_NC_RESET_BUFFER_CLEAR_BUDGET = 128U;
+
+    FixedCapacitySpscRing<
+        MotionNCSettleRequest,
+        MOTION_NC_SETTLE_REQUEST_CAPACITY> m_ncSettleRequestRing{};
+    std::atomic<MotionNCSettleRequestSequence>
+        m_nextNCSettleRequestSequence{ 1ULL };
+
+    std::array<MotionNCSettleTracker,
+        MOTION_NC_SETTLE_PROFILE_COUNT> m_ncSettleTrackers{};
+    std::array<MotionNCSettleSnapshot,
+        MOTION_NC_SETTLE_PROFILE_COUNT> m_ncSettlePublishedSnapshots{};
+    std::array<MotionNCSettleCounters,
+        MOTION_NC_SETTLE_PROFILE_COUNT> m_ncSettleProducerCounters{};
+
+    MotionNCSettleRequest m_activeFeedHoldNCSettleRequest{};
+    MotionNCSettleRequest m_activeResetNCSettleRequest{};
+    MotionNCResetRebaseAck m_ncResetRebaseAckProducer{};
+    MotionNCResetRebasePhase m_ncResetRebasePhase =
+        MotionNCResetRebasePhase::IDLE;
+    std::uint32_t m_ncLastGroupScopeMask = 0U;
+    MotionExecutionEpoch m_ncLastGroupScopeExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionExecutionIdentity m_ncLastGroupScopeExecutionIdentity{};
+    std::size_t m_ncResetBufferClearAxisSlot = 0U;
+    std::size_t m_ncResetBufferClearElement = 0U;
+    bool m_ncResetScalarRebaseApplied = false;
+
+    std::uint64_t m_ncSettleRuntimeCycleTick = 0ULL;
+    std::uint64_t m_ncSettlePreviousRuntimeCycleTick = 0ULL;
+    std::uint64_t m_ncSettleLastEvaluatedRuntimeCycleTick = 0ULL;
+    bool m_ncSettleRuntimeObserved = false;
+    bool m_ncSettlePreviousRuntimeCycleValid = false;
+    bool m_ncSettleRuntimeCycleValid = false;
+    bool m_ncSettleRuntimeCycleContiguous = false;
+    bool m_ncSettleMotionPassCompleted = false;
+    bool m_ncSettleHasEvaluatedRuntimeCycle = false;
+    std::uint64_t m_ncNextProofSequence = 0ULL;
+
+    void PublishStopSettleEvidence() noexcept;
+    bool TryReadStopSettlePublication(
+        MotionStopSettlePublicationPayload& payload) const noexcept;
+    MotionNCSettleRequestSequence AllocateNCSettleRequestSequence() noexcept;
+    bool SubmitNCSettleRequest(const MotionNCSettleRequest& request) noexcept;
+    bool ProcessNCSettleRequestsAndResetRebase() noexcept;
+    void UpdateNCSettleProducer(
+        MotionStopSettlePublicationPayload& payload) noexcept;
+    void ResetNCSettleCandidate(
+        MotionNCSettleProfile profile,
+        MotionNCSettleBlocker blocker,
+        bool identityReset = false,
+        bool scopeReset = false) noexcept;
+    std::uint32_t BuildExistingNCAxisMask() const noexcept;
+    std::uint32_t BuildCurrentNCGroupAxisMask() const noexcept;
+    bool HasNCResetUnsupportedMotion() const noexcept;
+    bool HasNCResetActiveCompensation() const noexcept;
+    MotionNCSettleBlocker ValidateNCResetCommitSeam() const noexcept;
+    void BlockNCResetCommit(MotionNCSettleBlocker blocker) noexcept;
+    void ApplyNCResetScalarRebase() noexcept;
+    bool ClearNCResetBuffersWithBudget() noexcept;
+    bool VerifyNCResetRebaseState() const noexcept;
+
+    // ========================================================================
     // Stage NC-0.1D - Execution Identity + Command / Feedback Transport State
     //
-    // m_executionEpoch：
-    //     RESET / GOTO / 新程式 / 新 Cycle Start 時遞增。
+    // m_executionEpochPublication：
+    //     RESET / GOTO / 新程式 / 新 Cycle Start 時遞增，並把目前 Epoch、
+    //     exact-Epoch Abort Policy 與 RT Pending 位元放在同一個 atomic word。
     //
     // m_nextSegmentId：
     //     全系統單調遞增，避免不同 Epoch 之間重複使用 SegmentId。
     //
-    // m_executionEpochChangePending：
-    //     NC 執行緒只設旗標；Queue / History 的清理由 Motion Runtime 執行。
+    //     這可避免 G00 ABORTING Epoch 尚未被 RT 消費時，後來的 Reset Epoch
+    //     被 boolean pending 合併後誤套用舊 Abort Policy。
     // ========================================================================
     // Stage NC-0.1F - Axis command mailbox and RT-only mutation requests.
     // ========================================================================
@@ -1534,6 +2073,16 @@ private:
     std::atomic<bool> m_emergencyStopAllPending{ false };
     std::atomic<bool> m_resetAllFaultsPending{ false };
     std::atomic<bool> m_stopGroupPending{ false };
+
+    // Packed NC Reset safety batch:
+    // bits  0..31 = the Epoch already published by NCManager::Reset()
+    // bit      32 = ResetAllFaults is part of this batch
+    // bit      63 = request present
+    //
+    // One atomic value keeps the Epoch proof and its deferred actions
+    // correlated across the NC producer and the 250 us Motion consumer.
+    std::atomic<std::uint64_t> m_resetSafetyBatchPending{ 0ULL };
+
     std::atomic<std::uint32_t> m_axisFaultResetPendingMask{ 0U };
     std::atomic<bool> m_safetyRecoveryRequestInProgress{ false };
 
@@ -1542,6 +2091,8 @@ private:
         MotionAxisCommand command,
         MotionAxisCommandSequence* outSequence) noexcept;
     void ApplyPendingSafetyAndRecoveryRequests() noexcept;
+    void ResetAllFaultsImpl(bool publishExecutionEpoch);
+    void StopGroupImpl(bool publishExecutionEpoch);
     void DrainAxisCommandMailbox() noexcept;
     void PublishAxisCommandResult(
         const MotionAxisCommand& command,
@@ -1553,7 +2104,10 @@ private:
     // Layout：bits 0..7 = MotionOwner，bits 32..63 = Generation。
     std::atomic<std::uint64_t> m_motionOwnerState{ 0ULL };
 
-    std::atomic<MotionExecutionEpoch> m_executionEpoch{ 1U };
+    // bits 0..31 = current Epoch, bit 32 = exact-Epoch Abort Policy,
+    // bits 33..40 = source, bit 63 = RT apply pending.  Initial Epoch is 1
+    // with UNKNOWN source and no pending work.
+    std::atomic<std::uint64_t> m_executionEpochPublication{ 1ULL };
     std::atomic<MotionSegmentId> m_nextSegmentId{ 1ULL };
     std::atomic<std::uint64_t> m_staleCommandDiscardCount{ 0ULL };
     std::atomic<std::uint64_t> m_motionOwnerConflictRejectCount{ 0ULL };
@@ -1567,8 +2121,6 @@ private:
     std::atomic<std::uint64_t> m_commandQueueFullRejectCount{ 0ULL };
     std::atomic<std::uint64_t> m_commandReplayOverflowCount{ 0ULL };
     std::atomic<MotionSegmentId> m_lastRejectedSegmentId{ MOTION_SEGMENT_ID_INVALID };
-    std::atomic<bool> m_executionEpochChangePending{ false };
-    std::atomic<bool> m_abortActiveCommandPending{ false };
 
     std::atomic<MotionCommandSource> m_pendingCommandSource{ MotionCommandSource::UNKNOWN };
 
@@ -1602,7 +2154,11 @@ private:
     std::atomic<MotionFeedbackType> m_lastDroppedMotionFeedbackType{ MotionFeedbackType::NONE };
 
     MotionSegmentId AllocateMotionSegmentId() noexcept;
-    void AssignExecutionIdentity(MotionCommand& command) noexcept;
+    void AssignExecutionIdentity(
+        MotionCommand& command,
+        MotionExecutionEpoch exactEpoch,
+        MotionCommandSource exactSource,
+        const MotionOwnerLease& exactOwnerLease) noexcept;
     bool IsCommandFromCurrentEpoch(const MotionCommand& command) const noexcept;
     bool IsCommandOwnerLeaseCurrent(const MotionCommand& command) const noexcept;
     MotionRejectReason GetCommandAuthorizationFailure(
@@ -1652,8 +2208,13 @@ private:
         MotionCommand& command) const noexcept;
     bool TryDequeueNextMotionCommand(MotionCommand& command) noexcept;
     bool TryRequeueMotionCommandFront(const MotionCommand& command) noexcept;
-    void RequestAbortingExecutionEpoch(MotionCommandSource source) noexcept;
+    MotionExecutionEpoch PublishNewExecutionEpoch(
+        MotionCommandSource source,
+        bool abortActiveCommand) noexcept;
+    MotionExecutionEpoch RequestAbortingExecutionEpoch(
+        MotionCommandSource source) noexcept;
 
+    bool HasPendingExecutionEpochChange() const noexcept;
     void DiscardStaleQueuedCommands();
     void ApplyPendingExecutionEpochChange();
 

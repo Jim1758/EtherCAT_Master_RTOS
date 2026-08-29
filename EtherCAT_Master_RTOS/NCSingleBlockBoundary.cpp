@@ -317,6 +317,50 @@ void NCSingleBlockBoundaryShadow::ObserveLegacyResume() noexcept
         NCSingleBlockShadowDecision::RESUMED);
 }
 
+
+void NCSingleBlockBoundaryShadow::ObserveControlledHold() noexcept
+{
+    if (!m_snapshot.active)
+    {
+        return;
+    }
+
+    ++m_counters.controlledHolds;
+    m_snapshot.controlledHoldObserved = true;
+    m_snapshot.legacyPausePending = false;
+
+    if (m_snapshot.boundaryReady)
+    {
+        ++m_counters.controlledAgreeHolds;
+        SetDecision(
+            NCSingleBlockShadowPhase::CONTROLLED_HOLD_CONFIRMED,
+            NCSingleBlockShadowDecision::CONTROLLED_HOLD_APPLIED);
+    }
+    else
+    {
+        ++m_counters.controlledEarlyHoldAttempts;
+        SetDecision(
+            NCSingleBlockShadowPhase::LEGACY_HOLD_MISMATCH,
+            NCSingleBlockShadowDecision::
+            CONTROLLED_HOLD_BEFORE_BOUNDARY);
+    }
+}
+
+void NCSingleBlockBoundaryShadow::ObserveControlledResume() noexcept
+{
+    if (!m_snapshot.controlledHoldObserved)
+    {
+        return;
+    }
+
+    m_snapshot.active = false;
+    m_snapshot.legacyPausePending = false;
+    ++m_counters.controlledResumed;
+    SetDecision(
+        NCSingleBlockShadowPhase::IDLE,
+        NCSingleBlockShadowDecision::CONTROLLED_RESUMED);
+}
+
 void NCSingleBlockBoundaryShadow::SuppressForProgramEnd() noexcept
 {
     if (!m_snapshot.active)
@@ -342,7 +386,8 @@ void NCSingleBlockBoundaryShadow::Cancel(bool superseded) noexcept
 
     if (superseded &&
         m_snapshot.boundaryReady &&
-        !m_snapshot.legacyHoldObserved)
+        !m_snapshot.legacyHoldObserved &&
+        !m_snapshot.controlledHoldObserved)
     {
         ++m_counters.legacyMissingHold;
     }

@@ -351,6 +351,18 @@
     <ClCompile Include="NCFeedHoldBoundary.cpp">
       <Filter>Source Files\NC\NC</Filter>
     </ClCompile>
+    <ClCompile Include="NCFeedHoldResumeGate.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCSingleBlockHoldGate.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCLifecycleInterruptionBoundary.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCResetReleaseGate.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -513,6 +525,18 @@
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
     <ClInclude Include="NCFeedHoldBoundary.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCFeedHoldResumeGate.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCSingleBlockHoldGate.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCLifecycleInterruptionBoundary.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCResetReleaseGate.h">
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
   </ItemGroup>

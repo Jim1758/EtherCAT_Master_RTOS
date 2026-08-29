@@ -55,6 +55,8 @@ void NCFeedHoldBoundaryShadowObserver::BeginRequest(
     snapshot.requestOwnerGeneration = sample.ownerLease.generation;
     snapshot.currentOwner = sample.ownerLease.owner;
     snapshot.currentOwnerGeneration = sample.ownerLease.generation;
+    snapshot.expectedSettleRequestSequence =
+        sample.expectedSettleRequestSequence;
     snapshot.dispatchId = sample.dispatchId;
     snapshot.requestPC = sample.activePC;
     snapshot.motion = sample.motion;
@@ -168,14 +170,41 @@ void NCFeedHoldBoundaryShadowObserver::Observe(
 
     if (m_snapshot.acknowledged)
     {
-        const bool acknowledgeStillValid =
-            (m_snapshot.source == NCFeedHoldSource::HOME)
-            ? sample.homePaused
-            : (sample.motion.overrideZero &&
-                sample.motion.commandStopped &&
-                sample.motion.actualStopped);
+        // -------------------------------------------------------------
+        // NC-0.2I.2.3 - ACK latch semantics
+        //
+        // Physical stop acknowledgement is an event boundary. Once the
+        // machine has satisfied the acquisition conditions and remained
+        // stable for the required samples, the ACK must remain latched
+        // until an explicit Resume, Reset, Owner/Epoch change or fault.
+        //
+        // currentActVel is derived from a single 250 us encoder delta. A
+        // stationary closed-loop servo can therefore report an occasional
+        // quantization / correction spike after ACK. Treating one such
+        // sample as ACK_LOST produced a false failure even though:
+        //
+        //   - Feedrate Override remained zero
+        //   - Command Velocity remained stopped
+        //   - NC remained in HOLD
+        //   - Owner / Epoch remained unchanged
+        //
+        // Actual Velocity remains visible in the diagnostic snapshot, but
+        // after ACK it is advisory. ACK_LOST is reserved for loss of the
+        // control-side hold condition without a recorded Resume request.
+        // -------------------------------------------------------------
+        if (m_snapshot.resumeRequested)
+        {
+            return;
+        }
 
-        if (!acknowledgeStillValid && !m_snapshot.resumeRequested)
+        const bool acknowledgeControlStillValid =
+            (m_snapshot.source == NCFeedHoldSource::HOME)
+            ? (sample.legacyHoldState && sample.homePaused)
+            : (sample.legacyHoldState &&
+                sample.motion.overrideZero &&
+                sample.motion.commandStopped);
+
+        if (!acknowledgeControlStillValid)
         {
             m_snapshot.acknowledgeLost = true;
             Fail(NCFeedHoldShadowDecision::ACK_LOST);
@@ -221,7 +250,22 @@ void NCFeedHoldBoundaryShadowObserver::Observe(
             return;
         }
 
-        if (!sample.motion.actualStopped)
+        const bool matchingRTSettleProof =
+            m_snapshot.expectedSettleRequestSequence !=
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
+            sample.motion.settleRequestAccepted &&
+            sample.motion.settleProofValid &&
+            sample.motion.settleRequestSequence ==
+            m_snapshot.expectedSettleRequestSequence &&
+            sample.motion.settleProofSequence != 0ULL &&
+            sample.motion.settleScopeMask != 0U &&
+            sample.motion.settleRequiredCycles ==
+            MOTION_NC_SETTLE_REQUIRED_CYCLES &&
+            sample.motion.settleDwellCycles >=
+            sample.motion.settleRequiredCycles &&
+            sample.motion.ncSettled;
+
+        if (!matchingRTSettleProof)
         {
             m_snapshot.stableSamples = 0U;
             m_snapshot.stopCandidate = false;

@@ -122,6 +122,8 @@ std::uint64_t NCProgramEndBoundary::AllocateSequence() noexcept
 void NCProgramEndBoundary::ResetStableConfirmation() noexcept
 {
     m_stablePasses = 0U;
+    m_lastStableSettlePublicationGeneration = 0ULL;
+    m_stableSettleProofSequence = 0ULL;
     m_readyRecorded = false;
 }
 
@@ -410,15 +412,34 @@ bool NCProgramEndBoundary::Evaluate(
         decision = NCProgramEndDecision::WAIT_SAFETY_REQUEST;
         ++m_counters.waitSafetyRequest;
     }
-    else if (!sample.groupStandstill)
+    else if (!sample.groupStandstill ||
+        sample.ncSettlePublicationGeneration == 0ULL ||
+        sample.ncSettleProofSequence == 0ULL)
     {
         decision = NCProgramEndDecision::WAIT_GROUP_STANDSTILL;
         ++m_counters.waitGroupStandstill;
     }
     else
     {
-        if (m_stablePasses < NC_PROGRAM_END_STABLE_PASSES_REQUIRED)
+        // NC-0.2J.5: two supervisory passes must belong to one continuous
+        // RT proof episode.  A new nonzero proofSequence starts again at
+        // pass one even when the previous episode was already release-ready.
+        if (sample.ncSettleProofSequence !=
+            m_stableSettleProofSequence)
         {
+            ResetStableConfirmation();
+            m_stableSettleProofSequence =
+                sample.ncSettleProofSequence;
+            m_lastStableSettlePublicationGeneration =
+                sample.ncSettlePublicationGeneration;
+            m_stablePasses = 1U;
+        }
+        else if (sample.ncSettlePublicationGeneration !=
+            m_lastStableSettlePublicationGeneration &&
+            m_stablePasses < NC_PROGRAM_END_STABLE_PASSES_REQUIRED)
+        {
+            m_lastStableSettlePublicationGeneration =
+                sample.ncSettlePublicationGeneration;
             ++m_stablePasses;
         }
 
@@ -463,6 +484,9 @@ bool NCProgramEndBoundary::MarkFinalized() noexcept
 {
     if (!m_runActive || !m_endPending || m_failClosed ||
         !m_snapshot.readyToFinalize ||
+        m_stableSettleProofSequence == 0ULL ||
+        m_snapshot.ncSettleProofSequence !=
+        m_stableSettleProofSequence ||
         m_stablePasses < NC_PROGRAM_END_STABLE_PASSES_REQUIRED)
     {
         return false;
@@ -540,6 +564,10 @@ void NCProgramEndBoundary::RefreshSnapshot(
         sample.lastPublishedFeedbackSequence;
     snapshot.lastConsumedFeedbackSequence =
         sample.lastConsumedFeedbackSequence;
+    snapshot.ncSettlePublicationGeneration =
+        sample.ncSettlePublicationGeneration;
+    snapshot.ncSettleProofSequence =
+        sample.ncSettleProofSequence;
 
     snapshot.integrityDelta =
         IntegrityDelta(m_runBaselineIntegrity, sample.integrity);

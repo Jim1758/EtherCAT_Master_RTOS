@@ -585,7 +585,7 @@ void NCManager::Reset()
 
 
     //重置馬達區塊--------------------------------------------------
-    const bool requestResetAllFaults =
+    const bool resetNeedsFaultOrEstopRecovery =
         m_motion.IsAnyAxisFaulted() ||
         m_motion.IsGroupFaulted() ||
         m_motion.IsGroupEmergencyStopped();
@@ -595,7 +595,7 @@ void NCManager::Reset()
     // correlated safety batch 執行，不允許每個 leaf 再各自發布 Epoch。
     m_motion.RequestResetSafetyBatch(
         resetEpoch,
-        requestResetAllFaults);
+        resetNeedsFaultOrEstopRecovery);
 
     // 🌟 [新增] 如果有放電跳刀/排渣，必須強制解鎖跳刀狀態機！
     // m_motion.ResetAllFaults(); // (如果您有寫清除跳刀狀態的 API，建議在這裡呼叫)
@@ -667,12 +667,21 @@ void NCManager::Reset()
     m_motion.SetPendingResetExecutionState(
         resetExecutionState);
 
+    // Stage NC-0.2J.6.2：上面的 bool 表示「本次 Reset 需要 RT 執行
+    // Fault / ESTOP recovery」，不是 settle/rebase 永久不支援。250 us
+    // Runtime 會先 ApplyPendingSafetyAndRecoveryRequests()，再消費這筆
+    // settle request；後續 proof 仍會 fail-closed 檢查實際 Fault / ESTOP、
+    // pending safety work、Epoch、Owner、軸狀態與速度。若把 recovery 需求
+    // 傳成 unsupported，第一次 Reset 即使已清除 ESTOP 也會被永久 BLOCKED，
+    // 操作員便被迫再按一次 Reset 才能建立可接受的新交易。
+    constexpr bool resetRebaseUnsupported = false;
+
     m_resetNCSettleRequestSequence =
         m_motion.RequestResetNCSettleAndRebase(
             resetEpoch,
             m_safetyMotionLease,
             resetExecutionState,
-            requestResetAllFaults);
+            resetRebaseUnsupported);
 
     // The release gate is armed only after the exact RT transaction sequence
     // exists.  A zero/rejected request therefore remains fail-closed in
@@ -911,6 +920,10 @@ NCManager::BuildLifecycleInterruptionSample() const noexcept
 
     sample.executionEpoch = m_motion.GetCurrentExecutionEpoch();
     sample.ownerLease = m_motion.GetMotionOwnerLease();
+    // The current Motion owner may already be SAFETY when Alarm is latched.
+    // Preserve the exact NC execution lease that produced the active Ledger
+    // blocks so J.6.3.1 can correlate their later retirement feedback.
+    sample.executionOwnerLease = m_programMotionLease;
     sample.activePC = GetActiveDispatchPC();
     sample.activeBlocks = lifecycle.activeBlocks;
 
@@ -1030,6 +1043,93 @@ void NCManager::ObserveLifecycleInterruptionShadow() noexcept
 
     m_lifecycleInterruptionShadow.Observe(
         BuildLifecycleInterruptionSample());
+}
+
+
+// =============================================================================
+// Stage NC-0.2J.6.1/J.6.3.2 - Alarm / Emergency-stop RT ACK Shadow
+// =============================================================================
+NCAlarmEmergencyStopSample
+NCManager::BuildAlarmEmergencyStopSample() const noexcept
+{
+    NCAlarmEmergencyStopSample sample{};
+
+    const AlarmManager& alarms = AlarmManager::GetInstance();
+    sample.alarmActive =
+        alarms.HasAlarm() ||
+        m_state == NCState::ALARM;
+    sample.alarmUpdateCount = alarms.GetUpdateCount();
+    sample.alarmCount = alarms.GetAlarmCount();
+    if (sample.alarmCount > 0)
+    {
+        const int alarmIndex = sample.alarmCount - 1;
+        sample.alarmCode = alarms.GetAlarmId(alarmIndex);
+        sample.alarmAxisIndex =
+            alarms.GetAlarmAxisIndex(alarmIndex);
+    }
+
+    sample.emergencyEvidenceCoherent =
+        m_motion.TryGetEmergencyStopEvidence(
+            sample.emergency,
+            sample.emergencyCounters);
+    sample.epochInvalidation =
+        m_motion.GetEmergencyStopEpochInvalidationEvidence();
+
+    // J.6.3.2 correlates Epoch, Owner and E-stop application from one coherent
+    // 250 us publication.  Reading the standalone atomics first can straddle
+    // the exact RT invalidation that this observer is trying to prove.
+    if (sample.emergencyEvidenceCoherent &&
+        sample.emergency.publicationGeneration != 0ULL &&
+        sample.emergency.currentExecutionEpoch !=
+        MOTION_EXECUTION_EPOCH_INVALID)
+    {
+        sample.executionEpoch =
+            sample.emergency.currentExecutionEpoch;
+        sample.ownerLease.owner =
+            sample.emergency.currentOwner;
+        sample.ownerLease.generation =
+            sample.emergency.currentOwnerGeneration;
+    }
+    else
+    {
+        sample.executionEpoch =
+            m_motion.GetCurrentExecutionEpoch();
+        sample.ownerLease =
+            m_motion.GetMotionOwnerLease();
+    }
+
+    sample.lifecycle =
+        m_lifecycleInterruptionShadow.GetSnapshot();
+    return sample;
+}
+
+
+void NCManager::BeginAlarmEmergencyStopShadow() noexcept
+{
+    m_alarmEmergencyStopShadow.Begin(
+        BuildAlarmEmergencyStopSample());
+}
+
+
+void NCManager::ObserveAlarmEmergencyStopShadow() noexcept
+{
+    if (m_alarmEmergencyStopShadow.IsActive())
+    {
+        m_alarmEmergencyStopShadow.Observe(
+            BuildAlarmEmergencyStopSample());
+    }
+
+    // Stage NC-0.2J.6.3: the exact J.6 RT acknowledgement is the authority
+    // for classifying the runtime-owned Alarm Epoch change.  Importing this
+    // evidence is idempotent and remains observer-only.
+    const NCAlarmEmergencyStopSnapshot alarmStop =
+        m_alarmEmergencyStopShadow.GetSnapshot();
+    if (alarmStop.acknowledged)
+    {
+        m_lifecycleInterruptionShadow.RecordAlarmStopAcknowledged(
+            alarmStop.lastAppliedExecutionEpoch,
+            alarmStop.epochChangeRequired);
+    }
 }
 
 // ============================================================================
@@ -1203,9 +1303,11 @@ void NCManager::ProcessTask()
             NCLifecycleInterruptionCause::ALARM,
             false);
         m_lifecycleInterruptionAlarmLatched = true;
+        BeginAlarmEmergencyStopShadow();
     }
     else if (!alarmActive)
     {
+        ObserveAlarmEmergencyStopShadow();
         m_lifecycleInterruptionAlarmLatched = false;
     }
 
@@ -1229,7 +1331,12 @@ void NCManager::ProcessTask()
 
         m_motion.RequestEmergencyStopAllAxes();
 
+        // First refresh generic Ledger/transport evidence.  While J.6 proof
+        // is pending, that observer deliberately defers Epoch classification.
+        // J.6 then consumes the fresh lifecycle sample and, on exact RT ACK,
+        // authorises the Epoch for the following bounded observation.
         ObserveLifecycleInterruptionShadow();
+        ObserveAlarmEmergencyStopShadow();
 
         // Alarm 或其他 lifecycle event 若取代進行中的 Reset，立即把
         // Reset release gate 標成 blocked；不可保留過期的放行資格。

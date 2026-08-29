@@ -363,6 +363,9 @@
     <ClCompile Include="NCResetReleaseGate.cpp">
       <Filter>Source Files\NC\NC</Filter>
     </ClCompile>
+    <ClCompile Include="NCAlarmEmergencyStopBoundary.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -537,6 +540,9 @@
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
     <ClInclude Include="NCResetReleaseGate.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCAlarmEmergencyStopBoundary.h">
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
   </ItemGroup>

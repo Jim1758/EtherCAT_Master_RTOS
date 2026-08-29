@@ -1921,8 +1921,29 @@ bool MotionCore::TryGetAxisCommandResult(
 
 void MotionCore::RequestEmergencyStopAllAxes() noexcept
 {
+    m_emergencyStopRequestAttemptCount.fetch_add(
+        1ULL,
+        std::memory_order_relaxed);
+
     TakeSafetyMotionOwner();
-    m_emergencyStopAllPending.store(true, std::memory_order_release);
+
+    const bool wasPending =
+        m_emergencyStopAllPending.exchange(
+            true,
+            std::memory_order_acq_rel);
+
+    if (wasPending)
+    {
+        m_emergencyStopRequestCoalescedCount.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        m_emergencyStopRequestPublishedCount.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
 }
 
 void MotionCore::RequestAxisFaultReset(int axisIndex) noexcept
@@ -3646,6 +3667,259 @@ bool MotionCore::ApplyMachineHome(AxisContext& axis, double capturedReferencePul
 
 // ==========================================
 // [API] 初始化與設定
+// =============================================================================
+// Stage NC-0.2J.6.4 - Startup Feedback Alignment / Permanent Lag Arming
+// =============================================================================
+void MotionCore::AlignStartupAxisCommandToActual(
+    AxisContext& axis) noexcept
+{
+    const double actualPosition = axis.currentActPos;
+
+    axis.startCmdPos = actualPosition;
+    axis.planningPos = actualPosition;
+    axis.currentCmdPos = actualPosition;
+    axis.logicalCmdPos = actualPosition;
+    axis.finalTargetPos = actualPosition;
+    axis.lastQueuedPulse = actualPosition;
+
+    axis.currentCmdVel = 0.0;
+    axis.logicalCmdVel = 0.0;
+    axis.currentActVel = 0.0;
+    axis.lastActPos = actualPosition;
+    axis.targetVelocity = 0.0;
+    axis.targetEndVel = 0.0;
+    axis.cruiseVel_PPS = 0.0;
+    axis.programmedVel_PPS = 0.0;
+    axis.motionTime = 0.0;
+
+    axis.pid.prevError = 0.0;
+    axis.pid.integralAcc = 0.0;
+
+    std::fill(axis.velBuffer.begin(), axis.velBuffer.end(), 0.0);
+    axis.bufferSum = 0.0;
+    axis.bufferIndex = 0;
+    axis.inPosition = true;
+}
+
+
+bool MotionCore::ObserveStartupLagMonitorArming(
+    AxisContext& axis,
+    bool feedbackReady) noexcept
+{
+    // Arming is permanent for this boot.  After this point the exact legacy
+    // Servo / compensation / PID / Lag path below remains authoritative.
+    if (axis.startupLagMonitorArmed)
+    {
+        return true;
+    }
+
+    if (!axis.isExist)
+    {
+        return false;
+    }
+
+    // A sequencing violation is boot-latched.  An operator Reset must not
+    // turn the forbidden pre-arm command into an implicit coordinate rebase.
+    if (axis.startupLagPrematureMotionBlocked)
+    {
+        axis.startupLagFeedbackReady = false;
+        axis.startupLagPositionAligned = false;
+        axis.startupLagStableSampleCount = 0U;
+        axis.currentCmdVel = 0.0;
+        axis.logicalCmdVel = 0.0;
+        axis.targetVelocity = 0.0;
+        axis.targetEndVel = 0.0;
+        axis.isFault = true;
+        axis.inPosition = false;
+        axis.state = MotionState::MotionState_ERROR;
+        return false;
+    }
+
+    // Existing ERROR / ESTOP evidence must never be hidden by coordinate
+    // alignment.  The normal fault path will keep the final PDO command zero.
+    if (axis.isFault ||
+        axis.state == MotionState::MotionState_ERROR ||
+        axis.state == MotionState::MotionState_ESTOP)
+    {
+        if (axis.startupLagStableSampleCount != 0U ||
+            axis.startupLagPositionAligned ||
+            axis.startupLagFeedbackReady)
+        {
+            ++m_startupLagReadinessResetProducer;
+        }
+
+        axis.startupLagFeedbackReady = false;
+        axis.startupLagPositionAligned = false;
+        axis.startupLagStableSampleCount = 0U;
+        return false;
+    }
+
+    // Any motion before the one-shot startup contract is complete is a real
+    // sequencing violation.  Preserve Cmd/Act evidence and fail closed.
+    if (m_Group.isActive || axis.state != MotionState::MotionState_IDLE)
+    {
+        if (!axis.startupLagPrematureMotionBlocked)
+        {
+            axis.startupLagPrematureMotionBlocked = true;
+            ++m_startupLagPrematureMotionBlockProducer;
+        }
+
+        axis.currentCmdVel = 0.0;
+        axis.logicalCmdVel = 0.0;
+        axis.targetVelocity = 0.0;
+        axis.targetEndVel = 0.0;
+        axis.startupLagFeedbackReady = false;
+        axis.startupLagPositionAligned = false;
+        axis.startupLagStableSampleCount = 0U;
+        axis.isFault = true;
+        axis.inPosition = false;
+        axis.state = MotionState::MotionState_ERROR;
+        return false;
+    }
+
+    const bool trustworthyFeedback =
+        feedbackReady && std::isfinite(axis.currentActPos);
+
+    // Before arming, no command may retain the constructor's zero coordinate.
+    // Even an unready sample is safe to mirror while the final PDO is forced
+    // to zero; later trustworthy samples repeat this alignment before arming.
+    if (std::isfinite(axis.currentActPos))
+    {
+        AlignStartupAxisCommandToActual(axis);
+    }
+
+    if (!trustworthyFeedback)
+    {
+        if (axis.startupLagStableSampleCount != 0U ||
+            axis.startupLagPositionAligned ||
+            axis.startupLagFeedbackReady)
+        {
+            ++m_startupLagReadinessResetProducer;
+        }
+
+        axis.startupLagFeedbackReady = false;
+        axis.startupLagPositionAligned = false;
+        axis.startupLagStableSampleCount = 0U;
+        return false;
+    }
+
+    axis.startupLagFeedbackReady = true;
+    if (!axis.startupLagPositionAligned)
+    {
+        axis.startupLagPositionAligned = true;
+        ++m_startupLagAlignmentEventProducer;
+    }
+
+    if (axis.startupLagStableSampleCount <
+        MOTION_STARTUP_LAG_ARM_STABLE_SAMPLES)
+    {
+        ++axis.startupLagStableSampleCount;
+    }
+
+    if (axis.startupLagStableSampleCount >=
+        MOTION_STARTUP_LAG_ARM_STABLE_SAMPLES)
+    {
+        axis.startupLagStableSampleCount =
+            MOTION_STARTUP_LAG_ARM_STABLE_SAMPLES;
+        axis.startupLagMonitorArmed = true;
+        ++m_startupLagArmingTransitionProducer;
+
+        // Keep this transition cycle at zero output.  The next PDO cycle is
+        // the first cycle allowed to enter the unchanged runtime Lag check.
+        return false;
+    }
+
+    return false;
+}
+
+
+void MotionCore::PublishStartupLagArmingEvidence() noexcept
+{
+    std::uint32_t existingMask = 0U;
+    std::uint32_t readyMask = 0U;
+    std::uint32_t alignedMask = 0U;
+    std::uint32_t armedMask = 0U;
+    std::uint32_t blockedMask = 0U;
+    std::uint32_t minimumStableSamples = 0U;
+
+    if (m_pContexts != nullptr)
+    {
+        const std::size_t axisCount = (std::min)(
+            m_pContexts->size(),
+            static_cast<std::size_t>(MAX_AXES));
+        bool hasExistingAxis = false;
+        minimumStableSamples = MOTION_STARTUP_LAG_ARM_STABLE_SAMPLES;
+
+        for (std::size_t axisSlot = 0U;
+            axisSlot < axisCount;
+            ++axisSlot)
+        {
+            const AxisContext& axis = (*m_pContexts)[axisSlot];
+            if (!axis.isExist)
+            {
+                continue;
+            }
+
+            hasExistingAxis = true;
+            const std::uint32_t bit =
+                1U << static_cast<unsigned int>(axisSlot);
+            existingMask |= bit;
+            if (axis.startupLagFeedbackReady)
+            {
+                readyMask |= bit;
+            }
+            if (axis.startupLagPositionAligned)
+            {
+                alignedMask |= bit;
+            }
+            if (axis.startupLagMonitorArmed)
+            {
+                armedMask |= bit;
+            }
+            if (axis.startupLagPrematureMotionBlocked)
+            {
+                blockedMask |= bit;
+            }
+
+            minimumStableSamples = (std::min)(
+                minimumStableSamples,
+                axis.startupLagStableSampleCount);
+        }
+
+        if (!hasExistingAxis)
+        {
+            minimumStableSamples = 0U;
+        }
+    }
+
+    const std::uint64_t packedMasks =
+        static_cast<std::uint64_t>(existingMask & 0xFFU) |
+        (static_cast<std::uint64_t>(readyMask & 0xFFU) << 8U) |
+        (static_cast<std::uint64_t>(alignedMask & 0xFFU) << 16U) |
+        (static_cast<std::uint64_t>(armedMask & 0xFFU) << 24U) |
+        (static_cast<std::uint64_t>(blockedMask & 0xFFU) << 32U);
+
+    m_startupLagAlignmentEvents.store(
+        m_startupLagAlignmentEventProducer,
+        std::memory_order_release);
+    m_startupLagArmingTransitions.store(
+        m_startupLagArmingTransitionProducer,
+        std::memory_order_release);
+    m_startupLagReadinessResets.store(
+        m_startupLagReadinessResetProducer,
+        std::memory_order_release);
+    m_startupLagPrematureMotionBlocks.store(
+        m_startupLagPrematureMotionBlockProducer,
+        std::memory_order_release);
+    m_startupLagMinimumStableSampleCount.store(
+        minimumStableSamples,
+        std::memory_order_release);
+    m_startupLagArmingMasks.store(
+        packedMasks,
+        std::memory_order_release);
+}
+
+
 // ==========================================
 void MotionCore::InitAxis(AxisContext& axis, double resolution)
 {
@@ -3683,6 +3957,13 @@ void MotionCore::InitAxis(AxisContext& axis, double resolution)
     axis.state = MotionState::MotionState_IDLE;
     axis.inPosition = true;
     axis.isFault = false;
+    axis.isLagAlarm = false;
+
+    axis.startupLagFeedbackReady = false;
+    axis.startupLagPositionAligned = false;
+    axis.startupLagMonitorArmed = false;
+    axis.startupLagPrematureMotionBlocked = false;
+    axis.startupLagStableSampleCount = 0U;
 
     axis.isServoOn = false;   // 開機必須強制為 false，直到 CiA 402 狀態機建立激磁
     axis.targetMode = 9;      // 預設 CSV
@@ -3732,6 +4013,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 
     // 1. 防呆：確保指標沒丟失
     if (m_pDrives == nullptr || m_pContexts == nullptr) {
+        PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
         return;
     }
@@ -3739,6 +4021,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     // 2. 防呆：確保兩個清單長度一致
     if (m_pDrives->size() != m_pContexts->size()) {
         // 這裡可以丟個錯誤 log
+        PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
         return;
     }
@@ -4020,6 +4303,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     // Keep publication at the end of the completed Motion pass so final PDO
     // TargetVelocity and encoder-derived Actual Velocity describe this cycle.
     m_ncSettleMotionPassCompleted = motionInputComplete;
+    PublishStartupLagArmingEvidence();
     PublishStopSettleEvidence();
 }
 
@@ -4829,10 +5113,16 @@ void MotionCore::EmergencyStopAllAxes()
         m_Group.isActive ||
         !m_Group.cmdQueue.empty();
 
+    const MotionExecutionEpoch executionEpochBeforeStop =
+        GetCurrentExecutionEpoch();
+    MotionExecutionEpoch executionEpochAfterStop =
+        executionEpochBeforeStop;
+
     if (hadExecutionToInvalidate)
     {
-        BeginNewExecutionEpoch(
+        executionEpochAfterStop = BeginNewExecutionEpoch(
             MotionCommandSource::SAFETY);
+        ++m_emergencyStopEpochInvalidationCount;
     }
 
     // 防止 UpdateInterpolation 繼續對實體軸寫入新的命令。
@@ -4846,6 +5136,42 @@ void MotionCore::EmergencyStopAllAxes()
     // interpolation virtual axis 也必須一起停止。
     // =========================================================
     EmergencyStop(m_Group.virtualAxis);
+
+    ++m_emergencyStopRTApplicationCount;
+    m_emergencyStopLastAppliedExecutionEpoch =
+        GetCurrentExecutionEpoch();
+    m_emergencyStopLastAppliedOwnerLease =
+        GetMotionOwnerLease();
+    m_emergencyStopLastApplyHadExecutionToInvalidate =
+        hadExecutionToInvalidate;
+
+    // Stage NC-0.2J.6.3.2: preserve the last application that *really*
+    // invalidated execution.  Level-sensitive C5/axis-protection inputs can
+    // apply E-stop again after the group is already stopped; those no-op
+    // applications must not overwrite the only exact old-Epoch -> new-Epoch
+    // correlation available to the later 10 ms J.6 observer.
+    if (hadExecutionToInvalidate)
+    {
+        const std::uint64_t packedEpochInvalidation =
+            static_cast<std::uint64_t>(executionEpochBeforeStop) |
+            (static_cast<std::uint64_t>(executionEpochAfterStop) << 32U);
+
+        // Odd = writer active, even = stable.  The separate seqlock preserves
+        // an exact pair across two 64-bit atomics while keeping the main RT
+        // stop/settle payload at its original 192-word ceiling.
+        m_emergencyStopEpochInvalidationWriteSequence.fetch_add(
+            1ULL,
+            std::memory_order_acq_rel);
+        m_emergencyStopLastEpochInvalidationPacked.store(
+            packedEpochInvalidation,
+            std::memory_order_relaxed);
+        m_emergencyStopLastEpochInvalidationCount.store(
+            m_emergencyStopEpochInvalidationCount,
+            std::memory_order_relaxed);
+        m_emergencyStopEpochInvalidationWriteSequence.fetch_add(
+            1ULL,
+            std::memory_order_release);
+    }
 
 
     // =========================================================
@@ -4904,6 +5230,23 @@ void MotionCore::Stop(AxisContext& axis)
 
 void MotionCore::ResetFault(AxisContext& axis)
 {
+    // NC-0.2J.6.4: a command that started before the permanent Lag monitor
+    // armed is a boot sequencing violation, not an operator-resettable Alarm.
+    // Keep the original Cmd/Act evidence and require a controlled restart.
+    if (axis.startupLagPrematureMotionBlocked &&
+        !axis.startupLagMonitorArmed)
+    {
+        axis.resetRequest = false;
+        axis.isFault = true;
+        axis.currentCmdVel = 0.0;
+        axis.logicalCmdVel = 0.0;
+        axis.targetVelocity = 0.0;
+        axis.targetEndVel = 0.0;
+        axis.inPosition = false;
+        axis.state = MotionState::MotionState_ERROR;
+        return;
+    }
+
     // 🌟 1. 先把「有沒有發生過嚴重脫節」的狀態記下來
     // 只有這些情況，大腦才需要放棄尊嚴，去跟實體座標對齊
     bool needPhysicalSnap = axis.isFault ||
@@ -6476,6 +6819,15 @@ void MotionCore::UpdateMotion(
     const MotionServoInputSnapshot& input)
 {
 
+    if (!axis.isExist)
+    {
+        WriteServoTargetVelocityCommand(
+            servo.pOutput,
+            axis.axisIndex,
+            0);
+        return;
+    }
+
     // =========================================================
       // 🌟 [神級修復] 絕對安全的 32-bit 展開寫法 (過濾編譯器 UB)
       // =========================================================
@@ -6509,6 +6861,24 @@ void MotionCore::UpdateMotion(
 
     // =========================================================
 
+    const int opMode = input.ModesOfOperationDisplay;
+    const bool rawOperationEnabled =
+        (input.StatusWord & 0x006FU) == 0x0027U;
+
+    // NC-0.2J.6.4: do not expose the constructor's Cmd=0 coordinate to the
+    // runtime Lag monitor.  Eight adjacent trustworthy samples align the
+    // command history first; arming is then permanent for the rest of boot.
+    if (!ObserveStartupLagMonitorArming(
+        axis,
+        rawOperationEnabled && opMode == 9))
+    {
+        WriteServoTargetVelocityCommand(
+            servo.pOutput,
+            axis.axisIndex,
+            0);
+        return;
+    }
+
 
     // 🟢 修改為：防抖動濾波寫法 (Debounce)
     bool rawServoOn = (input.StatusWord & 0x0027) == 0x0027;
@@ -6523,9 +6893,6 @@ void MotionCore::UpdateMotion(
 
     // 連續 5 個 Cycle (5 毫秒) 確實沒有激磁，才認定真的斷電了
     bool isServoOn = (axis.servoOffCounter < 5);
-
-    int opMode = input.ModesOfOperationDisplay;
-
 
     // 🌟 [優先權最高] 大腦監視實體馬達
     if (!isServoOn || opMode != 9) {
@@ -11633,6 +12000,10 @@ void MotionCore::PublishStopSettleEvidence() noexcept
 {
     MotionStopSettlePublicationPayload payload{};
     MotionStopSettleSnapshot& snapshot = payload.snapshot;
+    MotionEmergencyStopEvidence& emergency =
+        payload.emergencyStopEvidence;
+    MotionEmergencyStopCounters& emergencyCounters =
+        payload.emergencyStopCounters;
 
     const double commandVelocityDeadbandPps = 1.0;
     const double actualVelocityDeadbandPps = 1.0 / CYCLE_TIME_SEC;
@@ -11640,6 +12011,63 @@ void MotionCore::PublishStopSettleEvidence() noexcept
     snapshot.commandVelocityDeadbandPps = commandVelocityDeadbandPps;
     snapshot.actualVelocityDeadbandPps = actualVelocityDeadbandPps;
     snapshot.groupActive = m_Group.isActive;
+
+    emergencyCounters.requestAttempts =
+        m_emergencyStopRequestAttemptCount.load(
+            std::memory_order_acquire);
+    emergencyCounters.requestsPublished =
+        m_emergencyStopRequestPublishedCount.load(
+            std::memory_order_acquire);
+    emergencyCounters.requestsCoalesced =
+        m_emergencyStopRequestCoalescedCount.load(
+            std::memory_order_acquire);
+    emergencyCounters.rtApplications =
+        m_emergencyStopRTApplicationCount;
+    emergencyCounters.epochInvalidations =
+        m_emergencyStopEpochInvalidationCount;
+
+    const MotionOwnerLease emergencyCurrentOwner =
+        GetMotionOwnerLease();
+    emergency.currentExecutionEpoch =
+        GetCurrentExecutionEpoch();
+    emergency.lastAppliedExecutionEpoch =
+        m_emergencyStopLastAppliedExecutionEpoch;
+    emergency.currentOwner = emergencyCurrentOwner.owner;
+    emergency.currentOwnerGeneration =
+        emergencyCurrentOwner.generation;
+    emergency.lastAppliedOwner =
+        m_emergencyStopLastAppliedOwnerLease.owner;
+    emergency.lastAppliedOwnerGeneration =
+        m_emergencyStopLastAppliedOwnerLease.generation;
+    emergency.requestPending =
+        m_emergencyStopAllPending.load(
+            std::memory_order_acquire);
+    emergency.requestInProgress =
+        m_safetyRecoveryRequestInProgress.load(
+            std::memory_order_acquire);
+    emergency.lastApplyHadExecutionToInvalidate =
+        m_emergencyStopLastApplyHadExecutionToInvalidate;
+    emergency.groupActive = m_Group.isActive;
+    emergency.groupEmergencyStopped =
+        m_Group.virtualAxis.state ==
+        MotionState::MotionState_ESTOP;
+    emergency.groupError =
+        m_Group.virtualAxis.state ==
+        MotionState::MotionState_ERROR;
+    emergency.virtualCommandZero =
+        std::abs(m_Group.virtualAxis.currentCmdVel) <=
+        commandVelocityDeadbandPps &&
+        std::abs(m_Group.virtualAxis.logicalCmdVel) <=
+        commandVelocityDeadbandPps &&
+        std::abs(m_Group.virtualAxis.targetVelocity) <=
+        commandVelocityDeadbandPps;
+    emergency.virtualTargetSealed =
+        std::abs(
+            m_Group.virtualAxis.planningPos -
+            m_Group.virtualAxis.currentCmdPos) <= 1.0 &&
+        std::abs(
+            m_Group.virtualAxis.finalTargetPos -
+            m_Group.virtualAxis.currentCmdPos) <= 1.0;
 
     const std::size_t commandIngressDepth =
         m_Group.cmdQueue.ingress_size();
@@ -11704,6 +12132,56 @@ void MotionCore::PublishStopSettleEvidence() noexcept
             }
 
             ++snapshot.existingAxisCount;
+
+            std::uint32_t axisBit = 0U;
+            if (i < static_cast<std::size_t>(32U))
+            {
+                axisBit =
+                    static_cast<std::uint32_t>(
+                        1U << static_cast<unsigned>(i));
+                emergency.existingAxisMask |= axisBit;
+
+                if (axis.state == MotionState::MotionState_ESTOP)
+                {
+                    emergency.estopAxisMask |= axisBit;
+                }
+                if (axis.state == MotionState::MotionState_ERROR)
+                {
+                    emergency.errorAxisMask |= axisBit;
+                }
+                if (axis.isFault)
+                {
+                    emergency.faultAxisMask |= axisBit;
+                }
+                if (axis.isLagAlarm)
+                {
+                    emergency.lagAlarmAxisMask |= axisBit;
+                }
+
+                const bool axisCommandZero =
+                    std::abs(axis.currentCmdVel) <=
+                    commandVelocityDeadbandPps &&
+                    std::abs(axis.logicalCmdVel) <=
+                    commandVelocityDeadbandPps &&
+                    std::abs(axis.targetVelocity) <=
+                    commandVelocityDeadbandPps;
+                if (axisCommandZero)
+                {
+                    emergency.commandZeroAxisMask |= axisBit;
+                }
+
+                const bool axisTargetSealed =
+                    std::abs(
+                        axis.planningPos -
+                        axis.currentCmdPos) <= 1.0 &&
+                    std::abs(
+                        axis.finalTargetPos -
+                        axis.currentCmdPos) <= 1.0;
+                if (axisTargetSealed)
+                {
+                    emergency.targetSealedAxisMask |= axisBit;
+                }
+            }
 
             const std::int32_t publishedAxisIndex =
                 static_cast<std::int32_t>(axis.axisIndex);
@@ -11872,6 +12350,16 @@ void MotionCore::PublishStopSettleEvidence() noexcept
                         : targetVelocityWide);
 
                 ++snapshot.pdoTargetVelocitySampledAxisCount;
+                if (axisBit != 0U)
+                {
+                    emergency.pdoTargetVelocitySampledAxisMask |=
+                        axisBit;
+                    if (targetVelocity == 0)
+                    {
+                        emergency.pdoTargetVelocityZeroAxisMask |=
+                            axisBit;
+                    }
+                }
                 if (targetVelocity != 0)
                 {
                     ++snapshot.pdoTargetVelocityNonzeroAxisCount;
@@ -11889,6 +12377,43 @@ void MotionCore::PublishStopSettleEvidence() noexcept
             }
         }
     }
+
+    const std::uint32_t emergencySafeStateAxisMask =
+        emergency.estopAxisMask |
+        emergency.errorAxisMask;
+    emergency.allExistingAxesSafe =
+        (emergencySafeStateAxisMask &
+            emergency.existingAxisMask) ==
+        emergency.existingAxisMask;
+    emergency.allExistingAxisCommandsZero =
+        (emergency.commandZeroAxisMask &
+            emergency.existingAxisMask) ==
+        emergency.existingAxisMask;
+    emergency.allExistingAxisTargetsSealed =
+        (emergency.targetSealedAxisMask &
+            emergency.existingAxisMask) ==
+        emergency.existingAxisMask;
+    emergency.allSampledPdoTargetVelocitiesZero =
+        (emergency.pdoTargetVelocityZeroAxisMask &
+            emergency.pdoTargetVelocitySampledAxisMask) ==
+        emergency.pdoTargetVelocitySampledAxisMask;
+    emergency.safetyLeaseMatchesLastApply =
+        emergency.currentOwner == MotionOwner::SAFETY &&
+        emergency.currentOwner == emergency.lastAppliedOwner &&
+        emergency.currentOwnerGeneration !=
+        MOTION_OWNER_GENERATION_INVALID &&
+        emergency.currentOwnerGeneration ==
+        emergency.lastAppliedOwnerGeneration;
+    emergency.rtStopStateApplied =
+        emergencyCounters.rtApplications != 0ULL &&
+        !emergency.groupActive &&
+        (emergency.groupEmergencyStopped || emergency.groupError) &&
+        emergency.virtualCommandZero &&
+        emergency.virtualTargetSealed &&
+        emergency.allExistingAxesSafe &&
+        emergency.allExistingAxisCommandsZero &&
+        emergency.allExistingAxisTargetsSealed &&
+        emergency.safetyLeaseMatchesLastApply;
 
     snapshot.primaryBlocker = primaryBlocker;
     snapshot.primaryAxisIndex = primaryAxisIndex;
@@ -11965,6 +12490,8 @@ void MotionCore::PublishStopSettleEvidence() noexcept
     ++m_stopSettleNextPublicationGeneration;
     snapshot.publicationGeneration =
         m_stopSettleNextPublicationGeneration;
+    emergency.publicationGeneration =
+        snapshot.publicationGeneration;
     for (std::size_t profileIndex = 0U;
         profileIndex < MOTION_NC_SETTLE_PROFILE_COUNT;
         ++profileIndex)
@@ -12106,6 +12633,114 @@ void MotionCore::GetStopSettleEvidence(
 
     snapshot = payload.snapshot;
     counters = payload.counters;
+}
+
+
+bool MotionCore::TryGetEmergencyStopEvidence(
+    MotionEmergencyStopEvidence& evidence,
+    MotionEmergencyStopCounters& counters) const noexcept
+{
+    MotionStopSettlePublicationPayload payload{};
+    if (!TryReadStopSettlePublication(payload))
+    {
+        evidence = MotionEmergencyStopEvidence{};
+        counters = MotionEmergencyStopCounters{};
+        return false;
+    }
+
+    evidence = payload.emergencyStopEvidence;
+    counters = payload.emergencyStopCounters;
+    return true;
+}
+
+
+MotionEmergencyStopEpochInvalidationEvidence
+MotionCore::GetEmergencyStopEpochInvalidationEvidence() const noexcept
+{
+    // A bounded seqlock read keeps the packed Epoch pair and its monotonic
+    // invalidation count coherent without adding bytes to the stop/settle
+    // publication.  E-stop invalidations are rare; four retries are ample and
+    // an unstable read deliberately returns INVALID evidence.
+    for (unsigned int attempt = 0U; attempt < 4U; ++attempt)
+    {
+        const std::uint64_t sequenceBefore =
+            m_emergencyStopEpochInvalidationWriteSequence.load(
+                std::memory_order_acquire);
+        if ((sequenceBefore & 1ULL) != 0ULL)
+        {
+            continue;
+        }
+
+        const std::uint64_t packed =
+            m_emergencyStopLastEpochInvalidationPacked.load(
+                std::memory_order_acquire);
+        const std::uint64_t invalidationCount =
+            m_emergencyStopLastEpochInvalidationCount.load(
+                std::memory_order_acquire);
+        const std::uint64_t sequenceAfter =
+            m_emergencyStopEpochInvalidationWriteSequence.load(
+                std::memory_order_acquire);
+
+        if (sequenceBefore == sequenceAfter &&
+            (sequenceAfter & 1ULL) == 0ULL)
+        {
+            MotionEmergencyStopEpochInvalidationEvidence evidence{};
+            evidence.fromExecutionEpoch =
+                static_cast<MotionExecutionEpoch>(
+                    packed & 0xFFFFFFFFULL);
+            evidence.toExecutionEpoch =
+                static_cast<MotionExecutionEpoch>(
+                    (packed >> 32U) & 0xFFFFFFFFULL);
+            evidence.invalidationCount = invalidationCount;
+            return evidence;
+        }
+    }
+
+    return MotionEmergencyStopEpochInvalidationEvidence{};
+}
+
+
+MotionStartupLagArmingEvidence
+MotionCore::GetStartupLagArmingEvidence() const noexcept
+{
+    MotionStartupLagArmingEvidence evidence{};
+
+    const std::uint64_t packedMasks =
+        m_startupLagArmingMasks.load(std::memory_order_acquire);
+    evidence.existingAxisMask = static_cast<std::uint32_t>(
+        packedMasks & 0xFFULL);
+    evidence.feedbackReadyAxisMask = static_cast<std::uint32_t>(
+        (packedMasks >> 8U) & 0xFFULL);
+    evidence.positionAlignedAxisMask = static_cast<std::uint32_t>(
+        (packedMasks >> 16U) & 0xFFULL);
+    evidence.lagArmedAxisMask = static_cast<std::uint32_t>(
+        (packedMasks >> 24U) & 0xFFULL);
+    evidence.prematureMotionBlockedAxisMask =
+        static_cast<std::uint32_t>(
+            (packedMasks >> 32U) & 0xFFULL);
+    evidence.pendingAxisMask =
+        evidence.existingAxisMask & ~evidence.lagArmedAxisMask;
+
+    evidence.minimumStableSampleCount =
+        m_startupLagMinimumStableSampleCount.load(
+            std::memory_order_acquire);
+    evidence.stableSamplesRequired =
+        MOTION_STARTUP_LAG_ARM_STABLE_SAMPLES;
+    evidence.alignmentEvents =
+        m_startupLagAlignmentEvents.load(std::memory_order_acquire);
+    evidence.armingTransitions =
+        m_startupLagArmingTransitions.load(std::memory_order_acquire);
+    evidence.readinessResets =
+        m_startupLagReadinessResets.load(std::memory_order_acquire);
+    evidence.prematureMotionBlocks =
+        m_startupLagPrematureMotionBlocks.load(std::memory_order_acquire);
+
+    evidence.allExistingAxesArmed =
+        evidence.existingAxisMask != 0U &&
+        evidence.pendingAxisMask == 0U;
+    evidence.blocked =
+        evidence.prematureMotionBlockedAxisMask != 0U;
+    return evidence;
 }
 
 

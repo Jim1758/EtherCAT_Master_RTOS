@@ -16,6 +16,7 @@
 #include "NCFeedHoldResumeGate.h" // Stage NC-0.2I.3：Feed Hold ACK-Gated Resume Cutover
 #include "NCLifecycleInterruptionBoundary.h" // Stage NC-0.2J.1：Failure / Epoch Cancellation Shadow
 #include "NCResetReleaseGate.h" // Stage NC-0.2J.3：Reset Stable-Standstill Release Gate
+#include "NCAlarmEmergencyStopBoundary.h" // Stage NC-0.2J.6.1：Alarm / E-stop RT ACK Shadow
 
 #include <queue>
 #include <vector>
@@ -654,6 +655,22 @@ public:
         return m_resetReleaseGate.GetCounters();
     }
 
+    // =========================================================
+    // Stage NC-0.2J.6.1 - Alarm / Emergency-stop RT ACK Shadow.
+    // Read-only diagnostics; no Alarm clear or recovery permission.
+    // =========================================================
+    NCAlarmEmergencyStopSnapshot
+        GetAlarmEmergencyStopSnapshot() const noexcept
+    {
+        return m_alarmEmergencyStopShadow.GetSnapshot();
+    }
+
+    NCAlarmEmergencyStopCounters
+        GetAlarmEmergencyStopCounters() const noexcept
+    {
+        return m_alarmEmergencyStopShadow.GetCounters();
+    }
+
     static bool WaitForGMBlockTransactionCallback(NCManager* nc);
     static bool WaitAndHoldCallback(NCManager* nc);
     static bool WaitAndClearQueueCallback(NCManager* nc);
@@ -681,6 +698,7 @@ private:
     // terminal feedback share one fixed-size diagnostic interruption chain.
     NCLifecycleInterruptionBoundaryShadow m_lifecycleInterruptionShadow{};
     NCResetReleaseGate m_resetReleaseGate{};
+    NCAlarmEmergencyStopBoundaryShadow m_alarmEmergencyStopShadow{};
     bool m_lifecycleInterruptionAlarmLatched = false;
 
     // Stage NC-0.2F：已追蹤 Motion Block 的 Wait Callback 採 Dual-Key
@@ -841,6 +859,10 @@ private:
     void RecordLifecycleInterruptionEpochPublished(
         MotionExecutionEpoch executionEpoch) noexcept;
     void ObserveLifecycleInterruptionShadow() noexcept;
+    NCAlarmEmergencyStopSample
+        BuildAlarmEmergencyStopSample() const noexcept;
+    void BeginAlarmEmergencyStopShadow() noexcept;
+    void ObserveAlarmEmergencyStopShadow() noexcept;
     static bool IsLifecycleFailureFeedback(
         MotionFeedbackType type) noexcept;
     static NCLifecycleInterruptionCause

@@ -473,6 +473,7 @@ namespace HMI_Bridge
             case NCLifecycleInterruptionPhase::QUIESCENT: return "QUIESCENT";
             case NCLifecycleInterruptionPhase::EVIDENCE_GAP: return "EVIDENCE_GAP";
             case NCLifecycleInterruptionPhase::SUPERSEDED: return "SUPERSEDED";
+            case NCLifecycleInterruptionPhase::ALARM_STOP_CLOSED: return "ALARM_STOP_CLOSED";
             case NCLifecycleInterruptionPhase::IDLE:
             default: return "IDLE";
             }
@@ -508,7 +509,73 @@ namespace HMI_Bridge
             case NCLifecycleInterruptionDecision::EVIDENCE_LEDGER_REJECTED: return "GAP_LEDGER_REJECT";
             case NCLifecycleInterruptionDecision::EPOCH_SUPERSEDED: return "EPOCH_SUPERSEDED";
             case NCLifecycleInterruptionDecision::SUPERSEDED: return "SUPERSEDED";
+            case NCLifecycleInterruptionDecision::WAIT_ALARM_STOP_ACKNOWLEDGEMENT: return "WAIT_ALARM_ACK";
+            case NCLifecycleInterruptionDecision::WAIT_ALARM_STOP_TERMINAL: return "WAIT_ALARM_TERM";
+            case NCLifecycleInterruptionDecision::WAIT_ALARM_STOP_STABLE: return "WAIT_ALARM_STABLE";
+            case NCLifecycleInterruptionDecision::ALARM_STOP_CLOSED: return "ALARM_STOP_CLOSED";
             case NCLifecycleInterruptionDecision::NONE:
+            default: return "NONE";
+            }
+        }
+
+        const char* NCAlarmEmergencyStopTriggerToDiagnosticName(
+            NCAlarmEmergencyStopTrigger trigger) noexcept
+        {
+            switch (trigger)
+            {
+            case NCAlarmEmergencyStopTrigger::EMERGENCY_STOP: return "EMERGENCY_STOP";
+            case NCAlarmEmergencyStopTrigger::AXIS_PROTECTION: return "AXIS_PROTECT";
+            case NCAlarmEmergencyStopTrigger::HARD_LIMIT: return "HARD_LIMIT";
+            case NCAlarmEmergencyStopTrigger::DRIVE_FAULT: return "DRIVE_FAULT";
+            case NCAlarmEmergencyStopTrigger::LAG_ERROR: return "LAG_ERROR";
+            case NCAlarmEmergencyStopTrigger::NC_PROGRAM: return "NC_PROGRAM";
+            case NCAlarmEmergencyStopTrigger::EDM_PROCESS: return "EDM_PROCESS";
+            case NCAlarmEmergencyStopTrigger::SYSTEM: return "SYSTEM";
+            case NCAlarmEmergencyStopTrigger::AXIS: return "AXIS";
+            case NCAlarmEmergencyStopTrigger::UNKNOWN: return "UNKNOWN";
+            case NCAlarmEmergencyStopTrigger::NONE:
+            default: return "NONE";
+            }
+        }
+
+        const char* NCAlarmEmergencyStopPhaseToDiagnosticName(
+            NCAlarmEmergencyStopPhase phase) noexcept
+        {
+            switch (phase)
+            {
+            case NCAlarmEmergencyStopPhase::REQUESTED: return "REQUESTED";
+            case NCAlarmEmergencyStopPhase::WAITING_RT: return "WAITING_RT";
+            case NCAlarmEmergencyStopPhase::ACKNOWLEDGED: return "ACKNOWLEDGED";
+            case NCAlarmEmergencyStopPhase::CLEARED: return "CLEARED";
+            case NCAlarmEmergencyStopPhase::EVIDENCE_GAP: return "EVIDENCE_GAP";
+            case NCAlarmEmergencyStopPhase::SUPERSEDED: return "SUPERSEDED";
+            case NCAlarmEmergencyStopPhase::IDLE:
+            default: return "IDLE";
+            }
+        }
+
+        const char* NCAlarmEmergencyStopDecisionToDiagnosticName(
+            NCAlarmEmergencyStopDecision decision) noexcept
+        {
+            switch (decision)
+            {
+            case NCAlarmEmergencyStopDecision::ALARM_LATCHED: return "ALARM_LATCHED";
+            case NCAlarmEmergencyStopDecision::WAIT_PUBLICATION: return "WAIT_PUBLICATION";
+            case NCAlarmEmergencyStopDecision::WAIT_REQUEST: return "WAIT_REQUEST";
+            case NCAlarmEmergencyStopDecision::WAIT_RT_APPLY: return "WAIT_RT_APPLY";
+            case NCAlarmEmergencyStopDecision::WAIT_SAFETY_OWNER: return "WAIT_SAFETY_OWNER";
+            case NCAlarmEmergencyStopDecision::WAIT_EXECUTION_EPOCH: return "WAIT_EPOCH";
+            case NCAlarmEmergencyStopDecision::WAIT_GROUP_STOP: return "WAIT_GROUP_STOP";
+            case NCAlarmEmergencyStopDecision::WAIT_AXIS_SAFE_STATE: return "WAIT_AXIS_SAFE";
+            case NCAlarmEmergencyStopDecision::WAIT_COMMAND_ZERO: return "WAIT_COMMAND_ZERO";
+            case NCAlarmEmergencyStopDecision::WAIT_TARGET_SEALED: return "WAIT_TARGET_SEALED";
+            case NCAlarmEmergencyStopDecision::STOP_ACKNOWLEDGED: return "STOP_ACKNOWLEDGED";
+            case NCAlarmEmergencyStopDecision::ALARM_CLEARED_BEFORE_ACK: return "CLEARED_EARLY";
+            case NCAlarmEmergencyStopDecision::EVIDENCE_LIFECYCLE_GAP: return "GAP_LIFECYCLE";
+            case NCAlarmEmergencyStopDecision::EVIDENCE_LIFECYCLE_REPLACED: return "GAP_REPLACED";
+            case NCAlarmEmergencyStopDecision::EVIDENCE_AXIS_SCOPE_CHANGED: return "GAP_AXIS_SCOPE";
+            case NCAlarmEmergencyStopDecision::SUPERSEDED: return "SUPERSEDED";
+            case NCAlarmEmergencyStopDecision::NONE:
             default: return "NONE";
             }
         }
@@ -727,6 +794,13 @@ namespace HMI_Bridge
             // transition detector; it is not a lifecycle identity.
             token ^= value;
             return token * 1099511628211ULL;
+        }
+
+        std::uint64_t SubtractDiagnosticCounterFloor(
+            std::uint64_t raw,
+            std::uint64_t expected) noexcept
+        {
+            return raw > expected ? raw - expected : 0ULL;
         }
 
         std::uint64_t BuildNCSettleDiagnosticEventToken(
@@ -1595,6 +1669,9 @@ namespace HMI_Bridge
         // =============================================================
         MotionCore& motion = nc->GetMotion();
 
+        const MotionStartupLagArmingEvidence startupLagArming =
+            motion.GetStartupLagArmingEvidence();
+
         MotionStopSettleSnapshot stopSettleSnapshot{};
         MotionStopSettleCounters stopSettleCounters{};
         motion.GetStopSettleEvidence(
@@ -1737,6 +1814,11 @@ namespace HMI_Bridge
         const NCResetReleaseGateCounters resetReleaseGateCounters =
             nc->GetResetReleaseGateCounters();
 
+        const NCAlarmEmergencyStopSnapshot alarmEmergencyStopSnapshot =
+            nc->GetAlarmEmergencyStopSnapshot();
+        const NCAlarmEmergencyStopCounters alarmEmergencyStopCounters =
+            nc->GetAlarmEmergencyStopCounters();
+
         const std::uint64_t lifecycleChangeToken =
             blockCounters.dispatched +
             blockCounters.programCommitted +
@@ -1871,6 +1953,13 @@ namespace HMI_Bridge
             lifecycleInterruptionCounters.requestAttempts +
             lifecycleInterruptionCounters.requestsLatched +
             lifecycleInterruptionCounters.epochPublicationsObserved +
+            lifecycleInterruptionCounters.alarmStopAcknowledgements +
+            lifecycleInterruptionCounters.runtimeAlarmEpochChanges +
+            lifecycleInterruptionCounters.expectedAlarmAborts +
+            lifecycleInterruptionCounters.expectedAlarmPreReadRejects +
+            lifecycleInterruptionCounters.expectedAlarmOwnerConflictRejects +
+            lifecycleInterruptionCounters.expectedAlarmStaleEpochRejects +
+            lifecycleInterruptionCounters.alarmStopsClosed +
             lifecycleInterruptionCounters.terminalRejected +
             lifecycleInterruptionCounters.terminalCancelled +
             lifecycleInterruptionCounters.terminalAborted +
@@ -1903,7 +1992,32 @@ namespace HMI_Bridge
             resetReleaseGateCounters.blockedOwnerRelease +
             resetReleaseGateCounters.blockedPostInterruptionDispatch;
 
-        const std::uint64_t transportErrorTotal =
+        const std::uint64_t alarmEmergencyStopChangeToken =
+            alarmEmergencyStopSnapshot.sequence +
+            static_cast<std::uint64_t>(alarmEmergencyStopSnapshot.phase) +
+            static_cast<std::uint64_t>(alarmEmergencyStopSnapshot.decision) +
+            alarmEmergencyStopSnapshot.requestPublishedCurrent +
+            alarmEmergencyStopSnapshot.rtApplyCurrent +
+            alarmEmergencyStopSnapshot.epochInvalidationCurrent +
+            static_cast<std::uint64_t>(
+                alarmEmergencyStopSnapshot.
+                lastInvalidatedFromExecutionEpoch) +
+            static_cast<std::uint64_t>(
+                alarmEmergencyStopSnapshot.
+                lastInvalidatedToExecutionEpoch) +
+            alarmEmergencyStopSnapshot.lastInvalidationCount +
+            alarmEmergencyStopCounters.requestAttempts +
+            alarmEmergencyStopCounters.requestsLatched +
+            alarmEmergencyStopCounters.acknowledged +
+            alarmEmergencyStopCounters.preLatchedCorrelations +
+            alarmEmergencyStopCounters.preLatchedAcknowledged +
+            alarmEmergencyStopCounters.clearedBeforeAcknowledge +
+            alarmEmergencyStopCounters.lifecycleEvidenceGap +
+            alarmEmergencyStopCounters.lifecycleReplaced +
+            alarmEmergencyStopCounters.axisScopeChanged +
+            alarmEmergencyStopCounters.superseded;
+
+        const std::uint64_t transportRawErrorTotal =
             axisQueueFull +
             axisResultOverflow +
             ownerConflictReject +
@@ -1914,6 +2028,38 @@ namespace HMI_Bridge
             feedbackNoticeOverflow +
             feedbackSequenceGap +
             feedbackRejected +
+            feedbackFaulted;
+
+        // Stage NC-0.2J.6.3.1: retain the existing layered transport accounting
+        // (cause counter plus feedback terminal) for every unexpected failure.
+        // Remove only the two matching layers of a pre-read retirement proved
+        // by the exact Alarm lifecycle; unrelated errors remain fail-closed.
+        const std::uint64_t unexpectedOwnerConflictReject =
+            SubtractDiagnosticCounterFloor(
+                ownerConflictReject,
+                lifecycleInterruptionCounters.
+                expectedAlarmOwnerConflictRejects);
+        const std::uint64_t unexpectedStaleDiscard =
+            SubtractDiagnosticCounterFloor(
+                staleDiscard,
+                lifecycleInterruptionCounters.
+                expectedAlarmStaleEpochRejects);
+        const std::uint64_t unexpectedFeedbackRejected =
+            SubtractDiagnosticCounterFloor(
+                feedbackRejected,
+                lifecycleInterruptionCounters.
+                expectedAlarmPreReadRejects);
+        const std::uint64_t transportErrorTotal =
+            axisQueueFull +
+            axisResultOverflow +
+            unexpectedOwnerConflictReject +
+            unexpectedStaleDiscard +
+            commandQueueFull +
+            replayOverflow +
+            feedbackOverflow +
+            feedbackNoticeOverflow +
+            feedbackSequenceGap +
+            unexpectedFeedbackRejected +
             feedbackFaulted;
 
         const std::uint64_t j5SetInvalid =
@@ -2107,6 +2253,7 @@ namespace HMI_Bridge
         static std::uint64_t previousFeedHoldGateChangeToken = 0ULL;
         static std::uint64_t previousLifecycleInterruptionChangeToken = 0ULL;
         static std::uint64_t previousResetReleaseGateChangeToken = 0ULL;
+        static std::uint64_t previousAlarmEmergencyStopChangeToken = 0ULL;
         static std::uint64_t previousJ5EventToken = 0ULL;
 
         const bool ownerChanged =
@@ -2168,6 +2315,11 @@ namespace HMI_Bridge
             resetReleaseGateChangeToken !=
             previousResetReleaseGateChangeToken;
 
+        const bool alarmEmergencyStopChanged =
+            startupSamples != 0U &&
+            alarmEmergencyStopChangeToken !=
+            previousAlarmEmergencyStopChangeToken;
+
         const bool j5EventChanged =
             startupSamples != 0U &&
             j5EventToken != previousJ5EventToken;
@@ -2175,6 +2327,10 @@ namespace HMI_Bridge
         const bool shouldPrintJ5 =
             startupSamples == 0U ||
             j5EventChanged;
+
+        const bool shouldPrintJ6 =
+            startupSamples == 0U ||
+            alarmEmergencyStopChanged;
 
         const bool shouldPrint =
             startupSamples < 15U ||
@@ -2189,6 +2345,7 @@ namespace HMI_Bridge
             feedHoldGateChanged ||
             lifecycleInterruptionChanged ||
             resetReleaseGateChanged ||
+            alarmEmergencyStopChanged ||
             shouldPrintJ5 ||
             ownerChanged ||
             errorCounterChanged ||
@@ -2197,6 +2354,36 @@ namespace HMI_Bridge
 
         if (shouldPrint)
         {
+            RtPrintf(
+                "[NC02J64-LAG] Existing:%02X Ready:%02X Aligned:%02X "
+                "Armed:%02X Pending:%02X Blocked:%02X Stable:%u/%u "
+                "Align:%llu Arm:%llu Reset:%llu Early:%llu All:%u\n",
+                static_cast<unsigned int>(
+                    startupLagArming.existingAxisMask),
+                static_cast<unsigned int>(
+                    startupLagArming.feedbackReadyAxisMask),
+                static_cast<unsigned int>(
+                    startupLagArming.positionAlignedAxisMask),
+                static_cast<unsigned int>(
+                    startupLagArming.lagArmedAxisMask),
+                static_cast<unsigned int>(
+                    startupLagArming.pendingAxisMask),
+                static_cast<unsigned int>(
+                    startupLagArming.prematureMotionBlockedAxisMask),
+                static_cast<unsigned int>(
+                    startupLagArming.minimumStableSampleCount),
+                static_cast<unsigned int>(
+                    startupLagArming.stableSamplesRequired),
+                static_cast<unsigned long long>(
+                    startupLagArming.alignmentEvents),
+                static_cast<unsigned long long>(
+                    startupLagArming.armingTransitions),
+                static_cast<unsigned long long>(
+                    startupLagArming.readinessResets),
+                static_cast<unsigned long long>(
+                    startupLagArming.prematureMotionBlocks),
+                startupLagArming.allExistingAxesArmed ? 1U : 0U);
+
             RtPrintf(
                 "[NC01F-RT] NC:%d Mode:%d Owner:%s(%u) Gen:%u "
                 "Safety:%u AxisQ:%llu CmdIn:%llu Replay:%llu "
@@ -2960,12 +3147,170 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(feedHoldGateCounters.superseded),
                 static_cast<unsigned long long>(feedHoldGateCounters.rollbackDisabled));
 
+            if (shouldPrintJ6)
+            {
+                RtPrintf(
+                    "[NC02J6-ALM] Seq:%llu Code:%d Axis:%d Trigger:%s "
+                    "Phase:%s Decision:%s Active:%u Ack:%u Alarm:%u "
+                    "Upd:%u Count:%d LSeq:%llu\n",
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.sequence),
+                    static_cast<int>(
+                        alarmEmergencyStopSnapshot.alarmCode),
+                    static_cast<int>(
+                        alarmEmergencyStopSnapshot.alarmAxisIndex),
+                    NCAlarmEmergencyStopTriggerToDiagnosticName(
+                        alarmEmergencyStopSnapshot.trigger),
+                    NCAlarmEmergencyStopPhaseToDiagnosticName(
+                        alarmEmergencyStopSnapshot.phase),
+                    NCAlarmEmergencyStopDecisionToDiagnosticName(
+                        alarmEmergencyStopSnapshot.decision),
+                    alarmEmergencyStopSnapshot.active ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.acknowledged ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.alarmActive ? 1U : 0U,
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.alarmUpdateCount),
+                    static_cast<int>(
+                        alarmEmergencyStopSnapshot.alarmCount),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.lifecycleSequence));
+
+                RtPrintf(
+                    "[NC02J6-RT] Pub:%llu Req:%llu>%llu Apply:%llu>%llu "
+                    "Delta:%llu Inv:%llu>%llu Epoch:%llu>%llu Last:%llu "
+                    "Need:%u Owner:%s/%u LastOwner:%s/%u Match:%u\n",
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.motionPublicationGeneration),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.requestPublishedBaseline),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.requestPublishedCurrent),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.rtApplyBaseline),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.rtApplyCurrent),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.rtApplyDelta),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.epochInvalidationBaseline),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.epochInvalidationCurrent),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.requestExecutionEpoch),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.currentExecutionEpoch),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.lastAppliedExecutionEpoch),
+                    alarmEmergencyStopSnapshot.epochChangeRequired ? 1U : 0U,
+                    MotionOwnerToDiagnosticName(
+                        alarmEmergencyStopSnapshot.currentOwner),
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.currentOwnerGeneration),
+                    MotionOwnerToDiagnosticName(
+                        alarmEmergencyStopSnapshot.lastAppliedOwner),
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.lastAppliedOwnerGeneration),
+                    alarmEmergencyStopSnapshot.safetyOwnerMatched ? 1U : 0U);
+
+                RtPrintf(
+                    "[NC02J632-INV] From:%llu To:%llu Count:%llu "
+                    "Correlated:%u PreLatched:%u\n",
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.
+                        lastInvalidatedFromExecutionEpoch),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.
+                        lastInvalidatedToExecutionEpoch),
+                    static_cast<unsigned long long>(
+                        alarmEmergencyStopSnapshot.
+                        lastInvalidationCount),
+                    alarmEmergencyStopSnapshot.
+                    epochInvalidationCorrelated ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.
+                    preLatchedRTApplication ? 1U : 0U);
+
+                RtPrintf(
+                    "[NC02J6-AX] Expect:%08X Current:%08X ESTOP:%08X "
+                    "Error:%08X Cmd0:%08X Seal:%08X PDO:%08X/%08X "
+                    "Group:%u AxisSafe:%u CmdAll0:%u SealAll:%u PDOAll0:%u "
+                    "Coh:%u ReqSeen:%u RTAck:%u EpochOK:%u FbSync:%u "
+                    "Gap:%u Post:%u\n",
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.expectedAxisMask),
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.currentAxisMask),
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.estopAxisMask),
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.errorAxisMask),
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.commandZeroAxisMask),
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.targetSealedAxisMask),
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.pdoZeroAxisMask),
+                    static_cast<unsigned int>(
+                        alarmEmergencyStopSnapshot.pdoSampledAxisMask),
+                    alarmEmergencyStopSnapshot.groupStopApplied ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.allExistingAxesSafe ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.allExistingAxisCommandsZero ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.allExistingAxisTargetsSealed ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.allSampledPdoTargetVelocitiesZero ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.emergencyEvidenceCoherent ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.emergencyRequestObserved ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.rtApplyObserved ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.executionEpochMatched ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.feedbackSequenceSynchronized ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.lifecycleEvidenceGap ? 1U : 0U,
+                    alarmEmergencyStopSnapshot.postAlarmDispatchObserved ? 1U : 0U);
+
+                RtPrintf(
+                    "[NC02J6-CNT] ReqTry:%llu Req:%llu EStop:%llu "
+                    "Protect:%llu Limit:%llu Drive:%llu Lag:%llu NC:%llu "
+                    "EDM:%llu Other:%llu Eval:%llu WaitPub:%llu "
+                    "WaitReq:%llu WaitRT:%llu WaitOwner:%llu WaitEpoch:%llu "
+                    "WaitGroup:%llu WaitAxis:%llu WaitCmd:%llu WaitSeal:%llu "
+                    "Ack:%llu PreCorr:%llu PreAck:%llu ClearEarly:%llu "
+                    "Gap:%llu Replace:%llu "
+                    "AxisScope:%llu Super:%llu\n",
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.requestAttempts),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.requestsLatched),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.emergencyStopTriggers),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.axisProtectionTriggers),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.hardLimitTriggers),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.driveFaultTriggers),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.lagErrorTriggers),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.ncProgramTriggers),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.edmProcessTriggers),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.otherTriggers),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.evaluations),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitPublication),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitRequest),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitRTApply),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitSafetyOwner),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitExecutionEpoch),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitGroupStop),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitAxisSafeState),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitCommandZero),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitTargetSealed),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.acknowledged),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.preLatchedCorrelations),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.preLatchedAcknowledged),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.clearedBeforeAcknowledge),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.lifecycleEvidenceGap),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.lifecycleReplaced),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.axisScopeChanged),
+                    static_cast<unsigned long long>(alarmEmergencyStopCounters.superseded));
+            }
+
             RtPrintf(
                 "[NC02J-INT] Seq:%llu Cause:%s Phase:%s Decision:%s Active:%u "
                 "EpochExp:%u Epoch:%llu>%llu>%llu Owner:%s/%u>%s/%u "
+                "ExecOwner:%s/%u "
                 "D:%llu PC:%d Blocks:%u>%u Term:%s TSeq:%llu Seg:%llu "
-                "SrcBlk:%d LedgerOK:%u TermSeen:%u UnexpectedEpoch:%u "
-                "PostDispatch:%u\n",
+                "SrcBlk:%d LedgerOK:%u TermSeen:%u AlarmAck:%u "
+                "RTEpoch:%u ExpAbort:%u ExpRetire:%u ClassOK:%u StopClosed:%u "
+                "UnexpectedEpoch:%u PostDispatch:%u\n",
                 static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.sequence),
                 NCLifecycleInterruptionCauseToDiagnosticName(
@@ -2990,6 +3335,11 @@ namespace HMI_Bridge
                     lifecycleInterruptionSnapshot.currentOwner),
                 static_cast<unsigned int>(
                     lifecycleInterruptionSnapshot.currentOwnerGeneration),
+                MotionOwnerToDiagnosticName(
+                    lifecycleInterruptionSnapshot.requestExecutionOwner),
+                static_cast<unsigned int>(
+                    lifecycleInterruptionSnapshot.
+                    requestExecutionOwnerGeneration),
                 static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.requestDispatchId),
                 lifecycleInterruptionSnapshot.requestPC,
@@ -3007,6 +3357,12 @@ namespace HMI_Bridge
                     lifecycleInterruptionSnapshot.lastTerminalIdentity.sourceBlockId),
                 lifecycleInterruptionSnapshot.terminalFeedbackLedgerAccepted ? 1U : 0U,
                 lifecycleInterruptionSnapshot.terminalFailureObserved ? 1U : 0U,
+                lifecycleInterruptionSnapshot.alarmStopAcknowledged ? 1U : 0U,
+                lifecycleInterruptionSnapshot.runtimeAlarmEpochChangeObserved ? 1U : 0U,
+                lifecycleInterruptionSnapshot.expectedAlarmAbortObserved ? 1U : 0U,
+                lifecycleInterruptionSnapshot.expectedAlarmPreReadRejectObserved ? 1U : 0U,
+                lifecycleInterruptionSnapshot.alarmTerminalClassificationValid ? 1U : 0U,
+                lifecycleInterruptionSnapshot.alarmStopClosed ? 1U : 0U,
                 lifecycleInterruptionSnapshot.unexpectedEpochChangeObserved ? 1U : 0U,
                 lifecycleInterruptionSnapshot.postInterruptionDispatchObserved ? 1U : 0U);
 
@@ -3014,8 +3370,10 @@ namespace HMI_Bridge
                 "[NC02J-DRN] AxisQ:%llu AxisR:%llu CmdQ:%llu In:%llu "
                 "Replay:%llu Fb:%llu Notice:%llu FbSeq:%llu/%llu "
                 "Safety:%u Cb:%u Bind:%u Stand:%u Stable:%u/%u "
-                "Ready:%u Quiet:%u Gap:%u Dispatch:%llu DltFail:%llu Rej:%llu "
-                "Cancel:%llu Abort:%llu Fault:%llu Ledger:%llu "
+                "Ready:%u Quiet:%u Gap:%u Dispatch:%llu DltFail:%llu "
+                "RawFail:%llu ExpAbort:%llu ExpReject:%llu UnexpReject:%llu "
+                "ExpOwner:%llu ExpStale:%llu Rej:%llu Cancel:%llu "
+                "Abort:%llu Fault:%llu Ledger:%llu "
                 "FbOv:%llu NoticeOv:%llu SeqGap:%llu\n",
                 static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.axisCommandDepth),
@@ -3049,7 +3407,19 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.dispatchDelta),
                 static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.unexpectedBlockFailureDelta),
+                static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.blockFailureDelta),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.expectedAlarmAbortDelta),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.expectedAlarmPreReadRejectDelta),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.unexpectedFeedbackRejectedDelta),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.expectedAlarmOwnerConflictRejectDelta),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.expectedAlarmStaleEpochRejectDelta),
                 static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.feedbackRejectedDelta),
                 static_cast<unsigned long long>(
@@ -3071,7 +3441,9 @@ namespace HMI_Bridge
                 "[NC02J-CNT] ReqTry:%llu Req:%llu Reset:%llu Alarm:%llu "
                 "Prog:%llu MDI:%llu Manual:%llu Dynamic:%llu Goto:%llu "
                 "TermReq:%llu EpochExp:%llu EpochObs:%llu Unexpected:%llu "
-                "EpochSuper:%llu TRej:%llu TCancel:%llu TAbort:%llu "
+                "EpochSuper:%llu AlarmAck:%llu RTEpoch:%llu ExpAbort:%llu "
+                "ExpReject:%llu ExpOwner:%llu ExpStale:%llu StopClose:%llu "
+                "TRej:%llu TCancel:%llu TAbort:%llu "
                 "TFault:%llu LedgerReject:%llu PostDispatch:%llu Eval:%llu Quiet:%llu "
                 "Gap:%llu Super:%llu\n",
                 static_cast<unsigned long long>(
@@ -3103,6 +3475,20 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.epochSuperseded),
                 static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.alarmStopAcknowledgements),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.runtimeAlarmEpochChanges),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.expectedAlarmAborts),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.expectedAlarmPreReadRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.expectedAlarmOwnerConflictRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.expectedAlarmStaleEpochRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.alarmStopsClosed),
+                static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.terminalRejected),
                 static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.terminalCancelled),
@@ -3124,10 +3510,35 @@ namespace HMI_Bridge
                     lifecycleInterruptionCounters.superseded));
 
             RtPrintf(
+                "[NC02J631-TRN] RawTotal:%llu Unexpected:%llu "
+                "RawOwner:%llu RawStale:%llu RawFbRej:%llu "
+                "ExpOwner:%llu ExpStale:%llu ExpFbRej:%llu "
+                "ResidualOwner:%llu ResidualStale:%llu ResidualFb:%llu\n",
+                static_cast<unsigned long long>(transportRawErrorTotal),
+                static_cast<unsigned long long>(transportErrorTotal),
+                static_cast<unsigned long long>(ownerConflictReject),
+                static_cast<unsigned long long>(staleDiscard),
+                static_cast<unsigned long long>(feedbackRejected),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.
+                    expectedAlarmOwnerConflictRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.
+                    expectedAlarmStaleEpochRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.
+                    expectedAlarmPreReadRejects),
+                static_cast<unsigned long long>(
+                    unexpectedOwnerConflictReject),
+                static_cast<unsigned long long>(unexpectedStaleDiscard),
+                static_cast<unsigned long long>(unexpectedFeedbackRejected));
+
+            RtPrintf(
                 "[NC02J-WAIT] Epoch:%llu Blocks:%llu AxisQ:%llu AxisR:%llu "
                 "In:%llu Replay:%llu CmdQ:%llu Notice:%llu Fb:%llu "
                 "FbSeq:%llu Cb:%llu Bind:%llu Safety:%llu Stand:%llu "
-                "Stable:%llu GapFb:%llu GapNotice:%llu GapSeq:%llu "
+                "Stable:%llu AlarmAck:%llu AlarmTerm:%llu AlarmStable:%llu "
+                "GapFb:%llu GapNotice:%llu GapSeq:%llu "
                 "GapLedger:%llu GapReject:%llu\n",
                 static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.waitEpochPublication),
@@ -3159,6 +3570,12 @@ namespace HMI_Bridge
                     lifecycleInterruptionCounters.waitGroupStandstill),
                 static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.waitStableConfirmation),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.waitAlarmStopAcknowledgement),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.waitAlarmStopTerminal),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.waitAlarmStopStable),
                 static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.feedbackOverflowEvidenceGap),
                 static_cast<unsigned long long>(
@@ -3406,6 +3823,8 @@ namespace HMI_Bridge
             lifecycleInterruptionChangeToken;
         previousResetReleaseGateChangeToken =
             resetReleaseGateChangeToken;
+        previousAlarmEmergencyStopChangeToken =
+            alarmEmergencyStopChangeToken;
         previousJ5EventToken = j5EventToken;
     }
 }

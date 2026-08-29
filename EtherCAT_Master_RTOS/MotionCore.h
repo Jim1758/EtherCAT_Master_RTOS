@@ -21,6 +21,7 @@
 class EtherCatMaster;
 constexpr int MAX_AXES = 8;//最大軸數宣告
 const double CYCLE_TIME_SEC = 0.00025;// EtherCAT 通訊週期 (250us)
+constexpr std::uint32_t MOTION_STARTUP_LAG_ARM_STABLE_SAMPLES = 8U;
 
 
 
@@ -361,6 +362,15 @@ struct AxisContext//軸參數與狀態
     int32_t lastRawActPos = 0;    // 紀錄上一次的原始 32-bit 數值
     double  unwrappedActPos = 0.0;// 展開後、永遠不會溢位的絕對真實位置 (Pulse)
     bool    isFirstCycle = true;  // 開機第一圈對齊旗標
+
+    // Stage NC-0.2J.6.4: startup feedback alignment is a one-shot boot
+    // contract.  Once startupLagMonitorArmed becomes true it is never
+    // automatically cleared by Servo-Off, Alarm Reset or a second Link().
+    bool startupLagFeedbackReady = false;
+    bool startupLagPositionAligned = false;
+    bool startupLagMonitorArmed = false;
+    bool startupLagPrematureMotionBlocked = false;
+    std::uint32_t startupLagStableSampleCount = 0U;
 
 
     // 🌟 新增：用來給預讀引擎追蹤的「虛擬最後位置」
@@ -994,6 +1004,131 @@ static_assert(
 
 
 // =============================================================================
+// Stage NC-0.2J.6.1/J.6.3.2 - Emergency-stop RT evidence shadow
+//
+// The existing EmergencyStopAllAxes() behavior is intentionally unchanged in
+// this stage.  The 250 us Motion owner only publishes fixed-size evidence that
+// tells the supervisory Alarm boundary whether an emergency request really
+// reached the RT consumer, which execution Epoch it invalidated and which axes
+// entered a non-running safety state.  No field below grants Reset/recovery
+// permission and no SHM ABI is expanded.
+// =============================================================================
+struct MotionEmergencyStopCounters
+{
+    std::uint64_t requestAttempts = 0ULL;
+    std::uint64_t requestsPublished = 0ULL;
+    std::uint64_t requestsCoalesced = 0ULL;
+    std::uint64_t rtApplications = 0ULL;
+    std::uint64_t epochInvalidations = 0ULL;
+};
+
+
+struct MotionEmergencyStopEvidence
+{
+    std::uint64_t publicationGeneration = 0ULL;
+
+    MotionExecutionEpoch currentExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionExecutionEpoch lastAppliedExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+
+    MotionOwner currentOwner = MotionOwner::NONE;
+    MotionOwnerGeneration currentOwnerGeneration =
+        MOTION_OWNER_GENERATION_INVALID;
+    MotionOwner lastAppliedOwner = MotionOwner::NONE;
+    MotionOwnerGeneration lastAppliedOwnerGeneration =
+        MOTION_OWNER_GENERATION_INVALID;
+
+    std::uint32_t existingAxisMask = 0U;
+    std::uint32_t estopAxisMask = 0U;
+    std::uint32_t errorAxisMask = 0U;
+    std::uint32_t faultAxisMask = 0U;
+    std::uint32_t lagAlarmAxisMask = 0U;
+    std::uint32_t commandZeroAxisMask = 0U;
+    std::uint32_t targetSealedAxisMask = 0U;
+    std::uint32_t pdoTargetVelocitySampledAxisMask = 0U;
+    std::uint32_t pdoTargetVelocityZeroAxisMask = 0U;
+
+    bool requestPending = false;
+    bool requestInProgress = false;
+    bool lastApplyHadExecutionToInvalidate = false;
+    bool groupActive = false;
+    bool groupEmergencyStopped = false;
+    bool groupError = false;
+    bool virtualCommandZero = false;
+    bool virtualTargetSealed = false;
+    bool allExistingAxesSafe = false;
+    bool allExistingAxisCommandsZero = false;
+    bool allExistingAxisTargetsSealed = false;
+    bool allSampledPdoTargetVelocitiesZero = false;
+    bool safetyLeaseMatchesLastApply = false;
+    bool rtStopStateApplied = false;
+};
+
+
+// Stage NC-0.2J.6.3.2: one separately published atomic record retains the
+// latest real E-stop Epoch transition without increasing the already-full
+// 192-word stop/settle RT payload.  Both epochs are read from one 64-bit word.
+struct MotionEmergencyStopEpochInvalidationEvidence
+{
+    MotionExecutionEpoch fromExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionExecutionEpoch toExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    std::uint64_t invalidationCount = 0ULL;
+};
+
+
+// =============================================================================
+// Stage NC-0.2J.6.4 - Startup Feedback Alignment / Permanent Lag Arming
+//
+// This is a standalone atomic diagnostic record.  It deliberately stays out
+// of the already-full J.5 192-word stop/settle publication.  The RT owner is
+// the only writer; supervisory code receives masks and monotonic counters.
+// =============================================================================
+struct MotionStartupLagArmingEvidence
+{
+    std::uint32_t existingAxisMask = 0U;
+    std::uint32_t feedbackReadyAxisMask = 0U;
+    std::uint32_t positionAlignedAxisMask = 0U;
+    std::uint32_t lagArmedAxisMask = 0U;
+    std::uint32_t pendingAxisMask = 0U;
+    std::uint32_t prematureMotionBlockedAxisMask = 0U;
+
+    std::uint32_t minimumStableSampleCount = 0U;
+    std::uint32_t stableSamplesRequired =
+        MOTION_STARTUP_LAG_ARM_STABLE_SAMPLES;
+
+    std::uint64_t alignmentEvents = 0ULL;
+    std::uint64_t armingTransitions = 0ULL;
+    std::uint64_t readinessResets = 0ULL;
+    std::uint64_t prematureMotionBlocks = 0ULL;
+
+    bool allExistingAxesArmed = false;
+    bool blocked = false;
+};
+
+
+static_assert(
+    std::is_trivially_copyable<MotionEmergencyStopCounters>::value,
+    "MotionEmergencyStopCounters must remain trivially copyable.");
+
+static_assert(
+    std::is_trivially_copyable<MotionEmergencyStopEvidence>::value,
+    "MotionEmergencyStopEvidence must remain trivially copyable.");
+static_assert(
+    std::is_trivially_copyable<
+    MotionEmergencyStopEpochInvalidationEvidence>::value,
+    "Motion E-stop Epoch invalidation evidence must remain trivially copyable.");
+static_assert(
+    std::is_trivially_copyable<MotionStartupLagArmingEvidence>::value,
+    "Startup Lag arming evidence must remain trivially copyable.");
+static_assert(
+    sizeof(MotionExecutionEpoch) == sizeof(std::uint32_t),
+    "Packed E-stop Epoch invalidation requires 32-bit execution Epochs.");
+
+
+// =============================================================================
 // Stage NC-0.2J.5 - NC Settle Truth Model
 //
 // A gate receives permission only after 200 adjacent, valid 250 us Runtime
@@ -1611,6 +1746,19 @@ public:
         MotionStopSettleSnapshot& snapshot,
         MotionStopSettleCounters& counters) const noexcept;
 
+    // Stage NC-0.2J.6.1: coherent read-only RT evidence.  This is diagnostic
+    // shadow data only; it does not acknowledge an Alarm to the operator and
+    // does not release the SAFETY owner.
+    bool TryGetEmergencyStopEvidence(
+        MotionEmergencyStopEvidence& evidence,
+        MotionEmergencyStopCounters& counters) const noexcept;
+
+    MotionEmergencyStopEpochInvalidationEvidence
+        GetEmergencyStopEpochInvalidationEvidence() const noexcept;
+
+    MotionStartupLagArmingEvidence
+        GetStartupLagArmingEvidence() const noexcept;
+
     // Stage NC-0.2J.5 Runtime validity seam.  EtherCAT Runtime calls this
     // exactly once for every PDO cycle, including the first invalid cycle.
     void ObserveNCSettleRuntimeCycle(
@@ -1902,6 +2050,8 @@ private:
             static_cast<std::size_t>(MotionNCSettleProfile::COUNT)>
             ncSettleCounters{};
         MotionNCResetRebaseAck resetRebaseAck{};
+        MotionEmergencyStopEvidence emergencyStopEvidence{};
+        MotionEmergencyStopCounters emergencyStopCounters{};
     };
 
     static_assert(
@@ -2073,6 +2223,52 @@ private:
     std::atomic<bool> m_emergencyStopAllPending{ false };
     std::atomic<bool> m_resetAllFaultsPending{ false };
     std::atomic<bool> m_stopGroupPending{ false };
+
+    // NC-0.2J.6.1/J.6.3.2 producer/consumer accounting. Request counters may be
+    // incremented by the 10 ms control side; the remaining fields are owned by
+    // the 250 us Motion consumer and copied through the coherent publication.
+    std::atomic<std::uint64_t> m_emergencyStopRequestAttemptCount{ 0ULL };
+    std::atomic<std::uint64_t> m_emergencyStopRequestPublishedCount{ 0ULL };
+    std::atomic<std::uint64_t> m_emergencyStopRequestCoalescedCount{ 0ULL };
+    std::uint64_t m_emergencyStopRTApplicationCount = 0ULL;
+    std::uint64_t m_emergencyStopEpochInvalidationCount = 0ULL;
+    MotionExecutionEpoch m_emergencyStopLastAppliedExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionOwnerLease m_emergencyStopLastAppliedOwnerLease{};
+    bool m_emergencyStopLastApplyHadExecutionToInvalidate = false;
+
+    // Persistent identity of the most recent E-stop application that really
+    // invalidated an execution Epoch.  A later no-op E-stop application keeps
+    // this packed record intact so a late 10 ms observer can correlate it.
+    std::atomic<std::uint64_t>
+        m_emergencyStopLastEpochInvalidationPacked{ 0ULL };
+    std::atomic<std::uint64_t>
+        m_emergencyStopLastEpochInvalidationCount{ 0ULL };
+    std::atomic<std::uint64_t>
+        m_emergencyStopEpochInvalidationWriteSequence{ 0ULL };
+
+    // NC-0.2J.6.4 is intentionally independent of the stop/settle payload.
+    // Packed masks: existing [0..7], ready [8..15], aligned [16..23],
+    // armed [24..31], premature-motion blocked [32..39].
+    std::atomic<std::uint64_t> m_startupLagArmingMasks{ 0ULL };
+    std::atomic<std::uint32_t>
+        m_startupLagMinimumStableSampleCount{ 0U };
+    std::atomic<std::uint64_t> m_startupLagAlignmentEvents{ 0ULL };
+    std::atomic<std::uint64_t> m_startupLagArmingTransitions{ 0ULL };
+    std::atomic<std::uint64_t> m_startupLagReadinessResets{ 0ULL };
+    std::atomic<std::uint64_t> m_startupLagPrematureMotionBlocks{ 0ULL };
+
+    // Producer counters below are owned only by the 250 us Motion runtime.
+    std::uint64_t m_startupLagAlignmentEventProducer = 0ULL;
+    std::uint64_t m_startupLagArmingTransitionProducer = 0ULL;
+    std::uint64_t m_startupLagReadinessResetProducer = 0ULL;
+    std::uint64_t m_startupLagPrematureMotionBlockProducer = 0ULL;
+
+    void AlignStartupAxisCommandToActual(AxisContext& axis) noexcept;
+    bool ObserveStartupLagMonitorArming(
+        AxisContext& axis,
+        bool feedbackReady) noexcept;
+    void PublishStartupLagArmingEvidence() noexcept;
 
     // Packed NC Reset safety batch:
     // bits  0..31 = the Epoch already published by NCManager::Reset()

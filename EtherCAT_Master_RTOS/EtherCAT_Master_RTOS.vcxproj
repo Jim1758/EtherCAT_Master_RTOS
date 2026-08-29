@@ -127,6 +127,7 @@
     <ClInclude Include="MotionCore.h" />
     <ClInclude Include="MotionExecutionContract.h" />
     <ClInclude Include="MotionFeedbackRing.h" />
+    <ClInclude Include="NCAlarmEmergencyStopBoundary.h" />
     <ClInclude Include="NCBlockCompletionBoundary.h" />
     <ClInclude Include="NCBlockLifecycleLedger.h" />
     <ClInclude Include="NCExpressionResolver.h" />
@@ -208,6 +209,7 @@
     <ClCompile Include="MotionCore_G30.cpp" />
     <ClCompile Include="MotionCore_G32.cpp" />
     <ClCompile Include="MotionCore_G53.cpp" />
+    <ClCompile Include="NCAlarmEmergencyStopBoundary.cpp" />
     <ClCompile Include="NCBlockCompletionBoundary.cpp" />
     <ClCompile Include="NCBlockLifecycleLedger.cpp" />
     <ClCompile Include="NCExpressionResolver.cpp" />

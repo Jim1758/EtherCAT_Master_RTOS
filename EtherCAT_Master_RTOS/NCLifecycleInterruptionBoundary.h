@@ -50,7 +50,8 @@ enum class NCLifecycleInterruptionPhase : std::uint8_t
     STABLE_CONFIRMATION = 4,
     QUIESCENT = 5,
     EVIDENCE_GAP = 6,
-    SUPERSEDED = 7
+    SUPERSEDED = 7,
+    ALARM_STOP_CLOSED = 8
 };
 
 enum class NCLifecycleInterruptionDecision : std::uint8_t
@@ -80,13 +81,18 @@ enum class NCLifecycleInterruptionDecision : std::uint8_t
     EVIDENCE_LEDGER_INTEGRITY = 22,
     EVIDENCE_LEDGER_REJECTED = 23,
     EPOCH_SUPERSEDED = 24,
-    SUPERSEDED = 25
+    SUPERSEDED = 25,
+    WAIT_ALARM_STOP_ACKNOWLEDGEMENT = 26,
+    WAIT_ALARM_STOP_TERMINAL = 27,
+    WAIT_ALARM_STOP_STABLE = 28,
+    ALARM_STOP_CLOSED = 29
 };
 
 struct NCLifecycleInterruptionSample
 {
     MotionExecutionEpoch executionEpoch = MOTION_EXECUTION_EPOCH_INVALID;
     MotionOwnerLease ownerLease{};
+    MotionOwnerLease executionOwnerLease{};
 
     NCBlockDispatchId lastDispatchId = NC_BLOCK_DISPATCH_ID_INVALID;
     int activePC = -1;
@@ -149,6 +155,9 @@ struct NCLifecycleInterruptionSnapshot
     MotionOwner requestOwner = MotionOwner::NONE;
     MotionOwnerGeneration requestOwnerGeneration =
         MOTION_OWNER_GENERATION_INVALID;
+    MotionOwner requestExecutionOwner = MotionOwner::NONE;
+    MotionOwnerGeneration requestExecutionOwnerGeneration =
+        MOTION_OWNER_GENERATION_INVALID;
     MotionOwner currentOwner = MotionOwner::NONE;
     MotionOwnerGeneration currentOwnerGeneration =
         MOTION_OWNER_GENERATION_INVALID;
@@ -179,6 +188,12 @@ struct NCLifecycleInterruptionSnapshot
     std::uint32_t lastTerminalErrorCode = 0U;
 
     std::uint64_t blockFailureDelta = 0ULL;
+    std::uint64_t expectedAlarmAbortDelta = 0ULL;
+    std::uint64_t expectedAlarmPreReadRejectDelta = 0ULL;
+    std::uint64_t expectedAlarmOwnerConflictRejectDelta = 0ULL;
+    std::uint64_t expectedAlarmStaleEpochRejectDelta = 0ULL;
+    std::uint64_t unexpectedBlockFailureDelta = 0ULL;
+    std::uint64_t unexpectedFeedbackRejectedDelta = 0ULL;
     std::uint64_t dispatchDelta = 0ULL;
     std::uint64_t feedbackRejectedDelta = 0ULL;
     std::uint64_t feedbackCancelledDelta = 0ULL;
@@ -195,6 +210,13 @@ struct NCLifecycleInterruptionSnapshot
     bool active = false;
     bool expectsEpochChange = false;
     bool epochPublicationObserved = false;
+    bool alarmEpochClassificationPending = false;
+    bool alarmStopAcknowledged = false;
+    bool runtimeAlarmEpochChangeObserved = false;
+    bool expectedAlarmAbortObserved = false;
+    bool expectedAlarmPreReadRejectObserved = false;
+    bool alarmTerminalClassificationValid = true;
+    bool alarmStopClosed = false;
     bool unexpectedEpochChangeObserved = false;
     bool postInterruptionDispatchObserved = false;
     bool terminalFailureObserved = false;
@@ -227,6 +249,13 @@ struct NCLifecycleInterruptionCounters
     std::uint64_t epochPublicationsObserved = 0ULL;
     std::uint64_t unexpectedEpochChanges = 0ULL;
     std::uint64_t epochSuperseded = 0ULL;
+    std::uint64_t alarmStopAcknowledgements = 0ULL;
+    std::uint64_t runtimeAlarmEpochChanges = 0ULL;
+    std::uint64_t expectedAlarmAborts = 0ULL;
+    std::uint64_t expectedAlarmPreReadRejects = 0ULL;
+    std::uint64_t expectedAlarmOwnerConflictRejects = 0ULL;
+    std::uint64_t expectedAlarmStaleEpochRejects = 0ULL;
+    std::uint64_t alarmStopsClosed = 0ULL;
 
     std::uint64_t terminalRejected = 0ULL;
     std::uint64_t terminalCancelled = 0ULL;
@@ -251,6 +280,9 @@ struct NCLifecycleInterruptionCounters
     std::uint64_t waitSafetyRequest = 0ULL;
     std::uint64_t waitGroupStandstill = 0ULL;
     std::uint64_t waitStableConfirmation = 0ULL;
+    std::uint64_t waitAlarmStopAcknowledgement = 0ULL;
+    std::uint64_t waitAlarmStopTerminal = 0ULL;
+    std::uint64_t waitAlarmStopStable = 0ULL;
 
     std::uint64_t quiescent = 0ULL;
     std::uint64_t evidenceGap = 0ULL;
@@ -284,6 +316,13 @@ public:
 
     void RecordEpochPublished(MotionExecutionEpoch executionEpoch) noexcept;
 
+    // Stage NC-0.2J.6.3: import only the exact acknowledgement already
+    // proved by NCAlarmEmergencyStopBoundaryShadow.  This class remains an
+    // observer and does not request E-stop, mutate Motion, or release Safety.
+    void RecordAlarmStopAcknowledged(
+        MotionExecutionEpoch appliedExecutionEpoch,
+        bool epochChangeRequired) noexcept;
+
     void RecordTerminalFeedback(
         const MotionFeedbackEvent& event,
         bool ledgerAccepted) noexcept;
@@ -315,15 +354,25 @@ private:
     static std::uint64_t LedgerIntegrityDelta(
         const NCLifecycleInterruptionSample& baseline,
         const NCLifecycleInterruptionSample& current) noexcept;
+    bool IsAlarmRequestTerminalCandidate(
+        const MotionFeedbackEvent& event) const noexcept;
 
     std::uint64_t AllocateSequence() noexcept;
     void UpdateSample(const NCLifecycleInterruptionSample& sample) noexcept;
     void SetWaitDecision(NCLifecycleInterruptionDecision decision) noexcept;
     void MarkEvidenceGap(NCLifecycleInterruptionDecision decision) noexcept;
     void MarkSuperseded(NCLifecycleInterruptionDecision decision) noexcept;
+    void MarkAlarmStopClosed() noexcept;
 
     NCLifecycleInterruptionSample m_baseline{};
     NCLifecycleInterruptionSnapshot m_snapshot{};
     NCLifecycleInterruptionCounters m_counters{};
     std::uint64_t m_nextSequence = 1ULL;
+
+    // Stage NC-0.2J.6.3.1: terminal events may arrive before the exact J.6
+    // acknowledgement is imported.  Keep bounded candidate counts here and
+    // authorise them only after UpdateSample() observes that acknowledgement.
+    std::uint64_t m_alarmAbortCandidateCount = 0ULL;
+    std::uint64_t m_alarmOwnerConflictRejectCandidateCount = 0ULL;
+    std::uint64_t m_alarmStaleEpochRejectCandidateCount = 0ULL;
 };

@@ -7,6 +7,9 @@
 #include "MacroParser.h"       // 必須要有
 #include "GCodeParser.h"       // 🌟 解決 Parser 找不到的關鍵！
 #include "NCProgramCache.h"    // Stage NC-0.2C：Parsed Program Cache
+#include "NCPreparedBlockQueueShadow.h" // Stage NC-0.2K.1：Prepared Queue Shadow
+#include "NCPreparedHeadEquivalenceShadow.h" // Stage NC-0.2K.2：Prepared Head Exact Equivalence
+#include "NCPreparedHeadCutoverGate.h" // Stage NC-0.2K.3：Exact-Value Controlled Cutover
 #include "NCBlockLifecycleLedger.h" // Stage NC-0.2D：Block / Motion Lifecycle
 #include "NCBlockCompletionBoundary.h" // Stage NC-0.2F：Motion Completion Dual-Key Guard
 #include "NCProgramEndBoundary.h" // Stage NC-0.2G：Program End / Cycle End Gate
@@ -541,6 +544,61 @@ public:
         return m_preDispatchBarrierCounters;
     }
 
+    NCPreparedBlockQueueSnapshot
+        GetPreparedBlockQueueSnapshot() const noexcept
+    {
+        return m_preparedBlockQueueShadow.GetSnapshot();
+    }
+
+    NCPreparedBlockQueueCounters
+        GetPreparedBlockQueueCounters() const noexcept
+    {
+        return m_preparedBlockQueueShadow.GetCounters();
+    }
+
+    bool GetPreparedBlockQueueEntry(
+        std::size_t logicalOffset,
+        NCPreparedBlockEntrySnapshot& entry) const noexcept
+    {
+        return m_preparedBlockQueueShadow.TryGetEntry(
+            logicalOffset,
+            entry);
+    }
+
+    NCPreparedHeadEquivalenceSnapshot
+        GetPreparedHeadEquivalenceSnapshot() const noexcept
+    {
+        return m_preparedHeadEquivalenceShadow.GetSnapshot();
+    }
+
+    NCPreparedHeadEquivalenceCounters
+        GetPreparedHeadEquivalenceCounters() const noexcept
+    {
+        return m_preparedHeadEquivalenceShadow.GetCounters();
+    }
+
+    void SetPreparedHeadCutoverEnabled(bool enabled) noexcept
+    {
+        m_preparedHeadCutoverGate.SetEnabled(enabled);
+    }
+
+    bool IsPreparedHeadCutoverEnabled() const noexcept
+    {
+        return m_preparedHeadCutoverGate.IsEnabled();
+    }
+
+    NCPreparedHeadCutoverSnapshot
+        GetPreparedHeadCutoverSnapshot() const noexcept
+    {
+        return m_preparedHeadCutoverGate.GetSnapshot();
+    }
+
+    NCPreparedHeadCutoverCounters
+        GetPreparedHeadCutoverCounters() const noexcept
+    {
+        return m_preparedHeadCutoverGate.GetCounters();
+    }
+
     NCSingleBlockShadowSnapshot
         GetSingleBlockShadowSnapshot() const noexcept
     {
@@ -690,6 +748,7 @@ private:
 
     // Stage NC-0.1D：每個 NC 10 ms Cycle 先 Drain Motion Feedback Ring。
     void ProcessMotionFeedback() noexcept;
+    bool EnsureMappingIntegrityAlarmBoundaryBeforeFeedback() noexcept;
 
     // Stage NC-0.2D：Program Commit 與 Motion Segment Feedback 的對照表。
     NCBlockLifecycleLedger m_blockLifecycleLedger{};
@@ -700,6 +759,7 @@ private:
     NCResetReleaseGate m_resetReleaseGate{};
     NCAlarmEmergencyStopBoundaryShadow m_alarmEmergencyStopShadow{};
     bool m_lifecycleInterruptionAlarmLatched = false;
+    std::uint64_t m_lastHandledMappingIntegrityAlarmRequestCount = 0ULL;
 
     // Stage NC-0.2F：已追蹤 Motion Block 的 Wait Callback 採 Dual-Key
     // Guard；非 Motion Callback 維持 Legacy 行為。
@@ -741,6 +801,21 @@ private:
     NCPreDispatchBarrierSnapshot m_preDispatchBarrierSnapshot{};
     NCPreDispatchBarrierCounters m_preDispatchBarrierCounters{};
     std::uint64_t m_nextPreDispatchBarrierSequence = 1ULL;
+
+    // Stage NC-0.2K.1: fixed-capacity, observation-only Prepared Block Queue.
+    // It is deliberately separate from m_blockQueue and MotionCore queues.
+    NCPreparedBlockQueueShadow m_preparedBlockQueueShadow{};
+
+    // Stage NC-0.2K.2: one exact-head dual-path proof.  It remains a pure
+    // observer; K.3 owns the separate, reversible value-source decision.
+    NCPreparedHeadEquivalenceShadow
+        m_preparedHeadEquivalenceShadow{};
+
+    // Stage NC-0.2K.3: after one full K.2 lifecycle proof has qualified the
+    // current session, an exact current head may supply the NCBlock value to
+    // the unchanged handler path.  Default enabled; setter above is the
+    // immediate rollback switch for undispatched heads.
+    NCPreparedHeadCutoverGate m_preparedHeadCutoverGate{};
 
     // Stage NC-0.2I.1：只觀察 Single Block 正確完成點。
     NCSingleBlockBoundaryShadow m_singleBlockBoundaryShadow{};
@@ -823,6 +898,37 @@ private:
         std::uint64_t commandQueueDepth,
         bool groupStandstill) noexcept;
     void ClearPreDispatchBarrier() noexcept;
+
+    NCPreparedSourceIdentity
+        BuildPreparedBlockSourceIdentity() const noexcept;
+    NCPreparedModalSnapshot
+        BuildPreparedBlockModalSnapshot() const noexcept;
+    NCPreparedRuntimeProof
+        BuildPreparedBlockRuntimeProof() const noexcept;
+    NCPreparedInvalidationReason
+        GetPreparedBlockInactiveReason() const noexcept;
+    void ObservePreparedBlockQueueShadow(bool allowPlanning) noexcept;
+    bool ObservePreparedHeadEquivalenceResolved(
+        int sourcePC,
+        int sourceLineNumber,
+        const NCParsedBlock& parsedBlock,
+        const NCBlock& legacyBlock,
+        bool legacyDrainRequired,
+        NCPreparedHeadCutoverContext& cutoverContext) noexcept;
+    void ObservePreparedHeadEquivalenceResolveFailure(
+        int sourcePC,
+        int sourceLineNumber) noexcept;
+    void ObservePreparedHeadEquivalenceUpstreamProof(
+        const NCPreparedRuntimeProof& proof) noexcept;
+    bool BindPreparedHeadEquivalenceDispatch(
+        NCBlockDispatchId dispatchId,
+        const NCProgramCommitSnapshot& dispatchTarget) noexcept;
+    void CompletePreparedHeadEquivalence(
+        NCBlockDispatchId dispatchId,
+        const NCProgramCommitSnapshot& commitTarget,
+        bool commitSucceeded) noexcept;
+    void FailPreparedHeadEquivalenceRuntime(
+        NCBlockDispatchId dispatchId) noexcept;
 
     static NCSingleBlockCandidateKind ClassifySingleBlockCandidate(
         const NCBlock& block) noexcept;

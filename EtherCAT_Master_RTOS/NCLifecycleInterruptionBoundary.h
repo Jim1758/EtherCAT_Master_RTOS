@@ -192,6 +192,11 @@ struct NCLifecycleInterruptionSnapshot
     std::uint64_t expectedAlarmPreReadRejectDelta = 0ULL;
     std::uint64_t expectedAlarmOwnerConflictRejectDelta = 0ULL;
     std::uint64_t expectedAlarmStaleEpochRejectDelta = 0ULL;
+    std::uint64_t expectedAlarmPreLatchedAbortDelta = 0ULL;
+    std::uint64_t expectedAlarmPreLatchedRejectDelta = 0ULL;
+    std::uint64_t expectedResetPreReadRejectDelta = 0ULL;
+    std::uint64_t expectedResetOwnerConflictRejectDelta = 0ULL;
+    std::uint64_t expectedResetStaleEpochRejectDelta = 0ULL;
     std::uint64_t unexpectedBlockFailureDelta = 0ULL;
     std::uint64_t unexpectedFeedbackRejectedDelta = 0ULL;
     std::uint64_t dispatchDelta = 0ULL;
@@ -213,9 +218,14 @@ struct NCLifecycleInterruptionSnapshot
     bool alarmEpochClassificationPending = false;
     bool alarmStopAcknowledged = false;
     bool runtimeAlarmEpochChangeObserved = false;
+    bool alarmStopPreLatchedRTApplication = false;
     bool expectedAlarmAbortObserved = false;
     bool expectedAlarmPreReadRejectObserved = false;
+    bool expectedAlarmPreLatchedTerminalObserved = false;
+    bool expectedResetPreReadRejectObserved = false;
     bool alarmTerminalClassificationValid = true;
+    bool resetTerminalClassificationValid = true;
+    bool resetRetirementCommitted = false;
     bool alarmStopClosed = false;
     bool unexpectedEpochChangeObserved = false;
     bool postInterruptionDispatchObserved = false;
@@ -255,6 +265,11 @@ struct NCLifecycleInterruptionCounters
     std::uint64_t expectedAlarmPreReadRejects = 0ULL;
     std::uint64_t expectedAlarmOwnerConflictRejects = 0ULL;
     std::uint64_t expectedAlarmStaleEpochRejects = 0ULL;
+    std::uint64_t expectedAlarmPreLatchedAborts = 0ULL;
+    std::uint64_t expectedAlarmPreLatchedRejects = 0ULL;
+    std::uint64_t expectedResetPreReadRejects = 0ULL;
+    std::uint64_t expectedResetOwnerConflictRejects = 0ULL;
+    std::uint64_t expectedResetStaleEpochRejects = 0ULL;
     std::uint64_t alarmStopsClosed = 0ULL;
 
     std::uint64_t terminalRejected = 0ULL;
@@ -316,12 +331,15 @@ public:
 
     void RecordEpochPublished(MotionExecutionEpoch executionEpoch) noexcept;
 
-    // Stage NC-0.2J.6.3: import only the exact acknowledgement already
-    // proved by NCAlarmEmergencyStopBoundaryShadow.  This class remains an
-    // observer and does not request E-stop, mutate Motion, or release Safety.
+    // Stage NC-0.2J.6.3/J.6.5.1: import only the exact acknowledgement already
+    // proved by NCAlarmEmergencyStopBoundaryShadow.  PreLatched is explicit
+    // authority for the bounded unread terminal window; it never widens the
+    // accepted Epoch, identity or reject-reason contract.  This class remains
+    // an observer and does not request E-stop, mutate Motion, or release Safety.
     void RecordAlarmStopAcknowledged(
         MotionExecutionEpoch appliedExecutionEpoch,
-        bool epochChangeRequired) noexcept;
+        bool epochChangeRequired,
+        bool preLatchedRTApplication = false) noexcept;
 
     void RecordTerminalFeedback(
         const MotionFeedbackEvent& event,
@@ -354,7 +372,19 @@ private:
     static std::uint64_t LedgerIntegrityDelta(
         const NCLifecycleInterruptionSample& baseline,
         const NCLifecycleInterruptionSample& current) noexcept;
-    bool IsAlarmRequestTerminalCandidate(
+    static bool IsFeedbackSequenceInOpenClosedRange(
+        MotionFeedbackSequence candidate,
+        MotionFeedbackSequence lowerExclusive,
+        MotionFeedbackSequence upperInclusive) noexcept;
+    bool MatchesAlarmRequestTerminalIdentity(
+        const MotionFeedbackEvent& event) const noexcept;
+    bool IsAlarmPostBoundaryTerminalCandidate(
+        const MotionFeedbackEvent& event) const noexcept;
+    bool IsAlarmPreLatchedUnreadTerminalCandidate(
+        const MotionFeedbackEvent& event) const noexcept;
+    bool MatchesResetRequestTerminalIdentity(
+        const MotionFeedbackEvent& event) const noexcept;
+    bool IsResetPostBoundaryTerminalCandidate(
         const MotionFeedbackEvent& event) const noexcept;
 
     std::uint64_t AllocateSequence() noexcept;
@@ -363,6 +393,7 @@ private:
     void MarkEvidenceGap(NCLifecycleInterruptionDecision decision) noexcept;
     void MarkSuperseded(NCLifecycleInterruptionDecision decision) noexcept;
     void MarkAlarmStopClosed() noexcept;
+    void CommitExpectedResetRetirement() noexcept;
 
     NCLifecycleInterruptionSample m_baseline{};
     NCLifecycleInterruptionSnapshot m_snapshot{};
@@ -375,4 +406,20 @@ private:
     std::uint64_t m_alarmAbortCandidateCount = 0ULL;
     std::uint64_t m_alarmOwnerConflictRejectCandidateCount = 0ULL;
     std::uint64_t m_alarmStaleEpochRejectCandidateCount = 0ULL;
+
+    // NC-0.2J.6.5.1: a pre-latched RT E-stop may publish terminal feedback
+    // after the last NC consume point but before the 10 ms Alarm boundary
+    // captures its publication baseline.  Keep that bounded unread window
+    // separate and authorise it only after exact J.6 PreLatched ACK evidence.
+    std::uint64_t m_alarmPreLatchedAbortCandidateCount = 0ULL;
+    std::uint64_t m_alarmPreLatchedOwnerConflictRejectCandidateCount = 0ULL;
+    std::uint64_t m_alarmPreLatchedStaleEpochRejectCandidateCount = 0ULL;
+
+    // NC-0.2K.2.2.1: RESET is begun before the execution Epoch is advanced,
+    // so only post-boundary terminal feedback from the exact old execution
+    // identity is eligible.  Counts remain candidates until the complete
+    // quiescent contract proves that no unrelated terminal failure occurred.
+    std::uint64_t m_resetAbortCandidateCount = 0ULL;
+    std::uint64_t m_resetOwnerConflictRejectCandidateCount = 0ULL;
+    std::uint64_t m_resetStaleEpochRejectCandidateCount = 0ULL;
 };

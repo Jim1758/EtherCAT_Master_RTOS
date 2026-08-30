@@ -1022,10 +1022,66 @@ void NCManager::BeginLifecycleInterruptionShadow(
     NCLifecycleInterruptionCause cause,
     bool expectsEpochChange) noexcept
 {
+    NCLifecycleInterruptionSample sample =
+        BuildLifecycleInterruptionSample();
+
+    // K.2.1 internal mapping faults are detected and contained by the 250 us
+    // Runtime in the same pass. If the 10 ms NC observer arrives later, its
+    // ordinary sample may already be on the post-stop Epoch. Seed the exact
+    // pre-fault Epoch only for Alarm 3021 from the dedicated release-published
+    // request record written before AlarmManager::Trigger(). J.6 remains the
+    // authority that proves the later coherent old->new E-stop application;
+    // subsequent Observe() samples remain on the current Epoch.
+    if (cause == NCLifecycleInterruptionCause::ALARM)
+    {
+        const AlarmManager& alarms = AlarmManager::GetInstance();
+        const bool alarmActive = alarms.HasAlarm();
+        const int alarmCount = alarmActive
+            ? alarms.GetAlarmCount()
+            : 0;
+        bool mappingIntegrityAlarm = false;
+        for (int alarmIndex = 0;
+            alarmIndex < alarmCount;
+            ++alarmIndex)
+        {
+            if (alarms.GetAlarmId(alarmIndex) ==
+                AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY)
+            {
+                mappingIntegrityAlarm = true;
+                break;
+            }
+        }
+
+        const MotionP1HandoverSafetySnapshot p1Safety =
+            m_motion.GetP1HandoverSafetySnapshot();
+        const bool exactInternalAlarmRequest =
+            p1Safety.mappingIntegrityAlarmPending &&
+            p1Safety.mappingIntegrityAlarmRequests != 0ULL &&
+            p1Safety.mappingIntegrityAlarmRequests !=
+            m_lastHandledMappingIntegrityAlarmRequestCount &&
+            p1Safety.lastMappingIntegrityAlarmExecutionEpoch !=
+            MOTION_EXECUTION_EPOCH_INVALID;
+
+        // Prefer the explicit 3021 entry. If the fixed Alarm list was already
+        // full, an earlier active Alarm is a broader interruption boundary;
+        // the still-pending coherent P1 mailbox supplies the exact old Epoch
+        // and must be consumed so one Reset can recover.
+        if (mappingIntegrityAlarm || exactInternalAlarmRequest)
+        {
+            if (exactInternalAlarmRequest)
+            {
+                sample.executionEpoch =
+                    p1Safety.lastMappingIntegrityAlarmExecutionEpoch;
+                m_lastHandledMappingIntegrityAlarmRequestCount =
+                    p1Safety.mappingIntegrityAlarmRequests;
+            }
+        }
+    }
+
     m_lifecycleInterruptionShadow.Begin(
         cause,
         expectsEpochChange,
-        BuildLifecycleInterruptionSample());
+        sample);
 }
 
 void NCManager::RecordLifecycleInterruptionEpochPublished(
@@ -1128,13 +1184,81 @@ void NCManager::ObserveAlarmEmergencyStopShadow() noexcept
     {
         m_lifecycleInterruptionShadow.RecordAlarmStopAcknowledged(
             alarmStop.lastAppliedExecutionEpoch,
-            alarmStop.epochChangeRequired);
+            alarmStop.epochChangeRequired,
+            alarmStop.preLatchedRTApplication);
     }
 }
 
 // ============================================================================
 // Stage NC-0.1D - NC Motion Feedback Snapshot / Counters
 // ============================================================================
+bool NCManager::EnsureMappingIntegrityAlarmBoundaryBeforeFeedback() noexcept
+{
+    const MotionP1HandoverSafetySnapshot p1Safety =
+        m_motion.GetP1HandoverSafetySnapshot();
+    if (!p1Safety.mappingIntegrityAlarmPending ||
+        p1Safety.mappingIntegrityAlarmRequests == 0ULL)
+    {
+        return false;
+    }
+
+    if (p1Safety.mappingIntegrityAlarmRequests ==
+        m_lastHandledMappingIntegrityAlarmRequestCount)
+    {
+        return m_motion.AcknowledgeP1MappingIntegrityAlarmRequest(
+            p1Safety.mappingIntegrityAlarmRequests);
+    }
+
+    // AlarmManager is materialized only by this 10 ms NC owner. Motion has
+    // already release-published the exact old Epoch and pending request before
+    // it can publish any causal or retirement terminal feedback.
+    AlarmManager::GetInstance().Trigger(
+        AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY,
+        0,
+        p1Safety.lastOrphanAxisIndex);
+
+    const AlarmManager& alarms = AlarmManager::GetInstance();
+    bool mappingIntegrityAlarmPresent = false;
+    const int alarmCount = alarms.GetAlarmCount();
+    for (int alarmIndex = 0;
+        alarmIndex < alarmCount;
+        ++alarmIndex)
+    {
+        if (alarms.GetAlarmId(alarmIndex) ==
+            AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY)
+        {
+            mappingIntegrityAlarmPresent = true;
+            break;
+        }
+    }
+    if (!mappingIntegrityAlarmPresent && !alarms.HasAlarm())
+    {
+        // No formal Alarm path exists yet. Keep the mailbox pending and retry;
+        // never clear the only old-Epoch correlation without a boundary.
+        return false;
+    }
+
+    if (!m_lifecycleInterruptionAlarmLatched)
+    {
+        BeginLifecycleInterruptionShadow(
+            NCLifecycleInterruptionCause::ALARM,
+            false);
+        m_lifecycleInterruptionAlarmLatched = true;
+        BeginAlarmEmergencyStopShadow();
+    }
+    else
+    {
+        // An already-open Alarm boundary is earlier than this mapping stop
+        // and therefore safely contains it. Consume the mailbox without
+        // replacing that broader interruption boundary.
+        m_lastHandledMappingIntegrityAlarmRequestCount =
+            p1Safety.mappingIntegrityAlarmRequests;
+    }
+
+    return m_motion.AcknowledgeP1MappingIntegrityAlarmRequest(
+        p1Safety.mappingIntegrityAlarmRequests);
+}
+
 void NCManager::ProcessMotionFeedback() noexcept
 {
     MotionFeedbackEvent event{};
@@ -1153,6 +1277,15 @@ void NCManager::ProcessMotionFeedback() noexcept
 
         const bool lifecycleFailureFeedback =
             IsLifecycleFailureFeedback(event.type);
+
+        if (lifecycleFailureFeedback)
+        {
+            // Close the narrow preflight->drain race. Mapping Alarm and its
+            // old-Epoch record are release-published before every causal or
+            // retirement terminal, so this idempotent check always opens the
+            // Alarm boundary before the event reaches the Ledger observer.
+            EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+        }
 
         // Capture the pre-event state. This must happen before the sequence
         // check and Ledger apply so a gap revealed by this terminal event and
@@ -1259,6 +1392,12 @@ void NCManager::ProcessTask()
 {
     NC_RunCount++;
 
+    // A K.2.1 mapping-integrity Alarm can be published and physically stopped
+    // entirely between two NC scans. Open its Alarm boundary before draining
+    // the already-published terminal feedback so the existing pre-latched
+    // ABORTED/REJECTED accounting retains its open/closed sequence window.
+    EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+
     // 即使 NC 正處於 Alarm / Reset / Not Ready，也必須先 Drain Feedback，
     // 否則 Runtime Terminal Event 可能在上層長時間停住時累積。
     ProcessMotionFeedback();
@@ -1345,6 +1484,8 @@ void NCManager::ProcessTask()
             m_motion.GetNCResetRebaseAck(),
             m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease));
 
+        ObservePreparedBlockQueueShadow(false);
+
         // ⚠️ 立刻退出迴圈，絕對不准往下執行任何軌跡運算或 G 碼解析！
         return;
     }
@@ -1387,6 +1528,7 @@ void NCManager::ProcessTask()
 
             if (!m_resetReleaseGate.ShouldReleaseSafetyOwner())
             {
+                ObservePreparedBlockQueueShadow(false);
                 return;
             }
 
@@ -1418,6 +1560,8 @@ void NCManager::ProcessTask()
             }
         }
 
+        ObservePreparedBlockQueueShadow(false);
+
         // ⚠️ 只要還在滑行，就立刻 return，不准執行下面的 G 碼解析與模式分流！
         return;
     }
@@ -1444,6 +1588,7 @@ void NCManager::ProcessTask()
         }
 
         ObserveLifecycleInterruptionShadow();
+        ObservePreparedBlockQueueShadow(false);
         return;
     }
 
@@ -1455,6 +1600,7 @@ void NCManager::ProcessTask()
     if (ProcessPendingProgramRunStart())
     {
         ObserveLifecycleInterruptionShadow();
+        ObservePreparedBlockQueueShadow(false);
         return;
     }
 
@@ -1466,12 +1612,17 @@ void NCManager::ProcessTask()
     if (ProcessFeedHoldResumeGate())
     {
         ObserveLifecycleInterruptionShadow();
+        ObservePreparedBlockQueueShadow(false);
         return;
     }
 
     // =========================================================
     // 🌟 3. 正常任務分流 (只有在無警報時才會走到這裡)
     // =========================================================
+    // K.1 pre-observation fills only the fixed Shadow window.  The existing
+    // mode switch remains the sole Runtime dispatcher.
+    ObservePreparedBlockQueueShadow(true);
+
     switch (m_mode)
     {
     case NCOperationMode::MEMORY:
@@ -1503,6 +1654,9 @@ void NCManager::ProcessTask()
         break;
     }
 
+    // Observe the Dispatch / Commit evidence created by the unchanged
+    // Runtime path in this same 10 ms task.
+    ObservePreparedBlockQueueShadow(false);
     ObserveLifecycleInterruptionShadow();
 }
 
@@ -1759,6 +1913,8 @@ void NCManager::ProcessExecutionEngine()
         NCBlockDispatchId blockDispatchId =
             NC_BLOCK_DISPATCH_ID_INVALID;
         bool lineCommitted = false;
+        bool lineCommitSucceeded = false;
+        NCProgramCommitSnapshot lineCommitSnapshot{};
         bool blockSkippedBySwitch = false;
         NCSingleBlockCandidateKind singleBlockCandidateKind =
             NCSingleBlockCandidateKind::NONE;
@@ -1788,14 +1944,14 @@ void NCManager::ProcessExecutionEngine()
             if (!lineCommitted)
             {
                 const NCBlockDispatchId dispatchId = ensureBlockLifecycle();
-                NCProgramCommitSnapshot committedSnapshot{};
                 if (CommitProgramBlock(
                     commitTarget,
-                    committedSnapshot))
+                    lineCommitSnapshot))
                 {
-                    m_blockLifecycleLedger.MarkProgramCommitted(
-                        dispatchId,
-                        committedSnapshot);
+                    lineCommitSucceeded =
+                        m_blockLifecycleLedger.MarkProgramCommitted(
+                            dispatchId,
+                            lineCommitSnapshot);
                 }
                 else
                 {
@@ -1803,6 +1959,7 @@ void NCManager::ProcessExecutionEngine()
                     m_blockLifecycleLedger.MarkNCDispatchFailed(
                         dispatchId,
                         0x020D0001U);
+                    lineCommitSucceeded = false;
                 }
                 lineCommitted = true;
             }
@@ -1992,6 +2149,13 @@ void NCManager::ProcessExecutionEngine()
                 block,
                 resolveError))
             {
+                // K.2 must see the asymmetric outcome where K.1 accepted a
+                // literal Prepared head but the unchanged Runtime resolver
+                // rejected it.  This remains diagnostic-only.
+                ObservePreparedHeadEquivalenceResolveFailure(
+                    currentPC,
+                    sourceLineNumber);
+
                 int alarmCode = AlarmManager::MATH_ERROR;
                 if (resolveError == NCExpressionResolveError::TOO_MANY_G_CODES)
                 {
@@ -2054,6 +2218,21 @@ void NCManager::ProcessExecutionEngine()
                 isBarrier = true;
             }
 
+            // Stage NC-0.2K.2: compare the exact Prepared head against the
+            // unchanged Runtime-resolved value.  This is deliberately before
+            // lifecycle creation, handler execution and every side effect.
+            // A mismatch only closes future readiness; legacy execution below
+            // remains available as the fail-closed Runtime path.
+            NCPreparedHeadCutoverContext preparedCutoverContext{};
+            const bool preparedEquivalencePending =
+                ObservePreparedHeadEquivalenceResolved(
+                    currentPC,
+                    sourceLineNumber,
+                    parsedBlock,
+                    block,
+                    isBarrier,
+                    preparedCutoverContext);
+
             if (isBarrier)
             {
                 const std::uint64_t commandQueueDepth =
@@ -2108,6 +2287,38 @@ void NCManager::ProcessExecutionEngine()
             }
 
             const NCBlockDispatchId dispatchId = ensureBlockLifecycle();
+            const bool preparedEquivalenceDispatchBound =
+                preparedEquivalencePending &&
+                BindPreparedHeadEquivalenceDispatch(
+                    dispatchId,
+                    commitTarget);
+
+            // Stage NC-0.2K.3: the legacy resolver has already run and the
+            // current Prepared head has already passed K.2 exact comparison,
+            // the drain gate and exact Ledger Dispatch binding.  Only now may
+            // a previously qualified session replace the value source.  A
+            // rejection leaves block untouched and the legacy path continues.
+            // EMPTY has no handler value to replace, so it remains a K.2
+            // proof only and is not counted as a K.3 use attempt.
+            if (preparedEquivalenceDispatchBound && !block.isEmpty)
+            {
+                NCBlock selectedBlock = block;
+                if (m_preparedHeadCutoverGate.SelectExactPreparedValue(
+                    preparedCutoverContext,
+                    m_preparedHeadEquivalenceShadow.GetSnapshot(),
+                    m_preparedHeadEquivalenceShadow.GetCounters(),
+                    BuildPreparedBlockSourceIdentity(),
+                    dispatchId,
+                    m_preparedHeadEquivalenceShadow.
+                    RevalidateBoundPreparedValue(
+                        preparedCutoverContext.head,
+                        block),
+                    block,
+                    selectedBlock))
+                {
+                    block = selectedBlock;
+                }
+            }
 
             // Stage NC-0.2D：只在 NC Producer 執行緒收集此 Block 建立的
             // Segment Identity；不把 NC 型別帶入 250 us Motion Runtime。
@@ -2129,8 +2340,15 @@ void NCManager::ProcessExecutionEngine()
                 dispatchId,
                 motionCapture);
 
+            // A producer-side invalid command publishes the K.2.1 mailbox in
+            // this same NC scan, after the ordinary ProcessTask preflight.
+            // Materialize 3021 now so the existing dispatch-failure branch
+            // owns the block and PC cannot commit past the rejected command.
+            EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+
             if (AlarmManager::GetInstance().HasAlarm())
             {
+                FailPreparedHeadEquivalenceRuntime(dispatchId);
                 m_blockLifecycleLedger.MarkNCDispatchFailed(
                     dispatchId,
                     0U);
@@ -2175,6 +2393,7 @@ void NCManager::ProcessExecutionEngine()
             // G66 可能在這裡建立 Macro Frame；失敗時不可提交本行。
             if (AlarmManager::GetInstance().HasAlarm())
             {
+                FailPreparedHeadEquivalenceRuntime(dispatchId);
                 m_blockLifecycleLedger.MarkNCDispatchFailed(
                     dispatchId,
                     0U);
@@ -2189,6 +2408,14 @@ void NCManager::ProcessExecutionEngine()
             // 本行已完成 Runtime Resolve 與 NC Side Effect / Downstream Dispatch。
             // Motion 實際完成仍由 Feedback / Physical PC 表示。
             commitCurrentLine();
+
+            if (preparedEquivalenceDispatchBound)
+            {
+                CompletePreparedHeadEquivalence(
+                    dispatchId,
+                    lineCommitSnapshot,
+                    lineCommitSucceeded);
+            }
 
             // Stage NC-0.2H：M00/M01/M98/M99/M02/M30 的 Post Action
             // 由 G/M Transaction 在所有同行動作與 Motion Ledger 完成後套用。
@@ -3846,6 +4073,402 @@ void NCManager::ClearPreDispatchBarrier() noexcept
     m_preDispatchBarrierSnapshot.commandQueueDepth = 0ULL;
     m_preDispatchBarrierSnapshot.commandQueuePending = false;
     ++m_preDispatchBarrierCounters.cleared;
+}
+
+// =============================================================================
+// Stage NC-0.2K.1 - Prepared Block Queue Shadow
+//
+// This observer reads the immutable parsed-program cache and the already
+// published Dispatch / Commit evidence.  It does not call a G/M handler,
+// advance a PC, open a lifecycle block or submit anything to MotionCore.
+// =============================================================================
+NCPreparedSourceIdentity
+NCManager::BuildPreparedBlockSourceIdentity() const noexcept
+{
+    NCPreparedSourceIdentity source{};
+
+    if (!m_macroStack.empty())
+    {
+        const MacroFrame& frame = m_macroStack.back();
+        source.scope = NCProgramScope::MACRO;
+        source.frameId = frame.frameId;
+        if (frame.program != nullptr)
+        {
+            source.cacheGeneration = frame.program->GetGeneration();
+        }
+    }
+    else
+    {
+        source.scope = GetBaseProgramScope();
+        source.cacheGeneration = GetBaseProgramCache().GetGeneration();
+    }
+
+    source.executionEpoch = static_cast<std::uint64_t>(
+        m_motion.GetCurrentExecutionEpoch());
+    source.programFlowGeneration =
+        m_gmBlockTransactionCounters.m98Calls +
+        m_gmBlockTransactionCounters.m99Returns;
+    source.owner = static_cast<std::uint8_t>(m_programMotionLease.owner);
+    source.ownerGeneration = static_cast<std::uint64_t>(
+        m_programMotionLease.generation);
+    source.panel.blockSkipEnabled = m_isBlockSkipEnabled;
+    source.panel.singleBlockEnabled = m_isSingleBlockEnabled;
+    source.panel.optionalStopEnabled = m_isOptionalStopEnabled;
+    return source;
+}
+
+NCPreparedModalSnapshot
+NCManager::BuildPreparedBlockModalSnapshot() const noexcept
+{
+    NCPreparedModalSnapshot modal{};
+    modal.distanceMode = CoordSys.isAbsoluteMode ? 90 : 91;
+    modal.unitsMode = CoordSys.isInchMode ? 20 : 21;
+    modal.planeMode = CoordSys.activePlane;
+    modal.workCoordinateCode = CoordSys.GetCurrentWCSGCode();
+    modal.storedStrokeMode =
+        CoordSys.IsProgrammableTravelLimitEnabled() ? 22 : 23;
+    modal.toolLengthMode = CoordSys.toolLengthMode;
+    modal.hCode = CoordSys.currentHCode;
+    modal.toolRadiusMode = CoordSys.toolRadiusMode;
+    modal.dCode = CoordSys.currentDCode;
+    modal.toolCode = CoordSys.currentTCode;
+    modal.g68Active = CoordSys.isG68Active;
+    modal.g68Angle = CoordSys.g68Angle;
+    modal.g168Active = CoordSys.isWorkpieceRotationActive;
+    modal.workpieceCode = CoordSys.currentWCode;
+    modal.scalingActive = CoordSys.isScalingActive;
+    modal.scalingFactor = CoordSys.scaleFactor;
+    modal.mirrorMask = 0U;
+    for (int axis = 0; axis < 8; ++axis)
+    {
+        if (CoordSys.isMirrorActive[axis])
+        {
+            modal.mirrorMask |= static_cast<std::uint8_t>(1U << axis);
+        }
+        modal.commandedMCS[axis] = CoordSys.commandedMCS[axis];
+    }
+    modal.polarActive = CoordSys.isPolarCoordinateActive;
+    modal.cAxisOffsetRotationEnabled =
+        CoordSys.isCAxisOffsetRotationEnabled;
+    modal.modalMacroActive = m_isG66Active;
+    modal.g00OverrideRatio = m_motion.G00_overrideRatio;
+    modal.commandedMCSValid = true;
+    modal.imageValid = true;
+    return modal;
+}
+
+NCPreparedRuntimeProof
+NCManager::BuildPreparedBlockRuntimeProof() const noexcept
+{
+    NCPreparedRuntimeProof proof{};
+    NCBlockLifecycleSnapshot lifecycle{};
+    if (m_blockLifecycleLedger.GetLastDispatchedSnapshot(lifecycle))
+    {
+        proof.hasDispatch = lifecycle.IsValid();
+        proof.dispatchId = lifecycle.dispatchId;
+        proof.dispatchTarget = lifecycle.programTarget;
+        if (lifecycle.programCommitted)
+        {
+            proof.commitTarget = lifecycle.programCommit;
+        }
+    }
+    return proof;
+}
+
+NCPreparedInvalidationReason
+NCManager::GetPreparedBlockInactiveReason() const noexcept
+{
+    if (AlarmManager::GetInstance().HasAlarm() ||
+        m_state == NCState::ALARM)
+    {
+        return NCPreparedInvalidationReason::ALARM;
+    }
+    if (m_state == NCState::RESET_STATE)
+    {
+        return NCPreparedInvalidationReason::RESET;
+    }
+    if (m_state == NCState::P_END ||
+        m_programEndBoundary.IsEndPending())
+    {
+        return NCPreparedInvalidationReason::PROGRAM_END;
+    }
+    return NCPreparedInvalidationReason::NOT_RUNNING;
+}
+
+void NCManager::ObservePreparedBlockQueueShadow(
+    bool allowPlanning) noexcept
+{
+    const bool runtimeModeEligible =
+        m_mode == NCOperationMode::MEMORY ||
+        m_mode == NCOperationMode::MDI ||
+        (m_mode == NCOperationMode::MANUAL && m_manualAutoRunning);
+    const bool observationEligible =
+        runtimeModeEligible &&
+        (m_state == NCState::RUN || m_state == NCState::HOLD) &&
+        !AlarmManager::GetInstance().HasAlarm() &&
+        !m_programRunStartPending &&
+        !m_programEndBoundary.IsEndPending() &&
+        m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease);
+
+    if (!observationEligible)
+    {
+        NCPreparedInvalidationReason reason =
+            GetPreparedBlockInactiveReason();
+        if ((m_state == NCState::RUN || m_state == NCState::HOLD) &&
+            !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))
+        {
+            reason = NCPreparedInvalidationReason::OWNER_CHANGED;
+        }
+        if (allowPlanning)
+        {
+            m_preparedBlockQueueShadow.ObserveInactive(reason);
+        }
+        else
+        {
+            m_preparedBlockQueueShadow.ObserveFinalProofAndInvalidate(
+                BuildPreparedBlockRuntimeProof(),
+                reason);
+        }
+        m_preparedHeadEquivalenceShadow.ObserveQueueInactive(reason);
+        m_preparedHeadCutoverGate.ObserveQueueInactive(reason);
+        return;
+    }
+
+    const NCPreparedSourceIdentity source =
+        BuildPreparedBlockSourceIdentity();
+    const NCPreparedModalSnapshot modal =
+        BuildPreparedBlockModalSnapshot();
+    const NCPreparedRuntimeProof proof =
+        BuildPreparedBlockRuntimeProof();
+
+    const NCProgramCache* program = nullptr;
+    int runtimePC = -1;
+    int committedPC = -1;
+    if (!m_macroStack.empty())
+    {
+        const MacroFrame& frame = m_macroStack.back();
+        program = frame.program;
+        runtimePC = frame.currentPC;
+        committedPC = frame.committedPC;
+    }
+    else
+    {
+        program = &GetBaseProgramCache();
+        runtimePC = GetBasePCValue();
+        committedPC = GetBaseCommittedPCValue();
+    }
+
+    if (program == nullptr ||
+        !m_preparedBlockQueueShadow.BeginObservation(
+            source,
+            runtimePC,
+            committedPC,
+            modal,
+            proof))
+    {
+        m_preparedBlockQueueShadow.FinishObservation();
+        ObservePreparedHeadEquivalenceUpstreamProof(proof);
+        return;
+    }
+
+    const bool planningEligible =
+        allowPlanning && m_state == NCState::RUN;
+    std::size_t plannedSourceBytes = 0U;
+    for (std::size_t budget = 0U;
+        planningEligible &&
+        budget < NC_PREPARED_BLOCK_PLAN_BUDGET_PER_TASK &&
+        m_preparedBlockQueueShadow.CanPrepare();
+        ++budget)
+    {
+        const int planPC = m_preparedBlockQueueShadow.GetNextPlanPC();
+        if (planPC < 0 ||
+            static_cast<std::size_t>(planPC) >= program->Size())
+        {
+            m_preparedBlockQueueShadow.ObserveNaturalEOF(planPC);
+            break;
+        }
+
+        const NCProgramCacheLine* line = program->TryGetLine(planPC);
+        if (line == nullptr)
+        {
+            // A cache hole is impossible for a valid NCProgramCache.  Turn
+            // it into an explicit fail-closed planning fence without
+            // affecting the existing Runtime parser or Alarm path.
+            NCParsedBlock invalid{};
+            invalid.error = NCParseError::INVALID_GOTO;
+            (void)m_preparedBlockQueueShadow.PrepareParsedLine(
+                planPC,
+                planPC + 1,
+                invalid);
+            break;
+        }
+
+        const std::size_t sourceBytes = line->rawLine.size();
+        if (sourceBytes > NC_PREPARED_BLOCK_MAX_SOURCE_BYTES)
+        {
+            // The Pure Parse cache may legally contain a very long line.
+            // K.1 does not scan unbounded expression text in the 10 ms task;
+            // retain the line as a conservative flow fence instead.
+            NCParsedBlock boundedFence{};
+            boundedFence.dependsOnMacroState = true;
+            boundedFence.isBlockSkip = line->parsedBlock.isBlockSkip;
+            (void)m_preparedBlockQueueShadow.PrepareParsedLine(
+                planPC,
+                line->sourceLineNumber,
+                boundedFence);
+            break;
+        }
+
+        if (plannedSourceBytes + sourceBytes >
+            NC_PREPARED_BLOCK_SOURCE_BYTE_BUDGET_PER_TASK)
+        {
+            // Defer this PC to the next 10 ms planning pass.  Deferral is not
+            // a parse failure and cannot invalidate the existing window.
+            break;
+        }
+        plannedSourceBytes += sourceBytes;
+
+        if (!m_preparedBlockQueueShadow.PrepareParsedLine(
+            planPC,
+            line->sourceLineNumber,
+            line->parsedBlock))
+        {
+            break;
+        }
+    }
+
+    m_preparedBlockQueueShadow.FinishObservation();
+    ObservePreparedHeadEquivalenceUpstreamProof(proof);
+}
+
+// =============================================================================
+// Stage NC-0.2K.2 - Prepared Head Exact Equivalence Shadow
+//
+// All calls execute on the existing NC producer thread.  The observer receives
+// value snapshots only and cannot call ExecuteBlock, CommitProgramBlock or
+// MotionCore.  K.3 may later choose the already-compared Prepared value, but
+// this K.2 observer itself remains incapable of Runtime influence.
+// =============================================================================
+bool NCManager::ObservePreparedHeadEquivalenceResolved(
+    int sourcePC,
+    int sourceLineNumber,
+    const NCParsedBlock& parsedBlock,
+    const NCBlock& legacyBlock,
+    bool legacyDrainRequired,
+    NCPreparedHeadCutoverContext& cutoverContext) noexcept
+{
+    cutoverContext = NCPreparedHeadCutoverContext{};
+    cutoverContext.queue =
+        m_preparedBlockQueueShadow.GetSnapshot();
+    cutoverContext.queueCounters =
+        m_preparedBlockQueueShadow.GetCounters();
+    cutoverContext.hasHead =
+        m_preparedBlockQueueShadow.TryGetEntry(
+            0U,
+            cutoverContext.head);
+    cutoverContext.runtimeSource =
+        BuildPreparedBlockSourceIdentity();
+    cutoverContext.sourcePC = sourcePC;
+    cutoverContext.sourceLineNumber = sourceLineNumber;
+    cutoverContext.legacyDrainRequired = legacyDrainRequired;
+
+    return m_preparedHeadEquivalenceShadow.ObserveResolvedHead(
+        cutoverContext.queue,
+        cutoverContext.queueCounters,
+        cutoverContext.hasHead,
+        cutoverContext.head,
+        cutoverContext.runtimeSource,
+        sourcePC,
+        sourceLineNumber,
+        parsedBlock,
+        legacyBlock,
+        BuildPreparedBlockModalSnapshot(),
+        legacyDrainRequired);
+}
+
+void NCManager::ObservePreparedHeadEquivalenceResolveFailure(
+    int sourcePC,
+    int sourceLineNumber) noexcept
+{
+    const NCPreparedBlockQueueSnapshot queue =
+        m_preparedBlockQueueShadow.GetSnapshot();
+    const NCPreparedBlockQueueCounters queueCounters =
+        m_preparedBlockQueueShadow.GetCounters();
+    NCPreparedBlockEntrySnapshot head{};
+    const bool hasHead =
+        m_preparedBlockQueueShadow.TryGetEntry(0U, head);
+
+    m_preparedHeadEquivalenceShadow.ObserveResolveFailure(
+        queue,
+        queueCounters,
+        hasHead,
+        head,
+        BuildPreparedBlockSourceIdentity(),
+        sourcePC,
+        sourceLineNumber);
+}
+
+void NCManager::ObservePreparedHeadEquivalenceUpstreamProof(
+    const NCPreparedRuntimeProof& proof) noexcept
+{
+    const NCPreparedBlockQueueSnapshot queue =
+        m_preparedBlockQueueShadow.GetSnapshot();
+    const NCPreparedBlockQueueCounters queueCounters =
+        m_preparedBlockQueueShadow.GetCounters();
+    m_preparedHeadEquivalenceShadow.ObserveUpstreamProof(
+        queue,
+        queueCounters,
+        proof);
+    m_preparedHeadCutoverGate.ObserveEquivalenceState(
+        queue,
+        queueCounters,
+        m_preparedHeadEquivalenceShadow.GetSnapshot(),
+        m_preparedHeadEquivalenceShadow.GetCounters());
+}
+
+bool NCManager::BindPreparedHeadEquivalenceDispatch(
+    NCBlockDispatchId dispatchId,
+    const NCProgramCommitSnapshot& dispatchTarget) noexcept
+{
+    NCBlockLifecycleSnapshot ledger{};
+    const bool ledgerFound =
+        m_blockLifecycleLedger.TryGetSnapshot(dispatchId, ledger);
+    return m_preparedHeadEquivalenceShadow.BindDispatch(
+        dispatchId,
+        dispatchTarget,
+        BuildPreparedBlockSourceIdentity(),
+        ledgerFound,
+        ledger.programTarget,
+        ledger.sourceLineNumber);
+}
+
+void NCManager::CompletePreparedHeadEquivalence(
+    NCBlockDispatchId dispatchId,
+    const NCProgramCommitSnapshot& commitTarget,
+    bool commitSucceeded) noexcept
+{
+    NCBlockLifecycleSnapshot ledger{};
+    const bool ledgerFound =
+        m_blockLifecycleLedger.TryGetSnapshot(dispatchId, ledger);
+    m_preparedHeadEquivalenceShadow.ObserveCommit(
+        dispatchId,
+        commitTarget,
+        BuildPreparedBlockModalSnapshot(),
+        BuildPreparedBlockSourceIdentity(),
+        m_waitCallback != nullptr,
+        commitSucceeded,
+        ledgerFound,
+        ledger.programCommitted,
+        ledger.programTarget,
+        ledger.programCommit,
+        ledger.sourceLineNumber);
+}
+
+void NCManager::FailPreparedHeadEquivalenceRuntime(
+    NCBlockDispatchId dispatchId) noexcept
+{
+    m_preparedHeadEquivalenceShadow.ObserveRuntimeFailure();
+    m_preparedHeadCutoverGate.ObserveRuntimeFailure(dispatchId);
 }
 
 // =============================================================================

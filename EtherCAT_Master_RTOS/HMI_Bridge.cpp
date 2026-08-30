@@ -803,6 +803,15 @@ namespace HMI_Bridge
             return raw > expected ? raw - expected : 0ULL;
         }
 
+        std::uint64_t AddDiagnosticCounterSaturating(
+            std::uint64_t lhs,
+            std::uint64_t rhs) noexcept
+        {
+            const std::uint64_t maximum =
+                (std::numeric_limits<std::uint64_t>::max)();
+            return rhs > maximum - lhs ? maximum : lhs + rhs;
+        }
+
         std::uint64_t BuildNCSettleDiagnosticEventToken(
             bool coherent,
             const MotionNCSettleSnapshot& snapshot,
@@ -1672,6 +1681,78 @@ namespace HMI_Bridge
         const MotionStartupLagArmingEvidence startupLagArming =
             motion.GetStartupLagArmingEvidence();
 
+        const MotionP1HandoverSafetySnapshot p1HandoverSafety =
+            motion.GetP1HandoverSafetySnapshot();
+
+        const MotionLifecycleCommitReservationSnapshot lifecycleCommit =
+            motion.GetLifecycleCommitReservationSnapshot();
+
+        std::uint64_t p1HandoverChangeToken = 1469598103934665603ULL;
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.mappingBoundaryStops);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.droppedAxisRetirements);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.droppedAxisRetirementFailures);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.orphanAxisContainments);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.invalidProducerRejects);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.mappingIntegrityAlarmRequests);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.mappingIntegrityAlarmPending ? 1ULL : 0ULL);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.lastPreviousAxisMask);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.lastNextAxisMask);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            p1HandoverSafety.lastMappingIntegrityAlarmExecutionEpoch);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            static_cast<std::uint64_t>(
+                p1HandoverSafety.lastOrphanAxisIndex + 1));
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.attempts);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.acquired);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.blockedByLifecycle);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.compareExchangeLost);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.released);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.releaseFailures);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.publisherWaits);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.currentExecutionEpoch);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.reservationActive ? 1ULL : 0ULL);
+        p1HandoverChangeToken = FoldDiagnosticEventToken(
+            p1HandoverChangeToken,
+            lifecycleCommit.executionEpochPending ? 1ULL : 0ULL);
+
         MotionStopSettleSnapshot stopSettleSnapshot{};
         MotionStopSettleCounters stopSettleCounters{};
         motion.GetStopSettleEvidence(
@@ -1784,6 +1865,28 @@ namespace HMI_Bridge
         const NCPreDispatchBarrierCounters preDispatchBarrierCounters =
             nc->GetPreDispatchBarrierCounters();
 
+        const NCPreparedBlockQueueSnapshot preparedQueueSnapshot =
+            nc->GetPreparedBlockQueueSnapshot();
+        const NCPreparedBlockQueueCounters preparedQueueCounters =
+            nc->GetPreparedBlockQueueCounters();
+        const NCPreparedHeadEquivalenceSnapshot preparedEquivalenceSnapshot =
+            nc->GetPreparedHeadEquivalenceSnapshot();
+        const NCPreparedHeadEquivalenceCounters preparedEquivalenceCounters =
+            nc->GetPreparedHeadEquivalenceCounters();
+        const NCPreparedHeadCutoverSnapshot preparedCutoverSnapshot =
+            nc->GetPreparedHeadCutoverSnapshot();
+        const NCPreparedHeadCutoverCounters preparedCutoverCounters =
+            nc->GetPreparedHeadCutoverCounters();
+        NCPreparedBlockEntrySnapshot preparedQueueHead{};
+        NCPreparedBlockEntrySnapshot preparedQueueTail{};
+        const bool hasPreparedQueueHead =
+            nc->GetPreparedBlockQueueEntry(0U, preparedQueueHead);
+        const bool hasPreparedQueueTail =
+            preparedQueueSnapshot.depth != 0U &&
+            nc->GetPreparedBlockQueueEntry(
+                static_cast<std::size_t>(preparedQueueSnapshot.depth - 1U),
+                preparedQueueTail);
+
         const NCSingleBlockShadowSnapshot singleBlockShadowSnapshot =
             nc->GetSingleBlockShadowSnapshot();
         const NCSingleBlockShadowCounters singleBlockShadowCounters =
@@ -1880,6 +1983,133 @@ namespace HMI_Bridge
             preDispatchBarrierCounters.evaluations +
             preDispatchBarrierCounters.cleared;
 
+        // Exclude the observer's scan/publication counters from this token.
+        // They advance by design; K.1 diagnostics should print when the
+        // Prepared window or one of its proofs actually changes.
+        const std::uint64_t preparedQueueChangeToken =
+            preparedQueueSnapshot.session +
+            preparedQueueCounters.sessions +
+            preparedQueueCounters.prepared +
+            preparedQueueCounters.dispatchMatched +
+            preparedQueueCounters.commitMatched +
+            preparedQueueCounters.retired +
+            preparedQueueCounters.invalidatedEntries +
+            preparedQueueCounters.invalidations +
+            preparedQueueCounters.correlatedEpochAdvances +
+            preparedQueueCounters.barrierStops +
+            preparedQueueCounters.eofStops +
+            preparedQueueCounters.capacityStops +
+            preparedQueueCounters.overwritePrevented +
+            preparedQueueCounters.cursorRegressions +
+            preparedQueueCounters.planDiscontinuities +
+            preparedQueueCounters.expectedFlowCutovers +
+            preparedQueueCounters.dispatchMismatches +
+            preparedQueueCounters.commitMismatches +
+            preparedQueueCounters.staleRuntimeProofs +
+            preparedQueueCounters.identityFailures +
+            preparedQueueCounters.cutoverAttempts;
+
+        // K.2 scan/publication/replay counters advance during normal
+        // observation and are deliberately excluded.  Terminal proof,
+        // Session qualification and every failure counter must force a log.
+        std::uint64_t preparedEquivalenceStateBits = 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.candidate ? (1ULL << 0U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.pending ? (1ULL << 1U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.resolved ? (1ULL << 2U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.dispatchBound ? (1ULL << 3U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.commitBound ? (1ULL << 4U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.ledgerDispatchMatch
+            ? (1ULL << 5U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.ledgerCommitMatch
+            ? (1ULL << 6U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.upstreamDispatchCommitMatch
+            ? (1ULL << 7U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.retirementMatch
+            ? (1ULL << 8U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.upstreamProofMatch
+            ? (1ULL << 9U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.matched ? (1ULL << 10U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.readinessQualified
+            ? (1ULL << 11U) : 0ULL;
+        preparedEquivalenceStateBits |=
+            preparedEquivalenceSnapshot.runtimeWaitCallbackActive
+            ? (1ULL << 12U) : 0ULL;
+
+        const std::uint64_t preparedEquivalenceTokenFields[] =
+        {
+            preparedEquivalenceSnapshot.session,
+            preparedEquivalenceSnapshot.entrySequence,
+            static_cast<std::uint64_t>(preparedEquivalenceSnapshot.scope),
+            preparedEquivalenceSnapshot.cacheGeneration,
+            preparedEquivalenceSnapshot.frameId,
+            preparedEquivalenceSnapshot.executionEpoch,
+            preparedEquivalenceSnapshot.commitExecutionEpoch,
+            preparedEquivalenceSnapshot.programFlowGeneration,
+            preparedEquivalenceSnapshot.owner,
+            preparedEquivalenceSnapshot.panelMask,
+            preparedEquivalenceSnapshot.ownerGeneration,
+            preparedEquivalenceSnapshot.dispatchId,
+            preparedEquivalenceSnapshot.commitSequence,
+            preparedEquivalenceSnapshot.qualifiedSession,
+            static_cast<std::uint64_t>(preparedEquivalenceSnapshot.state),
+            static_cast<std::uint64_t>(
+                preparedEquivalenceSnapshot.lastInvalidation),
+            static_cast<std::uint64_t>(
+                preparedEquivalenceSnapshot.mismatchFlags),
+            preparedEquivalenceStateBits,
+            preparedEquivalenceSnapshot.sessionPeakDepth,
+            preparedEquivalenceCounters.candidates,
+            preparedEquivalenceCounters.matched,
+            preparedEquivalenceCounters.mismatched,
+            preparedEquivalenceCounters.invalidated,
+            preparedEquivalenceCounters.ineligible,
+            preparedEquivalenceCounters.lifetimePeakDepth,
+            preparedEquivalenceCounters.multiBlockObservations,
+            preparedEquivalenceCounters.queueMismatches,
+            preparedEquivalenceCounters.sourceMismatches,
+            preparedEquivalenceCounters.pcMismatches,
+            preparedEquivalenceCounters.lineMismatches,
+            preparedEquivalenceCounters.blockMismatches,
+            preparedEquivalenceCounters.planMismatches,
+            preparedEquivalenceCounters.classificationMismatches,
+            preparedEquivalenceCounters.drainMismatches,
+            preparedEquivalenceCounters.modalBeforeMismatches,
+            preparedEquivalenceCounters.modalAfterMismatches,
+            preparedEquivalenceCounters.lifecycleMismatches,
+            preparedEquivalenceCounters.staleTokens,
+            preparedEquivalenceCounters.resolveMismatches,
+            preparedEquivalenceCounters.upstreamMismatches,
+            preparedEquivalenceCounters.ledgerMismatches,
+            preparedEquivalenceCounters.bindIdentityMismatches,
+            preparedEquivalenceCounters.runtimeFailures,
+            preparedEquivalenceCounters.sessionTransitions,
+            preparedEquivalenceCounters.qualifiedSessions,
+            preparedEquivalenceCounters.wouldUse,
+            preparedEquivalenceCounters.useAttempts,
+            preparedEquivalenceCounters.cutoverAttempts,
+            preparedEquivalenceCounters.runtimeInfluence
+        };
+        std::uint64_t preparedEquivalenceChangeToken = 0ULL;
+        for (const std::uint64_t value :
+        preparedEquivalenceTokenFields)
+        {
+            preparedEquivalenceChangeToken = FoldDiagnosticEventToken(
+                preparedEquivalenceChangeToken,
+                value);
+        }
+
         const std::uint64_t singleBlockShadowChangeToken =
             singleBlockShadowSnapshot.sequence +
             singleBlockShadowCounters.armAttempts +
@@ -1959,6 +2189,9 @@ namespace HMI_Bridge
             lifecycleInterruptionCounters.expectedAlarmPreReadRejects +
             lifecycleInterruptionCounters.expectedAlarmOwnerConflictRejects +
             lifecycleInterruptionCounters.expectedAlarmStaleEpochRejects +
+            lifecycleInterruptionCounters.expectedResetPreReadRejects +
+            lifecycleInterruptionCounters.expectedResetOwnerConflictRejects +
+            lifecycleInterruptionCounters.expectedResetStaleEpochRejects +
             lifecycleInterruptionCounters.alarmStopsClosed +
             lifecycleInterruptionCounters.terminalRejected +
             lifecycleInterruptionCounters.terminalCancelled +
@@ -2030,25 +2263,42 @@ namespace HMI_Bridge
             feedbackRejected +
             feedbackFaulted;
 
-        // Stage NC-0.2J.6.3.1: retain the existing layered transport accounting
+        // NC-0.2J.6.3.1 / NC-0.2K.2.2.1: retain layered transport accounting
         // (cause counter plus feedback terminal) for every unexpected failure.
-        // Remove only the two matching layers of a pre-read retirement proved
-        // by the exact Alarm lifecycle; unrelated errors remain fail-closed.
+        // Remove both layers only for cumulative Alarm or RESET pre-read
+        // retirements proved by their exact lifecycle boundary.  RESET credit
+        // is committed only after QUIESCENT_PROVED; unrelated errors remain
+        // fail-closed.
+        const std::uint64_t expectedOwnerConflictReject =
+            AddDiagnosticCounterSaturating(
+                lifecycleInterruptionCounters.
+                expectedAlarmOwnerConflictRejects,
+                lifecycleInterruptionCounters.
+                expectedResetOwnerConflictRejects);
+        const std::uint64_t expectedStaleDiscard =
+            AddDiagnosticCounterSaturating(
+                lifecycleInterruptionCounters.
+                expectedAlarmStaleEpochRejects,
+                lifecycleInterruptionCounters.
+                expectedResetStaleEpochRejects);
+        const std::uint64_t expectedFeedbackRejected =
+            AddDiagnosticCounterSaturating(
+                lifecycleInterruptionCounters.
+                expectedAlarmPreReadRejects,
+                lifecycleInterruptionCounters.
+                expectedResetPreReadRejects);
         const std::uint64_t unexpectedOwnerConflictReject =
             SubtractDiagnosticCounterFloor(
                 ownerConflictReject,
-                lifecycleInterruptionCounters.
-                expectedAlarmOwnerConflictRejects);
+                expectedOwnerConflictReject);
         const std::uint64_t unexpectedStaleDiscard =
             SubtractDiagnosticCounterFloor(
                 staleDiscard,
-                lifecycleInterruptionCounters.
-                expectedAlarmStaleEpochRejects);
+                expectedStaleDiscard);
         const std::uint64_t unexpectedFeedbackRejected =
             SubtractDiagnosticCounterFloor(
                 feedbackRejected,
-                lifecycleInterruptionCounters.
-                expectedAlarmPreReadRejects);
+                expectedFeedbackRejected);
         const std::uint64_t transportErrorTotal =
             axisQueueFull +
             axisResultOverflow +
@@ -2247,6 +2497,8 @@ namespace HMI_Bridge
         static std::uint64_t previousProgramEndChangeToken = 0ULL;
         static std::uint64_t previousGMTransactionChangeToken = 0ULL;
         static std::uint64_t previousPreDispatchBarrierChangeToken = 0ULL;
+        static std::uint64_t previousPreparedQueueChangeToken = 0ULL;
+        static std::uint64_t previousPreparedEquivalenceChangeToken = 0ULL;
         static std::uint64_t previousSingleBlockShadowChangeToken = 0ULL;
         static std::uint64_t previousSingleBlockGateChangeToken = 0ULL;
         static std::uint64_t previousFeedHoldChangeToken = 0ULL;
@@ -2255,6 +2507,7 @@ namespace HMI_Bridge
         static std::uint64_t previousResetReleaseGateChangeToken = 0ULL;
         static std::uint64_t previousAlarmEmergencyStopChangeToken = 0ULL;
         static std::uint64_t previousJ5EventToken = 0ULL;
+        static std::uint64_t previousP1HandoverChangeToken = 0ULL;
 
         const bool ownerChanged =
             startupSamples != 0U &&
@@ -2286,6 +2539,15 @@ namespace HMI_Bridge
             startupSamples != 0U &&
             preDispatchBarrierChangeToken !=
             previousPreDispatchBarrierChangeToken;
+
+        const bool preparedQueueChanged =
+            startupSamples != 0U &&
+            preparedQueueChangeToken != previousPreparedQueueChangeToken;
+
+        const bool preparedEquivalenceChanged =
+            startupSamples != 0U &&
+            preparedEquivalenceChangeToken !=
+            previousPreparedEquivalenceChangeToken;
 
         const bool singleBlockShadowChanged =
             startupSamples != 0U &&
@@ -2324,6 +2586,10 @@ namespace HMI_Bridge
             startupSamples != 0U &&
             j5EventToken != previousJ5EventToken;
 
+        const bool p1HandoverChanged =
+            startupSamples != 0U &&
+            p1HandoverChangeToken != previousP1HandoverChangeToken;
+
         const bool shouldPrintJ5 =
             startupSamples == 0U ||
             j5EventChanged;
@@ -2339,6 +2605,8 @@ namespace HMI_Bridge
             programEndChanged ||
             gmTransactionChanged ||
             preDispatchBarrierChanged ||
+            preparedQueueChanged ||
+            preparedEquivalenceChanged ||
             singleBlockShadowChanged ||
             singleBlockGateChanged ||
             feedHoldChanged ||
@@ -2346,6 +2614,7 @@ namespace HMI_Bridge
             lifecycleInterruptionChanged ||
             resetReleaseGateChanged ||
             alarmEmergencyStopChanged ||
+            p1HandoverChanged ||
             shouldPrintJ5 ||
             ownerChanged ||
             errorCounterChanged ||
@@ -2383,6 +2652,67 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(
                     startupLagArming.prematureMotionBlocks),
                 startupLagArming.allExistingAxesArmed ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K21-P1] MapStop:%llu Retire:%llu RetireFail:%llu "
+                "Orphan:%llu Invalid:%llu AlarmReq:%llu AlarmEpoch:%u "
+                "Pending:%u "
+                "Prev:%02X Next:%02X LastAx:%d Pass:%u\n",
+                static_cast<unsigned long long>(
+                    p1HandoverSafety.mappingBoundaryStops),
+                static_cast<unsigned long long>(
+                    p1HandoverSafety.droppedAxisRetirements),
+                static_cast<unsigned long long>(
+                    p1HandoverSafety.droppedAxisRetirementFailures),
+                static_cast<unsigned long long>(
+                    p1HandoverSafety.orphanAxisContainments),
+                static_cast<unsigned long long>(
+                    p1HandoverSafety.invalidProducerRejects),
+                static_cast<unsigned long long>(
+                    p1HandoverSafety.mappingIntegrityAlarmRequests),
+                static_cast<unsigned int>(
+                    p1HandoverSafety.
+                    lastMappingIntegrityAlarmExecutionEpoch),
+                p1HandoverSafety.mappingIntegrityAlarmPending ? 1U : 0U,
+                static_cast<unsigned int>(
+                    p1HandoverSafety.lastPreviousAxisMask),
+                static_cast<unsigned int>(
+                    p1HandoverSafety.lastNextAxisMask),
+                p1HandoverSafety.lastOrphanAxisIndex,
+                (p1HandoverSafety.droppedAxisRetirementFailures == 0ULL &&
+                    p1HandoverSafety.orphanAxisContainments == 0ULL &&
+                    p1HandoverSafety.invalidProducerRejects == 0ULL &&
+                    !p1HandoverSafety.mappingIntegrityAlarmPending)
+                ? 1U
+                : 0U);
+
+            const bool lifecycleCommitBalanced =
+                lifecycleCommit.acquired ==
+                lifecycleCommit.released +
+                (lifecycleCommit.reservationActive ? 1ULL : 0ULL);
+            RtPrintf(
+                "[NC02K22-CAS] Try:%llu Acq:%llu Block:%llu Lost:%llu "
+                "Rel:%llu RelFail:%llu PubWait:%llu Active:%u Pending:%u "
+                "Epoch:%u Pass:%u\n",
+                static_cast<unsigned long long>(lifecycleCommit.attempts),
+                static_cast<unsigned long long>(lifecycleCommit.acquired),
+                static_cast<unsigned long long>(
+                    lifecycleCommit.blockedByLifecycle),
+                static_cast<unsigned long long>(
+                    lifecycleCommit.compareExchangeLost),
+                static_cast<unsigned long long>(lifecycleCommit.released),
+                static_cast<unsigned long long>(
+                    lifecycleCommit.releaseFailures),
+                static_cast<unsigned long long>(
+                    lifecycleCommit.publisherWaits),
+                lifecycleCommit.reservationActive ? 1U : 0U,
+                lifecycleCommit.executionEpochPending ? 1U : 0U,
+                static_cast<unsigned int>(
+                    lifecycleCommit.currentExecutionEpoch),
+                (lifecycleCommitBalanced &&
+                    lifecycleCommit.releaseFailures == 0ULL)
+                ? 1U
+                : 0U);
 
             RtPrintf(
                 "[NC01F-RT] NC:%d Mode:%d Owner:%s(%u) Gen:%u "
@@ -2728,6 +3058,442 @@ namespace HMI_Bridge
                     preDispatchBarrierCounters.waitGroupStandstill),
                 static_cast<unsigned long long>(
                     preDispatchBarrierCounters.cleared));
+
+            RtPrintf(
+                "[NC02K1-PREP] Pub:%llu Sess:%llu Active:%u Depth:%u/%u "
+                "RuntimePC:%d PlanPC:%d TailPC:%d DispatchPC:%d CommitPC:%d BasePC:%d BaseBlock:%u "
+                "Stop:%s Barrier:%s BPC:%d Valid:%u Order:%u Account:%u "
+                "Shadow:%u\n",
+                static_cast<unsigned long long>(
+                    preparedQueueSnapshot.publicationSequence),
+                static_cast<unsigned long long>(
+                    preparedQueueSnapshot.session),
+                preparedQueueSnapshot.active ? 1U : 0U,
+                static_cast<unsigned int>(preparedQueueSnapshot.depth),
+                static_cast<unsigned int>(preparedQueueSnapshot.capacity),
+                preparedQueueSnapshot.runtimeCurrentPC,
+                preparedQueueSnapshot.nextPlanPC,
+                preparedQueueSnapshot.tailPC,
+                preparedQueueSnapshot.dispatchPC,
+                preparedQueueSnapshot.commitPC,
+                preparedQueueSnapshot.committedBaselinePC,
+                preparedQueueSnapshot.committedBaselinePlanningBlocked
+                ? 1U : 0U,
+                NCPreparedQueueStopReasonToDiagnosticName(
+                    preparedQueueSnapshot.stopReason),
+                NCPreparedBarrierKindToDiagnosticName(
+                    preparedQueueSnapshot.barrierKind),
+                preparedQueueSnapshot.barrierPC,
+                preparedQueueSnapshot.valid ? 1U : 0U,
+                preparedQueueSnapshot.cursorOrderValid ? 1U : 0U,
+                preparedQueueSnapshot.accountingValid ? 1U : 0U,
+                preparedQueueSnapshot.shadowOnly ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K1-EDGE] Head:%u PC:%d Line:%d Class:%s Disp:%u Commit:%u "
+                "Tail:%u PC:%d Line:%d Class:%s Drain:%u Stop:%u\n",
+                hasPreparedQueueHead ? 1U : 0U,
+                hasPreparedQueueHead ? preparedQueueHead.sourcePC : -1,
+                hasPreparedQueueHead ? preparedQueueHead.sourceLineNumber : 0,
+                NCPreparedBlockClassToDiagnosticName(
+                    preparedQueueHead.classification.blockClass),
+                hasPreparedQueueHead && preparedQueueHead.dispatchObserved
+                ? 1U : 0U,
+                hasPreparedQueueHead && preparedQueueHead.commitObserved
+                ? 1U : 0U,
+                hasPreparedQueueTail ? 1U : 0U,
+                hasPreparedQueueTail ? preparedQueueTail.sourcePC : -1,
+                hasPreparedQueueTail ? preparedQueueTail.sourceLineNumber : 0,
+                NCPreparedBlockClassToDiagnosticName(
+                    preparedQueueTail.classification.blockClass),
+                hasPreparedQueueTail &&
+                preparedQueueTail.classification.legacyDrainRequired
+                ? 1U : 0U,
+                hasPreparedQueueTail &&
+                preparedQueueTail.classification.planningStopsHere
+                ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K1-MOD] Seed:G%d G%d G%d WCS:G%d G%d "
+                "Tail:G%d G%d G%d WCS:G%d G%d G68:%u G168:%u "
+                "Scale:%u Mirror:%02X Polar:%u COff:%u G66:%u "
+                "SeedV:%u TailV:%u MCS:%u G00F:%llu\n",
+                preparedQueueSnapshot.seedModal.distanceMode,
+                preparedQueueSnapshot.seedModal.unitsMode,
+                preparedQueueSnapshot.seedModal.planeMode,
+                preparedQueueSnapshot.seedModal.workCoordinateCode,
+                preparedQueueSnapshot.seedModal.storedStrokeMode,
+                preparedQueueSnapshot.tailModal.distanceMode,
+                preparedQueueSnapshot.tailModal.unitsMode,
+                preparedQueueSnapshot.tailModal.planeMode,
+                preparedQueueSnapshot.tailModal.workCoordinateCode,
+                preparedQueueSnapshot.tailModal.storedStrokeMode,
+                preparedQueueSnapshot.tailModal.g68Active ? 1U : 0U,
+                preparedQueueSnapshot.tailModal.g168Active ? 1U : 0U,
+                preparedQueueSnapshot.tailModal.scalingActive ? 1U : 0U,
+                static_cast<unsigned int>(
+                    preparedQueueSnapshot.tailModal.mirrorMask),
+                preparedQueueSnapshot.tailModal.polarActive ? 1U : 0U,
+                preparedQueueSnapshot.tailModal.cAxisOffsetRotationEnabled
+                ? 1U : 0U,
+                preparedQueueSnapshot.tailModal.modalMacroActive ? 1U : 0U,
+                preparedQueueSnapshot.seedModal.imageValid ? 1U : 0U,
+                preparedQueueSnapshot.tailModal.imageValid ? 1U : 0U,
+                preparedQueueSnapshot.tailModal.commandedMCSValid ? 1U : 0U,
+                static_cast<unsigned long long>(
+                    ScaleNonNegativeDiagnosticValue(
+                        preparedQueueSnapshot.tailModal.g00OverrideRatio,
+                        100.0)));
+
+            RtPrintf(
+                "[NC02K1-CUR] Scope:%u Cache:%llu Frame:%llu Epoch:%llu Flow:%llu "
+                "Owner:%u/%llu LastInv:%s Panel:%u/%u/%u EOF:%u Cap:%u\n",
+                static_cast<unsigned int>(preparedQueueSnapshot.source.scope),
+                static_cast<unsigned long long>(
+                    preparedQueueSnapshot.source.cacheGeneration),
+                static_cast<unsigned long long>(
+                    preparedQueueSnapshot.source.frameId),
+                static_cast<unsigned long long>(
+                    preparedQueueSnapshot.source.executionEpoch),
+                static_cast<unsigned long long>(
+                    preparedQueueSnapshot.source.programFlowGeneration),
+                static_cast<unsigned int>(preparedQueueSnapshot.source.owner),
+                static_cast<unsigned long long>(
+                    preparedQueueSnapshot.source.ownerGeneration),
+                NCPreparedInvalidationReasonToDiagnosticName(
+                    preparedQueueSnapshot.lastInvalidationReason),
+                preparedQueueSnapshot.source.panel.blockSkipEnabled ? 1U : 0U,
+                preparedQueueSnapshot.source.panel.singleBlockEnabled ? 1U : 0U,
+                preparedQueueSnapshot.source.panel.optionalStopEnabled ? 1U : 0U,
+                preparedQueueSnapshot.eofLatched ? 1U : 0U,
+                preparedQueueSnapshot.capacityLatched ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K1-CNT] Eval:%llu Pub:%llu Sess:%llu Prep:%llu "
+                "Disp:%llu Commit:%llu Retire:%llu InvEntry:%llu Depth:%u "
+                "Acct:%u Inv:%llu Alarm:%llu Reset:%llu Source:%llu "
+                "Epoch:%llu EpochOK:%llu Owner:%llu Frame:%llu Panel:%llu Barrier:%llu "
+                "EOF:%llu Cap:%llu Over:%llu Cursor:%llu PlanGap:%llu FlowOK:%llu "
+                "DMis:%llu CMis:%llu Stale:%llu IdFail:%llu Cutover:%llu\n",
+                static_cast<unsigned long long>(preparedQueueCounters.evaluations),
+                static_cast<unsigned long long>(preparedQueueCounters.publications),
+                static_cast<unsigned long long>(preparedQueueCounters.sessions),
+                static_cast<unsigned long long>(preparedQueueCounters.prepared),
+                static_cast<unsigned long long>(preparedQueueCounters.dispatchMatched),
+                static_cast<unsigned long long>(preparedQueueCounters.commitMatched),
+                static_cast<unsigned long long>(preparedQueueCounters.retired),
+                static_cast<unsigned long long>(preparedQueueCounters.invalidatedEntries),
+                static_cast<unsigned int>(preparedQueueSnapshot.depth),
+                preparedQueueSnapshot.accountingValid ? 1U : 0U,
+                static_cast<unsigned long long>(preparedQueueCounters.invalidations),
+                static_cast<unsigned long long>(preparedQueueCounters.alarmInvalidations),
+                static_cast<unsigned long long>(preparedQueueCounters.resetInvalidations),
+                static_cast<unsigned long long>(preparedQueueCounters.sourceInvalidations),
+                static_cast<unsigned long long>(preparedQueueCounters.epochInvalidations),
+                static_cast<unsigned long long>(preparedQueueCounters.correlatedEpochAdvances),
+                static_cast<unsigned long long>(preparedQueueCounters.ownerInvalidations),
+                static_cast<unsigned long long>(preparedQueueCounters.frameInvalidations),
+                static_cast<unsigned long long>(preparedQueueCounters.panelInvalidations),
+                static_cast<unsigned long long>(preparedQueueCounters.barrierStops),
+                static_cast<unsigned long long>(preparedQueueCounters.eofStops),
+                static_cast<unsigned long long>(preparedQueueCounters.capacityStops),
+                static_cast<unsigned long long>(preparedQueueCounters.overwritePrevented),
+                static_cast<unsigned long long>(preparedQueueCounters.cursorRegressions),
+                static_cast<unsigned long long>(preparedQueueCounters.planDiscontinuities),
+                static_cast<unsigned long long>(preparedQueueCounters.expectedFlowCutovers),
+                static_cast<unsigned long long>(preparedQueueCounters.dispatchMismatches),
+                static_cast<unsigned long long>(preparedQueueCounters.commitMismatches),
+                static_cast<unsigned long long>(preparedQueueCounters.staleRuntimeProofs),
+                static_cast<unsigned long long>(preparedQueueCounters.identityFailures),
+                static_cast<unsigned long long>(preparedQueueCounters.cutoverAttempts));
+
+            RtPrintf(
+                "[NC02K2-EQV] Pub:%llu State:%s Inv:%s Sess:%llu Entry:%llu "
+                "Scope:%u Cache:%llu Frame:%llu Epoch:%llu PostEpoch:%llu Flow:%llu "
+                "Owner:%u/%llu Panel:%02X PC:%d Line:%d Class:%s Barrier:%s "
+                "Depth:%u SPeak:%u LPeak:%u "
+                "QualSess:%llu Cand:%u Pend:%u Res:%u Disp:%llu Commit:%llu "
+                "Flags:%08X Block:%u Plan:%u ClassOK:%u Drain:%u ModB:%u "
+                "ModA:%u LedD:%u LedC:%u Wait:%u UpDC:%u Ret:%u Up:%u Life:%u "
+                "Match:%u Acct:%u "
+                "Qualified:%u Shadow:%u Influence:%u Cutover:%u\n",
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.publicationSequence),
+                NCPreparedHeadEquivalenceStateToDiagnosticName(
+                    preparedEquivalenceSnapshot.state),
+                NCPreparedHeadEquivalenceInvalidationToDiagnosticName(
+                    preparedEquivalenceSnapshot.lastInvalidation),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.session),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.entrySequence),
+                static_cast<unsigned int>(
+                    preparedEquivalenceSnapshot.scope),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.cacheGeneration),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.frameId),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.executionEpoch),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.commitExecutionEpoch),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.programFlowGeneration),
+                static_cast<unsigned int>(
+                    preparedEquivalenceSnapshot.owner),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.ownerGeneration),
+                static_cast<unsigned int>(
+                    preparedEquivalenceSnapshot.panelMask),
+                preparedEquivalenceSnapshot.sourcePC,
+                preparedEquivalenceSnapshot.sourceLineNumber,
+                NCPreparedBlockClassToDiagnosticName(
+                    preparedEquivalenceSnapshot.blockClass),
+                NCPreparedBarrierKindToDiagnosticName(
+                    preparedEquivalenceSnapshot.barrierKind),
+                static_cast<unsigned int>(
+                    preparedEquivalenceSnapshot.preparedDepth),
+                static_cast<unsigned int>(
+                    preparedEquivalenceSnapshot.sessionPeakDepth),
+                static_cast<unsigned int>(
+                    preparedEquivalenceSnapshot.lifetimePeakDepth),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.qualifiedSession),
+                preparedEquivalenceSnapshot.candidate ? 1U : 0U,
+                preparedEquivalenceSnapshot.pending ? 1U : 0U,
+                preparedEquivalenceSnapshot.resolved ? 1U : 0U,
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.dispatchId),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceSnapshot.commitSequence),
+                static_cast<unsigned int>(
+                    preparedEquivalenceSnapshot.mismatchFlags),
+                preparedEquivalenceSnapshot.blockMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.planMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.classificationMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.drainMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.modalBeforeMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.modalAfterMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.ledgerDispatchMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.ledgerCommitMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.runtimeWaitCallbackActive
+                ? 1U : 0U,
+                preparedEquivalenceSnapshot.upstreamDispatchCommitMatch
+                ? 1U : 0U,
+                preparedEquivalenceSnapshot.retirementMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.upstreamProofMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.lifecycleMatch ? 1U : 0U,
+                preparedEquivalenceSnapshot.matched ? 1U : 0U,
+                preparedEquivalenceSnapshot.accountingValid ? 1U : 0U,
+                preparedEquivalenceSnapshot.readinessQualified ? 1U : 0U,
+                preparedEquivalenceSnapshot.shadowOnly ? 1U : 0U,
+                preparedEquivalenceSnapshot.runtimeInfluence ? 1U : 0U,
+                preparedEquivalenceSnapshot.cutoverApplied ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K2-CNT] Obs:%llu Pub:%llu Cand:%llu Match:%llu Mis:%llu "
+                "Inv:%llu Inel:%llu Replay:%llu Bypass:%llu Peak:%llu Multi:%llu "
+                "QMis:%llu SrcMis:%llu PCMis:%llu LineMis:%llu BlockMis:%llu "
+                "PlanMis:%llu ClassMis:%llu DrainMis:%llu ModBMis:%llu "
+                "ModAMis:%llu LifeMis:%llu Stale:%llu ResolveMis:%llu "
+                "UpMis:%llu LedgerMis:%llu BindIdMis:%llu RuntimeFail:%llu "
+                "SessTrans:%llu QualSess:%llu WouldUse:%llu Use:%llu "
+                "Cutover:%llu Influence:%llu\n",
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.observations),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.publications),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.candidates),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.matched),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.mismatched),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.invalidated),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.ineligible),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.replays),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.queueBypasses),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.lifetimePeakDepth),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.multiBlockObservations),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.queueMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.sourceMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.pcMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.lineMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.blockMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.planMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.classificationMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.drainMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.modalBeforeMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.modalAfterMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.lifecycleMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.staleTokens),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.resolveMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.upstreamMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.ledgerMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.bindIdentityMismatches),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.runtimeFailures),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.sessionTransitions),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.qualifiedSessions),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.wouldUse),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.useAttempts),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.cutoverAttempts),
+                static_cast<unsigned long long>(
+                    preparedEquivalenceCounters.runtimeInfluence));
+
+            RtPrintf(
+                "[NC02K3-GATE] Pub:%llu Decision:%s Revoke:%s Enabled:%u Attempt:%u "
+                "Apply:%u Legacy:%u Sess:%llu Entry:%llu QualSess:%llu "
+                "Qualified:%u Armed:%u Quarantine:%u Lock:%u Scope:%u Cache:%llu Frame:%llu "
+                "Epoch:%llu Flow:%llu Owner:%u/%llu Panel:%02X PC:%d Line:%d Disp:%llu "
+                "Class:%s Queue:%u Token:%u Source:%u PCLine:%u ClassOK:%u "
+                "Exact:%u Recheck:%u Prepared:%u Influence:%u Cutover:%u Acct:%u\n",
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.publicationSequence),
+                NCPreparedHeadCutoverDecisionToDiagnosticName(
+                    preparedCutoverSnapshot.decision),
+                NCPreparedHeadCutoverRevocationToDiagnosticName(
+                    preparedCutoverSnapshot.lastRevocation),
+                preparedCutoverSnapshot.enabled ? 1U : 0U,
+                preparedCutoverSnapshot.attempted ? 1U : 0U,
+                preparedCutoverSnapshot.applied ? 1U : 0U,
+                preparedCutoverSnapshot.legacyRetained ? 1U : 0U,
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.session),
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.entrySequence),
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.qualifiedSession),
+                preparedCutoverSnapshot.sessionQualified ? 1U : 0U,
+                preparedCutoverSnapshot.qualificationArmed ? 1U : 0U,
+                preparedCutoverSnapshot.sessionQuarantined ? 1U : 0U,
+                preparedCutoverSnapshot.permanentLockout ? 1U : 0U,
+                static_cast<unsigned int>(preparedCutoverSnapshot.scope),
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.cacheGeneration),
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.frameId),
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.executionEpoch),
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.programFlowGeneration),
+                static_cast<unsigned int>(preparedCutoverSnapshot.owner),
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.ownerGeneration),
+                static_cast<unsigned int>(preparedCutoverSnapshot.panelMask),
+                preparedCutoverSnapshot.sourcePC,
+                preparedCutoverSnapshot.sourceLineNumber,
+                static_cast<unsigned long long>(
+                    preparedCutoverSnapshot.dispatchId),
+                NCPreparedBlockClassToDiagnosticName(
+                    preparedCutoverSnapshot.blockClass),
+                preparedCutoverSnapshot.queueExact ? 1U : 0U,
+                preparedCutoverSnapshot.tokenExact ? 1U : 0U,
+                preparedCutoverSnapshot.sourceExact ? 1U : 0U,
+                preparedCutoverSnapshot.pcLineExact ? 1U : 0U,
+                preparedCutoverSnapshot.classEligible ? 1U : 0U,
+                preparedCutoverSnapshot.equivalenceExact ? 1U : 0U,
+                preparedCutoverSnapshot.valueRevalidated ? 1U : 0U,
+                preparedCutoverSnapshot.preparedValueSelected ? 1U : 0U,
+                preparedCutoverSnapshot.runtimeInfluence ? 1U : 0U,
+                preparedCutoverSnapshot.cutoverApplied ? 1U : 0U,
+                preparedCutoverSnapshot.accountingValid ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K3-CNT] Eval:%llu Pub:%llu Attempt:%llu Apply:%llu "
+                "Fallback:%llu Disabled:%llu NoHead:%llu Queue:%llu "
+                "Upstream:%llu Warmup:%llu Quarantine:%llu Duplicate:%llu "
+                "Token:%llu Source:%llu PCLine:%llu Class:%llu Exact:%llu "
+                "RuntimeFail:%llu Arm:%llu Revoke:%llu DisRev:%llu QRev:%llu "
+                "AlarmRev:%llu ResetRev:%llu EndRev:%llu SrcRev:%llu UpRev:%llu "
+                "Use:%llu Cutover:%llu Influence:%llu\n",
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.evaluations),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.publications),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.attempts),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.applied),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.legacyFallbacks),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.disabled),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.noHead),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.queueRejected),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.upstreamRejected),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.unqualified),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.quarantined),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.duplicateRejected),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.tokenRejected),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.sourceRejected),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.pcLineRejected),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.classRejected),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.equivalenceRejected),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.runtimeFailures),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.arms),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.revocations),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.disabledRevocations),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.queueRevocations),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.alarmRevocations),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.resetRevocations),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.programEndRevocations),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.sourceRevocations),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.upstreamRevocations),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.applied),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.applied),
+                static_cast<unsigned long long>(
+                    preparedCutoverCounters.applied));
 
             const std::uint64_t stopCommandMaxPps =
                 ScaleNonNegativeDiagnosticValue(
@@ -3309,7 +4075,9 @@ namespace HMI_Bridge
                 "ExecOwner:%s/%u "
                 "D:%llu PC:%d Blocks:%u>%u Term:%s TSeq:%llu Seg:%llu "
                 "SrcBlk:%d LedgerOK:%u TermSeen:%u AlarmAck:%u "
-                "RTEpoch:%u ExpAbort:%u ExpRetire:%u ClassOK:%u StopClosed:%u "
+                "RTEpoch:%u PreLatched:%u ExpAbort:%u ExpRetire:%u "
+                "PreWin:%u ClassOK:%u StopClosed:%u "
+                "ResetRetire:%u ResetClass:%u ResetCommit:%u "
                 "UnexpectedEpoch:%u PostDispatch:%u\n",
                 static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.sequence),
@@ -3359,10 +4127,15 @@ namespace HMI_Bridge
                 lifecycleInterruptionSnapshot.terminalFailureObserved ? 1U : 0U,
                 lifecycleInterruptionSnapshot.alarmStopAcknowledged ? 1U : 0U,
                 lifecycleInterruptionSnapshot.runtimeAlarmEpochChangeObserved ? 1U : 0U,
+                lifecycleInterruptionSnapshot.alarmStopPreLatchedRTApplication ? 1U : 0U,
                 lifecycleInterruptionSnapshot.expectedAlarmAbortObserved ? 1U : 0U,
                 lifecycleInterruptionSnapshot.expectedAlarmPreReadRejectObserved ? 1U : 0U,
+                lifecycleInterruptionSnapshot.expectedAlarmPreLatchedTerminalObserved ? 1U : 0U,
                 lifecycleInterruptionSnapshot.alarmTerminalClassificationValid ? 1U : 0U,
                 lifecycleInterruptionSnapshot.alarmStopClosed ? 1U : 0U,
+                lifecycleInterruptionSnapshot.expectedResetPreReadRejectObserved ? 1U : 0U,
+                lifecycleInterruptionSnapshot.resetTerminalClassificationValid ? 1U : 0U,
+                lifecycleInterruptionSnapshot.resetRetirementCommitted ? 1U : 0U,
                 lifecycleInterruptionSnapshot.unexpectedEpochChangeObserved ? 1U : 0U,
                 lifecycleInterruptionSnapshot.postInterruptionDispatchObserved ? 1U : 0U);
 
@@ -3372,7 +4145,9 @@ namespace HMI_Bridge
                 "Safety:%u Cb:%u Bind:%u Stand:%u Stable:%u/%u "
                 "Ready:%u Quiet:%u Gap:%u Dispatch:%llu DltFail:%llu "
                 "RawFail:%llu ExpAbort:%llu ExpReject:%llu UnexpReject:%llu "
-                "ExpOwner:%llu ExpStale:%llu Rej:%llu Cancel:%llu "
+                "ExpOwner:%llu ExpStale:%llu PreAbort:%llu PreReject:%llu "
+                "RstReject:%llu RstOwner:%llu RstStale:%llu "
+                "Rej:%llu Cancel:%llu "
                 "Abort:%llu Fault:%llu Ledger:%llu "
                 "FbOv:%llu NoticeOv:%llu SeqGap:%llu\n",
                 static_cast<unsigned long long>(
@@ -3421,6 +4196,16 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.expectedAlarmStaleEpochRejectDelta),
                 static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.expectedAlarmPreLatchedAbortDelta),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.expectedAlarmPreLatchedRejectDelta),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.expectedResetPreReadRejectDelta),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.expectedResetOwnerConflictRejectDelta),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionSnapshot.expectedResetStaleEpochRejectDelta),
+                static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.feedbackRejectedDelta),
                 static_cast<unsigned long long>(
                     lifecycleInterruptionSnapshot.feedbackCancelledDelta),
@@ -3442,7 +4227,9 @@ namespace HMI_Bridge
                 "Prog:%llu MDI:%llu Manual:%llu Dynamic:%llu Goto:%llu "
                 "TermReq:%llu EpochExp:%llu EpochObs:%llu Unexpected:%llu "
                 "EpochSuper:%llu AlarmAck:%llu RTEpoch:%llu ExpAbort:%llu "
-                "ExpReject:%llu ExpOwner:%llu ExpStale:%llu StopClose:%llu "
+                "ExpReject:%llu ExpOwner:%llu ExpStale:%llu "
+                "PreAbort:%llu PreReject:%llu RstReject:%llu "
+                "RstOwner:%llu RstStale:%llu StopClose:%llu "
                 "TRej:%llu TCancel:%llu TAbort:%llu "
                 "TFault:%llu LedgerReject:%llu PostDispatch:%llu Eval:%llu Quiet:%llu "
                 "Gap:%llu Super:%llu\n",
@@ -3487,6 +4274,16 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.expectedAlarmStaleEpochRejects),
                 static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.expectedAlarmPreLatchedAborts),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.expectedAlarmPreLatchedRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.expectedResetPreReadRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.expectedResetOwnerConflictRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.expectedResetStaleEpochRejects),
+                static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.alarmStopsClosed),
                 static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.terminalRejected),
@@ -3513,12 +4310,17 @@ namespace HMI_Bridge
                 "[NC02J631-TRN] RawTotal:%llu Unexpected:%llu "
                 "RawOwner:%llu RawStale:%llu RawFbRej:%llu "
                 "ExpOwner:%llu ExpStale:%llu ExpFbRej:%llu "
+                "AlarmOwner:%llu AlarmStale:%llu AlarmFb:%llu "
+                "ResetOwner:%llu ResetStale:%llu ResetFb:%llu "
                 "ResidualOwner:%llu ResidualStale:%llu ResidualFb:%llu\n",
                 static_cast<unsigned long long>(transportRawErrorTotal),
                 static_cast<unsigned long long>(transportErrorTotal),
                 static_cast<unsigned long long>(ownerConflictReject),
                 static_cast<unsigned long long>(staleDiscard),
                 static_cast<unsigned long long>(feedbackRejected),
+                static_cast<unsigned long long>(expectedOwnerConflictReject),
+                static_cast<unsigned long long>(expectedStaleDiscard),
+                static_cast<unsigned long long>(expectedFeedbackRejected),
                 static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.
                     expectedAlarmOwnerConflictRejects),
@@ -3528,6 +4330,15 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(
                     lifecycleInterruptionCounters.
                     expectedAlarmPreReadRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.
+                    expectedResetOwnerConflictRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.
+                    expectedResetStaleEpochRejects),
+                static_cast<unsigned long long>(
+                    lifecycleInterruptionCounters.
+                    expectedResetPreReadRejects),
                 static_cast<unsigned long long>(
                     unexpectedOwnerConflictReject),
                 static_cast<unsigned long long>(unexpectedStaleDiscard),
@@ -3811,6 +4622,10 @@ namespace HMI_Bridge
         previousGMTransactionChangeToken = gmTransactionChangeToken;
         previousPreDispatchBarrierChangeToken =
             preDispatchBarrierChangeToken;
+        previousPreparedQueueChangeToken =
+            preparedQueueChangeToken;
+        previousPreparedEquivalenceChangeToken =
+            preparedEquivalenceChangeToken;
         previousSingleBlockShadowChangeToken =
             singleBlockShadowChangeToken;
         previousSingleBlockGateChangeToken =
@@ -3826,5 +4641,6 @@ namespace HMI_Bridge
         previousAlarmEmergencyStopChangeToken =
             alarmEmergencyStopChangeToken;
         previousJ5EventToken = j5EventToken;
+        previousP1HandoverChangeToken = p1HandoverChangeToken;
     }
 }

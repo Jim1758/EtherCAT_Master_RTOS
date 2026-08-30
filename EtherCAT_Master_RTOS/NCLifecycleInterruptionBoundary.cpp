@@ -74,7 +74,35 @@ std::uint64_t NCLifecycleInterruptionBoundaryShadow::LedgerIntegrityDelta(
     return total;
 }
 
-bool NCLifecycleInterruptionBoundaryShadow::IsAlarmRequestTerminalCandidate(
+bool NCLifecycleInterruptionBoundaryShadow::
+IsFeedbackSequenceInOpenClosedRange(
+    MotionFeedbackSequence candidate,
+    MotionFeedbackSequence lowerExclusive,
+    MotionFeedbackSequence upperInclusive) noexcept
+{
+    if (candidate == MOTION_FEEDBACK_SEQUENCE_INVALID ||
+        lowerExclusive == MOTION_FEEDBACK_SEQUENCE_INVALID ||
+        upperInclusive == MOTION_FEEDBACK_SEQUENCE_INVALID)
+    {
+        return false;
+    }
+
+    const MotionFeedbackSequence upperDistance =
+        upperInclusive - lowerExclusive;
+    const MotionFeedbackSequence candidateDistance =
+        candidate - lowerExclusive;
+    const MotionFeedbackSequence halfRange =
+        (std::numeric_limits<MotionFeedbackSequence>::max)() / 2ULL;
+
+    return
+        upperDistance != 0ULL &&
+        upperDistance <= halfRange &&
+        candidateDistance != 0ULL &&
+        candidateDistance <= upperDistance;
+}
+
+bool NCLifecycleInterruptionBoundaryShadow::
+MatchesAlarmRequestTerminalIdentity(
     const MotionFeedbackEvent& event) const noexcept
 {
     if (m_snapshot.cause != NCLifecycleInterruptionCause::ALARM ||
@@ -86,10 +114,7 @@ bool NCLifecycleInterruptionBoundaryShadow::IsAlarmRequestTerminalCandidate(
             m_snapshot.requestExecutionOwner) ||
         event.owner != m_snapshot.requestExecutionOwner ||
         event.ownerGeneration !=
-        m_snapshot.requestExecutionOwnerGeneration ||
-        !IsFeedbackSequenceAfter(
-            event.sequence,
-            m_baseline.lastPublishedFeedbackSequence))
+        m_snapshot.requestExecutionOwnerGeneration)
     {
         return false;
     }
@@ -98,8 +123,74 @@ bool NCLifecycleInterruptionBoundaryShadow::IsAlarmRequestTerminalCandidate(
         m_alarmAbortCandidateCount,
         AddSaturating(
             m_alarmOwnerConflictRejectCandidateCount,
-            m_alarmStaleEpochRejectCandidateCount));
+            AddSaturating(
+                m_alarmStaleEpochRejectCandidateCount,
+                AddSaturating(
+                    m_alarmPreLatchedAbortCandidateCount,
+                    AddSaturating(
+                        m_alarmPreLatchedOwnerConflictRejectCandidateCount,
+                        m_alarmPreLatchedStaleEpochRejectCandidateCount)))));
     return candidateTotal < m_snapshot.requestActiveBlocks;
+}
+
+bool NCLifecycleInterruptionBoundaryShadow::
+IsAlarmPostBoundaryTerminalCandidate(
+    const MotionFeedbackEvent& event) const noexcept
+{
+    return
+        MatchesAlarmRequestTerminalIdentity(event) &&
+        IsFeedbackSequenceAfter(
+            event.sequence,
+            m_baseline.lastPublishedFeedbackSequence);
+}
+
+bool NCLifecycleInterruptionBoundaryShadow::
+IsAlarmPreLatchedUnreadTerminalCandidate(
+    const MotionFeedbackEvent& event) const noexcept
+{
+    return
+        MatchesAlarmRequestTerminalIdentity(event) &&
+        IsFeedbackSequenceInOpenClosedRange(
+            event.sequence,
+            m_baseline.lastConsumedFeedbackSequence,
+            m_baseline.lastPublishedFeedbackSequence);
+}
+
+bool NCLifecycleInterruptionBoundaryShadow::
+MatchesResetRequestTerminalIdentity(
+    const MotionFeedbackEvent& event) const noexcept
+{
+    if (m_snapshot.cause != NCLifecycleInterruptionCause::RESET ||
+        m_snapshot.requestActiveBlocks == 0U ||
+        m_snapshot.postInterruptionDispatchObserved ||
+        !event.identity.IsAssigned() ||
+        event.identity.epoch != m_snapshot.requestExecutionEpoch ||
+        event.identity.source != ResolveMotionCommandSourceForOwner(
+            m_snapshot.requestExecutionOwner) ||
+        event.owner != m_snapshot.requestExecutionOwner ||
+        event.ownerGeneration !=
+        m_snapshot.requestExecutionOwnerGeneration)
+    {
+        return false;
+    }
+
+    const std::uint64_t candidateTotal = AddSaturating(
+        m_resetAbortCandidateCount,
+        AddSaturating(
+            m_resetOwnerConflictRejectCandidateCount,
+            m_resetStaleEpochRejectCandidateCount));
+    return candidateTotal < m_snapshot.requestActiveBlocks;
+}
+
+bool NCLifecycleInterruptionBoundaryShadow::
+IsResetPostBoundaryTerminalCandidate(
+    const MotionFeedbackEvent& event) const noexcept
+{
+    return
+        MatchesResetRequestTerminalIdentity(event) &&
+        IsFeedbackSequenceAfter(
+            event.sequence,
+            m_baseline.lastPublishedFeedbackSequence);
 }
 
 std::uint64_t NCLifecycleInterruptionBoundaryShadow::AllocateSequence() noexcept
@@ -123,6 +214,10 @@ void NCLifecycleInterruptionBoundaryShadow::UpdateSample(
         m_snapshot.expectedAlarmOwnerConflictRejectDelta;
     const std::uint64_t previousExpectedAlarmStaleEpochRejectDelta =
         m_snapshot.expectedAlarmStaleEpochRejectDelta;
+    const std::uint64_t previousExpectedAlarmPreLatchedAbortDelta =
+        m_snapshot.expectedAlarmPreLatchedAbortDelta;
+    const std::uint64_t previousExpectedAlarmPreLatchedRejectDelta =
+        m_snapshot.expectedAlarmPreLatchedRejectDelta;
 
     m_snapshot.currentExecutionEpoch = sample.executionEpoch;
     m_snapshot.currentOwner = sample.ownerLease.owner;
@@ -155,6 +250,13 @@ void NCLifecycleInterruptionBoundaryShadow::UpdateSample(
     m_snapshot.expectedAlarmPreReadRejectDelta = 0ULL;
     m_snapshot.expectedAlarmOwnerConflictRejectDelta = 0ULL;
     m_snapshot.expectedAlarmStaleEpochRejectDelta = 0ULL;
+    m_snapshot.expectedAlarmPreLatchedAbortDelta = 0ULL;
+    m_snapshot.expectedAlarmPreLatchedRejectDelta = 0ULL;
+    m_snapshot.expectedResetPreReadRejectDelta = 0ULL;
+    m_snapshot.expectedResetOwnerConflictRejectDelta = 0ULL;
+    m_snapshot.expectedResetStaleEpochRejectDelta = 0ULL;
+    m_snapshot.expectedResetPreReadRejectObserved = false;
+    m_snapshot.resetTerminalClassificationValid = true;
     m_snapshot.unexpectedBlockFailureDelta =
         m_snapshot.blockFailureDelta;
     m_snapshot.dispatchDelta =
@@ -191,22 +293,51 @@ void NCLifecycleInterruptionBoundaryShadow::UpdateSample(
     // still waiting in producer/ingress/queue may instead be retired as
     // OWNER_CONFLICT (Safety took the lease first) or STALE_EPOCH (the RT epoch
     // seam won first).  Only exact old-Epoch, old-owner terminal candidates
-    // published after this boundary and backed by the exact J.6 acknowledgement
-    // may be reclassified.  Raw counters are never erased.
+    // published after this boundary may be reclassified normally.  A terminal
+    // already published but still unread at Begin remains in a separate open-
+    // closed (lastConsumed, lastPublished] window and is included only when
+    // the exact J.6 acknowledgement proves PreLatched RT application.  Raw
+    // counters are never erased.
     if (m_snapshot.cause == NCLifecycleInterruptionCause::ALARM &&
         m_snapshot.alarmStopAcknowledged &&
         m_snapshot.runtimeAlarmEpochChangeObserved &&
         m_snapshot.terminalFeedbackLedgerAccepted)
     {
-        const std::uint64_t expectedRejectCandidateTotal = AddSaturating(
-            m_alarmOwnerConflictRejectCandidateCount,
-            m_alarmStaleEpochRejectCandidateCount);
-        const std::uint64_t expectedFailureCandidateTotal = AddSaturating(
+        const std::uint64_t preLatchedAbortCandidateTotal =
+            m_snapshot.alarmStopPreLatchedRTApplication
+            ? m_alarmPreLatchedAbortCandidateCount
+            : 0ULL;
+        const std::uint64_t preLatchedOwnerConflictCandidateTotal =
+            m_snapshot.alarmStopPreLatchedRTApplication
+            ? m_alarmPreLatchedOwnerConflictRejectCandidateCount
+            : 0ULL;
+        const std::uint64_t preLatchedStaleEpochCandidateTotal =
+            m_snapshot.alarmStopPreLatchedRTApplication
+            ? m_alarmPreLatchedStaleEpochRejectCandidateCount
+            : 0ULL;
+        const std::uint64_t preLatchedRejectCandidateTotal = AddSaturating(
+            preLatchedOwnerConflictCandidateTotal,
+            preLatchedStaleEpochCandidateTotal);
+        const std::uint64_t expectedAbortCandidateTotal = AddSaturating(
             m_alarmAbortCandidateCount,
+            preLatchedAbortCandidateTotal);
+        const std::uint64_t expectedOwnerConflictCandidateTotal =
+            AddSaturating(
+                m_alarmOwnerConflictRejectCandidateCount,
+                preLatchedOwnerConflictCandidateTotal);
+        const std::uint64_t expectedStaleEpochCandidateTotal =
+            AddSaturating(
+                m_alarmStaleEpochRejectCandidateCount,
+                preLatchedStaleEpochCandidateTotal);
+        const std::uint64_t expectedRejectCandidateTotal = AddSaturating(
+            expectedOwnerConflictCandidateTotal,
+            expectedStaleEpochCandidateTotal);
+        const std::uint64_t expectedFailureCandidateTotal = AddSaturating(
+            expectedAbortCandidateTotal,
             expectedRejectCandidateTotal);
 
         m_snapshot.alarmTerminalClassificationValid =
-            m_alarmAbortCandidateCount <=
+            expectedAbortCandidateTotal <=
             m_snapshot.feedbackAbortedDelta &&
             expectedRejectCandidateTotal <=
             m_snapshot.feedbackRejectedDelta &&
@@ -219,13 +350,17 @@ void NCLifecycleInterruptionBoundaryShadow::UpdateSample(
         if (m_snapshot.alarmTerminalClassificationValid)
         {
             m_snapshot.expectedAlarmAbortDelta =
-                m_alarmAbortCandidateCount;
+                expectedAbortCandidateTotal;
             m_snapshot.expectedAlarmOwnerConflictRejectDelta =
-                m_alarmOwnerConflictRejectCandidateCount;
+                expectedOwnerConflictCandidateTotal;
             m_snapshot.expectedAlarmStaleEpochRejectDelta =
-                m_alarmStaleEpochRejectCandidateCount;
+                expectedStaleEpochCandidateTotal;
             m_snapshot.expectedAlarmPreReadRejectDelta =
                 expectedRejectCandidateTotal;
+            m_snapshot.expectedAlarmPreLatchedAbortDelta =
+                preLatchedAbortCandidateTotal;
+            m_snapshot.expectedAlarmPreLatchedRejectDelta =
+                preLatchedRejectCandidateTotal;
             m_snapshot.unexpectedBlockFailureDelta =
                 m_snapshot.blockFailureDelta -
                 expectedFailureCandidateTotal;
@@ -238,6 +373,9 @@ void NCLifecycleInterruptionBoundaryShadow::UpdateSample(
             m_snapshot.expectedAlarmAbortDelta != 0ULL;
         m_snapshot.expectedAlarmPreReadRejectObserved =
             m_snapshot.expectedAlarmPreReadRejectDelta != 0ULL;
+        m_snapshot.expectedAlarmPreLatchedTerminalObserved =
+            m_snapshot.expectedAlarmPreLatchedAbortDelta != 0ULL ||
+            m_snapshot.expectedAlarmPreLatchedRejectDelta != 0ULL;
 
         if (m_snapshot.expectedAlarmAbortDelta >
             previousExpectedAlarmAbortDelta)
@@ -270,6 +408,68 @@ void NCLifecycleInterruptionBoundaryShadow::UpdateSample(
                 m_counters.expectedAlarmStaleEpochRejects,
                 m_snapshot.expectedAlarmStaleEpochRejectDelta -
                 previousExpectedAlarmStaleEpochRejectDelta);
+        }
+        if (m_snapshot.expectedAlarmPreLatchedAbortDelta >
+            previousExpectedAlarmPreLatchedAbortDelta)
+        {
+            m_counters.expectedAlarmPreLatchedAborts = AddSaturating(
+                m_counters.expectedAlarmPreLatchedAborts,
+                m_snapshot.expectedAlarmPreLatchedAbortDelta -
+                previousExpectedAlarmPreLatchedAbortDelta);
+        }
+        if (m_snapshot.expectedAlarmPreLatchedRejectDelta >
+            previousExpectedAlarmPreLatchedRejectDelta)
+        {
+            m_counters.expectedAlarmPreLatchedRejects = AddSaturating(
+                m_counters.expectedAlarmPreLatchedRejects,
+                m_snapshot.expectedAlarmPreLatchedRejectDelta -
+                previousExpectedAlarmPreLatchedRejectDelta);
+        }
+    }
+
+    // NC-0.2K.2.2.1: a normal RESET advances the execution Epoch after this
+    // boundary is captured.  Exact old-Epoch/old-owner terminal feedback may
+    // therefore describe the active command abort plus queued pre-read
+    // commands retired as OWNER_CONFLICT or STALE_EPOCH.  This stage only
+    // classifies candidates; cumulative diagnostic credit is withheld until
+    // Observe() proves the complete quiescent contract.
+    if (m_snapshot.cause == NCLifecycleInterruptionCause::RESET &&
+        m_snapshot.epochPublicationObserved &&
+        m_snapshot.terminalFeedbackLedgerAccepted)
+    {
+        const std::uint64_t expectedResetRejectCandidateTotal =
+            AddSaturating(
+                m_resetOwnerConflictRejectCandidateCount,
+                m_resetStaleEpochRejectCandidateCount);
+        const std::uint64_t expectedResetFailureCandidateTotal =
+            AddSaturating(
+                m_resetAbortCandidateCount,
+                expectedResetRejectCandidateTotal);
+
+        m_snapshot.resetTerminalClassificationValid =
+            m_resetAbortCandidateCount <=
+            m_snapshot.feedbackAbortedDelta &&
+            expectedResetRejectCandidateTotal <=
+            m_snapshot.feedbackRejectedDelta &&
+            expectedResetFailureCandidateTotal <=
+            m_snapshot.blockFailureDelta &&
+            expectedResetFailureCandidateTotal <=
+            static_cast<std::uint64_t>(
+                m_snapshot.requestActiveBlocks);
+
+        if (m_snapshot.resetTerminalClassificationValid)
+        {
+            m_snapshot.expectedResetOwnerConflictRejectDelta =
+                m_resetOwnerConflictRejectCandidateCount;
+            m_snapshot.expectedResetStaleEpochRejectDelta =
+                m_resetStaleEpochRejectCandidateCount;
+            m_snapshot.expectedResetPreReadRejectDelta =
+                expectedResetRejectCandidateTotal;
+            m_snapshot.expectedResetPreReadRejectObserved =
+                expectedResetRejectCandidateTotal != 0ULL;
+            m_snapshot.unexpectedFeedbackRejectedDelta =
+                m_snapshot.feedbackRejectedDelta -
+                expectedResetRejectCandidateTotal;
         }
     }
     m_snapshot.ledgerIntegrityDelta =
@@ -309,6 +509,12 @@ void NCLifecycleInterruptionBoundaryShadow::Begin(
     m_alarmAbortCandidateCount = 0ULL;
     m_alarmOwnerConflictRejectCandidateCount = 0ULL;
     m_alarmStaleEpochRejectCandidateCount = 0ULL;
+    m_alarmPreLatchedAbortCandidateCount = 0ULL;
+    m_alarmPreLatchedOwnerConflictRejectCandidateCount = 0ULL;
+    m_alarmPreLatchedStaleEpochRejectCandidateCount = 0ULL;
+    m_resetAbortCandidateCount = 0ULL;
+    m_resetOwnerConflictRejectCandidateCount = 0ULL;
+    m_resetStaleEpochRejectCandidateCount = 0ULL;
 
     NCLifecycleInterruptionSnapshot snapshot{};
     snapshot.sequence = AllocateSequence();
@@ -423,7 +629,8 @@ void NCLifecycleInterruptionBoundaryShadow::RecordEpochPublished(
 
 void NCLifecycleInterruptionBoundaryShadow::RecordAlarmStopAcknowledged(
     MotionExecutionEpoch appliedExecutionEpoch,
-    bool epochChangeRequired) noexcept
+    bool epochChangeRequired,
+    bool preLatchedRTApplication) noexcept
 {
     if (!m_snapshot.active ||
         m_snapshot.cause != NCLifecycleInterruptionCause::ALARM)
@@ -457,6 +664,9 @@ void NCLifecycleInterruptionBoundaryShadow::RecordAlarmStopAcknowledged(
         return;
     }
 
+    m_snapshot.alarmStopPreLatchedRTApplication =
+        preLatchedRTApplication;
+
     m_snapshot.publishedExecutionEpoch = appliedExecutionEpoch;
     if (!m_snapshot.epochPublicationObserved)
     {
@@ -486,24 +696,69 @@ void NCLifecycleInterruptionBoundaryShadow::RecordTerminalFeedback(
     m_snapshot.lastTerminalRejectReason = event.rejectReason;
     m_snapshot.lastTerminalErrorCode = event.errorCode;
 
-    if (ledgerAccepted &&
-        event.errorCode == 0U &&
-        IsAlarmRequestTerminalCandidate(event))
+    if (ledgerAccepted && event.errorCode == 0U)
     {
-        if (event.type == MotionFeedbackType::ABORTED &&
+        const bool alarmPostBoundaryCandidate =
+            IsAlarmPostBoundaryTerminalCandidate(event);
+        const bool alarmPreLatchedUnreadCandidate =
+            !alarmPostBoundaryCandidate &&
+            IsAlarmPreLatchedUnreadTerminalCandidate(event);
+        const bool resetPostBoundaryCandidate =
+            IsResetPostBoundaryTerminalCandidate(event);
+
+        if (resetPostBoundaryCandidate &&
+            event.type == MotionFeedbackType::ABORTED &&
+            event.rejectReason == MotionRejectReason::NONE)
+        {
+            ++m_resetAbortCandidateCount;
+        }
+        else if (resetPostBoundaryCandidate &&
+            event.type == MotionFeedbackType::REJECTED &&
+            event.rejectReason == MotionRejectReason::OWNER_CONFLICT)
+        {
+            ++m_resetOwnerConflictRejectCandidateCount;
+        }
+        else if (resetPostBoundaryCandidate &&
+            event.type == MotionFeedbackType::REJECTED &&
+            event.rejectReason == MotionRejectReason::STALE_EPOCH)
+        {
+            ++m_resetStaleEpochRejectCandidateCount;
+        }
+        else if (alarmPostBoundaryCandidate &&
+            event.type == MotionFeedbackType::ABORTED &&
             event.rejectReason == MotionRejectReason::NONE)
         {
             ++m_alarmAbortCandidateCount;
         }
-        else if (event.type == MotionFeedbackType::REJECTED &&
+        else if (alarmPostBoundaryCandidate &&
+            event.type == MotionFeedbackType::REJECTED &&
             event.rejectReason == MotionRejectReason::OWNER_CONFLICT)
         {
             ++m_alarmOwnerConflictRejectCandidateCount;
         }
-        else if (event.type == MotionFeedbackType::REJECTED &&
+        else if (alarmPostBoundaryCandidate &&
+            event.type == MotionFeedbackType::REJECTED &&
             event.rejectReason == MotionRejectReason::STALE_EPOCH)
         {
             ++m_alarmStaleEpochRejectCandidateCount;
+        }
+        else if (alarmPreLatchedUnreadCandidate &&
+            event.type == MotionFeedbackType::ABORTED &&
+            event.rejectReason == MotionRejectReason::NONE)
+        {
+            ++m_alarmPreLatchedAbortCandidateCount;
+        }
+        else if (alarmPreLatchedUnreadCandidate &&
+            event.type == MotionFeedbackType::REJECTED &&
+            event.rejectReason == MotionRejectReason::OWNER_CONFLICT)
+        {
+            ++m_alarmPreLatchedOwnerConflictRejectCandidateCount;
+        }
+        else if (alarmPreLatchedUnreadCandidate &&
+            event.type == MotionFeedbackType::REJECTED &&
+            event.rejectReason == MotionRejectReason::STALE_EPOCH)
+        {
+            ++m_alarmPreLatchedStaleEpochRejectCandidateCount;
         }
     }
 
@@ -616,6 +871,59 @@ void NCLifecycleInterruptionBoundaryShadow::MarkAlarmStopClosed() noexcept
     m_snapshot.quiescentReady = false;
     m_snapshot.quiescent = false;
     ++m_counters.alarmStopsClosed;
+}
+
+void NCLifecycleInterruptionBoundaryShadow::
+CommitExpectedResetRetirement() noexcept
+{
+    if (m_snapshot.resetRetirementCommitted ||
+        m_snapshot.cause != NCLifecycleInterruptionCause::RESET)
+    {
+        return;
+    }
+
+    const std::uint64_t expectedResetFailureTotal = AddSaturating(
+        m_resetAbortCandidateCount,
+        m_snapshot.expectedResetPreReadRejectDelta);
+    const bool exactResetTerminalContract =
+        m_snapshot.expectsEpochChange &&
+        m_snapshot.epochPublicationObserved &&
+        m_snapshot.publishedExecutionEpoch !=
+        MOTION_EXECUTION_EPOCH_INVALID &&
+        m_snapshot.publishedExecutionEpoch !=
+        m_snapshot.requestExecutionEpoch &&
+        m_snapshot.currentExecutionEpoch ==
+        m_snapshot.publishedExecutionEpoch &&
+        !m_snapshot.unexpectedEpochChangeObserved &&
+        !m_snapshot.postInterruptionDispatchObserved &&
+        m_snapshot.terminalFeedbackLedgerAccepted &&
+        m_snapshot.resetTerminalClassificationValid &&
+        m_snapshot.feedbackRejectedDelta ==
+        m_snapshot.expectedResetPreReadRejectDelta &&
+        m_snapshot.feedbackAbortedDelta ==
+        m_resetAbortCandidateCount &&
+        m_snapshot.feedbackCancelledDelta == 0ULL &&
+        m_snapshot.feedbackFaultedDelta == 0ULL &&
+        m_snapshot.blockFailureDelta == expectedResetFailureTotal &&
+        expectedResetFailureTotal ==
+        static_cast<std::uint64_t>(
+            m_snapshot.requestActiveBlocks);
+
+    if (!exactResetTerminalContract)
+    {
+        return;
+    }
+
+    m_counters.expectedResetPreReadRejects = AddSaturating(
+        m_counters.expectedResetPreReadRejects,
+        m_snapshot.expectedResetPreReadRejectDelta);
+    m_counters.expectedResetOwnerConflictRejects = AddSaturating(
+        m_counters.expectedResetOwnerConflictRejects,
+        m_snapshot.expectedResetOwnerConflictRejectDelta);
+    m_counters.expectedResetStaleEpochRejects = AddSaturating(
+        m_counters.expectedResetStaleEpochRejects,
+        m_snapshot.expectedResetStaleEpochRejectDelta);
+    m_snapshot.resetRetirementCommitted = true;
 }
 
 void NCLifecycleInterruptionBoundaryShadow::MarkEvidenceGap(
@@ -896,6 +1204,10 @@ void NCLifecycleInterruptionBoundaryShadow::Observe(
         ++m_counters.waitStableConfirmation;
         return;
     }
+
+    // Only this fully drained, stable and standstill path may convert RESET
+    // terminal candidates into cumulative diagnostic credit.
+    CommitExpectedResetRetirement();
 
     m_snapshot.phase = NCLifecycleInterruptionPhase::QUIESCENT;
     m_snapshot.decision =

@@ -475,6 +475,9 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     double decTime = 0.0;
 
     // 時光機專用快照記憶體
+    // True only for an RT replay transport copy whose lifecycle identity was
+    // already terminal before B2 pushed it back in front of the path.
+    bool replayTerminalAlreadyPublished = false;
     double mem_startPos[MAX_AXES] = { 0.0 };
     double mem_ratio[MAX_AXES] = { 0.0 };
     double mem_radius = 0.0;
@@ -1109,6 +1112,59 @@ struct MotionStartupLagArmingEvidence
 };
 
 
+// =============================================================================
+// Stage NC-0.2K.2.1 - P1 Mixed-Axis Handover Safety Diagnostics
+//
+// These values are monotonic, read-only diagnostics.  They deliberately stay
+// outside the fixed 192-word J.5 publication: the RT owner updates atomics and
+// the 1 s supervisor only observes them.  A healthy mixed-axis P1 run may
+// increase mappingBoundaryStops and droppedAxisRetirements; retirement,
+// orphan and invalid-producer failure counters must remain zero.
+// =============================================================================
+struct MotionP1HandoverSafetySnapshot
+{
+    std::uint64_t mappingBoundaryStops = 0ULL;
+    std::uint64_t droppedAxisRetirements = 0ULL;
+    std::uint64_t droppedAxisRetirementFailures = 0ULL;
+    std::uint64_t orphanAxisContainments = 0ULL;
+    std::uint64_t invalidProducerRejects = 0ULL;
+    std::uint64_t mappingIntegrityAlarmRequests = 0ULL;
+    bool mappingIntegrityAlarmPending = false;
+
+    std::uint32_t lastPreviousAxisMask = 0U;
+    std::uint32_t lastNextAxisMask = 0U;
+    MotionExecutionEpoch lastMappingIntegrityAlarmExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    std::int32_t lastOrphanAxisIndex = -1;
+};
+
+
+// =============================================================================
+// Stage NC-0.2K.2.2 - Lifecycle Atomic Commit Reservation
+//
+// The 250 us Runtime reserves the same packed word used to publish a new
+// Execution Epoch before it commits a terminal, mapping handoff or history
+// crossing.  A lifecycle publisher and an RT commit therefore have one total
+// order: whichever CAS wins is observed first, and neither side can cross the
+// other's mutation boundary.
+// =============================================================================
+struct MotionLifecycleCommitReservationSnapshot
+{
+    std::uint64_t attempts = 0ULL;
+    std::uint64_t acquired = 0ULL;
+    std::uint64_t blockedByLifecycle = 0ULL;
+    std::uint64_t compareExchangeLost = 0ULL;
+    std::uint64_t released = 0ULL;
+    std::uint64_t releaseFailures = 0ULL;
+    std::uint64_t publisherWaits = 0ULL;
+
+    MotionExecutionEpoch currentExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    bool reservationActive = false;
+    bool executionEpochPending = false;
+};
+
+
 static_assert(
     std::is_trivially_copyable<MotionEmergencyStopCounters>::value,
     "MotionEmergencyStopCounters must remain trivially copyable.");
@@ -1123,6 +1179,13 @@ static_assert(
 static_assert(
     std::is_trivially_copyable<MotionStartupLagArmingEvidence>::value,
     "Startup Lag arming evidence must remain trivially copyable.");
+static_assert(
+    std::is_trivially_copyable<MotionP1HandoverSafetySnapshot>::value,
+    "P1 handover safety diagnostics must remain trivially copyable.");
+static_assert(
+    std::is_trivially_copyable<
+    MotionLifecycleCommitReservationSnapshot>::value,
+    "Lifecycle commit reservation diagnostics must remain trivially copyable.");
 static_assert(
     sizeof(MotionExecutionEpoch) == sizeof(std::uint32_t),
     "Packed E-stop Epoch invalidation requires 32-bit execution Epochs.");
@@ -1759,6 +1822,15 @@ public:
     MotionStartupLagArmingEvidence
         GetStartupLagArmingEvidence() const noexcept;
 
+    MotionP1HandoverSafetySnapshot
+        GetP1HandoverSafetySnapshot() const noexcept;
+
+    MotionLifecycleCommitReservationSnapshot
+        GetLifecycleCommitReservationSnapshot() const noexcept;
+
+    bool AcknowledgeP1MappingIntegrityAlarmRequest(
+        std::uint64_t requestSequence) noexcept;
+
     // Stage NC-0.2J.5 Runtime validity seam.  EtherCAT Runtime calls this
     // exactly once for every PDO cycle, including the first invalid cycle.
     void ObserveNCSettleRuntimeCycle(
@@ -2258,6 +2330,23 @@ private:
     std::atomic<std::uint64_t> m_startupLagReadinessResets{ 0ULL };
     std::atomic<std::uint64_t> m_startupLagPrematureMotionBlocks{ 0ULL };
 
+    // NC-0.2K.2.1: fixed-size diagnostics for exact-stop mapping boundaries,
+    // expected dropped-axis retirement, and the independent RT orphan guard.
+    std::atomic<std::uint64_t> m_p1MappingBoundaryStopCount{ 0ULL };
+    std::atomic<std::uint64_t> m_p1DroppedAxisRetirementCount{ 0ULL };
+    std::atomic<std::uint64_t> m_p1DroppedAxisRetirementFailureCount{ 0ULL };
+    std::atomic<std::uint64_t> m_p1OrphanAxisContainmentCount{ 0ULL };
+    std::atomic<std::uint64_t> m_p1InvalidProducerRejectCount{ 0ULL };
+    // One coherent Motion -> NC publication. bits 0..31 carry the exact
+    // pre-stop execution Epoch, bits 32..62 a nonzero 31-bit request
+    // sequence, and bit 63 marks an unacknowledged request.  Motion never
+    // writes AlarmManager from the producer or 250 us Runtime path.
+    std::atomic<std::uint64_t>
+        m_p1MappingIntegrityAlarmRequestPublication{ 0ULL };
+    std::atomic<std::uint32_t> m_p1LastPreviousAxisMask{ 0U };
+    std::atomic<std::uint32_t> m_p1LastNextAxisMask{ 0U };
+    std::atomic<std::int32_t> m_p1LastOrphanAxisIndex{ -1 };
+
     // Producer counters below are owned only by the 250 us Motion runtime.
     std::uint64_t m_startupLagAlignmentEventProducer = 0ULL;
     std::uint64_t m_startupLagArmingTransitionProducer = 0ULL;
@@ -2287,6 +2376,13 @@ private:
         MotionAxisCommand command,
         MotionAxisCommandSequence* outSequence) noexcept;
     void ApplyPendingSafetyAndRecoveryRequests() noexcept;
+    void TriggerGroupMappingIntegrityEmergencyStop(
+        int axisIndex,
+        bool forceExecutionInvalidation = false) noexcept;
+    bool TryPublishGroupMappingIntegrityAlarmRequest(
+        MotionExecutionEpoch executionEpoch) noexcept;
+    void EmergencyStopAllAxesImpl(
+        bool forceExecutionInvalidation) noexcept;
     void ResetAllFaultsImpl(bool publishExecutionEpoch);
     void StopGroupImpl(bool publishExecutionEpoch);
     void DrainAxisCommandMailbox() noexcept;
@@ -2301,9 +2397,17 @@ private:
     std::atomic<std::uint64_t> m_motionOwnerState{ 0ULL };
 
     // bits 0..31 = current Epoch, bit 32 = exact-Epoch Abort Policy,
-    // bits 33..40 = source, bit 63 = RT apply pending.  Initial Epoch is 1
-    // with UNKNOWN source and no pending work.
+    // bits 33..40 = source, bit 62 = RT commit reservation and bit 63 =
+    // RT apply pending. Initial Epoch is 1 with UNKNOWN source and no
+    // pending work.
     std::atomic<std::uint64_t> m_executionEpochPublication{ 1ULL };
+    std::atomic<std::uint64_t> m_lifecycleCommitReservationAttemptCount{ 0ULL };
+    std::atomic<std::uint64_t> m_lifecycleCommitReservationAcquiredCount{ 0ULL };
+    std::atomic<std::uint64_t> m_lifecycleCommitReservationBlockedCount{ 0ULL };
+    std::atomic<std::uint64_t> m_lifecycleCommitReservationCASLostCount{ 0ULL };
+    std::atomic<std::uint64_t> m_lifecycleCommitReservationReleasedCount{ 0ULL };
+    std::atomic<std::uint64_t> m_lifecycleCommitReservationReleaseFailureCount{ 0ULL };
+    std::atomic<std::uint64_t> m_lifecycleCommitReservationPublisherWaitCount{ 0ULL };
     std::atomic<MotionSegmentId> m_nextSegmentId{ 1ULL };
     std::atomic<std::uint64_t> m_staleCommandDiscardCount{ 0ULL };
     std::atomic<std::uint64_t> m_motionOwnerConflictRejectCount{ 0ULL };
@@ -2328,6 +2432,11 @@ private:
         const MotionExecutionIdentity& identity,
         bool producerAccepted,
         MotionRejectReason immediateRejectReason) noexcept;
+    void RejectInvalidProducerMotionCommand(
+        MotionCommand command,
+        MotionExecutionEpoch executionEpoch,
+        MotionCommandSource commandSource,
+        const MotionOwnerLease& ownerLease) noexcept;
 
     // --------------------------------------------------------------------
     // Final Feedback Ring：Runtime Producer -> NC Consumer
@@ -2391,6 +2500,10 @@ private:
     void FaultTrackedMotionCommand(
         std::uint32_t errorCode,
         MotionRejectReason reason) noexcept;
+    bool IsTrackedMotionCommand(
+        const MotionCommand& command) const noexcept;
+    bool IsTerminalizedReplayOrTrackedCommand(
+        const MotionCommand& command) const noexcept;
     void RejectMotionCommand(
         const MotionCommand& command,
         MotionRejectReason reason,
@@ -2404,6 +2517,34 @@ private:
         MotionCommand& command) const noexcept;
     bool TryDequeueNextMotionCommand(MotionCommand& command) noexcept;
     bool TryRequeueMotionCommandFront(const MotionCommand& command) noexcept;
+
+    bool TryAcquireLifecycleCommitReservation(
+        const MotionExecutionIdentity& execution,
+        std::uint64_t& reservationToken) noexcept;
+    void ReleaseLifecycleCommitReservation(
+        std::uint64_t reservationToken) noexcept;
+
+    class LifecycleCommitReservationGuard
+    {
+    public:
+        LifecycleCommitReservationGuard(
+            MotionCore& owner,
+            const MotionExecutionIdentity& execution) noexcept;
+        ~LifecycleCommitReservationGuard() noexcept;
+
+        LifecycleCommitReservationGuard(
+            const LifecycleCommitReservationGuard&) = delete;
+        LifecycleCommitReservationGuard& operator=(
+            const LifecycleCommitReservationGuard&) = delete;
+
+        bool IsAcquired() const noexcept;
+        void Release() noexcept;
+
+    private:
+        MotionCore* m_owner = nullptr;
+        std::uint64_t m_reservationToken = 0ULL;
+    };
+
     MotionExecutionEpoch PublishNewExecutionEpoch(
         MotionCommandSource source,
         bool abortActiveCommand) noexcept;

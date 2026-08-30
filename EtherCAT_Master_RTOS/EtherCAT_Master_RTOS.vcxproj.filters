@@ -366,6 +366,15 @@
     <ClCompile Include="NCAlarmEmergencyStopBoundary.cpp">
       <Filter>Source Files\NC\NC</Filter>
     </ClCompile>
+    <ClCompile Include="NCPreparedBlockQueueShadow.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="inspect_nc02k1_sizes.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPreparedHeadEquivalenceShadow.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -543,6 +552,15 @@
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
     <ClInclude Include="NCAlarmEmergencyStopBoundary.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPreparedBlockQueueShadow.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPreparedHeadEquivalenceShadow.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPreparedHeadCutoverGate.h">
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
   </ItemGroup>

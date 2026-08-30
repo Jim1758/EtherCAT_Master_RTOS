@@ -138,6 +138,9 @@
     <ClInclude Include="NCManager.h" />
     <ClInclude Include="NCPLCManager.h" />
     <ClInclude Include="NCPLCMap.h" />
+    <ClInclude Include="NCPreparedBlockQueueShadow.h" />
+    <ClInclude Include="NCPreparedHeadCutoverGate.h" />
+    <ClInclude Include="NCPreparedHeadEquivalenceShadow.h" />
     <ClInclude Include="NCProgramCache.h" />
     <ClInclude Include="NCProgramEndBoundary.h" />
     <ClInclude Include="NCResetReleaseGate.h" />
@@ -198,6 +201,7 @@
     <ClCompile Include="HMI_Bridge.cpp" />
     <ClCompile Include="HomePersistenceManager.cpp" />
     <ClCompile Include="HomingManager.cpp" />
+    <ClCompile Include="inspect_nc02k1_sizes.cpp" />
     <ClCompile Include="MacroEngine.cpp" />
     <ClCompile Include="MacroParser.cpp" />
     <ClCompile Include="MCode.cpp" />
@@ -221,6 +225,8 @@
     <ClCompile Include="NCManager_PLCSync.cpp" />
     <ClCompile Include="NCManager_SysVars.cpp" />
     <ClCompile Include="NCPLCManager.cpp" />
+    <ClCompile Include="NCPreparedBlockQueueShadow.cpp" />
+    <ClCompile Include="NCPreparedHeadEquivalenceShadow.cpp" />
     <ClCompile Include="NCProgramCache.cpp" />
     <ClCompile Include="NCProgramEndBoundary.cpp" />
     <ClCompile Include="NCResetReleaseGate.cpp" />

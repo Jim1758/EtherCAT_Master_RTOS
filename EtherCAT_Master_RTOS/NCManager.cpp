@@ -54,6 +54,26 @@ namespace
     }
 
 
+    void TriggerMappingIntegrityAlarmOnce(int sourceLineNumber = 0)
+    {
+        AlarmManager& alarms = AlarmManager::GetInstance();
+        for (int alarmIndex = 0;
+            alarmIndex < alarms.GetAlarmCount();
+            ++alarmIndex)
+        {
+            if (alarms.GetAlarmId(alarmIndex) ==
+                AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY)
+            {
+                return;
+            }
+        }
+
+        alarms.Trigger(
+            AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY,
+            sourceLineNumber);
+    }
+
+
     bool TryGetPositiveIntegerAddress(
         const NCBlock& block,
         char address,
@@ -202,21 +222,37 @@ bool NCManager::LoadProgram(const std::string& filepath)
         return false;
     }
 
-    // Only after a complete image exists do we invalidate the old execution.
-    BeginLifecycleInterruptionShadow(
-        NCLifecycleInterruptionCause::PROGRAM_REPLACED,
-        true);
-    CancelProgramEndBoundary();
-    ClearCompletionWaitBoundary(true);
-    CancelGMBlockTransaction(true);
-    CancelSingleBlockShadow(true);
-    CancelFeedHoldBoundaryShadow(true);
-    m_waitCallback = nullptr;
-    ReleaseProgramMotionOwner();
-    const MotionExecutionEpoch replacementEpoch =
-        m_motion.BeginNewExecutionEpoch(
-            MotionCommandSource::NC_MEMORY);
-    RecordLifecycleInterruptionEpochPublished(replacementEpoch);
+    const bool bootstrapProgramLoad =
+        !m_bootProgramImageLoaded &&
+        m_state == NCState::IDLE &&
+        m_programCache.Empty();
+
+    if (!bootstrapProgramLoad)
+    {
+        // Only after a complete replacement image exists do we invalidate
+        // the old execution.  The very first startup image has no old
+        // execution to replace and must not manufacture a PROGRAM_REPLACE
+        // boundary that can be superseded by the retained bootstrap SAFETY
+        // owner before the UI is usable.
+        BeginLifecycleInterruptionShadow(
+            NCLifecycleInterruptionCause::PROGRAM_REPLACED,
+            true);
+        CancelProgramEndBoundary();
+        ClearCompletionWaitBoundary(true);
+        CancelGMBlockTransaction(true);
+        CancelSingleBlockShadow(true);
+        CancelFeedHoldBoundaryShadow(true);
+        m_waitCallback = nullptr;
+        ReleaseProgramMotionOwner();
+        const MotionExecutionEpoch replacementEpoch =
+            m_motion.BeginNewExecutionEpoch(
+                MotionCommandSource::NC_MEMORY);
+        if (replacementEpoch == MOTION_EXECUTION_EPOCH_INVALID)
+        {
+            return false;
+        }
+        RecordLifecycleInterruptionEpochPublished(replacementEpoch);
+    }
 
     const std::size_t pos = filepath.find_last_of("/\\");
     m_mainProgramName =
@@ -285,6 +321,7 @@ bool NCManager::LoadProgram(const std::string& filepath)
 
 
     m_state = NCState::READY;
+    m_bootProgramImageLoaded = true;
     return true;
 }
 
@@ -315,11 +352,67 @@ void NCManager::ChangeState(NCState newState) {
     m_state = newState;
 }
 
+bool NCManager::TryCommitHomingResume(
+    const MotionOwnerLease& expectedHomeLease) noexcept
+{
+    if (!expectedHomeLease.IsValid() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(expectedHomeLease) ||
+        AlarmManager::GetInstance().HasAlarm())
+    {
+        return false;
+    }
+
+    NCState expectedState = NCState::HOLD;
+    if (!m_state.compare_exchange_strong(
+        expectedState,
+        NCState::RUN,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    if (m_motion.IsMotionOwnerLeaseCurrent(expectedHomeLease) &&
+        !AlarmManager::GetInstance().HasAlarm())
+    {
+        return true;
+    }
+
+    // Roll back only our own provisional RUN.  A concurrent Reset/Alarm
+    // state always wins and is never overwritten with HOLD.
+    NCState provisionalRun = NCState::RUN;
+    (void)m_state.compare_exchange_strong(
+        provisionalRun,
+        NCState::HOLD,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+    return false;
+}
+
+void NCManager::TryRollbackHomingResume() noexcept
+{
+    NCState provisionalRun = NCState::RUN;
+    (void)m_state.compare_exchange_strong(
+        provisionalRun,
+        NCState::HOLD,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
 // ==========================================
 // 🌟 升級版 CycleStart (支援 M30 P_END 乾淨重啟)
 // ==========================================
 void NCManager::CycleStart()
 {
+    // A late Alarm may be published after the preceding ProcessTask sample.
+    // No HOLD resume or READY/P_END start may acquire/program Motion before
+    // the next periodic alarm trap observes it.
+    if (AlarmManager::GetInstance().HasAlarm() ||
+        m_state == NCState::ALARM)
+    {
+        return;
+    }
+
     // =========================================================
     // G81 HOME Resume
     //
@@ -330,24 +423,23 @@ void NCManager::CycleStart()
     if (m_state == NCState::HOLD &&
         Homing.IsActive())
     {
-        const bool resumeAccepted =
+        const HomingManager::ResumeResult resumeResult =
             Homing.Resume();
 
-        if (!resumeAccepted)
+        if (resumeResult == HomingManager::ResumeResult::REJECTED ||
+            resumeResult == HomingManager::ResumeResult::SUPERSEDED)
         {
             return;
         }
 
         ObserveFeedHoldResumeRequestedShadow();
 
-
-        // 已完全 PAUSED 時 Resume() 會立即恢復 RUNNING。
-        // 若仍在 HOLD_DECEL_STOP，Resume Request 先排隊，
-        // HomingManager 會在真正停妥後把 NC 切回 RUN。
-        if (!Homing.IsHoldDecelerating())
+        // Homing owns the exact PAUSED->RUNNING commit and never returns
+        // APPLIED until its Alarm/owner admission has completed.  A request
+        // made during controlled deceleration remains latched and is applied
+        // asynchronously at that same protected seam.
+        if (resumeResult == HomingManager::ResumeResult::APPLIED)
         {
-            m_state =
-                NCState::RUN;
             ObserveFeedHoldResumeAppliedShadow();
         }
 
@@ -367,6 +459,11 @@ void NCManager::CycleStart()
     if (m_state == NCState::HOLD &&
         m_singleBlockHoldGate.IsHoldApplied())
     {
+        if (!ArmHoldResumeAlarmAdmission(
+            HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK))
+        {
+            return;
+        }
         (void)ApplyControlledSingleBlockResume();
         return;
     }
@@ -380,6 +477,11 @@ void NCManager::CycleStart()
     // =========================================================
     if (m_state == NCState::HOLD)
     {
+        if (!ArmHoldResumeAlarmAdmission(
+            HoldResumeAdmissionKind::PROGRAM_HOLD))
+        {
+            return;
+        }
         const bool programFeedHoldCandidate =
             IsProgramFeedHoldResumeCandidate();
 
@@ -394,10 +496,9 @@ void NCManager::CycleStart()
                     m_feedHoldBoundaryShadow.GetSnapshot());
 
             if (gateResult ==
-                NCFeedHoldResumeGateRequestResult::DEFERRED ||
-                gateResult ==
-                NCFeedHoldResumeGateRequestResult::BLOCKED)
+                NCFeedHoldResumeGateRequestResult::DEFERRED)
             {
+                m_holdResumeGateControlled = true;
                 // ACK 前只鎖存 Cycle Start。保持 HOLD、Override=0、
                 // Callback/PC/Queue 全部原封不動。
                 m_pauseAfterBlock = false;
@@ -405,8 +506,18 @@ void NCManager::CycleStart()
             }
 
             if (gateResult ==
+                NCFeedHoldResumeGateRequestResult::BLOCKED)
+            {
+                ClearHoldResumeAlarmAdmission(
+                    HoldResumeAdmissionKind::PROGRAM_HOLD);
+                m_pauseAfterBlock = false;
+                return;
+            }
+
+            if (gateResult ==
                 NCFeedHoldResumeGateRequestResult::APPLY_NOW)
             {
+                m_holdResumeGateControlled = true;
                 // 已 ACK：同一個 Gate 立即套用 Resume。
                 (void)ApplyProgramHoldResume(true);
                 return;
@@ -414,8 +525,10 @@ void NCManager::CycleStart()
 
             // BYPASS_LEGACY 只可能發生在 Runtime 回退或 Boundary 已
             // 不再是 PROGRAM Feed Hold，沿用既有 Resume 行為。
+            m_holdResumeGateControlled = false;
         }
 
+        m_holdResumeGateControlled = false;
         (void)ApplyProgramHoldResume(false);
         return;
     }
@@ -434,51 +547,42 @@ void NCManager::CycleStart()
             return;
         }
 
-        CancelSingleBlockShadow(false);
-        CancelFeedHoldBoundaryShadow(false);
-        m_legacySingleBlockPausePending = false;
-
-        if (!AcquireProgramMotionOwner())
+        AlarmManager& startAlarms = AlarmManager::GetInstance();
+        const std::uint32_t alarmUpdateBefore =
+            startAlarms.GetUpdateCount();
+        const std::uint64_t alarmIntentBefore =
+            AlarmManager::MotionAdmissionBaseState(
+                startAlarms.GetMotionSafetyIntentState());
+        const bool alarmPresent = startAlarms.HasAlarm();
+        const std::uint32_t alarmUpdateAfter =
+            startAlarms.GetUpdateCount();
+        const std::uint64_t alarmIntentAfter =
+            AlarmManager::MotionAdmissionBaseState(
+                startAlarms.GetMotionSafetyIntentState());
+        if (alarmPresent ||
+            alarmUpdateBefore != alarmUpdateAfter ||
+            alarmIntentBefore != alarmIntentAfter)
         {
             return;
         }
 
-        // READY / P_END 都代表一個新的 Program Run。上一輪的
-        // Semantic Commit Boundary 不可被新 Execution Epoch 沿用。
-        ResetActiveProgramCommitBoundary();
-
-        if (m_state == NCState::P_END)
-        {
-            GetBasePC() =
-                0;
-
-            Reset_Gode();
-            m_macroStack.clear();
-        }
-
-
-        m_pauseAfterBlock =
-            false;
-
-        // READY / P_END 的 Cycle Start 是全新的執行世代；
-        // HOLD Resume 不會走到這裡，所以不會誤殺暫停中的路徑。
-        const MotionExecutionEpoch executionEpoch =
-            m_motion.BeginNewExecutionEpoch(
-                GetMotionCommandSourceForMode(m_mode));
-
-        // Do not classify this run until the 250 us consumer has observed the
-        // exact Epoch publication.  HasPendingSafetyOrRecoveryRequests() must
-        // continue to include Epoch PENDING for Reset/Stop/Fault fail-closed
-        // protection, so the supervisory side waits instead of weakening the
-        // admission predicate.
-        m_pendingProgramRunExecutionEpoch = executionEpoch;
-        m_pendingProgramRunOwnerLease = m_programMotionLease;
+        // Latch the operator edge before taking Motion owner/Epoch authority.
+        // A benign PDO Alarm reservation is retried by ProcessTask against
+        // this immutable revision; a later Alarm can only cancel it.
+        m_pendingProgramRunPhase =
+            ProgramRunStartPhase::ALARM_ADMISSION;
+        m_pendingProgramRunExecutionEpoch =
+            MOTION_EXECUTION_EPOCH_INVALID;
+        m_pendingProgramRunOwnerLease = MotionOwnerLease{};
         m_pendingProgramRunMode = m_mode;
         m_pendingProgramRunOriginState = m_state;
         m_pendingProgramRunScope = GetBaseProgramScope();
         m_pendingProgramRunCacheGeneration =
             GetBaseProgramCache().GetGeneration();
+        m_pendingProgramRunAlarmUpdateCount = alarmUpdateBefore;
+        m_pendingProgramRunAlarmSafetyIntentState = alarmIntentBefore;
         m_programRunStartPending = true;
+        (void)ProcessPendingProgramRunStart();
     }
 }
 
@@ -542,14 +646,54 @@ void NCManager::FeedHold()
 
 void NCManager::Reset()
 {
+    const bool waitingForResetButtonAdmission =
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::BUTTON_ADMISSION;
+    const bool waitingForResetAuthorityEdge =
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::AUTHORITY_EDGE;
+    const bool continuingResetTransaction =
+        waitingForResetButtonAdmission ||
+        waitingForResetAuthorityEdge ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::PRE_DRAIN ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::AUTHORITY ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::EPOCH ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::CONTROLLED_STOP ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::OUTPUT_HOLD ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::BATCH ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::ALARM_CLEAR ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::CLEANUP ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::SETTLE;
+
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::CLEANUP)
+    {
+        // The NC task which changed ALARM_CLEAR -> CLEANUP owns the bounded
+        // destructive reset section synchronously. A concurrent Reset call
+        // may observe this phase but can never re-enter that section.
+        return;
+    }
+
     // Stage NC-0.2J.5.1：Reset safety batch 尚未完成時，重複 Reset 必須
     // 保持冪等。只有 release gate 已進入 terminal BLOCKED，操作員再次
     // 明確按 Reset 才建立新的 Epoch / request / gate transaction。
-    if (m_state == NCState::RESET_STATE)
+    if (!continuingResetTransaction &&
+        m_state == NCState::RESET_STATE)
     {
         const NCResetReleaseGateSnapshot resetGate =
             m_resetReleaseGate.GetSnapshot();
         const bool terminalBlockedReset =
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::BLOCKED ||
             !resetGate.active &&
             resetGate.blocked &&
             resetGate.phase == NCResetReleaseGatePhase::BLOCKED;
@@ -559,43 +703,752 @@ void NCManager::Reset()
         }
     }
 
-    m_resetNCSettleRequestSequence =
-        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+    if (!continuingResetTransaction)
+    {
+        AlarmManager& resetButtonAlarms = AlarmManager::GetInstance();
+        m_resetAuthorityAlarmUpdateCount =
+            resetButtonAlarms.GetUpdateCount();
+        m_resetAuthorityAlarmSafetyIntentState =
+            AlarmManager::MotionAdmissionBaseState(
+                resetButtonAlarms.GetMotionSafetyIntentState());
+        m_resetAuthorityMappingAlarmRequestCount =
+            m_lastHandledMappingIntegrityAlarmRequestCount;
+        // Do not install the whole-PDO zero-output hold yet.  A normal Reset
+        // must hand the active G00/G01 to the exact SAFETY stop driver first;
+        // the hold is installed only after actual standstill is proved.
+        m_resetButtonCutoffProvenanceGeneration =
+            m_motion.GetSafetyProvenanceGeneration();
+        m_resetControlledStopPublished = false;
 
-    BeginLifecycleInterruptionShadow(
-        NCLifecycleInterruptionCause::RESET,
-        true);
+        // A frame which was already at its physical send point may own the
+        // Alarm reservation for a few microseconds.  Latch the button once
+        // and retry that exact revision/base instead of asking for another
+        // operator press.  Any Alarm sequence drift remains terminal.
+        m_resetContinuationPhase =
+            ResetContinuationPhase::BUTTON_ADMISSION;
+        m_programMotionLease = MotionOwnerLease{};
+        m_state = NCState::RESET_STATE;
+    }
 
-    CancelProgramEndBoundary();
-    if (Homing.IsActive()) Homing.Cancel();
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::BUTTON_ADMISSION)
+    {
+        AlarmManager& resetButtonAlarms = AlarmManager::GetInstance();
+        AlarmManager::MotionAdmissionReservation resetButtonAdmission{};
+        const AlarmManager::MotionAdmissionResult admissionResult =
+            resetButtonAlarms.TryBeginMotionAdmission(
+                m_resetAuthorityAlarmUpdateCount,
+                m_resetAuthorityAlarmSafetyIntentState,
+                resetButtonAdmission,
+                false);
+        if (admissionResult ==
+            AlarmManager::MotionAdmissionResult::BUSY)
+        {
+            return;
+        }
+        if (admissionResult !=
+            AlarmManager::MotionAdmissionResult::ACQUIRED ||
+            resetButtonAdmission.baseState !=
+            m_resetAuthorityAlarmSafetyIntentState ||
+            m_motion.GetSafetyProvenanceGeneration() !=
+            m_resetButtonCutoffProvenanceGeneration)
+        {
+            if (resetButtonAdmission.acquired)
+            {
+                (void)resetButtonAlarms.EndMotionAdmission(
+                    resetButtonAdmission);
+            }
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
 
-    // Safety 取得新的 Generation，讓舊 AUTO / MDI 命令與晚到 Release 失效。
-    m_safetyMotionLease =
-        m_motion.TakeSafetyMotionOwner();
+        if (m_lastHandledMappingIntegrityAlarmRequestCount !=
+            m_resetAuthorityMappingAlarmRequestCount)
+        {
+            (void)resetButtonAlarms.EndMotionAdmission(
+                resetButtonAdmission);
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
 
-    m_programMotionLease =
-        MotionOwnerLease{};
+        m_resetNCSettleRequestSequence =
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
 
-    // Stage NC-0.1B：先切換 Epoch。即使舊 Producer 晚一步派單，
-    // 250 us Motion Runtime 也會依 Epoch 拒絕載入。
+        BeginLifecycleInterruptionShadow(
+            NCLifecycleInterruptionCause::RESET,
+            true);
+
+        const NCLifecycleInterruptionSnapshot resetBoundary =
+            m_lifecycleInterruptionShadow.GetSnapshot();
+        m_resetLifecycleInterruptionSequence =
+            resetBoundary.cause == NCLifecycleInterruptionCause::RESET
+            ? resetBoundary.sequence
+            : 0ULL;
+
+        // RESET now owns the exact lifecycle boundary even when the button
+        // was pressed from an already-latched Alarm. Clear only the generic
+        // latch marker (not AlarmManager) so a genuinely later Alarm can
+        // supersede this immutable button transaction.
+        m_lifecycleInterruptionAlarmLatched = false;
+
+        CancelProgramEndBoundary();
+        if (Homing.IsActive()) Homing.Cancel();
+
+        m_resetAuthorityEntryGeneration =
+            MOTION_OWNER_GENERATION_INVALID;
+        m_resetAuthorityBaselineTicket = 0U;
+        m_resetAuthorityRequestTicket = 0U;
+        m_resetAuthorityProvenanceGeneration = 0ULL;
+        m_resetContinuationExecutionEpoch =
+            MOTION_EXECUTION_EPOCH_INVALID;
+        m_resetContinuationExecutionState =
+            MotionNCResetExecutionState{};
+
+        // Fail closed immediately at the button cutoff. The physical Motion
+        // authority edge is intentionally deferred until any already-finalized
+        // NIC frame has completed, but these baselines are never recaptured.
+        if (!resetButtonAlarms.EndMotionAdmission(
+            resetButtonAdmission) ||
+            resetButtonAlarms.GetUpdateCount() !=
+            m_resetAuthorityAlarmUpdateCount ||
+            AlarmManager::MotionAdmissionBaseState(
+                resetButtonAlarms.GetMotionSafetyIntentState()) !=
+            m_resetAuthorityAlarmSafetyIntentState ||
+            m_motion.GetSafetyProvenanceGeneration() !=
+            m_resetButtonCutoffProvenanceGeneration)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+
+        m_resetContinuationPhase =
+            ResetContinuationPhase::AUTHORITY_EDGE;
+    }
+
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::AUTHORITY_EDGE)
+    {
+        const ResetPreDrainReconcileResult firstReconcile =
+            ReconcileResetPreDrainMappingAlarmBoundary();
+        if (firstReconcile ==
+            ResetPreDrainReconcileResult::DEFERRED)
+        {
+            return;
+        }
+        if (firstReconcile ==
+            ResetPreDrainReconcileResult::SUPERSEDED)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+
+        // Every producer which was already in flight at the button cutoff
+        // must finish before the physical authority edge. A later producer
+        // changes the immutable cutoff and is rejected by Reconcile above.
+        if (m_motion.HasPendingSafetyOrRecoveryRequests())
+        {
+            return;
+        }
+
+        // Close publisher-end, Alarm and mapping seams one last time before
+        // the physical edge. No waiting scan may rebuild these baselines.
+        const ResetPreDrainReconcileResult finalAuthorityReconcile =
+            ReconcileResetPreDrainMappingAlarmBoundary();
+        if (finalAuthorityReconcile ==
+            ResetPreDrainReconcileResult::DEFERRED)
+        {
+            return;
+        }
+        if (finalAuthorityReconcile ==
+            ResetPreDrainReconcileResult::SUPERSEDED)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+
+        const std::uint64_t expectedAuthorityGeneration =
+            m_resetButtonCutoffProvenanceGeneration + 1ULL;
+        const std::uint64_t authorityGeneration =
+            m_motion.MarkResetSafetyOperatorEdge();
+        const NCLifecycleInterruptionSnapshot authorityBoundary =
+            m_lifecycleInterruptionShadow.GetSnapshot();
+        if (expectedAuthorityGeneration == 0ULL ||
+            authorityGeneration != expectedAuthorityGeneration ||
+            m_motion.GetSafetyProvenanceGeneration() !=
+            authorityGeneration ||
+            AlarmManager::GetInstance().GetUpdateCount() !=
+            m_resetAuthorityAlarmUpdateCount ||
+            AlarmManager::MotionAdmissionBaseState(
+                AlarmManager::GetInstance().
+                GetMotionSafetyIntentState()) !=
+            m_resetAuthorityAlarmSafetyIntentState ||
+            m_lastHandledMappingIntegrityAlarmRequestCount !=
+            m_resetAuthorityMappingAlarmRequestCount ||
+            authorityBoundary.sequence !=
+            m_resetLifecycleInterruptionSequence ||
+            authorityBoundary.cause !=
+            NCLifecycleInterruptionCause::RESET)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+
+        m_resetAuthorityProvenanceGeneration = authorityGeneration;
+        m_resetContinuationPhase =
+            ResetContinuationPhase::PRE_DRAIN;
+    }
+
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::PRE_DRAIN)
+    {
+        const ResetPreDrainReconcileResult firstPreDrainReconcile =
+            ReconcileResetPreDrainMappingAlarmBoundary();
+        if (firstPreDrainReconcile ==
+            ResetPreDrainReconcileResult::DEFERRED)
+        {
+            return;
+        }
+        if (firstPreDrainReconcile ==
+            ResetPreDrainReconcileResult::SUPERSEDED)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+
+        const NCLifecycleInterruptionSnapshot preDrainBoundary =
+            m_lifecycleInterruptionShadow.GetSnapshot();
+        if (m_resetLifecycleInterruptionSequence == 0ULL ||
+            preDrainBoundary.sequence !=
+            m_resetLifecycleInterruptionSequence ||
+            preDrainBoundary.cause !=
+            NCLifecycleInterruptionCause::RESET)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+
+        // The Reset baseline is captured only after every action which was
+        // already pending at the operator edge has reached RT.  Otherwise an
+        // old Stop/ResetFault action can publish H2 after this Reset recorded
+        // the fresh G/H acknowledgement and force a second button press.
+        if (m_motion.HasPendingSafetyOrRecoveryRequests())
+        {
+            return;
+        }
+
+        // Close the final publisher-end -> baseline-capture seam.  A mapping
+        // producer which began before the operator edge may publish its NC
+        // mailbox after the first reconciliation.  The Motion pending check
+        // above now includes that mailbox; this second exact pass consumes it
+        // before the immutable owner/ticket baseline is sampled.
+        const ResetPreDrainReconcileResult finalPreDrainReconcile =
+            ReconcileResetPreDrainMappingAlarmBoundary();
+        if (finalPreDrainReconcile ==
+            ResetPreDrainReconcileResult::DEFERRED)
+        {
+            return;
+        }
+        if (finalPreDrainReconcile ==
+            ResetPreDrainReconcileResult::SUPERSEDED)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+        const MotionCore::ResetSafetyAuthorityResult baseline =
+            m_motion.TryCaptureResetSafetyAuthorityBaseline(
+                m_resetAuthorityProvenanceGeneration);
+        if (baseline.status ==
+            MotionCore::ResetSafetyAuthorityStatus::SUPERSEDED)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+        if (baseline.status !=
+            MotionCore::ResetSafetyAuthorityStatus::ACQUIRED)
+        {
+            return;
+        }
+
+        m_resetAuthorityEntryGeneration =
+            baseline.lease.generation;
+        m_resetAuthorityBaselineTicket =
+            baseline.requestTicket;
+        m_resetContinuationPhase =
+            ResetContinuationPhase::AUTHORITY;
+    }
+
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::AUTHORITY)
+    {
+        // Safety 取得新的 Generation，讓舊 AUTO / MDI 命令與晚到 Release
+        // 失效。Every retry joins the original entry generation.
+        const MotionCore::ResetSafetyAuthorityResult authority =
+            m_motion.ContinueResetSafetyMotionOwnerGeneration(
+                m_resetAuthorityEntryGeneration,
+                m_resetAuthorityBaselineTicket,
+                m_resetAuthorityRequestTicket,
+                m_resetAuthorityProvenanceGeneration);
+        m_resetAuthorityRequestTicket = authority.requestTicket;
+        m_resetAuthorityProvenanceGeneration =
+            authority.provenanceGeneration;
+
+        if (authority.status ==
+            MotionCore::ResetSafetyAuthorityStatus::SUPERSEDED)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+        if (authority.status !=
+            MotionCore::ResetSafetyAuthorityStatus::ACQUIRED ||
+            !authority.lease.IsValid() ||
+            !m_motion.IsMotionOwnerLeaseCurrent(authority.lease))
+        {
+            return;
+        }
+        m_safetyMotionLease = authority.lease;
+        m_resetContinuationPhase =
+            ResetContinuationPhase::EPOCH;
+        // Do not fall through.  The 250 us owner must first consume the
+        // published SAFETY Epoch (and any older E-stop mailbox) before this
+        // Reset is allowed to publish its correlated batch.
+        return;
+    }
+
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::EPOCH)
+    {
+        // The fresh SAFETY-generation handshake already published the one
+        // Reset Epoch. Latch its exact generation acknowledgement instead of
+        // sampling a mutable live Epoch or publishing a second one.
+        MotionExecutionEpoch acknowledgedResetEpoch =
+            MOTION_EXECUTION_EPOCH_INVALID;
+        const MotionCore::ResetSafetyAuthorityStatus epochStatus =
+            m_motion.TryGetResetSafetyMotionOwnerEpoch(
+                m_safetyMotionLease,
+                m_resetAuthorityRequestTicket,
+                m_resetAuthorityProvenanceGeneration,
+                acknowledgedResetEpoch);
+        if (epochStatus ==
+            MotionCore::ResetSafetyAuthorityStatus::DEFERRED)
+        {
+            return;
+        }
+        if (epochStatus !=
+            MotionCore::ResetSafetyAuthorityStatus::ACQUIRED)
+        {
+            // ContinueNewSafetyMotionOwnerGeneration() returns a valid lease
+            // only after its exact owner/Epoch acknowledgement exists.  A
+            // later mismatch therefore means another lifecycle publication
+            // superseded this Reset; waiting cannot make the old tuple valid.
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+        m_resetContinuationExecutionEpoch =
+            acknowledgedResetEpoch;
+        m_resetContinuationPhase =
+            ResetContinuationPhase::CONTROLLED_STOP;
+        return;
+    }
+
     const MotionExecutionEpoch resetEpoch =
-        m_motion.BeginNewExecutionEpoch(
-            MotionCommandSource::SAFETY);
-    RecordLifecycleInterruptionEpochPublished(resetEpoch);
+        m_resetContinuationExecutionEpoch;
+    MotionExecutionEpoch exactResetEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    const MotionCore::ResetSafetyAuthorityStatus exactResetStatus =
+        m_motion.TryGetResetSafetyMotionOwnerEpoch(
+            m_safetyMotionLease,
+            m_resetAuthorityRequestTicket,
+            m_resetAuthorityProvenanceGeneration,
+            exactResetEpoch);
+    if (exactResetStatus ==
+        MotionCore::ResetSafetyAuthorityStatus::DEFERRED)
+    {
+        return;
+    }
+    const NCLifecycleInterruptionSnapshot resetBoundary =
+        m_lifecycleInterruptionShadow.GetSnapshot();
+    const bool resetBoundaryIdentityCurrent =
+        m_resetLifecycleInterruptionSequence != 0ULL &&
+        resetBoundary.sequence ==
+        m_resetLifecycleInterruptionSequence &&
+        resetBoundary.cause ==
+        NCLifecycleInterruptionCause::RESET &&
+        (m_resetContinuationPhase ==
+            ResetContinuationPhase::CONTROLLED_STOP ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::OUTPUT_HOLD ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::BATCH ||
+            resetBoundary.publishedExecutionEpoch == resetEpoch);
+    if ((m_resetContinuationPhase !=
+        ResetContinuationPhase::CONTROLLED_STOP &&
+        m_resetContinuationPhase !=
+        ResetContinuationPhase::OUTPUT_HOLD &&
+        m_resetContinuationPhase !=
+        ResetContinuationPhase::BATCH &&
+        m_resetContinuationPhase !=
+        ResetContinuationPhase::ALARM_CLEAR &&
+        m_resetContinuationPhase !=
+        ResetContinuationPhase::SETTLE) ||
+        resetEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        exactResetStatus !=
+        MotionCore::ResetSafetyAuthorityStatus::ACQUIRED ||
+        exactResetEpoch != resetEpoch ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease) ||
+        m_motion.GetCurrentExecutionEpoch() != resetEpoch ||
+        !resetBoundaryIdentityCurrent ||
+        AlarmManager::GetInstance().GetUpdateCount() !=
+        m_resetAuthorityAlarmUpdateCount ||
+        AlarmManager::MotionAdmissionBaseState(
+            AlarmManager::GetInstance().
+            GetMotionSafetyIntentState()) !=
+        m_resetAuthorityAlarmSafetyIntentState)
+    {
+        m_resetContinuationPhase =
+            ResetContinuationPhase::BLOCKED;
+        m_motion.RequestEmergencyStopAllAxes();
+        return;
+    }
+
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::CONTROLLED_STOP)
+    {
+        if (!m_resetControlledStopPublished)
+        {
+            const MotionCore::ResetSafetyAuthorityResult controlledStop =
+                m_motion.RequestExactResetSafetyBatch(
+                    resetEpoch,
+                    m_safetyMotionLease,
+                    m_resetAuthorityRequestTicket,
+                    m_resetAuthorityProvenanceGeneration,
+                    false,
+                    true);
+            m_resetAuthorityRequestTicket = controlledStop.requestTicket;
+            m_resetAuthorityProvenanceGeneration =
+                controlledStop.provenanceGeneration;
+            if (controlledStop.status ==
+                MotionCore::ResetSafetyAuthorityStatus::DEFERRED)
+            {
+                return;
+            }
+            if (controlledStop.status !=
+                MotionCore::ResetSafetyAuthorityStatus::ACQUIRED)
+            {
+                m_resetContinuationPhase =
+                    ResetContinuationPhase::BLOCKED;
+                m_motion.RequestEmergencyStopAllAxes();
+                return;
+            }
+
+            m_resetControlledStopPublished = true;
+            return;
+        }
+
+        // The controlled-stop child ticket remains unacknowledged while RT
+        // is decelerating.  Proceed only after the RT settle publication
+        // proves that the active group and all physical axes are stationary.
+        const MotionStopSettleSnapshot stopSettle =
+            m_motion.GetStopSettleSnapshot();
+        if (m_motion.HasPendingSafetyOrRecoveryRequests() ||
+            !stopSettle.standstill ||
+            stopSettle.groupActive)
+        {
+            return;
+        }
+
+        m_resetContinuationPhase = ResetContinuationPhase::OUTPUT_HOLD;
+        return;
+    }
+
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::OUTPUT_HOLD)
+    {
+        // This is intentionally after CONTROLLED_STOP.  It seals remaining
+        // PDO output and prevents a fresh command from entering while the
+        // final Reset batch, rebase, and owner-release proof complete.
+        if (!m_resetSafetyOutputHoldActive)
+        {
+            (void)m_motion.BeginResetSafetyOutputHold();
+            m_resetSafetyOutputHoldActive = true;
+            return;
+        }
+        if (m_motion.HasPendingSafetyOrRecoveryRequests() ||
+            !m_motion.IsResetSafetyOutputHoldEstablished())
+        {
+            return;
+        }
+        m_resetContinuationPhase = ResetContinuationPhase::BATCH;
+        return;
+    }
+
+    // Queue Full is a bounded producer result, not a reason to require a
+    // second operator Reset.  BATCH performs every destructive/modal action
+    // exactly once and saves the clean execution image.  SETTLE only retries
+    // publishing that same immutable request until its SPSC release-push
+    // succeeds, then and only then arms the release gate.
+    const auto TryPublishResetSettleAndArmGate =
+        [this, resetEpoch]() noexcept -> bool
+    {
+        if (m_resetContinuationPhase !=
+            ResetContinuationPhase::SETTLE ||
+            resetEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+            !m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease) ||
+            m_motion.GetCurrentExecutionEpoch() != resetEpoch ||
+            m_resetLifecycleInterruptionSequence == 0ULL ||
+            AlarmManager::GetInstance().GetUpdateCount() !=
+            m_resetAuthorityAlarmUpdateCount ||
+            AlarmManager::MotionAdmissionBaseState(
+                AlarmManager::GetInstance().
+                GetMotionSafetyIntentState()) !=
+            m_resetAuthorityAlarmSafetyIntentState)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return false;
+        }
+
+        MotionExecutionEpoch exactArmEpoch =
+            MOTION_EXECUTION_EPOCH_INVALID;
+        const MotionCore::ResetSafetyAuthorityStatus exactArmStatus =
+            m_motion.TryGetResetSafetyMotionOwnerEpoch(
+                m_safetyMotionLease,
+                m_resetAuthorityRequestTicket,
+                m_resetAuthorityProvenanceGeneration,
+                exactArmEpoch);
+        if (exactArmStatus ==
+            MotionCore::ResetSafetyAuthorityStatus::DEFERRED)
+        {
+            return false;
+        }
+        if (exactArmStatus !=
+            MotionCore::ResetSafetyAuthorityStatus::ACQUIRED ||
+            exactArmEpoch != resetEpoch)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return false;
+        }
+
+        const NCLifecycleInterruptionSnapshot armBoundary =
+            m_lifecycleInterruptionShadow.GetSnapshot();
+        if (armBoundary.sequence !=
+            m_resetLifecycleInterruptionSequence ||
+            armBoundary.cause !=
+            NCLifecycleInterruptionCause::RESET ||
+            armBoundary.publishedExecutionEpoch != resetEpoch)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return false;
+        }
+
+        const MotionNCSettleRequestSequence requestSequence =
+            m_motion.RequestResetNCSettleAndRebase(
+                resetEpoch,
+                m_safetyMotionLease,
+                m_resetAuthorityRequestTicket,
+                m_resetAuthorityProvenanceGeneration,
+                m_resetContinuationExecutionState,
+                false);
+        if (requestSequence ==
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID)
+        {
+            // Preserve SETTLE and the exact immutable tuple. ProcessTask()
+            // retries automatically after pending safety work has drained.
+            return false;
+        }
+
+        m_resetNCSettleRequestSequence = requestSequence;
+        m_resetReleaseGate.Arm(
+            armBoundary,
+            resetEpoch,
+            m_safetyMotionLease,
+            m_resetNCSettleRequestSequence,
+            m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease));
+        m_resetContinuationPhase =
+            ResetContinuationPhase::RELEASE_GATE;
+        m_resetAuthorityEntryGeneration =
+            MOTION_OWNER_GENERATION_INVALID;
+        return true;
+    };
+
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::SETTLE)
+    {
+        if (m_motion.HasPendingSafetyOrRecoveryRequests())
+        {
+            return;
+        }
+        (void)TryPublishResetSettleAndArmGate();
+        return;
+    }
+
+    if (m_motion.HasPendingSafetyOrRecoveryRequests())
+    {
+        return;
+    }
+
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::BATCH)
+    {
+        const bool resetNeedsFaultOrEstopRecovery =
+            m_motion.IsAnyAxisFaulted() ||
+            m_motion.IsGroupFaulted() ||
+            m_motion.IsGroupEmergencyStopped();
+        const MotionCore::ResetSafetyAuthorityResult resetBatch =
+            m_motion.RequestExactResetSafetyBatch(
+                resetEpoch,
+                m_safetyMotionLease,
+                m_resetAuthorityRequestTicket,
+                m_resetAuthorityProvenanceGeneration,
+                resetNeedsFaultOrEstopRecovery);
+        m_resetAuthorityRequestTicket = resetBatch.requestTicket;
+        m_resetAuthorityProvenanceGeneration =
+            resetBatch.provenanceGeneration;
+        if (resetBatch.status ==
+            MotionCore::ResetSafetyAuthorityStatus::DEFERRED)
+        {
+            return;
+        }
+        if (resetBatch.status !=
+            MotionCore::ResetSafetyAuthorityStatus::ACQUIRED)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+
+        RecordLifecycleInterruptionEpochPublished(resetEpoch);
+        const NCLifecycleInterruptionSnapshot publishedResetBoundary =
+            m_lifecycleInterruptionShadow.GetSnapshot();
+        if (publishedResetBoundary.sequence !=
+            m_resetLifecycleInterruptionSequence ||
+            publishedResetBoundary.cause !=
+            NCLifecycleInterruptionCause::RESET ||
+            publishedResetBoundary.publishedExecutionEpoch != resetEpoch)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+
+        // Persist the fact that the child batch was published before any
+        // Alarm-clear retry. A transient PDO reservation can delay the next
+        // phase, but no scan is allowed to publish this batch a second time.
+        m_resetContinuationPhase =
+            ResetContinuationPhase::ALARM_CLEAR;
+        return;
+    }
+
+    // The old Alarm image is acknowledged exactly once, only after the
+    // correlated SAFETY batch is published and consumed. A frame reservation
+    // is ordinary BUSY and retains ALARM_CLEAR; every Alarm sequence drift is
+    // SUPERSEDED and therefore preserves the newer Alarm fail-closed.
+    AlarmManager& resetAlarms = AlarmManager::GetInstance();
+    AlarmManager::MotionAdmissionReservation clearAdmission{};
+    const AlarmManager::MotionAdmissionResult clearAdmissionResult =
+        resetAlarms.TryBeginMotionAdmission(
+            m_resetAuthorityAlarmUpdateCount,
+            m_resetAuthorityAlarmSafetyIntentState,
+            clearAdmission,
+            false);
+    if (clearAdmissionResult ==
+        AlarmManager::MotionAdmissionResult::BUSY)
+    {
+        return;
+    }
+    if (clearAdmissionResult !=
+        AlarmManager::MotionAdmissionResult::ACQUIRED ||
+        clearAdmission.baseState !=
+        m_resetAuthorityAlarmSafetyIntentState)
+    {
+        m_resetContinuationPhase =
+            ResetContinuationPhase::BLOCKED;
+        m_motion.RequestEmergencyStopAllAxes();
+        return;
+    }
+
+    MotionExecutionEpoch clearExactEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    const MotionCore::ResetSafetyAuthorityStatus clearExactStatus =
+        m_motion.TryGetResetSafetyMotionOwnerEpoch(
+            m_safetyMotionLease,
+            m_resetAuthorityRequestTicket,
+            m_resetAuthorityProvenanceGeneration,
+            clearExactEpoch);
+    const NCLifecycleInterruptionSnapshot clearBoundary =
+        m_lifecycleInterruptionShadow.GetSnapshot();
+    if (clearExactStatus !=
+        MotionCore::ResetSafetyAuthorityStatus::ACQUIRED ||
+        clearExactEpoch != resetEpoch ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease) ||
+        m_motion.GetCurrentExecutionEpoch() != resetEpoch ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        clearBoundary.sequence !=
+        m_resetLifecycleInterruptionSequence ||
+        clearBoundary.cause !=
+        NCLifecycleInterruptionCause::RESET ||
+        clearBoundary.publishedExecutionEpoch != resetEpoch)
+    {
+        (void)resetAlarms.EndMotionAdmission(clearAdmission);
+        m_resetContinuationPhase =
+            ResetContinuationPhase::BLOCKED;
+        m_motion.RequestEmergencyStopAllAxes();
+        return;
+    }
+
+    if (!resetAlarms.ClearUnderMotionAdmission(clearAdmission))
+    {
+        (void)resetAlarms.EndMotionAdmission(clearAdmission);
+        m_resetContinuationPhase =
+            ResetContinuationPhase::BLOCKED;
+        m_motion.RequestEmergencyStopAllAxes();
+        return;
+    }
+
+    const std::uint32_t postClearAlarmUpdateCount =
+        clearAdmission.expectedUpdateCount;
+    const std::uint64_t postClearAlarmIntentState =
+        clearAdmission.baseState;
+    // Claim the destructive section before releasing the admission. The
+    // owning NC call remains synchronous; every concurrent Reset/ProcessTask
+    // observes CLEANUP and returns instead of repeating modal/cache cleanup.
+    m_resetContinuationPhase = ResetContinuationPhase::CLEANUP;
 
 
     //重置馬達區塊--------------------------------------------------
-    const bool resetNeedsFaultOrEstopRecovery =
-        m_motion.IsAnyAxisFaulted() ||
-        m_motion.IsGroupFaulted() ||
-        m_motion.IsGroupEmergencyStopped();
-
-    // Stage NC-0.2J.2：Reset 是唯一的頂層 Epoch owner。
-    // ResetAllFaults + controlled Stop 由 250 us Runtime 當成同一個
-    // correlated safety batch 執行，不允許每個 leaf 再各自發布 Epoch。
-    m_motion.RequestResetSafetyBatch(
-        resetEpoch,
-        resetNeedsFaultOrEstopRecovery);
+    // The correlated RT batch was already published above through the exact
+    // parent-ticket -> child-ticket transition.  Only after that immutable
+    // publication succeeds may this Reset perform destructive modal cleanup.
 
     // 🌟 [新增] 如果有放電跳刀/排渣，必須強制解鎖跳刀狀態機！
     // m_motion.ResetAllFaults(); // (如果您有寫清除跳刀狀態的 API，建議在這裡呼叫)
@@ -674,24 +1527,7 @@ void NCManager::Reset()
     // pending safety work、Epoch、Owner、軸狀態與速度。若把 recovery 需求
     // 傳成 unsupported，第一次 Reset 即使已清除 ESTOP 也會被永久 BLOCKED，
     // 操作員便被迫再按一次 Reset 才能建立可接受的新交易。
-    constexpr bool resetRebaseUnsupported = false;
-
-    m_resetNCSettleRequestSequence =
-        m_motion.RequestResetNCSettleAndRebase(
-            resetEpoch,
-            m_safetyMotionLease,
-            resetExecutionState,
-            resetRebaseUnsupported);
-
-    // The release gate is armed only after the exact RT transaction sequence
-    // exists.  A zero/rejected request therefore remains fail-closed in
-    // RESET_STATE and cannot fall back to legacy standstill.
-    m_resetReleaseGate.Arm(
-        m_lifecycleInterruptionShadow.GetSnapshot(),
-        resetEpoch,
-        m_safetyMotionLease,
-        m_resetNCSettleRequestSequence,
-        m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease));
+    m_resetContinuationExecutionState = resetExecutionState;
 
     //m_motion.EmergencyStopGroup();//急停
     //m_motion.ResetAllFaults();//軸清除錯誤
@@ -728,13 +1564,74 @@ void NCManager::Reset()
     std::swap(m_blockQueue, empty);
     m_waitCallback = nullptr;
 
+    // Keep the exact Alarm reservation across the bounded destructive NC
+    // cleanup.  A producer which overlaps this section is never allowed to
+    // wait; AlarmManager records it in the deferred slot.  End is therefore
+    // the commit point: it promotes any overlap and makes this Reset
+    // terminal BLOCKED instead of allowing the stale quiet image to reach
+    // SETTLE.
+    const bool clearAdmissionEnded =
+        resetAlarms.EndMotionAdmission(clearAdmission);
+    const std::uint32_t alarmUpdateAfterCleanup =
+        resetAlarms.GetUpdateCount();
+    const std::uint64_t alarmIntentAfterCleanup =
+        AlarmManager::MotionAdmissionBaseState(
+            resetAlarms.GetMotionSafetyIntentState());
+    MotionExecutionEpoch cleanupExactEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    const MotionCore::ResetSafetyAuthorityStatus cleanupExactStatus =
+        m_motion.TryGetResetSafetyMotionOwnerEpoch(
+            m_safetyMotionLease,
+            m_resetAuthorityRequestTicket,
+            m_resetAuthorityProvenanceGeneration,
+            cleanupExactEpoch);
+    const NCLifecycleInterruptionSnapshot cleanupBoundary =
+        m_lifecycleInterruptionShadow.GetSnapshot();
+    if (!clearAdmissionEnded ||
+        alarmUpdateAfterCleanup != postClearAlarmUpdateCount ||
+        alarmIntentAfterCleanup != postClearAlarmIntentState ||
+        resetAlarms.HasAlarm() ||
+        cleanupExactStatus !=
+        MotionCore::ResetSafetyAuthorityStatus::ACQUIRED ||
+        cleanupExactEpoch != resetEpoch ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease) ||
+        m_motion.GetCurrentExecutionEpoch() != resetEpoch ||
+        m_motion.GetSafetyProvenanceGeneration() !=
+        m_resetAuthorityProvenanceGeneration ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        m_lastHandledMappingIntegrityAlarmRequestCount !=
+        m_resetAuthorityMappingAlarmRequestCount ||
+        cleanupBoundary.sequence !=
+        m_resetLifecycleInterruptionSequence ||
+        cleanupBoundary.cause !=
+        NCLifecycleInterruptionCause::RESET ||
+        cleanupBoundary.publishedExecutionEpoch != resetEpoch)
+    {
+        m_resetContinuationPhase =
+            ResetContinuationPhase::BLOCKED;
+        m_state = NCState::RESET_STATE;
+        m_motion.RequestEmergencyStopAllAxes();
+        return;
+    }
 
-
-    //重置Alarm--------------------------------------------------
-    AlarmManager::GetInstance().Clear();
-
-
+    // Alarm was cleared once at the BATCH safety boundary above.  Commit
+    // the post-clear identity only after admission End proves that the whole
+    // cleanup was quiet. SETTLE retries never clear Alarm again; every later
+    // Alarm owns a newer lifecycle boundary and blocks this transaction.
+    m_resetAuthorityAlarmUpdateCount = postClearAlarmUpdateCount;
+    m_resetAuthorityAlarmSafetyIntentState = postClearAlarmIntentState;
     m_state = NCState::RESET_STATE;
+
+    // All BATCH work above is exactly-once.  From this point a failed ring
+    // push can only retry the saved tuple; it cannot clear modal/macro state
+    // again or publish another Safety batch/Epoch.
+    m_resetContinuationPhase =
+        ResetContinuationPhase::SETTLE;
+    // Do not publish the settle request in this same call.  The next scan
+    // first proves that the correlated Reset safety batch has been consumed;
+    // otherwise an older/higher-priority E-stop branch could clear the batch
+    // after the settle request was already visible.
+    return;
 
 
 
@@ -1022,6 +1919,11 @@ void NCManager::BeginLifecycleInterruptionShadow(
     NCLifecycleInterruptionCause cause,
     bool expectsEpochChange) noexcept
 {
+    // Any newly opened lifecycle interruption supersedes an older deferred
+    // GOTO tail rebase.  The GOTO path arms its replacement identity only
+    // after publishing and validating the new Epoch below its Begin() call.
+    ClearPendingGotoQueueTailRebase();
+
     NCLifecycleInterruptionSample sample =
         BuildLifecycleInterruptionSample();
 
@@ -1192,6 +2094,237 @@ void NCManager::ObserveAlarmEmergencyStopShadow() noexcept
 // ============================================================================
 // Stage NC-0.1D - NC Motion Feedback Snapshot / Counters
 // ============================================================================
+NCManager::ResetPreDrainReconcileResult
+NCManager::ReconcileResetPreDrainMappingAlarmBoundary() noexcept
+{
+    const bool waitingForAuthorityEdge =
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::AUTHORITY_EDGE;
+    if (!waitingForAuthorityEdge &&
+        m_resetContinuationPhase !=
+        ResetContinuationPhase::PRE_DRAIN)
+    {
+        return ResetPreDrainReconcileResult::READY;
+    }
+
+    // AUTHORITY_EDGE uses the immutable button cutoff; PRE_DRAIN uses the later
+    // physical Motion authority edge. A producer which began before the
+    // selected boundary may publish its mailbox later without advancing the
+    // generation. Every producer which begins after it must advance first.
+    const std::uint64_t expectedProvenanceGeneration =
+        waitingForAuthorityEdge
+        ? m_resetButtonCutoffProvenanceGeneration
+        : m_resetAuthorityProvenanceGeneration;
+    if ((!waitingForAuthorityEdge &&
+        expectedProvenanceGeneration == 0ULL) ||
+        m_motion.GetSafetyProvenanceGeneration() !=
+        expectedProvenanceGeneration)
+    {
+        return ResetPreDrainReconcileResult::SUPERSEDED;
+    }
+
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    AlarmManager::MotionAdmissionReservation alarmAdmission{};
+    const AlarmManager::MotionAdmissionResult admissionResult =
+        alarms.TryBeginMotionAdmission(
+            m_resetAuthorityAlarmUpdateCount,
+            m_resetAuthorityAlarmSafetyIntentState,
+            alarmAdmission,
+            false);
+    if (admissionResult ==
+        AlarmManager::MotionAdmissionResult::BUSY)
+    {
+        return ResetPreDrainReconcileResult::DEFERRED;
+    }
+    if (admissionResult !=
+        AlarmManager::MotionAdmissionResult::ACQUIRED ||
+        alarmAdmission.baseState !=
+        m_resetAuthorityAlarmSafetyIntentState)
+    {
+        return ResetPreDrainReconcileResult::SUPERSEDED;
+    }
+
+    const auto endAsSuperseded = [&alarms,
+        &alarmAdmission]() noexcept
+        -> ResetPreDrainReconcileResult
+    {
+        (void)alarms.EndMotionAdmission(alarmAdmission);
+        return ResetPreDrainReconcileResult::SUPERSEDED;
+    };
+
+    const std::uint64_t handledRequestBefore =
+        m_lastHandledMappingIntegrityAlarmRequestCount;
+    if (handledRequestBefore !=
+        m_resetAuthorityMappingAlarmRequestCount)
+    {
+        // An Alarm or mapping request was materialized outside this exact
+        // classification window.  It cannot be absorbed by the old Reset.
+        return endAsSuperseded();
+    }
+
+    const NCLifecycleInterruptionSnapshot boundaryBefore =
+        m_lifecycleInterruptionShadow.GetSnapshot();
+    if (m_resetLifecycleInterruptionSequence == 0ULL ||
+        boundaryBefore.sequence !=
+        m_resetLifecycleInterruptionSequence ||
+        boundaryBefore.cause !=
+        NCLifecycleInterruptionCause::RESET ||
+        m_motion.GetSafetyProvenanceGeneration() !=
+        expectedProvenanceGeneration)
+    {
+        return endAsSuperseded();
+    }
+
+    const MotionP1HandoverSafetySnapshot mappingBefore =
+        m_motion.GetP1HandoverSafetySnapshot();
+    if (!mappingBefore.mappingIntegrityAlarmPending)
+    {
+        // A pre-edge producer may still be between its provenance operation
+        // and mailbox publication.  Leave PRE_DRAIN intact; the next NC scan
+        // will classify the exact published request before draining feedback.
+        const std::uint32_t candidateAlarmUpdateCount =
+            alarmAdmission.expectedUpdateCount;
+        const std::uint64_t candidateAlarmIntentState =
+            alarmAdmission.baseState;
+        if (!alarms.EndMotionAdmission(alarmAdmission) ||
+            alarms.GetUpdateCount() != candidateAlarmUpdateCount ||
+            AlarmManager::MotionAdmissionBaseState(
+                alarms.GetMotionSafetyIntentState()) !=
+            candidateAlarmIntentState ||
+            m_motion.GetSafetyProvenanceGeneration() !=
+            expectedProvenanceGeneration)
+        {
+            return ResetPreDrainReconcileResult::SUPERSEDED;
+        }
+        return ResetPreDrainReconcileResult::READY;
+    }
+
+    const std::uint64_t capturedRequest =
+        mappingBefore.mappingIntegrityAlarmRequests;
+    if (capturedRequest == 0ULL)
+    {
+        return endAsSuperseded();
+    }
+
+    const bool requestAlreadyMaterialized =
+        capturedRequest == handledRequestBefore;
+    bool mappingAlarmPresentBefore = false;
+    for (int alarmIndex = 0;
+        alarmIndex < alarms.GetAlarmCount();
+        ++alarmIndex)
+    {
+        if (alarms.GetAlarmId(alarmIndex) ==
+            AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY)
+        {
+            mappingAlarmPresentBefore = true;
+            break;
+        }
+    }
+
+    if (!requestAlreadyMaterialized)
+    {
+        if (!mappingAlarmPresentBefore)
+        {
+            if (!alarms.TriggerUnderMotionAdmission(
+                alarmAdmission,
+                AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY,
+                0,
+                mappingBefore.lastOrphanAxisIndex))
+            {
+                return endAsSuperseded();
+            }
+        }
+
+        bool formalMappingAlarmPresent = false;
+        for (int alarmIndex = 0;
+            alarmIndex < alarms.GetAlarmCount();
+            ++alarmIndex)
+        {
+            if (alarms.GetAlarmId(alarmIndex) ==
+                AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY)
+            {
+                formalMappingAlarmPresent = true;
+                break;
+            }
+        }
+        if (!formalMappingAlarmPresent && !alarms.HasAlarm())
+        {
+            return endAsSuperseded();
+        }
+
+        // Preserve the original operator RESET lifecycle sequence.  Replacing
+        // it with ALARM and then opening a new RESET boundary would put an
+        // already-published causal terminal before the new baseline and lose
+        // its interruption accounting.  Alarm-stop diagnostics remain a
+        // separate observer and do not own the lifecycle boundary here.
+    }
+
+    const bool acknowledged =
+        m_motion.AcknowledgeP1MappingIntegrityAlarmRequest(
+            capturedRequest);
+    const MotionP1HandoverSafetySnapshot mappingAfter =
+        m_motion.GetP1HandoverSafetySnapshot();
+    const std::uint64_t provenanceAfter =
+        m_motion.GetSafetyProvenanceGeneration();
+    const bool capturedRequestRetired =
+        mappingAfter.mappingIntegrityAlarmRequests ==
+        capturedRequest &&
+        !mappingAfter.mappingIntegrityAlarmPending;
+    const bool nextPreEdgeRequestPending =
+        mappingAfter.mappingIntegrityAlarmRequests != 0ULL &&
+        mappingAfter.mappingIntegrityAlarmRequests !=
+        capturedRequest &&
+        mappingAfter.mappingIntegrityAlarmPending;
+    if (!acknowledged ||
+        provenanceAfter !=
+        expectedProvenanceGeneration ||
+        (!capturedRequestRetired &&
+            !nextPreEdgeRequestPending) ||
+        !alarms.IsMotionAdmissionCurrent(alarmAdmission))
+    {
+        return endAsSuperseded();
+    }
+
+    const std::uint32_t candidateAlarmUpdateCount =
+        alarmAdmission.expectedUpdateCount;
+    const std::uint64_t candidateAlarmIntentState =
+        alarmAdmission.baseState;
+
+    // A second producer may also have linearized before the operator edge but
+    // been unable to publish into the single P1 slot until this exact ACK.
+    // Stable provenance proves it is still pre-edge.  Keep PRE_DRAIN and let
+    // the next bounded NC pass materialize that newer immutable sequence.
+
+    const NCLifecycleInterruptionSnapshot boundaryBeforeEnd =
+        m_lifecycleInterruptionShadow.GetSnapshot();
+    if (boundaryBeforeEnd.sequence !=
+        m_resetLifecycleInterruptionSequence ||
+        boundaryBeforeEnd.cause !=
+        NCLifecycleInterruptionCause::RESET ||
+        !alarms.EndMotionAdmission(alarmAdmission) ||
+        alarms.GetUpdateCount() != candidateAlarmUpdateCount ||
+        AlarmManager::MotionAdmissionBaseState(
+            alarms.GetMotionSafetyIntentState()) !=
+        candidateAlarmIntentState ||
+        m_motion.GetSafetyProvenanceGeneration() !=
+        expectedProvenanceGeneration)
+    {
+        return ResetPreDrainReconcileResult::SUPERSEDED;
+    }
+
+    m_lastHandledMappingIntegrityAlarmRequestCount = capturedRequest;
+    m_resetAuthorityAlarmUpdateCount = candidateAlarmUpdateCount;
+    m_resetAuthorityAlarmSafetyIntentState = candidateAlarmIntentState;
+    m_resetAuthorityMappingAlarmRequestCount = capturedRequest;
+    if (!requestAlreadyMaterialized &&
+        !m_lifecycleInterruptionAlarmLatched)
+    {
+        BeginAlarmEmergencyStopShadow();
+    }
+    return ResetPreDrainReconcileResult::READY;
+}
+
+
 bool NCManager::EnsureMappingIntegrityAlarmBoundaryBeforeFeedback() noexcept
 {
     const MotionP1HandoverSafetySnapshot p1Safety =
@@ -1211,17 +2344,13 @@ bool NCManager::EnsureMappingIntegrityAlarmBoundaryBeforeFeedback() noexcept
 
     // AlarmManager is materialized only by this 10 ms NC owner. Motion has
     // already release-published the exact old Epoch and pending request before
-    // it can publish any causal or retirement terminal feedback.
-    AlarmManager::GetInstance().Trigger(
-        AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY,
-        0,
-        p1Safety.lastOrphanAxisIndex);
-
-    const AlarmManager& alarms = AlarmManager::GetInstance();
+    // it can publish any causal or retirement terminal feedback.  A G00
+    // producer rejection may have materialized the same 3021 immediately to
+    // stop the remainder of its NC block; do not duplicate that exact alarm.
+    AlarmManager& alarms = AlarmManager::GetInstance();
     bool mappingIntegrityAlarmPresent = false;
-    const int alarmCount = alarms.GetAlarmCount();
     for (int alarmIndex = 0;
-        alarmIndex < alarmCount;
+        alarmIndex < alarms.GetAlarmCount();
         ++alarmIndex)
     {
         if (alarms.GetAlarmId(alarmIndex) ==
@@ -1231,6 +2360,27 @@ bool NCManager::EnsureMappingIntegrityAlarmBoundaryBeforeFeedback() noexcept
             break;
         }
     }
+
+    if (!mappingIntegrityAlarmPresent)
+    {
+        alarms.Trigger(
+            AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY,
+            0,
+            p1Safety.lastOrphanAxisIndex);
+
+        for (int alarmIndex = 0;
+            alarmIndex < alarms.GetAlarmCount();
+            ++alarmIndex)
+        {
+            if (alarms.GetAlarmId(alarmIndex) ==
+                AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY)
+            {
+                mappingIntegrityAlarmPresent = true;
+                break;
+            }
+        }
+    }
+
     if (!mappingIntegrityAlarmPresent && !alarms.HasAlarm())
     {
         // No formal Alarm path exists yet. Keep the mailbox pending and retry;
@@ -1270,7 +2420,13 @@ void NCManager::ProcessMotionFeedback() noexcept
         i < MOTION_FEEDBACK_NC_DRAIN_LIMIT_PER_TASK;
         ++i)
     {
-        if (!m_motion.TryReadMotionFeedback(event))
+        if (m_deferredResetMotionFeedbackValid)
+        {
+            event = m_deferredResetMotionFeedback;
+            m_deferredResetMotionFeedback = MotionFeedbackEvent{};
+            m_deferredResetMotionFeedbackValid = false;
+        }
+        else if (!m_motion.TryReadMotionFeedback(event))
         {
             break;
         }
@@ -1284,7 +2440,41 @@ void NCManager::ProcessMotionFeedback() noexcept
             // old-Epoch record are release-published before every causal or
             // retirement terminal, so this idempotent check always opens the
             // Alarm boundary before the event reaches the Ledger observer.
-            EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+            // PRE_DRAIN is the one exception: its exact provenance classifier
+            // must decide whether a delayed mailbox belongs before or after
+            // the operator edge before any Alarm/lifecycle state is changed.
+            if (m_resetContinuationPhase ==
+                ResetContinuationPhase::AUTHORITY_EDGE ||
+                m_resetContinuationPhase ==
+                ResetContinuationPhase::PRE_DRAIN)
+            {
+                const ResetPreDrainReconcileResult reconcileResult =
+                    ReconcileResetPreDrainMappingAlarmBoundary();
+                if (reconcileResult ==
+                    ResetPreDrainReconcileResult::DEFERRED)
+                {
+                    // The event was already acquired from the SPSC ring.
+                    // Preserve exactly this item and retry its Reset/Alarm
+                    // classification before consuming any later feedback.
+                    m_deferredResetMotionFeedback = event;
+                    m_deferredResetMotionFeedbackValid = true;
+                    return;
+                }
+                if (reconcileResult ==
+                    ResetPreDrainReconcileResult::SUPERSEDED)
+                {
+                    m_resetContinuationPhase =
+                        ResetContinuationPhase::BLOCKED;
+                    m_resetAuthorityEntryGeneration =
+                        MOTION_OWNER_GENERATION_INVALID;
+                    m_motion.RequestEmergencyStopAllAxes();
+                    (void)EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+                }
+            }
+            else
+            {
+                (void)EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+            }
         }
 
         // Capture the pre-event state. This must happen before the sequence
@@ -1387,21 +2577,216 @@ void NCManager::ProcessMotionFeedback() noexcept
 }
 
 
+void NCManager::ObserveBootstrapSafetyHandoff() noexcept
+{
+    // The EtherCAT/RT startup path can deliberately leave the Motion owner
+    // as SAFETY while it establishes PDO and standstill evidence.  That is a
+    // safe default, but it must not require an operator Reset merely to use
+    // a clean, alarm-free UI.  This one-time handoff is intentionally much
+    // narrower than Reset: it never changes NC modal state, clears no Alarm
+    // or Fault, performs no coordinate rebase, and never enables motion.
+    if (!m_bootSafetyHandoffPending ||
+        (m_state != NCState::IDLE && m_state != NCState::READY) ||
+        m_resetContinuationPhase != ResetContinuationPhase::IDLE ||
+        m_resetSafetyOutputHoldActive ||
+        m_lifecycleInterruptionShadow.IsActive() ||
+        AlarmManager::GetInstance().HasAlarm() ||
+        m_motion.HasPendingSafetyOrRecoveryRequests())
+    {
+        return;
+    }
+
+    const MotionOwnerLease bootstrapLease =
+        m_motion.GetMotionOwnerLease();
+    if (bootstrapLease.owner == MotionOwner::NONE)
+    {
+        m_bootSafetyHandoffPending = false;
+        return;
+    }
+    if (bootstrapLease.owner != MotionOwner::SAFETY ||
+        !bootstrapLease.IsValid() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(bootstrapLease))
+    {
+        // A real non-bootstrap producer has already taken ownership.  Never
+        // reinterpret it as an idle startup lease on a later scan.
+        m_bootSafetyHandoffPending = false;
+        return;
+    }
+
+    const MotionStopSettleSnapshot settle =
+        m_motion.GetStopSettleSnapshot();
+    MotionEmergencyStopEvidence emergency{};
+    MotionEmergencyStopCounters emergencyCounters{};
+    if (settle.publicationGeneration == 0ULL ||
+        settle.sampleSequence == 0ULL ||
+        !settle.standstill ||
+        settle.groupActive ||
+        settle.commandQueueDepth != 0U ||
+        settle.nonIdleAxisCount != 0U ||
+        settle.commandMovingAxisCount != 0U ||
+        settle.actualMovingAxisCount != 0U ||
+        settle.pdoTargetVelocityNonzeroAxisCount != 0U ||
+        !m_motion.TryGetEmergencyStopEvidence(
+            emergency,
+            emergencyCounters) ||
+        emergency.publicationGeneration != settle.publicationGeneration ||
+        emergency.estopAxisMask != 0U ||
+        emergency.errorAxisMask != 0U ||
+        emergency.faultAxisMask != 0U ||
+        emergency.lagAlarmAxisMask != 0U)
+    {
+        return;
+    }
+
+    // ReleaseMotionOwner repeats the packed owner/ticket/pending checks at
+    // its CAS seam. A concurrent Safety request therefore wins fail-closed;
+    // we mark this bootstrap handoff consumed only after our own release CAS
+    // succeeds, so a later real Safety owner is never released by this path.
+    if (m_motion.ReleaseMotionOwner(bootstrapLease))
+    {
+        m_bootSafetyHandoffPending = false;
+        // Keep this one-time ownership handoff independent of the RTX API
+        // header/include order.  Existing NC01F runtime diagnostics expose
+        // the resulting NONE owner, while this supervisory path must remain
+        // buildable in every project configuration that hosts NCManager.
+    }
+}
+
+
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
     NC_RunCount++;
 
+    // A Reset button which collided only with the preceding PDO frame keeps
+    // its immutable Alarm/mapping/provenance cutoff here.  Do not run the
+    // ordinary Alarm materializer or drain feedback until that exact button
+    // admission is either acquired or superseded.
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::BUTTON_ADMISSION)
+    {
+        Reset();
+        if (m_resetContinuationPhase ==
+            ResetContinuationPhase::BUTTON_ADMISSION)
+        {
+            return;
+        }
+    }
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::CLEANUP)
+    {
+        return;
+    }
+
     // A K.2.1 mapping-integrity Alarm can be published and physically stopped
-    // entirely between two NC scans. Open its Alarm boundary before draining
-    // the already-published terminal feedback so the existing pre-latched
-    // ABORTED/REJECTED accounting retains its open/closed sequence window.
-    EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+    // entirely between two NC scans. OUTPUT_HOLD/PRE_DRAIN first classify the
+    // exact request against the immutable button/authority provenance while
+    // preserving its RESET lifecycle boundary. Every other phase uses the
+    // ordinary ALARM path.
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::AUTHORITY_EDGE ||
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::PRE_DRAIN)
+    {
+        const ResetPreDrainReconcileResult reconcileResult =
+            ReconcileResetPreDrainMappingAlarmBoundary();
+        if (reconcileResult ==
+            ResetPreDrainReconcileResult::DEFERRED)
+        {
+            return;
+        }
+        if (reconcileResult ==
+            ResetPreDrainReconcileResult::SUPERSEDED)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_resetAuthorityEntryGeneration =
+                MOTION_OWNER_GENERATION_INVALID;
+            m_motion.RequestEmergencyStopAllAxes();
+            (void)EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+        }
+    }
+    else
+    {
+        (void)EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+    }
 
     // 即使 NC 正處於 Alarm / Reset / Not Ready，也必須先 Drain Feedback，
     // 否則 Runtime Terminal Event 可能在上層長時間停住時累積。
     ProcessMotionFeedback();
     ObserveFeedHoldBoundaryShadow();
+
+    // Stage NC-0.2K.6.2: a whole-PDO/Epoch reservation may defer the first
+    // bounded Reset authority handshake.  Continue the exact original
+    // generation automatically on later 10 ms scans; while it is still
+    // deferred, Reset() keeps a Motion-visible E-stop mailbox latched and the
+    // NC state fail-closed in RESET_STATE.
+    const auto resetContinuationIsAdvancing = [this]() noexcept -> bool
+    {
+        return
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::BUTTON_ADMISSION ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::AUTHORITY_EDGE ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::PRE_DRAIN ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::AUTHORITY ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::EPOCH ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::CONTROLLED_STOP ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::OUTPUT_HOLD ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::BATCH ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::ALARM_CLEAR ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::CLEANUP ||
+            m_resetContinuationPhase ==
+            ResetContinuationPhase::SETTLE;
+    };
+    if (resetContinuationIsAdvancing())
+    {
+        if ((m_resetContinuationPhase !=
+            ResetContinuationPhase::AUTHORITY_EDGE &&
+            m_resetContinuationPhase !=
+            ResetContinuationPhase::PRE_DRAIN &&
+            (AlarmManager::GetInstance().GetUpdateCount() !=
+                m_resetAuthorityAlarmUpdateCount ||
+                AlarmManager::MotionAdmissionBaseState(
+                    AlarmManager::GetInstance().
+                    GetMotionSafetyIntentState()) !=
+                m_resetAuthorityAlarmSafetyIntentState)) ||
+            (m_resetContinuationPhase ==
+                ResetContinuationPhase::SETTLE &&
+                AlarmManager::GetInstance().HasAlarm()))
+        {
+            // A later Alarm owns the newer lifecycle boundary.  Do not let
+            // the older Reset continuation clear or retarget it.
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_resetAuthorityEntryGeneration =
+                MOTION_OWNER_GENERATION_INVALID;
+        }
+        else if (m_motion.HasPendingSafetyOrRecoveryRequests())
+        {
+            // The fail-closed fallback E-stop must reach its exact RT
+            // acknowledgement before this Reset publishes its correlated
+            // batch; otherwise the E-stop priority branch would consume and
+            // discard the just-published Reset batch.
+            return;
+        }
+        else
+        {
+            Reset();
+        }
+        if (resetContinuationIsAdvancing())
+        {
+            return;
+        }
+    }
 
     if (UpdateSystemVariables_initialize_flag == 0)//第一次初始更新Macro變數
     {
@@ -1452,6 +2837,12 @@ void NCManager::ProcessTask()
 
     if (alarmActive)
     {
+        if (m_resetContinuationPhase !=
+            ResetContinuationPhase::IDLE)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+        }
         ClearPreDispatchBarrier();
         m_state = NCState::ALARM; // 確保 NC 大腦確實進入警報狀態
         CancelFeedHoldBoundaryShadow(false);
@@ -1490,11 +2881,47 @@ void NCManager::ProcessTask()
         return;
     }
 
+    // Clean startup only: hand off a retained bootstrap SAFETY lease after
+    // the RT owner has published one coherent, stationary, no-fault image.
+    // This allows program selection and JOG admission to acquire their normal
+    // owners without requiring a cosmetic Reset at power-up.
+    ObserveBootstrapSafetyHandoff();
+
     // =========================================================
     // 🌟 2.5 【新增：滑行煞車攔截網】等待 Reset 後的馬達完全靜止
     // =========================================================
     if (m_state == NCState::RESET_STATE)
     {
+        if (m_resetContinuationPhase ==
+            ResetContinuationPhase::RELEASE_GATE)
+        {
+            MotionExecutionEpoch exactReleaseEpoch =
+                MOTION_EXECUTION_EPOCH_INVALID;
+            const MotionCore::ResetSafetyAuthorityStatus
+                exactReleaseStatus =
+                m_motion.TryGetResetSafetyMotionOwnerEpoch(
+                    m_safetyMotionLease,
+                    m_resetAuthorityRequestTicket,
+                    m_resetAuthorityProvenanceGeneration,
+                    exactReleaseEpoch);
+            if (exactReleaseStatus ==
+                MotionCore::ResetSafetyAuthorityStatus::DEFERRED)
+            {
+                ObservePreparedBlockQueueShadow(false);
+                return;
+            }
+
+            if (exactReleaseStatus !=
+                MotionCore::ResetSafetyAuthorityStatus::ACQUIRED ||
+                exactReleaseEpoch !=
+                m_resetContinuationExecutionEpoch)
+            {
+                m_resetContinuationPhase =
+                    ResetContinuationPhase::BLOCKED;
+                m_motion.RequestEmergencyStopAllAxes();
+            }
+        }
+
         // NC-0.2J.3：先完成本圈 interruption evidence 觀察，再讓
         // release gate 判斷。Legacy 的單次 IsGroupStandstill() 不再能
         // 提早釋放 SAFETY owner 或將 NC 宣告為 READY。
@@ -1509,7 +2936,9 @@ void NCManager::ProcessTask()
             resetRebaseAck,
             m_motion.IsMotionOwnerLeaseCurrent(m_safetyMotionLease));
 
-        if (m_resetReleaseGate.ShouldReleaseSafetyOwner())
+        if (m_resetContinuationPhase ==
+            ResetContinuationPhase::RELEASE_GATE &&
+            m_resetReleaseGate.ShouldReleaseSafetyOwner())
         {
             // NC-0.2J.5: close the proof-to-release window with one fresh ACK
             // and one fresh exact-lease observation.  The second gate pass
@@ -1532,17 +2961,178 @@ void NCManager::ProcessTask()
                 return;
             }
 
-            bool releaseSucceeded = false;
+            const auto resetSupervisoryIdentityCurrent =
+                [this]() noexcept -> bool
+            {
+                AlarmManager& alarms = AlarmManager::GetInstance();
+                const std::uint32_t alarmRevisionBefore =
+                    alarms.GetUpdateCount();
+                const bool alarmPresent = alarms.HasAlarm();
+                const NCLifecycleInterruptionSnapshot boundary =
+                    m_lifecycleInterruptionShadow.GetSnapshot();
+                const std::uint32_t alarmRevisionAfter =
+                    alarms.GetUpdateCount();
+
+                return
+                    alarmRevisionBefore ==
+                    m_resetAuthorityAlarmUpdateCount &&
+                    alarmRevisionAfter == alarmRevisionBefore &&
+                    !alarmPresent &&
+                    AlarmManager::MotionAdmissionBaseState(
+                        alarms.GetMotionSafetyIntentState()) ==
+                    m_resetAuthorityAlarmSafetyIntentState &&
+                    m_lastHandledMappingIntegrityAlarmRequestCount ==
+                    m_resetAuthorityMappingAlarmRequestCount &&
+                    boundary.sequence ==
+                    m_resetLifecycleInterruptionSequence &&
+                    boundary.cause ==
+                    NCLifecycleInterruptionCause::RESET &&
+                    boundary.publishedExecutionEpoch ==
+                    m_resetContinuationExecutionEpoch &&
+                    m_motion.GetSafetyProvenanceGeneration() ==
+                    m_resetAuthorityProvenanceGeneration &&
+                    !m_motion.HasPendingSafetyOrRecoveryRequests();
+            };
+
+            // AlarmManager and the RESET lifecycle are independent of the
+            // Motion owner word. Re-prove both immediately before consuming
+            // the one-shot RT authorization; a later Alarm must own a new
+            // operator Reset rather than be cleared by this transaction.
+            if (!resetSupervisoryIdentityCurrent())
+            {
+                m_resetContinuationPhase =
+                    ResetContinuationPhase::BLOCKED;
+                m_motion.RequestEmergencyStopAllAxes();
+                ObservePreparedBlockQueueShadow(false);
+                return;
+            }
+
+            AlarmManager& releaseAlarms = AlarmManager::GetInstance();
+            AlarmManager::MotionAdmissionReservation
+                releaseAlarmAdmission{};
+            const AlarmManager::MotionAdmissionResult
+                releaseAlarmAdmissionResult =
+                releaseAlarms.TryBeginMotionAdmission(
+                    m_resetAuthorityAlarmUpdateCount,
+                    m_resetAuthorityAlarmSafetyIntentState,
+                    releaseAlarmAdmission,
+                    true);
+            if (releaseAlarmAdmissionResult ==
+                AlarmManager::MotionAdmissionResult::BUSY)
+            {
+                ObservePreparedBlockQueueShadow(false);
+                return;
+            }
+            if (releaseAlarmAdmissionResult !=
+                AlarmManager::MotionAdmissionResult::ACQUIRED ||
+                releaseAlarmAdmission.baseState !=
+                m_resetAuthorityAlarmSafetyIntentState)
+            {
+                if (releaseAlarmAdmission.acquired)
+                {
+                    (void)releaseAlarms.EndMotionAdmission(
+                        releaseAlarmAdmission);
+                }
+                m_resetContinuationPhase =
+                    ResetContinuationPhase::BLOCKED;
+                m_motion.RequestEmergencyStopAllAxes();
+                ObservePreparedBlockQueueShadow(false);
+                return;
+            }
+
+            MotionCore::SafetyMotionOwnerReleaseStatus releaseStatus =
+                MotionCore::SafetyMotionOwnerReleaseStatus::SUPERSEDED;
             if (releaseSafetyLeaseCurrent)
             {
-                // Use the exact RT Actual snapshot that was rebased and
-                // post-verified.  A later supervisory read must not create a
-                // different NC/Motion coordinate boundary.
+                MotionNCResetSafetyReleaseAuthorization
+                    releaseAuthorization{};
+                releaseAuthorization.requestSequence =
+                    m_resetNCSettleRequestSequence;
+                releaseAuthorization.drainRevocationGeneration =
+                    m_resetAuthorityProvenanceGeneration;
+                releaseAuthorization.executionEpoch =
+                    m_resetContinuationExecutionEpoch;
+                releaseAuthorization.ownerGeneration =
+                    m_safetyMotionLease.generation;
+                releaseAuthorization.safetyRequestTicket =
+                    m_resetAuthorityRequestTicket;
+                releaseStatus =
+                    m_motion.TryReleaseSafetyMotionOwner(
+                        m_safetyMotionLease,
+                        releaseAuthorization);
+                if (releaseStatus ==
+                    MotionCore::SafetyMotionOwnerReleaseStatus::RELEASED)
+                {
+                    // Owner NONE is already published and is not rolled back.
+                    // A concurrent Alarm/Safety edge keeps the physical output
+                    // hold active, blocks READY and asks RT for a new stop.
+                    if (!resetSupervisoryIdentityCurrent())
+                    {
+                        releaseStatus = MotionCore::
+                            SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+                        m_resetContinuationPhase =
+                            ResetContinuationPhase::BLOCKED;
+                        m_motion.RequestEmergencyStopAllAxes();
+                    }
+                }
+            }
+
+            // A transient RT/frame reservation is not a terminal release
+            // failure. Retire the Alarm admission and retry the same one-shot
+            // authorization on the next NC scan without marking the gate.
+            if (releaseStatus ==
+                MotionCore::SafetyMotionOwnerReleaseStatus::DEFERRED)
+            {
+                if (!releaseAlarms.EndMotionAdmission(
+                    releaseAlarmAdmission))
+                {
+                    m_resetContinuationPhase =
+                        ResetContinuationPhase::BLOCKED;
+                    m_motion.RequestEmergencyStopAllAxes();
+                    m_resetReleaseGate.MarkReleaseResult(
+                        resetBoundary,
+                        releaseResetRebaseAck,
+                        releaseSafetyLeaseCurrent,
+                        false);
+                }
+                ObservePreparedBlockQueueShadow(false);
+                return;
+            }
+
+            bool releaseSucceeded =
+                releaseStatus == MotionCore::
+                SafetyMotionOwnerReleaseStatus::RELEASED;
+            if (!releaseAlarms.EndMotionAdmission(
+                releaseAlarmAdmission))
+            {
+                releaseSucceeded = false;
+                m_resetContinuationPhase =
+                    ResetContinuationPhase::BLOCKED;
+                m_motion.RequestEmergencyStopAllAxes();
+            }
+
+            if (releaseStatus == MotionCore::
+                SafetyMotionOwnerReleaseStatus::SUPERSEDED)
+            {
+                m_resetContinuationPhase =
+                    ResetContinuationPhase::BLOCKED;
+                m_motion.RequestEmergencyStopAllAxes();
+            }
+
+            if (releaseSucceeded)
+            {
+                // End is the Alarm commit point. Coordinate synchronization
+                // is applied only after that exact quiet transaction commits;
+                // output hold and owner NONE still prevent physical motion.
                 CoordSys.SyncMachinePosition(
                     releaseResetRebaseAck.actualMcsUnit);
-                releaseSucceeded =
-                    m_motion.ReleaseMotionOwner(
-                        m_safetyMotionLease);
+                if (!resetSupervisoryIdentityCurrent())
+                {
+                    releaseSucceeded = false;
+                    m_resetContinuationPhase =
+                        ResetContinuationPhase::BLOCKED;
+                    m_motion.RequestEmergencyStopAllAxes();
+                }
             }
 
             m_resetReleaseGate.MarkReleaseResult(
@@ -1554,7 +3144,23 @@ void NCManager::ProcessTask()
             if (releaseSucceeded &&
                 m_resetReleaseGate.GetSnapshot().releaseApplied)
             {
+                if (m_resetSafetyOutputHoldActive)
+                {
+                    m_motion.EndResetSafetyOutputHold();
+                    m_resetSafetyOutputHoldActive = false;
+                }
                 m_safetyMotionLease = MotionOwnerLease{};
+                m_resetContinuationPhase =
+                    ResetContinuationPhase::IDLE;
+                m_resetContinuationExecutionEpoch =
+                    MOTION_EXECUTION_EPOCH_INVALID;
+                m_resetLifecycleInterruptionSequence = 0ULL;
+                m_resetAuthorityBaselineTicket = 0U;
+                m_resetAuthorityRequestTicket = 0U;
+                m_resetButtonCutoffProvenanceGeneration = 0ULL;
+                m_resetAuthorityProvenanceGeneration = 0ULL;
+                m_resetContinuationExecutionState =
+                    MotionNCResetExecutionState{};
                 m_state = NCState::READY;
                 UpdateSystemVariables();
             }
@@ -1611,6 +3217,27 @@ void NCManager::ProcessTask()
     // =========================================================
     if (ProcessFeedHoldResumeGate())
     {
+        ObserveLifecycleInterruptionShadow();
+        ObservePreparedBlockQueueShadow(false);
+        return;
+    }
+
+    if (m_holdResumeAdmissionKind ==
+        HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK)
+    {
+        (void)ApplyControlledSingleBlockResume();
+        ObserveLifecycleInterruptionShadow();
+        ObservePreparedBlockQueueShadow(false);
+        return;
+    }
+
+    if (m_holdResumeAdmissionKind ==
+        HoldResumeAdmissionKind::PROGRAM_HOLD)
+    {
+        if (!m_holdResumeGateControlled)
+        {
+            (void)ApplyProgramHoldResume(false);
+        }
         ObserveLifecycleInterruptionShadow();
         ObservePreparedBlockQueueShadow(false);
         return;
@@ -2151,8 +3778,27 @@ void NCManager::ProcessExecutionEngine()
                 const MotionExecutionEpoch gotoEpoch =
                     m_motion.BeginNewExecutionEpoch(
                         GetMotionCommandSourceForMode(m_mode));
+                if (gotoEpoch == MOTION_EXECUTION_EPOCH_INVALID)
+                {
+                    markDispatchFailed(
+                        static_cast<std::uint32_t>(
+                            AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY));
+                    TriggerMappingIntegrityAlarmOnce(sourceLineNumber);
+                    m_state = NCState::ALARM;
+                    return;
+                }
                 RecordLifecycleInterruptionEpochPublished(gotoEpoch);
-                m_motion.SyncVirtualEndPosition();
+                if (!ArmPendingGotoQueueTailRebase(
+                    gotoEpoch,
+                    sourceLineNumber))
+                {
+                    markDispatchFailed(
+                        static_cast<std::uint32_t>(
+                            AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY));
+                    TriggerMappingIntegrityAlarmOnce(sourceLineNumber);
+                    m_state = NCState::ALARM;
+                    return;
+                }
                 m_programChanged = true;
             }
 
@@ -2762,9 +4408,10 @@ void NCManager::ProcessExecutionEngine()
                 return;
             }
 
-            // K.5 reads the completed Producer capture and K.4.2 Commit
-            // snapshot.  It does not own either result and cannot change the
-            // callback, epoch, Motion queue, Commit, or Runtime state.
+            // K.5/K.6.2 read the completed Producer capture and K.4.2 Commit
+            // snapshot.  K.6.2 additionally binds the immutable queue-tail
+            // receipt; admission still cannot change the callback, epoch,
+            // Motion queue, Commit, or Runtime state.
             NCOrdinaryG00LegacyCommitEvidence ordinaryAdmissionEvidence{};
             ordinaryAdmissionEvidence.dispatchId = dispatchId;
             ordinaryAdmissionEvidence.commitSequence =
@@ -2790,8 +4437,12 @@ void NCManager::ProcessExecutionEngine()
                 ordinaryAdmissionEvidence.segmentId =
                     static_cast<std::uint64_t>(
                         submission.identity.segmentId);
+                ordinaryAdmissionEvidence.submissionIdentity =
+                    submission.identity;
                 ordinaryAdmissionEvidence.commandPathMode =
                     submission.commandPathMode;
+                ordinaryAdmissionEvidence.queueTailReceipt =
+                    submission.queueTailReceipt;
                 ordinaryAdmissionEvidence.producerAccepted =
                     submission.producerAccepted;
                 ordinaryAdmissionEvidence.immediateRejectNone =
@@ -3703,6 +5354,10 @@ bool NCManager::LoadMDI(const std::string& mdiContent)
     const MotionExecutionEpoch replacementEpoch =
         m_motion.BeginNewExecutionEpoch(
             MotionCommandSource::NC_MDI);
+    if (replacementEpoch == MOTION_EXECUTION_EPOCH_INVALID)
+    {
+        return false;
+    }
     RecordLifecycleInterruptionEpochPublished(replacementEpoch);
 
     // 新的 Base Program Source 不可沿用上一份 MDI 的 Macro Frame / Cache。
@@ -3768,6 +5423,10 @@ bool NCManager::LoadManualAuto(const std::string& manualContent)
     const MotionExecutionEpoch replacementEpoch =
         m_motion.BeginNewExecutionEpoch(
             MotionCommandSource::NC_MANUAL_AUTO);
+    if (replacementEpoch == MOTION_EXECUTION_EPOCH_INVALID)
+    {
+        return false;
+    }
     RecordLifecycleInterruptionEpochPublished(replacementEpoch);
 
     // 新的 Manual-Auto Source 建立全新的 Macro Session。
@@ -3851,6 +5510,10 @@ bool NCManager::LoadDynamicCode(const std::string& content)
     const MotionExecutionEpoch replacementEpoch =
         m_motion.BeginNewExecutionEpoch(
             GetMotionCommandSourceForMode(m_mode));
+    if (replacementEpoch == MOTION_EXECUTION_EPOCH_INVALID)
+    {
+        return false;
+    }
     RecordLifecycleInterruptionEpochPublished(replacementEpoch);
 
     // Dynamic Code 也是新的 Base Program Source；先摧毀所有指向 Macro
@@ -4118,17 +5781,34 @@ bool NCManager::BeginProgramRunBoundary(
 
 bool NCManager::IsPendingProgramRunStartIdentityCurrent() const noexcept
 {
-    return
+    const bool sourceIdentityCurrent =
         m_programRunStartPending &&
-        m_pendingProgramRunExecutionEpoch !=
-        MOTION_EXECUTION_EPOCH_INVALID &&
+        m_pendingProgramRunPhase != ProgramRunStartPhase::IDLE &&
         (m_pendingProgramRunOriginState == NCState::READY ||
             m_pendingProgramRunOriginState == NCState::P_END) &&
         m_state == m_pendingProgramRunOriginState &&
         m_mode == m_pendingProgramRunMode &&
         GetBaseProgramScope() == m_pendingProgramRunScope &&
         GetBaseProgramCache().GetGeneration() ==
-        m_pendingProgramRunCacheGeneration &&
+        m_pendingProgramRunCacheGeneration;
+    if (!sourceIdentityCurrent)
+    {
+        return false;
+    }
+
+    if (m_pendingProgramRunPhase ==
+        ProgramRunStartPhase::ALARM_ADMISSION)
+    {
+        return
+            m_pendingProgramRunExecutionEpoch ==
+            MOTION_EXECUTION_EPOCH_INVALID &&
+            !m_pendingProgramRunOwnerLease.IsValid();
+    }
+
+    return
+        m_pendingProgramRunPhase == ProgramRunStartPhase::EPOCH_ACK &&
+        m_pendingProgramRunExecutionEpoch !=
+        MOTION_EXECUTION_EPOCH_INVALID &&
         m_programMotionLease.Matches(
             m_pendingProgramRunOwnerLease) &&
         m_motion.IsMotionOwnerLeaseCurrent(
@@ -4166,6 +5846,7 @@ void NCManager::ClearPendingProgramRunStart(bool cancelled) noexcept
     }
 
     m_programRunStartPending = false;
+    m_pendingProgramRunPhase = ProgramRunStartPhase::IDLE;
     m_pendingProgramRunExecutionEpoch =
         MOTION_EXECUTION_EPOCH_INVALID;
     m_pendingProgramRunOwnerLease = MotionOwnerLease{};
@@ -4174,6 +5855,56 @@ void NCManager::ClearPendingProgramRunStart(bool cancelled) noexcept
     m_pendingProgramRunScope = NCProgramScope::NONE;
     m_pendingProgramRunCacheGeneration =
         NC_PROGRAM_CACHE_GENERATION_INVALID;
+    m_pendingProgramRunAlarmUpdateCount = 0U;
+    m_pendingProgramRunAlarmSafetyIntentState = 0ULL;
+}
+
+bool NCManager::ArmPendingGotoQueueTailRebase(
+    MotionExecutionEpoch executionEpoch,
+    int sourceLineNumber) noexcept
+{
+    ClearPendingGotoQueueTailRebase();
+
+    const MotionOwnerLease currentOwnerLease =
+        m_motion.GetMotionOwnerLease();
+    if (executionEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        !currentOwnerLease.IsValid() ||
+        !currentOwnerLease.Matches(m_programMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(currentOwnerLease) ||
+        m_motion.GetCurrentExecutionEpoch() != executionEpoch)
+    {
+        return false;
+    }
+
+    m_gotoQueueTailRebasePending = true;
+    m_pendingGotoQueueTailRebaseExecutionEpoch = executionEpoch;
+    m_pendingGotoQueueTailRebaseOwnerLease = currentOwnerLease;
+    m_pendingGotoQueueTailRebaseSourceLine = sourceLineNumber;
+    return true;
+}
+
+bool NCManager::IsPendingGotoQueueTailRebaseIdentityCurrent() const noexcept
+{
+    return
+        m_gotoQueueTailRebasePending &&
+        m_pendingGotoQueueTailRebaseExecutionEpoch !=
+        MOTION_EXECUTION_EPOCH_INVALID &&
+        m_pendingGotoQueueTailRebaseOwnerLease.IsValid() &&
+        m_pendingGotoQueueTailRebaseOwnerLease.Matches(
+            m_programMotionLease) &&
+        m_motion.IsMotionOwnerLeaseCurrent(
+            m_pendingGotoQueueTailRebaseOwnerLease) &&
+        m_motion.GetCurrentExecutionEpoch() ==
+        m_pendingGotoQueueTailRebaseExecutionEpoch;
+}
+
+void NCManager::ClearPendingGotoQueueTailRebase() noexcept
+{
+    m_gotoQueueTailRebasePending = false;
+    m_pendingGotoQueueTailRebaseExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    m_pendingGotoQueueTailRebaseOwnerLease = MotionOwnerLease{};
+    m_pendingGotoQueueTailRebaseSourceLine = 0;
 }
 
 bool NCManager::ProcessPendingProgramRunStart() noexcept
@@ -4183,62 +5914,270 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         return false;
     }
 
-    // Any state transition or newer lifecycle Epoch supersedes this exact
-    // button request.  Never retarget a pending start to whatever Epoch happens
-    // to be current after Reset/Stop/Fault.
-    if (!IsPendingProgramRunStartIdentityCurrent())
+    const auto cancelPendingStart = [this](bool alarmSuperseded) noexcept
     {
         ReleasePendingProgramRunMotionOwner();
         ClearPendingProgramRunStart(true);
         m_programEndBoundary.Cancel();
         m_programEndAlarmRaised = false;
+        if (alarmSuperseded)
+        {
+            NCState observedState =
+                m_state.load(std::memory_order_acquire);
+            if (observedState != NCState::RESET_STATE &&
+                observedState != NCState::ALARM)
+            {
+                (void)m_state.compare_exchange_strong(
+                    observedState,
+                    NCState::ALARM,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire);
+            }
+            m_motion.RequestEmergencyStopAllAxes();
+        }
+    };
+
+    // Any state/source/cache change supersedes this exact button request.
+    // Never retarget a pending start to a newer owner or execution Epoch.
+    if (!IsPendingProgramRunStartIdentityCurrent())
+    {
+        cancelPendingStart(false);
+        return true;
+    }
+
+    AlarmManager& startAlarms = AlarmManager::GetInstance();
+    const auto alarmIdentityCurrent = [this, &startAlarms]() noexcept
+    {
+        return
+            startAlarms.GetUpdateCount() ==
+            m_pendingProgramRunAlarmUpdateCount &&
+            AlarmManager::MotionAdmissionBaseState(
+                startAlarms.GetMotionSafetyIntentState()) ==
+            m_pendingProgramRunAlarmSafetyIntentState &&
+            !startAlarms.HasAlarm();
+    };
+
+    if (m_pendingProgramRunPhase ==
+        ProgramRunStartPhase::ALARM_ADMISSION)
+    {
+        if (!alarmIdentityCurrent())
+        {
+            cancelPendingStart(startAlarms.HasAlarm());
+            return true;
+        }
+
+        AlarmManager::MotionAdmissionReservation admission{};
+        const AlarmManager::MotionAdmissionResult beginResult =
+            startAlarms.TryBeginMotionAdmission(
+                m_pendingProgramRunAlarmUpdateCount,
+                m_pendingProgramRunAlarmSafetyIntentState,
+                admission,
+                true);
+        if (beginResult == AlarmManager::MotionAdmissionResult::BUSY)
+        {
+            return true;
+        }
+        if (beginResult !=
+            AlarmManager::MotionAdmissionResult::ACQUIRED)
+        {
+            cancelPendingStart(startAlarms.HasAlarm());
+            return true;
+        }
+
+        if (!IsPendingProgramRunStartIdentityCurrent() ||
+            admission.baseState !=
+            m_pendingProgramRunAlarmSafetyIntentState)
+        {
+            const bool ended = startAlarms.EndMotionAdmission(admission);
+            cancelPendingStart(!ended || startAlarms.HasAlarm());
+            return true;
+        }
+
+        if (!AcquireProgramMotionOwner())
+        {
+            if (!startAlarms.EndMotionAdmission(admission))
+            {
+                cancelPendingStart(true);
+            }
+            return true;
+        }
+
+        // A fresh run has its own Epoch/baseline transaction and must never
+        // inherit an unfinished GOTO rebase from an older execution.
+        ClearPendingGotoQueueTailRebase();
+        CancelSingleBlockShadow(false);
+        CancelFeedHoldBoundaryShadow(false);
+        m_legacySingleBlockPausePending = false;
+        ResetActiveProgramCommitBoundary();
+
+        if (m_pendingProgramRunOriginState == NCState::P_END)
+        {
+            GetBasePC() = 0;
+            Reset_Gode();
+            m_macroStack.clear();
+        }
+        m_pauseAfterBlock = false;
+
+        const MotionExecutionEpoch executionEpoch =
+            m_motion.BeginNewExecutionEpoch(
+                GetMotionCommandSourceForMode(
+                    m_pendingProgramRunMode));
+        if (executionEpoch == MOTION_EXECUTION_EPOCH_INVALID)
+        {
+            ReleaseProgramMotionOwner();
+            const bool ended = startAlarms.EndMotionAdmission(admission);
+            if (!ended)
+            {
+                cancelPendingStart(true);
+            }
+            return true;
+        }
+
+        m_pendingProgramRunExecutionEpoch = executionEpoch;
+        m_pendingProgramRunOwnerLease = m_programMotionLease;
+        m_pendingProgramRunPhase = ProgramRunStartPhase::EPOCH_ACK;
+        if (!startAlarms.EndMotionAdmission(admission))
+        {
+            cancelPendingStart(true);
+        }
+        return true;
+    }
+
+    if (!alarmIdentityCurrent())
+    {
+        cancelPendingStart(startAlarms.HasAlarm());
         return true;
     }
 
     const MotionExecutionEpoch pendingEpoch =
         m_pendingProgramRunExecutionEpoch;
-
-    // This includes the start's own Epoch PENDING bit.  It can clear only in
-    // the 250 us consumer.  Real safety/recovery requests use the same wait and
-    // therefore remain fail-closed without being confused with START_DIRTY.
-    if (m_motion.HasPendingSafetyOrRecoveryRequests())
+    if (m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        !m_motion.HasExactExecutionDrainAcknowledgement(
+            pendingEpoch,
+            m_pendingProgramRunOwnerLease))
     {
         return true;
     }
 
-    // Stage NC-0.2G：新 Program Run 只能從乾淨的 Lifecycle / Transport
-    // 邊界開始，避免把上一輪殘留算進新的 Cycle End。
-    if (!BeginProgramRunBoundary(pendingEpoch))
+    AlarmManager::MotionAdmissionReservation runAdmission{};
+    const AlarmManager::MotionAdmissionResult runAdmissionResult =
+        startAlarms.TryBeginMotionAdmission(
+            m_pendingProgramRunAlarmUpdateCount,
+            m_pendingProgramRunAlarmSafetyIntentState,
+            runAdmission,
+            true);
+    if (runAdmissionResult ==
+        AlarmManager::MotionAdmissionResult::BUSY)
     {
-        ReleasePendingProgramRunMotionOwner();
-        ClearPendingProgramRunStart(true);
+        return true;
+    }
+    if (runAdmissionResult !=
+        AlarmManager::MotionAdmissionResult::ACQUIRED)
+    {
+        cancelPendingStart(startAlarms.HasAlarm());
         return true;
     }
 
-    // Close the sample-to-RUN seam.  A newer lifecycle publication or owner
-    // transfer after BeginRun invalidates the just-created baseline.
     if (!IsPendingProgramRunStartIdentityCurrent() ||
+        !m_motion.HasExactExecutionDrainAcknowledgement(
+            pendingEpoch,
+            m_pendingProgramRunOwnerLease) ||
         m_motion.HasPendingSafetyOrRecoveryRequests())
     {
-        ReleasePendingProgramRunMotionOwner();
-        ClearPendingProgramRunStart(true);
-        m_programEndBoundary.Cancel();
+        const bool ended = startAlarms.EndMotionAdmission(runAdmission);
+        cancelPendingStart(!ended || startAlarms.HasAlarm());
         return true;
     }
 
-    const bool startManualAuto =
-        m_pendingProgramRunMode == NCOperationMode::MANUAL &&
-        !m_manualProgramCache.Empty();
-    ClearPendingProgramRunStart(false);
-
-    if (m_mode == NCOperationMode::MANUAL)
+    if (!BeginProgramRunBoundary(pendingEpoch))
     {
-        m_manualAutoRunning = startManualAuto;
+        const bool ended = startAlarms.EndMotionAdmission(runAdmission);
+        cancelPendingStart(!ended || startAlarms.HasAlarm());
+        return true;
     }
 
     m_motion.SyncVirtualEndPosition();
+    double synchronizedQueueTailMCS[MAX_AXES] = {};
+    if (!m_motion.TryGetSynchronizedG00QueueTailMCS(
+        synchronizedQueueTailMCS) ||
+        !IsPendingProgramRunStartIdentityCurrent() ||
+        !m_motion.HasExactExecutionDrainAcknowledgement(
+            pendingEpoch,
+            m_pendingProgramRunOwnerLease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests())
+    {
+        (void)startAlarms.EndMotionAdmission(runAdmission);
+        TriggerMappingIntegrityAlarmOnce();
+        cancelPendingStart(true);
+        return true;
+    }
+
+    CoordSys.SyncMachinePosition(synchronizedQueueTailMCS);
+    if (!IsPendingProgramRunStartIdentityCurrent() ||
+        !m_motion.HasExactExecutionDrainAcknowledgement(
+            pendingEpoch,
+            m_pendingProgramRunOwnerLease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        !startAlarms.IsMotionAdmissionCurrent(runAdmission))
+    {
+        const bool ended = startAlarms.EndMotionAdmission(runAdmission);
+        cancelPendingStart(!ended || startAlarms.HasAlarm());
+        return true;
+    }
+
+    const NCState originState = m_pendingProgramRunOriginState;
+    const bool startManualAuto =
+        m_pendingProgramRunMode == NCOperationMode::MANUAL &&
+        !m_manualProgramCache.Empty();
+    if (m_pendingProgramRunMode == NCOperationMode::MANUAL)
+    {
+        m_manualAutoRunning = startManualAuto;
+    }
+    NCState expectedOriginState = originState;
+    const bool committedRun =
+        m_state.compare_exchange_strong(
+            expectedOriginState,
+            NCState::RUN,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    if (!committedRun ||
+        !m_motion.IsMotionOwnerLeaseCurrent(
+            m_pendingProgramRunOwnerLease) ||
+        !m_motion.HasExactExecutionDrainAcknowledgement(
+            pendingEpoch,
+            m_pendingProgramRunOwnerLease))
+    {
+        if (committedRun)
+        {
+            NCState provisionalRun = NCState::RUN;
+            (void)m_state.compare_exchange_strong(
+                provisionalRun,
+                originState,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+        m_manualAutoRunning = false;
+        const bool ended =
+            startAlarms.EndMotionAdmission(runAdmission);
+        cancelPendingStart(!ended || startAlarms.HasAlarm());
+        return true;
+    }
+
+    if (!startAlarms.EndMotionAdmission(runAdmission))
+    {
+        NCState provisionalRun = NCState::RUN;
+        (void)m_state.compare_exchange_strong(
+            provisionalRun,
+            originState,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        m_manualAutoRunning = false;
+        cancelPendingStart(true);
+        return true;
+    }
+
+    ClearPendingProgramRunStart(false);
     UpdateSystemVariables();
-    m_state = NCState::RUN;
 
     // The first block is intentionally dispatched on the next NC task.
     return true;
@@ -4250,6 +6189,7 @@ bool NCManager::RequestProgramEnd(
     int sourceLineNumber,
     NCBlockDispatchId markerDispatchId) noexcept
 {
+    ClearPendingGotoQueueTailRebase();
     m_pauseAfterBlock = false;
     m_legacySingleBlockPausePending = false;
     m_singleBlockBoundaryShadow.SuppressForProgramEnd();
@@ -4330,6 +6270,8 @@ void NCManager::ProcessProgramEndBoundary()
 
 void NCManager::FinalizeProgramEnd()
 {
+    ClearPendingGotoQueueTailRebase();
+
     // NC-0.2J.5: rebuild and re-evaluate every formal input immediately
     // before the permission action.  Do not finalize from the earlier scan's
     // READY_TO_FINALIZE snapshot.
@@ -4391,6 +6333,7 @@ void NCManager::FinalizeProgramEnd()
 
 void NCManager::CancelProgramEndBoundary() noexcept
 {
+    ClearPendingGotoQueueTailRebase();
     m_programEndBoundary.Cancel();
     m_programEndAlarmRaised = false;
     ClearPendingProgramRunStart(true);
@@ -5420,26 +7363,191 @@ bool NCManager::ApplyControlledSingleBlockHold() noexcept
     return true;
 }
 
+bool NCManager::ArmHoldResumeAlarmAdmission(
+    HoldResumeAdmissionKind kind) noexcept
+{
+    if (kind == HoldResumeAdmissionKind::NONE)
+    {
+        return false;
+    }
+    if (m_holdResumeAdmissionKind == kind)
+    {
+        return true;
+    }
+    if (m_holdResumeAdmissionKind != HoldResumeAdmissionKind::NONE)
+    {
+        return false;
+    }
+
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    const std::uint32_t updateBefore = alarms.GetUpdateCount();
+    const std::uint64_t intentBefore =
+        AlarmManager::MotionAdmissionBaseState(
+            alarms.GetMotionSafetyIntentState());
+    const bool alarmPresent = alarms.HasAlarm();
+    const std::uint32_t updateAfter = alarms.GetUpdateCount();
+    const std::uint64_t intentAfter =
+        AlarmManager::MotionAdmissionBaseState(
+            alarms.GetMotionSafetyIntentState());
+    if (alarmPresent ||
+        updateBefore != updateAfter ||
+        intentBefore != intentAfter)
+    {
+        return false;
+    }
+
+    m_holdResumeAlarmUpdateCount = updateBefore;
+    m_holdResumeAlarmSafetyIntentState = intentBefore;
+    m_holdResumeAdmissionKind = kind;
+    return true;
+}
+
+void NCManager::ClearHoldResumeAlarmAdmission(
+    HoldResumeAdmissionKind kind) noexcept
+{
+    if (kind != HoldResumeAdmissionKind::NONE &&
+        m_holdResumeAdmissionKind != kind)
+    {
+        return;
+    }
+    m_holdResumeAdmissionKind = HoldResumeAdmissionKind::NONE;
+    m_holdResumeAlarmUpdateCount = 0U;
+    m_holdResumeAlarmSafetyIntentState = 0ULL;
+    m_holdResumeGateControlled = false;
+}
+
 bool NCManager::ApplyControlledSingleBlockResume() noexcept
 {
     if (m_state != NCState::HOLD ||
+        !m_singleBlockHoldGate.IsHoldApplied() ||
+        m_holdResumeAdmissionKind !=
+        HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK)
+    {
+        return false;
+    }
+
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    AlarmManager::MotionAdmissionReservation admission{};
+    const AlarmManager::MotionAdmissionResult beginResult =
+        alarms.TryBeginMotionAdmission(
+            m_holdResumeAlarmUpdateCount,
+            m_holdResumeAlarmSafetyIntentState,
+            admission,
+            true);
+    if (beginResult == AlarmManager::MotionAdmissionResult::BUSY)
+    {
+        return false;
+    }
+    if (beginResult != AlarmManager::MotionAdmissionResult::ACQUIRED)
+    {
+        ClearHoldResumeAlarmAdmission(
+            HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK);
+        NCState heldState = NCState::HOLD;
+        (void)m_state.compare_exchange_strong(
+            heldState,
+            NCState::ALARM,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        m_motion.RequestEmergencyStopAllAxes();
+        return false;
+    }
+
+    if (m_state != NCState::HOLD ||
         !m_singleBlockHoldGate.IsHoldApplied())
     {
+        const bool ended = alarms.EndMotionAdmission(admission);
+        ClearHoldResumeAlarmAdmission(
+            HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK);
+        if (!ended)
+        {
+            NCState heldState = NCState::HOLD;
+            (void)m_state.compare_exchange_strong(
+                heldState,
+                NCState::ALARM,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+            m_motion.RequestEmergencyStopAllAxes();
+        }
         return false;
     }
 
     if (!AcquireProgramMotionOwner())
     {
+        if (!alarms.EndMotionAdmission(admission))
+        {
+            ClearHoldResumeAlarmAdmission(
+                HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK);
+            NCState heldState = NCState::HOLD;
+            (void)m_state.compare_exchange_strong(
+                heldState,
+                NCState::ALARM,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+            m_motion.RequestEmergencyStopAllAxes();
+        }
+        return false;
+    }
+
+    const bool leaseCurrentBeforeCommit =
+        m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease);
+    NCState heldState = NCState::HOLD;
+    const bool committedRun =
+        leaseCurrentBeforeCommit &&
+        m_state.compare_exchange_strong(
+            heldState,
+            NCState::RUN,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    if (!committedRun ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))
+    {
+        if (committedRun)
+        {
+            NCState provisionalRun = NCState::RUN;
+            (void)m_state.compare_exchange_strong(
+                provisionalRun,
+                NCState::HOLD,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+        const bool ended = alarms.EndMotionAdmission(admission);
+        if (!ended)
+        {
+            NCState restoredHold = NCState::HOLD;
+            (void)m_state.compare_exchange_strong(
+                restoredHold,
+                NCState::ALARM,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+            m_motion.RequestEmergencyStopAllAxes();
+        }
+        return false;
+    }
+    m_motion.SetGroupFeedrateOverride(1.0);
+    if (!alarms.EndMotionAdmission(admission))
+    {
+        NCState provisionalRun = NCState::RUN;
+        (void)m_state.compare_exchange_strong(
+            provisionalRun,
+            NCState::ALARM,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        if (m_state != NCState::RUN)
+        {
+            m_motion.SetGroupFeedrateOverride(0.0);
+        }
+        ClearHoldResumeAlarmAdmission(
+            HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK);
+        m_motion.RequestEmergencyStopAllAxes();
         return false;
     }
 
     m_singleBlockBoundaryShadow.ObserveControlledResume();
     m_singleBlockHoldGate.MarkResumeApplied();
-
-    m_state = NCState::RUN;
-    m_motion.SetGroupFeedrateOverride(1.0);
     m_pauseAfterBlock = false;
     m_legacySingleBlockPausePending = false;
+    ClearHoldResumeAlarmAdmission(
+        HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK);
     return true;
 }
 
@@ -5459,6 +7567,8 @@ void NCManager::CancelSingleBlockShadow(
     m_singleBlockBoundaryShadow.Cancel(superseded);
     m_singleBlockHoldGate.Cancel(superseded);
     m_legacySingleBlockPausePending = false;
+    ClearHoldResumeAlarmAdmission(
+        HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK);
 }
 
 // =============================================================================
@@ -5525,6 +7635,8 @@ NCFeedHoldBoundarySample NCManager::BuildFeedHoldBoundarySample() const noexcept
 void NCManager::BeginFeedHoldBoundaryShadow(
     NCFeedHoldSource source) noexcept
 {
+    ClearHoldResumeAlarmAdmission(
+        HoldResumeAdmissionKind::PROGRAM_HOLD);
     if (source != NCFeedHoldSource::PROGRAM)
     {
         m_feedHoldNCSettleRequestSequence =
@@ -5604,6 +7716,8 @@ void NCManager::CancelFeedHoldBoundaryShadow(
 {
     m_feedHoldBoundaryShadow.Cancel(superseded);
     m_feedHoldResumeGate.Cancel(superseded);
+    ClearHoldResumeAlarmAdmission(
+        HoldResumeAdmissionKind::PROGRAM_HOLD);
 }
 
 // =============================================================================
@@ -5625,8 +7739,56 @@ bool NCManager::IsProgramFeedHoldResumeCandidate() const noexcept
 bool NCManager::ApplyProgramHoldResume(
     bool gateControlled) noexcept
 {
-    if (m_state != NCState::HOLD)
+    if (m_state != NCState::HOLD ||
+        m_holdResumeAdmissionKind !=
+        HoldResumeAdmissionKind::PROGRAM_HOLD)
     {
+        return false;
+    }
+
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    AlarmManager::MotionAdmissionReservation admission{};
+    const AlarmManager::MotionAdmissionResult beginResult =
+        alarms.TryBeginMotionAdmission(
+            m_holdResumeAlarmUpdateCount,
+            m_holdResumeAlarmSafetyIntentState,
+            admission,
+            true);
+    if (beginResult == AlarmManager::MotionAdmissionResult::BUSY)
+    {
+        return false;
+    }
+    if (beginResult != AlarmManager::MotionAdmissionResult::ACQUIRED)
+    {
+        ClearHoldResumeAlarmAdmission(
+            HoldResumeAdmissionKind::PROGRAM_HOLD);
+        NCState heldState = NCState::HOLD;
+        (void)m_state.compare_exchange_strong(
+            heldState,
+            NCState::ALARM,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        m_motion.RequestEmergencyStopAllAxes();
+        return false;
+    }
+
+    if (m_state != NCState::HOLD ||
+        (gateControlled &&
+            !m_feedHoldResumeGate.ShouldApplyResume()))
+    {
+        const bool ended = alarms.EndMotionAdmission(admission);
+        ClearHoldResumeAlarmAdmission(
+            HoldResumeAdmissionKind::PROGRAM_HOLD);
+        if (!ended)
+        {
+            NCState heldState = NCState::HOLD;
+            (void)m_state.compare_exchange_strong(
+                heldState,
+                NCState::ALARM,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+            m_motion.RequestEmergencyStopAllAxes();
+        }
         return false;
     }
 
@@ -5635,26 +7797,84 @@ bool NCManager::ApplyProgramHoldResume(
         // The Gate remains RELEASE_READY and will retry from ProcessTask after
         // the current Owner arbitration becomes valid.  No state or Override
         // is changed on this failed attempt.
+        if (!alarms.EndMotionAdmission(admission))
+        {
+            ClearHoldResumeAlarmAdmission(
+                HoldResumeAdmissionKind::PROGRAM_HOLD);
+            NCState heldState = NCState::HOLD;
+            (void)m_state.compare_exchange_strong(
+                heldState,
+                NCState::ALARM,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+            m_motion.RequestEmergencyStopAllAxes();
+        }
         return false;
     }
 
-    // A Cycle Start is considered applied only here.  Early button presses do
-    // not consume Single Block state and do not clear the current Wait Callback.
+    const bool leaseCurrentBeforeCommit =
+        m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease);
+    NCState heldState = NCState::HOLD;
+    const bool committedRun =
+        leaseCurrentBeforeCommit &&
+        m_state.compare_exchange_strong(
+            heldState,
+            NCState::RUN,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    if (!committedRun ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))
+    {
+        if (committedRun)
+        {
+            NCState provisionalRun = NCState::RUN;
+            (void)m_state.compare_exchange_strong(
+                provisionalRun,
+                NCState::HOLD,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+        const bool ended = alarms.EndMotionAdmission(admission);
+        if (!ended)
+        {
+            NCState restoredHold = NCState::HOLD;
+            (void)m_state.compare_exchange_strong(
+                restoredHold,
+                NCState::ALARM,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+            m_motion.RequestEmergencyStopAllAxes();
+        }
+        return false;
+    }
+    m_motion.SetGroupFeedrateOverride(1.0);
+    if (!alarms.EndMotionAdmission(admission))
+    {
+        NCState provisionalRun = NCState::RUN;
+        (void)m_state.compare_exchange_strong(
+            provisionalRun,
+            NCState::ALARM,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        m_motion.SetGroupFeedrateOverride(0.0);
+        ClearHoldResumeAlarmAdmission(
+            HoldResumeAdmissionKind::PROGRAM_HOLD);
+        m_motion.RequestEmergencyStopAllAxes();
+        return false;
+    }
+
+    // A Cycle Start is considered applied only after the admission End CAS.
     m_singleBlockBoundaryShadow.ObserveLegacyResume();
     m_legacySingleBlockPausePending = false;
-
-    m_state = NCState::RUN;
-    m_motion.SetGroupFeedrateOverride(1.0);
     m_pauseAfterBlock = false;
-
     ObserveFeedHoldResumeAppliedShadow();
-
     if (gateControlled)
     {
         m_feedHoldResumeGate.MarkResumeApplied(
             m_feedHoldBoundaryShadow.GetSnapshot());
     }
-
+    ClearHoldResumeAlarmAdmission(
+        HoldResumeAdmissionKind::PROGRAM_HOLD);
     return true;
 }
 
@@ -5678,7 +7898,10 @@ bool NCManager::ProcessFeedHoldResumeGate() noexcept
         return false;
     }
 
-    return ApplyProgramHoldResume(true);
+    (void)ApplyProgramHoldResume(true);
+    // A BUSY reservation retains the exact resume ticket and must consume
+    // this NC scan; otherwise normal dispatch could run past the HOLD gate.
+    return true;
 }
 
 // =============================================================================
@@ -5786,7 +8009,80 @@ bool NCManager::WaitForCycleStartCallback(NCManager* nc) {
 
 // 3. 只等待馬達靜止 (清空預讀)
 bool NCManager::WaitAndClearQueueCallback(NCManager* nc) {
-    if (nc->m_motion.GetQueueSize() > 0 || !nc->m_motion.IsGroupNCDrained()) return false;
+    if (nc->m_motion.GetQueueSize() > 0 ||
+        !nc->m_motion.IsGroupNCDrained())
+    {
+        return false;
+    }
+
+    // A GOTO publishes its replacement Epoch before arming this callback.
+    // Wait for the 250 us consumer acknowledgement (and for any other
+    // safety/recovery request) before sampling RT-owned logicalCmdPos.
+    if (nc->m_motion.HasPendingSafetyOrRecoveryRequests())
+    {
+        return false;
+    }
+
+    // Macro call/return/repeat also sets m_programChanged, but does not publish
+    // a replacement Epoch.  Only the dedicated GOTO identity owns this
+    // lifecycle rebase.
+    if (!nc->m_gotoQueueTailRebasePending)
+    {
+        return true;
+    }
+
+    const auto failGotoRebaseClosed = [nc]() -> bool
+    {
+        const int sourceLineNumber =
+            nc->m_pendingGotoQueueTailRebaseSourceLine;
+        nc->ClearPendingGotoQueueTailRebase();
+        TriggerMappingIntegrityAlarmOnce(sourceLineNumber);
+        nc->m_state = NCState::ALARM;
+        return true;
+    };
+
+    // A later Reset/Safety/owner transition must cancel, never retarget, the
+    // deferred GOTO rebase to whatever identity happens to be current.
+    if (!nc->IsPendingGotoQueueTailRebaseIdentityCurrent())
+    {
+        return failGotoRebaseClosed();
+    }
+
+    if (!nc->m_motion.HasExactExecutionDrainAcknowledgement(
+        nc->m_pendingGotoQueueTailRebaseExecutionEpoch,
+        nc->m_pendingGotoQueueTailRebaseOwnerLease))
+    {
+        return false;
+    }
+
+    nc->m_motion.SyncVirtualEndPosition();
+
+    double synchronizedQueueTailMCS[MAX_AXES] = {};
+    if (!nc->m_motion.TryGetSynchronizedG00QueueTailMCS(
+        synchronizedQueueTailMCS) ||
+        !nc->IsPendingGotoQueueTailRebaseIdentityCurrent() ||
+        !nc->m_motion.HasExactExecutionDrainAcknowledgement(
+            nc->m_pendingGotoQueueTailRebaseExecutionEpoch,
+            nc->m_pendingGotoQueueTailRebaseOwnerLease))
+    {
+        return failGotoRebaseClosed();
+    }
+
+    // Only this exact drain/acknowledgement identity may rebase the producer
+    // tail and NC MCS endpoint.  The next G90/G91 preview therefore starts
+    // from one coherent post-GOTO baseline.
+    nc->CoordSys.SyncMachinePosition(
+        synchronizedQueueTailMCS);
+
+    if (!nc->IsPendingGotoQueueTailRebaseIdentityCurrent() ||
+        !nc->m_motion.HasExactExecutionDrainAcknowledgement(
+            nc->m_pendingGotoQueueTailRebaseExecutionEpoch,
+            nc->m_pendingGotoQueueTailRebaseOwnerLease))
+    {
+        return failGotoRebaseClosed();
+    }
+
+    nc->ClearPendingGotoQueueTailRebase();
     return true;
 }
 // ==========================================================

@@ -15726,16 +15726,12 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
                             pMaster->tickCount_PDO++;
 
-
-                            // =========================================================
-                            // NC-0.2J.5 - NC settle PDO continuity seam
-                            //
-                            // The settle dwell is valid only across consecutive valid
-                            // PDO cycles.  Notify MotionCore before the Motion branch so
-                            // the first invalid cycle resets the proof even though that
-                            // cycle intentionally skips UpdateAllMotion().
-                            // =========================================================
-
+                            // NC-0.2J.5 / K.6.2: publish every PDO-cycle
+                            // validity edge to the Motion settle producer
+                            // before any interpolation work.  The invalid
+                            // first-cycle path intentionally skips Motion, so
+                            // ObserveNCSettleRuntimeCycle() also revokes stale
+                            // drain proof immediately for that case.
                             pMaster->
                                 m_Motion.
                                 ObserveNCSettleRuntimeCycle(

@@ -30,6 +30,7 @@
 #include <map>                 // Parsed Macro Cache 使用穩定節點位址
 #include <stack>               // 🌟 新增：為了支援副程式返回堆疊
 #include <cstdint>
+#include <atomic>
 #include <type_traits>
 class NCManager;
 
@@ -176,6 +177,12 @@ static_assert(
 static_assert(
     std::is_trivially_copyable<NCPreDispatchBarrierCounters>::value,
     "NCPreDispatchBarrierCounters must remain trivially copyable.");
+static_assert(
+    sizeof(std::atomic<NCState>) == sizeof(NCState),
+    "NCState atomic must remain one machine word.");
+static_assert(
+    ATOMIC_INT_LOCK_FREE == 2,
+    "NCState atomic requires always-lock-free int atomics.");
 
 class NCManager {
 public:
@@ -184,6 +191,9 @@ public:
     // 1. 系統狀態控制
     void ChangeMode(NCOperationMode newMode);
     void ChangeState(NCState newState);
+    bool TryCommitHomingResume(
+        const MotionOwnerLease& expectedHomeLease) noexcept;
+    void TryRollbackHomingResume() noexcept;
 
     // =========================================================
 // NC State Query
@@ -193,7 +203,7 @@ public:
 // =========================================================
     NCState GetState() const
     {
-        return m_state;
+        return m_state.load(std::memory_order_acquire);
     }
 
     NCOperationMode GetMode() const
@@ -797,7 +807,19 @@ private:
 
     // Stage NC-0.1D：每個 NC 10 ms Cycle 先 Drain Motion Feedback Ring。
     void ProcessMotionFeedback() noexcept;
+    // Startup may inherit a quiescent SAFETY owner from the runtime bootstrap.
+    // This is a one-time, read-only-evidence-gated handoff; it never clears
+    // alarms/faults and never enables physical motion.
+    void ObserveBootstrapSafetyHandoff() noexcept;
     bool EnsureMappingIntegrityAlarmBoundaryBeforeFeedback() noexcept;
+    enum class ResetPreDrainReconcileResult : std::uint8_t
+    {
+        READY = 0,
+        DEFERRED,
+        SUPERSEDED
+    };
+    ResetPreDrainReconcileResult
+        ReconcileResetPreDrainMappingAlarmBoundary() noexcept;
 
     // Stage NC-0.2D：Program Commit 與 Motion Segment Feedback 的對照表。
     NCBlockLifecycleLedger m_blockLifecycleLedger{};
@@ -809,6 +831,12 @@ private:
     NCAlarmEmergencyStopBoundaryShadow m_alarmEmergencyStopShadow{};
     bool m_lifecycleInterruptionAlarmLatched = false;
     std::uint64_t m_lastHandledMappingIntegrityAlarmRequestCount = 0ULL;
+
+    // The first program image is a boot image, not a replacement of an
+    // already-running program.  Defer a retained SAFETY owner handoff until
+    // the 250 us runtime publishes clean standstill evidence.
+    bool m_bootProgramImageLoaded = false;
+    bool m_bootSafetyHandoffPending = true;
 
     // Stage NC-0.2F：已追蹤 Motion Block 的 Wait Callback 採 Dual-Key
     // Guard；非 Motion Callback 維持 Legacy 行為。
@@ -827,6 +855,14 @@ private:
     // Keep the exact Epoch latched so a newer Reset/Stop/Fault publication
     // can only cancel this start, never accidentally authorize it.
     bool m_programRunStartPending = false;
+    enum class ProgramRunStartPhase : std::uint8_t
+    {
+        IDLE = 0,
+        ALARM_ADMISSION,
+        EPOCH_ACK
+    };
+    ProgramRunStartPhase m_pendingProgramRunPhase =
+        ProgramRunStartPhase::IDLE;
     MotionExecutionEpoch m_pendingProgramRunExecutionEpoch =
         MOTION_EXECUTION_EPOCH_INVALID;
     MotionOwnerLease m_pendingProgramRunOwnerLease{};
@@ -835,6 +871,18 @@ private:
     NCProgramScope m_pendingProgramRunScope = NCProgramScope::NONE;
     NCProgramCacheGeneration m_pendingProgramRunCacheGeneration =
         NC_PROGRAM_CACHE_GENERATION_INVALID;
+    std::uint32_t m_pendingProgramRunAlarmUpdateCount = 0U;
+    std::uint64_t m_pendingProgramRunAlarmSafetyIntentState = 0ULL;
+
+    // Stage NC-0.2K.6.2: GOTO publishes a replacement Epoch before the
+    // 250 us consumer can acknowledge/drain it.  Keep that exact identity
+    // separate from the legacy m_programChanged macro-flow flag so a later
+    // Safety/Reset Epoch can never authorize a stale GOTO rebase.
+    bool m_gotoQueueTailRebasePending = false;
+    MotionExecutionEpoch m_pendingGotoQueueTailRebaseExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionOwnerLease m_pendingGotoQueueTailRebaseOwnerLease{};
+    int m_pendingGotoQueueTailRebaseSourceLine = 0;
 
     struct NCGMBlockTransactionState
     {
@@ -907,11 +955,68 @@ private:
     MotionNCSettleRequestSequence m_resetNCSettleRequestSequence =
         MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
 
+    // Stage NC-0.2K.6.2: one operator Reset owns one fresh SAFETY
+    // generation request.  If a bounded Motion reservation defers the
+    // handshake, subsequent 10 ms scans continue against this original
+    // generation instead of minting another generation/Epoch.
+    enum class ResetContinuationPhase : std::uint8_t
+    {
+        IDLE = 0,
+        BUTTON_ADMISSION,
+        AUTHORITY_EDGE,
+        CONTROLLED_STOP,
+        OUTPUT_HOLD,
+        PRE_DRAIN,
+        AUTHORITY,
+        EPOCH,
+        BATCH,
+        ALARM_CLEAR,
+        CLEANUP,
+        SETTLE,
+        RELEASE_GATE,
+        BLOCKED
+    };
+
+    ResetContinuationPhase m_resetContinuationPhase =
+        ResetContinuationPhase::IDLE;
+    MotionOwnerGeneration m_resetAuthorityEntryGeneration =
+        MOTION_OWNER_GENERATION_INVALID;
+    std::uint32_t m_resetAuthorityBaselineTicket = 0U;
+    std::uint32_t m_resetAuthorityRequestTicket = 0U;
+    std::uint64_t m_resetButtonCutoffProvenanceGeneration = 0ULL;
+    std::uint64_t m_resetAuthorityProvenanceGeneration = 0ULL;
+    // Normal operator RESET must first decelerate an active G00/G01 under
+    // the exact SAFETY lease.  This latch prevents a delayed 10 ms retry
+    // from publishing a second stop child-ticket while the first stop is
+    // still being consumed by the 250 us owner.
+    bool m_resetControlledStopPublished = false;
+    bool m_resetSafetyOutputHoldActive = false;
+    std::uint32_t m_resetAuthorityAlarmUpdateCount = 0U;
+    std::uint64_t m_resetAuthorityAlarmSafetyIntentState = 0ULL;
+    std::uint64_t m_resetAuthorityMappingAlarmRequestCount = 0ULL;
+    std::uint64_t m_resetLifecycleInterruptionSequence = 0ULL;
+    MotionExecutionEpoch m_resetContinuationExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionNCResetExecutionState m_resetContinuationExecutionState{};
+
     // Stage NC-0.2I.3：PROGRAM Feed Hold 的 Cycle Start 在 ACK 前只
     // 先鎖存；ACK 成立後才允許真正恢復。保留 Runtime Legacy 回退開關。
     NCFeedHoldResumeGate m_feedHoldResumeGate{};
+    enum class HoldResumeAdmissionKind : std::uint8_t
+    {
+        NONE = 0,
+        CONTROLLED_SINGLE_BLOCK,
+        PROGRAM_HOLD
+    };
+    HoldResumeAdmissionKind m_holdResumeAdmissionKind =
+        HoldResumeAdmissionKind::NONE;
+    std::uint32_t m_holdResumeAlarmUpdateCount = 0U;
+    std::uint64_t m_holdResumeAlarmSafetyIntentState = 0ULL;
+    bool m_holdResumeGateControlled = false;
 
     MotionFeedbackEvent m_lastMotionFeedback{};
+    MotionFeedbackEvent m_deferredResetMotionFeedback{};
+    bool m_deferredResetMotionFeedbackValid = false;
     MotionExecutionIdentity m_lastAcceptedMotionIdentity{};
     MotionExecutionIdentity m_lastStartedMotionIdentity{};
     MotionExecutionIdentity m_lastCompletedMotionIdentity{};
@@ -1028,6 +1133,10 @@ private:
     bool IsProgramFeedHoldResumeCandidate() const noexcept;
     bool ApplyProgramHoldResume(bool gateControlled) noexcept;
     bool ProcessFeedHoldResumeGate() noexcept;
+    bool ArmHoldResumeAlarmAdmission(
+        HoldResumeAdmissionKind kind) noexcept;
+    void ClearHoldResumeAlarmAdmission(
+        HoldResumeAdmissionKind kind) noexcept;
 
     NCLifecycleInterruptionSample
         BuildLifecycleInterruptionSample() const noexcept;
@@ -1081,6 +1190,11 @@ private:
     void ReleasePendingProgramRunMotionOwner() noexcept;
     void ClearPendingProgramRunStart(bool cancelled) noexcept;
     bool ProcessPendingProgramRunStart() noexcept;
+    bool ArmPendingGotoQueueTailRebase(
+        MotionExecutionEpoch executionEpoch,
+        int sourceLineNumber) noexcept;
+    bool IsPendingGotoQueueTailRebaseIdentityCurrent() const noexcept;
+    void ClearPendingGotoQueueTailRebase() noexcept;
     bool RequestProgramEnd(
         NCProgramEndCause cause,
         int sourcePC,
@@ -1116,7 +1230,7 @@ public:
     HomingManager Homing{ m_motion };
 
     NCOperationMode m_mode = NCOperationMode::MANUAL;
-    NCState m_state = NCState::NOT_READY;
+    std::atomic<NCState> m_state{ NCState::NOT_READY };
     EDMState m_edmState = EDMState::NOT_READY;
 
 

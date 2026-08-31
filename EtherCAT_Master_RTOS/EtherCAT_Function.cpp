@@ -532,7 +532,47 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
     frame[26 + length + 1] = 0x00;
 
     // --- 5. 發送封包 ---
-    m_pNic->SendPacket(frame, total_send_len);
+    // The PDO callback sends the image produced by the previous Motion pass.
+    // Commit that exact whole-image proof at the real transport seam; on any
+    // Owner/Epoch/Safety race Motion scrubs every mapped TargetVelocity to
+    // zero before this final payload capture.
+    const bool isRuntimeProcessImage =
+        LogAddr == 0U &&
+        data == m_IoMap &&
+        static_cast<int>(length) == m_IoMapSize;
+    MotionCore::ServoOutputFrameReservation frameReservation{};
+    if (isRuntimeProcessImage &&
+        !m_Motion.BeginServoOutputFrameAtSendPoint(
+            frameReservation))
+    {
+        return -1;
+    }
+    if (length > 0U && data != nullptr)
+    {
+        memcpy(&frame[26], data, length);
+    }
+    if (isRuntimeProcessImage &&
+        !m_Motion.FinalizeServoOutputFrameAtSendPoint(
+            frameReservation))
+    {
+        return -1;
+    }
+    if (frameReservation.recopyRequired &&
+        length > 0U && data != nullptr)
+    {
+        memcpy(&frame[26], data, length);
+    }
+    const bool sendSucceeded =
+        m_pNic->SendPacket(frame, total_send_len);
+    if (isRuntimeProcessImage)
+    {
+        m_Motion.EndServoOutputFrameAfterSend(
+            frameReservation);
+    }
+    if (!sendSucceeded)
+    {
+        return -1;
+    }
 
     // --- 6. 接收回應 (Receive Loop) ---
     int max_retries = timeout * 100; // 視您的 timer 解析度而定
@@ -5807,6 +5847,38 @@ int EtherCatMaster::ecx_LRW_FRMW(
             false;
     }
 
+    // Final whole-PDO-image commit. Re-copy LRW data only after the Motion
+    // proof either linearizes against the packed Safety ticket/Epoch words or
+    // scrubs the live IO map to an exact all-zero velocity image.
+    const bool isRuntimeProcessImage =
+        LogAddr == 0U &&
+        data == m_IoMap &&
+        static_cast<int>(length) == m_IoMapSize;
+    MotionCore::ServoOutputFrameReservation frameReservation{};
+    if (isRuntimeProcessImage &&
+        !m_Motion.BeginServoOutputFrameAtSendPoint(
+            frameReservation))
+    {
+        return -1;
+    }
+    memcpy(
+        &frame[lrwDataOffset],
+        data,
+        length);
+    if (isRuntimeProcessImage &&
+        !m_Motion.FinalizeServoOutputFrameAtSendPoint(
+            frameReservation))
+    {
+        return -1;
+    }
+    if (frameReservation.recopyRequired)
+    {
+        memcpy(
+            &frame[lrwDataOffset],
+            data,
+            length);
+    }
+
     // =============================================================
     // Exact software send point timing
     // =============================================================
@@ -5840,10 +5912,22 @@ int EtherCatMaster::ecx_LRW_FRMW(
     // Actual NIC Send API
     // =============================================================
 
-    m_pNic->
-        SendPacket(
-            frame,
-            totalFrameLength);
+    const bool sendSucceeded =
+        m_pNic->
+            SendPacket(
+                frame,
+                totalFrameLength);
+
+    if (isRuntimeProcessImage)
+    {
+        m_Motion.EndServoOutputFrameAfterSend(
+            frameReservation);
+    }
+    if (!sendSucceeded)
+    {
+        rxResyncPending = true;
+        return -1;
+    }
 
 
     if (qpcBeforeSendValid)

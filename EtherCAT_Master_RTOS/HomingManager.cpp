@@ -409,7 +409,7 @@ bool HomingManager::Start(
     m_completed = false;
     m_hasError = false;
     m_cancelRequested = false;
-    m_resumeRequested = false;
+    ClearResumeRequest();
     m_runControlState = HomeRunControlState::IDLE;
 
     m_lastError =
@@ -621,6 +621,10 @@ void HomingManager::Process(
     if (m_runControlState ==
         HomeRunControlState::PAUSED)
     {
+        if (m_resumeRequested)
+        {
+            (void)TryResumeFromPaused();
+        }
         return;
     }
 
@@ -698,8 +702,7 @@ bool HomingManager::RequestHold()
         return true;
     }
 
-    m_resumeRequested =
-        false;
+    ClearResumeRequest();
 
     m_runControlState =
         HomeRunControlState::HOLD_DECEL_STOP;
@@ -708,13 +711,69 @@ bool HomingManager::RequestHold()
 }
 
 
-bool HomingManager::Resume()
+void HomingManager::ClearResumeRequest() noexcept
+{
+    m_resumeRequested = false;
+    m_resumeAlarmUpdateCount = 0U;
+    m_resumeAlarmIntentBaseState = 0ULL;
+    m_resumeHomeMotionLease = MotionOwnerLease{};
+    m_resumeAdmissionTicketValid = false;
+}
+
+
+HomingManager::ResumeResult HomingManager::Resume() noexcept
 {
     if (!m_active ||
         m_hasError ||
-        m_cancelRequested)
+        m_cancelRequested ||
+        (m_runControlState !=
+            HomeRunControlState::HOLD_DECEL_STOP &&
+            m_runControlState !=
+            HomeRunControlState::PAUSED) ||
+        m_nc == nullptr ||
+        !m_homeMotionLease.IsValid() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_homeMotionLease))
     {
-        return false;
+        ClearResumeRequest();
+        return ResumeResult::REJECTED;
+    }
+
+    if (!m_resumeRequested)
+    {
+        // Capture the button edge once.  MotionAdmissionBaseState removes only
+        // a benign concurrent reservation; Alarm/Clear sequence and active
+        // intent bits remain part of the immutable identity.
+        AlarmManager& alarms = AlarmManager::GetInstance();
+        const std::uint32_t updateBefore = alarms.GetUpdateCount();
+        const std::uint64_t intentBefore =
+            AlarmManager::MotionAdmissionBaseState(
+                alarms.GetMotionSafetyIntentState());
+        const bool alarmPresent = alarms.HasAlarm();
+        const std::uint32_t updateAfter = alarms.GetUpdateCount();
+        const std::uint64_t intentAfter =
+            AlarmManager::MotionAdmissionBaseState(
+                alarms.GetMotionSafetyIntentState());
+
+        if (alarmPresent ||
+            updateBefore != updateAfter ||
+            intentBefore != intentAfter)
+        {
+            ClearResumeRequest();
+            return ResumeResult::SUPERSEDED;
+        }
+
+        m_resumeAlarmUpdateCount = updateAfter;
+        m_resumeAlarmIntentBaseState = intentAfter;
+        m_resumeHomeMotionLease = m_homeMotionLease;
+        m_resumeAdmissionTicketValid = true;
+        m_resumeRequested = true;
+    }
+
+    if (!m_resumeAdmissionTicketValid ||
+        !m_resumeHomeMotionLease.Matches(m_homeMotionLease))
+    {
+        ClearResumeRequest();
+        return ResumeResult::SUPERSEDED;
     }
 
     // 操作員可以在 Controlled Stop 尚未完全結束前先按 Start。
@@ -722,20 +781,10 @@ bool HomingManager::Resume()
     if (m_runControlState ==
         HomeRunControlState::HOLD_DECEL_STOP)
     {
-        m_resumeRequested =
-            true;
-
-        return true;
+        return ResumeResult::DEFERRED;
     }
 
-    if (m_runControlState !=
-        HomeRunControlState::PAUSED)
-    {
-        return false;
-    }
-
-    ResumeFromPaused();
-    return true;
+    return TryResumeFromPaused();
 }
 
 
@@ -787,8 +836,7 @@ void HomingManager::Reset()
     m_cancelRequested =
         false;
 
-    m_resumeRequested =
-        false;
+    ClearResumeRequest();
 
     m_runControlState =
         HomeRunControlState::IDLE;
@@ -1944,8 +1992,7 @@ void HomingManager::ProcessCancel()
     m_cancelRequested =
         false;
 
-    m_resumeRequested =
-        false;
+    ClearResumeRequest();
 
     m_runControlState =
         HomeRunControlState::IDLE;
@@ -2072,21 +2119,72 @@ void HomingManager::ProcessHold(
     // 操作員可能在減速尚未完成前就先按 C12。
     if (m_resumeRequested)
     {
-        ResumeFromPaused();
+        (void)TryResumeFromPaused();
     }
 }
 
 
-void HomingManager::ResumeFromPaused()
+HomingManager::ResumeResult HomingManager::TryResumeFromPaused() noexcept
 {
     if (!m_active ||
+        m_hasError ||
+        m_cancelRequested ||
         m_runControlState !=
-        HomeRunControlState::PAUSED)
+        HomeRunControlState::PAUSED ||
+        !m_resumeRequested ||
+        !m_resumeAdmissionTicketValid ||
+        !m_resumeHomeMotionLease.IsValid() ||
+        !m_resumeHomeMotionLease.Matches(m_homeMotionLease) ||
+        m_nc == nullptr)
     {
-        return;
+        ClearResumeRequest();
+        return ResumeResult::SUPERSEDED;
+    }
+
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    AlarmManager::MotionAdmissionReservation admission{};
+    const AlarmManager::MotionAdmissionResult beginResult =
+        alarms.TryBeginMotionAdmission(
+            m_resumeAlarmUpdateCount,
+            m_resumeAlarmIntentBaseState,
+            admission,
+            true);
+    if (beginResult ==
+        AlarmManager::MotionAdmissionResult::BUSY)
+    {
+        return ResumeResult::DEFERRED;
+    }
+    if (beginResult !=
+        AlarmManager::MotionAdmissionResult::ACQUIRED)
+    {
+        ClearResumeRequest();
+        return ResumeResult::SUPERSEDED;
+    }
+
+    // Revalidate all HOME/NC/Motion identities only after admission.  A
+    // queued request never retargets a newer HOME owner generation.
+    if (!m_active ||
+        m_hasError ||
+        m_cancelRequested ||
+        m_runControlState !=
+        HomeRunControlState::PAUSED ||
+        !m_resumeRequested ||
+        !m_resumeAdmissionTicketValid ||
+        !m_resumeHomeMotionLease.Matches(m_homeMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_resumeHomeMotionLease) ||
+        m_nc == nullptr ||
+        m_nc->GetState() != NCState::HOLD)
+    {
+        const bool admissionEnded =
+            alarms.EndMotionAdmission(admission);
+        ClearResumeRequest();
+        (void)admissionEnded;
+        return ResumeResult::SUPERSEDED;
     }
 
 
+    int errorAxisIndex = -1;
+    HomeErrorReason resumeError = HomeErrorReason::NONE;
     for (int i = 0;
         i < HOME_AXIS_COUNT;
         ++i)
@@ -2110,12 +2208,9 @@ void HomingManager::ResumeFromPaused()
 
         if (!axis.isServoOn)
         {
-            SetAxisError(
-                i,
-                axis,
-                HomeErrorReason::SERVO_NOT_READY);
-
-            return;
+            errorAxisIndex = i;
+            resumeError = HomeErrorReason::SERVO_NOT_READY;
+            break;
         }
 
 
@@ -2126,21 +2221,81 @@ void HomingManager::ResumeFromPaused()
             axis.state ==
             MotionState::MotionState_ESTOP)
         {
-            SetAxisError(
-                i,
-                axis,
-                HomeErrorReason::MOTION_FAULT);
-
-            return;
+            errorAxisIndex = i;
+            resumeError = HomeErrorReason::MOTION_FAULT;
+            break;
         }
 
 
         if (axis.state !=
             MotionState::MotionState_IDLE)
         {
-            return;
+            const bool admissionEnded =
+                alarms.EndMotionAdmission(admission);
+            if (!admissionEnded)
+            {
+                ClearResumeRequest();
+                return ResumeResult::SUPERSEDED;
+            }
+            return ResumeResult::DEFERRED;
+        }
+    }
+
+    if (resumeError != HomeErrorReason::NONE)
+    {
+        const bool admissionEnded =
+            alarms.EndMotionAdmission(admission);
+        AxisContext& errorAxis =
+            m_motion.GetAxisContext(errorAxisIndex);
+        SetAxisError(
+            errorAxisIndex,
+            errorAxis,
+            resumeError);
+        return admissionEnded
+            ? ResumeResult::REJECTED
+            : ResumeResult::SUPERSEDED;
+    }
+
+    if (!alarms.IsMotionAdmissionCurrent(admission) ||
+        !m_active ||
+        m_hasError ||
+        m_cancelRequested ||
+        m_runControlState !=
+        HomeRunControlState::PAUSED ||
+        !m_resumeRequested ||
+        !m_resumeAdmissionTicketValid ||
+        !m_resumeHomeMotionLease.Matches(m_homeMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_resumeHomeMotionLease) ||
+        m_nc == nullptr ||
+        m_nc->GetState() != NCState::HOLD)
+    {
+        const bool admissionEnded =
+            alarms.EndMotionAdmission(admission);
+        ClearResumeRequest();
+        (void)admissionEnded;
+        return ResumeResult::SUPERSEDED;
+    }
+
+    // Validation and mutation are intentionally separate.  No earlier axis
+    // receives a partial PID reset when a later axis is still stopping.
+    for (int i = 0;
+        i < HOME_AXIS_COUNT;
+        ++i)
+    {
+        if (!IsAxisRequested(
+            m_activeAxisMask,
+            i))
+        {
+            continue;
         }
 
+        AxisContext& axis =
+            m_motion.GetAxisContext(i);
+        if (!axis.homeRuntime.active ||
+            axis.homeRuntime.completed)
+        {
+            continue;
+        }
 
         // Bumpless Resume：不改 Search / Backoff / Index 起點，
         // 只清除 PID 歷史，避免暫停期間殘留積分造成起步突波。
@@ -2151,23 +2306,60 @@ void HomingManager::ResumeFromPaused()
             0.0;
     }
 
+    // Reset/Alarm-independent owner and NC transitions are not covered by the
+    // Alarm word.  Re-prove them at the final mutation seam as well.
+    if (!alarms.IsMotionAdmissionCurrent(admission) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_resumeHomeMotionLease) ||
+        m_nc == nullptr ||
+        m_nc->GetState() != NCState::HOLD)
+    {
+        (void)alarms.EndMotionAdmission(admission);
+        ClearResumeRequest();
+        return ResumeResult::SUPERSEDED;
+    }
 
-    m_resumeRequested =
-        false;
+    // NC owns the state CAS.  Its lease -> HOLD/RUN CAS -> lease proof makes a
+    // concurrent Reset/Alarm state win without a raw store from HOME.
+    if (!m_nc->TryCommitHomingResume(m_resumeHomeMotionLease))
+    {
+        (void)alarms.EndMotionAdmission(admission);
+        ClearResumeRequest();
+        return ResumeResult::SUPERSEDED;
+    }
 
     m_runControlState =
         HomeRunControlState::RUNNING;
-
-
-    // 若 Cycle Start 在減速完成前已經先按下，
-    // NCManager 當時仍維持 HOLD；此處正式恢復 RUN。
-    if (m_nc != nullptr &&
-        m_nc->GetState() ==
-        NCState::HOLD)
+    if (m_nc->GetState() != NCState::RUN ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_resumeHomeMotionLease))
     {
-        m_nc->ChangeState(
-            NCState::RUN);
+        m_runControlState =
+            HomeRunControlState::PAUSED;
+        m_nc->TryRollbackHomingResume();
+        (void)alarms.EndMotionAdmission(admission);
+        ClearResumeRequest();
+        return ResumeResult::SUPERSEDED;
     }
+
+    ClearResumeRequest();
+
+    if (!alarms.EndMotionAdmission(admission))
+    {
+        // RUN was only provisional while the reservation was held.  No NC
+        // dispatch can occur inside this HOME call.  Restore HOLD before
+        // returning and force the overlapping Alarm to remain fail-closed.
+        if (m_active &&
+            !m_hasError &&
+            !m_cancelRequested)
+        {
+            m_runControlState =
+                HomeRunControlState::PAUSED;
+        }
+        m_nc->TryRollbackHomingResume();
+        m_motion.RequestEmergencyStopAllAxes();
+        return ResumeResult::SUPERSEDED;
+    }
+
+    return ResumeResult::APPLIED;
 }
 
 
@@ -4846,8 +5038,7 @@ void HomingManager::SetAxisError(
     m_cancelRequested =
         false;
 
-    m_resumeRequested =
-        false;
+    ClearResumeRequest();
 
     m_runControlState =
         HomeRunControlState::IDLE;
@@ -4992,8 +5183,7 @@ void HomingManager::CompleteRequest()
     m_cancelRequested =
         false;
 
-    m_resumeRequested =
-        false;
+    ClearResumeRequest();
 
     m_runControlState =
         HomeRunControlState::IDLE;

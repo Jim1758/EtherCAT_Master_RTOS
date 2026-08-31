@@ -2,6 +2,7 @@
 #include "EtherCatMaster_DC_Internal.h"
 #include "EtherCatMaster_DC_Topology.h"
 #include "EtherCatMaster_DC_Tuning.h"
+#include "AlarmManager.h"
 #include "ConfigReader.h"
 #include "GlobalConfig.h"
 #include <windows.h>
@@ -1029,6 +1030,13 @@ int EtherCatMaster::StartDcPdoRuntime()
     HANDLE hTimer_PDO = NULL;
     LARGE_INTEGER liPeriod_PDO;
     liPeriod_PDO.QuadPart = 2500; // CLOCK_2 以 100 ns 為單位：2500 = 250 us。
+
+    // The PDO callback is the first high-priority RT consumer of the Alarm
+    // manager.  AlarmManager now has module-static storage, so this is only
+    // an explicit startup reference: no C++ function-local-static guard can
+    // be entered by the 250 us callback.  It performs no Alarm mutation and
+    // no EtherCAT I/O.
+    (void)AlarmManager::GetInstance();
 
 
     // ========================================================================

@@ -15,15 +15,15 @@ CoordinateManager::CoordinateManager()
     m_ToolRadius.resize(100, std::vector<double>(8, 0.0));
     m_WorkOffset.resize(100, std::vector<double>(8, 0.0));
     m_RefPoints.resize(100, std::vector<double>(8, 0.0));
-   
+
     // 2. 開機自動載入所有檔案
-  
+
     LoadAllParameters();
 
     // 🌟 開機預設為 G49 關閉刀長補正
     toolLengthMode = 49;
     currentHCode = 0;
-  
+
 }
 
 bool CoordinateManager::SetWCS(int gCode, NCManager* nc)
@@ -63,7 +63,36 @@ void CoordinateManager::SyncMachinePosition(const double* actualMCS) {
     }
 }
 
-void CoordinateManager::Transform_WCS_to_MCS(const double* targetWCS, const bool* hasAxis, double* outputMCS) {
+void CoordinateManager::Transform_WCS_to_MCS(
+    const double* targetWCS,
+    const bool* hasAxis,
+    double* outputMCS)
+{
+    Transform_WCS_to_MCS_Internal(
+        targetWCS,
+        hasAxis,
+        outputMCS,
+        true);
+}
+
+void CoordinateManager::Preview_WCS_to_MCS(
+    const double* targetWCS,
+    const bool* hasAxis,
+    double* outputMCS)
+{
+    Transform_WCS_to_MCS_Internal(
+        targetWCS,
+        hasAxis,
+        outputMCS,
+        false);
+}
+
+void CoordinateManager::Transform_WCS_to_MCS_Internal(
+    const double* targetWCS,
+    const bool* hasAxis,
+    double* outputMCS,
+    bool commitCommandedMCS)
+{
 
     // 🌟 先複製一份 targetWCS，方便我們做旋轉加工
     double finalTargetWCS[8];
@@ -197,7 +226,10 @@ void CoordinateManager::Transform_WCS_to_MCS(const double* targetWCS, const bool
         else {
             outputMCS[i] = commandedMCS[i] + targetWCS[i]; // G91 增量通常不吃 G68 (視各廠牌規定)
         }
-        commandedMCS[i] = outputMCS[i];
+        if (commitCommandedMCS)
+        {
+            commandedMCS[i] = outputMCS[i];
+        }
     }
 }
 
@@ -527,7 +559,7 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
     }
 }
 // 🌟 2. 實作 ApplyG92 (直接覆寫當前表格！)
-void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targetPos , NCManager* nc) {
+void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targetPos, NCManager* nc) {
 
     // 1. 取得「當下」包含所有補正(刀長、旋轉等)的純粹命令工作座標
     double currentCmdWCS[8] = { 0.0 };
@@ -558,13 +590,13 @@ void CoordinateManager::GetActualMCS(double* outMCS) const {
     }
 }
 
-void  CoordinateManager::Set_G90G91(int value,NCManager* nc)//設定90絕對模式 91增量模式
+void  CoordinateManager::Set_G90G91(int value, NCManager* nc)//設定90絕對模式 91增量模式
 {
     if (value == 90)
     {
         isAbsoluteMode = true;
         nc->MacroSys.SetVar('$', 3, 90);
-       
+
     }
     if (value == 91)
     {
@@ -602,7 +634,7 @@ void CoordinateManager::CancelToolLengthCompensation(NCManager* nc)
 {
     toolLengthMode = 49; // 強制切換為 G49
     currentHCode = 0;
-   
+
 
     // 更新系統巨集變數 (群組 8 的狀態改為 49)
     if (nc) nc->MacroSys.SetVar('$', 8, 49.0);
@@ -879,7 +911,7 @@ void CoordinateManager::SetToolRadiusCompensation(int gCode, int dCode, NCManage
 void CoordinateManager::CancelToolRadiusCompensation(NCManager* nc)
 {
     toolRadiusMode = 40;
-     currentDCode = 0; // 通常 D 碼保留，只改狀態
+    currentDCode = 0; // 通常 D 碼保留，只改狀態
     if (nc) nc->MacroSys.SetVar('$', 7, 40.0);
     RtPrintf("[G40] Tool Radius Comp OFF.\n");
 }
@@ -914,7 +946,7 @@ void CoordinateManager::SetToolNumber(int tCode, NCManager* nc)
     // (選配) 如果需要將 T 碼狀態寫入巨集變數或觸發狀態廣播
     if (nc) {
         // 例如更新系統巨集變數
-         nc->MacroSys.SetVar('$', 48, (double)tCode);
+        nc->MacroSys.SetVar('$', 48, (double)tCode);
     }
 
     //DEBUG_PRINT("[Coordinate] Tool Number Updated: T%d\n", currentTCode);
@@ -926,10 +958,10 @@ void CoordinateManager::SetWorkpieceNumber(int num, NCManager* nc)
     currentWorkpieceNum = num;
 
     // (選配) 如果你有需要，也可以在這裡直接即時更新 $49
-     if (nc)
-     {
-         nc->MacroSys.SetVar('$', 49, (double)num);
-     }
+    if (nc)
+    {
+        nc->MacroSys.SetVar('$', 49, (double)num);
+    }
 
     // DEBUG_PRINT("[Coordinate] Independent Workpiece Number Updated: %d\n", currentWorkpieceNum);
 }

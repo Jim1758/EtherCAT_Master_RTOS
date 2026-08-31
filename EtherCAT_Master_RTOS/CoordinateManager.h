@@ -165,6 +165,15 @@ public:
     void SyncMachinePosition(const double* actualMCS);
     void Transform_WCS_to_MCS(const double* targetWCS, const bool* hasAxis, double* outputMCS);
 
+    // Stage NC-0.2K.6.2: calculate the complete G00 MCS candidate without
+    // publishing commandedMCS.  The normal G00 producer commits that endpoint
+    // together with lastQueuedPulse only after Motion ingress accepts the
+    // matching command.
+    void Preview_WCS_to_MCS(
+        const double* targetWCS,
+        const bool* hasAxis,
+        double* outputMCS);
+
 
     // 🌟 新增：刀長補正控制 API
     void SetToolLengthCompensation(int gCode, int hCode, NCManager* nc);
@@ -175,7 +184,7 @@ public:
     // ==========================================
     // 🌟 新增：多檔案管理系統
     // ==========================================
-  
+
     void LoadAllParameters();
     void SaveAllParameters();
 
@@ -186,26 +195,26 @@ public:
     void SaveToolRadius();
     void SaveRefPoints();
     void SaveWorkOffset();
- 
+
     void SaveWCSTable();
     int GetCurrentWCSGCode() const;
 
-  
+
     // 🌟 新增：G92 相關 API
-    void ApplyG92(const bool* axisProgrammed, const double* targetPos , NCManager* nc);
+    void ApplyG92(const bool* axisProgrammed, const double* targetPos, NCManager* nc);
 
     void GetActualMCS(double* outMCS) const; // 取出當前的真實機械座標
      // 🌟 新增：獲取當前純粹的數學命令座標 (Commanded WCS) - 供 G92 等內部數學計算用
     void GetCommandedWCS(double* outWCS) const;
 
     void Set_G90G91(int value, NCManager* nc);//設定90絕對模式 91增量模式
-   
+
     // ==========================================
     // 🌟 旋轉控制 API
     // ==========================================
     void SetWorkpieceRotation(int wCode, const bool* hasAxis, const double* targetWCS, NCManager* nc);
     void CancelWorkpieceRotation(NCManager* nc);
-   
+
 
     bool GetRefPoint(int pCode, double* outPos) const;
 
@@ -282,7 +291,7 @@ public:
 // nc:
 //      預留給後續 Alarm / System Variable / 狀態同步。
 // ----------------------------------------------------------
-    void SetStoredStrokeCheckMode(int gCode,NCManager* nc = nullptr);
+    void SetStoredStrokeCheckMode(int gCode, NCManager* nc = nullptr);
 
 
     // ----------------------------------------------------------
@@ -332,7 +341,7 @@ public:
     // 不產生 Alarm。
     // 不直接停止 Motion。
     // ----------------------------------------------------------
-    void UpdateSoftwareTravelLimitState( AxisContext& axis) const;
+    void UpdateSoftwareTravelLimitState(AxisContext& axis) const;
 
 
     // ----------------------------------------------------------
@@ -355,7 +364,7 @@ public:
     // true  = Target 合法
     // false = Target 超出啟用中的 Software Travel Limit
     // ----------------------------------------------------------
-    bool IsTargetWithinSoftwareTravelLimit( const AxisContext& axis,  double targetMCS) const;
+    bool IsTargetWithinSoftwareTravelLimit(const AxisContext& axis, double targetMCS) const;
 
 
     // ----------------------------------------------------------
@@ -374,7 +383,7 @@ public:
     //
     // 所以 JOG 可以反方向離開。
     // ----------------------------------------------------------
-    bool CanMoveSoftwarePositive( const AxisContext& axis) const;
+    bool CanMoveSoftwarePositive(const AxisContext& axis) const;
     bool CanMoveSoftwareNegative(const AxisContext& axis) const;
 
     // ==========================================================
@@ -422,16 +431,16 @@ public:
     // HMI 正式建議使用這個 API。
     // ----------------------------------------------------------
 
-    void SetManualFrameAngles( double yawDeg, double pitchDeg, double rollDeg);
+    void SetManualFrameAngles(double yawDeg, double pitchDeg, double rollDeg);
 
 
     // ----------------------------------------------------------
     // 各別設定
     // ----------------------------------------------------------
 
-    void SetManualFrameYaw( double yawDeg);
+    void SetManualFrameYaw(double yawDeg);
     void SetManualFramePitch(double pitchDeg);
-    void SetManualFrameRoll( double rollDeg);
+    void SetManualFrameRoll(double rollDeg);
 
 
     // ----------------------------------------------------------
@@ -454,7 +463,7 @@ public:
     // NCPLCManager 不需要知道角度來源。
     // ----------------------------------------------------------
 
-    void TransformManualVector(const double* manualVector,double* machineVector) const;
+    void TransformManualVector(const double* manualVector, double* machineVector) const;
 
 
     // ==========================================================
@@ -473,6 +482,12 @@ public:
 
     bool m_programmableTravelLimitEnabled = false;
 private:
+    void Transform_WCS_to_MCS_Internal(
+        const double* targetWCS,
+        const bool* hasAxis,
+        double* outputMCS,
+        bool commitCommandedMCS);
+
     // 底層輔助函式：負責讀寫 8 軸二維陣列，並確保原子寫入防護
     void SaveTableToFile(const std::string& filename, const std::vector<std::vector<double>>& table);
     void LoadTableFromFile(const std::string& filename, std::vector<std::vector<double>>& table, int maxRows);
@@ -481,10 +496,10 @@ private:
 // Manual Frame State
 // ==========================================================
 
-    bool m_manualFrameEnabled =false;
-    double m_manualFrameYawDeg =0.0;
+    bool m_manualFrameEnabled = false;
+    double m_manualFrameYawDeg = 0.0;
     double m_manualFramePitchDeg = 0.0;
-    double m_manualFrameRollDeg =0.0;
+    double m_manualFrameRollDeg = 0.0;
 
 
 };

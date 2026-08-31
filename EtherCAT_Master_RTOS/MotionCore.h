@@ -7,6 +7,7 @@
 #include <atomic>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <queue> // 引入佇列函式庫
 #include <type_traits>
 #include <deque>
@@ -15,9 +16,11 @@
 #include "SHM_Types.h"
 #include "MotionExecutionContract.h"
 #include "MotionCommandPathModeTransport.h"
+#include "MotionQueueTailTransaction.h"
 #include "MotionCommandRing.h"
 #include "MotionFeedbackRing.h"
 #include "MotionAxisCommandMailbox.h"
+#include "AlarmManager.h"
 
 class EtherCatMaster;
 constexpr int MAX_AXES = 8;//最大軸數宣告
@@ -95,6 +98,90 @@ enum class AxisType {
     ROTARY = 1,       // 旋轉軸 (單位 Degree，0~360 循環，走最短路徑)
     ROTARY_CONTINUOUS = 2 // 連續旋轉軸 (例如主軸，一直累加不歸零)
 };
+
+// K.6.2: RT owns logical command-position updates while NC samples lifecycle
+// baselines; NC normally owns the queued endpoint while lifecycle/reset may
+// rebase it.  A copyable 64-bit atomic scalar keeps those roles data-race-free
+// without changing either existing AxisContext field footprint.
+class MotionAtomicDouble
+{
+public:
+    MotionAtomicDouble() noexcept = default;
+    MotionAtomicDouble(double value) noexcept
+        : m_bits(Encode(value))
+    {
+    }
+
+    MotionAtomicDouble(const MotionAtomicDouble& other) noexcept
+        : m_bits(other.m_bits.load(std::memory_order_acquire))
+    {
+    }
+
+    MotionAtomicDouble& operator=(
+        const MotionAtomicDouble& other) noexcept
+    {
+        Store(other.Load());
+        return *this;
+    }
+
+    MotionAtomicDouble& operator=(double value) noexcept
+    {
+        Store(value);
+        return *this;
+    }
+
+    operator double() const noexcept
+    {
+        return Load();
+    }
+
+    double Load() const noexcept
+    {
+        return Decode(m_bits.load(std::memory_order_acquire));
+    }
+
+    void Store(double value) noexcept
+    {
+        m_bits.store(Encode(value), std::memory_order_release);
+    }
+
+    // One exact, bounded RMW.  Callers treat contention as an ownership
+    // invariant failure; the fixed-period Runtime must never spin here.
+    bool TryCompareExchange(double expected, double desired) noexcept
+    {
+        std::uint64_t expectedBits = Encode(expected);
+        return m_bits.compare_exchange_strong(
+            expectedBits,
+            Encode(desired),
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+
+private:
+    static std::uint64_t Encode(double value) noexcept
+    {
+        std::uint64_t bits = 0ULL;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
+    static double Decode(std::uint64_t bits) noexcept
+    {
+        double value = 0.0;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    std::atomic<std::uint64_t> m_bits{ 0ULL };
+};
+
+static_assert(
+    ATOMIC_LLONG_LOCK_FREE == 2,
+    "K.6.2 queue-tail rebase requires lock-free 64-bit atomics.");
+static_assert(
+    sizeof(MotionAtomicDouble) == sizeof(double) &&
+    alignof(MotionAtomicDouble) == alignof(double),
+    "K.6.2 atomic queue-tail scalar must preserve the double footprint.");
 
 
 struct AxisContext//軸參數與狀態
@@ -272,7 +359,7 @@ struct AxisContext//軸參數與狀態
     double currentActPos = 0.0;// 實際馬達回授的真實位置
 
     // 🟢 [新增] 大腦專用的邏輯座標與速度 (G68 計算用)
-    double logicalCmdPos = 0.0;//是給上層 NC 大腦思考用的（它是還原了 G68 空間旋轉、補正後的純邏輯點）。
+    MotionAtomicDouble logicalCmdPos{ 0.0 };//是給上層 NC 大腦思考用的（它是還原了 G68 空間旋轉、補正後的純邏輯點）。
     double logicalCmdVel = 0.0;
 
     //機台狀態旗標-------------------------------------------------
@@ -375,7 +462,7 @@ struct AxisContext//軸參數與狀態
 
 
     // 🌟 新增：用來給預讀引擎追蹤的「虛擬最後位置」
-    double lastQueuedPulse = 0.0;
+    MotionAtomicDouble lastQueuedPulse{ 0.0 };
 
     int servoOffCounter = 0;
 
@@ -557,6 +644,7 @@ struct MotionProgramBlockSubmission
     MotionExecutionIdentity identity{};
     MotionCommandPathMode commandPathMode =
         MotionCommandPathMode::UNSPECIFIED;
+    MotionQueueTailCommitReceipt queueTailReceipt{};
     bool producerAccepted = false;
     MotionRejectReason immediateRejectReason = MotionRejectReason::NONE;
 };
@@ -1418,6 +1506,37 @@ static_assert(
     std::is_trivially_copyable<MotionNCResetRebaseAck>::value,
     "MotionNCResetRebaseAck must remain trivially copyable.");
 
+// Kept outside MotionStopSettlePublicationPayload: that fixed RT bank already
+// occupies its 192-word ABI ceiling. A separate bounded seqlock binds the
+// supervisory Reset release to the exact post-proof Safety incident.
+struct MotionNCResetSafetyReleaseAuthorization
+{
+    MotionNCSettleRequestSequence requestSequence =
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+    std::uint64_t drainRevocationGeneration = 0ULL;
+    MotionExecutionEpoch executionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionOwnerGeneration ownerGeneration =
+        MOTION_OWNER_GENERATION_INVALID;
+    std::uint32_t safetyRequestTicket = 0U;
+
+    bool IsValid() const noexcept
+    {
+        return
+            requestSequence !=
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
+            drainRevocationGeneration != 0ULL &&
+            executionEpoch != MOTION_EXECUTION_EPOCH_INVALID &&
+            ownerGeneration != MOTION_OWNER_GENERATION_INVALID &&
+            safetyRequestTicket != 0U;
+    }
+};
+
+static_assert(
+    std::is_trivially_copyable<
+    MotionNCResetSafetyReleaseAuthorization>::value,
+    "Reset Safety release authorization must remain trivially copyable.");
+
 
 //核心類別宣告--------------------------------------------------------------------
 // ==========================================
@@ -1458,6 +1577,29 @@ public:
 
     //軸狀態
     void UpdateAllMotion();//更新全部軸狀態 逐步激磁
+
+    // Priority-64 EtherCAT send-point transaction. Begin acquires exact
+    // packed Owner/Epoch reservations before the final LRW payload capture;
+    // Finalize verifies them and End keeps both held through SendPacket. On a
+    // race the live image is scrubbed and copied once more as all-zero.
+    struct ServoOutputFrameReservation
+    {
+        AlarmManager::MotionAdmissionReservation alarmAdmission{};
+        std::uint64_t baseOwnerState = 0ULL;
+        std::uint64_t reservedOwnerState = 0ULL;
+        std::uint64_t baseExecutionPublication = 0ULL;
+        std::uint64_t reservedExecutionPublication = 0ULL;
+        std::uint64_t safetyIntentState = 0ULL;
+        bool acquired = false;
+        bool recopyRequired = false;
+    };
+
+    bool BeginServoOutputFrameAtSendPoint(
+        ServoOutputFrameReservation& reservation) noexcept;
+    bool FinalizeServoOutputFrameAtSendPoint(
+        ServoOutputFrameReservation& reservation) noexcept;
+    void EndServoOutputFrameAfterSend(
+        ServoOutputFrameReservation& reservation) noexcept;
 
     // Stage 11D.6:
     // Input arrives through MotionServoInputSnapshot.
@@ -1525,7 +1667,11 @@ public:
     bool GetDriveTouchProbeData(int axisIndex, uint16_t& status, int32_t& capturedPosition) const;
     bool SetDriveTouchProbeFunction(int axisIndex, uint16_t value);
     double ConvertDriveCaptureToRawLogicalPulse(int axisIndex, int32_t capturedPosition, HomeReferenceSource source) const;
-    bool ApplyMachineHome(AxisContext& axis, double capturedReferencePulse, double homeOffsetUnit);
+    bool ApplyMachineHome(
+        AxisContext& axis,
+        double capturedReferencePulse,
+        double homeOffsetUnit,
+        const MotionOwnerLease& ownerLease);
 
     //多軸插補功能區塊--------------------------------------------------------------------
 
@@ -1583,7 +1729,81 @@ public:
     bool ReleaseMotionOwner(
         const MotionOwnerLease& lease) noexcept;
 
+    enum class SafetyMotionOwnerReleaseStatus : std::uint8_t
+    {
+        DEFERRED = 0,
+        RELEASED,
+        SUPERSEDED
+    };
+
+    SafetyMotionOwnerReleaseStatus TryReleaseSafetyMotionOwner(
+        const MotionOwnerLease& lease,
+        const MotionNCResetSafetyReleaseAuthorization&
+        authorization) noexcept;
+
+    bool ReleaseSafetyMotionOwner(
+        const MotionOwnerLease& lease,
+        const MotionNCResetSafetyReleaseAuthorization&
+        authorization) noexcept;
+
     MotionOwnerLease TakeSafetyMotionOwner() noexcept;
+    MotionOwnerLease BeginNewSafetyMotionOwnerGeneration() noexcept;
+    MotionOwnerLease ContinueNewSafetyMotionOwnerGeneration(
+        MotionOwnerGeneration entryGeneration) noexcept;
+
+    enum class ResetSafetyAuthorityStatus : std::uint8_t
+    {
+        DEFERRED = 0,
+        ACQUIRED,
+        SUPERSEDED
+    };
+
+    struct ResetSafetyAuthorityResult
+    {
+        ResetSafetyAuthorityStatus status =
+            ResetSafetyAuthorityStatus::DEFERRED;
+        MotionOwnerLease lease{};
+        std::uint32_t requestTicket = 0U;
+        std::uint64_t provenanceGeneration = 0ULL;
+    };
+
+    // Hold the process-data send seam closed for the complete multi-scan
+    // Reset transaction.  This is deliberately independent of the drain-
+    // acknowledgement publisher count: RT may continue consuming and
+    // acknowledging pre-existing safety work while every outgoing target
+    // velocity remains zero.
+    std::uint64_t BeginResetSafetyOutputHold() noexcept;
+    bool IsResetSafetyOutputHoldEstablished() const noexcept;
+    void EndResetSafetyOutputHold() noexcept;
+    std::uint64_t MarkResetSafetyOperatorEdge() noexcept;
+    std::uint64_t GetSafetyProvenanceGeneration() const noexcept;
+
+    // Capture the exact post-drain baseline belonging to the operator edge.
+    // Every independent Safety producer increments provenance before it can
+    // publish a ticket/mailbox, including a producer temporarily blocked by
+    // a frame reservation.  Therefore a changed provenance is superseding,
+    // while a stable in-flight baseline is merely deferred.
+    ResetSafetyAuthorityResult TryCaptureResetSafetyAuthorityBaseline(
+        std::uint64_t expectedProvenanceGeneration) const noexcept;
+
+    // A Reset may retry through bounded reservations, but it may never join
+    // an unrelated SAFETY incident which happened to acquire the next owner
+    // generation.  Ticket + provenance form the persistent Reset identity.
+    ResetSafetyAuthorityResult ContinueResetSafetyMotionOwnerGeneration(
+        MotionOwnerGeneration entryGeneration,
+        std::uint32_t baselineTicket,
+        std::uint32_t requestTicket,
+        std::uint64_t expectedProvenanceGeneration) noexcept;
+
+    ResetSafetyAuthorityStatus TryGetResetSafetyMotionOwnerEpoch(
+        const MotionOwnerLease& safetyLease,
+        std::uint32_t requestTicket,
+        std::uint64_t expectedProvenanceGeneration,
+        MotionExecutionEpoch& executionEpoch) const noexcept;
+
+    bool TryGetSafetyMotionOwnerEpoch(
+        const MotionOwnerLease& safetyLease,
+        MotionExecutionEpoch& executionEpoch) const noexcept;
 
     MotionOwnerLease GetMotionOwnerLease() const noexcept;
 
@@ -1671,6 +1891,17 @@ public:
     void RequestResetSafetyBatch(
         MotionExecutionEpoch publishedEpoch,
         bool requestResetAllFaults) noexcept;
+
+    // Strict Reset-only parent -> child publication.  The batch is visible
+    // only when the exact SAFETY lease, Epoch, ticket and provenance still
+    // belong to this Reset; an unrelated Safety producer is SUPERSEDED.
+    ResetSafetyAuthorityResult RequestExactResetSafetyBatch(
+        MotionExecutionEpoch publishedEpoch,
+        const MotionOwnerLease& safetyLease,
+        std::uint32_t parentRequestTicket,
+        std::uint64_t expectedProvenanceGeneration,
+        bool requestResetAllFaults,
+        bool requestControlledStop = false) noexcept;
 
     bool HasPendingSafetyOrRecoveryRequests() const noexcept;
 
@@ -1860,6 +2091,11 @@ public:
     MotionCommandPathModeTransportSnapshot
         GetCommandPathModeTransportSnapshot() const noexcept;
 
+    // Stage NC-0.2K.6.2: coherent producer-side proof that the G00 queue-tail
+    // endpoint was published only after the matching ingress command.
+    MotionQueueTailTransactionSnapshot
+        GetQueueTailTransactionSnapshot() const noexcept;
+
     MotionLifecycleCommitReservationSnapshot
         GetLifecycleCommitReservationSnapshot() const noexcept;
 
@@ -1879,6 +2115,8 @@ public:
     MotionNCSettleRequestSequence RequestResetNCSettleAndRebase(
         MotionExecutionEpoch executionEpoch,
         const MotionOwnerLease& ownerLease,
+        std::uint32_t safetyRequestTicket,
+        std::uint64_t safetyProvenanceGeneration,
         const MotionNCResetExecutionState& executionState,
         bool unsupportedFaultOrEstop) noexcept;
 
@@ -1889,7 +2127,14 @@ public:
 
     bool IsGroupNCSettled() const noexcept;
     bool IsGroupNCDrained() const noexcept;
+    bool HasExactExecutionDrainAcknowledgement(
+        MotionExecutionEpoch executionEpoch,
+        const MotionOwnerLease& ownerLease) const noexcept;
     MotionNCResetRebaseAck GetNCResetRebaseAck() const noexcept;
+    bool TryGetNCResetSafetyReleaseAuthorization(
+        MotionNCSettleRequestSequence requestSequence,
+        MotionNCResetSafetyReleaseAuthorization&
+        outAuthorization) const noexcept;
 
 
     // ========================================================
@@ -2129,6 +2374,8 @@ public:
 
     // 🌟 消滅幽靈座標專用 API：將大腦預讀起點，強制同步為馬達當下真實位置
     void SyncVirtualEndPosition();
+    bool TryGetSynchronizedG00QueueTailMCS(
+        double(&outputMCS)[MAX_AXES]) const noexcept;
 
     //G碼參數專區------------------------------------------------------------
     double G00_overrideRatio = 1;//G00 專屬速度比例
@@ -2213,6 +2460,8 @@ private:
         MotionExecutionEpoch executionEpoch =
             MOTION_EXECUTION_EPOCH_INVALID;
         MotionOwnerLease ownerLease{};
+        std::uint32_t safetyRequestTicket = 0U;
+        std::uint64_t safetyProvenanceGeneration = 0ULL;
         MotionNCResetExecutionState resetExecutionState{};
         bool unsupportedFaultOrEstop = false;
     };
@@ -2261,6 +2510,19 @@ private:
     MotionNCSettleRequest m_activeFeedHoldNCSettleRequest{};
     MotionNCSettleRequest m_activeResetNCSettleRequest{};
     MotionNCResetRebaseAck m_ncResetRebaseAckProducer{};
+    std::atomic<std::uint64_t>
+        m_ncResetReleaseAuthWriteSequence{ 0ULL };
+    std::atomic<MotionNCSettleRequestSequence>
+        m_ncResetReleaseAuthRequestSequence{
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID };
+    std::atomic<std::uint64_t>
+        m_ncResetReleaseAuthPackedIdentity{ 0ULL };
+    std::atomic<std::uint32_t>
+        m_ncResetReleaseAuthSafetyTicket{ 0U };
+    std::atomic<std::uint64_t>
+        m_ncResetReleaseAuthDrainGeneration{ 0ULL };
+    std::atomic<std::uint8_t>
+        m_ncResetReleaseAuthState{ 0U };
     MotionNCResetRebasePhase m_ncResetRebasePhase =
         MotionNCResetRebasePhase::IDLE;
     std::uint32_t m_ncLastGroupScopeMask = 0U;
@@ -2287,6 +2549,13 @@ private:
         MotionStopSettlePublicationPayload& payload) const noexcept;
     MotionNCSettleRequestSequence AllocateNCSettleRequestSequence() noexcept;
     bool SubmitNCSettleRequest(const MotionNCSettleRequest& request) noexcept;
+    bool IsExactResetNCSettleAuthorityCurrent(
+        const MotionNCSettleRequest& request) const noexcept;
+    bool TryAcquireExactResetNCSettleReservation(
+        const MotionNCSettleRequest& request,
+        std::uint64_t& reservedOwnerState) noexcept;
+    void ReleaseExactResetNCSettleReservation(
+        std::uint64_t reservedOwnerState) noexcept;
     bool ProcessNCSettleRequestsAndResetRebase() noexcept;
     void UpdateNCSettleProducer(
         MotionStopSettlePublicationPayload& payload) noexcept;
@@ -2304,6 +2573,14 @@ private:
     void ApplyNCResetScalarRebase() noexcept;
     bool ClearNCResetBuffersWithBudget() noexcept;
     bool VerifyNCResetRebaseState() const noexcept;
+    bool TryPublishNCResetSafetyReleaseAuthorization() noexcept;
+    bool TryClaimNCResetSafetyReleaseAuthorization(
+        MotionNCSettleRequestSequence requestSequence,
+        MotionNCResetSafetyReleaseAuthorization&
+        authorization) noexcept;
+    bool TryInvalidateNCResetSafetyReleaseAuthorization() noexcept;
+    bool ReleaseNCResetSafetyReleaseAuthorizationClaim() noexcept;
+    bool ConsumeNCResetSafetyReleaseAuthorizationClaim() noexcept;
 
     // ========================================================================
     // Stage NC-0.1D - Execution Identity + Command / Feedback Transport State
@@ -2327,7 +2604,9 @@ private:
     std::atomic<std::uint64_t> m_axisCommandQueueFullCount{ 0ULL };
     std::atomic<std::uint64_t> m_axisCommandResultOverflowCount{ 0ULL };
 
-    std::atomic<bool> m_emergencyStopAllPending{ false };
+    // bits 0..31 = causal pre-takeover Epoch, bit 32 = exact-evidence
+    // obligation, bit 62 = bounded publication reservation, bit 63 = pending.
+    std::atomic<std::uint64_t> m_emergencyStopRequestPublication{ 0ULL };
     std::atomic<bool> m_resetAllFaultsPending{ false };
     std::atomic<bool> m_stopGroupPending{ false };
 
@@ -2402,6 +2681,8 @@ private:
     // One atomic value keeps the Epoch proof and its deferred actions
     // correlated across the NC producer and the 250 us Motion consumer.
     std::atomic<std::uint64_t> m_resetSafetyBatchPending{ 0ULL };
+    std::atomic<std::uint64_t>
+        m_resetSafetyBatchProvenanceGeneration{ 0ULL };
 
     std::atomic<std::uint32_t> m_axisFaultResetPendingMask{ 0U };
     std::atomic<bool> m_safetyRecoveryRequestInProgress{ false };
@@ -2417,8 +2698,15 @@ private:
     bool TryPublishGroupMappingIntegrityAlarmRequest(
         MotionExecutionEpoch executionEpoch) noexcept;
     void EmergencyStopAllAxesImpl(
-        bool forceExecutionInvalidation) noexcept;
+        bool forceExecutionInvalidation,
+        MotionExecutionEpoch causalExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID) noexcept;
     void ResetAllFaultsImpl(bool publishExecutionEpoch);
+    // An operator Reset holds every final PDO velocity at zero before the
+    // exact RT batch is consumed.  It must therefore retire an active group
+    // as an abort, not enter the normal controlled-deceleration path which
+    // depends on non-zero PDO velocity commands reaching the drives.
+    void AbortActiveExecutionForResetSafetyBatch() noexcept;
     void StopGroupImpl(bool publishExecutionEpoch);
     void DrainAxisCommandMailbox() noexcept;
     void PublishAxisCommandResult(
@@ -2428,8 +2716,43 @@ private:
 
     // ========================================================================
     // Stage NC-0.1E：Owner + Generation 打包成單一 atomic state。
-    // Layout：bits 0..7 = MotionOwner，bits 32..63 = Generation。
+    // Layout: bits 0..3 Owner; bit 4 handshake; bit 5 per-axis output
+    // commit; bit 6 Safety action; bit 7 whole-frame send reservation;
+    // bit 8 Epoch commit reservation; bits 9..31 request ticket;
+    // bits 32..63 Owner Generation.
     std::atomic<std::uint64_t> m_motionOwnerState{ 0ULL };
+
+    // NC-0.2K.6.2: a successful SAFETY owner-generation takeover is not
+    // complete until a successor SAFETY Epoch has been published. The high
+    // word acknowledges the exact owner generation and the low word records
+    // one causally-later SAFETY Epoch. The separate expected-Epoch claim makes
+    // every same-generation helper target the same single publication.
+    std::atomic<std::uint64_t>
+        m_safetyOwnerEpochAcknowledgement{ 0ULL };
+    std::atomic<std::uint64_t>
+        m_safetyOwnerEpochClaim{ 0ULL };
+
+    // NC-0.2K.6.2: bits 8..31 of m_motionOwnerState carry one global
+    // cross-mailbox Safety request ticket. RT acknowledges only a ticket
+    // whose request publication and mutation are both complete. A Safety
+    // release CAS includes the same ticket, so a concurrent request
+    // invalidates release without refreshing Owner Generation or Epoch.
+    std::atomic<std::uint32_t>
+        m_safetyRequestAcknowledgedTicket{ 0U };
+
+    // A request can be consumed and have its pending bit cleared before the
+    // next coherent RT settle publication. These generations prevent an old
+    // exact-drain image from becoming valid again in that short interval.
+    std::atomic<std::uint64_t>
+        m_executionDrainRevocationGeneration{ 0ULL };
+    // High 32 bits: monotonic Safety-intent sequence. Low 32 bits: active
+    // revocation publishers. Begin updates both in one atomic RMW; this is
+    // the whole-PDO frame linearization fence.
+    std::atomic<std::uint64_t> m_frameSafetyIntentState{ 0ULL };
+    std::atomic<std::uint64_t>
+        m_executionDrainObservedRevocationGeneration{ 0ULL };
+    std::atomic<std::uint32_t>
+        m_executionDrainRevocationPublishersInProgress{ 0U };
 
     // bits 0..31 = current Epoch, bit 32 = exact-Epoch Abort Policy,
     // bits 33..40 = source, bit 62 = RT commit reservation and bit 63 =
@@ -2452,6 +2775,11 @@ private:
     // 最多只淘汰固定筆數，而不是每個 Helper 各自再淘汰一批。
     std::size_t m_staleCommandDiscardBudgetRemaining =
         MOTION_COMMAND_STALE_DISCARD_LIMIT_PER_RUNTIME_PASS;
+    std::atomic<bool> m_safetyControlledStopInProgress{ false };
+    MotionOwnerLease m_safetyControlledStopOwnerLease{};
+    MotionExecutionEpoch m_safetyControlledStopEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    std::uint32_t m_safetyControlledStopRequestTicket = 0U;
 
     std::atomic<std::uint64_t> m_commandQueueFullRejectCount{ 0ULL };
     std::atomic<std::uint64_t> m_commandReplayOverflowCount{ 0ULL };
@@ -2492,6 +2820,43 @@ private:
     std::atomic<std::uint64_t> m_pathModeAuthorityDriverBlocks{ 0ULL };
     std::atomic<std::uint64_t> m_pathModeAuthorityInvalidRejects{ 0ULL };
 
+    // K.6.2 producer-authoritative tail.  Normal G00 planning never samples
+    // RT queue/group state; lifecycle rebase enters only through
+    // SyncVirtualEndPosition before the next Program Run.
+    std::array<double, MAX_AXES> m_g00ProducerQueueTailPulse{};
+    std::uint32_t m_g00ProducerQueueTailValidMask = 0U;
+    MotionExecutionEpoch m_g00ProducerQueueTailEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionOwnerLease m_g00ProducerQueueTailOwnerLease{};
+
+    // Stage NC-0.2K.6.2: one NC Producer owns these counters. writeSequence is
+    // odd while the diagnostic payload is being changed and even when stable.
+    std::atomic<std::uint64_t> m_queueTailWriteSequence{ 0ULL };
+    std::atomic<MotionQueueTailTransactionSequence>
+        m_nextQueueTailTransactionSequence{ 1ULL };
+    std::atomic<std::uint64_t> m_queueTailAttempts{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailCommandAccepted{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailCommandRejected{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailCommitted{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailRejectPreserved{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailCommandedMCSCommitted{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailLastQueuedPulseCommitted{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailRapidOverrideCommitted{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailEndpointExact{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailCaptureBound{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailInvalidInputs{ 0ULL };
+    std::atomic<std::uint64_t> m_queueTailMismatches{ 0ULL };
+    std::atomic<MotionQueueTailTransactionSequence>
+        m_lastQueueTailTransactionSequence{
+            MOTION_QUEUE_TAIL_TRANSACTION_SEQUENCE_INVALID };
+    std::atomic<MotionExecutionEpoch> m_lastQueueTailExecutionEpoch{
+        MOTION_EXECUTION_EPOCH_INVALID };
+    std::atomic<MotionSegmentId> m_lastQueueTailSegmentId{
+        MOTION_SEGMENT_ID_INVALID };
+    std::atomic<std::uint32_t> m_lastQueueTailAxisMask{ 0U };
+    std::atomic<std::uint64_t> m_lastQueueTailCommittedFingerprint{
+        MOTION_QUEUE_TAIL_FINGERPRINT_SEED };
+
     std::atomic<MotionCommandSource> m_pendingCommandSource{ MotionCommandSource::UNKNOWN };
 
     // Stage NC-0.2D：只由 Motion Command Producer 使用。
@@ -2502,6 +2867,33 @@ private:
         const MotionCommand& command,
         bool producerAccepted,
         MotionRejectReason immediateRejectReason) noexcept;
+    bool BindProgramBlockQueueTailReceipt(
+        MotionQueueTailCommitReceipt& receipt) noexcept;
+    MotionQueueTailTransactionSequence
+        AllocateQueueTailTransactionSequence() noexcept;
+    void PublishQueueTailTransactionReceipt(
+        MotionQueueTailCommitReceipt& receipt,
+        bool invalidInput) noexcept;
+    bool TryLineMove(
+        const std::vector<int>& axes,
+        const std::vector<double>& targetPos,
+        double targetVel,
+        double acc_time,
+        double dec_time,
+        BufferMode mode,
+        MotionCommandPathMode commandPathMode,
+        MotionExecutionIdentity* producedIdentity,
+        MotionOwnerLease* producedOwnerLease,
+        MotionExecutionEpoch plannedTailEpoch,
+        const MotionOwnerLease* plannedTailOwnerLease) noexcept;
+    bool TryG00MoveInternal(
+        const std::vector<int>& axes,
+        const std::vector<double>& targetPos,
+        BufferMode mode,
+        MotionCommandPathMode commandPathMode,
+        double rapidOverrideCandidate,
+        double* commandedMCSTail,
+        bool transactionalTail);
     void ObserveCommandPathModeProducer(
         const MotionCommand& command,
         bool accepted) noexcept;
@@ -2513,11 +2905,21 @@ private:
     bool RejectFrontCommandForPathModeAuthority(
         const MotionCommand& peekedCommand,
         MotionCommandPathModeAuthorityDecision decision) noexcept;
+    void RejectNonGeometryProducerMotionCommand(
+        MotionCommand command,
+        MotionExecutionEpoch executionEpoch,
+        MotionCommandSource commandSource,
+        const MotionOwnerLease& ownerLease,
+        MotionRejectReason rejectReason,
+        MotionExecutionIdentity* producedIdentity = nullptr,
+        MotionOwnerLease* producedOwnerLease = nullptr) noexcept;
     void RejectInvalidProducerMotionCommand(
         MotionCommand command,
         MotionExecutionEpoch executionEpoch,
         MotionCommandSource commandSource,
-        const MotionOwnerLease& ownerLease) noexcept;
+        const MotionOwnerLease& ownerLease,
+        MotionExecutionIdentity* producedIdentity = nullptr,
+        MotionOwnerLease* producedOwnerLease = nullptr) noexcept;
 
     // --------------------------------------------------------------------
     // Final Feedback Ring：Runtime Producer -> NC Consumer
@@ -2552,11 +2954,62 @@ private:
 
     static std::uint64_t PackMotionOwnerState(
         MotionOwner owner,
-        MotionOwnerGeneration generation) noexcept;
+        MotionOwnerGeneration generation,
+        std::uint32_t safetyRequestTicket = 0U,
+        bool safetyHandshakeInProgress = false,
+        bool safetyActionPending = false) noexcept;
     static MotionOwnerLease UnpackMotionOwnerState(
+        std::uint64_t packed) noexcept;
+    static std::uint32_t UnpackMotionOwnerSafetyRequestTicket(
+        std::uint64_t packed) noexcept;
+    static bool UnpackMotionOwnerSafetyHandshake(
+        std::uint64_t packed) noexcept;
+    static bool UnpackMotionOwnerSafetyActionPending(
         std::uint64_t packed) noexcept;
     static MotionOwnerGeneration NextMotionOwnerGeneration(
         MotionOwnerGeneration current) noexcept;
+
+    bool EnsureSafetyMotionOwnerEpoch(
+        const MotionOwnerLease& safetyLease,
+        std::uint32_t safetyRequestTicket) noexcept;
+    std::uint32_t PublishSafetyMotionRequestTicket(
+        bool requiresRTApplication) noexcept;
+    bool EnsureSafetyMotionActionTicket(
+        std::uint32_t& safetyRequestTicket) noexcept;
+    bool CompleteSafetyMotionActionTicket(
+        std::uint32_t safetyRequestTicket) noexcept;
+    bool TryPublishEmergencyStopMailbox(
+        MotionExecutionEpoch causalExecutionEpoch,
+        bool evidenceRequired = false) noexcept;
+    bool PublishEmergencyStopMailboxContentionFallback(
+        MotionExecutionEpoch causalExecutionEpoch,
+        bool evidenceRequired) noexcept;
+    bool TryClaimEmergencyStopMailbox(
+        std::uint64_t& claimedRequest) noexcept;
+    bool TryClaimEmergencyStopMailboxForDirectContainment(
+        std::uint64_t& claimedRequest,
+        bool& evidenceReservationHeld) noexcept;
+    bool FinalizeDirectContainmentEmergencyStopMailbox(
+        std::uint64_t claimedRequest,
+        bool evidenceAlreadyPersistent) noexcept;
+    bool TryClaimResetSafetyBatch(
+        std::uint64_t& claimedBatch,
+        std::uint64_t& provenanceGeneration) noexcept;
+    bool FinalizeClaimedResetSafetyBatch(
+        std::uint64_t claimedBatch) noexcept;
+    MotionOwnerLease TryTakeSafetyMotionOwnerForTicket(
+        std::uint32_t safetyRequestTicket) noexcept;
+    bool HasUnacknowledgedSafetyMotionRequest() const noexcept;
+    bool HasPendingSafetyIntent() const noexcept;
+    void TryAcknowledgeAppliedSafetyMotionRequests() noexcept;
+    bool IsSafetyControlledStopAuthorized(
+        int contextAxisSlot) const noexcept;
+    void BeginExecutionDrainAcknowledgementRevocation() noexcept;
+    bool BeginResetSafetyProvenanceOperation(
+        std::uint64_t expectedProvenanceGeneration,
+        std::uint64_t& operationProvenanceGeneration) noexcept;
+    void EndExecutionDrainAcknowledgementRevocation() noexcept;
+    void RevokeExecutionDrainAcknowledgement() noexcept;
 
     MotionFeedbackSequence AllocateMotionFeedbackSequence() noexcept;
     bool TryQueueProducerFeedbackNotice(
@@ -2604,7 +3057,6 @@ private:
         std::uint64_t& reservationToken) noexcept;
     void ReleaseLifecycleCommitReservation(
         std::uint64_t reservationToken) noexcept;
-
     class LifecycleCommitReservationGuard
     {
     public:
@@ -2631,6 +3083,11 @@ private:
         bool abortActiveCommand) noexcept;
     MotionExecutionEpoch RequestAbortingExecutionEpoch(
         MotionCommandSource source) noexcept;
+    bool TryPublishOwnerAuthorizedAbortingExecutionEpoch(
+        MotionCommandSource source,
+        MotionExecutionEpoch expectedEpoch,
+        const MotionOwnerLease& expectedOwnerLease,
+        MotionExecutionEpoch& publishedEpoch) noexcept;
 
     bool HasPendingExecutionEpochChange() const noexcept;
     void DiscardStaleQueuedCommands();
@@ -2700,6 +3157,44 @@ private:
         ServoOutput* output,
         int axisIndex,
         int32_t value);
+
+    enum class ServoOutputImageProofMode : std::uint8_t
+    {
+        INVALID = 0,
+        ZERO_ONLY,
+        NORMAL,
+        CONTROLLED_STOP
+    };
+
+    struct ServoOutputImageProof
+    {
+        std::uint64_t ownerState = 0ULL;
+        std::uint64_t executionPublication = 0ULL;
+        std::uint64_t frameSafetyIntentState = 0ULL;
+        std::uint64_t alarmSafetyIntentState = 0ULL;
+        std::uint64_t generation = 0ULL;
+        std::uint32_t alarmUpdateCount = 0U;
+        std::uint32_t slotMask = 0U;
+        ServoOutputImageProofMode mode =
+            ServoOutputImageProofMode::INVALID;
+        std::array<std::int32_t, MAX_AXES> targetVelocity{};
+    };
+
+    // These fields are single-writer/single-reader on the same Priority-64
+    // callback: UpdateAllMotion builds the next image only after the current
+    // frame round trip, and EtherCAT captures it at the following send point.
+    ServoOutputImageProof m_servoOutputImageProof{};
+    std::uint64_t m_servoOutputImageProofGeneration = 0ULL;
+
+    void InvalidateServoOutputImageProof() noexcept;
+    bool ZeroAllServoTargetVelocityForFrame() noexcept;
+    bool PublishServoOutputImageProof(
+        std::uint64_t ownerState,
+        std::uint64_t executionPublication,
+        std::uint64_t frameSafetyIntentState,
+        std::uint64_t alarmSafetyIntentState,
+        std::uint32_t alarmUpdateCount,
+        ServoOutputImageProofMode mode) noexcept;
 
     void WriteServoTouchProbeFunctionCommand(
         ServoOutput* output,
@@ -2771,6 +3266,13 @@ public:
         const std::vector<double>& targetPos,
         BufferMode mode,
         MotionCommandPathMode commandPathMode);// K.6 explicit transport contract
+    bool TryG00MoveTransactionalTail(
+        const std::vector<int>& axes,
+        const std::vector<double>& targetPos,
+        BufferMode mode,
+        MotionCommandPathMode commandPathMode,
+        double rapidOverrideCandidate,
+        double(&commandedMCSTail)[MAX_AXES]);
     void G07_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G07 快速定位 API
     void G161_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G161 快速定位 API
     void G53_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G53 機械定位 API

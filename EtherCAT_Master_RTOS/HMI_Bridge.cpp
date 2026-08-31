@@ -979,7 +979,7 @@ namespace HMI_Bridge
 
         pShm->NC_Status.SHM_m_mode = static_cast<int32_t>(nc->m_mode);
 
-        pShm->NC_Status.SHM_NC_State = static_cast<int32_t>(nc->m_state);
+        pShm->NC_Status.SHM_NC_State = static_cast<int32_t>(nc->GetState());
         pShm->NC_Status.SHM_EDM_State = static_cast<int32_t>(nc->m_edmState);
 
 
@@ -1690,6 +1690,9 @@ namespace HMI_Bridge
         const MotionCommandPathModeTransportSnapshot commandPathModeTransport =
             motion.GetCommandPathModeTransportSnapshot();
 
+        const MotionQueueTailTransactionSnapshot queueTailTransaction =
+            motion.GetQueueTailTransactionSnapshot();
+
         std::uint64_t p1HandoverChangeToken = 1469598103934665603ULL;
         p1HandoverChangeToken = FoldDiagnosticEventToken(
             p1HandoverChangeToken,
@@ -1795,6 +1798,42 @@ namespace HMI_Bridge
         {
             commandPathModeChangeToken = FoldDiagnosticEventToken(
                 commandPathModeChangeToken,
+                value);
+        }
+
+        const std::uint64_t queueTailTransactionTokenFields[] =
+        {
+            queueTailTransaction.writeSequence,
+            queueTailTransaction.attempts,
+            queueTailTransaction.commandAccepted,
+            queueTailTransaction.commandRejected,
+            queueTailTransaction.committed,
+            queueTailTransaction.rejectPreserved,
+            queueTailTransaction.commandedMCSCommitted,
+            queueTailTransaction.lastQueuedPulseCommitted,
+            queueTailTransaction.rapidOverrideCommitted,
+            queueTailTransaction.endpointExact,
+            queueTailTransaction.captureBound,
+            queueTailTransaction.invalidInputs,
+            queueTailTransaction.mismatches,
+            queueTailTransaction.lastTransactionSequence,
+            queueTailTransaction.lastExecutionEpoch,
+            queueTailTransaction.lastSegmentId,
+            queueTailTransaction.lastAxisMask,
+            queueTailTransaction.lastCommittedFingerprint,
+            queueTailTransaction.authoritative ? 1ULL : 0ULL,
+            queueTailTransaction.shadowOnly ? 1ULL : 0ULL,
+            queueTailTransaction.cutoverAttempted ? 1ULL : 0ULL,
+            queueTailTransaction.runtimeInfluence ? 1ULL : 0ULL,
+            queueTailTransaction.ready ? 1ULL : 0ULL,
+            queueTailTransaction.snapshotCoherent ? 1ULL : 0ULL,
+            queueTailTransaction.accountingValid ? 1ULL : 0ULL
+        };
+        std::uint64_t queueTailTransactionChangeToken = 0ULL;
+        for (const std::uint64_t value : queueTailTransactionTokenFields)
+        {
+            queueTailTransactionChangeToken = FoldDiagnosticEventToken(
+                queueTailTransactionChangeToken,
                 value);
         }
 
@@ -2642,6 +2681,7 @@ namespace HMI_Bridge
         static std::uint64_t previousJ5EventToken = 0ULL;
         static std::uint64_t previousP1HandoverChangeToken = 0ULL;
         static std::uint64_t previousCommandPathModeChangeToken = 0ULL;
+        static std::uint64_t previousQueueTailTransactionChangeToken = 0ULL;
 
         const bool ownerChanged =
             startupSamples != 0U &&
@@ -2729,6 +2769,11 @@ namespace HMI_Bridge
             commandPathModeChangeToken !=
             previousCommandPathModeChangeToken;
 
+        const bool queueTailTransactionChanged =
+            startupSamples != 0U &&
+            queueTailTransactionChangeToken !=
+            previousQueueTailTransactionChangeToken;
+
         const bool shouldPrintJ5 =
             startupSamples == 0U ||
             j5EventChanged;
@@ -2755,6 +2800,7 @@ namespace HMI_Bridge
             alarmEmergencyStopChanged ||
             p1HandoverChanged ||
             commandPathModeChanged ||
+            queueTailTransactionChanged ||
             shouldPrintJ5 ||
             ownerChanged ||
             errorCounterChanged ||
@@ -2949,6 +2995,39 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(
                     commandPathModeTransport.authorityInvalidRejects),
                 commandPathModeTransport.accountingValid ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K62-TAIL] Try:%llu Accept:%llu Reject:%llu "
+                "Commit:%llu Preserve:%llu MCS:%llu Pulse:%llu "
+                "Ovr:%llu Exact:%llu Bound:%llu Invalid:%llu Mis:%llu "
+                "Ready:%u Coh:%u Acct:%u\n",
+                static_cast<unsigned long long>(
+                    queueTailTransaction.attempts),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.commandAccepted),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.commandRejected),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.committed),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.rejectPreserved),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.commandedMCSCommitted),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.lastQueuedPulseCommitted),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.rapidOverrideCommitted),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.endpointExact),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.captureBound),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.invalidInputs),
+                static_cast<unsigned long long>(
+                    queueTailTransaction.mismatches),
+                queueTailTransaction.ready ? 1U : 0U,
+                queueTailTransaction.snapshotCoherent ? 1U : 0U,
+                queueTailTransaction.accountingValid ? 1U : 0U);
 
             RtPrintf(
                 "[NC01F-CNT] AxisQFull:%llu AxisResOv:%llu "
@@ -5343,5 +5422,7 @@ namespace HMI_Bridge
         previousP1HandoverChangeToken = p1HandoverChangeToken;
         previousCommandPathModeChangeToken =
             commandPathModeChangeToken;
+        previousQueueTailTransactionChangeToken =
+            queueTailTransactionChangeToken;
     }
 }

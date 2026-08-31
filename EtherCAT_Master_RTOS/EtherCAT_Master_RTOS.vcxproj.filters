@@ -575,6 +575,9 @@
     <ClInclude Include="MotionCommandPathModeTransport.h">
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
+    <ClInclude Include="MotionQueueTailTransaction.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="DC同步_相關設定說明.txt">

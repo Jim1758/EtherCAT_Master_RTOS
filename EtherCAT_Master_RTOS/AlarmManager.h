@@ -1,16 +1,40 @@
 ﻿#pragma once
 #include <array>
 #include <stdint.h> // 🌟 為了支援 uint32_t
+#include <cstdint>
 #include <atomic> // 🌟 確保多執行緒安全
 // 簡單的警報項目結構 (無 std::string，保證 RTOS 安全)
+//
+// Alarm producers are serialized, but HMI readers are independent.  Keep
+// each field atomic so Clear/Trigger can never form a C++ data race with a
+// reader which sampled the preceding published count.
 struct AlarmItem {
-    int code;
-    int lineNo;
-    int axisIndex; // 🌟 新增：哪一軸發生的錯誤 (-1 表示無關)
+    std::atomic<int> code{ 0 };
+    std::atomic<int> lineNo{ 0 };
+    std::atomic<int> axisIndex{ -1 }; // -1 表示無關
 };
 
 class AlarmManager {
 public:
+    // Fixed-cost Alarm-to-Motion admission reservation. Trigger/Clear never
+    // wait: they advance sequence+active in one RMW, so a holder either owns
+    // an exact quiet revision or detects the overlapping publication.
+    struct MotionAdmissionReservation
+    {
+        std::uint64_t baseState = 0ULL;
+        std::uint64_t reservedState = 0ULL;
+        std::uint32_t expectedUpdateCount = 0U;
+        bool requireNoAlarm = true;
+        bool acquired = false;
+    };
+
+    enum class MotionAdmissionResult : std::uint8_t
+    {
+        ACQUIRED = 0,
+        BUSY,
+        SUPERSEDED
+    };
+
     // 錯誤代碼列舉
    // 🌟 1. 定義分類的基準值 (Base Offsets)
     enum CategoryBase {
@@ -105,8 +129,60 @@ public:
     int GetAlarmAxisIndex(int index) const; // 🌟 新增：撈取軸編號
     // 🌟 新增：取得警報更新計數器 (給 HMI_Bridge 判斷用的)
     uint32_t GetUpdateCount() const;
+    std::uint64_t GetMotionSafetyIntentState() const noexcept;
+    static std::uint64_t MotionAdmissionBaseState(
+        std::uint64_t state) noexcept;
+    MotionAdmissionResult TryBeginMotionAdmission(
+        std::uint32_t expectedUpdateCount,
+        MotionAdmissionReservation& reservation,
+        bool requireNoAlarm = true) noexcept;
+    MotionAdmissionResult TryBeginMotionAdmission(
+        std::uint32_t expectedUpdateCount,
+        std::uint64_t expectedIntentState,
+        MotionAdmissionReservation& reservation,
+        bool requireNoAlarm = true) noexcept;
+    bool BeginMotionAdmission(
+        std::uint32_t expectedUpdateCount,
+        MotionAdmissionReservation& reservation,
+        bool requireNoAlarm = true) noexcept;
+    bool IsMotionAdmissionCurrent(
+        const MotionAdmissionReservation& reservation) const noexcept;
+    bool EndMotionAdmission(
+        MotionAdmissionReservation& reservation) noexcept;
+    bool ClearUnderMotionAdmission(
+        MotionAdmissionReservation& reservation) noexcept;
+    bool TriggerUnderMotionAdmission(
+        MotionAdmissionReservation& reservation,
+        int code,
+        int lineNo = 0,
+        int axisIndex = -1) noexcept;
 
 private:
+    static constexpr std::uint64_t MOTION_ADMISSION_ACTIVE_MASK =
+        0x000000007FFFFFFFULL;
+    static constexpr std::uint64_t MOTION_ADMISSION_RESERVED =
+        0x0000000080000000ULL;
+    static constexpr std::uint64_t MOTION_ALARM_INTENT_BEGIN_DELTA =
+        0x0000000100000001ULL;
+    static constexpr std::uint64_t MOTION_ALARM_INTENT_SEQUENCE_DELTA =
+        0x0000000100000000ULL;
+
+    static constexpr std::uint64_t DEFERRED_ALARM_CODE_MASK =
+        0x000000000000FFFFULL;
+    static constexpr unsigned DEFERRED_ALARM_LINE_SHIFT = 16U;
+    static constexpr std::uint64_t DEFERRED_ALARM_LINE_MASK =
+        0x0000FFFFFFFF0000ULL;
+    static constexpr unsigned DEFERRED_ALARM_AXIS_SHIFT = 48U;
+    static constexpr std::uint64_t DEFERRED_ALARM_AXIS_MASK =
+        0x00FF000000000000ULL;
+    static constexpr unsigned DEFERRED_ALARM_COUNT_SHIFT = 56U;
+    static constexpr std::uint64_t DEFERRED_ALARM_COUNT_MASK =
+        0x7F00000000000000ULL;
+    static constexpr std::uint32_t DEFERRED_ALARM_COUNT_MAX = 0x7FU;
+    static constexpr std::uint64_t DEFERRED_ALARM_OVERFLOW =
+        0x8000000000000000ULL;
+    static constexpr unsigned DEFERRED_ALARM_CAS_ATTEMPTS = 32U;
+
     static constexpr int MAX_ALARMS = 64;
     std::array<AlarmItem, MAX_ALARMS> m_alarms;
 
@@ -114,6 +190,35 @@ private:
     std::atomic<int> m_alarmCount{ 0 };
     std::atomic<bool> m_hasAlarm{ false };
     std::atomic<uint32_t> m_updateCount{ 0 };
+    std::atomic<std::uint64_t> m_motionSafetyIntentState{ 0ULL };
+    // First-payload + count are one atomic publication, so multiple Alarm
+    // producers can never tear code/line/axis or overwrite a claimed slot.
+    std::atomic<std::uint64_t> m_deferredAlarmPublication{ 0ULL };
+    // Only used when the bounded packed CAS budget is exhausted.  It keeps
+    // the overflow-only diagnostic payload coherent; the packed overflow bit
+    // remains the safety/liveness authority.
+    std::atomic<std::uint64_t> m_deferredAlarmOverflowPayload{ 0ULL };
+    std::atomic<bool> m_alarmWriterReserved{ false };
+
+    void DeferAlarm(int code, int lineNo, int axisIndex) noexcept;
+    void TryPromoteDeferredAlarms() noexcept;
+    void TryPromoteDeferredAlarmsOnce() noexcept;
+    bool HasDeferredAlarmPublication() const noexcept;
+    void PublishAlarmUnderWriter(
+        int code,
+        int lineNo,
+        int axisIndex,
+        std::uint32_t updateDelta) noexcept;
+    MotionAdmissionResult TryBeginMotionAdmissionImpl(
+        std::uint32_t expectedUpdateCount,
+        const std::uint64_t* expectedIntentState,
+        MotionAdmissionReservation& reservation,
+        bool requireNoAlarm) noexcept;
+
+    // RTSS PDO callbacks must never enter a C++ function-local-static guard.
+    // The instance is constructed by the module during startup, before the
+    // timer callback can run; GetInstance() is then a plain reference return.
+    static AlarmManager s_instance;
 
     AlarmManager();
     AlarmManager(const AlarmManager&) = delete; // 禁止複製

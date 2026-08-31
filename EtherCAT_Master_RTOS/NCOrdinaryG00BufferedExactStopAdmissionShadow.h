@@ -2,6 +2,7 @@
 
 #include "NCPreparedHeadResolverBypassGate.h"
 #include "MotionCommandPathModeTransport.h"
+#include "MotionQueueTailTransaction.h"
 
 #include <array>
 #include <cstddef>
@@ -9,7 +10,8 @@
 #include <type_traits>
 
 // =============================================================================
-// Stage NC-0.2K.5 / K.6.1 - Ordinary G00 Buffered Exact-Stop Admission
+// Stage NC-0.2K.5 / K.6.1 / K.6.2 - Ordinary G00 Buffered Exact-Stop
+// Admission
 //
 // This observer describes the contract that a future ordinary no-P G00
 // read-ahead cutover would have to satisfy.  It cannot select an NCBlock,
@@ -21,8 +23,9 @@
 // K.5 correlates that real path with one immutable Prepared token and reports
 // the blockers that must be removed before a later controlled cutover:
 //   command-local EXACT_STOP, transactional queue-tail endpoint, and a bounded
-//   multi-dispatch terminal registry.  K.6.1 closes only the first item from
-//   immutable Motion submission evidence; admission remains shadow-only.
+//   multi-dispatch terminal registry.  K.6.1 closes the first item and K.6.2
+//   closes only the transactional endpoint item from immutable, capture-bound
+//   Motion submission evidence; admission remains shadow-only.
 // =============================================================================
 
 enum class NCOrdinaryG00AdmissionDecision : std::uint8_t
@@ -95,6 +98,9 @@ struct NCOrdinaryG00AdmissionSnapshot
     std::uint64_t dispatchId = 0ULL;
     NCProgramCommitSequence commitSequence =
         NC_PROGRAM_COMMIT_SEQUENCE_INVALID;
+    MotionQueueTailTransactionSequence queueTailTransactionSequence =
+        MOTION_QUEUE_TAIL_TRANSACTION_SEQUENCE_INVALID;
+    std::uint32_t queueTailAxisMask = 0U;
 
     std::uint64_t initialQueueDepth = 0ULL;
     std::uint64_t busySamples = 0ULL;
@@ -114,6 +120,7 @@ struct NCOrdinaryG00AdmissionSnapshot
     bool legacyCallbackCompleted = false;
     bool legacyEpochAdvanced = false;
     bool commandPathModeProven = false;
+    bool transactionalEndpointProven = false;
     bool legacyUpstreamProofVerified = false;
     bool legacyCompleted = false;
 
@@ -182,8 +189,10 @@ struct NCOrdinaryG00LegacyCommitEvidence
     std::uint64_t segmentExecutionEpoch = 0ULL;
     std::uint64_t segmentId = 0ULL;
     std::size_t submissionCount = 0U;
+    MotionExecutionIdentity submissionIdentity{};
     MotionCommandPathMode commandPathMode =
         MotionCommandPathMode::UNSPECIFIED;
+    MotionQueueTailCommitReceipt queueTailReceipt{};
     bool captureOverflow = false;
     bool producerAccepted = false;
     bool immediateRejectNone = false;
@@ -382,6 +391,47 @@ public:
             evidence.submissionCount == 1U &&
             evidence.commandPathMode ==
             MotionCommandPathMode::EXACT_STOP;
+        const MotionQueueTailCommitReceipt& queueTail =
+            evidence.queueTailReceipt;
+        const bool submissionIdentityExact =
+            evidence.submissionIdentity.IsAssigned() &&
+            evidence.submissionIdentity.epoch ==
+            static_cast<MotionExecutionEpoch>(
+                evidence.segmentExecutionEpoch) &&
+            evidence.submissionIdentity.segmentId ==
+            static_cast<MotionSegmentId>(evidence.segmentId) &&
+            evidence.submissionIdentity.sourceBlockId ==
+            static_cast<MotionSourceBlockId>(
+                m_snapshot.sourcePC) &&
+            evidence.submissionIdentity.source ==
+            MotionCommandSource::NC_MEMORY;
+        const bool receiptIdentityExact =
+            queueTail.identity.epoch ==
+            evidence.submissionIdentity.epoch &&
+            queueTail.identity.segmentId ==
+            evidence.submissionIdentity.segmentId &&
+            queueTail.identity.sourceBlockId ==
+            evidence.submissionIdentity.sourceBlockId &&
+            queueTail.identity.source ==
+            evidence.submissionIdentity.source;
+        const bool receiptOwnerExact =
+            queueTail.ownerLease.IsValid() &&
+            queueTail.ownerLease.owner == MotionOwner::AUTO &&
+            static_cast<std::uint8_t>(queueTail.ownerLease.owner) ==
+            m_snapshot.owner &&
+            static_cast<std::uint64_t>(
+                queueTail.ownerLease.generation) ==
+            m_snapshot.ownerGeneration;
+        const bool transactionalEndpointProven =
+            evidence.submissionCount == 1U &&
+            submissionIdentityExact &&
+            receiptIdentityExact &&
+            receiptOwnerExact &&
+            queueTail.captureBound &&
+            queueTail.transactionSequence !=
+            MOTION_QUEUE_TAIL_TRANSACTION_SEQUENCE_INVALID &&
+            queueTail.axisMask != 0U &&
+            queueTail.IsCommitted();
         const bool exact =
             KeyEqual(key, m_pendingKey) &&
             m_snapshot.legacySelected &&
@@ -404,6 +454,7 @@ public:
             evidence.waitCallbackActive &&
             evidence.submissionCount == 1U &&
             commandPathModeProven &&
+            transactionalEndpointProven &&
             !evidence.captureOverflow &&
             evidence.producerAccepted &&
             evidence.immediateRejectNone &&
@@ -419,6 +470,10 @@ public:
             {
                 ++m_counters.missingCommandPathMode;
             }
+            if (!transactionalEndpointProven)
+            {
+                ++m_counters.missingTransactionalEndpoint;
+            }
             FailMismatch();
             return;
         }
@@ -432,9 +487,16 @@ public:
         m_snapshot.legacyCallbackObserved = true;
         m_snapshot.legacyEpochAdvanced = true;
         m_snapshot.commandPathModeProven = true;
+        m_snapshot.transactionalEndpointProven = true;
+        m_snapshot.queueTailTransactionSequence =
+            queueTail.transactionSequence;
+        m_snapshot.queueTailAxisMask = queueTail.axisMask;
         m_snapshot.blockerMask &=
             ~static_cast<std::uint32_t>(
                 NC_ORDINARY_G00_BLOCKER_COMMAND_PATH_MODE);
+        m_snapshot.blockerMask &=
+            ~static_cast<std::uint32_t>(
+                NC_ORDINARY_G00_BLOCKER_TRANSACTIONAL_ENDPOINT);
         ++m_counters.legacyDispatchBound;
         ++m_counters.legacyCommitBound;
         Publish(NCOrdinaryG00AdmissionDecision::LEGACY_COMMITTED);
@@ -949,7 +1011,6 @@ private:
         {
             ++m_counters.initialDrained;
         }
-        ++m_counters.missingTransactionalEndpoint;
         ++m_counters.missingInflightRegistry;
     }
 
@@ -1026,8 +1087,11 @@ private:
             m_counters.sourceRevocations &&
             m_counters.missingCommandPathMode <=
             m_counters.candidates &&
-            m_counters.missingTransactionalEndpoint ==
+            m_counters.legacyCommitBound <=
             m_counters.candidates &&
+            m_counters.missingTransactionalEndpoint <=
+            m_counters.candidates -
+            m_counters.legacyCommitBound &&
             m_counters.missingInflightRegistry ==
             m_counters.candidates &&
             m_counters.cutoverAttempts == 0ULL &&

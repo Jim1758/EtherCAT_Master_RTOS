@@ -22,6 +22,38 @@ namespace
     constexpr std::uint64_t EXECUTION_EPOCH_PUBLICATION_PENDING =
         0x8000000000000000ULL;
 
+    constexpr std::uint64_t MOTION_OWNER_VALUE_MASK =
+        0x000000000000000FULL;
+    constexpr std::uint64_t MOTION_OWNER_SAFETY_HANDSHAKE =
+        0x0000000000000010ULL;
+    constexpr std::uint64_t MOTION_OWNER_OUTPUT_COMMIT_RESERVED =
+        0x0000000000000020ULL;
+    constexpr std::uint64_t MOTION_OWNER_SAFETY_ACTION_PENDING =
+        0x0000000000000040ULL;
+    constexpr std::uint64_t MOTION_OWNER_FRAME_SEND_RESERVED =
+        0x0000000000000080ULL;
+    constexpr std::uint64_t MOTION_OWNER_EPOCH_COMMIT_RESERVED =
+        0x0000000000000100ULL;
+    // Historical name retained locally to minimize churn.  This mask now
+    // covers every packed-owner reservation that must block owner transfer,
+    // output publication, and Safety takeover.
+    constexpr std::uint64_t MOTION_OWNER_ANY_OUTPUT_RESERVATION =
+        MOTION_OWNER_OUTPUT_COMMIT_RESERVED |
+        MOTION_OWNER_FRAME_SEND_RESERVED |
+        MOTION_OWNER_EPOCH_COMMIT_RESERVED;
+    constexpr unsigned MOTION_OWNER_SAFETY_TICKET_SHIFT = 9U;
+    constexpr std::uint64_t MOTION_OWNER_SAFETY_TICKET_MASK =
+        0x00000000FFFFFE00ULL;
+    constexpr std::uint32_t MOTION_OWNER_SAFETY_TICKET_MAX =
+        0x007FFFFFU;
+    constexpr unsigned MOTION_OWNER_BOUNDED_CAS_ATTEMPTS = 32U;
+    constexpr std::uint64_t FRAME_SAFETY_INTENT_BEGIN_DELTA =
+        0x0000000100000001ULL;
+    constexpr std::uint8_t RESET_RELEASE_AUTH_EMPTY = 0U;
+    constexpr std::uint8_t RESET_RELEASE_AUTH_AVAILABLE = 1U;
+    constexpr std::uint8_t RESET_RELEASE_AUTH_CLAIMED = 2U;
+    constexpr std::uint8_t RESET_RELEASE_AUTH_CONSUMED = 3U;
+
     std::uint64_t PackExecutionEpochPublication(
         MotionExecutionEpoch executionEpoch,
         MotionCommandSource source,
@@ -60,8 +92,54 @@ namespace
         0x00000000FFFFFFFFULL;
     constexpr std::uint64_t RESET_SAFETY_BATCH_RESET_FAULTS =
         0x0000000100000000ULL;
+    // A normal operator RESET first requests the existing Safety-owned
+    // controlled deceleration.  Alarm/E-stop remains on its independent,
+    // immediate-zero mailbox path.
+    constexpr std::uint64_t RESET_SAFETY_BATCH_CONTROLLED_STOP =
+        0x0100000000000000ULL;
+    constexpr unsigned RESET_SAFETY_BATCH_TICKET_SHIFT = 33U;
+    constexpr std::uint64_t RESET_SAFETY_BATCH_TICKET_MASK =
+        0x00FFFFFE00000000ULL;
+    constexpr std::uint64_t RESET_SAFETY_BATCH_PUBLISH_RESERVED =
+        0x4000000000000000ULL;
     constexpr std::uint64_t RESET_SAFETY_BATCH_PRESENT =
         0x8000000000000000ULL;
+
+    constexpr std::uint64_t EMERGENCY_STOP_REQUEST_EPOCH_MASK =
+        0x00000000FFFFFFFFULL;
+    constexpr std::uint64_t EMERGENCY_STOP_REQUEST_EVIDENCE_REQUIRED =
+        0x0000000100000000ULL;
+    constexpr std::uint64_t EMERGENCY_STOP_REQUEST_PUBLISH_RESERVED =
+        0x4000000000000000ULL;
+    constexpr std::uint64_t EMERGENCY_STOP_REQUEST_PENDING =
+        0x8000000000000000ULL;
+
+    std::uint64_t PackEmergencyStopRequest(
+        MotionExecutionEpoch causalEpoch,
+        bool evidenceRequired) noexcept
+    {
+        return
+            static_cast<std::uint64_t>(causalEpoch) |
+            (evidenceRequired
+                ? EMERGENCY_STOP_REQUEST_EVIDENCE_REQUIRED
+                : 0ULL) |
+            EMERGENCY_STOP_REQUEST_PENDING;
+    }
+
+    MotionExecutionEpoch UnpackEmergencyStopRequestEpoch(
+        std::uint64_t request) noexcept
+    {
+        return static_cast<MotionExecutionEpoch>(
+            request & EMERGENCY_STOP_REQUEST_EPOCH_MASK);
+    }
+
+    bool UnpackEmergencyStopRequestEvidenceRequired(
+        std::uint64_t request) noexcept
+    {
+        return
+            (request &
+                EMERGENCY_STOP_REQUEST_EVIDENCE_REQUIRED) != 0ULL;
+    }
 
     constexpr std::uint64_t P1_MAPPING_ALARM_EPOCH_MASK =
         0x00000000FFFFFFFFULL;
@@ -75,13 +153,25 @@ namespace
 
     std::uint64_t PackResetSafetyBatch(
         MotionExecutionEpoch publishedEpoch,
-        bool requestResetAllFaults) noexcept
+        bool requestResetAllFaults,
+        bool requestControlledStop,
+        std::uint32_t safetyRequestTicket,
+        bool reserved) noexcept
     {
         return
             RESET_SAFETY_BATCH_PRESENT |
             static_cast<std::uint64_t>(publishedEpoch) |
+            ((static_cast<std::uint64_t>(safetyRequestTicket) <<
+                RESET_SAFETY_BATCH_TICKET_SHIFT) &
+                RESET_SAFETY_BATCH_TICKET_MASK) |
             (requestResetAllFaults
                 ? RESET_SAFETY_BATCH_RESET_FAULTS
+                : 0ULL) |
+            (requestControlledStop
+                ? RESET_SAFETY_BATCH_CONTROLLED_STOP
+                : 0ULL) |
+            (reserved
+                ? RESET_SAFETY_BATCH_PUBLISH_RESERVED
                 : 0ULL);
     }
 
@@ -90,6 +180,14 @@ namespace
     {
         return static_cast<MotionExecutionEpoch>(
             packed & RESET_SAFETY_BATCH_EPOCH_MASK);
+    }
+
+    std::uint32_t UnpackResetSafetyBatchTicket(
+        std::uint64_t packed) noexcept
+    {
+        return static_cast<std::uint32_t>(
+            (packed & RESET_SAFETY_BATCH_TICKET_MASK) >>
+            RESET_SAFETY_BATCH_TICKET_SHIFT);
     }
 
     bool MotionExecutionIdentityExactlyMatches(
@@ -458,6 +556,315 @@ bool MotionCore::SubmitNCSettleRequest(
 }
 
 
+bool MotionCore::IsExactResetNCSettleAuthorityCurrent(
+    const MotionNCSettleRequest& request) const noexcept
+{
+    if (request.profile != MotionNCSettleProfile::RESET_ALL ||
+        request.requestSequence ==
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID ||
+        request.safetyRequestTicket == 0U ||
+        request.safetyProvenanceGeneration == 0ULL)
+    {
+        return false;
+    }
+
+    MotionExecutionEpoch exactEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    return
+        TryGetResetSafetyMotionOwnerEpoch(
+            request.ownerLease,
+            request.safetyRequestTicket,
+            request.safetyProvenanceGeneration,
+            exactEpoch) == ResetSafetyAuthorityStatus::ACQUIRED &&
+        exactEpoch == request.executionEpoch;
+}
+
+
+bool MotionCore::TryAcquireExactResetNCSettleReservation(
+    const MotionNCSettleRequest& request,
+    std::uint64_t& reservedOwnerState) noexcept
+{
+    reservedOwnerState = 0ULL;
+    if (!IsExactResetNCSettleAuthorityCurrent(request))
+    {
+        return false;
+    }
+
+    std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if (!UnpackMotionOwnerState(ownerState).Matches(request.ownerLease) ||
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) !=
+        request.safetyRequestTicket ||
+        UnpackMotionOwnerSafetyHandshake(ownerState) ||
+        UnpackMotionOwnerSafetyActionPending(ownerState) ||
+        (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL)
+    {
+        return false;
+    }
+
+    const std::uint64_t desired =
+        ownerState | MOTION_OWNER_EPOCH_COMMIT_RESERVED;
+    if (!m_motionOwnerState.compare_exchange_strong(
+        ownerState,
+        desired,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    reservedOwnerState = desired;
+    if (m_executionDrainRevocationGeneration.load(
+        std::memory_order_acquire) !=
+        request.safetyProvenanceGeneration ||
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+        m_motionOwnerState.load(std::memory_order_acquire) != desired ||
+        m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire) !=
+        request.safetyRequestTicket)
+    {
+        ReleaseExactResetNCSettleReservation(reservedOwnerState);
+        reservedOwnerState = 0ULL;
+        return false;
+    }
+
+    return true;
+}
+
+
+void MotionCore::ReleaseExactResetNCSettleReservation(
+    std::uint64_t reservedOwnerState) noexcept
+{
+    if ((reservedOwnerState &
+        MOTION_OWNER_EPOCH_COMMIT_RESERVED) == 0ULL)
+    {
+        return;
+    }
+
+    std::uint64_t expected = reservedOwnerState;
+    const std::uint64_t released =
+        reservedOwnerState &
+        ~MOTION_OWNER_EPOCH_COMMIT_RESERVED;
+    if (!m_motionOwnerState.compare_exchange_strong(
+        expected,
+        released,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        m_motionOwnerState.fetch_and(
+            ~MOTION_OWNER_EPOCH_COMMIT_RESERVED,
+            std::memory_order_acq_rel);
+    }
+}
+
+
+bool MotionCore::TryPublishNCResetSafetyReleaseAuthorization() noexcept
+{
+    const MotionNCSettleRequest& request =
+        m_activeResetNCSettleRequest;
+    if (m_ncResetRebasePhase !=
+        MotionNCResetRebasePhase::ACKNOWLEDGED ||
+        !IsExactResetNCSettleAuthorityCurrent(request) ||
+        !m_ncResetRebaseAckProducer.acknowledged ||
+        !m_ncResetRebaseAckProducer.acked ||
+        m_ncResetRebaseAckProducer.requestSequence !=
+        request.requestSequence)
+    {
+        return false;
+    }
+
+    if (m_ncResetReleaseAuthState.load(
+        std::memory_order_acquire) !=
+        RESET_RELEASE_AUTH_EMPTY)
+    {
+        return false;
+    }
+
+    m_ncResetReleaseAuthWriteSequence.fetch_add(
+        1ULL,
+        std::memory_order_acq_rel);
+    m_ncResetReleaseAuthRequestSequence.store(
+        request.requestSequence,
+        std::memory_order_relaxed);
+    m_ncResetReleaseAuthPackedIdentity.store(
+        (static_cast<std::uint64_t>(
+            request.ownerLease.generation) << 32U) |
+        static_cast<std::uint64_t>(request.executionEpoch),
+        std::memory_order_relaxed);
+    m_ncResetReleaseAuthSafetyTicket.store(
+        request.safetyRequestTicket,
+        std::memory_order_relaxed);
+    m_ncResetReleaseAuthDrainGeneration.store(
+        request.safetyProvenanceGeneration,
+        std::memory_order_relaxed);
+    m_ncResetReleaseAuthWriteSequence.fetch_add(
+        1ULL,
+        std::memory_order_release);
+
+    // The payload is not consumable until the complete Reset tuple is proved
+    // again after publication. NC can only claim AVAILABLE, never the
+    // seqlock payload while it is being replaced or after ACK was revoked.
+    if (m_ncResetRebasePhase !=
+        MotionNCResetRebasePhase::ACKNOWLEDGED ||
+        !IsExactResetNCSettleAuthorityCurrent(request) ||
+        !m_ncResetRebaseAckProducer.acknowledged ||
+        !m_ncResetRebaseAckProducer.acked ||
+        m_ncResetRebaseAckProducer.requestSequence !=
+        request.requestSequence)
+    {
+        return false;
+    }
+
+    std::uint8_t expectedState = RESET_RELEASE_AUTH_EMPTY;
+    return m_ncResetReleaseAuthState.compare_exchange_strong(
+        expectedState,
+        RESET_RELEASE_AUTH_AVAILABLE,
+        std::memory_order_release,
+        std::memory_order_acquire);
+}
+
+
+bool MotionCore::TryGetNCResetSafetyReleaseAuthorization(
+    MotionNCSettleRequestSequence requestSequence,
+    MotionNCResetSafetyReleaseAuthorization& authorization) const noexcept
+{
+    authorization = MotionNCResetSafetyReleaseAuthorization{};
+    if (requestSequence ==
+        MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID)
+    {
+        return false;
+    }
+
+    const std::uint8_t entryState =
+        m_ncResetReleaseAuthState.load(std::memory_order_acquire);
+    if (entryState != RESET_RELEASE_AUTH_AVAILABLE &&
+        entryState != RESET_RELEASE_AUTH_CLAIMED)
+    {
+        return false;
+    }
+
+    for (unsigned attempt = 0U; attempt < 16U; ++attempt)
+    {
+        const std::uint64_t sequenceBefore =
+            m_ncResetReleaseAuthWriteSequence.load(
+                std::memory_order_acquire);
+        if ((sequenceBefore & 1ULL) != 0ULL)
+        {
+            continue;
+        }
+
+        MotionNCResetSafetyReleaseAuthorization candidate{};
+        candidate.requestSequence =
+            m_ncResetReleaseAuthRequestSequence.load(
+                std::memory_order_relaxed);
+        const std::uint64_t packedIdentity =
+            m_ncResetReleaseAuthPackedIdentity.load(
+                std::memory_order_relaxed);
+        candidate.executionEpoch =
+            static_cast<MotionExecutionEpoch>(
+                packedIdentity & 0xFFFFFFFFULL);
+        candidate.ownerGeneration =
+            static_cast<MotionOwnerGeneration>(
+                packedIdentity >> 32U);
+        candidate.safetyRequestTicket =
+            m_ncResetReleaseAuthSafetyTicket.load(
+                std::memory_order_relaxed);
+        candidate.drainRevocationGeneration =
+            m_ncResetReleaseAuthDrainGeneration.load(
+                std::memory_order_relaxed);
+
+        const std::uint64_t sequenceAfter =
+            m_ncResetReleaseAuthWriteSequence.load(
+                std::memory_order_acquire);
+        const std::uint8_t exitState =
+            m_ncResetReleaseAuthState.load(std::memory_order_acquire);
+        if (sequenceBefore == sequenceAfter &&
+            (sequenceAfter & 1ULL) == 0ULL &&
+            exitState == entryState &&
+            candidate.requestSequence == requestSequence &&
+            candidate.IsValid())
+        {
+            authorization = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+bool MotionCore::TryClaimNCResetSafetyReleaseAuthorization(
+    MotionNCSettleRequestSequence requestSequence,
+    MotionNCResetSafetyReleaseAuthorization& authorization) noexcept
+{
+    authorization = MotionNCResetSafetyReleaseAuthorization{};
+    std::uint8_t expectedState = RESET_RELEASE_AUTH_AVAILABLE;
+    if (!m_ncResetReleaseAuthState.compare_exchange_strong(
+        expectedState,
+        RESET_RELEASE_AUTH_CLAIMED,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    if (!TryGetNCResetSafetyReleaseAuthorization(
+        requestSequence,
+        authorization))
+    {
+        (void)ReleaseNCResetSafetyReleaseAuthorizationClaim();
+        return false;
+    }
+
+    return true;
+}
+
+
+bool MotionCore::TryInvalidateNCResetSafetyReleaseAuthorization() noexcept
+{
+    std::uint8_t state =
+        m_ncResetReleaseAuthState.load(std::memory_order_acquire);
+    if (state == RESET_RELEASE_AUTH_EMPTY)
+    {
+        return true;
+    }
+    if (state == RESET_RELEASE_AUTH_CLAIMED ||
+        state == RESET_RELEASE_AUTH_CONSUMED)
+    {
+        return false;
+    }
+
+    return m_ncResetReleaseAuthState.compare_exchange_strong(
+        state,
+        RESET_RELEASE_AUTH_EMPTY,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
+
+bool MotionCore::ReleaseNCResetSafetyReleaseAuthorizationClaim() noexcept
+{
+    std::uint8_t expectedState = RESET_RELEASE_AUTH_CLAIMED;
+    return m_ncResetReleaseAuthState.compare_exchange_strong(
+        expectedState,
+        RESET_RELEASE_AUTH_EMPTY,
+        std::memory_order_release,
+        std::memory_order_acquire);
+}
+
+
+bool MotionCore::ConsumeNCResetSafetyReleaseAuthorizationClaim() noexcept
+{
+    std::uint8_t expectedState = RESET_RELEASE_AUTH_CLAIMED;
+    return m_ncResetReleaseAuthState.compare_exchange_strong(
+        expectedState,
+        RESET_RELEASE_AUTH_CONSUMED,
+        std::memory_order_release,
+        std::memory_order_acquire);
+}
+
+
 MotionNCSettleRequestSequence MotionCore::RequestFeedHoldNCSettle(
     MotionExecutionEpoch executionEpoch,
     const MotionOwnerLease& ownerLease) noexcept
@@ -487,11 +894,15 @@ MotionNCSettleRequestSequence
 MotionCore::RequestResetNCSettleAndRebase(
     MotionExecutionEpoch executionEpoch,
     const MotionOwnerLease& ownerLease,
+    std::uint32_t safetyRequestTicket,
+    std::uint64_t safetyProvenanceGeneration,
     const MotionNCResetExecutionState& executionState,
     bool unsupportedFaultOrEstop) noexcept
 {
     if (executionEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
-        !ownerLease.IsValid())
+        !ownerLease.IsValid() ||
+        safetyRequestTicket == 0U ||
+        safetyProvenanceGeneration == 0ULL)
     {
         return MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
     }
@@ -501,10 +912,33 @@ MotionCore::RequestResetNCSettleAndRebase(
     request.profile = MotionNCSettleProfile::RESET_ALL;
     request.executionEpoch = executionEpoch;
     request.ownerLease = ownerLease;
+    request.safetyRequestTicket = safetyRequestTicket;
+    request.safetyProvenanceGeneration =
+        safetyProvenanceGeneration;
     request.resetExecutionState = executionState;
     request.unsupportedFaultOrEstop = unsupportedFaultOrEstop;
 
-    if (!SubmitNCSettleRequest(request))
+    std::uint64_t reservedOwnerState = 0ULL;
+    if (!TryAcquireExactResetNCSettleReservation(
+        request,
+        reservedOwnerState))
+    {
+        return MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+    }
+
+    ReleaseExactResetNCSettleReservation(reservedOwnerState);
+    // Never expose the request while its own owner reservation is visible to
+    // the 250 us consumer: a pop in that window would look like an unrelated
+    // supersession.  Revalidate once after release, then publish.  Any Safety
+    // event racing the release-push is carried by ticket/provenance in the
+    // payload and is rejected again at dequeue and commit.
+    if (!IsExactResetNCSettleAuthorityCurrent(request))
+    {
+        return MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+    }
+
+    const bool submitted = SubmitNCSettleRequest(request);
+    if (!submitted)
     {
         return MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
     }
@@ -537,6 +971,7 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
     // survive until a later valid Motion pass.
     if (!pdoCycleValid)
     {
+        InvalidateServoOutputImageProof();
         PublishStopSettleEvidence();
     }
 }
@@ -1200,6 +1635,11 @@ MotionCore::ValidateNCResetCommitSeam() const noexcept
         return MotionNCSettleBlocker::OWNER_LEASE_MISMATCH;
     }
 
+    if (!IsExactResetNCSettleAuthorityCurrent(request))
+    {
+        return MotionNCSettleBlocker::SAFETY_OR_RECOVERY_PENDING;
+    }
+
     const std::uint32_t currentAxisMask = BuildExistingNCAxisMask();
     if (ack.requestedAxisMask == 0U ||
         currentAxisMask == 0U)
@@ -1295,6 +1735,47 @@ void MotionCore::BlockNCResetCommit(
 
 bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
 {
+    if (m_ncResetReleaseAuthState.load(std::memory_order_acquire) ==
+        RESET_RELEASE_AUTH_CONSUMED)
+    {
+        // A successful NC release consumes the exact ACK once. Retire the RT
+        // transaction normally on the following pass while preserving its
+        // ACK/history for the release gate and diagnostics; owner NONE is the
+        // expected result here, not a superseding lifecycle incident.
+        MotionNCSettleTracker& consumedTracker =
+            m_ncSettleTrackers[static_cast<std::size_t>(
+                MotionNCSettleProfile::RESET_ALL)];
+        consumedTracker.candidate = false;
+        consumedTracker.settled = false;
+        consumedTracker.dwellCycles = 0U;
+        consumedTracker.requestAccepted = false;
+        m_activeResetNCSettleRequest = MotionNCSettleRequest{};
+        m_ncResetRebasePhase = MotionNCResetRebasePhase::IDLE;
+        m_ncResetScalarRebaseApplied = false;
+        m_ncResetBufferClearAxisSlot = 0U;
+        m_ncResetBufferClearElement = 0U;
+
+        std::uint8_t expectedState = RESET_RELEASE_AUTH_CONSUMED;
+        if (!m_ncResetReleaseAuthState.compare_exchange_strong(
+            expectedState,
+            RESET_RELEASE_AUTH_EMPTY,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            return true;
+        }
+    }
+
+    // NC owns a release authorization only after an AVAILABLE -> CLAIMED
+    // transition. While that one-shot token is claimed, RT freezes the
+    // Reset settle/rebase producer instead of interpreting NC's temporary
+    // EPOCH reservation as a superseding owner change. Otherwise revoke
+    // any older unclaimed token before this cycle can mutate ACK state.
+    if (!TryInvalidateNCResetSafetyReleaseAuthorization())
+    {
+        return true;
+    }
+
     const std::size_t resetProfileIndex = static_cast<std::size_t>(
         MotionNCSettleProfile::RESET_ALL);
     MotionNCSettleTracker& resetTracker =
@@ -1327,7 +1808,8 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
             activeRequest.ownerLease.IsValid() &&
             activeRequest.ownerLease.owner == MotionOwner::SAFETY &&
             activeRequest.ownerLease.Matches(
-                observedOwnerLease);
+                observedOwnerLease) &&
+            IsExactResetNCSettleAuthorityCurrent(activeRequest);
     };
 
     const bool postRebaseTransaction =
@@ -1418,6 +1900,10 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
             request.executionEpoch == requestObservedExecutionEpoch &&
             request.ownerLease.IsValid() &&
             request.ownerLease.Matches(requestObservedOwnerLease);
+        const bool exactResetTupleCurrent =
+            request.profile == MotionNCSettleProfile::RESET_ALL &&
+            tupleCurrent &&
+            IsExactResetNCSettleAuthorityCurrent(request);
 
         if (request.profile == MotionNCSettleProfile::FEED_HOLD_GROUP)
         {
@@ -1539,7 +2025,7 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
                 const bool compensationActive =
                     HasNCResetActiveCompensation();
                 const bool accepted =
-                    tupleCurrent &&
+                    exactResetTupleCurrent &&
                     request.ownerLease.owner == MotionOwner::SAFETY &&
                     !request.unsupportedFaultOrEstop &&
                     !pathUnsupported &&
@@ -1588,7 +2074,7 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
                         blocker =
                             MotionNCSettleBlocker::PATH_RUNTIME_UNSUPPORTED;
                     }
-                    else if (!tupleCurrent)
+                    else if (!exactResetTupleCurrent)
                     {
                         blocker =
                             MotionNCSettleBlocker::OWNER_LEASE_MISMATCH;
@@ -1614,20 +2100,30 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
     if (m_ncResetRebasePhase ==
         MotionNCResetRebasePhase::CLEARING_BUFFERS)
     {
+        const MotionNCSettleBlocker currentCommitBlocker =
+            ValidateNCResetCommitSeam();
+        if (currentCommitBlocker != MotionNCSettleBlocker::NONE)
+        {
+            BlockNCResetCommit(currentCommitBlocker);
+            return true;
+        }
+
+        std::uint64_t reservedOwnerState = 0ULL;
+        if (!TryAcquireExactResetNCSettleReservation(
+            m_activeResetNCSettleRequest,
+            reservedOwnerState))
+        {
+            BlockNCResetCommit(
+                MotionNCSettleBlocker::
+                SAFETY_OR_RECOVERY_PENDING);
+            return true;
+        }
+
         if (!m_ncResetScalarRebaseApplied)
         {
-            // Commit-time validation is intentionally repeated after this
-            // pass has consumed all pending Safety/Emergency work.  A Reset
-            // pre-proof from the preceding PDO cycle is never authority to
-            // overwrite a same-pass ESTOP/fault or a superseded tuple.
-            const MotionNCSettleBlocker commitBlocker =
-                ValidateNCResetCommitSeam();
-            if (commitBlocker != MotionNCSettleBlocker::NONE)
-            {
-                BlockNCResetCommit(commitBlocker);
-                return true;
-            }
-
+            // Commit-time reservation is held through the scalar rebase and
+            // this pass's bounded buffer-clear chunk.  Every later chunk
+            // reacquires and revalidates the same exact Reset identity.
             ApplyNCResetScalarRebase();
         }
 
@@ -1642,6 +2138,9 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
                 MotionNCSettleProfile::RESET_ALL,
                 MotionNCSettleBlocker::REBASE_IN_PROGRESS);
         }
+
+        ReleaseExactResetNCSettleReservation(
+            reservedOwnerState);
 
         // Freeze the interpolator while command references and all smoothing
         // buffers are being rebased.  UpdateAllMotion still runs and keeps
@@ -1659,12 +2158,25 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
 
 std::uint64_t MotionCore::PackMotionOwnerState(
     MotionOwner owner,
-    MotionOwnerGeneration generation) noexcept
+    MotionOwnerGeneration generation,
+    std::uint32_t safetyRequestTicket,
+    bool safetyHandshakeInProgress,
+    bool safetyActionPending) noexcept
 {
     return
         (static_cast<std::uint64_t>(generation) << 32U) |
-        static_cast<std::uint64_t>(
-            static_cast<std::uint8_t>(owner));
+        ((static_cast<std::uint64_t>(safetyRequestTicket) <<
+            MOTION_OWNER_SAFETY_TICKET_SHIFT) &
+            MOTION_OWNER_SAFETY_TICKET_MASK) |
+        (safetyHandshakeInProgress
+            ? MOTION_OWNER_SAFETY_HANDSHAKE
+            : 0ULL) |
+        (safetyActionPending
+            ? MOTION_OWNER_SAFETY_ACTION_PENDING
+            : 0ULL) |
+        (static_cast<std::uint64_t>(
+            static_cast<std::uint8_t>(owner)) &
+            MOTION_OWNER_VALUE_MASK);
 }
 
 
@@ -1676,13 +2188,38 @@ MotionOwnerLease MotionCore::UnpackMotionOwnerState(
     lease.owner =
         static_cast<MotionOwner>(
             static_cast<std::uint8_t>(
-                packed & 0xFFULL));
+                packed & MOTION_OWNER_VALUE_MASK));
 
     lease.generation =
         static_cast<MotionOwnerGeneration>(
             packed >> 32U);
 
     return lease;
+}
+
+
+std::uint32_t MotionCore::UnpackMotionOwnerSafetyRequestTicket(
+    std::uint64_t packed) noexcept
+{
+    return static_cast<std::uint32_t>(
+        (packed & MOTION_OWNER_SAFETY_TICKET_MASK) >>
+        MOTION_OWNER_SAFETY_TICKET_SHIFT);
+}
+
+
+bool MotionCore::UnpackMotionOwnerSafetyHandshake(
+    std::uint64_t packed) noexcept
+{
+    return
+        (packed & MOTION_OWNER_SAFETY_HANDSHAKE) != 0ULL;
+}
+
+
+bool MotionCore::UnpackMotionOwnerSafetyActionPending(
+    std::uint64_t packed) noexcept
+{
+    return
+        (packed & MOTION_OWNER_SAFETY_ACTION_PENDING) != 0ULL;
 }
 
 
@@ -1723,12 +2260,13 @@ bool MotionCore::IsMotionOwnerLeaseCurrent(
         return false;
     }
 
+    const std::uint64_t packed =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const MotionOwnerLease current =
+        UnpackMotionOwnerState(packed);
     return
-        m_motionOwnerState.load(
-            std::memory_order_acquire) ==
-        PackMotionOwnerState(
-            lease.owner,
-            lease.generation);
+        !UnpackMotionOwnerSafetyHandshake(packed) &&
+        current.Matches(lease);
 }
 
 
@@ -1748,14 +2286,34 @@ bool MotionCore::TryAcquireMotionOwner(
         return false;
     }
 
+    if (requestedOwner == MotionOwner::SAFETY)
+    {
+        outLease = TakeSafetyMotionOwner();
+        return outLease.IsValid();
+    }
+
     std::uint64_t currentPacked =
         m_motionOwnerState.load(
             std::memory_order_acquire);
 
-    for (;;)
+    for (unsigned attempt = 0U;
+        attempt < MOTION_OWNER_BOUNDED_CAS_ATTEMPTS;
+        ++attempt)
     {
         const MotionOwnerLease currentLease =
             UnpackMotionOwnerState(currentPacked);
+        const std::uint32_t safetyTicket =
+            UnpackMotionOwnerSafetyRequestTicket(currentPacked);
+
+        if (UnpackMotionOwnerSafetyHandshake(currentPacked) ||
+            UnpackMotionOwnerSafetyActionPending(currentPacked) ||
+            (currentPacked &
+                MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+            safetyTicket != m_safetyRequestAcknowledgedTicket.load(
+                std::memory_order_acquire))
+        {
+            return false;
+        }
 
         // 同一個邏輯 Owner 重複 Acquire 視為冪等操作，不產生新世代。
         if (currentLease.owner == requestedOwner &&
@@ -1778,7 +2336,9 @@ bool MotionCore::TryAcquireMotionOwner(
         const std::uint64_t requestedPacked =
             PackMotionOwnerState(
                 requestedLease.owner,
-                requestedLease.generation);
+                requestedLease.generation,
+                safetyTicket,
+                false);
 
         if (m_motionOwnerState.compare_exchange_weak(
             currentPacked,
@@ -1790,6 +2350,8 @@ bool MotionCore::TryAcquireMotionOwner(
             return true;
         }
     }
+
+    return false;
 }
 
 
@@ -1811,6 +2373,16 @@ bool MotionCore::TryTransferMotionOwner(
         return false;
     }
 
+    if (requestedOwner == MotionOwner::SAFETY)
+    {
+        if (!IsMotionOwnerLeaseCurrent(currentLease))
+        {
+            return false;
+        }
+        outLease = TakeSafetyMotionOwner();
+        return outLease.IsValid();
+    }
+
     if (requestedOwner == currentLease.owner)
     {
         if (!IsMotionOwnerLeaseCurrent(currentLease))
@@ -1823,9 +2395,21 @@ bool MotionCore::TryTransferMotionOwner(
     }
 
     std::uint64_t expectedPacked =
-        PackMotionOwnerState(
-            currentLease.owner,
-            currentLease.generation);
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const MotionOwnerLease observedLease =
+        UnpackMotionOwnerState(expectedPacked);
+    const std::uint32_t safetyTicket =
+        UnpackMotionOwnerSafetyRequestTicket(expectedPacked);
+    if (!observedLease.Matches(currentLease) ||
+        UnpackMotionOwnerSafetyHandshake(expectedPacked) ||
+        UnpackMotionOwnerSafetyActionPending(expectedPacked) ||
+        (expectedPacked &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        safetyTicket != m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire))
+    {
+        return false;
+    }
 
     MotionOwnerLease requestedLease{};
     requestedLease.owner = requestedOwner;
@@ -1835,7 +2419,9 @@ bool MotionCore::TryTransferMotionOwner(
     const std::uint64_t requestedPacked =
         PackMotionOwnerState(
             requestedLease.owner,
-            requestedLease.generation);
+            requestedLease.generation,
+            safetyTicket,
+            false);
 
     if (!m_motionOwnerState.compare_exchange_strong(
         expectedPacked,
@@ -1860,14 +2446,46 @@ bool MotionCore::ReleaseMotionOwner(
     }
 
     std::uint64_t expectedPacked =
-        PackMotionOwnerState(
-            lease.owner,
-            lease.generation);
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const MotionOwnerLease observedLease =
+        UnpackMotionOwnerState(expectedPacked);
+    const std::uint32_t safetyTicket =
+        UnpackMotionOwnerSafetyRequestTicket(expectedPacked);
+    if (!observedLease.Matches(lease) ||
+        UnpackMotionOwnerSafetyHandshake(expectedPacked) ||
+        UnpackMotionOwnerSafetyActionPending(expectedPacked) ||
+        (expectedPacked &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL)
+    {
+        return false;
+    }
+
+    if (safetyTicket !=
+        m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    if (lease.owner == MotionOwner::SAFETY)
+    {
+        if (m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+            m_safetyRecoveryRequestInProgress.load(
+                std::memory_order_acquire) ||
+            HasPendingSafetyOrRecoveryRequests() ||
+            m_safetyControlledStopInProgress)
+        {
+            return false;
+        }
+    }
 
     const std::uint64_t releasedPacked =
         PackMotionOwnerState(
             MotionOwner::NONE,
-            NextMotionOwnerGeneration(lease.generation));
+            NextMotionOwnerGeneration(lease.generation),
+            safetyTicket,
+            false);
 
     return
         m_motionOwnerState.compare_exchange_strong(
@@ -1878,43 +2496,1543 @@ bool MotionCore::ReleaseMotionOwner(
 }
 
 
-MotionOwnerLease MotionCore::TakeSafetyMotionOwner() noexcept
+MotionCore::SafetyMotionOwnerReleaseStatus
+MotionCore::TryReleaseSafetyMotionOwner(
+    const MotionOwnerLease& lease,
+    const MotionNCResetSafetyReleaseAuthorization& authorization) noexcept
 {
-    std::uint64_t currentPacked =
-        m_motionOwnerState.load(
+    const auto authorizationMatches =
+        [&authorization](
+            const MotionNCResetSafetyReleaseAuthorization& candidate)
+        noexcept
+    {
+        return
+            candidate.requestSequence ==
+            authorization.requestSequence &&
+            candidate.drainRevocationGeneration ==
+            authorization.drainRevocationGeneration &&
+            candidate.executionEpoch ==
+            authorization.executionEpoch &&
+            candidate.ownerGeneration ==
+            authorization.ownerGeneration &&
+            candidate.safetyRequestTicket ==
+            authorization.safetyRequestTicket;
+    };
+
+    if (!authorization.IsValid() ||
+        !lease.IsValid() ||
+        lease.owner != MotionOwner::SAFETY ||
+        authorization.ownerGeneration != lease.generation)
+    {
+        return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+    }
+
+    // Classify a bounded retry without weakening the exact Reset identity.
+    // A reservation or an incomplete Epoch/ACK publication is transient only
+    // while the complete lease/ticket/provenance tuple is still current.
+    // Any later Safety producer makes the old release permanently stale.
+    const auto classifyCurrentTuple = [this, &lease, &authorization]()
+        noexcept -> SafetyMotionOwnerReleaseStatus
+    {
+        const auto ownerIdentityMatches =
+            [this, &lease, &authorization](std::uint64_t ownerState)
+            noexcept
+        {
+            return
+                UnpackMotionOwnerState(ownerState).Matches(lease) &&
+                UnpackMotionOwnerSafetyRequestTicket(ownerState) ==
+                authorization.safetyRequestTicket &&
+                !UnpackMotionOwnerSafetyHandshake(ownerState) &&
+                !UnpackMotionOwnerSafetyActionPending(ownerState);
+        };
+        const auto epochIdentityMatches =
+            [&lease, &authorization](
+                std::uint64_t acknowledgement,
+                std::uint64_t publication) noexcept
+        {
+            return
+                static_cast<MotionOwnerGeneration>(
+                    acknowledgement >> 32U) == lease.generation &&
+                static_cast<MotionExecutionEpoch>(
+                    acknowledgement & 0xFFFFFFFFULL) ==
+                authorization.executionEpoch &&
+                UnpackExecutionEpochPublication(publication) ==
+                authorization.executionEpoch &&
+                UnpackExecutionEpochPublicationSource(publication) ==
+                MotionCommandSource::SAFETY;
+        };
+
+        if (m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire) !=
+            authorization.drainRevocationGeneration ||
+            m_executionDrainRevocationPublishersInProgress.load(
+                std::memory_order_acquire) != 0U ||
+            m_safetyRecoveryRequestInProgress.load(
+                std::memory_order_acquire) ||
+            HasPendingSafetyOrRecoveryRequests() ||
+            m_safetyControlledStopInProgress)
+        {
+            return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+        }
+
+        const std::uint64_t currentOwnerState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        const std::uint64_t currentAcknowledgement =
+            m_safetyOwnerEpochAcknowledgement.load(
+                std::memory_order_acquire);
+        const std::uint64_t currentPublication =
+            m_executionEpochPublication.load(
+                std::memory_order_acquire);
+        if (!ownerIdentityMatches(currentOwnerState) ||
+            m_safetyRequestAcknowledgedTicket.load(
+                std::memory_order_acquire) !=
+            authorization.safetyRequestTicket ||
+            !epochIdentityMatches(
+                currentAcknowledgement,
+                currentPublication) ||
+            m_executionDrainRevocationGeneration.load(
+                std::memory_order_acquire) !=
+            authorization.drainRevocationGeneration ||
+            m_executionDrainRevocationPublishersInProgress.load(
+                std::memory_order_acquire) != 0U ||
+            m_safetyRecoveryRequestInProgress.load(
+                std::memory_order_acquire) ||
+            HasPendingSafetyOrRecoveryRequests() ||
+            m_safetyControlledStopInProgress ||
+            !ownerIdentityMatches(
+                m_motionOwnerState.load(std::memory_order_acquire)) ||
+            m_safetyRequestAcknowledgedTicket.load(
+                std::memory_order_acquire) !=
+            authorization.safetyRequestTicket ||
+            !epochIdentityMatches(
+                m_safetyOwnerEpochAcknowledgement.load(
+                    std::memory_order_acquire),
+                m_executionEpochPublication.load(
+                    std::memory_order_acquire)))
+        {
+            return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+        }
+
+        return SafetyMotionOwnerReleaseStatus::DEFERRED;
+    };
+
+    const std::uint8_t authorizationEntryState =
+        m_ncResetReleaseAuthState.load(std::memory_order_acquire);
+    MotionNCResetSafetyReleaseAuthorization publishedAuthorization{};
+    if (!TryClaimNCResetSafetyReleaseAuthorization(
+        authorization.requestSequence,
+        publishedAuthorization))
+    {
+        const std::uint8_t authorizationExitState =
+            m_ncResetReleaseAuthState.load(std::memory_order_acquire);
+        if (authorizationEntryState == RESET_RELEASE_AUTH_CONSUMED ||
+            authorizationExitState == RESET_RELEASE_AUTH_CONSUMED)
+        {
+            return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+        }
+
+        MotionNCResetSafetyReleaseAuthorization transientAuthorization{};
+        if ((authorizationEntryState == RESET_RELEASE_AUTH_AVAILABLE ||
+            authorizationEntryState == RESET_RELEASE_AUTH_CLAIMED ||
+            authorizationExitState == RESET_RELEASE_AUTH_AVAILABLE ||
+            authorizationExitState == RESET_RELEASE_AUTH_CLAIMED) &&
+            TryGetNCResetSafetyReleaseAuthorization(
+                authorization.requestSequence,
+                transientAuthorization) &&
+            authorizationMatches(transientAuthorization))
+        {
+            return classifyCurrentTuple();
+        }
+
+        // A competing claimant or this routine's previous reservation retry
+        // may leave the authorization briefly EMPTY before RT republishes the
+        // same ACK. Take one fixed-cost seqlock snapshot to distinguish that
+        // exact transient from a different authorization. An unstable writer
+        // is also retryable only while the live owner tuple remains exact.
+        const std::uint64_t sequenceBefore =
+            m_ncResetReleaseAuthWriteSequence.load(
+                std::memory_order_acquire);
+        MotionNCResetSafetyReleaseAuthorization snapshot{};
+        snapshot.requestSequence =
+            m_ncResetReleaseAuthRequestSequence.load(
+                std::memory_order_relaxed);
+        const std::uint64_t packedIdentity =
+            m_ncResetReleaseAuthPackedIdentity.load(
+                std::memory_order_relaxed);
+        snapshot.executionEpoch =
+            static_cast<MotionExecutionEpoch>(
+                packedIdentity & 0xFFFFFFFFULL);
+        snapshot.ownerGeneration =
+            static_cast<MotionOwnerGeneration>(
+                packedIdentity >> 32U);
+        snapshot.safetyRequestTicket =
+            m_ncResetReleaseAuthSafetyTicket.load(
+                std::memory_order_relaxed);
+        snapshot.drainRevocationGeneration =
+            m_ncResetReleaseAuthDrainGeneration.load(
+                std::memory_order_relaxed);
+        const std::uint64_t sequenceAfter =
+            m_ncResetReleaseAuthWriteSequence.load(
+                std::memory_order_acquire);
+        if (sequenceBefore != sequenceAfter ||
+            (sequenceAfter & 1ULL) != 0ULL)
+        {
+            return classifyCurrentTuple();
+        }
+        if (snapshot.IsValid() && authorizationMatches(snapshot))
+        {
+            return classifyCurrentTuple();
+        }
+
+        return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+    }
+    if (!authorizationMatches(publishedAuthorization))
+    {
+        (void)ReleaseNCResetSafetyReleaseAuthorizationClaim();
+        return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+    }
+
+    const auto releaseAuthorizationClaim = [this]() noexcept
+    {
+        (void)ReleaseNCResetSafetyReleaseAuthorizationClaim();
+    };
+
+    MotionExecutionEpoch exactEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    const ResetSafetyAuthorityStatus exactEpochStatus =
+        TryGetResetSafetyMotionOwnerEpoch(
+            lease,
+            authorization.safetyRequestTicket,
+            authorization.drainRevocationGeneration,
+            exactEpoch);
+    if (exactEpochStatus != ResetSafetyAuthorityStatus::ACQUIRED ||
+        exactEpoch != authorization.executionEpoch)
+    {
+        releaseAuthorizationClaim();
+        if (exactEpochStatus == ResetSafetyAuthorityStatus::DEFERRED)
+        {
+            return classifyCurrentTuple();
+        }
+        return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+    }
+
+    std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if (!UnpackMotionOwnerState(ownerState).Matches(lease) ||
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) !=
+        authorization.safetyRequestTicket)
+    {
+        releaseAuthorizationClaim();
+        return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+    }
+    if (UnpackMotionOwnerSafetyHandshake(ownerState) ||
+        UnpackMotionOwnerSafetyActionPending(ownerState))
+    {
+        releaseAuthorizationClaim();
+        return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+    }
+    if ((ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL)
+    {
+        releaseAuthorizationClaim();
+        return classifyCurrentTuple();
+    }
+
+    const std::uint64_t reservedOwnerState =
+        ownerState | MOTION_OWNER_EPOCH_COMMIT_RESERVED;
+    if (!m_motionOwnerState.compare_exchange_strong(
+        ownerState,
+        reservedOwnerState,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        releaseAuthorizationClaim();
+        return classifyCurrentTuple();
+    }
+
+    const auto releaseReservation = [this,
+        reservedOwnerState]() noexcept
+    {
+        std::uint64_t expected = reservedOwnerState;
+        if (!m_motionOwnerState.compare_exchange_strong(
+            expected,
+            reservedOwnerState &
+            ~MOTION_OWNER_EPOCH_COMMIT_RESERVED,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            m_motionOwnerState.fetch_and(
+                ~MOTION_OWNER_EPOCH_COMMIT_RESERVED,
+                std::memory_order_acq_rel);
+        }
+    };
+
+    if (m_executionDrainRevocationGeneration.load(
+        std::memory_order_acquire) !=
+        authorization.drainRevocationGeneration ||
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+        m_safetyRecoveryRequestInProgress.load(
+            std::memory_order_acquire) ||
+        HasPendingSafetyOrRecoveryRequests() ||
+        m_safetyControlledStopInProgress)
+    {
+        releaseReservation();
+        releaseAuthorizationClaim();
+        return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+    }
+    if (m_motionOwnerState.load(std::memory_order_acquire) !=
+        reservedOwnerState)
+    {
+        releaseReservation();
+        releaseAuthorizationClaim();
+        return classifyCurrentTuple();
+    }
+
+    const std::uint64_t releasedOwnerState =
+        PackMotionOwnerState(
+            MotionOwner::NONE,
+            NextMotionOwnerGeneration(lease.generation),
+            authorization.safetyRequestTicket,
+            false,
+            false);
+    std::uint64_t expectedReservedOwnerState =
+        reservedOwnerState;
+    if (!m_motionOwnerState.compare_exchange_strong(
+        expectedReservedOwnerState,
+        releasedOwnerState,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        releaseReservation();
+        releaseAuthorizationClaim();
+        return classifyCurrentTuple();
+    }
+
+    // The owner CAS is the release linearization point, but an independent
+    // Safety producer can begin while the EPOCH reservation is held: it
+    // advances provenance first, fails to replace the reserved owner, and
+    // leaves a fail-closed mailbox for RT.  Re-prove the complete tuple after
+    // publishing NONE so the caller cannot enter READY or retire the
+    // cross-scan zero-output hold across that interleaving.  The released
+    // owner is deliberately not restored on failure; the newer Safety work
+    // owns the subsequent transition.
+    if (m_executionDrainRevocationGeneration.load(
+        std::memory_order_acquire) !=
+        authorization.drainRevocationGeneration ||
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+        m_safetyRecoveryRequestInProgress.load(
+            std::memory_order_acquire) ||
+        HasPendingSafetyOrRecoveryRequests() ||
+        m_safetyControlledStopInProgress ||
+        m_motionOwnerState.load(std::memory_order_acquire) !=
+        releasedOwnerState)
+    {
+        releaseAuthorizationClaim();
+        return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+    }
+
+    if (!ConsumeNCResetSafetyReleaseAuthorizationClaim())
+    {
+        return SafetyMotionOwnerReleaseStatus::SUPERSEDED;
+    }
+
+    return SafetyMotionOwnerReleaseStatus::RELEASED;
+}
+
+
+bool MotionCore::ReleaseSafetyMotionOwner(
+    const MotionOwnerLease& lease,
+    const MotionNCResetSafetyReleaseAuthorization& authorization) noexcept
+{
+    return TryReleaseSafetyMotionOwner(lease, authorization) ==
+        SafetyMotionOwnerReleaseStatus::RELEASED;
+}
+
+
+bool MotionCore::EnsureSafetyMotionOwnerEpoch(
+    const MotionOwnerLease& safetyLease,
+    std::uint32_t safetyRequestTicket) noexcept
+{
+    if (!safetyLease.IsValid() ||
+        safetyLease.owner != MotionOwner::SAFETY ||
+        safetyRequestTicket == 0U)
+    {
+        return false;
+    }
+
+    const auto PackedGeneration =
+        [](std::uint64_t packed) noexcept
+        -> MotionOwnerGeneration
+    {
+        return static_cast<MotionOwnerGeneration>(
+            packed >> 32U);
+    };
+    const auto PackedEpoch =
+        [](std::uint64_t packed) noexcept
+        -> MotionExecutionEpoch
+    {
+        return static_cast<MotionExecutionEpoch>(
+            packed & 0xFFFFFFFFULL);
+    };
+    const auto PackGenerationEpoch =
+        [](MotionOwnerGeneration generation,
+            MotionExecutionEpoch epoch) noexcept -> std::uint64_t
+    {
+        return
+            (static_cast<std::uint64_t>(generation) << 32U) |
+            static_cast<std::uint64_t>(epoch);
+    };
+    const auto IsNewerOwnerGeneration =
+        [](MotionOwnerGeneration candidate,
+            MotionOwnerGeneration observed) noexcept -> bool
+    {
+        if (candidate == MOTION_OWNER_GENERATION_INVALID)
+        {
+            return false;
+        }
+        if (observed == MOTION_OWNER_GENERATION_INVALID)
+        {
+            return true;
+        }
+
+        // Owner generations advance modulo 2^32. The signed half-range
+        // comparison is the standard serial-number ordering and prevents
+        // a delayed helper from replacing a later takeover generation.
+        return static_cast<std::int32_t>(candidate - observed) > 0;
+    };
+
+    for (unsigned attempt = 0U;
+        attempt < MOTION_OWNER_BOUNDED_CAS_ATTEMPTS;
+        ++attempt)
+    {
+        std::uint64_t ownerState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        if (!UnpackMotionOwnerState(ownerState).Matches(safetyLease))
+        {
+            return false;
+        }
+
+        const std::uint32_t currentTicket =
+            UnpackMotionOwnerSafetyRequestTicket(ownerState);
+        if (currentTicket == 0U ||
+            currentTicket == m_safetyRequestAcknowledgedTicket.load(
+                std::memory_order_acquire))
+        {
+            return false;
+        }
+        safetyRequestTicket = currentTicket;
+
+        std::uint64_t acknowledgement =
+            m_safetyOwnerEpochAcknowledgement.load(
+                std::memory_order_acquire);
+        std::uint64_t publication =
+            m_executionEpochPublication.load(
+                std::memory_order_acquire);
+
+        // An acknowledged generation is complete only after the same packed
+        // Owner state leaves HANDSHAKE. Release rejects HANDSHAKE, so no old
+        // helper can publish a SAFETY Epoch after the lease was released.
+        if (PackedGeneration(acknowledgement) ==
+            safetyLease.generation &&
+            PackedEpoch(acknowledgement) !=
+            MOTION_EXECUTION_EPOCH_INVALID &&
+            UnpackExecutionEpochPublicationSource(publication) ==
+            MotionCommandSource::SAFETY)
+        {
+            if (!UnpackMotionOwnerSafetyHandshake(ownerState))
+            {
+                return IsMotionOwnerLeaseCurrent(safetyLease);
+            }
+
+            const std::uint64_t stableOwnerState =
+                ownerState & ~MOTION_OWNER_SAFETY_HANDSHAKE;
+            if (m_motionOwnerState.compare_exchange_strong(
+                ownerState,
+                stableOwnerState,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            {
+                return IsMotionOwnerLeaseCurrent(safetyLease);
+            }
+            continue;
+        }
+
+        if (!UnpackMotionOwnerSafetyHandshake(ownerState))
+        {
+            return false;
+        }
+
+        // Every helper for one owner generation shares one exact expected
+        // Epoch claim. They all attempt the same successor CAS, so a delayed
+        // helper cannot publish an extra SAFETY Epoch after E-stop evidence
+        // has already correlated the first one.
+        std::uint64_t claim = m_safetyOwnerEpochClaim.load(
+            std::memory_order_acquire);
+        if (PackedGeneration(claim) != safetyLease.generation)
+        {
+            if (!IsNewerOwnerGeneration(
+                safetyLease.generation,
+                PackedGeneration(claim)))
+            {
+                return false;
+            }
+
+            if ((publication &
+                EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL)
+            {
+                publication = m_executionEpochPublication.load(
+                    std::memory_order_acquire);
+                continue;
+            }
+
+            const std::uint64_t desiredClaim =
+                PackGenerationEpoch(
+                    safetyLease.generation,
+                    UnpackExecutionEpochPublication(publication));
+            if (!m_safetyOwnerEpochClaim.compare_exchange_strong(
+                claim,
+                desiredClaim,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            {
+                continue;
+            }
+            claim = desiredClaim;
+        }
+
+        const MotionExecutionEpoch expectedEpoch = PackedEpoch(claim);
+        if (expectedEpoch == MOTION_EXECUTION_EPOCH_INVALID)
+        {
+            return false;
+        }
+
+        // Re-read both completion and publication immediately before the
+        // one-shot CAS. A helper that was descheduled after reading the claim
+        // observes the winning helper here and returns without Epoch churn.
+        acknowledgement = m_safetyOwnerEpochAcknowledgement.load(
+            std::memory_order_acquire);
+        if (PackedGeneration(acknowledgement) ==
+            safetyLease.generation &&
+            PackedEpoch(acknowledgement) !=
+            MOTION_EXECUTION_EPOCH_INVALID)
+        {
+            continue;
+        }
+
+        publication = m_executionEpochPublication.load(
+            std::memory_order_acquire);
+        if ((publication &
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL)
+        {
+            continue;
+        }
+
+        MotionExecutionEpoch observedEpoch =
+            UnpackExecutionEpochPublication(publication);
+        MotionCommandSource observedSource =
+            UnpackExecutionEpochPublicationSource(publication);
+
+        if (observedEpoch == expectedEpoch)
+        {
+            const MotionExecutionEpoch successorEpoch =
+                (expectedEpoch ==
+                    (std::numeric_limits<MotionExecutionEpoch>::max)())
+                ? 1U
+                : static_cast<MotionExecutionEpoch>(expectedEpoch + 1U);
+            const std::uint64_t desiredPublication =
+                PackExecutionEpochPublication(
+                    successorEpoch,
+                    MotionCommandSource::SAFETY,
+                    false,
+                    true);
+
+            if (!m_executionEpochPublication.compare_exchange_strong(
+                publication,
+                desiredPublication,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            {
+                continue;
+            }
+
+            observedEpoch = successorEpoch;
+            observedSource = MotionCommandSource::SAFETY;
+        }
+        else if (observedSource != MotionCommandSource::SAFETY)
+        {
+            // The only ordinary publisher allowed to cross this seam is the
+            // already-in-flight one-shot producer. Advance the shared claim
+            // to its exact result; every helper now targets one common SAFETY
+            // successor rather than independently incrementing the Epoch.
+            const std::uint64_t advancedClaim =
+                PackGenerationEpoch(
+                    safetyLease.generation,
+                    observedEpoch);
+            (void)m_safetyOwnerEpochClaim.compare_exchange_strong(
+                claim,
+                advancedClaim,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+            continue;
+        }
+
+        ownerState = m_motionOwnerState.load(std::memory_order_acquire);
+        if (!UnpackMotionOwnerState(ownerState).Matches(safetyLease) ||
+            !UnpackMotionOwnerSafetyHandshake(ownerState) ||
+            observedSource != MotionCommandSource::SAFETY)
+        {
+            return false;
+        }
+
+        const std::uint64_t desiredAcknowledgement =
+            PackGenerationEpoch(
+                safetyLease.generation,
+                observedEpoch);
+        acknowledgement = m_safetyOwnerEpochAcknowledgement.load(
+            std::memory_order_acquire);
+        if (IsNewerOwnerGeneration(
+            safetyLease.generation,
+            PackedGeneration(acknowledgement)))
+        {
+            (void)m_safetyOwnerEpochAcknowledgement.compare_exchange_strong(
+                acknowledgement,
+                desiredAcknowledgement,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+    }
+
+    return false;
+}
+
+
+std::uint32_t MotionCore::PublishSafetyMotionRequestTicket(
+    bool requiresRTApplication) noexcept
+{
+    std::uint64_t observed =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    for (unsigned attempt = 0U;
+        attempt < MOTION_OWNER_BOUNDED_CAS_ATTEMPTS;
+        ++attempt)
+    {
+        if ((observed &
+            (MOTION_OWNER_FRAME_SEND_RESERVED |
+                MOTION_OWNER_EPOCH_COMMIT_RESERVED)) != 0ULL)
+        {
+            // The non-zero process-data frame owns the physical send seam.
+            // The request has not linearized yet; its caller retains the
+            // revocation window/mailbox and the next bounded attempt/pass
+            // publishes after EndServoOutputFrameAtSendPoint releases it.
+            return 0U;
+        }
+        const MotionOwnerLease lease = UnpackMotionOwnerState(observed);
+        const std::uint32_t previous =
+            UnpackMotionOwnerSafetyRequestTicket(observed);
+
+        // Every BeginRevocation window performs a value-changing CAS on this
+        // same packed word, including pure authority helpers. This is the
+        // cross-thread ordering edge which prevents a parallel Release/ACK
+        // from passing a producer paused before its takeover/mutation.
+        const std::uint32_t next =
+            previous >= MOTION_OWNER_SAFETY_TICKET_MAX
+            ? 1U
+            : previous + 1U;
+        const bool actionPending =
+            UnpackMotionOwnerSafetyActionPending(observed) ||
+            requiresRTApplication;
+        const std::uint64_t desired =
+            PackMotionOwnerState(
+                lease.owner,
+                lease.generation,
+                next,
+                UnpackMotionOwnerSafetyHandshake(observed),
+                actionPending) |
+            (observed & MOTION_OWNER_OUTPUT_COMMIT_RESERVED);
+        if (m_motionOwnerState.compare_exchange_strong(
+            observed,
+            desired,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            return next;
+        }
+    }
+    return 0U;
+}
+
+
+bool MotionCore::EnsureSafetyMotionActionTicket(
+    std::uint32_t& safetyRequestTicket) noexcept
+{
+    const std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint32_t currentTicket =
+        UnpackMotionOwnerSafetyRequestTicket(ownerState);
+    const std::uint32_t acknowledged =
+        m_safetyRequestAcknowledgedTicket.load(
             std::memory_order_acquire);
 
-    for (;;)
+    if (currentTicket != 0U &&
+        currentTicket != acknowledged &&
+        UnpackMotionOwnerSafetyActionPending(ownerState))
     {
+        // Every caller holds the drain-revocation publisher count.  Therefore
+        // an existing unacknowledged ACTION ticket cannot be completed while
+        // this producer is still publishing its mailbox/direct mutation, and
+        // it is safe to join that exact incident without a second CAS loop.
+        safetyRequestTicket = currentTicket;
+        return true;
+    }
+
+    safetyRequestTicket = 0U;
+    return false;
+}
+
+
+bool MotionCore::CompleteSafetyMotionActionTicket(
+    std::uint32_t safetyRequestTicket) noexcept
+{
+    if (safetyRequestTicket == 0U)
+    {
+        return false;
+    }
+
+    std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    for (unsigned attempt = 0U;
+        attempt < MOTION_OWNER_BOUNDED_CAS_ATTEMPTS;
+        ++attempt)
+    {
+        if (UnpackMotionOwnerSafetyRequestTicket(ownerState) !=
+            safetyRequestTicket)
+        {
+            // A newer producer now owns ACTION_PENDING. Never clear its bit;
+            // this producer is still covered by the revocation count until
+            // it returns, and any deferred mailbox it published is itself an
+            // acknowledgement fence.
+            return false;
+        }
+
+        if (!UnpackMotionOwnerSafetyActionPending(ownerState))
+        {
+            return true;
+        }
+
+        const std::uint64_t completedOwnerState =
+            ownerState & ~MOTION_OWNER_SAFETY_ACTION_PENDING;
+        if (m_motionOwnerState.compare_exchange_strong(
+            ownerState,
+            completedOwnerState,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+bool MotionCore::HasUnacknowledgedSafetyMotionRequest() const noexcept
+{
+    const std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint32_t ticket =
+        UnpackMotionOwnerSafetyRequestTicket(ownerState);
+    return
+        (ticket != 0U &&
+            ticket != m_safetyRequestAcknowledgedTicket.load(
+                std::memory_order_acquire)) ||
+        UnpackMotionOwnerSafetyActionPending(ownerState);
+}
+
+
+MotionOwnerLease MotionCore::TryTakeSafetyMotionOwnerForTicket(
+    std::uint32_t safetyRequestTicket) noexcept
+{
+    MotionOwnerLease invalidLease{};
+    if (safetyRequestTicket == 0U)
+    {
+        return invalidLease;
+    }
+
+    std::uint64_t currentPacked =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    for (unsigned attempt = 0U;
+        attempt < MOTION_OWNER_BOUNDED_CAS_ATTEMPTS;
+        ++attempt)
+    {
+        const std::uint32_t currentTicket =
+            UnpackMotionOwnerSafetyRequestTicket(currentPacked);
+        if ((currentPacked &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL)
+        {
+            return invalidLease;
+        }
+        if (currentTicket == 0U ||
+            currentTicket == m_safetyRequestAcknowledgedTicket.load(
+                std::memory_order_acquire))
+        {
+            return invalidLease;
+        }
+        safetyRequestTicket = currentTicket;
+
         const MotionOwnerLease currentLease =
             UnpackMotionOwnerState(currentPacked);
-
-        // Alarm 狀態可能每個 Scan 都重複呼叫；Safety 已持有時不遞增。
         if (currentLease.owner == MotionOwner::SAFETY &&
             currentLease.generation != MOTION_OWNER_GENERATION_INVALID)
         {
-            return currentLease;
+            if (!UnpackMotionOwnerSafetyHandshake(currentPacked))
+            {
+                return currentLease;
+            }
+            if (EnsureSafetyMotionOwnerEpoch(
+                currentLease,
+                safetyRequestTicket))
+            {
+                return currentLease;
+            }
+            // EnsureSafetyMotionOwnerEpoch has its own fixed budget.  Do not
+            // nest it inside all outer takeover attempts; the next 250 us
+            // pass can safely resume the still-visible handshake.
+            return invalidLease;
         }
 
         MotionOwnerLease safetyLease{};
         safetyLease.owner = MotionOwner::SAFETY;
         safetyLease.generation =
             NextMotionOwnerGeneration(currentLease.generation);
-
         const std::uint64_t safetyPacked =
             PackMotionOwnerState(
                 safetyLease.owner,
-                safetyLease.generation);
-
-        if (m_motionOwnerState.compare_exchange_weak(
+                safetyLease.generation,
+                safetyRequestTicket,
+                true,
+                UnpackMotionOwnerSafetyActionPending(currentPacked));
+        if (m_motionOwnerState.compare_exchange_strong(
             currentPacked,
             safetyPacked,
             std::memory_order_acq_rel,
             std::memory_order_acquire))
         {
-            return safetyLease;
+            if (EnsureSafetyMotionOwnerEpoch(
+                safetyLease,
+                safetyRequestTicket))
+            {
+                return safetyLease;
+            }
+            return invalidLease;
         }
     }
+    return invalidLease;
+}
+
+
+void MotionCore::BeginExecutionDrainAcknowledgementRevocation() noexcept
+{
+    m_executionDrainRevocationPublishersInProgress.fetch_add(
+        1U,
+        std::memory_order_acq_rel);
+    m_frameSafetyIntentState.fetch_add(
+        FRAME_SAFETY_INTENT_BEGIN_DELTA,
+        std::memory_order_acq_rel);
+    // Count closes the J.5 acknowledgement seam first; the packed state then
+    // closes the whole-PDO seam; generation remains the exact settle token.
+    m_executionDrainRevocationGeneration.fetch_add(
+        1ULL,
+        std::memory_order_acq_rel);
+}
+
+
+bool MotionCore::BeginResetSafetyProvenanceOperation(
+    std::uint64_t expectedProvenanceGeneration,
+    std::uint64_t& operationProvenanceGeneration) noexcept
+{
+    m_executionDrainRevocationPublishersInProgress.fetch_add(
+        1U,
+        std::memory_order_acq_rel);
+    m_frameSafetyIntentState.fetch_add(
+        FRAME_SAFETY_INTENT_BEGIN_DELTA,
+        std::memory_order_acq_rel);
+
+    const std::uint64_t previousProvenanceGeneration =
+        m_executionDrainRevocationGeneration.fetch_add(
+            1ULL,
+            std::memory_order_acq_rel);
+    operationProvenanceGeneration =
+        previousProvenanceGeneration + 1ULL;
+    return
+        previousProvenanceGeneration ==
+        expectedProvenanceGeneration;
+}
+
+
+void MotionCore::EndExecutionDrainAcknowledgementRevocation() noexcept
+{
+    m_executionDrainRevocationPublishersInProgress.fetch_sub(
+        1U,
+        std::memory_order_release);
+    m_frameSafetyIntentState.fetch_sub(
+        1ULL,
+        std::memory_order_release);
+}
+
+
+std::uint64_t MotionCore::BeginResetSafetyOutputHold() noexcept
+{
+    // Keep the active-count half nonzero across 10 ms scans.  The sequence
+    // half changes at the same RMW, so a frame which began immediately before
+    // this call also fails its final send-point comparison and is scrubbed.
+    m_frameSafetyIntentState.fetch_add(
+        FRAME_SAFETY_INTENT_BEGIN_DELTA,
+        std::memory_order_acq_rel);
+    return m_executionDrainRevocationGeneration.load(
+        std::memory_order_acquire);
+}
+
+
+bool MotionCore::IsResetSafetyOutputHoldEstablished() const noexcept
+{
+    const std::uint64_t safetyIntentState =
+        m_frameSafetyIntentState.load(std::memory_order_acquire);
+    const std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+
+    // A frame whose send-point reservation is still held has already passed
+    // Finalize but may not yet have reached the NIC.  Keep the operator edge
+    // deferred until EndServoOutputFrameAfterSend() retires that transaction.
+    // The active output hold installed before this check prevents every later
+    // non-zero frame from acquiring a new reservation; a contender which read
+    // the old state just before the hold will fail its final safety-state
+    // proof and be scrubbed.
+    return
+        static_cast<std::uint32_t>(safetyIntentState) != 0U &&
+        (ownerState & MOTION_OWNER_FRAME_SEND_RESERVED) == 0ULL;
+}
+
+
+void MotionCore::EndResetSafetyOutputHold() noexcept
+{
+    // Leave the sequence half advanced; only retire this Reset's one active
+    // hold.  The caller owns the matching begin/end lifetime.
+    m_frameSafetyIntentState.fetch_sub(
+        1ULL,
+        std::memory_order_release);
+}
+
+
+std::uint64_t MotionCore::MarkResetSafetyOperatorEdge() noexcept
+{
+    // This short, balanced publisher is the exact linearization point for
+    // every explicit Reset edge, including a new edge which reuses an
+    // already-active cross-scan output hold after terminal BLOCKED.
+    m_executionDrainRevocationPublishersInProgress.fetch_add(
+        1U,
+        std::memory_order_acq_rel);
+    m_frameSafetyIntentState.fetch_add(
+        FRAME_SAFETY_INTENT_BEGIN_DELTA,
+        std::memory_order_acq_rel);
+    const std::uint64_t generation =
+        m_executionDrainRevocationGeneration.fetch_add(
+            1ULL,
+            std::memory_order_acq_rel) + 1ULL;
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
+    return generation;
+}
+
+
+std::uint64_t MotionCore::GetSafetyProvenanceGeneration() const noexcept
+{
+    return m_executionDrainRevocationGeneration.load(
+        std::memory_order_acquire);
+}
+
+
+void MotionCore::RevokeExecutionDrainAcknowledgement() noexcept
+{
+    BeginExecutionDrainAcknowledgementRevocation();
+    EndExecutionDrainAcknowledgementRevocation();
+}
+
+
+MotionOwnerLease MotionCore::TakeSafetyMotionOwner() noexcept
+{
+    BeginExecutionDrainAcknowledgementRevocation();
+    const std::uint32_t ticket =
+        PublishSafetyMotionRequestTicket(false);
+    const MotionOwnerLease lease =
+        TryTakeSafetyMotionOwnerForTicket(ticket);
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
+    return lease;
+}
+
+
+MotionOwnerLease MotionCore::BeginNewSafetyMotionOwnerGeneration() noexcept
+{
+    const MotionOwnerGeneration entryGeneration =
+        UnpackMotionOwnerState(
+            m_motionOwnerState.load(
+                std::memory_order_acquire)).generation;
+    return ContinueNewSafetyMotionOwnerGeneration(entryGeneration);
+}
+
+
+MotionOwnerLease MotionCore::ContinueNewSafetyMotionOwnerGeneration(
+    MotionOwnerGeneration entryGeneration) noexcept
+{
+    BeginExecutionDrainAcknowledgementRevocation();
+    MotionOwnerLease result{};
+    std::uint64_t currentPacked =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const MotionOwnerLease entryObservedLease =
+        UnpackMotionOwnerState(currentPacked);
+    if (entryObservedLease.owner == MotionOwner::SAFETY &&
+        entryObservedLease.generation != entryGeneration &&
+        !UnpackMotionOwnerSafetyHandshake(currentPacked) &&
+        (currentPacked & MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL &&
+        IsMotionOwnerLeaseCurrent(entryObservedLease))
+    {
+        EndExecutionDrainAcknowledgementRevocation();
+        TryAcknowledgeAppliedSafetyMotionRequests();
+        return entryObservedLease;
+    }
+    if (entryObservedLease.generation != entryGeneration &&
+        entryObservedLease.owner != MotionOwner::SAFETY)
+    {
+        EndExecutionDrainAcknowledgementRevocation();
+        return result;
+    }
+
+    std::uint32_t ticket =
+        UnpackMotionOwnerSafetyRequestTicket(currentPacked);
+    if (ticket == 0U ||
+        ticket == m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire))
+    {
+        ticket = PublishSafetyMotionRequestTicket(false);
+        currentPacked = m_motionOwnerState.load(
+            std::memory_order_acquire);
+    }
+
+    for (unsigned attempt = 0U;
+        attempt < MOTION_OWNER_BOUNDED_CAS_ATTEMPTS;
+        ++attempt)
+    {
+        ticket = UnpackMotionOwnerSafetyRequestTicket(currentPacked);
+        if (ticket == 0U ||
+            ticket == m_safetyRequestAcknowledgedTicket.load(
+                std::memory_order_acquire))
+        {
+            ticket = PublishSafetyMotionRequestTicket(false);
+            currentPacked = m_motionOwnerState.load(
+                std::memory_order_acquire);
+            continue;
+        }
+
+        if ((currentPacked &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL)
+        {
+            currentPacked = m_motionOwnerState.load(
+                std::memory_order_acquire);
+            continue;
+        }
+
+        const MotionOwnerLease currentLease =
+            UnpackMotionOwnerState(currentPacked);
+
+        // The continuation may join a newer SAFETY takeover, but it must
+        // never mint yet another generation after an unrelated owner has
+        // superseded the original Reset baseline.
+        if (currentLease.generation != entryGeneration &&
+            currentLease.owner != MotionOwner::SAFETY)
+        {
+            break;
+        }
+
+        // A concurrent takeover which already advanced beyond our entry
+        // generation satisfies the freshness contract only after its exact
+        // handshake/Epoch publication is complete. Never fall back to the
+        // idempotent same-generation Take path here.
+        if (currentLease.owner == MotionOwner::SAFETY &&
+            currentLease.generation != entryGeneration)
+        {
+            if (EnsureSafetyMotionOwnerEpoch(currentLease, ticket))
+            {
+                result = currentLease;
+                break;
+            }
+            currentPacked = m_motionOwnerState.load(
+                std::memory_order_acquire);
+            continue;
+        }
+
+        if (UnpackMotionOwnerSafetyHandshake(currentPacked))
+        {
+            if (currentLease.owner == MotionOwner::SAFETY)
+            {
+                (void)EnsureSafetyMotionOwnerEpoch(
+                    currentLease,
+                    ticket);
+            }
+            currentPacked = m_motionOwnerState.load(
+                std::memory_order_acquire);
+            continue;
+        }
+
+        MotionOwnerLease safetyLease{};
+        safetyLease.owner = MotionOwner::SAFETY;
+        safetyLease.generation =
+            NextMotionOwnerGeneration(currentLease.generation);
+        const std::uint64_t safetyPacked =
+            PackMotionOwnerState(
+                safetyLease.owner,
+                safetyLease.generation,
+                ticket,
+                true,
+                UnpackMotionOwnerSafetyActionPending(currentPacked));
+        if (m_motionOwnerState.compare_exchange_strong(
+            currentPacked,
+            safetyPacked,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire) &&
+            EnsureSafetyMotionOwnerEpoch(safetyLease, ticket))
+        {
+            result = safetyLease;
+            break;
+        }
+    }
+
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
+    return result;
+}
+
+
+MotionCore::ResetSafetyAuthorityResult
+MotionCore::TryCaptureResetSafetyAuthorityBaseline(
+    std::uint64_t expectedProvenanceGeneration) const noexcept
+{
+    ResetSafetyAuthorityResult result{};
+    result.provenanceGeneration = expectedProvenanceGeneration;
+
+    const std::uint64_t entryProvenance =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    if (entryProvenance != expectedProvenanceGeneration)
+    {
+        result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+        return result;
+    }
+
+    const std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint32_t ticket =
+        UnpackMotionOwnerSafetyRequestTicket(ownerState);
+    const std::uint32_t acknowledgedTicket =
+        m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire);
+    const std::uint64_t executionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const bool hasPendingSafetyOrRecovery =
+        HasPendingSafetyOrRecoveryRequests();
+
+    if (m_executionDrainRevocationGeneration.load(
+        std::memory_order_acquire) != entryProvenance)
+    {
+        result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+        return result;
+    }
+
+    if (m_motionOwnerState.load(std::memory_order_acquire) != ownerState ||
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+        m_safetyRecoveryRequestInProgress.load(
+            std::memory_order_acquire) ||
+        ticket != acknowledgedTicket ||
+        UnpackMotionOwnerSafetyHandshake(ownerState) ||
+        UnpackMotionOwnerSafetyActionPending(ownerState) ||
+        (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        (executionPublication &
+            (EXECUTION_EPOCH_PUBLICATION_PENDING |
+                EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+        hasPendingSafetyOrRecovery)
+    {
+        return result;
+    }
+
+    result.lease = UnpackMotionOwnerState(ownerState);
+    result.requestTicket = ticket;
+    result.status = ResetSafetyAuthorityStatus::ACQUIRED;
+    return result;
+}
+
+
+MotionCore::ResetSafetyAuthorityResult
+MotionCore::ContinueResetSafetyMotionOwnerGeneration(
+    MotionOwnerGeneration entryGeneration,
+    std::uint32_t baselineTicket,
+    std::uint32_t requestTicket,
+    std::uint64_t expectedProvenanceGeneration) noexcept
+{
+    ResetSafetyAuthorityResult result{};
+    result.requestTicket = requestTicket;
+
+    if (!BeginResetSafetyProvenanceOperation(
+        expectedProvenanceGeneration,
+        result.provenanceGeneration))
+    {
+        result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+        EndExecutionDrainAcknowledgementRevocation();
+        TryAcknowledgeAppliedSafetyMotionRequests();
+        return result;
+    }
+
+    const MotionOwnerGeneration targetGeneration =
+        NextMotionOwnerGeneration(entryGeneration);
+    MotionOwnerLease resetSafetyLease{};
+    resetSafetyLease.owner = MotionOwner::SAFETY;
+    resetSafetyLease.generation = targetGeneration;
+
+    // The first successful operation performs one indivisible transition
+    // from the exact drained baseline to RESET-owned SAFETY authority.  No
+    // ticket-only state is ever observable, so RT cannot acknowledge a Reset
+    // request before its target generation/handshake exists.
+    if (result.requestTicket == 0U)
+    {
+        std::uint64_t baselineState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        const MotionOwnerLease baselineLease =
+            UnpackMotionOwnerState(baselineState);
+        const std::uint32_t observedBaselineTicket =
+            UnpackMotionOwnerSafetyRequestTicket(baselineState);
+        const std::uint32_t acknowledgedTicket =
+            m_safetyRequestAcknowledgedTicket.load(
+                std::memory_order_acquire);
+
+        if (baselineLease.generation != entryGeneration ||
+            observedBaselineTicket != baselineTicket ||
+            acknowledgedTicket != baselineTicket ||
+            UnpackMotionOwnerSafetyHandshake(baselineState) ||
+            UnpackMotionOwnerSafetyActionPending(baselineState))
+        {
+            result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+        }
+        else if ((baselineState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL &&
+            m_executionDrainRevocationGeneration.load(
+                std::memory_order_acquire) ==
+            result.provenanceGeneration &&
+            m_executionDrainRevocationPublishersInProgress.load(
+                std::memory_order_acquire) == 1U)
+        {
+            const std::uint32_t nextTicket =
+                baselineTicket >= MOTION_OWNER_SAFETY_TICKET_MAX
+                ? 1U
+                : baselineTicket + 1U;
+            const std::uint64_t resetSafetyState =
+                PackMotionOwnerState(
+                    resetSafetyLease.owner,
+                    resetSafetyLease.generation,
+                    nextTicket,
+                    true,
+                    false);
+            std::uint64_t expectedBaselineState = baselineState;
+            if (m_motionOwnerState.compare_exchange_strong(
+                expectedBaselineState,
+                resetSafetyState,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            {
+                result.requestTicket = nextTicket;
+            }
+            else
+            {
+                const MotionOwnerLease observedLease =
+                    UnpackMotionOwnerState(expectedBaselineState);
+                const std::uint32_t observedTicket =
+                    UnpackMotionOwnerSafetyRequestTicket(
+                        expectedBaselineState);
+                if (observedLease.generation != entryGeneration ||
+                    observedTicket != baselineTicket ||
+                    m_executionDrainRevocationGeneration.load(
+                        std::memory_order_acquire) !=
+                    result.provenanceGeneration)
+                {
+                    result.status =
+                        ResetSafetyAuthorityStatus::SUPERSEDED;
+                }
+            }
+        }
+    }
+
+    if (result.status != ResetSafetyAuthorityStatus::SUPERSEDED &&
+        result.requestTicket != 0U)
+    {
+        const std::uint64_t currentState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        const MotionOwnerLease currentLease =
+            UnpackMotionOwnerState(currentState);
+        const std::uint32_t currentTicket =
+            UnpackMotionOwnerSafetyRequestTicket(currentState);
+
+        if (!currentLease.Matches(resetSafetyLease) ||
+            currentTicket != result.requestTicket ||
+            m_executionDrainRevocationGeneration.load(
+                std::memory_order_acquire) !=
+            result.provenanceGeneration)
+        {
+            result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+        }
+        else
+        {
+            MotionExecutionEpoch exactEpoch =
+                MOTION_EXECUTION_EPOCH_INVALID;
+            const ResetSafetyAuthorityStatus exactStatus =
+                TryGetResetSafetyMotionOwnerEpoch(
+                    resetSafetyLease,
+                    result.requestTicket,
+                    result.provenanceGeneration,
+                    exactEpoch);
+            if (exactStatus == ResetSafetyAuthorityStatus::ACQUIRED)
+            {
+                result.lease = resetSafetyLease;
+                result.status = ResetSafetyAuthorityStatus::ACQUIRED;
+            }
+            else if (exactStatus ==
+                ResetSafetyAuthorityStatus::SUPERSEDED)
+            {
+                result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+            }
+            else if ((currentState &
+                MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL &&
+                UnpackMotionOwnerSafetyHandshake(currentState) &&
+                EnsureSafetyMotionOwnerEpoch(
+                    resetSafetyLease,
+                    result.requestTicket))
+            {
+                const std::uint64_t afterEnsure =
+                    m_motionOwnerState.load(std::memory_order_acquire);
+                if (UnpackMotionOwnerState(afterEnsure).Matches(
+                    resetSafetyLease) &&
+                    UnpackMotionOwnerSafetyRequestTicket(afterEnsure) ==
+                    result.requestTicket &&
+                    m_executionDrainRevocationGeneration.load(
+                        std::memory_order_acquire) ==
+                    result.provenanceGeneration)
+                {
+                    result.lease = resetSafetyLease;
+                    result.status =
+                        ResetSafetyAuthorityStatus::ACQUIRED;
+                }
+                else
+                {
+                    result.status =
+                        ResetSafetyAuthorityStatus::SUPERSEDED;
+                }
+            }
+        }
+    }
+
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
+    return result;
+}
+
+
+void MotionCore::TryAcknowledgeAppliedSafetyMotionRequests() noexcept
+{
+    const auto hasUnappliedSafetyMailbox = [this]() noexcept -> bool
+    {
+        return
+            HasPendingExecutionEpochChange() ||
+            (m_emergencyStopRequestPublication.load(
+                std::memory_order_acquire) &
+                EMERGENCY_STOP_REQUEST_PENDING) != 0ULL ||
+            m_resetAllFaultsPending.load(std::memory_order_acquire) ||
+            m_stopGroupPending.load(std::memory_order_acquire) ||
+            m_resetSafetyBatchPending.load(
+                std::memory_order_acquire) != 0ULL ||
+            m_axisFaultResetPendingMask.load(
+                std::memory_order_acquire) != 0U;
+    };
+
+    if (m_executionDrainRevocationPublishersInProgress.load(
+        std::memory_order_acquire) != 0U ||
+        m_safetyRecoveryRequestInProgress.load(
+            std::memory_order_acquire) ||
+        m_safetyControlledStopInProgress ||
+        hasUnappliedSafetyMailbox())
+    {
+        return;
+    }
+
+    std::uint64_t entryOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    MotionOwnerLease entryLease =
+        UnpackMotionOwnerState(entryOwnerState);
+    const std::uint32_t ticket =
+        UnpackMotionOwnerSafetyRequestTicket(entryOwnerState);
+    if (entryLease.owner != MotionOwner::SAFETY ||
+        !entryLease.IsValid() ||
+        UnpackMotionOwnerSafetyHandshake(entryOwnerState) ||
+        (entryOwnerState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        ticket == 0U)
+    {
+        return;
+    }
+
+    if (UnpackMotionOwnerSafetyActionPending(entryOwnerState))
+    {
+        // BeginRevocation is sequenced before every action-ticket CAS. The
+        // acquire of that same packed word therefore makes the producer
+        // count visible here. Only a genuinely orphaned completion bit may
+        // be cleared after all publishers/mailboxes/direct mutations have
+        // left their explicit gates.
+        if (m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+            m_safetyRecoveryRequestInProgress.load(
+                std::memory_order_acquire) ||
+            m_safetyControlledStopInProgress ||
+            hasUnappliedSafetyMailbox() ||
+            !CompleteSafetyMotionActionTicket(ticket))
+        {
+            return;
+        }
+
+        entryOwnerState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        entryLease = UnpackMotionOwnerState(entryOwnerState);
+        if (entryLease.owner != MotionOwner::SAFETY ||
+            !entryLease.IsValid() ||
+            UnpackMotionOwnerSafetyHandshake(entryOwnerState) ||
+            UnpackMotionOwnerSafetyActionPending(entryOwnerState) ||
+            (entryOwnerState &
+                MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+            UnpackMotionOwnerSafetyRequestTicket(entryOwnerState) !=
+            ticket)
+        {
+            return;
+        }
+    }
+
+    // Only advance from the exact acknowledgement observed for this helper.
+    // A delayed helper must never overwrite a later incident's ACK with an
+    // older ticket after wrap/coalescing or concurrent RT/NC observation.
+    std::uint32_t expectedAcknowledgement =
+        m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire);
+    if (expectedAcknowledgement == ticket)
+    {
+        return;
+    }
+
+    if (m_motionOwnerState.load(std::memory_order_acquire) !=
+        entryOwnerState ||
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+        m_safetyRecoveryRequestInProgress.load(
+            std::memory_order_acquire) ||
+        m_safetyControlledStopInProgress ||
+        hasUnappliedSafetyMailbox())
+    {
+        return;
+    }
+
+    if (!m_safetyRequestAcknowledgedTicket.compare_exchange_strong(
+        expectedAcknowledgement,
+        ticket,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return;
+    }
+
+    // A request that races the acknowledgement changes the same packed Owner
+    // word first. Its new ticket therefore remains outstanding and prevents
+    // release even though the older ticket was just acknowledged.
+    const std::uint64_t exitOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if (exitOwnerState != entryOwnerState ||
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+        m_safetyRecoveryRequestInProgress.load(
+            std::memory_order_acquire) ||
+        m_safetyControlledStopInProgress ||
+        hasUnappliedSafetyMailbox())
+    {
+        return;
+    }
+}
+
+
+bool MotionCore::IsSafetyControlledStopAuthorized(
+    int contextAxisSlot) const noexcept
+{
+    if (!m_safetyControlledStopInProgress ||
+        contextAxisSlot < 0 ||
+        m_pContexts == nullptr ||
+        contextAxisSlot >= static_cast<int>(m_pContexts->size()) ||
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+        m_safetyRecoveryRequestInProgress.load(
+            std::memory_order_acquire) ||
+        (m_emergencyStopRequestPublication.load(
+            std::memory_order_acquire) &
+            EMERGENCY_STOP_REQUEST_PENDING) != 0ULL ||
+        m_resetAllFaultsPending.load(std::memory_order_acquire) ||
+        m_stopGroupPending.load(std::memory_order_acquire) ||
+        m_resetSafetyBatchPending.load(
+            std::memory_order_acquire) != 0ULL ||
+        m_axisFaultResetPendingMask.load(
+            std::memory_order_acquire) != 0U ||
+        (m_p1MappingIntegrityAlarmRequestPublication.load(
+            std::memory_order_acquire) &
+            P1_MAPPING_ALARM_PENDING) != 0ULL ||
+        !IsMotionOwnerLeaseCurrent(
+            m_safetyControlledStopOwnerLease))
+    {
+        return false;
+    }
+
+    const std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if (UnpackMotionOwnerSafetyHandshake(ownerState) ||
+        UnpackMotionOwnerSafetyActionPending(ownerState) ||
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) !=
+        m_safetyControlledStopRequestTicket ||
+        UnpackMotionOwnerState(ownerState).owner != MotionOwner::SAFETY)
+    {
+        return false;
+    }
+
+    const std::uint64_t publication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    if ((publication &
+        (EXECUTION_EPOCH_PUBLICATION_PENDING |
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+        UnpackExecutionEpochPublication(publication) !=
+        m_safetyControlledStopEpoch ||
+        UnpackExecutionEpochPublicationSource(publication) !=
+        MotionCommandSource::SAFETY)
+    {
+        return false;
+    }
+
+    const int safeGroupAxisCount =
+        ClampMotionAxisCount(m_Group.axisCount);
+    for (int slot = 0; slot < safeGroupAxisCount; ++slot)
+    {
+        if (m_Group.axisIndices[slot] == contextAxisSlot)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 
@@ -2136,20 +4254,246 @@ bool MotionCore::TryGetAxisCommandResult(
     return true;
 }
 
+
+bool MotionCore::TryPublishEmergencyStopMailbox(
+    MotionExecutionEpoch causalExecutionEpoch,
+    bool evidenceRequired) noexcept
+{
+    std::uint64_t requestPublication =
+        m_emergencyStopRequestPublication.load(
+            std::memory_order_acquire);
+    for (unsigned attempt = 0U;
+        attempt < MOTION_OWNER_BOUNDED_CAS_ATTEMPTS;
+        ++attempt)
+    {
+        if ((requestPublication &
+            EMERGENCY_STOP_REQUEST_PENDING) != 0ULL)
+        {
+            // A direct RT containment that already stopped active execution
+            // must not lose its causal P->H evidence behind an older ordinary
+            // deferred request. Upgrade that pending request once, preserving
+            // the first already-required incident thereafter.
+            if (!evidenceRequired ||
+                UnpackEmergencyStopRequestEvidenceRequired(
+                    requestPublication))
+            {
+                return false;
+            }
+
+            const std::uint64_t upgradedRequest =
+                PackEmergencyStopRequest(
+                    causalExecutionEpoch,
+                    true);
+            if (m_emergencyStopRequestPublication.compare_exchange_strong(
+                requestPublication,
+                upgradedRequest,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            {
+                return false;
+            }
+            continue;
+        }
+
+        const std::uint64_t desiredRequest =
+            PackEmergencyStopRequest(
+                causalExecutionEpoch,
+                evidenceRequired);
+        if (m_emergencyStopRequestPublication.compare_exchange_strong(
+            requestPublication,
+            desiredRequest,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            return true;
+        }
+    }
+
+    return PublishEmergencyStopMailboxContentionFallback(
+        causalExecutionEpoch,
+        evidenceRequired);
+}
+
+
+bool MotionCore::PublishEmergencyStopMailboxContentionFallback(
+    MotionExecutionEpoch causalExecutionEpoch,
+    bool evidenceRequired) noexcept
+{
+    if (!evidenceRequired)
+    {
+        // An ordinary stop needs a visible physical-action fence, not an
+        // exact P->H evidence edge.  Never fabricate EVIDENCE_REQUIRED with
+        // an epoch-zero or unrelated payload after the bounded CAS budget.
+        const std::uint64_t previous =
+            m_emergencyStopRequestPublication.fetch_or(
+                EMERGENCY_STOP_REQUEST_PENDING,
+                std::memory_order_acq_rel);
+        return
+            (previous & EMERGENCY_STOP_REQUEST_PENDING) == 0ULL;
+    }
+
+    // Bit 62 is a same-word publication reservation.  The first exact-
+    // evidence producer closes the consumer claim seam in one bounded RMW,
+    // then publishes its complete causal Epoch.  The 250 us consumer never
+    // waits: it simply defers a RESERVED mailbox to the following pass.
+    const std::uint64_t previous =
+        m_emergencyStopRequestPublication.fetch_or(
+            EMERGENCY_STOP_REQUEST_PENDING |
+            EMERGENCY_STOP_REQUEST_EVIDENCE_REQUIRED |
+            EMERGENCY_STOP_REQUEST_PUBLISH_RESERVED,
+            std::memory_order_acq_rel);
+
+    if ((previous &
+        EMERGENCY_STOP_REQUEST_PUBLISH_RESERVED) != 0ULL)
+    {
+        // First reserved evidence incident wins.  A second publisher must
+        // not overwrite its exact causal Epoch.
+        return false;
+    }
+
+    if ((previous & EMERGENCY_STOP_REQUEST_PENDING) != 0ULL &&
+        (previous &
+            EMERGENCY_STOP_REQUEST_EVIDENCE_REQUIRED) != 0ULL)
+    {
+        m_emergencyStopRequestPublication.fetch_and(
+            ~EMERGENCY_STOP_REQUEST_PUBLISH_RESERVED,
+            std::memory_order_release);
+        return false;
+    }
+
+    // Empty or ordinary content is now protected from both consumer claims
+    // and stale producer CAS.  Publish the mapping incident's exact P and
+    // release the reservation atomically with this complete word.
+    m_emergencyStopRequestPublication.store(
+        PackEmergencyStopRequest(
+            causalExecutionEpoch,
+            true),
+        std::memory_order_release);
+    return
+        (previous & EMERGENCY_STOP_REQUEST_PENDING) == 0ULL;
+}
+
+
+bool MotionCore::TryClaimEmergencyStopMailbox(
+    std::uint64_t& claimedRequest) noexcept
+{
+    claimedRequest = 0ULL;
+    std::uint64_t observed =
+        m_emergencyStopRequestPublication.load(
+            std::memory_order_acquire);
+    if ((observed & EMERGENCY_STOP_REQUEST_PENDING) == 0ULL ||
+        (observed &
+            EMERGENCY_STOP_REQUEST_PUBLISH_RESERVED) != 0ULL)
+    {
+        return false;
+    }
+
+    if (!m_emergencyStopRequestPublication.compare_exchange_strong(
+        observed,
+        0ULL,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    claimedRequest = observed;
+    return true;
+}
+
+
+bool MotionCore::TryClaimEmergencyStopMailboxForDirectContainment(
+    std::uint64_t& claimedRequest,
+    bool& evidenceReservationHeld) noexcept
+{
+    claimedRequest = 0ULL;
+    evidenceReservationHeld = false;
+
+    std::uint64_t observed =
+        m_emergencyStopRequestPublication.load(
+            std::memory_order_acquire);
+    if ((observed & EMERGENCY_STOP_REQUEST_PENDING) == 0ULL ||
+        (observed &
+            EMERGENCY_STOP_REQUEST_PUBLISH_RESERVED) != 0ULL)
+    {
+        return false;
+    }
+
+    claimedRequest = observed;
+    if (UnpackEmergencyStopRequestEvidenceRequired(observed))
+    {
+        const std::uint64_t reserved =
+            observed |
+            EMERGENCY_STOP_REQUEST_PUBLISH_RESERVED;
+        if (!m_emergencyStopRequestPublication.compare_exchange_strong(
+            observed,
+            reserved,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            claimedRequest = 0ULL;
+            return false;
+        }
+        evidenceReservationHeld = true;
+        return true;
+    }
+
+    if (!m_emergencyStopRequestPublication.compare_exchange_strong(
+        observed,
+        0ULL,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        claimedRequest = 0ULL;
+        return false;
+    }
+    return true;
+}
+
+
+bool MotionCore::FinalizeDirectContainmentEmergencyStopMailbox(
+    std::uint64_t claimedRequest,
+    bool evidenceAlreadyPersistent) noexcept
+{
+    if ((claimedRequest & EMERGENCY_STOP_REQUEST_PENDING) == 0ULL ||
+        !UnpackEmergencyStopRequestEvidenceRequired(claimedRequest))
+    {
+        return false;
+    }
+
+    std::uint64_t expected =
+        claimedRequest |
+        EMERGENCY_STOP_REQUEST_PUBLISH_RESERVED;
+    const std::uint64_t desired =
+        evidenceAlreadyPersistent
+        ? 0ULL
+        : claimedRequest;
+    return m_emergencyStopRequestPublication.compare_exchange_strong(
+        expected,
+        desired,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
 void MotionCore::RequestEmergencyStopAllAxes() noexcept
 {
     m_emergencyStopRequestAttemptCount.fetch_add(
         1ULL,
         std::memory_order_relaxed);
 
-    TakeSafetyMotionOwner();
+    BeginExecutionDrainAcknowledgementRevocation();
+    // Capture the causal predecessor before publishing the takeover ticket.
+    // A concurrent 250 us helper may immediately publish the SAFETY
+    // successor once the packed ticket becomes visible.
+    const MotionExecutionEpoch causalEpoch =
+        GetCurrentExecutionEpoch();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    (void)EnsureSafetyMotionActionTicket(safetyRequestTicket);
+    const bool published =
+        TryPublishEmergencyStopMailbox(causalEpoch);
 
-    const bool wasPending =
-        m_emergencyStopAllPending.exchange(
-            true,
-            std::memory_order_acq_rel);
-
-    if (wasPending)
+    if (!published)
     {
         m_emergencyStopRequestCoalescedCount.fetch_add(
             1ULL,
@@ -2161,6 +4505,11 @@ void MotionCore::RequestEmergencyStopAllAxes() noexcept
             1ULL,
             std::memory_order_relaxed);
     }
+    // Every safety mailbox shares one ticketed incident. Repeated level-
+    // sensitive requests can advance the ticket, but never refresh Owner
+    // Generation or Epoch while SAFETY already owns the incident.
+    (void)TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
+    EndExecutionDrainAcknowledgementRevocation();
 }
 
 bool MotionCore::TryPublishGroupMappingIntegrityAlarmRequest(
@@ -2206,22 +4555,119 @@ void MotionCore::TriggerGroupMappingIntegrityEmergencyStop(
     int axisIndex,
     bool forceExecutionInvalidation) noexcept
 {
+    BeginExecutionDrainAcknowledgementRevocation();
+    const MotionExecutionEpoch causalEpoch =
+        GetCurrentExecutionEpoch();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    (void)EnsureSafetyMotionActionTicket(safetyRequestTicket);
+
     // The 250 us containment may run before the 10 ms NC observer. Publish a
     // formal Alarm first so J.6.3.2 can correlate the pre-latched E-stop and
     // SAFETY ownership is released only through the normal Reset lifecycle.
     TryPublishGroupMappingIntegrityAlarmRequest(
-        GetCurrentExecutionEpoch());
+        causalEpoch);
 
-    // This is already the RT consumer. Publish one immediate request/apply
-    // accounting edge without leaving the deferred pending bit set; otherwise
-    // a deep stale queue could make the next pass apply a second invalidation.
+    // This is already the RT consumer.  When the ticket-bound SAFETY
+    // takeover completes now, apply and retire the action directly without
+    // leaving an emergency-stop mailbox behind for the next RT pass.  When
+    // an output/Epoch reservation temporarily blocks that takeover, keep one
+    // evidence-required mailbox so the later handshake can publish the exact
+    // causal P->H edge after the immediate physical containment below.
     m_emergencyStopRequestAttemptCount.fetch_add(
         1ULL,
         std::memory_order_relaxed);
-    m_emergencyStopRequestPublishedCount.fetch_add(
-        1ULL,
-        std::memory_order_relaxed);
-    EmergencyStopAllAxesImpl(forceExecutionInvalidation);
+    const MotionOwnerLease directSafetyLease =
+        TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
+    const bool directSafetyAuthority =
+        directSafetyLease.IsValid() &&
+        directSafetyLease.owner == MotionOwner::SAFETY &&
+        IsMotionOwnerLeaseCurrent(directSafetyLease);
+    std::uint64_t claimedEmergencyStopRequest = 0ULL;
+    bool directEvidenceReservationHeld = false;
+    bool directMailboxClaimed = false;
+    if (directSafetyAuthority)
+    {
+        // The direct mapping-integrity stop subsumes an older deferred
+        // all-axis E-stop.  Exact P->H evidence is never exchanged to zero:
+        // reserve that complete word in place until this direct stop proves
+        // the same evidence is already persistent or restores it unchanged.
+        directMailboxClaimed =
+            TryClaimEmergencyStopMailboxForDirectContainment(
+                claimedEmergencyStopRequest,
+                directEvidenceReservationHeld);
+    }
+    if (directSafetyAuthority)
+    {
+        m_emergencyStopRequestPublishedCount.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        if (TryPublishEmergencyStopMailbox(causalEpoch, true))
+        {
+            m_emergencyStopRequestPublishedCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+        else
+        {
+            m_emergencyStopRequestCoalescedCount.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+    }
+    EmergencyStopAllAxesImpl(
+        forceExecutionInvalidation,
+        causalEpoch);
+    if (directSafetyAuthority)
+    {
+        bool directMailboxFinalized = true;
+        if (directEvidenceReservationHeld)
+        {
+            const MotionExecutionEpoch claimedCausalEpoch =
+                UnpackEmergencyStopRequestEpoch(
+                    claimedEmergencyStopRequest);
+            const MotionExecutionEpoch currentSafetyEpoch =
+                GetCurrentExecutionEpoch();
+            const MotionEmergencyStopEpochInvalidationEvidence evidence =
+                GetEmergencyStopEpochInvalidationEvidence();
+            const bool claimedEvidenceAlreadyPersistent =
+                evidence.fromExecutionEpoch == claimedCausalEpoch &&
+                evidence.toExecutionEpoch == currentSafetyEpoch &&
+                evidence.invalidationCount != 0ULL;
+            directMailboxFinalized =
+                FinalizeDirectContainmentEmergencyStopMailbox(
+                    claimedEmergencyStopRequest,
+                    claimedEvidenceAlreadyPersistent);
+        }
+        else if (!directMailboxClaimed &&
+            (m_emergencyStopRequestPublication.load(
+                std::memory_order_acquire) &
+                EMERGENCY_STOP_REQUEST_PENDING) != 0ULL)
+        {
+            // A producer/consumer reservation won the claim seam.  Leave the
+            // action ticket open; the ordinary RT consumer will finish that
+            // exact mailbox once the same-word reservation is released.
+            directMailboxFinalized = false;
+        }
+
+        // Never clear ACTION_PENDING from a newer producer.  If it advanced
+        // the ticket without publishing its own mailbox (for example a pure
+        // authority request), leave one no-evidence RT fence: the direct stop
+        // already performed the physical action, and the later pass only
+        // retires the inherited action phase.
+        if (directMailboxFinalized &&
+            !CompleteSafetyMotionActionTicket(safetyRequestTicket))
+        {
+            (void)TryPublishEmergencyStopMailbox(
+                GetCurrentExecutionEpoch(),
+                false);
+        }
+    }
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
 }
 
 void MotionCore::RequestAxisFaultReset(int axisIndex) noexcept
@@ -2233,66 +4679,379 @@ void MotionCore::RequestAxisFaultReset(int axisIndex) noexcept
 
     const std::uint32_t mask =
         static_cast<std::uint32_t>(1U << static_cast<unsigned>(axisIndex));
-    m_axisFaultResetPendingMask.fetch_or(mask, std::memory_order_release);
+    BeginExecutionDrainAcknowledgementRevocation();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    (void)EnsureSafetyMotionActionTicket(safetyRequestTicket);
+    (void)m_axisFaultResetPendingMask.fetch_or(
+        mask,
+        std::memory_order_acq_rel);
+    (void)TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
+    EndExecutionDrainAcknowledgementRevocation();
 }
 
 void MotionCore::RequestResetAllFaults() noexcept
 {
-    TakeSafetyMotionOwner();
+    BeginExecutionDrainAcknowledgementRevocation();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    (void)EnsureSafetyMotionActionTicket(safetyRequestTicket);
     m_resetAllFaultsPending.store(true, std::memory_order_release);
+    (void)TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
+    EndExecutionDrainAcknowledgementRevocation();
 }
 
 void MotionCore::RequestStopGroup() noexcept
 {
-    TakeSafetyMotionOwner();
+    BeginExecutionDrainAcknowledgementRevocation();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    (void)EnsureSafetyMotionActionTicket(safetyRequestTicket);
     m_stopGroupPending.store(true, std::memory_order_release);
+    (void)TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
+    EndExecutionDrainAcknowledgementRevocation();
 }
 
 void MotionCore::RequestResetSafetyBatch(
     MotionExecutionEpoch publishedEpoch,
     bool requestResetAllFaults) noexcept
 {
-    TakeSafetyMotionOwner();
+    BeginExecutionDrainAcknowledgementRevocation();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    (void)EnsureSafetyMotionActionTicket(safetyRequestTicket);
+    const MotionOwnerLease safetyLease =
+        TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
+    const std::uint64_t provenanceGeneration =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
 
-    std::uint64_t current =
-        m_resetSafetyBatchPending.load(std::memory_order_relaxed);
-
-    for (;;)
+    bool batchPublished = false;
+    bool batchCommitted = false;
+    const std::uint64_t reservedBatch =
+        PackResetSafetyBatch(
+            publishedEpoch,
+            requestResetAllFaults,
+            false,
+            safetyRequestTicket,
+            true);
+    const std::uint64_t committedBatch =
+        reservedBatch &
+        ~RESET_SAFETY_BATCH_PUBLISH_RESERVED;
+    std::uint64_t emptyBatch = 0ULL;
+    if (safetyRequestTicket != 0U &&
+        safetyLease.IsValid() &&
+        safetyLease.owner == MotionOwner::SAFETY &&
+        publishedEpoch != MOTION_EXECUTION_EPOCH_INVALID &&
+        publishedEpoch == GetCurrentExecutionEpoch() &&
+        m_resetSafetyBatchPending.compare_exchange_strong(
+            emptyBatch,
+            reservedBatch,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
     {
-        // Repeated Reset requests before the RT consumer runs use the latest
-        // Epoch, while retaining a fault-reset request already latched by an
-        // earlier request in the same pending batch.
-        const bool mergedResetAllFaults =
-            requestResetAllFaults ||
-            ((current & RESET_SAFETY_BATCH_PRESENT) != 0ULL &&
-                (current & RESET_SAFETY_BATCH_RESET_FAULTS) != 0ULL);
-
-        const std::uint64_t desired =
-            PackResetSafetyBatch(
-                publishedEpoch,
-                mergedResetAllFaults);
-
-        if (m_resetSafetyBatchPending.compare_exchange_weak(
-            current,
-            desired,
-            std::memory_order_release,
-            std::memory_order_relaxed))
+        m_resetSafetyBatchProvenanceGeneration.store(
+            provenanceGeneration,
+            std::memory_order_release);
+        const std::uint64_t ownerState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        const bool exactPublication =
+            m_executionDrainRevocationGeneration.load(
+                std::memory_order_acquire) == provenanceGeneration &&
+            m_executionDrainRevocationPublishersInProgress.load(
+                std::memory_order_acquire) == 1U &&
+            UnpackMotionOwnerState(ownerState).Matches(safetyLease) &&
+            UnpackMotionOwnerSafetyRequestTicket(ownerState) ==
+            safetyRequestTicket &&
+            GetCurrentExecutionEpoch() == publishedEpoch;
+        std::uint64_t expectedReserved = reservedBatch;
+        if (exactPublication &&
+            m_resetSafetyBatchPending.compare_exchange_strong(
+                expectedReserved,
+                committedBatch,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire) &&
+            (batchCommitted = true) &&
+            m_executionDrainRevocationGeneration.load(
+                std::memory_order_acquire) == provenanceGeneration &&
+            m_executionDrainRevocationPublishersInProgress.load(
+                std::memory_order_acquire) == 1U)
         {
-            break;
+            batchPublished = true;
+        }
+
+        if (!batchCommitted)
+        {
+            m_resetSafetyBatchProvenanceGeneration.store(
+                0ULL,
+                std::memory_order_release);
+            expectedReserved = reservedBatch;
+            (void)m_resetSafetyBatchPending.compare_exchange_strong(
+                expectedReserved,
+                0ULL,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
         }
     }
+
+    if (!batchPublished)
+    {
+        // Never merge or overwrite an occupied/reserved batch slot.  A
+        // bounded publication failure is contained by a persistent E-stop
+        // mailbox instead of an unbounded producer loop.
+        (void)TryPublishEmergencyStopMailbox(
+            GetCurrentExecutionEpoch(),
+            false);
+    }
+    EndExecutionDrainAcknowledgementRevocation();
 }
+
+
+MotionCore::ResetSafetyAuthorityResult
+MotionCore::RequestExactResetSafetyBatch(
+    MotionExecutionEpoch publishedEpoch,
+    const MotionOwnerLease& safetyLease,
+    std::uint32_t parentRequestTicket,
+    std::uint64_t expectedProvenanceGeneration,
+    bool requestResetAllFaults,
+    bool requestControlledStop) noexcept
+{
+    ResetSafetyAuthorityResult result{};
+    result.lease = safetyLease;
+    result.requestTicket = parentRequestTicket;
+
+    if (!BeginResetSafetyProvenanceOperation(
+        expectedProvenanceGeneration,
+        result.provenanceGeneration))
+    {
+        result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+        EndExecutionDrainAcknowledgementRevocation();
+        TryAcknowledgeAppliedSafetyMotionRequests();
+        return result;
+    }
+
+    MotionExecutionEpoch exactEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    result.status = TryGetResetSafetyMotionOwnerEpoch(
+        safetyLease,
+        parentRequestTicket,
+        result.provenanceGeneration,
+        exactEpoch);
+    if (result.status == ResetSafetyAuthorityStatus::ACQUIRED &&
+        exactEpoch != publishedEpoch)
+    {
+        result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+    }
+
+    if (result.status == ResetSafetyAuthorityStatus::ACQUIRED)
+    {
+        std::uint64_t parentState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        if (m_resetSafetyBatchPending.load(
+            std::memory_order_acquire) != 0ULL)
+        {
+            result.status = ResetSafetyAuthorityStatus::DEFERRED;
+        }
+        else if (!UnpackMotionOwnerState(parentState).Matches(
+            safetyLease) ||
+            UnpackMotionOwnerSafetyRequestTicket(parentState) !=
+            parentRequestTicket)
+        {
+            result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+        }
+        else if ((parentState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL)
+        {
+            result.status = ResetSafetyAuthorityStatus::DEFERRED;
+        }
+        else if (m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire) !=
+            result.provenanceGeneration ||
+            m_executionDrainRevocationPublishersInProgress.load(
+                std::memory_order_acquire) != 1U)
+        {
+            result.status = ResetSafetyAuthorityStatus::SUPERSEDED;
+        }
+        else
+        {
+            const std::uint32_t childTicket =
+                parentRequestTicket >= MOTION_OWNER_SAFETY_TICKET_MAX
+                ? 1U
+                : parentRequestTicket + 1U;
+            const std::uint64_t childState =
+                PackMotionOwnerState(
+                    safetyLease.owner,
+                    safetyLease.generation,
+                    childTicket,
+                    false,
+                    true);
+            std::uint64_t expectedParentState = parentState;
+            if (!m_motionOwnerState.compare_exchange_strong(
+                expectedParentState,
+                childState,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            {
+                if (UnpackMotionOwnerState(expectedParentState).Matches(
+                    safetyLease) &&
+                    UnpackMotionOwnerSafetyRequestTicket(
+                        expectedParentState) == parentRequestTicket &&
+                    (expectedParentState &
+                        MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL &&
+                    m_executionDrainRevocationGeneration.load(
+                        std::memory_order_acquire) ==
+                    result.provenanceGeneration)
+                {
+                    result.status =
+                        ResetSafetyAuthorityStatus::DEFERRED;
+                }
+                else
+                {
+                    result.status =
+                        ResetSafetyAuthorityStatus::SUPERSEDED;
+                }
+            }
+            else
+            {
+                result.requestTicket = childTicket;
+
+                // Reserve the single batch slot before publishing its full
+                // provenance sidecar.  Neither a producer nor the RT
+                // consumer may overwrite/claim this word while RESERVED.
+                const std::uint64_t reservedBatch =
+                    PackResetSafetyBatch(
+                        publishedEpoch,
+                        requestResetAllFaults,
+                        requestControlledStop,
+                        childTicket,
+                        true);
+                const std::uint64_t committedBatch =
+                    reservedBatch &
+                    ~RESET_SAFETY_BATCH_PUBLISH_RESERVED;
+                std::uint64_t emptyBatch = 0ULL;
+                bool slotReserved =
+                    m_resetSafetyBatchPending.compare_exchange_strong(
+                        emptyBatch,
+                        reservedBatch,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire);
+                bool batchCommitted = false;
+                if (!slotReserved)
+                {
+                    result.status =
+                        ResetSafetyAuthorityStatus::SUPERSEDED;
+                }
+                else
+                {
+                    m_resetSafetyBatchProvenanceGeneration.store(
+                        result.provenanceGeneration,
+                        std::memory_order_release);
+                }
+
+                if (m_executionDrainRevocationGeneration.load(
+                    std::memory_order_acquire) !=
+                    result.provenanceGeneration ||
+                    m_executionDrainRevocationPublishersInProgress.load(
+                        std::memory_order_acquire) != 1U)
+                {
+                    result.status =
+                        ResetSafetyAuthorityStatus::SUPERSEDED;
+                }
+                else if (slotReserved)
+                {
+                    const std::uint64_t publishedOwnerState =
+                        m_motionOwnerState.load(
+                            std::memory_order_acquire);
+                    std::uint64_t expectedReserved = reservedBatch;
+                    if (UnpackMotionOwnerState(
+                        publishedOwnerState).Matches(safetyLease) &&
+                        UnpackMotionOwnerSafetyRequestTicket(
+                            publishedOwnerState) == childTicket &&
+                        m_resetSafetyBatchPending.compare_exchange_strong(
+                            expectedReserved,
+                            committedBatch,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire))
+                    {
+                        batchCommitted = true;
+                    }
+                    else
+                    {
+                        result.status =
+                            ResetSafetyAuthorityStatus::SUPERSEDED;
+                    }
+                }
+
+                const std::uint64_t postCommitOwnerState =
+                    m_motionOwnerState.load(
+                        std::memory_order_acquire);
+                if (batchCommitted &&
+                    (m_executionDrainRevocationGeneration.load(
+                        std::memory_order_acquire) !=
+                        result.provenanceGeneration ||
+                        m_executionDrainRevocationPublishersInProgress.load(
+                            std::memory_order_acquire) != 1U ||
+                        !UnpackMotionOwnerState(
+                            postCommitOwnerState).Matches(
+                                safetyLease) ||
+                        UnpackMotionOwnerSafetyRequestTicket(
+                            postCommitOwnerState) != childTicket))
+                {
+                    result.status =
+                        ResetSafetyAuthorityStatus::SUPERSEDED;
+                }
+
+                if (slotReserved &&
+                    !batchCommitted &&
+                    result.status != ResetSafetyAuthorityStatus::ACQUIRED)
+                {
+                    // A producer may roll back only its never-published
+                    // RESERVED word. Once committed, ownership belongs to the
+                    // RT consumer; it validates the sidecar and fails closed.
+                    m_resetSafetyBatchProvenanceGeneration.store(
+                        0ULL,
+                        std::memory_order_release);
+                    std::uint64_t expectedReserved = reservedBatch;
+                    (void)m_resetSafetyBatchPending.compare_exchange_strong(
+                        expectedReserved,
+                        0ULL,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire);
+                }
+            }
+        }
+    }
+
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
+    return result;
+}
+
+bool MotionCore::HasPendingSafetyIntent() const noexcept
+{
+    return
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+        HasUnacknowledgedSafetyMotionRequest() ||
+        m_safetyRecoveryRequestInProgress.load(std::memory_order_acquire) ||
+        (m_emergencyStopRequestPublication.load(
+            std::memory_order_acquire) &
+            EMERGENCY_STOP_REQUEST_PENDING) != 0ULL ||
+        m_resetAllFaultsPending.load(std::memory_order_acquire) ||
+        m_stopGroupPending.load(std::memory_order_acquire) ||
+        m_resetSafetyBatchPending.load(std::memory_order_acquire) != 0ULL ||
+        m_axisFaultResetPendingMask.load(std::memory_order_acquire) != 0U ||
+        (m_p1MappingIntegrityAlarmRequestPublication.load(
+            std::memory_order_acquire) &
+            P1_MAPPING_ALARM_PENDING) != 0ULL;
+}
+
 
 bool MotionCore::HasPendingSafetyOrRecoveryRequests() const noexcept
 {
     return
-        HasPendingExecutionEpochChange() ||
-        m_safetyRecoveryRequestInProgress.load(std::memory_order_acquire) ||
-        m_emergencyStopAllPending.load(std::memory_order_acquire) ||
-        m_resetAllFaultsPending.load(std::memory_order_acquire) ||
-        m_stopGroupPending.load(std::memory_order_acquire) ||
-        m_resetSafetyBatchPending.load(std::memory_order_acquire) != 0ULL ||
-        m_axisFaultResetPendingMask.load(std::memory_order_acquire) != 0U;
+        HasPendingSafetyIntent() ||
+        HasPendingExecutionEpochChange();
 }
 
 void MotionCore::PublishAxisCommandResult(
@@ -2315,10 +5074,162 @@ void MotionCore::PublishAxisCommandResult(
     }
 }
 
+
+bool MotionCore::TryClaimResetSafetyBatch(
+    std::uint64_t& claimedBatch,
+    std::uint64_t& provenanceGeneration) noexcept
+{
+    claimedBatch = 0ULL;
+    provenanceGeneration = 0ULL;
+    std::uint64_t observed =
+        m_resetSafetyBatchPending.load(std::memory_order_acquire);
+    if ((observed & RESET_SAFETY_BATCH_PRESENT) == 0ULL ||
+        (observed &
+            RESET_SAFETY_BATCH_PUBLISH_RESERVED) != 0ULL)
+    {
+        return false;
+    }
+
+    const std::uint64_t sidecar =
+        m_resetSafetyBatchProvenanceGeneration.load(
+            std::memory_order_acquire);
+    const std::uint64_t reserved =
+        observed | RESET_SAFETY_BATCH_PUBLISH_RESERVED;
+    if (!m_resetSafetyBatchPending.compare_exchange_strong(
+        observed,
+        reserved,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    claimedBatch =
+        reserved & ~RESET_SAFETY_BATCH_PUBLISH_RESERVED;
+    provenanceGeneration = sidecar;
+    return true;
+}
+
+
+bool MotionCore::FinalizeClaimedResetSafetyBatch(
+    std::uint64_t claimedBatch) noexcept
+{
+    if ((claimedBatch & RESET_SAFETY_BATCH_PRESENT) == 0ULL ||
+        (claimedBatch &
+            RESET_SAFETY_BATCH_PUBLISH_RESERVED) != 0ULL)
+    {
+        return false;
+    }
+
+    const std::uint64_t reserved =
+        claimedBatch | RESET_SAFETY_BATCH_PUBLISH_RESERVED;
+    // Clear the sidecar while this consumer still owns the nonzero reserved
+    // word.  No producer can reuse the slot before the following exact CAS.
+    m_resetSafetyBatchProvenanceGeneration.store(
+        0ULL,
+        std::memory_order_release);
+    std::uint64_t expected = reserved;
+    return m_resetSafetyBatchPending.compare_exchange_strong(
+        expected,
+        0ULL,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
+
+void MotionCore::AbortActiveExecutionForResetSafetyBatch() noexcept
+{
+    // Reset installs a cross-scan whole-PDO zero-output hold before it
+    // publishes this batch.  A conventional StopGroupImpl(false) would set a
+    // virtual controlled-deceleration trajectory, but the final PDO fence is
+    // deliberately not allowed to transmit that non-zero trajectory.  The
+    // old group would then remain logically active forever, preventing the
+    // Reset settle/rebase transaction from ever being armed.
+    //
+    // This is the exact Reset-only counterpart of the abort-active Epoch
+    // consumer path: preserve terminal ABORT accounting, cancel future
+    // history, and make all command state zero.  It does not raise an E-stop,
+    // clear a fault, or claim that the physical axes have already stopped;
+    // the following formal RESET_ALL settle proof still waits for measured
+    // standstill before rebase and release.
+    AbortTrackedMotionCommand();
+
+    // Old-Epoch queue entries are retired by the bounded consumer on the
+    // subsequent pass after this batch ticket is acknowledged.  History can
+    // be retired immediately because it is RT-owned and cannot cross Reset.
+    m_Group.historyQueue.clear();
+
+    m_Group.isActive = false;
+    m_safetyControlledStopInProgress = false;
+    m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+    m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    m_safetyControlledStopRequestTicket = 0U;
+
+    // Cancel jump/path producers as part of the same Reset abort.  Leaving a
+    // JUMP_TRACKING or PATH_SERVO mode live after the group is inactive would
+    // correctly make Reset fail closed as "unsupported", but would require a
+    // second Reset even though this exact batch already owns the cancellation.
+    m_Group.pathMode = PathMode::EXACT_STOP;
+    m_Group.pathServoVel = 0.0;
+    m_Group.jumpManager.state = JumpState::IDLE;
+    m_Group.jumpManager.currentOffset = 0.0;
+    m_Group.jumpManager.targetOffset = 0.0;
+    m_Group.jumpManager.jumpVel = 0.0;
+    m_Group.jumpManager.currentStepIdx = 0;
+    m_Group.jumpManager.dwellTimer = 0.0;
+    m_Group.jumpManager.dwellTimeTarget = 0.0;
+    m_Group.jumpManager.isRecovering = false;
+    m_Group.jumpManager.isPauseMode = false;
+    m_Group.jumpManager.resumeAlignMode = 0;
+    m_Group.jumpManager.firstStageMask = 0;
+    m_Group.jumpManager.alignVel = 0.0;
+    m_Group.jumpManager.alignOffset = 0.0;
+    m_Group.jumpManager.alignDist = 0.0;
+
+    // Match the existing abort-active Epoch retirement semantics.  Invalid
+    // values, faults, and E-stop states are intentionally left visible so
+    // RESET_ALL proof remains fail-closed instead of silently masking them.
+    if (!m_Group.virtualAxis.isFault &&
+        !m_Group.virtualAxis.isLagAlarm &&
+        m_Group.virtualAxis.state != MotionState::MotionState_ERROR &&
+        m_Group.virtualAxis.state != MotionState::MotionState_ESTOP)
+    {
+        m_Group.virtualAxis.state = MotionState::MotionState_IDLE;
+        (void)TryCanonicalizeIdleAxisCommandState(
+            m_Group.virtualAxis);
+    }
+
+    if (m_pContexts != nullptr)
+    {
+        const int safeGroupAxisCount =
+            (std::max)(0, (std::min)(m_Group.axisCount, MAX_AXES));
+        for (int groupAxis = 0;
+            groupAxis < safeGroupAxisCount;
+            ++groupAxis)
+        {
+            const int axisIndex = m_Group.axisIndices[groupAxis];
+            if (axisIndex < 0 ||
+                axisIndex >= static_cast<int>(m_pContexts->size()))
+            {
+                continue;
+            }
+
+            (void)TryCanonicalizeInactivePhysicalAxisCommandState(
+                (*m_pContexts)[axisIndex]);
+        }
+    }
+
+    m_Group.currentCmd.execution = MotionExecutionIdentity{};
+    m_Group.currentCmd.ownerLease = MotionOwnerLease{};
+}
+
+
 void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
 {
     const bool hasPendingRequest =
-        m_emergencyStopAllPending.load(std::memory_order_acquire) ||
+        (m_emergencyStopRequestPublication.load(
+            std::memory_order_acquire) &
+            EMERGENCY_STOP_REQUEST_PENDING) != 0ULL ||
         m_resetAllFaultsPending.load(std::memory_order_acquire) ||
         m_stopGroupPending.load(std::memory_order_acquire) ||
         m_resetSafetyBatchPending.load(std::memory_order_acquire) != 0ULL ||
@@ -2334,38 +5245,179 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
     // exchange before the underlying AxisContext mutation has completed.
     m_safetyRecoveryRequestInProgress.store(true, std::memory_order_release);
 
-    if (m_emergencyStopAllPending.exchange(false, std::memory_order_acq_rel))
+    std::uint64_t safetyOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    std::uint32_t safetyRequestTicket =
+        UnpackMotionOwnerSafetyRequestTicket(safetyOwnerState);
+    if (safetyRequestTicket == 0U ||
+        safetyRequestTicket == m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire))
     {
-        m_resetAllFaultsPending.store(false, std::memory_order_release);
-        m_stopGroupPending.store(false, std::memory_order_release);
-        m_resetSafetyBatchPending.store(0ULL, std::memory_order_release);
-        m_axisFaultResetPendingMask.store(0U, std::memory_order_release);
-        EmergencyStopAllAxes();
-        m_safetyRecoveryRequestInProgress.store(false, std::memory_order_release);
+        // The mailbox is already observable, so it is the exact action
+        // publication fence. A replacement ticket does not need a producer-
+        // owned ACTION_PENDING bit; the mailbox/in-progress gates keep it
+        // unacknowledged until this RT pass applies it.
+        safetyRequestTicket =
+            PublishSafetyMotionRequestTicket(false);
+    }
+    const MotionOwnerLease safetyLease =
+        TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
+    if (!safetyLease.IsValid() ||
+        safetyLease.owner != MotionOwner::SAFETY ||
+        !IsMotionOwnerLeaseCurrent(safetyLease))
+    {
+        // Bounded RT attempt failed (normally only a transient reservation or
+        // CAS collision). Keep every mailbox bit intact for the next pass;
+        // the outstanding ticket and final PDO fence already fail closed.
+        m_safetyRecoveryRequestInProgress.store(
+            false,
+            std::memory_order_release);
         return;
     }
 
-    const std::uint64_t resetSafetyBatch =
-        m_resetSafetyBatchPending.exchange(
-            0ULL,
-            std::memory_order_acq_rel);
+    // Claim the exact action only after a mailbox is observable and while
+    // the RT in-progress gate is held. If the bounded CAS loses, leave every
+    // mailbox intact; applying the SAFETY Epoch before this claim would erase
+    // the causal P queue needed by J.6 E-stop evidence.
+    if (m_executionDrainRevocationPublishersInProgress.load(
+        std::memory_order_acquire) != 0U)
+    {
+        m_safetyRecoveryRequestInProgress.store(
+            false,
+            std::memory_order_release);
+        return;
+    }
+
+    if (UnpackMotionOwnerSafetyActionPending(
+        m_motionOwnerState.load(std::memory_order_acquire)) &&
+        !CompleteSafetyMotionActionTicket(safetyRequestTicket))
+    {
+        m_safetyRecoveryRequestInProgress.store(
+            false,
+            std::memory_order_release);
+        return;
+    }
+
+    const bool emergencyStopMailboxPending =
+        (m_emergencyStopRequestPublication.load(
+            std::memory_order_acquire) &
+            EMERGENCY_STOP_REQUEST_PENDING) != 0ULL;
+    std::uint64_t emergencyStopRequest = 0ULL;
+    if (emergencyStopMailboxPending &&
+        !TryClaimEmergencyStopMailbox(emergencyStopRequest))
+    {
+        // RESERVED or concurrently changed: retain strict E-stop priority
+        // and every lower-priority recovery mailbox for the next RT pass.
+        m_safetyRecoveryRequestInProgress.store(
+            false,
+            std::memory_order_release);
+        return;
+    }
+    if ((emergencyStopRequest &
+        EMERGENCY_STOP_REQUEST_PENDING) != 0ULL)
+    {
+        m_resetAllFaultsPending.store(false, std::memory_order_release);
+        m_stopGroupPending.store(false, std::memory_order_release);
+        std::uint64_t discardedBatch = 0ULL;
+        std::uint64_t discardedBatchProvenance = 0ULL;
+        if (TryClaimResetSafetyBatch(
+            discardedBatch,
+            discardedBatchProvenance))
+        {
+            (void)FinalizeClaimedResetSafetyBatch(discardedBatch);
+        }
+        m_axisFaultResetPendingMask.store(0U, std::memory_order_release);
+        EmergencyStopAllAxesImpl(
+            UnpackEmergencyStopRequestEvidenceRequired(
+                emergencyStopRequest),
+            UnpackEmergencyStopRequestEpoch(
+                emergencyStopRequest));
+        (void)CompleteSafetyMotionActionTicket(
+            safetyRequestTicket);
+        m_safetyRecoveryRequestInProgress.store(false, std::memory_order_release);
+        TryAcknowledgeAppliedSafetyMotionRequests();
+        return;
+    }
+
+    std::uint64_t resetSafetyBatch = 0ULL;
+    std::uint64_t resetSafetyBatchProvenance = 0ULL;
+    const bool resetSafetyBatchPending =
+        m_resetSafetyBatchPending.load(
+            std::memory_order_acquire) != 0ULL;
+    if (resetSafetyBatchPending &&
+        !TryClaimResetSafetyBatch(
+            resetSafetyBatch,
+            resetSafetyBatchProvenance))
+    {
+        // Producer-RESERVED or concurrently changed: do not inspect a
+        // partial sidecar and do not let lower-priority recovery overtake it.
+        m_safetyRecoveryRequestInProgress.store(
+            false,
+            std::memory_order_release);
+        return;
+    }
 
     if ((resetSafetyBatch & RESET_SAFETY_BATCH_PRESENT) != 0ULL)
     {
         const MotionExecutionEpoch coveredEpoch =
             UnpackResetSafetyBatchEpoch(resetSafetyBatch);
+        const std::uint32_t coveredTicket =
+            UnpackResetSafetyBatchTicket(resetSafetyBatch);
+        const std::uint64_t currentOwnerState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        const std::uint64_t currentExecutionPublication =
+            m_executionEpochPublication.load(
+                std::memory_order_acquire);
 
         const bool epochCoverageValid =
             coveredEpoch != MOTION_EXECUTION_EPOCH_INVALID &&
-            coveredEpoch == GetCurrentExecutionEpoch();
+            coveredEpoch ==
+            UnpackExecutionEpochPublication(
+                currentExecutionPublication) &&
+            UnpackExecutionEpochPublicationSource(
+                currentExecutionPublication) ==
+            MotionCommandSource::SAFETY &&
+            (currentExecutionPublication &
+                (EXECUTION_EPOCH_PUBLICATION_PENDING |
+                    EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL;
+        const bool provenanceValid =
+            resetSafetyBatchProvenance != 0ULL &&
+            resetSafetyBatchProvenance ==
+            m_executionDrainRevocationGeneration.load(
+                std::memory_order_acquire) &&
+            m_executionDrainRevocationPublishersInProgress.load(
+                std::memory_order_acquire) == 0U;
+        const MotionOwnerLease currentSafetyLease =
+            UnpackMotionOwnerState(currentOwnerState);
+        const bool ownerTicketValid =
+            coveredTicket != 0U &&
+            coveredTicket == safetyRequestTicket &&
+            currentSafetyLease.owner == MotionOwner::SAFETY &&
+            currentSafetyLease.IsValid() &&
+            UnpackMotionOwnerSafetyRequestTicket(currentOwnerState) ==
+            coveredTicket &&
+            !UnpackMotionOwnerSafetyHandshake(currentOwnerState) &&
+            !UnpackMotionOwnerSafetyActionPending(currentOwnerState) &&
+            (currentOwnerState &
+                MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL;
 
-        if (!epochCoverageValid)
+        if (!epochCoverageValid ||
+            !provenanceValid ||
+            !ownerTicketValid)
         {
-            // Another lifecycle event genuinely intervened. Fail closed, but
-            // publish at most one replacement Epoch for the entire safety
-            // batch rather than one per leaf operation.
-            BeginNewExecutionEpoch(
-                MotionCommandSource::SAFETY);
+            // Another lifecycle event intervened.  Never retarget this Reset
+            // batch to a replacement Epoch: stop fail-closed and let the
+            // exact NC Reset release gate remain blocked until a new explicit
+            // operator transaction is created.
+            EmergencyStopAllAxesImpl(true);
+            (void)FinalizeClaimedResetSafetyBatch(resetSafetyBatch);
+            (void)CompleteSafetyMotionActionTicket(
+                safetyRequestTicket);
+            m_safetyRecoveryRequestInProgress.store(
+                false,
+                std::memory_order_release);
+            TryAcknowledgeAppliedSafetyMotionRequests();
+            return;
         }
 
         // UpdateInterpolation normally applies the Epoch before entering this
@@ -2380,12 +5432,32 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
             ResetAllFaultsImpl(false);
         }
 
-        StopGroupImpl(false);
+        if ((resetSafetyBatch &
+            RESET_SAFETY_BATCH_CONTROLLED_STOP) != 0ULL)
+        {
+            // Normal RESET deliberately reaches this branch before it installs
+            // the final zero-output hold.  The already-published SAFETY Epoch
+            // retires future AUTO work, while the current G00/G01 receives the
+            // existing configured Stop_dec_time trajectory.
+            StopGroupImpl(false);
+        }
+        else
+        {
+            // The final Reset batch runs only after controlled stop + actual
+            // standstill are proven and the whole-PDO hold is active.  At this
+            // point aborting residual logical execution is correct and cannot
+            // turn a moving G00 into an abrupt zero-velocity command.
+            AbortActiveExecutionForResetSafetyBatch();
+        }
+        if (!FinalizeClaimedResetSafetyBatch(resetSafetyBatch))
+        {
+            EmergencyStopAllAxesImpl(true);
+        }
     }
 
     if (m_resetAllFaultsPending.exchange(false, std::memory_order_acq_rel))
     {
-        ResetAllFaults();
+        ResetAllFaultsImpl(true);
     }
 
     const std::uint32_t resetMask =
@@ -2406,10 +5478,12 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
 
     if (m_stopGroupPending.exchange(false, std::memory_order_acq_rel))
     {
-        StopGroup();
+        StopGroupImpl(true);
     }
 
+    (void)CompleteSafetyMotionActionTicket(safetyRequestTicket);
     m_safetyRecoveryRequestInProgress.store(false, std::memory_order_release);
+    TryAcknowledgeAppliedSafetyMotionRequests();
 }
 
 void MotionCore::DrainAxisCommandMailbox() noexcept
@@ -2491,7 +5565,11 @@ void MotionCore::DrainAxisCommandMailbox() noexcept
             break;
 
         case MotionAxisCommandType::APPLY_MACHINE_HOME:
-            applied = ApplyMachineHome(axis, command.value0, command.value1);
+            applied = ApplyMachineHome(
+                axis,
+                command.value0,
+                command.value1,
+                command.ownerLease);
             if (!applied) rejectReason = MotionRejectReason::NOT_READY;
             break;
 
@@ -2537,74 +5615,223 @@ MotionExecutionEpoch MotionCore::GetCurrentExecutionEpoch() const noexcept
 }
 
 
+MotionCore::ResetSafetyAuthorityStatus
+MotionCore::TryGetResetSafetyMotionOwnerEpoch(
+    const MotionOwnerLease& safetyLease,
+    std::uint32_t requestTicket,
+    std::uint64_t expectedProvenanceGeneration,
+    MotionExecutionEpoch& executionEpoch) const noexcept
+{
+    executionEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    if (!safetyLease.IsValid() ||
+        safetyLease.owner != MotionOwner::SAFETY ||
+        requestTicket == 0U)
+    {
+        return ResetSafetyAuthorityStatus::SUPERSEDED;
+    }
+
+    const std::uint64_t entryProvenance =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    if (entryProvenance != expectedProvenanceGeneration)
+    {
+        return ResetSafetyAuthorityStatus::SUPERSEDED;
+    }
+
+    const std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if (!UnpackMotionOwnerState(ownerState).Matches(safetyLease) ||
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) != requestTicket)
+    {
+        return ResetSafetyAuthorityStatus::SUPERSEDED;
+    }
+
+    const std::uint32_t acknowledgedTicket =
+        m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire);
+    const std::uint64_t acknowledgement =
+        m_safetyOwnerEpochAcknowledgement.load(
+            std::memory_order_acquire);
+    const std::uint64_t publication =
+        m_executionEpochPublication.load(
+            std::memory_order_acquire);
+
+    if (m_executionDrainRevocationGeneration.load(
+        std::memory_order_acquire) != entryProvenance ||
+        m_motionOwnerState.load(std::memory_order_acquire) != ownerState)
+    {
+        return ResetSafetyAuthorityStatus::SUPERSEDED;
+    }
+
+    if (UnpackMotionOwnerSafetyHandshake(ownerState) ||
+        UnpackMotionOwnerSafetyActionPending(ownerState) ||
+        (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        acknowledgedTicket != requestTicket)
+    {
+        return ResetSafetyAuthorityStatus::DEFERRED;
+    }
+
+    const MotionOwnerGeneration acknowledgedGeneration =
+        static_cast<MotionOwnerGeneration>(acknowledgement >> 32U);
+    const MotionExecutionEpoch acknowledgedEpoch =
+        static_cast<MotionExecutionEpoch>(
+            acknowledgement & 0xFFFFFFFFULL);
+    if (acknowledgedGeneration != safetyLease.generation ||
+        acknowledgedEpoch == MOTION_EXECUTION_EPOCH_INVALID)
+    {
+        return ResetSafetyAuthorityStatus::DEFERRED;
+    }
+
+    if ((publication &
+        (EXECUTION_EPOCH_PUBLICATION_PENDING |
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL)
+    {
+        return ResetSafetyAuthorityStatus::DEFERRED;
+    }
+
+    if (UnpackExecutionEpochPublication(publication) !=
+        acknowledgedEpoch ||
+        UnpackExecutionEpochPublicationSource(publication) !=
+        MotionCommandSource::SAFETY)
+    {
+        return ResetSafetyAuthorityStatus::SUPERSEDED;
+    }
+
+    executionEpoch = acknowledgedEpoch;
+    return ResetSafetyAuthorityStatus::ACQUIRED;
+}
+
+
+bool MotionCore::TryGetSafetyMotionOwnerEpoch(
+    const MotionOwnerLease& safetyLease,
+    MotionExecutionEpoch& executionEpoch) const noexcept
+{
+    executionEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    if (!safetyLease.IsValid() ||
+        safetyLease.owner != MotionOwner::SAFETY)
+    {
+        return false;
+    }
+
+    const std::uint64_t ownerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t acknowledgement =
+        m_safetyOwnerEpochAcknowledgement.load(
+            std::memory_order_acquire);
+    const std::uint64_t publication =
+        m_executionEpochPublication.load(
+            std::memory_order_acquire);
+    const MotionOwnerGeneration acknowledgedGeneration =
+        static_cast<MotionOwnerGeneration>(acknowledgement >> 32U);
+    const MotionExecutionEpoch acknowledgedEpoch =
+        static_cast<MotionExecutionEpoch>(
+            acknowledgement & 0xFFFFFFFFULL);
+
+    if (!UnpackMotionOwnerState(ownerState).Matches(safetyLease) ||
+        UnpackMotionOwnerSafetyHandshake(ownerState) ||
+        acknowledgedGeneration != safetyLease.generation ||
+        acknowledgedEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        UnpackExecutionEpochPublication(publication) !=
+        acknowledgedEpoch ||
+        UnpackExecutionEpochPublicationSource(publication) !=
+        MotionCommandSource::SAFETY)
+    {
+        return false;
+    }
+
+    executionEpoch = acknowledgedEpoch;
+    return true;
+}
+
+
 MotionExecutionEpoch MotionCore::PublishNewExecutionEpoch(
     MotionCommandSource source,
     bool abortActiveCommand) noexcept
 {
-    std::uint64_t currentPublication =
-        m_executionEpochPublication.load(
-            std::memory_order_relaxed);
+    const std::uint64_t entryOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const MotionOwnerLease entryOwnerLease =
+        UnpackMotionOwnerState(entryOwnerState);
+    const MotionOwner requiredOwner =
+        ResolveMotionOwnerForSource(source);
 
-    MotionExecutionEpoch nextEpoch =
-        MOTION_EXECUTION_EPOCH_INVALID;
-    bool publisherWaitRecorded = false;
-
-    for (;;)
+    if (UnpackMotionOwnerSafetyHandshake(entryOwnerState) ||
+        (entryOwnerState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL)
     {
-        // The RT owner holds this bit only across a bounded terminal / handoff
-        // commit.  A publisher that arrives second waits until the complete
-        // mutation is visible, then publishes the next Epoch.  It must never
-        // build PackExecutionEpochPublication() from a reserved word because
-        // that would silently clear the RT reservation.
-        if ((currentPublication &
-            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL)
+        return MOTION_EXECUTION_EPOCH_INVALID;
+    }
+
+    if (source == MotionCommandSource::SAFETY)
+    {
+        if (entryOwnerLease.owner != MotionOwner::SAFETY ||
+            !entryOwnerLease.IsValid())
         {
-            if (!publisherWaitRecorded)
-            {
-                m_lifecycleCommitReservationPublisherWaitCount.fetch_add(
-                    1ULL,
-                    std::memory_order_relaxed);
-                publisherWaitRecorded = true;
-            }
-            currentPublication = m_executionEpochPublication.load(
-                std::memory_order_acquire);
-            continue;
+            return MOTION_EXECUTION_EPOCH_INVALID;
         }
-
-        // Epoch 0 永遠保留為 INVALID。
-        const MotionExecutionEpoch currentEpoch =
-            UnpackExecutionEpochPublication(
-                currentPublication);
-
-        nextEpoch =
-            (currentEpoch ==
-                (std::numeric_limits<MotionExecutionEpoch>::max)())
-            ? 1U
-            : static_cast<MotionExecutionEpoch>(
-                currentEpoch + 1U);
-
-        const std::uint64_t desiredPublication =
-            PackExecutionEpochPublication(
-                nextEpoch,
-                source,
-                abortActiveCommand,
-                true);
-
-        // Epoch allocation, its exact Abort Policy and the RT Pending bit are
-        // one CAS publication.  Therefore a later Reset Epoch cannot inherit
-        // an earlier G00 ABORTING boolean, even with multiple producers.
-        if (m_executionEpochPublication.compare_exchange_weak(
-            currentPublication,
-            desiredPublication,
-            std::memory_order_acq_rel,
-            std::memory_order_relaxed))
+    }
+    else
+    {
+        if (HasUnacknowledgedSafetyMotionRequest() ||
+            entryOwnerLease.owner == MotionOwner::SAFETY ||
+            (entryOwnerLease.owner != MotionOwner::NONE &&
+                requiredOwner != MotionOwner::NONE &&
+                entryOwnerLease.owner != requiredOwner))
         {
-            break;
+            return MOTION_EXECUTION_EPOCH_INVALID;
         }
     }
 
-    return
-        nextEpoch;
+    std::uint64_t currentPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    if ((currentPublication &
+        EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL)
+    {
+        m_lifecycleCommitReservationPublisherWaitCount.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        return MOTION_EXECUTION_EPOCH_INVALID;
+    }
+
+    if (m_motionOwnerState.load(std::memory_order_acquire) !=
+        entryOwnerState)
+    {
+        return MOTION_EXECUTION_EPOCH_INVALID;
+    }
+
+    const MotionExecutionEpoch currentEpoch =
+        UnpackExecutionEpochPublication(currentPublication);
+    const MotionExecutionEpoch nextEpoch =
+        (currentEpoch ==
+            (std::numeric_limits<MotionExecutionEpoch>::max)())
+        ? 1U
+        : static_cast<MotionExecutionEpoch>(currentEpoch + 1U);
+    const std::uint64_t desiredPublication =
+        PackExecutionEpochPublication(
+            nextEpoch,
+            source,
+            abortActiveCommand,
+            true);
+
+    // One exact attempt only. A stale lifecycle producer never rebuilds from
+    // a later SAFETY Epoch. If a Safety takeover starts after the precheck,
+    // either this CAS linearizes first and the handshake publishes after it,
+    // or this exact CAS loses and returns INVALID.
+    if (!m_executionEpochPublication.compare_exchange_strong(
+        currentPublication,
+        desiredPublication,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return MOTION_EXECUTION_EPOCH_INVALID;
+    }
+
+    if (m_motionOwnerState.load(std::memory_order_acquire) !=
+        entryOwnerState)
+    {
+        return MOTION_EXECUTION_EPOCH_INVALID;
+    }
+    return nextEpoch;
 }
 
 
@@ -2616,6 +5843,30 @@ bool MotionCore::TryAcquireLifecycleCommitReservation(
     m_lifecycleCommitReservationAttemptCount.fetch_add(
         1ULL,
         std::memory_order_relaxed);
+
+    const std::uint64_t entryOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const MotionOwnerLease entryOwnerLease =
+        UnpackMotionOwnerState(entryOwnerState);
+    const MotionOwner requiredOwner =
+        ResolveMotionOwnerForSource(execution.source);
+    if (UnpackMotionOwnerSafetyHandshake(entryOwnerState) ||
+        UnpackMotionOwnerSafetyActionPending(entryOwnerState) ||
+        (entryOwnerState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        UnpackMotionOwnerSafetyRequestTicket(entryOwnerState) !=
+        m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire) ||
+        HasPendingSafetyOrRecoveryRequests() ||
+        requiredOwner == MotionOwner::NONE ||
+        entryOwnerLease.owner != requiredOwner ||
+        !entryOwnerLease.IsValid())
+    {
+        m_lifecycleCommitReservationBlockedCount.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        return false;
+    }
 
     std::uint64_t observed = m_executionEpochPublication.load(
         std::memory_order_acquire);
@@ -2641,6 +5892,22 @@ bool MotionCore::TryAcquireLifecycleCommitReservation(
         std::memory_order_acq_rel,
         std::memory_order_acquire))
     {
+        m_lifecycleCommitReservationCASLostCount.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        return false;
+    }
+
+    if (m_motionOwnerState.load(std::memory_order_acquire) !=
+        entryOwnerState)
+    {
+        std::uint64_t expectedReserved = reserved;
+        (void)m_executionEpochPublication.compare_exchange_strong(
+            expectedReserved,
+            reserved &
+            ~EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
         m_lifecycleCommitReservationCASLostCount.fetch_add(
             1ULL,
             std::memory_order_relaxed);
@@ -2773,6 +6040,146 @@ void MotionCore::RecordProgramBlockMotionSubmission(
     submission.commandPathMode = command.commandPathMode;
     submission.producerAccepted = producerAccepted;
     submission.immediateRejectReason = immediateRejectReason;
+}
+
+
+bool MotionCore::BindProgramBlockQueueTailReceipt(
+    MotionQueueTailCommitReceipt& receipt) noexcept
+{
+    if (!m_programBlockMotionCaptureActive ||
+        m_programBlockMotionCapture.count == 0U)
+    {
+        return false;
+    }
+
+    for (std::size_t offset = 0U;
+        offset < m_programBlockMotionCapture.count;
+        ++offset)
+    {
+        const std::size_t index =
+            m_programBlockMotionCapture.count - 1U - offset;
+        MotionProgramBlockSubmission& submission =
+            m_programBlockMotionCapture.submissions[index];
+        const MotionExecutionIdentity& identity = submission.identity;
+        if (identity.epoch != receipt.identity.epoch ||
+            identity.segmentId != receipt.identity.segmentId ||
+            identity.sourceBlockId != receipt.identity.sourceBlockId ||
+            identity.source != receipt.identity.source)
+        {
+            continue;
+        }
+
+        receipt.captureBound = true;
+        submission.queueTailReceipt = receipt;
+        return true;
+    }
+    return false;
+}
+
+
+MotionQueueTailTransactionSequence
+MotionCore::AllocateQueueTailTransactionSequence() noexcept
+{
+    MotionQueueTailTransactionSequence sequence =
+        m_nextQueueTailTransactionSequence.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    if (sequence == MOTION_QUEUE_TAIL_TRANSACTION_SEQUENCE_INVALID)
+    {
+        sequence = m_nextQueueTailTransactionSequence.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    return sequence;
+}
+
+
+void MotionCore::PublishQueueTailTransactionReceipt(
+    MotionQueueTailCommitReceipt& receipt,
+    bool invalidInput) noexcept
+{
+    (void)BindProgramBlockQueueTailReceipt(receipt);
+
+    m_queueTailWriteSequence.fetch_add(
+        1ULL,
+        std::memory_order_acq_rel);
+    m_queueTailAttempts.fetch_add(1ULL, std::memory_order_relaxed);
+
+    const bool committed = receipt.IsCommitted();
+    const bool rejectedPreserved = receipt.IsRejectedAndPreserved();
+    if (receipt.commandAccepted)
+    {
+        m_queueTailCommandAccepted.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        m_queueTailCommandRejected.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+
+    if (committed)
+    {
+        m_queueTailCommitted.fetch_add(1ULL, std::memory_order_relaxed);
+        m_queueTailCommandedMCSCommitted.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_queueTailLastQueuedPulseCommitted.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_queueTailRapidOverrideCommitted.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_queueTailEndpointExact.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        if (receipt.captureBound)
+        {
+            m_queueTailCaptureBound.fetch_add(
+                1ULL,
+                std::memory_order_relaxed);
+        }
+        m_lastQueueTailCommittedFingerprint.store(
+            receipt.committedFingerprint,
+            std::memory_order_relaxed);
+    }
+    else if (rejectedPreserved)
+    {
+        m_queueTailRejectPreserved.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        m_queueTailMismatches.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+
+    if (invalidInput)
+    {
+        m_queueTailInvalidInputs.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+
+    m_lastQueueTailTransactionSequence.store(
+        receipt.transactionSequence,
+        std::memory_order_relaxed);
+    m_lastQueueTailExecutionEpoch.store(
+        receipt.identity.epoch,
+        std::memory_order_relaxed);
+    m_lastQueueTailSegmentId.store(
+        receipt.identity.segmentId,
+        std::memory_order_relaxed);
+    m_lastQueueTailAxisMask.store(
+        receipt.axisMask,
+        std::memory_order_relaxed);
+    m_queueTailWriteSequence.fetch_add(
+        1ULL,
+        std::memory_order_release);
 }
 
 
@@ -3130,11 +6537,67 @@ bool MotionCore::RejectFrontCommandForPathModeAuthority(
     return true;
 }
 
+
+void MotionCore::RejectNonGeometryProducerMotionCommand(
+    MotionCommand command,
+    MotionExecutionEpoch executionEpoch,
+    MotionCommandSource commandSource,
+    const MotionOwnerLease& ownerLease,
+    MotionRejectReason rejectReason,
+    MotionExecutionIdentity* producedIdentity,
+    MotionOwnerLease* producedOwnerLease) noexcept
+{
+    if (rejectReason != MotionRejectReason::STALE_EPOCH &&
+        rejectReason != MotionRejectReason::OWNER_CONFLICT &&
+        rejectReason != MotionRejectReason::NOT_READY)
+    {
+        rejectReason = MotionRejectReason::NOT_READY;
+    }
+
+    AssignExecutionIdentity(
+        command,
+        executionEpoch,
+        commandSource,
+        ownerLease);
+
+    if (producedIdentity != nullptr)
+    {
+        *producedIdentity = command.execution;
+    }
+    if (producedOwnerLease != nullptr)
+    {
+        *producedOwnerLease = command.ownerLease;
+    }
+
+    m_lastRejectedSegmentId.store(
+        command.execution.segmentId,
+        std::memory_order_relaxed);
+
+    // A producer-side planning baseline can become unavailable without the
+    // submitted geometry itself being malformed.  Preserve ordinary Motion
+    // accounting and feedback, but do not convert tuple drift / NOT_READY
+    // into a mapping-integrity Alarm or an RT Emergency Stop request.
+    TryQueueProducerFeedbackNotice(
+        command,
+        MotionFeedbackType::REJECTED,
+        rejectReason,
+        0U,
+        0.0);
+
+    ObserveCommandPathModeProducer(command, false);
+    RecordProgramBlockMotionSubmission(
+        command,
+        false,
+        rejectReason);
+}
+
 void MotionCore::RejectInvalidProducerMotionCommand(
     MotionCommand command,
     MotionExecutionEpoch executionEpoch,
     MotionCommandSource commandSource,
-    const MotionOwnerLease& ownerLease) noexcept
+    const MotionOwnerLease& ownerLease,
+    MotionExecutionIdentity* producedIdentity,
+    MotionOwnerLease* producedOwnerLease) noexcept
 {
     m_p1InvalidProducerRejectCount.fetch_add(
         1ULL,
@@ -3145,6 +6608,15 @@ void MotionCore::RejectInvalidProducerMotionCommand(
         executionEpoch,
         commandSource,
         ownerLease);
+
+    if (producedIdentity != nullptr)
+    {
+        *producedIdentity = command.execution;
+    }
+    if (producedOwnerLease != nullptr)
+    {
+        *producedOwnerLease = command.ownerLease;
+    }
 
     m_lastRejectedSegmentId.store(
         command.execution.segmentId,
@@ -3264,6 +6736,11 @@ bool MotionCore::IsCommandOwnerLeaseCurrent(
 MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
     const MotionCommand& command) const noexcept
 {
+    if (HasUnacknowledgedSafetyMotionRequest())
+    {
+        return MotionRejectReason::OWNER_CONFLICT;
+    }
+
     if (!IsCommandFromCurrentEpoch(command))
     {
         return MotionRejectReason::STALE_EPOCH;
@@ -3903,12 +7380,173 @@ MotionExecutionEpoch MotionCore::RequestAbortingExecutionEpoch(
 }
 
 
+bool MotionCore::TryPublishOwnerAuthorizedAbortingExecutionEpoch(
+    MotionCommandSource source,
+    MotionExecutionEpoch expectedEpoch,
+    const MotionOwnerLease& expectedOwnerLease,
+    MotionExecutionEpoch& publishedEpoch) noexcept
+{
+    publishedEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+
+    if (expectedEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        !expectedOwnerLease.IsValid() ||
+        ResolveMotionOwnerForSource(source) !=
+        expectedOwnerLease.owner ||
+        !IsMotionOwnerLeaseCurrent(expectedOwnerLease) ||
+        HasUnacknowledgedSafetyMotionRequest())
+    {
+        return false;
+    }
+
+    const std::uint64_t expectedDrainRevocationGeneration =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    if (m_executionDrainRevocationPublishersInProgress.load(
+        std::memory_order_acquire) != 0U)
+    {
+        return false;
+    }
+
+    const std::uint64_t expectedOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if (!UnpackMotionOwnerState(expectedOwnerState).Matches(
+        expectedOwnerLease) ||
+        UnpackMotionOwnerSafetyHandshake(expectedOwnerState) ||
+        UnpackMotionOwnerSafetyActionPending(expectedOwnerState) ||
+        UnpackMotionOwnerSafetyRequestTicket(expectedOwnerState) !=
+        m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire) ||
+        (expectedOwnerState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL)
+    {
+        return false;
+    }
+
+    // Reserve the packed Owner word before touching the execution Epoch.
+    // Safety ticket publication refuses this bit.  Therefore either Safety
+    // linearizes first and this exact CAS fails, or AUTO publishes its one
+    // ABORTING Epoch first and Safety remains visibly deferred until the bit
+    // is released.  No ticket can appear between the owner proof and Epoch
+    // CAS.
+    const std::uint64_t reservedOwnerState =
+        expectedOwnerState | MOTION_OWNER_EPOCH_COMMIT_RESERVED;
+    std::uint64_t ownerReservationExpected = expectedOwnerState;
+    if (!m_motionOwnerState.compare_exchange_strong(
+        ownerReservationExpected,
+        reservedOwnerState,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    const auto releaseOwnerReservation = [this,
+        expectedOwnerState,
+        reservedOwnerState]() noexcept -> bool
+    {
+        std::uint64_t expected = reservedOwnerState;
+        if (m_motionOwnerState.compare_exchange_strong(
+            expected,
+            expectedOwnerState,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            return true;
+        }
+        m_motionOwnerState.fetch_and(
+            ~MOTION_OWNER_EPOCH_COMMIT_RESERVED,
+            std::memory_order_acq_rel);
+        return false;
+    };
+
+    // A command producer gets one exact CAS attempt.  It must never retry
+    // from a newer Epoch: otherwise a stale AUTO producer could publish after
+    // (and supersede) a concurrent Reset or SAFETY lifecycle boundary.
+    std::uint64_t expectedPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    if ((expectedPublication &
+        EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL ||
+        UnpackExecutionEpochPublication(expectedPublication) !=
+        expectedEpoch)
+    {
+        (void)releaseOwnerReservation();
+        return false;
+    }
+
+    // Close owner transfer before the one-shot Epoch CAS.  If SAFETY takes
+    // ownership after this check, its lifecycle publisher either wins first
+    // (making this exact CAS fail) or publishes the following Epoch.  This
+    // producer never loops past it and RT never waits.
+    if (m_motionOwnerState.load(std::memory_order_acquire) !=
+        reservedOwnerState ||
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire) !=
+        expectedDrainRevocationGeneration ||
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U)
+    {
+        (void)releaseOwnerReservation();
+        return false;
+    }
+
+    const MotionExecutionEpoch nextEpoch =
+        (expectedEpoch ==
+            (std::numeric_limits<MotionExecutionEpoch>::max)())
+        ? 1U
+        : static_cast<MotionExecutionEpoch>(expectedEpoch + 1U);
+    const std::uint64_t desiredPublication =
+        PackExecutionEpochPublication(
+            nextEpoch,
+            source,
+            true,
+            true);
+
+    if (!m_executionEpochPublication.compare_exchange_strong(
+        expectedPublication,
+        desiredPublication,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        (void)releaseOwnerReservation();
+        return false;
+    }
+
+    publishedEpoch = nextEpoch;
+
+    if (!releaseOwnerReservation())
+    {
+        return false;
+    }
+
+    // The Epoch may have linearized immediately before an owner preemption.
+    // In that case do not enqueue under the retired lease; the concurrent
+    // SAFETY publisher is ordered after this one-shot publication.
+    return
+        m_motionOwnerState.load(std::memory_order_acquire) ==
+        expectedOwnerState &&
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire) ==
+        expectedDrainRevocationGeneration &&
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) == 0U;
+}
+
+
 void MotionCore::DiscardStaleQueuedCommands()
 {
     MotionCommand queuedCommand{};
 
     while (m_staleCommandDiscardBudgetRemaining > 0U)
     {
+        // Preserve the exact pre-takeover queue until the Safety action has
+        // consumed its causal evidence. Ticket/action publication precedes
+        // the SAFETY Epoch, so this acquire gate closes the race even if the
+        // Epoch becomes current between two queue observations.
+        if (HasUnacknowledgedSafetyMotionRequest())
+        {
+            return;
+        }
+
         if (!TryPeekNextMotionCommand(
             queuedCommand))
         {
@@ -3919,6 +7557,11 @@ void MotionCore::DiscardStaleQueuedCommands()
             GetCommandAuthorizationFailure(queuedCommand);
 
         if (authorizationFailure == MotionRejectReason::NONE)
+        {
+            return;
+        }
+
+        if (HasUnacknowledgedSafetyMotionRequest())
         {
             return;
         }
@@ -3981,6 +7624,22 @@ void MotionCore::ApplyPendingExecutionEpochChange()
         return;
     }
 
+    const MotionCommandSource pendingSource =
+        UnpackExecutionEpochPublicationSource(publication);
+    if (pendingSource == MotionCommandSource::SAFETY)
+    {
+        // An action-bearing Safety request publishes its ticket before the
+        // takeover Epoch and leaves ACTION_PENDING set until the RT consumer
+        // has an observable mailbox/direct mutation. Do not erase the causal
+        // predecessor queue before that action is claimed.
+        const std::uint64_t ownerState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        if (UnpackMotionOwnerSafetyActionPending(ownerState))
+        {
+            return;
+        }
+    }
+
     // Consume exactly the Epoch/Source/Policy tuple that was observed.  The
     // RT seam makes one bounded strong-CAS attempt per call; a concurrent
     // publisher wins cleanly and the newer tuple is retried by the safety seam
@@ -4030,6 +7689,10 @@ void MotionCore::ApplyPendingExecutionEpochChange()
     if (abortActiveCommand)
     {
         m_Group.isActive = false;
+        m_safetyControlledStopInProgress = false;
+        m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+        m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        m_safetyControlledStopRequestTicket = 0U;
 
         // Exact Abort is an immediate position hold.  It must not leave the
         // previous segment's virtual command speed alive after Group inactive.
@@ -4165,31 +7828,120 @@ void MotionCore::WriteServoTargetVelocityCommand(
         return;
     }
 
-    bool structuredWritten = false;
-
-    if (m_pStructuredServoReadShadowMaster != nullptr)
+    const auto writeTarget =
+        [&](int32_t exactValue)
     {
-        structuredWritten =
+        bool structuredWritten = false;
+        if (m_pStructuredServoReadShadowMaster != nullptr)
+        {
+            structuredWritten =
+                m_pStructuredServoReadShadowMaster->
+                TryWriteMotionServoOutputCommandStructured(
+                    axisIndex,
+                    MotionServoOutputCommandField::TargetVelocity,
+                    static_cast<int64_t>(exactValue),
+                    output);
+        }
+        if (!structuredWritten)
+        {
+            output->TargetVelocity = exactValue;
+        }
+        if (m_pStructuredServoReadShadowMaster != nullptr)
+        {
             m_pStructuredServoReadShadowMaster->
-            TryWriteMotionServoOutputCommandStructured(
-                axisIndex,
-                MotionServoOutputCommandField::TargetVelocity,
-                static_cast<int64_t>(value),
-                output);
+                ObserveMotionServoOutputCommandSeamWriteShadow(
+                    axisIndex,
+                    MotionServoOutputCommandField::TargetVelocity,
+                    static_cast<int64_t>(exactValue));
+        }
+    };
+
+    // Zero is always allowed and never needs a reservation. A non-zero PDO
+    // command is a tiny transaction against the same packed Owner word used
+    // by Safety request tickets. If a ticket linearizes while the write is in
+    // progress it changes the exact word, makes the release CAS fail, and the
+    // command is overwritten with zero before this RT call returns.
+    if (value == 0)
+    {
+        writeTarget(0);
+        return;
     }
 
-    if (!structuredWritten)
+    const std::uint64_t entryPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    std::uint64_t entryOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const MotionOwnerLease entryLease =
+        UnpackMotionOwnerState(entryOwnerState);
+    const std::uint32_t entryTicket =
+        UnpackMotionOwnerSafetyRequestTicket(entryOwnerState);
+    const bool controlledStopAuthorized =
+        IsSafetyControlledStopAuthorized(axisIndex);
+    const bool entryGroupAuthorized =
+        !m_Group.isActive ||
+        GetCommandAuthorizationFailure(m_Group.currentCmd) ==
+        MotionRejectReason::NONE ||
+        controlledStopAuthorized;
+    if ((entryPublication &
+        (EXECUTION_EPOCH_PUBLICATION_PENDING |
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+        (entryOwnerState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        UnpackMotionOwnerSafetyHandshake(entryOwnerState) ||
+        UnpackMotionOwnerSafetyActionPending(entryOwnerState) ||
+        (HasPendingSafetyOrRecoveryRequests() &&
+            !controlledStopAuthorized) ||
+        (entryTicket != m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire) &&
+            !controlledStopAuthorized) ||
+        (entryLease.owner == MotionOwner::SAFETY &&
+            !controlledStopAuthorized) ||
+        !entryGroupAuthorized)
     {
-        output->TargetVelocity = value;
+        writeTarget(0);
+        return;
     }
 
-    if (m_pStructuredServoReadShadowMaster != nullptr)
+    const std::uint64_t reservedOwnerState =
+        entryOwnerState | MOTION_OWNER_OUTPUT_COMMIT_RESERVED;
+    if (!m_motionOwnerState.compare_exchange_strong(
+        entryOwnerState,
+        reservedOwnerState,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
     {
-        m_pStructuredServoReadShadowMaster->
-            ObserveMotionServoOutputCommandSeamWriteShadow(
-                axisIndex,
-                MotionServoOutputCommandField::TargetVelocity,
-                static_cast<int64_t>(value));
+        writeTarget(0);
+        return;
+    }
+
+    int32_t finalValue = value;
+    if (m_executionEpochPublication.load(std::memory_order_acquire) !=
+        entryPublication ||
+        m_motionOwnerState.load(std::memory_order_acquire) !=
+        reservedOwnerState)
+    {
+        finalValue = 0;
+    }
+    writeTarget(finalValue);
+
+    std::uint64_t expectedReservedState = reservedOwnerState;
+    if (!m_motionOwnerState.compare_exchange_strong(
+        expectedReservedState,
+        reservedOwnerState &
+        ~MOTION_OWNER_OUTPUT_COMMIT_RESERVED,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        // A Safety ticket changed the packed word during the output call.
+        // Roll the externally visible command back before releasing only our
+        // reservation bit; all newer Owner/ticket information is preserved.
+        if (finalValue != 0)
+        {
+            writeTarget(0);
+        }
+        m_motionOwnerState.fetch_and(
+            ~MOTION_OWNER_OUTPUT_COMMIT_RESERVED,
+            std::memory_order_acq_rel);
     }
 }
 
@@ -4541,25 +8293,103 @@ double MotionCore::ConvertDriveCaptureToRawLogicalPulse(int axisIndex, int32_t c
     return logical;
 }
 
-bool MotionCore::ApplyMachineHome(AxisContext& axis, double capturedReferencePulse, double homeOffsetUnit)
+bool MotionCore::ApplyMachineHome(
+    AxisContext& axis,
+    double capturedReferencePulse,
+    double homeOffsetUnit,
+    const MotionOwnerLease& ownerLease)
 {
-    if (!axis.isExist || axis.state != MotionState::MotionState_IDLE || !std::isfinite(capturedReferencePulse) || !std::isfinite(homeOffsetUnit) || axis.resolution_PPR <= 0.0 || std::abs(axis.finalLead) < 1.0e-12) return false;
+    if (!axis.isExist ||
+        axis.state != MotionState::MotionState_IDLE ||
+        !std::isfinite(capturedReferencePulse) ||
+        !std::isfinite(homeOffsetUnit) ||
+        axis.resolution_PPR <= 0.0 ||
+        std::abs(axis.finalLead) < 1.0e-12 ||
+        !ownerLease.IsValid() ||
+        ownerLease.owner != MotionOwner::HOME ||
+        !IsMotionOwnerLeaseCurrent(ownerLease))
+    {
+        return false;
+    }
 
     const double pulsePerUnit = axis.resolution_PPR / std::abs(axis.finalLead);
     const double homeOffsetPulse = homeOffsetUnit * pulsePerUnit;
     const double oldOffset = axis.machineCoordinateOffsetPulse;
     const double newOffset = capturedReferencePulse - homeOffsetPulse;
     const double shift = oldOffset - newOffset;
+    const double oldLogicalCmdPos = axis.logicalCmdPos.Load();
+    const double oldLastQueuedPulse = axis.lastQueuedPulse.Load();
+    const double shiftedCurrentActPos = axis.currentActPos + shift;
+    const double shiftedCurrentCmdPos = axis.currentCmdPos + shift;
+    const double shiftedLogicalCmdPos = oldLogicalCmdPos + shift;
+    const double shiftedPlanningPos = axis.planningPos + shift;
+    const double shiftedFinalTargetPos = axis.finalTargetPos + shift;
+    const double shiftedStartCmdPos = axis.startCmdPos + shift;
+    const double shiftedLastQueuedPulse = oldLastQueuedPulse + shift;
+    const double shiftedLastActPos = axis.lastActPos + shift;
+
+    if (!std::isfinite(pulsePerUnit) ||
+        !std::isfinite(homeOffsetPulse) ||
+        !std::isfinite(oldOffset) ||
+        !std::isfinite(newOffset) ||
+        !std::isfinite(shift) ||
+        !std::isfinite(oldLogicalCmdPos) ||
+        !std::isfinite(oldLastQueuedPulse) ||
+        !std::isfinite(shiftedCurrentActPos) ||
+        !std::isfinite(shiftedCurrentCmdPos) ||
+        !std::isfinite(shiftedLogicalCmdPos) ||
+        !std::isfinite(shiftedPlanningPos) ||
+        !std::isfinite(shiftedFinalTargetPos) ||
+        !std::isfinite(shiftedStartCmdPos) ||
+        !std::isfinite(shiftedLastQueuedPulse) ||
+        !std::isfinite(shiftedLastActPos))
+    {
+        return false;
+    }
+
+    // The two cross-thread mirrors commit before every RT-private scalar.
+    // Each edge is one strong CAS; contention is an ownership breach, not a
+    // condition under which the 250 us thread may retry or spin.
+    if (!axis.logicalCmdPos.TryCompareExchange(
+        oldLogicalCmdPos,
+        shiftedLogicalCmdPos))
+    {
+        EmergencyStopAllAxes();
+        return false;
+    }
+    if (!axis.lastQueuedPulse.TryCompareExchange(
+        oldLastQueuedPulse,
+        shiftedLastQueuedPulse))
+    {
+        (void)axis.logicalCmdPos.TryCompareExchange(
+            shiftedLogicalCmdPos,
+            oldLogicalCmdPos);
+        EmergencyStopAllAxes();
+        return false;
+    }
+
+    // Close owner transfer after the pair commit but before any RT-private
+    // field is changed.  Exact rollback is bounded; regardless of rollback
+    // success, containment makes the rejected HOME command fail closed.
+    if (!IsMotionOwnerLeaseCurrent(ownerLease))
+    {
+        (void)axis.lastQueuedPulse.TryCompareExchange(
+            shiftedLastQueuedPulse,
+            oldLastQueuedPulse);
+        (void)axis.logicalCmdPos.TryCompareExchange(
+            shiftedLogicalCmdPos,
+            oldLogicalCmdPos);
+        EmergencyStopAllAxes();
+        return false;
+    }
 
     axis.machineCoordinateOffsetPulse = newOffset;
-    axis.currentActPos += shift;
-    axis.currentCmdPos += shift;
-    axis.logicalCmdPos += shift;
-    axis.planningPos += shift;
-    axis.finalTargetPos += shift;
-    axis.startCmdPos += shift;
-    axis.lastQueuedPulse += shift;
-    axis.lastActPos += shift;
+    axis.currentActPos = shiftedCurrentActPos;
+    axis.currentCmdPos = shiftedCurrentCmdPos;
+    axis.planningPos = shiftedPlanningPos;
+    axis.finalTargetPos = shiftedFinalTargetPos;
+    axis.startCmdPos = shiftedStartCmdPos;
+    axis.lastActPos = shiftedLastActPos;
 
     axis.currentCmdVel = 0.0;
     axis.logicalCmdVel = 0.0;
@@ -4573,6 +8403,12 @@ bool MotionCore::ApplyMachineHome(AxisContext& axis, double capturedReferencePul
     axis.bufferSum = 0.0;
     axis.bufferIndex = 0;
     axis.inPosition = true;
+
+    if (!IsMotionOwnerLeaseCurrent(ownerLease))
+    {
+        EmergencyStopAllAxes();
+        return false;
+    }
     return true;
 }
 
@@ -4917,13 +8753,424 @@ void MotionCore::LinkCoordinateManager(CoordinateManager* pCoord)
 {
     m_pCoordMgr = pCoord;
 }
+
+
+void MotionCore::InvalidateServoOutputImageProof() noexcept
+{
+    ++m_servoOutputImageProofGeneration;
+    m_servoOutputImageProof = ServoOutputImageProof{};
+    m_servoOutputImageProof.generation =
+        m_servoOutputImageProofGeneration;
+}
+
+
+bool MotionCore::ZeroAllServoTargetVelocityForFrame() noexcept
+{
+    if (m_pDrives == nullptr)
+    {
+        return false;
+    }
+
+    const std::size_t boundedDriveCount =
+        (std::min)(
+            m_pDrives->size(),
+            static_cast<std::size_t>(MAX_AXES));
+    bool complete = m_pDrives->size() <= MAX_AXES;
+    for (std::size_t slot = 0U;
+        slot < boundedDriveCount;
+        ++slot)
+    {
+        ENI_ServoDrive& drive = (*m_pDrives)[slot];
+        if (drive.pOutput == nullptr)
+        {
+            complete = false;
+            continue;
+        }
+
+        const int axisIndex =
+            m_pContexts != nullptr && slot < m_pContexts->size()
+            ? (*m_pContexts)[slot].axisIndex
+            : static_cast<int>(slot);
+        WriteServoTargetVelocityCommand(
+            drive.pOutput,
+            axisIndex,
+            0);
+    }
+
+    return complete;
+}
+
+
+bool MotionCore::PublishServoOutputImageProof(
+    std::uint64_t ownerState,
+    std::uint64_t executionPublication,
+    std::uint64_t frameSafetyIntentState,
+    std::uint64_t alarmSafetyIntentState,
+    std::uint32_t alarmUpdateCount,
+    ServoOutputImageProofMode mode) noexcept
+{
+    ServoOutputImageProof proof{};
+    proof.ownerState = ownerState;
+    proof.executionPublication = executionPublication;
+    proof.frameSafetyIntentState = frameSafetyIntentState;
+    proof.alarmSafetyIntentState = alarmSafetyIntentState;
+    proof.alarmUpdateCount = alarmUpdateCount;
+    proof.generation = ++m_servoOutputImageProofGeneration;
+    proof.mode = mode;
+
+    if (m_pDrives == nullptr ||
+        m_pDrives->size() > MAX_AXES ||
+        m_pDrives->size() > 32U)
+    {
+        proof.mode = ServoOutputImageProofMode::INVALID;
+        m_servoOutputImageProof = proof;
+        return false;
+    }
+
+    for (std::size_t slot = 0U;
+        slot < m_pDrives->size();
+        ++slot)
+    {
+        const ENI_ServoDrive& drive = (*m_pDrives)[slot];
+        if (drive.pOutput == nullptr)
+        {
+            proof.mode = ServoOutputImageProofMode::INVALID;
+            m_servoOutputImageProof = proof;
+            return false;
+        }
+
+        proof.slotMask |=
+            static_cast<std::uint32_t>(1U << slot);
+        proof.targetVelocity[slot] =
+            drive.pOutput->TargetVelocity;
+    }
+
+    m_servoOutputImageProof = proof;
+    return true;
+}
+
+
+bool MotionCore::BeginServoOutputFrameAtSendPoint(
+    ServoOutputFrameReservation& reservation) noexcept
+{
+    reservation = ServoOutputFrameReservation{};
+    const ServoOutputImageProof proof =
+        m_servoOutputImageProof;
+    const std::uint64_t entrySafetyIntentState =
+        m_frameSafetyIntentState.load(
+            std::memory_order_acquire);
+
+    const auto scrubAndInvalidate = [this]() noexcept -> bool
+    {
+        const bool scrubbed =
+            ZeroAllServoTargetVelocityForFrame();
+        InvalidateServoOutputImageProof();
+        return scrubbed;
+    };
+
+    if (proof.mode == ServoOutputImageProofMode::INVALID ||
+        proof.generation == 0ULL ||
+        static_cast<std::uint32_t>(entrySafetyIntentState) != 0U ||
+        m_pDrives == nullptr ||
+        m_pDrives->size() > MAX_AXES ||
+        m_pDrives->size() > 32U)
+    {
+        return scrubAndInvalidate();
+    }
+
+    std::uint32_t observedMask = 0U;
+    bool observedNonZero = false;
+    for (std::size_t slot = 0U;
+        slot < m_pDrives->size();
+        ++slot)
+    {
+        const ENI_ServoDrive& drive = (*m_pDrives)[slot];
+        if (drive.pOutput == nullptr)
+        {
+            return scrubAndInvalidate();
+        }
+
+        observedMask |=
+            static_cast<std::uint32_t>(1U << slot);
+        const std::int32_t targetVelocity =
+            drive.pOutput->TargetVelocity;
+        if (targetVelocity != proof.targetVelocity[slot])
+        {
+            return scrubAndInvalidate();
+        }
+        observedNonZero = observedNonZero || targetVelocity != 0;
+    }
+
+    if (observedMask != proof.slotMask)
+    {
+        return scrubAndInvalidate();
+    }
+
+    if (!observedNonZero)
+    {
+        return
+            proof.mode == ServoOutputImageProofMode::ZERO_ONLY
+            ? true
+            : scrubAndInvalidate();
+    }
+
+    if (proof.mode != ServoOutputImageProofMode::NORMAL &&
+        proof.mode != ServoOutputImageProofMode::CONTROLLED_STOP)
+    {
+        return scrubAndInvalidate();
+    }
+
+    // Owner/Epoch can remain byte-identical when a bounded Safety producer
+    // is blocked and completes only a short revocation publication.  Bind
+    // every non-zero image to the full sequence+active word captured by the
+    // Motion pass so such an incident permanently invalidates the old proof.
+    if (entrySafetyIntentState != proof.frameSafetyIntentState)
+    {
+        return scrubAndInvalidate();
+    }
+
+    std::uint64_t baseOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t baseExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    if (baseOwnerState != proof.ownerState ||
+        baseExecutionPublication != proof.executionPublication ||
+        UnpackMotionOwnerSafetyHandshake(baseOwnerState) ||
+        UnpackMotionOwnerSafetyActionPending(baseOwnerState) ||
+        (baseOwnerState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        (baseExecutionPublication &
+            (EXECUTION_EPOCH_PUBLICATION_PENDING |
+                EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL)
+    {
+        return scrubAndInvalidate();
+    }
+
+    if (proof.mode == ServoOutputImageProofMode::NORMAL)
+    {
+        const MotionOwnerLease lease =
+            UnpackMotionOwnerState(baseOwnerState);
+        if (lease.owner == MotionOwner::NONE ||
+            lease.owner == MotionOwner::SAFETY ||
+            UnpackMotionOwnerSafetyRequestTicket(baseOwnerState) !=
+            m_safetyRequestAcknowledgedTicket.load(
+                std::memory_order_acquire) ||
+            HasPendingSafetyOrRecoveryRequests())
+        {
+            return scrubAndInvalidate();
+        }
+    }
+    else
+    {
+        for (std::size_t slot = 0U;
+            slot < m_pDrives->size();
+            ++slot)
+        {
+            if (proof.targetVelocity[slot] == 0)
+            {
+                continue;
+            }
+
+            if (m_pContexts == nullptr ||
+                slot >= m_pContexts->size() ||
+                !IsSafetyControlledStopAuthorized(
+                    (*m_pContexts)[slot].axisIndex))
+            {
+                return scrubAndInvalidate();
+            }
+        }
+    }
+
+    AlarmManager& frameAlarms = AlarmManager::GetInstance();
+    AlarmManager::MotionAdmissionReservation alarmAdmission{};
+    if (!frameAlarms.BeginMotionAdmission(
+        proof.alarmUpdateCount,
+        alarmAdmission) ||
+        alarmAdmission.baseState != proof.alarmSafetyIntentState)
+    {
+        if (alarmAdmission.acquired)
+        {
+            (void)frameAlarms.EndMotionAdmission(alarmAdmission);
+        }
+        return scrubAndInvalidate();
+    }
+
+    const std::uint64_t reservedOwnerState =
+        baseOwnerState | MOTION_OWNER_FRAME_SEND_RESERVED;
+    if (!m_motionOwnerState.compare_exchange_strong(
+        baseOwnerState,
+        reservedOwnerState,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        (void)frameAlarms.EndMotionAdmission(alarmAdmission);
+        return scrubAndInvalidate();
+    }
+
+    std::uint64_t expectedExecutionPublication =
+        baseExecutionPublication;
+    const std::uint64_t reservedExecutionPublication =
+        baseExecutionPublication |
+        EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED;
+    if (!m_executionEpochPublication.compare_exchange_strong(
+        expectedExecutionPublication,
+        reservedExecutionPublication,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        const bool scrubbed = ZeroAllServoTargetVelocityForFrame();
+        m_motionOwnerState.fetch_and(
+            ~MOTION_OWNER_FRAME_SEND_RESERVED,
+            std::memory_order_acq_rel);
+        (void)frameAlarms.EndMotionAdmission(alarmAdmission);
+        InvalidateServoOutputImageProof();
+        return scrubbed;
+    }
+
+    reservation.alarmAdmission = alarmAdmission;
+    reservation.baseOwnerState = baseOwnerState;
+    reservation.reservedOwnerState = reservedOwnerState;
+    reservation.baseExecutionPublication =
+        baseExecutionPublication;
+    reservation.reservedExecutionPublication =
+        reservedExecutionPublication;
+    reservation.safetyIntentState =
+        entrySafetyIntentState;
+    reservation.acquired = true;
+    return true;
+}
+
+
+bool MotionCore::FinalizeServoOutputFrameAtSendPoint(
+    ServoOutputFrameReservation& reservation) noexcept
+{
+    if (!reservation.acquired)
+    {
+        return true;
+    }
+
+    if (m_motionOwnerState.load(std::memory_order_acquire) !=
+        reservation.reservedOwnerState ||
+        m_executionEpochPublication.load(
+            std::memory_order_acquire) !=
+        reservation.reservedExecutionPublication ||
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire) != 0U ||
+        !AlarmManager::GetInstance().IsMotionAdmissionCurrent(
+            reservation.alarmAdmission) ||
+        // Keep this exact packed-state read as the final atomic observation
+        // before frame commit. BeginRevocation changes sequence+active count
+        // in one RMW, so Frame Begin can never capture a half-published
+        // Safety intent.
+        m_frameSafetyIntentState.load(
+            std::memory_order_acquire) !=
+        reservation.safetyIntentState)
+    {
+        const bool scrubbed = ZeroAllServoTargetVelocityForFrame();
+        reservation.recopyRequired = true;
+        m_motionOwnerState.fetch_and(
+            ~MOTION_OWNER_FRAME_SEND_RESERVED,
+            std::memory_order_acq_rel);
+        std::uint64_t expectedReservedExecution =
+            reservation.reservedExecutionPublication;
+        if (!m_executionEpochPublication.compare_exchange_strong(
+            expectedReservedExecution,
+            reservation.baseExecutionPublication,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            m_executionEpochPublication.fetch_and(
+                ~EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED,
+                std::memory_order_acq_rel);
+        }
+        InvalidateServoOutputImageProof();
+        (void)AlarmManager::GetInstance().EndMotionAdmission(
+            reservation.alarmAdmission);
+        reservation.acquired = false;
+        return scrubbed;
+    }
+
+    // Keep both reservations through the actual NIC SendPacket call. Safety
+    // ticket publication refuses FRAME_SEND_RESERVED, and ordinary lifecycle
+    // publishers refuse the execution commit bit, so the physical frame is
+    // ordered before every request that begins while SendPacket is in flight.
+    return true;
+}
+
+
+void MotionCore::EndServoOutputFrameAfterSend(
+    ServoOutputFrameReservation& reservation) noexcept
+{
+    if (!reservation.acquired)
+    {
+        return;
+    }
+
+    std::uint64_t expectedReservedOwner =
+        reservation.reservedOwnerState;
+    if (!m_motionOwnerState.compare_exchange_strong(
+        expectedReservedOwner,
+        reservation.baseOwnerState,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        m_motionOwnerState.fetch_and(
+            ~MOTION_OWNER_FRAME_SEND_RESERVED,
+            std::memory_order_acq_rel);
+    }
+
+    std::uint64_t expectedReservedExecution =
+        reservation.reservedExecutionPublication;
+    if (!m_executionEpochPublication.compare_exchange_strong(
+        expectedReservedExecution,
+        reservation.baseExecutionPublication,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        m_executionEpochPublication.fetch_and(
+            ~EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED,
+            std::memory_order_acq_rel);
+    }
+
+    (void)AlarmManager::GetInstance().EndMotionAdmission(
+        reservation.alarmAdmission);
+
+    reservation.acquired = false;
+}
+
+
 // 檔案：MotionCore.cpp
 void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 {
+    InvalidateServoOutputImageProof();
+    AlarmManager& motionAlarms = AlarmManager::GetInstance();
+    const std::uint64_t imageEntryAlarmSafetyIntentState =
+        motionAlarms.GetMotionSafetyIntentState();
+    const std::uint32_t imageEntryAlarmUpdateCount =
+        motionAlarms.GetUpdateCount();
+    const bool imageEntryAlarmPresent = motionAlarms.HasAlarm();
+    const std::uint64_t imageEntrySafetyIntentState =
+        m_frameSafetyIntentState.load(std::memory_order_acquire);
+    const std::uint64_t imageEntryOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t imageEntryExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
     m_ncSettleMotionPassCompleted = false;
 
     // 1. 防呆：確保指標沒丟失
     if (m_pDrives == nullptr || m_pContexts == nullptr) {
+        if (ZeroAllServoTargetVelocityForFrame())
+        {
+            (void)PublishServoOutputImageProof(
+                m_motionOwnerState.load(std::memory_order_acquire),
+                m_executionEpochPublication.load(
+                    std::memory_order_acquire),
+                m_frameSafetyIntentState.load(
+                    std::memory_order_acquire),
+                motionAlarms.GetMotionSafetyIntentState(),
+                motionAlarms.GetUpdateCount(),
+                ServoOutputImageProofMode::ZERO_ONLY);
+        }
         PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
         return;
@@ -4932,6 +9179,18 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     // 2. 防呆：確保兩個清單長度一致
     if (m_pDrives->size() != m_pContexts->size()) {
         // 這裡可以丟個錯誤 log
+        if (ZeroAllServoTargetVelocityForFrame())
+        {
+            (void)PublishServoOutputImageProof(
+                m_motionOwnerState.load(std::memory_order_acquire),
+                m_executionEpochPublication.load(
+                    std::memory_order_acquire),
+                m_frameSafetyIntentState.load(
+                    std::memory_order_acquire),
+                motionAlarms.GetMotionSafetyIntentState(),
+                motionAlarms.GetUpdateCount(),
+                ServoOutputImageProofMode::ZERO_ONLY);
+        }
         PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
         return;
@@ -5208,6 +9467,130 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 
 
 
+
+    const std::uint64_t imageExitExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t imageExitOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t imageExitSafetyIntentState =
+        m_frameSafetyIntentState.load(std::memory_order_acquire);
+    const std::uint64_t imageExitAlarmSafetyIntentState =
+        motionAlarms.GetMotionSafetyIntentState();
+    const std::uint32_t imageExitAlarmUpdateCount =
+        motionAlarms.GetUpdateCount();
+    const bool imageExitAlarmPresent = motionAlarms.HasAlarm();
+    bool imageHasNonZeroTargetVelocity = false;
+    bool imageMappingComplete =
+        m_pDrives->size() <= MAX_AXES &&
+        m_pDrives->size() <= 32U;
+    for (std::size_t slot = 0U;
+        slot < m_pDrives->size();
+        ++slot)
+    {
+        if ((*m_pDrives)[slot].pOutput == nullptr)
+        {
+            imageMappingComplete = false;
+            continue;
+        }
+        imageHasNonZeroTargetVelocity =
+            imageHasNonZeroTargetVelocity ||
+            (*m_pDrives)[slot].pOutput->TargetVelocity != 0;
+    }
+
+    ServoOutputImageProofMode imageProofMode =
+        ServoOutputImageProofMode::INVALID;
+    bool imageAuthorized =
+        imageMappingComplete && motionInputComplete;
+    if (!imageHasNonZeroTargetVelocity)
+    {
+        imageProofMode = ServoOutputImageProofMode::ZERO_ONLY;
+    }
+    else
+    {
+        imageAuthorized = imageAuthorized &&
+            imageEntryAlarmSafetyIntentState ==
+            imageExitAlarmSafetyIntentState &&
+            static_cast<std::uint32_t>(
+                imageExitAlarmSafetyIntentState) == 0U &&
+            imageEntryAlarmUpdateCount == imageExitAlarmUpdateCount &&
+            !imageEntryAlarmPresent &&
+            !imageExitAlarmPresent &&
+            imageEntrySafetyIntentState ==
+            imageExitSafetyIntentState &&
+            static_cast<std::uint32_t>(
+                imageExitSafetyIntentState) == 0U &&
+            imageEntryOwnerState == imageExitOwnerState &&
+            imageEntryExecutionPublication ==
+            imageExitExecutionPublication &&
+            !UnpackMotionOwnerSafetyHandshake(
+                imageExitOwnerState) &&
+            !UnpackMotionOwnerSafetyActionPending(
+                imageExitOwnerState) &&
+            (imageExitOwnerState &
+                MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL &&
+            (imageExitExecutionPublication &
+                (EXECUTION_EPOCH_PUBLICATION_PENDING |
+                    EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL;
+
+        const MotionOwnerLease imageLease =
+            UnpackMotionOwnerState(imageExitOwnerState);
+        if (imageLease.owner == MotionOwner::SAFETY)
+        {
+            imageProofMode =
+                ServoOutputImageProofMode::CONTROLLED_STOP;
+            for (std::size_t slot = 0U;
+                slot < m_pDrives->size();
+                ++slot)
+            {
+                if ((*m_pDrives)[slot].pOutput == nullptr ||
+                    (*m_pDrives)[slot].pOutput->TargetVelocity == 0)
+                {
+                    continue;
+                }
+                imageAuthorized = imageAuthorized &&
+                    slot < m_pContexts->size() &&
+                    IsSafetyControlledStopAuthorized(
+                        (*m_pContexts)[slot].axisIndex);
+            }
+        }
+        else
+        {
+            imageProofMode = ServoOutputImageProofMode::NORMAL;
+            imageAuthorized = imageAuthorized &&
+                imageLease.owner != MotionOwner::NONE &&
+                UnpackMotionOwnerSafetyRequestTicket(
+                    imageExitOwnerState) ==
+                m_safetyRequestAcknowledgedTicket.load(
+                    std::memory_order_acquire) &&
+                !HasPendingSafetyOrRecoveryRequests();
+        }
+    }
+
+    if (!imageAuthorized)
+    {
+        if (ZeroAllServoTargetVelocityForFrame())
+        {
+            (void)PublishServoOutputImageProof(
+                m_motionOwnerState.load(std::memory_order_acquire),
+                m_executionEpochPublication.load(
+                    std::memory_order_acquire),
+                m_frameSafetyIntentState.load(
+                    std::memory_order_acquire),
+                motionAlarms.GetMotionSafetyIntentState(),
+                motionAlarms.GetUpdateCount(),
+                ServoOutputImageProofMode::ZERO_ONLY);
+        }
+    }
+    else
+    {
+        (void)PublishServoOutputImageProof(
+            imageExitOwnerState,
+            imageExitExecutionPublication,
+            imageExitSafetyIntentState,
+            imageExitAlarmSafetyIntentState,
+            imageExitAlarmUpdateCount,
+            imageProofMode);
+    }
 
     // Stage NC-0.2J.4: the 250 us Motion owner is the only code allowed to
     // inspect AxisContext / Group while constructing this diagnostic image.
@@ -6011,11 +10394,36 @@ void MotionCore::EmergencyStop(AxisContext& axis)
 }
 void MotionCore::EmergencyStopAllAxes()
 {
-    EmergencyStopAllAxesImpl(false);
+    BeginExecutionDrainAcknowledgementRevocation();
+    const MotionExecutionEpoch causalEpoch =
+        GetCurrentExecutionEpoch();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    (void)EnsureSafetyMotionActionTicket(safetyRequestTicket);
+    m_emergencyStopRequestAttemptCount.fetch_add(
+        1ULL,
+        std::memory_order_relaxed);
+    if (TryPublishEmergencyStopMailbox(causalEpoch))
+    {
+        m_emergencyStopRequestPublishedCount.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        m_emergencyStopRequestCoalescedCount.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    (void)TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
+    EmergencyStopAllAxesImpl(false, causalEpoch);
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
 }
 
 void MotionCore::EmergencyStopAllAxesImpl(
-    bool forceExecutionInvalidation) noexcept
+    bool forceExecutionInvalidation,
+    MotionExecutionEpoch causalExecutionEpoch) noexcept
 {
     // =========================================================
     // 1. 使目前執行世代失效
@@ -6023,8 +10431,12 @@ void MotionCore::EmergencyStopAllAxesImpl(
     // Emergency 訊號可能每個 Scan 都持續呼叫本函式。只有仍有
     // Active / Queued Motion 時才切換 Epoch，避免空機時無限遞增。
     // =========================================================
-    const MotionExecutionEpoch executionEpochBeforeStop =
+    const MotionExecutionEpoch runtimeEpochBeforeStop =
         GetCurrentExecutionEpoch();
+    const MotionExecutionEpoch executionEpochBeforeStop =
+        causalExecutionEpoch != MOTION_EXECUTION_EPOCH_INVALID
+        ? causalExecutionEpoch
+        : runtimeEpochBeforeStop;
     MotionCommand queuedCommand{};
     // Alarm blocks NC dispatch and the queue is FIFO. After the first
     // invalidation, a stale front therefore proves the remaining visible
@@ -6034,7 +10446,7 @@ void MotionCore::EmergencyStopAllAxesImpl(
         TryPeekNextMotionCommand(queuedCommand) &&
         queuedCommand.execution.IsAssigned() &&
         queuedCommand.execution.epoch == executionEpochBeforeStop;
-    const bool hadExecutionToInvalidate =
+    const bool hadRuntimeExecutionToInvalidate =
         forceExecutionInvalidation ||
         m_Group.isActive ||
         queuedExecutionCurrent;
@@ -6043,20 +10455,61 @@ void MotionCore::EmergencyStopAllAxesImpl(
     // Capture the current-Epoch work first: after this takeover an AUTO
     // command is intentionally owner-conflicted and cannot prove whether the
     // stop still needs one (and only one) Epoch invalidation.
-    TakeSafetyMotionOwner();
+    MotionOwnerLease safetyLease = GetMotionOwnerLease();
+    if (safetyLease.owner != MotionOwner::SAFETY ||
+        !IsMotionOwnerLeaseCurrent(safetyLease))
+    {
+        const std::uint64_t ownerState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        safetyLease = TryTakeSafetyMotionOwnerForTicket(
+            UnpackMotionOwnerSafetyRequestTicket(ownerState));
+    }
 
     MotionExecutionEpoch executionEpochAfterStop =
-        executionEpochBeforeStop;
+        GetCurrentExecutionEpoch();
 
-    if (hadExecutionToInvalidate)
+    // A fresh takeover handshake is itself the one causal invalidation. Do
+    // not publish a second SAFETY Epoch: a late same-generation helper would
+    // otherwise move current past the exact J.6 from->to evidence. Only when
+    // SAFETY already owned the unchanged Epoch and live work still exists is
+    // one additional invalidation required.
+    if (hadRuntimeExecutionToInvalidate &&
+        executionEpochAfterStop == executionEpochBeforeStop)
     {
         executionEpochAfterStop = BeginNewExecutionEpoch(
             MotionCommandSource::SAFETY);
+        if (executionEpochAfterStop == MOTION_EXECUTION_EPOCH_INVALID)
+        {
+            const std::uint64_t publication =
+                m_executionEpochPublication.load(
+                    std::memory_order_acquire);
+            if (UnpackExecutionEpochPublicationSource(publication) ==
+                MotionCommandSource::SAFETY)
+            {
+                executionEpochAfterStop =
+                    UnpackExecutionEpochPublication(publication);
+            }
+        }
+    }
+
+    const bool recordedExecutionInvalidation =
+        hadRuntimeExecutionToInvalidate &&
+        safetyLease.IsValid() &&
+        safetyLease.owner == MotionOwner::SAFETY &&
+        executionEpochBeforeStop != MOTION_EXECUTION_EPOCH_INVALID &&
+        executionEpochAfterStop != MOTION_EXECUTION_EPOCH_INVALID &&
+        executionEpochAfterStop != executionEpochBeforeStop;
+    if (recordedExecutionInvalidation)
+    {
         ++m_emergencyStopEpochInvalidationCount;
     }
 
     // 防止 UpdateInterpolation 繼續對實體軸寫入新的命令。
     m_Group.isActive = false;
+    m_safetyControlledStopInProgress = false;
+    m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+    m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    m_safetyControlledStopRequestTicket = 0U;
 
 
     // =========================================================
@@ -6073,14 +10526,14 @@ void MotionCore::EmergencyStopAllAxesImpl(
     m_emergencyStopLastAppliedOwnerLease =
         GetMotionOwnerLease();
     m_emergencyStopLastApplyHadExecutionToInvalidate =
-        hadExecutionToInvalidate;
+        recordedExecutionInvalidation;
 
     // Stage NC-0.2J.6.3.2: preserve the last application that *really*
     // invalidated execution.  Level-sensitive C5/axis-protection inputs can
     // apply E-stop again after the group is already stopped; those no-op
     // applications must not overwrite the only exact old-Epoch -> new-Epoch
     // correlation available to the later 10 ms J.6 observer.
-    if (hadExecutionToInvalidate)
+    if (recordedExecutionInvalidation)
     {
         const std::uint64_t packedEpochInvalidation =
             static_cast<std::uint64_t>(executionEpochBeforeStop) |
@@ -6219,7 +10672,20 @@ void MotionCore::ResetFault(AxisContext& axis)
 }
 void MotionCore::ResetAllFaults()//全軸 清除異常狀態
 {
+    BeginExecutionDrainAcknowledgementRevocation();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    if (!EnsureSafetyMotionActionTicket(safetyRequestTicket))
+    {
+        EmergencyStopAllAxesImpl(true);
+        EndExecutionDrainAcknowledgementRevocation();
+        return;
+    }
+    (void)TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
     ResetAllFaultsImpl(true);
+    (void)CompleteSafetyMotionActionTicket(safetyRequestTicket);
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
 }
 
 void MotionCore::ResetAllFaultsImpl(
@@ -6242,6 +10708,10 @@ void MotionCore::ResetAllFaultsImpl(
     }
 
     m_Group.isActive = false;
+    m_safetyControlledStopInProgress = false;
+    m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+    m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    m_safetyControlledStopRequestTicket = 0U;
     // Future Command 由新 Epoch 在 250 us Consumer 端淘汰。
     ResetFault(m_Group.virtualAxis); // 👈 現在有了 isVirtualAxis 保護，這裡也安全了！
 
@@ -7866,6 +12336,32 @@ void MotionCore::UpdateMotion(
         ? static_cast<int>(&axis - m_pContexts->data())
         : axis.axisIndex;
 
+    // NC-0.2K.6.2 final command fence. Freezing UpdateInterpolation alone is
+    // insufficient because an INTERPOLATING AxisContext would otherwise keep
+    // forwarding its previous non-zero velocity to the PDO. Every outstanding
+    // Safety request, SAFETY owner phase, or unauthorized active Group emits
+    // an immediate zero at the final servo-command seam. The sole exception
+    // is an RT-owned controlled stop bound to the exact SAFETY lease, Epoch,
+    // request ticket and physical group member.
+    const MotionOwnerLease runtimeOwnerLease = GetMotionOwnerLease();
+    const bool controlledStopAuthorized =
+        IsSafetyControlledStopAuthorized(contextAxisSlot);
+    const bool activeGroupUnauthorized =
+        m_Group.isActive &&
+        GetCommandAuthorizationFailure(m_Group.currentCmd) !=
+        MotionRejectReason::NONE;
+    if (!controlledStopAuthorized &&
+        (HasUnacknowledgedSafetyMotionRequest() ||
+            runtimeOwnerLease.owner == MotionOwner::SAFETY ||
+            activeGroupUnauthorized))
+    {
+        WriteServoTargetVelocityCommand(
+            servo.pOutput,
+            axis.axisIndex,
+            0);
+        return;
+    }
+
     // 初始化 cmd (防呆)
     cmd.instantCmdPos = axis.currentCmdPos;
     cmd.instantCmdVel = 0.0;
@@ -8086,21 +12582,181 @@ void MotionCore::LineMove(
     BufferMode mode,
     MotionCommandPathMode commandPathMode)
 {
+    // ABORTING opens a new execution Epoch.  Capture one data-race-free
+    // logical baseline before publication so an accepted legacy/special
+    // LineMove can rebuild every existing axis in the new producer tail.
+    // The captured values are not authoritative unless ingress accepts.
+    std::array<double, MAX_AXES> abortingLogicalSnapshot{};
+    std::uint32_t abortingLogicalValidMask = 0U;
+    if (mode == BufferMode::ABORTING && m_pContexts != nullptr)
+    {
+        const std::size_t contextCount = (std::min)(
+            m_pContexts->size(),
+            static_cast<std::size_t>(MAX_AXES));
+        for (std::size_t axisSlot = 0U;
+            axisSlot < contextCount;
+            ++axisSlot)
+        {
+            const AxisContext& axis = (*m_pContexts)[axisSlot];
+            if (!axis.isExist)
+            {
+                continue;
+            }
+
+            const double logicalPulse = axis.logicalCmdPos.Load();
+            if (!std::isfinite(logicalPulse))
+            {
+                continue;
+            }
+
+            abortingLogicalSnapshot[axisSlot] = logicalPulse;
+            abortingLogicalValidMask |=
+                (1U << static_cast<unsigned>(axisSlot));
+        }
+    }
+
+    MotionExecutionIdentity producedIdentity{};
+    MotionOwnerLease producedOwnerLease{};
+    const bool accepted = TryLineMove(
+        axes,
+        targetPos,
+        targetVel,
+        acc_time,
+        dec_time,
+        mode,
+        commandPathMode,
+        &producedIdentity,
+        &producedOwnerLease,
+        MOTION_EXECUTION_EPOCH_INVALID,
+        nullptr);
+    if (!accepted)
+    {
+        return;
+    }
+
+    const bool preserveBufferedTail =
+        mode == BufferMode::BUFFERED &&
+        m_g00ProducerQueueTailEpoch == producedIdentity.epoch &&
+        m_g00ProducerQueueTailOwnerLease.IsValid() &&
+        m_g00ProducerQueueTailOwnerLease.Matches(producedOwnerLease);
+
+    std::uint32_t committedValidMask =
+        preserveBufferedTail
+        ? m_g00ProducerQueueTailValidMask
+        : 0U;
+
+    if (mode == BufferMode::ABORTING)
+    {
+        m_g00ProducerQueueTailPulse.fill(0.0);
+        committedValidMask = 0U;
+
+        for (std::size_t axisSlot = 0U;
+            axisSlot < static_cast<std::size_t>(MAX_AXES);
+            ++axisSlot)
+        {
+            const std::uint32_t axisBit =
+                (1U << static_cast<unsigned>(axisSlot));
+            if ((abortingLogicalValidMask & axisBit) == 0U)
+            {
+                continue;
+            }
+
+            const double logicalPulse =
+                abortingLogicalSnapshot[axisSlot];
+            m_g00ProducerQueueTailPulse[axisSlot] = logicalPulse;
+            (*m_pContexts)[axisSlot].lastQueuedPulse.Store(logicalPulse);
+            committedValidMask |= axisBit;
+        }
+    }
+    else if (!preserveBufferedTail)
+    {
+        m_g00ProducerQueueTailPulse.fill(0.0);
+    }
+
+    // Active targets supersede the ABORTING logical baseline, or extend the
+    // same-tag BUFFERED tail.  No legacy producer endpoint is visible before
+    // its MotionCommand has crossed the ingress linearization point.
+    for (std::size_t slot = 0U; slot < axes.size(); ++slot)
+    {
+        const std::size_t axisSlot =
+            static_cast<std::size_t>(axes[slot]);
+        const double targetPulse = targetPos[slot];
+        m_g00ProducerQueueTailPulse[axisSlot] = targetPulse;
+        (*m_pContexts)[axisSlot].lastQueuedPulse.Store(targetPulse);
+        committedValidMask |=
+            (1U << static_cast<unsigned>(axisSlot));
+    }
+
+    m_g00ProducerQueueTailValidMask = committedValidMask;
+    m_g00ProducerQueueTailEpoch = producedIdentity.epoch;
+    m_g00ProducerQueueTailOwnerLease = producedOwnerLease;
+}
+
+bool MotionCore::TryLineMove(
+    const std::vector<int>& axes,
+    const std::vector<double>& targetPos,
+    double targetVel,
+    double acc_time,
+    double dec_time,
+    BufferMode mode,
+    MotionCommandPathMode commandPathMode,
+    MotionExecutionIdentity* producedIdentity,
+    MotionOwnerLease* producedOwnerLease,
+    MotionExecutionEpoch plannedTailEpoch,
+    const MotionOwnerLease* plannedTailOwnerLease) noexcept
+{
+    if (producedIdentity != nullptr)
+    {
+        *producedIdentity = MotionExecutionIdentity{};
+    }
+    if (producedOwnerLease != nullptr)
+    {
+        *producedOwnerLease = MotionOwnerLease{};
+    }
     // Capture one producer tuple before validation. Even malformed producer
     // input must receive an identity, a terminal REJECTED notice and a formal
     // Alarm/E-stop transaction; it must never disappear before M30 accounting.
     const MotionCommandSource commandSource =
         m_pendingCommandSource.load(
             std::memory_order_acquire);
-    const MotionOwnerLease commandOwnerLease =
+    const MotionOwnerLease entryOwnerLease =
         GetMotionOwnerLease();
-    MotionExecutionEpoch commandEpoch =
+    const MotionExecutionEpoch entryEpoch =
         GetCurrentExecutionEpoch();
+
+    const bool plannedTailRequested =
+        plannedTailEpoch != MOTION_EXECUTION_EPOCH_INVALID ||
+        plannedTailOwnerLease != nullptr;
+    const bool plannedTailWellFormed =
+        plannedTailEpoch != MOTION_EXECUTION_EPOCH_INVALID &&
+        plannedTailOwnerLease != nullptr &&
+        plannedTailOwnerLease->IsValid();
+
+    MotionExecutionEpoch commandEpoch =
+        plannedTailWellFormed
+        ? plannedTailEpoch
+        : entryEpoch;
+    MotionOwnerLease commandOwnerLease =
+        plannedTailWellFormed
+        ? *plannedTailOwnerLease
+        : entryOwnerLease;
 
     MotionCommand invalidCommand{};
     invalidCommand.mode = InterpolationMode::LINEAR;
     invalidCommand.sourceLinePC = m_pendingSourcePC;
     invalidCommand.commandPathMode = commandPathMode;
+
+    if (plannedTailRequested && !plannedTailWellFormed)
+    {
+        RejectInvalidProducerMotionCommand(
+            invalidCommand,
+            entryEpoch,
+            commandSource,
+            entryOwnerLease,
+            producedIdentity,
+            producedOwnerLease);
+        return false;
+    }
 
     if (m_pContexts == nullptr ||
         axes.empty() ||
@@ -8115,8 +12771,10 @@ void MotionCore::LineMove(
             invalidCommand,
             commandEpoch,
             commandSource,
-            commandOwnerLease);
-        return;
+            commandOwnerLease,
+            producedIdentity,
+            producedOwnerLease);
+        return false;
     }
 
     std::array<bool, MAX_AXES> seenAxis{};
@@ -8134,8 +12792,10 @@ void MotionCore::LineMove(
                 invalidCommand,
                 commandEpoch,
                 commandSource,
-                commandOwnerLease);
-            return;
+                commandOwnerLease,
+                producedIdentity,
+                producedOwnerLease);
+            return false;
         }
         seenAxis[static_cast<std::size_t>(axisIndex)] = true;
     }
@@ -8192,8 +12852,55 @@ void MotionCore::LineMove(
     // 2. 判斷是「乖乖排隊」還是「緊急覆寫」？
     if (mode == BufferMode::ABORTING)
     {
-        commandEpoch = RequestAbortingExecutionEpoch(
-            commandSource);
+        const MotionExecutionEpoch expectedEpoch =
+            plannedTailWellFormed
+            ? plannedTailEpoch
+            : entryEpoch;
+        const MotionOwnerLease expectedOwnerLease =
+            plannedTailWellFormed
+            ? *plannedTailOwnerLease
+            : entryOwnerLease;
+
+        const bool plannedTupleMatchesEntry =
+            expectedEpoch == entryEpoch &&
+            expectedOwnerLease.Matches(entryOwnerLease);
+
+        MotionExecutionEpoch publishedEpoch =
+            MOTION_EXECUTION_EPOCH_INVALID;
+        if (!plannedTupleMatchesEntry ||
+            !TryPublishOwnerAuthorizedAbortingExecutionEpoch(
+                commandSource,
+                expectedEpoch,
+                expectedOwnerLease,
+                publishedEpoch))
+        {
+            const bool ownerStillCurrent =
+                IsMotionOwnerLeaseCurrent(expectedOwnerLease);
+            const MotionExecutionEpoch currentEpoch =
+                GetCurrentExecutionEpoch();
+            const MotionRejectReason rejectReason =
+                !ownerStillCurrent
+                ? MotionRejectReason::OWNER_CONFLICT
+                : (currentEpoch != expectedEpoch &&
+                    currentEpoch != publishedEpoch)
+                ? MotionRejectReason::STALE_EPOCH
+                : MotionRejectReason::NOT_READY;
+
+            RejectNonGeometryProducerMotionCommand(
+                invalidCommand,
+                publishedEpoch != MOTION_EXECUTION_EPOCH_INVALID
+                ? publishedEpoch
+                : expectedEpoch,
+                commandSource,
+                expectedOwnerLease,
+                rejectReason,
+                producedIdentity,
+                producedOwnerLease);
+            return false;
+        }
+
+        commandEpoch = publishedEpoch;
+        commandOwnerLease = expectedOwnerLease;
 
         // Future Queue / History 與 Active Abort 都由 250 us Consumer
         // 在 Epoch 邊界套用；Producer 不再修改 Motion Runtime 容器。
@@ -8205,7 +12912,16 @@ void MotionCore::LineMove(
         commandEpoch,
         commandSource,
         commandOwnerLease);
-    TryEnqueueMotionCommand(cmd);
+    if (producedIdentity != nullptr)
+    {
+        *producedIdentity = cmd.execution;
+    }
+    if (producedOwnerLease != nullptr)
+    {
+        *producedOwnerLease = cmd.ownerLease;
+    }
+
+    return TryEnqueueMotionCommand(cmd);
 }
 // =========================================================
 // Spiral / Variable Radius Arc Helpers
@@ -8427,6 +13143,14 @@ void MotionCore::LoadNextCommand()
     if (HasPendingExecutionEpochChange())
     {
         return;
+    }
+
+    if (!m_Group.isActive)
+    {
+        m_safetyControlledStopInProgress = false;
+        m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+        m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        m_safetyControlledStopRequestTicket = 0U;
     }
 
     if (m_Group.cmdQueue.empty())
@@ -10296,8 +15020,38 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
     // 2. 判斷插隊或排隊
     if (mode == BufferMode::ABORTING)
     {
-        commandEpoch = RequestAbortingExecutionEpoch(
-            commandSource);
+        MotionExecutionEpoch publishedEpoch =
+            MOTION_EXECUTION_EPOCH_INVALID;
+        if (!TryPublishOwnerAuthorizedAbortingExecutionEpoch(
+            commandSource,
+            commandEpoch,
+            commandOwnerLease,
+            publishedEpoch))
+        {
+            const bool ownerStillCurrent =
+                IsMotionOwnerLeaseCurrent(commandOwnerLease);
+            const MotionExecutionEpoch currentEpoch =
+                GetCurrentExecutionEpoch();
+            const MotionRejectReason rejectReason =
+                !ownerStillCurrent
+                ? MotionRejectReason::OWNER_CONFLICT
+                : (currentEpoch != commandEpoch &&
+                    currentEpoch != publishedEpoch)
+                ? MotionRejectReason::STALE_EPOCH
+                : MotionRejectReason::NOT_READY;
+
+            RejectNonGeometryProducerMotionCommand(
+                invalidCommand,
+                publishedEpoch != MOTION_EXECUTION_EPOCH_INVALID
+                ? publishedEpoch
+                : commandEpoch,
+                commandSource,
+                commandOwnerLease,
+                rejectReason);
+            return;
+        }
+
+        commandEpoch = publishedEpoch;
 
         // Future Queue / History 與 Active Abort 都由 250 us Consumer
         // 在 Epoch 邊界套用。
@@ -10314,20 +15068,52 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
 
 void MotionCore::StopGroup()
 {
+    BeginExecutionDrainAcknowledgementRevocation();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    if (!EnsureSafetyMotionActionTicket(safetyRequestTicket))
+    {
+        EmergencyStopAllAxesImpl(true);
+        EndExecutionDrainAcknowledgementRevocation();
+        return;
+    }
+    (void)TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
     StopGroupImpl(true);
+    (void)CompleteSafetyMotionActionTicket(safetyRequestTicket);
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
 }
 
 void MotionCore::StopGroupImpl(
     bool publishExecutionEpoch)
 {
+    const MotionOwnerLease safetyLease = GetMotionOwnerLease();
+    if (safetyLease.owner != MotionOwner::SAFETY ||
+        !IsMotionOwnerLeaseCurrent(safetyLease))
+    {
+        // Never create a controlled-stop exception without exact SAFETY
+        // authority. The RT E-stop path still zeroes every axis even if its
+        // bounded handshake must be completed on the next pass.
+        EmergencyStopAllAxesImpl(true);
+        return;
+    }
+
     const bool hadExecutionToInvalidate =
         m_Group.isActive ||
         !m_Group.cmdQueue.empty();
 
+    MotionExecutionEpoch controlledStopEpoch =
+        GetCurrentExecutionEpoch();
+
     if (publishExecutionEpoch && hadExecutionToInvalidate)
     {
-        BeginNewExecutionEpoch(
+        controlledStopEpoch = BeginNewExecutionEpoch(
             MotionCommandSource::SAFETY);
+        if (controlledStopEpoch == MOTION_EXECUTION_EPOCH_INVALID)
+        {
+            EmergencyStopAllAxesImpl(true);
+            return;
+        }
     }
 
     // 尚未開始的 Future Queue 已由新 Epoch 取消；
@@ -10335,6 +15121,11 @@ void MotionCore::StopGroupImpl(
 
     if (!m_Group.isActive)
     {
+        m_safetyControlledStopInProgress = false;
+        m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+        m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        m_safetyControlledStopRequestTicket = 0U;
+
         // Reset can arrive after an exact Abort or terminal Group transition.
         // Inactive + IDLE must still be a fully quiescent command state; repair
         // finite legacy residue here before J.5 samples the Reset pre-proof.
@@ -10345,6 +15136,27 @@ void MotionCore::StopGroupImpl(
                 m_Group.virtualAxis);
         }
 
+        return;
+    }
+
+    // This RT-owned token spans the whole controlled-stop lifecycle. The
+    // virtual state is not a sufficient proxy: MOVING truncates its target
+    // first, and it may reach IDLE while physical axes are still converging.
+    m_safetyControlledStopInProgress = true;
+    m_safetyControlledStopOwnerLease = safetyLease;
+    m_safetyControlledStopEpoch = controlledStopEpoch;
+    m_safetyControlledStopRequestTicket =
+        UnpackMotionOwnerSafetyRequestTicket(
+            m_motionOwnerState.load(std::memory_order_acquire));
+
+    // Jump and PATH_SERVO own independent velocity drivers that can overwrite
+    // StopMove on the next line. They are not eligible for the controlled-
+    // stop exception; contain them with the all-axis E-stop path instead.
+    if (m_Group.jumpManager.state != JumpState::IDLE ||
+        m_Group.pathMode == PathMode::PATH_SERVO ||
+        m_Group.pathMode == PathMode::JUMP_TRACKING)
+    {
+        EmergencyStopAllAxesImpl(false);
         return;
     }
 
@@ -10376,8 +15188,11 @@ void MotionCore::StopGroupImpl(
 
 void MotionCore::EmergencyStopGroup()
 {
-    // Group E-Stop 也必須使先前 Owner Lease 失效。
-    TakeSafetyMotionOwner();
+    BeginExecutionDrainAcknowledgementRevocation();
+    std::uint32_t safetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    (void)EnsureSafetyMotionActionTicket(safetyRequestTicket);
+    (void)TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
 
     const bool hadExecutionToInvalidate =
         m_Group.isActive ||
@@ -10406,6 +15221,14 @@ void MotionCore::EmergencyStopGroup()
         // 呼叫我們先前寫好的單軸 EmergencyStop
         EmergencyStop(realAxis);
     }
+
+    m_safetyControlledStopInProgress = false;
+    m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+    m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    m_safetyControlledStopRequestTicket = 0U;
+    (void)CompleteSafetyMotionActionTicket(safetyRequestTicket);
+    EndExecutionDrainAcknowledgementRevocation();
+    TryAcknowledgeAppliedSafetyMotionRequests();
 
     // RtPrintf(">>> [ALARM] EmergencyStopGroup Executed. All motions killed.\n");
 }
@@ -11659,6 +16482,20 @@ void MotionCore::UpdateInterpolation()
     // Safety requests have priority over manual/home mailbox commands.
     ApplyPendingSafetyAndRecoveryRequests();
 
+    // A direct Safety takeover or a request producer paused between ticket
+    // publication and its mailbox write is still an observable stop intent.
+    // Help the bounded handshake here; never acknowledge a producer that is
+    // still inside the revocation window.
+    if (HasUnacknowledgedSafetyMotionRequest())
+    {
+        const std::uint64_t ownerState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        (void)TryTakeSafetyMotionOwnerForTicket(
+            UnpackMotionOwnerSafetyRequestTicket(ownerState));
+        ApplyPendingExecutionEpochChange();
+        TryAcknowledgeAppliedSafetyMotionRequests();
+    }
+
     // A producer can publish a newer Epoch while the bounded CAS seam above
     // is running.  Safety/recovery requests have already had priority; all
     // ordinary settle/mailbox/planner work now waits until that exact packed
@@ -11666,6 +16503,38 @@ void MotionCore::UpdateInterpolation()
     // the gate at the final command-acquisition seam to close publication that
     // occurs later in this pass.
     if (HasPendingExecutionEpochChange())
+    {
+        return;
+    }
+
+    if (HasUnacknowledgedSafetyMotionRequest() &&
+        !m_safetyControlledStopInProgress)
+    {
+        return;
+    }
+
+    if (!m_Group.isActive)
+    {
+        m_safetyControlledStopInProgress = false;
+        m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+        m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        m_safetyControlledStopRequestTicket = 0U;
+    }
+
+    // NC-0.2K.6.2: an owner takeover and its request mailbox are separate
+    // atomic publications. If the request producer is preempted after the
+    // SAFETY Owner/Epoch handshake, the former AUTO currentCmd is already
+    // unauthorized and must not advance for even one more Runtime pass.
+    //
+    // Keep the active geometry and virtual velocity intact while fenced so a
+    // later STOP request can still enter the existing controlled-deceleration
+    // path. Once StopGroupImpl() changes the virtual axis to STOPPING, that
+    // bounded stop trajectory is the only unauthorized active state allowed
+    // to continue. Emergency/Reset paths deactivate or similarly stop it.
+    if (m_Group.isActive &&
+        !m_safetyControlledStopInProgress &&
+        GetCommandAuthorizationFailure(m_Group.currentCmd) !=
+        MotionRejectReason::NONE)
     {
         return;
     }
@@ -11799,13 +16668,35 @@ void MotionCore::UpdateInterpolation()
     AxisCommand vCmd{}; // 準備統一收集速度與位置
     bool virtualCommandResynchronized = false;
 
+    if (m_safetyControlledStopInProgress &&
+        !IsSafetyControlledStopAuthorized(m_Group.axisIndices[0]))
+    {
+        EmergencyStopAllAxesImpl(false);
+        return;
+    }
+
 
 
 
     // ======================================================
     // 🌟 [司機 A] 跳刀狀態機接管 (優先權最高)
     // ======================================================
-    if (jm.state != JumpState::IDLE)
+    if (m_safetyControlledStopInProgress)
+    {
+        // Dedicated RT safety-stop driver: never dequeue, cross History, or
+        // consult PATH_SERVO/Jump velocity sources while the stale command is
+        // being retired. StopMove selected either the original trapezoidal
+        // deceleration target or STOPPING velocity ramp.
+        if (vAxis.state == MotionState::MotionState_STOPPING)
+        {
+            Calc_Trajectory_Velocity(vAxis, vCmd);
+        }
+        else
+        {
+            Calc_Trajectory_Trapezoidal(vAxis, vCmd);
+        }
+    }
+    else if (jm.state != JumpState::IDLE)
     {
         if (jm.state == JumpState::RETRACTING)
         {
@@ -12197,7 +17088,8 @@ void MotionCore::UpdateInterpolation()
     // =========================================================
     // 🔴 獨立的時光機 (向後跨節)：必須放在司機分流的外面！
     // =========================================================
-    if (vAxis.currentCmdPos < 0.0)
+    if (!m_safetyControlledStopInProgress &&
+        vAxis.currentCmdPos < 0.0)
     {
         virtualCommandResynchronized = true;
 
@@ -12324,7 +17216,8 @@ void MotionCore::UpdateInterpolation()
     // 向後跨節已經由上面的共用區統一處理，
     // 這裡絕對不要再 pop history。
     // =========================================================
-    if (jm.state != JumpState::IDLE)
+    if (!m_safetyControlledStopInProgress &&
+        jm.state != JumpState::IDLE)
     {
         if (vAxis.currentCmdPos >
             m_Group.currentCmd.mem_totalDist)
@@ -13143,6 +18036,43 @@ void MotionCore::UpdateInterpolation()
         // 🌟 神級收尾：大腦算完，且實體馬達"全部"都擠進視窗後，才准切換為 IDLE！
         if (allPhysicalInPos)
         {
+            if (m_safetyControlledStopInProgress)
+            {
+                // The prior segment was already terminalized ABORTED when
+                // the SAFETY Epoch was applied. Retire its RT geometry here
+                // without Complete(), History insertion, or an unauthorized
+                // lifecycle reservation.
+                if (!IsSafetyControlledStopAuthorized(
+                    m_Group.axisIndices[0]) ||
+                    !TryCanonicalizeIdleAxisCommandState(vAxis))
+                {
+                    EmergencyStopAllAxesImpl(false);
+                    return;
+                }
+
+                for (int i = 0; i < m_Group.axisCount; ++i)
+                {
+                    const int idx = m_Group.axisIndices[i];
+                    if (!TryCanonicalizeInactivePhysicalAxisCommandState(
+                        (*m_pContexts)[idx]))
+                    {
+                        TriggerGroupMappingIntegrityEmergencyStop(idx, true);
+                        return;
+                    }
+                }
+
+                m_Group.isActive = false;
+                m_Group.currentCmd.execution = MotionExecutionIdentity{};
+                m_Group.currentCmd.ownerLease = MotionOwnerLease{};
+                m_safetyControlledStopInProgress = false;
+                m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+                m_safetyControlledStopEpoch =
+                    MOTION_EXECUTION_EPOCH_INVALID;
+                m_safetyControlledStopRequestTicket = 0U;
+                TryAcknowledgeAppliedSafetyMotionRequests();
+                return;
+            }
+
             if (HasPendingExecutionEpochChange() ||
                 GetCommandAuthorizationFailure(m_Group.currentCmd) !=
                 MotionRejectReason::NONE)
@@ -13264,20 +18194,258 @@ void MotionCore::UpdateInterpolation()
 
 void MotionCore::SyncVirtualEndPosition()
 {
-    // 防呆：確認指標不是空的，且 vector 裡面真的有東西
-    if (m_pContexts == nullptr || m_pContexts->empty()) return;
+    // Invalidate the identity tag first.  Pulses and the valid mask are only
+    // producer-owned staging data until a coherent Epoch/Owner sample is
+    // published at the end of this function.
+    m_g00ProducerQueueTailEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    m_g00ProducerQueueTailOwnerLease = MotionOwnerLease{};
+    m_g00ProducerQueueTailValidMask = 0U;
+    m_g00ProducerQueueTailPulse.fill(0.0);
 
-    // 🌟 修正：動態取得 vector 實際的大小，絕對不寫死 8！
-    for (size_t i = 0; i < m_pContexts->size(); i++)
+    if (m_pContexts == nullptr || m_pContexts->empty())
     {
-        if ((*m_pContexts)[i].isExist)
+        return;
+    }
+
+    // Sample each packed identity word exactly once at entry.  Reading the
+    // Epoch and PENDING bit from the same atomic word closes the otherwise
+    // possible split read where an Epoch publisher starts between them.
+    const std::uint64_t entryExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t entryOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if ((entryExecutionPublication &
+        EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        (entryExecutionPublication &
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL)
+    {
+        return;
+    }
+
+    const MotionExecutionEpoch entryEpoch =
+        UnpackExecutionEpochPublication(entryExecutionPublication);
+    const MotionOwnerLease entryOwnerLease =
+        UnpackMotionOwnerState(entryOwnerState);
+    if (entryEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        !entryOwnerLease.IsValid())
+    {
+        return;
+    }
+
+    std::array<double, MAX_AXES> stagedTailPulse{};
+    std::uint32_t validMask = 0U;
+    for (std::size_t axisSlot = 0U;
+        axisSlot < m_pContexts->size();
+        ++axisSlot)
+    {
+        AxisContext& axis = (*m_pContexts)[axisSlot];
+        if (!axis.isExist)
         {
-            // 將每一軸的預讀追蹤點 (lastQueuedPulse) 拉回馬達當下的真實邏輯位置
-            (*m_pContexts)[i].lastQueuedPulse = (*m_pContexts)[i].logicalCmdPos;
+            continue;
+        }
+
+        // An enabled axis that cannot be represented in the fixed producer
+        // sidecar makes the entire baseline unusable.
+        if (axisSlot >= static_cast<std::size_t>(MAX_AXES))
+        {
+            return;
+        }
+
+        // logicalCmdPos is written by the RT owner.  At this drained lifecycle
+        // seam it is stationary, but it must still be sampled atomically so
+        // the C++ memory model never observes a torn/data-racing double.
+        const double referencePulse = axis.logicalCmdPos.Load();
+        if (!std::isfinite(referencePulse))
+        {
+            return;
+        }
+
+        stagedTailPulse[axisSlot] = referencePulse;
+        validMask |=
+            (1U << static_cast<unsigned>(axisSlot));
+    }
+
+    // Double-sample the exact packed Epoch and Owner words.  Any publication,
+    // pending transition, active RT terminal-commit reservation, or
+    // owner-generation transfer during the axis snapshot rejects the whole
+    // baseline without waiting on RT.
+    const std::uint64_t exitExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t exitOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if ((exitExecutionPublication &
+        EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        (exitExecutionPublication &
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL ||
+        exitExecutionPublication != entryExecutionPublication ||
+        exitOwnerState != entryOwnerState)
+    {
+        return;
+    }
+
+    // Commit only the coherent staged sample.  The legacy per-axis atomic
+    // mirror and all sidecar values precede the identity tag publication.
+    for (std::size_t axisSlot = 0U;
+        axisSlot < m_pContexts->size();
+        ++axisSlot)
+    {
+        AxisContext& axis = (*m_pContexts)[axisSlot];
+        if (axis.isExist)
+        {
+            axis.lastQueuedPulse.Store(stagedTailPulse[axisSlot]);
+        }
+    }
+    m_g00ProducerQueueTailPulse = stagedTailPulse;
+    m_g00ProducerQueueTailValidMask = validMask;
+    m_g00ProducerQueueTailOwnerLease = entryOwnerLease;
+    m_g00ProducerQueueTailEpoch = entryEpoch;
+}
+
+
+bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
+    double(&outputMCS)[MAX_AXES]) const noexcept
+{
+    std::fill_n(outputMCS, MAX_AXES, 0.0);
+    std::array<double, MAX_AXES> convertedMCS{};
+
+    if (m_pContexts == nullptr || m_pContexts->empty())
+    {
+        return false;
+    }
+
+    const std::uint64_t entryExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t entryOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if ((entryExecutionPublication &
+        EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        (entryExecutionPublication &
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL)
+    {
+        return false;
+    }
+
+    const MotionExecutionEpoch entryEpoch =
+        UnpackExecutionEpochPublication(entryExecutionPublication);
+    const MotionOwnerLease entryOwnerLease =
+        UnpackMotionOwnerState(entryOwnerState);
+    if (entryEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        !entryOwnerLease.IsValid() ||
+        m_g00ProducerQueueTailEpoch != entryEpoch ||
+        !m_g00ProducerQueueTailOwnerLease.IsValid() ||
+        !m_g00ProducerQueueTailOwnerLease.Matches(entryOwnerLease))
+    {
+        return false;
+    }
+
+    const std::array<double, MAX_AXES> stagedTailPulse =
+        m_g00ProducerQueueTailPulse;
+    const std::uint32_t stagedValidMask =
+        m_g00ProducerQueueTailValidMask;
+    const MotionExecutionEpoch stagedTailEpoch =
+        m_g00ProducerQueueTailEpoch;
+    const MotionOwnerLease stagedTailOwnerLease =
+        m_g00ProducerQueueTailOwnerLease;
+
+    for (const double tailPulse : stagedTailPulse)
+    {
+        if (!std::isfinite(tailPulse))
+        {
+            return false;
         }
     }
 
-    // DEBUG_PRINT("[Motion] Virtual End Position Synced! Axes checked: %zu\n", m_pContexts->size());
+    const std::size_t axisCount = (std::min)(
+        m_pContexts->size(),
+        static_cast<std::size_t>(MAX_AXES));
+    for (std::size_t axisSlot = 0U;
+        axisSlot < axisCount;
+        ++axisSlot)
+    {
+        const AxisContext& axis = (*m_pContexts)[axisSlot];
+        if (!axis.isExist)
+        {
+            continue;
+        }
+
+        const std::uint32_t axisBit =
+            (1U << static_cast<unsigned>(axisSlot));
+        const double tailPulse =
+            stagedTailPulse[axisSlot];
+        if ((stagedValidMask & axisBit) == 0U ||
+            !std::isfinite(axis.resolution_PPR) ||
+            !std::isfinite(axis.finalLead) ||
+            axis.resolution_PPR == 0.0)
+        {
+            return false;
+        }
+
+        double mcsUnit =
+            tailPulse * axis.finalLead / axis.resolution_PPR;
+        if (!std::isfinite(mcsUnit))
+        {
+            return false;
+        }
+
+        // Match Reset rebase semantics: modulo-normalize only a configured
+        // finite rotary range.  Continuous rotary axes remain unwrapped.
+        if (axis.axisType == AxisType::ROTARY &&
+            std::isfinite(axis.rotaryModulo) &&
+            axis.rotaryModulo > 0.0)
+        {
+            mcsUnit = std::fmod(mcsUnit, axis.rotaryModulo);
+            if (mcsUnit < 0.0)
+            {
+                mcsUnit += axis.rotaryModulo;
+            }
+        }
+        if (!std::isfinite(mcsUnit))
+        {
+            return false;
+        }
+
+        convertedMCS[axisSlot] = mcsUnit;
+    }
+
+    for (std::size_t axisSlot = axisCount;
+        axisSlot < m_pContexts->size();
+        ++axisSlot)
+    {
+        if ((*m_pContexts)[axisSlot].isExist)
+        {
+            return false;
+        }
+    }
+
+    // Close the conversion seam against a concurrent Epoch publication or
+    // owner transfer.  Recheck both packed words and the producer tag; copy
+    // output only when the entry and exit observations are identical and no
+    // execution transition is pending.
+    const std::uint64_t exitExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t exitOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    if ((exitExecutionPublication &
+        EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        (exitExecutionPublication &
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL ||
+        exitExecutionPublication != entryExecutionPublication ||
+        exitOwnerState != entryOwnerState ||
+        m_g00ProducerQueueTailEpoch != stagedTailEpoch ||
+        !m_g00ProducerQueueTailOwnerLease.Matches(
+            stagedTailOwnerLease) ||
+        stagedTailEpoch != entryEpoch ||
+        !stagedTailOwnerLease.Matches(entryOwnerLease) ||
+        m_g00ProducerQueueTailValidMask != stagedValidMask)
+    {
+        return false;
+    }
+
+    std::copy(
+        convertedMCS.begin(),
+        convertedMCS.end(),
+        outputMCS);
+    return true;
 }
 bool MotionCore::IsGroupStandstill() const
 {
@@ -13388,6 +18556,18 @@ bool MotionCore::IsGroupStandstill() const
 void MotionCore::UpdateNCSettleProducer(
     MotionStopSettlePublicationPayload& payload) noexcept
 {
+    // A claimed Reset release token freezes both the ACK and its evidence
+    // image until the NC-side owner CAS has completed. With no claim, make
+    // every older token non-consumable before evaluating this fresh sample;
+    // ACKNOWLEDGED republishes a new one at the end of the same RT pass.
+    if (!TryInvalidateNCResetSafetyReleaseAuthorization())
+    {
+        payload.ncSettleSnapshots = m_ncSettlePublishedSnapshots;
+        payload.ncSettleCounters = m_ncSettleProducerCounters;
+        payload.resetRebaseAck = m_ncResetRebaseAckProducer;
+        return;
+    }
+
     const std::uint32_t currentGroupMask =
         BuildCurrentNCGroupAxisMask();
 
@@ -13606,7 +18786,9 @@ void MotionCore::UpdateNCSettleProducer(
                 m_activeResetNCSettleRequest.ownerLease.owner ==
                 MotionOwner::SAFETY &&
                 m_activeResetNCSettleRequest.ownerLease.Matches(
-                    currentOwnerLease);
+                    currentOwnerLease) &&
+                IsExactResetNCSettleAuthorityCurrent(
+                    m_activeResetNCSettleRequest);
             const bool resetInternalCoherent =
                 profile == MotionNCSettleProfile::RESET_ALL &&
                 m_activeResetNCSettleRequest.requestSequence ==
@@ -14196,6 +19378,15 @@ void MotionCore::UpdateNCSettleProducer(
         m_ncSettleHasEvaluatedRuntimeCycle = true;
     }
 
+    if (m_ncResetRebasePhase ==
+        MotionNCResetRebasePhase::ACKNOWLEDGED)
+    {
+        // Retry the bounded seqlock publication on each fresh RT sample.  A
+        // transient owner/frame reservation can delay authorization, but an
+        // older request sequence can never authorize this Reset's release.
+        (void)TryPublishNCResetSafetyReleaseAuthorization();
+    }
+
     payload.ncSettleSnapshots = m_ncSettlePublishedSnapshots;
     payload.ncSettleCounters = m_ncSettleProducerCounters;
     payload.resetRebaseAck = m_ncResetRebaseAckProducer;
@@ -14207,6 +19398,13 @@ void MotionCore::UpdateNCSettleProducer(
 // =============================================================================
 void MotionCore::PublishStopSettleEvidence() noexcept
 {
+    const std::uint64_t drainRevocationGenerationAtEntry =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint32_t drainRevocationPublishersAtEntry =
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire);
+
     MotionStopSettlePublicationPayload payload{};
     MotionStopSettleSnapshot& snapshot = payload.snapshot;
     MotionEmergencyStopEvidence& emergency =
@@ -14249,8 +19447,9 @@ void MotionCore::PublishStopSettleEvidence() noexcept
     emergency.lastAppliedOwnerGeneration =
         m_emergencyStopLastAppliedOwnerLease.generation;
     emergency.requestPending =
-        m_emergencyStopAllPending.load(
-            std::memory_order_acquire);
+        (m_emergencyStopRequestPublication.load(
+            std::memory_order_acquire) &
+            EMERGENCY_STOP_REQUEST_PENDING) != 0ULL;
     emergency.requestInProgress =
         m_safetyRecoveryRequestInProgress.load(
             std::memory_order_acquire);
@@ -14741,6 +19940,26 @@ void MotionCore::PublishStopSettleEvidence() noexcept
     m_stopSettlePublicationGeneration.store(
         snapshot.publicationGeneration,
         std::memory_order_release);
+
+    const std::uint64_t drainRevocationGenerationAtExit =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint32_t drainRevocationPublishersAtExit =
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire);
+    if (drainRevocationPublishersAtEntry == 0U &&
+        drainRevocationPublishersAtExit == 0U &&
+        drainRevocationGenerationAtEntry ==
+        drainRevocationGenerationAtExit)
+    {
+        // The coherent bank above is a fresh RT observation of this exact
+        // request-generation. A publisher that starts after these checks
+        // changes either the in-progress count or current generation, so the
+        // exact-drain reader still fails closed at its exit seam.
+        m_executionDrainObservedRevocationGeneration.store(
+            drainRevocationGenerationAtEntry,
+            std::memory_order_release);
+    }
 }
 
 
@@ -15180,6 +20399,101 @@ MotionCore::GetCommandPathModeTransportSnapshot() const noexcept
 }
 
 
+MotionQueueTailTransactionSnapshot
+MotionCore::GetQueueTailTransactionSnapshot() const noexcept
+{
+    MotionQueueTailTransactionSnapshot snapshot{};
+    snapshot.snapshotCoherent = false;
+
+    for (std::size_t attempt = 0U; attempt < 8U; ++attempt)
+    {
+        const std::uint64_t begin =
+            m_queueTailWriteSequence.load(std::memory_order_acquire);
+        if ((begin & 1ULL) != 0ULL)
+        {
+            continue;
+        }
+
+        snapshot.writeSequence = begin;
+        snapshot.attempts =
+            m_queueTailAttempts.load(std::memory_order_relaxed);
+        snapshot.commandAccepted =
+            m_queueTailCommandAccepted.load(std::memory_order_relaxed);
+        snapshot.commandRejected =
+            m_queueTailCommandRejected.load(std::memory_order_relaxed);
+        snapshot.committed =
+            m_queueTailCommitted.load(std::memory_order_relaxed);
+        snapshot.rejectPreserved =
+            m_queueTailRejectPreserved.load(std::memory_order_relaxed);
+        snapshot.commandedMCSCommitted =
+            m_queueTailCommandedMCSCommitted.load(
+                std::memory_order_relaxed);
+        snapshot.lastQueuedPulseCommitted =
+            m_queueTailLastQueuedPulseCommitted.load(
+                std::memory_order_relaxed);
+        snapshot.rapidOverrideCommitted =
+            m_queueTailRapidOverrideCommitted.load(
+                std::memory_order_relaxed);
+        snapshot.endpointExact =
+            m_queueTailEndpointExact.load(std::memory_order_relaxed);
+        snapshot.captureBound =
+            m_queueTailCaptureBound.load(std::memory_order_relaxed);
+        snapshot.invalidInputs =
+            m_queueTailInvalidInputs.load(std::memory_order_relaxed);
+        snapshot.mismatches =
+            m_queueTailMismatches.load(std::memory_order_relaxed);
+        snapshot.lastTransactionSequence =
+            m_lastQueueTailTransactionSequence.load(
+                std::memory_order_relaxed);
+        snapshot.lastExecutionEpoch =
+            m_lastQueueTailExecutionEpoch.load(std::memory_order_relaxed);
+        snapshot.lastSegmentId =
+            m_lastQueueTailSegmentId.load(std::memory_order_relaxed);
+        snapshot.lastAxisMask =
+            m_lastQueueTailAxisMask.load(std::memory_order_relaxed);
+        snapshot.lastCommittedFingerprint =
+            m_lastQueueTailCommittedFingerprint.load(
+                std::memory_order_relaxed);
+
+        const std::uint64_t end =
+            m_queueTailWriteSequence.load(std::memory_order_acquire);
+        if (begin == end && (end & 1ULL) == 0ULL)
+        {
+            snapshot.writeSequence = end;
+            snapshot.snapshotCoherent = true;
+            break;
+        }
+    }
+
+    snapshot.accountingValid =
+        snapshot.snapshotCoherent &&
+        snapshot.attempts ==
+        snapshot.commandAccepted + snapshot.commandRejected &&
+        snapshot.commandAccepted == snapshot.committed &&
+        snapshot.commandRejected == snapshot.rejectPreserved &&
+        snapshot.committed == snapshot.commandedMCSCommitted &&
+        snapshot.committed == snapshot.lastQueuedPulseCommitted &&
+        snapshot.committed == snapshot.rapidOverrideCommitted &&
+        snapshot.committed == snapshot.endpointExact &&
+        snapshot.captureBound <= snapshot.committed &&
+        snapshot.invalidInputs <= snapshot.commandRejected &&
+        snapshot.mismatches == 0ULL;
+
+    snapshot.authoritative = true;
+    snapshot.shadowOnly = false;
+    snapshot.cutoverAttempted = snapshot.attempts != 0ULL;
+    snapshot.runtimeInfluence = snapshot.committed != 0ULL;
+    snapshot.ready =
+        snapshot.committed != 0ULL &&
+        snapshot.captureBound == snapshot.committed &&
+        snapshot.accountingValid &&
+        snapshot.commandRejected == 0ULL &&
+        snapshot.invalidInputs == 0ULL &&
+        snapshot.mismatches == 0ULL;
+    return snapshot;
+}
+
+
 MotionLifecycleCommitReservationSnapshot
 MotionCore::GetLifecycleCommitReservationSnapshot() const noexcept
 {
@@ -15305,6 +20619,117 @@ bool MotionCore::IsGroupNCDrained() const noexcept
             counters) &&
         snapshot.runtimeCycleValid &&
         snapshot.groupDrained;
+}
+
+
+bool MotionCore::HasExactExecutionDrainAcknowledgement(
+    MotionExecutionEpoch executionEpoch,
+    const MotionOwnerLease& ownerLease) const noexcept
+{
+    if (executionEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        !ownerLease.IsValid())
+    {
+        return false;
+    }
+
+    const std::uint64_t entryExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t entryOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t entryDrainRevocationGeneration =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint64_t entryObservedDrainRevocationGeneration =
+        m_executionDrainObservedRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint32_t entryDrainRevocationPublishers =
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire);
+    const MotionOwnerLease entryOwnerLease =
+        UnpackMotionOwnerState(entryOwnerState);
+    if ((entryExecutionPublication &
+        (EXECUTION_EPOCH_PUBLICATION_PENDING |
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+        UnpackExecutionEpochPublication(entryExecutionPublication) !=
+        executionEpoch ||
+        !entryOwnerLease.Matches(ownerLease) ||
+        UnpackMotionOwnerSafetyHandshake(entryOwnerState) ||
+        UnpackMotionOwnerSafetyActionPending(entryOwnerState) ||
+        (entryOwnerState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        UnpackMotionOwnerSafetyRequestTicket(entryOwnerState) !=
+        m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire) ||
+        entryDrainRevocationPublishers != 0U ||
+        entryDrainRevocationGeneration !=
+        entryObservedDrainRevocationGeneration ||
+        HasPendingSafetyOrRecoveryRequests())
+    {
+        return false;
+    }
+
+    MotionNCSettleSnapshot snapshot{};
+    MotionNCSettleCounters counters{};
+    if (!TryGetNCSettleEvidence(
+        MotionNCSettleProfile::GROUP_COMPLETION,
+        snapshot,
+        counters))
+    {
+        return false;
+    }
+
+    // This is an RT-published acknowledgement, not a live NC-side peek.  Its
+    // exact Epoch/Owner identity proves that ApplyPendingExecutionEpochChange
+    // has completed and that the drained observation does not belong to the
+    // preceding lifecycle generation.
+    if (snapshot.publicationGeneration == 0ULL ||
+        snapshot.profile != MotionNCSettleProfile::GROUP_COMPLETION ||
+        snapshot.executionEpoch != executionEpoch ||
+        snapshot.owner != ownerLease.owner ||
+        snapshot.ownerGeneration != ownerLease.generation ||
+        !snapshot.runtimeObserved ||
+        !snapshot.runtimeCycleValid ||
+        !snapshot.runtimeCycleContiguous ||
+        snapshot.groupActive ||
+        !snapshot.groupDrained ||
+        snapshot.safetyOrRecoveryPending ||
+        snapshot.commandQueueDepth != 0U ||
+        snapshot.commandIngressDepth != 0U ||
+        snapshot.commandReplayDepth != 0U)
+    {
+        return false;
+    }
+
+    // Close the publication-read seam with exact packed-word equality.  Split
+    // getters could otherwise observe E, then miss a complete E+1 publish/apply
+    // that clears PENDING again before the final boolean check.
+    const std::uint64_t exitExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t exitOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t exitDrainRevocationGeneration =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint64_t exitObservedDrainRevocationGeneration =
+        m_executionDrainObservedRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint32_t exitDrainRevocationPublishers =
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire);
+    return
+        exitExecutionPublication == entryExecutionPublication &&
+        exitOwnerState == entryOwnerState &&
+        exitDrainRevocationPublishers == 0U &&
+        exitDrainRevocationGeneration ==
+        entryDrainRevocationGeneration &&
+        exitObservedDrainRevocationGeneration ==
+        entryObservedDrainRevocationGeneration &&
+        exitDrainRevocationGeneration ==
+        exitObservedDrainRevocationGeneration &&
+        (exitExecutionPublication &
+            (EXECUTION_EPOCH_PUBLICATION_PENDING |
+                EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL &&
+        !HasPendingSafetyOrRecoveryRequests();
 }
 
 

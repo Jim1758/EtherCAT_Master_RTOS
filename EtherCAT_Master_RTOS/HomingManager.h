@@ -53,6 +53,14 @@ class HomingManager
 public:
     static constexpr int HOME_AXIS_COUNT = 8;
 
+    enum class ResumeResult : std::uint8_t
+    {
+        REJECTED = 0,
+        DEFERRED,
+        APPLIED,
+        SUPERSEDED
+    };
+
 
     // ========================================================
     // Constructor
@@ -152,7 +160,7 @@ public:
     bool RequestHold();
 
     // Cycle Start：從 PAUSED 恢復；若仍在減速，先排入 Resume Request。
-    bool Resume();
+    ResumeResult Resume() noexcept;
 
     // Reset / Abort：受控停止後清除尚未完成的 HOME Runtime，不可恢復。
     void Cancel();
@@ -352,7 +360,8 @@ private:
 
     void ProcessCancel();
     void ProcessHold(double cycleTimeSec);
-    void ResumeFromPaused();
+    ResumeResult TryResumeFromPaused() noexcept;
+    void ClearResumeRequest() noexcept;
 
     bool MonitorSwitchDuringHold(int axisIndex, AxisContext& axis);
     bool MonitorReferenceDuringHold(int axisIndex, AxisContext& axis);
@@ -476,6 +485,20 @@ private:
     // Cycle Start 可能在 Hold 減速完成前先按下。
     // 此旗標讓 HomingManager 在所有軸真正停止後自動恢復。
     bool m_resumeRequested =
+        false;
+
+    // Immutable Alarm/Motion identity captured by the operator Cycle Start.
+    // A queued HOME resume may wait through controlled deceleration, but it
+    // must never recapture a newer post-Alarm baseline and resume implicitly.
+    std::uint32_t m_resumeAlarmUpdateCount =
+        0U;
+
+    std::uint64_t m_resumeAlarmIntentBaseState =
+        0ULL;
+
+    MotionOwnerLease m_resumeHomeMotionLease{};
+
+    bool m_resumeAdmissionTicketValid =
         false;
 
 

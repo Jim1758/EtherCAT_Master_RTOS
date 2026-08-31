@@ -138,7 +138,12 @@ namespace GCodeHandlers
         // 此時 axisProgrammed 的 XYZ 絕對都是 true 了！轉換引擎才會真的去算旋轉！
         // =========================================================
         double targetMCS[8] = { 0.0 };
-        nc->CoordSys.Transform_WCS_to_MCS(axisTarget, axisProgrammed, targetMCS);
+        // K.6.2 preview only: commandedMCS remains unchanged until the
+        // matching Motion command has been accepted by the ingress queue.
+        nc->CoordSys.Preview_WCS_to_MCS(
+            axisTarget,
+            axisProgrammed,
+            targetMCS);
 
 
 
@@ -208,15 +213,14 @@ namespace GCodeHandlers
         // =========================================================
         // 🌟 【新增邏輯】讀取 G00 的專屬倍率
         // =========================================================
-        double rapidOverride = 1.0; // 預設 100%
+        double rapidOverrideCandidate =
+            nc->GetMotion().G00_overrideRatio;
 
         // 檢查有沒有下達 F 參數 (例如 G00 X100 F20)
         if (block.has('F'))
         {
             double f_val = block.val('F');
-            nc->GetMotion().G00_overrideRatio = f_val / 100.0;
-
-
+            rapidOverrideCandidate = f_val / 100.0;
         }
         else
         {
@@ -227,29 +231,56 @@ namespace GCodeHandlers
 
         // 6. 下達移動命令！(底層會自動套用 G00 的快速定位 PID 與速度)
 
-        if (block.has('P') && block.val('P') == 1.0)
+        const bool continuousPath =
+            block.has('P') && block.val('P') == 1.0;
+        bool motionAccepted = false;
+
+        if (continuousPath)
         {
-
-            nc->GetMotion().G00_Move(
-                activeAxes,
-                targetPos,
-                BufferMode::BUFFERED,
-                MotionCommandPathMode::CONTINUOUS);//連續路徑
-
-
-             // 🔓 解開第二道鎖：
-             // 回傳 nullptr 代表「不要等我走完，大腦請立刻去讀下一行！」
-             // 這個 G00 包裹會乖乖排在倉庫裡，第二個 G00 也會馬上被送進來排隊。
-
-            return nullptr;
+            motionAccepted =
+                nc->GetMotion().TryG00MoveTransactionalTail(
+                    activeAxes,
+                    targetPos,
+                    BufferMode::BUFFERED,
+                    MotionCommandPathMode::CONTINUOUS,
+                    rapidOverrideCandidate,
+                    nc->CoordSys.commandedMCS);//連續路徑
         }
         else
         {
-            nc->GetMotion().G00_Move(
-                activeAxes,
-                targetPos,
-                BufferMode::ABORTING,
-                MotionCommandPathMode::EXACT_STOP);//不連續
+            motionAccepted =
+                nc->GetMotion().TryG00MoveTransactionalTail(
+                    activeAxes,
+                    targetPos,
+                    BufferMode::ABORTING,
+                    MotionCommandPathMode::EXACT_STOP,
+                    rapidOverrideCandidate,
+                    nc->CoordSys.commandedMCS);//不連續
+        }
+
+        // K.6.2: an ingress rejection is a failed NC dispatch.  Never let a
+        // P1 block return nullptr (or an ordinary block wait for a command
+        // that does not exist), because either path could commit the PC past
+        // an unaccepted G00.  Queue-full already materializes 3019; all other
+        // producer-side integrity rejections are contained by 3021.
+        if (!motionAccepted)
+        {
+            if (!AlarmManager::GetInstance().HasAlarm())
+            {
+                AlarmManager::GetInstance().Trigger(
+                    AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+            }
+
+            nc->ChangeState(NCState::ALARM);
+            return [](NCManager*) { return true; };
+        }
+
+        if (continuousPath)
+        {
+            // 🔓 解開第二道鎖：
+            // 回傳 nullptr 代表「不要等我走完，大腦請立刻去讀下一行！」
+            // 這個 G00 包裹會乖乖排在倉庫裡，第二個 G00 也會馬上被送進來排隊。
+            return nullptr;
         }
 
 

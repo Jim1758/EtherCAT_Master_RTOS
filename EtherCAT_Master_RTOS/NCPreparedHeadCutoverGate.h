@@ -6,7 +6,7 @@
 #include <type_traits>
 
 // =============================================================================
-// Stage NC-0.2K.3 - Prepared Head Exact-Value Controlled Cutover
+// Stage NC-0.2K.3.1 - Ordinary G00 Exact-Value Cutover Expansion
 //
 // The unchanged Runtime parser / expression resolver remains mandatory.  This
 // gate may only replace that already-resolved value with the exact Prepared
@@ -142,7 +142,16 @@ struct NCPreparedHeadCutoverContext
     NCPreparedSourceIdentity runtimeSource{};
     int sourcePC = -1;
     int sourceLineNumber = 0;
+    // K.4 captures this exact live modal image and immutable Queue head before
+    // the unchanged Runtime ResolveBlock call.  K.2 and K.3 then consume the
+    // same context; they must not fetch a second head after resolution.
+    NCPreparedModalSnapshot runtimeModalBefore{};
+    bool capturedBeforeResolve = false;
+    bool runtimeModalBeforeValid = false;
     bool legacyDrainRequired = false;
+    // Set only after NCManager observes queue depth zero and group standstill
+    // for a required legacy barrier in the same producer-thread pass.
+    bool legacyDrainSatisfied = false;
     bool hasHead = false;
 };
 
@@ -297,7 +306,8 @@ public:
             ClassEligible(
                 context.head,
                 liveSource,
-                context.legacyDrainRequired);
+                context.legacyDrainRequired,
+                context.legacyDrainSatisfied);
         if (!m_snapshot.classEligible)
         {
             ++m_counters.classRejected;
@@ -596,21 +606,56 @@ private:
             equivalence.panelMask == PanelMask(source.panel);
     }
 
+    static bool HasAnyAxisAddress(const NCBlock& block) noexcept
+    {
+        return
+            block.has('X') || block.has('Y') || block.has('Z') ||
+            block.has('A') || block.has('B') || block.has('C') ||
+            block.has('U') || block.has('V') || block.has('W');
+    }
+
+    static bool ContainsStoredGCode(
+        const NCBlock& block,
+        int requiredCode) noexcept
+    {
+        if (block.gCount < 0 ||
+            block.gCount > NC_MAX_G_CODES_PER_BLOCK)
+        {
+            return false;
+        }
+
+        if (block.hasG && block.gCode == requiredCode)
+        {
+            return true;
+        }
+
+        for (int index = 0; index < block.gCount; ++index)
+        {
+            if (block.gCodes[index] == requiredCode)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     static bool ClassEligible(
         const NCPreparedBlockEntrySnapshot& head,
         const NCPreparedSourceIdentity& runtimeSource,
-        bool legacyDrainRequired) noexcept
+        bool legacyDrainRequired,
+        bool legacyDrainSatisfied) noexcept
     {
         if (runtimeSource.scope != NCProgramScope::MEMORY ||
             runtimeSource.frameId != NC_PROGRAM_FRAME_ID_INVALID ||
             runtimeSource.panel.blockSkipEnabled ||
             runtimeSource.panel.singleBlockEnabled ||
             runtimeSource.panel.optionalStopEnabled ||
+            head.classification.legacyDrainRequired !=
             legacyDrainRequired ||
+            (legacyDrainRequired && !legacyDrainSatisfied) ||
             !head.classification.literalResolved ||
             !head.classification.modalAfterValid ||
             head.classification.planningStopsHere ||
-            head.classification.legacyDrainRequired ||
             head.classification.barrierFlags !=
             NC_PREPARED_BARRIER_FLAG_NONE ||
             head.modalBefore.modalMacroActive ||
@@ -625,15 +670,28 @@ private:
         if (head.classification.blockClass ==
             NCPreparedBlockClass::PURE_MODAL_COPY)
         {
-            return true;
+            // Preserve the original K.3 modal-copy boundary exactly.
+            return !legacyDrainRequired;
         }
 
-        return
-            head.classification.blockClass ==
-            NCPreparedBlockClass::MOTION_SHADOW &&
-            head.classification.primaryGCode == 0 &&
-            head.preparedBlock.has('P') &&
-            head.preparedBlock.val('P') == 1.0;
+        if (head.classification.blockClass !=
+            NCPreparedBlockClass::MOTION_SHADOW ||
+            head.classification.primaryGCode != 0 ||
+            !ContainsStoredGCode(head.preparedBlock, 0))
+        {
+            return false;
+        }
+
+        // Preserve the complete prior K.3 P1 admission and its no-drain
+        // contract.  K.3.1 adds only a no-P literal G00 that carries at least
+        // one real axis and has completed the mandatory legacy drain.  These
+        // explicit policy checks remain fail-closed even if both classifiers
+        // were ever to agree on the wrong drain requirement.
+        return head.preparedBlock.has('P')
+            ? head.preparedBlock.val('P') == 1.0 &&
+            !legacyDrainRequired
+            : HasAnyAxisAddress(head.preparedBlock) &&
+            legacyDrainRequired && legacyDrainSatisfied;
     }
 
     static bool EquivalenceReady(

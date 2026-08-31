@@ -14,6 +14,7 @@
 #include "CompensationEngine.h" // 引入剛寫好的標頭檔
 #include "SHM_Types.h"
 #include "MotionExecutionContract.h"
+#include "MotionCommandPathModeTransport.h"
 #include "MotionCommandRing.h"
 #include "MotionFeedbackRing.h"
 #include "MotionAxisCommandMailbox.h"
@@ -520,12 +521,31 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     std::uint8_t sourceMirrorMask = 0U;
     bool sourceG16Active = false;
     bool sourceG162Active = true;
+
+    // Stage NC-0.2K.6 / K.6.1: command-local G00 terminal policy.
+    // K.6 transports this byte; K.6.1 makes the authorized 250 us Consumer
+    // the only normal-G00 writer of the effective planner PathMode.
+    MotionCommandPathMode commandPathMode =
+        MotionCommandPathMode::UNSPECIFIED;
     int sourcePlaneMode = 17;
 };
 
 static_assert(
     std::is_trivially_copyable<MotionCommand>::value,
     "MotionCommand must remain trivially copyable for the fixed SPSC ring.");
+static_assert(
+    std::is_standard_layout<MotionCommand>::value,
+    "MotionCommand layout must remain inspectable across the fixed transport.");
+
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
+static_assert(
+    sizeof(MotionCommand) == 560U && alignof(MotionCommand) == 8U,
+    "K.6 must consume existing x64 padding without changing MotionCommand ABI size.");
+static_assert(
+    offsetof(MotionCommand, commandPathMode) == 555U &&
+    offsetof(MotionCommand, sourcePlaneMode) == 556U,
+    "K.6 commandPathMode must occupy the accepted x64 tail-padding byte.");
+#endif
 
 // Stage NC-0.2D：NC Producer 在單一 Program Block 派送期間，
 // 固定容量收集該 Block 建立的 Segment Identity。它只存在 Producer
@@ -535,6 +555,8 @@ constexpr std::size_t MOTION_PROGRAM_BLOCK_CAPTURE_CAPACITY = 32U;
 struct MotionProgramBlockSubmission
 {
     MotionExecutionIdentity identity{};
+    MotionCommandPathMode commandPathMode =
+        MotionCommandPathMode::UNSPECIFIED;
     bool producerAccepted = false;
     MotionRejectReason immediateRejectReason = MotionRejectReason::NONE;
 };
@@ -1507,7 +1529,15 @@ public:
 
     //多軸插補功能區塊--------------------------------------------------------------------
 
-    void LineMove(const std::vector<int>& axes, const std::vector<double>& targetPos, double targetVel, double acc_time, double dec_time, BufferMode mode = BufferMode::ABORTING);// 直線插補指令
+    void LineMove(
+        const std::vector<int>& axes,
+        const std::vector<double>& targetPos,
+        double targetVel,
+        double acc_time,
+        double dec_time,
+        BufferMode mode = BufferMode::ABORTING,
+        MotionCommandPathMode commandPathMode =
+        MotionCommandPathMode::UNSPECIFIED);// 直線插補指令
     void ArcMove(const std::vector<int>& axes, const std::vector<double>& targetPos, const std::vector<double>& centerPos, int dir, double targetVel, double acc_time, double dec_time, BufferMode mode = BufferMode::ABORTING);// 圓弧插補指令
     void UpdateInterpolation();// 插補群組更新 (計算虛擬主軸並分配位移給實體軸)
     void InitVirtualAxisSmooth(int windowSize); // 初始化虛擬主軸的 S-Curve 平滑設定
@@ -1824,6 +1854,11 @@ public:
 
     MotionP1HandoverSafetySnapshot
         GetP1HandoverSafetySnapshot() const noexcept;
+
+    // Stage NC-0.2K.6: aggregate producer/consumer evidence only.  The command
+    // field is not authoritative for planning until a later controlled cutover.
+    MotionCommandPathModeTransportSnapshot
+        GetCommandPathModeTransportSnapshot() const noexcept;
 
     MotionLifecycleCommitReservationSnapshot
         GetLifecycleCommitReservationSnapshot() const noexcept;
@@ -2422,6 +2457,41 @@ private:
     std::atomic<std::uint64_t> m_commandReplayOverflowCount{ 0ULL };
     std::atomic<MotionSegmentId> m_lastRejectedSegmentId{ MOTION_SEGMENT_ID_INVALID };
 
+    // Stage NC-0.2K.6 / K.6.1: Producer and Consumer update separate atomic
+    // counters.  K.6.1 authority decisions remain bounded, allocation-free and
+    // owned by the existing 250 us Consumer.
+    std::atomic<std::uint64_t> m_pathModeProducerSequence{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeProducerAccepted{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeProducerRejected{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeProducerExactStop{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeProducerContinuous{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeProducerUnspecified{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeProducerInvalid{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeProducerFingerprint{
+        MOTION_COMMAND_PATH_MODE_FINGERPRINT_SEED };
+
+    std::atomic<std::uint64_t> m_pathModeConsumerSequence{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeConsumerCommitted{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeConsumerIngressCommitted{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeConsumerReplayCommitted{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeConsumerExactStop{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeConsumerContinuous{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeConsumerUnspecified{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeConsumerInvalid{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeConsumerFingerprint{
+        MOTION_COMMAND_PATH_MODE_FINGERPRINT_SEED };
+    std::atomic<std::uint64_t> m_pathModeLegacyMatches{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeLegacyMismatches{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeDriverOverrideObservations{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeAuthorityAttempts{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeAuthorityApplied{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeAuthorityExactStop{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeAuthorityContinuous{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeAuthorityLegacyFallbacks{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeAuthorityReplayBypasses{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeAuthorityDriverBlocks{ 0ULL };
+    std::atomic<std::uint64_t> m_pathModeAuthorityInvalidRejects{ 0ULL };
+
     std::atomic<MotionCommandSource> m_pendingCommandSource{ MotionCommandSource::UNKNOWN };
 
     // Stage NC-0.2D：只由 Motion Command Producer 使用。
@@ -2429,9 +2499,20 @@ private:
     bool m_programBlockMotionCaptureActive = false;
 
     void RecordProgramBlockMotionSubmission(
-        const MotionExecutionIdentity& identity,
+        const MotionCommand& command,
         bool producerAccepted,
         MotionRejectReason immediateRejectReason) noexcept;
+    void ObserveCommandPathModeProducer(
+        const MotionCommand& command,
+        bool accepted) noexcept;
+    void CommitCommandPathModeConsumerAuthority(
+        const MotionCommand& command,
+        MotionCommandPathModeAuthorityDecision decision) noexcept;
+    void ObserveCommandPathModeAuthorityReject(
+        MotionCommandPathModeAuthorityDecision decision) noexcept;
+    bool RejectFrontCommandForPathModeAuthority(
+        const MotionCommand& peekedCommand,
+        MotionCommandPathModeAuthorityDecision decision) noexcept;
     void RejectInvalidProducerMotionCommand(
         MotionCommand command,
         MotionExecutionEpoch executionEpoch,
@@ -2681,7 +2762,15 @@ private:
 public:
 
     //G碼使用-------------------------------------------------------------- 
-    void G00_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G00 快速定位 API
+    void G00_Move(
+        const std::vector<int>& axes,
+        const std::vector<double>& targetPos,
+        BufferMode mode = BufferMode::ABORTING);// G00 快速定位 API
+    void G00_Move(
+        const std::vector<int>& axes,
+        const std::vector<double>& targetPos,
+        BufferMode mode,
+        MotionCommandPathMode commandPathMode);// K.6 explicit transport contract
     void G07_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G07 快速定位 API
     void G161_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G161 快速定位 API
     void G53_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G53 機械定位 API

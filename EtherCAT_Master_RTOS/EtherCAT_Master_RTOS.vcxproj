@@ -123,6 +123,7 @@
     <ClInclude Include="MacroEngine.h" />
     <ClInclude Include="MacroParser.h" />
     <ClInclude Include="MotionAxisCommandMailbox.h" />
+    <ClInclude Include="MotionCommandPathModeTransport.h" />
     <ClInclude Include="MotionCommandRing.h" />
     <ClInclude Include="MotionCore.h" />
     <ClInclude Include="MotionExecutionContract.h" />
@@ -136,11 +137,14 @@
     <ClInclude Include="NCGCodeSemantics.h" />
     <ClInclude Include="NCLifecycleInterruptionBoundary.h" />
     <ClInclude Include="NCManager.h" />
+    <ClInclude Include="NCOrdinaryG00BufferedExactStopAdmissionShadow.h" />
     <ClInclude Include="NCPLCManager.h" />
     <ClInclude Include="NCPLCMap.h" />
     <ClInclude Include="NCPreparedBlockQueueShadow.h" />
     <ClInclude Include="NCPreparedHeadCutoverGate.h" />
     <ClInclude Include="NCPreparedHeadEquivalenceShadow.h" />
+    <ClInclude Include="NCPreparedHeadPreResolveAdmissionShadow.h" />
+    <ClInclude Include="NCPreparedHeadResolverBypassGate.h" />
     <ClInclude Include="NCProgramCache.h" />
     <ClInclude Include="NCProgramEndBoundary.h" />
     <ClInclude Include="NCResetReleaseGate.h" />

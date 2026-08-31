@@ -1725,6 +1725,50 @@ void NCManager::ProcessExecutionEngine()
             {
                 effectiveReady =
                     ApplyCompletionWaitBoundaryGuard(legacyReady);
+
+                // Stage NC-0.2K.4.2: ordinary no-P G00 must consume the real
+                // Stage F callback/dual-key result before the callback is
+                // cleared or PC can retire.  Other callback lanes are no-ops.
+                const NCBlockDispatchId completionDispatchId =
+                    m_waitingBlockDispatchId;
+                const bool resolverBypassCompletionValid =
+                    m_preparedHeadResolverBypassGate.
+                    ObserveCompletionWaitSample(
+                        completionDispatchId,
+                        m_blockCompletionBoundaryObserver.
+                        GetLastSnapshot(),
+                        legacyReady,
+                        effectiveReady);
+                if (!resolverBypassCompletionValid)
+                {
+                    m_ordinaryG00AdmissionShadow.
+                        ObserveRuntimeFailure(completionDispatchId);
+                    const NCPreparedResolverBypassSnapshot bypassSnapshot =
+                        m_preparedHeadResolverBypassGate.GetSnapshot();
+                    if (completionDispatchId !=
+                        NC_BLOCK_DISPATCH_ID_INVALID)
+                    {
+                        m_blockLifecycleLedger.MarkNCDispatchFailed(
+                            completionDispatchId,
+                            static_cast<std::uint32_t>(
+                                AlarmManager::SYNTAX_ERROR));
+                    }
+                    AlarmManager::GetInstance().Trigger(
+                        AlarmManager::SYNTAX_ERROR,
+                        bypassSnapshot.sourceLineNumber);
+                    m_state = NCState::ALARM;
+                    return;
+                }
+
+                // Stage NC-0.2K.5 is read-only.  It correlates the accepted
+                // K.4.2 ordinary callback/dual-key completion with the same
+                // immutable candidate, before callback clear and PC advance.
+                m_ordinaryG00AdmissionShadow.
+                    ObserveLegacyCompletionSample(
+                        completionDispatchId,
+                        m_preparedHeadResolverBypassGate.GetSnapshot(),
+                        legacyReady,
+                        effectiveReady);
             }
 
             // Stage NC-0.2I.1 / I.4：先由 Shadow 證明完成點，再讓
@@ -2140,48 +2184,166 @@ void NCManager::ProcessExecutionEngine()
                 ClearPreDispatchBarrier();
             }
 
-            NCBlock block{};
-            NCExpressionResolveError resolveError =
-                NCExpressionResolveError::NONE;
-            if (!NCExpressionResolver::ResolveBlock(
-                parsedBlock,
-                MathParser,
-                block,
-                resolveError))
-            {
-                // K.2 must see the asymmetric outcome where K.1 accepted a
-                // literal Prepared head but the unchanged Runtime resolver
-                // rejected it.  This remains diagnostic-only.
-                ObservePreparedHeadEquivalenceResolveFailure(
+            // Stage NC-0.2K.4.2: capture one immutable head before either
+            // value-source path is chosen.  A true K.4.2 decision is the only
+            // path that skips the resolver; a rejection enters the accepted
+            // K.4 legacy chain without changing its internal order.
+            NCPreparedHeadCutoverContext preparedCutoverContext =
+                CapturePreparedHeadBeforeResolve(
                     currentPC,
                     sourceLineNumber);
+            std::uint64_t preResolveDrainDepth = 0ULL;
+            bool preResolveGroupStandstill = true;
+            if (preparedCutoverContext.legacyDrainRequired)
+            {
+                preResolveDrainDepth =
+                    static_cast<std::uint64_t>(
+                        m_motion.GetQueueSize());
+                preResolveGroupStandstill =
+                    m_motion.IsGroupNCDrained();
+                preparedCutoverContext.legacyDrainSatisfied =
+                    preResolveDrainDepth == 0ULL &&
+                    preResolveGroupStandstill;
+            }
+            const auto isOrdinaryProgramAxis = [](char letter) noexcept
+            {
+                return
+                    letter == 'X' || letter == 'Y' || letter == 'Z' ||
+                    letter == 'A' || letter == 'B' || letter == 'C' ||
+                    letter == 'U' || letter == 'V' || letter == 'W';
+            };
+            bool ordinaryConfiguredAxisPresent = false;
+            if (preparedCutoverContext.hasHead)
+            {
+                // The ordinary no-P lane may bypass only when the immutable
+                // Prepared block addresses at least one axis that this
+                // runtime actually maps and enables.  This keeps an
+                // unconfigured U/V/W-only line on the accepted legacy path.
+                const int axisSlotCount = static_cast<int>(
+                    sizeof(m_axisNames) / sizeof(m_axisNames[0]));
+                for (int axisIndex = 0;
+                    axisIndex < axisSlotCount;
+                    ++axisIndex)
+                {
+                    const char axisLetter = GetAxisName(axisIndex);
+                    if (isOrdinaryProgramAxis(axisLetter) &&
+                        preparedCutoverContext.head.preparedBlock.has(
+                            axisLetter) &&
+                        m_motion.GetAxisContext(axisIndex).isExist)
+                    {
+                        ordinaryConfiguredAxisPresent = true;
+                        break;
+                    }
+                }
+            }
+            NCBlock block{};
+            const bool preparedResolverBypassed =
+                m_preparedHeadResolverBypassGate.TrySelectPreparedBlock(
+                    preparedCutoverContext,
+                    parsedBlock,
+                    m_preparedHeadEquivalenceShadow.GetCounters(),
+                    m_preparedHeadCutoverGate.GetSnapshot(),
+                    m_preparedHeadCutoverGate.GetCounters(),
+                    m_preparedHeadPreResolveAdmissionShadow.GetSnapshot(),
+                    m_preparedHeadPreResolveAdmissionShadow.GetCounters(),
+                    block,
+                    ordinaryConfiguredAxisPresent);
 
-                int alarmCode = AlarmManager::MATH_ERROR;
-                if (resolveError == NCExpressionResolveError::TOO_MANY_G_CODES)
-                {
-                    alarmCode = AlarmManager::G_code_Count_Error;
-                }
-                else if (resolveError == NCExpressionResolveError::TOO_MANY_M_CODES)
-                {
-                    alarmCode = AlarmManager::M_code_Count_Error;
-                }
-                else if (resolveError == NCExpressionResolveError::INVALID_VARIABLE_INDEX)
-                {
-                    alarmCode = AlarmManager::MACRO_VARIABLE_INDEX_OUT_OF_RANGE;
-                }
-                else if (resolveError == NCExpressionResolveError::INVALID_CODE_VALUE ||
-                    resolveError == NCExpressionResolveError::INVALID_PARSED_BLOCK)
-                {
-                    alarmCode = AlarmManager::SYNTAX_ERROR;
-                }
+            const NCPreparedResolverBypassSnapshot
+                preparedResolverBypassSelection =
+                m_preparedHeadResolverBypassGate.GetSnapshot();
 
-                markDispatchFailed(
-                    static_cast<std::uint32_t>(alarmCode));
-                AlarmManager::GetInstance().Trigger(
-                    alarmCode,
-                    sourceLineNumber);
-                m_state = NCState::ALARM;
+            // Stage NC-0.2K.5 observes the K.4.2 decision only.  Its result is
+            // deliberately not used by Resolver selection, barrier handling,
+            // ExecuteBlock, callback assignment, Commit, or PC control.
+            m_ordinaryG00AdmissionShadow.ObserveResolverDecision(
+                preparedCutoverContext,
+                preparedResolverBypassSelection,
+                preparedResolverBypassed,
+                preResolveDrainDepth,
+                preResolveGroupStandstill,
+                ordinaryConfiguredAxisPresent);
+            if (!preparedResolverBypassed &&
+                preparedResolverBypassSelection.decision ==
+                NCPreparedResolverBypassDecision::WAIT_LEGACY_DRAIN)
+            {
+                // The ordinary lane is already qualified, so this exact token
+                // waits before Resolver/K.2/K.3/K.4 and cannot leave a
+                // synthetic legacy pending token behind.
+                ObservePreDispatchBarrier(
+                    NCPreDispatchBarrierKind::G_CODE_BARRIER,
+                    currentPC,
+                    sourceLineNumber,
+                    -1,
+                    preResolveDrainDepth,
+                    preResolveGroupStandstill);
                 return;
+            }
+
+            if (!preparedResolverBypassed)
+            {
+                // Stage NC-0.2K.4 remains an observation-only oracle on the
+                // complete legacy path.  Bypassed tokens never call this
+                // observer, so K.4 cannot retain a synthetic pending token.
+                (void)m_preparedHeadPreResolveAdmissionShadow.
+                    ObserveBeforeResolve(
+                        preparedCutoverContext,
+                        m_preparedHeadEquivalenceShadow.GetCounters(),
+                        m_preparedHeadCutoverGate.GetSnapshot(),
+                        m_preparedHeadCutoverGate.GetCounters());
+
+                NCExpressionResolveError resolveError =
+                    NCExpressionResolveError::NONE;
+                if (!NCExpressionResolver::ResolveBlock(
+                    parsedBlock,
+                    MathParser,
+                    block,
+                    resolveError))
+                {
+                    // K.2 must see the asymmetric outcome where K.1 accepted
+                    // a literal Prepared head but the Runtime resolver
+                    // rejected it.  This remains diagnostic-only.
+                    m_preparedHeadPreResolveAdmissionShadow.
+                        ObserveResolveFailure(
+                            preparedCutoverContext.runtimeSource,
+                            currentPC,
+                            sourceLineNumber);
+                    ObservePreparedHeadEquivalenceResolveFailure(
+                        preparedCutoverContext);
+
+                    int alarmCode = AlarmManager::MATH_ERROR;
+                    if (resolveError ==
+                        NCExpressionResolveError::TOO_MANY_G_CODES)
+                    {
+                        alarmCode = AlarmManager::G_code_Count_Error;
+                    }
+                    else if (resolveError ==
+                        NCExpressionResolveError::TOO_MANY_M_CODES)
+                    {
+                        alarmCode = AlarmManager::M_code_Count_Error;
+                    }
+                    else if (resolveError ==
+                        NCExpressionResolveError::INVALID_VARIABLE_INDEX)
+                    {
+                        alarmCode =
+                            AlarmManager::MACRO_VARIABLE_INDEX_OUT_OF_RANGE;
+                    }
+                    else if (resolveError ==
+                        NCExpressionResolveError::INVALID_CODE_VALUE ||
+                        resolveError ==
+                        NCExpressionResolveError::INVALID_PARSED_BLOCK)
+                    {
+                        alarmCode = AlarmManager::SYNTAX_ERROR;
+                    }
+
+                    markDispatchFailed(
+                        static_cast<std::uint32_t>(alarmCode));
+                    AlarmManager::GetInstance().Trigger(
+                        alarmCode,
+                        sourceLineNumber);
+                    m_state = NCState::ALARM;
+                    return;
+                }
             }
 
             singleBlockCandidateKind =
@@ -2218,20 +2380,54 @@ void NCManager::ProcessExecutionEngine()
                 isBarrier = true;
             }
 
+            // K.4.2 adds exactly one expected barrier lane: ordinary no-P G00.
+            // PURE_MODAL/P1 must remain no-barrier.  Ordinary must retain its
+            // exact K.1 drain classification and the pre-resolve drain proof.
+            const bool selectedOrdinaryG00 =
+                preparedResolverBypassed &&
+                preparedResolverBypassSelection.lane ==
+                NCPreparedResolverBypassLane::G00_NO_P &&
+                preparedCutoverContext.hasHead &&
+                preparedCutoverContext.legacyDrainRequired &&
+                preparedCutoverContext.legacyDrainSatisfied &&
+                preparedCutoverContext.head.classification.
+                legacyDrainRequired;
+            const bool selectedBarrierInvariant =
+                !preparedResolverBypassed ||
+                (selectedOrdinaryG00 ? isBarrier : !isBarrier);
+            if (!selectedBarrierInvariant)
+            {
+                m_preparedHeadResolverBypassGate.
+                    ObserveSelectedInvariantFailure();
+                m_ordinaryG00AdmissionShadow.
+                    ObserveRuntimeFailure(0ULL);
+                markDispatchFailed(
+                    static_cast<std::uint32_t>(
+                        AlarmManager::SYNTAX_ERROR));
+                AlarmManager::GetInstance().Trigger(
+                    AlarmManager::SYNTAX_ERROR,
+                    sourceLineNumber);
+                m_state = NCState::ALARM;
+                return;
+            }
+
             // Stage NC-0.2K.2: compare the exact Prepared head against the
             // unchanged Runtime-resolved value.  This is deliberately before
             // lifecycle creation, handler execution and every side effect.
             // A mismatch only closes future readiness; legacy execution below
             // remains available as the fail-closed Runtime path.
-            NCPreparedHeadCutoverContext preparedCutoverContext{};
-            const bool preparedEquivalencePending =
-                ObservePreparedHeadEquivalenceResolved(
-                    currentPC,
-                    sourceLineNumber,
-                    parsedBlock,
-                    block,
-                    isBarrier,
-                    preparedCutoverContext);
+            bool preparedEquivalencePending = false;
+            if (!preparedResolverBypassed)
+            {
+                preparedEquivalencePending =
+                    ObservePreparedHeadEquivalenceResolved(
+                        currentPC,
+                        sourceLineNumber,
+                        parsedBlock,
+                        block,
+                        isBarrier,
+                        preparedCutoverContext);
+            }
 
             if (isBarrier)
             {
@@ -2239,8 +2435,34 @@ void NCManager::ProcessExecutionEngine()
                     static_cast<std::uint64_t>(m_motion.GetQueueSize());
                 const bool groupStandstill =
                     m_motion.IsGroupNCDrained();
+                preparedCutoverContext.legacyDrainSatisfied =
+                    commandQueueDepth == 0ULL && groupStandstill;
                 if (commandQueueDepth > 0ULL || !groupStandstill)
                 {
+                    if (preparedResolverBypassed)
+                    {
+                        // Resolver selection is irreversible.  A drain race
+                        // after selection is a proof failure, never a retry.
+                        m_preparedHeadResolverBypassGate.
+                            ObserveSelectedInvariantFailure();
+                        m_ordinaryG00AdmissionShadow.
+                            ObserveRuntimeFailure(0ULL);
+                        markDispatchFailed(
+                            static_cast<std::uint32_t>(
+                                AlarmManager::SYNTAX_ERROR));
+                        AlarmManager::GetInstance().Trigger(
+                            AlarmManager::SYNTAX_ERROR,
+                            sourceLineNumber);
+                        m_state = NCState::ALARM;
+                        return;
+                    }
+
+                    m_preparedHeadPreResolveAdmissionShadow.
+                        ObserveLegacyDrainWait(
+                            preparedCutoverContext,
+                            m_preparedHeadEquivalenceShadow.GetSnapshot(),
+                            preparedEquivalencePending);
+
                     NCPreDispatchBarrierKind barrierKind =
                         NCPreDispatchBarrierKind::BLOCK_BARRIER;
                     int barrierMCode = -1;
@@ -2283,41 +2505,108 @@ void NCManager::ProcessExecutionEngine()
             }
             else
             {
+                preparedCutoverContext.legacyDrainSatisfied = true;
                 ClearPreDispatchBarrier();
             }
 
             const NCBlockDispatchId dispatchId = ensureBlockLifecycle();
-            const bool preparedEquivalenceDispatchBound =
-                preparedEquivalencePending &&
-                BindPreparedHeadEquivalenceDispatch(
+            bool preparedEquivalenceDispatchBound = false;
+            if (preparedResolverBypassed)
+            {
+                NCBlockLifecycleSnapshot bypassLedger{};
+                const bool bypassLedgerFound =
+                    m_blockLifecycleLedger.TryGetSnapshot(
+                        dispatchId,
+                        bypassLedger);
+                if (!m_preparedHeadResolverBypassGate.BindDispatch(
+                    preparedCutoverContext,
                     dispatchId,
-                    commitTarget);
+                    commitTarget,
+                    BuildPreparedBlockSourceIdentity(),
+                    bypassLedgerFound,
+                    bypassLedger.programTarget,
+                    bypassLedger.sourceLineNumber))
+                {
+                    m_ordinaryG00AdmissionShadow.
+                        ObserveRuntimeFailure(dispatchId);
+                    m_blockLifecycleLedger.MarkNCDispatchFailed(
+                        dispatchId,
+                        static_cast<std::uint32_t>(
+                            AlarmManager::SYNTAX_ERROR));
+                    AlarmManager::GetInstance().Trigger(
+                        AlarmManager::SYNTAX_ERROR,
+                        sourceLineNumber);
+                    m_state = NCState::ALARM;
+                    return;
+                }
+            }
+            else
+            {
+                preparedEquivalenceDispatchBound =
+                    preparedEquivalencePending &&
+                    BindPreparedHeadEquivalenceDispatch(
+                        dispatchId,
+                        commitTarget);
+            }
 
-            // Stage NC-0.2K.3: the legacy resolver has already run and the
+            // Stage NC-0.2K.3.1: the legacy resolver has already run and the
             // current Prepared head has already passed K.2 exact comparison,
             // the drain gate and exact Ledger Dispatch binding.  Only now may
             // a previously qualified session replace the value source.  A
             // rejection leaves block untouched and the legacy path continues.
             // EMPTY has no handler value to replace, so it remains a K.2
-            // proof only and is not counted as a K.3 use attempt.
-            if (preparedEquivalenceDispatchBound && !block.isEmpty)
+            // proof only and is not counted as a K.3 use attempt.  Ordinary
+            // literal G00 no longer requires the P1 admission sentinel.
+            bool lastMileValueExact = false;
+            bool preparedCutoverApplied = false;
+            if (!preparedResolverBypassed)
             {
-                NCBlock selectedBlock = block;
-                if (m_preparedHeadCutoverGate.SelectExactPreparedValue(
-                    preparedCutoverContext,
-                    m_preparedHeadEquivalenceShadow.GetSnapshot(),
-                    m_preparedHeadEquivalenceShadow.GetCounters(),
-                    BuildPreparedBlockSourceIdentity(),
-                    dispatchId,
+                lastMileValueExact =
+                    preparedEquivalenceDispatchBound &&
+                    !block.isEmpty &&
                     m_preparedHeadEquivalenceShadow.
                     RevalidateBoundPreparedValue(
                         preparedCutoverContext.head,
-                        block),
-                    block,
-                    selectedBlock))
+                        block);
+                if (preparedEquivalenceDispatchBound && !block.isEmpty)
                 {
-                    block = selectedBlock;
+                    NCBlock selectedBlock = block;
+                    preparedCutoverApplied =
+                        m_preparedHeadCutoverGate.SelectExactPreparedValue(
+                            preparedCutoverContext,
+                            m_preparedHeadEquivalenceShadow.GetSnapshot(),
+                            m_preparedHeadEquivalenceShadow.GetCounters(),
+                            BuildPreparedBlockSourceIdentity(),
+                            dispatchId,
+                            lastMileValueExact,
+                            block,
+                            selectedBlock);
+                    if (preparedCutoverApplied)
+                    {
+                        block = selectedBlock;
+                    }
                 }
+
+                // K.4's structural prediction is accepted only when the
+                // complete legacy/K.2/K.3 same-token path independently
+                // proves it.  K.4.1 records this as a pending per-lane
+                // qualification; it is not armed until post-Commit proof.
+                m_preparedHeadPreResolveAdmissionShadow.
+                    ObserveResolvedOutcome(
+                        preparedCutoverContext,
+                        m_preparedHeadEquivalenceShadow.GetSnapshot(),
+                        m_preparedHeadCutoverGate.GetSnapshot(),
+                        dispatchId,
+                        preparedEquivalencePending,
+                        preparedEquivalenceDispatchBound,
+                        lastMileValueExact,
+                        preparedCutoverApplied);
+                m_preparedHeadResolverBypassGate.ObserveLegacyConfirmation(
+                    preparedCutoverContext,
+                    m_preparedHeadCutoverGate.GetSnapshot(),
+                    m_preparedHeadPreResolveAdmissionShadow.GetSnapshot(),
+                    dispatchId,
+                    ordinaryConfiguredAxisPresent);
             }
 
             // Stage NC-0.2D：只在 NC Producer 執行緒收集此 Block 建立的
@@ -2348,7 +2637,17 @@ void NCManager::ProcessExecutionEngine()
 
             if (AlarmManager::GetInstance().HasAlarm())
             {
-                FailPreparedHeadEquivalenceRuntime(dispatchId);
+                if (preparedResolverBypassed)
+                {
+                    m_preparedHeadResolverBypassGate.
+                        ObserveRuntimeFailure(dispatchId);
+                    m_ordinaryG00AdmissionShadow.
+                        ObserveRuntimeFailure(dispatchId);
+                }
+                else
+                {
+                    FailPreparedHeadEquivalenceRuntime(dispatchId);
+                }
                 m_blockLifecycleLedger.MarkNCDispatchFailed(
                     dispatchId,
                     0U);
@@ -2393,7 +2692,17 @@ void NCManager::ProcessExecutionEngine()
             // G66 可能在這裡建立 Macro Frame；失敗時不可提交本行。
             if (AlarmManager::GetInstance().HasAlarm())
             {
-                FailPreparedHeadEquivalenceRuntime(dispatchId);
+                if (preparedResolverBypassed)
+                {
+                    m_preparedHeadResolverBypassGate.
+                        ObserveRuntimeFailure(dispatchId);
+                    m_ordinaryG00AdmissionShadow.
+                        ObserveRuntimeFailure(dispatchId);
+                }
+                else
+                {
+                    FailPreparedHeadEquivalenceRuntime(dispatchId);
+                }
                 m_blockLifecycleLedger.MarkNCDispatchFailed(
                     dispatchId,
                     0U);
@@ -2405,17 +2714,94 @@ void NCManager::ProcessExecutionEngine()
                 return;
             }
 
-            // 本行已完成 Runtime Resolve 與 NC Side Effect / Downstream Dispatch。
-            // Motion 實際完成仍由 Feedback / Physical PC 表示。
+            // 本行已完成已選定的 value-source path 與 NC Side Effect /
+            // Downstream Dispatch。Motion 實際完成仍由 Feedback /
+            // Physical PC 表示。
             commitCurrentLine();
 
-            if (preparedEquivalenceDispatchBound)
+            if (!preparedResolverBypassed &&
+                preparedEquivalenceDispatchBound)
             {
                 CompletePreparedHeadEquivalence(
                     dispatchId,
                     lineCommitSnapshot,
                     lineCommitSucceeded);
             }
+
+            NCBlockLifecycleSnapshot resolverBypassCommitLedger{};
+            const bool resolverBypassCommitLedgerFound =
+                m_blockLifecycleLedger.TryGetSnapshot(
+                    dispatchId,
+                    resolverBypassCommitLedger);
+            const bool resolverBypassCommitValid =
+                m_preparedHeadResolverBypassGate.ObserveProgramCommit(
+                    dispatchId,
+                    lineCommitSnapshot,
+                    BuildPreparedBlockModalSnapshot(),
+                    BuildPreparedBlockSourceIdentity(),
+                    m_waitCallback != nullptr,
+                    lineCommitSucceeded,
+                    resolverBypassCommitLedgerFound,
+                    resolverBypassCommitLedger.programCommitted,
+                    resolverBypassCommitLedger.programTarget,
+                    resolverBypassCommitLedger.programCommit,
+                    resolverBypassCommitLedger.sourceLineNumber);
+            if (preparedResolverBypassed &&
+                !resolverBypassCommitValid)
+            {
+                m_ordinaryG00AdmissionShadow.
+                    ObserveRuntimeFailure(dispatchId);
+                m_blockLifecycleLedger.MarkNCDispatchFailed(
+                    dispatchId,
+                    static_cast<std::uint32_t>(
+                        AlarmManager::SYNTAX_ERROR));
+                AlarmManager::GetInstance().Trigger(
+                    AlarmManager::SYNTAX_ERROR,
+                    sourceLineNumber);
+                m_state = NCState::ALARM;
+                return;
+            }
+
+            // K.5 reads the completed Producer capture and K.4.2 Commit
+            // snapshot.  It does not own either result and cannot change the
+            // callback, epoch, Motion queue, Commit, or Runtime state.
+            NCOrdinaryG00LegacyCommitEvidence ordinaryAdmissionEvidence{};
+            ordinaryAdmissionEvidence.dispatchId = dispatchId;
+            ordinaryAdmissionEvidence.commitSequence =
+                lineCommitSnapshot.sequence;
+            ordinaryAdmissionEvidence.currentExecutionEpoch =
+                static_cast<std::uint64_t>(
+                    m_motion.GetCurrentExecutionEpoch());
+            ordinaryAdmissionEvidence.submissionCount =
+                motionCapture.count;
+            ordinaryAdmissionEvidence.captureOverflow =
+                motionCapture.overflow;
+            ordinaryAdmissionEvidence.waitCallbackActive =
+                m_waitCallback != nullptr;
+            ordinaryAdmissionEvidence.commitSucceeded =
+                lineCommitSucceeded;
+            if (motionCapture.count == 1U)
+            {
+                const MotionProgramBlockSubmission& submission =
+                    motionCapture.submissions[0U];
+                ordinaryAdmissionEvidence.segmentExecutionEpoch =
+                    static_cast<std::uint64_t>(
+                        submission.identity.epoch);
+                ordinaryAdmissionEvidence.segmentId =
+                    static_cast<std::uint64_t>(
+                        submission.identity.segmentId);
+                ordinaryAdmissionEvidence.commandPathMode =
+                    submission.commandPathMode;
+                ordinaryAdmissionEvidence.producerAccepted =
+                    submission.producerAccepted;
+                ordinaryAdmissionEvidence.immediateRejectNone =
+                    submission.immediateRejectReason ==
+                    MotionRejectReason::NONE;
+            }
+            m_ordinaryG00AdmissionShadow.ObserveLegacyCommit(
+                preparedCutoverContext,
+                m_preparedHeadResolverBypassGate.GetSnapshot(),
+                ordinaryAdmissionEvidence);
 
             // Stage NC-0.2H：M00/M01/M98/M99/M02/M30 的 Post Action
             // 由 G/M Transaction 在所有同行動作與 Motion Ledger 完成後套用。
@@ -4214,6 +4600,8 @@ void NCManager::ObservePreparedBlockQueueShadow(
     {
         NCPreparedInvalidationReason reason =
             GetPreparedBlockInactiveReason();
+        const NCPreparedRuntimeProof inactiveProof =
+            BuildPreparedBlockRuntimeProof();
         if ((m_state == NCState::RUN || m_state == NCState::HOLD) &&
             !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))
         {
@@ -4226,11 +4614,20 @@ void NCManager::ObservePreparedBlockQueueShadow(
         else
         {
             m_preparedBlockQueueShadow.ObserveFinalProofAndInvalidate(
-                BuildPreparedBlockRuntimeProof(),
+                inactiveProof,
                 reason);
+            m_preparedHeadResolverBypassGate.ObserveUpstreamProof(
+                m_preparedBlockQueueShadow.GetSnapshot(),
+                m_preparedBlockQueueShadow.GetCounters(),
+                inactiveProof,
+                m_preparedHeadEquivalenceShadow.GetSnapshot(),
+                m_preparedHeadEquivalenceShadow.GetCounters());
         }
         m_preparedHeadEquivalenceShadow.ObserveQueueInactive(reason);
         m_preparedHeadCutoverGate.ObserveQueueInactive(reason);
+        m_preparedHeadPreResolveAdmissionShadow.ObserveQueueInactive(reason);
+        m_preparedHeadResolverBypassGate.ObserveQueueInactive(reason);
+        m_ordinaryG00AdmissionShadow.ObserveQueueInactive(reason);
         return;
     }
 
@@ -4268,6 +4665,12 @@ void NCManager::ObservePreparedBlockQueueShadow(
     {
         m_preparedBlockQueueShadow.FinishObservation();
         ObservePreparedHeadEquivalenceUpstreamProof(proof);
+        m_preparedHeadPreResolveAdmissionShadow.ObserveQueueInactive(
+            NCPreparedInvalidationReason::IDENTITY_INVALID);
+        m_preparedHeadResolverBypassGate.ObserveQueueInactive(
+            NCPreparedInvalidationReason::IDENTITY_INVALID);
+        m_ordinaryG00AdmissionShadow.ObserveQueueInactive(
+            NCPreparedInvalidationReason::IDENTITY_INVALID);
         return;
     }
 
@@ -4349,6 +4752,31 @@ void NCManager::ObservePreparedBlockQueueShadow(
 // MotionCore.  K.3 may later choose the already-compared Prepared value, but
 // this K.2 observer itself remains incapable of Runtime influence.
 // =============================================================================
+NCPreparedHeadCutoverContext
+NCManager::CapturePreparedHeadBeforeResolve(
+    int sourcePC,
+    int sourceLineNumber) const noexcept
+{
+    NCPreparedHeadCutoverContext context{};
+    context.queue = m_preparedBlockQueueShadow.GetSnapshot();
+    context.queueCounters = m_preparedBlockQueueShadow.GetCounters();
+    context.hasHead = m_preparedBlockQueueShadow.TryGetEntry(
+        0U,
+        context.head);
+    context.runtimeSource = BuildPreparedBlockSourceIdentity();
+    context.sourcePC = sourcePC;
+    context.sourceLineNumber = sourceLineNumber;
+    context.runtimeModalBefore = BuildPreparedBlockModalSnapshot();
+    context.capturedBeforeResolve = true;
+    context.runtimeModalBeforeValid =
+        context.runtimeModalBefore.imageValid;
+    context.legacyDrainRequired =
+        context.hasHead &&
+        context.head.classification.legacyDrainRequired;
+    context.legacyDrainSatisfied = !context.legacyDrainRequired;
+    return context;
+}
+
 bool NCManager::ObservePreparedHeadEquivalenceResolved(
     int sourcePC,
     int sourceLineNumber,
@@ -4357,20 +4785,16 @@ bool NCManager::ObservePreparedHeadEquivalenceResolved(
     bool legacyDrainRequired,
     NCPreparedHeadCutoverContext& cutoverContext) noexcept
 {
-    cutoverContext = NCPreparedHeadCutoverContext{};
-    cutoverContext.queue =
-        m_preparedBlockQueueShadow.GetSnapshot();
-    cutoverContext.queueCounters =
-        m_preparedBlockQueueShadow.GetCounters();
-    cutoverContext.hasHead =
-        m_preparedBlockQueueShadow.TryGetEntry(
-            0U,
-            cutoverContext.head);
-    cutoverContext.runtimeSource =
-        BuildPreparedBlockSourceIdentity();
-    cutoverContext.sourcePC = sourcePC;
-    cutoverContext.sourceLineNumber = sourceLineNumber;
+    // K.4 requires the immutable pre-resolve capture.  Do not fetch the Queue
+    // head or live modal image a second time after ResolveBlock.
+    if (!cutoverContext.capturedBeforeResolve ||
+        cutoverContext.sourcePC != sourcePC ||
+        cutoverContext.sourceLineNumber != sourceLineNumber)
+    {
+        return false;
+    }
     cutoverContext.legacyDrainRequired = legacyDrainRequired;
+    cutoverContext.legacyDrainSatisfied = !legacyDrainRequired;
 
     return m_preparedHeadEquivalenceShadow.ObserveResolvedHead(
         cutoverContext.queue,
@@ -4382,30 +4806,21 @@ bool NCManager::ObservePreparedHeadEquivalenceResolved(
         sourceLineNumber,
         parsedBlock,
         legacyBlock,
-        BuildPreparedBlockModalSnapshot(),
+        cutoverContext.runtimeModalBefore,
         legacyDrainRequired);
 }
 
 void NCManager::ObservePreparedHeadEquivalenceResolveFailure(
-    int sourcePC,
-    int sourceLineNumber) noexcept
+    const NCPreparedHeadCutoverContext& cutoverContext) noexcept
 {
-    const NCPreparedBlockQueueSnapshot queue =
-        m_preparedBlockQueueShadow.GetSnapshot();
-    const NCPreparedBlockQueueCounters queueCounters =
-        m_preparedBlockQueueShadow.GetCounters();
-    NCPreparedBlockEntrySnapshot head{};
-    const bool hasHead =
-        m_preparedBlockQueueShadow.TryGetEntry(0U, head);
-
     m_preparedHeadEquivalenceShadow.ObserveResolveFailure(
-        queue,
-        queueCounters,
-        hasHead,
-        head,
-        BuildPreparedBlockSourceIdentity(),
-        sourcePC,
-        sourceLineNumber);
+        cutoverContext.queue,
+        cutoverContext.queueCounters,
+        cutoverContext.hasHead,
+        cutoverContext.head,
+        cutoverContext.runtimeSource,
+        cutoverContext.sourcePC,
+        cutoverContext.sourceLineNumber);
 }
 
 void NCManager::ObservePreparedHeadEquivalenceUpstreamProof(
@@ -4424,6 +4839,16 @@ void NCManager::ObservePreparedHeadEquivalenceUpstreamProof(
         queueCounters,
         m_preparedHeadEquivalenceShadow.GetSnapshot(),
         m_preparedHeadEquivalenceShadow.GetCounters());
+    m_preparedHeadPreResolveAdmissionShadow.
+        ObserveActiveQueueSession(queue);
+    m_preparedHeadResolverBypassGate.ObserveUpstreamProof(
+        queue,
+        queueCounters,
+        proof,
+        m_preparedHeadEquivalenceShadow.GetSnapshot(),
+        m_preparedHeadEquivalenceShadow.GetCounters());
+    m_ordinaryG00AdmissionShadow.ObserveUpstreamProof(
+        m_preparedHeadResolverBypassGate.GetSnapshot());
 }
 
 bool NCManager::BindPreparedHeadEquivalenceDispatch(
@@ -4469,6 +4894,10 @@ void NCManager::FailPreparedHeadEquivalenceRuntime(
 {
     m_preparedHeadEquivalenceShadow.ObserveRuntimeFailure();
     m_preparedHeadCutoverGate.ObserveRuntimeFailure(dispatchId);
+    m_preparedHeadPreResolveAdmissionShadow.
+        ObserveConfirmedRuntimeFailure(dispatchId);
+    m_preparedHeadResolverBypassGate.
+        ObserveRuntimeFailure(dispatchId);
 }
 
 // =============================================================================

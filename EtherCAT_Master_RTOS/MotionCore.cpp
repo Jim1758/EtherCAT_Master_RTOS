@@ -2750,7 +2750,7 @@ MotionProgramBlockCapture MotionCore::EndProgramBlockMotionCapture() noexcept
 
 
 void MotionCore::RecordProgramBlockMotionSubmission(
-    const MotionExecutionIdentity& identity,
+    const MotionCommand& command,
     bool producerAccepted,
     MotionRejectReason immediateRejectReason) noexcept
 {
@@ -2769,9 +2769,365 @@ void MotionCore::RecordProgramBlockMotionSubmission(
     MotionProgramBlockSubmission& submission =
         m_programBlockMotionCapture.submissions[
             m_programBlockMotionCapture.count++];
-    submission.identity = identity;
+    submission.identity = command.execution;
+    submission.commandPathMode = command.commandPathMode;
     submission.producerAccepted = producerAccepted;
     submission.immediateRejectReason = immediateRejectReason;
+}
+
+
+static std::uint64_t FoldCommandPathModeTransportFingerprintValue(
+    std::uint64_t fingerprint,
+    std::uint64_t value) noexcept
+{
+    return (fingerprint ^ value) * 1099511628211ULL;
+}
+
+
+static std::uint64_t FoldCommandPathModeTransportFingerprint(
+    std::uint64_t fingerprint,
+    const MotionCommand& command) noexcept
+{
+    fingerprint = FoldCommandPathModeTransportFingerprintValue(
+        fingerprint,
+        static_cast<std::uint64_t>(command.execution.epoch));
+    fingerprint = FoldCommandPathModeTransportFingerprintValue(
+        fingerprint,
+        static_cast<std::uint64_t>(command.execution.segmentId));
+    fingerprint = FoldCommandPathModeTransportFingerprintValue(
+        fingerprint,
+        static_cast<std::uint64_t>(
+            static_cast<std::int64_t>(command.sourceLinePC)));
+    fingerprint = FoldCommandPathModeTransportFingerprintValue(
+        fingerprint,
+        static_cast<std::uint64_t>(command.commandPathMode));
+    fingerprint = FoldCommandPathModeTransportFingerprintValue(
+        fingerprint,
+        static_cast<std::uint64_t>(command.axisCount));
+
+    const int boundedAxisCount =
+        (command.axisCount < 0)
+        ? 0
+        : ((command.axisCount > MAX_AXES)
+            ? MAX_AXES
+            : command.axisCount);
+    for (int slot = 0; slot < boundedAxisCount; ++slot)
+    {
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(
+            fingerprint,
+            static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(command.axisIndices[slot])));
+    }
+    return fingerprint;
+}
+
+
+void MotionCore::ObserveCommandPathModeProducer(
+    const MotionCommand& command,
+    bool accepted) noexcept
+{
+    m_pathModeProducerSequence.fetch_add(
+        1ULL,
+        std::memory_order_acq_rel);
+
+    if (accepted)
+    {
+        m_pathModeProducerAccepted.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        m_pathModeProducerRejected.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+
+    if (!accepted)
+    {
+        m_pathModeProducerSequence.fetch_add(
+            1ULL,
+            std::memory_order_release);
+        return;
+    }
+
+    switch (command.commandPathMode)
+    {
+    case MotionCommandPathMode::EXACT_STOP:
+        m_pathModeProducerExactStop.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    case MotionCommandPathMode::CONTINUOUS:
+        m_pathModeProducerContinuous.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    case MotionCommandPathMode::UNSPECIFIED:
+        m_pathModeProducerUnspecified.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    default:
+        m_pathModeProducerInvalid.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    }
+
+    const std::uint64_t producerFingerprint =
+        m_pathModeProducerFingerprint.load(std::memory_order_relaxed);
+    m_pathModeProducerFingerprint.store(
+        FoldCommandPathModeTransportFingerprint(
+            producerFingerprint,
+            command),
+        std::memory_order_relaxed);
+
+    m_pathModeProducerSequence.fetch_add(
+        1ULL,
+        std::memory_order_release);
+}
+
+
+void MotionCore::CommitCommandPathModeConsumerAuthority(
+    const MotionCommand& command,
+    MotionCommandPathModeAuthorityDecision decision) noexcept
+{
+    m_pathModeConsumerSequence.fetch_add(
+        1ULL,
+        std::memory_order_acq_rel);
+
+    m_pathModeAuthorityAttempts.fetch_add(
+        1ULL,
+        std::memory_order_relaxed);
+
+    switch (decision)
+    {
+    case MotionCommandPathModeAuthorityDecision::APPLY_EXACT_STOP:
+        m_Group.pathMode = PathMode::EXACT_STOP;
+        m_pathModeAuthorityApplied.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_pathModeAuthorityExactStop.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    case MotionCommandPathModeAuthorityDecision::APPLY_CONTINUOUS:
+        m_Group.pathMode = PathMode::CONTINUOUS;
+        m_pathModeAuthorityApplied.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_pathModeAuthorityContinuous.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    case MotionCommandPathModeAuthorityDecision::LEGACY_FALLBACK:
+        m_pathModeAuthorityLegacyFallbacks.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    case MotionCommandPathModeAuthorityDecision::REPLAY_BYPASS:
+        m_pathModeAuthorityReplayBypasses.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    case MotionCommandPathModeAuthorityDecision::REJECT_DRIVER_OVERRIDE:
+        m_pathModeAuthorityDriverBlocks.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_pathModeConsumerSequence.fetch_add(
+            1ULL,
+            std::memory_order_release);
+        return;
+    case MotionCommandPathModeAuthorityDecision::REJECT_INVALID:
+    default:
+        m_pathModeAuthorityInvalidRejects.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_pathModeConsumerSequence.fetch_add(
+            1ULL,
+            std::memory_order_release);
+        return;
+    }
+
+    m_pathModeConsumerCommitted.fetch_add(
+        1ULL,
+        std::memory_order_relaxed);
+
+    if (command.replayTerminalAlreadyPublished)
+    {
+        m_pathModeConsumerReplayCommitted.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        m_pathModeConsumerIngressCommitted.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+
+    const std::uint64_t consumerFingerprint =
+        m_pathModeConsumerFingerprint.load(std::memory_order_relaxed);
+    m_pathModeConsumerFingerprint.store(
+        FoldCommandPathModeTransportFingerprint(
+            consumerFingerprint,
+            command),
+        std::memory_order_relaxed);
+
+    switch (command.commandPathMode)
+    {
+    case MotionCommandPathMode::EXACT_STOP:
+        m_pathModeConsumerExactStop.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    case MotionCommandPathMode::CONTINUOUS:
+        m_pathModeConsumerContinuous.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        break;
+    case MotionCommandPathMode::UNSPECIFIED:
+        m_pathModeConsumerUnspecified.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_pathModeConsumerSequence.fetch_add(
+            1ULL,
+            std::memory_order_release);
+        return;
+    default:
+        m_pathModeConsumerInvalid.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_pathModeConsumerSequence.fetch_add(
+            1ULL,
+            std::memory_order_release);
+        return;
+    }
+
+    if (m_Group.pathMode == PathMode::PATH_SERVO ||
+        m_Group.pathMode == PathMode::JUMP_TRACKING)
+    {
+        m_pathModeDriverOverrideObservations.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+        m_pathModeConsumerSequence.fetch_add(
+            1ULL,
+            std::memory_order_release);
+        return;
+    }
+
+    const bool matchesAppliedRuntime =
+        (command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+            m_Group.pathMode == PathMode::EXACT_STOP) ||
+        (command.commandPathMode == MotionCommandPathMode::CONTINUOUS &&
+            m_Group.pathMode == PathMode::CONTINUOUS);
+
+    if (matchesAppliedRuntime)
+    {
+        m_pathModeLegacyMatches.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        m_pathModeLegacyMismatches.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+
+    m_pathModeConsumerSequence.fetch_add(
+        1ULL,
+        std::memory_order_release);
+}
+
+
+void MotionCore::ObserveCommandPathModeAuthorityReject(
+    MotionCommandPathModeAuthorityDecision decision) noexcept
+{
+    m_pathModeConsumerSequence.fetch_add(
+        1ULL,
+        std::memory_order_acq_rel);
+    m_pathModeAuthorityAttempts.fetch_add(
+        1ULL,
+        std::memory_order_relaxed);
+
+    if (decision ==
+        MotionCommandPathModeAuthorityDecision::REJECT_DRIVER_OVERRIDE)
+    {
+        m_pathModeAuthorityDriverBlocks.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        m_pathModeAuthorityInvalidRejects.fetch_add(
+            1ULL,
+            std::memory_order_relaxed);
+    }
+
+    m_pathModeConsumerSequence.fetch_add(
+        1ULL,
+        std::memory_order_release);
+}
+
+
+bool MotionCore::RejectFrontCommandForPathModeAuthority(
+    const MotionCommand& peekedCommand,
+    MotionCommandPathModeAuthorityDecision decision) noexcept
+{
+    if (HasPendingExecutionEpochChange())
+    {
+        return false;
+    }
+
+    MotionCommand rejectedCommand{};
+    if (!m_Group.cmdQueue.ConsumerTryPop(rejectedCommand))
+    {
+        return false;
+    }
+
+    const bool exactPeekedIdentity =
+        MotionExecutionIdentityExactlyMatches(
+            peekedCommand.execution,
+            rejectedCommand.execution) &&
+        peekedCommand.ownerLease.owner ==
+        rejectedCommand.ownerLease.owner &&
+        peekedCommand.ownerLease.generation ==
+        rejectedCommand.ownerLease.generation;
+    const MotionRejectReason authorizationFailure =
+        GetCommandAuthorizationFailure(rejectedCommand);
+
+    if (authorizationFailure != MotionRejectReason::NONE)
+    {
+        RejectMotionCommand(
+            rejectedCommand,
+            authorizationFailure,
+            0U);
+        return true;
+    }
+
+    if (!exactPeekedIdentity || HasPendingExecutionEpochChange())
+    {
+        RejectMotionCommand(
+            rejectedCommand,
+            MotionRejectReason::STALE_EPOCH,
+            0U);
+        return true;
+    }
+
+    ObserveCommandPathModeAuthorityReject(decision);
+    m_p1DroppedAxisRetirementFailureCount.fetch_add(
+        1ULL,
+        std::memory_order_relaxed);
+    m_p1LastOrphanAxisIndex.store(-1, std::memory_order_release);
+    TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+    RejectMotionCommand(
+        rejectedCommand,
+        MotionRejectReason::INVALID_GEOMETRY,
+        static_cast<std::uint32_t>(
+            AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY));
+    return true;
 }
 
 void MotionCore::RejectInvalidProducerMotionCommand(
@@ -2812,8 +3168,9 @@ void MotionCore::RejectInvalidProducerMotionCommand(
             AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY),
         0.0);
 
+    ObserveCommandPathModeProducer(command, false);
     RecordProgramBlockMotionSubmission(
-        command.execution,
+        command,
         false,
         MotionRejectReason::INVALID_GEOMETRY);
 }
@@ -3334,8 +3691,9 @@ bool MotionCore::TryEnqueueMotionCommand(
             0U,
             0.0);
 
+        ObserveCommandPathModeProducer(command, false);
         RecordProgramBlockMotionSubmission(
-            command.execution,
+            command,
             false,
             authorizationFailure);
         return false;
@@ -3343,8 +3701,9 @@ bool MotionCore::TryEnqueueMotionCommand(
 
     if (m_Group.cmdQueue.ProducerTryPush(command))
     {
+        ObserveCommandPathModeProducer(command, true);
         RecordProgramBlockMotionSubmission(
-            command.execution,
+            command,
             true,
             MotionRejectReason::NONE);
         return true;
@@ -3370,8 +3729,9 @@ bool MotionCore::TryEnqueueMotionCommand(
             AlarmManager::MOTION_COMMAND_QUEUE_FULL),
         0.0);
 
+    ObserveCommandPathModeProducer(command, false);
     RecordProgramBlockMotionSubmission(
-        command.execution,
+        command,
         false,
         MotionRejectReason::QUEUE_FULL);
 
@@ -7717,7 +8077,14 @@ void MotionCore::InitVirtualAxisSmooth(int windowSize)
     // RtPrintf("[DEBUG] Virtual Axis & Group Initialized. Smooth Buffer: %d\n", windowSize);
 }
 
-void MotionCore::LineMove(const std::vector<int>& axes, const std::vector<double>& targetPos, double targetVel, double acc_time, double dec_time, BufferMode mode)
+void MotionCore::LineMove(
+    const std::vector<int>& axes,
+    const std::vector<double>& targetPos,
+    double targetVel,
+    double acc_time,
+    double dec_time,
+    BufferMode mode,
+    MotionCommandPathMode commandPathMode)
 {
     // Capture one producer tuple before validation. Even malformed producer
     // input must receive an identity, a terminal REJECTED notice and a formal
@@ -7733,11 +8100,13 @@ void MotionCore::LineMove(const std::vector<int>& axes, const std::vector<double
     MotionCommand invalidCommand{};
     invalidCommand.mode = InterpolationMode::LINEAR;
     invalidCommand.sourceLinePC = m_pendingSourcePC;
+    invalidCommand.commandPathMode = commandPathMode;
 
     if (m_pContexts == nullptr ||
         axes.empty() ||
         axes.size() > static_cast<std::size_t>(MAX_AXES) ||
         targetPos.size() != axes.size() ||
+        !IsValidMotionCommandPathMode(commandPathMode) ||
         !std::isfinite(targetVel) ||
         !std::isfinite(acc_time) ||
         !std::isfinite(dec_time))
@@ -7775,6 +8144,7 @@ void MotionCore::LineMove(const std::vector<int>& axes, const std::vector<double
     MotionCommand cmd{};
     cmd.mode = InterpolationMode::LINEAR;
     cmd.axisCount = (int)axes.size();
+    cmd.commandPathMode = commandPathMode;
 
     // 將座標與參數抄寫到包裹裡
     for (int i = 0; i < cmd.axisCount; ++i) {
@@ -8178,6 +8548,29 @@ void MotionCore::LoadNextCommand()
         return;
     }
 
+    const bool pathModeDriverOverrideActive =
+        m_Group.pathMode == PathMode::PATH_SERVO ||
+        m_Group.pathMode == PathMode::JUMP_TRACKING;
+    const MotionCommandPathModeAuthorityDecision
+        frontPathModeAuthorityDecision =
+        ResolveMotionCommandPathModeAuthorityDecision(
+            frontCommand.commandPathMode,
+            frontCommand.replayTerminalAlreadyPublished,
+            pathModeDriverOverrideActive);
+    if (frontPathModeAuthorityDecision ==
+        MotionCommandPathModeAuthorityDecision::REJECT_INVALID ||
+        frontPathModeAuthorityDecision ==
+        MotionCommandPathModeAuthorityDecision::REJECT_DRIVER_OVERRIDE)
+    {
+        // K.6.1 fail-closed boundary.  Consume only the exact peeked identity,
+        // publish its terminal rejection and open the existing Alarm 3021
+        // lifecycle transaction.  Never let a normal G00 steal driver mode.
+        (void)RejectFrontCommandForPathModeAuthority(
+            frontCommand,
+            frontPathModeAuthorityDecision);
+        return;
+    }
+
     const double prospectiveCruiseVelocity =
         std::abs(frontCommand.targetVel) * m_Group.feedrateOverride;
     if (!std::isfinite(m_Group.feedrateOverride) ||
@@ -8442,6 +8835,13 @@ void MotionCore::LoadNextCommand()
         return;
     }
 
+    const MotionCommandPathModeAuthorityDecision
+        commandPathModeAuthorityDecision =
+        ResolveMotionCommandPathModeAuthorityDecision(
+            cmd.commandPathMode,
+            cmd.replayTerminalAlreadyPublished,
+            pathModeDriverOverrideActive);
+
     const auto RejectPoppedCommandIfLifecycleSuperseded =
         [this, &cmd]() noexcept -> bool
     {
@@ -8483,6 +8883,8 @@ void MotionCore::LoadNextCommand()
     };
 
     if (!exactPeekedIdentity ||
+        commandPathModeAuthorityDecision !=
+        frontPathModeAuthorityDecision ||
         !IsMotionCommandConsumerGeometryValid(cmd, m_pContexts) ||
         (hasOutgoingCommand &&
             mappingChanged !=
@@ -8742,6 +9144,14 @@ void MotionCore::LoadNextCommand()
 
     // 保存目前執行指令
     m_Group.currentCmd = cmd;
+
+    // Stage NC-0.2K.6.1: the fully authorized, post-pop command becomes the
+    // planner authority only after the lifecycle/mapping handoff commits.
+    // Producer code never writes m_Group.pathMode for G00.  Replay and
+    // UNSPECIFIED decisions preserve their accepted legacy/driver authority.
+    CommitCommandPathModeConsumerAuthority(
+        m_Group.currentCmd,
+        commandPathModeAuthorityDecision);
 
 
     // ======================================================
@@ -14575,6 +14985,197 @@ MotionCore::GetP1HandoverSafetySnapshot() const noexcept
             alarmRequestPublication & P1_MAPPING_ALARM_EPOCH_MASK);
     snapshot.lastOrphanAxisIndex =
         m_p1LastOrphanAxisIndex.load(std::memory_order_acquire);
+    return snapshot;
+}
+
+
+MotionCommandPathModeTransportSnapshot
+MotionCore::GetCommandPathModeTransportSnapshot() const noexcept
+{
+    MotionCommandPathModeTransportSnapshot snapshot{};
+
+    snapshot.producerSnapshotCoherent = false;
+    for (std::size_t attempt = 0U; attempt < 8U; ++attempt)
+    {
+        const std::uint64_t begin =
+            m_pathModeProducerSequence.load(std::memory_order_acquire);
+        if ((begin & 1ULL) != 0ULL)
+        {
+            continue;
+        }
+
+        snapshot.producerAccepted =
+            m_pathModeProducerAccepted.load(std::memory_order_relaxed);
+        snapshot.producerRejected =
+            m_pathModeProducerRejected.load(std::memory_order_relaxed);
+        snapshot.producerExactStop =
+            m_pathModeProducerExactStop.load(std::memory_order_relaxed);
+        snapshot.producerContinuous =
+            m_pathModeProducerContinuous.load(std::memory_order_relaxed);
+        snapshot.producerUnspecified =
+            m_pathModeProducerUnspecified.load(std::memory_order_relaxed);
+        snapshot.producerInvalid =
+            m_pathModeProducerInvalid.load(std::memory_order_relaxed);
+        snapshot.producerFingerprint =
+            m_pathModeProducerFingerprint.load(std::memory_order_relaxed);
+
+        const std::uint64_t end =
+            m_pathModeProducerSequence.load(std::memory_order_acquire);
+        if (begin == end && (end & 1ULL) == 0ULL)
+        {
+            snapshot.producerSnapshotCoherent = true;
+            break;
+        }
+    }
+
+    snapshot.consumerSnapshotCoherent = false;
+    for (std::size_t attempt = 0U; attempt < 8U; ++attempt)
+    {
+        const std::uint64_t begin =
+            m_pathModeConsumerSequence.load(std::memory_order_acquire);
+        if ((begin & 1ULL) != 0ULL)
+        {
+            continue;
+        }
+
+        snapshot.consumerCommitted =
+            m_pathModeConsumerCommitted.load(std::memory_order_relaxed);
+        snapshot.consumerIngressCommitted =
+            m_pathModeConsumerIngressCommitted.load(
+                std::memory_order_relaxed);
+        snapshot.consumerReplayCommitted =
+            m_pathModeConsumerReplayCommitted.load(
+                std::memory_order_relaxed);
+        snapshot.consumerExactStop =
+            m_pathModeConsumerExactStop.load(std::memory_order_relaxed);
+        snapshot.consumerContinuous =
+            m_pathModeConsumerContinuous.load(std::memory_order_relaxed);
+        snapshot.consumerUnspecified =
+            m_pathModeConsumerUnspecified.load(std::memory_order_relaxed);
+        snapshot.consumerInvalid =
+            m_pathModeConsumerInvalid.load(std::memory_order_relaxed);
+        snapshot.consumerFingerprint =
+            m_pathModeConsumerFingerprint.load(std::memory_order_relaxed);
+        snapshot.legacyModeMatches =
+            m_pathModeLegacyMatches.load(std::memory_order_relaxed);
+        snapshot.legacyModeMismatches =
+            m_pathModeLegacyMismatches.load(std::memory_order_relaxed);
+        snapshot.driverOverrideObservations =
+            m_pathModeDriverOverrideObservations.load(
+                std::memory_order_relaxed);
+        snapshot.authorityAttempts =
+            m_pathModeAuthorityAttempts.load(std::memory_order_relaxed);
+        snapshot.authorityApplied =
+            m_pathModeAuthorityApplied.load(std::memory_order_relaxed);
+        snapshot.authorityExactStop =
+            m_pathModeAuthorityExactStop.load(std::memory_order_relaxed);
+        snapshot.authorityContinuous =
+            m_pathModeAuthorityContinuous.load(std::memory_order_relaxed);
+        snapshot.authorityLegacyFallbacks =
+            m_pathModeAuthorityLegacyFallbacks.load(
+                std::memory_order_relaxed);
+        snapshot.authorityReplayBypasses =
+            m_pathModeAuthorityReplayBypasses.load(
+                std::memory_order_relaxed);
+        snapshot.authorityDriverBlocks =
+            m_pathModeAuthorityDriverBlocks.load(
+                std::memory_order_relaxed);
+        snapshot.authorityInvalidRejects =
+            m_pathModeAuthorityInvalidRejects.load(
+                std::memory_order_relaxed);
+
+        const std::uint64_t end =
+            m_pathModeConsumerSequence.load(std::memory_order_acquire);
+        if (begin == end && (end & 1ULL) == 0ULL)
+        {
+            snapshot.consumerSnapshotCoherent = true;
+            break;
+        }
+    }
+
+    const std::uint64_t producerClassified =
+        snapshot.producerExactStop +
+        snapshot.producerContinuous +
+        snapshot.producerUnspecified +
+        snapshot.producerInvalid;
+    const std::uint64_t consumerClassified =
+        snapshot.consumerExactStop +
+        snapshot.consumerContinuous +
+        snapshot.consumerUnspecified +
+        snapshot.consumerInvalid;
+    const std::uint64_t explicitConsumerClassified =
+        snapshot.consumerExactStop +
+        snapshot.consumerContinuous;
+    const std::uint64_t legacyCompared =
+        snapshot.legacyModeMatches +
+        snapshot.legacyModeMismatches +
+        snapshot.driverOverrideObservations;
+    const std::uint64_t authorityAccounted =
+        snapshot.authorityApplied +
+        snapshot.authorityLegacyFallbacks +
+        snapshot.authorityReplayBypasses +
+        snapshot.authorityDriverBlocks +
+        snapshot.authorityInvalidRejects;
+
+    snapshot.accountingValid =
+        snapshot.producerSnapshotCoherent &&
+        snapshot.consumerSnapshotCoherent &&
+        snapshot.producerAccepted == producerClassified &&
+        snapshot.consumerCommitted == consumerClassified &&
+        snapshot.consumerCommitted ==
+        snapshot.consumerIngressCommitted +
+        snapshot.consumerReplayCommitted &&
+        explicitConsumerClassified == legacyCompared &&
+        snapshot.authorityAttempts == authorityAccounted &&
+        snapshot.authorityApplied ==
+        snapshot.authorityExactStop +
+        snapshot.authorityContinuous &&
+        snapshot.consumerCommitted ==
+        snapshot.authorityApplied +
+        snapshot.authorityLegacyFallbacks +
+        snapshot.authorityReplayBypasses;
+
+    snapshot.commandLocalPayloadPresent =
+        snapshot.producerExactStop +
+        snapshot.producerContinuous != 0ULL;
+
+    snapshot.transportReady =
+        snapshot.commandLocalPayloadPresent &&
+        snapshot.accountingValid &&
+        snapshot.producerRejected == 0ULL &&
+        snapshot.producerInvalid == 0ULL &&
+        snapshot.consumerInvalid == 0ULL &&
+        snapshot.producerUnspecified == 0ULL &&
+        snapshot.consumerUnspecified == 0ULL &&
+        snapshot.consumerReplayCommitted == 0ULL &&
+        snapshot.authorityReplayBypasses == 0ULL &&
+        snapshot.authorityDriverBlocks == 0ULL &&
+        snapshot.authorityInvalidRejects == 0ULL &&
+        snapshot.authorityLegacyFallbacks == 0ULL &&
+        snapshot.driverOverrideObservations == 0ULL &&
+        snapshot.legacyModeMismatches == 0ULL &&
+        snapshot.authorityApplied ==
+        snapshot.consumerIngressCommitted &&
+        snapshot.authorityExactStop ==
+        snapshot.consumerExactStop &&
+        snapshot.authorityContinuous ==
+        snapshot.consumerContinuous &&
+        snapshot.producerAccepted ==
+        snapshot.consumerIngressCommitted &&
+        snapshot.producerExactStop ==
+        snapshot.consumerExactStop &&
+        snapshot.producerContinuous ==
+        snapshot.consumerContinuous &&
+        snapshot.producerFingerprint ==
+        snapshot.consumerFingerprint;
+
+    // K.6.1 is the bounded Consumer-authority cutover.  Runtime influence is
+    // evidence-based: it becomes true only after at least one explicit mode
+    // was committed into the planner.
+    snapshot.shadowOnly = false;
+    snapshot.consumerAuthority = true;
+    snapshot.runtimeInfluence = snapshot.authorityApplied != 0ULL;
+    snapshot.cutoverAttempted = snapshot.authorityAttempts != 0ULL;
     return snapshot;
 }
 

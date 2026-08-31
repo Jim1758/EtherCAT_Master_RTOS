@@ -172,15 +172,15 @@ namespace GCodeHandlers
                 continue;
             }
 
-            AxisContext& axis =nc->m_motion.GetAxisContext(i);
+            AxisContext& axis = nc->m_motion.GetAxisContext(i);
 
-            const bool targetWithinSoftwareLimit =nc->CoordSys.IsTargetWithinSoftwareTravelLimit( axis, targetMCS[i]);
+            const bool targetWithinSoftwareLimit = nc->CoordSys.IsTargetWithinSoftwareTravelLimit(axis, targetMCS[i]);
 
             if (!targetWithinSoftwareLimit)
             {
-                AlarmManager::GetInstance().Trigger(  AlarmManager::PROGRAMMED_OVER_TRAVEL, 0, axis.axisIndex);
+                AlarmManager::GetInstance().Trigger(AlarmManager::PROGRAMMED_OVER_TRAVEL, 0, axis.axisIndex);
 
-                nc->ChangeState( NCState::ALARM);
+                nc->ChangeState(NCState::ALARM);
 
                 return [](NCManager*)
                 {
@@ -214,9 +214,9 @@ namespace GCodeHandlers
         if (block.has('F'))
         {
             double f_val = block.val('F');
-            nc->GetMotion().G00_overrideRatio= f_val / 100.0;
-          
-           
+            nc->GetMotion().G00_overrideRatio = f_val / 100.0;
+
+
         }
         else
         {
@@ -224,14 +224,18 @@ namespace GCodeHandlers
             // 如果這行沒有寫 F，就去讀取人機介面上的「G00 旋鈕」變數
             // rapidOverride = nc->GetGlobalRapidOverride(); 
         }
-       
+
         // 6. 下達移動命令！(底層會自動套用 G00 的快速定位 PID 與速度)
 
         if (block.has('P') && block.val('P') == 1.0)
         {
-           
-            nc->GetMotion().G00_Move(activeAxes, targetPos, BufferMode::BUFFERED);//連續路徑
-           
+
+            nc->GetMotion().G00_Move(
+                activeAxes,
+                targetPos,
+                BufferMode::BUFFERED,
+                MotionCommandPathMode::CONTINUOUS);//連續路徑
+
 
              // 🔓 解開第二道鎖：
              // 回傳 nullptr 代表「不要等我走完，大腦請立刻去讀下一行！」
@@ -241,10 +245,14 @@ namespace GCodeHandlers
         }
         else
         {
-            nc->GetMotion().G00_Move(activeAxes, targetPos,BufferMode::ABORTING);//不連續
+            nc->GetMotion().G00_Move(
+                activeAxes,
+                targetPos,
+                BufferMode::ABORTING,
+                MotionCommandPathMode::EXACT_STOP);//不連續
         }
-       
-      
+
+
 
         // 7. 回傳檢查函式，交給 NC 系統去輪詢 (Polling)
         return CheckMotionDone;

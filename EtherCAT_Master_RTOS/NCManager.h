@@ -9,7 +9,10 @@
 #include "NCProgramCache.h"    // Stage NC-0.2C：Parsed Program Cache
 #include "NCPreparedBlockQueueShadow.h" // Stage NC-0.2K.1：Prepared Queue Shadow
 #include "NCPreparedHeadEquivalenceShadow.h" // Stage NC-0.2K.2：Prepared Head Exact Equivalence
-#include "NCPreparedHeadCutoverGate.h" // Stage NC-0.2K.3：Exact-Value Controlled Cutover
+#include "NCPreparedHeadCutoverGate.h" // Stage NC-0.2K.3.1：Ordinary G00 Cutover
+#include "NCPreparedHeadPreResolveAdmissionShadow.h" // Stage NC-0.2K.4：Pre-Resolve Admission Shadow
+#include "NCPreparedHeadResolverBypassGate.h" // Stage NC-0.2K.4.2：Ordinary G00 Controlled Resolver Bypass
+#include "NCOrdinaryG00BufferedExactStopAdmissionShadow.h" // Stage NC-0.2K.5：Ordinary G00 Buffered Exact-Stop Admission Shadow
 #include "NCBlockLifecycleLedger.h" // Stage NC-0.2D：Block / Motion Lifecycle
 #include "NCBlockCompletionBoundary.h" // Stage NC-0.2F：Motion Completion Dual-Key Guard
 #include "NCProgramEndBoundary.h" // Stage NC-0.2G：Program End / Cycle End Gate
@@ -599,6 +602,52 @@ public:
         return m_preparedHeadCutoverGate.GetCounters();
     }
 
+    NCPreparedPreResolveAdmissionSnapshot
+        GetPreparedPreResolveAdmissionSnapshot() const noexcept
+    {
+        return m_preparedHeadPreResolveAdmissionShadow.GetSnapshot();
+    }
+
+    NCPreparedPreResolveAdmissionCounters
+        GetPreparedPreResolveAdmissionCounters() const noexcept
+    {
+        return m_preparedHeadPreResolveAdmissionShadow.GetCounters();
+    }
+
+    void SetPreparedResolverBypassEnabled(bool enabled) noexcept
+    {
+        m_preparedHeadResolverBypassGate.SetEnabled(enabled);
+    }
+
+    bool IsPreparedResolverBypassEnabled() const noexcept
+    {
+        return m_preparedHeadResolverBypassGate.IsEnabled();
+    }
+
+    NCPreparedResolverBypassSnapshot
+        GetPreparedResolverBypassSnapshot() const noexcept
+    {
+        return m_preparedHeadResolverBypassGate.GetSnapshot();
+    }
+
+    NCPreparedResolverBypassCounters
+        GetPreparedResolverBypassCounters() const noexcept
+    {
+        return m_preparedHeadResolverBypassGate.GetCounters();
+    }
+
+    NCOrdinaryG00AdmissionSnapshot
+        GetOrdinaryG00AdmissionSnapshot() const noexcept
+    {
+        return m_ordinaryG00AdmissionShadow.GetSnapshot();
+    }
+
+    NCOrdinaryG00AdmissionCounters
+        GetOrdinaryG00AdmissionCounters() const noexcept
+    {
+        return m_ordinaryG00AdmissionShadow.GetCounters();
+    }
+
     NCSingleBlockShadowSnapshot
         GetSingleBlockShadowSnapshot() const noexcept
     {
@@ -811,11 +860,32 @@ private:
     NCPreparedHeadEquivalenceShadow
         m_preparedHeadEquivalenceShadow{};
 
-    // Stage NC-0.2K.3: after one full K.2 lifecycle proof has qualified the
+    // Stage NC-0.2K.3.1: after one full K.2 lifecycle proof has qualified the
     // current session, an exact current head may supply the NCBlock value to
-    // the unchanged handler path.  Default enabled; setter above is the
+    // the unchanged handler path.  Ordinary no-P G00 additionally requires
+    // the same-pass legacy drain proof.  Default enabled; setter above is the
     // immediate rollback switch for undispatched heads.
     NCPreparedHeadCutoverGate m_preparedHeadCutoverGate{};
+
+    // Stage NC-0.2K.4: captures one immutable Prepared head before the legacy
+    // resolver, then uses the unchanged K.2/K.3 result as its oracle.  This is
+    // observation-only: it cannot bypass ResolveBlock or influence Runtime.
+    NCPreparedHeadPreResolveAdmissionShadow
+        m_preparedHeadPreResolveAdmissionShadow{};
+
+    // Stage NC-0.2K.4.1: after one complete per-lane legacy proof, this
+    // reversible gate may skip ResolveBlock only for PURE_MODAL_COPY or an
+    // exact literal G00 P1 head.  It owns a separate lifecycle proof and
+    // never fabricates a K.2/K.3/K.4 legacy comparison for bypassed tokens.
+    NCPreparedHeadResolverBypassGate
+        m_preparedHeadResolverBypassGate{};
+
+    // Stage NC-0.2K.5: models the future ordinary no-P G00
+    // BUFFERED + command-local EXACT_STOP admission contract.  It only reads
+    // K.4.2 and lifecycle evidence; the accepted drain/ABORTING/callback path
+    // remains the sole Runtime path in this stage.
+    NCOrdinaryG00BufferedExactStopAdmissionShadow
+        m_ordinaryG00AdmissionShadow{};
 
     // Stage NC-0.2I.1：只觀察 Single Block 正確完成點。
     NCSingleBlockBoundaryShadow m_singleBlockBoundaryShadow{};
@@ -908,6 +978,9 @@ private:
     NCPreparedInvalidationReason
         GetPreparedBlockInactiveReason() const noexcept;
     void ObservePreparedBlockQueueShadow(bool allowPlanning) noexcept;
+    NCPreparedHeadCutoverContext CapturePreparedHeadBeforeResolve(
+        int sourcePC,
+        int sourceLineNumber) const noexcept;
     bool ObservePreparedHeadEquivalenceResolved(
         int sourcePC,
         int sourceLineNumber,
@@ -916,8 +989,7 @@ private:
         bool legacyDrainRequired,
         NCPreparedHeadCutoverContext& cutoverContext) noexcept;
     void ObservePreparedHeadEquivalenceResolveFailure(
-        int sourcePC,
-        int sourceLineNumber) noexcept;
+        const NCPreparedHeadCutoverContext& cutoverContext) noexcept;
     void ObservePreparedHeadEquivalenceUpstreamProof(
         const NCPreparedRuntimeProof& proof) noexcept;
     bool BindPreparedHeadEquivalenceDispatch(

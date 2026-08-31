@@ -1687,6 +1687,9 @@ namespace HMI_Bridge
         const MotionLifecycleCommitReservationSnapshot lifecycleCommit =
             motion.GetLifecycleCommitReservationSnapshot();
 
+        const MotionCommandPathModeTransportSnapshot commandPathModeTransport =
+            motion.GetCommandPathModeTransportSnapshot();
+
         std::uint64_t p1HandoverChangeToken = 1469598103934665603ULL;
         p1HandoverChangeToken = FoldDiagnosticEventToken(
             p1HandoverChangeToken,
@@ -1752,6 +1755,48 @@ namespace HMI_Bridge
         p1HandoverChangeToken = FoldDiagnosticEventToken(
             p1HandoverChangeToken,
             lifecycleCommit.executionEpochPending ? 1ULL : 0ULL);
+
+        const std::uint64_t commandPathModeTokenFields[] =
+        {
+            commandPathModeTransport.producerAccepted,
+            commandPathModeTransport.producerRejected,
+            commandPathModeTransport.producerExactStop,
+            commandPathModeTransport.producerContinuous,
+            commandPathModeTransport.producerUnspecified,
+            commandPathModeTransport.producerInvalid,
+            commandPathModeTransport.producerFingerprint,
+            commandPathModeTransport.consumerCommitted,
+            commandPathModeTransport.consumerIngressCommitted,
+            commandPathModeTransport.consumerReplayCommitted,
+            commandPathModeTransport.consumerExactStop,
+            commandPathModeTransport.consumerContinuous,
+            commandPathModeTransport.consumerUnspecified,
+            commandPathModeTransport.consumerInvalid,
+            commandPathModeTransport.consumerFingerprint,
+            commandPathModeTransport.legacyModeMatches,
+            commandPathModeTransport.legacyModeMismatches,
+            commandPathModeTransport.driverOverrideObservations,
+            commandPathModeTransport.authorityAttempts,
+            commandPathModeTransport.authorityApplied,
+            commandPathModeTransport.authorityExactStop,
+            commandPathModeTransport.authorityContinuous,
+            commandPathModeTransport.authorityLegacyFallbacks,
+            commandPathModeTransport.authorityReplayBypasses,
+            commandPathModeTransport.authorityDriverBlocks,
+            commandPathModeTransport.authorityInvalidRejects,
+            commandPathModeTransport.commandLocalPayloadPresent ? 1ULL : 0ULL,
+            commandPathModeTransport.transportReady ? 1ULL : 0ULL,
+            commandPathModeTransport.producerSnapshotCoherent ? 1ULL : 0ULL,
+            commandPathModeTransport.consumerSnapshotCoherent ? 1ULL : 0ULL,
+            commandPathModeTransport.accountingValid ? 1ULL : 0ULL
+        };
+        std::uint64_t commandPathModeChangeToken = 0ULL;
+        for (const std::uint64_t value : commandPathModeTokenFields)
+        {
+            commandPathModeChangeToken = FoldDiagnosticEventToken(
+                commandPathModeChangeToken,
+                value);
+        }
 
         MotionStopSettleSnapshot stopSettleSnapshot{};
         MotionStopSettleCounters stopSettleCounters{};
@@ -1877,6 +1922,24 @@ namespace HMI_Bridge
             nc->GetPreparedHeadCutoverSnapshot();
         const NCPreparedHeadCutoverCounters preparedCutoverCounters =
             nc->GetPreparedHeadCutoverCounters();
+        const NCPreparedPreResolveAdmissionSnapshot
+            preparedPreResolveSnapshot =
+            nc->GetPreparedPreResolveAdmissionSnapshot();
+        const NCPreparedPreResolveAdmissionCounters
+            preparedPreResolveCounters =
+            nc->GetPreparedPreResolveAdmissionCounters();
+        const NCPreparedResolverBypassSnapshot
+            preparedResolverBypassSnapshot =
+            nc->GetPreparedResolverBypassSnapshot();
+        const NCPreparedResolverBypassCounters
+            preparedResolverBypassCounters =
+            nc->GetPreparedResolverBypassCounters();
+        const NCOrdinaryG00AdmissionSnapshot
+            ordinaryG00AdmissionSnapshot =
+            nc->GetOrdinaryG00AdmissionSnapshot();
+        const NCOrdinaryG00AdmissionCounters
+            ordinaryG00AdmissionCounters =
+            nc->GetOrdinaryG00AdmissionCounters();
         NCPreparedBlockEntrySnapshot preparedQueueHead{};
         NCPreparedBlockEntrySnapshot preparedQueueTail{};
         const bool hasPreparedQueueHead =
@@ -2099,7 +2162,77 @@ namespace HMI_Bridge
             preparedEquivalenceCounters.wouldUse,
             preparedEquivalenceCounters.useAttempts,
             preparedEquivalenceCounters.cutoverAttempts,
-            preparedEquivalenceCounters.runtimeInfluence
+            preparedEquivalenceCounters.runtimeInfluence,
+            preparedResolverBypassSnapshot.publicationSequence,
+            static_cast<std::uint64_t>(
+                preparedResolverBypassSnapshot.decision),
+            preparedResolverBypassCounters.selected,
+            preparedResolverBypassCounters.proofVerified,
+            preparedResolverBypassCounters.qualificationCandidates,
+            preparedResolverBypassCounters.qualifiedPureModal,
+            preparedResolverBypassCounters.qualifiedG00P1,
+            preparedResolverBypassCounters.runtimeFailures,
+            preparedResolverBypassCounters.proofMismatches,
+            preparedResolverBypassCounters.revocations,
+            preparedResolverBypassCounters.runtimeInfluence,
+            preparedResolverBypassCounters.resolverBypasses,
+            preparedResolverBypassSnapshot.g00NoPQualifiedSession,
+            preparedResolverBypassSnapshot.commitExecutionEpoch,
+            preparedResolverBypassSnapshot.legacyDrainRequired ? 1ULL : 0ULL,
+            preparedResolverBypassSnapshot.legacyDrainSatisfied ? 1ULL : 0ULL,
+            preparedResolverBypassSnapshot.deferredForDrain ? 1ULL : 0ULL,
+            preparedResolverBypassSnapshot.callbackRequired ? 1ULL : 0ULL,
+            preparedResolverBypassSnapshot.callbackActiveAtCommit ? 1ULL : 0ULL,
+            preparedResolverBypassSnapshot.waitPhaseObserved ? 1ULL : 0ULL,
+            preparedResolverBypassSnapshot.callbackCompletionObserved
+                ? 1ULL : 0ULL,
+            preparedResolverBypassCounters.selectedPureModal,
+            preparedResolverBypassCounters.selectedG00P1,
+            preparedResolverBypassCounters.selectedG00NoP,
+            preparedResolverBypassCounters.proofVerifiedPureModal,
+            preparedResolverBypassCounters.proofVerifiedG00P1,
+            preparedResolverBypassCounters.proofVerifiedG00NoP,
+            preparedResolverBypassCounters.drainWaitSamples,
+            preparedResolverBypassCounters.callbackWaitSamples,
+            preparedResolverBypassCounters.callbackCompletions,
+            preparedResolverBypassCounters.ordinaryWaitPhases,
+            preparedResolverBypassCounters.qualifiedG00NoP,
+            ordinaryG00AdmissionSnapshot.publicationSequence,
+            static_cast<std::uint64_t>(
+                ordinaryG00AdmissionSnapshot.decision),
+            ordinaryG00AdmissionSnapshot.session,
+            ordinaryG00AdmissionSnapshot.entrySequence,
+            static_cast<std::uint64_t>(
+                ordinaryG00AdmissionSnapshot.owner),
+            ordinaryG00AdmissionSnapshot.ownerGeneration,
+            static_cast<std::uint64_t>(
+                ordinaryG00AdmissionSnapshot.panelMask),
+            ordinaryG00AdmissionSnapshot.dispatchId,
+            ordinaryG00AdmissionSnapshot.commitSequence,
+            ordinaryG00AdmissionSnapshot.busySamples,
+            ordinaryG00AdmissionSnapshot.blockerMask,
+            ordinaryG00AdmissionSnapshot.pending ? 1ULL : 0ULL,
+            ordinaryG00AdmissionSnapshot.permanentLockout ? 1ULL : 0ULL,
+            ordinaryG00AdmissionSnapshot.accountingValid ? 1ULL : 0ULL,
+            ordinaryG00AdmissionSnapshot.legacyCallbackCompleted ? 1ULL : 0ULL,
+            ordinaryG00AdmissionSnapshot.legacyUpstreamProofVerified
+                ? 1ULL : 0ULL,
+            ordinaryG00AdmissionCounters.uniqueEvaluations,
+            ordinaryG00AdmissionCounters.warmup,
+            ordinaryG00AdmissionCounters.candidates,
+            ordinaryG00AdmissionCounters.initialDrained,
+            ordinaryG00AdmissionCounters.initialBusy,
+            ordinaryG00AdmissionCounters.busySamples,
+            ordinaryG00AdmissionCounters.legacySelections,
+            ordinaryG00AdmissionCounters.legacyCommitBound,
+            ordinaryG00AdmissionCounters.callbackCompleted,
+            ordinaryG00AdmissionCounters.legacyCompleted,
+            ordinaryG00AdmissionCounters.rejected,
+            ordinaryG00AdmissionCounters.mismatches,
+            ordinaryG00AdmissionCounters.revocations,
+            ordinaryG00AdmissionCounters.runtimeInfluence,
+            ordinaryG00AdmissionCounters.resolverBypasses,
+            ordinaryG00AdmissionCounters.cutoverAttempts
         };
         std::uint64_t preparedEquivalenceChangeToken = 0ULL;
         for (const std::uint64_t value :
@@ -2508,6 +2641,7 @@ namespace HMI_Bridge
         static std::uint64_t previousAlarmEmergencyStopChangeToken = 0ULL;
         static std::uint64_t previousJ5EventToken = 0ULL;
         static std::uint64_t previousP1HandoverChangeToken = 0ULL;
+        static std::uint64_t previousCommandPathModeChangeToken = 0ULL;
 
         const bool ownerChanged =
             startupSamples != 0U &&
@@ -2590,6 +2724,11 @@ namespace HMI_Bridge
             startupSamples != 0U &&
             p1HandoverChangeToken != previousP1HandoverChangeToken;
 
+        const bool commandPathModeChanged =
+            startupSamples != 0U &&
+            commandPathModeChangeToken !=
+            previousCommandPathModeChangeToken;
+
         const bool shouldPrintJ5 =
             startupSamples == 0U ||
             j5EventChanged;
@@ -2615,6 +2754,7 @@ namespace HMI_Bridge
             resetReleaseGateChanged ||
             alarmEmergencyStopChanged ||
             p1HandoverChanged ||
+            commandPathModeChanged ||
             shouldPrintJ5 ||
             ownerChanged ||
             errorCounterChanged ||
@@ -2729,6 +2869,86 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(commandReplayDepth),
                 static_cast<unsigned long long>(feedbackDepth),
                 static_cast<unsigned long long>(feedbackNoticeDepth));
+
+            RtPrintf(
+                "[NC02K6-PATH] Payload:%u Ready:%u Shadow:%u Apply:%u "
+                "Influence:%u Cutover:%u Coh:%u/%u Acct:%u\n",
+                commandPathModeTransport.commandLocalPayloadPresent ? 1U : 0U,
+                commandPathModeTransport.transportReady ? 1U : 0U,
+                commandPathModeTransport.shadowOnly ? 1U : 0U,
+                commandPathModeTransport.consumerAuthority ? 1U : 0U,
+                commandPathModeTransport.runtimeInfluence ? 1U : 0U,
+                commandPathModeTransport.cutoverAttempted ? 1U : 0U,
+                commandPathModeTransport.producerSnapshotCoherent ? 1U : 0U,
+                commandPathModeTransport.consumerSnapshotCoherent ? 1U : 0U,
+                commandPathModeTransport.accountingValid ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K6-CNT] Submit:%llu Accept:%llu Reject:%llu "
+                "PE:%llu PC:%llu PU:%llu PI:%llu Observe:%llu "
+                "Ingress:%llu Replay:%llu CE:%llu CC:%llu CU:%llu CI:%llu "
+                "Match:%llu Mis:%llu Driver:%llu PF:%016llX CF:%016llX\n",
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.producerAccepted +
+                    commandPathModeTransport.producerRejected),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.producerAccepted),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.producerRejected),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.producerExactStop),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.producerContinuous),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.producerUnspecified),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.producerInvalid),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.consumerCommitted),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.consumerIngressCommitted),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.consumerReplayCommitted),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.consumerExactStop),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.consumerContinuous),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.consumerUnspecified),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.consumerInvalid),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.legacyModeMatches),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.legacyModeMismatches),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.driverOverrideObservations),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.producerFingerprint),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.consumerFingerprint));
+
+            RtPrintf(
+                "[NC02K61-AUTH] Try:%llu Apply:%llu Exact:%llu Cont:%llu "
+                "Legacy:%llu Replay:%llu DriverBlock:%llu Invalid:%llu "
+                "Acct:%u\n",
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.authorityAttempts),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.authorityApplied),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.authorityExactStop),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.authorityContinuous),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.authorityLegacyFallbacks),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.authorityReplayBypasses),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.authorityDriverBlocks),
+                static_cast<unsigned long long>(
+                    commandPathModeTransport.authorityInvalidRejects),
+                commandPathModeTransport.accountingValid ? 1U : 0U);
 
             RtPrintf(
                 "[NC01F-CNT] AxisQFull:%llu AxisResOv:%llu "
@@ -3494,6 +3714,485 @@ namespace HMI_Bridge
                     preparedCutoverCounters.applied),
                 static_cast<unsigned long long>(
                     preparedCutoverCounters.applied));
+
+            RtPrintf(
+                "[NC02K4-ADM] Pub:%llu Decision:%s Revoke:%s Sess:%llu Entry:%llu "
+                "Scope:%u Cache:%llu Frame:%llu Epoch:%llu Flow:%llu Owner:%u/%llu "
+                "Panel:%02X PC:%d Line:%d Disp:%llu Class:%s Head:%u Queue:%u "
+                "Up:%u Qual:%u Token:%u Source:%u PCLine:%u Modal:%u ClassOK:%u "
+                "DrainReq:%u DrainOK:%u Cand:%u Legacy:%u Eq:%u K3:%u Confirm:%u "
+                "Lock:%u Shadow:%u Influence:%u Bypass:%u Acct:%u\n",
+                static_cast<unsigned long long>(
+                    preparedPreResolveSnapshot.publicationSequence),
+                NCPreparedPreResolveAdmissionDecisionToDiagnosticName(
+                    preparedPreResolveSnapshot.decision),
+                NCPreparedPreResolveAdmissionRevocationToDiagnosticName(
+                    preparedPreResolveSnapshot.lastRevocation),
+                static_cast<unsigned long long>(
+                    preparedPreResolveSnapshot.session),
+                static_cast<unsigned long long>(
+                    preparedPreResolveSnapshot.entrySequence),
+                static_cast<unsigned int>(preparedPreResolveSnapshot.scope),
+                static_cast<unsigned long long>(
+                    preparedPreResolveSnapshot.cacheGeneration),
+                static_cast<unsigned long long>(
+                    preparedPreResolveSnapshot.frameId),
+                static_cast<unsigned long long>(
+                    preparedPreResolveSnapshot.executionEpoch),
+                static_cast<unsigned long long>(
+                    preparedPreResolveSnapshot.programFlowGeneration),
+                static_cast<unsigned int>(preparedPreResolveSnapshot.owner),
+                static_cast<unsigned long long>(
+                    preparedPreResolveSnapshot.ownerGeneration),
+                static_cast<unsigned int>(preparedPreResolveSnapshot.panelMask),
+                preparedPreResolveSnapshot.sourcePC,
+                preparedPreResolveSnapshot.sourceLineNumber,
+                static_cast<unsigned long long>(
+                    preparedPreResolveSnapshot.dispatchId),
+                NCPreparedBlockClassToDiagnosticName(
+                    preparedPreResolveSnapshot.blockClass),
+                preparedPreResolveSnapshot.hasHead ? 1U : 0U,
+                preparedPreResolveSnapshot.queueExact ? 1U : 0U,
+                preparedPreResolveSnapshot.upstreamHealthy ? 1U : 0U,
+                preparedPreResolveSnapshot.sessionQualified ? 1U : 0U,
+                preparedPreResolveSnapshot.tokenExact ? 1U : 0U,
+                preparedPreResolveSnapshot.sourceExact ? 1U : 0U,
+                preparedPreResolveSnapshot.pcLineExact ? 1U : 0U,
+                preparedPreResolveSnapshot.modalExact ? 1U : 0U,
+                preparedPreResolveSnapshot.classEligible ? 1U : 0U,
+                preparedPreResolveSnapshot.legacyDrainRequired ? 1U : 0U,
+                preparedPreResolveSnapshot.legacyDrainSatisfied ? 1U : 0U,
+                preparedPreResolveSnapshot.candidate ? 1U : 0U,
+                preparedPreResolveSnapshot.legacyResolveObserved ? 1U : 0U,
+                preparedPreResolveSnapshot.equivalenceObserved ? 1U : 0U,
+                preparedPreResolveSnapshot.cutoverObserved ? 1U : 0U,
+                preparedPreResolveSnapshot.confirmed ? 1U : 0U,
+                preparedPreResolveSnapshot.permanentLockout ? 1U : 0U,
+                preparedPreResolveSnapshot.shadowOnly ? 1U : 0U,
+                preparedPreResolveSnapshot.runtimeInfluence ? 1U : 0U,
+                preparedPreResolveSnapshot.resolverBypassed ? 1U : 0U,
+                preparedPreResolveSnapshot.accountingValid ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K4-CNT] Eval:%llu Pub:%llu Cand:%llu Confirm:%llu "
+                "Reject:%llu Wait:%llu NoHead:%llu Queue:%llu Up:%llu "
+                "Session:%llu Token:%llu Source:%llu PCLine:%llu Modal:%llu "
+                "Class:%llu ResolveFail:%llu PostMis:%llu CandInv:%llu ConfirmFail:%llu "
+                "Revoke:%llu QRev:%llu AlarmRev:%llu ResetRev:%llu EndRev:%llu "
+                "SrcRev:%llu UpRev:%llu Influence:%llu Bypass:%llu\n",
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.evaluations),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.publications),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.candidates),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.confirmed),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.rejections),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.drainWaitSamples),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.noHead),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.queueRejected),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.upstreamRejected),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.sessionRejected),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.tokenRejected),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.sourceRejected),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.pcLineRejected),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.modalRejected),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.classRejected),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.legacyResolveFailures),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.postResolveMismatches),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.candidateInvalidations),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.confirmedRuntimeFailures),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.revocations),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.queueRevocations),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.alarmRevocations),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.resetRevocations),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.programEndRevocations),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.sourceRevocations),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.upstreamRevocations),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.runtimeInfluence),
+                static_cast<unsigned long long>(
+                    preparedPreResolveCounters.resolverBypasses));
+
+            RtPrintf(
+                "[NC02K41-BYP] Pub:%llu Decision:%s Revoke:%s Lane:%s "
+                "Sess:%llu Entry:%llu PC:%d Line:%d Disp:%llu Commit:%llu "
+                "QPure:%llu QP1:%llu Enable:%u Attempt:%u Select:%u "
+                "Bind:%u CommitOK:%u Proof:%u Queue:%u Up:%u LaneQ:%u "
+                "Token:%u Source:%u PCLine:%u Modal:%u Class:%u Rebuild:%u "
+                "Pending:%u Lock:%u Legacy:%u Influence:%u Bypass:%u Acct:%u\n",
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.publicationSequence),
+                NCPreparedResolverBypassDecisionToDiagnosticName(
+                    preparedResolverBypassSnapshot.decision),
+                NCPreparedResolverBypassRevocationToDiagnosticName(
+                    preparedResolverBypassSnapshot.lastRevocation),
+                NCPreparedResolverBypassLaneToDiagnosticName(
+                    preparedResolverBypassSnapshot.lane),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.session),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.entrySequence),
+                preparedResolverBypassSnapshot.sourcePC,
+                preparedResolverBypassSnapshot.sourceLineNumber,
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.dispatchId),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.commitSequence),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.
+                    pureModalQualifiedSession),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.g00P1QualifiedSession),
+                preparedResolverBypassSnapshot.enabled ? 1U : 0U,
+                preparedResolverBypassSnapshot.attempted ? 1U : 0U,
+                preparedResolverBypassSnapshot.selected ? 1U : 0U,
+                preparedResolverBypassSnapshot.dispatchBound ? 1U : 0U,
+                preparedResolverBypassSnapshot.commitBound ? 1U : 0U,
+                preparedResolverBypassSnapshot.upstreamProofVerified
+                ? 1U : 0U,
+                preparedResolverBypassSnapshot.queueExact ? 1U : 0U,
+                preparedResolverBypassSnapshot.upstreamHealthy ? 1U : 0U,
+                preparedResolverBypassSnapshot.laneQualified ? 1U : 0U,
+                preparedResolverBypassSnapshot.tokenExact ? 1U : 0U,
+                preparedResolverBypassSnapshot.sourceExact ? 1U : 0U,
+                preparedResolverBypassSnapshot.pcLineExact ? 1U : 0U,
+                preparedResolverBypassSnapshot.modalExact ? 1U : 0U,
+                preparedResolverBypassSnapshot.classEligible ? 1U : 0U,
+                preparedResolverBypassSnapshot.literalRebuiltExact
+                ? 1U : 0U,
+                preparedResolverBypassSnapshot.pending ? 1U : 0U,
+                preparedResolverBypassSnapshot.permanentLockout ? 1U : 0U,
+                preparedResolverBypassSnapshot.legacyResolverRetained
+                ? 1U : 0U,
+                preparedResolverBypassSnapshot.runtimeInfluence ? 1U : 0U,
+                preparedResolverBypassSnapshot.resolverBypassed ? 1U : 0U,
+                preparedResolverBypassSnapshot.accountingValid ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K41-CNT] Eval:%llu Pub:%llu Select:%llu Fallback:%llu "
+                "Bind:%llu Commit:%llu Proof:%llu Wait:%llu Disable:%llu "
+                "Busy:%llu NoHead:%llu Queue:%llu Up:%llu Session:%llu "
+                "Token:%llu Source:%llu PCLine:%llu Modal:%llu Class:%llu "
+                "QualCand:%llu QualModal:%llu QualP1:%llu QualFail:%llu "
+                "QualInv:%llu RuntimeFail:%llu ProofMis:%llu PendingInv:%llu "
+                "Revoke:%llu DisRev:%llu QRev:%llu AlarmRev:%llu "
+                "ResetRev:%llu EndRev:%llu SrcRev:%llu RunRev:%llu "
+                "ProofRev:%llu Prepared:%llu Influence:%llu Bypass:%llu\n",
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.evaluations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.publications),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.selected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.legacyFallbacks),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.dispatchBound),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.commitBound),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.proofVerified),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.proofWaitSamples),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.disabled),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.busy),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.noHead),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.queueRejected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.upstreamRejected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.sessionRejected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.tokenRejected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.sourceRejected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.pcLineRejected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.modalRejected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.classRejected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.
+                    qualificationCandidates),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.qualifiedPureModal),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.qualifiedG00P1),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.qualificationFailures),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.
+                    qualificationInvalidations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.runtimeFailures),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.proofMismatches),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.
+                    invalidatedPendingBypasses),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.revocations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.disabledRevocations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.queueRevocations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.alarmRevocations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.resetRevocations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.programEndRevocations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.sourceRevocations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.runtimeRevocations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.proofRevocations),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.preparedSelections),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.runtimeInfluence),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.resolverBypasses));
+
+            RtPrintf(
+                "[NC02K42-NOP] Pub:%llu Decision:%s Lane:%s Sess:%llu "
+                "Entry:%llu QNoP:%llu DrainReq:%u DrainOK:%u DrainWait:%u "
+                "CbReq:%u CbCommit:%u WaitSeen:%u CbDone:%u Epoch:%llu "
+                "CommitEpoch:%llu Disp:%llu Commit:%llu Pending:%u Lock:%u "
+                "Acct:%u\n",
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.publicationSequence),
+                NCPreparedResolverBypassDecisionToDiagnosticName(
+                    preparedResolverBypassSnapshot.decision),
+                NCPreparedResolverBypassLaneToDiagnosticName(
+                    preparedResolverBypassSnapshot.lane),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.session),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.entrySequence),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.g00NoPQualifiedSession),
+                preparedResolverBypassSnapshot.legacyDrainRequired ? 1U : 0U,
+                preparedResolverBypassSnapshot.legacyDrainSatisfied ? 1U : 0U,
+                preparedResolverBypassSnapshot.deferredForDrain ? 1U : 0U,
+                preparedResolverBypassSnapshot.callbackRequired ? 1U : 0U,
+                preparedResolverBypassSnapshot.callbackActiveAtCommit
+                ? 1U : 0U,
+                preparedResolverBypassSnapshot.waitPhaseObserved ? 1U : 0U,
+                preparedResolverBypassSnapshot.callbackCompletionObserved
+                ? 1U : 0U,
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.executionEpoch),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.commitExecutionEpoch),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.dispatchId),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassSnapshot.commitSequence),
+                preparedResolverBypassSnapshot.pending ? 1U : 0U,
+                preparedResolverBypassSnapshot.permanentLockout ? 1U : 0U,
+                preparedResolverBypassSnapshot.accountingValid ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K42-CNT] DrainWait:%llu CbWait:%llu CbDone:%llu "
+                "WaitPhase:%llu QualNoP:%llu SelPure:%llu SelP1:%llu "
+                "SelNoP:%llu ProofPure:%llu ProofP1:%llu ProofNoP:%llu "
+                "Select:%llu Proof:%llu\n",
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.drainWaitSamples),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.callbackWaitSamples),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.callbackCompletions),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.ordinaryWaitPhases),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.qualifiedG00NoP),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.selectedPureModal),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.selectedG00P1),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.selectedG00NoP),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.proofVerifiedPureModal),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.proofVerifiedG00P1),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.proofVerifiedG00NoP),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.selected),
+                static_cast<unsigned long long>(
+                    preparedResolverBypassCounters.proofVerified));
+
+            RtPrintf(
+                "[NC02K5-ADM] Pub:%llu Decision:%s Revoke:%s Sess:%llu "
+                "Entry:%llu Owner:%u/%llu Panel:%X PC:%d Line:%d "
+                "Disp:%llu Commit:%llu Depth:%llu "
+                "Still:%u BusyS:%llu Block:0x%X Q:%u Env:%u Axis:%u "
+                "Project:%u Drained:%u Busy:%u Select:%u Bind:%u "
+                "CommitOK:%u Cb:%u CbDone:%u EpochAdv:%u Proof:%u "
+                "Done:%u Shadow:%u "
+                "Pending:%u Ready:%u Influence:%u Bypass:%u Lock:%u "
+                "Acct:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.publicationSequence),
+                NCOrdinaryG00AdmissionDecisionToDiagnosticName(
+                    ordinaryG00AdmissionSnapshot.decision),
+                NCOrdinaryG00AdmissionRevocationToDiagnosticName(
+                    ordinaryG00AdmissionSnapshot.lastRevocation),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.session),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.entrySequence),
+                static_cast<unsigned int>(
+                    ordinaryG00AdmissionSnapshot.owner),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.ownerGeneration),
+                static_cast<unsigned int>(
+                    ordinaryG00AdmissionSnapshot.panelMask),
+                ordinaryG00AdmissionSnapshot.sourcePC,
+                ordinaryG00AdmissionSnapshot.sourceLineNumber,
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.dispatchId),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.commitSequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.initialQueueDepth),
+                ordinaryG00AdmissionSnapshot.initialGroupStandstill
+                ? 1U : 0U,
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.busySamples),
+                static_cast<unsigned int>(
+                    ordinaryG00AdmissionSnapshot.blockerMask),
+                ordinaryG00AdmissionSnapshot.upstreamQualified ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.simpleG90Envelope ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.configuredAxisPresent
+                ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.projected ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.initialDrained ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.initialBusy ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.legacySelected ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.legacyDispatchBound ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.legacyCommitBound ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.legacyCallbackObserved
+                ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.legacyCallbackCompleted
+                ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.legacyEpochAdvanced ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.legacyUpstreamProofVerified
+                ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.legacyCompleted ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.shadowOnly ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.pending ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.cutoverReady ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.runtimeInfluence ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.resolverBypassed ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.permanentLockout ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.accountingValid ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K5-CNT] Scan:%llu Pub:%llu Unique:%llu Warmup:%llu "
+                "Project:%llu Cand:%llu Drained:%llu BusyToken:%llu "
+                "BusyS:%llu Select:%llu Bind:%llu Commit:%llu Wait:%llu "
+                "CbDone:%llu Done:%llu Reject:%llu MissingPath:%llu MissingTail:%llu "
+                "MissingFlight:%llu Mis:%llu RuntimeFail:%llu "
+                "PendingInv:%llu Revoke:%llu QRev:%llu AlarmRev:%llu "
+                "ResetRev:%llu EndRev:%llu SrcRev:%llu Cutover:%llu "
+                "Influence:%llu Bypass:%llu\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.scans),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.publications),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.uniqueEvaluations),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.warmup),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.projected),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.candidates),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.initialDrained),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.initialBusy),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.busySamples),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.legacySelections),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.legacyDispatchBound),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.legacyCommitBound),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.completionWaitSamples),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.callbackCompleted),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.legacyCompleted),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.rejected),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.missingCommandPathMode),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.
+                    missingTransactionalEndpoint),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.missingInflightRegistry),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.mismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.runtimeFailures),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.invalidatedPending),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.revocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.queueRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.alarmRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.resetRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.programEndRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.sourceRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.cutoverAttempts),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.runtimeInfluence),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.resolverBypasses));
 
             const std::uint64_t stopCommandMaxPps =
                 ScaleNonNegativeDiagnosticValue(
@@ -4642,5 +5341,7 @@ namespace HMI_Bridge
             alarmEmergencyStopChangeToken;
         previousJ5EventToken = j5EventToken;
         previousP1HandoverChangeToken = p1HandoverChangeToken;
+        previousCommandPathModeChangeToken =
+            commandPathModeChangeToken;
     }
 }

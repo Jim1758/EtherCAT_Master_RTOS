@@ -6,7 +6,30 @@
 #include <algorithm> // 確保也有這個，為了 std::max
 #include "EtherCatMaster.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
-void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double>& targetPos_mm, BufferMode mode)
+void MotionCore::G00_Move(
+    const std::vector<int>& axes,
+    const std::vector<double>& targetPos_mm,
+    BufferMode mode)
+{
+    // Backward-compatible API: preserve the accepted G00 mapping for any
+    // out-of-tree caller that has not yet supplied the independent K.6 field.
+    const MotionCommandPathMode commandPathMode =
+        mode == BufferMode::BUFFERED
+        ? MotionCommandPathMode::CONTINUOUS
+        : MotionCommandPathMode::EXACT_STOP;
+
+    G00_Move(
+        axes,
+        targetPos_mm,
+        mode,
+        commandPathMode);
+}
+
+void MotionCore::G00_Move(
+    const std::vector<int>& axes,
+    const std::vector<double>& targetPos_mm,
+    BufferMode mode,
+    MotionCommandPathMode commandPathMode)
 {
     if (m_pContexts == nullptr || axes.empty() || axes.size() != targetPos_mm.size()) return;
 
@@ -90,17 +113,22 @@ void MotionCore::G00_Move(const std::vector<int>& axes, const std::vector<double
         groupG00Vel_PPS = totalDist_Pulse / finalMotionTime;
     }
 
-    if (mode == BufferMode::ABORTING) 
-    {
-        SetGroupPathMode(PathMode::EXACT_STOP);
-    }
-    else {
-        SetGroupPathMode(PathMode::CONTINUOUS);
-    }
+    // Stage NC-0.2K.6.1 authority cutover:
+    // The NC Producer must not write m_Group.pathMode.  The explicit policy is
+    // release-published with this MotionCommand and only the authorized 250 us
+    // Consumer may apply it at the committed handoff.  BufferMode still owns
+    // admission/epoch behavior and remains an independent dimension.
 
-    LineMove(axes, targetPos_Pulse, groupG00Vel_PPS, groupAccTime, groupDecTime, mode);
+    LineMove(
+        axes,
+        targetPos_Pulse,
+        groupG00Vel_PPS,
+        groupAccTime,
+        groupDecTime,
+        mode,
+        commandPathMode);
 
- 
+
 }
 
 

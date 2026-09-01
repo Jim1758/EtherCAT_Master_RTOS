@@ -3,6 +3,7 @@
 #include "NCPreparedHeadResolverBypassGate.h"
 #include "MotionCommandPathModeTransport.h"
 #include "MotionQueueTailTransaction.h"
+#include "NCOrdinaryG00InflightTerminalRegistryShadow.h"
 
 #include <array>
 #include <cstddef>
@@ -25,7 +26,9 @@
 //   command-local EXACT_STOP, transactional queue-tail endpoint, and a bounded
 //   multi-dispatch terminal registry.  K.6.1 closes the first item and K.6.2
 //   closes only the transactional endpoint item from immutable, capture-bound
-//   Motion submission evidence; admission remains shadow-only.
+//   Motion submission evidence. K.6.3 closes the bounded in-flight terminal
+//   registry item from an independently verified registration proof;
+//   admission remains shadow-only.
 // =============================================================================
 
 enum class NCOrdinaryG00AdmissionDecision : std::uint8_t
@@ -93,6 +96,7 @@ struct NCOrdinaryG00AdmissionSnapshot
     std::uint64_t ownerGeneration = 0ULL;
     std::uint64_t sourceExecutionEpoch = 0ULL;
     std::uint64_t legacyCommitExecutionEpoch = 0ULL;
+    MotionExecutionIdentity legacyCommitIdentity{};
     int sourcePC = -1;
     int sourceLineNumber = 0;
     std::uint64_t dispatchId = 0ULL;
@@ -101,15 +105,38 @@ struct NCOrdinaryG00AdmissionSnapshot
     MotionQueueTailTransactionSequence queueTailTransactionSequence =
         MOTION_QUEUE_TAIL_TRANSACTION_SEQUENCE_INVALID;
     std::uint32_t queueTailAxisMask = 0U;
+    std::uint64_t queueTailBeforeFingerprint =
+        MOTION_QUEUE_TAIL_FINGERPRINT_SEED;
+    std::uint64_t queueTailCommittedFingerprint =
+        MOTION_QUEUE_TAIL_FINGERPRINT_SEED;
+    std::uint64_t inflightRegistrySequence = 0ULL;
+    MotionExecutionEpoch inflightExecutionEpoch =
+        MOTION_EXECUTION_EPOCH_INVALID;
+    MotionSegmentId inflightSegmentId = MOTION_SEGMENT_ID_INVALID;
 
     std::uint64_t initialQueueDepth = 0ULL;
     std::uint64_t busySamples = 0ULL;
     std::uint32_t blockerMask = NC_ORDINARY_G00_BLOCKER_NONE;
 
+    // Diagnostic-only rejection evidence.  A set bit identifies a failed
+    // prerequisite; these fields never participate in Runtime decisions.
+    std::uint64_t baseEvidenceFailureMask = 0ULL;
+    std::uint64_t modalEnvelopeFailureMask = 0ULL;
+    std::uint32_t busyRouteFailureMask = 0U;
+    std::uint32_t drainedRouteFailureMask = 0U;
+    NCPreparedResolverBypassDecision observedBypassDecision =
+        NCPreparedResolverBypassDecision::IDLE;
+
     bool initialGroupStandstill = true;
     bool upstreamQualified = false;
     bool simpleG90Envelope = false;
     bool configuredAxisPresent = false;
+    bool resolverBypassedInput = false;
+    bool observedBypassSelected = false;
+    bool observedBypassResolverBypassed = false;
+    bool observedBypassLaneQualified = false;
+    bool observedBypassDeferredForDrain = false;
+    bool observedLegacyDrainSatisfied = false;
     bool projected = false;
     bool initialDrained = false;
     bool initialBusy = false;
@@ -121,6 +148,7 @@ struct NCOrdinaryG00AdmissionSnapshot
     bool legacyEpochAdvanced = false;
     bool commandPathModeProven = false;
     bool transactionalEndpointProven = false;
+    bool inflightRegistryProven = false;
     bool legacyUpstreamProofVerified = false;
     bool legacyCompleted = false;
 
@@ -162,6 +190,7 @@ struct NCOrdinaryG00AdmissionCounters
     std::uint64_t missingCommandPathMode = 0ULL;
     std::uint64_t missingTransactionalEndpoint = 0ULL;
     std::uint64_t missingInflightRegistry = 0ULL;
+    std::uint64_t inflightRegistryBound = 0ULL;
 
     std::uint64_t mismatches = 0ULL;
     std::uint64_t runtimeFailures = 0ULL;
@@ -228,6 +257,27 @@ public:
                 bypass,
                 configuredAxisPresent) &&
             SimpleG90Envelope(context);
+        const std::uint64_t baseEvidenceFailureMask =
+            BuildBaseEvidenceFailureMask(
+                context,
+                bypass,
+                configuredAxisPresent);
+        const std::uint64_t modalEnvelopeFailureMask =
+            BuildSimpleG90EnvelopeFailureMask(context);
+        const std::uint32_t busyRouteFailureMask =
+            BuildBusyRouteFailureMask(
+                context,
+                bypass,
+                resolverBypassed,
+                queueDepth,
+                groupStandstill);
+        const std::uint32_t drainedRouteFailureMask =
+            BuildDrainedRouteFailureMask(
+                context,
+                bypass,
+                resolverBypassed,
+                queueDepth,
+                groupStandstill);
 
         if (m_pending && !KeyEqual(key, m_pendingKey))
         {
@@ -246,14 +296,40 @@ public:
             ResetTokenSnapshot();
         }
 
-        // One immutable token receives exactly one initial classification.
-        // Re-observation is useful only while that same candidate is pending
-        // (for example, repeated WAIT_LEGACY_DRAIN scans).
+        // A rejected/warmup token is immutable.  Keep the evidence captured
+        // by its first classification instead of letting later scans rewrite
+        // the diagnostic snapshot without a matching publication.
         if (alreadySeen && !m_pending)
         {
             return;
         }
 
+        // Preserve the exact first-classification evidence even when the
+        // immutable token is rejected.  The former Env:0/Axis:0 snapshot did
+        // not distinguish a modal-envelope mismatch from a K.4.2 route
+        // mismatch, which made hardware qualification ambiguous.
+        m_snapshot.baseEvidenceFailureMask = baseEvidenceFailureMask;
+        m_snapshot.modalEnvelopeFailureMask = modalEnvelopeFailureMask;
+        m_snapshot.busyRouteFailureMask = busyRouteFailureMask;
+        m_snapshot.drainedRouteFailureMask = drainedRouteFailureMask;
+        m_snapshot.observedBypassDecision = bypass.decision;
+        m_snapshot.upstreamQualified = bypass.laneQualified;
+        m_snapshot.simpleG90Envelope =
+            modalEnvelopeFailureMask == 0ULL;
+        m_snapshot.configuredAxisPresent = configuredAxisPresent;
+        m_snapshot.resolverBypassedInput = resolverBypassed;
+        m_snapshot.observedBypassSelected = bypass.selected;
+        m_snapshot.observedBypassResolverBypassed =
+            bypass.resolverBypassed;
+        m_snapshot.observedBypassLaneQualified = bypass.laneQualified;
+        m_snapshot.observedBypassDeferredForDrain =
+            bypass.deferredForDrain;
+        m_snapshot.observedLegacyDrainSatisfied =
+            context.legacyDrainSatisfied;
+
+        // One immutable token receives exactly one initial classification.
+        // Re-observation is useful only while that same candidate is pending
+        // (for example, repeated WAIT_LEGACY_DRAIN scans).
         if (m_permanentLockout)
         {
             if (!alreadySeen)
@@ -482,6 +558,7 @@ public:
         m_snapshot.commitSequence = evidence.commitSequence;
         m_snapshot.legacyCommitExecutionEpoch =
             evidence.currentExecutionEpoch;
+        m_snapshot.legacyCommitIdentity = evidence.submissionIdentity;
         m_snapshot.legacyDispatchBound = true;
         m_snapshot.legacyCommitBound = true;
         m_snapshot.legacyCallbackObserved = true;
@@ -491,6 +568,10 @@ public:
         m_snapshot.queueTailTransactionSequence =
             queueTail.transactionSequence;
         m_snapshot.queueTailAxisMask = queueTail.axisMask;
+        m_snapshot.queueTailBeforeFingerprint =
+            queueTail.beforeFingerprint;
+        m_snapshot.queueTailCommittedFingerprint =
+            queueTail.committedFingerprint;
         m_snapshot.blockerMask &=
             ~static_cast<std::uint32_t>(
                 NC_ORDINARY_G00_BLOCKER_COMMAND_PATH_MODE);
@@ -546,6 +627,102 @@ public:
         m_snapshot.legacyCallbackCompleted = true;
         ++m_counters.callbackCompleted;
         Publish(NCOrdinaryG00AdmissionDecision::CALLBACK_COMPLETED);
+    }
+
+    void ObserveInflightRegistryRegistration(
+        const NCOrdinaryG00InflightRegistrationProof& proof) noexcept
+    {
+        if (!m_pending || !m_snapshot.legacyCommitBound)
+        {
+            return;
+        }
+
+        const bool exact =
+            proof.registered &&
+            proof.exact &&
+            proof.active &&
+            proof.bounded &&
+            proof.shadowOnly &&
+            !proof.runtimeInfluence &&
+            !proof.motionWrite &&
+            proof.accountingValid &&
+            proof.registrySequence != 0ULL &&
+            proof.session == m_snapshot.session &&
+            proof.entrySequence == m_snapshot.entrySequence &&
+            proof.scope == m_snapshot.scope &&
+            proof.cacheGeneration == m_snapshot.cacheGeneration &&
+            proof.frameId == m_snapshot.frameId &&
+            proof.sourceExecutionEpoch ==
+            m_snapshot.sourceExecutionEpoch &&
+            proof.programFlowGeneration ==
+            m_snapshot.programFlowGeneration &&
+            proof.owner == m_snapshot.owner &&
+            proof.panelMask == m_snapshot.panelMask &&
+            proof.ownerGeneration == m_snapshot.ownerGeneration &&
+            proof.sourcePC == m_snapshot.sourcePC &&
+            proof.sourceLineNumber == m_snapshot.sourceLineNumber &&
+            proof.dispatchId == m_snapshot.dispatchId &&
+            proof.commitSequence == m_snapshot.commitSequence &&
+            proof.identity.IsAssigned() &&
+            proof.identity.epoch ==
+            m_snapshot.legacyCommitIdentity.epoch &&
+            proof.identity.segmentId ==
+            m_snapshot.legacyCommitIdentity.segmentId &&
+            proof.identity.sourceBlockId ==
+            m_snapshot.legacyCommitIdentity.sourceBlockId &&
+            proof.identity.source ==
+            m_snapshot.legacyCommitIdentity.source &&
+            proof.ownerLease.IsValid() &&
+            proof.ownerLease.owner == MotionOwner::AUTO &&
+            static_cast<std::uint8_t>(proof.ownerLease.owner) ==
+            m_snapshot.owner &&
+            static_cast<std::uint64_t>(proof.ownerLease.generation) ==
+            m_snapshot.ownerGeneration &&
+            proof.queueTailTransactionSequence ==
+            m_snapshot.queueTailTransactionSequence &&
+            proof.queueTailAxisMask == m_snapshot.queueTailAxisMask &&
+            proof.queueTailBeforeFingerprint ==
+            m_snapshot.queueTailBeforeFingerprint &&
+            proof.queueTailCommittedFingerprint ==
+            m_snapshot.queueTailCommittedFingerprint &&
+            proof.queueTailTransactionSequence !=
+            MOTION_QUEUE_TAIL_TRANSACTION_SEQUENCE_INVALID &&
+            proof.queueTailAxisMask != 0U;
+
+        if (m_snapshot.inflightRegistryProven)
+        {
+            const bool exactReplay =
+                exact &&
+                proof.registrySequence ==
+                m_snapshot.inflightRegistrySequence &&
+                proof.identity.epoch ==
+                m_snapshot.inflightExecutionEpoch &&
+                proof.identity.segmentId ==
+                m_snapshot.inflightSegmentId;
+            if (exactReplay)
+            {
+                return;
+            }
+            FailMismatch();
+            return;
+        }
+
+        if (!exact)
+        {
+            ++m_counters.missingInflightRegistry;
+            FailMismatch();
+            return;
+        }
+
+        m_snapshot.inflightRegistrySequence = proof.registrySequence;
+        m_snapshot.inflightExecutionEpoch = proof.identity.epoch;
+        m_snapshot.inflightSegmentId = proof.identity.segmentId;
+        m_snapshot.inflightRegistryProven = true;
+        m_snapshot.blockerMask &=
+            ~static_cast<std::uint32_t>(
+                NC_ORDINARY_G00_BLOCKER_INFLIGHT_REGISTRY);
+        ++m_counters.inflightRegistryBound;
+        Publish(NCOrdinaryG00AdmissionDecision::LEGACY_COMMITTED);
     }
 
     void ObserveUpstreamProof(
@@ -868,11 +1045,126 @@ private:
             bypass.accountingValid;
     }
 
+    static constexpr std::uint64_t EvidenceFailureBit(
+        unsigned int index) noexcept
+    {
+        return 1ULL << index;
+    }
+
+    // Bit mapping is intentionally stable and documented in the diagnostic
+    // handoff.  This mirrors BaseEvidenceExact() without changing its result.
+    static std::uint64_t BuildBaseEvidenceFailureMask(
+        const NCPreparedHeadCutoverContext& context,
+        const NCPreparedResolverBypassSnapshot& bypass,
+        bool configuredAxisPresent) noexcept
+    {
+        std::uint64_t mask = 0ULL;
+        if (!context.hasHead) mask |= EvidenceFailureBit(0U);
+        if (!context.capturedBeforeResolve) mask |= EvidenceFailureBit(1U);
+        if (!context.runtimeModalBeforeValid) mask |= EvidenceFailureBit(2U);
+        if (!context.queue.active) mask |= EvidenceFailureBit(3U);
+        if (!context.queue.valid) mask |= EvidenceFailureBit(4U);
+        if (!context.queue.accountingValid) mask |= EvidenceFailureBit(5U);
+        if (context.queue.session == NC_PREPARED_QUEUE_SESSION_INVALID)
+            mask |= EvidenceFailureBit(6U);
+        if (context.queue.session != context.head.session)
+            mask |= EvidenceFailureBit(7U);
+        if (context.queue.runtimeCurrentPC != context.sourcePC)
+            mask |= EvidenceFailureBit(8U);
+        if (context.head.entrySequence == NC_PREPARED_ENTRY_SEQUENCE_INVALID)
+            mask |= EvidenceFailureBit(9U);
+        if (context.head.sourcePC != context.sourcePC)
+            mask |= EvidenceFailureBit(10U);
+        if (context.head.sourceLineNumber != context.sourceLineNumber)
+            mask |= EvidenceFailureBit(11U);
+        if (!SourceExact(context.head.source, context.runtimeSource))
+            mask |= EvidenceFailureBit(12U);
+        if (context.runtimeSource.scope != NCProgramScope::MEMORY)
+            mask |= EvidenceFailureBit(13U);
+        if (context.runtimeSource.frameId != NC_PROGRAM_FRAME_ID_INVALID)
+            mask |= EvidenceFailureBit(14U);
+        if (context.runtimeSource.panel.blockSkipEnabled)
+            mask |= EvidenceFailureBit(15U);
+        if (context.runtimeSource.panel.singleBlockEnabled)
+            mask |= EvidenceFailureBit(16U);
+        if (context.runtimeSource.panel.optionalStopEnabled)
+            mask |= EvidenceFailureBit(17U);
+        if (!context.legacyDrainRequired) mask |= EvidenceFailureBit(18U);
+        if (!context.head.classification.legacyDrainRequired)
+            mask |= EvidenceFailureBit(19U);
+        if (context.head.classification.blockClass !=
+            NCPreparedBlockClass::MOTION_SHADOW)
+            mask |= EvidenceFailureBit(20U);
+        if (context.head.classification.primaryGCode != 0)
+            mask |= EvidenceFailureBit(21U);
+        if (!context.head.classification.literalResolved)
+            mask |= EvidenceFailureBit(22U);
+        if (!context.head.classification.modalAfterValid)
+            mask |= EvidenceFailureBit(23U);
+        if (context.head.classification.planningStopsHere)
+            mask |= EvidenceFailureBit(24U);
+        if (context.head.classification.barrierKind !=
+            NCPreparedBarrierKind::NONE)
+            mask |= EvidenceFailureBit(25U);
+        if (context.head.classification.barrierFlags !=
+            NC_PREPARED_BARRIER_FLAG_NONE)
+            mask |= EvidenceFailureBit(26U);
+        if (!configuredAxisPresent) mask |= EvidenceFailureBit(27U);
+        if (bypass.session != context.head.session)
+            mask |= EvidenceFailureBit(28U);
+        if (bypass.entrySequence != context.head.entrySequence)
+            mask |= EvidenceFailureBit(29U);
+        if (bypass.sourcePC != context.sourcePC)
+            mask |= EvidenceFailureBit(30U);
+        if (bypass.sourceLineNumber != context.sourceLineNumber)
+            mask |= EvidenceFailureBit(31U);
+        if (bypass.executionEpoch != context.runtimeSource.executionEpoch)
+            mask |= EvidenceFailureBit(32U);
+        if (bypass.scope != context.runtimeSource.scope)
+            mask |= EvidenceFailureBit(33U);
+        if (bypass.cacheGeneration != context.runtimeSource.cacheGeneration)
+            mask |= EvidenceFailureBit(34U);
+        if (bypass.frameId != context.runtimeSource.frameId)
+            mask |= EvidenceFailureBit(35U);
+        if (bypass.programFlowGeneration !=
+            context.runtimeSource.programFlowGeneration)
+            mask |= EvidenceFailureBit(36U);
+        if (bypass.owner != context.runtimeSource.owner)
+            mask |= EvidenceFailureBit(37U);
+        if (bypass.ownerGeneration != context.runtimeSource.ownerGeneration)
+            mask |= EvidenceFailureBit(38U);
+        if (bypass.panelMask != PanelMask(context.runtimeSource.panel))
+            mask |= EvidenceFailureBit(39U);
+        if (bypass.g00NoPQualifiedSession !=
+            (bypass.laneQualified
+                ? context.head.session
+                : NC_PREPARED_QUEUE_SESSION_INVALID))
+            mask |= EvidenceFailureBit(40U);
+        if (!bypass.queueExact) mask |= EvidenceFailureBit(41U);
+        if (!bypass.upstreamHealthy) mask |= EvidenceFailureBit(42U);
+        if (!bypass.tokenExact) mask |= EvidenceFailureBit(43U);
+        if (!bypass.sourceExact) mask |= EvidenceFailureBit(44U);
+        if (!bypass.pcLineExact) mask |= EvidenceFailureBit(45U);
+        if (!bypass.modalExact) mask |= EvidenceFailureBit(46U);
+        if (!bypass.classEligible) mask |= EvidenceFailureBit(47U);
+        if (!bypass.literalRebuiltExact) mask |= EvidenceFailureBit(48U);
+        if (!bypass.legacyDrainRequired) mask |= EvidenceFailureBit(49U);
+        if (bypass.permanentLockout) mask |= EvidenceFailureBit(50U);
+        if (!bypass.accountingValid) mask |= EvidenceFailureBit(51U);
+        return mask;
+    }
+
     static bool SimpleG90Envelope(
         const NCPreparedHeadCutoverContext& context) noexcept
     {
+        // Modal words on a motion block take effect for that same block.
+        // runtimeModalBefore is still proven exact against head.modalBefore by
+        // BaseEvidenceExact() / K.4, but the motion envelope must be evaluated
+        // from the immutable, literal-rebuilt modalAfter image.  Otherwise a
+        // valid "G90 G00 ..." block entered while G91 is active is rejected
+        // solely because its pre-block image is incremental.
         const NCPreparedModalSnapshot& modal =
-            context.runtimeModalBefore;
+            context.head.modalAfter;
         return
             modal.imageValid &&
             modal.distanceMode == 90 &&
@@ -892,6 +1184,70 @@ private:
             !modal.polarActive &&
             modal.cAxisOffsetRotationEnabled &&
             !modal.modalMacroActive;
+    }
+
+    // This mirrors SimpleG90Envelope() and is diagnostic-only.
+    static std::uint64_t BuildSimpleG90EnvelopeFailureMask(
+        const NCPreparedHeadCutoverContext& context) noexcept
+    {
+        const NCPreparedModalSnapshot& modal = context.head.modalAfter;
+        std::uint64_t mask = 0ULL;
+        if (!modal.imageValid) mask |= EvidenceFailureBit(0U);
+        if (modal.distanceMode != 90) mask |= EvidenceFailureBit(1U);
+        if (modal.unitsMode != 21) mask |= EvidenceFailureBit(2U);
+        if (modal.planeMode != 17) mask |= EvidenceFailureBit(3U);
+        if (modal.workCoordinateCode != 54) mask |= EvidenceFailureBit(4U);
+        if (modal.storedStrokeMode != 22) mask |= EvidenceFailureBit(5U);
+        if (modal.toolLengthMode != 49) mask |= EvidenceFailureBit(6U);
+        if (modal.toolRadiusMode != 40) mask |= EvidenceFailureBit(7U);
+        if (modal.g68Active) mask |= EvidenceFailureBit(8U);
+        if (modal.g168Active) mask |= EvidenceFailureBit(9U);
+        if (modal.scalingActive) mask |= EvidenceFailureBit(10U);
+        if (modal.mirrorMask != 0U) mask |= EvidenceFailureBit(11U);
+        if (modal.polarActive) mask |= EvidenceFailureBit(12U);
+        if (!modal.cAxisOffsetRotationEnabled)
+            mask |= EvidenceFailureBit(13U);
+        if (modal.modalMacroActive) mask |= EvidenceFailureBit(14U);
+        return mask;
+    }
+
+    static std::uint32_t BuildBusyRouteFailureMask(
+        const NCPreparedHeadCutoverContext& context,
+        const NCPreparedResolverBypassSnapshot& bypass,
+        bool resolverBypassed,
+        std::uint64_t queueDepth,
+        bool groupStandstill) noexcept
+    {
+        std::uint32_t mask = 0U;
+        if (bypass.decision !=
+            NCPreparedResolverBypassDecision::WAIT_LEGACY_DRAIN)
+            mask |= 1U << 0U;
+        if (resolverBypassed) mask |= 1U << 1U;
+        if (!bypass.laneQualified) mask |= 1U << 2U;
+        if (!bypass.deferredForDrain) mask |= 1U << 3U;
+        if (context.legacyDrainSatisfied) mask |= 1U << 4U;
+        if (queueDepth == 0ULL && groupStandstill) mask |= 1U << 5U;
+        return mask;
+    }
+
+    static std::uint32_t BuildDrainedRouteFailureMask(
+        const NCPreparedHeadCutoverContext& context,
+        const NCPreparedResolverBypassSnapshot& bypass,
+        bool resolverBypassed,
+        std::uint64_t queueDepth,
+        bool groupStandstill) noexcept
+    {
+        std::uint32_t mask = 0U;
+        if (bypass.decision != NCPreparedResolverBypassDecision::SELECTED)
+            mask |= 1U << 0U;
+        if (!resolverBypassed) mask |= 1U << 1U;
+        if (!bypass.selected) mask |= 1U << 2U;
+        if (!bypass.resolverBypassed) mask |= 1U << 3U;
+        if (!bypass.laneQualified) mask |= 1U << 4U;
+        if (!context.legacyDrainSatisfied) mask |= 1U << 5U;
+        if (queueDepth != 0ULL) mask |= 1U << 6U;
+        if (!groupStandstill) mask |= 1U << 7U;
+        return mask;
     }
 
     bool HasSeen(const TokenKey& key) const noexcept
@@ -1011,7 +1367,6 @@ private:
         {
             ++m_counters.initialDrained;
         }
-        ++m_counters.missingInflightRegistry;
     }
 
     void FailMismatch() noexcept
@@ -1092,8 +1447,11 @@ private:
             m_counters.missingTransactionalEndpoint <=
             m_counters.candidates -
             m_counters.legacyCommitBound &&
-            m_counters.missingInflightRegistry ==
-            m_counters.candidates &&
+            m_counters.inflightRegistryBound <=
+            m_counters.legacyCommitBound &&
+            m_counters.missingInflightRegistry <=
+            m_counters.legacyCommitBound -
+            m_counters.inflightRegistryBound &&
             m_counters.cutoverAttempts == 0ULL &&
             m_counters.runtimeInfluence == 0ULL &&
             m_counters.resolverBypasses == 0ULL;

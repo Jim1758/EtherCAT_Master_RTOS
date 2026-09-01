@@ -139,6 +139,7 @@
     <ClInclude Include="NCLifecycleInterruptionBoundary.h" />
     <ClInclude Include="NCManager.h" />
     <ClInclude Include="NCOrdinaryG00BufferedExactStopAdmissionShadow.h" />
+    <ClInclude Include="NCOrdinaryG00InflightTerminalRegistryShadow.h" />
     <ClInclude Include="NCPLCManager.h" />
     <ClInclude Include="NCPLCMap.h" />
     <ClInclude Include="NCPreparedBlockQueueShadow.h" />

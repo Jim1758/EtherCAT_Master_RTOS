@@ -578,6 +578,9 @@
     <ClInclude Include="MotionQueueTailTransaction.h">
       <Filter>Header Files\Motion</Filter>
     </ClInclude>
+    <ClInclude Include="NCOrdinaryG00InflightTerminalRegistryShadow.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="DC同步_相關設定說明.txt">

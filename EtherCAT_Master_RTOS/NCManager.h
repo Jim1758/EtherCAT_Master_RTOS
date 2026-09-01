@@ -13,6 +13,7 @@
 #include "NCPreparedHeadPreResolveAdmissionShadow.h" // Stage NC-0.2K.4：Pre-Resolve Admission Shadow
 #include "NCPreparedHeadResolverBypassGate.h" // Stage NC-0.2K.4.2：Ordinary G00 Controlled Resolver Bypass
 #include "NCOrdinaryG00BufferedExactStopAdmissionShadow.h" // Stage NC-0.2K.5：Ordinary G00 Buffered Exact-Stop Admission Shadow
+#include "NCOrdinaryG00InflightTerminalRegistryShadow.h" // Stage NC-0.2K.6.3：Bounded In-Flight Terminal Registry Shadow
 #include "NCBlockLifecycleLedger.h" // Stage NC-0.2D：Block / Motion Lifecycle
 #include "NCBlockCompletionBoundary.h" // Stage NC-0.2F：Motion Completion Dual-Key Guard
 #include "NCProgramEndBoundary.h" // Stage NC-0.2G：Program End / Cycle End Gate
@@ -658,6 +659,27 @@ public:
         return m_ordinaryG00AdmissionShadow.GetCounters();
     }
 
+    NCOrdinaryG00InflightRegistrySnapshot
+        GetOrdinaryG00InflightRegistrySnapshot() const noexcept
+    {
+        return m_ordinaryG00InflightRegistryShadow.GetSnapshot();
+    }
+
+    NCOrdinaryG00InflightRegistryCounters
+        GetOrdinaryG00InflightRegistryCounters() const noexcept
+    {
+        return m_ordinaryG00InflightRegistryShadow.GetCounters();
+    }
+
+    bool GetOrdinaryG00InflightRegistryEntry(
+        std::size_t slot,
+        NCOrdinaryG00InflightEntrySnapshot& entry) const noexcept
+    {
+        return m_ordinaryG00InflightRegistryShadow.TryGetEntry(
+            slot,
+            entry);
+    }
+
     NCSingleBlockShadowSnapshot
         GetSingleBlockShadowSnapshot() const noexcept
     {
@@ -934,6 +956,12 @@ private:
     // remains the sole Runtime path in this stage.
     NCOrdinaryG00BufferedExactStopAdmissionShadow
         m_ordinaryG00AdmissionShadow{};
+
+    // Stage NC-0.2K.6.3: independently binds each accepted ordinary G00 to
+    // one fixed-capacity terminal slot.  It is an NC-thread-only observer and
+    // never writes Motion, PC, callback, Epoch, owner, or PDO state.
+    NCOrdinaryG00InflightTerminalRegistryShadow
+        m_ordinaryG00InflightRegistryShadow{};
 
     // Stage NC-0.2I.1：只觀察 Single Block 正確完成點。
     NCSingleBlockBoundaryShadow m_singleBlockBoundaryShadow{};

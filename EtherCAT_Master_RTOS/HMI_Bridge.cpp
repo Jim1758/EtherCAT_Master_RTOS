@@ -1979,6 +1979,12 @@ namespace HMI_Bridge
         const NCOrdinaryG00AdmissionCounters
             ordinaryG00AdmissionCounters =
             nc->GetOrdinaryG00AdmissionCounters();
+        const NCOrdinaryG00InflightRegistrySnapshot
+            ordinaryG00InflightRegistrySnapshot =
+            nc->GetOrdinaryG00InflightRegistrySnapshot();
+        const NCOrdinaryG00InflightRegistryCounters
+            ordinaryG00InflightRegistryCounters =
+            nc->GetOrdinaryG00InflightRegistryCounters();
         NCPreparedBlockEntrySnapshot preparedQueueHead{};
         NCPreparedBlockEntrySnapshot preparedQueueTail{};
         const bool hasPreparedQueueHead =
@@ -2271,7 +2277,42 @@ namespace HMI_Bridge
             ordinaryG00AdmissionCounters.revocations,
             ordinaryG00AdmissionCounters.runtimeInfluence,
             ordinaryG00AdmissionCounters.resolverBypasses,
-            ordinaryG00AdmissionCounters.cutoverAttempts
+            ordinaryG00AdmissionCounters.cutoverAttempts,
+            ordinaryG00AdmissionCounters.inflightRegistryBound,
+            ordinaryG00AdmissionSnapshot.inflightRegistrySequence,
+            ordinaryG00AdmissionSnapshot.inflightExecutionEpoch,
+            ordinaryG00AdmissionSnapshot.inflightSegmentId,
+            ordinaryG00AdmissionSnapshot.inflightRegistryProven
+                ? 1ULL : 0ULL,
+            ordinaryG00InflightRegistrySnapshot.publicationSequence,
+            ordinaryG00InflightRegistrySnapshot.lastRegistrySequence,
+            ordinaryG00InflightRegistrySnapshot.currentSession,
+            ordinaryG00InflightRegistrySnapshot.activeEntries,
+            ordinaryG00InflightRegistrySnapshot.revokedPendingEntries,
+            ordinaryG00InflightRegistrySnapshot.permanentLockout
+                ? 1ULL : 0ULL,
+            ordinaryG00InflightRegistrySnapshot.accountingValid
+                ? 1ULL : 0ULL,
+            ordinaryG00InflightRegistryCounters.registrationAttempts,
+            ordinaryG00InflightRegistryCounters.registered,
+            ordinaryG00InflightRegistryCounters.registrationRejected,
+            ordinaryG00InflightRegistryCounters.capacityOverflow,
+            ordinaryG00InflightRegistryCounters.terminal,
+            ordinaryG00InflightRegistryCounters.completed,
+            ordinaryG00InflightRegistryCounters.rejected,
+            ordinaryG00InflightRegistryCounters.cancelled,
+            ordinaryG00InflightRegistryCounters.aborted,
+            ordinaryG00InflightRegistryCounters.faulted,
+            ordinaryG00InflightRegistryCounters.feedbackSequenceGaps,
+            ordinaryG00InflightRegistryCounters.ledgerOrphans,
+            ordinaryG00InflightRegistryCounters.identityConflicts,
+            ordinaryG00InflightRegistryCounters.ownerMismatches,
+            ordinaryG00InflightRegistryCounters.duplicateTerminal,
+            ordinaryG00InflightRegistryCounters.terminalConflict,
+            ordinaryG00InflightRegistryCounters.entriesRevoked,
+            ordinaryG00InflightRegistryCounters.revokedTerminals,
+            ordinaryG00InflightRegistryCounters.runtimeInfluence,
+            ordinaryG00InflightRegistryCounters.motionWrites
         };
         std::uint64_t preparedEquivalenceChangeToken = 0ULL;
         for (const std::uint64_t value :
@@ -4140,7 +4181,8 @@ namespace HMI_Bridge
                 "Disp:%llu Commit:%llu Depth:%llu "
                 "Still:%u BusyS:%llu Block:0x%X Q:%u Env:%u Axis:%u "
                 "Project:%u Drained:%u Busy:%u Select:%u Bind:%u "
-                "CommitOK:%u Cb:%u CbDone:%u EpochAdv:%u Proof:%u "
+                "CommitOK:%u Flight:%u FSeq:%llu FEpoch:%u FSeg:%llu "
+                "Cb:%u CbDone:%u EpochAdv:%u Proof:%u "
                 "Done:%u Shadow:%u "
                 "Pending:%u Ready:%u Influence:%u Bypass:%u Lock:%u "
                 "Acct:%u\n",
@@ -4184,6 +4226,14 @@ namespace HMI_Bridge
                 ordinaryG00AdmissionSnapshot.legacySelected ? 1U : 0U,
                 ordinaryG00AdmissionSnapshot.legacyDispatchBound ? 1U : 0U,
                 ordinaryG00AdmissionSnapshot.legacyCommitBound ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.inflightRegistryProven
+                ? 1U : 0U,
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.inflightRegistrySequence),
+                static_cast<unsigned int>(
+                    ordinaryG00AdmissionSnapshot.inflightExecutionEpoch),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.inflightSegmentId),
                 ordinaryG00AdmissionSnapshot.legacyCallbackObserved
                 ? 1U : 0U,
                 ordinaryG00AdmissionSnapshot.legacyCallbackCompleted
@@ -4201,10 +4251,39 @@ namespace HMI_Bridge
                 ordinaryG00AdmissionSnapshot.accountingValid ? 1U : 0U);
 
             RtPrintf(
+                "[NC02K5-ENV] BaseFail:0x%013llX ModalFail:0x%04llX "
+                "BusyFail:0x%02X DrainedFail:0x%02X BDecision:%s "
+                "ResolverInput:%u Selected:%u BypassField:%u LaneQ:%u "
+                "Deferred:%u DrainOK:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.
+                    baseEvidenceFailureMask),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionSnapshot.
+                    modalEnvelopeFailureMask),
+                static_cast<unsigned int>(
+                    ordinaryG00AdmissionSnapshot.busyRouteFailureMask),
+                static_cast<unsigned int>(
+                    ordinaryG00AdmissionSnapshot.drainedRouteFailureMask),
+                NCPreparedResolverBypassDecisionToDiagnosticName(
+                    ordinaryG00AdmissionSnapshot.observedBypassDecision),
+                ordinaryG00AdmissionSnapshot.resolverBypassedInput ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.observedBypassSelected ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.
+                observedBypassResolverBypassed ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.
+                observedBypassLaneQualified ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.
+                observedBypassDeferredForDrain ? 1U : 0U,
+                ordinaryG00AdmissionSnapshot.
+                observedLegacyDrainSatisfied ? 1U : 0U);
+
+            RtPrintf(
                 "[NC02K5-CNT] Scan:%llu Pub:%llu Unique:%llu Warmup:%llu "
                 "Project:%llu Cand:%llu Drained:%llu BusyToken:%llu "
                 "BusyS:%llu Select:%llu Bind:%llu Commit:%llu Wait:%llu "
-                "CbDone:%llu Done:%llu Reject:%llu MissingPath:%llu MissingTail:%llu "
+                "FlightBind:%llu CbDone:%llu Done:%llu Reject:%llu "
+                "MissingPath:%llu MissingTail:%llu "
                 "MissingFlight:%llu Mis:%llu RuntimeFail:%llu "
                 "PendingInv:%llu Revoke:%llu QRev:%llu AlarmRev:%llu "
                 "ResetRev:%llu EndRev:%llu SrcRev:%llu Cutover:%llu "
@@ -4235,6 +4314,8 @@ namespace HMI_Bridge
                     ordinaryG00AdmissionCounters.legacyCommitBound),
                 static_cast<unsigned long long>(
                     ordinaryG00AdmissionCounters.completionWaitSamples),
+                static_cast<unsigned long long>(
+                    ordinaryG00AdmissionCounters.inflightRegistryBound),
                 static_cast<unsigned long long>(
                     ordinaryG00AdmissionCounters.callbackCompleted),
                 static_cast<unsigned long long>(
@@ -4272,6 +4353,168 @@ namespace HMI_Bridge
                     ordinaryG00AdmissionCounters.runtimeInfluence),
                 static_cast<unsigned long long>(
                     ordinaryG00AdmissionCounters.resolverBypasses));
+
+            const NCOrdinaryG00InflightEntrySnapshot& inflightLast =
+                ordinaryG00InflightRegistrySnapshot.lastEntry;
+            RtPrintf(
+                "[NC02K63-FLIGHT] Pub:%llu Seq:%llu Sess:%llu Entry:%llu "
+                "Disp:%llu Commit:%llu Epoch:%u Seg:%llu SrcBlk:%d "
+                "Owner:%u/%u State:%s Revoke:%s Active:%u Term:%u "
+                "Revoked:%u Slots:%u ActiveN:%u RevPend:%u Peak:%u "
+                "Ready:%u Lock:%u Bounded:%u Shadow:%u Influence:%u "
+                "MotionWrite:%u Acct:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistrySnapshot.publicationSequence),
+                static_cast<unsigned long long>(
+                    inflightLast.registrySequence),
+                static_cast<unsigned long long>(inflightLast.session),
+                static_cast<unsigned long long>(inflightLast.entrySequence),
+                static_cast<unsigned long long>(inflightLast.dispatchId),
+                static_cast<unsigned long long>(inflightLast.commitSequence),
+                static_cast<unsigned int>(inflightLast.identity.epoch),
+                static_cast<unsigned long long>(
+                    inflightLast.identity.segmentId),
+                static_cast<int>(inflightLast.identity.sourceBlockId),
+                static_cast<unsigned int>(inflightLast.ownerLease.owner),
+                static_cast<unsigned int>(inflightLast.ownerLease.generation),
+                NCOrdinaryG00InflightStateToDiagnosticName(
+                    inflightLast.state),
+                NCOrdinaryG00InflightRevocationToDiagnosticName(
+                    inflightLast.revocation),
+                inflightLast.active ? 1U : 0U,
+                inflightLast.terminal ? 1U : 0U,
+                inflightLast.revoked ? 1U : 0U,
+                ordinaryG00InflightRegistrySnapshot.occupiedEntries,
+                ordinaryG00InflightRegistrySnapshot.activeEntries,
+                ordinaryG00InflightRegistrySnapshot.revokedPendingEntries,
+                ordinaryG00InflightRegistrySnapshot.peakActiveEntries,
+                ordinaryG00InflightRegistrySnapshot.ready ? 1U : 0U,
+                ordinaryG00InflightRegistrySnapshot.permanentLockout
+                ? 1U : 0U,
+                ordinaryG00InflightRegistrySnapshot.bounded ? 1U : 0U,
+                ordinaryG00InflightRegistrySnapshot.shadowOnly ? 1U : 0U,
+                ordinaryG00InflightRegistrySnapshot.runtimeInfluence
+                ? 1U : 0U,
+                ordinaryG00InflightRegistrySnapshot.motionWrite ? 1U : 0U,
+                ordinaryG00InflightRegistrySnapshot.accountingValid
+                ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K63-FCNT] Try:%llu Reg:%llu Reject:%llu Invalid:%llu "
+                "DupId:%llu Overflow:%llu Reuse:%llu Obs:%llu Match:%llu "
+                "Ignore:%llu Accept:%llu Start:%llu Prog:%llu Held:%llu "
+                "Resume:%llu Term:%llu Done:%llu RejectT:%llu Cancel:%llu "
+                "Abort:%llu Fault:%llu SeqInv:%llu Gap:%llu ActiveGap:%llu "
+                "Orphan:%llu IdConflict:%llu OwnerMis:%llu DupTerm:%llu "
+                "TermConflict:%llu PostTerm:%llu Rev:%llu RevTerm:%llu "
+                "QRev:%llu AlarmRev:%llu ResetRev:%llu EndRev:%llu "
+                "SrcRev:%llu RunRev:%llu FbOv:%llu NoticeOv:%llu "
+                "LedBlkOv:%llu LedSegOv:%llu "
+                "LedDup:%llu LedConflict:%llu RunFail:%llu Fail:%llu "
+                "Active:%llu Peak:%llu Influence:%llu MotionWrite:%llu\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.registrationAttempts),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.registered),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.registrationRejected),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.invalidRegistration),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.duplicateIdentity),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.capacityOverflow),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.slotReuses),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.feedbackObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.feedbackMatched),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.feedbackIgnored),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.accepted),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.started),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.progress),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.held),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.resumed),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.terminal),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.completed),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.rejected),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.cancelled),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.aborted),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.faulted),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.invalidFeedbackSequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.feedbackSequenceGaps),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.activeSequenceGapFailures),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.ledgerOrphans),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.identityConflicts),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.ownerMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.duplicateTerminal),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.terminalConflict),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.postTerminalFeedback),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.entriesRevoked),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.revokedTerminals),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.queueRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.alarmRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.resetRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.programEndRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.sourceRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.runtimeRevocations),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.feedbackOverflowObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.
+                    producerNoticeOverflowObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.
+                    ledgerActiveBlockOverwriteObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.
+                    ledgerActiveSegmentIndexOverwriteObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.ledgerDuplicateObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.ledgerConflictObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.runtimeFailures),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.permanentFailures),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.activeEntries),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.peakActiveEntries),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.runtimeInfluence),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.motionWrites));
 
             const std::uint64_t stopCommandMaxPps =
                 ScaleNonNegativeDiagnosticValue(

@@ -12332,6 +12332,42 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     }
 
 
+    // =========================================================
+    // NC-0.2K.6.3 START idle-PID authority fence
+    //
+    // A non-zero servo image is deliberately scrubbed at the physical send
+    // seam while Motion has no owner.  The historical loop nevertheless kept
+    // integrating the stationary position error into axis.pid.integralAcc.
+    // That internal value was therefore invisible on the wire until Cycle
+    // Start acquired AUTO ownership; the first newly-authorized frame could
+    // then release the accumulated correction as a full-scale velocity pulse
+    // before the first NC block was dispatched.
+    //
+    // Keep feedback acquisition, actual-velocity measurement and travel-limit
+    // observation above active while unowned, but do not evolve a controller
+    // whose output is contractually forbidden from reaching the drive.  This
+    // is an authority-state reset only: it does not rebase command position,
+    // change planner state, or modify G00 / Reset deceleration behavior.
+    // =========================================================
+    const MotionOwnerLease servoLoopOwnerLease =
+        GetMotionOwnerLease();
+    if (servoLoopOwnerLease.owner == MotionOwner::NONE)
+    {
+        axis.pid.prevError = 0.0;
+        axis.pid.integralAcc = 0.0;
+        axis.Pid_IDLE.prevError = 0.0;
+        axis.Pid_IDLE.integralAcc = 0.0;
+        axis.Pid_G00.prevError = 0.0;
+        axis.Pid_G00.integralAcc = 0.0;
+
+        WriteServoTargetVelocityCommand(
+            servo.pOutput,
+            axis.axisIndex,
+            0);
+        return;
+    }
+
+
     // 2. [Lag Monitor] 跟隨誤差檢查 (此時的 ActPos 絕對不會溢位)
     double error = cmd.instantCmdPos - axis.currentActPos;
 
@@ -19175,8 +19211,32 @@ void MotionCore::UpdateNCSettleProducer(
                 // finalize.  Keep the exact current Segment/Epoch/Owner
                 // identity, but formally scope the 200-cycle proof to every
                 // existing physical axis.  No payload field or ABI changes.
+                // A pure logic / Macro program can legally reach M30 without
+                // ever dispatching a Motion Segment.  In that case
+                // m_Group.currentCmd.execution remains unassigned even though
+                // the exact Program owner/epoch is current and every Motion
+                // queue is drained.  Leaving scopeMask at zero makes the
+                // formal GROUP_COMPLETION proof permanently SCOPE_EMPTY, so
+                // M30 can never enter P_END.
+                //
+                // Give only this no-segment, fully drained execution a
+                // machine-wide scope anchored by the current non-NONE owner
+                // lease and execution epoch.  If a Motion Segment is later
+                // dispatched, currentGroupIdentityCorrelated becomes true;
+                // identityChanged resets this candidate and the normal exact
+                // Segment/Epoch/Owner proof takes over.  Motion programs keep
+                // the existing safety contract unchanged.
+                const bool pureProgramExecutionScope =
+                    !currentGroupIdentityCorrelated &&
+                    currentOwnerLease.IsValid() &&
+                    currentOwnerLease.owner != MotionOwner::NONE &&
+                    currentExecutionEpoch !=
+                    MOTION_EXECUTION_EPOCH_INVALID &&
+                    groupDrained;
+
                 const std::uint32_t scopeMask =
-                    currentGroupIdentityCorrelated
+                    (currentGroupIdentityCorrelated ||
+                        pureProgramExecutionScope)
                     ? existingAxisMask
                     : 0U;
 

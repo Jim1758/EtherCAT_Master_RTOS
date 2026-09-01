@@ -2419,6 +2419,22 @@ void NCManager::ProcessMotionFeedback() noexcept
 {
     MotionFeedbackEvent event{};
 
+    // Stage NC-0.2K.6.3: a terminal registry can only qualify while the
+    // existing bounded transports and Lifecycle Ledger have never lost or
+    // ambiguously terminalised an event.  This reads counters only; it adds
+    // no EtherCAT traffic and performs no Motion write.
+    const NCBlockLifecycleCounters preDrainLedgerCounters =
+        m_blockLifecycleLedger.GetCounters();
+    m_ordinaryG00InflightRegistryShadow.ObserveTransportHealth(
+        m_motion.GetMotionFeedbackOverflowCount(),
+        m_motion.GetMotionFeedbackProducerNoticeOverflowCount(),
+        m_motionFeedbackSequenceGapCount,
+        preDrainLedgerCounters.activeBlockOverwrite,
+        preDrainLedgerCounters.activeSegmentIndexOverwrite,
+        preDrainLedgerCounters.orphanFeedback,
+        preDrainLedgerCounters.duplicateTerminalFeedback,
+        preDrainLedgerCounters.terminalFeedbackConflict);
+
     // 每個 NC Cycle 最多處理固定筆數，避免異常事件 Burst 讓
     // 10 ms NC Task 出現過大的單圈負擔。2048 筆 Ring 可容納完整
     // Epoch 淘汰 Burst，未讀事件由後續 Cycle 繼續 Drain。
@@ -2527,6 +2543,13 @@ void NCManager::ProcessMotionFeedback() noexcept
         // Wait Callback、Single Block 或 Motion 執行結果。
         const bool ledgerAccepted =
             m_blockLifecycleLedger.ApplyMotionFeedback(event);
+
+        // K.6.3 consumes the exact same immutable event only after the
+        // authoritative NC-0.2D Ledger has classified it.  The observer
+        // cannot acknowledge, remove, replay, or otherwise influence it.
+        m_ordinaryG00InflightRegistryShadow.ObserveMotionFeedback(
+            event,
+            ledgerAccepted);
 
         if (lifecycleFailureFeedback)
         {
@@ -2716,6 +2739,43 @@ void NCManager::ProcessTask()
     else
     {
         (void)EnsureMappingIntegrityAlarmBoundaryBeforeFeedback();
+    }
+
+    // K.6.3 revocation is deliberately owned by this NC task.  Mark an
+    // already-visible Reset/Alarm/Program-End boundary before draining its
+    // delayed terminal feedback, while retaining every exact entry until the
+    // terminal event itself is observed.
+    if (AlarmManager::GetInstance().HasAlarm() ||
+        m_state == NCState::ALARM)
+    {
+        m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
+            NCPreparedInvalidationReason::ALARM);
+    }
+    else if (m_state == NCState::RESET_STATE ||
+        m_resetContinuationPhase != ResetContinuationPhase::IDLE)
+    {
+        m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
+            NCPreparedInvalidationReason::RESET);
+    }
+    else if (m_state == NCState::P_END ||
+        m_programEndBoundary.IsEndPending())
+    {
+        m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
+            NCPreparedInvalidationReason::PROGRAM_END);
+    }
+    else if (m_state == NCState::RUN || m_state == NCState::HOLD)
+    {
+        // A program/cache/frame/flow/owner/panel replacement can remain in a
+        // RUN-compatible state.  Compare it on this same NC thread before a
+        // delayed terminal is consumed.  The normal one-Epoch legacy G00
+        // advance is explicitly compatible with its registered identity.
+        m_ordinaryG00InflightRegistryShadow.ObserveLiveSource(
+            BuildPreparedBlockSourceIdentity());
+    }
+    else
+    {
+        m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
+            NCPreparedInvalidationReason::NOT_RUNNING);
     }
 
     // 即使 NC 正處於 Alarm / Reset / Not Ready，也必須先 Drain Feedback，
@@ -3386,6 +3446,8 @@ void NCManager::ProcessExecutionEngine()
                 if (!resolverBypassCompletionValid)
                 {
                     m_ordinaryG00AdmissionShadow.
+                        ObserveRuntimeFailure(completionDispatchId);
+                    m_ordinaryG00InflightRegistryShadow.
                         ObserveRuntimeFailure(completionDispatchId);
                     const NCPreparedResolverBypassSnapshot bypassSnapshot =
                         m_preparedHeadResolverBypassGate.GetSnapshot();
@@ -4064,6 +4126,8 @@ void NCManager::ProcessExecutionEngine()
                     ObserveSelectedInvariantFailure();
                 m_ordinaryG00AdmissionShadow.
                     ObserveRuntimeFailure(0ULL);
+                m_ordinaryG00InflightRegistryShadow.
+                    ObserveRuntimeFailure(0ULL);
                 markDispatchFailed(
                     static_cast<std::uint32_t>(
                         AlarmManager::SYNTAX_ERROR));
@@ -4109,6 +4173,8 @@ void NCManager::ProcessExecutionEngine()
                         m_preparedHeadResolverBypassGate.
                             ObserveSelectedInvariantFailure();
                         m_ordinaryG00AdmissionShadow.
+                            ObserveRuntimeFailure(0ULL);
+                        m_ordinaryG00InflightRegistryShadow.
                             ObserveRuntimeFailure(0ULL);
                         markDispatchFailed(
                             static_cast<std::uint32_t>(
@@ -4191,6 +4257,8 @@ void NCManager::ProcessExecutionEngine()
                     bypassLedger.sourceLineNumber))
                 {
                     m_ordinaryG00AdmissionShadow.
+                        ObserveRuntimeFailure(dispatchId);
+                    m_ordinaryG00InflightRegistryShadow.
                         ObserveRuntimeFailure(dispatchId);
                     m_blockLifecycleLedger.MarkNCDispatchFailed(
                         dispatchId,
@@ -4306,6 +4374,8 @@ void NCManager::ProcessExecutionEngine()
                         ObserveRuntimeFailure(dispatchId);
                     m_ordinaryG00AdmissionShadow.
                         ObserveRuntimeFailure(dispatchId);
+                    m_ordinaryG00InflightRegistryShadow.
+                        ObserveRuntimeFailure(dispatchId);
                 }
                 else
                 {
@@ -4361,6 +4431,8 @@ void NCManager::ProcessExecutionEngine()
                         ObserveRuntimeFailure(dispatchId);
                     m_ordinaryG00AdmissionShadow.
                         ObserveRuntimeFailure(dispatchId);
+                    m_ordinaryG00InflightRegistryShadow.
+                        ObserveRuntimeFailure(dispatchId);
                 }
                 else
                 {
@@ -4413,6 +4485,8 @@ void NCManager::ProcessExecutionEngine()
                 !resolverBypassCommitValid)
             {
                 m_ordinaryG00AdmissionShadow.
+                    ObserveRuntimeFailure(dispatchId);
+                m_ordinaryG00InflightRegistryShadow.
                     ObserveRuntimeFailure(dispatchId);
                 m_blockLifecycleLedger.MarkNCDispatchFailed(
                     dispatchId,
@@ -4470,6 +4544,95 @@ void NCManager::ProcessExecutionEngine()
                 preparedCutoverContext,
                 m_preparedHeadResolverBypassGate.GetSnapshot(),
                 ordinaryAdmissionEvidence);
+
+            // Stage NC-0.2K.6.3: after K.6.1/K.6.2 have independently bound
+            // this exact ordinary G00 Commit, register its one already-
+            // accepted Motion segment in the bounded terminal observer.  A
+            // registry proof is diagnostic input to K.5 only; neither result
+            // can change the accepted callback/PC/Motion path.
+            const NCOrdinaryG00AdmissionSnapshot admissionAfterCommit =
+                m_ordinaryG00AdmissionShadow.GetSnapshot();
+            if (admissionAfterCommit.pending &&
+                admissionAfterCommit.legacyCommitBound &&
+                !admissionAfterCommit.inflightRegistryProven &&
+                admissionAfterCommit.dispatchId == dispatchId)
+            {
+                NCOrdinaryG00InflightRegistrationEvidence
+                    inflightEvidence{};
+                inflightEvidence.dispatchId =
+                    ordinaryAdmissionEvidence.dispatchId;
+                inflightEvidence.commitSequence =
+                    ordinaryAdmissionEvidence.commitSequence;
+                inflightEvidence.currentExecutionEpoch =
+                    ordinaryAdmissionEvidence.currentExecutionEpoch;
+                inflightEvidence.segmentExecutionEpoch =
+                    ordinaryAdmissionEvidence.segmentExecutionEpoch;
+                inflightEvidence.segmentId =
+                    ordinaryAdmissionEvidence.segmentId;
+                inflightEvidence.submissionCount =
+                    ordinaryAdmissionEvidence.submissionCount;
+                inflightEvidence.submissionIdentity =
+                    ordinaryAdmissionEvidence.submissionIdentity;
+                inflightEvidence.commandPathMode =
+                    ordinaryAdmissionEvidence.commandPathMode;
+                inflightEvidence.queueTailReceipt =
+                    ordinaryAdmissionEvidence.queueTailReceipt;
+                inflightEvidence.captureOverflow =
+                    ordinaryAdmissionEvidence.captureOverflow;
+                inflightEvidence.producerAccepted =
+                    ordinaryAdmissionEvidence.producerAccepted;
+                inflightEvidence.immediateRejectNone =
+                    ordinaryAdmissionEvidence.immediateRejectNone;
+                inflightEvidence.waitCallbackActive =
+                    ordinaryAdmissionEvidence.waitCallbackActive;
+                inflightEvidence.commitSucceeded =
+                    ordinaryAdmissionEvidence.commitSucceeded;
+
+                inflightEvidence.ledgerFound =
+                    resolverBypassCommitLedgerFound;
+                inflightEvidence.ledgerDispatchId =
+                    resolverBypassCommitLedger.dispatchId;
+                inflightEvidence.ledgerCommitSequence =
+                    resolverBypassCommitLedger.programCommit.sequence;
+                inflightEvidence.ledgerScope =
+                    resolverBypassCommitLedger.programCommit.scope;
+                inflightEvidence.ledgerCacheGeneration =
+                    resolverBypassCommitLedger.
+                    programCommit.cacheGeneration;
+                inflightEvidence.ledgerFrameId =
+                    resolverBypassCommitLedger.programCommit.frameId;
+                inflightEvidence.ledgerSourcePC =
+                    resolverBypassCommitLedger.programCommit.sourcePC;
+                inflightEvidence.ledgerSourceLineNumber =
+                    resolverBypassCommitLedger.sourceLineNumber;
+                inflightEvidence.ledgerProgramCommitted =
+                    resolverBypassCommitLedger.programCommitted;
+                inflightEvidence.ledgerCaptureOverflow =
+                    resolverBypassCommitLedger.motionCaptureOverflow;
+                inflightEvidence.ledgerMotionSegmentCount =
+                    resolverBypassCommitLedger.motionSegmentCount;
+                if (resolverBypassCommitLedgerFound &&
+                    resolverBypassCommitLedger.motionSegmentCount == 1U)
+                {
+                    const NCBlockMotionSegmentSnapshot& ledgerSegment =
+                        resolverBypassCommitLedger.motionSegments[0U];
+                    inflightEvidence.ledgerIdentity =
+                        ledgerSegment.identity;
+                    inflightEvidence.ledgerProducerAccepted =
+                        ledgerSegment.producerAccepted;
+                    inflightEvidence.ledgerImmediateRejectReason =
+                        ledgerSegment.immediateRejectReason;
+                }
+
+                NCOrdinaryG00InflightRegistrationProof inflightProof{};
+                (void)m_ordinaryG00InflightRegistryShadow.TryRegister(
+                    preparedCutoverContext,
+                    m_preparedHeadResolverBypassGate.GetSnapshot(),
+                    inflightEvidence,
+                    inflightProof);
+                m_ordinaryG00AdmissionShadow.
+                    ObserveInflightRegistryRegistration(inflightProof);
+            }
 
             // Stage NC-0.2H：M00/M01/M98/M99/M02/M30 的 Post Action
             // 由 G/M Transaction 在所有同行動作與 Motion Ledger 完成後套用。
@@ -6588,6 +6751,7 @@ void NCManager::ObservePreparedBlockQueueShadow(
         m_preparedHeadPreResolveAdmissionShadow.ObserveQueueInactive(reason);
         m_preparedHeadResolverBypassGate.ObserveQueueInactive(reason);
         m_ordinaryG00AdmissionShadow.ObserveQueueInactive(reason);
+        m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(reason);
         return;
     }
 
@@ -6630,6 +6794,8 @@ void NCManager::ObservePreparedBlockQueueShadow(
         m_preparedHeadResolverBypassGate.ObserveQueueInactive(
             NCPreparedInvalidationReason::IDENTITY_INVALID);
         m_ordinaryG00AdmissionShadow.ObserveQueueInactive(
+            NCPreparedInvalidationReason::IDENTITY_INVALID);
+        m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
             NCPreparedInvalidationReason::IDENTITY_INVALID);
         return;
     }
@@ -6801,6 +6967,8 @@ void NCManager::ObservePreparedHeadEquivalenceUpstreamProof(
         m_preparedHeadEquivalenceShadow.GetCounters());
     m_preparedHeadPreResolveAdmissionShadow.
         ObserveActiveQueueSession(queue);
+    m_ordinaryG00InflightRegistryShadow.ObserveActiveSession(
+        queue.session);
     m_preparedHeadResolverBypassGate.ObserveUpstreamProof(
         queue,
         queueCounters,

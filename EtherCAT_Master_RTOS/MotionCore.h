@@ -1537,6 +1537,20 @@ static_assert(
     MotionNCResetSafetyReleaseAuthorization>::value,
     "Reset Safety release authorization must remain trivially copyable.");
 
+// RESET smooth-stop ingress is deliberately separate from the immediate
+// Alarm/E-stop ticket path. Its persistent phase closes the NC 10 ms / RT
+// 250 us handoff without making the pre-ticket request an immediate PDO-zero
+// condition.
+enum class ResetControlledStopPhase : std::uint32_t
+{
+    IDLE = 0U,
+    PENDING = 1U,
+    APPLYING = 2U,
+    ACTIVE = 3U,
+    COMPLETED = 4U,
+    SUPERSEDED = 5U
+};
+
 
 //核心類別宣告--------------------------------------------------------------------
 // ==========================================
@@ -1883,6 +1897,15 @@ public:
     void RequestResetAllFaults() noexcept;
     void RequestStopGroup() noexcept;
 
+    // RESET during an ordinary G00/G01 is deliberately staged without
+    // taking the SAFETY owner in the NC/HMI thread.  The 250 us runtime
+    // consumes this mailbox and creates the exact ticket/epoch together,
+    // preventing a one-frame zero-PDO seam before controlled deceleration.
+    void RequestResetControlledStop() noexcept;
+    ResetControlledStopPhase GetResetControlledStopPhase() const noexcept;
+    bool ConsumeCompletedResetControlledStop() noexcept;
+    bool RetireSupersededResetControlledStop() noexcept;
+
     // Stage NC-0.2J.2:
     // NC Reset already owns and publishes one execution Epoch before it
     // submits the deferred safety work. Correlate ResetAllFaults + StopGroup
@@ -1900,8 +1923,7 @@ public:
         const MotionOwnerLease& safetyLease,
         std::uint32_t parentRequestTicket,
         std::uint64_t expectedProvenanceGeneration,
-        bool requestResetAllFaults,
-        bool requestControlledStop = false) noexcept;
+        bool requestResetAllFaults) noexcept;
 
     bool HasPendingSafetyOrRecoveryRequests() const noexcept;
 
@@ -2128,6 +2150,17 @@ public:
     bool IsGroupNCSettled() const noexcept;
     bool IsGroupNCDrained() const noexcept;
     bool HasExactExecutionDrainAcknowledgement(
+        MotionExecutionEpoch executionEpoch,
+        const MotionOwnerLease& ownerLease) const noexcept;
+    // Program start is intentionally stricter than a generic execution
+    // drain: the next program must not consume its first motion command until
+    // the same 250 us RT publication proves every physical axis satisfies the
+    // exact incoming-axis readiness predicate used by LoadNextCommand().
+    // Raw derivative velocity and IDLE PID PDO holding correction are advisory
+    // only; treating either as a hard admission condition would permanently
+    // block a stationary servo with noisy feedback.  This is a read-only
+    // admission gate; it never clears, recovers, or weakens a safety condition.
+    bool HasExactProgramStartQuiescenceAcknowledgement(
         MotionExecutionEpoch executionEpoch,
         const MotionOwnerLease& ownerLease) const noexcept;
     MotionNCResetRebaseAck GetNCResetRebaseAck() const noexcept;
@@ -2443,6 +2476,53 @@ private:
         m_stopSettlePublicationBanks{};
     std::atomic<std::uint64_t> m_stopSettlePublicationGeneration{ 0ULL };
 
+    // The J.5 stop/settle bank above is deliberately capped at 192 words and
+    // is already full.  Keep the Program-Start proof in its own compact
+    // double-buffered publication, then bind it to the stop bank using the
+    // same 250 us publication generation and sample sequence.  A reader only
+    // accepts a matched pair, so it cannot combine a ready result from one RT
+    // pass with drain evidence from another pass.
+    struct MotionProgramStartReadinessSnapshot
+    {
+        std::uint64_t stopPublicationGeneration = 0ULL;
+        std::uint64_t stopSampleSequence = 0ULL;
+        std::uint32_t existingAxisCount = 0U;
+        std::uint32_t readyAxisCount = 0U;
+        std::uint32_t notReadyAxisCount = 0U;
+        std::int32_t firstNotReadyAxisIndex = -1;
+    };
+
+    static_assert(
+        std::is_trivially_copyable<MotionProgramStartReadinessSnapshot>::value,
+        "Program-start readiness publication must remain trivially copyable.");
+
+    static constexpr std::size_t
+        MOTION_PROGRAM_START_READINESS_PUBLICATION_WORD_COUNT =
+        (sizeof(MotionProgramStartReadinessSnapshot) +
+            sizeof(std::uint64_t) - 1U) /
+        sizeof(std::uint64_t);
+
+    struct MotionProgramStartReadinessAtomicBank
+    {
+        std::atomic<std::uint64_t> writeSequence{ 0ULL };
+        std::array<
+            std::atomic<std::uint64_t>,
+            MOTION_PROGRAM_START_READINESS_PUBLICATION_WORD_COUNT> words;
+
+        MotionProgramStartReadinessAtomicBank() noexcept
+        {
+            for (std::size_t i = 0U; i < words.size(); ++i)
+            {
+                words[i].store(0ULL, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::array<MotionProgramStartReadinessAtomicBank, 2U>
+        m_programStartReadinessPublicationBanks{};
+    std::atomic<std::uint64_t>
+        m_programStartReadinessPublicationGeneration{ 0ULL };
+
     // The fields below are owned only by the 250 us Motion runtime.
     std::uint64_t m_stopSettleNextPublicationGeneration = 0ULL;
     MotionStopSettleCounters m_stopSettleProducerCounters{};
@@ -2547,6 +2627,8 @@ private:
     void PublishStopSettleEvidence() noexcept;
     bool TryReadStopSettlePublication(
         MotionStopSettlePublicationPayload& payload) const noexcept;
+    bool TryReadProgramStartReadinessPublication(
+        MotionProgramStartReadinessSnapshot& readiness) const noexcept;
     MotionNCSettleRequestSequence AllocateNCSettleRequestSequence() noexcept;
     bool SubmitNCSettleRequest(const MotionNCSettleRequest& request) noexcept;
     bool IsExactResetNCSettleAuthorityCurrent(
@@ -2609,6 +2691,14 @@ private:
     std::atomic<std::uint64_t> m_emergencyStopRequestPublication{ 0ULL };
     std::atomic<bool> m_resetAllFaultsPending{ false };
     std::atomic<bool> m_stopGroupPending{ false };
+
+    // RESET-only pre-ticket ingress.  This single atomic is both mailbox and
+    // persistent outcome: PENDING -> APPLYING -> ACTIVE -> COMPLETED, or
+    // SUPERSEDED by a higher-priority Safety action.  Keeping it in one word
+    // avoids a producer/RT race between a phase store and a separate pending
+    // boolean.  NC never decides from a transient mailbox bit alone.
+    std::atomic<std::uint32_t> m_resetControlledStopPhase{
+        static_cast<std::uint32_t>(ResetControlledStopPhase::IDLE) };
 
     // NC-0.2J.6.1/J.6.3.2 producer/consumer accounting. Request counters may be
     // incremented by the 10 ms control side; the remaining fields are owned by
@@ -2692,6 +2782,10 @@ private:
         MotionAxisCommand command,
         MotionAxisCommandSequence* outSequence) noexcept;
     void ApplyPendingSafetyAndRecoveryRequests() noexcept;
+    void ApplyPendingResetControlledStopRequest() noexcept;
+    bool HasResetControlledStopPriorityWinner() const noexcept;
+    void SupersedeResetControlledStop() noexcept;
+    void CompleteResetControlledStop() noexcept;
     void TriggerGroupMappingIntegrityEmergencyStop(
         int axisIndex,
         bool forceExecutionInvalidation = false) noexcept;

@@ -92,11 +92,6 @@ namespace
         0x00000000FFFFFFFFULL;
     constexpr std::uint64_t RESET_SAFETY_BATCH_RESET_FAULTS =
         0x0000000100000000ULL;
-    // A normal operator RESET first requests the existing Safety-owned
-    // controlled deceleration.  Alarm/E-stop remains on its independent,
-    // immediate-zero mailbox path.
-    constexpr std::uint64_t RESET_SAFETY_BATCH_CONTROLLED_STOP =
-        0x0100000000000000ULL;
     constexpr unsigned RESET_SAFETY_BATCH_TICKET_SHIFT = 33U;
     constexpr std::uint64_t RESET_SAFETY_BATCH_TICKET_MASK =
         0x00FFFFFE00000000ULL;
@@ -154,7 +149,6 @@ namespace
     std::uint64_t PackResetSafetyBatch(
         MotionExecutionEpoch publishedEpoch,
         bool requestResetAllFaults,
-        bool requestControlledStop,
         std::uint32_t safetyRequestTicket,
         bool reserved) noexcept
     {
@@ -166,9 +160,6 @@ namespace
                 RESET_SAFETY_BATCH_TICKET_MASK) |
             (requestResetAllFaults
                 ? RESET_SAFETY_BATCH_RESET_FAULTS
-                : 0ULL) |
-            (requestControlledStop
-                ? RESET_SAFETY_BATCH_CONTROLLED_STOP
                 : 0ULL) |
             (reserved
                 ? RESET_SAFETY_BATCH_PUBLISH_RESERVED
@@ -346,6 +337,41 @@ namespace
             std::abs(axis.targetEndVel) <= 1.0 &&
             std::isfinite(followingError) &&
             followingError <= axis.inPositionWindow_Pulse;
+    }
+
+    // A front command may wait only for a physically recoverable settle
+    // condition.  Faults, invalid numerical state, an orphaned interpolation
+    // state, or a startup-lag block remain hard integrity failures and are
+    // deliberately allowed to reach the existing post-pop AL3021 path.
+    // This classifier is read-only and is used solely before the SPSC pop.
+    bool IsIncomingPhysicalAxisReadinessTransient(
+        const AxisContext& axis) noexcept
+    {
+        const bool finiteCommandState =
+            std::isfinite(axis.currentCmdPos) &&
+            std::isfinite(axis.currentActPos) &&
+            std::isfinite(axis.logicalCmdPos) &&
+            std::isfinite(axis.planningPos) &&
+            std::isfinite(axis.finalTargetPos) &&
+            std::isfinite(axis.currentCmdVel) &&
+            std::isfinite(axis.logicalCmdVel) &&
+            std::isfinite(axis.targetVelocity) &&
+            std::isfinite(axis.targetEndVel) &&
+            std::isfinite(axis.inPositionWindow_Pulse) &&
+            axis.inPositionWindow_Pulse > 0.0;
+        const bool settlingState =
+            axis.state == MotionState::MotionState_IDLE ||
+            axis.state == MotionState::MotionState_MOVING ||
+            axis.state == MotionState::MotionState_STOPPING ||
+            axis.state == MotionState::MotionState_VELOCITY ||
+            axis.state == MotionState::MotionState_MPG;
+        return
+            axis.isExist &&
+            !axis.startupLagPrematureMotionBlocked &&
+            !axis.isFault &&
+            !axis.isLagAlarm &&
+            finiteCommandState &&
+            settlingState;
     }
 
     bool IsMotionCommandHistorySnapshotValid(
@@ -4477,6 +4503,12 @@ bool MotionCore::FinalizeDirectContainmentEmergencyStopMailbox(
 
 void MotionCore::RequestEmergencyStopAllAxes() noexcept
 {
+    // A real emergency event always wins over the benign RESET smooth-stop
+    // ingress.  Publish that outcome before taking the regular Safety ticket
+    // so the NC RESET continuation can never mistake containment for a
+    // physically-proved deceleration completion.
+    SupersedeResetControlledStop();
+
     m_emergencyStopRequestAttemptCount.fetch_add(
         1ULL,
         std::memory_order_relaxed);
@@ -4555,6 +4587,10 @@ void MotionCore::TriggerGroupMappingIntegrityEmergencyStop(
     int axisIndex,
     bool forceExecutionInvalidation) noexcept
 {
+    // AL3021 is an Alarm/E-stop containment path, never a continuation of an
+    // operator RESET controlled stop.
+    SupersedeResetControlledStop();
+
     BeginExecutionDrainAcknowledgementRevocation();
     const MotionExecutionEpoch causalEpoch =
         GetCurrentExecutionEpoch();
@@ -4679,6 +4715,7 @@ void MotionCore::RequestAxisFaultReset(int axisIndex) noexcept
 
     const std::uint32_t mask =
         static_cast<std::uint32_t>(1U << static_cast<unsigned>(axisIndex));
+    SupersedeResetControlledStop();
     BeginExecutionDrainAcknowledgementRevocation();
     std::uint32_t safetyRequestTicket =
         PublishSafetyMotionRequestTicket(true);
@@ -4692,6 +4729,7 @@ void MotionCore::RequestAxisFaultReset(int axisIndex) noexcept
 
 void MotionCore::RequestResetAllFaults() noexcept
 {
+    SupersedeResetControlledStop();
     BeginExecutionDrainAcknowledgementRevocation();
     std::uint32_t safetyRequestTicket =
         PublishSafetyMotionRequestTicket(true);
@@ -4703,6 +4741,9 @@ void MotionCore::RequestResetAllFaults() noexcept
 
 void MotionCore::RequestStopGroup() noexcept
 {
+    // The legacy StopGroup producer owns an immediate Safety ticket.  It is
+    // intentionally distinct from RESET's RT-only smooth-stop ingress.
+    SupersedeResetControlledStop();
     BeginExecutionDrainAcknowledgementRevocation();
     std::uint32_t safetyRequestTicket =
         PublishSafetyMotionRequestTicket(true);
@@ -4712,10 +4753,72 @@ void MotionCore::RequestStopGroup() noexcept
     EndExecutionDrainAcknowledgementRevocation();
 }
 
+void MotionCore::RequestResetControlledStop() noexcept
+{
+    // RESET of an ordinary program move is not an Alarm/E-stop.  Do not
+    // publish a SAFETY ticket from this producer thread: doing so lets the
+    // final PDO fence observe the new ticket before RT has built the
+    // same-direction deceleration trajectory, creating a 250 us zero pulse.
+    //
+    // RT consumes this single bit at the beginning of UpdateInterpolation(),
+    // then creates the ticket, owner lease, Epoch and StopMove state as one
+    // serial RT operation.  Emergency/alarm producers retain their existing
+    // immediate ticket-and-zero-output behavior.
+    // The phase is the linearization state visible to the 10 ms NC task.
+    // Only IDLE can begin a fresh operator transaction; repeated Reset taps
+    // are idempotent and a concurrent Alarm/E-stop can atomically supersede
+    // the request without a two-boolean reactivation race.
+    std::uint32_t expected =
+        static_cast<std::uint32_t>(ResetControlledStopPhase::IDLE);
+    // The phase itself is the pre-ticket RT mailbox.  Do not publish a second
+    // boolean here: RT may otherwise observe PENDING before the boolean store
+    // and incorrectly supersede a valid button press.
+    (void)m_resetControlledStopPhase.compare_exchange_strong(
+        expected,
+        static_cast<std::uint32_t>(ResetControlledStopPhase::PENDING),
+        std::memory_order_release,
+        std::memory_order_acquire);
+}
+
+ResetControlledStopPhase MotionCore::GetResetControlledStopPhase() const noexcept
+{
+    return static_cast<ResetControlledStopPhase>(
+        m_resetControlledStopPhase.load(std::memory_order_acquire));
+}
+
+bool MotionCore::ConsumeCompletedResetControlledStop() noexcept
+{
+    std::uint32_t expected =
+        static_cast<std::uint32_t>(ResetControlledStopPhase::COMPLETED);
+    return m_resetControlledStopPhase.compare_exchange_strong(
+        expected,
+        static_cast<std::uint32_t>(ResetControlledStopPhase::IDLE),
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
+bool MotionCore::RetireSupersededResetControlledStop() noexcept
+{
+    // Only a second, explicit operator RESET may retire a terminally
+    // superseded smooth-stop request.  It has no motion effect; it merely
+    // makes the ordinary, already fail-closed Reset batch eligible to begin.
+    std::uint32_t expected =
+        static_cast<std::uint32_t>(ResetControlledStopPhase::SUPERSEDED);
+    return m_resetControlledStopPhase.compare_exchange_strong(
+        expected,
+        static_cast<std::uint32_t>(ResetControlledStopPhase::IDLE),
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
 void MotionCore::RequestResetSafetyBatch(
     MotionExecutionEpoch publishedEpoch,
     bool requestResetAllFaults) noexcept
 {
+    // The normal RESET batch is only allowed after the smooth-stop phase has
+    // reached COMPLETED and NC has consumed it back to IDLE.  Any overlapping
+    // batch therefore supersedes the in-flight button press.
+    SupersedeResetControlledStop();
     BeginExecutionDrainAcknowledgementRevocation();
     std::uint32_t safetyRequestTicket =
         PublishSafetyMotionRequestTicket(true);
@@ -4732,7 +4835,6 @@ void MotionCore::RequestResetSafetyBatch(
         PackResetSafetyBatch(
             publishedEpoch,
             requestResetAllFaults,
-            false,
             safetyRequestTicket,
             true);
     const std::uint64_t committedBatch =
@@ -4813,9 +4915,10 @@ MotionCore::RequestExactResetSafetyBatch(
     const MotionOwnerLease& safetyLease,
     std::uint32_t parentRequestTicket,
     std::uint64_t expectedProvenanceGeneration,
-    bool requestResetAllFaults,
-    bool requestControlledStop) noexcept
+    bool requestResetAllFaults) noexcept
 {
+    SupersedeResetControlledStop();
+
     ResetSafetyAuthorityResult result{};
     result.lease = safetyLease;
     result.requestTicket = parentRequestTicket;
@@ -4922,7 +5025,6 @@ MotionCore::RequestExactResetSafetyBatch(
                     PackResetSafetyBatch(
                         publishedEpoch,
                         requestResetAllFaults,
-                        requestControlledStop,
                         childTicket,
                         true);
                 const std::uint64_t committedBatch =
@@ -5034,6 +5136,27 @@ bool MotionCore::HasPendingSafetyIntent() const noexcept
             std::memory_order_acquire) != 0U ||
         HasUnacknowledgedSafetyMotionRequest() ||
         m_safetyRecoveryRequestInProgress.load(std::memory_order_acquire) ||
+        (m_emergencyStopRequestPublication.load(
+            std::memory_order_acquire) &
+            EMERGENCY_STOP_REQUEST_PENDING) != 0ULL ||
+        m_resetAllFaultsPending.load(std::memory_order_acquire) ||
+        m_stopGroupPending.load(std::memory_order_acquire) ||
+        m_resetSafetyBatchPending.load(std::memory_order_acquire) != 0ULL ||
+        m_axisFaultResetPendingMask.load(std::memory_order_acquire) != 0U ||
+        (m_p1MappingIntegrityAlarmRequestPublication.load(
+            std::memory_order_acquire) &
+            P1_MAPPING_ALARM_PENDING) != 0ULL;
+}
+
+bool MotionCore::HasResetControlledStopPriorityWinner() const noexcept
+{
+    // This deliberately excludes RESET's own phase/ticket.  It names only
+    // independent Safety producers that must win over a benign operator
+    // controlled-stop request.  In particular, HasPendingSafetyIntent() is
+    // not enough here because an already materialized Alarm has no required
+    // mailbox bit yet.
+    return
+        AlarmManager::GetInstance().HasAlarm() ||
         (m_emergencyStopRequestPublication.load(
             std::memory_order_acquire) &
             EMERGENCY_STOP_REQUEST_PENDING) != 0ULL ||
@@ -5316,6 +5439,7 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
     if ((emergencyStopRequest &
         EMERGENCY_STOP_REQUEST_PENDING) != 0ULL)
     {
+        SupersedeResetControlledStop();
         m_resetAllFaultsPending.store(false, std::memory_order_release);
         m_stopGroupPending.store(false, std::memory_order_release);
         std::uint64_t discardedBatch = 0ULL;
@@ -5359,6 +5483,7 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
 
     if ((resetSafetyBatch & RESET_SAFETY_BATCH_PRESENT) != 0ULL)
     {
+        SupersedeResetControlledStop();
         const MotionExecutionEpoch coveredEpoch =
             UnpackResetSafetyBatchEpoch(resetSafetyBatch);
         const std::uint32_t coveredTicket =
@@ -5432,23 +5557,12 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
             ResetAllFaultsImpl(false);
         }
 
-        if ((resetSafetyBatch &
-            RESET_SAFETY_BATCH_CONTROLLED_STOP) != 0ULL)
-        {
-            // Normal RESET deliberately reaches this branch before it installs
-            // the final zero-output hold.  The already-published SAFETY Epoch
-            // retires future AUTO work, while the current G00/G01 receives the
-            // existing configured Stop_dec_time trajectory.
-            StopGroupImpl(false);
-        }
-        else
-        {
-            // The final Reset batch runs only after controlled stop + actual
-            // standstill are proven and the whole-PDO hold is active.  At this
-            // point aborting residual logical execution is correct and cannot
-            // turn a moving G00 into an abrupt zero-velocity command.
-            AbortActiveExecutionForResetSafetyBatch();
-        }
+        // The operator Reset output hold forces final PDO velocity to zero
+        // before this exact batch reaches RT.  Retire the active command as
+        // an abort instead of starting a controlled stop whose PDO output is
+        // intentionally fenced; physical standstill is proved later by the
+        // existing RESET_ALL settle/rebase gate.
+        AbortActiveExecutionForResetSafetyBatch();
         if (!FinalizeClaimedResetSafetyBatch(resetSafetyBatch))
         {
             EmergencyStopAllAxesImpl(true);
@@ -5457,6 +5571,7 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
 
     if (m_resetAllFaultsPending.exchange(false, std::memory_order_acq_rel))
     {
+        SupersedeResetControlledStop();
         ResetAllFaultsImpl(true);
     }
 
@@ -5465,6 +5580,7 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
 
     if (resetMask != 0U && m_pContexts != nullptr)
     {
+        SupersedeResetControlledStop();
         const std::size_t axisCount = (std::min)(
             m_pContexts->size(), static_cast<std::size_t>(32U));
         for (std::size_t i = 0U; i < axisCount; ++i)
@@ -5478,11 +5594,242 @@ void MotionCore::ApplyPendingSafetyAndRecoveryRequests() noexcept
 
     if (m_stopGroupPending.exchange(false, std::memory_order_acq_rel))
     {
+        SupersedeResetControlledStop();
         StopGroupImpl(true);
+
+        // The stop mailbox is consumed after UpdateInterpolation()'s normal
+        // Epoch seam. Consume the successor now, while the exact SAFETY
+        // action ticket has already been completed above, so this same PDO
+        // pass emits the deceleration command rather than one forced zero.
+        ApplyPendingExecutionEpochChange();
     }
 
     (void)CompleteSafetyMotionActionTicket(safetyRequestTicket);
     m_safetyRecoveryRequestInProgress.store(false, std::memory_order_release);
+    TryAcknowledgeAppliedSafetyMotionRequests();
+}
+
+void MotionCore::SupersedeResetControlledStop() noexcept
+{
+    std::uint32_t observed =
+        m_resetControlledStopPhase.load(std::memory_order_acquire);
+    for (;;)
+    {
+        const ResetControlledStopPhase phase =
+            static_cast<ResetControlledStopPhase>(observed);
+        if (phase == ResetControlledStopPhase::IDLE ||
+            phase == ResetControlledStopPhase::SUPERSEDED)
+        {
+            return;
+        }
+
+        if (m_resetControlledStopPhase.compare_exchange_weak(
+            observed,
+            static_cast<std::uint32_t>(
+                ResetControlledStopPhase::SUPERSEDED),
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            return;
+        }
+    }
+}
+
+void MotionCore::CompleteResetControlledStop() noexcept
+{
+    std::uint32_t expected =
+        static_cast<std::uint32_t>(ResetControlledStopPhase::ACTIVE);
+    if (m_resetControlledStopPhase.compare_exchange_strong(
+        expected,
+        static_cast<std::uint32_t>(
+            ResetControlledStopPhase::COMPLETED),
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return;
+    }
+
+    // A reset issued in the small post-command/pre-physical-active window
+    // can coherently prove that no group motion remains.  It still needs a
+    // terminal success result for NC, but never overwrites SUPERSEDED.
+    expected = static_cast<std::uint32_t>(
+        ResetControlledStopPhase::APPLYING);
+    (void)m_resetControlledStopPhase.compare_exchange_strong(
+        expected,
+        static_cast<std::uint32_t>(
+            ResetControlledStopPhase::COMPLETED),
+        std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
+
+void MotionCore::ApplyPendingResetControlledStopRequest() noexcept
+{
+    std::uint32_t expectedPhase =
+        static_cast<std::uint32_t>(ResetControlledStopPhase::PENDING);
+    if (!m_resetControlledStopPhase.compare_exchange_strong(
+        expectedPhase,
+        static_cast<std::uint32_t>(
+            ResetControlledStopPhase::APPLYING),
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return;
+    }
+
+    // PENDING was atomically claimed above.  A true Alarm/E-stop/reset batch
+    // is always the winner and turns this button press terminal rather than
+    // letting it enter the PDO hold path.
+    if (m_resetControlledStopPhase.load(std::memory_order_acquire) !=
+        static_cast<std::uint32_t>(
+            ResetControlledStopPhase::APPLYING) ||
+        HasPendingSafetyIntent() ||
+        HasResetControlledStopPriorityWinner())
+    {
+        SupersedeResetControlledStop();
+        return;
+    }
+
+    // Only the 250 us consumer is allowed to turn the benign RESET ingress
+    // into a SAFETY owner/ticket transition. Therefore the first final PDO
+    // command which can observe this ticket is emitted after StopMove has
+    // already selected the controlled-deceleration trajectory.
+    BeginExecutionDrainAcknowledgementRevocation();
+    const std::uint64_t resetProvenanceGeneration =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint32_t publishedSafetyRequestTicket =
+        PublishSafetyMotionRequestTicket(true);
+    std::uint32_t safetyRequestTicket = publishedSafetyRequestTicket;
+    if (publishedSafetyRequestTicket == 0U ||
+        !EnsureSafetyMotionActionTicket(safetyRequestTicket) ||
+        safetyRequestTicket != publishedSafetyRequestTicket)
+    {
+        m_safetyRecoveryRequestInProgress.store(
+            false,
+            std::memory_order_release);
+        SupersedeResetControlledStop();
+        EmergencyStopAllAxesImpl(true);
+        EndExecutionDrainAcknowledgementRevocation();
+        return;
+    }
+
+    const MotionOwnerLease safetyLease =
+        TryTakeSafetyMotionOwnerForTicket(safetyRequestTicket);
+    const auto ownsExactResetSafetyAction = [&]() noexcept -> bool
+    {
+        const std::uint64_t ownerState =
+            m_motionOwnerState.load(std::memory_order_acquire);
+        const MotionOwnerLease ownerLease =
+            UnpackMotionOwnerState(ownerState);
+        return
+            m_resetControlledStopPhase.load(
+                std::memory_order_acquire) ==
+            static_cast<std::uint32_t>(
+                ResetControlledStopPhase::APPLYING) &&
+            m_executionDrainRevocationGeneration.load(
+                std::memory_order_acquire) == resetProvenanceGeneration &&
+            m_executionDrainRevocationPublishersInProgress.load(
+                std::memory_order_acquire) == 1U &&
+            !HasResetControlledStopPriorityWinner() &&
+            safetyLease.IsValid() &&
+            safetyLease.owner == MotionOwner::SAFETY &&
+            safetyLease.Matches(ownerLease) &&
+            IsMotionOwnerLeaseCurrent(safetyLease) &&
+            UnpackMotionOwnerSafetyRequestTicket(ownerState) ==
+            safetyRequestTicket &&
+            !UnpackMotionOwnerSafetyHandshake(ownerState) &&
+            UnpackMotionOwnerSafetyActionPending(ownerState) &&
+            (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL;
+    };
+
+    if (!ownsExactResetSafetyAction())
+    {
+        // TryTakeSafetyMotionOwnerForTicket deliberately rewrites only its
+        // local ticket when a newer Safety incident wins.  Never use an
+        // ambiguous lease to build a RESET controlled-stop exception; fail
+        // closed and make the NC result terminally BLOCKED instead.
+        SupersedeResetControlledStop();
+        EndExecutionDrainAcknowledgementRevocation();
+        EmergencyStopAllAxesImpl(true);
+        return;
+    }
+
+    // This is a short RT-only transaction. It prevents acknowledgement/release
+    // helpers from observing a half-built controlled stop; it is cleared
+    // before UpdateAllMotion can evaluate the controlled-stop authorization.
+    m_safetyRecoveryRequestInProgress.store(
+        true,
+        std::memory_order_release);
+
+    StopGroupImpl(true);
+
+    // StopGroupImpl publishes the SAFETY successor Epoch after the normal
+    // top-of-pass Epoch seam.  A higher-priority producer may have arrived
+    // while it ran, so prove the whole owner/ticket/provenance tuple again
+    // before completing an action.  RESET must never complete another
+    // safety event's ticket.
+    const bool exactActionStillOwned = ownsExactResetSafetyAction();
+    const bool actionCompleted =
+        exactActionStillOwned &&
+        CompleteSafetyMotionActionTicket(safetyRequestTicket);
+    if (actionCompleted)
+    {
+        // Same-pass Epoch application is the key seam: final PDO can now see
+        // both the exact completed Safety ticket and StopMove's deceleration
+        // trajectory, rather than emitting a forced zero frame first.
+        ApplyPendingExecutionEpochChange();
+    }
+
+    m_safetyRecoveryRequestInProgress.store(
+        false,
+        std::memory_order_release);
+    EndExecutionDrainAcknowledgementRevocation();
+
+    if (!actionCompleted)
+    {
+        // A newer Safety action owns the packed ticket now. Do not apply an
+        // ambiguous Epoch; the ordinary Safety path will contain it and this
+        // Reset press remains terminally superseded.
+        SupersedeResetControlledStop();
+        EmergencyStopAllAxesImpl(true);
+        return;
+    }
+
+    if (!m_safetyControlledStopInProgress)
+    {
+        // Inactive/no-queue group: RT consumed the request coherently and no
+        // physical controlled-stop proof remains to collect.
+        TryAcknowledgeAppliedSafetyMotionRequests();
+        CompleteResetControlledStop();
+        return;
+    }
+
+    const int firstGroupAxis =
+        m_Group.axisCount > 0 ? m_Group.axisIndices[0] : -1;
+    if (firstGroupAxis < 0 ||
+        !IsSafetyControlledStopAuthorized(firstGroupAxis))
+    {
+        // A concurrent immediate Safety producer or Epoch reservation won a
+        // post-claim seam. The final PDO fence stays fail-closed; do not let
+        // this Reset continuation mistake that containment for completion.
+        SupersedeResetControlledStop();
+        return;
+    }
+
+    std::uint32_t applying =
+        static_cast<std::uint32_t>(ResetControlledStopPhase::APPLYING);
+    if (!m_resetControlledStopPhase.compare_exchange_strong(
+        applying,
+        static_cast<std::uint32_t>(
+            ResetControlledStopPhase::ACTIVE),
+        std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        // The only legal concurrent winner is a higher-priority supersede.
+        // Existing Safety fences handle its output; never overwrite it.
+        return;
+    }
+
     TryAcknowledgeAppliedSafetyMotionRequests();
 }
 
@@ -10311,27 +10658,64 @@ void MotionCore::StopMove(AxisContext& axis, double dec_time)
     // ---------------------------------------------------------
     if (axis.state == MotionState::MotionState_MOVING)
     {
-        double currentSpeed =
-            std::abs(axis.currentCmdVel);
-
         double stopDist =
             (currentSpeed * currentSpeed) /
             (2.0 * axis.dec_PPS2);
 
-        if (axis.currentCmdVel > 0.0)
+        // A continuous segment may carry a non-zero handover velocity. A
+        // RESET stop is always P0: it must reach zero rather than inherit a
+        // previous P1 endpoint speed.
+        axis.targetEndVel = 0.0;
+
+        // currentCmdVel is normally the correct sign. During a filtered
+        // S-curve tail it can already be near zero while logical/target
+        // velocity still owns the planned direction, so use the same bounded
+        // fallback hierarchy that selected currentSpeed above.
+        double stopDirectionVelocity = axis.currentCmdVel;
+        if (std::abs(stopDirectionVelocity) < 0.1)
         {
-            axis.finalTargetPos =
-                axis.currentCmdPos + stopDist;
+            stopDirectionVelocity = axis.logicalCmdVel;
         }
-        else if (axis.currentCmdVel < 0.0)
+        if (std::abs(stopDirectionVelocity) < 0.1)
         {
-            axis.finalTargetPos =
+            stopDirectionVelocity = axis.targetVelocity;
+        }
+
+        if (stopDirectionVelocity > 0.0)
+        {
+            double proposedTarget =
+                axis.currentCmdPos + stopDist;
+
+            // Calc_Trajectory_Trapezoidal() chooses direction from
+            // finalTargetPos - planningPos. Usually currentCmdPos is the
+            // correct filtered output anchor. If filter lag makes that
+            // proposed endpoint cross the raw planning coordinate, preserve
+            // the original direction by moving it to the positive side of
+            // planningPos before the next trajectory step.
+            if (proposedTarget <= axis.planningPos)
+            {
+                proposedTarget = axis.planningPos + stopDist;
+            }
+            axis.finalTargetPos = proposedTarget;
+        }
+        else if (stopDirectionVelocity < 0.0)
+        {
+            double proposedTarget =
                 axis.currentCmdPos - stopDist;
+
+            // Symmetric negative-direction guard. Do not let a filtered
+            // output/planner offset turn a deceleration request into a
+            // reverse-direction trajectory on the following 250 us pass.
+            if (proposedTarget >= axis.planningPos)
+            {
+                proposedTarget = axis.planningPos - stopDist;
+            }
+            axis.finalTargetPos = proposedTarget;
         }
         else
         {
             axis.finalTargetPos =
-                axis.currentCmdPos;
+                axis.planningPos;
         }
     }
 
@@ -10394,6 +10778,7 @@ void MotionCore::EmergencyStop(AxisContext& axis)
 }
 void MotionCore::EmergencyStopAllAxes()
 {
+    SupersedeResetControlledStop();
     BeginExecutionDrainAcknowledgementRevocation();
     const MotionExecutionEpoch causalEpoch =
         GetCurrentExecutionEpoch();
@@ -10425,6 +10810,12 @@ void MotionCore::EmergencyStopAllAxesImpl(
     bool forceExecutionInvalidation,
     MotionExecutionEpoch causalExecutionEpoch) noexcept
 {
+    // A real Alarm/E-stop supersedes a benign operator RESET stop before it
+    // can be claimed or resumed. The normal Reset flow will later use its
+    // explicit zero-output safety batch; it must never resurrect this
+    // controlled-deceleration request after emergency containment.
+    SupersedeResetControlledStop();
+
     // =========================================================
     // 1. 使目前執行世代失效
     //
@@ -10672,6 +11063,7 @@ void MotionCore::ResetFault(AxisContext& axis)
 }
 void MotionCore::ResetAllFaults()//全軸 清除異常狀態
 {
+    SupersedeResetControlledStop();
     BeginExecutionDrainAcknowledgementRevocation();
     std::uint32_t safetyRequestTicket =
         PublishSafetyMotionRequestTicket(true);
@@ -10691,6 +11083,10 @@ void MotionCore::ResetAllFaults()//全軸 清除異常狀態
 void MotionCore::ResetAllFaultsImpl(
     bool publishExecutionEpoch)
 {
+    // Fault-reset/batch recovery owns a whole-PDO zero-output contract and
+    // therefore supersedes any pre-ticket smooth RESET request.
+    SupersedeResetControlledStop();
+
     if (m_pContexts == nullptr) return;
 
     for (size_t i = 0; i < m_pContexts->size(); ++i) {
@@ -13499,7 +13895,43 @@ void MotionCore::LoadNextCommand()
 
 
     // ======================================================
-    // 3. 由 250 us Consumer 取得下一條 Motion Command
+    // 3. Pre-pop admission for a newly claimed physical axis.
+    //
+    // The NC Program-Start gate deliberately samples readiness before it
+    // promotes the run to RUN.  That proof cannot reserve AxisContext across
+    // the NC -> 250 us handoff, so a legitimate settling sample may become
+    // temporarily not-ready before this RT consumer sees the first command.
+    // Never consume that command and turn the transient into AL3021.  Leave
+    // the exact front identity in the SPSC queue and retry on the next RT
+    // pass.  No mapping, planner, lifecycle, or physical-output state has
+    // changed at this point, so deferral is fail-closed.
+    //
+    // Geometry, path-mode authority, Epoch/Owner authorization, and the
+    // outgoing exact-stop proof have already run above.  The post-pop check
+    // below remains an invariant backstop; this preflight closes the only
+    // normal transient readiness window without weakening those hard faults.
+    // ======================================================
+    for (int slot = 0; slot < frontCommand.axisCount; ++slot)
+    {
+        const int axisIndex = frontCommand.axisIndices[slot];
+        const bool incomingOnly =
+            !hasOutgoingCommand ||
+            !MotionCommandHasAxis(m_Group.currentCmd, axisIndex);
+        if (!incomingOnly)
+        {
+            continue;
+        }
+
+        const AxisContext& incomingAxis = (*m_pContexts)[axisIndex];
+        if (!IsIncomingPhysicalAxisReadyForGroup(incomingAxis) &&
+            IsIncomingPhysicalAxisReadinessTransient(incomingAxis))
+        {
+            return;
+        }
+    }
+
+    // ======================================================
+    // 4. 由 250 us Consumer 取得下一條 Motion Command
     //
     // The outgoing segment is deliberately not terminal yet. Pop,
     // re-authorization, consumer validation and dropped-axis retirement form
@@ -15068,6 +15500,7 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
 
 void MotionCore::StopGroup()
 {
+    SupersedeResetControlledStop();
     BeginExecutionDrainAcknowledgementRevocation();
     std::uint32_t safetyRequestTicket =
         PublishSafetyMotionRequestTicket(true);
@@ -15188,6 +15621,11 @@ void MotionCore::StopGroupImpl(
 
 void MotionCore::EmergencyStopGroup()
 {
+    // Direct group emergency containment is equivalent to the all-axis
+    // emergency path for a staged operator RESET: discard the benign
+    // controlled-stop request rather than allowing it to revive afterward.
+    SupersedeResetControlledStop();
+
     BeginExecutionDrainAcknowledgementRevocation();
     std::uint32_t safetyRequestTicket =
         PublishSafetyMotionRequestTicket(true);
@@ -16481,6 +16919,12 @@ void MotionCore::UpdateInterpolation()
 
     // Safety requests have priority over manual/home mailbox commands.
     ApplyPendingSafetyAndRecoveryRequests();
+
+    // RESET during a clean G00/G01 is a controlled-stop request, not an
+    // immediate safety-zero request. Its producer only publishes a
+    // pre-ticket bit; RT creates and consumes the exact SAFETY ticket/Epoch
+    // here before any final PDO command is constructed.
+    ApplyPendingResetControlledStopRequest();
 
     // A direct Safety takeover or a request producer paused between ticket
     // publication and its mailbox write is still an observable stop intent.
@@ -18070,6 +18514,12 @@ void MotionCore::UpdateInterpolation()
                     MOTION_EXECUTION_EPOCH_INVALID;
                 m_safetyControlledStopRequestTicket = 0U;
                 TryAcknowledgeAppliedSafetyMotionRequests();
+                // Release the NC Reset continuation only after every
+                // physical group axis has met the existing in-position
+                // proof.  A higher-priority action may already have changed
+                // the phase to SUPERSEDED; the CAS helper deliberately does
+                // not overwrite that terminal result.
+                CompleteResetControlledStop();
                 return;
             }
 
@@ -19407,6 +19857,7 @@ void MotionCore::PublishStopSettleEvidence() noexcept
 
     MotionStopSettlePublicationPayload payload{};
     MotionStopSettleSnapshot& snapshot = payload.snapshot;
+    MotionProgramStartReadinessSnapshot programStartReadiness{};
     MotionEmergencyStopEvidence& emergency =
         payload.emergencyStopEvidence;
     MotionEmergencyStopCounters& emergencyCounters =
@@ -19540,6 +19991,7 @@ void MotionCore::PublishStopSettleEvidence() noexcept
             }
 
             ++snapshot.existingAxisCount;
+            ++programStartReadiness.existingAxisCount;
 
             std::uint32_t axisBit = 0U;
             if (i < static_cast<std::size_t>(32U))
@@ -19593,6 +20045,29 @@ void MotionCore::PublishStopSettleEvidence() noexcept
 
             const std::int32_t publishedAxisIndex =
                 static_cast<std::int32_t>(axis.axisIndex);
+
+            // This is deliberately the exact same predicate used by
+            // LoadNextCommand() when an incoming command claims a physical
+            // axis. A fresh program is held at the NC boundary if any
+            // existing axis would otherwise trip the AL3021 containment path
+            // on its first command. Do not substitute raw actual velocity or
+            // final PDO TargetVelocity here: the IDLE servo loop can report
+            // noisy derivative feedback and legitimate small holding output
+            // while the axis is already safe to admit.
+            if (IsIncomingPhysicalAxisReadyForGroup(axis))
+            {
+                ++programStartReadiness.readyAxisCount;
+            }
+            else
+            {
+                ++programStartReadiness.notReadyAxisCount;
+                if (programStartReadiness.firstNotReadyAxisIndex < 0)
+                {
+                    programStartReadiness.firstNotReadyAxisIndex =
+                        publishedAxisIndex;
+                }
+            }
+
             const double commandVelocityAbsPps =
                 std::abs(axis.currentCmdVel);
             const double actualVelocityAbsPps =
@@ -19910,6 +20385,45 @@ void MotionCore::PublishStopSettleEvidence() noexcept
             snapshot.publicationGeneration;
     }
 
+    // Publish the compact per-axis readiness proof before the paired stop
+    // bank becomes active. Readers require this exact generation/sample pair;
+    // a writer that races between either read produces a mismatch and Start
+    // simply remains pending for the next NC scan.
+    programStartReadiness.stopPublicationGeneration =
+        snapshot.publicationGeneration;
+    programStartReadiness.stopSampleSequence = snapshot.sampleSequence;
+    std::array<
+        std::uint64_t,
+        MOTION_PROGRAM_START_READINESS_PUBLICATION_WORD_COUNT>
+        programStartReadinessWords{};
+    std::memcpy(
+        programStartReadinessWords.data(),
+        &programStartReadiness,
+        sizeof(programStartReadiness));
+
+    MotionProgramStartReadinessAtomicBank& programStartReadinessBank =
+        m_programStartReadinessPublicationBanks[
+            static_cast<std::size_t>(
+                snapshot.publicationGeneration & 1ULL)];
+    programStartReadinessBank.writeSequence.fetch_add(
+        1ULL,
+        std::memory_order_acq_rel);
+    for (std::size_t i = 0U;
+        i < programStartReadinessWords.size();
+        ++i)
+    {
+        programStartReadinessBank.words[i].store(
+            programStartReadinessWords[i],
+            std::memory_order_relaxed);
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    programStartReadinessBank.writeSequence.fetch_add(
+        1ULL,
+        std::memory_order_release);
+    m_programStartReadinessPublicationGeneration.store(
+        snapshot.publicationGeneration,
+        std::memory_order_release);
+
     std::array<
         std::uint64_t,
         MOTION_STOP_SETTLE_PUBLICATION_WORD_COUNT> words{};
@@ -20021,6 +20535,61 @@ bool MotionCore::TryReadStopSettlePublication(
     }
 
     payload = MotionStopSettlePublicationPayload{};
+    return false;
+}
+
+
+bool MotionCore::TryReadProgramStartReadinessPublication(
+    MotionProgramStartReadinessSnapshot& readiness) const noexcept
+{
+    std::array<
+        std::uint64_t,
+        MOTION_PROGRAM_START_READINESS_PUBLICATION_WORD_COUNT> words{};
+
+    for (std::uint32_t attempt = 0U; attempt < 16U; ++attempt)
+    {
+        const std::uint64_t generationBefore =
+            m_programStartReadinessPublicationGeneration.load(
+                std::memory_order_acquire);
+        const MotionProgramStartReadinessAtomicBank& publicationBank =
+            m_programStartReadinessPublicationBanks[
+                static_cast<std::size_t>(generationBefore & 1ULL)];
+        const std::uint64_t bankSequenceBefore =
+            publicationBank.writeSequence.load(
+                std::memory_order_acquire);
+        if ((bankSequenceBefore & 1ULL) != 0ULL)
+        {
+            continue;
+        }
+
+        for (std::size_t i = 0U; i < words.size(); ++i)
+        {
+            words[i] = publicationBank.words[i].load(
+                std::memory_order_relaxed);
+        }
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const std::uint64_t bankSequenceAfter =
+            publicationBank.writeSequence.load(
+                std::memory_order_acquire);
+        const std::uint64_t generationAfter =
+            m_programStartReadinessPublicationGeneration.load(
+                std::memory_order_acquire);
+        if (bankSequenceBefore == bankSequenceAfter &&
+            (bankSequenceAfter & 1ULL) == 0ULL &&
+            generationBefore == generationAfter)
+        {
+            MotionProgramStartReadinessSnapshot candidate{};
+            std::memcpy(&candidate, words.data(), sizeof(candidate));
+            if (candidate.stopPublicationGeneration == generationBefore)
+            {
+                readiness = candidate;
+                return true;
+            }
+        }
+    }
+
+    readiness = MotionProgramStartReadinessSnapshot{};
     return false;
 }
 
@@ -20703,6 +21272,162 @@ bool MotionCore::HasExactExecutionDrainAcknowledgement(
     // Close the publication-read seam with exact packed-word equality.  Split
     // getters could otherwise observe E, then miss a complete E+1 publish/apply
     // that clears PENDING again before the final boolean check.
+    const std::uint64_t exitExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t exitOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t exitDrainRevocationGeneration =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint64_t exitObservedDrainRevocationGeneration =
+        m_executionDrainObservedRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint32_t exitDrainRevocationPublishers =
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire);
+    return
+        exitExecutionPublication == entryExecutionPublication &&
+        exitOwnerState == entryOwnerState &&
+        exitDrainRevocationPublishers == 0U &&
+        exitDrainRevocationGeneration ==
+        entryDrainRevocationGeneration &&
+        exitObservedDrainRevocationGeneration ==
+        entryObservedDrainRevocationGeneration &&
+        exitDrainRevocationGeneration ==
+        exitObservedDrainRevocationGeneration &&
+        (exitExecutionPublication &
+            (EXECUTION_EPOCH_PUBLICATION_PENDING |
+                EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL &&
+        !HasPendingSafetyOrRecoveryRequests();
+}
+
+
+bool MotionCore::HasExactProgramStartQuiescenceAcknowledgement(
+    MotionExecutionEpoch executionEpoch,
+    const MotionOwnerLease& ownerLease) const noexcept
+{
+    if (executionEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        !ownerLease.IsValid())
+    {
+        return false;
+    }
+
+    // Keep the same entry seam as HasExactExecutionDrainAcknowledgement.
+    // A program start is only allowed to extend that exact Epoch/Owner proof;
+    // it must never rely on a newer or split publication.
+    const std::uint64_t entryExecutionPublication =
+        m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t entryOwnerState =
+        m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t entryDrainRevocationGeneration =
+        m_executionDrainRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint64_t entryObservedDrainRevocationGeneration =
+        m_executionDrainObservedRevocationGeneration.load(
+            std::memory_order_acquire);
+    const std::uint32_t entryDrainRevocationPublishers =
+        m_executionDrainRevocationPublishersInProgress.load(
+            std::memory_order_acquire);
+    const MotionOwnerLease entryOwnerLease =
+        UnpackMotionOwnerState(entryOwnerState);
+    if ((entryExecutionPublication &
+        (EXECUTION_EPOCH_PUBLICATION_PENDING |
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+        UnpackExecutionEpochPublication(entryExecutionPublication) !=
+        executionEpoch ||
+        !entryOwnerLease.Matches(ownerLease) ||
+        UnpackMotionOwnerSafetyHandshake(entryOwnerState) ||
+        UnpackMotionOwnerSafetyActionPending(entryOwnerState) ||
+        (entryOwnerState &
+            MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        UnpackMotionOwnerSafetyRequestTicket(entryOwnerState) !=
+        m_safetyRequestAcknowledgedTicket.load(
+            std::memory_order_acquire) ||
+        entryDrainRevocationPublishers != 0U ||
+        entryDrainRevocationGeneration !=
+        entryObservedDrainRevocationGeneration ||
+        HasPendingSafetyOrRecoveryRequests())
+    {
+        return false;
+    }
+
+    // Read the formal execution-drain proof and the physical stop evidence
+    // from one atomic RT publication bank.  Calling two public getters here
+    // could combine different 250 us samples and let a fresh program start
+    // cross a post-Reset coast-down seam.
+    MotionStopSettlePublicationPayload payload{};
+    if (!TryReadStopSettlePublication(payload))
+    {
+        return false;
+    }
+
+    MotionProgramStartReadinessSnapshot readiness{};
+    if (!TryReadProgramStartReadinessPublication(readiness))
+    {
+        return false;
+    }
+
+    const MotionNCSettleSnapshot& drain =
+        payload.ncSettleSnapshots[static_cast<std::size_t>(
+            MotionNCSettleProfile::GROUP_COMPLETION)];
+    const MotionStopSettleSnapshot& stop = payload.snapshot;
+
+    // Preserve every formal identity and ownership requirement of the
+    // generic drain acknowledgement.  Do not require drain.settled here:
+    // a brand-new Epoch has no group scope yet, so it legitimately reports a
+    // drained empty scope before the first command is admitted.
+    if (drain.publicationGeneration == 0ULL ||
+        drain.profile != MotionNCSettleProfile::GROUP_COMPLETION ||
+        drain.executionEpoch != executionEpoch ||
+        drain.owner != ownerLease.owner ||
+        drain.ownerGeneration != ownerLease.generation ||
+        !drain.runtimeObserved ||
+        !drain.runtimeCycleValid ||
+        !drain.runtimeCycleContiguous ||
+        drain.groupActive ||
+        !drain.groupDrained ||
+        drain.safetyOrRecoveryPending ||
+        drain.commandQueueDepth != 0U ||
+        drain.commandIngressDepth != 0U ||
+        drain.commandReplayDepth != 0U)
+    {
+        return false;
+    }
+
+    // The generic drain proof deliberately does not require physical
+    // convergence.  Program start does, but its physical proof must match the
+    // one used by LoadNextCommand() for an incoming axis.  The raw 250 us
+    // derivative velocity and a small final PDO TargetVelocity are both
+    // advisory in an IDLE servo: treating them as motion caused a stationary
+    // system to remain in START_PENDING forever.  Instead, require every
+    // existing axis to satisfy the exact incoming-axis predicate (servo,
+    // startup-lag state, fault state, canonical IDLE, in-position state,
+    // finite command data, zero commanded velocity and following window).
+    // This holds a fresh G00 at the NC boundary whenever LoadNextCommand()
+    // would otherwise invoke the AL3021 fail-closed containment path.
+    if (stop.publicationGeneration == 0ULL ||
+        stop.publicationGeneration != drain.publicationGeneration ||
+        stop.sampleSequence == 0ULL ||
+        stop.groupActive ||
+        stop.commandQueueDepth != 0U ||
+        stop.commandIngressDepth != 0U ||
+        stop.commandReplayDepth != 0U ||
+        stop.nonIdleAxisCount != 0U ||
+        stop.commandMovingAxisCount != 0U ||
+        stop.outsideInPositionWindowAxisCount != 0U ||
+        readiness.stopPublicationGeneration !=
+        stop.publicationGeneration ||
+        readiness.stopSampleSequence != stop.sampleSequence ||
+        readiness.existingAxisCount == 0U ||
+        readiness.notReadyAxisCount != 0U ||
+        readiness.readyAxisCount != readiness.existingAxisCount)
+    {
+        return false;
+    }
+
+    // Close the same lifecycle seam after the physical proof.  Any change
+    // while reading invalidates the admission and leaves Program Start
+    // pending for the next 10 ms NC scan.
     const std::uint64_t exitExecutionPublication =
         m_executionEpochPublication.load(std::memory_order_acquire);
     const std::uint64_t exitOwnerState =

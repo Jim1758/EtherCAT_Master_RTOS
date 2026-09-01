@@ -646,25 +646,25 @@ void NCManager::FeedHold()
 
 void NCManager::Reset()
 {
+    const bool waitingForPreResetControlledStop =
+        m_resetContinuationPhase ==
+        ResetContinuationPhase::PRE_RESET_CONTROLLED_STOP;
     const bool waitingForResetButtonAdmission =
         m_resetContinuationPhase ==
         ResetContinuationPhase::BUTTON_ADMISSION;
-    const bool waitingForResetAuthorityEdge =
+    const bool waitingForResetOutputHold =
         m_resetContinuationPhase ==
-        ResetContinuationPhase::AUTHORITY_EDGE;
-    const bool continuingResetTransaction =
+        ResetContinuationPhase::OUTPUT_HOLD;
+    bool continuingResetTransaction =
+        waitingForPreResetControlledStop ||
         waitingForResetButtonAdmission ||
-        waitingForResetAuthorityEdge ||
+        waitingForResetOutputHold ||
         m_resetContinuationPhase ==
         ResetContinuationPhase::PRE_DRAIN ||
         m_resetContinuationPhase ==
         ResetContinuationPhase::AUTHORITY ||
         m_resetContinuationPhase ==
         ResetContinuationPhase::EPOCH ||
-        m_resetContinuationPhase ==
-        ResetContinuationPhase::CONTROLLED_STOP ||
-        m_resetContinuationPhase ==
-        ResetContinuationPhase::OUTPUT_HOLD ||
         m_resetContinuationPhase ==
         ResetContinuationPhase::BATCH ||
         m_resetContinuationPhase ==
@@ -673,6 +673,7 @@ void NCManager::Reset()
         ResetContinuationPhase::CLEANUP ||
         m_resetContinuationPhase ==
         ResetContinuationPhase::SETTLE;
+    bool bypassResetStateIdempotence = false;
 
     if (m_resetContinuationPhase ==
         ResetContinuationPhase::CLEANUP)
@@ -683,28 +684,104 @@ void NCManager::Reset()
         return;
     }
 
+    if (waitingForPreResetControlledStop)
+    {
+        // The Reset-controlled-stop ingress is deliberately pre-ticket until
+        // the 250 us runtime owns it.  Keep RESET_STATE stable during that
+        // short handoff as well as throughout the exact SAFETY stop ticket.
+        // Do not overlap this pre-phase with Reset's PDO output-hold/batch:
+        // the whole-PDO hold is for fault recovery and would turn a normal
+        // G00 deceleration into an abrupt zero-command stop.
+        const ResetControlledStopPhase resetStopPhase =
+            m_motion.GetResetControlledStopPhase();
+        if (resetStopPhase == ResetControlledStopPhase::PENDING ||
+            resetStopPhase == ResetControlledStopPhase::APPLYING ||
+            resetStopPhase == ResetControlledStopPhase::ACTIVE ||
+            m_motion.HasPendingSafetyOrRecoveryRequests())
+        {
+            return;
+        }
+
+        // Only a physically settled RT-controlled stop may continue into the
+        // original Reset output-hold/batch transaction. A real Alarm/E-stop
+        // or any exact-ticket race supersedes this button press; require a
+        // fresh explicit Reset after the operator has handled that condition.
+        if (resetStopPhase != ResetControlledStopPhase::COMPLETED ||
+            AlarmManager::GetInstance().HasAlarm() ||
+            !m_motion.ConsumeCompletedResetControlledStop())
+        {
+            m_resetContinuationPhase = ResetContinuationPhase::BLOCKED;
+            m_programMotionLease = MotionOwnerLease{};
+            m_state = NCState::RESET_STATE;
+            return;
+        }
+
+        // The controlled stop has been RT-completed.  Fall through to start
+        // the original proven Reset transaction while retaining RESET_STATE;
+        // an HMI producer must never see a transient IDLE window between the
+        // StopGroup ticket and the Reset button admission.
+        m_resetContinuationPhase = ResetContinuationPhase::IDLE;
+        continuingResetTransaction = false;
+        bypassResetStateIdempotence = true;
+    }
+
     // Stage NC-0.2J.5.1：Reset safety batch 尚未完成時，重複 Reset 必須
     // 保持冪等。只有 release gate 已進入 terminal BLOCKED，操作員再次
     // 明確按 Reset 才建立新的 Epoch / request / gate transaction。
     if (!continuingResetTransaction &&
         m_state == NCState::RESET_STATE)
     {
-        const NCResetReleaseGateSnapshot resetGate =
-            m_resetReleaseGate.GetSnapshot();
-        const bool terminalBlockedReset =
-            m_resetContinuationPhase ==
-            ResetContinuationPhase::BLOCKED ||
-            !resetGate.active &&
-            resetGate.blocked &&
-            resetGate.phase == NCResetReleaseGatePhase::BLOCKED;
-        if (!terminalBlockedReset)
+        if (!bypassResetStateIdempotence)
         {
-            return;
+            const NCResetReleaseGateSnapshot resetGate =
+                m_resetReleaseGate.GetSnapshot();
+            const bool terminalBlockedReset =
+                m_resetContinuationPhase ==
+                ResetContinuationPhase::BLOCKED ||
+                !resetGate.active &&
+                resetGate.blocked &&
+                resetGate.phase == NCResetReleaseGatePhase::BLOCKED;
+            if (!terminalBlockedReset)
+            {
+                return;
+            }
+
+            // A prior G00 RESET may have been superseded by Alarm/E-stop.
+            // This is a *new explicit* RESET press after the terminal block,
+            // so it may retire the bookkeeping outcome and start the normal
+            // fail-closed RESET batch.  It does not re-arm the old smooth
+            // stop or release any Safety owner.
+            (void)m_motion.RetireSupersededResetControlledStop();
         }
     }
 
     if (!continuingResetTransaction)
     {
+        // Do not apply Reset's whole-PDO zero-output hold across an active
+        // G00/G01 group.  A RUN state can also exist before its first command
+        // is consumed or after a group has already drained; issuing a no-op
+        // StopGroup in either case would create a needless safety transition.
+        // Therefore only the coherent RT observation of an active group uses
+        // the controlled-deceleration pre-phase.  All other cases retain the
+        // original Reset safety-output-hold transaction.
+        const MotionStopSettleSnapshot resetStopSnapshot =
+            m_motion.GetStopSettleSnapshot();
+        const bool cleanProgramRunReset =
+            m_state == NCState::RUN &&
+            resetStopSnapshot.publicationGeneration != 0ULL &&
+            resetStopSnapshot.groupActive &&
+            !m_resetSafetyOutputHoldActive &&
+            !AlarmManager::GetInstance().HasAlarm();
+        if (cleanProgramRunReset)
+        {
+            m_resetContinuationPhase =
+                ResetContinuationPhase::PRE_RESET_CONTROLLED_STOP;
+            m_programMotionLease = MotionOwnerLease{};
+            m_state = NCState::RESET_STATE;
+            m_motion.RequestResetControlledStop();
+            return;
+        }
+
         AlarmManager& resetButtonAlarms = AlarmManager::GetInstance();
         m_resetAuthorityAlarmUpdateCount =
             resetButtonAlarms.GetUpdateCount();
@@ -713,12 +790,19 @@ void NCManager::Reset()
                 resetButtonAlarms.GetMotionSafetyIntentState());
         m_resetAuthorityMappingAlarmRequestCount =
             m_lastHandledMappingIntegrityAlarmRequestCount;
-        // Do not install the whole-PDO zero-output hold yet.  A normal Reset
-        // must hand the active G00/G01 to the exact SAFETY stop driver first;
-        // the hold is installed only after actual standstill is proved.
-        m_resetButtonCutoffProvenanceGeneration =
-            m_motion.GetSafetyProvenanceGeneration();
-        m_resetControlledStopPublished = false;
+        if (!m_resetSafetyOutputHoldActive)
+        {
+            m_resetButtonCutoffProvenanceGeneration =
+                m_motion.BeginResetSafetyOutputHold();
+            m_resetSafetyOutputHoldActive = true;
+        }
+        else
+        {
+            // A new operator press after terminal BLOCKED reuses the already
+            // active zero-output hold but owns a fresh immutable cutoff.
+            m_resetButtonCutoffProvenanceGeneration =
+                m_motion.GetSafetyProvenanceGeneration();
+        }
 
         // A frame which was already at its physical send point may own the
         // Alarm reservation for a few microseconds.  Latch the button once
@@ -828,11 +912,11 @@ void NCManager::Reset()
         }
 
         m_resetContinuationPhase =
-            ResetContinuationPhase::AUTHORITY_EDGE;
+            ResetContinuationPhase::OUTPUT_HOLD;
     }
 
     if (m_resetContinuationPhase ==
-        ResetContinuationPhase::AUTHORITY_EDGE)
+        ResetContinuationPhase::OUTPUT_HOLD)
     {
         const ResetPreDrainReconcileResult firstReconcile =
             ReconcileResetPreDrainMappingAlarmBoundary();
@@ -853,21 +937,22 @@ void NCManager::Reset()
         // Every producer which was already in flight at the button cutoff
         // must finish before the physical authority edge. A later producer
         // changes the immutable cutoff and is rejected by Reconcile above.
-        if (m_motion.HasPendingSafetyOrRecoveryRequests())
+        if (m_motion.HasPendingSafetyOrRecoveryRequests() ||
+            !m_motion.IsResetSafetyOutputHoldEstablished())
         {
             return;
         }
 
         // Close publisher-end, Alarm and mapping seams one last time before
         // the physical edge. No waiting scan may rebuild these baselines.
-        const ResetPreDrainReconcileResult finalAuthorityReconcile =
+        const ResetPreDrainReconcileResult finalOutputReconcile =
             ReconcileResetPreDrainMappingAlarmBoundary();
-        if (finalAuthorityReconcile ==
+        if (finalOutputReconcile ==
             ResetPreDrainReconcileResult::DEFERRED)
         {
             return;
         }
-        if (finalAuthorityReconcile ==
+        if (finalOutputReconcile ==
             ResetPreDrainReconcileResult::SUPERSEDED)
         {
             m_resetContinuationPhase =
@@ -1070,7 +1155,7 @@ void NCManager::Reset()
         m_resetContinuationExecutionEpoch =
             acknowledgedResetEpoch;
         m_resetContinuationPhase =
-            ResetContinuationPhase::CONTROLLED_STOP;
+            ResetContinuationPhase::BATCH;
         return;
     }
 
@@ -1098,17 +1183,9 @@ void NCManager::Reset()
         resetBoundary.cause ==
         NCLifecycleInterruptionCause::RESET &&
         (m_resetContinuationPhase ==
-            ResetContinuationPhase::CONTROLLED_STOP ||
-            m_resetContinuationPhase ==
-            ResetContinuationPhase::OUTPUT_HOLD ||
-            m_resetContinuationPhase ==
             ResetContinuationPhase::BATCH ||
             resetBoundary.publishedExecutionEpoch == resetEpoch);
     if ((m_resetContinuationPhase !=
-        ResetContinuationPhase::CONTROLLED_STOP &&
-        m_resetContinuationPhase !=
-        ResetContinuationPhase::OUTPUT_HOLD &&
-        m_resetContinuationPhase !=
         ResetContinuationPhase::BATCH &&
         m_resetContinuationPhase !=
         ResetContinuationPhase::ALARM_CLEAR &&
@@ -1131,77 +1208,6 @@ void NCManager::Reset()
         m_resetContinuationPhase =
             ResetContinuationPhase::BLOCKED;
         m_motion.RequestEmergencyStopAllAxes();
-        return;
-    }
-
-    if (m_resetContinuationPhase ==
-        ResetContinuationPhase::CONTROLLED_STOP)
-    {
-        if (!m_resetControlledStopPublished)
-        {
-            const MotionCore::ResetSafetyAuthorityResult controlledStop =
-                m_motion.RequestExactResetSafetyBatch(
-                    resetEpoch,
-                    m_safetyMotionLease,
-                    m_resetAuthorityRequestTicket,
-                    m_resetAuthorityProvenanceGeneration,
-                    false,
-                    true);
-            m_resetAuthorityRequestTicket = controlledStop.requestTicket;
-            m_resetAuthorityProvenanceGeneration =
-                controlledStop.provenanceGeneration;
-            if (controlledStop.status ==
-                MotionCore::ResetSafetyAuthorityStatus::DEFERRED)
-            {
-                return;
-            }
-            if (controlledStop.status !=
-                MotionCore::ResetSafetyAuthorityStatus::ACQUIRED)
-            {
-                m_resetContinuationPhase =
-                    ResetContinuationPhase::BLOCKED;
-                m_motion.RequestEmergencyStopAllAxes();
-                return;
-            }
-
-            m_resetControlledStopPublished = true;
-            return;
-        }
-
-        // The controlled-stop child ticket remains unacknowledged while RT
-        // is decelerating.  Proceed only after the RT settle publication
-        // proves that the active group and all physical axes are stationary.
-        const MotionStopSettleSnapshot stopSettle =
-            m_motion.GetStopSettleSnapshot();
-        if (m_motion.HasPendingSafetyOrRecoveryRequests() ||
-            !stopSettle.standstill ||
-            stopSettle.groupActive)
-        {
-            return;
-        }
-
-        m_resetContinuationPhase = ResetContinuationPhase::OUTPUT_HOLD;
-        return;
-    }
-
-    if (m_resetContinuationPhase ==
-        ResetContinuationPhase::OUTPUT_HOLD)
-    {
-        // This is intentionally after CONTROLLED_STOP.  It seals remaining
-        // PDO output and prevents a fresh command from entering while the
-        // final Reset batch, rebase, and owner-release proof complete.
-        if (!m_resetSafetyOutputHoldActive)
-        {
-            (void)m_motion.BeginResetSafetyOutputHold();
-            m_resetSafetyOutputHoldActive = true;
-            return;
-        }
-        if (m_motion.HasPendingSafetyOrRecoveryRequests() ||
-            !m_motion.IsResetSafetyOutputHoldEstablished())
-        {
-            return;
-        }
-        m_resetContinuationPhase = ResetContinuationPhase::BATCH;
         return;
     }
 
@@ -2097,25 +2103,25 @@ void NCManager::ObserveAlarmEmergencyStopShadow() noexcept
 NCManager::ResetPreDrainReconcileResult
 NCManager::ReconcileResetPreDrainMappingAlarmBoundary() noexcept
 {
-    const bool waitingForAuthorityEdge =
+    const bool waitingForOutputHold =
         m_resetContinuationPhase ==
-        ResetContinuationPhase::AUTHORITY_EDGE;
-    if (!waitingForAuthorityEdge &&
+        ResetContinuationPhase::OUTPUT_HOLD;
+    if (!waitingForOutputHold &&
         m_resetContinuationPhase !=
         ResetContinuationPhase::PRE_DRAIN)
     {
         return ResetPreDrainReconcileResult::READY;
     }
 
-    // AUTHORITY_EDGE uses the immutable button cutoff; PRE_DRAIN uses the later
+    // OUTPUT_HOLD uses the immutable button cutoff; PRE_DRAIN uses the later
     // physical Motion authority edge. A producer which began before the
     // selected boundary may publish its mailbox later without advancing the
     // generation. Every producer which begins after it must advance first.
     const std::uint64_t expectedProvenanceGeneration =
-        waitingForAuthorityEdge
+        waitingForOutputHold
         ? m_resetButtonCutoffProvenanceGeneration
         : m_resetAuthorityProvenanceGeneration;
-    if ((!waitingForAuthorityEdge &&
+    if ((!waitingForOutputHold &&
         expectedProvenanceGeneration == 0ULL) ||
         m_motion.GetSafetyProvenanceGeneration() !=
         expectedProvenanceGeneration)
@@ -2444,7 +2450,7 @@ void NCManager::ProcessMotionFeedback() noexcept
             // must decide whether a delayed mailbox belongs before or after
             // the operator edge before any Alarm/lifecycle state is changed.
             if (m_resetContinuationPhase ==
-                ResetContinuationPhase::AUTHORITY_EDGE ||
+                ResetContinuationPhase::OUTPUT_HOLD ||
                 m_resetContinuationPhase ==
                 ResetContinuationPhase::PRE_DRAIN)
             {
@@ -2672,6 +2678,7 @@ void NCManager::ProcessTask()
             return;
         }
     }
+
     if (m_resetContinuationPhase ==
         ResetContinuationPhase::CLEANUP)
     {
@@ -2684,7 +2691,7 @@ void NCManager::ProcessTask()
     // preserving its RESET lifecycle boundary. Every other phase uses the
     // ordinary ALARM path.
     if (m_resetContinuationPhase ==
-        ResetContinuationPhase::AUTHORITY_EDGE ||
+        ResetContinuationPhase::OUTPUT_HOLD ||
         m_resetContinuationPhase ==
         ResetContinuationPhase::PRE_DRAIN)
     {
@@ -2727,17 +2734,13 @@ void NCManager::ProcessTask()
             m_resetContinuationPhase ==
             ResetContinuationPhase::BUTTON_ADMISSION ||
             m_resetContinuationPhase ==
-            ResetContinuationPhase::AUTHORITY_EDGE ||
+            ResetContinuationPhase::OUTPUT_HOLD ||
             m_resetContinuationPhase ==
             ResetContinuationPhase::PRE_DRAIN ||
             m_resetContinuationPhase ==
             ResetContinuationPhase::AUTHORITY ||
             m_resetContinuationPhase ==
             ResetContinuationPhase::EPOCH ||
-            m_resetContinuationPhase ==
-            ResetContinuationPhase::CONTROLLED_STOP ||
-            m_resetContinuationPhase ==
-            ResetContinuationPhase::OUTPUT_HOLD ||
             m_resetContinuationPhase ==
             ResetContinuationPhase::BATCH ||
             m_resetContinuationPhase ==
@@ -2750,7 +2753,7 @@ void NCManager::ProcessTask()
     if (resetContinuationIsAdvancing())
     {
         if ((m_resetContinuationPhase !=
-            ResetContinuationPhase::AUTHORITY_EDGE &&
+            ResetContinuationPhase::OUTPUT_HOLD &&
             m_resetContinuationPhase !=
             ResetContinuationPhase::PRE_DRAIN &&
             (AlarmManager::GetInstance().GetUpdateCount() !=
@@ -2878,6 +2881,20 @@ void NCManager::ProcessTask()
         ObservePreparedBlockQueueShadow(false);
 
         // ⚠️ 立刻退出迴圈，絕對不准往下執行任何軌跡運算或 G 碼解析！
+        return;
+    }
+
+    // This phase deliberately runs after the normal Alarm branch.  A real
+    // Alarm therefore supersedes a decelerating Reset with the established
+    // immediate E-stop path instead of being hidden behind an outstanding
+    // StopGroup ticket.  The ticket itself remains pending until the RT
+    // controlled-stop trajectory has reached physical convergence, so no
+    // cross-thread snapshot is used as an early completion permit here.
+    if (m_resetContinuationPhase ==
+        ResetContinuationPhase::PRE_RESET_CONTROLLED_STOP)
+    {
+        Reset();
+        ObservePreparedBlockQueueShadow(false);
         return;
     }
 
@@ -6052,7 +6069,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     const MotionExecutionEpoch pendingEpoch =
         m_pendingProgramRunExecutionEpoch;
     if (m_motion.HasPendingSafetyOrRecoveryRequests() ||
-        !m_motion.HasExactExecutionDrainAcknowledgement(
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
             pendingEpoch,
             m_pendingProgramRunOwnerLease))
     {
@@ -6079,7 +6096,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     }
 
     if (!IsPendingProgramRunStartIdentityCurrent() ||
-        !m_motion.HasExactExecutionDrainAcknowledgement(
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
             pendingEpoch,
             m_pendingProgramRunOwnerLease) ||
         m_motion.HasPendingSafetyOrRecoveryRequests())
@@ -6101,7 +6118,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     if (!m_motion.TryGetSynchronizedG00QueueTailMCS(
         synchronizedQueueTailMCS) ||
         !IsPendingProgramRunStartIdentityCurrent() ||
-        !m_motion.HasExactExecutionDrainAcknowledgement(
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
             pendingEpoch,
             m_pendingProgramRunOwnerLease) ||
         m_motion.HasPendingSafetyOrRecoveryRequests())
@@ -6114,7 +6131,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
 
     CoordSys.SyncMachinePosition(synchronizedQueueTailMCS);
     if (!IsPendingProgramRunStartIdentityCurrent() ||
-        !m_motion.HasExactExecutionDrainAcknowledgement(
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
             pendingEpoch,
             m_pendingProgramRunOwnerLease) ||
         m_motion.HasPendingSafetyOrRecoveryRequests() ||
@@ -6143,7 +6160,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     if (!committedRun ||
         !m_motion.IsMotionOwnerLeaseCurrent(
             m_pendingProgramRunOwnerLease) ||
-        !m_motion.HasExactExecutionDrainAcknowledgement(
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
             pendingEpoch,
             m_pendingProgramRunOwnerLease))
     {

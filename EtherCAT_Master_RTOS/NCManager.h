@@ -962,9 +962,12 @@ private:
     enum class ResetContinuationPhase : std::uint8_t
     {
         IDLE = 0,
+        // A Reset received during an ordinary G00/G01 interpolation group
+        // first lets the existing SAFETY-owned StopGroup trajectory decelerate
+        // the physical axes.  No Reset PDO hold or Reset batch is published
+        // until that trajectory has terminated.
+        PRE_RESET_CONTROLLED_STOP,
         BUTTON_ADMISSION,
-        AUTHORITY_EDGE,
-        CONTROLLED_STOP,
         OUTPUT_HOLD,
         PRE_DRAIN,
         AUTHORITY,
@@ -985,11 +988,6 @@ private:
     std::uint32_t m_resetAuthorityRequestTicket = 0U;
     std::uint64_t m_resetButtonCutoffProvenanceGeneration = 0ULL;
     std::uint64_t m_resetAuthorityProvenanceGeneration = 0ULL;
-    // Normal operator RESET must first decelerate an active G00/G01 under
-    // the exact SAFETY lease.  This latch prevents a delayed 10 ms retry
-    // from publishing a second stop child-ticket while the first stop is
-    // still being consumed by the 250 us owner.
-    bool m_resetControlledStopPublished = false;
     bool m_resetSafetyOutputHoldActive = false;
     std::uint32_t m_resetAuthorityAlarmUpdateCount = 0U;
     std::uint64_t m_resetAuthorityAlarmSafetyIntentState = 0ULL;

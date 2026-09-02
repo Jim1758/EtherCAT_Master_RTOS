@@ -244,6 +244,98 @@ public:
         return m_enabled;
     }
 
+    // Stage NC-0.2K.7.1: non-mutating inspection for the separately-owned
+    // ordinary G00 read-ahead gate.  This deliberately does not publish a
+    // K.4.2 decision, create a K.4.2 pending token, or change K.4.2 counters.
+    // The K.7.1 gate owns the later selection/bind/commit proof.
+    bool TryInspectOrdinaryG00ReadAheadCandidate(
+        const NCPreparedHeadCutoverContext& context,
+        const NCParsedBlock& parsedBlock,
+        const NCPreparedHeadEquivalenceCounters& equivalenceCounters,
+        const NCPreparedHeadCutoverSnapshot& cutoverSnapshot,
+        const NCPreparedHeadCutoverCounters& cutoverCounters,
+        const NCPreparedPreResolveAdmissionSnapshot& admissionSnapshot,
+        const NCPreparedPreResolveAdmissionCounters& admissionCounters,
+        NCBlock& selectedBlock,
+        bool ordinaryConfiguredAxisPresent) const noexcept
+    {
+        selectedBlock = NCBlock{};
+        if (!m_enabled || m_permanentLockout ||
+            m_pendingKind != PendingKind::NONE ||
+            !context.hasHead ||
+            !QueueExact(
+                context.queue,
+                context.queueCounters,
+                context.hasHead) ||
+            !UpstreamHealthy(
+                context.queueCounters,
+                equivalenceCounters,
+                cutoverSnapshot,
+                cutoverCounters,
+                admissionSnapshot,
+                admissionCounters) ||
+            !TokenExact(context.queue, context.head) ||
+            !SourceIdentityExact(
+                context.queue.source,
+                context.head.source) ||
+            !SourceIdentityExact(
+                context.head.source,
+                context.runtimeSource) ||
+            context.queue.runtimeCurrentPC != context.sourcePC ||
+            context.head.sourcePC != context.sourcePC ||
+            context.head.sourceLineNumber != context.sourceLineNumber ||
+            !context.capturedBeforeResolve ||
+            !context.runtimeModalBeforeValid ||
+            !ModalExact(
+                context.head.modalBefore,
+                context.runtimeModalBefore,
+                true) ||
+            !AccountingValid())
+        {
+            return false;
+        }
+
+        NCBlock rebuiltBlock{};
+        if (!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(
+            parsedBlock,
+            rebuiltBlock) ||
+            !StorageBlockEqual(
+                rebuiltBlock,
+                context.head.preparedBlock))
+        {
+            return false;
+        }
+
+        const NCPreparedBlockClassification rebuiltClassification =
+            NCPreparedBlockQueueShadow::ClassifyLiteralBlock(
+                parsedBlock,
+                rebuiltBlock,
+                context.runtimeSource.panel);
+        const bool rebuiltExact =
+            ClassificationEqual(
+                rebuiltClassification,
+                context.head.classification) &&
+            ExecutionPlanValidAndEqual(
+                rebuiltBlock,
+                context.head.preparedBlock);
+        if (ClassifyEligibleLane(
+            context,
+            rebuiltBlock,
+            rebuiltClassification,
+            rebuiltExact,
+            ordinaryConfiguredAxisPresent) !=
+            NCPreparedResolverBypassLane::G00_NO_P ||
+            !LaneQualified(
+                NCPreparedResolverBypassLane::G00_NO_P,
+                context.queue.session))
+        {
+            return false;
+        }
+
+        selectedBlock = context.head.preparedBlock;
+        return true;
+    }
+
     // A true result is the irreversible decision for this token to skip the
     // legacy resolver.  selectedBlock is then an exact storage copy of the
     // immutable K.1 head.  A false result leaves selectedBlock empty and the

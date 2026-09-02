@@ -3,6 +3,7 @@
 #include "GlobalConfig.h" 
 #include "NCManager.h"
 #include "AlarmManager.h"
+#include "EtherCatPdoRuntimeInvalidCorrelation.h"
 #include <cstring> 
 #include "PLCManager.h"
 #include "NCPLCMap.h"
@@ -440,6 +441,327 @@ namespace HMI_Bridge
             }
         }
 
+        const char* NCOrdinaryG00FeedHoldCohortPhaseToDiagnosticName(
+            NCOrdinaryG00FeedHoldCohortPhase phase) noexcept
+        {
+            switch (phase)
+            {
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_BYPASSED:
+                return "BYPASS";
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_CAPTURED:
+                return "CAPTURED";
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_HOLD_ACKNOWLEDGED:
+                return "HOLD_ACK";
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_RESUME_REQUESTED:
+                return "RESUME_REQ";
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_RESUME_APPLIED:
+                return "RESUME_APPLIED";
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_TERMINAL_PENDING:
+                return "TERM_PENDING";
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_TERMINAL_COMPLETE:
+                return "TERM_COMPLETE";
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_CANCELLED:
+                return "CANCELLED";
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_FAILED:
+                return "FAILED";
+            case NCOrdinaryG00FeedHoldCohortPhase::K73_IDLE:
+            default:
+                return "IDLE";
+            }
+        }
+
+        const char* NCOrdinaryG00FeedHoldCohortDecisionToDiagnosticName(
+            NCOrdinaryG00FeedHoldCohortDecision decision) noexcept
+        {
+            switch (decision)
+            {
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_BYPASS_NOT_PROGRAM:
+                return "BYPASS_NOT_PROGRAM";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_BYPASS_NOT_TWO_ACTIVE:
+                return "BYPASS_NOT_TWO";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_CAPTURED_EXACT:
+                return "CAPTURED_EXACT";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_HOLD_ACKNOWLEDGED:
+                return "HOLD_ACK";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_RESUME_BEFORE_ACK:
+                return "RESUME_BEFORE_ACK";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_RESUME_AFTER_ACK:
+                return "RESUME_AFTER_ACK";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_RESUME_APPLIED:
+                return "RESUME_APPLIED";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_WAIT_FIRST_TERMINAL:
+                return "WAIT_FIRST_TERM";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_WAIT_SECOND_TERMINAL:
+                return "WAIT_SECOND_TERM";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_ALL_COMPLETED_EXACT:
+                return "ALL_COMPLETED";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_INTERRUPTED_TERMINAL_EXACT:
+                return "INTERRUPTED_EXACT";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_INVALID_BOUNDARY:
+                return "INVALID_BOUNDARY";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_INVALID_REGISTRY:
+                return "INVALID_REGISTRY";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_INVALID_MEMBER:
+                return "INVALID_MEMBER";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_SESSION_MISMATCH:
+                return "SESSION_MISMATCH";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_IDENTITY_CONFLICT:
+                return "IDENTITY_CONFLICT";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_OWNER_MISMATCH:
+                return "OWNER_MISMATCH";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_LEDGER_REJECTED:
+                return "LEDGER_REJECTED";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_TERMINAL_OUT_OF_ORDER:
+                return "TERM_OUT_OF_ORDER";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_DUPLICATE_TERMINAL:
+                return "DUP_TERMINAL";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_BOUNDARY_MISMATCH:
+                return "BOUNDARY_MISMATCH";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_GATE_MISMATCH:
+                return "GATE_MISMATCH";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_CANCELLED:
+                return "CANCELLED";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_SUPERSEDED:
+                return "SUPERSEDED";
+            case NCOrdinaryG00FeedHoldCohortDecision::K73_NONE:
+            default:
+                return "NONE";
+            }
+        }
+
+        const char*
+            NCOrdinaryG00FeedHoldCohortCutoverPhaseToDiagnosticName(
+                NCOrdinaryG00FeedHoldCohortCutoverPhase phase) noexcept
+        {
+            switch (phase)
+            {
+            case NCOrdinaryG00FeedHoldCohortCutoverPhase::BYPASSED:
+                return "BYPASS";
+            case NCOrdinaryG00FeedHoldCohortCutoverPhase::BOUND:
+                return "BOUND";
+            case NCOrdinaryG00FeedHoldCohortCutoverPhase::WAIT_TERMINAL:
+                return "WAIT_TERMINAL";
+            case NCOrdinaryG00FeedHoldCohortCutoverPhase::RELEASED:
+                return "RELEASED";
+            case NCOrdinaryG00FeedHoldCohortCutoverPhase::LEGACY_FALLBACK:
+                return "LEGACY_FALLBACK";
+            case NCOrdinaryG00FeedHoldCohortCutoverPhase::DISABLED:
+                return "DISABLED";
+            case NCOrdinaryG00FeedHoldCohortCutoverPhase::IDLE:
+            default:
+                return "IDLE";
+            }
+        }
+
+        const char*
+            NCOrdinaryG00FeedHoldCohortCutoverDecisionToDiagnosticName(
+                NCOrdinaryG00FeedHoldCohortCutoverDecision decision) noexcept
+        {
+            switch (decision)
+            {
+            case NCOrdinaryG00FeedHoldCohortCutoverDecision::DISABLED:
+                return "DISABLED";
+                case NCOrdinaryG00FeedHoldCohortCutoverDecision::
+                BYPASS_NO_EXACT_COHORT:
+                    return "BYPASS_NO_EXACT";
+                case NCOrdinaryG00FeedHoldCohortCutoverDecision::COHORT_BOUND:
+                    return "COHORT_BOUND";
+                case NCOrdinaryG00FeedHoldCohortCutoverDecision::WAIT_HOLD_ACK:
+                    return "WAIT_HOLD_ACK";
+                case NCOrdinaryG00FeedHoldCohortCutoverDecision::WAIT_RESUME:
+                    return "WAIT_RESUME";
+                    case NCOrdinaryG00FeedHoldCohortCutoverDecision::
+                    WAIT_FIRST_TERMINAL:
+                        return "WAIT_FIRST_TERM";
+                        case NCOrdinaryG00FeedHoldCohortCutoverDecision::
+                        WAIT_SECOND_TERMINAL:
+                            return "WAIT_SECOND_TERM";
+                            case NCOrdinaryG00FeedHoldCohortCutoverDecision::
+                            ALLOW_READ_AHEAD:
+                                return "ALLOW_READ_AHEAD";
+                                case NCOrdinaryG00FeedHoldCohortCutoverDecision::
+                                FALLBACK_INTERRUPTED:
+                                    return "FALLBACK_INTERRUPTED";
+                                    case NCOrdinaryG00FeedHoldCohortCutoverDecision::
+                                    FALLBACK_CANCELLED:
+                                        return "FALLBACK_CANCELLED";
+                                        case NCOrdinaryG00FeedHoldCohortCutoverDecision::
+                                        FALLBACK_FAILED_PROOF:
+                                            return "FALLBACK_FAILED_PROOF";
+                                            case NCOrdinaryG00FeedHoldCohortCutoverDecision::
+                                            FALLBACK_REGISTRY:
+                                                return "FALLBACK_REGISTRY";
+                                                case NCOrdinaryG00FeedHoldCohortCutoverDecision::
+                                                FALLBACK_ACCOUNTING:
+                                                    return "FALLBACK_ACCOUNTING";
+                                                case NCOrdinaryG00FeedHoldCohortCutoverDecision::SESSION_RESET:
+                                                    return "SESSION_RESET";
+                                                case NCOrdinaryG00FeedHoldCohortCutoverDecision::NONE:
+                                                default:
+                                                    return "NONE";
+            }
+        }
+
+        const char*
+            NCOrdinaryG00FeedHoldCohortRearmPhaseToDiagnosticName(
+                NCOrdinaryG00FeedHoldCohortRearmPhase phase) noexcept
+        {
+            switch (phase)
+            {
+            case NCOrdinaryG00FeedHoldCohortRearmPhase::K75_FIRST_BOUND:
+                return "FIRST_BOUND";
+            case NCOrdinaryG00FeedHoldCohortRearmPhase::K75_FIRST_RELEASED:
+                return "FIRST_RELEASED";
+            case NCOrdinaryG00FeedHoldCohortRearmPhase::K75_SECOND_BOUND:
+                return "SECOND_BOUND";
+            case NCOrdinaryG00FeedHoldCohortRearmPhase::K75_SECOND_RELEASED:
+                return "SECOND_RELEASED";
+            case NCOrdinaryG00FeedHoldCohortRearmPhase::K75_FAILED:
+                return "FAILED";
+            case NCOrdinaryG00FeedHoldCohortRearmPhase::K75_IDLE:
+            default:
+                return "IDLE";
+            }
+        }
+
+        const char*
+            NCOrdinaryG00FeedHoldCohortRearmDecisionToDiagnosticName(
+                NCOrdinaryG00FeedHoldCohortRearmDecision decision) noexcept
+        {
+            switch (decision)
+            {
+                case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                K75_FIRST_GENERATION_BOUND:
+                    return "FIRST_BOUND";
+                    case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                    K75_WAIT_FIRST_RELEASE:
+                        return "WAIT_FIRST_RELEASE";
+                        case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                        K75_FIRST_GENERATION_RELEASED:
+                            return "FIRST_RELEASED";
+                            case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                            K75_SECOND_GENERATION_BOUND:
+                                return "SECOND_BOUND";
+                                case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                K75_WAIT_SECOND_RELEASE:
+                                    return "WAIT_SECOND_RELEASE";
+                                case NCOrdinaryG00FeedHoldCohortRearmDecision::K75_REARM_PROVEN:
+                                    return "REARM_PROVEN";
+                                case NCOrdinaryG00FeedHoldCohortRearmDecision::K75_EARLY_REARM:
+                                    return "EARLY_REARM";
+                                    case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                    K75_SESSION_MISMATCH:
+                                        return "SESSION_MISMATCH";
+                                        case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                        K75_COHORT_SEQUENCE_MISMATCH:
+                                            return "COHORT_SEQ_MISMATCH";
+                                            case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                            K75_BOUNDARY_SEQUENCE_MISMATCH:
+                                                return "BOUNDARY_SEQ_MISMATCH";
+                                                case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                                K75_GATE_SEQUENCE_MISMATCH:
+                                                    return "GATE_SEQ_MISMATCH";
+                                                    case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                                    K75_MEMBER_IDENTITY_REUSE:
+                                                        return "MEMBER_REUSE";
+                                                        case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                                        K75_REGISTRY_MISMATCH:
+                                                            return "REGISTRY_MISMATCH";
+                                                            case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                                            K75_PROOF_MISMATCH:
+                                                                return "PROOF_MISMATCH";
+                                                                case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                                                K75_FALLBACK_OBSERVED:
+                                                                    return "FALLBACK_OBSERVED";
+                                                                    case NCOrdinaryG00FeedHoldCohortRearmDecision::
+                                                                    K75_ACCOUNTING_MISMATCH:
+                                                                        return "ACCOUNTING_MISMATCH";
+                                                                    case NCOrdinaryG00FeedHoldCohortRearmDecision::K75_NONE:
+                                                                    default:
+                                                                        return "NONE";
+            }
+        }
+
+        const char*
+            NCOrdinaryG00FeedHoldRearmCutoverPhaseToDiagnosticName(
+                NCOrdinaryG00FeedHoldRearmCutoverPhase phase) noexcept
+        {
+            switch (phase)
+            {
+            case NCOrdinaryG00FeedHoldRearmCutoverPhase::K76_BYPASSED:
+                return "BYPASSED";
+            case NCOrdinaryG00FeedHoldRearmCutoverPhase::K76_SECOND_BOUND:
+                return "SECOND_BOUND";
+                case NCOrdinaryG00FeedHoldRearmCutoverPhase::
+                K76_WAIT_SECOND_RELEASE:
+                    return "WAIT_SECOND_RELEASE";
+                    case NCOrdinaryG00FeedHoldRearmCutoverPhase::
+                    K76_SECOND_RELEASED:
+                        return "SECOND_RELEASED";
+                        case NCOrdinaryG00FeedHoldRearmCutoverPhase::
+                        K76_LEGACY_FALLBACK:
+                            return "LEGACY_FALLBACK";
+                        case NCOrdinaryG00FeedHoldRearmCutoverPhase::K76_DISABLED:
+                            return "DISABLED";
+                        case NCOrdinaryG00FeedHoldRearmCutoverPhase::K76_IDLE:
+                        default:
+                            return "IDLE";
+            }
+        }
+
+        const char*
+            NCOrdinaryG00FeedHoldRearmCutoverDecisionToDiagnosticName(
+                NCOrdinaryG00FeedHoldRearmCutoverDecision decision) noexcept
+        {
+            switch (decision)
+            {
+            case NCOrdinaryG00FeedHoldRearmCutoverDecision::K76_DISABLED:
+                return "DISABLED";
+                case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                K76_BYPASS_BEFORE_SECOND_GENERATION:
+                    return "BYPASS_BEFORE_SECOND";
+                    case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                    K76_SECOND_GENERATION_BOUND:
+                        return "SECOND_BOUND";
+                        case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                        K76_WAIT_K74_RELEASE:
+                            return "WAIT_K74_RELEASE";
+                            case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                            K76_WAIT_K75_REARM_PROOF:
+                                return "WAIT_K75_PROOF";
+                                case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                                K76_ALLOW_READ_AHEAD:
+                                    return "ALLOW_READ_AHEAD";
+                                    case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                                    K76_FALLBACK_K75_FAILED:
+                                        return "FALLBACK_K75_FAILED";
+                                        case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                                        K76_FALLBACK_K74:
+                                            return "FALLBACK_K74";
+                                            case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                                            K76_FALLBACK_SESSION:
+                                                return "FALLBACK_SESSION";
+                                                case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                                                K76_FALLBACK_SEQUENCE:
+                                                    return "FALLBACK_SEQUENCE";
+                                                    case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                                                    K76_FALLBACK_IDENTITY:
+                                                        return "FALLBACK_IDENTITY";
+                                                        case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                                                        K76_FALLBACK_REGISTRY:
+                                                            return "FALLBACK_REGISTRY";
+                                                            case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                                                            K76_FALLBACK_ACCOUNTING:
+                                                                return "FALLBACK_ACCOUNTING";
+                                                                case NCOrdinaryG00FeedHoldRearmCutoverDecision::
+                                                                K76_SESSION_RESET:
+                                                                    return "SESSION_RESET";
+                                                                case NCOrdinaryG00FeedHoldRearmCutoverDecision::K76_NONE:
+                                                                default:
+                                                                    return "NONE";
+            }
+        }
+
         const char* NCLifecycleInterruptionCauseToDiagnosticName(
             NCLifecycleInterruptionCause cause) noexcept
         {
@@ -784,6 +1106,76 @@ namespace HMI_Bridge
             case MotionOwner::SAFETY:      return "SAFETY";
             default:                       return "UNKNOWN";
             }
+        }
+
+        const char* PdoRuntimeInvalidEventToDiagnosticName(
+            EtherCatPdoRuntimeInvalidEventKind eventKind) noexcept
+        {
+            switch (eventKind)
+            {
+            case EtherCatPdoRuntimeInvalidEventKind::NONE:
+                return "NONE";
+            case EtherCatPdoRuntimeInvalidEventKind::INVALID_CYCLE:
+                return "INVALID";
+                case EtherCatPdoRuntimeInvalidEventKind::
+                RECOVERED_AFTER_INVALID:
+                    return "RECOVERED";
+                case EtherCatPdoRuntimeInvalidEventKind::VALID_TICK_GAP:
+                    return "VALID_TICK_GAP";
+                    case EtherCatPdoRuntimeInvalidEventKind::
+                    VALIDITY_CONTRACT_MISMATCH:
+                        return "CONTRACT_MISMATCH";
+                        case EtherCatPdoRuntimeInvalidEventKind::
+                        VALIDITY_CONTRACT_RESTORED:
+                            return "CONTRACT_RESTORED";
+                        default:
+                            return "UNKNOWN";
+            }
+        }
+
+        const char* PdoRuntimeInvalidReasonToDiagnosticName(
+            std::uint32_t reasonMask) noexcept
+        {
+            const bool negative =
+                (reasonMask &
+                    ECAT_PDO_INVALID_REASON_LRW_CALL_NEGATIVE) != 0U;
+            const bool mismatch =
+                (reasonMask &
+                    ECAT_PDO_INVALID_REASON_LRW_WKC_MISMATCH) != 0U;
+            const bool dcInvalid =
+                (reasonMask &
+                    ECAT_PDO_INVALID_REASON_DC_WKC_INVALID) != 0U;
+            const bool contractMismatch =
+                (reasonMask &
+                    ECAT_PDO_INVALID_REASON_VALIDITY_CONTRACT_MISMATCH) != 0U;
+
+            if (contractMismatch && !negative && !mismatch && !dcInvalid)
+            {
+                return "VALIDITY_CONTRACT_MISMATCH";
+            }
+            if (negative && dcInvalid)
+            {
+                return "COMBINED_NEGATIVE+DC_WKC_INVALID";
+            }
+            if (mismatch && dcInvalid)
+            {
+                return "LRW_WKC_MISMATCH+DC_WKC_INVALID";
+            }
+            if (negative)
+            {
+                return "COMBINED_NEGATIVE";
+            }
+            if (mismatch)
+            {
+                return "LRW_WKC_MISMATCH";
+            }
+            if (dcInvalid)
+            {
+                return "DC_WKC_INVALID";
+            }
+            return reasonMask == ECAT_PDO_INVALID_REASON_NONE
+                ? "NONE"
+                : "UNKNOWN_MASK";
         }
 
         std::uint64_t FoldDiagnosticEventToken(
@@ -1678,6 +2070,17 @@ namespace HMI_Bridge
         // =============================================================
         MotionCore& motion = nc->GetMotion();
 
+        EtherCatPdoRuntimeInvalidCorrelationSnapshot
+            pdoInvalidCorrelation{};
+        const bool pdoInvalidCorrelationCoherent =
+            TryReadEtherCatPdoRuntimeInvalidCorrelation(
+                pdoInvalidCorrelation);
+
+        EtherCatPdoSafetyStopCauseSnapshot pdoSafetyStopCause{};
+        const bool pdoSafetyStopCauseCoherent =
+            TryReadEtherCatPdoSafetyStopCause(
+                pdoSafetyStopCause);
+
         const MotionStartupLagArmingEvidence startupLagArming =
             motion.GetStartupLagArmingEvidence();
 
@@ -1985,6 +2388,36 @@ namespace HMI_Bridge
         const NCOrdinaryG00InflightRegistryCounters
             ordinaryG00InflightRegistryCounters =
             nc->GetOrdinaryG00InflightRegistryCounters();
+        const NCOrdinaryG00ReadAheadSnapshot
+            ordinaryG00ReadAheadSnapshot =
+            nc->GetOrdinaryG00ReadAheadSnapshot();
+        const NCOrdinaryG00ReadAheadCounters
+            ordinaryG00ReadAheadCounters =
+            nc->GetOrdinaryG00ReadAheadCounters();
+        const NCOrdinaryG00FeedHoldCohortSnapshot
+            ordinaryG00FeedHoldCohortSnapshot =
+            nc->GetOrdinaryG00FeedHoldCohortSnapshot();
+        const NCOrdinaryG00FeedHoldCohortCounters
+            ordinaryG00FeedHoldCohortCounters =
+            nc->GetOrdinaryG00FeedHoldCohortCounters();
+        const NCOrdinaryG00FeedHoldCohortCutoverSnapshot
+            ordinaryG00FeedHoldCohortCutoverSnapshot =
+            nc->GetOrdinaryG00FeedHoldCohortCutoverSnapshot();
+        const NCOrdinaryG00FeedHoldCohortCutoverCounters
+            ordinaryG00FeedHoldCohortCutoverCounters =
+            nc->GetOrdinaryG00FeedHoldCohortCutoverCounters();
+        const NCOrdinaryG00FeedHoldCohortRearmSnapshot
+            ordinaryG00FeedHoldCohortRearmSnapshot =
+            nc->GetOrdinaryG00FeedHoldCohortRearmSnapshot();
+        const NCOrdinaryG00FeedHoldCohortRearmCounters
+            ordinaryG00FeedHoldCohortRearmCounters =
+            nc->GetOrdinaryG00FeedHoldCohortRearmCounters();
+        const NCOrdinaryG00FeedHoldRearmCutoverSnapshot
+            ordinaryG00FeedHoldRearmCutoverSnapshot =
+            nc->GetOrdinaryG00FeedHoldRearmCutoverSnapshot();
+        const NCOrdinaryG00FeedHoldRearmCutoverCounters
+            ordinaryG00FeedHoldRearmCutoverCounters =
+            nc->GetOrdinaryG00FeedHoldRearmCutoverCounters();
         NCPreparedBlockEntrySnapshot preparedQueueHead{};
         NCPreparedBlockEntrySnapshot preparedQueueTail{};
         const bool hasPreparedQueueHead =
@@ -2312,7 +2745,129 @@ namespace HMI_Bridge
             ordinaryG00InflightRegistryCounters.entriesRevoked,
             ordinaryG00InflightRegistryCounters.revokedTerminals,
             ordinaryG00InflightRegistryCounters.runtimeInfluence,
-            ordinaryG00InflightRegistryCounters.motionWrites
+            ordinaryG00InflightRegistryCounters.motionWrites,
+            ordinaryG00InflightRegistryCounters.readAheadRegistered,
+            ordinaryG00ReadAheadSnapshot.publicationSequence,
+            static_cast<std::uint64_t>(
+                ordinaryG00ReadAheadSnapshot.decision),
+            ordinaryG00ReadAheadSnapshot.session,
+            ordinaryG00ReadAheadSnapshot.warmupSession,
+            ordinaryG00ReadAheadSnapshot.dispatchId,
+            ordinaryG00ReadAheadSnapshot.commitSequence,
+            ordinaryG00ReadAheadSnapshot.identity.epoch,
+            ordinaryG00ReadAheadSnapshot.identity.segmentId,
+            static_cast<std::uint64_t>(
+                ordinaryG00ReadAheadSnapshot.chainSourcePC + 1),
+            ordinaryG00ReadAheadSnapshot.contiguousChain ? 1ULL : 0ULL,
+            ordinaryG00ReadAheadSnapshot.pending ? 1ULL : 0ULL,
+            ordinaryG00ReadAheadSnapshot.permanentLockout ? 1ULL : 0ULL,
+            ordinaryG00ReadAheadSnapshot.registryReady ? 1ULL : 0ULL,
+            ordinaryG00ReadAheadSnapshot.registryHealthy ? 1ULL : 0ULL,
+            ordinaryG00ReadAheadSnapshot.registryHealthFenced
+                ? 1ULL : 0ULL,
+            ordinaryG00ReadAheadSnapshot.registryHealthLockout
+                ? 1ULL : 0ULL,
+            ordinaryG00ReadAheadSnapshot.accountingValid ? 1ULL : 0ULL,
+            ordinaryG00ReadAheadCounters.selected,
+            ordinaryG00ReadAheadCounters.committed,
+            ordinaryG00ReadAheadCounters.capacityWaits,
+            ordinaryG00ReadAheadCounters.registryHealthFences,
+            ordinaryG00ReadAheadCounters.registryHealthLockouts,
+            ordinaryG00ReadAheadCounters.runtimeFailures,
+            ordinaryG00ReadAheadCounters.proofMismatches,
+            ordinaryG00ReadAheadCounters.runtimeInfluence,
+            ordinaryG00FeedHoldCohortSnapshot.publicationSequence,
+            ordinaryG00FeedHoldCohortSnapshot.cohortSequence,
+            ordinaryG00FeedHoldCohortSnapshot.boundarySequence,
+            ordinaryG00FeedHoldCohortSnapshot.gateSequence,
+            static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortSnapshot.phase),
+            static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortSnapshot.decision),
+            ordinaryG00FeedHoldCohortSnapshot.terminalCount,
+            ordinaryG00FeedHoldCohortSnapshot.failed ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldCohortSnapshot.accountingValid ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldCohortCounters.cohortsCaptured,
+            ordinaryG00FeedHoldCohortCounters.terminalCohorts,
+            ordinaryG00FeedHoldCohortCounters.failures,
+            ordinaryG00FeedHoldCohortCutoverSnapshot.publicationSequence,
+            ordinaryG00FeedHoldCohortCutoverSnapshot.cohortSequence,
+            static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortCutoverSnapshot.phase),
+            static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortCutoverSnapshot.decision),
+            ordinaryG00FeedHoldCohortCutoverSnapshot.terminalCount,
+            ordinaryG00FeedHoldCohortCutoverSnapshot.registryActiveEntries,
+            ordinaryG00FeedHoldCohortCutoverSnapshot.waiting ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldCohortCutoverSnapshot.released ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldCohortCutoverSnapshot.fallbackLegacy
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldCohortCutoverSnapshot.accountingValid
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldCohortCutoverCounters.cohortsBound,
+            ordinaryG00FeedHoldCohortCutoverCounters.waitFirstTerminal,
+            ordinaryG00FeedHoldCohortCutoverCounters.waitSecondTerminal,
+            ordinaryG00FeedHoldCohortCutoverCounters.releases,
+            ordinaryG00FeedHoldCohortCutoverCounters.allowReadAhead,
+            ordinaryG00FeedHoldCohortCutoverCounters.fallbackLegacy,
+            ordinaryG00FeedHoldCohortCutoverCounters.runtimeInfluence,
+            ordinaryG00FeedHoldCohortRearmSnapshot.publicationSequence,
+            static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortRearmSnapshot.phase),
+            static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortRearmSnapshot.decision),
+            ordinaryG00FeedHoldCohortRearmSnapshot.session,
+            ordinaryG00FeedHoldCohortRearmSnapshot.generationCount,
+            ordinaryG00FeedHoldCohortRearmSnapshot.releaseCount,
+            ordinaryG00FeedHoldCohortRearmSnapshot.rearmProven ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldCohortRearmSnapshot.failed ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldCohortRearmSnapshot.accountingValid
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldCohortRearmCounters.generationsCaptured,
+            ordinaryG00FeedHoldCohortRearmCounters.firstReleased,
+            ordinaryG00FeedHoldCohortRearmCounters.secondReleased,
+            ordinaryG00FeedHoldCohortRearmCounters.earlyRearm,
+            ordinaryG00FeedHoldCohortRearmCounters.sessionMismatches,
+            ordinaryG00FeedHoldCohortRearmCounters.memberIdentityReuse,
+            ordinaryG00FeedHoldCohortRearmCounters.proofMismatches,
+            ordinaryG00FeedHoldCohortRearmCounters.sessionResets,
+            ordinaryG00FeedHoldCohortRearmCounters.failures,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.publicationSequence,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.
+                rearmPublicationSequence,
+            static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldRearmCutoverSnapshot.phase),
+            static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldRearmCutoverSnapshot.decision),
+            ordinaryG00FeedHoldRearmCutoverSnapshot.session,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.cohortSequence,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.boundarySequence,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.gateSequence,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.generationCount,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.releaseCount,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.bound ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.waiting ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.released ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.fallbackLegacy
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.sessionLockout
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverSnapshot.accountingValid
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverCounters.secondGenerationsBound,
+            ordinaryG00FeedHoldRearmCutoverCounters.waitK74Release != 0ULL
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverCounters.waitK75RearmProof != 0ULL
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverCounters.releases,
+            ordinaryG00FeedHoldRearmCutoverCounters.allowReadAhead != 0ULL
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverCounters.fallbackLegacy != 0ULL
+                ? 1ULL : 0ULL,
+            ordinaryG00FeedHoldRearmCutoverCounters.sessionResets,
+            ordinaryG00FeedHoldRearmCutoverCounters.failures,
+            ordinaryG00FeedHoldRearmCutoverCounters.runtimeInfluence != 0ULL
+                ? 1ULL : 0ULL
         };
         std::uint64_t preparedEquivalenceChangeToken = 0ULL;
         for (const std::uint64_t value :
@@ -2593,6 +3148,32 @@ namespace HMI_Bridge
             j5ProgramEndFailure +
             transportErrorTotal;
 
+        const bool pdoInvalidProfileCorrelationMatched =
+            pdoInvalidCorrelationCoherent &&
+            groupNCSettleCoherent &&
+            feedHoldNCSettleCoherent &&
+            resetNCSettleCoherent &&
+            pdoInvalidCorrelation.validityContractMismatchCount == 0ULL &&
+            groupNCSettleCounters.invalidRuntimeCycleCount ==
+            pdoInvalidCorrelation.invalidCycleCount &&
+            feedHoldNCSettleCounters.invalidRuntimeCycleCount ==
+            pdoInvalidCorrelation.invalidCycleCount &&
+            resetNCSettleCounters.invalidRuntimeCycleCount ==
+            pdoInvalidCorrelation.invalidCycleCount &&
+            groupNCSettleCounters.runtimeGapCount ==
+            pdoInvalidCorrelation.expectedNCSettleGapCount &&
+            feedHoldNCSettleCounters.runtimeGapCount ==
+            pdoInvalidCorrelation.expectedNCSettleGapCount &&
+            resetNCSettleCounters.runtimeGapCount ==
+            pdoInvalidCorrelation.expectedNCSettleGapCount;
+
+        const std::uint32_t pdoInvalidDisplayedReasonMask =
+            pdoInvalidCorrelation.lastEventKind ==
+            EtherCatPdoRuntimeInvalidEventKind::
+            VALIDITY_CONTRACT_MISMATCH
+            ? pdoInvalidCorrelation.lastEventReasonMask
+            : pdoInvalidCorrelation.lastInvalidReasonMask;
+
         std::uint64_t j5EventToken = 1469598103934665603ULL;
         j5EventToken = FoldDiagnosticEventToken(
             j5EventToken,
@@ -2612,6 +3193,27 @@ namespace HMI_Bridge
                 resetNCSettleCoherent,
                 resetNCSettleSnapshot,
                 resetNCSettleCounters));
+        j5EventToken = FoldDiagnosticEventToken(
+            j5EventToken,
+            pdoInvalidCorrelationCoherent ? 1ULL : 0ULL);
+        j5EventToken = FoldDiagnosticEventToken(
+            j5EventToken,
+            pdoInvalidCorrelation.eventSequence);
+        j5EventToken = FoldDiagnosticEventToken(
+            j5EventToken,
+            pdoInvalidCorrelation.validityContractMismatchCount);
+        j5EventToken = FoldDiagnosticEventToken(
+            j5EventToken,
+            pdoInvalidProfileCorrelationMatched ? 1ULL : 0ULL);
+        j5EventToken = FoldDiagnosticEventToken(
+            j5EventToken,
+            pdoSafetyStopCauseCoherent ? 1ULL : 0ULL);
+        j5EventToken = FoldDiagnosticEventToken(
+            j5EventToken,
+            pdoSafetyStopCause.publicationSequence);
+        j5EventToken = FoldDiagnosticEventToken(
+            j5EventToken,
+            pdoSafetyStopCause.alarmRequestCount);
 
         j5EventToken = FoldDiagnosticEventToken(
             j5EventToken,
@@ -4516,6 +5118,790 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(
                     ordinaryG00InflightRegistryCounters.motionWrites));
 
+            RtPrintf(
+                "[NC02K7-RA] Pub:%llu Decision:%s Sess:%llu WarmSess:%llu "
+                "Entry:%llu PC:%d Line:%d ChainPC:%d Disp:%llu Commit:%llu "
+                "Epoch:%u Seg:%llu ActiveAt:%u QDepth:%llu Limit:%u "
+                "Cand:%u Env:%u RegReady:%u RegHealth:%u RegFence:%u "
+                "HealthLock:%u Warm:%u Chain:%u Cap:%u Sel:%u Bind:%u Auth:%u "
+                "CommitOK:%u Reg:%u Buffered:%u Exact:%u Stable:%u "
+                "NoCb:%u Txn:%u Pending:%u Lock:%u Influence:%u "
+                "Bypass:%u MotionWrite:%u Acct:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadSnapshot.publicationSequence),
+                NCOrdinaryG00ReadAheadDecisionToDiagnosticName(
+                    ordinaryG00ReadAheadSnapshot.decision),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadSnapshot.session),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadSnapshot.warmupSession),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadSnapshot.entrySequence),
+                ordinaryG00ReadAheadSnapshot.sourcePC,
+                ordinaryG00ReadAheadSnapshot.sourceLineNumber,
+                ordinaryG00ReadAheadSnapshot.chainSourcePC,
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadSnapshot.dispatchId),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadSnapshot.commitSequence),
+                static_cast<unsigned int>(
+                    ordinaryG00ReadAheadSnapshot.identity.epoch),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadSnapshot.identity.segmentId),
+                ordinaryG00ReadAheadSnapshot.activeEntriesAtSelection,
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadSnapshot.queueDepthAtSelection),
+                ordinaryG00ReadAheadSnapshot.activeLimit,
+                ordinaryG00ReadAheadSnapshot.candidateExact ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.envelopeExact ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.registryReady ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.registryHealthy ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.registryHealthFenced
+                ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.registryHealthLockout
+                ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.legacyWarmupProven ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.contiguousChain ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.capacityAvailable ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.selected ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.dispatchBound ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.motionAuthorized ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.commitBound ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.registryBound ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.bufferedTransport ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.exactStop ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.stableExecutionEpoch ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.noPerBlockCallback ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.transactionalEndpoint ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.pending ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.permanentLockout ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.runtimeInfluence ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.resolverBypassed ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.motionWrite ? 1U : 0U,
+                ordinaryG00ReadAheadSnapshot.accountingValid ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K7-CNT] Eval:%llu Pub:%llu Ineligible:%llu "
+                "WarmWait:%llu RegFence:%llu HealthLock:%llu Discont:%llu "
+                "CapWait:%llu Select:%llu Bind:%llu "
+                "Auth:%llu Commit:%llu Reg:%llu Revoked:%llu "
+                "RuntimeFail:%llu Mis:%llu Warmup:%llu MaxActive:%llu "
+                "Influence:%llu Bypass:%llu MotionWrite:%llu "
+                "RegTry:%llu RegOK:%llu RegReject:%llu\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.evaluations),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.publications),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.ineligible),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.legacyWarmupWaits),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.registryHealthFences),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.registryHealthLockouts),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.discontinuityFallbacks),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.capacityWaits),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.selected),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.dispatchBound),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.motionAuthorized),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.committed),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.registryBound),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.revokedPending),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.runtimeFailures),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.proofMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.sessionWarmups),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.maxActiveObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.runtimeInfluence),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.resolverBypasses),
+                static_cast<unsigned long long>(
+                    ordinaryG00ReadAheadCounters.motionWrites),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.
+                    readAheadRegistrationAttempts),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.
+                    readAheadRegistered),
+                static_cast<unsigned long long>(
+                    ordinaryG00InflightRegistryCounters.
+                    readAheadRegistrationRejected));
+
+            RtPrintf(
+                "[NC02K73-FHC] Pub:%llu Coh:%llu BSeq:%llu GSeq:%llu "
+                "Phase:%s Decision:%s Sess:%llu Epoch:%u Owner:%u/%u "
+                "ActiveAt:%u Members:%u Term:%u Ack:%u Req:%u Early:%u "
+                "Applied:%u Order:%u CohortDone:%u AllDone:%u Active:%u "
+                "Cancel:%u Fail:%u Shadow:%u Influence:%u MotionWrite:%u "
+                "Acct:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortSnapshot.publicationSequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortSnapshot.cohortSequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortSnapshot.boundarySequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortSnapshot.gateSequence),
+                NCOrdinaryG00FeedHoldCohortPhaseToDiagnosticName(
+                    ordinaryG00FeedHoldCohortSnapshot.phase),
+                NCOrdinaryG00FeedHoldCohortDecisionToDiagnosticName(
+                    ordinaryG00FeedHoldCohortSnapshot.decision),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortSnapshot.session),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortSnapshot.executionEpoch),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortSnapshot.owner),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortSnapshot.ownerGeneration),
+                ordinaryG00FeedHoldCohortSnapshot.activeEntriesAtCapture,
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortSnapshot.memberCount),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortSnapshot.terminalCount),
+                ordinaryG00FeedHoldCohortSnapshot.holdAcknowledged ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.resumeRequested ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.
+                resumeBeforeAcknowledge ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.resumeApplied ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.terminalOrderValid ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.
+                terminalCohortComplete ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.allMembersCompleted
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.active ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.cancelled ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.failed ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.shadowOnly ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.runtimeInfluence ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.motionWrite ? 1U : 0U,
+                ordinaryG00FeedHoldCohortSnapshot.accountingValid ? 1U : 0U);
+
+            for (std::size_t memberIndex = 0U;
+                memberIndex < NC_ORDINARY_G00_FEED_HOLD_COHORT_SIZE;
+                ++memberIndex)
+            {
+                const NCOrdinaryG00FeedHoldCohortMemberSnapshot& member =
+                    ordinaryG00FeedHoldCohortSnapshot.members[memberIndex];
+                RtPrintf(
+                    "[NC02K73-M%u] Reg:%llu Entry:%llu Disp:%llu "
+                    "Commit:%llu PC:%d Line:%d Epoch:%u Seg:%llu "
+                    "SrcBlk:%d State:%s Last:%s FB:%llu Held:%u "
+                    "Resumed:%u Term:%u Ord:%u PreAck:%u PreResume:%u "
+                    "Done:%u Exact:%u\n",
+                    static_cast<unsigned int>(memberIndex),
+                    static_cast<unsigned long long>(member.registrySequence),
+                    static_cast<unsigned long long>(member.entrySequence),
+                    static_cast<unsigned long long>(member.dispatchId),
+                    static_cast<unsigned long long>(member.commitSequence),
+                    member.sourcePC,
+                    member.sourceLineNumber,
+                    static_cast<unsigned int>(member.identity.epoch),
+                    static_cast<unsigned long long>(member.identity.segmentId),
+                    static_cast<int>(member.identity.sourceBlockId),
+                    NCOrdinaryG00InflightStateToDiagnosticName(
+                        member.currentState),
+                    MotionFeedbackTypeToDiagnosticName(
+                        member.lastFeedbackType),
+                    static_cast<unsigned long long>(
+                        member.lastFeedbackSequence),
+                    member.heldObserved ? 1U : 0U,
+                    member.resumedObserved ? 1U : 0U,
+                    member.terminalObserved ? 1U : 0U,
+                    static_cast<unsigned int>(member.terminalOrdinal),
+                    member.terminalBeforeAcknowledge ? 1U : 0U,
+                    member.terminalBeforeResume ? 1U : 0U,
+                    member.terminalCompleted ? 1U : 0U,
+                    member.exact ? 1U : 0U);
+            }
+
+            RtPrintf(
+                "[NC02K73-CNT] Try:%llu Prog:%llu BypassOther:%llu "
+                "BypassN:%llu Capture:%llu BTrans:%llu Gate:%llu Ack:%llu "
+                "Early:%llu After:%llu Applied:%llu FbObs:%llu Match:%llu "
+                "Ignore:%llu Held:%llu Resume:%llu Term:%llu Done:%llu "
+                "Interrupt:%llu PreAck:%llu PreResume:%llu Cohort:%llu "
+                "AllDone:%llu IntCohort:%llu Cancel:%llu Super:%llu "
+                "Fail:%llu Influence:%llu MotionWrite:%llu\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.captureAttempts),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.programRequests),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.bypassNotProgram),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.bypassNotTwoActive),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.cohortsCaptured),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.boundaryTransitions),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.gateCorrelations),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.holdAcknowledged),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.
+                    resumeBeforeAcknowledge),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.
+                    resumeAfterAcknowledge),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.resumeApplied),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.feedbackObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.feedbackMatched),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.feedbackIgnored),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.held),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.resumed),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.terminals),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.completedTerminals),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.interruptedTerminals),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.
+                    terminalBeforeAcknowledge),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.terminalBeforeResume),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.terminalCohorts),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.allCompletedCohorts),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.interruptedCohorts),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.cancelled),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.superseded),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.failures),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.runtimeInfluence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.motionWrites));
+
+            RtPrintf(
+                "[NC02K73-FAIL] Boundary:%llu Registry:%llu Member:%llu "
+                "Session:%llu Identity:%llu Owner:%llu Ledger:%llu "
+                "Order:%llu DupTerm:%llu BMis:%llu GMis:%llu Acct:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.invalidBoundary),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.invalidRegistry),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.invalidMember),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.sessionMismatch),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.identityConflict),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.ownerMismatch),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.ledgerRejected),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.terminalOutOfOrder),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.duplicateTerminal),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.boundaryMismatch),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCounters.gateMismatch),
+                ordinaryG00FeedHoldCohortSnapshot.accountingValid ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K74-GATE] Pub:%llu Coh:%llu BSeq:%llu GSeq:%llu "
+                "Phase:%s Decision:%s Sess:%llu Epoch:%u ActiveAt:%u "
+                "ActiveN:%u Members:%u Term:%u Ack:%u Req:%u Applied:%u "
+                "Exact:%u Bound:%u Wait:%u Release:%u Fallback:%u "
+                "Lock:%u Enabled:%u Influence:%u Bypass:%u MotionWrite:%u "
+                "Acct:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.
+                    publicationSequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.cohortSequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.boundarySequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.gateSequence),
+                NCOrdinaryG00FeedHoldCohortCutoverPhaseToDiagnosticName(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.phase),
+                NCOrdinaryG00FeedHoldCohortCutoverDecisionToDiagnosticName(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.decision),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.session),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.executionEpoch),
+                ordinaryG00FeedHoldCohortCutoverSnapshot.
+                activeEntriesAtCapture,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.
+                registryActiveEntries,
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.memberCount),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortCutoverSnapshot.terminalCount),
+                ordinaryG00FeedHoldCohortCutoverSnapshot.
+                holdAcknowledged ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.
+                resumeRequested ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.
+                resumeApplied ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.exactCohort
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.bound ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.waiting ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.released ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.fallbackLegacy
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.sessionLockout
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.enabled ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.runtimeInfluence
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.resolverBypassed
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.motionWrite
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.accountingValid
+                ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K74-CNT] Obs:%llu Bind:%llu BypassOff:%llu "
+                "BypassNoCoh:%llu Stale:%llu Eval:%llu Bypass:%llu "
+                "WaitAck:%llu WaitResume:%llu WaitM0:%llu WaitM1:%llu "
+                "Release:%llu Allow:%llu Fallback:%llu Int:%llu "
+                "Cancel:%llu Proof:%llu RegMis:%llu AcctMis:%llu "
+                "SessReset:%llu Influence:%llu ResolverBypass:%llu "
+                "MotionWrite:%llu\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.observations),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.cohortsBound),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.bypassDisabled),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    bypassNoExactCohort),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    staleObservations),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.admissionChecks),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    admissionBypasses),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    waitHoldAcknowledge),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.waitResume),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    waitFirstTerminal),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    waitSecondTerminal),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.releases),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.allowReadAhead),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.fallbackLegacy),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    interruptedCohorts),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    cancelledCohorts),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.failedProofs),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    registryMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    accountingMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.sessionResets),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    runtimeInfluence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    resolverBypasses),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.motionWrites));
+
+            RtPrintf(
+                "[NC02K74-FAIL] Proof:%llu Reg:%llu Acct:%llu "
+                "Lock:%u Fallback:%u AcctOK:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.failedProofs),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    registryMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortCutoverCounters.
+                    accountingMismatches),
+                ordinaryG00FeedHoldCohortCutoverSnapshot.sessionLockout
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.fallbackLegacy
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortCutoverSnapshot.accountingValid
+                ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K75-RRM] Pub:%llu Phase:%s Decision:%s Sess:%llu "
+                "Gen:%u Rel:%u SameSess:%u Lease:%u CohSeq:%u BSeq:%u "
+                "GSeq:%u Isolate:%u NoOverlap:%u Proven:%u Fail:%u "
+                "Shadow:%u Influence:%u MotionWrite:%u Acct:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmSnapshot.
+                    publicationSequence),
+                NCOrdinaryG00FeedHoldCohortRearmPhaseToDiagnosticName(
+                    ordinaryG00FeedHoldCohortRearmSnapshot.phase),
+                NCOrdinaryG00FeedHoldCohortRearmDecisionToDiagnosticName(
+                    ordinaryG00FeedHoldCohortRearmSnapshot.decision),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmSnapshot.session),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortRearmSnapshot.generationCount),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldCohortRearmSnapshot.releaseCount),
+                ordinaryG00FeedHoldCohortRearmSnapshot.sameSession ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.sameExecutionLease
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.
+                cohortSequenceMonotonic ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.
+                boundarySequenceMonotonic ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.
+                gateSequenceMonotonic ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.memberIsolation
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.noOverlap ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.rearmProven ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.failed ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.shadowOnly ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.runtimeInfluence
+                ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.motionWrite ? 1U : 0U,
+                ordinaryG00FeedHoldCohortRearmSnapshot.accountingValid
+                ? 1U : 0U);
+
+            for (std::size_t generationIndex = 0U;
+                generationIndex <
+                NC_ORDINARY_G00_FEED_HOLD_REARM_GENERATIONS;
+                ++generationIndex)
+            {
+                const NCOrdinaryG00FeedHoldCohortGenerationSnapshot&
+                    generation =
+                    ordinaryG00FeedHoldCohortRearmSnapshot.
+                    generations[generationIndex];
+                RtPrintf(
+                    "[NC02K75-G%u] Coh:%llu BSeq:%llu GSeq:%llu "
+                    "Sess:%llu Epoch:%u Members:%u Term:%u Captured:%u "
+                    "Release:%u Exact:%u Order:%u Done:%u RegEmpty:%u "
+                    "E0:%llu D0:%llu S0:%llu E1:%llu D1:%llu S1:%llu\n",
+                    static_cast<unsigned int>(generationIndex),
+                    static_cast<unsigned long long>(
+                        generation.cohortSequence),
+                    static_cast<unsigned long long>(
+                        generation.boundarySequence),
+                    static_cast<unsigned long long>(generation.gateSequence),
+                    static_cast<unsigned long long>(generation.session),
+                    static_cast<unsigned int>(generation.executionEpoch),
+                    static_cast<unsigned int>(generation.memberCount),
+                    static_cast<unsigned int>(generation.terminalCount),
+                    generation.captured ? 1U : 0U,
+                    generation.released ? 1U : 0U,
+                    generation.exact ? 1U : 0U,
+                    generation.terminalOrderValid ? 1U : 0U,
+                    generation.allMembersCompleted ? 1U : 0U,
+                    generation.registryEmptyAtRelease ? 1U : 0U,
+                    static_cast<unsigned long long>(
+                        generation.memberEntrySequence[0]),
+                    static_cast<unsigned long long>(
+                        generation.memberDispatchId[0]),
+                    static_cast<unsigned long long>(
+                        generation.memberIdentity[0].segmentId),
+                    static_cast<unsigned long long>(
+                        generation.memberEntrySequence[1]),
+                    static_cast<unsigned long long>(
+                        generation.memberDispatchId[1]),
+                    static_cast<unsigned long long>(
+                        generation.memberIdentity[1].segmentId));
+            }
+
+            RtPrintf(
+                "[NC02K75-CNT] Obs:%llu Edge:%llu Bypass:%llu Gen:%llu "
+                "FirstB:%llu FirstR:%llu SecondB:%llu SecondR:%llu "
+                "Stable:%llu Stale:%llu Early:%llu Sess:%llu Lease:%llu "
+                "CohSeq:%llu BSeq:%llu GSeq:%llu Reuse:%llu Reg:%llu "
+                "Proof:%llu Fallback:%llu Acct:%llu SessReset:%llu "
+                "Fail:%llu "
+                "Influence:%llu MotionWrite:%llu\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.observations),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.cohortEdges),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.nonExactBypasses),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    generationsCaptured),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.firstBound),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.firstReleased),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.secondBound),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.secondReleased),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    stableObservations),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    staleObservations),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.earlyRearm),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    sessionMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    executionLeaseMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    cohortSequenceMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    boundarySequenceMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    gateSequenceMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    memberIdentityReuse),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    registryMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.proofMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.fallbackObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    accountingMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.sessionResets),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.failures),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.runtimeInfluence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.motionWrites));
+
+            RtPrintf(
+                "[NC02K75-FAIL] Early:%llu Sess:%llu Lease:%llu "
+                "CohSeq:%llu BSeq:%llu GSeq:%llu Reuse:%llu Reg:%llu "
+                "Proof:%llu Fallback:%llu Acct:%llu Fail:%llu AcctOK:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.earlyRearm),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    sessionMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    executionLeaseMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    cohortSequenceMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    boundarySequenceMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    gateSequenceMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    memberIdentityReuse),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    registryMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.proofMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.fallbackObserved),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.
+                    accountingMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldCohortRearmCounters.failures),
+                ordinaryG00FeedHoldCohortRearmSnapshot.accountingValid
+                ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K76-GATE] Pub:%llu RPub:%llu Phase:%s Decision:%s "
+                "Sess:%llu Coh:%llu BSeq:%llu GSeq:%llu Gen:%u Rel:%u "
+                "Exact:%u Bound:%u Wait:%u Release:%u Fallback:%u "
+                "Lock:%u Enabled:%u Influence:%u MotionWrite:%u Acct:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.
+                    publicationSequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.
+                    rearmPublicationSequence),
+                NCOrdinaryG00FeedHoldRearmCutoverPhaseToDiagnosticName(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.phase),
+                NCOrdinaryG00FeedHoldRearmCutoverDecisionToDiagnosticName(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.decision),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.session),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.cohortSequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.
+                    boundarySequence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.gateSequence),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.generationCount),
+                static_cast<unsigned int>(
+                    ordinaryG00FeedHoldRearmCutoverSnapshot.releaseCount),
+                ordinaryG00FeedHoldRearmCutoverSnapshot.
+                exactSecondGeneration ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.bound ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.waiting ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.released ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.fallbackLegacy
+                ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.sessionLockout
+                ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.enabled ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.runtimeInfluence
+                ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.motionWrite
+                ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.accountingValid
+                ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K76-CNT] Obs:%llu Bind:%llu BypassOff:%llu "
+                "BypassPre:%llu Stale:%llu Eval:%llu EvalBypass:%llu "
+                "Wait74:%llu Wait75:%llu Release:%llu Allow:%llu "
+                "Fallback:%llu K75Fail:%llu K74Fail:%llu Sess:%llu "
+                "Seq:%llu Identity:%llu Reg:%llu Acct:%llu "
+                "SessReset:%llu Fail:%llu Influence:%llu MotionWrite:%llu\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.observations),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    secondGenerationsBound),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.bypassDisabled),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    bypassBeforeSecondGeneration),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    staleObservations),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.admissionChecks),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    admissionBypasses),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.waitK74Release),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    waitK75RearmProof),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.releases),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.allowReadAhead),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.fallbackLegacy),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.k75Failures),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.k74Failures),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    sessionMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    sequenceMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    identityMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    registryMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    accountingMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.sessionResets),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.failures),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    runtimeInfluence),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.motionWrites));
+
+            RtPrintf(
+                "[NC02K76-FAIL] K75:%llu K74:%llu Sess:%llu Seq:%llu "
+                "Identity:%llu Reg:%llu Acct:%llu Fail:%llu Lock:%u "
+                "Fallback:%u AcctOK:%u\n",
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.k75Failures),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.k74Failures),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    sessionMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    sequenceMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    identityMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    registryMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.
+                    accountingMismatches),
+                static_cast<unsigned long long>(
+                    ordinaryG00FeedHoldRearmCutoverCounters.failures),
+                ordinaryG00FeedHoldRearmCutoverSnapshot.sessionLockout
+                ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.fallbackLegacy
+                ? 1U : 0U,
+                ordinaryG00FeedHoldRearmCutoverSnapshot.accountingValid
+                ? 1U : 0U);
+
             const std::uint64_t stopCommandMaxPps =
                 ScaleNonNegativeDiagnosticValue(
                     stopSettleSnapshot.maxAxisCommandVelocityAbsPps,
@@ -5529,6 +6915,155 @@ namespace HMI_Bridge
                 resetNCSettleCoherent,
                 resetNCSettleSnapshot,
                 resetNCSettleCounters);
+
+            RtPrintf(
+                "[NC02K721-PDO] Coh:%u Seq:%llu Event:%s Tick:%llu "
+                "Invalid:%llu Episode:%llu Recover:%llu TickGap:%llu "
+                "ExpGap:%llu J5Inv:%llu/%llu/%llu "
+                "J5Gap:%llu/%llu/%llu Corr:%u\n",
+                pdoInvalidCorrelationCoherent ? 1U : 0U,
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.eventSequence),
+                PdoRuntimeInvalidEventToDiagnosticName(
+                    pdoInvalidCorrelation.lastEventKind),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lastEventRuntimeCycleTick),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.invalidCycleCount),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.invalidEpisodeCount),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.recoveryAfterInvalidCount),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.validTickGapCount),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.expectedNCSettleGapCount),
+                static_cast<unsigned long long>(
+                    groupNCSettleCounters.invalidRuntimeCycleCount),
+                static_cast<unsigned long long>(
+                    feedHoldNCSettleCounters.invalidRuntimeCycleCount),
+                static_cast<unsigned long long>(
+                    resetNCSettleCounters.invalidRuntimeCycleCount),
+                static_cast<unsigned long long>(
+                    groupNCSettleCounters.runtimeGapCount),
+                static_cast<unsigned long long>(
+                    feedHoldNCSettleCounters.runtimeGapCount),
+                static_cast<unsigned long long>(
+                    resetNCSettleCounters.runtimeGapCount),
+                pdoInvalidProfileCorrelationMatched ? 1U : 0U);
+
+            RtPrintf(
+                "[NC02K721-SRC] Reason:%s Mask:%02X EMask:%02X "
+                "ELRW:%d/%d EDC:%d EPath:%llu "
+                "LastInv:%llu LastRec:%llu Gap:%llu>%llu "
+                "LRW:%d/%d DC:%d Rec:%d/%d/%d Req:%u Sub:%u "
+                "PathNs:%llu/%llu Consec:%u Max:%u Len:%u "
+                "Negative:%llu WkcMis:%llu DcBad:%llu Both:%llu "
+                "Contract:%llu RT:%llu/%llu\n",
+                PdoRuntimeInvalidReasonToDiagnosticName(
+                    pdoInvalidDisplayedReasonMask),
+                static_cast<unsigned int>(
+                    pdoInvalidDisplayedReasonMask),
+                static_cast<unsigned int>(
+                    pdoInvalidCorrelation.lastEventReasonMask),
+                static_cast<int>(
+                    pdoInvalidCorrelation.lastEventActualLrwWkc),
+                static_cast<int>(
+                    pdoInvalidCorrelation.lastEventExpectedLrwWkc),
+                static_cast<int>(
+                    pdoInvalidCorrelation.lastEventDcWkc),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lastEventCombinedPathNs),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lastInvalidRuntimeCycleTick),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lastRecoveryRuntimeCycleTick),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lastGapFromRuntimeCycleTick),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lastGapToRuntimeCycleTick),
+                static_cast<int>(
+                    pdoInvalidCorrelation.lastInvalidActualLrwWkc),
+                static_cast<int>(
+                    pdoInvalidCorrelation.lastInvalidExpectedLrwWkc),
+                static_cast<int>(
+                    pdoInvalidCorrelation.lastInvalidDcWkc),
+                static_cast<int>(
+                    pdoInvalidCorrelation.lastRecoveryActualLrwWkc),
+                static_cast<int>(
+                    pdoInvalidCorrelation.lastRecoveryExpectedLrwWkc),
+                static_cast<int>(
+                    pdoInvalidCorrelation.lastRecoveryDcWkc),
+                pdoInvalidCorrelation.dcReferenceRequired ? 1U : 0U,
+                static_cast<unsigned int>(
+                    pdoInvalidCorrelation.lastEventSubTick),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lastInvalidCombinedPathNs),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lastRecoveryCombinedPathNs),
+                static_cast<unsigned int>(
+                    pdoInvalidCorrelation.currentConsecutiveInvalidCycles),
+                static_cast<unsigned int>(
+                    pdoInvalidCorrelation.maximumConsecutiveInvalidCycles),
+                static_cast<unsigned int>(
+                    pdoInvalidCorrelation.lastRecoveredEpisodeLength),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lrwCallNegativeCount),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.lrwWkcMismatchCount),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.dcWkcInvalidCount),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.combinedLrwDcInvalidCount),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.validityContractMismatchCount),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.
+                    runtimePdoNegativeTotalAtLastEvent),
+                static_cast<unsigned long long>(
+                    pdoInvalidCorrelation.
+                    runtimePdoWkcErrorTotalAtLastEvent));
+
+            RtPrintf(
+                "[NC02K722-ALM] Coh:%u Latched:%u Seq:%llu Req:%llu "
+                "Episode:%llu RePub:%llu Tick:%llu InvEpisode:%llu "
+                "Alarm:%d Reason:%s Mask:%02X LRW:%d/%d DC:%d "
+                "DCReq:%u Sub:%u PathNs:%llu Consec:%u Contain:%u "
+                "RePubNow:%u RT:%llu/%llu\n",
+                pdoSafetyStopCauseCoherent ? 1U : 0U,
+                pdoSafetyStopCause.publicationSequence != 0ULL ? 1U : 0U,
+                static_cast<unsigned long long>(
+                    pdoSafetyStopCause.publicationSequence),
+                static_cast<unsigned long long>(
+                    pdoSafetyStopCause.alarmRequestCount),
+                static_cast<unsigned long long>(
+                    pdoSafetyStopCause.alarmedInvalidEpisodeCount),
+                static_cast<unsigned long long>(
+                    pdoSafetyStopCause.alarmRepublishCount),
+                static_cast<unsigned long long>(
+                    pdoSafetyStopCause.runtimeCycleTick),
+                static_cast<unsigned long long>(
+                    pdoSafetyStopCause.invalidEpisodeCount),
+                static_cast<int>(pdoSafetyStopCause.alarmCode),
+                PdoRuntimeInvalidReasonToDiagnosticName(
+                    pdoSafetyStopCause.reasonMask),
+                static_cast<unsigned int>(
+                    pdoSafetyStopCause.reasonMask),
+                static_cast<int>(pdoSafetyStopCause.actualLrwWkc),
+                static_cast<int>(pdoSafetyStopCause.expectedLrwWkc),
+                static_cast<int>(pdoSafetyStopCause.dcWkc),
+                pdoSafetyStopCause.dcReferenceRequired ? 1U : 0U,
+                static_cast<unsigned int>(pdoSafetyStopCause.subTick),
+                static_cast<unsigned long long>(
+                    pdoSafetyStopCause.combinedPathNs),
+                static_cast<unsigned int>(
+                    pdoSafetyStopCause.consecutiveInvalidCycles),
+                pdoSafetyStopCause.safetyContainmentApplied ? 1U : 0U,
+                pdoSafetyStopCause.alarmRequestRepublished ? 1U : 0U,
+                static_cast<unsigned long long>(
+                    pdoSafetyStopCause.runtimePdoNegativeTotal),
+                static_cast<unsigned long long>(
+                    pdoSafetyStopCause.runtimePdoWkcErrorTotal));
 
             RtPrintf(
                 "[NC02J5-RB] Kind:ACK Req:%llu Phase:%s Block:%s "

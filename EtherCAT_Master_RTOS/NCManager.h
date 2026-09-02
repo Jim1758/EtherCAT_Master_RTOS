@@ -14,6 +14,11 @@
 #include "NCPreparedHeadResolverBypassGate.h" // Stage NC-0.2K.4.2：Ordinary G00 Controlled Resolver Bypass
 #include "NCOrdinaryG00BufferedExactStopAdmissionShadow.h" // Stage NC-0.2K.5：Ordinary G00 Buffered Exact-Stop Admission Shadow
 #include "NCOrdinaryG00InflightTerminalRegistryShadow.h" // Stage NC-0.2K.6.3：Bounded In-Flight Terminal Registry Shadow
+#include "NCOrdinaryG00FeedHoldCohortShadow.h" // Stage NC-0.2K.7.3：Two-Entry Feed Hold / Resume Terminal Cohort Shadow
+#include "NCOrdinaryG00FeedHoldCohortCutoverGate.h" // Stage NC-0.2K.7.4：Terminal Cohort Controlled Cutover
+#include "NCOrdinaryG00FeedHoldCohortRearmShadow.h" // Stage NC-0.2K.7.5：Repeated Cohort Re-arm Shadow
+#include "NCOrdinaryG00FeedHoldCohortRearmCutoverGate.h" // Stage NC-0.2K.7.6：Repeated Cohort Re-arm Controlled Cutover
+#include "NCOrdinaryG00ReadAheadCutoverGate.h" // Stage NC-0.2K.7.1：Two-Entry Ordinary G00 Read-Ahead Cutover
 #include "NCBlockLifecycleLedger.h" // Stage NC-0.2D：Block / Motion Lifecycle
 #include "NCBlockCompletionBoundary.h" // Stage NC-0.2F：Motion Completion Dual-Key Guard
 #include "NCProgramEndBoundary.h" // Stage NC-0.2G：Program End / Cycle End Gate
@@ -680,6 +685,105 @@ public:
             entry);
     }
 
+    NCOrdinaryG00FeedHoldCohortSnapshot
+        GetOrdinaryG00FeedHoldCohortSnapshot() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortShadow.GetSnapshot();
+    }
+
+    NCOrdinaryG00FeedHoldCohortCounters
+        GetOrdinaryG00FeedHoldCohortCounters() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortShadow.GetCounters();
+    }
+
+    void SetOrdinaryG00FeedHoldCohortCutoverEnabled(
+        bool enabled) noexcept
+    {
+        m_ordinaryG00FeedHoldCohortCutoverGate.SetEnabled(enabled);
+    }
+
+    bool IsOrdinaryG00FeedHoldCohortCutoverEnabled() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortCutoverGate.IsEnabled();
+    }
+
+    NCOrdinaryG00FeedHoldCohortCutoverSnapshot
+        GetOrdinaryG00FeedHoldCohortCutoverSnapshot() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortCutoverGate.GetSnapshot();
+    }
+
+    NCOrdinaryG00FeedHoldCohortCutoverCounters
+        GetOrdinaryG00FeedHoldCohortCutoverCounters() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortCutoverGate.GetCounters();
+    }
+
+    NCOrdinaryG00FeedHoldCohortRearmSnapshot
+        GetOrdinaryG00FeedHoldCohortRearmSnapshot() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortRearmShadow.GetSnapshot();
+    }
+
+    NCOrdinaryG00FeedHoldCohortRearmCounters
+        GetOrdinaryG00FeedHoldCohortRearmCounters() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortRearmShadow.GetCounters();
+    }
+
+    void SetOrdinaryG00FeedHoldRearmCutoverEnabled(
+        bool enabled) noexcept
+    {
+        m_ordinaryG00FeedHoldCohortRearmCutoverGate.SetEnabled(enabled);
+    }
+
+    bool IsOrdinaryG00FeedHoldRearmCutoverEnabled() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortRearmCutoverGate.IsEnabled();
+    }
+
+    NCOrdinaryG00FeedHoldRearmCutoverSnapshot
+        GetOrdinaryG00FeedHoldRearmCutoverSnapshot() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortRearmCutoverGate.GetSnapshot();
+    }
+
+    NCOrdinaryG00FeedHoldRearmCutoverCounters
+        GetOrdinaryG00FeedHoldRearmCutoverCounters() const noexcept
+    {
+        return m_ordinaryG00FeedHoldCohortRearmCutoverGate.GetCounters();
+    }
+
+    void SetOrdinaryG00ReadAheadCutoverEnabled(bool enabled) noexcept
+    {
+        m_ordinaryG00ReadAheadCutoverGate.SetEnabled(enabled);
+    }
+
+    bool IsOrdinaryG00ReadAheadCutoverEnabled() const noexcept
+    {
+        return m_ordinaryG00ReadAheadCutoverGate.IsEnabled();
+    }
+
+    NCOrdinaryG00ReadAheadSnapshot
+        GetOrdinaryG00ReadAheadSnapshot() const noexcept
+    {
+        return m_ordinaryG00ReadAheadCutoverGate.GetSnapshot();
+    }
+
+    NCOrdinaryG00ReadAheadCounters
+        GetOrdinaryG00ReadAheadCounters() const noexcept
+    {
+        return m_ordinaryG00ReadAheadCutoverGate.GetCounters();
+    }
+
+    bool ConsumeOrdinaryG00ReadAheadMotionAuthorization() noexcept
+    {
+        return m_ordinaryG00ReadAheadCutoverGate.
+            ConsumeMotionAuthorization(
+                m_currentExecutingBlockDispatchId);
+    }
+
     NCSingleBlockShadowSnapshot
         GetSingleBlockShadowSnapshot() const noexcept
     {
@@ -957,11 +1061,44 @@ private:
     NCOrdinaryG00BufferedExactStopAdmissionShadow
         m_ordinaryG00AdmissionShadow{};
 
-    // Stage NC-0.2K.6.3: independently binds each accepted ordinary G00 to
-    // one fixed-capacity terminal slot.  It is an NC-thread-only observer and
-    // never writes Motion, PC, callback, Epoch, owner, or PDO state.
+    // Stage NC-0.2K.6.3/K.7.1: independently binds each accepted ordinary G00
+    // to one fixed-capacity terminal slot.  It never writes Motion, PC,
+    // callback, Epoch, owner, or PDO state; K.7.1 makes successful registration
+    // a mandatory post-submit proof for its controlled path.
     NCOrdinaryG00InflightTerminalRegistryShadow
         m_ordinaryG00InflightRegistryShadow{};
+
+    // Stage NC-0.2K.7.3: captures the exact two active K.7.1 identities at a
+    // PROGRAM Feed Hold edge and observes ACK, Resume and ordered terminals.
+    // K.7.4 may consume its immutable proof, but this observer never acts.
+    NCOrdinaryG00FeedHoldCohortShadow
+        m_ordinaryG00FeedHoldCohortShadow{};
+
+    // Stage NC-0.2K.7.4: consumes only the exact K.7.3 cohort proof at the
+    // K.7.1 admission seam.  It prevents a third read-ahead G00 from joining
+    // a Feed-Hold cohort before both captured members reach ordered terminal.
+    // Failure selects the existing legacy drain path; Motion remains untouched.
+    NCOrdinaryG00FeedHoldCohortCutoverGate
+        m_ordinaryG00FeedHoldCohortCutoverGate{};
+
+    // Stage NC-0.2K.7.5: observes two consecutive exact K.7.4 cohorts in one
+    // Queue session and proves clean release-before-rearm, monotonic
+    // generations and cross-generation Motion identity isolation.  Shadow
+    // only; no admission or Motion result consumes this evidence.
+    NCOrdinaryG00FeedHoldCohortRearmShadow
+        m_ordinaryG00FeedHoldCohortRearmShadow{};
+
+    // Stage NC-0.2K.7.6: consumes the exact K.7.5 second-generation proof at
+    // the K.7.1 admission seam.  It waits until SECOND_RELEASED /
+    // REARM_PROVEN and selects legacy drain on any cross-generation mismatch.
+    // It owns no Motion storage and never writes Motion or PDO state.
+    NCOrdinaryG00FeedHoldCohortRearmCutoverGate
+        m_ordinaryG00FeedHoldCohortRearmCutoverGate{};
+
+    // Stage NC-0.2K.7.1: reversible, qualification-gated Runtime cutover.
+    // It owns no Motion storage and cannot exceed two active registry entries.
+    NCOrdinaryG00ReadAheadCutoverGate
+        m_ordinaryG00ReadAheadCutoverGate{};
 
     // Stage NC-0.2I.1：只觀察 Single Block 正確完成點。
     NCSingleBlockBoundaryShadow m_singleBlockBoundaryShadow{};
@@ -1021,6 +1158,12 @@ private:
     std::uint64_t m_resetAuthorityAlarmSafetyIntentState = 0ULL;
     std::uint64_t m_resetAuthorityMappingAlarmRequestCount = 0ULL;
     std::uint64_t m_resetLifecycleInterruptionSequence = 0ULL;
+    // NC-0.2K.7.1.1: a Reset pressed while an ordinary group is active opens
+    // its lifecycle boundary before the smooth controlled-stop pre-phase.
+    // Keep that exact old Epoch/AUTO/active-block identity across a deferred
+    // button-admission retry so the later ABORTED active command and stale
+    // read-ahead retirement remain provably owned by this operator Reset.
+    bool m_resetLifecycleBoundaryPrearmedByControlledStop = false;
     MotionExecutionEpoch m_resetContinuationExecutionEpoch =
         MOTION_EXECUTION_EPOCH_INVALID;
     MotionNCResetExecutionState m_resetContinuationExecutionState{};
@@ -1155,6 +1298,9 @@ private:
     void ObserveFeedHoldResumeRequestedShadow() noexcept;
     void ObserveFeedHoldResumeAppliedShadow() noexcept;
     void CancelFeedHoldBoundaryShadow(bool superseded) noexcept;
+    void BeginOrdinaryG00FeedHoldCohortShadow() noexcept;
+    void ObserveOrdinaryG00FeedHoldCohortBoundary() noexcept;
+    void ObserveOrdinaryG00FeedHoldCohortCutover() noexcept;
 
     bool IsProgramFeedHoldResumeCandidate() const noexcept;
     bool ApplyProgramHoldResume(bool gateControlled) noexcept;
@@ -1310,6 +1456,11 @@ public:
         int sourcePC,
         int sourceLineNumber,
         NCBlockDispatchId dispatchId);
+
+    // Valid only while ExecuteBlock is synchronously dispatching one block.
+    // G00 consumes a K.7.1 authorization through the public one-shot API.
+    NCBlockDispatchId m_currentExecutingBlockDispatchId =
+        NC_BLOCK_DISPATCH_ID_INVALID;
 
     // 🌟 替換：捨棄 Enum，改用統一的檢查回呼函式
     WaitConditionFunc m_waitCallback = nullptr;

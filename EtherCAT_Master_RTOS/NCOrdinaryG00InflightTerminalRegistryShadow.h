@@ -13,14 +13,15 @@
 // =============================================================================
 // Stage NC-0.2K.6.3 - Ordinary G00 Bounded In-Flight Terminal Registry Shadow
 //
-// The accepted K.4.2/K.6.2 Runtime path remains the sole producer and Motion
-// remains the sole consumer/writer.  This fixed-capacity NC-thread observer
-// binds one exact ordinary G00 Program Commit to its already-accepted Motion
-// segment and then retains that identity until exactly one Ledger-accepted
-// terminal feedback event is observed.
+// Motion remains the sole consumer/writer.  This fixed-capacity NC-thread
+// registry binds one exact ordinary G00 Program Commit to its already-
+// accepted Motion segment and then retains that identity until exactly one
+// Ledger-accepted terminal feedback event is observed.  K.7.1 reuses the
+// proven registry as a mandatory safety dependency for its controlled path.
 //
 // It never advances a PC, changes a callback/Epoch/owner, submits Motion work,
-// writes a PDO, allocates memory, waits, or authorises a read-ahead cutover.
+// writes a PDO, allocates memory, or waits.  Legacy K.6.3 registrations remain
+// observation-only; K.7.1 registrations explicitly report Runtime influence.
 // =============================================================================
 
 constexpr std::size_t NC_ORDINARY_G00_INFLIGHT_REGISTRY_CAPACITY = 32U;
@@ -125,6 +126,7 @@ struct NCOrdinaryG00InflightRegistrationProof
     bool registered = false;
     bool exact = false;
     bool active = false;
+    bool readAheadCutover = false;
     bool bounded = true;
     bool shadowOnly = true;
     bool runtimeInfluence = false;
@@ -168,6 +170,7 @@ struct NCOrdinaryG00InflightEntrySnapshot
     bool terminal = false;
     bool revoked = false;
     bool ledgerAcceptedTerminal = false;
+    bool readAheadCutover = false;
 };
 
 struct NCOrdinaryG00InflightRegistrySnapshot
@@ -206,6 +209,9 @@ struct NCOrdinaryG00InflightRegistryCounters
     std::uint64_t duplicateIdentity = 0ULL;
     std::uint64_t capacityOverflow = 0ULL;
     std::uint64_t slotReuses = 0ULL;
+    std::uint64_t readAheadRegistrationAttempts = 0ULL;
+    std::uint64_t readAheadRegistered = 0ULL;
+    std::uint64_t readAheadRegistrationRejected = 0ULL;
 
     std::uint64_t feedbackObserved = 0ULL;
     std::uint64_t feedbackMatched = 0ULL;
@@ -255,7 +261,9 @@ struct NCOrdinaryG00InflightRegistryCounters
     std::uint64_t activeEntries = 0ULL;
     std::uint64_t peakActiveEntries = 0ULL;
 
-    // These remain structural zeros in K.6.3.
+    // K.7.1 records one unit of Runtime influence for each successfully
+    // registered read-ahead segment.  The registry itself never writes
+    // Motion; motionWrites therefore remains a structural zero.
     std::uint64_t runtimeInfluence = 0ULL;
     std::uint64_t motionWrites = 0ULL;
 };
@@ -282,6 +290,48 @@ public:
             RejectRegistration(RegistrationFailure::K63_INVALID);
             return false;
         }
+
+        return RegisterExact(context, evidence, false, proof);
+    }
+
+    // Stage NC-0.2K.7.1: register an already-accepted BUFFERED + EXACT_STOP
+    // ordinary G00.  Unlike the legacy K.6.3 path, the exact execution Epoch
+    // is stable and no per-block completion callback may be present.
+    bool TryRegisterReadAhead(
+        const NCPreparedHeadCutoverContext& context,
+        const NCOrdinaryG00InflightRegistrationEvidence& evidence,
+        NCOrdinaryG00InflightRegistrationProof& proof) noexcept
+    {
+        proof = NCOrdinaryG00InflightRegistrationProof{};
+        ++m_counters.registrationAttempts;
+        ++m_counters.readAheadRegistrationAttempts;
+
+        ObserveActiveSessionInternal(context.queue.session);
+
+        if (m_permanentLockout ||
+            !ReadAheadRegistrationEvidenceExact(context, evidence))
+        {
+            ++m_counters.readAheadRegistrationRejected;
+            RejectRegistration(RegistrationFailure::K63_INVALID);
+            return false;
+        }
+
+        const bool registered =
+            RegisterExact(context, evidence, true, proof);
+        if (!registered)
+        {
+            ++m_counters.readAheadRegistrationRejected;
+        }
+        return registered;
+    }
+
+private:
+    bool RegisterExact(
+        const NCPreparedHeadCutoverContext& context,
+        const NCOrdinaryG00InflightRegistrationEvidence& evidence,
+        bool readAheadCutover,
+        NCOrdinaryG00InflightRegistrationProof& proof) noexcept
+    {
 
         for (const NCOrdinaryG00InflightEntrySnapshot& entry : m_entries)
         {
@@ -350,9 +400,15 @@ public:
         entry.state = NCOrdinaryG00InflightState::K63_REGISTERED;
         entry.occupied = true;
         entry.active = true;
+        entry.readAheadCutover = readAheadCutover;
 
         m_entries[target] = entry;
         ++m_counters.registered;
+        if (readAheadCutover)
+        {
+            ++m_counters.readAheadRegistered;
+            ++m_counters.runtimeInfluence;
+        }
         ++m_counters.activeEntries;
         if (m_counters.activeEntries > m_counters.peakActiveEntries)
         {
@@ -363,6 +419,8 @@ public:
         FillProof(m_entries[target], proof);
         return true;
     }
+
+public:
 
     void ObserveMotionFeedback(
         const MotionFeedbackEvent& event,
@@ -914,6 +972,108 @@ private:
             evidence.commitSucceeded;
     }
 
+    static bool ReadAheadRegistrationEvidenceExact(
+        const NCPreparedHeadCutoverContext& context,
+        const NCOrdinaryG00InflightRegistrationEvidence& evidence) noexcept
+    {
+        const MotionExecutionIdentity& identity =
+            evidence.submissionIdentity;
+        const bool identityExact =
+            identity.IsAssigned() &&
+            context.runtimeSource.executionEpoch != 0ULL &&
+            context.runtimeSource.executionEpoch <=
+            static_cast<std::uint64_t>(UINT32_MAX) &&
+            static_cast<std::uint64_t>(identity.epoch) ==
+            context.runtimeSource.executionEpoch &&
+            static_cast<std::uint64_t>(identity.epoch) ==
+            evidence.segmentExecutionEpoch &&
+            static_cast<std::uint64_t>(identity.segmentId) ==
+            evidence.segmentId &&
+            identity.sourceBlockId ==
+            static_cast<MotionSourceBlockId>(context.sourcePC) &&
+            identity.source == MotionCommandSource::NC_MEMORY;
+        const bool ledgerExact =
+            evidence.ledgerFound &&
+            evidence.ledgerProgramCommitted &&
+            !evidence.ledgerCaptureOverflow &&
+            evidence.ledgerDispatchId == evidence.dispatchId &&
+            evidence.ledgerCommitSequence == evidence.commitSequence &&
+            evidence.ledgerScope == context.runtimeSource.scope &&
+            evidence.ledgerCacheGeneration ==
+            context.runtimeSource.cacheGeneration &&
+            evidence.ledgerFrameId == context.runtimeSource.frameId &&
+            evidence.ledgerSourcePC == context.sourcePC &&
+            evidence.ledgerSourceLineNumber == context.sourceLineNumber &&
+            evidence.ledgerMotionSegmentCount == 1U &&
+            evidence.ledgerProducerAccepted &&
+            evidence.ledgerImmediateRejectReason ==
+            MotionRejectReason::NONE &&
+            IdentityExactlyMatches(evidence.ledgerIdentity, identity);
+
+        return
+            context.hasHead &&
+            context.capturedBeforeResolve &&
+            context.runtimeModalBeforeValid &&
+            context.queue.active &&
+            context.queue.valid &&
+            context.queue.accountingValid &&
+            context.queue.session != NC_PREPARED_QUEUE_SESSION_INVALID &&
+            context.queue.session == context.head.session &&
+            context.queue.runtimeCurrentPC == context.sourcePC &&
+            SourceExactlyMatches(
+                context.queue.source,
+                context.runtimeSource) &&
+            context.head.entrySequence !=
+            NC_PREPARED_ENTRY_SEQUENCE_INVALID &&
+            context.head.sourcePC == context.sourcePC &&
+            context.head.sourceLineNumber == context.sourceLineNumber &&
+            SourceExactlyMatches(
+                context.head.source,
+                context.runtimeSource) &&
+            context.runtimeSource.scope == NCProgramScope::MEMORY &&
+            context.runtimeSource.frameId == NC_PROGRAM_FRAME_ID_INVALID &&
+            context.runtimeSource.owner ==
+            static_cast<std::uint8_t>(MotionOwner::AUTO) &&
+            context.runtimeSource.ownerGeneration != 0ULL &&
+            context.runtimeSource.ownerGeneration <=
+            static_cast<std::uint64_t>(UINT32_MAX) &&
+            !context.runtimeSource.panel.blockSkipEnabled &&
+            !context.runtimeSource.panel.singleBlockEnabled &&
+            !context.runtimeSource.panel.optionalStopEnabled &&
+            context.legacyDrainRequired &&
+            context.head.classification.blockClass ==
+            NCPreparedBlockClass::MOTION_SHADOW &&
+            context.head.classification.primaryGCode == 0 &&
+            context.head.classification.literalResolved &&
+            context.head.classification.modalAfterValid &&
+            context.head.classification.legacyDrainRequired &&
+            !context.head.classification.planningStopsHere &&
+            context.head.classification.barrierKind ==
+            NCPreparedBarrierKind::NONE &&
+            context.head.classification.barrierFlags ==
+            NC_PREPARED_BARRIER_FLAG_NONE &&
+            evidence.dispatchId != 0ULL &&
+            evidence.commitSequence !=
+            NC_PROGRAM_COMMIT_SEQUENCE_INVALID &&
+            evidence.currentExecutionEpoch ==
+            context.runtimeSource.executionEpoch &&
+            evidence.submissionCount == 1U &&
+            evidence.commandPathMode ==
+            MotionCommandPathMode::EXACT_STOP &&
+            identityExact &&
+            QueueTailExactlyMatches(
+                evidence.queueTailReceipt,
+                identity,
+                context.runtimeSource.owner,
+                context.runtimeSource.ownerGeneration) &&
+            ledgerExact &&
+            !evidence.captureOverflow &&
+            evidence.producerAccepted &&
+            evidence.immediateRejectNone &&
+            !evidence.waitCallbackActive &&
+            evidence.commitSucceeded;
+    }
+
     static bool IsTerminal(MotionFeedbackType type) noexcept
     {
         return
@@ -1001,6 +1161,9 @@ private:
         proof.registered = true;
         proof.exact = true;
         proof.active = true;
+        proof.readAheadCutover = entry.readAheadCutover;
+        proof.shadowOnly = !entry.readAheadCutover;
+        proof.runtimeInfluence = entry.readAheadCutover;
         proof.accountingValid = m_snapshot.accountingValid;
     }
 
@@ -1213,8 +1376,10 @@ private:
             m_lastObservedFeedbackSequence;
         m_snapshot.permanentLockout = m_permanentLockout;
         m_snapshot.bounded = true;
-        m_snapshot.shadowOnly = true;
-        m_snapshot.runtimeInfluence = false;
+        m_snapshot.shadowOnly =
+            m_counters.readAheadRegistered == 0ULL;
+        m_snapshot.runtimeInfluence =
+            m_counters.readAheadRegistered != 0ULL;
         m_snapshot.motionWrite = false;
         if (m_lastEntryIndex < m_entries.size())
         {
@@ -1251,6 +1416,12 @@ private:
             m_counters.invalidRegistration +
             m_counters.duplicateIdentity +
             m_counters.capacityOverflow &&
+            m_counters.readAheadRegistrationAttempts ==
+            m_counters.readAheadRegistered +
+            m_counters.readAheadRegistrationRejected &&
+            m_counters.readAheadRegistered <= m_counters.registered &&
+            m_counters.readAheadRegistrationRejected <=
+            m_counters.registrationRejected &&
             m_counters.registered ==
             m_counters.terminal + m_counters.activeEntries &&
             m_counters.feedbackMatched == matchedSum &&
@@ -1262,7 +1433,8 @@ private:
             m_counters.peakActiveEntries >= m_counters.activeEntries &&
             m_counters.peakActiveEntries <=
             NC_ORDINARY_G00_INFLIGHT_REGISTRY_CAPACITY &&
-            m_counters.runtimeInfluence == 0ULL &&
+            m_counters.runtimeInfluence ==
+            m_counters.readAheadRegistered &&
             m_counters.motionWrites == 0ULL;
         m_snapshot.ready =
             m_counters.registered != 0ULL &&

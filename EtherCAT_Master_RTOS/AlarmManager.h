@@ -48,7 +48,8 @@ public:
     enum SysAlarm {
         NONE = 0,
         EMG_STOP = SYS_BASE + 1, // 1001: 緊急停止觸發
-        SHM_LINK_ERROR = SYS_BASE + 2  // 1002: RTX64 共享記憶體通訊異常
+        SHM_LINK_ERROR = SYS_BASE + 2, // 1002: RTX64 共享記憶體通訊異常
+        ETHERCAT_PDO_SAFETY_STOP = SYS_BASE + 3 // 1003: 連續 PDO 無效觸發安全停止
     };
 
     // 🌟 3. NC 程式警報 (2000 ~ 2999)

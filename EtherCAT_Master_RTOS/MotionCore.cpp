@@ -19277,6 +19277,66 @@ void MotionCore::UpdateNCSettleProducer(
                 }
             }
 
+            // -------------------------------------------------------------
+            // NC-0.2K.7.5.1 - Feed Hold read-ahead member transition rebind
+            //
+            // A PROGRAM Feed Hold request is scoped to the active Motion
+            // group, not to only the single segment which happened to be at
+            // m_Group.currentCmd when the 250 us consumer accepted it.  With
+            // ordinary G00 read-ahead, that member can finish during the
+            // controlled deceleration and the already admitted next member
+            // can become current before the 200-cycle settle proof rises.
+            //
+            // The previous exact-identity check then held the request at
+            // EXECUTION_EPOCH_MISMATCH forever even though the request,
+            // Program owner, execution epoch and zero-override hold were all
+            // still current.  Cycle Start correctly remained deferred, but
+            // no later cycle could ever produce the ACK which releases it.
+            //
+            // Rebind only this FEED_HOLD_GROUP tracker, and only while every
+            // authority condition which created the request is still exact:
+            //
+            //   - same accepted request sequence;
+            //   - same execution epoch and owner lease;
+            //   - current group identity is assigned to that epoch;
+            //   - group is still active under zero Feed Override;
+            //   - virtual command velocity is already stopped;
+            //   - no Safety / recovery request is pending.
+            //
+            // Rebinding revokes any partial/old proof and restarts the full
+            // dwell against the new member and scope.  It does not set
+            // settled, acknowledge Feed Hold, apply Resume, write Motion, or
+            // weaken any following-error / excursion / fault predicate below.
+            // -------------------------------------------------------------
+            if (profile == MotionNCSettleProfile::FEED_HOLD_GROUP &&
+                tracker.requestSequence !=
+                MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
+                tracker.requestAccepted &&
+                tracker.executionEpoch == currentExecutionEpoch &&
+                tracker.ownerLease.Matches(currentOwnerLease) &&
+                tracker.executionIdentity.IsAssigned() &&
+                currentGroupIdentityCorrelated &&
+                !MotionExecutionIdentityExactlyMatches(
+                    tracker.executionIdentity,
+                    currentGroupIdentity) &&
+                m_Group.isActive &&
+                snapshot.overrideZero &&
+                snapshot.virtualCommandStopped &&
+                correlatedCurrentGroupMask != 0U &&
+                !snapshot.safetyOrRecoveryPending)
+            {
+                const bool scopeChanged =
+                    tracker.scopeMask != correlatedCurrentGroupMask;
+                ResetNCSettleCandidate(
+                    profile,
+                    MotionNCSettleBlocker::EXECUTION_EPOCH_MISMATCH,
+                    true,
+                    scopeChanged);
+                tracker.executionIdentity = currentGroupIdentity;
+                tracker.scopeMask = correlatedCurrentGroupMask;
+                tracker.requestAccepted = true;
+            }
+
             snapshot.requestSequence = tracker.requestSequence;
             snapshot.executionEpoch = tracker.executionEpoch;
             snapshot.owner = tracker.ownerLease.owner;

@@ -581,6 +581,24 @@
     <ClInclude Include="NCOrdinaryG00InflightTerminalRegistryShadow.h">
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
+    <ClInclude Include="NCOrdinaryG00ReadAheadCutoverGate.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatPdoRuntimeInvalidCorrelation.h">
+      <Filter>Header Files\EtherCAT_Master\DC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortShadow.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortCutoverGate.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmShadow.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmCutoverGate.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="DC同步_相關設定說明.txt">

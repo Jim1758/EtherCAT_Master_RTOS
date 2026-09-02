@@ -1,9 +1,13 @@
 ﻿#include "EtherCatMaster.h"
 #include "EtherCatMaster_DC_Topology.h"
 #include "EtherCatMaster_DC_Tuning.h"
+#include "EtherCatPdoRuntimeInvalidCorrelation.h"
+#include "AlarmManager.h"
 #include <windows.h> 
 #include <rtapi.h> 
 #include <rtssapi.h> 
+#include <array>
+#include <atomic>
 #include <cstring>
 #include <stdio.h>
 #include "GlobalConfig.h"
@@ -260,6 +264,261 @@ namespace
         InterlockedIncrement(&g_ecatDiagRtShadow.Sequence);
         // Even Sequence means one complete snapshot is available.
     }
+}
+
+// ============================================================================
+// NC-0.2K.7.2.1 - PDO Runtime Invalid Source Correlation Diagnostic
+// ============================================================================
+//
+// This publisher is deliberately independent from the Motion settle bank.
+// The Priority-64 owner observes the already-computed PDO validity contract;
+// Priority-50 can only read the published atomic words.  The data is never
+// consumed by EtherCAT, Motion, RESET, Registry, or read-ahead decisions.
+//
+// Healthy cycles execute the pure tracker plus one predictable false branch.
+// Atomic publication happens only for an invalid edge/checkpoint, recovery,
+// true runtime tick discontinuity, or contract event/checkpoint.
+// ============================================================================
+
+namespace
+{
+    using PdoInvalidCorrelationSnapshot =
+        EtherCatPdoRuntimeInvalidCorrelationSnapshot;
+
+    constexpr std::size_t PDO_INVALID_CORRELATION_WORD_COUNT =
+        (sizeof(PdoInvalidCorrelationSnapshot) + sizeof(std::uint64_t) - 1U) /
+        sizeof(std::uint64_t);
+
+    static_assert(
+        PDO_INVALID_CORRELATION_WORD_COUNT <= 32U,
+        "PDO invalid diagnostic publication must remain small and bounded.");
+    static_assert(
+        ATOMIC_LLONG_LOCK_FREE == 2,
+        "Priority-64 diagnostic publication requires lock-free 64-bit atomics.");
+
+    struct PdoInvalidCorrelationAtomicBank
+    {
+        std::atomic<std::uint64_t> sequence{ 0ULL };
+        std::array<
+            std::atomic<std::uint64_t>,
+            PDO_INVALID_CORRELATION_WORD_COUNT> words{};
+
+        PdoInvalidCorrelationAtomicBank() noexcept
+        {
+            for (auto& word : words)
+            {
+                word.store(0ULL, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    PdoInvalidCorrelationAtomicBank g_pdoInvalidCorrelationBank;
+    EtherCatPdoRuntimeInvalidCorrelationTracker
+        g_pdoInvalidCorrelationTracker;
+
+    using PdoSafetyStopCauseSnapshot =
+        EtherCatPdoSafetyStopCauseSnapshot;
+
+    constexpr std::size_t PDO_SAFETY_STOP_CAUSE_WORD_COUNT =
+        (sizeof(PdoSafetyStopCauseSnapshot) + sizeof(std::uint64_t) - 1U) /
+        sizeof(std::uint64_t);
+
+    static_assert(
+        PDO_SAFETY_STOP_CAUSE_WORD_COUNT <= 16U,
+        "PDO safety stop cause publication must remain small and bounded.");
+
+    struct PdoSafetyStopCauseAtomicBank
+    {
+        std::atomic<std::uint64_t> sequence{ 0ULL };
+        std::array<
+            std::atomic<std::uint64_t>,
+            PDO_SAFETY_STOP_CAUSE_WORD_COUNT> words{};
+
+        PdoSafetyStopCauseAtomicBank() noexcept
+        {
+            for (auto& word : words)
+            {
+                word.store(0ULL, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    PdoSafetyStopCauseAtomicBank g_pdoSafetyStopCauseBank;
+    EtherCatPdoSafetyStopAlarmBridgeTracker
+        g_pdoSafetyStopAlarmBridgeTracker;
+
+    void PublishPdoInvalidCorrelationSnapshot(
+        const PdoInvalidCorrelationSnapshot& snapshot) noexcept
+    {
+        std::array<
+            std::uint64_t,
+            PDO_INVALID_CORRELATION_WORD_COUNT> packed{};
+        std::memcpy(packed.data(), &snapshot, sizeof(snapshot));
+
+        const std::uint64_t writingSequence =
+            g_pdoInvalidCorrelationBank.sequence.fetch_add(
+                1ULL,
+                std::memory_order_acq_rel) + 1ULL;
+
+        for (std::size_t index = 0U;
+            index < PDO_INVALID_CORRELATION_WORD_COUNT;
+            ++index)
+        {
+            g_pdoInvalidCorrelationBank.words[index].store(
+                packed[index],
+                std::memory_order_relaxed);
+        }
+
+        g_pdoInvalidCorrelationBank.sequence.store(
+            writingSequence + 1ULL,
+            std::memory_order_release);
+    }
+
+    void PublishPdoSafetyStopCauseSnapshot(
+        const PdoSafetyStopCauseSnapshot& snapshot) noexcept
+    {
+        std::array<
+            std::uint64_t,
+            PDO_SAFETY_STOP_CAUSE_WORD_COUNT> packed{};
+        std::memcpy(packed.data(), &snapshot, sizeof(snapshot));
+
+        const std::uint64_t writingSequence =
+            g_pdoSafetyStopCauseBank.sequence.fetch_add(
+                1ULL,
+                std::memory_order_acq_rel) + 1ULL;
+
+        for (std::size_t index = 0U;
+            index < PDO_SAFETY_STOP_CAUSE_WORD_COUNT;
+            ++index)
+        {
+            g_pdoSafetyStopCauseBank.words[index].store(
+                packed[index],
+                std::memory_order_relaxed);
+        }
+
+        g_pdoSafetyStopCauseBank.sequence.store(
+            writingSequence + 1ULL,
+            std::memory_order_release);
+    }
+
+    void ObservePdoRuntimeInvalidCorrelation(
+        std::uint64_t runtimeCycleTick,
+        bool pdoCycleValid,
+        std::int32_t actualLrwWkc,
+        std::int32_t expectedLrwWkc,
+        std::int32_t dcWkc,
+        bool dcReferenceRequired,
+        std::uint64_t combinedPathNs,
+        std::uint64_t runtimePdoNegativeTotal,
+        std::uint64_t runtimePdoWkcErrorTotal,
+        std::uint32_t subTick) noexcept
+    {
+        if (!g_pdoInvalidCorrelationTracker.Observe(
+            runtimeCycleTick,
+            pdoCycleValid,
+            actualLrwWkc,
+            expectedLrwWkc,
+            dcWkc,
+            dcReferenceRequired,
+            combinedPathNs,
+            runtimePdoNegativeTotal,
+            runtimePdoWkcErrorTotal,
+            subTick))
+        {
+            return;
+        }
+
+        PublishPdoInvalidCorrelationSnapshot(
+            g_pdoInvalidCorrelationTracker.Snapshot());
+    }
+}
+
+bool TryReadEtherCatPdoRuntimeInvalidCorrelation(
+    EtherCatPdoRuntimeInvalidCorrelationSnapshot& snapshot) noexcept
+{
+    constexpr std::uint32_t MAX_READ_ATTEMPTS = 4U;
+
+    for (std::uint32_t attempt = 0U;
+        attempt < MAX_READ_ATTEMPTS;
+        ++attempt)
+    {
+        const std::uint64_t sequenceBefore =
+            g_pdoInvalidCorrelationBank.sequence.load(
+                std::memory_order_acquire);
+        if ((sequenceBefore & 1ULL) != 0ULL)
+        {
+            continue;
+        }
+
+        std::array<
+            std::uint64_t,
+            PDO_INVALID_CORRELATION_WORD_COUNT> packed{};
+        for (std::size_t index = 0U;
+            index < PDO_INVALID_CORRELATION_WORD_COUNT;
+            ++index)
+        {
+            packed[index] =
+                g_pdoInvalidCorrelationBank.words[index].load(
+                    std::memory_order_relaxed);
+        }
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const std::uint64_t sequenceAfter =
+            g_pdoInvalidCorrelationBank.sequence.load(
+                std::memory_order_acquire);
+        if (sequenceBefore == sequenceAfter &&
+            (sequenceAfter & 1ULL) == 0ULL)
+        {
+            std::memcpy(&snapshot, packed.data(), sizeof(snapshot));
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool TryReadEtherCatPdoSafetyStopCause(
+    EtherCatPdoSafetyStopCauseSnapshot& snapshot) noexcept
+{
+    constexpr std::uint32_t MAX_READ_ATTEMPTS = 4U;
+
+    for (std::uint32_t attempt = 0U;
+        attempt < MAX_READ_ATTEMPTS;
+        ++attempt)
+    {
+        const std::uint64_t sequenceBefore =
+            g_pdoSafetyStopCauseBank.sequence.load(
+                std::memory_order_acquire);
+        if ((sequenceBefore & 1ULL) != 0ULL)
+        {
+            continue;
+        }
+
+        std::array<
+            std::uint64_t,
+            PDO_SAFETY_STOP_CAUSE_WORD_COUNT> packed{};
+        for (std::size_t index = 0U;
+            index < PDO_SAFETY_STOP_CAUSE_WORD_COUNT;
+            ++index)
+        {
+            packed[index] =
+                g_pdoSafetyStopCauseBank.words[index].load(
+                    std::memory_order_relaxed);
+        }
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const std::uint64_t sequenceAfter =
+            g_pdoSafetyStopCauseBank.sequence.load(
+                std::memory_order_acquire);
+        if (sequenceBefore == sequenceAfter &&
+            (sequenceAfter & 1ULL) == 0ULL)
+        {
+            std::memcpy(&snapshot, packed.data(), sizeof(snapshot));
+            return true;
+        }
+    }
+
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -15750,6 +16009,9 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 pMaster->
                                 GetCurrentMasterTimeNs();
 
+                            bool pdoSafetyStopAppliedThisCycle =
+                                false;
+
 
                             if (pdoCycleValid)
                             {
@@ -15769,6 +16031,9 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 pMaster->
                                     m_Motion.
                                     EmergencyStopAllAxes();
+
+                                pdoSafetyStopAppliedThisCycle =
+                                    true;
 
 
                                 pMaster->
@@ -15792,6 +16057,68 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 motionNs =
                                     stageMotionEndNs -
                                     stageMotionStartNs;
+                            }
+
+                            // NC-0.2K.7.2.1: latch exact source values only
+                            // after the existing Motion validity observer and
+                            // this cycle's interpolation / Emergency Stop work
+                            // have completed.  The diagnostic therefore cannot
+                            // delay a safety action and is excluded from the
+                            // existing motionNs measurement above.
+                            ObservePdoRuntimeInvalidCorrelation(
+                                pMaster->tickCount_PDO,
+                                pdoCycleValid,
+                                static_cast<std::int32_t>(wkc),
+                                static_cast<std::int32_t>(
+                                    pMaster->EXPECTED_WKC_PDO),
+                                static_cast<std::int32_t>(dcWkc),
+                                dcReferenceSlaveIndex >= 0,
+                                combinedCommNs,
+                                static_cast<std::uint64_t>(
+                                    pMaster->timeout_count_PDO),
+                                static_cast<std::uint64_t>(
+                                    pMaster->wkc_error_count_PDO),
+                                static_cast<std::uint32_t>(subTick));
+
+                            // NC-0.2K.7.2.2: the existing safety action above
+                            // remains first.  Only after ESTOP and K.7.2.1
+                            // source capture do we publish the small cause
+                            // latch and bridge it into AlarmManager.  RESET
+                            // clearing Alarm during a sustained PDO fault is
+                            // detected by HasAlarm() and immediately re-latched.
+                            if (pdoSafetyStopAppliedThisCycle)
+                            {
+                                AlarmManager& alarmManager =
+                                    AlarmManager::GetInstance();
+                                const std::int32_t alarmCode =
+                                    static_cast<std::int32_t>(
+                                        AlarmManager::
+                                        ETHERCAT_PDO_SAFETY_STOP);
+
+                                if (g_pdoSafetyStopAlarmBridgeTracker.
+                                    ObserveSafetyContainment(
+                                        alarmManager.HasAlarm(),
+                                        alarmCode,
+                                        g_pdoInvalidCorrelationTracker.
+                                        Snapshot(),
+                                        pdoConsecutiveInvalidCycles,
+                                        dcReferenceSlaveIndex >= 0,
+                                        static_cast<std::uint64_t>(
+                                            pMaster->timeout_count_PDO),
+                                        static_cast<std::uint64_t>(
+                                            pMaster->wkc_error_count_PDO),
+                                        static_cast<std::uint32_t>(subTick)))
+                                {
+                                    // Cause publication is intentionally
+                                    // visible before the Alarm image.
+                                    PublishPdoSafetyStopCauseSnapshot(
+                                        g_pdoSafetyStopAlarmBridgeTracker.
+                                        Snapshot());
+                                    alarmManager.Trigger(
+                                        alarmCode,
+                                        0,
+                                        -1);
+                                }
                             }
 
 

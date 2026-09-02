@@ -1,6 +1,4 @@
 ﻿#include "GMCodeHandlers.h"
-#include "EtherCatMaster.h"
-#include "GlobalConfig.h" 
 #include <vector>
 #include "AlarmManager.h" 
 #include "MotionCore.h"
@@ -233,6 +231,9 @@ namespace GCodeHandlers
 
         const bool continuousPath =
             block.has('P') && block.val('P') == 1.0;
+        const bool readAheadExactStop =
+            !continuousPath &&
+            nc->ConsumeOrdinaryG00ReadAheadMotionAuthorization();
         bool motionAccepted = false;
 
         if (continuousPath)
@@ -245,6 +246,20 @@ namespace GCodeHandlers
                     MotionCommandPathMode::CONTINUOUS,
                     rapidOverrideCandidate,
                     nc->CoordSys.commandedMCS);//連續路徑
+        }
+        else if (readAheadExactStop)
+        {
+            // NC-0.2K.7.1: controlled ordinary G00 read-ahead keeps the
+            // existing execution Epoch and queue ordering, but preserves a
+            // command-local exact-stop boundary for this segment.
+            motionAccepted =
+                nc->GetMotion().TryG00MoveTransactionalTail(
+                    activeAxes,
+                    targetPos,
+                    BufferMode::BUFFERED,
+                    MotionCommandPathMode::EXACT_STOP,
+                    rapidOverrideCandidate,
+                    nc->CoordSys.commandedMCS);
         }
         else
         {
@@ -275,7 +290,7 @@ namespace GCodeHandlers
             return [](NCManager*) { return true; };
         }
 
-        if (continuousPath)
+        if (continuousPath || readAheadExactStop)
         {
             // 🔓 解開第二道鎖：
             // 回傳 nullptr 代表「不要等我走完，大腦請立刻去讀下一行！」

@@ -106,6 +106,7 @@
     <ClInclude Include="EtherCatMaster_DC_Topology.h" />
     <ClInclude Include="EtherCatMaster_DC_Tuning.h" />
     <ClInclude Include="EtherCatPdo.h" />
+    <ClInclude Include="EtherCatPdoRuntimeInvalidCorrelation.h" />
     <ClInclude Include="EtherCatRxCorrelationDiagContract.h" />
     <ClInclude Include="EtherCatServo.h" />
     <ClInclude Include="EtherCatSmDiagContract.h" />
@@ -139,7 +140,12 @@
     <ClInclude Include="NCLifecycleInterruptionBoundary.h" />
     <ClInclude Include="NCManager.h" />
     <ClInclude Include="NCOrdinaryG00BufferedExactStopAdmissionShadow.h" />
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortCutoverGate.h" />
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmCutoverGate.h" />
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmShadow.h" />
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortShadow.h" />
     <ClInclude Include="NCOrdinaryG00InflightTerminalRegistryShadow.h" />
+    <ClInclude Include="NCOrdinaryG00ReadAheadCutoverGate.h" />
     <ClInclude Include="NCPLCManager.h" />
     <ClInclude Include="NCPLCMap.h" />
     <ClInclude Include="NCPreparedBlockQueueShadow.h" />

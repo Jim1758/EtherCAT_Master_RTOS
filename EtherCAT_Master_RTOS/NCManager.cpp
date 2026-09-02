@@ -711,6 +711,7 @@ void NCManager::Reset()
             !m_motion.ConsumeCompletedResetControlledStop())
         {
             m_resetContinuationPhase = ResetContinuationPhase::BLOCKED;
+            m_resetLifecycleBoundaryPrearmedByControlledStop = false;
             m_programMotionLease = MotionOwnerLease{};
             m_state = NCState::RESET_STATE;
             return;
@@ -752,6 +753,7 @@ void NCManager::Reset()
             // fail-closed RESET batch.  It does not re-arm the old smooth
             // stop or release any Safety owner.
             (void)m_motion.RetireSupersededResetControlledStop();
+            m_resetLifecycleBoundaryPrearmedByControlledStop = false;
         }
     }
 
@@ -774,6 +776,37 @@ void NCManager::Reset()
             !AlarmManager::GetInstance().HasAlarm();
         if (cleanProgramRunReset)
         {
+            // NC-0.2K.7.1.1: the operator button is the lifecycle cutoff.
+            // K.7.1 can have one STARTED command plus one accepted read-ahead
+            // command at this instant.  The controlled-stop pre-phase may
+            // publish ABORTED for the former and STALE_EPOCH/OWNER_CONFLICT
+            // REJECTED for the latter before the original Reset batch begins.
+            // Capture the exact old execution lease and both active Ledger
+            // blocks now; reopening this boundary after deceleration would
+            // lose that immutable correlation and misreport the expected
+            // retirement as a transport failure.
+            BeginLifecycleInterruptionShadow(
+                NCLifecycleInterruptionCause::RESET,
+                true);
+            const NCLifecycleInterruptionSnapshot preStopBoundary =
+                m_lifecycleInterruptionShadow.GetSnapshot();
+            m_resetLifecycleInterruptionSequence =
+                preStopBoundary.active &&
+                preStopBoundary.cause ==
+                NCLifecycleInterruptionCause::RESET
+                ? preStopBoundary.sequence
+                : 0ULL;
+            if (m_resetLifecycleInterruptionSequence == 0ULL)
+            {
+                m_resetContinuationPhase =
+                    ResetContinuationPhase::BLOCKED;
+                m_resetLifecycleBoundaryPrearmedByControlledStop = false;
+                m_programMotionLease = MotionOwnerLease{};
+                m_state = NCState::RESET_STATE;
+                m_motion.RequestEmergencyStopAllAxes();
+                return;
+            }
+            m_resetLifecycleBoundaryPrearmedByControlledStop = true;
             m_resetContinuationPhase =
                 ResetContinuationPhase::PRE_RESET_CONTROLLED_STOP;
             m_programMotionLease = MotionOwnerLease{};
@@ -862,16 +895,61 @@ void NCManager::Reset()
         m_resetNCSettleRequestSequence =
             MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
 
-        BeginLifecycleInterruptionShadow(
-            NCLifecycleInterruptionCause::RESET,
-            true);
-
-        const NCLifecycleInterruptionSnapshot resetBoundary =
+        const NCLifecycleInterruptionSnapshot existingResetBoundary =
             m_lifecycleInterruptionShadow.GetSnapshot();
-        m_resetLifecycleInterruptionSequence =
-            resetBoundary.cause == NCLifecycleInterruptionCause::RESET
-            ? resetBoundary.sequence
-            : 0ULL;
+        const bool controlledStopBoundaryExpected =
+            m_resetLifecycleBoundaryPrearmedByControlledStop;
+        const bool reuseControlledStopBoundary =
+            controlledStopBoundaryExpected &&
+            m_resetLifecycleInterruptionSequence != 0ULL &&
+            existingResetBoundary.active &&
+            existingResetBoundary.cause ==
+            NCLifecycleInterruptionCause::RESET &&
+            existingResetBoundary.sequence ==
+            m_resetLifecycleInterruptionSequence;
+
+        // A pre-armed boundary which lost coherence cannot be silently
+        // replaced after its terminal feedback has already passed.  Preserve
+        // that evidence gap and stop closed; only a new explicit Reset after
+        // BLOCKED may open a fresh transaction.
+        if (controlledStopBoundaryExpected &&
+            !reuseControlledStopBoundary)
+        {
+            (void)resetButtonAlarms.EndMotionAdmission(
+                resetButtonAdmission);
+            m_resetLifecycleBoundaryPrearmedByControlledStop = false;
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
+
+        if (!controlledStopBoundaryExpected)
+        {
+            BeginLifecycleInterruptionShadow(
+                NCLifecycleInterruptionCause::RESET,
+                true);
+
+            const NCLifecycleInterruptionSnapshot resetBoundary =
+                m_lifecycleInterruptionShadow.GetSnapshot();
+            m_resetLifecycleInterruptionSequence =
+                resetBoundary.active &&
+                resetBoundary.cause ==
+                NCLifecycleInterruptionCause::RESET
+                ? resetBoundary.sequence
+                : 0ULL;
+        }
+        m_resetLifecycleBoundaryPrearmedByControlledStop = false;
+
+        if (m_resetLifecycleInterruptionSequence == 0ULL)
+        {
+            (void)resetButtonAlarms.EndMotionAdmission(
+                resetButtonAdmission);
+            m_resetContinuationPhase =
+                ResetContinuationPhase::BLOCKED;
+            m_motion.RequestEmergencyStopAllAxes();
+            return;
+        }
 
         // RESET now owns the exact lifecycle boundary even when the button
         // was pressed from an already-latched Alarm. Clear only the generic
@@ -2551,6 +2629,17 @@ void NCManager::ProcessMotionFeedback() noexcept
             event,
             ledgerAccepted);
 
+        // K.7.3 observes the same already-classified immutable event.  The
+        // observer itself cannot act on Registry, Ledger, NC flow or Motion.
+        m_ordinaryG00FeedHoldCohortShadow.ObserveMotionFeedback(
+            event,
+            ledgerAccepted,
+            m_ordinaryG00InflightRegistryShadow.GetSnapshot());
+
+        // K.7.4 consumes only K.7.3's published proof and the already-updated
+        // K.6.3 Registry accounting.  It cannot consume or modify the event.
+        ObserveOrdinaryG00FeedHoldCohortCutover();
+
         if (lifecycleFailureFeedback)
         {
             m_lifecycleInterruptionShadow.RecordTerminalFeedback(
@@ -2748,18 +2837,24 @@ void NCManager::ProcessTask()
     if (AlarmManager::GetInstance().HasAlarm() ||
         m_state == NCState::ALARM)
     {
+        m_ordinaryG00ReadAheadCutoverGate.ObserveQueueInactive(
+            NCPreparedInvalidationReason::ALARM);
         m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
             NCPreparedInvalidationReason::ALARM);
     }
     else if (m_state == NCState::RESET_STATE ||
         m_resetContinuationPhase != ResetContinuationPhase::IDLE)
     {
+        m_ordinaryG00ReadAheadCutoverGate.ObserveQueueInactive(
+            NCPreparedInvalidationReason::RESET);
         m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
             NCPreparedInvalidationReason::RESET);
     }
     else if (m_state == NCState::P_END ||
         m_programEndBoundary.IsEndPending())
     {
+        m_ordinaryG00ReadAheadCutoverGate.ObserveQueueInactive(
+            NCPreparedInvalidationReason::PROGRAM_END);
         m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
             NCPreparedInvalidationReason::PROGRAM_END);
     }
@@ -2774,6 +2869,8 @@ void NCManager::ProcessTask()
     }
     else
     {
+        m_ordinaryG00ReadAheadCutoverGate.ObserveQueueInactive(
+            NCPreparedInvalidationReason::NOT_RUNNING);
         m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
             NCPreparedInvalidationReason::NOT_RUNNING);
     }
@@ -3229,6 +3326,7 @@ void NCManager::ProcessTask()
                 m_safetyMotionLease = MotionOwnerLease{};
                 m_resetContinuationPhase =
                     ResetContinuationPhase::IDLE;
+                m_resetLifecycleBoundaryPrearmedByControlledStop = false;
                 m_resetContinuationExecutionEpoch =
                     MOTION_EXECUTION_EPOCH_INVALID;
                 m_resetLifecycleInterruptionSequence = 0ULL;
@@ -3962,8 +4060,10 @@ void NCManager::ProcessExecutionEngine()
                 }
             }
             NCBlock block{};
-            const bool preparedResolverBypassed =
-                m_preparedHeadResolverBypassGate.TrySelectPreparedBlock(
+            NCBlock readAheadCandidateBlock{};
+            const bool readAheadCandidateExact =
+                m_preparedHeadResolverBypassGate.
+                TryInspectOrdinaryG00ReadAheadCandidate(
                     preparedCutoverContext,
                     parsedBlock,
                     m_preparedHeadEquivalenceShadow.GetCounters(),
@@ -3971,8 +4071,99 @@ void NCManager::ProcessExecutionEngine()
                     m_preparedHeadCutoverGate.GetCounters(),
                     m_preparedHeadPreResolveAdmissionShadow.GetSnapshot(),
                     m_preparedHeadPreResolveAdmissionShadow.GetCounters(),
-                    block,
+                    readAheadCandidateBlock,
                     ordinaryConfiguredAxisPresent);
+
+            NCOrdinaryG00ReadAheadSelectResult readAheadSelectResult =
+                NCOrdinaryG00ReadAheadSelectResult::NOT_SELECTED;
+            if (readAheadCandidateExact)
+            {
+                const NCOrdinaryG00InflightRegistrySnapshot
+                    ordinaryRegistrySnapshot =
+                    m_ordinaryG00InflightRegistryShadow.GetSnapshot();
+                const NCOrdinaryG00FeedHoldCohortAdmissionResult
+                    cohortAdmission =
+                    m_ordinaryG00FeedHoldCohortCutoverGate.
+                    EvaluateAdmission(
+                        ordinaryRegistrySnapshot);
+                const NCOrdinaryG00FeedHoldRearmAdmissionResult
+                    rearmAdmission =
+                    m_ordinaryG00FeedHoldCohortRearmCutoverGate.
+                    EvaluateAdmission(ordinaryRegistrySnapshot);
+                const bool feedHoldLegacyFallback =
+                    cohortAdmission ==
+                    NCOrdinaryG00FeedHoldCohortAdmissionResult::
+                    FALLBACK_LEGACY ||
+                    rearmAdmission ==
+                    NCOrdinaryG00FeedHoldRearmAdmissionResult::
+                    FALLBACK_LEGACY;
+                const bool feedHoldAdmissionWait =
+                    cohortAdmission ==
+                    NCOrdinaryG00FeedHoldCohortAdmissionResult::
+                    WAIT_COHORT ||
+                    rearmAdmission ==
+                    NCOrdinaryG00FeedHoldRearmAdmissionResult::
+                    WAIT_REARM;
+                if (!feedHoldLegacyFallback && !feedHoldAdmissionWait)
+                {
+                    block = readAheadCandidateBlock;
+                    readAheadSelectResult =
+                        m_ordinaryG00ReadAheadCutoverGate.TrySelect(
+                            preparedCutoverContext,
+                            true,
+                            m_ordinaryG00AdmissionShadow.GetSnapshot(),
+                            m_ordinaryG00AdmissionShadow.GetCounters(),
+                            m_ordinaryG00InflightRegistryShadow.GetSnapshot(),
+                            m_ordinaryG00InflightRegistryShadow.GetCounters(),
+                            preResolveDrainDepth,
+                            block);
+                }
+                if (!feedHoldLegacyFallback && feedHoldAdmissionWait)
+                {
+                    ObservePreDispatchBarrier(
+                        NCPreDispatchBarrierKind::G_CODE_BARRIER,
+                        currentPC,
+                        sourceLineNumber,
+                        -1,
+                        preResolveDrainDepth,
+                        preResolveGroupStandstill);
+                    return;
+                }
+            }
+            if (readAheadSelectResult ==
+                NCOrdinaryG00ReadAheadSelectResult::WAIT_CAPACITY)
+            {
+                ObservePreDispatchBarrier(
+                    NCPreDispatchBarrierKind::G_CODE_BARRIER,
+                    currentPC,
+                    sourceLineNumber,
+                    -1,
+                    preResolveDrainDepth,
+                    preResolveGroupStandstill);
+                return;
+            }
+            const bool ordinaryReadAheadSelected =
+                readAheadSelectResult ==
+                NCOrdinaryG00ReadAheadSelectResult::SELECTED;
+
+            bool preparedResolverBypassed = false;
+            if (!ordinaryReadAheadSelected)
+            {
+                preparedResolverBypassed =
+                    m_preparedHeadResolverBypassGate.
+                    TrySelectPreparedBlock(
+                        preparedCutoverContext,
+                        parsedBlock,
+                        m_preparedHeadEquivalenceShadow.GetCounters(),
+                        m_preparedHeadCutoverGate.GetSnapshot(),
+                        m_preparedHeadCutoverGate.GetCounters(),
+                        m_preparedHeadPreResolveAdmissionShadow.
+                        GetSnapshot(),
+                        m_preparedHeadPreResolveAdmissionShadow.
+                        GetCounters(),
+                        block,
+                        ordinaryConfiguredAxisPresent);
+            }
 
             const NCPreparedResolverBypassSnapshot
                 preparedResolverBypassSelection =
@@ -3981,14 +4172,18 @@ void NCManager::ProcessExecutionEngine()
             // Stage NC-0.2K.5 observes the K.4.2 decision only.  Its result is
             // deliberately not used by Resolver selection, barrier handling,
             // ExecuteBlock, callback assignment, Commit, or PC control.
-            m_ordinaryG00AdmissionShadow.ObserveResolverDecision(
-                preparedCutoverContext,
-                preparedResolverBypassSelection,
-                preparedResolverBypassed,
-                preResolveDrainDepth,
-                preResolveGroupStandstill,
-                ordinaryConfiguredAxisPresent);
-            if (!preparedResolverBypassed &&
+            if (!ordinaryReadAheadSelected)
+            {
+                m_ordinaryG00AdmissionShadow.ObserveResolverDecision(
+                    preparedCutoverContext,
+                    preparedResolverBypassSelection,
+                    preparedResolverBypassed,
+                    preResolveDrainDepth,
+                    preResolveGroupStandstill,
+                    ordinaryConfiguredAxisPresent);
+            }
+            if (!ordinaryReadAheadSelected &&
+                !preparedResolverBypassed &&
                 preparedResolverBypassSelection.decision ==
                 NCPreparedResolverBypassDecision::WAIT_LEGACY_DRAIN)
             {
@@ -4005,7 +4200,8 @@ void NCManager::ProcessExecutionEngine()
                 return;
             }
 
-            if (!preparedResolverBypassed)
+            if (!ordinaryReadAheadSelected &&
+                !preparedResolverBypassed)
             {
                 // Stage NC-0.2K.4 remains an observation-only oracle on the
                 // complete legacy path.  Bypassed tokens never call this
@@ -4105,6 +4301,15 @@ void NCManager::ProcessExecutionEngine()
                 isBarrier = true;
             }
 
+            // NC-0.2K.7.1 owns the only ordinary no-P G00 exception to the
+            // legacy drain barrier.  Its exact-stop boundary is command-local
+            // in Motion, so the NC producer may commit and inspect the next
+            // Prepared head without waiting on a per-block callback.
+            if (ordinaryReadAheadSelected)
+            {
+                isBarrier = false;
+            }
+
             // K.4.2 adds exactly one expected barrier lane: ordinary no-P G00.
             // PURE_MODAL/P1 must remain no-barrier.  Ordinary must retain its
             // exact K.1 drain classification and the pre-resolve drain proof.
@@ -4118,14 +4323,25 @@ void NCManager::ProcessExecutionEngine()
                 preparedCutoverContext.head.classification.
                 legacyDrainRequired;
             const bool selectedBarrierInvariant =
-                !preparedResolverBypassed ||
-                (selectedOrdinaryG00 ? isBarrier : !isBarrier);
+                ordinaryReadAheadSelected
+                ? !isBarrier
+                : (!preparedResolverBypassed ||
+                    (selectedOrdinaryG00 ? isBarrier : !isBarrier));
             if (!selectedBarrierInvariant)
             {
-                m_preparedHeadResolverBypassGate.
-                    ObserveSelectedInvariantFailure();
-                m_ordinaryG00AdmissionShadow.
-                    ObserveRuntimeFailure(0ULL);
+                if (ordinaryReadAheadSelected)
+                {
+                    m_ordinaryG00ReadAheadCutoverGate.
+                        ObserveRuntimeFailure(
+                            NC_BLOCK_DISPATCH_ID_INVALID);
+                }
+                else
+                {
+                    m_preparedHeadResolverBypassGate.
+                        ObserveSelectedInvariantFailure();
+                    m_ordinaryG00AdmissionShadow.
+                        ObserveRuntimeFailure(0ULL);
+                }
                 m_ordinaryG00InflightRegistryShadow.
                     ObserveRuntimeFailure(0ULL);
                 markDispatchFailed(
@@ -4144,7 +4360,8 @@ void NCManager::ProcessExecutionEngine()
             // A mismatch only closes future readiness; legacy execution below
             // remains available as the fail-closed Runtime path.
             bool preparedEquivalencePending = false;
-            if (!preparedResolverBypassed)
+            if (!ordinaryReadAheadSelected &&
+                !preparedResolverBypassed)
             {
                 preparedEquivalencePending =
                     ObservePreparedHeadEquivalenceResolved(
@@ -4240,7 +4457,36 @@ void NCManager::ProcessExecutionEngine()
 
             const NCBlockDispatchId dispatchId = ensureBlockLifecycle();
             bool preparedEquivalenceDispatchBound = false;
-            if (preparedResolverBypassed)
+            if (ordinaryReadAheadSelected)
+            {
+                NCBlockLifecycleSnapshot readAheadLedger{};
+                const bool readAheadLedgerFound =
+                    m_blockLifecycleLedger.TryGetSnapshot(
+                        dispatchId,
+                        readAheadLedger);
+                if (!m_ordinaryG00ReadAheadCutoverGate.BindDispatch(
+                    preparedCutoverContext,
+                    dispatchId,
+                    commitTarget,
+                    BuildPreparedBlockSourceIdentity(),
+                    readAheadLedgerFound,
+                    readAheadLedger.programTarget,
+                    readAheadLedger.sourceLineNumber))
+                {
+                    m_ordinaryG00InflightRegistryShadow.
+                        ObserveRuntimeFailure(dispatchId);
+                    m_blockLifecycleLedger.MarkNCDispatchFailed(
+                        dispatchId,
+                        static_cast<std::uint32_t>(
+                            AlarmManager::SYNTAX_ERROR));
+                    AlarmManager::GetInstance().Trigger(
+                        AlarmManager::SYNTAX_ERROR,
+                        sourceLineNumber);
+                    m_state = NCState::ALARM;
+                    return;
+                }
+            }
+            else if (preparedResolverBypassed)
             {
                 NCBlockLifecycleSnapshot bypassLedger{};
                 const bool bypassLedgerFound =
@@ -4290,7 +4536,8 @@ void NCManager::ProcessExecutionEngine()
             // literal G00 no longer requires the P1 admission sentinel.
             bool lastMileValueExact = false;
             bool preparedCutoverApplied = false;
-            if (!preparedResolverBypassed)
+            if (!ordinaryReadAheadSelected &&
+                !preparedResolverBypassed)
             {
                 lastMileValueExact =
                     preparedEquivalenceDispatchBound &&
@@ -4345,6 +4592,7 @@ void NCManager::ProcessExecutionEngine()
             m_motion.BeginProgramBlockMotionCapture();
 
             // Stage NC-0.2A：同一 Block 的 Modal 已先 Commit，才擷取 Snapshot。
+            m_currentExecutingBlockDispatchId = dispatchId;
             if (!block.isEmpty)
             {
                 ExecuteBlock(
@@ -4353,6 +4601,8 @@ void NCManager::ProcessExecutionEngine()
                     sourceLineNumber,
                     dispatchId);
             }
+            m_currentExecutingBlockDispatchId =
+                NC_BLOCK_DISPATCH_ID_INVALID;
 
             const MotionProgramBlockCapture motionCapture =
                 m_motion.EndProgramBlockMotionCapture();
@@ -4368,7 +4618,14 @@ void NCManager::ProcessExecutionEngine()
 
             if (AlarmManager::GetInstance().HasAlarm())
             {
-                if (preparedResolverBypassed)
+                if (ordinaryReadAheadSelected)
+                {
+                    m_ordinaryG00ReadAheadCutoverGate.
+                        ObserveRuntimeFailure(dispatchId);
+                    m_ordinaryG00InflightRegistryShadow.
+                        ObserveRuntimeFailure(dispatchId);
+                }
+                else if (preparedResolverBypassed)
                 {
                     m_preparedHeadResolverBypassGate.
                         ObserveRuntimeFailure(dispatchId);
@@ -4425,7 +4682,14 @@ void NCManager::ProcessExecutionEngine()
             // G66 可能在這裡建立 Macro Frame；失敗時不可提交本行。
             if (AlarmManager::GetInstance().HasAlarm())
             {
-                if (preparedResolverBypassed)
+                if (ordinaryReadAheadSelected)
+                {
+                    m_ordinaryG00ReadAheadCutoverGate.
+                        ObserveRuntimeFailure(dispatchId);
+                    m_ordinaryG00InflightRegistryShadow.
+                        ObserveRuntimeFailure(dispatchId);
+                }
+                else if (preparedResolverBypassed)
                 {
                     m_preparedHeadResolverBypassGate.
                         ObserveRuntimeFailure(dispatchId);
@@ -4454,7 +4718,8 @@ void NCManager::ProcessExecutionEngine()
             // Physical PC 表示。
             commitCurrentLine();
 
-            if (!preparedResolverBypassed &&
+            if (!ordinaryReadAheadSelected &&
+                !preparedResolverBypassed &&
                 preparedEquivalenceDispatchBound)
             {
                 CompletePreparedHeadEquivalence(
@@ -4540,10 +4805,120 @@ void NCManager::ProcessExecutionEngine()
                     submission.immediateRejectReason ==
                     MotionRejectReason::NONE;
             }
-            m_ordinaryG00AdmissionShadow.ObserveLegacyCommit(
-                preparedCutoverContext,
-                m_preparedHeadResolverBypassGate.GetSnapshot(),
-                ordinaryAdmissionEvidence);
+            if (!ordinaryReadAheadSelected)
+            {
+                m_ordinaryG00AdmissionShadow.ObserveLegacyCommit(
+                    preparedCutoverContext,
+                    m_preparedHeadResolverBypassGate.GetSnapshot(),
+                    ordinaryAdmissionEvidence);
+            }
+
+            // NC-0.2K.7.1: a selected ordinary G00 is already accepted by
+            // Motion at this point.  Registration and local Commit proof are
+            // therefore mandatory; any mismatch is contained immediately by
+            // AL3021 plus the existing RT emergency-stop request path.
+            if (ordinaryReadAheadSelected)
+            {
+                NCOrdinaryG00InflightRegistrationEvidence
+                    readAheadInflightEvidence{};
+                readAheadInflightEvidence.dispatchId =
+                    ordinaryAdmissionEvidence.dispatchId;
+                readAheadInflightEvidence.commitSequence =
+                    ordinaryAdmissionEvidence.commitSequence;
+                readAheadInflightEvidence.currentExecutionEpoch =
+                    ordinaryAdmissionEvidence.currentExecutionEpoch;
+                readAheadInflightEvidence.segmentExecutionEpoch =
+                    ordinaryAdmissionEvidence.segmentExecutionEpoch;
+                readAheadInflightEvidence.segmentId =
+                    ordinaryAdmissionEvidence.segmentId;
+                readAheadInflightEvidence.submissionCount =
+                    ordinaryAdmissionEvidence.submissionCount;
+                readAheadInflightEvidence.submissionIdentity =
+                    ordinaryAdmissionEvidence.submissionIdentity;
+                readAheadInflightEvidence.commandPathMode =
+                    ordinaryAdmissionEvidence.commandPathMode;
+                readAheadInflightEvidence.queueTailReceipt =
+                    ordinaryAdmissionEvidence.queueTailReceipt;
+                readAheadInflightEvidence.captureOverflow =
+                    ordinaryAdmissionEvidence.captureOverflow;
+                readAheadInflightEvidence.producerAccepted =
+                    ordinaryAdmissionEvidence.producerAccepted;
+                readAheadInflightEvidence.immediateRejectNone =
+                    ordinaryAdmissionEvidence.immediateRejectNone;
+                readAheadInflightEvidence.waitCallbackActive =
+                    ordinaryAdmissionEvidence.waitCallbackActive;
+                readAheadInflightEvidence.commitSucceeded =
+                    ordinaryAdmissionEvidence.commitSucceeded;
+
+                readAheadInflightEvidence.ledgerFound =
+                    resolverBypassCommitLedgerFound;
+                readAheadInflightEvidence.ledgerDispatchId =
+                    resolverBypassCommitLedger.dispatchId;
+                readAheadInflightEvidence.ledgerCommitSequence =
+                    resolverBypassCommitLedger.programCommit.sequence;
+                readAheadInflightEvidence.ledgerScope =
+                    resolverBypassCommitLedger.programCommit.scope;
+                readAheadInflightEvidence.ledgerCacheGeneration =
+                    resolverBypassCommitLedger.
+                    programCommit.cacheGeneration;
+                readAheadInflightEvidence.ledgerFrameId =
+                    resolverBypassCommitLedger.programCommit.frameId;
+                readAheadInflightEvidence.ledgerSourcePC =
+                    resolverBypassCommitLedger.programCommit.sourcePC;
+                readAheadInflightEvidence.ledgerSourceLineNumber =
+                    resolverBypassCommitLedger.sourceLineNumber;
+                readAheadInflightEvidence.ledgerProgramCommitted =
+                    resolverBypassCommitLedger.programCommitted;
+                readAheadInflightEvidence.ledgerCaptureOverflow =
+                    resolverBypassCommitLedger.motionCaptureOverflow;
+                readAheadInflightEvidence.ledgerMotionSegmentCount =
+                    resolverBypassCommitLedger.motionSegmentCount;
+                if (resolverBypassCommitLedgerFound &&
+                    resolverBypassCommitLedger.motionSegmentCount == 1U)
+                {
+                    const NCBlockMotionSegmentSnapshot& ledgerSegment =
+                        resolverBypassCommitLedger.motionSegments[0U];
+                    readAheadInflightEvidence.ledgerIdentity =
+                        ledgerSegment.identity;
+                    readAheadInflightEvidence.ledgerProducerAccepted =
+                        ledgerSegment.producerAccepted;
+                    readAheadInflightEvidence.
+                        ledgerImmediateRejectReason =
+                        ledgerSegment.immediateRejectReason;
+                }
+
+                NCOrdinaryG00InflightRegistrationProof
+                    readAheadInflightProof{};
+                const bool readAheadRegistered =
+                    m_ordinaryG00InflightRegistryShadow.
+                    TryRegisterReadAhead(
+                        preparedCutoverContext,
+                        readAheadInflightEvidence,
+                        readAheadInflightProof);
+                const bool readAheadCommitValid =
+                    readAheadRegistered &&
+                    m_ordinaryG00ReadAheadCutoverGate.ObserveCommit(
+                        preparedCutoverContext,
+                        readAheadInflightEvidence,
+                        readAheadInflightProof);
+                if (!readAheadCommitValid)
+                {
+                    m_ordinaryG00ReadAheadCutoverGate.
+                        ObserveRuntimeFailure(dispatchId);
+                    m_ordinaryG00InflightRegistryShadow.
+                        ObserveRuntimeFailure(dispatchId);
+                    m_blockLifecycleLedger.MarkNCDispatchFailed(
+                        dispatchId,
+                        static_cast<std::uint32_t>(
+                            AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY));
+                    AlarmManager::GetInstance().Trigger(
+                        AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY,
+                        sourceLineNumber);
+                    m_motion.RequestEmergencyStopAllAxes();
+                    m_state = NCState::ALARM;
+                    return;
+                }
+            }
 
             // Stage NC-0.2K.6.3: after K.6.1/K.6.2 have independently bound
             // this exact ordinary G00 Commit, register its one already-
@@ -4552,7 +4927,8 @@ void NCManager::ProcessExecutionEngine()
             // can change the accepted callback/PC/Motion path.
             const NCOrdinaryG00AdmissionSnapshot admissionAfterCommit =
                 m_ordinaryG00AdmissionShadow.GetSnapshot();
-            if (admissionAfterCommit.pending &&
+            if (!ordinaryReadAheadSelected &&
+                admissionAfterCommit.pending &&
                 admissionAfterCommit.legacyCommitBound &&
                 !admissionAfterCommit.inflightRegistryProven &&
                 admissionAfterCommit.dispatchId == dispatchId)
@@ -6751,6 +7127,7 @@ void NCManager::ObservePreparedBlockQueueShadow(
         m_preparedHeadPreResolveAdmissionShadow.ObserveQueueInactive(reason);
         m_preparedHeadResolverBypassGate.ObserveQueueInactive(reason);
         m_ordinaryG00AdmissionShadow.ObserveQueueInactive(reason);
+        m_ordinaryG00ReadAheadCutoverGate.ObserveQueueInactive(reason);
         m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(reason);
         return;
     }
@@ -6794,6 +7171,8 @@ void NCManager::ObservePreparedBlockQueueShadow(
         m_preparedHeadResolverBypassGate.ObserveQueueInactive(
             NCPreparedInvalidationReason::IDENTITY_INVALID);
         m_ordinaryG00AdmissionShadow.ObserveQueueInactive(
+            NCPreparedInvalidationReason::IDENTITY_INVALID);
+        m_ordinaryG00ReadAheadCutoverGate.ObserveQueueInactive(
             NCPreparedInvalidationReason::IDENTITY_INVALID);
         m_ordinaryG00InflightRegistryShadow.ObserveQueueInactive(
             NCPreparedInvalidationReason::IDENTITY_INVALID);
@@ -7835,6 +8214,8 @@ void NCManager::BeginFeedHoldBoundaryShadow(
     m_feedHoldBoundaryShadow.BeginRequest(
         source,
         BuildFeedHoldBoundarySample());
+
+    BeginOrdinaryG00FeedHoldCohortShadow();
 }
 
 void NCManager::ObserveFeedHoldBoundaryShadow() noexcept
@@ -7869,6 +8250,7 @@ void NCManager::ObserveFeedHoldBoundaryShadow() noexcept
         // data independently and therefore cannot disagree with the ACK
         // observer about Request identity or stop completion.
         m_feedHoldResumeGate.ObserveBoundary(snapshot);
+        ObserveOrdinaryG00FeedHoldCohortBoundary();
         return;
     }
 
@@ -7876,24 +8258,28 @@ void NCManager::ObserveFeedHoldBoundaryShadow() noexcept
     // RESUMED Boundary snapshot even after the observer itself became inactive.
     m_feedHoldResumeGate.ObserveBoundary(
         m_feedHoldBoundaryShadow.GetSnapshot());
+    ObserveOrdinaryG00FeedHoldCohortBoundary();
 }
 
 void NCManager::ObserveFeedHoldLegacyHoldShadow() noexcept
 {
     m_feedHoldBoundaryShadow.ObserveLegacyHoldEntered(
         BuildFeedHoldBoundarySample());
+    ObserveOrdinaryG00FeedHoldCohortBoundary();
 }
 
 void NCManager::ObserveFeedHoldResumeRequestedShadow() noexcept
 {
     m_feedHoldBoundaryShadow.ObserveResumeRequested(
         BuildFeedHoldBoundarySample());
+    ObserveOrdinaryG00FeedHoldCohortBoundary();
 }
 
 void NCManager::ObserveFeedHoldResumeAppliedShadow() noexcept
 {
     m_feedHoldBoundaryShadow.ObserveResumeApplied(
         BuildFeedHoldBoundarySample());
+    ObserveOrdinaryG00FeedHoldCohortBoundary();
 }
 
 void NCManager::CancelFeedHoldBoundaryShadow(
@@ -7901,8 +8287,72 @@ void NCManager::CancelFeedHoldBoundaryShadow(
 {
     m_feedHoldBoundaryShadow.Cancel(superseded);
     m_feedHoldResumeGate.Cancel(superseded);
+    m_ordinaryG00FeedHoldCohortShadow.Cancel(superseded);
+    ObserveOrdinaryG00FeedHoldCohortCutover();
     ClearHoldResumeAlarmAdmission(
         HoldResumeAdmissionKind::PROGRAM_HOLD);
+}
+
+void NCManager::BeginOrdinaryG00FeedHoldCohortShadow() noexcept
+{
+    NCOrdinaryG00FeedHoldCohortShadow::CandidateArray candidates{};
+    std::size_t candidateCount = 0U;
+    for (std::size_t slot = 0U;
+        slot < NC_ORDINARY_G00_INFLIGHT_REGISTRY_CAPACITY;
+        ++slot)
+    {
+        NCOrdinaryG00InflightEntrySnapshot entry{};
+        if (!m_ordinaryG00InflightRegistryShadow.TryGetEntry(slot, entry) ||
+            !entry.active)
+        {
+            continue;
+        }
+        if (candidateCount < candidates.size())
+        {
+            candidates[candidateCount] = entry;
+        }
+        ++candidateCount;
+    }
+
+    // The Registry snapshot remains the authoritative active-count proof.
+    // A scan/count disagreement therefore enters K.7.3's diagnostic failure
+    // path without changing any existing Runtime state.
+    m_ordinaryG00FeedHoldCohortShadow.Begin(
+        m_feedHoldBoundaryShadow.GetSnapshot(),
+        m_ordinaryG00InflightRegistryShadow.GetSnapshot(),
+        candidates);
+    ObserveOrdinaryG00FeedHoldCohortCutover();
+}
+
+void NCManager::ObserveOrdinaryG00FeedHoldCohortBoundary() noexcept
+{
+    m_ordinaryG00FeedHoldCohortShadow.ObserveBoundary(
+        m_feedHoldBoundaryShadow.GetSnapshot(),
+        m_feedHoldResumeGate.GetSnapshot(),
+        m_ordinaryG00InflightRegistryShadow.GetSnapshot());
+    ObserveOrdinaryG00FeedHoldCohortCutover();
+}
+
+void NCManager::ObserveOrdinaryG00FeedHoldCohortCutover() noexcept
+{
+    m_ordinaryG00FeedHoldCohortCutoverGate.Observe(
+        m_ordinaryG00FeedHoldCohortShadow.GetSnapshot(),
+        m_ordinaryG00InflightRegistryShadow.GetSnapshot());
+
+    // NC-0.2K.7.5 is a diagnostic-only consumer of the already-published
+    // K.7.3/K.7.4 evidence.  Its result never enters admission or Motion.
+    m_ordinaryG00FeedHoldCohortRearmShadow.Observe(
+        m_ordinaryG00FeedHoldCohortShadow.GetSnapshot(),
+        m_ordinaryG00FeedHoldCohortCutoverGate.GetSnapshot(),
+        m_ordinaryG00InflightRegistryShadow.GetSnapshot());
+
+    // NC-0.2K.7.6 is the reversible controlled consumer of K.7.5.  It may
+    // influence only the ordinary G00 admission seam above; it never writes
+    // Motion, PDO, NC state, PC, callback, Epoch or owner state.
+    m_ordinaryG00FeedHoldCohortRearmCutoverGate.Observe(
+        m_ordinaryG00FeedHoldCohortRearmShadow.GetSnapshot(),
+        m_ordinaryG00FeedHoldCohortCutoverGate.GetSnapshot(),
+        m_ordinaryG00InflightRegistryShadow.GetSnapshot());
 }
 
 // =============================================================================

@@ -1,6 +1,48 @@
 #pragma once
 #include <windows.h>
 
+// =============================================================
+// DC-RX.3F - deterministic test-only fault injection
+//
+// Startup reads D:\EtherCAT_Master_Data\DC_FaultInjection.txt once,
+// validates an explicit arm token, and publishes this immutable config before
+// the real PDO timer is created. Runtime executes at most one scenario per
+// RTOS process. The normal production path remains OFF by default.
+// =============================================================
+
+enum class DcRx3fFaultScenario : LONG
+{
+    Off = 0,
+    DcWkcDrop = 1,
+    LrwWkcDrop = 2,
+    ExactTimingMissing = 3,
+    LateRtt = 4,
+    DcTimestampRepeat = 5,
+    DcTimestampBackward = 6,
+    PhaseMapJump = 7,
+    SchedulerRecovery = 8,
+    LrwTimeout = 9
+};
+
+enum class DcRx3fFaultState : LONG
+{
+    Off = 0,
+    WaitGate = 1,
+    Delay = 2,
+    Inject = 3,
+    Recovery = 4,
+    Pass = 5,
+    Fail = 6
+};
+
+extern volatile LONG g_dcRx3fConfigReady;
+extern volatile LONG g_dcRx3fConfiguredScenario;
+extern volatile LONG g_dcRx3fConfiguredCycles;
+extern volatile LONG g_dcRx3fConfiguredStartDelayCycles;
+extern volatile LONGLONG g_dcRx3fConfiguredValueNs;
+extern volatile LONG g_dcRx3fConfiguredRequireServoOff;
+extern volatile LONG g_dcRx3fConfiguredAllowSafetyStop;
+
 /*
  * 檔案：EtherCatMaster_DC_Internal.h
  * 版本：EtherCAT DC Release Candidate RC1.8
@@ -199,6 +241,288 @@ g_pdoRtLrwWkc;
 extern volatile LONG
 g_pdoRtDcWkc;
 
+// DC-RX.3A - decoupled Process Data / DC transport quality snapshot
+extern volatile LONG
+g_pdoRtDcReferencePresent;
+
+extern volatile LONG
+g_pdoRtProcessDataValid;
+
+extern volatile LONG
+g_pdoRtDcTransportValid;
+
+extern volatile LONG
+g_pdoRtProcessInvalidStreak;
+
+extern volatile LONG
+g_pdoRtDcTransportInvalidStreak;
+
+extern volatile LONG
+g_pdoRtDcTransportInvalidMaxStreak;
+
+extern volatile LONGLONG
+g_pdoRtDcWkcInvalidTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcOnlyInvalidTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcTransportRecoveryTotal;
+
+// DC-RX.3B bounded DC-only holdover / graded requalification snapshot
+extern volatile LONG
+g_pdoRtDcOnlyInvalidStreak;
+
+extern volatile LONG
+g_pdoRtDcOnlyInvalidMaxStreak;
+
+extern volatile LONG
+g_pdoRtDcHoldoverTier;
+
+extern volatile LONG
+g_pdoRtDcHoldoverCurrentCycles;
+
+extern volatile LONG
+g_pdoRtDcHoldoverMaxCycles;
+
+extern volatile LONG
+g_pdoRtDcGlitchDebt;
+
+extern volatile LONG
+g_pdoRtDcGlitchDebtMax;
+
+extern volatile LONG
+g_pdoRtDcGlitchDebtLimit;
+
+extern volatile LONGLONG
+g_pdoRtDcGraceAcceptedCyclesTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcHoldoverEpisodeTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcHoldoverEntryTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcDegradedEntryTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcRelockEntryTotal;
+
+// DC-RX.3C sample freshness / stale-frame / phase-jump guard snapshot
+extern volatile LONG
+g_pdoRtDcSampleGuardState;
+
+extern volatile LONG
+g_pdoRtDcSampleQualified;
+
+extern volatile LONG
+g_pdoRtDcSampleGuardReasonMask;
+
+extern volatile LONG
+g_pdoRtDcSampleRejectStreak;
+
+extern volatile LONG
+g_pdoRtDcSampleRejectMaxStreak;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleApproxAgeNs;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleApproxAgeMaxNs;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleQpcDeltaNs;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleDcDeltaNs;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleDeltaErrorNs;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleDeltaToleranceNs;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleAcceptedTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleRejectedTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleAnchorTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleReanchorTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleAgeRejectTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleOrderRejectTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleDeltaRejectTotal;
+
+extern volatile LONG
+g_pdoRtDcPhaseJumpGuardActive;
+
+extern volatile LONG
+g_pdoRtDcPhaseJumpGuardGoodWindows;
+
+extern volatile LONG
+g_pdoRtDcPhaseJumpGuardRequiredWindows;
+
+extern volatile LONGLONG
+g_pdoRtDcPhaseJumpLastNs;
+
+extern volatile LONGLONG
+g_pdoRtDcPhaseJumpMaxAbsNs;
+
+extern volatile LONGLONG
+g_pdoRtDcPhaseJumpArmTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcPhaseJumpPassTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcPhaseJumpRejectTotal;
+
+extern volatile LONG
+g_pdoRtDcPhaseMapSequence;
+
+extern volatile LONG
+g_pdoRtDcPhaseMapNew;
+
+extern volatile LONG
+g_pdoRtDcPhaseMapAgeGood;
+
+extern volatile LONGLONG
+g_pdoRtDcPhaseMapAgeNs;
+
+extern volatile LONGLONG
+g_pdoRtDcPhaseMapStaleTotal;
+
+// DC-RX.3D exact TX/RX software timing anchor snapshot
+extern volatile LONG
+g_pdoRtDcTimingSource;
+
+extern volatile LONG
+g_pdoRtDcExactTimingLocked;
+
+extern volatile LONG
+g_pdoRtDcExactTimingValid;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingSelectedRttNs;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingExactRttNs;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingExactRttMaxNs;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingCallRttNs;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingExcludedOverheadNs;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingMidpointShiftNs;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingMidpointShiftMaxAbsNs;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingExactUseTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingFallbackUseTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingMissingAfterLockTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingSourceSwitchTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcTimingRejectTotal;
+
+// DC-RX.3E adaptive exact-RTT envelope / late-sample guard snapshot
+extern volatile LONG
+g_pdoRtDcRttGuardState;
+
+extern volatile LONG
+g_pdoRtDcRttGuardAccepted;
+
+extern volatile LONG
+g_pdoRtDcRttGuardWarmupSamples;
+
+extern volatile LONG
+g_pdoRtDcRttGuardWarmupRequired;
+
+extern volatile LONGLONG
+g_pdoRtDcRttGuardCurrentNs;
+
+extern volatile LONGLONG
+g_pdoRtDcRttGuardBaselineNs;
+
+extern volatile LONGLONG
+g_pdoRtDcRttGuardDeviationNs;
+
+extern volatile LONGLONG
+g_pdoRtDcRttGuardLimitNs;
+
+extern volatile LONGLONG
+g_pdoRtDcRttGuardExcessNs;
+
+extern volatile LONG
+g_pdoRtDcRttGuardOutlierStreak;
+
+extern volatile LONG
+g_pdoRtDcRttGuardOutlierMaxStreak;
+
+extern volatile LONG
+g_pdoRtDcRttGuardRebaseCandidateSamples;
+
+extern volatile LONGLONG
+g_pdoRtDcRttGuardAcceptedTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcRttGuardRejectedTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcRttGuardRebaseTotal;
+
+extern volatile LONGLONG
+g_pdoRtDcSampleRttRejectTotal;
+
+// DC-RX.3F deterministic fault-injection runtime snapshot.
+// These fields are diagnostic-only and remain inside the existing internal
+// g_pdoRtDiagSequence seqlock; SHM/API layout is unchanged.
+extern volatile LONG g_pdoRtDcFaultState;
+extern volatile LONG g_pdoRtDcFaultScenario;
+extern volatile LONG g_pdoRtDcFaultConfiguredCycles;
+extern volatile LONG g_pdoRtDcFaultAppliedCycles;
+extern volatile LONG g_pdoRtDcFaultStartDelayRemaining;
+extern volatile LONG g_pdoRtDcFaultRecoveryCycles;
+extern volatile LONG g_pdoRtDcFaultTargetWaitCycles;
+extern volatile LONG g_pdoRtDcFaultActiveThisCycle;
+extern volatile LONG g_pdoRtDcFaultGateBlockMask;
+extern volatile LONG g_pdoRtDcFaultEvidenceMask;
+extern volatile LONG g_pdoRtDcFaultFailureMask;
+extern volatile LONG g_pdoRtDcFaultRequireServoOff;
+extern volatile LONG g_pdoRtDcFaultAllowSafetyStop;
+extern volatile LONGLONG g_pdoRtDcFaultValueNs;
+extern volatile LONGLONG g_pdoRtDcFaultBaselineAppliedPpb;
+extern volatile LONGLONG g_pdoRtDcFaultCurrentAppliedPpb;
+extern volatile LONGLONG g_pdoRtDcFaultMaxAppliedDeltaPpb;
+extern volatile LONG g_pdoRtDcFaultMaxPdoInvalidStreak;
+extern volatile LONGLONG g_pdoRtDcFaultStartTick;
+extern volatile LONGLONG g_pdoRtDcFaultLastAppliedTick;
+extern volatile LONGLONG g_pdoRtDcFaultEndTick;
+
 // =============================================================
 // PDO Fine Scheduler Timing Diagnostic Snapshot
 // =============================================================
@@ -278,7 +602,9 @@ g_ecatSendQpcValid;
 // CurrentConsecutiveTimeout：目前連續 Hard Timeout 次數。
 // RecoveryAfterTimeout：Timeout 後重新收到有效封包的次數。
 // TimeoutPreReceive：呼叫 ReceivePacket() 前已超過 Hard Deadline。
-// TimeoutSleep0/1/2：Timeout 發生前完成的 coarse sleep 次數。
+// TimeoutSleep0/1/2：既有 ABI 名稱；DC-RX.2 起表示 Timeout 前完成的 wait slice 數。
+// SleepCount：既有 ABI 名稱；DC-RX.2 起表示總 coarse wait slice 數。
+// EventWait*：NAL RX event 等待、喚醒、timeout、fallback 與耗時統計。
 // ReceiveCallMaxNs：單次 ReceivePacket() 的最大執行時間。
 // TimeoutReceiveCallMaxNs：直接造成 Hard Timeout 的 ReceivePacket() 最大時間。
 // =============================================================
@@ -310,6 +636,17 @@ extern volatile LONG g_ecatRxDiagTimeoutAttemptAvg;
 extern volatile LONG g_ecatRxDiagTimeoutAttemptMax;
 extern volatile LONGLONG g_ecatRxDiagReceiveCallMaxNs;
 extern volatile LONGLONG g_ecatRxDiagTimeoutReceiveCallMaxNs;
+extern volatile LONG g_ecatRxDiagWaitMode;
+extern volatile LONG g_ecatRxDiagEventWaitCalls;
+extern volatile LONG g_ecatRxDiagEventSignaled;
+extern volatile LONG g_ecatRxDiagEventTimeout;
+extern volatile LONG g_ecatRxDiagEventFailed;
+extern volatile LONG g_ecatRxDiagEventStopped;
+extern volatile LONG g_ecatRxDiagEventFallbackSleep;
+extern volatile LONG g_ecatRxDiagEventWaitValid;
+extern volatile LONGLONG g_ecatRxDiagEventWaitAvgNs;
+extern volatile LONGLONG g_ecatRxDiagEventWaitMaxNs;
+extern volatile LONG g_ecatRxDiagEventLastError;
 extern volatile LONG g_ecatRxDiagSoftDeadlineNs;
 extern volatile LONG g_ecatRxDiagHardDeadlineNs;
 
@@ -613,6 +950,9 @@ g_qpcLiveFfSamples;
 
 extern volatile LONG
 g_qpcLiveFfDcPhaseDiagSequence;
+
+extern volatile LONGLONG
+g_qpcLiveFfDcPhaseLastSampleQpc;
 
 extern volatile LONG
 g_qpcLiveFfDcPhaseInitialized;
@@ -1119,6 +1459,10 @@ extern volatile LONG g_qpcRealFfV0Seq;
 extern volatile LONG g_qpcRealFfV0State;
 extern volatile LONG g_qpcRealFfV0PhaseGood;
 extern volatile LONG g_qpcRealFfV0ArmGood;
+extern volatile LONG g_qpcRealFfV0HoldMask;
+extern volatile LONG g_qpcRealFfV0HistoryMask;
+extern volatile LONG g_qpcRealFfV0CleanCycles;
+extern volatile LONG g_qpcRealFfV0CleanCyclesRequired;
 extern volatile LONG g_qpcRealFfV0TripMask;
 extern volatile LONG g_qpcRealFfV0TripCount;
 extern volatile LONGLONG g_qpcRealFfV0RecommendedPpb;
@@ -1134,6 +1478,8 @@ extern volatile LONG g_qpcRealFfV0HoldGood;
 extern volatile LONG g_qpcRealFfV0HoldBad;
 extern volatile LONG g_qpcRealFfV0HoldEntries;
 extern volatile LONG g_qpcRealFfV0ClampActive;
+extern volatile LONG g_qpcRealFfV0RecoveryProfile;
+extern volatile LONG g_qpcRealFfV0HoldRecoveryWindowsRequired;
 
 extern volatile LONG g_qpcRealFfClampSelfTestSeq;
 extern volatile LONG g_qpcRealFfClampSelfTestPass;

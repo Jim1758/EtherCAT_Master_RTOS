@@ -7,6 +7,7 @@
 #include "EtherCatDcQualificationDiagContract.h"
 #include "EtherCatDcV1aDiagContract.h"
 #include "EtherCatRxCorrelationDiagContract.h"
+#include "EtherCatRxForensicsDiagContract.h"
 #include <string>
 
 // RTX64 API
@@ -88,6 +89,9 @@ GetEtherCatDcV1aDiagSharedMemoryData();
 
 SHM_ECAT_RxCorrDiagData*
 GetEtherCatRxCorrelationDiagSharedMemoryData();
+
+SHM_ECAT_RxForensicsData*
+GetEtherCatRxForensicsSharedMemoryData();
 
 
 class SHMManager

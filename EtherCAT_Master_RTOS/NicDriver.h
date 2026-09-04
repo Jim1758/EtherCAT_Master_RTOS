@@ -2,7 +2,7 @@
 
 /*
  * 檔案：NicDriver.h
- * 版本：EtherCAT DC Release Candidate RC1
+ * 版本：EtherCAT DC-RX.2 Event-Aware Bounded Receive
  *
  * 功能：
  * 1. 封裝 RTX64 NAL 的 TX/RX Queue。
@@ -28,12 +28,24 @@
 #include <RtNalApi.h>
 #include <tchar.h>
 #include <string.h>
+#include "EtherCatRxForensics.h"
 
  // RTX64 NAL 設定的最大 Ethernet Frame 大小。
 #define MAX_ETHER_FRAME_SIZE 1514
 
 // RX 暫存空間額外保留 4 bytes，接收後仍會限制複製長度為 1514 bytes。
 #define MAX_ETHER_RX_BUFFER_SIZE 1518
+
+// RX notification wait 的結果。
+// Signaled/Timeout 是正常路徑；Unavailable/Failed 由上層自動退回既有 sleep。
+enum class NicRxWaitResult : unsigned int
+{
+    Unavailable = 0,
+    Signaled = 1,
+    Timeout = 2,
+    Stopped = 3,
+    Failed = 4
+};
 
 class CNicDriver
 {
@@ -56,6 +68,21 @@ public:
 
     // 嘗試取得一個 RX Frame。無資料或接收失敗時回傳 0。
     unsigned int ReceivePacket(unsigned char* pBuffer);
+
+    // 使用 RtNalAcquireQueue() 回傳的 RX/Stop notification events 做有界等待。
+    // timeout100ns 單位為 100 ns；本函式不接收或搬移封包，只等待通知。
+    NicRxWaitResult WaitForReceiveNotification(
+        ULONGLONG timeout100ns,
+        DWORD* pLastError);
+
+    // RX event 可用時回傳 true；不可用時上層維持舊版 bounded sleep。
+    bool IsReceiveNotificationAvailable() const;
+
+    // Copy the outcome of the most recent RtNalReceive() call.
+    // The same Priority-64 queue owner reads this immediately after
+    // ReceivePacket(); no second queue consumer or blocking lock is added.
+    bool GetLastReceiveCallDiagnostic(
+        NicRxCallDiagnostic* pDiagnostic) const;
 
     // 複製目前 RTX64 NIC 的實體 MAC Address。
     void GetMacAddress(unsigned char* pMac)
@@ -97,6 +124,10 @@ private:
     RTNAL_QUEUE_HANDLE m_hTxQueue;
     RTNAL_QUEUE_HANDLE m_hRxQueue;
 
+    // RtNalAcquireQueue() 建立的 notification handles。
+    // 事件由 RtNalReleaseQueue() 關閉，應用程式不可自行 CloseHandle。
+    RTNAL_QUEUE_EVENTS m_RxQueueEvents;
+
     // zero-copy TX Frame；ownership 可能在 Application 與 NAL 之間切換。
     PRTNAL_FRAME m_pTxFrame;
     PRTNAL_FRAME m_pTxFrameArray[1];
@@ -106,6 +137,16 @@ private:
 
     // STANDARD_BUFFER_V2 的固定 RX 緩衝區。
     RxPacket m_RxPacket;
+
+    // DC-RX.4A per-call NAL outcome, owned by the EtherCAT RX thread.
+    uint64_t m_RxCallCounter;
+    NicRxCallDiagnostic m_LastRxCallDiagnostic;
+
+    void PublishReceiveCallDiagnostic(
+        NicRxCallOutcome outcome,
+        BOOL nalCallSucceeded,
+        DWORD lastError,
+        ULONG length);
 };
 
 // -----------------------------------------------------------------------------

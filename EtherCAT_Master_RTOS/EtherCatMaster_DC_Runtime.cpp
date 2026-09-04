@@ -1,7 +1,11 @@
 ﻿#include "EtherCatMaster.h"
+#include "EtherCatMaster_DC_Internal.h"
 #include "EtherCatMaster_DC_Topology.h"
 #include "EtherCatMaster_DC_Tuning.h"
 #include "EtherCatPdoRuntimeInvalidCorrelation.h"
+#include "EtherCatPdoSafetyStopDebounce.h"
+#include "EtherCatRxForensics.h"
+#include "EtherCatP64DeferredDiagnostics.h"
 #include "AlarmManager.h"
 #include <windows.h> 
 #include <rtapi.h> 
@@ -14,6 +18,14 @@
 #include "PLCManager.h" // 🌟 1. 記得 include PLCManager 標頭檔
 #define MAX_MBX_SIZE 1024
 
+#if defined(_MSC_VER)
+#define OSCARMAX_P64_DIAG_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define OSCARMAX_P64_DIAG_NOINLINE __attribute__((noinline))
+#else
+#define OSCARMAX_P64_DIAG_NOINLINE
+#endif
+
 // ============================================================================
 // EtherCatMaster_DC_Runtime.cpp
 // EtherCAT DC 即時循環正式版候選 RC1.8（冷／溫機 Drift 自動捕獲版）
@@ -22,7 +34,7 @@
 //   1. 執行 4 kHz／250 us PDO 即時循環。
 //   2. 用 LRW + FRMW 在同一個 Ethernet frame 交換 PDO，並擷取所選 Reference DC 時間。
 //   3. 維護 QPC <-> DC Reference 對映、漂移觀測器、Real FF 與 Phase-P 控制器。
-//   4. 在 EtherCAT 通訊有效時更新 PLC Input、Motion 與非同步命令。
+//   4. LRW Process Data 有效時更新 PLC/Motion；DC sample 另由獨立品質閘門控制。
 //   5. 只把統計結果發布到 snapshot，實際文字輸出交給 Priority 50 主執行緒。
 //
 // 執行緒與資料所有權：
@@ -173,7 +185,7 @@ namespace
         EtherCatMaster* pMaster,
         int currentLrwWkc,
         int currentDcWkc,
-        bool pdoCycleValid)
+        bool processDataValid)
     {
         if (pMaster == nullptr)
         {
@@ -207,13 +219,13 @@ namespace
         MemoryBarrier();
 
         g_ecatDiagRtShadow.ProcessImageBytes = imageBytes;
-        g_ecatDiagRtShadow.ProcessImageValid = pdoCycleValid ? 1u : 0u;
+        g_ecatDiagRtShadow.ProcessImageValid = processDataValid ? 1u : 0u;
         g_ecatDiagRtShadow.ActualLrwWkc = static_cast<int32_t>(currentLrwWkc);
         g_ecatDiagRtShadow.DcWkc = static_cast<int32_t>(currentDcWkc);
         g_ecatDiagRtShadow.SourcePdoTick = pMaster->tickCount_PDO;
         g_ecatDiagRtShadow.CaptureAttempts++;
 
-        if (pdoCycleValid &&
+        if (processDataValid &&
             pMaster->m_IoMap != nullptr &&
             imageBytes > 0u)
         {
@@ -264,6 +276,90 @@ namespace
         InterlockedIncrement(&g_ecatDiagRtShadow.Sequence);
         // Even Sequence means one complete snapshot is available.
     }
+}
+
+// ============================================================================
+// DC-DIAG.2 - Priority-64 numeric diagnostic handoff
+// ============================================================================
+//
+// The fixed PDO callback never formats text. Its single writer publishes one
+// small latest-event snapshot; Priority 50 notices EventSerial changes and
+// performs the optional RtPrintf work. Multiple events before one P50 read may
+// collapse to the newest event, and the serial gap makes that condition visible.
+// ============================================================================
+namespace
+{
+    struct EtherCatP64DeferredDiagSlot
+    {
+        volatile LONG Sequence = 0;
+        EtherCatP64DeferredDiagSnapshot Snapshot{};
+    };
+
+    static_assert(
+        sizeof(EtherCatP64DeferredDiagSnapshot) <= 96u,
+        "Priority-64 deferred diagnostic snapshot must remain small.");
+
+    EtherCatP64DeferredDiagSlot g_p64DeferredDiagSlot{};
+    uint64_t g_p64DeferredDiagNextSerial = 0ULL;
+
+    OSCARMAX_P64_DIAG_NOINLINE void PublishP64DeferredDiagnostic(
+        EtherCatP64DeferredDiagKind kind,
+        uint64_t pdoTick,
+        int64_t value0,
+        int64_t value1,
+        int64_t value2,
+        int64_t value3,
+        int64_t value4,
+        int64_t value5,
+        int64_t value6,
+        int64_t value7) noexcept
+    {
+        EtherCatP64DeferredDiagSnapshot& snapshot =
+            g_p64DeferredDiagSlot.Snapshot;
+
+        InterlockedIncrement(&g_p64DeferredDiagSlot.Sequence);
+        MemoryBarrier();
+
+        snapshot.EventSerial = ++g_p64DeferredDiagNextSerial;
+        snapshot.PdoTick = pdoTick;
+        snapshot.Kind = static_cast<uint32_t>(kind);
+        snapshot.Reserved = 0u;
+        snapshot.Value0 = value0;
+        snapshot.Value1 = value1;
+        snapshot.Value2 = value2;
+        snapshot.Value3 = value3;
+        snapshot.Value4 = value4;
+        snapshot.Value5 = value5;
+        snapshot.Value6 = value6;
+        snapshot.Value7 = value7;
+
+        MemoryBarrier();
+        InterlockedIncrement(&g_p64DeferredDiagSlot.Sequence);
+    }
+}
+
+OSCARMAX_P64_DIAG_NOINLINE bool TryReadEtherCatP64DeferredDiagnostic(
+    EtherCatP64DeferredDiagSnapshot& snapshot) noexcept
+{
+    const LONG sequenceBefore =
+        g_p64DeferredDiagSlot.Sequence;
+
+    if (sequenceBefore == 0L ||
+        (sequenceBefore & 1L) != 0L)
+    {
+        return false;
+    }
+
+    MemoryBarrier();
+    snapshot = g_p64DeferredDiagSlot.Snapshot;
+    MemoryBarrier();
+
+    const LONG sequenceAfter =
+        g_p64DeferredDiagSlot.Sequence;
+
+    return
+        sequenceBefore == sequenceAfter &&
+        (sequenceAfter & 1L) == 0L;
 }
 
 // ============================================================================
@@ -403,7 +499,7 @@ namespace
 
     void ObservePdoRuntimeInvalidCorrelation(
         std::uint64_t runtimeCycleTick,
-        bool pdoCycleValid,
+        bool processDataValid,
         std::int32_t actualLrwWkc,
         std::int32_t expectedLrwWkc,
         std::int32_t dcWkc,
@@ -415,7 +511,7 @@ namespace
     {
         if (!g_pdoInvalidCorrelationTracker.Observe(
             runtimeCycleTick,
-            pdoCycleValid,
+            processDataValid,
             actualLrwWkc,
             expectedLrwWkc,
             dcWkc,
@@ -1495,7 +1591,7 @@ namespace
     RuntimeSafeSdoStepDisposition ProcessRuntimeSafeSdoStep(
         EtherCatMaster* pMaster,
         uint64_t pdoCycleStartMasterNs,
-        bool pdoCycleValid,
+        bool processDataValid,
         int* terminalWkc)
     {
         if (terminalWkc != nullptr)
@@ -1557,7 +1653,7 @@ namespace
             return RuntimeSafeSdoStepDisposition::Error;
         }
 
-        if (!pdoCycleValid)
+        if (!processDataValid)
         {
             g_runtimeSafeSdo.stepsDeferredPdo++;
             PublishRuntimeSafeSdoDiagSnapshot();
@@ -2296,9 +2392,20 @@ extern "C" bool OSCARMAX_ECAT_SdoRtDiag_Read(
 //     OSCARMAX_FMMU_DIAG_RT_12E5A_20260826
 //     OSCARMAX_WATCHDOG_DIAG_RT_12E7A_20260827
 // ============================================================================
+
+// DC-RX.4A monotonic correlation serial. It changes only when a low-rate ESC
+// port/error-counter sample observes a raw counter change.
+__declspec(align(8)) volatile LONGLONG
+g_ecatRx4aEscPortChangeSerial = 0;
+
 namespace
 {
     constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES = 128u;
+
+    static_assert(
+        ETHERCAT_RX4A_ESC_MAX_SLAVES ==
+        OSCARMAX_ECAT_ESC_DIAG_MAX_SLAVES,
+        "DC-RX.4A slave-capacity mismatch");
     constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_MAX_SYNC_MANAGERS = 16u;
     constexpr uint32_t OSCARMAX_ECAT_ESC_DIAG_MAX_FMMUS = 16u;
     constexpr uint64_t OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES = 80ULL;
@@ -2367,6 +2474,9 @@ namespace
         uint32_t RxErrorCount = 0u;
         uint32_t LostLinkCount = 0u;
 
+        // DC-RX.4A raw per-port counters, baseline/delta and saturation state.
+        EtherCatEscPortErrorSnapshot Rx4aPortErrors{};
+
         // Stage 12E.7A - raw ESC Process Data Watchdog registers.
         uint16_t WatchdogDivider = 0u;           // 0x0400
         uint16_t WatchdogTimeProcessData = 0u;   // 0x0420
@@ -2407,6 +2517,229 @@ namespace
     };
 
     OSCARMAX_ECAT_EscDiagRtShadow g_ecatEscDiagRtShadow;
+
+    bool Rx4aPortArrayChanged(
+        const uint8_t* before,
+        const uint8_t* after)
+    {
+        for (uint32_t port = 0u;
+            port < ETHERCAT_RX4A_ESC_PORT_COUNT;
+            ++port)
+        {
+            if (before[port] != after[port])
+                return true;
+        }
+
+        return false;
+    }
+
+    bool Rx4aPortArrayDecreased(
+        const uint8_t* before,
+        const uint8_t* after)
+    {
+        for (uint32_t port = 0u;
+            port < ETHERCAT_RX4A_ESC_PORT_COUNT;
+            ++port)
+        {
+            if (after[port] < before[port])
+                return true;
+        }
+
+        return false;
+    }
+
+    void Rx4aCopyPortArray(
+        uint8_t* target,
+        const uint8_t* source)
+    {
+        for (uint32_t port = 0u;
+            port < ETHERCAT_RX4A_ESC_PORT_COUNT;
+            ++port)
+        {
+            target[port] = source[port];
+        }
+    }
+
+    uint32_t Rx4aBuildSaturationMask(
+        const uint8_t* values)
+    {
+        uint32_t mask = 0u;
+
+        for (uint32_t port = 0u;
+            port < ETHERCAT_RX4A_ESC_PORT_COUNT;
+            ++port)
+        {
+            if (values[port] == 0xFFu)
+            {
+                mask |= (1u << port);
+            }
+        }
+
+        return mask;
+    }
+
+    void Rx4aUpdateEscPortErrorSnapshot(
+        EtherCatEscPortErrorSnapshot& snapshot,
+        uint32_t slavePosition,
+        uint16_t configuredAddress,
+        uint64_t sampleTick,
+        const uint8_t* readBuffer)
+    {
+        uint8_t invalidFrame[ETHERCAT_RX4A_ESC_PORT_COUNT] = {};
+        uint8_t physicalRx[ETHERCAT_RX4A_ESC_PORT_COUNT] = {};
+        uint8_t forwardedRx[ETHERCAT_RX4A_ESC_PORT_COUNT] = {};
+        uint8_t lostLink[ETHERCAT_RX4A_ESC_PORT_COUNT] = {};
+
+        for (uint32_t port = 0u;
+            port < ETHERCAT_RX4A_ESC_PORT_COUNT;
+            ++port)
+        {
+            invalidFrame[port] = readBuffer[port * 2u];
+            physicalRx[port] = readBuffer[port * 2u + 1u];
+            forwardedRx[port] = readBuffer[8u + port];
+            lostLink[port] = readBuffer[16u + port];
+        }
+
+        const uint8_t ecatProcessingUnitError = readBuffer[12u];
+        const uint8_t pdiError = readBuffer[13u];
+
+        const bool firstSample = snapshot.Valid == 0u;
+        const bool rawChanged =
+            firstSample ||
+            Rx4aPortArrayChanged(snapshot.InvalidFrame, invalidFrame) ||
+            Rx4aPortArrayChanged(snapshot.PhysicalRxError, physicalRx) ||
+            Rx4aPortArrayChanged(snapshot.ForwardedRxError, forwardedRx) ||
+            Rx4aPortArrayChanged(snapshot.LostLink, lostLink) ||
+            snapshot.EcatProcessingUnitError != ecatProcessingUnitError ||
+            snapshot.PdiError != pdiError;
+
+        const bool rxGroupReset =
+            !firstSample &&
+            (Rx4aPortArrayDecreased(snapshot.InvalidFrame, invalidFrame) ||
+                Rx4aPortArrayDecreased(snapshot.PhysicalRxError, physicalRx) ||
+                Rx4aPortArrayDecreased(snapshot.ForwardedRxError, forwardedRx));
+
+        const bool ecatProcessingUnitReset =
+            !firstSample &&
+            ecatProcessingUnitError < snapshot.EcatProcessingUnitError;
+
+        const bool pdiReset =
+            !firstSample &&
+            pdiError < snapshot.PdiError;
+
+        const bool lostLinkGroupReset =
+            !firstSample &&
+            Rx4aPortArrayDecreased(snapshot.LostLink, lostLink);
+
+        snapshot.Valid = 1u;
+        snapshot.SlavePosition = slavePosition;
+        snapshot.ConfiguredAddress = configuredAddress;
+        snapshot.SampleTick = sampleTick;
+        snapshot.SampleCount++;
+
+        if (firstSample)
+        {
+            snapshot.BaselineValid = 1u;
+            snapshot.InitialBaselineTick = sampleTick;
+            snapshot.RxBaselineTick = sampleTick;
+            snapshot.EcatProcessingUnitBaselineTick = sampleTick;
+            snapshot.PdiBaselineTick = sampleTick;
+            snapshot.LostLinkBaselineTick = sampleTick;
+            Rx4aCopyPortArray(snapshot.BaselineInvalidFrame, invalidFrame);
+            Rx4aCopyPortArray(snapshot.BaselinePhysicalRxError, physicalRx);
+            Rx4aCopyPortArray(snapshot.BaselineForwardedRxError, forwardedRx);
+            Rx4aCopyPortArray(snapshot.BaselineLostLink, lostLink);
+            snapshot.BaselineEcatProcessingUnitError =
+                ecatProcessingUnitError;
+            snapshot.BaselinePdiError = pdiError;
+        }
+        else
+        {
+            if (rxGroupReset)
+            {
+                snapshot.RxGroupResetCount++;
+                snapshot.RxBaselineTick = sampleTick;
+                Rx4aCopyPortArray(snapshot.BaselineInvalidFrame, invalidFrame);
+                Rx4aCopyPortArray(snapshot.BaselinePhysicalRxError, physicalRx);
+                Rx4aCopyPortArray(snapshot.BaselineForwardedRxError, forwardedRx);
+            }
+
+            if (ecatProcessingUnitReset)
+            {
+                snapshot.EcatProcessingUnitResetCount++;
+                snapshot.EcatProcessingUnitBaselineTick = sampleTick;
+                snapshot.BaselineEcatProcessingUnitError =
+                    ecatProcessingUnitError;
+            }
+
+            if (pdiReset)
+            {
+                snapshot.PdiResetCount++;
+                snapshot.PdiBaselineTick = sampleTick;
+                snapshot.BaselinePdiError = pdiError;
+            }
+
+            if (lostLinkGroupReset)
+            {
+                snapshot.LostLinkGroupResetCount++;
+                snapshot.LostLinkBaselineTick = sampleTick;
+                Rx4aCopyPortArray(snapshot.BaselineLostLink, lostLink);
+            }
+        }
+
+        Rx4aCopyPortArray(snapshot.InvalidFrame, invalidFrame);
+        Rx4aCopyPortArray(snapshot.PhysicalRxError, physicalRx);
+        Rx4aCopyPortArray(snapshot.ForwardedRxError, forwardedRx);
+        Rx4aCopyPortArray(snapshot.LostLink, lostLink);
+        snapshot.EcatProcessingUnitError = ecatProcessingUnitError;
+        snapshot.PdiError = pdiError;
+
+        for (uint32_t port = 0u;
+            port < ETHERCAT_RX4A_ESC_PORT_COUNT;
+            ++port)
+        {
+            snapshot.DeltaInvalidFrame[port] =
+                static_cast<uint32_t>(invalidFrame[port]) -
+                static_cast<uint32_t>(snapshot.BaselineInvalidFrame[port]);
+            snapshot.DeltaPhysicalRxError[port] =
+                static_cast<uint32_t>(physicalRx[port]) -
+                static_cast<uint32_t>(snapshot.BaselinePhysicalRxError[port]);
+            snapshot.DeltaForwardedRxError[port] =
+                static_cast<uint32_t>(forwardedRx[port]) -
+                static_cast<uint32_t>(snapshot.BaselineForwardedRxError[port]);
+            snapshot.DeltaLostLink[port] =
+                static_cast<uint32_t>(lostLink[port]) -
+                static_cast<uint32_t>(snapshot.BaselineLostLink[port]);
+        }
+
+        snapshot.DeltaEcatProcessingUnitError =
+            static_cast<uint32_t>(ecatProcessingUnitError) -
+            static_cast<uint32_t>(
+                snapshot.BaselineEcatProcessingUnitError);
+        snapshot.DeltaPdiError =
+            static_cast<uint32_t>(pdiError) -
+            static_cast<uint32_t>(snapshot.BaselinePdiError);
+
+        snapshot.SaturatedInvalidFrameMask =
+            Rx4aBuildSaturationMask(invalidFrame);
+        snapshot.SaturatedPhysicalRxErrorMask =
+            Rx4aBuildSaturationMask(physicalRx);
+        snapshot.SaturatedForwardedRxErrorMask =
+            Rx4aBuildSaturationMask(forwardedRx);
+        snapshot.SaturatedLostLinkMask =
+            Rx4aBuildSaturationMask(lostLink);
+        snapshot.SaturatedMiscMask =
+            (ecatProcessingUnitError == 0xFFu ? 0x01u : 0u) |
+            (pdiError == 0xFFu ? 0x02u : 0u);
+
+        if (rawChanged)
+        {
+            snapshot.LastChangeTick = sampleTick;
+            snapshot.ChangeSerial = static_cast<uint64_t>(
+                InterlockedIncrement64(
+                    &g_ecatRx4aEscPortChangeSerial));
+        }
+    }
 
     uint8_t DecodeEscCommunicationMask(uint16_t dlStatus)
     {
@@ -2541,7 +2874,7 @@ namespace
     void ProcessRuntimeEscDiagProbe(
         EtherCatMaster* pMaster,
         uint64_t pdoCycleStartMasterNs,
-        bool pdoCycleValid)
+        bool processDataValid)
     {
         static uint32_t nextSlave = 0u;
         static uint32_t nextField = 0u;
@@ -2564,7 +2897,7 @@ namespace
             return;
         }
 
-        if (!pdoCycleValid)
+        if (!processDataValid)
         {
             g_ecatEscDiagRtShadow.DeferredPdo++;
             nextProbeTick =
@@ -2936,6 +3269,14 @@ namespace
 
                 target.RxErrorCount = rxErrorTotal;
                 target.LostLinkCount = lostLinkTotal;
+
+                Rx4aUpdateEscPortErrorSnapshot(
+                    target.Rx4aPortErrors,
+                    nextSlave,
+                    configuredAddress,
+                    pMaster->tickCount_PDO,
+                    readBuffer);
+
                 target.ValidMask |= OSCARMAX_ECAT_ESC_DIAG_VALID_ERRORS;
             }
             else if (nextField == 3u)
@@ -2990,6 +3331,84 @@ namespace
         nextProbeTick =
             pMaster->tickCount_PDO + OSCARMAX_ECAT_ESC_DIAG_PROBE_INTERVAL_CYCLES;
     }
+}
+
+// ---------------------------------------------------------------------------
+// DC-RX.4A Priority-50 readers. These copy the existing low-rate owner-safe
+// shadow only; they never issue an EtherCAT frame and never clear ESC counters.
+// ---------------------------------------------------------------------------
+uint32_t EtherCatRx4aEscPortSlaveCount()
+{
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const LONG sequenceBefore =
+            g_ecatEscDiagRtShadow.Sequence;
+
+        if ((sequenceBefore & 1L) != 0L)
+            continue;
+
+        MemoryBarrier();
+        uint32_t count = g_ecatEscDiagRtShadow.SlaveCount;
+        MemoryBarrier();
+
+        const LONG sequenceAfter =
+            g_ecatEscDiagRtShadow.Sequence;
+
+        if (sequenceBefore == sequenceAfter &&
+            (sequenceAfter & 1L) == 0L)
+        {
+            if (count > ETHERCAT_RX4A_ESC_MAX_SLAVES)
+                count = ETHERCAT_RX4A_ESC_MAX_SLAVES;
+            return count;
+        }
+    }
+
+    return 0u;
+}
+
+bool EtherCatRx4aEscPortRead(
+    uint16_t slavePosition,
+    EtherCatEscPortErrorSnapshot* snapshot)
+{
+    if (snapshot == nullptr ||
+        slavePosition >= ETHERCAT_RX4A_ESC_MAX_SLAVES)
+    {
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const LONG sequenceBefore =
+            g_ecatEscDiagRtShadow.Sequence;
+
+        if ((sequenceBefore & 1L) != 0L)
+            continue;
+
+        MemoryBarrier();
+
+        if (static_cast<uint32_t>(slavePosition) >=
+            g_ecatEscDiagRtShadow.SlaveCount)
+        {
+            return false;
+        }
+
+        const EtherCatEscPortErrorSnapshot local =
+            g_ecatEscDiagRtShadow.Slaves[slavePosition].Rx4aPortErrors;
+
+        MemoryBarrier();
+
+        const LONG sequenceAfter =
+            g_ecatEscDiagRtShadow.Sequence;
+
+        if (sequenceBefore == sequenceAfter &&
+            (sequenceAfter & 1L) == 0L)
+        {
+            *snapshot = local;
+            return local.Valid != 0u;
+        }
+    }
+
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -3426,6 +3845,17 @@ EtherCatDcTuning::SchedulerBootstrapDriftPpb;
 volatile LONG g_dcDriftCalibrationLockCount = 0;
 
 // =============================================================
+// DC-RX.3F test-only immutable startup config
+// =============================================================
+volatile LONG g_dcRx3fConfigReady = 0;
+volatile LONG g_dcRx3fConfiguredScenario = 0;
+volatile LONG g_dcRx3fConfiguredCycles = 0;
+volatile LONG g_dcRx3fConfiguredStartDelayCycles = 0;
+volatile LONGLONG g_dcRx3fConfiguredValueNs = 0;
+volatile LONG g_dcRx3fConfiguredRequireServoOff = 1;
+volatile LONG g_dcRx3fConfiguredAllowSafetyStop = 0;
+
+// =============================================================
 // PDO 即時診斷快照
 //
 // Writer：Priority 64 PDO Handler
@@ -3465,9 +3895,130 @@ volatile LONG g_pdoRtExecOver300Count = 0;
 volatile LONG g_pdoRtExecOver400Count = 0;
 
 
-// LRW PDO WKC 與 FRMW DC WKC；用來判斷本週期資料是否可採用。
+// LRW PDO WKC 與 FRMW DC WKC。DC-RX.3A 起，Process Data 與 DC sample
+// 使用獨立有效性；DC-only 抖動不再把正常 LRW/PDO 判成 invalid。
 volatile LONG g_pdoRtLrwWkc = 0;
 volatile LONG g_pdoRtDcWkc = 0;
+volatile LONG g_pdoRtDcReferencePresent = 0;
+volatile LONG g_pdoRtProcessDataValid = 0;
+volatile LONG g_pdoRtDcTransportValid = 0;
+volatile LONG g_pdoRtProcessInvalidStreak = 0;
+volatile LONG g_pdoRtDcTransportInvalidStreak = 0;
+volatile LONG g_pdoRtDcTransportInvalidMaxStreak = 0;
+volatile LONGLONG g_pdoRtDcWkcInvalidTotal = 0;
+volatile LONGLONG g_pdoRtDcOnlyInvalidTotal = 0;
+volatile LONGLONG g_pdoRtDcTransportRecoveryTotal = 0;
+
+// DC-RX.3B - bounded DC-only holdover / graded requalification.
+// These are internal diagnostic snapshots only; SHM/API layout is unchanged.
+volatile LONG g_pdoRtDcOnlyInvalidStreak = 0;
+volatile LONG g_pdoRtDcOnlyInvalidMaxStreak = 0;
+volatile LONG g_pdoRtDcHoldoverTier = 0;
+volatile LONG g_pdoRtDcHoldoverCurrentCycles = 0;
+volatile LONG g_pdoRtDcHoldoverMaxCycles = 0;
+volatile LONG g_pdoRtDcGlitchDebt = 0;
+volatile LONG g_pdoRtDcGlitchDebtMax = 0;
+volatile LONG g_pdoRtDcGlitchDebtLimit = 16;
+volatile LONGLONG g_pdoRtDcGraceAcceptedCyclesTotal = 0;
+volatile LONGLONG g_pdoRtDcHoldoverEpisodeTotal = 0;
+volatile LONGLONG g_pdoRtDcHoldoverEntryTotal = 0;
+volatile LONGLONG g_pdoRtDcDegradedEntryTotal = 0;
+volatile LONGLONG g_pdoRtDcRelockEntryTotal = 0;
+
+// DC-RX.3C - DC sample freshness / age / phase jump guards.
+// Internal diagnostic snapshot only; SHM/API layout remains unchanged.
+volatile LONG g_pdoRtDcSampleGuardState = 0;
+volatile LONG g_pdoRtDcSampleQualified = 0;
+volatile LONG g_pdoRtDcSampleGuardReasonMask = 0;
+volatile LONG g_pdoRtDcSampleRejectStreak = 0;
+volatile LONG g_pdoRtDcSampleRejectMaxStreak = 0;
+volatile LONGLONG g_pdoRtDcSampleApproxAgeNs = 0;
+volatile LONGLONG g_pdoRtDcSampleApproxAgeMaxNs = 0;
+volatile LONGLONG g_pdoRtDcSampleQpcDeltaNs = 0;
+volatile LONGLONG g_pdoRtDcSampleDcDeltaNs = 0;
+volatile LONGLONG g_pdoRtDcSampleDeltaErrorNs = 0;
+volatile LONGLONG g_pdoRtDcSampleDeltaToleranceNs = 0;
+volatile LONGLONG g_pdoRtDcSampleAcceptedTotal = 0;
+volatile LONGLONG g_pdoRtDcSampleRejectedTotal = 0;
+volatile LONGLONG g_pdoRtDcSampleAnchorTotal = 0;
+volatile LONGLONG g_pdoRtDcSampleReanchorTotal = 0;
+volatile LONGLONG g_pdoRtDcSampleAgeRejectTotal = 0;
+volatile LONGLONG g_pdoRtDcSampleOrderRejectTotal = 0;
+volatile LONGLONG g_pdoRtDcSampleDeltaRejectTotal = 0;
+volatile LONG g_pdoRtDcPhaseJumpGuardActive = 0;
+volatile LONG g_pdoRtDcPhaseJumpGuardGoodWindows = 3;
+volatile LONG g_pdoRtDcPhaseJumpGuardRequiredWindows = 3;
+volatile LONGLONG g_pdoRtDcPhaseJumpLastNs = 0;
+volatile LONGLONG g_pdoRtDcPhaseJumpMaxAbsNs = 0;
+volatile LONGLONG g_pdoRtDcPhaseJumpArmTotal = 0;
+volatile LONGLONG g_pdoRtDcPhaseJumpPassTotal = 0;
+volatile LONGLONG g_pdoRtDcPhaseJumpRejectTotal = 0;
+volatile LONG g_pdoRtDcPhaseMapSequence = 0;
+volatile LONG g_pdoRtDcPhaseMapNew = 0;
+volatile LONG g_pdoRtDcPhaseMapAgeGood = 0;
+volatile LONGLONG g_pdoRtDcPhaseMapAgeNs = 0;
+volatile LONGLONG g_pdoRtDcPhaseMapStaleTotal = 0;
+
+// DC-RX.3D - exact TX/RX software timing anchor diagnostics.
+// Internal snapshot only; SHM/API layout remains unchanged.
+volatile LONG g_pdoRtDcTimingSource = 0;
+volatile LONG g_pdoRtDcExactTimingLocked = 0;
+volatile LONG g_pdoRtDcExactTimingValid = 0;
+volatile LONGLONG g_pdoRtDcTimingSelectedRttNs = 0;
+volatile LONGLONG g_pdoRtDcTimingExactRttNs = 0;
+volatile LONGLONG g_pdoRtDcTimingExactRttMaxNs = 0;
+volatile LONGLONG g_pdoRtDcTimingCallRttNs = 0;
+volatile LONGLONG g_pdoRtDcTimingExcludedOverheadNs = 0;
+volatile LONGLONG g_pdoRtDcTimingMidpointShiftNs = 0;
+volatile LONGLONG g_pdoRtDcTimingMidpointShiftMaxAbsNs = 0;
+volatile LONGLONG g_pdoRtDcTimingExactUseTotal = 0;
+volatile LONGLONG g_pdoRtDcTimingFallbackUseTotal = 0;
+volatile LONGLONG g_pdoRtDcTimingMissingAfterLockTotal = 0;
+volatile LONGLONG g_pdoRtDcTimingSourceSwitchTotal = 0;
+volatile LONGLONG g_pdoRtDcTimingRejectTotal = 0;
+
+// DC-RX.3E - adaptive exact-RTT envelope / late-sample quarantine.
+// Internal snapshot only; SHM/API layout remains unchanged.
+volatile LONG g_pdoRtDcRttGuardState = 0;
+volatile LONG g_pdoRtDcRttGuardAccepted = 0;
+volatile LONG g_pdoRtDcRttGuardWarmupSamples = 0;
+volatile LONG g_pdoRtDcRttGuardWarmupRequired = 128;
+volatile LONGLONG g_pdoRtDcRttGuardCurrentNs = 0;
+volatile LONGLONG g_pdoRtDcRttGuardBaselineNs = 0;
+volatile LONGLONG g_pdoRtDcRttGuardDeviationNs = 0;
+volatile LONGLONG g_pdoRtDcRttGuardLimitNs = 0;
+volatile LONGLONG g_pdoRtDcRttGuardExcessNs = 0;
+volatile LONG g_pdoRtDcRttGuardOutlierStreak = 0;
+volatile LONG g_pdoRtDcRttGuardOutlierMaxStreak = 0;
+volatile LONG g_pdoRtDcRttGuardRebaseCandidateSamples = 0;
+volatile LONGLONG g_pdoRtDcRttGuardAcceptedTotal = 0;
+volatile LONGLONG g_pdoRtDcRttGuardRejectedTotal = 0;
+volatile LONGLONG g_pdoRtDcRttGuardRebaseTotal = 0;
+volatile LONGLONG g_pdoRtDcSampleRttRejectTotal = 0;
+
+// DC-RX.3F deterministic test-only fault-injection snapshot.
+// Published inside the existing PDO diagnostic seqlock.
+volatile LONG g_pdoRtDcFaultState = 0;
+volatile LONG g_pdoRtDcFaultScenario = 0;
+volatile LONG g_pdoRtDcFaultConfiguredCycles = 0;
+volatile LONG g_pdoRtDcFaultAppliedCycles = 0;
+volatile LONG g_pdoRtDcFaultStartDelayRemaining = 0;
+volatile LONG g_pdoRtDcFaultRecoveryCycles = 0;
+volatile LONG g_pdoRtDcFaultTargetWaitCycles = 0;
+volatile LONG g_pdoRtDcFaultActiveThisCycle = 0;
+volatile LONG g_pdoRtDcFaultGateBlockMask = 0;
+volatile LONG g_pdoRtDcFaultEvidenceMask = 0;
+volatile LONG g_pdoRtDcFaultFailureMask = 0;
+volatile LONG g_pdoRtDcFaultRequireServoOff = 1;
+volatile LONG g_pdoRtDcFaultAllowSafetyStop = 0;
+volatile LONGLONG g_pdoRtDcFaultValueNs = 0;
+volatile LONGLONG g_pdoRtDcFaultBaselineAppliedPpb = 0;
+volatile LONGLONG g_pdoRtDcFaultCurrentAppliedPpb = 0;
+volatile LONGLONG g_pdoRtDcFaultMaxAppliedDeltaPpb = 0;
+volatile LONG g_pdoRtDcFaultMaxPdoInvalidStreak = 0;
+volatile LONGLONG g_pdoRtDcFaultStartTick = 0;
+volatile LONGLONG g_pdoRtDcFaultLastAppliedTick = 0;
+volatile LONGLONG g_pdoRtDcFaultEndTick = 0;
 
 
 // =============================================================
@@ -3649,29 +4200,33 @@ volatile LONG
 g_qpcSchedulerValid =
 0;
 
-extern volatile LONG g_ecatRxDiagCurrentConsecutiveTimeout;
-
 // ============================================================================
 // Real FF V0 與 Phase-P V0 正式控制快照
 //
 // Real FF 狀態：0=WAIT、1=ARM、2=ACTIVE、3=HOLD、4=TRIP/FALLBACK。
 //   - ACTIVE 時把合格的 Frequency FF V2 建議值，限幅與限速後套入 QPC period。
-//   - TripMask 0x01 表示相位觀測器進入 FALLBACK；0x02 表示連續 RX timeout。
-//   - 0x01 是可恢復的 soft observer trip：V2 回到穩定 TRACK 後可重新 ARM。
-//   - 0x02/0x04/0x08/0x10 為 hard safety trip，本次執行期間維持 Baseline。
+//   - TripMask 0x01 表示相位觀測器進入 FALLBACK；0x04/0x08 才是 hard trip。
+//   - 單次 PDO/DC 無效與 Scheduler runtime recovery 不再寫入 TripMask；它們只會
+//     進入可恢復 HOLD，並保持最後一個合格 Applied FF，避免跳回 Startup Baseline。
+//   - 週期控制只使用上一個 PDO callback 的即時品質，不再使用約一秒才發布一次的
+//     RX 診斷快照，避免已恢復的 RX 被過時值持續判定為故障。
 //
 // Phase-P 狀態：0=WAIT、1=ARM、2=ACTIVE、3=HOLD、4=TRIP。
 //   - 只有 Real FF ACTIVE、phase gate 合格、TripMask=0 時才修正 offset。
-//   - soft observer trip 恢復後 Phase-P 重新由 WAIT/ARM 進入，不直接 ACTIVE。
+//   - transient HOLD 保留既有 offset；觀測器重新合格後再由 HOLD 平順恢復。
 //   - ActualErr/Offset/Step 都是 ns；offset 會真正加到 One-Shot final target。
 //
-// Stage 11F.2A-R1 fingerprint:
-//   OSCARMAX_DC_SOFT_OBSERVER_REARM_11F2A_R1_20260827
+// DC-RX.1 fingerprint:
+//   OSCARMAX_DC_RX1_TRANSIENT_HOLD_LAST_GOOD_FF_20260903
 // ============================================================================
 volatile LONG g_qpcRealFfV0Seq = 0;
 volatile LONG g_qpcRealFfV0State = 0;
 volatile LONG g_qpcRealFfV0PhaseGood = 0;
 volatile LONG g_qpcRealFfV0ArmGood = 0;
+volatile LONG g_qpcRealFfV0HoldMask = 0;
+volatile LONG g_qpcRealFfV0HistoryMask = 0;
+volatile LONG g_qpcRealFfV0CleanCycles = 0;
+volatile LONG g_qpcRealFfV0CleanCyclesRequired = 32;
 volatile LONG g_qpcRealFfV0TripMask = 0;
 volatile LONG g_qpcRealFfV0TripCount = 0;
 volatile LONGLONG g_qpcRealFfV0RecommendedPpb = EtherCatDcTuning::SchedulerBootstrapDriftPpb;
@@ -3687,6 +4242,8 @@ volatile LONG g_qpcRealFfV0HoldGood = 0;
 volatile LONG g_qpcRealFfV0HoldBad = 0;
 volatile LONG g_qpcRealFfV0HoldEntries = 0;
 volatile LONG g_qpcRealFfV0ClampActive = 0;
+volatile LONG g_qpcRealFfV0RecoveryProfile = 0;
+volatile LONG g_qpcRealFfV0HoldRecoveryWindowsRequired = 3;
 
 volatile LONG g_qpcRealFfClampSelfTestSeq = 0;
 volatile LONG g_qpcRealFfClampSelfTestPass = 0;
@@ -4134,6 +4691,12 @@ g_qpcLiveFfSamples =
 
 volatile LONG
 g_qpcLiveFfDcPhaseDiagSequence =
+0;
+
+// QPC midpoint of the newest sample included in this coherent phase snapshot.
+// DC-RX.3C uses it only to reject stale Phase-P publications.
+volatile LONGLONG
+g_qpcLiveFfDcPhaseLastSampleQpc =
 0;
 
 volatile LONG
@@ -4965,13 +5528,13 @@ g_pdoOneShotInfraFinalLateCount =
 // 正常週期順序：
 //   1. 驗證 one-shot startup gate，讀取 QPC wake time。
 //   2. 更新 QPC scheduler／Real FF／Phase-P，先 re-arm 下一次 callback。
-//   3. Flush PLC outputs，送出 LRW+FRMW，驗證 PDO/DC WKC。
+//   3. Flush PLC outputs，送出 LRW+FRMW，分別驗證 Process Data/DC sample。
 //   4. 更新 QPC<->DC Reference 與各種 shadow observer snapshot。
-//   5. Fetch PLC inputs，更新 DC 軟體估測器／控制器。
+//   5. LRW 有效則 Fetch PLC inputs；DC sample 有效才更新 DC estimator/controller。
 //   6. 處理低頻 async command，更新 Motion，發布執行時間快照。
 //
-// 安全原則：下一次 timer 必須在 EtherCAT 通訊前 re-arm；通訊失敗時不採用 Input，
-// 連續兩個無效週期才觸發各軸 EmergencyStop，避免單次雜訊造成不必要停機。
+// 安全原則：下一次 timer 必須在 EtherCAT 通訊前 re-arm；LRW 失敗時不採用 Input，
+// 連續八個無效週期才觸發各軸 EmergencyStop，避免單次雜訊造成不必要停機。
 // ============================================================================
 void RTAPI GlobalTimerHandler_PDO(void* nContext)
 {
@@ -5232,6 +5795,150 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     // Only TripMask == 0x01 may accumulate this recovery counter.
     static uint32_t realFfV0SoftRearmGood = 0;
 
+    // DC-RX.1：由上一個 4 kHz callback 的實際 PDO/DC WKC 與 one-shot 結果
+    // 建立控制品質，不再使用每約一秒才發布一次的 RX 診斷欄位。
+    static bool realFfV0CycleQualityKnown = false;
+    static bool realFfV0PreviousCycleClean = true;
+    static LONG realFfV0PreviousCycleReasonMask = 0;
+    static uint32_t realFfV0CleanCycleStreak = 0;
+    static LONG realFfV0TransientHoldReasonMask = 0;
+    static LONG realFfV0HistoryMask = 0;
+    static LONG realFfV0RecoveryObserverSeqFloor = 0;
+    static bool realFfV0FreshObserverRequired = false;
+    static bool realFfV0PreviousDcTransportValid = true;
+    static bool realFfV0PreviousDcSampleQualified = true;
+
+    // DC-RX.3C sample freshness state.
+    // State: 0=UNBOUND, 1=VERIFY, 2=TRACK.
+    static LONG dcSampleGuardState = 0;
+    static LONG dcSampleGuardLastReasonMask = 0;
+    static uint64_t dcSampleGuardLastAcceptedDcNs = 0;
+    static uint64_t dcSampleGuardLastAcceptedQpcMidCount = 0;
+    static uint32_t dcSampleGuardConsecutiveRejects = 0;
+    static uint32_t dcSampleGuardMaximumConsecutiveRejects = 0;
+    static uint64_t dcSampleGuardAcceptedTotal = 0;
+    static uint64_t dcSampleGuardRejectedTotal = 0;
+    static uint64_t dcSampleGuardAnchorTotal = 0;
+    static uint64_t dcSampleGuardReanchorTotal = 0;
+    static uint64_t dcSampleGuardAgeRejectTotal = 0;
+    static uint64_t dcSampleGuardOrderRejectTotal = 0;
+    static uint64_t dcSampleGuardDeltaRejectTotal = 0;
+    static uint64_t dcSampleGuardLastApproxAgeNs = 0;
+    static uint64_t dcSampleGuardMaximumApproxAgeNs = 0;
+    static uint64_t dcSampleGuardLastQpcDeltaNs = 0;
+    static uint64_t dcSampleGuardLastDcDeltaNs = 0;
+    static int64_t dcSampleGuardLastDeltaErrorNs = 0;
+    static uint64_t dcSampleGuardLastDeltaToleranceNs = 0;
+    static uint64_t dcSampleGuardTimingRejectTotal = 0;
+    static bool dcPhaseMapRebindPending = false;
+
+    // DC-RX.3D exact TX/RX timing-source policy.
+    // Once exact timing has appeared, the session never silently falls back to
+    // the wider whole-call midpoint; a missing exact timestamp is treated as a
+    // recoverable DC-only sample miss so fixed timing bias cannot flap.
+    static LONG dcSampleTimingSource = 0;
+    static bool dcExactTimingLocked = false;
+    static uint64_t dcTimingExactUseTotal = 0;
+    static uint64_t dcTimingFallbackUseTotal = 0;
+    static uint64_t dcTimingMissingAfterLockTotal = 0;
+    static uint64_t dcTimingSourceSwitchTotal = 0;
+    static uint64_t dcTimingExactRttMaximumNs = 0;
+    static int64_t dcTimingMidpointShiftLastNs = 0;
+    static uint64_t dcTimingMidpointShiftMaximumAbsNs = 0;
+
+    // DC-RX.3E adaptive exact-RTT envelope.
+    // State: 0=UNBOUND, 1=WARMUP, 2=TRACK, 3=SHIFT_CHECK.
+    static LONG dcRttGuardState = 0;
+    static uint32_t dcRttGuardWarmupSamples = 0;
+    static uint64_t dcRttGuardBaselineNs = 0;
+    static uint64_t dcRttGuardDeviationNs = 0;
+    static uint64_t dcRttGuardLimitNs = 0;
+    static uint64_t dcRttGuardLastRttNs = 0;
+    static uint64_t dcRttGuardLastExcessNs = 0;
+    static uint32_t dcRttGuardOutlierStreak = 0;
+    static uint32_t dcRttGuardOutlierMaximumStreak = 0;
+    static uint32_t dcRttGuardRebaseCandidateSamples = 0;
+    static uint64_t dcRttGuardRebaseCandidateMeanNs = 0;
+    static uint64_t dcRttGuardRebaseCandidateMinNs = 0;
+    static uint64_t dcRttGuardRebaseCandidateMaxNs = 0;
+    static uint64_t dcRttGuardAcceptedTotal = 0;
+    static uint64_t dcRttGuardRejectedTotal = 0;
+    static uint64_t dcRttGuardRebaseTotal = 0;
+    static uint64_t dcSampleGuardRttRejectTotal = 0;
+
+    // DC-RX.3F deterministic test-only fault injection.
+    // All state is owned by this Priority-64 callback. Startup publishes an
+    // immutable, token-gated configuration before the timer is created.
+    static bool dcRx3fRuntimeInitialized = false;
+    static DcRx3fFaultScenario dcRx3fScenario =
+        DcRx3fFaultScenario::Off;
+    static DcRx3fFaultState dcRx3fState =
+        DcRx3fFaultState::Off;
+    static uint32_t dcRx3fConfiguredCycles = 0;
+    static uint32_t dcRx3fConfiguredStartDelayCycles = 0;
+    static uint32_t dcRx3fStartDelayRemaining = 0;
+    static uint32_t dcRx3fAppliedCycles = 0;
+    static uint32_t dcRx3fTargetWaitCycles = 0;
+    static uint32_t dcRx3fRecoveryCycles = 0;
+    static uint32_t dcRx3fRecoveryStableCycles = 0;
+    static uint32_t dcRx3fMaximumPdoInvalidStreak = 0;
+    static uint64_t dcRx3fConfiguredValueNs = 0;
+    static uint64_t dcRx3fStartTick = 0;
+    static uint64_t dcRx3fLastAppliedTick = 0;
+    static uint64_t dcRx3fEndTick = 0;
+    static uint64_t dcRx3fBaselineAcceptedDcNs = 0;
+    static int64_t dcRx3fBaselineAppliedPpb = 0;
+    static int64_t dcRx3fMaximumAppliedDeltaPpb = 0;
+    static LONG dcRx3fGateBlockMask = 0;
+    static LONG dcRx3fEvidenceMask = 0;
+    static LONG dcRx3fFailureMask = 0;
+    static bool dcRx3fRequireServoOff = true;
+    static bool dcRx3fAllowSafetyStop = false;
+
+    // DC-RX.3C Phase-P recovery jump guard.
+    static bool phasePRecoveryJumpGuardActive = false;
+    static bool phasePRecoveryJumpReferenceValid = false;
+    static int64_t phasePRecoveryJumpReferenceWrappedNs = 0;
+    static uint32_t phasePRecoveryJumpGoodWindows = 3U;
+    static uint64_t phasePRecoveryJumpArmTotal = 0;
+    static uint64_t phasePRecoveryJumpPassTotal = 0;
+    static uint64_t phasePRecoveryJumpRejectTotal = 0;
+    static int64_t phasePRecoveryJumpLastNs = 0;
+    static int64_t phasePRecoveryJumpMaximumAbsNs = 0;
+    static bool phasePActV0LastObservedWrappedValid = false;
+    static int64_t phasePActV0LastObservedWrappedNs = 0;
+    static LONG phasePActV0LastSeenPhaseMapSeq = 0;
+    static LONG phasePActV0LastAcceptedPhaseMapSeq = 0;
+    static bool phasePActV0AcceptedPhaseMapValid = false;
+    static int64_t phasePActV0AcceptedFixedUnwrappedErrorNs = 0;
+    static uint64_t phasePActV0AcceptedPhaseMapQpc = 0;
+    static bool phasePActV0PhaseMapStaleEpisodeActive = false;
+    static uint64_t phasePActV0PhaseMapStaleTotal = 0;
+    static LONG phasePActV0DiagPhaseMapSequence = 0;
+    static bool phasePActV0DiagPhaseMapNew = false;
+    static bool phasePActV0DiagPhaseMapAgeGood = false;
+    static uint64_t phasePActV0DiagPhaseMapAgeNs = 0;
+
+    // DC-RX.3B bounded holdover policy state.
+    // RecoveryProfile: 0=FAST, 1=CONSERVATIVE, 2=FULL_RELOCK.
+    static LONG realFfV0RecoveryProfile = 0;
+    static uint32_t realFfV0CleanCyclesRequired = 32U;
+    static uint32_t realFfV0HoldRecoveryWindowsRequired = 3U;
+
+    static uint32_t dcOnlyInvalidConsecutiveCycles = 0;
+    static uint32_t dcOnlyInvalidMaximumConsecutiveCycles = 0;
+    static uint32_t dcOnlyGlitchDebt = 0;
+    static uint32_t dcOnlyGlitchDebtMaximum = 0;
+    static bool dcHoldoverEpisodeActive = false;
+    static uint32_t dcHoldoverUnqualifiedCycles = 0;
+    static uint32_t dcHoldoverMaximumUnqualifiedCycles = 0;
+    static uint64_t dcGraceAcceptedCyclesTotal = 0;
+    static uint64_t dcHoldoverEpisodeTotal = 0;
+    static uint64_t dcHoldoverEntryTotal = 0;
+    static uint64_t dcDegradedEntryTotal = 0;
+    static uint64_t dcRelockEntryTotal = 0;
+    static LONG dcHoldoverDiagTier = 0;
+
     static bool realFfV0ClampActive = false;
     static bool realFfClampSelfTestDone = false;
 
@@ -5485,10 +6192,544 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
     // ---------------------------------------------------------------------
+    // DC-RX.3B bounded holdover contract
+    //
+    // 0x02/0x10/0x20/0x80 are recoverable HOLD reasons:
+    //   0x02 = LRW Process Data invalid (the existing 8-cycle PDO safety
+    //          debounce remains authoritative).
+    //   0x10 = one-shot scheduler continuity interruption.
+    //   0x20 = LRW valid / FRMW DC WKC invalid; PDO/PLC/Motion continue.
+    //   0x80 = FRMW WKC valid, but DC sample age/order/delta is untrusted.
+    //          PDO/PLC/Motion still continue from the valid LRW image.
+    //
+    // 0x40 is a recoverable FULL_RELOCK marker. It is entered only when the
+    // DC-only path cannot regain a continuous clean qualification interval for
+    // about one second. Unlike 0x04/0x08, it preserves Last-Known-Good FF and
+    // may automatically re-arm after conservative clean/fresh observer gates.
+    // ---------------------------------------------------------------------
+    const uint32_t REAL_FF_V0_DEFAULT_CLEAN_CYCLES = 32U;       // 8 ms @ 4 kHz
+    const uint32_t REAL_FF_V0_CONSERVATIVE_CLEAN_CYCLES = 128U; // 32 ms @ 4 kHz
+    const uint32_t REAL_FF_V0_DEFAULT_HOLD_RECOVERY_WINDOWS = 3U;
+    const uint32_t REAL_FF_V0_CONSERVATIVE_HOLD_RECOVERY_WINDOWS = 5U;
+
+    const uint32_t DC_RX3B_GLITCH_GRACE_CYCLES = 4U;
+    const uint32_t DC_RX3B_GLITCH_DEBT_ADD = 4U;
+    const uint32_t DC_RX3B_GLITCH_DEBT_DECAY = 1U;
+    const uint32_t DC_RX3B_GLITCH_DEBT_LIMIT = 16U;
+    const uint32_t DC_RX3B_GLITCH_DEBT_SATURATION = 64U;
+    const uint32_t DC_RX3B_DEGRADED_HOLDOVER_CYCLES = 400U;  // 100 ms
+    const uint32_t DC_RX3B_FULL_RELOCK_CYCLES = 4000U;       // 1 s
+
+    // DC-RX.3C sample freshness / stale-frame rejection.
+    // The combined call includes frame build and RX processing. The 300 us
+    // ceiling is an observer-qualification guard only: it does not change the
+    // existing 205/210 us RX deadlines or the 250 us PDO cycle. A transaction
+    // beyond this ceiling is never allowed to steer a DC observer.
+    const uint64_t DC_RX3C_MAX_SAMPLE_TRANSACTION_NS = 300000ULL;
+    const uint64_t DC_RX3C_DELTA_BASE_TOLERANCE_NS = 150000ULL;
+    const uint64_t DC_RX3C_DELTA_DRIFT_DIVISOR = 20000ULL; // 50 ppm
+    const uint64_t DC_RX3C_DELTA_MAX_TOLERANCE_NS = 750000ULL;
+    const uint32_t DC_RX3C_REANCHOR_REJECT_LIMIT = 4U;
+
+    const LONG DC_RX3C_SAMPLE_STATE_UNBOUND = 0;
+    const LONG DC_RX3C_SAMPLE_STATE_VERIFY = 1;
+    const LONG DC_RX3C_SAMPLE_STATE_TRACK = 2;
+
+    const LONG DC_RX3C_SAMPLE_REJECT_AGE = 0x01;
+    const LONG DC_RX3C_SAMPLE_REJECT_ANCHOR = 0x02;
+    const LONG DC_RX3C_SAMPLE_REJECT_DC_ORDER = 0x04;
+    const LONG DC_RX3C_SAMPLE_REJECT_QPC_ORDER = 0x08;
+    const LONG DC_RX3C_SAMPLE_REJECT_DELTA = 0x10;
+    const LONG DC_RX3C_SAMPLE_REJECT_CONVERSION = 0x20;
+    const LONG DC_RX3D_SAMPLE_REJECT_TIMING_SOURCE = 0x40;
+    const LONG DC_RX3E_SAMPLE_REJECT_RTT_ENVELOPE = 0x80;
+
+    const LONG DC_RX3D_TIMING_SOURCE_NONE = 0;
+    const LONG DC_RX3D_TIMING_SOURCE_EXACT_TXRX = 1;
+    const LONG DC_RX3D_TIMING_SOURCE_CALL_FALLBACK = 2;
+
+    // DC-RX.3E exact software RTT quality contract.
+    // A frame may still beat the 210 us hard deadline yet arrive much later
+    // than the stable path. Such a sample carries receive-queue/IST latency in
+    // its software midpoint and must not steer the DC observer.
+    const LONG DC_RX3E_RTT_STATE_UNBOUND = 0;
+    const LONG DC_RX3E_RTT_STATE_WARMUP = 1;
+    const LONG DC_RX3E_RTT_STATE_TRACK = 2;
+    const LONG DC_RX3E_RTT_STATE_SHIFT_CHECK = 3;
+    const uint32_t DC_RX3E_RTT_WARMUP_SAMPLES = 128U; // 32 ms @ 4 kHz
+    const uint64_t DC_RX3E_RTT_INITIAL_DEVIATION_NS = 5000ULL;
+    const uint64_t DC_RX3E_RTT_MIN_HEADROOM_NS = 50000ULL;
+    const uint64_t DC_RX3E_RTT_MAX_HEADROOM_NS = 100000ULL;
+    const uint64_t DC_RX3E_RTT_JITTER_BIAS_NS = 10000ULL;
+    const uint64_t DC_RX3E_RTT_ABSOLUTE_LIMIT_NS = 200000ULL;
+    const uint32_t DC_RX3E_RTT_REBASE_SAMPLES = 64U; // 16 ms @ 4 kHz
+    const uint64_t DC_RX3E_RTT_REBASE_CONSISTENCY_NS = 20000ULL;
+    const uint64_t DC_RX3E_RTT_REBASE_RANGE_NS = 40000ULL;
+
+    const uint32_t DC_RX3C_PHASE_JUMP_GOOD_WINDOWS = 3U;
+    const int64_t DC_RX3C_PHASE_JUMP_MAX_NS = 50000LL;
+    const uint64_t DC_RX3C_PHASE_MAP_MAX_AGE_NS = 1500000000ULL;
+
+    const LONG DC_RX3B_TIER_NONE = 0;
+    const LONG DC_RX3B_TIER_GRACE = 1;
+    const LONG DC_RX3B_TIER_HOLDOVER = 2;
+    const LONG DC_RX3B_TIER_DEGRADED = 3;
+    const LONG DC_RX3B_TIER_RELOCK = 4;
+    const LONG DC_RX3B_TIER_REQUALIFY = 5;
+
+    const LONG REAL_FF_V0_TRANSIENT_RX_REASON = 0x02;
+    const LONG REAL_FF_V0_TRANSIENT_SCHEDULER_REASON = 0x10;
+    const LONG REAL_FF_V0_TRANSIENT_DC_SAMPLE_REASON = 0x20;
+    const LONG REAL_FF_V0_TRANSIENT_DC_FRESHNESS_REASON = 0x80;
+    const LONG REAL_FF_V0_SOFT_DC_RELOCK_REASON = 0x40;
+    const LONG REAL_FF_V0_SOFT_RECOVERABLE_TRIP_MASK =
+        0x01 | REAL_FF_V0_SOFT_DC_RELOCK_REASON;
+    const LONG REAL_FF_V0_HARD_TRIP_MASK = 0x04 | 0x08;
+
+    auto IsRealFfV0CleanRecoveryReady = [&]() -> bool
+    {
+        return
+            !realFfV0CycleQualityKnown ||
+            realFfV0CleanCycleStreak >= realFfV0CleanCyclesRequired;
+    };
+
+    auto QpcCountsToNsSafe =
+        [&](uint64_t counts, uint64_t* resultNs) -> bool
+    {
+        if (resultNs == nullptr || qpcFrequency == 0)
+        {
+            return false;
+        }
+
+        // Quotient/remainder conversion avoids counts * 1e9 overflow after a
+        // prolonged communication interruption. The practical RTX64 QPC
+        // frequency is far below the guarded multiplication limit.
+        const uint64_t wholeSeconds = counts / qpcFrequency;
+        const uint64_t remainderCounts = counts % qpcFrequency;
+
+        if (wholeSeconds > 0xFFFFFFFFFFFFFFFFULL / 1000000000ULL ||
+            remainderCounts > 0xFFFFFFFFFFFFFFFFULL / 1000000000ULL)
+        {
+            return false;
+        }
+
+        const uint64_t wholeNs = wholeSeconds * 1000000000ULL;
+        const uint64_t remainderNs =
+            (remainderCounts * 1000000000ULL) / qpcFrequency;
+
+        if (wholeNs > 0xFFFFFFFFFFFFFFFFULL - remainderNs)
+        {
+            return false;
+        }
+
+        *resultNs = wholeNs + remainderNs;
+        return true;
+    };
+
+    auto ArmPhasePRecoveryJumpGuard =
+        [&](bool preservePreviousReference)
+    {
+        if (!phasePRecoveryJumpGuardActive)
+        {
+            phasePRecoveryJumpArmTotal++;
+            phasePRecoveryJumpGuardActive = true;
+            phasePRecoveryJumpGoodWindows = 0;
+
+            if (preservePreviousReference &&
+                phasePActV0LastObservedWrappedValid)
+            {
+                phasePRecoveryJumpReferenceWrappedNs =
+                    phasePActV0LastObservedWrappedNs;
+                phasePRecoveryJumpReferenceValid = true;
+            }
+            else
+            {
+                phasePRecoveryJumpReferenceValid = false;
+            }
+        }
+        else if (!preservePreviousReference)
+        {
+            // A DC clock chronology re-anchor changes the coordinate binding.
+            // Do not compare the new phase against the pre-reanchor reference.
+            phasePRecoveryJumpReferenceValid = false;
+            phasePRecoveryJumpGoodWindows = 0;
+        }
+    };
+
+    // These locals describe this callback's scheduler result and remain in
+    // scope until the LRW+FRMW result is known later in the same callback.
+    bool currentSchedulerEvaluated = false;
+    bool currentSchedulerRearmOk = false;
+    bool currentSchedulerUsedBootstrap = false;
+    bool currentSchedulerRuntimeRecovery = false;
+    bool dcObserversResetThisCycle = false;
+
+    auto ResetDcObserversAfterTransientInterruption = [&]()
+    {
+        // Preserve the already-qualified timelines and the real actuator's
+        // last-known-good frequency. Only incomplete windows that span the
+        // interruption are discarded later in this callback.
+        qpcPhaseFfV2DesiredPpb = qpcPhaseFfV2AppliedPpb;
+        qpcPhaseFfV2LastAppliedStepPpb = 0;
+        qpcPhaseFfV2LastObserverSequence =
+            g_qpcDcPhaseResidualV1ADiagSequence;
+        qpcPhaseFfV2WarmupGoodCount = 0;
+        qpcPhaseFfV2BadCount = 0;
+        qpcPhaseFfV2RecoveryGoodCount = 0;
+        qpcPhaseFfV2WindowSamples = 0;
+        qpcPhaseFfV2TargetDeltaWindowStartNs = 0;
+        qpcPhaseFfV2TargetDeltaWindowEndNs = 0;
+        qpcPhaseFfV2TrackCyclesWindow = 0;
+        qpcPhaseFfV2HoldCyclesWindow = 0;
+        qpcPhaseFfV2FallbackCyclesWindow = 0;
+        qpcPhaseFfV2StateSwitchesWindow = 0;
+
+        qpcLiveFfWindowSamples = 0;
+        qpcLiveFfShadowWindowStartErrorNs = 0;
+        qpcLiveFfShadowWindowEndErrorNs = 0;
+        qpcLiveFfShadowWindowMinErrorNs = 0;
+        qpcLiveFfShadowWindowMaxErrorNs = 0;
+        qpcLiveFfTargetDeltaWindowStartNs = 0;
+        qpcLiveFfTargetDeltaWindowEndNs = 0;
+        qpcLiveFfTrustedCyclesWindow = 0;
+        qpcLiveFfFallbackCyclesWindow = 0;
+        qpcLiveFfModeSwitchesWindow = 0;
+
+        // Real FF may resume only after V2 carries a V1A publication newer
+        // than the interruption. This prevents an old one-second snapshot from
+        // releasing HOLD while preserving the completed 16-point history.
+        realFfV0RecoveryObserverSeqFloor =
+            g_qpcDcPhaseResidualV1ADiagSequence;
+        realFfV0FreshObserverRequired = true;
+
+        // Do not consume the pre-interruption V2 publication again.
+        realFfV0LastPhaseSeq =
+            g_qpcPhaseFfV2DiagSequence;
+
+        dcObserversResetThisCycle = true;
+    };
+
+    auto EnterRealFfV0TransientHold =
+        [&](LONG reasonMask, bool resetObservers)
+    {
+        realFfV0CleanCycleStreak = 0;
+
+        // A hard trip remains latched. Transient activity must not downgrade it.
+        if ((realFfV0TripMask & REAL_FF_V0_HARD_TRIP_MASK) != 0)
+        {
+            return;
+        }
+
+        realFfV0TransientHoldReasonMask |= reasonMask;
+        realFfV0HistoryMask |= reasonMask;
+        realFfV0LastStepPpb = 0;
+        realFfV0SoftRearmGood = 0;
+
+        if (realFfV0State == 2 || realFfV0State == 3)
+        {
+            if (realFfV0State != 3)
+            {
+                realFfV0HoldEntries++;
+            }
+
+            realFfV0State = 3;
+            realFfV0DesiredPpb = realFfV0AppliedPpb;
+            realFfV0HoldGood = 0;
+            realFfV0HoldBad = 0;
+        }
+        else if (realFfV0State == 0 || realFfV0State == 1)
+        {
+            realFfV0State = 0;
+            realFfV0ArmGood = 0;
+            realFfV0DesiredPpb = realFfV0AppliedPpb;
+            realFfV0HoldGood = 0;
+            realFfV0HoldBad = 0;
+        }
+        else if (realFfV0State == 4)
+        {
+            // Observer-only state 4 also keeps the last-known-good frequency.
+            realFfV0DesiredPpb = realFfV0AppliedPpb;
+        }
+
+        if (resetObservers)
+        {
+            ArmPhasePRecoveryJumpGuard(true);
+
+            if (!dcObserversResetThisCycle)
+            {
+                ResetDcObserversAfterTransientInterruption();
+            }
+        }
+    };
+
+    auto ResetRealFfV0RecoveryProfileAfterActive = [&]()
+    {
+        realFfV0RecoveryProfile = 0;
+        realFfV0CleanCyclesRequired = REAL_FF_V0_DEFAULT_CLEAN_CYCLES;
+        realFfV0HoldRecoveryWindowsRequired =
+            REAL_FF_V0_DEFAULT_HOLD_RECOVERY_WINDOWS;
+        dcHoldoverEpisodeActive = false;
+        dcHoldoverUnqualifiedCycles = 0;
+        dcHoldoverDiagTier = DC_RX3B_TIER_NONE;
+    };
+
+    auto ApplyRealFfV0ConservativeRecoveryProfile = [&]()
+    {
+        if (realFfV0RecoveryProfile < 1)
+        {
+            realFfV0RecoveryProfile = 1;
+        }
+
+        realFfV0CleanCyclesRequired =
+            REAL_FF_V0_CONSERVATIVE_CLEAN_CYCLES;
+        realFfV0HoldRecoveryWindowsRequired =
+            REAL_FF_V0_CONSERVATIVE_HOLD_RECOVERY_WINDOWS;
+    };
+
+    auto EscalateRealFfV0ToSoftDcRelock = [&]()
+    {
+        // Timer/bootstrap integrity failures remain the only hard-latched
+        // reasons. A prolonged DC-only outage keeps Last-Known-Good FF and
+        // requests a full, automatically recoverable requalification.
+        if ((realFfV0TripMask & REAL_FF_V0_HARD_TRIP_MASK) != 0)
+        {
+            return;
+        }
+
+        ApplyRealFfV0ConservativeRecoveryProfile();
+        realFfV0RecoveryProfile = 2;
+        realFfV0State = 4;
+        realFfV0DesiredPpb = realFfV0AppliedPpb;
+        realFfV0LastStepPpb = 0;
+        realFfV0TripMask |= REAL_FF_V0_SOFT_DC_RELOCK_REASON;
+        realFfV0HistoryMask |= REAL_FF_V0_SOFT_DC_RELOCK_REASON;
+        realFfV0TransientHoldReasonMask |=
+            REAL_FF_V0_TRANSIENT_DC_SAMPLE_REASON;
+        realFfV0ArmGood = 0;
+        realFfV0HoldGood = 0;
+        realFfV0HoldBad = 0;
+        realFfV0SoftRearmGood = 0;
+
+        if (!dcObserversResetThisCycle)
+        {
+            ResetDcObserversAfterTransientInterruption();
+        }
+    };
+
+
+    // ---------------------------------------------------------------------
+    // DC-RX.3F deterministic test-only fault injection controller
+    //
+    // This controller only decides when a logical result/sample will be
+    // overridden later in this callback. It never skips the real EtherCAT
+    // exchange and never performs file I/O, printing, sleeping, or allocation.
+    // A scenario runs once per RTOS process and remains PASS/FAIL afterwards.
+    // ---------------------------------------------------------------------
+    const LONG DC_RX3F_GATE_REAL_FF = 0x0001;
+    const LONG DC_RX3F_GATE_PHASE_P = 0x0002;
+    const LONG DC_RX3F_GATE_HOLD_TRIP = 0x0004;
+    const LONG DC_RX3F_GATE_CLEAN = 0x0008;
+    const LONG DC_RX3F_GATE_SAMPLE = 0x0010;
+    const LONG DC_RX3F_GATE_EXACT = 0x0020;
+    const LONG DC_RX3F_GATE_RTT = 0x0040;
+    const LONG DC_RX3F_GATE_PHASE_GUARD = 0x0080;
+    const LONG DC_RX3F_GATE_SCHEDULER = 0x0100;
+    const LONG DC_RX3F_GATE_SERVO_ON = 0x0200;
+    const LONG DC_RX3F_GATE_DC_REFERENCE = 0x0400;
+    const LONG DC_RX3F_GATE_PHASE_MAP = 0x0800;
+
+    const LONG DC_RX3F_EVIDENCE_APPLIED = 0x0001;
+    const LONG DC_RX3F_EVIDENCE_DOWNSTREAM = 0x0002;
+    const LONG DC_RX3F_EVIDENCE_PDO_PRESERVED = 0x0004;
+    const LONG DC_RX3F_EVIDENCE_HOLD_OR_GRACE = 0x0008;
+    const LONG DC_RX3F_EVIDENCE_SAFETY_STOP = 0x0010;
+    const LONG DC_RX3F_EVIDENCE_RECOVERED = 0x0020;
+    const LONG DC_RX3F_EVIDENCE_FF_PRESERVED = 0x0040;
+
+    const LONG DC_RX3F_FAIL_TARGET_TIMEOUT = 0x0001;
+    const LONG DC_RX3F_FAIL_RECOVERY_TIMEOUT = 0x0002;
+    const LONG DC_RX3F_FAIL_HARD_TRIP = 0x0004;
+    const LONG DC_RX3F_FAIL_FF_DISCONTINUITY = 0x0008;
+    const LONG DC_RX3F_FAIL_UNEXPECTED_PDO_INVALID = 0x0010;
+    const LONG DC_RX3F_FAIL_UNEXPECTED_SAFETY_STOP = 0x0020;
+    const LONG DC_RX3F_FAIL_MISSING_EVIDENCE = 0x0040;
+
+    const uint32_t DC_RX3F_TARGET_WAIT_LIMIT_CYCLES = 40000U; // 10 s
+    const uint32_t DC_RX3F_RECOVERY_LIMIT_CYCLES = 180000U;   // 45 s
+    const uint32_t DC_RX3F_RECOVERY_STABLE_CYCLES = 128U;     // 32 ms
+    const int64_t DC_RX3F_MAX_APPLIED_FF_DELTA_PPB = 1000LL;
+
+    bool dcRx3fInjectionRequestedThisCycle = false;
+    bool dcRx3fInjectionAppliedThisCycle = false;
+
+    if (!dcRx3fRuntimeInitialized &&
+        g_dcRx3fConfigReady != 0)
+    {
+        MemoryBarrier();
+
+        const LONG configuredScenario =
+            g_dcRx3fConfiguredScenario;
+
+        if (configuredScenario >=
+            (LONG)DcRx3fFaultScenario::DcWkcDrop &&
+            configuredScenario <=
+            (LONG)DcRx3fFaultScenario::LrwTimeout &&
+            g_dcRx3fConfiguredCycles > 0)
+        {
+            dcRx3fScenario =
+                (DcRx3fFaultScenario)configuredScenario;
+            dcRx3fConfiguredCycles =
+                (uint32_t)g_dcRx3fConfiguredCycles;
+            dcRx3fConfiguredStartDelayCycles =
+                g_dcRx3fConfiguredStartDelayCycles > 0
+                ? (uint32_t)g_dcRx3fConfiguredStartDelayCycles
+                : 0U;
+            dcRx3fStartDelayRemaining =
+                dcRx3fConfiguredStartDelayCycles;
+            dcRx3fConfiguredValueNs =
+                g_dcRx3fConfiguredValueNs > 0
+                ? (uint64_t)g_dcRx3fConfiguredValueNs
+                : 0ULL;
+            dcRx3fRequireServoOff =
+                g_dcRx3fConfiguredRequireServoOff != 0;
+            dcRx3fAllowSafetyStop =
+                g_dcRx3fConfiguredAllowSafetyStop != 0;
+            dcRx3fState = DcRx3fFaultState::WaitGate;
+        }
+        else
+        {
+            dcRx3fScenario = DcRx3fFaultScenario::Off;
+            dcRx3fState = DcRx3fFaultState::Off;
+        }
+
+        dcRx3fRuntimeInitialized = true;
+    }
+
+    bool dcRx3fAllExistingAxesServoOff = true;
+    if (dcRx3fRuntimeInitialized &&
+        dcRx3fScenario != DcRx3fFaultScenario::Off &&
+        dcRx3fRequireServoOff)
+    {
+        for (const AxisContext& axis : pMaster->m_Axes)
+        {
+            if (axis.isExist && axis.isServoOn)
+            {
+                dcRx3fAllExistingAxesServoOff = false;
+                break;
+            }
+        }
+    }
+
+    dcRx3fGateBlockMask = 0;
+    if (dcRx3fRuntimeInitialized &&
+        dcRx3fScenario != DcRx3fFaultScenario::Off)
+    {
+        if (realFfV0State != 2)
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_REAL_FF;
+        if (phasePActV0State != 2)
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_PHASE_P;
+        if (realFfV0TransientHoldReasonMask != 0 ||
+            realFfV0TripMask != 0)
+        {
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_HOLD_TRIP;
+        }
+        if (!realFfV0CycleQualityKnown ||
+            !realFfV0PreviousCycleClean ||
+            realFfV0CleanCycleStreak < realFfV0CleanCyclesRequired)
+        {
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_CLEAN;
+        }
+        if (dcSampleGuardState != DC_RX3C_SAMPLE_STATE_TRACK ||
+            dcSampleGuardLastAcceptedDcNs == 0)
+        {
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_SAMPLE;
+        }
+        if (!dcExactTimingLocked)
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_EXACT;
+        if (dcRttGuardState != DC_RX3E_RTT_STATE_TRACK)
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_RTT;
+        if (phasePRecoveryJumpGuardActive)
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_PHASE_GUARD;
+        if (!qpcSchedulerInitialized)
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_SCHEDULER;
+        if (!dcRx3fAllExistingAxesServoOff)
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_SERVO_ON;
+        if (GetDcReferenceSlaveIndex() < 0)
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_DC_REFERENCE;
+        if (!phasePActV0AcceptedPhaseMapValid ||
+            !phasePActV0DiagPhaseMapAgeGood)
+        {
+            dcRx3fGateBlockMask |= DC_RX3F_GATE_PHASE_MAP;
+        }
+    }
+
+    auto BeginDcRx3fInjection = [&]()
+    {
+        dcRx3fState = DcRx3fFaultState::Inject;
+        dcRx3fAppliedCycles = 0;
+        dcRx3fTargetWaitCycles = 0;
+        dcRx3fRecoveryCycles = 0;
+        dcRx3fRecoveryStableCycles = 0;
+        dcRx3fEvidenceMask = 0;
+        dcRx3fFailureMask = 0;
+        dcRx3fMaximumPdoInvalidStreak = 0;
+        dcRx3fBaselineAcceptedDcNs =
+            dcSampleGuardLastAcceptedDcNs;
+        dcRx3fBaselineAppliedPpb = realFfV0AppliedPpb;
+        dcRx3fMaximumAppliedDeltaPpb = 0;
+        dcRx3fStartTick = pMaster->tickCount_PDO;
+        dcRx3fLastAppliedTick = 0;
+        dcRx3fEndTick = 0;
+    };
+
+    if (dcRx3fState == DcRx3fFaultState::WaitGate)
+    {
+        dcRx3fStartDelayRemaining =
+            dcRx3fConfiguredStartDelayCycles;
+
+        if (dcRx3fGateBlockMask == 0)
+        {
+            if (dcRx3fStartDelayRemaining == 0)
+            {
+                BeginDcRx3fInjection();
+            }
+            else
+            {
+                dcRx3fState = DcRx3fFaultState::Delay;
+            }
+        }
+    }
+    else if (dcRx3fState == DcRx3fFaultState::Delay)
+    {
+        if (dcRx3fGateBlockMask != 0)
+        {
+            dcRx3fState = DcRx3fFaultState::WaitGate;
+            dcRx3fStartDelayRemaining =
+                dcRx3fConfiguredStartDelayCycles;
+        }
+        else
+        {
+            if (dcRx3fStartDelayRemaining > 0)
+            {
+                dcRx3fStartDelayRemaining--;
+            }
+
+            if (dcRx3fStartDelayRemaining == 0)
+            {
+                BeginDcRx3fInjection();
+            }
+        }
+    }
+
+    dcRx3fInjectionRequestedThisCycle =
+        dcRx3fState == DcRx3fFaultState::Inject &&
+        dcRx3fAppliedCycles < dcRx3fConfiguredCycles;
+
+    // ---------------------------------------------------------------------
     // 啟動 Drift 校正
     //
     // AUTO：Robust snapshot 必須已鎖定、Buffer=9、MAD 與 Raw/Median 差值
-    // 都通過門檻，且沒有連續 RX timeout。冷機與溫機不需要
+    // 都通過門檻，且前一段 4 kHz PDO/DC 控制品質已連續穩定。冷機與溫機不需要
     // 接近 Bootstrap，只要在絕對捕獲範圍內連續五窗穩定，就取 median 平均鎖定。
     // FIXED：第一個 callback 直接採用 Startup 已驗證的設定值。
     // 校正只改「後續週期的頻率」，不重算既有 target，因此沒有相位突跳。
@@ -5601,7 +6842,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     EtherCatDcTuning::DriftCalibrationMaximumMadPpb &&
                     rawMedianAbsPpb <=
                     EtherCatDcTuning::DriftCalibrationMaximumRawMedianDeviationPpb &&
-                    g_ecatRxDiagCurrentConsecutiveTimeout == 0;
+                    IsRealFfV0CleanRecoveryReady();
 
                 if (driftCalibrationCandidateGood)
                 {
@@ -5664,6 +6905,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         realFfV0AppliedPpb = driftBaselinePpb;
         realFfV0LastStepPpb = 0;
         realFfV0TripMask = 0;
+        realFfV0TransientHoldReasonMask = 0;
+        realFfV0HistoryMask = 0;
+        realFfV0RecoveryObserverSeqFloor = 0;
+        realFfV0FreshObserverRequired = false;
         realFfV0HoldGood = 0;
         realFfV0HoldBad = 0;
         realFfV0SoftRearmGood = 0;
@@ -5673,6 +6918,22 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         phasePActV0HoldGood = 0;
         phasePActV0OffsetNs = 0;
         phasePActV0LastStepNs = 0;
+        phasePRecoveryJumpGuardActive = false;
+        phasePRecoveryJumpReferenceValid = false;
+        phasePRecoveryJumpGoodWindows =
+            DC_RX3C_PHASE_JUMP_GOOD_WINDOWS;
+        phasePActV0LastObservedWrappedValid = false;
+        phasePActV0LastObservedWrappedNs = 0;
+        phasePActV0LastSeenPhaseMapSeq = 0;
+        phasePActV0LastAcceptedPhaseMapSeq = 0;
+        phasePActV0AcceptedPhaseMapValid = false;
+        phasePActV0AcceptedFixedUnwrappedErrorNs = 0;
+        phasePActV0AcceptedPhaseMapQpc = 0;
+        phasePActV0PhaseMapStaleEpisodeActive = false;
+        phasePActV0DiagPhaseMapSequence = 0;
+        phasePActV0DiagPhaseMapNew = false;
+        phasePActV0DiagPhaseMapAgeGood = false;
+        phasePActV0DiagPhaseMapAgeNs = 0;
 
         qpcPhaseFfV2Initialized = false;
         qpcPhaseFfV2State = 0;
@@ -5774,8 +7035,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         EtherCatDcTuning::RealFfMaximumDriftPpb;
     const int64_t REAL_FF_V0_MAX_STEP_PPB = 10LL; // 每個約一秒觀測窗最大頻率變更。
     const uint32_t REAL_FF_V0_ARM_WINDOWS = 3U;   // 連續合格 3 窗才進入 ACTIVE。
-    const uint32_t REAL_FF_V0_HOLD_RECOVERY_WINDOWS = 3U; // HOLD 連續合格 3 窗才恢復。
-    const uint32_t REAL_FF_V0_HOLD_BAD_LIMIT = 5U; // HOLD 連續失敗 5 窗即 LATCHED。
+    const uint32_t REAL_FF_V0_HOLD_BAD_LIMIT = 5U; // HOLD 連續失敗 5 窗即 soft trip。
 
     // V2 自己從 FALLBACK 回 TRACK 後，再額外要求 5 個完整合格窗，
     // 才允許 Real FF 的 soft observer trip (0x01 only) 重新進 ARM。
@@ -5911,6 +7171,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         //   0x20=pair 數不是 120
         //   0x40=slope MAD > 150 ppb
         //   0x80=啟動 Drift 尚未鎖定
+        //   0x100=transient 後尚未看到新的 V1A observer publication
         // 只有 mask=0 才能累積 ARM 或在 ACTIVE 中更新 drift。
         // -----------------------------------------------------------------
         LONG realPhaseSeq1 = g_qpcPhaseFfV2DiagSequence;
@@ -5920,6 +7181,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         LONG realPhasePoint = 0;
         LONG realPhasePoints = 0;
         LONG realPhasePairs = 0;
+        LONG realPhaseObserverSeq = 0;
         LONGLONG realPhaseMad = 0;
         LONGLONG realPhaseRecommended = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
         bool realPhaseSnapshot = false;
@@ -5933,6 +7195,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             realPhasePoint = g_qpcPhaseFfV2PointAccepted;
             realPhasePoints = g_qpcPhaseFfV2Points;
             realPhasePairs = g_qpcPhaseFfV2Pairs;
+            realPhaseObserverSeq = g_qpcPhaseFfV2ObserverSequence;
             realPhaseMad = g_qpcPhaseFfV2SlopeMadPpb;
             realPhaseRecommended = g_qpcPhaseFfV2RecommendedPpb;
             MemoryBarrier();
@@ -5961,24 +7224,30 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             if (realPhasePairs != 120) phaseReject |= 0x20;
             if (realPhaseMad > 150) phaseReject |= 0x40;
             if (!driftCalibrationLocked) phaseReject |= 0x80;
+
+            if (realFfV0FreshObserverRequired)
+            {
+                const bool freshObserverPublication =
+                    realPhaseObserverSeq != 0 &&
+                    (realPhaseObserverSeq & 1) == 0 &&
+                    realPhaseObserverSeq > realFfV0RecoveryObserverSeqFloor;
+
+                if (!freshObserverPublication)
+                {
+                    phaseReject |= 0x100;
+                }
+                else
+                {
+                    realFfV0FreshObserverRequired = false;
+                }
+            }
         }
 
         realFfV0PhaseRejectMask = phaseReject;
         bool realPhaseGood = phaseReject == 0;
 
-        if ((realFfV0State == 2 || realFfV0State == 3) &&
-            g_ecatRxDiagCurrentConsecutiveTimeout != 0)
-        {
-            // ACTIVE/HOLD 期間只要看到連續 RX timeout 非零，立即永久 Trip 到
-            // 退回本次啟動已鎖定的 Baseline，避免錯誤時間樣本影響 FF。
-            realFfV0State = 4;
-            realFfV0AppliedPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
-            realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
-            realFfV0LastStepPpb = 0;
-            realFfV0TripMask |= 0x02;
-            realFfV0TripCount++;
-            realFfV0SoftRearmGood = 0;
-        }
+        // DC-RX.1：PDO/DC 通訊品質在本 callback 的 combined transaction 完成後
+        // 直接寫入 transient HOLD；這裡不再讀取約一秒才發布一次的 RX 診斷快照。
 
         if (realPhaseSnapshot &&
             realPhaseSeq1 != realFfV0LastPhaseSeq)
@@ -5989,46 +7258,64 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
             if (realFfV0State == 4)
             {
-                // Always stay on the startup baseline while latched.
-                realFfV0AppliedPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
-                realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                const bool hardSafetyTrip =
+                    (realFfV0TripMask & REAL_FF_V0_HARD_TRIP_MASK) != 0;
+
+                if (hardSafetyTrip)
+                {
+                    // Timer/bootstrap integrity failures remain latched on the
+                    // startup baseline until the RTOS process restarts.
+                    realFfV0AppliedPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                    realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                }
+                else
+                {
+                    // Observer-only trip: freeze, do not throw away the last
+                    // frequency that was already proven on the real actuator.
+                    realFfV0DesiredPpb = realFfV0AppliedPpb;
+                }
+
                 realFfV0LastStepPpb = 0;
 
-                // Stage 11F.2A-R1:
-                // Recover ONLY an observer-only trip. Any hard-safety bit
-                // keeps state 4 latched until the RTOS process restarts.
-                bool softObserverTripOnly =
-                    realFfV0TripMask == 0x01;
+                // Observer fallback (0x01) and prolonged DC relock (0x40)
+                // are automatically recoverable. Any 0x04/0x08 hard-safety bit
+                // remains latched until the RTOS process restarts.
+                const bool softRecoverableTripOnly =
+                    realFfV0TripMask != 0 &&
+                    (realFfV0TripMask & REAL_FF_V0_HARD_TRIP_MASK) == 0 &&
+                    (realFfV0TripMask &
+                        ~REAL_FF_V0_SOFT_RECOVERABLE_TRIP_MASK) == 0;
 
-                bool softObserverRecoveryGood =
-                    softObserverTripOnly &&
+                const bool softRecoveryGood =
+                    softRecoverableTripOnly &&
                     realPhaseGood &&
                     realPhaseState == 1 &&
                     driftCalibrationLocked &&
                     realFfV0OneShotHealthy &&
                     qpcSchedulerInitialized &&
-                    g_ecatRxDiagCurrentConsecutiveTimeout == 0;
+                    IsRealFfV0CleanRecoveryReady();
 
-                if (softObserverRecoveryGood)
+                if (softRecoveryGood)
                 {
+                    // A transient reason is released only after both the
+                    // dynamic clean gate and a new good V2 window pass.
+                    realFfV0TransientHoldReasonMask = 0;
                     realFfV0SoftRearmGood++;
 
                     if (realFfV0SoftRearmGood >=
                         REAL_FF_V0_SOFT_REARM_WINDOWS)
                     {
                         // Never jump from TRIP directly to ACTIVE.
-                        // Clear only the recoverable observer bit and
-                        // re-enter normal ARM qualification from Baseline.
-                        realFfV0TripMask &= ~0x01;
+                        // Re-enter normal ARM qualification without a frequency jump.
+                        realFfV0TripMask &=
+                            ~REAL_FF_V0_SOFT_RECOVERABLE_TRIP_MASK;
                         realFfV0State = 1;
                         realFfV0ArmGood = 0;
                         realFfV0HoldGood = 0;
                         realFfV0HoldBad = 0;
                         realFfV0SoftRearmGood = 0;
-                        realFfV0DesiredPpb =
-                            QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
-                        realFfV0AppliedPpb =
-                            QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                        realFfV0TransientHoldReasonMask = 0;
+                        realFfV0DesiredPpb = realFfV0AppliedPpb;
                         realFfV0LastStepPpb = 0;
                     }
                 }
@@ -6043,13 +7330,18 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     driftCalibrationLocked &&
                     realFfV0OneShotHealthy &&
                     qpcSchedulerInitialized &&
-                    g_ecatRxDiagCurrentConsecutiveTimeout == 0)
+                    IsRealFfV0CleanRecoveryReady())
                 {
+                    realFfV0TransientHoldReasonMask = 0;
                     realFfV0State = 1;
                     realFfV0ArmGood++;
 
                     if (realFfV0ArmGood >= REAL_FF_V0_ARM_WINDOWS)
+                    {
                         realFfV0State = 2;
+                        realFfV0TransientHoldReasonMask = 0;
+                        ResetRealFfV0RecoveryProfileAfterActive();
+                    }
                 }
                 else
                 {
@@ -6067,9 +7359,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     if (realPhaseState == 3)
                     {
                         realFfV0State = 4;
-                        realFfV0AppliedPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
-                        realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                        realFfV0DesiredPpb = realFfV0AppliedPpb;
                         realFfV0TripMask |= 0x01;
+                        realFfV0HistoryMask |= 0x01;
+                        realFfV0TransientHoldReasonMask = 0;
                         realFfV0TripCount++;
                         realFfV0SoftRearmGood = 0;
                     }
@@ -6101,17 +7394,47 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             else if (realFfV0State == 3)
             {
                 realFfV0LastStepPpb = 0;
+                realFfV0DesiredPpb = realFfV0AppliedPpb;
 
-                if (realPhaseGood)
+                const bool holdInfrastructureGood =
+                    driftCalibrationLocked &&
+                    realFfV0OneShotHealthy &&
+                    qpcSchedulerInitialized &&
+                    IsRealFfV0CleanRecoveryReady();
+
+                // While a PDO/scheduler interruption is rebuilding its observer
+                // windows, stay in HOLD without counting those expected WARMUP
+                // publications as observer failures.
+                if (realFfV0TransientHoldReasonMask != 0)
+                {
+                    realFfV0HoldGood = 0;
+                    realFfV0HoldBad = 0;
+
+                    if (holdInfrastructureGood && realPhaseGood)
+                    {
+                        realFfV0TransientHoldReasonMask = 0;
+                    }
+                }
+
+                if (realFfV0TransientHoldReasonMask != 0 ||
+                    !holdInfrastructureGood)
+                {
+                    realFfV0HoldGood = 0;
+                    realFfV0HoldBad = 0;
+                }
+                else if (realPhaseGood)
                 {
                     realFfV0HoldGood++;
                     realFfV0HoldBad = 0;
 
-                    if (realFfV0HoldGood >= REAL_FF_V0_HOLD_RECOVERY_WINDOWS)
+                    if (realFfV0HoldGood >=
+                        realFfV0HoldRecoveryWindowsRequired)
                     {
                         realFfV0State = 2;
                         realFfV0HoldGood = 0;
+                        realFfV0TransientHoldReasonMask = 0;
                         realFfV0DesiredPpb = realFfV0AppliedPpb;
+                        ResetRealFfV0RecoveryProfileAfterActive();
                     }
                 }
                 else
@@ -6124,9 +7447,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                         realFfV0HoldBad >= REAL_FF_V0_HOLD_BAD_LIMIT)
                     {
                         realFfV0State = 4;
-                        realFfV0AppliedPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
-                        realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
+                        realFfV0DesiredPpb = realFfV0AppliedPpb;
                         realFfV0TripMask |= 0x01;
+                        realFfV0HistoryMask |= 0x01;
+                        realFfV0TransientHoldReasonMask = 0;
                         realFfV0TripCount++;
                         realFfV0SoftRearmGood = 0;
                     }
@@ -8080,6 +9404,14 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 g_qpcRealFfV0State = realFfV0State;
                 g_qpcRealFfV0PhaseGood = realPhaseGood ? 1L : 0L;
                 g_qpcRealFfV0ArmGood = (LONG)realFfV0ArmGood;
+                g_qpcRealFfV0HoldMask = realFfV0TransientHoldReasonMask;
+                g_qpcRealFfV0HistoryMask = realFfV0HistoryMask;
+                g_qpcRealFfV0CleanCycles = (LONG)realFfV0CleanCycleStreak;
+                g_qpcRealFfV0CleanCyclesRequired =
+                    (LONG)realFfV0CleanCyclesRequired;
+                g_qpcRealFfV0RecoveryProfile = realFfV0RecoveryProfile;
+                g_qpcRealFfV0HoldRecoveryWindowsRequired =
+                    (LONG)realFfV0HoldRecoveryWindowsRequired;
                 g_qpcRealFfV0TripMask = realFfV0TripMask;
                 g_qpcRealFfV0TripCount = (LONG)realFfV0TripCount;
                 g_qpcRealFfV0RecommendedPpb = realPhaseRecommended;
@@ -8088,8 +9420,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 g_qpcRealFfV0LastStepPpb = (LONGLONG)realFfV0LastStepPpb;
                 g_qpcRealFfV0TargetVsFixedNs = (LONGLONG)realVsFixedNs;
                 g_qpcRealFfV0DcErrEstNs =
-                    (LONGLONG)(g_qpcLiveFfDcPhaseFixedUnwrappedErrorNs +
-                        realVsFixedNs);
+                    phasePActV0AcceptedPhaseMapValid
+                    ? (LONGLONG)(phasePActV0AcceptedFixedUnwrappedErrorNs +
+                        realVsFixedNs)
+                    : 0;
                 g_qpcRealFfV0PhaseSeq = realPhaseSeq1;
                 g_qpcRealFfV0PhaseRejectMask = realFfV0PhaseRejectMask;
                 g_qpcRealFfV0LastPhaseRejectMask = realFfV0LastPhaseRejectMask;
@@ -8100,27 +9434,307 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 MemoryBarrier();
                 InterlockedIncrement(&g_qpcRealFfV0Seq);
 
-                int64_t pBaseErrNs =
-                    (int64_t)g_qpcLiveFfDcPhaseFixedUnwrappedErrorNs +
-                    realVsFixedNs;
+                // ---------------------------------------------------------
+                // DC-RX.3C coherent Phase-P publication freshness guard.
+                //
+                // A scheduler window is allowed to consume a phase map only
+                // once. A coherent map older than 1.5 s is considered stale;
+                // a discontinuous new map is quarantined until three mutually
+                // consistent publications arrive. Existing Phase-P offset is
+                // preserved during every quarantine/HOLD transition.
+                // ---------------------------------------------------------
+                LONG pPhaseMapSeq1 =
+                    g_qpcLiveFfDcPhaseDiagSequence;
+                LONG pPhaseMapInitialized = 0;
+                LONG pPhaseMapSamples = 0;
+                LONGLONG pPhaseMapFixedUnwrappedErrorNs = 0;
+                LONGLONG pPhaseMapLastSampleQpc = 0;
+                bool pPhaseMapSnapshotCoherent = false;
 
-                int64_t pActualErrNs =
+                if (pPhaseMapSeq1 != 0 &&
+                    (pPhaseMapSeq1 & 1) == 0)
+                {
+                    MemoryBarrier();
+                    pPhaseMapInitialized =
+                        g_qpcLiveFfDcPhaseInitialized;
+                    pPhaseMapSamples =
+                        g_qpcLiveFfDcPhaseSamples;
+                    pPhaseMapFixedUnwrappedErrorNs =
+                        g_qpcLiveFfDcPhaseFixedUnwrappedErrorNs;
+                    pPhaseMapLastSampleQpc =
+                        g_qpcLiveFfDcPhaseLastSampleQpc;
+                    MemoryBarrier();
+
+                    const LONG pPhaseMapSeq2 =
+                        g_qpcLiveFfDcPhaseDiagSequence;
+                    pPhaseMapSnapshotCoherent =
+                        pPhaseMapSeq1 == pPhaseMapSeq2 &&
+                        (pPhaseMapSeq2 & 1) == 0;
+                }
+
+                const bool pPhaseMapNew =
+                    pPhaseMapSnapshotCoherent &&
+                    pPhaseMapSeq1 != phasePActV0LastSeenPhaseMapSeq;
+
+                if (pPhaseMapSnapshotCoherent)
+                {
+                    phasePActV0LastSeenPhaseMapSeq = pPhaseMapSeq1;
+                }
+
+                uint64_t pPhaseMapAgeNs = 0;
+                bool pPhaseMapAgeConvertible = false;
+
+                if (pPhaseMapSnapshotCoherent &&
+                    pPhaseMapLastSampleQpc > 0 &&
+                    actualWakeQpc >= (uint64_t)pPhaseMapLastSampleQpc)
+                {
+                    pPhaseMapAgeConvertible =
+                        QpcCountsToNsSafe(
+                            actualWakeQpc -
+                            (uint64_t)pPhaseMapLastSampleQpc,
+                            &pPhaseMapAgeNs);
+                }
+
+                const bool pPhaseMapCurrentUsable =
+                    pPhaseMapSnapshotCoherent &&
+                    pPhaseMapInitialized != 0 &&
+                    pPhaseMapSamples > 0 &&
+                    pPhaseMapAgeConvertible &&
+                    pPhaseMapAgeNs <= DC_RX3C_PHASE_MAP_MAX_AGE_NS;
+
+                const bool pPhaseObservationFresh =
+                    !realFfV0CycleQualityKnown ||
+                    (realFfV0PreviousDcTransportValid &&
+                        realFfV0PreviousDcSampleQualified);
+
+                const bool pPhaseObservationEligible =
+                    pPhaseMapNew &&
+                    pPhaseMapCurrentUsable &&
+                    qpcSchedulerInitialized &&
+                    pPhaseObservationFresh &&
+                    (realFfV0TripMask & REAL_FF_V0_HARD_TRIP_MASK) == 0;
+
+                // DC-RX.3F PHASE_MAP_JUMP alters only this local consumer copy.
+                // The producer snapshot remains untouched, so the next genuine
+                // publication proves that quarantine/requalification can recover.
+                if (dcRx3fInjectionRequestedThisCycle &&
+                    dcRx3fScenario == DcRx3fFaultScenario::PhaseMapJump &&
+                    pPhaseObservationEligible &&
+                    !phasePRecoveryJumpGuardActive &&
+                    dcRx3fConfiguredValueNs > 0)
+                {
+                    pPhaseMapFixedUnwrappedErrorNs +=
+                        (LONGLONG)dcRx3fConfiguredValueNs;
+                    dcRx3fInjectionAppliedThisCycle = true;
+                }
+
+                bool pPhaseMapAcceptedThisWindow = false;
+
+                auto WrapPhaseValueNs =
+                    [&](int64_t valueNs) -> int64_t
+                {
+                    int64_t wrappedNs =
+                        valueNs % PHASE_P_ACT_CYCLE_NS;
+
+                    if (wrappedNs > PHASE_P_ACT_CYCLE_NS / 2LL)
+                        wrappedNs -= PHASE_P_ACT_CYCLE_NS;
+
+                    if (wrappedNs < -PHASE_P_ACT_CYCLE_NS / 2LL)
+                        wrappedNs += PHASE_P_ACT_CYCLE_NS;
+
+                    return wrappedNs;
+                };
+
+                auto WrapPhaseJumpNs =
+                    [&](int64_t currentNs, int64_t previousNs) -> int64_t
+                {
+                    return WrapPhaseValueNs(currentNs - previousNs);
+                };
+
+                if (pPhaseObservationEligible)
+                {
+                    const int64_t pCandidateBaseWrappedNs =
+                        WrapPhaseValueNs(
+                            (int64_t)pPhaseMapFixedUnwrappedErrorNs +
+                            realVsFixedNs);
+
+                    bool acceptCurrentMap = false;
+
+                    if (!phasePActV0AcceptedPhaseMapValid &&
+                        !phasePRecoveryJumpGuardActive)
+                    {
+                        // Initial bind is safe because no previous phase command
+                        // exists to jump away from.
+                        acceptCurrentMap = true;
+                    }
+                    else if (phasePRecoveryJumpGuardActive)
+                    {
+                        if (!phasePRecoveryJumpReferenceValid)
+                        {
+                            phasePRecoveryJumpReferenceWrappedNs =
+                                pCandidateBaseWrappedNs;
+                            phasePRecoveryJumpReferenceValid = true;
+                            phasePRecoveryJumpGoodWindows = 1;
+                        }
+                        else
+                        {
+                            const int64_t jumpNs =
+                                WrapPhaseJumpNs(
+                                    pCandidateBaseWrappedNs,
+                                    phasePRecoveryJumpReferenceWrappedNs);
+                            const int64_t jumpAbsNs =
+                                jumpNs >= 0 ? jumpNs : -jumpNs;
+
+                            phasePRecoveryJumpLastNs = jumpNs;
+                            if (jumpAbsNs > phasePRecoveryJumpMaximumAbsNs)
+                            {
+                                phasePRecoveryJumpMaximumAbsNs = jumpAbsNs;
+                            }
+
+                            phasePRecoveryJumpReferenceWrappedNs =
+                                pCandidateBaseWrappedNs;
+
+                            if (jumpAbsNs <= DC_RX3C_PHASE_JUMP_MAX_NS)
+                            {
+                                if (phasePRecoveryJumpGoodWindows <
+                                    DC_RX3C_PHASE_JUMP_GOOD_WINDOWS)
+                                {
+                                    phasePRecoveryJumpGoodWindows++;
+                                }
+
+                                if (phasePRecoveryJumpGoodWindows >=
+                                    DC_RX3C_PHASE_JUMP_GOOD_WINDOWS)
+                                {
+                                    phasePRecoveryJumpGuardActive = false;
+                                    phasePRecoveryJumpReferenceValid = false;
+                                    phasePRecoveryJumpGoodWindows =
+                                        DC_RX3C_PHASE_JUMP_GOOD_WINDOWS;
+                                    phasePRecoveryJumpPassTotal++;
+                                    acceptCurrentMap = true;
+                                }
+                            }
+                            else
+                            {
+                                // The new publication becomes the next
+                                // candidate, but cannot control Phase-P yet.
+                                phasePRecoveryJumpGoodWindows = 1;
+                                phasePRecoveryJumpRejectTotal++;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        const int64_t jumpNs =
+                            WrapPhaseJumpNs(
+                                pCandidateBaseWrappedNs,
+                                phasePActV0LastObservedWrappedNs);
+                        const int64_t jumpAbsNs =
+                            jumpNs >= 0 ? jumpNs : -jumpNs;
+
+                        phasePRecoveryJumpLastNs = jumpNs;
+                        if (jumpAbsNs > phasePRecoveryJumpMaximumAbsNs)
+                        {
+                            phasePRecoveryJumpMaximumAbsNs = jumpAbsNs;
+                        }
+
+                        if (phasePActV0LastObservedWrappedValid &&
+                            jumpAbsNs > DC_RX3C_PHASE_JUMP_MAX_NS)
+                        {
+                            ArmPhasePRecoveryJumpGuard(false);
+                            phasePRecoveryJumpReferenceWrappedNs =
+                                pCandidateBaseWrappedNs;
+                            phasePRecoveryJumpReferenceValid = true;
+                            phasePRecoveryJumpGoodWindows = 1;
+                            phasePRecoveryJumpRejectTotal++;
+                        }
+                        else
+                        {
+                            acceptCurrentMap = true;
+                        }
+                    }
+
+                    if (acceptCurrentMap)
+                    {
+                        phasePActV0AcceptedPhaseMapValid = true;
+                        phasePActV0AcceptedFixedUnwrappedErrorNs =
+                            (int64_t)pPhaseMapFixedUnwrappedErrorNs;
+                        phasePActV0AcceptedPhaseMapQpc =
+                            (uint64_t)pPhaseMapLastSampleQpc;
+                        phasePActV0LastAcceptedPhaseMapSeq =
+                            pPhaseMapSeq1;
+                        phasePActV0LastObservedWrappedNs =
+                            pCandidateBaseWrappedNs;
+                        phasePActV0LastObservedWrappedValid = true;
+                        pPhaseMapAcceptedThisWindow = true;
+                    }
+                }
+
+                uint64_t pAcceptedPhaseMapAgeNs = 0;
+                bool pAcceptedPhaseMapAgeGood = false;
+
+                if (phasePActV0AcceptedPhaseMapValid &&
+                    actualWakeQpc >= phasePActV0AcceptedPhaseMapQpc &&
+                    QpcCountsToNsSafe(
+                        actualWakeQpc - phasePActV0AcceptedPhaseMapQpc,
+                        &pAcceptedPhaseMapAgeNs))
+                {
+                    pAcceptedPhaseMapAgeGood =
+                        pAcceptedPhaseMapAgeNs <=
+                        DC_RX3C_PHASE_MAP_MAX_AGE_NS;
+                }
+
+                if (!pAcceptedPhaseMapAgeGood)
+                {
+                    if (!phasePActV0PhaseMapStaleEpisodeActive &&
+                        phasePActV0AcceptedPhaseMapValid)
+                    {
+                        phasePActV0PhaseMapStaleEpisodeActive = true;
+                        if (phasePActV0PhaseMapStaleTotal !=
+                            0xFFFFFFFFFFFFFFFFULL)
+                        {
+                            phasePActV0PhaseMapStaleTotal++;
+                        }
+                    }
+
+                    if (phasePActV0State == 2)
+                    {
+                        ArmPhasePRecoveryJumpGuard(true);
+                    }
+                }
+                else
+                {
+                    phasePActV0PhaseMapStaleEpisodeActive = false;
+                }
+
+                phasePActV0DiagPhaseMapSequence =
+                    phasePActV0LastAcceptedPhaseMapSeq;
+                phasePActV0DiagPhaseMapNew =
+                    pPhaseMapAcceptedThisWindow;
+                phasePActV0DiagPhaseMapAgeGood =
+                    pAcceptedPhaseMapAgeGood;
+                phasePActV0DiagPhaseMapAgeNs =
+                    pAcceptedPhaseMapAgeNs;
+
+                const int64_t pBaseErrNs =
+                    phasePActV0AcceptedPhaseMapValid
+                    ? phasePActV0AcceptedFixedUnwrappedErrorNs +
+                    realVsFixedNs
+                    : 0;
+
+                const int64_t pActualErrNs =
                     pBaseErrNs + phasePActV0OffsetNs;
 
-                int64_t pWrappedErrNs =
-                    pActualErrNs % PHASE_P_ACT_CYCLE_NS;
+                const int64_t pWrappedErrNs =
+                    WrapPhaseValueNs(pActualErrNs);
 
-                if (pWrappedErrNs > PHASE_P_ACT_CYCLE_NS / 2LL)
-                    pWrappedErrNs -= PHASE_P_ACT_CYCLE_NS;
-
-                if (pWrappedErrNs < -PHASE_P_ACT_CYCLE_NS / 2LL)
-                    pWrappedErrNs += PHASE_P_ACT_CYCLE_NS;
-
-                bool pGateGood =
+                const bool pGateGood =
                     realFfV0State == 2 &&
                     realPhaseGood &&
                     realFfV0TripMask == 0 &&
-                    qpcSchedulerInitialized;
+                    qpcSchedulerInitialized &&
+                    phasePActV0AcceptedPhaseMapValid &&
+                    pAcceptedPhaseMapAgeGood &&
+                    !phasePRecoveryJumpGuardActive;
 
                 // ---------------------------------------------------------
                 // Phase-P 正式控制器
@@ -8137,7 +9751,11 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     if (pGateGood)
                     {
                         phasePActV0State = 1;
-                        phasePActV0ArmGood++;
+
+                        if (pPhaseMapAcceptedThisWindow)
+                        {
+                            phasePActV0ArmGood++;
+                        }
 
                         if (phasePActV0ArmGood >= PHASE_P_ACT_ARM_WINDOWS)
                             phasePActV0State = 2;
@@ -8171,7 +9789,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     }
                     else if (pGateGood)
                     {
-                        phasePActV0HoldGood++;
+                        if (pPhaseMapAcceptedThisWindow)
+                        {
+                            phasePActV0HoldGood++;
+                        }
 
                         if (phasePActV0HoldGood >=
                             PHASE_P_ACT_HOLD_RECOVERY_WINDOWS)
@@ -8212,8 +9833,15 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     pWrappedErrNs >= 0
                     ? pWrappedErrNs : -pWrappedErrNs;
 
+                const bool pCorrectionSampleFresh =
+                    pPhaseMapAcceptedThisWindow &&
+                    (!realFfV0CycleQualityKnown ||
+                        realFfV0PreviousDcSampleQualified) &&
+                    !phasePRecoveryJumpGuardActive;
+
                 if (phasePActV0State == 2 &&
                     pGateGood &&
+                    pCorrectionSampleFresh &&
                     pAbsErrNs > PHASE_P_ACT_DEADBAND_NS)
                 {
                     // 負回授：誤差為正就減少 offset，誤差為負就增加 offset。
@@ -8274,6 +9902,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 bool pImprove =
                     phasePActV0State == 2 &&
                     pGateGood &&
+                    pCorrectionSampleFresh &&
                     (
                         pAbsErrNs <= PHASE_P_ACT_DEADBAND_NS ||
                         pAbsPredictedNs < pAbsErrNs
@@ -9608,29 +11237,91 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         }
 
 
-        bool realFfCycleSafe =
+        // DC-RX.3F SCHEDULER_RECOVERY is a logical recovery-path test.
+        // The real timer was already re-armed successfully; only the controller
+        // result is overridden so no artificial timer miss is created.
+        if (dcRx3fInjectionRequestedThisCycle &&
+            dcRx3fScenario == DcRx3fFaultScenario::SchedulerRecovery &&
             rearmOk &&
             !usedBootstrap &&
-            !runtimeRecoveryThisCycle &&
-            g_ecatRxDiagCurrentConsecutiveTimeout == 0;
-
-        if ((realFfV0State == 2 || realFfV0State == 3) &&
-            !realFfCycleSafe)
+            !runtimeRecoveryThisCycle)
         {
-            LONG mask = 0;
-            if (g_ecatRxDiagCurrentConsecutiveTimeout != 0) mask |= 0x02;
-            if (usedBootstrap) mask |= 0x04;
-            if (!rearmOk) mask |= 0x08;
-            if (runtimeRecoveryThisCycle) mask |= 0x10;
+            runtimeRecoveryThisCycle = true;
+            dcRx3fInjectionAppliedThisCycle = true;
+        }
 
+        currentSchedulerEvaluated = true;
+        currentSchedulerRearmOk = rearmOk;
+        currentSchedulerUsedBootstrap = usedBootstrap;
+        currentSchedulerRuntimeRecovery = runtimeRecoveryThisCycle;
+
+        LONG hardTripMask = 0;
+        if (usedBootstrap) hardTripMask |= 0x04;
+        if (!rearmOk) hardTripMask |= 0x08;
+
+        const bool realFfCanLatchHardTrip =
+            realFfV0State == 2 ||
+            realFfV0State == 3 ||
+            (realFfV0State == 4 &&
+                (realFfV0TripMask & REAL_FF_V0_HARD_TRIP_MASK) == 0);
+
+        if (hardTripMask != 0 && realFfCanLatchHardTrip)
+        {
             realFfV0State = 4;
             realFfV0AppliedPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
             realFfV0DesiredPpb = QPC_SCHEDULER_ASSUMED_DRIFT_PPB;
             realFfV0LastStepPpb = 0;
-            realFfV0TripMask |= mask;
+            realFfV0TripMask |= hardTripMask;
+            realFfV0HistoryMask |= hardTripMask;
+            realFfV0TransientHoldReasonMask = 0;
             realFfV0TripCount++;
             realFfV0SoftRearmGood = 0;
         }
+        else if (hardTripMask != 0 &&
+            (realFfV0State == 0 || realFfV0State == 1))
+        {
+            // Startup/ARM has not yet earned ACTIVE authority. Return to WAIT,
+            // but do not create a latched trip merely for bootstrap qualification.
+            realFfV0State = 0;
+            realFfV0ArmGood = 0;
+            realFfV0DesiredPpb = realFfV0AppliedPpb;
+            realFfV0LastStepPpb = 0;
+        }
+        else if (hardTripMask == 0)
+        {
+            LONG transientReasonMask = 0;
+
+            if (runtimeRecoveryThisCycle)
+            {
+                transientReasonMask |= REAL_FF_V0_TRANSIENT_SCHEDULER_REASON;
+            }
+
+            if (realFfV0CycleQualityKnown &&
+                !realFfV0PreviousCycleClean)
+            {
+                transientReasonMask |=
+                    realFfV0PreviousCycleReasonMask != 0
+                    ? realFfV0PreviousCycleReasonMask
+                    : REAL_FF_V0_TRANSIENT_SCHEDULER_REASON;
+            }
+
+            if (transientReasonMask != 0)
+            {
+                // A scheduler target skip changes the timeline immediately, so
+                // always reopen observers. A previous PDO failure was already
+                // reopened at the end of the callback that detected it.
+                EnterRealFfV0TransientHold(
+                    transientReasonMask,
+                    runtimeRecoveryThisCycle);
+            }
+        }
+
+        bool realFfCycleSafe =
+            rearmOk &&
+            !usedBootstrap &&
+            !runtimeRecoveryThisCycle &&
+            (!realFfV0CycleQualityKnown ||
+                realFfV0PreviousCycleClean);
 
         realFfV0OneShotHealthy = realFfCycleSafe;
 
@@ -10207,31 +11898,35 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     0;
 
 
-                RtPrintf(
-                    "[DC-HAL-BURST-START] "
-                    "Current:%lu | "
-                    "Base:%lu | "
-                    "Command:%lld ppb\n",
-
-                    (unsigned long)
-                    currentCounts,
-
-                    (unsigned long)
-                    baseCounts,
-
-                    (long long)
-                    pMaster->
-                    m_dcHalFrequencyCommandPpb);
+                PublishP64DeferredDiagnostic(
+                    EtherCatP64DeferredDiagKind::HalBurstStart,
+                    static_cast<uint64_t>(pMaster->tickCount_PDO),
+                    static_cast<int64_t>(currentCounts),
+                    static_cast<int64_t>(baseCounts),
+                    static_cast<int64_t>(
+                        pMaster->m_dcHalFrequencyCommandPpb),
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL);
             }
             else
             {
-                RtPrintf(
-                    "[DC-HAL-BURST-FAULT] "
-                    "GetHalTimerPeriodCounts FAILED | "
-                    "Error:%lu\n",
+                const DWORD errorCode =
+                    GetLastError();
 
-                    (unsigned long)
-                    GetLastError());
+                PublishP64DeferredDiagnostic(
+                    EtherCatP64DeferredDiagKind::HalBurstGetCountsFailed,
+                    static_cast<uint64_t>(pMaster->tickCount_PDO),
+                    static_cast<int64_t>(errorCode),
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL);
 
 
                 halActuatorFault =
@@ -10297,12 +11992,17 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 if (burstAltCycles >
                     4000U)
                 {
-                    RtPrintf(
-                        "[DC-HAL-BURST-FAULT] "
-                        "AltCycles invalid:%u\n",
-
-                        (unsigned int)
-                        burstAltCycles);
+                    PublishP64DeferredDiagnostic(
+                        EtherCatP64DeferredDiagKind::HalBurstAltCyclesInvalid,
+                        static_cast<uint64_t>(pMaster->tickCount_PDO),
+                        static_cast<int64_t>(burstAltCycles),
+                        0LL,
+                        0LL,
+                        0LL,
+                        0LL,
+                        0LL,
+                        0LL,
+                        0LL);
 
 
                     halActuatorFault =
@@ -10310,28 +12010,17 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 }
                 else
                 {
-                    RtPrintf(
-                        "[DC-HAL-BURST-PLAN] "
-                        "AltCycles:%u | "
-                        "BaseCycles:%u | "
-                        "Remainder:%llu | "
-                        "Step:%llu\n",
-
-                        (unsigned int)
-                        burstAltCycles,
-
-                        (unsigned int)
-                        (
-                            4000U -
-                            burstAltCycles
-                            ),
-
-                        (unsigned long long)
-                        burstFractionRemainder,
-
-                        (unsigned long long)
-                        pMaster->
-                        m_dcHalDitherStep);
+                    PublishP64DeferredDiagnostic(
+                        EtherCatP64DeferredDiagKind::HalBurstPlan,
+                        static_cast<uint64_t>(pMaster->tickCount_PDO),
+                        static_cast<int64_t>(burstAltCycles),
+                        static_cast<int64_t>(4000U - burstAltCycles),
+                        static_cast<int64_t>(burstFractionRemainder),
+                        static_cast<int64_t>(pMaster->m_dcHalDitherStep),
+                        0LL,
+                        0LL,
+                        0LL,
+                        0LL);
                 }
             }
 
@@ -10413,16 +12102,17 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             GetLastError();
 
 
-                        RtPrintf(
-                            "[DC-HAL-BURST-FAULT] "
-                            "Set:%lu FAILED | "
-                            "Error:%lu\n",
-
-                            (unsigned long)
-                            desiredCounts,
-
-                            (unsigned long)
-                            errorCode);
+                        PublishP64DeferredDiagnostic(
+                            EtherCatP64DeferredDiagKind::HalBurstSetFailed,
+                            static_cast<uint64_t>(pMaster->tickCount_PDO),
+                            static_cast<int64_t>(desiredCounts),
+                            static_cast<int64_t>(errorCode),
+                            0LL,
+                            0LL,
+                            0LL,
+                            0LL,
+                            0LL,
+                            0LL);
 
 
                         // =====================================
@@ -10444,23 +12134,35 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 m_dcHalBaseCounts;
 
 
-                            RtPrintf(
-                                "[DC-HAL-BURST-FAULT] "
-                                "Base restored:%u\n",
-
-                                (unsigned int)
-                                pMaster->
-                                m_dcHalBaseCounts);
+                            PublishP64DeferredDiagnostic(
+                                EtherCatP64DeferredDiagKind::HalBurstBaseRestored,
+                                static_cast<uint64_t>(pMaster->tickCount_PDO),
+                                static_cast<int64_t>(
+                                    pMaster->m_dcHalBaseCounts),
+                                0LL,
+                                0LL,
+                                0LL,
+                                0LL,
+                                0LL,
+                                0LL,
+                                0LL);
                         }
                         else
                         {
-                            RtPrintf(
-                                "[DC-HAL-BURST-FAULT] "
-                                "BASE RESTORE FAILED | "
-                                "Error:%lu\n",
+                            const DWORD restoreErrorCode =
+                                GetLastError();
 
-                                (unsigned long)
-                                GetLastError());
+                            PublishP64DeferredDiagnostic(
+                                EtherCatP64DeferredDiagKind::HalBurstBaseRestoreFailed,
+                                static_cast<uint64_t>(pMaster->tickCount_PDO),
+                                static_cast<int64_t>(restoreErrorCode),
+                                0LL,
+                                0LL,
+                                0LL,
+                                0LL,
+                                0LL,
+                                0LL,
+                                0LL);
                         }
 
 
@@ -10505,45 +12207,17 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     }
 
 
-                    RtPrintf(
-                        "[DC-HAL-BURST] "
-                        "BaseCycles:%llu | "
-                        "AltCycles:%llu | "
-                        "Duty:%llu.%03llu %% | "
-                        "Applied:%lu | "
-                        "SetOK:%llu | "
-                        "SetFail:%llu | "
-                        "Remainder:%llu\n",
-
-                        (unsigned long long)
-                        burstBaseCycleCount,
-
-                        (unsigned long long)
-                        burstAlternateCycleCount,
-
-                        (unsigned long long)
-                        (
-                            altDutyPercentX1000 /
-                            1000ULL
-                            ),
-
-                        (unsigned long long)
-                        (
-                            altDutyPercentX1000 %
-                            1000ULL
-                            ),
-
-                        (unsigned long)
-                        lastAppliedHalCounts,
-
-                        (unsigned long long)
-                        halSetSuccessCount,
-
-                        (unsigned long long)
-                        halSetFailureCount,
-
-                        (unsigned long long)
-                        burstFractionRemainder);
+                    PublishP64DeferredDiagnostic(
+                        EtherCatP64DeferredDiagKind::HalBurstSummary,
+                        static_cast<uint64_t>(pMaster->tickCount_PDO),
+                        static_cast<int64_t>(burstBaseCycleCount),
+                        static_cast<int64_t>(burstAlternateCycleCount),
+                        static_cast<int64_t>(altDutyPercentX1000),
+                        static_cast<int64_t>(lastAppliedHalCounts),
+                        static_cast<int64_t>(halSetSuccessCount),
+                        static_cast<int64_t>(halSetFailureCount),
+                        static_cast<int64_t>(burstFractionRemainder),
+                        0LL);
 
 
                     // =========================================
@@ -10606,14 +12280,17 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                     m_dcHalBaseCounts;
 
 
-                RtPrintf(
-                    "[DC-HAL-BURST] "
-                    "Actuator disabled -> "
-                    "Base restored:%u\n",
-
-                    (unsigned int)
-                    pMaster->
-                    m_dcHalBaseCounts);
+                PublishP64DeferredDiagnostic(
+                    EtherCatP64DeferredDiagKind::HalBurstDisabledBaseRestored,
+                    static_cast<uint64_t>(pMaster->tickCount_PDO),
+                    static_cast<int64_t>(pMaster->m_dcHalBaseCounts),
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL,
+                    0LL);
             }
         }
     }
@@ -10815,8 +12492,19 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     static uint32_t pdoConsecutiveInvalidCycles =
         0;
 
-    // 上一週期有效才把新的 PLC output 刷入實體 IO Map；若通訊已失效，保留
-    // 最後送出資料並等待安全處置，避免錯誤期間繼續注入變化的命令。
+    // DC-RX.3A：DC sample transport 與 LRW Process Data 各自維護品質。
+    // DC-only invalid 不會增加 pdoConsecutiveInvalidCycles，也不會阻止 PLC/Motion；
+    // 它只讓 DC controller 進入 last-known-good frequency holdover。
+    static uint32_t dcTransportConsecutiveInvalidCycles = 0;
+    static uint32_t dcTransportMaximumInvalidCycles = 0;
+    static uint64_t dcWkcInvalidCyclesTotal = 0;
+    static uint64_t dcOnlyInvalidCyclesTotal = 0;
+    static uint64_t dcTransportRecoveryTotal = 0;
+    static bool dcTransportQualityKnown = false;
+    static bool previousDcTransportValid = true;
+
+    // 上一週期 Process Data 有效才把新的 PLC output 刷入實體 IO Map；若 LRW
+    // 已失效，保留最後送出資料並等待安全處置，避免錯誤期間注入變化命令。
     if (pdoConsecutiveInvalidCycles == 0)
     {
         pMaster->m_Plc.FlushOutputs();
@@ -10840,6 +12528,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
     int dcWkc =
         0;
+
+    // DC-RX.3D receives the exact software TX/RX window only when a fully
+    // correlated LRW+FRMW response is accepted by ecx_LRW_FRMW().
+    EtherCatDcCycleTiming dcCycleTiming = {};
 
     // =============================================================
 // EtherCAT combined call 前的 QPC 時間戳
@@ -10912,7 +12604,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 &pMaster->
                         DC_reference_time,
                         &dcWkc,
-                        50);
+                        50,
+                        &dcCycleTiming);
     }
     else
     {
@@ -10952,19 +12645,1337 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         }
     }
 
+    // ---------------------------------------------------------
+    // DC-RX.3F logical transport/sample overrides
+    //
+    // The real LRW+FRMW transaction always completes first. A test replaces
+    // only the result consumed by the downstream quality state machines, so
+    // fault containment is reproducible without intentionally disturbing the
+    // physical EtherCAT wire or NAL queue.
+    // ---------------------------------------------------------
+    const bool dcRx3fActualLrwValid =
+        wkc == pMaster->EXPECTED_WKC_PDO;
+    const bool dcRx3fActualDcValid =
+        dcReferenceSlaveIndex < 0 || dcWkc > 0;
+    const bool dcRx3fActualCombinedValid =
+        dcRx3fActualLrwValid && dcRx3fActualDcValid;
+    const bool dcRx3fActualExactTimingValid =
+        dcCycleTiming.valid != 0U &&
+        dcCycleTiming.source ==
+        (uint32_t)EtherCatDcCycleTimingSource::ExactSoftwareTxRx &&
+        dcCycleTiming.softwareRoundTripCounts > 0 &&
+        dcCycleTiming.sampleMidpointQpc > 0;
+
+    if (dcRx3fInjectionRequestedThisCycle &&
+        !dcRx3fInjectionAppliedThisCycle)
+    {
+        switch (dcRx3fScenario)
+        {
+        case DcRx3fFaultScenario::DcWkcDrop:
+            if (dcReferenceSlaveIndex >= 0 &&
+                dcRx3fActualCombinedValid)
+            {
+                dcWkc = 0;
+                dcRx3fInjectionAppliedThisCycle = true;
+            }
+            break;
+
+        case DcRx3fFaultScenario::LrwWkcDrop:
+            if (dcRx3fActualCombinedValid &&
+                pMaster->EXPECTED_WKC_PDO > 0)
+            {
+                wkc = pMaster->EXPECTED_WKC_PDO - 1;
+                dcRx3fInjectionAppliedThisCycle = true;
+            }
+            break;
+
+        case DcRx3fFaultScenario::LrwTimeout:
+            if (dcRx3fActualCombinedValid)
+            {
+                wkc = -1;
+                dcRx3fInjectionAppliedThisCycle = true;
+            }
+            break;
+
+        case DcRx3fFaultScenario::ExactTimingMissing:
+            if (dcRx3fActualCombinedValid &&
+                dcRx3fActualExactTimingValid)
+            {
+                dcCycleTiming.valid = 0U;
+                dcRx3fInjectionAppliedThisCycle = true;
+            }
+            break;
+
+        case DcRx3fFaultScenario::LateRtt:
+            if (dcRx3fActualCombinedValid &&
+                dcRx3fActualExactTimingValid &&
+                qpcFrequency > 0 &&
+                dcRx3fConfiguredValueNs > 0 &&
+                dcRx3fConfiguredValueNs <=
+                0xFFFFFFFFFFFFFFFFULL / qpcFrequency)
+            {
+                const uint64_t forcedRttProduct =
+                    dcRx3fConfiguredValueNs * qpcFrequency;
+
+                uint64_t forcedRttCounts =
+                    forcedRttProduct / 1000000000ULL;
+
+                if ((forcedRttProduct % 1000000000ULL) != 0)
+                {
+                    forcedRttCounts++;
+                }
+
+                if (forcedRttCounts == 0)
+                {
+                    forcedRttCounts = 1;
+                }
+
+                dcCycleTiming.softwareRoundTripCounts =
+                    forcedRttCounts;
+                dcRx3fInjectionAppliedThisCycle = true;
+            }
+            break;
+
+        case DcRx3fFaultScenario::DcTimestampRepeat:
+            if (dcRx3fActualCombinedValid &&
+                dcRx3fBaselineAcceptedDcNs > 0)
+            {
+                pMaster->DC_reference_time =
+                    dcRx3fBaselineAcceptedDcNs;
+                dcRx3fInjectionAppliedThisCycle = true;
+            }
+            break;
+
+        case DcRx3fFaultScenario::DcTimestampBackward:
+            if (dcRx3fActualCombinedValid &&
+                dcRx3fConfiguredValueNs > 0 &&
+                dcRx3fBaselineAcceptedDcNs >
+                dcRx3fConfiguredValueNs)
+            {
+                pMaster->DC_reference_time =
+                    dcRx3fBaselineAcceptedDcNs -
+                    dcRx3fConfiguredValueNs;
+                dcRx3fInjectionAppliedThisCycle = true;
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+
     const bool pdoWkcValid =
         wkc == pMaster->EXPECTED_WKC_PDO;
 
+    // DC-RX.3A/3B quality split:
+    //   Process Data validity is decided by LRW WKC only.
+    //   DC transport validity additionally requires a successful FRMW DC WKC.
+    // A DC-only miss therefore freezes/requalifies DC observers while PDO/PLC/Motion
+    // continue from a coherent LRW process image.
+    const bool processDataValid =
+        pdoWkcValid;
+
+    const bool dcReferencePresent =
+        dcReferenceSlaveIndex >= 0;
+
     const bool dcWkcValid =
-        dcReferenceSlaveIndex < 0 ||
+        !dcReferencePresent ||
         dcWkc > 0;
 
-    const bool pdoCycleValid =
-        pdoWkcValid && dcWkcValid;
+    const bool dcTransportValid =
+        processDataValid &&
+        dcWkcValid;
 
-    // 只有 PDO WKC 與 DC WKC 同時有效才允許採用 Input 與更新控制器。
-    // 無 DC reference slave 時 dcWkcValid 固定為 true，系統退化為普通 LRW 模式。
-    if (pdoCycleValid)
+    const bool dcOnlyInvalid =
+        dcReferencePresent &&
+        processDataValid &&
+        !dcWkcValid;
+
+    // ---------------------------------------------------------
+    // DC-RX.3C/3D sample freshness + exact timing-source guard
+    //
+    // WKC proves that a matching FRMW datagram returned, but it does not prove
+    // that the captured DC time is chronologically fresh. DC-RX.3D additionally
+    // removes variable frame-build/post-RX software time from the QPC pairing by
+    // preferring the exact SendPacket()/matching ReceivePacket() window returned
+    // by ecx_LRW_FRMW().
+    //
+    // Policy:
+    //   - Exact TX/RX timing is preferred immediately when available.
+    //   - Whole-call midpoint remains a startup compatibility fallback only.
+    //   - After exact timing has appeared once, a missing exact timestamp is a
+    //     recoverable DC-only sample miss; the session never flaps back to the
+    //     wider call midpoint and therefore never injects a fixed phase bias.
+    // ---------------------------------------------------------
+    uint64_t qpcDcRttNs = 0;
+    uint64_t qpcDcMidCount = 0;
+    uint64_t qpcDcApproxAgeNs = 0;
+    uint64_t qpcDcExactRttNs = 0;
+    uint64_t qpcDcCallRttNs = 0;
+    uint64_t qpcDcExcludedOverheadNs = 0;
+    int64_t qpcDcMidpointShiftNs = 0;
+    bool qpcDcCallTimingAvailable = false;
+    bool qpcDcExactTimingAvailable = false;
+    const bool dcReferenceTimeValueValid =
+        pMaster->DC_reference_time > 0;
+    bool dcSampleTimingCandidate = false;
+    bool dcSampleFreshnessAccepted = false;
+    bool dcSampleGuardWarmupThisCycle = false;
+    bool dcSampleFreshnessReanchorThisCycle = false;
+    bool dcSampleTimingSourceChangedThisCycle = false;
+    bool dcRttGuardEvaluatedThisCycle = false;
+    bool dcRttGuardAcceptedThisCycle = false;
+    bool dcRttGuardRebaseThisCycle = false;
+    LONG dcSampleTimingSourceThisCycle = DC_RX3D_TIMING_SOURCE_NONE;
+    LONG dcSampleGuardReasonMask = 0;
+
+    uint64_t qpcDcCallMidCount = 0;
+    if (dcTransportValid &&
+        dcReferencePresent &&
+        qpcDcBeforeValid &&
+        qpcDcAfterValid &&
+        qpcFrequency > 0)
+    {
+        const uint64_t qpcDcCallRttCounts =
+            (uint64_t)(qpcDcAfter.QuadPart - qpcDcBefore.QuadPart);
+
+        if (qpcDcCallRttCounts > 0 &&
+            QpcCountsToNsSafe(qpcDcCallRttCounts, &qpcDcCallRttNs))
+        {
+            qpcDcCallMidCount =
+                (uint64_t)qpcDcBefore.QuadPart +
+                qpcDcCallRttCounts / 2ULL;
+            qpcDcCallTimingAvailable = true;
+        }
+    }
+
+    if (dcTransportValid &&
+        dcReferencePresent &&
+        dcCycleTiming.valid != 0U &&
+        dcCycleTiming.source ==
+        (uint32_t)EtherCatDcCycleTimingSource::ExactSoftwareTxRx &&
+        dcCycleTiming.softwareRoundTripCounts > 0 &&
+        dcCycleTiming.sampleMidpointQpc > 0 &&
+        dcCycleTiming.rxAfterMatchQpc >= dcCycleTiming.txAfterSendQpc &&
+        dcCycleTiming.txAfterSendQpc >= dcCycleTiming.txBeforeSendQpc &&
+        QpcCountsToNsSafe(
+            dcCycleTiming.softwareRoundTripCounts,
+            &qpcDcExactRttNs))
+    {
+        qpcDcExactTimingAvailable = true;
+    }
+
+    // -----------------------------------------------------------------
+    // DC-RX.3E: adaptive exact-RTT envelope / late-sample quarantine.
+    //
+    // The 210 us RX hard deadline decides whether Process Data arrived in
+    // time.  DC phase/frequency control needs a stricter contract: a frame
+    // can still beat that deadline yet carry an unusually large receive-IST,
+    // queue, or scheduler delay in its software midpoint.  Such a frame is
+    // valid Process Data, but it must not steer the DC observer.
+    //
+    // The guard learns the low-latency exact RTT floor for 32 ms, then accepts
+    // Base + max(50 us, 3 x deviation + 10 us), capped at 200 us.  A stable
+    // new latency regime may rebase after 64 coherent samples (16 ms).  An
+    // isolated late sample is rejected only from DC; PDO/PLC/Motion remain on
+    // the Process Data quality path introduced by DC-RX.3A.
+    // -----------------------------------------------------------------
+    auto ComputeDcRttGuardLimit = [&]() -> uint64_t
+    {
+        if (dcRttGuardBaselineNs == 0)
+        {
+            return DC_RX3E_RTT_ABSOLUTE_LIMIT_NS;
+        }
+
+        uint64_t scaledDeviationNs = dcRttGuardDeviationNs;
+        if (scaledDeviationNs >
+            (0xFFFFFFFFFFFFFFFFULL - DC_RX3E_RTT_JITTER_BIAS_NS) /
+            3ULL)
+        {
+            scaledDeviationNs = DC_RX3E_RTT_MAX_HEADROOM_NS;
+        }
+        else
+        {
+            scaledDeviationNs =
+                scaledDeviationNs * 3ULL +
+                DC_RX3E_RTT_JITTER_BIAS_NS;
+        }
+
+        uint64_t headroomNs = scaledDeviationNs;
+        if (headroomNs < DC_RX3E_RTT_MIN_HEADROOM_NS)
+        {
+            headroomNs = DC_RX3E_RTT_MIN_HEADROOM_NS;
+        }
+        if (headroomNs > DC_RX3E_RTT_MAX_HEADROOM_NS)
+        {
+            headroomNs = DC_RX3E_RTT_MAX_HEADROOM_NS;
+        }
+
+        uint64_t limitNs =
+            dcRttGuardBaselineNs >
+            0xFFFFFFFFFFFFFFFFULL - headroomNs
+            ? 0xFFFFFFFFFFFFFFFFULL
+            : dcRttGuardBaselineNs + headroomNs;
+
+        if (limitNs > DC_RX3E_RTT_ABSOLUTE_LIMIT_NS)
+        {
+            limitNs = DC_RX3E_RTT_ABSOLUTE_LIMIT_NS;
+        }
+
+        return limitNs;
+    };
+
+    auto UpdateDcRttGuardDeviation = [&](uint64_t residualNs)
+    {
+        // A late spike must not inflate the envelope enough to admit the next
+        // spike.  The tracked deviation itself is therefore bounded.
+        if (residualNs > DC_RX3E_RTT_MAX_HEADROOM_NS)
+        {
+            residualNs = DC_RX3E_RTT_MAX_HEADROOM_NS;
+        }
+
+        if (residualNs > dcRttGuardDeviationNs)
+        {
+            // Rise moderately (1/32) so sustained jitter is learned without
+            // reacting to one sample.
+            dcRttGuardDeviationNs +=
+                (residualNs - dcRttGuardDeviationNs + 31ULL) /
+                32ULL;
+        }
+        else if (dcRttGuardDeviationNs > residualNs)
+        {
+            // Decay more slowly (1/64), avoiding a chattering threshold.
+            dcRttGuardDeviationNs -=
+                (dcRttGuardDeviationNs - residualNs + 63ULL) /
+                64ULL;
+        }
+    };
+
+    auto ResetDcRttGuardRebaseCandidate = [&]()
+    {
+        dcRttGuardRebaseCandidateSamples = 0;
+        dcRttGuardRebaseCandidateMeanNs = 0;
+        dcRttGuardRebaseCandidateMinNs = 0;
+        dcRttGuardRebaseCandidateMaxNs = 0;
+    };
+
+    if (qpcDcExactTimingAvailable)
+    {
+        dcRttGuardEvaluatedThisCycle = true;
+        dcRttGuardLastRttNs = qpcDcExactRttNs;
+
+        if (qpcDcExactRttNs > DC_RX3E_RTT_ABSOLUTE_LIMIT_NS)
+        {
+            // Never learn from or rebase to a sample inside the final 10 us
+            // before the 210 us Process Data hard deadline.
+            if (dcRttGuardState == DC_RX3E_RTT_STATE_TRACK ||
+                dcRttGuardState == DC_RX3E_RTT_STATE_SHIFT_CHECK)
+            {
+                dcRttGuardState = DC_RX3E_RTT_STATE_SHIFT_CHECK;
+            }
+
+            dcRttGuardLastExcessNs =
+                qpcDcExactRttNs - DC_RX3E_RTT_ABSOLUTE_LIMIT_NS;
+
+            if (dcRttGuardOutlierStreak != 0xFFFFFFFFU)
+            {
+                dcRttGuardOutlierStreak++;
+            }
+            if (dcRttGuardOutlierStreak >
+                dcRttGuardOutlierMaximumStreak)
+            {
+                dcRttGuardOutlierMaximumStreak =
+                    dcRttGuardOutlierStreak;
+            }
+
+            ResetDcRttGuardRebaseCandidate();
+        }
+        else if (dcRttGuardState == DC_RX3E_RTT_STATE_UNBOUND)
+        {
+            dcRttGuardBaselineNs = qpcDcExactRttNs;
+            dcRttGuardDeviationNs =
+                DC_RX3E_RTT_INITIAL_DEVIATION_NS;
+            dcRttGuardWarmupSamples = 1U;
+            dcRttGuardState = DC_RX3E_RTT_STATE_WARMUP;
+            dcRttGuardOutlierStreak = 0;
+            dcRttGuardLastExcessNs = 0;
+            ResetDcRttGuardRebaseCandidate();
+            dcRttGuardAcceptedThisCycle = true;
+        }
+        else if (dcRttGuardState == DC_RX3E_RTT_STATE_WARMUP)
+        {
+            // Learn the low-latency floor.  Startup DC controllers are already
+            // qualification-gated, so these bounded samples may establish the
+            // envelope without changing the normal Phase-P gain.
+            if (qpcDcExactRttNs < dcRttGuardBaselineNs)
+            {
+                dcRttGuardBaselineNs = qpcDcExactRttNs;
+            }
+
+            const uint64_t residualNs =
+                qpcDcExactRttNs >= dcRttGuardBaselineNs
+                ? qpcDcExactRttNs - dcRttGuardBaselineNs
+                : dcRttGuardBaselineNs - qpcDcExactRttNs;
+
+            UpdateDcRttGuardDeviation(residualNs);
+
+            if (dcRttGuardWarmupSamples <
+                DC_RX3E_RTT_WARMUP_SAMPLES)
+            {
+                dcRttGuardWarmupSamples++;
+            }
+            if (dcRttGuardWarmupSamples >=
+                DC_RX3E_RTT_WARMUP_SAMPLES)
+            {
+                dcRttGuardState = DC_RX3E_RTT_STATE_TRACK;
+            }
+
+            dcRttGuardOutlierStreak = 0;
+            dcRttGuardLastExcessNs = 0;
+            ResetDcRttGuardRebaseCandidate();
+            dcRttGuardAcceptedThisCycle = true;
+        }
+        else
+        {
+            dcRttGuardLimitNs = ComputeDcRttGuardLimit();
+
+            if (qpcDcExactRttNs <= dcRttGuardLimitNs)
+            {
+                dcRttGuardState = DC_RX3E_RTT_STATE_TRACK;
+                dcRttGuardOutlierStreak = 0;
+                dcRttGuardLastExcessNs = 0;
+                ResetDcRttGuardRebaseCandidate();
+
+                // Follow a lower latency floor quickly but a higher one very
+                // slowly.  This prevents ordinary late samples from dragging
+                // the accepted envelope upward.
+                if (qpcDcExactRttNs < dcRttGuardBaselineNs)
+                {
+                    dcRttGuardBaselineNs -=
+                        (dcRttGuardBaselineNs - qpcDcExactRttNs + 3ULL) /
+                        4ULL;
+                }
+                else if (qpcDcExactRttNs > dcRttGuardBaselineNs)
+                {
+                    dcRttGuardBaselineNs +=
+                        (qpcDcExactRttNs - dcRttGuardBaselineNs + 1023ULL) /
+                        1024ULL;
+                }
+
+                const uint64_t residualNs =
+                    qpcDcExactRttNs >= dcRttGuardBaselineNs
+                    ? qpcDcExactRttNs - dcRttGuardBaselineNs
+                    : dcRttGuardBaselineNs - qpcDcExactRttNs;
+
+                UpdateDcRttGuardDeviation(residualNs);
+                dcRttGuardAcceptedThisCycle = true;
+            }
+            else
+            {
+                dcRttGuardState = DC_RX3E_RTT_STATE_SHIFT_CHECK;
+                dcRttGuardLastExcessNs =
+                    qpcDcExactRttNs - dcRttGuardLimitNs;
+
+                if (dcRttGuardOutlierStreak != 0xFFFFFFFFU)
+                {
+                    dcRttGuardOutlierStreak++;
+                }
+                if (dcRttGuardOutlierStreak >
+                    dcRttGuardOutlierMaximumStreak)
+                {
+                    dcRttGuardOutlierMaximumStreak =
+                        dcRttGuardOutlierStreak;
+                }
+
+                bool rebaseCandidateConsistent = false;
+
+                if (dcRttGuardRebaseCandidateSamples == 0U)
+                {
+                    rebaseCandidateConsistent = true;
+                    dcRttGuardRebaseCandidateSamples = 1U;
+                    dcRttGuardRebaseCandidateMeanNs =
+                        qpcDcExactRttNs;
+                    dcRttGuardRebaseCandidateMinNs =
+                        qpcDcExactRttNs;
+                    dcRttGuardRebaseCandidateMaxNs =
+                        qpcDcExactRttNs;
+                }
+                else
+                {
+                    const uint64_t candidateDifferenceNs =
+                        qpcDcExactRttNs >=
+                        dcRttGuardRebaseCandidateMeanNs
+                        ? qpcDcExactRttNs -
+                        dcRttGuardRebaseCandidateMeanNs
+                        : dcRttGuardRebaseCandidateMeanNs -
+                        qpcDcExactRttNs;
+
+                    const uint64_t candidateMinimumNs =
+                        qpcDcExactRttNs <
+                        dcRttGuardRebaseCandidateMinNs
+                        ? qpcDcExactRttNs
+                        : dcRttGuardRebaseCandidateMinNs;
+
+                    const uint64_t candidateMaximumNs =
+                        qpcDcExactRttNs >
+                        dcRttGuardRebaseCandidateMaxNs
+                        ? qpcDcExactRttNs
+                        : dcRttGuardRebaseCandidateMaxNs;
+
+                    rebaseCandidateConsistent =
+                        candidateDifferenceNs <=
+                        DC_RX3E_RTT_REBASE_CONSISTENCY_NS &&
+                        candidateMaximumNs - candidateMinimumNs <=
+                        DC_RX3E_RTT_REBASE_RANGE_NS;
+
+                    if (rebaseCandidateConsistent)
+                    {
+                        if (dcRttGuardRebaseCandidateSamples !=
+                            0xFFFFFFFFU)
+                        {
+                            dcRttGuardRebaseCandidateSamples++;
+                        }
+
+                        const uint64_t divisor =
+                            (uint64_t)dcRttGuardRebaseCandidateSamples;
+
+                        if (qpcDcExactRttNs >=
+                            dcRttGuardRebaseCandidateMeanNs)
+                        {
+                            dcRttGuardRebaseCandidateMeanNs +=
+                                (qpcDcExactRttNs -
+                                    dcRttGuardRebaseCandidateMeanNs) /
+                                divisor;
+                        }
+                        else
+                        {
+                            dcRttGuardRebaseCandidateMeanNs -=
+                                (dcRttGuardRebaseCandidateMeanNs -
+                                    qpcDcExactRttNs) /
+                                divisor;
+                        }
+
+                        dcRttGuardRebaseCandidateMinNs =
+                            candidateMinimumNs;
+                        dcRttGuardRebaseCandidateMaxNs =
+                            candidateMaximumNs;
+                    }
+                    else
+                    {
+                        // Start a new proof sequence.  This sample itself is
+                        // still rejected; a regime change must remain coherent
+                        // for the full 64-sample qualification interval.
+                        dcRttGuardRebaseCandidateSamples = 1U;
+                        dcRttGuardRebaseCandidateMeanNs =
+                            qpcDcExactRttNs;
+                        dcRttGuardRebaseCandidateMinNs =
+                            qpcDcExactRttNs;
+                        dcRttGuardRebaseCandidateMaxNs =
+                            qpcDcExactRttNs;
+                    }
+                }
+
+                if (rebaseCandidateConsistent &&
+                    dcRttGuardRebaseCandidateSamples >=
+                    DC_RX3E_RTT_REBASE_SAMPLES &&
+                    dcRttGuardRebaseCandidateMeanNs <=
+                    DC_RX3E_RTT_ABSOLUTE_LIMIT_NS)
+                {
+                    const uint64_t candidateRangeNs =
+                        dcRttGuardRebaseCandidateMaxNs -
+                        dcRttGuardRebaseCandidateMinNs;
+
+                    dcRttGuardBaselineNs =
+                        dcRttGuardRebaseCandidateMeanNs;
+                    dcRttGuardDeviationNs =
+                        candidateRangeNs / 2ULL;
+
+                    if (dcRttGuardDeviationNs <
+                        DC_RX3E_RTT_INITIAL_DEVIATION_NS)
+                    {
+                        dcRttGuardDeviationNs =
+                            DC_RX3E_RTT_INITIAL_DEVIATION_NS;
+                    }
+
+                    dcRttGuardWarmupSamples =
+                        DC_RX3E_RTT_WARMUP_SAMPLES;
+                    dcRttGuardState = DC_RX3E_RTT_STATE_TRACK;
+                    dcRttGuardOutlierStreak = 0;
+                    dcRttGuardLastExcessNs = 0;
+                    dcRttGuardRebaseThisCycle = true;
+                    dcRttGuardAcceptedThisCycle = true;
+
+                    if (dcRttGuardRebaseTotal !=
+                        0xFFFFFFFFFFFFFFFFULL)
+                    {
+                        dcRttGuardRebaseTotal++;
+                    }
+
+                    ResetDcRttGuardRebaseCandidate();
+                }
+            }
+        }
+
+        dcRttGuardLimitNs = ComputeDcRttGuardLimit();
+
+        if (dcRttGuardAcceptedThisCycle)
+        {
+            if (dcRttGuardAcceptedTotal != 0xFFFFFFFFFFFFFFFFULL)
+            {
+                dcRttGuardAcceptedTotal++;
+            }
+        }
+        else if (dcRttGuardRejectedTotal != 0xFFFFFFFFFFFFFFFFULL)
+        {
+            dcRttGuardRejectedTotal++;
+        }
+    }
+
+    if (qpcDcExactTimingAvailable)
+    {
+        dcExactTimingLocked = true;
+        dcSampleTimingSourceThisCycle =
+            DC_RX3D_TIMING_SOURCE_EXACT_TXRX;
+        qpcDcRttNs = qpcDcExactRttNs;
+        qpcDcMidCount = dcCycleTiming.sampleMidpointQpc;
+
+        if (dcTimingExactUseTotal != 0xFFFFFFFFFFFFFFFFULL)
+        {
+            dcTimingExactUseTotal++;
+        }
+
+        if (qpcDcExactRttNs > dcTimingExactRttMaximumNs)
+        {
+            dcTimingExactRttMaximumNs = qpcDcExactRttNs;
+        }
+    }
+    else if (!dcExactTimingLocked && qpcDcCallTimingAvailable)
+    {
+        dcSampleTimingSourceThisCycle =
+            DC_RX3D_TIMING_SOURCE_CALL_FALLBACK;
+        qpcDcRttNs = qpcDcCallRttNs;
+        qpcDcMidCount = qpcDcCallMidCount;
+
+        if (dcTimingFallbackUseTotal != 0xFFFFFFFFFFFFFFFFULL)
+        {
+            dcTimingFallbackUseTotal++;
+        }
+    }
+    else if (dcTransportValid && dcReferencePresent)
+    {
+        if (dcExactTimingLocked)
+        {
+            dcSampleGuardReasonMask |=
+                DC_RX3D_SAMPLE_REJECT_TIMING_SOURCE;
+
+            if (dcTimingMissingAfterLockTotal != 0xFFFFFFFFFFFFFFFFULL)
+            {
+                dcTimingMissingAfterLockTotal++;
+            }
+        }
+        else
+        {
+            dcSampleGuardReasonMask |=
+                DC_RX3C_SAMPLE_REJECT_AGE;
+        }
+    }
+
+    if (dcSampleTimingSourceThisCycle != DC_RX3D_TIMING_SOURCE_NONE)
+    {
+        dcSampleTimingSourceChangedThisCycle =
+            dcSampleTimingSource != DC_RX3D_TIMING_SOURCE_NONE &&
+            dcSampleTimingSource != dcSampleTimingSourceThisCycle;
+
+        if (dcSampleTimingSourceChangedThisCycle &&
+            dcTimingSourceSwitchTotal != 0xFFFFFFFFFFFFFFFFULL)
+        {
+            dcTimingSourceSwitchTotal++;
+        }
+
+        dcSampleTimingSource = dcSampleTimingSourceThisCycle;
+    }
+
+    if (qpcDcExactTimingAvailable && qpcDcCallTimingAvailable)
+    {
+        qpcDcExcludedOverheadNs =
+            qpcDcCallRttNs > qpcDcExactRttNs
+            ? qpcDcCallRttNs - qpcDcExactRttNs
+            : 0ULL;
+
+        const bool exactMidAfterCallMid =
+            dcCycleTiming.sampleMidpointQpc >= qpcDcCallMidCount;
+        const uint64_t midpointShiftCounts =
+            exactMidAfterCallMid
+            ? dcCycleTiming.sampleMidpointQpc - qpcDcCallMidCount
+            : qpcDcCallMidCount - dcCycleTiming.sampleMidpointQpc;
+        uint64_t midpointShiftAbsNs = 0;
+
+        if (QpcCountsToNsSafe(
+            midpointShiftCounts,
+            &midpointShiftAbsNs))
+        {
+            if (midpointShiftAbsNs > 0x7FFFFFFFFFFFFFFFULL)
+            {
+                qpcDcMidpointShiftNs =
+                    exactMidAfterCallMid
+                    ? 0x7FFFFFFFFFFFFFFFLL
+                    : (-0x7FFFFFFFFFFFFFFFLL - 1LL);
+            }
+            else
+            {
+                qpcDcMidpointShiftNs =
+                    exactMidAfterCallMid
+                    ? (int64_t)midpointShiftAbsNs
+                    : -(int64_t)midpointShiftAbsNs;
+            }
+
+            dcTimingMidpointShiftLastNs = qpcDcMidpointShiftNs;
+            if (midpointShiftAbsNs >
+                dcTimingMidpointShiftMaximumAbsNs)
+            {
+                dcTimingMidpointShiftMaximumAbsNs =
+                    midpointShiftAbsNs;
+            }
+        }
+    }
+
+    if (dcSampleTimingSourceThisCycle != DC_RX3D_TIMING_SOURCE_NONE)
+    {
+        const bool sampleTransactionWithinBounds =
+            dcReferenceTimeValueValid &&
+            qpcDcRttNs > 0 &&
+            qpcDcRttNs <= DC_RX3C_MAX_SAMPLE_TRANSACTION_NS;
+
+        if (!sampleTransactionWithinBounds)
+        {
+            dcSampleGuardReasonMask |=
+                DC_RX3C_SAMPLE_REJECT_AGE;
+        }
+        else if (dcSampleTimingSourceThisCycle ==
+            DC_RX3D_TIMING_SOURCE_EXACT_TXRX &&
+            dcRttGuardEvaluatedThisCycle &&
+            !dcRttGuardAcceptedThisCycle)
+        {
+            dcSampleGuardReasonMask |=
+                DC_RX3E_SAMPLE_REJECT_RTT_ENVELOPE;
+        }
+        else
+        {
+            qpcDcApproxAgeNs = qpcDcRttNs / 2ULL;
+            dcSampleTimingCandidate = true;
+        }
+    }
+
+    dcSampleGuardLastApproxAgeNs = qpcDcApproxAgeNs;
+    if (qpcDcApproxAgeNs > dcSampleGuardMaximumApproxAgeNs)
+    {
+        dcSampleGuardMaximumApproxAgeNs = qpcDcApproxAgeNs;
+    }
+
+    auto BindDcSampleGuardAnchor = [&]()
+    {
+        dcSampleGuardLastAcceptedDcNs =
+            (uint64_t)pMaster->DC_reference_time;
+        dcSampleGuardLastAcceptedQpcMidCount = qpcDcMidCount;
+        dcSampleGuardState = DC_RX3C_SAMPLE_STATE_VERIFY;
+        dcSampleGuardConsecutiveRejects = 0;
+        dcSampleGuardAnchorTotal++;
+    };
+
+    if (dcSampleTimingCandidate)
+    {
+        if (dcSampleGuardState == DC_RX3C_SAMPLE_STATE_UNBOUND)
+        {
+            // The first sample establishes chronology only. It is deliberately
+            // not fed into a phase/frequency observer.
+            BindDcSampleGuardAnchor();
+            dcSampleGuardWarmupThisCycle = true;
+            dcSampleGuardReasonMask = DC_RX3C_SAMPLE_REJECT_ANCHOR;
+        }
+        else if (dcSampleTimingSourceChangedThisCycle ||
+            dcRttGuardRebaseThisCycle)
+        {
+            // A timing-source switch or a proven persistent RTT-regime shift
+            // changes fixed software capture bias. Never bridge an observer
+            // window across that boundary: bind a new anchor, force recoverable
+            // HOLD, and quarantine Phase-P until fresh maps prove continuity.
+            BindDcSampleGuardAnchor();
+            dcSampleGuardReasonMask =
+                DC_RX3C_SAMPLE_REJECT_ANCHOR;
+
+            if (dcSampleTimingSourceChangedThisCycle)
+            {
+                dcSampleGuardReasonMask |=
+                    DC_RX3D_SAMPLE_REJECT_TIMING_SOURCE;
+            }
+            if (dcRttGuardRebaseThisCycle)
+            {
+                dcSampleGuardReasonMask |=
+                    DC_RX3E_SAMPLE_REJECT_RTT_ENVELOPE;
+            }
+
+            dcSampleGuardReanchorTotal++;
+            dcSampleFreshnessReanchorThisCycle = true;
+            dcPhaseMapRebindPending = true;
+            ArmPhasePRecoveryJumpGuard(false);
+        }
+        else
+        {
+            const uint64_t currentDcNs =
+                (uint64_t)pMaster->DC_reference_time;
+
+            const bool qpcMonotonic =
+                qpcDcMidCount > dcSampleGuardLastAcceptedQpcMidCount;
+            const bool dcMonotonic =
+                currentDcNs > dcSampleGuardLastAcceptedDcNs;
+
+            uint64_t qpcDeltaNs = 0;
+            uint64_t dcDeltaNs = 0;
+            uint64_t deltaToleranceNs =
+                DC_RX3C_DELTA_BASE_TOLERANCE_NS;
+            int64_t deltaErrorNs = 0;
+            bool deltaConversionValid = false;
+            bool deltaPlausible = false;
+
+            if (!qpcMonotonic)
+            {
+                dcSampleGuardReasonMask |=
+                    DC_RX3C_SAMPLE_REJECT_QPC_ORDER;
+            }
+
+            if (!dcMonotonic)
+            {
+                dcSampleGuardReasonMask |=
+                    DC_RX3C_SAMPLE_REJECT_DC_ORDER;
+            }
+
+            if (qpcMonotonic && dcMonotonic)
+            {
+                const uint64_t qpcDeltaCounts =
+                    qpcDcMidCount -
+                    dcSampleGuardLastAcceptedQpcMidCount;
+
+                dcDeltaNs =
+                    currentDcNs - dcSampleGuardLastAcceptedDcNs;
+
+                deltaConversionValid =
+                    QpcCountsToNsSafe(qpcDeltaCounts, &qpcDeltaNs);
+
+                if (deltaConversionValid)
+                {
+                    uint64_t driftToleranceNs =
+                        qpcDeltaNs / DC_RX3C_DELTA_DRIFT_DIVISOR;
+
+                    if (driftToleranceNs >
+                        DC_RX3C_DELTA_MAX_TOLERANCE_NS -
+                        DC_RX3C_DELTA_BASE_TOLERANCE_NS)
+                    {
+                        deltaToleranceNs =
+                            DC_RX3C_DELTA_MAX_TOLERANCE_NS;
+                    }
+                    else
+                    {
+                        deltaToleranceNs =
+                            DC_RX3C_DELTA_BASE_TOLERANCE_NS +
+                            driftToleranceNs;
+                    }
+
+                    const bool dcAhead = dcDeltaNs >= qpcDeltaNs;
+                    const uint64_t absoluteDeltaErrorNs =
+                        dcAhead
+                        ? dcDeltaNs - qpcDeltaNs
+                        : qpcDeltaNs - dcDeltaNs;
+
+                    if (absoluteDeltaErrorNs > 0x7FFFFFFFFFFFFFFFULL)
+                    {
+                        deltaErrorNs =
+                            dcAhead
+                            ? 0x7FFFFFFFFFFFFFFFLL
+                            : (-0x7FFFFFFFFFFFFFFFLL - 1LL);
+                    }
+                    else
+                    {
+                        deltaErrorNs =
+                            dcAhead
+                            ? (int64_t)absoluteDeltaErrorNs
+                            : -(int64_t)absoluteDeltaErrorNs;
+                    }
+
+                    deltaPlausible =
+                        absoluteDeltaErrorNs <= deltaToleranceNs;
+
+                    if (!deltaPlausible)
+                    {
+                        dcSampleGuardReasonMask |=
+                            DC_RX3C_SAMPLE_REJECT_DELTA;
+                    }
+                }
+                else
+                {
+                    dcSampleGuardReasonMask |=
+                        DC_RX3C_SAMPLE_REJECT_CONVERSION;
+                }
+            }
+
+            dcSampleGuardLastQpcDeltaNs = qpcDeltaNs;
+            dcSampleGuardLastDcDeltaNs = dcDeltaNs;
+            dcSampleGuardLastDeltaErrorNs = deltaErrorNs;
+            dcSampleGuardLastDeltaToleranceNs = deltaToleranceNs;
+
+            const bool samplePlausible =
+                qpcMonotonic &&
+                dcMonotonic &&
+                deltaConversionValid &&
+                deltaPlausible;
+
+            if (samplePlausible)
+            {
+                dcSampleFreshnessAccepted = true;
+                dcSampleGuardState = DC_RX3C_SAMPLE_STATE_TRACK;
+                dcSampleGuardLastAcceptedDcNs = currentDcNs;
+                dcSampleGuardLastAcceptedQpcMidCount = qpcDcMidCount;
+                dcSampleGuardConsecutiveRejects = 0;
+                dcSampleGuardAcceptedTotal++;
+                dcSampleGuardReasonMask = 0;
+            }
+            else
+            {
+                dcSampleGuardRejectedTotal++;
+
+                if ((dcSampleGuardReasonMask &
+                    DC_RX3C_SAMPLE_REJECT_AGE) != 0)
+                {
+                    dcSampleGuardAgeRejectTotal++;
+                }
+
+                if ((dcSampleGuardReasonMask &
+                    (DC_RX3C_SAMPLE_REJECT_DC_ORDER |
+                        DC_RX3C_SAMPLE_REJECT_QPC_ORDER)) != 0)
+                {
+                    dcSampleGuardOrderRejectTotal++;
+                }
+
+                if ((dcSampleGuardReasonMask &
+                    (DC_RX3C_SAMPLE_REJECT_DELTA |
+                        DC_RX3C_SAMPLE_REJECT_CONVERSION)) != 0)
+                {
+                    dcSampleGuardDeltaRejectTotal++;
+                }
+
+                if (dcSampleGuardConsecutiveRejects < 0xFFFFFFFFU)
+                {
+                    dcSampleGuardConsecutiveRejects++;
+                }
+
+                if (dcSampleGuardConsecutiveRejects >
+                    dcSampleGuardMaximumConsecutiveRejects)
+                {
+                    dcSampleGuardMaximumConsecutiveRejects =
+                        dcSampleGuardConsecutiveRejects;
+                }
+
+                if (dcSampleGuardState == DC_RX3C_SAMPLE_STATE_VERIFY)
+                {
+                    // Replace an unproven anchor. This lets one stale first
+                    // frame recover on the following clean pair.
+                    BindDcSampleGuardAnchor();
+                }
+                else if (dcSampleGuardConsecutiveRejects >=
+                    DC_RX3C_REANCHOR_REJECT_LIMIT)
+                {
+                    // Four chronology/plausibility failures indicate that the
+                    // reference coordinate may have discontinuously changed.
+                    // Rebind phase mapping and force a real HOLD/requalification.
+                    BindDcSampleGuardAnchor();
+                    dcSampleGuardReanchorTotal++;
+                    dcSampleFreshnessReanchorThisCycle = true;
+                    dcPhaseMapRebindPending = true;
+                    ArmPhasePRecoveryJumpGuard(false);
+                }
+            }
+        }
+    }
+    else if (dcTransportValid && dcReferencePresent)
+    {
+        dcSampleGuardRejectedTotal++;
+
+        if ((dcSampleGuardReasonMask &
+            DC_RX3C_SAMPLE_REJECT_AGE) != 0)
+        {
+            dcSampleGuardAgeRejectTotal++;
+        }
+
+        if ((dcSampleGuardReasonMask &
+            DC_RX3D_SAMPLE_REJECT_TIMING_SOURCE) != 0)
+        {
+            dcSampleGuardTimingRejectTotal++;
+        }
+
+        if ((dcSampleGuardReasonMask &
+            DC_RX3E_SAMPLE_REJECT_RTT_ENVELOPE) != 0)
+        {
+            dcSampleGuardRttRejectTotal++;
+        }
+
+        if (dcSampleGuardConsecutiveRejects < 0xFFFFFFFFU)
+        {
+            dcSampleGuardConsecutiveRejects++;
+        }
+
+        if (dcSampleGuardConsecutiveRejects >
+            dcSampleGuardMaximumConsecutiveRejects)
+        {
+            dcSampleGuardMaximumConsecutiveRejects =
+                dcSampleGuardConsecutiveRejects;
+        }
+    }
+
+    dcSampleGuardLastReasonMask = dcSampleGuardReasonMask;
+
+    const bool dcSampleFreshnessInvalid =
+        dcReferencePresent &&
+        dcTransportValid &&
+        !dcSampleFreshnessAccepted &&
+        !dcSampleGuardWarmupThisCycle;
+
+    const bool dcControlSampleValid =
+        !dcReferencePresent
+        ? processDataValid
+        : dcSampleFreshnessAccepted;
+
+    const bool dcControlSampleInvalid =
+        dcReferencePresent &&
+        processDataValid &&
+        !dcControlSampleValid &&
+        !dcSampleGuardWarmupThisCycle;
+
+    if (dcReferencePresent)
+    {
+        if (!dcWkcValid &&
+            dcWkcInvalidCyclesTotal != 0xFFFFFFFFFFFFFFFFULL)
+        {
+            dcWkcInvalidCyclesTotal++;
+        }
+
+        if (dcOnlyInvalid &&
+            dcOnlyInvalidCyclesTotal != 0xFFFFFFFFFFFFFFFFULL)
+        {
+            dcOnlyInvalidCyclesTotal++;
+        }
+
+        if (!dcTransportValid)
+        {
+            if (dcTransportConsecutiveInvalidCycles < 0xFFFFFFFFU)
+            {
+                dcTransportConsecutiveInvalidCycles++;
+            }
+
+            if (dcTransportConsecutiveInvalidCycles >
+                dcTransportMaximumInvalidCycles)
+            {
+                dcTransportMaximumInvalidCycles =
+                    dcTransportConsecutiveInvalidCycles;
+            }
+        }
+        else
+        {
+            if (dcTransportQualityKnown &&
+                !previousDcTransportValid &&
+                dcTransportRecoveryTotal != 0xFFFFFFFFFFFFFFFFULL)
+            {
+                dcTransportRecoveryTotal++;
+            }
+
+            dcTransportConsecutiveInvalidCycles = 0;
+        }
+
+        previousDcTransportValid = dcTransportValid;
+        dcTransportQualityKnown = true;
+    }
+    else
+    {
+        // No DC reference means ordinary LRW mode. Keep the DC-only diagnostic
+        // neutral while Process Data keeps its normal safety contract.
+        dcTransportConsecutiveInvalidCycles = 0;
+        previousDcTransportValid = true;
+        dcTransportQualityKnown = false;
+    }
+
+    const bool currentSchedulerClean =
+        currentSchedulerEvaluated &&
+        currentSchedulerRearmOk &&
+        !currentSchedulerUsedBootstrap &&
+        !currentSchedulerRuntimeRecovery;
+
+    // ---------------------------------------------------------
+    // DC-RX.3B micro-glitch budget
+    //
+    // A stable ACTIVE controller may bridge at most four consecutive DC-only
+    // misses (1 ms at 4 kHz), provided the leaky debt budget is not exhausted.
+    // The missing DC samples are still rejected from every observer. Only the
+    // expensive HOLD/reset/requalification transition is filtered.
+    // ---------------------------------------------------------
+    bool dcOnlyGraceAcceptedThisCycle = false;
+    bool dcOnlyRequiresHoldThisCycle = false;
+
+    if (dcControlSampleInvalid)
+    {
+        if (dcOnlyInvalidConsecutiveCycles < 0xFFFFFFFFU)
+        {
+            dcOnlyInvalidConsecutiveCycles++;
+        }
+
+        if (dcOnlyInvalidConsecutiveCycles >
+            dcOnlyInvalidMaximumConsecutiveCycles)
+        {
+            dcOnlyInvalidMaximumConsecutiveCycles =
+                dcOnlyInvalidConsecutiveCycles;
+        }
+
+        // Count every raw DC-only burst, including those fully absorbed by the
+        // grace budget. HoldoverEntry counts only bursts promoted to HOLD.
+        if (dcOnlyInvalidConsecutiveCycles == 1U &&
+            dcHoldoverEpisodeTotal != 0xFFFFFFFFFFFFFFFFULL)
+        {
+            dcHoldoverEpisodeTotal++;
+        }
+
+        if (dcOnlyGlitchDebt <=
+            DC_RX3B_GLITCH_DEBT_SATURATION - DC_RX3B_GLITCH_DEBT_ADD)
+        {
+            dcOnlyGlitchDebt += DC_RX3B_GLITCH_DEBT_ADD;
+        }
+        else
+        {
+            dcOnlyGlitchDebt = DC_RX3B_GLITCH_DEBT_SATURATION;
+        }
+
+        if (dcOnlyGlitchDebt > dcOnlyGlitchDebtMaximum)
+        {
+            dcOnlyGlitchDebtMaximum = dcOnlyGlitchDebt;
+        }
+
+        const bool graceEligible =
+            realFfV0State == 2 &&
+            realFfV0TripMask == 0 &&
+            realFfV0TransientHoldReasonMask == 0 &&
+            realFfV0RecoveryProfile == 0 &&
+            currentSchedulerClean;
+
+        dcOnlyGraceAcceptedThisCycle =
+            graceEligible &&
+            !dcSampleFreshnessReanchorThisCycle &&
+            dcOnlyInvalidConsecutiveCycles <=
+            DC_RX3B_GLITCH_GRACE_CYCLES &&
+            dcOnlyGlitchDebt <= DC_RX3B_GLITCH_DEBT_LIMIT;
+
+        if (dcOnlyGraceAcceptedThisCycle)
+        {
+            // Preserve forensic history without turning the micro-glitch into
+            // an active HOLD reason. History never blocks STABLE by itself.
+            realFfV0HistoryMask |=
+                dcSampleFreshnessInvalid
+                ? REAL_FF_V0_TRANSIENT_DC_FRESHNESS_REASON
+                : REAL_FF_V0_TRANSIENT_DC_SAMPLE_REASON;
+
+            if (dcGraceAcceptedCyclesTotal != 0xFFFFFFFFFFFFFFFFULL)
+            {
+                dcGraceAcceptedCyclesTotal++;
+            }
+        }
+        else
+        {
+            dcOnlyRequiresHoldThisCycle = true;
+        }
+    }
+    else if (dcControlSampleValid)
+    {
+        dcOnlyInvalidConsecutiveCycles = 0;
+
+        if (dcOnlyGlitchDebt > DC_RX3B_GLITCH_DEBT_DECAY)
+        {
+            dcOnlyGlitchDebt -= DC_RX3B_GLITCH_DEBT_DECAY;
+        }
+        else
+        {
+            dcOnlyGlitchDebt = 0;
+        }
+    }
+    else
+    {
+        // LRW invalid is governed by the existing PDO safety debounce. Do not
+        // disguise it as a DC-only grace event, and do not erase recent debt.
+        dcOnlyInvalidConsecutiveCycles = 0;
+    }
+
+    const bool currentControlCycleActuallyClean =
+        dcControlSampleValid && currentSchedulerClean;
+
+    const bool currentControlCyclePolicySafe =
+        currentControlCycleActuallyClean ||
+        dcOnlyGraceAcceptedThisCycle ||
+        dcSampleGuardWarmupThisCycle;
+
+    LONG currentControlCycleReasonMask = 0;
+    if (!processDataValid)
+    {
+        currentControlCycleReasonMask |=
+            REAL_FF_V0_TRANSIENT_RX_REASON;
+    }
+    else if (!dcWkcValid && !dcOnlyGraceAcceptedThisCycle)
+    {
+        currentControlCycleReasonMask |=
+            REAL_FF_V0_TRANSIENT_DC_SAMPLE_REASON;
+    }
+    else if (dcSampleFreshnessInvalid && !dcOnlyGraceAcceptedThisCycle)
+    {
+        currentControlCycleReasonMask |=
+            REAL_FF_V0_TRANSIENT_DC_FRESHNESS_REASON;
+    }
+
+    if (!currentSchedulerEvaluated ||
+        currentSchedulerRuntimeRecovery)
+    {
+        currentControlCycleReasonMask |=
+            REAL_FF_V0_TRANSIENT_SCHEDULER_REASON;
+    }
+
+    if (currentControlCycleActuallyClean)
+    {
+        // Saturating at the current qualification threshold keeps diagnostics
+        // bounded. A conservative episode may raise this target from 32 to 128.
+        if (realFfV0CleanCycleStreak < realFfV0CleanCyclesRequired)
+        {
+            realFfV0CleanCycleStreak++;
+        }
+    }
+    else if (dcOnlyGraceAcceptedThisCycle)
+    {
+        // Do not claim a new clean sample, but preserve previously earned
+        // qualification. Frequency and Phase-P commands remain unchanged.
+    }
+    else
+    {
+        const bool startsNewControlInterruption =
+            !realFfV0CycleQualityKnown ||
+            realFfV0PreviousCycleClean;
+
+        realFfV0CleanCycleStreak = 0;
+
+        if (dcOnlyRequiresHoldThisCycle && !dcHoldoverEpisodeActive)
+        {
+            dcHoldoverEpisodeActive = true;
+            dcHoldoverUnqualifiedCycles = 0;
+
+            if (dcHoldoverEntryTotal != 0xFFFFFFFFFFFFFFFFULL)
+            {
+                dcHoldoverEntryTotal++;
+            }
+        }
+
+        if (currentControlCycleReasonMask != 0)
+        {
+            // The first non-grace DC-only miss reopens partial observers.
+            // Subsequent callbacks preserve Last-Known-Good FF in HOLD.
+            EnterRealFfV0TransientHold(
+                currentControlCycleReasonMask,
+                startsNewControlInterruption);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // Bounded holdover escalation
+    //
+    // UnqualifiedCycles measures how long a forced DC-only episode has failed
+    // to earn its current continuous clean gate. It stops accumulating once
+    // that gate is met, so normal multi-window observer requalification is not
+    // mistaken for continuing transport loss.
+    // ---------------------------------------------------------
+    if (dcHoldoverEpisodeActive &&
+        !IsRealFfV0CleanRecoveryReady() &&
+        processDataValid)
+    {
+        if (dcHoldoverUnqualifiedCycles < 0xFFFFFFFFU)
+        {
+            dcHoldoverUnqualifiedCycles++;
+        }
+
+        if (dcHoldoverUnqualifiedCycles >
+            dcHoldoverMaximumUnqualifiedCycles)
+        {
+            dcHoldoverMaximumUnqualifiedCycles =
+                dcHoldoverUnqualifiedCycles;
+        }
+
+        if (dcHoldoverUnqualifiedCycles >=
+            DC_RX3B_DEGRADED_HOLDOVER_CYCLES &&
+            realFfV0RecoveryProfile < 1)
+        {
+            ApplyRealFfV0ConservativeRecoveryProfile();
+
+            if (dcDegradedEntryTotal != 0xFFFFFFFFFFFFFFFFULL)
+            {
+                dcDegradedEntryTotal++;
+            }
+
+            // Start the conservative qualification from a post-escalation
+            // observer publication, not from a partially unstable window.
+            if (!dcObserversResetThisCycle)
+            {
+                ResetDcObserversAfterTransientInterruption();
+            }
+        }
+
+        if (dcHoldoverUnqualifiedCycles >=
+            DC_RX3B_FULL_RELOCK_CYCLES &&
+            realFfV0RecoveryProfile < 2 &&
+            (realFfV0TripMask & REAL_FF_V0_HARD_TRIP_MASK) == 0)
+        {
+            if (dcRelockEntryTotal != 0xFFFFFFFFFFFFFFFFULL)
+            {
+                dcRelockEntryTotal++;
+            }
+
+            realFfV0TripCount++;
+            EscalateRealFfV0ToSoftDcRelock();
+        }
+    }
+
+    if ((realFfV0TripMask & REAL_FF_V0_SOFT_DC_RELOCK_REASON) != 0)
+    {
+        dcHoldoverDiagTier = DC_RX3B_TIER_RELOCK;
+    }
+    else if (dcHoldoverEpisodeActive)
+    {
+        dcHoldoverDiagTier =
+            IsRealFfV0CleanRecoveryReady()
+            ? DC_RX3B_TIER_REQUALIFY
+            : (realFfV0RecoveryProfile >= 1
+                ? DC_RX3B_TIER_DEGRADED
+                : DC_RX3B_TIER_HOLDOVER);
+    }
+    else if (dcOnlyGraceAcceptedThisCycle)
+    {
+        dcHoldoverDiagTier = DC_RX3B_TIER_GRACE;
+    }
+    else
+    {
+        dcHoldoverDiagTier = DC_RX3B_TIER_NONE;
+    }
+
+    realFfV0PreviousCycleClean =
+        currentControlCyclePolicySafe;
+    realFfV0PreviousCycleReasonMask =
+        currentControlCycleReasonMask;
+    realFfV0PreviousDcTransportValid =
+        dcTransportValid;
+    realFfV0PreviousDcSampleQualified =
+        dcControlSampleValid;
+    realFfV0CycleQualityKnown = true;
+
+    // Process Data safety 只看 LRW WKC。DC-only invalid 不得增加 PDO invalid
+    // debounce，也不得阻止 FetchInputs / Motion。沒有 DC reference 時維持普通 LRW。
+    if (processDataValid)
     {
         pdoConsecutiveInvalidCycles =
             0;
@@ -11640,64 +14651,89 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 50LL;
 
 
-                            bool qpcDcSampleValid =
-                                false;
 
-
-                            uint64_t qpcDcRttNs =
-                                0;
-
-                            uint64_t qpcDcMidCount =
-                                0;
-
-
-                            // =============================================================
-                            // Validate sample
-                            // =============================================================
-
-                            if (pdoCycleValid &&
-                                dcReferenceSlaveIndex >= 0 &&
-                                qpcDcBeforeValid &&
-                                qpcDcAfterValid &&
-                                qpcFrequency > 0 &&
-                                dcWkc > 0 &&
-                                pMaster->DC_reference_time > 0)
+                            // DC-RX.1: discard only partial windows that cross
+                            // a PDO/DC or scheduler interruption. Completed
+                            // robust/V1A history and phase unwrap continuity are
+                            // retained, so recovery does not require rebuilding
+                            // the entire 16-point observer from zero.
+                            if (dcObserversResetThisCycle)
                             {
-                                uint64_t qpcDcRttCounts =
-                                    (uint64_t)
-                                    (
-                                        qpcDcAfter.QuadPart -
-                                        qpcDcBefore.QuadPart
-                                        );
+                                qpcDcWindowStartMidCount = 0;
+                                qpcDcWindowEndMidCount = 0;
+                                qpcDcWindowStartDcNs = 0;
+                                qpcDcWindowEndDcNs = 0;
+                                qpcDcRttSumNs = 0;
+                                qpcDcRttMinNs = 0;
+                                qpcDcRttMaxNs = 0;
+                                qpcDcWindowValidSamples = 0;
+                                qpcDcWindowRejectedSamples = 0;
 
+                                qpcLiveFfDcPhaseWindowSamples = 0;
+                                qpcLiveFfDcPhaseFixedWindowStartNs = 0;
+                                qpcLiveFfDcPhaseFixedWindowEndNs = 0;
+                                qpcLiveFfDcPhaseFixedWindowMinNs = 0;
+                                qpcLiveFfDcPhaseFixedWindowMaxNs = 0;
+                                qpcLiveFfDcPhaseShadowWindowStartNs = 0;
+                                qpcLiveFfDcPhaseShadowWindowEndNs = 0;
+                                qpcLiveFfDcPhaseShadowWindowMinNs = 0;
+                                qpcLiveFfDcPhaseShadowWindowMaxNs = 0;
+                                qpcLiveFfDcPhaseFixedAbsSumNs = 0;
+                                qpcLiveFfDcPhaseShadowAbsSumNs = 0;
+                                qpcLiveFfDcPhaseShadowBetterCount = 0;
+                                qpcLiveFfDcPhaseShadowWorseCount = 0;
+                                qpcLiveFfDcPhaseEqualCount = 0;
+                                qpcLiveFfDcPhaseMapRttSumNs = 0;
+                                qpcLiveFfDcPhaseMapRttMinNs = 0;
+                                qpcLiveFfDcPhaseMapRttMaxNs = 0;
+                                qpcLiveFfDcPhaseWindowStartDcNs = 0;
+                                qpcLiveFfDcPhaseWindowEndDcNs = 0;
 
-                                qpcDcRttNs =
-                                    (
-                                        qpcDcRttCounts *
-                                        1000000000ULL
-                                        )
-                                    /
-                                    qpcFrequency;
+                                qpcPhaseFfV2DcWindowSamples = 0;
+                                qpcPhaseFfV2DcWindowStartNs = 0;
+                                qpcPhaseFfV2DcWindowEndNs = 0;
+                                qpcPhaseFfV2DcWindowMinNs = 0;
+                                qpcPhaseFfV2DcWindowMaxNs = 0;
+                                qpcPhaseFfV2DcAbsSumNs = 0;
+                                qpcPhaseFfV2DcBetterThanFixed = 0;
+                                qpcPhaseFfV2DcBetterThanTrusted = 0;
 
-
-                                if (qpcDcRttNs > 0 &&
-                                    qpcDcRttNs <=
-                                    QPC_DC_MAX_RTT_NS)
-                                {
-                                    qpcDcMidCount =
-                                        (uint64_t)
-                                        qpcDcBefore.QuadPart +
-                                        (
-                                            qpcDcRttCounts /
-                                            2ULL
-                                            );
-
-
-                                    qpcDcSampleValid =
-                                        true;
-                                }
+                                qpcDcPhaseResidualV1AMeanSumNs = 0;
+                                qpcDcPhaseResidualV1AMeanSampleCount = 0;
                             }
 
+                            // DC-RX.3C: only a chronologically qualified sample
+                            // may enter any DC observer. Transport WKC alone is not enough.
+                            const bool qpcDcSampleValid =
+                                dcReferenceSlaveIndex >= 0 &&
+                                dcSampleFreshnessAccepted &&
+                                qpcDcRttNs > 0 &&
+                                qpcDcRttNs <= QPC_DC_MAX_RTT_NS;
+
+
+                            if (dcPhaseMapRebindPending &&
+                                qpcDcSampleValid)
+                            {
+                                qpcLiveFfDcPhaseInitialized = false;
+                                qpcLiveFfDcPhaseFixedUnwrapValid = false;
+                                qpcLiveFfDcPhaseShadowUnwrapValid = false;
+                                qpcLiveFfDcPhaseFixedUnwrappedNs = 0;
+                                qpcLiveFfDcPhaseShadowUnwrappedNs = 0;
+                                qpcLiveFfDcPhaseWindowSamples = 0;
+                                qpcLiveFfDcPhaseFixedAbsSumNs = 0;
+                                qpcLiveFfDcPhaseShadowAbsSumNs = 0;
+                                qpcLiveFfDcPhaseShadowBetterCount = 0;
+                                qpcLiveFfDcPhaseShadowWorseCount = 0;
+                                qpcLiveFfDcPhaseEqualCount = 0;
+                                qpcLiveFfDcPhaseMapRttSumNs = 0;
+                                qpcLiveFfDcPhaseMapRttMinNs = 0;
+                                qpcLiveFfDcPhaseMapRttMaxNs = 0;
+                                qpcDcPhaseResidualV1AMeanSumNs = 0;
+                                qpcDcPhaseResidualV1AMeanSampleCount = 0;
+                                qpcPhaseFfV2DcWindowSamples = 0;
+                                qpcPhaseFfV2DcAbsSumNs = 0;
+                                dcPhaseMapRebindPending = false;
+                            }
 
                             // =============================================================
                             // Accumulate valid sample
@@ -13917,6 +16953,9 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                                             ? 1L
                                                             : 0L;
 
+                                                        g_qpcLiveFfDcPhaseLastSampleQpc =
+                                                            (LONGLONG)qpcDcMidCount;
+
                                                         g_qpcLiveFfDcPhaseBoundInitCount =
                                                             (LONG)
                                                             qpcLiveFfDcPhaseBoundInitCount;
@@ -15605,17 +18644,17 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 pMaster,
                                 wkc,
                                 dcWkc,
-                                pdoCycleValid);
+                                processDataValid);
 
 
                             // =========================================================
                             // PLC INPUT：EtherCAT IO Map -> Shadow Input
                             //
-                            // 只有 pdoCycleValid 才更新 shadow input，避免應用層讀到
+                            // 只有 LRW Process Data 有效才更新 shadow input，避免應用層讀到
                             // timeout／WKC 錯誤週期的半成品。PDO Handler 是 IO Map 唯一 Owner。
                             // =========================================================
 
-                            if (pdoCycleValid)
+                            if (processDataValid)
                             {
                                 pMaster->m_Plc.FetchInputs();
                             }
@@ -15634,7 +18673,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 // =========================================================
                                 // DC Software Estimator / Phase Controller
                                 //
-                                // 目前 enableDcSoftwareDiagnostics=true，因此有效 PDO
+                                // 目前 enableDcSoftwareDiagnostics=true，因此有效 DC transport
                                 // 週期會更新 Master/DC estimator 與 PDO phase controller。
                                 // 兩個函式必須維持無高頻 RtPrintf 的即時安全版本。
                                 // 即使日後關閉此 gate，LRW+FRMW 與從站 DC/Sync0 仍會運作；
@@ -15645,7 +18684,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                     true;
 
 
-                                if (pdoCycleValid &&
+                                if (dcTransportValid &&
                                     enableDcSoftwareDiagnostics)
                                 {
                                     pMaster->
@@ -15759,39 +18798,31 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                                     1);
 
 
-                                    RtPrintf(
-                                        "[DC] "
-                                        "Servo:%d Slave:%d "
-                                        "Diff:%d ns "
-                                        "Delay:%u ns "
-                                        "DelayWKC:%d "
-                                        "Raw:0x%08X\n",
-
-                                        (int)
-                                        dcDiagServoIndex,
-
-                                        slaveIndex,
-
-                                        dcDifferenceNs,
-
-                                        (unsigned int)
-                                        dcPropagationDelay,
-
-                                        delayWkc,
-
-                                        rawDcDifference);
+                                    PublishP64DeferredDiagnostic(
+                                        EtherCatP64DeferredDiagKind::DcSlaveSample,
+                                        static_cast<uint64_t>(pMaster->tickCount_PDO),
+                                        static_cast<int64_t>(dcDiagServoIndex),
+                                        static_cast<int64_t>(slaveIndex),
+                                        static_cast<int64_t>(dcDifferenceNs),
+                                        static_cast<int64_t>(dcPropagationDelay),
+                                        static_cast<int64_t>(delayWkc),
+                                        static_cast<int64_t>(rawDcDifference),
+                                        0LL,
+                                        0LL);
                                 }
                                 else
                                 {
-                                    RtPrintf(
-                                        "[DC] "
-                                        "Servo:%d Slave:%d "
-                                        "Read 0x092C FAILED\n",
-
-                                        (int)
-                                        dcDiagServoIndex,
-
-                                        slaveIndex);
+                                    PublishP64DeferredDiagnostic(
+                                        EtherCatP64DeferredDiagKind::DcSlaveReadFailed,
+                                        static_cast<uint64_t>(pMaster->tickCount_PDO),
+                                        static_cast<int64_t>(dcDiagServoIndex),
+                                        static_cast<int64_t>(slaveIndex),
+                                        0LL,
+                                        0LL,
+                                        0LL,
+                                        0LL,
+                                        0LL,
+                                        0LL);
                                 }
 
 
@@ -15820,12 +18851,12 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             // CMD_SET_STATE 必須能在 PDO WKC 尚未完整有效時執行。
                             // 典型情境是 SAFE-OP -> OP：部分從站的 Output SM 在
                             // OP 前可能尚未貢獻完整 LRW WKC。若把進 OP 指令本身
-                            // 綁在 pdoCycleValid，會形成死結：
+                            // 綁在 processDataValid，會形成死結：
                             //
                             //   PDO WKC 未完整 -> 不送 OP -> 永遠無法進 OP
                             //
                             // 安全策略：
-                            // - CMD_SET_STATE：允許在 pdoCycleValid == false 時執行。
+                            // - CMD_SET_STATE：允許在 processDataValid == false 時執行。
                             // - 其他 Async Command（例如 SDO）：仍要求 PDO cycle valid。
                             // - 仍只在 subTick == 2 處理，維持既有 NIC 單一執行路徑。
                             // =========================================================
@@ -15840,7 +18871,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 (int)EcatCmdType::CMD_SET_STATE;
 
                             const bool asyncCmdAllowed =
-                                pdoCycleValid ||
+                                processDataValid ||
                                 stateTransitionPending;
 
                             if (subTick == 2 &&
@@ -15851,20 +18882,23 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 bool commandTerminal = true;
                                 bool commandError = false;
 
-                                if (!pdoCycleValid &&
+                                if (!processDataValid &&
                                     stateTransitionPending)
                                 {
-                                    RtPrintf(
-                                        "[ASYNC-STATE-TRANSITION] "
-                                        "Policy:ALLOW_WITHOUT_FULL_PDO_WKC | "
-                                        "RequestedState:0x%04X | "
-                                        "LRW:%d/%d | DCWKC:%d | "
-                                        "PDOValid:NO\n",
-                                        (unsigned int)
-                                        ((uint16_t)pMaster->m_asyncCmd.dataValue),
-                                        wkc,
-                                        pMaster->EXPECTED_WKC_PDO,
-                                        dcWkc);
+                                    PublishP64DeferredDiagnostic(
+                                        EtherCatP64DeferredDiagKind::AsyncStateWithoutFullPdoWkc,
+                                        static_cast<uint64_t>(pMaster->tickCount_PDO),
+                                        static_cast<int64_t>(
+                                            static_cast<uint16_t>(
+                                                pMaster->m_asyncCmd.dataValue)),
+                                        static_cast<int64_t>(wkc),
+                                        static_cast<int64_t>(
+                                            pMaster->EXPECTED_WKC_PDO),
+                                        static_cast<int64_t>(dcWkc),
+                                        0LL,
+                                        0LL,
+                                        0LL,
+                                        0LL);
                                 }
 
                                 switch (pMaster->m_asyncCmd.type)
@@ -15906,7 +18940,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                         ProcessRuntimeSafeSdoStep(
                                             pMaster,
                                             pdoCycleStartMasterNs,
-                                            pdoCycleValid,
+                                            processDataValid,
                                             &terminalSdoWkc);
 
                                     if (disposition ==
@@ -15959,11 +18993,12 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             ProcessRuntimeEscDiagProbe(
                                 pMaster,
                                 pdoCycleStartMasterNs,
-                                pdoCycleValid);
+                                processDataValid);
 
                             // =========================================================
-                            // PDO 通訊結果分類：wkc<0 算 timeout；frame 有回覆但 PDO/DC
-                            // WKC 不符合則算 wkc_error，兩者不可混為同一種故障。
+                            // PDO 通訊結果分類：wkc<0 算 timeout；frame 有回覆但 LRW
+                            // WKC 不符合才算 PDO wkc_error。FRMW DC WKC 由 DC-RX.3A
+                            // 獨立計數，不再把 DC-only 抖動偽裝成 PDO instability。
                             // =========================================================
 
                             if (wkc < 0)
@@ -15971,8 +19006,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 pMaster->
                                     timeout_count_PDO++;
                             }
-                            else if (!pdoWkcValid ||
-                                !dcWkcValid)
+                            else if (!pdoWkcValid)
                             {
                                 pMaster->
                                     wkc_error_count_PDO++;
@@ -15995,14 +19029,16 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 m_Motion.
                                 ObserveNCSettleRuntimeCycle(
                                     pMaster->tickCount_PDO,
-                                    pdoCycleValid);
+                                    processDataValid);
 
 
                             // =========================================================
                             // Motion
                             //
-                            // 有效週期才更新插補與軸控制；第一個無效週期先保留狀態，
-                            // 連續第二個無效週期起執行 EmergencyStopAllAxes，再發布輸出。
+                            // 有效週期才更新插補與軸控制。無效週期 1..7 不採用 Input、
+                            // 不更新插補／Motion；偵測到第一次無效後，下一 callback 起
+                            // 也不再 Flush 新 PLC output。連續第 8 個無效週期才執行
+                            // EmergencyStopAllAxes 並由下方發布 AL1003。
                             // =========================================================
 
                             uint64_t stageMotionStartNs =
@@ -16013,7 +19049,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 false;
 
 
-                            if (pdoCycleValid)
+                            if (processDataValid)
                             {
                                 pMaster->
                                     m_Motion.
@@ -16025,8 +19061,9 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                     UpdateAllMotion();
                             }
                             else if (
-                                pdoConsecutiveInvalidCycles >=
-                                2U)
+                                EtherCatPdoSafetyStopDebounce::
+                                IsContainmentRequired(
+                                    pdoConsecutiveInvalidCycles))
                             {
                                 pMaster->
                                     m_Motion.
@@ -16067,7 +19104,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             // existing motionNs measurement above.
                             ObservePdoRuntimeInvalidCorrelation(
                                 pMaster->tickCount_PDO,
-                                pdoCycleValid,
+                                processDataValid,
                                 static_cast<std::int32_t>(wkc),
                                 static_cast<std::int32_t>(
                                     pMaster->EXPECTED_WKC_PDO),
@@ -16121,6 +19158,351 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 }
                             }
 
+
+                            // =========================================================
+                            // DC-RX.3F deterministic fault-injection acceptance engine
+                            //
+                            // This block runs after the existing Motion/AL1003 safety
+                            // boundary. It never changes a production decision; it only
+                            // records whether the already-existing DC/PDO containment and
+                            // recovery paths reacted exactly as designed.
+                            // =========================================================
+
+                            if (dcRx3fScenario != DcRx3fFaultScenario::Off &&
+                                dcRx3fState != DcRx3fFaultState::Off)
+                            {
+                                const bool dcRx3fLrwScenario =
+                                    dcRx3fScenario ==
+                                    DcRx3fFaultScenario::LrwWkcDrop ||
+                                    dcRx3fScenario ==
+                                    DcRx3fFaultScenario::LrwTimeout;
+
+                                const bool dcRx3fDestructiveLrwScenario =
+                                    dcRx3fLrwScenario &&
+                                    dcRx3fConfiguredCycles >= 8U &&
+                                    dcRx3fAllowSafetyStop;
+
+                                if (pdoConsecutiveInvalidCycles >
+                                    dcRx3fMaximumPdoInvalidStreak)
+                                {
+                                    dcRx3fMaximumPdoInvalidStreak =
+                                        pdoConsecutiveInvalidCycles;
+                                }
+
+                                int64_t dcRx3fAppliedDeltaPpb =
+                                    realFfV0AppliedPpb -
+                                    dcRx3fBaselineAppliedPpb;
+
+                                if (dcRx3fAppliedDeltaPpb < 0)
+                                {
+                                    dcRx3fAppliedDeltaPpb =
+                                        -dcRx3fAppliedDeltaPpb;
+                                }
+
+                                if (dcRx3fAppliedDeltaPpb >
+                                    dcRx3fMaximumAppliedDeltaPpb)
+                                {
+                                    dcRx3fMaximumAppliedDeltaPpb =
+                                        dcRx3fAppliedDeltaPpb;
+                                }
+
+                                const bool dcRx3fTestActive =
+                                    dcRx3fState == DcRx3fFaultState::Inject ||
+                                    dcRx3fState == DcRx3fFaultState::Recovery;
+
+                                if (dcRx3fInjectionRequestedThisCycle)
+                                {
+                                    if (dcRx3fInjectionAppliedThisCycle)
+                                    {
+                                        if (dcRx3fAppliedCycles < 0xFFFFFFFFU)
+                                        {
+                                            dcRx3fAppliedCycles++;
+                                        }
+
+                                        dcRx3fLastAppliedTick =
+                                            pMaster->tickCount_PDO;
+                                        dcRx3fEvidenceMask |=
+                                            DC_RX3F_EVIDENCE_APPLIED;
+
+                                        switch (dcRx3fScenario)
+                                        {
+                                        case DcRx3fFaultScenario::DcWkcDrop:
+                                            if (!dcWkcValid && dcOnlyInvalid)
+                                            {
+                                                dcRx3fEvidenceMask |=
+                                                    DC_RX3F_EVIDENCE_DOWNSTREAM;
+                                            }
+                                            break;
+
+                                        case DcRx3fFaultScenario::LrwWkcDrop:
+                                            if (!processDataValid && wkc >= 0)
+                                            {
+                                                dcRx3fEvidenceMask |=
+                                                    DC_RX3F_EVIDENCE_DOWNSTREAM;
+                                            }
+                                            break;
+
+                                        case DcRx3fFaultScenario::LrwTimeout:
+                                            if (!processDataValid && wkc < 0)
+                                            {
+                                                dcRx3fEvidenceMask |=
+                                                    DC_RX3F_EVIDENCE_DOWNSTREAM;
+                                            }
+                                            break;
+
+                                        case DcRx3fFaultScenario::ExactTimingMissing:
+                                            if (!dcControlSampleValid &&
+                                                (dcSampleGuardReasonMask &
+                                                    DC_RX3D_SAMPLE_REJECT_TIMING_SOURCE) != 0)
+                                            {
+                                                dcRx3fEvidenceMask |=
+                                                    DC_RX3F_EVIDENCE_DOWNSTREAM;
+                                            }
+                                            break;
+
+                                        case DcRx3fFaultScenario::LateRtt:
+                                            if (dcRttGuardEvaluatedThisCycle &&
+                                                !dcRttGuardAcceptedThisCycle &&
+                                                !dcControlSampleValid &&
+                                                (dcSampleGuardReasonMask &
+                                                    DC_RX3E_SAMPLE_REJECT_RTT_ENVELOPE) != 0)
+                                            {
+                                                dcRx3fEvidenceMask |=
+                                                    DC_RX3F_EVIDENCE_DOWNSTREAM;
+                                            }
+                                            break;
+
+                                        case DcRx3fFaultScenario::DcTimestampRepeat:
+                                        case DcRx3fFaultScenario::DcTimestampBackward:
+                                            if (!dcControlSampleValid &&
+                                                (dcSampleGuardReasonMask &
+                                                    DC_RX3C_SAMPLE_REJECT_DC_ORDER) != 0)
+                                            {
+                                                dcRx3fEvidenceMask |=
+                                                    DC_RX3F_EVIDENCE_DOWNSTREAM;
+                                            }
+                                            break;
+
+                                        case DcRx3fFaultScenario::PhaseMapJump:
+                                            if (phasePRecoveryJumpGuardActive)
+                                            {
+                                                dcRx3fEvidenceMask |=
+                                                    DC_RX3F_EVIDENCE_DOWNSTREAM;
+                                            }
+                                            break;
+
+                                        case DcRx3fFaultScenario::SchedulerRecovery:
+                                            if (currentSchedulerRuntimeRecovery)
+                                            {
+                                                dcRx3fEvidenceMask |=
+                                                    DC_RX3F_EVIDENCE_DOWNSTREAM;
+                                            }
+                                            break;
+
+                                        default:
+                                            break;
+                                        }
+
+                                        if (!dcRx3fLrwScenario &&
+                                            processDataValid)
+                                        {
+                                            dcRx3fEvidenceMask |=
+                                                DC_RX3F_EVIDENCE_PDO_PRESERVED;
+                                        }
+
+                                        if (!dcRx3fLrwScenario &&
+                                            (dcOnlyGraceAcceptedThisCycle ||
+                                                realFfV0State == 3 ||
+                                                phasePActV0State == 3 ||
+                                                realFfV0TransientHoldReasonMask != 0 ||
+                                                phasePRecoveryJumpGuardActive ||
+                                                currentSchedulerRuntimeRecovery))
+                                        {
+                                            dcRx3fEvidenceMask |=
+                                                DC_RX3F_EVIDENCE_HOLD_OR_GRACE;
+                                        }
+
+                                        if (dcRx3fAppliedCycles >=
+                                            dcRx3fConfiguredCycles)
+                                        {
+                                            dcRx3fState =
+                                                DcRx3fFaultState::Recovery;
+                                            dcRx3fRecoveryCycles = 0;
+                                            dcRx3fRecoveryStableCycles = 0;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if (dcRx3fTargetWaitCycles < 0xFFFFFFFFU)
+                                        {
+                                            dcRx3fTargetWaitCycles++;
+                                        }
+
+                                        if (dcRx3fTargetWaitCycles >=
+                                            DC_RX3F_TARGET_WAIT_LIMIT_CYCLES)
+                                        {
+                                            dcRx3fFailureMask |=
+                                                DC_RX3F_FAIL_TARGET_TIMEOUT;
+                                        }
+                                    }
+                                }
+
+                                if (dcRx3fTestActive ||
+                                    dcRx3fState == DcRx3fFaultState::Recovery)
+                                {
+                                    if ((realFfV0TripMask &
+                                        REAL_FF_V0_HARD_TRIP_MASK) != 0)
+                                    {
+                                        dcRx3fFailureMask |=
+                                            DC_RX3F_FAIL_HARD_TRIP;
+                                    }
+
+                                    if (!dcRx3fDestructiveLrwScenario &&
+                                        dcRx3fMaximumAppliedDeltaPpb >
+                                        DC_RX3F_MAX_APPLIED_FF_DELTA_PPB)
+                                    {
+                                        dcRx3fFailureMask |=
+                                            DC_RX3F_FAIL_FF_DISCONTINUITY;
+                                    }
+
+                                    if (!dcRx3fLrwScenario &&
+                                        pdoConsecutiveInvalidCycles != 0)
+                                    {
+                                        dcRx3fFailureMask |=
+                                            DC_RX3F_FAIL_UNEXPECTED_PDO_INVALID;
+                                    }
+
+                                    if (pdoSafetyStopAppliedThisCycle &&
+                                        !dcRx3fDestructiveLrwScenario)
+                                    {
+                                        dcRx3fFailureMask |=
+                                            DC_RX3F_FAIL_UNEXPECTED_SAFETY_STOP;
+                                    }
+                                }
+
+                                if (dcRx3fDestructiveLrwScenario &&
+                                    dcRx3fState == DcRx3fFaultState::Recovery)
+                                {
+                                    if (pdoSafetyStopAppliedThisCycle)
+                                    {
+                                        dcRx3fEvidenceMask |=
+                                            DC_RX3F_EVIDENCE_DOWNSTREAM |
+                                            DC_RX3F_EVIDENCE_SAFETY_STOP;
+                                        dcRx3fState = DcRx3fFaultState::Pass;
+                                        dcRx3fEndTick = pMaster->tickCount_PDO;
+                                    }
+                                    else
+                                    {
+                                        dcRx3fFailureMask |=
+                                            DC_RX3F_FAIL_MISSING_EVIDENCE;
+                                    }
+                                }
+                                else if (dcRx3fState ==
+                                    DcRx3fFaultState::Recovery)
+                                {
+                                    if (dcRx3fRecoveryCycles < 0xFFFFFFFFU)
+                                    {
+                                        dcRx3fRecoveryCycles++;
+                                    }
+
+                                    const bool dcRx3fFullyRecovered =
+                                        realFfV0State == 2 &&
+                                        phasePActV0State == 2 &&
+                                        realFfV0TransientHoldReasonMask == 0 &&
+                                        realFfV0TripMask == 0 &&
+                                        realFfV0CycleQualityKnown &&
+                                        realFfV0PreviousCycleClean &&
+                                        realFfV0CleanCycleStreak >=
+                                        realFfV0CleanCyclesRequired &&
+                                        dcSampleGuardState ==
+                                        DC_RX3C_SAMPLE_STATE_TRACK &&
+                                        dcControlSampleValid &&
+                                        dcExactTimingLocked &&
+                                        dcRttGuardState ==
+                                        DC_RX3E_RTT_STATE_TRACK &&
+                                        !phasePRecoveryJumpGuardActive &&
+                                        phasePActV0AcceptedPhaseMapValid &&
+                                        phasePActV0DiagPhaseMapAgeGood &&
+                                        currentSchedulerClean &&
+                                        processDataValid &&
+                                        pdoConsecutiveInvalidCycles == 0;
+
+                                    if (dcRx3fFullyRecovered)
+                                    {
+                                        if (dcRx3fRecoveryStableCycles <
+                                            DC_RX3F_RECOVERY_STABLE_CYCLES)
+                                        {
+                                            dcRx3fRecoveryStableCycles++;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        dcRx3fRecoveryStableCycles = 0;
+                                    }
+
+                                    if (dcRx3fRecoveryStableCycles >=
+                                        DC_RX3F_RECOVERY_STABLE_CYCLES)
+                                    {
+                                        dcRx3fEvidenceMask |=
+                                            DC_RX3F_EVIDENCE_RECOVERED;
+
+                                        if (dcRx3fMaximumAppliedDeltaPpb <=
+                                            DC_RX3F_MAX_APPLIED_FF_DELTA_PPB)
+                                        {
+                                            dcRx3fEvidenceMask |=
+                                                DC_RX3F_EVIDENCE_FF_PRESERVED;
+                                        }
+
+                                        LONG dcRx3fRequiredEvidence =
+                                            DC_RX3F_EVIDENCE_APPLIED |
+                                            DC_RX3F_EVIDENCE_DOWNSTREAM |
+                                            DC_RX3F_EVIDENCE_RECOVERED |
+                                            DC_RX3F_EVIDENCE_FF_PRESERVED;
+
+                                        if (!dcRx3fLrwScenario)
+                                        {
+                                            dcRx3fRequiredEvidence |=
+                                                DC_RX3F_EVIDENCE_PDO_PRESERVED |
+                                                DC_RX3F_EVIDENCE_HOLD_OR_GRACE;
+                                        }
+
+                                        const bool dcRx3fLrwStreakProved =
+                                            !dcRx3fLrwScenario ||
+                                            dcRx3fMaximumPdoInvalidStreak >=
+                                            dcRx3fConfiguredCycles;
+
+                                        if ((dcRx3fEvidenceMask &
+                                            dcRx3fRequiredEvidence) ==
+                                            dcRx3fRequiredEvidence &&
+                                            dcRx3fLrwStreakProved)
+                                        {
+                                            dcRx3fState =
+                                                DcRx3fFaultState::Pass;
+                                            dcRx3fEndTick =
+                                                pMaster->tickCount_PDO;
+                                        }
+                                        else
+                                        {
+                                            dcRx3fFailureMask |=
+                                                DC_RX3F_FAIL_MISSING_EVIDENCE;
+                                        }
+                                    }
+                                    else if (dcRx3fRecoveryCycles >=
+                                        DC_RX3F_RECOVERY_LIMIT_CYCLES)
+                                    {
+                                        dcRx3fFailureMask |=
+                                            DC_RX3F_FAIL_RECOVERY_TIMEOUT;
+                                    }
+                                }
+
+                                if (dcRx3fFailureMask != 0 &&
+                                    dcRx3fState != DcRx3fFaultState::Pass &&
+                                    dcRx3fState != DcRx3fFaultState::Fail)
+                                {
+                                    dcRx3fState = DcRx3fFaultState::Fail;
+                                    dcRx3fEndTick = pMaster->tickCount_PDO;
+                                }
+                            }
 
                             // =========================================================
                             // LRW+FRMW round-trip 統計；4000 samples 約一秒形成快照。
@@ -16540,6 +19922,391 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                     g_pdoRtDcWkc =
                                         (LONG)
                                         dcWkc;
+
+                                    g_pdoRtDcReferencePresent =
+                                        dcReferencePresent ? 1L : 0L;
+
+                                    g_pdoRtProcessDataValid =
+                                        processDataValid ? 1L : 0L;
+
+                                    g_pdoRtDcTransportValid =
+                                        dcTransportValid ? 1L : 0L;
+
+                                    g_pdoRtProcessInvalidStreak =
+                                        (LONG)(
+                                            pdoConsecutiveInvalidCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : pdoConsecutiveInvalidCycles);
+
+                                    g_pdoRtDcTransportInvalidStreak =
+                                        (LONG)(
+                                            dcTransportConsecutiveInvalidCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcTransportConsecutiveInvalidCycles);
+
+                                    g_pdoRtDcTransportInvalidMaxStreak =
+                                        (LONG)(
+                                            dcTransportMaximumInvalidCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcTransportMaximumInvalidCycles);
+
+                                    g_pdoRtDcWkcInvalidTotal =
+                                        (LONGLONG)dcWkcInvalidCyclesTotal;
+
+                                    g_pdoRtDcOnlyInvalidTotal =
+                                        (LONGLONG)dcOnlyInvalidCyclesTotal;
+
+                                    g_pdoRtDcTransportRecoveryTotal =
+                                        (LONGLONG)dcTransportRecoveryTotal;
+
+                                    g_pdoRtDcOnlyInvalidStreak =
+                                        (LONG)(
+                                            dcOnlyInvalidConsecutiveCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcOnlyInvalidConsecutiveCycles);
+
+                                    g_pdoRtDcOnlyInvalidMaxStreak =
+                                        (LONG)(
+                                            dcOnlyInvalidMaximumConsecutiveCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcOnlyInvalidMaximumConsecutiveCycles);
+
+                                    g_pdoRtDcHoldoverTier =
+                                        dcHoldoverDiagTier;
+
+                                    const uint32_t dcHoldoverCurrentCycles =
+                                        dcHoldoverEpisodeActive
+                                        ? dcHoldoverUnqualifiedCycles
+                                        : (dcOnlyGraceAcceptedThisCycle
+                                            ? dcOnlyInvalidConsecutiveCycles
+                                            : 0U);
+
+                                    g_pdoRtDcHoldoverCurrentCycles =
+                                        (LONG)(
+                                            dcHoldoverCurrentCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcHoldoverCurrentCycles);
+
+                                    g_pdoRtDcHoldoverMaxCycles =
+                                        (LONG)(
+                                            dcHoldoverMaximumUnqualifiedCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcHoldoverMaximumUnqualifiedCycles);
+
+                                    g_pdoRtDcGlitchDebt =
+                                        (LONG)dcOnlyGlitchDebt;
+
+                                    g_pdoRtDcGlitchDebtMax =
+                                        (LONG)dcOnlyGlitchDebtMaximum;
+
+                                    g_pdoRtDcGlitchDebtLimit =
+                                        (LONG)DC_RX3B_GLITCH_DEBT_LIMIT;
+
+                                    g_pdoRtDcGraceAcceptedCyclesTotal =
+                                        (LONGLONG)dcGraceAcceptedCyclesTotal;
+
+                                    g_pdoRtDcHoldoverEpisodeTotal =
+                                        (LONGLONG)dcHoldoverEpisodeTotal;
+
+                                    g_pdoRtDcHoldoverEntryTotal =
+                                        (LONGLONG)dcHoldoverEntryTotal;
+
+                                    g_pdoRtDcDegradedEntryTotal =
+                                        (LONGLONG)dcDegradedEntryTotal;
+
+                                    g_pdoRtDcRelockEntryTotal =
+                                        (LONGLONG)dcRelockEntryTotal;
+
+                                    g_pdoRtDcSampleGuardState =
+                                        dcSampleGuardState;
+
+                                    g_pdoRtDcSampleQualified =
+                                        dcControlSampleValid ? 1L : 0L;
+
+                                    g_pdoRtDcSampleGuardReasonMask =
+                                        dcSampleGuardLastReasonMask;
+
+                                    g_pdoRtDcSampleRejectStreak =
+                                        (LONG)(
+                                            dcSampleGuardConsecutiveRejects > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcSampleGuardConsecutiveRejects);
+
+                                    g_pdoRtDcSampleRejectMaxStreak =
+                                        (LONG)(
+                                            dcSampleGuardMaximumConsecutiveRejects > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcSampleGuardMaximumConsecutiveRejects);
+
+                                    g_pdoRtDcSampleApproxAgeNs =
+                                        (LONGLONG)dcSampleGuardLastApproxAgeNs;
+
+                                    g_pdoRtDcSampleApproxAgeMaxNs =
+                                        (LONGLONG)dcSampleGuardMaximumApproxAgeNs;
+
+                                    g_pdoRtDcSampleQpcDeltaNs =
+                                        (LONGLONG)dcSampleGuardLastQpcDeltaNs;
+
+                                    g_pdoRtDcSampleDcDeltaNs =
+                                        (LONGLONG)dcSampleGuardLastDcDeltaNs;
+
+                                    g_pdoRtDcSampleDeltaErrorNs =
+                                        (LONGLONG)dcSampleGuardLastDeltaErrorNs;
+
+                                    g_pdoRtDcSampleDeltaToleranceNs =
+                                        (LONGLONG)dcSampleGuardLastDeltaToleranceNs;
+
+                                    g_pdoRtDcSampleAcceptedTotal =
+                                        (LONGLONG)dcSampleGuardAcceptedTotal;
+
+                                    g_pdoRtDcSampleRejectedTotal =
+                                        (LONGLONG)dcSampleGuardRejectedTotal;
+
+                                    g_pdoRtDcSampleAnchorTotal =
+                                        (LONGLONG)dcSampleGuardAnchorTotal;
+
+                                    g_pdoRtDcSampleReanchorTotal =
+                                        (LONGLONG)dcSampleGuardReanchorTotal;
+
+                                    g_pdoRtDcSampleAgeRejectTotal =
+                                        (LONGLONG)dcSampleGuardAgeRejectTotal;
+
+                                    g_pdoRtDcSampleOrderRejectTotal =
+                                        (LONGLONG)dcSampleGuardOrderRejectTotal;
+
+                                    g_pdoRtDcSampleDeltaRejectTotal =
+                                        (LONGLONG)dcSampleGuardDeltaRejectTotal;
+
+                                    g_pdoRtDcPhaseJumpGuardActive =
+                                        phasePRecoveryJumpGuardActive ? 1L : 0L;
+
+                                    g_pdoRtDcPhaseJumpGuardGoodWindows =
+                                        (LONG)phasePRecoveryJumpGoodWindows;
+
+                                    g_pdoRtDcPhaseJumpGuardRequiredWindows =
+                                        (LONG)DC_RX3C_PHASE_JUMP_GOOD_WINDOWS;
+
+                                    g_pdoRtDcPhaseJumpLastNs =
+                                        (LONGLONG)phasePRecoveryJumpLastNs;
+
+                                    g_pdoRtDcPhaseJumpMaxAbsNs =
+                                        (LONGLONG)phasePRecoveryJumpMaximumAbsNs;
+
+                                    g_pdoRtDcPhaseJumpArmTotal =
+                                        (LONGLONG)phasePRecoveryJumpArmTotal;
+
+                                    g_pdoRtDcPhaseJumpPassTotal =
+                                        (LONGLONG)phasePRecoveryJumpPassTotal;
+
+                                    g_pdoRtDcPhaseJumpRejectTotal =
+                                        (LONGLONG)phasePRecoveryJumpRejectTotal;
+
+                                    g_pdoRtDcPhaseMapSequence =
+                                        phasePActV0DiagPhaseMapSequence;
+
+                                    g_pdoRtDcPhaseMapNew =
+                                        phasePActV0DiagPhaseMapNew ? 1L : 0L;
+
+                                    g_pdoRtDcPhaseMapAgeGood =
+                                        phasePActV0DiagPhaseMapAgeGood ? 1L : 0L;
+
+                                    g_pdoRtDcPhaseMapAgeNs =
+                                        (LONGLONG)phasePActV0DiagPhaseMapAgeNs;
+
+                                    g_pdoRtDcPhaseMapStaleTotal =
+                                        (LONGLONG)phasePActV0PhaseMapStaleTotal;
+
+                                    g_pdoRtDcTimingSource =
+                                        dcSampleTimingSource;
+
+                                    g_pdoRtDcExactTimingLocked =
+                                        dcExactTimingLocked ? 1L : 0L;
+
+                                    g_pdoRtDcExactTimingValid =
+                                        qpcDcExactTimingAvailable ? 1L : 0L;
+
+                                    g_pdoRtDcTimingSelectedRttNs =
+                                        (LONGLONG)qpcDcRttNs;
+
+                                    g_pdoRtDcTimingExactRttNs =
+                                        (LONGLONG)qpcDcExactRttNs;
+
+                                    g_pdoRtDcTimingExactRttMaxNs =
+                                        (LONGLONG)dcTimingExactRttMaximumNs;
+
+                                    g_pdoRtDcTimingCallRttNs =
+                                        (LONGLONG)qpcDcCallRttNs;
+
+                                    g_pdoRtDcTimingExcludedOverheadNs =
+                                        (LONGLONG)qpcDcExcludedOverheadNs;
+
+                                    g_pdoRtDcTimingMidpointShiftNs =
+                                        (LONGLONG)dcTimingMidpointShiftLastNs;
+
+                                    g_pdoRtDcTimingMidpointShiftMaxAbsNs =
+                                        (LONGLONG)
+                                        dcTimingMidpointShiftMaximumAbsNs;
+
+                                    g_pdoRtDcTimingExactUseTotal =
+                                        (LONGLONG)dcTimingExactUseTotal;
+
+                                    g_pdoRtDcTimingFallbackUseTotal =
+                                        (LONGLONG)dcTimingFallbackUseTotal;
+
+                                    g_pdoRtDcTimingMissingAfterLockTotal =
+                                        (LONGLONG)
+                                        dcTimingMissingAfterLockTotal;
+
+                                    g_pdoRtDcTimingSourceSwitchTotal =
+                                        (LONGLONG)dcTimingSourceSwitchTotal;
+
+                                    g_pdoRtDcTimingRejectTotal =
+                                        (LONGLONG)
+                                        dcSampleGuardTimingRejectTotal;
+
+                                    g_pdoRtDcRttGuardState =
+                                        dcRttGuardState;
+
+                                    g_pdoRtDcRttGuardAccepted =
+                                        (dcRttGuardEvaluatedThisCycle &&
+                                            dcRttGuardAcceptedThisCycle)
+                                        ? 1L : 0L;
+
+                                    g_pdoRtDcRttGuardWarmupSamples =
+                                        (LONG)dcRttGuardWarmupSamples;
+
+                                    g_pdoRtDcRttGuardWarmupRequired =
+                                        (LONG)DC_RX3E_RTT_WARMUP_SAMPLES;
+
+                                    g_pdoRtDcRttGuardCurrentNs =
+                                        (LONGLONG)dcRttGuardLastRttNs;
+
+                                    g_pdoRtDcRttGuardBaselineNs =
+                                        (LONGLONG)dcRttGuardBaselineNs;
+
+                                    g_pdoRtDcRttGuardDeviationNs =
+                                        (LONGLONG)dcRttGuardDeviationNs;
+
+                                    g_pdoRtDcRttGuardLimitNs =
+                                        (LONGLONG)dcRttGuardLimitNs;
+
+                                    g_pdoRtDcRttGuardExcessNs =
+                                        (LONGLONG)dcRttGuardLastExcessNs;
+
+                                    g_pdoRtDcRttGuardOutlierStreak =
+                                        (LONG)(
+                                            dcRttGuardOutlierStreak > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcRttGuardOutlierStreak);
+
+                                    g_pdoRtDcRttGuardOutlierMaxStreak =
+                                        (LONG)(
+                                            dcRttGuardOutlierMaximumStreak > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcRttGuardOutlierMaximumStreak);
+
+                                    g_pdoRtDcRttGuardRebaseCandidateSamples =
+                                        (LONG)(
+                                            dcRttGuardRebaseCandidateSamples > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcRttGuardRebaseCandidateSamples);
+
+                                    g_pdoRtDcRttGuardAcceptedTotal =
+                                        (LONGLONG)dcRttGuardAcceptedTotal;
+
+                                    g_pdoRtDcRttGuardRejectedTotal =
+                                        (LONGLONG)dcRttGuardRejectedTotal;
+
+                                    g_pdoRtDcRttGuardRebaseTotal =
+                                        (LONGLONG)dcRttGuardRebaseTotal;
+
+                                    g_pdoRtDcSampleRttRejectTotal =
+                                        (LONGLONG)dcSampleGuardRttRejectTotal;
+
+                                    // =====================================================
+                                    // DC-RX.3F deterministic fault-injection snapshot
+                                    // =====================================================
+
+                                    g_pdoRtDcFaultState =
+                                        (LONG)dcRx3fState;
+
+                                    g_pdoRtDcFaultScenario =
+                                        (LONG)dcRx3fScenario;
+
+                                    g_pdoRtDcFaultConfiguredCycles =
+                                        (LONG)(
+                                            dcRx3fConfiguredCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcRx3fConfiguredCycles);
+
+                                    g_pdoRtDcFaultAppliedCycles =
+                                        (LONG)(
+                                            dcRx3fAppliedCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcRx3fAppliedCycles);
+
+                                    g_pdoRtDcFaultStartDelayRemaining =
+                                        (LONG)(
+                                            dcRx3fStartDelayRemaining > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcRx3fStartDelayRemaining);
+
+                                    g_pdoRtDcFaultRecoveryCycles =
+                                        (LONG)(
+                                            dcRx3fRecoveryCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcRx3fRecoveryCycles);
+
+                                    g_pdoRtDcFaultTargetWaitCycles =
+                                        (LONG)(
+                                            dcRx3fTargetWaitCycles > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcRx3fTargetWaitCycles);
+
+                                    g_pdoRtDcFaultActiveThisCycle =
+                                        dcRx3fInjectionAppliedThisCycle ? 1L : 0L;
+
+                                    g_pdoRtDcFaultGateBlockMask =
+                                        dcRx3fGateBlockMask;
+
+                                    g_pdoRtDcFaultEvidenceMask =
+                                        dcRx3fEvidenceMask;
+
+                                    g_pdoRtDcFaultFailureMask =
+                                        dcRx3fFailureMask;
+
+                                    g_pdoRtDcFaultRequireServoOff =
+                                        dcRx3fRequireServoOff ? 1L : 0L;
+
+                                    g_pdoRtDcFaultAllowSafetyStop =
+                                        dcRx3fAllowSafetyStop ? 1L : 0L;
+
+                                    g_pdoRtDcFaultValueNs =
+                                        (LONGLONG)dcRx3fConfiguredValueNs;
+
+                                    g_pdoRtDcFaultBaselineAppliedPpb =
+                                        (LONGLONG)dcRx3fBaselineAppliedPpb;
+
+                                    g_pdoRtDcFaultCurrentAppliedPpb =
+                                        (LONGLONG)realFfV0AppliedPpb;
+
+                                    g_pdoRtDcFaultMaxAppliedDeltaPpb =
+                                        (LONGLONG)dcRx3fMaximumAppliedDeltaPpb;
+
+                                    g_pdoRtDcFaultMaxPdoInvalidStreak =
+                                        (LONG)(
+                                            dcRx3fMaximumPdoInvalidStreak > 0x7FFFFFFFU
+                                            ? 0x7FFFFFFFU
+                                            : dcRx3fMaximumPdoInvalidStreak);
+
+                                    g_pdoRtDcFaultStartTick =
+                                        (LONGLONG)dcRx3fStartTick;
+
+                                    g_pdoRtDcFaultLastAppliedTick =
+                                        (LONGLONG)dcRx3fLastAppliedTick;
+
+                                    g_pdoRtDcFaultEndTick =
+                                        (LONGLONG)dcRx3fEndTick;
 
 
                                     // 確保資料先完成，再發布 even sequence。

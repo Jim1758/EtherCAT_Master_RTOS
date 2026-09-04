@@ -105,9 +105,13 @@
     <ClInclude Include="EtherCatMaster_DC_Internal.h" />
     <ClInclude Include="EtherCatMaster_DC_Topology.h" />
     <ClInclude Include="EtherCatMaster_DC_Tuning.h" />
+    <ClInclude Include="EtherCatP64DeferredDiagnostics.h" />
     <ClInclude Include="EtherCatPdo.h" />
     <ClInclude Include="EtherCatPdoRuntimeInvalidCorrelation.h" />
+    <ClInclude Include="EtherCatPdoSafetyStopDebounce.h" />
     <ClInclude Include="EtherCatRxCorrelationDiagContract.h" />
+    <ClInclude Include="EtherCatRxForensics.h" />
+    <ClInclude Include="EtherCatRxForensicsDiagContract.h" />
     <ClInclude Include="EtherCatServo.h" />
     <ClInclude Include="EtherCatSmDiagContract.h" />
     <ClInclude Include="EtherCatTypes.h" />
@@ -144,8 +148,11 @@
     <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmCutoverGate.h" />
     <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmShadow.h" />
     <ClInclude Include="NCOrdinaryG00FeedHoldCohortShadow.h" />
+    <ClInclude Include="NCOrdinaryG00FeedHoldRollingRearmCutoverGate.h" />
+    <ClInclude Include="NCOrdinaryG00FeedHoldRollingRearmShadow.h" />
     <ClInclude Include="NCOrdinaryG00InflightTerminalRegistryShadow.h" />
     <ClInclude Include="NCOrdinaryG00ReadAheadCutoverGate.h" />
+    <ClInclude Include="NCPathCoreInputHandoffCompactShadow.h" />
     <ClInclude Include="NCPLCManager.h" />
     <ClInclude Include="NCPLCMap.h" />
     <ClInclude Include="NCPreparedBlockQueueShadow.h" />
@@ -213,7 +220,6 @@
     <ClCompile Include="HMI_Bridge.cpp" />
     <ClCompile Include="HomePersistenceManager.cpp" />
     <ClCompile Include="HomingManager.cpp" />
-    <ClCompile Include="inspect_nc02k1_sizes.cpp" />
     <ClCompile Include="MacroEngine.cpp" />
     <ClCompile Include="MacroParser.cpp" />
     <ClCompile Include="MCode.cpp" />

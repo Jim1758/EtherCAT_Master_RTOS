@@ -19,7 +19,7 @@
  * - PDO cycle：250 us（4 kHz）。
  * - RX Soft Deadline：205 us。
  * - RX Hard Deadline：210 us。
- * - RX coarse wait request：50 us，最多兩次。
+ * - RX coarse wait slice：50 us，優先等待 NAL RX event，失敗才退回 sleep。
  * - RTX64 HAL：25 us；NAL interrupt/TX complete priority：70/70。
  *
  * 安全原則：
@@ -28,6 +28,8 @@
  * - 所有 Priority 64 診斷只做計數與 seqlock publish，不做格式化輸出。
  */
 #include "EtherCatMaster.h"
+#include "EtherCatMaster_DC_Internal.h"
+#include "EtherCatRxForensics.h"
 #include "ConfigReader.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 #include <windows.h> 
@@ -38,6 +40,14 @@
 #include <cctype>
 #include <string>
 #define MAX_MBX_SIZE 1024
+
+#if defined(_MSC_VER)
+#define OSCARMAX_RX4A_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define OSCARMAX_RX4A_NOINLINE __attribute__((noinline))
+#else
+#define OSCARMAX_RX4A_NOINLINE
+#endif
 
 
 
@@ -5152,8 +5162,249 @@ volatile LONG g_ecatRxDiagTimeoutAttemptAvg = 0;
 volatile LONG g_ecatRxDiagTimeoutAttemptMax = 0;
 volatile LONGLONG g_ecatRxDiagReceiveCallMaxNs = 0;
 volatile LONGLONG g_ecatRxDiagTimeoutReceiveCallMaxNs = 0;
+volatile LONG g_ecatRxDiagWaitMode = 0;
+volatile LONG g_ecatRxDiagEventWaitCalls = 0;
+volatile LONG g_ecatRxDiagEventSignaled = 0;
+volatile LONG g_ecatRxDiagEventTimeout = 0;
+volatile LONG g_ecatRxDiagEventFailed = 0;
+volatile LONG g_ecatRxDiagEventStopped = 0;
+volatile LONG g_ecatRxDiagEventFallbackSleep = 0;
+volatile LONG g_ecatRxDiagEventWaitValid = 0;
+volatile LONGLONG g_ecatRxDiagEventWaitAvgNs = 0;
+volatile LONGLONG g_ecatRxDiagEventWaitMaxNs = 0;
+volatile LONG g_ecatRxDiagEventLastError = ERROR_SUCCESS;
 volatile LONG g_ecatRxDiagSoftDeadlineNs = 205000;
 volatile LONG g_ecatRxDiagHardDeadlineNs = 210000;
+
+
+// =============================================================
+// DC-RX.4A - NAL outcome snapshot and fixed-size incident ring
+//
+// The ring is written only by the Priority-64 EtherCAT owner. Priority 50
+// drains it once per second. No formatting, allocation, lock, file I/O or
+// additional NAL queue access is performed by the diagnostic consumer.
+// =============================================================
+
+volatile LONG g_ecatRx4aNalFrame = 0;
+volatile LONG g_ecatRx4aNalNoData = 0;
+volatile LONG g_ecatRx4aNalApiError = 0;
+volatile LONG g_ecatRx4aNalInvalidLength = 0;
+volatile LONG g_ecatRx4aNalUnavailable = 0;
+volatile LONG g_ecatRx4aNalLastError = ERROR_SUCCESS;
+volatile LONG g_ecatRx4aCallOver50us = 0;
+volatile LONG g_ecatRx4aCallOver100us = 0;
+volatile LONG g_ecatRx4aCallOver150us = 0;
+volatile LONG g_ecatRx4aCallOver200us = 0;
+volatile LONG g_ecatRx4aTimeoutNoFrame = 0;
+volatile LONG g_ecatRx4aTimeoutNalStall = 0;
+volatile LONG g_ecatRx4aTimeoutLateFrame = 0;
+volatile LONG g_ecatRx4aResyncEvents = 0;
+volatile LONG g_ecatRx4aResyncFrames = 0;
+volatile LONG g_ecatRx4aResyncLimitHit = 0;
+
+namespace
+{
+    constexpr uint64_t ETHERCAT_RX4A_NAL_STALL_HINT_NS = 100000ULL;
+
+    struct EtherCatRx4aIncidentSlot
+    {
+        volatile LONG Sequence = 0;
+        EtherCatRxIncidentRecord Record{};
+    };
+
+    struct EtherCatRx4aWindowCounters
+    {
+        uint64_t NalFrame = 0ULL;
+        uint64_t NalNoData = 0ULL;
+        uint64_t NalApiError = 0ULL;
+        uint64_t NalInvalidLength = 0ULL;
+        uint64_t NalUnavailable = 0ULL;
+        DWORD NalLastError = ERROR_SUCCESS;
+        uint64_t CallOver50us = 0ULL;
+        uint64_t CallOver100us = 0ULL;
+        uint64_t CallOver150us = 0ULL;
+        uint64_t CallOver200us = 0ULL;
+        uint64_t TimeoutNoFrame = 0ULL;
+        uint64_t TimeoutNalStall = 0ULL;
+        uint64_t TimeoutLateFrame = 0ULL;
+        uint64_t ResyncEvents = 0ULL;
+        uint64_t ResyncFrames = 0ULL;
+        uint64_t ResyncLimitHit = 0ULL;
+    };
+
+    EtherCatRx4aIncidentSlot
+        g_ecatRx4aIncidentRing[ETHERCAT_RX4A_INCIDENT_RING_CAPACITY] = {};
+
+    __declspec(align(8)) volatile LONGLONG
+        g_ecatRx4aLatestIncidentId = 0;
+
+    uint64_t g_ecatRx4aNextIncidentId = 0ULL;
+    uint64_t g_ecatRx4aCurrentBurstId = 0ULL;
+    uint64_t g_ecatRx4aLastHardIncidentId = 0ULL;
+    uint64_t g_ecatRx4aTotalHardTimeoutProducer = 0ULL;
+    bool g_ecatRx4aPendingResyncAttempted = false;
+    uint32_t g_ecatRx4aPendingResyncDrainCount = 0u;
+    uint32_t g_ecatRx4aPendingResyncDrainLimitHit = 0u;
+    EtherCatRx4aWindowCounters g_ecatRx4aWindow{};
+
+    // DC-DIAG.2: ecx_LRW_FRMW() has one Priority-64 owner. Reuse one
+    // process-lifetime producer workspace instead of creating, returning and
+    // passing 240-byte incident records by value on the fixed RT stack.
+    const EtherCatRxIncidentRecord g_ecatRx4aEmptyIncident{};
+    EtherCatRxIncidentRecord g_ecatRx4aProducerWorkspace{};
+
+    void AccumulateRx4aNalOutcome(
+        const NicRxCallDiagnostic& diagnostic)
+    {
+        const NicRxCallOutcome outcome =
+            static_cast<NicRxCallOutcome>(diagnostic.Outcome);
+
+        switch (outcome)
+        {
+        case NicRxCallOutcome::Frame:
+            g_ecatRx4aWindow.NalFrame++;
+            break;
+
+        case NicRxCallOutcome::NoData:
+            g_ecatRx4aWindow.NalNoData++;
+            break;
+
+        case NicRxCallOutcome::InvalidLength:
+            g_ecatRx4aWindow.NalInvalidLength++;
+            g_ecatRx4aWindow.NalLastError = diagnostic.LastError;
+            break;
+
+        case NicRxCallOutcome::NalError:
+            g_ecatRx4aWindow.NalApiError++;
+            g_ecatRx4aWindow.NalLastError = diagnostic.LastError;
+            break;
+
+        default:
+            g_ecatRx4aWindow.NalUnavailable++;
+            g_ecatRx4aWindow.NalLastError = diagnostic.LastError;
+            break;
+        }
+    }
+
+    void FillRx4aControlContext(
+        EtherCatRxIncidentRecord& record)
+    {
+        record.SchedulerRecoveryTotal =
+            static_cast<uint64_t>(
+                InterlockedCompareExchange64(
+                    &g_pdoRuntimeRecoveryTotalEvents,
+                    0,
+                    0));
+        record.EscPortChangeSerial =
+            static_cast<uint64_t>(
+                InterlockedCompareExchange64(
+                    &g_ecatRx4aEscPortChangeSerial,
+                    0,
+                    0));
+        record.PhaseErrorNs =
+            static_cast<int64_t>(
+                InterlockedCompareExchange64(
+                    &g_qpcPhasePActV0ActualErrNs,
+                    0,
+                    0));
+        record.AppliedPpb =
+            static_cast<int64_t>(
+                InterlockedCompareExchange64(
+                    &g_qpcRealFfV0AppliedPpb,
+                    0,
+                    0));
+        record.RecommendedPpb =
+            static_cast<int64_t>(
+                InterlockedCompareExchange64(
+                    &g_qpcRealFfV0RecommendedPpb,
+                    0,
+                    0));
+        record.HoldMask =
+            static_cast<uint32_t>(g_qpcRealFfV0HoldMask);
+        record.TripMask =
+            static_cast<uint32_t>(g_qpcRealFfV0TripMask);
+        record.ProcessDataValid =
+            g_pdoRtProcessDataValid != 0 ? 1u : 0u;
+        record.DcTransportValid =
+            g_pdoRtDcTransportValid != 0 ? 1u : 0u;
+    }
+
+    OSCARMAX_RX4A_NOINLINE uint64_t PublishRx4aIncident(
+        EtherCatRxIncidentRecord& record)
+    {
+        const uint64_t incidentId = ++g_ecatRx4aNextIncidentId;
+        const uint32_t slotIndex = static_cast<uint32_t>(
+            (incidentId - 1ULL) % ETHERCAT_RX4A_INCIDENT_RING_CAPACITY);
+
+        EtherCatRx4aIncidentSlot& slot =
+            g_ecatRx4aIncidentRing[slotIndex];
+
+        record.IncidentId = incidentId;
+
+        InterlockedIncrement(&slot.Sequence);
+        MemoryBarrier();
+        slot.Record = record;
+        MemoryBarrier();
+        InterlockedIncrement(&slot.Sequence);
+
+        InterlockedExchange64(
+            &g_ecatRx4aLatestIncidentId,
+            static_cast<LONGLONG>(incidentId));
+
+        return incidentId;
+    }
+}
+
+uint64_t EtherCatRx4aIncidentLatestId()
+{
+    return static_cast<uint64_t>(
+        InterlockedCompareExchange64(
+            &g_ecatRx4aLatestIncidentId,
+            0,
+            0));
+}
+
+bool EtherCatRx4aIncidentRead(
+    uint64_t incidentId,
+    EtherCatRxIncidentRecord* record)
+{
+    if (incidentId == 0ULL || record == nullptr)
+        return false;
+
+    const uint64_t latestId = EtherCatRx4aIncidentLatestId();
+    if (incidentId > latestId ||
+        (latestId - incidentId) >= ETHERCAT_RX4A_INCIDENT_RING_CAPACITY)
+    {
+        return false;
+    }
+
+    const uint32_t slotIndex = static_cast<uint32_t>(
+        (incidentId - 1ULL) % ETHERCAT_RX4A_INCIDENT_RING_CAPACITY);
+    EtherCatRx4aIncidentSlot& slot =
+        g_ecatRx4aIncidentRing[slotIndex];
+
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const LONG sequenceBefore = slot.Sequence;
+        if (sequenceBefore == 0 || (sequenceBefore & 1L) != 0L)
+            continue;
+
+        MemoryBarrier();
+        const EtherCatRxIncidentRecord local = slot.Record;
+        MemoryBarrier();
+
+        const LONG sequenceAfter = slot.Sequence;
+        if (sequenceBefore == sequenceAfter &&
+            (sequenceAfter & 1L) == 0L &&
+            local.IncidentId == incidentId)
+        {
+            *record = local;
+            return true;
+        }
+    }
+
+    return false;
+}
 
 
 /*
@@ -5184,8 +5435,15 @@ int EtherCatMaster::ecx_LRW_FRMW(
     uint16_t dcSlaveAddr,
     uint64_t* dcReferenceTime,
     int* dcWkc,
-    int timeout)
+    int timeout,
+    EtherCatDcCycleTiming* dcCycleTiming)
 {
+    // DC-RX.3D: never expose stale timing from a previous successful call.
+    if (dcCycleTiming != nullptr)
+    {
+        *dcCycleTiming = EtherCatDcCycleTiming{};
+    }
+
     // =====================================================
     // 0. Parameter Check
     // =====================================================
@@ -5825,6 +6083,7 @@ int EtherCatMaster::ecx_LRW_FRMW(
         const int RX_RESYNC_DRAIN_LIMIT =
             8;
 
+        uint32_t drainedFrameCount = 0u;
 
         for (int drainIndex = 0;
              drainIndex < RX_RESYNC_DRAIN_LIMIT;
@@ -5835,13 +6094,38 @@ int EtherCatMaster::ecx_LRW_FRMW(
                 ReceivePacket(
                     m_rxBuffer);
 
+            NicRxCallDiagnostic drainDiagnostic{};
+            if (m_pNic->GetLastReceiveCallDiagnostic(
+                &drainDiagnostic))
+            {
+                AccumulateRx4aNalOutcome(drainDiagnostic);
+            }
 
             if (staleLength <= 0)
             {
                 break;
             }
+
+            drainedFrameCount++;
         }
 
+        const bool drainLimitHit =
+            drainedFrameCount >=
+            static_cast<uint32_t>(RX_RESYNC_DRAIN_LIMIT);
+
+        g_ecatRx4aPendingResyncAttempted = true;
+        g_ecatRx4aPendingResyncDrainCount += drainedFrameCount;
+        if (drainLimitHit)
+        {
+            g_ecatRx4aPendingResyncDrainLimitHit = 1u;
+        }
+
+        g_ecatRx4aWindow.ResyncEvents++;
+        g_ecatRx4aWindow.ResyncFrames += drainedFrameCount;
+        if (drainLimitHit)
+        {
+            g_ecatRx4aWindow.ResyncLimitHit++;
+        }
 
         rxResyncPending =
             false;
@@ -5893,13 +6177,14 @@ int EtherCatMaster::ecx_LRW_FRMW(
         false;
 
 
-    if (qpcBuildStartValid)
+    if (sendQpcValid)
     {
         if (RtQueryPerformanceCounter(
             &qpcBeforeSend))
         {
-            if (qpcBeforeSend.QuadPart >=
-                qpcBuildStart.QuadPart)
+            if (!qpcBuildStartValid ||
+                qpcBeforeSend.QuadPart >=
+                    qpcBuildStart.QuadPart)
             {
                 qpcBeforeSendValid =
                     true;
@@ -5918,18 +6203,9 @@ int EtherCatMaster::ecx_LRW_FRMW(
                 frame,
                 totalFrameLength);
 
-    if (isRuntimeProcessImage)
-    {
-        m_Motion.EndServoOutputFrameAfterSend(
-            frameReservation);
-    }
-    if (!sendSucceeded)
-    {
-        rxResyncPending = true;
-        return -1;
-    }
-
-
+    // DC-RX.3D: capture the SendPacket() return boundary before any
+    // reservation-release bookkeeping. This keeps the exact TX software
+    // window independent of Motion/Alarm publication contention.
     if (qpcBeforeSendValid)
     {
         if (RtQueryPerformanceCounter(
@@ -5942,6 +6218,17 @@ int EtherCatMaster::ecx_LRW_FRMW(
                     true;
             }
         }
+    }
+
+    if (isRuntimeProcessImage)
+    {
+        m_Motion.EndServoOutputFrameAfterSend(
+            frameReservation);
+    }
+    if (!sendSucceeded)
+    {
+        rxResyncPending = true;
+        return -1;
     }
 
 
@@ -6179,6 +6466,16 @@ int EtherCatMaster::ecx_LRW_FRMW(
     static uint64_t rxDiagTimeoutAttemptMaxWindow = 0;
     static uint64_t rxDiagReceiveCallMaxNsWindow = 0;
     static uint64_t rxDiagTimeoutReceiveCallMaxNsWindow = 0;
+    static uint64_t rxDiagEventWaitCallsWindow = 0;
+    static uint64_t rxDiagEventSignaledWindow = 0;
+    static uint64_t rxDiagEventTimeoutWindow = 0;
+    static uint64_t rxDiagEventFailedWindow = 0;
+    static uint64_t rxDiagEventStoppedWindow = 0;
+    static uint64_t rxDiagEventFallbackSleepWindow = 0;
+    static uint64_t rxDiagEventWaitValidWindow = 0;
+    static uint64_t rxDiagEventWaitSumNsWindow = 0;
+    static uint64_t rxDiagEventWaitMaxNsWindow = 0;
+    static DWORD rxDiagEventLastError = ERROR_SUCCESS;
 
 
     // =============================================================
@@ -6191,11 +6488,12 @@ int EtherCatMaster::ecx_LRW_FRMW(
     // - Soft Deadline = 205 us：晚於此時間但早於 Hard 的有效 Frame
     //   仍可接受，並累加 SoftLateAccepted。
     // - Hard Deadline = 210 us：到達或超過此時間立即失敗，Frame 不採用。
-    // - 每次 RX phase 最多執行兩次 50 us coarse wait request。
+    // - 每次 RX phase 最多執行兩次 50 us coarse wait slice。
+    // - 每個 slice 優先等待 NAL RX event；不可用／失敗才使用舊版 RtSleepFt。
     // - 第二次 wait 後使用 bounded polling，直到 Frame 或 Hard Deadline。
     // - QPC 無效時採固定 4 次 ReceivePacket() fallback，避免無界等待。
     //
-    // RTX64 HAL 目前設定 25 us；RX_COARSE_SLEEP_NS 是要求等待 50 us，
+    // RTX64 HAL 目前設定 25 us；RX_COARSE_WAIT_NS 是單次有界等待 50 us，
     // 兩者用途不同，不應把此常數改成 HAL 值。
     // timeout 參數只為維持既有函式介面，不再控制 RX 等待長度。
     // =============================================================
@@ -6210,7 +6508,7 @@ int EtherCatMaster::ecx_LRW_FRMW(
     // - Hard 調小：更快判定失敗，但偶發 NAL／interrupt 延遲更容易被算 Timeout。
     // - 建議一次只移動 5000 ns，先看 RxElapsed Max、PostReceiveLate 與 PDO-EXEC Max。
     // - Soft 與 Hard 建議至少保留 5000 ns 間隔，讓 SoftLate 能成為提前警報。
-    // - RX_COARSE_SLEEP_NS 不是 deadline；它是 coarse wait request，不要跟 HAL 值混用。
+    // - RX_COARSE_WAIT_NS 不是 deadline；它是 coarse wait slice，不要跟 HAL 值混用。
     //
     // 調整前後都必須重新執行長時間激磁三軸同動測試；正式基準先保持 205/210 us。
     const uint64_t RX_SOFT_DEADLINE_NS =
@@ -6219,13 +6517,13 @@ int EtherCatMaster::ecx_LRW_FRMW(
     const uint64_t RX_HARD_DEADLINE_NS =
         210000ULL;
 
-    const uint64_t RX_COARSE_SLEEP_NS =
+    const uint64_t RX_COARSE_WAIT_NS =
         50000ULL;       // 50 us
 
 
-    LARGE_INTEGER wait;
+    LARGE_INTEGER fallbackSleepInterval;
 
-    wait.QuadPart =
+    fallbackSleepInterval.QuadPart =
         500;            // 50 us in 100 ns units
 
 
@@ -6241,7 +6539,7 @@ int EtherCatMaster::ecx_LRW_FRMW(
     LONGLONG rxHardDeadlineQpc =
         0;
 
-    uint64_t rxSleepCounts =
+    uint64_t rxCoarseWaitCounts =
         0;
 
 
@@ -6268,9 +6566,9 @@ int EtherCatMaster::ecx_LRW_FRMW(
             1000000000ULL;
 
 
-        rxSleepCounts =
+        rxCoarseWaitCounts =
             (
-                RX_COARSE_SLEEP_NS *
+                RX_COARSE_WAIT_NS *
                 sendQpcFrequency
             )
             /
@@ -6280,7 +6578,7 @@ int EtherCatMaster::ecx_LRW_FRMW(
         if (rxSoftDeadlineCounts > 0 &&
             rxHardDeadlineCounts >
             rxSoftDeadlineCounts &&
-            rxSleepCounts > 0)
+            rxCoarseWaitCounts > 0)
         {
             rxSoftDeadlineQpc =
                 rxStartQpc.QuadPart +
@@ -6315,34 +6613,169 @@ int EtherCatMaster::ecx_LRW_FRMW(
     uint32_t rxAttemptNumber =
         0;
 
-    uint32_t rxCoarseSleepCount =
+    uint32_t rxCoarseWaitCount =
         0U;
+
+    NicRxCallDiagnostic rxLastCallDiagnostic{};
+    bool rxLastCallDiagnosticValid = false;
+    uint64_t rxCycleReceiveCallMaxNs = 0ULL;
+    uint32_t rxCycleEventSignaledCount = 0u;
+    uint32_t rxCycleEventTimeoutCount = 0u;
+    uint32_t rxCycleEventFailedCount = 0u;
+    uint32_t rxCycleEventFallbackSleepCount = 0u;
+    uint32_t rxCycleLastEventResult = 0u;
+    DWORD rxCycleLastEventError = ERROR_SUCCESS;
+
+    auto CaptureLastNicReceiveDiagnostic =
+        [&]()
+    {
+        NicRxCallDiagnostic diagnostic{};
+        if (m_pNic->GetLastReceiveCallDiagnostic(&diagnostic))
+        {
+            rxLastCallDiagnostic = diagnostic;
+            rxLastCallDiagnosticValid = true;
+            AccumulateRx4aNalOutcome(diagnostic);
+        }
+    };
+
+    auto ComputeRxElapsedNs =
+        [&](LONGLONG qpcValue) -> uint64_t
+    {
+        if (!rxDeadlineValid ||
+            sendQpcFrequency == 0ULL ||
+            qpcValue < rxStartQpc.QuadPart)
+        {
+            return 0ULL;
+        }
+
+        const uint64_t elapsedCounts =
+            static_cast<uint64_t>(
+                qpcValue - rxStartQpc.QuadPart);
+
+        return
+            (elapsedCounts * 1000000000ULL) /
+            sendQpcFrequency;
+    };
+
+    auto BuildRx4aIncident =
+        [&](EtherCatRxIncidentRecord& record,
+            EtherCatRxIncidentKind kind,
+            EtherCatRxIncidentReason reason,
+            EtherCatRxIncidentClassification classification,
+            uint32_t consecutiveTimeout,
+            int rxLength,
+            int lrwWkc,
+            int localDcWkc,
+            uint64_t rxElapsedNs,
+            uint64_t receiveCallNs)
+    {
+        // Reset from a process-lifetime template so value initialization does
+        // not create an aggregate temporary in the fixed RT stack frame.
+        record = g_ecatRx4aEmptyIncident;
+
+        record.RelatedIncidentId = g_ecatRx4aLastHardIncidentId;
+        record.BurstId = g_ecatRx4aCurrentBurstId;
+        record.PdoTick = static_cast<uint64_t>(tickCount_PDO);
+        record.QpcFrequency = sendQpcFrequency;
+        record.TotalHardTimeout = g_ecatRx4aTotalHardTimeoutProducer;
+        record.RxElapsedNs = rxElapsedNs;
+        record.ReceiveCallNs = receiveCallNs;
+        record.ReceiveCallMaxNs = rxCycleReceiveCallMaxNs;
+        record.Kind = static_cast<uint32_t>(kind);
+        record.Reason = static_cast<uint32_t>(reason);
+        record.Classification = static_cast<uint32_t>(classification);
+        record.ConsecutiveTimeout = consecutiveTimeout;
+        record.AttemptCount = rxAttemptNumber;
+        record.CoarseWaitCount = rxCoarseWaitCount;
+        record.EventSignaledCount = rxCycleEventSignaledCount;
+        record.EventTimeoutCount = rxCycleEventTimeoutCount;
+        record.EventFailedCount = rxCycleEventFailedCount;
+        record.EventFallbackSleepCount = rxCycleEventFallbackSleepCount;
+        record.LastEventResult = rxCycleLastEventResult;
+        record.LastEventError = rxCycleLastEventError;
+        record.RxLength = rxLength;
+        record.LrwWkc = lrwWkc;
+        record.DcWkc = localDcWkc;
+        record.ExpectedLrwWkc = EXPECTED_WKC_PDO;
+
+        if (rxLastCallDiagnosticValid)
+        {
+            record.NalCallSequence =
+                rxLastCallDiagnostic.CallSequence;
+            record.NalOutcome =
+                rxLastCallDiagnostic.Outcome;
+            record.NalCallSucceeded =
+                rxLastCallDiagnostic.NalCallSucceeded;
+            record.NalError =
+                rxLastCallDiagnostic.LastError;
+            record.NalLength =
+                rxLastCallDiagnostic.Length;
+        }
+
+        record.ResyncAttempted =
+            g_ecatRx4aPendingResyncAttempted ? 1u : 0u;
+        record.ResyncDrainCount =
+            g_ecatRx4aPendingResyncDrainCount;
+        record.ResyncDrainLimitHit =
+            g_ecatRx4aPendingResyncDrainLimitHit;
+
+        g_ecatRx4aPendingResyncAttempted = false;
+        g_ecatRx4aPendingResyncDrainCount = 0u;
+        g_ecatRx4aPendingResyncDrainLimitHit = 0u;
+
+        LARGE_INTEGER incidentQpc{};
+        if (sendQpcValid &&
+            RtQueryPerformanceCounter(&incidentQpc))
+        {
+            record.Qpc =
+                static_cast<uint64_t>(incidentQpc.QuadPart);
+        }
+        else if (rxDeadlineValid)
+        {
+            record.Qpc =
+                static_cast<uint64_t>(rxStartQpc.QuadPart);
+        }
+
+        FillRx4aControlContext(record);
+    };
 
 
     // 集中記錄一次 Hard Timeout，避免不同 timeout 出口漏掉欄位。
     auto MarkRxHardTimeoutDiagnostic =
-        [&](bool preReceiveDeadline,
-            uint64_t timeoutReceiveCallNs)
+        [&](EtherCatRxIncidentReason reason,
+            bool preReceiveDeadline,
+            uint64_t timeoutReceiveCallNs,
+            int rxLength,
+            uint64_t rxElapsedNs)
     {
         rxResyncPending =
             true;
 
+        const bool firstTimeoutInBurst =
+            rxDiagCurrentConsecutiveTimeout == 0ULL;
+
+        if (firstTimeoutInBurst)
+        {
+            g_ecatRx4aCurrentBurstId++;
+        }
+
         rxDiagHardTimeoutWindow++;
         rxDiagTotalHardTimeout++;
         rxDiagCurrentConsecutiveTimeout++;
-
+        g_ecatRx4aTotalHardTimeoutProducer =
+            rxDiagTotalHardTimeout;
 
         if (preReceiveDeadline)
         {
             rxDiagTimeoutPreReceiveWindow++;
         }
 
-
-        if (rxCoarseSleepCount == 0U)
+        // TimeoutSleep0/1/2 是既有 ABI 名稱；DC-RX.2 起代表完成的 wait slice 數。
+        if (rxCoarseWaitCount == 0U)
         {
             rxDiagTimeoutSleep0Window++;
         }
-        else if (rxCoarseSleepCount == 1U)
+        else if (rxCoarseWaitCount == 1U)
         {
             rxDiagTimeoutSleep1Window++;
         }
@@ -6351,10 +6784,8 @@ int EtherCatMaster::ecx_LRW_FRMW(
             rxDiagTimeoutSleep2Window++;
         }
 
-
         rxDiagTimeoutAttemptSumWindow +=
             rxAttemptNumber;
-
 
         if (rxAttemptNumber >
             rxDiagTimeoutAttemptMaxWindow)
@@ -6363,7 +6794,6 @@ int EtherCatMaster::ecx_LRW_FRMW(
                 rxAttemptNumber;
         }
 
-
         if (timeoutReceiveCallNs >
             rxDiagTimeoutReceiveCallMaxNsWindow)
         {
@@ -6371,13 +6801,80 @@ int EtherCatMaster::ecx_LRW_FRMW(
                 timeoutReceiveCallNs;
         }
 
-
         if (rxDiagCurrentConsecutiveTimeout >
             rxDiagMaxConsecutiveTimeoutWindow)
         {
             rxDiagMaxConsecutiveTimeoutWindow =
                 rxDiagCurrentConsecutiveTimeout;
         }
+
+        EtherCatRxIncidentClassification classification =
+            EtherCatRxIncidentClassification::NoFrameByDeadline;
+
+        if (reason == EtherCatRxIncidentReason::QpcFailure)
+        {
+            classification =
+                EtherCatRxIncidentClassification::QpcFailure;
+        }
+        else if (reason == EtherCatRxIncidentReason::PostReceiveLate &&
+            rxLength > 0)
+        {
+            classification =
+                EtherCatRxIncidentClassification::LateFrameReturned;
+        }
+        else if (timeoutReceiveCallNs >=
+                ETHERCAT_RX4A_NAL_STALL_HINT_NS ||
+            (rxLastCallDiagnosticValid &&
+                rxLastCallDiagnostic.Outcome ==
+                static_cast<uint32_t>(NicRxCallOutcome::NalError)))
+        {
+            classification =
+                EtherCatRxIncidentClassification::NalCallStall;
+        }
+
+        if (classification ==
+            EtherCatRxIncidentClassification::LateFrameReturned)
+        {
+            g_ecatRx4aWindow.TimeoutLateFrame++;
+        }
+        else if (classification ==
+            EtherCatRxIncidentClassification::NalCallStall)
+        {
+            g_ecatRx4aWindow.TimeoutNalStall++;
+        }
+        else if (classification ==
+            EtherCatRxIncidentClassification::NoFrameByDeadline)
+        {
+            g_ecatRx4aWindow.TimeoutNoFrame++;
+        }
+
+        EtherCatRxIncidentRecord& record =
+            g_ecatRx4aProducerWorkspace;
+
+        BuildRx4aIncident(
+                record,
+                EtherCatRxIncidentKind::HardTimeout,
+                reason,
+                classification,
+                static_cast<uint32_t>(
+                    rxDiagCurrentConsecutiveTimeout),
+                rxLength,
+                -1,
+                0,
+                rxElapsedNs,
+                timeoutReceiveCallNs);
+
+        // The first timeout in a burst must not point at the previous burst.
+        // Subsequent timeout records and the recovery record remain linked to
+        // the most recent hard-timeout incident.
+        if (firstTimeoutInBurst)
+        {
+            record.RelatedIncidentId = 0ULL;
+        }
+
+        const uint64_t incidentId =
+            PublishRx4aIncident(record);
+        g_ecatRx4aLastHardIncidentId = incidentId;
     };
 
 
@@ -6455,6 +6952,16 @@ int EtherCatMaster::ecx_LRW_FRMW(
                 (
                     rxDiagTimeoutAttemptSumWindow /
                     rxDiagHardTimeoutWindow
+                )
+                :
+                0ULL;
+
+            uint64_t rxEventWaitAvgNs =
+                rxDiagEventWaitValidWindow > 0
+                ?
+                (
+                    rxDiagEventWaitSumNsWindow /
+                    rxDiagEventWaitValidWindow
                 )
                 :
                 0ULL;
@@ -6542,11 +7049,79 @@ int EtherCatMaster::ecx_LRW_FRMW(
             g_ecatRxDiagTimeoutReceiveCallMaxNs =
                 (LONGLONG)rxDiagTimeoutReceiveCallMaxNsWindow;
 
+            g_ecatRxDiagWaitMode =
+                m_pNic->IsReceiveNotificationAvailable()
+                ? 1
+                : 0;
+
+            g_ecatRxDiagEventWaitCalls =
+                (LONG)rxDiagEventWaitCallsWindow;
+
+            g_ecatRxDiagEventSignaled =
+                (LONG)rxDiagEventSignaledWindow;
+
+            g_ecatRxDiagEventTimeout =
+                (LONG)rxDiagEventTimeoutWindow;
+
+            g_ecatRxDiagEventFailed =
+                (LONG)rxDiagEventFailedWindow;
+
+            g_ecatRxDiagEventStopped =
+                (LONG)rxDiagEventStoppedWindow;
+
+            g_ecatRxDiagEventFallbackSleep =
+                (LONG)rxDiagEventFallbackSleepWindow;
+
+            g_ecatRxDiagEventWaitValid =
+                (LONG)rxDiagEventWaitValidWindow;
+
+            g_ecatRxDiagEventWaitAvgNs =
+                (LONGLONG)rxEventWaitAvgNs;
+
+            g_ecatRxDiagEventWaitMaxNs =
+                (LONGLONG)rxDiagEventWaitMaxNsWindow;
+
+            g_ecatRxDiagEventLastError =
+                (LONG)rxDiagEventLastError;
+
             g_ecatRxDiagSoftDeadlineNs =
                 (LONG)RX_SOFT_DEADLINE_NS;
 
             g_ecatRxDiagHardDeadlineNs =
                 (LONG)RX_HARD_DEADLINE_NS;
+
+            g_ecatRx4aNalFrame =
+                (LONG)g_ecatRx4aWindow.NalFrame;
+            g_ecatRx4aNalNoData =
+                (LONG)g_ecatRx4aWindow.NalNoData;
+            g_ecatRx4aNalApiError =
+                (LONG)g_ecatRx4aWindow.NalApiError;
+            g_ecatRx4aNalInvalidLength =
+                (LONG)g_ecatRx4aWindow.NalInvalidLength;
+            g_ecatRx4aNalUnavailable =
+                (LONG)g_ecatRx4aWindow.NalUnavailable;
+            g_ecatRx4aNalLastError =
+                (LONG)g_ecatRx4aWindow.NalLastError;
+            g_ecatRx4aCallOver50us =
+                (LONG)g_ecatRx4aWindow.CallOver50us;
+            g_ecatRx4aCallOver100us =
+                (LONG)g_ecatRx4aWindow.CallOver100us;
+            g_ecatRx4aCallOver150us =
+                (LONG)g_ecatRx4aWindow.CallOver150us;
+            g_ecatRx4aCallOver200us =
+                (LONG)g_ecatRx4aWindow.CallOver200us;
+            g_ecatRx4aTimeoutNoFrame =
+                (LONG)g_ecatRx4aWindow.TimeoutNoFrame;
+            g_ecatRx4aTimeoutNalStall =
+                (LONG)g_ecatRx4aWindow.TimeoutNalStall;
+            g_ecatRx4aTimeoutLateFrame =
+                (LONG)g_ecatRx4aWindow.TimeoutLateFrame;
+            g_ecatRx4aResyncEvents =
+                (LONG)g_ecatRx4aWindow.ResyncEvents;
+            g_ecatRx4aResyncFrames =
+                (LONG)g_ecatRx4aWindow.ResyncFrames;
+            g_ecatRx4aResyncLimitHit =
+                (LONG)g_ecatRx4aWindow.ResyncLimitHit;
 
 
             MemoryBarrier();
@@ -6579,6 +7154,16 @@ int EtherCatMaster::ecx_LRW_FRMW(
             rxDiagTimeoutAttemptMaxWindow = 0;
             rxDiagReceiveCallMaxNsWindow = 0;
             rxDiagTimeoutReceiveCallMaxNsWindow = 0;
+            rxDiagEventWaitCallsWindow = 0;
+            rxDiagEventSignaledWindow = 0;
+            rxDiagEventTimeoutWindow = 0;
+            rxDiagEventFailedWindow = 0;
+            rxDiagEventStoppedWindow = 0;
+            rxDiagEventFallbackSleepWindow = 0;
+            rxDiagEventWaitValidWindow = 0;
+            rxDiagEventWaitSumNsWindow = 0;
+            rxDiagEventWaitMaxNsWindow = 0;
+            g_ecatRx4aWindow = EtherCatRx4aWindowCounters{};
         }
     };
 
@@ -6616,7 +7201,10 @@ int EtherCatMaster::ecx_LRW_FRMW(
             {
                 rxDiagQpcFailWindow++;
                 MarkRxHardTimeoutDiagnostic(
+                    EtherCatRxIncidentReason::QpcFailure,
                     false,
+                    0ULL,
+                    0,
                     0ULL);
 
                 FinalizeRxDiagnostic();
@@ -6629,8 +7217,11 @@ int EtherCatMaster::ecx_LRW_FRMW(
                 rxHardDeadlineQpc)
             {
                 MarkRxHardTimeoutDiagnostic(
+                    EtherCatRxIncidentReason::PreReceiveDeadline,
                     true,
-                    0ULL);
+                    0ULL,
+                    0,
+                    ComputeRxElapsedNs(rxNowQpc.QuadPart));
 
                 FinalizeRxDiagnostic();
 
@@ -6650,7 +7241,10 @@ int EtherCatMaster::ecx_LRW_FRMW(
                 0)
             {
                 MarkRxHardTimeoutDiagnostic(
+                    EtherCatRxIncidentReason::FallbackExhausted,
                     true,
+                    0ULL,
+                    0,
                     0ULL);
 
                 FinalizeRxDiagnostic();
@@ -6668,33 +7262,38 @@ int EtherCatMaster::ecx_LRW_FRMW(
             ReceivePacket(
                 m_rxBuffer);
 
+        CaptureLastNicReceiveDiagnostic();
+
 
         // =============================================================
         // ReceivePacket() 後的 Hard Deadline 強制檢查
         //
-        // 只在呼叫前檢查仍不夠，因為 driver call 本身可能偶發延遲。
-        // 因此 ReceivePacket() 返回後立刻讀 QPC：
-        // - 未超時：繼續驗證 EtherType、Datagram Index 與 WKC。
-        // - 已超時：即使 Frame 內容正確也丟棄，記錄 PostReceiveLate。
-        //
-        // 此檢查不修改 HAL 或 Timer。
+        // DC-RX.3D keeps this QPC sample alive until full datagram
+        // correlation succeeds.  It therefore serves both the existing hard
+        // deadline check and the exact TX/RX timing handoff without adding a
+        // second QPC read to the normal 4 kHz path.
         // =============================================================
+        LARGE_INTEGER rxAfterReceiveQpc = {};
+        bool rxAfterReceiveQpcValid = false;
+        uint64_t rxReceiveCallNs = 0ULL;
+
+        if (sendQpcValid &&
+            RtQueryPerformanceCounter(
+                &rxAfterReceiveQpc))
+        {
+            rxAfterReceiveQpcValid = true;
+        }
 
         if (rxDeadlineValid)
         {
-            LARGE_INTEGER rxAfterReceiveQpc =
-                {};
-
-            uint64_t rxReceiveCallNs =
-                0ULL;
-
-
-            if (!RtQueryPerformanceCounter(
-                &rxAfterReceiveQpc))
+            if (!rxAfterReceiveQpcValid)
             {
                 rxDiagQpcFailWindow++;
                 MarkRxHardTimeoutDiagnostic(
+                    EtherCatRxIncidentReason::QpcFailure,
                     false,
+                    0ULL,
+                    rxLen,
                     0ULL);
 
                 FinalizeRxDiagnostic();
@@ -6730,6 +7329,20 @@ int EtherCatMaster::ecx_LRW_FRMW(
                     rxDiagReceiveCallMaxNsWindow =
                         rxReceiveCallNs;
                 }
+
+                if (rxReceiveCallNs > rxCycleReceiveCallMaxNs)
+                {
+                    rxCycleReceiveCallMaxNs = rxReceiveCallNs;
+                }
+
+                if (rxReceiveCallNs >= 50000ULL)
+                    g_ecatRx4aWindow.CallOver50us++;
+                if (rxReceiveCallNs >= 100000ULL)
+                    g_ecatRx4aWindow.CallOver100us++;
+                if (rxReceiveCallNs >= 150000ULL)
+                    g_ecatRx4aWindow.CallOver150us++;
+                if (rxReceiveCallNs >= 200000ULL)
+                    g_ecatRx4aWindow.CallOver200us++;
             }
 
 
@@ -6771,8 +7384,11 @@ int EtherCatMaster::ecx_LRW_FRMW(
 
                 rxDiagPostReceiveLateWindow++;
                 MarkRxHardTimeoutDiagnostic(
+                    EtherCatRxIncidentReason::PostReceiveLate,
                     false,
-                    rxReceiveCallNs);
+                    rxReceiveCallNs,
+                    rxLen,
+                    rxAttemptElapsedNs);
 
                 // IMPORTANT:
                 // Even if rxLen contains a valid matching EtherCAT
@@ -6789,21 +7405,26 @@ int EtherCatMaster::ecx_LRW_FRMW(
         {
             rxDiagEmptyRxWindow++;
 
-            if (rxCoarseSleepCount <
+            if (rxCoarseWaitCount <
                 2U)
             {
+                LARGE_INTEGER rxBeforeWaitQpc =
+                    {};
+
+                bool rxBeforeWaitQpcValid =
+                    false;
+
                 if (rxDeadlineValid)
                 {
-                    LARGE_INTEGER rxBeforeSleepQpc =
-                        {};
-
-
                     if (!RtQueryPerformanceCounter(
-                        &rxBeforeSleepQpc))
+                        &rxBeforeWaitQpc))
                     {
                         rxDiagQpcFailWindow++;
                         MarkRxHardTimeoutDiagnostic(
+                            EtherCatRxIncidentReason::QpcFailure,
                             false,
+                            0ULL,
+                            0,
                             0ULL);
 
                         FinalizeRxDiagnostic();
@@ -6811,43 +7432,227 @@ int EtherCatMaster::ecx_LRW_FRMW(
                         return -1;
                     }
 
+                    rxBeforeWaitQpcValid =
+                        true;
 
-                    if (rxBeforeSleepQpc.QuadPart >=
+                    if (rxBeforeWaitQpc.QuadPart >=
                         rxHardDeadlineQpc)
                     {
                         MarkRxHardTimeoutDiagnostic(
+                            EtherCatRxIncidentReason::PreWaitDeadline,
                             true,
-                            0ULL);
+                            0ULL,
+                            0,
+                            ComputeRxElapsedNs(
+                                rxBeforeWaitQpc.QuadPart));
 
                         FinalizeRxDiagnostic();
 
                         return -1;
                     }
-
 
                     uint64_t remainingCounts =
                         (uint64_t)
                         (
                             rxHardDeadlineQpc -
-                            rxBeforeSleepQpc.QuadPart
+                            rxBeforeWaitQpc.QuadPart
                         );
 
-
                     if (remainingCounts <=
-                        rxSleepCounts)
+                        rxCoarseWaitCounts)
                     {
                         continue;
                     }
                 }
 
+                rxCoarseWaitCount++;
 
-                rxCoarseSleepCount++;
-
+                // 保留既有 SleepCount ABI：DC-RX.2 起代表總 coarse wait slice 數。
                 rxDiagSleepCountWindow++;
 
+                bool eventWaitCompleted =
+                    false;
 
-                RtSleepFt(
-                    &wait);
+                bool eventWaitAttempted =
+                    false;
+
+                if (m_pNic->IsReceiveNotificationAvailable())
+                {
+                    eventWaitAttempted = true;
+                    rxDiagEventWaitCallsWindow++;
+
+                    DWORD eventWaitError =
+                        ERROR_SUCCESS;
+
+                    NicRxWaitResult eventWaitResult =
+                        m_pNic->WaitForReceiveNotification(
+                            500ULL,
+                            &eventWaitError);
+
+                    rxCycleLastEventResult =
+                        static_cast<uint32_t>(eventWaitResult);
+                    rxCycleLastEventError = eventWaitError;
+
+                    // Event wait 耗時每 16 次取樣一次，避免診斷 QPC 增加 4 kHz 熱路徑負擔。
+                    if (rxBeforeWaitQpcValid &&
+                        sendQpcFrequency > 0 &&
+                        (rxDiagEventWaitCallsWindow & 0x0FULL) == 0ULL)
+                    {
+                        LARGE_INTEGER rxAfterWaitQpc =
+                            {};
+
+                        if (RtQueryPerformanceCounter(
+                            &rxAfterWaitQpc) &&
+                            rxAfterWaitQpc.QuadPart >=
+                            rxBeforeWaitQpc.QuadPart)
+                        {
+                            uint64_t eventWaitCounts =
+                                (uint64_t)
+                                (
+                                    rxAfterWaitQpc.QuadPart -
+                                    rxBeforeWaitQpc.QuadPart
+                                );
+
+                            uint64_t eventWaitNs =
+                                (
+                                    eventWaitCounts *
+                                    1000000000ULL
+                                )
+                                /
+                                sendQpcFrequency;
+
+                            rxDiagEventWaitValidWindow++;
+                            rxDiagEventWaitSumNsWindow +=
+                                eventWaitNs;
+
+                            if (eventWaitNs >
+                                rxDiagEventWaitMaxNsWindow)
+                            {
+                                rxDiagEventWaitMaxNsWindow =
+                                    eventWaitNs;
+                            }
+                        }
+                    }
+
+                    if (eventWaitResult ==
+                        NicRxWaitResult::Signaled)
+                    {
+                        rxDiagEventSignaledWindow++;
+                        rxCycleEventSignaledCount++;
+                        eventWaitCompleted = true;
+                    }
+                    else if (eventWaitResult ==
+                        NicRxWaitResult::Timeout)
+                    {
+                        rxDiagEventTimeoutWindow++;
+                        rxCycleEventTimeoutCount++;
+                        eventWaitCompleted = true;
+                    }
+                    else if (eventWaitResult ==
+                        NicRxWaitResult::Stopped)
+                    {
+                        rxDiagEventStoppedWindow++;
+                        rxDiagEventLastError =
+                            eventWaitError;
+                        rxResyncPending = true;
+
+                        EtherCatRxIncidentRecord& stoppedRecord =
+                            g_ecatRx4aProducerWorkspace;
+
+                        BuildRx4aIncident(
+                                stoppedRecord,
+                                EtherCatRxIncidentKind::QueueStopped,
+                                EtherCatRxIncidentReason::EventStopped,
+                                EtherCatRxIncidentClassification::QueueStopped,
+                                static_cast<uint32_t>(
+                                    rxDiagCurrentConsecutiveTimeout),
+                                0,
+                                -1,
+                                0,
+                                ComputeRxElapsedNs(
+                                    rxBeforeWaitQpc.QuadPart),
+                                0ULL);
+                        PublishRx4aIncident(stoppedRecord);
+
+                        FinalizeRxDiagnostic();
+
+                        return -1;
+                    }
+                    else
+                    {
+                        if (eventWaitResult ==
+                            NicRxWaitResult::Failed)
+                        {
+                            rxDiagEventFailedWindow++;
+                            rxCycleEventFailedCount++;
+                            rxDiagEventLastError =
+                                eventWaitError;
+                        }
+                    }
+                }
+
+                if (!eventWaitCompleted)
+                {
+                    // Wait API 若失敗，先重查 deadline，避免 event wait 後再 sleep 造成越界。
+                    if (eventWaitAttempted &&
+                        rxDeadlineValid)
+                    {
+                        LARGE_INTEGER rxBeforeFallbackSleepQpc =
+                            {};
+
+                        if (!RtQueryPerformanceCounter(
+                            &rxBeforeFallbackSleepQpc))
+                        {
+                            rxDiagQpcFailWindow++;
+                            MarkRxHardTimeoutDiagnostic(
+                                EtherCatRxIncidentReason::QpcFailure,
+                                false,
+                                0ULL,
+                                0,
+                                0ULL);
+
+                            FinalizeRxDiagnostic();
+
+                            return -1;
+                        }
+
+                        if (rxBeforeFallbackSleepQpc.QuadPart >=
+                            rxHardDeadlineQpc)
+                        {
+                            MarkRxHardTimeoutDiagnostic(
+                                EtherCatRxIncidentReason::PreFallbackDeadline,
+                                true,
+                                0ULL,
+                                0,
+                                ComputeRxElapsedNs(
+                                    rxBeforeFallbackSleepQpc.QuadPart));
+
+                            FinalizeRxDiagnostic();
+
+                            return -1;
+                        }
+
+                        uint64_t remainingBeforeFallbackCounts =
+                            (uint64_t)
+                            (
+                                rxHardDeadlineQpc -
+                                rxBeforeFallbackSleepQpc.QuadPart
+                            );
+
+                        if (remainingBeforeFallbackCounts <=
+                            rxCoarseWaitCounts)
+                        {
+                            continue;
+                        }
+                    }
+
+                    // Event 不可用或 wait API 失敗時，保留原版 50 us bounded sleep。
+                    rxDiagEventFallbackSleepWindow++;
+                    rxCycleEventFallbackSleepCount++;
+
+                    RtSleepFt(
+                        &fallbackSleepInterval);
+                }
             }
 
             continue;
@@ -6927,6 +7732,50 @@ int EtherCatMaster::ecx_LRW_FRMW(
             rxDiagInvalidFrameWindow++;
 
             continue;
+        }
+
+
+        // =============================================================
+        // DC-RX.3D exact software TX/RX timing handoff
+        //
+        // The timing is published only for the fully correlated frame that is
+        // about to commit its LRW image and DC value.  Stale/foreign frames
+        // seen earlier in the bounded receive loop can never populate it.
+        // =============================================================
+        if (dcCycleTiming != nullptr &&
+            qpcBeforeSendValid &&
+            qpcAfterSendValid &&
+            rxAfterReceiveQpcValid &&
+            qpcAfterSend.QuadPart >= qpcBeforeSend.QuadPart &&
+            rxAfterReceiveQpc.QuadPart >= qpcAfterSend.QuadPart)
+        {
+            const uint64_t txBeforeQpc =
+                (uint64_t)qpcBeforeSend.QuadPart;
+            const uint64_t txAfterQpc =
+                (uint64_t)qpcAfterSend.QuadPart;
+            const uint64_t rxAfterQpc =
+                (uint64_t)rxAfterReceiveQpc.QuadPart;
+            const uint64_t txMidQpc =
+                txBeforeQpc + (txAfterQpc - txBeforeQpc) / 2ULL;
+
+            if (rxAfterQpc >= txMidQpc)
+            {
+                const uint64_t roundTripCounts =
+                    rxAfterQpc - txMidQpc;
+
+                dcCycleTiming->txBeforeSendQpc = txBeforeQpc;
+                dcCycleTiming->txAfterSendQpc = txAfterQpc;
+                dcCycleTiming->rxAfterMatchQpc = rxAfterQpc;
+                dcCycleTiming->txMidpointQpc = txMidQpc;
+                dcCycleTiming->sampleMidpointQpc =
+                    txMidQpc + roundTripCounts / 2ULL;
+                dcCycleTiming->softwareRoundTripCounts =
+                    roundTripCounts;
+                dcCycleTiming->source =
+                    (uint32_t)
+                    EtherCatDcCycleTimingSource::ExactSoftwareTxRx;
+                dcCycleTiming->valid = 1U;
+            }
         }
 
 
@@ -7039,6 +7888,38 @@ int EtherCatMaster::ecx_LRW_FRMW(
         // A successful matching EtherCAT response after one or more
         // timed-out calls counts as one recovery and clears the streak.
         // =============================================================
+
+        if (rxDiagCurrentConsecutiveTimeout > 0 ||
+            g_ecatRx4aPendingResyncAttempted)
+        {
+            EtherCatRxIncidentClassification recoveryClass =
+                EtherCatRxIncidentClassification::Recovered;
+
+            if (g_ecatRx4aPendingResyncAttempted)
+            {
+                recoveryClass =
+                    g_ecatRx4aPendingResyncDrainCount > 0u
+                    ? EtherCatRxIncidentClassification::LateFrameQueued
+                    : EtherCatRxIncidentClassification::NoLateFrameQueued;
+            }
+
+            EtherCatRxIncidentRecord& recoveryRecord =
+                g_ecatRx4aProducerWorkspace;
+
+            BuildRx4aIncident(
+                    recoveryRecord,
+                    EtherCatRxIncidentKind::Recovery,
+                    EtherCatRxIncidentReason::None,
+                    recoveryClass,
+                    static_cast<uint32_t>(
+                        rxDiagCurrentConsecutiveTimeout),
+                    rxLen,
+                    static_cast<int>(lrwWkc),
+                    static_cast<int>(receivedDcWkc),
+                    rxAttemptElapsedNs,
+                    rxReceiveCallNs);
+            PublishRx4aIncident(recoveryRecord);
+        }
 
         if (rxDiagCurrentConsecutiveTimeout >
             0)

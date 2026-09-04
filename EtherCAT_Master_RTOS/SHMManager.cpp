@@ -6,6 +6,7 @@
 #include "EtherCatDcQualificationDiagContract.h"
 #include "EtherCatDcV1aDiagContract.h"
 #include "EtherCatRxCorrelationDiagContract.h"
+#include "EtherCatRxForensicsDiagContract.h"
 
 #include "GlobalConfig.h"
 
@@ -173,6 +174,23 @@ namespace
 
     SHM_ECAT_RxCorrDiagData*
         g_pEtherCatRxCorrDiagData =
+        nullptr;
+
+
+    // =====================================================================
+    // DC-RX.4B - OSCARMAX_ECAT_RX_FORENSICS
+    // =====================================================================
+
+    constexpr const wchar_t*
+        ECAT_RX_FORENSICS_SHM_NAME =
+        L"OSCARMAX_ECAT_RX_FORENSICS";
+
+    HANDLE
+        g_hEtherCatRxForensicsShm =
+        NULL;
+
+    SHM_ECAT_RxForensicsData*
+        g_pEtherCatRxForensicsData =
         nullptr;
 
 
@@ -1395,6 +1413,119 @@ namespace
 
 
 // =====================================================================
+// DC-RX.4B - RX Incident Forensics Shared Memory
+// =====================================================================
+
+namespace
+{
+    bool InitializeEtherCatRxForensicsSharedMemory()
+    {
+        if (g_pEtherCatRxForensicsData != nullptr)
+        {
+            return true;
+        }
+
+        DEBUG_PRINT(
+            "[ECAT-RX-FORENSICS-SHM] Initializing "
+            "OSCARMAX_ECAT_RX_FORENSICS\n");
+
+        void* pLocation =
+            nullptr;
+
+        g_hEtherCatRxForensicsShm =
+            RtCreateSharedMemory(
+                PAGE_READWRITE,
+                0,
+                sizeof(SHM_ECAT_RxForensicsData),
+                ECAT_RX_FORENSICS_SHM_NAME,
+                &pLocation);
+
+        if (g_hEtherCatRxForensicsShm == NULL ||
+            pLocation == nullptr)
+        {
+            DEBUG_PRINT(
+                "[ECAT-RX-FORENSICS-SHM] WARNING | "
+                "Create failed. RX forensics UI/package unavailable; "
+                "machine runtime will continue.\n");
+
+            if (g_hEtherCatRxForensicsShm != NULL)
+            {
+                RtCloseHandle(
+                    g_hEtherCatRxForensicsShm);
+
+                g_hEtherCatRxForensicsShm =
+                    NULL;
+            }
+
+            g_pEtherCatRxForensicsData =
+                nullptr;
+
+            return false;
+        }
+
+        g_pEtherCatRxForensicsData =
+            static_cast<SHM_ECAT_RxForensicsData*>(
+                pLocation);
+
+        std::memset(
+            g_pEtherCatRxForensicsData,
+            0,
+            sizeof(SHM_ECAT_RxForensicsData));
+
+        g_pEtherCatRxForensicsData->Header.Magic =
+            SHM_ECAT_RX_FORENSICS_MAGIC;
+
+        g_pEtherCatRxForensicsData->Header.VersionMajor =
+            SHM_ECAT_RX_FORENSICS_VERSION_MAJOR;
+
+        g_pEtherCatRxForensicsData->Header.VersionMinor =
+            SHM_ECAT_RX_FORENSICS_VERSION_MINOR;
+
+        g_pEtherCatRxForensicsData->Header.StructSize =
+            static_cast<uint32_t>(
+                sizeof(SHM_ECAT_RxForensicsData));
+
+        g_pEtherCatRxForensicsData->Header.IncidentCapacity =
+            SHM_ECAT_RX_FORENSICS_INCIDENT_CAPACITY;
+
+        g_pEtherCatRxForensicsData->Header.SlaveCapacity =
+            SHM_ECAT_RX_FORENSICS_SLAVE_CAPACITY;
+
+        DEBUG_PRINT(
+            "[ECAT-RX-FORENSICS-SHM] ACTIVE | "
+            "Size:%zu B | Incident:%u | Slave:%u | "
+            "Publisher:P50 read-only bridge\n",
+            sizeof(SHM_ECAT_RxForensicsData),
+            static_cast<unsigned int>(
+                SHM_ECAT_RX_FORENSICS_INCIDENT_CAPACITY),
+            static_cast<unsigned int>(
+                SHM_ECAT_RX_FORENSICS_SLAVE_CAPACITY));
+
+        return true;
+    }
+
+
+    void ShutdownEtherCatRxForensicsSharedMemory()
+    {
+        g_pEtherCatRxForensicsData =
+            nullptr;
+
+        if (g_hEtherCatRxForensicsShm != NULL)
+        {
+            RtCloseHandle(
+                g_hEtherCatRxForensicsShm);
+
+            g_hEtherCatRxForensicsShm =
+                NULL;
+
+            DEBUG_PRINT(
+                "[ECAT-RX-FORENSICS-SHM] Closed.\n");
+        }
+    }
+}
+
+
+// =====================================================================
 // Producer-side Shared Memory accessors
 // =====================================================================
 
@@ -1462,6 +1593,14 @@ GetEtherCatRxCorrelationDiagSharedMemoryData()
 }
 
 
+SHM_ECAT_RxForensicsData*
+GetEtherCatRxForensicsSharedMemoryData()
+{
+    return
+        g_pEtherCatRxForensicsData;
+}
+
+
 // =====================================================================
 // SHMManager
 // =====================================================================
@@ -1484,6 +1623,8 @@ bool SHMManager::Initialize(
         InitializeEtherCatDcV1aDiagSharedMemory();
 
         InitializeEtherCatRxCorrelationDiagSharedMemory();
+
+        InitializeEtherCatRxForensicsSharedMemory();
 
         InitializeEtherCatServiceSharedMemory();
 
@@ -1573,6 +1714,8 @@ bool SHMManager::Initialize(
 
     InitializeEtherCatRxCorrelationDiagSharedMemory();
 
+    InitializeEtherCatRxForensicsSharedMemory();
+
     InitializeEtherCatServiceSharedMemory();
 
 
@@ -1583,6 +1726,8 @@ bool SHMManager::Initialize(
 void SHMManager::Shutdown()
 {
     ShutdownEtherCatServiceSharedMemory();
+
+    ShutdownEtherCatRxForensicsSharedMemory();
 
     ShutdownEtherCatRxCorrelationDiagSharedMemory();
 

@@ -14,6 +14,14 @@
 #include <limits>
 #include <rtapi.h>
 
+#if defined(_MSC_VER)
+#define HMI_DIAG_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define HMI_DIAG_NOINLINE __attribute__((noinline))
+#else
+#define HMI_DIAG_NOINLINE
+#endif
+
 namespace HMI_Bridge
 {
     namespace
@@ -1204,7 +1212,7 @@ namespace HMI_Bridge
             return rhs > maximum - lhs ? maximum : lhs + rhs;
         }
 
-        std::uint64_t BuildNCSettleDiagnosticEventToken(
+        HMI_DIAG_NOINLINE std::uint64_t BuildNCSettleDiagnosticEventToken(
             bool coherent,
             const MotionNCSettleSnapshot& snapshot,
             const MotionNCSettleCounters& counters) noexcept
@@ -1259,7 +1267,7 @@ namespace HMI_Bridge
             return token;
         }
 
-        void PrintNCSettleDiagnostic(
+        HMI_DIAG_NOINLINE void PrintNCSettleDiagnostic(
             bool coherent,
             const MotionNCSettleSnapshot& snapshot,
             const MotionNCSettleCounters& counters) noexcept
@@ -1291,9 +1299,7 @@ namespace HMI_Bridge
 
             RtPrintf(
                 "[NC02J5-SET] P:%s Coh:%u Pub:%llu Req:%llu Proof:%llu "
-                "Epoch:%u Owner:%s/%u Mask:%u Obs:%u Valid:%u Contig:%u "
-                "Accept:%u Drain:%u Cand:%u Set:%u Pre:%u Post:%u "
-                "Block:%s Ax:%d Dwell:%u/%u\n",
+                "Epoch:%u Owner:%s/%u Mask:%u Obs:%u Valid:%u Contig:%u ",
                 MotionNCSettleProfileToDiagnosticName(snapshot.profile),
                 coherent ? 1U : 0U,
                 static_cast<unsigned long long>(
@@ -1306,7 +1312,10 @@ namespace HMI_Bridge
                 static_cast<unsigned int>(snapshot.scopeMask),
                 snapshot.runtimeObserved ? 1U : 0U,
                 snapshot.runtimeCycleValid ? 1U : 0U,
-                snapshot.runtimeCycleContiguous ? 1U : 0U,
+                snapshot.runtimeCycleContiguous ? 1U : 0U);
+            RtPrintf(
+                "Accept:%u Drain:%u Cand:%u Set:%u Pre:%u Post:%u "
+                "Block:%s Ax:%d Dwell:%u/%u\n",
                 snapshot.requestAccepted ? 1U : 0U,
                 snapshot.groupDrained ? 1U : 0U,
                 snapshot.candidate ? 1U : 0U,
@@ -1321,10 +1330,7 @@ namespace HMI_Bridge
             RtPrintf(
                 "[NC02J5-SET] P:%s Ev CmdPps:%llu CmdAx:%d "
                 "FollowX1000:%llu/%llu FollowAx:%d "
-                "ExcX1000:%llu/%llu ExcAx:%d RawPps:%llu PDO:%u "
-                "Start:%llu Reset:%llu Rise:%llu Revoke:%llu "
-                "Invalid:%llu Gap:%llu IdReset:%llu ScopeReset:%llu "
-                "Reject:%llu ReadFail:%llu\n",
+                "ExcX1000:%llu/%llu ExcAx:%d RawPps:%llu PDO:%u ",
                 MotionNCSettleProfileToDiagnosticName(snapshot.profile),
                 static_cast<unsigned long long>(commandPps),
                 snapshot.worstCommandVelocityAxisIndex,
@@ -1336,7 +1342,11 @@ namespace HMI_Bridge
                 snapshot.worstActualExcursionAxisIndex,
                 static_cast<unsigned long long>(advisoryActualPps),
                 static_cast<unsigned int>(
-                    snapshot.advisoryMaxPdoTargetVelocityAbs),
+                    snapshot.advisoryMaxPdoTargetVelocityAbs));
+            RtPrintf(
+                "Start:%llu Reset:%llu Rise:%llu Revoke:%llu "
+                "Invalid:%llu Gap:%llu IdReset:%llu ScopeReset:%llu "
+                "Reject:%llu ReadFail:%llu\n",
                 static_cast<unsigned long long>(
                     counters.candidateStartCount),
                 static_cast<unsigned long long>(
@@ -1352,6 +1362,777 @@ namespace HMI_Bridge
                 static_cast<unsigned long long>(
                     counters.publicationReadFailureCount));
         }
+
+        // NC-0.2K.7.8.2: fixed Priority-50 diagnostic workspace.
+        // Single caller, single writer, process lifetime, non-reentrant.
+        struct Hmi1000msDiagnosticWorkspace
+        {
+            EtherCatPdoRuntimeInvalidCorrelationSnapshot pdoInvalidCorrelation{};
+            EtherCatPdoSafetyStopCauseSnapshot pdoSafetyStopCause{};
+            MotionStartupLagArmingEvidence startupLagArming{};
+            MotionP1HandoverSafetySnapshot p1HandoverSafety{};
+            MotionLifecycleCommitReservationSnapshot lifecycleCommit{};
+            MotionCommandPathModeTransportSnapshot commandPathModeTransport{};
+            MotionQueueTailTransactionSnapshot queueTailTransaction{};
+            MotionStopSettleSnapshot stopSettleSnapshot{};
+            MotionStopSettleCounters stopSettleCounters{};
+            MotionNCSettleSnapshot groupNCSettleSnapshot{};
+            MotionNCSettleCounters groupNCSettleCounters{};
+            MotionNCSettleSnapshot feedHoldNCSettleSnapshot{};
+            MotionNCSettleCounters feedHoldNCSettleCounters{};
+            MotionNCSettleSnapshot resetNCSettleSnapshot{};
+            MotionNCSettleCounters resetNCSettleCounters{};
+            MotionNCResetRebaseAck resetRebaseAck{};
+            MotionOwnerLease ownerLease{};
+            NCBlockLifecycleSnapshot blockLifecycle{};
+            NCBlockLifecycleCounters blockCounters{};
+            NCBlockCompletionBoundarySnapshot completionBoundary{};
+            NCBlockCompletionBoundaryCounters completionCounters{};
+            NCProgramEndGateSnapshot programEndSnapshot{};
+            NCProgramEndGateCounters programEndCounters{};
+            NCGMBlockTransactionSnapshot gmTransactionSnapshot{};
+            NCGMBlockTransactionCounters gmTransactionCounters{};
+            NCPreDispatchBarrierSnapshot preDispatchBarrierSnapshot{};
+            NCPreDispatchBarrierCounters preDispatchBarrierCounters{};
+            NCPreparedBlockQueueSnapshot preparedQueueSnapshot{};
+            NCPreparedBlockQueueCounters preparedQueueCounters{};
+            NCPreparedHeadEquivalenceSnapshot preparedEquivalenceSnapshot{};
+            NCPreparedHeadEquivalenceCounters preparedEquivalenceCounters{};
+            NCPreparedHeadCutoverSnapshot preparedCutoverSnapshot{};
+            NCPreparedHeadCutoverCounters preparedCutoverCounters{};
+            NCPreparedPreResolveAdmissionSnapshot preparedPreResolveSnapshot{};
+            NCPreparedPreResolveAdmissionCounters preparedPreResolveCounters{};
+            NCPreparedResolverBypassSnapshot preparedResolverBypassSnapshot{};
+            NCPreparedResolverBypassCounters preparedResolverBypassCounters{};
+            NCOrdinaryG00AdmissionSnapshot ordinaryG00AdmissionSnapshot{};
+            NCOrdinaryG00AdmissionCounters ordinaryG00AdmissionCounters{};
+            NCOrdinaryG00InflightRegistrySnapshot ordinaryG00InflightRegistrySnapshot{};
+            NCOrdinaryG00InflightRegistryCounters ordinaryG00InflightRegistryCounters{};
+            NCOrdinaryG00ReadAheadSnapshot ordinaryG00ReadAheadSnapshot{};
+            NCOrdinaryG00ReadAheadCounters ordinaryG00ReadAheadCounters{};
+            NCOrdinaryG00FeedHoldCohortSnapshot ordinaryG00FeedHoldCohortSnapshot{};
+            NCOrdinaryG00FeedHoldCohortCounters ordinaryG00FeedHoldCohortCounters{};
+            NCOrdinaryG00FeedHoldCohortCutoverSnapshot ordinaryG00FeedHoldCohortCutoverSnapshot{};
+            NCOrdinaryG00FeedHoldCohortCutoverCounters ordinaryG00FeedHoldCohortCutoverCounters{};
+            NCOrdinaryG00FeedHoldCohortRearmSnapshot ordinaryG00FeedHoldCohortRearmSnapshot{};
+            NCOrdinaryG00FeedHoldCohortRearmCounters ordinaryG00FeedHoldCohortRearmCounters{};
+            NCOrdinaryG00FeedHoldRearmCutoverSnapshot ordinaryG00FeedHoldRearmCutoverSnapshot{};
+            NCOrdinaryG00FeedHoldRearmCutoverCounters ordinaryG00FeedHoldRearmCutoverCounters{};
+            NCOrdinaryG00FeedHoldRollingRearmSnapshot ordinaryG00FeedHoldRollingRearmSnapshot{};
+            NCOrdinaryG00FeedHoldRollingRearmCounters ordinaryG00FeedHoldRollingRearmCounters{};
+            NCOrdinaryG00FeedHoldRollingCutoverSnapshot ordinaryG00FeedHoldRollingCutoverSnapshot{};
+            NCOrdinaryG00FeedHoldRollingCutoverCounters ordinaryG00FeedHoldRollingCutoverCounters{};
+            NCPreparedBlockEntrySnapshot preparedQueueHead{};
+            NCPreparedBlockEntrySnapshot preparedQueueTail{};
+            NCSingleBlockShadowSnapshot singleBlockShadowSnapshot{};
+            NCSingleBlockShadowCounters singleBlockShadowCounters{};
+            NCSingleBlockHoldGateSnapshot singleBlockGateSnapshot{};
+            NCSingleBlockHoldGateCounters singleBlockGateCounters{};
+            NCFeedHoldBoundarySnapshot feedHoldSnapshot{};
+            NCFeedHoldBoundaryCounters feedHoldCounters{};
+            NCFeedHoldResumeGateSnapshot feedHoldGateSnapshot{};
+            NCFeedHoldResumeGateCounters feedHoldGateCounters{};
+            NCLifecycleInterruptionSnapshot lifecycleInterruptionSnapshot{};
+            NCLifecycleInterruptionCounters lifecycleInterruptionCounters{};
+            NCResetReleaseGateSnapshot resetReleaseGateSnapshot{};
+            NCResetReleaseGateCounters resetReleaseGateCounters{};
+            NCAlarmEmergencyStopSnapshot alarmEmergencyStopSnapshot{};
+            NCAlarmEmergencyStopCounters alarmEmergencyStopCounters{};
+            volatile NCPathCoreInputHandoffCompactState
+                pathCoreInputHandoffCompactState{
+                    NCPathCoreInputHandoffCompactState::NOT_RUNNING };
+            volatile std::uint32_t pathCoreInputHandoffChangeToken{};
+            volatile bool pathCoreInputHandoffChanged{};
+            bool pdoInvalidCorrelationCoherent{};
+            bool pdoSafetyStopCauseCoherent{};
+            bool groupNCSettleCoherent{};
+            bool feedHoldNCSettleCoherent{};
+            bool resetNCSettleCoherent{};
+            bool hasBlockLifecycle{};
+            bool hasPreparedQueueHead{};
+            bool hasPreparedQueueTail{};
+        };
+
+        HMI_DIAG_NOINLINE void CapturePathCoreCompactDiagnosticFamily(
+            NCManager& nc,
+            Hmi1000msDiagnosticWorkspace& workspace)
+        {
+            // NC-0.2L.1E2: only scalar state/token values enter the fixed
+            // process-lifetime workspace. No by-value diagnostic, stack
+            // snapshot, counter family or text output is introduced.
+            const std::uint32_t previousToken =
+                workspace.pathCoreInputHandoffChangeToken;
+            const std::uint32_t currentToken =
+                nc.GetPathCoreInputHandoffChangeToken();
+
+            workspace.pathCoreInputHandoffCompactState =
+                nc.GetPathCoreInputHandoffCompactState();
+            workspace.pathCoreInputHandoffChangeToken = currentToken;
+            workspace.pathCoreInputHandoffChanged =
+                currentToken != previousToken;
+        }
+
+        HMI_DIAG_NOINLINE void CaptureTransportDiagnosticFamily(
+            MotionCore& motion,
+            Hmi1000msDiagnosticWorkspace& workspace)
+        {
+            workspace.pdoInvalidCorrelation = {};
+            workspace.pdoInvalidCorrelationCoherent =
+                TryReadEtherCatPdoRuntimeInvalidCorrelation(
+                    workspace.pdoInvalidCorrelation);
+            workspace.pdoSafetyStopCause = {};
+            workspace.pdoSafetyStopCauseCoherent =
+                TryReadEtherCatPdoSafetyStopCause(workspace.pdoSafetyStopCause);
+            workspace.startupLagArming = motion.GetStartupLagArmingEvidence();
+            workspace.p1HandoverSafety = motion.GetP1HandoverSafetySnapshot();
+            workspace.lifecycleCommit =
+                motion.GetLifecycleCommitReservationSnapshot();
+            workspace.commandPathModeTransport =
+                motion.GetCommandPathModeTransportSnapshot();
+            workspace.queueTailTransaction =
+                motion.GetQueueTailTransactionSnapshot();
+        }
+
+        HMI_DIAG_NOINLINE void CaptureMotionSettleDiagnosticFamily(
+            MotionCore& motion,
+            Hmi1000msDiagnosticWorkspace& workspace)
+        {
+            workspace.stopSettleSnapshot = {};
+            workspace.stopSettleCounters = {};
+            motion.GetStopSettleEvidence(
+                workspace.stopSettleSnapshot,
+                workspace.stopSettleCounters);
+            workspace.groupNCSettleSnapshot = {};
+            workspace.groupNCSettleCounters = {};
+            workspace.groupNCSettleCoherent = motion.TryGetNCSettleEvidence(
+                MotionNCSettleProfile::GROUP_COMPLETION,
+                workspace.groupNCSettleSnapshot,
+                workspace.groupNCSettleCounters);
+            workspace.feedHoldNCSettleSnapshot = {};
+            workspace.feedHoldNCSettleCounters = {};
+            workspace.feedHoldNCSettleCoherent = motion.TryGetNCSettleEvidence(
+                MotionNCSettleProfile::FEED_HOLD_GROUP,
+                workspace.feedHoldNCSettleSnapshot,
+                workspace.feedHoldNCSettleCounters);
+            workspace.resetNCSettleSnapshot = {};
+            workspace.resetNCSettleCounters = {};
+            workspace.resetNCSettleCoherent = motion.TryGetNCSettleEvidence(
+                MotionNCSettleProfile::RESET_ALL,
+                workspace.resetNCSettleSnapshot,
+                workspace.resetNCSettleCounters);
+            workspace.resetRebaseAck = motion.GetNCResetRebaseAck();
+            workspace.ownerLease = motion.GetMotionOwnerLease();
+        }
+
+        HMI_DIAG_NOINLINE void CaptureNCBlockDiagnosticFamily(
+            NCManager& nc,
+            Hmi1000msDiagnosticWorkspace& workspace)
+        {
+            workspace.blockLifecycle = {};
+            workspace.hasBlockLifecycle =
+                nc.GetLastBlockLifecycleSnapshot(workspace.blockLifecycle);
+            workspace.blockCounters = nc.GetBlockLifecycleCounters();
+            workspace.completionBoundary =
+                nc.GetLastBlockCompletionBoundarySnapshot();
+            workspace.completionCounters =
+                nc.GetBlockCompletionBoundaryCounters();
+            workspace.programEndSnapshot = nc.GetProgramEndGateSnapshot();
+            workspace.programEndCounters = nc.GetProgramEndGateCounters();
+            workspace.gmTransactionSnapshot = nc.GetGMBlockTransactionSnapshot();
+            workspace.gmTransactionCounters = nc.GetGMBlockTransactionCounters();
+            workspace.preDispatchBarrierSnapshot =
+                nc.GetPreDispatchBarrierSnapshot();
+            workspace.preDispatchBarrierCounters =
+                nc.GetPreDispatchBarrierCounters();
+        }
+
+        HMI_DIAG_NOINLINE void CaptureNCPreparedQueueDiagnosticFamily(
+            NCManager& nc,
+            Hmi1000msDiagnosticWorkspace& workspace)
+        {
+            workspace.preparedQueueSnapshot = nc.GetPreparedBlockQueueSnapshot();
+            workspace.preparedQueueCounters = nc.GetPreparedBlockQueueCounters();
+            workspace.preparedEquivalenceSnapshot = nc.GetPreparedHeadEquivalenceSnapshot();
+            workspace.preparedEquivalenceCounters = nc.GetPreparedHeadEquivalenceCounters();
+        }
+
+        HMI_DIAG_NOINLINE void CaptureNCPreparedAdmissionDiagnosticFamily(
+            NCManager& nc,
+            Hmi1000msDiagnosticWorkspace& workspace)
+        {
+            workspace.preparedCutoverSnapshot = nc.GetPreparedHeadCutoverSnapshot();
+            workspace.preparedCutoverCounters = nc.GetPreparedHeadCutoverCounters();
+            workspace.preparedPreResolveSnapshot = nc.GetPreparedPreResolveAdmissionSnapshot();
+            workspace.preparedPreResolveCounters = nc.GetPreparedPreResolveAdmissionCounters();
+            workspace.preparedResolverBypassSnapshot = nc.GetPreparedResolverBypassSnapshot();
+            workspace.preparedResolverBypassCounters = nc.GetPreparedResolverBypassCounters();
+            workspace.ordinaryG00AdmissionSnapshot = nc.GetOrdinaryG00AdmissionSnapshot();
+            workspace.ordinaryG00AdmissionCounters = nc.GetOrdinaryG00AdmissionCounters();
+        }
+
+        HMI_DIAG_NOINLINE void CaptureNCPreparedReadAheadDiagnosticFamily(
+            NCManager& nc,
+            Hmi1000msDiagnosticWorkspace& workspace)
+        {
+            workspace.ordinaryG00InflightRegistrySnapshot = nc.GetOrdinaryG00InflightRegistrySnapshot();
+            workspace.ordinaryG00InflightRegistryCounters = nc.GetOrdinaryG00InflightRegistryCounters();
+            workspace.ordinaryG00ReadAheadSnapshot = nc.GetOrdinaryG00ReadAheadSnapshot();
+            workspace.ordinaryG00ReadAheadCounters = nc.GetOrdinaryG00ReadAheadCounters();
+        }
+
+        HMI_DIAG_NOINLINE void CaptureNCPreparedHoldDiagnosticFamily(
+            NCManager& nc,
+            Hmi1000msDiagnosticWorkspace& workspace)
+        {
+            workspace.ordinaryG00FeedHoldCohortSnapshot = nc.GetOrdinaryG00FeedHoldCohortSnapshot();
+            workspace.ordinaryG00FeedHoldCohortCounters = nc.GetOrdinaryG00FeedHoldCohortCounters();
+            workspace.ordinaryG00FeedHoldCohortCutoverSnapshot = nc.GetOrdinaryG00FeedHoldCohortCutoverSnapshot();
+            workspace.ordinaryG00FeedHoldCohortCutoverCounters = nc.GetOrdinaryG00FeedHoldCohortCutoverCounters();
+            workspace.ordinaryG00FeedHoldCohortRearmSnapshot = nc.GetOrdinaryG00FeedHoldCohortRearmSnapshot();
+            workspace.ordinaryG00FeedHoldCohortRearmCounters = nc.GetOrdinaryG00FeedHoldCohortRearmCounters();
+            workspace.ordinaryG00FeedHoldRearmCutoverSnapshot = nc.GetOrdinaryG00FeedHoldRearmCutoverSnapshot();
+            workspace.ordinaryG00FeedHoldRearmCutoverCounters = nc.GetOrdinaryG00FeedHoldRearmCutoverCounters();
+            workspace.ordinaryG00FeedHoldRollingRearmSnapshot = nc.GetOrdinaryG00FeedHoldRollingRearmSnapshot();
+            workspace.ordinaryG00FeedHoldRollingRearmCounters = nc.GetOrdinaryG00FeedHoldRollingRearmCounters();
+            workspace.ordinaryG00FeedHoldRollingCutoverSnapshot = nc.GetOrdinaryG00FeedHoldRollingCutoverSnapshot();
+            workspace.ordinaryG00FeedHoldRollingCutoverCounters = nc.GetOrdinaryG00FeedHoldRollingCutoverCounters();
+            workspace.preparedQueueHead = {};
+            workspace.preparedQueueTail = {};
+            workspace.hasPreparedQueueHead = nc.GetPreparedBlockQueueEntry(0U, workspace.preparedQueueHead);
+            workspace.hasPreparedQueueTail =
+                workspace.preparedQueueSnapshot.depth != 0U &&
+                nc.GetPreparedBlockQueueEntry(
+                    static_cast<std::size_t>(workspace.preparedQueueSnapshot.depth - 1U),
+                    workspace.preparedQueueTail);
+        }
+
+        HMI_DIAG_NOINLINE void CaptureNCHoldSafetyDiagnosticFamily(
+            NCManager& nc,
+            Hmi1000msDiagnosticWorkspace& workspace)
+        {
+            workspace.singleBlockShadowSnapshot = nc.GetSingleBlockShadowSnapshot();
+            workspace.singleBlockShadowCounters = nc.GetSingleBlockShadowCounters();
+            workspace.singleBlockGateSnapshot = nc.GetSingleBlockHoldGateSnapshot();
+            workspace.singleBlockGateCounters = nc.GetSingleBlockHoldGateCounters();
+            workspace.feedHoldSnapshot = nc.GetFeedHoldBoundarySnapshot();
+            workspace.feedHoldCounters = nc.GetFeedHoldBoundaryCounters();
+            workspace.feedHoldGateSnapshot = nc.GetFeedHoldResumeGateSnapshot();
+            workspace.feedHoldGateCounters = nc.GetFeedHoldResumeGateCounters();
+            workspace.lifecycleInterruptionSnapshot = nc.GetLifecycleInterruptionSnapshot();
+            workspace.lifecycleInterruptionCounters = nc.GetLifecycleInterruptionCounters();
+            workspace.resetReleaseGateSnapshot = nc.GetResetReleaseGateSnapshot();
+            workspace.resetReleaseGateCounters = nc.GetResetReleaseGateCounters();
+            workspace.alarmEmergencyStopSnapshot = nc.GetAlarmEmergencyStopSnapshot();
+            workspace.alarmEmergencyStopCounters = nc.GetAlarmEmergencyStopCounters();
+        }
+
+        template <typename DiagnosticWriter>
+        HMI_DIAG_NOINLINE void RunHmiDiagnosticOutputFamily(
+            DiagnosticWriter&& writer)
+        {
+            // Compile-time dispatch only: no allocation and no retained
+            // callable. The noinline boundary confines each family's
+            // RtPrintf argument staging to its own bounded frame.
+            writer();
+        }
+
+        HMI_DIAG_NOINLINE std::uint64_t
+            BuildCommandPathModeChangeToken(
+                const MotionCommandPathModeTransportSnapshot& snapshot) noexcept
+        {
+            const MotionCommandPathModeTransportSnapshot& commandPathModeTransport = snapshot;
+
+            std::uint64_t token = 0ULL;
+            const auto fold = [&token](std::uint64_t value) noexcept
+            {
+                token = FoldDiagnosticEventToken(token, value);
+            };
+            fold(commandPathModeTransport.producerAccepted);
+            fold(commandPathModeTransport.producerRejected);
+            fold(commandPathModeTransport.producerExactStop);
+            fold(commandPathModeTransport.producerContinuous);
+            fold(commandPathModeTransport.producerUnspecified);
+            fold(commandPathModeTransport.producerInvalid);
+            fold(commandPathModeTransport.producerFingerprint);
+            fold(commandPathModeTransport.consumerCommitted);
+            fold(commandPathModeTransport.consumerIngressCommitted);
+            fold(commandPathModeTransport.consumerReplayCommitted);
+            fold(commandPathModeTransport.consumerExactStop);
+            fold(commandPathModeTransport.consumerContinuous);
+            fold(commandPathModeTransport.consumerUnspecified);
+            fold(commandPathModeTransport.consumerInvalid);
+            fold(commandPathModeTransport.consumerFingerprint);
+            fold(commandPathModeTransport.legacyModeMatches);
+            fold(commandPathModeTransport.legacyModeMismatches);
+            fold(commandPathModeTransport.driverOverrideObservations);
+            fold(commandPathModeTransport.authorityAttempts);
+            fold(commandPathModeTransport.authorityApplied);
+            fold(commandPathModeTransport.authorityExactStop);
+            fold(commandPathModeTransport.authorityContinuous);
+            fold(commandPathModeTransport.authorityLegacyFallbacks);
+            fold(commandPathModeTransport.authorityReplayBypasses);
+            fold(commandPathModeTransport.authorityDriverBlocks);
+            fold(commandPathModeTransport.authorityInvalidRejects);
+            fold(commandPathModeTransport.commandLocalPayloadPresent ? 1ULL : 0ULL);
+            fold(commandPathModeTransport.transportReady ? 1ULL : 0ULL);
+            fold(commandPathModeTransport.producerSnapshotCoherent ? 1ULL : 0ULL);
+            fold(commandPathModeTransport.consumerSnapshotCoherent ? 1ULL : 0ULL);
+            fold(commandPathModeTransport.accountingValid ? 1ULL : 0ULL);
+            return token;
+        }
+
+        HMI_DIAG_NOINLINE std::uint64_t
+            BuildQueueTailTransactionChangeToken(
+                const MotionQueueTailTransactionSnapshot& snapshot) noexcept
+        {
+            const MotionQueueTailTransactionSnapshot& queueTailTransaction = snapshot;
+
+            std::uint64_t token = 0ULL;
+            const auto fold = [&token](std::uint64_t value) noexcept
+            {
+                token = FoldDiagnosticEventToken(token, value);
+            };
+            fold(queueTailTransaction.writeSequence);
+            fold(queueTailTransaction.attempts);
+            fold(queueTailTransaction.commandAccepted);
+            fold(queueTailTransaction.commandRejected);
+            fold(queueTailTransaction.committed);
+            fold(queueTailTransaction.rejectPreserved);
+            fold(queueTailTransaction.commandedMCSCommitted);
+            fold(queueTailTransaction.lastQueuedPulseCommitted);
+            fold(queueTailTransaction.rapidOverrideCommitted);
+            fold(queueTailTransaction.endpointExact);
+            fold(queueTailTransaction.captureBound);
+            fold(queueTailTransaction.invalidInputs);
+            fold(queueTailTransaction.mismatches);
+            fold(queueTailTransaction.lastTransactionSequence);
+            fold(queueTailTransaction.lastExecutionEpoch);
+            fold(queueTailTransaction.lastSegmentId);
+            fold(queueTailTransaction.lastAxisMask);
+            fold(queueTailTransaction.lastCommittedFingerprint);
+            fold(queueTailTransaction.authoritative ? 1ULL : 0ULL);
+            fold(queueTailTransaction.shadowOnly ? 1ULL : 0ULL);
+            fold(queueTailTransaction.cutoverAttempted ? 1ULL : 0ULL);
+            fold(queueTailTransaction.runtimeInfluence ? 1ULL : 0ULL);
+            fold(queueTailTransaction.ready ? 1ULL : 0ULL);
+            fold(queueTailTransaction.snapshotCoherent ? 1ULL : 0ULL);
+            fold(queueTailTransaction.accountingValid ? 1ULL : 0ULL);
+            return token;
+        }
+
+        HMI_DIAG_NOINLINE std::uint64_t
+            BuildPreparedDiagnosticsChangeToken(
+                const Hmi1000msDiagnosticWorkspace& workspace,
+                std::uint64_t preparedEquivalenceStateBits) noexcept
+        {
+            const NCPreparedHeadEquivalenceSnapshot& preparedEquivalenceSnapshot = workspace.preparedEquivalenceSnapshot;
+            const NCPreparedHeadEquivalenceCounters& preparedEquivalenceCounters = workspace.preparedEquivalenceCounters;
+            const NCPreparedResolverBypassSnapshot& preparedResolverBypassSnapshot = workspace.preparedResolverBypassSnapshot;
+            const NCPreparedResolverBypassCounters& preparedResolverBypassCounters = workspace.preparedResolverBypassCounters;
+            const NCOrdinaryG00AdmissionSnapshot& ordinaryG00AdmissionSnapshot = workspace.ordinaryG00AdmissionSnapshot;
+            const NCOrdinaryG00AdmissionCounters& ordinaryG00AdmissionCounters = workspace.ordinaryG00AdmissionCounters;
+            const NCOrdinaryG00InflightRegistrySnapshot& ordinaryG00InflightRegistrySnapshot = workspace.ordinaryG00InflightRegistrySnapshot;
+            const NCOrdinaryG00InflightRegistryCounters& ordinaryG00InflightRegistryCounters = workspace.ordinaryG00InflightRegistryCounters;
+            const NCOrdinaryG00ReadAheadSnapshot& ordinaryG00ReadAheadSnapshot = workspace.ordinaryG00ReadAheadSnapshot;
+            const NCOrdinaryG00ReadAheadCounters& ordinaryG00ReadAheadCounters = workspace.ordinaryG00ReadAheadCounters;
+            const NCOrdinaryG00FeedHoldCohortSnapshot& ordinaryG00FeedHoldCohortSnapshot = workspace.ordinaryG00FeedHoldCohortSnapshot;
+            const NCOrdinaryG00FeedHoldCohortCounters& ordinaryG00FeedHoldCohortCounters = workspace.ordinaryG00FeedHoldCohortCounters;
+            const NCOrdinaryG00FeedHoldCohortCutoverSnapshot& ordinaryG00FeedHoldCohortCutoverSnapshot = workspace.ordinaryG00FeedHoldCohortCutoverSnapshot;
+            const NCOrdinaryG00FeedHoldCohortCutoverCounters& ordinaryG00FeedHoldCohortCutoverCounters = workspace.ordinaryG00FeedHoldCohortCutoverCounters;
+            const NCOrdinaryG00FeedHoldCohortRearmSnapshot& ordinaryG00FeedHoldCohortRearmSnapshot = workspace.ordinaryG00FeedHoldCohortRearmSnapshot;
+            const NCOrdinaryG00FeedHoldCohortRearmCounters& ordinaryG00FeedHoldCohortRearmCounters = workspace.ordinaryG00FeedHoldCohortRearmCounters;
+            const NCOrdinaryG00FeedHoldRearmCutoverSnapshot& ordinaryG00FeedHoldRearmCutoverSnapshot = workspace.ordinaryG00FeedHoldRearmCutoverSnapshot;
+            const NCOrdinaryG00FeedHoldRearmCutoverCounters& ordinaryG00FeedHoldRearmCutoverCounters = workspace.ordinaryG00FeedHoldRearmCutoverCounters;
+            const NCOrdinaryG00FeedHoldRollingRearmSnapshot& ordinaryG00FeedHoldRollingRearmSnapshot = workspace.ordinaryG00FeedHoldRollingRearmSnapshot;
+            const NCOrdinaryG00FeedHoldRollingRearmCounters& ordinaryG00FeedHoldRollingRearmCounters = workspace.ordinaryG00FeedHoldRollingRearmCounters;
+            const NCOrdinaryG00FeedHoldRollingCutoverSnapshot& ordinaryG00FeedHoldRollingCutoverSnapshot = workspace.ordinaryG00FeedHoldRollingCutoverSnapshot;
+            const NCOrdinaryG00FeedHoldRollingCutoverCounters& ordinaryG00FeedHoldRollingCutoverCounters = workspace.ordinaryG00FeedHoldRollingCutoverCounters;
+            std::uint64_t token = 0ULL;
+            const auto fold = [&token](std::uint64_t value) noexcept
+            {
+                token = FoldDiagnosticEventToken(token, value);
+            };
+            fold(preparedEquivalenceSnapshot.session);
+            fold(preparedEquivalenceSnapshot.entrySequence);
+            fold(static_cast<std::uint64_t>(preparedEquivalenceSnapshot.scope));
+            fold(preparedEquivalenceSnapshot.cacheGeneration);
+            fold(preparedEquivalenceSnapshot.frameId);
+            fold(preparedEquivalenceSnapshot.executionEpoch);
+            fold(preparedEquivalenceSnapshot.commitExecutionEpoch);
+            fold(preparedEquivalenceSnapshot.programFlowGeneration);
+            fold(preparedEquivalenceSnapshot.owner);
+            fold(preparedEquivalenceSnapshot.panelMask);
+            fold(preparedEquivalenceSnapshot.ownerGeneration);
+            fold(preparedEquivalenceSnapshot.dispatchId);
+            fold(preparedEquivalenceSnapshot.commitSequence);
+            fold(preparedEquivalenceSnapshot.qualifiedSession);
+            fold(static_cast<std::uint64_t>(preparedEquivalenceSnapshot.state));
+            fold(static_cast<std::uint64_t>(
+                preparedEquivalenceSnapshot.lastInvalidation));
+            fold(static_cast<std::uint64_t>(
+                preparedEquivalenceSnapshot.mismatchFlags));
+            fold(preparedEquivalenceStateBits);
+            fold(preparedEquivalenceSnapshot.sessionPeakDepth);
+            fold(preparedEquivalenceCounters.candidates);
+            fold(preparedEquivalenceCounters.matched);
+            fold(preparedEquivalenceCounters.mismatched);
+            fold(preparedEquivalenceCounters.invalidated);
+            fold(preparedEquivalenceCounters.ineligible);
+            fold(preparedEquivalenceCounters.lifetimePeakDepth);
+            fold(preparedEquivalenceCounters.multiBlockObservations);
+            fold(preparedEquivalenceCounters.queueMismatches);
+            fold(preparedEquivalenceCounters.sourceMismatches);
+            fold(preparedEquivalenceCounters.pcMismatches);
+            fold(preparedEquivalenceCounters.lineMismatches);
+            fold(preparedEquivalenceCounters.blockMismatches);
+            fold(preparedEquivalenceCounters.planMismatches);
+            fold(preparedEquivalenceCounters.classificationMismatches);
+            fold(preparedEquivalenceCounters.drainMismatches);
+            fold(preparedEquivalenceCounters.modalBeforeMismatches);
+            fold(preparedEquivalenceCounters.modalAfterMismatches);
+            fold(preparedEquivalenceCounters.lifecycleMismatches);
+            fold(preparedEquivalenceCounters.staleTokens);
+            fold(preparedEquivalenceCounters.resolveMismatches);
+            fold(preparedEquivalenceCounters.upstreamMismatches);
+            fold(preparedEquivalenceCounters.ledgerMismatches);
+            fold(preparedEquivalenceCounters.bindIdentityMismatches);
+            fold(preparedEquivalenceCounters.runtimeFailures);
+            fold(preparedEquivalenceCounters.sessionTransitions);
+            fold(preparedEquivalenceCounters.qualifiedSessions);
+            fold(preparedEquivalenceCounters.wouldUse);
+            fold(preparedEquivalenceCounters.useAttempts);
+            fold(preparedEquivalenceCounters.cutoverAttempts);
+            fold(preparedEquivalenceCounters.runtimeInfluence);
+            fold(preparedResolverBypassSnapshot.publicationSequence);
+            fold(static_cast<std::uint64_t>(
+                preparedResolverBypassSnapshot.decision));
+            fold(preparedResolverBypassCounters.selected);
+            fold(preparedResolverBypassCounters.proofVerified);
+            fold(preparedResolverBypassCounters.qualificationCandidates);
+            fold(preparedResolverBypassCounters.qualifiedPureModal);
+            fold(preparedResolverBypassCounters.qualifiedG00P1);
+            fold(preparedResolverBypassCounters.runtimeFailures);
+            fold(preparedResolverBypassCounters.proofMismatches);
+            fold(preparedResolverBypassCounters.revocations);
+            fold(preparedResolverBypassCounters.runtimeInfluence);
+            fold(preparedResolverBypassCounters.resolverBypasses);
+            fold(preparedResolverBypassSnapshot.g00NoPQualifiedSession);
+            fold(preparedResolverBypassSnapshot.commitExecutionEpoch);
+            fold(preparedResolverBypassSnapshot.legacyDrainRequired ? 1ULL : 0ULL);
+            fold(preparedResolverBypassSnapshot.legacyDrainSatisfied ? 1ULL : 0ULL);
+            fold(preparedResolverBypassSnapshot.deferredForDrain ? 1ULL : 0ULL);
+            fold(preparedResolverBypassSnapshot.callbackRequired ? 1ULL : 0ULL);
+            fold(preparedResolverBypassSnapshot.callbackActiveAtCommit ? 1ULL : 0ULL);
+            fold(preparedResolverBypassSnapshot.waitPhaseObserved ? 1ULL : 0ULL);
+            fold(preparedResolverBypassSnapshot.callbackCompletionObserved
+                ? 1ULL : 0ULL);
+            fold(preparedResolverBypassCounters.selectedPureModal);
+            fold(preparedResolverBypassCounters.selectedG00P1);
+            fold(preparedResolverBypassCounters.selectedG00NoP);
+            fold(preparedResolverBypassCounters.proofVerifiedPureModal);
+            fold(preparedResolverBypassCounters.proofVerifiedG00P1);
+            fold(preparedResolverBypassCounters.proofVerifiedG00NoP);
+            fold(preparedResolverBypassCounters.drainWaitSamples);
+            fold(preparedResolverBypassCounters.callbackWaitSamples);
+            fold(preparedResolverBypassCounters.callbackCompletions);
+            fold(preparedResolverBypassCounters.ordinaryWaitPhases);
+            fold(preparedResolverBypassCounters.qualifiedG00NoP);
+            fold(ordinaryG00AdmissionSnapshot.publicationSequence);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00AdmissionSnapshot.decision));
+            fold(ordinaryG00AdmissionSnapshot.session);
+            fold(ordinaryG00AdmissionSnapshot.entrySequence);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00AdmissionSnapshot.owner));
+            fold(ordinaryG00AdmissionSnapshot.ownerGeneration);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00AdmissionSnapshot.panelMask));
+            fold(ordinaryG00AdmissionSnapshot.dispatchId);
+            fold(ordinaryG00AdmissionSnapshot.commitSequence);
+            fold(ordinaryG00AdmissionSnapshot.busySamples);
+            fold(ordinaryG00AdmissionSnapshot.blockerMask);
+            fold(ordinaryG00AdmissionSnapshot.pending ? 1ULL : 0ULL);
+            fold(ordinaryG00AdmissionSnapshot.permanentLockout ? 1ULL : 0ULL);
+            fold(ordinaryG00AdmissionSnapshot.accountingValid ? 1ULL : 0ULL);
+            fold(ordinaryG00AdmissionSnapshot.legacyCallbackCompleted ? 1ULL : 0ULL);
+            fold(ordinaryG00AdmissionSnapshot.legacyUpstreamProofVerified
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00AdmissionCounters.uniqueEvaluations);
+            fold(ordinaryG00AdmissionCounters.warmup);
+            fold(ordinaryG00AdmissionCounters.candidates);
+            fold(ordinaryG00AdmissionCounters.initialDrained);
+            fold(ordinaryG00AdmissionCounters.initialBusy);
+            fold(ordinaryG00AdmissionCounters.busySamples);
+            fold(ordinaryG00AdmissionCounters.legacySelections);
+            fold(ordinaryG00AdmissionCounters.legacyCommitBound);
+            fold(ordinaryG00AdmissionCounters.callbackCompleted);
+            fold(ordinaryG00AdmissionCounters.legacyCompleted);
+            fold(ordinaryG00AdmissionCounters.rejected);
+            fold(ordinaryG00AdmissionCounters.mismatches);
+            fold(ordinaryG00AdmissionCounters.revocations);
+            fold(ordinaryG00AdmissionCounters.runtimeInfluence);
+            fold(ordinaryG00AdmissionCounters.resolverBypasses);
+            fold(ordinaryG00AdmissionCounters.cutoverAttempts);
+            fold(ordinaryG00AdmissionCounters.inflightRegistryBound);
+            fold(ordinaryG00AdmissionSnapshot.inflightRegistrySequence);
+            fold(ordinaryG00AdmissionSnapshot.inflightExecutionEpoch);
+            fold(ordinaryG00AdmissionSnapshot.inflightSegmentId);
+            fold(ordinaryG00AdmissionSnapshot.inflightRegistryProven
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00InflightRegistrySnapshot.publicationSequence);
+            fold(ordinaryG00InflightRegistrySnapshot.lastRegistrySequence);
+            fold(ordinaryG00InflightRegistrySnapshot.currentSession);
+            fold(ordinaryG00InflightRegistrySnapshot.activeEntries);
+            fold(ordinaryG00InflightRegistrySnapshot.revokedPendingEntries);
+            fold(ordinaryG00InflightRegistrySnapshot.permanentLockout
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00InflightRegistrySnapshot.accountingValid
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00InflightRegistryCounters.registrationAttempts);
+            fold(ordinaryG00InflightRegistryCounters.registered);
+            fold(ordinaryG00InflightRegistryCounters.registrationRejected);
+            fold(ordinaryG00InflightRegistryCounters.capacityOverflow);
+            fold(ordinaryG00InflightRegistryCounters.terminal);
+            fold(ordinaryG00InflightRegistryCounters.completed);
+            fold(ordinaryG00InflightRegistryCounters.rejected);
+            fold(ordinaryG00InflightRegistryCounters.cancelled);
+            fold(ordinaryG00InflightRegistryCounters.aborted);
+            fold(ordinaryG00InflightRegistryCounters.faulted);
+            fold(ordinaryG00InflightRegistryCounters.feedbackSequenceGaps);
+            fold(ordinaryG00InflightRegistryCounters.ledgerOrphans);
+            fold(ordinaryG00InflightRegistryCounters.identityConflicts);
+            fold(ordinaryG00InflightRegistryCounters.ownerMismatches);
+            fold(ordinaryG00InflightRegistryCounters.duplicateTerminal);
+            fold(ordinaryG00InflightRegistryCounters.terminalConflict);
+            fold(ordinaryG00InflightRegistryCounters.entriesRevoked);
+            fold(ordinaryG00InflightRegistryCounters.revokedTerminals);
+            fold(ordinaryG00InflightRegistryCounters.runtimeInfluence);
+            fold(ordinaryG00InflightRegistryCounters.motionWrites);
+            fold(ordinaryG00InflightRegistryCounters.readAheadRegistered);
+            fold(ordinaryG00ReadAheadSnapshot.publicationSequence);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00ReadAheadSnapshot.decision));
+            fold(ordinaryG00ReadAheadSnapshot.session);
+            fold(ordinaryG00ReadAheadSnapshot.warmupSession);
+            fold(ordinaryG00ReadAheadSnapshot.dispatchId);
+            fold(ordinaryG00ReadAheadSnapshot.commitSequence);
+            fold(ordinaryG00ReadAheadSnapshot.identity.epoch);
+            fold(ordinaryG00ReadAheadSnapshot.identity.segmentId);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00ReadAheadSnapshot.chainSourcePC + 1));
+            fold(ordinaryG00ReadAheadSnapshot.contiguousChain ? 1ULL : 0ULL);
+            fold(ordinaryG00ReadAheadSnapshot.pending ? 1ULL : 0ULL);
+            fold(ordinaryG00ReadAheadSnapshot.permanentLockout ? 1ULL : 0ULL);
+            fold(ordinaryG00ReadAheadSnapshot.registryReady ? 1ULL : 0ULL);
+            fold(ordinaryG00ReadAheadSnapshot.registryHealthy ? 1ULL : 0ULL);
+            fold(ordinaryG00ReadAheadSnapshot.registryHealthFenced
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00ReadAheadSnapshot.registryHealthLockout
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00ReadAheadSnapshot.accountingValid ? 1ULL : 0ULL);
+            fold(ordinaryG00ReadAheadCounters.selected);
+            fold(ordinaryG00ReadAheadCounters.committed);
+            fold(ordinaryG00ReadAheadCounters.capacityWaits);
+            fold(ordinaryG00ReadAheadCounters.registryHealthFences);
+            fold(ordinaryG00ReadAheadCounters.registryHealthLockouts);
+            fold(ordinaryG00ReadAheadCounters.runtimeFailures);
+            fold(ordinaryG00ReadAheadCounters.proofMismatches);
+            fold(ordinaryG00ReadAheadCounters.runtimeInfluence);
+            fold(ordinaryG00FeedHoldCohortSnapshot.publicationSequence);
+            fold(ordinaryG00FeedHoldCohortSnapshot.cohortSequence);
+            fold(ordinaryG00FeedHoldCohortSnapshot.boundarySequence);
+            fold(ordinaryG00FeedHoldCohortSnapshot.gateSequence);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortSnapshot.phase));
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortSnapshot.decision));
+            fold(ordinaryG00FeedHoldCohortSnapshot.terminalCount);
+            fold(ordinaryG00FeedHoldCohortSnapshot.failed ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldCohortSnapshot.accountingValid ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldCohortCounters.cohortsCaptured);
+            fold(ordinaryG00FeedHoldCohortCounters.terminalCohorts);
+            fold(ordinaryG00FeedHoldCohortCounters.failures);
+            fold(ordinaryG00FeedHoldCohortCutoverSnapshot.publicationSequence);
+            fold(ordinaryG00FeedHoldCohortCutoverSnapshot.cohortSequence);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortCutoverSnapshot.phase));
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortCutoverSnapshot.decision));
+            fold(ordinaryG00FeedHoldCohortCutoverSnapshot.terminalCount);
+            fold(ordinaryG00FeedHoldCohortCutoverSnapshot.registryActiveEntries);
+            fold(ordinaryG00FeedHoldCohortCutoverSnapshot.waiting ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldCohortCutoverSnapshot.released ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldCohortCutoverSnapshot.fallbackLegacy
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldCohortCutoverSnapshot.accountingValid
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldCohortCutoverCounters.cohortsBound);
+            fold(ordinaryG00FeedHoldCohortCutoverCounters.waitFirstTerminal);
+            fold(ordinaryG00FeedHoldCohortCutoverCounters.waitSecondTerminal);
+            fold(ordinaryG00FeedHoldCohortCutoverCounters.releases);
+            fold(ordinaryG00FeedHoldCohortCutoverCounters.allowReadAhead);
+            fold(ordinaryG00FeedHoldCohortCutoverCounters.fallbackLegacy);
+            fold(ordinaryG00FeedHoldCohortCutoverCounters.runtimeInfluence);
+            fold(ordinaryG00FeedHoldCohortRearmSnapshot.publicationSequence);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortRearmSnapshot.phase));
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldCohortRearmSnapshot.decision));
+            fold(ordinaryG00FeedHoldCohortRearmSnapshot.session);
+            fold(ordinaryG00FeedHoldCohortRearmSnapshot.generationCount);
+            fold(ordinaryG00FeedHoldCohortRearmSnapshot.releaseCount);
+            fold(ordinaryG00FeedHoldCohortRearmSnapshot.rearmProven ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldCohortRearmSnapshot.failed ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldCohortRearmSnapshot.accountingValid
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldCohortRearmCounters.generationsCaptured);
+            fold(ordinaryG00FeedHoldCohortRearmCounters.firstReleased);
+            fold(ordinaryG00FeedHoldCohortRearmCounters.secondReleased);
+            fold(ordinaryG00FeedHoldCohortRearmCounters.earlyRearm);
+            fold(ordinaryG00FeedHoldCohortRearmCounters.sessionMismatches);
+            fold(ordinaryG00FeedHoldCohortRearmCounters.memberIdentityReuse);
+            fold(ordinaryG00FeedHoldCohortRearmCounters.proofMismatches);
+            fold(ordinaryG00FeedHoldCohortRearmCounters.sessionResets);
+            fold(ordinaryG00FeedHoldCohortRearmCounters.failures);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.publicationSequence);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.
+                rearmPublicationSequence);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldRearmCutoverSnapshot.phase));
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldRearmCutoverSnapshot.decision));
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.session);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.cohortSequence);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.boundarySequence);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.gateSequence);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.generationCount);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.releaseCount);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.bound ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.waiting ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.released ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.fallbackLegacy
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.sessionLockout
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverSnapshot.accountingValid
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverCounters.secondGenerationsBound);
+            fold(ordinaryG00FeedHoldRearmCutoverCounters.waitK74Release != 0ULL
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverCounters.waitK75RearmProof != 0ULL
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverCounters.releases);
+            fold(ordinaryG00FeedHoldRearmCutoverCounters.allowReadAhead != 0ULL
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverCounters.fallbackLegacy != 0ULL
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRearmCutoverCounters.sessionResets);
+            fold(ordinaryG00FeedHoldRearmCutoverCounters.failures);
+            fold(ordinaryG00FeedHoldRearmCutoverCounters.runtimeInfluence != 0ULL
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.publicationSequence);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.
+                seedK75PublicationSequence);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.
+                seedK76PublicationSequence);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.
+                seedK73PublicationSequence);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.
+                seedK74PublicationSequence);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.
+                seedRegistryPublicationSequence);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldRollingRearmSnapshot.phase));
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldRollingRearmSnapshot.decision));
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.session);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.lineageDigest);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.lastCohortSequence);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.lastBoundarySequence);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.lastGateSequence);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.
+                registrySequenceHighWater);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.entrySequenceHighWater);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.dispatchIdHighWater);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.commitSequenceHighWater);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.segmentIdHighWater);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.rollingCaptureCount);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.rollingReleaseCount);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.generationCount);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.releaseCount);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.
+                activeGenerationOrdinal);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.seeded ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.tracking ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.active ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.releasedContinuity
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.failed ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingRearmSnapshot.accountingValid
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.seedAccepted);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.rollingCohortEdges);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.nonExactBypasses);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.rollingCaptures);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.rollingReleases);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.earlyEdges);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.sessionMismatches);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.
+                executionLeaseMismatches);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.sequenceMismatches);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.
+                sequenceWrapUnsupported);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.lineageMismatches);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.registryMismatches);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.accountingMismatches);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.
+                activeInvariantMismatches);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.ordinalExhausted);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.proofMismatches);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.fallbackObserved);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.sessionResets);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.resetWhileActive);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.failures);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.runtimeInfluence);
+            fold(ordinaryG00FeedHoldRollingRearmCounters.motionWrites);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.publicationSequence);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.
+                rollingPublicationSequence);
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldRollingCutoverSnapshot.phase));
+            fold(static_cast<std::uint64_t>(
+                ordinaryG00FeedHoldRollingCutoverSnapshot.decision));
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.session);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.generationOrdinal);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.
+                lastReleasedGenerationOrdinal);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.bound ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.waiting ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.released ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.fallbackLegacy
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.sessionLockout
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverSnapshot.accountingValid
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverCounters.generationsBound);
+            fold(ordinaryG00FeedHoldRollingCutoverCounters.waitK74Release != 0ULL
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverCounters.
+                waitK77ContinuityProof != 0ULL ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverCounters.releases);
+            fold(ordinaryG00FeedHoldRollingCutoverCounters.allowReadAhead != 0ULL
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverCounters.fallbackLegacy != 0ULL
+                ? 1ULL : 0ULL);
+            fold(ordinaryG00FeedHoldRollingCutoverCounters.sessionResets);
+            fold(ordinaryG00FeedHoldRollingCutoverCounters.failures);
+            fold(ordinaryG00FeedHoldRollingCutoverCounters.runtimeInfluence != 0ULL
+                ? 1ULL : 0ULL);
+            return token;
+        }
+
+        Hmi1000msDiagnosticWorkspace g_hmi1000msDiagnosticWorkspace{};
     }
     // =========================================================================
     // 🚀 1. ProcessTask (每一圈執行) - 處理高優先級命令與即時座標
@@ -2070,31 +2851,26 @@ namespace HMI_Bridge
         // =============================================================
         MotionCore& motion = nc->GetMotion();
 
-        EtherCatPdoRuntimeInvalidCorrelationSnapshot
-            pdoInvalidCorrelation{};
+        Hmi1000msDiagnosticWorkspace& workspace =
+            g_hmi1000msDiagnosticWorkspace;
+        CapturePathCoreCompactDiagnosticFamily(*nc, workspace);
+        CaptureTransportDiagnosticFamily(motion, workspace);
+
+        EtherCatPdoRuntimeInvalidCorrelationSnapshot&
+            pdoInvalidCorrelation = workspace.pdoInvalidCorrelation;
         const bool pdoInvalidCorrelationCoherent =
-            TryReadEtherCatPdoRuntimeInvalidCorrelation(
-                pdoInvalidCorrelation);
+            workspace.pdoInvalidCorrelationCoherent;
 
-        EtherCatPdoSafetyStopCauseSnapshot pdoSafetyStopCause{};
+        EtherCatPdoSafetyStopCauseSnapshot& pdoSafetyStopCause =
+            workspace.pdoSafetyStopCause;
         const bool pdoSafetyStopCauseCoherent =
-            TryReadEtherCatPdoSafetyStopCause(
-                pdoSafetyStopCause);
+            workspace.pdoSafetyStopCauseCoherent;
 
-        const MotionStartupLagArmingEvidence startupLagArming =
-            motion.GetStartupLagArmingEvidence();
-
-        const MotionP1HandoverSafetySnapshot p1HandoverSafety =
-            motion.GetP1HandoverSafetySnapshot();
-
-        const MotionLifecycleCommitReservationSnapshot lifecycleCommit =
-            motion.GetLifecycleCommitReservationSnapshot();
-
-        const MotionCommandPathModeTransportSnapshot commandPathModeTransport =
-            motion.GetCommandPathModeTransportSnapshot();
-
-        const MotionQueueTailTransactionSnapshot queueTailTransaction =
-            motion.GetQueueTailTransactionSnapshot();
+        MotionStartupLagArmingEvidence& startupLagArming = workspace.startupLagArming;
+        MotionP1HandoverSafetySnapshot& p1HandoverSafety = workspace.p1HandoverSafety;
+        MotionLifecycleCommitReservationSnapshot& lifecycleCommit = workspace.lifecycleCommit;
+        MotionCommandPathModeTransportSnapshot& commandPathModeTransport = workspace.commandPathModeTransport;
+        MotionQueueTailTransactionSnapshot& queueTailTransaction = workspace.queueTailTransaction;
 
         std::uint64_t p1HandoverChangeToken = 1469598103934665603ULL;
         p1HandoverChangeToken = FoldDiagnosticEventToken(
@@ -2162,119 +2938,33 @@ namespace HMI_Bridge
             p1HandoverChangeToken,
             lifecycleCommit.executionEpochPending ? 1ULL : 0ULL);
 
-        const std::uint64_t commandPathModeTokenFields[] =
-        {
-            commandPathModeTransport.producerAccepted,
-            commandPathModeTransport.producerRejected,
-            commandPathModeTransport.producerExactStop,
-            commandPathModeTransport.producerContinuous,
-            commandPathModeTransport.producerUnspecified,
-            commandPathModeTransport.producerInvalid,
-            commandPathModeTransport.producerFingerprint,
-            commandPathModeTransport.consumerCommitted,
-            commandPathModeTransport.consumerIngressCommitted,
-            commandPathModeTransport.consumerReplayCommitted,
-            commandPathModeTransport.consumerExactStop,
-            commandPathModeTransport.consumerContinuous,
-            commandPathModeTransport.consumerUnspecified,
-            commandPathModeTransport.consumerInvalid,
-            commandPathModeTransport.consumerFingerprint,
-            commandPathModeTransport.legacyModeMatches,
-            commandPathModeTransport.legacyModeMismatches,
-            commandPathModeTransport.driverOverrideObservations,
-            commandPathModeTransport.authorityAttempts,
-            commandPathModeTransport.authorityApplied,
-            commandPathModeTransport.authorityExactStop,
-            commandPathModeTransport.authorityContinuous,
-            commandPathModeTransport.authorityLegacyFallbacks,
-            commandPathModeTransport.authorityReplayBypasses,
-            commandPathModeTransport.authorityDriverBlocks,
-            commandPathModeTransport.authorityInvalidRejects,
-            commandPathModeTransport.commandLocalPayloadPresent ? 1ULL : 0ULL,
-            commandPathModeTransport.transportReady ? 1ULL : 0ULL,
-            commandPathModeTransport.producerSnapshotCoherent ? 1ULL : 0ULL,
-            commandPathModeTransport.consumerSnapshotCoherent ? 1ULL : 0ULL,
-            commandPathModeTransport.accountingValid ? 1ULL : 0ULL
-        };
-        std::uint64_t commandPathModeChangeToken = 0ULL;
-        for (const std::uint64_t value : commandPathModeTokenFields)
-        {
-            commandPathModeChangeToken = FoldDiagnosticEventToken(
-                commandPathModeChangeToken,
-                value);
-        }
+        const std::uint64_t commandPathModeChangeToken =
+            BuildCommandPathModeChangeToken(commandPathModeTransport);
 
-        const std::uint64_t queueTailTransactionTokenFields[] =
-        {
-            queueTailTransaction.writeSequence,
-            queueTailTransaction.attempts,
-            queueTailTransaction.commandAccepted,
-            queueTailTransaction.commandRejected,
-            queueTailTransaction.committed,
-            queueTailTransaction.rejectPreserved,
-            queueTailTransaction.commandedMCSCommitted,
-            queueTailTransaction.lastQueuedPulseCommitted,
-            queueTailTransaction.rapidOverrideCommitted,
-            queueTailTransaction.endpointExact,
-            queueTailTransaction.captureBound,
-            queueTailTransaction.invalidInputs,
-            queueTailTransaction.mismatches,
-            queueTailTransaction.lastTransactionSequence,
-            queueTailTransaction.lastExecutionEpoch,
-            queueTailTransaction.lastSegmentId,
-            queueTailTransaction.lastAxisMask,
-            queueTailTransaction.lastCommittedFingerprint,
-            queueTailTransaction.authoritative ? 1ULL : 0ULL,
-            queueTailTransaction.shadowOnly ? 1ULL : 0ULL,
-            queueTailTransaction.cutoverAttempted ? 1ULL : 0ULL,
-            queueTailTransaction.runtimeInfluence ? 1ULL : 0ULL,
-            queueTailTransaction.ready ? 1ULL : 0ULL,
-            queueTailTransaction.snapshotCoherent ? 1ULL : 0ULL,
-            queueTailTransaction.accountingValid ? 1ULL : 0ULL
-        };
-        std::uint64_t queueTailTransactionChangeToken = 0ULL;
-        for (const std::uint64_t value : queueTailTransactionTokenFields)
-        {
-            queueTailTransactionChangeToken = FoldDiagnosticEventToken(
-                queueTailTransactionChangeToken,
-                value);
-        }
+        const std::uint64_t queueTailTransactionChangeToken =
+            BuildQueueTailTransactionChangeToken(queueTailTransaction);
 
-        MotionStopSettleSnapshot stopSettleSnapshot{};
-        MotionStopSettleCounters stopSettleCounters{};
-        motion.GetStopSettleEvidence(
-            stopSettleSnapshot,
-            stopSettleCounters);
+        CaptureMotionSettleDiagnosticFamily(motion, workspace);
 
-        MotionNCSettleSnapshot groupNCSettleSnapshot{};
-        MotionNCSettleCounters groupNCSettleCounters{};
+        MotionStopSettleSnapshot& stopSettleSnapshot = workspace.stopSettleSnapshot;
+        MotionStopSettleCounters& stopSettleCounters = workspace.stopSettleCounters;
+        MotionNCSettleSnapshot& groupNCSettleSnapshot = workspace.groupNCSettleSnapshot;
+        MotionNCSettleCounters& groupNCSettleCounters = workspace.groupNCSettleCounters;
         const bool groupNCSettleCoherent =
-            motion.TryGetNCSettleEvidence(
-                MotionNCSettleProfile::GROUP_COMPLETION,
-                groupNCSettleSnapshot,
-                groupNCSettleCounters);
+            workspace.groupNCSettleCoherent;
 
-        MotionNCSettleSnapshot feedHoldNCSettleSnapshot{};
-        MotionNCSettleCounters feedHoldNCSettleCounters{};
+        MotionNCSettleSnapshot& feedHoldNCSettleSnapshot = workspace.feedHoldNCSettleSnapshot;
+        MotionNCSettleCounters& feedHoldNCSettleCounters = workspace.feedHoldNCSettleCounters;
         const bool feedHoldNCSettleCoherent =
-            motion.TryGetNCSettleEvidence(
-                MotionNCSettleProfile::FEED_HOLD_GROUP,
-                feedHoldNCSettleSnapshot,
-                feedHoldNCSettleCounters);
+            workspace.feedHoldNCSettleCoherent;
 
-        MotionNCSettleSnapshot resetNCSettleSnapshot{};
-        MotionNCSettleCounters resetNCSettleCounters{};
+        MotionNCSettleSnapshot& resetNCSettleSnapshot = workspace.resetNCSettleSnapshot;
+        MotionNCSettleCounters& resetNCSettleCounters = workspace.resetNCSettleCounters;
         const bool resetNCSettleCoherent =
-            motion.TryGetNCSettleEvidence(
-                MotionNCSettleProfile::RESET_ALL,
-                resetNCSettleSnapshot,
-                resetNCSettleCounters);
+            workspace.resetNCSettleCoherent;
 
-        const MotionNCResetRebaseAck resetRebaseAck =
-            motion.GetNCResetRebaseAck();
-
-        const MotionOwnerLease ownerLease =
-            motion.GetMotionOwnerLease();
+        MotionNCResetRebaseAck& resetRebaseAck = workspace.resetRebaseAck;
+        MotionOwnerLease& ownerLease = workspace.ownerLease;
 
         const bool safetyPending =
             motion.HasPendingSafetyOrRecoveryRequests();
@@ -2326,142 +3016,74 @@ namespace HMI_Bridge
         const std::uint64_t feedbackFaulted =
             nc->GetFaultedMotionFeedbackCount();
 
-        NCBlockLifecycleSnapshot blockLifecycle{};
-        const bool hasBlockLifecycle =
-            nc->GetLastBlockLifecycleSnapshot(blockLifecycle);
-        const NCBlockLifecycleCounters blockCounters =
-            nc->GetBlockLifecycleCounters();
+        CaptureNCBlockDiagnosticFamily(*nc, workspace);
 
-        const NCBlockCompletionBoundarySnapshot completionBoundary =
-            nc->GetLastBlockCompletionBoundarySnapshot();
-        const NCBlockCompletionBoundaryCounters completionCounters =
-            nc->GetBlockCompletionBoundaryCounters();
+        NCBlockLifecycleSnapshot& blockLifecycle = workspace.blockLifecycle;
+        const bool hasBlockLifecycle = workspace.hasBlockLifecycle;
+        NCBlockLifecycleCounters& blockCounters = workspace.blockCounters;
+        NCBlockCompletionBoundarySnapshot& completionBoundary = workspace.completionBoundary;
+        NCBlockCompletionBoundaryCounters& completionCounters = workspace.completionCounters;
+        NCProgramEndGateSnapshot& programEndSnapshot = workspace.programEndSnapshot;
+        NCProgramEndGateCounters& programEndCounters = workspace.programEndCounters;
+        NCGMBlockTransactionSnapshot& gmTransactionSnapshot = workspace.gmTransactionSnapshot;
+        NCGMBlockTransactionCounters& gmTransactionCounters = workspace.gmTransactionCounters;
+        NCPreDispatchBarrierSnapshot& preDispatchBarrierSnapshot = workspace.preDispatchBarrierSnapshot;
+        NCPreDispatchBarrierCounters& preDispatchBarrierCounters = workspace.preDispatchBarrierCounters;
 
-        const NCProgramEndGateSnapshot programEndSnapshot =
-            nc->GetProgramEndGateSnapshot();
-        const NCProgramEndGateCounters programEndCounters =
-            nc->GetProgramEndGateCounters();
+        CaptureNCPreparedQueueDiagnosticFamily(*nc, workspace);
+        CaptureNCPreparedAdmissionDiagnosticFamily(*nc, workspace);
+        CaptureNCPreparedReadAheadDiagnosticFamily(*nc, workspace);
+        CaptureNCPreparedHoldDiagnosticFamily(*nc, workspace);
 
-        const NCGMBlockTransactionSnapshot gmTransactionSnapshot =
-            nc->GetGMBlockTransactionSnapshot();
-        const NCGMBlockTransactionCounters gmTransactionCounters =
-            nc->GetGMBlockTransactionCounters();
+        NCPreparedBlockQueueSnapshot& preparedQueueSnapshot = workspace.preparedQueueSnapshot;
+        NCPreparedBlockQueueCounters& preparedQueueCounters = workspace.preparedQueueCounters;
+        NCPreparedHeadEquivalenceSnapshot& preparedEquivalenceSnapshot = workspace.preparedEquivalenceSnapshot;
+        NCPreparedHeadEquivalenceCounters& preparedEquivalenceCounters = workspace.preparedEquivalenceCounters;
+        NCPreparedHeadCutoverSnapshot& preparedCutoverSnapshot = workspace.preparedCutoverSnapshot;
+        NCPreparedHeadCutoverCounters& preparedCutoverCounters = workspace.preparedCutoverCounters;
+        NCPreparedPreResolveAdmissionSnapshot& preparedPreResolveSnapshot = workspace.preparedPreResolveSnapshot;
+        NCPreparedPreResolveAdmissionCounters& preparedPreResolveCounters = workspace.preparedPreResolveCounters;
+        NCPreparedResolverBypassSnapshot& preparedResolverBypassSnapshot = workspace.preparedResolverBypassSnapshot;
+        NCPreparedResolverBypassCounters& preparedResolverBypassCounters = workspace.preparedResolverBypassCounters;
+        NCOrdinaryG00AdmissionSnapshot& ordinaryG00AdmissionSnapshot = workspace.ordinaryG00AdmissionSnapshot;
+        NCOrdinaryG00AdmissionCounters& ordinaryG00AdmissionCounters = workspace.ordinaryG00AdmissionCounters;
+        NCOrdinaryG00InflightRegistrySnapshot& ordinaryG00InflightRegistrySnapshot = workspace.ordinaryG00InflightRegistrySnapshot;
+        NCOrdinaryG00InflightRegistryCounters& ordinaryG00InflightRegistryCounters = workspace.ordinaryG00InflightRegistryCounters;
+        NCOrdinaryG00ReadAheadSnapshot& ordinaryG00ReadAheadSnapshot = workspace.ordinaryG00ReadAheadSnapshot;
+        NCOrdinaryG00ReadAheadCounters& ordinaryG00ReadAheadCounters = workspace.ordinaryG00ReadAheadCounters;
+        NCOrdinaryG00FeedHoldCohortSnapshot& ordinaryG00FeedHoldCohortSnapshot = workspace.ordinaryG00FeedHoldCohortSnapshot;
+        NCOrdinaryG00FeedHoldCohortCounters& ordinaryG00FeedHoldCohortCounters = workspace.ordinaryG00FeedHoldCohortCounters;
+        NCOrdinaryG00FeedHoldCohortCutoverSnapshot& ordinaryG00FeedHoldCohortCutoverSnapshot = workspace.ordinaryG00FeedHoldCohortCutoverSnapshot;
+        NCOrdinaryG00FeedHoldCohortCutoverCounters& ordinaryG00FeedHoldCohortCutoverCounters = workspace.ordinaryG00FeedHoldCohortCutoverCounters;
+        NCOrdinaryG00FeedHoldCohortRearmSnapshot& ordinaryG00FeedHoldCohortRearmSnapshot = workspace.ordinaryG00FeedHoldCohortRearmSnapshot;
+        NCOrdinaryG00FeedHoldCohortRearmCounters& ordinaryG00FeedHoldCohortRearmCounters = workspace.ordinaryG00FeedHoldCohortRearmCounters;
+        NCOrdinaryG00FeedHoldRearmCutoverSnapshot& ordinaryG00FeedHoldRearmCutoverSnapshot = workspace.ordinaryG00FeedHoldRearmCutoverSnapshot;
+        NCOrdinaryG00FeedHoldRearmCutoverCounters& ordinaryG00FeedHoldRearmCutoverCounters = workspace.ordinaryG00FeedHoldRearmCutoverCounters;
+        NCOrdinaryG00FeedHoldRollingRearmSnapshot& ordinaryG00FeedHoldRollingRearmSnapshot = workspace.ordinaryG00FeedHoldRollingRearmSnapshot;
+        NCOrdinaryG00FeedHoldRollingRearmCounters& ordinaryG00FeedHoldRollingRearmCounters = workspace.ordinaryG00FeedHoldRollingRearmCounters;
+        NCOrdinaryG00FeedHoldRollingCutoverSnapshot& ordinaryG00FeedHoldRollingCutoverSnapshot = workspace.ordinaryG00FeedHoldRollingCutoverSnapshot;
+        NCOrdinaryG00FeedHoldRollingCutoverCounters& ordinaryG00FeedHoldRollingCutoverCounters = workspace.ordinaryG00FeedHoldRollingCutoverCounters;
+        NCPreparedBlockEntrySnapshot& preparedQueueHead = workspace.preparedQueueHead;
+        NCPreparedBlockEntrySnapshot& preparedQueueTail = workspace.preparedQueueTail;
+        const bool hasPreparedQueueHead = workspace.hasPreparedQueueHead;
+        const bool hasPreparedQueueTail = workspace.hasPreparedQueueTail;
 
-        const NCPreDispatchBarrierSnapshot preDispatchBarrierSnapshot =
-            nc->GetPreDispatchBarrierSnapshot();
-        const NCPreDispatchBarrierCounters preDispatchBarrierCounters =
-            nc->GetPreDispatchBarrierCounters();
+        CaptureNCHoldSafetyDiagnosticFamily(*nc, workspace);
 
-        const NCPreparedBlockQueueSnapshot preparedQueueSnapshot =
-            nc->GetPreparedBlockQueueSnapshot();
-        const NCPreparedBlockQueueCounters preparedQueueCounters =
-            nc->GetPreparedBlockQueueCounters();
-        const NCPreparedHeadEquivalenceSnapshot preparedEquivalenceSnapshot =
-            nc->GetPreparedHeadEquivalenceSnapshot();
-        const NCPreparedHeadEquivalenceCounters preparedEquivalenceCounters =
-            nc->GetPreparedHeadEquivalenceCounters();
-        const NCPreparedHeadCutoverSnapshot preparedCutoverSnapshot =
-            nc->GetPreparedHeadCutoverSnapshot();
-        const NCPreparedHeadCutoverCounters preparedCutoverCounters =
-            nc->GetPreparedHeadCutoverCounters();
-        const NCPreparedPreResolveAdmissionSnapshot
-            preparedPreResolveSnapshot =
-            nc->GetPreparedPreResolveAdmissionSnapshot();
-        const NCPreparedPreResolveAdmissionCounters
-            preparedPreResolveCounters =
-            nc->GetPreparedPreResolveAdmissionCounters();
-        const NCPreparedResolverBypassSnapshot
-            preparedResolverBypassSnapshot =
-            nc->GetPreparedResolverBypassSnapshot();
-        const NCPreparedResolverBypassCounters
-            preparedResolverBypassCounters =
-            nc->GetPreparedResolverBypassCounters();
-        const NCOrdinaryG00AdmissionSnapshot
-            ordinaryG00AdmissionSnapshot =
-            nc->GetOrdinaryG00AdmissionSnapshot();
-        const NCOrdinaryG00AdmissionCounters
-            ordinaryG00AdmissionCounters =
-            nc->GetOrdinaryG00AdmissionCounters();
-        const NCOrdinaryG00InflightRegistrySnapshot
-            ordinaryG00InflightRegistrySnapshot =
-            nc->GetOrdinaryG00InflightRegistrySnapshot();
-        const NCOrdinaryG00InflightRegistryCounters
-            ordinaryG00InflightRegistryCounters =
-            nc->GetOrdinaryG00InflightRegistryCounters();
-        const NCOrdinaryG00ReadAheadSnapshot
-            ordinaryG00ReadAheadSnapshot =
-            nc->GetOrdinaryG00ReadAheadSnapshot();
-        const NCOrdinaryG00ReadAheadCounters
-            ordinaryG00ReadAheadCounters =
-            nc->GetOrdinaryG00ReadAheadCounters();
-        const NCOrdinaryG00FeedHoldCohortSnapshot
-            ordinaryG00FeedHoldCohortSnapshot =
-            nc->GetOrdinaryG00FeedHoldCohortSnapshot();
-        const NCOrdinaryG00FeedHoldCohortCounters
-            ordinaryG00FeedHoldCohortCounters =
-            nc->GetOrdinaryG00FeedHoldCohortCounters();
-        const NCOrdinaryG00FeedHoldCohortCutoverSnapshot
-            ordinaryG00FeedHoldCohortCutoverSnapshot =
-            nc->GetOrdinaryG00FeedHoldCohortCutoverSnapshot();
-        const NCOrdinaryG00FeedHoldCohortCutoverCounters
-            ordinaryG00FeedHoldCohortCutoverCounters =
-            nc->GetOrdinaryG00FeedHoldCohortCutoverCounters();
-        const NCOrdinaryG00FeedHoldCohortRearmSnapshot
-            ordinaryG00FeedHoldCohortRearmSnapshot =
-            nc->GetOrdinaryG00FeedHoldCohortRearmSnapshot();
-        const NCOrdinaryG00FeedHoldCohortRearmCounters
-            ordinaryG00FeedHoldCohortRearmCounters =
-            nc->GetOrdinaryG00FeedHoldCohortRearmCounters();
-        const NCOrdinaryG00FeedHoldRearmCutoverSnapshot
-            ordinaryG00FeedHoldRearmCutoverSnapshot =
-            nc->GetOrdinaryG00FeedHoldRearmCutoverSnapshot();
-        const NCOrdinaryG00FeedHoldRearmCutoverCounters
-            ordinaryG00FeedHoldRearmCutoverCounters =
-            nc->GetOrdinaryG00FeedHoldRearmCutoverCounters();
-        NCPreparedBlockEntrySnapshot preparedQueueHead{};
-        NCPreparedBlockEntrySnapshot preparedQueueTail{};
-        const bool hasPreparedQueueHead =
-            nc->GetPreparedBlockQueueEntry(0U, preparedQueueHead);
-        const bool hasPreparedQueueTail =
-            preparedQueueSnapshot.depth != 0U &&
-            nc->GetPreparedBlockQueueEntry(
-                static_cast<std::size_t>(preparedQueueSnapshot.depth - 1U),
-                preparedQueueTail);
-
-        const NCSingleBlockShadowSnapshot singleBlockShadowSnapshot =
-            nc->GetSingleBlockShadowSnapshot();
-        const NCSingleBlockShadowCounters singleBlockShadowCounters =
-            nc->GetSingleBlockShadowCounters();
-
-        const NCSingleBlockHoldGateSnapshot singleBlockGateSnapshot =
-            nc->GetSingleBlockHoldGateSnapshot();
-        const NCSingleBlockHoldGateCounters singleBlockGateCounters =
-            nc->GetSingleBlockHoldGateCounters();
-
-        const NCFeedHoldBoundarySnapshot feedHoldSnapshot =
-            nc->GetFeedHoldBoundarySnapshot();
-        const NCFeedHoldBoundaryCounters feedHoldCounters =
-            nc->GetFeedHoldBoundaryCounters();
-
-        const NCFeedHoldResumeGateSnapshot feedHoldGateSnapshot =
-            nc->GetFeedHoldResumeGateSnapshot();
-        const NCFeedHoldResumeGateCounters feedHoldGateCounters =
-            nc->GetFeedHoldResumeGateCounters();
-
-        const NCLifecycleInterruptionSnapshot lifecycleInterruptionSnapshot =
-            nc->GetLifecycleInterruptionSnapshot();
-        const NCLifecycleInterruptionCounters lifecycleInterruptionCounters =
-            nc->GetLifecycleInterruptionCounters();
-
-        const NCResetReleaseGateSnapshot resetReleaseGateSnapshot =
-            nc->GetResetReleaseGateSnapshot();
-        const NCResetReleaseGateCounters resetReleaseGateCounters =
-            nc->GetResetReleaseGateCounters();
-
-        const NCAlarmEmergencyStopSnapshot alarmEmergencyStopSnapshot =
-            nc->GetAlarmEmergencyStopSnapshot();
-        const NCAlarmEmergencyStopCounters alarmEmergencyStopCounters =
-            nc->GetAlarmEmergencyStopCounters();
+        NCSingleBlockShadowSnapshot& singleBlockShadowSnapshot = workspace.singleBlockShadowSnapshot;
+        NCSingleBlockShadowCounters& singleBlockShadowCounters = workspace.singleBlockShadowCounters;
+        NCSingleBlockHoldGateSnapshot& singleBlockGateSnapshot = workspace.singleBlockGateSnapshot;
+        NCSingleBlockHoldGateCounters& singleBlockGateCounters = workspace.singleBlockGateCounters;
+        NCFeedHoldBoundarySnapshot& feedHoldSnapshot = workspace.feedHoldSnapshot;
+        NCFeedHoldBoundaryCounters& feedHoldCounters = workspace.feedHoldCounters;
+        NCFeedHoldResumeGateSnapshot& feedHoldGateSnapshot = workspace.feedHoldGateSnapshot;
+        NCFeedHoldResumeGateCounters& feedHoldGateCounters = workspace.feedHoldGateCounters;
+        NCLifecycleInterruptionSnapshot& lifecycleInterruptionSnapshot = workspace.lifecycleInterruptionSnapshot;
+        NCLifecycleInterruptionCounters& lifecycleInterruptionCounters = workspace.lifecycleInterruptionCounters;
+        NCResetReleaseGateSnapshot& resetReleaseGateSnapshot = workspace.resetReleaseGateSnapshot;
+        NCResetReleaseGateCounters& resetReleaseGateCounters = workspace.resetReleaseGateCounters;
+        NCAlarmEmergencyStopSnapshot& alarmEmergencyStopSnapshot = workspace.alarmEmergencyStopSnapshot;
+        NCAlarmEmergencyStopCounters& alarmEmergencyStopCounters = workspace.alarmEmergencyStopCounters;
 
         const std::uint64_t lifecycleChangeToken =
             blockCounters.dispatched +
@@ -2588,295 +3210,10 @@ namespace HMI_Bridge
             preparedEquivalenceSnapshot.runtimeWaitCallbackActive
             ? (1ULL << 12U) : 0ULL;
 
-        const std::uint64_t preparedEquivalenceTokenFields[] =
-        {
-            preparedEquivalenceSnapshot.session,
-            preparedEquivalenceSnapshot.entrySequence,
-            static_cast<std::uint64_t>(preparedEquivalenceSnapshot.scope),
-            preparedEquivalenceSnapshot.cacheGeneration,
-            preparedEquivalenceSnapshot.frameId,
-            preparedEquivalenceSnapshot.executionEpoch,
-            preparedEquivalenceSnapshot.commitExecutionEpoch,
-            preparedEquivalenceSnapshot.programFlowGeneration,
-            preparedEquivalenceSnapshot.owner,
-            preparedEquivalenceSnapshot.panelMask,
-            preparedEquivalenceSnapshot.ownerGeneration,
-            preparedEquivalenceSnapshot.dispatchId,
-            preparedEquivalenceSnapshot.commitSequence,
-            preparedEquivalenceSnapshot.qualifiedSession,
-            static_cast<std::uint64_t>(preparedEquivalenceSnapshot.state),
-            static_cast<std::uint64_t>(
-                preparedEquivalenceSnapshot.lastInvalidation),
-            static_cast<std::uint64_t>(
-                preparedEquivalenceSnapshot.mismatchFlags),
-            preparedEquivalenceStateBits,
-            preparedEquivalenceSnapshot.sessionPeakDepth,
-            preparedEquivalenceCounters.candidates,
-            preparedEquivalenceCounters.matched,
-            preparedEquivalenceCounters.mismatched,
-            preparedEquivalenceCounters.invalidated,
-            preparedEquivalenceCounters.ineligible,
-            preparedEquivalenceCounters.lifetimePeakDepth,
-            preparedEquivalenceCounters.multiBlockObservations,
-            preparedEquivalenceCounters.queueMismatches,
-            preparedEquivalenceCounters.sourceMismatches,
-            preparedEquivalenceCounters.pcMismatches,
-            preparedEquivalenceCounters.lineMismatches,
-            preparedEquivalenceCounters.blockMismatches,
-            preparedEquivalenceCounters.planMismatches,
-            preparedEquivalenceCounters.classificationMismatches,
-            preparedEquivalenceCounters.drainMismatches,
-            preparedEquivalenceCounters.modalBeforeMismatches,
-            preparedEquivalenceCounters.modalAfterMismatches,
-            preparedEquivalenceCounters.lifecycleMismatches,
-            preparedEquivalenceCounters.staleTokens,
-            preparedEquivalenceCounters.resolveMismatches,
-            preparedEquivalenceCounters.upstreamMismatches,
-            preparedEquivalenceCounters.ledgerMismatches,
-            preparedEquivalenceCounters.bindIdentityMismatches,
-            preparedEquivalenceCounters.runtimeFailures,
-            preparedEquivalenceCounters.sessionTransitions,
-            preparedEquivalenceCounters.qualifiedSessions,
-            preparedEquivalenceCounters.wouldUse,
-            preparedEquivalenceCounters.useAttempts,
-            preparedEquivalenceCounters.cutoverAttempts,
-            preparedEquivalenceCounters.runtimeInfluence,
-            preparedResolverBypassSnapshot.publicationSequence,
-            static_cast<std::uint64_t>(
-                preparedResolverBypassSnapshot.decision),
-            preparedResolverBypassCounters.selected,
-            preparedResolverBypassCounters.proofVerified,
-            preparedResolverBypassCounters.qualificationCandidates,
-            preparedResolverBypassCounters.qualifiedPureModal,
-            preparedResolverBypassCounters.qualifiedG00P1,
-            preparedResolverBypassCounters.runtimeFailures,
-            preparedResolverBypassCounters.proofMismatches,
-            preparedResolverBypassCounters.revocations,
-            preparedResolverBypassCounters.runtimeInfluence,
-            preparedResolverBypassCounters.resolverBypasses,
-            preparedResolverBypassSnapshot.g00NoPQualifiedSession,
-            preparedResolverBypassSnapshot.commitExecutionEpoch,
-            preparedResolverBypassSnapshot.legacyDrainRequired ? 1ULL : 0ULL,
-            preparedResolverBypassSnapshot.legacyDrainSatisfied ? 1ULL : 0ULL,
-            preparedResolverBypassSnapshot.deferredForDrain ? 1ULL : 0ULL,
-            preparedResolverBypassSnapshot.callbackRequired ? 1ULL : 0ULL,
-            preparedResolverBypassSnapshot.callbackActiveAtCommit ? 1ULL : 0ULL,
-            preparedResolverBypassSnapshot.waitPhaseObserved ? 1ULL : 0ULL,
-            preparedResolverBypassSnapshot.callbackCompletionObserved
-                ? 1ULL : 0ULL,
-            preparedResolverBypassCounters.selectedPureModal,
-            preparedResolverBypassCounters.selectedG00P1,
-            preparedResolverBypassCounters.selectedG00NoP,
-            preparedResolverBypassCounters.proofVerifiedPureModal,
-            preparedResolverBypassCounters.proofVerifiedG00P1,
-            preparedResolverBypassCounters.proofVerifiedG00NoP,
-            preparedResolverBypassCounters.drainWaitSamples,
-            preparedResolverBypassCounters.callbackWaitSamples,
-            preparedResolverBypassCounters.callbackCompletions,
-            preparedResolverBypassCounters.ordinaryWaitPhases,
-            preparedResolverBypassCounters.qualifiedG00NoP,
-            ordinaryG00AdmissionSnapshot.publicationSequence,
-            static_cast<std::uint64_t>(
-                ordinaryG00AdmissionSnapshot.decision),
-            ordinaryG00AdmissionSnapshot.session,
-            ordinaryG00AdmissionSnapshot.entrySequence,
-            static_cast<std::uint64_t>(
-                ordinaryG00AdmissionSnapshot.owner),
-            ordinaryG00AdmissionSnapshot.ownerGeneration,
-            static_cast<std::uint64_t>(
-                ordinaryG00AdmissionSnapshot.panelMask),
-            ordinaryG00AdmissionSnapshot.dispatchId,
-            ordinaryG00AdmissionSnapshot.commitSequence,
-            ordinaryG00AdmissionSnapshot.busySamples,
-            ordinaryG00AdmissionSnapshot.blockerMask,
-            ordinaryG00AdmissionSnapshot.pending ? 1ULL : 0ULL,
-            ordinaryG00AdmissionSnapshot.permanentLockout ? 1ULL : 0ULL,
-            ordinaryG00AdmissionSnapshot.accountingValid ? 1ULL : 0ULL,
-            ordinaryG00AdmissionSnapshot.legacyCallbackCompleted ? 1ULL : 0ULL,
-            ordinaryG00AdmissionSnapshot.legacyUpstreamProofVerified
-                ? 1ULL : 0ULL,
-            ordinaryG00AdmissionCounters.uniqueEvaluations,
-            ordinaryG00AdmissionCounters.warmup,
-            ordinaryG00AdmissionCounters.candidates,
-            ordinaryG00AdmissionCounters.initialDrained,
-            ordinaryG00AdmissionCounters.initialBusy,
-            ordinaryG00AdmissionCounters.busySamples,
-            ordinaryG00AdmissionCounters.legacySelections,
-            ordinaryG00AdmissionCounters.legacyCommitBound,
-            ordinaryG00AdmissionCounters.callbackCompleted,
-            ordinaryG00AdmissionCounters.legacyCompleted,
-            ordinaryG00AdmissionCounters.rejected,
-            ordinaryG00AdmissionCounters.mismatches,
-            ordinaryG00AdmissionCounters.revocations,
-            ordinaryG00AdmissionCounters.runtimeInfluence,
-            ordinaryG00AdmissionCounters.resolverBypasses,
-            ordinaryG00AdmissionCounters.cutoverAttempts,
-            ordinaryG00AdmissionCounters.inflightRegistryBound,
-            ordinaryG00AdmissionSnapshot.inflightRegistrySequence,
-            ordinaryG00AdmissionSnapshot.inflightExecutionEpoch,
-            ordinaryG00AdmissionSnapshot.inflightSegmentId,
-            ordinaryG00AdmissionSnapshot.inflightRegistryProven
-                ? 1ULL : 0ULL,
-            ordinaryG00InflightRegistrySnapshot.publicationSequence,
-            ordinaryG00InflightRegistrySnapshot.lastRegistrySequence,
-            ordinaryG00InflightRegistrySnapshot.currentSession,
-            ordinaryG00InflightRegistrySnapshot.activeEntries,
-            ordinaryG00InflightRegistrySnapshot.revokedPendingEntries,
-            ordinaryG00InflightRegistrySnapshot.permanentLockout
-                ? 1ULL : 0ULL,
-            ordinaryG00InflightRegistrySnapshot.accountingValid
-                ? 1ULL : 0ULL,
-            ordinaryG00InflightRegistryCounters.registrationAttempts,
-            ordinaryG00InflightRegistryCounters.registered,
-            ordinaryG00InflightRegistryCounters.registrationRejected,
-            ordinaryG00InflightRegistryCounters.capacityOverflow,
-            ordinaryG00InflightRegistryCounters.terminal,
-            ordinaryG00InflightRegistryCounters.completed,
-            ordinaryG00InflightRegistryCounters.rejected,
-            ordinaryG00InflightRegistryCounters.cancelled,
-            ordinaryG00InflightRegistryCounters.aborted,
-            ordinaryG00InflightRegistryCounters.faulted,
-            ordinaryG00InflightRegistryCounters.feedbackSequenceGaps,
-            ordinaryG00InflightRegistryCounters.ledgerOrphans,
-            ordinaryG00InflightRegistryCounters.identityConflicts,
-            ordinaryG00InflightRegistryCounters.ownerMismatches,
-            ordinaryG00InflightRegistryCounters.duplicateTerminal,
-            ordinaryG00InflightRegistryCounters.terminalConflict,
-            ordinaryG00InflightRegistryCounters.entriesRevoked,
-            ordinaryG00InflightRegistryCounters.revokedTerminals,
-            ordinaryG00InflightRegistryCounters.runtimeInfluence,
-            ordinaryG00InflightRegistryCounters.motionWrites,
-            ordinaryG00InflightRegistryCounters.readAheadRegistered,
-            ordinaryG00ReadAheadSnapshot.publicationSequence,
-            static_cast<std::uint64_t>(
-                ordinaryG00ReadAheadSnapshot.decision),
-            ordinaryG00ReadAheadSnapshot.session,
-            ordinaryG00ReadAheadSnapshot.warmupSession,
-            ordinaryG00ReadAheadSnapshot.dispatchId,
-            ordinaryG00ReadAheadSnapshot.commitSequence,
-            ordinaryG00ReadAheadSnapshot.identity.epoch,
-            ordinaryG00ReadAheadSnapshot.identity.segmentId,
-            static_cast<std::uint64_t>(
-                ordinaryG00ReadAheadSnapshot.chainSourcePC + 1),
-            ordinaryG00ReadAheadSnapshot.contiguousChain ? 1ULL : 0ULL,
-            ordinaryG00ReadAheadSnapshot.pending ? 1ULL : 0ULL,
-            ordinaryG00ReadAheadSnapshot.permanentLockout ? 1ULL : 0ULL,
-            ordinaryG00ReadAheadSnapshot.registryReady ? 1ULL : 0ULL,
-            ordinaryG00ReadAheadSnapshot.registryHealthy ? 1ULL : 0ULL,
-            ordinaryG00ReadAheadSnapshot.registryHealthFenced
-                ? 1ULL : 0ULL,
-            ordinaryG00ReadAheadSnapshot.registryHealthLockout
-                ? 1ULL : 0ULL,
-            ordinaryG00ReadAheadSnapshot.accountingValid ? 1ULL : 0ULL,
-            ordinaryG00ReadAheadCounters.selected,
-            ordinaryG00ReadAheadCounters.committed,
-            ordinaryG00ReadAheadCounters.capacityWaits,
-            ordinaryG00ReadAheadCounters.registryHealthFences,
-            ordinaryG00ReadAheadCounters.registryHealthLockouts,
-            ordinaryG00ReadAheadCounters.runtimeFailures,
-            ordinaryG00ReadAheadCounters.proofMismatches,
-            ordinaryG00ReadAheadCounters.runtimeInfluence,
-            ordinaryG00FeedHoldCohortSnapshot.publicationSequence,
-            ordinaryG00FeedHoldCohortSnapshot.cohortSequence,
-            ordinaryG00FeedHoldCohortSnapshot.boundarySequence,
-            ordinaryG00FeedHoldCohortSnapshot.gateSequence,
-            static_cast<std::uint64_t>(
-                ordinaryG00FeedHoldCohortSnapshot.phase),
-            static_cast<std::uint64_t>(
-                ordinaryG00FeedHoldCohortSnapshot.decision),
-            ordinaryG00FeedHoldCohortSnapshot.terminalCount,
-            ordinaryG00FeedHoldCohortSnapshot.failed ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldCohortSnapshot.accountingValid ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldCohortCounters.cohortsCaptured,
-            ordinaryG00FeedHoldCohortCounters.terminalCohorts,
-            ordinaryG00FeedHoldCohortCounters.failures,
-            ordinaryG00FeedHoldCohortCutoverSnapshot.publicationSequence,
-            ordinaryG00FeedHoldCohortCutoverSnapshot.cohortSequence,
-            static_cast<std::uint64_t>(
-                ordinaryG00FeedHoldCohortCutoverSnapshot.phase),
-            static_cast<std::uint64_t>(
-                ordinaryG00FeedHoldCohortCutoverSnapshot.decision),
-            ordinaryG00FeedHoldCohortCutoverSnapshot.terminalCount,
-            ordinaryG00FeedHoldCohortCutoverSnapshot.registryActiveEntries,
-            ordinaryG00FeedHoldCohortCutoverSnapshot.waiting ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldCohortCutoverSnapshot.released ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldCohortCutoverSnapshot.fallbackLegacy
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldCohortCutoverSnapshot.accountingValid
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldCohortCutoverCounters.cohortsBound,
-            ordinaryG00FeedHoldCohortCutoverCounters.waitFirstTerminal,
-            ordinaryG00FeedHoldCohortCutoverCounters.waitSecondTerminal,
-            ordinaryG00FeedHoldCohortCutoverCounters.releases,
-            ordinaryG00FeedHoldCohortCutoverCounters.allowReadAhead,
-            ordinaryG00FeedHoldCohortCutoverCounters.fallbackLegacy,
-            ordinaryG00FeedHoldCohortCutoverCounters.runtimeInfluence,
-            ordinaryG00FeedHoldCohortRearmSnapshot.publicationSequence,
-            static_cast<std::uint64_t>(
-                ordinaryG00FeedHoldCohortRearmSnapshot.phase),
-            static_cast<std::uint64_t>(
-                ordinaryG00FeedHoldCohortRearmSnapshot.decision),
-            ordinaryG00FeedHoldCohortRearmSnapshot.session,
-            ordinaryG00FeedHoldCohortRearmSnapshot.generationCount,
-            ordinaryG00FeedHoldCohortRearmSnapshot.releaseCount,
-            ordinaryG00FeedHoldCohortRearmSnapshot.rearmProven ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldCohortRearmSnapshot.failed ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldCohortRearmSnapshot.accountingValid
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldCohortRearmCounters.generationsCaptured,
-            ordinaryG00FeedHoldCohortRearmCounters.firstReleased,
-            ordinaryG00FeedHoldCohortRearmCounters.secondReleased,
-            ordinaryG00FeedHoldCohortRearmCounters.earlyRearm,
-            ordinaryG00FeedHoldCohortRearmCounters.sessionMismatches,
-            ordinaryG00FeedHoldCohortRearmCounters.memberIdentityReuse,
-            ordinaryG00FeedHoldCohortRearmCounters.proofMismatches,
-            ordinaryG00FeedHoldCohortRearmCounters.sessionResets,
-            ordinaryG00FeedHoldCohortRearmCounters.failures,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.publicationSequence,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.
-                rearmPublicationSequence,
-            static_cast<std::uint64_t>(
-                ordinaryG00FeedHoldRearmCutoverSnapshot.phase),
-            static_cast<std::uint64_t>(
-                ordinaryG00FeedHoldRearmCutoverSnapshot.decision),
-            ordinaryG00FeedHoldRearmCutoverSnapshot.session,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.cohortSequence,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.boundarySequence,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.gateSequence,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.generationCount,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.releaseCount,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.bound ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.waiting ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.released ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.fallbackLegacy
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.sessionLockout
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverSnapshot.accountingValid
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverCounters.secondGenerationsBound,
-            ordinaryG00FeedHoldRearmCutoverCounters.waitK74Release != 0ULL
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverCounters.waitK75RearmProof != 0ULL
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverCounters.releases,
-            ordinaryG00FeedHoldRearmCutoverCounters.allowReadAhead != 0ULL
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverCounters.fallbackLegacy != 0ULL
-                ? 1ULL : 0ULL,
-            ordinaryG00FeedHoldRearmCutoverCounters.sessionResets,
-            ordinaryG00FeedHoldRearmCutoverCounters.failures,
-            ordinaryG00FeedHoldRearmCutoverCounters.runtimeInfluence != 0ULL
-                ? 1ULL : 0ULL
-        };
-        std::uint64_t preparedEquivalenceChangeToken = 0ULL;
-        for (const std::uint64_t value :
-        preparedEquivalenceTokenFields)
-        {
-            preparedEquivalenceChangeToken = FoldDiagnosticEventToken(
-                preparedEquivalenceChangeToken,
-                value);
-        }
+        const std::uint64_t preparedEquivalenceChangeToken =
+            BuildPreparedDiagnosticsChangeToken(
+                workspace,
+                preparedEquivalenceStateBits);
 
         const std::uint64_t singleBlockShadowChangeToken =
             singleBlockShadowSnapshot.sequence +
@@ -3314,6 +3651,8 @@ namespace HMI_Bridge
         static std::uint64_t previousPreDispatchBarrierChangeToken = 0ULL;
         static std::uint64_t previousPreparedQueueChangeToken = 0ULL;
         static std::uint64_t previousPreparedEquivalenceChangeToken = 0ULL;
+        static std::uint64_t
+            previousOrdinaryG00FeedHoldRollingCutoverPublication = 0ULL;
         static std::uint64_t previousSingleBlockShadowChangeToken = 0ULL;
         static std::uint64_t previousSingleBlockGateChangeToken = 0ULL;
         static std::uint64_t previousFeedHoldChangeToken = 0ULL;
@@ -3347,6 +3686,20 @@ namespace HMI_Bridge
         const bool programEndChanged =
             startupSamples != 0U &&
             programEndChangeToken != previousProgramEndChangeToken;
+
+        const bool ordinaryG00FeedHoldRollingCutoverChanged =
+            startupSamples != 0U &&
+            ordinaryG00FeedHoldRollingCutoverSnapshot.publicationSequence !=
+            previousOrdinaryG00FeedHoldRollingCutoverPublication;
+
+        // K.7.8 is intentionally event-gated.  The shared diagnostic block
+        // also prints once per second while Motion transport is busy; without
+        // this local gate, a long F100 acceptance run would add two K.7.8
+        // lines every second.  Always publish the final counters at P_END.
+        const bool shouldPrintK78 =
+            startupSamples == 0U ||
+            ordinaryG00FeedHoldRollingCutoverChanged ||
+            programEndChanged;
 
         const bool gmTransactionChanged =
             startupSamples != 0U &&
@@ -3452,3715 +3805,4374 @@ namespace HMI_Bridge
 
         if (shouldPrint)
         {
-            RtPrintf(
-                "[NC02J64-LAG] Existing:%02X Ready:%02X Aligned:%02X "
-                "Armed:%02X Pending:%02X Blocked:%02X Stable:%u/%u "
-                "Align:%llu Arm:%llu Reset:%llu Early:%llu All:%u\n",
-                static_cast<unsigned int>(
-                    startupLagArming.existingAxisMask),
-                static_cast<unsigned int>(
-                    startupLagArming.feedbackReadyAxisMask),
-                static_cast<unsigned int>(
-                    startupLagArming.positionAlignedAxisMask),
-                static_cast<unsigned int>(
-                    startupLagArming.lagArmedAxisMask),
-                static_cast<unsigned int>(
-                    startupLagArming.pendingAxisMask),
-                static_cast<unsigned int>(
-                    startupLagArming.prematureMotionBlockedAxisMask),
-                static_cast<unsigned int>(
-                    startupLagArming.minimumStableSampleCount),
-                static_cast<unsigned int>(
-                    startupLagArming.stableSamplesRequired),
-                static_cast<unsigned long long>(
-                    startupLagArming.alignmentEvents),
-                static_cast<unsigned long long>(
-                    startupLagArming.armingTransitions),
-                static_cast<unsigned long long>(
-                    startupLagArming.readinessResets),
-                static_cast<unsigned long long>(
-                    startupLagArming.prematureMotionBlocks),
-                startupLagArming.allExistingAxesArmed ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K21-P1] MapStop:%llu Retire:%llu RetireFail:%llu "
-                "Orphan:%llu Invalid:%llu AlarmReq:%llu AlarmEpoch:%u "
-                "Pending:%u "
-                "Prev:%02X Next:%02X LastAx:%d Pass:%u\n",
-                static_cast<unsigned long long>(
-                    p1HandoverSafety.mappingBoundaryStops),
-                static_cast<unsigned long long>(
-                    p1HandoverSafety.droppedAxisRetirements),
-                static_cast<unsigned long long>(
-                    p1HandoverSafety.droppedAxisRetirementFailures),
-                static_cast<unsigned long long>(
-                    p1HandoverSafety.orphanAxisContainments),
-                static_cast<unsigned long long>(
-                    p1HandoverSafety.invalidProducerRejects),
-                static_cast<unsigned long long>(
-                    p1HandoverSafety.mappingIntegrityAlarmRequests),
-                static_cast<unsigned int>(
-                    p1HandoverSafety.
-                    lastMappingIntegrityAlarmExecutionEpoch),
-                p1HandoverSafety.mappingIntegrityAlarmPending ? 1U : 0U,
-                static_cast<unsigned int>(
-                    p1HandoverSafety.lastPreviousAxisMask),
-                static_cast<unsigned int>(
-                    p1HandoverSafety.lastNextAxisMask),
-                p1HandoverSafety.lastOrphanAxisIndex,
-                (p1HandoverSafety.droppedAxisRetirementFailures == 0ULL &&
-                    p1HandoverSafety.orphanAxisContainments == 0ULL &&
-                    p1HandoverSafety.invalidProducerRejects == 0ULL &&
-                    !p1HandoverSafety.mappingIntegrityAlarmPending)
-                ? 1U
-                : 0U);
-
-            const bool lifecycleCommitBalanced =
-                lifecycleCommit.acquired ==
-                lifecycleCommit.released +
-                (lifecycleCommit.reservationActive ? 1ULL : 0ULL);
-            RtPrintf(
-                "[NC02K22-CAS] Try:%llu Acq:%llu Block:%llu Lost:%llu "
-                "Rel:%llu RelFail:%llu PubWait:%llu Active:%u Pending:%u "
-                "Epoch:%u Pass:%u\n",
-                static_cast<unsigned long long>(lifecycleCommit.attempts),
-                static_cast<unsigned long long>(lifecycleCommit.acquired),
-                static_cast<unsigned long long>(
-                    lifecycleCommit.blockedByLifecycle),
-                static_cast<unsigned long long>(
-                    lifecycleCommit.compareExchangeLost),
-                static_cast<unsigned long long>(lifecycleCommit.released),
-                static_cast<unsigned long long>(
-                    lifecycleCommit.releaseFailures),
-                static_cast<unsigned long long>(
-                    lifecycleCommit.publisherWaits),
-                lifecycleCommit.reservationActive ? 1U : 0U,
-                lifecycleCommit.executionEpochPending ? 1U : 0U,
-                static_cast<unsigned int>(
-                    lifecycleCommit.currentExecutionEpoch),
-                (lifecycleCommitBalanced &&
-                    lifecycleCommit.releaseFailures == 0ULL)
-                ? 1U
-                : 0U);
-
-            RtPrintf(
-                "[NC01F-RT] NC:%d Mode:%d Owner:%s(%u) Gen:%u "
-                "Safety:%u AxisQ:%llu CmdIn:%llu Replay:%llu "
-                "FbQ:%llu Notice:%llu\n",
-                static_cast<int>(nc->GetState()),
-                static_cast<int>(nc->GetMode()),
-                MotionOwnerToDiagnosticName(ownerLease.owner),
-                static_cast<unsigned int>(ownerLease.owner),
-                static_cast<unsigned int>(ownerLease.generation),
-                safetyPending ? 1U : 0U,
-                static_cast<unsigned long long>(axisCommandDepth),
-                static_cast<unsigned long long>(commandIngressDepth),
-                static_cast<unsigned long long>(commandReplayDepth),
-                static_cast<unsigned long long>(feedbackDepth),
-                static_cast<unsigned long long>(feedbackNoticeDepth));
-
-            RtPrintf(
-                "[NC02K6-PATH] Payload:%u Ready:%u Shadow:%u Apply:%u "
-                "Influence:%u Cutover:%u Coh:%u/%u Acct:%u\n",
-                commandPathModeTransport.commandLocalPayloadPresent ? 1U : 0U,
-                commandPathModeTransport.transportReady ? 1U : 0U,
-                commandPathModeTransport.shadowOnly ? 1U : 0U,
-                commandPathModeTransport.consumerAuthority ? 1U : 0U,
-                commandPathModeTransport.runtimeInfluence ? 1U : 0U,
-                commandPathModeTransport.cutoverAttempted ? 1U : 0U,
-                commandPathModeTransport.producerSnapshotCoherent ? 1U : 0U,
-                commandPathModeTransport.consumerSnapshotCoherent ? 1U : 0U,
-                commandPathModeTransport.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K6-CNT] Submit:%llu Accept:%llu Reject:%llu "
-                "PE:%llu PC:%llu PU:%llu PI:%llu Observe:%llu "
-                "Ingress:%llu Replay:%llu CE:%llu CC:%llu CU:%llu CI:%llu "
-                "Match:%llu Mis:%llu Driver:%llu PF:%016llX CF:%016llX\n",
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.producerAccepted +
-                    commandPathModeTransport.producerRejected),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.producerAccepted),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.producerRejected),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.producerExactStop),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.producerContinuous),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.producerUnspecified),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.producerInvalid),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.consumerCommitted),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.consumerIngressCommitted),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.consumerReplayCommitted),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.consumerExactStop),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.consumerContinuous),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.consumerUnspecified),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.consumerInvalid),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.legacyModeMatches),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.legacyModeMismatches),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.driverOverrideObservations),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.producerFingerprint),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.consumerFingerprint));
-
-            RtPrintf(
-                "[NC02K61-AUTH] Try:%llu Apply:%llu Exact:%llu Cont:%llu "
-                "Legacy:%llu Replay:%llu DriverBlock:%llu Invalid:%llu "
-                "Acct:%u\n",
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.authorityAttempts),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.authorityApplied),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.authorityExactStop),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.authorityContinuous),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.authorityLegacyFallbacks),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.authorityReplayBypasses),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.authorityDriverBlocks),
-                static_cast<unsigned long long>(
-                    commandPathModeTransport.authorityInvalidRejects),
-                commandPathModeTransport.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K62-TAIL] Try:%llu Accept:%llu Reject:%llu "
-                "Commit:%llu Preserve:%llu MCS:%llu Pulse:%llu "
-                "Ovr:%llu Exact:%llu Bound:%llu Invalid:%llu Mis:%llu "
-                "Ready:%u Coh:%u Acct:%u\n",
-                static_cast<unsigned long long>(
-                    queueTailTransaction.attempts),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.commandAccepted),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.commandRejected),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.committed),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.rejectPreserved),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.commandedMCSCommitted),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.lastQueuedPulseCommitted),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.rapidOverrideCommitted),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.endpointExact),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.captureBound),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.invalidInputs),
-                static_cast<unsigned long long>(
-                    queueTailTransaction.mismatches),
-                queueTailTransaction.ready ? 1U : 0U,
-                queueTailTransaction.snapshotCoherent ? 1U : 0U,
-                queueTailTransaction.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC01F-CNT] AxisQFull:%llu AxisResOv:%llu "
-                "OwnerReject:%llu Stale:%llu CmdFull:%llu ReplayOv:%llu "
-                "FbOv:%llu NoticeOv:%llu FbProc:%llu FbGap:%llu "
-                "FbAcc:%llu FbStart:%llu FbDone:%llu FbReject:%llu "
-                "FbCancel:%llu FbAbort:%llu FbFault:%llu\n",
-                static_cast<unsigned long long>(axisQueueFull),
-                static_cast<unsigned long long>(axisResultOverflow),
-                static_cast<unsigned long long>(ownerConflictReject),
-                static_cast<unsigned long long>(staleDiscard),
-                static_cast<unsigned long long>(commandQueueFull),
-                static_cast<unsigned long long>(replayOverflow),
-                static_cast<unsigned long long>(feedbackOverflow),
-                static_cast<unsigned long long>(feedbackNoticeOverflow),
-                static_cast<unsigned long long>(feedbackProcessed),
-                static_cast<unsigned long long>(feedbackSequenceGap),
-                static_cast<unsigned long long>(feedbackAccepted),
-                static_cast<unsigned long long>(feedbackStarted),
-                static_cast<unsigned long long>(feedbackCompleted),
-                static_cast<unsigned long long>(feedbackRejected),
-                static_cast<unsigned long long>(feedbackCancelled),
-                static_cast<unsigned long long>(feedbackAborted),
-                static_cast<unsigned long long>(feedbackFaulted));
-
-            RtPrintf(
-                "[NC02D-BLK] D:%llu Scope:%u Cache:%llu Frame:%llu "
-                "PC:%d Line:%d State:%s Commit:%u Seg:%u "
-                "Acc:%u Start:%u Done:%u Term:%u Fail:%u Ov:%u\n",
-                static_cast<unsigned long long>(
-                    hasBlockLifecycle ? blockLifecycle.dispatchId : 0ULL),
-                static_cast<unsigned int>(
-                    hasBlockLifecycle ? blockLifecycle.programTarget.scope :
-                    NCProgramScope::NONE),
-                static_cast<unsigned long long>(
-                    hasBlockLifecycle ? blockLifecycle.programTarget.cacheGeneration : 0ULL),
-                static_cast<unsigned long long>(
-                    hasBlockLifecycle ? blockLifecycle.programTarget.frameId : 0ULL),
-                hasBlockLifecycle ? blockLifecycle.programTarget.sourcePC : -1,
-                hasBlockLifecycle ? blockLifecycle.sourceLineNumber : 0,
-                NCBlockLifecycleStateToDiagnosticName(
-                    hasBlockLifecycle ? blockLifecycle.state :
-                    NCBlockLifecycleState::NONE),
-                hasBlockLifecycle && blockLifecycle.programCommitted ? 1U : 0U,
-                hasBlockLifecycle ?
-                static_cast<unsigned int>(blockLifecycle.motionSegmentCount) : 0U,
-                hasBlockLifecycle ?
-                static_cast<unsigned int>(blockLifecycle.motionAcceptedCount) : 0U,
-                hasBlockLifecycle ?
-                static_cast<unsigned int>(blockLifecycle.motionStartedCount) : 0U,
-                hasBlockLifecycle ?
-                static_cast<unsigned int>(blockLifecycle.motionCompletedCount) : 0U,
-                hasBlockLifecycle ?
-                static_cast<unsigned int>(blockLifecycle.motionTerminalCount) : 0U,
-                hasBlockLifecycle ?
-                static_cast<unsigned int>(blockLifecycle.motionFailedCount) : 0U,
-                hasBlockLifecycle && blockLifecycle.motionCaptureOverflow ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02D-CNT] Dispatch:%llu Commit:%llu ProgOnly:%llu "
-                "MotionBlk:%llu Seg:%llu PAcc:%llu PRej:%llu "
-                "FAcc:%llu FStart:%llu FDone:%llu FRej:%llu "
-                "FCancel:%llu FAbort:%llu FFault:%llu "
-                "BlkDone:%llu BlkFail:%llu NCFail:%llu "
-                "CaptureOv:%llu Orphan:%llu DupTerm:%llu Conflict:%llu "
-                "Active:%u\n",
-                static_cast<unsigned long long>(blockCounters.dispatched),
-                static_cast<unsigned long long>(blockCounters.programCommitted),
-                static_cast<unsigned long long>(blockCounters.programOnlyCompleted),
-                static_cast<unsigned long long>(blockCounters.motionBlocks),
-                static_cast<unsigned long long>(blockCounters.motionSegmentsBound),
-                static_cast<unsigned long long>(blockCounters.producerAccepted),
-                static_cast<unsigned long long>(blockCounters.producerRejected),
-                static_cast<unsigned long long>(blockCounters.feedbackAccepted),
-                static_cast<unsigned long long>(blockCounters.feedbackStarted),
-                static_cast<unsigned long long>(blockCounters.feedbackCompleted),
-                static_cast<unsigned long long>(blockCounters.feedbackRejected),
-                static_cast<unsigned long long>(blockCounters.feedbackCancelled),
-                static_cast<unsigned long long>(blockCounters.feedbackAborted),
-                static_cast<unsigned long long>(blockCounters.feedbackFaulted),
-                static_cast<unsigned long long>(blockCounters.blockCompleted),
-                static_cast<unsigned long long>(blockCounters.blockFailed),
-                static_cast<unsigned long long>(blockCounters.ncDispatchFailed),
-                static_cast<unsigned long long>(blockCounters.motionCaptureOverflow),
-                static_cast<unsigned long long>(blockCounters.orphanFeedback),
-                static_cast<unsigned long long>(blockCounters.duplicateTerminalFeedback),
-                static_cast<unsigned long long>(blockCounters.terminalFeedbackConflict),
-                static_cast<unsigned int>(blockCounters.activeBlocks));
-
-            RtPrintf(
-                "[NC02E-BND] D:%llu Kind:%s Legacy:%s Ledger:%s "
-                "Compare:%s State:%s Seg:%u Done:%u Term:%u Fail:%u\n",
-                static_cast<unsigned long long>(completionBoundary.dispatchId),
-                NCBlockWaitKindToDiagnosticName(completionBoundary.waitKind),
-                completionBoundary.legacyReady ? "READY" : "WAIT",
-                NCBlockMotionBoundaryStateToDiagnosticName(
-                    completionBoundary.ledgerBoundary),
-                NCBlockCompletionComparisonToDiagnosticName(
-                    completionBoundary.comparison),
-                NCBlockLifecycleStateToDiagnosticName(
-                    completionBoundary.lifecycleState),
-                static_cast<unsigned int>(completionBoundary.motionSegmentCount),
-                static_cast<unsigned int>(completionBoundary.motionCompletedCount),
-                static_cast<unsigned int>(completionBoundary.motionTerminalCount),
-                static_cast<unsigned int>(completionBoundary.motionFailedCount));
-
-            RtPrintf(
-                "[NC02E-CNT] Bind:%llu Motion:%llu Aux:%llu Flow:%llu "
-                "Obs:%llu Release:%llu Agree:%llu LedgerEarly:%llu "
-                "LegacyEarly:%llu LedgerFail:%llu ReleaseFail:%llu "
-                "Overflow:%llu Missing:%llu NonMotion:%llu Supersede:%llu\n",
-                static_cast<unsigned long long>(completionCounters.bindings),
-                static_cast<unsigned long long>(completionCounters.motionBindings),
-                static_cast<unsigned long long>(completionCounters.auxiliaryBindings),
-                static_cast<unsigned long long>(completionCounters.programFlowBindings),
-                static_cast<unsigned long long>(completionCounters.observations),
-                static_cast<unsigned long long>(completionCounters.releaseChecks),
-                static_cast<unsigned long long>(completionCounters.agreeRelease),
-                static_cast<unsigned long long>(completionCounters.ledgerReadyBeforeLegacy),
-                static_cast<unsigned long long>(completionCounters.legacyEarlyRelease),
-                static_cast<unsigned long long>(completionCounters.ledgerFailureObserved),
-                static_cast<unsigned long long>(completionCounters.releaseOnLedgerFailure),
-                static_cast<unsigned long long>(completionCounters.trackingOverflow),
-                static_cast<unsigned long long>(completionCounters.missingLifecycle),
-                static_cast<unsigned long long>(completionCounters.nonMotionWait),
-                static_cast<unsigned long long>(completionCounters.supersededBindings));
-
-            RtPrintf(
-                "[NC02F-GATE] D:%llu Eligible:%u Applied:%u Legacy:%s "
-                "Ledger:%s Decision:%s Effective:%s FailClosed:%u\n",
-                static_cast<unsigned long long>(completionBoundary.dispatchId),
-                completionBoundary.guardEligible ? 1U : 0U,
-                completionBoundary.guardApplied ? 1U : 0U,
-                completionBoundary.legacyReady ? "READY" : "WAIT",
-                NCBlockMotionBoundaryStateToDiagnosticName(
-                    completionBoundary.ledgerBoundary),
-                NCBlockCompletionGateDecisionToDiagnosticName(
-                    completionBoundary.gateDecision),
-                completionBoundary.effectiveReady ? "READY" : "WAIT",
-                completionBoundary.failClosed ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02F-CNT] Eval:%llu Eligible:%llu Bypass:%llu "
-                "Wait:%llu Release:%llu BlockEarly:%llu BlockFail:%llu "
-                "BlockOv:%llu BlockMissing:%llu BlockNotTracked:%llu "
-                "FailClosed:%llu\n",
-                static_cast<unsigned long long>(completionCounters.guardEvaluations),
-                static_cast<unsigned long long>(completionCounters.guardEligibleSamples),
-                static_cast<unsigned long long>(completionCounters.guardBypassSamples),
-                static_cast<unsigned long long>(completionCounters.guardWaitSamples),
-                static_cast<unsigned long long>(completionCounters.dualKeyRelease),
-                static_cast<unsigned long long>(completionCounters.blockedLegacyEarly),
-                static_cast<unsigned long long>(completionCounters.blockedLedgerFailure),
-                static_cast<unsigned long long>(completionCounters.blockedTrackingOverflow),
-                static_cast<unsigned long long>(completionCounters.blockedMissingLifecycle),
-                static_cast<unsigned long long>(completionCounters.blockedNotTracked),
-                static_cast<unsigned long long>(completionCounters.failClosedBindings));
-            RtPrintf(
-                "[NC02G-END] Run:%llu Req:%llu Cause:%s Phase:%s Decision:%s "
-                "Scope:%u Cache:%llu RunEpoch:%u ReqEpoch:%u "
-                "RunOwner:%u/%u ReqOwner:%u/%u CurOwner:%u/%u "
-                "PC:%d Line:%d D:%llu Pending:%u Ready:%u Fail:%u\n",
-                static_cast<unsigned long long>(programEndSnapshot.run.runId),
-                static_cast<unsigned long long>(programEndSnapshot.requestId),
-                NCProgramEndCauseToDiagnosticName(programEndSnapshot.cause),
-                NCProgramEndPhaseToDiagnosticName(programEndSnapshot.phase),
-                NCProgramEndDecisionToDiagnosticName(programEndSnapshot.decision),
-                static_cast<unsigned int>(programEndSnapshot.run.scope),
-                static_cast<unsigned long long>(programEndSnapshot.run.cacheGeneration),
-                static_cast<unsigned int>(programEndSnapshot.run.executionEpoch),
-                static_cast<unsigned int>(programEndSnapshot.requestExecutionEpoch),
-                static_cast<unsigned int>(programEndSnapshot.run.owner),
-                static_cast<unsigned int>(programEndSnapshot.run.ownerGeneration),
-                static_cast<unsigned int>(programEndSnapshot.requestOwner),
-                static_cast<unsigned int>(programEndSnapshot.requestOwnerGeneration),
-                static_cast<unsigned int>(programEndSnapshot.currentOwner),
-                static_cast<unsigned int>(programEndSnapshot.currentOwnerGeneration),
-                programEndSnapshot.sourcePC,
-                programEndSnapshot.sourceLineNumber,
-                static_cast<unsigned long long>(programEndSnapshot.markerDispatchId),
-                programEndSnapshot.requestPending ? 1U : 0U,
-                programEndSnapshot.readyToFinalize ? 1U : 0U,
-                programEndSnapshot.failClosed ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02G-DRN] Active:%u AxisQ:%llu AxisR:%llu CmdQ:%llu "
-                "CmdIn:%llu Replay:%llu FbQ:%llu Notice:%llu "
-                "FbPub:%llu FbCon:%llu FbSync:%u Stable:%u/%u "
-                "Stand:%u Safety:%u Wait:%u Bind:%u OwnerOK:%u Integrity:%llu\n",
-                static_cast<unsigned int>(programEndSnapshot.activeBlocks),
-                static_cast<unsigned long long>(programEndSnapshot.axisCommandDepth),
-                static_cast<unsigned long long>(programEndSnapshot.axisResultDepth),
-                static_cast<unsigned long long>(programEndSnapshot.commandQueueDepth),
-                static_cast<unsigned long long>(programEndSnapshot.commandIngressDepth),
-                static_cast<unsigned long long>(programEndSnapshot.commandReplayDepth),
-                static_cast<unsigned long long>(programEndSnapshot.feedbackDepth),
-                static_cast<unsigned long long>(programEndSnapshot.feedbackNoticeDepth),
-                static_cast<unsigned long long>(programEndSnapshot.lastPublishedFeedbackSequence),
-                static_cast<unsigned long long>(programEndSnapshot.lastConsumedFeedbackSequence),
-                programEndSnapshot.feedbackSequenceSynchronized ? 1U : 0U,
-                static_cast<unsigned int>(programEndSnapshot.stablePasses),
-                static_cast<unsigned int>(NC_PROGRAM_END_STABLE_PASSES_REQUIRED),
-                programEndSnapshot.groupStandstill ? 1U : 0U,
-                programEndSnapshot.safetyOrRecoveryPending ? 1U : 0U,
-                programEndSnapshot.waitCallbackActive ? 1U : 0U,
-                programEndSnapshot.completionBindingActive ? 1U : 0U,
-                programEndSnapshot.ownerLeaseCurrent ? 1U : 0U,
-                static_cast<unsigned long long>(programEndSnapshot.integrityDelta));
-
-            RtPrintf(
-                "[NC02G-CNT] StartTry:%llu Started:%llu StartBlock:%llu "
-                "Req:%llu EOF:%llu M02:%llu M30:%llu ReqReject:%llu "
-                "Eval:%llu Ready:%llu Final:%llu Cancel:%llu Fail:%llu "
-                "EpochFail:%llu OwnerFail:%llu IntegrityFail:%llu\n",
-                static_cast<unsigned long long>(programEndCounters.runStartAttempts),
-                static_cast<unsigned long long>(programEndCounters.runsStarted),
-                static_cast<unsigned long long>(programEndCounters.runStartBlocked),
-                static_cast<unsigned long long>(programEndCounters.requests),
-                static_cast<unsigned long long>(programEndCounters.naturalEofRequests),
-                static_cast<unsigned long long>(programEndCounters.m02Requests),
-                static_cast<unsigned long long>(programEndCounters.m30Requests),
-                static_cast<unsigned long long>(programEndCounters.rejectedRequests),
-                static_cast<unsigned long long>(programEndCounters.evaluations),
-                static_cast<unsigned long long>(programEndCounters.readyToFinalize),
-                static_cast<unsigned long long>(programEndCounters.finalized),
-                static_cast<unsigned long long>(programEndCounters.cancelled),
-                static_cast<unsigned long long>(programEndCounters.failClosed),
-                static_cast<unsigned long long>(programEndCounters.epochMismatch),
-                static_cast<unsigned long long>(programEndCounters.ownerLeaseLost),
-                static_cast<unsigned long long>(programEndCounters.integrityFailure));
-
-            RtPrintf(
-                "[NC02G-WAIT] Blocks:%llu AxisQ:%llu AxisR:%llu CmdQ:%llu "
-                "Ingress:%llu Replay:%llu Notice:%llu Feedback:%llu FbSeq:%llu "
-                "Callback:%llu Binding:%llu Safety:%llu Standstill:%llu Stable:%llu\n",
-                static_cast<unsigned long long>(programEndCounters.waitActiveBlocks),
-                static_cast<unsigned long long>(programEndCounters.waitAxisCommand),
-                static_cast<unsigned long long>(programEndCounters.waitAxisResult),
-                static_cast<unsigned long long>(programEndCounters.waitCommandQueue),
-                static_cast<unsigned long long>(programEndCounters.waitCommandIngress),
-                static_cast<unsigned long long>(programEndCounters.waitCommandReplay),
-                static_cast<unsigned long long>(programEndCounters.waitFeedbackNotice),
-                static_cast<unsigned long long>(programEndCounters.waitFeedback),
-                static_cast<unsigned long long>(programEndCounters.waitFeedbackSequence),
-                static_cast<unsigned long long>(programEndCounters.waitCallback),
-                static_cast<unsigned long long>(programEndCounters.waitCompletionBinding),
-                static_cast<unsigned long long>(programEndCounters.waitSafetyRequest),
-                static_cast<unsigned long long>(programEndCounters.waitGroupStandstill),
-                static_cast<unsigned long long>(programEndCounters.waitStableConfirmation));
-
-
-            RtPrintf(
-                "[NC02H-TXN] Seq:%llu D:%llu Phase:%s Post:%s Active:%u "
-                "GReq:%u GDone:%u MReq:%u MDone:%u PC:%d Line:%d "
-                "M:%d P:%d L:%d Main:%u Applied:%u\n",
-                static_cast<unsigned long long>(gmTransactionSnapshot.sequence),
-                static_cast<unsigned long long>(gmTransactionSnapshot.dispatchId),
-                NCGMBlockTransactionPhaseToDiagnosticName(
-                    gmTransactionSnapshot.phase),
-                NCGMBlockPostActionToDiagnosticName(
-                    gmTransactionSnapshot.postAction),
-                gmTransactionSnapshot.active ? 1U : 0U,
-                gmTransactionSnapshot.gWaitRequired ? 1U : 0U,
-                gmTransactionSnapshot.gWaitComplete ? 1U : 0U,
-                gmTransactionSnapshot.mWaitRequired ? 1U : 0U,
-                gmTransactionSnapshot.mWaitComplete ? 1U : 0U,
-                gmTransactionSnapshot.sourcePC,
-                gmTransactionSnapshot.sourceLineNumber,
-                gmTransactionSnapshot.mCode,
-                gmTransactionSnapshot.pValue,
-                gmTransactionSnapshot.repeatCount,
-                gmTransactionSnapshot.fromMainProgram ? 1U : 0U,
-                gmTransactionSnapshot.postActionApplied ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02H-CNT] Start:%llu GComp:%llu MComp:%llu Dual:%llu "
-                "Eval:%llu GWait:%llu MWait:%llu Ready:%llu Final:%llu "
-                "Cancel:%llu Fail:%llu M00:%llu M01:%llu M98:%llu "
-                "M99:%llu M02:%llu M30:%llu\n",
-                static_cast<unsigned long long>(gmTransactionCounters.started),
-                static_cast<unsigned long long>(gmTransactionCounters.gWaitComponents),
-                static_cast<unsigned long long>(gmTransactionCounters.mWaitComponents),
-                static_cast<unsigned long long>(gmTransactionCounters.dualComponentTransactions),
-                static_cast<unsigned long long>(gmTransactionCounters.evaluations),
-                static_cast<unsigned long long>(gmTransactionCounters.gWaitSamples),
-                static_cast<unsigned long long>(gmTransactionCounters.mWaitSamples),
-                static_cast<unsigned long long>(gmTransactionCounters.readyTransitions),
-                static_cast<unsigned long long>(gmTransactionCounters.finalized),
-                static_cast<unsigned long long>(gmTransactionCounters.cancelled),
-                static_cast<unsigned long long>(gmTransactionCounters.finalizeFailed),
-                static_cast<unsigned long long>(gmTransactionCounters.m00Stops),
-                static_cast<unsigned long long>(gmTransactionCounters.m01Stops),
-                static_cast<unsigned long long>(gmTransactionCounters.m98Calls),
-                static_cast<unsigned long long>(gmTransactionCounters.m99Returns),
-                static_cast<unsigned long long>(gmTransactionCounters.m02Ends),
-                static_cast<unsigned long long>(gmTransactionCounters.m30Ends));
-
-            RtPrintf(
-                "[NC02J4-BAR] Seq:%llu Active:%u Kind:%s PC:%d Line:%d "
-                "M:%d Samples:%llu Ms:%llu CmdQ:%llu QWait:%u Stand:%u\n",
-                static_cast<unsigned long long>(
-                    preDispatchBarrierSnapshot.sequence),
-                preDispatchBarrierSnapshot.active ? 1U : 0U,
-                NCPreDispatchBarrierKindToDiagnosticName(
-                    preDispatchBarrierSnapshot.kind),
-                preDispatchBarrierSnapshot.sourcePC,
-                preDispatchBarrierSnapshot.sourceLineNumber,
-                preDispatchBarrierSnapshot.mCode,
-                static_cast<unsigned long long>(
-                    preDispatchBarrierSnapshot.waitSamples),
-                static_cast<unsigned long long>(
-                    preDispatchBarrierSnapshot.waitSamples * 10ULL),
-                static_cast<unsigned long long>(
-                    preDispatchBarrierSnapshot.commandQueueDepth),
-                preDispatchBarrierSnapshot.commandQueuePending ? 1U : 0U,
-                preDispatchBarrierSnapshot.groupStandstill ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02J4-BCNT] Arm:%llu Eval:%llu CmdQ:%llu Stand:%llu Clear:%llu\n",
-                static_cast<unsigned long long>(
-                    preDispatchBarrierCounters.activations),
-                static_cast<unsigned long long>(
-                    preDispatchBarrierCounters.evaluations),
-                static_cast<unsigned long long>(
-                    preDispatchBarrierCounters.waitCommandQueue),
-                static_cast<unsigned long long>(
-                    preDispatchBarrierCounters.waitGroupStandstill),
-                static_cast<unsigned long long>(
-                    preDispatchBarrierCounters.cleared));
-
-            RtPrintf(
-                "[NC02K1-PREP] Pub:%llu Sess:%llu Active:%u Depth:%u/%u "
-                "RuntimePC:%d PlanPC:%d TailPC:%d DispatchPC:%d CommitPC:%d BasePC:%d BaseBlock:%u "
-                "Stop:%s Barrier:%s BPC:%d Valid:%u Order:%u Account:%u "
-                "Shadow:%u\n",
-                static_cast<unsigned long long>(
-                    preparedQueueSnapshot.publicationSequence),
-                static_cast<unsigned long long>(
-                    preparedQueueSnapshot.session),
-                preparedQueueSnapshot.active ? 1U : 0U,
-                static_cast<unsigned int>(preparedQueueSnapshot.depth),
-                static_cast<unsigned int>(preparedQueueSnapshot.capacity),
-                preparedQueueSnapshot.runtimeCurrentPC,
-                preparedQueueSnapshot.nextPlanPC,
-                preparedQueueSnapshot.tailPC,
-                preparedQueueSnapshot.dispatchPC,
-                preparedQueueSnapshot.commitPC,
-                preparedQueueSnapshot.committedBaselinePC,
-                preparedQueueSnapshot.committedBaselinePlanningBlocked
-                ? 1U : 0U,
-                NCPreparedQueueStopReasonToDiagnosticName(
-                    preparedQueueSnapshot.stopReason),
-                NCPreparedBarrierKindToDiagnosticName(
-                    preparedQueueSnapshot.barrierKind),
-                preparedQueueSnapshot.barrierPC,
-                preparedQueueSnapshot.valid ? 1U : 0U,
-                preparedQueueSnapshot.cursorOrderValid ? 1U : 0U,
-                preparedQueueSnapshot.accountingValid ? 1U : 0U,
-                preparedQueueSnapshot.shadowOnly ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K1-EDGE] Head:%u PC:%d Line:%d Class:%s Disp:%u Commit:%u "
-                "Tail:%u PC:%d Line:%d Class:%s Drain:%u Stop:%u\n",
-                hasPreparedQueueHead ? 1U : 0U,
-                hasPreparedQueueHead ? preparedQueueHead.sourcePC : -1,
-                hasPreparedQueueHead ? preparedQueueHead.sourceLineNumber : 0,
-                NCPreparedBlockClassToDiagnosticName(
-                    preparedQueueHead.classification.blockClass),
-                hasPreparedQueueHead && preparedQueueHead.dispatchObserved
-                ? 1U : 0U,
-                hasPreparedQueueHead && preparedQueueHead.commitObserved
-                ? 1U : 0U,
-                hasPreparedQueueTail ? 1U : 0U,
-                hasPreparedQueueTail ? preparedQueueTail.sourcePC : -1,
-                hasPreparedQueueTail ? preparedQueueTail.sourceLineNumber : 0,
-                NCPreparedBlockClassToDiagnosticName(
-                    preparedQueueTail.classification.blockClass),
-                hasPreparedQueueTail &&
-                preparedQueueTail.classification.legacyDrainRequired
-                ? 1U : 0U,
-                hasPreparedQueueTail &&
-                preparedQueueTail.classification.planningStopsHere
-                ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K1-MOD] Seed:G%d G%d G%d WCS:G%d G%d "
-                "Tail:G%d G%d G%d WCS:G%d G%d G68:%u G168:%u "
-                "Scale:%u Mirror:%02X Polar:%u COff:%u G66:%u "
-                "SeedV:%u TailV:%u MCS:%u G00F:%llu\n",
-                preparedQueueSnapshot.seedModal.distanceMode,
-                preparedQueueSnapshot.seedModal.unitsMode,
-                preparedQueueSnapshot.seedModal.planeMode,
-                preparedQueueSnapshot.seedModal.workCoordinateCode,
-                preparedQueueSnapshot.seedModal.storedStrokeMode,
-                preparedQueueSnapshot.tailModal.distanceMode,
-                preparedQueueSnapshot.tailModal.unitsMode,
-                preparedQueueSnapshot.tailModal.planeMode,
-                preparedQueueSnapshot.tailModal.workCoordinateCode,
-                preparedQueueSnapshot.tailModal.storedStrokeMode,
-                preparedQueueSnapshot.tailModal.g68Active ? 1U : 0U,
-                preparedQueueSnapshot.tailModal.g168Active ? 1U : 0U,
-                preparedQueueSnapshot.tailModal.scalingActive ? 1U : 0U,
-                static_cast<unsigned int>(
-                    preparedQueueSnapshot.tailModal.mirrorMask),
-                preparedQueueSnapshot.tailModal.polarActive ? 1U : 0U,
-                preparedQueueSnapshot.tailModal.cAxisOffsetRotationEnabled
-                ? 1U : 0U,
-                preparedQueueSnapshot.tailModal.modalMacroActive ? 1U : 0U,
-                preparedQueueSnapshot.seedModal.imageValid ? 1U : 0U,
-                preparedQueueSnapshot.tailModal.imageValid ? 1U : 0U,
-                preparedQueueSnapshot.tailModal.commandedMCSValid ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    ScaleNonNegativeDiagnosticValue(
-                        preparedQueueSnapshot.tailModal.g00OverrideRatio,
-                        100.0)));
-
-            RtPrintf(
-                "[NC02K1-CUR] Scope:%u Cache:%llu Frame:%llu Epoch:%llu Flow:%llu "
-                "Owner:%u/%llu LastInv:%s Panel:%u/%u/%u EOF:%u Cap:%u\n",
-                static_cast<unsigned int>(preparedQueueSnapshot.source.scope),
-                static_cast<unsigned long long>(
-                    preparedQueueSnapshot.source.cacheGeneration),
-                static_cast<unsigned long long>(
-                    preparedQueueSnapshot.source.frameId),
-                static_cast<unsigned long long>(
-                    preparedQueueSnapshot.source.executionEpoch),
-                static_cast<unsigned long long>(
-                    preparedQueueSnapshot.source.programFlowGeneration),
-                static_cast<unsigned int>(preparedQueueSnapshot.source.owner),
-                static_cast<unsigned long long>(
-                    preparedQueueSnapshot.source.ownerGeneration),
-                NCPreparedInvalidationReasonToDiagnosticName(
-                    preparedQueueSnapshot.lastInvalidationReason),
-                preparedQueueSnapshot.source.panel.blockSkipEnabled ? 1U : 0U,
-                preparedQueueSnapshot.source.panel.singleBlockEnabled ? 1U : 0U,
-                preparedQueueSnapshot.source.panel.optionalStopEnabled ? 1U : 0U,
-                preparedQueueSnapshot.eofLatched ? 1U : 0U,
-                preparedQueueSnapshot.capacityLatched ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K1-CNT] Eval:%llu Pub:%llu Sess:%llu Prep:%llu "
-                "Disp:%llu Commit:%llu Retire:%llu InvEntry:%llu Depth:%u "
-                "Acct:%u Inv:%llu Alarm:%llu Reset:%llu Source:%llu "
-                "Epoch:%llu EpochOK:%llu Owner:%llu Frame:%llu Panel:%llu Barrier:%llu "
-                "EOF:%llu Cap:%llu Over:%llu Cursor:%llu PlanGap:%llu FlowOK:%llu "
-                "DMis:%llu CMis:%llu Stale:%llu IdFail:%llu Cutover:%llu\n",
-                static_cast<unsigned long long>(preparedQueueCounters.evaluations),
-                static_cast<unsigned long long>(preparedQueueCounters.publications),
-                static_cast<unsigned long long>(preparedQueueCounters.sessions),
-                static_cast<unsigned long long>(preparedQueueCounters.prepared),
-                static_cast<unsigned long long>(preparedQueueCounters.dispatchMatched),
-                static_cast<unsigned long long>(preparedQueueCounters.commitMatched),
-                static_cast<unsigned long long>(preparedQueueCounters.retired),
-                static_cast<unsigned long long>(preparedQueueCounters.invalidatedEntries),
-                static_cast<unsigned int>(preparedQueueSnapshot.depth),
-                preparedQueueSnapshot.accountingValid ? 1U : 0U,
-                static_cast<unsigned long long>(preparedQueueCounters.invalidations),
-                static_cast<unsigned long long>(preparedQueueCounters.alarmInvalidations),
-                static_cast<unsigned long long>(preparedQueueCounters.resetInvalidations),
-                static_cast<unsigned long long>(preparedQueueCounters.sourceInvalidations),
-                static_cast<unsigned long long>(preparedQueueCounters.epochInvalidations),
-                static_cast<unsigned long long>(preparedQueueCounters.correlatedEpochAdvances),
-                static_cast<unsigned long long>(preparedQueueCounters.ownerInvalidations),
-                static_cast<unsigned long long>(preparedQueueCounters.frameInvalidations),
-                static_cast<unsigned long long>(preparedQueueCounters.panelInvalidations),
-                static_cast<unsigned long long>(preparedQueueCounters.barrierStops),
-                static_cast<unsigned long long>(preparedQueueCounters.eofStops),
-                static_cast<unsigned long long>(preparedQueueCounters.capacityStops),
-                static_cast<unsigned long long>(preparedQueueCounters.overwritePrevented),
-                static_cast<unsigned long long>(preparedQueueCounters.cursorRegressions),
-                static_cast<unsigned long long>(preparedQueueCounters.planDiscontinuities),
-                static_cast<unsigned long long>(preparedQueueCounters.expectedFlowCutovers),
-                static_cast<unsigned long long>(preparedQueueCounters.dispatchMismatches),
-                static_cast<unsigned long long>(preparedQueueCounters.commitMismatches),
-                static_cast<unsigned long long>(preparedQueueCounters.staleRuntimeProofs),
-                static_cast<unsigned long long>(preparedQueueCounters.identityFailures),
-                static_cast<unsigned long long>(preparedQueueCounters.cutoverAttempts));
-
-            RtPrintf(
-                "[NC02K2-EQV] Pub:%llu State:%s Inv:%s Sess:%llu Entry:%llu "
-                "Scope:%u Cache:%llu Frame:%llu Epoch:%llu PostEpoch:%llu Flow:%llu "
-                "Owner:%u/%llu Panel:%02X PC:%d Line:%d Class:%s Barrier:%s "
-                "Depth:%u SPeak:%u LPeak:%u "
-                "QualSess:%llu Cand:%u Pend:%u Res:%u Disp:%llu Commit:%llu "
-                "Flags:%08X Block:%u Plan:%u ClassOK:%u Drain:%u ModB:%u "
-                "ModA:%u LedD:%u LedC:%u Wait:%u UpDC:%u Ret:%u Up:%u Life:%u "
-                "Match:%u Acct:%u "
-                "Qualified:%u Shadow:%u Influence:%u Cutover:%u\n",
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.publicationSequence),
-                NCPreparedHeadEquivalenceStateToDiagnosticName(
-                    preparedEquivalenceSnapshot.state),
-                NCPreparedHeadEquivalenceInvalidationToDiagnosticName(
-                    preparedEquivalenceSnapshot.lastInvalidation),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.session),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.entrySequence),
-                static_cast<unsigned int>(
-                    preparedEquivalenceSnapshot.scope),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.cacheGeneration),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.frameId),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.executionEpoch),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.commitExecutionEpoch),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.programFlowGeneration),
-                static_cast<unsigned int>(
-                    preparedEquivalenceSnapshot.owner),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.ownerGeneration),
-                static_cast<unsigned int>(
-                    preparedEquivalenceSnapshot.panelMask),
-                preparedEquivalenceSnapshot.sourcePC,
-                preparedEquivalenceSnapshot.sourceLineNumber,
-                NCPreparedBlockClassToDiagnosticName(
-                    preparedEquivalenceSnapshot.blockClass),
-                NCPreparedBarrierKindToDiagnosticName(
-                    preparedEquivalenceSnapshot.barrierKind),
-                static_cast<unsigned int>(
-                    preparedEquivalenceSnapshot.preparedDepth),
-                static_cast<unsigned int>(
-                    preparedEquivalenceSnapshot.sessionPeakDepth),
-                static_cast<unsigned int>(
-                    preparedEquivalenceSnapshot.lifetimePeakDepth),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.qualifiedSession),
-                preparedEquivalenceSnapshot.candidate ? 1U : 0U,
-                preparedEquivalenceSnapshot.pending ? 1U : 0U,
-                preparedEquivalenceSnapshot.resolved ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.dispatchId),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceSnapshot.commitSequence),
-                static_cast<unsigned int>(
-                    preparedEquivalenceSnapshot.mismatchFlags),
-                preparedEquivalenceSnapshot.blockMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.planMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.classificationMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.drainMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.modalBeforeMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.modalAfterMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.ledgerDispatchMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.ledgerCommitMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.runtimeWaitCallbackActive
-                ? 1U : 0U,
-                preparedEquivalenceSnapshot.upstreamDispatchCommitMatch
-                ? 1U : 0U,
-                preparedEquivalenceSnapshot.retirementMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.upstreamProofMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.lifecycleMatch ? 1U : 0U,
-                preparedEquivalenceSnapshot.matched ? 1U : 0U,
-                preparedEquivalenceSnapshot.accountingValid ? 1U : 0U,
-                preparedEquivalenceSnapshot.readinessQualified ? 1U : 0U,
-                preparedEquivalenceSnapshot.shadowOnly ? 1U : 0U,
-                preparedEquivalenceSnapshot.runtimeInfluence ? 1U : 0U,
-                preparedEquivalenceSnapshot.cutoverApplied ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K2-CNT] Obs:%llu Pub:%llu Cand:%llu Match:%llu Mis:%llu "
-                "Inv:%llu Inel:%llu Replay:%llu Bypass:%llu Peak:%llu Multi:%llu "
-                "QMis:%llu SrcMis:%llu PCMis:%llu LineMis:%llu BlockMis:%llu "
-                "PlanMis:%llu ClassMis:%llu DrainMis:%llu ModBMis:%llu "
-                "ModAMis:%llu LifeMis:%llu Stale:%llu ResolveMis:%llu "
-                "UpMis:%llu LedgerMis:%llu BindIdMis:%llu RuntimeFail:%llu "
-                "SessTrans:%llu QualSess:%llu WouldUse:%llu Use:%llu "
-                "Cutover:%llu Influence:%llu\n",
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.observations),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.publications),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.candidates),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.matched),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.mismatched),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.invalidated),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.ineligible),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.replays),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.queueBypasses),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.lifetimePeakDepth),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.multiBlockObservations),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.queueMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.sourceMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.pcMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.lineMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.blockMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.planMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.classificationMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.drainMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.modalBeforeMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.modalAfterMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.lifecycleMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.staleTokens),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.resolveMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.upstreamMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.ledgerMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.bindIdentityMismatches),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.runtimeFailures),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.sessionTransitions),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.qualifiedSessions),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.wouldUse),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.useAttempts),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.cutoverAttempts),
-                static_cast<unsigned long long>(
-                    preparedEquivalenceCounters.runtimeInfluence));
-
-            RtPrintf(
-                "[NC02K3-GATE] Pub:%llu Decision:%s Revoke:%s Enabled:%u Attempt:%u "
-                "Apply:%u Legacy:%u Sess:%llu Entry:%llu QualSess:%llu "
-                "Qualified:%u Armed:%u Quarantine:%u Lock:%u Scope:%u Cache:%llu Frame:%llu "
-                "Epoch:%llu Flow:%llu Owner:%u/%llu Panel:%02X PC:%d Line:%d Disp:%llu "
-                "Class:%s Queue:%u Token:%u Source:%u PCLine:%u ClassOK:%u "
-                "Exact:%u Recheck:%u Prepared:%u Influence:%u Cutover:%u Acct:%u\n",
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.publicationSequence),
-                NCPreparedHeadCutoverDecisionToDiagnosticName(
-                    preparedCutoverSnapshot.decision),
-                NCPreparedHeadCutoverRevocationToDiagnosticName(
-                    preparedCutoverSnapshot.lastRevocation),
-                preparedCutoverSnapshot.enabled ? 1U : 0U,
-                preparedCutoverSnapshot.attempted ? 1U : 0U,
-                preparedCutoverSnapshot.applied ? 1U : 0U,
-                preparedCutoverSnapshot.legacyRetained ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.session),
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.entrySequence),
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.qualifiedSession),
-                preparedCutoverSnapshot.sessionQualified ? 1U : 0U,
-                preparedCutoverSnapshot.qualificationArmed ? 1U : 0U,
-                preparedCutoverSnapshot.sessionQuarantined ? 1U : 0U,
-                preparedCutoverSnapshot.permanentLockout ? 1U : 0U,
-                static_cast<unsigned int>(preparedCutoverSnapshot.scope),
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.cacheGeneration),
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.frameId),
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.executionEpoch),
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.programFlowGeneration),
-                static_cast<unsigned int>(preparedCutoverSnapshot.owner),
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.ownerGeneration),
-                static_cast<unsigned int>(preparedCutoverSnapshot.panelMask),
-                preparedCutoverSnapshot.sourcePC,
-                preparedCutoverSnapshot.sourceLineNumber,
-                static_cast<unsigned long long>(
-                    preparedCutoverSnapshot.dispatchId),
-                NCPreparedBlockClassToDiagnosticName(
-                    preparedCutoverSnapshot.blockClass),
-                preparedCutoverSnapshot.queueExact ? 1U : 0U,
-                preparedCutoverSnapshot.tokenExact ? 1U : 0U,
-                preparedCutoverSnapshot.sourceExact ? 1U : 0U,
-                preparedCutoverSnapshot.pcLineExact ? 1U : 0U,
-                preparedCutoverSnapshot.classEligible ? 1U : 0U,
-                preparedCutoverSnapshot.equivalenceExact ? 1U : 0U,
-                preparedCutoverSnapshot.valueRevalidated ? 1U : 0U,
-                preparedCutoverSnapshot.preparedValueSelected ? 1U : 0U,
-                preparedCutoverSnapshot.runtimeInfluence ? 1U : 0U,
-                preparedCutoverSnapshot.cutoverApplied ? 1U : 0U,
-                preparedCutoverSnapshot.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K3-CNT] Eval:%llu Pub:%llu Attempt:%llu Apply:%llu "
-                "Fallback:%llu Disabled:%llu NoHead:%llu Queue:%llu "
-                "Upstream:%llu Warmup:%llu Quarantine:%llu Duplicate:%llu "
-                "Token:%llu Source:%llu PCLine:%llu Class:%llu Exact:%llu "
-                "RuntimeFail:%llu Arm:%llu Revoke:%llu DisRev:%llu QRev:%llu "
-                "AlarmRev:%llu ResetRev:%llu EndRev:%llu SrcRev:%llu UpRev:%llu "
-                "Use:%llu Cutover:%llu Influence:%llu\n",
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.evaluations),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.publications),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.attempts),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.applied),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.legacyFallbacks),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.disabled),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.noHead),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.queueRejected),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.upstreamRejected),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.unqualified),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.quarantined),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.duplicateRejected),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.tokenRejected),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.sourceRejected),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.pcLineRejected),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.classRejected),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.equivalenceRejected),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.runtimeFailures),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.arms),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.revocations),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.disabledRevocations),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.queueRevocations),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.alarmRevocations),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.resetRevocations),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.programEndRevocations),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.sourceRevocations),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.upstreamRevocations),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.applied),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.applied),
-                static_cast<unsigned long long>(
-                    preparedCutoverCounters.applied));
-
-            RtPrintf(
-                "[NC02K4-ADM] Pub:%llu Decision:%s Revoke:%s Sess:%llu Entry:%llu "
-                "Scope:%u Cache:%llu Frame:%llu Epoch:%llu Flow:%llu Owner:%u/%llu "
-                "Panel:%02X PC:%d Line:%d Disp:%llu Class:%s Head:%u Queue:%u "
-                "Up:%u Qual:%u Token:%u Source:%u PCLine:%u Modal:%u ClassOK:%u "
-                "DrainReq:%u DrainOK:%u Cand:%u Legacy:%u Eq:%u K3:%u Confirm:%u "
-                "Lock:%u Shadow:%u Influence:%u Bypass:%u Acct:%u\n",
-                static_cast<unsigned long long>(
-                    preparedPreResolveSnapshot.publicationSequence),
-                NCPreparedPreResolveAdmissionDecisionToDiagnosticName(
-                    preparedPreResolveSnapshot.decision),
-                NCPreparedPreResolveAdmissionRevocationToDiagnosticName(
-                    preparedPreResolveSnapshot.lastRevocation),
-                static_cast<unsigned long long>(
-                    preparedPreResolveSnapshot.session),
-                static_cast<unsigned long long>(
-                    preparedPreResolveSnapshot.entrySequence),
-                static_cast<unsigned int>(preparedPreResolveSnapshot.scope),
-                static_cast<unsigned long long>(
-                    preparedPreResolveSnapshot.cacheGeneration),
-                static_cast<unsigned long long>(
-                    preparedPreResolveSnapshot.frameId),
-                static_cast<unsigned long long>(
-                    preparedPreResolveSnapshot.executionEpoch),
-                static_cast<unsigned long long>(
-                    preparedPreResolveSnapshot.programFlowGeneration),
-                static_cast<unsigned int>(preparedPreResolveSnapshot.owner),
-                static_cast<unsigned long long>(
-                    preparedPreResolveSnapshot.ownerGeneration),
-                static_cast<unsigned int>(preparedPreResolveSnapshot.panelMask),
-                preparedPreResolveSnapshot.sourcePC,
-                preparedPreResolveSnapshot.sourceLineNumber,
-                static_cast<unsigned long long>(
-                    preparedPreResolveSnapshot.dispatchId),
-                NCPreparedBlockClassToDiagnosticName(
-                    preparedPreResolveSnapshot.blockClass),
-                preparedPreResolveSnapshot.hasHead ? 1U : 0U,
-                preparedPreResolveSnapshot.queueExact ? 1U : 0U,
-                preparedPreResolveSnapshot.upstreamHealthy ? 1U : 0U,
-                preparedPreResolveSnapshot.sessionQualified ? 1U : 0U,
-                preparedPreResolveSnapshot.tokenExact ? 1U : 0U,
-                preparedPreResolveSnapshot.sourceExact ? 1U : 0U,
-                preparedPreResolveSnapshot.pcLineExact ? 1U : 0U,
-                preparedPreResolveSnapshot.modalExact ? 1U : 0U,
-                preparedPreResolveSnapshot.classEligible ? 1U : 0U,
-                preparedPreResolveSnapshot.legacyDrainRequired ? 1U : 0U,
-                preparedPreResolveSnapshot.legacyDrainSatisfied ? 1U : 0U,
-                preparedPreResolveSnapshot.candidate ? 1U : 0U,
-                preparedPreResolveSnapshot.legacyResolveObserved ? 1U : 0U,
-                preparedPreResolveSnapshot.equivalenceObserved ? 1U : 0U,
-                preparedPreResolveSnapshot.cutoverObserved ? 1U : 0U,
-                preparedPreResolveSnapshot.confirmed ? 1U : 0U,
-                preparedPreResolveSnapshot.permanentLockout ? 1U : 0U,
-                preparedPreResolveSnapshot.shadowOnly ? 1U : 0U,
-                preparedPreResolveSnapshot.runtimeInfluence ? 1U : 0U,
-                preparedPreResolveSnapshot.resolverBypassed ? 1U : 0U,
-                preparedPreResolveSnapshot.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K4-CNT] Eval:%llu Pub:%llu Cand:%llu Confirm:%llu "
-                "Reject:%llu Wait:%llu NoHead:%llu Queue:%llu Up:%llu "
-                "Session:%llu Token:%llu Source:%llu PCLine:%llu Modal:%llu "
-                "Class:%llu ResolveFail:%llu PostMis:%llu CandInv:%llu ConfirmFail:%llu "
-                "Revoke:%llu QRev:%llu AlarmRev:%llu ResetRev:%llu EndRev:%llu "
-                "SrcRev:%llu UpRev:%llu Influence:%llu Bypass:%llu\n",
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.evaluations),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.publications),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.candidates),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.confirmed),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.rejections),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.drainWaitSamples),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.noHead),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.queueRejected),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.upstreamRejected),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.sessionRejected),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.tokenRejected),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.sourceRejected),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.pcLineRejected),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.modalRejected),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.classRejected),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.legacyResolveFailures),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.postResolveMismatches),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.candidateInvalidations),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.confirmedRuntimeFailures),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.revocations),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.queueRevocations),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.alarmRevocations),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.resetRevocations),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.programEndRevocations),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.sourceRevocations),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.upstreamRevocations),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.runtimeInfluence),
-                static_cast<unsigned long long>(
-                    preparedPreResolveCounters.resolverBypasses));
-
-            RtPrintf(
-                "[NC02K41-BYP] Pub:%llu Decision:%s Revoke:%s Lane:%s "
-                "Sess:%llu Entry:%llu PC:%d Line:%d Disp:%llu Commit:%llu "
-                "QPure:%llu QP1:%llu Enable:%u Attempt:%u Select:%u "
-                "Bind:%u CommitOK:%u Proof:%u Queue:%u Up:%u LaneQ:%u "
-                "Token:%u Source:%u PCLine:%u Modal:%u Class:%u Rebuild:%u "
-                "Pending:%u Lock:%u Legacy:%u Influence:%u Bypass:%u Acct:%u\n",
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.publicationSequence),
-                NCPreparedResolverBypassDecisionToDiagnosticName(
-                    preparedResolverBypassSnapshot.decision),
-                NCPreparedResolverBypassRevocationToDiagnosticName(
-                    preparedResolverBypassSnapshot.lastRevocation),
-                NCPreparedResolverBypassLaneToDiagnosticName(
-                    preparedResolverBypassSnapshot.lane),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.session),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.entrySequence),
-                preparedResolverBypassSnapshot.sourcePC,
-                preparedResolverBypassSnapshot.sourceLineNumber,
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.dispatchId),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.commitSequence),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.
-                    pureModalQualifiedSession),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.g00P1QualifiedSession),
-                preparedResolverBypassSnapshot.enabled ? 1U : 0U,
-                preparedResolverBypassSnapshot.attempted ? 1U : 0U,
-                preparedResolverBypassSnapshot.selected ? 1U : 0U,
-                preparedResolverBypassSnapshot.dispatchBound ? 1U : 0U,
-                preparedResolverBypassSnapshot.commitBound ? 1U : 0U,
-                preparedResolverBypassSnapshot.upstreamProofVerified
-                ? 1U : 0U,
-                preparedResolverBypassSnapshot.queueExact ? 1U : 0U,
-                preparedResolverBypassSnapshot.upstreamHealthy ? 1U : 0U,
-                preparedResolverBypassSnapshot.laneQualified ? 1U : 0U,
-                preparedResolverBypassSnapshot.tokenExact ? 1U : 0U,
-                preparedResolverBypassSnapshot.sourceExact ? 1U : 0U,
-                preparedResolverBypassSnapshot.pcLineExact ? 1U : 0U,
-                preparedResolverBypassSnapshot.modalExact ? 1U : 0U,
-                preparedResolverBypassSnapshot.classEligible ? 1U : 0U,
-                preparedResolverBypassSnapshot.literalRebuiltExact
-                ? 1U : 0U,
-                preparedResolverBypassSnapshot.pending ? 1U : 0U,
-                preparedResolverBypassSnapshot.permanentLockout ? 1U : 0U,
-                preparedResolverBypassSnapshot.legacyResolverRetained
-                ? 1U : 0U,
-                preparedResolverBypassSnapshot.runtimeInfluence ? 1U : 0U,
-                preparedResolverBypassSnapshot.resolverBypassed ? 1U : 0U,
-                preparedResolverBypassSnapshot.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K41-CNT] Eval:%llu Pub:%llu Select:%llu Fallback:%llu "
-                "Bind:%llu Commit:%llu Proof:%llu Wait:%llu Disable:%llu "
-                "Busy:%llu NoHead:%llu Queue:%llu Up:%llu Session:%llu "
-                "Token:%llu Source:%llu PCLine:%llu Modal:%llu Class:%llu "
-                "QualCand:%llu QualModal:%llu QualP1:%llu QualFail:%llu "
-                "QualInv:%llu RuntimeFail:%llu ProofMis:%llu PendingInv:%llu "
-                "Revoke:%llu DisRev:%llu QRev:%llu AlarmRev:%llu "
-                "ResetRev:%llu EndRev:%llu SrcRev:%llu RunRev:%llu "
-                "ProofRev:%llu Prepared:%llu Influence:%llu Bypass:%llu\n",
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.evaluations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.publications),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.selected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.legacyFallbacks),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.dispatchBound),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.commitBound),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.proofVerified),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.proofWaitSamples),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.disabled),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.busy),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.noHead),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.queueRejected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.upstreamRejected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.sessionRejected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.tokenRejected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.sourceRejected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.pcLineRejected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.modalRejected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.classRejected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.
-                    qualificationCandidates),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.qualifiedPureModal),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.qualifiedG00P1),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.qualificationFailures),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.
-                    qualificationInvalidations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.runtimeFailures),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.proofMismatches),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.
-                    invalidatedPendingBypasses),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.revocations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.disabledRevocations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.queueRevocations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.alarmRevocations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.resetRevocations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.programEndRevocations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.sourceRevocations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.runtimeRevocations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.proofRevocations),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.preparedSelections),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.runtimeInfluence),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.resolverBypasses));
-
-            RtPrintf(
-                "[NC02K42-NOP] Pub:%llu Decision:%s Lane:%s Sess:%llu "
-                "Entry:%llu QNoP:%llu DrainReq:%u DrainOK:%u DrainWait:%u "
-                "CbReq:%u CbCommit:%u WaitSeen:%u CbDone:%u Epoch:%llu "
-                "CommitEpoch:%llu Disp:%llu Commit:%llu Pending:%u Lock:%u "
-                "Acct:%u\n",
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.publicationSequence),
-                NCPreparedResolverBypassDecisionToDiagnosticName(
-                    preparedResolverBypassSnapshot.decision),
-                NCPreparedResolverBypassLaneToDiagnosticName(
-                    preparedResolverBypassSnapshot.lane),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.session),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.entrySequence),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.g00NoPQualifiedSession),
-                preparedResolverBypassSnapshot.legacyDrainRequired ? 1U : 0U,
-                preparedResolverBypassSnapshot.legacyDrainSatisfied ? 1U : 0U,
-                preparedResolverBypassSnapshot.deferredForDrain ? 1U : 0U,
-                preparedResolverBypassSnapshot.callbackRequired ? 1U : 0U,
-                preparedResolverBypassSnapshot.callbackActiveAtCommit
-                ? 1U : 0U,
-                preparedResolverBypassSnapshot.waitPhaseObserved ? 1U : 0U,
-                preparedResolverBypassSnapshot.callbackCompletionObserved
-                ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.executionEpoch),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.commitExecutionEpoch),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.dispatchId),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassSnapshot.commitSequence),
-                preparedResolverBypassSnapshot.pending ? 1U : 0U,
-                preparedResolverBypassSnapshot.permanentLockout ? 1U : 0U,
-                preparedResolverBypassSnapshot.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K42-CNT] DrainWait:%llu CbWait:%llu CbDone:%llu "
-                "WaitPhase:%llu QualNoP:%llu SelPure:%llu SelP1:%llu "
-                "SelNoP:%llu ProofPure:%llu ProofP1:%llu ProofNoP:%llu "
-                "Select:%llu Proof:%llu\n",
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.drainWaitSamples),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.callbackWaitSamples),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.callbackCompletions),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.ordinaryWaitPhases),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.qualifiedG00NoP),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.selectedPureModal),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.selectedG00P1),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.selectedG00NoP),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.proofVerifiedPureModal),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.proofVerifiedG00P1),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.proofVerifiedG00NoP),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.selected),
-                static_cast<unsigned long long>(
-                    preparedResolverBypassCounters.proofVerified));
-
-            RtPrintf(
-                "[NC02K5-ADM] Pub:%llu Decision:%s Revoke:%s Sess:%llu "
-                "Entry:%llu Owner:%u/%llu Panel:%X PC:%d Line:%d "
-                "Disp:%llu Commit:%llu Depth:%llu "
-                "Still:%u BusyS:%llu Block:0x%X Q:%u Env:%u Axis:%u "
-                "Project:%u Drained:%u Busy:%u Select:%u Bind:%u "
-                "CommitOK:%u Flight:%u FSeq:%llu FEpoch:%u FSeg:%llu "
-                "Cb:%u CbDone:%u EpochAdv:%u Proof:%u "
-                "Done:%u Shadow:%u "
-                "Pending:%u Ready:%u Influence:%u Bypass:%u Lock:%u "
-                "Acct:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.publicationSequence),
-                NCOrdinaryG00AdmissionDecisionToDiagnosticName(
-                    ordinaryG00AdmissionSnapshot.decision),
-                NCOrdinaryG00AdmissionRevocationToDiagnosticName(
-                    ordinaryG00AdmissionSnapshot.lastRevocation),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.session),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.entrySequence),
-                static_cast<unsigned int>(
-                    ordinaryG00AdmissionSnapshot.owner),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.ownerGeneration),
-                static_cast<unsigned int>(
-                    ordinaryG00AdmissionSnapshot.panelMask),
-                ordinaryG00AdmissionSnapshot.sourcePC,
-                ordinaryG00AdmissionSnapshot.sourceLineNumber,
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.dispatchId),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.commitSequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.initialQueueDepth),
-                ordinaryG00AdmissionSnapshot.initialGroupStandstill
-                ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.busySamples),
-                static_cast<unsigned int>(
-                    ordinaryG00AdmissionSnapshot.blockerMask),
-                ordinaryG00AdmissionSnapshot.upstreamQualified ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.simpleG90Envelope ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.configuredAxisPresent
-                ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.projected ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.initialDrained ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.initialBusy ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.legacySelected ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.legacyDispatchBound ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.legacyCommitBound ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.inflightRegistryProven
-                ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.inflightRegistrySequence),
-                static_cast<unsigned int>(
-                    ordinaryG00AdmissionSnapshot.inflightExecutionEpoch),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.inflightSegmentId),
-                ordinaryG00AdmissionSnapshot.legacyCallbackObserved
-                ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.legacyCallbackCompleted
-                ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.legacyEpochAdvanced ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.legacyUpstreamProofVerified
-                ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.legacyCompleted ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.shadowOnly ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.pending ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.cutoverReady ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.runtimeInfluence ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.resolverBypassed ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.permanentLockout ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K5-ENV] BaseFail:0x%013llX ModalFail:0x%04llX "
-                "BusyFail:0x%02X DrainedFail:0x%02X BDecision:%s "
-                "ResolverInput:%u Selected:%u BypassField:%u LaneQ:%u "
-                "Deferred:%u DrainOK:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.
-                    baseEvidenceFailureMask),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionSnapshot.
-                    modalEnvelopeFailureMask),
-                static_cast<unsigned int>(
-                    ordinaryG00AdmissionSnapshot.busyRouteFailureMask),
-                static_cast<unsigned int>(
-                    ordinaryG00AdmissionSnapshot.drainedRouteFailureMask),
-                NCPreparedResolverBypassDecisionToDiagnosticName(
-                    ordinaryG00AdmissionSnapshot.observedBypassDecision),
-                ordinaryG00AdmissionSnapshot.resolverBypassedInput ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.observedBypassSelected ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.
-                observedBypassResolverBypassed ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.
-                observedBypassLaneQualified ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.
-                observedBypassDeferredForDrain ? 1U : 0U,
-                ordinaryG00AdmissionSnapshot.
-                observedLegacyDrainSatisfied ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K5-CNT] Scan:%llu Pub:%llu Unique:%llu Warmup:%llu "
-                "Project:%llu Cand:%llu Drained:%llu BusyToken:%llu "
-                "BusyS:%llu Select:%llu Bind:%llu Commit:%llu Wait:%llu "
-                "FlightBind:%llu CbDone:%llu Done:%llu Reject:%llu "
-                "MissingPath:%llu MissingTail:%llu "
-                "MissingFlight:%llu Mis:%llu RuntimeFail:%llu "
-                "PendingInv:%llu Revoke:%llu QRev:%llu AlarmRev:%llu "
-                "ResetRev:%llu EndRev:%llu SrcRev:%llu Cutover:%llu "
-                "Influence:%llu Bypass:%llu\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.scans),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.publications),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.uniqueEvaluations),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.warmup),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.projected),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.candidates),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.initialDrained),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.initialBusy),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.busySamples),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.legacySelections),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.legacyDispatchBound),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.legacyCommitBound),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.completionWaitSamples),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.inflightRegistryBound),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.callbackCompleted),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.legacyCompleted),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.rejected),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.missingCommandPathMode),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.
-                    missingTransactionalEndpoint),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.missingInflightRegistry),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.mismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.runtimeFailures),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.invalidatedPending),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.revocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.queueRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.alarmRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.resetRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.programEndRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.sourceRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.cutoverAttempts),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.runtimeInfluence),
-                static_cast<unsigned long long>(
-                    ordinaryG00AdmissionCounters.resolverBypasses));
-
-            const NCOrdinaryG00InflightEntrySnapshot& inflightLast =
-                ordinaryG00InflightRegistrySnapshot.lastEntry;
-            RtPrintf(
-                "[NC02K63-FLIGHT] Pub:%llu Seq:%llu Sess:%llu Entry:%llu "
-                "Disp:%llu Commit:%llu Epoch:%u Seg:%llu SrcBlk:%d "
-                "Owner:%u/%u State:%s Revoke:%s Active:%u Term:%u "
-                "Revoked:%u Slots:%u ActiveN:%u RevPend:%u Peak:%u "
-                "Ready:%u Lock:%u Bounded:%u Shadow:%u Influence:%u "
-                "MotionWrite:%u Acct:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistrySnapshot.publicationSequence),
-                static_cast<unsigned long long>(
-                    inflightLast.registrySequence),
-                static_cast<unsigned long long>(inflightLast.session),
-                static_cast<unsigned long long>(inflightLast.entrySequence),
-                static_cast<unsigned long long>(inflightLast.dispatchId),
-                static_cast<unsigned long long>(inflightLast.commitSequence),
-                static_cast<unsigned int>(inflightLast.identity.epoch),
-                static_cast<unsigned long long>(
-                    inflightLast.identity.segmentId),
-                static_cast<int>(inflightLast.identity.sourceBlockId),
-                static_cast<unsigned int>(inflightLast.ownerLease.owner),
-                static_cast<unsigned int>(inflightLast.ownerLease.generation),
-                NCOrdinaryG00InflightStateToDiagnosticName(
-                    inflightLast.state),
-                NCOrdinaryG00InflightRevocationToDiagnosticName(
-                    inflightLast.revocation),
-                inflightLast.active ? 1U : 0U,
-                inflightLast.terminal ? 1U : 0U,
-                inflightLast.revoked ? 1U : 0U,
-                ordinaryG00InflightRegistrySnapshot.occupiedEntries,
-                ordinaryG00InflightRegistrySnapshot.activeEntries,
-                ordinaryG00InflightRegistrySnapshot.revokedPendingEntries,
-                ordinaryG00InflightRegistrySnapshot.peakActiveEntries,
-                ordinaryG00InflightRegistrySnapshot.ready ? 1U : 0U,
-                ordinaryG00InflightRegistrySnapshot.permanentLockout
-                ? 1U : 0U,
-                ordinaryG00InflightRegistrySnapshot.bounded ? 1U : 0U,
-                ordinaryG00InflightRegistrySnapshot.shadowOnly ? 1U : 0U,
-                ordinaryG00InflightRegistrySnapshot.runtimeInfluence
-                ? 1U : 0U,
-                ordinaryG00InflightRegistrySnapshot.motionWrite ? 1U : 0U,
-                ordinaryG00InflightRegistrySnapshot.accountingValid
-                ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K63-FCNT] Try:%llu Reg:%llu Reject:%llu Invalid:%llu "
-                "DupId:%llu Overflow:%llu Reuse:%llu Obs:%llu Match:%llu "
-                "Ignore:%llu Accept:%llu Start:%llu Prog:%llu Held:%llu "
-                "Resume:%llu Term:%llu Done:%llu RejectT:%llu Cancel:%llu "
-                "Abort:%llu Fault:%llu SeqInv:%llu Gap:%llu ActiveGap:%llu "
-                "Orphan:%llu IdConflict:%llu OwnerMis:%llu DupTerm:%llu "
-                "TermConflict:%llu PostTerm:%llu Rev:%llu RevTerm:%llu "
-                "QRev:%llu AlarmRev:%llu ResetRev:%llu EndRev:%llu "
-                "SrcRev:%llu RunRev:%llu FbOv:%llu NoticeOv:%llu "
-                "LedBlkOv:%llu LedSegOv:%llu "
-                "LedDup:%llu LedConflict:%llu RunFail:%llu Fail:%llu "
-                "Active:%llu Peak:%llu Influence:%llu MotionWrite:%llu\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.registrationAttempts),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.registered),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.registrationRejected),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.invalidRegistration),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.duplicateIdentity),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.capacityOverflow),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.slotReuses),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.feedbackObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.feedbackMatched),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.feedbackIgnored),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.accepted),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.started),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.progress),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.held),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.resumed),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.terminal),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.completed),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.rejected),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.cancelled),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.aborted),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.faulted),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.invalidFeedbackSequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.feedbackSequenceGaps),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.activeSequenceGapFailures),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.ledgerOrphans),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.identityConflicts),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.ownerMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.duplicateTerminal),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.terminalConflict),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.postTerminalFeedback),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.entriesRevoked),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.revokedTerminals),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.queueRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.alarmRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.resetRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.programEndRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.sourceRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.runtimeRevocations),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.feedbackOverflowObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.
-                    producerNoticeOverflowObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.
-                    ledgerActiveBlockOverwriteObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.
-                    ledgerActiveSegmentIndexOverwriteObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.ledgerDuplicateObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.ledgerConflictObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.runtimeFailures),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.permanentFailures),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.activeEntries),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.peakActiveEntries),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.runtimeInfluence),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.motionWrites));
-
-            RtPrintf(
-                "[NC02K7-RA] Pub:%llu Decision:%s Sess:%llu WarmSess:%llu "
-                "Entry:%llu PC:%d Line:%d ChainPC:%d Disp:%llu Commit:%llu "
-                "Epoch:%u Seg:%llu ActiveAt:%u QDepth:%llu Limit:%u "
-                "Cand:%u Env:%u RegReady:%u RegHealth:%u RegFence:%u "
-                "HealthLock:%u Warm:%u Chain:%u Cap:%u Sel:%u Bind:%u Auth:%u "
-                "CommitOK:%u Reg:%u Buffered:%u Exact:%u Stable:%u "
-                "NoCb:%u Txn:%u Pending:%u Lock:%u Influence:%u "
-                "Bypass:%u MotionWrite:%u Acct:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadSnapshot.publicationSequence),
-                NCOrdinaryG00ReadAheadDecisionToDiagnosticName(
-                    ordinaryG00ReadAheadSnapshot.decision),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadSnapshot.session),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadSnapshot.warmupSession),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadSnapshot.entrySequence),
-                ordinaryG00ReadAheadSnapshot.sourcePC,
-                ordinaryG00ReadAheadSnapshot.sourceLineNumber,
-                ordinaryG00ReadAheadSnapshot.chainSourcePC,
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadSnapshot.dispatchId),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadSnapshot.commitSequence),
-                static_cast<unsigned int>(
-                    ordinaryG00ReadAheadSnapshot.identity.epoch),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadSnapshot.identity.segmentId),
-                ordinaryG00ReadAheadSnapshot.activeEntriesAtSelection,
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadSnapshot.queueDepthAtSelection),
-                ordinaryG00ReadAheadSnapshot.activeLimit,
-                ordinaryG00ReadAheadSnapshot.candidateExact ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.envelopeExact ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.registryReady ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.registryHealthy ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.registryHealthFenced
-                ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.registryHealthLockout
-                ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.legacyWarmupProven ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.contiguousChain ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.capacityAvailable ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.selected ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.dispatchBound ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.motionAuthorized ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.commitBound ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.registryBound ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.bufferedTransport ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.exactStop ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.stableExecutionEpoch ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.noPerBlockCallback ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.transactionalEndpoint ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.pending ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.permanentLockout ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.runtimeInfluence ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.resolverBypassed ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.motionWrite ? 1U : 0U,
-                ordinaryG00ReadAheadSnapshot.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K7-CNT] Eval:%llu Pub:%llu Ineligible:%llu "
-                "WarmWait:%llu RegFence:%llu HealthLock:%llu Discont:%llu "
-                "CapWait:%llu Select:%llu Bind:%llu "
-                "Auth:%llu Commit:%llu Reg:%llu Revoked:%llu "
-                "RuntimeFail:%llu Mis:%llu Warmup:%llu MaxActive:%llu "
-                "Influence:%llu Bypass:%llu MotionWrite:%llu "
-                "RegTry:%llu RegOK:%llu RegReject:%llu\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.evaluations),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.publications),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.ineligible),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.legacyWarmupWaits),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.registryHealthFences),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.registryHealthLockouts),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.discontinuityFallbacks),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.capacityWaits),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.selected),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.dispatchBound),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.motionAuthorized),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.committed),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.registryBound),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.revokedPending),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.runtimeFailures),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.proofMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.sessionWarmups),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.maxActiveObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.runtimeInfluence),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.resolverBypasses),
-                static_cast<unsigned long long>(
-                    ordinaryG00ReadAheadCounters.motionWrites),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.
-                    readAheadRegistrationAttempts),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.
-                    readAheadRegistered),
-                static_cast<unsigned long long>(
-                    ordinaryG00InflightRegistryCounters.
-                    readAheadRegistrationRejected));
-
-            RtPrintf(
-                "[NC02K73-FHC] Pub:%llu Coh:%llu BSeq:%llu GSeq:%llu "
-                "Phase:%s Decision:%s Sess:%llu Epoch:%u Owner:%u/%u "
-                "ActiveAt:%u Members:%u Term:%u Ack:%u Req:%u Early:%u "
-                "Applied:%u Order:%u CohortDone:%u AllDone:%u Active:%u "
-                "Cancel:%u Fail:%u Shadow:%u Influence:%u MotionWrite:%u "
-                "Acct:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortSnapshot.publicationSequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortSnapshot.cohortSequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortSnapshot.boundarySequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortSnapshot.gateSequence),
-                NCOrdinaryG00FeedHoldCohortPhaseToDiagnosticName(
-                    ordinaryG00FeedHoldCohortSnapshot.phase),
-                NCOrdinaryG00FeedHoldCohortDecisionToDiagnosticName(
-                    ordinaryG00FeedHoldCohortSnapshot.decision),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortSnapshot.session),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortSnapshot.executionEpoch),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortSnapshot.owner),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortSnapshot.ownerGeneration),
-                ordinaryG00FeedHoldCohortSnapshot.activeEntriesAtCapture,
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortSnapshot.memberCount),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortSnapshot.terminalCount),
-                ordinaryG00FeedHoldCohortSnapshot.holdAcknowledged ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.resumeRequested ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.
-                resumeBeforeAcknowledge ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.resumeApplied ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.terminalOrderValid ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.
-                terminalCohortComplete ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.allMembersCompleted
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.active ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.cancelled ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.failed ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.shadowOnly ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.runtimeInfluence ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.motionWrite ? 1U : 0U,
-                ordinaryG00FeedHoldCohortSnapshot.accountingValid ? 1U : 0U);
-
-            for (std::size_t memberIndex = 0U;
-                memberIndex < NC_ORDINARY_G00_FEED_HOLD_COHORT_SIZE;
-                ++memberIndex)
-            {
-                const NCOrdinaryG00FeedHoldCohortMemberSnapshot& member =
-                    ordinaryG00FeedHoldCohortSnapshot.members[memberIndex];
-                RtPrintf(
-                    "[NC02K73-M%u] Reg:%llu Entry:%llu Disp:%llu "
-                    "Commit:%llu PC:%d Line:%d Epoch:%u Seg:%llu "
-                    "SrcBlk:%d State:%s Last:%s FB:%llu Held:%u "
-                    "Resumed:%u Term:%u Ord:%u PreAck:%u PreResume:%u "
-                    "Done:%u Exact:%u\n",
-                    static_cast<unsigned int>(memberIndex),
-                    static_cast<unsigned long long>(member.registrySequence),
-                    static_cast<unsigned long long>(member.entrySequence),
-                    static_cast<unsigned long long>(member.dispatchId),
-                    static_cast<unsigned long long>(member.commitSequence),
-                    member.sourcePC,
-                    member.sourceLineNumber,
-                    static_cast<unsigned int>(member.identity.epoch),
-                    static_cast<unsigned long long>(member.identity.segmentId),
-                    static_cast<int>(member.identity.sourceBlockId),
-                    NCOrdinaryG00InflightStateToDiagnosticName(
-                        member.currentState),
-                    MotionFeedbackTypeToDiagnosticName(
-                        member.lastFeedbackType),
-                    static_cast<unsigned long long>(
-                        member.lastFeedbackSequence),
-                    member.heldObserved ? 1U : 0U,
-                    member.resumedObserved ? 1U : 0U,
-                    member.terminalObserved ? 1U : 0U,
-                    static_cast<unsigned int>(member.terminalOrdinal),
-                    member.terminalBeforeAcknowledge ? 1U : 0U,
-                    member.terminalBeforeResume ? 1U : 0U,
-                    member.terminalCompleted ? 1U : 0U,
-                    member.exact ? 1U : 0U);
-            }
-
-            RtPrintf(
-                "[NC02K73-CNT] Try:%llu Prog:%llu BypassOther:%llu "
-                "BypassN:%llu Capture:%llu BTrans:%llu Gate:%llu Ack:%llu "
-                "Early:%llu After:%llu Applied:%llu FbObs:%llu Match:%llu "
-                "Ignore:%llu Held:%llu Resume:%llu Term:%llu Done:%llu "
-                "Interrupt:%llu PreAck:%llu PreResume:%llu Cohort:%llu "
-                "AllDone:%llu IntCohort:%llu Cancel:%llu Super:%llu "
-                "Fail:%llu Influence:%llu MotionWrite:%llu\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.captureAttempts),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.programRequests),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.bypassNotProgram),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.bypassNotTwoActive),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.cohortsCaptured),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.boundaryTransitions),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.gateCorrelations),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.holdAcknowledged),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.
-                    resumeBeforeAcknowledge),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.
-                    resumeAfterAcknowledge),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.resumeApplied),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.feedbackObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.feedbackMatched),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.feedbackIgnored),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.held),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.resumed),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.terminals),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.completedTerminals),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.interruptedTerminals),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.
-                    terminalBeforeAcknowledge),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.terminalBeforeResume),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.terminalCohorts),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.allCompletedCohorts),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.interruptedCohorts),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.cancelled),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.superseded),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.failures),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.runtimeInfluence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.motionWrites));
-
-            RtPrintf(
-                "[NC02K73-FAIL] Boundary:%llu Registry:%llu Member:%llu "
-                "Session:%llu Identity:%llu Owner:%llu Ledger:%llu "
-                "Order:%llu DupTerm:%llu BMis:%llu GMis:%llu Acct:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.invalidBoundary),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.invalidRegistry),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.invalidMember),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.sessionMismatch),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.identityConflict),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.ownerMismatch),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.ledgerRejected),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.terminalOutOfOrder),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.duplicateTerminal),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.boundaryMismatch),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCounters.gateMismatch),
-                ordinaryG00FeedHoldCohortSnapshot.accountingValid ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K74-GATE] Pub:%llu Coh:%llu BSeq:%llu GSeq:%llu "
-                "Phase:%s Decision:%s Sess:%llu Epoch:%u ActiveAt:%u "
-                "ActiveN:%u Members:%u Term:%u Ack:%u Req:%u Applied:%u "
-                "Exact:%u Bound:%u Wait:%u Release:%u Fallback:%u "
-                "Lock:%u Enabled:%u Influence:%u Bypass:%u MotionWrite:%u "
-                "Acct:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.
-                    publicationSequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.cohortSequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.boundarySequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.gateSequence),
-                NCOrdinaryG00FeedHoldCohortCutoverPhaseToDiagnosticName(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.phase),
-                NCOrdinaryG00FeedHoldCohortCutoverDecisionToDiagnosticName(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.decision),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.session),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.executionEpoch),
-                ordinaryG00FeedHoldCohortCutoverSnapshot.
-                activeEntriesAtCapture,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.
-                registryActiveEntries,
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.memberCount),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortCutoverSnapshot.terminalCount),
-                ordinaryG00FeedHoldCohortCutoverSnapshot.
-                holdAcknowledged ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.
-                resumeRequested ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.
-                resumeApplied ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.exactCohort
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.bound ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.waiting ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.released ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.fallbackLegacy
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.sessionLockout
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.enabled ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.runtimeInfluence
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.resolverBypassed
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.motionWrite
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.accountingValid
-                ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K74-CNT] Obs:%llu Bind:%llu BypassOff:%llu "
-                "BypassNoCoh:%llu Stale:%llu Eval:%llu Bypass:%llu "
-                "WaitAck:%llu WaitResume:%llu WaitM0:%llu WaitM1:%llu "
-                "Release:%llu Allow:%llu Fallback:%llu Int:%llu "
-                "Cancel:%llu Proof:%llu RegMis:%llu AcctMis:%llu "
-                "SessReset:%llu Influence:%llu ResolverBypass:%llu "
-                "MotionWrite:%llu\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.observations),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.cohortsBound),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.bypassDisabled),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    bypassNoExactCohort),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    staleObservations),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.admissionChecks),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    admissionBypasses),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    waitHoldAcknowledge),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.waitResume),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    waitFirstTerminal),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    waitSecondTerminal),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.releases),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.allowReadAhead),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.fallbackLegacy),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    interruptedCohorts),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    cancelledCohorts),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.failedProofs),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    registryMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    accountingMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.sessionResets),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    runtimeInfluence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    resolverBypasses),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.motionWrites));
-
-            RtPrintf(
-                "[NC02K74-FAIL] Proof:%llu Reg:%llu Acct:%llu "
-                "Lock:%u Fallback:%u AcctOK:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.failedProofs),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    registryMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortCutoverCounters.
-                    accountingMismatches),
-                ordinaryG00FeedHoldCohortCutoverSnapshot.sessionLockout
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.fallbackLegacy
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortCutoverSnapshot.accountingValid
-                ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K75-RRM] Pub:%llu Phase:%s Decision:%s Sess:%llu "
-                "Gen:%u Rel:%u SameSess:%u Lease:%u CohSeq:%u BSeq:%u "
-                "GSeq:%u Isolate:%u NoOverlap:%u Proven:%u Fail:%u "
-                "Shadow:%u Influence:%u MotionWrite:%u Acct:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmSnapshot.
-                    publicationSequence),
-                NCOrdinaryG00FeedHoldCohortRearmPhaseToDiagnosticName(
-                    ordinaryG00FeedHoldCohortRearmSnapshot.phase),
-                NCOrdinaryG00FeedHoldCohortRearmDecisionToDiagnosticName(
-                    ordinaryG00FeedHoldCohortRearmSnapshot.decision),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmSnapshot.session),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortRearmSnapshot.generationCount),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldCohortRearmSnapshot.releaseCount),
-                ordinaryG00FeedHoldCohortRearmSnapshot.sameSession ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.sameExecutionLease
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.
-                cohortSequenceMonotonic ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.
-                boundarySequenceMonotonic ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.
-                gateSequenceMonotonic ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.memberIsolation
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.noOverlap ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.rearmProven ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.failed ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.shadowOnly ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.runtimeInfluence
-                ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.motionWrite ? 1U : 0U,
-                ordinaryG00FeedHoldCohortRearmSnapshot.accountingValid
-                ? 1U : 0U);
-
-            for (std::size_t generationIndex = 0U;
-                generationIndex <
-                NC_ORDINARY_G00_FEED_HOLD_REARM_GENERATIONS;
-                ++generationIndex)
-            {
-                const NCOrdinaryG00FeedHoldCohortGenerationSnapshot&
-                    generation =
-                    ordinaryG00FeedHoldCohortRearmSnapshot.
-                    generations[generationIndex];
-                RtPrintf(
-                    "[NC02K75-G%u] Coh:%llu BSeq:%llu GSeq:%llu "
-                    "Sess:%llu Epoch:%u Members:%u Term:%u Captured:%u "
-                    "Release:%u Exact:%u Order:%u Done:%u RegEmpty:%u "
-                    "E0:%llu D0:%llu S0:%llu E1:%llu D1:%llu S1:%llu\n",
-                    static_cast<unsigned int>(generationIndex),
-                    static_cast<unsigned long long>(
-                        generation.cohortSequence),
-                    static_cast<unsigned long long>(
-                        generation.boundarySequence),
-                    static_cast<unsigned long long>(generation.gateSequence),
-                    static_cast<unsigned long long>(generation.session),
-                    static_cast<unsigned int>(generation.executionEpoch),
-                    static_cast<unsigned int>(generation.memberCount),
-                    static_cast<unsigned int>(generation.terminalCount),
-                    generation.captured ? 1U : 0U,
-                    generation.released ? 1U : 0U,
-                    generation.exact ? 1U : 0U,
-                    generation.terminalOrderValid ? 1U : 0U,
-                    generation.allMembersCompleted ? 1U : 0U,
-                    generation.registryEmptyAtRelease ? 1U : 0U,
-                    static_cast<unsigned long long>(
-                        generation.memberEntrySequence[0]),
-                    static_cast<unsigned long long>(
-                        generation.memberDispatchId[0]),
-                    static_cast<unsigned long long>(
-                        generation.memberIdentity[0].segmentId),
-                    static_cast<unsigned long long>(
-                        generation.memberEntrySequence[1]),
-                    static_cast<unsigned long long>(
-                        generation.memberDispatchId[1]),
-                    static_cast<unsigned long long>(
-                        generation.memberIdentity[1].segmentId));
-            }
-
-            RtPrintf(
-                "[NC02K75-CNT] Obs:%llu Edge:%llu Bypass:%llu Gen:%llu "
-                "FirstB:%llu FirstR:%llu SecondB:%llu SecondR:%llu "
-                "Stable:%llu Stale:%llu Early:%llu Sess:%llu Lease:%llu "
-                "CohSeq:%llu BSeq:%llu GSeq:%llu Reuse:%llu Reg:%llu "
-                "Proof:%llu Fallback:%llu Acct:%llu SessReset:%llu "
-                "Fail:%llu "
-                "Influence:%llu MotionWrite:%llu\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.observations),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.cohortEdges),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.nonExactBypasses),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    generationsCaptured),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.firstBound),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.firstReleased),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.secondBound),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.secondReleased),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    stableObservations),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    staleObservations),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.earlyRearm),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    sessionMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    executionLeaseMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    cohortSequenceMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    boundarySequenceMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    gateSequenceMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    memberIdentityReuse),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    registryMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.proofMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.fallbackObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    accountingMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.sessionResets),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.failures),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.runtimeInfluence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.motionWrites));
-
-            RtPrintf(
-                "[NC02K75-FAIL] Early:%llu Sess:%llu Lease:%llu "
-                "CohSeq:%llu BSeq:%llu GSeq:%llu Reuse:%llu Reg:%llu "
-                "Proof:%llu Fallback:%llu Acct:%llu Fail:%llu AcctOK:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.earlyRearm),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    sessionMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    executionLeaseMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    cohortSequenceMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    boundarySequenceMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    gateSequenceMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    memberIdentityReuse),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    registryMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.proofMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.fallbackObserved),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.
-                    accountingMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldCohortRearmCounters.failures),
-                ordinaryG00FeedHoldCohortRearmSnapshot.accountingValid
-                ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K76-GATE] Pub:%llu RPub:%llu Phase:%s Decision:%s "
-                "Sess:%llu Coh:%llu BSeq:%llu GSeq:%llu Gen:%u Rel:%u "
-                "Exact:%u Bound:%u Wait:%u Release:%u Fallback:%u "
-                "Lock:%u Enabled:%u Influence:%u MotionWrite:%u Acct:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.
-                    publicationSequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.
-                    rearmPublicationSequence),
-                NCOrdinaryG00FeedHoldRearmCutoverPhaseToDiagnosticName(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.phase),
-                NCOrdinaryG00FeedHoldRearmCutoverDecisionToDiagnosticName(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.decision),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.session),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.cohortSequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.
-                    boundarySequence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.gateSequence),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.generationCount),
-                static_cast<unsigned int>(
-                    ordinaryG00FeedHoldRearmCutoverSnapshot.releaseCount),
-                ordinaryG00FeedHoldRearmCutoverSnapshot.
-                exactSecondGeneration ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.bound ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.waiting ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.released ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.fallbackLegacy
-                ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.sessionLockout
-                ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.enabled ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.runtimeInfluence
-                ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.motionWrite
-                ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.accountingValid
-                ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02K76-CNT] Obs:%llu Bind:%llu BypassOff:%llu "
-                "BypassPre:%llu Stale:%llu Eval:%llu EvalBypass:%llu "
-                "Wait74:%llu Wait75:%llu Release:%llu Allow:%llu "
-                "Fallback:%llu K75Fail:%llu K74Fail:%llu Sess:%llu "
-                "Seq:%llu Identity:%llu Reg:%llu Acct:%llu "
-                "SessReset:%llu Fail:%llu Influence:%llu MotionWrite:%llu\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.observations),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    secondGenerationsBound),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.bypassDisabled),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    bypassBeforeSecondGeneration),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    staleObservations),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.admissionChecks),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    admissionBypasses),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.waitK74Release),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    waitK75RearmProof),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.releases),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.allowReadAhead),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.fallbackLegacy),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.k75Failures),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.k74Failures),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    sessionMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    sequenceMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    identityMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    registryMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    accountingMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.sessionResets),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.failures),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    runtimeInfluence),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.motionWrites));
-
-            RtPrintf(
-                "[NC02K76-FAIL] K75:%llu K74:%llu Sess:%llu Seq:%llu "
-                "Identity:%llu Reg:%llu Acct:%llu Fail:%llu Lock:%u "
-                "Fallback:%u AcctOK:%u\n",
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.k75Failures),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.k74Failures),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    sessionMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    sequenceMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    identityMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    registryMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.
-                    accountingMismatches),
-                static_cast<unsigned long long>(
-                    ordinaryG00FeedHoldRearmCutoverCounters.failures),
-                ordinaryG00FeedHoldRearmCutoverSnapshot.sessionLockout
-                ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.fallbackLegacy
-                ? 1U : 0U,
-                ordinaryG00FeedHoldRearmCutoverSnapshot.accountingValid
-                ? 1U : 0U);
-
-            const std::uint64_t stopCommandMaxPps =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.maxAxisCommandVelocityAbsPps,
-                    1.0);
-            const std::uint64_t stopActualMaxPps =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.maxAxisActualVelocityAbsPps,
-                    1.0);
-            const std::uint64_t stopCommandDeadbandPps =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.commandVelocityDeadbandPps,
-                    1.0);
-            const std::uint64_t stopActualDeadbandPps =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.actualVelocityDeadbandPps,
-                    1.0);
-            const std::uint64_t followingErrorNm =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.worstFollowingErrorAbsMm,
-                    1000000.0);
-            const std::uint64_t followingWindowNm =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.worstFollowingErrorWindowMm,
-                    1000000.0);
-            const std::uint64_t followingRatioX1000 =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.worstFollowingErrorWindowRatio,
-                    1000.0);
-            const std::uint64_t groupFollowingErrorNm =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.worstGroupFollowingErrorAbsMm,
-                    1000000.0);
-            const std::uint64_t groupFollowingWindowNm =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.worstGroupFollowingErrorWindowMm,
-                    1000000.0);
-            const std::uint64_t groupFollowingRatioX1000 =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.worstGroupFollowingErrorWindowRatio,
-                    1000.0);
-            const std::uint64_t maximumStopDecTimeMs =
-                ScaleNonNegativeDiagnosticValue(
-                    stopSettleSnapshot.maxConfiguredStopDecTimeSec,
-                    1000.0);
-
-            RtPrintf(
-                "[NC02J4-SET] Gen:%llu Valid:%u Sample:%llu Stand:%u Block:%s "
-                "BAx:%d BState:%s GActive:%u Q:%u/%u/%u GAxes:%u "
-                "Axes:%u NonIdle:%u CmdMove:%u ActMove:%u PDO:%u/%u\n",
-                static_cast<unsigned long long>(
-                    stopSettleSnapshot.publicationGeneration),
-                stopSettleSnapshot.publicationGeneration != 0ULL ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    stopSettleSnapshot.sampleSequence),
-                stopSettleSnapshot.standstill ? 1U : 0U,
-                MotionStopSettleBlockerToDiagnosticName(
-                    stopSettleSnapshot.primaryBlocker),
-                stopSettleSnapshot.primaryAxisIndex,
-                MotionStateToDiagnosticName(
-                    stopSettleSnapshot.primaryAxisState),
-                stopSettleSnapshot.groupActive ? 1U : 0U,
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.commandQueueDepth),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.commandIngressDepth),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.commandReplayDepth),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.groupAxisCount),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.existingAxisCount),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.nonIdleAxisCount),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.commandMovingAxisCount),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.actualMovingAxisCount),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.pdoTargetVelocityNonzeroAxisCount),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.pdoTargetVelocitySampledAxisCount));
-
-            RtPrintf(
-                "[NC02J4-AX] CmdAx:%d CmdMax:%llu/%llu ActAx:%d "
-                "ActMax:%llu/%llu PDOAx:%d PDOMax:%u FollowAx:%d "
-                "ErrNm:%llu WinNm:%llu RatioX1000:%llu Outside:%u "
-                "GFollowAx:%d GErrNm:%llu GWinNm:%llu GRatioX1000:%llu "
-                "GOutside:%u StopAx:%d StopMs:%llu\n",
-                stopSettleSnapshot.worstCommandVelocityAxisIndex,
-                static_cast<unsigned long long>(stopCommandMaxPps),
-                static_cast<unsigned long long>(stopCommandDeadbandPps),
-                stopSettleSnapshot.worstActualVelocityAxisIndex,
-                static_cast<unsigned long long>(stopActualMaxPps),
-                static_cast<unsigned long long>(stopActualDeadbandPps),
-                stopSettleSnapshot.worstFinalPdoTargetVelocityAxisIndex,
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.maxFinalPdoTargetVelocityAbs),
-                stopSettleSnapshot.worstFollowingErrorAxisIndex,
-                static_cast<unsigned long long>(followingErrorNm),
-                static_cast<unsigned long long>(followingWindowNm),
-                static_cast<unsigned long long>(followingRatioX1000),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.outsideInPositionWindowAxisCount),
-                stopSettleSnapshot.worstGroupFollowingErrorAxisIndex,
-                static_cast<unsigned long long>(groupFollowingErrorNm),
-                static_cast<unsigned long long>(groupFollowingWindowNm),
-                static_cast<unsigned long long>(groupFollowingRatioX1000),
-                static_cast<unsigned int>(
-                    stopSettleSnapshot.groupOutsideInPositionWindowAxisCount),
-                stopSettleSnapshot.maxStopDecTimeAxisIndex,
-                static_cast<unsigned long long>(maximumStopDecTimeMs));
-
-            RtPrintf(
-                "[NC02J4-MCNT] Sample:%llu Stand:%llu Block:%llu "
-                "GActive:%llu CmdQ:%llu State:%llu CmdVel:%llu ActVel:%llu "
-                "BTrans:%llu STrans:%llu Into:%llu Out:%llu\n",
-                static_cast<unsigned long long>(
-                    stopSettleCounters.sampleCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.standstillSampleCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.blockedSampleCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.groupActiveBlockerCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.commandQueueBlockerCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.axisNotIdleBlockerCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.axisCommandVelocityBlockerCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.axisActualVelocityBlockerCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.primaryBlockerTransitionCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.standstillTransitionCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.transitionIntoStandstillCount),
-                static_cast<unsigned long long>(
-                    stopSettleCounters.transitionOutOfStandstillCount));
-
-            const bool resetStandstillSkew =
-                lifecycleInterruptionSnapshot.active &&
-                lifecycleInterruptionSnapshot.groupStandstill !=
-                stopSettleSnapshot.standstill;
-            const bool programEndStandstillSkew =
-                programEndSnapshot.requestPending &&
-                programEndSnapshot.groupStandstill !=
-                stopSettleSnapshot.standstill;
-            const bool barrierStandstillSkew =
-                preDispatchBarrierSnapshot.active &&
-                preDispatchBarrierSnapshot.groupStandstill !=
-                stopSettleSnapshot.standstill;
-
-            RtPrintf(
-                "[NC02J4-XCHK] RT:%u Reset:%u/%u Skew:%u "
-                "PEnd:%u/%u Skew:%u Bar:%u/%u Skew:%u FH:%u/%u\n",
-                stopSettleSnapshot.standstill ? 1U : 0U,
-                lifecycleInterruptionSnapshot.active ? 1U : 0U,
-                lifecycleInterruptionSnapshot.groupStandstill ? 1U : 0U,
-                resetStandstillSkew ? 1U : 0U,
-                programEndSnapshot.requestPending ? 1U : 0U,
-                programEndSnapshot.groupStandstill ? 1U : 0U,
-                programEndStandstillSkew ? 1U : 0U,
-                preDispatchBarrierSnapshot.active ? 1U : 0U,
-                preDispatchBarrierSnapshot.groupStandstill ? 1U : 0U,
-                barrierStandstillSkew ? 1U : 0U,
-                feedHoldSnapshot.active ? 1U : 0U,
-                feedHoldSnapshot.motion.actualStopped ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02I-SB] Seq:%llu D:%llu Phase:%s Decision:%s Kind:%s "
-                "Active:%u PC:%d Line:%d Commit:%u Cb:%u/%u Txn:%u/%u "
-                "Motion:%s Done:%u Fail:%u Ready:%u Pause:%u Hold:%u Ctrl:%u EndSup:%u\n",
-                static_cast<unsigned long long>(singleBlockShadowSnapshot.sequence),
-                static_cast<unsigned long long>(singleBlockShadowSnapshot.dispatchId),
-                NCSingleBlockShadowPhaseToDiagnosticName(
-                    singleBlockShadowSnapshot.phase),
-                NCSingleBlockShadowDecisionToDiagnosticName(
-                    singleBlockShadowSnapshot.decision),
-                NCSingleBlockCandidateKindToDiagnosticName(
-                    singleBlockShadowSnapshot.candidateKind),
-                singleBlockShadowSnapshot.active ? 1U : 0U,
-                singleBlockShadowSnapshot.sourcePC,
-                singleBlockShadowSnapshot.sourceLineNumber,
-                singleBlockShadowSnapshot.programCommitted ? 1U : 0U,
-                singleBlockShadowSnapshot.callbackComplete ? 1U : 0U,
-                singleBlockShadowSnapshot.callbackRequired ? 1U : 0U,
-                singleBlockShadowSnapshot.transactionComplete ? 1U : 0U,
-                singleBlockShadowSnapshot.transactionRequired ? 1U : 0U,
-                NCBlockMotionBoundaryStateToDiagnosticName(
-                    singleBlockShadowSnapshot.motionState),
-                singleBlockShadowSnapshot.motionComplete ? 1U : 0U,
-                singleBlockShadowSnapshot.motionFailed ? 1U : 0U,
-                singleBlockShadowSnapshot.boundaryReady ? 1U : 0U,
-                singleBlockShadowSnapshot.legacyPausePending ? 1U : 0U,
-                singleBlockShadowSnapshot.legacyHoldObserved ? 1U : 0U,
-                singleBlockShadowSnapshot.controlledHoldObserved ? 1U : 0U,
-                singleBlockShadowSnapshot.programEndSuppressed ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02I-CNT] ArmTry:%llu Armed:%llu NotEligible:%llu Eval:%llu "
-                "WaitLife:%llu WaitCommit:%llu WaitTxn:%llu WaitCb:%llu "
-                "WaitMotion:%llu Ready:%llu LegacyHold:%llu Agree:%llu "
-                "Early:%llu Phantom:%llu Missing:%llu CtrlHold:%llu "
-                "CtrlAgree:%llu CtrlEarly:%llu CtrlResume:%llu MotionFail:%llu "
-                "Overflow:%llu TxnFail:%llu EndSup:%llu Resume:%llu "
-                "Cancel:%llu Supersede:%llu\n",
-                static_cast<unsigned long long>(singleBlockShadowCounters.armAttempts),
-                static_cast<unsigned long long>(singleBlockShadowCounters.armed),
-                static_cast<unsigned long long>(singleBlockShadowCounters.notEligible),
-                static_cast<unsigned long long>(singleBlockShadowCounters.evaluations),
-                static_cast<unsigned long long>(singleBlockShadowCounters.waitLifecycle),
-                static_cast<unsigned long long>(singleBlockShadowCounters.waitProgramCommit),
-                static_cast<unsigned long long>(singleBlockShadowCounters.waitTransaction),
-                static_cast<unsigned long long>(singleBlockShadowCounters.waitCallback),
-                static_cast<unsigned long long>(singleBlockShadowCounters.waitMotion),
-                static_cast<unsigned long long>(singleBlockShadowCounters.boundaryReady),
-                static_cast<unsigned long long>(singleBlockShadowCounters.legacyHolds),
-                static_cast<unsigned long long>(singleBlockShadowCounters.agreeHolds),
-                static_cast<unsigned long long>(singleBlockShadowCounters.legacyEarlyHolds),
-                static_cast<unsigned long long>(singleBlockShadowCounters.legacyHoldWithoutArm),
-                static_cast<unsigned long long>(singleBlockShadowCounters.legacyMissingHold),
-                static_cast<unsigned long long>(singleBlockShadowCounters.controlledHolds),
-                static_cast<unsigned long long>(singleBlockShadowCounters.controlledAgreeHolds),
-                static_cast<unsigned long long>(singleBlockShadowCounters.controlledEarlyHoldAttempts),
-                static_cast<unsigned long long>(singleBlockShadowCounters.controlledResumed),
-                static_cast<unsigned long long>(singleBlockShadowCounters.motionFailures),
-                static_cast<unsigned long long>(singleBlockShadowCounters.trackingOverflow),
-                static_cast<unsigned long long>(singleBlockShadowCounters.transactionFailures),
-                static_cast<unsigned long long>(singleBlockShadowCounters.programEndSuppressed),
-                static_cast<unsigned long long>(singleBlockShadowCounters.resumed),
-                static_cast<unsigned long long>(singleBlockShadowCounters.cancelled),
-                static_cast<unsigned long long>(singleBlockShadowCounters.superseded));
-
-            RtPrintf(
-                "[NC02I-SG] Seq:%llu BSeq:%llu Enabled:%u Phase:%s Decision:%s "
-                "Active:%u D:%llu PC:%d Line:%d Kind:%s Match:%u Ready:%u "
-                "HoldReady:%u Hold:%u Resume:%u Explicit:%u EndSup:%u "
-                "Blocked:%u Cancel:%u\n",
-                static_cast<unsigned long long>(singleBlockGateSnapshot.sequence),
-                static_cast<unsigned long long>(singleBlockGateSnapshot.boundarySequence),
-                singleBlockGateSnapshot.enabled ? 1U : 0U,
-                NCSingleBlockHoldGatePhaseToDiagnosticName(
-                    singleBlockGateSnapshot.phase),
-                NCSingleBlockHoldGateDecisionToDiagnosticName(
-                    singleBlockGateSnapshot.decision),
-                singleBlockGateSnapshot.active ? 1U : 0U,
-                static_cast<unsigned long long>(singleBlockGateSnapshot.dispatchId),
-                singleBlockGateSnapshot.sourcePC,
-                singleBlockGateSnapshot.sourceLineNumber,
-                NCSingleBlockCandidateKindToDiagnosticName(
-                    singleBlockGateSnapshot.candidateKind),
-                singleBlockGateSnapshot.boundaryMatched ? 1U : 0U,
-                singleBlockGateSnapshot.boundaryReady ? 1U : 0U,
-                singleBlockGateSnapshot.holdReady ? 1U : 0U,
-                singleBlockGateSnapshot.holdApplied ? 1U : 0U,
-                singleBlockGateSnapshot.resumeApplied ? 1U : 0U,
-                singleBlockGateSnapshot.explicitStopBypass ? 1U : 0U,
-                singleBlockGateSnapshot.programEndSuppressed ? 1U : 0U,
-                singleBlockGateSnapshot.blocked ? 1U : 0U,
-                singleBlockGateSnapshot.cancelled ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02I-SCNT] Req:%llu Armed:%llu BypassOff:%llu "
-                "BypassStop:%llu Wait:%llu Ready:%llu Hold:%llu Resume:%llu "
-                "EndSup:%llu BlockMotion:%llu BlockTxn:%llu BlockOv:%llu "
-                "BlockCancel:%llu Cancel:%llu Super:%llu Rollback:%llu\n",
-                static_cast<unsigned long long>(singleBlockGateCounters.requestAttempts),
-                static_cast<unsigned long long>(singleBlockGateCounters.controlledArms),
-                static_cast<unsigned long long>(singleBlockGateCounters.legacyBypassDisabled),
-                static_cast<unsigned long long>(singleBlockGateCounters.legacyBypassExplicitStop),
-                static_cast<unsigned long long>(singleBlockGateCounters.waitBoundarySamples),
-                static_cast<unsigned long long>(singleBlockGateCounters.holdReady),
-                static_cast<unsigned long long>(singleBlockGateCounters.holdApplied),
-                static_cast<unsigned long long>(singleBlockGateCounters.resumeApplied),
-                static_cast<unsigned long long>(singleBlockGateCounters.programEndSuppressed),
-                static_cast<unsigned long long>(singleBlockGateCounters.blockedMotionFailure),
-                static_cast<unsigned long long>(singleBlockGateCounters.blockedTransactionFailure),
-                static_cast<unsigned long long>(singleBlockGateCounters.blockedTrackingOverflow),
-                static_cast<unsigned long long>(singleBlockGateCounters.blockedCancelled),
-                static_cast<unsigned long long>(singleBlockGateCounters.cancelled),
-                static_cast<unsigned long long>(singleBlockGateCounters.superseded),
-                static_cast<unsigned long long>(singleBlockGateCounters.rollbackDisabled));
-
-            const std::uint64_t feedrateOverrideX1000 =
-                ScaleNonNegativeDiagnosticValue(
-                    feedHoldSnapshot.motion.feedrateOverride,
-                    1000.0);
-            const std::uint64_t maximumCommandVelocityPps =
-                ScaleNonNegativeDiagnosticValue(
-                    feedHoldSnapshot.motion.maxAxisCommandVelocityPps,
-                    1.0);
-            const std::uint64_t maximumActualVelocityPps =
-                ScaleNonNegativeDiagnosticValue(
-                    feedHoldSnapshot.motion.maxAxisActualVelocityPps,
-                    1.0);
-
-            // RTX64 RtPrintf does not reliably support floating-point format
-            // specifiers. Passing doubles to %.3f / %.0f desynchronizes the
-            // remaining varargs and can make a later %s consume a non-pointer,
-            // causing 0xC0000005 inside the diagnostic formatter. Convert all
-            // floating-point values to scaled integers before RtPrintf.
-            RtPrintf(
-                "[NC02I-FH] Seq:%llu Src:%s Phase:%s Decision:%s Active:%u "
-                "PC:%d D:%llu Legacy:%u Ack:%u Stable:%u/%u "
-                "OvrX1000:%llu CmdStop:%u ActStop:%u HomePause:%u "
-                "CmdMaxPps:%llu ActMaxPps:%llu Q:%u/%u/%u "
-                "Owner:%s/%u->%s/%u Epoch:%llu->%llu Fail:%u\n",
-                static_cast<unsigned long long>(feedHoldSnapshot.sequence),
-                NCFeedHoldSourceToDiagnosticName(feedHoldSnapshot.source),
-                NCFeedHoldShadowPhaseToDiagnosticName(feedHoldSnapshot.phase),
-                NCFeedHoldShadowDecisionToDiagnosticName(feedHoldSnapshot.decision),
-                feedHoldSnapshot.active ? 1U : 0U,
-                feedHoldSnapshot.requestPC,
-                static_cast<unsigned long long>(feedHoldSnapshot.dispatchId),
-                feedHoldSnapshot.legacyHoldEntered ? 1U : 0U,
-                feedHoldSnapshot.acknowledged ? 1U : 0U,
-                static_cast<unsigned int>(feedHoldSnapshot.stableSamples),
-                static_cast<unsigned int>(feedHoldSnapshot.requiredStableSamples),
-                static_cast<unsigned long long>(feedrateOverrideX1000),
-                feedHoldSnapshot.motion.commandStopped ? 1U : 0U,
-                feedHoldSnapshot.motion.actualStopped ? 1U : 0U,
-                feedHoldSnapshot.homePaused ? 1U : 0U,
-                static_cast<unsigned long long>(maximumCommandVelocityPps),
-                static_cast<unsigned long long>(maximumActualVelocityPps),
-                static_cast<unsigned int>(feedHoldSnapshot.motion.commandQueueDepth),
-                static_cast<unsigned int>(feedHoldSnapshot.motion.commandIngressDepth),
-                static_cast<unsigned int>(feedHoldSnapshot.motion.commandReplayDepth),
-                MotionOwnerToDiagnosticName(feedHoldSnapshot.requestOwner),
-                static_cast<unsigned int>(feedHoldSnapshot.requestOwnerGeneration),
-                MotionOwnerToDiagnosticName(feedHoldSnapshot.currentOwner),
-                static_cast<unsigned int>(feedHoldSnapshot.currentOwnerGeneration),
-                static_cast<unsigned long long>(feedHoldSnapshot.requestExecutionEpoch),
-                static_cast<unsigned long long>(feedHoldSnapshot.currentExecutionEpoch),
-                feedHoldSnapshot.failed ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02I-FCNT] ReqTry:%llu Req:%llu Prog:%llu Home:%llu Eval:%llu "
-                "WaitOvr:%llu WaitCmd:%llu WaitAct:%llu WaitHome:%llu WaitStable:%llu "
-                "Ack:%llu Legacy:%llu Early:%llu Agree:%llu "
-                "ResumeReq:%llu ResumeEarly:%llu ResumeAck:%llu Resumed:%llu "
-                "OwnerFail:%llu EpochFail:%llu MotionFail:%llu AckLost:%llu "
-                "Cancel:%llu Super:%llu\n",
-                static_cast<unsigned long long>(feedHoldCounters.requestAttempts),
-                static_cast<unsigned long long>(feedHoldCounters.requestsLatched),
-                static_cast<unsigned long long>(feedHoldCounters.programRequests),
-                static_cast<unsigned long long>(feedHoldCounters.homeRequests),
-                static_cast<unsigned long long>(feedHoldCounters.evaluations),
-                static_cast<unsigned long long>(feedHoldCounters.waitOverrideZero),
-                static_cast<unsigned long long>(feedHoldCounters.waitCommandStop),
-                static_cast<unsigned long long>(feedHoldCounters.waitActualStop),
-                static_cast<unsigned long long>(feedHoldCounters.waitHomePaused),
-                static_cast<unsigned long long>(feedHoldCounters.waitStable),
-                static_cast<unsigned long long>(feedHoldCounters.acknowledged),
-                static_cast<unsigned long long>(feedHoldCounters.legacyHolds),
-                static_cast<unsigned long long>(feedHoldCounters.legacyEarlyHolds),
-                static_cast<unsigned long long>(feedHoldCounters.legacyAgreeHolds),
-                static_cast<unsigned long long>(feedHoldCounters.resumeRequests),
-                static_cast<unsigned long long>(feedHoldCounters.resumeBeforeAcknowledge),
-                static_cast<unsigned long long>(feedHoldCounters.resumeAfterAcknowledge),
-                static_cast<unsigned long long>(feedHoldCounters.resumed),
-                static_cast<unsigned long long>(feedHoldCounters.ownerChanged),
-                static_cast<unsigned long long>(feedHoldCounters.executionEpochChanged),
-                static_cast<unsigned long long>(feedHoldCounters.motionFault),
-                static_cast<unsigned long long>(feedHoldCounters.acknowledgeLost),
-                static_cast<unsigned long long>(feedHoldCounters.cancelled),
-                static_cast<unsigned long long>(feedHoldCounters.superseded));
-
-
-            RtPrintf(
-                "[NC02I-FG] Seq:%llu BSeq:%llu Enabled:%u Phase:%s Decision:%s "
-                "Active:%u Pending:%u Ack:%u Release:%u Applied:%u "
-                "Blocked:%u Cancel:%u Src:%s PC:%d D:%llu "
-                "Owner:%s/%u Epoch:%llu BActive:%u BFail:%u BCancel:%u\n",
-                static_cast<unsigned long long>(feedHoldGateSnapshot.sequence),
-                static_cast<unsigned long long>(feedHoldGateSnapshot.boundarySequence),
-                feedHoldGateSnapshot.enabled ? 1U : 0U,
-                NCFeedHoldResumeGatePhaseToDiagnosticName(
-                    feedHoldGateSnapshot.phase),
-                NCFeedHoldResumeGateDecisionToDiagnosticName(
-                    feedHoldGateSnapshot.decision),
-                feedHoldGateSnapshot.active ? 1U : 0U,
-                feedHoldGateSnapshot.deferredUntilAcknowledge ? 1U : 0U,
-                feedHoldGateSnapshot.acknowledgeObserved ? 1U : 0U,
-                feedHoldGateSnapshot.releaseReady ? 1U : 0U,
-                feedHoldGateSnapshot.resumeApplied ? 1U : 0U,
-                feedHoldGateSnapshot.blocked ? 1U : 0U,
-                feedHoldGateSnapshot.cancelled ? 1U : 0U,
-                NCFeedHoldSourceToDiagnosticName(feedHoldGateSnapshot.source),
-                feedHoldGateSnapshot.requestPC,
-                static_cast<unsigned long long>(feedHoldGateSnapshot.dispatchId),
-                MotionOwnerToDiagnosticName(feedHoldGateSnapshot.owner),
-                static_cast<unsigned int>(feedHoldGateSnapshot.ownerGeneration),
-                static_cast<unsigned long long>(feedHoldGateSnapshot.executionEpoch),
-                feedHoldGateSnapshot.boundaryActive ? 1U : 0U,
-                feedHoldGateSnapshot.boundaryFailed ? 1U : 0U,
-                feedHoldGateSnapshot.boundaryCancelled ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02I-GCNT] Req:%llu BypassOff:%llu BypassOther:%llu "
-                "Deferred:%llu Immediate:%llu Duplicate:%llu Release:%llu "
-                "Applied:%llu BlockFail:%llu BlockCancel:%llu Cancel:%llu "
-                "Super:%llu Rollback:%llu\n",
-                static_cast<unsigned long long>(feedHoldGateCounters.requestAttempts),
-                static_cast<unsigned long long>(feedHoldGateCounters.legacyBypassDisabled),
-                static_cast<unsigned long long>(feedHoldGateCounters.legacyBypassNotProgramFeedHold),
-                static_cast<unsigned long long>(feedHoldGateCounters.deferredBeforeAcknowledge),
-                static_cast<unsigned long long>(feedHoldGateCounters.immediateAfterAcknowledge),
-                static_cast<unsigned long long>(feedHoldGateCounters.duplicateRequests),
-                static_cast<unsigned long long>(feedHoldGateCounters.releaseOnAcknowledge),
-                static_cast<unsigned long long>(feedHoldGateCounters.resumeApplied),
-                static_cast<unsigned long long>(feedHoldGateCounters.blockedBoundaryFailed),
-                static_cast<unsigned long long>(feedHoldGateCounters.blockedBoundaryCancelled),
-                static_cast<unsigned long long>(feedHoldGateCounters.cancelled),
-                static_cast<unsigned long long>(feedHoldGateCounters.superseded),
-                static_cast<unsigned long long>(feedHoldGateCounters.rollbackDisabled));
-
-            if (shouldPrintJ6)
-            {
-                RtPrintf(
-                    "[NC02J6-ALM] Seq:%llu Code:%d Axis:%d Trigger:%s "
-                    "Phase:%s Decision:%s Active:%u Ack:%u Alarm:%u "
-                    "Upd:%u Count:%d LSeq:%llu\n",
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.sequence),
-                    static_cast<int>(
-                        alarmEmergencyStopSnapshot.alarmCode),
-                    static_cast<int>(
-                        alarmEmergencyStopSnapshot.alarmAxisIndex),
-                    NCAlarmEmergencyStopTriggerToDiagnosticName(
-                        alarmEmergencyStopSnapshot.trigger),
-                    NCAlarmEmergencyStopPhaseToDiagnosticName(
-                        alarmEmergencyStopSnapshot.phase),
-                    NCAlarmEmergencyStopDecisionToDiagnosticName(
-                        alarmEmergencyStopSnapshot.decision),
-                    alarmEmergencyStopSnapshot.active ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.acknowledged ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.alarmActive ? 1U : 0U,
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.alarmUpdateCount),
-                    static_cast<int>(
-                        alarmEmergencyStopSnapshot.alarmCount),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.lifecycleSequence));
-
-                RtPrintf(
-                    "[NC02J6-RT] Pub:%llu Req:%llu>%llu Apply:%llu>%llu "
-                    "Delta:%llu Inv:%llu>%llu Epoch:%llu>%llu Last:%llu "
-                    "Need:%u Owner:%s/%u LastOwner:%s/%u Match:%u\n",
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.motionPublicationGeneration),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.requestPublishedBaseline),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.requestPublishedCurrent),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.rtApplyBaseline),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.rtApplyCurrent),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.rtApplyDelta),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.epochInvalidationBaseline),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.epochInvalidationCurrent),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.requestExecutionEpoch),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.currentExecutionEpoch),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.lastAppliedExecutionEpoch),
-                    alarmEmergencyStopSnapshot.epochChangeRequired ? 1U : 0U,
-                    MotionOwnerToDiagnosticName(
-                        alarmEmergencyStopSnapshot.currentOwner),
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.currentOwnerGeneration),
-                    MotionOwnerToDiagnosticName(
-                        alarmEmergencyStopSnapshot.lastAppliedOwner),
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.lastAppliedOwnerGeneration),
-                    alarmEmergencyStopSnapshot.safetyOwnerMatched ? 1U : 0U);
-
-                RtPrintf(
-                    "[NC02J632-INV] From:%llu To:%llu Count:%llu "
-                    "Correlated:%u PreLatched:%u\n",
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.
-                        lastInvalidatedFromExecutionEpoch),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.
-                        lastInvalidatedToExecutionEpoch),
-                    static_cast<unsigned long long>(
-                        alarmEmergencyStopSnapshot.
-                        lastInvalidationCount),
-                    alarmEmergencyStopSnapshot.
-                    epochInvalidationCorrelated ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.
-                    preLatchedRTApplication ? 1U : 0U);
-
-                RtPrintf(
-                    "[NC02J6-AX] Expect:%08X Current:%08X ESTOP:%08X "
-                    "Error:%08X Cmd0:%08X Seal:%08X PDO:%08X/%08X "
-                    "Group:%u AxisSafe:%u CmdAll0:%u SealAll:%u PDOAll0:%u "
-                    "Coh:%u ReqSeen:%u RTAck:%u EpochOK:%u FbSync:%u "
-                    "Gap:%u Post:%u\n",
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.expectedAxisMask),
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.currentAxisMask),
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.estopAxisMask),
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.errorAxisMask),
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.commandZeroAxisMask),
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.targetSealedAxisMask),
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.pdoZeroAxisMask),
-                    static_cast<unsigned int>(
-                        alarmEmergencyStopSnapshot.pdoSampledAxisMask),
-                    alarmEmergencyStopSnapshot.groupStopApplied ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.allExistingAxesSafe ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.allExistingAxisCommandsZero ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.allExistingAxisTargetsSealed ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.allSampledPdoTargetVelocitiesZero ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.emergencyEvidenceCoherent ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.emergencyRequestObserved ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.rtApplyObserved ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.executionEpochMatched ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.feedbackSequenceSynchronized ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.lifecycleEvidenceGap ? 1U : 0U,
-                    alarmEmergencyStopSnapshot.postAlarmDispatchObserved ? 1U : 0U);
-
-                RtPrintf(
-                    "[NC02J6-CNT] ReqTry:%llu Req:%llu EStop:%llu "
-                    "Protect:%llu Limit:%llu Drive:%llu Lag:%llu NC:%llu "
-                    "EDM:%llu Other:%llu Eval:%llu WaitPub:%llu "
-                    "WaitReq:%llu WaitRT:%llu WaitOwner:%llu WaitEpoch:%llu "
-                    "WaitGroup:%llu WaitAxis:%llu WaitCmd:%llu WaitSeal:%llu "
-                    "Ack:%llu PreCorr:%llu PreAck:%llu ClearEarly:%llu "
-                    "Gap:%llu Replace:%llu "
-                    "AxisScope:%llu Super:%llu\n",
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.requestAttempts),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.requestsLatched),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.emergencyStopTriggers),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.axisProtectionTriggers),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.hardLimitTriggers),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.driveFaultTriggers),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.lagErrorTriggers),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.ncProgramTriggers),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.edmProcessTriggers),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.otherTriggers),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.evaluations),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitPublication),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitRequest),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitRTApply),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitSafetyOwner),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitExecutionEpoch),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitGroupStop),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitAxisSafeState),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitCommandZero),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.waitTargetSealed),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.acknowledged),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.preLatchedCorrelations),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.preLatchedAcknowledged),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.clearedBeforeAcknowledge),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.lifecycleEvidenceGap),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.lifecycleReplaced),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.axisScopeChanged),
-                    static_cast<unsigned long long>(alarmEmergencyStopCounters.superseded));
-            }
-
-            RtPrintf(
-                "[NC02J-INT] Seq:%llu Cause:%s Phase:%s Decision:%s Active:%u "
-                "EpochExp:%u Epoch:%llu>%llu>%llu Owner:%s/%u>%s/%u "
-                "ExecOwner:%s/%u "
-                "D:%llu PC:%d Blocks:%u>%u Term:%s TSeq:%llu Seg:%llu "
-                "SrcBlk:%d LedgerOK:%u TermSeen:%u AlarmAck:%u "
-                "RTEpoch:%u PreLatched:%u ExpAbort:%u ExpRetire:%u "
-                "PreWin:%u ClassOK:%u StopClosed:%u "
-                "ResetRetire:%u ResetClass:%u ResetCommit:%u "
-                "UnexpectedEpoch:%u PostDispatch:%u\n",
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.sequence),
-                NCLifecycleInterruptionCauseToDiagnosticName(
-                    lifecycleInterruptionSnapshot.cause),
-                NCLifecycleInterruptionPhaseToDiagnosticName(
-                    lifecycleInterruptionSnapshot.phase),
-                NCLifecycleInterruptionDecisionToDiagnosticName(
-                    lifecycleInterruptionSnapshot.decision),
-                lifecycleInterruptionSnapshot.active ? 1U : 0U,
-                lifecycleInterruptionSnapshot.expectsEpochChange ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.requestExecutionEpoch),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.publishedExecutionEpoch),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.currentExecutionEpoch),
-                MotionOwnerToDiagnosticName(
-                    lifecycleInterruptionSnapshot.requestOwner),
-                static_cast<unsigned int>(
-                    lifecycleInterruptionSnapshot.requestOwnerGeneration),
-                MotionOwnerToDiagnosticName(
-                    lifecycleInterruptionSnapshot.currentOwner),
-                static_cast<unsigned int>(
-                    lifecycleInterruptionSnapshot.currentOwnerGeneration),
-                MotionOwnerToDiagnosticName(
-                    lifecycleInterruptionSnapshot.requestExecutionOwner),
-                static_cast<unsigned int>(
-                    lifecycleInterruptionSnapshot.
-                    requestExecutionOwnerGeneration),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.requestDispatchId),
-                lifecycleInterruptionSnapshot.requestPC,
-                static_cast<unsigned int>(
-                    lifecycleInterruptionSnapshot.requestActiveBlocks),
-                static_cast<unsigned int>(
-                    lifecycleInterruptionSnapshot.activeBlocks),
-                MotionFeedbackTypeToDiagnosticName(
-                    lifecycleInterruptionSnapshot.lastTerminalFeedbackType),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.lastTerminalFeedbackSequence),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.lastTerminalIdentity.segmentId),
-                static_cast<int>(
-                    lifecycleInterruptionSnapshot.lastTerminalIdentity.sourceBlockId),
-                lifecycleInterruptionSnapshot.terminalFeedbackLedgerAccepted ? 1U : 0U,
-                lifecycleInterruptionSnapshot.terminalFailureObserved ? 1U : 0U,
-                lifecycleInterruptionSnapshot.alarmStopAcknowledged ? 1U : 0U,
-                lifecycleInterruptionSnapshot.runtimeAlarmEpochChangeObserved ? 1U : 0U,
-                lifecycleInterruptionSnapshot.alarmStopPreLatchedRTApplication ? 1U : 0U,
-                lifecycleInterruptionSnapshot.expectedAlarmAbortObserved ? 1U : 0U,
-                lifecycleInterruptionSnapshot.expectedAlarmPreReadRejectObserved ? 1U : 0U,
-                lifecycleInterruptionSnapshot.expectedAlarmPreLatchedTerminalObserved ? 1U : 0U,
-                lifecycleInterruptionSnapshot.alarmTerminalClassificationValid ? 1U : 0U,
-                lifecycleInterruptionSnapshot.alarmStopClosed ? 1U : 0U,
-                lifecycleInterruptionSnapshot.expectedResetPreReadRejectObserved ? 1U : 0U,
-                lifecycleInterruptionSnapshot.resetTerminalClassificationValid ? 1U : 0U,
-                lifecycleInterruptionSnapshot.resetRetirementCommitted ? 1U : 0U,
-                lifecycleInterruptionSnapshot.unexpectedEpochChangeObserved ? 1U : 0U,
-                lifecycleInterruptionSnapshot.postInterruptionDispatchObserved ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02J-DRN] AxisQ:%llu AxisR:%llu CmdQ:%llu In:%llu "
-                "Replay:%llu Fb:%llu Notice:%llu FbSeq:%llu/%llu "
-                "Safety:%u Cb:%u Bind:%u Stand:%u Stable:%u/%u "
-                "Ready:%u Quiet:%u Gap:%u Dispatch:%llu DltFail:%llu "
-                "RawFail:%llu ExpAbort:%llu ExpReject:%llu UnexpReject:%llu "
-                "ExpOwner:%llu ExpStale:%llu PreAbort:%llu PreReject:%llu "
-                "RstReject:%llu RstOwner:%llu RstStale:%llu "
-                "Rej:%llu Cancel:%llu "
-                "Abort:%llu Fault:%llu Ledger:%llu "
-                "FbOv:%llu NoticeOv:%llu SeqGap:%llu\n",
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.axisCommandDepth),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.axisResultDepth),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.commandQueueDepth),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.commandIngressDepth),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.commandReplayDepth),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.feedbackDepth),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.feedbackNoticeDepth),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.lastPublishedFeedbackSequence),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.lastConsumedFeedbackSequence),
-                lifecycleInterruptionSnapshot.safetyOrRecoveryPending ? 1U : 0U,
-                lifecycleInterruptionSnapshot.waitCallbackActive ? 1U : 0U,
-                lifecycleInterruptionSnapshot.completionBindingActive ? 1U : 0U,
-                lifecycleInterruptionSnapshot.groupStandstill ? 1U : 0U,
-                static_cast<unsigned int>(
-                    lifecycleInterruptionSnapshot.stableSamples),
-                static_cast<unsigned int>(
-                    lifecycleInterruptionSnapshot.requiredStableSamples),
-                lifecycleInterruptionSnapshot.quiescentReady ? 1U : 0U,
-                lifecycleInterruptionSnapshot.quiescent ? 1U : 0U,
-                lifecycleInterruptionSnapshot.evidenceGap ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.dispatchDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.unexpectedBlockFailureDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.blockFailureDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.expectedAlarmAbortDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.expectedAlarmPreReadRejectDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.unexpectedFeedbackRejectedDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.expectedAlarmOwnerConflictRejectDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.expectedAlarmStaleEpochRejectDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.expectedAlarmPreLatchedAbortDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.expectedAlarmPreLatchedRejectDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.expectedResetPreReadRejectDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.expectedResetOwnerConflictRejectDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.expectedResetStaleEpochRejectDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.feedbackRejectedDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.feedbackCancelledDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.feedbackAbortedDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.feedbackFaultedDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.ledgerIntegrityDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.feedbackOverflowDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.feedbackNoticeOverflowDelta),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionSnapshot.feedbackSequenceGapDelta));
-
-            RtPrintf(
-                "[NC02J-CNT] ReqTry:%llu Req:%llu Reset:%llu Alarm:%llu "
-                "Prog:%llu MDI:%llu Manual:%llu Dynamic:%llu Goto:%llu "
-                "TermReq:%llu EpochExp:%llu EpochObs:%llu Unexpected:%llu "
-                "EpochSuper:%llu AlarmAck:%llu RTEpoch:%llu ExpAbort:%llu "
-                "ExpReject:%llu ExpOwner:%llu ExpStale:%llu "
-                "PreAbort:%llu PreReject:%llu RstReject:%llu "
-                "RstOwner:%llu RstStale:%llu StopClose:%llu "
-                "TRej:%llu TCancel:%llu TAbort:%llu "
-                "TFault:%llu LedgerReject:%llu PostDispatch:%llu Eval:%llu Quiet:%llu "
-                "Gap:%llu Super:%llu\n",
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.requestAttempts),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.requestsLatched),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.resetRequests),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.alarmRequests),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.programReplaceRequests),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.mdiReplaceRequests),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.manualAutoReplaceRequests),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.dynamicCodeReplaceRequests),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.gotoEpochRequests),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.terminalTriggeredRequests),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.epochPublicationsExpected),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.epochPublicationsObserved),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.unexpectedEpochChanges),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.epochSuperseded),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.alarmStopAcknowledgements),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.runtimeAlarmEpochChanges),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.expectedAlarmAborts),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.expectedAlarmPreReadRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.expectedAlarmOwnerConflictRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.expectedAlarmStaleEpochRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.expectedAlarmPreLatchedAborts),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.expectedAlarmPreLatchedRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.expectedResetPreReadRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.expectedResetOwnerConflictRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.expectedResetStaleEpochRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.alarmStopsClosed),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.terminalRejected),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.terminalCancelled),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.terminalAborted),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.terminalFaulted),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.terminalLedgerRejected),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.postInterruptionDispatch),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.evaluations),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.quiescent),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.evidenceGap),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.superseded));
-
-            RtPrintf(
-                "[NC02J631-TRN] RawTotal:%llu Unexpected:%llu "
-                "RawOwner:%llu RawStale:%llu RawFbRej:%llu "
-                "ExpOwner:%llu ExpStale:%llu ExpFbRej:%llu "
-                "AlarmOwner:%llu AlarmStale:%llu AlarmFb:%llu "
-                "ResetOwner:%llu ResetStale:%llu ResetFb:%llu "
-                "ResidualOwner:%llu ResidualStale:%llu ResidualFb:%llu\n",
-                static_cast<unsigned long long>(transportRawErrorTotal),
-                static_cast<unsigned long long>(transportErrorTotal),
-                static_cast<unsigned long long>(ownerConflictReject),
-                static_cast<unsigned long long>(staleDiscard),
-                static_cast<unsigned long long>(feedbackRejected),
-                static_cast<unsigned long long>(expectedOwnerConflictReject),
-                static_cast<unsigned long long>(expectedStaleDiscard),
-                static_cast<unsigned long long>(expectedFeedbackRejected),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.
-                    expectedAlarmOwnerConflictRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.
-                    expectedAlarmStaleEpochRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.
-                    expectedAlarmPreReadRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.
-                    expectedResetOwnerConflictRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.
-                    expectedResetStaleEpochRejects),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.
-                    expectedResetPreReadRejects),
-                static_cast<unsigned long long>(
-                    unexpectedOwnerConflictReject),
-                static_cast<unsigned long long>(unexpectedStaleDiscard),
-                static_cast<unsigned long long>(unexpectedFeedbackRejected));
-
-            RtPrintf(
-                "[NC02J-WAIT] Epoch:%llu Blocks:%llu AxisQ:%llu AxisR:%llu "
-                "In:%llu Replay:%llu CmdQ:%llu Notice:%llu Fb:%llu "
-                "FbSeq:%llu Cb:%llu Bind:%llu Safety:%llu Stand:%llu "
-                "Stable:%llu AlarmAck:%llu AlarmTerm:%llu AlarmStable:%llu "
-                "GapFb:%llu GapNotice:%llu GapSeq:%llu "
-                "GapLedger:%llu GapReject:%llu\n",
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitEpochPublication),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitActiveBlocks),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitAxisCommand),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitAxisResult),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitCommandIngress),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitCommandReplay),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitCommandQueue),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitFeedbackNotice),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitFeedback),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitFeedbackSequence),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitCallback),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitCompletionBinding),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitSafetyRequest),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitGroupStandstill),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitStableConfirmation),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitAlarmStopAcknowledgement),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitAlarmStopTerminal),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.waitAlarmStopStable),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.feedbackOverflowEvidenceGap),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.feedbackNoticeOverflowEvidenceGap),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.feedbackSequenceEvidenceGap),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.ledgerIntegrityEvidenceGap),
-                static_cast<unsigned long long>(
-                    lifecycleInterruptionCounters.ledgerRejectedEvidenceGap));
-
-            RtPrintf(
-                "[NC02J-RG] Seq:%llu BSeq:%llu Phase:%s Decision:%s "
-                "Active:%u Epoch:%llu/%llu/%llu Match:%u/%u "
-                "Safety:%s/%u Lease:%u/%u BOwner:%s/%u OMatch:%u "
-                "BPhase:%s BDecision:%s Stable:%u/%u Stand:%u "
-                "Quiet:%u Ready:%u Attempt:%u Applied:%u Block:%u\n",
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.sequence),
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.boundarySequence),
-                NCResetReleaseGatePhaseToDiagnosticName(
-                    resetReleaseGateSnapshot.phase),
-                NCResetReleaseGateDecisionToDiagnosticName(
-                    resetReleaseGateSnapshot.decision),
-                resetReleaseGateSnapshot.active ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.expectedExecutionEpoch),
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.boundaryPublishedExecutionEpoch),
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.boundaryCurrentExecutionEpoch),
-                resetReleaseGateSnapshot.publishedEpochMatched ? 1U : 0U,
-                resetReleaseGateSnapshot.currentEpochMatched ? 1U : 0U,
-                MotionOwnerToDiagnosticName(
-                    resetReleaseGateSnapshot.safetyOwner),
-                static_cast<unsigned int>(
-                    resetReleaseGateSnapshot.safetyOwnerGeneration),
-                resetReleaseGateSnapshot.safetyLeaseValid ? 1U : 0U,
-                resetReleaseGateSnapshot.safetyLeaseCurrent ? 1U : 0U,
-                MotionOwnerToDiagnosticName(
-                    resetReleaseGateSnapshot.boundaryCurrentOwner),
-                static_cast<unsigned int>(
-                    resetReleaseGateSnapshot.boundaryCurrentOwnerGeneration),
-                resetReleaseGateSnapshot.boundaryOwnerMatched ? 1U : 0U,
-                NCLifecycleInterruptionPhaseToDiagnosticName(
-                    resetReleaseGateSnapshot.boundaryPhase),
-                NCLifecycleInterruptionDecisionToDiagnosticName(
-                    resetReleaseGateSnapshot.boundaryDecision),
-                static_cast<unsigned int>(
-                    resetReleaseGateSnapshot.stableSamples),
-                static_cast<unsigned int>(
-                    resetReleaseGateSnapshot.requiredStableSamples),
-                resetReleaseGateSnapshot.groupStandstill ? 1U : 0U,
-                resetReleaseGateSnapshot.quiescenceProved ? 1U : 0U,
-                resetReleaseGateSnapshot.releaseReady ? 1U : 0U,
-                resetReleaseGateSnapshot.releaseAttempted ? 1U : 0U,
-                resetReleaseGateSnapshot.releaseApplied ? 1U : 0U,
-                resetReleaseGateSnapshot.blocked ? 1U : 0U);
-
-            RtPrintf(
-                "[NC02J-RCNT] ArmTry:%llu Arm:%llu ReArm:%llu "
-                "Eval:%llu Wait:%llu Ready:%llu RelTry:%llu Released:%llu "
-                "Inv:%llu Seq:%llu Cause:%llu Gap:%llu Super:%llu "
-                "Incomplete:%llu Epoch:%llu Lease:%llu ReleaseFail:%llu "
-                "PostDispatch:%llu\n",
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.armAttempts),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.armed),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.supersededArms),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.evaluations),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.waitQuiescence),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.releaseReady),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.releaseAttempts),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.released),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedInvalidBoundary),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedBoundarySequence),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedBoundaryCause),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedEvidenceGap),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedSuperseded),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedIncomplete),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedEpochMismatch),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedSafetyLease),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedOwnerRelease),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.blockedPostInterruptionDispatch));
+            RunHmiDiagnosticOutputFamily([&]()
+                {
+                    RtPrintf(
+                        "[NC02J64-LAG] Existing:%02X Ready:%02X Aligned:%02X "
+                        "Armed:%02X Pending:%02X Blocked:%02X Stable:%u/%u ",
+                        static_cast<unsigned int>(
+                            startupLagArming.existingAxisMask),
+                        static_cast<unsigned int>(
+                            startupLagArming.feedbackReadyAxisMask),
+                        static_cast<unsigned int>(
+                            startupLagArming.positionAlignedAxisMask),
+                        static_cast<unsigned int>(
+                            startupLagArming.lagArmedAxisMask),
+                        static_cast<unsigned int>(
+                            startupLagArming.pendingAxisMask),
+                        static_cast<unsigned int>(
+                            startupLagArming.prematureMotionBlockedAxisMask),
+                        static_cast<unsigned int>(
+                            startupLagArming.minimumStableSampleCount),
+                        static_cast<unsigned int>(
+                            startupLagArming.stableSamplesRequired));
+                    RtPrintf(
+                        "Align:%llu Arm:%llu Reset:%llu Early:%llu All:%u\n",
+                        static_cast<unsigned long long>(
+                            startupLagArming.alignmentEvents),
+                        static_cast<unsigned long long>(
+                            startupLagArming.armingTransitions),
+                        static_cast<unsigned long long>(
+                            startupLagArming.readinessResets),
+                        static_cast<unsigned long long>(
+                            startupLagArming.prematureMotionBlocks),
+                        startupLagArming.allExistingAxesArmed ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K21-P1] MapStop:%llu Retire:%llu RetireFail:%llu "
+                        "Orphan:%llu Invalid:%llu AlarmReq:%llu AlarmEpoch:%u "
+                        "Pending:%u "
+                        "Prev:%02X Next:%02X LastAx:%d Pass:%u\n",
+                        static_cast<unsigned long long>(
+                            p1HandoverSafety.mappingBoundaryStops),
+                        static_cast<unsigned long long>(
+                            p1HandoverSafety.droppedAxisRetirements),
+                        static_cast<unsigned long long>(
+                            p1HandoverSafety.droppedAxisRetirementFailures),
+                        static_cast<unsigned long long>(
+                            p1HandoverSafety.orphanAxisContainments),
+                        static_cast<unsigned long long>(
+                            p1HandoverSafety.invalidProducerRejects),
+                        static_cast<unsigned long long>(
+                            p1HandoverSafety.mappingIntegrityAlarmRequests),
+                        static_cast<unsigned int>(
+                            p1HandoverSafety.
+                            lastMappingIntegrityAlarmExecutionEpoch),
+                        p1HandoverSafety.mappingIntegrityAlarmPending ? 1U : 0U,
+                        static_cast<unsigned int>(
+                            p1HandoverSafety.lastPreviousAxisMask),
+                        static_cast<unsigned int>(
+                            p1HandoverSafety.lastNextAxisMask),
+                        p1HandoverSafety.lastOrphanAxisIndex,
+                        (p1HandoverSafety.droppedAxisRetirementFailures == 0ULL &&
+                            p1HandoverSafety.orphanAxisContainments == 0ULL &&
+                            p1HandoverSafety.invalidProducerRejects == 0ULL &&
+                            !p1HandoverSafety.mappingIntegrityAlarmPending)
+                        ? 1U
+                        : 0U);
+
+                    const bool lifecycleCommitBalanced =
+                        lifecycleCommit.acquired ==
+                        lifecycleCommit.released +
+                        (lifecycleCommit.reservationActive ? 1ULL : 0ULL);
+                    RtPrintf(
+                        "[NC02K22-CAS] Try:%llu Acq:%llu Block:%llu Lost:%llu "
+                        "Rel:%llu RelFail:%llu PubWait:%llu Active:%u Pending:%u "
+                        "Epoch:%u Pass:%u\n",
+                        static_cast<unsigned long long>(lifecycleCommit.attempts),
+                        static_cast<unsigned long long>(lifecycleCommit.acquired),
+                        static_cast<unsigned long long>(
+                            lifecycleCommit.blockedByLifecycle),
+                        static_cast<unsigned long long>(
+                            lifecycleCommit.compareExchangeLost),
+                        static_cast<unsigned long long>(lifecycleCommit.released),
+                        static_cast<unsigned long long>(
+                            lifecycleCommit.releaseFailures),
+                        static_cast<unsigned long long>(
+                            lifecycleCommit.publisherWaits),
+                        lifecycleCommit.reservationActive ? 1U : 0U,
+                        lifecycleCommit.executionEpochPending ? 1U : 0U,
+                        static_cast<unsigned int>(
+                            lifecycleCommit.currentExecutionEpoch),
+                        (lifecycleCommitBalanced &&
+                            lifecycleCommit.releaseFailures == 0ULL)
+                        ? 1U
+                        : 0U);
+
+                    RtPrintf(
+                        "[NC01F-RT] NC:%d Mode:%d Owner:%s(%u) Gen:%u "
+                        "Safety:%u AxisQ:%llu CmdIn:%llu Replay:%llu "
+                        "FbQ:%llu Notice:%llu\n",
+                        static_cast<int>(nc->GetState()),
+                        static_cast<int>(nc->GetMode()),
+                        MotionOwnerToDiagnosticName(ownerLease.owner),
+                        static_cast<unsigned int>(ownerLease.owner),
+                        static_cast<unsigned int>(ownerLease.generation),
+                        safetyPending ? 1U : 0U,
+                        static_cast<unsigned long long>(axisCommandDepth),
+                        static_cast<unsigned long long>(commandIngressDepth),
+                        static_cast<unsigned long long>(commandReplayDepth),
+                        static_cast<unsigned long long>(feedbackDepth),
+                        static_cast<unsigned long long>(feedbackNoticeDepth));
+
+                    RtPrintf(
+                        "[NC02K6-PATH] Payload:%u Ready:%u Shadow:%u Apply:%u "
+                        "Influence:%u Cutover:%u Coh:%u/%u Acct:%u\n",
+                        commandPathModeTransport.commandLocalPayloadPresent ? 1U : 0U,
+                        commandPathModeTransport.transportReady ? 1U : 0U,
+                        commandPathModeTransport.shadowOnly ? 1U : 0U,
+                        commandPathModeTransport.consumerAuthority ? 1U : 0U,
+                        commandPathModeTransport.runtimeInfluence ? 1U : 0U,
+                        commandPathModeTransport.cutoverAttempted ? 1U : 0U,
+                        commandPathModeTransport.producerSnapshotCoherent ? 1U : 0U,
+                        commandPathModeTransport.consumerSnapshotCoherent ? 1U : 0U,
+                        commandPathModeTransport.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K6-CNT] Submit:%llu Accept:%llu Reject:%llu "
+                        "PE:%llu PC:%llu PU:%llu PI:%llu Observe:%llu ",
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.producerAccepted +
+                            commandPathModeTransport.producerRejected),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.producerAccepted),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.producerRejected),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.producerExactStop),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.producerContinuous),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.producerUnspecified),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.producerInvalid),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.consumerCommitted));
+                    RtPrintf(
+                        "Ingress:%llu Replay:%llu CE:%llu CC:%llu CU:%llu CI:%llu "
+                        "Match:%llu Mis:%llu Driver:%llu PF:%016llX CF:%016llX\n",
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.consumerIngressCommitted),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.consumerReplayCommitted),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.consumerExactStop),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.consumerContinuous),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.consumerUnspecified),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.consumerInvalid),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.legacyModeMatches),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.legacyModeMismatches),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.driverOverrideObservations),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.producerFingerprint),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.consumerFingerprint));
+
+                    RtPrintf(
+                        "[NC02K61-AUTH] Try:%llu Apply:%llu Exact:%llu Cont:%llu "
+                        "Legacy:%llu Replay:%llu DriverBlock:%llu Invalid:%llu "
+                        "Acct:%u\n",
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.authorityAttempts),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.authorityApplied),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.authorityExactStop),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.authorityContinuous),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.authorityLegacyFallbacks),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.authorityReplayBypasses),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.authorityDriverBlocks),
+                        static_cast<unsigned long long>(
+                            commandPathModeTransport.authorityInvalidRejects),
+                        commandPathModeTransport.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K62-TAIL] Try:%llu Accept:%llu Reject:%llu "
+                        "Commit:%llu Preserve:%llu MCS:%llu Pulse:%llu "
+                        "Ovr:%llu Exact:%llu Bound:%llu Invalid:%llu Mis:%llu ",
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.attempts),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.commandAccepted),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.commandRejected),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.committed),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.rejectPreserved),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.commandedMCSCommitted),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.lastQueuedPulseCommitted),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.rapidOverrideCommitted),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.endpointExact),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.captureBound),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.invalidInputs),
+                        static_cast<unsigned long long>(
+                            queueTailTransaction.mismatches));
+                    RtPrintf(
+                        "Ready:%u Coh:%u Acct:%u\n",
+                        queueTailTransaction.ready ? 1U : 0U,
+                        queueTailTransaction.snapshotCoherent ? 1U : 0U,
+                        queueTailTransaction.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC01F-CNT] AxisQFull:%llu AxisResOv:%llu "
+                        "OwnerReject:%llu Stale:%llu CmdFull:%llu ReplayOv:%llu "
+                        "FbOv:%llu NoticeOv:%llu FbProc:%llu FbGap:%llu ",
+                        static_cast<unsigned long long>(axisQueueFull),
+                        static_cast<unsigned long long>(axisResultOverflow),
+                        static_cast<unsigned long long>(ownerConflictReject),
+                        static_cast<unsigned long long>(staleDiscard),
+                        static_cast<unsigned long long>(commandQueueFull),
+                        static_cast<unsigned long long>(replayOverflow),
+                        static_cast<unsigned long long>(feedbackOverflow),
+                        static_cast<unsigned long long>(feedbackNoticeOverflow),
+                        static_cast<unsigned long long>(feedbackProcessed),
+                        static_cast<unsigned long long>(feedbackSequenceGap));
+                    RtPrintf(
+                        "FbAcc:%llu FbStart:%llu FbDone:%llu FbReject:%llu "
+                        "FbCancel:%llu FbAbort:%llu FbFault:%llu\n",
+                        static_cast<unsigned long long>(feedbackAccepted),
+                        static_cast<unsigned long long>(feedbackStarted),
+                        static_cast<unsigned long long>(feedbackCompleted),
+                        static_cast<unsigned long long>(feedbackRejected),
+                        static_cast<unsigned long long>(feedbackCancelled),
+                        static_cast<unsigned long long>(feedbackAborted),
+                        static_cast<unsigned long long>(feedbackFaulted));
+
+                });
+            RunHmiDiagnosticOutputFamily([&]()
+                {
+                    RtPrintf(
+                        "[NC02D-BLK] D:%llu Scope:%u Cache:%llu Frame:%llu "
+                        "PC:%d Line:%d State:%s Commit:%u Seg:%u ",
+                        static_cast<unsigned long long>(
+                            hasBlockLifecycle ? blockLifecycle.dispatchId : 0ULL),
+                        static_cast<unsigned int>(
+                            hasBlockLifecycle ? blockLifecycle.programTarget.scope :
+                            NCProgramScope::NONE),
+                        static_cast<unsigned long long>(
+                            hasBlockLifecycle ? blockLifecycle.programTarget.cacheGeneration : 0ULL),
+                        static_cast<unsigned long long>(
+                            hasBlockLifecycle ? blockLifecycle.programTarget.frameId : 0ULL),
+                        hasBlockLifecycle ? blockLifecycle.programTarget.sourcePC : -1,
+                        hasBlockLifecycle ? blockLifecycle.sourceLineNumber : 0,
+                        NCBlockLifecycleStateToDiagnosticName(
+                            hasBlockLifecycle ? blockLifecycle.state :
+                            NCBlockLifecycleState::NONE),
+                        hasBlockLifecycle && blockLifecycle.programCommitted ? 1U : 0U,
+                        hasBlockLifecycle ?
+                        static_cast<unsigned int>(blockLifecycle.motionSegmentCount) : 0U);
+                    RtPrintf(
+                        "Acc:%u Start:%u Done:%u Term:%u Fail:%u Ov:%u\n",
+                        hasBlockLifecycle ?
+                        static_cast<unsigned int>(blockLifecycle.motionAcceptedCount) : 0U,
+                        hasBlockLifecycle ?
+                        static_cast<unsigned int>(blockLifecycle.motionStartedCount) : 0U,
+                        hasBlockLifecycle ?
+                        static_cast<unsigned int>(blockLifecycle.motionCompletedCount) : 0U,
+                        hasBlockLifecycle ?
+                        static_cast<unsigned int>(blockLifecycle.motionTerminalCount) : 0U,
+                        hasBlockLifecycle ?
+                        static_cast<unsigned int>(blockLifecycle.motionFailedCount) : 0U,
+                        hasBlockLifecycle && blockLifecycle.motionCaptureOverflow ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02D-CNT] Dispatch:%llu Commit:%llu ProgOnly:%llu "
+                        "MotionBlk:%llu Seg:%llu PAcc:%llu PRej:%llu "
+                        "FAcc:%llu FStart:%llu FDone:%llu FRej:%llu ",
+                        static_cast<unsigned long long>(blockCounters.dispatched),
+                        static_cast<unsigned long long>(blockCounters.programCommitted),
+                        static_cast<unsigned long long>(blockCounters.programOnlyCompleted),
+                        static_cast<unsigned long long>(blockCounters.motionBlocks),
+                        static_cast<unsigned long long>(blockCounters.motionSegmentsBound),
+                        static_cast<unsigned long long>(blockCounters.producerAccepted),
+                        static_cast<unsigned long long>(blockCounters.producerRejected),
+                        static_cast<unsigned long long>(blockCounters.feedbackAccepted),
+                        static_cast<unsigned long long>(blockCounters.feedbackStarted),
+                        static_cast<unsigned long long>(blockCounters.feedbackCompleted),
+                        static_cast<unsigned long long>(blockCounters.feedbackRejected));
+                    RtPrintf(
+                        "FCancel:%llu FAbort:%llu FFault:%llu "
+                        "BlkDone:%llu BlkFail:%llu NCFail:%llu "
+                        "CaptureOv:%llu Orphan:%llu DupTerm:%llu Conflict:%llu "
+                        "Active:%u\n",
+                        static_cast<unsigned long long>(blockCounters.feedbackCancelled),
+                        static_cast<unsigned long long>(blockCounters.feedbackAborted),
+                        static_cast<unsigned long long>(blockCounters.feedbackFaulted),
+                        static_cast<unsigned long long>(blockCounters.blockCompleted),
+                        static_cast<unsigned long long>(blockCounters.blockFailed),
+                        static_cast<unsigned long long>(blockCounters.ncDispatchFailed),
+                        static_cast<unsigned long long>(blockCounters.motionCaptureOverflow),
+                        static_cast<unsigned long long>(blockCounters.orphanFeedback),
+                        static_cast<unsigned long long>(blockCounters.duplicateTerminalFeedback),
+                        static_cast<unsigned long long>(blockCounters.terminalFeedbackConflict),
+                        static_cast<unsigned int>(blockCounters.activeBlocks));
+
+                    RtPrintf(
+                        "[NC02E-BND] D:%llu Kind:%s Legacy:%s Ledger:%s "
+                        "Compare:%s State:%s Seg:%u Done:%u Term:%u Fail:%u\n",
+                        static_cast<unsigned long long>(completionBoundary.dispatchId),
+                        NCBlockWaitKindToDiagnosticName(completionBoundary.waitKind),
+                        completionBoundary.legacyReady ? "READY" : "WAIT",
+                        NCBlockMotionBoundaryStateToDiagnosticName(
+                            completionBoundary.ledgerBoundary),
+                        NCBlockCompletionComparisonToDiagnosticName(
+                            completionBoundary.comparison),
+                        NCBlockLifecycleStateToDiagnosticName(
+                            completionBoundary.lifecycleState),
+                        static_cast<unsigned int>(completionBoundary.motionSegmentCount),
+                        static_cast<unsigned int>(completionBoundary.motionCompletedCount),
+                        static_cast<unsigned int>(completionBoundary.motionTerminalCount),
+                        static_cast<unsigned int>(completionBoundary.motionFailedCount));
+
+                    RtPrintf(
+                        "[NC02E-CNT] Bind:%llu Motion:%llu Aux:%llu Flow:%llu "
+                        "Obs:%llu Release:%llu Agree:%llu LedgerEarly:%llu "
+                        "LegacyEarly:%llu LedgerFail:%llu ReleaseFail:%llu ",
+                        static_cast<unsigned long long>(completionCounters.bindings),
+                        static_cast<unsigned long long>(completionCounters.motionBindings),
+                        static_cast<unsigned long long>(completionCounters.auxiliaryBindings),
+                        static_cast<unsigned long long>(completionCounters.programFlowBindings),
+                        static_cast<unsigned long long>(completionCounters.observations),
+                        static_cast<unsigned long long>(completionCounters.releaseChecks),
+                        static_cast<unsigned long long>(completionCounters.agreeRelease),
+                        static_cast<unsigned long long>(completionCounters.ledgerReadyBeforeLegacy),
+                        static_cast<unsigned long long>(completionCounters.legacyEarlyRelease),
+                        static_cast<unsigned long long>(completionCounters.ledgerFailureObserved),
+                        static_cast<unsigned long long>(completionCounters.releaseOnLedgerFailure));
+                    RtPrintf(
+                        "Overflow:%llu Missing:%llu NonMotion:%llu Supersede:%llu\n",
+                        static_cast<unsigned long long>(completionCounters.trackingOverflow),
+                        static_cast<unsigned long long>(completionCounters.missingLifecycle),
+                        static_cast<unsigned long long>(completionCounters.nonMotionWait),
+                        static_cast<unsigned long long>(completionCounters.supersededBindings));
+
+                    RtPrintf(
+                        "[NC02F-GATE] D:%llu Eligible:%u Applied:%u Legacy:%s "
+                        "Ledger:%s Decision:%s Effective:%s FailClosed:%u\n",
+                        static_cast<unsigned long long>(completionBoundary.dispatchId),
+                        completionBoundary.guardEligible ? 1U : 0U,
+                        completionBoundary.guardApplied ? 1U : 0U,
+                        completionBoundary.legacyReady ? "READY" : "WAIT",
+                        NCBlockMotionBoundaryStateToDiagnosticName(
+                            completionBoundary.ledgerBoundary),
+                        NCBlockCompletionGateDecisionToDiagnosticName(
+                            completionBoundary.gateDecision),
+                        completionBoundary.effectiveReady ? "READY" : "WAIT",
+                        completionBoundary.failClosed ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02F-CNT] Eval:%llu Eligible:%llu Bypass:%llu "
+                        "Wait:%llu Release:%llu BlockEarly:%llu BlockFail:%llu "
+                        "BlockOv:%llu BlockMissing:%llu BlockNotTracked:%llu "
+                        "FailClosed:%llu\n",
+                        static_cast<unsigned long long>(completionCounters.guardEvaluations),
+                        static_cast<unsigned long long>(completionCounters.guardEligibleSamples),
+                        static_cast<unsigned long long>(completionCounters.guardBypassSamples),
+                        static_cast<unsigned long long>(completionCounters.guardWaitSamples),
+                        static_cast<unsigned long long>(completionCounters.dualKeyRelease),
+                        static_cast<unsigned long long>(completionCounters.blockedLegacyEarly),
+                        static_cast<unsigned long long>(completionCounters.blockedLedgerFailure),
+                        static_cast<unsigned long long>(completionCounters.blockedTrackingOverflow),
+                        static_cast<unsigned long long>(completionCounters.blockedMissingLifecycle),
+                        static_cast<unsigned long long>(completionCounters.blockedNotTracked),
+                        static_cast<unsigned long long>(completionCounters.failClosedBindings));
+                    RtPrintf(
+                        "[NC02G-END] Run:%llu Req:%llu Cause:%s Phase:%s Decision:%s "
+                        "Scope:%u Cache:%llu RunEpoch:%u ReqEpoch:%u ",
+                        static_cast<unsigned long long>(programEndSnapshot.run.runId),
+                        static_cast<unsigned long long>(programEndSnapshot.requestId),
+                        NCProgramEndCauseToDiagnosticName(programEndSnapshot.cause),
+                        NCProgramEndPhaseToDiagnosticName(programEndSnapshot.phase),
+                        NCProgramEndDecisionToDiagnosticName(programEndSnapshot.decision),
+                        static_cast<unsigned int>(programEndSnapshot.run.scope),
+                        static_cast<unsigned long long>(programEndSnapshot.run.cacheGeneration),
+                        static_cast<unsigned int>(programEndSnapshot.run.executionEpoch),
+                        static_cast<unsigned int>(programEndSnapshot.requestExecutionEpoch));
+                    RtPrintf(
+                        "RunOwner:%u/%u ReqOwner:%u/%u CurOwner:%u/%u "
+                        "PC:%d Line:%d D:%llu Pending:%u Ready:%u Fail:%u\n",
+                        static_cast<unsigned int>(programEndSnapshot.run.owner),
+                        static_cast<unsigned int>(programEndSnapshot.run.ownerGeneration),
+                        static_cast<unsigned int>(programEndSnapshot.requestOwner),
+                        static_cast<unsigned int>(programEndSnapshot.requestOwnerGeneration),
+                        static_cast<unsigned int>(programEndSnapshot.currentOwner),
+                        static_cast<unsigned int>(programEndSnapshot.currentOwnerGeneration),
+                        programEndSnapshot.sourcePC,
+                        programEndSnapshot.sourceLineNumber,
+                        static_cast<unsigned long long>(programEndSnapshot.markerDispatchId),
+                        programEndSnapshot.requestPending ? 1U : 0U,
+                        programEndSnapshot.readyToFinalize ? 1U : 0U,
+                        programEndSnapshot.failClosed ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02G-DRN] Active:%u AxisQ:%llu AxisR:%llu CmdQ:%llu "
+                        "CmdIn:%llu Replay:%llu FbQ:%llu Notice:%llu ",
+                        static_cast<unsigned int>(programEndSnapshot.activeBlocks),
+                        static_cast<unsigned long long>(programEndSnapshot.axisCommandDepth),
+                        static_cast<unsigned long long>(programEndSnapshot.axisResultDepth),
+                        static_cast<unsigned long long>(programEndSnapshot.commandQueueDepth),
+                        static_cast<unsigned long long>(programEndSnapshot.commandIngressDepth),
+                        static_cast<unsigned long long>(programEndSnapshot.commandReplayDepth),
+                        static_cast<unsigned long long>(programEndSnapshot.feedbackDepth),
+                        static_cast<unsigned long long>(programEndSnapshot.feedbackNoticeDepth));
+                    RtPrintf(
+                        "FbPub:%llu FbCon:%llu FbSync:%u Stable:%u/%u "
+                        "Stand:%u Safety:%u Wait:%u Bind:%u OwnerOK:%u Integrity:%llu\n",
+                        static_cast<unsigned long long>(programEndSnapshot.lastPublishedFeedbackSequence),
+                        static_cast<unsigned long long>(programEndSnapshot.lastConsumedFeedbackSequence),
+                        programEndSnapshot.feedbackSequenceSynchronized ? 1U : 0U,
+                        static_cast<unsigned int>(programEndSnapshot.stablePasses),
+                        static_cast<unsigned int>(NC_PROGRAM_END_STABLE_PASSES_REQUIRED),
+                        programEndSnapshot.groupStandstill ? 1U : 0U,
+                        programEndSnapshot.safetyOrRecoveryPending ? 1U : 0U,
+                        programEndSnapshot.waitCallbackActive ? 1U : 0U,
+                        programEndSnapshot.completionBindingActive ? 1U : 0U,
+                        programEndSnapshot.ownerLeaseCurrent ? 1U : 0U,
+                        static_cast<unsigned long long>(programEndSnapshot.integrityDelta));
+
+                    RtPrintf(
+                        "[NC02G-CNT] StartTry:%llu Started:%llu StartBlock:%llu "
+                        "Req:%llu EOF:%llu M02:%llu M30:%llu ReqReject:%llu ",
+                        static_cast<unsigned long long>(programEndCounters.runStartAttempts),
+                        static_cast<unsigned long long>(programEndCounters.runsStarted),
+                        static_cast<unsigned long long>(programEndCounters.runStartBlocked),
+                        static_cast<unsigned long long>(programEndCounters.requests),
+                        static_cast<unsigned long long>(programEndCounters.naturalEofRequests),
+                        static_cast<unsigned long long>(programEndCounters.m02Requests),
+                        static_cast<unsigned long long>(programEndCounters.m30Requests),
+                        static_cast<unsigned long long>(programEndCounters.rejectedRequests));
+                    RtPrintf(
+                        "Eval:%llu Ready:%llu Final:%llu Cancel:%llu Fail:%llu "
+                        "EpochFail:%llu OwnerFail:%llu IntegrityFail:%llu\n",
+                        static_cast<unsigned long long>(programEndCounters.evaluations),
+                        static_cast<unsigned long long>(programEndCounters.readyToFinalize),
+                        static_cast<unsigned long long>(programEndCounters.finalized),
+                        static_cast<unsigned long long>(programEndCounters.cancelled),
+                        static_cast<unsigned long long>(programEndCounters.failClosed),
+                        static_cast<unsigned long long>(programEndCounters.epochMismatch),
+                        static_cast<unsigned long long>(programEndCounters.ownerLeaseLost),
+                        static_cast<unsigned long long>(programEndCounters.integrityFailure));
+
+                    RtPrintf(
+                        "[NC02G-WAIT] Blocks:%llu AxisQ:%llu AxisR:%llu CmdQ:%llu "
+                        "Ingress:%llu Replay:%llu Notice:%llu Feedback:%llu FbSeq:%llu ",
+                        static_cast<unsigned long long>(programEndCounters.waitActiveBlocks),
+                        static_cast<unsigned long long>(programEndCounters.waitAxisCommand),
+                        static_cast<unsigned long long>(programEndCounters.waitAxisResult),
+                        static_cast<unsigned long long>(programEndCounters.waitCommandQueue),
+                        static_cast<unsigned long long>(programEndCounters.waitCommandIngress),
+                        static_cast<unsigned long long>(programEndCounters.waitCommandReplay),
+                        static_cast<unsigned long long>(programEndCounters.waitFeedbackNotice),
+                        static_cast<unsigned long long>(programEndCounters.waitFeedback),
+                        static_cast<unsigned long long>(programEndCounters.waitFeedbackSequence));
+                    RtPrintf(
+                        "Callback:%llu Binding:%llu Safety:%llu Standstill:%llu Stable:%llu\n",
+                        static_cast<unsigned long long>(programEndCounters.waitCallback),
+                        static_cast<unsigned long long>(programEndCounters.waitCompletionBinding),
+                        static_cast<unsigned long long>(programEndCounters.waitSafetyRequest),
+                        static_cast<unsigned long long>(programEndCounters.waitGroupStandstill),
+                        static_cast<unsigned long long>(programEndCounters.waitStableConfirmation));
+
+
+                    RtPrintf(
+                        "[NC02H-TXN] Seq:%llu D:%llu Phase:%s Post:%s Active:%u "
+                        "GReq:%u GDone:%u MReq:%u MDone:%u PC:%d Line:%d ",
+                        static_cast<unsigned long long>(gmTransactionSnapshot.sequence),
+                        static_cast<unsigned long long>(gmTransactionSnapshot.dispatchId),
+                        NCGMBlockTransactionPhaseToDiagnosticName(
+                            gmTransactionSnapshot.phase),
+                        NCGMBlockPostActionToDiagnosticName(
+                            gmTransactionSnapshot.postAction),
+                        gmTransactionSnapshot.active ? 1U : 0U,
+                        gmTransactionSnapshot.gWaitRequired ? 1U : 0U,
+                        gmTransactionSnapshot.gWaitComplete ? 1U : 0U,
+                        gmTransactionSnapshot.mWaitRequired ? 1U : 0U,
+                        gmTransactionSnapshot.mWaitComplete ? 1U : 0U,
+                        gmTransactionSnapshot.sourcePC,
+                        gmTransactionSnapshot.sourceLineNumber);
+                    RtPrintf(
+                        "M:%d P:%d L:%d Main:%u Applied:%u\n",
+                        gmTransactionSnapshot.mCode,
+                        gmTransactionSnapshot.pValue,
+                        gmTransactionSnapshot.repeatCount,
+                        gmTransactionSnapshot.fromMainProgram ? 1U : 0U,
+                        gmTransactionSnapshot.postActionApplied ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02H-CNT] Start:%llu GComp:%llu MComp:%llu Dual:%llu "
+                        "Eval:%llu GWait:%llu MWait:%llu Ready:%llu Final:%llu ",
+                        static_cast<unsigned long long>(gmTransactionCounters.started),
+                        static_cast<unsigned long long>(gmTransactionCounters.gWaitComponents),
+                        static_cast<unsigned long long>(gmTransactionCounters.mWaitComponents),
+                        static_cast<unsigned long long>(gmTransactionCounters.dualComponentTransactions),
+                        static_cast<unsigned long long>(gmTransactionCounters.evaluations),
+                        static_cast<unsigned long long>(gmTransactionCounters.gWaitSamples),
+                        static_cast<unsigned long long>(gmTransactionCounters.mWaitSamples),
+                        static_cast<unsigned long long>(gmTransactionCounters.readyTransitions),
+                        static_cast<unsigned long long>(gmTransactionCounters.finalized));
+                    RtPrintf(
+                        "Cancel:%llu Fail:%llu M00:%llu M01:%llu M98:%llu "
+                        "M99:%llu M02:%llu M30:%llu\n",
+                        static_cast<unsigned long long>(gmTransactionCounters.cancelled),
+                        static_cast<unsigned long long>(gmTransactionCounters.finalizeFailed),
+                        static_cast<unsigned long long>(gmTransactionCounters.m00Stops),
+                        static_cast<unsigned long long>(gmTransactionCounters.m01Stops),
+                        static_cast<unsigned long long>(gmTransactionCounters.m98Calls),
+                        static_cast<unsigned long long>(gmTransactionCounters.m99Returns),
+                        static_cast<unsigned long long>(gmTransactionCounters.m02Ends),
+                        static_cast<unsigned long long>(gmTransactionCounters.m30Ends));
+
+                    RtPrintf(
+                        "[NC02J4-BAR] Seq:%llu Active:%u Kind:%s PC:%d Line:%d "
+                        "M:%d Samples:%llu Ms:%llu CmdQ:%llu QWait:%u Stand:%u\n",
+                        static_cast<unsigned long long>(
+                            preDispatchBarrierSnapshot.sequence),
+                        preDispatchBarrierSnapshot.active ? 1U : 0U,
+                        NCPreDispatchBarrierKindToDiagnosticName(
+                            preDispatchBarrierSnapshot.kind),
+                        preDispatchBarrierSnapshot.sourcePC,
+                        preDispatchBarrierSnapshot.sourceLineNumber,
+                        preDispatchBarrierSnapshot.mCode,
+                        static_cast<unsigned long long>(
+                            preDispatchBarrierSnapshot.waitSamples),
+                        static_cast<unsigned long long>(
+                            preDispatchBarrierSnapshot.waitSamples * 10ULL),
+                        static_cast<unsigned long long>(
+                            preDispatchBarrierSnapshot.commandQueueDepth),
+                        preDispatchBarrierSnapshot.commandQueuePending ? 1U : 0U,
+                        preDispatchBarrierSnapshot.groupStandstill ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02J4-BCNT] Arm:%llu Eval:%llu CmdQ:%llu Stand:%llu Clear:%llu\n",
+                        static_cast<unsigned long long>(
+                            preDispatchBarrierCounters.activations),
+                        static_cast<unsigned long long>(
+                            preDispatchBarrierCounters.evaluations),
+                        static_cast<unsigned long long>(
+                            preDispatchBarrierCounters.waitCommandQueue),
+                        static_cast<unsigned long long>(
+                            preDispatchBarrierCounters.waitGroupStandstill),
+                        static_cast<unsigned long long>(
+                            preDispatchBarrierCounters.cleared));
+
+                });
+            RunHmiDiagnosticOutputFamily([&]()
+                {
+                    RtPrintf(
+                        "[NC02K1-PREP] Pub:%llu Sess:%llu Active:%u Depth:%u/%u "
+                        "RuntimePC:%d PlanPC:%d TailPC:%d DispatchPC:%d CommitPC:%d BasePC:%d BaseBlock:%u ",
+                        static_cast<unsigned long long>(
+                            preparedQueueSnapshot.publicationSequence),
+                        static_cast<unsigned long long>(
+                            preparedQueueSnapshot.session),
+                        preparedQueueSnapshot.active ? 1U : 0U,
+                        static_cast<unsigned int>(preparedQueueSnapshot.depth),
+                        static_cast<unsigned int>(preparedQueueSnapshot.capacity),
+                        preparedQueueSnapshot.runtimeCurrentPC,
+                        preparedQueueSnapshot.nextPlanPC,
+                        preparedQueueSnapshot.tailPC,
+                        preparedQueueSnapshot.dispatchPC,
+                        preparedQueueSnapshot.commitPC,
+                        preparedQueueSnapshot.committedBaselinePC,
+                        preparedQueueSnapshot.committedBaselinePlanningBlocked
+                        ? 1U : 0U);
+                    RtPrintf(
+                        "Stop:%s Barrier:%s BPC:%d Valid:%u Order:%u Account:%u "
+                        "Shadow:%u\n",
+                        NCPreparedQueueStopReasonToDiagnosticName(
+                            preparedQueueSnapshot.stopReason),
+                        NCPreparedBarrierKindToDiagnosticName(
+                            preparedQueueSnapshot.barrierKind),
+                        preparedQueueSnapshot.barrierPC,
+                        preparedQueueSnapshot.valid ? 1U : 0U,
+                        preparedQueueSnapshot.cursorOrderValid ? 1U : 0U,
+                        preparedQueueSnapshot.accountingValid ? 1U : 0U,
+                        preparedQueueSnapshot.shadowOnly ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K1-EDGE] Head:%u PC:%d Line:%d Class:%s Disp:%u Commit:%u "
+                        "Tail:%u PC:%d Line:%d Class:%s Drain:%u Stop:%u\n",
+                        hasPreparedQueueHead ? 1U : 0U,
+                        hasPreparedQueueHead ? preparedQueueHead.sourcePC : -1,
+                        hasPreparedQueueHead ? preparedQueueHead.sourceLineNumber : 0,
+                        NCPreparedBlockClassToDiagnosticName(
+                            preparedQueueHead.classification.blockClass),
+                        hasPreparedQueueHead && preparedQueueHead.dispatchObserved
+                        ? 1U : 0U,
+                        hasPreparedQueueHead && preparedQueueHead.commitObserved
+                        ? 1U : 0U,
+                        hasPreparedQueueTail ? 1U : 0U,
+                        hasPreparedQueueTail ? preparedQueueTail.sourcePC : -1,
+                        hasPreparedQueueTail ? preparedQueueTail.sourceLineNumber : 0,
+                        NCPreparedBlockClassToDiagnosticName(
+                            preparedQueueTail.classification.blockClass),
+                        hasPreparedQueueTail &&
+                        preparedQueueTail.classification.legacyDrainRequired
+                        ? 1U : 0U,
+                        hasPreparedQueueTail &&
+                        preparedQueueTail.classification.planningStopsHere
+                        ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K1-MOD] Seed:G%d G%d G%d WCS:G%d G%d "
+                        "Tail:G%d G%d G%d WCS:G%d G%d G68:%u G168:%u ",
+                        preparedQueueSnapshot.seedModal.distanceMode,
+                        preparedQueueSnapshot.seedModal.unitsMode,
+                        preparedQueueSnapshot.seedModal.planeMode,
+                        preparedQueueSnapshot.seedModal.workCoordinateCode,
+                        preparedQueueSnapshot.seedModal.storedStrokeMode,
+                        preparedQueueSnapshot.tailModal.distanceMode,
+                        preparedQueueSnapshot.tailModal.unitsMode,
+                        preparedQueueSnapshot.tailModal.planeMode,
+                        preparedQueueSnapshot.tailModal.workCoordinateCode,
+                        preparedQueueSnapshot.tailModal.storedStrokeMode,
+                        preparedQueueSnapshot.tailModal.g68Active ? 1U : 0U,
+                        preparedQueueSnapshot.tailModal.g168Active ? 1U : 0U);
+                    RtPrintf(
+                        "Scale:%u Mirror:%02X Polar:%u COff:%u G66:%u "
+                        "SeedV:%u TailV:%u MCS:%u G00F:%llu\n",
+                        preparedQueueSnapshot.tailModal.scalingActive ? 1U : 0U,
+                        static_cast<unsigned int>(
+                            preparedQueueSnapshot.tailModal.mirrorMask),
+                        preparedQueueSnapshot.tailModal.polarActive ? 1U : 0U,
+                        preparedQueueSnapshot.tailModal.cAxisOffsetRotationEnabled
+                        ? 1U : 0U,
+                        preparedQueueSnapshot.tailModal.modalMacroActive ? 1U : 0U,
+                        preparedQueueSnapshot.seedModal.imageValid ? 1U : 0U,
+                        preparedQueueSnapshot.tailModal.imageValid ? 1U : 0U,
+                        preparedQueueSnapshot.tailModal.commandedMCSValid ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            ScaleNonNegativeDiagnosticValue(
+                                preparedQueueSnapshot.tailModal.g00OverrideRatio,
+                                100.0)));
+
+                    RtPrintf(
+                        "[NC02K1-CUR] Scope:%u Cache:%llu Frame:%llu Epoch:%llu Flow:%llu ",
+                        static_cast<unsigned int>(preparedQueueSnapshot.source.scope),
+                        static_cast<unsigned long long>(
+                            preparedQueueSnapshot.source.cacheGeneration),
+                        static_cast<unsigned long long>(
+                            preparedQueueSnapshot.source.frameId),
+                        static_cast<unsigned long long>(
+                            preparedQueueSnapshot.source.executionEpoch),
+                        static_cast<unsigned long long>(
+                            preparedQueueSnapshot.source.programFlowGeneration));
+                    RtPrintf(
+                        "Owner:%u/%llu LastInv:%s Panel:%u/%u/%u EOF:%u Cap:%u\n",
+                        static_cast<unsigned int>(preparedQueueSnapshot.source.owner),
+                        static_cast<unsigned long long>(
+                            preparedQueueSnapshot.source.ownerGeneration),
+                        NCPreparedInvalidationReasonToDiagnosticName(
+                            preparedQueueSnapshot.lastInvalidationReason),
+                        preparedQueueSnapshot.source.panel.blockSkipEnabled ? 1U : 0U,
+                        preparedQueueSnapshot.source.panel.singleBlockEnabled ? 1U : 0U,
+                        preparedQueueSnapshot.source.panel.optionalStopEnabled ? 1U : 0U,
+                        preparedQueueSnapshot.eofLatched ? 1U : 0U,
+                        preparedQueueSnapshot.capacityLatched ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K1-CNT] Eval:%llu Pub:%llu Sess:%llu Prep:%llu "
+                        "Disp:%llu Commit:%llu Retire:%llu InvEntry:%llu Depth:%u ",
+                        static_cast<unsigned long long>(preparedQueueCounters.evaluations),
+                        static_cast<unsigned long long>(preparedQueueCounters.publications),
+                        static_cast<unsigned long long>(preparedQueueCounters.sessions),
+                        static_cast<unsigned long long>(preparedQueueCounters.prepared),
+                        static_cast<unsigned long long>(preparedQueueCounters.dispatchMatched),
+                        static_cast<unsigned long long>(preparedQueueCounters.commitMatched),
+                        static_cast<unsigned long long>(preparedQueueCounters.retired),
+                        static_cast<unsigned long long>(preparedQueueCounters.invalidatedEntries),
+                        static_cast<unsigned int>(preparedQueueSnapshot.depth));
+                    RtPrintf(
+                        "Acct:%u Inv:%llu Alarm:%llu Reset:%llu Source:%llu "
+                        "Epoch:%llu EpochOK:%llu Owner:%llu Frame:%llu Panel:%llu Barrier:%llu ",
+                        preparedQueueSnapshot.accountingValid ? 1U : 0U,
+                        static_cast<unsigned long long>(preparedQueueCounters.invalidations),
+                        static_cast<unsigned long long>(preparedQueueCounters.alarmInvalidations),
+                        static_cast<unsigned long long>(preparedQueueCounters.resetInvalidations),
+                        static_cast<unsigned long long>(preparedQueueCounters.sourceInvalidations),
+                        static_cast<unsigned long long>(preparedQueueCounters.epochInvalidations),
+                        static_cast<unsigned long long>(preparedQueueCounters.correlatedEpochAdvances),
+                        static_cast<unsigned long long>(preparedQueueCounters.ownerInvalidations),
+                        static_cast<unsigned long long>(preparedQueueCounters.frameInvalidations),
+                        static_cast<unsigned long long>(preparedQueueCounters.panelInvalidations),
+                        static_cast<unsigned long long>(preparedQueueCounters.barrierStops));
+                    RtPrintf(
+                        "EOF:%llu Cap:%llu Over:%llu Cursor:%llu PlanGap:%llu FlowOK:%llu "
+                        "DMis:%llu CMis:%llu Stale:%llu IdFail:%llu Cutover:%llu\n",
+                        static_cast<unsigned long long>(preparedQueueCounters.eofStops),
+                        static_cast<unsigned long long>(preparedQueueCounters.capacityStops),
+                        static_cast<unsigned long long>(preparedQueueCounters.overwritePrevented),
+                        static_cast<unsigned long long>(preparedQueueCounters.cursorRegressions),
+                        static_cast<unsigned long long>(preparedQueueCounters.planDiscontinuities),
+                        static_cast<unsigned long long>(preparedQueueCounters.expectedFlowCutovers),
+                        static_cast<unsigned long long>(preparedQueueCounters.dispatchMismatches),
+                        static_cast<unsigned long long>(preparedQueueCounters.commitMismatches),
+                        static_cast<unsigned long long>(preparedQueueCounters.staleRuntimeProofs),
+                        static_cast<unsigned long long>(preparedQueueCounters.identityFailures),
+                        static_cast<unsigned long long>(preparedQueueCounters.cutoverAttempts));
+
+                    RtPrintf(
+                        "[NC02K2-EQV] Pub:%llu State:%s Inv:%s Sess:%llu Entry:%llu "
+                        "Scope:%u Cache:%llu Frame:%llu Epoch:%llu PostEpoch:%llu Flow:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.publicationSequence),
+                        NCPreparedHeadEquivalenceStateToDiagnosticName(
+                            preparedEquivalenceSnapshot.state),
+                        NCPreparedHeadEquivalenceInvalidationToDiagnosticName(
+                            preparedEquivalenceSnapshot.lastInvalidation),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.session),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.entrySequence),
+                        static_cast<unsigned int>(
+                            preparedEquivalenceSnapshot.scope),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.cacheGeneration),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.frameId),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.executionEpoch),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.commitExecutionEpoch),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.programFlowGeneration));
+                    RtPrintf(
+                        "Owner:%u/%llu Panel:%02X PC:%d Line:%d Class:%s Barrier:%s "
+                        "Depth:%u SPeak:%u LPeak:%u ",
+                        static_cast<unsigned int>(
+                            preparedEquivalenceSnapshot.owner),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.ownerGeneration),
+                        static_cast<unsigned int>(
+                            preparedEquivalenceSnapshot.panelMask),
+                        preparedEquivalenceSnapshot.sourcePC,
+                        preparedEquivalenceSnapshot.sourceLineNumber,
+                        NCPreparedBlockClassToDiagnosticName(
+                            preparedEquivalenceSnapshot.blockClass),
+                        NCPreparedBarrierKindToDiagnosticName(
+                            preparedEquivalenceSnapshot.barrierKind),
+                        static_cast<unsigned int>(
+                            preparedEquivalenceSnapshot.preparedDepth),
+                        static_cast<unsigned int>(
+                            preparedEquivalenceSnapshot.sessionPeakDepth),
+                        static_cast<unsigned int>(
+                            preparedEquivalenceSnapshot.lifetimePeakDepth));
+                    RtPrintf(
+                        "QualSess:%llu Cand:%u Pend:%u Res:%u Disp:%llu Commit:%llu "
+                        "Flags:%08X Block:%u Plan:%u ClassOK:%u Drain:%u ModB:%u ",
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.qualifiedSession),
+                        preparedEquivalenceSnapshot.candidate ? 1U : 0U,
+                        preparedEquivalenceSnapshot.pending ? 1U : 0U,
+                        preparedEquivalenceSnapshot.resolved ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.dispatchId),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceSnapshot.commitSequence),
+                        static_cast<unsigned int>(
+                            preparedEquivalenceSnapshot.mismatchFlags),
+                        preparedEquivalenceSnapshot.blockMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.planMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.classificationMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.drainMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.modalBeforeMatch ? 1U : 0U);
+                    RtPrintf(
+                        "ModA:%u LedD:%u LedC:%u Wait:%u UpDC:%u Ret:%u Up:%u Life:%u "
+                        "Match:%u Acct:%u ",
+                        preparedEquivalenceSnapshot.modalAfterMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.ledgerDispatchMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.ledgerCommitMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.runtimeWaitCallbackActive
+                        ? 1U : 0U,
+                        preparedEquivalenceSnapshot.upstreamDispatchCommitMatch
+                        ? 1U : 0U,
+                        preparedEquivalenceSnapshot.retirementMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.upstreamProofMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.lifecycleMatch ? 1U : 0U,
+                        preparedEquivalenceSnapshot.matched ? 1U : 0U,
+                        preparedEquivalenceSnapshot.accountingValid ? 1U : 0U);
+                    RtPrintf(
+                        "Qualified:%u Shadow:%u Influence:%u Cutover:%u\n",
+                        preparedEquivalenceSnapshot.readinessQualified ? 1U : 0U,
+                        preparedEquivalenceSnapshot.shadowOnly ? 1U : 0U,
+                        preparedEquivalenceSnapshot.runtimeInfluence ? 1U : 0U,
+                        preparedEquivalenceSnapshot.cutoverApplied ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K2-CNT] Obs:%llu Pub:%llu Cand:%llu Match:%llu Mis:%llu "
+                        "Inv:%llu Inel:%llu Replay:%llu Bypass:%llu Peak:%llu Multi:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.observations),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.publications),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.candidates),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.matched),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.mismatched),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.invalidated),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.ineligible),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.replays),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.queueBypasses),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.lifetimePeakDepth),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.multiBlockObservations));
+                    RtPrintf(
+                        "QMis:%llu SrcMis:%llu PCMis:%llu LineMis:%llu BlockMis:%llu "
+                        "PlanMis:%llu ClassMis:%llu DrainMis:%llu ModBMis:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.queueMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.sourceMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.pcMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.lineMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.blockMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.planMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.classificationMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.drainMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.modalBeforeMismatches));
+                    RtPrintf(
+                        "ModAMis:%llu LifeMis:%llu Stale:%llu ResolveMis:%llu "
+                        "UpMis:%llu LedgerMis:%llu BindIdMis:%llu RuntimeFail:%llu "
+                        "SessTrans:%llu QualSess:%llu WouldUse:%llu Use:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.modalAfterMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.lifecycleMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.staleTokens),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.resolveMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.upstreamMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.ledgerMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.bindIdentityMismatches),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.runtimeFailures),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.sessionTransitions),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.qualifiedSessions),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.wouldUse),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.useAttempts));
+                    RtPrintf(
+                        "Cutover:%llu Influence:%llu\n",
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.cutoverAttempts),
+                        static_cast<unsigned long long>(
+                            preparedEquivalenceCounters.runtimeInfluence));
+
+                    RtPrintf(
+                        "[NC02K3-GATE] Pub:%llu Decision:%s Revoke:%s Enabled:%u Attempt:%u "
+                        "Apply:%u Legacy:%u Sess:%llu Entry:%llu QualSess:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.publicationSequence),
+                        NCPreparedHeadCutoverDecisionToDiagnosticName(
+                            preparedCutoverSnapshot.decision),
+                        NCPreparedHeadCutoverRevocationToDiagnosticName(
+                            preparedCutoverSnapshot.lastRevocation),
+                        preparedCutoverSnapshot.enabled ? 1U : 0U,
+                        preparedCutoverSnapshot.attempted ? 1U : 0U,
+                        preparedCutoverSnapshot.applied ? 1U : 0U,
+                        preparedCutoverSnapshot.legacyRetained ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.session),
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.entrySequence),
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.qualifiedSession));
+                    RtPrintf(
+                        "Qualified:%u Armed:%u Quarantine:%u Lock:%u Scope:%u Cache:%llu Frame:%llu ",
+                        preparedCutoverSnapshot.sessionQualified ? 1U : 0U,
+                        preparedCutoverSnapshot.qualificationArmed ? 1U : 0U,
+                        preparedCutoverSnapshot.sessionQuarantined ? 1U : 0U,
+                        preparedCutoverSnapshot.permanentLockout ? 1U : 0U,
+                        static_cast<unsigned int>(preparedCutoverSnapshot.scope),
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.cacheGeneration),
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.frameId));
+                    RtPrintf(
+                        "Epoch:%llu Flow:%llu Owner:%u/%llu Panel:%02X PC:%d Line:%d Disp:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.executionEpoch),
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.programFlowGeneration),
+                        static_cast<unsigned int>(preparedCutoverSnapshot.owner),
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.ownerGeneration),
+                        static_cast<unsigned int>(preparedCutoverSnapshot.panelMask),
+                        preparedCutoverSnapshot.sourcePC,
+                        preparedCutoverSnapshot.sourceLineNumber,
+                        static_cast<unsigned long long>(
+                            preparedCutoverSnapshot.dispatchId));
+                    RtPrintf(
+                        "Class:%s Queue:%u Token:%u Source:%u PCLine:%u ClassOK:%u "
+                        "Exact:%u Recheck:%u Prepared:%u Influence:%u Cutover:%u Acct:%u\n",
+                        NCPreparedBlockClassToDiagnosticName(
+                            preparedCutoverSnapshot.blockClass),
+                        preparedCutoverSnapshot.queueExact ? 1U : 0U,
+                        preparedCutoverSnapshot.tokenExact ? 1U : 0U,
+                        preparedCutoverSnapshot.sourceExact ? 1U : 0U,
+                        preparedCutoverSnapshot.pcLineExact ? 1U : 0U,
+                        preparedCutoverSnapshot.classEligible ? 1U : 0U,
+                        preparedCutoverSnapshot.equivalenceExact ? 1U : 0U,
+                        preparedCutoverSnapshot.valueRevalidated ? 1U : 0U,
+                        preparedCutoverSnapshot.preparedValueSelected ? 1U : 0U,
+                        preparedCutoverSnapshot.runtimeInfluence ? 1U : 0U,
+                        preparedCutoverSnapshot.cutoverApplied ? 1U : 0U,
+                        preparedCutoverSnapshot.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K3-CNT] Eval:%llu Pub:%llu Attempt:%llu Apply:%llu "
+                        "Fallback:%llu Disabled:%llu NoHead:%llu Queue:%llu "
+                        "Upstream:%llu Warmup:%llu Quarantine:%llu Duplicate:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.evaluations),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.publications),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.attempts),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.applied),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.legacyFallbacks),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.disabled),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.noHead),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.queueRejected),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.upstreamRejected),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.unqualified),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.quarantined),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.duplicateRejected));
+                    RtPrintf(
+                        "Token:%llu Source:%llu PCLine:%llu Class:%llu Exact:%llu "
+                        "RuntimeFail:%llu Arm:%llu Revoke:%llu DisRev:%llu QRev:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.tokenRejected),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.sourceRejected),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.pcLineRejected),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.classRejected),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.equivalenceRejected),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.runtimeFailures),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.arms),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.revocations),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.disabledRevocations),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.queueRevocations));
+                    RtPrintf(
+                        "AlarmRev:%llu ResetRev:%llu EndRev:%llu SrcRev:%llu UpRev:%llu "
+                        "Use:%llu Cutover:%llu Influence:%llu\n",
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.alarmRevocations),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.resetRevocations),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.programEndRevocations),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.sourceRevocations),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.upstreamRevocations),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.applied),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.applied),
+                        static_cast<unsigned long long>(
+                            preparedCutoverCounters.applied));
+
+                    RtPrintf(
+                        "[NC02K4-ADM] Pub:%llu Decision:%s Revoke:%s Sess:%llu Entry:%llu "
+                        "Scope:%u Cache:%llu Frame:%llu Epoch:%llu Flow:%llu Owner:%u/%llu ",
+                        static_cast<unsigned long long>(
+                            preparedPreResolveSnapshot.publicationSequence),
+                        NCPreparedPreResolveAdmissionDecisionToDiagnosticName(
+                            preparedPreResolveSnapshot.decision),
+                        NCPreparedPreResolveAdmissionRevocationToDiagnosticName(
+                            preparedPreResolveSnapshot.lastRevocation),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveSnapshot.session),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveSnapshot.entrySequence),
+                        static_cast<unsigned int>(preparedPreResolveSnapshot.scope),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveSnapshot.cacheGeneration),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveSnapshot.frameId),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveSnapshot.executionEpoch),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveSnapshot.programFlowGeneration),
+                        static_cast<unsigned int>(preparedPreResolveSnapshot.owner),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveSnapshot.ownerGeneration));
+                    RtPrintf(
+                        "Panel:%02X PC:%d Line:%d Disp:%llu Class:%s Head:%u Queue:%u ",
+                        static_cast<unsigned int>(preparedPreResolveSnapshot.panelMask),
+                        preparedPreResolveSnapshot.sourcePC,
+                        preparedPreResolveSnapshot.sourceLineNumber,
+                        static_cast<unsigned long long>(
+                            preparedPreResolveSnapshot.dispatchId),
+                        NCPreparedBlockClassToDiagnosticName(
+                            preparedPreResolveSnapshot.blockClass),
+                        preparedPreResolveSnapshot.hasHead ? 1U : 0U,
+                        preparedPreResolveSnapshot.queueExact ? 1U : 0U);
+                    RtPrintf(
+                        "Up:%u Qual:%u Token:%u Source:%u PCLine:%u Modal:%u ClassOK:%u ",
+                        preparedPreResolveSnapshot.upstreamHealthy ? 1U : 0U,
+                        preparedPreResolveSnapshot.sessionQualified ? 1U : 0U,
+                        preparedPreResolveSnapshot.tokenExact ? 1U : 0U,
+                        preparedPreResolveSnapshot.sourceExact ? 1U : 0U,
+                        preparedPreResolveSnapshot.pcLineExact ? 1U : 0U,
+                        preparedPreResolveSnapshot.modalExact ? 1U : 0U,
+                        preparedPreResolveSnapshot.classEligible ? 1U : 0U);
+                    RtPrintf(
+                        "DrainReq:%u DrainOK:%u Cand:%u Legacy:%u Eq:%u K3:%u Confirm:%u "
+                        "Lock:%u Shadow:%u Influence:%u Bypass:%u Acct:%u\n",
+                        preparedPreResolveSnapshot.legacyDrainRequired ? 1U : 0U,
+                        preparedPreResolveSnapshot.legacyDrainSatisfied ? 1U : 0U,
+                        preparedPreResolveSnapshot.candidate ? 1U : 0U,
+                        preparedPreResolveSnapshot.legacyResolveObserved ? 1U : 0U,
+                        preparedPreResolveSnapshot.equivalenceObserved ? 1U : 0U,
+                        preparedPreResolveSnapshot.cutoverObserved ? 1U : 0U,
+                        preparedPreResolveSnapshot.confirmed ? 1U : 0U,
+                        preparedPreResolveSnapshot.permanentLockout ? 1U : 0U,
+                        preparedPreResolveSnapshot.shadowOnly ? 1U : 0U,
+                        preparedPreResolveSnapshot.runtimeInfluence ? 1U : 0U,
+                        preparedPreResolveSnapshot.resolverBypassed ? 1U : 0U,
+                        preparedPreResolveSnapshot.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K4-CNT] Eval:%llu Pub:%llu Cand:%llu Confirm:%llu "
+                        "Reject:%llu Wait:%llu NoHead:%llu Queue:%llu Up:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.evaluations),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.publications),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.candidates),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.confirmed),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.rejections),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.drainWaitSamples),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.noHead),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.queueRejected),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.upstreamRejected));
+                    RtPrintf(
+                        "Session:%llu Token:%llu Source:%llu PCLine:%llu Modal:%llu "
+                        "Class:%llu ResolveFail:%llu PostMis:%llu CandInv:%llu ConfirmFail:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.sessionRejected),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.tokenRejected),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.sourceRejected),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.pcLineRejected),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.modalRejected),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.classRejected),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.legacyResolveFailures),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.postResolveMismatches),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.candidateInvalidations),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.confirmedRuntimeFailures));
+                    RtPrintf(
+                        "Revoke:%llu QRev:%llu AlarmRev:%llu ResetRev:%llu EndRev:%llu "
+                        "SrcRev:%llu UpRev:%llu Influence:%llu Bypass:%llu\n",
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.revocations),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.queueRevocations),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.alarmRevocations),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.resetRevocations),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.programEndRevocations),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.sourceRevocations),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.upstreamRevocations),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            preparedPreResolveCounters.resolverBypasses));
+
+                    RtPrintf(
+                        "[NC02K41-BYP] Pub:%llu Decision:%s Revoke:%s Lane:%s "
+                        "Sess:%llu Entry:%llu PC:%d Line:%d Disp:%llu Commit:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.publicationSequence),
+                        NCPreparedResolverBypassDecisionToDiagnosticName(
+                            preparedResolverBypassSnapshot.decision),
+                        NCPreparedResolverBypassRevocationToDiagnosticName(
+                            preparedResolverBypassSnapshot.lastRevocation),
+                        NCPreparedResolverBypassLaneToDiagnosticName(
+                            preparedResolverBypassSnapshot.lane),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.session),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.entrySequence),
+                        preparedResolverBypassSnapshot.sourcePC,
+                        preparedResolverBypassSnapshot.sourceLineNumber,
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.dispatchId),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.commitSequence));
+                    RtPrintf(
+                        "QPure:%llu QP1:%llu Enable:%u Attempt:%u Select:%u "
+                        "Bind:%u CommitOK:%u Proof:%u Queue:%u Up:%u LaneQ:%u ",
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.
+                            pureModalQualifiedSession),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.g00P1QualifiedSession),
+                        preparedResolverBypassSnapshot.enabled ? 1U : 0U,
+                        preparedResolverBypassSnapshot.attempted ? 1U : 0U,
+                        preparedResolverBypassSnapshot.selected ? 1U : 0U,
+                        preparedResolverBypassSnapshot.dispatchBound ? 1U : 0U,
+                        preparedResolverBypassSnapshot.commitBound ? 1U : 0U,
+                        preparedResolverBypassSnapshot.upstreamProofVerified
+                        ? 1U : 0U,
+                        preparedResolverBypassSnapshot.queueExact ? 1U : 0U,
+                        preparedResolverBypassSnapshot.upstreamHealthy ? 1U : 0U,
+                        preparedResolverBypassSnapshot.laneQualified ? 1U : 0U);
+                    RtPrintf(
+                        "Token:%u Source:%u PCLine:%u Modal:%u Class:%u Rebuild:%u "
+                        "Pending:%u Lock:%u Legacy:%u Influence:%u Bypass:%u Acct:%u\n",
+                        preparedResolverBypassSnapshot.tokenExact ? 1U : 0U,
+                        preparedResolverBypassSnapshot.sourceExact ? 1U : 0U,
+                        preparedResolverBypassSnapshot.pcLineExact ? 1U : 0U,
+                        preparedResolverBypassSnapshot.modalExact ? 1U : 0U,
+                        preparedResolverBypassSnapshot.classEligible ? 1U : 0U,
+                        preparedResolverBypassSnapshot.literalRebuiltExact
+                        ? 1U : 0U,
+                        preparedResolverBypassSnapshot.pending ? 1U : 0U,
+                        preparedResolverBypassSnapshot.permanentLockout ? 1U : 0U,
+                        preparedResolverBypassSnapshot.legacyResolverRetained
+                        ? 1U : 0U,
+                        preparedResolverBypassSnapshot.runtimeInfluence ? 1U : 0U,
+                        preparedResolverBypassSnapshot.resolverBypassed ? 1U : 0U,
+                        preparedResolverBypassSnapshot.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K41-CNT] Eval:%llu Pub:%llu Select:%llu Fallback:%llu "
+                        "Bind:%llu Commit:%llu Proof:%llu Wait:%llu Disable:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.evaluations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.publications),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.selected),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.legacyFallbacks),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.dispatchBound),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.commitBound),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.proofVerified),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.proofWaitSamples),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.disabled));
+                    RtPrintf(
+                        "Busy:%llu NoHead:%llu Queue:%llu Up:%llu Session:%llu "
+                        "Token:%llu Source:%llu PCLine:%llu Modal:%llu Class:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.busy),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.noHead),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.queueRejected),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.upstreamRejected),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.sessionRejected),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.tokenRejected),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.sourceRejected),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.pcLineRejected),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.modalRejected),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.classRejected));
+                    RtPrintf(
+                        "QualCand:%llu QualModal:%llu QualP1:%llu QualFail:%llu "
+                        "QualInv:%llu RuntimeFail:%llu ProofMis:%llu PendingInv:%llu "
+                        "Revoke:%llu DisRev:%llu QRev:%llu AlarmRev:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.
+                            qualificationCandidates),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.qualifiedPureModal),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.qualifiedG00P1),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.qualificationFailures),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.
+                            qualificationInvalidations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.runtimeFailures),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.proofMismatches),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.
+                            invalidatedPendingBypasses),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.revocations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.disabledRevocations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.queueRevocations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.alarmRevocations));
+                    RtPrintf(
+                        "ResetRev:%llu EndRev:%llu SrcRev:%llu RunRev:%llu "
+                        "ProofRev:%llu Prepared:%llu Influence:%llu Bypass:%llu\n",
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.resetRevocations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.programEndRevocations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.sourceRevocations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.runtimeRevocations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.proofRevocations),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.preparedSelections),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.resolverBypasses));
+
+                    RtPrintf(
+                        "[NC02K42-NOP] Pub:%llu Decision:%s Lane:%s Sess:%llu "
+                        "Entry:%llu QNoP:%llu DrainReq:%u DrainOK:%u DrainWait:%u ",
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.publicationSequence),
+                        NCPreparedResolverBypassDecisionToDiagnosticName(
+                            preparedResolverBypassSnapshot.decision),
+                        NCPreparedResolverBypassLaneToDiagnosticName(
+                            preparedResolverBypassSnapshot.lane),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.session),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.entrySequence),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.g00NoPQualifiedSession),
+                        preparedResolverBypassSnapshot.legacyDrainRequired ? 1U : 0U,
+                        preparedResolverBypassSnapshot.legacyDrainSatisfied ? 1U : 0U,
+                        preparedResolverBypassSnapshot.deferredForDrain ? 1U : 0U);
+                    RtPrintf(
+                        "CbReq:%u CbCommit:%u WaitSeen:%u CbDone:%u Epoch:%llu "
+                        "CommitEpoch:%llu Disp:%llu Commit:%llu Pending:%u Lock:%u "
+                        "Acct:%u\n",
+                        preparedResolverBypassSnapshot.callbackRequired ? 1U : 0U,
+                        preparedResolverBypassSnapshot.callbackActiveAtCommit
+                        ? 1U : 0U,
+                        preparedResolverBypassSnapshot.waitPhaseObserved ? 1U : 0U,
+                        preparedResolverBypassSnapshot.callbackCompletionObserved
+                        ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.executionEpoch),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.commitExecutionEpoch),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.dispatchId),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassSnapshot.commitSequence),
+                        preparedResolverBypassSnapshot.pending ? 1U : 0U,
+                        preparedResolverBypassSnapshot.permanentLockout ? 1U : 0U,
+                        preparedResolverBypassSnapshot.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K42-CNT] DrainWait:%llu CbWait:%llu CbDone:%llu "
+                        "WaitPhase:%llu QualNoP:%llu SelPure:%llu SelP1:%llu "
+                        "SelNoP:%llu ProofPure:%llu ProofP1:%llu ProofNoP:%llu ",
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.drainWaitSamples),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.callbackWaitSamples),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.callbackCompletions),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.ordinaryWaitPhases),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.qualifiedG00NoP),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.selectedPureModal),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.selectedG00P1),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.selectedG00NoP),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.proofVerifiedPureModal),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.proofVerifiedG00P1),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.proofVerifiedG00NoP));
+                    RtPrintf(
+                        "Select:%llu Proof:%llu\n",
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.selected),
+                        static_cast<unsigned long long>(
+                            preparedResolverBypassCounters.proofVerified));
+
+                });
+            RunHmiDiagnosticOutputFamily([&]()
+                {
+                    RtPrintf(
+                        "[NC02K5-ADM] Pub:%llu Decision:%s Revoke:%s Sess:%llu "
+                        "Entry:%llu Owner:%u/%llu Panel:%X PC:%d Line:%d ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.publicationSequence),
+                        NCOrdinaryG00AdmissionDecisionToDiagnosticName(
+                            ordinaryG00AdmissionSnapshot.decision),
+                        NCOrdinaryG00AdmissionRevocationToDiagnosticName(
+                            ordinaryG00AdmissionSnapshot.lastRevocation),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.session),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.entrySequence),
+                        static_cast<unsigned int>(
+                            ordinaryG00AdmissionSnapshot.owner),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.ownerGeneration),
+                        static_cast<unsigned int>(
+                            ordinaryG00AdmissionSnapshot.panelMask),
+                        ordinaryG00AdmissionSnapshot.sourcePC,
+                        ordinaryG00AdmissionSnapshot.sourceLineNumber);
+                    RtPrintf(
+                        "Disp:%llu Commit:%llu Depth:%llu "
+                        "Still:%u BusyS:%llu Block:0x%X Q:%u Env:%u Axis:%u ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.dispatchId),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.commitSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.initialQueueDepth),
+                        ordinaryG00AdmissionSnapshot.initialGroupStandstill
+                        ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.busySamples),
+                        static_cast<unsigned int>(
+                            ordinaryG00AdmissionSnapshot.blockerMask),
+                        ordinaryG00AdmissionSnapshot.upstreamQualified ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.simpleG90Envelope ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.configuredAxisPresent
+                        ? 1U : 0U);
+                    RtPrintf(
+                        "Project:%u Drained:%u Busy:%u Select:%u Bind:%u "
+                        "CommitOK:%u Flight:%u FSeq:%llu FEpoch:%u FSeg:%llu ",
+                        ordinaryG00AdmissionSnapshot.projected ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.initialDrained ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.initialBusy ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.legacySelected ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.legacyDispatchBound ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.legacyCommitBound ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.inflightRegistryProven
+                        ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.inflightRegistrySequence),
+                        static_cast<unsigned int>(
+                            ordinaryG00AdmissionSnapshot.inflightExecutionEpoch),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.inflightSegmentId));
+                    RtPrintf(
+                        "Cb:%u CbDone:%u EpochAdv:%u Proof:%u "
+                        "Done:%u Shadow:%u "
+                        "Pending:%u Ready:%u Influence:%u Bypass:%u Lock:%u "
+                        "Acct:%u\n",
+                        ordinaryG00AdmissionSnapshot.legacyCallbackObserved
+                        ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.legacyCallbackCompleted
+                        ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.legacyEpochAdvanced ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.legacyUpstreamProofVerified
+                        ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.legacyCompleted ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.shadowOnly ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.pending ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.cutoverReady ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.runtimeInfluence ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.resolverBypassed ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.permanentLockout ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K5-ENV] BaseFail:0x%013llX ModalFail:0x%04llX "
+                        "BusyFail:0x%02X DrainedFail:0x%02X BDecision:%s "
+                        "ResolverInput:%u Selected:%u BypassField:%u LaneQ:%u "
+                        "Deferred:%u DrainOK:%u\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.
+                            baseEvidenceFailureMask),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionSnapshot.
+                            modalEnvelopeFailureMask),
+                        static_cast<unsigned int>(
+                            ordinaryG00AdmissionSnapshot.busyRouteFailureMask),
+                        static_cast<unsigned int>(
+                            ordinaryG00AdmissionSnapshot.drainedRouteFailureMask),
+                        NCPreparedResolverBypassDecisionToDiagnosticName(
+                            ordinaryG00AdmissionSnapshot.observedBypassDecision),
+                        ordinaryG00AdmissionSnapshot.resolverBypassedInput ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.observedBypassSelected ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.
+                        observedBypassResolverBypassed ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.
+                        observedBypassLaneQualified ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.
+                        observedBypassDeferredForDrain ? 1U : 0U,
+                        ordinaryG00AdmissionSnapshot.
+                        observedLegacyDrainSatisfied ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K5-CNT] Scan:%llu Pub:%llu Unique:%llu Warmup:%llu "
+                        "Project:%llu Cand:%llu Drained:%llu BusyToken:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.scans),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.publications),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.uniqueEvaluations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.warmup),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.projected),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.candidates),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.initialDrained),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.initialBusy));
+                    RtPrintf(
+                        "BusyS:%llu Select:%llu Bind:%llu Commit:%llu Wait:%llu "
+                        "FlightBind:%llu CbDone:%llu Done:%llu Reject:%llu "
+                        "MissingPath:%llu MissingTail:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.busySamples),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.legacySelections),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.legacyDispatchBound),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.legacyCommitBound),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.completionWaitSamples),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.inflightRegistryBound),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.callbackCompleted),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.legacyCompleted),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.rejected),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.missingCommandPathMode),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.
+                            missingTransactionalEndpoint));
+                    RtPrintf(
+                        "MissingFlight:%llu Mis:%llu RuntimeFail:%llu "
+                        "PendingInv:%llu Revoke:%llu QRev:%llu AlarmRev:%llu "
+                        "ResetRev:%llu EndRev:%llu SrcRev:%llu Cutover:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.missingInflightRegistry),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.mismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.runtimeFailures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.invalidatedPending),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.revocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.queueRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.alarmRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.resetRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.programEndRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.sourceRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.cutoverAttempts));
+                    RtPrintf(
+                        "Influence:%llu Bypass:%llu\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00AdmissionCounters.resolverBypasses));
+
+                    const NCOrdinaryG00InflightEntrySnapshot& inflightLast =
+                        ordinaryG00InflightRegistrySnapshot.lastEntry;
+                    RtPrintf(
+                        "[NC02K63-FLIGHT] Pub:%llu Seq:%llu Sess:%llu Entry:%llu "
+                        "Disp:%llu Commit:%llu Epoch:%u Seg:%llu SrcBlk:%d ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistrySnapshot.publicationSequence),
+                        static_cast<unsigned long long>(
+                            inflightLast.registrySequence),
+                        static_cast<unsigned long long>(inflightLast.session),
+                        static_cast<unsigned long long>(inflightLast.entrySequence),
+                        static_cast<unsigned long long>(inflightLast.dispatchId),
+                        static_cast<unsigned long long>(inflightLast.commitSequence),
+                        static_cast<unsigned int>(inflightLast.identity.epoch),
+                        static_cast<unsigned long long>(
+                            inflightLast.identity.segmentId),
+                        static_cast<int>(inflightLast.identity.sourceBlockId));
+                    RtPrintf(
+                        "Owner:%u/%u State:%s Revoke:%s Active:%u Term:%u "
+                        "Revoked:%u Slots:%u ActiveN:%u RevPend:%u Peak:%u ",
+                        static_cast<unsigned int>(inflightLast.ownerLease.owner),
+                        static_cast<unsigned int>(inflightLast.ownerLease.generation),
+                        NCOrdinaryG00InflightStateToDiagnosticName(
+                            inflightLast.state),
+                        NCOrdinaryG00InflightRevocationToDiagnosticName(
+                            inflightLast.revocation),
+                        inflightLast.active ? 1U : 0U,
+                        inflightLast.terminal ? 1U : 0U,
+                        inflightLast.revoked ? 1U : 0U,
+                        ordinaryG00InflightRegistrySnapshot.occupiedEntries,
+                        ordinaryG00InflightRegistrySnapshot.activeEntries,
+                        ordinaryG00InflightRegistrySnapshot.revokedPendingEntries,
+                        ordinaryG00InflightRegistrySnapshot.peakActiveEntries);
+                    RtPrintf(
+                        "Ready:%u Lock:%u Bounded:%u Shadow:%u Influence:%u "
+                        "MotionWrite:%u Acct:%u\n",
+                        ordinaryG00InflightRegistrySnapshot.ready ? 1U : 0U,
+                        ordinaryG00InflightRegistrySnapshot.permanentLockout
+                        ? 1U : 0U,
+                        ordinaryG00InflightRegistrySnapshot.bounded ? 1U : 0U,
+                        ordinaryG00InflightRegistrySnapshot.shadowOnly ? 1U : 0U,
+                        ordinaryG00InflightRegistrySnapshot.runtimeInfluence
+                        ? 1U : 0U,
+                        ordinaryG00InflightRegistrySnapshot.motionWrite ? 1U : 0U,
+                        ordinaryG00InflightRegistrySnapshot.accountingValid
+                        ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K63-FCNT] Try:%llu Reg:%llu Reject:%llu Invalid:%llu "
+                        "DupId:%llu Overflow:%llu Reuse:%llu Obs:%llu Match:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.registrationAttempts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.registered),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.registrationRejected),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.invalidRegistration),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.duplicateIdentity),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.capacityOverflow),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.slotReuses),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.feedbackObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.feedbackMatched));
+                    RtPrintf(
+                        "Ignore:%llu Accept:%llu Start:%llu Prog:%llu Held:%llu "
+                        "Resume:%llu Term:%llu Done:%llu RejectT:%llu Cancel:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.feedbackIgnored),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.accepted),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.started),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.progress),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.held),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.resumed),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.terminal),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.completed),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.rejected),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.cancelled));
+                    RtPrintf(
+                        "Abort:%llu Fault:%llu SeqInv:%llu Gap:%llu ActiveGap:%llu "
+                        "Orphan:%llu IdConflict:%llu OwnerMis:%llu DupTerm:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.aborted),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.faulted),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.invalidFeedbackSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.feedbackSequenceGaps),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.activeSequenceGapFailures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.ledgerOrphans),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.identityConflicts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.ownerMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.duplicateTerminal));
+                    RtPrintf(
+                        "TermConflict:%llu PostTerm:%llu Rev:%llu RevTerm:%llu "
+                        "QRev:%llu AlarmRev:%llu ResetRev:%llu EndRev:%llu "
+                        "SrcRev:%llu RunRev:%llu FbOv:%llu NoticeOv:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.terminalConflict),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.postTerminalFeedback),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.entriesRevoked),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.revokedTerminals),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.queueRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.alarmRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.resetRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.programEndRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.sourceRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.runtimeRevocations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.feedbackOverflowObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.
+                            producerNoticeOverflowObserved));
+                    RtPrintf(
+                        "LedBlkOv:%llu LedSegOv:%llu "
+                        "LedDup:%llu LedConflict:%llu RunFail:%llu Fail:%llu "
+                        "Active:%llu Peak:%llu Influence:%llu MotionWrite:%llu\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.
+                            ledgerActiveBlockOverwriteObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.
+                            ledgerActiveSegmentIndexOverwriteObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.ledgerDuplicateObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.ledgerConflictObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.runtimeFailures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.permanentFailures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.activeEntries),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.peakActiveEntries),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.motionWrites));
+
+                    RtPrintf(
+                        "[NC02K7-RA] Pub:%llu Decision:%s Sess:%llu WarmSess:%llu "
+                        "Entry:%llu PC:%d Line:%d ChainPC:%d Disp:%llu Commit:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadSnapshot.publicationSequence),
+                        NCOrdinaryG00ReadAheadDecisionToDiagnosticName(
+                            ordinaryG00ReadAheadSnapshot.decision),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadSnapshot.session),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadSnapshot.warmupSession),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadSnapshot.entrySequence),
+                        ordinaryG00ReadAheadSnapshot.sourcePC,
+                        ordinaryG00ReadAheadSnapshot.sourceLineNumber,
+                        ordinaryG00ReadAheadSnapshot.chainSourcePC,
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadSnapshot.dispatchId),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadSnapshot.commitSequence));
+                    RtPrintf(
+                        "Epoch:%u Seg:%llu ActiveAt:%u QDepth:%llu Limit:%u "
+                        "Cand:%u Env:%u RegReady:%u RegHealth:%u RegFence:%u ",
+                        static_cast<unsigned int>(
+                            ordinaryG00ReadAheadSnapshot.identity.epoch),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadSnapshot.identity.segmentId),
+                        ordinaryG00ReadAheadSnapshot.activeEntriesAtSelection,
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadSnapshot.queueDepthAtSelection),
+                        ordinaryG00ReadAheadSnapshot.activeLimit,
+                        ordinaryG00ReadAheadSnapshot.candidateExact ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.envelopeExact ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.registryReady ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.registryHealthy ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.registryHealthFenced
+                        ? 1U : 0U);
+                    RtPrintf(
+                        "HealthLock:%u Warm:%u Chain:%u Cap:%u Sel:%u Bind:%u Auth:%u "
+                        "CommitOK:%u Reg:%u Buffered:%u Exact:%u Stable:%u ",
+                        ordinaryG00ReadAheadSnapshot.registryHealthLockout
+                        ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.legacyWarmupProven ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.contiguousChain ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.capacityAvailable ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.selected ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.dispatchBound ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.motionAuthorized ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.commitBound ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.registryBound ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.bufferedTransport ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.exactStop ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.stableExecutionEpoch ? 1U : 0U);
+                    RtPrintf(
+                        "NoCb:%u Txn:%u Pending:%u Lock:%u Influence:%u "
+                        "Bypass:%u MotionWrite:%u Acct:%u\n",
+                        ordinaryG00ReadAheadSnapshot.noPerBlockCallback ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.transactionalEndpoint ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.pending ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.permanentLockout ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.runtimeInfluence ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.resolverBypassed ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.motionWrite ? 1U : 0U,
+                        ordinaryG00ReadAheadSnapshot.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K7-CNT] Eval:%llu Pub:%llu Ineligible:%llu "
+                        "WarmWait:%llu RegFence:%llu HealthLock:%llu Discont:%llu "
+                        "CapWait:%llu Select:%llu Bind:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.evaluations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.publications),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.ineligible),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.legacyWarmupWaits),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.registryHealthFences),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.registryHealthLockouts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.discontinuityFallbacks),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.capacityWaits),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.selected),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.dispatchBound));
+                    RtPrintf(
+                        "Auth:%llu Commit:%llu Reg:%llu Revoked:%llu "
+                        "RuntimeFail:%llu Mis:%llu Warmup:%llu MaxActive:%llu "
+                        "Influence:%llu Bypass:%llu MotionWrite:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.motionAuthorized),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.committed),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.registryBound),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.revokedPending),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.runtimeFailures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.proofMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.sessionWarmups),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.maxActiveObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.resolverBypasses),
+                        static_cast<unsigned long long>(
+                            ordinaryG00ReadAheadCounters.motionWrites));
+                    RtPrintf(
+                        "RegTry:%llu RegOK:%llu RegReject:%llu\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.
+                            readAheadRegistrationAttempts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.
+                            readAheadRegistered),
+                        static_cast<unsigned long long>(
+                            ordinaryG00InflightRegistryCounters.
+                            readAheadRegistrationRejected));
+
+                    RtPrintf(
+                        "[NC02K73-FHC] Pub:%llu Coh:%llu BSeq:%llu GSeq:%llu "
+                        "Phase:%s Decision:%s Sess:%llu Epoch:%u Owner:%u/%u ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortSnapshot.publicationSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortSnapshot.cohortSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortSnapshot.boundarySequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortSnapshot.gateSequence),
+                        NCOrdinaryG00FeedHoldCohortPhaseToDiagnosticName(
+                            ordinaryG00FeedHoldCohortSnapshot.phase),
+                        NCOrdinaryG00FeedHoldCohortDecisionToDiagnosticName(
+                            ordinaryG00FeedHoldCohortSnapshot.decision),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortSnapshot.session),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortSnapshot.executionEpoch),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortSnapshot.owner),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortSnapshot.ownerGeneration));
+                    RtPrintf(
+                        "ActiveAt:%u Members:%u Term:%u Ack:%u Req:%u Early:%u "
+                        "Applied:%u Order:%u CohortDone:%u AllDone:%u Active:%u ",
+                        ordinaryG00FeedHoldCohortSnapshot.activeEntriesAtCapture,
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortSnapshot.memberCount),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortSnapshot.terminalCount),
+                        ordinaryG00FeedHoldCohortSnapshot.holdAcknowledged ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.resumeRequested ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.
+                        resumeBeforeAcknowledge ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.resumeApplied ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.terminalOrderValid ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.
+                        terminalCohortComplete ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.allMembersCompleted
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.active ? 1U : 0U);
+                    RtPrintf(
+                        "Cancel:%u Fail:%u Shadow:%u Influence:%u MotionWrite:%u "
+                        "Acct:%u\n",
+                        ordinaryG00FeedHoldCohortSnapshot.cancelled ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.failed ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.shadowOnly ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.runtimeInfluence ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.motionWrite ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortSnapshot.accountingValid ? 1U : 0U);
+
+                    for (std::size_t memberIndex = 0U;
+                        memberIndex < NC_ORDINARY_G00_FEED_HOLD_COHORT_SIZE;
+                        ++memberIndex)
+                    {
+                        const NCOrdinaryG00FeedHoldCohortMemberSnapshot& member =
+                            ordinaryG00FeedHoldCohortSnapshot.members[memberIndex];
+                        RtPrintf(
+                            "[NC02K73-M%u] Reg:%llu Entry:%llu Disp:%llu "
+                            "Commit:%llu PC:%d Line:%d Epoch:%u Seg:%llu ",
+                            static_cast<unsigned int>(memberIndex),
+                            static_cast<unsigned long long>(member.registrySequence),
+                            static_cast<unsigned long long>(member.entrySequence),
+                            static_cast<unsigned long long>(member.dispatchId),
+                            static_cast<unsigned long long>(member.commitSequence),
+                            member.sourcePC,
+                            member.sourceLineNumber,
+                            static_cast<unsigned int>(member.identity.epoch),
+                            static_cast<unsigned long long>(member.identity.segmentId));
+                        RtPrintf(
+                            "SrcBlk:%d State:%s Last:%s FB:%llu Held:%u "
+                            "Resumed:%u Term:%u Ord:%u PreAck:%u PreResume:%u "
+                            "Done:%u Exact:%u\n",
+                            static_cast<int>(member.identity.sourceBlockId),
+                            NCOrdinaryG00InflightStateToDiagnosticName(
+                                member.currentState),
+                            MotionFeedbackTypeToDiagnosticName(
+                                member.lastFeedbackType),
+                            static_cast<unsigned long long>(
+                                member.lastFeedbackSequence),
+                            member.heldObserved ? 1U : 0U,
+                            member.resumedObserved ? 1U : 0U,
+                            member.terminalObserved ? 1U : 0U,
+                            static_cast<unsigned int>(member.terminalOrdinal),
+                            member.terminalBeforeAcknowledge ? 1U : 0U,
+                            member.terminalBeforeResume ? 1U : 0U,
+                            member.terminalCompleted ? 1U : 0U,
+                            member.exact ? 1U : 0U);
+                    }
+
+                    RtPrintf(
+                        "[NC02K73-CNT] Try:%llu Prog:%llu BypassOther:%llu "
+                        "BypassN:%llu Capture:%llu BTrans:%llu Gate:%llu Ack:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.captureAttempts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.programRequests),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.bypassNotProgram),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.bypassNotTwoActive),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.cohortsCaptured),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.boundaryTransitions),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.gateCorrelations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.holdAcknowledged));
+                    RtPrintf(
+                        "Early:%llu After:%llu Applied:%llu FbObs:%llu Match:%llu "
+                        "Ignore:%llu Held:%llu Resume:%llu Term:%llu Done:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.
+                            resumeBeforeAcknowledge),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.
+                            resumeAfterAcknowledge),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.resumeApplied),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.feedbackObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.feedbackMatched),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.feedbackIgnored),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.held),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.resumed),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.terminals),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.completedTerminals));
+                    RtPrintf(
+                        "Interrupt:%llu PreAck:%llu PreResume:%llu Cohort:%llu "
+                        "AllDone:%llu IntCohort:%llu Cancel:%llu Super:%llu "
+                        "Fail:%llu Influence:%llu MotionWrite:%llu\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.interruptedTerminals),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.
+                            terminalBeforeAcknowledge),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.terminalBeforeResume),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.terminalCohorts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.allCompletedCohorts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.interruptedCohorts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.cancelled),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.superseded),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.failures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.motionWrites));
+
+                    RtPrintf(
+                        "[NC02K73-FAIL] Boundary:%llu Registry:%llu Member:%llu "
+                        "Session:%llu Identity:%llu Owner:%llu Ledger:%llu "
+                        "Order:%llu DupTerm:%llu BMis:%llu GMis:%llu Acct:%u\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.invalidBoundary),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.invalidRegistry),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.invalidMember),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.sessionMismatch),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.identityConflict),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.ownerMismatch),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.ledgerRejected),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.terminalOutOfOrder),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.duplicateTerminal),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.boundaryMismatch),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCounters.gateMismatch),
+                        ordinaryG00FeedHoldCohortSnapshot.accountingValid ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K74-GATE] Pub:%llu Coh:%llu BSeq:%llu GSeq:%llu "
+                        "Phase:%s Decision:%s Sess:%llu Epoch:%u ActiveAt:%u ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.
+                            publicationSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.cohortSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.boundarySequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.gateSequence),
+                        NCOrdinaryG00FeedHoldCohortCutoverPhaseToDiagnosticName(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.phase),
+                        NCOrdinaryG00FeedHoldCohortCutoverDecisionToDiagnosticName(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.decision),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.session),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.executionEpoch),
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.
+                        activeEntriesAtCapture);
+                    RtPrintf(
+                        "ActiveN:%u Members:%u Term:%u Ack:%u Req:%u Applied:%u "
+                        "Exact:%u Bound:%u Wait:%u Release:%u Fallback:%u ",
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.
+                        registryActiveEntries,
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.memberCount),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortCutoverSnapshot.terminalCount),
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.
+                        holdAcknowledged ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.
+                        resumeRequested ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.
+                        resumeApplied ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.exactCohort
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.bound ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.waiting ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.released ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.fallbackLegacy
+                        ? 1U : 0U);
+                    RtPrintf(
+                        "Lock:%u Enabled:%u Influence:%u Bypass:%u MotionWrite:%u "
+                        "Acct:%u\n",
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.sessionLockout
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.enabled ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.runtimeInfluence
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.resolverBypassed
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.motionWrite
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.accountingValid
+                        ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K74-CNT] Obs:%llu Bind:%llu BypassOff:%llu "
+                        "BypassNoCoh:%llu Stale:%llu Eval:%llu Bypass:%llu "
+                        "WaitAck:%llu WaitResume:%llu WaitM0:%llu WaitM1:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.observations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.cohortsBound),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.bypassDisabled),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            bypassNoExactCohort),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            staleObservations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.admissionChecks),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            admissionBypasses),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            waitHoldAcknowledge),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.waitResume),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            waitFirstTerminal),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            waitSecondTerminal));
+                    RtPrintf(
+                        "Release:%llu Allow:%llu Fallback:%llu Int:%llu "
+                        "Cancel:%llu Proof:%llu RegMis:%llu AcctMis:%llu "
+                        "SessReset:%llu Influence:%llu ResolverBypass:%llu "
+                        "MotionWrite:%llu\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.releases),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.allowReadAhead),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.fallbackLegacy),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            interruptedCohorts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            cancelledCohorts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.failedProofs),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            registryMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            accountingMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.sessionResets),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            resolverBypasses),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.motionWrites));
+
+                    RtPrintf(
+                        "[NC02K74-FAIL] Proof:%llu Reg:%llu Acct:%llu "
+                        "Lock:%u Fallback:%u AcctOK:%u\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.failedProofs),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            registryMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortCutoverCounters.
+                            accountingMismatches),
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.sessionLockout
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.fallbackLegacy
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortCutoverSnapshot.accountingValid
+                        ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K75-RRM] Pub:%llu Phase:%s Decision:%s Sess:%llu "
+                        "Gen:%u Rel:%u SameSess:%u Lease:%u CohSeq:%u BSeq:%u ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmSnapshot.
+                            publicationSequence),
+                        NCOrdinaryG00FeedHoldCohortRearmPhaseToDiagnosticName(
+                            ordinaryG00FeedHoldCohortRearmSnapshot.phase),
+                        NCOrdinaryG00FeedHoldCohortRearmDecisionToDiagnosticName(
+                            ordinaryG00FeedHoldCohortRearmSnapshot.decision),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmSnapshot.session),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortRearmSnapshot.generationCount),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldCohortRearmSnapshot.releaseCount),
+                        ordinaryG00FeedHoldCohortRearmSnapshot.sameSession ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.sameExecutionLease
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.
+                        cohortSequenceMonotonic ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.
+                        boundarySequenceMonotonic ? 1U : 0U);
+                    RtPrintf(
+                        "GSeq:%u Isolate:%u NoOverlap:%u Proven:%u Fail:%u "
+                        "Shadow:%u Influence:%u MotionWrite:%u Acct:%u\n",
+                        ordinaryG00FeedHoldCohortRearmSnapshot.
+                        gateSequenceMonotonic ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.memberIsolation
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.noOverlap ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.rearmProven ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.failed ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.shadowOnly ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.runtimeInfluence
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.motionWrite ? 1U : 0U,
+                        ordinaryG00FeedHoldCohortRearmSnapshot.accountingValid
+                        ? 1U : 0U);
+
+                    for (std::size_t generationIndex = 0U;
+                        generationIndex <
+                        NC_ORDINARY_G00_FEED_HOLD_REARM_GENERATIONS;
+                        ++generationIndex)
+                    {
+                        const NCOrdinaryG00FeedHoldCohortGenerationSnapshot&
+                            generation =
+                            ordinaryG00FeedHoldCohortRearmSnapshot.
+                            generations[generationIndex];
+                        RtPrintf(
+                            "[NC02K75-G%u] Coh:%llu BSeq:%llu GSeq:%llu "
+                            "Sess:%llu Epoch:%u Members:%u Term:%u Captured:%u ",
+                            static_cast<unsigned int>(generationIndex),
+                            static_cast<unsigned long long>(
+                                generation.cohortSequence),
+                            static_cast<unsigned long long>(
+                                generation.boundarySequence),
+                            static_cast<unsigned long long>(generation.gateSequence),
+                            static_cast<unsigned long long>(generation.session),
+                            static_cast<unsigned int>(generation.executionEpoch),
+                            static_cast<unsigned int>(generation.memberCount),
+                            static_cast<unsigned int>(generation.terminalCount),
+                            generation.captured ? 1U : 0U);
+                        RtPrintf(
+                            "Release:%u Exact:%u Order:%u Done:%u RegEmpty:%u "
+                            "E0:%llu D0:%llu S0:%llu E1:%llu D1:%llu S1:%llu\n",
+                            generation.released ? 1U : 0U,
+                            generation.exact ? 1U : 0U,
+                            generation.terminalOrderValid ? 1U : 0U,
+                            generation.allMembersCompleted ? 1U : 0U,
+                            generation.registryEmptyAtRelease ? 1U : 0U,
+                            static_cast<unsigned long long>(
+                                generation.memberEntrySequence[0]),
+                            static_cast<unsigned long long>(
+                                generation.memberDispatchId[0]),
+                            static_cast<unsigned long long>(
+                                generation.memberIdentity[0].segmentId),
+                            static_cast<unsigned long long>(
+                                generation.memberEntrySequence[1]),
+                            static_cast<unsigned long long>(
+                                generation.memberDispatchId[1]),
+                            static_cast<unsigned long long>(
+                                generation.memberIdentity[1].segmentId));
+                    }
+
+                    RtPrintf(
+                        "[NC02K75-CNT] Obs:%llu Edge:%llu Bypass:%llu Gen:%llu "
+                        "FirstB:%llu FirstR:%llu SecondB:%llu SecondR:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.observations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.cohortEdges),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.nonExactBypasses),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            generationsCaptured),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.firstBound),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.firstReleased),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.secondBound),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.secondReleased));
+                    RtPrintf(
+                        "Stable:%llu Stale:%llu Early:%llu Sess:%llu Lease:%llu "
+                        "CohSeq:%llu BSeq:%llu GSeq:%llu Reuse:%llu Reg:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            stableObservations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            staleObservations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.earlyRearm),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            sessionMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            executionLeaseMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            cohortSequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            boundarySequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            gateSequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            memberIdentityReuse),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            registryMismatches));
+                    RtPrintf(
+                        "Proof:%llu Fallback:%llu Acct:%llu SessReset:%llu "
+                        "Fail:%llu "
+                        "Influence:%llu MotionWrite:%llu\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.proofMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.fallbackObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            accountingMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.sessionResets),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.failures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.motionWrites));
+
+                    RtPrintf(
+                        "[NC02K75-FAIL] Early:%llu Sess:%llu Lease:%llu "
+                        "CohSeq:%llu BSeq:%llu GSeq:%llu Reuse:%llu Reg:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.earlyRearm),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            sessionMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            executionLeaseMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            cohortSequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            boundarySequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            gateSequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            memberIdentityReuse),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            registryMismatches));
+                    RtPrintf(
+                        "Proof:%llu Fallback:%llu Acct:%llu Fail:%llu AcctOK:%u\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.proofMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.fallbackObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.
+                            accountingMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldCohortRearmCounters.failures),
+                        ordinaryG00FeedHoldCohortRearmSnapshot.accountingValid
+                        ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K76-GATE] Pub:%llu RPub:%llu Phase:%s Decision:%s "
+                        "Sess:%llu Coh:%llu BSeq:%llu GSeq:%llu Gen:%u Rel:%u ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.
+                            publicationSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.
+                            rearmPublicationSequence),
+                        NCOrdinaryG00FeedHoldRearmCutoverPhaseToDiagnosticName(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.phase),
+                        NCOrdinaryG00FeedHoldRearmCutoverDecisionToDiagnosticName(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.decision),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.session),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.cohortSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.
+                            boundarySequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.gateSequence),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.generationCount),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldRearmCutoverSnapshot.releaseCount));
+                    RtPrintf(
+                        "Exact:%u Bound:%u Wait:%u Release:%u Fallback:%u "
+                        "Lock:%u Enabled:%u Influence:%u MotionWrite:%u Acct:%u\n",
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.
+                        exactSecondGeneration ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.bound ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.waiting ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.released ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.fallbackLegacy
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.sessionLockout
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.enabled ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.runtimeInfluence
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.motionWrite
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.accountingValid
+                        ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K76-CNT] Obs:%llu Bind:%llu BypassOff:%llu "
+                        "BypassPre:%llu Stale:%llu Eval:%llu EvalBypass:%llu "
+                        "Wait74:%llu Wait75:%llu Release:%llu Allow:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.observations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            secondGenerationsBound),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.bypassDisabled),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            bypassBeforeSecondGeneration),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            staleObservations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.admissionChecks),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            admissionBypasses),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.waitK74Release),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            waitK75RearmProof),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.releases),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.allowReadAhead));
+                    RtPrintf(
+                        "Fallback:%llu K75Fail:%llu K74Fail:%llu Sess:%llu "
+                        "Seq:%llu Identity:%llu Reg:%llu Acct:%llu "
+                        "SessReset:%llu Fail:%llu Influence:%llu MotionWrite:%llu\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.fallbackLegacy),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.k75Failures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.k74Failures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            sessionMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            sequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            identityMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            registryMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            accountingMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.sessionResets),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.failures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.motionWrites));
+
+                    RtPrintf(
+                        "[NC02K76-FAIL] K75:%llu K74:%llu Sess:%llu Seq:%llu "
+                        "Identity:%llu Reg:%llu Acct:%llu Fail:%llu Lock:%u "
+                        "Fallback:%u AcctOK:%u\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.k75Failures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.k74Failures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            sessionMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            sequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            identityMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            registryMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.
+                            accountingMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRearmCutoverCounters.failures),
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.sessionLockout
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.fallbackLegacy
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRearmCutoverSnapshot.accountingValid
+                        ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K77-ROLL] Pub:%llu Phase:%s Decision:%s Sess:%llu "
+                        "Gen:%llu Rel:%llu RollCap:%llu RollRel:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            publicationSequence),
+                        NCOrdinaryG00FeedHoldRollingRearmPhaseName(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.phase),
+                        NCOrdinaryG00FeedHoldRollingRearmDecisionName(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.decision),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.session),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            generationCount),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.releaseCount),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            rollingCaptureCount),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            rollingReleaseCount));
+                    RtPrintf(
+                        "ActiveOrd:%llu Seed:%u Track:%u Active:%u Continuity:%u "
+                        "SameSess:%u SameLease:%u SeqMono:%u Lineage:%u ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            activeGenerationOrdinal),
+                        ordinaryG00FeedHoldRollingRearmSnapshot.seeded ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.tracking
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.active ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.
+                        releasedContinuity ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.sameSession
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.sameExecutionLease
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.sequenceMonotonic
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.fullLineageValid
+                        ? 1U : 0U);
+                    RtPrintf(
+                        "NoOverlap:%u Fail:%u Bounded:%u Shadow:%u Influence:%u "
+                        "MotionWrite:%u Acct:%u\n",
+                        ordinaryG00FeedHoldRollingRearmSnapshot.noOverlap
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.failed ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.bounded ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.shadowOnly
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.runtimeInfluence
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.motionWrite
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingRearmSnapshot.accountingValid
+                        ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02K77-LINE] K75Pub:%llu K76Pub:%llu K73Pub:%llu "
+                        "K74Pub:%llu RegPub:%llu SeedCoh:%llu SeedB:%llu "
+                        "SeedG:%llu LastCoh:%llu LastB:%llu LastG:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            seedK75PublicationSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            seedK76PublicationSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            seedK73PublicationSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            seedK74PublicationSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            seedRegistryPublicationSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            seedCohortSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            seedBoundarySequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            seedGateSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            lastCohortSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            lastBoundarySequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            lastGateSequence));
+                    RtPrintf(
+                        "RegHW:%llu EntryHW:%llu DispatchHW:%llu CommitHW:%llu "
+                        "SegmentHW:%llu Digest:%llu\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            registrySequenceHighWater),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            entrySequenceHighWater),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            dispatchIdHighWater),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            commitSequenceHighWater),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.
+                            segmentIdHighWater),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmSnapshot.lineageDigest));
+
+                    const NCOrdinaryG00FeedHoldRollingGenerationSnapshot&
+                        ordinaryG00FeedHoldRollingGeneration =
+                        ordinaryG00FeedHoldRollingRearmSnapshot.active
+                        ? ordinaryG00FeedHoldRollingRearmSnapshot.currentActive
+                        : ordinaryG00FeedHoldRollingRearmSnapshot.lastReleased;
+
+                    RtPrintf(
+                        "[NC02K77-GEN] Ord:%llu Coh:%llu BSeq:%llu GSeq:%llu "
+                        "Cap73:%llu Cap74:%llu CapReg:%llu Rel73:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.
+                            generationOrdinal),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.cohortSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.boundarySequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.gateSequence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.
+                            cohortPublicationAtCapture),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.
+                            cutoverPublicationAtCapture),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.
+                            registryPublicationAtCapture),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.
+                            cohortPublicationAtRelease));
+                    RtPrintf(
+                        "Rel74:%llu RelReg:%llu Sess:%llu Epoch:%u Owner:%u "
+                        "OwnerGen:%u Members:%u Term:%u Seed:%u Rolling:%u ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.
+                            cutoverPublicationAtRelease),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.
+                            registryPublicationAtRelease),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.session),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldRollingGeneration.executionEpoch),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldRollingGeneration.owner),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldRollingGeneration.ownerGeneration),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldRollingGeneration.memberCount),
+                        static_cast<unsigned int>(
+                            ordinaryG00FeedHoldRollingGeneration.terminalCount),
+                        ordinaryG00FeedHoldRollingGeneration.seedEvidence
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingGeneration.rollingEvidence
+                        ? 1U : 0U);
+                    RtPrintf(
+                        "Captured:%u Released:%u Hold:%u ResumeReq:%u "
+                        "ResumeApplied:%u Order:%u Done:%u TermFB:%u "
+                        "RegEmpty:%u Digest:%llu\n",
+                        ordinaryG00FeedHoldRollingGeneration.captured ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingGeneration.released ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingGeneration.holdAcknowledged
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingGeneration.resumeRequested
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingGeneration.resumeApplied
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingGeneration.terminalOrderValid
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingGeneration.allMembersCompleted
+                        ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingGeneration.
+                        terminalFeedbackComplete ? 1U : 0U,
+                        ordinaryG00FeedHoldRollingGeneration.
+                        registryEmptyAtRelease ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingGeneration.lineageDigest));
+
+                    for (std::size_t rollingMemberIndex = 0U;
+                        rollingMemberIndex <
+                        NC_ORDINARY_G00_FEED_HOLD_COHORT_SIZE;
+                        ++rollingMemberIndex)
+                    {
+                        const NCOrdinaryG00FeedHoldRollingMemberLineageSnapshot&
+                            rollingMember = ordinaryG00FeedHoldRollingGeneration.
+                            members[rollingMemberIndex];
+                        RtPrintf(
+                            "[NC02K77-M%u] Reg:%llu Entry:%llu Dispatch:%llu "
+                            "Commit:%llu PC:%d Line:%d Epoch:%u Segment:%llu ",
+                            static_cast<unsigned int>(rollingMemberIndex),
+                            static_cast<unsigned long long>(
+                                rollingMember.registrySequence),
+                            static_cast<unsigned long long>(
+                                rollingMember.entrySequence),
+                            static_cast<unsigned long long>(
+                                rollingMember.dispatchId),
+                            static_cast<unsigned long long>(
+                                rollingMember.commitSequence),
+                            rollingMember.sourcePC,
+                            rollingMember.sourceLineNumber,
+                            static_cast<unsigned int>(rollingMember.identity.epoch),
+                            static_cast<unsigned long long>(
+                                rollingMember.identity.segmentId));
+                        RtPrintf(
+                            "SourceBlock:%d Source:%u LeaseOwner:%u LeaseGen:%u "
+                            "Fingerprint:%llu Exact:%u TermFB:%u TermDone:%u "
+                            "TermOrd:%u TermSeq:%llu TermType:%u\n",
+                            static_cast<int>(rollingMember.identity.sourceBlockId),
+                            static_cast<unsigned int>(rollingMember.identity.source),
+                            static_cast<unsigned int>(rollingMember.ownerLease.owner),
+                            static_cast<unsigned int>(
+                                rollingMember.ownerLease.generation),
+                            static_cast<unsigned long long>(
+                                rollingMember.lineageFingerprint),
+                            rollingMember.exact ? 1U : 0U,
+                            rollingMember.terminalFeedbackReceived ? 1U : 0U,
+                            rollingMember.terminalCompleted ? 1U : 0U,
+                            static_cast<unsigned int>(rollingMember.terminalOrdinal),
+                            static_cast<unsigned long long>(
+                                rollingMember.terminalFeedbackSequence),
+                            static_cast<unsigned int>(
+                                rollingMember.terminalFeedbackType));
+                    }
+
+                    RtPrintf(
+                        "[NC02K77-CNT] Obs:%llu SeedTry:%llu Wait75:%llu "
+                        "Wait76:%llu WaitCurrent:%llu SeedOK:%llu Edge:%llu "
+                        "Bypass:%llu Cap:%llu Rel:%llu Stable:%llu Early:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.observations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.seedAttempts),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.waitK75Seed),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.waitK76Seed),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            waitCurrentCohortSeed),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.seedAccepted),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            rollingCohortEdges),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            nonExactBypasses),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.rollingCaptures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.rollingReleases),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            stableObservations),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.earlyEdges));
+                    RtPrintf(
+                        "Sess:%llu Lease:%llu Seq:%llu Wrap:%llu Lineage:%llu "
+                        "Reg:%llu Acct:%llu ActiveInv:%llu Ordinal:%llu "
+                        "Proof:%llu Fallback:%llu SessReset:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            sessionMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            executionLeaseMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            sequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            sequenceWrapUnsupported),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            lineageMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            registryMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            accountingMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            activeInvariantMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            ordinalExhausted),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.proofMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.fallbackObserved),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.sessionResets));
+                    RtPrintf(
+                        "ResetActive:%llu Fail:%llu Influence:%llu "
+                        "MotionWrite:%llu\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.resetWhileActive),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.failures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.motionWrites));
+
+                    RtPrintf(
+                        "[NC02K77-FAIL] Early:%llu Sess:%llu Lease:%llu "
+                        "Seq:%llu Wrap:%llu Lineage:%llu Reg:%llu Acct:%llu "
+                        "ActiveInv:%llu Ordinal:%llu Proof:%llu Fallback:%llu ",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.earlyEdges),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            sessionMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            executionLeaseMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            sequenceMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            sequenceWrapUnsupported),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            lineageMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            registryMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            accountingMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.
+                            activeInvariantMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.ordinalExhausted),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.proofMismatches),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.fallbackObserved));
+                    RtPrintf(
+                        "ResetActive:%llu Fail:%llu Influence:%llu "
+                        "MotionWrite:%llu AcctOK:%u\n",
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.resetWhileActive),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.failures),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.runtimeInfluence),
+                        static_cast<unsigned long long>(
+                            ordinaryG00FeedHoldRollingRearmCounters.motionWrites),
+                        ordinaryG00FeedHoldRollingRearmSnapshot.accountingValid
+                        ? 1U : 0U);
+
+                    if (shouldPrintK78)
+                    {
+                        RtPrintf(
+                            "[NC02K78-GATE] Pub:%llu RPub:%llu K74Pub:%llu "
+                            "RegPub:%llu Phase:%s Decision:%s Sess:%llu Ord:%llu ",
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.
+                                publicationSequence),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.
+                                rollingPublicationSequence),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.
+                                cohortCutoverPublicationSequence),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.
+                                registryPublicationSequence),
+                            NCOrdinaryG00FeedHoldRollingCutoverPhaseName(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.phase),
+                            NCOrdinaryG00FeedHoldRollingCutoverDecisionName(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.decision),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.session),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.
+                                generationOrdinal));
+                        RtPrintf(
+                            "LastRel:%llu Gen:%llu Rel:%llu Coh:%llu BSeq:%llu "
+                            "GSeq:%llu Exact:%u Seed:%u Bound:%u Wait:%u Release:%u ",
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.
+                                lastReleasedGenerationOrdinal),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.
+                                generationCount),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.releaseCount),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.cohortSequence),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.
+                                boundarySequence),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverSnapshot.gateSequence),
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.exactGeneration
+                            ? 1U : 0U,
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.trackingSeeded
+                            ? 1U : 0U,
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.bound ? 1U : 0U,
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.waiting ? 1U : 0U,
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.released ? 1U : 0U);
+                        RtPrintf(
+                            "Fallback:%u Lock:%u Enabled:%u Influence:%u "
+                            "MotionWrite:%u Acct:%u\n",
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.fallbackLegacy
+                            ? 1U : 0U,
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.sessionLockout
+                            ? 1U : 0U,
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.enabled ? 1U : 0U,
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.runtimeInfluence
+                            ? 1U : 0U,
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.motionWrite
+                            ? 1U : 0U,
+                            ordinaryG00FeedHoldRollingCutoverSnapshot.accountingValid
+                            ? 1U : 0U);
+
+                        RtPrintf(
+                            "[NC02K78-CNT] Obs:%llu Seed:%llu Bind:%llu "
+                            "BypassOff:%llu BypassSeed:%llu BypassIdle:%llu "
+                            "Stale:%llu Eval:%llu EvalBypass:%llu Wait74:%llu ",
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.observations),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.trackingSeeds),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                generationsBound),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                bypassDisabled),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.bypassWaitSeed),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                bypassNoActiveGeneration),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                staleObservations),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.admissionChecks),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                admissionBypasses),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.waitK74Release));
+                        RtPrintf(
+                            "Wait77:%llu Release:%llu Allow:%llu Fallback:%llu "
+                            "K77Fail:%llu K74Fail:%llu Sess:%llu Lease:%llu ",
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                waitK77ContinuityProof),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.releases),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.allowReadAhead),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.fallbackLegacy),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.k77Failures),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.k74Failures),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                sessionMismatches),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                executionLeaseMismatches));
+                        RtPrintf(
+                            "Seq:%llu Lineage:%llu Identity:%llu Reg:%llu Acct:%llu "
+                            "ActiveInv:%llu SessReset:%llu Fail:%llu Influence:%llu "
+                            "MotionWrite:%llu\n",
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                sequenceMismatches),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                lineageMismatches),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                identityMismatches),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                registryMismatches),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                accountingMismatches),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                activeInvariantMismatches),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.sessionResets),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.failures),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.
+                                runtimeInfluence),
+                            static_cast<unsigned long long>(
+                                ordinaryG00FeedHoldRollingCutoverCounters.motionWrites));
+                    }
+
+                });
+            RunHmiDiagnosticOutputFamily([&]()
+                {
+                    const std::uint64_t stopCommandMaxPps =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.maxAxisCommandVelocityAbsPps,
+                            1.0);
+                    const std::uint64_t stopActualMaxPps =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.maxAxisActualVelocityAbsPps,
+                            1.0);
+                    const std::uint64_t stopCommandDeadbandPps =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.commandVelocityDeadbandPps,
+                            1.0);
+                    const std::uint64_t stopActualDeadbandPps =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.actualVelocityDeadbandPps,
+                            1.0);
+                    const std::uint64_t followingErrorNm =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.worstFollowingErrorAbsMm,
+                            1000000.0);
+                    const std::uint64_t followingWindowNm =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.worstFollowingErrorWindowMm,
+                            1000000.0);
+                    const std::uint64_t followingRatioX1000 =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.worstFollowingErrorWindowRatio,
+                            1000.0);
+                    const std::uint64_t groupFollowingErrorNm =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.worstGroupFollowingErrorAbsMm,
+                            1000000.0);
+                    const std::uint64_t groupFollowingWindowNm =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.worstGroupFollowingErrorWindowMm,
+                            1000000.0);
+                    const std::uint64_t groupFollowingRatioX1000 =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.worstGroupFollowingErrorWindowRatio,
+                            1000.0);
+                    const std::uint64_t maximumStopDecTimeMs =
+                        ScaleNonNegativeDiagnosticValue(
+                            stopSettleSnapshot.maxConfiguredStopDecTimeSec,
+                            1000.0);
+
+                    RtPrintf(
+                        "[NC02J4-SET] Gen:%llu Valid:%u Sample:%llu Stand:%u Block:%s "
+                        "BAx:%d BState:%s GActive:%u Q:%u/%u/%u GAxes:%u ",
+                        static_cast<unsigned long long>(
+                            stopSettleSnapshot.publicationGeneration),
+                        stopSettleSnapshot.publicationGeneration != 0ULL ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            stopSettleSnapshot.sampleSequence),
+                        stopSettleSnapshot.standstill ? 1U : 0U,
+                        MotionStopSettleBlockerToDiagnosticName(
+                            stopSettleSnapshot.primaryBlocker),
+                        stopSettleSnapshot.primaryAxisIndex,
+                        MotionStateToDiagnosticName(
+                            stopSettleSnapshot.primaryAxisState),
+                        stopSettleSnapshot.groupActive ? 1U : 0U,
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.commandQueueDepth),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.commandIngressDepth),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.commandReplayDepth),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.groupAxisCount));
+                    RtPrintf(
+                        "Axes:%u NonIdle:%u CmdMove:%u ActMove:%u PDO:%u/%u\n",
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.existingAxisCount),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.nonIdleAxisCount),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.commandMovingAxisCount),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.actualMovingAxisCount),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.pdoTargetVelocityNonzeroAxisCount),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.pdoTargetVelocitySampledAxisCount));
+
+                    RtPrintf(
+                        "[NC02J4-AX] CmdAx:%d CmdMax:%llu/%llu ActAx:%d "
+                        "ActMax:%llu/%llu PDOAx:%d PDOMax:%u FollowAx:%d ",
+                        stopSettleSnapshot.worstCommandVelocityAxisIndex,
+                        static_cast<unsigned long long>(stopCommandMaxPps),
+                        static_cast<unsigned long long>(stopCommandDeadbandPps),
+                        stopSettleSnapshot.worstActualVelocityAxisIndex,
+                        static_cast<unsigned long long>(stopActualMaxPps),
+                        static_cast<unsigned long long>(stopActualDeadbandPps),
+                        stopSettleSnapshot.worstFinalPdoTargetVelocityAxisIndex,
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.maxFinalPdoTargetVelocityAbs),
+                        stopSettleSnapshot.worstFollowingErrorAxisIndex);
+                    RtPrintf(
+                        "ErrNm:%llu WinNm:%llu RatioX1000:%llu Outside:%u "
+                        "GFollowAx:%d GErrNm:%llu GWinNm:%llu GRatioX1000:%llu "
+                        "GOutside:%u StopAx:%d StopMs:%llu\n",
+                        static_cast<unsigned long long>(followingErrorNm),
+                        static_cast<unsigned long long>(followingWindowNm),
+                        static_cast<unsigned long long>(followingRatioX1000),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.outsideInPositionWindowAxisCount),
+                        stopSettleSnapshot.worstGroupFollowingErrorAxisIndex,
+                        static_cast<unsigned long long>(groupFollowingErrorNm),
+                        static_cast<unsigned long long>(groupFollowingWindowNm),
+                        static_cast<unsigned long long>(groupFollowingRatioX1000),
+                        static_cast<unsigned int>(
+                            stopSettleSnapshot.groupOutsideInPositionWindowAxisCount),
+                        stopSettleSnapshot.maxStopDecTimeAxisIndex,
+                        static_cast<unsigned long long>(maximumStopDecTimeMs));
+
+                    RtPrintf(
+                        "[NC02J4-MCNT] Sample:%llu Stand:%llu Block:%llu "
+                        "GActive:%llu CmdQ:%llu State:%llu CmdVel:%llu ActVel:%llu "
+                        "BTrans:%llu STrans:%llu Into:%llu Out:%llu\n",
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.sampleCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.standstillSampleCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.blockedSampleCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.groupActiveBlockerCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.commandQueueBlockerCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.axisNotIdleBlockerCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.axisCommandVelocityBlockerCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.axisActualVelocityBlockerCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.primaryBlockerTransitionCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.standstillTransitionCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.transitionIntoStandstillCount),
+                        static_cast<unsigned long long>(
+                            stopSettleCounters.transitionOutOfStandstillCount));
+
+                    const bool resetStandstillSkew =
+                        lifecycleInterruptionSnapshot.active &&
+                        lifecycleInterruptionSnapshot.groupStandstill !=
+                        stopSettleSnapshot.standstill;
+                    const bool programEndStandstillSkew =
+                        programEndSnapshot.requestPending &&
+                        programEndSnapshot.groupStandstill !=
+                        stopSettleSnapshot.standstill;
+                    const bool barrierStandstillSkew =
+                        preDispatchBarrierSnapshot.active &&
+                        preDispatchBarrierSnapshot.groupStandstill !=
+                        stopSettleSnapshot.standstill;
+
+                    RtPrintf(
+                        "[NC02J4-XCHK] RT:%u Reset:%u/%u Skew:%u "
+                        "PEnd:%u/%u Skew:%u Bar:%u/%u Skew:%u FH:%u/%u\n",
+                        stopSettleSnapshot.standstill ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.active ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.groupStandstill ? 1U : 0U,
+                        resetStandstillSkew ? 1U : 0U,
+                        programEndSnapshot.requestPending ? 1U : 0U,
+                        programEndSnapshot.groupStandstill ? 1U : 0U,
+                        programEndStandstillSkew ? 1U : 0U,
+                        preDispatchBarrierSnapshot.active ? 1U : 0U,
+                        preDispatchBarrierSnapshot.groupStandstill ? 1U : 0U,
+                        barrierStandstillSkew ? 1U : 0U,
+                        feedHoldSnapshot.active ? 1U : 0U,
+                        feedHoldSnapshot.motion.actualStopped ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02I-SB] Seq:%llu D:%llu Phase:%s Decision:%s Kind:%s ",
+                        static_cast<unsigned long long>(singleBlockShadowSnapshot.sequence),
+                        static_cast<unsigned long long>(singleBlockShadowSnapshot.dispatchId),
+                        NCSingleBlockShadowPhaseToDiagnosticName(
+                            singleBlockShadowSnapshot.phase),
+                        NCSingleBlockShadowDecisionToDiagnosticName(
+                            singleBlockShadowSnapshot.decision),
+                        NCSingleBlockCandidateKindToDiagnosticName(
+                            singleBlockShadowSnapshot.candidateKind));
+                    RtPrintf(
+                        "Active:%u PC:%d Line:%d Commit:%u Cb:%u/%u Txn:%u/%u ",
+                        singleBlockShadowSnapshot.active ? 1U : 0U,
+                        singleBlockShadowSnapshot.sourcePC,
+                        singleBlockShadowSnapshot.sourceLineNumber,
+                        singleBlockShadowSnapshot.programCommitted ? 1U : 0U,
+                        singleBlockShadowSnapshot.callbackComplete ? 1U : 0U,
+                        singleBlockShadowSnapshot.callbackRequired ? 1U : 0U,
+                        singleBlockShadowSnapshot.transactionComplete ? 1U : 0U,
+                        singleBlockShadowSnapshot.transactionRequired ? 1U : 0U);
+                    RtPrintf(
+                        "Motion:%s Done:%u Fail:%u Ready:%u Pause:%u Hold:%u Ctrl:%u EndSup:%u\n",
+                        NCBlockMotionBoundaryStateToDiagnosticName(
+                            singleBlockShadowSnapshot.motionState),
+                        singleBlockShadowSnapshot.motionComplete ? 1U : 0U,
+                        singleBlockShadowSnapshot.motionFailed ? 1U : 0U,
+                        singleBlockShadowSnapshot.boundaryReady ? 1U : 0U,
+                        singleBlockShadowSnapshot.legacyPausePending ? 1U : 0U,
+                        singleBlockShadowSnapshot.legacyHoldObserved ? 1U : 0U,
+                        singleBlockShadowSnapshot.controlledHoldObserved ? 1U : 0U,
+                        singleBlockShadowSnapshot.programEndSuppressed ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02I-CNT] ArmTry:%llu Armed:%llu NotEligible:%llu Eval:%llu "
+                        "WaitLife:%llu WaitCommit:%llu WaitTxn:%llu WaitCb:%llu "
+                        "WaitMotion:%llu Ready:%llu LegacyHold:%llu Agree:%llu ",
+                        static_cast<unsigned long long>(singleBlockShadowCounters.armAttempts),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.armed),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.notEligible),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.evaluations),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.waitLifecycle),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.waitProgramCommit),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.waitTransaction),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.waitCallback),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.waitMotion),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.boundaryReady),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.legacyHolds),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.agreeHolds));
+                    RtPrintf(
+                        "Early:%llu Phantom:%llu Missing:%llu CtrlHold:%llu "
+                        "CtrlAgree:%llu CtrlEarly:%llu CtrlResume:%llu MotionFail:%llu "
+                        "Overflow:%llu TxnFail:%llu EndSup:%llu Resume:%llu ",
+                        static_cast<unsigned long long>(singleBlockShadowCounters.legacyEarlyHolds),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.legacyHoldWithoutArm),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.legacyMissingHold),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.controlledHolds),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.controlledAgreeHolds),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.controlledEarlyHoldAttempts),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.controlledResumed),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.motionFailures),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.trackingOverflow),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.transactionFailures),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.programEndSuppressed),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.resumed));
+                    RtPrintf(
+                        "Cancel:%llu Supersede:%llu\n",
+                        static_cast<unsigned long long>(singleBlockShadowCounters.cancelled),
+                        static_cast<unsigned long long>(singleBlockShadowCounters.superseded));
+
+                    RtPrintf(
+                        "[NC02I-SG] Seq:%llu BSeq:%llu Enabled:%u Phase:%s Decision:%s "
+                        "Active:%u D:%llu PC:%d Line:%d Kind:%s Match:%u Ready:%u ",
+                        static_cast<unsigned long long>(singleBlockGateSnapshot.sequence),
+                        static_cast<unsigned long long>(singleBlockGateSnapshot.boundarySequence),
+                        singleBlockGateSnapshot.enabled ? 1U : 0U,
+                        NCSingleBlockHoldGatePhaseToDiagnosticName(
+                            singleBlockGateSnapshot.phase),
+                        NCSingleBlockHoldGateDecisionToDiagnosticName(
+                            singleBlockGateSnapshot.decision),
+                        singleBlockGateSnapshot.active ? 1U : 0U,
+                        static_cast<unsigned long long>(singleBlockGateSnapshot.dispatchId),
+                        singleBlockGateSnapshot.sourcePC,
+                        singleBlockGateSnapshot.sourceLineNumber,
+                        NCSingleBlockCandidateKindToDiagnosticName(
+                            singleBlockGateSnapshot.candidateKind),
+                        singleBlockGateSnapshot.boundaryMatched ? 1U : 0U,
+                        singleBlockGateSnapshot.boundaryReady ? 1U : 0U);
+                    RtPrintf(
+                        "HoldReady:%u Hold:%u Resume:%u Explicit:%u EndSup:%u "
+                        "Blocked:%u Cancel:%u\n",
+                        singleBlockGateSnapshot.holdReady ? 1U : 0U,
+                        singleBlockGateSnapshot.holdApplied ? 1U : 0U,
+                        singleBlockGateSnapshot.resumeApplied ? 1U : 0U,
+                        singleBlockGateSnapshot.explicitStopBypass ? 1U : 0U,
+                        singleBlockGateSnapshot.programEndSuppressed ? 1U : 0U,
+                        singleBlockGateSnapshot.blocked ? 1U : 0U,
+                        singleBlockGateSnapshot.cancelled ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02I-SCNT] Req:%llu Armed:%llu BypassOff:%llu "
+                        "BypassStop:%llu Wait:%llu Ready:%llu Hold:%llu Resume:%llu "
+                        "EndSup:%llu BlockMotion:%llu BlockTxn:%llu BlockOv:%llu ",
+                        static_cast<unsigned long long>(singleBlockGateCounters.requestAttempts),
+                        static_cast<unsigned long long>(singleBlockGateCounters.controlledArms),
+                        static_cast<unsigned long long>(singleBlockGateCounters.legacyBypassDisabled),
+                        static_cast<unsigned long long>(singleBlockGateCounters.legacyBypassExplicitStop),
+                        static_cast<unsigned long long>(singleBlockGateCounters.waitBoundarySamples),
+                        static_cast<unsigned long long>(singleBlockGateCounters.holdReady),
+                        static_cast<unsigned long long>(singleBlockGateCounters.holdApplied),
+                        static_cast<unsigned long long>(singleBlockGateCounters.resumeApplied),
+                        static_cast<unsigned long long>(singleBlockGateCounters.programEndSuppressed),
+                        static_cast<unsigned long long>(singleBlockGateCounters.blockedMotionFailure),
+                        static_cast<unsigned long long>(singleBlockGateCounters.blockedTransactionFailure),
+                        static_cast<unsigned long long>(singleBlockGateCounters.blockedTrackingOverflow));
+                    RtPrintf(
+                        "BlockCancel:%llu Cancel:%llu Super:%llu Rollback:%llu\n",
+                        static_cast<unsigned long long>(singleBlockGateCounters.blockedCancelled),
+                        static_cast<unsigned long long>(singleBlockGateCounters.cancelled),
+                        static_cast<unsigned long long>(singleBlockGateCounters.superseded),
+                        static_cast<unsigned long long>(singleBlockGateCounters.rollbackDisabled));
+
+                    const std::uint64_t feedrateOverrideX1000 =
+                        ScaleNonNegativeDiagnosticValue(
+                            feedHoldSnapshot.motion.feedrateOverride,
+                            1000.0);
+                    const std::uint64_t maximumCommandVelocityPps =
+                        ScaleNonNegativeDiagnosticValue(
+                            feedHoldSnapshot.motion.maxAxisCommandVelocityPps,
+                            1.0);
+                    const std::uint64_t maximumActualVelocityPps =
+                        ScaleNonNegativeDiagnosticValue(
+                            feedHoldSnapshot.motion.maxAxisActualVelocityPps,
+                            1.0);
+
+                    // RTX64 RtPrintf does not reliably support floating-point format
+                    // specifiers. Passing doubles to %.3f / %.0f desynchronizes the
+                    // remaining varargs and can make a later %s consume a non-pointer,
+                    // causing 0xC0000005 inside the diagnostic formatter. Convert all
+                    // floating-point values to scaled integers before RtPrintf.
+                    RtPrintf(
+                        "[NC02I-FH] Seq:%llu Src:%s Phase:%s Decision:%s Active:%u "
+                        "PC:%d D:%llu Legacy:%u Ack:%u Stable:%u/%u ",
+                        static_cast<unsigned long long>(feedHoldSnapshot.sequence),
+                        NCFeedHoldSourceToDiagnosticName(feedHoldSnapshot.source),
+                        NCFeedHoldShadowPhaseToDiagnosticName(feedHoldSnapshot.phase),
+                        NCFeedHoldShadowDecisionToDiagnosticName(feedHoldSnapshot.decision),
+                        feedHoldSnapshot.active ? 1U : 0U,
+                        feedHoldSnapshot.requestPC,
+                        static_cast<unsigned long long>(feedHoldSnapshot.dispatchId),
+                        feedHoldSnapshot.legacyHoldEntered ? 1U : 0U,
+                        feedHoldSnapshot.acknowledged ? 1U : 0U,
+                        static_cast<unsigned int>(feedHoldSnapshot.stableSamples),
+                        static_cast<unsigned int>(feedHoldSnapshot.requiredStableSamples));
+                    RtPrintf(
+                        "OvrX1000:%llu CmdStop:%u ActStop:%u HomePause:%u "
+                        "CmdMaxPps:%llu ActMaxPps:%llu Q:%u/%u/%u ",
+                        static_cast<unsigned long long>(feedrateOverrideX1000),
+                        feedHoldSnapshot.motion.commandStopped ? 1U : 0U,
+                        feedHoldSnapshot.motion.actualStopped ? 1U : 0U,
+                        feedHoldSnapshot.homePaused ? 1U : 0U,
+                        static_cast<unsigned long long>(maximumCommandVelocityPps),
+                        static_cast<unsigned long long>(maximumActualVelocityPps),
+                        static_cast<unsigned int>(feedHoldSnapshot.motion.commandQueueDepth),
+                        static_cast<unsigned int>(feedHoldSnapshot.motion.commandIngressDepth),
+                        static_cast<unsigned int>(feedHoldSnapshot.motion.commandReplayDepth));
+                    RtPrintf(
+                        "Owner:%s/%u->%s/%u Epoch:%llu->%llu Fail:%u\n",
+                        MotionOwnerToDiagnosticName(feedHoldSnapshot.requestOwner),
+                        static_cast<unsigned int>(feedHoldSnapshot.requestOwnerGeneration),
+                        MotionOwnerToDiagnosticName(feedHoldSnapshot.currentOwner),
+                        static_cast<unsigned int>(feedHoldSnapshot.currentOwnerGeneration),
+                        static_cast<unsigned long long>(feedHoldSnapshot.requestExecutionEpoch),
+                        static_cast<unsigned long long>(feedHoldSnapshot.currentExecutionEpoch),
+                        feedHoldSnapshot.failed ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02I-FCNT] ReqTry:%llu Req:%llu Prog:%llu Home:%llu Eval:%llu "
+                        "WaitOvr:%llu WaitCmd:%llu WaitAct:%llu WaitHome:%llu WaitStable:%llu ",
+                        static_cast<unsigned long long>(feedHoldCounters.requestAttempts),
+                        static_cast<unsigned long long>(feedHoldCounters.requestsLatched),
+                        static_cast<unsigned long long>(feedHoldCounters.programRequests),
+                        static_cast<unsigned long long>(feedHoldCounters.homeRequests),
+                        static_cast<unsigned long long>(feedHoldCounters.evaluations),
+                        static_cast<unsigned long long>(feedHoldCounters.waitOverrideZero),
+                        static_cast<unsigned long long>(feedHoldCounters.waitCommandStop),
+                        static_cast<unsigned long long>(feedHoldCounters.waitActualStop),
+                        static_cast<unsigned long long>(feedHoldCounters.waitHomePaused),
+                        static_cast<unsigned long long>(feedHoldCounters.waitStable));
+                    RtPrintf(
+                        "Ack:%llu Legacy:%llu Early:%llu Agree:%llu "
+                        "ResumeReq:%llu ResumeEarly:%llu ResumeAck:%llu Resumed:%llu "
+                        "OwnerFail:%llu EpochFail:%llu MotionFail:%llu AckLost:%llu ",
+                        static_cast<unsigned long long>(feedHoldCounters.acknowledged),
+                        static_cast<unsigned long long>(feedHoldCounters.legacyHolds),
+                        static_cast<unsigned long long>(feedHoldCounters.legacyEarlyHolds),
+                        static_cast<unsigned long long>(feedHoldCounters.legacyAgreeHolds),
+                        static_cast<unsigned long long>(feedHoldCounters.resumeRequests),
+                        static_cast<unsigned long long>(feedHoldCounters.resumeBeforeAcknowledge),
+                        static_cast<unsigned long long>(feedHoldCounters.resumeAfterAcknowledge),
+                        static_cast<unsigned long long>(feedHoldCounters.resumed),
+                        static_cast<unsigned long long>(feedHoldCounters.ownerChanged),
+                        static_cast<unsigned long long>(feedHoldCounters.executionEpochChanged),
+                        static_cast<unsigned long long>(feedHoldCounters.motionFault),
+                        static_cast<unsigned long long>(feedHoldCounters.acknowledgeLost));
+                    RtPrintf(
+                        "Cancel:%llu Super:%llu\n",
+                        static_cast<unsigned long long>(feedHoldCounters.cancelled),
+                        static_cast<unsigned long long>(feedHoldCounters.superseded));
+
+
+                    RtPrintf(
+                        "[NC02I-FG] Seq:%llu BSeq:%llu Enabled:%u Phase:%s Decision:%s "
+                        "Active:%u Pending:%u Ack:%u Release:%u Applied:%u ",
+                        static_cast<unsigned long long>(feedHoldGateSnapshot.sequence),
+                        static_cast<unsigned long long>(feedHoldGateSnapshot.boundarySequence),
+                        feedHoldGateSnapshot.enabled ? 1U : 0U,
+                        NCFeedHoldResumeGatePhaseToDiagnosticName(
+                            feedHoldGateSnapshot.phase),
+                        NCFeedHoldResumeGateDecisionToDiagnosticName(
+                            feedHoldGateSnapshot.decision),
+                        feedHoldGateSnapshot.active ? 1U : 0U,
+                        feedHoldGateSnapshot.deferredUntilAcknowledge ? 1U : 0U,
+                        feedHoldGateSnapshot.acknowledgeObserved ? 1U : 0U,
+                        feedHoldGateSnapshot.releaseReady ? 1U : 0U,
+                        feedHoldGateSnapshot.resumeApplied ? 1U : 0U);
+                    RtPrintf(
+                        "Blocked:%u Cancel:%u Src:%s PC:%d D:%llu "
+                        "Owner:%s/%u Epoch:%llu BActive:%u BFail:%u BCancel:%u\n",
+                        feedHoldGateSnapshot.blocked ? 1U : 0U,
+                        feedHoldGateSnapshot.cancelled ? 1U : 0U,
+                        NCFeedHoldSourceToDiagnosticName(feedHoldGateSnapshot.source),
+                        feedHoldGateSnapshot.requestPC,
+                        static_cast<unsigned long long>(feedHoldGateSnapshot.dispatchId),
+                        MotionOwnerToDiagnosticName(feedHoldGateSnapshot.owner),
+                        static_cast<unsigned int>(feedHoldGateSnapshot.ownerGeneration),
+                        static_cast<unsigned long long>(feedHoldGateSnapshot.executionEpoch),
+                        feedHoldGateSnapshot.boundaryActive ? 1U : 0U,
+                        feedHoldGateSnapshot.boundaryFailed ? 1U : 0U,
+                        feedHoldGateSnapshot.boundaryCancelled ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02I-GCNT] Req:%llu BypassOff:%llu BypassOther:%llu "
+                        "Deferred:%llu Immediate:%llu Duplicate:%llu Release:%llu "
+                        "Applied:%llu BlockFail:%llu BlockCancel:%llu Cancel:%llu ",
+                        static_cast<unsigned long long>(feedHoldGateCounters.requestAttempts),
+                        static_cast<unsigned long long>(feedHoldGateCounters.legacyBypassDisabled),
+                        static_cast<unsigned long long>(feedHoldGateCounters.legacyBypassNotProgramFeedHold),
+                        static_cast<unsigned long long>(feedHoldGateCounters.deferredBeforeAcknowledge),
+                        static_cast<unsigned long long>(feedHoldGateCounters.immediateAfterAcknowledge),
+                        static_cast<unsigned long long>(feedHoldGateCounters.duplicateRequests),
+                        static_cast<unsigned long long>(feedHoldGateCounters.releaseOnAcknowledge),
+                        static_cast<unsigned long long>(feedHoldGateCounters.resumeApplied),
+                        static_cast<unsigned long long>(feedHoldGateCounters.blockedBoundaryFailed),
+                        static_cast<unsigned long long>(feedHoldGateCounters.blockedBoundaryCancelled),
+                        static_cast<unsigned long long>(feedHoldGateCounters.cancelled));
+                    RtPrintf(
+                        "Super:%llu Rollback:%llu\n",
+                        static_cast<unsigned long long>(feedHoldGateCounters.superseded),
+                        static_cast<unsigned long long>(feedHoldGateCounters.rollbackDisabled));
+
+                    if (shouldPrintJ6)
+                    {
+                        RtPrintf(
+                            "[NC02J6-ALM] Seq:%llu Code:%d Axis:%d Trigger:%s "
+                            "Phase:%s Decision:%s Active:%u Ack:%u Alarm:%u "
+                            "Upd:%u Count:%d LSeq:%llu\n",
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.sequence),
+                            static_cast<int>(
+                                alarmEmergencyStopSnapshot.alarmCode),
+                            static_cast<int>(
+                                alarmEmergencyStopSnapshot.alarmAxisIndex),
+                            NCAlarmEmergencyStopTriggerToDiagnosticName(
+                                alarmEmergencyStopSnapshot.trigger),
+                            NCAlarmEmergencyStopPhaseToDiagnosticName(
+                                alarmEmergencyStopSnapshot.phase),
+                            NCAlarmEmergencyStopDecisionToDiagnosticName(
+                                alarmEmergencyStopSnapshot.decision),
+                            alarmEmergencyStopSnapshot.active ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.acknowledged ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.alarmActive ? 1U : 0U,
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.alarmUpdateCount),
+                            static_cast<int>(
+                                alarmEmergencyStopSnapshot.alarmCount),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.lifecycleSequence));
+
+                        RtPrintf(
+                            "[NC02J6-RT] Pub:%llu Req:%llu>%llu Apply:%llu>%llu "
+                            "Delta:%llu Inv:%llu>%llu Epoch:%llu>%llu Last:%llu ",
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.motionPublicationGeneration),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.requestPublishedBaseline),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.requestPublishedCurrent),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.rtApplyBaseline),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.rtApplyCurrent),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.rtApplyDelta),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.epochInvalidationBaseline),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.epochInvalidationCurrent),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.requestExecutionEpoch),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.currentExecutionEpoch),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.lastAppliedExecutionEpoch));
+                        RtPrintf(
+                            "Need:%u Owner:%s/%u LastOwner:%s/%u Match:%u\n",
+                            alarmEmergencyStopSnapshot.epochChangeRequired ? 1U : 0U,
+                            MotionOwnerToDiagnosticName(
+                                alarmEmergencyStopSnapshot.currentOwner),
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.currentOwnerGeneration),
+                            MotionOwnerToDiagnosticName(
+                                alarmEmergencyStopSnapshot.lastAppliedOwner),
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.lastAppliedOwnerGeneration),
+                            alarmEmergencyStopSnapshot.safetyOwnerMatched ? 1U : 0U);
+
+                        RtPrintf(
+                            "[NC02J632-INV] From:%llu To:%llu Count:%llu "
+                            "Correlated:%u PreLatched:%u\n",
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.
+                                lastInvalidatedFromExecutionEpoch),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.
+                                lastInvalidatedToExecutionEpoch),
+                            static_cast<unsigned long long>(
+                                alarmEmergencyStopSnapshot.
+                                lastInvalidationCount),
+                            alarmEmergencyStopSnapshot.
+                            epochInvalidationCorrelated ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.
+                            preLatchedRTApplication ? 1U : 0U);
+
+                        RtPrintf(
+                            "[NC02J6-AX] Expect:%08X Current:%08X ESTOP:%08X "
+                            "Error:%08X Cmd0:%08X Seal:%08X PDO:%08X/%08X ",
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.expectedAxisMask),
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.currentAxisMask),
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.estopAxisMask),
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.errorAxisMask),
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.commandZeroAxisMask),
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.targetSealedAxisMask),
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.pdoZeroAxisMask),
+                            static_cast<unsigned int>(
+                                alarmEmergencyStopSnapshot.pdoSampledAxisMask));
+                        RtPrintf(
+                            "Group:%u AxisSafe:%u CmdAll0:%u SealAll:%u PDOAll0:%u "
+                            "Coh:%u ReqSeen:%u RTAck:%u EpochOK:%u FbSync:%u "
+                            "Gap:%u Post:%u\n",
+                            alarmEmergencyStopSnapshot.groupStopApplied ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.allExistingAxesSafe ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.allExistingAxisCommandsZero ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.allExistingAxisTargetsSealed ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.allSampledPdoTargetVelocitiesZero ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.emergencyEvidenceCoherent ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.emergencyRequestObserved ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.rtApplyObserved ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.executionEpochMatched ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.feedbackSequenceSynchronized ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.lifecycleEvidenceGap ? 1U : 0U,
+                            alarmEmergencyStopSnapshot.postAlarmDispatchObserved ? 1U : 0U);
+
+                        RtPrintf(
+                            "[NC02J6-CNT] ReqTry:%llu Req:%llu EStop:%llu "
+                            "Protect:%llu Limit:%llu Drive:%llu Lag:%llu NC:%llu "
+                            "EDM:%llu Other:%llu Eval:%llu WaitPub:%llu ",
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.requestAttempts),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.requestsLatched),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.emergencyStopTriggers),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.axisProtectionTriggers),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.hardLimitTriggers),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.driveFaultTriggers),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.lagErrorTriggers),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.ncProgramTriggers),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.edmProcessTriggers),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.otherTriggers),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.evaluations),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.waitPublication));
+                        RtPrintf(
+                            "WaitReq:%llu WaitRT:%llu WaitOwner:%llu WaitEpoch:%llu "
+                            "WaitGroup:%llu WaitAxis:%llu WaitCmd:%llu WaitSeal:%llu "
+                            "Ack:%llu PreCorr:%llu PreAck:%llu ClearEarly:%llu ",
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.waitRequest),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.waitRTApply),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.waitSafetyOwner),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.waitExecutionEpoch),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.waitGroupStop),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.waitAxisSafeState),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.waitCommandZero),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.waitTargetSealed),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.acknowledged),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.preLatchedCorrelations),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.preLatchedAcknowledged),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.clearedBeforeAcknowledge));
+                        RtPrintf(
+                            "Gap:%llu Replace:%llu "
+                            "AxisScope:%llu Super:%llu\n",
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.lifecycleEvidenceGap),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.lifecycleReplaced),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.axisScopeChanged),
+                            static_cast<unsigned long long>(alarmEmergencyStopCounters.superseded));
+                    }
+
+                });
+            RunHmiDiagnosticOutputFamily([&]()
+                {
+                    RtPrintf(
+                        "[NC02J-INT] Seq:%llu Cause:%s Phase:%s Decision:%s Active:%u ",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.sequence),
+                        NCLifecycleInterruptionCauseToDiagnosticName(
+                            lifecycleInterruptionSnapshot.cause),
+                        NCLifecycleInterruptionPhaseToDiagnosticName(
+                            lifecycleInterruptionSnapshot.phase),
+                        NCLifecycleInterruptionDecisionToDiagnosticName(
+                            lifecycleInterruptionSnapshot.decision),
+                        lifecycleInterruptionSnapshot.active ? 1U : 0U);
+                    RtPrintf(
+                        "EpochExp:%u Epoch:%llu>%llu>%llu Owner:%s/%u>%s/%u "
+                        "ExecOwner:%s/%u ",
+                        lifecycleInterruptionSnapshot.expectsEpochChange ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.requestExecutionEpoch),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.publishedExecutionEpoch),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.currentExecutionEpoch),
+                        MotionOwnerToDiagnosticName(
+                            lifecycleInterruptionSnapshot.requestOwner),
+                        static_cast<unsigned int>(
+                            lifecycleInterruptionSnapshot.requestOwnerGeneration),
+                        MotionOwnerToDiagnosticName(
+                            lifecycleInterruptionSnapshot.currentOwner),
+                        static_cast<unsigned int>(
+                            lifecycleInterruptionSnapshot.currentOwnerGeneration),
+                        MotionOwnerToDiagnosticName(
+                            lifecycleInterruptionSnapshot.requestExecutionOwner),
+                        static_cast<unsigned int>(
+                            lifecycleInterruptionSnapshot.
+                            requestExecutionOwnerGeneration));
+                    RtPrintf(
+                        "D:%llu PC:%d Blocks:%u>%u Term:%s TSeq:%llu Seg:%llu "
+                        "SrcBlk:%d LedgerOK:%u TermSeen:%u AlarmAck:%u ",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.requestDispatchId),
+                        lifecycleInterruptionSnapshot.requestPC,
+                        static_cast<unsigned int>(
+                            lifecycleInterruptionSnapshot.requestActiveBlocks),
+                        static_cast<unsigned int>(
+                            lifecycleInterruptionSnapshot.activeBlocks),
+                        MotionFeedbackTypeToDiagnosticName(
+                            lifecycleInterruptionSnapshot.lastTerminalFeedbackType),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.lastTerminalFeedbackSequence),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.lastTerminalIdentity.segmentId),
+                        static_cast<int>(
+                            lifecycleInterruptionSnapshot.lastTerminalIdentity.sourceBlockId),
+                        lifecycleInterruptionSnapshot.terminalFeedbackLedgerAccepted ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.terminalFailureObserved ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.alarmStopAcknowledged ? 1U : 0U);
+                    RtPrintf(
+                        "RTEpoch:%u PreLatched:%u ExpAbort:%u ExpRetire:%u "
+                        "PreWin:%u ClassOK:%u StopClosed:%u "
+                        "ResetRetire:%u ResetClass:%u ResetCommit:%u "
+                        "UnexpectedEpoch:%u PostDispatch:%u\n",
+                        lifecycleInterruptionSnapshot.runtimeAlarmEpochChangeObserved ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.alarmStopPreLatchedRTApplication ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.expectedAlarmAbortObserved ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.expectedAlarmPreReadRejectObserved ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.expectedAlarmPreLatchedTerminalObserved ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.alarmTerminalClassificationValid ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.alarmStopClosed ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.expectedResetPreReadRejectObserved ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.resetTerminalClassificationValid ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.resetRetirementCommitted ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.unexpectedEpochChangeObserved ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.postInterruptionDispatchObserved ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02J-DRN] AxisQ:%llu AxisR:%llu CmdQ:%llu In:%llu "
+                        "Replay:%llu Fb:%llu Notice:%llu FbSeq:%llu/%llu ",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.axisCommandDepth),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.axisResultDepth),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.commandQueueDepth),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.commandIngressDepth),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.commandReplayDepth),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.feedbackDepth),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.feedbackNoticeDepth),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.lastPublishedFeedbackSequence),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.lastConsumedFeedbackSequence));
+                    RtPrintf(
+                        "Safety:%u Cb:%u Bind:%u Stand:%u Stable:%u/%u "
+                        "Ready:%u Quiet:%u Gap:%u Dispatch:%llu DltFail:%llu ",
+                        lifecycleInterruptionSnapshot.safetyOrRecoveryPending ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.waitCallbackActive ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.completionBindingActive ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.groupStandstill ? 1U : 0U,
+                        static_cast<unsigned int>(
+                            lifecycleInterruptionSnapshot.stableSamples),
+                        static_cast<unsigned int>(
+                            lifecycleInterruptionSnapshot.requiredStableSamples),
+                        lifecycleInterruptionSnapshot.quiescentReady ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.quiescent ? 1U : 0U,
+                        lifecycleInterruptionSnapshot.evidenceGap ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.dispatchDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.unexpectedBlockFailureDelta));
+                    RtPrintf(
+                        "RawFail:%llu ExpAbort:%llu ExpReject:%llu UnexpReject:%llu "
+                        "ExpOwner:%llu ExpStale:%llu PreAbort:%llu PreReject:%llu "
+                        "RstReject:%llu RstOwner:%llu RstStale:%llu ",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.blockFailureDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.expectedAlarmAbortDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.expectedAlarmPreReadRejectDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.unexpectedFeedbackRejectedDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.expectedAlarmOwnerConflictRejectDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.expectedAlarmStaleEpochRejectDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.expectedAlarmPreLatchedAbortDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.expectedAlarmPreLatchedRejectDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.expectedResetPreReadRejectDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.expectedResetOwnerConflictRejectDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.expectedResetStaleEpochRejectDelta));
+                    RtPrintf(
+                        "Rej:%llu Cancel:%llu "
+                        "Abort:%llu Fault:%llu Ledger:%llu "
+                        "FbOv:%llu NoticeOv:%llu SeqGap:%llu\n",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.feedbackRejectedDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.feedbackCancelledDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.feedbackAbortedDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.feedbackFaultedDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.ledgerIntegrityDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.feedbackOverflowDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.feedbackNoticeOverflowDelta),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionSnapshot.feedbackSequenceGapDelta));
+
+                    RtPrintf(
+                        "[NC02J-CNT] ReqTry:%llu Req:%llu Reset:%llu Alarm:%llu "
+                        "Prog:%llu MDI:%llu Manual:%llu Dynamic:%llu Goto:%llu ",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.requestAttempts),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.requestsLatched),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.resetRequests),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.alarmRequests),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.programReplaceRequests),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.mdiReplaceRequests),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.manualAutoReplaceRequests),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.dynamicCodeReplaceRequests),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.gotoEpochRequests));
+                    RtPrintf(
+                        "TermReq:%llu EpochExp:%llu EpochObs:%llu Unexpected:%llu "
+                        "EpochSuper:%llu AlarmAck:%llu RTEpoch:%llu ExpAbort:%llu "
+                        "ExpReject:%llu ExpOwner:%llu ExpStale:%llu ",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.terminalTriggeredRequests),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.epochPublicationsExpected),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.epochPublicationsObserved),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.unexpectedEpochChanges),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.epochSuperseded),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.alarmStopAcknowledgements),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.runtimeAlarmEpochChanges),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.expectedAlarmAborts),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.expectedAlarmPreReadRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.expectedAlarmOwnerConflictRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.expectedAlarmStaleEpochRejects));
+                    RtPrintf(
+                        "PreAbort:%llu PreReject:%llu RstReject:%llu "
+                        "RstOwner:%llu RstStale:%llu StopClose:%llu "
+                        "TRej:%llu TCancel:%llu TAbort:%llu ",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.expectedAlarmPreLatchedAborts),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.expectedAlarmPreLatchedRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.expectedResetPreReadRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.expectedResetOwnerConflictRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.expectedResetStaleEpochRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.alarmStopsClosed),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.terminalRejected),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.terminalCancelled),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.terminalAborted));
+                    RtPrintf(
+                        "TFault:%llu LedgerReject:%llu PostDispatch:%llu Eval:%llu Quiet:%llu "
+                        "Gap:%llu Super:%llu\n",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.terminalFaulted),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.terminalLedgerRejected),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.postInterruptionDispatch),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.evaluations),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.quiescent),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.evidenceGap),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.superseded));
+
+                    RtPrintf(
+                        "[NC02J631-TRN] RawTotal:%llu Unexpected:%llu "
+                        "RawOwner:%llu RawStale:%llu RawFbRej:%llu "
+                        "ExpOwner:%llu ExpStale:%llu ExpFbRej:%llu "
+                        "AlarmOwner:%llu AlarmStale:%llu AlarmFb:%llu ",
+                        static_cast<unsigned long long>(transportRawErrorTotal),
+                        static_cast<unsigned long long>(transportErrorTotal),
+                        static_cast<unsigned long long>(ownerConflictReject),
+                        static_cast<unsigned long long>(staleDiscard),
+                        static_cast<unsigned long long>(feedbackRejected),
+                        static_cast<unsigned long long>(expectedOwnerConflictReject),
+                        static_cast<unsigned long long>(expectedStaleDiscard),
+                        static_cast<unsigned long long>(expectedFeedbackRejected),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.
+                            expectedAlarmOwnerConflictRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.
+                            expectedAlarmStaleEpochRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.
+                            expectedAlarmPreReadRejects));
+                    RtPrintf(
+                        "ResetOwner:%llu ResetStale:%llu ResetFb:%llu "
+                        "ResidualOwner:%llu ResidualStale:%llu ResidualFb:%llu\n",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.
+                            expectedResetOwnerConflictRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.
+                            expectedResetStaleEpochRejects),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.
+                            expectedResetPreReadRejects),
+                        static_cast<unsigned long long>(
+                            unexpectedOwnerConflictReject),
+                        static_cast<unsigned long long>(unexpectedStaleDiscard),
+                        static_cast<unsigned long long>(unexpectedFeedbackRejected));
+
+                    RtPrintf(
+                        "[NC02J-WAIT] Epoch:%llu Blocks:%llu AxisQ:%llu AxisR:%llu "
+                        "In:%llu Replay:%llu CmdQ:%llu Notice:%llu Fb:%llu ",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitEpochPublication),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitActiveBlocks),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitAxisCommand),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitAxisResult),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitCommandIngress),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitCommandReplay),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitCommandQueue),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitFeedbackNotice),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitFeedback));
+                    RtPrintf(
+                        "FbSeq:%llu Cb:%llu Bind:%llu Safety:%llu Stand:%llu "
+                        "Stable:%llu AlarmAck:%llu AlarmTerm:%llu AlarmStable:%llu "
+                        "GapFb:%llu GapNotice:%llu GapSeq:%llu ",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitFeedbackSequence),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitCallback),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitCompletionBinding),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitSafetyRequest),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitGroupStandstill),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitStableConfirmation),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitAlarmStopAcknowledgement),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitAlarmStopTerminal),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.waitAlarmStopStable),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.feedbackOverflowEvidenceGap),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.feedbackNoticeOverflowEvidenceGap),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.feedbackSequenceEvidenceGap));
+                    RtPrintf(
+                        "GapLedger:%llu GapReject:%llu\n",
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.ledgerIntegrityEvidenceGap),
+                        static_cast<unsigned long long>(
+                            lifecycleInterruptionCounters.ledgerRejectedEvidenceGap));
+
+                    RtPrintf(
+                        "[NC02J-RG] Seq:%llu BSeq:%llu Phase:%s Decision:%s "
+                        "Active:%u Epoch:%llu/%llu/%llu Match:%u/%u ",
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.sequence),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.boundarySequence),
+                        NCResetReleaseGatePhaseToDiagnosticName(
+                            resetReleaseGateSnapshot.phase),
+                        NCResetReleaseGateDecisionToDiagnosticName(
+                            resetReleaseGateSnapshot.decision),
+                        resetReleaseGateSnapshot.active ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.expectedExecutionEpoch),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.boundaryPublishedExecutionEpoch),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.boundaryCurrentExecutionEpoch),
+                        resetReleaseGateSnapshot.publishedEpochMatched ? 1U : 0U,
+                        resetReleaseGateSnapshot.currentEpochMatched ? 1U : 0U);
+                    RtPrintf(
+                        "Safety:%s/%u Lease:%u/%u BOwner:%s/%u OMatch:%u "
+                        "BPhase:%s BDecision:%s Stable:%u/%u Stand:%u ",
+                        MotionOwnerToDiagnosticName(
+                            resetReleaseGateSnapshot.safetyOwner),
+                        static_cast<unsigned int>(
+                            resetReleaseGateSnapshot.safetyOwnerGeneration),
+                        resetReleaseGateSnapshot.safetyLeaseValid ? 1U : 0U,
+                        resetReleaseGateSnapshot.safetyLeaseCurrent ? 1U : 0U,
+                        MotionOwnerToDiagnosticName(
+                            resetReleaseGateSnapshot.boundaryCurrentOwner),
+                        static_cast<unsigned int>(
+                            resetReleaseGateSnapshot.boundaryCurrentOwnerGeneration),
+                        resetReleaseGateSnapshot.boundaryOwnerMatched ? 1U : 0U,
+                        NCLifecycleInterruptionPhaseToDiagnosticName(
+                            resetReleaseGateSnapshot.boundaryPhase),
+                        NCLifecycleInterruptionDecisionToDiagnosticName(
+                            resetReleaseGateSnapshot.boundaryDecision),
+                        static_cast<unsigned int>(
+                            resetReleaseGateSnapshot.stableSamples),
+                        static_cast<unsigned int>(
+                            resetReleaseGateSnapshot.requiredStableSamples),
+                        resetReleaseGateSnapshot.groupStandstill ? 1U : 0U);
+                    RtPrintf(
+                        "Quiet:%u Ready:%u Attempt:%u Applied:%u Block:%u\n",
+                        resetReleaseGateSnapshot.quiescenceProved ? 1U : 0U,
+                        resetReleaseGateSnapshot.releaseReady ? 1U : 0U,
+                        resetReleaseGateSnapshot.releaseAttempted ? 1U : 0U,
+                        resetReleaseGateSnapshot.releaseApplied ? 1U : 0U,
+                        resetReleaseGateSnapshot.blocked ? 1U : 0U);
+
+                    RtPrintf(
+                        "[NC02J-RCNT] ArmTry:%llu Arm:%llu ReArm:%llu "
+                        "Eval:%llu Wait:%llu Ready:%llu RelTry:%llu Released:%llu ",
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.armAttempts),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.armed),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.supersededArms),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.evaluations),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.waitQuiescence),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.releaseReady),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.releaseAttempts),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.released));
+                    RtPrintf(
+                        "Inv:%llu Seq:%llu Cause:%llu Gap:%llu Super:%llu "
+                        "Incomplete:%llu Epoch:%llu Lease:%llu ReleaseFail:%llu "
+                        "PostDispatch:%llu\n",
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedInvalidBoundary),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedBoundarySequence),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedBoundaryCause),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedEvidenceGap),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedSuperseded),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedIncomplete),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedEpochMismatch),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedSafetyLease),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedOwnerRelease),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.blockedPostInterruptionDispatch));
+                });
         }
 
         if (shouldPrintJ5)
         {
-            // J.5 lines are transition/event driven.  J.4 raw standstill,
-            // encoder velocity, and PDO diagnostics above remain available
-            // for A/B evidence, but none of them can trigger this block.
-            PrintNCSettleDiagnostic(
-                groupNCSettleCoherent,
-                groupNCSettleSnapshot,
-                groupNCSettleCounters);
-            PrintNCSettleDiagnostic(
-                feedHoldNCSettleCoherent,
-                feedHoldNCSettleSnapshot,
-                feedHoldNCSettleCounters);
-            PrintNCSettleDiagnostic(
-                resetNCSettleCoherent,
-                resetNCSettleSnapshot,
-                resetNCSettleCounters);
+            RunHmiDiagnosticOutputFamily([&]()
+                {
+                    // J.5 lines are transition/event driven.  J.4 raw standstill,
+                    // encoder velocity, and PDO diagnostics above remain available
+                    // for A/B evidence, but none of them can trigger this block.
+                    PrintNCSettleDiagnostic(
+                        groupNCSettleCoherent,
+                        groupNCSettleSnapshot,
+                        groupNCSettleCounters);
+                    PrintNCSettleDiagnostic(
+                        feedHoldNCSettleCoherent,
+                        feedHoldNCSettleSnapshot,
+                        feedHoldNCSettleCounters);
+                    PrintNCSettleDiagnostic(
+                        resetNCSettleCoherent,
+                        resetNCSettleSnapshot,
+                        resetNCSettleCounters);
 
-            RtPrintf(
-                "[NC02K721-PDO] Coh:%u Seq:%llu Event:%s Tick:%llu "
-                "Invalid:%llu Episode:%llu Recover:%llu TickGap:%llu "
-                "ExpGap:%llu J5Inv:%llu/%llu/%llu "
-                "J5Gap:%llu/%llu/%llu Corr:%u\n",
-                pdoInvalidCorrelationCoherent ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.eventSequence),
-                PdoRuntimeInvalidEventToDiagnosticName(
-                    pdoInvalidCorrelation.lastEventKind),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lastEventRuntimeCycleTick),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.invalidCycleCount),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.invalidEpisodeCount),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.recoveryAfterInvalidCount),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.validTickGapCount),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.expectedNCSettleGapCount),
-                static_cast<unsigned long long>(
-                    groupNCSettleCounters.invalidRuntimeCycleCount),
-                static_cast<unsigned long long>(
-                    feedHoldNCSettleCounters.invalidRuntimeCycleCount),
-                static_cast<unsigned long long>(
-                    resetNCSettleCounters.invalidRuntimeCycleCount),
-                static_cast<unsigned long long>(
-                    groupNCSettleCounters.runtimeGapCount),
-                static_cast<unsigned long long>(
-                    feedHoldNCSettleCounters.runtimeGapCount),
-                static_cast<unsigned long long>(
-                    resetNCSettleCounters.runtimeGapCount),
-                pdoInvalidProfileCorrelationMatched ? 1U : 0U);
+                    RtPrintf(
+                        "[NC02K721-PDO] Coh:%u Seq:%llu Event:%s Tick:%llu "
+                        "Invalid:%llu Episode:%llu Recover:%llu TickGap:%llu "
+                        "ExpGap:%llu J5Inv:%llu/%llu/%llu ",
+                        pdoInvalidCorrelationCoherent ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.eventSequence),
+                        PdoRuntimeInvalidEventToDiagnosticName(
+                            pdoInvalidCorrelation.lastEventKind),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lastEventRuntimeCycleTick),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.invalidCycleCount),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.invalidEpisodeCount),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.recoveryAfterInvalidCount),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.validTickGapCount),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.expectedNCSettleGapCount),
+                        static_cast<unsigned long long>(
+                            groupNCSettleCounters.invalidRuntimeCycleCount),
+                        static_cast<unsigned long long>(
+                            feedHoldNCSettleCounters.invalidRuntimeCycleCount),
+                        static_cast<unsigned long long>(
+                            resetNCSettleCounters.invalidRuntimeCycleCount));
+                    RtPrintf(
+                        "J5Gap:%llu/%llu/%llu Corr:%u\n",
+                        static_cast<unsigned long long>(
+                            groupNCSettleCounters.runtimeGapCount),
+                        static_cast<unsigned long long>(
+                            feedHoldNCSettleCounters.runtimeGapCount),
+                        static_cast<unsigned long long>(
+                            resetNCSettleCounters.runtimeGapCount),
+                        pdoInvalidProfileCorrelationMatched ? 1U : 0U);
 
-            RtPrintf(
-                "[NC02K721-SRC] Reason:%s Mask:%02X EMask:%02X "
-                "ELRW:%d/%d EDC:%d EPath:%llu "
-                "LastInv:%llu LastRec:%llu Gap:%llu>%llu "
-                "LRW:%d/%d DC:%d Rec:%d/%d/%d Req:%u Sub:%u "
-                "PathNs:%llu/%llu Consec:%u Max:%u Len:%u "
-                "Negative:%llu WkcMis:%llu DcBad:%llu Both:%llu "
-                "Contract:%llu RT:%llu/%llu\n",
-                PdoRuntimeInvalidReasonToDiagnosticName(
-                    pdoInvalidDisplayedReasonMask),
-                static_cast<unsigned int>(
-                    pdoInvalidDisplayedReasonMask),
-                static_cast<unsigned int>(
-                    pdoInvalidCorrelation.lastEventReasonMask),
-                static_cast<int>(
-                    pdoInvalidCorrelation.lastEventActualLrwWkc),
-                static_cast<int>(
-                    pdoInvalidCorrelation.lastEventExpectedLrwWkc),
-                static_cast<int>(
-                    pdoInvalidCorrelation.lastEventDcWkc),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lastEventCombinedPathNs),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lastInvalidRuntimeCycleTick),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lastRecoveryRuntimeCycleTick),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lastGapFromRuntimeCycleTick),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lastGapToRuntimeCycleTick),
-                static_cast<int>(
-                    pdoInvalidCorrelation.lastInvalidActualLrwWkc),
-                static_cast<int>(
-                    pdoInvalidCorrelation.lastInvalidExpectedLrwWkc),
-                static_cast<int>(
-                    pdoInvalidCorrelation.lastInvalidDcWkc),
-                static_cast<int>(
-                    pdoInvalidCorrelation.lastRecoveryActualLrwWkc),
-                static_cast<int>(
-                    pdoInvalidCorrelation.lastRecoveryExpectedLrwWkc),
-                static_cast<int>(
-                    pdoInvalidCorrelation.lastRecoveryDcWkc),
-                pdoInvalidCorrelation.dcReferenceRequired ? 1U : 0U,
-                static_cast<unsigned int>(
-                    pdoInvalidCorrelation.lastEventSubTick),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lastInvalidCombinedPathNs),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lastRecoveryCombinedPathNs),
-                static_cast<unsigned int>(
-                    pdoInvalidCorrelation.currentConsecutiveInvalidCycles),
-                static_cast<unsigned int>(
-                    pdoInvalidCorrelation.maximumConsecutiveInvalidCycles),
-                static_cast<unsigned int>(
-                    pdoInvalidCorrelation.lastRecoveredEpisodeLength),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lrwCallNegativeCount),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.lrwWkcMismatchCount),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.dcWkcInvalidCount),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.combinedLrwDcInvalidCount),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.validityContractMismatchCount),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.
-                    runtimePdoNegativeTotalAtLastEvent),
-                static_cast<unsigned long long>(
-                    pdoInvalidCorrelation.
-                    runtimePdoWkcErrorTotalAtLastEvent));
+                    RtPrintf(
+                        "[NC02K721-SRC] Reason:%s Mask:%02X EMask:%02X "
+                        "ELRW:%d/%d EDC:%d EPath:%llu "
+                        "LastInv:%llu LastRec:%llu Gap:%llu>%llu ",
+                        PdoRuntimeInvalidReasonToDiagnosticName(
+                            pdoInvalidDisplayedReasonMask),
+                        static_cast<unsigned int>(
+                            pdoInvalidDisplayedReasonMask),
+                        static_cast<unsigned int>(
+                            pdoInvalidCorrelation.lastEventReasonMask),
+                        static_cast<int>(
+                            pdoInvalidCorrelation.lastEventActualLrwWkc),
+                        static_cast<int>(
+                            pdoInvalidCorrelation.lastEventExpectedLrwWkc),
+                        static_cast<int>(
+                            pdoInvalidCorrelation.lastEventDcWkc),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lastEventCombinedPathNs),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lastInvalidRuntimeCycleTick),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lastRecoveryRuntimeCycleTick),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lastGapFromRuntimeCycleTick),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lastGapToRuntimeCycleTick));
+                    RtPrintf(
+                        "LRW:%d/%d DC:%d Rec:%d/%d/%d Req:%u Sub:%u ",
+                        static_cast<int>(
+                            pdoInvalidCorrelation.lastInvalidActualLrwWkc),
+                        static_cast<int>(
+                            pdoInvalidCorrelation.lastInvalidExpectedLrwWkc),
+                        static_cast<int>(
+                            pdoInvalidCorrelation.lastInvalidDcWkc),
+                        static_cast<int>(
+                            pdoInvalidCorrelation.lastRecoveryActualLrwWkc),
+                        static_cast<int>(
+                            pdoInvalidCorrelation.lastRecoveryExpectedLrwWkc),
+                        static_cast<int>(
+                            pdoInvalidCorrelation.lastRecoveryDcWkc),
+                        pdoInvalidCorrelation.dcReferenceRequired ? 1U : 0U,
+                        static_cast<unsigned int>(
+                            pdoInvalidCorrelation.lastEventSubTick));
+                    RtPrintf(
+                        "PathNs:%llu/%llu Consec:%u Max:%u Len:%u "
+                        "Negative:%llu WkcMis:%llu DcBad:%llu Both:%llu "
+                        "Contract:%llu RT:%llu/%llu\n",
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lastInvalidCombinedPathNs),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lastRecoveryCombinedPathNs),
+                        static_cast<unsigned int>(
+                            pdoInvalidCorrelation.currentConsecutiveInvalidCycles),
+                        static_cast<unsigned int>(
+                            pdoInvalidCorrelation.maximumConsecutiveInvalidCycles),
+                        static_cast<unsigned int>(
+                            pdoInvalidCorrelation.lastRecoveredEpisodeLength),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lrwCallNegativeCount),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.lrwWkcMismatchCount),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.dcWkcInvalidCount),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.combinedLrwDcInvalidCount),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.validityContractMismatchCount),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.
+                            runtimePdoNegativeTotalAtLastEvent),
+                        static_cast<unsigned long long>(
+                            pdoInvalidCorrelation.
+                            runtimePdoWkcErrorTotalAtLastEvent));
 
-            RtPrintf(
-                "[NC02K722-ALM] Coh:%u Latched:%u Seq:%llu Req:%llu "
-                "Episode:%llu RePub:%llu Tick:%llu InvEpisode:%llu "
-                "Alarm:%d Reason:%s Mask:%02X LRW:%d/%d DC:%d "
-                "DCReq:%u Sub:%u PathNs:%llu Consec:%u Contain:%u "
-                "RePubNow:%u RT:%llu/%llu\n",
-                pdoSafetyStopCauseCoherent ? 1U : 0U,
-                pdoSafetyStopCause.publicationSequence != 0ULL ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    pdoSafetyStopCause.publicationSequence),
-                static_cast<unsigned long long>(
-                    pdoSafetyStopCause.alarmRequestCount),
-                static_cast<unsigned long long>(
-                    pdoSafetyStopCause.alarmedInvalidEpisodeCount),
-                static_cast<unsigned long long>(
-                    pdoSafetyStopCause.alarmRepublishCount),
-                static_cast<unsigned long long>(
-                    pdoSafetyStopCause.runtimeCycleTick),
-                static_cast<unsigned long long>(
-                    pdoSafetyStopCause.invalidEpisodeCount),
-                static_cast<int>(pdoSafetyStopCause.alarmCode),
-                PdoRuntimeInvalidReasonToDiagnosticName(
-                    pdoSafetyStopCause.reasonMask),
-                static_cast<unsigned int>(
-                    pdoSafetyStopCause.reasonMask),
-                static_cast<int>(pdoSafetyStopCause.actualLrwWkc),
-                static_cast<int>(pdoSafetyStopCause.expectedLrwWkc),
-                static_cast<int>(pdoSafetyStopCause.dcWkc),
-                pdoSafetyStopCause.dcReferenceRequired ? 1U : 0U,
-                static_cast<unsigned int>(pdoSafetyStopCause.subTick),
-                static_cast<unsigned long long>(
-                    pdoSafetyStopCause.combinedPathNs),
-                static_cast<unsigned int>(
-                    pdoSafetyStopCause.consecutiveInvalidCycles),
-                pdoSafetyStopCause.safetyContainmentApplied ? 1U : 0U,
-                pdoSafetyStopCause.alarmRequestRepublished ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    pdoSafetyStopCause.runtimePdoNegativeTotal),
-                static_cast<unsigned long long>(
-                    pdoSafetyStopCause.runtimePdoWkcErrorTotal));
+                    RtPrintf(
+                        "[NC02K722-ALM] Coh:%u Latched:%u Seq:%llu Req:%llu "
+                        "Episode:%llu RePub:%llu Tick:%llu InvEpisode:%llu ",
+                        pdoSafetyStopCauseCoherent ? 1U : 0U,
+                        pdoSafetyStopCause.publicationSequence != 0ULL ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            pdoSafetyStopCause.publicationSequence),
+                        static_cast<unsigned long long>(
+                            pdoSafetyStopCause.alarmRequestCount),
+                        static_cast<unsigned long long>(
+                            pdoSafetyStopCause.alarmedInvalidEpisodeCount),
+                        static_cast<unsigned long long>(
+                            pdoSafetyStopCause.alarmRepublishCount),
+                        static_cast<unsigned long long>(
+                            pdoSafetyStopCause.runtimeCycleTick),
+                        static_cast<unsigned long long>(
+                            pdoSafetyStopCause.invalidEpisodeCount));
+                    RtPrintf(
+                        "Alarm:%d Reason:%s Mask:%02X LRW:%d/%d DC:%d "
+                        "DCReq:%u Sub:%u PathNs:%llu Consec:%u Contain:%u ",
+                        static_cast<int>(pdoSafetyStopCause.alarmCode),
+                        PdoRuntimeInvalidReasonToDiagnosticName(
+                            pdoSafetyStopCause.reasonMask),
+                        static_cast<unsigned int>(
+                            pdoSafetyStopCause.reasonMask),
+                        static_cast<int>(pdoSafetyStopCause.actualLrwWkc),
+                        static_cast<int>(pdoSafetyStopCause.expectedLrwWkc),
+                        static_cast<int>(pdoSafetyStopCause.dcWkc),
+                        pdoSafetyStopCause.dcReferenceRequired ? 1U : 0U,
+                        static_cast<unsigned int>(pdoSafetyStopCause.subTick),
+                        static_cast<unsigned long long>(
+                            pdoSafetyStopCause.combinedPathNs),
+                        static_cast<unsigned int>(
+                            pdoSafetyStopCause.consecutiveInvalidCycles),
+                        pdoSafetyStopCause.safetyContainmentApplied ? 1U : 0U);
+                    RtPrintf(
+                        "RePubNow:%u RT:%llu/%llu\n",
+                        pdoSafetyStopCause.alarmRequestRepublished ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            pdoSafetyStopCause.runtimePdoNegativeTotal),
+                        static_cast<unsigned long long>(
+                            pdoSafetyStopCause.runtimePdoWkcErrorTotal));
 
-            RtPrintf(
-                "[NC02J5-RB] Kind:ACK Req:%llu Phase:%s Block:%s "
-                "Epoch:%u Owner:%s/%u Mask:%u/%u Accept:%u Apply:%u "
-                "Post:%u Ack:%u Acked:%u Blocked:%u Super:%u "
-                "FaultEstop:%u Comp:%u\n",
-                static_cast<unsigned long long>(
-                    resetRebaseAck.requestSequence),
-                MotionNCResetRebasePhaseToDiagnosticName(
-                    resetRebaseAck.phase),
-                MotionNCSettleBlockerToDiagnosticName(
-                    resetRebaseAck.failureBlocker),
-                static_cast<unsigned int>(
-                    resetRebaseAck.executionEpoch),
-                MotionOwnerToDiagnosticName(resetRebaseAck.owner),
-                static_cast<unsigned int>(
-                    resetRebaseAck.ownerGeneration),
-                static_cast<unsigned int>(
-                    resetRebaseAck.requestedAxisMask),
-                static_cast<unsigned int>(
-                    resetRebaseAck.appliedAxisMask),
-                resetRebaseAck.requestAccepted ? 1U : 0U,
-                resetRebaseAck.rebaseApplied ? 1U : 0U,
-                resetRebaseAck.postVerifyPassed ? 1U : 0U,
-                resetRebaseAck.acknowledged ? 1U : 0U,
-                resetRebaseAck.acked ? 1U : 0U,
-                resetRebaseAck.blocked ? 1U : 0U,
-                resetRebaseAck.superseded ? 1U : 0U,
-                resetRebaseAck.unsupportedFaultOrEstop ? 1U : 0U,
-                resetRebaseAck.compensationBlocked ? 1U : 0U);
+                    RtPrintf(
+                        "[NC02J5-RB] Kind:ACK Req:%llu Phase:%s Block:%s "
+                        "Epoch:%u Owner:%s/%u Mask:%u/%u Accept:%u Apply:%u ",
+                        static_cast<unsigned long long>(
+                            resetRebaseAck.requestSequence),
+                        MotionNCResetRebasePhaseToDiagnosticName(
+                            resetRebaseAck.phase),
+                        MotionNCSettleBlockerToDiagnosticName(
+                            resetRebaseAck.failureBlocker),
+                        static_cast<unsigned int>(
+                            resetRebaseAck.executionEpoch),
+                        MotionOwnerToDiagnosticName(resetRebaseAck.owner),
+                        static_cast<unsigned int>(
+                            resetRebaseAck.ownerGeneration),
+                        static_cast<unsigned int>(
+                            resetRebaseAck.requestedAxisMask),
+                        static_cast<unsigned int>(
+                            resetRebaseAck.appliedAxisMask),
+                        resetRebaseAck.requestAccepted ? 1U : 0U,
+                        resetRebaseAck.rebaseApplied ? 1U : 0U);
+                    RtPrintf(
+                        "Post:%u Ack:%u Acked:%u Blocked:%u Super:%u "
+                        "FaultEstop:%u Comp:%u\n",
+                        resetRebaseAck.postVerifyPassed ? 1U : 0U,
+                        resetRebaseAck.acknowledged ? 1U : 0U,
+                        resetRebaseAck.acked ? 1U : 0U,
+                        resetRebaseAck.blocked ? 1U : 0U,
+                        resetRebaseAck.superseded ? 1U : 0U,
+                        resetRebaseAck.unsupportedFaultOrEstop ? 1U : 0U,
+                        resetRebaseAck.compensationBlocked ? 1U : 0U);
 
-            RtPrintf(
-                "[NC02J5-RB] Kind:GATE Seq:%llu BSeq:%llu Phase:%s "
-                "Decision:%s Active:%u Req:%llu/%llu AckEpoch:%u "
-                "AckOwner:%s/%u AckMask:%llu/%llu AckPhase:%s "
-                "Obs:%u Match:%u/%u/%u/%u/%u Accept:%u Apply:%u "
-                "Post:%u Ack:%u RebaseMatch:%u Release:%u Block:%u "
-                "WaitAck:%llu AckFail:%llu RbFail:%llu\n",
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.sequence),
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.boundarySequence),
-                NCResetReleaseGatePhaseToDiagnosticName(
-                    resetReleaseGateSnapshot.phase),
-                NCResetReleaseGateDecisionToDiagnosticName(
-                    resetReleaseGateSnapshot.decision),
-                resetReleaseGateSnapshot.active ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.expectedResetRequestSequence),
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.ackRequestSequence),
-                static_cast<unsigned int>(
-                    resetReleaseGateSnapshot.ackExecutionEpoch),
-                MotionOwnerToDiagnosticName(
-                    resetReleaseGateSnapshot.ackOwner),
-                static_cast<unsigned int>(
-                    resetReleaseGateSnapshot.ackOwnerGeneration),
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.ackRequestedAxisMask),
-                static_cast<unsigned long long>(
-                    resetReleaseGateSnapshot.ackAppliedAxisMask),
-                MotionNCResetRebasePhaseToDiagnosticName(
-                    resetReleaseGateSnapshot.ackPhase),
-                resetReleaseGateSnapshot.ackObserved ? 1U : 0U,
-                resetReleaseGateSnapshot.ackSequenceMatched ? 1U : 0U,
-                resetReleaseGateSnapshot.ackEpochMatched ? 1U : 0U,
-                resetReleaseGateSnapshot.ackOwnerMatched ? 1U : 0U,
-                resetReleaseGateSnapshot.ackAxisMaskMatched ? 1U : 0U,
-                resetReleaseGateSnapshot.ackPhaseAcknowledged ? 1U : 0U,
-                resetReleaseGateSnapshot.ackRequestAccepted ? 1U : 0U,
-                resetReleaseGateSnapshot.ackRebaseApplied ? 1U : 0U,
-                resetReleaseGateSnapshot.ackPostVerifyPassed ? 1U : 0U,
-                resetReleaseGateSnapshot.ackAcknowledged ? 1U : 0U,
-                resetReleaseGateSnapshot.rebaseAckMatched ? 1U : 0U,
-                resetReleaseGateSnapshot.releaseApplied ? 1U : 0U,
-                resetReleaseGateSnapshot.blocked ? 1U : 0U,
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.waitRebaseAck),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.ackMismatch),
-                static_cast<unsigned long long>(
-                    resetReleaseGateCounters.rebaseFailed));
+                    RtPrintf(
+                        "[NC02J5-RB] Kind:GATE Seq:%llu BSeq:%llu Phase:%s "
+                        "Decision:%s Active:%u Req:%llu/%llu AckEpoch:%u ",
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.sequence),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.boundarySequence),
+                        NCResetReleaseGatePhaseToDiagnosticName(
+                            resetReleaseGateSnapshot.phase),
+                        NCResetReleaseGateDecisionToDiagnosticName(
+                            resetReleaseGateSnapshot.decision),
+                        resetReleaseGateSnapshot.active ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.expectedResetRequestSequence),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.ackRequestSequence),
+                        static_cast<unsigned int>(
+                            resetReleaseGateSnapshot.ackExecutionEpoch));
+                    RtPrintf(
+                        "AckOwner:%s/%u AckMask:%llu/%llu AckPhase:%s ",
+                        MotionOwnerToDiagnosticName(
+                            resetReleaseGateSnapshot.ackOwner),
+                        static_cast<unsigned int>(
+                            resetReleaseGateSnapshot.ackOwnerGeneration),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.ackRequestedAxisMask),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateSnapshot.ackAppliedAxisMask),
+                        MotionNCResetRebasePhaseToDiagnosticName(
+                            resetReleaseGateSnapshot.ackPhase));
+                    RtPrintf(
+                        "Obs:%u Match:%u/%u/%u/%u/%u Accept:%u Apply:%u ",
+                        resetReleaseGateSnapshot.ackObserved ? 1U : 0U,
+                        resetReleaseGateSnapshot.ackSequenceMatched ? 1U : 0U,
+                        resetReleaseGateSnapshot.ackEpochMatched ? 1U : 0U,
+                        resetReleaseGateSnapshot.ackOwnerMatched ? 1U : 0U,
+                        resetReleaseGateSnapshot.ackAxisMaskMatched ? 1U : 0U,
+                        resetReleaseGateSnapshot.ackPhaseAcknowledged ? 1U : 0U,
+                        resetReleaseGateSnapshot.ackRequestAccepted ? 1U : 0U,
+                        resetReleaseGateSnapshot.ackRebaseApplied ? 1U : 0U);
+                    RtPrintf(
+                        "Post:%u Ack:%u RebaseMatch:%u Release:%u Block:%u "
+                        "WaitAck:%llu AckFail:%llu RbFail:%llu\n",
+                        resetReleaseGateSnapshot.ackPostVerifyPassed ? 1U : 0U,
+                        resetReleaseGateSnapshot.ackAcknowledged ? 1U : 0U,
+                        resetReleaseGateSnapshot.rebaseAckMatched ? 1U : 0U,
+                        resetReleaseGateSnapshot.releaseApplied ? 1U : 0U,
+                        resetReleaseGateSnapshot.blocked ? 1U : 0U,
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.waitRebaseAck),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.ackMismatch),
+                        static_cast<unsigned long long>(
+                            resetReleaseGateCounters.rebaseFailed));
 
-            RtPrintf(
-                "[NC02J5-FAIL] Total:%llu SetInvalid:%llu SetGap:%llu "
-                "SetReject:%llu SetRead:%llu Rebase:%llu ResetGate:%llu "
-                "FeedHold:%llu ProgramEnd:%llu Transport:%llu\n",
-                static_cast<unsigned long long>(j5FailureTotal),
-                static_cast<unsigned long long>(j5SetInvalid),
-                static_cast<unsigned long long>(j5SetGap),
-                static_cast<unsigned long long>(j5SetReject),
-                static_cast<unsigned long long>(j5SetReadFailure),
-                static_cast<unsigned long long>(j5RebaseFailure),
-                static_cast<unsigned long long>(j5ResetGateFailure),
-                static_cast<unsigned long long>(j5FeedHoldFailure),
-                static_cast<unsigned long long>(j5ProgramEndFailure),
-                static_cast<unsigned long long>(transportErrorTotal));
+                    RtPrintf(
+                        "[NC02J5-FAIL] Total:%llu SetInvalid:%llu SetGap:%llu "
+                        "SetReject:%llu SetRead:%llu Rebase:%llu ResetGate:%llu "
+                        "FeedHold:%llu ProgramEnd:%llu Transport:%llu\n",
+                        static_cast<unsigned long long>(j5FailureTotal),
+                        static_cast<unsigned long long>(j5SetInvalid),
+                        static_cast<unsigned long long>(j5SetGap),
+                        static_cast<unsigned long long>(j5SetReject),
+                        static_cast<unsigned long long>(j5SetReadFailure),
+                        static_cast<unsigned long long>(j5RebaseFailure),
+                        static_cast<unsigned long long>(j5ResetGateFailure),
+                        static_cast<unsigned long long>(j5FeedHoldFailure),
+                        static_cast<unsigned long long>(j5ProgramEndFailure),
+                        static_cast<unsigned long long>(transportErrorTotal));
+                });
         }
 
         if (startupSamples < 15U)
@@ -7182,6 +8194,8 @@ namespace HMI_Bridge
             preparedQueueChangeToken;
         previousPreparedEquivalenceChangeToken =
             preparedEquivalenceChangeToken;
+        previousOrdinaryG00FeedHoldRollingCutoverPublication =
+            ordinaryG00FeedHoldRollingCutoverSnapshot.publicationSequence;
         previousSingleBlockShadowChangeToken =
             singleBlockShadowChangeToken;
         previousSingleBlockGateChangeToken =
@@ -7204,3 +8218,5 @@ namespace HMI_Bridge
             queueTailTransactionChangeToken;
     }
 }
+
+#undef HMI_DIAG_NOINLINE

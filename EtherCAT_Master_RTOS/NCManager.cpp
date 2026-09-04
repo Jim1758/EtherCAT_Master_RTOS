@@ -2771,10 +2771,45 @@ void NCManager::ObserveBootstrapSafetyHandoff() noexcept
 }
 
 
+#if defined(_MSC_VER)
+#define NC_PATH_CORE_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define NC_PATH_CORE_NOINLINE __attribute__((noinline))
+#else
+#define NC_PATH_CORE_NOINLINE
+#endif
+
+NC_PATH_CORE_NOINLINE
+void NCManager::ObservePathCoreAcceptedReadAheadInput(
+    const NCOrdinaryG00InflightRegistrationProof& proof) noexcept
+{
+    // L.2A receives an already-created K.7 proof by reference and extracts
+    // only scalar identity.  This observer has no return value and cannot
+    // participate in Runtime, Gate, PC, Alarm or Motion control decisions.
+    m_pathCoreInputContractShadow.ObserveAcceptedReadAhead(
+        static_cast<std::uint64_t>(proof.session),
+        static_cast<std::uint64_t>(proof.entrySequence),
+        proof.dispatchId,
+        static_cast<std::uint64_t>(proof.commitSequence),
+        static_cast<std::uint64_t>(proof.identity.epoch),
+        static_cast<std::uint64_t>(proof.identity.segmentId),
+        static_cast<std::int32_t>(proof.sourcePC),
+        static_cast<std::int32_t>(proof.sourceLineNumber));
+    m_pathCoreInputHandoffCompactShadow.ObserveReadAheadInputEvent();
+}
+
+#undef NC_PATH_CORE_NOINLINE
+
+
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
     NC_RunCount++;
+
+    // NC-0.2L.2A: retain the accepted B2 baseline publication exactly once.
+    // Do not overwrite an accepted-input event at the start of each 10 ms
+    // scan and do not create a 100 Hz compact-token oscillation.
+    m_pathCoreInputHandoffCompactShadow.EnsureNotRunningPublished();
 
     // A Reset button which collided only with the preceding PDO frame keeps
     // its immutable Alarm/mapping/provenance cutoff here.  Do not run the
@@ -4090,12 +4125,19 @@ void NCManager::ProcessExecutionEngine()
                     rearmAdmission =
                     m_ordinaryG00FeedHoldCohortRearmCutoverGate.
                     EvaluateAdmission(ordinaryRegistrySnapshot);
+                const NCOrdinaryG00FeedHoldRollingAdmissionResult
+                    rollingAdmission =
+                    m_ordinaryG00FeedHoldRollingRearmCutoverGate.
+                    EvaluateAdmission(ordinaryRegistrySnapshot);
                 const bool feedHoldLegacyFallback =
                     cohortAdmission ==
                     NCOrdinaryG00FeedHoldCohortAdmissionResult::
                     FALLBACK_LEGACY ||
                     rearmAdmission ==
                     NCOrdinaryG00FeedHoldRearmAdmissionResult::
+                    FALLBACK_LEGACY ||
+                    rollingAdmission ==
+                    NCOrdinaryG00FeedHoldRollingAdmissionResult::
                     FALLBACK_LEGACY;
                 const bool feedHoldAdmissionWait =
                     cohortAdmission ==
@@ -4103,7 +4145,10 @@ void NCManager::ProcessExecutionEngine()
                     WAIT_COHORT ||
                     rearmAdmission ==
                     NCOrdinaryG00FeedHoldRearmAdmissionResult::
-                    WAIT_REARM;
+                    WAIT_REARM ||
+                    rollingAdmission ==
+                    NCOrdinaryG00FeedHoldRollingAdmissionResult::
+                    WAIT_ROLLING_REARM;
                 if (!feedHoldLegacyFallback && !feedHoldAdmissionWait)
                 {
                     block = readAheadCandidateBlock;
@@ -4918,6 +4963,12 @@ void NCManager::ProcessExecutionEngine()
                     m_state = NCState::ALARM;
                     return;
                 }
+
+                // NC-0.2L.2A: publish only after the existing mandatory K.7
+                // registry and commit proofs have both succeeded. The result
+                // is history-only and is never read by this control path.
+                ObservePathCoreAcceptedReadAheadInput(
+                    readAheadInflightProof);
             }
 
             // Stage NC-0.2K.6.3: after K.6.1/K.6.2 have independently bound
@@ -8351,6 +8402,24 @@ void NCManager::ObserveOrdinaryG00FeedHoldCohortCutover() noexcept
     // Motion, PDO, NC state, PC, callback, Epoch or owner state.
     m_ordinaryG00FeedHoldCohortRearmCutoverGate.Observe(
         m_ordinaryG00FeedHoldCohortRearmShadow.GetSnapshot(),
+        m_ordinaryG00FeedHoldCohortCutoverGate.GetSnapshot(),
+        m_ordinaryG00InflightRegistryShadow.GetSnapshot());
+
+    // NC-0.2K.7.7 observes the already-published K.7.5/K.7.6 seed and the
+    // current K.7.3/K.7.4/Registry evidence.  It is shadow-only and cannot
+    // influence admission or write Motion, PDO, state, PC, Epoch or owner.
+    m_ordinaryG00FeedHoldRollingRearmShadow.Observe(
+        m_ordinaryG00FeedHoldCohortRearmShadow.GetSnapshot(),
+        m_ordinaryG00FeedHoldCohortRearmCutoverGate.GetSnapshot(),
+        m_ordinaryG00FeedHoldCohortShadow.GetSnapshot(),
+        m_ordinaryG00FeedHoldCohortCutoverGate.GetSnapshot(),
+        m_ordinaryG00InflightRegistryShadow.GetSnapshot());
+
+    // NC-0.2K.7.8 is the reversible controlled consumer of K.7.7.  Only its
+    // admission result is used by the ordinary G00 seam; it owns no Motion
+    // storage and cannot write Motion, PDO, NC state, PC, Epoch or owner.
+    m_ordinaryG00FeedHoldRollingRearmCutoverGate.Observe(
+        m_ordinaryG00FeedHoldRollingRearmShadow.GetSnapshot(),
         m_ordinaryG00FeedHoldCohortCutoverGate.GetSnapshot(),
         m_ordinaryG00InflightRegistryShadow.GetSnapshot());
 }

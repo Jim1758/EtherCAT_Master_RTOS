@@ -143,6 +143,41 @@ struct DCAutoPropagationTable
 };
 
 // ============================================================================
+// DC-RX.3D - exact software TX/RX timing handoff
+//
+// ecx_LRW_FRMW() fills this POD only after a fully correlated LRW+FRMW frame
+// has passed the hard RX deadline and datagram identity checks.  The caller may
+// then use the narrower SendPacket()/matching ReceivePacket() software window
+// instead of the wider whole-function call window when pairing QPC with the
+// returned DC reference time.
+//
+// source:
+//   0 = none / unavailable
+//   1 = exact software TX-call midpoint -> matching RX-return timing
+// ============================================================================
+enum class EtherCatDcCycleTimingSource : uint32_t
+{
+    None = 0,
+    ExactSoftwareTxRx = 1
+};
+
+struct EtherCatDcCycleTiming
+{
+    uint64_t txBeforeSendQpc = 0;
+    uint64_t txAfterSendQpc = 0;
+    uint64_t rxAfterMatchQpc = 0;
+    uint64_t txMidpointQpc = 0;
+    uint64_t sampleMidpointQpc = 0;
+    uint64_t softwareRoundTripCounts = 0;
+    uint32_t valid = 0;
+    uint32_t source = 0;
+};
+
+static_assert(
+    sizeof(EtherCatDcCycleTiming) == 56,
+    "EtherCatDcCycleTiming ABI changed unexpectedly.");
+
+// ============================================================================
 // EtherCAT 主站類別 (EtherCatMaster)
 // 負責底層封包收發、狀態機管理與從站配置
 // ============================================================================
@@ -352,7 +387,8 @@ public:
         uint16_t dcSlaveAddr,
         uint64_t* dcReferenceTime,
         int* dcWkc,
-        int timeout);
+        int timeout,
+        EtherCatDcCycleTiming* dcCycleTiming = nullptr);
     int ecx_FPWR(uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout);//指定位址物理寫入
     int ecx_FPRD(uint16_t slaveAddr, uint16_t regAddr, void* data, int len, int timeout);//指定位址物理讀取
     int ecx_SDOwrite(int slave_pos, uint16_t index, uint8_t subindex, int CA, int size, void* data, int timeout);//服務資料物件寫入 (SDO Write / 寫入物件字典)

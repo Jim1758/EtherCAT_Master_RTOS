@@ -1,11 +1,12 @@
 ﻿#include "NicDriver.h"
 #include "GlobalConfig.h"
 
+#include <rtssapi.h>
 #include <string.h>
 
 /*
  * 檔案：NicDriver.cpp
- * 版本：EtherCAT DC Release Candidate RC1
+ * 版本：EtherCAT DC-RX.4A RX Incident Forensics（保留 DC-RX.2 Event Wait）
  *
  * 此檔案只負責 RTX64 NAL Queue、Frame ownership 與封包搬移。
  * 不處理 EtherCAT Datagram、DC 控制、Motion 或 NC 邏輯。
@@ -18,7 +19,7 @@
  */
 
 #if defined(_MSC_VER)
-#pragma message("Compiling NicDriver.cpp - ETHERCAT_DC_RELEASE_CANDIDATE_RC1")
+#pragma message("Compiling NicDriver.cpp - ETHERCAT_DC_RX4A_FORENSICS")
 #endif
 
  // TX Queue callback 的保底緩衝區；zero-copy RtNalTransmitEx() 不使用它傳資料。
@@ -40,8 +41,11 @@ CNicDriver::CNicDriver()
 {
     memset(m_pTxFrameArray, 0, sizeof(m_pTxFrameArray));
     memset(m_MacAddress, 0, sizeof(m_MacAddress));
+    memset(&m_RxQueueEvents, 0, sizeof(m_RxQueueEvents));
     memset(&m_RxPacket, 0, sizeof(m_RxPacket));
     m_RxPacket.Owner = this;
+    m_RxCallCounter = 0ULL;
+    m_LastRxCallDiagnostic = NicRxCallDiagnostic{};
 }
 
 CNicDriver::~CNicDriver()
@@ -156,6 +160,11 @@ bool CNicDriver::Open()
 
     DEBUG_PRINT("CNicDriver: RX Configuration [OK]\n");
     DEBUG_PRINT("CNicDriver: RX Mode [STANDARD_BUFFER_V2]\n");
+    DEBUG_PRINT(
+        "CNicDriver: RX Wait [%s]\n",
+        IsReceiveNotificationAvailable()
+        ? "EVENT_HYBRID_DC_RX2"
+        : "SLEEP_FALLBACK");
 
     // 清除舊 filter，再只接受 EtherCAT EtherType 0x88A4。
     for (int i = 0; i < 32; ++i)
@@ -187,6 +196,8 @@ bool CNicDriver::Open()
     m_pTxFrameArray[0] = m_pTxFrame;
     m_RxPacket.Owner = this;
     m_RxPacket.Length = 0;
+    m_RxCallCounter = 0ULL;
+    m_LastRxCallDiagnostic = NicRxCallDiagnostic{};
 
     // 每次 Open() 成功都開始一組新的 TX 診斷統計。
     InterlockedExchange64(&g_nicTxCalls, 0);
@@ -223,6 +234,7 @@ void CNicDriver::Close()
         m_hRxQueue = NULL;
     }
 
+    memset(&m_RxQueueEvents, 0, sizeof(m_RxQueueEvents));
     m_RxPacket.Length = 0;
 }
 
@@ -298,27 +310,177 @@ bool CNicDriver::SendPacket(unsigned char* pData, unsigned int length)
     return true;
 }
 
+void CNicDriver::PublishReceiveCallDiagnostic(
+    NicRxCallOutcome outcome,
+    BOOL nalCallSucceeded,
+    DWORD lastError,
+    ULONG length)
+{
+    NicRxCallDiagnostic diagnostic{};
+    diagnostic.CallSequence = ++m_RxCallCounter;
+    diagnostic.Outcome = static_cast<uint32_t>(outcome);
+    diagnostic.NalCallSucceeded = nalCallSucceeded == TRUE ? 1u : 0u;
+    diagnostic.LastError = lastError;
+    diagnostic.Length = static_cast<uint32_t>(length);
+
+    // The same Priority-64 owner reads this immediately after ReceivePacket().
+    m_LastRxCallDiagnostic = diagnostic;
+}
+
+bool CNicDriver::GetLastReceiveCallDiagnostic(
+    NicRxCallDiagnostic* pDiagnostic) const
+{
+    if (pDiagnostic == NULL)
+        return false;
+
+    *pDiagnostic = m_LastRxCallDiagnostic;
+    return pDiagnostic->CallSequence != 0ULL;
+}
+
 unsigned int CNicDriver::ReceivePacket(unsigned char* pBuffer)
 {
-    // 非阻塞式嘗試接收；無資料時回傳 0，由上層 deadline loop 決定重試。
-    if (m_hRxQueue == NULL || pBuffer == NULL)
+    // Non-blocking receive. DC-RX.4A preserves the existing return contract
+    // while retaining the raw NAL outcome for incident forensics.
+    if (m_hRxQueue == NULL)
+    {
+        PublishReceiveCallDiagnostic(
+            NicRxCallOutcome::QueueUnavailable,
+            FALSE,
+            ERROR_INVALID_HANDLE,
+            0);
         return 0;
+    }
+
+    if (pBuffer == NULL)
+    {
+        PublishReceiveCallDiagnostic(
+            NicRxCallOutcome::QueueUnavailable,
+            FALSE,
+            ERROR_INVALID_PARAMETER,
+            0);
+        return 0;
+    }
 
     m_RxPacket.Length = 0;
 
-    // RtNalReceive() 會透過 RxGetPacket/RxDecodePacket 填入 m_RxPacket。
-    if (!RtNalReceive(m_hRxQueue))
+    // RtNalReceive() distinguishes an empty queue from an API/driver fault
+    // through GetLastError(). ERROR_NO_DATA is normal bounded polling.
+    const BOOL nalResult = RtNalReceive(m_hRxQueue);
+    if (nalResult != TRUE)
+    {
+        const DWORD error = GetLastError();
+        PublishReceiveCallDiagnostic(
+            error == ERROR_NO_DATA
+            ? NicRxCallOutcome::NoData
+            : NicRxCallOutcome::NalError,
+            FALSE,
+            error,
+            0);
         return 0;
+    }
 
-    ULONG length = m_RxPacket.Length;
-    if (length == 0 || length > MAX_ETHER_RX_BUFFER_SIZE)
+    const ULONG reportedLength = m_RxPacket.Length;
+    if (reportedLength == 0 ||
+        reportedLength > MAX_ETHER_RX_BUFFER_SIZE)
+    {
+        PublishReceiveCallDiagnostic(
+            NicRxCallOutcome::InvalidLength,
+            TRUE,
+            ERROR_INVALID_DATA,
+            reportedLength);
         return 0;
+    }
 
-    if (length > MAX_ETHER_FRAME_SIZE)
-        length = MAX_ETHER_FRAME_SIZE;
+    ULONG copyLength = reportedLength;
+    if (copyLength > MAX_ETHER_FRAME_SIZE)
+        copyLength = MAX_ETHER_FRAME_SIZE;
 
-    memcpy(pBuffer, m_RxPacket.Data, length);
-    return static_cast<unsigned int>(length);
+    memcpy(pBuffer, m_RxPacket.Data, copyLength);
+    PublishReceiveCallDiagnostic(
+        NicRxCallOutcome::Frame,
+        TRUE,
+        ERROR_SUCCESS,
+        reportedLength);
+
+    return static_cast<unsigned int>(copyLength);
+}
+
+bool CNicDriver::IsReceiveNotificationAvailable() const
+{
+    return
+        m_hRxQueue != NULL &&
+        m_RxQueueEvents.hRxEvent != NULL;
+}
+
+NicRxWaitResult CNicDriver::WaitForReceiveNotification(
+    ULONGLONG timeout100ns,
+    DWORD* pLastError)
+{
+    if (pLastError != NULL)
+        *pLastError = ERROR_SUCCESS;
+
+    if (!IsReceiveNotificationAvailable())
+    {
+        if (pLastError != NULL)
+            *pLastError = ERROR_NOT_READY;
+
+        return NicRxWaitResult::Unavailable;
+    }
+
+    ULARGE_INTEGER waitInterval;
+    waitInterval.QuadPart = timeout100ns;
+
+    DWORD waitResult = WAIT_FAILED;
+
+    // Stop event 放在 index 0；若 RX 與 Stop 同時 signaled，停止流程優先。
+    if (m_RxQueueEvents.hStopEvent != NULL &&
+        m_RxQueueEvents.hStopEvent != m_RxQueueEvents.hRxEvent)
+    {
+        HANDLE waitHandles[2] =
+        {
+            m_RxQueueEvents.hStopEvent,
+            m_RxQueueEvents.hRxEvent
+        };
+
+        waitResult = RtWaitForMultipleObjectsEx(
+            2,
+            waitHandles,
+            FALSE,
+            &waitInterval);
+
+        if (waitResult == WAIT_OBJECT_0)
+        {
+            if (pLastError != NULL)
+                *pLastError = ERROR_OPERATION_ABORTED;
+
+            return NicRxWaitResult::Stopped;
+        }
+
+        if (waitResult == WAIT_OBJECT_0 + 1U)
+            return NicRxWaitResult::Signaled;
+    }
+    else
+    {
+        waitResult = RtWaitForSingleObjectEx(
+            m_RxQueueEvents.hRxEvent,
+            &waitInterval);
+
+        if (waitResult == WAIT_OBJECT_0)
+            return NicRxWaitResult::Signaled;
+    }
+
+    if (waitResult == WAIT_TIMEOUT)
+        return NicRxWaitResult::Timeout;
+
+    DWORD error =
+        waitResult == WAIT_FAILED
+        ? GetLastError()
+        : ERROR_GEN_FAILURE;
+
+    if (pLastError != NULL)
+        *pLastError = error;
+
+    return NicRxWaitResult::Failed;
 }
 
 bool CNicDriver::AcquireTxQueueInternal()
@@ -379,7 +541,8 @@ bool CNicDriver::AcquireRxQueueInternal()
     const INT queueCount = RtNalGetNumberOfQueues();
     RTNAL_QUEUE info;
     RTNAL_QUEUE_CRITERIA criteria;
-    RTNAL_QUEUE_EVENTS events;
+
+    memset(&m_RxQueueEvents, 0, sizeof(m_RxQueueEvents));
 
     for (int i = 0; i < queueCount; ++i)
     {
@@ -390,27 +553,36 @@ bool CNicDriver::AcquireRxQueueInternal()
             continue;
 
         memset(&criteria, 0, sizeof(criteria));
-        memset(&events, 0, sizeof(events));
+        memset(&m_RxQueueEvents, 0, sizeof(m_RxQueueEvents));
 
         criteria.method = RTNAL_DEVICE_NAME_QUEUE_EXACT;
         criteria.deviceQueueNumber = info.queueInfo.deviceQueueNumber;
         criteria.queueType = RTNAL_QUEUE_TYPE_RX;
-        // 保留目前已驗證可掃描從站的 RX event 設定，不在 RC1 改變模式。
+        // RX notification 由 NAL IST 觸發；上層使用有界 event wait，失敗自動 fallback。
         criteria.flags = RTNAL_USE_RX_EVENT_FLAG;
         memcpy(
             criteria.deviceName,
             info.deviceInfo.deviceName,
             RTNAL_DEVICE_NAME_LENGTH);
 
-        m_hRxQueue = RtNalAcquireQueue(&criteria, &info, &events);
+        m_hRxQueue = RtNalAcquireQueue(
+            &criteria,
+            &info,
+            &m_RxQueueEvents);
+
         if (m_hRxQueue == NULL)
             continue;
 
         DEBUG_PRINT("CNicDriver: [RX] Queue Acquired\n");
         DEBUG_PRINT("    > Name: %s\n", info.deviceInfo.deviceName);
+        DEBUG_PRINT(
+            "    > RX Event: %s | Stop Event: %s\n",
+            m_RxQueueEvents.hRxEvent != NULL ? "READY" : "UNAVAILABLE",
+            m_RxQueueEvents.hStopEvent != NULL ? "READY" : "UNAVAILABLE");
         return true;
     }
 
+    memset(&m_RxQueueEvents, 0, sizeof(m_RxQueueEvents));
     DEBUG_PRINT("CNicDriver Error: No available RTX64 RX Queue found!\n");
     return false;
 }

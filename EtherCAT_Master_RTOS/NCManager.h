@@ -18,6 +18,8 @@
 #include "NCOrdinaryG00FeedHoldCohortCutoverGate.h" // Stage NC-0.2K.7.4：Terminal Cohort Controlled Cutover
 #include "NCOrdinaryG00FeedHoldCohortRearmShadow.h" // Stage NC-0.2K.7.5：Repeated Cohort Re-arm Shadow
 #include "NCOrdinaryG00FeedHoldCohortRearmCutoverGate.h" // Stage NC-0.2K.7.6：Repeated Cohort Re-arm Controlled Cutover
+#include "NCOrdinaryG00FeedHoldRollingRearmShadow.h" // Stage NC-0.2K.7.7：Same-Session Rolling Re-arm Continuity Shadow
+#include "NCOrdinaryG00FeedHoldRollingRearmCutoverGate.h" // Stage NC-0.2K.7.8：Rolling Re-arm Continuity Controlled Cutover
 #include "NCOrdinaryG00ReadAheadCutoverGate.h" // Stage NC-0.2K.7.1：Two-Entry Ordinary G00 Read-Ahead Cutover
 #include "NCBlockLifecycleLedger.h" // Stage NC-0.2D：Block / Motion Lifecycle
 #include "NCBlockCompletionBoundary.h" // Stage NC-0.2F：Motion Completion Dual-Key Guard
@@ -29,6 +31,7 @@
 #include "NCLifecycleInterruptionBoundary.h" // Stage NC-0.2J.1：Failure / Epoch Cancellation Shadow
 #include "NCResetReleaseGate.h" // Stage NC-0.2J.3：Reset Stable-Standstill Release Gate
 #include "NCAlarmEmergencyStopBoundary.h" // Stage NC-0.2J.6.1：Alarm / E-stop RT ACK Shadow
+#include "NCPathCoreInputHandoffCompactShadow.h" // Stage NC-0.2L.2A：Path Core accepted-input contract
 
 #include <queue>
 #include <vector>
@@ -755,6 +758,41 @@ public:
         return m_ordinaryG00FeedHoldCohortRearmCutoverGate.GetCounters();
     }
 
+    NCOrdinaryG00FeedHoldRollingRearmSnapshot
+        GetOrdinaryG00FeedHoldRollingRearmSnapshot() const noexcept
+    {
+        return m_ordinaryG00FeedHoldRollingRearmShadow.GetSnapshot();
+    }
+
+    NCOrdinaryG00FeedHoldRollingRearmCounters
+        GetOrdinaryG00FeedHoldRollingRearmCounters() const noexcept
+    {
+        return m_ordinaryG00FeedHoldRollingRearmShadow.GetCounters();
+    }
+
+    void SetOrdinaryG00FeedHoldRollingCutoverEnabled(
+        bool enabled) noexcept
+    {
+        m_ordinaryG00FeedHoldRollingRearmCutoverGate.SetEnabled(enabled);
+    }
+
+    bool IsOrdinaryG00FeedHoldRollingCutoverEnabled() const noexcept
+    {
+        return m_ordinaryG00FeedHoldRollingRearmCutoverGate.IsEnabled();
+    }
+
+    NCOrdinaryG00FeedHoldRollingCutoverSnapshot
+        GetOrdinaryG00FeedHoldRollingCutoverSnapshot() const noexcept
+    {
+        return m_ordinaryG00FeedHoldRollingRearmCutoverGate.GetSnapshot();
+    }
+
+    NCOrdinaryG00FeedHoldRollingCutoverCounters
+        GetOrdinaryG00FeedHoldRollingCutoverCounters() const noexcept
+    {
+        return m_ordinaryG00FeedHoldRollingRearmCutoverGate.GetCounters();
+    }
+
     void SetOrdinaryG00ReadAheadCutoverEnabled(bool enabled) noexcept
     {
         m_ordinaryG00ReadAheadCutoverGate.SetEnabled(enabled);
@@ -912,6 +950,21 @@ public:
         GetAlarmEmergencyStopCounters() const noexcept
     {
         return m_alarmEmergencyStopShadow.GetCounters();
+    }
+
+    // =========================================================
+    // Stage NC-0.2L.1E2 - scalar HMI state and change token only.
+    // The HMI receives no counters, snapshot or control permit.
+    // =========================================================
+    NCPathCoreInputHandoffCompactState
+        GetPathCoreInputHandoffCompactState() const noexcept
+    {
+        return m_pathCoreInputHandoffCompactShadow.GetCompactState();
+    }
+
+    std::uint32_t GetPathCoreInputHandoffChangeToken() const noexcept
+    {
+        return m_pathCoreInputHandoffCompactShadow.GetChangeToken();
     }
 
     static bool WaitForGMBlockTransactionCallback(NCManager* nc);
@@ -1095,6 +1148,19 @@ private:
     NCOrdinaryG00FeedHoldCohortRearmCutoverGate
         m_ordinaryG00FeedHoldCohortRearmCutoverGate{};
 
+    // Stage NC-0.2K.7.7: the exact K.7.5/K.7.6 two-generation proof seeds
+    // continuous same-session observation of later K.7.3/K.7.4 cohorts.
+    // Observation only; no admission decision or Motion/PDO write.
+    NCOrdinaryG00FeedHoldRollingRearmShadow
+        m_ordinaryG00FeedHoldRollingRearmShadow{};
+
+    // Stage NC-0.2K.7.8: consumes only K.7.7 generation-three-and-later
+    // continuity at the K.7.1 ordinary G00 admission seam.  A bound rolling
+    // generation waits for exact K.7.7/K.7.4/Registry release; mismatch keeps
+    // the current Queue session on legacy drain.  No Motion/PDO write.
+    NCOrdinaryG00FeedHoldRollingRearmCutoverGate
+        m_ordinaryG00FeedHoldRollingRearmCutoverGate{};
+
     // Stage NC-0.2K.7.1: reversible, qualification-gated Runtime cutover.
     // It owns no Motion storage and cannot exceed two active registry entries.
     NCOrdinaryG00ReadAheadCutoverGate
@@ -1252,6 +1318,8 @@ private:
     NCPreparedInvalidationReason
         GetPreparedBlockInactiveReason() const noexcept;
     void ObservePreparedBlockQueueShadow(bool allowPlanning) noexcept;
+    void ObservePathCoreAcceptedReadAheadInput(
+        const NCOrdinaryG00InflightRegistrationProof& proof) noexcept;
     NCPreparedHeadCutoverContext CapturePreparedHeadBeforeResolve(
         int sourcePC,
         int sourceLineNumber) const noexcept;
@@ -1510,7 +1578,13 @@ public:
     int m_g66L = 1;             // 記住重複次數 (L)
     NCBlock m_g66Block;         // 記住 G66 當下夾帶的所有變數 (A, B, C...)
 
+private:
+    // NC-0.2L.1A2 through L.2A: HMI remains scalar-only. NCManager is
+    // heap-owned, so these fixed tail members do not consume RT thread stack.
+    NCPathCoreInputHandoffCompactShadow
+        m_pathCoreInputHandoffCompactShadow{};
 
-
-
+    // NC-0.2L.2A: last two accepted K.7 handoff identities. History-only;
+    // never consulted by a Runtime, Gate, PC, Alarm or Motion decision.
+    NCPathCoreInputContractShadow m_pathCoreInputContractShadow{};
 };

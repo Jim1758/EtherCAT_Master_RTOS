@@ -369,9 +369,6 @@
     <ClCompile Include="NCPreparedBlockQueueShadow.cpp">
       <Filter>Source Files\NC\NC</Filter>
     </ClCompile>
-    <ClCompile Include="inspect_nc02k1_sizes.cpp">
-      <Filter>Source Files\NC\NC</Filter>
-    </ClCompile>
     <ClCompile Include="NCPreparedHeadEquivalenceShadow.cpp">
       <Filter>Source Files\NC\NC</Filter>
     </ClCompile>
@@ -598,6 +595,27 @@
     </ClInclude>
     <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmCutoverGate.h">
       <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldRollingRearmShadow.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatPdoSafetyStopDebounce.h">
+      <Filter>Header Files\EtherCAT_Master\DC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldRollingRearmCutoverGate.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreInputHandoffCompactShadow.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatRxForensics.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatRxForensicsDiagContract.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="EtherCatP64DeferredDiagnostics.h">
+      <Filter>Header Files\EtherCAT_Master</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

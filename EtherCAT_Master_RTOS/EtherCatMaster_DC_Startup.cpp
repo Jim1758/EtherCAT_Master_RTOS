@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cerrno>
+#include <cstdlib>
 #include <string>
 
 // ============================================================================
@@ -188,6 +190,498 @@ static void LoadDcDriftCalibrationConfig()
         (unsigned long)EtherCatDcTuning::DriftCalibrationGoodWindows,
         (long long)EtherCatDcTuning::DriftCalibrationMaximumMadPpb,
         (long long)EtherCatDcTuning::DriftCalibrationMaximumRawMedianDeviationPpb);
+}
+
+
+// ============================================================================
+// DC-RX.3F deterministic test-only fault injection configuration
+//
+// File:
+//   D:\EtherCAT_Master_Data\DC_FaultInjection.txt
+//
+// Safety contract:
+//   - absent / Enable=0 / invalid token => OFF;
+//   - one scenario runs at most once per RTOS process;
+//   - no file I/O occurs in the 4 kHz callback;
+//   - LRW 8-cycle containment requires a second dangerous token and Servo OFF;
+//   - all normal DC/PDO control parameters remain unchanged.
+// ============================================================================
+
+static std::string TrimDcRx3fText(std::string value)
+{
+    const auto first =
+        std::find_if(
+            value.begin(),
+            value.end(),
+            [](unsigned char ch)
+            {
+                return std::isspace(ch) == 0;
+            });
+
+    value.erase(value.begin(), first);
+
+    const auto last =
+        std::find_if(
+            value.rbegin(),
+            value.rend(),
+            [](unsigned char ch)
+            {
+                return std::isspace(ch) == 0;
+            }).base();
+
+            value.erase(last, value.end());
+            return value;
+}
+
+static std::string UpperDcRx3fText(std::string value)
+{
+    value = TrimDcRx3fText(value);
+
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char ch)
+        {
+            return (char)std::toupper(ch);
+        });
+
+    return value;
+}
+
+static bool ParseDcRx3fBool(
+    const std::string& value,
+    bool defaultValue)
+{
+    const std::string normalized =
+        UpperDcRx3fText(value);
+
+    if (normalized == "1" ||
+        normalized == "TRUE" ||
+        normalized == "YES" ||
+        normalized == "ON")
+    {
+        return true;
+    }
+
+    if (normalized == "0" ||
+        normalized == "FALSE" ||
+        normalized == "NO" ||
+        normalized == "OFF")
+    {
+        return false;
+    }
+
+    return defaultValue;
+}
+
+static uint64_t ParseDcRx3fUnsigned(
+    const std::string& value,
+    uint64_t defaultValue)
+{
+    const std::string normalized =
+        TrimDcRx3fText(value);
+
+    if (normalized.empty())
+    {
+        return defaultValue;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+
+    const unsigned long long parsed =
+        std::strtoull(
+            normalized.c_str(),
+            &end,
+            10);
+
+    if (errno == ERANGE ||
+        end == normalized.c_str() ||
+        end == nullptr ||
+        *end != '\0')
+    {
+        return defaultValue;
+    }
+
+    return (uint64_t)parsed;
+}
+
+static DcRx3fFaultScenario ParseDcRx3fScenario(
+    const std::string& value)
+{
+    const std::string normalized =
+        UpperDcRx3fText(value);
+
+    if (normalized == "DC_WKC_DROP")
+        return DcRx3fFaultScenario::DcWkcDrop;
+
+    if (normalized == "LRW_WKC_DROP")
+        return DcRx3fFaultScenario::LrwWkcDrop;
+
+    if (normalized == "EXACT_TIMING_MISSING")
+        return DcRx3fFaultScenario::ExactTimingMissing;
+
+    if (normalized == "LATE_RTT")
+        return DcRx3fFaultScenario::LateRtt;
+
+    if (normalized == "DC_TIMESTAMP_REPEAT")
+        return DcRx3fFaultScenario::DcTimestampRepeat;
+
+    if (normalized == "DC_TIMESTAMP_BACKWARD")
+        return DcRx3fFaultScenario::DcTimestampBackward;
+
+    if (normalized == "PHASE_MAP_JUMP")
+        return DcRx3fFaultScenario::PhaseMapJump;
+
+    if (normalized == "SCHEDULER_RECOVERY")
+        return DcRx3fFaultScenario::SchedulerRecovery;
+
+    if (normalized == "LRW_TIMEOUT")
+        return DcRx3fFaultScenario::LrwTimeout;
+
+    return DcRx3fFaultScenario::Off;
+}
+
+static const char* DcRx3fScenarioConfigText(
+    DcRx3fFaultScenario scenario)
+{
+    switch (scenario)
+    {
+    case DcRx3fFaultScenario::DcWkcDrop:
+        return "DC_WKC_DROP";
+    case DcRx3fFaultScenario::LrwWkcDrop:
+        return "LRW_WKC_DROP";
+    case DcRx3fFaultScenario::ExactTimingMissing:
+        return "EXACT_TIMING_MISSING";
+    case DcRx3fFaultScenario::LateRtt:
+        return "LATE_RTT";
+    case DcRx3fFaultScenario::DcTimestampRepeat:
+        return "DC_TIMESTAMP_REPEAT";
+    case DcRx3fFaultScenario::DcTimestampBackward:
+        return "DC_TIMESTAMP_BACKWARD";
+    case DcRx3fFaultScenario::PhaseMapJump:
+        return "PHASE_MAP_JUMP";
+    case DcRx3fFaultScenario::SchedulerRecovery:
+        return "SCHEDULER_RECOVERY";
+    case DcRx3fFaultScenario::LrwTimeout:
+        return "LRW_TIMEOUT";
+    default:
+        return "OFF";
+    }
+}
+
+static uint32_t DcRx3fDefaultCycles(
+    DcRx3fFaultScenario scenario)
+{
+    switch (scenario)
+    {
+    case DcRx3fFaultScenario::DcTimestampBackward:
+        return 4U;
+    default:
+        return 1U;
+    }
+}
+
+static void PublishDcRx3fConfig(
+    DcRx3fFaultScenario scenario,
+    uint32_t cycles,
+    uint32_t startDelayCycles,
+    uint64_t valueNs,
+    bool requireServoOff,
+    bool allowSafetyStop)
+{
+    g_dcRx3fConfiguredScenario =
+        (LONG)scenario;
+
+    g_dcRx3fConfiguredCycles =
+        (LONG)cycles;
+
+    g_dcRx3fConfiguredStartDelayCycles =
+        (LONG)startDelayCycles;
+
+    g_dcRx3fConfiguredValueNs =
+        (LONGLONG)valueNs;
+
+    g_dcRx3fConfiguredRequireServoOff =
+        requireServoOff ? 1L : 0L;
+
+    g_dcRx3fConfiguredAllowSafetyStop =
+        allowSafetyStop ? 1L : 0L;
+
+    MemoryBarrier();
+
+    InterlockedExchange(
+        &g_dcRx3fConfigReady,
+        1L);
+}
+
+static void LoadDcRx3fFaultInjectionConfig()
+{
+    InterlockedExchange(
+        &g_dcRx3fConfigReady,
+        0L);
+
+    const std::string configPath =
+        GlobalConfig::GetInstance().BaseDataDir +
+        "DC_FaultInjection.txt";
+
+    const bool enabled =
+        ParseDcRx3fBool(
+            ConfigUtil::ReadConfigString(
+                configPath,
+                "Enable",
+                "0"),
+            false);
+
+    if (!enabled)
+    {
+        PublishDcRx3fConfig(
+            DcRx3fFaultScenario::Off,
+            0U,
+            0U,
+            0ULL,
+            true,
+            false);
+
+        RtPrintf(
+            "[DC-RX3F-CONFIG] OFF | "
+            "File:%s | Production path unchanged.\n",
+            configPath.c_str());
+
+        return;
+    }
+
+    const std::string armToken =
+        UpperDcRx3fText(
+            ConfigUtil::ReadConfigString(
+                configPath,
+                "ArmToken",
+                ""));
+
+    const DcRx3fFaultScenario scenario =
+        ParseDcRx3fScenario(
+            ConfigUtil::ReadConfigString(
+                configPath,
+                "Scenario",
+                "OFF"));
+
+    if (armToken != "DC_RX3F_TEST_ONLY" ||
+        scenario == DcRx3fFaultScenario::Off)
+    {
+        PublishDcRx3fConfig(
+            DcRx3fFaultScenario::Off,
+            0U,
+            0U,
+            0ULL,
+            true,
+            false);
+
+        RtPrintf(
+            "[DC-RX3F-CONFIG] REJECTED | "
+            "ArmToken/Scenario invalid | File:%s\n",
+            configPath.c_str());
+
+        return;
+    }
+
+    uint64_t cycles64 =
+        ParseDcRx3fUnsigned(
+            ConfigUtil::ReadConfigString(
+                configPath,
+                "Cycles",
+                ""),
+            (uint64_t)DcRx3fDefaultCycles(scenario));
+
+    uint64_t maximumCycles = 4000ULL;
+
+    if (scenario == DcRx3fFaultScenario::LrwWkcDrop ||
+        scenario == DcRx3fFaultScenario::LrwTimeout)
+    {
+        maximumCycles = 8ULL;
+    }
+    else if (scenario == DcRx3fFaultScenario::PhaseMapJump)
+    {
+        maximumCycles = 1ULL;
+    }
+    else if (scenario == DcRx3fFaultScenario::SchedulerRecovery)
+    {
+        maximumCycles = 4ULL;
+    }
+
+    if (cycles64 == 0ULL ||
+        cycles64 > maximumCycles)
+    {
+        PublishDcRx3fConfig(
+            DcRx3fFaultScenario::Off,
+            0U,
+            0U,
+            0ULL,
+            true,
+            false);
+
+        RtPrintf(
+            "[DC-RX3F-CONFIG] REJECTED | "
+            "Scenario:%s Cycles:%llu outside 1..%llu\n",
+            DcRx3fScenarioConfigText(scenario),
+            (unsigned long long)cycles64,
+            (unsigned long long)maximumCycles);
+
+        return;
+    }
+
+    uint64_t startDelayMs =
+        ParseDcRx3fUnsigned(
+            ConfigUtil::ReadConfigString(
+                configPath,
+                "StartDelayMs",
+                "3000"),
+            3000ULL);
+
+    if (startDelayMs > 60000ULL)
+    {
+        startDelayMs = 60000ULL;
+    }
+
+    const uint64_t startDelayCycles64 =
+        startDelayMs * 4ULL;
+
+    bool requireServoOff =
+        ParseDcRx3fBool(
+            ConfigUtil::ReadConfigString(
+                configPath,
+                "RequireServoOff",
+                "1"),
+            true);
+
+    bool allowSafetyStop =
+        ParseDcRx3fBool(
+            ConfigUtil::ReadConfigString(
+                configPath,
+                "AllowSafetyStop",
+                "0"),
+            false);
+
+    const bool destructiveLrwTest =
+        (scenario == DcRx3fFaultScenario::LrwWkcDrop ||
+            scenario == DcRx3fFaultScenario::LrwTimeout) &&
+        cycles64 >= 8ULL;
+
+    const bool anyLrwTest =
+        scenario == DcRx3fFaultScenario::LrwWkcDrop ||
+        scenario == DcRx3fFaultScenario::LrwTimeout;
+
+    // Every Process Data injection is forced to Servo OFF. The config may
+    // relax this gate only for DC-only/timing tests, never for LRW tests.
+    if (anyLrwTest)
+    {
+        requireServoOff = true;
+    }
+
+    if (destructiveLrwTest)
+    {
+        const std::string dangerousToken =
+            UpperDcRx3fText(
+                ConfigUtil::ReadConfigString(
+                    configPath,
+                    "DangerousToken",
+                    ""));
+
+        if (!allowSafetyStop ||
+            dangerousToken != "ALLOW_AL1003_ESTOP")
+        {
+            PublishDcRx3fConfig(
+                DcRx3fFaultScenario::Off,
+                0U,
+                0U,
+                0ULL,
+                true,
+                false);
+
+            RtPrintf(
+                "[DC-RX3F-CONFIG] REJECTED | "
+                "8-cycle LRW containment requires "
+                "AllowSafetyStop=1 and "
+                "DangerousToken=ALLOW_AL1003_ESTOP.\n");
+
+            return;
+        }
+    }
+    else
+    {
+        allowSafetyStop = false;
+    }
+
+    uint64_t valueNs = 0ULL;
+
+    if (scenario == DcRx3fFaultScenario::LateRtt)
+    {
+        valueNs =
+            ParseDcRx3fUnsigned(
+                ConfigUtil::ReadConfigString(
+                    configPath,
+                    "ValueNs",
+                    "205000"),
+                205000ULL);
+
+        if (valueNs <= 200000ULL ||
+            valueNs >= 300000ULL)
+        {
+            valueNs = 205000ULL;
+        }
+    }
+    else if (scenario == DcRx3fFaultScenario::DcTimestampBackward)
+    {
+        valueNs =
+            ParseDcRx3fUnsigned(
+                ConfigUtil::ReadConfigString(
+                    configPath,
+                    "ValueNs",
+                    "1000000"),
+                1000000ULL);
+
+        if (valueNs < 250000ULL ||
+            valueNs > 100000000ULL)
+        {
+            valueNs = 1000000ULL;
+        }
+    }
+    else if (scenario == DcRx3fFaultScenario::PhaseMapJump)
+    {
+        valueNs =
+            ParseDcRx3fUnsigned(
+                ConfigUtil::ReadConfigString(
+                    configPath,
+                    "ValueNs",
+                    "80000"),
+                80000ULL);
+
+        if (valueNs <= 50000ULL ||
+            valueNs > 120000ULL)
+        {
+            valueNs = 80000ULL;
+        }
+    }
+
+    PublishDcRx3fConfig(
+        scenario,
+        (uint32_t)cycles64,
+        (uint32_t)startDelayCycles64,
+        valueNs,
+        requireServoOff,
+        allowSafetyStop);
+
+    RtPrintf(
+        "[DC-RX3F-CONFIG] *** TEST-ONLY ARMED *** | "
+        "Scenario:%s Cycles:%llu Delay:%llums Value:%lluns | "
+        "RequireServoOff:%s AllowAL1003:%s | "
+        "RunOncePerProcess:YES\n",
+        DcRx3fScenarioConfigText(scenario),
+        (unsigned long long)cycles64,
+        (unsigned long long)startDelayMs,
+        (unsigned long long)valueNs,
+        requireServoOff ? "YES" : "NO",
+        allowSafetyStop ? "YES" : "NO");
 }
 
 // ============================================================================
@@ -1133,6 +1627,9 @@ int EtherCatMaster::StartDcPdoRuntime()
 
     // Drift 設定必須在建立正式 PDO timer 前固定；Runtime 只讀取記憶體快照。
     LoadDcDriftCalibrationConfig();
+
+    // DC-RX.3F: configuration is loaded once before the real PDO timer exists.
+    LoadDcRx3fFaultInjectionConfig();
 
     // ============================================================
     // Step 2：RTX64 Warmed Coarse + Fine QPC Scheduler Probe V6

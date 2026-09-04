@@ -2,6 +2,7 @@
 #include "EtherCatMaster_DC_Internal.h"
 #include "EtherCatMaster_DC_Tuning.h"
 #include "NicDriver.h"
+#include "EtherCatRxForensics.h"
 #include <windows.h>
 #include <rtapi.h>
 #include <rtssapi.h>
@@ -39,7 +40,8 @@
  *
  * 2. 再看 [DC-HEALTH-SUMMARY]
  *    正常目標：ACTIVE、PhaseGood:YES、ActualErr 接近 0、OffsetSat:NO、
- *    TripMask:0x00、Recover/Skip=0、Recent_Timeout=0、WKC=13/7、RESULT:STABLE。
+ *    HoldMask/TripMask=0、Clean=32/32、Recent_Timeout=0、WKC=13/7、RESULT:STABLE。
+ *    History、Recover/Skip、SoftLate 與 Timeout Total 是歷史證據，非目前鎖定原因。
  *    ActualErr 的 NEAR_ZERO 門檻是 ±1000 ns；這是顯示門檻，不是 Phase-P 的
  *    500 ns deadband。Snapshot:BUSY 偶爾一行可忽略，連續出現才要查 snapshot writer。
  *
@@ -51,7 +53,8 @@
  *
  * 4. 再看 [ECAT-RX-STAGE-MAIN] 判斷卡在哪一階段
  *    PreDeadline：進入 receive 前已無時間；PostReceive：ReceivePacket 返回後才超時；
- *    SleepAtTimeout 0/1/2：timeout 發生前走過幾次 coarse sleep；
+ *    WaitSliceAtTimeout 0/1/2：timeout 發生前走過幾次 coarse wait slice；
+ *    先看 [ECAT-RX-WAIT-MAIN] 的 EventSignaled/Timeout/Failed/FallbackSleep；
  *    ReceiveCallMax：單次 NIC receive 呼叫最久時間；TimeoutCallMax：timeout 當次最久值。
  *    若 ReceiveCallMax 突增，優先查 NAL interrupt／CPU priority；若 PreDeadline 增加，
  *    優先查 TX、Motion、NC 或前段 Handler 執行時間。
@@ -63,8 +66,11 @@
  *    不能把 13/7 當成所有機台的固定標準。
  *
  * 6. 看正式 DC 控制
- *    [QPC-REAL-FF-V0C-MAIN]：State=ACTIVE、PhaseGood=YES、TripMask=0、Reject=0。
- *    Applied 是真正使用的 drift；Step 應小且緩慢。LATCHED 或 TripMask 非 0 是正式警報。
+ *    [QPC-REAL-FF-V0C-MAIN]：State=ACTIVE、PhaseGood=YES、HoldMask/TripMask=0、
+ *    Clean=32/32、Reject=0。HoldMask 0x02/0x10/0x20/0x80 是可恢復 HOLD；
+ *    0x80 代表 WKC 正常但 DC 樣本時間序／新鮮度或 Exact RTT 包絡不可信。
+ *    TripMask 0x40 是可自動恢復的 DC FULL_RELOCK。
+ *    Applied 是真正使用的 drift；Step 應小且緩慢。0x40 顯示 RELOCK 並可自動恢復；0x04/0x08 才是 hard latch。
  *    [QPC-PHASE-P-ACT-V0-MAIN]：State=ACTIVE、Gate=YES、ActualErr 接近 0、
  *    OffsetSat=NO、Improve=YES。Step 正負頻繁切換代表 deadband／P 強度可能過敏；
  *    Offset 長期往單方向累積代表 Real FF 尚有 residual frequency error。
@@ -73,7 +79,7 @@
  *    [PDO-ONESHOT-INFRA-MAIN]：Control=ON、FineWait=OFF、RearmFail=0。
  *    [PDO-BOOTSTRAP-REASON-MAIN]：啟動初期少量 NotReady 可接受；穩定運轉後
  *    Bootstrap、RuntimeRecover、Skip 持續增加，表示 callback 醒來或 re-arm 太晚。
- *    Recover/Skip 是 scheduler 自救事件，不等同 EtherCAT RX HardTimeout。
+ *    Recover/Skip 是 scheduler 自救歷史；單次事件只進可恢復 HOLD，不再永久 Trip。
  *
  * 8. 看即時負載
  *    [PDO-TIMER-MAIN] Avg 應接近 250000 ns；Short/Long 代表 callback 抖動分布。
@@ -89,6 +95,391 @@
 
 namespace
 {
+    const LONG DC_RX3B_SOFT_RELOCK_MASK = 0x40;
+    const LONG DC_RX3B_HARD_TRIP_MASK = 0x04 | 0x08;
+
+    const char* DcRx3bHoldoverTierText(LONG tier)
+    {
+        return
+            tier == 1 ? "GRACE" :
+            tier == 2 ? "HOLDOVER" :
+            tier == 3 ? "DEGRADED" :
+            tier == 4 ? "RELOCK" :
+            tier == 5 ? "REQUALIFY" : "NONE";
+    }
+
+    const char* DcRx3bRecoveryProfileText(LONG profile)
+    {
+        return
+            profile == 2 ? "FULL_RELOCK" :
+            profile == 1 ? "CONSERVATIVE" : "FAST";
+    }
+
+    const char* DcRx3cSampleGuardStateText(LONG state)
+    {
+        return
+            state == 2 ? "TRACK" :
+            state == 1 ? "VERIFY" : "UNBOUND";
+    }
+
+    const char* DcRx3dTimingSourceText(LONG source)
+    {
+        return
+            source == 1 ? "EXACT_TXRX" :
+            source == 2 ? "CALL_FALLBACK" : "NONE";
+    }
+
+    const char* DcRx3eRttGuardStateText(LONG state)
+    {
+        return
+            state == 3 ? "SHIFT_CHECK" :
+            state == 2 ? "TRACK" :
+            state == 1 ? "WARMUP" : "UNBOUND";
+    }
+
+    const char* DcRx3fScenarioText(LONG scenario)
+    {
+        return
+            scenario == 1 ? "DC_WKC_DROP" :
+            scenario == 2 ? "LRW_WKC_DROP" :
+            scenario == 3 ? "EXACT_TIMING_MISSING" :
+            scenario == 4 ? "LATE_RTT" :
+            scenario == 5 ? "DC_TIMESTAMP_REPEAT" :
+            scenario == 6 ? "DC_TIMESTAMP_BACKWARD" :
+            scenario == 7 ? "PHASE_MAP_JUMP" :
+            scenario == 8 ? "SCHEDULER_RECOVERY" :
+            scenario == 9 ? "LRW_TIMEOUT" : "OFF";
+    }
+
+    const char* DcRx3fStateText(LONG state)
+    {
+        return
+            state == 1 ? "WAIT_GATE" :
+            state == 2 ? "START_DELAY" :
+            state == 3 ? "INJECT" :
+            state == 4 ? "RECOVERY" :
+            state == 5 ? "PASS" :
+            state == 6 ? "FAIL" : "OFF";
+    }
+
+    const char* Rx4aIncidentKindText(uint32_t value)
+    {
+        const EtherCatRxIncidentKind kind =
+            static_cast<EtherCatRxIncidentKind>(value);
+
+        return
+            kind == EtherCatRxIncidentKind::HardTimeout ? "HARD_TIMEOUT" :
+            kind == EtherCatRxIncidentKind::Recovery ? "RECOVERY" :
+            kind == EtherCatRxIncidentKind::QueueStopped ? "QUEUE_STOPPED" :
+            "UNKNOWN";
+    }
+
+    const char* Rx4aIncidentReasonText(uint32_t value)
+    {
+        const EtherCatRxIncidentReason reason =
+            static_cast<EtherCatRxIncidentReason>(value);
+
+        return
+            reason == EtherCatRxIncidentReason::QpcFailure ? "QPC_FAIL" :
+            reason == EtherCatRxIncidentReason::PreReceiveDeadline ? "PRE_RECEIVE_DEADLINE" :
+            reason == EtherCatRxIncidentReason::PostReceiveLate ? "POST_RECEIVE_LATE" :
+            reason == EtherCatRxIncidentReason::PreWaitDeadline ? "PRE_WAIT_DEADLINE" :
+            reason == EtherCatRxIncidentReason::PreFallbackDeadline ? "PRE_FALLBACK_DEADLINE" :
+            reason == EtherCatRxIncidentReason::FallbackExhausted ? "FALLBACK_EXHAUSTED" :
+            reason == EtherCatRxIncidentReason::EventStopped ? "EVENT_STOPPED" :
+            "NONE";
+    }
+
+    const char* Rx4aIncidentClassificationText(uint32_t value)
+    {
+        const EtherCatRxIncidentClassification classification =
+            static_cast<EtherCatRxIncidentClassification>(value);
+
+        return
+            classification == EtherCatRxIncidentClassification::NoFrameByDeadline ? "NO_FRAME" :
+            classification == EtherCatRxIncidentClassification::NalCallStall ? "NAL_CALL_STALL" :
+            classification == EtherCatRxIncidentClassification::LateFrameReturned ? "LATE_FRAME_RETURNED" :
+            classification == EtherCatRxIncidentClassification::LateFrameQueued ? "LATE_FRAME_QUEUED" :
+            classification == EtherCatRxIncidentClassification::NoLateFrameQueued ? "NO_LATE_FRAME_QUEUED" :
+            classification == EtherCatRxIncidentClassification::QpcFailure ? "QPC_FAILURE" :
+            classification == EtherCatRxIncidentClassification::QueueStopped ? "QUEUE_STOPPED" :
+            classification == EtherCatRxIncidentClassification::Recovered ? "RECOVERED" :
+            "UNKNOWN";
+    }
+
+    const char* Rx4aNalOutcomeText(uint32_t value)
+    {
+        const NicRxCallOutcome outcome =
+            static_cast<NicRxCallOutcome>(value);
+
+        return
+            outcome == NicRxCallOutcome::NoData ? "NO_DATA" :
+            outcome == NicRxCallOutcome::Frame ? "FRAME" :
+            outcome == NicRxCallOutcome::InvalidLength ? "INVALID_LENGTH" :
+            outcome == NicRxCallOutcome::NalError ? "NAL_ERROR" :
+            "QUEUE_UNAVAILABLE";
+    }
+
+    const char* Rx4aWaitResultText(uint32_t value)
+    {
+        const NicRxWaitResult result =
+            static_cast<NicRxWaitResult>(value);
+
+        return
+            result == NicRxWaitResult::Signaled ? "SIGNALED" :
+            result == NicRxWaitResult::Timeout ? "TIMEOUT" :
+            result == NicRxWaitResult::Stopped ? "STOPPED" :
+            result == NicRxWaitResult::Failed ? "FAILED" :
+            "UNAVAILABLE";
+    }
+
+    void PrintRx4aIncidentForensics()
+    {
+        static uint64_t lastPrintedIncidentId = 0ULL;
+
+        const uint64_t latestIncidentId =
+            EtherCatRx4aIncidentLatestId();
+
+        if (latestIncidentId == 0ULL)
+            return;
+
+        if (lastPrintedIncidentId > latestIncidentId)
+        {
+            lastPrintedIncidentId = 0ULL;
+        }
+
+        uint64_t firstIncidentId = lastPrintedIncidentId + 1ULL;
+        const uint64_t availableFirst =
+            latestIncidentId >= ETHERCAT_RX4A_INCIDENT_RING_CAPACITY
+            ? latestIncidentId - ETHERCAT_RX4A_INCIDENT_RING_CAPACITY + 1ULL
+            : 1ULL;
+
+        if (firstIncidentId < availableFirst)
+        {
+            RtPrintf(
+                "[ECAT-RX4A-INCIDENT-LOSS] "
+                "Requested:%llu | Available:%llu..%llu | "
+                "Lost:%llu | Capacity:%lu\n",
+                (unsigned long long)firstIncidentId,
+                (unsigned long long)availableFirst,
+                (unsigned long long)latestIncidentId,
+                (unsigned long long)(availableFirst - firstIncidentId),
+                (unsigned long)ETHERCAT_RX4A_INCIDENT_RING_CAPACITY);
+
+            firstIncidentId = availableFirst;
+        }
+
+        for (uint64_t incidentId = firstIncidentId;
+            incidentId <= latestIncidentId;
+            ++incidentId)
+        {
+            EtherCatRxIncidentRecord record{};
+            if (!EtherCatRx4aIncidentRead(incidentId, &record))
+                continue;
+
+            RtPrintf(
+                "[ECAT-RX4A-INCIDENT] "
+                "Id:%llu Rel:%llu Burst:%llu | "
+                "Kind:%s Reason:%s Hint:%s | "
+                "Tick:%llu Qpc:%llu/%llu | "
+                "Total:%llu Streak:%lu Attempt:%lu Wait:%lu | "
+                "RxElapsed:%llu Call:%llu CallMax:%llu ns\n",
+                (unsigned long long)record.IncidentId,
+                (unsigned long long)record.RelatedIncidentId,
+                (unsigned long long)record.BurstId,
+                Rx4aIncidentKindText(record.Kind),
+                Rx4aIncidentReasonText(record.Reason),
+                Rx4aIncidentClassificationText(record.Classification),
+                (unsigned long long)record.PdoTick,
+                (unsigned long long)record.Qpc,
+                (unsigned long long)record.QpcFrequency,
+                (unsigned long long)record.TotalHardTimeout,
+                (unsigned long)record.ConsecutiveTimeout,
+                (unsigned long)record.AttemptCount,
+                (unsigned long)record.CoarseWaitCount,
+                (unsigned long long)record.RxElapsedNs,
+                (unsigned long long)record.ReceiveCallNs,
+                (unsigned long long)record.ReceiveCallMaxNs);
+
+            RtPrintf(
+                "[ECAT-RX4A-CONTEXT] "
+                "Id:%llu | "
+                "NAL:%s Seq:%llu OK:%lu Err:0x%08lX NalLen:%lu RxLen:%ld | "
+                "Event S/T/F/FB:%lu/%lu/%lu/%lu Last:%s Err:0x%08lX | "
+                "Resync A/Drain/Limit:%lu/%lu/%lu | "
+                "LRW:%ld/%ld DC:%ld PDO:%lu DCQ:%lu | "
+                "Phase:%lld ns FF:%lld/%lld ppb | "
+                "Hold:0x%08lX Trip:0x%08lX | "
+                "SchedRecover:%llu EscSerial:%llu\n",
+                (unsigned long long)record.IncidentId,
+                Rx4aNalOutcomeText(record.NalOutcome),
+                (unsigned long long)record.NalCallSequence,
+                (unsigned long)record.NalCallSucceeded,
+                (unsigned long)record.NalError,
+                (unsigned long)record.NalLength,
+                (long)record.RxLength,
+                (unsigned long)record.EventSignaledCount,
+                (unsigned long)record.EventTimeoutCount,
+                (unsigned long)record.EventFailedCount,
+                (unsigned long)record.EventFallbackSleepCount,
+                Rx4aWaitResultText(record.LastEventResult),
+                (unsigned long)record.LastEventError,
+                (unsigned long)record.ResyncAttempted,
+                (unsigned long)record.ResyncDrainCount,
+                (unsigned long)record.ResyncDrainLimitHit,
+                (long)record.LrwWkc,
+                (long)record.ExpectedLrwWkc,
+                (long)record.DcWkc,
+                (unsigned long)record.ProcessDataValid,
+                (unsigned long)record.DcTransportValid,
+                (long long)record.PhaseErrorNs,
+                (long long)record.AppliedPpb,
+                (long long)record.RecommendedPpb,
+                (unsigned long)record.HoldMask,
+                (unsigned long)record.TripMask,
+                (unsigned long long)record.SchedulerRecoveryTotal,
+                (unsigned long long)record.EscPortChangeSerial);
+
+            lastPrintedIncidentId = incidentId;
+        }
+    }
+
+    void PrintRx4aEscPortForensics()
+    {
+        static EtherCatEscPortErrorSnapshot
+            previous[ETHERCAT_RX4A_ESC_MAX_SLAVES] = {};
+        static bool
+            previousValid[ETHERCAT_RX4A_ESC_MAX_SLAVES] = {};
+
+        const uint32_t slaveCount =
+            EtherCatRx4aEscPortSlaveCount();
+
+        for (uint32_t slave = 0u;
+            slave < slaveCount &&
+            slave < ETHERCAT_RX4A_ESC_MAX_SLAVES;
+            ++slave)
+        {
+            EtherCatEscPortErrorSnapshot snapshot{};
+            if (!EtherCatRx4aEscPortRead(
+                static_cast<uint16_t>(slave),
+                &snapshot))
+            {
+                continue;
+            }
+
+            const bool changed =
+                !previousValid[slave] ||
+                previous[slave].ChangeSerial != snapshot.ChangeSerial ||
+                previous[slave].RxGroupResetCount != snapshot.RxGroupResetCount ||
+                previous[slave].EcatProcessingUnitResetCount !=
+                snapshot.EcatProcessingUnitResetCount ||
+                previous[slave].PdiResetCount != snapshot.PdiResetCount ||
+                previous[slave].LostLinkGroupResetCount !=
+                snapshot.LostLinkGroupResetCount;
+
+            if (!changed)
+                continue;
+
+            RtPrintf(
+                "[ECAT-RX4A-ESC-PORT] "
+                "Slave:%lu Addr:0x%04lX | "
+                "Tick:%llu Base Init/RX/PU/PDI/LOST:%llu/%llu/%llu/%llu/%llu | "
+                "ChangeTick:%llu Serial:%llu Samples:%llu | "
+                "Reset RX/PU/PDI/LOST:%llu/%llu/%llu/%llu | "
+                "Policy:READ_ONLY_NO_CLEAR\n",
+                (unsigned long)snapshot.SlavePosition,
+                (unsigned long)snapshot.ConfiguredAddress,
+                (unsigned long long)snapshot.SampleTick,
+                (unsigned long long)snapshot.InitialBaselineTick,
+                (unsigned long long)snapshot.RxBaselineTick,
+                (unsigned long long)snapshot.EcatProcessingUnitBaselineTick,
+                (unsigned long long)snapshot.PdiBaselineTick,
+                (unsigned long long)snapshot.LostLinkBaselineTick,
+                (unsigned long long)snapshot.LastChangeTick,
+                (unsigned long long)snapshot.ChangeSerial,
+                (unsigned long long)snapshot.SampleCount,
+                (unsigned long long)snapshot.RxGroupResetCount,
+                (unsigned long long)snapshot.EcatProcessingUnitResetCount,
+                (unsigned long long)snapshot.PdiResetCount,
+                (unsigned long long)snapshot.LostLinkGroupResetCount);
+
+            RtPrintf(
+                "[ECAT-RX4A-ESC-RAW] "
+                "Slave:%lu | "
+                "IF:%u/%u/%u/%u PHY:%u/%u/%u/%u "
+                "FWD:%u/%u/%u/%u LOST:%u/%u/%u/%u PU:%u PDI:%u | "
+                "Sat IF/PHY/FWD/LOST/MISC:%02lX/%02lX/%02lX/%02lX/%02lX\n",
+                (unsigned long)snapshot.SlavePosition,
+                (unsigned int)snapshot.InvalidFrame[0],
+                (unsigned int)snapshot.InvalidFrame[1],
+                (unsigned int)snapshot.InvalidFrame[2],
+                (unsigned int)snapshot.InvalidFrame[3],
+                (unsigned int)snapshot.PhysicalRxError[0],
+                (unsigned int)snapshot.PhysicalRxError[1],
+                (unsigned int)snapshot.PhysicalRxError[2],
+                (unsigned int)snapshot.PhysicalRxError[3],
+                (unsigned int)snapshot.ForwardedRxError[0],
+                (unsigned int)snapshot.ForwardedRxError[1],
+                (unsigned int)snapshot.ForwardedRxError[2],
+                (unsigned int)snapshot.ForwardedRxError[3],
+                (unsigned int)snapshot.LostLink[0],
+                (unsigned int)snapshot.LostLink[1],
+                (unsigned int)snapshot.LostLink[2],
+                (unsigned int)snapshot.LostLink[3],
+                (unsigned int)snapshot.EcatProcessingUnitError,
+                (unsigned int)snapshot.PdiError,
+                (unsigned long)snapshot.SaturatedInvalidFrameMask,
+                (unsigned long)snapshot.SaturatedPhysicalRxErrorMask,
+                (unsigned long)snapshot.SaturatedForwardedRxErrorMask,
+                (unsigned long)snapshot.SaturatedLostLinkMask,
+                (unsigned long)snapshot.SaturatedMiscMask);
+
+            RtPrintf(
+                "[ECAT-RX4A-ESC-DELTA] "
+                "Slave:%lu | "
+                "IF:%lu/%lu/%lu/%lu PHY:%lu/%lu/%lu/%lu "
+                "FWD:%lu/%lu/%lu/%lu LOST:%lu/%lu/%lu/%lu PU:%lu PDI:%lu\n",
+                (unsigned long)snapshot.SlavePosition,
+                (unsigned long)snapshot.DeltaInvalidFrame[0],
+                (unsigned long)snapshot.DeltaInvalidFrame[1],
+                (unsigned long)snapshot.DeltaInvalidFrame[2],
+                (unsigned long)snapshot.DeltaInvalidFrame[3],
+                (unsigned long)snapshot.DeltaPhysicalRxError[0],
+                (unsigned long)snapshot.DeltaPhysicalRxError[1],
+                (unsigned long)snapshot.DeltaPhysicalRxError[2],
+                (unsigned long)snapshot.DeltaPhysicalRxError[3],
+                (unsigned long)snapshot.DeltaForwardedRxError[0],
+                (unsigned long)snapshot.DeltaForwardedRxError[1],
+                (unsigned long)snapshot.DeltaForwardedRxError[2],
+                (unsigned long)snapshot.DeltaForwardedRxError[3],
+                (unsigned long)snapshot.DeltaLostLink[0],
+                (unsigned long)snapshot.DeltaLostLink[1],
+                (unsigned long)snapshot.DeltaLostLink[2],
+                (unsigned long)snapshot.DeltaLostLink[3],
+                (unsigned long)snapshot.DeltaEcatProcessingUnitError,
+                (unsigned long)snapshot.DeltaPdiError);
+
+            previous[slave] = snapshot;
+            previousValid[slave] = true;
+        }
+    }
+
+    const char* DcRx3bRealFfStateText(LONG state, LONG tripMask)
+    {
+        if (state == 4 &&
+            (tripMask & DC_RX3B_SOFT_RELOCK_MASK) != 0 &&
+            (tripMask & DC_RX3B_HARD_TRIP_MASK) == 0)
+        {
+            return "RELOCK";
+        }
+
+        return
+            state == 2 ? "ACTIVE" :
+            state == 1 ? "ARMING" :
+            state == 3 ? "HOLD" :
+            state == 4 ? "LATCHED" : "WAIT";
+    }
+
     // 純顯示參數，不會改變 RX deadline 或 DC 控制：
     // PrintDcHealthSummary() 每 1000 ms 呼叫一次，因此 300 次代表約五分鐘。
     // 調大：孤立 Timeout 需要更久才由 Recent_Timeout 清除；調小：較快恢復 STABLE，
@@ -190,6 +581,10 @@ namespace
 
             LONG realState = g_qpcRealFfV0State;
             LONG phaseGood = g_qpcRealFfV0PhaseGood;
+            LONG holdMask = g_qpcRealFfV0HoldMask;
+            LONG historyMask = g_qpcRealFfV0HistoryMask;
+            LONG cleanCycles = g_qpcRealFfV0CleanCycles;
+            LONG cleanCyclesRequired = g_qpcRealFfV0CleanCyclesRequired;
             LONG tripMask = g_qpcRealFfV0TripMask;
             LONG phasePState = g_qpcPhasePActV0State;
             LONG phasePGate = g_qpcPhasePActV0GateGood;
@@ -201,6 +596,19 @@ namespace
             LONGLONG totalTimeout = g_ecatRxDiagTotalHardTimeout;
             LONG lrwWkc = g_pdoRtLrwWkc;
             LONG dcWkc = g_pdoRtDcWkc;
+            LONG dcReferencePresent = g_pdoRtDcReferencePresent;
+            LONG processDataValid = g_pdoRtProcessDataValid;
+            LONG dcTransportValid = g_pdoRtDcTransportValid;
+            LONG dcSampleQualified = g_pdoRtDcSampleQualified;
+            LONG dcPhaseJumpGuardActive =
+                g_pdoRtDcPhaseJumpGuardActive;
+            LONG dcPhaseMapAgeGood = g_pdoRtDcPhaseMapAgeGood;
+            LONG processInvalidStreak = g_pdoRtProcessInvalidStreak;
+            LONG dcInvalidStreak = g_pdoRtDcTransportInvalidStreak;
+            LONG dcHoldoverTier = g_pdoRtDcHoldoverTier;
+            LONG dcHoldoverCurrentCycles =
+                g_pdoRtDcHoldoverCurrentCycles;
+            LONG recoveryProfile = g_qpcRealFfV0RecoveryProfile;
             LONG driftState = g_dcDriftCalibrationState;
             LONGLONG driftBaselinePpb = g_dcDriftCalibrationBaselinePpb;
 
@@ -230,10 +638,13 @@ namespace
             }
 
             const char* realStateText =
-                realState == 2 ? "ACTIVE" :
-                realState == 1 ? "ARMING" :
-                realState == 3 ? "HOLD" :
-                realState == 4 ? "LATCHED" : "WAIT";
+                DcRx3bRealFfStateText(realState, tripMask);
+
+            const char* holdoverTierText =
+                DcRx3bHoldoverTierText(dcHoldoverTier);
+
+            const char* recoveryProfileText =
+                DcRx3bRecoveryProfileText(recoveryProfile);
 
             const char* driftStateText =
                 driftState == 2 ? "FIXED" :
@@ -266,28 +677,37 @@ namespace
                 phasePGate != 0 &&
                 phasePOffsetSat == 0 &&
                 nearZero &&
+                holdMask == 0 &&
                 tripMask == 0 &&
-                totalRecover == 0 &&
-                totalSkip == 0 &&
-                totalSoftLate == 0 &&
+                dcHoldoverTier == 0 &&
+                cleanCyclesRequired > 0 &&
+                cleanCycles >= cleanCyclesRequired &&
                 recentTimeout == 0 &&
-                lrwWkc == 13 &&
-                dcWkc == 7;
+                processDataValid != 0 &&
+                (dcReferencePresent == 0 ||
+                    (dcTransportValid != 0 &&
+                        dcSampleQualified != 0 &&
+                        dcPhaseJumpGuardActive == 0 &&
+                        dcPhaseMapAgeGood != 0));
 
             // 一行總結的優先判讀：
-            // 先看 RESULT，再依序看 TripMask、WKC、Recent_Timeout、Recover/Skip，
-            // 最後才看 ActualErr。Total 是歷史證據，單獨不會阻止五分鐘後恢復 STABLE。
+            // HoldMask/TripMask/Clean/WKC/Recent_Timeout 是「目前狀態」；
+            // History、Recover/Skip、SoftLate、Total 是歷史證據，不再永久阻止恢復 STABLE。
             RtPrintf(
                 "[DC-HEALTH-SUMMARY] "
                 "Drift:%s(%+lldppb) + "
                 "%s + PhaseGood:%s + "
                 "ActualErr:%+lldns(NEAR_ZERO:%s) + "
                 "OffsetSat:%s + "
-                "TripMask:0x%02lX + "
+                "HoldMask:0x%02lX TripMask:0x%02lX History:0x%02lX "
+                "Clean:%ld/%ld + "
                 "Recover:%lld/Skip:%lld + "
                 "SoftLate:%lld + "
                 "Timeout Total:%lld Recent_Timeout:%lld "
                 "Quiet:%ld/%lds State:%s + "
+                "Quality:PDO:%s(%ld) DC:%s(%ld) "
+                "Sample:%s PhaseMap:%s JumpGuard:%s + "
+                "Holdover:%s(%ldcy) Recovery:%s + "
                 "WKC:%ld/%ld => RESULT:%s\n",
                 driftStateText,
                 (long long)driftBaselinePpb,
@@ -296,7 +716,11 @@ namespace
                 (long long)actualErrNs,
                 nearZero ? "YES" : "NO",
                 phasePOffsetSat ? "YES" : "NO",
+                (long)holdMask,
                 (long)tripMask,
+                (long)historyMask,
+                (long)cleanCycles,
+                (long)cleanCyclesRequired,
                 (long long)totalRecover,
                 (long long)totalSkip,
                 (long long)totalSoftLate,
@@ -305,6 +729,19 @@ namespace
                 (long)timeoutQuietSeconds,
                 (long)TIMEOUT_RECENT_RESET_SECONDS,
                 timeoutStateText,
+                processDataValid ? "VALID" : "INVALID",
+                (long)processInvalidStreak,
+                (dcReferencePresent == 0 || dcTransportValid)
+                ? "VALID" : "INVALID",
+                (long)dcInvalidStreak,
+                (dcReferencePresent == 0 || dcSampleQualified)
+                ? "QUALIFIED" : "REJECTED",
+                (dcReferencePresent == 0 || dcPhaseMapAgeGood)
+                ? "FRESH" : "STALE",
+                dcPhaseJumpGuardActive ? "QUARANTINE" : "READY",
+                holdoverTierText,
+                (long)dcHoldoverCurrentCycles,
+                recoveryProfileText,
                 (long)lrwWkc,
                 (long)dcWkc,
                 stable ? "STABLE" : "CHECK");
@@ -3156,6 +3593,56 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
         LONG rxDiagHardDeadlineNs =
             g_ecatRxDiagHardDeadlineNs;
 
+        LONG rxDiagWaitMode =
+            g_ecatRxDiagWaitMode;
+
+        LONG rxDiagEventWaitCalls =
+            g_ecatRxDiagEventWaitCalls;
+
+        LONG rxDiagEventSignaled =
+            g_ecatRxDiagEventSignaled;
+
+        LONG rxDiagEventTimeout =
+            g_ecatRxDiagEventTimeout;
+
+        LONG rxDiagEventFailed =
+            g_ecatRxDiagEventFailed;
+
+        LONG rxDiagEventStopped =
+            g_ecatRxDiagEventStopped;
+
+        LONG rxDiagEventFallbackSleep =
+            g_ecatRxDiagEventFallbackSleep;
+
+        LONG rxDiagEventWaitValid =
+            g_ecatRxDiagEventWaitValid;
+
+        LONGLONG rxDiagEventWaitAvgNs =
+            g_ecatRxDiagEventWaitAvgNs;
+
+        LONGLONG rxDiagEventWaitMaxNs =
+            g_ecatRxDiagEventWaitMaxNs;
+
+        LONG rxDiagEventLastError =
+            g_ecatRxDiagEventLastError;
+
+        LONG rx4aNalFrame = g_ecatRx4aNalFrame;
+        LONG rx4aNalNoData = g_ecatRx4aNalNoData;
+        LONG rx4aNalApiError = g_ecatRx4aNalApiError;
+        LONG rx4aNalInvalidLength = g_ecatRx4aNalInvalidLength;
+        LONG rx4aNalUnavailable = g_ecatRx4aNalUnavailable;
+        LONG rx4aNalLastError = g_ecatRx4aNalLastError;
+        LONG rx4aCallOver50us = g_ecatRx4aCallOver50us;
+        LONG rx4aCallOver100us = g_ecatRx4aCallOver100us;
+        LONG rx4aCallOver150us = g_ecatRx4aCallOver150us;
+        LONG rx4aCallOver200us = g_ecatRx4aCallOver200us;
+        LONG rx4aTimeoutNoFrame = g_ecatRx4aTimeoutNoFrame;
+        LONG rx4aTimeoutNalStall = g_ecatRx4aTimeoutNalStall;
+        LONG rx4aTimeoutLateFrame = g_ecatRx4aTimeoutLateFrame;
+        LONG rx4aResyncEvents = g_ecatRx4aResyncEvents;
+        LONG rx4aResyncFrames = g_ecatRx4aResyncFrames;
+        LONG rx4aResyncLimitHit = g_ecatRx4aResyncLimitHit;
+
 
         MemoryBarrier();
 
@@ -3195,7 +3682,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 "TotalHardTimeout:%lld | "
                 "RecoveryAfterTimeout:%ld | "
                 "QpcFail:%ld | "
-                "Sleep:%ld | "
+                "WaitSlice:%ld | "
                 "RxElapsed Avg:%lld Max:%lld ns | "
                 "ElapsedValid:%ld | "
                 "Soft:%ld Hard:%ld ns | "
@@ -3226,13 +3713,13 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
 
             // Stage 訊息只定位 timeout 發生位置，不重複計算事件次數。
             // PreDeadline 高：TX 或 Handler 前段已耗掉 RX 預算。
-            // SleepAtTimeout=2 高：兩次 coarse wait 後仍未收包。
+            // WaitSliceAtTimeout=2 高：兩次 event/sleep wait 後仍未收包。
             // ReceiveCallMax 高：ReceivePacket 本身耗時突增，優先檢查 NIC interrupt。
             RtPrintf(
                 "[ECAT-RX-STAGE-MAIN] "
                 "PreDeadline:%ld | "
                 "PostReceive:%ld | "
-                "SleepAtTimeout 0:%ld 1:%ld 2:%ld | "
+                "WaitSliceAtTimeout 0:%ld 1:%ld 2:%ld | "
                 "Attempts Avg:%ld Max:%ld | "
                 "ReceiveCallMax:%lld ns | "
                 "TimeoutCallMax:%lld ns | "
@@ -3247,6 +3734,61 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 (long)rxDiagTimeoutAttemptMax,
                 (long long)rxDiagReceiveCallMaxNs,
                 (long long)rxDiagTimeoutReceiveCallMaxNs,
+                (long)rxDiagSequenceAfter);
+
+            RtPrintf(
+                "[ECAT-RX-WAIT-MAIN] "
+                "Mode:%s | "
+                "EventWait:%ld | "
+                "Signaled:%ld | "
+                "Timeout:%ld | "
+                "Failed:%ld | "
+                "Stopped:%ld | "
+                "FallbackSleep:%ld | "
+                "Wait Avg:%lld Max:%lld ns | "
+                "WaitValid:%ld | "
+                "LastError:0x%08lX | "
+                "Snap:%ld\n",
+
+                rxDiagWaitMode != 0
+                ? "EVENT-HYBRID"
+                : "SLEEP-FALLBACK",
+                (long)rxDiagEventWaitCalls,
+                (long)rxDiagEventSignaled,
+                (long)rxDiagEventTimeout,
+                (long)rxDiagEventFailed,
+                (long)rxDiagEventStopped,
+                (long)rxDiagEventFallbackSleep,
+                (long long)rxDiagEventWaitAvgNs,
+                (long long)rxDiagEventWaitMaxNs,
+                (long)rxDiagEventWaitValid,
+                (unsigned long)rxDiagEventLastError,
+                (long)rxDiagSequenceAfter);
+
+            RtPrintf(
+                "[ECAT-RX4A-NAL-MAIN] "
+                "Window Frame:%ld NoData:%ld ApiError:%ld InvalidLen:%ld Unavailable:%ld | "
+                "LastError:0x%08lX | "
+                "CallTail >=50/100/150/200us:%ld/%ld/%ld/%ld | "
+                "TimeoutHint NoFrame/NalStall/LateFrame:%ld/%ld/%ld | "
+                "Resync Event/Frame/Limit:%ld/%ld/%ld | "
+                "Policy:FORENSICS_ONLY Snap:%ld\n",
+                (long)rx4aNalFrame,
+                (long)rx4aNalNoData,
+                (long)rx4aNalApiError,
+                (long)rx4aNalInvalidLength,
+                (long)rx4aNalUnavailable,
+                (unsigned long)rx4aNalLastError,
+                (long)rx4aCallOver50us,
+                (long)rx4aCallOver100us,
+                (long)rx4aCallOver150us,
+                (long)rx4aCallOver200us,
+                (long)rx4aTimeoutNoFrame,
+                (long)rx4aTimeoutNalStall,
+                (long)rx4aTimeoutLateFrame,
+                (long)rx4aResyncEvents,
+                (long)rx4aResyncFrames,
+                (long)rx4aResyncLimitHit,
                 (long)rxDiagSequenceAfter);
         }
     }
@@ -3511,6 +4053,321 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
         LONG dcWkc =
             g_pdoRtDcWkc;
 
+        LONG dcReferencePresent =
+            g_pdoRtDcReferencePresent;
+
+        LONG processDataValid =
+            g_pdoRtProcessDataValid;
+
+        LONG dcTransportValid =
+            g_pdoRtDcTransportValid;
+
+        LONG processInvalidStreak =
+            g_pdoRtProcessInvalidStreak;
+
+        LONG dcInvalidStreak =
+            g_pdoRtDcTransportInvalidStreak;
+
+        LONG dcInvalidMaxStreak =
+            g_pdoRtDcTransportInvalidMaxStreak;
+
+        LONGLONG dcWkcInvalidTotal =
+            g_pdoRtDcWkcInvalidTotal;
+
+        LONGLONG dcOnlyInvalidTotal =
+            g_pdoRtDcOnlyInvalidTotal;
+
+        LONGLONG dcTransportRecoveryTotal =
+            g_pdoRtDcTransportRecoveryTotal;
+
+        LONG dcOnlyInvalidStreak =
+            g_pdoRtDcOnlyInvalidStreak;
+
+        LONG dcOnlyInvalidMaxStreak =
+            g_pdoRtDcOnlyInvalidMaxStreak;
+
+        LONG dcHoldoverTier =
+            g_pdoRtDcHoldoverTier;
+
+        LONG dcHoldoverCurrentCycles =
+            g_pdoRtDcHoldoverCurrentCycles;
+
+        LONG dcHoldoverMaxCycles =
+            g_pdoRtDcHoldoverMaxCycles;
+
+        LONG dcGlitchDebt =
+            g_pdoRtDcGlitchDebt;
+
+        LONG dcGlitchDebtMax =
+            g_pdoRtDcGlitchDebtMax;
+
+        LONG dcGlitchDebtLimit =
+            g_pdoRtDcGlitchDebtLimit;
+
+        LONGLONG dcGraceAcceptedCyclesTotal =
+            g_pdoRtDcGraceAcceptedCyclesTotal;
+
+        LONGLONG dcHoldoverEpisodeTotal =
+            g_pdoRtDcHoldoverEpisodeTotal;
+
+        LONGLONG dcHoldoverEntryTotal =
+            g_pdoRtDcHoldoverEntryTotal;
+
+        LONGLONG dcDegradedEntryTotal =
+            g_pdoRtDcDegradedEntryTotal;
+
+        LONGLONG dcRelockEntryTotal =
+            g_pdoRtDcRelockEntryTotal;
+
+        LONG dcSampleGuardState =
+            g_pdoRtDcSampleGuardState;
+
+        LONG dcSampleQualified =
+            g_pdoRtDcSampleQualified;
+
+        LONG dcSampleGuardReasonMask =
+            g_pdoRtDcSampleGuardReasonMask;
+
+        LONG dcSampleRejectStreak =
+            g_pdoRtDcSampleRejectStreak;
+
+        LONG dcSampleRejectMaxStreak =
+            g_pdoRtDcSampleRejectMaxStreak;
+
+        LONGLONG dcSampleApproxAgeNs =
+            g_pdoRtDcSampleApproxAgeNs;
+
+        LONGLONG dcSampleApproxAgeMaxNs =
+            g_pdoRtDcSampleApproxAgeMaxNs;
+
+        LONGLONG dcSampleQpcDeltaNs =
+            g_pdoRtDcSampleQpcDeltaNs;
+
+        LONGLONG dcSampleDcDeltaNs =
+            g_pdoRtDcSampleDcDeltaNs;
+
+        LONGLONG dcSampleDeltaErrorNs =
+            g_pdoRtDcSampleDeltaErrorNs;
+
+        LONGLONG dcSampleDeltaToleranceNs =
+            g_pdoRtDcSampleDeltaToleranceNs;
+
+        LONGLONG dcSampleAcceptedTotal =
+            g_pdoRtDcSampleAcceptedTotal;
+
+        LONGLONG dcSampleRejectedTotal =
+            g_pdoRtDcSampleRejectedTotal;
+
+        LONGLONG dcSampleAnchorTotal =
+            g_pdoRtDcSampleAnchorTotal;
+
+        LONGLONG dcSampleReanchorTotal =
+            g_pdoRtDcSampleReanchorTotal;
+
+        LONGLONG dcSampleAgeRejectTotal =
+            g_pdoRtDcSampleAgeRejectTotal;
+
+        LONGLONG dcSampleOrderRejectTotal =
+            g_pdoRtDcSampleOrderRejectTotal;
+
+        LONGLONG dcSampleDeltaRejectTotal =
+            g_pdoRtDcSampleDeltaRejectTotal;
+
+        LONG dcPhaseJumpGuardActive =
+            g_pdoRtDcPhaseJumpGuardActive;
+
+        LONG dcPhaseJumpGuardGoodWindows =
+            g_pdoRtDcPhaseJumpGuardGoodWindows;
+
+        LONG dcPhaseJumpGuardRequiredWindows =
+            g_pdoRtDcPhaseJumpGuardRequiredWindows;
+
+        LONGLONG dcPhaseJumpLastNs =
+            g_pdoRtDcPhaseJumpLastNs;
+
+        LONGLONG dcPhaseJumpMaxAbsNs =
+            g_pdoRtDcPhaseJumpMaxAbsNs;
+
+        LONGLONG dcPhaseJumpArmTotal =
+            g_pdoRtDcPhaseJumpArmTotal;
+
+        LONGLONG dcPhaseJumpPassTotal =
+            g_pdoRtDcPhaseJumpPassTotal;
+
+        LONGLONG dcPhaseJumpRejectTotal =
+            g_pdoRtDcPhaseJumpRejectTotal;
+
+        LONG dcPhaseMapSequence =
+            g_pdoRtDcPhaseMapSequence;
+
+        LONG dcPhaseMapNew =
+            g_pdoRtDcPhaseMapNew;
+
+        LONG dcPhaseMapAgeGood =
+            g_pdoRtDcPhaseMapAgeGood;
+
+        LONGLONG dcPhaseMapAgeNs =
+            g_pdoRtDcPhaseMapAgeNs;
+
+        LONGLONG dcPhaseMapStaleTotal =
+            g_pdoRtDcPhaseMapStaleTotal;
+
+        LONG dcTimingSource =
+            g_pdoRtDcTimingSource;
+
+        LONG dcExactTimingLocked =
+            g_pdoRtDcExactTimingLocked;
+
+        LONG dcExactTimingValid =
+            g_pdoRtDcExactTimingValid;
+
+        LONGLONG dcTimingSelectedRttNs =
+            g_pdoRtDcTimingSelectedRttNs;
+
+        LONGLONG dcTimingExactRttNs =
+            g_pdoRtDcTimingExactRttNs;
+
+        LONGLONG dcTimingExactRttMaxNs =
+            g_pdoRtDcTimingExactRttMaxNs;
+
+        LONGLONG dcTimingCallRttNs =
+            g_pdoRtDcTimingCallRttNs;
+
+        LONGLONG dcTimingExcludedOverheadNs =
+            g_pdoRtDcTimingExcludedOverheadNs;
+
+        LONGLONG dcTimingMidpointShiftNs =
+            g_pdoRtDcTimingMidpointShiftNs;
+
+        LONGLONG dcTimingMidpointShiftMaxAbsNs =
+            g_pdoRtDcTimingMidpointShiftMaxAbsNs;
+
+        LONGLONG dcTimingExactUseTotal =
+            g_pdoRtDcTimingExactUseTotal;
+
+        LONGLONG dcTimingFallbackUseTotal =
+            g_pdoRtDcTimingFallbackUseTotal;
+
+        LONGLONG dcTimingMissingAfterLockTotal =
+            g_pdoRtDcTimingMissingAfterLockTotal;
+
+        LONGLONG dcTimingSourceSwitchTotal =
+            g_pdoRtDcTimingSourceSwitchTotal;
+
+        LONGLONG dcTimingRejectTotal =
+            g_pdoRtDcTimingRejectTotal;
+
+        LONG dcRttGuardState =
+            g_pdoRtDcRttGuardState;
+
+        LONG dcRttGuardAccepted =
+            g_pdoRtDcRttGuardAccepted;
+
+        LONG dcRttGuardWarmupSamples =
+            g_pdoRtDcRttGuardWarmupSamples;
+
+        LONG dcRttGuardWarmupRequired =
+            g_pdoRtDcRttGuardWarmupRequired;
+
+        LONGLONG dcRttGuardCurrentNs =
+            g_pdoRtDcRttGuardCurrentNs;
+
+        LONGLONG dcRttGuardBaselineNs =
+            g_pdoRtDcRttGuardBaselineNs;
+
+        LONGLONG dcRttGuardDeviationNs =
+            g_pdoRtDcRttGuardDeviationNs;
+
+        LONGLONG dcRttGuardLimitNs =
+            g_pdoRtDcRttGuardLimitNs;
+
+        LONGLONG dcRttGuardExcessNs =
+            g_pdoRtDcRttGuardExcessNs;
+
+        LONG dcRttGuardOutlierStreak =
+            g_pdoRtDcRttGuardOutlierStreak;
+
+        LONG dcRttGuardOutlierMaxStreak =
+            g_pdoRtDcRttGuardOutlierMaxStreak;
+
+        LONG dcRttGuardRebaseCandidateSamples =
+            g_pdoRtDcRttGuardRebaseCandidateSamples;
+
+        LONGLONG dcRttGuardAcceptedTotal =
+            g_pdoRtDcRttGuardAcceptedTotal;
+
+        LONGLONG dcRttGuardRejectedTotal =
+            g_pdoRtDcRttGuardRejectedTotal;
+
+        LONGLONG dcRttGuardRebaseTotal =
+            g_pdoRtDcRttGuardRebaseTotal;
+
+        LONGLONG dcSampleRttRejectTotal =
+            g_pdoRtDcSampleRttRejectTotal;
+
+        LONG dcFaultState =
+            g_pdoRtDcFaultState;
+
+        LONG dcFaultScenario =
+            g_pdoRtDcFaultScenario;
+
+        LONG dcFaultConfiguredCycles =
+            g_pdoRtDcFaultConfiguredCycles;
+
+        LONG dcFaultAppliedCycles =
+            g_pdoRtDcFaultAppliedCycles;
+
+        LONG dcFaultStartDelayRemaining =
+            g_pdoRtDcFaultStartDelayRemaining;
+
+        LONG dcFaultRecoveryCycles =
+            g_pdoRtDcFaultRecoveryCycles;
+
+        LONG dcFaultTargetWaitCycles =
+            g_pdoRtDcFaultTargetWaitCycles;
+
+        LONG dcFaultActiveThisCycle =
+            g_pdoRtDcFaultActiveThisCycle;
+
+        LONG dcFaultGateBlockMask =
+            g_pdoRtDcFaultGateBlockMask;
+
+        LONG dcFaultEvidenceMask =
+            g_pdoRtDcFaultEvidenceMask;
+
+        LONG dcFaultFailureMask =
+            g_pdoRtDcFaultFailureMask;
+
+        LONG dcFaultRequireServoOff =
+            g_pdoRtDcFaultRequireServoOff;
+
+        LONG dcFaultAllowSafetyStop =
+            g_pdoRtDcFaultAllowSafetyStop;
+
+        LONGLONG dcFaultValueNs =
+            g_pdoRtDcFaultValueNs;
+
+        LONGLONG dcFaultBaselineAppliedPpb =
+            g_pdoRtDcFaultBaselineAppliedPpb;
+
+        LONGLONG dcFaultCurrentAppliedPpb =
+            g_pdoRtDcFaultCurrentAppliedPpb;
+
+        LONGLONG dcFaultMaxAppliedDeltaPpb =
+            g_pdoRtDcFaultMaxAppliedDeltaPpb;
+
+        LONG dcFaultMaxPdoInvalidStreak =
+            g_pdoRtDcFaultMaxPdoInvalidStreak;
+
+        LONGLONG dcFaultStartTick =
+            g_pdoRtDcFaultStartTick;
+
+        LONGLONG dcFaultLastAppliedTick =
+            g_pdoRtDcFaultLastAppliedTick;
+
+        LONGLONG dcFaultEndTick =
+            g_pdoRtDcFaultEndTick;
+
 
         // -----------------------------------------------------
         // 確保上面所有讀取完成後，
@@ -3616,6 +4473,211 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
 
                 (long)
                 sequenceAfter);
+
+            const bool dcOnlyHoldover =
+                dcReferencePresent != 0 &&
+                processDataValid != 0 &&
+                dcTransportValid == 0;
+
+            RtPrintf(
+                "[DC-RX3A-QUALITY-MAIN] "
+                "ProcessData:%s Streak:%ld | "
+                "DCRef:%s DCTransport:%s Streak:%ld Max:%ld "
+                "DCOnlyHoldover:%s | "
+                "DcWkcBad:%lld DcOnly:%lld Recover:%lld | "
+                "Policy:PDO_LRW_ONLY/DC_HOLDOVER\n",
+                processDataValid ? "VALID" : "INVALID",
+                (long)processInvalidStreak,
+                dcReferencePresent ? "YES" : "NO",
+                (dcReferencePresent == 0 || dcTransportValid)
+                ? "VALID" : "INVALID",
+                (long)dcInvalidStreak,
+                (long)dcInvalidMaxStreak,
+                dcOnlyHoldover ? "YES" : "NO",
+                (long long)dcWkcInvalidTotal,
+                (long long)dcOnlyInvalidTotal,
+                (long long)dcTransportRecoveryTotal);
+
+            const char* dcHoldoverTierText =
+                DcRx3bHoldoverTierText(dcHoldoverTier);
+
+            const LONG dcHoldoverCurrentUs =
+                dcHoldoverCurrentCycles > 0x7FFFFFFF / 250
+                ? 0x7FFFFFFF
+                : dcHoldoverCurrentCycles * 250;
+
+            const LONG dcHoldoverMaxUs =
+                dcHoldoverMaxCycles > 0x7FFFFFFF / 250
+                ? 0x7FFFFFFF
+                : dcHoldoverMaxCycles * 250;
+
+            RtPrintf(
+                "[DC-RX3B-HOLDOVER-MAIN] "
+                "Tier:%s Current:%ldcy/%ldus Max:%ldcy/%ldus | "
+                "DcOnlyStreak:%ld MaxStreak:%ld "
+                "Debt:%ld/%ld MaxDebt:%ld | "
+                "GraceCycles:%lld Episodes:%lld Hold:%lld "
+                "Degraded:%lld Relock:%lld | "
+                "Grace<=4cy Degraded@400cy Relock@4000cy | "
+                "PDO:UNCHANGED\n",
+                dcHoldoverTierText,
+                (long)dcHoldoverCurrentCycles,
+                (long)dcHoldoverCurrentUs,
+                (long)dcHoldoverMaxCycles,
+                (long)dcHoldoverMaxUs,
+                (long)dcOnlyInvalidStreak,
+                (long)dcOnlyInvalidMaxStreak,
+                (long)dcGlitchDebt,
+                (long)dcGlitchDebtLimit,
+                (long)dcGlitchDebtMax,
+                (long long)dcGraceAcceptedCyclesTotal,
+                (long long)dcHoldoverEpisodeTotal,
+                (long long)dcHoldoverEntryTotal,
+                (long long)dcDegradedEntryTotal,
+                (long long)dcRelockEntryTotal);
+
+            const char* dcSampleGuardStateText =
+                DcRx3cSampleGuardStateText(dcSampleGuardState);
+
+            RtPrintf(
+                "[DC-RX3C-SAMPLE-GUARD-MAIN] "
+                "State:%s Qualified:%s Reason:0x%02lX "
+                "Reject:%ld Max:%ld | "
+                "Age:%lld MaxAge:%lld ns | "
+                "Delta QPC:%lld DC:%lld Err:%lld Tol:%lld ns | "
+                "Accept:%lld RejectTotal:%lld Anchor:%lld Reanchor:%lld "
+                "AgeBad:%lld OrderBad:%lld DeltaBad:%lld TimingBad:%lld "
+                "RttBad:%lld | MaxTxn:300000ns\n",
+                dcSampleGuardStateText,
+                dcSampleQualified ? "YES" : "NO",
+                (unsigned long)dcSampleGuardReasonMask,
+                (long)dcSampleRejectStreak,
+                (long)dcSampleRejectMaxStreak,
+                (long long)dcSampleApproxAgeNs,
+                (long long)dcSampleApproxAgeMaxNs,
+                (long long)dcSampleQpcDeltaNs,
+                (long long)dcSampleDcDeltaNs,
+                (long long)dcSampleDeltaErrorNs,
+                (long long)dcSampleDeltaToleranceNs,
+                (long long)dcSampleAcceptedTotal,
+                (long long)dcSampleRejectedTotal,
+                (long long)dcSampleAnchorTotal,
+                (long long)dcSampleReanchorTotal,
+                (long long)dcSampleAgeRejectTotal,
+                (long long)dcSampleOrderRejectTotal,
+                (long long)dcSampleDeltaRejectTotal,
+                (long long)dcTimingRejectTotal,
+                (long long)dcSampleRttRejectTotal);
+
+            const char* dcTimingSourceText =
+                DcRx3dTimingSourceText(dcTimingSource);
+
+            RtPrintf(
+                "[DC-RX3D-TIMING-ANCHOR-MAIN] "
+                "Source:%s Exact:%s Locked:%s | "
+                "RTT Selected:%lld Exact:%lld Max:%lld Call:%lld ns | "
+                "Excluded:%lld ns MidShift:%lld MaxAbs:%lld ns | "
+                "Use Exact:%lld Fallback:%lld Missing:%lld "
+                "Switch:%lld TimingReject:%lld | "
+                "Policy:EXACT_LOCKED_NO_FLAP PDO:UNCHANGED\n",
+                dcTimingSourceText,
+                dcExactTimingValid ? "YES" : "NO",
+                dcExactTimingLocked ? "YES" : "NO",
+                (long long)dcTimingSelectedRttNs,
+                (long long)dcTimingExactRttNs,
+                (long long)dcTimingExactRttMaxNs,
+                (long long)dcTimingCallRttNs,
+                (long long)dcTimingExcludedOverheadNs,
+                (long long)dcTimingMidpointShiftNs,
+                (long long)dcTimingMidpointShiftMaxAbsNs,
+                (long long)dcTimingExactUseTotal,
+                (long long)dcTimingFallbackUseTotal,
+                (long long)dcTimingMissingAfterLockTotal,
+                (long long)dcTimingSourceSwitchTotal,
+                (long long)dcTimingRejectTotal);
+
+            const char* dcRttGuardStateText =
+                DcRx3eRttGuardStateText(dcRttGuardState);
+
+            RtPrintf(
+                "[DC-RX3E-RTT-GUARD-MAIN] "
+                "State:%s Accepted:%s | "
+                "RTT:%lld Base:%lld Dev:%lld Limit:%lld Excess:%lld ns | "
+                "Warmup:%ld/%ld Outlier:%ld Max:%ld Shift:%ld/64 | "
+                "Accept:%lld Reject:%lld Rebase:%lld | "
+                "Envelope:Base+max(50us,3xDev+10us),cap200us "
+                "PDO:UNCHANGED\n",
+                dcRttGuardStateText,
+                dcRttGuardAccepted ? "YES" : "NO",
+                (long long)dcRttGuardCurrentNs,
+                (long long)dcRttGuardBaselineNs,
+                (long long)dcRttGuardDeviationNs,
+                (long long)dcRttGuardLimitNs,
+                (long long)dcRttGuardExcessNs,
+                (long)dcRttGuardWarmupSamples,
+                (long)dcRttGuardWarmupRequired,
+                (long)dcRttGuardOutlierStreak,
+                (long)dcRttGuardOutlierMaxStreak,
+                (long)dcRttGuardRebaseCandidateSamples,
+                (long long)dcRttGuardAcceptedTotal,
+                (long long)dcRttGuardRejectedTotal,
+                (long long)dcRttGuardRebaseTotal);
+
+            if (dcFaultScenario != 0)
+            {
+                RtPrintf(
+                    "[DC-RX3F-FAULT-INJECTION-MAIN] "
+                    "*** TEST-ONLY *** Scenario:%s State:%s | "
+                    "Applied:%ld/%ld Active:%s Delay:%ldcy "
+                    "TargetWait:%ldcy Recovery:%ldcy | "
+                    "Gate:0x%04lX Evidence:0x%04lX Failure:0x%04lX | "
+                    "FF Base:%+lld Current:%+lld MaxDelta:%lld ppb | "
+                    "PdoInvalidMax:%ld Value:%lldns ServoOffRequired:%s "
+                    "AllowAL1003:%s | "
+                    "Tick Start:%lld Last:%lld End:%lld | "
+                    "RunOnce:YES ProductionDefault:OFF\n",
+                    DcRx3fScenarioText(dcFaultScenario),
+                    DcRx3fStateText(dcFaultState),
+                    (long)dcFaultAppliedCycles,
+                    (long)dcFaultConfiguredCycles,
+                    dcFaultActiveThisCycle ? "YES" : "NO",
+                    (long)dcFaultStartDelayRemaining,
+                    (long)dcFaultTargetWaitCycles,
+                    (long)dcFaultRecoveryCycles,
+                    (unsigned long)dcFaultGateBlockMask,
+                    (unsigned long)dcFaultEvidenceMask,
+                    (unsigned long)dcFaultFailureMask,
+                    (long long)dcFaultBaselineAppliedPpb,
+                    (long long)dcFaultCurrentAppliedPpb,
+                    (long long)dcFaultMaxAppliedDeltaPpb,
+                    (long)dcFaultMaxPdoInvalidStreak,
+                    (long long)dcFaultValueNs,
+                    dcFaultRequireServoOff ? "YES" : "NO",
+                    dcFaultAllowSafetyStop ? "YES" : "NO",
+                    (long long)dcFaultStartTick,
+                    (long long)dcFaultLastAppliedTick,
+                    (long long)dcFaultEndTick);
+            }
+
+            RtPrintf(
+                "[DC-RX3C-PHASE-GUARD-MAIN] "
+                "MapSeq:%ld New:%s Age:%lldns Fresh:%s Stale:%lld | "
+                "Guard:%s Good:%ld/%ld Jump:%lld MaxAbs:%lld ns | "
+                "Arm:%lld Pass:%lld Reject:%lld | "
+                "AgeLimit:1500000000ns JumpLimit:50000ns PDO:UNCHANGED\n",
+                (long)dcPhaseMapSequence,
+                dcPhaseMapNew ? "YES" : "NO",
+                (long long)dcPhaseMapAgeNs,
+                dcPhaseMapAgeGood ? "YES" : "NO",
+                (long long)dcPhaseMapStaleTotal,
+                dcPhaseJumpGuardActive ? "QUARANTINE" : "READY",
+                (long)dcPhaseJumpGuardGoodWindows,
+                (long)dcPhaseJumpGuardRequiredWindows,
+                (long long)dcPhaseJumpLastNs,
+                (long long)dcPhaseJumpMaxAbsNs,
+                (long long)dcPhaseJumpArmTotal,
+                (long long)dcPhaseJumpPassTotal,
+                (long long)dcPhaseJumpRejectTotal);
 
 
         }
@@ -3871,6 +4933,10 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
         LONG st = g_qpcRealFfV0State;
         LONG good = g_qpcRealFfV0PhaseGood;
         LONG arm = g_qpcRealFfV0ArmGood;
+        LONG holdMask = g_qpcRealFfV0HoldMask;
+        LONG historyMask = g_qpcRealFfV0HistoryMask;
+        LONG cleanCycles = g_qpcRealFfV0CleanCycles;
+        LONG cleanCyclesRequired = g_qpcRealFfV0CleanCyclesRequired;
         LONG trip = g_qpcRealFfV0TripMask;
         LONG trips = g_qpcRealFfV0TripCount;
         LONGLONG rec = g_qpcRealFfV0RecommendedPpb;
@@ -3886,6 +4952,9 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
         LONG holdBad = g_qpcRealFfV0HoldBad;
         LONG holdEntries = g_qpcRealFfV0HoldEntries;
         LONG clampActive = g_qpcRealFfV0ClampActive;
+        LONG recoveryProfile = g_qpcRealFfV0RecoveryProfile;
+        LONG holdRecoveryWindowsRequired =
+            g_qpcRealFfV0HoldRecoveryWindowsRequired;
         MemoryBarrier();
         LONG rf2 = g_qpcRealFfV0Seq;
 
@@ -3893,22 +4962,27 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
         {
             lastRealFfV0Seq = rf2;
             const char* stateText =
-                st == 2 ? "ACTIVE" :
-                st == 1 ? "ARMING" :
-                st == 3 ? "HOLD" :
-                st == 4 ? "LATCHED" : "WAIT";
+                DcRx3bRealFfStateText(st, trip);
 
-            // 正式 Real FF 判讀：ACTIVE + PhaseGood:YES + Reject:0 + TripMask:0。
+            const char* recoveryProfileText =
+                DcRx3bRecoveryProfileText(recoveryProfile);
+
+            // 正式 Real FF 判讀：ACTIVE + PhaseGood:YES + Reject:0 + HoldMask/TripMask:0 + Clean qualified。
             // Rec 是 observer 建議；Desired 是限幅後目標；Applied 才是真正排程使用值；
             // Step 是本觀測窗實際變化。ClampActive:YES 時不要直接放寬上下限。
             // Reject 0x80 只表示啟動 Drift 尚未 LOCKED，WARMUP 期間屬正常。
+            // Reject 0x100 表示 transient 後等待新的 V1A publication，屬恢復流程；
+            // HoldMask 0x20 是 DC WKC invalid；HoldMask 0x80 是 DC sample freshness
+            // invalid。兩者都不會把有效的 LRW PDO／Motion 一起停止。
             RtPrintf(
                 "[QPC-REAL-FF-V0C-MAIN] "
                 "State:%s PhaseGood:%s Arm:%ld/3 | "
                 "Rec:%+lld Desired:%+lld Applied:%+lld Step:%+lld ppb "
                 "ClampActive:%s | "
                 "Reject:0x%02lX LastReject:0x%02lX "
-                "HoldGood:%ld/3 HoldBad:%ld/5 HoldEntries:%ld | "
+                "HoldGood:%ld/%ld HoldBad:%ld/5 HoldEntries:%ld | "
+                "HoldMask:0x%02lX History:0x%02lX Clean:%ld/%ld "
+                "Recovery:%s | "
                 "TargetVsFixed:%+lld ns RealDcEst:%+lld ns | "
                 "TripMask:0x%02lX Trips:%ld PhaseSeq:%ld | "
                 "Control:ON Snap:%ld\n",
@@ -3917,7 +4991,11 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
                 (long long)app, (long long)step,
                 clampActive ? "YES" : "NO",
                 (long)reject, (long)lastReject,
-                (long)holdGood, (long)holdBad, (long)holdEntries,
+                (long)holdGood, (long)holdRecoveryWindowsRequired,
+                (long)holdBad, (long)holdEntries,
+                (long)holdMask, (long)historyMask,
+                (long)cleanCycles, (long)cleanCyclesRequired,
+                recoveryProfileText,
                 (long long)delta, (long long)dcEst,
                 (long)trip, (long)trips, (long)pseq, (long)rf2);
         }
@@ -4762,5 +5840,7 @@ void EtherCatMaster::PrintDcRuntimeDiagnostics()
         }
     }
 
+    PrintRx4aIncidentForensics();
+    PrintRx4aEscPortForensics();
     PrintDcHealthSummary();
 }

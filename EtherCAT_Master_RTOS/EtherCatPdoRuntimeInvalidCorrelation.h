@@ -8,9 +8,11 @@
 // NC-0.2K.7.2.1 - PDO Runtime Invalid Source Correlation Diagnostic
 //
 // This contract is diagnostic only.  The Priority-64 EtherCAT PDO owner feeds
-// the tracker with values it has already computed for the existing
-// pdoCycleValid decision.  No value in this record is consumed by Motion,
-// RESET, Registry, read-ahead, EtherCAT output, or any admission gate.
+// the tracker with values it has already computed for the LRW Process Data
+// validity decision. DC WKC is retained as a correlated diagnostic, but a
+// DC-only miss is not a Process Data invalid cycle after DC-RX.3A. No value in
+// this record is consumed by Motion, RESET, Registry, read-ahead, EtherCAT
+// output, or any admission gate.
 // =============================================================================
 
 enum class EtherCatPdoRuntimeInvalidEventKind : std::uint8_t
@@ -103,7 +105,7 @@ class EtherCatPdoRuntimeInvalidCorrelationTracker
 public:
     bool Observe(
         std::uint64_t runtimeCycleTick,
-        bool pdoCycleValid,
+        bool processDataValid,
         std::int32_t actualLrwWkc,
         std::int32_t expectedLrwWkc,
         std::int32_t dcWkc,
@@ -126,9 +128,9 @@ public:
         const bool dcWkcInvalid =
             dcReferenceRequired && dcWkc <= 0;
         const bool lrwInvalid = lrwCallNegative || lrwWkcMismatch;
-        const bool derivedCycleValid = !lrwInvalid && !dcWkcInvalid;
+        const bool derivedProcessDataValid = !lrwInvalid;
         const bool validityContractMismatch =
-            derivedCycleValid != pdoCycleValid;
+            derivedProcessDataValid != processDataValid;
         const bool contractMismatchWasOpen =
             m_consecutiveContractMismatchCycles != 0U;
         const std::uint32_t previousContractMismatchReasonMask =
@@ -156,11 +158,19 @@ public:
                 ECAT_PDO_INVALID_REASON_VALIDITY_CONTRACT_MISMATCH;
         }
 
+        // DC WKC is counted independently from Process Data invalidity.
+        // This preserves the physical/DC evidence while avoiding a false PDO
+        // invalid episode when LRW itself is coherent.
+        if (dcWkcInvalid)
+        {
+            IncrementSaturating(m_snapshot.dcWkcInvalidCount);
+        }
+
         bool publishEvent = false;
         EtherCatPdoRuntimeInvalidEventKind eventKind =
             EtherCatPdoRuntimeInvalidEventKind::NONE;
 
-        if (!pdoCycleValid)
+        if (!processDataValid)
         {
             const bool invalidEpisodeStart =
                 m_consecutiveInvalidCycles == 0U;
@@ -186,10 +196,6 @@ public:
             if (lrwWkcMismatch)
             {
                 IncrementSaturating(m_snapshot.lrwWkcMismatchCount);
-            }
-            if (dcWkcInvalid)
-            {
-                IncrementSaturating(m_snapshot.dcWkcInvalidCount);
             }
             if (lrwInvalid && dcWkcInvalid)
             {
@@ -293,7 +299,7 @@ public:
 
         m_observed = true;
         m_previousRuntimeCycleTick = runtimeCycleTick;
-        m_previousCycleValid = pdoCycleValid;
+        m_previousCycleValid = processDataValid;
 
         if (!publishEvent)
         {
@@ -310,7 +316,7 @@ public:
         m_snapshot.currentConsecutiveInvalidCycles =
             m_consecutiveInvalidCycles;
         m_snapshot.lastEventKind = eventKind;
-        m_snapshot.lastEventCycleValid = pdoCycleValid;
+        m_snapshot.lastEventCycleValid = processDataValid;
         m_snapshot.dcReferenceRequired = dcReferenceRequired;
         m_snapshot.lastEventActualLrwWkc = actualLrwWkc;
         m_snapshot.lastEventExpectedLrwWkc = expectedLrwWkc;

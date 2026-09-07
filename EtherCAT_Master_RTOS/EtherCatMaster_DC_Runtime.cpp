@@ -19608,214 +19608,71 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
 
                             // =========================================================
-                            // PDO Handler 總執行時間診斷
+                            // PDO Handler full-callback execution-time accumulator.
                             //
-                            // Handler Start:
-                            //
-                            //     pdoCycleStartMasterNs
-                            //
-                            // Handler End:
-                            //
-                            //     現在
-                            //
+                            // The end timestamp is captured at the absolute callback
+                            // tail, after the diagnostic snapshot publisher. This keeps
+                            // its once-per-window cost inside ExecMaxNs and the
+                            // Over250 / Over300 / Over400 deadline counters.
                             // =========================================================
 
-                            uint64_t pdoHandlerEndNs =
-                                pMaster->
-                                GetCurrentMasterTimeNs();
+                            static uint64_t execSumNs =
+                                0;
 
 
-                            if (pdoHandlerEndNs >=
-                                pdoCycleStartMasterNs)
+                            static uint64_t execMinNs =
+                                0;
+
+
+                            static uint64_t execMaxNs =
+                                0;
+
+
+                            static uint32_t execSamples =
+                                0;
+
+
+                            static uint32_t execOver250Count =
+                                0;
+
+
+                            static uint32_t execOver300Count =
+                                0;
+
+
+                            static uint32_t execOver400Count =
+                                0;
+
+
+                            // =====================================================
+                            // Latest finished PDO Execution window
+                            // =====================================================
+
+                            static uint64_t latestExecAvgNs =
+                                0;
+
+                            static uint64_t latestExecMinNs =
+                                0;
+
+                            static uint64_t latestExecMaxNs =
+                                0;
+
+                            static uint32_t latestExecOver250Count =
+                                0;
+
+                            static uint32_t latestExecOver300Count =
+                                0;
+
+                            static uint32_t latestExecOver400Count =
+                                0;
+
+                            static bool latestExecValid =
+                                false;
+
+
+                            // Keep the large snapshot publisher ahead of the end
+                            // timestamp while limiting its local scope explicitly.
                             {
-                                uint64_t executionNs =
-                                    pdoHandlerEndNs -
-                                    pdoCycleStartMasterNs;
-
-
-                                static uint64_t execSumNs =
-                                    0;
-
-
-                                static uint64_t execMinNs =
-                                    0;
-
-
-                                static uint64_t execMaxNs =
-                                    0;
-
-
-                                static uint32_t execSamples =
-                                    0;
-
-
-                                static uint32_t execOver250Count =
-                                    0;
-
-
-                                static uint32_t execOver300Count =
-                                    0;
-
-
-                                static uint32_t execOver400Count =
-                                    0;
-
-
-                                // =====================================================
-                                // Latest finished PDO Execution window
-                                // =====================================================
-
-                                static uint64_t latestExecAvgNs =
-                                    0;
-
-                                static uint64_t latestExecMinNs =
-                                    0;
-
-                                static uint64_t latestExecMaxNs =
-                                    0;
-
-                                static uint32_t latestExecOver250Count =
-                                    0;
-
-                                static uint32_t latestExecOver300Count =
-                                    0;
-
-                                static uint32_t latestExecOver400Count =
-                                    0;
-
-                                static bool latestExecValid =
-                                    false;
-
-
-                                // =====================================================
-                                // Initialize Min / Max
-                                // =====================================================
-
-                                if (execSamples == 0)
-                                {
-                                    execMinNs =
-                                        executionNs;
-
-
-                                    execMaxNs =
-                                        executionNs;
-                                }
-
-
-                                if (executionNs <
-                                    execMinNs)
-                                {
-                                    execMinNs =
-                                        executionNs;
-                                }
-
-
-                                if (executionNs >
-                                    execMaxNs)
-                                {
-                                    execMaxNs =
-                                        executionNs;
-                                }
-
-
-                                execSumNs +=
-                                    executionNs;
-
-
-                                execSamples++;
-
-
-                                // =====================================================
-                                // Deadline 統計：分別計算超過 250/300/400 us 的週期數。
-                                // =====================================================
-
-                                if (executionNs >
-                                    250000ULL)
-                                {
-                                    execOver250Count++;
-                                }
-
-
-                                if (executionNs >
-                                    300000ULL)
-                                {
-                                    execOver300Count++;
-                                }
-
-
-                                if (executionNs >
-                                    400000ULL)
-                                {
-                                    execOver400Count++;
-                                }
-
-
-                                // =====================================================
-                                // 每 4000 cycle 完成一個約一秒的 Exec 視窗；此處只保存數值。
-                                // =====================================================
-
-                                if (execSamples >=
-                                    4000U)
-                                {
-                                    uint64_t execAvgNs =
-                                        execSumNs /
-                                        (uint64_t)
-                                        execSamples;
-
-
-                                    // =====================================================
-                                    // Save completed EXEC window
-                                    // =====================================================
-
-                                    latestExecAvgNs =
-                                        execAvgNs;
-
-                                    latestExecMinNs =
-                                        execMinNs;
-
-                                    latestExecMaxNs =
-                                        execMaxNs;
-
-                                    latestExecOver250Count =
-                                        execOver250Count;
-
-                                    latestExecOver300Count =
-                                        execOver300Count;
-
-                                    latestExecOver400Count =
-                                        execOver400Count;
-
-                                    latestExecValid =
-                                        true;
-
-
-                                    // =====================================================
-                                    // Reset EXEC Window
-                                    // =====================================================
-
-                                    execSumNs =
-                                        0;
-
-                                    execMinNs =
-                                        0;
-
-                                    execMaxNs =
-                                        0;
-
-                                    execSamples =
-                                        0;
-
-                                    execOver250Count =
-                                        0;
-
-                                    execOver300Count =
-                                        0;
-
-                                    execOver400Count =
-                                        0;
-                                }
-
-
                                 // =========================================================
                                 // PDO RT 診斷快照發布器
                                 //
@@ -20333,6 +20190,156 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
                                     latestExecValid =
                                         false;
+                                }
+                            }
+                            // =========================================================
+                            // Full callback execution time
+                            //
+                            // Only this small accounting tail is necessarily excluded.
+                            // The diagnostic publisher above is now measured.
+                            // =========================================================
+
+                            uint64_t pdoHandlerEndNs =
+                                pMaster->
+                                GetCurrentMasterTimeNs();
+
+
+                            if (pdoHandlerEndNs >=
+                                pdoCycleStartMasterNs)
+                            {
+                                uint64_t executionNs =
+                                    pdoHandlerEndNs -
+                                    pdoCycleStartMasterNs;
+
+
+
+
+                                // =====================================================
+                                // Initialize Min / Max
+                                // =====================================================
+
+                                if (execSamples == 0)
+                                {
+                                    execMinNs =
+                                        executionNs;
+
+
+                                    execMaxNs =
+                                        executionNs;
+                                }
+
+
+                                if (executionNs <
+                                    execMinNs)
+                                {
+                                    execMinNs =
+                                        executionNs;
+                                }
+
+
+                                if (executionNs >
+                                    execMaxNs)
+                                {
+                                    execMaxNs =
+                                        executionNs;
+                                }
+
+
+                                execSumNs +=
+                                    executionNs;
+
+
+                                execSamples++;
+
+
+                                // =====================================================
+                                // Deadline 統計：分別計算超過 250/300/400 us 的週期數。
+                                // =====================================================
+
+                                if (executionNs >
+                                    250000ULL)
+                                {
+                                    execOver250Count++;
+                                }
+
+
+                                if (executionNs >
+                                    300000ULL)
+                                {
+                                    execOver300Count++;
+                                }
+
+
+                                if (executionNs >
+                                    400000ULL)
+                                {
+                                    execOver400Count++;
+                                }
+
+
+                                // =====================================================
+                                // 每 4000 cycle 完成一個約一秒的 Exec 視窗；此處只保存數值。
+                                // =====================================================
+
+                                if (execSamples >=
+                                    4000U)
+                                {
+                                    uint64_t execAvgNs =
+                                        execSumNs /
+                                        (uint64_t)
+                                        execSamples;
+
+
+                                    // =====================================================
+                                    // Save completed EXEC window
+                                    // =====================================================
+
+                                    latestExecAvgNs =
+                                        execAvgNs;
+
+                                    latestExecMinNs =
+                                        execMinNs;
+
+                                    latestExecMaxNs =
+                                        execMaxNs;
+
+                                    latestExecOver250Count =
+                                        execOver250Count;
+
+                                    latestExecOver300Count =
+                                        execOver300Count;
+
+                                    latestExecOver400Count =
+                                        execOver400Count;
+
+                                    latestExecValid =
+                                        true;
+
+
+                                    // =====================================================
+                                    // Reset EXEC Window
+                                    // =====================================================
+
+                                    execSumNs =
+                                        0;
+
+                                    execMinNs =
+                                        0;
+
+                                    execMaxNs =
+                                        0;
+
+                                    execSamples =
+                                        0;
+
+                                    execOver250Count =
+                                        0;
+
+                                    execOver300Count =
+                                        0;
+
+                                    execOver400Count =
+                                        0;
                                 }
                             }
 }

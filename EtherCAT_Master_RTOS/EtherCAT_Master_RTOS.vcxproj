@@ -36,7 +36,7 @@
       <PreprocessorDefinitions>_AMD64_;UNDER_RTSS;_DEBUG;_UNICODE;UNICODE;%(PreprocessorDefinitions) </PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <Optimization>Disabled</Optimization>
-      <AdditionalOptions>/openmp- /Gs99999 /Gu %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/openmp- /Gs99999 /Gu /FS %(AdditionalOptions)</AdditionalOptions>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
@@ -62,6 +62,7 @@
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
+      <DebugInformationFormat>OldStyle</DebugInformationFormat>
       <AdditionalOptions>/openmp- /Gs99999 /Gu %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
@@ -152,7 +153,55 @@
     <ClInclude Include="NCOrdinaryG00FeedHoldRollingRearmShadow.h" />
     <ClInclude Include="NCOrdinaryG00InflightTerminalRegistryShadow.h" />
     <ClInclude Include="NCOrdinaryG00ReadAheadCutoverGate.h" />
+    <ClInclude Include="NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageShadow.h" />
+    <ClInclude Include="NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageTransitionShadow.h" />
+    <ClInclude Include="NCPathCoreBoundaryAvailabilityTransitionPairRunShadow.h" />
+    <ClInclude Include="NCPathCoreBoundaryAvailabilityTransitionPairShadow.h" />
+    <ClInclude Include="NCPathCoreCommandedChordAxisQuery.h" />
+    <ClInclude Include="NCPathCoreCommandedChordAxisStation.h" />
+    <ClInclude Include="NCPathCoreCommandedChordAxisStationRange.h" />
+    <ClInclude Include="NCPathCoreCommandedChordAxisStationResolve.h" />
+    <ClInclude Include="NCPathCoreCommandedChordAxisVariation.h" />
+    <ClInclude Include="NCPathCoreCommandedChordCursor.h" />
+    <ClInclude Include="NCPathCoreCommandedChordEval.h" />
+    <ClInclude Include="NCPathCoreCommandedChordLocate.h" />
+    <ClInclude Include="NCPathCoreCommandedChordPosition.h" />
+    <ClInclude Include="NCPathCoreCommandedChordSegment.h" />
+    <ClInclude Include="NCPathCoreCommandedChordSnapshot.h" />
+    <ClInclude Include="NCPathCoreCommandedChordStore.h" />
+    <ClInclude Include="NCPathCoreCommandedChordSubpath.h" />
+    <ClInclude Include="NCPathCoreCommandedSegmentCheck.h" />
+    <ClInclude Include="NCPathCoreCommittedGeometryLinkShadow.h" />
+    <ClInclude Include="NCPathCoreCommittedGeometryShadow.h" />
+    <ClInclude Include="NCPathCoreFrontierReadContract.h" />
+    <ClInclude Include="NCPathCoreFrontierReadProbe.h" />
+    <ClInclude Include="NCPathCoreFrontierTicketContract.h" />
     <ClInclude Include="NCPathCoreInputHandoffCompactShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentPairShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunBoundaryShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryAvailabilityTransitionShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionSummaryShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunDisplacementShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunShadow.h" />
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentShadow.h" />
+    <ClInclude Include="NCPathCoreProofFrontierShadow.h" />
+    <ClInclude Include="NCPathCoreReadbackCheckContract.h" />
+    <ClInclude Include="NCPathCoreRunCoverageBoundaryAvailabilityPairRunShadow.h" />
+    <ClInclude Include="NCPathCoreCurrentProofScopeShadow.h" />
+    <ClInclude Include="NCPathCoreRunCoverageBoundaryAvailabilityPairShadow.h" />
+    <ClInclude Include="NCPathCoreRunCoverageBoundaryAvailabilityShadow.h" />
+    <ClInclude Include="NCPathCoreRunCoverageBoundaryShadow.h" />
+    <ClInclude Include="NCPathCoreRunCoverageTransitionPairRunShadow.h" />
+    <ClInclude Include="NCPathCoreRunCoverageTransitionPairShadow.h" />
+    <ClInclude Include="NCPathCoreSampleReadContract.h" />
     <ClInclude Include="NCPLCManager.h" />
     <ClInclude Include="NCPLCMap.h" />
     <ClInclude Include="NCPreparedBlockQueueShadow.h" />
@@ -240,8 +289,21 @@
     <ClCompile Include="NCGCodeSemantics.cpp" />
     <ClCompile Include="NCLifecycleInterruptionBoundary.cpp" />
     <ClCompile Include="NCManager.cpp" />
+    <ClCompile Include="NCManager_PathCore.cpp" />
     <ClCompile Include="NCManager_PLCSync.cpp" />
     <ClCompile Include="NCManager_SysVars.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordAxisQuery.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordAxisStation.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordAxisStationRange.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordAxisStationResolve.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordAxisVariation.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordCursor.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordPosition.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordSnapshot.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordSnapshotJoin.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordSnapshotRange.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordStore.cpp" />
+    <ClCompile Include="NCPathCoreCommandedChordSubpath.cpp" />
     <ClCompile Include="NCPLCManager.cpp" />
     <ClCompile Include="NCPreparedBlockQueueShadow.cpp" />
     <ClCompile Include="NCPreparedHeadEquivalenceShadow.cpp" />

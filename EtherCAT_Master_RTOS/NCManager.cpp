@@ -17,6 +17,27 @@
 #include <limits>
 #include <utility>
 #include <cmath>
+// NC-0.2L.2AT / Split-Unit Link Pairing Guard.
+// Link-only MSVC/COFF pairing of the two AS implementation units. Each unit
+// contributes its own revisioned witness and requires the peer's witness.
+// A partial AT/legacy-AS update must not silently link. detect_mismatch also
+// rejects different TAGGED contract revisions; it does not hash source bytes.
+// These non-exported empty symbols are never called by NC/CRT/PDO code. They
+// are retained by /INCLUDE, not a callback, object or runtime registration.
+// Keep both stamps in sync when changing this split-unit contract. Do not
+// remove a witness or enable /FORCE:UNRESOLVED to bypass a missing-peer error.
+// This is not a complete duplicate detector: extra untagged legacy objects,
+// both-old files, or same-tag altered code still require source/SHA auditing.
+#if defined(_MSC_VER)
+#pragma detect_mismatch("NCPathCore.SplitPair", "AT1")
+#if defined(_M_IX86)
+#pragma comment(linker, "/include:_NCPathCoreSplit_AT1_PathCoreWitness")
+#else
+#pragma comment(linker, "/include:NCPathCoreSplit_AT1_PathCoreWitness")
+#endif
+extern "C" void __cdecl NCPathCoreSplit_AT1_ManagerWitness() noexcept {}
+#endif
+
 namespace GCodeHandlers
 {
     WaitConditionFunc Handle_G81(const NCBlock& block, NCManager* nc);
@@ -2771,34 +2792,7 @@ void NCManager::ObserveBootstrapSafetyHandoff() noexcept
 }
 
 
-#if defined(_MSC_VER)
-#define NC_PATH_CORE_NOINLINE __declspec(noinline)
-#elif defined(__GNUC__) || defined(__clang__)
-#define NC_PATH_CORE_NOINLINE __attribute__((noinline))
-#else
-#define NC_PATH_CORE_NOINLINE
-#endif
-
-NC_PATH_CORE_NOINLINE
-void NCManager::ObservePathCoreAcceptedReadAheadInput(
-    const NCOrdinaryG00InflightRegistrationProof& proof) noexcept
-{
-    // L.2A receives an already-created K.7 proof by reference and extracts
-    // only scalar identity.  This observer has no return value and cannot
-    // participate in Runtime, Gate, PC, Alarm or Motion control decisions.
-    m_pathCoreInputContractShadow.ObserveAcceptedReadAhead(
-        static_cast<std::uint64_t>(proof.session),
-        static_cast<std::uint64_t>(proof.entrySequence),
-        proof.dispatchId,
-        static_cast<std::uint64_t>(proof.commitSequence),
-        static_cast<std::uint64_t>(proof.identity.epoch),
-        static_cast<std::uint64_t>(proof.identity.segmentId),
-        static_cast<std::int32_t>(proof.sourcePC),
-        static_cast<std::int32_t>(proof.sourceLineNumber));
-    m_pathCoreInputHandoffCompactShadow.ObserveReadAheadInputEvent();
-}
-
-#undef NC_PATH_CORE_NOINLINE
+// NC-0.2L.2AS: Path Core shadow methods are defined in NCManager_PathCore.cpp.
 
 
 // 🌟 放在 RTOS 迴圈的核心任務
@@ -4968,7 +4962,8 @@ void NCManager::ProcessExecutionEngine()
                 // registry and commit proofs have both succeeded. The result
                 // is history-only and is never read by this control path.
                 ObservePathCoreAcceptedReadAheadInput(
-                    readAheadInflightProof);
+                    readAheadInflightProof,
+                    preparedCutoverContext);
             }
 
             // Stage NC-0.2K.6.3: after K.6.1/K.6.2 have independently bound
@@ -8266,6 +8261,11 @@ void NCManager::BeginFeedHoldBoundaryShadow(
         source,
         BuildFeedHoldBoundarySample());
 
+    // NC-0.2L.2T_M00_FIX1: establish ownership from the request source.
+    // A failed current PROGRAM request still owns HOLD and must fail closed.
+    m_programFeedHoldLifetimeActive =
+        source == NCFeedHoldSource::PROGRAM;
+
     BeginOrdinaryG00FeedHoldCohortShadow();
 }
 
@@ -8328,6 +8328,9 @@ void NCManager::ObserveFeedHoldResumeRequestedShadow() noexcept
 
 void NCManager::ObserveFeedHoldResumeAppliedShadow() noexcept
 {
+    // NC-0.2L.2T_M00_FIX1: callers notify only after Resume commits.
+    // End current ownership even if terminal diagnostics stay retained.
+    m_programFeedHoldLifetimeActive = false;
     m_feedHoldBoundaryShadow.ObserveResumeApplied(
         BuildFeedHoldBoundarySample());
     ObserveOrdinaryG00FeedHoldCohortBoundary();
@@ -8336,6 +8339,9 @@ void NCManager::ObserveFeedHoldResumeAppliedShadow() noexcept
 void NCManager::CancelFeedHoldBoundaryShadow(
     bool superseded) noexcept
 {
+    // NC-0.2L.2T_M00_FIX1: retire control ownership independently of
+    // retained terminal diagnostics; observer Cancel may be a no-op.
+    m_programFeedHoldLifetimeActive = false;
     m_feedHoldBoundaryShadow.Cancel(superseded);
     m_feedHoldResumeGate.Cancel(superseded);
     m_ordinaryG00FeedHoldCohortShadow.Cancel(superseded);
@@ -8433,6 +8439,7 @@ bool NCManager::IsProgramFeedHoldResumeCandidate() const noexcept
         m_feedHoldBoundaryShadow.GetSnapshot();
 
     return
+        m_programFeedHoldLifetimeActive &&
         snapshot.sequence != 0ULL &&
         snapshot.source == NCFeedHoldSource::PROGRAM &&
         snapshot.requestLatched &&

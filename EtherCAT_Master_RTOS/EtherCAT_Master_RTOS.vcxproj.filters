@@ -121,6 +121,21 @@
     <Filter Include="Header Files\NC\Home">
       <UniqueIdentifier>{476d704f-4d73-426b-9ace-b46a6499f3c8}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\NC\NC\NCPathCore">
+      <UniqueIdentifier>{4e4e96fe-6b43-4db3-accf-98bf8c4f2eb8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\NC\NC\NCOrdinary">
+      <UniqueIdentifier>{de1cbcd6-51eb-4fc3-ab40-e64798dd30a7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\NC\NC\NCPrepared">
+      <UniqueIdentifier>{a65d2dbf-833b-4e83-bfa8-5df59cce38de}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NC\NC\NCPathCore">
+      <UniqueIdentifier>{849c5039-9e94-4f50-90b6-5c039f2f0d23}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NC\NC\NCPrepared">
+      <UniqueIdentifier>{73831e2a-59d2-45f6-a69a-e61c52b09e49}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
@@ -366,11 +381,50 @@
     <ClCompile Include="NCAlarmEmergencyStopBoundary.cpp">
       <Filter>Source Files\NC\NC</Filter>
     </ClCompile>
-    <ClCompile Include="NCPreparedBlockQueueShadow.cpp">
+    <ClCompile Include="NCManager_PathCore.cpp">
       <Filter>Source Files\NC\NC</Filter>
     </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordCursor.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordPosition.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordStore.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPreparedBlockQueueShadow.cpp">
+      <Filter>Source Files\NC\NC\NCPrepared</Filter>
+    </ClCompile>
     <ClCompile Include="NCPreparedHeadEquivalenceShadow.cpp">
-      <Filter>Source Files\NC\NC</Filter>
+      <Filter>Source Files\NC\NC\NCPrepared</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordSubpath.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordSnapshot.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordAxisQuery.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordAxisVariation.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordSnapshotRange.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordSnapshotJoin.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordAxisStation.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordAxisStationResolve.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordAxisStationRange.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -551,62 +605,17 @@
     <ClInclude Include="NCAlarmEmergencyStopBoundary.h">
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
-    <ClInclude Include="NCPreparedBlockQueueShadow.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCPreparedHeadEquivalenceShadow.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCPreparedHeadCutoverGate.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCPreparedHeadPreResolveAdmissionShadow.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCPreparedHeadResolverBypassGate.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCOrdinaryG00BufferedExactStopAdmissionShadow.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
     <ClInclude Include="MotionCommandPathModeTransport.h">
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
     <ClInclude Include="MotionQueueTailTransaction.h">
       <Filter>Header Files\Motion</Filter>
     </ClInclude>
-    <ClInclude Include="NCOrdinaryG00InflightTerminalRegistryShadow.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCOrdinaryG00ReadAheadCutoverGate.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
     <ClInclude Include="EtherCatPdoRuntimeInvalidCorrelation.h">
       <Filter>Header Files\EtherCAT_Master\DC</Filter>
     </ClInclude>
-    <ClInclude Include="NCOrdinaryG00FeedHoldCohortShadow.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCOrdinaryG00FeedHoldCohortCutoverGate.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmShadow.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmCutoverGate.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCOrdinaryG00FeedHoldRollingRearmShadow.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
     <ClInclude Include="EtherCatPdoSafetyStopDebounce.h">
       <Filter>Header Files\EtherCAT_Master\DC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCOrdinaryG00FeedHoldRollingRearmCutoverGate.h">
-      <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCPathCoreInputHandoffCompactShadow.h">
-      <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
     <ClInclude Include="EtherCatRxForensics.h">
       <Filter>Header Files\EtherCAT_Master</Filter>
@@ -616,6 +625,195 @@
     </ClInclude>
     <ClInclude Include="EtherCatP64DeferredDiagnostics.h">
       <Filter>Header Files\EtherCAT_Master</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageTransitionShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreBoundaryAvailabilityTransitionPairRunShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreBoundaryAvailabilityTransitionPairShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordCursor.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordEval.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordLocate.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordPosition.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordSegment.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordStore.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedSegmentCheck.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommittedGeometryLinkShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommittedGeometryShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCurrentProofScopeShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreFrontierReadContract.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreFrontierReadProbe.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreFrontierTicketContract.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreInputHandoffCompactShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentPairShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunBoundaryShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryAvailabilityTransitionShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunClosureTransitionSummaryShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunDisplacementShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentRunShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLinkedCommittedSegmentShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreProofFrontierShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreReadbackCheckContract.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreRunCoverageBoundaryAvailabilityPairRunShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreRunCoverageBoundaryAvailabilityPairShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreRunCoverageBoundaryAvailabilityShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreRunCoverageBoundaryShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreRunCoverageTransitionPairRunShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreRunCoverageTransitionPairShadow.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreSampleReadContract.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00BufferedExactStopAdmissionShadow.h">
+      <Filter>Header Files\NC\NC\NCOrdinary</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortCutoverGate.h">
+      <Filter>Header Files\NC\NC\NCOrdinary</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmCutoverGate.h">
+      <Filter>Header Files\NC\NC\NCOrdinary</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmShadow.h">
+      <Filter>Header Files\NC\NC\NCOrdinary</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldCohortShadow.h">
+      <Filter>Header Files\NC\NC\NCOrdinary</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldRollingRearmCutoverGate.h">
+      <Filter>Header Files\NC\NC\NCOrdinary</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00FeedHoldRollingRearmShadow.h">
+      <Filter>Header Files\NC\NC\NCOrdinary</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00InflightTerminalRegistryShadow.h">
+      <Filter>Header Files\NC\NC\NCOrdinary</Filter>
+    </ClInclude>
+    <ClInclude Include="NCOrdinaryG00ReadAheadCutoverGate.h">
+      <Filter>Header Files\NC\NC\NCOrdinary</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPreparedBlockQueueShadow.h">
+      <Filter>Header Files\NC\NC\NCPrepared</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPreparedHeadCutoverGate.h">
+      <Filter>Header Files\NC\NC\NCPrepared</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPreparedHeadEquivalenceShadow.h">
+      <Filter>Header Files\NC\NC\NCPrepared</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPreparedHeadPreResolveAdmissionShadow.h">
+      <Filter>Header Files\NC\NC\NCPrepared</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPreparedHeadResolverBypassGate.h">
+      <Filter>Header Files\NC\NC\NCPrepared</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordSubpath.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordSnapshot.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordAxisQuery.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordAxisVariation.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordAxisStation.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordAxisStationResolve.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordAxisStationRange.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

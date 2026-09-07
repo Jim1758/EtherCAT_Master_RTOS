@@ -32,6 +32,44 @@
 #include "NCResetReleaseGate.h" // Stage NC-0.2J.3：Reset Stable-Standstill Release Gate
 #include "NCAlarmEmergencyStopBoundary.h" // Stage NC-0.2J.6.1：Alarm / E-stop RT ACK Shadow
 #include "NCPathCoreInputHandoffCompactShadow.h" // Stage NC-0.2L.2A：Path Core accepted-input contract
+#include "NCPathCoreCommittedGeometryShadow.h" // Stage NC-0.2L.2D：committed endpoint-pair contract
+#include "NCPathCoreCommittedGeometryLinkShadow.h" // Stage NC-0.2L.2E：immediate committed link relation
+#include "NCPathCoreLinkedCommittedSegmentShadow.h" // Stage NC-0.2L.2F：linked committed segment geometry
+#include "NCPathCoreLinkedCommittedSegmentPairShadow.h" // Stage NC-0.2L.2G：immediate linked segment-pair continuity
+#include "NCPathCoreLinkedCommittedSegmentRunShadow.h" // Stage NC-0.2L.2H：proven linked segment run-length
+#include "NCPathCoreLinkedCommittedSegmentRunBoundaryShadow.h" // Stage NC-0.2L.2I：run endpoint boundary
+#include "NCPathCoreLinkedCommittedSegmentRunDisplacementShadow.h" // Stage NC-0.2L.2J：run endpoint net displacement
+#include "NCPathCoreLinkedCommittedSegmentRunClosureShadow.h" // Stage NC-0.2L.2K：run endpoint closure / returned-axis relation
+#include "NCPathCoreLinkedCommittedSegmentRunClosureTransitionShadow.h" // Stage NC-0.2L.2L：run endpoint return transition
+#include "NCPathCoreLinkedCommittedSegmentRunClosureTransitionSummaryShadow.h" // Stage NC-0.2L.2M：run endpoint return transition coverage
+#include "NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationShadow.h" // Stage NC-0.2L.2N：return coverage qualification
+#include "NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionShadow.h" // Stage NC-0.2L.2O: return coverage qualification transition
+#include "NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairShadow.h" // Stage NC-0.2L.2P: qualification transition pair relation
+#include "NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityShadow.h" // Stage NC-0.2L.2Q: qualification transition pair continuity
+#include "NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunShadow.h" // Stage NC-0.2L.2R: local continuity certificate run length
+#include "NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryShadow.h" // Stage NC-0.2L.2S: observed local continuity run boundary
+#include "NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryAvailabilityTransitionShadow.h" // Stage NC-0.2L.2T: boundary certificate availability transition
+#include "NCPathCoreBoundaryAvailabilityTransitionPairShadow.h" // Stage NC-0.2L.2U: adjacent availability transition pair continuity
+#include "NCPathCoreBoundaryAvailabilityTransitionPairRunShadow.h" // Stage NC-0.2L.2V: local availability continuity certificate count
+#include "NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageShadow.h" // Stage NC-0.2L.2W: observed local run pattern coverage
+#include "NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageTransitionShadow.h" // Stage NC-0.2L.2X: adjacent run pattern coverage change
+#include "NCPathCoreRunCoverageTransitionPairShadow.h" // Stage NC-0.2L.2Y: adjacent pattern discovery transition pair
+#include "NCPathCoreRunCoverageTransitionPairRunShadow.h" // Stage NC-0.2L.2Z: local consecutive discovery pair certificates
+#include "NCPathCoreRunCoverageBoundaryShadow.h" // Stage NC-0.2L.2AA: observed first-Y coverage boundary
+#include "NCPathCoreRunCoverageBoundaryAvailabilityShadow.h" // Stage NC-0.2L.2AB: adjacent boundary availability
+#include "NCPathCoreRunCoverageBoundaryAvailabilityPairShadow.h" // Stage NC-0.2L.2AC: adjacent availability transition pair
+#include "NCPathCoreRunCoverageBoundaryAvailabilityPairRunShadow.h" // Stage NC-0.2L.2AD: local consecutive availability pair certificates
+#include "NCPathCoreCurrentProofScopeShadow.h" // Stage NC-0.2L.2AE: current local proof-scope coherence audit
+#include "NCPathCoreProofFrontierShadow.h" // Stage NC-0.2L.2AF: coherent current proof-frontier certificate
+#include "NCPathCoreFrontierTicketContract.h" // Stage NC-0.2L.2AG: contract-only newest-owner revalidation; no runtime consumer
+#include "NCPathCoreFrontierReadContract.h" // Stage NC-0.2L.2AH: ticket-bound scalar value read; no runtime consumer
+#include "NCPathCoreFrontierReadProbe.h" // Stage NC-0.2L.2AI: first diagnostic-only AG/AH runtime probe
+#include "NCPathCoreSampleReadContract.h" // Stage NC-0.2L.2AJ: revalidated last-sample read boundary
+#include "NCPathCoreReadbackCheckContract.h" // Stage NC-0.2L.2AL: exact AI/result/copy-out consistency
+#include "NCPathCoreCommandedSegmentCheck.h" // NC-0.2L.2AU: current D/E/F source revalidation
+#include "NCPathCoreCommandedChordEval.h" // NC-0.2L.2AW: commanded chord, not actual motion
+#include "NCPathCoreCommandedChordLocate.h" // NC-0.2L.2AX: inverse single-axis chord query
+#include "NCPathCoreCommandedChordSegment.h" // NC-0.2L.2AY: explicit single commanded chord value
 
 #include <queue>
 #include <vector>
@@ -196,6 +234,37 @@ static_assert(
 class NCManager {
 public:
     NCManager(MotionCore& motion);
+
+    // NC-0.2L.2AJ: internal NC-thread diagnostic only; NEVER HMI/SHM/API polling.
+    // No reentrancy/owner mutation during the entire call. Caller-owned output
+    // must be disjoint from this manager. Failure clears it; never recaptures.
+    // A successful copy is current only at this call, not a lifecycle/permit.
+    NCPathCoreSampleReadResult ReadPathCoreLastFrontierSampleSameThread(
+        NCPathCoreFrontierReadValueV1& output) const noexcept;
+
+    // NC-0.2L.2AU: instantaneous NC-thread D/E/F check; no geometry is returned.
+    // AV samples this privately after F. Not a ticket, control permit or HMI/SHM API.
+    NCPathCoreCommandedSegmentCheck CheckPathCoreCurrentCommandedSegmentSameThread() const noexcept;
+
+    // AW: evaluate one axis of the newest D endpoint chord, including first D.
+    // Same NC thread, live sources/no reentry; output must not overlap this.
+    // No production caller; not G00 interpolation, length, progress or permit.
+    NCPathCoreCommandedChordCode EvaluatePathCoreCurrentCommandedChordAxisSameThread(
+        std::uint32_t axisIndex, double unitParameter,
+        NCPathCoreCommandedChordAxisValueV1& output) const noexcept;
+
+    // AX: locate u from ONE axis coordinate, not measured path/execution progress.
+    // Same unchanged owner/thread as AW; output must not overlap this manager.
+    // Constant-axis/point queries are non-unique; no runtime consumer is added.
+    NCPathCoreCommandedChordLocateCode LocatePathCoreCurrentCommandedChordAxisSameThread(
+        std::uint32_t axisIndex, double queryCoordinateMCS,
+        NCPathCoreCommandedChordLocationV1& output) const noexcept;
+
+    // AY: capture newest D into a disjoint caller-provided HEAP-OWNED value.
+    // Same NC thread/live owner/no reentry. No member, observer or caller added.
+    // Later value queries need no D slot; NOT current proof or Motion history.
+    NCPathCoreCommandedChordSegmentCaptureCode CapturePathCoreCurrentCommandedChordSegmentSameThread(
+        NCPathCoreCommandedChordSegmentV1& output) const noexcept;
 
     // 1. 系統狀態控制
     void ChangeMode(NCOperationMode newMode);
@@ -1178,6 +1247,10 @@ private:
     // NC-0.2J.5：區分 Feed Hold Request、Legacy HOLD 顯示與正式的
     // RT 連續 Settle Acknowledge。
     NCFeedHoldBoundaryShadowObserver m_feedHoldBoundaryShadow{};
+    // NC-0.2L.2T_M00_FIX1: current PROGRAM Feed Hold lifetime only.
+    // Retained FAILED diagnostics must not own a later M00/M01 HOLD.
+    // Explicit cancellation clears this even when the observer is inactive.
+    bool m_programFeedHoldLifetimeActive = false;
     MotionNCSettleRequestSequence m_feedHoldNCSettleRequestSequence =
         MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
 
@@ -1319,7 +1392,8 @@ private:
         GetPreparedBlockInactiveReason() const noexcept;
     void ObservePreparedBlockQueueShadow(bool allowPlanning) noexcept;
     void ObservePathCoreAcceptedReadAheadInput(
-        const NCOrdinaryG00InflightRegistrationProof& proof) noexcept;
+        const NCOrdinaryG00InflightRegistrationProof& proof,
+        const NCPreparedHeadCutoverContext& context) noexcept;
     NCPreparedHeadCutoverContext CapturePreparedHeadBeforeResolve(
         int sourcePC,
         int sourceLineNumber) const noexcept;
@@ -1587,4 +1661,339 @@ private:
     // NC-0.2L.2A: last two accepted K.7 handoff identities. History-only;
     // never consulted by a Runtime, Gate, PC, Alarm or Motion decision.
     NCPathCoreInputContractShadow m_pathCoreInputContractShadow{};
+
+    // NC-0.2L.2D: last two accepted ordinary G00 committed commanded
+    // endpoint-pair observations. Heap-resident, same-thread and history-only.
+    NCPathCoreCommittedGeometryShadow m_pathCoreCommittedGeometryShadow{};
+
+    // NC-0.2L.2E: immediate L.2D endpoint seam and opaque queue-tail seal.
+    // Fixed heap-resident history only; never consulted by control decisions.
+    NCPathCoreCommittedGeometryLinkShadow
+        m_pathCoreCommittedGeometryLinkShadow{};
+
+    // NC-0.2L.2F: current committed endpoint segment formed only from a
+    // proven L.2E link. Fixed heap-resident history; no control consumer.
+    NCPathCoreLinkedCommittedSegmentShadow
+        m_pathCoreLinkedCommittedSegmentShadow{};
+
+    // NC-0.2L.2G: immediate continuity relation between the newest two
+    // formed L.2F segments. Compact fixed history; no control consumer.
+    NCPathCoreLinkedCommittedSegmentPairShadow
+        m_pathCoreLinkedCommittedSegmentPairShadow{};
+
+    // NC-0.2L.2H: scalar run summary formed only from directly overlapping
+    // proven L.2G pairs. No endpoint arrays, traversal or control consumer.
+    NCPathCoreLinkedCommittedSegmentRunShadow
+        m_pathCoreLinkedCommittedSegmentRunShadow{};
+
+    // NC-0.2L.2I: commanded head/tail endpoint boundary of the newest
+    // proven L.2H run. No intermediate segment history or control consumer.
+    NCPathCoreLinkedCommittedSegmentRunBoundaryShadow
+        m_pathCoreLinkedCommittedSegmentRunBoundaryShadow{};
+
+    // NC-0.2L.2J: component-wise net displacement from the proven L.2I
+    // run head to current tail. No endpoint list, traversal or control use.
+    NCPathCoreLinkedCommittedSegmentRunDisplacementShadow
+        m_pathCoreLinkedCommittedSegmentRunDisplacementShadow{};
+
+    // NC-0.2L.2K: scalar endpoint-open / returned-axis classification of
+    // the proven L.2J run displacement. No geometry array or control use.
+    NCPathCoreLinkedCommittedSegmentRunClosureShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureShadow{};
+
+    // NC-0.2L.2L: immediate scalar transition between adjacent proven
+    // L.2K closure states. No geometry, traversal or control consumer.
+    NCPathCoreLinkedCommittedSegmentRunClosureTransitionShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureTransitionShadow{};
+
+    // NC-0.2L.2M: bounded scalar coverage of directly adjacent proven
+    // L.2L transition events. No event order, geometry or control consumer.
+    NCPathCoreLinkedCommittedSegmentRunClosureTransitionSummaryShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureTransitionSummaryShadow{};
+
+    // NC-0.2L.2N: scalar qualification of which endpoint states and direct
+    // return/reopen transitions L.2M has covered. No event order or geometry.
+    NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationShadow{};
+
+    // NC-0.2L.2O: direct scalar qualification changes inside one proven
+    // coverage interval. Fixed heap-resident history; no control consumer.
+    NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionShadow{};
+
+    // NC-0.2L.2P: direct pair relations across overlapping L.2O scalar
+    // projections. Fixed heap-resident history; no control consumer.
+    NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairShadow{};
+
+    // NC-0.2L.2Q: retained scalar overlap continuity across adjacent L.2P
+    // pairs. Fixed heap-resident history; no control consumer.
+    NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityShadow{};
+
+    // NC-0.2L.2R: counts only consecutive proven L.2Q certificates.
+    // Fixed heap-resident history; no control consumer.
+    NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunShadow{};
+
+    // NC-0.2L.2S: retains head/latest references only after observing
+    // the actual R run head. Fixed heap history; no control consumer.
+    NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryShadow{};
+
+    // NC-0.2L.2T: direct S certificate availability changes only.
+    // Fixed heap history; unavailable does not mean run completion.
+    NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryAvailabilityTransitionShadow
+        m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryAvailabilityTransitionShadow{};
+
+    // NC-0.2L.2U: joins adjacent T certificates on shared identity/state.
+    // Two scalar heap records; no same-run restoration or control claim.
+    NCPathCoreBoundaryAvailabilityTransitionPairShadow
+        m_pathCoreBoundaryAvailabilityTransitionPairShadow{};
+
+    // NC-0.2L.2V: counts only directly bound U certificates in a local run.
+    // Two fixed scalar heap records; no segment count or execution claim.
+    NCPathCoreBoundaryAvailabilityTransitionPairRunShadow
+        m_pathCoreBoundaryAvailabilityTransitionPairRunShadow{};
+
+    // NC-0.2L.2W: summarizes eight U patterns only after observing V head.
+    // Fixed scalar heap history; missing prefix and event order stay unknown.
+    NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageShadow
+        m_pathCoreBoundaryAvailabilityTransitionPairRunCoverageShadow{};
+
+    // NC-0.2L.2X: compares two adjacent proven W coverage summaries.
+    // Fixed scalar heap history; interruption never implies pattern loss.
+    NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageTransitionShadow
+        m_pathCoreBoundaryAvailabilityTransitionPairRunCoverageTransitionShadow{};
+
+    // NC-0.2L.2Y: joins two directly adjacent proven X transitions.
+    // Fixed scalar heap history; no event list or continuity through gaps.
+    NCPathCoreRunCoverageTransitionPairShadow
+        m_pathCoreRunCoverageTransitionPairShadow{};
+
+    // NC-0.2L.2Z: counts a local suffix of directly linked Y certificates.
+    // Fixed scalar heap history; a gap clears the count and starts no bridge.
+    NCPathCoreRunCoverageTransitionPairRunShadow
+        m_pathCoreRunCoverageTransitionPairRunShadow{};
+
+    // NC-0.2L.2AA: pins first-Y coverage only at an observed Z START.
+    // Missing the head leaves this scalar boundary unproven until a new START.
+    NCPathCoreRunCoverageBoundaryShadow
+        m_pathCoreRunCoverageBoundaryShadow{};
+
+    // NC-0.2L.2AB: classifies directly adjacent AA certificate availability.
+    // Invalid or missing proof creates no transition and controls no motion.
+    NCPathCoreRunCoverageBoundaryAvailabilityShadow
+        m_pathCoreRunCoverageBoundaryAvailabilityShadow{};
+
+    // NC-0.2L.2AC: one compatible pair of adjacent AB availability transitions.
+    // Missing or invalid proof yields no pair and controls no motion.
+    NCPathCoreRunCoverageBoundaryAvailabilityPairShadow
+        m_pathCoreRunCoverageBoundaryAvailabilityPairShadow{};
+
+    // NC-0.2L.2AD: counts only consecutive overlapping AC certificates here.
+    // Any proof interruption ends the local count; no motion interval is inferred.
+    NCPathCoreRunCoverageBoundaryAvailabilityPairRunShadow
+        m_pathCoreRunCoverageBoundaryAvailabilityPairRunShadow{};
+
+    // NC-0.2L.2AE: terminal current-source coherence and explicit local proof scope.
+    // Fixed small heap history only; no control consumer or new run accumulator.
+    NCPathCoreCurrentProofScopeShadow m_pathCoreCurrentProofScopeShadow{};
+
+    // NC-0.2L.2AF: compact identity for the currently rebound AE proof frontier.
+    // No path admission, queue ownership, geometry capture or motion consumer.
+    NCPathCoreProofFrontierShadow m_pathCoreProofFrontierShadow{};
+    // L.2AI: one last-sampled read workspace; no history/publication or control use.
+    NCPathCoreFrontierReadProbe m_pathCoreFrontierReadProbe{};
+
+    // NC-0.2L.2AK: last CALL receipt only, not a retained frontier/certificate.
+    // This private diagnostic never drives control and is not HMI/SHM data.
+    enum class PathCoreSampleReadbackDisposition : std::uint8_t
+    {
+        NOT_CALLED = 0U,
+        READ_REJECTED_EMPTY_OUTPUT = 1U,
+        READ_BOUNDARY_AVAILABLE = 2U,
+        READ_BOUNDARY_UNAVAILABLE = 3U,
+        READBACK_CONTRACT_MISMATCH = 4U
+    };
+    static_assert(sizeof(PathCoreSampleReadbackDisposition) == 1U,
+        "AK readback disposition is one byte.");
+    NCPathCoreSampleReadResult m_pathCoreSampleReadbackResult{};
+    PathCoreSampleReadbackDisposition m_pathCoreSampleReadbackDisposition =
+        PathCoreSampleReadbackDisposition::NOT_CALLED;
+    // NC-0.2L.2AP / Declared Path Core Member Storage Budget Guard.
+    // Audit the ACTUAL member declarations, not only their named record types.
+    // An array, pointer/reference or same-sized substitute is not the approved
+    // in-object owner. This block has no data, constructor or runtime work.
+    // The 34-member inventory totals 9769 sizeof-bytes (9760 owners/workspace
+    // plus 9 diagnostic bytes). Inter-member/NCManager padding, other members,
+    // allocator metadata, external allocations and call-chain stack are NOT
+    // included; this is NOT sizeof(NCManager) or process/RTSS memory usage.
+    // New members MUST be added to this reviewed inventory explicitly: C++14
+    // has no automatic enumeration of future class members. Equal size/traits
+    // do not prove no allocation, a history capacity, or safe observer copying.
+    // Keep existing ownership/lifetime/source-proof rules and header guards.
+    // A failed assertion requires a storage-contract review, NOT an automatic
+    // increase of this budget. Existing early bounded geometry is preserved.
+#define NC_PATH_CORE_AP_MEMBER_CHECK(member, expected, bytes, alignment) \
+    static_assert(std::is_same<decltype(member), expected>::value, \
+        "AP member type changed: " #member); \
+    static_assert(sizeof(member) == bytes && alignof(decltype(member)) == alignment, \
+        "AP member storage changed: " #member); \
+    static_assert(std::is_trivially_copyable<decltype(member)>::value && \
+        std::is_trivially_destructible<decltype(member)>::value, \
+        "AP member lifetime traits changed: " #member)
+#define NC_PATH_CORE_AP_NONCOPYABLE_MEMBER_CHECK(member, expected, bytes, alignment) \
+    static_assert(std::is_same<decltype(member), expected>::value, \
+        "AP member type changed: " #member); \
+    static_assert(sizeof(member) == bytes && alignof(decltype(member)) == alignment, \
+        "AP member storage changed: " #member); \
+    static_assert(std::is_trivially_destructible<decltype(member)>::value && \
+        !std::is_copy_constructible<decltype(member)>::value && \
+        !std::is_copy_assignable<decltype(member)>::value && \
+        !std::is_move_constructible<decltype(member)>::value && \
+        !std::is_move_assignable<decltype(member)>::value, \
+        "AP noncopyable member lifetime contract changed: " #member)
+
+    static_assert(sizeof(void*) == 8U, "AP member budget requires the x64 target.");
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreInputHandoffCompactShadow,
+        NCPathCoreInputHandoffCompactShadow, 8U, 4U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreInputContractShadow,
+        NCPathCoreInputContractShadow, 120U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreCommittedGeometryShadow,
+        NCPathCoreCommittedGeometryShadow, 504U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreCommittedGeometryLinkShadow,
+        NCPathCoreCommittedGeometryLinkShadow, 224U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentShadow,
+        NCPathCoreLinkedCommittedSegmentShadow, 448U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentPairShadow,
+        NCPathCoreLinkedCommittedSegmentPairShadow, 288U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunShadow,
+        NCPathCoreLinkedCommittedSegmentRunShadow, 280U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunBoundaryShadow,
+        NCPathCoreLinkedCommittedSegmentRunBoundaryShadow, 592U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunDisplacementShadow,
+        NCPathCoreLinkedCommittedSegmentRunDisplacementShadow, 464U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureShadow, 368U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureTransitionShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureTransitionShadow, 400U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureTransitionSummaryShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureTransitionSummaryShadow, 488U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationShadow, 576U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionShadow, 320U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairShadow, 320U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityShadow, 192U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunShadow, 240U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryShadow, 320U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryAvailabilityTransitionShadow,
+        NCPathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryAvailabilityTransitionShadow, 80U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreBoundaryAvailabilityTransitionPairShadow,
+        NCPathCoreBoundaryAvailabilityTransitionPairShadow, 112U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreBoundaryAvailabilityTransitionPairRunShadow,
+        NCPathCoreBoundaryAvailabilityTransitionPairRunShadow, 176U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreBoundaryAvailabilityTransitionPairRunCoverageShadow,
+        NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageShadow, 208U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreBoundaryAvailabilityTransitionPairRunCoverageTransitionShadow,
+        NCPathCoreBoundaryAvailabilityTransitionPairRunCoverageTransitionShadow, 240U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreRunCoverageTransitionPairShadow,
+        NCPathCoreRunCoverageTransitionPairShadow, 256U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreRunCoverageTransitionPairRunShadow,
+        NCPathCoreRunCoverageTransitionPairRunShadow, 320U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreRunCoverageBoundaryShadow,
+        NCPathCoreRunCoverageBoundaryShadow, 352U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreRunCoverageBoundaryAvailabilityShadow,
+        NCPathCoreRunCoverageBoundaryAvailabilityShadow, 400U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreRunCoverageBoundaryAvailabilityPairShadow,
+        NCPathCoreRunCoverageBoundaryAvailabilityPairShadow, 448U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreRunCoverageBoundaryAvailabilityPairRunShadow,
+        NCPathCoreRunCoverageBoundaryAvailabilityPairRunShadow, 512U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreCurrentProofScopeShadow,
+        NCPathCoreCurrentProofScopeShadow, 208U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreProofFrontierShadow,
+        NCPathCoreProofFrontierShadow, 176U, 8U);
+    NC_PATH_CORE_AP_NONCOPYABLE_MEMBER_CHECK(m_pathCoreFrontierReadProbe,
+        NCPathCoreFrontierReadProbe, 120U, 8U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreSampleReadbackResult,
+        NCPathCoreSampleReadResult, 8U, 1U);
+    NC_PATH_CORE_AP_MEMBER_CHECK(m_pathCoreSampleReadbackDisposition,
+        PathCoreSampleReadbackDisposition, 1U, 1U);
+#undef NC_PATH_CORE_AP_NONCOPYABLE_MEMBER_CHECK
+#undef NC_PATH_CORE_AP_MEMBER_CHECK
+
+    static_assert(
+        sizeof(m_pathCoreInputHandoffCompactShadow) +
+        sizeof(m_pathCoreInputContractShadow) +
+        sizeof(m_pathCoreCommittedGeometryShadow) +
+        sizeof(m_pathCoreCommittedGeometryLinkShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentPairShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunBoundaryShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunDisplacementShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureTransitionShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureTransitionSummaryShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryShadow) +
+        sizeof(m_pathCoreLinkedCommittedSegmentRunClosureTransitionCoverageQualificationTransitionPairContinuityRunBoundaryAvailabilityTransitionShadow) +
+        sizeof(m_pathCoreBoundaryAvailabilityTransitionPairShadow) +
+        sizeof(m_pathCoreBoundaryAvailabilityTransitionPairRunShadow) +
+        sizeof(m_pathCoreBoundaryAvailabilityTransitionPairRunCoverageShadow) +
+        sizeof(m_pathCoreBoundaryAvailabilityTransitionPairRunCoverageTransitionShadow) +
+        sizeof(m_pathCoreRunCoverageTransitionPairShadow) +
+        sizeof(m_pathCoreRunCoverageTransitionPairRunShadow) +
+        sizeof(m_pathCoreRunCoverageBoundaryShadow) +
+        sizeof(m_pathCoreRunCoverageBoundaryAvailabilityShadow) +
+        sizeof(m_pathCoreRunCoverageBoundaryAvailabilityPairShadow) +
+        sizeof(m_pathCoreRunCoverageBoundaryAvailabilityPairRunShadow) +
+        sizeof(m_pathCoreCurrentProofScopeShadow) +
+        sizeof(m_pathCoreProofFrontierShadow) +
+        sizeof(m_pathCoreFrontierReadProbe) +
+        sizeof(m_pathCoreSampleReadbackResult) +
+        sizeof(m_pathCoreSampleReadbackDisposition) == 9769U,
+        "AP reviewed Path Core member-size sum changed; review the inventory and budget.");
+
+    // NC-0.2L.2AV: last synchronous AU check, diagnostic only. Initial
+    // NO_CURRENT_SEGMENT does not prove this call has run. This byte is NOT
+    // a live proof, ticket, lifecycle epoch or Motion/Path Queue permission.
+    // A subsequent rejected check overwrites success; no retained fallback.
+    // No reset/stop/idle hook is added. Only the NC thread may inspect it.
+    NCPathCoreCommandedSegmentCheck m_pathCoreCommandedSegmentLastCheck =
+        NCPathCoreCommandedSegmentCheck::NO_CURRENT_SEGMENT;
+    // Keep AP's original 34-member 9769-byte subtotal and FIX1 unchanged.
+    // AV adds one separately checked byte: reviewed named total = 9770.
+    static_assert(std::is_same<decltype(m_pathCoreCommandedSegmentLastCheck),
+        NCPathCoreCommandedSegmentCheck>::value &&
+        sizeof(m_pathCoreCommandedSegmentLastCheck) == 1U &&
+        alignof(decltype(m_pathCoreCommandedSegmentLastCheck)) == 1U,
+        "AV commanded-segment diagnostic must remain its exact one-byte type.");
+    static_assert(std::is_trivially_copyable<decltype(m_pathCoreCommandedSegmentLastCheck)>::value&&
+        std::is_trivially_destructible<decltype(m_pathCoreCommandedSegmentLastCheck)>::value,
+        "AV commanded-segment diagnostic lifetime traits changed.");
+
+    // L.2AO: borrowed D/F pairs end before the downstream J->AF/readback chain.
+    void ObservePathCoreCommittedLinkAndSegmentSameThread() noexcept;
+    void ObservePathCoreLinkedSegmentRunBoundarySameThread() noexcept;
+    // L.2AN: reference-only D geometry observation with its own frame.
+    void ObservePathCoreAcceptedGeometrySameThread(
+        const NCOrdinaryG00InflightRegistrationProof& proof,
+        const NCPreparedHeadCutoverContext& context) noexcept;
+    // L.2AQ: one reviewed mapping for AI/AJ; borrowed view, not current proof.
+    NCPathCoreFrontierOwnersSameThread BorrowPathCoreFrontierOwnersSameThread() const noexcept;
+    // L.2AN: scoped six-owner view, independent of the readback output frame.
+    void SamplePathCoreCurrentFrontierSameThread() noexcept;
+    // Isolated noinline implementation: one bounded 112-byte CALLER output,
+    // disjoint from the manager as AJ requires. No source snapshot is made.
+    void ProbePathCoreLastSampleReadbackSameThread() noexcept;
 };

@@ -6,11 +6,18 @@
 #include <type_traits>
 
 // =============================================================
-// NC-0.2L.2A / Path Core Accepted Input Contract Shadow
+// NC-0.2L.2C / Path Core Accepted-Handoff Run-Length Shadow
 //
 // An accepted K.7 read-ahead handoff is reduced to scalar identity fields
 // only.  The fixed two-record ring is history for the same NC thread; it is
 // not a queue, ownership claim, Runtime permit or Motion command source.
+// L.2B classifies only the relationship between the newest accepted input and
+// its immediate predecessor.  A chain boundary is neutral history, never a
+// fault, rejection or fallback request.
+// L.2C reduces those pair relations to the number of consecutive accepted
+// K.7 handoff observations since the latest boundary.  This is not path
+// distance, Geometry segment count, Motion queue depth, execution progress or
+// a B2 breadcrumb count, and it must never be interpreted as a permit.
 // HMI exposure remains limited to the one-byte compact state and four-byte
 // change token below.  There are no counters, large snapshots, allocations
 // or cross-thread references.
@@ -18,12 +25,33 @@
 
 constexpr std::size_t NC_PATH_CORE_INPUT_CONTRACT_CAPACITY = 2U;
 
+namespace NCPathCoreDetail
+{
+    constexpr std::uint32_t ACCEPTED_HANDOFF_RUN_LENGTH_MAX = 0xFFFFFFFFU;
+
+    constexpr std::uint32_t SaturatingIncrementAcceptedHandoffRunLength(
+        std::uint32_t current) noexcept
+    {
+        return current == ACCEPTED_HANDOFF_RUN_LENGTH_MAX
+            ? ACCEPTED_HANDOFF_RUN_LENGTH_MAX
+            : current + 1U;
+    }
+}
+
 // This is the latest publication kind, latched for HMI observation. It does
 // not describe live readiness and must never be interpreted as a permit.
 enum class NCPathCoreInputHandoffCompactState : std::uint8_t
 {
     NOT_RUNNING = 0U,
     READ_AHEAD_INPUT_OBSERVED = 1U
+};
+
+enum class NCPathCoreAcceptedInputPairRelation : std::uint8_t
+{
+    NONE = 0U,
+    FIRST_INPUT = 1U,
+    CONTIGUOUS_PAIR = 2U,
+    CHAIN_BOUNDARY = 3U
 };
 
 struct NCPathCoreAcceptedInputRecord
@@ -58,6 +86,8 @@ public:
         std::int32_t sourcePC,
         std::int32_t sourceLineNumber) noexcept
     {
+        const NCPathCoreAcceptedInputRecord* const previous =
+            GetNewestSameThread();
         const std::size_t targetIndex =
             m_latestIndex == INVALID_INDEX
             ? 0U
@@ -75,6 +105,33 @@ public:
         target.motionSegmentId = motionSegmentId;
         target.sourcePC = sourcePC;
         target.sourceLineNumber = sourceLineNumber;
+
+        m_pairRelation =
+            previous == nullptr
+            ? NCPathCoreAcceptedInputPairRelation::FIRST_INPUT
+            : IsContiguousPairSameThread(*previous, target)
+            ? NCPathCoreAcceptedInputPairRelation::CONTIGUOUS_PAIR
+            : NCPathCoreAcceptedInputPairRelation::CHAIN_BOUNDARY;
+
+        if (m_pairRelation ==
+            NCPathCoreAcceptedInputPairRelation::CONTIGUOUS_PAIR)
+        {
+            m_latestAcceptedHandoffRunLength =
+                NCPathCoreDetail::SaturatingIncrementAcceptedHandoffRunLength(
+                    m_latestAcceptedHandoffRunLength);
+        }
+        else if (
+            m_pairRelation ==
+            NCPathCoreAcceptedInputPairRelation::FIRST_INPUT ||
+            m_pairRelation ==
+            NCPathCoreAcceptedInputPairRelation::CHAIN_BOUNDARY)
+        {
+            m_latestAcceptedHandoffRunLength = 1U;
+        }
+        else
+        {
+            m_latestAcceptedHandoffRunLength = 0U;
+        }
 
         m_latestIndex = static_cast<std::uint8_t>(targetIndex);
         if (m_recordCount < NC_PATH_CORE_INPUT_CONTRACT_CAPACITY)
@@ -103,14 +160,88 @@ public:
         return m_recordCount;
     }
 
+    NCPathCoreAcceptedInputPairRelation
+        GetPairRelationSameThread() const noexcept
+    {
+        return m_pairRelation;
+    }
+
+    std::uint32_t GetLatestAcceptedHandoffRunLengthSameThread() const noexcept
+    {
+        return m_latestAcceptedHandoffRunLength;
+    }
+
 private:
     static constexpr std::uint8_t INVALID_INDEX = 0xFFU;
+
+    static bool IsStrictlyIncreasingNonZero(
+        std::uint64_t previous,
+        std::uint64_t current) noexcept
+    {
+        return previous != 0ULL &&
+            current != 0ULL &&
+            current > previous;
+    }
+
+    static bool IsMatchingNonZero(
+        std::uint64_t previous,
+        std::uint64_t current) noexcept
+    {
+        return previous != 0ULL &&
+            current != 0ULL &&
+            current == previous;
+    }
+
+    static bool IsContiguousPairSameThread(
+        const NCPathCoreAcceptedInputRecord& previous,
+        const NCPathCoreAcceptedInputRecord& current) noexcept
+    {
+        if (!previous.IsPopulated() || !current.IsPopulated())
+        {
+            return false;
+        }
+
+        // sourceLineNumber is diagnostic provenance and is intentionally not
+        // required to be dense. Convert sourcePC to int64_t before adding one
+        // so the comparison remains defined at the int32_t boundary.
+        const bool sourcePcContiguous =
+            previous.sourcePC >= 0 &&
+            current.sourcePC >= 0 &&
+            static_cast<std::int64_t>(current.sourcePC) ==
+            static_cast<std::int64_t>(previous.sourcePC) + 1LL;
+
+        // Zero is the upstream invalid sentinel for both the prepared queue
+        // session and Motion execution epoch.  Equal zero anchors therefore
+        // cannot establish a real accepted-input chain.
+        return IsMatchingNonZero(
+            previous.preparedSession,
+            current.preparedSession) &&
+            IsMatchingNonZero(
+                previous.motionExecutionEpoch,
+                current.motionExecutionEpoch) &&
+            sourcePcContiguous &&
+            IsStrictlyIncreasingNonZero(
+                previous.preparedEntrySequence,
+                current.preparedEntrySequence) &&
+            IsStrictlyIncreasingNonZero(
+                previous.dispatchId,
+                current.dispatchId) &&
+            IsStrictlyIncreasingNonZero(
+                previous.commitSequence,
+                current.commitSequence) &&
+            IsStrictlyIncreasingNonZero(
+                previous.motionSegmentId,
+                current.motionSegmentId);
+    }
 
     std::array<
         NCPathCoreAcceptedInputRecord,
         NC_PATH_CORE_INPUT_CONTRACT_CAPACITY> m_records{};
     std::uint8_t m_latestIndex = INVALID_INDEX;
     std::uint8_t m_recordCount = 0U;
+    NCPathCoreAcceptedInputPairRelation m_pairRelation =
+        NCPathCoreAcceptedInputPairRelation::NONE;
+    std::uint32_t m_latestAcceptedHandoffRunLength = 0U;
 };
 
 class NCPathCoreInputHandoffCompactShadow final
@@ -191,6 +322,17 @@ static_assert(
     sizeof(NCPathCoreInputHandoffCompactState) == 1U,
     "Path Core compact state must remain one byte.");
 static_assert(
+    sizeof(NCPathCoreAcceptedInputPairRelation) == 1U,
+    "Path Core pair relation must remain one byte.");
+static_assert(
+    NCPathCoreDetail::SaturatingIncrementAcceptedHandoffRunLength(0U) == 1U,
+    "Path Core run length must advance from zero to one.");
+static_assert(
+    NCPathCoreDetail::SaturatingIncrementAcceptedHandoffRunLength(
+        NCPathCoreDetail::ACCEPTED_HANDOFF_RUN_LENGTH_MAX) ==
+    NCPathCoreDetail::ACCEPTED_HANDOFF_RUN_LENGTH_MAX,
+    "Path Core run length must saturate instead of wrapping.");
+static_assert(
     std::is_standard_layout<NCPathCoreAcceptedInputRecord>::value,
     "Path Core accepted input record must remain standard-layout.");
 static_assert(
@@ -206,8 +348,8 @@ static_assert(
     std::is_trivially_copyable<NCPathCoreInputContractShadow>::value,
     "Path Core input contract shadow must remain trivially copyable.");
 static_assert(
-    sizeof(NCPathCoreInputContractShadow) <= 120U,
-    "Path Core input contract shadow exceeded its fixed size budget.");
+    sizeof(NCPathCoreInputContractShadow) == 120U,
+    "Path Core input contract shadow must remain exactly 120 bytes.");
 static_assert(
     sizeof(NCPathCoreInputHandoffCompactShadow) <= 8U,
     "Path Core compact state and token must remain eight bytes or less.");

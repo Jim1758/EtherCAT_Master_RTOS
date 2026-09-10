@@ -259,7 +259,8 @@ namespace GCodeHandlers
                     BufferMode::BUFFERED,
                     MotionCommandPathMode::EXACT_STOP,
                     rapidOverrideCandidate,
-                    nc->CoordSys.commandedMCS);
+                    nc->CoordSys.commandedMCS,
+                    nc->GetPathCoreCommandedReceiptWorkspaceSameThread());
         }
         else
         {
@@ -270,7 +271,8 @@ namespace GCodeHandlers
                     BufferMode::ABORTING,
                     MotionCommandPathMode::EXACT_STOP,
                     rapidOverrideCandidate,
-                    nc->CoordSys.commandedMCS);//不連續
+                    nc->CoordSys.commandedMCS,
+                    nc->GetPathCoreCommandedReceiptWorkspaceSameThread());//不連續
         }
 
         // K.6.2: an ingress rejection is a failed NC dispatch.  Never let a

@@ -70,6 +70,18 @@
 #include "NCPathCoreCommandedChordEval.h" // NC-0.2L.2AW: commanded chord, not actual motion
 #include "NCPathCoreCommandedChordLocate.h" // NC-0.2L.2AX: inverse single-axis chord query
 #include "NCPathCoreCommandedChordSegment.h" // NC-0.2L.2AY: explicit single commanded chord value
+#include "NCPathCoreLiveRetention.h" // BN: finite live commanded retention
+// BP-BEGIN
+#include "NCPathCoreCompletedSnapshot.h" // BP: detached completed retained set
+// BQ-BEGIN
+#include "NCPathCoreCommittedRun.h"
+#include "MotionFeedLineReceipt.h"
+#include "NCPathCoreRetainedPath.h"
+#include "MotionPathCoreRetainedReceipt.h"
+// BQ-END
+
+// BP-END
+#include "NCPathCoreExecutionLink.h" // BO: retained segment / Motion feedback association
 
 #include <queue>
 #include <vector>
@@ -266,7 +278,55 @@ public:
     NCPathCoreCommandedChordSegmentCaptureCode CapturePathCoreCurrentCommandedChordSegmentSameThread(
         NCPathCoreCommandedChordSegmentV1& output) const noexcept;
 
-    // 1. 系統狀態控制
+
+    // BN: internal NC-thread data access, not an exported HMI/SHM interface.
+    bool ReadPathCoreLiveExecutionSameThread(
+        const NCPathCoreCommandedChordStoreHandleV1& handle,
+        NCPathCoreExecutionRecordV1& output) noexcept;
+    // All outputs are caller-owned/disjoint; Segment output must be heap-owned.
+    // Each call revalidates live NC scope. Held/stale/fenced payload reads fail.
+    void GetPathCoreLiveRetentionStatusSameThread(
+        NCPathCoreLiveRetentionStatusV1& output) noexcept;
+    NCPathCoreCommandedChordStoreCode GetPathCoreLiveRetainedHandleSameThread(
+        std::uint32_t ordinal, NCPathCoreCommandedChordStoreHandleV1& output) noexcept;
+    NCPathCoreCommandedChordStoreCode ReadPathCoreLiveRetainedSegmentSameThread(
+        const NCPathCoreCommandedChordStoreHandleV1& handle,
+        NCPathCoreCommandedChordSegmentV1& output) noexcept;
+
+    // BN: detached mathematical snapshot; all three referenced objects are
+    // disjoint caller-owned heap values. No snapshot member or Motion permit.
+    NCPathCoreCommandedChordSnapshotCode CapturePathCoreLiveSnapshotSameThread(
+        const NCPathCoreCommandedChordSubpathV1& subpath,
+        NCPathCoreCommandedChordSegmentV1& workspace,
+        NCPathCoreCommandedChordSnapshotV1& output) noexcept;
+
+    // BP-BEGIN
+        // Internal NC-thread queries of the LAST successfully finalized retained set.
+        // All outputs are disjoint caller-owned heap values. Not current permission,
+        // full NC coverage, physical trajectory, or a cross-thread/SHM interface.
+    bool GetPathCoreCompletedSnapshotInfoSameThread(
+        NCPathCoreCompletedSnapshotInfoV1& output) const noexcept;
+    NCPathCoreCompletedSnapshotCode ReadPathCoreCompletedPieceSameThread(
+        std::uint32_t index, NCPathCoreCommandedChordSegmentV1& segment,
+        NCPathCoreExecutionRecordV1& execution,
+        NCPathCoreCommandedChordSubpathPieceV1& piece,
+        NCPathCoreCommandedChordSubpathInfoV1& info) const noexcept;
+    NCPathCoreCompletedSnapshotCode EvaluatePathCoreCompletedPieceSameThread(
+        std::uint32_t index, double sourceU,
+        NCPathCoreCommandedChordPositionSampleV1& sample,
+        NCPathCoreExecutionRecordV1& execution) const noexcept;
+
+    // BP-END
+    // BQ-BEGIN
+        // BQ: NC-thread producer workspace and published native-MCS commanded run.
+        // Outputs are disjoint caller-owned heap values, never Motion authority.
+    MotionCommandedEndpointReceiptV1* GetPathCoreCommandedReceiptWorkspaceSameThread() noexcept;
+    bool ReadPathCoreCommittedRunPieceSameThread(std::uint32_t index,
+        NCPathCoreCommittedRecordV1& output) noexcept;
+    bool EvaluatePathCoreCommittedRunPieceSameThread(std::uint32_t index, double u,
+        NCPathCoreCommittedSampleV1& output) noexcept;
+    // BQ-END
+        // 1. 系統狀態控制
     void ChangeMode(NCOperationMode newMode);
     void ChangeState(NCState newState);
     bool TryCommitHomingResume(
@@ -1981,6 +2041,451 @@ private:
     static_assert(std::is_trivially_copyable<decltype(m_pathCoreCommandedSegmentLastCheck)>::value&&
         std::is_trivially_destructible<decltype(m_pathCoreCommandedSegmentLastCheck)>::value,
         "AV commanded-segment diagnostic lifetime traits changed.");
+
+
+    static_assert(static_cast<std::uint32_t>(NCProgramScope::MEMORY) == 1U &&
+        static_cast<std::uint32_t>(NCProgramScope::MDI) == 2U &&
+        static_cast<std::uint32_t>(NCProgramScope::MANUAL_AUTO) == 3U &&
+        static_cast<std::uint32_t>(NCOperationMode::MEMORY) == 0U &&
+        static_cast<std::uint32_t>(NCOperationMode::MDI) == 1U &&
+        static_cast<std::uint32_t>(NCOperationMode::MANUAL) == 2U,
+        "BN scope encodings must match existing NC enums.");
+    // BN is a separate 5904-byte named heap-member budget; AP/AV stay 9770.
+    using PathCoreLiveFenceReason = NCPathCoreLiveRetentionReason;
+    struct PathCoreLiveNativeConfig
+    {
+        double lead[8U]{};
+        double resolution[8U]{};
+        std::int32_t axisIndex[8U]{};
+        std::uint8_t axisType[8U]{};
+        char axisName[8U]{};
+        std::uint8_t exists[8U]{};
+    };
+    struct PathCoreLiveBookkeeping
+    {
+        std::uint64_t lastRunToken = 0ULL;
+        std::uint64_t currentRunToken = 0ULL;
+        std::uint64_t readbackCount = 0ULL;
+        std::uint32_t holdCount = 0U;
+        std::uint32_t resumeCount = 0U;
+        bool lastReadbackMatched = false;
+        bool nativeBound = false;
+        bool runSummaryQueued = false;
+        bool summaryPending = false;
+        std::uint8_t reserved[4U]{};
+    };
+    struct PathCoreLiveSummary
+    {
+        NCPathCoreLiveRetentionStatusV1 status{};
+        std::uint64_t readbackCount = 0ULL;
+        std::uint32_t holdCount = 0U;
+        std::uint32_t resumeCount = 0U;
+        bool lastReadbackMatched = false;
+        std::uint8_t reserved[7U]{};
+    };
+    NCPathCoreLiveRetention m_pathCoreLiveRetention;
+    NCPathCoreCommandedChordSegmentV1 m_pathCoreLiveCapture{};
+    NCPathCoreCommandedChordSegmentV1 m_pathCoreLiveReadback{};
+    NCPathCoreCommandedChordStoreHandleV1 m_pathCoreLiveHandle{};
+    NCPathCoreLiveRetentionStatusV1 m_pathCoreLiveStatus{};
+    PathCoreLiveNativeConfig m_pathCoreLiveNative{};
+    PathCoreLiveBookkeeping m_pathCoreLiveBookkeeping{};
+    PathCoreLiveSummary m_pathCoreLiveSummary{};
+    static_assert(sizeof(PathCoreLiveNativeConfig) == 184U &&
+        alignof(PathCoreLiveNativeConfig) == 8U &&
+        sizeof(PathCoreLiveBookkeeping) == 40U &&
+        alignof(PathCoreLiveBookkeeping) == 8U &&
+        sizeof(PathCoreLiveSummary) == 72U &&
+        alignof(PathCoreLiveSummary) == 8U,
+        "BN fixed native/small-summary layout changed.");
+    static_assert(std::is_trivially_copyable<PathCoreLiveNativeConfig>::value&&
+        std::is_trivially_copyable<PathCoreLiveBookkeeping>::value&&
+        std::is_trivially_copyable<PathCoreLiveSummary>::value,
+        "BN scalar scope and summary must remain fixed values.");
+    static_assert(std::is_same<decltype(m_pathCoreLiveRetention),
+        NCPathCoreLiveRetention>::value &&
+        sizeof(m_pathCoreLiveRetention) == 5200U &&
+        alignof(NCPathCoreLiveRetention) == 8U &&
+        std::is_trivially_destructible<NCPathCoreLiveRetention>::value &&
+        !std::is_copy_constructible<NCPathCoreLiveRetention>::value &&
+        !std::is_copy_assignable<NCPathCoreLiveRetention>::value &&
+        !std::is_move_constructible<NCPathCoreLiveRetention>::value &&
+        !std::is_move_assignable<NCPathCoreLiveRetention>::value,
+        "BN retention is one fixed, noncopyable heap-owned member.");
+    static_assert(sizeof(m_pathCoreLiveRetention) +
+        sizeof(m_pathCoreLiveCapture) + sizeof(m_pathCoreLiveReadback) +
+        sizeof(m_pathCoreLiveHandle) + sizeof(m_pathCoreLiveStatus) +
+        sizeof(m_pathCoreLiveNative) + sizeof(m_pathCoreLiveBookkeeping) +
+        sizeof(m_pathCoreLiveSummary) == 5904U,
+        "BN named runtime addition changed; review independently of AP/AV.");
+
+    // BO adds 3200 named heap-member bytes; BN/AP/AV budgets stay separate.
+    NCPathCoreExecutionLink m_pathCoreExecutionLink{};
+    NCPathCoreExecutionLinkStatusV1 m_pathCoreExecutionSummary{};
+    struct PathCoreExecutionBookkeeping
+    {
+        bool summaryPending = false;
+        std::uint8_t reserved[7U]{};
+    } m_pathCoreExecutionBookkeeping{};
+    static_assert(sizeof(m_pathCoreExecutionLink) == 3128U &&
+        sizeof(m_pathCoreExecutionSummary) == 64U &&
+        sizeof(m_pathCoreExecutionBookkeeping) == 8U &&
+        sizeof(m_pathCoreExecutionLink) + sizeof(m_pathCoreExecutionSummary) +
+        sizeof(m_pathCoreExecutionBookkeeping) == 3200U,
+        "BO fixed heap member budget changed.");
+    void ClosePathCoreExecutionLinkSameThread(PathCoreLiveFenceReason reason) noexcept;
+    void FlushPathCoreExecutionSummarySameThread() noexcept;
+
+    // BP-BEGIN
+    NCPathCoreCompletedSnapshotV1 m_pathCoreCompletedSnapshot{};
+    NCPathCoreCompletedSnapshotWorkspaceV1 m_pathCoreCompletedWorkspace{};
+    NCPathCoreCompletedSnapshotInfoV1 m_pathCoreCompletedInfo{};
+    NCPathCoreExecutionRecordV1 m_pathCoreCompletedRecord{};
+    NCPathCoreCommandedChordPositionSampleV1 m_pathCoreCompletedSample{};
+    struct PathCoreCompletedSummary
+    {
+        std::uint64_t run = 0ULL, lifetime = 0ULL;
+        std::uint32_t count = 0U, reads = 0U, evaluations = 0U;
+        NCPathCoreCompletedSnapshotCode code = NCPathCoreCompletedSnapshotCode::NONE;
+        bool published = false, pending = false;
+        std::uint8_t reserved = 0U;
+    } m_pathCoreCompletedSummary{};
+    struct PathCoreCompletedBookkeeping
+    {
+        bool prepared = false, readable = false;
+        std::uint8_t reserved[6U]{};
+    } m_pathCoreCompletedBookkeeping{};
+    static_assert(sizeof(m_pathCoreCompletedSnapshot) == 8336U &&
+        sizeof(m_pathCoreCompletedWorkspace) == 432U &&
+        sizeof(m_pathCoreCompletedInfo) == 40U &&
+        sizeof(m_pathCoreCompletedRecord) == 96U &&
+        sizeof(m_pathCoreCompletedSample) == 120U &&
+        sizeof(m_pathCoreCompletedSummary) == 32U &&
+        sizeof(m_pathCoreCompletedBookkeeping) == 8U &&
+        sizeof(m_pathCoreCompletedSnapshot) + sizeof(m_pathCoreCompletedWorkspace) +
+        sizeof(m_pathCoreCompletedInfo) + sizeof(m_pathCoreCompletedRecord) +
+        sizeof(m_pathCoreCompletedSample) + sizeof(m_pathCoreCompletedSummary) +
+        sizeof(m_pathCoreCompletedBookkeeping) == 9064U,
+        "BP adds 9064 named heap bytes; AP/AV/BN/BO budgets remain separate.");
+    void DiscardPathCoreCompletedSnapshotSameThread() noexcept;
+    void PreparePathCoreCompletedSnapshotSameThread() noexcept;
+    void PublishPathCoreCompletedSnapshotSameThread() noexcept;
+    void FlushPathCoreCompletedSummarySameThread() noexcept;
+
+    // BP-END
+    // BQ-BEGIN
+    NCPathCoreCommittedRun m_pathCoreCommittedRun{};
+    NCPathCoreCommittedScopeV1 m_pathCoreCommittedScope{};
+    std::array<double, 8U> m_pathCoreCommittedRotaryModulo{};
+    MotionCommandedEndpointReceiptV1 m_pathCoreCommandedReceipt{};
+    NCPathCoreCommittedRunStatusV1 m_pathCoreCommittedStatus{};
+    NCPathCoreCommittedRunStatusV1 m_pathCoreCommittedSummary{};
+    NCPathCoreCommittedRecordV1 m_pathCoreCommittedRecord{};
+    NCPathCoreCommittedSampleV1 m_pathCoreCommittedSample{};
+    struct PathCoreCommittedBookkeeping
+    {
+        NCBlockDispatchId dispatchId = NC_BLOCK_DISPATCH_ID_INVALID;
+        std::uint32_t reads = 0U, evaluations = 0U;
+        bool eligible = false, requested = false, summaryPending = false;
+        bool published = false, closed = false, pendingAdmission = false;
+        std::uint8_t reserved[2U]{};
+        std::uint64_t pendingCommitSequence = 0ULL;
+    } m_pathCoreCommittedBookkeeping{};
+    static_assert(sizeof(m_pathCoreCommittedRun) == 8272U &&
+        sizeof(m_pathCoreCommittedScope) == 40U && sizeof(m_pathCoreCommittedRotaryModulo) == 64U &&
+        sizeof(m_pathCoreCommandedReceipt) == 216U && sizeof(m_pathCoreCommittedStatus) == 72U &&
+        sizeof(m_pathCoreCommittedSummary) == 72U && sizeof(m_pathCoreCommittedRecord) == 256U &&
+        sizeof(m_pathCoreCommittedSample) == 128U && sizeof(m_pathCoreCommittedBookkeeping) == 32U &&
+        sizeof(m_pathCoreCommittedRun) + sizeof(m_pathCoreCommittedScope) +
+        sizeof(m_pathCoreCommittedRotaryModulo) + sizeof(m_pathCoreCommandedReceipt) +
+        sizeof(m_pathCoreCommittedStatus) + sizeof(m_pathCoreCommittedSummary) +
+        sizeof(m_pathCoreCommittedRecord) + sizeof(m_pathCoreCommittedSample) +
+        sizeof(m_pathCoreCommittedBookkeeping) == 9152U,
+        "BQ adds 9152 named heap bytes; previous AP/AV/BN/BO/BP stays 27938.");
+    NCPathCoreCommittedScopeV1 BuildPathCoreCommittedScopeSameThread() const noexcept;
+    bool IsPathCoreCommittedNativeConfigCurrentSameThread() noexcept;
+    bool ValidatePathCoreCommittedBaseScopeSameThread() noexcept;
+    bool ValidatePathCoreCommittedRunSameThread() noexcept;
+    void DrainPathCorePendingCommandedCaptureSameThread() noexcept;
+    bool ValidatePathCorePublishedCommittedRunSameThread() noexcept;
+    void ArmPathCoreCommittedRunSameThread() noexcept;
+    void ClosePathCoreCommittedRunSameThread() noexcept;
+    void BeginPathCoreCommandedCaptureSameThread(const NCBlock& block,
+        NCBlockDispatchId dispatchId) noexcept;
+    void CommitPathCoreCommandedCaptureSameThread(NCBlockDispatchId dispatchId,
+        const MotionProgramBlockCapture& capture, const NCProgramCommitSnapshot& commit,
+        bool commitSucceeded, bool ledgerFound, const NCBlockLifecycleSnapshot& ledger,
+        int sourcePC, int sourceLineNumber) noexcept;
+    void PreparePathCoreCommittedRunSameThread() noexcept;
+    void PublishPathCoreCommittedRunSameThread() noexcept;
+    void FlushPathCoreCommittedRunSummarySameThread() noexcept;
+    // BQ-END
+    static std::uint64_t AllocatePathCoreLiveOwnerTagStartup() noexcept;
+    NCPathCoreLiveRetentionScopeV1 BuildPathCoreLiveScopeSameThread() const noexcept;
+    void CapturePathCoreLiveNativeConfigSameThread() noexcept;
+    bool IsPathCoreLiveNativeConfigCurrentSameThread() noexcept;
+    bool ValidatePathCoreLiveRetentionSameThread() noexcept;
+    void ArmPathCoreLiveRetentionSameThread() noexcept;
+    void FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason reason) noexcept;
+    void PausePathCoreLiveRetentionSameThread() noexcept;
+    void ResumePathCoreLiveRetentionSameThread() noexcept;
+    void AdmitPathCoreLiveRetentionSameThread(
+        const NCOrdinaryG00InflightRegistrationProof& proof,
+        const NCPreparedHeadCutoverContext& context) noexcept;
+    void QueuePathCoreLiveSummarySameThread() noexcept;
+    void FlushPathCoreLiveSummarySameThread() noexcept;
+
+    // BS: one G171 request uses at most eight native linear-axis slots.
+    // Allocate at NCManager construction; request-time resize stays within
+    // this startup capacity. No additional retained history or snapshot.
+    std::vector<int> m_pathCoreReturnAxes = std::vector<int>(8U, 0);
+    std::vector<double> m_pathCoreReturnTargets = std::vector<double>(8U, 0.0);
+    struct PathCoreReturnSummary
+    {
+        std::uint64_t run = 0ULL, dispatch = 0ULL;
+        MotionExecutionIdentity source{}, submitted{};
+        double fromX = 0.0, targetX = 0.0, rapidPercent = 0.0;
+        double newStartX = 0.0, newEndX = 0.0;
+        std::uint32_t code = 0U, seamsBefore = 0U;
+        // Qualified reads bound the ordinal to 1..32; receipt flags are uint8.
+        // Both fit in uint16. Fill the 128-byte summary without tail padding
+        // so its value reset does not need a larger aggregate temporary.
+        std::uint16_t sourceOrdinal = 0U, sourceFlags = 0U;
+        bool pending = false;
+        std::uint8_t startByteMask = 0U, startNumericMask = 0U, otherEndMask = 0U;
+        std::uint8_t sourceValidMask = 0U, newValidMask = 0U;
+        bool outputValid = false, targetExact = false;
+        std::uint8_t sourceAxisMask = 0U, newAxisMask = 0U;
+        std::uint8_t axisCount = 0U, targetMismatchMask = 0U;
+    } m_pathCoreReturnSummary{};
+    static_assert(sizeof(PathCoreReturnSummary) == 128U,
+        "BS summary remains 128 named heap bytes; two eight-element vectors are separate.");
+    // BT: a bounded cursor names a frozen suffix in the same BQ owner.
+    // New return receipts remain in BQ but never become this cursor's sources.
+    enum class PathCoreReturnCursorState : std::uint8_t
+    {
+        NEW = 0U, ACTIVE = 1U, PENDING = 2U, EXHAUSTED = 3U, INVALID = 4U
+    };
+    struct PathCoreReturnCursor
+    {
+        std::uint64_t run = 0ULL, completedDispatch = 0ULL;
+        MotionExecutionIdentity expectedIdentity{};
+        std::uint32_t sourceCount = 0U, requested = 0U, remaining = 0U;
+        std::uint32_t nextOrdinal = 0U, lowerBound = 0U, expectedCount = 0U;
+        std::uint32_t selectedOrdinal = 0U;
+        std::uint8_t sourceAxisMask = 0U, sourceValidMask = 0U;
+        PathCoreReturnCursorState state = PathCoreReturnCursorState::NEW;
+        bool completionReady = false;
+        // BU: opt-in P1 retains each source row's programmed axis mask.
+        bool mixedAxes = false;
+        // BV: one forward traversal may follow a fully completed retreat.
+        bool forward = false, forwardAvailable = false;
+    } m_pathCoreReturnCursor{};
+    static_assert(sizeof(PathCoreReturnCursor) <= 96U,
+        "BT cursor is bounded scalar state; it never owns a path snapshot.");
+    std::uint16_t m_pathCoreReturnCommand = 171U;
+    bool PreparePathCoreReturnCursorSourceSameThread(const NCBlock& block);
+    bool CompletePathCoreReturnCursorSameThread();
+    bool PreparePathCoreAdvanceCursorSourceSameThread();
+    bool CheckPathCoreMixedReturnOutputSameThread() noexcept;
+    void InvalidatePathCoreReturnCursorSameThread() noexcept;
+    void ObservePathCoreReturnDispatchSameThread(const NCBlock& block) noexcept;
+    void LogPathCoreReturnCursorSameThread(const char* phase) const noexcept;
+    static bool IsPathCoreReturnBlockShapeValid(const NCBlock& block) noexcept;
+    WaitConditionFunc StartPathCoreReturnSameThread(const NCBlock& block);
+    void RejectPathCoreReturnSameThread(std::uint32_t code, int alarmCode);
+    void FlushPathCoreReturnSummarySameThread() noexcept;
+
+    // BX-FEED-BEGIN: fixed startup-owned G01 state, distinct from V1 G00 history.
+    MotionFeedLineWorkspace m_pathFeedMotion{};
+    std::vector<int> m_pathFeedAxes = std::vector<int>(3U, 0);
+    std::vector<double> m_pathFeedTargets = std::vector<double>(3U, 0.0);
+    std::array<double, 8U> m_pathFeedWCS{}, m_pathFeedCandidate{};
+    std::array<bool, 8U> m_pathFeedProgrammed{};
+    struct PathFeedState
+    {
+        std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL, commit = 0ULL;
+        MotionFeedbackSequence lastSequence = 0ULL;
+        std::uint32_t submitted = 0U, accepted = 0U, started = 0U, done = 0U;
+        std::uint32_t rejected = 0U, failed = 0U, code = 0U;
+        int sourcePC = -1, sourceLine = 0;
+        bool armed = false, pending = false, bound = false, consumerAccepted = false;
+        bool consumerStarted = false, completed = false, explicitFeed = false;
+    } m_pathFeed{};
+    static bool IsPathCoreFeedBlockShapeValid(const NCBlock& block) noexcept;
+    bool IsPathCoreFeedInputOmission(const NCBlock& block) const noexcept;
+    bool IsPathCoreFeedConfigurationValid() noexcept;
+    void ArmPathCoreFeedSameThread() noexcept;
+    void InvalidatePathCoreFeedSameThread() noexcept;
+    void ValidatePathCoreFeedSameThread();
+    void BeginPathCoreFeedCaptureSameThread(const NCBlock& block,
+        NCBlockDispatchId dispatchId) noexcept;
+    WaitConditionFunc StartPathCoreFeedSameThread(const NCBlock& block);
+    void CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId,
+        const MotionProgramBlockCapture& capture, const NCProgramCommitSnapshot& commit,
+        bool committed, bool ledgerFound, const NCBlockLifecycleSnapshot& ledger,
+        int sourcePC, int sourceLine);
+    void ObservePathCoreFeedFeedbackSameThread(const MotionFeedbackEvent& event,
+        bool ledgerAccepted);
+    bool CompletePathCoreFeedSameThread();
+    void RejectPathCoreFeedSameThread(std::uint32_t code, int alarmCode);
+    void FinalizePathCoreFeedSameThread() noexcept;
+    void LogPathCoreFeedSameThread(const char* phase) const noexcept;
+    void LogPathCoreFeedGeometrySameThread() const noexcept;
+    // BX-FEED-END
+
+    // BY-ARC-BEGIN: fixed NC-owned arc workspace, separate from G01 and G00.
+    MotionFeedArcWorkspace m_pathArcMotion{};
+    MotionCommand m_pathArcCommand{};
+    std::array<double, 2U> m_pathArcCenterOffset{};
+    std::array<double, 8U> m_pathArcWCS{}, m_pathArcCandidate{};
+    std::array<bool, 8U> m_pathArcProgrammed{};
+    struct PathArcState
+    {
+        std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL, commit = 0ULL;
+        MotionFeedbackSequence lastSequence = 0ULL;
+        std::uint32_t submitted = 0U, accepted = 0U, started = 0U, done = 0U;
+        std::uint32_t rejected = 0U, failed = 0U, code = 0U;
+        int sourcePC = -1, sourceLine = 0;
+        bool armed = false, pending = false, bound = false, consumerAccepted = false;
+        bool consumerStarted = false, completed = false, explicitArc = false;
+    } m_pathArc{};
+    static bool IsPathCoreArcBlockShapeValid(const NCBlock& block) noexcept;
+    bool IsPathCoreArcInputOmission(const NCBlock& block) const noexcept;
+    bool IsPathCoreArcConfigurationValid() noexcept;
+    void ArmPathCoreArcSameThread() noexcept;
+    void InvalidatePathCoreArcSameThread() noexcept;
+    void ValidatePathCoreArcSameThread();
+    void BeginPathCoreArcCaptureSameThread(const NCBlock& block,
+        NCBlockDispatchId dispatchId) noexcept;
+    WaitConditionFunc StartPathCoreArcSameThread(const NCBlock& block);
+    void CommitPathCoreArcCaptureSameThread(NCBlockDispatchId dispatchId,
+        const MotionProgramBlockCapture& capture, const NCProgramCommitSnapshot& commit,
+        bool committed, bool ledgerFound, const NCBlockLifecycleSnapshot& ledger,
+        int sourcePC, int sourceLine);
+    void ObservePathCoreArcFeedbackSameThread(const MotionFeedbackEvent& event,
+        bool ledgerAccepted);
+    bool CompletePathCoreArcSameThread();
+    void RejectPathCoreArcSameThread(std::uint32_t code, int alarmCode);
+    void FinalizePathCoreArcSameThread() noexcept;
+    void LogPathCoreArcSameThread(const char* phase) const noexcept;
+    void LogPathCoreArcGeometrySameThread() const noexcept;
+    // BY-ARC-END
+
+    // BZ-REPLAY-BEGIN: 16 immutable completed G01/arc rows and one live receipt.
+    NCPathCoreRetainedPath m_pathReplayStore{};
+    NCPathCoreRetainedGeometry m_pathReplayGeometry{};
+    MotionPathCoreRetainedWorkspace m_pathReplayMotion{};
+    MotionCommand m_pathReplayCommand{};
+    std::array<double, 8U> m_pathReplayPulsePerMM{}, m_pathReplayRotaryModulo{};
+    struct PathReplaySource
+    {
+        MotionExecutionIdentity identity{};
+        std::uint64_t dispatch = 0ULL, commit = 0ULL;
+        int sourcePC = -1, sourceLine = 0;
+    };
+    std::array<PathReplaySource, 16U> m_pathReplaySource{};
+    MotionOwnerLease m_pathReplayLease{};
+    struct PathReplayState
+    {
+        std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL, commit = 0ULL;
+        MotionFeedbackSequence lastSequence = 0ULL;
+        std::uint32_t submitted = 0U, accepted = 0U, started = 0U, done = 0U;
+        std::uint32_t rejected = 0U, failed = 0U, code = 0U;
+        std::uint32_t command = 0U, ordinal = 0U;
+        int sourcePC = -1, sourceLine = 0;
+        double feedMMMin = 0.0;
+        double requestedD = 0.0, appliedD = 0.0, startU = 0.0, endU = 0.0;
+        bool armed = false, pending = false, bound = false, consumerAccepted = false;
+        bool consumerStarted = false, completed = false, reverse = false, explicitReplay = false;
+        bool distanceMode = false, capped = false;
+    } m_pathReplay{};
+    static_assert(sizeof(PathReplaySource) <= 64U, "BZ provenance row storage budget changed.");
+    static_assert(sizeof(PathReplayState) <= 144U, "CA live replay state storage budget changed.");
+    bool IsPathCoreReplayConfigurationValid() noexcept;
+    static bool IsPathCoreReplayBlockShapeValid(const NCBlock& block) noexcept;
+    bool IsPathCoreReplayInputOmission(const NCBlock& block) const noexcept;
+    void ArmPathCoreReplaySameThread() noexcept;
+    void InvalidatePathCoreReplaySameThread() noexcept;
+    void ClearPathCoreReplayHistorySameThread() noexcept;
+    void ValidatePathCoreReplaySameThread();
+    void BeginPathCoreReplayCaptureSameThread(const NCBlock& block, NCBlockDispatchId dispatchId) noexcept;
+    void RetainPathCoreFeedSameThread() noexcept;
+    void RetainPathCoreArcSameThread() noexcept;
+    void AppendPathCoreReplayGeometrySameThread(const MotionExecutionIdentity& identity,
+        std::uint32_t validAxisMask, std::uint64_t dispatch, std::uint64_t commit,
+        int sourcePC, int sourceLine) noexcept;
+    WaitConditionFunc StartPathCoreReplaySameThread(const NCBlock& block);
+    void CommitPathCoreReplayCaptureSameThread(NCBlockDispatchId dispatchId,
+        const MotionProgramBlockCapture& capture, const NCProgramCommitSnapshot& commit,
+        bool committed, bool ledgerFound, const NCBlockLifecycleSnapshot& ledger,
+        int sourcePC, int sourceLine);
+    void ObservePathCoreReplayFeedbackSameThread(const MotionFeedbackEvent& event, bool ledgerAccepted);
+    bool CompletePathCoreReplaySameThread();
+    void RejectPathCoreReplaySameThread(std::uint32_t code, int alarmCode);
+    void FinalizePathCoreReplaySameThread() noexcept;
+    void LogPathCoreReplaySameThread(const char* phase) const noexcept;
+    void LogPathCoreReplayGeometrySameThread(std::uint32_t ordinal, bool reverse) const noexcept;
+    // BZ-REPLAY-END
+
+    // CB-HOLD-BEGIN: bounded opt-in excursions inside the next original source.
+    struct PathHoldState
+    {
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL, commit = 0ULL;
+        std::uint64_t candidateDispatch = 0ULL, observedTransition = 0ULL, observedSeamCount = 0ULL;
+        MotionNCSettleRequestSequence requestedHoldSequence = MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+        double distanceMM = 0.0, feedMMMin = 0.0;
+        double automaticIntervalMM = 0.0, automaticIntervalPulse = 0.0, automaticNextS = 0.0;
+        std::uint64_t automaticObservedReturns = 0ULL, automaticBoundarySequence = 0ULL;
+        MotionNCSettleRequestSequence automaticSettleSequence = MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+        bool automaticEnabled = false, automaticHoldOwned = false, automaticAdmissionOwned = false;
+        int sourcePC = -1, sourceLine = 0;
+        std::uint32_t code = 0U, cycleLimit = 1U;
+        bool armed = false, bound = false, requested = false, blocked = false;
+        bool explicitControl = false, startCommitted = false, crossSegment = false;
+    } m_pathHold{};
+    // CD: NC-owned immutable handoff scratch. No large automatic view copies.
+    MotionPathCoreHoldExcursionView m_pathHoldView{};
+    bool PreparePathCoreHoldHistorySameThread() noexcept;
+    bool BuildPathCoreHoldViewSameThread(bool line) noexcept;
+    // CB FIX1: NC-thread-only last fault survives revocation and rolling logs.
+    // Diagnostic storage only; never authorizes Motion or restores a source.
+    struct PathHoldLastFault
+    {
+        MotionPathCoreHoldExcursionSnapshot snapshot{};
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        std::uint64_t run = 0ULL, dispatch = 0ULL;
+        std::uint32_t code = 0U, origin = 0U, repeatCalls = 0U;
+        int alarmCode = 0, sourcePC = -1, sourceLine = 0;
+        bool present = false, rtValid = false, identityMatch = false, leaseMatch = false;
+    } m_pathHoldLastFault{};
+    static_assert(sizeof(PathHoldLastFault) <= 320U,
+        "CB last-fault diagnostics must remain fixed and bounded.");
+    static bool IsPathCoreHoldBlockShapeValid(const NCBlock& block) noexcept;
+    bool IsPathCoreHoldInputOmission(const NCBlock& block) const noexcept;
+    WaitConditionFunc StartPathCoreHoldSameThread(const NCBlock& block);
+    void BeginPathCoreHoldCaptureSameThread(const NCBlock& block,
+        NCBlockDispatchId dispatchId) noexcept;
+    void CommitPathCoreHoldCaptureSameThread(NCBlockDispatchId dispatchId);
+    void InvalidatePathCoreHoldSameThread() noexcept;
+    void FeedHoldInternal();
+    void CancelPathCoreHoldAutomaticSameThread(const char* reason) noexcept;
+    bool ProcessPathCoreHoldAutomaticSameThread() noexcept;
+    void LogPathCoreHoldAutomaticSameThread(const char* phase) const noexcept;
+    void ObservePathCoreHoldSameThread();
+    bool PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcept;
+    bool CommitPathCoreHoldResumeSameThread() noexcept;
+    void RejectPathCoreHoldSameThread(std::uint32_t code, int alarmCode,
+        const MotionPathCoreHoldExcursionSnapshot* observed = nullptr);
+    void CapturePathCoreHoldFaultSameThread(std::uint32_t code, int alarmCode,
+        std::uint32_t origin, const MotionPathCoreHoldExcursionSnapshot* observed = nullptr) noexcept;
+    void LogPathCoreHoldLastFaultSameThread() const noexcept;
+    void LogPathCoreHoldSameThread(const char* phase) const noexcept;
+    // CB-HOLD-END
+
 
     // L.2AO: borrowed D/F pairs end before the downstream J->AF/readback chain.
     void ObservePathCoreCommittedLinkAndSegmentSameThread() noexcept;

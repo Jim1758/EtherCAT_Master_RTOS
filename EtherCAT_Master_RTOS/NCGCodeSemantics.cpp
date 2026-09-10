@@ -94,6 +94,9 @@ namespace NCGCodeSemantics
             // Primary motion / machine actions
             // ---------------------------------------------------------
         case 0:
+        case 1: // BX: explicit G01 feed line, mm/min.
+        case 2: // BY-ARC: explicit G17 XY arc, exact stop.
+        case 3:
         case 7:
         case 28:
         case 30:
@@ -114,6 +117,20 @@ namespace NCGCodeSemantics
             // ---------------------------------------------------------
             // One-shot / parameter-owning actions
             // ---------------------------------------------------------
+// BR-BEGIN
+        case 171: // Explicit saved-start positioning, nonmodal; F is G00 percent.
+        case 172: // BT: L selects a frozen suffix on the first one-shot step.
+        case 173: // BV: one saved-end step in the frozen forward traversal.
+        case 174: // BZ: retained G01/arc reverse, explicit F mm/min.
+        case 175: // BZ: retained G01/arc forward after full retreat.
+        case 176: // CA: saved canonical interval retreat, D mm / F mm/min.
+        case 177: // CA: saved canonical interval advance, D mm / F mm/min.
+        case 178: // CB: arm one original-source Feed Hold excursion.
+        case 179: // CB: cancel an unused one-shot arm.
+            descriptor = MakeDescriptor(code, NCGCodeModalGroup::NONE,
+                NCGCodeRole::PRIMARY_ACTION, 200, true, true, true);
+            return true;
+            // BR-END
         case 4:   // Dwell
         case 10:  // Tool offset write
         case 12:  // Exact-stop / pre-read barrier

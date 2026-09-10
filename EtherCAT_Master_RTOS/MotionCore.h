@@ -17,6 +17,11 @@
 #include "MotionExecutionContract.h"
 #include "MotionCommandPathModeTransport.h"
 #include "MotionQueueTailTransaction.h"
+#include "MotionCommandedEndpointReceipt.h" // BQ producer-only data export
+#include "MotionFeedLineReceipt.h" // BX G01 producer-owned workspace
+#include "MotionFeedArcReceipt.h" // BY G02/G03 producer-owned workspace
+#include "MotionPathCoreRetainedReceipt.h" // BZ immutable traversal workspace
+#include "MotionPathCoreHoldExcursion.h" // CB same-source held excursion
 #include "MotionCommandRing.h"
 #include "MotionFeedbackRing.h"
 #include "MotionAxisCommandMailbox.h"
@@ -24,6 +29,8 @@
 
 class EtherCatMaster;
 constexpr int MAX_AXES = 8;//最大軸數宣告
+static_assert(MAX_AXES == MOTION_COMMANDED_ENDPOINT_AXIS_COUNT,
+    "BQ native-MCS receipt must match Motion axis capacity.");
 const double CYCLE_TIME_SEC = 0.00025;// EtherCAT 通訊週期 (250us)
 constexpr std::uint32_t MOTION_STARTUP_LAG_ARM_STABLE_SAMPLES = 8U;
 
@@ -556,6 +563,12 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     double endRadius = 0.0;
 
     int dir = 0; // 方向 (1=CCW, -1=CW)
+    // BY: consume the existing padding after dir; transport stays 560 bytes.
+    bool pathCorePlanarCircle = false;
+    bool pathCoreFullCircle = false;
+    // BZ: canonical geometry uses mem_* only while this fresh traversal is active.
+    bool pathCoreRetainedTraversal = false;
+    bool pathCoreRetainedReverse = false;
 
     // 運動參數
     double targetVel = 0.0;
@@ -632,6 +645,12 @@ static_assert(
     offsetof(MotionCommand, commandPathMode) == 555U &&
     offsetof(MotionCommand, sourcePlaneMode) == 556U,
     "K.6 commandPathMode must occupy the accepted x64 tail-padding byte.");
+static_assert(offsetof(MotionCommand, pathCorePlanarCircle) == 172U &&
+    offsetof(MotionCommand, pathCoreFullCircle) == 173U,
+    "BY circular policy flags must consume existing dir padding only.");
+static_assert(offsetof(MotionCommand, pathCoreRetainedTraversal) == 174U &&
+    offsetof(MotionCommand, pathCoreRetainedReverse) == 175U,
+    "BZ traversal flags must consume the remaining dir padding only.");
 #endif
 
 // Stage NC-0.2D：NC Producer 在單一 Program Block 派送期間，
@@ -2084,6 +2103,20 @@ public:
     // 因此使用速度型停止快照，不要求 IsGroupDone()。
     MotionFeedHoldStopSnapshot GetFeedHoldStopSnapshot() const noexcept;
 
+    bool BindPathCoreHoldExcursion(const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& lease, double lengthMM, double lengthPulse,
+        double distanceMM, double feedMMMin,
+        double sourceFeedMMMin, double sourceVelocityPPS,
+        std::uint32_t cycleLimit = 1U,
+        const MotionPathCoreHoldExcursionView* crossView = nullptr) noexcept;
+    bool RequestPathCoreHoldExcursion(const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& lease, MotionNCSettleRequestSequence settleSequence) noexcept;
+    bool CommitPathCoreHoldExcursion(const MotionExecutionIdentity& identity,
+        const MotionOwnerLease& lease, MotionNCSettleRequestSequence settleSequence) noexcept;
+    void CancelPathCoreHoldExcursion() noexcept;
+    MotionPathCoreHoldExcursionSnapshot GetPathCoreHoldExcursionSnapshot() const noexcept;
+
+
     // Stage NC-0.2J.4：跨執行緒讀取只碰 Atomic Publication Bank，
     // 不直接讀取 250 us Motion owner 的 AxisContext / Group 狀態。
     MotionStopSettleSnapshot GetStopSettleSnapshot() const noexcept;
@@ -2426,6 +2459,80 @@ private:
     // reader never races a plain AxisContext read and no mutex or atomic large
     // structure is required.
     // ========================================================================
+    struct PathCoreHoldRequest
+    {
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        std::uint64_t generation = 0ULL;
+        std::uint64_t settleSequence = 0ULL;
+        std::uint64_t expectedTransitionSequence = 0ULL;
+        std::uint32_t cycleLimit = 1U;
+        double lengthMM = 0.0, lengthPulse = 0.0, distanceMM = 0.0, feedMMMin = 0.0;
+        double sourceFeedMMMin = 0.0, sourceVelocityPPS = 0.0;
+        bool start = false, crossSegment = false;
+        MotionPathCoreHoldExcursionView crossView{};
+    };
+    FixedCapacitySpscRing<PathCoreHoldRequest, 8U> m_pathHoldRequests{};
+    // NC producer only: successful enqueue ticket binds Commit and rejects
+    // duplicate starts before the RT consumer publishes its next transition.
+    PathCoreHoldRequest m_pathHoldStartTicket{};
+    PathCoreHoldRequest m_pathHoldProducerRequest{}; // sole NC producer scratch
+    PathCoreHoldRequest m_pathHoldConsumeRequest{}; // RT scratch, never a full view on the RT stack
+    std::atomic<std::uint64_t> m_pathHoldGeneration{ 1ULL };
+    std::atomic<std::uint64_t> m_pathHoldCommittedRequest{ 0ULL };
+    struct PathCoreHoldRuntime
+    {
+        MotionPathCoreHoldExcursionSnapshot status{};
+        std::uint64_t generation = 0ULL;
+        std::uint64_t lastSettleTick = 0ULL;
+        std::uint64_t lastAcceptedStartSequence = 0ULL;
+        double lengthMM = 0.0, excursionVelocity = 0.0, goal = 0.0;
+        double sourceVelocityPPS = 0.0;
+        double savedPlanning = 0.0, savedFinalTarget = 0.0;
+        double savedMaxVelocity = 0.0, savedCruise = 0.0, savedAcc = 0.0, savedDec = 0.0;
+        double savedTargetVelocity = 0.0, savedTargetEndVelocity = 0.0;
+        std::array<double, MAX_AXES> actualMinimum{}, actualMaximum{};
+        std::array<double, MAX_AXES> heldCommand{};
+        std::uint32_t settleCycles = 0U;
+        bool sourceSeen = false, endpoint = false, endpointSettled = false, startPending = false, movementOwned = false;
+        bool startCaptured = false;
+        MotionPathCoreHoldExcursionView crossView{};
+        double spanStartS = 0.0, originalExcursionVelocity = 0.0;
+        std::array<int, MAX_AXES> originalAxisIndices{};
+        std::uint32_t unionAxisMask = 0U;
+        int originalAxisCount = 0;
+        bool unionActive = false, crossGeometryActive = false;
+        bool prelaunchRejected = false; // zero-motion distance rejection owns a stationary source fence
+    } m_pathHold{};
+    static constexpr std::size_t PATH_HOLD_WORD_COUNT =
+        (sizeof(MotionPathCoreHoldExcursionSnapshot) + 7U) / 8U;
+    struct PathCoreHoldAtomicBank
+    {
+        std::atomic<std::uint64_t> sequence{ 0ULL };
+        std::array<std::atomic<std::uint64_t>, PATH_HOLD_WORD_COUNT> words{};
+        PathCoreHoldAtomicBank() noexcept
+        {
+            for (auto& word : words) word.store(0ULL, std::memory_order_relaxed);
+        }
+    };
+    std::array<PathCoreHoldAtomicBank, 2U> m_pathHoldBanks{};
+    std::atomic<std::uint64_t> m_pathHoldPublication{ 0ULL };
+    std::uint64_t m_pathHoldNextPublication = 0ULL;
+    bool ProcessPathCoreHoldExcursion(AxisCommand& command) noexcept;
+    bool IsPathCoreHoldExcursionDriving() const noexcept;
+    bool IsPathCoreHoldEffectiveMappingValid() const noexcept;
+    bool ValidatePathCoreHoldCrossSource() const noexcept;
+    bool ExpandPathCoreHoldAxisUnion() noexcept;
+    void RestorePathCoreHoldAxisUnion() noexcept;
+    bool BeginPathCoreHoldSpan(std::uint32_t ordinal, double startS, double targetS) noexcept;
+    bool MapPathCoreHoldExcursionGeometry(const AxisCommand& command) noexcept;
+    bool IsPathCoreHoldStrictlyStopped() const noexcept;
+    bool IsPathCoreHoldSourceCurrent() const noexcept;
+    bool ClosePathCoreHoldEndpoint(AxisCommand& command) noexcept;
+    void UpdatePathCoreHoldExcursionEvidence() noexcept;
+    void PublishPathCoreHoldExcursionSnapshot() noexcept;
+    void SetPathCoreHoldPhase(MotionPathCoreHoldExcursionPhase phase, std::uint32_t reason = 0U) noexcept;
+
     struct MotionStopSettlePublicationPayload
     {
         MotionStopSettleSnapshot snapshot{};
@@ -2968,6 +3075,18 @@ private:
     void PublishQueueTailTransactionReceipt(
         MotionQueueTailCommitReceipt& receipt,
         bool invalidInput) noexcept;
+    void RejectPathCoreRetainedPublication(
+        MotionCommand& command,
+        MotionExecutionEpoch plannedEpoch,
+        MotionExecutionEpoch publishedEpoch,
+        MotionCommandSource source,
+        const MotionOwnerLease& plannedOwner,
+        MotionPathCoreRetainedReceipt& result) noexcept;
+    void RejectPathCoreArcPublication(
+        MotionCommand& command, MotionExecutionEpoch plannedEpoch,
+        MotionExecutionEpoch publishedEpoch, MotionCommandSource source,
+        const MotionOwnerLease& plannedOwner, MotionFeedArcReceipt& result) noexcept;
+
     bool TryLineMove(
         const std::vector<int>& axes,
         const std::vector<double>& targetPos,
@@ -2987,7 +3106,8 @@ private:
         MotionCommandPathMode commandPathMode,
         double rapidOverrideCandidate,
         double* commandedMCSTail,
-        bool transactionalTail);
+        bool transactionalTail,
+        MotionCommandedEndpointReceiptV1* commandedEndpointReceipt = nullptr);
     void ObserveCommandPathModeProducer(
         const MotionCommand& command,
         bool accepted) noexcept;
@@ -3367,6 +3487,48 @@ public:
         MotionCommandPathMode commandPathMode,
         double rapidOverrideCandidate,
         double(&commandedMCSTail)[MAX_AXES]);
+    // BQ: optional data export; the compatibility overload above is unchanged.
+    bool TryG00MoveTransactionalTail(
+        const std::vector<int>& axes,
+        const std::vector<double>& targetPos,
+        BufferMode mode,
+        MotionCommandPathMode commandPathMode,
+        double rapidOverrideCandidate,
+        double(&commandedMCSTail)[MAX_AXES],
+        MotionCommandedEndpointReceiptV1* commandedEndpointReceipt);
+    // BX: G01 uses mm/min along the physical XYZ chord, exact-stop only.
+    bool TryG01MoveTransactionalTail(
+        const std::vector<int>& axes,
+        const std::vector<double>& targetMCS,
+        double feedMMMin,
+        double(&commandedMCSTail)[MAX_AXES],
+        MotionFeedLineWorkspace& workspace);
+    // BY: synchronous borrowed travel guard, caller-owned command scratch.
+    bool TryG02G03MoveTransactionalTail(
+        const std::array<double, 8U>& targetMCS,
+        const std::array<double, 2U>& centerOffsetMM,
+        int direction, bool fullCircle, double feedMMMin,
+        const MotionArcTravelGuard& travelGuard,
+        double(&commandedMCSTail)[MAX_AXES],
+        MotionFeedArcWorkspace& workspace,
+        MotionCommand& commandWorkspace);
+
+    // BZ: evaluate the original canonical line/circle in either direction.
+    bool TryPathCoreRetainedMoveTransactionalTail(
+        const NCPathCoreRetainedGeometry& geometry, bool reverse, double feedMMMin,
+        const MotionArcTravelGuard& travelGuard,
+        double(&commandedMCSTail)[MAX_AXES],
+        MotionPathCoreRetainedWorkspace& workspace,
+        MotionCommand& commandWorkspace);
+
+    // CA: traverse a finite sub-interval of the unchanged canonical source.
+    bool TryPathCoreRetainedIntervalMoveTransactionalTail(
+        const NCPathCoreRetainedGeometry& geometry, double startU, double endU, double feedMMMin,
+        const MotionArcTravelGuard& travelGuard,
+        double(&commandedMCSTail)[MAX_AXES],
+        MotionPathCoreRetainedWorkspace& workspace,
+        MotionCommand& commandWorkspace);
+
     void G07_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G07 快速定位 API
     void G161_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G161 快速定位 API
     void G53_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G53 機械定位 API

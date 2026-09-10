@@ -67,6 +67,12 @@ public:
         axis_is_not_Homed = NC_BASE + 11,   // 2011:軸尚未尋原點
         PROGRAM_END_GATE_ERROR = NC_BASE + 12, // 2012:程式結束完整性閘門失敗
         MACRO_VARIABLE_INDEX_OUT_OF_RANGE = NC_BASE + 13, // 2013:Macro變數索引超出允許範圍
+        PATH_EXECUTION_NOT_READY = NC_BASE + 14, // 2014:路徑執行狀態或設定未就緒 / Path execution not ready
+        PATH_GEOMETRY_INVALID = NC_BASE + 15, // 2015:路徑座標或幾何無效 / Invalid path geometry
+        PATH_REPLAY_HISTORY_UNAVAILABLE = NC_BASE + 16, // 2016:回退歷史或回放狀態不可用 / Replay history or state unavailable
+        PATH_REPLAY_HISTORY_CAPACITY = NC_BASE + 17, // 2017:回退歷史超過固定容量 / Replay history capacity exceeded
+        PATH_MOTION_NOT_ADMITTED = NC_BASE + 18, // 2018:路徑Motion命令未受理 / Path motion not admitted
+        PATH_RETREAT_UNAVAILABLE = NC_BASE + 19, // 2019:要求的回退路徑不可用 / Requested retreat path unavailable
     };
 
     // 🌟 4. 運動軸控警報 (3000 ~ 3999)

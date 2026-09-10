@@ -115,6 +115,28 @@ bool MotionCore::TryG00MoveTransactionalTail(
 }
 
 
+// BQ: the caller owns the output workspace; no Motion capture ABI changes.
+bool MotionCore::TryG00MoveTransactionalTail(
+    const std::vector<int>& axes,
+    const std::vector<double>& targetPos_mm,
+    BufferMode mode,
+    MotionCommandPathMode commandPathMode,
+    double rapidOverrideCandidate,
+    double(&commandedMCSTail)[MAX_AXES],
+    MotionCommandedEndpointReceiptV1* commandedEndpointReceipt)
+{
+    return TryG00MoveInternal(
+        axes,
+        targetPos_mm,
+        mode,
+        commandPathMode,
+        rapidOverrideCandidate,
+        commandedMCSTail,
+        true,
+        commandedEndpointReceipt);
+}
+
+
 bool MotionCore::TryG00MoveInternal(
     const std::vector<int>& axes,
     const std::vector<double>& targetPos_mm,
@@ -122,8 +144,15 @@ bool MotionCore::TryG00MoveInternal(
     MotionCommandPathMode commandPathMode,
     double rapidOverrideCandidate,
     double* commandedMCSTail,
-    bool transactionalTail)
+    bool transactionalTail,
+    MotionCommandedEndpointReceiptV1* commandedEndpointReceipt)
 {
+    // BQ: every invocation starts unpublished, including every rejection path.
+    if (commandedEndpointReceipt != nullptr)
+    {
+        commandedEndpointReceipt->Clear();
+    }
+
     // Capture one Producer tuple. TryLineMove revalidates it without blocking:
     // BUFFERED keeps this exact tuple, while ABORTING may publish only its exact
     // successor.  The sidecar tag is the final commit seal after enqueue.
@@ -155,6 +184,12 @@ bool MotionCore::TryG00MoveInternal(
             bool publishFormalMotionReject,
             MotionRejectReason formalRejectReason) -> bool
     {
+        // BQ: a rejected attempt cannot leave a preceding endpoint readable.
+        if (commandedEndpointReceipt != nullptr)
+        {
+            commandedEndpointReceipt->Clear();
+        }
+
         if (publishFormalMotionReject)
         {
             MotionCommand rejectedCommand{};
@@ -374,6 +409,18 @@ bool MotionCore::TryG00MoveInternal(
                 stagedCommandedMCS[axisSlot] = baselineMCS;
             }
         }
+    }
+
+    // BQ: retain the exact staged baseline before programmed targets replace
+    // it. ABORTING has already sampled/rebuilt its successor native MCS here.
+    // The mask describes existing baseline axes, separate from programmed axes.
+    if (transactionalTail && commandedEndpointReceipt != nullptr)
+    {
+        commandedEndpointReceipt->startMCS = stagedCommandedMCS;
+        commandedEndpointReceipt->validAxisMask = stagedValidMask;
+        commandedEndpointReceipt->origin = mode == BufferMode::ABORTING
+            ? MotionCommandedBaselineOrigin::ABORTING_BASELINE
+            : MotionCommandedBaselineOrigin::BUFFERED_TAIL;
     }
 
     std::vector<double> targetPosPulse(axes.size(), 0.0);
@@ -644,6 +691,12 @@ bool MotionCore::TryG00MoveInternal(
     const auto failAcceptedCommit =
         [&](bool assignmentCommitted) -> bool
     {
+        // BQ: post-enqueue tuple failures keep the data export unpublished.
+        if (commandedEndpointReceipt != nullptr)
+        {
+            commandedEndpointReceipt->Clear();
+        }
+
         if (transactionalTail)
         {
             receipt.commandAccepted = true;
@@ -753,5 +806,37 @@ bool MotionCore::TryG00MoveInternal(
     receipt.accountingValid = true;
     receipt.committedFingerprint = stagedCommittedFingerprint;
     PublishQueueTailTransactionReceipt(receipt, false);
+
+    // BQ: PublishQueueTailTransactionReceipt fills captureBound; copy its final
+    // value only after publication. Data validation never changes G00 outcome.
+    if (commandedEndpointReceipt != nullptr)
+    {
+        commandedEndpointReceipt->transaction = receipt;
+        commandedEndpointReceipt->endMCS = stagedCommandedMCS;
+        const std::uint32_t validAxisMask =
+            commandedEndpointReceipt->validAxisMask;
+        bool endpointValid = receipt.IsCommitted() && receipt.captureBound &&
+            validAxisMask != 0U &&
+            (validAxisMask >> MAX_AXES) == 0U &&
+            (receipt.axisMask & validAxisMask) == receipt.axisMask;
+        for (std::size_t axisSlot = 0U;
+            axisSlot < MOTION_COMMANDED_ENDPOINT_AXIS_COUNT;
+            ++axisSlot)
+        {
+            endpointValid = endpointValid &&
+                std::isfinite(commandedEndpointReceipt->startMCS[axisSlot]) &&
+                std::isfinite(commandedEndpointReceipt->endMCS[axisSlot]);
+        }
+        if (endpointValid)
+        {
+            commandedEndpointReceipt->schemaVersion =
+                MOTION_COMMANDED_ENDPOINT_SCHEMA_VERSION;
+            commandedEndpointReceipt->valid = true;
+        }
+        else
+        {
+            commandedEndpointReceipt->Clear();
+        }
+    }
     return true;
 }

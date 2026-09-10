@@ -7,6 +7,8 @@
 #include "CoordinateManager.h"
 #include "SHM_Types.h"
 #include "AlarmManager.h"
+#include "NCPathCoreFeedArc.h" // BY fixed planar circle consumer geometry
+#include "MotionRetainedInterval.h" // CA canonical interval transport and evaluation
 
 namespace
 {
@@ -263,6 +265,149 @@ namespace
         return mask;
     }
 
+    // BZ uses the two remaining dir-padding flags and existing mem_* bytes.
+    // These values are canonical path data, never a legacy history snapshot.
+    bool IsMotionCommandRetainedGeometryValid(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts) noexcept
+    {
+        if (!command.pathCoreRetainedTraversal)
+            return !command.pathCoreRetainedReverse;
+        if (contexts == nullptr || contexts->empty() || contexts->size() > MAX_AXES ||
+            command.axisCount <= 0 || command.axisCount > MAX_AXES)
+            return false;
+        if (command.replayTerminalAlreadyPublished || command.mem_enableTransform ||
+            command.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+            command.sourceWCS != 54 || command.sourceToolLengthMode != 49 ||
+            command.sourceToolRadiusMode != 40 || !command.sourceIsAbsoluteMode ||
+            command.sourceG68Active || command.sourceG168Active || command.sourceG51Active ||
+            command.sourceMirrorMask != 0U || command.sourceG16Active || command.sourceG162Active ||
+            command.sourcePlaneMode != 17 || command.targetVel < 0.0 ||
+            command.accTime <= 0.0 || command.decTime <= 0.0 ||
+            !std::isfinite(command.mem_totalDist) || command.mem_totalDist < 0.0)
+            return false;
+        for (int axis = 0; axis < MAX_AXES; ++axis)
+        {
+            if (!std::isfinite(command.mem_startPos[axis]) || !std::isfinite(command.mem_ratio[axis]))
+                return false;
+        }
+        double startU = 0.0, endU = 0.0, intervalDistance = 0.0;
+        if (!GetMotionRetainedInterval(command, startU, endU, intervalDistance))
+            return false;
+        double length = 0.0;
+        bool pulseChanges = false;
+        for (int slot = 0; slot < command.axisCount; ++slot)
+        {
+            const int axis = command.axisIndices[slot];
+            if (axis < 0 || axis > 2 || axis >= static_cast<int>(contexts->size()) ||
+                (*contexts)[axis].axisType != AxisType::LINEAR ||
+                !std::isfinite((*contexts)[axis].maxVel_PPS) || (*contexts)[axis].maxVel_PPS <= 0.0)
+                return false;
+            double expectedStart = 0.0, expectedTarget = 0.0;
+            if (!EvaluateMotionRetainedPulseCanonical(command, static_cast<std::size_t>(axis), startU, expectedStart) ||
+                !EvaluateMotionRetainedPulseCanonical(command, static_cast<std::size_t>(axis), endU, expectedTarget) ||
+                command.targetPos[slot] != expectedTarget)
+                return false;
+            pulseChanges = pulseChanges || expectedStart != expectedTarget;
+            const double delta = command.mem_ratio[axis] - command.mem_startPos[axis];
+            if (!std::isfinite(delta)) return false;
+            length = std::hypot(length, delta);
+            const double projection = command.pathCorePlanarCircle ? command.targetVel :
+                command.mem_totalDist == 0.0 ? 0.0 : std::abs(command.targetVel * (delta / command.mem_totalDist));
+            if (!std::isfinite(projection) || projection > (*contexts)[axis].maxVel_PPS ||
+                (!command.pathCorePlanarCircle && delta != 0.0 &&
+                    (delta / command.mem_totalDist == 0.0 || projection == 0.0)))
+                return false;
+        }
+        if (command.mem_totalDist > 0.0 &&
+            !(command.pathCoreFullCircle && std::abs(endU - startU) == 1.0) && !pulseChanges)
+            return false;
+        for (int axis = 0; axis < MAX_AXES; ++axis)
+        {
+            bool selected = false;
+            for (int slot = 0; slot < command.axisCount; ++slot)
+                selected = selected || command.axisIndices[slot] == axis;
+            if (!selected && command.mem_startPos[axis] != command.mem_ratio[axis])
+                return false;
+        }
+        if (command.mode == InterpolationMode::LINEAR)
+        {
+            const double error = std::abs(length - command.mem_totalDist);
+            return !command.pathCorePlanarCircle && !command.pathCoreFullCircle &&
+                std::isfinite(length) && error <= 64.0 * std::numeric_limits<double>::epsilon() *
+                (std::max)(1.0, length) &&
+                ((length == 0.0 && command.mem_totalDist == 0.0 && command.targetVel == 0.0) ||
+                    (length > 0.0 && command.mem_totalDist > 0.0 && command.targetVel >= 1.0));
+        }
+        // Validate the queued canonical circle without deriving a replacement
+        // radius, start angle or sweep. A corrupted angle cannot authorize an
+        // interior jump merely because its target endpoint still looks valid.
+        for (int axis = 0; axis < 2; ++axis)
+        {
+            if (axis >= static_cast<int>(contexts->size())) return false;
+            const AxisContext& context = (*contexts)[axis];
+            const double ppm = context.resolution_PPR / context.finalLead;
+            if (!std::isfinite(context.resolution_PPR) || context.resolution_PPR <= 0.0 ||
+                !std::isfinite(context.finalLead) || context.finalLead <= 0.0 ||
+                !std::isfinite(ppm) || ppm <= 0.0) return false;
+            const double center = axis == 0 ? command.mem_centerX : command.mem_centerY;
+            const double scale = (std::max)(1.0, (std::max)(std::abs(center),
+                (std::max)(std::abs(command.mem_radius), (std::max)(std::abs(command.mem_startPos[axis]), std::abs(command.mem_ratio[axis])))));
+            for (int end = 0; end < 2; ++end)
+            {
+                const double angle = command.mem_startAngle + (end == 0 ? 0.0 : command.mem_totalAngle);
+                const double evaluated = center + command.mem_radius * (axis == 0 ? std::cos(angle) : std::sin(angle));
+                const double expected = end == 0 ? command.mem_startPos[axis] : command.mem_ratio[axis];
+                const double error = std::abs(evaluated - expected);
+                if (!std::isfinite(evaluated) ||
+                    error > 64.0 * std::numeric_limits<double>::epsilon() * scale || error / ppm > 5e-8)
+                    return false;
+            }
+        }
+        const double originalDirection = command.pathCoreRetainedReverse ? -command.dir : command.dir;
+        const double twoPi = 2.0 * std::acos(-1.0);
+        return command.pathCorePlanarCircle && command.targetVel >= 1.0 &&
+            std::isfinite(command.mem_radius) && command.mem_radius > 0.0 &&
+            command.mem_radius == command.startRadius &&
+            std::isfinite(command.mem_centerX) && std::isfinite(command.mem_centerY) &&
+            command.mem_centerX == command.centerPos[0] && command.mem_centerY == command.centerPos[1] &&
+            std::isfinite(command.mem_startAngle) && std::abs(command.mem_startAngle) <= twoPi &&
+            std::isfinite(command.mem_totalAngle) && command.mem_totalAngle * originalDirection > 0.0 &&
+            std::abs(command.mem_totalAngle) <= twoPi && command.mem_totalDist > 0.0 &&
+            std::isfinite(command.mem_radius * std::abs(command.mem_totalAngle)) &&
+            command.mem_totalDist == command.mem_radius * std::abs(command.mem_totalAngle) &&
+            (command.pathCoreFullCircle ? (std::abs(command.mem_totalAngle) == twoPi &&
+                command.mem_startPos[0] == command.mem_ratio[0] && command.mem_startPos[1] == command.mem_ratio[1])
+                : std::abs(command.mem_totalAngle) < twoPi);
+    }
+
+    bool DoesMotionRetainedStartMatch(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts) noexcept
+    {
+        if (contexts == nullptr || contexts->empty() || contexts->size() > MAX_AXES)
+            return false;
+        double startU = 0.0, endU = 0.0, intervalDistance = 0.0;
+        if (!GetMotionRetainedInterval(command, startU, endU, intervalDistance)) return false;
+        for (std::size_t axis = 0U; axis < contexts->size(); ++axis)
+        {
+            const AxisContext& context = (*contexts)[axis];
+            if (!context.isExist) continue;
+            const double actual = context.logicalCmdPos;
+            double expected = 0.0;
+            if (!EvaluateMotionRetainedPulseCanonical(command, axis, startU, expected)) return false;
+            double scale = (std::max)(1.0, (std::max)(std::abs(command.mem_startPos[axis]), std::abs(command.mem_ratio[axis])));
+            if (command.pathCorePlanarCircle && axis < 2U)
+                scale = (std::max)(scale, (std::max)(std::abs(command.centerPos[axis]), command.mem_radius));
+            const double error = std::abs(actual - expected);
+            const double ppm = context.resolution_PPR / context.finalLead;
+            if (!std::isfinite(actual) || !std::isfinite(context.resolution_PPR) || context.resolution_PPR <= 0.0 ||
+                !std::isfinite(context.finalLead) || context.finalLead <= 0.0 ||
+                !std::isfinite(ppm) || ppm <= 0.0 ||
+                error > 64.0 * std::numeric_limits<double>::epsilon() * scale || error / ppm > 1e-7)
+                return false;
+        }
+        return true;
+    }
+
     bool IsMotionCommandConsumerGeometryValid(
         const MotionCommand& command,
         const std::vector<AxisContext>* contexts) noexcept
@@ -275,6 +420,27 @@ namespace
             !std::isfinite(command.targetVel) ||
             !std::isfinite(command.accTime) ||
             !std::isfinite(command.decTime))
+        {
+            return false;
+        }
+
+        if (!IsMotionCommandRetainedGeometryValid(command, contexts))
+            return false;
+
+        // BY: flags authorize only the bounded native XY circle contract.
+        // Legacy LINEAR / spiral commands keep both flags false.
+        if (command.pathCoreFullCircle && !command.pathCorePlanarCircle)
+        {
+            return false;
+        }
+        if (command.pathCorePlanarCircle &&
+            (command.axisCount != 2 ||
+                command.axisIndices[0] != 0 || command.axisIndices[1] != 1 ||
+                command.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+                !std::isfinite(command.startRadius) || command.startRadius <= 0.0 ||
+                command.startRadius != command.endRadius ||
+                !((command.mode == InterpolationMode::CIRCULAR_CW && command.dir == -1) ||
+                    (command.mode == InterpolationMode::CIRCULAR_CCW && command.dir == 1))))
         {
             return false;
         }
@@ -378,7 +544,8 @@ namespace
         const MotionCommand& command) noexcept
     {
         const int axisCount = ClampMotionAxisCount(command.axisCount);
-        if (axisCount <= 0 ||
+        if (command.pathCoreRetainedTraversal || command.pathCoreRetainedReverse ||
+            axisCount <= 0 ||
             axisCount != command.axisCount ||
             !std::isfinite(command.mem_totalDist) ||
             command.mem_totalDist <= 0.0)
@@ -11473,6 +11640,18 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     if (isStopping)
     {
         isHandoverReady = (isPlanDone && isBufferDry);
+        if (isHandoverReady && axis.isVirtualAxis &&
+            &axis == &m_Group.virtualAxis && m_Group.isActive &&
+            (m_Group.currentCmd.pathCoreRetainedTraversal || IsPathCoreHoldExcursionDriving()) &&
+            !m_safetyControlledStopInProgress && axis.velBuffer.size() > 1)
+        {
+            // BZ_FIX1: sub-pulse paths can have a filtered velocity below
+            // 1 PPS while their last step is still inside the filter. Drain
+            // every pending sample before IDLE erases the remaining tail.
+            // An endpoint clamp has already cleared this buffer and passes.
+            isHandoverReady = std::all_of(axis.velBuffer.begin(), axis.velBuffer.end(),
+                [](double velocity) { return velocity == 0.0; });
+        }
     }
 
 
@@ -14319,7 +14498,7 @@ void MotionCore::LoadNextCommand()
     }
 
     if (m_Group.isActive &&
-        m_Group.enableHistory &&
+        m_Group.enableHistory && !m_Group.currentCmd.pathCoreRetainedTraversal &&
         GetCommandAuthorizationFailure(m_Group.currentCmd) ==
         MotionRejectReason::NONE)
     {
@@ -14607,7 +14786,58 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // LINEAR
     // ======================================================
-    if (m_Group.mode == InterpolationMode::LINEAR)
+    if (cmd.pathCoreRetainedTraversal)
+    {
+        // Canonical values remain the complete ORIGINAL source. Only the
+        // scalar travel distance and parameter boundaries use the interval.
+        double startU = 0.0, endU = 0.0, intervalDistance = 0.0;
+        if (!GetMotionRetainedInterval(cmd, startU, endU, intervalDistance))
+        {
+            FailDerivedConsumerGeometry();
+            return;
+        }
+        if (m_Group.pathMode != PathMode::EXACT_STOP || m_Group.enableHistory ||
+            m_Group.enableTransform || m_Group.jumpManager.state != JumpState::IDLE ||
+            !DoesMotionRetainedStartMatch(cmd, m_pContexts))
+        {
+            FailDerivedConsumerGeometry();
+            return;
+        }
+        for (int slot = 0; slot < cmd.axisCount; ++slot)
+        {
+            const int axis = cmd.axisIndices[slot];
+            m_Group.axisIndices[slot] = axis;
+            if (!EvaluateMotionRetainedPulseCanonical(cmd, static_cast<std::size_t>(axis), startU, m_Group.startPos[slot]))
+            {
+                FailDerivedConsumerGeometry();
+                return;
+            }
+            m_Group.ratio[slot] = cmd.mem_totalDist == 0.0 ? 0.0 :
+                (cmd.mem_ratio[axis] - cmd.mem_startPos[axis]) / cmd.mem_totalDist *
+                (cmd.pathCoreRetainedReverse ? -1.0 : 1.0);
+        }
+        m_Group.radius = cmd.mem_radius;
+        m_Group.startAngle = cmd.mem_startAngle;
+        m_Group.totalAngle = cmd.mem_totalAngle;
+        m_Group.centerX = cmd.mem_centerX;
+        m_Group.centerY = cmd.mem_centerY;
+        m_Group.totalDist3D = intervalDistance;
+        vAxis.finalTargetPos = intervalDistance;
+        if (intervalDistance == 0.0)
+        {
+            CompleteWithoutMotion();
+            return;
+        }
+        if (HasInvalidZeroVelocity()) return;
+        vAxis.inPosition = false;
+        for (int slot = 0; slot < cmd.axisCount; ++slot)
+        {
+            AxisContext& realAxis = (*m_pContexts)[cmd.axisIndices[slot]];
+            realAxis.state = MotionState::MotionState_INTERPOLATING;
+            realAxis.inPosition = false;
+        }
+    }
+    else if (m_Group.mode == InterpolationMode::LINEAR)
     {
         double totalDist = 0.0;
         bool alreadyAtTarget = true;
@@ -14848,79 +15078,103 @@ void MotionCore::LoadNextCommand()
         m_Group.centerY = cy;
 
 
-        // ----------------------------------------------
-        // 起始 / 結束角
-        // ----------------------------------------------
-        m_Group.startAngle = std::atan2(sy - cy, sx - cx);
-
-        double endAngle = std::atan2(ey - cy, ex - cx);
-
-
-        double totalAngle = endAngle - m_Group.startAngle;
-
-
-        if (m_Group.mode == InterpolationMode::CIRCULAR_CCW)
+        double totalDist3D = 0.0;
+        if (cmd.pathCorePlanarCircle)
         {
-            if (totalAngle <= 0.0)
+            NCPathCoreArcPulseGeometry circle{};
+            if (m_Group.pathMode != PathMode::EXACT_STOP || m_Group.enableTransform ||
+                !ResolveNCPathCorePlanarCirclePulse(sx, sy, ex, ey, cx, cy,
+                    cmd.startRadius, cmd.dir, cmd.pathCoreFullCircle, circle))
             {
-                totalAngle += 2.0 * 3.14159265359;
+                FailDerivedConsumerGeometry();
+                return;
             }
+            // Both radii are intentionally identical. A rounding seam in the
+            // observed start must never select the variable-radius integral.
+            m_Group.startAngle = circle.startAngle;
+            m_Group.totalAngle = circle.sweepRadians;
+            m_Group.radius = circle.radius;
+            m_Group.currentCmd.startRadius = circle.radius;
+            m_Group.currentCmd.endRadius = circle.radius;
+            totalDist3D = circle.lengthPulse;
         }
         else
         {
-            if (totalAngle >= 0.0)
+            // ----------------------------------------------
+            // 起始 / 結束角
+            // ----------------------------------------------
+            m_Group.startAngle = std::atan2(sy - cy, sx - cx);
+
+            double endAngle = std::atan2(ey - cy, ex - cx);
+
+
+            double totalAngle = endAngle - m_Group.startAngle;
+
+
+            if (m_Group.mode == InterpolationMode::CIRCULAR_CCW)
             {
-                totalAngle -= 2.0 * 3.14159265359;
+                if (totalAngle <= 0.0)
+                {
+                    totalAngle += 2.0 * 3.14159265359;
+                }
             }
+            else
+            {
+                if (totalAngle >= 0.0)
+                {
+                    totalAngle -= 2.0 * 3.14159265359;
+                }
+            }
+
+
+            m_Group.totalAngle = totalAngle;
+
+
+            // ----------------------------------------------
+            // Radius
+            // ----------------------------------------------
+            const double startDeltaX = sx - cx;
+            const double startDeltaY = sy - cy;
+            const double endDeltaX = ex - cx;
+            const double endDeltaY = ey - cy;
+            double startRadius = std::hypot(startDeltaX, startDeltaY);
+            double endRadius = std::hypot(endDeltaX, endDeltaY);
+            if (!std::isfinite(startDeltaX) ||
+                !std::isfinite(startDeltaY) ||
+                !std::isfinite(endDeltaX) ||
+                !std::isfinite(endDeltaY) ||
+                !std::isfinite(startRadius) ||
+                !std::isfinite(endRadius) ||
+                !std::isfinite(totalAngle))
+            {
+                FailDerivedConsumerGeometry();
+                return;
+            }
+            m_Group.currentCmd.startRadius = startRadius;
+            m_Group.currentCmd.endRadius = endRadius;
+            m_Group.radius = startRadius;
+
+
+            // ----------------------------------------------
+            // 3D Arc Distance
+            // ----------------------------------------------
+            double avgRadius = (startRadius + endRadius) / 2.0;
+
+            double arcLength = avgRadius * std::abs(totalAngle);
+
+
+            // ----------------------------------------------
+            // True 3D Spiral / Arc Distance
+            //
+            // 支援：
+            // 1. 標準等半徑 Arc
+            // 2. Helix
+            // 3. Variable Radius Spiral
+            // 4. Variable Radius + Z
+            // ----------------------------------------------
+            totalDist3D = CalcSpiralArcLengthAtProgress(1.0, startRadius, endRadius, totalAngle, deltaZ);
+
         }
-
-
-        m_Group.totalAngle = totalAngle;
-
-
-        // ----------------------------------------------
-        // Radius
-        // ----------------------------------------------
-        const double startDeltaX = sx - cx;
-        const double startDeltaY = sy - cy;
-        const double endDeltaX = ex - cx;
-        const double endDeltaY = ey - cy;
-        double startRadius = std::hypot(startDeltaX, startDeltaY);
-        double endRadius = std::hypot(endDeltaX, endDeltaY);
-        if (!std::isfinite(startDeltaX) ||
-            !std::isfinite(startDeltaY) ||
-            !std::isfinite(endDeltaX) ||
-            !std::isfinite(endDeltaY) ||
-            !std::isfinite(startRadius) ||
-            !std::isfinite(endRadius) ||
-            !std::isfinite(totalAngle))
-        {
-            FailDerivedConsumerGeometry();
-            return;
-        }
-        m_Group.currentCmd.startRadius = startRadius;
-        m_Group.currentCmd.endRadius = endRadius;
-        m_Group.radius = startRadius;
-
-
-        // ----------------------------------------------
-        // 3D Arc Distance
-        // ----------------------------------------------
-        double avgRadius = (startRadius + endRadius) / 2.0;
-
-        double arcLength = avgRadius * std::abs(totalAngle);
-
-
-        // ----------------------------------------------
-        // True 3D Spiral / Arc Distance
-        //
-        // 支援：
-        // 1. 標準等半徑 Arc
-        // 2. Helix
-        // 3. Variable Radius Spiral
-        // 4. Variable Radius + Z
-        // ----------------------------------------------
-        double totalDist3D = CalcSpiralArcLengthAtProgress(1.0, startRadius, endRadius, totalAngle, deltaZ);
 
         if (!std::isfinite(totalDist3D))
         {
@@ -15295,7 +15549,7 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     // 13. History 幾何快照
     // ======================================================
-    if (m_Group.enableHistory)
+    if (m_Group.enableHistory && !m_Group.currentCmd.pathCoreRetainedTraversal)
     {
         for (int i = 0; i < 8; ++i)
         {
@@ -17030,6 +17284,25 @@ void MotionCore::UpdateInterpolation()
 
     DrainAxisCommandMailbox();
 
+    // BZ canonical storage has no history/B2/transform interpretation.
+    if (m_Group.isActive && m_Group.currentCmd.pathCoreRetainedTraversal &&
+        (m_Group.enableHistory || m_Group.enableTransform ||
+            m_Group.jumpManager.state != JumpState::IDLE ||
+            m_Group.pathMode != PathMode::EXACT_STOP))
+    {
+        TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return;
+    }
+
+    if (IsPathCoreHoldExcursionDriving() && !m_safetyControlledStopInProgress &&
+        GetCommandAuthorizationFailure(m_Group.currentCmd) == MotionRejectReason::NONE &&
+        (m_Group.enableHistory || m_Group.enableTransform ||
+            m_Group.jumpManager.state != JumpState::IDLE || m_Group.pathMode != PathMode::EXACT_STOP))
+    {
+        TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return;
+    }
+
     // 1. 基本防呆
     if (m_pContexts == nullptr) return;
 
@@ -17051,7 +17324,8 @@ void MotionCore::UpdateInterpolation()
         currentGroupMappingValid =
             safeGroupAxisCount > 0 &&
             safeGroupAxisCount == m_Group.axisCount &&
-            m_Group.currentCmd.axisCount == m_Group.axisCount;
+            (m_pathHold.unionActive ? IsPathCoreHoldEffectiveMappingValid() :
+                m_Group.currentCmd.axisCount == m_Group.axisCount);
 
         for (int slot = 0;
             currentGroupMappingValid && slot < safeGroupAxisCount;
@@ -17061,7 +17335,7 @@ void MotionCore::UpdateInterpolation()
             if (axisIndex < 0 ||
                 axisIndex >= static_cast<int>(m_pContexts->size()) ||
                 axisIndex >= MAX_AXES ||
-                m_Group.currentCmd.axisIndices[slot] != axisIndex ||
+                (!m_pathHold.unionActive && m_Group.currentCmd.axisIndices[slot] != axisIndex) ||
                 currentGroupMembership[
                     static_cast<std::size_t>(axisIndex)] ||
                 !(*m_pContexts)[axisIndex].isExist)
@@ -17411,6 +17685,12 @@ void MotionCore::UpdateInterpolation()
     // ======================================================
     // 🌟 [司機 B] PATH_SERVO 放電上帝模式 (優先權次高)
     // ======================================================
+    else if (ProcessPathCoreHoldExcursion(vCmd))
+    {
+        // CB owns only the scalar planner; original source geometry and identity remain live.
+        if (!m_Group.isActive || HasPendingSafetyOrRecoveryRequests() ||
+            GetCommandAuthorizationFailure(m_Group.currentCmd) != MotionRejectReason::NONE) return;
+    }
     else if (m_Group.pathMode == PathMode::PATH_SERVO)
     {
 
@@ -17568,6 +17848,11 @@ void MotionCore::UpdateInterpolation()
     // =========================================================
     // 🔴 獨立的時光機 (向後跨節)：必須放在司機分流的外面！
     // =========================================================
+    if (m_pathHold.unionActive && (!std::isfinite(vAxis.currentCmdPos) || vAxis.currentCmdPos < 0.0))
+    {
+        TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return;
+    }
     if (!m_safetyControlledStopInProgress &&
         vAxis.currentCmdPos < 0.0)
     {
@@ -17729,7 +18014,115 @@ void MotionCore::UpdateInterpolation()
     // ======================================================
     // 🌟 以下完全保留你原本的幾何分配與空間旋轉 (原封不動！)
     // ======================================================
-    if (m_Group.mode == InterpolationMode::LINEAR)
+    if (m_pathHold.unionActive)
+    {
+        if (!MapPathCoreHoldExcursionGeometry(vCmd))
+        {
+            TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+            return;
+        }
+    }
+    else if (m_Group.currentCmd.pathCoreRetainedTraversal)
+    {
+        // Reject a non-finite planner output before clamping; min/max would
+        // otherwise turn NaN into a plausible endpoint parameter.
+        if (!std::isfinite(vCmd.instantCmdPos) || !std::isfinite(vCmd.instantCmdVel))
+        {
+            TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+            return;
+        }
+        const MotionCommand& retained = m_Group.currentCmd;
+        double startU = 0.0, endU = 0.0, intervalDistance = 0.0;
+        if (!GetMotionRetainedInterval(retained, startU, endU, intervalDistance))
+        {
+            TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+            return;
+        }
+        if (vAxis.state == MotionState::MotionState_IDLE &&
+            !m_safetyControlledStopInProgress)
+        {
+            // BZ_FIX1: the filtered planner can finish a few ULPs short,
+            // then canonicalize its finalTargetPos to currentCmdPos. Close
+            // only normal retained completion to the immutable path length
+            // before distributing the exact saved endpoint. A controlled
+            // stop must retain its partial position.
+            if (!m_Group.isActive || HasPendingSafetyOrRecoveryRequests() ||
+                GetCommandAuthorizationFailure(retained) != MotionRejectReason::NONE)
+            {
+                return;
+            }
+            LifecycleCommitReservationGuard endpointCommit(*this, retained.execution);
+            if (!endpointCommit.IsAcquired() || HasPendingSafetyOrRecoveryRequests() ||
+                GetCommandAuthorizationFailure(retained) != MotionRejectReason::NONE)
+            {
+                return;
+            }
+            const double distance = intervalDistance;
+            const double error = std::abs(distance - vCmd.instantCmdPos);
+            // CA partial spans accumulate independent filtered integration
+            // residue. The finite host matrix reached 100.95 epsilon * span.
+            // Keep BZ full-range 64 unchanged; partial intervals allow 128,
+            // still bounded by the physical cap and every lifecycle guard.
+            const double roundingFactor = std::abs(endU - startU) == 1.0 ? 64.0 : 128.0;
+            bool endpointValid = m_Group.pathMode == PathMode::EXACT_STOP &&
+                vAxis.isVirtualAxis && vAxis.inPosition && !vAxis.isFault && !vAxis.isLagAlarm &&
+                std::isfinite(distance) && distance > 0.0 && std::isfinite(error) &&
+                error <= roundingFactor * std::numeric_limits<double>::epsilon() * distance &&
+                vAxis.currentCmdPos == vCmd.instantCmdPos &&
+                vAxis.planningPos == vAxis.currentCmdPos &&
+                vAxis.finalTargetPos == vAxis.currentCmdPos &&
+                vAxis.currentCmdVel == 0.0 && vAxis.logicalCmdVel == 0.0 &&
+                vAxis.targetVelocity == 0.0 && vAxis.targetEndVel == 0.0 &&
+                vCmd.instantCmdVel == 0.0;
+            for (int slot = 0; endpointValid && slot < m_Group.axisCount; ++slot)
+            {
+                const AxisContext& realAxis = (*m_pContexts)[m_Group.axisIndices[slot]];
+                const double pulsePerMM = realAxis.resolution_PPR / realAxis.finalLead;
+                const double errorMM = error / pulsePerMM;
+                endpointValid = std::isfinite(realAxis.resolution_PPR) && realAxis.resolution_PPR > 0.0 &&
+                    std::isfinite(realAxis.finalLead) && realAxis.finalLead > 0.0 &&
+                    std::isfinite(pulsePerMM) && pulsePerMM > 0.0 &&
+                    std::isfinite(errorMM) && errorMM <= 5e-8;
+            }
+            if (!endpointValid)
+            {
+                endpointCommit.Release();
+                TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+                return;
+            }
+            vAxis.currentCmdPos = distance;
+            vAxis.planningPos = distance;
+            vAxis.finalTargetPos = distance;
+            vCmd.instantCmdPos = distance;
+        }
+        const double progress = intervalDistance <= 0.0 ? 1.0 :
+            (std::max)(0.0, (std::min)(1.0, vCmd.instantCmdPos / intervalDistance));
+        const double u = MotionRetainedParameterAtProgress(startU, endU, progress);
+        // Normalize the geometric derivative before applying velocity; v/L
+        // can overflow for a valid extremely short retained line.
+        const double traversalVelocity = vCmd.instantCmdVel * (retained.pathCoreRetainedReverse ? -1.0 : 1.0);
+        const double angle = retained.mem_startAngle + retained.mem_totalAngle * u;
+        const double cosine = retained.pathCorePlanarCircle ? std::cos(angle) : 0.0;
+        const double sine = retained.pathCorePlanarCircle ? std::sin(angle) : 0.0;
+        for (int slot = 0; slot < m_Group.axisCount; ++slot)
+        {
+            const int axis = m_Group.axisIndices[slot];
+            AxisContext& realAxis = (*m_pContexts)[axis];
+            const double delta = retained.mem_ratio[axis] - retained.mem_startPos[axis];
+            double evaluatedPulse = 0.0;
+            if (!EvaluateMotionRetainedPulseCanonical(retained, static_cast<std::size_t>(axis), u, evaluatedPulse))
+            {
+                TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+                return;
+            }
+            realAxis.logicalCmdPos = evaluatedPulse;
+            const double derivative = !retained.pathCorePlanarCircle ? delta : axis == 0 ?
+                -retained.mem_radius * sine * retained.mem_totalAngle : retained.mem_radius * cosine * retained.mem_totalAngle;
+            realAxis.logicalCmdVel = retained.mem_totalDist <= 0.0 ? 0.0 :
+                (derivative / retained.mem_totalDist) * traversalVelocity;
+        }
+    }
+    else if (m_Group.mode == InterpolationMode::LINEAR)
     {
         for (int i = 0; i < m_Group.axisCount; ++i) {
             int idx = m_Group.axisIndices[i];
@@ -17793,8 +18186,21 @@ void MotionCore::UpdateInterpolation()
         //
         // 這裡才是真正 Variable Radius。
         // =====================================================
-        realX.logicalCmdPos = m_Group.centerX + currentRadius * cosAngle;
-        realY.logicalCmdPos = m_Group.centerY + currentRadius * sinAngle;
+        if (m_Group.currentCmd.pathCorePlanarCircle && progressRatio <= 0.0)
+        {
+            realX.logicalCmdPos = m_Group.startPos[0];
+            realY.logicalCmdPos = m_Group.startPos[1];
+        }
+        else if (m_Group.currentCmd.pathCorePlanarCircle && progressRatio >= 1.0)
+        {
+            realX.logicalCmdPos = m_Group.currentCmd.targetPos[0];
+            realY.logicalCmdPos = m_Group.currentCmd.targetPos[1];
+        }
+        else
+        {
+            realX.logicalCmdPos = m_Group.centerX + currentRadius * cosAngle;
+            realY.logicalCmdPos = m_Group.centerY + currentRadius * sinAngle;
+        }
 
 
         // =====================================================
@@ -17829,7 +18235,11 @@ void MotionCore::UpdateInterpolation()
         //
         // dp/dt = vPath / (ds/dp)
         // =====================================================
-        const double pathMetric = std::sqrt(deltaRadius * deltaRadius + currentRadius * currentRadius * totalAngle * totalAngle + deltaZ * deltaZ);
+        // BY fixed XY circle already has its exact finite dS/du. Avoid
+        // squaring a representable pulse radius into infinity.
+        const double pathMetric = m_Group.currentCmd.pathCorePlanarCircle
+            ? m_Group.totalDist3D
+            : std::sqrt(deltaRadius * deltaRadius + currentRadius * currentRadius * totalAngle * totalAngle + deltaZ * deltaZ);
 
 
         double progressVelocity = 0.0;
@@ -18476,7 +18886,8 @@ void MotionCore::UpdateInterpolation()
 
     // 3. 結束檢查 (G00 / G01 實體馬達準停確認)
     // =========================================================
-    if (vAxis.state == MotionState::MotionState_IDLE)
+    if (vAxis.state == MotionState::MotionState_IDLE &&
+        (!IsPathCoreHoldExcursionDriving() || m_safetyControlledStopInProgress))
     {
         bool allPhysicalInPos = true;
 
@@ -18592,7 +19003,7 @@ void MotionCore::UpdateInterpolation()
             CompleteTrackedMotionCommand(
                 m_Group.currentCmd);
 
-            if (m_Group.enableHistory &&
+            if (m_Group.enableHistory && !m_Group.currentCmd.pathCoreRetainedTraversal &&
                 GetCommandAuthorizationFailure(m_Group.currentCmd) ==
                 MotionRejectReason::NONE)
             {
@@ -20489,6 +20900,7 @@ void MotionCore::PublishStopSettleEvidence() noexcept
     // Formal J.5 profiles and Reset ACK share this exact coherent bank with
     // the legacy J.4 diagnostics.
     UpdateNCSettleProducer(payload);
+    UpdatePathCoreHoldExcursionEvidence();
 
     ++m_stopSettleNextPublicationGeneration;
     snapshot.publicationGeneration =
@@ -21712,13 +22124,13 @@ bool MotionCore::IsGroupFaulted() const
         (std::max)(
             0,
             (std::min)(
-                m_Group.currentCmd.axisCount,
+                m_pathHold.unionActive ? m_Group.axisCount : m_Group.currentCmd.axisCount,
                 MAX_AXES));
 
     for (int j = 0; j < commandAxisCount; ++j)
     {
         const int axisIndex =
-            m_Group.currentCmd.axisIndices[j];
+            m_pathHold.unionActive ? m_Group.axisIndices[j] : m_Group.currentCmd.axisIndices[j];
 
         if (axisIndex < 0 ||
             static_cast<std::size_t>(axisIndex) >= contextCount)

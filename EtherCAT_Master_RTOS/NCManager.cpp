@@ -183,7 +183,8 @@ bool NCManager::AdoptProgramMotionLease(
 }
 
 
-NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys), Parser()
+NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys), Parser(),
+m_pathCoreLiveRetention(AllocatePathCoreLiveOwnerTagStartup())
 {
     // =========================================================
     // G81 HOME Manager Link
@@ -350,6 +351,11 @@ void NCManager::ChangeMode(NCOperationMode newMode)
 {
     // 只有在 IDLE 或 READY 狀態才能切換模式
     if (m_state == NCState::IDLE || m_state == NCState::READY || m_state == NCState::P_END) {
+        FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::MODE_CHANGE);
+        InvalidatePathCoreFeedSameThread(); // BX-FEED
+        InvalidatePathCoreArcSameThread(); // BY-ARC
+        InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+        InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
         CancelProgramEndBoundary();
         ClearCompletionWaitBoundary(true);
         CancelGMBlockTransaction(true);
@@ -370,6 +376,17 @@ void NCManager::ChangeMode(NCOperationMode newMode)
 }
 
 void NCManager::ChangeState(NCState newState) {
+    // BN: public state writes cannot arm or resume retained geometry.
+    if (newState == NCState::HOLD)
+        PausePathCoreLiveRetentionSameThread();
+    else if (newState != NCState::RUN)
+    {
+        FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::STATE_CHANGE);
+        InvalidatePathCoreFeedSameThread(); // BX-FEED
+        InvalidatePathCoreArcSameThread(); // BY-ARC
+        InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+        InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
+    }
     m_state = newState;
 }
 
@@ -425,6 +442,7 @@ void NCManager::TryRollbackHomingResume() noexcept
 // ==========================================
 void NCManager::CycleStart()
 {
+    CancelPathCoreHoldAutomaticSameThread("MANUAL_START");
     // A late Alarm may be published after the preceding ProcessTask sample.
     // No HOLD resume or READY/P_END start may acquire/program Motion before
     // the next periodic alarm trap observes it.
@@ -609,6 +627,13 @@ void NCManager::CycleStart()
 
 void NCManager::FeedHold()
 {
+    // Operator Hold revokes an automatic resume even when already in HOLD.
+    CancelPathCoreHoldAutomaticSameThread("MANUAL_HOLD");
+    FeedHoldInternal();
+}
+
+void NCManager::FeedHoldInternal()
+{
     // =========================================================
     // G81 HOME Feed Hold
     //
@@ -618,6 +643,11 @@ void NCManager::FeedHold()
 
     if (Homing.IsActive())
     {
+        FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::HOME);
+        InvalidatePathCoreFeedSameThread(); // BX-FEED
+        InvalidatePathCoreArcSameThread(); // BY-ARC
+        InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+        InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
         if (Homing.RequestHold())
         {
             if (!m_feedHoldBoundaryShadow.IsActive())
@@ -641,6 +671,7 @@ void NCManager::FeedHold()
 
     if (m_state == NCState::RUN)
     {
+        PausePathCoreLiveRetentionSameThread();
         // NC-0.2J.5: arm one fresh RT proof before publishing the PROGRAM
         // Feed Hold boundary.  The observer will only accept a settled proof
         // carrying this exact request sequence, Epoch and Program lease.
@@ -667,6 +698,12 @@ void NCManager::FeedHold()
 
 void NCManager::Reset()
 {
+    // BN: revoke only commanded-retention reads at the operator boundary.
+    FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::RESET);
+    InvalidatePathCoreFeedSameThread(); // BX-FEED
+    InvalidatePathCoreArcSameThread(); // BY-ARC
+    InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+    InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
     const bool waitingForPreResetControlledStop =
         m_resetContinuationPhase ==
         ResetContinuationPhase::PRE_RESET_CONTROLLED_STOP;
@@ -1765,6 +1802,11 @@ void NCManager::Reset_Gode()       // 重置G碼相關
 // ==========================================
 bool NCManager::CallMacro(const std::string& filename)
 {
+    FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::MACRO);
+    InvalidatePathCoreFeedSameThread(); // BX-FEED
+    InvalidatePathCoreArcSameThread(); // BY-ARC
+    InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+    InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
     if (MacroSys.PushCallStack() == false)
     {
         AlarmManager::GetInstance().Trigger(AlarmManager::MACRO_OVERFLOW);
@@ -1832,6 +1874,11 @@ bool NCManager::CallMacro(const std::string& filename)
 void NCManager::ReturnMacro(bool queueAlreadyDrained)
 {
     if (m_macroStack.empty()) return;
+    FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::MACRO);
+    InvalidatePathCoreFeedSameThread(); // BX-FEED
+    InvalidatePathCoreArcSameThread(); // BY-ARC
+    InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+    InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
 
     // =========================================================
     // 🌟 【L 重複次數核心】：如果 repeatCount 還大於 1，PC 歸零重跑！
@@ -2024,6 +2071,12 @@ void NCManager::BeginLifecycleInterruptionShadow(
     NCLifecycleInterruptionCause cause,
     bool expectsEpochChange) noexcept
 {
+    FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::INTERRUPTION);
+    InvalidatePathCoreFeedSameThread(); // BX-FEED
+    InvalidatePathCoreArcSameThread(); // BY-ARC
+    InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+    InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
+
     // Any newly opened lifecycle interruption supersedes an older deferred
     // GOTO tail rebase.  The GOTO path arms its replacement identity only
     // after publishing and validating the new Epoch below its Begin() call.
@@ -2189,9 +2242,46 @@ void NCManager::ObserveAlarmEmergencyStopShadow() noexcept
         m_alarmEmergencyStopShadow.GetSnapshot();
     if (alarmStop.acknowledged)
     {
+        // BR FIX2: an idle NC Alarm may have no execution to invalidate,
+        // while its AUTO -> SAFETY ownership takeover still publishes an
+        // Epoch. Import that change only with the exact existing handshake
+        // acknowledgement, not merely because a runtime Epoch changed.
+        MotionExecutionEpoch successor = alarmStop.requestExecutionEpoch + 1U;
+        if (successor == MOTION_EXECUTION_EPOCH_INVALID) successor = 1U;
+        bool idleSafetyTakeoverProven = false;
+        if (!alarmStop.epochChangeRequired && !alarmStop.hadExecutionToInvalidate &&
+            alarmStop.trigger == NCAlarmEmergencyStopTrigger::NC_PROGRAM &&
+            alarmStop.phase == NCAlarmEmergencyStopPhase::ACKNOWLEDGED &&
+            alarmStop.emergencyEvidenceCoherent && alarmStop.motionPublicationGeneration != 0ULL &&
+            alarmStop.emergencyRequestObserved && alarmStop.rtApplyObserved &&
+            alarmStop.rtApplyDelta != 0ULL && alarmStop.safetyOwnerMatched &&
+            alarmStop.executionEpochMatched && alarmStop.groupStopApplied &&
+            alarmStop.allExistingAxesSafe && alarmStop.allExistingAxisCommandsZero &&
+            alarmStop.allExistingAxisTargetsSealed && alarmStop.feedbackSequenceSynchronized &&
+            !alarmStop.lifecycleEvidenceGap && !alarmStop.postAlarmDispatchObserved &&
+            !alarmStop.evidenceGap && !alarmStop.superseded &&
+            alarmStop.activeBlocks == 0U && alarmStop.commandQueueDepth == 0ULL &&
+            alarmStop.commandIngressDepth == 0ULL && alarmStop.commandReplayDepth == 0ULL &&
+            alarmStop.currentOwner == MotionOwner::SAFETY &&
+            alarmStop.lastAppliedOwner == MotionOwner::SAFETY &&
+            alarmStop.currentOwnerGeneration == alarmStop.lastAppliedOwnerGeneration &&
+            alarmStop.lastAppliedExecutionEpoch == successor &&
+            alarmStop.currentExecutionEpoch == successor &&
+            m_lifecycleInterruptionShadow.MatchesIdleAlarmRequestForSafetyTakeover(
+                alarmStop.lifecycleSequence, alarmStop.requestExecutionEpoch,
+                alarmStop.currentOwnerGeneration))
+        {
+            MotionOwnerLease safetyLease{};
+            safetyLease.owner = alarmStop.currentOwner;
+            safetyLease.generation = alarmStop.currentOwnerGeneration;
+            MotionExecutionEpoch provenEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+            idleSafetyTakeoverProven =
+                m_motion.TryGetSafetyMotionOwnerEpoch(safetyLease, provenEpoch) &&
+                provenEpoch == alarmStop.lastAppliedExecutionEpoch;
+        }
         m_lifecycleInterruptionShadow.RecordAlarmStopAcknowledged(
             alarmStop.lastAppliedExecutionEpoch,
-            alarmStop.epochChangeRequired,
+            alarmStop.epochChangeRequired || idleSafetyTakeoverProven,
             alarmStop.preLatchedRTApplication);
     }
 }
@@ -2516,6 +2606,11 @@ bool NCManager::EnsureMappingIntegrityAlarmBoundaryBeforeFeedback() noexcept
 
 void NCManager::ProcessMotionFeedback() noexcept
 {
+    // BQ-FIX2-BEGIN
+        // Admit the saved, NC-committed receipt after RT clears pending requests,
+        // before this same consumer applies its ACCEPTED/COMPLETED events.
+    DrainPathCorePendingCommandedCaptureSameThread();
+    // BQ-FIX2-END
     MotionFeedbackEvent event{};
 
     // Stage NC-0.2K.6.3: a terminal registry can only qualify while the
@@ -2534,9 +2629,31 @@ void NCManager::ProcessMotionFeedback() noexcept
         preDrainLedgerCounters.duplicateTerminalFeedback,
         preDrainLedgerCounters.terminalFeedbackConflict);
 
-    // 每個 NC Cycle 最多處理固定筆數，避免異常事件 Burst 讓
-    // 10 ms NC Task 出現過大的單圈負擔。2048 筆 Ring 可容納完整
-    // Epoch 淘汰 Burst，未讀事件由後續 Cycle 繼續 Drain。
+    // BO reuses the authoritative counters already read by this NC consumer.
+    m_pathCoreExecutionLink.CheckTransport(
+        m_motion.GetMotionFeedbackOverflowCount() == 0ULL &&
+        m_motion.GetMotionFeedbackProducerNoticeOverflowCount() == 0ULL &&
+        m_motionFeedbackSequenceGapCount == 0ULL &&
+        preDrainLedgerCounters.activeBlockOverwrite == 0ULL &&
+        preDrainLedgerCounters.activeSegmentIndexOverwrite == 0ULL &&
+        preDrainLedgerCounters.orphanFeedback == 0ULL &&
+        preDrainLedgerCounters.duplicateTerminalFeedback == 0ULL &&
+        preDrainLedgerCounters.terminalFeedbackConflict == 0ULL);
+
+    // BQ-BEGIN
+    m_pathCoreCommittedRun.CheckTransport(
+        m_motion.GetMotionFeedbackOverflowCount() == 0ULL &&
+        m_motion.GetMotionFeedbackProducerNoticeOverflowCount() == 0ULL &&
+        m_motionFeedbackSequenceGapCount == 0ULL &&
+        preDrainLedgerCounters.activeBlockOverwrite == 0ULL &&
+        preDrainLedgerCounters.activeSegmentIndexOverwrite == 0ULL &&
+        preDrainLedgerCounters.orphanFeedback == 0ULL &&
+        preDrainLedgerCounters.duplicateTerminalFeedback == 0ULL &&
+        preDrainLedgerCounters.terminalFeedbackConflict == 0ULL);
+    // BQ-END
+        // 每個 NC Cycle 最多處理固定筆數，避免異常事件 Burst 讓
+        // 10 ms NC Task 出現過大的單圈負擔。2048 筆 Ring 可容納完整
+        // Epoch 淘汰 Burst，未讀事件由後續 Cycle 繼續 Drain。
     for (std::size_t i = 0U;
         i < MOTION_FEEDBACK_NC_DRAIN_LIMIT_PER_TASK;
         ++i)
@@ -2649,6 +2766,24 @@ void NCManager::ProcessMotionFeedback() noexcept
         m_ordinaryG00InflightRegistryShadow.ObserveMotionFeedback(
             event,
             ledgerAccepted);
+
+        // BO updates only pre-bound retained identities from this same event.
+        // No second dequeue, acknowledgement, registry mutation or Motion write.
+        m_pathCoreExecutionLink.CheckTransport(
+            m_motion.GetMotionFeedbackOverflowCount() == 0ULL &&
+            m_motion.GetMotionFeedbackProducerNoticeOverflowCount() == 0ULL &&
+            m_motionFeedbackSequenceGapCount == 0ULL);
+        m_pathCoreExecutionLink.Observe(event, ledgerAccepted);
+        // BQ-BEGIN
+        m_pathCoreCommittedRun.CheckTransport(
+            m_motion.GetMotionFeedbackOverflowCount() == 0ULL &&
+            m_motion.GetMotionFeedbackProducerNoticeOverflowCount() == 0ULL &&
+            m_motionFeedbackSequenceGapCount == 0ULL);
+        m_pathCoreCommittedRun.Observe(event, ledgerAccepted);
+        ObservePathCoreFeedFeedbackSameThread(event, ledgerAccepted); // BX-FEED
+        ObservePathCoreArcFeedbackSameThread(event, ledgerAccepted); // BY-ARC
+        ObservePathCoreReplayFeedbackSameThread(event, ledgerAccepted); // BZ-REPLAY
+// BQ-END
 
         // K.7.3 observes the same already-classified immutable event.  The
         // observer itself cannot act on Registry, Ledger, NC flow or Motion.
@@ -2798,6 +2933,16 @@ void NCManager::ObserveBootstrapSafetyHandoff() noexcept
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
+    ValidatePathCoreFeedSameThread(); // BX-FEED: observe lifecycle before early returns.
+    ValidatePathCoreArcSameThread(); // BY-ARC
+    ValidatePathCoreReplaySameThread(); // BZ-REPLAY
+    ObservePathCoreHoldSameThread(); // CB: validate scope and report RT phase transitions before early returns.
+    FlushPathCoreLiveSummarySameThread();
+    // BN: bounded data-only guard, before any early-returning control phase.
+    (void)ValidatePathCoreLiveRetentionSameThread();
+    // BQ-BEGIN
+    (void)ValidatePathCoreCommittedRunSameThread();
+    // BQ-END
     NC_RunCount++;
 
     // NC-0.2L.2A: retain the accepted B2 baseline publication exactly once.
@@ -3381,6 +3526,7 @@ void NCManager::ProcessTask()
 // =========================================================
     if (m_edmState == EDMState::NOT_READY)
     {
+        CancelPathCoreHoldAutomaticSameThread("INTERLOCK");
         ClearPreDispatchBarrier();
 
         // Do not turn a temporary external/servo interlock recovery into an
@@ -3419,6 +3565,13 @@ void NCManager::ProcessTask()
     // Ready Interlock 全部通過後套用。套用當圈直接 return，避免同一
     // 10 ms 週期內又立刻 Dispatch 下一個 Block。
     // =========================================================
+    // CF dry run: the automatic request shares the existing stop/resume gates.
+    if (ProcessPathCoreHoldAutomaticSameThread())
+    {
+        ObserveLifecycleInterruptionShadow();
+        ObservePreparedBlockQueueShadow(false);
+        return;
+    }
     if (ProcessFeedHoldResumeGate())
     {
         ObserveLifecycleInterruptionShadow();
@@ -3690,6 +3843,7 @@ void NCManager::ProcessExecutionEngine()
             m_state != NCState::P_END) {
             ObserveLegacySingleBlockHold();
             m_pauseAfterBlock = false;
+            PausePathCoreLiveRetentionSameThread();
             m_state = NCState::HOLD;                    // 切換為暫停
             m_waitCallback = WaitForCycleStartCallback; // 掛上「等待 Start 按鈕」
             return; // 結束本回合，定格在下一行！
@@ -3881,6 +4035,17 @@ void NCManager::ProcessExecutionEngine()
             }
             ClearPreDispatchBarrier();
 
+            // BT-BEGIN
+            // These control branches bypass ordinary NCBlock capture. Revoke
+            // only an already chosen suffix, before evaluating side effects.
+            if (m_pathCoreReturnCursor.state == PathCoreReturnCursorState::ACTIVE ||
+                m_pathCoreReturnCursor.state == PathCoreReturnCursorState::PENDING ||
+                m_pathCoreReturnCursor.forwardAvailable)
+                InvalidatePathCoreReturnCursorSameThread();
+            // BT-END
+            ClearPathCoreReplayHistorySameThread(); // BZ: control side effect interrupts saved path.
+            InvalidatePathCoreHoldSameThread(); // CB: assignments cannot carry a one-shot arm.
+
             NCMacroAssignmentCommit assignment{};
             NCExpressionResolveError resolveError =
                 NCExpressionResolveError::NONE;
@@ -3932,6 +4097,17 @@ void NCManager::ProcessExecutionEngine()
                 return;
             }
             ClearPreDispatchBarrier();
+
+            // BT-BEGIN
+            // These control branches bypass ordinary NCBlock capture. Revoke
+            // only an already chosen suffix, before evaluating side effects.
+            if (m_pathCoreReturnCursor.state == PathCoreReturnCursorState::ACTIVE ||
+                m_pathCoreReturnCursor.state == PathCoreReturnCursorState::PENDING ||
+                m_pathCoreReturnCursor.forwardAvailable)
+                InvalidatePathCoreReturnCursorSameThread();
+            // BT-END
+            ClearPathCoreReplayHistorySameThread(); // BZ: branch interrupts saved path.
+            InvalidatePathCoreHoldSameThread(); // CB: branches cannot carry a one-shot arm.
 
             NCGotoDecision decision{};
             NCExpressionResolveError resolveError =
@@ -4628,6 +4804,13 @@ void NCManager::ProcessExecutionEngine()
 
             // Stage NC-0.2D：只在 NC Producer 執行緒收集此 Block 建立的
             // Segment Identity；不把 NC 型別帶入 250 us Motion Runtime。
+// BQ-BEGIN
+            BeginPathCoreHoldCaptureSameThread(block, dispatchId); // CB: bind only the next explicit original source.
+            BeginPathCoreReplayCaptureSameThread(block, dispatchId); // BZ-REPLAY
+            BeginPathCoreFeedCaptureSameThread(block, dispatchId); // BX-FEED
+            BeginPathCoreArcCaptureSameThread(block, dispatchId); // BY-ARC
+            BeginPathCoreCommandedCaptureSameThread(block, dispatchId);
+            // BQ-END
             m_motion.BeginProgramBlockMotionCapture();
 
             // Stage NC-0.2A：同一 Block 的 Modal 已先 Commit，才擷取 Snapshot。
@@ -5056,9 +5239,25 @@ void NCManager::ProcessExecutionEngine()
                     ObserveInflightRegistryRegistration(inflightProof);
             }
 
-            // Stage NC-0.2H：M00/M01/M98/M99/M02/M30 的 Post Action
-            // 由 G/M Transaction 在所有同行動作與 Motion Ledger 完成後套用。
-            // 此處不可再提前改變 PC、HOLD 或 Program End 狀態。
+            // BQ-BEGIN
+            CommitPathCoreCommandedCaptureSameThread(dispatchId, motionCapture,
+                lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
+                resolverBypassCommitLedger, currentPC, sourceLineNumber);
+            CommitPathCoreFeedCaptureSameThread(dispatchId, motionCapture,
+                lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
+                resolverBypassCommitLedger, currentPC, sourceLineNumber); // BX-FEED
+            CommitPathCoreArcCaptureSameThread(dispatchId, motionCapture,
+                lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
+                resolverBypassCommitLedger, currentPC, sourceLineNumber); // BY-ARC
+            CommitPathCoreReplayCaptureSameThread(dispatchId, motionCapture,
+                lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
+                resolverBypassCommitLedger, currentPC, sourceLineNumber); // BZ-REPLAY
+            CommitPathCoreHoldCaptureSameThread(dispatchId); // CB: only after authoritative BX/BY ledger binding.
+            if (m_state == NCState::ALARM) return;
+            // BQ-END
+                        // Stage NC-0.2H：M00/M01/M98/M99/M02/M30 的 Post Action
+                        // 由 G/M Transaction 在所有同行動作與 Motion Ledger 完成後套用。
+                        // 此處不可再提前改變 PC、HOLD 或 Program End 狀態。
         }
 
         // Block Skip、Assignment、GOTO 與空白行會在這裡提交；
@@ -5523,6 +5722,28 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
     {
     case 0:
         return GCodeHandlers::Handle_G00(block, this);
+    case 1: // BX-FEED: explicit G01 uses its own feed producer.
+        return StartPathCoreFeedSameThread(block);
+    case 2: // BY-ARC: G17 XY circular interpolation, exact stop.
+    case 3:
+        return StartPathCoreArcSameThread(block);
+    case 178: // CB: arm one Feed Hold excursion on the next original source.
+    case 179: // CB: cancel an unused one-shot arm.
+        return StartPathCoreHoldSameThread(block);
+    case 174: // BZ: one retained segment in reverse, explicit F mm/min.
+    case 175: // BZ: one retained segment forward after full retreat.
+    case 176: // CA: bounded distance retreat within one saved source.
+    case 177: // CA: bounded distance advance, including an early turn.
+        return StartPathCoreReplaySameThread(block);
+        // BR-BEGIN
+    case 171:
+    case 172: // BT: explicit frozen-suffix step; same Motion transaction.
+    case 173: // BV: advance to the next original saved end after full retreat.
+        InvalidatePathCoreArcSameThread(); // BY-ARC: no saved-G00 permission reuse.
+        InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+        InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
+        return StartPathCoreReturnSameThread(block);
+        // BR-END
     case 7:
         return GCodeHandlers::Handle_G07(block, this);
     case 12:
@@ -5532,6 +5753,11 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
     case 53:
         return GCodeHandlers::Handle_G53(block, this);
     case 81:
+        FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::HOME);
+        InvalidatePathCoreFeedSameThread(); // BX-FEED
+        InvalidatePathCoreArcSameThread(); // BY-ARC
+        InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+        InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
         return GCodeHandlers::Handle_G81(block, this);
     case 28:
         return GCodeHandlers::Handle_G28(block, this);
@@ -5610,6 +5836,109 @@ void NCManager::ExecuteBlock(
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
+    // CB: whole-block guard runs before any setting/tool/M side effect.
+    const bool explicitHoldControl = NCGCodeSemantics::Contains(block, 178) || NCGCodeSemantics::Contains(block, 179);
+    const bool invalidArmedFeed = m_pathHold.armed && m_pathHold.candidateDispatch == dispatchId &&
+        (!block.has('F') || !std::isfinite(block.val('F')) || m_pathHold.feedMMMin > block.val('F'));
+    if ((explicitHoldControl && !IsPathCoreHoldBlockShapeValid(block)) ||
+        IsPathCoreHoldInputOmission(block) || invalidArmedFeed)
+    {
+        RejectPathCoreHoldSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return;
+    }
+    // BZ: reject malformed replay before any setting/tool/M-code side effect.
+    const bool explicitReplay = NCGCodeSemantics::Contains(block, 174) || NCGCodeSemantics::Contains(block, 175) ||
+        NCGCodeSemantics::Contains(block, 176) || NCGCodeSemantics::Contains(block, 177);
+    if ((explicitReplay && (!IsPathCoreReplayBlockShapeValid(block) || m_pathFeed.pending || m_pathArc.pending)) ||
+        IsPathCoreReplayInputOmission(block) || (m_pathReplay.pending && !block.isEmpty))
+    {
+        if (!m_pathReplay.pending)
+        {
+            m_pathReplayMotion.receipt.Clear();
+            m_pathReplay.dispatch = dispatchId;
+            m_pathReplay.commit = 0ULL;
+            m_pathReplay.bound = false;
+            m_pathReplay.consumerAccepted = false;
+            m_pathReplay.consumerStarted = false;
+            m_pathReplay.completed = false;
+            m_pathReplay.sourcePC = sourcePC;
+            m_pathReplay.sourceLine = sourceLineNumber;
+        }
+        RejectPathCoreReplaySameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return;
+    }
+    if (explicitReplay)
+    {
+        m_pathReplay.sourcePC = sourcePC;
+        m_pathReplay.sourceLine = sourceLineNumber;
+    }
+    // BY-ARC-BEGIN: whole-block guard before any setting/tool/M side effect.
+    const bool explicitArc = NCGCodeSemantics::Contains(block, 2) || NCGCodeSemantics::Contains(block, 3);
+    if ((explicitArc && (!IsPathCoreArcBlockShapeValid(block) || m_pathFeed.pending)) ||
+        IsPathCoreArcInputOmission(block) ||
+        (m_pathArc.pending && (explicitArc || NCGCodeSemantics::Contains(block, 0) || NCGCodeSemantics::Contains(block, 1))))
+    {
+        if (!m_pathArc.pending)
+        {
+            m_pathArcMotion.receipt.Clear();
+            m_pathArc.dispatch = dispatchId;
+            m_pathArc.commit = 0ULL;
+            m_pathArc.sourcePC = sourcePC;
+            m_pathArc.sourceLine = sourceLineNumber;
+            m_pathArc.bound = false;
+            m_pathArc.consumerAccepted = false;
+            m_pathArc.consumerStarted = false;
+            m_pathArc.completed = false;
+        }
+        RejectPathCoreArcSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return;
+    }
+    if (explicitArc && !m_pathArc.pending)
+    {
+        m_pathArc.sourcePC = sourcePC;
+        m_pathArc.sourceLine = sourceLineNumber;
+    }
+    // BY-ARC-END
+    // BX-FEED: reject unsupported shape before setting/tool/M-code side effects.
+    if ((NCGCodeSemantics::Contains(block, 1) && !IsPathCoreFeedBlockShapeValid(block)) ||
+        IsPathCoreFeedInputOmission(block))
+    {
+        if (!m_pathFeed.pending)
+        {
+            m_pathFeedMotion.receipt.Clear();
+            m_pathFeed.dispatch = dispatchId;
+            m_pathFeed.commit = 0ULL;
+            m_pathFeed.sourcePC = sourcePC;
+            m_pathFeed.sourceLine = sourceLineNumber;
+            m_pathFeed.bound = false;
+            m_pathFeed.consumerAccepted = false;
+            m_pathFeed.consumerStarted = false;
+            m_pathFeed.completed = false;
+        }
+        RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return;
+    }
+    if (NCGCodeSemantics::Contains(block, 1) && !m_pathFeed.pending)
+    {
+        m_pathFeed.sourcePC = sourcePC;
+        m_pathFeed.sourceLine = sourceLineNumber;
+    }
+    // BR-BEGIN
+        // Reject malformed G171 before setting/tool/M-code side effects.
+    if ((NCGCodeSemantics::Contains(block, 171) || NCGCodeSemantics::Contains(block, 172) ||
+        NCGCodeSemantics::Contains(block, 173)) &&
+        !IsPathCoreReturnBlockShapeValid(block))
+    {
+        FlushPathCoreReturnSummarySameThread();
+        m_pathCoreReturnCommand = NCGCodeSemantics::Contains(block, 173) ? 173U :
+            (NCGCodeSemantics::Contains(block, 172) ? 172U : 171U);
+        m_pathCoreReturnSummary = PathCoreReturnSummary{};
+        m_pathCoreReturnSummary.run = m_pathCoreLiveBookkeeping.currentRunToken;
+        m_pathCoreReturnSummary.dispatch = dispatchId;
+        RejectPathCoreReturnSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return;
+    }
+    // BR-END
     const bool blockStartedInMainProgram = m_macroStack.empty();
 
     NCGCodeExecutionPlan plan{};
@@ -5827,6 +6156,11 @@ void NCManager::ExecuteBlock(
 // =========================================================
 void NCManager::LoadAxisConfiguration()
 {
+    FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::AXIS_CONFIG);
+    InvalidatePathCoreFeedSameThread(); // BX-FEED
+    InvalidatePathCoreArcSameThread(); // BY-ARC
+    InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+    InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
 
     std::string filepath = GlobalConfig::GetInstance().NCDataDir + "AXIS_CFG.ini";
     std::ifstream inFile(filepath);
@@ -6778,6 +7112,12 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         return true;
     }
 
+    // BN: this is the completed fresh-start admission, never a provisional RUN.
+    ArmPathCoreLiveRetentionSameThread();
+    ArmPathCoreFeedSameThread(); // BX-FEED: completed fresh NC Start only.
+    ArmPathCoreArcSameThread(); // BY-ARC: fresh NC Start only.
+    ArmPathCoreReplaySameThread(); // BZ: completed fresh run, never M00 resume.
+    InvalidatePathCoreHoldSameThread(); // CB: a fresh run never inherits an old arm.
     ClearPendingProgramRunStart(false);
     UpdateSystemVariables();
 
@@ -6874,13 +7214,27 @@ void NCManager::FinalizeProgramEnd()
 {
     ClearPendingGotoQueueTailRebase();
 
-    // NC-0.2J.5: rebuild and re-evaluate every formal input immediately
-    // before the permission action.  Do not finalize from the earlier scan's
-    // READY_TO_FINALIZE snapshot.
+    // BP-BEGIN
+        // Bounded data capture precedes the ORIGINAL final fresh permission sample.
+        // Failure never changes any existing End/Gate decision.
+    PreparePathCoreCompletedSnapshotSameThread();
+    // BP-END
+    // BQ-BEGIN
+    PreparePathCoreCommittedRunSameThread();
+    // BQ-END
+        // NC-0.2J.5: rebuild and re-evaluate every formal input immediately
+        // before the permission action.  Do not finalize from the earlier scan's
+        // READY_TO_FINALIZE snapshot.
     const NCProgramEndGateSample releaseSample =
         BuildProgramEndGateSample();
     if (!m_programEndBoundary.Evaluate(releaseSample))
     {
+        // BP-BEGIN
+        DiscardPathCoreCompletedSnapshotSameThread();
+        // BP-END
+        // BQ-BEGIN
+        ClosePathCoreCommittedRunSameThread();
+        // BQ-END
         return;
     }
 
@@ -6890,16 +7244,40 @@ void NCManager::FinalizeProgramEnd()
     if (!m_programMotionLease.IsValid() ||
         !m_motion.ReleaseMotionOwner(m_programMotionLease))
     {
+        // BP-BEGIN
+        DiscardPathCoreCompletedSnapshotSameThread();
+        // BP-END
+        // BQ-BEGIN
+        ClosePathCoreCommittedRunSameThread();
+        // BQ-END
         return;
     }
 
+    // BN: the exact Program lease has been released; no old live reads survive.
+    FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::PROGRAM_END);
     m_programMotionLease = MotionOwnerLease{};
 
     if (!m_programEndBoundary.MarkFinalized())
     {
+        // BP-BEGIN
+        DiscardPathCoreCompletedSnapshotSameThread();
+        // BP-END
+        // BQ-BEGIN
+        ClosePathCoreCommittedRunSameThread();
+        // BQ-END
         return;
     }
 
+    // BP-BEGIN
+    PublishPathCoreCompletedSnapshotSameThread();
+    // BP-END
+    // BQ-BEGIN
+    PublishPathCoreCommittedRunSameThread();
+    FinalizePathCoreFeedSameThread(); // BX-FEED: original End gate already finalized.
+    FinalizePathCoreArcSameThread(); // BY-ARC: current run summary only.
+    FinalizePathCoreReplaySameThread(); // BZ-REPLAY
+    InvalidatePathCoreHoldSameThread(); // CB: program end closes any unused arm.
+// BQ-END
     m_waitCallback = nullptr;
     ClearCompletionWaitBoundary(false);
     CancelGMBlockTransaction(false);
@@ -7626,6 +8004,12 @@ bool NCManager::FinalizeGMBlockTransaction()
     }
 
     case NCGMBlockPostAction::RETURN_M99:
+        // BN: main-program M99 loops without entering ReturnMacro().
+        FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::MACRO);
+        InvalidatePathCoreFeedSameThread(); // BX-FEED
+        InvalidatePathCoreArcSameThread(); // BY-ARC
+        InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
+        InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
         ++m_gmBlockTransactionCounters.m99Returns;
         if (snapshot.fromMainProgram)
         {
@@ -7747,6 +8131,7 @@ void NCManager::SetSingleBlockEnabled(bool enabled)
 
     if (enabled)
     {
+        CancelPathCoreHoldAutomaticSameThread("SINGLE_BLOCK");
         return;
     }
 
@@ -7968,6 +8353,7 @@ bool NCManager::ApplyControlledSingleBlockHold() noexcept
 
     m_pauseAfterBlock = false;
     m_legacySingleBlockPausePending = false;
+    PausePathCoreLiveRetentionSameThread();
     m_state = NCState::HOLD;
     m_waitCallback = WaitForCycleStartCallback;
     return true;
@@ -8158,6 +8544,7 @@ bool NCManager::ApplyControlledSingleBlockResume() noexcept
     m_legacySingleBlockPausePending = false;
     ClearHoldResumeAlarmAdmission(
         HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK);
+    ResumePathCoreLiveRetentionSameThread();
     return true;
 }
 
@@ -8471,6 +8858,7 @@ bool NCManager::ApplyProgramHoldResume(
     }
     if (beginResult != AlarmManager::MotionAdmissionResult::ACQUIRED)
     {
+        InvalidatePathCoreHoldSameThread();
         ClearHoldResumeAlarmAdmission(
             HoldResumeAdmissionKind::PROGRAM_HOLD);
         NCState heldState = NCState::HOLD;
@@ -8492,6 +8880,7 @@ bool NCManager::ApplyProgramHoldResume(
             HoldResumeAdmissionKind::PROGRAM_HOLD);
         if (!ended)
         {
+            InvalidatePathCoreHoldSameThread();
             NCState heldState = NCState::HOLD;
             (void)m_state.compare_exchange_strong(
                 heldState,
@@ -8510,6 +8899,7 @@ bool NCManager::ApplyProgramHoldResume(
         // is changed on this failed attempt.
         if (!alarms.EndMotionAdmission(admission))
         {
+            InvalidatePathCoreHoldSameThread();
             ClearHoldResumeAlarmAdmission(
                 HoldResumeAdmissionKind::PROGRAM_HOLD);
             NCState heldState = NCState::HOLD;
@@ -8523,6 +8913,24 @@ bool NCManager::ApplyProgramHoldResume(
         return false;
     }
 
+    const MotionNCSettleRequestSequence resumeHoldRequest = m_feedHoldNCSettleRequestSequence;
+    // CB: a refused/deferred excursion leaves the exact HOLD and Override=0.
+    // CB keeps Override=0 until successful End and explicit RT start commit.
+    if (!PreparePathCoreHoldResumeSameThread(gateControlled))
+    {
+        if (!alarms.EndMotionAdmission(admission))
+        {
+            InvalidatePathCoreHoldSameThread();
+            ClearHoldResumeAlarmAdmission(HoldResumeAdmissionKind::PROGRAM_HOLD);
+            NCState heldState = NCState::HOLD;
+            (void)m_state.compare_exchange_strong(heldState, NCState::ALARM,
+                std::memory_order_acq_rel, std::memory_order_acquire);
+            m_motion.RequestEmergencyStopAllAxes();
+        }
+        return false;
+    }
+
+    const bool pathHoldResume = m_pathHold.bound;
     const bool leaseCurrentBeforeCommit =
         m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease);
     NCState heldState = NCState::HOLD;
@@ -8536,6 +8944,7 @@ bool NCManager::ApplyProgramHoldResume(
     if (!committedRun ||
         !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))
     {
+        InvalidatePathCoreHoldSameThread();
         if (committedRun)
         {
             NCState provisionalRun = NCState::RUN;
@@ -8548,6 +8957,7 @@ bool NCManager::ApplyProgramHoldResume(
         const bool ended = alarms.EndMotionAdmission(admission);
         if (!ended)
         {
+            InvalidatePathCoreHoldSameThread();
             NCState restoredHold = NCState::HOLD;
             (void)m_state.compare_exchange_strong(
                 restoredHold,
@@ -8558,9 +8968,30 @@ bool NCManager::ApplyProgramHoldResume(
         }
         return false;
     }
-    m_motion.SetGroupFeedrateOverride(1.0);
+    if (m_pathHold.bound && (m_state != NCState::RUN ||
+        m_feedHoldNCSettleRequestSequence != resumeHoldRequest ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease)))
+    {
+        InvalidatePathCoreHoldSameThread();
+        NCState provisionalRun = NCState::RUN;
+        (void)m_state.compare_exchange_strong(provisionalRun, NCState::HOLD,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        m_motion.SetGroupFeedrateOverride(0.0);
+        if (!alarms.EndMotionAdmission(admission))
+        {
+            InvalidatePathCoreHoldSameThread();
+            NCState failedAdmissionHold = NCState::HOLD;
+            (void)m_state.compare_exchange_strong(failedAdmissionHold, NCState::ALARM,
+                std::memory_order_acq_rel, std::memory_order_acquire);
+            m_motion.RequestEmergencyStopAllAxes();
+        }
+        ClearHoldResumeAlarmAdmission(HoldResumeAdmissionKind::PROGRAM_HOLD);
+        return false;
+    }
+    if (!pathHoldResume) m_motion.SetGroupFeedrateOverride(1.0);
     if (!alarms.EndMotionAdmission(admission))
     {
+        InvalidatePathCoreHoldSameThread();
         NCState provisionalRun = NCState::RUN;
         (void)m_state.compare_exchange_strong(
             provisionalRun,
@@ -8572,6 +9003,44 @@ bool NCManager::ApplyProgramHoldResume(
             HoldResumeAdmissionKind::PROGRAM_HOLD);
         m_motion.RequestEmergencyStopAllAxes();
         return false;
+    }
+
+    // CB, including repeated Hold within an excursion: End succeeds before
+    // Commit and Override=1. Keep the J.5 zero-override proof intact until then.
+    if (pathHoldResume && (!m_pathHold.bound || m_state != NCState::RUN ||
+        m_feedHoldNCSettleRequestSequence != resumeHoldRequest ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || AlarmManager::GetInstance().HasAlarm() ||
+        !CommitPathCoreHoldResumeSameThread()))
+    {
+        m_pathHold.code = 13U;
+        LogPathCoreHoldSameThread("COMMIT_BLOCKED");
+        m_motion.CancelPathCoreHoldExcursion();
+        m_pathHold.blocked = true;
+        NCState provisionalRun = NCState::RUN;
+        (void)m_state.compare_exchange_strong(provisionalRun, NCState::HOLD,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        m_motion.SetGroupFeedrateOverride(0.0);
+        return false;
+    }
+
+    if (pathHoldResume)
+    {
+        m_motion.SetGroupFeedrateOverride(1.0);
+        // Controls are serviced on the NC thread; these final checks also
+        // revoke a concurrently superseded owner/safety/hold publication.
+        if (m_state != NCState::RUN || m_feedHoldNCSettleRequestSequence != resumeHoldRequest ||
+            !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
+            m_motion.HasPendingSafetyOrRecoveryRequests() || AlarmManager::GetInstance().HasAlarm())
+        {
+            m_motion.SetGroupFeedrateOverride(0.0);
+            m_motion.CancelPathCoreHoldExcursion();
+            m_pathHold.blocked = true;
+            NCState provisionalRun = NCState::RUN;
+            (void)m_state.compare_exchange_strong(provisionalRun, NCState::HOLD,
+                std::memory_order_acq_rel, std::memory_order_acquire);
+            return false;
+        }
     }
 
     // A Cycle Start is considered applied only after the admission End CAS.
@@ -8586,6 +9055,7 @@ bool NCManager::ApplyProgramHoldResume(
     }
     ClearHoldResumeAlarmAdmission(
         HoldResumeAdmissionKind::PROGRAM_HOLD);
+    ResumePathCoreLiveRetentionSameThread();
     return true;
 }
 

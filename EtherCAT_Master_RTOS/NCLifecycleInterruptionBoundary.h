@@ -341,6 +341,28 @@ public:
         bool epochChangeRequired,
         bool preLatchedRTApplication = false) noexcept;
 
+    // BR FIX2: a borrowed scalar check against this exact idle NC Alarm
+    // request. No snapshot copy, owner/epoch mutation or recovery authority.
+    // The caller must additionally prove the current SAFETY handshake and
+    // the coherent RT stop acknowledgement for this same lifecycle sequence.
+    bool MatchesIdleAlarmRequestForSafetyTakeover(
+        std::uint64_t lifecycleSequence,
+        MotionExecutionEpoch requestEpoch,
+        MotionOwnerGeneration safetyGeneration) const noexcept
+    {
+        MotionOwnerGeneration successor = m_snapshot.requestOwnerGeneration + 1U;
+        if (successor == MOTION_OWNER_GENERATION_INVALID) successor = 1U;
+        return m_snapshot.active &&
+            m_snapshot.cause == NCLifecycleInterruptionCause::ALARM &&
+            m_snapshot.sequence == lifecycleSequence && lifecycleSequence != 0ULL &&
+            m_snapshot.requestExecutionEpoch == requestEpoch &&
+            requestEpoch != MOTION_EXECUTION_EPOCH_INVALID &&
+            m_snapshot.requestActiveBlocks == 0U &&
+            m_snapshot.requestOwner == MotionOwner::AUTO &&
+            m_snapshot.requestOwnerGeneration != MOTION_OWNER_GENERATION_INVALID &&
+            safetyGeneration == successor;
+    }
+
     void RecordTerminalFeedback(
         const MotionFeedbackEvent& event,
         bool ledgerAccepted) noexcept;

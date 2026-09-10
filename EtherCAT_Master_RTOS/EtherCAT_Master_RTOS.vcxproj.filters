@@ -426,6 +426,54 @@
     <ClCompile Include="NCPathCoreCommandedChordAxisStationRange.cpp">
       <Filter>Source Files\NC\NC\NCPathCore</Filter>
     </ClCompile>
+    <ClCompile Include="NCPathCoreCommandedChordAxisDirection.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreLiveRetention.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreExecutionLink.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCompletedSnapshot.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreCommittedRun.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G01.cpp">
+      <Filter>Source Files\Motion\MotionCore_GCode</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_PathFeed.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreFeedLine.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_G02G03.cpp">
+      <Filter>Source Files\Motion\MotionCore_GCode</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_PathArc.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreFeedArc.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_PathReplay.cpp">
+      <Filter>Source Files\Motion</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_PathReplay.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCPathCoreRetainedPath.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="MotionCore_PathHold.cpp">
+      <Filter>Source Files\Motion</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_PathHold.cpp">
+      <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -814,6 +862,48 @@
     </ClInclude>
     <ClInclude Include="NCPathCoreCommandedChordAxisStationRange.h">
       <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommandedChordAxisDirection.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreLiveRetention.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreExecutionLink.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCompletedSnapshot.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionCommandedEndpointReceipt.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCommittedRun.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionFeedLineReceipt.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreFeedLine.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionFeedArcReceipt.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreFeedArc.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionPathCoreRetainedReceipt.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreRetainedPath.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionRetainedInterval.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionPathCoreHoldExcursion.h">
+      <Filter>Header Files\Motion</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

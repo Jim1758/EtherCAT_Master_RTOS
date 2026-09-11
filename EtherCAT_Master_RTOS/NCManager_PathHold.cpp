@@ -58,8 +58,8 @@ bool NCManager::IsPathCoreHoldBlockShapeValid(const NCBlock& block) noexcept
         (!std::isfinite(block.val('L')) || block.val('L') < 1.0 || block.val('L') > 32.0 ||
             std::floor(block.val('L')) != block.val('L'))) return false;
     if (block.gCode == 178 && block.has('P') &&
-        block.val('P') != 1.0 && block.val('P') != 2.0 && block.val('P') != 3.0 && block.val('P') != 4.0) return false;
-    if (block.gCode == 178 && block.has('P') && (block.val('P') == 2.0 || block.val('P') == 3.0) &&
+        block.val('P') != 1.0 && block.val('P') != 2.0 && block.val('P') != 3.0 && block.val('P') != 4.0 && block.val('P') != 5.0) return false;
+    if (block.gCode == 178 && block.has('P') && (block.val('P') == 2.0 || block.val('P') == 3.0 || block.val('P') == 5.0) &&
         (!block.has('Q') || (block.has('L') && block.val('L') != 1.0))) return false;
     if (block.gCode == 178 && block.has('P') && block.val('P') == 4.0 && !block.has('Q')) return false;
     if (block.gCode == 178 && block.has('Q') &&
@@ -84,7 +84,7 @@ bool NCManager::IsPathCoreHoldInputOmission(const NCBlock& block) const noexcept
 }
 
 NC_PATH_HOLD_NOINLINE
-void NCManager::InvalidatePathCoreHoldSameThread() noexcept
+void NCManager::InvalidatePathCoreHoldSameThread(bool cancelMotion) noexcept
 {
     CancelPathCoreHoldAutomaticSameThread("INVALIDATED");
     // Constructor paths may revoke NC state before Motion is initialized.
@@ -97,7 +97,9 @@ void NCManager::InvalidatePathCoreHoldSameThread() noexcept
             AlarmManager::GetInstance().HasAlarm()))
         CapturePathCoreHoldFaultSameThread(m_pathHold.code, 0, 2U);
     if (m_pathHold.armed || m_pathHold.bound) LogPathCoreHoldSameThread("INVALIDATED");
-    if (m_pathHold.bound) m_motion.CancelPathCoreHoldExcursion();
+    // CL_FIX1: RESET revokes NC admission now, but its exact safety batch
+    // owns RT retirement. Keep immutable excursion geometry alive until then.
+    if (cancelMotion && m_pathHold.bound) m_motion.CancelPathCoreHoldExcursion();
     m_pathHold.armed = false;
     m_pathHold.bound = false;
     m_pathHold.requested = false;
@@ -176,6 +178,7 @@ WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& block)
     m_pathHold.feedMMMin = block.val('F');
     m_pathHold.cycleLimit = block.has('L') ? static_cast<std::uint32_t>(block.val('L')) : 1U;
     m_pathHold.crossSegment = block.has('P');
+    m_pathHold.requireReturnAuthorization = block.has('P') && block.val('P') == 5.0;
     m_pathHold.automaticEnabled = block.has('Q');
     m_pathHold.automaticIntervalMM = block.has('Q') ? block.val('Q') : 0.0;
     if (m_pathHold.crossSegment && !PreparePathCoreHoldHistorySameThread())
@@ -185,8 +188,9 @@ WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& block)
     }
     m_pathHold.armed = true;
     m_pathHold.code = 1U;
-    if (block.has('P') && (block.val('P') == 2.0 || block.val('P') == 3.0 || block.val('P') == 4.0) &&
-        !StartGapPathSimulationSameThread(block.val('P') != 2.0, block.val('P') == 4.0))
+    if (block.has('P') && (block.val('P') == 2.0 || block.val('P') == 3.0 || block.val('P') == 4.0 || block.val('P') == 5.0) &&
+        !StartGapPathSimulationSameThread(block.val('P') != 2.0,
+            block.val('P') == 4.0 || block.val('P') == 5.0, block.val('P') == 5.0))
         return nullptr;
     LogPathCoreHoldSameThread("ARMED");
     if (m_pathHold.automaticEnabled) LogPathCoreHoldAutomaticSameThread("ARMED");
@@ -371,7 +375,8 @@ void NCManager::CommitPathCoreHoldCaptureSameThread(NCBlockDispatchId dispatchId
         (m_pathHold.crossSegment && !BuildPathCoreHoldViewSameThread(line)) ||
         !m_motion.BindPathCoreHoldExcursion(m_pathHold.identity, m_pathHold.lease,
             lengthMM, lengthPulse, m_pathHold.distanceMM, m_pathHold.feedMMMin, sourceFeed, sourceVelocity,
-            m_pathHold.cycleLimit, m_pathHold.crossSegment ? &m_pathHoldView : nullptr))
+            m_pathHold.cycleLimit, m_pathHold.crossSegment ? &m_pathHoldView : nullptr,
+            m_pathHold.requireReturnAuthorization))
     {
         RejectPathCoreHoldSameThread(7U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         return;
@@ -523,7 +528,7 @@ void NCManager::ObservePathCoreHoldSameThread()
 
 // CH/CI/CK use the CG input monitor; the original path owns all motion authority.
 NC_PATH_HOLD_NOINLINE
-bool NCManager::StartGapPathSimulationSameThread(bool automaticResume, bool repeating) noexcept
+bool NCManager::StartGapPathSimulationSameThread(bool automaticResume, bool repeating, bool lowRetreat) noexcept
 {
     m_gapPath = GapPathSimulationState{};
     m_gapServiceCurrent = GapServiceDiagnostic{};
@@ -531,6 +536,7 @@ bool NCManager::StartGapPathSimulationSameThread(bool automaticResume, bool repe
     m_gapPath.active = true;
     m_gapPath.automaticResume = automaticResume;
     m_gapPath.repeating = repeating;
+    m_gapPath.lowRetreat = lowRetreat;
     LARGE_INTEGER frequency{};
     if (m_gapDryRun.active || !RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
         static_cast<std::uint64_t>(frequency.QuadPart) >
@@ -557,7 +563,7 @@ void NCManager::RejectGapPathSimulationSameThread(const char* reason) noexcept
     m_gapServiceLastFault.run = m_pathHold.run;
     m_gapServiceLastFault.dispatch = m_pathHold.dispatch;
     RtPrintf("[%s] phase=FAILED reason=%s run=%llu dispatch=%llu line=%d alarm=%d\n",
-        m_gapPath.repeating ? "GAP-CK" : (m_gapPath.automaticResume ? "GAP-CI" : "GAP-CH"), reason, static_cast<unsigned long long>(m_pathHold.run),
+        m_gapPath.lowRetreat ? "GAP-CL" : (m_gapPath.repeating ? "GAP-CK" : (m_gapPath.automaticResume ? "GAP-CI" : "GAP-CH")), reason, static_cast<unsigned long long>(m_pathHold.run),
         static_cast<unsigned long long>(m_pathHold.dispatch), m_pathHold.sourceLine,
         static_cast<int>(AlarmManager::GAP_PATH_SIMULATION_FAILED));
     if (m_pathHold.bound && m_state == NCState::RUN &&
@@ -670,7 +676,8 @@ bool NCManager::ServiceGapPathSimulationSameThread(double activeS, bool publishS
         m_gapPath.lowInjected = true;
         lowEvent = true;
     }
-    if (m_gapPath.held && !m_gapPath.recoveryInjected &&
+    if (m_gapPath.held && (!m_gapPath.lowRetreat || m_gapPath.returnHold) &&
+        !m_gapPath.recoveryInjected &&
         nowMs >= m_gapPath.holdStartMs &&
         nowMs - m_gapPath.holdStartMs >= (m_gapPath.automaticResume ? 3000ULL : 1000ULL))
     {
@@ -720,15 +727,31 @@ bool NCManager::IsGapPathAutomaticNormalSameThread() const noexcept
 }
 
 NC_PATH_HOLD_NOINLINE
+bool NCManager::IsGapPathAutomaticResumeSignalSameThread() const noexcept
+{
+    if (!m_gapPath.lowRetreat || m_gapPath.returnHold)
+        return IsGapPathAutomaticNormalSameThread();
+    const EDMGap::Snapshot& gap = m_gapInput.Current();
+    return m_gapPath.active && m_gapPath.automaticResume && m_gapPath.held &&
+        m_gapPath.lowInjected && !m_gapPath.recoveryInjected && gap.configured &&
+        gap.source == EDMGap::Source::SIMULATED && gap.quality == EDMGap::Quality::VALID &&
+        gap.band == EDMGap::Band::LOW && gap.pendingBand == EDMGap::Band::UNKNOWN &&
+        m_gapPath.sequence != 0ULL && gap.sequence == m_gapPath.sequence &&
+        gap.observedAtMs == m_gapPath.lastServiceMs && gap.sampledAtMs <= m_gapPath.lastServiceMs &&
+        m_gapPath.lastServiceMs - gap.sampledAtMs <= 100ULL;
+}
+
+NC_PATH_HOLD_NOINLINE
 bool NCManager::ValidateGapPathAutomaticResumeSameThread() noexcept
 {
     if (!m_gapPath.active || !m_gapPath.automaticResume || !m_pathHold.automaticHoldOwned) return true;
     // Admission can be delayed between the service, Prepare and Commit. Poll
     // the actual clock without publishing or qualifying a replacement sample.
     if (!ServiceGapPathSimulationSameThread(0.0, false, "ADMISSION")) return false;
-    if (!m_pathHold.automaticAdmissionOwned || !IsGapPathAutomaticNormalSameThread())
+    if (!m_pathHold.automaticAdmissionOwned || !IsGapPathAutomaticResumeSignalSameThread())
     {
-        RejectGapPathSimulationSameThread("RECOVERY_NOT_NORMAL_AT_ADMISSION");
+        RejectGapPathSimulationSameThread(m_gapPath.lowRetreat ?
+            "CL_SIGNAL_NOT_QUALIFIED_AT_ADMISSION" : "RECOVERY_NOT_NORMAL_AT_ADMISSION");
         return false;
     }
     return true;
@@ -739,7 +762,7 @@ void NCManager::LogGapPathSimulationSameThread(const char* phase) const noexcept
 {
     const EDMGap::Snapshot& gap = m_gapInput.Current();
     RtPrintf("[%s] phase=%s source=%s quality=%s band=%s mv=%d seq=%llu ms=%llu run=%llu dispatch=%llu line=%d owner=%u generation=%llu epoch=%llu hold=%llu owned=%u ack=%u low=%u recovered=%u resume=%s completed=%llu limit=%u nextS=%016llX motion=1 discharge=0\n",
-        m_gapPath.repeating ? "GAP-CK" : (m_gapPath.automaticResume ? "GAP-CI" : "GAP-CH"), phase, EDMGap::SourceName(gap.source), EDMGap::QualityName(gap.quality), EDMGap::BandName(gap.band),
+        m_gapPath.lowRetreat ? "GAP-CL" : (m_gapPath.repeating ? "GAP-CK" : (m_gapPath.automaticResume ? "GAP-CI" : "GAP-CH")), phase, EDMGap::SourceName(gap.source), EDMGap::QualityName(gap.quality), EDMGap::BandName(gap.band),
         static_cast<int>(gap.voltageMv), static_cast<unsigned long long>(gap.sequence),
         static_cast<unsigned long long>(m_gapPath.lastServiceMs), static_cast<unsigned long long>(m_pathHold.run),
         static_cast<unsigned long long>(m_pathHold.dispatch), m_pathHold.sourceLine,
@@ -748,7 +771,8 @@ void NCManager::LogGapPathSimulationSameThread(const char* phase) const noexcept
         static_cast<unsigned long long>(m_pathHold.automaticSettleSequence),
         m_pathHold.automaticHoldOwned ? 1U : 0U, m_gapPath.ackLogged ? 1U : 0U,
         m_gapPath.lowInjected ? 1U : 0U, m_gapPath.recoveryLogged ? 1U : 0U,
-        m_gapPath.automaticResume ? "AUTO_NORMAL" : "OPERATOR",
+        m_gapPath.lowRetreat ? (m_gapPath.returnHold ? "NORMAL_RETURN" : "LOW_RETREAT") :
+        (m_gapPath.automaticResume ? "AUTO_NORMAL" : "OPERATOR"),
         static_cast<unsigned long long>(m_pathHold.automaticObservedReturns),
         static_cast<unsigned int>(m_pathHold.cycleLimit),
         static_cast<unsigned long long>(HoldDoubleBits(m_pathHold.automaticNextS)));
@@ -789,9 +813,83 @@ void NCManager::CancelPathCoreHoldAutomaticSameThread(const char* reason) noexce
     m_pathHold.automaticSettleSequence = MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
 }
 
+// CL: a separate endpoint boundary is mandatory even after operator takeover.
+// This NC helper creates no velocity command and cannot release WAIT_RETURN.
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ProcessPathCoreReturnWaitSameThread() noexcept
+{
+    if (!m_pathHold.bound || !m_pathHold.requireReturnAuthorization ||
+        m_pathHold.returnHoldRequested || !m_pathHold.requested || !m_pathHold.startCommitted ||
+        Close_System_Com_flag || AlarmManager::GetInstance().HasAlarm() ||
+        (m_state != NCState::RUN && m_state != NCState::HOLD) ||
+        m_mode != NCOperationMode::MEMORY || Homing.IsActive() || m_isG66Active || !m_macroStack.empty() ||
+        m_pathHold.blocked || m_pathHold.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        m_pathHold.cache != GetBaseProgramCache().GetGeneration() ||
+        m_pathHold.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !m_pathHold.lease.Matches(m_programMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_pathHold.lease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !IsPathCoreReplayConfigurationValid()) return false;
+    const bool line = m_pathFeed.pending && m_pathFeed.bound && m_pathFeed.dispatch == m_pathHold.dispatch;
+    const bool arc = m_pathArc.pending && m_pathArc.bound && m_pathArc.dispatch == m_pathHold.dispatch;
+    if (line == arc) return false;
+    const auto snapshot = m_motion.GetPathCoreHoldExcursionSnapshot();
+    if (snapshot.publicationSequence == 0ULL || !HoldIdentityEqual(snapshot.identity, m_pathHold.identity) ||
+        !snapshot.ownerLease.Matches(m_pathHold.lease) ||
+        snapshot.phase != MotionPathCoreHoldExcursionPhase::WAIT_RETURN) return false;
+    if (!snapshot.requireReturnAuthorization || !snapshot.crossSegment ||
+        snapshot.historyCount != m_pathHoldView.completedCount || snapshot.cycleLimit != 1U ||
+        snapshot.retreatCount != 1ULL || snapshot.returnCount != 0ULL ||
+        snapshot.holdRequestSequence < m_pathHold.requestedHoldSequence)
+    {
+        RejectPathCoreHoldSameThread(15U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY, &snapshot);
+        return true;
+    }
+    if (m_gapPath.active && !ServiceGapPathSimulationSameThread(0.0, true, "RETURN_HOLD")) return true;
+    if (m_state == NCState::RUN) FeedHoldInternal();
+    else
+    {
+        // A HOLD/START pressed while retreating cannot preauthorize return.
+        // Refresh the boundary while remaining HOLD; Begin cancels its old START.
+        m_feedHoldNCSettleRequestSequence = m_motion.RequestFeedHoldNCSettle(
+            m_motion.GetCurrentExecutionEpoch(), m_programMotionLease);
+        BeginFeedHoldBoundaryShadow(NCFeedHoldSource::PROGRAM);
+        m_motion.SetGroupFeedrateOverride(0.0);
+        ObserveFeedHoldLegacyHoldShadow();
+    }
+    const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
+    if (m_state != NCState::HOLD || !IsProgramFeedHoldResumeCandidate() ||
+        boundary.sequence == 0ULL || boundary.dispatchId != m_pathHold.dispatch ||
+        boundary.requestExecutionEpoch != m_pathHold.identity.epoch ||
+        boundary.requestOwner != m_pathHold.lease.owner ||
+        boundary.requestOwnerGeneration != m_pathHold.lease.generation ||
+        m_feedHoldNCSettleRequestSequence <= m_pathHold.requestedHoldSequence ||
+        m_feedHoldNCSettleRequestSequence <= snapshot.holdRequestSequence ||
+        boundary.expectedSettleRequestSequence != m_feedHoldNCSettleRequestSequence ||
+        boundary.failed || boundary.cancelled)
+    {
+        RejectPathCoreHoldSameThread(15U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY, &snapshot);
+        return true;
+    }
+    m_pathHold.returnHoldRequested = true;
+    if (m_pathHold.automaticEnabled && m_gapPath.active && m_gapPath.lowRetreat)
+    {
+        m_pathHold.automaticBoundarySequence = boundary.sequence;
+        m_pathHold.automaticSettleSequence = m_feedHoldNCSettleRequestSequence;
+        m_pathHold.automaticHoldOwned = true;
+        m_pathHold.automaticAdmissionOwned = false;
+        m_gapPath.returnHold = true;
+        m_gapPath.holdStartMs = m_gapPath.lastServiceMs;
+        m_gapPath.ackLogged = false;
+        m_gapPath.waitJ5Logged = false;
+    }
+    LogPathCoreHoldAutomaticSameThread("RETURN_HOLD_REQUESTED");
+    return true;
+}
+
 NC_PATH_HOLD_NOINLINE
 bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
 {
+    if (ProcessPathCoreReturnWaitSameThread()) return true;
     if (!m_pathHold.automaticEnabled) return false;
     if (Close_System_Com_flag || AlarmManager::GetInstance().HasAlarm() ||
         (m_state != NCState::RUN && m_state != NCState::HOLD) ||
@@ -858,7 +956,7 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
     // CK retains the session through the excursion. Historical activeS is
     // local to its current leg and may exceed the original source length.
     const bool gapReturnPending = m_gapPath.active && m_gapPath.repeating &&
-        m_gapPath.held && !m_pathHold.automaticHoldOwned &&
+        m_gapPath.held && (!m_pathHold.automaticHoldOwned || m_gapPath.returnHold) &&
         m_pathHold.requested && m_pathHold.startCommitted;
     if (m_gapPath.active)
     {
@@ -904,13 +1002,14 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
             if (!m_gapPath.ackLogged)
             {
                 m_gapPath.ackLogged = true;
-                LogGapPathSimulationSameThread(m_gapPath.automaticResume ?
-                    "STOP_CONFIRMED_WAIT_NORMAL" : "STOP_CONFIRMED_WAIT_START");
+                LogGapPathSimulationSameThread(m_gapPath.lowRetreat && !m_gapPath.returnHold ?
+                    "STOP_CONFIRMED_LOW_RETREAT" : (m_gapPath.automaticResume ?
+                        "STOP_CONFIRMED_WAIT_NORMAL" : "STOP_CONFIRMED_WAIT_START"));
             }
             if (!m_gapPath.automaticResume) return true;
             // Diagnostic latches never grant admission: require this scan's
             // actual, fully qualified sample and the exact owned J5 boundary.
-            if (!IsGapPathAutomaticNormalSameThread() ||
+            if (!IsGapPathAutomaticResumeSignalSameThread() ||
                 m_gapInput.Current().sampledAtMs != m_gapPath.lastServiceMs) return true;
             if (snapshot.boundaryOnly)
             {
@@ -1171,12 +1270,17 @@ bool NCManager::PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcep
     const MotionPathCoreHoldExcursionSnapshot snapshot = m_motion.GetPathCoreHoldExcursionSnapshot();
     if (!HoldIdentityEqual(snapshot.identity, m_pathHold.identity)) return false; // Bind mailbox not yet consumed.
     if (!snapshot.ownerLease.Matches(m_pathHold.lease) ||
-        snapshot.cycleLimit != m_pathHold.cycleLimit || snapshot.cycleLimit < 1U || snapshot.cycleLimit > 32U)
+        snapshot.cycleLimit != m_pathHold.cycleLimit || snapshot.cycleLimit < 1U || snapshot.cycleLimit > 32U ||
+        snapshot.requireReturnAuthorization != m_pathHold.requireReturnAuthorization)
     {
         if (!m_pathHold.blocked) { m_pathHold.code = 11U; LogPathCoreHoldSameThread("RESUME_BLOCKED"); }
         m_pathHold.blocked = true;
         return false;
     }
+    const bool returnStart = m_pathHold.requireReturnAuthorization && m_pathHold.returnHoldRequested &&
+        m_pathHold.requested && snapshot.requireReturnAuthorization &&
+        snapshot.phase == MotionPathCoreHoldExcursionPhase::WAIT_RETURN &&
+        snapshot.retreatCount == 1ULL && snapshot.returnCount == 0ULL;
     const bool initial = !m_pathHold.requested && snapshot.phase == MotionPathCoreHoldExcursionPhase::ARMED;
     const bool repeat = m_pathHold.requested && snapshot.phase == MotionPathCoreHoldExcursionPhase::COMPLETE &&
         snapshot.returnCount < m_pathHold.cycleLimit&&
@@ -1203,7 +1307,7 @@ bool NCManager::PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcep
         m_pathHold.blocked = true;
         return false;
     }
-    if (m_pathHold.requested && snapshot.phase != MotionPathCoreHoldExcursionPhase::COMPLETE)
+    if (m_pathHold.requested && snapshot.phase != MotionPathCoreHoldExcursionPhase::COMPLETE && !returnStart)
     {
         // A Hold inside the current excursion resumes that leg. It cannot
         // consume a later repetition, including the pending launch dwell.
@@ -1219,7 +1323,7 @@ bool NCManager::PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcep
     if (m_pathHold.requested && snapshot.phase == MotionPathCoreHoldExcursionPhase::COMPLETE &&
         m_feedHoldNCSettleRequestSequence != MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
         m_feedHoldNCSettleRequestSequence <= snapshot.completedHoldRequestSequence) return true;
-    if ((!initial && !repeat) || !snapshot.ready ||
+    if ((!initial && !repeat && !returnStart) || !snapshot.ready ||
         snapshot.holdRequestSequence != m_feedHoldNCSettleRequestSequence ||
         !m_motion.RequestPathCoreHoldExcursion(m_pathHold.identity,
             m_pathHold.lease, m_feedHoldNCSettleRequestSequence)) return false;

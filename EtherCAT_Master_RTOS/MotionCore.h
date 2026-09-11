@@ -2153,7 +2153,8 @@ public:
         double distanceMM, double feedMMMin,
         double sourceFeedMMMin, double sourceVelocityPPS,
         std::uint32_t cycleLimit = 1U,
-        const MotionPathCoreHoldExcursionView* crossView = nullptr) noexcept;
+        const MotionPathCoreHoldExcursionView* crossView = nullptr,
+        bool requireReturnAuthorization = false) noexcept;
     bool RequestPathCoreHoldExcursion(const MotionExecutionIdentity& identity,
         const MotionOwnerLease& lease, MotionNCSettleRequestSequence settleSequence) noexcept;
     bool CommitPathCoreHoldExcursion(const MotionExecutionIdentity& identity,
@@ -2515,6 +2516,7 @@ private:
         double lengthMM = 0.0, lengthPulse = 0.0, distanceMM = 0.0, feedMMMin = 0.0;
         double sourceFeedMMMin = 0.0, sourceVelocityPPS = 0.0;
         bool start = false, crossSegment = false;
+        bool returnStart = false, requireReturnAuthorization = false;
         MotionPathCoreHoldExcursionView crossView{};
     };
     FixedCapacitySpscRing<PathCoreHoldRequest, 8U> m_pathHoldRequests{};

@@ -814,7 +814,11 @@ void NCManager::Reset()
     InvalidatePathCoreFeedSameThread(); // BX-FEED
     InvalidatePathCoreArcSameThread(); // BY-ARC
     InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
-    InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
+    // CL_FIX1: revoke all NC arm/resume state at the button boundary, including
+    // bound, so the next observer scan cannot cancel Motion ahead of RESET.
+    // RT still needs its immutable excursion/union geometry while the old
+    // AUTO source is authorized or a controlled stop is decelerating.
+    InvalidatePathCoreHoldSameThread(false);
     const bool waitingForPreResetControlledStop =
         m_resetContinuationPhase ==
         ResetContinuationPhase::PRE_RESET_CONTROLLED_STOP;
@@ -1696,6 +1700,12 @@ void NCManager::Reset()
     // owning NC call remains synchronous; every concurrent Reset/ProcessTask
     // observes CLEANUP and returns instead of repeating modal/cache cleanup.
     m_resetContinuationPhase = ResetContinuationPhase::CLEANUP;
+
+    // CL_FIX1: the exact RESET batch has been consumed and the old AUTO
+    // owner/epoch is fenced. Retire RT receipts here, once, before cleanup.
+    // Publishing this generation at button entry races the still-authorized
+    // excursion and correctly trips its orphan/mapping integrity guard.
+    m_motion.CancelPathCoreHoldExcursion();
 
 
     //重置馬達區塊--------------------------------------------------

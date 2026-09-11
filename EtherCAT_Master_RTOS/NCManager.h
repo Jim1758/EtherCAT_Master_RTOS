@@ -2470,6 +2470,7 @@ private:
         bool active = false, clockStarted = false, lowInjected = false, held = false;
         bool recoveryInjected = false, normalLogged = false, recoveryLogged = false, ackLogged = false;
         bool automaticResume = false, waitJ5Logged = false, repeating = false;
+        bool lowRetreat = false, returnHold = false;
     } m_gapPath{};
     static_assert(sizeof(GapPathSimulationState) <= 128U,
         "CH/CI/CK simulation must remain fixed NC-owned storage.");
@@ -2486,7 +2487,9 @@ private:
     static_assert(2U * sizeof(GapServiceDiagnostic) + sizeof(std::uint32_t) <= 192U,
         "CK service evidence must remain fixed NC-owned storage.");
     void LogGapServiceFaultSameThread() const noexcept;
-    bool StartGapPathSimulationSameThread(bool automaticResume = false, bool repeating = false) noexcept;
+    bool StartGapPathSimulationSameThread(bool automaticResume = false, bool repeating = false,
+        bool lowRetreat = false) noexcept;
+    bool IsGapPathAutomaticResumeSignalSameThread() const noexcept;
     bool IsGapPathAutomaticNormalSameThread() const noexcept;
     bool ValidateGapPathAutomaticResumeSameThread() noexcept;
     bool ServiceGapPathSimulationSameThread(double activeS, bool publishSample = true,
@@ -2511,6 +2514,8 @@ private:
         std::uint32_t code = 0U, cycleLimit = 1U;
         bool armed = false, bound = false, requested = false, blocked = false;
         bool explicitControl = false, startCommitted = false, crossSegment = false;
+        // CL endpoint authorization survives revocation of automatic GAP control.
+        bool requireReturnAuthorization = false, returnHoldRequested = false;
     } m_pathHold{};
     // CD: NC-owned immutable handoff scratch. No large automatic view copies.
     MotionPathCoreHoldExcursionView m_pathHoldView{};
@@ -2536,10 +2541,11 @@ private:
     void BeginPathCoreHoldCaptureSameThread(const NCBlock& block,
         NCBlockDispatchId dispatchId) noexcept;
     void CommitPathCoreHoldCaptureSameThread(NCBlockDispatchId dispatchId);
-    void InvalidatePathCoreHoldSameThread() noexcept;
+    void InvalidatePathCoreHoldSameThread(bool cancelMotion = true) noexcept;
     void FeedHoldInternal();
     void CancelPathCoreHoldAutomaticSameThread(const char* reason) noexcept;
     bool ProcessPathCoreHoldAutomaticSameThread() noexcept;
+    bool ProcessPathCoreReturnWaitSameThread() noexcept;
     void LogPathCoreHoldAutomaticSameThread(const char* phase) const noexcept;
     void ObservePathCoreHoldSameThread();
     bool PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcept;

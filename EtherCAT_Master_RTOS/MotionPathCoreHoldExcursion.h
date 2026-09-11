@@ -19,7 +19,7 @@ static_assert(std::is_trivially_copyable<MotionPathCoreHoldExcursionView>::value
 // CB: producer/RT control metadata only; MotionCommand and shared-memory ABI stay unchanged.
 enum class MotionPathCoreHoldExcursionPhase : std::uint32_t
 {
-    IDLE, ARMED, RETREATING, RETURNING, COMPLETE, REJECTED, INVALIDATED
+    IDLE, ARMED, RETREATING, RETURNING, COMPLETE, REJECTED, INVALIDATED, WAIT_RETURN
 };
 struct MotionPathCoreHoldExcursionSnapshot
 {
@@ -47,6 +47,7 @@ struct MotionPathCoreHoldExcursionSnapshot
     bool crossSegment = false;
     bool ready = false;
     bool boundaryOnly = false;
+    bool requireReturnAuthorization = false;
 };
 static_assert(std::is_trivially_copyable<MotionPathCoreHoldExcursionSnapshot>::value,
     "CB publication must remain fixed POD.");

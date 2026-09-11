@@ -96,6 +96,7 @@
     <ClInclude Include="CompensationEngine.h" />
     <ClInclude Include="ConfigReader.h" />
     <ClInclude Include="CoordinateManager.h" />
+    <ClInclude Include="EDMGapSignal.h" />
     <ClInclude Include="EtherCatDcQualificationDiagContract.h" />
     <ClInclude Include="EtherCatDcV1aDiagContract.h" />
     <ClInclude Include="EtherCatEni.h" />
@@ -307,6 +308,7 @@
     <ClCompile Include="NCGCodeSemantics.cpp" />
     <ClCompile Include="NCLifecycleInterruptionBoundary.cpp" />
     <ClCompile Include="NCManager.cpp" />
+    <ClCompile Include="NCManager_Gap.cpp" />
     <ClCompile Include="NCManager_PathArc.cpp" />
     <ClCompile Include="NCManager_PathCore.cpp" />
     <ClCompile Include="NCManager_PathFeed.cpp" />

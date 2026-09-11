@@ -2121,15 +2121,31 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
                 ? BuildCurrentNCGroupAxisMask()
                 : 0U;
 
-            tracker.scopeMask = currentScopeMask;
-            if (tracker.scopeMask != 0U)
+            // CG FIX1: G180/G04 and pure logic can HOLD before any Motion
+            // segment exists in this epoch. Bind a drained NC program to all
+            // physical axes; retain the full 200-cycle stop proof below.
+            const bool pureProgramScope =
+                tupleCurrent && !requestIdentityCurrent &&
+                (request.ownerLease.owner == MotionOwner::AUTO ||
+                    request.ownerLease.owner == MotionOwner::MDI ||
+                    request.ownerLease.owner == MotionOwner::MANUAL_AUTO) &&
+                !m_Group.isActive && m_Group.cmdQueue.ingress_size() == 0U &&
+                m_Group.cmdQueue.replay_size() == 0U &&
+                m_axisCommandChannel.command_size() == 0U &&
+                m_Group.pathMode != PathMode::PATH_SERVO &&
+                m_Group.pathMode != PathMode::JUMP_TRACKING &&
+                m_Group.jumpManager.state == JumpState::IDLE;
+            tracker.scopeMask = pureProgramScope
+                ? BuildExistingNCAxisMask()
+                : currentScopeMask;
+            if (requestIdentityCurrent && tracker.scopeMask != 0U)
             {
                 m_ncLastGroupScopeMask = tracker.scopeMask;
                 m_ncLastGroupScopeExecutionEpoch = request.executionEpoch;
                 m_ncLastGroupScopeExecutionIdentity =
                     tracker.executionIdentity;
             }
-            else if (m_ncLastGroupScopeMask != 0U &&
+            else if (requestIdentityCurrent && m_ncLastGroupScopeMask != 0U &&
                 m_ncLastGroupScopeExecutionEpoch == request.executionEpoch &&
                 MotionExecutionIdentityExactlyMatches(
                     m_ncLastGroupScopeExecutionIdentity,
@@ -2139,7 +2155,7 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
             }
             tracker.requestAccepted =
                 tupleCurrent &&
-                requestIdentityCurrent &&
+                (requestIdentityCurrent || pureProgramScope) &&
                 tracker.scopeMask != 0U;
             if (!tracker.requestAccepted)
             {
@@ -2516,7 +2532,8 @@ bool MotionCore::TryAcquireMotionOwner(
             return true;
         }
 
-        if (currentLease.owner != MotionOwner::NONE)
+        if (currentLease.owner != MotionOwner::NONE &&
+            currentLease.owner != MotionOwner::IDLE_HOLD)
         {
             return false;
         }
@@ -2545,6 +2562,123 @@ bool MotionCore::TryAcquireMotionOwner(
     }
 
     return false;
+}
+
+
+bool MotionCore::TryEnterProgramEndIdleHold(
+    const MotionOwnerLease& programLease,
+    MotionExecutionEpoch expectedEpoch) noexcept
+{
+    if ((programLease.owner != MotionOwner::AUTO &&
+        programLease.owner != MotionOwner::MDI &&
+        programLease.owner != MotionOwner::MANUAL_AUTO) ||
+        !HasExactExecutionDrainAcknowledgement(expectedEpoch, programLease))
+    {
+        return false;
+    }
+    const auto exactSettledProof = [&programLease, expectedEpoch](
+        const MotionNCSettleSnapshot& sample) noexcept -> bool
+    {
+        return sample.profile == MotionNCSettleProfile::GROUP_COMPLETION &&
+            sample.publicationGeneration != 0ULL && sample.proofSequence != 0ULL &&
+            sample.runtimeObserved && sample.runtimeCycleValid &&
+            sample.runtimeCycleContiguous && sample.groupDrained && !sample.groupActive &&
+            sample.settled && sample.scopeMask != 0U && !sample.safetyOrRecoveryPending &&
+            sample.commandQueueDepth == 0U && sample.commandIngressDepth == 0U &&
+            sample.commandReplayDepth == 0U && sample.executionEpoch == expectedEpoch &&
+            sample.owner == programLease.owner && sample.ownerGeneration == programLease.generation &&
+            sample.requiredCycles == MOTION_NC_SETTLE_REQUIRED_CYCLES &&
+            sample.dwellCycles >= sample.requiredCycles;
+    };
+    MotionNCSettleSnapshot proof{};
+    MotionNCSettleCounters counters{};
+    if (!TryGetNCSettleEvidence(MotionNCSettleProfile::GROUP_COMPLETION,
+        proof, counters) || !exactSettledProof(proof))
+    {
+        return false;
+    }
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    AlarmManager::MotionAdmissionReservation admission{};
+    if (!alarms.BeginMotionAdmission(alarms.GetUpdateCount(), admission))
+    {
+        return false;
+    }
+    std::uint64_t ownerState = m_motionOwnerState.load(std::memory_order_acquire);
+    std::uint64_t execution = m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t baseExecution = execution;
+    const std::uint32_t safetyTicket = UnpackMotionOwnerSafetyRequestTicket(ownerState);
+    bool entered = false;
+    bool postCommitCurrent = true;
+    bool epochReleaseFailed = false;
+    MotionOwnerLease holdLease{};
+    holdLease.owner = MotionOwner::IDLE_HOLD;
+    holdLease.generation = NextMotionOwnerGeneration(programLease.generation);
+    if (UnpackMotionOwnerState(ownerState).Matches(programLease) &&
+        !UnpackMotionOwnerSafetyHandshake(ownerState) &&
+        !UnpackMotionOwnerSafetyActionPending(ownerState) &&
+        (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL &&
+        safetyTicket == m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire) &&
+        UnpackExecutionEpochPublication(execution) == expectedEpoch &&
+        (execution & (EXECUTION_EPOCH_PUBLICATION_PENDING |
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL &&
+        !HasPendingSafetyOrRecoveryRequests() &&
+        HasExactExecutionDrainAcknowledgement(expectedEpoch, programLease) &&
+        alarms.IsMotionAdmissionCurrent(admission) &&
+        m_executionEpochPublication.compare_exchange_strong(execution,
+            baseExecution | EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        // Re-read the RT stop proof after reserving this exact epoch.
+        if (TryGetNCSettleEvidence(MotionNCSettleProfile::GROUP_COMPLETION,
+            proof, counters) && exactSettledProof(proof) &&
+            alarms.IsMotionAdmissionCurrent(admission) &&
+            !HasPendingSafetyOrRecoveryRequests())
+        {
+            // Bind epoch before owner publication, including the first RT pass.
+            m_programEndIdleHoldGrant.store(
+                (static_cast<std::uint64_t>(holdLease.generation) << 32U) |
+                static_cast<std::uint64_t>(expectedEpoch),
+                std::memory_order_release);
+            entered = m_motionOwnerState.compare_exchange_strong(ownerState,
+                PackMotionOwnerState(holdLease.owner, holdLease.generation,
+                    safetyTicket, false),
+                std::memory_order_acq_rel, std::memory_order_acquire);
+        }
+        std::uint64_t reserved = baseExecution | EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED;
+        if (!m_executionEpochPublication.compare_exchange_strong(reserved,
+            baseExecution, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            // Exact-token release only: never clear another publisher's reservation.
+            epochReleaseFailed = true;
+            postCommitCurrent = false;
+        }
+    }
+    if (!alarms.EndMotionAdmission(admission) ||
+        !IsMotionOwnerLeaseCurrent(holdLease) ||
+        GetCurrentExecutionEpoch() != expectedEpoch ||
+        HasPendingSafetyOrRecoveryRequests())
+    {
+        postCommitCurrent = false;
+    }
+    if (epochReleaseFailed)
+    {
+        RtPrintf("[IDLE-CJ] FAILED reason=EPOCH_RESERVATION_LOST epoch=%u\n", expectedEpoch);
+        if (!alarms.HasAlarm()) alarms.Trigger(AlarmManager::IDLE_POSITION_HOLD_FAILED);
+    }
+    if (!entered)
+    {
+        return false;
+    }
+    // A successful CAS consumed the program lease. Even an immediately
+    // cancelled hold is a committed handoff, never an NC retry of that lease.
+    if (!postCommitCurrent)
+    {
+        (void)ReleaseMotionOwner(holdLease);
+    }
+    RtPrintf("[IDLE-CJ] ENTER owner=%u generation=%u epoch=%u mask=%u current=%u\n",
+        static_cast<unsigned>(holdLease.owner), holdLease.generation,
+        expectedEpoch, proof.scopeMask, postCommitCurrent ? 1U : 0U);
+    return true;
 }
 
 
@@ -9269,6 +9403,314 @@ void MotionCore::LinkCoordinateManager(CoordinateManager* pCoord)
 }
 
 
+bool MotionCore::TryPopIdleHoldDiagnostic(IdleHoldDiagnosticEvent& event) noexcept
+{
+    // Exactly one consumer: HMI_Bridge::ProcessTask_1000ms, Priority 50.
+    return m_idleHoldDiagnostics.events.ConsumerTryPop(event);
+}
+
+std::uint32_t MotionCore::GetIdleHoldDiagnosticDroppedCount() const noexcept
+{
+    return m_idleHoldDiagnostics.dropped.load(std::memory_order_acquire);
+}
+
+void MotionCore::QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType eventType,
+    IdleHoldDiagnosticReason reason, int axisIndex,
+    MotionOwnerLease nextLease) noexcept
+{
+    // RT sole producer. Capture immutable values only; never format, allocate,
+    // wait, retry, or give a diagnostic failure authority over Motion.
+    IdleHoldDiagnostics& diagnostics = m_idleHoldDiagnostics;
+    IdleHoldDiagnosticEvent& event = diagnostics.producerEvent;
+    const IdlePositionHoldState& hold = m_idlePositionHold;
+    event.runtimeTick = m_ncSettleRuntimeCycleTick;
+    event.cmdPulseBits = 0ULL;
+    event.actPulseBits = 0ULL;
+    event.windowPulseBits = 0ULL;
+    if (diagnostics.nextSequence != (std::numeric_limits<std::uint64_t>::max)())
+    {
+        ++diagnostics.nextSequence;
+    }
+    event.sequence = diagnostics.nextSequence;
+    event.epoch = hold.epoch;
+    event.generation = hold.lease.generation;
+    event.mask = hold.requiredMask;
+    event.nextGeneration = nextLease.generation;
+    event.axisIndex = axisIndex;
+    event.owner = hold.lease.owner;
+    event.nextOwner = nextLease.owner;
+    event.eventType = eventType;
+    event.reason = reason;
+    if (eventType == IdleHoldDiagnosticEventType::REFERENCE &&
+        axisIndex >= 0 && axisIndex < MAX_AXES && m_pContexts != nullptr &&
+        static_cast<std::size_t>(axisIndex) < m_pContexts->size())
+    {
+        const std::size_t slot = static_cast<std::size_t>(axisIndex);
+        std::memcpy(&event.cmdPulseBits, &hold.reference[slot], sizeof(event.cmdPulseBits));
+        std::memcpy(&event.actPulseBits, &(*m_pContexts)[slot].currentActPos,
+            sizeof(event.actPulseBits));
+        std::memcpy(&event.windowPulseBits, &hold.window[slot], sizeof(event.windowPulseBits));
+    }
+    if (!diagnostics.events.ProducerTryPush(event))
+    {
+        // Single RT writer: a saturating load/store needs no CAS retry loop.
+        const std::uint32_t dropped = diagnostics.dropped.load(std::memory_order_relaxed);
+        if (dropped != (std::numeric_limits<std::uint32_t>::max)())
+        {
+            diagnostics.dropped.store(dropped + 1U, std::memory_order_release);
+        }
+    }
+}
+
+void MotionCore::CancelIdlePositionHold(IdleHoldDiagnosticReason reason, bool fault,
+    int axisIndex) noexcept
+{
+    IdlePositionHoldState& hold = m_idlePositionHold;
+    const bool firstCancellation = !hold.cancelled;
+    hold.cancelled = true;
+    hold.active = false;
+    hold.frameMask = 0U;
+    (void)ZeroAllServoTargetVelocityForFrame();
+    (void)ReleaseMotionOwner(hold.lease);
+    if (fault && !AlarmManager::GetInstance().HasAlarm())
+    {
+        AlarmManager::GetInstance().Trigger(
+            AlarmManager::IDLE_POSITION_HOLD_FAILED, 0, axisIndex);
+    }
+    // All control and alarm actions precede best-effort diagnostics.
+    if (firstCancellation)
+    {
+        QueueIdleHoldDiagnostic(fault ? IdleHoldDiagnosticEventType::FAILED :
+            IdleHoldDiagnosticEventType::CANCELLED, reason, axisIndex);
+    }
+}
+
+void MotionCore::PrepareIdlePositionHoldPass() noexcept
+{
+    IdlePositionHoldState& hold = m_idlePositionHold;
+    hold.frameMask = 0U;
+    hold.passRequested = false;
+    const MotionOwnerLease lease = GetMotionOwnerLease();
+    if (lease.owner != MotionOwner::IDLE_HOLD)
+    {
+        if (hold.lease.IsValid())
+        {
+            QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType::RELEASED,
+                IdleHoldDiagnosticReason::NONE, -1, lease);
+        }
+        hold = IdlePositionHoldState{};
+        return;
+    }
+    hold.passRequested = true;
+    if (!hold.lease.Matches(lease))
+    {
+        hold = IdlePositionHoldState{};
+        hold.passRequested = true;
+        hold.lease = lease;
+        const std::uint64_t grant = m_programEndIdleHoldGrant.load(std::memory_order_acquire);
+        hold.epoch = static_cast<MotionExecutionEpoch>(grant);
+        if (static_cast<MotionOwnerGeneration>(grant >> 32U) != lease.generation)
+        {
+            CancelIdlePositionHold(IdleHoldDiagnosticReason::GRANT_MISMATCH, true);
+            return;
+        }
+        hold.requiredMask = BuildExistingNCAxisMask();
+    }
+    if (hold.cancelled)
+    {
+        (void)ReleaseMotionOwner(hold.lease);
+        return;
+    }
+    const std::uint64_t publication = m_executionEpochPublication.load(std::memory_order_acquire);
+    if (UnpackExecutionEpochPublication(publication) != hold.epoch ||
+        (publication & EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        HasPendingSafetyOrRecoveryRequests() || AlarmManager::GetInstance().HasAlarm())
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::AUTHORITY_CHANGED, false);
+        return;
+    }
+    if ((publication & EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL)
+    {
+        return;
+    }
+    if (m_pContexts == nullptr || m_pDrives == nullptr ||
+        m_pContexts->size() != m_pDrives->size() ||
+        m_pContexts->size() > MAX_AXES || hold.requiredMask == 0U ||
+        BuildExistingNCAxisMask() != hold.requiredMask || m_Group.isActive ||
+        m_Group.cmdQueue.ingress_size() != 0U || m_Group.cmdQueue.replay_size() != 0U ||
+        !std::isfinite(m_Group.virtualAxis.currentCmdVel) ||
+        !std::isfinite(m_Group.virtualAxis.logicalCmdVel) ||
+        m_Group.virtualAxis.currentCmdVel != 0.0 ||
+        m_Group.virtualAxis.logicalCmdVel != 0.0)
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::GROUP_OR_MAPPING_CHANGED, true);
+        return;
+    }
+    hold.runtimeTick = m_ncSettleRuntimeCycleTick;
+}
+
+void MotionCore::UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& axis,
+    const MotionServoInputSnapshot& input) noexcept
+{
+    IdlePositionHoldState& hold = m_idlePositionHold;
+    WriteServoTargetVelocityCommand(output, axis.axisIndex, 0);
+    axis.pid.prevError = axis.pid.integralAcc = 0.0;
+    axis.Pid_IDLE.prevError = axis.Pid_IDLE.integralAcc = 0.0;
+    axis.Pid_G00.prevError = axis.Pid_G00.integralAcc = 0.0;
+    axis.currentActVel = (axis.currentActPos - axis.lastActPos) / CYCLE_TIME_SEC;
+    axis.lastActPos = axis.currentActPos;
+    if (!hold.passRequested || hold.cancelled || !hold.lease.IsValid() ||
+        !IsMotionOwnerLeaseCurrent(hold.lease) ||
+        !m_ncSettleRuntimeObserved || !m_ncSettleRuntimeCycleValid ||
+        !m_ncSettleRuntimeCycleContiguous ||
+        hold.runtimeTick != m_ncSettleRuntimeCycleTick)
+    {
+        return;
+    }
+    const std::uint64_t publication = m_executionEpochPublication.load(std::memory_order_acquire);
+    if (UnpackExecutionEpochPublication(publication) != hold.epoch ||
+        (publication & (EXECUTION_EPOCH_PUBLICATION_PENDING |
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+        HasPendingSafetyOrRecoveryRequests() || AlarmManager::GetInstance().HasAlarm())
+    {
+        return;
+    }
+    if ((input.StatusWord & 0x006FU) != 0x0027U ||
+        input.ModesOfOperationDisplay != 9 || axis.targetMode != 9 || !axis.isServoOn)
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::SERVO_OR_MODE_LOST, false, axis.axisIndex);
+        return;
+    }
+    if (axis.axisIndex < 0 || axis.axisIndex >= MAX_AXES || output == nullptr ||
+        m_pContexts == nullptr || static_cast<std::size_t>(axis.axisIndex) >= m_pContexts->size() ||
+        &(*m_pContexts)[axis.axisIndex] != &axis)
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::AXIS_MAPPING, true, axis.axisIndex);
+        return;
+    }
+    const std::size_t index = static_cast<std::size_t>(axis.axisIndex);
+    const std::uint32_t bit = 1U << index;
+    if (!std::isfinite(axis.currentCompOffset_unit))
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::COMPENSATION_NONFINITE, true, axis.axisIndex);
+        return;
+    }
+    if ((hold.requiredMask & bit) == 0U || axis.isVirtualAxis ||
+        axis.axisType != AxisType::LINEAR || axis.fbMode != FeedbackSource::MOTOR_ENCODER ||
+        axis.enableBacklash || axis.enablePitch || axis.currentCompOffset_unit != 0.0)
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::UNSUPPORTED_SCOPE, hold.active, axis.axisIndex);
+        return;
+    }
+    if (axis.isFault || axis.isLagAlarm || axis.homeRuntime.active ||
+        axis.state != MotionState::MotionState_IDLE ||
+        !std::isfinite(axis.currentCmdPos) || !std::isfinite(axis.currentActPos) ||
+        !std::isfinite(axis.machineCoordinateOffsetPulse) ||
+        !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+        !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+        !std::isfinite(axis.inPositionWindow_Pulse) || axis.inPositionWindow_Pulse <= 0.0 ||
+        !std::isfinite(axis.Pid_IDLE.Kp) || axis.Pid_IDLE.Kp <= 0.0 ||
+        !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ||
+        !std::isfinite(axis.currentCmdVel) || axis.currentCmdVel != 0.0 ||
+        !std::isfinite(axis.logicalCmdVel) || axis.logicalCmdVel != 0.0)
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::AXIS_CONFIG_OR_COMMAND, true, axis.axisIndex);
+        return;
+    }
+    const double unitsPerPulse = axis.finalLead / axis.resolution_PPR;
+    const double cap = (std::min)(axis.maxVel_PPS, 0.1 / unitsPerPulse);
+    const bool reverse = axis.isReverse != axis.Axis_Reverse;
+    if (!std::isfinite(unitsPerPulse) || unitsPerPulse <= 0.0 ||
+        !std::isfinite(cap) || cap <= 0.0 ||
+        cap > static_cast<double>((std::numeric_limits<std::int32_t>::max)()))
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::VELOCITY_CONVERSION, true, axis.axisIndex);
+        return;
+    }
+    if ((hold.capturedMask & bit) == 0U)
+    {
+        hold.reference[index] = axis.currentCmdPos;
+        hold.unitsPerPulse[index] = unitsPerPulse;
+        hold.window[index] = axis.inPositionWindow_Pulse;
+        hold.kp[index] = axis.Pid_IDLE.Kp;
+        hold.maxVelocity[index] = axis.maxVel_PPS;
+        hold.machineOffset[index] = axis.machineCoordinateOffsetPulse;
+        if (reverse) hold.reverseMask |= bit;
+        hold.capturedMask |= bit;
+    }
+    if (axis.currentCmdPos != hold.reference[index] ||
+        unitsPerPulse != hold.unitsPerPulse[index] ||
+        axis.inPositionWindow_Pulse != hold.window[index] ||
+        axis.Pid_IDLE.Kp != hold.kp[index] || axis.maxVel_PPS != hold.maxVelocity[index] ||
+        axis.machineCoordinateOffsetPulse != hold.machineOffset[index] ||
+        reverse != ((hold.reverseMask & bit) != 0U))
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::REFERENCE_OR_CONFIG_CHANGED, true, axis.axisIndex);
+        return;
+    }
+    const double error = hold.reference[index] - axis.currentActPos;
+    const double bound = hold.window[index] * (hold.active ? 2.0 : 1.0);
+    if (!std::isfinite(error) || !std::isfinite(bound) || std::abs(error) > bound)
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::FOLLOWING_ERROR, true, axis.axisIndex);
+        return;
+    }
+    double velocity = error * hold.kp[index];
+    if (!std::isfinite(velocity))
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::CORRECTION_NONFINITE, true, axis.axisIndex);
+        return;
+    }
+    velocity = (std::max)(-cap, (std::min)(cap, velocity));
+    if (m_pCoordMgr != nullptr) m_pCoordMgr->UpdateSoftwareTravelLimitState(axis);
+    const bool positiveAllowed = !axis.hardLimitPositive &&
+        (m_pCoordMgr == nullptr || m_pCoordMgr->CanMoveSoftwarePositive(axis));
+    const bool negativeAllowed = !axis.hardLimitNegative &&
+        (m_pCoordMgr == nullptr || m_pCoordMgr->CanMoveSoftwareNegative(axis));
+    if ((velocity > 0.0 && !positiveAllowed) || (velocity < 0.0 && !negativeAllowed))
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::TRAVEL_LIMIT, true, axis.axisIndex);
+        return;
+    }
+    if (reverse) velocity = -velocity;
+    WriteServoTargetVelocityCommand(output, axis.axisIndex, static_cast<std::int32_t>(velocity));
+    hold.frameMask |= bit;
+    if (!hold.active && hold.frameMask == hold.requiredMask &&
+        hold.capturedMask == hold.requiredMask)
+    {
+        hold.active = true;
+        QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType::ACTIVE);
+        for (std::size_t slot = 0U; slot < MAX_AXES; ++slot)
+        {
+            if ((hold.requiredMask & (1U << slot)) == 0U) continue;
+            QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType::REFERENCE,
+                IdleHoldDiagnosticReason::NONE, static_cast<int>(slot));
+        }
+    }
+}
+
+bool MotionCore::IsIdlePositionHoldImageCurrent(std::uint64_t ownerState,
+    std::uint64_t executionPublication) const noexcept
+{
+    const IdlePositionHoldState& hold = m_idlePositionHold;
+    const std::uint64_t grant = m_programEndIdleHoldGrant.load(std::memory_order_acquire);
+    return hold.passRequested && hold.active && !hold.cancelled && hold.requiredMask != 0U &&
+        hold.frameMask == hold.requiredMask && hold.capturedMask == hold.requiredMask &&
+        hold.lease.owner == MotionOwner::IDLE_HOLD &&
+        UnpackMotionOwnerState(ownerState).Matches(hold.lease) &&
+        UnpackExecutionEpochPublication(executionPublication) == hold.epoch &&
+        grant == ((static_cast<std::uint64_t>(hold.lease.generation) << 32U) | hold.epoch) &&
+        !UnpackMotionOwnerSafetyHandshake(ownerState) &&
+        !UnpackMotionOwnerSafetyActionPending(ownerState) &&
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) ==
+        m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire) &&
+        m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+        m_ncSettleRuntimeCycleContiguous && hold.runtimeTick == m_ncSettleRuntimeCycleTick &&
+        !m_Group.isActive && m_Group.cmdQueue.ingress_size() == 0U &&
+        m_Group.cmdQueue.replay_size() == 0U && !HasPendingSafetyOrRecoveryRequests();
+}
+
+
 void MotionCore::InvalidateServoOutputImageProof() noexcept
 {
     ++m_servoOutputImageProofGeneration;
@@ -9429,7 +9871,8 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
     }
 
     if (proof.mode != ServoOutputImageProofMode::NORMAL &&
-        proof.mode != ServoOutputImageProofMode::CONTROLLED_STOP)
+        proof.mode != ServoOutputImageProofMode::CONTROLLED_STOP &&
+        proof.mode != ServoOutputImageProofMode::IDLE_HOLD)
     {
         return scrubAndInvalidate();
     }
@@ -9460,12 +9903,21 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
         return scrubAndInvalidate();
     }
 
-    if (proof.mode == ServoOutputImageProofMode::NORMAL)
+    if (proof.mode == ServoOutputImageProofMode::IDLE_HOLD)
+    {
+        if (!IsIdlePositionHoldImageCurrent(
+            baseOwnerState, baseExecutionPublication))
+        {
+            return scrubAndInvalidate();
+        }
+    }
+    else if (proof.mode == ServoOutputImageProofMode::NORMAL)
     {
         const MotionOwnerLease lease =
             UnpackMotionOwnerState(baseOwnerState);
         if (lease.owner == MotionOwner::NONE ||
             lease.owner == MotionOwner::SAFETY ||
+            lease.owner == MotionOwner::IDLE_HOLD ||
             UnpackMotionOwnerSafetyRequestTicket(baseOwnerState) !=
             m_safetyRequestAcknowledgedTicket.load(
                 std::memory_order_acquire) ||
@@ -9563,7 +10015,10 @@ bool MotionCore::FinalizeServoOutputFrameAtSendPoint(
         return true;
     }
 
-    if (m_motionOwnerState.load(std::memory_order_acquire) !=
+    if ((m_servoOutputImageProof.mode == ServoOutputImageProofMode::IDLE_HOLD &&
+        !IsIdlePositionHoldImageCurrent(reservation.baseOwnerState,
+            reservation.baseExecutionPublication)) ||
+        m_motionOwnerState.load(std::memory_order_acquire) !=
         reservation.reservedOwnerState ||
         m_executionEpochPublication.load(
             std::memory_order_acquire) !=
@@ -9670,6 +10125,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     const std::uint64_t imageEntryExecutionPublication =
         m_executionEpochPublication.load(std::memory_order_acquire);
     m_ncSettleMotionPassCompleted = false;
+    PrepareIdlePositionHoldPass();
 
     // 1. 防呆：確保指標沒丟失
     if (m_pDrives == nullptr || m_pContexts == nullptr) {
@@ -10067,6 +10523,13 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                         (*m_pContexts)[slot].axisIndex);
             }
         }
+        else if (imageLease.owner == MotionOwner::IDLE_HOLD)
+        {
+            imageProofMode = ServoOutputImageProofMode::IDLE_HOLD;
+            imageAuthorized = imageAuthorized &&
+                IsIdlePositionHoldImageCurrent(imageExitOwnerState,
+                    imageExitExecutionPublication);
+        }
         else
         {
             imageProofMode = ServoOutputImageProofMode::NORMAL;
@@ -10078,6 +10541,13 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                     std::memory_order_acquire) &&
                 !HasPendingSafetyOrRecoveryRequests();
         }
+    }
+
+    if (m_idlePositionHold.passRequested &&
+        !IsIdlePositionHoldImageCurrent(imageExitOwnerState,
+            imageExitExecutionPublication))
+    {
+        imageAuthorized = false;
     }
 
     if (!imageAuthorized)
@@ -12530,7 +13000,8 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     // =========================================================
     const MotionOwnerLease servoLoopOwnerLease =
         GetMotionOwnerLease();
-    if (servoLoopOwnerLease.owner == MotionOwner::NONE)
+    if (servoLoopOwnerLease.owner == MotionOwner::NONE ||
+        servoLoopOwnerLease.owner == MotionOwner::IDLE_HOLD)
     {
         axis.pid.prevError = 0.0;
         axis.pid.integralAcc = 0.0;
@@ -12875,6 +13346,13 @@ void MotionCore::UpdateMotion(
     const int opMode = input.ModesOfOperationDisplay;
     const bool rawOperationEnabled =
         (input.StatusWord & 0x006FU) == 0x0027U;
+
+    if (m_idlePositionHold.passRequested ||
+        GetMotionOwnerLease().owner == MotionOwner::IDLE_HOLD)
+    {
+        UpdateIdlePositionHoldAxis(servo.pOutput, axis, input);
+        return;
+    }
 
     // NC-0.2J.6.4: do not expose the constructor's Cmd=0 coordinate to the
     // runtime Lag monitor.  Eight adjacent trustworthy samples align the
@@ -19545,6 +20023,10 @@ void MotionCore::UpdateNCSettleProducer(
                 static_cast<MotionNCSettleProfile>(profileIndex);
             MotionNCSettleTracker& tracker =
                 m_ncSettleTrackers[profileIndex];
+            const bool pureFeedHoldScope =
+                profile == MotionNCSettleProfile::FEED_HOLD_GROUP &&
+                (!tracker.executionIdentity.IsAssigned() ||
+                    tracker.executionIdentity.epoch != tracker.executionEpoch);
             MotionNCSettleCounters& counters =
                 m_ncSettleProducerCounters[profileIndex];
             MotionNCSettleSnapshot snapshot{};
@@ -19726,6 +20208,7 @@ void MotionCore::UpdateNCSettleProducer(
                 tracker.executionEpoch == currentExecutionEpoch &&
                 tracker.ownerLease.Matches(currentOwnerLease) &&
                 tracker.executionIdentity.IsAssigned() &&
+                tracker.executionIdentity.epoch == tracker.executionEpoch &&
                 currentGroupIdentityCorrelated &&
                 !MotionExecutionIdentityExactlyMatches(
                     tracker.executionIdentity,
@@ -19833,24 +20316,51 @@ void MotionCore::UpdateNCSettleProducer(
                 else if (profile ==
                     MotionNCSettleProfile::FEED_HOLD_GROUP)
                 {
-                    if (correlatedCurrentGroupMask != 0U &&
-                        correlatedCurrentGroupMask != tracker.scopeMask)
+                    // A no-segment request never adopts a later segment or
+                    // a different machine mask. Its original tuple stays fixed.
+                    if (pureFeedHoldScope)
                     {
-                        if (blocker == MotionNCSettleBlocker::NONE)
+                        const bool pureScopeCurrent =
+                            !currentGroupIdentityCorrelated && groupDrained &&
+                            m_axisCommandChannel.command_size() == 0U &&
+                            (currentOwnerLease.owner == MotionOwner::AUTO ||
+                                currentOwnerLease.owner == MotionOwner::MDI ||
+                                currentOwnerLease.owner == MotionOwner::MANUAL_AUTO) &&
+                            m_Group.pathMode != PathMode::PATH_SERVO &&
+                            m_Group.pathMode != PathMode::JUMP_TRACKING &&
+                            m_Group.jumpManager.state == JumpState::IDLE &&
+                            tracker.scopeMask != 0U &&
+                            tracker.scopeMask == existingAxisMask &&
+                            MotionExecutionIdentityExactlyMatches(
+                                tracker.executionIdentity,
+                                currentGroupIdentity);
+                        if (!pureScopeCurrent &&
+                            blocker == MotionNCSettleBlocker::NONE)
                         {
                             blocker = MotionNCSettleBlocker::SCOPE_CHANGED;
                         }
                     }
-                    if (!tracker.executionIdentity.IsAssigned() ||
-                        !currentGroupIdentityCorrelated ||
-                        !MotionExecutionIdentityExactlyMatches(
-                            tracker.executionIdentity,
-                            currentGroupIdentity))
+                    else
                     {
-                        if (blocker == MotionNCSettleBlocker::NONE)
+                        if (correlatedCurrentGroupMask != 0U &&
+                            correlatedCurrentGroupMask != tracker.scopeMask)
                         {
-                            blocker = MotionNCSettleBlocker::
-                                EXECUTION_EPOCH_MISMATCH;
+                            if (blocker == MotionNCSettleBlocker::NONE)
+                            {
+                                blocker = MotionNCSettleBlocker::SCOPE_CHANGED;
+                            }
+                        }
+                        if (!tracker.executionIdentity.IsAssigned() ||
+                            !currentGroupIdentityCorrelated ||
+                            !MotionExecutionIdentityExactlyMatches(
+                                tracker.executionIdentity,
+                                currentGroupIdentity))
+                        {
+                            if (blocker == MotionNCSettleBlocker::NONE)
+                            {
+                                blocker = MotionNCSettleBlocker::
+                                    EXECUTION_EPOCH_MISMATCH;
+                            }
                         }
                     }
                 }
@@ -20072,6 +20582,7 @@ void MotionCore::UpdateNCSettleProducer(
                         ((profile ==
                             MotionNCSettleProfile::FEED_HOLD_GROUP ||
                             profile == MotionNCSettleProfile::RESET_ALL) &&
+                            !pureFeedHoldScope &&
                             (axis.state ==
                                 MotionState::MotionState_INTERPOLATING ||
                                 axis.state ==

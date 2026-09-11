@@ -1750,6 +1750,51 @@ public:
     // 所有權狀態使用單一 64-bit Atomic Packed State，避免 Owner 與
     // Generation 分開讀取時產生撕裂快照。
     // ====================================================================
+    // True means the exact program lease was consumed by the handoff CAS.
+    // NC must still honor any concurrent Alarm / Reset before publishing P_END.
+    bool TryEnterProgramEndIdleHold(
+        const MotionOwnerLease& programLease,
+        MotionExecutionEpoch expectedEpoch) noexcept;
+
+    // CJ FIX1: the 250 us/Priority-80 PDO owner is the sole producer.
+    // Only the existing Priority-50 HMI 1000 ms task may consume this queue.
+    enum class IdleHoldDiagnosticEventType : std::uint8_t
+    {
+        ACTIVE, REFERENCE, RELEASED, CANCELLED, FAILED
+    };
+    enum class IdleHoldDiagnosticReason : std::uint8_t
+    {
+        NONE, GRANT_MISMATCH, AUTHORITY_CHANGED, GROUP_OR_MAPPING_CHANGED,
+        SERVO_OR_MODE_LOST, AXIS_MAPPING, COMPENSATION_NONFINITE,
+        UNSUPPORTED_SCOPE, AXIS_CONFIG_OR_COMMAND, VELOCITY_CONVERSION,
+        REFERENCE_OR_CONFIG_CHANGED, FOLLOWING_ERROR, CORRECTION_NONFINITE,
+        TRAVEL_LIMIT
+    };
+    struct IdleHoldDiagnosticEvent
+    {
+        std::uint64_t runtimeTick = 0ULL;
+        std::uint64_t cmdPulseBits = 0ULL;
+        std::uint64_t actPulseBits = 0ULL;
+        std::uint64_t windowPulseBits = 0ULL;
+        std::uint64_t sequence = 0ULL;
+        MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
+        MotionOwnerGeneration generation = 0U;
+        std::uint32_t mask = 0U;
+        MotionOwnerGeneration nextGeneration = 0U;
+        std::int32_t axisIndex = -1;
+        MotionOwner owner = MotionOwner::NONE;
+        MotionOwner nextOwner = MotionOwner::NONE;
+        IdleHoldDiagnosticEventType eventType = IdleHoldDiagnosticEventType::ACTIVE;
+        IdleHoldDiagnosticReason reason = IdleHoldDiagnosticReason::NONE;
+    };
+    static_assert(sizeof(IdleHoldDiagnosticEvent) == 64U &&
+        std::is_trivially_copyable<IdleHoldDiagnosticEvent>::value,
+        "CJ FIX1 diagnostic records must remain fixed 64-byte POD values.");
+    static constexpr std::size_t IDLE_HOLD_DIAGNOSTIC_CAPACITY = 8U;
+    static constexpr std::size_t IDLE_HOLD_DIAGNOSTIC_DRAIN_BUDGET = 8U;
+    bool TryPopIdleHoldDiagnostic(IdleHoldDiagnosticEvent& event) noexcept;
+    std::uint32_t GetIdleHoldDiagnosticDroppedCount() const noexcept;
+
     bool TryAcquireMotionOwner(
         MotionOwner requestedOwner,
         MotionOwnerLease& outLease) noexcept;
@@ -3377,7 +3422,8 @@ private:
         INVALID = 0,
         ZERO_ONLY,
         NORMAL,
-        CONTROLLED_STOP
+        CONTROLLED_STOP,
+        IDLE_HOLD
     };
 
     struct ServoOutputImageProof
@@ -3399,6 +3445,58 @@ private:
     // frame round trip, and EtherCAT captures it at the following send point.
     ServoOutputImageProof m_servoOutputImageProof{};
     std::uint64_t m_servoOutputImageProofGeneration = 0ULL;
+
+    // NC writes only the atomic grant; the 250 us owner owns all hold state.
+    std::atomic<std::uint64_t> m_programEndIdleHoldGrant{ 0ULL };
+    struct IdlePositionHoldState
+    {
+        MotionOwnerLease lease{};
+        MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
+        std::uint32_t requiredMask = 0U;
+        std::uint32_t capturedMask = 0U;
+        std::uint32_t frameMask = 0U;
+        std::uint32_t reverseMask = 0U;
+        std::uint64_t runtimeTick = 0ULL;
+        bool active = false;
+        bool passRequested = false;
+        bool cancelled = false;
+        std::array<double, MAX_AXES> reference{};
+        std::array<double, MAX_AXES> unitsPerPulse{};
+        std::array<double, MAX_AXES> window{};
+        std::array<double, MAX_AXES> kp{};
+        std::array<double, MAX_AXES> maxVelocity{};
+        std::array<double, MAX_AXES> machineOffset{};
+    };
+    static_assert(sizeof(IdlePositionHoldState) + sizeof(std::uint64_t) <= 512U,
+        "CJ idle hold storage must remain bounded.");
+    IdlePositionHoldState m_idlePositionHold{};
+    void PrepareIdlePositionHoldPass() noexcept;
+    void UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& axis,
+        const MotionServoInputSnapshot& input) noexcept;
+    bool IsIdlePositionHoldImageCurrent(std::uint64_t ownerState,
+        std::uint64_t executionPublication) const noexcept;
+    void CancelIdlePositionHold(IdleHoldDiagnosticReason reason, bool fault,
+        int axisIndex = -1) noexcept;
+
+    struct IdleHoldDiagnostics
+    {
+        FixedCapacitySpscRing<IdleHoldDiagnosticEvent,
+            IDLE_HOLD_DIAGNOSTIC_CAPACITY> events{};
+        // RT-owned reusable capture workspace: no record array on RT stack.
+        IdleHoldDiagnosticEvent producerEvent{};
+        std::uint64_t nextSequence = 0ULL;
+        std::atomic<std::uint32_t> dropped{ 0U };
+    };
+    // Transport + RT workspace + HMI's one record and last-drop scalar.
+    // Separate from (and does not relax) the original 512-byte hold budget.
+    static_assert(sizeof(IdleHoldDiagnostics) + sizeof(IdleHoldDiagnosticEvent) +
+        sizeof(std::uint32_t) <= 1024U,
+        "CJ FIX1 total fixed diagnostic workspace must not exceed 1 KiB.");
+    IdleHoldDiagnostics m_idleHoldDiagnostics{};
+    void QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType eventType,
+        IdleHoldDiagnosticReason reason = IdleHoldDiagnosticReason::NONE,
+        int axisIndex = -1,
+        MotionOwnerLease nextLease = MotionOwnerLease{}) noexcept;
 
     void InvalidateServoOutputImageProof() noexcept;
     bool ZeroAllServoTargetVelocityForFrame() noexcept;

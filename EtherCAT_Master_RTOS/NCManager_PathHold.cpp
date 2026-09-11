@@ -3,6 +3,7 @@
 #include "AlarmManager.h"
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <windows.h>
 #include <rtapi.h>
 
@@ -56,7 +57,11 @@ bool NCManager::IsPathCoreHoldBlockShapeValid(const NCBlock& block) noexcept
     if (block.gCode == 178 && block.has('L') &&
         (!std::isfinite(block.val('L')) || block.val('L') < 1.0 || block.val('L') > 32.0 ||
             std::floor(block.val('L')) != block.val('L'))) return false;
-    if (block.gCode == 178 && block.has('P') && block.val('P') != 1.0) return false;
+    if (block.gCode == 178 && block.has('P') &&
+        block.val('P') != 1.0 && block.val('P') != 2.0 && block.val('P') != 3.0 && block.val('P') != 4.0) return false;
+    if (block.gCode == 178 && block.has('P') && (block.val('P') == 2.0 || block.val('P') == 3.0) &&
+        (!block.has('Q') || (block.has('L') && block.val('L') != 1.0))) return false;
+    if (block.gCode == 178 && block.has('P') && block.val('P') == 4.0 && !block.has('Q')) return false;
     if (block.gCode == 178 && block.has('Q') &&
         (!block.has('P') || !std::isfinite(block.val('Q')) || block.val('Q') <= 0.0)) return false;
     for (int i = 0; i < 26; ++i)
@@ -141,7 +146,7 @@ WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& block)
     }
     if (m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY ||
         m_pathFeed.pending || m_pathArc.pending || m_pathReplay.pending || m_pathHold.bound ||
-        !IsPathCoreReplayConfigurationValid() || m_isG66Active || !m_macroStack.empty() || Homing.IsActive() ||
+        m_gapDryRun.active || !IsPathCoreReplayConfigurationValid() || m_isG66Active || !m_macroStack.empty() || Homing.IsActive() ||
         AlarmManager::GetInstance().HasAlarm() || !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
         m_motion.HasPendingSafetyOrRecoveryRequests() || !m_motion.IsGroupDone() ||
         m_motion.GetCommandIngressSize() != 0U || m_motion.GetCommandReplaySize() != 0U ||
@@ -154,6 +159,9 @@ WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& block)
     InvalidatePathCoreHoldSameThread();
     m_pathHold = PathHoldState{};
     m_pathHoldLastFault = PathHoldLastFault{}; // Only a newly admitted G178/G179 clears it.
+    m_gapServiceCurrent = GapServiceDiagnostic{};
+    m_gapServiceLastFault = GapServiceDiagnostic{};
+    m_gapServiceAgeOnlyCalls = 0U;
     m_pathHold.explicitControl = true;
     m_pathHoldView.completedCount = 0U;
     if (block.gCode == 179)
@@ -177,6 +185,9 @@ WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& block)
     }
     m_pathHold.armed = true;
     m_pathHold.code = 1U;
+    if (block.has('P') && (block.val('P') == 2.0 || block.val('P') == 3.0 || block.val('P') == 4.0) &&
+        !StartGapPathSimulationSameThread(block.val('P') != 2.0, block.val('P') == 4.0))
+        return nullptr;
     LogPathCoreHoldSameThread("ARMED");
     if (m_pathHold.automaticEnabled) LogPathCoreHoldAutomaticSameThread("ARMED");
     return nullptr;
@@ -341,6 +352,11 @@ void NCManager::CommitPathCoreHoldCaptureSameThread(NCBlockDispatchId dispatchId
     m_pathHold.dispatch = dispatchId;
     if (lengthMM == 0.0 || lengthPulse == 0.0)
     {
+        if (m_gapPath.active)
+        {
+            RejectGapPathSimulationSameThread("POINT_SOURCE_UNAVAILABLE");
+            return;
+        }
         m_pathHold.code = 6U;
         LogPathCoreHoldSameThread("UNUSED_POINT");
         InvalidatePathCoreHoldSameThread();
@@ -372,6 +388,11 @@ void NCManager::CommitPathCoreHoldCaptureSameThread(NCBlockDispatchId dispatchId
             RejectPathCoreHoldSameThread(18U, AlarmManager::PATH_GEOMETRY_INVALID);
             return;
         }
+        if (m_gapPath.active && m_pathHold.automaticIntervalPulse >= lengthPulse)
+        {
+            RejectGapPathSimulationSameThread("STATION_OUTSIDE_SOURCE");
+            return;
+        }
         LogPathCoreHoldAutomaticSameThread("BOUND");
     }
     LogPathCoreHoldSameThread("BOUND");
@@ -391,6 +412,7 @@ void NCManager::ObservePathCoreHoldSameThread()
             {
                 m_pathHoldLastFault.repeatCalls = 0U;
                 LogPathCoreHoldLastFaultSameThread();
+                LogGapServiceFaultSameThread();
             }
         }
         else m_pathHoldLastFault.repeatCalls = 0U;
@@ -412,6 +434,62 @@ void NCManager::ObservePathCoreHoldSameThread()
         (m_pathArc.dispatch == m_pathHold.dispatch && m_pathArc.completed);
     if (completed)
     {
+        // Observe runs before the automatic service. A final return and source
+        // completion can arrive together, so consume only its exact proof here.
+        if (m_gapPath.active && m_gapPath.repeating)
+        {
+            const auto terminal = m_motion.GetPathCoreHoldExcursionSnapshot();
+            if (terminal.publicationSequence == 0ULL)
+            {
+                // A bounded publication collision grants no completion and
+                // cannot refresh GAP age. Keep this source pending for retry.
+                (void)ServiceGapPathSimulationSameThread(0.0, false, "FINAL_NO_RT");
+                return;
+            }
+            if (!m_pathHold.requested || !m_pathHold.startCommitted || !m_gapPath.held ||
+                m_pathHold.automaticHoldOwned ||
+                !HoldIdentityEqual(terminal.identity, m_pathHold.identity) ||
+                m_pathHold.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+                !terminal.ownerLease.Matches(m_pathHold.lease) || !terminal.crossSegment ||
+                terminal.historyCount != m_pathHoldView.completedCount ||
+                terminal.cycleLimit != m_pathHold.cycleLimit ||
+                terminal.phase != MotionPathCoreHoldExcursionPhase::COMPLETE ||
+                m_pathHold.requestedHoldSequence == MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID ||
+                terminal.holdRequestSequence != m_pathHold.requestedHoldSequence ||
+                // Completion is a global J5 fence, not the accepted request ID.
+                terminal.completedHoldRequestSequence < m_pathHold.requestedHoldSequence ||
+                terminal.activeOrdinal != terminal.historyCount ||
+                terminal.retreatCount != terminal.returnCount ||
+                terminal.returnCount != m_pathHold.automaticObservedReturns + 1ULL ||
+                terminal.returnCount != m_pathHold.cycleLimit ||
+                !std::isfinite(terminal.lengthPulse) || terminal.lengthPulse <= 0.0 ||
+                !std::isfinite(terminal.returnedS) || terminal.returnedS < 0.0 ||
+                terminal.returnedS > terminal.lengthPulse || terminal.returnedS != terminal.heldS)
+            {
+                RejectGapPathSimulationSameThread("SOURCE_COMPLETED_WITHOUT_FINAL_RETURN");
+                return;
+            }
+            if (!ServiceGapPathSimulationSameThread(0.0, true, "FINAL_RETURN")) return;
+            if (!IsGapPathAutomaticNormalSameThread() ||
+                m_gapInput.Current().sampledAtMs != m_gapPath.lastServiceMs)
+            {
+                RejectGapPathSimulationSameThread("FINAL_RETURN_NOT_NORMAL");
+                return;
+            }
+            m_pathHold.automaticObservedReturns = terminal.returnCount;
+            LogPathCoreHoldAutomaticSameThread("RETURNED");
+            CancelPathCoreHoldAutomaticSameThread("BUDGET_DONE");
+        }
+        if (m_gapPath.active && !m_gapPath.held)
+        {
+            RejectGapPathSimulationSameThread("SOURCE_COMPLETED_BEFORE_LOW");
+            return;
+        }
+        if (m_gapPath.active && m_gapPath.automaticResume && m_pathHold.automaticHoldOwned)
+        {
+            RejectGapPathSimulationSameThread("SOURCE_COMPLETED_BEFORE_RESUME");
+            return;
+        }
         LogPathCoreHoldSameThread(m_pathHold.requested ? "SOURCE_COMPLETED" : "UNUSED_COMPLETED");
         InvalidatePathCoreHoldSameThread();
         return;
@@ -443,13 +521,251 @@ void NCManager::ObservePathCoreHoldSameThread()
     }
 }
 
+// CH/CI/CK use the CG input monitor; the original path owns all motion authority.
+NC_PATH_HOLD_NOINLINE
+bool NCManager::StartGapPathSimulationSameThread(bool automaticResume, bool repeating) noexcept
+{
+    m_gapPath = GapPathSimulationState{};
+    m_gapServiceCurrent = GapServiceDiagnostic{};
+    m_gapServiceAgeOnlyCalls = 0U;
+    m_gapPath.active = true;
+    m_gapPath.automaticResume = automaticResume;
+    m_gapPath.repeating = repeating;
+    LARGE_INTEGER frequency{};
+    if (m_gapDryRun.active || !RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(frequency.QuadPart) >
+        (std::numeric_limits<std::uint64_t>::max)() / 1000ULL)
+    {
+        RejectGapPathSimulationSameThread("CLOCK_FREQUENCY_OR_SESSION");
+        return false;
+    }
+    m_gapPath.frequency = static_cast<std::uint64_t>(frequency.QuadPart);
+    if (!m_gapInput.Configure(EDMGap::Config{}, EDMGap::Source::SIMULATED))
+    {
+        RejectGapPathSimulationSameThread("INPUT_CONFIGURATION");
+        return false;
+    }
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+void NCManager::RejectGapPathSimulationSameThread(const char* reason) noexcept
+{
+    m_gapServiceLastFault = m_gapServiceCurrent;
+    m_gapServiceLastFault.present = true;
+    m_gapServiceLastFault.quality = m_gapInput.Current().quality;
+    m_gapServiceLastFault.run = m_pathHold.run;
+    m_gapServiceLastFault.dispatch = m_pathHold.dispatch;
+    RtPrintf("[%s] phase=FAILED reason=%s run=%llu dispatch=%llu line=%d alarm=%d\n",
+        m_gapPath.repeating ? "GAP-CK" : (m_gapPath.automaticResume ? "GAP-CI" : "GAP-CH"), reason, static_cast<unsigned long long>(m_pathHold.run),
+        static_cast<unsigned long long>(m_pathHold.dispatch), m_pathHold.sourceLine,
+        static_cast<int>(AlarmManager::GAP_PATH_SIMULATION_FAILED));
+    if (m_pathHold.bound && m_state == NCState::RUN &&
+        m_pathHold.identity.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        m_motion.IsMotionOwnerLeaseCurrent(m_pathHold.lease))
+        FeedHoldInternal();
+    RejectPathCoreHoldSameThread(19U, AlarmManager::GAP_PATH_SIMULATION_FAILED);
+    LogGapServiceFaultSameThread();
+}
+
+NC_PATH_HOLD_NOINLINE
+void NCManager::LogGapServiceFaultSameThread() const noexcept
+{
+    const GapServiceDiagnostic& d = m_gapServiceLastFault;
+    if (!d.present) return;
+    const bool serviceGapValid = d.nowValid && d.lastServiceValid && d.nowMs >= d.lastServiceMs;
+    const bool ageValid = d.nowValid && d.sampleSequence != 0ULL && d.nowMs >= d.sampledAtMs;
+    RtPrintf("[GAP-SERVICE-FAULT] site=%s nowValid=%u nowMs=%llu lastServiceMs=%llu serviceGapValid=%u serviceGapMs=%llu sampleMs=%llu ageValid=%u ageMs=%llu sampleSeq=%llu publish=%u ageOnlyCalls=%u quality=%s run=%llu dispatch=%llu\n",
+        d.site, d.nowValid ? 1U : 0U, static_cast<unsigned long long>(d.nowMs),
+        static_cast<unsigned long long>(d.lastServiceMs), serviceGapValid ? 1U : 0U,
+        static_cast<unsigned long long>(serviceGapValid ? d.nowMs - d.lastServiceMs : 0ULL),
+        static_cast<unsigned long long>(d.sampledAtMs), ageValid ? 1U : 0U,
+        static_cast<unsigned long long>(ageValid ? d.nowMs - d.sampledAtMs : 0ULL),
+        static_cast<unsigned long long>(d.sampleSequence), d.publishSample ? 1U : 0U,
+        static_cast<unsigned int>(d.ageOnlyCalls), EDMGap::QualityName(d.quality),
+        static_cast<unsigned long long>(d.run), static_cast<unsigned long long>(d.dispatch));
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ServiceGapPathSimulationSameThread(double activeS, bool publishSample, const char* site) noexcept
+{
+    if (!m_gapPath.active) return false;
+    GapServiceDiagnostic& diagnostic = m_gapServiceCurrent;
+    diagnostic = GapServiceDiagnostic{};
+    diagnostic.present = true;
+    diagnostic.site = site != nullptr ? site : "AUTOMATIC";
+    diagnostic.lastServiceMs = m_gapPath.lastServiceMs;
+    diagnostic.lastServiceValid = m_gapPath.clockStarted;
+    diagnostic.sampledAtMs = m_gapInput.Current().sampledAtMs;
+    diagnostic.sampleSequence = m_gapInput.Current().sequence;
+    diagnostic.quality = m_gapInput.Current().quality;
+    diagnostic.publishSample = publishSample;
+    diagnostic.run = m_pathHold.run;
+    diagnostic.dispatch = m_pathHold.dispatch;
+    if (!publishSample && m_gapServiceAgeOnlyCalls != (std::numeric_limits<std::uint32_t>::max)())
+        ++m_gapServiceAgeOnlyCalls;
+    diagnostic.ageOnlyCalls = m_gapServiceAgeOnlyCalls;
+    LARGE_INTEGER counter{};
+    if (m_gapDryRun.active || m_gapPath.frequency == 0ULL ||
+        !RtQueryPerformanceCounter(&counter) || counter.QuadPart < 0)
+    {
+        RejectGapPathSimulationSameThread("CLOCK_READ_OR_SESSION");
+        return false;
+    }
+    const std::uint64_t ticks = static_cast<std::uint64_t>(counter.QuadPart);
+    const std::uint64_t seconds = ticks / m_gapPath.frequency;
+    const std::uint64_t fraction = (ticks % m_gapPath.frequency) * 1000ULL / m_gapPath.frequency;
+    if (seconds <= ((std::numeric_limits<std::uint64_t>::max)() - fraction) / 1000ULL)
+    {
+        diagnostic.nowMs = seconds * 1000ULL + fraction;
+        diagnostic.nowValid = true;
+    }
+    if ((m_gapPath.clockStarted && ticks < m_gapPath.lastTicks) ||
+        seconds > ((std::numeric_limits<std::uint64_t>::max)() - fraction) / 1000ULL)
+    {
+        RejectGapPathSimulationSameThread("CLOCK_REGRESSION_OR_RANGE");
+        return false;
+    }
+    const std::uint64_t nowMs = seconds * 1000ULL + fraction;
+    if (m_gapPath.clockStarted)
+    {
+        if (nowMs < m_gapPath.lastServiceMs || nowMs - m_gapPath.lastServiceMs > 250ULL)
+        {
+            RejectGapPathSimulationSameThread("SERVICE_GAP");
+            return false;
+        }
+        m_gapPath.stalledCalls = nowMs == m_gapPath.lastServiceMs ? m_gapPath.stalledCalls + 1U : 0U;
+        if (m_gapPath.stalledCalls >= 4096U)
+        {
+            RejectGapPathSimulationSameThread("CLOCK_NOT_ADVANCING");
+            return false;
+        }
+        if (m_gapPath.sequence != 0ULL && m_gapInput.Poll(nowMs).quality != EDMGap::Quality::VALID)
+        {
+            RejectGapPathSimulationSameThread("INPUT_QUALITY_OR_AGE");
+            return false;
+        }
+        if (m_gapPath.sequence == 0ULL && nowMs - m_gapPath.firstServiceMs > 100ULL)
+        {
+            RejectGapPathSimulationSameThread("SOURCE_SAMPLE_UNAVAILABLE");
+            return false;
+        }
+    }
+    else m_gapPath.firstServiceMs = nowMs;
+    m_gapPath.clockStarted = true;
+    m_gapPath.lastTicks = ticks;
+    m_gapPath.lastServiceMs = nowMs;
+    // An unavailable RT publication may age input, never refresh or invent it.
+    if (!publishSample) return true;
+    if (!std::isfinite(activeS) || activeS < 0.0 ||
+        !std::isfinite(m_pathHold.automaticNextS) || m_pathHold.automaticNextS <= 0.0 ||
+        m_gapPath.sequence == (std::numeric_limits<std::uint64_t>::max)())
+    {
+        RejectGapPathSimulationSameThread("PROGRESS_OR_SEQUENCE");
+        return false;
+    }
+    bool lowEvent = false, recoveryEvent = false;
+    if (!m_gapPath.held && !m_gapPath.lowInjected && activeS >= m_pathHold.automaticNextS)
+    {
+        m_gapPath.lowInjected = true;
+        lowEvent = true;
+    }
+    if (m_gapPath.held && !m_gapPath.recoveryInjected &&
+        nowMs >= m_gapPath.holdStartMs &&
+        nowMs - m_gapPath.holdStartMs >= (m_gapPath.automaticResume ? 3000ULL : 1000ULL))
+    {
+        m_gapPath.recoveryInjected = true;
+        recoveryEvent = true;
+    }
+    EDMGap::Sample sample{};
+    sample.source = EDMGap::Source::SIMULATED;
+    sample.valid = true;
+    sample.voltageMv = m_gapPath.lowInjected && !m_gapPath.recoveryInjected ? 20000 : 50000;
+    sample.sequence = ++m_gapPath.sequence;
+    sample.sampledAtMs = nowMs;
+    const EDMGap::Snapshot& gap = m_gapInput.Publish(sample, nowMs);
+    if (gap.quality != EDMGap::Quality::VALID || gap.source != EDMGap::Source::SIMULATED)
+    {
+        RejectGapPathSimulationSameThread("INPUT_NOT_VALID");
+        return false;
+    }
+    m_gapServiceAgeOnlyCalls = 0U;
+    if (lowEvent) LogGapPathSimulationSameThread("INJECT_LOW");
+    if (recoveryEvent) LogGapPathSimulationSameThread("INJECT_RECOVERY");
+    if (!m_gapPath.lowInjected && gap.band == EDMGap::Band::NORMAL && !m_gapPath.normalLogged)
+    {
+        m_gapPath.normalLogged = true;
+        LogGapPathSimulationSameThread("NORMAL_CONFIRMED");
+    }
+    if (m_gapPath.recoveryInjected && gap.band == EDMGap::Band::NORMAL && !m_gapPath.recoveryLogged)
+    {
+        m_gapPath.recoveryLogged = true;
+        LogGapPathSimulationSameThread(m_gapPath.automaticResume ?
+            "RECOVERED_NORMAL" : "RECOVERED_WAIT_START");
+    }
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::IsGapPathAutomaticNormalSameThread() const noexcept
+{
+    const EDMGap::Snapshot& gap = m_gapInput.Current();
+    return m_gapPath.active && m_gapPath.automaticResume && m_gapPath.held &&
+        m_gapPath.lowInjected && m_gapPath.recoveryInjected && gap.configured &&
+        gap.source == EDMGap::Source::SIMULATED && gap.quality == EDMGap::Quality::VALID &&
+        gap.band == EDMGap::Band::NORMAL && gap.pendingBand == EDMGap::Band::UNKNOWN &&
+        m_gapPath.sequence != 0ULL && gap.sequence == m_gapPath.sequence &&
+        gap.observedAtMs == m_gapPath.lastServiceMs && gap.sampledAtMs <= m_gapPath.lastServiceMs &&
+        m_gapPath.lastServiceMs - gap.sampledAtMs <= 100ULL;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ValidateGapPathAutomaticResumeSameThread() noexcept
+{
+    if (!m_gapPath.active || !m_gapPath.automaticResume || !m_pathHold.automaticHoldOwned) return true;
+    // Admission can be delayed between the service, Prepare and Commit. Poll
+    // the actual clock without publishing or qualifying a replacement sample.
+    if (!ServiceGapPathSimulationSameThread(0.0, false, "ADMISSION")) return false;
+    if (!m_pathHold.automaticAdmissionOwned || !IsGapPathAutomaticNormalSameThread())
+    {
+        RejectGapPathSimulationSameThread("RECOVERY_NOT_NORMAL_AT_ADMISSION");
+        return false;
+    }
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+void NCManager::LogGapPathSimulationSameThread(const char* phase) const noexcept
+{
+    const EDMGap::Snapshot& gap = m_gapInput.Current();
+    RtPrintf("[%s] phase=%s source=%s quality=%s band=%s mv=%d seq=%llu ms=%llu run=%llu dispatch=%llu line=%d owner=%u generation=%llu epoch=%llu hold=%llu owned=%u ack=%u low=%u recovered=%u resume=%s completed=%llu limit=%u nextS=%016llX motion=1 discharge=0\n",
+        m_gapPath.repeating ? "GAP-CK" : (m_gapPath.automaticResume ? "GAP-CI" : "GAP-CH"), phase, EDMGap::SourceName(gap.source), EDMGap::QualityName(gap.quality), EDMGap::BandName(gap.band),
+        static_cast<int>(gap.voltageMv), static_cast<unsigned long long>(gap.sequence),
+        static_cast<unsigned long long>(m_gapPath.lastServiceMs), static_cast<unsigned long long>(m_pathHold.run),
+        static_cast<unsigned long long>(m_pathHold.dispatch), m_pathHold.sourceLine,
+        static_cast<unsigned int>(m_pathHold.lease.owner), static_cast<unsigned long long>(m_pathHold.lease.generation),
+        static_cast<unsigned long long>(m_pathHold.identity.epoch),
+        static_cast<unsigned long long>(m_pathHold.automaticSettleSequence),
+        m_pathHold.automaticHoldOwned ? 1U : 0U, m_gapPath.ackLogged ? 1U : 0U,
+        m_gapPath.lowInjected ? 1U : 0U, m_gapPath.recoveryLogged ? 1U : 0U,
+        m_gapPath.automaticResume ? "AUTO_NORMAL" : "OPERATOR",
+        static_cast<unsigned long long>(m_pathHold.automaticObservedReturns),
+        static_cast<unsigned int>(m_pathHold.cycleLimit),
+        static_cast<unsigned long long>(HoldDoubleBits(m_pathHold.automaticNextS)));
+}
+
 // CF: distance-triggered dry-run supervision. It never supplies GAP velocity.
 NC_PATH_HOLD_NOINLINE
 void NCManager::CancelPathCoreHoldAutomaticSameThread(const char* reason) noexcept
 {
     if (!m_pathHold.automaticEnabled && !m_pathHold.automaticHoldOwned &&
-        !m_pathHold.automaticAdmissionOwned) return;
+        !m_pathHold.automaticAdmissionOwned && !m_gapPath.active) return;
     LogPathCoreHoldAutomaticSameThread(reason);
+    if (m_gapPath.active)
+    {
+        m_gapPath = GapPathSimulationState{};
+        m_gapInput.Reset();
+    }
     if (m_pathHold.automaticHoldOwned)
     {
         const auto gate = m_feedHoldResumeGate.GetSnapshot();
@@ -492,7 +808,22 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
         CancelPathCoreHoldAutomaticSameThread("SCOPE_REVOKED");
         return false;
     }
-    if (!m_pathHold.bound) return false;
+    if (!m_pathHold.bound)
+    {
+        if (m_gapPath.active && m_gapPath.automaticResume &&
+            (m_pathHold.automaticHoldOwned || (m_gapPath.repeating && m_pathHold.requested)))
+            CancelPathCoreHoldAutomaticSameThread("SOURCE_UNBOUND");
+        return false;
+    }
+    if (m_gapPath.active && m_gapPath.repeating &&
+        ((m_pathFeed.dispatch == m_pathHold.dispatch && m_pathFeed.completed) ||
+            (m_pathArc.dispatch == m_pathHold.dispatch && m_pathArc.completed)))
+    {
+        // Observe may have seen a temporary unavailable final publication.
+        // Consume this scan so the generic callback cannot advance the source.
+        ObservePathCoreHoldSameThread();
+        return true;
+    }
     const bool line = m_pathFeed.pending && m_pathFeed.bound && m_pathFeed.dispatch == m_pathHold.dispatch;
     const bool arc = m_pathArc.pending && m_pathArc.bound && m_pathArc.dispatch == m_pathHold.dispatch;
     if (line == arc || m_pathHold.identity.epoch != m_motion.GetCurrentExecutionEpoch())
@@ -502,10 +833,16 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
     }
     const auto snapshot = m_motion.GetPathCoreHoldExcursionSnapshot();
     // A bounded read can be unavailable during publication; it grants no new action.
-    if (snapshot.publicationSequence == 0ULL) return m_pathHold.automaticHoldOwned;
+    if (snapshot.publicationSequence == 0ULL)
+    {
+        if (m_gapPath.active && !ServiceGapPathSimulationSameThread(0.0, false, "NO_RT")) return true;
+        return m_pathHold.automaticHoldOwned;
+    }
     if (!HoldIdentityEqual(snapshot.identity, m_pathHold.identity))
     {
-        if (m_pathHold.automaticHoldOwned)
+        if (m_gapPath.active && !ServiceGapPathSimulationSameThread(0.0, false, "IDENTITY_WAIT")) return true;
+        if (m_pathHold.automaticHoldOwned ||
+            (m_gapPath.active && m_gapPath.repeating && m_pathHold.requested))
             CancelPathCoreHoldAutomaticSameThread("IDENTITY_REVOKED");
         return false; // The asynchronous Bind may not have been consumed yet.
     }
@@ -517,6 +854,23 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
     {
         CancelPathCoreHoldAutomaticSameThread("RT_REVOKED");
         return false;
+    }
+    // CK retains the session through the excursion. Historical activeS is
+    // local to its current leg and may exceed the original source length.
+    const bool gapReturnPending = m_gapPath.active && m_gapPath.repeating &&
+        m_gapPath.held && !m_pathHold.automaticHoldOwned &&
+        m_pathHold.requested && m_pathHold.startCommitted;
+    if (m_gapPath.active)
+    {
+        if (!std::isfinite(snapshot.activeS) || snapshot.activeS < 0.0 ||
+            (!gapReturnPending && snapshot.activeS > snapshot.lengthPulse) ||
+            !std::isfinite(snapshot.lengthPulse) || snapshot.lengthPulse <= 0.0 ||
+            !std::isfinite(m_pathHold.automaticNextS) || m_pathHold.automaticNextS <= 0.0)
+        {
+            RejectGapPathSimulationSameThread("PROGRESS_INVALID");
+            return true;
+        }
+        if (!ServiceGapPathSimulationSameThread(gapReturnPending ? 0.0 : snapshot.activeS)) return true;
     }
     if (m_pathHold.automaticHoldOwned)
     {
@@ -536,7 +890,34 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
         }
         if (!boundary.acknowledged || !boundary.motion.settleProofValid ||
             !boundary.motion.ncSettled ||
-            boundary.motion.settleRequestSequence != m_pathHold.automaticSettleSequence) return true;
+            boundary.motion.settleRequestSequence != m_pathHold.automaticSettleSequence)
+        {
+            if (m_gapPath.active && m_gapPath.automaticResume && !m_gapPath.waitJ5Logged)
+            {
+                m_gapPath.waitJ5Logged = true;
+                LogGapPathSimulationSameThread("WAIT_J5");
+            }
+            return true;
+        }
+        if (m_gapPath.active)
+        {
+            if (!m_gapPath.ackLogged)
+            {
+                m_gapPath.ackLogged = true;
+                LogGapPathSimulationSameThread(m_gapPath.automaticResume ?
+                    "STOP_CONFIRMED_WAIT_NORMAL" : "STOP_CONFIRMED_WAIT_START");
+            }
+            if (!m_gapPath.automaticResume) return true;
+            // Diagnostic latches never grant admission: require this scan's
+            // actual, fully qualified sample and the exact owned J5 boundary.
+            if (!IsGapPathAutomaticNormalSameThread() ||
+                m_gapInput.Current().sampledAtMs != m_gapPath.lastServiceMs) return true;
+            if (snapshot.boundaryOnly)
+            {
+                RejectGapPathSimulationSameThread("SOURCE_BOUNDARY_NO_EXCURSION");
+                return true;
+            }
+        }
         if (!m_pathHold.automaticAdmissionOwned)
         {
             // Never adopt an admission or button ticket created by another source.
@@ -562,6 +943,13 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
         if (m_feedHoldResumeGate.ShouldApplyResume() && ApplyProgramHoldResume(true))
         {
             LogPathCoreHoldAutomaticSameThread("RESUME_APPLIED");
+            if (m_gapPath.active && m_gapPath.automaticResume && !m_gapPath.repeating)
+            {
+                // Consume only the simulated automatic authority. The staged
+                // original-identity excursion must survive until its return.
+                CancelPathCoreHoldAutomaticSameThread("SESSION_CONSUMED");
+                return true;
+            }
             m_pathHold.automaticHoldOwned = false;
             m_pathHold.automaticAdmissionOwned = false;
             m_pathHold.automaticBoundarySequence = 0ULL;
@@ -588,17 +976,61 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
         return false;
     if (snapshot.returnCount != m_pathHold.automaticObservedReturns)
     {
+        if (m_gapPath.active && m_gapPath.repeating &&
+            (!gapReturnPending || m_pathHold.requestedHoldSequence == MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID ||
+                snapshot.completedHoldRequestSequence < m_pathHold.requestedHoldSequence ||
+                snapshot.holdRequestSequence != m_pathHold.requestedHoldSequence ||
+                snapshot.returnCount > m_pathHold.cycleLimit ||
+                !std::isfinite(snapshot.heldS) || snapshot.returnedS != snapshot.heldS ||
+                !IsGapPathAutomaticNormalSameThread() ||
+                m_gapInput.Current().sampledAtMs != m_gapPath.lastServiceMs))
+        {
+            RejectGapPathSimulationSameThread("RETURN_NOT_PROVEN_OR_NORMAL");
+            return true;
+        }
         if (snapshot.returnCount != m_pathHold.automaticObservedReturns + 1ULL ||
             snapshot.phase != MotionPathCoreHoldExcursionPhase::COMPLETE ||
             !std::isfinite(snapshot.returnedS) || snapshot.returnedS < 0.0 ||
             snapshot.returnedS > snapshot.lengthPulse)
         {
+            if (m_gapPath.active && m_gapPath.repeating)
+            {
+                RejectGapPathSimulationSameThread("RETURN_COUNT_OR_POSITION");
+                return true;
+            }
             CancelPathCoreHoldAutomaticSameThread("RETURN_REVOKED");
             return false;
         }
         m_pathHold.automaticObservedReturns = snapshot.returnCount;
         m_pathHold.automaticNextS = snapshot.returnedS + m_pathHold.automaticIntervalPulse;
         LogPathCoreHoldAutomaticSameThread("RETURNED");
+        if (m_gapPath.active && m_gapPath.repeating)
+        {
+            if (snapshot.returnCount >= m_pathHold.cycleLimit)
+            {
+                CancelPathCoreHoldAutomaticSameThread("BUDGET_DONE");
+                return false;
+            }
+            if (!std::isfinite(m_pathHold.automaticNextS) ||
+                m_pathHold.automaticNextS <= snapshot.returnedS ||
+                m_pathHold.automaticNextS >= snapshot.lengthPulse)
+            {
+                RejectGapPathSimulationSameThread("SOURCE_REMAINING_INSUFFICIENT");
+                return true;
+            }
+            // Preserve the monitor, sequence, clock and accepted Motion fence.
+            // Only this proven return may arm a new simulated LOW station.
+            m_gapPath.lowInjected = false;
+            m_gapPath.held = false;
+            m_gapPath.holdStartMs = 0ULL;
+            m_gapPath.recoveryInjected = false;
+            m_gapPath.normalLogged = false;
+            m_gapPath.recoveryLogged = false;
+            m_gapPath.ackLogged = false;
+            m_gapPath.waitJ5Logged = false;
+            LogPathCoreHoldAutomaticSameThread("REARMED");
+            return false;
+        }
         if (!std::isfinite(m_pathHold.automaticNextS) || m_pathHold.automaticNextS <= snapshot.returnedS)
         {
             CancelPathCoreHoldAutomaticSameThread("INTERVAL_UNAVAILABLE");
@@ -607,6 +1039,11 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
     }
     if (snapshot.returnCount >= m_pathHold.cycleLimit)
     {
+        if (m_gapPath.active && m_gapPath.repeating)
+        {
+            RejectGapPathSimulationSameThread("BUDGET_WITHOUT_RETURN_PROOF");
+            return true;
+        }
         CancelPathCoreHoldAutomaticSameThread("BUDGET_DONE");
         return false;
     }
@@ -619,10 +1056,22 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
     }
     if (m_pathHold.automaticNextS >= snapshot.lengthPulse || snapshot.activeS >= snapshot.lengthPulse)
     {
+        if (m_gapPath.active)
+        {
+            RejectGapPathSimulationSameThread("SOURCE_END_BEFORE_LOW");
+            return true;
+        }
         CancelPathCoreHoldAutomaticSameThread("SOURCE_END");
         return false;
     }
-    if (snapshot.activeS < m_pathHold.automaticNextS) return false;
+    if (m_gapPath.active)
+    {
+        const EDMGap::Snapshot& gap = m_gapInput.Current();
+        if (!m_gapPath.lowInjected || gap.quality != EDMGap::Quality::VALID ||
+            gap.band != EDMGap::Band::LOW || gap.source != EDMGap::Source::SIMULATED ||
+            gap.sampledAtMs != m_gapPath.lastServiceMs) return false;
+    }
+    else if (snapshot.activeS < m_pathHold.automaticNextS) return false;
     if (m_holdResumeAdmissionKind != HoldResumeAdmissionKind::NONE ||
         m_feedHoldResumeGate.GetSnapshot().active)
     {
@@ -646,6 +1095,11 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
     m_pathHold.automaticBoundarySequence = boundary.sequence;
     m_pathHold.automaticSettleSequence = m_feedHoldNCSettleRequestSequence;
     m_pathHold.automaticHoldOwned = true;
+    if (m_gapPath.active)
+    {
+        m_gapPath.held = true;
+        m_gapPath.holdStartMs = m_gapPath.lastServiceMs;
+    }
     LogPathCoreHoldAutomaticSameThread("HOLD_REQUESTED");
     return true;
 }
@@ -653,6 +1107,11 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
 NC_PATH_HOLD_NOINLINE
 void NCManager::LogPathCoreHoldAutomaticSameThread(const char* phase) const noexcept
 {
+    if (m_gapPath.active)
+    {
+        LogGapPathSimulationSameThread(phase);
+        return;
+    }
     RtPrintf("[PCORE-CF] mode=DRY_RUN run=%llu dispatch=%llu phase=%s pc=%d line=%d enabled=%u owned=%u admission=%u Q_BITS=%016llX nextS=%016llX returned=%llu L=%u boundary=%llu hold=%llu\n",
         static_cast<unsigned long long>(m_pathHold.run), static_cast<unsigned long long>(m_pathHold.dispatch),
         phase, m_pathHold.sourcePC, m_pathHold.sourceLine, m_pathHold.automaticEnabled ? 1U : 0U,
@@ -667,6 +1126,7 @@ void NCManager::LogPathCoreHoldAutomaticSameThread(const char* phase) const noex
 NC_PATH_HOLD_NOINLINE
 bool NCManager::PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcept
 {
+    if (!ValidateGapPathAutomaticResumeSameThread()) return false;
     if (!m_pathHold.bound) return true;
     const bool line = m_pathFeed.pending && m_pathFeed.bound && m_pathFeed.dispatch == m_pathHold.dispatch;
     const bool arc = m_pathArc.pending && m_pathArc.bound && m_pathArc.dispatch == m_pathHold.dispatch;
@@ -674,6 +1134,11 @@ bool NCManager::PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcep
         (m_pathArc.dispatch == m_pathHold.dispatch && m_pathArc.completed);
     if (completed)
     {
+        if (m_gapPath.active && m_gapPath.automaticResume && m_pathHold.automaticHoldOwned)
+        {
+            RejectGapPathSimulationSameThread("SOURCE_COMPLETED_BEFORE_RESUME");
+            return false;
+        }
         LogPathCoreHoldSameThread(m_pathHold.requested ? "SOURCE_COMPLETED" : "UNUSED_COMPLETED");
         InvalidatePathCoreHoldSameThread();
         return true;
@@ -719,6 +1184,11 @@ bool NCManager::PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcep
     if ((initial || repeat) && !m_pathHold.blocked && snapshot.boundaryOnly &&
         snapshot.holdRequestSequence == m_feedHoldNCSettleRequestSequence)
     {
+        if (m_gapPath.active && m_gapPath.automaticResume && m_pathHold.automaticHoldOwned)
+        {
+            RejectGapPathSimulationSameThread("SOURCE_BOUNDARY_NO_EXCURSION");
+            return false;
+        }
         // A freshly proven stop exactly at the source boundary has no
         // interior excursion. Expire the option and preserve ordinary resume.
         m_pathHold.code = 14U;
@@ -764,6 +1234,7 @@ bool NCManager::PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcep
 NC_PATH_HOLD_NOINLINE
 bool NCManager::CommitPathCoreHoldResumeSameThread() noexcept
 {
+    if (!ValidateGapPathAutomaticResumeSameThread()) return false;
     if (!m_pathHold.bound || !m_pathHold.requested) return true;
     if (m_state != NCState::RUN || AlarmManager::GetInstance().HasAlarm() ||
         m_pathHold.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||

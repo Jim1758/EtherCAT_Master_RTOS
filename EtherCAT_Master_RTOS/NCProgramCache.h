@@ -84,6 +84,20 @@ public:
 
     void Clear();
 
+    // Swap immutable images without allocation; retire the old image outside
+    // Motion admission so cache size cannot delay holding-output permission.
+    void Swap(NCProgramCache& prepared) noexcept
+    {
+        m_lines.swap(prepared.m_lines);
+        m_jumpTable.swap(prepared.m_jumpTable);
+        const NCProgramCacheGeneration previousGeneration = m_generation;
+        m_generation = prepared.m_generation;
+        prepared.m_generation = previousGeneration;
+        const int previousErrorPC = m_firstParseErrorPC;
+        m_firstParseErrorPC = prepared.m_firstParseErrorPC;
+        prepared.m_firstParseErrorPC = previousErrorPC;
+    }
+
     bool Empty() const noexcept
     {
         return m_lines.empty();

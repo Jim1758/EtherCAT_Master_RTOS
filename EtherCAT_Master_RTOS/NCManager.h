@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include "NC_Types.h"
+#include "EDMGapSignal.h"
 #include "MotionCore.h"
 #include "HomingManager.h"
 #include "CoordinateManager.h"
@@ -351,6 +352,7 @@ public:
 
     // 🌟 新增功能：載入 NC 程式檔
     bool LoadProgram(const std::string& filepath);
+    bool RejectProgramLoad(const char* reason, const std::string& filepath) noexcept;
 
     // 🌟 新增：呼叫與返回副程式的介面
     bool CallMacro(const std::string& filename);
@@ -1144,6 +1146,7 @@ private:
     // already-running program.  Defer a retained SAFETY owner handoff until
     // the 250 us runtime publishes clean standstill evidence.
     bool m_bootProgramImageLoaded = false;
+    bool m_programLoadStartBlocked = false;
     bool m_bootSafetyHandoffPending = true;
 
     // Stage NC-0.2F：已追蹤 Motion Block 的 Wait Callback 採 Dual-Key
@@ -2427,6 +2430,69 @@ private:
     void LogPathCoreReplaySameThread(const char* phase) const noexcept;
     void LogPathCoreReplayGeometrySameThread(std::uint32_t ordinal, bool reverse) const noexcept;
     // BZ-REPLAY-END
+
+    // CG-GAP-BEGIN: explicit simulation, fixed NC-owned data; no RT observer.
+    EDMGap::Monitor m_gapInput{};
+    struct GapDryRunState
+    {
+        MotionOwnerLease lease{};
+        MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
+        EDMGap::Sample sample{};
+        std::uint64_t test = 0ULL, run = 0ULL, cache = 0ULL, dispatch = 0ULL;
+        std::uint64_t frequency = 0ULL, lastTicks = 0ULL;
+        std::uint64_t phaseStartMs = 0ULL, lastServiceMs = 0ULL, sequence = 0ULL;
+        std::uint32_t phase = 0U, passedMask = 0U, observations = 0U, phaseSamples = 0U;
+        std::uint32_t restarts = 0U, result = 0U; // result: pending / pass / cancelled / fail.
+        int sourceLine = 0;
+        bool active = false, paused = false;
+    } m_gapDryRun{};
+    std::uint64_t m_gapDryRunSerial = 0ULL;
+    static_assert(sizeof(GapDryRunState) + sizeof(EDMGap::Monitor) <= 512U,
+        "CG fixed NC storage budget changed.");
+    static bool IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept;
+    WaitConditionFunc StartGapDryRunSameThread(const NCBlock& block);
+    static bool WaitForGapDryRunCallback(NCManager* nc);
+    bool ProcessGapDryRunSameThread();
+    bool RestartGapDryRunSameThread();
+    bool ReadGapDryRunClockSameThread(std::uint64_t& nowMs) noexcept;
+    void ValidateGapDryRunSameThread();
+    void PauseGapDryRunSameThread(const char* reason) noexcept;
+    void CancelGapDryRunSameThread(const char* reason) noexcept;
+    void RejectGapDryRunSameThread(int alarmCode, int line, const char* reason);
+    // CG-GAP-END
+
+    // CH uses operator resume; CI admits one recovery; CK repeats after proven returns.
+    struct GapPathSimulationState
+    {
+        std::uint64_t frequency = 0ULL, lastTicks = 0ULL, lastServiceMs = 0ULL;
+        std::uint64_t sequence = 0ULL, holdStartMs = 0ULL, firstServiceMs = 0ULL;
+        std::uint32_t stalledCalls = 0U;
+        bool active = false, clockStarted = false, lowInjected = false, held = false;
+        bool recoveryInjected = false, normalLogged = false, recoveryLogged = false, ackLogged = false;
+        bool automaticResume = false, waitJ5Logged = false, repeating = false;
+    } m_gapPath{};
+    static_assert(sizeof(GapPathSimulationState) <= 128U,
+        "CH/CI/CK simulation must remain fixed NC-owned storage.");
+    struct GapServiceDiagnostic
+    {
+        const char* site = "NOT_SERVICED";
+        std::uint64_t nowMs = 0ULL, lastServiceMs = 0ULL, sampledAtMs = 0ULL;
+        std::uint64_t sampleSequence = 0ULL, run = 0ULL, dispatch = 0ULL;
+        std::uint32_t ageOnlyCalls = 0U;
+        EDMGap::Quality quality = EDMGap::Quality::NO_SAMPLE;
+        bool present = false, nowValid = false, lastServiceValid = false, publishSample = false;
+    } m_gapServiceCurrent{}, m_gapServiceLastFault{};
+    std::uint32_t m_gapServiceAgeOnlyCalls = 0U;
+    static_assert(2U * sizeof(GapServiceDiagnostic) + sizeof(std::uint32_t) <= 192U,
+        "CK service evidence must remain fixed NC-owned storage.");
+    void LogGapServiceFaultSameThread() const noexcept;
+    bool StartGapPathSimulationSameThread(bool automaticResume = false, bool repeating = false) noexcept;
+    bool IsGapPathAutomaticNormalSameThread() const noexcept;
+    bool ValidateGapPathAutomaticResumeSameThread() noexcept;
+    bool ServiceGapPathSimulationSameThread(double activeS, bool publishSample = true,
+        const char* site = "AUTOMATIC") noexcept;
+    void RejectGapPathSimulationSameThread(const char* reason) noexcept;
+    void LogGapPathSimulationSameThread(const char* phase) const noexcept;
 
     // CB-HOLD-BEGIN: bounded opt-in excursions inside the next original source.
     struct PathHoldState

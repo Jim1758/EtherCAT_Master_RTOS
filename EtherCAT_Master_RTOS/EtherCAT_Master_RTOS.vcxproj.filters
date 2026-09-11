@@ -136,6 +136,12 @@
     <Filter Include="Source Files\NC\NC\NCPrepared">
       <UniqueIdentifier>{73831e2a-59d2-45f6-a69a-e61c52b09e49}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\EDM">
+      <UniqueIdentifier>{a820116e-f14d-438e-bf17-70c9da2747de}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\NC\EDM">
+      <UniqueIdentifier>{d381ca88-2fa8-4ea5-804c-90fac4f3eac0}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="EtherCAT_Master_RTOSDriver.cpp">
@@ -473,6 +479,9 @@
     </ClCompile>
     <ClCompile Include="NCManager_PathHold.cpp">
       <Filter>Source Files\NC\NC\NCPathCore</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_Gap.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -904,6 +913,9 @@
     </ClInclude>
     <ClInclude Include="MotionPathCoreHoldExcursion.h">
       <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMGapSignal.h">
+      <Filter>Header Files\EDM</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

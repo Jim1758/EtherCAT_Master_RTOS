@@ -58,6 +58,15 @@ public:
     }
     void Reset(); // 新增：系統重置時，清空堆疊與區域變數
 
+    // Commit a prepared local reset without allocating or changing @ / $.
+    void SwapLocalState(MacroEngine& prepared) noexcept
+    {
+        m_localStack.swap(prepared.m_localStack);
+        const int previousDepth = m_callDepth;
+        m_callDepth = prepared.m_callDepth;
+        prepared.m_callDepth = previousDepth;
+    }
+
     // ==========================================
     // 🌟 新增：提供給 HMI_Bridge 進行全廣播複製的底層記憶體指標
     // ==========================================

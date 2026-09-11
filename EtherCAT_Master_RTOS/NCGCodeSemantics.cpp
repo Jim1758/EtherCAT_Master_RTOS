@@ -131,6 +131,10 @@ namespace NCGCodeSemantics
                 NCGCodeRole::PRIMARY_ACTION, 200, true, true, true);
             return true;
             // BR-END
+        case 180: // CG: explicit, nonmodal input-only diagnostic barrier.
+            descriptor = MakeDescriptor(code, NCGCodeModalGroup::NONE,
+                NCGCodeRole::PRIMARY_ACTION, 200, true, false, true);
+            return true;
         case 4:   // Dwell
         case 10:  // Tool offset write
         case 12:  // Exact-stop / pre-read barrier

@@ -192,7 +192,8 @@ bool HomingManager::AcquireHomeMotionOwner() noexcept
 
     const MotionOwnerLease currentLease = m_motion.GetMotionOwnerLease();
 
-    if (currentLease.owner == MotionOwner::NONE)
+    if (currentLease.owner == MotionOwner::NONE ||
+        currentLease.owner == MotionOwner::IDLE_HOLD)
     {
         return m_motion.TryAcquireMotionOwner(
             MotionOwner::HOME, m_homeMotionLease);

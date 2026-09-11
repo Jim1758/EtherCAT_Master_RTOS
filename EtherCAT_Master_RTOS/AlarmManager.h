@@ -73,6 +73,9 @@ public:
         PATH_REPLAY_HISTORY_CAPACITY = NC_BASE + 17, // 2017:回退歷史超過固定容量 / Replay history capacity exceeded
         PATH_MOTION_NOT_ADMITTED = NC_BASE + 18, // 2018:路徑Motion命令未受理 / Path motion not admitted
         PATH_RETREAT_UNAVAILABLE = NC_BASE + 19, // 2019:要求的回退路徑不可用 / Requested retreat path unavailable
+        GAP_INPUT_TEST_FAILED = NC_BASE + 20, // 2020: GAP input simulation self-test failed; see [GAP-CG].
+        GAP_PATH_SIMULATION_FAILED = NC_BASE + 21, // 2021: GAP 路徑模擬訊號異常 / GAP path simulation signal invalid; see [GAP-CH].
+        IDLE_POSITION_HOLD_FAILED = NC_BASE + 22, // 2022: 程序結束後保持位置無效 /Post-program position hold invalid; see [IDLE-CJ].
     };
 
     // 🌟 4. 運動軸控警報 (3000 ~ 3999)

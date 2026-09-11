@@ -1,5 +1,6 @@
 ﻿#include "NCManager.h"
 #include "MacroEngine.h"
+#include <memory>
 #include "MacroParser.h"
 #include "GCodeParser.h"
 #include "NCGCodeSemantics.h"
@@ -17,6 +18,8 @@
 #include <limits>
 #include <utility>
 #include <cmath>
+#include <windows.h>
+#include <rtapi.h>
 // NC-0.2L.2AT / Split-Unit Link Pairing Guard.
 // Link-only MSVC/COFF pairing of the two AS implementation units. Each unit
 // contributes its own revisioned witness and requires the peer's witness.
@@ -213,83 +216,152 @@ m_pathCoreLiveRetention(AllocatePathCoreLiveOwnerTagStartup())
         MotionCommandSource::NC_MEMORY);
 }
 
+bool NCManager::RejectProgramLoad(
+    const char* reason, const std::string& filepath) noexcept
+{
+    m_programLoadStartBlocked = true;
+    RtPrintf("[NC-LOAD-CJ] REJECTED reason=%s requested=%.240s current=%.240s startBlocked=1\n",
+        reason, filepath.c_str(), m_mainProgramName.c_str());
+    return false;
+}
+
 bool NCManager::LoadProgram(const std::string& filepath)
 {
-    // NC-0.2J.3：Reset release 尚未完成時不得以 Program Replace
-    // 發布新 Epoch 或提早把 NC 狀態改回 READY。
-    if (m_state == NCState::RESET_STATE)
-    {
-        return false;
-    }
+    const NCState originState = m_state.load(std::memory_order_acquire);
+    if (originState != NCState::IDLE && originState != NCState::READY &&
+        originState != NCState::P_END)
+        return RejectProgramLoad("STATE_NOT_IDLE", filepath);
 
-    std::ifstream file(filepath);
-    if (!file.is_open())
-    {
-        return false;
-    }
+    const NCOperationMode originMode = m_mode;
+    const NCProgramCacheGeneration originCache = m_programCache.GetGeneration();
+    const bool bootstrapProgramLoad = !m_bootProgramImageLoaded &&
+        originState == NCState::IDLE && m_programCache.Empty();
+    const MotionOwnerLease originOwner = m_motion.GetMotionOwnerLease();
+    const MotionExecutionEpoch originEpoch = m_motion.GetCurrentExecutionEpoch();
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    const std::uint32_t alarmRevision = alarms.GetUpdateCount();
 
-    std::vector<std::string> rawLines;
-    std::string line;
-    while (std::getline(file, line))
+    const auto contextCurrent = [&]() noexcept -> bool
     {
-        rawLines.push_back(line);
-    }
-    file.close();
+        const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
+        if (m_state != originState || m_mode != originMode ||
+            m_programCache.GetGeneration() != originCache ||
+            owner.owner != originOwner.owner || owner.generation != originOwner.generation ||
+            m_motion.GetCurrentExecutionEpoch() != originEpoch ||
+            m_programRunStartPending || Homing.IsActive()) return false;
+        // The retained boot SAFETY owner still belongs to startup, not a LOAD.
+        if (bootstrapProgramLoad) return true;
+        if (alarms.HasAlarm() || alarms.GetUpdateCount() != alarmRevision ||
+            m_motion.HasPendingSafetyOrRecoveryRequests() ||
+            m_lifecycleInterruptionShadow.IsActive() ||
+            (owner.owner != MotionOwner::NONE && owner.owner != MotionOwner::IDLE_HOLD))
+            return false;
+        const NCLifecycleInterruptionSample sample = BuildLifecycleInterruptionSample();
+        if (sample.activeBlocks != 0U || sample.axisCommandDepth != 0U ||
+            sample.axisResultDepth != 0U || sample.commandQueueDepth != 0U ||
+            sample.commandIngressDepth != 0U || sample.commandReplayDepth != 0U ||
+            sample.feedbackDepth != 0U || sample.feedbackNoticeDepth != 0U ||
+            sample.lastPublishedFeedbackSequence != sample.lastConsumedFeedbackSequence ||
+            sample.waitCallbackActive || sample.completionBindingActive ||
+            sample.safetyOrRecoveryPending || !m_motion.IsGroupNCDrained()) return false;
+        if (owner.owner == MotionOwner::IDLE_HOLD)
+        {
+            MotionNCSettleSnapshot proof{};
+            MotionNCSettleCounters counters{};
+            if (!m_motion.TryGetNCSettleEvidence(MotionNCSettleProfile::GROUP_COMPLETION,
+                proof, counters) ||
+                proof.profile != MotionNCSettleProfile::GROUP_COMPLETION ||
+                proof.publicationGeneration == 0ULL || proof.proofSequence == 0ULL ||
+                proof.executionEpoch != originEpoch || proof.owner != owner.owner ||
+                proof.ownerGeneration != owner.generation || proof.scopeMask == 0U ||
+                !proof.runtimeObserved || !proof.runtimeCycleValid ||
+                !proof.runtimeCycleContiguous || !proof.groupDrained || proof.groupActive ||
+                !proof.settled || proof.safetyOrRecoveryPending ||
+                proof.requiredCycles != MOTION_NC_SETTLE_REQUIRED_CYCLES ||
+                proof.dwellCycles < proof.requiredCycles || proof.commandQueueDepth != 0U ||
+                proof.commandIngressDepth != 0U || proof.commandReplayDepth != 0U)
+                return false;
+        }
+        const MotionOwnerLease checkedOwner = m_motion.GetMotionOwnerLease();
+        return checkedOwner.owner == originOwner.owner &&
+            checkedOwner.generation == originOwner.generation &&
+            m_motion.GetCurrentExecutionEpoch() == originEpoch &&
+            m_state == originState && !m_motion.HasPendingSafetyOrRecoveryRequests();
+    };
+    if (!contextCurrent()) return RejectProgramLoad("CONTEXT_BUSY", filepath);
 
-    // Build the new immutable image first. A failed build must not destroy
-    // the currently loaded program or its execution boundary.
     NCProgramCache newProgramCache;
-    if (!newProgramCache.Build(std::move(rawLines), Parser))
+    std::string newProgramName;
+    std::unique_ptr<MacroEngine> newMacroState;
+    try
     {
-        return false;
+        std::ifstream file(filepath);
+        if (!file.is_open()) return RejectProgramLoad("FILE_OPEN", filepath);
+        std::vector<std::string> rawLines;
+        std::string line;
+        while (std::getline(file, line)) rawLines.push_back(line);
+        if (file.bad()) return RejectProgramLoad("FILE_READ", filepath);
+        if (!newProgramCache.Build(std::move(rawLines), Parser))
+            return RejectProgramLoad("CACHE_BUILD", filepath);
+        const std::size_t pos = filepath.find_last_of("/\\");
+        newProgramName = pos == std::string::npos ? filepath : filepath.substr(pos + 1U);
+        newMacroState.reset(new MacroEngine());
+    }
+    catch (...)
+    {
+        return RejectProgramLoad("IMAGE_ALLOCATION", filepath);
     }
 
-    const bool bootstrapProgramLoad =
-        !m_bootProgramImageLoaded &&
-        m_state == NCState::IDLE &&
-        m_programCache.Empty();
+    if (!contextCurrent()) return RejectProgramLoad("CONTEXT_CHANGED", filepath);
+    const auto committedContextCurrent = [&]() noexcept -> bool
+    {
+        const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
+        return m_mode == originMode && owner.owner == originOwner.owner &&
+            owner.generation == originOwner.generation &&
+            m_motion.GetCurrentExecutionEpoch() == originEpoch &&
+            (bootstrapProgramLoad || (!alarms.HasAlarm() &&
+                alarms.GetUpdateCount() == alarmRevision &&
+                !m_motion.HasPendingSafetyOrRecoveryRequests()));
+    };
+    AlarmManager::MotionAdmissionReservation admission{};
+    if (!bootstrapProgramLoad && !alarms.BeginMotionAdmission(alarmRevision, admission))
+        return RejectProgramLoad("ADMISSION_BUSY", filepath);
+    const auto endAdmission = [&]() noexcept -> bool
+    {
+        return bootstrapProgramLoad || alarms.EndMotionAdmission(admission);
+    };
+    if (!contextCurrent() ||
+        (!bootstrapProgramLoad && !alarms.IsMotionAdmissionCurrent(admission)))
+    {
+        (void)endAdmission();
+        return RejectProgramLoad("ADMISSION_CHANGED", filepath);
+    }
+    // The reservation protects only bounded swaps. In particular, neither
+    // allocation nor old-cache destruction may stall RT holding output here.
+    m_programLoadStartBlocked = true;
+    m_programCache.Swap(newProgramCache);
+    m_mainProgramName.swap(newProgramName);
+    MacroSys.SwapLocalState(*newMacroState);
+    const bool admissionEnded = endAdmission();
+    if (!admissionEnded || !committedContextCurrent() || m_state != originState)
+        return RejectProgramLoad("POST_COMMIT_SUPERSEDED", filepath);
 
     if (!bootstrapProgramLoad)
     {
-        // Only after a complete replacement image exists do we invalidate
-        // the old execution.  The very first startup image has no old
-        // execution to replace and must not manufacture a PROGRAM_REPLACE
-        // boundary that can be superseded by the retained bootstrap SAFETY
-        // owner before the UI is usable.
         BeginLifecycleInterruptionShadow(
-            NCLifecycleInterruptionCause::PROGRAM_REPLACED,
-            true);
+            NCLifecycleInterruptionCause::PROGRAM_REPLACED, false);
         CancelProgramEndBoundary();
         ClearCompletionWaitBoundary(true);
         CancelGMBlockTransaction(true);
         CancelSingleBlockShadow(true);
         CancelFeedHoldBoundaryShadow(true);
         m_waitCallback = nullptr;
-        ReleaseProgramMotionOwner();
-        const MotionExecutionEpoch replacementEpoch =
-            m_motion.BeginNewExecutionEpoch(
-                MotionCommandSource::NC_MEMORY);
-        if (replacementEpoch == MOTION_EXECUTION_EPOCH_INVALID)
-        {
-            return false;
-        }
-        RecordLifecycleInterruptionEpochPublished(replacementEpoch);
     }
-
-    const std::size_t pos = filepath.find_last_of("/\\");
-    m_mainProgramName =
-        pos != std::string::npos
-        ? filepath.substr(pos + 1U)
-        : filepath;
-
+    m_programMotionLease = MotionOwnerLease{};
     m_macroStack.clear();
     m_macroProgramCaches.clear();
-    MacroSys.Reset();
-
-    m_macroProgramName = "";
+    m_macroProgramName.clear();
     m_macroProgramPC = -1;
-
-    m_programCache = std::move(newProgramCache);
     m_programPC = 0;
     ResetAllProgramCommitBoundaries();
     m_motion.ResetPhysicalPC();
@@ -342,15 +414,33 @@ bool NCManager::LoadProgram(const std::string& filepath)
         curPlane);
 
 
-    m_state = NCState::READY;
+
+    NCState expectedState = originState;
+    const bool stateCommitted = committedContextCurrent() &&
+        m_state.compare_exchange_strong(expectedState, NCState::READY,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+    if (!stateCommitted || !committedContextCurrent() ||
+        m_state != NCState::READY)
+    {
+        // A late safety change may follow the inert image commit; it may not
+        // become a successful LOAD or authorize START of this installed image.
+        return RejectProgramLoad("POST_COMMIT_SUPERSEDED", filepath);
+    }
+    m_programLoadStartBlocked = false;
     m_bootProgramImageLoaded = true;
+    RtPrintf("[NC-LOAD-CJ] LOADED file=%.240s cache=%llu owner=%u generation=%u epoch=%u keepHold=%u startBlocked=0\n",
+        m_mainProgramName.c_str(), static_cast<unsigned long long>(m_programCache.GetGeneration()),
+        static_cast<unsigned>(originOwner.owner), originOwner.generation, originEpoch,
+        originOwner.owner == MotionOwner::IDLE_HOLD ? 1U : 0U);
     return true;
 }
+
 
 void NCManager::ChangeMode(NCOperationMode newMode)
 {
     // 只有在 IDLE 或 READY 狀態才能切換模式
     if (m_state == NCState::IDLE || m_state == NCState::READY || m_state == NCState::P_END) {
+        CancelGapDryRunSameThread("MODE_CHANGE");
         FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::MODE_CHANGE);
         InvalidatePathCoreFeedSameThread(); // BX-FEED
         InvalidatePathCoreArcSameThread(); // BY-ARC
@@ -376,6 +466,8 @@ void NCManager::ChangeMode(NCOperationMode newMode)
 }
 
 void NCManager::ChangeState(NCState newState) {
+    if (newState == NCState::HOLD) PauseGapDryRunSameThread("STATE_HOLD");
+    else if (newState != NCState::RUN) CancelGapDryRunSameThread("STATE_CHANGE");
     // BN: public state writes cannot arm or resume retained geometry.
     if (newState == NCState::HOLD)
         PausePathCoreLiveRetentionSameThread();
@@ -442,6 +534,13 @@ void NCManager::TryRollbackHomingResume() noexcept
 // ==========================================
 void NCManager::CycleStart()
 {
+    if (m_programLoadStartBlocked && m_mode == NCOperationMode::MEMORY &&
+        (m_state == NCState::READY || m_state == NCState::P_END || m_state == NCState::IDLE))
+    {
+        RtPrintf("[NC-LOAD-CJ] START_BLOCKED current=%.240s action=LOAD_OR_RESET\n",
+            m_mainProgramName.c_str());
+        return;
+    }
     CancelPathCoreHoldAutomaticSameThread("MANUAL_START");
     // A late Alarm may be published after the preceding ProcessTask sample.
     // No HOLD resume or READY/P_END start may acquire/program Motion before
@@ -627,8 +726,18 @@ void NCManager::CycleStart()
 
 void NCManager::FeedHold()
 {
+    PauseGapDryRunSameThread("MANUAL_HOLD");
     // Operator Hold revokes an automatic resume even when already in HOLD.
     CancelPathCoreHoldAutomaticSameThread("MANUAL_HOLD");
+    if (m_state == NCState::HOLD)
+    {
+        // A later HOLD also supersedes a manual START waiting for RT proof.
+        // Retain the physical stop boundary so a fresh START can request
+        // admission again; do not create or acknowledge another stop here.
+        m_feedHoldResumeGate.Cancel(true);
+        ClearHoldResumeAlarmAdmission(
+            HoldResumeAdmissionKind::PROGRAM_HOLD);
+    }
     FeedHoldInternal();
 }
 
@@ -698,6 +807,8 @@ void NCManager::FeedHoldInternal()
 
 void NCManager::Reset()
 {
+    m_programLoadStartBlocked = false;
+    CancelGapDryRunSameThread("RESET");
     // BN: revoke only commanded-retention reads at the operator boundary.
     FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::RESET);
     InvalidatePathCoreFeedSameThread(); // BX-FEED
@@ -2071,6 +2182,7 @@ void NCManager::BeginLifecycleInterruptionShadow(
     NCLifecycleInterruptionCause cause,
     bool expectsEpochChange) noexcept
 {
+    CancelGapDryRunSameThread("LIFECYCLE");
     FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::INTERRUPTION);
     InvalidatePathCoreFeedSameThread(); // BX-FEED
     InvalidatePathCoreArcSameThread(); // BY-ARC
@@ -2933,6 +3045,7 @@ void NCManager::ObserveBootstrapSafetyHandoff() noexcept
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
+    ValidateGapDryRunSameThread(); // CG: revoke/pause before early control returns.
     ValidatePathCoreFeedSameThread(); // BX-FEED: observe lifecycle before early returns.
     ValidatePathCoreArcSameThread(); // BY-ARC
     ValidatePathCoreReplaySameThread(); // BZ-REPLAY
@@ -3526,6 +3639,7 @@ void NCManager::ProcessTask()
 // =========================================================
     if (m_edmState == EDMState::NOT_READY)
     {
+        PauseGapDryRunSameThread("INTERLOCK");
         CancelPathCoreHoldAutomaticSameThread("INTERLOCK");
         ClearPreDispatchBarrier();
 
@@ -5727,6 +5841,8 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
     case 2: // BY-ARC: G17 XY circular interpolation, exact stop.
     case 3:
         return StartPathCoreArcSameThread(block);
+    case 180: // CG: standalone simulated GAP input self-test.
+        return StartGapDryRunSameThread(block);
     case 178: // CB: arm one Feed Hold excursion on the next original source.
     case 179: // CB: cancel an unused one-shot arm.
         return StartPathCoreHoldSameThread(block);
@@ -5836,6 +5952,17 @@ void NCManager::ExecuteBlock(
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
+    // CG: reject mixed/implicit test commands before settings, tools or M outputs.
+    if (NCGCodeSemantics::Contains(block, 180))
+    {
+        if (!IsGapDryRunBlockShapeValid(block))
+        {
+            RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter,
+                sourceLineNumber, "BLOCK_SHAPE");
+            return;
+        }
+        m_gapDryRun.sourceLine = sourceLineNumber;
+    }
     // CB: whole-block guard runs before any setting/tool/M side effect.
     const bool explicitHoldControl = NCGCodeSemantics::Contains(block, 178) || NCGCodeSemantics::Contains(block, 179);
     const bool invalidArmedFeed = m_pathHold.armed && m_pathHold.candidateDispatch == dispatchId &&
@@ -6706,6 +6833,7 @@ NCProgramEndGateSample NCManager::BuildProgramEndGateSample() const noexcept
 bool NCManager::BeginProgramRunBoundary(
     MotionExecutionEpoch executionEpoch) noexcept
 {
+    CancelGapDryRunSameThread("NEW_RUN");
     m_programEndAlarmRaised = false;
     return m_programEndBoundary.BeginRun(
         GetBaseProgramScope(),
@@ -6892,6 +7020,22 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
             m_pendingProgramRunAlarmSafetyIntentState &&
             !startAlarms.HasAlarm();
     };
+
+    if (m_programLoadStartBlocked && m_pendingProgramRunMode == NCOperationMode::MEMORY)
+    {
+        cancelPendingStart(startAlarms.HasAlarm());
+        return true;
+    }
+    const auto replacement = m_lifecycleInterruptionShadow.GetSnapshot();
+    if (replacement.active &&
+        replacement.cause == NCLifecycleInterruptionCause::PROGRAM_REPLACED &&
+        !replacement.expectsEpochChange)
+    {
+        // Ordinary NC observations close the inert replacement before START
+        // can publish an epoch. Never count two observations inside LOAD.
+        if (!alarmIdentityCurrent()) cancelPendingStart(startAlarms.HasAlarm());
+        return true;
+    }
 
     if (m_pendingProgramRunPhase ==
         ProgramRunStartPhase::ALARM_ADMISSION)
@@ -7212,6 +7356,13 @@ void NCManager::ProcessProgramEndBoundary()
 
 void NCManager::FinalizeProgramEnd()
 {
+    const NCState entryState = m_state.load(std::memory_order_acquire);
+
+    if (entryState != NCState::RUN && entryState != NCState::HOLD)
+    {
+        return;
+    }
+
     ClearPendingGotoQueueTailRebase();
 
     // BP-BEGIN
@@ -7238,11 +7389,12 @@ void NCManager::FinalizeProgramEnd()
         return;
     }
 
-    // CAS-release the exact Program lease before any modal, queue, callback,
-    // or NC state cleanup.  On failure retain both the lease and pending End
-    // boundary; the next Evaluate observes the current owner and fails closed.
+    // CJ: hand the exact, freshly settled Program lease to output-only idle
+    // holding before NC cleanup. A busy reservation preserves the pending End
+    // transaction; ordinary producers cannot create this holding authority.
     if (!m_programMotionLease.IsValid() ||
-        !m_motion.ReleaseMotionOwner(m_programMotionLease))
+        !m_motion.TryEnterProgramEndIdleHold(
+            m_programMotionLease, releaseSample.executionEpoch))
     {
         // BP-BEGIN
         DiscardPathCoreCompletedSnapshotSameThread();
@@ -7253,9 +7405,45 @@ void NCManager::FinalizeProgramEnd()
         return;
     }
 
-    // BN: the exact Program lease has been released; no old live reads survive.
+    // CJ: Program authority has ended; no old live reads or NC lease survive.
     FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::PROGRAM_END);
     m_programMotionLease = MotionOwnerLease{};
+
+    // The Motion CAS is a committed handoff even when immediately superseded.
+    // Never retry its consumed Program lease or hide a newer Reset/Alarm state.
+    const auto cancelSupersededEnd = [this, entryState, &releaseSample]() -> bool
+    {
+        AlarmManager& alarms = AlarmManager::GetInstance();
+        const bool alarmPresent = alarms.HasAlarm();
+        const bool authorityChanged =
+            m_motion.GetCurrentExecutionEpoch() != releaseSample.executionEpoch ||
+            m_motion.HasPendingSafetyOrRecoveryRequests();
+        const NCState currentState = m_state.load(std::memory_order_acquire);
+        if (!alarmPresent && !authorityChanged && currentState == entryState)
+        {
+            return false;
+        }
+        const int sourceLine = m_programEndBoundary.GetSnapshot().sourceLineNumber;
+        CancelProgramEndBoundary();
+        DiscardPathCoreCompletedSnapshotSameThread();
+        ClosePathCoreCommittedRunSameThread();
+        if (currentState == entryState)
+        {
+            if (!alarmPresent)
+            {
+                alarms.Trigger(AlarmManager::PROGRAM_END_GATE_ERROR,
+                    sourceLine);
+            }
+            NCState expectedState = entryState;
+            (void)m_state.compare_exchange_strong(expectedState, NCState::ALARM,
+                std::memory_order_acq_rel, std::memory_order_acquire);
+        }
+        return true;
+    };
+    if (cancelSupersededEnd())
+    {
+        return;
+    }
 
     if (!m_programEndBoundary.MarkFinalized())
     {
@@ -7296,19 +7484,20 @@ void NCManager::FinalizeProgramEnd()
     Reset_Gode();
     UpdateSystemVariables();
 
+    if (cancelSupersededEnd())
+    {
+        return;
+    }
+    const NCState endState =
+        (m_mode == NCOperationMode::MANUAL || m_mode == NCOperationMode::MDI)
+        ? NCState::READY : NCState::P_END;
     if (m_mode == NCOperationMode::MANUAL)
     {
         m_manualAutoRunning = false;
-        m_state = NCState::READY;
     }
-    else if (m_mode == NCOperationMode::MDI)
-    {
-        m_state = NCState::READY;
-    }
-    else
-    {
-        m_state = NCState::P_END;
-    }
+    NCState expectedState = entryState;
+    (void)m_state.compare_exchange_strong(expectedState, endState,
+        std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 void NCManager::CancelProgramEndBoundary() noexcept

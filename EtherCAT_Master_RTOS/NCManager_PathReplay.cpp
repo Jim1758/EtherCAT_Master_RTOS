@@ -210,7 +210,7 @@ void NCManager::BeginPathCoreReplayCaptureSameThread(const NCBlock& block, NCBlo
     if (block.isEmpty || plainStop) return;
     // CD: only a well-formed explicit cross-segment arm preserves completed
     // canonical history. Ordinary G178/G179 keep their established CC boundary.
-    if (block.gCode == 178 && block.has('P') && block.val('P') == 1.0 &&
+    if (block.gCode == 178 && block.has('P') && (block.val('P') == 1.0 || block.val('P') == 2.0 || block.val('P') == 3.0 || block.val('P') == 4.0) &&
         IsPathCoreHoldBlockShapeValid(block)) return;
     ClearPathCoreReplayHistorySameThread();
 }

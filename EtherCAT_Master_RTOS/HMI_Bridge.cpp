@@ -26,6 +26,93 @@ namespace HMI_Bridge
 {
     namespace
     {
+        const char* IdleHoldDiagnosticReasonToName(
+            MotionCore::IdleHoldDiagnosticReason reason) noexcept
+        {
+            using Reason = MotionCore::IdleHoldDiagnosticReason;
+            switch (reason)
+            {
+            case Reason::NONE: return "NONE";
+            case Reason::GRANT_MISMATCH: return "GRANT_MISMATCH";
+            case Reason::AUTHORITY_CHANGED: return "AUTHORITY_CHANGED";
+            case Reason::GROUP_OR_MAPPING_CHANGED: return "GROUP_OR_MAPPING_CHANGED";
+            case Reason::SERVO_OR_MODE_LOST: return "SERVO_OR_MODE_LOST";
+            case Reason::AXIS_MAPPING: return "AXIS_MAPPING";
+            case Reason::COMPENSATION_NONFINITE: return "COMPENSATION_NONFINITE";
+            case Reason::UNSUPPORTED_SCOPE: return "UNSUPPORTED_SCOPE";
+            case Reason::AXIS_CONFIG_OR_COMMAND: return "AXIS_CONFIG_OR_COMMAND";
+            case Reason::VELOCITY_CONVERSION: return "VELOCITY_CONVERSION";
+            case Reason::REFERENCE_OR_CONFIG_CHANGED: return "REFERENCE_OR_CONFIG_CHANGED";
+            case Reason::FOLLOWING_ERROR: return "FOLLOWING_ERROR";
+            case Reason::CORRECTION_NONFINITE: return "CORRECTION_NONFINITE";
+            case Reason::TRAVEL_LIMIT: return "TRAVEL_LIMIT";
+            default: return "UNKNOWN";
+            }
+        }
+
+        HMI_DIAG_NOINLINE void DrainIdleHoldDiagnostics(MotionCore& motion)
+        {
+            // CJ FIX1 sole consumer, on the existing Priority-50 1000 ms task.
+            // No live AxisContext/hold reads: even delayed rows retain RT values.
+            // Fixed workspace is included in MotionCore's 1 KiB diagnostic budget.
+            static MotionCore::IdleHoldDiagnosticEvent event{};
+            static std::uint32_t lastReportedDropped = 0U;
+            using EventType = MotionCore::IdleHoldDiagnosticEventType;
+            for (std::size_t consumed = 0U;
+                consumed < MotionCore::IDLE_HOLD_DIAGNOSTIC_DRAIN_BUDGET; ++consumed)
+            {
+                if (!motion.TryPopIdleHoldDiagnostic(event)) break;
+                switch (event.eventType)
+                {
+                case EventType::ACTIVE:
+                    RtPrintf("[IDLE-CJ] ACTIVE owner=%u generation=%u epoch=%u mask=%u capUMs=100 rtTick=%llu diagSeq=%llu\n",
+                        static_cast<unsigned>(event.owner), event.generation,
+                        event.epoch, event.mask,
+                        static_cast<unsigned long long>(event.runtimeTick),
+                        static_cast<unsigned long long>(event.sequence));
+                    break;
+                case EventType::REFERENCE:
+                    RtPrintf("[IDLE-CJ] REFERENCE axis=%u generation=%u epoch=%u cmdPulseBits=%08X%08X actPulseBits=%08X%08X windowPulseBits=%08X%08X rtTick=%llu diagSeq=%llu\n",
+                        static_cast<unsigned>(event.axisIndex), event.generation, event.epoch,
+                        static_cast<unsigned>(event.cmdPulseBits >> 32U),
+                        static_cast<unsigned>(event.cmdPulseBits),
+                        static_cast<unsigned>(event.actPulseBits >> 32U),
+                        static_cast<unsigned>(event.actPulseBits),
+                        static_cast<unsigned>(event.windowPulseBits >> 32U),
+                        static_cast<unsigned>(event.windowPulseBits),
+                        static_cast<unsigned long long>(event.runtimeTick),
+                        static_cast<unsigned long long>(event.sequence));
+                    break;
+                case EventType::RELEASED:
+                    RtPrintf("[IDLE-CJ] RELEASED owner=%u generation=%u epoch=%u nextOwner=%u nextGeneration=%u rtTick=%llu diagSeq=%llu\n",
+                        static_cast<unsigned>(event.owner), event.generation, event.epoch,
+                        static_cast<unsigned>(event.nextOwner), event.nextGeneration,
+                        static_cast<unsigned long long>(event.runtimeTick),
+                        static_cast<unsigned long long>(event.sequence));
+                    break;
+                case EventType::CANCELLED:
+                case EventType::FAILED:
+                    RtPrintf("[IDLE-CJ] %s reason=%s owner=%u generation=%u epoch=%u mask=%u axis=%d rtTick=%llu diagSeq=%llu\n",
+                        event.eventType == EventType::FAILED ? "FAILED" : "CANCELLED",
+                        IdleHoldDiagnosticReasonToName(event.reason),
+                        static_cast<unsigned>(event.owner), event.generation,
+                        event.epoch, event.mask, event.axisIndex,
+                        static_cast<unsigned long long>(event.runtimeTick),
+                        static_cast<unsigned long long>(event.sequence));
+                    break;
+                }
+            }
+            // At most one additional loss row per drain. Never reset the RT counter.
+            const std::uint32_t dropped = motion.GetIdleHoldDiagnosticDroppedCount();
+            if (dropped != lastReportedDropped)
+            {
+                RtPrintf("[IDLE-CJ] DIAG_DROPPED total=%u capacity=%u drainBudget=%u\n",
+                    dropped, static_cast<unsigned>(MotionCore::IDLE_HOLD_DIAGNOSTIC_CAPACITY),
+                    static_cast<unsigned>(MotionCore::IDLE_HOLD_DIAGNOSTIC_DRAIN_BUDGET));
+                lastReportedDropped = dropped;
+            }
+        }
+
         const char* NCBlockLifecycleStateToDiagnosticName(
             NCBlockLifecycleState state) noexcept
         {
@@ -1112,6 +1199,7 @@ namespace HMI_Bridge
             case MotionOwner::EDM_RETRACT: return "EDM_RETRACT";
             case MotionOwner::RECOVERY:    return "RECOVERY";
             case MotionOwner::SAFETY:      return "SAFETY";
+            case MotionOwner::IDLE_HOLD:   return "IDLE_HOLD";
             default:                       return "UNKNOWN";
             }
         }
@@ -2219,10 +2307,77 @@ namespace HMI_Bridge
             nc->MacroSys.SetVar(pShm->varCmd.prefix, pShm->varCmd.index, pShm->varCmd.writeValue);
             pShm->varCmd.writeReq = false;
         }
-        if (pShm->NC_Command.cycleStart) { nc->CycleStart(); pShm->NC_Command.cycleStart = false; }
-        if (pShm->NC_Command.feedHold) { nc->FeedHold(); pShm->NC_Command.feedHold = false; }
-        if (pShm->NC_Command.reset) { nc->Reset(); pShm->NC_Command.reset = false; }
-        if (pShm->NC_Command.Close_System) { nc->Close_System_Com_flag = true; pShm->NC_Command.Close_System = false; }
+        // CJ LOAD FIX1: consume the request group before dispatching START.
+        const bool closeRequested = pShm->NC_Command.Close_System ||
+            nc->Close_System_Com_flag;
+        const bool resetRequested = pShm->NC_Command.reset;
+        const bool holdRequested = pShm->NC_Command.feedHold;
+        const bool modeRequested = pShm->NC_Command.reqChangeMode;
+        const bool loadRequested = pShm->NC_Command.loadProgramReq;
+        const bool startRequested = pShm->NC_Command.cycleStart;
+        if (startRequested) pShm->NC_Command.cycleStart = false;
+
+        if (pShm->NC_Command.Close_System)
+        {
+            nc->Close_System_Com_flag = true;
+            pShm->NC_Command.Close_System = false;
+        }
+        if (resetRequested)
+        {
+            nc->Reset();
+            pShm->NC_Command.reset = false;
+        }
+        if (holdRequested)
+        {
+            if (!resetRequested && !closeRequested) nc->FeedHold();
+            pShm->NC_Command.feedHold = false;
+        }
+        if (modeRequested)
+        {
+            if (!resetRequested && !holdRequested && !closeRequested)
+            {
+                nc->ChangeMode(static_cast<NCOperationMode>(
+                    pShm->NC_Command.targetMode));
+            }
+            pShm->NC_Command.reqChangeMode = false;
+        }
+
+        if (loadRequested)
+        {
+            const size_t safeLength = strnlen(
+                pShm->NC_Command.loadprogramName,
+                sizeof(pShm->NC_Command.loadprogramName));
+            const std::string requestedName(
+                pShm->NC_Command.loadprogramName, safeLength);
+            const std::string requestedPath =
+                GlobalConfig::GetInstance().NCProgramDir + requestedName + ".nc";
+            const char* priorityReason = closeRequested ? "CLOSE_REQUEST" :
+                resetRequested ? "RESET_REQUEST" :
+                holdRequested ? "HOLD_REQUEST" :
+                modeRequested ? "MODE_REQUEST" : nullptr;
+            const bool loaded = priorityReason != nullptr
+                ? nc->RejectProgramLoad(priorityReason, requestedPath)
+                : nc->LoadProgram(requestedPath);
+            RtPrintf("[HMI-LOAD-CJ] result=%s requested=%s actual=%s "
+                "startDiscarded=%u\n",
+                loaded ? "SUCCESS" : "REJECTED",
+                requestedName.c_str(), nc->m_mainProgramName.c_str(),
+                (startRequested || pShm->NC_Command.cycleStart) ? 1U : 0U);
+            pShm->NC_Command.loadProgramReq = false;
+            std::memset(pShm->NC_Command.loadprogramName, 0,
+                sizeof(pShm->NC_Command.loadprogramName));
+            // START published before LOAD finishes also needs a fresh press.
+            pShm->NC_Command.cycleStart = false;
+        }
+        else if (startRequested && !closeRequested && !resetRequested &&
+            !holdRequested && !modeRequested &&
+            !pShm->NC_Command.Close_System && !pShm->NC_Command.reset &&
+            !pShm->NC_Command.feedHold && !pShm->NC_Command.reqChangeMode &&
+            !pShm->NC_Command.loadProgramReq)
+        {
+            nc->CycleStart();
+        }
+        // CJ LOAD FIX1: end of ordered control request dispatch.
 
 
         //單步執行切換
@@ -2602,20 +2757,6 @@ namespace HMI_Bridge
         pShm->NC_Status.m_programmableTravelLimitEnabled = m_programmableTravelLimitEnabled;
 
 
-        if (pShm->NC_Command.reqChangeMode)//處理 OP 模式切換請求 (來自 NC_Command)
-        {
-            nc->ChangeMode(static_cast<NCOperationMode>(pShm->NC_Command.targetMode));
-            pShm->NC_Command.reqChangeMode = false;
-        }
-
-        if (pShm->NC_Command.loadProgramReq)
-        {
-            size_t safeLength = strnlen(pShm->NC_Command.loadprogramName, 256);
-            std::string NC_loadprogramName(pShm->NC_Command.loadprogramName, safeLength);
-            nc->LoadProgram(GlobalConfig::GetInstance().NCProgramDir + NC_loadprogramName + ".nc");
-            pShm->NC_Command.loadProgramReq = false;
-            std::memset(pShm->NC_Command.loadprogramName, 0, sizeof(pShm->NC_Command.loadprogramName));
-        }
 
 
 
@@ -2831,8 +2972,12 @@ namespace HMI_Bridge
     // =========================================================================
     void ProcessTask_1000ms(NCManager* nc)
     {
+        if (nc == nullptr) return;
+        MotionCore& motion = nc->GetMotion();
+        // CJ FIX1: unconditional drain before SHM/ordinary diagnostic gates.
+        DrainIdleHoldDiagnostics(motion);
         SHM_Data* pShm = SHMManager::GetInstance().GetData();
-        if (pShm == nullptr || nc == nullptr) return;
+        if (pShm == nullptr) return;
 
         // =============================================================
         // Stage NC-0.1F.2 - No-motion Runtime Acceptance Diagnostics
@@ -2849,8 +2994,6 @@ namespace HMI_Bridge
         // This keeps the acceptance trace useful without creating an
         // unlimited one-line-per-second production log.
         // =============================================================
-        MotionCore& motion = nc->GetMotion();
-
         Hmi1000msDiagnosticWorkspace& workspace =
             g_hmi1000msDiagnosticWorkspace;
         CapturePathCoreCompactDiagnosticFamily(*nc, workspace);

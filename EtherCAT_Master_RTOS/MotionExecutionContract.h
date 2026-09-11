@@ -58,7 +58,8 @@ enum class MotionOwner : std::uint8_t
     EDM_PATH = 7,
     EDM_RETRACT = 8,
     RECOVERY = 9,
-    SAFETY = 10
+    SAFETY = 10,
+    IDLE_HOLD = 11 // Output-only; no command source maps to this owner.
 };
 
 // Stage NC-0.1E¡GMotion ±±¨îÅv¯²¬ù¡C

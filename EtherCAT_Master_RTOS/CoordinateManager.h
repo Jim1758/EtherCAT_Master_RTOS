@@ -19,8 +19,21 @@ public:
     bool PrepareDistanceModeTransition(int mode, NCTranslationSnapshot& candidate) const noexcept;
     bool CommitDistanceModeTransition(const NCTranslationSnapshot& candidate) noexcept;
     // NC-only drained unit selection; stored native mm/degrees never change.
+    bool PrepareStoredStrokeTransition(int mode, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitStoredStrokeTransition(const NCTranslationSnapshot& candidate) noexcept;
     bool PrepareUnitModeTransition(int mode, NCTranslationSnapshot& candidate) const noexcept;
     bool CommitUnitModeTransition(const NCTranslationSnapshot& candidate) noexcept;
+    // Drained polar notation selection; native geometry and Cartesian frame stay fixed.
+    bool PreparePolarTransition(int code, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitPolarTransition(const NCTranslationSnapshot& candidate) noexcept;
+    // Drained physical cutter-radius selection; this never moves the tool centre.
+    bool PrepareToolRadiusSelectionTransition(int mode, int dCode,
+        NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitToolRadiusSelectionTransition(const NCTranslationSnapshot& candidate) noexcept;
+    bool IsToolRadiusSelectionSupported(int mode, int dCode) const noexcept;
+    // One-based D row; native mm, RAM only, G40 before first motion in a run.
+    bool SetToolRadiusValue(int dCode, double radiusMM, NCManager* nc);
+
     // Fully drained XYZ scale/mirror selection; unchanged requests are idempotent.
     bool PrepareScaleMirrorTransition(int code, const double* values, const bool* hasAxis,
         double factor, NCTranslationSnapshot& candidate) const noexcept;
@@ -376,6 +389,14 @@ public:
     // 取得目前 G22 / G23 狀態
     // ----------------------------------------------------------
     bool IsProgrammableTravelLimitEnabled() const;
+
+    // Pure effective-policy checks; HOME is required before any limit applies.
+    // Bits 1/2/4: invalid active range; bit 8: disjoint active valid ranges.
+    // storedStrokeMode: 0 = current selector, 22/23 = candidate selector.
+    unsigned GetInvalidSoftwareTravelLimitMask(const AxisContext& axis,
+        int storedStrokeMode = 0) const;
+    int GetSoftwareTravelLimitAlarmCode(const AxisContext& axis,
+        int fallbackAlarmCode) const;
 
 
     // ----------------------------------------------------------

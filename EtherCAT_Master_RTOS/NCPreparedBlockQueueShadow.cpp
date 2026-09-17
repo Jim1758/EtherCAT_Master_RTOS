@@ -1335,18 +1335,17 @@ NCPreparedModalSnapshot NCPreparedBlockQueueShadow::ReduceModalSnapshot(
         }
         else if (code == 40 || code == 41 || code == 42)
         {
-            if (code == 40)
+            int mode = 40, dCode = 0;
+            if (!TryDecodeNCToolRadiusSelection(code, block.has('D'),
+                block.has('D') ? block.val('D') : 0.0, mode, dCode))
             {
-                after.toolRadiusMode = 40;
-                after.dCode = 0;
+                afterValid = false;
             }
             else
             {
-                after.toolRadiusMode = code;
-                if (block.has('D'))
-                {
-                    after.dCode = static_cast<int>(block.val('D'));
-                }
+                // Diagnostic-only scalar decode; the table descriptor remains fenced.
+                after.toolRadiusMode = mode;
+                after.dCode = dCode;
             }
         }
         else if (code == 68)

@@ -413,6 +413,17 @@ WaitConditionFunc NCManager::StartPathCoreReplaySameThread(const NCBlock& block)
         m_pathReplay.endU = m_pathReplay.reverse ? 0.0 : 1.0;
     }
     m_pathReplay.feedMMMin = block.val('F');
+    for (int axisIndex = 0; axisIndex < 8; ++axisIndex)
+    {
+        if ((geometry->axisMask & (1U << static_cast<unsigned>(axisIndex))) == 0U) continue;
+        const unsigned invalidMask = CoordSys.GetInvalidSoftwareTravelLimitMask(m_motion.GetAxisContext(axisIndex));
+        if (invalidMask != 0U)
+        {
+            RtPrintf("[TRAVEL-CONFIG][REJECT] unit=REPLAY axis=%d invalidMask=%u beforeSubmit=1\n", axisIndex, invalidMask);
+            RejectPathCoreReplaySameThread(7U, AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG);
+            return nullptr;
+        }
+    }
     MotionArcTravelGuard travelGuard{};
     travelGuard.context = this;
     travelGuard.check = [](const void* context, int axisIndex, double target) -> bool

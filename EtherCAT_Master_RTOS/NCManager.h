@@ -77,6 +77,7 @@
 // BQ-BEGIN
 #include "NCPathCoreCommittedRun.h"
 #include "MotionFeedLineReceipt.h"
+#include "NCPathCoreCutterContour.h"
 #include "NCPathCoreRetainedPath.h"
 #include "MotionPathCoreRetainedReceipt.h"
 // BQ-END
@@ -2335,6 +2336,32 @@ private:
     void CommitCncModalFeedSameThread(const CncFeedValueSnapshot& snapshot,
         NCBlockDispatchId dispatch, std::uint64_t commit, int pc, int line) noexcept;
 
+    // Cutter nominal contour is distinct from the accepted physical tool centre.
+    // Only a validated program/ledger commit advances this tail. HOLD retains it;
+    // invalidation/RESET retires it, so an interrupted contour cannot be resumed.
+    struct CutterLineState
+    {
+        std::array<double, 8U> nominal{}, stagedNominal{};
+        std::array<double, 2U> physicalTail{}, expectedNext{}, stagedNext{};
+        NCPathCoreCutterPrimitive expectedPrimitive{}, stagedPrimitive{}, stagedNextPrimitive{};
+        NCPathCoreCutterContourOutput stagedGeometry{};
+        std::uint64_t stagedRun = 0ULL, stagedCache = 0ULL, stagedGeneration = 0ULL, stagedDispatch = 0ULL;
+        int stagedPC = -1;
+        std::uint64_t run = 0ULL, cache = 0ULL, generation = 0ULL;
+        std::uint64_t commit = 0ULL, dispatch = 0ULL;
+        int nextPC = -1, stagedNextPC = -1;
+        bool valid = false, staged = false, terminal = false, stagedTerminal = false;
+        bool leadOutRequired = false;
+    } m_cutterLine{};
+    static bool IsCutterContourBlockShapeValid(const NCBlock& block, int unitsMode) noexcept;
+    bool BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
+        std::uint64_t run, std::uint64_t cache, std::uint64_t dispatch,
+        std::array<double, 8U>& endpoint, std::array<double, 2U>& nativeCenterOffset, int& direction);
+    bool CommitCutterContourSameThread(std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, std::uint64_t commit, std::uint64_t generation,
+        int sourcePC, const std::array<double, 8U>& physicalEnd) noexcept;
+    void LogCutterContourSameThread(std::uint64_t run, std::uint64_t dispatch, int sourcePC) const noexcept;
+
     // BX-FEED-BEGIN: fixed startup-owned G01 state, distinct from V1 G00 history.
     MotionFeedLineWorkspace m_pathFeedMotion{};
     std::vector<int> m_pathFeedAxes = std::vector<int>(3U, 0);
@@ -2354,8 +2381,9 @@ private:
         bool invalidatedByGoto = false; // Diagnostic cause only; never a motion permit.
     } m_pathFeed{};
     static bool IsPathCoreFeedBlockShapeValid(const NCBlock& block,
-        bool allowMissingFeed = false, int unitsMode = 21) noexcept;
+        bool allowMissingFeed = false, int unitsMode = 21, bool polar = false) noexcept;
     bool IsPathCoreFeedInputOmission(const NCBlock& block) const noexcept;
+    bool IsCutterContourEndAllowedSameThread(int sourceLine);
     bool IsPathCoreFeedConfigurationValid() noexcept;
     void ArmPathCoreFeedSameThread() noexcept;
     void InvalidatePathCoreFeedSameThread(bool byGoto = false) noexcept;
@@ -2431,7 +2459,7 @@ private:
     } m_cncFeed{};
     static_assert(sizeof(CncFeedFlight) <= 1536U, "DG mixed receipt row storage budget changed.");
     static_assert(sizeof(CncFeedQueue) <= 7168U, "DG NC-owned mixed queue storage budget changed.");
-    static bool IsCncPathQueuedBlockShapeValid(const NCBlock& block, int unitsMode = 21) noexcept;
+    static bool IsCncPathQueuedBlockShapeValid(const NCBlock& block, int unitsMode = 21, bool polar = false) noexcept;
     bool IsCncFeedScopeSameThread() noexcept;
     bool PrepareCncFeedDispatchSameThread(const NCParsedBlock* parsed, int pc);
     bool IsCncFeedSelectedBlockSameThread(const NCBlock& block) const noexcept;
@@ -2464,7 +2492,7 @@ private:
         bool invalidatedByGoto = false; // Diagnostic cause only; never a motion permit.
     } m_pathArc{};
     static bool IsPathCoreArcBlockShapeValid(const NCBlock& block,
-        bool allowMissingFeed = false, int unitsMode = 21) noexcept;
+        bool allowMissingFeed = false, int unitsMode = 21, bool polar = false) noexcept;
     bool IsPathCoreArcInputOmission(const NCBlock& block) const noexcept;
     bool IsPathCoreArcConfigurationValid() noexcept;
     void ArmPathCoreArcSameThread() noexcept;

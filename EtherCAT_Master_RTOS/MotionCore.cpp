@@ -495,6 +495,34 @@ namespace
             command.mem_totalDist == circle.lengthPulse;
     }
 
+    bool ResolveCutterPlanarCircle(const MotionCommand& command, NCPathCoreArcPulseGeometry& circle) noexcept
+    {
+        if (command.sourceTranslation.cutterMode == 40 ||
+            !IsMotionFixedTranslationCutterSourceAllowed(command) || !command.pathCorePlanarCircle ||
+            command.startRadius != command.endRadius || command.mem_radius != command.startRadius ||
+            !std::isfinite(command.mem_startPos[2]) ||
+            !ResolveNCPathCorePlanarCirclePulse(command.mem_startPos[0], command.mem_startPos[1],
+                command.targetPos[0], command.targetPos[1], command.centerPos[0], command.centerPos[1],
+                command.startRadius, command.dir, false, circle)) return false;
+        return command.mem_startAngle == circle.startAngle && command.mem_totalAngle == circle.sweepRadians &&
+            command.mem_totalDist == circle.lengthPulse;
+    }
+
+    bool CutterCircleStartMatches(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts) noexcept
+    {
+        if (contexts == nullptr || contexts->size() < 3U) return false;
+        for (std::size_t i = 0U; i < 3U; ++i)
+        {
+            const AxisContext& axis = (*contexts)[i];
+            const double actual = axis.logicalCmdPos.Load();
+            if (!axis.isExist || axis.axisType != AxisType::LINEAR ||
+                !std::isfinite(actual) || !std::isfinite(command.mem_startPos[i]) ||
+                std::memcmp(&actual, &command.mem_startPos[i], sizeof(double)) != 0) return false;
+        }
+        return true;
+    }
+
     bool CncCircleStartMatches(const MotionCommand& command,
         const std::vector<AxisContext>* contexts) noexcept
     {
@@ -518,7 +546,8 @@ namespace
         const MotionCommand& command,
         const std::vector<AxisContext>* contexts) noexcept
     {
-        if (!IsNCTranslationSnapshotEmpty(command.sourceTranslation) &&
+        if ((!IsNCTranslationSnapshotEmpty(command.sourceTranslation) ||
+                command.sourceToolRadiusMode != 40) &&
             !IsMotionFixedTranslationSourceAllowed(command)) return false;
         // DT records native exact-stop G01 provenance, not new Motion authority.
         // Terminal history copies keep the marker; the runtime tail rule below
@@ -532,10 +561,11 @@ namespace
                 command.pathCoreRetainedTraversal || command.pathCoreRetainedReverse ||
                 command.execution.source != MotionCommandSource::NC_MEMORY || command.ownerLease.owner != MotionOwner::AUTO ||
                 !IsMotionFixedTranslationRotationSourceAllowed(command) || !IsMotionFixedTranslationWorkSourceAllowed(command) ||
-                !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) || command.sourceG16Active || command.sourceG162Active ||
+                !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) ||
+                !IsMotionFixedTranslationPolarSourceAllowed(command) || command.sourceG162Active ||
                 (!command.sourceIsAbsoluteMode && IsNCTranslationSnapshotEmpty(command.sourceTranslation)) ||
                 !IsMotionFixedTranslationSourceAllowed(command) || command.sourcePlaneMode != 17 ||
-                !IsMotionFixedTranslationToolSourceAllowed(command) || command.sourceToolRadiusMode != 40)) return false;
+                !IsMotionFixedTranslationToolSourceAllowed(command) || !IsMotionFixedTranslationCutterSourceAllowed(command))) return false;
 
         if (command.cncFeedLookahead &&
             ((command.mode != InterpolationMode::LINEAR && !command.pathCorePlanarCircle) ||
@@ -546,7 +576,8 @@ namespace
                 command.replayTerminalAlreadyPublished ||
                 command.execution.source != MotionCommandSource::NC_MEMORY || command.ownerLease.owner != MotionOwner::AUTO ||
                 !IsMotionFixedTranslationRotationSourceAllowed(command) || !IsMotionFixedTranslationWorkSourceAllowed(command) ||
-                !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) || command.sourceG16Active || command.sourceG162Active ||
+                !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) ||
+                !IsMotionFixedTranslationPolarSourceAllowed(command) || command.sourceG162Active ||
                 !command.sourceIsAbsoluteMode || !IsMotionFixedTranslationSourceAllowed(command) || command.sourcePlaneMode != 17 ||
                 !IsMotionFixedTranslationToolSourceAllowed(command) || command.sourceToolRadiusMode != 40)) return false;
 
@@ -619,6 +650,31 @@ namespace
             }
         }
 
+        if (command.pathCorePlanarCircle && command.sourceTranslation.cutterMode != 40)
+        {
+            NCPathCoreArcPulseGeometry circle{};
+            if (!ResolveCutterPlanarCircle(command, circle) || contexts->size() < 3U ||
+                command.targetVel < 1.0 || command.accTime <= 0.0 || command.decTime <= 0.0)
+                return false;
+            double ppm = 0.0;
+            for (std::size_t i = 0U; i < 3U; ++i)
+            {
+                const AxisContext& axis = (*contexts)[i];
+                const double scale = axis.resolution_PPR / axis.finalLead;
+                if (!axis.isExist || axis.axisType != AxisType::LINEAR ||
+                    !std::isfinite(scale) || scale <= 0.0 ||
+                    !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+                    !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0) return false;
+                if (i < 2U)
+                {
+                    if ((i != 0U && scale != ppm) || !std::isfinite(axis.maxVel_PPS) ||
+                        command.targetVel > axis.maxVel_PPS ||
+                        command.targetVel / scale > (100.0 / 60.0) *
+                            (1.0 + 16.0 * std::numeric_limits<double>::epsilon())) return false;
+                    ppm = scale;
+                }
+            }
+        }
         std::array<bool, MAX_AXES> seen{};
         for (int slot = 0; slot < command.axisCount; ++slot)
         {
@@ -7604,7 +7660,7 @@ MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
         (emptyTranslation && command.execution.source == MotionCommandSource::NC_MEMORY &&
             (GetActiveTranslationGeneration() != 0ULL || command.sourceToolLengthMode != 49 ||
                 command.sourceG168Active || command.sourceWCode != 0 || command.sourceG68Active ||
-                command.sourceG51Active || command.sourceMirrorMask != 0U)))
+                command.sourceG51Active || command.sourceMirrorMask != 0U || command.sourceG16Active)))
         return MotionRejectReason::NOT_READY;
 
     return MotionRejectReason::NONE;
@@ -12115,13 +12171,23 @@ bool MotionCore::HasCompletedCncLineEndpointProof(const MotionCommand& source,
         source.sourceTranslation.revision > previous.revision ||
         previous.generation - source.sourceTranslation.generation !=
             previous.revision - source.sourceTranslation.revision) return false;
+    // Same-generation proof has no intervening selector that could explain a
+    // changed source. Older generations are reconciled only by the sanctioned
+    // selected-frame fields below; native geometry and EXT remain immutable.
+    if (source.sourceTranslation.generation == previous.generation &&
+        !SameNCTranslationSnapshot(source.sourceTranslation, previous)) return false;
     NCTranslationSnapshot expected = source.sourceTranslation;
-    // Standalone units/distance/WCS/H/G68/WORK/scale/mirror selections preserve the accepted native endpoint.
+    // Standalone units/stroke/distance/WCS/H/G68/WORK/scale/mirror/polar/cutter selections preserve the accepted native endpoint.
     // The old immutable packet still owns its completion marker. Only these
     // selected-frame fields may differ; EXT remains frozen.
     // The original queued packet must be G90; fixed rotation requires canonical XY geometry.
     expected.distanceMode = previous.distanceMode;
     expected.unitsMode = previous.unitsMode;
+    expected.polarMode = previous.polarMode;
+    expected.storedStrokeMode = previous.storedStrokeMode;
+    expected.cutterMode = previous.cutterMode;
+    expected.cutterD = previous.cutterD;
+    expected.cutterRadiusMM = previous.cutterRadiusMM;
     expected.wcsCode = previous.wcsCode;
     std::memcpy(expected.wcsOffsetMM, previous.wcsOffsetMM, sizeof(expected.wcsOffsetMM));
     expected.toolLengthMode = previous.toolLengthMode;
@@ -13675,6 +13741,23 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     {
         m_pCoordMgr->UpdateSoftwareTravelLimitState(
             axis);
+
+        // An active malformed range has no permitted direction. Fence every
+        // axis through the existing Safety mailbox once per alarm incident,
+        // and keep this output zero on every cycle without advancing PID or
+        // rebasing any commanded position. HOME=false retains its bypass.
+        if (m_pCoordMgr->GetInvalidSoftwareTravelLimitMask(axis) != 0U)
+        {
+            if (!AlarmManager::GetInstance().HasAlarm())
+            {
+                AlarmManager::GetInstance().Trigger(
+                    AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG,
+                    0, axis.axisIndex);
+                RequestEmergencyStopAllAxes();
+            }
+            WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+            return;
+        }
     }
 
 
@@ -13691,7 +13774,10 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         {
             if (!AlarmManager::GetInstance().HasAlarm())
             {
-                AlarmManager::GetInstance().Trigger(AlarmManager::OVER_TRAVEL, 0, axis.axisIndex);
+                AlarmManager::GetInstance().Trigger(
+                    m_pCoordMgr->GetSoftwareTravelLimitAlarmCode(
+                        axis, AlarmManager::OVER_TRAVEL),
+                    0, axis.axisIndex);
                 EmergencyStopGroup();
             }
 
@@ -14626,6 +14712,12 @@ bool MotionCore::TryLineMove(
         !pathCoreFeedExactStop && (cncCorner != nullptr || cncPrefixVelocityPPS == 0.0) &&
         axes.size() == 2U && axes[0] == 0 && axes[1] == 1;
     if (!IsPendingCommandTranslationValid(commandSource) ||
+        (commandSource == MotionCommandSource::NC_MEMORY && m_pendingToolRadMode != 40 &&
+            (!pathCoreFeedExactStop || !plannedTailWellFormed ||
+                commandOwnerLease.owner != MotionOwner::AUTO ||
+                mode != BufferMode::ABORTING || commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+                cncFeedLookahead || cncCorner != nullptr || cncPrefixVelocityPPS != 0.0 ||
+                axes.size() != 2U || axes[0] != 0 || axes[1] != 1)) ||
         (commandSource == MotionCommandSource::NC_MEMORY && NCTranslationHasPlanarRotation(m_pendingTranslation) &&
             !fixedRotatedQueuedLine && (commandPathMode != MotionCommandPathMode::EXACT_STOP ||
                 cncFeedLookahead || cncCorner != nullptr)) ||
@@ -16351,6 +16443,8 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         commandPathModeAuthorityDecision !=
         frontPathModeAuthorityDecision ||
         !IsMotionCommandConsumerGeometryValid(cmd, m_pContexts) ||
+        (cmd.pathCorePlanarCircle && cmd.sourceTranslation.cutterMode != 40 &&
+            !CutterCircleStartMatches(cmd, m_pContexts)) ||
         (hasOutgoingCommand &&
             mappingChanged !=
             (!MotionCommandsHaveIdenticalAxisMapping(
@@ -17006,8 +17100,18 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
                 if (m_pCoordMgr != nullptr &&
                     !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(realAxis, resolvedTargetUnits))
                 {
-                    AlarmManager::GetInstance().Trigger(
-                        AlarmManager::PROGRAMMED_OVER_TRAVEL, cmd.sourceLinePC, idx);
+                    const int travelAlarm = m_pCoordMgr->GetSoftwareTravelLimitAlarmCode(
+                        realAxis, AlarmManager::PROGRAMMED_OVER_TRAVEL);
+                    AlarmManager::GetInstance().Trigger(travelAlarm, cmd.sourceLinePC, idx);
+                    if (travelAlarm == AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG)
+                    {
+                        // Release the lifecycle reservation before publishing
+                        // Safety. The following geometry cleanup then retires
+                        // this command by its superseded authority, without a
+                        // second, unrelated mapping-integrity alarm.
+                        lifecycleCommit.Release();
+                        RequestEmergencyStopAllAxes();
+                    }
                     derivedGeometryValid = false;
                     break;
                 }
@@ -17230,6 +17334,8 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
             // retain CncCircleStartMatches bounds before using canonical geometry.
             if (m_Group.pathMode != (cmd.cncFeedLookahead ? PathMode::CONTINUOUS : PathMode::EXACT_STOP) ||
                 m_Group.enableTransform || (cmd.cncFeedLookahead && !cncBoundaryCrossing && !CncCircleStartMatches(cmd, m_pContexts)) ||
+                (cmd.sourceTranslation.cutterMode != 40 &&
+                    (!ResolveCutterPlanarCircle(cmd, circle) || !CutterCircleStartMatches(cmd, m_pContexts))) ||
                 (!(cmd.cncFeedLookahead && cmd.pathCoreFullCircle) &&
                     !ResolveNCPathCorePlanarCirclePulse(sx, sy, ex, ey, cx, cy,
                         cmd.startRadius, cmd.dir, cmd.pathCoreFullCircle, circle)))
@@ -17240,6 +17346,11 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
             if (cmd.cncFeedLookahead)
             {
                 if (!ResolveCncPlanarCircle(cmd, circle)) { FailDerivedConsumerGeometry(); return; }
+                m_Group.startPos[0] = cmd.mem_startPos[0]; m_Group.startPos[1] = cmd.mem_startPos[1];
+            }
+            if (cmd.sourceTranslation.cutterMode != 40)
+            {
+                if (!ResolveCutterPlanarCircle(cmd, circle)) { FailDerivedConsumerGeometry(); return; }
                 m_Group.startPos[0] = cmd.mem_startPos[0]; m_Group.startPos[1] = cmd.mem_startPos[1];
             }
             // Both radii are intentionally identical. A rounding seam in the
@@ -17868,7 +17979,8 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
         seenAxis[static_cast<std::size_t>(axisIndex)] = true;
     }
 
-    if (!IsPendingCommandTranslationValid(commandSource))
+    if (!IsPendingCommandTranslationValid(commandSource) ||
+        (commandSource == MotionCommandSource::NC_MEMORY && m_pendingToolRadMode != 40))
     {
         RejectNonGeometryProducerMotionCommand(invalidCommand, commandEpoch,
             commandSource, commandOwnerLease, MotionRejectReason::NOT_READY);
@@ -24303,6 +24415,11 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
     // EXT and all fields outside that selection remain frozen.
     const bool distanceChanged = previous.distanceMode != next.distanceMode;
     const bool unitsChanged = previous.unitsMode != next.unitsMode;
+    const bool strokeChanged = previous.storedStrokeMode != next.storedStrokeMode;
+    const bool polarChanged = previous.polarMode != next.polarMode;
+    const bool cutterChanged = previous.cutterMode != next.cutterMode ||
+        previous.cutterD != next.cutterD ||
+        std::memcmp(&previous.cutterRadiusMM, &next.cutterRadiusMM, sizeof(double)) != 0;
     const bool workCoordinateChanged = previous.wcsCode != next.wcsCode;
     const bool toolLengthChanged = previous.toolLengthMode != next.toolLengthMode ||
         previous.toolHCode != next.toolHCode;
@@ -24322,7 +24439,14 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
     if (static_cast<unsigned>(distanceChanged) + static_cast<unsigned>(workCoordinateChanged) +
         static_cast<unsigned>(toolLengthChanged) + static_cast<unsigned>(planarRotationChanged) +
         static_cast<unsigned>(workCompensationChanged) + static_cast<unsigned>(unitsChanged) +
-        static_cast<unsigned>(scalingChanged) + static_cast<unsigned>(mirrorChanged) != 1U)
+        static_cast<unsigned>(scalingChanged) + static_cast<unsigned>(mirrorChanged) +
+        static_cast<unsigned>(polarChanged) + static_cast<unsigned>(cutterChanged) +
+        static_cast<unsigned>(strokeChanged) != 1U)
+        return MotionNCTranslationTransitionResult::DEFERRED;
+    // A selected contour owns one immutable frame and one physical radius.
+    // Cancel it before changing its side, D row, radius or coordinate frame.
+    if (previous.cutterMode != 40 &&
+        (!cutterChanged || next.cutterMode != 40))
         return MotionNCTranslationTransitionResult::DEFERRED;
     if (planarRotationChanged)
     {
@@ -24356,6 +24480,14 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
     NCTranslationSnapshot expected = previous;
     if (distanceChanged) expected.distanceMode = next.distanceMode;
     else if (unitsChanged) expected.unitsMode = next.unitsMode;
+    else if (strokeChanged) expected.storedStrokeMode = next.storedStrokeMode;
+    else if (polarChanged) expected.polarMode = next.polarMode;
+    else if (cutterChanged)
+    {
+        expected.cutterMode = next.cutterMode;
+        expected.cutterD = next.cutterD;
+        expected.cutterRadiusMM = next.cutterRadiusMM;
+    }
     else if (workCoordinateChanged)
     {
         expected.wcsCode = next.wcsCode;

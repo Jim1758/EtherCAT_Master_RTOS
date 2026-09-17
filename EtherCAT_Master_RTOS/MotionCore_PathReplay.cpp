@@ -186,7 +186,10 @@ namespace
         std::memset(static_cast<void*>(&command), 0, sizeof(command));
         command.execution.sourceBlockId = MOTION_SOURCE_BLOCK_ID_INVALID;
         command.sourceWCS = 54;
-        command.sourceTranslation.schema = 8U;
+        command.sourceTranslation.schema = 11U;
+        command.sourceTranslation.storedStrokeMode = 23;
+        command.sourceTranslation.cutterMode = 40;
+        command.sourceTranslation.polarMode = 15;
         command.sourceTranslation.scalingMode = 50;
         command.sourceTranslation.scalingFactor = 1.0;
         command.sourceTranslation.distanceMode = 90;

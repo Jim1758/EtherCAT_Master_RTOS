@@ -154,7 +154,7 @@ namespace GCodeHandlers
 
                 if (!intermediateTargetValid)
                 {
-                    AlarmManager::GetInstance().Trigger( AlarmManager::PROGRAMMED_OVER_TRAVEL, 0,  axis.axisIndex);
+                    AlarmManager::GetInstance().Trigger( nc->CoordSys.GetSoftwareTravelLimitAlarmCode(axis, AlarmManager::PROGRAMMED_OVER_TRAVEL), 0,  axis.axisIndex);
 
                     nc->ChangeState( NCState::ALARM);
 
@@ -174,7 +174,7 @@ namespace GCodeHandlers
 
             if (!referenceTargetValid)
             {
-                AlarmManager::GetInstance().Trigger(  AlarmManager::PROGRAMMED_OVER_TRAVEL,  0,axis.axisIndex);
+                AlarmManager::GetInstance().Trigger(  nc->CoordSys.GetSoftwareTravelLimitAlarmCode(axis, AlarmManager::PROGRAMMED_OVER_TRAVEL),  0,axis.axisIndex);
 
                 nc->ChangeState(NCState::ALARM);
 

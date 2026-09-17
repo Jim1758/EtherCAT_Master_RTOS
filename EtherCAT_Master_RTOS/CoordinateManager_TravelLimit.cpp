@@ -24,6 +24,7 @@
 // ============================================================
 
 #include "CoordinateManager.h"
+#include "AlarmManager.h"
 #include "MotionCore.h"
 #include <cmath>
 #include "NCManager.h"
@@ -36,22 +37,7 @@
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 namespace
 {
-    // ========================================================
-    // Travel Limit Range Validation
-    //
-    // 正常行程範圍必須：
-    //
-    // Negative Limit < Positive Limit
-    //
-    // 例如：
-    //
-    // -10.0 ~ +500.0
-    //
-    // Enable=true 但範圍錯誤時，
-    // 目前先視為無效範圍。
-    //
-    // 正式 Parameter Alarm 後續再加入。
-    // ========================================================
+    // Active ranges require finite endpoints and negative < positive.
     bool IsValidTravelLimitRange(
         double negativeLimit,
         double positiveLimit)
@@ -109,77 +95,27 @@ namespace
 // G22 / G23
 // ============================================================
 
-void CoordinateManager::SetStoredStrokeCheckMode( int gCode,NCManager* nc)
+void CoordinateManager::SetStoredStrokeCheckMode(int gCode, NCManager* nc)
 {
-    if ((gCode == 22 || gCode == 23) &&
-        m_programmableTravelLimitEnabled != (gCode == 22) &&
-        !GuardCoordinateMutation("STROKE_MODE", nc)) return;
-    // 目前不使用 NCManager。
-    // 之後若要做 Alarm / System Variable / Log
-    // 可以直接從這個入口擴充。
-    (void)nc;
-
-
-    switch (gCode)
+    if (gCode != 22 && gCode != 23) return;
+    const bool enabled = gCode == 22;
+    const bool changed = m_programmableTravelLimitEnabled != enabled;
+    if (changed && !GuardCoordinateMutation("STROKE_MODE", nc)) return;
+    // The normal dispatcher repeats the exact selector after a drained commit.
+    // A no-op must still prove the complete frozen source was not changed.
+    if (!changed && m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
     {
-    case 22:
-
-        // G22
-        //
-        // Enable Programmable Travel Limit 1
-        m_programmableTravelLimitEnabled = true;
-        nc->MacroSys.SetVar('$', 4, 22.0);
-        break;
-
-
-    case 23:
-
-        // G23
-        //
-        // Disable Programmable Travel Limit 1
-        m_programmableTravelLimitEnabled = false;
-        nc->MacroSys.SetVar('$', 4, 23.0);
-        break;
-
-
-    default:
-
-        // 這個 API 只接受 G22 / G23。
-        //
-        // 不在 CoordinateManager 產生 G-Code Alarm。
-        // Unsupported G-Code 仍由 NCManager / Parser 負責。
-
-
-        break;
+        RejectCoordinateMutation("STROKE_MODE", "SOURCE_CHANGED", nc, true);
+        return;
     }
+    m_programmableTravelLimitEnabled = enabled;
+    if (nc != nullptr) nc->MacroSys.SetVar('$', 4, static_cast<double>(gCode));
 }
 
-
-// ============================================================
-// Direct Runtime State Setter
-//
-// 給未來 Power-On Parameter / Reset 使用。
-// ============================================================
-
-void CoordinateManager::SetProgrammableTravelLimitEnabled(
-    bool enabled, NCManager* nc)
+// Direct power-on/runtime entry obeys the same mutation and optional-NC rules.
+void CoordinateManager::SetProgrammableTravelLimitEnabled(bool enabled, NCManager* nc)
 {
-    if (m_programmableTravelLimitEnabled != enabled &&
-        !GuardCoordinateMutation("STROKE_POLICY", nc)) return;
-    m_programmableTravelLimitEnabled =
-        enabled;
-
-    if (enabled == true)
-    {
-        nc->MacroSys.SetVar('$', 4, 22.0);
-    }
-    else
-    {
-        nc->MacroSys.SetVar('$', 4, 23.0);
-    }
-
-
-
+    SetStoredStrokeCheckMode(enabled ? 22 : 23, nc);
 }
 
 
@@ -193,6 +129,58 @@ bool CoordinateManager::IsProgrammableTravelLimitEnabled() const
         m_programmableTravelLimitEnabled;
 }
 
+
+// Pure configuration validation. Never publish an Alarm from a coordinate query.
+unsigned CoordinateManager::GetInvalidSoftwareTravelLimitMask(
+    const AxisContext& axis, int storedStrokeMode) const
+{
+    if (!axis.isExist || !axis.isHomed) return 0U;
+    const bool strokeEnabled = storedStrokeMode == 0 ?
+        m_programmableTravelLimitEnabled : storedStrokeMode == 22;
+    const bool enabled[3] = { axis.travelLimit1Enable && strokeEnabled,
+        axis.travelLimit2Enable, axis.travelLimit3Enable };
+    const double negative[3] = { axis.travelLimit1Negative_unit,
+        axis.travelLimit2Negative_unit, axis.travelLimit3Negative_unit };
+    const double positive[3] = { axis.travelLimit1Positive_unit,
+        axis.travelLimit2Positive_unit, axis.travelLimit3Positive_unit };
+    unsigned invalidMask = 0U;
+    unsigned validCount = 0U;
+    double intersectionNegative = 0.0;
+    double intersectionPositive = 0.0;
+    for (unsigned group = 0U; group < 3U; ++group)
+    {
+        if (!enabled[group]) continue;
+        if (!IsValidTravelLimitRange(negative[group], positive[group]))
+        {
+            invalidMask |= 1U << group;
+            continue;
+        }
+        if (validCount == 0U)
+        {
+            intersectionNegative = negative[group];
+            intersectionPositive = positive[group];
+        }
+        else
+        {
+            if (negative[group] > intersectionNegative)
+                intersectionNegative = negative[group];
+            if (positive[group] < intersectionPositive)
+                intersectionPositive = positive[group];
+        }
+        ++validCount;
+    }
+    // Inclusive target limits retain a shared single point as valid.
+    if (validCount > 1U && intersectionNegative > intersectionPositive)
+        invalidMask |= 8U;
+    return invalidMask;
+}
+
+int CoordinateManager::GetSoftwareTravelLimitAlarmCode(
+    const AxisContext& axis, int fallbackAlarmCode) const
+{
+    return GetInvalidSoftwareTravelLimitMask(axis) != 0U ?
+        static_cast<int>(AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG) : fallbackAlarmCode;
+}
 
 // ============================================================
 // Update Software Travel Limit Runtime State
@@ -256,6 +244,25 @@ void CoordinateManager::UpdateSoftwareTravelLimitState(
 
     const double currentPosition =
         GetActualMachinePositionUnit(axis);
+
+    const unsigned invalidMask = GetInvalidSoftwareTravelLimitMask(axis);
+    const bool emptyIntersection = (invalidMask & 8U) != 0U;
+    if ((invalidMask & 1U) != 0U ||
+        (emptyIntersection && axis.travelLimit1Enable && m_programmableTravelLimitEnabled))
+    {
+        axis.travelLimit1PositiveActive = true;
+        axis.travelLimit1NegativeActive = true;
+    }
+    if ((invalidMask & 2U) != 0U || (emptyIntersection && axis.travelLimit2Enable))
+    {
+        axis.travelLimit2PositiveActive = true;
+        axis.travelLimit2NegativeActive = true;
+    }
+    if ((invalidMask & 4U) != 0U || (emptyIntersection && axis.travelLimit3Enable))
+    {
+        axis.travelLimit3PositiveActive = true;
+        axis.travelLimit3NegativeActive = true;
+    }
 
 
     // ========================================================
@@ -392,6 +399,8 @@ bool CoordinateManager::IsTargetWithinSoftwareTravelLimit(
         return true;
     }
 
+    if (GetInvalidSoftwareTravelLimitMask(axis) != 0U) return false;
+
 
     // ========================================================
     // 3. Travel Limit 1
@@ -473,6 +482,8 @@ bool CoordinateManager::IsTargetWithinSoftwareTravelLimit(
 bool CoordinateManager::CanMoveSoftwarePositive(
     const AxisContext& axis) const
 {
+    if (GetInvalidSoftwareTravelLimitMask(axis) != 0U) return false;
+
     if (axis.travelLimit1PositiveActive)
     {
         return false;
@@ -504,6 +515,8 @@ bool CoordinateManager::CanMoveSoftwarePositive(
 bool CoordinateManager::CanMoveSoftwareNegative(
     const AxisContext& axis) const
 {
+    if (GetInvalidSoftwareTravelLimitMask(axis) != 0U) return false;
+
     if (axis.travelLimit1NegativeActive)
     {
         return false;

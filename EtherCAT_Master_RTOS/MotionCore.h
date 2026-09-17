@@ -724,13 +724,62 @@ inline bool IsMotionFixedTranslationScaleMirrorSourceAllowed(const MotionCommand
         (!NCTranslationHasScaleMirror(s) || !command.sourceG162Active);
 }
 
+inline bool IsMotionFixedTranslationPolarSourceAllowed(const MotionCommand& command) noexcept
+{
+    // G16 has already become native Cartesian geometry at the NC boundary.
+    // RT checks only immutable provenance; it never interprets radius or angle.
+    const NCTranslationSnapshot& s = command.sourceTranslation;
+    if (IsNCTranslationSnapshotEmpty(s)) return !command.sourceG16Active;
+    if (!IsNCTranslationPolarModeAllowed(command.sourceG16Active, s)) return false;
+    if (!command.sourceG16Active) return true;
+    return command.execution.source == MotionCommandSource::NC_MEMORY &&
+        command.ownerLease.owner == MotionOwner::AUTO &&
+        command.sourceIsAbsoluteMode && s.distanceMode == 90 &&
+        command.sourcePlaneMode == 17 && !command.sourceG162Active &&
+        !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse &&
+        !command.replayTerminalAlreadyPublished && !command.mem_enableTransform &&
+        ((command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+            !command.cncFeedLookahead && !command.cncCornerBlend) ||
+         (command.commandPathMode == MotionCommandPathMode::CONTINUOUS &&
+            command.cncFeedLookahead));
+}
+
+inline bool IsMotionFixedTranslationCutterSourceAllowed(const MotionCommand& command) noexcept
+{
+    const NCTranslationSnapshot& s = command.sourceTranslation;
+    if (IsNCTranslationSnapshotEmpty(s))
+        return command.sourceToolRadiusMode == 40 && command.sourceDCode == 0;
+    if (!IsNCTranslationSnapshotValid(s) || command.sourceToolRadiusMode != s.cutterMode ||
+        command.sourceDCode != s.cutterD) return false;
+    if (s.cutterMode == 40) return true;
+    // The NC contour planner has already offset the native geometry. Only
+    // stopped XY lines or prepared partial circles carry cutter provenance.
+    const bool line = command.mode == InterpolationMode::LINEAR &&
+        command.pathCoreFeedExactStop && !command.pathCorePlanarCircle && !command.pathCoreFullCircle;
+    const bool arc = command.pathCorePlanarCircle && !command.pathCoreFeedExactStop &&
+        !command.pathCoreFullCircle &&
+        ((command.mode == InterpolationMode::CIRCULAR_CW && command.dir == -1) ||
+            (command.mode == InterpolationMode::CIRCULAR_CCW && command.dir == 1));
+    return command.execution.source == MotionCommandSource::NC_MEMORY &&
+        command.ownerLease.owner == MotionOwner::AUTO &&
+        (line || arc) && command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        !command.cncFeedLookahead && !command.cncCornerBlend &&
+        !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse &&
+        !command.replayTerminalAlreadyPublished && !command.mem_enableTransform &&
+        command.sourceIsAbsoluteMode && command.sourcePlaneMode == 17 &&
+        !command.sourceG16Active && !command.sourceG162Active &&
+        command.axisCount == 2 && command.axisIndices[0] == 0 && command.axisIndices[1] == 1;
+}
+
 inline bool IsMotionFixedTranslationSourceAllowed(const MotionCommand& command) noexcept
 {
     if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
         return command.sourceWCS == 54 && IsMotionFixedTranslationToolSourceAllowed(command) &&
             IsMotionFixedTranslationWorkSourceAllowed(command) &&
             IsMotionFixedTranslationRotationSourceAllowed(command) &&
-            IsMotionFixedTranslationScaleMirrorSourceAllowed(command);
+            IsMotionFixedTranslationScaleMirrorSourceAllowed(command) &&
+            IsMotionFixedTranslationPolarSourceAllowed(command) &&
+            IsMotionFixedTranslationCutterSourceAllowed(command);
     // G49 with no WORK leaves the G00 C-offset flag dormant. Active H or
     // WORK requires its frozen identity and G163; no dynamic transform authority.
     return IsNCTranslationSourceAllowed(command.sourceWCS, command.sourceTranslation) &&
@@ -740,9 +789,10 @@ inline bool IsMotionFixedTranslationSourceAllowed(const MotionCommand& command) 
                 !command.cncFeedLookahead && !command.cncCornerBlend &&
                 !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse)) &&
         command.sourcePlaneMode == 17 &&
-        IsMotionFixedTranslationToolSourceAllowed(command) && command.sourceToolRadiusMode == 40 &&
+        IsMotionFixedTranslationToolSourceAllowed(command) && IsMotionFixedTranslationCutterSourceAllowed(command) &&
         IsMotionFixedTranslationRotationSourceAllowed(command) && IsMotionFixedTranslationWorkSourceAllowed(command) &&
-        IsMotionFixedTranslationScaleMirrorSourceAllowed(command) && !command.sourceG16Active && !command.mem_enableTransform &&
+        IsMotionFixedTranslationScaleMirrorSourceAllowed(command) &&
+        IsMotionFixedTranslationPolarSourceAllowed(command) && !command.mem_enableTransform &&
         command.axisCount >= 1 && command.axisCount <= 3;
 }
 
@@ -755,8 +805,8 @@ static_assert(
 
 #if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
 static_assert(
-    sizeof(MotionCommand) == 992U && alignof(MotionCommand) == 8U,
-    "Fixed scale/mirror source proof appends 424 bytes; rebuild every RTSS translation unit.");
+    sizeof(MotionCommand) == 1016U && alignof(MotionCommand) == 8U,
+    "Fixed cutter source proof appends 448 bytes; rebuild every RTSS translation unit.");
 static_assert(offsetof(MotionCommand, sourceTranslation) == 568U,
     "Fixed translation must preserve every pre-existing command offset.");
 static_assert(offsetof(MotionCommand, cncPrefixVelocityPPS) == 560U,
@@ -3627,15 +3677,19 @@ private:
     {
         if (source != MotionCommandSource::NC_MEMORY) return true;
         if (IsNCTranslationSnapshotEmpty(m_pendingTranslation))
-            return m_pendingToolMode == 49 && !m_pendingG168Active && m_pendingWCode == 0 &&
+            return m_pendingToolMode == 49 && m_pendingToolRadMode == 40 && m_pendingDCode == 0 && !m_pendingG168Active && m_pendingWCode == 0 &&
                 !m_pendingG68Active && !m_pendingG51Active && m_pendingMirrorMask == 0U &&
-                GetActiveTranslationGeneration() == 0ULL;
+                !m_pendingG16Active && GetActiveTranslationGeneration() == 0ULL;
         return IsNCTranslationSourceAllowed(m_pendingSourceWCS, m_pendingTranslation) &&
             (m_pendingIsAbsoluteMode ? 90 : 91) == m_pendingTranslation.distanceMode &&
             m_pendingPlaneMode == 17 &&
             IsNCTranslationToolModeAllowed(m_pendingToolMode, m_pendingTranslation) &&
             m_pendingHCode == m_pendingTranslation.toolHCode &&
-            (m_pendingToolMode == 49 || !m_pendingG162Active) && m_pendingToolRadMode == 40 &&
+            (m_pendingToolMode == 49 || !m_pendingG162Active) &&
+            m_pendingToolRadMode == m_pendingTranslation.cutterMode &&
+            m_pendingDCode == m_pendingTranslation.cutterD &&
+            (m_pendingTranslation.cutterMode == 40 ||
+                (m_pendingIsAbsoluteMode && !m_pendingG16Active && !m_pendingG162Active)) &&
             IsNCTranslationRotationModeAllowed(m_pendingG68Active, m_pendingG68Angle,
                 m_pendingPlaneMode, m_pendingTranslation) &&
             (!m_pendingG68Active || !m_pendingG162Active) &&
@@ -3645,15 +3699,16 @@ private:
             std::memcmp(&m_pendingScaleRatio, &m_pendingTranslation.scalingFactor, sizeof(double)) == 0 &&
             static_cast<std::uint32_t>(m_pendingMirrorMask) == m_pendingTranslation.mirrorMask &&
             (!NCTranslationHasScaleMirror(m_pendingTranslation) || !m_pendingG162Active) &&
-            !m_pendingG16Active &&
+            IsNCTranslationPolarModeAllowed(m_pendingG16Active, m_pendingTranslation) &&
+            (!m_pendingG16Active || (m_pendingIsAbsoluteMode && !m_pendingG162Active)) &&
             MatchesNCTranslation(m_pendingTranslation);
     }
     bool IsPendingFixedTranslationSourceAllowed() const noexcept
     {
         return IsNCTranslationSnapshotEmpty(m_pendingTranslation) ?
-            (m_pendingSourceWCS == 54 && m_pendingToolMode == 49 && !m_pendingG168Active && m_pendingWCode == 0 &&
+            (m_pendingSourceWCS == 54 && m_pendingToolMode == 49 && m_pendingToolRadMode == 40 && m_pendingDCode == 0 && !m_pendingG168Active && m_pendingWCode == 0 &&
                 !m_pendingG68Active && !m_pendingG51Active && m_pendingMirrorMask == 0U &&
-                GetActiveTranslationGeneration() == 0ULL) :
+                !m_pendingG16Active && GetActiveTranslationGeneration() == 0ULL) :
             IsPendingCommandTranslationValid(MotionCommandSource::NC_MEMORY);
     }
     int m_pendingSourcePC = 0;
@@ -4013,7 +4068,9 @@ public:
         bool cncFeedLookahead,
         // EF: endpoint-word presence, distinct from the physical XY arc mask.
         std::uint32_t endpointAxisMask = 3U,
-        bool requirePlanarBaselineMatch = false);
+        bool requirePlanarBaselineMatch = false,
+        // NC contour geometry only: fully resolved partial XY cutter circle.
+        bool preparedCutterArc = false);
 
     // BZ: evaluate the original canonical line/circle in either direction.
     bool TryPathCoreRetainedMoveTransactionalTail(

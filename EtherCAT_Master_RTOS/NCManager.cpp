@@ -4096,6 +4096,7 @@ void NCManager::ProcessExecutionEngine()
             static_cast<std::size_t>(currentPC) >= currentProgram->Size())
         {
             if (!PrepareCncFeedDispatchSameThread(nullptr, currentPC)) return; // DD EOF drains receipts first.
+            if (!IsCutterContourEndAllowedSameThread(static_cast<int>(currentProgram->Size()) + 1)) return;
             if (currentIsMacro)
             {
                 // Macro EOF 仍是返回邊界，不是整份 Program End。
@@ -4217,6 +4218,25 @@ void NCManager::ProcessExecutionEngine()
                 sourceLineNumber);
             m_state = NCState::ALARM;
             return;
+        }
+
+        // Cutter lookahead is an immutable literal contour. Reject control-flow,
+        // assignments and optional skips before resolver/macro side effects.
+        if ((CoordSys.toolRadiusMode != 40 || m_cutterLine.leadOutRequired) && !parsedBlock.isEmpty)
+        {
+            NCBlock cutterLiteral{};
+            bool allowed = !parsedBlock.isBlockSkip &&
+                NCPreparedBlockQueueShadow::TryBuildLiteralBlock(parsedBlock, cutterLiteral);
+            if (allowed)
+                allowed = IsFixedTranslationBlockAllowedSameThread(cutterLiteral);
+            if (!allowed)
+            {
+                markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                RtPrintf("[CUTTER][REJECT] reason=LITERAL_CONTOUR_REQUIRED line=%d beforeCommit=1\n", sourceLineNumber);
+                AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter, sourceLineNumber);
+                ChangeState(NCState::ALARM);
+                return;
+            }
         }
 
         // 選擇性跳躍開啟時，整行不求值、不 Commit 任何 Macro Side Effect。
@@ -6211,7 +6231,7 @@ void NCManager::ExecuteBlock(
     }
     // BY-ARC-BEGIN: whole-block guard before any setting/tool/M side effect.
     const bool explicitArc = NCGCodeSemantics::Contains(block, 2) || NCGCodeSemantics::Contains(block, 3);
-    if ((explicitArc && (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21) || m_pathFeed.pending)) ||
+    if ((explicitArc && (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) || m_pathFeed.pending)) ||
         IsPathCoreArcInputOmission(block) ||
         (m_pathArc.pending && (explicitArc || NCGCodeSemantics::Contains(block, 0) || NCGCodeSemantics::Contains(block, 1))))
     {
@@ -6237,7 +6257,7 @@ void NCManager::ExecuteBlock(
     }
     // BY-ARC-END
     // BX-FEED: reject unsupported shape before setting/tool/M-code side effects.
-    if ((NCGCodeSemantics::Contains(block, 1) && !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21)) ||
+    if ((NCGCodeSemantics::Contains(block, 1) && !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive)) ||
         IsPathCoreFeedInputOmission(block))
     {
         if (!m_pathFeed.pending)

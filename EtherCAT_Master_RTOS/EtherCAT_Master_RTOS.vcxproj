@@ -153,6 +153,8 @@
     <ClInclude Include="NCGCodeSemantics.h" />
     <ClInclude Include="NCLifecycleInterruptionBoundary.h" />
     <ClInclude Include="NCManager.h" />
+    <ClInclude Include="NCPathCoreCutterContour.h" />
+    <ClInclude Include="NCPathCoreCutterLine.h" />
     <ClInclude Include="NCOrdinaryG00BufferedExactStopAdmissionShadow.h" />
     <ClInclude Include="NCOrdinaryG00FeedHoldCohortCutoverGate.h" />
     <ClInclude Include="NCOrdinaryG00FeedHoldCohortRearmCutoverGate.h" />
@@ -312,6 +314,7 @@
     <ClCompile Include="NCLifecycleInterruptionBoundary.cpp" />
     <ClCompile Include="NCManager.cpp" />
     <ClCompile Include="NCManager_Gap.cpp" />
+    <ClCompile Include="NCManager_Cutter.cpp" />
     <ClCompile Include="NCManager_PathArc.cpp" />
     <ClCompile Include="NCManager_PathCore.cpp" />
     <ClCompile Include="NCManager_PathFeed.cpp" />

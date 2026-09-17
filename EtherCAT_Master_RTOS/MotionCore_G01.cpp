@@ -275,18 +275,27 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     const MotionOwnerLease plannedOwner = GetMotionOwnerLease();
     const MotionCommandSource source =
         m_pendingCommandSource.load(std::memory_order_acquire);
-    const bool rotatedEndpoint = NCTranslationHasPlanarRotation(m_pendingTranslation);
-    const bool rotatedQueuedLine = rotatedEndpoint && cncFeedLookahead;
+    // G16 sparse radius/angle depends on the same accepted XY predecessor as
+    // rotated Cartesian endpoints, even when G68 and WORK yaw are both zero.
+    const bool cutterActive = m_pendingTranslation.cutterMode != 40;
+    const bool coupledPlanarEndpoint = NCTranslationHasPlanarRotation(m_pendingTranslation) ||
+        m_pendingTranslation.polarMode == 16;
+    const bool coupledPlanarQueuedLine = coupledPlanarEndpoint && cncFeedLookahead;
     if (!IsPendingFixedTranslationSourceAllowed() ||
+        (cutterActive && (cncFeedLookahead || predecessor != nullptr ||
+            cornerNextMCS != nullptr || cornerToleranceMM != 0.0 ||
+            cornerTravelGuard != nullptr || cornerNextFeedMMMin != 0.0 ||
+            axes.size() != 2U || axes[0] != 0 || axes[1] != 1 ||
+            endpointAxisMask != 3U || !requirePlanarBaselineMatch)) ||
         (m_pendingTranslation.distanceMode == 91 &&
             (cncFeedLookahead || cornerNextMCS != nullptr)) ||
-        (rotatedEndpoint && cornerNextMCS != nullptr && !cncFeedLookahead) ||
-        (rotatedQueuedLine && (m_pendingTranslation.distanceMode != 90 ||
+        (coupledPlanarEndpoint && cornerNextMCS != nullptr && !cncFeedLookahead) ||
+        (coupledPlanarQueuedLine && (m_pendingTranslation.distanceMode != 90 ||
             axes.size() != 2U || axes[0] != 0 || axes[1] != 1 || endpointAxisMask != 0U)) ||
         m_pContexts == nullptr || m_pContexts->size() > 8U ||
         axes.empty() || axes.size() > 3U ||
         axes.size() != targetMCS.size() ||
-        (endpointAxisMask != 0U &&
+        (endpointAxisMask != 0U && !cutterActive &&
             ((endpointAxisMask != 1U && endpointAxisMask != 2U) || !cncFeedLookahead ||
                 axes.size() != 2U || axes[0] != 0 || axes[1] != 1 ||
                 cornerNextMCS != nullptr || cornerToleranceMM != 0.0 ||
@@ -338,14 +347,14 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
 
     const bool incrementalEndpoint = m_pendingTranslation.distanceMode == 91;
     const std::uint32_t requiredBaselineMask =
-        ((requirePlanarBaselineMatch || rotatedQueuedLine) ? 3U : 0U) |
+        ((requirePlanarBaselineMatch || coupledPlanarQueuedLine) ? 3U : 0U) |
         (incrementalEndpoint ? workspace.input.axisMask : 0U);
-    // A first rotated plain/Q line uses the same sampled native basis as geometry.
+    // A first coupled XY plain/Q line proves the sampled native basis used by geometry.
     // A buffered line already proved its immutable accepted predecessor above;
     // live axes can still be inside an earlier segment and must not replace it.
     if (((requirePlanarBaselineMatch || incrementalEndpoint) &&
-            !rotatedQueuedLine && (buffered || cncFeedLookahead)) ||
-        ((requirePlanarBaselineMatch || rotatedQueuedLine || incrementalEndpoint) && !buffered &&
+            !coupledPlanarQueuedLine && (buffered || cncFeedLookahead)) ||
+        ((requirePlanarBaselineMatch || coupledPlanarQueuedLine || incrementalEndpoint) && !buffered &&
             !IsPlanarEndpointBasisCurrent(commandedMCSTail,
                 workspace.input.startPulse, result.validAxisMask, requiredBaselineMask)))
     {
@@ -392,6 +401,7 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
             if (!cornerTravelGuard->check(cornerTravelGuard->context, int(i), result.blendGeometry.boundsMinMCS[i]) ||
                 !cornerTravelGuard->check(cornerTravelGuard->context, int(i), result.blendGeometry.boundsMaxMCS[i]))
             {
+                result.travelLimitRejected = true;
                 result.code = MotionFeedLineCode::GEOMETRY_REJECTED; return false;
             }
             workspace.targetPulse[i] = result.blendGeometry.endPulse[i];

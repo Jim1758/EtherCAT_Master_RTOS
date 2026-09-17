@@ -4,6 +4,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include "GlobalConfig.h"
 #include "EtherCatMaster.h"
@@ -96,14 +97,17 @@ bool CoordinateManager::IsScaleMirrorActive() const noexcept
 bool CoordinateManager::IsTranslationModeSupported() const noexcept
 {
     if (activePlane != 17 ||
-        toolRadiusMode != 40 ||
-        isPolarCoordinateActive || currentWCSIndex < 0 ||
+        !IsToolRadiusSelectionSupported(toolRadiusMode, currentDCode) ||
+        (toolRadiusMode != 40 && (!isAbsoluteMode || isPolarCoordinateActive ||
+            isCAxisOffsetRotationEnabled)) ||
+        currentWCSIndex < 0 ||
         currentWCSIndex > 5 ||
         static_cast<std::size_t>(currentWCSIndex) >= m_WCSTable.size()) return false;
     if (isG68Active && (isCAxisOffsetRotationEnabled || !std::isfinite(g68Angle) ||
         std::fabs(g68Angle) > 360.0 || !std::isfinite(g68CenterWCS[0]) ||
         !std::isfinite(g68CenterWCS[1]) || g68CenterWCS[2] != 0.0 ||
         std::signbit(g68CenterWCS[2]))) return false;
+    if (isPolarCoordinateActive && (!isAbsoluteMode || isCAxisOffsetRotationEnabled)) return false;
     if (IsScaleMirrorActive() && isCAxisOffsetRotationEnabled) return false;
     if (isScalingActive && (!std::isfinite(scaleFactor) || scaleFactor <= 0.0)) return false;
     for (unsigned axis = 0U; axis < 8U; ++axis)
@@ -145,6 +149,11 @@ NCTranslationSnapshot CoordinateManager::BuildCurrentCoordinateSnapshot() const 
     result.wcsCode = currentWCSIndex + 54;
     result.distanceMode = isAbsoluteMode ? 90 : 91;
     result.unitsMode = isInchMode ? 20 : 21;
+    result.polarMode = isPolarCoordinateActive ? 16 : 15;
+    result.storedStrokeMode = m_programmableTravelLimitEnabled ? 22 : 23;
+    result.cutterMode = toolRadiusMode;
+    result.cutterD = currentDCode;
+    result.cutterRadiusMM = GetActiveToolRadius();
     result.toolLengthMode = toolLengthMode;
     result.toolHCode = currentHCode;
     result.workMode = isWorkpieceRotationActive ? 168 : 169;
@@ -210,6 +219,7 @@ bool CoordinateManager::FreezeTranslationRun() noexcept
 bool CoordinateManager::PrepareDistanceModeTransition(int mode,
     NCTranslationSnapshot& candidate) const noexcept
 {
+    if (toolRadiusMode != 40) return false;
     if (!m_translationFrozen || m_translationResetBypass ||
         (mode != 90 && mode != 91) || mode == m_frozenTranslation.distanceMode ||
         !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
@@ -241,9 +251,45 @@ bool CoordinateManager::CommitDistanceModeTransition(
     return true;
 }
 
+bool CoordinateManager::PrepareStoredStrokeTransition(int mode,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    if (toolRadiusMode != 40) return false;
+    if (!m_translationFrozen || m_translationResetBypass ||
+        (mode != 22 && mode != 23) || mode == m_frozenTranslation.storedStrokeMode ||
+        !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
+        m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.storedStrokeMode = mode;
+    next.generation = m_translationGenerationCounter + 1ULL;
+    next.revision = m_translationRevision + 1ULL;
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitStoredStrokeTransition(
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    NCTranslationSnapshot expected{};
+    if (!PrepareStoredStrokeTransition(candidate.storedStrokeMode, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    // Motion has already reserved/published the same source transaction.
+    // The travel policy changes without resampling native geometry or tables.
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    m_programmableTravelLimitEnabled = candidate.storedStrokeMode == 22;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
 bool CoordinateManager::PrepareUnitModeTransition(int mode,
     NCTranslationSnapshot& candidate) const noexcept
 {
+    if (toolRadiusMode != 40) return false;
     if (!m_translationFrozen || m_translationResetBypass ||
         (mode != 20 && mode != 21) || mode == m_frozenTranslation.unitsMode ||
         !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
@@ -272,6 +318,110 @@ bool CoordinateManager::CommitUnitModeTransition(
     m_translationRevision = candidate.revision;
     isInchMode = candidate.unitsMode == 20;
     m_frozenTranslation = candidate;
+    return true;
+}
+
+bool CoordinateManager::PreparePolarTransition(int code,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    if (toolRadiusMode != 40) return false;
+    if ((code != 15 && code != 16) || !m_translationFrozen ||
+        m_translationResetBypass || !IsTranslationRunCurrent() ||
+        m_translationGeneration != m_translationGenerationCounter ||
+        (code == 16 && (!isAbsoluteMode || activePlane != 17 ||
+            isCAxisOffsetRotationEnabled))) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    if (next.polarMode != code)
+    {
+        if (m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+            m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+        next.polarMode = code;
+        next.generation = m_translationGenerationCounter + 1ULL;
+        next.revision = m_translationRevision + 1ULL;
+    }
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitPolarTransition(const NCTranslationSnapshot& candidate) noexcept
+{
+    NCTranslationSnapshot expected{};
+    if (!PreparePolarTransition(candidate.polarMode, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    if (SameNCTranslationSnapshot(candidate, m_frozenTranslation)) return true;
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    isPolarCoordinateActive = candidate.polarMode == 16;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
+bool CoordinateManager::IsToolRadiusSelectionSupported(int mode, int dCode) const noexcept
+{
+    if (mode == 40) return dCode == 0;
+    if ((mode != 41 && mode != 42) || dCode < 1 || dCode > 100 ||
+        static_cast<std::size_t>(dCode) > m_ToolRadius.size()) return false;
+    const std::vector<double>& row = m_ToolRadius[dCode - 1];
+    return row.size() == 8U && std::isfinite(row[3]) && row[3] > 0.0;
+}
+
+bool CoordinateManager::PrepareToolRadiusSelectionTransition(int mode, int dCode,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass || !IsTranslationRunCurrent() ||
+        m_translationGeneration != m_translationGenerationCounter ||
+        !IsToolRadiusSelectionSupported(mode, dCode) ||
+        (mode != 40 && (!isAbsoluteMode || activePlane != 17 ||
+            isPolarCoordinateActive || isCAxisOffsetRotationEnabled))) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.cutterMode = mode;
+    next.cutterD = dCode;
+    next.cutterRadiusMM = mode == 40 ? 0.0 : m_ToolRadius[dCode - 1][3];
+    if (!SameNCTranslationSnapshot(next, m_frozenTranslation))
+    {
+        // An active contour must be led out through G40 before a new D/side.
+        if ((m_frozenTranslation.cutterMode != 40 && mode != 40) ||
+            m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+            m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+        next.generation = m_translationGenerationCounter + 1ULL;
+        next.revision = m_translationRevision + 1ULL;
+    }
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitToolRadiusSelectionTransition(
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    NCTranslationSnapshot expected{};
+    if (!PrepareToolRadiusSelectionTransition(candidate.cutterMode, candidate.cutterD, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    if (SameNCTranslationSnapshot(candidate, m_frozenTranslation)) return true;
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    toolRadiusMode = candidate.cutterMode;
+    currentDCode = candidate.cutterD;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
+bool CoordinateManager::SetToolRadiusValue(int dCode, double radiusMM, NCManager* nc)
+{
+    if (dCode < 1 || dCode > 100 || static_cast<std::size_t>(dCode) > m_ToolRadius.size() ||
+        m_ToolRadius[dCode - 1].size() != 8U || !std::isfinite(radiusMM) || radiusMM < 0.0)
+        return RejectCoordinateMutation("TOOL_RADIUS_WRITE", "VALUE_OR_ROW", nc, true);
+    if (toolRadiusMode != 40 || currentDCode != 0)
+        return RejectCoordinateMutation("TOOL_RADIUS_WRITE", "REQUIRES_G40", nc, true);
+    if (!GuardCoordinateMutation("TOOL_RADIUS_WRITE", nc)) return false;
+    // The historic fourth table field is a scalar radius, never the C-axis value.
+    // Program setup is intentionally RAM-only; disk settings remain operator owned.
+    m_ToolRadius[dCode - 1][3] = radiusMM == 0.0 ? 0.0 : radiusMM;
     return true;
 }
 
@@ -321,6 +471,7 @@ bool CoordinateManager::BuildScaleMirrorSelection(int code, const double* values
 bool CoordinateManager::PrepareScaleMirrorTransition(int code, const double* values,
     const bool* hasAxis, double factor, NCTranslationSnapshot& candidate) const noexcept
 {
+    if (toolRadiusMode != 40) return false;
     if (!m_translationFrozen || m_translationResetBypass || !IsTranslationRunCurrent() ||
         m_translationGeneration != m_translationGenerationCounter) return false;
     NCTranslationSnapshot next{};
@@ -396,6 +547,7 @@ bool CoordinateManager::CommitScaleMirrorTransition(const NCTranslationSnapshot&
 bool CoordinateManager::PrepareWorkCoordinateTransition(int wcsCode,
     NCTranslationSnapshot& candidate) const noexcept
 {
+    if (toolRadiusMode != 40) return false;
     if (!m_translationFrozen || m_translationResetBypass ||
         wcsCode < 54 || wcsCode > 59 || wcsCode == m_frozenTranslation.wcsCode ||
         !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
@@ -435,6 +587,7 @@ bool CoordinateManager::CommitWorkCoordinateTransition(
 bool CoordinateManager::PrepareToolLengthTransition(int normalizedMode,
     int normalizedH, NCTranslationSnapshot& candidate) const noexcept
 {
+    if (toolRadiusMode != 40) return false;
     if (!m_translationFrozen || m_translationResetBypass ||
         !IsToolLengthSelectionSupported(normalizedMode, normalizedH) ||
         (normalizedMode != 49 && isCAxisOffsetRotationEnabled) ||
@@ -479,6 +632,7 @@ bool CoordinateManager::CommitToolLengthTransition(
 bool CoordinateManager::PreparePlanarRotationTransition(int mode, double centerX,
     double centerY, double angle, NCTranslationSnapshot& candidate) const noexcept
 {
+    if (toolRadiusMode != 40) return false;
     if (!m_translationFrozen || m_translationResetBypass ||
         (mode != 68 && mode != 69) || !std::isfinite(centerX) ||
         !std::isfinite(centerY) || !std::isfinite(angle) || std::fabs(angle) > 360.0 ||
@@ -529,6 +683,7 @@ bool CoordinateManager::PrepareWorkpieceTransition(int mode, int wCode,
     bool hasCenter, double centerX, double centerY,
     NCTranslationSnapshot& candidate) const noexcept
 {
+    if (toolRadiusMode != 40) return false;
     if (!m_translationFrozen || m_translationResetBypass ||
         !IsWorkpieceSelectionSupported(mode, wCode) ||
         !std::isfinite(centerX) || !std::isfinite(centerY) ||
@@ -763,7 +918,7 @@ bool CoordinateManager::TryDecodeWorkTableWrite(const NCBlock& block,
 bool CoordinateManager::ApplyCoordinateOrigin(int axis, double desiredWCS,
     NCManager* nc, bool reportAlarm)
 {
-    if (IsFixedPlanarRotationActive() || IsScaleMirrorActive())
+    if (IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive)
         return RejectCoordinateMutation("ORIGIN_WRITE", "ROTATION_ACTIVE", nc, reportAlarm);
     if (axis < 0 || axis >= 8 || currentWCSIndex < 0 ||
         static_cast<std::size_t>(currentWCSIndex) >= m_WCSTable.size() ||
@@ -799,6 +954,8 @@ bool CoordinateManager::ApplyCoordinateOrigin(int axis, double desiredWCS,
 
 bool CoordinateManager::SetCAxisOffsetRotationEnabled(bool enabled, NCManager* nc)
 {
+    if (enabled && isPolarCoordinateActive && !m_translationResetBypass)
+        return RejectCoordinateMutation("G162", "POLAR_ACTIVE", nc, true);
     if (isCAxisOffsetRotationEnabled == enabled) return true;
     if (!GuardCoordinateMutation("G162_G163", nc)) return false;
     isCAxisOffsetRotationEnabled = enabled;
@@ -860,6 +1017,21 @@ bool CoordinateManager::CompleteFixedPlanarEndpoint(
     double* targetWCS, bool* hasAxis) noexcept
 {
     if (!targetWCS || !hasAxis) return false;
+    if ((m_translationFrozen && m_frozenTranslation.polarMode == 16) ||
+        (!m_translationFrozen && isPolarCoordinateActive))
+    {
+        if (m_translationFrozen && !IsTranslationRunCurrent()) return false;
+        if (!m_translationFrozen && !IsTranslationModeSupported()) return false;
+        NCTranslationSnapshot source = m_translationFrozen ?
+            m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        if (!m_translationFrozen)
+        {
+            source.runToken = 1ULL;
+            source.generation = 1ULL;
+            source.revision = 1ULL;
+        }
+        return TryCompleteNCTranslationPolarEndpoint(source, commandedMCS, targetWCS, hasAxis);
+    }
     if (!m_translationFrozen) return true;
     if (m_frozenTranslation.distanceMode == 91)
     {
@@ -892,7 +1064,16 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
     double* outputMCS,
     bool commitCommandedMCS)
 {
-    if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive()) && IsTranslationModeSupported()))
+    // Polar motion is owned by the audited NC preview/admission path only.
+    // Legacy direct-transform callers must not treat raw radius/angle as XY.
+    if (commitCommandedMCS && (isPolarCoordinateActive ||
+        (m_translationFrozen && m_frozenTranslation.polarMode == 16)))
+    {
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            outputMCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+        return;
+    }
+    if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive) && IsTranslationModeSupported()))
     {
         const NCTranslationSnapshot source = m_translationFrozen ?
             m_frozenTranslation : BuildCurrentCoordinateSnapshot();
@@ -946,25 +1127,14 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
     double finalTargetWCS[8];
     for (int i = 0; i < 8; i++) finalTargetWCS[i] = targetWCS[i];
 
-    // ==========================================================
-    // 🌟 數學過濾器 0：G16 極座標 (Polar Coordinate)
-    // 將操作員腦中的 (半徑, 角度) 轉換為標準 (X, Y) 直角座標
-    // ==========================================================
-    if (isPolarCoordinateActive && isAbsoluteMode)
+    // Polar endpoints are decoded once by CompleteFixedPlanarEndpoint.
+    // Never fall back to the old unchecked polar conversion in an unsupported frame.
+    if (isPolarCoordinateActive)
     {
-        int ax1 = 0, ax2 = 1; // 預設對應 G17 (XY 平面)
-        if (activePlane == 18) { ax1 = 0; ax2 = 2; } // 若是 G18 (XZ 平面)
-        if (activePlane == 19) { ax1 = 1; ax2 = 2; } // 若是 G19 (YZ 平面)
-
-        // 取出操作員下達的「半徑」與「角度」
-        double radius = finalTargetWCS[ax1];
-        double angleRad = finalTargetWCS[ax2] * (3.14159265359 / 180.0);
-
-        // 利用三角函數，將半徑與角度，換算回正常的 WCS 座標
-        finalTargetWCS[ax1] = radius * std::cos(angleRad);
-        finalTargetWCS[ax2] = radius * std::sin(angleRad);
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            outputMCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+        return;
     }
-
 
     // ==========================================================
       // 🌟 數學過濾器 1：G51 縮放 (Scaling)
@@ -1223,7 +1393,7 @@ void CoordinateManager::UpdateActualMCS(const double* newMCS) {
 
 // 🌟 1. 核心公式：算回最簡單的 絕對座標 = 機械座標 - EXT - 表格偏移
 void CoordinateManager::GetActualWCS(double* outWCS) const {
-    if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive()) && IsTranslationModeSupported()))
+    if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive) && IsTranslationModeSupported()))
     {
         const NCTranslationSnapshot source = m_translationFrozen ?
             m_frozenTranslation : BuildCurrentCoordinateSnapshot();
@@ -1326,7 +1496,7 @@ void CoordinateManager::GetActualWCS(double* outWCS) const {
 
 // 🌟 1.5 核心公式：算回最簡單的 絕對座標 = 虛擬命令機械座標 - EXT - 表格偏移
 void CoordinateManager::GetCommandedWCS(double* outWCS) const {
-    if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive()) && IsTranslationModeSupported()))
+    if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive) && IsTranslationModeSupported()))
     {
         const NCTranslationSnapshot source = m_translationFrozen ?
             m_frozenTranslation : BuildCurrentCoordinateSnapshot();
@@ -1429,7 +1599,7 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
 }
 // 🌟 2. 實作 ApplyG92 (直接覆寫當前表格！)
 void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targetPos, NCManager* nc) {
-    if (IsFixedPlanarRotationActive() || IsScaleMirrorActive())
+    if (IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive)
     {
         RejectCoordinateMutation("G92", "ROTATION_ACTIVE", nc, true);
         return;
@@ -1504,6 +1674,8 @@ void  CoordinateManager::Set_G90G91(int value, NCManager* nc)//設定90絕對模
     }
     if (value == 91)
     {
+        if (isPolarCoordinateActive && !m_translationResetBypass)
+        { RejectCoordinateMutation("G91", "POLAR_ACTIVE", nc, true); return; }
         if (isAbsoluteMode && !GuardCoordinateMutation("G91", nc)) return;
         isAbsoluteMode = false;
         nc->MacroSys.SetVar('$', 3, 91);
@@ -1790,6 +1962,8 @@ double CoordinateManager::GetActiveWorkOffset(int axisIndex) const
 void CoordinateManager::SetActivePlane(int gCode, NCManager* nc)
 {
     if (gCode == 17 || gCode == 18 || gCode == 19) {
+        if (isPolarCoordinateActive && gCode != 17 && !m_translationResetBypass)
+        { RejectCoordinateMutation("PLANE", "POLAR_ACTIVE", nc, true); return; }
         if (activePlane != gCode && !GuardCoordinateMutation("PLANE", nc)) return;
         activePlane = gCode;
 
@@ -1975,65 +2149,79 @@ void CoordinateManager::CancelMirror(const bool* hasAxis, NCManager* nc)
 // ==========================================================
 // 🌟 G16 啟動極座標 / G15 關閉極座標
 // ==========================================================
-void CoordinateManager::SetPolarCoordinate(NCManager* nc) {
-    if (!isPolarCoordinateActive && !GuardCoordinateMutation("G16", nc)) return;
+void CoordinateManager::SetPolarCoordinate(NCManager* nc)
+{
+    if (!IsTranslationRunBound() || !isAbsoluteMode || activePlane != 17 ||
+        isCAxisOffsetRotationEnabled || !IsTranslationModeSupported())
+    { RejectCoordinateMutation("G16", "G17_G90_G163_SCOPE", nc, true); return; }
+    if (isPolarCoordinateActive)
+    {
+        if (m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
+        { RejectCoordinateMutation("G16", "SOURCE_CHANGED", nc, true); return; }
+    }
+    else if (!GuardCoordinateMutation("G16", nc)) return;
     isPolarCoordinateActive = true;
-    if (nc) nc->MacroSys.SetVar('$', 17, 16.0); // 更新群組 17
-    RtPrintf("[G16] Polar Coordinate System ON.\n");
+    if (nc) nc->MacroSys.SetVar('$', 17, 16.0);
+    RtPrintf("[G16] Polar endpoint notation ON (XY, G90).\n");
 }
 
-void CoordinateManager::CancelPolarCoordinate(NCManager* nc) {
+void CoordinateManager::CancelPolarCoordinate(NCManager* nc)
+{
     if (isPolarCoordinateActive && !GuardCoordinateMutation("G15", nc)) return;
+    if (m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
+    { RejectCoordinateMutation("G15", "SOURCE_CHANGED", nc, true); return; }
     isPolarCoordinateActive = false;
     if (nc) nc->MacroSys.SetVar('$', 17, 15.0);
-    RtPrintf("[G15] Polar Coordinate System OFF.\n");
+    RtPrintf("[G15] Polar endpoint notation OFF.\n");
 }
 
 
 // 🌟 啟動 G41 / G42
 void CoordinateManager::SetToolRadiusCompensation(int gCode, int dCode, NCManager* nc)
 {
-    if (gCode == 41 || gCode == 42) {
-        if (dCode > 0 && dCode <= m_ToolOffset.size()) {
-            if ((toolRadiusMode != gCode || currentDCode != dCode) &&
-                !GuardCoordinateMutation("TOOL_RADIUS", nc)) return;
-            toolRadiusMode = gCode;
-            currentDCode = dCode;
-            if (nc) nc->MacroSys.SetVar('$', 7, (double)gCode);
-            RtPrintf("[G%d] Tool Radius Comp ON. D-Code: %d\n", gCode, dCode);
-        }
-        else {
-            RtPrintf(">>> [ALARM] G%d D%d is out of range!\n", gCode, dCode);
-        }
-    }
+    if (!IsTranslationRunBound() || !IsToolRadiusSelectionSupported(gCode, dCode) ||
+        (gCode != 41 && gCode != 42) || !isAbsoluteMode || activePlane != 17 ||
+        isPolarCoordinateActive || isCAxisOffsetRotationEnabled)
+    { RejectCoordinateMutation("TOOL_RADIUS", "G17_G90_G15_G163_D_RADIUS", nc, true); return; }
+    const bool changed = toolRadiusMode != gCode || currentDCode != dCode;
+    if (changed && toolRadiusMode != 40)
+    { RejectCoordinateMutation("TOOL_RADIUS", "REQUIRES_G40", nc, true); return; }
+    if (changed && !GuardCoordinateMutation("TOOL_RADIUS", nc)) return;
+    if (!changed && m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
+    { RejectCoordinateMutation("TOOL_RADIUS", "SOURCE_CHANGED", nc, true); return; }
+    toolRadiusMode = gCode;
+    currentDCode = dCode;
+    if (nc) nc->MacroSys.SetVar('$', 7, static_cast<double>(gCode));
+    // Keep RT diagnostics on the existing integer-only bit-pattern protocol.
+    // The target RtPrintf did not consume %.9f as a floating-point argument.
+    const double radiusMM = GetActiveToolRadius();
+    std::uint64_t radiusMMBits = 0ULL;
+    std::memcpy(&radiusMMBits, &radiusMM, sizeof(radiusMMBits));
+    RtPrintf("[G%d] Tool Radius Comp ON. D-Code: %d radiusMMBits=%llu\n",
+        gCode, dCode, static_cast<unsigned long long>(radiusMMBits));
 }
 
-// 🌟 取消 G40
 void CoordinateManager::CancelToolRadiusCompensation(NCManager* nc)
 {
-    if ((toolRadiusMode != 40 || currentDCode != 0) &&
-        !GuardCoordinateMutation("G40", nc)) return;
+    const bool changed = toolRadiusMode != 40 || currentDCode != 0;
+    if (changed && !GuardCoordinateMutation("G40", nc)) return;
+    if (!changed && m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
+    { RejectCoordinateMutation("G40", "SOURCE_CHANGED", nc, true); return; }
     toolRadiusMode = 40;
-    currentDCode = 0; // 通常 D 碼保留，只改狀態
+    currentDCode = 0;
     if (nc) nc->MacroSys.SetVar('$', 7, 40.0);
     RtPrintf("[G40] Tool Radius Comp OFF.\n");
 }
 
-// 🌟 取得當前刀具的「半徑」值
 double CoordinateManager::GetActiveToolRadius() const
 {
-    if (toolRadiusMode == 40 || currentDCode <= 0 || currentDCode > m_ToolOffset.size()) {
-        return 0.0;
-    }
-
-    int arrayIndex = currentDCode - 1;
-
-    // ⚠️ 這裡要依照你們的刀具表定義！
-    // 假設 X=0, Y=1, Z=2。 半徑可能存在 index 3 (第四個欄位)
-    const int RADIUS_INDEX = 3;
-
-    return  m_ToolRadius[arrayIndex][RADIUS_INDEX];
+    if ((toolRadiusMode != 41 && toolRadiusMode != 42) || currentDCode < 1 ||
+        currentDCode > 100 || static_cast<std::size_t>(currentDCode) > m_ToolRadius.size()) return 0.0;
+    const std::vector<double>& row = m_ToolRadius[currentDCode - 1];
+    if (row.size() != 8U || !std::isfinite(row[3]) || row[3] < 0.0) return 0.0;
+    return row[3] == 0.0 ? 0.0 : row[3];
 }
+
 bool CoordinateManager::GetRefPoint(int pCode, double* outPos) const {
     int index = pCode - 1; // P1 對應 index 0
     if (index < 0 || index >= m_RefPoints.size()) return false;

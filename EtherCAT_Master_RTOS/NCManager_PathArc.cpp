@@ -1,6 +1,7 @@
 // BY / Path Core V2-02. Explicit G17 XY arcs use a distinct exact-stop producer.
 #include "NCManager.h"
 #include "AlarmManager.h"
+#include "NCPathCoreRadiusArc.h"
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -51,26 +52,32 @@ namespace
 }
 
 NC_PATH_ARC_NOINLINE
-bool NCManager::IsPathCoreArcBlockShapeValid(const NCBlock& block, bool allowMissingFeed, int unitsMode) noexcept
+bool NCManager::IsPathCoreArcBlockShapeValid(const NCBlock& block, bool allowMissingFeed, int unitsMode, bool polar) noexcept
 {
     if (unitsMode != 20 && unitsMode != 21) return false;
+    const bool radiusFormat = block.has('R');
     const double feedMMMin = block.has('F') ? NCTranslationLengthToMM(block.val('F'), unitsMode) : 0.0;
     if (block.isEmpty || block.isGoto || !block.hasG ||
         (block.gCode != 2 && block.gCode != 3) || block.gCount != 1 ||
         block.gCodes[0] != block.gCode || block.mCount != 0 ||
-        (!block.has('I') && !block.has('J')) ||
+        (!radiusFormat && !block.has('I') && !block.has('J')) ||
         (!block.has('F') && !allowMissingFeed) ||
         (block.has('F') && (!std::isfinite(feedMMMin) ||
             feedMMMin <= 0.0 || feedMMMin > 100.0))) return false;
+    // Radius and centre formats are mutually exclusive. This first R scope
+    // is Cartesian exact-stop only; a full circle requires explicit I/J.
+    if (radiusFormat && (polar || block.has('I') || block.has('J') || block.has('P') ||
+        (!block.has('X') && !block.has('Y')) || block.val('R') == 0.0)) return false;
     for (int i = 0; i < 26; ++i)
     {
         if (!block.hasParam[i]) continue;
         const char address = static_cast<char>('A' + i);
-        if (address != 'N' && address != 'F' && address != 'X' && address != 'Y' && address != 'I' && address != 'J' && address != 'P') return false;
+        if (address != 'N' && address != 'F' && address != 'X' && address != 'Y' && address != 'I' && address != 'J' && address != 'P' && address != 'R') return false;
         if (!std::isfinite(block.val(address))) return false;
-        if ((address == 'X' || address == 'Y' || address == 'I' || address == 'J') &&
+        if ((address == 'X' || (!polar && address == 'Y') || address == 'I' || address == 'J' || address == 'R') &&
             !std::isfinite(NCTranslationLengthToMM(block.val(address), unitsMode))) return false;
     }
+    if (polar && block.has('X') && block.val('X') < 0.0) return false;
     // P1 is this controller's explicit queued planar-transition request;
     // EF: either endpoint word may be omitted; only both omitted is a full circle.
     // P remains a queued transition request, not a turn count.
@@ -81,8 +88,12 @@ bool NCManager::IsPathCoreArcBlockShapeValid(const NCBlock& block, bool allowMis
 NC_PATH_ARC_NOINLINE
 bool NCManager::IsPathCoreArcInputOmission(const NCBlock& block) const noexcept
 {
-    return m_pathArc.armed && m_pathArc.explicitArc && !block.hasG && block.gCount == 0 &&
-        (block.has('X') || block.has('Y') || block.has('Z') || block.has('F') || block.has('I') || block.has('J'));
+    if (!m_pathArc.armed || block.hasG || block.gCount != 0) return false;
+    // Bare R has no modal owner, including at a fresh START or after a line.
+    // The dispatcher calls this before any M/tool side effect. Explicit G10,
+    // G68 and other settings continue to own their own R parameter.
+    return block.has('R') || (m_pathArc.explicitArc &&
+        (block.has('X') || block.has('Y') || block.has('Z') || block.has('F') || block.has('I') || block.has('J')));
 }
 
 NC_PATH_ARC_NOINLINE
@@ -92,12 +103,14 @@ bool NCManager::IsPathCoreArcConfigurationValid() noexcept
     if (!IsNCTranslationDistanceModeAllowed(CoordSys.isAbsoluteMode, translation) ||
         !IsNCTranslationUnitModeAllowed(CoordSys.isInchMode, translation) || !IsNCTranslationSourceAllowed(CoordSys.GetCurrentWCSGCode(), translation) ||
         CoordSys.activePlane != 17 || !IsNCTranslationToolModeAllowed(CoordSys.toolLengthMode, translation) ||
-        CoordSys.currentHCode != translation.toolHCode || CoordSys.toolRadiusMode != 40 ||
+        CoordSys.currentHCode != translation.toolHCode || CoordSys.toolRadiusMode != translation.cutterMode ||
+        (translation.cutterMode != 40 && (CoordSys.currentDCode != translation.cutterD ||
+            ArcDoubleBits(CoordSys.GetActiveToolRadius()) != ArcDoubleBits(translation.cutterRadiusMM))) ||
         !IsNCTranslationRotationModeAllowed(CoordSys.isG68Active, CoordSys.g68Angle,
             CoordSys.activePlane, translation) ||
         !IsNCTranslationWorkModeAllowed(CoordSys.isWorkpieceRotationActive, CoordSys.currentWCode, translation) ||
         !IsNCTranslationScaleMirrorModeAllowed(CoordSys.isScalingActive, CoordSys.isMirrorActive, translation) ||
-        CoordSys.isPolarCoordinateActive || CoordSys.isCAxisOffsetRotationEnabled ||
+        !IsNCTranslationPolarModeAllowed(CoordSys.isPolarCoordinateActive, translation) || CoordSys.isCAxisOffsetRotationEnabled ||
         m_axisNames[0] != 'X' || m_axisNames[1] != 'Y' || m_axisNames[2] != 'Z' ||
         !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
     return true;
@@ -119,6 +132,7 @@ void NCManager::ArmPathCoreArcSameThread() noexcept
 NC_PATH_ARC_NOINLINE
 void NCManager::InvalidatePathCoreArcSameThread(bool byGoto) noexcept
 {
+    m_cutterLine = CutterLineState{};
     ClearCncModalFeedSameThread();
     const bool wasPending = m_pathArc.pending;
     m_pathArc.armed = false;
@@ -178,6 +192,7 @@ void NCManager::BeginPathCoreArcCaptureSameThread(const NCBlock& block,
     m_pathFeed.explicitFeed = false;
     ClosePathCoreCommittedRunSameThread();
     m_pathArcMotion.receipt.Clear();
+    m_cutterLine.staged = false;
     m_pathArc.dispatch = dispatchId;
     m_pathArc.commit = 0ULL;
     m_pathArc.capturedFeed = CncFeedValueSnapshot{};
@@ -193,6 +208,7 @@ void NCManager::BeginPathCoreArcCaptureSameThread(const NCBlock& block,
 NC_PATH_ARC_NOINLINE
 void NCManager::RejectPathCoreArcSameThread(std::uint32_t code, int alarmCode)
 {
+    m_cutterLine = CutterLineState{};
     if (alarmCode == AlarmManager::G_Code_Invalid_parameter)
     {
         if (code == 3U || code == 4U) alarmCode = AlarmManager::PATH_EXECUTION_NOT_READY;
@@ -230,7 +246,27 @@ void NCManager::RejectPathCoreArcSameThread(std::uint32_t code, int alarmCode)
 NC_PATH_ARC_NOINLINE
 WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
 {
-    if (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21))
+    if (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive))
+    {
+        RejectPathCoreArcSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return nullptr;
+    }
+    // A bad active policy is a configuration error, not an out-of-range point.
+    // HOME-before-limits and G23/Limit1 semantics are owned by CoordinateManager.
+    for (int axisIndex = 0; axisIndex < 3; ++axisIndex)
+    {
+        const unsigned invalidMask = CoordSys.GetInvalidSoftwareTravelLimitMask(m_motion.GetAxisContext(axisIndex));
+        if (invalidMask != 0U)
+        {
+            RtPrintf("[TRAVEL-CONFIG][REJECT] unit=ARC axis=%d invalidMask=%u beforeSubmit=1\n", axisIndex, invalidMask);
+            RejectPathCoreArcSameThread(7U, AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG);
+            return nullptr;
+        }
+    }
+    const bool radiusFormat = block.has('R');
+    const bool cutter = CoordSys.toolRadiusMode != 40;
+    if ((cutter && !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21)) ||
+        m_cutterLine.leadOutRequired)
     {
         RejectPathCoreArcSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
@@ -280,7 +316,7 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     const NCTranslationSnapshot arcSource = CoordSys.GetTranslationSnapshot();
     const bool mirroredXY = ((arcSource.mirrorMask & 1U) != 0U) !=
         ((arcSource.mirrorMask & 2U) != 0U);
-    const int direction = (block.gCode == 2 ? -1 : 1) * (mirroredXY ? -1 : 1);
+    int direction = (block.gCode == 2 ? -1 : 1) * (mirroredXY ? -1 : 1);
     m_pathArcProgrammed.fill(false);
     m_pathArcWCS.fill(0.0);
     m_pathArcCandidate.fill(0.0);
@@ -312,12 +348,14 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
             return nullptr;
         }
         m_pathArcProgrammed[i] = block.has(m_axisNames[i]);
-        if (m_pathArcProgrammed[i]) m_pathArcWCS[i] =
-            NCTranslationLengthToMM(block.val(m_axisNames[i]), CoordSys.isInchMode ? 20 : 21);
+        if (m_pathArcProgrammed[i]) m_pathArcWCS[i] = CoordSys.isPolarCoordinateActive && i == 1U ?
+            block.val(m_axisNames[i]) : NCTranslationLengthToMM(block.val(m_axisNames[i]), CoordSys.isInchMode ? 20 : 21);
     }
-    const bool requirePlanarBaselineMatch = CoordSys.IsTranslationRunFrozen() &&
-        NCTranslationHasPlanarRotation(CoordSys.GetTranslationSnapshot()) &&
-        (m_pathArcProgrammed[0] != m_pathArcProgrammed[1]);
+    const bool sparsePlanarBaselineMatch = cutter || (CoordSys.IsTranslationRunFrozen() &&
+        (NCTranslationHasPlanarRotation(CoordSys.GetTranslationSnapshot()) || CoordSys.isPolarCoordinateActive) &&
+        (m_pathArcProgrammed[0] != m_pathArcProgrammed[1]));
+    // R centre resolution depends on the accepted start even for full XY G90.
+    const bool requirePlanarBaselineMatch = radiusFormat || sparsePlanarBaselineMatch;
     if (!CoordSys.CompleteFixedPlanarEndpoint(m_pathArcWCS.data(), m_pathArcProgrammed.data()))
     {
         RejectPathCoreArcSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
@@ -325,7 +363,7 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     }
     const std::uint32_t endpointAxisMask = (m_pathArcProgrammed[0] ? 1U : 0U) |
         (m_pathArcProgrammed[1] ? 2U : 0U);
-    if (requirePlanarBaselineMatch)
+    if (sparsePlanarBaselineMatch)
         RtPrintf("[ROTATION][SPARSE_XY] g=%d rawXYMask=%u effectiveXYMask=3 beforeSubmit=1\n",
             block.gCode, sourceEndpointAxisMask);
     if (!CoordSys.isAbsoluteMode)
@@ -335,11 +373,34 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     // Full-circle classification uses original presence, never the effective
     // rotated endpoint mask. I/J above remain vectors in program space.
     CoordSys.Preview_WCS_to_MCS(m_pathArcWCS.data(), m_pathArcProgrammed.data(), m_pathArcCandidate.data());
+    if (cutter && !BuildCutterContourSameThread(block, m_pathArc.sourcePC, m_pathArc.run,
+        m_pathArc.cache, m_pathArc.dispatch, m_pathArcCandidate, m_pathArcCenterOffset, direction))
+    {
+        RejectPathCoreArcSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
+        return nullptr;
+    }
     for (std::size_t i = 0U; i < 8U; ++i)
     {
         if (!std::isfinite(m_pathArcCandidate[i]))
         {
             RejectPathCoreArcSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
+            return nullptr;
+        }
+    }
+    // Cutter construction already resolved the nominal R circle and produced
+    // its physical centre/endpoint. Do not solve R again from that offset path.
+    if (radiusFormat && !cutter)
+    {
+        // The endpoint is already native. R receives units and positive uniform
+        // scaling once; the direction above already accounts for XY reflection.
+        // The resulting centre offset must not pass through the affine map again.
+        const double signedRadiusMM = NCTranslationLengthToMM(block.val('R'), arcSource.unitsMode) *
+            (arcSource.scalingMode == 51 ? arcSource.scalingFactor : 1.0);
+        if (!TryResolveNCPathRadiusArcCenter(CoordSys.commandedMCS[0], CoordSys.commandedMCS[1],
+            m_pathArcCandidate[0], m_pathArcCandidate[1], signedRadiusMM, direction,
+            m_pathArcCenterOffset[0], m_pathArcCenterOffset[1]))
+        {
+            RejectPathCoreArcSameThread(5U, AlarmManager::PATH_GEOMETRY_INVALID);
             return nullptr;
         }
     }
@@ -354,7 +415,7 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     const bool accepted = m_motion.TryG02G03MoveTransactionalCncTail(m_pathArcCandidate,
         m_pathArcCenterOffset, direction, fullCircle, effectiveFeed, travelGuard,
         CoordSys.commandedMCS, m_pathArcMotion, m_pathArcCommand,
-        buffered ? &m_cncFeed.tail : nullptr, queued, endpointAxisMask, requirePlanarBaselineMatch);
+        buffered ? &m_cncFeed.tail : nullptr, queued, endpointAxisMask, requirePlanarBaselineMatch, cutter);
     if (!accepted)
     {
         RejectPathCoreArcSameThread(6U, m_pathArcMotion.receipt.commandAccepted ?
@@ -404,6 +465,7 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
         RejectPathCoreArcSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         return nullptr;
     }
+    if (cutter) LogCutterContourSameThread(m_pathArc.run, m_pathArc.dispatch, m_pathArc.sourcePC);
     ++m_pathArc.submitted;
     m_pathArc.pending = true;
     m_pathArc.explicitArc = true;
@@ -450,6 +512,13 @@ void NCManager::CommitPathCoreArcCaptureSameThread(NCBlockDispatchId dispatchId,
         r.identity.sourceBlockId != static_cast<MotionSourceBlockId>(sourcePC) ||
         r.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
         !r.ownerLease.Matches(m_programMotionLease))
+    {
+        RejectPathCoreArcSameThread(9U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        return;
+    }
+    if (CoordSys.toolRadiusMode != 40 &&
+        !CommitCutterContourSameThread(m_pathArc.run, m_pathArc.cache, dispatchId,
+            commit.sequence, r.translationGeneration, sourcePC, r.arc.endMCS))
     {
         RejectPathCoreArcSameThread(9U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         return;
@@ -541,7 +610,8 @@ bool NCManager::CompletePathCoreArcSameThread()
     if (!m_pathArc.bound || !m_pathArc.completed || m_motion.HasPendingSafetyOrRecoveryRequests() ||
         !m_motion.IsGroupDone()) return false;
     if (m_gapWindow.active && m_gapWindow.normalSource && !m_gapWindow.normalProven) return false;
-    RetainPathCoreArcSameThread(); // BZ: only after the real completion gate.
+    if (CoordSys.toolRadiusMode == 40)
+        RetainPathCoreArcSameThread(); // Cutter retained replay is a later stage.
     m_pathArc.pending = false;
     ++m_pathArc.done;
     LogPathCoreArcSameThread("COMPLETED");

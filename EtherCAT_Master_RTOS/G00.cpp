@@ -31,6 +31,15 @@ namespace GCodeHandlers
     // ==========================================================
     WaitConditionFunc Handle_G00(const NCBlock& block, NCManager* nc)
     {
+        // Never let an unsupported legacy/MDI route consume radius/angle words.
+        // A modal-only rapid is still a no-motion setting before first freeze.
+        if (nc->CoordSys.isPolarCoordinateActive &&
+            (nc->GetMode() != NCOperationMode::MEMORY || !nc->CoordSys.IsTranslationRunBound()))
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::ALARM);
+            return [](NCManager*) { return true; };
+        }
         nc->MacroSys.SetVar('$', 1, 0);//設定群組1變數
 
 
@@ -90,6 +99,12 @@ namespace GCodeHandlers
         if (!hasAnyAxis) {
             return [](NCManager*) { return true; }; // 瞬間通過，不浪費時間
         }
+        if (nc->CoordSys.isPolarCoordinateActive && !nc->CoordSys.IsTranslationRunFrozen())
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::ALARM);
+            return [](NCManager*) { return true; };
+        }
 
         // =========================================================
              // 🌟 【神級修復】：在轉換 "前"，強迫綁定 XYZ，並補齊未下達的 WCS 座標！
@@ -103,35 +118,19 @@ namespace GCodeHandlers
         // 🌟 條件加入 isG16Active
         const bool fixedPlanarRotation = nc->CoordSys.IsTranslationRunFrozen() &&
             NCTranslationHasPlanarRotation(nc->CoordSys.GetTranslationSnapshot());
-        const bool requirePlanarBaselineMatch = fixedPlanarRotation &&
+        const bool requirePlanarBaselineMatch = (fixedPlanarRotation || isG16Active) &&
             (axisProgrammed[0] != axisProgrammed[1]);
         const unsigned rawXYMask = (axisProgrammed[0] ? 1U : 0U) |
             (axisProgrammed[1] ? 2U : 0U);
         // Fixed rotation completes only sparse XY. Z-only native XY stays untouched.
-        if (!fixedPlanarRotation && !(nc->CoordSys.IsTranslationRunFrozen() && !nc->CoordSys.isAbsoluteMode) &&
-            (isG168Active || isG68Active || isG16Active) && moveXYZ)
+        if (!isG16Active && !fixedPlanarRotation && !(nc->CoordSys.IsTranslationRunFrozen() && !nc->CoordSys.isAbsoluteMode) &&
+            (isG168Active || isG68Active) && moveXYZ)
         {
             double currentWCS[8] = { 0.0 };
             // =========================================================
              // 🌟 終極修復：絕對不能吃 Actual！改吃 Commanded 理論座標！
              // =========================================================
             nc->CoordSys.GetCommandedWCS(currentWCS);
-
-            // =========================================================
-            // 🌟 針對 G16 的極座標逆運算：把 (X, Y) 轉回 (半徑, 角度)
-            // =========================================================
-            if (isG16Active) {
-                int p1 = 0, p2 = 1; // 預設 G17 (XY 平面)
-                if (nc->CoordSys.activePlane == 18) { p1 = 0; p2 = 2; }
-                if (nc->CoordSys.activePlane == 19) { p1 = 1; p2 = 2; }
-
-                // 利用目前所在位置，逆推算回現在的 半徑(r) 與 角度(a)
-                double r = std::sqrt(currentWCS[p1] * currentWCS[p1] + currentWCS[p2] * currentWCS[p2]);
-                double a = std::atan2(currentWCS[p2], currentWCS[p1]) * (180.0 / 3.14159265359);
-
-                currentWCS[p1] = r; // 將補齊用的座標替換成 半徑
-                currentWCS[p2] = a; // 將補齊用的座標替換成 角度
-            }
 
             for (int i = 0; i < 3; i++) {
                 if (!axisProgrammed[i]) {
@@ -206,7 +205,7 @@ namespace GCodeHandlers
 
             if (!targetWithinSoftwareLimit)
             {
-                AlarmManager::GetInstance().Trigger(AlarmManager::PROGRAMMED_OVER_TRAVEL, 0, axis.axisIndex);
+                AlarmManager::GetInstance().Trigger(nc->CoordSys.GetSoftwareTravelLimitAlarmCode(axis, AlarmManager::PROGRAMMED_OVER_TRAVEL), 0, axis.axisIndex);
 
                 nc->ChangeState(NCState::ALARM);
 

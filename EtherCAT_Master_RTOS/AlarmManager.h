@@ -115,7 +115,8 @@ public:
         // Stage NC-0.1C：固定容量 Motion Command Transport
         MOTION_COMMAND_QUEUE_FULL = AXIS_BASE + 19, // 3019: NC -> Motion SPSC Ingress 已滿
         MOTION_REPLAY_QUEUE_FULL = AXIS_BASE + 20,  // 3020: B2 RT Replay 固定緩衝區已滿
-        MOTION_GROUP_MAPPING_INTEGRITY = AXIS_BASE + 21 // 3021: 插補映射／孤兒軸完整性失敗
+        MOTION_GROUP_MAPPING_INTEGRITY = AXIS_BASE + 21, // 3021: 插補映射／孤兒軸完整性失敗
+        SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG = AXIS_BASE + 22 // 3022:軟體行程限位配置無效 / Active software travel-limit configuration invalid
 
     };
 

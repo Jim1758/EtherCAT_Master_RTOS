@@ -40,6 +40,7 @@ struct MotionFeedLineReceipt
     bool tailCommitted = false;
     bool captureBound = false;
     bool valid = false;
+    bool travelLimitRejected = false;
 
     void Clear() noexcept
     {
@@ -55,6 +56,7 @@ struct MotionFeedLineReceipt
         tailCommitted = false;
         captureBound = false;
         valid = false;
+        travelLimitRejected = false;
     }
 };
 

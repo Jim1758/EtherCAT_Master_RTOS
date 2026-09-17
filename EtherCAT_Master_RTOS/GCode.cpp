@@ -8,6 +8,29 @@
 
 namespace GCodeHandlers
 {
+    namespace
+    {
+        bool DecodeCutterSelector(const NCBlock& block, NCManager* nc,
+            int selected, int& mode, int& dCode)
+        {
+            const int count = block.gCount > 0 ? block.gCount : (block.hasG ? 1 : 0);
+            bool valid = nc != nullptr && count == 1 && block.mCount == 0 &&
+                !block.isGoto && !block.isBlockSkip &&
+                TryDecodeNCToolRadiusSelection(selected, block.has('D'), block.val('D'), mode, dCode);
+            for (char word = 'A'; valid && word <= 'Z'; ++word)
+                if (block.has(word) && ((word != 'N' && word != 'G' && word != 'D') ||
+                    !std::isfinite(block.val(word)))) valid = false;
+            return valid && nc->CoordSys.IsToolRadiusSelectionSupported(mode, dCode);
+        }
+
+        void RejectCutterParameter(NCManager* nc, const char* reason)
+        {
+            RtPrintf("[CUTTER][REJECT] reason=%s beforeCommit=1\n", reason);
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            if (nc != nullptr) nc->ChangeState(NCState::HOLD);
+        }
+    }
+
     WaitConditionFunc Handle_G12(const NCBlock& block, NCManager* nc)
     {
         // 程式能進到這裡，代表 isBarrier 已經成功攔截，
@@ -199,6 +222,31 @@ namespace GCodeHandlers
         // ==========================================================
     WaitConditionFunc Handle_G10(const NCBlock& block, NCManager* nc)
     {
+        if (block.has('L'))
+        {
+            const int count = block.gCount > 0 ? block.gCount : (block.hasG ? 1 : 0);
+            bool valid = count == 1 && block.gCode == 10 && block.mCount == 0 &&
+                !block.isGoto && !block.isBlockSkip && block.val('L') == 12.0 &&
+                block.has('P') && block.has('R') && nc->CoordSys.toolRadiusMode == 40 &&
+                !nc->CoordSys.IsTranslationRunFrozen();
+            for (char word = 'A'; valid && word <= 'Z'; ++word)
+                if (block.has(word) && ((word != 'N' && word != 'G' && word != 'L' &&
+                    word != 'P' && word != 'R') || !std::isfinite(block.val(word)))) valid = false;
+            const double row = block.val('P');
+            const double radiusMM = nc->CoordSys.ToInternalUnit(block.val('R'), false);
+            valid = valid && std::isfinite(row) && row >= 1.0 && row <= 100.0 &&
+                row <= static_cast<double>(nc->CoordSys.m_ToolRadius.size()) && std::floor(row) == row &&
+                std::isfinite(radiusMM) && radiusMM >= 0.0;
+            if (!valid)
+            {
+                RejectCutterParameter(nc, "TABLE_SYNTAX");
+                return [](NCManager*) { return true; };
+            }
+            const int dCode = static_cast<int>(row);
+            if (nc->CoordSys.SetToolRadiusValue(dCode, radiusMM, nc))
+                RtPrintf("[CUTTER][TABLE] D=%d storage=RAM_ONLY\n", dCode);
+            return [](NCManager*) { return true; };
+        }
         // 防呆：必須指定 P (刀號)
         if (!block.has('P')) {
             RtPrintf(">>> [ALARM] G10 missing 'P' (Tool Index) parameter!\n");
@@ -469,37 +517,57 @@ namespace GCodeHandlers
         return [](NCManager*) { return true; };
     }
 
-    WaitConditionFunc Handle_G16(const NCBlock& block, NCManager* nc) {
+    bool ValidatePolarSelectionBlock(const NCBlock& block, int code)
+    {
+        if ((code != 15 && code != 16) || block.gCount != 1 ||
+            block.gCodes[0] != code || block.mCount != 0) return false;
+        for (char letter = 'A'; letter <= 'Z'; ++letter)
+            if (block.has(letter) && ((letter != 'G' && letter != 'N') ||
+                !std::isfinite(block.val(letter)))) return false;
+        return true;
+    }
+
+    WaitConditionFunc Handle_G16(const NCBlock& block, NCManager* nc)
+    {
+        if (!ValidatePolarSelectionBlock(block, 16))
+        {
+            RtPrintf("[POLAR][REJECT] g=16 reason=STANDALONE_SYNTAX beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return true; };
+        }
         nc->CoordSys.SetPolarCoordinate(nc);
         return [](NCManager*) { return true; };
     }
-    WaitConditionFunc Handle_G15(const NCBlock& block, NCManager* nc) {
+    WaitConditionFunc Handle_G15(const NCBlock& block, NCManager* nc)
+    {
+        if (!ValidatePolarSelectionBlock(block, 15))
+        {
+            RtPrintf("[POLAR][REJECT] g=15 reason=STANDALONE_SYNTAX beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return true; };
+        }
         nc->CoordSys.CancelPolarCoordinate(nc);
         return [](NCManager*) { return true; };
     }
 
     // ==========================================================
-    // 🌟 G41 左刀補 / G42 右刀補
-    // 格式範例：G41 D1 X10. Y10.
+    // G41 / G42 select a physical radius row. Entry is the following G01 XY.
     // ==========================================================
     WaitConditionFunc Handle_G41(const NCBlock& block, NCManager* nc) {
-        if (block.has('D')) {
-            nc->CoordSys.SetToolRadiusCompensation(41, (int)block.val('D'), nc);
-        }
-        else {
-            // 如果沒寫 D，通常繼承上一次的 D 碼
-            nc->CoordSys.SetToolRadiusCompensation(41, nc->CoordSys.currentDCode, nc);
-        }
+        int mode = 40, dCode = 0;
+        if (!DecodeCutterSelector(block, nc, 41, mode, dCode))
+            RejectCutterParameter(nc, "D_SELECTION");
+        else nc->CoordSys.SetToolRadiusCompensation(mode, dCode, nc);
         return [](NCManager*) { return true; };
     }
 
     WaitConditionFunc Handle_G42(const NCBlock& block, NCManager* nc) {
-        if (block.has('D')) {
-            nc->CoordSys.SetToolRadiusCompensation(42, (int)block.val('D'), nc);
-        }
-        else {
-            nc->CoordSys.SetToolRadiusCompensation(42, nc->CoordSys.currentDCode, nc);
-        }
+        int mode = 40, dCode = 0;
+        if (!DecodeCutterSelector(block, nc, 42, mode, dCode))
+            RejectCutterParameter(nc, "D_SELECTION");
+        else nc->CoordSys.SetToolRadiusCompensation(mode, dCode, nc);
         return [](NCManager*) { return true; };
     }
 
@@ -507,7 +575,10 @@ namespace GCodeHandlers
     // 🌟 G40 取消刀補
     // ==========================================================
     WaitConditionFunc Handle_G40(const NCBlock& block, NCManager* nc) {
-        nc->CoordSys.CancelToolRadiusCompensation(nc);
+        int mode = 40, dCode = 0;
+        if (!TryDecodeNCToolRadiusSelection(40, block.has('D'), block.val('D'), mode, dCode))
+            RejectCutterParameter(nc, "CANCEL_SELECTION");
+        else nc->CoordSys.CancelToolRadiusCompensation(nc);
         return [](NCManager*) { return true; };
     }
 

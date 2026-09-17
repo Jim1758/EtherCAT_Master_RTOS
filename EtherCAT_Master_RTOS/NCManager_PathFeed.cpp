@@ -378,7 +378,7 @@ void NCManager::CommitCncModalFeedSameThread(const CncFeedValueSnapshot& snapsho
 }
 
 NC_PATH_FEED_NOINLINE
-bool NCManager::IsPathCoreFeedBlockShapeValid(const NCBlock& block, bool allowMissingFeed, int unitsMode) noexcept
+bool NCManager::IsPathCoreFeedBlockShapeValid(const NCBlock& block, bool allowMissingFeed, int unitsMode, bool polar) noexcept
 {
     if (unitsMode != 20 && unitsMode != 21) return false;
     const double feedMMMin = block.has('F') ? NCTranslationLengthToMM(block.val('F'), unitsMode) : 0.0;
@@ -395,9 +395,10 @@ bool NCManager::IsPathCoreFeedBlockShapeValid(const NCBlock& block, bool allowMi
         const char address = static_cast<char>('A' + i);
         if (address != 'N' && address != 'F' && address != 'X' && address != 'Y' && address != 'Z' && address != 'Q') return false;
         if (!std::isfinite(block.val(address))) return false;
-        if ((address == 'X' || address == 'Y' || address == 'Z') &&
+        if ((address == 'X' || (!polar && address == 'Y') || address == 'Z') &&
             !std::isfinite(NCTranslationLengthToMM(block.val(address), unitsMode))) return false;
     }
+    if (polar && block.has('X') && block.val('X') < 0.0) return false;
     if (block.has('Q') && (!block.has('X') || !block.has('Y') || block.has('Z') ||
         !std::isfinite(toleranceMM) || toleranceMM < 0.0001 || toleranceMM > 1.0)) return false;
     return true;
@@ -411,18 +412,31 @@ bool NCManager::IsPathCoreFeedInputOmission(const NCBlock& block) const noexcept
 }
 
 NC_PATH_FEED_NOINLINE
+bool NCManager::IsCutterContourEndAllowedSameThread(int sourceLine)
+{
+    if (CoordSys.toolRadiusMode == 40 && !m_cutterLine.leadOutRequired) return true;
+    RtPrintf("[CUTTER][REJECT] reason=INCOMPLETE_CONTOUR_EOF line=%d beforeCommit=1\n", sourceLine);
+    AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter, sourceLine);
+    ChangeState(NCState::ALARM);
+    return false;
+}
+
+NC_PATH_FEED_NOINLINE
 bool NCManager::IsPathCoreFeedConfigurationValid() noexcept
 {
     const NCTranslationSnapshot translation = CoordSys.GetTranslationSnapshot();
     if (!IsNCTranslationDistanceModeAllowed(CoordSys.isAbsoluteMode, translation) ||
         !IsNCTranslationUnitModeAllowed(CoordSys.isInchMode, translation) || !IsNCTranslationSourceAllowed(CoordSys.GetCurrentWCSGCode(), translation) ||
         CoordSys.activePlane != 17 || !IsNCTranslationToolModeAllowed(CoordSys.toolLengthMode, translation) ||
-        CoordSys.currentHCode != translation.toolHCode || CoordSys.toolRadiusMode != 40 ||
+        CoordSys.currentHCode != translation.toolHCode ||
+        CoordSys.toolRadiusMode != translation.cutterMode ||
+        (translation.cutterMode != 40 && (CoordSys.currentDCode != translation.cutterD ||
+            FeedDoubleBits(CoordSys.GetActiveToolRadius()) != FeedDoubleBits(translation.cutterRadiusMM))) ||
         !IsNCTranslationRotationModeAllowed(CoordSys.isG68Active, CoordSys.g68Angle,
             CoordSys.activePlane, translation) ||
         !IsNCTranslationWorkModeAllowed(CoordSys.isWorkpieceRotationActive, CoordSys.currentWCode, translation) ||
         !IsNCTranslationScaleMirrorModeAllowed(CoordSys.isScalingActive, CoordSys.isMirrorActive, translation) ||
-        CoordSys.isPolarCoordinateActive || CoordSys.isCAxisOffsetRotationEnabled ||
+        !IsNCTranslationPolarModeAllowed(CoordSys.isPolarCoordinateActive, translation) || CoordSys.isCAxisOffsetRotationEnabled ||
         m_axisNames[0] != 'X' || m_axisNames[1] != 'Y' || m_axisNames[2] != 'Z' ||
         !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
     return true;
@@ -434,6 +448,7 @@ void NCManager::ArmPathCoreFeedSameThread() noexcept
     ClearCncModalFeedSameThread();
     m_cncFeed.Clear();
     m_pathFeed = PathFeedState{};
+    m_cutterLine = CutterLineState{};
     m_pathFeedMotion.receipt.Clear();
     m_pathFeed.run = m_pathCoreLiveBookkeeping.currentRunToken;
     m_pathFeed.cache = GetBaseProgramCache().GetGeneration();
@@ -445,6 +460,7 @@ void NCManager::ArmPathCoreFeedSameThread() noexcept
 NC_PATH_FEED_NOINLINE
 void NCManager::InvalidatePathCoreFeedSameThread(bool byGoto) noexcept
 {
+    m_cutterLine = CutterLineState{};
     ClearCncModalFeedSameThread();
     InvalidateCncFeedSameThread();
     const bool wasPending = m_pathFeed.pending;
@@ -496,6 +512,13 @@ NC_PATH_FEED_NOINLINE
 void NCManager::BeginPathCoreFeedCaptureSameThread(const NCBlock& block,
     NCBlockDispatchId dispatchId) noexcept
 {
+    if (NCGCodeSemantics::Contains(block, 40) && m_cutterLine.valid)
+    {
+        // G40 changes the descriptor without moving the centre. A separate
+        // exact-stop full-XY G01 must remove the remaining physical offset.
+        m_cutterLine.leadOutRequired = true;
+        m_cutterLine.valid = false;
+    }
     if (NCGCodeSemantics::Contains(block, 0)) m_pathFeed.explicitFeed = false;
     if (!NCGCodeSemantics::Contains(block, 1)) return;
     // End the old G00-only data service explicitly, without faulting its store
@@ -503,6 +526,7 @@ void NCManager::BeginPathCoreFeedCaptureSameThread(const NCBlock& block,
     ClosePathCoreCommittedRunSameThread();
     if (m_pathFeed.pending) return; // Start rejects; never overwrite a live receipt.
     m_pathFeedMotion.receipt.Clear();
+    m_cutterLine.staged = false;
     m_pathFeed.dispatch = dispatchId;
     m_pathFeed.commit = 0ULL;
     m_pathFeed.capturedFeed = CncFeedValueSnapshot{};
@@ -518,13 +542,16 @@ void NCManager::BeginPathCoreFeedCaptureSameThread(const NCBlock& block,
 NC_PATH_FEED_NOINLINE
 void NCManager::RejectPathCoreFeedSameThread(std::uint32_t code, int alarmCode)
 {
+    m_cutterLine = CutterLineState{};
     if (alarmCode == AlarmManager::G_Code_Invalid_parameter)
     {
         if (code == 3U || code == 4U) alarmCode = AlarmManager::PATH_EXECUTION_NOT_READY;
         else if (code == 5U) alarmCode = AlarmManager::PATH_GEOMETRY_INVALID;
         else if (code == 6U)
         {
-            if (m_pathFeedMotion.receipt.code == MotionFeedLineCode::NOT_READY)
+            if (m_pathFeedMotion.receipt.travelLimitRejected)
+                alarmCode = AlarmManager::PROGRAMMED_OVER_TRAVEL;
+            else if (m_pathFeedMotion.receipt.code == MotionFeedLineCode::NOT_READY)
                 alarmCode = AlarmManager::PATH_EXECUTION_NOT_READY;
             else if (m_pathFeedMotion.receipt.code == MotionFeedLineCode::GEOMETRY_REJECTED)
                 alarmCode = AlarmManager::PATH_GEOMETRY_INVALID;
@@ -555,8 +582,28 @@ void NCManager::RejectPathCoreFeedSameThread(std::uint32_t code, int alarmCode)
 NC_PATH_FEED_NOINLINE
 WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
 {
-    if (!IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21))
+    if (!IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive))
     {
+        RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return nullptr;
+    }
+    // A bad active policy is a configuration error, not an out-of-range point.
+    // HOME-before-limits and G23/Limit1 semantics are owned by CoordinateManager.
+    for (int axisIndex = 0; axisIndex < 3; ++axisIndex)
+    {
+        const unsigned invalidMask = CoordSys.GetInvalidSoftwareTravelLimitMask(m_motion.GetAxisContext(axisIndex));
+        if (invalidMask != 0U)
+        {
+            RtPrintf("[TRAVEL-CONFIG][REJECT] unit=FEED axis=%d invalidMask=%u beforeSubmit=1\n", axisIndex, invalidMask);
+            RejectPathCoreFeedSameThread(7U, AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG);
+            return nullptr;
+        }
+    }
+    const bool cutter = CoordSys.toolRadiusMode != 40;
+    if ((cutter || m_cutterLine.leadOutRequired) &&
+        (!block.has('X') || !block.has('Y') || block.has('Z') || block.has('Q')))
+    {
+        RtPrintf("[CUTTER][REJECT] reason=FULL_XY_REQUIRED beforeSubmit=1\n");
         RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
     }
@@ -615,11 +662,12 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
             return nullptr;
         }
         m_pathFeedProgrammed[i] = true;
-        m_pathFeedWCS[i] = NCTranslationLengthToMM(block.val(letter), CoordSys.isInchMode ? 20 : 21);
+        m_pathFeedWCS[i] = CoordSys.isPolarCoordinateActive && i == 1U ? block.val(letter) :
+            NCTranslationLengthToMM(block.val(letter), CoordSys.isInchMode ? 20 : 21);
     }
-    const bool requirePlanarBaselineMatch = CoordSys.IsTranslationRunFrozen() &&
-        NCTranslationHasPlanarRotation(CoordSys.GetTranslationSnapshot()) &&
-        (m_pathFeedProgrammed[0] != m_pathFeedProgrammed[1]);
+    const bool requirePlanarBaselineMatch = cutter || (CoordSys.IsTranslationRunFrozen() &&
+        (NCTranslationHasPlanarRotation(CoordSys.GetTranslationSnapshot()) || CoordSys.isPolarCoordinateActive) &&
+        (m_pathFeedProgrammed[0] != m_pathFeedProgrammed[1]));
     const unsigned rawXYMask = (m_pathFeedProgrammed[0] ? 1U : 0U) |
         (m_pathFeedProgrammed[1] ? 2U : 0U);
     if (!CoordSys.CompleteFixedPlanarEndpoint(m_pathFeedWCS.data(), m_pathFeedProgrammed.data()))
@@ -637,7 +685,7 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
             rawXYMask | (block.has('Z') ? 4U : 0U), static_cast<unsigned>(programmedMask));
     const std::uint32_t physicalMask = queued ?
         FeedQueuedPhysicalMask(programmedMask, FeedPlanarXYMappingAvailable(m_motion)) : programmedMask;
-    const std::uint32_t endpointAxisMask = physicalMask != programmedMask ? programmedMask : 0U;
+    const std::uint32_t endpointAxisMask = cutter ? 3U : (physicalMask != programmedMask ? programmedMask : 0U);
     if (queued && physicalMask != m_cncFeed.mask)
     {
         RejectCncFeedSameThread("SUBMIT_MAPPING", m_pathFeed.sourceLine);
@@ -646,6 +694,18 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
     // Rotated sparse XY now carries both physical endpoints. Unrotated omission
     // keeps the original Motion-owned native start semantics.
     CoordSys.Preview_WCS_to_MCS(m_pathFeedWCS.data(), m_pathFeedProgrammed.data(), m_pathFeedCandidate.data());
+    if (cutter)
+    {
+        std::array<double, 2U> unusedCenter{};
+        int unusedDirection = 1;
+        if (!BuildCutterContourSameThread(block, m_pathFeed.sourcePC, m_pathFeed.run,
+            m_pathFeed.cache, m_pathFeed.dispatch, m_pathFeedCandidate, unusedCenter, unusedDirection))
+        {
+            RejectPathCoreFeedSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
+            return nullptr;
+        }
+    }
+
     for (std::size_t i = 0U; i < 8U; ++i)
     {
         if (!std::isfinite(m_pathFeedCandidate[i]))
@@ -656,9 +716,10 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
         if ((physicalMask & (1U << static_cast<unsigned>(i))) == 0U) continue;
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
         if (m_pathFeedProgrammed[i] &&
-            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, m_pathFeedCandidate[i]))
+            (!CoordSys.IsTargetWithinSoftwareTravelLimit(axis, m_pathFeedCandidate[i]) ||
+                (cutter && !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, CoordSys.commandedMCS[i]))))
         {
-            RejectPathCoreFeedSameThread(7U, AlarmManager::PROGRAMMED_OVER_TRAVEL);
+            RejectPathCoreFeedSameThread(7U, CoordSys.GetSoftwareTravelLimitAlarmCode(axis, AlarmManager::PROGRAMMED_OVER_TRAVEL));
             return nullptr;
         }
         m_pathFeedAxes.push_back(static_cast<int>(i));
@@ -683,7 +744,7 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
         // servo position. No queue side effect until next-row permission is proven.
         if (!queued || !next || next->parsedBlock.isBlockSkip ||
             !FeedBuildCornerNextGeometry(next->parsedBlock, m_cncFeed.nextCandidate) ||
-            !IsPathCoreFeedBlockShapeValid(m_cncFeed.nextCandidate, true, CoordSys.isInchMode ? 20 : 21) ||
+            !IsPathCoreFeedBlockShapeValid(m_cncFeed.nextCandidate, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) ||
             !m_cncFeed.nextCandidate.has('X') || !m_cncFeed.nextCandidate.has('Y') || m_cncFeed.nextCandidate.has('Z'))
         {
             RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter); return nullptr;
@@ -695,7 +756,18 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
             NCTranslationLengthToMM(m_cncFeed.nextCandidate.val('F'), CoordSys.isInchMode ? 20 : 21) : effectiveFeed;
         std::array<double, 8U> nextWCS = m_pathFeedWCS;
         nextWCS[0] = NCTranslationLengthToMM(m_cncFeed.nextCandidate.val('X'), CoordSys.isInchMode ? 20 : 21);
-        nextWCS[1] = NCTranslationLengthToMM(m_cncFeed.nextCandidate.val('Y'), CoordSys.isInchMode ? 20 : 21);
+        nextWCS[1] = CoordSys.isPolarCoordinateActive ? m_cncFeed.nextCandidate.val('Y') :
+            NCTranslationLengthToMM(m_cncFeed.nextCandidate.val('Y'), CoordSys.isInchMode ? 20 : 21);
+        // The declared vertex, before Q trimming, is the next polar baseline.
+        // The immutable next row has both endpoint words; it is decoded once
+        // without sampling a future variable or the moving servo position.
+        std::array<bool, 8U> nextProgrammed = m_pathFeedProgrammed;
+        if (CoordSys.isPolarCoordinateActive &&
+            !TryCompleteNCTranslationPolarEndpoint(CoordSys.GetTranslationSnapshot(),
+                m_pathFeedCandidate.data(), nextWCS.data(), nextProgrammed.data()))
+        {
+            RejectPathCoreFeedSameThread(5U, AlarmManager::G_Code_Invalid_parameter); return nullptr;
+        }
         CoordSys.Preview_WCS_to_MCS(nextWCS.data(), m_pathFeedProgrammed.data(), cornerNext.data());
         cornerGuard.context = this;
         cornerGuard.check = [](const void* context, int axis, double value)->bool
@@ -706,7 +778,7 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
         for (unsigned i = 0U; i < 2U; ++i)
             if (!std::isfinite(cornerNext[i]) || !cornerGuard.check(this, int(i), cornerNext[i]))
             {
-                RejectPathCoreFeedSameThread(7U, AlarmManager::PROGRAMMED_OVER_TRAVEL); return nullptr;
+                RejectPathCoreFeedSameThread(7U, CoordSys.GetSoftwareTravelLimitAlarmCode(m_motion.GetAxisContext(int(i)), AlarmManager::PROGRAMMED_OVER_TRAVEL)); return nullptr;
             }
     }
     const bool accepted = m_motion.TryG01MoveTransactionalCncTail(m_pathFeedAxes, m_pathFeedTargets,
@@ -759,6 +831,7 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
         RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         return nullptr;
     }
+    if (cutter) LogCutterContourSameThread(m_pathFeed.run, m_pathFeed.dispatch, m_pathFeed.sourcePC);
     ++m_pathFeed.submitted;
     m_pathFeed.pending = true;
     m_pathFeed.explicitFeed = true;
@@ -805,6 +878,21 @@ void NCManager::CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId
     {
         RejectPathCoreFeedSameThread(9U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         return;
+    }
+    if (CoordSys.toolRadiusMode != 40)
+    {
+        if (!CommitCutterContourSameThread(m_pathFeed.run, m_pathFeed.cache, dispatchId,
+            commit.sequence, r.translationGeneration, sourcePC, r.line.endMCS))
+        {
+            RejectPathCoreFeedSameThread(9U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+            return;
+        }
+    }
+    else if (m_cutterLine.leadOutRequired)
+    {
+        m_cutterLine = CutterLineState{};
+        RtPrintf("[CUTTER][LEAD_OUT_BOUND] pc=%d commit=%llu\n", sourcePC,
+            static_cast<unsigned long long>(commit.sequence));
     }
     m_pathFeed.commit = commit.sequence;
     m_pathFeed.bound = true;
@@ -894,7 +982,8 @@ bool NCManager::CompletePathCoreFeedSameThread()
     if (!m_pathFeed.bound || !m_pathFeed.completed || m_motion.HasPendingSafetyOrRecoveryRequests() ||
         !m_motion.IsGroupDone()) return false;
     if (m_gapWindow.active && m_gapWindow.normalSource && !m_gapWindow.normalProven) return false;
-    RetainPathCoreFeedSameThread(); // BZ: only after the real completion gate.
+    if (CoordSys.toolRadiusMode == 40)
+        RetainPathCoreFeedSameThread(); // Cutter replay is a later stage.
     m_pathFeed.pending = false;
     ++m_pathFeed.done;
     LogPathCoreFeedSameThread("COMPLETED");
@@ -904,6 +993,7 @@ bool NCManager::CompletePathCoreFeedSameThread()
 NC_PATH_FEED_NOINLINE
 void NCManager::FinalizePathCoreFeedSameThread() noexcept
 {
+    m_cutterLine = CutterLineState{};
     ClearCncModalFeedSameThread();
     InvalidateCncFeedSameThread();
     if (m_pathFeed.submitted != 0U) LogPathCoreFeedSameThread("FINALIZED");
@@ -960,11 +1050,11 @@ void NCManager::LogPathCoreFeedGeometrySameThread() const noexcept
 }
 
 NC_PATH_FEED_NOINLINE
-bool NCManager::IsCncPathQueuedBlockShapeValid(const NCBlock& block, int unitsMode) noexcept
+bool NCManager::IsCncPathQueuedBlockShapeValid(const NCBlock& block, int unitsMode, bool polar) noexcept
 {
     // Pure shape only: future missing F never samples the modal value.
-    return IsPathCoreFeedBlockShapeValid(block, true, unitsMode) ||
-        (IsPathCoreArcBlockShapeValid(block, true, unitsMode) && block.has('P') && block.val('P') == 1.0);
+    return IsPathCoreFeedBlockShapeValid(block, true, unitsMode, polar) ||
+        (IsPathCoreArcBlockShapeValid(block, true, unitsMode, polar) && block.has('P') && block.val('P') == 1.0);
 }
 
 NC_PATH_FEED_NOINLINE
@@ -972,7 +1062,8 @@ bool NCManager::IsCncFeedScopeSameThread() noexcept
 {
     // Fixed rotation retains G90/G17 and the lifecycle gates below. Candidate
     // gates limit motion to XY G01, bounded full-XY Q and P1 planar arcs.
-    return CoordSys.isAbsoluteMode && m_pathFeed.armed && !m_cncFeed.faulted && !m_pathFeed.pending &&
+    return CoordSys.toolRadiusMode == 40 && !m_cutterLine.leadOutRequired &&
+        CoordSys.isAbsoluteMode && m_pathFeed.armed && !m_cncFeed.faulted && !m_pathFeed.pending &&
         m_state == NCState::RUN && m_mode == NCOperationMode::MEMORY &&
         !m_isSingleBlockEnabled && !m_isG66Active && m_macroStack.empty() &&
         !Homing.IsActive() && !IsFeedHoldActive() && !m_pathArc.pending && !m_pathReplay.pending &&
@@ -998,7 +1089,7 @@ bool NCManager::PrepareCncFeedDispatchSameThread(const NCParsedBlock* parsed, in
         m_programMotionLease.owner == MotionOwner::AUTO &&
         !m_motion.HasPendingSafetyOrRecoveryRequests();
     const bool planarXYAvailable = scope && FeedPlanarXYMappingAvailable(m_motion);
-    const bool fixedRotation = CoordSys.IsFixedPlanarRotationActive();
+    const bool fixedRotation = CoordSys.IsFixedPlanarRotationActive() || CoordSys.isPolarCoordinateActive;
     const bool globalHead = globalScope && FeedGlobalBlockSyntax(*parsed, globalMask) &&
         (!fixedRotation || FeedFixedRotationQueuedSyntaxAllowed(*parsed));
     globalMask = FeedQueuedPhysicalMask(globalMask, planarXYAvailable);
@@ -1016,7 +1107,7 @@ bool NCManager::PrepareCncFeedDispatchSameThread(const NCParsedBlock* parsed, in
         (NCPreparedBlockQueueShadow::TryBuildLiteralBlock(*parsed, m_cncFeed.candidate) ||
             (globalHead && NCExpressionResolver::ResolveBlock(*parsed, MathParser,
                 m_cncFeed.candidate, resolveError))) &&
-        IsCncPathQueuedBlockShapeValid(m_cncFeed.candidate, CoordSys.isInchMode ? 20 : 21) &&
+        IsCncPathQueuedBlockShapeValid(m_cncFeed.candidate, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) &&
         (!fixedRotation || FeedFixedRotationQueuedBlockAllowed(m_cncFeed.candidate)) &&
         CaptureCncFeedValueSameThread(m_cncFeed.candidate, m_cncFeed.candidateFeed);
     std::uint32_t mask = 0U;
@@ -1057,7 +1148,7 @@ bool NCManager::PrepareCncFeedDispatchSameThread(const NCParsedBlock* parsed, in
         std::uint32_t nextMask = 0U;
         const bool nextLiteral = next != nullptr && !next->parsedBlock.isBlockSkip &&
             NCPreparedBlockQueueShadow::TryBuildLiteralBlock(next->parsedBlock, m_cncFeed.nextCandidate) &&
-            IsCncPathQueuedBlockShapeValid(m_cncFeed.nextCandidate, CoordSys.isInchMode ? 20 : 21) &&
+            IsCncPathQueuedBlockShapeValid(m_cncFeed.nextCandidate, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) &&
             (!fixedRotation || FeedFixedRotationQueuedBlockAllowed(m_cncFeed.nextCandidate));
         // DS/DU/DV/DW/DX/DY/DZ/EA do not predict future values. A bounded variable G01
         // or P1 arc may justify starting an unmarked line chain, but gains
@@ -1094,8 +1185,8 @@ bool NCManager::PrepareCncFeedDispatchSameThread(const NCParsedBlock* parsed, in
 NC_PATH_FEED_NOINLINE
 bool NCManager::IsCncFeedSelectedBlockSameThread(const NCBlock& block) const noexcept
 {
-    if (!m_cncFeed.selected || !IsCncPathQueuedBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21) ||
-        (CoordSys.IsFixedPlanarRotationActive() && !FeedFixedRotationQueuedBlockAllowed(block)) ||
+    if (!m_cncFeed.selected || !IsCncPathQueuedBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) ||
+        ((CoordSys.IsFixedPlanarRotationActive() || CoordSys.isPolarCoordinateActive) && !FeedFixedRotationQueuedBlockAllowed(block)) ||
         !IsCncFeedValueCurrentSameThread(m_cncFeed.candidateFeed) ||
         m_cncFeed.candidateFeed.programmed != block.has('F') ||
         (block.has('F') && FeedDoubleBits(NCTranslationLengthToMM(block.val('F'), CoordSys.isInchMode ? 20 : 21)) != FeedDoubleBits(m_cncFeed.candidateFeed.feedMMMin)) ||

@@ -115,8 +115,9 @@ bool MotionCore::TryG00MoveTransactionalTail(
 }
 
 
-// Sparse NC endpoints were completed from the accepted native tail. Prove that
-// reference against the SAME start sample used by this producer before enqueue.
+// Sparse/incremental endpoints and R-arc centers depend on the accepted native
+// tail, including unrotated G90 R arcs. Prove that reference against the SAME
+// start sample used by this producer before enqueue; callers own feature scope.
 // Both exact arithmetic representations are valid: accepted forward conversion,
 // or the division-built baseline produced by START/RESET. No tolerance hides drift.
 bool MotionCore::IsPlanarEndpointBasisCurrent(const double* referenceMCS,
@@ -125,9 +126,8 @@ bool MotionCore::IsPlanarEndpointBasisCurrent(const double* referenceMCS,
 {
     if (referenceMCS == nullptr || m_pContexts == nullptr || requiredAxisMask == 0U ||
         (requiredAxisMask & ~7U) != 0U || (validAxisMask & requiredAxisMask) != requiredAxisMask ||
-        !IsNCTranslationSnapshotValid(m_pendingTranslation) || !IsPendingFixedTranslationSourceAllowed() ||
-        (!NCTranslationHasPlanarRotation(m_pendingTranslation) &&
-            m_pendingTranslation.distanceMode != 91)) return false;
+        !IsNCTranslationSnapshotValid(m_pendingTranslation) ||
+        !IsPendingFixedTranslationSourceAllowed()) return false;
     for (std::size_t slot = 0U; slot < 3U; ++slot)
     {
         if ((requiredAxisMask & (1U << static_cast<unsigned>(slot))) == 0U) continue;
@@ -298,6 +298,7 @@ bool MotionCore::TryG00MoveInternal(
     };
 
     if (m_pContexts == nullptr ||
+        (commandSource == MotionCommandSource::NC_MEMORY && m_pendingToolRadMode != 40) ||
         (transactionalTail && commandedMCSTail == nullptr))
     {
         return rejectWithoutTailMutation(
@@ -617,7 +618,7 @@ bool MotionCore::TryG00MoveInternal(
                             !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, resolvedTargetUnits))
                         {
                             AlarmManager::GetInstance().Trigger(
-                                AlarmManager::PROGRAMMED_OVER_TRAVEL, m_pendingSourcePC, axisIndex);
+                                m_pCoordMgr->GetSoftwareTravelLimitAlarmCode(axis, AlarmManager::PROGRAMMED_OVER_TRAVEL), m_pendingSourcePC, axisIndex);
                             return rejectWithoutTailMutation(
                                 true, true, MotionRejectReason::INVALID_GEOMETRY);
                         }

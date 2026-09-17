@@ -450,6 +450,9 @@
     <ClCompile Include="MotionCore_G01.cpp">
       <Filter>Source Files\Motion\MotionCore_GCode</Filter>
     </ClCompile>
+    <ClCompile Include="NCManager_Cutter.cpp">
+      <Filter>Source Files\NC\NC</Filter>
+    </ClCompile>
     <ClCompile Include="NCManager_PathFeed.cpp">
       <Filter>Source Files\NC\NC</Filter>
     </ClCompile>
@@ -574,6 +577,12 @@
     </ClInclude>
     <ClInclude Include="NC_Types.h">
       <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCutterContour.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCutterLine.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="NCManager.h">
       <Filter>Header Files\NC\NC</Filter>

@@ -455,8 +455,8 @@ static_assert(
     std::is_trivially_copyable<NCPreparedBlockQueueCounters>::value,
     "NCPreparedBlockQueueCounters must remain trivially copyable.");
 static_assert(
-    sizeof(NCPreparedBlockEntrySnapshot) <= 1632U,
-    "A Prepared Entry, including two fixed scale/mirror coordinate proofs, must remain bounded.");
+    sizeof(NCPreparedBlockEntrySnapshot) <= 1680U,
+    "A Prepared Entry, including two fixed cutter coordinate proofs, must remain bounded.");
 static_assert(
-    sizeof(NCPreparedBlockQueueShadow) <= 55296U,
-    "The fixed Shadow Queue, including 67 scale/mirror proofs (+4288 bytes), must remain at most 54 KiB.");
+    sizeof(NCPreparedBlockQueueShadow) <= 56320U,
+    "The fixed Shadow Queue, including 67 fixed coordinate proofs, must remain at most 55 KiB.");

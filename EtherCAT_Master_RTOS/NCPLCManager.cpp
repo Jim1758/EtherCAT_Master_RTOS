@@ -1071,10 +1071,11 @@ void NCPLCManager::ProcessManualInputs()
                     const double targetMCS = targetPosition / pulsePerUnit;
 
                     const bool targetWithinSoftwareLimit = m_nc.GetCoordSys().IsTargetWithinSoftwareTravelLimit(physicalAxis, targetMCS);
+                    const bool travelConfigurationValid = m_nc.GetCoordSys().GetInvalidSoftwareTravelLimitMask(physicalAxis) == 0U;
                     const bool positiveSoftwareLimitActive = physicalAxis.travelLimit1PositiveActive || physicalAxis.travelLimit2PositiveActive || physicalAxis.travelLimit3PositiveActive;
                     const bool negativeSoftwareLimitActive = physicalAxis.travelLimit1NegativeActive || physicalAxis.travelLimit2NegativeActive || physicalAxis.travelLimit3NegativeActive;
-                    const bool recoveringFromPositiveLimit = positiveSoftwareLimitActive && physicalDeltaUnit < 0.0;
-                    const bool recoveringFromNegativeLimit = negativeSoftwareLimitActive && physicalDeltaUnit > 0.0;
+                    const bool recoveringFromPositiveLimit = travelConfigurationValid && positiveSoftwareLimitActive && physicalDeltaUnit < 0.0;
+                    const bool recoveringFromNegativeLimit = travelConfigurationValid && negativeSoftwareLimitActive && physicalDeltaUnit > 0.0;
 
                     if (!targetWithinSoftwareLimit && !recoveringFromPositiveLimit && !recoveringFromNegativeLimit)
                     {
@@ -1203,10 +1204,11 @@ void NCPLCManager::ProcessManualInputs()
             const double targetMCS = targetPosition / pulsePerUnit;
 
             const bool targetWithinSoftwareLimit = m_nc.GetCoordSys().IsTargetWithinSoftwareTravelLimit(axis, targetMCS);
+            const bool travelConfigurationValid = m_nc.GetCoordSys().GetInvalidSoftwareTravelLimitMask(axis) == 0U;
             const bool positiveSoftwareLimitActive = axis.travelLimit1PositiveActive || axis.travelLimit2PositiveActive || axis.travelLimit3PositiveActive;
             const bool negativeSoftwareLimitActive = axis.travelLimit1NegativeActive || axis.travelLimit2NegativeActive || axis.travelLimit3NegativeActive;
-            const bool recoveringFromPositiveLimit = positiveSoftwareLimitActive && deltaDistance < 0.0;
-            const bool recoveringFromNegativeLimit = negativeSoftwareLimitActive && deltaDistance > 0.0;
+            const bool recoveringFromPositiveLimit = travelConfigurationValid && positiveSoftwareLimitActive && deltaDistance < 0.0;
+            const bool recoveringFromNegativeLimit = travelConfigurationValid && negativeSoftwareLimitActive && deltaDistance > 0.0;
 
             if (!targetWithinSoftwareLimit && !recoveringFromPositiveLimit && !recoveringFromNegativeLimit)
             {
@@ -1501,10 +1503,11 @@ void NCPLCManager::ProcessManualInputs()
                     const double targetMCS = targetPosition / pulsePerUnit;
 
                     const bool targetWithinSoftwareLimit = m_nc.GetCoordSys().IsTargetWithinSoftwareTravelLimit(physicalAxis, targetMCS);
+                    const bool travelConfigurationValid = m_nc.GetCoordSys().GetInvalidSoftwareTravelLimitMask(physicalAxis) == 0U;
                     const bool positiveSoftwareLimitActive = physicalAxis.travelLimit1PositiveActive || physicalAxis.travelLimit2PositiveActive || physicalAxis.travelLimit3PositiveActive;
                     const bool negativeSoftwareLimitActive = physicalAxis.travelLimit1NegativeActive || physicalAxis.travelLimit2NegativeActive || physicalAxis.travelLimit3NegativeActive;
-                    const bool recoveringFromPositiveLimit = positiveSoftwareLimitActive && deltaUnit < 0.0;
-                    const bool recoveringFromNegativeLimit = negativeSoftwareLimitActive && deltaUnit > 0.0;
+                    const bool recoveringFromPositiveLimit = travelConfigurationValid && positiveSoftwareLimitActive && deltaUnit < 0.0;
+                    const bool recoveringFromNegativeLimit = travelConfigurationValid && negativeSoftwareLimitActive && deltaUnit > 0.0;
 
                     if (!targetWithinSoftwareLimit && !recoveringFromPositiveLimit && !recoveringFromNegativeLimit)
                     {
@@ -1662,10 +1665,11 @@ void NCPLCManager::ProcessManualInputs()
 
             const double targetMCS = targetPosition / pulsePerUnit;
             const bool targetWithinSoftwareLimit = m_nc.GetCoordSys().IsTargetWithinSoftwareTravelLimit(axis, targetMCS);
+            const bool travelConfigurationValid = m_nc.GetCoordSys().GetInvalidSoftwareTravelLimitMask(axis) == 0U;
             const bool positiveSoftwareLimitActive = axis.travelLimit1PositiveActive || axis.travelLimit2PositiveActive || axis.travelLimit3PositiveActive;
             const bool negativeSoftwareLimitActive = axis.travelLimit1NegativeActive || axis.travelLimit2NegativeActive || axis.travelLimit3NegativeActive;
-            const bool recoveringFromPositiveLimit = positiveSoftwareLimitActive && inchNegative;
-            const bool recoveringFromNegativeLimit = negativeSoftwareLimitActive && inchPositive;
+            const bool recoveringFromPositiveLimit = travelConfigurationValid && positiveSoftwareLimitActive && inchNegative;
+            const bool recoveringFromNegativeLimit = travelConfigurationValid && negativeSoftwareLimitActive && inchPositive;
 
             if (!targetWithinSoftwareLimit && !recoveringFromPositiveLimit && !recoveringFromNegativeLimit)
             {

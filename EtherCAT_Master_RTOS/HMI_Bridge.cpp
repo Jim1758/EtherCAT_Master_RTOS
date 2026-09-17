@@ -3235,12 +3235,13 @@ namespace HMI_Bridge
         // or feedback rings.  It only reads atomic / snapshot counters.
         //
         // Output policy:
-        //   1. Print the first 15 one-second samples after startup.
-        //   2. Afterwards, print only while a transport is busy, Safety is
-        //      pending, Owner changes, or an error counter changes.
-        //
-        // This keeps the acceptance trace useful without creating an
-        // unlimited one-line-per-second production log.
+        //   1. Print one full startup sample, then full reports on events.
+        //   2. Safety/transport/NC mode-state edges are events; an unchanged
+        //      pending safety latch is NOT a reason to repeat the full dump.
+        //   3. After ten quiet samples print one compact integer-only heartbeat.
+        // Snapshot capture, bounded event drains and error tracking still run
+        // every second. Static snapshot storage/noinline output families stay
+        // intact; this gate does not change NC, safety, motion or PDO state.
         // =============================================================
         Hmi1000msDiagnosticWorkspace& workspace =
             g_hmi1000msDiagnosticWorkspace;
@@ -4031,6 +4032,20 @@ namespace HMI_Bridge
             feedbackNoticeDepth != 0U;
 
         static std::uint32_t startupSamples = 0U;
+        static std::uint32_t quietDiagnosticSamples = 0U;
+        static std::uint64_t diagnosticSamples = 0ULL;
+        static std::uint64_t fullDiagnosticReports = 0ULL;
+        static bool previousSafetyPending = false;
+        static bool previousTransportBusy = false;
+        static int previousDiagnosticNCState = -1;
+        static int previousDiagnosticMode = -1;
+        const int diagnosticNCState = static_cast<int>(nc->GetState());
+        const int diagnosticMode = static_cast<int>(nc->GetMode());
+        const bool operatingStateChanged = startupSamples != 0U &&
+            (safetyPending != previousSafetyPending ||
+                transportBusy != previousTransportBusy ||
+                diagnosticNCState != previousDiagnosticNCState ||
+                diagnosticMode != previousDiagnosticMode);
         static MotionOwner previousOwner = MotionOwner::NONE;
         static MotionOwnerGeneration previousGeneration =
             MOTION_OWNER_GENERATION_INVALID;
@@ -4083,10 +4098,9 @@ namespace HMI_Bridge
             ordinaryG00FeedHoldRollingCutoverSnapshot.publicationSequence !=
             previousOrdinaryG00FeedHoldRollingCutoverPublication;
 
-        // K.7.8 is intentionally event-gated.  The shared diagnostic block
-        // also prints once per second while Motion transport is busy; without
-        // this local gate, a long F100 acceptance run would add two K.7.8
-        // lines every second.  Always publish the final counters at P_END.
+        // K.7.8 is intentionally event-gated. Other lifecycle events may
+        // request the shared block without changing K.7.8. Always publish
+        // its own events and the final counters at P_END.
         const bool shouldPrintK78 =
             startupSamples == 0U ||
             ordinaryG00FeedHoldRollingCutoverChanged ||
@@ -4170,10 +4184,11 @@ namespace HMI_Bridge
             alarmEmergencyStopChanged;
 
         const bool shouldPrint =
-            startupSamples < 15U ||
+            startupSamples == 0U ||
             lifecycleChanged ||
             completionBoundaryChanged ||
             programEndChanged ||
+            ordinaryG00FeedHoldRollingCutoverChanged ||
             gmTransactionChanged ||
             preDispatchBarrierChanged ||
             preparedQueueChanged ||
@@ -4191,8 +4206,34 @@ namespace HMI_Bridge
             shouldPrintJ5 ||
             ownerChanged ||
             errorCounterChanged ||
-            safetyPending ||
-            transportBusy;
+            operatingStateChanged;
+
+        diagnosticSamples = AddDiagnosticCounterSaturating(diagnosticSamples, 1ULL);
+        if (shouldPrint)
+        {
+            quietDiagnosticSamples = 0U;
+            fullDiagnosticReports = AddDiagnosticCounterSaturating(fullDiagnosticReports, 1ULL);
+        }
+        else if (++quietDiagnosticSamples >= 10U)
+        {
+            quietDiagnosticSamples = 0U;
+            RunHmiDiagnosticOutputFamily([&]()
+                {
+                    RtPrintf(
+                        "[NC-DIAG] Policy:ARC_FIX1 Sample:%llu Full:%llu "
+                        "NC:%d Mode:%d Owner:%u/%u Safety:%u Busy:%u "
+                        "RTSample:%llu J5Fail:%llu PDOInvalid:%llu\n",
+                        static_cast<unsigned long long>(diagnosticSamples),
+                        static_cast<unsigned long long>(fullDiagnosticReports),
+                        diagnosticNCState, diagnosticMode,
+                        static_cast<unsigned int>(ownerLease.owner),
+                        static_cast<unsigned int>(ownerLease.generation),
+                        safetyPending ? 1U : 0U, transportBusy ? 1U : 0U,
+                        static_cast<unsigned long long>(groupNCSettleSnapshot.sampleSequence),
+                        static_cast<unsigned long long>(j5FailureTotal),
+                        static_cast<unsigned long long>(pdoInvalidCorrelation.invalidCycleCount));
+                });
+        }
 
         if (shouldPrint)
         {
@@ -8566,10 +8607,11 @@ namespace HMI_Bridge
                 });
         }
 
-        if (startupSamples < 15U)
-        {
-            ++startupSamples;
-        }
+        startupSamples = 1U;
+        previousSafetyPending = safetyPending;
+        previousTransportBusy = transportBusy;
+        previousDiagnosticNCState = diagnosticNCState;
+        previousDiagnosticMode = diagnosticMode;
 
         previousOwner = ownerLease.owner;
         previousGeneration = ownerLease.generation;

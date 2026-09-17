@@ -172,7 +172,10 @@ namespace
         std::memset(static_cast<void*>(&command), 0, sizeof(command));
         command.execution.sourceBlockId = MOTION_SOURCE_BLOCK_ID_INVALID;
         command.sourceWCS = 54;
-        command.sourceTranslation.schema = 8U;
+        command.sourceTranslation.schema = 11U;
+        command.sourceTranslation.storedStrokeMode = 23;
+        command.sourceTranslation.cutterMode = 40;
+        command.sourceTranslation.polarMode = 15;
         command.sourceTranslation.scalingMode = 50;
         command.sourceTranslation.scalingFactor = 1.0;
         command.sourceTranslation.distanceMode = 90;
@@ -241,7 +244,7 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     MotionFeedArcWorkspace& workspace,
     MotionCommand& commandWorkspace, const MotionCncPathTail* predecessor,
     bool cncFeedLookahead, std::uint32_t endpointAxisMask,
-    bool requirePlanarBaselineMatch)
+    bool requirePlanarBaselineMatch, bool preparedCutterArc)
 {
     static_assert(MAX_AXES == 8, "BY fixed workspace must match Motion axes.");
     MotionFeedArcReceipt& result = workspace.receipt;
@@ -256,7 +259,13 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     const MotionOwnerLease plannedOwner = GetMotionOwnerLease();
     const MotionCommandSource source =
         m_pendingCommandSource.load(std::memory_order_acquire);
+    const bool cutterActive = m_pendingTranslation.cutterMode != 40;
     if (!IsPendingFixedTranslationSourceAllowed() ||
+        preparedCutterArc != cutterActive ||
+        (cutterActive && (cncFeedLookahead || predecessor != nullptr || fullCircle ||
+            endpointAxisMask != 3U || !requirePlanarBaselineMatch ||
+            m_pendingTranslation.distanceMode != 90 || !m_pendingIsAbsoluteMode ||
+            m_pendingPlaneMode != 17 || m_pendingG16Active || m_pendingG162Active)) ||
         (cncFeedLookahead && (m_pendingTranslation.distanceMode != 90 ||
             !m_pendingIsAbsoluteMode || m_pendingPlaneMode != 17 || m_pendingG162Active)) ||
         m_pContexts == nullptr || m_pContexts->size() < 2U ||
@@ -269,6 +278,19 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     {
         result.code = MotionFeedArcCode::INVALID_INPUT;
         return false;
+    }
+    // A prepared XY circle may never hide a Z or auxiliary-axis endpoint.
+    // XYZ is the bounded contour scope; all other axes retain their source tail.
+    if (cutterActive)
+    {
+        for (std::size_t slot = 2U; slot < 8U; ++slot)
+        {
+            if (!std::isfinite(targetMCS[slot]) || targetMCS[slot] != commandedMCSTail[slot])
+            {
+                result.code = MotionFeedArcCode::INVALID_INPUT;
+                return false;
+            }
+        }
     }
     const bool buffered = predecessor != nullptr;
     if (buffered && (!cncFeedLookahead || !IsCncPathProducerTailCurrent(*predecessor, 3U,
@@ -299,7 +321,7 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
             (cncFeedLookahead && NCTranslationHasPlanarRotation(m_pendingTranslation)) ||
             m_pendingTranslation.distanceMode == 91) && !buffered &&
         !IsPlanarEndpointBasisCurrent(commandedMCSTail,
-            workspace.input.startPulse, result.validAxisMask, 3U))
+            workspace.input.startPulse, result.validAxisMask, cutterActive ? 7U : 3U))
     {
         result.code = MotionFeedArcCode::NOT_READY;
         return false;
@@ -347,9 +369,12 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     cmd.decTime = workspace.decTime;
     cmd.commandPathMode = cncFeedLookahead ? MotionCommandPathMode::CONTINUOUS : MotionCommandPathMode::EXACT_STOP;
     cmd.cncFeedLookahead = cncFeedLookahead;
-    if (cncFeedLookahead)
+    if (cncFeedLookahead || cutterActive)
     {
-        for (std::size_t i = 0U; i < 2U; ++i) cmd.mem_startPos[i] = result.arc.startPulse[i];
+        // Prepared cutter circles freeze XYZ start pulses as a read-only proof.
+        // Their native curve is resolved again at the consumer before loading.
+        for (std::size_t i = 0U; i < (cutterActive ? 3U : 2U); ++i)
+            cmd.mem_startPos[i] = result.arc.startPulse[i];
         cmd.mem_radius = result.arc.radiusPulse;
         cmd.mem_startAngle = result.arc.startAngle;
         cmd.mem_totalAngle = result.arc.sweepRadians;

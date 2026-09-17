@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 
 // Fixed XYZ translation and planar rotation source contract. Native MCS/pulse geometry remains
@@ -16,7 +17,7 @@ struct NCTranslationSnapshot
     std::uint64_t generation = 0ULL;
     std::uint64_t revision = 0ULL;
     std::int32_t wcsCode = 0;
-    std::uint32_t schema = 8U;
+    std::uint32_t schema = 11U;
     double extOffsetMM[8] = {};
     double wcsOffsetMM[8] = {};
     std::int32_t toolLengthMode = 49;
@@ -37,6 +38,11 @@ struct NCTranslationSnapshot
     double scalingFactor = 1.0;
     double scalingCenterMM[3] = {};
     double mirrorCenterMM[3] = {};
+    std::int32_t polarMode = 15; // Authored endpoint notation; affine geometry stays Cartesian.
+    std::int32_t storedStrokeMode = 23; // G22/G23 policy; native bounds remain axis configuration.
+    std::int32_t cutterMode = 40;
+    std::int32_t cutterD = 0;
+    double cutterRadiusMM = 0.0; // Physical tool radius, independent of contour scaling.
 };
 
 inline bool TryDecodeNCWorkSelection(int gCode, bool hasW, double wValue,
@@ -69,6 +75,21 @@ inline bool TryDecodeNCToolLengthSelection(int gCode, bool hasH, double hValue,
     return true;
 }
 
+// D is a table index, never an axis value. Decode before narrowing or modal writes.
+inline bool TryDecodeNCToolRadiusSelection(int gCode, bool hasD, double dValue,
+    int& mode, int& dCode) noexcept
+{
+    if (gCode != 40 && gCode != 41 && gCode != 42) return false;
+    if (gCode != 40 && !hasD) return false;
+    if (hasD && (!std::isfinite(dValue) || dValue < 0.0 || dValue > 100.0 ||
+        std::floor(dValue) != dValue)) return false;
+    if ((gCode == 40 && hasD) ||
+        (gCode != 40 && dValue < 1.0)) return false;
+    mode = gCode;
+    dCode = gCode == 40 ? 0 : static_cast<int>(dValue);
+    return true;
+}
+
 inline double NCTranslationToolOffsetMM(const NCTranslationSnapshot& s,
     unsigned axis) noexcept
 {
@@ -88,14 +109,16 @@ inline double NCTranslationAxisOffsetMM(const NCTranslationSnapshot& s,
 inline bool IsNCTranslationSnapshotEmpty(const NCTranslationSnapshot& s) noexcept
 {
     if (s.runToken != 0ULL || s.generation != 0ULL || s.revision != 0ULL ||
-        s.wcsCode != 0 || s.schema != 8U || s.toolLengthMode != 49 ||
+        s.wcsCode != 0 || s.schema != 11U || s.toolLengthMode != 49 ||
         s.toolHCode != 0 || s.workMode != 169 || s.workWCode != 0 ||
         s.rotationMode != 69 || s.rotationPlane != 17 ||
         s.rotationCenterMM[0] != 0.0 || s.rotationCenterMM[1] != 0.0 ||
         s.rotationAngleDeg != 0.0 || s.workRotationCenterMM[0] != 0.0 ||
         s.workRotationCenterMM[1] != 0.0 || s.distanceMode != 90 ||
         s.unitsMode != 21 || s.scalingMode != 50 || s.mirrorMask != 0U ||
-        s.scalingFactor != 1.0) return false;
+        s.scalingFactor != 1.0 || s.polarMode != 15 || s.storedStrokeMode != 23 ||
+        s.cutterMode != 40 || s.cutterD != 0 || s.cutterRadiusMM != 0.0 ||
+        std::signbit(s.cutterRadiusMM)) return false;
     for (unsigned axis = 0U; axis < 3U; ++axis)
         if (s.scalingCenterMM[axis] != 0.0 || std::signbit(s.scalingCenterMM[axis]) ||
             s.mirrorCenterMM[axis] != 0.0 || std::signbit(s.mirrorCenterMM[axis])) return false;
@@ -108,8 +131,18 @@ inline bool IsNCTranslationSnapshotEmpty(const NCTranslationSnapshot& s) noexcep
 inline bool IsNCTranslationSnapshotValid(const NCTranslationSnapshot& s) noexcept
 {
     if (s.runToken == 0ULL || s.generation == 0ULL || s.revision == 0ULL ||
-        s.schema != 8U || s.wcsCode < 54 || s.wcsCode > 59 ||
+        s.schema != 11U || s.wcsCode < 54 || s.wcsCode > 59 ||
         (s.distanceMode != 90 && s.distanceMode != 91) || (s.unitsMode != 20 && s.unitsMode != 21)) return false;
+    if ((s.polarMode != 15 && s.polarMode != 16) || (s.storedStrokeMode != 22 && s.storedStrokeMode != 23) ||
+        (s.polarMode == 16 && s.distanceMode != 90)) return false;
+    if (s.cutterMode == 40)
+    {
+        if (s.cutterD != 0 || s.cutterRadiusMM != 0.0 ||
+            std::signbit(s.cutterRadiusMM)) return false;
+    }
+    else if ((s.cutterMode != 41 && s.cutterMode != 42) ||
+        s.cutterD < 1 || s.cutterD > 100 || !std::isfinite(s.cutterRadiusMM) ||
+        s.cutterRadiusMM <= 0.0 || s.distanceMode != 90 || s.polarMode != 15) return false;
     if ((s.rotationMode != 68 && s.rotationMode != 69) || s.rotationPlane != 17 ||
         !std::isfinite(s.rotationCenterMM[0]) || !std::isfinite(s.rotationCenterMM[1]) ||
         !std::isfinite(s.rotationAngleDeg) || std::fabs(s.rotationAngleDeg) > 360.0 ||
@@ -161,6 +194,9 @@ inline bool SameNCTranslationSnapshot(const NCTranslationSnapshot& a,
         a.rotationMode == b.rotationMode && a.rotationPlane == b.rotationPlane &&
         a.distanceMode == b.distanceMode && a.unitsMode == b.unitsMode &&
         a.scalingMode == b.scalingMode && a.mirrorMask == b.mirrorMask &&
+        a.polarMode == b.polarMode && a.storedStrokeMode == b.storedStrokeMode &&
+        a.cutterMode == b.cutterMode && a.cutterD == b.cutterD &&
+        std::memcmp(&a.cutterRadiusMM, &b.cutterRadiusMM, sizeof(double)) == 0 &&
         std::memcmp(&a.scalingFactor, &b.scalingFactor, sizeof(a.scalingFactor)) == 0 &&
         std::memcmp(a.scalingCenterMM, b.scalingCenterMM, sizeof(a.scalingCenterMM)) == 0 &&
         std::memcmp(a.mirrorCenterMM, b.mirrorCenterMM, sizeof(a.mirrorCenterMM)) == 0 &&
@@ -172,6 +208,13 @@ inline bool SameNCTranslationSnapshot(const NCTranslationSnapshot& a,
         std::memcmp(a.workOffset, b.workOffset, sizeof(a.workOffset)) == 0 &&
         std::memcmp(a.workRotationCenterMM, b.workRotationCenterMM,
             sizeof(a.workRotationCenterMM)) == 0;
+}
+
+inline bool IsNCTranslationCutterModeAllowed(int mode, int dCode,
+    const NCTranslationSnapshot& snapshot) noexcept
+{
+    return IsNCTranslationSnapshotValid(snapshot) &&
+        mode == snapshot.cutterMode && dCode == snapshot.cutterD;
 }
 
 inline bool IsNCTranslationSourceAllowed(int wcs,
@@ -198,6 +241,13 @@ inline bool IsNCTranslationUnitModeAllowed(bool inch,
     const NCTranslationSnapshot& snapshot) noexcept
 {
     return IsNCTranslationSnapshotValid(snapshot) && snapshot.unitsMode == (inch ? 20 : 21);
+}
+
+inline bool IsNCTranslationPolarModeAllowed(bool active,
+    const NCTranslationSnapshot& snapshot) noexcept
+{
+    return IsNCTranslationSnapshotValid(snapshot) &&
+        snapshot.polarMode == (active ? 16 : 15);
 }
 
 // Producer boundary only. The caller validates unitsMode and the finite result.
@@ -393,6 +443,83 @@ inline void NCTranslationInversePoint(const NCTranslationSnapshot& s,
         wcs[axis] = NCTranslationInverseScaleMirrorAxisPoint(s, wcs[axis], axis);
 }
 
+// Producer boundary only: X is radius in native mm, Y is an angle in degrees.
+// The accepted native tail supplies omitted polar words through the Cartesian
+// affine inverse. No modal radius/angle cache can diverge from the native tail.
+// On success the selected XY pair is Cartesian; do not decode it a second time.
+inline bool TryCompleteNCTranslationPolarEndpoint(const NCTranslationSnapshot& s,
+    const double* baselineMCS, double* targetWCS, bool* hasAxis) noexcept
+{
+    if (!baselineMCS || !targetWCS || !hasAxis ||
+        !IsNCTranslationSnapshotValid(s) || s.polarMode != 16 ||
+        s.distanceMode != 90 || s.rotationPlane != 17) return false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        if (!std::isfinite(baselineMCS[axis]) ||
+            (hasAxis[axis] && (axis >= 3U || !std::isfinite(targetWCS[axis])))) return false;
+    // A Z-only block does not manufacture XY presence or rewrite omitted words.
+    if (!hasAxis[0] && !hasAxis[1]) return true;
+    double radius = hasAxis[0] ? targetWCS[0] : 0.0;
+    double angle = hasAxis[1] ? targetWCS[1] : 0.0;
+    if (!hasAxis[0] || !hasAxis[1])
+    {
+        double baselineWCS[8] = {};
+        NCTranslationInversePoint(s, baselineMCS, baselineWCS);
+        if (!std::isfinite(baselineWCS[0]) || !std::isfinite(baselineWCS[1])) return false;
+        const double baselineRadius = std::hypot(baselineWCS[0], baselineWCS[1]);
+        if (!std::isfinite(baselineRadius)) return false;
+        if (!hasAxis[0]) radius = baselineRadius;
+        if (!hasAxis[1])
+        {
+            // A transformed origin can inverse-map to a tiny nonzero residue.
+            // Do not infer an arbitrary direction from cancellation/roundoff.
+            double originWCS[8] = {}, originMCS[8] = {};
+            NCTranslationForwardPoint(s, originWCS, originMCS);
+            double magnitude = 1.0;
+            for (unsigned axis = 0U; axis < 2U; ++axis)
+            {
+                const double scaledCenter = s.scalingCenterMM[axis] * s.scalingFactor;
+                const double terms[] = { baselineMCS[axis], originMCS[axis],
+                    s.extOffsetMM[axis], s.wcsOffsetMM[axis], s.toolOffsetMM[axis],
+                    s.workOffset[axis], s.scalingCenterMM[axis], scaledCenter,
+                    s.mirrorCenterMM[axis], s.rotationCenterMM[axis],
+                    s.workRotationCenterMM[axis] };
+                for (double term : terms)
+                {
+                    if (!std::isfinite(term)) return false;
+                    if (std::fabs(term) > magnitude) magnitude = std::fabs(term);
+                }
+            }
+            const double originBudget = 64.0 * (std::numeric_limits<double>::epsilon)() * magnitude;
+            if (baselineRadius == 0.0 ||
+                std::hypot(baselineMCS[0] - originMCS[0],
+                    baselineMCS[1] - originMCS[1]) <= originBudget) return false;
+            angle = std::atan2(baselineWCS[1], baselineWCS[0]) *
+                (180.0 / 3.14159265358979323846);
+        }
+    }
+    if (!std::isfinite(radius) || radius < 0.0 || !std::isfinite(angle)) return false;
+    // Reduce finite multi-turn angles before multiplication, avoiding overflow.
+    angle = std::fmod(angle, 360.0);
+    double cosine = 1.0, sine = 0.0;
+    NCTranslationPlanarCoefficients(angle, cosine, sine);
+    const double x = radius == 0.0 ? 0.0 : radius * cosine;
+    const double y = radius == 0.0 ? 0.0 : radius * sine;
+    if (!std::isfinite(x) || !std::isfinite(y)) return false;
+    double cartesian[8] = {};
+    cartesian[0] = x;
+    cartesian[1] = y;
+    if (hasAxis[2]) cartesian[2] = targetWCS[2];
+    double native[8] = {};
+    NCTranslationForwardPoint(s, cartesian, native);
+    if (!std::isfinite(native[0]) || !std::isfinite(native[1]) ||
+        (hasAxis[2] && !std::isfinite(native[2]))) return false;
+    targetWCS[0] = x;
+    targetWCS[1] = y;
+    hasAxis[0] = true;
+    hasAxis[1] = true;
+    return true;
+}
+
 // Fixed G91 uses displacement vectors, not points: neither rotation centre,
 // EXT/WCS/H nor G168 translation is added a second time. The caller separately
 // proves the sampled Motion baseline still matches this accepted native tail.
@@ -489,7 +616,7 @@ inline bool TryCompleteNCTranslationPlanarEndpoint(const NCTranslationSnapshot& 
     return true;
 }
 
-static_assert(sizeof(NCTranslationSnapshot) == 424U &&
+static_assert(sizeof(NCTranslationSnapshot) == 448U &&
     alignof(NCTranslationSnapshot) == 8U,
     "Fixed translation descriptor layout must remain explicit.");
 static_assert(std::is_trivially_copyable<NCTranslationSnapshot>::value &&
@@ -520,5 +647,10 @@ static_assert(offsetof(NCTranslationSnapshot, runToken) == 0U &&
     offsetof(NCTranslationSnapshot, mirrorMask) == 364U &&
     offsetof(NCTranslationSnapshot, scalingFactor) == 368U &&
     offsetof(NCTranslationSnapshot, scalingCenterMM) == 376U &&
-    offsetof(NCTranslationSnapshot, mirrorCenterMM) == 400U,
+    offsetof(NCTranslationSnapshot, mirrorCenterMM) == 400U &&
+    offsetof(NCTranslationSnapshot, polarMode) == 424U &&
+    offsetof(NCTranslationSnapshot, storedStrokeMode) == 428U &&
+    offsetof(NCTranslationSnapshot, cutterMode) == 432U &&
+    offsetof(NCTranslationSnapshot, cutterD) == 436U &&
+    offsetof(NCTranslationSnapshot, cutterRadiusMM) == 440U,
     "Atomic exact comparison requires a padding-free translation descriptor.");

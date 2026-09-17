@@ -2,6 +2,8 @@
 #include <vector>
 #include "AlarmManager.h" 
 #include "MotionCore.h"
+#include <windows.h>
+#include <rtapi.h>
 
 namespace GCodeHandlers
 {
@@ -99,7 +101,15 @@ namespace GCodeHandlers
         bool moveXYZ = axisProgrammed[0] || axisProgrammed[1] || axisProgrammed[2];
 
         // 🌟 條件加入 isG16Active
-        if ((isG168Active || isG68Active || isG16Active) && moveXYZ)
+        const bool fixedPlanarRotation = nc->CoordSys.IsTranslationRunFrozen() &&
+            NCTranslationHasPlanarRotation(nc->CoordSys.GetTranslationSnapshot());
+        const bool requirePlanarBaselineMatch = fixedPlanarRotation &&
+            (axisProgrammed[0] != axisProgrammed[1]);
+        const unsigned rawXYMask = (axisProgrammed[0] ? 1U : 0U) |
+            (axisProgrammed[1] ? 2U : 0U);
+        // Fixed rotation completes only sparse XY. Z-only native XY stays untouched.
+        if (!fixedPlanarRotation && !(nc->CoordSys.IsTranslationRunFrozen() && !nc->CoordSys.isAbsoluteMode) &&
+            (isG168Active || isG68Active || isG16Active) && moveXYZ)
         {
             double currentWCS[8] = { 0.0 };
             // =========================================================
@@ -131,9 +141,24 @@ namespace GCodeHandlers
             }
         }
 
+        if (!nc->CoordSys.CompleteFixedPlanarEndpoint(axisTarget, axisProgrammed))
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::ALARM);
+            return [](NCManager*) { return true; };
+        }
+        if (requirePlanarBaselineMatch)
+            RtPrintf("[ROTATION][SPARSE_XY] g=0 rawXYMask=%u effectiveXYMask=3 beforeSubmit=1\n", rawXYMask);
+
+        if (nc->CoordSys.IsTranslationRunFrozen() && !nc->CoordSys.isAbsoluteMode)
+            RtPrintf("[INCREMENTAL][TARGET] g=0 rawMask=%u effectiveMask=%u beforeSubmit=1\n",
+                rawXYMask | (axisProgrammed[2] ? 4U : 0U),
+                (axisProgrammed[0] ? 1U : 0U) | (axisProgrammed[1] ? 2U : 0U) |
+                    (axisProgrammed[2] ? 4U : 0U));
+
         // =========================================================
         // 🌟 4. 座標轉換 (WCS -> MCS)
-        // 此時 axisProgrammed 的 XYZ 絕對都是 true 了！轉換引擎才會真的去算旋轉！
+        // 旋轉下的 X/Y 已補齊，未指定的其他軸保留原生位置。
         // =========================================================
         double targetMCS[8] = { 0.0 };
         // K.6.2 preview only: commandedMCS remains unchanged until the
@@ -260,7 +285,8 @@ namespace GCodeHandlers
                     MotionCommandPathMode::EXACT_STOP,
                     rapidOverrideCandidate,
                     nc->CoordSys.commandedMCS,
-                    nc->GetPathCoreCommandedReceiptWorkspaceSameThread());
+                    nc->GetPathCoreCommandedReceiptWorkspaceSameThread(),
+                    requirePlanarBaselineMatch);
         }
         else
         {
@@ -272,7 +298,8 @@ namespace GCodeHandlers
                     MotionCommandPathMode::EXACT_STOP,
                     rapidOverrideCandidate,
                     nc->CoordSys.commandedMCS,
-                    nc->GetPathCoreCommandedReceiptWorkspaceSameThread());//不連續
+                    nc->GetPathCoreCommandedReceiptWorkspaceSameThread(),
+                    requirePlanarBaselineMatch);//不連續
         }
 
         // K.6.2: an ingress rejection is a failed NC dispatch.  Never let a

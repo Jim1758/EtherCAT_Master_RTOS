@@ -42,17 +42,26 @@ void MotionCore::G07_Move(const std::vector<int>& axes, const std::vector<double
         groupDecTime = std::max<double>(groupDecTime, axis.G07_dec_time);
 
         // 1-2. mm 轉 Pulse
-        double lead = axis.finalLead;
-        if (lead < 1e-6) lead = 1.0;
-        double pulsePerUnit = axis.resolution_PPR / lead;
+        const bool rotaryShortestPath =
+            axis.axisType == AxisType::ROTARY && axis.useShortestPath;
+        double pulsePerUnit = 0.0;
+        if (!TryGetMotionPulsePerUnit(axis.resolution_PPR, axis.finalLead,
+            rotaryShortestPath, pulsePerUnit))
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID, m_pendingSourcePC, idx);
+            return;
+        }
         double targetPulse = targetPos_mm[i] * pulsePerUnit;
 
         // 1-3. 改用虛擬終點做為起點！
         double startPulse = isLookAheadActive ? axis.lastQueuedPulse : axis.logicalCmdPos;
 
         // 【保留旋轉軸最短路徑判斷】
-        if (axis.axisType == AxisType::ROTARY && axis.useShortestPath) {
-            targetPulse = CalculateShortestTarget(startPulse, targetPulse, axis.rotaryModulo);
+        if (!TryResolveMotionTargetPulse(startPulse, targetPulse, pulsePerUnit,
+            rotaryShortestPath, axis.rotaryModulo, targetPulse))
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID, m_pendingSourcePC, idx);
+            return;
         }
 
         targetPos_Pulse[i] = targetPulse;
@@ -67,7 +76,7 @@ void MotionCore::G07_Move(const std::vector<int>& axes, const std::vector<double
         sum_sq_mm += (distance_mm * distance_mm);
 
         // 極度重要：把這次的終點存起來，交接給下一行！
-        axis.lastQueuedPulse = targetPulse;
+        // Publish all pulse tails only after every axis conversion succeeds.
 
         // =========================================================
         // 🌟 1-5. 硬體極限防呆 (這顆馬達全速跑最少需要幾秒？)
@@ -81,6 +90,11 @@ void MotionCore::G07_Move(const std::vector<int>& axes, const std::vector<double
             double timeNeeded = distancePulse / currentAxisMaxPPS;
             maxTimeNeeded = std::max<double>(maxTimeNeeded, timeNeeded);
         }
+    }
+
+    for (size_t i = 0; i < axes.size(); ++i)
+    {
+        (*m_pContexts)[axes[i]].lastQueuedPulse = targetPos_Pulse[i];
     }
 
     // 防呆保護

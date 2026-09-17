@@ -1,0 +1,275 @@
+﻿RTX64 / EtherCAT 250 us
+PDO 干擾：Windows 背景排程關閉設定
+更新日期：2026-09-17
+
+============================================================
+一、目的
+============================================================
+
+這份設定整理自實機 EtherCAT / RTX64 長時間測試中，曾與 PDO RX / Master-NAL
+長尾或背景維護活動在時間上高度相關、並已實際做過停用測試的 Windows Scheduled Tasks。
+
+本文件不代表每一個 Task 都已被單獨證明為唯一根因。
+用途是建立「專用 RTX64 / EtherCAT 控制電腦」的一致 A/B 測試與部署基準。
+
+本版不會：
+- 刪除 Windows Scheduled Task
+- 關閉 VSS Service
+- 關閉整個 System Restore 功能
+- 修改 Task ACL / Registry TaskCache
+- 停用 Security-SPP service
+- 大範圍停用 Windows Update / Office / Edge / Adobe 排程
+
+本版只停用目前已納入測試範圍的指定 Scheduled Tasks。
+
+
+============================================================
+二、新電腦建議操作方式：使用一鍵 PowerShell 腳本
+============================================================
+
+檔案：
+RTX64_Windows_BackgroundTasks_OneClick.ps1
+
+1. 將 PS1 複製到新電腦本機，例如：
+   C:\RTX64_Setup\RTX64_Windows_BackgroundTasks_OneClick.ps1
+
+2. Windows 開始功能表搜尋：
+   Windows PowerShell
+
+3. 右鍵：
+   以系統管理員身分執行
+
+4. 執行：
+
+   Set-ExecutionPolicy -Scope Process Bypass -Force
+
+5. 執行腳本，例如：
+
+   & "C:\RTX64_Setup\RTX64_Windows_BackgroundTasks_OneClick.ps1"
+
+6. 等待畫面出現：
+
+   === FINAL CHECK ===
+
+7. 最後應看到：
+
+   PASS: All existing target tasks are Disabled.
+
+8. 腳本同時會在桌面建立：
+   RTX64_BackgroundTasks_Check_YYYYMMDD_HHMMSS.txt
+
+   操作人員可以直接保存這份 TXT 當作部署驗收證據。
+
+
+============================================================
+三、本版會停用的 Scheduled Tasks
+============================================================
+
+A. Application Experience
+------------------------------------------------------------
+\Microsoft\Windows\Application Experience\
+Microsoft Compatibility Appraiser
+
+
+B. Device Information
+------------------------------------------------------------
+\Microsoft\Windows\Device Information\
+Device
+
+
+C. Memory Diagnostic
+------------------------------------------------------------
+\Microsoft\Windows\MemoryDiagnostic\
+RunFullMemoryDiagnostic
+
+\Microsoft\Windows\MemoryDiagnostic\
+ProcessMemoryDiagnosticEvents
+
+
+D. .NET Framework NGEN
+------------------------------------------------------------
+\Microsoft\Windows\.NET Framework\
+.NET Framework NGEN v4.0.30319 64
+
+\Microsoft\Windows\.NET Framework\
+.NET Framework NGEN v4.0.30319
+
+\Microsoft\Windows\.NET Framework\
+.NET Framework NGEN v4.0.30319 64 Critical
+
+\Microsoft\Windows\.NET Framework\
+.NET Framework NGEN v4.0.30319 Critical
+
+
+E. System Restore Scheduled Restore Point
+------------------------------------------------------------
+\Microsoft\Windows\SystemRestore\
+SR
+
+
+F. Customer Experience Improvement Program
+------------------------------------------------------------
+\Microsoft\Windows\Customer Experience Improvement Program\
+Consolidator
+
+
+G. DeviceDirectoryClient
+------------------------------------------------------------
+\Microsoft\Windows\DeviceDirectoryClient\
+RegisterDevicePeriodic24
+
+\Microsoft\Windows\DeviceDirectoryClient\
+RegisterDeviceLocationRightsChange
+
+\Microsoft\Windows\DeviceDirectoryClient\
+RegisterDeviceProtectionStateChanged
+
+\Microsoft\Windows\DeviceDirectoryClient\
+RegisterUserDevice
+
+注意：
+DeviceDirectoryClient 這四個在實機上使用 Administrator 權限執行
+Disable-ScheduledTask / schtasks /Change 時曾出現 0x80070005 Access Denied。
+
+因此一鍵腳本會自動建立短暫的 SYSTEM helper task，
+以 SYSTEM 權限停用這些目標，驗證完成後會自動移除 helper。
+不需要操作人員手動改 ACL、Registry 或 TrustedInstaller 權限。
+
+
+============================================================
+四、只做檢查，不修改設定
+============================================================
+
+檔案：
+RTX64_Windows_BackgroundTasks_Check.ps1
+
+使用方法：
+
+1. 開啟 PowerShell。
+2. 執行：
+
+   Set-ExecutionPolicy -Scope Process Bypass -Force
+
+3. 執行：
+
+   & "C:\RTX64_Setup\RTX64_Windows_BackgroundTasks_Check.ps1"
+
+判讀：
+
+PASS  = 該 Task 已 Disabled
+FAIL  = 該 Task 還是 Ready / Running / Enabled
+N/A   = 此 Windows 版本不存在這個 Task
+
+最後應顯示：
+
+PASS: All existing target tasks are Disabled.
+
+
+============================================================
+五、手動檢查指令
+============================================================
+
+若不使用 Check.ps1，也可以直接貼：
+
+Get-ScheduledTask |
+Where-Object {
+    $_.TaskName -match 'Microsoft Compatibility Appraiser|RunFullMemoryDiagnostic|ProcessMemoryDiagnosticEvents|NGEN|Consolidator|RegisterDevice|^Device$|^SR$'
+} |
+Select TaskPath,TaskName,State |
+Sort TaskPath,TaskName |
+Format-Table -AutoSize
+
+另外確認 Task Scheduler Operational Log：
+
+Get-WinEvent -ListLog 'Microsoft-Windows-TaskScheduler/Operational' |
+Select LogName,IsEnabled,RecordCount
+
+IsEnabled 應為：
+True
+
+
+============================================================
+六、Task Scheduler Operational Log
+============================================================
+
+建議專用 RTX64 控制機永久保持：
+
+Microsoft-Windows-TaskScheduler/Operational = Enabled
+
+啟用指令：
+
+wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
+
+原因：
+若未來再次出現 PDO RX / NAL 長尾，可直接將 EtherCAT timestamp
+與 Windows Task started / action started / completed 做秒級對時。
+
+
+============================================================
+七、目前不納入一鍵停用腳本的項目
+============================================================
+
+2026-09-17 實機仍觀察到其他 Windows 背景工作，例如：
+
+- WindowsUpdate\Scheduled Start
+- UpdateOrchestrator\USO_UxBroker
+- UpdateOrchestrator\Schedule Scan
+- UpdateOrchestrator\Backup Scan
+- PushToInstall\Registration
+- InstallService\ScanForUpdates
+- Office Automatic Updates 2.0
+- Office Feature Updates Logon
+- LanguageComponentsInstaller\Installation
+- MicrosoftEdgeUpdateTaskMachineUA
+- Adobe Acrobat Update Task
+- OneDrive Startup Task
+- DeviceDirectoryClient 其他未納入 A/B 的工作
+
+本版「故意不一次全部關掉」。
+理由是保留工程 A/B 可追溯性，避免一次改太多後無法判斷是哪一個背景工作真正造成干擾。
+
+若後續 EtherCAT Diagnostic 再證明其中某一項與 RX / NAL 異常高度對時，
+再將該項加入正式 RTX64 Windows Profile。
+
+
+============================================================
+八、操作原則
+============================================================
+
+1. 新機先完成 BIOS / RTX64 / EtherCAT 基本設定。
+2. 套用本一鍵腳本。
+3. 確認 FINAL CHECK 全部 PASS。
+4. 保持 TaskScheduler Operational Log 開啟。
+5. RTX64 正式性能驗證使用 RtssRelease。
+6. EtherCAT 維持相同 250 us 測試條件。
+7. 長時間觀察：
+   - RX Hard Timeout
+   - ReceivePacket Max / long tail
+   - WKC
+   - ESC Physical / Invalid / Forwarded / LostLink Delta
+   - PDO Exec Max / Combined Max
+   - RTX64 Latency
+8. Windows 型 Master/NAL 問題與 EtherCAT Physical Error 問題要分開判讀：
+   - ReceivePacket 190~225 us、ESC Physical Delta 0：
+     優先查 Windows shared-resource / Master NIC / NAL。
+   - ReceivePacket 本身很快、ESC Physical/Invalid Delta 增加：
+     優先查 EtherCAT 線材 / PHY / Slave physical domain。
+
+
+============================================================
+九、恢復原設定
+============================================================
+
+目前建議先把這份 Profile 當「專用 RTX64 控制機 A/B / deployment profile」。
+不要刪除 Task。
+
+若需要恢復某個 Task，可用：
+
+Enable-ScheduledTask -TaskPath "<TaskPath>" -TaskName "<TaskName>"
+
+DeviceDirectoryClient 若恢復時遇到 Access Denied，
+同樣需要以 SYSTEM 權限執行。
+
+============================================================
+END
+============================================================

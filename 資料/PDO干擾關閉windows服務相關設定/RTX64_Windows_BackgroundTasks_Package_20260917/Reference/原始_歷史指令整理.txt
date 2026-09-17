@@ -1,0 +1,131 @@
+
+//關閉-----------------------------------------------------------
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Application Experience\" `
+  -TaskName "Microsoft Compatibility Appraiser"
+
+
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Device Information\" `
+  -TaskName "Device"
+
+
+
+//確認關閉-----------------------------------------------------------
+
+Get-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Application Experience\" `
+  -TaskName "Microsoft Compatibility Appraiser"
+
+Get-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Device Information\" `
+  -TaskName "Device"
+
+
+
+
+
+-------------------------------------------------------------------------------------------------
+
+
+
+
+//關閉-----------------------------------------------------------
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\MemoryDiagnostic\" `
+  -TaskName "RunFullMemoryDiagnostic"
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\.NET Framework\" `
+  -TaskName ".NET Framework NGEN v4.0.30319 64"
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\.NET Framework\" `
+  -TaskName ".NET Framework NGEN v4.0.30319"
+
+
+
+
+
+//確認--------------------------------------------------------------
+Get-ScheduledTask |
+Where-Object {
+    $_.TaskName -match 'RunFullMemoryDiagnostic|NGEN'
+} |
+Select TaskPath,TaskName,State
+
+
+
+
+
+
+
+
+
+//關閉-----------------------------------------------------------
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\SystemRestore\" `
+  -TaskName "SR"
+
+
+
+//確認--------------------------------------------------------------
+
+
+Get-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\SystemRestore\" `
+  -TaskName "SR" |
+Select TaskPath,TaskName,State
+
+
+
+//檢查 SR 任務--------------------------------------------------------------
+$t = Get-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\SystemRestore\" `
+  -TaskName "SR"
+
+$t.Settings.MaintenanceSettings | Format-List *
+$t.Settings.IdleSettings | Format-List *
+
+
+
+
+//關閉-----------------------------------------------------------
+
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\MemoryDiagnostic\" `
+  -TaskName "ProcessMemoryDiagnosticEvents"
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Customer Experience Improvement Program\" `
+  -TaskName "Consolidator"
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\DeviceDirectoryClient\" `
+  -TaskName "RegisterDevicePeriodic24"
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\DeviceDirectoryClient\" `
+  -TaskName "RegisterDeviceLocationRightsChange"
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\DeviceDirectoryClient\" `
+  -TaskName "RegisterDeviceProtectionStateChanged"
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\DeviceDirectoryClient\" `
+  -TaskName "RegisterUserDevice"
+
+
+//檢查 SR 任務--------------------------------------------------------------
+
+Get-ScheduledTask |
+Where-Object {
+    $_.TaskName -match 'ProcessMemoryDiagnosticEvents|Consolidator|RegisterDevice'
+} |
+Select TaskPath,TaskName,State |
+Format-Table -AutoSize

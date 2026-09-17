@@ -31,6 +31,7 @@ struct MotionFeedArcReceipt
     NCPathCoreFeedArcV2 arc{};
     MotionExecutionIdentity identity{};
     MotionOwnerLease ownerLease{};
+    std::uint64_t translationGeneration = 0ULL;
     std::uint32_t validAxisMask = 0U;
     std::uint32_t geometryCode = 0U;
     MotionFeedArcCode code = MotionFeedArcCode::NONE;
@@ -45,6 +46,7 @@ struct MotionFeedArcReceipt
         arc.Clear();
         identity = MotionExecutionIdentity{};
         ownerLease = MotionOwnerLease{};
+        translationGeneration = 0ULL;
         validAxisMask = 0U;
         geometryCode = 0U;
         code = MotionFeedArcCode::NONE;

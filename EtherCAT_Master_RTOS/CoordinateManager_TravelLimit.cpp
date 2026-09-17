@@ -111,6 +111,9 @@ namespace
 
 void CoordinateManager::SetStoredStrokeCheckMode( int gCode,NCManager* nc)
 {
+    if ((gCode == 22 || gCode == 23) &&
+        m_programmableTravelLimitEnabled != (gCode == 22) &&
+        !GuardCoordinateMutation("STROKE_MODE", nc)) return;
     // 目前不使用 NCManager。
     // 之後若要做 Alarm / System Variable / Log
     // 可以直接從這個入口擴充。
@@ -161,6 +164,8 @@ void CoordinateManager::SetStoredStrokeCheckMode( int gCode,NCManager* nc)
 void CoordinateManager::SetProgrammableTravelLimitEnabled(
     bool enabled, NCManager* nc)
 {
+    if (m_programmableTravelLimitEnabled != enabled &&
+        !GuardCoordinateMutation("STROKE_POLICY", nc)) return;
     m_programmableTravelLimitEnabled =
         enabled;
 

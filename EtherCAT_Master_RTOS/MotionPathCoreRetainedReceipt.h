@@ -16,6 +16,7 @@ struct MotionPathCoreRetainedReceipt
 {
     MotionExecutionIdentity identity{};
     MotionOwnerLease ownerLease{};
+    std::uint64_t translationGeneration = 0ULL;
     std::uint32_t validAxisMask = 0U;
     MotionPathCoreRetainedCode code = MotionPathCoreRetainedCode::NONE;
     bool commandAccepted = false, tailCommitted = false, captureBound = false;
@@ -24,6 +25,7 @@ struct MotionPathCoreRetainedReceipt
     {
         identity = MotionExecutionIdentity{};
         ownerLease = MotionOwnerLease{};
+        translationGeneration = 0ULL;
         validAxisMask = 0U;
         code = MotionPathCoreRetainedCode::NONE;
         commandAccepted = tailCommitted = captureBound = travelLimitRejected = valid = false;

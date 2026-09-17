@@ -138,9 +138,11 @@
     <ClInclude Include="MotionFeedArcReceipt.h" />
     <ClInclude Include="MotionFeedbackRing.h" />
     <ClInclude Include="MotionFeedLineReceipt.h" />
+    <ClInclude Include="MotionNCTranslationProof.h" />
     <ClInclude Include="MotionPathCoreHoldExcursion.h" />
     <ClInclude Include="MotionPathCoreRetainedReceipt.h" />
     <ClInclude Include="MotionQueueTailTransaction.h" />
+    <ClInclude Include="MotionRotaryTarget.h" />
     <ClInclude Include="MotionRetainedInterval.h" />
     <ClInclude Include="NCAlarmEmergencyStopBoundary.h" />
     <ClInclude Include="NCBlockCompletionBoundary.h" />
@@ -229,6 +231,7 @@
     <ClInclude Include="NCResetReleaseGate.h" />
     <ClInclude Include="NCSingleBlockBoundary.h" />
     <ClInclude Include="NCSingleBlockHoldGate.h" />
+    <ClInclude Include="NCTranslationSnapshot.h" />
     <ClInclude Include="NC_Types.h" />
     <ClInclude Include="NicDriver.h" />
     <ClInclude Include="PlcCore.h" />

@@ -15,25 +15,25 @@
 
 namespace
 {
-    BY_ARC_NOINLINE bool FeedArcNormalOverride(const MotionCore& motion) noexcept
+    BY_ARC_NOINLINE bool FeedArcNormalOverride(const MotionCore& motion, bool buffered = false) noexcept
     {
         const MotionFeedHoldStopSnapshot snapshot = motion.GetFeedHoldStopSnapshot();
         return std::isfinite(snapshot.feedrateOverride) &&
             snapshot.feedrateOverride == 1.0 && !snapshot.overrideZero &&
-            snapshot.groupDone && !snapshot.groupActive &&
-            snapshot.commandQueueDepth == 0U &&
-            snapshot.commandIngressDepth == 0U &&
+            (buffered || (snapshot.groupDone && !snapshot.groupActive &&
+                snapshot.commandQueueDepth == 0U && snapshot.commandIngressDepth == 0U)) &&
             snapshot.commandReplayDepth == 0U &&
             !snapshot.groupFaulted && !snapshot.groupEmergencyStopped &&
             !snapshot.safetyOrRecoveryPending && snapshot.faultedAxes == 0U &&
-            snapshot.commandStopped;
+            (buffered || snapshot.commandStopped);
     }
 
     BY_ARC_NOINLINE bool PrepareFeedArcGeometry(
         const std::vector<AxisContext>* contexts,
         const std::array<double, 8U>& targetMCS,
         const double* commandedTail,
-        MotionFeedArcWorkspace& workspace) noexcept
+        MotionFeedArcWorkspace& workspace, const MotionCncPathTail* predecessor,
+        std::uint32_t endpointAxisMask) noexcept
     {
         MotionFeedArcReceipt& result = workspace.receipt;
         // Sample every existing native command baseline, exactly as BX/G00.
@@ -52,7 +52,7 @@ namespace
             if (slot >= contexts->size() || !(*contexts)[slot].isExist)
                 continue;
             const AxisContext& axis = (*contexts)[slot];
-            const double logicalPulse = axis.logicalCmdPos.Load();
+            const double logicalPulse = predecessor != nullptr ? predecessor->endPulse[slot] : axis.logicalCmdPos.Load();
             if (!std::isfinite(logicalPulse) ||
                 !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
                 !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0)
@@ -60,8 +60,18 @@ namespace
                 result.code = MotionFeedArcCode::INVALID_INPUT;
                 return false;
             }
-            double baseline = logicalPulse * axis.finalLead / axis.resolution_PPR;
-            if (axis.axisType == AxisType::LINEAR && std::isfinite(baseline))
+            if (predecessor != nullptr &&
+                ((predecessor->validAxisMask & (1U << static_cast<unsigned>(slot))) == 0U ||
+                    commandedTail[slot] != predecessor->endMCS[slot]))
+            {
+                result.code = MotionFeedArcCode::NOT_READY; return false;
+            }
+            double baseline = predecessor != nullptr ? predecessor->endMCS[slot] :
+                logicalPulse * axis.finalLead / axis.resolution_PPR;
+            // EF: buffered MCS stays canonical even if commanded tail has a numerically
+            // equal but bit-distinct representation (for example signed zero).
+            if (predecessor == nullptr && axis.axisType == AxisType::LINEAR &&
+                std::isfinite(baseline))
             {
                 // Keep the commanded MCS representation only after its forward
                 // conversion exactly matches the sampled pulse. A round trip
@@ -117,9 +127,11 @@ namespace
                 result.code = MotionFeedArcCode::INVALID_INPUT;
                 return false;
             }
-            // Full-circle endpoint is the actual sampled start, bit for bit.
-            // Do not round-trip its pulses through the MCS conversion.
-            if (!workspace.input.fullCircle)
+            // EF: an omitted endpoint axis keeps the sampled start bit for bit,
+            // including buffered canonical-tail pulses. Full circles keep both.
+            // Do not round-trip an unprogrammed axis through MCS conversion.
+            if (!workspace.input.fullCircle &&
+                (endpointAxisMask & (1U << static_cast<unsigned>(slot))) != 0U)
             {
                 const double targetPulse = targetMCS[slot] * pulsePerMM;
                 if (!std::isfinite(targetMCS[slot]) || !std::isfinite(targetPulse))
@@ -160,6 +172,15 @@ namespace
         std::memset(static_cast<void*>(&command), 0, sizeof(command));
         command.execution.sourceBlockId = MOTION_SOURCE_BLOCK_ID_INVALID;
         command.sourceWCS = 54;
+        command.sourceTranslation.schema = 8U;
+        command.sourceTranslation.scalingMode = 50;
+        command.sourceTranslation.scalingFactor = 1.0;
+        command.sourceTranslation.distanceMode = 90;
+        command.sourceTranslation.unitsMode = 21;
+        command.sourceTranslation.toolLengthMode = 49;
+        command.sourceTranslation.workMode = 169;
+        command.sourceTranslation.rotationMode = 69;
+        command.sourceTranslation.rotationPlane = 17;
         command.sourceToolLengthMode = 49;
         command.sourceToolRadiusMode = 40;
         command.sourceIsAbsoluteMode = true;
@@ -205,6 +226,23 @@ bool MotionCore::TryG02G03MoveTransactionalTail(
     MotionFeedArcWorkspace& workspace,
     MotionCommand& commandWorkspace)
 {
+    return TryG02G03MoveTransactionalCncTail(targetMCS, centerOffsetMM, direction, fullCircle,
+        feedMMMin, travelGuard, commandedMCSTail, workspace, commandWorkspace, nullptr, false);
+}
+
+bool MotionCore::TryG02G03MoveTransactionalCncTail(
+    const std::array<double, 8U>& targetMCS,
+    const std::array<double, 2U>& centerOffsetMM,
+    int direction,
+    bool fullCircle,
+    double feedMMMin,
+    const MotionArcTravelGuard& travelGuard,
+    double(&commandedMCSTail)[MAX_AXES],
+    MotionFeedArcWorkspace& workspace,
+    MotionCommand& commandWorkspace, const MotionCncPathTail* predecessor,
+    bool cncFeedLookahead, std::uint32_t endpointAxisMask,
+    bool requirePlanarBaselineMatch)
+{
     static_assert(MAX_AXES == 8, "BY fixed workspace must match Motion axes.");
     MotionFeedArcReceipt& result = workspace.receipt;
     result.Clear();
@@ -218,13 +256,25 @@ bool MotionCore::TryG02G03MoveTransactionalTail(
     const MotionOwnerLease plannedOwner = GetMotionOwnerLease();
     const MotionCommandSource source =
         m_pendingCommandSource.load(std::memory_order_acquire);
-    if (m_pContexts == nullptr || m_pContexts->size() < 2U ||
+    if (!IsPendingFixedTranslationSourceAllowed() ||
+        (cncFeedLookahead && (m_pendingTranslation.distanceMode != 90 ||
+            !m_pendingIsAbsoluteMode || m_pendingPlaneMode != 17 || m_pendingG162Active)) ||
+        m_pContexts == nullptr || m_pContexts->size() < 2U ||
         m_pContexts->size() > 8U || travelGuard.check == nullptr ||
         !std::isfinite(feedMMMin) || feedMMMin <= 0.0 || feedMMMin > 100.0 ||
         (direction != -1 && direction != 1) ||
+        (fullCircle ? (endpointAxisMask != 0U && endpointAxisMask != 3U) :
+            (endpointAxisMask == 0U || endpointAxisMask > 3U)) ||
         !std::isfinite(centerOffsetMM[0]) || !std::isfinite(centerOffsetMM[1]))
     {
         result.code = MotionFeedArcCode::INVALID_INPUT;
+        return false;
+    }
+    const bool buffered = predecessor != nullptr;
+    if (buffered && (!cncFeedLookahead || !IsCncPathProducerTailCurrent(*predecessor, 3U,
+        commandedMCSTail, plannedEpoch, plannedOwner, source)))
+    {
+        result.code = MotionFeedArcCode::NOT_READY;
         return false;
     }
     if (plannedEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
@@ -233,13 +283,38 @@ bool MotionCore::TryG02G03MoveTransactionalTail(
         !m_programBlockMotionCaptureActive ||
         m_programBlockMotionCapture.overflow ||
         m_programBlockMotionCapture.count != 0U ||
-        HasPendingSafetyOrRecoveryRequests() || !FeedArcNormalOverride(*this))
+        HasPendingSafetyOrRecoveryRequests() || !FeedArcNormalOverride(*this, buffered))
     {
         result.code = MotionFeedArcCode::NOT_READY;
         return false;
     }
-    if (!PrepareFeedArcGeometry(m_pContexts, targetMCS, commandedMCSTail, workspace))
+    if (!PrepareFeedArcGeometry(m_pContexts, targetMCS, commandedMCSTail,
+        workspace, predecessor, endpointAxisMask))
         return false;
+    // A first rotated/dependent endpoint is tied to the sampled native basis.
+    // A buffered arc already proved its accepted predecessor tuple above;
+    // PrepareFeedArcGeometry preserves that canonical MCS/pulse tail, while
+    // live axes may still be moving on an earlier queued segment.
+    if ((requirePlanarBaselineMatch ||
+            (cncFeedLookahead && NCTranslationHasPlanarRotation(m_pendingTranslation)) ||
+            m_pendingTranslation.distanceMode == 91) && !buffered &&
+        !IsPlanarEndpointBasisCurrent(commandedMCSTail,
+            workspace.input.startPulse, result.validAxisMask, 3U))
+    {
+        result.code = MotionFeedArcCode::NOT_READY;
+        return false;
+    }
+    if (cncFeedLookahead)
+    {
+        const double budget = 0.5 * (std::min)(result.arc.velocityPPS / workspace.accTime,
+            result.arc.velocityPPS / workspace.decTime);
+        const double speed = (std::min)(result.arc.velocityPPS,
+            std::sqrt(budget) * std::sqrt(result.arc.radiusPulse));
+        if (!std::isfinite(speed) || speed < 1.0)
+        {
+            result.code = MotionFeedArcCode::GEOMETRY_REJECTED; return false;
+        }
+    }
     // Endpoints alone are insufficient: every directed-sweep cardinal bound
     // must pass the same software travel policy before changing epoch/queue.
     for (int axis = 0; axis < 2; ++axis)
@@ -270,11 +345,21 @@ bool MotionCore::TryG02G03MoveTransactionalTail(
     cmd.targetVel = result.arc.velocityPPS;
     cmd.accTime = workspace.accTime;
     cmd.decTime = workspace.decTime;
-    cmd.commandPathMode = MotionCommandPathMode::EXACT_STOP;
+    cmd.commandPathMode = cncFeedLookahead ? MotionCommandPathMode::CONTINUOUS : MotionCommandPathMode::EXACT_STOP;
+    cmd.cncFeedLookahead = cncFeedLookahead;
+    if (cncFeedLookahead)
+    {
+        for (std::size_t i = 0U; i < 2U; ++i) cmd.mem_startPos[i] = result.arc.startPulse[i];
+        cmd.mem_radius = result.arc.radiusPulse;
+        cmd.mem_startAngle = result.arc.startAngle;
+        cmd.mem_totalAngle = result.arc.sweepRadians;
+        cmd.mem_totalDist = result.arc.lengthPulse;
+    }
     cmd.pathCorePlanarCircle = true;
     cmd.pathCoreFullCircle = fullCircle;
     cmd.sourceLinePC = m_pendingSourcePC;
     cmd.sourceWCS = m_pendingSourceWCS;
+    cmd.sourceTranslation = m_pendingTranslation;
     cmd.sourceToolLengthMode = m_pendingToolMode;
     cmd.sourceHCode = m_pendingHCode;
     cmd.sourceToolRadiusMode = m_pendingToolRadMode;
@@ -291,8 +376,8 @@ bool MotionCore::TryG02G03MoveTransactionalTail(
     cmd.sourceG162Active = m_pendingG162Active;
     cmd.sourcePlaneMode = m_pendingPlaneMode;
 
-    MotionExecutionEpoch publishedEpoch = MOTION_EXECUTION_EPOCH_INVALID;
-    if (!TryPublishOwnerAuthorizedAbortingExecutionEpoch(
+    MotionExecutionEpoch publishedEpoch = plannedEpoch;
+    if (!buffered && !TryPublishOwnerAuthorizedAbortingExecutionEpoch(
         source, plannedEpoch, plannedOwner, publishedEpoch))
     {
         RejectPathCoreArcPublication(cmd, plannedEpoch, publishedEpoch,
@@ -301,6 +386,7 @@ bool MotionCore::TryG02G03MoveTransactionalTail(
     }
     AssignExecutionIdentity(cmd, publishedEpoch, source, plannedOwner);
     result.identity = cmd.execution;
+    result.translationGeneration = cmd.sourceTranslation.generation;
     result.ownerLease = cmd.ownerLease;
     result.commandAccepted = TryEnqueueMotionCommand(cmd);
     if (!result.commandAccepted)
@@ -352,9 +438,10 @@ bool MotionCore::TryG02G03MoveTransactionalTail(
     }
     const MotionProgramBlockSubmission& submission =
         m_programBlockMotionCapture.submissions[0U];
-    result.captureBound = submission.producerAccepted &&
+    result.captureBound = submission.translationGeneration == result.translationGeneration &&
+        submission.producerAccepted &&
         submission.immediateRejectReason == MotionRejectReason::NONE &&
-        submission.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        submission.commandPathMode == (cncFeedLookahead ? MotionCommandPathMode::CONTINUOUS : MotionCommandPathMode::EXACT_STOP) &&
         submission.identity.epoch == result.identity.epoch &&
         submission.identity.segmentId == result.identity.segmentId &&
         submission.identity.sourceBlockId == result.identity.sourceBlockId &&

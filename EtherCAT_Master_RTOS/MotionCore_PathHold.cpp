@@ -20,20 +20,20 @@ namespace
     bool CLReturnEligible(const MotionPathCoreHoldExcursionSnapshot& s) noexcept
     {
         return s.phase == MotionPathCoreHoldExcursionPhase::WAIT_RETURN &&
-            s.requireReturnAuthorization && s.cycleLimit == 1U &&
-            s.retreatCount == 1ULL && s.returnCount == 0ULL;
+            s.requireReturnAuthorization && s.cycleLimit >= 1U && s.cycleLimit <= 32U &&
+            s.returnCount < s.cycleLimit&& s.retreatCount == s.returnCount + 1ULL;
     }
     bool CDViewValid(const MotionPathCoreHoldExcursionView& view) noexcept
     {
         if (view.completedCount == 0U || view.completedCount > view.completed.size() ||
             view.validAxisMask == 0U || (view.validAxisMask & ~255U) != 0U ||
-            !IsNCPathCoreRetainedGeometryValid(view.original) || view.original.point) return false;
+            (view.original.kind == NCPathCoreRetainedKind::LINE_ARC || !IsNCPathCoreRetainedGeometryValid(view.original)) || view.original.point) return false;
         for (std::uint32_t axis = 0U; axis < 8U; ++axis)
             if ((view.validAxisMask & (1U << axis)) != 0U && !CBPositive(view.pulsePerMM[axis])) return false;
         for (std::uint32_t row = 0U; row <= view.completedCount; ++row)
         {
             const auto& g = row == view.completedCount ? view.original : view.completed[row];
-            if (!IsNCPathCoreRetainedGeometryValid(g) || (g.axisMask & ~view.validAxisMask) != 0U ||
+            if ((g.kind == NCPathCoreRetainedKind::LINE_ARC || !IsNCPathCoreRetainedGeometryValid(g)) || (g.axisMask & ~view.validAxisMask) != 0U ||
                 (!g.point && !CBPositive(g.lengthPulse / g.lengthMM))) return false;
             if (row != 0U && !AreNCPathCoreRetainedEndpointsConnected(view.completed[row - 1U],
                 g, view.validAxisMask, view.pulsePerMM)) return false;
@@ -70,24 +70,26 @@ bool MotionCore::BindPathCoreHoldExcursion(const MotionExecutionIdentity& identi
     double sourceFeedMMMin, double sourceVelocityPPS, std::uint32_t cycleLimit,
     const MotionPathCoreHoldExcursionView* crossView, bool requireReturnAuthorization) noexcept
 {
-    if (!identity.IsAssigned() || identity.source != MotionCommandSource::NC_MEMORY ||
+    if (!IsPendingFixedTranslationSourceAllowed() ||
+        !identity.IsAssigned() || identity.source != MotionCommandSource::NC_MEMORY ||
         !lease.IsValid() || lease.owner != MotionOwner::AUTO ||
         !CBPositive(lengthMM) || !CBPositive(lengthPulse) || !CBPositive(distanceMM) ||
         !CBPositive(feedMMMin) || !CBPositive(sourceFeedMMMin) || sourceFeedMMMin > 100.0 ||
         feedMMMin > sourceFeedMMMin || !CBPositive(sourceVelocityPPS) ||
-        !CBPositive(lengthPulse / lengthMM) || cycleLimit < 1U || cycleLimit > 32U ||
-        (requireReturnAuthorization && cycleLimit != 1U)) return false;
+        !CBPositive(lengthPulse / lengthMM) || cycleLimit < 1U || cycleLimit > 32U) return false;
     // FIX2: Use the admitted source speed as the sole PPS reference.
     // Re-converting F through rounded geometry can differ by one ULP even
     // when both NC feeds are exactly F6. Keep the semantic F bound exact.
     const double excursionVelocity = sourceVelocityPPS * (feedMMMin / sourceFeedMMMin);
     if (!CBPositive(excursionVelocity) || excursionVelocity > sourceVelocityPPS) return false;
     if (crossView != nullptr && (!CDViewValid(*crossView) ||
-        crossView->original.lengthMM != lengthMM || crossView->original.lengthPulse != lengthPulse)) return false;
+        crossView->original.lengthMM != lengthMM || crossView->original.lengthPulse != lengthPulse ||
+        crossView->translationGeneration != m_pendingTranslation.generation)) return false;
     auto& r = m_pathHoldProducerRequest;
     r.start = false; r.returnStart = false; r.requireReturnAuthorization = requireReturnAuthorization;
     r.settleSequence = 0ULL; r.expectedTransitionSequence = 0ULL;
     r.identity = identity; r.lease = lease;
+    r.translationGeneration = m_pendingTranslation.generation;
     r.generation = m_pathHoldGeneration.load(std::memory_order_acquire);
     r.lengthMM = lengthMM; r.lengthPulse = lengthPulse; r.distanceMM = distanceMM; r.feedMMMin = feedMMMin;
     r.sourceFeedMMMin = sourceFeedMMMin; r.sourceVelocityPPS = sourceVelocityPPS;
@@ -102,7 +104,8 @@ bool MotionCore::RequestPathCoreHoldExcursion(const MotionExecutionIdentity& ide
 {
     const auto s = GetPathCoreHoldExcursionSnapshot();
     const auto generation = m_pathHoldGeneration.load(std::memory_order_acquire);
-    if (settleSequence == MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID ||
+    if (s.translationGeneration != GetActiveTranslationGeneration() ||
+        s.admissionPending || settleSequence == MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID ||
         (!CCEligible(s) && !CLReturnEligible(s)) || !s.ready || s.requestGeneration != generation ||
         !CBIdentity(s.identity, identity) || !s.ownerLease.Matches(lease) ||
         !IsMotionOwnerLeaseCurrent(lease) || HasPendingSafetyOrRecoveryRequests() ||
@@ -118,6 +121,7 @@ bool MotionCore::RequestPathCoreHoldExcursion(const MotionExecutionIdentity& ide
     auto& r = m_pathHoldProducerRequest;
     r.crossSegment = false; r.returnStart = CLReturnEligible(s);
     r.identity = identity; r.lease = lease; r.start = true; r.settleSequence = settleSequence;
+    r.translationGeneration = s.translationGeneration;
     r.generation = generation; r.expectedTransitionSequence = s.transitionSequence;
     if (!m_pathHoldRequests.ProducerTryPush(r)) return false;
     m_pathHoldStartTicket = r;
@@ -134,7 +138,9 @@ bool MotionCore::CommitPathCoreHoldExcursion(const MotionExecutionIdentity& iden
         (snapshot.phase == MotionPathCoreHoldExcursionPhase::ARMED &&
             ticket.expectedTransitionSequence != (std::numeric_limits<std::uint64_t>::max)() &&
             snapshot.transitionSequence == ticket.expectedTransitionSequence + 1ULL);
-    if (!identity.IsAssigned() || identity.epoch != GetCurrentExecutionEpoch() ||
+    if (snapshot.translationGeneration != GetActiveTranslationGeneration() ||
+        ticket.translationGeneration != snapshot.translationGeneration ||
+        snapshot.admissionPending || !identity.IsAssigned() || identity.epoch != GetCurrentExecutionEpoch() ||
         !CBIdentity(snapshot.identity, identity) || !snapshot.ownerLease.Matches(lease) ||
         !CBIdentity(ticket.identity, identity) || !ticket.lease.Matches(lease) ||
         ticket.generation != generation || snapshot.requestGeneration != generation ||
@@ -191,24 +197,45 @@ void MotionCore::PublishPathCoreHoldExcursionSnapshot() noexcept
     m_pathHoldPublication.store(++m_pathHoldNextPublication, std::memory_order_release);
 }
 
+void MotionCore::ResetPathCoreAdmissionCorrectionDiagnostic() noexcept
+{
+    auto& s = m_pathHold.status;
+    s.admissionCorrectionTick = 0ULL;
+    s.admissionCorrectionCycles = 0ULL;
+    s.admissionCorrectionAxis = -1;
+    s.admissionCorrectionMask = 0U;
+    s.admissionCorrectionDecision = MotionPathCoreAdmissionCorrectionDecision::NOT_APPLICABLE;
+    s.admissionCorrectionReason = MotionPathCoreAdmissionCorrectionReason::NONE;
+    s.admissionCorrectionFirstIntegral = 0.0;
+    s.admissionCorrectionKp = 0.0;
+    s.admissionCorrectionVelocityPPS = 0.0;
+}
+
 void MotionCore::SetPathCoreHoldPhase(MotionPathCoreHoldExcursionPhase phase, std::uint32_t reason) noexcept
 {
+    ResetPathCoreAdmissionCorrectionDiagnostic();
     m_pathHold.status.phase = phase; m_pathHold.status.reason = reason;
+    m_pathHold.status.admissionPending = false;
+    m_pathHold.status.admissionWaitTick = 0ULL;
+    m_pathHold.status.admissionWaitAxis = -1;
+    m_pathHold.status.admissionFollowingError = 0.0;
+    m_pathHold.status.admissionWindowPulse = 0.0;
     ++m_pathHold.status.transitionSequence; m_pathHold.status.ready = false; m_pathHold.status.boundaryOnly = false;
 }
 
 bool MotionCore::IsPathCoreHoldSourceCurrent() const noexcept
 {
     const auto& c = m_Group.currentCmd;
-    return m_Group.isActive && CBIdentity(c.execution, m_pathHold.status.identity) &&
+    return m_Group.isActive && !c.cncCornerBlend && CBIdentity(c.execution, m_pathHold.status.identity) &&
         c.ownerLease.Matches(m_pathHold.status.ownerLease) &&
         GetCommandAuthorizationFailure(c) == MotionRejectReason::NONE &&
         !HasPendingSafetyOrRecoveryRequests() && !HasPendingExecutionEpochChange() &&
         m_Group.pathMode == PathMode::EXACT_STOP && !m_Group.enableHistory && !m_Group.enableTransform &&
         m_Group.jumpManager.state == JumpState::IDLE && !c.pathCoreRetainedTraversal &&
-        !c.replayTerminalAlreadyPublished && c.sourceWCS == 54 && c.sourceToolLengthMode == 49 &&
+        !c.replayTerminalAlreadyPublished && IsMotionFixedTranslationSourceAllowed(c) &&
+        c.sourceTranslation.generation == m_pathHold.status.translationGeneration && IsMotionFixedTranslationToolSourceAllowed(c) &&
         c.sourceToolRadiusMode == 40 && c.sourceIsAbsoluteMode && c.sourcePlaneMode == 17 &&
-        !c.sourceG68Active && !c.sourceG168Active && !c.sourceG51Active &&
+        IsMotionFixedTranslationRotationSourceAllowed(c) && IsMotionFixedTranslationWorkSourceAllowed(c) && !c.sourceG51Active &&
         c.sourceMirrorMask == 0U && !c.sourceG16Active && !c.sourceG162Active &&
         (c.mode == InterpolationMode::LINEAR || c.pathCorePlanarCircle) &&
         m_Group.axisCount > 0 && m_Group.axisCount <= 3 &&
@@ -249,6 +276,7 @@ bool MotionCore::IsPathCoreHoldEffectiveMappingValid() const noexcept
     if (!m_pathHold.unionActive || !m_pathHold.status.crossSegment) return false;
     const auto& c = m_Group.currentCmd;
     if (!CBIdentity(c.execution, m_pathHold.status.identity) ||
+        c.sourceTranslation.generation != m_pathHold.status.translationGeneration ||
         !c.ownerLease.Matches(m_pathHold.status.ownerLease)) return false;
     if (m_Group.axisCount < m_pathHold.originalAxisCount || m_Group.axisCount > 3 ||
         c.axisCount != m_pathHold.originalAxisCount) return false;
@@ -269,7 +297,9 @@ bool MotionCore::ValidatePathCoreHoldCrossSource() const noexcept
     if (!m_pathHold.status.crossSegment) return true;
     const auto& view = m_pathHold.crossView;
     const auto& source = view.original;
-    if (!CDViewValid(view) || m_pContexts == nullptr) return false;
+    if (!CDViewValid(view) || m_pContexts == nullptr ||
+        view.translationGeneration != m_pathHold.status.translationGeneration ||
+        view.translationGeneration != m_Group.currentCmd.sourceTranslation.generation) return false;
     std::uint32_t mask = 0U;
     for (int slot = 0; slot < m_Group.currentCmd.axisCount; ++slot)
     {
@@ -292,8 +322,9 @@ bool MotionCore::ValidatePathCoreHoldCrossSource() const noexcept
     return true;
 }
 
-bool MotionCore::ExpandPathCoreHoldAxisUnion() noexcept
+bool MotionCore::ExpandPathCoreHoldAxisUnion(bool& waitForSettle) noexcept
 {
+    waitForSettle = false;
     if (!m_pathHold.status.crossSegment || m_pathHold.unionActive) return true;
     if (!ValidatePathCoreHoldCrossSource()) return false;
     std::uint32_t mask = m_pathHold.crossView.original.axisMask;
@@ -302,6 +333,7 @@ bool MotionCore::ExpandPathCoreHoldAxisUnion() noexcept
     if ((mask & ~7U) != 0U) return false;
     // Extra axes are admitted while still IDLE. Their first motion requires
     // the same NEW 200-cycle proof as every original source axis.
+    bool followingReady = true;
     for (int axis = 0; axis < 3; ++axis)
     {
         if ((mask & (1U << axis)) == 0U) continue;
@@ -310,14 +342,20 @@ bool MotionCore::ExpandPathCoreHoldAxisUnion() noexcept
         if (!a.isExist || a.axisType != AxisType::LINEAR || !a.isServoOn || a.isFault || a.isLagAlarm ||
             !CBPositive(a.maxVel_PPS) || !CBPositive(a.inPositionWindow_Pulse) ||
             !std::isfinite(a.currentCmdPos) || !std::isfinite(a.currentActPos) ||
-            a.currentCmdVel != 0.0 || a.logicalCmdVel != 0.0 ||
-            std::abs(a.currentCmdPos - a.currentActPos) > a.inPositionWindow_Pulse) return false;
+            a.currentCmdVel != 0.0 || a.logicalCmdVel != 0.0) return false;
+        const double followingError = std::abs(a.currentCmdPos - a.currentActPos);
+        if (!std::isfinite(followingError)) return false;
+        followingReady = followingReady && followingError <= a.inPositionWindow_Pulse;
         if ((m_pathHold.crossView.original.axisMask & (1U << axis)) == 0U &&
             (a.state != MotionState::MotionState_IDLE || a.targetVelocity != 0.0 || a.targetEndVel != 0.0 ||
                 a.bufferSum != 0.0 || !std::all_of(a.velBuffer.begin(), a.velBuffer.end(), [](double q) { return q == 0.0; }) ||
                 !CDPulseNear(a.currentCmdPos, m_pathHold.crossView.original.startPulse[axis],
                     m_pathHold.crossView.original, axis, m_pathHold.crossView.pulsePerMM[axis]))) return false;
     }
+    // A finite physical settling delay does not invalidate source geometry.
+    // Finish all structural checks before waiting; preserve the IDLE axes and
+    // acquire the existing fresh union proof only after this window recovers.
+    if (!followingReady) { waitForSettle = true; return false; }
     m_pathHold.originalAxisCount = m_Group.axisCount;
     for (int slot = 0; slot < m_Group.axisCount; ++slot)
         m_pathHold.originalAxisIndices[slot] = m_Group.axisIndices[slot];
@@ -535,7 +573,9 @@ bool MotionCore::ProcessPathCoreHoldExcursion(AxisCommand& command) noexcept
         return false;
     }
     auto& request = m_pathHoldConsumeRequest;
-    if (m_pathHoldRequests.ConsumerTryPop(request) && request.generation == generation &&
+    if (m_pathHoldRequests.ConsumerTryPop(request) &&
+        request.translationGeneration == GetActiveTranslationGeneration() &&
+        request.generation == generation &&
         request.generation == m_pathHoldGeneration.load(std::memory_order_acquire))
     {
         // A duplicate receipt cannot reset this source's cumulative budget,
@@ -559,6 +599,7 @@ bool MotionCore::ProcessPathCoreHoldExcursion(AxisCommand& command) noexcept
             m_pathHold.status.transitionSequence = transitions;
             m_pathHold.generation = generation;
             m_pathHold.status.identity = request.identity; m_pathHold.status.ownerLease = request.lease;
+            m_pathHold.status.translationGeneration = request.translationGeneration;
             m_pathHold.status.lengthPulse = request.lengthPulse;
             m_pathHold.status.cycleLimit = request.cycleLimit;
             m_pathHold.status.requireReturnAuthorization = request.requireReturnAuthorization;
@@ -578,6 +619,7 @@ bool MotionCore::ProcessPathCoreHoldExcursion(AxisCommand& command) noexcept
         }
         else if (request.start && request.returnStart && CLReturnEligible(m_pathHold.status) &&
             request.generation == m_pathHold.generation &&
+            request.translationGeneration == m_pathHold.status.translationGeneration &&
             request.expectedTransitionSequence == m_pathHold.status.transitionSequence &&
             request.settleSequence > m_pathHold.lastAcceptedStartSequence &&
             request.settleSequence > m_pathHold.status.completedHoldRequestSequence &&
@@ -595,6 +637,7 @@ bool MotionCore::ProcessPathCoreHoldExcursion(AxisCommand& command) noexcept
         else if (request.start && !request.returnStart && CCEligible(m_pathHold.status) &&
             !m_pathHold.startPending && !m_pathHold.movementOwned &&
             request.generation == m_pathHold.generation &&
+            request.translationGeneration == m_pathHold.status.translationGeneration &&
             request.expectedTransitionSequence == m_pathHold.status.transitionSequence &&
             request.settleSequence > m_pathHold.lastAcceptedStartSequence &&
             request.settleSequence > m_pathHold.status.completedHoldRequestSequence &&
@@ -702,8 +745,10 @@ bool MotionCore::ProcessPathCoreHoldExcursion(AxisCommand& command) noexcept
         if (!IsPathCoreHoldStrictlyStopped()) return true;
         if (!m_pathHold.startCaptured)
         {
-            if (!ExpandPathCoreHoldAxisUnion())
+            bool waitForSettle = false;
+            if (!ExpandPathCoreHoldAxisUnion(waitForSettle))
             {
+                if (waitForSettle) return true;
                 m_pathHold.startPending = false; SetPathCoreHoldPhase(MotionPathCoreHoldExcursionPhase::REJECTED, 8U); return true;
             }
             m_pathHold.status.heldS = v.currentCmdPos;
@@ -1001,10 +1046,26 @@ bool MotionCore::ProcessPathCoreHoldExcursion(AxisCommand& command) noexcept
     return true;
 }
 
+bool MotionCore::IsPathCoreAdmissionWaitAxisHealthy(const AxisContext& axis) const noexcept
+{
+    return axis.isExist && axis.isServoOn && axis.startupLagMonitorArmed &&
+        !axis.startupLagPrematureMotionBlocked && !axis.isFault && !axis.isLagAlarm &&
+        axis.state == MotionState::MotionState_IDLE && axis.inPosition &&
+        std::isfinite(axis.currentCmdPos) && std::isfinite(axis.currentActPos) &&
+        std::isfinite(std::abs(axis.currentCmdPos - axis.currentActPos)) &&
+        std::isfinite(axis.logicalCmdPos) && std::isfinite(axis.planningPos) &&
+        std::isfinite(axis.finalTargetPos) && CBPositive(axis.inPositionWindow_Pulse) &&
+        std::isfinite(axis.currentCmdVel) && std::abs(axis.currentCmdVel) <= 1.0 &&
+        std::isfinite(axis.logicalCmdVel) && std::abs(axis.logicalCmdVel) <= 1.0 &&
+        std::isfinite(axis.targetVelocity) && std::abs(axis.targetVelocity) <= 1.0 &&
+        std::isfinite(axis.targetEndVel) && std::abs(axis.targetEndVel) <= 1.0;
+}
+
 void MotionCore::UpdatePathCoreHoldExcursionEvidence() noexcept
 {
     const auto generation = m_pathHoldGeneration.load(std::memory_order_acquire);
     if (m_pathHold.generation != 0ULL && (generation != m_pathHold.generation ||
+        m_pathHold.status.translationGeneration != GetActiveTranslationGeneration() ||
         m_pathHold.status.identity.epoch != GetCurrentExecutionEpoch() ||
         !IsMotionOwnerLeaseCurrent(m_pathHold.status.ownerLease) || HasPendingSafetyOrRecoveryRequests()))
     {
@@ -1018,6 +1079,59 @@ void MotionCore::UpdatePathCoreHoldExcursionEvidence() noexcept
         m_pathHold.unionActive = false; m_pathHold.crossGeometryActive = false;
         m_pathHold.prelaunchRejected = false;
     }
+    // CR_FIX1: Bind can precede command ingress/LoadNextCommand. Keep the
+    // previous publication until this scalar belongs to the new source.
+    // Rejected/invalidated states still publish; same-tick load/completion
+    // needs no sourceSeen flag once the command identity and lease match.
+    if (m_pathHold.status.phase == MotionPathCoreHoldExcursionPhase::ARMED &&
+        !m_pathHold.sourceSeen &&
+        (!CBIdentity(m_Group.currentCmd.execution, m_pathHold.status.identity) ||
+            !m_Group.currentCmd.ownerLease.Matches(m_pathHold.status.ownerLease)))
+    {
+        auto& s = m_pathHold.status;
+        if (s.admissionPending && !m_Group.isActive && !HasPendingExecutionEpochChange() &&
+            m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+            m_ncSettleRuntimeCycleContiguous && m_ncSettleMotionPassCompleted &&
+            s.admissionWaitTick != 0ULL && s.admissionWaitTick == m_ncSettleRuntimeCycleTick &&
+            s.admissionWaitAxis >= 0 && m_pContexts != nullptr &&
+            static_cast<std::size_t>(s.admissionWaitAxis) < m_pContexts->size() &&
+            CBPositive(s.admissionWindowPulse) && std::isfinite(s.admissionFollowingError) &&
+            s.admissionFollowingError > s.admissionWindowPulse &&
+            TryPeekNextMotionCommand(m_pathHoldAdmissionFront) &&
+            CBIdentity(m_pathHoldAdmissionFront.execution, s.identity) &&
+            m_pathHoldAdmissionFront.ownerLease.Matches(s.ownerLease) &&
+            GetCommandAuthorizationFailure(m_pathHoldAdmissionFront) == MotionRejectReason::NONE &&
+            s.holdRequestSequence == 0ULL && s.completedHoldRequestSequence == 0ULL &&
+            s.retreatCount == 0ULL && s.returnCount == 0ULL && !m_pathHold.startPending &&
+            m_pathHoldAdmissionFront.axisCount > 0 && m_pathHoldAdmissionFront.axisCount <= MAX_AXES)
+        {
+            // Feedback and servo state are refreshed after the load gate.
+            // A later fault on any incoming axis cannot renew this heartbeat.
+            bool healthy = true, blockedMember = false;
+            std::uint32_t seen = 0U;
+            for (int slot = 0; healthy && slot < m_pathHoldAdmissionFront.axisCount; ++slot)
+            {
+                const int axis = m_pathHoldAdmissionFront.axisIndices[slot];
+                healthy = axis >= 0 && axis < MAX_AXES&& axis < 32 &&
+                    static_cast<std::size_t>(axis) < m_pContexts->size();
+                if (!healthy) break;
+                const auto bit = static_cast<std::uint32_t>(1U << axis);
+                healthy = (seen & bit) == 0U && IsPathCoreAdmissionWaitAxisHealthy((*m_pContexts)[axis]);
+                seen |= bit;
+                blockedMember = blockedMember || axis == s.admissionWaitAxis;
+            }
+            if (!healthy || !blockedMember) return;
+            s.activeS = (std::numeric_limits<double>::quiet_NaN)();
+            s.ready = false; s.boundaryOnly = false;
+            PublishPathCoreHoldExcursionSnapshot();
+        }
+        return;
+    }
+    m_pathHold.status.admissionPending = false;
+    m_pathHold.status.admissionWaitTick = 0ULL;
+    m_pathHold.status.admissionWaitAxis = -1;
+    m_pathHold.status.admissionFollowingError = 0.0;
+    m_pathHold.status.admissionWindowPulse = 0.0;
     m_pathHold.status.activeS = m_Group.virtualAxis.currentCmdPos;
     m_pathHold.status.ready = false;
     m_pathHold.status.boundaryOnly = false;
@@ -1026,23 +1140,32 @@ void MotionCore::UpdatePathCoreHoldExcursionEvidence() noexcept
     {
         const auto& proof = m_ncSettlePublishedSnapshots[static_cast<std::size_t>(MotionNCSettleProfile::FEED_HOLD_GROUP)];
         const auto& tracker = m_ncSettleTrackers[static_cast<std::size_t>(MotionNCSettleProfile::FEED_HOLD_GROUP)];
-        const bool settled = proof.settled && proof.requestAccepted && proof.runtimeCycleValid &&
-            proof.runtimeCycleContiguous && proof.overrideZero &&
-            proof.requestSequence != MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
+        // A stopped new source must not inherit the previous source's J5 ticket.
+        const bool sourceProof = proof.requestSequence != MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
             proof.requestSequence == tracker.requestSequence &&
             proof.requestSequence == m_activeFeedHoldNCSettleRequest.requestSequence &&
-            proof.requestSequence > m_pathHold.status.completedHoldRequestSequence &&
-            proof.requestSequence > m_pathHold.lastAcceptedStartSequence &&
+            proof.profile == MotionNCSettleProfile::FEED_HOLD_GROUP &&
+            m_activeFeedHoldNCSettleRequest.profile == MotionNCSettleProfile::FEED_HOLD_GROUP &&
+            proof.executionEpoch == m_pathHold.status.identity.epoch &&
+            tracker.executionEpoch == m_pathHold.status.identity.epoch &&
+            m_activeFeedHoldNCSettleRequest.executionEpoch == m_pathHold.status.identity.epoch &&
+            proof.owner == m_pathHold.status.ownerLease.owner &&
+            proof.ownerGeneration == m_pathHold.status.ownerLease.generation &&
             CBIdentity(tracker.executionIdentity, m_pathHold.status.identity) &&
-            tracker.ownerLease.Matches(m_pathHold.status.ownerLease);
+            tracker.ownerLease.Matches(m_pathHold.status.ownerLease) &&
+            m_activeFeedHoldNCSettleRequest.ownerLease.Matches(m_pathHold.status.ownerLease);
+        const bool settled = sourceProof && proof.settled && proof.requestAccepted && proof.runtimeCycleValid &&
+            proof.runtimeCycleContiguous && proof.overrideZero &&
+            proof.requestSequence > m_pathHold.status.completedHoldRequestSequence &&
+            proof.requestSequence > m_pathHold.lastAcceptedStartSequence;
         const bool returnWait = CLReturnEligible(m_pathHold.status);
         m_pathHold.status.ready = settled && (returnWait ?
             (m_pathHold.endpoint && m_Group.virtualAxis.currentCmdPos == m_pathHold.goal) :
             (m_Group.virtualAxis.currentCmdPos > 0.0 && m_Group.virtualAxis.currentCmdPos < m_pathHold.status.lengthPulse));
         m_pathHold.status.boundaryOnly = !returnWait && settled && (m_Group.virtualAxis.currentCmdPos == 0.0 ||
             m_Group.virtualAxis.currentCmdPos == m_pathHold.status.lengthPulse);
-        if (!returnWait || (proof.requestAccepted && proof.requestSequence > m_pathHold.lastAcceptedStartSequence &&
-            proof.requestSequence == m_activeFeedHoldNCSettleRequest.requestSequence))
+        if (sourceProof && (!returnWait || (proof.requestAccepted &&
+            proof.requestSequence > m_pathHold.lastAcceptedStartSequence)))
             m_pathHold.status.holdRequestSequence = proof.requestSequence;
     }
     if (m_pathHold.startPending && m_pathHold.startCaptured &&

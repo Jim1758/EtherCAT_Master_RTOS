@@ -1,0 +1,13 @@
+{
+  "package": "RTX64_Windows_BackgroundTasks_Package_20260917",
+  "revision": "2026-09-17 FIX3",
+  "created": "2026-09-17T01:38:22",
+  "launcher_behavior": {
+    "auto_execute_after_uac": true,
+    "enter_key_required_to_start": false,
+    "enter_key_required_after_completion": false,
+    "elevated_powershell_noexit": true,
+    "powershell_window_stays_open_after_script": true,
+    "manual_close_required": true
+  }
+}

@@ -4,6 +4,7 @@
 #include "GlobalConfig.h"   // 如果你有用到 DEBUG_PRINT 等功能
 #include "AlarmManager.h"
 #include "SHMManager.h"
+#include <cmath>
 
 namespace GCodeHandlers
 {
@@ -99,10 +100,19 @@ namespace GCodeHandlers
         case 43:
         case 44:
         case 49:
-        {  
-            int hCode = block.val('H');
-           
-        nc->CoordSys.SetToolLengthCompensation(block.gCode, hCode, nc); // 設定模式為 43，H碼為1
+        {
+            int toolMode = 49;
+            int hCode = 0;
+            if (!TryDecodeNCToolLengthSelection(block.gCode, block.has('H'),
+                    block.val('H'), toolMode, hCode) ||
+                !nc->CoordSys.IsToolLengthSelectionSupported(toolMode, hCode))
+            {
+                RtPrintf("[TOOL][REJECT] g=%d reason=H_SELECTION beforeCommit=1\n", block.gCode);
+                AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+                nc->ChangeState(NCState::HOLD);
+                return nullptr;
+            }
+            nc->CoordSys.SetToolLengthCompensation(toolMode, hCode, nc);
         }
           
             break;
@@ -137,7 +147,9 @@ namespace GCodeHandlers
                 if (block.has(axisLetter))
                 {
                     axisProgrammed[i] = true;
-                    axisTarget[i] = block.val(axisLetter);
+                    axisTarget[i] = nc->CoordSys.ToInternalUnit(block.val(axisLetter),
+                        (nc->GetMotion().GetAxisContext(i).axisType == AxisType::ROTARY ||
+                         nc->GetMotion().GetAxisContext(i).axisType == AxisType::ROTARY_CONTINUOUS));
                     hasAnyAxis = true;
                 }
             }
@@ -163,12 +175,12 @@ namespace GCodeHandlers
 
         case 162:  
         {
-            nc->CoordSys.isCAxisOffsetRotationEnabled = true;
+            nc->CoordSys.SetCAxisOffsetRotationEnabled(true, nc);
         }
         break;
         case 163:
         {
-            nc->CoordSys.isCAxisOffsetRotationEnabled = false;
+            nc->CoordSys.SetCAxisOffsetRotationEnabled(false, nc);
         }
         break;
       
@@ -193,7 +205,17 @@ namespace GCodeHandlers
             return [](NCManager*) { return true; };
         }
 
-        int pCode = (int)block.val('P');
+        const double requestedRow = block.val('P');
+        if (!std::isfinite(requestedRow) || requestedRow < 1.0 ||
+            requestedRow > static_cast<double>(nc->CoordSys.m_ToolOffset.size()) ||
+            std::floor(requestedRow) != requestedRow)
+        {
+            nc->CoordSys.ApplyCoordinateTableValues(2, -1, nullptr, nullptr, nc);
+            return [](NCManager*) { return true; };
+        }
+        bool writeFields[8] = {};
+        double writeValues[8] = {};
+        int pCode = static_cast<int>(requestedRow);
         int arrayIndex = pCode - 1; // P1 對應陣列 [0]
 
         // 防呆：檢查陣列範圍
@@ -205,12 +227,17 @@ namespace GCodeHandlers
                 if (axisLetter != ' ' && axisLetter != '\0' && axisLetter != 'N') {
                     // 如果 G 碼有下達這個軸，就覆寫表格內的數值
                     if (block.has(axisLetter)) {
-                        nc->CoordSys.m_ToolOffset[arrayIndex][i] = block.val(axisLetter);
+                        writeFields[i] = true;
+                        writeValues[i] = nc->CoordSys.ToInternalUnit(block.val(axisLetter),
+                            (nc->GetMotion().GetAxisContext(i).axisType == AxisType::ROTARY ||
+                             nc->GetMotion().GetAxisContext(i).axisType == AxisType::ROTARY_CONTINUOUS));
                     }
                 }
             }
 
             // 🌟 貼心功能：設定完自動存檔，確保重開機數值還在
+            if (!nc->CoordSys.ApplyCoordinateTableValues(2, arrayIndex,
+                writeFields, writeValues, nc)) return [](NCManager*) { return true; };
             nc->CoordSys.SaveToolOffset();
             RtPrintf("[G10] Tool Offset P%d updated and saved.\n", pCode);
         }
@@ -228,46 +255,20 @@ namespace GCodeHandlers
     // ==========================================================
     WaitConditionFunc Handle_G160(const NCBlock& block, NCManager* nc)
     {
-        if (!block.has('P')) {
-            RtPrintf(">>> [ALARM] G160 missing 'P' (Work Offset Index) parameter!\n");
+        int arrayIndex = -1;
+        bool writeFields[8] = {};
+        double writeValues[8] = {};
+        if (!nc->CoordSys.TryDecodeWorkTableWrite(block, arrayIndex, writeFields, writeValues))
+        {
+            RtPrintf("[WORK][REJECT] g=160 reason=TABLE_INPUT beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
             return [](NCManager*) { return true; };
         }
-
-        int pCode = (int)block.val('P');
-        int arrayIndex = pCode - 1; // P1 對應陣列 [0]
-
-        if (arrayIndex >= 0 && arrayIndex < nc->CoordSys.m_WorkOffset.size())
-        {
-            // 1. 設定平移量 (X, Y, Z 等真實軸)
-            for (int i = 0; i < 8; i++) {
-                char axisLetter = nc->m_axisNames[i];
-                if (axisLetter != ' ' && axisLetter != '\0' && axisLetter != 'N') {
-                    if (block.has(axisLetter)) {
-                        nc->CoordSys.m_WorkOffset[arrayIndex][i] = block.val(axisLetter);
-                    }
-                }
-            }
-
-            // 2. 設定旋轉角度 (I, J, K)
-            // 對應 CoordinateManager::WorkOffsetField 的 3, 4, 5
-            if (block.has('I')) {
-                nc->CoordSys.m_WorkOffset[arrayIndex][3] = block.val('I');
-            }
-            if (block.has('J')) {
-                nc->CoordSys.m_WorkOffset[arrayIndex][4] = block.val('J');
-            }
-            if (block.has('K')) {
-                nc->CoordSys.m_WorkOffset[arrayIndex][5] = block.val('K');
-            }
-
-            // 🌟 設定完自動存檔
-            nc->CoordSys.SaveWorkOffset();
-            RtPrintf("[G160] Work Offset P%d updated and saved.\n", pCode);
-        }
-        else {
-            RtPrintf(">>> [ALARM] G160 P%d is out of range!\n", pCode);
-        }
-
+        if (!nc->CoordSys.ApplyCoordinateTableValues(3, arrayIndex,
+            writeFields, writeValues, nc)) return [](NCManager*) { return true; };
+        nc->CoordSys.SaveWorkOffset();
+        RtPrintf("[G160] Work Offset P%d updated and saved.\n", arrayIndex + 1);
         return [](NCManager*) { return true; };
     }
 
@@ -278,8 +279,10 @@ namespace GCodeHandlers
     WaitConditionFunc Handle_G68(const NCBlock& block, NCManager* nc)
     {
         // 1. 防呆：G68 必須包含 R (角度)
-        if (!block.has('R')) {
-            RtPrintf(">>> [ALARM] G68 missing 'R' (Angle) parameter!\n");
+        if (!block.has('R') || !std::isfinite(block.val('R'))) {
+            RtPrintf("[ROTATION][REJECT] reason=ANGLE_REQUIRED beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
             return [](NCManager*) { return true; };
         }
 
@@ -292,7 +295,7 @@ namespace GCodeHandlers
         for (int i = 0; i < 3; i++) {
             if (block.has(axisNames[i])) {
                 hasAxis[i] = true;
-                centerPos[i] = block.val(axisNames[i]);
+                centerPos[i] = nc->CoordSys.ToInternalUnit(block.val(axisNames[i]), false);
             }
         }
 
@@ -313,39 +316,58 @@ namespace GCodeHandlers
 
     WaitConditionFunc Handle_G168(const NCBlock& block, NCManager* nc)
     {
-        // 防呆：必須有下達 W 參數
-        if (!block.has('W')) {
-            RtPrintf(">>> [ALARM] G168 missing 'W' parameter!\n");
-            // 可在此觸發 AlarmManager
-            return [](NCManager*) { return true; };
-        }
-
-        int wCode = (int)block.val('W');
-
-        bool hasAxis[8] = { false };
-        double targetWCS[8] = { 0.0 };
-
-        // 檢查 X, Y, Z 是否有被賦值
-        char axisNames[] = { 'X', 'Y', 'Z' };
-        for (int i = 0; i < 3; i++) {
-            if (block.has(axisNames[i])) {
-                hasAxis[i] = true;
-                targetWCS[i] = block.val(axisNames[i]);
+        int workMode = 169;
+        int wCode = 0;
+        bool valid = TryDecodeNCWorkSelection(168, block.has('W'),
+            block.val('W'), workMode, wCode);
+        if (nc->CoordSys.IsTranslationRunBound())
+        {
+            valid = valid && nc->CoordSys.IsWorkpieceSelectionSupported(workMode, wCode) &&
+                block.gCount == 1 && block.mCount == 0;
+            for (char letter = 'A'; letter <= 'Z'; ++letter)
+                if (block.has(letter) && letter != 'G' && letter != 'N' && letter != 'W' &&
+                    letter != 'X' && letter != 'Y') valid = false;
+            valid = valid && block.has('X') == block.has('Y') &&
+                (!block.has('X') || (std::isfinite(block.val('X')) && std::isfinite(block.val('Y'))));
+            if (valid)
+            {
+                const bool hasYaw = nc->CoordSys.m_WorkOffset[wCode - 1][CoordinateManager::WO_ANGLE_XY_YAW] != 0.0;
+                const bool sameWork = nc->CoordSys.isWorkpieceRotationActive && nc->CoordSys.currentWCode == wCode;
+                valid = hasYaw ? (nc->CoordSys.IsTranslationRunCurrent() &&
+                    (block.has('X') || sameWork)) : !block.has('X');
             }
         }
-
-        // 呼叫 CoordinateManager 執行旋轉設定
+        if (!valid)
+        {
+            RtPrintf("[WORK][REJECT] g=168 reason=W_SELECTION_OR_SYNTAX beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return true; };
+        }
+        bool hasAxis[8] = {};
+        double targetWCS[8] = {};
+        const char axisNames[3] = { 'X', 'Y', 'Z' };
+        for (unsigned axis = 0U; axis < 3U; ++axis)
+        {
+            hasAxis[axis] = block.has(axisNames[axis]);
+            if (hasAxis[axis]) targetWCS[axis] =
+                nc->CoordSys.ToInternalUnit(block.val(axisNames[axis]), false);
+        }
         nc->CoordSys.SetWorkpieceRotation(wCode, hasAxis, targetWCS, nc);
-
-        return [](NCManager*) { return true; }; // 瞬間設定完成，繼續下一行
+        return [](NCManager*) { return true; };
     }
 
-    // ==========================================================
-    // 🌟 G169 取消工件旋轉
-    // 格式：G169
-    // ==========================================================
     WaitConditionFunc Handle_G169(const NCBlock& block, NCManager* nc)
     {
+        int workMode = 169;
+        int wCode = 0;
+        if (!TryDecodeNCWorkSelection(169, block.has('W'), block.val('W'), workMode, wCode))
+        {
+            RtPrintf("[WORK][REJECT] g=169 reason=W_SELECTION beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return true; };
+        }
         nc->CoordSys.CancelWorkpieceRotation(nc);
         return [](NCManager*) { return true; };
     }
@@ -353,69 +375,97 @@ namespace GCodeHandlers
 
     // ==========================================================
     // 🌟 G51 縮放
-    // 格式：G51 X0 Y0 P2.0 (P 為放大兩倍)
+    // 格式：G51 X0 Y0 Z0 P2.0 (P 為放大兩倍)
     // ==========================================================
-    WaitConditionFunc Handle_G51(const NCBlock& block, NCManager* nc) {
-        double factor = block.has('P') ? block.val('P') : 1.0;
-
-        bool hasAxis[8] = { false };
-        double centerPos[8] = { 0.0 };
-        for (int i = 0; i < 8; i++) {
-            char axisLetter = nc->m_axisNames[i];
-            if (axisLetter != ' ' && block.has(axisLetter)) {
-                hasAxis[i] = true;
-                centerPos[i] = block.val(axisLetter);
-            }
+    // Centers are authored XYZ lengths; P is dimensionless. NC runs require
+    // explicit G51 XYZ P so publication and the normal handler share one pivot.
+    bool DecodeScaleMirrorBlock(const NCBlock& block, NCManager* nc, int code,
+        double* values, bool* hasAxis, double& factor)
+    {
+        if (!nc || !values || !hasAxis) return false;
+        factor = code == 51 && block.has('P') ? block.val('P') : 1.0;
+        if (!std::isfinite(factor) || factor <= 0.0 ||
+            ((code == 51 || code == 151) &&
+                (block.gCount != 1 || block.gCodes[0] != code || block.mCount != 0))) return false;
+        const bool bound = nc->CoordSys.IsTranslationRunBound();
+        if (code == 51 && bound && (!block.has('P') || !block.has('X') ||
+            !block.has('Y') || !block.has('Z'))) return false;
+        bool any = false;
+        for (char letter = 'A'; letter <= 'Z'; ++letter)
+        {
+            if (!block.has(letter)) continue;
+            const bool axis = letter == 'X' || letter == 'Y' || letter == 'Z';
+            if ((letter != 'G' && letter != 'N' && !(axis && code != 50) &&
+                !(letter == 'P' && code == 51)) || !std::isfinite(block.val(letter))) return false;
         }
-        nc->CoordSys.SetScaling(centerPos, hasAxis, factor, nc);
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+        {
+            hasAxis[axis] = axis < 3U && block.has("XYZ"[axis]);
+            values[axis] = hasAxis[axis] ?
+                nc->CoordSys.ToInternalUnit(block.val("XYZ"[axis]), false) : 0.0;
+            if (!std::isfinite(values[axis])) return false;
+            any = any || hasAxis[axis];
+        }
+        return code != 151 || any;
+    }
+
+    WaitConditionFunc Handle_G51(const NCBlock& block, NCManager* nc)
+    {
+        double factor = 1.0, center[8] = {};
+        bool selected[8] = {};
+        if (!DecodeScaleMirrorBlock(block, nc, 51, center, selected, factor))
+        {
+            RtPrintf("[SCALE-MIRROR][REJECT] g=51 reason=XYZ_P_SYNTAX beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return true; };
+        }
+        nc->CoordSys.SetScaling(center, selected, factor, nc);
         return [](NCManager*) { return true; };
     }
 
-    WaitConditionFunc Handle_G50(const NCBlock& block, NCManager* nc) {
+    WaitConditionFunc Handle_G50(const NCBlock& block, NCManager* nc)
+    {
+        double factor = 1.0, values[8] = {};
+        bool selected[8] = {};
+        if (!DecodeScaleMirrorBlock(block, nc, 50, values, selected, factor))
+        {
+            RtPrintf("[SCALE-MIRROR][REJECT] g=50 reason=SYNTAX beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return true; };
+        }
         nc->CoordSys.CancelScaling(nc);
         return [](NCManager*) { return true; };
     }
 
-    // ==========================================================
-     // 🌟 G151 啟動鏡像 (自定義取代 G51.1)
-     // 格式：G151 X100. (以 X=100 為對稱軸進行鏡像)
-     // ==========================================================
-    WaitConditionFunc Handle_G151(const NCBlock& block, NCManager* nc) {
-        bool hasAxis[8] = { false };
-        double mirrorPos[8] = { 0.0 };
-
-        for (int i = 0; i < 8; i++) {
-            char axisLetter = nc->m_axisNames[i];
-            // 抓出操作員下達的對稱中心座標
-            if (axisLetter != ' ' && block.has(axisLetter)) {
-                hasAxis[i] = true;
-                mirrorPos[i] = block.val(axisLetter);
-            }
+    WaitConditionFunc Handle_G151(const NCBlock& block, NCManager* nc)
+    {
+        double factor = 1.0, center[8] = {};
+        bool selected[8] = {};
+        if (!DecodeScaleMirrorBlock(block, nc, 151, center, selected, factor))
+        {
+            RtPrintf("[SCALE-MIRROR][REJECT] g=151 reason=XYZ_SYNTAX beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return true; };
         }
-
-        nc->CoordSys.SetMirror(mirrorPos, hasAxis, nc);
-        RtPrintf("[G151] Mirror Image ON.\n");
-
+        nc->CoordSys.SetMirror(center, selected, nc);
         return [](NCManager*) { return true; };
     }
 
-    // ==========================================================
-    // 🌟 G150 關閉鏡像 (自定義取代 G50.1)
-    // 格式：G150 X (只取消 X 軸)，或單下 G150 (全部取消)
-    // ==========================================================
-    WaitConditionFunc Handle_G150(const NCBlock& block, NCManager* nc) {
-        bool hasAxis[8] = { false };
-
-        for (int i = 0; i < 8; i++) {
-            char axisLetter = nc->m_axisNames[i];
-            if (axisLetter != ' ' && block.has(axisLetter)) {
-                hasAxis[i] = true;
-            }
+    WaitConditionFunc Handle_G150(const NCBlock& block, NCManager* nc)
+    {
+        double factor = 1.0, values[8] = {};
+        bool selected[8] = {};
+        if (!DecodeScaleMirrorBlock(block, nc, 150, values, selected, factor))
+        {
+            RtPrintf("[SCALE-MIRROR][REJECT] g=150 reason=XYZ_SYNTAX beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return true; };
         }
-
-        nc->CoordSys.CancelMirror(hasAxis, nc);
-        RtPrintf("[G150] Mirror Image OFF.\n");
-
+        nc->CoordSys.CancelMirror(selected, nc);
         return [](NCManager*) { return true; };
     }
 

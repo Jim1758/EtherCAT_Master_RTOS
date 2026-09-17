@@ -345,6 +345,12 @@ public:
         return m_state.load(std::memory_order_acquire);
     }
 
+    // CO_FIX1: read only on the existing NC/HMI supervisory thread.
+    bool IsGapPathSimulationActiveSameThread() const noexcept
+    {
+        return m_gapPath.active || m_gapWindow.active;
+    }
+
     NCOperationMode GetMode() const
     {
         return m_mode;
@@ -1415,6 +1421,19 @@ private:
     bool IsRealMotionBlock(const NCBlock& block);
 
     // Stage NC-0.2A：同一 Block 先 Commit 相容 Modal，再擷取 Motion 標籤。
+    struct FixedTranslationTravelPolicy
+    {
+        double minimum[3] = {}, maximum[3] = {};
+        bool enabled[3] = {}, homed = false;
+    };
+    std::array<FixedTranslationTravelPolicy, 3U> m_fixedTranslationTravel{};
+    std::uint64_t m_fixedTranslationTravelGeneration = 0ULL;
+    bool IsFixedTranslationTravelCurrentSameThread() const noexcept;
+    bool PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode);
+    bool IsFixedTranslationBlockAllowedSameThread(const NCBlock& block);
+    bool RequiresFixedTranslationSelectionTransitionSameThread(const NCBlock& block) const;
+    bool TransitionFixedTranslationSelectionSameThread(const NCBlock& block);
+    void RetireFixedTranslationSameThread() noexcept;
     void CapturePendingCommandState(int sourcePC);
     WaitConditionFunc DispatchSingleGCode(
         const NCBlock& sourceBlock,
@@ -2299,6 +2318,23 @@ private:
     void RejectPathCoreReturnSameThread(std::uint32_t code, int alarmCode);
     void FlushPathCoreReturnSummarySameThread() noexcept;
 
+    // EH: NC-owned effective feed snapshot. Epoch belongs to each Motion
+    // receipt; a committed F may cross ordinary motion epoch boundaries.
+    struct CncFeedValueSnapshot
+    {
+        MotionOwnerLease ownerLease{};
+        double feedMMMin = 0.0;
+        std::uint64_t run = 0ULL, cache = 0ULL, sourceCommit = 0ULL, sourceDispatch = 0ULL;
+        int sourcePC = -1;
+        bool valid = false, programmed = false;
+    } m_cncModalFeed{};
+    void ClearCncModalFeedSameThread() noexcept;
+    bool CaptureCncFeedValueSameThread(const NCBlock& block,
+        CncFeedValueSnapshot& snapshot) const noexcept;
+    bool IsCncFeedValueCurrentSameThread(const CncFeedValueSnapshot& snapshot) const noexcept;
+    void CommitCncModalFeedSameThread(const CncFeedValueSnapshot& snapshot,
+        NCBlockDispatchId dispatch, std::uint64_t commit, int pc, int line) noexcept;
+
     // BX-FEED-BEGIN: fixed startup-owned G01 state, distinct from V1 G00 history.
     MotionFeedLineWorkspace m_pathFeedMotion{};
     std::vector<int> m_pathFeedAxes = std::vector<int>(3U, 0);
@@ -2307,6 +2343,7 @@ private:
     std::array<bool, 8U> m_pathFeedProgrammed{};
     struct PathFeedState
     {
+        CncFeedValueSnapshot capturedFeed{};
         std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL, commit = 0ULL;
         MotionFeedbackSequence lastSequence = 0ULL;
         std::uint32_t submitted = 0U, accepted = 0U, started = 0U, done = 0U;
@@ -2314,12 +2351,14 @@ private:
         int sourcePC = -1, sourceLine = 0;
         bool armed = false, pending = false, bound = false, consumerAccepted = false;
         bool consumerStarted = false, completed = false, explicitFeed = false;
+        bool invalidatedByGoto = false; // Diagnostic cause only; never a motion permit.
     } m_pathFeed{};
-    static bool IsPathCoreFeedBlockShapeValid(const NCBlock& block) noexcept;
+    static bool IsPathCoreFeedBlockShapeValid(const NCBlock& block,
+        bool allowMissingFeed = false, int unitsMode = 21) noexcept;
     bool IsPathCoreFeedInputOmission(const NCBlock& block) const noexcept;
     bool IsPathCoreFeedConfigurationValid() noexcept;
     void ArmPathCoreFeedSameThread() noexcept;
-    void InvalidatePathCoreFeedSameThread() noexcept;
+    void InvalidatePathCoreFeedSameThread(bool byGoto = false) noexcept;
     void ValidatePathCoreFeedSameThread();
     void BeginPathCoreFeedCaptureSameThread(const NCBlock& block,
         NCBlockDispatchId dispatchId) noexcept;
@@ -2335,6 +2374,75 @@ private:
     void FinalizePathCoreFeedSameThread() noexcept;
     void LogPathCoreFeedSameThread(const char* phase) const noexcept;
     void LogPathCoreFeedGeometrySameThread() const noexcept;
+    // DG: four immutable mixed receipts; unmarked arcs remain on their original callback.
+    struct CncFeedFlight
+    {
+        MotionFeedLineReceipt receipt{};
+        MotionFeedArcReceipt arcReceipt{};
+        bool arc = false;
+        const MotionExecutionIdentity& Identity() const noexcept
+        {
+            return arc ? arcReceipt.identity : receipt.identity;
+        }
+        const MotionOwnerLease& OwnerLease() const noexcept
+        {
+            return arc ? arcReceipt.ownerLease : receipt.ownerLease;
+        }
+        std::uint32_t ValidAxisMask() const noexcept
+        {
+            return arc ? arcReceipt.validAxisMask : receipt.validAxisMask;
+        }
+        void Invalidate() noexcept { receipt.valid = false; arcReceipt.valid = false; }
+        NCBlockDispatchId dispatch = 0ULL;
+        std::uint64_t commit = 0ULL;
+        MotionFeedbackSequence lastSequence = 0ULL;
+        int pc = -1, line = 0;
+        bool accepted = false, started = false;
+    };
+    struct CncFeedQueue
+    {
+        std::array<CncFeedFlight, 4U> flights{};
+        MotionCncPathTail tail{};
+        NCBlock candidate{}, nextCandidate{};
+        CncFeedValueSnapshot candidateFeed{};
+        std::uint64_t run = 0ULL, cache = 0ULL, chain = 0ULL, eventSequence = 0ULL;
+        std::uint32_t head = 0U, count = 0U, mask = 0U, peak = 0U;
+        std::uint32_t submitted = 0U, accepted = 0U, started = 0U, done = 0U;
+        std::uint32_t revoked = 0U, failures = 0U;
+        int nextPC = -1, selectedPC = -1;
+        bool active = false, selected = false, capacityLogged = false, drainLogged = false;
+        bool faulted = false;
+        void Clear() noexcept
+        {
+            // Clear caller-owned storage without a full queue automatic copy.
+            for (auto& row : flights)
+            {
+                row.receipt.Clear(); row.arcReceipt.Clear(); row.arc = false;
+                row.dispatch = row.commit = row.lastSequence = 0ULL;
+                row.pc = -1; row.line = 0; row.accepted = row.started = false;
+            }
+            tail.Clear(); candidate = NCBlock{}; nextCandidate = NCBlock{};
+            candidateFeed = CncFeedValueSnapshot{};
+            run = cache = chain = eventSequence = 0ULL;
+            head = count = mask = peak = submitted = accepted = started = done = revoked = failures = 0U;
+            nextPC = selectedPC = -1;
+            active = selected = capacityLogged = drainLogged = faulted = false;
+        }
+    } m_cncFeed{};
+    static_assert(sizeof(CncFeedFlight) <= 1536U, "DG mixed receipt row storage budget changed.");
+    static_assert(sizeof(CncFeedQueue) <= 7168U, "DG NC-owned mixed queue storage budget changed.");
+    static bool IsCncPathQueuedBlockShapeValid(const NCBlock& block, int unitsMode = 21) noexcept;
+    bool IsCncFeedScopeSameThread() noexcept;
+    bool PrepareCncFeedDispatchSameThread(const NCParsedBlock* parsed, int pc);
+    bool IsCncFeedSelectedBlockSameThread(const NCBlock& block) const noexcept;
+    bool DrainCncFeedSameThread();
+    void CommitCncFeedSameThread();
+    void CommitCncArcSameThread();
+    void ObserveCncFeedFeedbackSameThread(const MotionFeedbackEvent& event, bool ledgerAccepted);
+    void ValidateCncFeedSameThread();
+    void InvalidateCncFeedSameThread() noexcept;
+    void RejectCncFeedSameThread(const char* reason, int line);
+    void LogCncFeedSameThread(const char* phase, const CncFeedFlight* row = nullptr) noexcept;
     // BX-FEED-END
 
     // BY-ARC-BEGIN: fixed NC-owned arc workspace, separate from G01 and G00.
@@ -2345,6 +2453,7 @@ private:
     std::array<bool, 8U> m_pathArcProgrammed{};
     struct PathArcState
     {
+        CncFeedValueSnapshot capturedFeed{};
         std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL, commit = 0ULL;
         MotionFeedbackSequence lastSequence = 0ULL;
         std::uint32_t submitted = 0U, accepted = 0U, started = 0U, done = 0U;
@@ -2352,12 +2461,14 @@ private:
         int sourcePC = -1, sourceLine = 0;
         bool armed = false, pending = false, bound = false, consumerAccepted = false;
         bool consumerStarted = false, completed = false, explicitArc = false;
+        bool invalidatedByGoto = false; // Diagnostic cause only; never a motion permit.
     } m_pathArc{};
-    static bool IsPathCoreArcBlockShapeValid(const NCBlock& block) noexcept;
+    static bool IsPathCoreArcBlockShapeValid(const NCBlock& block,
+        bool allowMissingFeed = false, int unitsMode = 21) noexcept;
     bool IsPathCoreArcInputOmission(const NCBlock& block) const noexcept;
     bool IsPathCoreArcConfigurationValid() noexcept;
     void ArmPathCoreArcSameThread() noexcept;
-    void InvalidatePathCoreArcSameThread() noexcept;
+    void InvalidatePathCoreArcSameThread(bool byGoto = false) noexcept;
     void ValidatePathCoreArcSameThread();
     void BeginPathCoreArcCaptureSameThread(const NCBlock& block,
         NCBlockDispatchId dispatchId) noexcept;
@@ -2385,6 +2496,7 @@ private:
     {
         MotionExecutionIdentity identity{};
         std::uint64_t dispatch = 0ULL, commit = 0ULL;
+        std::uint64_t translationGeneration = 0ULL;
         int sourcePC = -1, sourceLine = 0;
     };
     std::array<PathReplaySource, 16U> m_pathReplaySource{};
@@ -2417,7 +2529,7 @@ private:
     void RetainPathCoreArcSameThread() noexcept;
     void AppendPathCoreReplayGeometrySameThread(const MotionExecutionIdentity& identity,
         std::uint32_t validAxisMask, std::uint64_t dispatch, std::uint64_t commit,
-        int sourcePC, int sourceLine) noexcept;
+        std::uint64_t translationGeneration, int sourcePC, int sourceLine) noexcept;
     WaitConditionFunc StartPathCoreReplaySameThread(const NCBlock& block);
     void CommitPathCoreReplayCaptureSameThread(NCBlockDispatchId dispatchId,
         const MotionProgramBlockCapture& capture, const NCProgramCommitSnapshot& commit,
@@ -2466,35 +2578,232 @@ private:
     {
         std::uint64_t frequency = 0ULL, lastTicks = 0ULL, lastServiceMs = 0ULL;
         std::uint64_t sequence = 0ULL, holdStartMs = 0ULL, firstServiceMs = 0ULL;
+        std::uint64_t returnWatchStartMs = 0ULL, returnGeneration = 0ULL, returnReholdSequence = 0ULL;
+        std::uint64_t returnCompletedFence = 0ULL, returnCompletedHold = 0ULL, returnCompletedSBits = 0ULL;
+        std::uint64_t returnCompletedRehold = 0ULL;
+        std::uint64_t returnWatchPublication = 0ULL, returnWatchSBits = 0ULL;
+        std::uint32_t returnWatchOrdinal = 0U;
         std::uint32_t stalledCalls = 0U;
+        std::uint8_t returnRoundPhase = 0U;
+        bool returnLowTest = false, returnWatchStarted = false, returnLowInjected = false;
+        bool returnRehold = false, returnResumeApplied = false;
+        bool repeatedReturnLow = false;
+        std::uint8_t returnProbeLimit = 1U, returnProbeHoldCount = 0U, returnProbeResumeCount = 0U;
         bool active = false, clockStarted = false, lowInjected = false, held = false;
         bool recoveryInjected = false, normalLogged = false, recoveryLogged = false, ackLogged = false;
         bool automaticResume = false, waitJ5Logged = false, repeating = false;
-        bool lowRetreat = false, returnHold = false;
+        bool lowRetreat = false, returnHold = false, repeatedLowRetreat = false;
     } m_gapPath{};
-    static_assert(sizeof(GapPathSimulationState) <= 128U,
-        "CH/CI/CK simulation must remain fixed NC-owned storage.");
+    static_assert(sizeof(GapPathSimulationState) <= 152U,
+        "CH through CP simulation must remain fixed NC-owned storage.");
+    // CR_FIX2: pending physical admission is RT liveness, never a GAP sample.
+    struct GapPathAdmissionState
+    {
+        std::uint64_t publication = 0ULL, tick = 0ULL, generation = 0ULL;
+        std::uint64_t heartbeatMs = 0ULL, sampleOriginMs = 0ULL;
+        std::uint64_t obsoletePublication = 0ULL, obsoleteTick = 0ULL;
+        std::uint64_t loadedPublication = 0ULL;
+        double followingError = 0.0, windowPulse = 0.0;
+        std::int32_t blockedAxis = -1;
+        bool seen = false, closed = false, sampleClockStarted = false, obsoleteSeen = false, progressSeen = false, readyLogged = false;
+    } m_gapAdmission{};
+    static_assert(sizeof(GapPathAdmissionState) <= 96U,
+        "CR_FIX2 admission supervision must remain fixed NC-owned storage.");
+    bool ServiceGapPathAdmissionSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool HasGapPathSourceConsumerAcceptedSameThread() const noexcept;
+    void LogGapPathAdmissionSameThread(const char* phase, std::uint64_t nowMs) const noexcept;
+    bool ValidateGapPathLoadedPublicationSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    // CQ grants only a bounded next-source admission after actual retained completion.
+    struct GapPathSourceWindowState
+    {
+        MotionExecutionIdentity previousIdentity{};
+        MotionOwnerLease lease{};
+        std::uint64_t run = 0ULL, cache = 0ULL, previousDispatch = 0ULL, previousCommit = 0ULL;
+        double distanceMM = 0.0, feedMMMin = 0.0, intervalMM = 0.0;
+        double completedForwardMM = 0.0; // CS: only completed + retained original window lengths.
+        std::uint64_t budgetPublication = 0ULL, budgetFence = 0ULL, budgetRequest = 0ULL;
+        std::uint64_t budgetLatestStop = 0ULL, budgetReturnedSBits = 0ULL, budgetGeneration = 0ULL;
+        std::uint64_t normalPublication = 0ULL, normalGeneration = 0ULL;
+        std::uint64_t seamPublication = 0ULL; // CV: pre-HOLD start-station sample frontier.
+        std::uint32_t initialHistoryCount = 0U, sourceIndex = 0U;
+        std::uint32_t cycleLimit = 0U, probeLimit = 0U;
+        std::uint32_t stationLimit = 0U, completedStations = 0U; // CT: window L, never Motion cycleLimit.
+        std::uint16_t sourceLimit = 0U; // K is admitted only in [2, 8].
+        bool active = false, budgetProven = false;
+        bool allowNormalSources = false, normalSource = false, normalProven = false;
+        bool cumulativeStation = false, stationConsumed = false;
+        bool repeatedCumulativeStation = false, multipleStationsPerSource = false;
+        bool allowSeamStations = false; // CV: exact end belongs to the next source.
+        bool tailSupervision = false; // CW: budget retirement does not retire GAP input.
+        std::uint8_t tailVoltage = 50U; // P16/P17 SIMULATED tail voltage, 50 or 20 V.
+        bool continuousSignal = false; // CX carries input, never prior source authority.
+        std::uint8_t sourceGapMs = 0U; // P17-only H150 bounded SIMULATED sample loss.
+        bool sampledInput = false; // CZ: independent NC-owned 20 ms acquisition.
+        bool queuedInput = false; // DA: ordered three-frame delayed delivery.
+        bool recoverQueuedInput = false; // DB: scoped 40 ms consumer pause and ordered recovery.
+        std::uint8_t queuedProbeVoltage = 50U; // P21 U50/U20, independent of P18.
+        bool pendingLowAcrossSources = false; // CY: one terminal LOW candidate.
+        std::uint8_t pendingLowVoltage = 50U; // P18 U50/U20, never a U-axis command.
+    } m_gapWindow{};
+    static_assert(sizeof(GapPathSourceWindowState) <= 224U,
+        "CY source-window configuration must remain fixed NC-owned storage.");
+    int ClassifyGapPathStationSameThread(double prefixMM, double lengthMM, double lengthPulse,
+        double targetMM) const noexcept;
+    bool IsGapPathInitialStationAtSeamSameThread() noexcept;
+    double GetGapPathWindowStationMMSameThread() const noexcept;
+    bool CountGapPathSourceStationsSameThread(double prefixMM, double lengthMM, double lengthPulse,
+        std::uint32_t completedStations, std::uint32_t& planned) const noexcept;
+    bool IsGapPathNextStationBeyondSourceSameThread(double prefixMM, double lengthMM,
+        double lengthPulse, std::uint32_t completedStations) const noexcept;
+    bool IsGapPathSourceWindowScopeValidSameThread(bool bindingCurrentSource = false) noexcept;
+    bool CompleteGapPathSourceBudgetSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool CompleteGapPathSourceSameThread(bool line) noexcept;
+    bool ValidateGapPathNormalSourceSnapshotSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) const noexcept;
+    bool ServiceGapPathNormalSourceSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool CompleteGapPathNormalSourceProofSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    void LogGapPathSourceWindowSameThread(const char* phase, const char* reason = "NONE") const noexcept;
+    void ClearPathCoreHoldAutomaticStateSameThread(const char* reason) noexcept;
+    struct GapPathSignalSessionState
+    {
+        std::uint64_t run = 0ULL, cache = 0ULL;
+        std::uint64_t sourceStartSequence = 0ULL, sourceSampledAtMs = 0ULL;
+        std::uint64_t sourceFirstServiceMs = 0ULL, publication = 0ULL, dropStartMs = 0ULL;
+        double normalActiveS = 0.0;
+        std::uint32_t sourceIndex = 0U, dropTargetSourceIndex = 0U;
+        bool active = false, handoffPending = false, sourceClockStarted = false;
+        bool sourceSampleSeen = false, dropStarted = false, dropConsumed = false;
+    } m_gapSignal{};
+    static_assert(sizeof(GapPathSignalSessionState) <= 80U,
+        "CX signal session and per-source frontiers must remain bounded.");
+    bool StartNextGapPathSignalSourceSameThread() noexcept;
+    void LogGapPathSignalSessionSameThread(const char* phase) const noexcept;
+    // CZ: one immutable producer cell and two proof copies, all NC-thread owned.
+    // No shared-memory ABI, ADC driver or cross-thread synchronization is implied.
+    struct GapPathSampleFrame
+    {
+        EDMGap::Sample sample{};
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        std::uint64_t run = 0ULL, cache = 0ULL, publication = 0ULL;
+        std::uint32_t sourceIndex = 0U;
+    };
+    struct GapPathSampleInletState
+    {
+        GapPathSampleFrame frame{}, sealedFrame{}, acceptedFrame{};
+        std::uint64_t acquisitionSequence = 0ULL, lastAcquiredMs = 0ULL;
+        std::uint64_t sourceFloor = 0ULL, acceptedPublication = 0ULL, freezeStartMs = 0ULL;
+        bool active = false, available = false, clockStarted = false;
+        bool accepted = false, acquiredLogged = false, cachedLogged = false;
+        bool freezeStarted = false, freezeConsumed = false;
+    } m_gapInlet{};
+    static_assert(sizeof(GapPathSampleInletState) <= 416U,
+        "CZ sampled inlet must remain fixed NC-owned storage.");
+    bool ValidateGapPathSampleFrameSameThread() const noexcept;
+    bool PrepareGapPathSampleAcquisitionSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot,
+        std::uint64_t nowMs, bool& acquire, bool acquisitionIntent = true) noexcept;
+    bool AcquireGapPathSampleSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot,
+        std::uint64_t nowMs, std::int32_t voltageMv) noexcept;
+    bool ConsumeGapPathSampleSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot,
+        std::uint64_t nowMs, bool freshPublication, bool& accepted) noexcept;
+    bool IsGapPathCurrentSampleProvenSameThread() const noexcept;
+    void LogGapPathSampleInletSameThread(const char* phase, std::uint64_t nowMs) const noexcept;
+    // DA: immutable queued acquisitions; producer and consumer are NC-owned.
+    struct GapPathSampleQueueState
+    {
+        std::array<GapPathSampleFrame, 3U> frames{}, seals{};
+        GapPathSampleFrame terminalFrame{}, terminalSeal{};
+        std::uint64_t terminalPublication = 0ULL, terminalPublicationSeal = 0ULL, pauseStartMs = 0ULL;
+        std::uint32_t head = 0U, count = 0U;
+        bool active = false, terminalSealed = false, terminalDrained = false;
+        bool consumerPaused = false, pauseConsumed = false;
+        bool queuedLogged = false, acceptedLogged = false;
+    } m_gapQueue{};
+    static_assert(sizeof(GapPathSampleQueueState) <= 1024U,
+        "DA sampled FIFO and terminal proof must remain fixed NC-owned storage.");
+    bool ValidateGapPathSampleQueueSameThread() const noexcept;
+    bool CompleteGapPathSampleQueueSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    void LogGapPathSampleQueueSameThread(const char* phase, std::uint64_t nowMs) const noexcept;
+    struct GapPathQueueRecoveryState
+    {
+        GapPathSampleFrame frame{}, sealedFrame{};
+        std::uint64_t pauseAcquisitionSequence = 0ULL, pauseAcquisitionSeal = 0ULL;
+        std::uint64_t pauseAcceptedSequence = 0ULL, pauseSampleMs = 0ULL, pauseSampleSeal = 0ULL;
+        std::uint64_t resumedAtMs = 0ULL, resumedAtSeal = 0ULL;
+        std::uint64_t publication = 0ULL, publicationSeal = 0ULL, probeSequence = 0ULL;
+        bool active = false, resumed = false, fenceAccepted = false, probeAcquired = false;
+    } m_gapRecovery{};
+    static_assert(sizeof(GapPathQueueRecoveryState) <= 352U,
+        "DB recovery fence must remain fixed NC-owned storage.");
+    bool ValidateGapPathQueueRecoverySameThread(bool previousSource = false) const noexcept;
+    void LogGapPathQueueRecoverySameThread(const char* phase, std::uint64_t nowMs) const noexcept;
+    struct GapPathPendingLowState
+    {
+        MotionExecutionIdentity originIdentity{};
+        std::uint64_t run = 0ULL, cache = 0ULL, originDispatch = 0ULL, originCommit = 0ULL;
+        std::uint64_t originGeneration = 0ULL, originPublication = 0ULL;
+        std::uint64_t firstSequence = 0ULL, pendingSinceMs = 0ULL;
+        std::uint32_t originSourceIndex = 0U, targetSourceIndex = 0U;
+        bool active = false, injected = false, carried = false, resolved = false;
+    } m_gapPending{};
+    static_assert(sizeof(GapPathPendingLowState) <= 112U,
+        "CY terminal pending LOW token must remain fixed NC-owned storage.");
+    bool IsGapPathPendingLowCarrySameThread() const noexcept;
+    bool PrepareGapPathPendingLowSampleSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot,
+        std::uint64_t nowMs, std::int32_t& voltageMv) noexcept;
+    bool ObserveGapPathPendingLowSampleSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    void LogGapPathPendingLowSameThread(const char* phase) const noexcept;
+
+    struct GapPathTailState
+    {
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL, commit = 0ULL;
+        std::uint64_t generation = 0ULL, fence = 0ULL, request = 0ULL, latestStop = 0ULL;
+        std::uint64_t returnedSBits = 0ULL, budgetPublication = 0ULL, publication = 0ULL;
+        std::uint64_t sequence = 0ULL, sampleFloor = 0ULL; // CZ tail acquisition floor.
+        double activeS = 0.0, lengthPulse = 0.0;
+        std::uint32_t historyCount = 0U, cycleLimit = 0U, sourceIndex = 0U;
+        std::uint8_t voltage = 50U;
+        bool active = false, sampleSeen = false, normalLogged = false, endProven = false;
+    } m_gapTail{};
+    static_assert(sizeof(GapPathTailState) <= 192U,
+        "CW tail supervision must remain fixed NC-owned storage.");
+    bool StartGapPathTailSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool ValidateGapPathTailScopeSameThread() noexcept;
+    bool ValidateGapPathTailSnapshotSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool ServiceGapPathTailSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool CompleteGapPathTailProofSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    void LogGapPathTailSameThread(const char* phase) const noexcept;
     struct GapServiceDiagnostic
     {
         const char* site = "NOT_SERVICED";
         std::uint64_t nowMs = 0ULL, lastServiceMs = 0ULL, sampledAtMs = 0ULL;
         std::uint64_t sampleSequence = 0ULL, run = 0ULL, dispatch = 0ULL;
+        std::uint64_t admissionOriginMs = 0ULL, admissionHeartbeatMs = 0ULL, sourceSampleOriginMs = 0ULL;
         std::uint32_t ageOnlyCalls = 0U;
+        bool admissionSeen = false, admissionClosed = false, sourceSampleClockStarted = false;
         EDMGap::Quality quality = EDMGap::Quality::NO_SAMPLE;
         bool present = false, nowValid = false, lastServiceValid = false, publishSample = false;
     } m_gapServiceCurrent{}, m_gapServiceLastFault{};
     std::uint32_t m_gapServiceAgeOnlyCalls = 0U;
-    static_assert(2U * sizeof(GapServiceDiagnostic) + sizeof(std::uint32_t) <= 192U,
+    static_assert(2U * sizeof(GapServiceDiagnostic) + sizeof(std::uint32_t) <= 240U,
         "CK service evidence must remain fixed NC-owned storage.");
     void LogGapServiceFaultSameThread() const noexcept;
     bool StartGapPathSimulationSameThread(bool automaticResume = false, bool repeating = false,
-        bool lowRetreat = false) noexcept;
+        bool lowRetreat = false, bool repeatedLowRetreat = false, bool returnLowTest = false,
+        bool repeatedReturnLow = false, std::uint8_t returnProbeLimit = 1U) noexcept;
     bool IsGapPathAutomaticResumeSignalSameThread() const noexcept;
     bool IsGapPathAutomaticNormalSameThread() const noexcept;
     bool ValidateGapPathAutomaticResumeSameThread() noexcept;
     bool ServiceGapPathSimulationSameThread(double activeS, bool publishSample = true,
-        const char* site = "AUTOMATIC") noexcept;
-    void RejectGapPathSimulationSameThread(const char* reason) noexcept;
+        const char* site = "AUTOMATIC", bool returningSample = false,
+        const MotionPathCoreHoldExcursionSnapshot* pendingAdmission = nullptr,
+        const MotionPathCoreHoldExcursionSnapshot* sourcePublication = nullptr) noexcept;
+    bool ValidateGapPathRepeatedReturnLowSnapshotSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool ValidateGapPathReturnLowSnapshotSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool ProcessGapPathReturnLowHoldSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    void RejectGapPathSimulationSameThread(const char* reason,
+        const MotionPathCoreHoldExcursionSnapshot* observed = nullptr) noexcept;
     void LogGapPathSimulationSameThread(const char* phase) const noexcept;
 
     // CB-HOLD-BEGIN: bounded opt-in excursions inside the next original source.
@@ -2516,10 +2825,12 @@ private:
         bool explicitControl = false, startCommitted = false, crossSegment = false;
         // CL endpoint authorization survives revocation of automatic GAP control.
         bool requireReturnAuthorization = false, returnHoldRequested = false;
+        std::uint64_t returnHoldRetreatCount = 0ULL;
     } m_pathHold{};
     // CD: NC-owned immutable handoff scratch. No large automatic view copies.
     MotionPathCoreHoldExcursionView m_pathHoldView{};
-    bool PreparePathCoreHoldHistorySameThread() noexcept;
+    bool PreparePathCoreHoldHistorySameThread(
+        NCBlockDispatchId dispatchCeiling = NC_BLOCK_DISPATCH_ID_INVALID) noexcept;
     bool BuildPathCoreHoldViewSameThread(bool line) noexcept;
     // CB FIX1: NC-thread-only last fault survives revocation and rolling logs.
     // Diagnostic storage only; never authorizes Motion or restores a source.
@@ -2533,7 +2844,7 @@ private:
         int alarmCode = 0, sourcePC = -1, sourceLine = 0;
         bool present = false, rtValid = false, identityMatch = false, leaseMatch = false;
     } m_pathHoldLastFault{};
-    static_assert(sizeof(PathHoldLastFault) <= 320U,
+    static_assert(sizeof(PathHoldLastFault) <= 368U,
         "CB last-fault diagnostics must remain fixed and bounded.");
     static bool IsPathCoreHoldBlockShapeValid(const NCBlock& block) noexcept;
     bool IsPathCoreHoldInputOmission(const NCBlock& block) const noexcept;
@@ -2547,7 +2858,7 @@ private:
     bool ProcessPathCoreHoldAutomaticSameThread() noexcept;
     bool ProcessPathCoreReturnWaitSameThread() noexcept;
     void LogPathCoreHoldAutomaticSameThread(const char* phase) const noexcept;
-    void ObservePathCoreHoldSameThread();
+    void ObservePathCoreHoldSameThread(bool bindingCurrentSource = false);
     bool PreparePathCoreHoldResumeSameThread(bool gateControlled) noexcept;
     bool CommitPathCoreHoldResumeSameThread() noexcept;
     void RejectPathCoreHoldSameThread(std::uint32_t code, int alarmCode,

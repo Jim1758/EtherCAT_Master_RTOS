@@ -1,0 +1,53 @@
+﻿RTX64 / EtherCAT Windows 背景工作
+實機調查摘要（截至 2026-09-17）
+
+本檔用途：
+記錄為什麼目前 Profile 納入這些 Task。
+這不是「每一項 Task 都已 100% 單獨證明因果」的宣告。
+
+主要觀察：
+
+1. Microsoft Compatibility Appraiser
+   - 實機曾在 EtherCAT RX burst 時段附近執行。
+   - Trigger 曾觀察到 03:00 + RandomDelay 2h。
+   - 因此納入專用 IPC A/B Profile。
+
+2. Device Information\Device
+   - 實機曾與另一波 RX transient 時間接近。
+   - 納入 A/B Profile。
+
+3. MemoryDiagnostic / .NET NGEN
+   - TaskScheduler/Operational 曾抓到一批 Idle background workload 同時啟動。
+   - 第一波 RX 異常幾乎同步。
+   - 約 100 秒後，MemoryDiagnostic + NGEN 因「電腦已不再處於閒置」而停止，
+     下一秒又出現另一波 RX timeout。
+   - 因此納入。
+
+4. SystemRestore\SR
+   - LastRunTime 01:53:53。
+   - 01:54:01 建立排定還原點。
+   - 01:54:09 VSS / shadowcopy scoping start。
+   - EtherCAT 01:54:09 同秒出現 LRW/RX Hard Timeout burst。
+   - 此事件為 Master/NAL 型：ReceivePacket 長尾，ESC Physical Delta 0。
+   - SR MaintenanceSettings：
+     Period=P3D，Deadline=P3DT1M，Exclusive=True。
+   - 因此納入。
+
+5. CEIP Consolidator / DeviceDirectoryClient
+   - 2026-09-17 TaskScheduler/Operational 顯示多次 background task cluster。
+   - RegisterDevicePeriodic24、RegisterDeviceLocationRightsChange 等
+     與 Security-SPP 16394/16384 事件高度接近。
+   - DeviceDirectoryClient 使用 Administrator 停用時曾 Access Denied，
+     因此 OneClick 使用 SYSTEM helper。
+
+6. Security-SPP
+   - 多次出現 16394 / 16384（RulesEngine）與 Windows background activity 聚集。
+   - 目前視為「背景活動指示燈 / 伴隨事件」之一，不直接停用 sppsvc。
+   - 本包不關閉 Security-SPP service。
+
+7. 重要分流
+   - Windows / Master-NAL 型：
+     ReceivePacket long-tail，ESC Physical Delta 0。
+   - Physical EtherCAT 型：
+     ESC Physical / Invalid / Forwarded counters 增加。
+   - 兩種問題已在實機上分別觀察到，不能混淆。

@@ -1,0 +1,86 @@
+﻿RTX64 / EtherCAT 專用 IPC
+Windows 背景排程一鍵設定 SOP
+
+============================================================
+A. 新電腦部署
+============================================================
+
+【步驟 1】準備檔案
+將以下兩個檔案放在同一資料夾：
+- Run_RTX64_Windows_BackgroundTasks_OneClick.cmd
+- RTX64_Windows_BackgroundTasks_OneClick.ps1
+
+建議位置：
+C:\RTX64_Setup\
+
+【步驟 2】執行
+直接雙擊：
+Run_RTX64_Windows_BackgroundTasks_OneClick.cmd
+
+【步驟 3】UAC
+Windows 跳出「使用者帳戶控制」時按：
+是
+
+【步驟 4】等待
+腳本會：
+1. 自動以 Administrator 權限執行。
+2. 啟用 TaskScheduler/Operational 記錄。
+3. 建立暫時 SYSTEM helper。
+4. 以 SYSTEM 權限關閉受保護的 DeviceDirectoryClient Task。
+5. 關閉其他列入 Profile 的 Windows Scheduled Tasks。
+6. 自動逐項驗證。
+7. 刪除暫時 SYSTEM helper。
+8. 在桌面產生驗收報告 TXT。
+9. 執行完成後直接停留在 PowerShell 提示字元；不需按 Enter，視窗不會自動閃退。
+
+【步驟 5】看結果
+畫面必須看到：
+
+PASS: All existing target tasks are Disabled.
+
+TaskScheduler Operational Log: PASS
+
+如果看到 FAIL：
+不要直接交機，請看 Docs\04_還原與故障排除.txt。
+
+【步驟 6】保存驗收證據
+桌面會產生：
+RTX64_BackgroundTasks_Check_YYYYMMDD_HHMMSS.txt
+
+建議將此 TXT 存入該 IPC 的出廠 / 驗收資料夾。
+
+============================================================
+B. 日後只做檢查，不修改設定
+============================================================
+
+執行：
+RTX64_Windows_BackgroundTasks_Check.ps1
+
+建議 PowerShell 指令：
+
+Set-ExecutionPolicy -Scope Process Bypass -Force
+& "C:\RTX64_Setup\RTX64_Windows_BackgroundTasks_Check.ps1"
+
+判讀：
+PASS = 已 Disabled
+FAIL = 還是 Ready / Running / Enabled
+N/A  = 此 Windows 版本不存在該 Task
+
+============================================================
+C. 建議驗收順序
+============================================================
+
+1. BIOS / RTX64 / NIC / EtherCAT 基本設定完成。
+2. 執行本 OneClick Profile。
+3. FINAL CHECK 全 PASS。
+4. TaskScheduler Operational Log = PASS。
+5. RTX64 使用 RtssRelease 做正式效能驗證。
+6. EtherCAT 250 us，保持相同拓撲長跑。
+7. 紀錄：
+   - RX Hard Timeout
+   - ReceivePacket Max / long tail
+   - WKC
+   - ESC Physical / Invalid / Forwarded / LostLink Delta
+   - PDO Exec Max / Combined Max
+   - RTX64 Latency
+8. 長時間驗收建議至少跨越夜間 / Idle / Maintenance 時段。

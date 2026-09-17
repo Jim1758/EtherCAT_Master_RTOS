@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include "NC_Types.h"
+#include "NCTranslationSnapshot.h"
 #include <vector>
 #include <string>
 
@@ -8,6 +9,60 @@ struct AxisContext;
 class CoordinateManager {
 public:
     CoordinateManager();
+
+    // One NC-thread writer owns the run descriptor. The RT position update
+    // writes actualMCS only; it never reads or mutates this descriptor.
+    bool BeginTranslationRun(std::uint64_t runToken) noexcept;
+    NCTranslationSnapshot GetTranslationSnapshot() const noexcept;
+    bool FreezeTranslationRun() noexcept;
+    // NC-only staged distance change; frame geometry and native tail stay fixed.
+    bool PrepareDistanceModeTransition(int mode, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitDistanceModeTransition(const NCTranslationSnapshot& candidate) noexcept;
+    // NC-only drained unit selection; stored native mm/degrees never change.
+    bool PrepareUnitModeTransition(int mode, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitUnitModeTransition(const NCTranslationSnapshot& candidate) noexcept;
+    // Fully drained XYZ scale/mirror selection; unchanged requests are idempotent.
+    bool PrepareScaleMirrorTransition(int code, const double* values, const bool* hasAxis,
+        double factor, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitScaleMirrorTransition(const NCTranslationSnapshot& candidate) noexcept;
+    bool IsScaleMirrorActive() const noexcept;
+    // NC-only drained WCS selection; fixed transforms and native tail stay unchanged.
+    bool PrepareWorkCoordinateTransition(int wcsCode, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitWorkCoordinateTransition(const NCTranslationSnapshot& candidate) noexcept;
+    // NC-only drained H selection; native geometry and fixed centres remain exact.
+    bool PrepareToolLengthTransition(int normalizedMode, int normalizedH,
+        NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitToolLengthTransition(const NCTranslationSnapshot& candidate) noexcept;
+    // NC-only drained G68/G69 selection; MCS and all offset tables stay fixed.
+    bool PreparePlanarRotationTransition(int mode, double centerX, double centerY,
+        double angle, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitPlanarRotationTransition(const NCTranslationSnapshot& candidate) noexcept;
+    // Drained WORK selection. Explicit XY belongs to the complete prior frame.
+    // A valid identical selection returns the unchanged descriptor.
+    bool PrepareWorkpieceTransition(int mode, int wCode, bool hasCenter,
+        double centerX, double centerY, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitWorkpieceTransition(int mode, int wCode, bool hasCenter,
+        double centerX, double centerY, const NCTranslationSnapshot& candidate) noexcept;
+    bool IsTranslationRunCurrent() const noexcept;
+    bool IsTranslationRunFrozen() const noexcept;
+    bool IsTranslationRunBound() const noexcept;
+    void RetireTranslationRun() noexcept;
+    bool GuardCoordinateMutation(const char* operation, NCManager* nc,
+        bool reportAlarm = true);
+    void BeginTranslationReset() noexcept;
+    void EndTranslationReset() noexcept;
+
+    // Validate every selected field before changing any table value. Work
+    // fields remain the existing schema; this does not enable new transforms.
+    bool ApplyCoordinateTableValues(int offsetType, int row,
+        const bool* hasField, const double* values, NCManager* nc,
+        bool reportAlarm = true);
+    // G160 uses fixed table fields XYZ / IJK, never configured axis letters.
+    bool TryDecodeWorkTableWrite(const NCBlock& block, int& rowIndex,
+        bool* fields, double* values) const noexcept;
+    bool ApplyCoordinateOrigin(int axis, double desiredWCS, NCManager* nc,
+        bool reportAlarm = false);
+    bool SetCAxisOffsetRotationEnabled(bool enabled, NCManager* nc);
 
     // ==========================================
     // 狀態紀錄
@@ -161,9 +216,14 @@ public:
     // ==========================================
     // 核心操作函式
     // ==========================================
-    bool SetWCS(int gCode, NCManager* nc);
+    bool SetWCS(int gCode, NCManager* nc, bool reportAlarm = true);
     void SyncMachinePosition(const double* actualMCS);
     void Transform_WCS_to_MCS(const double* targetWCS, const bool* hasAxis, double* outputMCS);
+
+    // G90 sparse rotation uses the frozen inverse; G91 expands omitted XY
+    // displacement to zero and validates against the accepted native tail.
+    // This changes only caller-owned staging arrays, never commandedMCS.
+    bool CompleteFixedPlanarEndpoint(double* targetWCS, bool* hasAxis) noexcept;
 
     // Stage NC-0.2K.6.2: calculate the complete G00 MCS candidate without
     // publishing commandedMCS.  The normal G00 producer commits that endpoint
@@ -176,10 +236,13 @@ public:
 
 
     // 🌟 新增：刀長補正控制 API
+    bool IsToolLengthSelectionSupported(int normalizedMode, int normalizedH) const noexcept;
     void SetToolLengthCompensation(int gCode, int hCode, NCManager* nc);
     void CancelToolLengthCompensation(NCManager* nc); // 供 Reset 時呼叫
     double GetActiveToolOffset(int axisIndex, double cAngleMCS = 0.0) const;
     // 🌟 新增：取得目前作用中的工件平移偏移量 (G168 W 碼)
+    bool IsWorkpieceSelectionSupported(int normalizedMode, int normalizedW) const noexcept;
+    bool IsFixedPlanarRotationActive() const noexcept;
     double GetActiveWorkOffset(int axisIndex) const;
     // ==========================================
     // 🌟 新增：多檔案管理系統
@@ -482,6 +545,36 @@ public:
 
     bool m_programmableTravelLimitEnabled = false;
 private:
+    bool m_workRotationCenterFixed = false; // Only explicit fixed G168 XY selection grants this proof.
+    // One-use confirmation for the ordinary G168 handler after staged publication.
+    // It binds the original words, avoiding reinterpretation in the new frame.
+    struct WorkCenterConfirmation
+    {
+        bool armed = false;
+        std::uint64_t runToken = 0ULL;
+        std::uint64_t generation = 0ULL;
+        std::uint64_t revision = 0ULL;
+        int wCode = 0;
+        double inputXY[2] = {};
+    };
+    WorkCenterConfirmation m_workCenterConfirmation{};
+    NCTranslationSnapshot BuildCurrentCoordinateSnapshot() const noexcept;
+    NCTranslationSnapshot BuildLiveTranslationSnapshot() const noexcept;
+    bool IsTranslationModeSupported() const noexcept;
+    bool BuildScaleMirrorSelection(int code, const double* values, const bool* hasAxis,
+        double factor, const NCTranslationSnapshot& source, NCTranslationSnapshot& candidate) const noexcept;
+    bool IsToolOffsetRowValid(int hCode, bool xyzOnly) const noexcept;
+    bool IsWorkOffsetRowValid(int wCode, bool fixedPlanar) const noexcept;
+    bool RejectCoordinateMutation(const char* operation, const char* reason,
+        NCManager* nc, bool reportAlarm) const;
+    std::uint64_t m_translationGenerationCounter = 0ULL;
+    std::uint64_t m_translationRunToken = 0ULL;
+    std::uint64_t m_translationGeneration = 0ULL;
+    std::uint64_t m_translationRevision = 1ULL;
+    bool m_translationFrozen = false;
+    bool m_translationResetBypass = false;
+    NCTranslationSnapshot m_frozenTranslation{};
+
     void Transform_WCS_to_MCS_Internal(
         const double* targetWCS,
         const bool* hasAxis,

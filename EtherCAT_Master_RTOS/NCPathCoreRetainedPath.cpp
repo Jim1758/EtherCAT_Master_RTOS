@@ -1,4 +1,5 @@
 #include "NCPathCoreRetainedPath.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -18,7 +19,7 @@ namespace
     {
         double scale = Maximum(std::fabs(pulse ? g.startPulse[axis] : g.startMCS[axis]),
             std::fabs(pulse ? g.endPulse[axis] : g.endMCS[axis]));
-        if (g.kind == NCPathCoreRetainedKind::ARC && axis < 2U)
+        if ((g.kind == NCPathCoreRetainedKind::ARC || g.kind == NCPathCoreRetainedKind::LINE_ARC) && axis < 2U)
         {
             scale = Maximum(scale, std::fabs(pulse ? g.centerPulse[axis] : g.centerMCS[axis]));
             scale = Maximum(scale, pulse ? g.radiusPulse : g.radiusMM);
@@ -63,7 +64,8 @@ namespace
     {
         output = 0.0;
         if (!g.valid || axis >= 8U || !std::isfinite(u) || u < 0.0 || u > 1.0 ||
-            (g.kind != NCPathCoreRetainedKind::LINE && g.kind != NCPathCoreRetainedKind::ARC))
+            (g.kind != NCPathCoreRetainedKind::LINE && g.kind != NCPathCoreRetainedKind::ARC &&
+                g.kind != NCPathCoreRetainedKind::LINE_ARC))
             return false;
         const double start = pulse ? g.startPulse[axis] : g.startMCS[axis];
         const double end = pulse ? g.endPulse[axis] : g.endMCS[axis];
@@ -77,7 +79,25 @@ namespace
             return true;
         }
         double value = 0.0;
-        if (g.kind == NCPathCoreRetainedKind::LINE)
+        if (g.kind == NCPathCoreRetainedKind::LINE_ARC)
+        {
+            if (axis > 1U) return false;
+            const double radius = pulse ? g.radiusPulse : g.radiusMM;
+            const double total = pulse ? g.lengthPulse : g.lengthMM;
+            const double arcLength = radius * std::fabs(g.sweepRadians);
+            const double prefix = total - arcLength;
+            if (!std::isfinite(total) || !std::isfinite(prefix) || prefix <= 0.0 || radius <= 0.0) return false;
+            const double center = pulse ? g.centerPulse[axis] : g.centerMCS[axis];
+            const double entry = center + radius * (axis == 0U ? std::cos(g.startAngle) : std::sin(g.startAngle));
+            const double distance = u * total;
+            if (distance <= prefix) value = start + (entry - start) * (distance / prefix);
+            else
+            {
+                const double angle = g.startAngle + (distance - prefix) / arcLength * g.sweepRadians;
+                value = center + radius * (axis == 0U ? std::cos(angle) : std::sin(angle));
+            }
+        }
+        else if (g.kind == NCPathCoreRetainedKind::LINE)
         {
             const double delta = end - start;
             if (!std::isfinite(delta)) return false;
@@ -109,7 +129,8 @@ void NCPathCoreRetainedGeometry::Clear() noexcept
     fullCircle = point = valid = false;
 }
 
-bool IsNCPathCoreRetainedGeometryValid(const NCPathCoreRetainedGeometry& g) noexcept
+static bool ValidateRetainedGeometry(const NCPathCoreRetainedGeometry& g,
+    bool generatedArc) noexcept
 {
     if (!g.valid || g.axisMask == 0U || (g.axisMask & ~7U) != 0U ||
         !std::isfinite(g.lengthMM) || !std::isfinite(g.lengthPulse) ||
@@ -128,6 +149,36 @@ bool IsNCPathCoreRetainedGeometryValid(const NCPathCoreRetainedGeometry& g) noex
             g.boundsMinMCS[axis] > g.boundsMaxMCS[axis] ||
             g.startMCS[axis] < g.boundsMinMCS[axis] || g.startMCS[axis] > g.boundsMaxMCS[axis] ||
             g.endMCS[axis] < g.boundsMinMCS[axis] || g.endMCS[axis] > g.boundsMaxMCS[axis]) return false;
+    }
+    if (g.kind == NCPathCoreRetainedKind::LINE_ARC)
+    {
+        if (g.axisMask != 3U || g.point || g.fullCircle || !std::isfinite(g.radiusMM) ||
+            !std::isfinite(g.radiusPulse) || g.radiusMM <= 0.0 || g.radiusPulse <= 0.0 ||
+            !std::isfinite(g.sweepRadians) || std::fabs(g.sweepRadians) < 0.0872664625997164 ||
+            std::fabs(g.sweepRadians) > 2.356194490192345) return false;
+        NCPathCoreRetainedGeometry arc = g; // bounded 384-byte validation scratch
+        arc.kind = NCPathCoreRetainedKind::ARC;
+        arc.lengthMM = g.radiusMM * std::fabs(g.sweepRadians);
+        arc.lengthPulse = g.radiusPulse * std::fabs(g.sweepRadians);
+        double lm = 0.0, lp = 0.0;
+        for (unsigned i = 0U; i < 2U; ++i)
+        {
+            const double trig = i == 0U ? std::cos(g.startAngle) : std::sin(g.startAngle);
+            arc.startMCS[i] = g.centerMCS[i] + g.radiusMM * trig;
+            arc.startPulse[i] = g.centerPulse[i] + g.radiusPulse * trig;
+            lm = std::hypot(lm, arc.startMCS[i] - g.startMCS[i]);
+            lp = std::hypot(lp, arc.startPulse[i] - g.startPulse[i]);
+        }
+        if (!std::isfinite(lm) || !std::isfinite(lp) || lm <= 0.0 || lp <= 0.0 ||
+            !Near(lm + arc.lengthMM, g.lengthMM, Maximum(g.lengthMM, 1.0)) ||
+            !Near(lp + arc.lengthPulse, g.lengthPulse, Maximum(g.lengthPulse, 1.0)) ||
+            !ValidateRetainedGeometry(arc, true)) return false;
+        const double tx = -double(g.direction) * std::sin(g.startAngle);
+        const double ty = double(g.direction) * std::cos(g.startAngle);
+        return std::fabs((arc.startMCS[0] - g.startMCS[0]) / lm - tx) <= 1e-11 &&
+            std::fabs((arc.startMCS[1] - g.startMCS[1]) / lm - ty) <= 1e-11 &&
+            std::fabs((arc.startPulse[0] - g.startPulse[0]) / lp - tx) <= 1e-11 &&
+            std::fabs((arc.startPulse[1] - g.startPulse[1]) / lp - ty) <= 1e-11;
     }
     if (g.kind == NCPathCoreRetainedKind::LINE)
     {
@@ -161,6 +212,23 @@ bool IsNCPathCoreRetainedGeometryValid(const NCPathCoreRetainedGeometry& g) noex
             (std::fabs(g.sweepRadians) < 1.0e-12 || std::fabs(g.sweepRadians) >= TwoPi))) return false;
     if (!g.fullCircle && ((g.startPulse[0] == g.endPulse[0] && g.startPulse[1] == g.endPulse[1]) ||
         (g.startMCS[0] == g.endMCS[0] && g.startMCS[1] == g.endMCS[1]))) return false;
+    // DJ_FIX1: ONLY Q-generated arc scratch uses a two-coordinate roundoff
+    // budget. Its radius/angle come from both XY pulse coordinates; near-zero
+    // X still carries subtraction roundoff from a large Y center, and vice versa.
+    // Ordinary ARC retention/replay/PathHold keeps its original per-axis checks.
+    // Neither branch changes Q, any stored geometry, or source-to-source seams.
+    double pulsePerMM = 1.0, reconstructionBudgetMM = 0.0;
+    if (generatedArc)
+    {
+        pulsePerMM = g.radiusPulse / g.radiusMM;
+        if (!std::isfinite(pulsePerMM) || pulsePerMM <= 0.0) return false;
+        const double mmMagnitude = Maximum(Magnitude(g, 0U, false), Magnitude(g, 1U, false));
+        const double pulseMagnitude = Maximum(Magnitude(g, 0U, true), Magnitude(g, 1U, true));
+        reconstructionBudgetMM = EpsilonBudget * mmMagnitude +
+            (EpsilonBudget * pulseMagnitude) / pulsePerMM;
+        if (!std::isfinite(reconstructionBudgetMM) || reconstructionBudgetMM > 1.0e-7)
+            return false;
+    }
     for (std::uint32_t axis = 0U; axis < 2U; ++axis)
     {
         if (!std::isfinite(g.centerMCS[axis]) || !std::isfinite(g.centerPulse[axis]) ||
@@ -169,10 +237,25 @@ bool IsNCPathCoreRetainedGeometryValid(const NCPathCoreRetainedGeometry& g) noex
         const double trigStart = axis == 0U ? std::cos(g.startAngle) : std::sin(g.startAngle);
         const double endAngle = g.startAngle + g.sweepRadians;
         const double trigEnd = axis == 0U ? std::cos(endAngle) : std::sin(endAngle);
-        if (!Near(g.centerMCS[axis] + g.radiusMM * trigStart, g.startMCS[axis], Magnitude(g, axis, false)) ||
-            !Near(g.centerMCS[axis] + g.radiusMM * trigEnd, g.endMCS[axis], Magnitude(g, axis, false)) ||
-            !Near(g.centerPulse[axis] + g.radiusPulse * trigStart, g.startPulse[axis], Magnitude(g, axis, true)) ||
-            !Near(g.centerPulse[axis] + g.radiusPulse * trigEnd, g.endPulse[axis], Magnitude(g, axis, true))) return false;
+        if (!generatedArc)
+        {
+            if (!Near(g.centerMCS[axis] + g.radiusMM * trigStart, g.startMCS[axis], Magnitude(g, axis, false)) ||
+                !Near(g.centerMCS[axis] + g.radiusMM * trigEnd, g.endMCS[axis], Magnitude(g, axis, false)) ||
+                !Near(g.centerPulse[axis] + g.radiusPulse * trigStart, g.startPulse[axis], Magnitude(g, axis, true)) ||
+                !Near(g.centerPulse[axis] + g.radiusPulse * trigEnd, g.endPulse[axis], Magnitude(g, axis, true))) return false;
+        }
+        else
+        {
+            const double startMMError = (g.centerMCS[axis] + g.radiusMM * trigStart) - g.startMCS[axis];
+            const double endMMError = (g.centerMCS[axis] + g.radiusMM * trigEnd) - g.endMCS[axis];
+            const double startPulseErrorMM = ((g.centerPulse[axis] + g.radiusPulse * trigStart) - g.startPulse[axis]) / pulsePerMM;
+            const double endPulseErrorMM = ((g.centerPulse[axis] + g.radiusPulse * trigEnd) - g.endPulse[axis]) / pulsePerMM;
+            if (!std::isfinite(startMMError) || !std::isfinite(endMMError) ||
+                !std::isfinite(startPulseErrorMM) || !std::isfinite(endPulseErrorMM) ||
+                std::fabs(startMMError) > reconstructionBudgetMM || std::fabs(endMMError) > reconstructionBudgetMM ||
+                std::fabs(startPulseErrorMM) > reconstructionBudgetMM || std::fabs(endPulseErrorMM) > reconstructionBudgetMM)
+                return false;
+        }
         // Check exact cardinal extrema independently of the source's bounds.
         const double maximumAngle = axis == 0U ? 0.0 : Pi * 0.5;
         const double minimumAngle = axis == 0U ? Pi : -Pi * 0.5;
@@ -186,6 +269,11 @@ bool IsNCPathCoreRetainedGeometryValid(const NCPathCoreRetainedGeometry& g) noex
     return std::isfinite(lengthMM) && std::isfinite(lengthPulse) &&
         Near(lengthMM, g.lengthMM, Maximum(lengthMM, g.lengthMM)) &&
         Near(lengthPulse, g.lengthPulse, Maximum(lengthPulse, g.lengthPulse));
+}
+
+bool IsNCPathCoreRetainedGeometryValid(const NCPathCoreRetainedGeometry& g) noexcept
+{
+    return ValidateRetainedGeometry(g, false);
 }
 
 bool BuildNCPathCoreRetainedLine(const NCPathCoreFeedLineV2& source,
@@ -208,8 +296,8 @@ bool BuildNCPathCoreRetainedLine(const NCPathCoreFeedLineV2& source,
     output.Clear(); return false;
 }
 
-bool BuildNCPathCoreRetainedArc(const NCPathCoreFeedArcV2& source,
-    NCPathCoreRetainedGeometry& output) noexcept
+static bool BuildRetainedArc(const NCPathCoreFeedArcV2& source,
+    NCPathCoreRetainedGeometry& output, bool generatedArc) noexcept
 {
     output.Clear();
     if (!source.valid) return false;
@@ -222,8 +310,14 @@ bool BuildNCPathCoreRetainedArc(const NCPathCoreFeedArcV2& source,
     output.lengthMM = source.lengthMM; output.lengthPulse = source.lengthPulse;
     output.axisMask = source.axisMask; output.direction = source.direction;
     output.fullCircle = source.fullCircle; output.kind = NCPathCoreRetainedKind::ARC; output.valid = true;
-    if (IsNCPathCoreRetainedGeometryValid(output)) return true;
+    if (ValidateRetainedGeometry(output, generatedArc)) return true;
     output.Clear(); return false;
+}
+
+bool BuildNCPathCoreRetainedArc(const NCPathCoreFeedArcV2& source,
+    NCPathCoreRetainedGeometry& output) noexcept
+{
+    return BuildRetainedArc(source, output, false);
 }
 
 bool EvaluateNCPathCoreRetainedAxisCanonical(const NCPathCoreRetainedGeometry& g,
@@ -336,6 +430,11 @@ const NCPathCoreRetainedGeometry* NCPathCoreRetainedPath::Get(std::uint32_t inde
 }
 bool NCPathCoreRetainedPath::BeginRetreat(std::uint32_t requested) noexcept
 {
+    // DH compound rows are retained/evaluable, but not admitted to legacy
+    // replay/EDM traversal until that producer supports the compound metric.
+    for (std::uint32_t i = 0U; i < m_count; ++i)
+        if (m_rows[i].kind == NCPathCoreRetainedKind::LINE_ARC) return false;
+
     if (m_fault != NCPathCoreRetainedFault::NONE || m_pending || m_selected || requested == 0U ||
         requested > m_count || (m_state != NCPathCoreRetainedCursorState::IDLE &&
             m_state != NCPathCoreRetainedCursorState::RETURNED)) return false;
@@ -368,6 +467,11 @@ bool NCPathCoreRetainedPath::SelectStep(bool forward,
 }
 bool NCPathCoreRetainedPath::BeginDistanceRetreat(std::uint32_t requested) noexcept
 {
+    // DH compound rows are retained/evaluable, but not admitted to legacy
+    // replay/EDM traversal until that producer supports the compound metric.
+    for (std::uint32_t i = 0U; i < m_count; ++i)
+        if (m_rows[i].kind == NCPathCoreRetainedKind::LINE_ARC) return false;
+
     if (m_fault != NCPathCoreRetainedFault::NONE || m_pending || m_selected ||
         requested == 0U || requested > m_count ||
         (m_state != NCPathCoreRetainedCursorState::IDLE &&
@@ -470,4 +574,72 @@ bool NCPathCoreRetainedPath::CompleteStep() noexcept
         if (m_position == m_lower) m_state = NCPathCoreRetainedCursorState::AT_START;
     }
     m_pending = false; return true;
+}
+
+// Local polyline fillet: theta is the change in direction. The vertex-to-arc
+// distance d*tan(theta/4) bounds BOTH sides of the local Hausdorff distance.
+bool BuildNCPathCoreCornerBlend(NCPathCoreFeedLineInput& input,
+    const std::array<double, 8U>& next, double tolerance,
+    const std::array<double, 2U>& ppm, NCPathCoreFeedLineV2& prefix,
+    NCPathCoreFeedArcInput& ai, NCPathCoreFeedArcV2& arc,
+    NCPathCoreRetainedGeometry& out, NCPathCoreCornerMetadata& meta) noexcept
+{
+    out.Clear(); meta = NCPathCoreCornerMetadata{}; arc.Clear(); prefix.Clear();
+    if (input.axisMask != 3U || !std::isfinite(tolerance) || tolerance < 0.0001 || tolerance > 1.0 ||
+        !std::isfinite(ppm[0]) || ppm[0] <= 0.0 || ppm[0] != ppm[1]) return false;
+    for (unsigned i = 0U; i < 8U; ++i)
+        if (!std::isfinite(input.startMCS[i]) || !std::isfinite(input.endMCS[i]) ||
+            !std::isfinite(input.startPulse[i]) || !std::isfinite(input.endPulse[i]) || !std::isfinite(next[i]) ||
+            (i > 1U && (input.startMCS[i] != input.endMCS[i] || input.startMCS[i] != next[i]))) return false;
+    const double ax = input.startMCS[0], ay = input.startMCS[1];
+    const double bx = input.endMCS[0], by = input.endMCS[1], cx = next[0], cy = next[1];
+    if (std::fabs(ax) > 1e6 || std::fabs(ay) > 1e6 || std::fabs(bx) > 1e6 ||
+        std::fabs(by) > 1e6 || std::fabs(cx) > 1e6 || std::fabs(cy) > 1e6) return false;
+    const double a = std::hypot(bx - ax, by - ay), b = std::hypot(cx - bx, cy - by);
+    if (!std::isfinite(a) || !std::isfinite(b) || a <= 1e-6 || b <= 1e-6) return false;
+    const double ux = (bx - ax) / a, uy = (by - ay) / a, vx = (cx - bx) / b, vy = (cy - by) / b;
+    const double cross = ux * vy - uy * vx, dot = ux * vx + uy * vy;
+    const double theta = std::atan2(std::fabs(cross), dot);
+    if (!std::isfinite(theta) || theta < 0.0872664625997165 || theta>2.3561944901923448) return false;
+    const double maximumRadius = tolerance / (std::tan(theta * 0.25) * std::tan(theta * 0.5));
+    const double magnitude = 1.0 + (std::max)((std::max)((std::max)(std::fabs(ax), std::fabs(ay)),
+        (std::max)(std::fabs(bx), std::fabs(by))), (std::max)(std::fabs(cx), std::fabs(cy))) + maximumRadius;
+    const double arithmeticBudget = 512.0 * std::numeric_limits<double>::epsilon() * magnitude;
+    const double guard = (std::max)(tolerance * 1e-8, arithmeticBudget);
+    if (!std::isfinite(guard) || guard >= tolerance * 0.25) return false;
+    const double trim = (std::min)((tolerance - guard) / std::tan(theta * 0.25), 0.25 * (std::min)(a, b));
+    const double radius = trim / std::tan(theta * 0.5);
+    const int dir = cross > 0.0 ? 1 : -1;
+    const double t1x = bx - ux * trim, t1y = by - uy * trim, t2x = bx + vx * trim, t2y = by + vy * trim;
+    if (!std::isfinite(radius) || radius <= 0.0 || trim <= 1e-6 || a - trim <= 1e-6) return false;
+    ai = NCPathCoreFeedArcInput{};
+    ai.startMCS = input.startMCS; ai.endMCS = input.startMCS;
+    ai.startPulse = input.startPulse; ai.endPulse = input.startPulse;
+    ai.startMCS[0] = t1x; ai.startMCS[1] = t1y; ai.endMCS[0] = t2x; ai.endMCS[1] = t2y;
+    for (unsigned i = 0; i < 2; ++i) { ai.startPulse[i] = ai.startMCS[i] * ppm[i]; ai.endPulse[i] = ai.endMCS[i] * ppm[i]; }
+    // Canonicalize a stationary native-pulse component against the immutable
+    // successor vertex; preserve the strict line zero-delta space check.
+    for (unsigned i = 0U; i < 2U; ++i) {
+        const double nextPulse = next[i] * ppm[i];
+        if (std::isfinite(nextPulse) && ai.endPulse[i] == nextPulse &&
+            std::fabs(ai.endMCS[i] - next[i]) <= arithmeticBudget)
+            ai.endMCS[i] = next[i];
+    }
+    ai.centerOffsetMM[0] = -double(dir) * uy * radius; ai.centerOffsetMM[1] = double(dir) * ux * radius;
+    ai.pulsePerMM = ppm; ai.maxVelocityPPS[0] = input.maxVelocityPPS[0]; ai.maxVelocityPPS[1] = input.maxVelocityPPS[1];
+    ai.feedMMMin = input.feedMMMin; ai.direction = dir;
+    if (BuildNCPathCoreFeedArc(ai, arc) != NCPathCoreFeedArcCode::BUILT_ARC) return false;
+    input.endMCS = arc.startMCS; input.endPulse = arc.startPulse;
+    if (BuildNCPathCoreFeedLine(input, prefix) != NCPathCoreFeedLineCode::BUILT_LINE || !BuildRetainedArc(arc, out, true)) return false;
+    out.kind = NCPathCoreRetainedKind::LINE_ARC; out.startMCS = prefix.startMCS; out.startPulse = prefix.startPulse;
+    out.lengthMM += prefix.lengthMM; out.lengthPulse += prefix.lengthPulse;
+    for (unsigned i = 0U; i < 2U; ++i) {
+        out.boundsMinMCS[i] = (std::min)(out.boundsMinMCS[i], prefix.startMCS[i]);
+        out.boundsMaxMCS[i] = (std::max)(out.boundsMaxMCS[i], prefix.startMCS[i]);
+    }
+    const double actualDeviation = std::hypot(bx - arc.centerMCS[0], by - arc.centerMCS[1]) - arc.radiusMM;
+    if (!std::isfinite(actualDeviation) || actualDeviation<0.0 || actualDeviation + arithmeticBudget>tolerance || !IsNCPathCoreRetainedGeometryValid(out)) { out.Clear(); return false; }
+    meta.vertex = { {bx,by} }; meta.next = { {cx,cy} }; meta.entry = { {t1x,t1y} }; meta.exit = { {arc.endMCS[0],arc.endMCS[1]} };
+    meta.toleranceMM = tolerance; meta.trimMM = trim; meta.deviationMM = actualDeviation + arithmeticBudget;
+    return true;
 }

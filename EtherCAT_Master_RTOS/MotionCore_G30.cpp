@@ -66,14 +66,24 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
             groupAccTime = std::max<double>(groupAccTime, safe_acc);
             groupDecTime = std::max<double>(groupDecTime, safe_dec);
 
-            double lead = (axis.finalLead < 1e-6) ? 1.0 : axis.finalLead;
-            double pulsePerUnit = axis.resolution_PPR / lead;
+            const bool rotaryShortestPath =
+                axis.axisType == AxisType::ROTARY && axis.useShortestPath;
+            double pulsePerUnit = 0.0;
+            if (!TryGetMotionPulsePerUnit(axis.resolution_PPR, axis.finalLead,
+                rotaryShortestPath, pulsePerUnit))
+            {
+                AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID, m_pendingSourcePC, idx);
+                return result;
+            }
 
             double targetPulse = target_mm[i] * pulsePerUnit;
             double startPulse = simulatedStartPulse[i];
 
-            if (axis.axisType == AxisType::ROTARY && axis.useShortestPath) {
-                targetPulse = CalculateShortestTarget(startPulse, targetPulse, axis.rotaryModulo);
+            if (!TryResolveMotionTargetPulse(startPulse, targetPulse, pulsePerUnit,
+                rotaryShortestPath, axis.rotaryModulo, targetPulse))
+            {
+                AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID, m_pendingSourcePC, idx);
+                return result;
             }
 
             target_Pulse[i] = targetPulse;
@@ -92,7 +102,7 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
             }
 
             // 把算完的終點存起來，當作下一段(如果有)的起點
-            simulatedStartPulse[i] = targetPulse;
+            // Keep the simulated tail unchanged until every axis is valid.
         }
 
         double totalDist_Pulse = std::sqrt(sum_sq_pulse);
@@ -100,6 +110,7 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
         // 用最慢軸的時間去牽制全部，計算群組虛擬速度
         double vel = (maxTimeNeeded > 0.0001) ? (totalDist_Pulse / maxTimeNeeded) : 0;
 
+        simulatedStartPulse = target_Pulse;
         result.success = true;
         result.targetPulse = target_Pulse;
         result.vel = vel;
@@ -112,6 +123,16 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
     // ---------------------------------------------------------
     // 執行階段：採用安全的變數萃取法
     // ---------------------------------------------------------
+    // Validate both converted legs before either can enter the motion queue.
+    MoveResult intermediateResult{};
+    if (intermediatePos_mm != nullptr)
+    {
+        intermediateResult = processMove(*intermediatePos_mm);
+        if (!intermediateResult.success) return;
+    }
+    MoveResult referenceResult = processMove(refPos_mm);
+    if (!referenceResult.success) return;
+
     PathMode prevMode = GetGroupPathMode();
     SetGroupPathMode(PathMode::EXACT_STOP);
 
@@ -121,7 +142,7 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
     // 1. 跑第一段 (中間點)
     if (intermediatePos_mm != nullptr)
     {
-        MoveResult res = processMove(*intermediatePos_mm);
+        const MoveResult& res = intermediateResult;
         if (res.success)
         {
             LineMove(axes, res.targetPulse, res.vel, res.acc, res.dec, currentMode);
@@ -132,7 +153,7 @@ void MotionCore::G30_Move(const std::vector<int>& axes, const std::vector<double
     }
 
     // 2. 跑第二段 (參考點)
-    MoveResult resRef = processMove(refPos_mm);
+    const MoveResult& resRef = referenceResult;
     if (resRef.success)
     {
         // 這裡的 currentMode 可能已經因為上面的 if 變成了 BUFFERED

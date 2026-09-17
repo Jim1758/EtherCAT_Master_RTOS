@@ -1,0 +1,16 @@
+﻿RTX64 Windows Background Tasks Package Manifest
+Revision: 2026-09-17 FIX3
+
+7b4a1d74d55f56bc6256c6aeec1711be50eb66e8ac1dc87930087df47f6927c3        2574  Docs/01_新電腦_操作步驟_SOP.txt
+735719168d892247e21f94f498858e35b2fd536fadc4e442a499f423957e4369        2229  Docs/02_設定完成_檢查清單.txt
+ce3af5533755e8b6819cd88caf7aff1cdc0b5a67f663b3d226ba9ec82e762aeb        2088  Docs/03_停用項目清單與判讀原則.txt
+3a967219b46cee784ead6222eea27404f1c9f5f54b9bae095549c1f68e7d196a        2871  Docs/04_還原與故障排除.txt
+3331c538c2a3aa0a556f909f11853905e8d6c9f68f2b3ba6b2bdb0d63c1a56fe        2196  Docs/05_實機調查證據摘要_20260917.txt
+f466fb05b93cbd001fbd6659fd5f0679363a3695bf08ae0cb8414ed2bec50c54        1024  Docs/06_目前未納入一鍵停用的背景工作.txt
+aba2317cdbbf4918a0b2989e03e9123c38cf46495cab53b5cc84bd5fe64a64b8         421  PACKAGE_INFO.json
+ec656b3a5ca27d469eb3edc92b336bdf7c1704c3a58b6183ee2515e5b92d426c        2692  README_FIRST.txt
+8a5d1ae20584d21ae03385bcc00f41d386c893ece1d9bef08b8462fc11684059        3168  Reference/原始_歷史指令整理.txt
+f000c089aa1d8311cc1686540645a17d8a629436c48828df44f0b7aad7d64dd7        8275  Reference/歷史版_完整操作說明_20260917.txt
+97615ca55a4276343530b3028dc8e076ad3825f905fffd408331797e7789dce3        2878  Tools/RTX64_Windows_BackgroundTasks_Check.ps1
+2294a901dcacd6a70d4dc55944057dc36127dbf8171fa622fd10a01637423e79        9151  Tools/RTX64_Windows_BackgroundTasks_OneClick.ps1
+2eecb3511734ce6d47ff41cc4c33b278c6ea669e00d350f576c2e21216c3e75d         815  Tools/Run_RTX64_Windows_BackgroundTasks_OneClick.cmd

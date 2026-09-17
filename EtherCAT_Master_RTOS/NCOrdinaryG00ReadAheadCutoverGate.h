@@ -605,16 +605,18 @@ private:
             modal.distanceMode == 90 &&
             modal.unitsMode == 21 &&
             modal.planeMode == 17 &&
-            modal.workCoordinateCode == 54 &&
+            IsNCTranslationSourceAllowed(modal.workCoordinateCode, modal.translation) &&
             modal.storedStrokeMode == 22 &&
-            modal.toolLengthMode == 49 &&
+            IsNCTranslationToolModeAllowed(modal.toolLengthMode, modal.translation) &&
+            modal.hCode == modal.translation.toolHCode &&
             modal.toolRadiusMode == 40 &&
-            !modal.g68Active &&
-            !modal.g168Active &&
+            !modal.g68Active && !NCTranslationHasPlanarRotation(modal.translation) &&
+            IsNCTranslationWorkModeAllowed(modal.g168Active, modal.workpieceCode, modal.translation) &&
             !modal.scalingActive &&
             modal.mirrorMask == 0U &&
             !modal.polarActive &&
-            modal.cAxisOffsetRotationEnabled &&
+            (modal.toolLengthMode == 49 && !modal.g168Active ? modal.cAxisOffsetRotationEnabled :
+                !modal.cAxisOffsetRotationEnabled) &&
             !modal.modalMacroActive;
     }
 

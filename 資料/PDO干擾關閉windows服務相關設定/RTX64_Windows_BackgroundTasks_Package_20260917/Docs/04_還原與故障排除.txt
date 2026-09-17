@@ -1,0 +1,93 @@
+﻿RTX64 Windows Background Tasks
+還原與故障排除
+
+============================================================
+1. OneClick 顯示 FAIL
+============================================================
+
+先執行：
+RTX64_Windows_BackgroundTasks_Check.ps1
+
+確認是哪一個 Task 仍為 Ready / Running。
+
+DeviceDirectoryClient 若使用一般 Administrator 執行
+Disable-ScheduledTask / schtasks /Change 可能出現：
+0x80070005 / Access Denied
+
+本包 OneClick 已用 SYSTEM helper 自動處理，不需要手動改 ACL。
+
+============================================================
+2. PS1 被 Execution Policy 阻擋
+============================================================
+
+PowerShell 執行：
+
+Set-ExecutionPolicy -Scope Process Bypass -Force
+
+再執行 PS1。
+
+使用 CMD Launcher 時已帶 Bypass，一般不需手動設定。
+
+============================================================
+3. 沒有 Administrator 權限
+============================================================
+
+建議直接雙擊：
+Run_RTX64_Windows_BackgroundTasks_OneClick.cmd
+
+它會要求 UAC。
+
+PS1 本身也包含自動升權邏輯。
+
+============================================================
+4. 執行完視窗會不會自動關閉？
+============================================================
+
+最新版本不會。
+最後會顯示：
+「按 Enter 關閉此視窗...」
+
+============================================================
+5. 如何恢復某個 Task
+============================================================
+
+一般 Task：
+
+Enable-ScheduledTask -TaskPath "<TaskPath>" -TaskName "<TaskName>"
+
+DeviceDirectoryClient 若恢復時遇到 Access Denied，
+需用 SYSTEM 權限執行。
+
+============================================================
+6. 不要做的事
+============================================================
+
+不要為了這份 Profile：
+- 刪除 Scheduled Task
+- 修改 TaskCache Registry
+- 任意取得 TrustedInstaller / Task ACL 所有權
+- 關閉 Security-SPP service
+- 關閉整個 VSS Service
+- 關閉整個 System Restore 功能
+
+除非另有獨立驗證需求。
+
+============================================================
+7. Windows 更新後重新檢查
+============================================================
+
+Windows Feature Update / Image 還原 / 大型更新後，
+建議重新執行 Check.ps1。
+
+若出現 FAIL，再執行 OneClick。
+
+============================================================
+8. 如何判斷不是 Windows，而是 Physical fault
+============================================================
+
+如果：
+- ESC Physical / Invalid / Forwarded / LostLink Delta 增加
+- ReceivePacket 本身只有幾 us
+- NO_FRAME_BY_DEADLINE
+
+優先查 EtherCAT physical domain，不要繼續盲目關 Windows Task。

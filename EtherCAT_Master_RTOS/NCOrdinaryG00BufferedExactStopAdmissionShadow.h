@@ -1170,19 +1170,21 @@ private:
             modal.distanceMode == 90 &&
             modal.unitsMode == 21 &&
             modal.planeMode == 17 &&
-            modal.workCoordinateCode == 54 &&
+            IsNCTranslationSourceAllowed(modal.workCoordinateCode, modal.translation) &&
             // The target's accepted K.4.2 motion trace runs with G22 stored
             // stroke checking enabled.  Do not project a future cutover while
             // that machine-level safety envelope is disabled by G23.
             modal.storedStrokeMode == 22 &&
-            modal.toolLengthMode == 49 &&
+            IsNCTranslationToolModeAllowed(modal.toolLengthMode, modal.translation) &&
+            modal.hCode == modal.translation.toolHCode &&
             modal.toolRadiusMode == 40 &&
-            !modal.g68Active &&
-            !modal.g168Active &&
+            !modal.g68Active && !NCTranslationHasPlanarRotation(modal.translation) &&
+            IsNCTranslationWorkModeAllowed(modal.g168Active, modal.workpieceCode, modal.translation) &&
             !modal.scalingActive &&
             modal.mirrorMask == 0U &&
             !modal.polarActive &&
-            modal.cAxisOffsetRotationEnabled &&
+            (modal.toolLengthMode == 49 && !modal.g168Active ? modal.cAxisOffsetRotationEnabled :
+                !modal.cAxisOffsetRotationEnabled) &&
             !modal.modalMacroActive;
     }
 
@@ -1196,17 +1198,20 @@ private:
         if (modal.distanceMode != 90) mask |= EvidenceFailureBit(1U);
         if (modal.unitsMode != 21) mask |= EvidenceFailureBit(2U);
         if (modal.planeMode != 17) mask |= EvidenceFailureBit(3U);
-        if (modal.workCoordinateCode != 54) mask |= EvidenceFailureBit(4U);
+        if (!IsNCTranslationSourceAllowed(modal.workCoordinateCode, modal.translation)) mask |= EvidenceFailureBit(4U);
         if (modal.storedStrokeMode != 22) mask |= EvidenceFailureBit(5U);
-        if (modal.toolLengthMode != 49) mask |= EvidenceFailureBit(6U);
+        if (!IsNCTranslationToolModeAllowed(modal.toolLengthMode, modal.translation) ||
+            modal.hCode != modal.translation.toolHCode) mask |= EvidenceFailureBit(6U);
         if (modal.toolRadiusMode != 40) mask |= EvidenceFailureBit(7U);
-        if (modal.g68Active) mask |= EvidenceFailureBit(8U);
-        if (modal.g168Active) mask |= EvidenceFailureBit(9U);
+        if (modal.g68Active || NCTranslationHasPlanarRotation(modal.translation))
+            mask |= EvidenceFailureBit(8U);
+        if (!IsNCTranslationWorkModeAllowed(modal.g168Active, modal.workpieceCode, modal.translation))
+            mask |= EvidenceFailureBit(9U);
         if (modal.scalingActive) mask |= EvidenceFailureBit(10U);
         if (modal.mirrorMask != 0U) mask |= EvidenceFailureBit(11U);
         if (modal.polarActive) mask |= EvidenceFailureBit(12U);
-        if (!modal.cAxisOffsetRotationEnabled)
-            mask |= EvidenceFailureBit(13U);
+        if (modal.toolLengthMode == 49 && !modal.g168Active ? !modal.cAxisOffsetRotationEnabled :
+            modal.cAxisOffsetRotationEnabled) mask |= EvidenceFailureBit(13U);
         if (modal.modalMacroActive) mask |= EvidenceFailureBit(14U);
         return mask;
     }

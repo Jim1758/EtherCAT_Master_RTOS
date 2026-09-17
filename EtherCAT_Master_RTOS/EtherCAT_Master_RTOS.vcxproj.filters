@@ -665,6 +665,9 @@
     <ClInclude Include="MotionCommandPathModeTransport.h">
       <Filter>Header Files\NC\NC</Filter>
     </ClInclude>
+    <ClInclude Include="MotionRotaryTarget.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
     <ClInclude Include="MotionQueueTailTransaction.h">
       <Filter>Header Files\Motion</Filter>
     </ClInclude>
@@ -916,6 +919,12 @@
     </ClInclude>
     <ClInclude Include="EDMGapSignal.h">
       <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="NCTranslationSnapshot.h">
+      <Filter>Header Files\NC\Coordinate</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionNCTranslationProof.h">
+      <Filter>Header Files\Motion</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

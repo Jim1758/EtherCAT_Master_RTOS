@@ -168,7 +168,7 @@ namespace NCGCodeSemantics
                 NCGCodeModalGroup::COORD_ROTATION_2D,
                 NCGCodeRole::PRIMARY_ACTION,
                 200,
-                false,
+                true,
                 false,
                 true);
             return true;
@@ -179,7 +179,7 @@ namespace NCGCodeSemantics
                 NCGCodeModalGroup::WORKPIECE_ROTATION_3D,
                 NCGCodeRole::PRIMARY_ACTION,
                 200,
-                false,
+                true,
                 false,
                 true);
             return true;
@@ -242,7 +242,7 @@ namespace NCGCodeSemantics
                 NCGCodeModalGroup::DISTANCE,
                 NCGCodeRole::SETTING,
                 30,
-                false,
+                true,
                 false,
                 false);
             return true;
@@ -267,7 +267,7 @@ namespace NCGCodeSemantics
                 NCGCodeModalGroup::TOOL_LENGTH,
                 NCGCodeRole::SETTING,
                 60,
-                false,
+                true,
                 false,
                 false);
             return true;
@@ -326,7 +326,7 @@ namespace NCGCodeSemantics
                 NCGCodeModalGroup::WORKPIECE_ROTATION_3D,
                 NCGCodeRole::SETTING,
                 110,
-                false,
+                true,
                 false,
                 true);
             return true;
@@ -337,7 +337,7 @@ namespace NCGCodeSemantics
                 NCGCodeModalGroup::COORD_ROTATION_2D,
                 NCGCodeRole::SETTING,
                 120,
-                false,
+                true,
                 false,
                 true);
             return true;

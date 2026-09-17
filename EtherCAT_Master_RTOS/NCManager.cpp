@@ -78,6 +78,73 @@ namespace
     }
 
 
+    // DN/DV: deliberately bounded direct-variable P syntax for @/#/$.
+    // Preserve each prefix's range and current-PC resolver semantics.
+    // Arithmetic/indexed P and coordinate expressions keep their drain path.
+    bool IsCncRapidGlobalPLiteral(const std::string& expression) noexcept
+    {
+        if (expression.empty() || expression.size() > 64U) return false;
+        std::size_t i = 0U;
+        if (expression[i] == '+' || expression[i] == '-') ++i;
+        bool digit = false;
+        bool point = false;
+        for (; i < expression.size(); ++i)
+        {
+            const char c = expression[i];
+            if (c >= '0' && c <= '9') digit = true;
+            else if (c == '.' && !point) point = true;
+            else return false;
+        }
+        return digit;
+    }
+
+    bool TryResolveCncRapidGlobalP1(const NCParsedBlock& parsed,
+        MacroParser& evaluator, NCBlock& block, int& globalIndex)
+    {
+        globalIndex = 0;
+        if (parsed.isEmpty || parsed.isBlockSkip ||
+            parsed.error != NCParseError::NONE || !parsed.dependsOnMacroState ||
+            parsed.controlType != NCParsedControlType::NONE ||
+            parsed.gCount != 1 || parsed.mCount != 0 || !parsed.has('P') ||
+            (parsed.gExpressions[0] != "0" && parsed.gExpressions[0] != "00") ||
+            (!parsed.has('X') && !parsed.has('Y') && !parsed.has('Z')))
+            return false;
+
+        const std::string& p = parsed.expression('P');
+        if (p.size() < 2U || p.size() > 5U ||
+            (p[0] != '@' && p[0] != '#' && p[0] != '$')) return false;
+        int index = 0;
+        for (std::size_t i = 1U; i < p.size(); ++i)
+        {
+            if (p[i] < '0' || p[i] > '9') return false;
+            index = index * 10 + (p[i] - '0');
+        }
+        if (!MacroVariableRules::IsValidIndex(p[0], index)) return false;
+        for (int i = 0; i < 26; ++i)
+        {
+            if (!parsed.hasParam[static_cast<std::size_t>(i)]) continue;
+            const char letter = static_cast<char>('A' + i);
+            if (letter == 'P') continue;
+            if (letter != 'X' && letter != 'Y' && letter != 'Z' &&
+                letter != 'F' && letter != 'N') return false;
+            if (!IsCncRapidGlobalPLiteral(parsed.expression(letter))) return false;
+        }
+
+        // Resolve exactly once for a selected dispatch, into the very block
+        // passed to ExecuteBlock. Never qualify with P=1 and read it again:
+        // a changed P=0 would select G00's ABORTING producer path.
+        // A non-selected result remains subject to the old drain/error path.
+        NCExpressionResolveError error = NCExpressionResolveError::NONE;
+        if (!NCExpressionResolver::ResolveBlock(parsed, evaluator, block, error) ||
+            !std::isfinite(block.val('P')) || block.val('P') != 1.0) return false;
+        for (int i = 0; i < 26; ++i)
+            if (block.hasParam[i] && !std::isfinite(block.param[i])) return false;
+        if (block.has('F') && (block.val('F') <= 0.0 || block.val('F') > 100.0))
+            return false;
+        globalIndex = index;
+        return true;
+    }
+
     void TriggerMappingIntegrityAlarmOnce(int sourceLineNumber = 0)
     {
         AlarmManager& alarms = AlarmManager::GetInstance();
@@ -1903,10 +1970,12 @@ void NCManager::Reset()
 }
 void NCManager::Reset_Gode()       // 重置G碼相關
 {
+    CoordSys.BeginTranslationReset();
     GCodeHandlers::Reset_G04(this);
     CoordSys.Set_G90G91(90, this);//重置G90 絕對模式
     CoordSys.CancelToolLengthCompensation(this);//取消刀常補正
     CoordSys.CancelWorkpieceRotation(this);//工件補償取消
+    CoordSys.CancelG68Rotation(this); // RESET clears live rotation; frozen source retires later.
     CoordSys.SetActivePlane(17, this);//平面選擇
     CoordSys.isCAxisOffsetRotationEnabled = true;//C 軸電極偏心旋轉補償
     CoordSys.CancelScaling(this);//關閉縮放功能
@@ -1916,6 +1985,7 @@ void NCManager::Reset_Gode()       // 重置G碼相關
     CoordSys.CancelToolRadiusCompensation(this);//關閉刀徑補償
 
     m_isG66Active = false; // 🌟 Reset 必須強制取消 G66
+    CoordSys.EndTranslationReset();
 }
 
 // ==========================================
@@ -2194,8 +2264,11 @@ void NCManager::BeginLifecycleInterruptionShadow(
 {
     CancelGapDryRunSameThread("LIFECYCLE");
     FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::INTERRUPTION);
-    InvalidatePathCoreFeedSameThread(); // BX-FEED
-    InvalidatePathCoreArcSameThread(); // BY-ARC
+    // Carry only the immediate invalidation cause; RESET/ALARM/replacement
+    // and all ordinary invalidations clear it through the default argument.
+    const bool byGoto = cause == NCLifecycleInterruptionCause::GOTO_EPOCH;
+    InvalidatePathCoreFeedSameThread(byGoto); // BX-FEED
+    InvalidatePathCoreArcSameThread(byGoto); // BY-ARC
     InvalidatePathCoreReplaySameThread(); // BZ: revoke saved geometry and active replay.
     InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
 
@@ -3633,6 +3706,7 @@ void NCManager::ProcessTask()
                 m_resetAuthorityProvenanceGeneration = 0ULL;
                 m_resetContinuationExecutionState =
                     MotionNCResetExecutionState{};
+                RetireFixedTranslationSameThread();
                 m_state = NCState::READY;
                 UpdateSystemVariables();
             }
@@ -3641,6 +3715,17 @@ void NCManager::ProcessTask()
         ObservePreparedBlockQueueShadow(false);
 
         // ⚠️ 只要還在滑行，就立刻 return，不准執行下面的 G 碼解析與模式分流！
+        return;
+    }
+
+    if (CoordSys.IsTranslationRunFrozen() &&
+        (m_state == NCState::RUN || m_state == NCState::HOLD) &&
+        (!CoordSys.IsTranslationRunCurrent() || !IsFixedTranslationTravelCurrentSameThread()))
+    {
+        RtPrintf("[COORD][FAULT] fixed translation or travel policy changed\n");
+        TriggerMappingIntegrityAlarmOnce();
+        m_state = NCState::ALARM;
+        m_motion.RequestEmergencyStopAllAxes();
         return;
     }
 
@@ -4010,6 +4095,7 @@ void NCManager::ProcessExecutionEngine()
         if (currentPC < 0 ||
             static_cast<std::size_t>(currentPC) >= currentProgram->Size())
         {
+            if (!PrepareCncFeedDispatchSameThread(nullptr, currentPC)) return; // DD EOF drains receipts first.
             if (currentIsMacro)
             {
                 // Macro EOF 仍是返回邊界，不是整份 Program End。
@@ -4062,6 +4148,7 @@ void NCManager::ProcessExecutionEngine()
 
         // Runtime 只讀取 Load Time 建立的 Pure Parsed Cache。
         const NCParsedBlock& parsedBlock = cachedLine->parsedBlock;
+        if (!PrepareCncFeedDispatchSameThread(&parsedBlock, currentPC)) return; // DD capacity/boundary gate.
         const int sourceLineNumber = cachedLine->sourceLineNumber;
         const NCProgramCommitSnapshot commitTarget =
             MakeCurrentProgramCommitTarget(currentPC);
@@ -4313,10 +4400,60 @@ void NCManager::ProcessExecutionEngine()
         }
         else
         {
-            // G/M/Address Expression 只要讀取 #/@/$，就必須等前段
-            // Motion 完整 Commit 後才求值。這也涵蓋會隨 Runtime
-            // 更新的 $ System Variable，避免 Lookahead 提早取樣。
-            if (parsedBlock.dependsOnMacroState)
+            NCBlock block{};
+            int rapidGlobalPIndex = 0;
+            // DN samples only the current PC, on the NC producer thread.
+            // HMI global writes and NC dispatch are sequenced in that loop;
+            // a later HMI write affects only a later undispatched block.
+            // No sample/token survives HOLD, RESET, owner or cache changes.
+            bool rapidGlobalPScope = parsedBlock.dependsOnMacroState &&
+                m_state == NCState::RUN &&
+                (m_mode == NCOperationMode::MEMORY || m_mode == NCOperationMode::MDI) &&
+                !currentIsMacro && MacroSys.GetCurrentDepth() == 0 && !m_isG66Active &&
+                !m_isSingleBlockEnabled && !IsFeedHoldActive() && !Homing.IsActive() &&
+                !m_motion.HasPendingSafetyOrRecoveryRequests() &&
+                m_programMotionLease.owner == GetMotionOwnerForMode(m_mode) &&
+                m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) &&
+                !m_cncFeed.active && !m_pathArc.pending && !m_pathReplay.pending &&
+                !m_pathHold.armed && !m_pathHold.bound && !m_gapDryRun.active &&
+                !m_gapPath.active && !m_gapWindow.active &&
+                CoordSys.isAbsoluteMode && !CoordSys.isInchMode &&
+                IsNCTranslationSourceAllowed(CoordSys.GetCurrentWCSGCode(), CoordSys.GetTranslationSnapshot()) && CoordSys.activePlane == 17 &&
+                // Fixed H uses its complete published descriptor; G49 keeps
+                // the accepted dormant-C-offset route.
+                IsNCTranslationToolModeAllowed(CoordSys.toolLengthMode, CoordSys.GetTranslationSnapshot()) &&
+                CoordSys.currentHCode == CoordSys.GetTranslationSnapshot().toolHCode &&
+                (CoordSys.toolLengthMode == 49 || !CoordSys.isCAxisOffsetRotationEnabled) &&
+                CoordSys.toolRadiusMode == 40 &&
+                !CoordSys.isG68Active &&
+                IsNCTranslationWorkModeAllowed(CoordSys.isWorkpieceRotationActive, CoordSys.currentWCode, CoordSys.GetTranslationSnapshot()) &&
+                (!CoordSys.isWorkpieceRotationActive || !CoordSys.isCAxisOffsetRotationEnabled) &&
+                !CoordSys.isScalingActive && !CoordSys.isPolarCoordinateActive &&
+                m_axisNames[0] == 'X' && m_axisNames[1] == 'Y' && m_axisNames[2] == 'Z';
+            if (rapidGlobalPScope)
+            {
+                for (int i = 0; i < 8; ++i)
+                    if (CoordSys.isMirrorActive[i]) rapidGlobalPScope = false;
+                for (int i = 0; i < 3; ++i)
+                    if (parsedBlock.has(m_axisNames[i]) &&
+                        (!m_motion.GetAxisContext(i).isExist ||
+                            m_motion.GetAxisContext(i).axisType != AxisType::LINEAR))
+                        rapidGlobalPScope = false;
+            }
+            const bool rapidGlobalPSelected = rapidGlobalPScope &&
+                TryResolveCncRapidGlobalP1(parsedBlock, MathParser, block, rapidGlobalPIndex);
+
+            // DS-RESOLVED-HEAD-BEGIN
+            const bool feedGlobalSelected = m_cncFeed.selected && parsedBlock.dependsOnMacroState &&
+                m_cncFeed.selectedPC == currentPC;
+            if (feedGlobalSelected) block = m_cncFeed.candidate;
+            // DS-RESOLVED-HEAD-END
+
+            // An unselected probe is discarded; retain the accepted drain
+            // and post-drain execution resolver for every unselected prefix.
+            // Keep the original parsed cache and dependsOnMacroState flag:
+            // DN never creates a literal Prepared head or K.4 bypass token.
+            if (parsedBlock.dependsOnMacroState && !rapidGlobalPSelected && !feedGlobalSelected)
             {
                 const std::uint64_t commandQueueDepth =
                     static_cast<std::uint64_t>(m_motion.GetQueueSize());
@@ -4388,7 +4525,6 @@ void NCManager::ProcessExecutionEngine()
                     }
                 }
             }
-            NCBlock block{};
             NCBlock readAheadCandidateBlock{};
             const bool readAheadCandidateExact =
                 m_preparedHeadResolverBypassGate.
@@ -4500,7 +4636,10 @@ void NCManager::ProcessExecutionEngine()
                         GetSnapshot(),
                         m_preparedHeadPreResolveAdmissionShadow.
                         GetCounters(),
-                        block,
+                        // K.4 clears its output even on rejection. Preserve
+                        // DN/DS once-resolved values using the existing scratch;
+                        // the unchanged macro head cannot qualify this gate.
+                        (rapidGlobalPSelected || feedGlobalSelected) ? readAheadCandidateBlock : block,
                         ordinaryConfiguredAxisPresent);
             }
 
@@ -4554,7 +4693,7 @@ void NCManager::ProcessExecutionEngine()
 
                 NCExpressionResolveError resolveError =
                     NCExpressionResolveError::NONE;
-                if (!NCExpressionResolver::ResolveBlock(
+                if (!rapidGlobalPSelected && !feedGlobalSelected && !NCExpressionResolver::ResolveBlock(
                     parsedBlock,
                     MathParser,
                     block,
@@ -4640,6 +4779,17 @@ void NCManager::ProcessExecutionEngine()
                 isBarrier = true;
             }
 
+            // DD/DS relax producer drain only for the selected, exact G01 source value.
+            if (m_cncFeed.selected)
+            {
+                if (!IsCncFeedSelectedBlockSameThread(block))
+                {
+                    RejectCncFeedSameThread("RESOLVED_VALUE", sourceLineNumber);
+                    return;
+                }
+                if (m_cncFeed.active) isBarrier = false;
+            }
+
             // NC-0.2K.7.1 owns the only ordinary no-P G00 exception to the
             // legacy drain barrier.  Its exact-stop boundary is command-local
             // in Motion, so the NC producer may commit and inspect the next
@@ -4716,8 +4866,11 @@ void NCManager::ProcessExecutionEngine()
             {
                 const std::uint64_t commandQueueDepth =
                     static_cast<std::uint64_t>(m_motion.GetQueueSize());
-                const bool groupStandstill =
-                    m_motion.IsGroupNCDrained();
+                const bool coordinateTransition =
+                    RequiresFixedTranslationSelectionTransitionSameThread(block);
+                const bool groupStandstill = m_motion.IsGroupNCDrained() &&
+                    (!coordinateTransition || m_motion.HasExactExecutionDrainAcknowledgement(
+                        m_motion.GetCurrentExecutionEpoch(), m_programMotionLease));
                 preparedCutoverContext.legacyDrainSatisfied =
                     commandQueueDepth == 0ULL && groupStandstill;
                 if (commandQueueDepth > 0ULL || !groupStandstill)
@@ -4792,6 +4945,31 @@ void NCManager::ProcessExecutionEngine()
             {
                 preparedCutoverContext.legacyDrainSatisfied = true;
                 ClearPreDispatchBarrier();
+            }
+
+            // A bounded RT publication read or reservation may be busy. Do
+            // the coordinate handoff before creating/committing this dispatch,
+            // so an unchanged source can retry the same PC on the next scan.
+            const bool coordinateTransition =
+                RequiresFixedTranslationSelectionTransitionSameThread(block);
+            if (coordinateTransition)
+            {
+                if (!IsFixedTranslationBlockAllowedSameThread(block))
+                {
+                    markDispatchFailed(static_cast<std::uint32_t>(
+                        AlarmManager::G_Code_Invalid_parameter));
+                    return;
+                }
+                if (!TransitionFixedTranslationSelectionSameThread(block))
+                {
+                    if (m_state == NCState::ALARM)
+                        markDispatchFailed(static_cast<std::uint32_t>(
+                            AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY));
+                    else if (m_state == NCState::HOLD)
+                        markDispatchFailed(static_cast<std::uint32_t>(
+                            AlarmManager::G_Code_Invalid_parameter));
+                    return;
+                }
             }
 
             const NCBlockDispatchId dispatchId = ensureBlockLifecycle();
@@ -5378,6 +5556,25 @@ void NCManager::ProcessExecutionEngine()
                 resolverBypassCommitLedger, currentPC, sourceLineNumber); // BZ-REPLAY
             CommitPathCoreHoldCaptureSameThread(dispatchId); // CB: only after authoritative BX/BY ledger binding.
             if (m_state == NCState::ALARM) return;
+            // DN producer diagnostic only, after the authoritative dispatch
+            // and program Commit. Motion's CNC-DC events remain the evidence
+            // of an actual nonzero seam; this line alone is not that proof.
+            if (rapidGlobalPSelected && lineCommitSucceeded &&
+                motionCapture.count == 1U && !motionCapture.overflow &&
+                motionCapture.submissions[0].producerAccepted)
+            {
+                const MotionExecutionIdentity& identity = motionCapture.submissions[0].identity;
+                RtPrintf("[CNC-DN] P_GLOBAL_COMMIT pc=%d line=%d var=%c%d value=1 "
+                    "cache=%llu dispatch=%llu source=%u owner=%u generation=%u epoch=%u seg=%llu\n",
+                    currentPC, sourceLineNumber, parsedBlock.expression('P')[0], rapidGlobalPIndex,
+                    static_cast<unsigned long long>(currentProgram->GetGeneration()),
+                    static_cast<unsigned long long>(dispatchId),
+                    static_cast<unsigned>(identity.source),
+                    static_cast<unsigned>(m_programMotionLease.owner),
+                    static_cast<unsigned>(m_programMotionLease.generation),
+                    static_cast<unsigned>(identity.epoch),
+                    static_cast<unsigned long long>(identity.segmentId));
+            }
             // BQ-END
                         // Stage NC-0.2H：M00/M01/M98/M99/M02/M30 的 Post Action
                         // 由 G/M Transaction 在所有同行動作與 Motion Ledger 完成後套用。
@@ -5778,6 +5975,8 @@ int NCManager::GetActiveCommittedPC() const noexcept
 }
 void NCManager::CapturePendingCommandState(int sourcePC)
 {
+    m_motion.SetNextCommandTranslation(CoordSys.IsTranslationRunFrozen()
+        ? CoordSys.GetTranslationSnapshot() : NCTranslationSnapshot{});
     const int currentBrainWCS = CoordSys.GetCurrentWCSGCode();
     const int currentBrainToolMode = CoordSys.toolLengthMode;
     const int currentBrainHCode = CoordSys.currentHCode;
@@ -5962,6 +6161,7 @@ void NCManager::ExecuteBlock(
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
+    if (!IsFixedTranslationBlockAllowedSameThread(block)) return;
     // CG: reject mixed/implicit test commands before settings, tools or M outputs.
     if (NCGCodeSemantics::Contains(block, 180))
     {
@@ -6011,7 +6211,7 @@ void NCManager::ExecuteBlock(
     }
     // BY-ARC-BEGIN: whole-block guard before any setting/tool/M side effect.
     const bool explicitArc = NCGCodeSemantics::Contains(block, 2) || NCGCodeSemantics::Contains(block, 3);
-    if ((explicitArc && (!IsPathCoreArcBlockShapeValid(block) || m_pathFeed.pending)) ||
+    if ((explicitArc && (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21) || m_pathFeed.pending)) ||
         IsPathCoreArcInputOmission(block) ||
         (m_pathArc.pending && (explicitArc || NCGCodeSemantics::Contains(block, 0) || NCGCodeSemantics::Contains(block, 1))))
     {
@@ -6037,7 +6237,7 @@ void NCManager::ExecuteBlock(
     }
     // BY-ARC-END
     // BX-FEED: reject unsupported shape before setting/tool/M-code side effects.
-    if ((NCGCodeSemantics::Contains(block, 1) && !IsPathCoreFeedBlockShapeValid(block)) ||
+    if ((NCGCodeSemantics::Contains(block, 1) && !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21)) ||
         IsPathCoreFeedInputOmission(block))
     {
         if (!m_pathFeed.pending)
@@ -6194,6 +6394,7 @@ void NCManager::ExecuteBlock(
         // 再擷取 Motion Frame Snapshot，最後才派送唯一 Primary Action。
         if (descriptor.role == NCGCodeRole::PRIMARY_ACTION)
         {
+            if (!PrepareFixedTranslationMotionSameThread(block, gCode)) return;
             CapturePendingCommandState(sourcePC);
         }
 
@@ -7268,6 +7469,18 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
 
     // BN: this is the completed fresh-start admission, never a provisional RUN.
     ArmPathCoreLiveRetentionSameThread();
+    // The fresh Start has already proved quiescence and committed ownership.
+    // Reserve the run identity now; the values freeze at its first motion.
+    RetireFixedTranslationSameThread();
+    if (m_mode == NCOperationMode::MEMORY &&
+        !CoordSys.BeginTranslationRun(m_pathCoreLiveBookkeeping.currentRunToken))
+    {
+        TriggerMappingIntegrityAlarmOnce();
+        m_state = NCState::ALARM;
+        m_motion.RequestEmergencyStopAllAxes();
+        ClearPendingProgramRunStart(false);
+        return true;
+    }
     ArmPathCoreFeedSameThread(); // BX-FEED: completed fresh NC Start only.
     ArmPathCoreArcSameThread(); // BY-ARC: fresh NC Start only.
     ArmPathCoreReplaySameThread(); // BZ: completed fresh run, never M00 resume.
@@ -7474,6 +7687,7 @@ void NCManager::FinalizeProgramEnd()
     FinalizePathCoreFeedSameThread(); // BX-FEED: original End gate already finalized.
     FinalizePathCoreArcSameThread(); // BY-ARC: current run summary only.
     FinalizePathCoreReplaySameThread(); // BZ-REPLAY
+    RetireFixedTranslationSameThread();
     InvalidatePathCoreHoldSameThread(); // CB: program end closes any unused arm.
 // BQ-END
     m_waitCallback = nullptr;
@@ -7633,6 +7847,7 @@ NCManager::BuildPreparedBlockModalSnapshot() const noexcept
     modal.unitsMode = CoordSys.isInchMode ? 20 : 21;
     modal.planeMode = CoordSys.activePlane;
     modal.workCoordinateCode = CoordSys.GetCurrentWCSGCode();
+    modal.translation = CoordSys.GetTranslationSnapshot();
     modal.storedStrokeMode =
         CoordSys.IsProgrammableTravelLimitEnabled() ? 22 : 23;
     modal.toolLengthMode = CoordSys.toolLengthMode;

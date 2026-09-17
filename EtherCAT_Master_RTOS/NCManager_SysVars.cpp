@@ -13,7 +13,15 @@ void NCManager::UpdateSystemVariables()
 {
    
     // 🌟 新增：取得目前的顯示單位倍率 (公制=1.0, 英制=1/25.4)
-    double unitScale = CoordSys.isInchMode ? (1.0 / 25.4) : 1.0;
+    // RESET may clean live modes before the frozen display frame is retired.
+    const bool displayInch = CoordSys.IsTranslationRunFrozen() ?
+        CoordSys.GetTranslationSnapshot().unitsMode == 20 : CoordSys.isInchMode;
+    const double unitScale = displayInch ? (1.0 / 25.4) : 1.0;
+    double axisUnitScale[8] = {};
+    for (int axis = 0; axis < 8; ++axis)
+        axisUnitScale[axis] = (m_motion.GetAxisContext(axis).axisType == AxisType::ROTARY ||
+            m_motion.GetAxisContext(axis).axisType == AxisType::ROTARY_CONTINUOUS) ?
+            1.0 : unitScale;
 
     // =========================================================
     // 1. 軸啟用狀態 ($30 ~ $37)
@@ -44,8 +52,8 @@ void NCManager::UpdateSystemVariables()
     CoordSys.GetCommandedWCS(cmdWCS); // 取得包含所有補償後的純理論 WCS
 
     for (int i = 0; i < 8; i++) {
-        MacroSys.SetVar('$', 100 + i, cmdWCS[i] * unitScale);         // $100~$107
-        MacroSys.SetVar('$', 110 + i, CoordSys.commandedMCS[i] * unitScale);  // $110~$117
+        MacroSys.SetVar('$', 100 + i, cmdWCS[i] * axisUnitScale[i]);         // $100~$107
+        MacroSys.SetVar('$', 110 + i, CoordSys.commandedMCS[i] * axisUnitScale[i]);  // $110~$117
     }
 
     // =========================================================
@@ -57,7 +65,7 @@ void NCManager::UpdateSystemVariables()
             - CoordSys.extOffset[i]
             - CoordSys.m_WCSTable[CoordSys.currentWCSIndex][i];
         // 🌟 修改：乘上 unitScale
-        MacroSys.SetVar('$', 120 + i, rawWCS * unitScale);
+        MacroSys.SetVar('$', 120 + i, rawWCS * axisUnitScale[i]);
     }
 
     // =========================================================
@@ -66,7 +74,7 @@ void NCManager::UpdateSystemVariables()
     double cAngleMCS = CoordSys.commandedMCS[CoordSys.C_AXIS_INDEX];
     for (int i = 0; i < 8; i++) {
         double activeToolLen = CoordSys.GetActiveToolOffset(i, cAngleMCS);
-        MacroSys.SetVar('$', 130 + i, activeToolLen * unitScale);
+        MacroSys.SetVar('$', 130 + i, activeToolLen * axisUnitScale[i]);
     }
     double activeToolRad = CoordSys.GetActiveToolRadius();
     MacroSys.SetVar('$', 138, activeToolRad * unitScale); // 🌟 修改
@@ -74,25 +82,52 @@ void NCManager::UpdateSystemVariables()
     // =========================================================
     // 6. G68 旋轉參數 ($150 ~ $153)
     // =========================================================
-    MacroSys.SetVar('$', 150, CoordSys.g68CenterWCS[0] * unitScale);
-    MacroSys.SetVar('$', 151, CoordSys.g68CenterWCS[1] * unitScale);
-    MacroSys.SetVar('$', 152, CoordSys.g68CenterWCS[2] * unitScale);
-    MacroSys.SetVar('$', 153, CoordSys.isG68Active ? CoordSys.g68Angle : 0.0);
+    if (CoordSys.IsTranslationRunFrozen())
+    {
+        // Report the frame used by commanded/actual inverse coordinates.
+        // Interpreter modal group $16 retains its existing RESET semantics.
+        const NCTranslationSnapshot display = CoordSys.GetTranslationSnapshot();
+        MacroSys.SetVar('$', 150, display.rotationCenterMM[0] * unitScale);
+        MacroSys.SetVar('$', 151, display.rotationCenterMM[1] * unitScale);
+        MacroSys.SetVar('$', 152, 0.0); // Fixed G17 has no Z rotation centre.
+        MacroSys.SetVar('$', 153, display.rotationAngleDeg);
+    }
+    else
+    {
+        MacroSys.SetVar('$', 150, CoordSys.g68CenterWCS[0] * unitScale);
+        MacroSys.SetVar('$', 151, CoordSys.g68CenterWCS[1] * unitScale);
+        MacroSys.SetVar('$', 152, CoordSys.g68CenterWCS[2] * unitScale);
+        MacroSys.SetVar('$', 153, CoordSys.isG68Active ? CoordSys.g68Angle : 0.0);
+    }
 
     // =========================================================
     // 7. G168 旋轉參數 ($160 ~ $165)
     // =========================================================
-    MacroSys.SetVar('$', 160, CoordSys.rotationCenterMCS[0]);
-    MacroSys.SetVar('$', 161, CoordSys.rotationCenterMCS[1]);
-    MacroSys.SetVar('$', 162, CoordSys.rotationCenterMCS[2]);
-
+    double workCenterX = CoordSys.rotationCenterMCS[0];
+    double workCenterY = CoordSys.rotationCenterMCS[1];
+    double workCenterZ = CoordSys.rotationCenterMCS[2];
     double yaw = 0.0, pitch = 0.0, roll = 0.0;
-    if (CoordSys.isWorkpieceRotationActive && CoordSys.currentWCode > 0 && CoordSys.currentWCode <= CoordSys.m_WorkOffset.size()) {
+    if (CoordSys.IsTranslationRunFrozen())
+    {
+        // The displayed frame stays on the same source while RESET cleans
+        // live modes; a Z center does not participate in the fixed yaw map.
+        const NCTranslationSnapshot display = CoordSys.GetTranslationSnapshot();
+        workCenterX = display.workRotationCenterMM[0];
+        workCenterY = display.workRotationCenterMM[1];
+        workCenterZ = 0.0;
+        yaw = display.workOffset[CoordinateManager::WO_ANGLE_XY_YAW];
+        pitch = display.workOffset[CoordinateManager::WO_ANGLE_XZ_PITCH];
+        roll = display.workOffset[CoordinateManager::WO_ANGLE_YZ_ROLL];
+    }
+    else if (CoordSys.isWorkpieceRotationActive && CoordSys.currentWCode > 0 && CoordSys.currentWCode <= CoordSys.m_WorkOffset.size()) {
         int wIdx = CoordSys.currentWCode - 1;
         yaw = CoordSys.m_WorkOffset[wIdx][CoordinateManager::WO_ANGLE_XY_YAW];
         pitch = CoordSys.m_WorkOffset[wIdx][CoordinateManager::WO_ANGLE_XZ_PITCH];
         roll = CoordSys.m_WorkOffset[wIdx][CoordinateManager::WO_ANGLE_YZ_ROLL];
     }
+    MacroSys.SetVar('$', 160, workCenterX * unitScale);
+    MacroSys.SetVar('$', 161, workCenterY * unitScale);
+    MacroSys.SetVar('$', 162, workCenterZ * unitScale);
     MacroSys.SetVar('$', 163, yaw);
     MacroSys.SetVar('$', 164, pitch);
     MacroSys.SetVar('$', 165, roll);
@@ -100,7 +135,11 @@ void NCManager::UpdateSystemVariables()
     // =========================================================
     // 8. G51 縮放倍率 ($166)
     // =========================================================
-    MacroSys.SetVar('$', 166, CoordSys.isScalingActive ? CoordSys.scaleFactor : 1.0);
+    // Keep this parameter on the same immutable frame as WCS during RESET.
+    const double displayScale = CoordSys.IsTranslationRunFrozen() ?
+        CoordSys.GetTranslationSnapshot().scalingFactor :
+        (CoordSys.isScalingActive ? CoordSys.scaleFactor : 1.0);
+    MacroSys.SetVar('$', 166, displayScale);
 
     // =========================================================
     // 9. 座標系底層表格數值 ($180 ~ $197)

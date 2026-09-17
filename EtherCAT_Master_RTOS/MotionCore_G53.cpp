@@ -39,9 +39,15 @@ void MotionCore::G53_Move(const std::vector<int>& axes, const std::vector<double
         groupAccTime = std::max<double>(groupAccTime, axis.G53_acc_time);
         groupDecTime = std::max<double>(groupDecTime, axis.G53_dec_time);
 
-        double lead = axis.finalLead;
-        if (lead < 1e-6) lead = 1.0;
-        double pulsePerUnit = axis.resolution_PPR / lead;
+        const bool rotaryShortestPath =
+            axis.axisType == AxisType::ROTARY && axis.useShortestPath;
+        double pulsePerUnit = 0.0;
+        if (!TryGetMotionPulsePerUnit(axis.resolution_PPR, axis.finalLead,
+            rotaryShortestPath, pulsePerUnit))
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID, m_pendingSourcePC, idx);
+            return;
+        }
 
         double targetPulse = targetPos_mm[i] * pulsePerUnit;
 
@@ -50,8 +56,11 @@ void MotionCore::G53_Move(const std::vector<int>& axes, const std::vector<double
         // =========================================================
         double startPulse = isLookAheadActive ? axis.lastQueuedPulse : axis.logicalCmdPos;
 
-        if (axis.axisType == AxisType::ROTARY && axis.useShortestPath) {
-            targetPulse = CalculateShortestTarget(startPulse, targetPulse, axis.rotaryModulo);
+        if (!TryResolveMotionTargetPulse(startPulse, targetPulse, pulsePerUnit,
+            rotaryShortestPath, axis.rotaryModulo, targetPulse))
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID, m_pendingSourcePC, idx);
+            return;
         }
 
         targetPos_Pulse[i] = targetPulse;
@@ -66,7 +75,7 @@ void MotionCore::G53_Move(const std::vector<int>& axes, const std::vector<double
         // =========================================================
         // 🌟 3. 極度重要：把這次的 G53 終點存起來，給未來的指令當起點！
         // =========================================================
-        axis.lastQueuedPulse = targetPulse;
+        // Publish all pulse tails only after every axis conversion succeeds.
 
         // 🌟 【神級修復】防止除以零的防呆寫法，讀取 G53 專屬極速
         double currentAxisMaxPPS = axis.G53_PPS;
@@ -74,6 +83,11 @@ void MotionCore::G53_Move(const std::vector<int>& axes, const std::vector<double
             double timeNeeded = distancePulse / currentAxisMaxPPS;
             maxTimeNeeded = std::max<double>(maxTimeNeeded, timeNeeded);
         }
+    }
+
+    for (size_t i = 0; i < axes.size(); ++i)
+    {
+        (*m_pContexts)[axes[i]].lastQueuedPulse = targetPos_Pulse[i];
     }
 
     // 防呆保護

@@ -1134,6 +1134,8 @@ NCPreparedBlockQueueShadow::ClassifyLiteralBlock(
             code == 90 || code == 91)
         {
             hasPureModal = true;
+            AddBarrier(result, NCPreparedBarrierKind::MODAL_SNAPSHOT,
+                NC_PREPARED_BARRIER_FLAG_MODAL);
             continue;
         }
 
@@ -1245,6 +1247,14 @@ NCPreparedBlockQueueShadow::ClassifyLiteralBlock(
             NC_PREPARED_BARRIER_FLAG_IMPLICIT);
     }
 
+    // H is table-dependent even when no explicit G43/G44 shares the block.
+    // Never pre-resolve a later motion across an unproven tool selection.
+    if (block.has('H'))
+    {
+        AddBarrier(result, NCPreparedBarrierKind::MODAL_SNAPSHOT,
+            NC_PREPARED_BARRIER_FLAG_MODAL);
+    }
+
     if (block.has('T'))
     {
         AddBarrier(
@@ -1283,11 +1293,25 @@ NCPreparedModalSnapshot NCPreparedBlockQueueShadow::ReduceModalSnapshot(
 {
     NCPreparedModalSnapshot after = before;
     afterValid = before.imageValid;
+    if (block.has('H')) afterValid = false;
 
     const int count = SafeGCodeCount(block);
     for (int i = 0; i < count; ++i)
     {
         const int code = StoredGCode(block, i);
+        // Coordinate settings depend on the actual table revision. Never
+        // predict a new translation from only a G-code or a table index.
+        if ((code >= 54 && code <= 959 && IsExtendedWorkCoordinateCode(code)) ||
+            code == 10 || code == 92 || code == 160 || code == 168 || code == 169 ||
+            code == 20 || code == 21 || code == 17 || code == 18 || code == 19 ||
+            code == 22 || code == 23 || code == 90 || code == 91 ||
+            code == 40 || code == 41 || code == 42 || code == 43 || code == 44 || code == 49 ||
+            code == 50 || code == 51 || code == 68 || code == 69 ||
+            code == 150 || code == 151 || code == 162 || code == 163 || code == 15 || code == 16)
+        {
+            afterValid = false;
+            after.imageValid = false;
+        }
         if (code == 90 || code == 91) after.distanceMode = code;
         else if (code == 20 || code == 21) after.unitsMode = code;
         else if (code == 17 || code == 18 || code == 19) after.planeMode = code;
@@ -1295,19 +1319,17 @@ NCPreparedModalSnapshot NCPreparedBlockQueueShadow::ReduceModalSnapshot(
         else if (IsExtendedWorkCoordinateCode(code)) after.workCoordinateCode = code;
         else if (code == 43 || code == 44 || code == 49)
         {
-            const int hCode =
-                block.has('H') ? static_cast<int>(block.val('H')) : 0;
-            if (code == 49 || hCode == 0)
+            int mode = 49, hCode = 0;
+            if (!TryDecodeNCToolLengthSelection(code, block.has('H'),
+                block.has('H') ? block.val('H') : 0.0, mode, hCode))
             {
-                after.toolLengthMode = 49;
-                after.hCode = 0;
+                afterValid = false;
             }
             else
             {
-                // Positive H still depends on the live table size.  The
-                // surrounding MODAL_SNAPSHOT fence marks the scalar image
-                // unproven before any later entry may consume it.
-                after.toolLengthMode = code;
+                // The scalar diagnostic is decoded safely; the surrounding
+                // fence still prevents prediction of a live H-table snapshot.
+                after.toolLengthMode = mode;
                 after.hCode = hCode;
             }
         }
@@ -1329,23 +1351,37 @@ NCPreparedModalSnapshot NCPreparedBlockQueueShadow::ReduceModalSnapshot(
         }
         else if (code == 68)
         {
-            after.g68Active = true;
-            if (block.has('R')) after.g68Angle = block.val('R');
+            // Diagnostic tags only. The complete captured descriptor above
+            // (including its rotation centre) stays unchanged and invalidated;
+            // a reducer never manufactures authority for a new G68 source.
+            if (block.has('X') && block.has('Y') && block.has('R') &&
+                std::isfinite(block.val('X')) && std::isfinite(block.val('Y')) &&
+                std::isfinite(block.val('R')) && std::abs(block.val('R')) <= 360.0)
+            {
+                after.g68Active = true;
+                after.g68Angle = block.val('R');
+            }
         }
         else if (code == 69)
         {
             after.g68Active = false;
             after.g68Angle = 0.0;
         }
-        else if (code == 168)
+        else if (code == 168 || code == 169)
         {
-            after.g168Active = true;
-            if (block.has('W')) after.workpieceCode = static_cast<int>(block.val('W'));
-        }
-        else if (code == 169)
-        {
-            after.g168Active = false;
-            after.workpieceCode = 0;
+            int mode = 169, wCode = 0;
+            if (!TryDecodeNCWorkSelection(code, block.has('W'),
+                block.has('W') ? block.val('W') : 0.0, mode, wCode))
+            {
+                afterValid = false;
+            }
+            else
+            {
+                // Safely decode only the diagnostic tag. The barrier above
+                // still refuses prediction of a live WORK table row.
+                after.g168Active = mode == 168;
+                after.workpieceCode = wCode;
+            }
         }
         else if (code == 51)
         {

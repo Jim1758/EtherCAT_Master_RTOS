@@ -4,6 +4,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <limits>
 #include "GlobalConfig.h"
 #include "EtherCatMaster.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
@@ -26,7 +27,785 @@ CoordinateManager::CoordinateManager()
 
 }
 
-bool CoordinateManager::SetWCS(int gCode, NCManager* nc)
+bool CoordinateManager::BeginTranslationRun(std::uint64_t runToken) noexcept
+{
+    if (runToken == 0ULL || m_translationRunToken != 0ULL ||
+        m_translationFrozen || m_translationGenerationCounter ==
+            (std::numeric_limits<std::uint64_t>::max)()) return false;
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationRunToken = runToken;
+    m_translationGeneration = ++m_translationGenerationCounter;
+    m_translationResetBypass = false;
+    return true;
+}
+
+bool CoordinateManager::IsToolOffsetRowValid(int hCode, bool xyzOnly) const noexcept
+{
+    if (hCode < 1 || hCode > 100 ||
+        static_cast<std::size_t>(hCode) > m_ToolOffset.size()) return false;
+    const std::vector<double>& row = m_ToolOffset[hCode - 1];
+    if (row.size() != 8U) return false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        if (!std::isfinite(row[axis]) ||
+            (xyzOnly && axis >= 3U && row[axis] != 0.0)) return false;
+    return true;
+}
+
+bool CoordinateManager::IsToolLengthSelectionSupported(int normalizedMode,
+    int normalizedH) const noexcept
+{
+    if (normalizedMode == 49) return normalizedH == 0;
+    return (normalizedMode == 43 || normalizedMode == 44) &&
+        IsToolOffsetRowValid(normalizedH, true);
+}
+
+bool CoordinateManager::IsWorkOffsetRowValid(int wCode, bool fixedPlanar) const noexcept
+{
+    if (wCode < 1 || wCode > 100 ||
+        static_cast<std::size_t>(wCode) > m_WorkOffset.size()) return false;
+    const std::vector<double>& row = m_WorkOffset[wCode - 1];
+    if (row.size() != 8U) return false;
+    for (unsigned field = 0U; field < 8U; ++field)
+        if (!std::isfinite(row[field]) ||
+            (fixedPlanar && ((field == 3U && std::fabs(row[field]) > 360.0) ||
+                (field >= 4U && row[field] != 0.0)))) return false;
+    return true;
+}
+
+bool CoordinateManager::IsWorkpieceSelectionSupported(int normalizedMode,
+    int normalizedW) const noexcept
+{
+    if (normalizedMode == 169) return normalizedW == 0;
+    return normalizedMode == 168 && IsWorkOffsetRowValid(normalizedW, true);
+}
+
+bool CoordinateManager::IsFixedPlanarRotationActive() const noexcept
+{
+    return isG68Active || (isWorkpieceRotationActive &&
+        IsWorkOffsetRowValid(currentWCode, true) && m_WorkOffset[currentWCode - 1][3] != 0.0);
+}
+
+bool CoordinateManager::IsScaleMirrorActive() const noexcept
+{
+    if (isScalingActive) return true;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        if (isMirrorActive[axis]) return true;
+    return false;
+}
+
+bool CoordinateManager::IsTranslationModeSupported() const noexcept
+{
+    if (activePlane != 17 ||
+        toolRadiusMode != 40 ||
+        isPolarCoordinateActive || currentWCSIndex < 0 ||
+        currentWCSIndex > 5 ||
+        static_cast<std::size_t>(currentWCSIndex) >= m_WCSTable.size()) return false;
+    if (isG68Active && (isCAxisOffsetRotationEnabled || !std::isfinite(g68Angle) ||
+        std::fabs(g68Angle) > 360.0 || !std::isfinite(g68CenterWCS[0]) ||
+        !std::isfinite(g68CenterWCS[1]) || g68CenterWCS[2] != 0.0 ||
+        std::signbit(g68CenterWCS[2]))) return false;
+    if (IsScaleMirrorActive() && isCAxisOffsetRotationEnabled) return false;
+    if (isScalingActive && (!std::isfinite(scaleFactor) || scaleFactor <= 0.0)) return false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if (axis >= 3U && (isMirrorActive[axis] ||
+            (isScalingActive && scalingCenterWCS[axis] != 0.0))) return false;
+        if (axis < 3U && ((isScalingActive && !std::isfinite(scalingCenterWCS[axis])) ||
+            (isMirrorActive[axis] && !std::isfinite(mirrorCenterWCS[axis])))) return false;
+    }
+    if (toolLengthMode == 49)
+    {
+        if (currentHCode != 0) return false;
+    }
+    else if ((toolLengthMode != 43 && toolLengthMode != 44) ||
+        isCAxisOffsetRotationEnabled || !IsToolOffsetRowValid(currentHCode, true))
+        return false;
+    if (isWorkpieceRotationActive)
+    {
+        if (isCAxisOffsetRotationEnabled || !IsWorkOffsetRowValid(currentWCode, true))
+            return false;
+        if (m_WorkOffset[currentWCode - 1][WO_ANGLE_XY_YAW] != 0.0 &&
+            (!m_workRotationCenterFixed ||
+             !std::isfinite(rotationCenterMCS[0]) || !std::isfinite(rotationCenterMCS[1]) ||
+             rotationCenterMCS[2] != 0.0 || std::signbit(rotationCenterMCS[2])))
+            return false;
+    }
+    else if (currentWCode != 0) return false;
+    // G162 remains dormant only without active H/WORK. Active fixed offsets
+    // require G163 so their source is independent of any C-axis position.
+    return m_WCSTable[currentWCSIndex].size() >= 8U;
+}
+
+NCTranslationSnapshot CoordinateManager::BuildCurrentCoordinateSnapshot() const noexcept
+{
+    NCTranslationSnapshot result{};
+    result.runToken = m_translationRunToken;
+    result.generation = m_translationGeneration;
+    result.revision = m_translationRevision;
+    result.wcsCode = currentWCSIndex + 54;
+    result.distanceMode = isAbsoluteMode ? 90 : 91;
+    result.unitsMode = isInchMode ? 20 : 21;
+    result.toolLengthMode = toolLengthMode;
+    result.toolHCode = currentHCode;
+    result.workMode = isWorkpieceRotationActive ? 168 : 169;
+    result.workWCode = currentWCode;
+    result.rotationMode = isG68Active ? 68 : 69;
+    result.rotationPlane = 17;
+    result.scalingMode = isScalingActive ? 51 : 50;
+    result.scalingFactor = isScalingActive ? scaleFactor : 1.0;
+    for (unsigned axis = 0U; axis < 3U; ++axis)
+    {
+        if (isScalingActive) result.scalingCenterMM[axis] = scalingCenterWCS[axis];
+        if (isMirrorActive[axis])
+        {
+            result.mirrorMask |= 1U << axis;
+            result.mirrorCenterMM[axis] = mirrorCenterWCS[axis];
+        }
+    }
+    if (isG68Active)
+    {
+        result.rotationCenterMM[0] = g68CenterWCS[0];
+        result.rotationCenterMM[1] = g68CenterWCS[1];
+        result.rotationAngleDeg = g68Angle;
+    }
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        result.extOffsetMM[axis] = extOffset[axis];
+        result.wcsOffsetMM[axis] = m_WCSTable[currentWCSIndex][axis];
+        if (toolLengthMode != 49)
+            result.toolOffsetMM[axis] = m_ToolOffset[currentHCode - 1][axis];
+        if (isWorkpieceRotationActive)
+            result.workOffset[axis] = m_WorkOffset[currentWCode - 1][axis];
+    }
+    if (isWorkpieceRotationActive && result.workOffset[WO_ANGLE_XY_YAW] != 0.0)
+    {
+        result.workRotationCenterMM[0] = rotationCenterMCS[0];
+        result.workRotationCenterMM[1] = rotationCenterMCS[1];
+    }
+    return result;
+}
+
+NCTranslationSnapshot CoordinateManager::BuildLiveTranslationSnapshot() const noexcept
+{
+    if (m_translationRunToken == 0ULL || !IsTranslationModeSupported()) return NCTranslationSnapshot{};
+    const NCTranslationSnapshot result = BuildCurrentCoordinateSnapshot();
+    return IsNCTranslationSnapshotValid(result) ? result : NCTranslationSnapshot{};
+}
+
+NCTranslationSnapshot CoordinateManager::GetTranslationSnapshot() const noexcept
+{
+    return m_translationFrozen ? m_frozenTranslation : BuildLiveTranslationSnapshot();
+}
+
+bool CoordinateManager::FreezeTranslationRun() noexcept
+{
+    if (m_translationFrozen) return IsTranslationRunCurrent();
+    const NCTranslationSnapshot candidate = BuildLiveTranslationSnapshot();
+    if (!IsNCTranslationSnapshotValid(candidate)) return false;
+    m_frozenTranslation = candidate;
+    m_translationFrozen = true;
+    return true;
+}
+
+bool CoordinateManager::PrepareDistanceModeTransition(int mode,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass ||
+        (mode != 90 && mode != 91) || mode == m_frozenTranslation.distanceMode ||
+        !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
+        m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.distanceMode = mode;
+    next.generation = m_translationGenerationCounter + 1ULL;
+    next.revision = m_translationRevision + 1ULL;
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitDistanceModeTransition(
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    NCTranslationSnapshot expected{};
+    if (!PrepareDistanceModeTransition(candidate.distanceMode, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    // Publication was accepted under the Motion lifecycle reservation first.
+    // No pulse/MCS resampling: the accepted native endpoint remains exact.
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    isAbsoluteMode = candidate.distanceMode == 90;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
+bool CoordinateManager::PrepareUnitModeTransition(int mode,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass ||
+        (mode != 20 && mode != 21) || mode == m_frozenTranslation.unitsMode ||
+        !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
+        m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.unitsMode = mode;
+    next.generation = m_translationGenerationCounter + 1ULL;
+    next.revision = m_translationRevision + 1ULL;
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitUnitModeTransition(
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    NCTranslationSnapshot expected{};
+    if (!PrepareUnitModeTransition(candidate.unitsMode, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    // Motion has already reserved/published the same source transaction.
+    // The unit is input/display metadata: no geometry/table/feed rescaling.
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    isInchMode = candidate.unitsMode == 20;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
+bool CoordinateManager::BuildScaleMirrorSelection(int code, const double* values,
+    const bool* hasAxis, double factor, const NCTranslationSnapshot& source,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!values || !hasAxis || (code != 50 && code != 51 && code != 150 && code != 151) ||
+        !std::isfinite(factor) || factor <= 0.0 || (code != 51 && factor != 1.0)) return false;
+    bool any = false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        any = any || hasAxis[axis];
+        if (hasAxis[axis] && (axis >= 3U || !std::isfinite(values[axis]))) return false;
+    }
+    if ((code == 50 && any) || (code == 151 && !any) ||
+        (code == 51 && (!hasAxis[0] || !hasAxis[1] || !hasAxis[2])) ||
+        ((code == 51 || code == 151) && isCAxisOffsetRotationEnabled)) return false;
+    NCTranslationSnapshot next = source;
+    if (code == 50 || code == 51)
+    {
+        next.scalingMode = code;
+        next.scalingFactor = code == 51 ? factor : 1.0;
+        for (unsigned axis = 0U; axis < 3U; ++axis)
+            next.scalingCenterMM[axis] = code == 51 ? values[axis] : 0.0;
+    }
+    else
+    {
+        for (unsigned axis = 0U; axis < 3U; ++axis)
+        {
+            if (code == 151 && hasAxis[axis])
+            {
+                next.mirrorMask |= 1U << axis;
+                next.mirrorCenterMM[axis] = values[axis];
+            }
+            else if (code == 150 && (!any || hasAxis[axis]))
+            {
+                next.mirrorMask &= ~(1U << axis);
+                next.mirrorCenterMM[axis] = 0.0;
+            }
+        }
+    }
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::PrepareScaleMirrorTransition(int code, const double* values,
+    const bool* hasAxis, double factor, NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass || !IsTranslationRunCurrent() ||
+        m_translationGeneration != m_translationGenerationCounter) return false;
+    NCTranslationSnapshot next{};
+    if (!BuildScaleMirrorSelection(code, values, hasAxis, factor, m_frozenTranslation, next)) return false;
+    if (!SameNCTranslationSnapshot(next, m_frozenTranslation))
+    {
+        if (m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+            m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+        next.generation = m_translationGenerationCounter + 1ULL;
+        next.revision = m_translationRevision + 1ULL;
+    }
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitScaleMirrorTransition(const NCTranslationSnapshot& candidate) noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass || !IsTranslationRunCurrent() ||
+        m_translationGeneration != m_translationGenerationCounter ||
+        !IsNCTranslationSnapshotValid(candidate)) return false;
+    if (SameNCTranslationSnapshot(candidate, m_frozenTranslation)) return true;
+    NCTranslationSnapshot normalized = candidate;
+    normalized.generation = m_frozenTranslation.generation;
+    normalized.revision = m_frozenTranslation.revision;
+    normalized.scalingMode = m_frozenTranslation.scalingMode;
+    normalized.scalingFactor = m_frozenTranslation.scalingFactor;
+    for (unsigned axis = 0U; axis < 3U; ++axis)
+        normalized.scalingCenterMM[axis] = m_frozenTranslation.scalingCenterMM[axis];
+    const bool scalingSelection = SameNCTranslationSnapshot(normalized, m_frozenTranslation);
+    double values[8] = {};
+    bool selected[8] = {};
+    int code = candidate.scalingMode;
+    double factor = candidate.scalingFactor;
+    if (scalingSelection)
+    {
+        for (unsigned axis = 0U; axis < 3U; ++axis)
+        {
+            selected[axis] = code == 51;
+            values[axis] = candidate.scalingCenterMM[axis];
+        }
+    }
+    else
+    {
+        factor = 1.0;
+        const unsigned removed = m_frozenTranslation.mirrorMask & ~candidate.mirrorMask;
+        code = removed != 0U ? 150 : 151;
+        for (unsigned axis = 0U; axis < 3U; ++axis)
+        {
+            selected[axis] = ((code == 150 ? removed : candidate.mirrorMask) & (1U << axis)) != 0U;
+            values[axis] = code == 151 ? candidate.mirrorCenterMM[axis] : 0.0;
+        }
+    }
+    NCTranslationSnapshot expected{};
+    if (!PrepareScaleMirrorTransition(code, values, selected, factor, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    isScalingActive = candidate.scalingMode == 51;
+    scaleFactor = candidate.scalingFactor;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        scalingCenterWCS[axis] = axis < 3U ? candidate.scalingCenterMM[axis] : 0.0;
+        isMirrorActive[axis] = axis < 3U && (candidate.mirrorMask & (1U << axis)) != 0U;
+        mirrorCenterWCS[axis] = axis < 3U ? candidate.mirrorCenterMM[axis] : 0.0;
+    }
+    m_frozenTranslation = candidate;
+    return true;
+}
+
+bool CoordinateManager::PrepareWorkCoordinateTransition(int wcsCode,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass ||
+        wcsCode < 54 || wcsCode > 59 || wcsCode == m_frozenTranslation.wcsCode ||
+        !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
+        m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    const std::size_t rowIndex = static_cast<std::size_t>(wcsCode - 54);
+    if (rowIndex >= m_WCSTable.size() || m_WCSTable[rowIndex].size() != 8U) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.wcsCode = wcsCode;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        next.wcsOffsetMM[axis] = m_WCSTable[rowIndex][axis];
+    next.generation = m_translationGenerationCounter + 1ULL;
+    next.revision = m_translationRevision + 1ULL;
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitWorkCoordinateTransition(
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    NCTranslationSnapshot expected{};
+    if (!PrepareWorkCoordinateTransition(candidate.wcsCode, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    // The Motion publication is accepted first under its lifecycle reservation.
+    // G68 keeps its WCS centre; G168 keeps its separately fixed MCS centre.
+    // Selection changes neither the accepted native endpoint nor any table row.
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    currentWCSIndex = candidate.wcsCode - 54;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
+bool CoordinateManager::PrepareToolLengthTransition(int normalizedMode,
+    int normalizedH, NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass ||
+        !IsToolLengthSelectionSupported(normalizedMode, normalizedH) ||
+        (normalizedMode != 49 && isCAxisOffsetRotationEnabled) ||
+        (normalizedMode == m_frozenTranslation.toolLengthMode &&
+            normalizedH == m_frozenTranslation.toolHCode) ||
+        !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
+        m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.toolLengthMode = normalizedMode;
+    next.toolHCode = normalizedH;
+    // Cancellation has one canonical all-zero row, independent of old H bits.
+    // An active selection copies the validated raw row; G43/G44 owns its sign.
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        next.toolOffsetMM[axis] = normalizedMode == 49 ? 0.0 :
+            m_ToolOffset[normalizedH - 1][axis];
+    next.generation = m_translationGenerationCounter + 1ULL;
+    next.revision = m_translationRevision + 1ULL;
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitToolLengthTransition(
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    NCTranslationSnapshot expected{};
+    if (!PrepareToolLengthTransition(candidate.toolLengthMode, candidate.toolHCode, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    // Motion accepted publication under the drained lifecycle reservation first.
+    // Revalidate the old source and selected H row before the NC descriptor commit.
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    toolLengthMode = candidate.toolLengthMode;
+    currentHCode = candidate.toolHCode;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
+bool CoordinateManager::PreparePlanarRotationTransition(int mode, double centerX,
+    double centerY, double angle, NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass ||
+        (mode != 68 && mode != 69) || !std::isfinite(centerX) ||
+        !std::isfinite(centerY) || !std::isfinite(angle) || std::fabs(angle) > 360.0 ||
+        (mode == 68 && (!isAbsoluteMode || isCAxisOffsetRotationEnabled)) ||
+        (mode == 69 && (centerX != 0.0 || centerY != 0.0 || angle != 0.0 ||
+            std::signbit(centerX) || std::signbit(centerY) || std::signbit(angle))) ||
+        !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
+        m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.rotationMode = mode;
+    next.rotationCenterMM[0] = mode == 68 ? centerX : 0.0;
+    next.rotationCenterMM[1] = mode == 68 ? centerY : 0.0;
+    next.rotationAngleDeg = mode == 68 ? angle : 0.0;
+    // Identical bits are idempotent setup, not a descriptor transition.
+    if (SameNCTranslationSnapshot(next, m_frozenTranslation)) return false;
+    next.generation = m_translationGenerationCounter + 1ULL;
+    next.revision = m_translationRevision + 1ULL;
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitPlanarRotationTransition(
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    NCTranslationSnapshot expected{};
+    if (!PreparePlanarRotationTransition(candidate.rotationMode,
+        candidate.rotationCenterMM[0], candidate.rotationCenterMM[1],
+        candidate.rotationAngleDeg, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    // Motion accepted the drained descriptor first. Revalidate all old sources
+    // before selecting the new frame; never resample or transform native MCS.
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    isG68Active = candidate.rotationMode == 68;
+    g68CenterWCS[0] = candidate.rotationCenterMM[0];
+    g68CenterWCS[1] = candidate.rotationCenterMM[1];
+    g68CenterWCS[2] = 0.0;
+    g68Angle = candidate.rotationAngleDeg;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
+bool CoordinateManager::PrepareWorkpieceTransition(int mode, int wCode,
+    bool hasCenter, double centerX, double centerY,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass ||
+        !IsWorkpieceSelectionSupported(mode, wCode) ||
+        !std::isfinite(centerX) || !std::isfinite(centerY) ||
+        (!hasCenter && (centerX != 0.0 || centerY != 0.0 ||
+            std::signbit(centerX) || std::signbit(centerY))) ||
+        (mode == 169 && hasCenter) ||
+        (mode == 168 && isCAxisOffsetRotationEnabled) ||
+        !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
+        m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.workMode = mode;
+    next.workWCode = wCode;
+    for (unsigned field = 0U; field < 8U; ++field)
+        next.workOffset[field] = mode == 168 ? m_WorkOffset[wCode - 1][field] : 0.0;
+    next.workRotationCenterMM[0] = 0.0;
+    next.workRotationCenterMM[1] = 0.0;
+    if (mode == 168 && next.workOffset[WO_ANGLE_XY_YAW] != 0.0)
+    {
+        if (hasCenter)
+        {
+            if (!isAbsoluteMode) return false;
+            // The input point uses the entire OLD frozen G68/H/WCS/WORK frame.
+            // Do not use Actual, update native tail, or reinterpret after commit.
+            const double input[8] = { centerX, centerY };
+            double native[8] = {};
+            NCTranslationForwardPoint(m_frozenTranslation, input, native);
+            if (!std::isfinite(native[0]) || !std::isfinite(native[1])) return false;
+            next.workRotationCenterMM[0] = native[0];
+            next.workRotationCenterMM[1] = native[1];
+        }
+        else
+        {
+            if (m_frozenTranslation.workMode != 168 ||
+                m_frozenTranslation.workWCode != wCode || !m_workRotationCenterFixed)
+                return false;
+            next.workRotationCenterMM[0] = m_frozenTranslation.workRotationCenterMM[0];
+            next.workRotationCenterMM[1] = m_frozenTranslation.workRotationCenterMM[1];
+        }
+    }
+    else if (hasCenter) return false;
+
+    if (!SameNCTranslationSnapshot(next, m_frozenTranslation))
+    {
+        next.generation = m_translationGenerationCounter + 1ULL;
+        next.revision = m_translationRevision + 1ULL;
+    }
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitWorkpieceTransition(int mode, int wCode,
+    bool hasCenter, double centerX, double centerY,
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    NCTranslationSnapshot expected{};
+    if (!PrepareWorkpieceTransition(mode, wCode, hasCenter, centerX, centerY, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    // Revalidate the original words against the old source and current target row.
+    // Only the selected descriptor changes; native positions and tables do not.
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    isWorkpieceRotationActive = candidate.workMode == 168;
+    currentWCode = candidate.workWCode;
+    m_workRotationCenterFixed = isWorkpieceRotationActive &&
+        candidate.workOffset[WO_ANGLE_XY_YAW] != 0.0;
+    rotationCenterMCS[0] = candidate.workRotationCenterMM[0];
+    rotationCenterMCS[1] = candidate.workRotationCenterMM[1];
+    rotationCenterMCS[2] = 0.0;
+    m_frozenTranslation = candidate;
+    if (hasCenter)
+    {
+        m_workCenterConfirmation.armed = true;
+        m_workCenterConfirmation.runToken = candidate.runToken;
+        m_workCenterConfirmation.generation = candidate.generation;
+        m_workCenterConfirmation.revision = candidate.revision;
+        m_workCenterConfirmation.wCode = wCode;
+        m_workCenterConfirmation.inputXY[0] = centerX;
+        m_workCenterConfirmation.inputXY[1] = centerY;
+    }
+    return true;
+}
+
+bool CoordinateManager::IsTranslationRunCurrent() const noexcept
+{
+    if (!m_translationFrozen) return IsNCTranslationSnapshotValid(BuildLiveTranslationSnapshot());
+    const NCTranslationSnapshot live = BuildLiveTranslationSnapshot();
+    return IsNCTranslationSnapshotValid(live) &&
+        SameNCTranslationSnapshot(live, m_frozenTranslation);
+}
+
+bool CoordinateManager::IsTranslationRunFrozen() const noexcept
+{
+    return m_translationFrozen;
+}
+
+bool CoordinateManager::IsTranslationRunBound() const noexcept
+{
+    return m_translationRunToken != 0ULL;
+}
+
+void CoordinateManager::RetireTranslationRun() noexcept
+{
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationFrozen = false;
+    m_translationRunToken = 0ULL;
+    m_translationGeneration = 0ULL;
+    m_translationResetBypass = false;
+    m_frozenTranslation = NCTranslationSnapshot{};
+}
+
+void CoordinateManager::BeginTranslationReset() noexcept
+{
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    // Only NC lifecycle cleanup may enter this scope. It never releases the
+    // frozen source, which remains the display basis until full retirement.
+    m_translationResetBypass = true;
+}
+
+void CoordinateManager::EndTranslationReset() noexcept
+{
+    m_translationResetBypass = false;
+}
+
+bool CoordinateManager::RejectCoordinateMutation(const char* operation,
+    const char* reason, NCManager* nc, bool reportAlarm) const
+{
+    RtPrintf("[COORD][REJECT] run=%llu generation=%llu revision=%llu op=%s reason=%s\n",
+        static_cast<unsigned long long>(m_translationRunToken),
+        static_cast<unsigned long long>(m_translationGeneration),
+        static_cast<unsigned long long>(m_translationRevision), operation, reason);
+    if (reportAlarm && nc != nullptr)
+    {
+        AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+        nc->ChangeState(NCState::HOLD);
+    }
+    return false;
+}
+
+bool CoordinateManager::GuardCoordinateMutation(const char* operation,
+    NCManager* nc, bool reportAlarm)
+{
+    if (m_translationFrozen && !m_translationResetBypass)
+        return RejectCoordinateMutation(operation, "RUN_FROZEN", nc, reportAlarm);
+    if (m_translationRevision == (std::numeric_limits<std::uint64_t>::max)())
+        return RejectCoordinateMutation(operation, "REVISION_EXHAUSTED", nc, reportAlarm);
+    ++m_translationRevision;
+    return true;
+}
+
+bool CoordinateManager::ApplyCoordinateTableValues(int offsetType, int row,
+    const bool* hasField, const double* values, NCManager* nc, bool reportAlarm)
+{
+    if (hasField == nullptr || values == nullptr || offsetType < 0 || offsetType > 3 ||
+        (offsetType == 1 && (row < 0 || static_cast<std::size_t>(row) >= m_WCSTable.size())) ||
+        (offsetType == 2 && (row < 0 || static_cast<std::size_t>(row) >= m_ToolOffset.size())) ||
+        (offsetType == 3 && (row < 0 || static_cast<std::size_t>(row) >= m_WorkOffset.size())))
+        return RejectCoordinateMutation("TABLE_WRITE", "INDEX", nc, reportAlarm);
+    bool anyField = false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if (!hasField[axis]) continue;
+        anyField = true;
+        if (!std::isfinite(values[axis]))
+            return RejectCoordinateMutation("TABLE_WRITE", "NONFINITE", nc, reportAlarm);
+        if ((offsetType == 1 && m_WCSTable[row].size() <= axis) ||
+            (offsetType == 2 && m_ToolOffset[row].size() <= axis) ||
+            (offsetType == 3 && m_WorkOffset[row].size() <= axis))
+            return RejectCoordinateMutation("TABLE_WRITE", "ROW_SHAPE", nc, reportAlarm);
+    }
+    if (!anyField) return true;
+    if (!GuardCoordinateMutation("TABLE_WRITE", nc, reportAlarm)) return false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if (!hasField[axis]) continue;
+        if (offsetType == 0) extOffset[axis] = values[axis];
+        else if (offsetType == 1) m_WCSTable[row][axis] = values[axis];
+        else if (offsetType == 2) m_ToolOffset[row][axis] = values[axis];
+        else m_WorkOffset[row][axis] = values[axis];
+    }
+    return true;
+}
+
+bool CoordinateManager::TryDecodeWorkTableWrite(const NCBlock& block,
+    int& rowIndex, bool* fields, double* values) const noexcept
+{
+    if (!fields || !values || !block.has('P') || block.gCount != 1 ||
+        block.gCodes[0] != 160 || block.mCount != 0) return false;
+    const double requested = block.val('P');
+    if (!std::isfinite(requested) || requested < 1.0 || requested > 100.0 ||
+        std::floor(requested) != requested ||
+        requested > static_cast<double>(m_WorkOffset.size())) return false;
+    const int candidateRow = static_cast<int>(requested) - 1;
+    if (m_WorkOffset[candidateRow].size() != 8U) return false;
+    // WORK is XYZ millimetres / yaw,pitch,roll degrees / reserved,reserved.
+    // In particular a configured C/I/J/K axis never aliases these fields.
+    const char fieldNames[6] = { 'X', 'Y', 'Z', 'I', 'J', 'K' };
+    for (char letter = 'A'; letter <= 'Z'; ++letter)
+    {
+        if (!block.has(letter)) continue;
+        bool allowed = letter == 'G' || letter == 'N' || letter == 'P';
+        for (unsigned field = 0U; field < 6U; ++field)
+            if (letter == fieldNames[field]) allowed = true;
+        if (!allowed || !std::isfinite(block.val(letter))) return false;
+    }
+    bool candidateFields[8] = {};
+    double candidateValues[8] = {};
+    for (unsigned field = 0U; field < 8U; ++field)
+    {
+        const bool selected = field < 6U && block.has(fieldNames[field]);
+        // XYZ are programmed lengths; IJK are fixed WORK angles in degrees.
+        // Existing unselected native table fields must not be converted again.
+        const double value = selected ? ToInternalUnit(block.val(fieldNames[field]), field >= 3U) :
+            m_WorkOffset[candidateRow][field];
+        if (!std::isfinite(value)) return false;
+        candidateFields[field] = selected;
+        candidateValues[field] = selected ? value : 0.0;
+    }
+    for (unsigned field = 0U; field < 8U; ++field)
+    {
+        fields[field] = candidateFields[field];
+        values[field] = candidateValues[field];
+    }
+    rowIndex = candidateRow;
+    return true;
+}
+
+bool CoordinateManager::ApplyCoordinateOrigin(int axis, double desiredWCS,
+    NCManager* nc, bool reportAlarm)
+{
+    if (IsFixedPlanarRotationActive() || IsScaleMirrorActive())
+        return RejectCoordinateMutation("ORIGIN_WRITE", "ROTATION_ACTIVE", nc, reportAlarm);
+    if (axis < 0 || axis >= 8 || currentWCSIndex < 0 ||
+        static_cast<std::size_t>(currentWCSIndex) >= m_WCSTable.size() ||
+        !std::isfinite(desiredWCS) || !std::isfinite(actualMCS[axis]) ||
+        !std::isfinite(extOffset[axis]))
+        return RejectCoordinateMutation("ORIGIN_WRITE", "INPUT", nc, reportAlarm);
+    bool fields[8] = {};
+    double values[8] = {};
+    fields[axis] = true;
+    double toolOffset = 0.0;
+    double workOffset = 0.0;
+    const bool hasFixedOffset = toolLengthMode != 49 || currentHCode != 0 ||
+        isWorkpieceRotationActive || currentWCode != 0;
+    if (hasFixedOffset)
+    {
+        // Origin edits must invert the same fixed source as motion/display.
+        // Reject unsupported transforms before changing any table value.
+        if (axis >= 3 || !IsTranslationModeSupported())
+            return RejectCoordinateMutation("ORIGIN_WRITE", "UNSUPPORTED_TRANSFORM", nc, reportAlarm);
+        if (toolLengthMode != 49)
+        {
+            const double raw = m_ToolOffset[currentHCode - 1][axis];
+            toolOffset = toolLengthMode == 43 ? raw : -raw;
+        }
+        if (isWorkpieceRotationActive)
+            workOffset = m_WorkOffset[currentWCode - 1][axis];
+    }
+    values[axis] = hasFixedOffset ?
+        actualMCS[axis] - extOffset[axis] - toolOffset - workOffset - desiredWCS :
+        actualMCS[axis] - extOffset[axis] - desiredWCS;
+    return ApplyCoordinateTableValues(1, currentWCSIndex, fields, values, nc, reportAlarm);
+}
+
+bool CoordinateManager::SetCAxisOffsetRotationEnabled(bool enabled, NCManager* nc)
+{
+    if (isCAxisOffsetRotationEnabled == enabled) return true;
+    if (!GuardCoordinateMutation("G162_G163", nc)) return false;
+    isCAxisOffsetRotationEnabled = enabled;
+    return true;
+}
+
+bool CoordinateManager::SetWCS(int gCode, NCManager* nc, bool reportAlarm)
 {
     int calculatedIndex = -1;
 
@@ -45,6 +824,8 @@ bool CoordinateManager::SetWCS(int gCode, NCManager* nc)
 
     // 如果計算成功
     if (calculatedIndex != -1 && nc != nullptr) {
+        if (calculatedIndex != currentWCSIndex &&
+            !GuardCoordinateMutation("WCS_SELECT", nc, reportAlarm)) return false;
         currentWCSIndex = calculatedIndex;
 
         // 🌟 使用你原本的呼叫方式，直接設定 #14
@@ -53,7 +834,7 @@ bool CoordinateManager::SetWCS(int gCode, NCManager* nc)
         return true;
     }
 
-    return false;
+    return RejectCoordinateMutation("WCS_SELECT", "INDEX", nc, reportAlarm);
 }
 
 void CoordinateManager::SyncMachinePosition(const double* actualMCS) {
@@ -75,6 +856,24 @@ void CoordinateManager::Transform_WCS_to_MCS(
         true);
 }
 
+bool CoordinateManager::CompleteFixedPlanarEndpoint(
+    double* targetWCS, bool* hasAxis) noexcept
+{
+    if (!targetWCS || !hasAxis) return false;
+    if (!m_translationFrozen) return true;
+    if (m_frozenTranslation.distanceMode == 91)
+    {
+        if (!IsTranslationRunCurrent()) return false;
+        return TryCompleteNCTranslationIncrementalEndpoint(m_frozenTranslation,
+            commandedMCS, targetWCS, hasAxis);
+    }
+    if (hasAxis[0] == hasAxis[1] ||
+        !NCTranslationHasPlanarRotation(m_frozenTranslation)) return true;
+    if (!IsTranslationRunCurrent()) return false;
+    return TryCompleteNCTranslationPlanarEndpoint(m_frozenTranslation,
+        commandedMCS, targetWCS, hasAxis);
+}
+
 void CoordinateManager::Preview_WCS_to_MCS(
     const double* targetWCS,
     const bool* hasAxis,
@@ -93,6 +892,55 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
     double* outputMCS,
     bool commitCommandedMCS)
 {
+    if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive()) && IsTranslationModeSupported()))
+    {
+        const NCTranslationSnapshot source = m_translationFrozen ?
+            m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        if (source.distanceMode == 91)
+        {
+            double candidate[8] = {};
+            NCTranslationSnapshot vectorSource = source;
+            if (!m_translationFrozen)
+            {
+                vectorSource.runToken = 1ULL;
+                vectorSource.generation = 1ULL;
+                vectorSource.revision = 1ULL;
+            }
+            if ((m_translationFrozen && !IsTranslationRunCurrent()) ||
+                !TryNCTranslationIncrementalTarget(vectorSource, commandedMCS,
+                    targetWCS, hasAxis, candidate))
+            {
+                for (unsigned axis = 0U; axis < 8U; ++axis)
+                    outputMCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+                return;
+            }
+            for (unsigned axis = 0U; axis < 8U; ++axis)
+                outputMCS[axis] = candidate[axis];
+            if (commitCommandedMCS)
+                for (unsigned axis = 0U; axis < 8U; ++axis)
+                    if (hasAxis[axis]) commandedMCS[axis] = candidate[axis];
+            return;
+        }
+        // Audited producers complete sparse planar endpoints before Preview.
+        // Keep this guard for callers that have not proved their native baseline.
+        if (NCTranslationHasPlanarRotation(source) && hasAxis[0] != hasAxis[1])
+        {
+            for (unsigned axis = 0U; axis < 8U; ++axis)
+                outputMCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+            return;
+        }
+        double selectedWCS[8] = {};
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            if (hasAxis[axis]) selectedWCS[axis] = targetWCS[axis];
+        double transformed[8] = {};
+        NCTranslationForwardPoint(source, selectedWCS, transformed);
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+        {
+            outputMCS[axis] = hasAxis[axis] ? transformed[axis] : commandedMCS[axis];
+            if (commitCommandedMCS && hasAxis[axis]) commandedMCS[axis] = outputMCS[axis];
+        }
+        return;
+    }
 
     // 🌟 先複製一份 targetWCS，方便我們做旋轉加工
     double finalTargetWCS[8];
@@ -237,6 +1085,7 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
 // 🌟 總管函式 (就是這裡遺失導致 LNK2019)
 // ==========================================
 void CoordinateManager::LoadAllParameters() {
+    if (!GuardCoordinateMutation("LOAD_TABLES", nullptr, false)) return;
     // 🌟 1. 檔名改為 WCS_STATUS.ini
     std::ifstream inStatus(GlobalConfig::GetInstance().NCDataDir + "WCS_STATUS.ini");
     if (inStatus.is_open()) {
@@ -374,6 +1223,13 @@ void CoordinateManager::UpdateActualMCS(const double* newMCS) {
 
 // 🌟 1. 核心公式：算回最簡單的 絕對座標 = 機械座標 - EXT - 表格偏移
 void CoordinateManager::GetActualWCS(double* outWCS) const {
+    if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive()) && IsTranslationModeSupported()))
+    {
+        const NCTranslationSnapshot source = m_translationFrozen ?
+            m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        NCTranslationInversePoint(source, actualMCS, outWCS);
+        return;
+    }
     // 1. 複製一份真實的物理機械座標
     double tempMCS[8];
     for (int i = 0; i < 8; i++) tempMCS[i] = actualMCS[i];
@@ -382,7 +1238,10 @@ void CoordinateManager::GetActualWCS(double* outWCS) const {
     // 🌟 2. 逆矩陣運算：把「歪掉的實體座標」轉回「方正的邏輯座標」
     // 在旋轉矩陣中，反矩陣 (Inverse) 剛好等於轉置矩陣 (Transpose)！
     // ==========================================================
-    if (isWorkpieceRotationActive && currentWCode > 0 && currentWCode <= m_WorkOffset.size())
+    if (isWorkpieceRotationActive && IsWorkOffsetRowValid(currentWCode, false) &&
+        (m_WorkOffset[currentWCode - 1][WO_ANGLE_XY_YAW] != 0.0 ||
+         m_WorkOffset[currentWCode - 1][WO_ANGLE_XZ_PITCH] != 0.0 ||
+         m_WorkOffset[currentWCode - 1][WO_ANGLE_YZ_ROLL] != 0.0))
     {
         int idx = currentWCode - 1;
 
@@ -467,6 +1326,13 @@ void CoordinateManager::GetActualWCS(double* outWCS) const {
 
 // 🌟 1.5 核心公式：算回最簡單的 絕對座標 = 虛擬命令機械座標 - EXT - 表格偏移
 void CoordinateManager::GetCommandedWCS(double* outWCS) const {
+    if (m_translationFrozen || ((IsFixedPlanarRotationActive() || IsScaleMirrorActive()) && IsTranslationModeSupported()))
+    {
+        const NCTranslationSnapshot source = m_translationFrozen ?
+            m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        NCTranslationInversePoint(source, commandedMCS, outWCS);
+        return;
+    }
     // 1. 複製一份大腦的理論命令機械座標 (Commanded MCS)
     double tempMCS[8];
     for (int i = 0; i < 8; i++) tempMCS[i] = commandedMCS[i]; // 🌟 唯一差別：吃 commandedMCS
@@ -475,7 +1341,10 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
     // 🌟 2. 逆矩陣運算：把「歪掉的實體座標」轉回「方正的邏輯座標」
     // 在旋轉矩陣中，反矩陣 (Inverse) 剛好等於轉置矩陣 (Transpose)！
     // ==========================================================
-    if (isWorkpieceRotationActive && currentWCode > 0 && currentWCode <= m_WorkOffset.size())
+    if (isWorkpieceRotationActive && IsWorkOffsetRowValid(currentWCode, false) &&
+        (m_WorkOffset[currentWCode - 1][WO_ANGLE_XY_YAW] != 0.0 ||
+         m_WorkOffset[currentWCode - 1][WO_ANGLE_XZ_PITCH] != 0.0 ||
+         m_WorkOffset[currentWCode - 1][WO_ANGLE_YZ_ROLL] != 0.0))
     {
         int idx = currentWCode - 1;
 
@@ -560,12 +1429,46 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
 }
 // 🌟 2. 實作 ApplyG92 (直接覆寫當前表格！)
 void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targetPos, NCManager* nc) {
+    if (IsFixedPlanarRotationActive() || IsScaleMirrorActive())
+    {
+        RejectCoordinateMutation("G92", "ROTATION_ACTIVE", nc, true);
+        return;
+    }
+    if (axisProgrammed == nullptr || targetPos == nullptr ||
+        currentWCSIndex < 0 || static_cast<std::size_t>(currentWCSIndex) >= m_WCSTable.size() ||
+        m_WCSTable[currentWCSIndex].size() < 8U)
+    {
+        RejectCoordinateMutation("G92", "INPUT", nc, true);
+        return;
+    }
+    if (m_translationFrozen && !m_translationResetBypass)
+    {
+        GuardCoordinateMutation("G92", nc);
+        return;
+    }
 
     // 1. 取得「當下」包含所有補正(刀長、旋轉等)的純粹命令工作座標
     double currentCmdWCS[8] = { 0.0 };
 
     // 🌟 呼叫剛剛寫好的神級函式！不吃實際位置！
     GetCommandedWCS(currentCmdWCS);
+    double proposedWCS[8] = {};
+    for (int i = 0; i < 8; ++i)
+    {
+        if (!axisProgrammed[i]) continue;
+        if (m_WCSTable[currentWCSIndex].size() <= static_cast<std::size_t>(i))
+        {
+            RejectCoordinateMutation("G92", "ROW_SHAPE", nc, true);
+            return;
+        }
+        proposedWCS[i] = m_WCSTable[currentWCSIndex][i] + (currentCmdWCS[i] - targetPos[i]);
+        if (!std::isfinite(targetPos[i]) || !std::isfinite(proposedWCS[i]))
+        {
+            RejectCoordinateMutation("G92", "NONFINITE", nc, true);
+            return;
+        }
+    }
+    if (!GuardCoordinateMutation("G92", nc)) return;
 
     for (int i = 0; i < 8; i++) {
         if (axisProgrammed[i]) {
@@ -594,12 +1497,14 @@ void  CoordinateManager::Set_G90G91(int value, NCManager* nc)//設定90絕對模
 {
     if (value == 90)
     {
+        if (!isAbsoluteMode && !GuardCoordinateMutation("G90", nc)) return;
         isAbsoluteMode = true;
         nc->MacroSys.SetVar('$', 3, 90);
 
     }
     if (value == 91)
     {
+        if (isAbsoluteMode && !GuardCoordinateMutation("G91", nc)) return;
         isAbsoluteMode = false;
         nc->MacroSys.SetVar('$', 3, 91);
     }
@@ -610,28 +1515,42 @@ void  CoordinateManager::Set_G90G91(int value, NCManager* nc)//設定90絕對模
 // ==========================================
 void CoordinateManager::SetToolLengthCompensation(int gCode, int hCode, NCManager* nc)
 {
-    // 處理 G49 或 H0 (取消補正)
-    if (gCode == 49 || hCode == 0) {
+    if ((gCode != 43 && gCode != 44 && gCode != 49) ||
+        (gCode == 49 && hCode != 0))
+    {
+        RejectCoordinateMutation("TOOL_LENGTH", "MODE", nc, true);
+        return;
+    }
+    // G49 and H0 share one canonical cancelled descriptor.
+    if (gCode == 49 || hCode == 0)
+    {
         CancelToolLengthCompensation(nc);
         return;
     }
-
-    if (gCode == 43 || gCode == 44) {
-        // 🌟 防呆範圍修改：允許 hCode 介於 1 到 size 之間 (例如 1~100)
-        if (hCode > 0 && hCode <= m_ToolOffset.size()) {
-            toolLengthMode = gCode;
-            currentHCode = hCode;
-
-            if (nc) nc->MacroSys.SetVar('$', 8, (double)gCode);
-        }
-        else {
-            // (選配) 可以呼叫你的警報系統：H 碼超出範圍！
-        }
+    if (hCode < 1 || hCode > 100 ||
+        static_cast<std::size_t>(hCode) > m_ToolOffset.size())
+    {
+        RejectCoordinateMutation("TOOL_LENGTH", "H_INDEX", nc, true);
+        return;
     }
+    // Preserve legacy multi-axis transforms outside the bounded NC run, but
+    // never permit malformed/nonfinite table rows to become active.
+    if (!IsToolOffsetRowValid(hCode, m_translationRunToken != 0ULL))
+    {
+        RejectCoordinateMutation("TOOL_LENGTH", "H_ROW", nc, true);
+        return;
+    }
+    if ((toolLengthMode != gCode || currentHCode != hCode) &&
+        !GuardCoordinateMutation("TOOL_LENGTH", nc)) return;
+    toolLengthMode = gCode;
+    currentHCode = hCode;
+    if (nc) nc->MacroSys.SetVar('$', 8, static_cast<double>(gCode));
 }
 
 void CoordinateManager::CancelToolLengthCompensation(NCManager* nc)
 {
+    if ((toolLengthMode != 49 || currentHCode != 0) &&
+        !GuardCoordinateMutation("G49", nc)) return;
     toolLengthMode = 49; // 強制切換為 G49
     currentHCode = 0;
 
@@ -649,6 +1568,10 @@ double CoordinateManager::GetActiveToolOffset(int axisIndex, double cAngleMCS) c
         return 0.0;
     }
 
+    if (axisIndex < 0 || axisIndex >= 8 ||
+        (toolLengthMode != 43 && toolLengthMode != 44) ||
+        !IsToolOffsetRowValid(currentHCode, false))
+        return (std::numeric_limits<double>::quiet_NaN)();
     int arrayIndex = currentHCode - 1;
 
     // 取出原始表格中的補正數值
@@ -683,51 +1606,142 @@ double CoordinateManager::GetActiveToolOffset(int axisIndex, double cAngleMCS) c
 // ==========================================================
 void CoordinateManager::SetWorkpieceRotation(int wCode, const bool* hasAxis, const double* targetWCS, NCManager* nc)
 {
-    // 1. 防呆：確保 W 碼在陣列範圍內 (W1 對應 size 100 內)
-    if (wCode < 1 || wCode > m_WorkOffset.size()) {
-        RtPrintf(">>> [ALARM] G168 W%d is out of range!\n", wCode);
-        return; // 範圍錯誤，不執行
-    }
-
-    currentWCode = wCode;
-    int arrayIndex = wCode - 1; // 🌟 陣列從 0 開始，所以 W1 對應 [0]
-
-    // 2. 決定旋轉圓心 (必須轉成絕對機械座標 MCS 讓底層使用)
-    double convertedMCS[8] = { 0.0 };
-
-    // 如果有下達 XYZ，先將指令的工作座標(WCS)轉成實體機械座標(MCS)
-    Transform_WCS_to_MCS(targetWCS, hasAxis, convertedMCS);
-
-    for (int i = 0; i < 3; i++)
+    // Every handler attempt consumes the receipt, including mismatches/rejections.
+    const WorkCenterConfirmation confirmation = m_workCenterConfirmation;
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    const bool fixedRun = IsTranslationRunBound();
+    if (!hasAxis || !targetWCS || !IsWorkOffsetRowValid(wCode, fixedRun))
     {
-        if (hasAxis[i]) {
-            // 有下 XYZ 指令 -> 使用轉換後的指令座標當圓心
-            rotationCenterMCS[i] = convertedMCS[i];
-        }
-        else {
-            // 沒下 XYZ 指令 -> 抓取機台「當下真實的機械座標」當圓心
-            rotationCenterMCS[i] = actualMCS[i];
+        RejectCoordinateMutation("G168", "W_SELECTION", nc, true);
+        return;
+    }
+    bool hasAnyCenter = false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        hasAnyCenter = hasAnyCenter || hasAxis[axis];
+        if (hasAxis[axis] && (axis >= 3U || !std::isfinite(targetWCS[axis])))
+        {
+            RejectCoordinateMutation("G168", "CENTER_UNSUPPORTED", nc, true);
+            return;
         }
     }
+    if (fixedRun)
+    {
+        // The descriptor owns all fixed geometry. Never also enable the legacy
+        // Motion matrix, and never sample Actual to choose a fixed centre.
+        const bool hasYaw = m_WorkOffset[wCode - 1][WO_ANGLE_XY_YAW] != 0.0;
+        if (confirmation.armed)
+        {
+            bool exactXY = hasAxis[0] && hasAxis[1];
+            for (unsigned axis = 2U; axis < 8U; ++axis)
+                exactXY = exactXY && !hasAxis[axis];
+            if (!m_translationFrozen || m_translationResetBypass || !exactXY ||
+                !hasYaw || !isAbsoluteMode || !isWorkpieceRotationActive ||
+                currentWCode != wCode || !m_workRotationCenterFixed ||
+                confirmation.runToken != m_translationRunToken ||
+                confirmation.generation != m_translationGeneration ||
+                m_translationGeneration != m_translationGenerationCounter ||
+                confirmation.revision != m_translationRevision ||
+                confirmation.wCode != wCode ||
+                std::memcmp(confirmation.inputXY, targetWCS, sizeof confirmation.inputXY) != 0 ||
+                !IsTranslationRunCurrent())
+            {
+                RejectCoordinateMutation("G168", "CENTER_CONFIRMATION", nc, true);
+                return;
+            }
+            // The frozen descriptor already owns the transform. Confirmation
+            // changes neither Motion matrix state nor native geometry.
+            return;
+        }
+        if (isWorkpieceRotationActive && currentWCode == wCode && !hasAnyCenter)
+        {
+            if (hasYaw && !m_workRotationCenterFixed)
+            {
+                RejectCoordinateMutation("G168", "FIXED_XY_CENTER_REQUIRED", nc, true);
+                return;
+            }
+            if (!hasYaw) m_workRotationCenterFixed = false;
+            if (m_translationFrozen)
+            {
+                if (!IsTranslationRunCurrent())
+                    RejectCoordinateMutation("G168", "SOURCE_CHANGED", nc, true);
+            }
+            else if (nc)
+                nc->GetMotion().SetCoordinateTransform(false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            return;
+        }
+        if (m_translationFrozen && !m_translationResetBypass)
+        {
+            GuardCoordinateMutation("G168", nc);
+            return;
+        }
+        if ((hasYaw && (!hasAxis[0] || !hasAxis[1] || hasAxis[2])) ||
+            (!hasYaw && hasAnyCenter))
+        {
+            RejectCoordinateMutation("G168", "FIXED_XY_CENTER_REQUIRED", nc, true);
+            return;
+        }
+        double center[2] = {};
+        if (hasYaw)
+        {
+            if (!isAbsoluteMode || !IsTranslationModeSupported() || isCAxisOffsetRotationEnabled)
+            {
+                RejectCoordinateMutation("G168", "PRIOR_SOURCE_UNSUPPORTED", nc, true);
+                return;
+            }
+            // Explicit centre words belong to the complete prior source.
+            // Both XY words are present; omitted native axes remain untouched.
+            double convertedMCS[8] = {};
+            Preview_WCS_to_MCS(targetWCS, hasAxis, convertedMCS);
+            for (unsigned axis = 0U; axis < 2U; ++axis)
+            {
+                center[axis] = convertedMCS[axis];
+                if (!std::isfinite(center[axis]))
+                {
+                    RejectCoordinateMutation("G168", "CENTER_NONFINITE", nc, true);
+                    return;
+                }
+            }
+        }
+        if (!GuardCoordinateMutation("G168", nc)) return;
+        currentWCode = wCode;
+        isWorkpieceRotationActive = true;
+        rotationCenterMCS[0] = center[0];
+        rotationCenterMCS[1] = center[1];
+        rotationCenterMCS[2] = 0.0;
+        m_workRotationCenterFixed = hasYaw;
+        if (nc) nc->GetMotion().SetCoordinateTransform(false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        RtPrintf("[WORK][SELECT] mode=168 W=%d fixedXYZ=1 fixedYaw=%d matrix=0\n", wCode, hasYaw ? 1 : 0);
+        return;
+    }
 
-    // 3. 從 m_WorkOffset 表格抓出三個平面的旋轉角度
-    double yaw_xy = m_WorkOffset[arrayIndex][WO_ANGLE_XY_YAW];
-    double pitch_xz = m_WorkOffset[arrayIndex][WO_ANGLE_XZ_PITCH];
-    double roll_yz = m_WorkOffset[arrayIndex][WO_ANGLE_YZ_ROLL];
-
+    // Legacy rotation outside a bounded MEMORY run retains its matrix path.
+    // Preview the centre against the prior source and validate all components
+    // before publishing mode, index, centre or Motion matrix. Never move tail.
+    double convertedMCS[8] = {};
+    Preview_WCS_to_MCS(targetWCS, hasAxis, convertedMCS);
+    double center[3] = {};
+    for (unsigned axis = 0U; axis < 3U; ++axis)
+    {
+        center[axis] = hasAxis[axis] ? convertedMCS[axis] : actualMCS[axis];
+        if (!std::isfinite(center[axis]))
+        {
+            RejectCoordinateMutation("G168", "CENTER_NONFINITE", nc, true);
+            return;
+        }
+    }
+    if (!GuardCoordinateMutation("G168", nc)) return;
+    currentWCode = wCode;
     isWorkpieceRotationActive = true;
-
-    // 4. 呼叫 MotionCore 底層的空間旋轉引擎！
-    if (nc) {
-        nc->GetMotion().SetCoordinateTransform
-        (
-            true,
-            rotationCenterMCS[0], rotationCenterMCS[1], rotationCenterMCS[2],
-            yaw_xy, pitch_xz, roll_yz
-        );
-
+    m_workRotationCenterFixed = false;
+    for (unsigned axis = 0U; axis < 3U; ++axis) rotationCenterMCS[axis] = center[axis];
+    const std::vector<double>& row = m_WorkOffset[wCode - 1];
+    if (nc)
+    {
+        nc->GetMotion().SetCoordinateTransform(true, center[0], center[1], center[2],
+            row[WO_ANGLE_XY_YAW], row[WO_ANGLE_XZ_PITCH], row[WO_ANGLE_YZ_ROLL]);
         RtPrintf("[G168] Workpiece Rotation ON (W%d). Center:(%.3f, %.3f, %.3f)\n",
-            wCode, rotationCenterMCS[0], rotationCenterMCS[1], rotationCenterMCS[2]);
+            wCode, center[0], center[1], center[2]);
     }
 }
 
@@ -736,8 +1750,13 @@ void CoordinateManager::SetWorkpieceRotation(int wCode, const bool* hasAxis, con
 // ==========================================================
 void CoordinateManager::CancelWorkpieceRotation(NCManager* nc)
 {
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    if ((isWorkpieceRotationActive || currentWCode != 0) &&
+        !GuardCoordinateMutation("G169", nc)) return;
     isWorkpieceRotationActive = false;
     currentWCode = 0;
+    m_workRotationCenterFixed = false;
+    for (unsigned axis = 0U; axis < 3U; ++axis) rotationCenterMCS[axis] = 0.0;
 
     if (nc) {
         // 傳入 false 關閉旋轉矩陣
@@ -750,7 +1769,7 @@ void CoordinateManager::CancelWorkpieceRotation(NCManager* nc)
 double CoordinateManager::GetActiveWorkOffset(int axisIndex) const
 {
     // 1. 如果 G168 沒開啟，或者是無效的 W 碼，就不平移
-    if (!isWorkpieceRotationActive || currentWCode <= 0 || currentWCode > m_WorkOffset.size()) {
+    if (!isWorkpieceRotationActive || !IsWorkOffsetRowValid(currentWCode, false)) {
         return 0.0;
     }
 
@@ -759,7 +1778,7 @@ double CoordinateManager::GetActiveWorkOffset(int axisIndex) const
     // 陣列 0, 1, 2 分別是 X, Y, Z 的線性平移 (允許回傳)
     // 陣列 3, 4, 5 是 旋轉角度，絕對不能當作平移量回傳！
     // =========================================================
-    if (axisIndex > 2) {
+    if (axisIndex < 0 || axisIndex > 2) {
         return 0.0; // 只要大於 Z 軸 (也就是角度欄位)，全部強制回傳 0.0！
     }
 
@@ -771,6 +1790,7 @@ double CoordinateManager::GetActiveWorkOffset(int axisIndex) const
 void CoordinateManager::SetActivePlane(int gCode, NCManager* nc)
 {
     if (gCode == 17 || gCode == 18 || gCode == 19) {
+        if (activePlane != gCode && !GuardCoordinateMutation("PLANE", nc)) return;
         activePlane = gCode;
 
         // 更新系統巨集變數 (群組 2)
@@ -785,35 +1805,70 @@ void CoordinateManager::SetActivePlane(int gCode, NCManager* nc)
 // ==========================================================
 void CoordinateManager::SetG68Rotation(const double* centerPos, const bool* hasAxis, double angle, NCManager* nc)
 {
-    isG68Active = true;
-    g68Angle = angle;
-
-    // 取得當前的 WCS (若 G68 沒給圓心參數，就以當前 WCS 為旋轉圓心)
-    double currentWCS[8];
-    GetActualWCS(currentWCS);
-
-    for (int i = 0; i < 3; i++) {
-        if (hasAxis[i]) {
-            g68CenterWCS[i] = centerPos[i];
-        }
-        else {
-            g68CenterWCS[i] = currentWCS[i];
+    if (!centerPos || !hasAxis || !std::isfinite(angle) || std::fabs(angle) > 360.0)
+    {
+        RejectCoordinateMutation("G68", "ANGLE_OR_INPUT", nc, true);
+        return;
+    }
+    const bool fixedRun = IsTranslationRunBound();
+    if (fixedRun && (activePlane != 17 || !isAbsoluteMode ||
+        isCAxisOffsetRotationEnabled || !hasAxis[0] || !hasAxis[1] || hasAxis[2]))
+    {
+        RejectCoordinateMutation("G68", "FIXED_XY_SCOPE", nc, true);
+        return;
+    }
+    if (activePlane != 17 && activePlane != 18 && activePlane != 19)
+    {
+        RejectCoordinateMutation("G68", "PLANE", nc, true);
+        return;
+    }
+    // Capture omitted legacy centres against the complete prior source. Never
+    // change angle/active before inverse conversion, or move commandedMCS.
+    double priorWCS[8] = {};
+    if (!fixedRun && (!hasAxis[0] || !hasAxis[1] || !hasAxis[2]))
+        GetActualWCS(priorWCS);
+    double proposedCenter[3] = {};
+    for (unsigned axis = 0U; axis < 3U; ++axis)
+    {
+        proposedCenter[axis] = fixedRun && axis == 2U ? 0.0 :
+            (hasAxis[axis] ? centerPos[axis] : priorWCS[axis]);
+        if (!std::isfinite(proposedCenter[axis]))
+        {
+            RejectCoordinateMutation("G68", "CENTER_NONFINITE", nc, true);
+            return;
         }
     }
-
-    if (nc) nc->MacroSys.SetVar('$', 16, 68.0); // 更新群組 16 巨集
+    const bool unchanged = isG68Active &&
+        std::memcmp(&angle, &g68Angle, sizeof(angle)) == 0 &&
+        std::memcmp(proposedCenter, g68CenterWCS, sizeof(proposedCenter)) == 0;
+    if (unchanged)
+    {
+        if (m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
+        {
+            RejectCoordinateMutation("G68", "SOURCE_CHANGED", nc, true);
+            return;
+        }
+        // A staged commit selected this frame before the normal modal setter.
+        if (nc) nc->MacroSys.SetVar('$', 16, 68.0);
+        return;
+    }
+    if (!GuardCoordinateMutation("G68", nc)) return;
+    isG68Active = true;
+    g68Angle = angle;
+    for (unsigned axis = 0U; axis < 3U; ++axis) g68CenterWCS[axis] = proposedCenter[axis];
+    if (nc) nc->MacroSys.SetVar('$', 16, 68.0);
     RtPrintf("[G68] 2D Rotation ON. Plane:%d, Center:(%.3f, %.3f), Angle:%.3f\n",
         activePlane, g68CenterWCS[0], g68CenterWCS[1], g68Angle);
 }
 
-// ==========================================================
-// 🌟 取消 G69 座標旋轉
-// ==========================================================
 void CoordinateManager::CancelG68Rotation(NCManager* nc)
 {
+    if ((isG68Active || g68Angle != 0.0 || g68CenterWCS[0] != 0.0 ||
+        g68CenterWCS[1] != 0.0 || g68CenterWCS[2] != 0.0) &&
+        !GuardCoordinateMutation("G69", nc)) return;
     isG68Active = false;
     g68Angle = 0.0;
-
+    for (unsigned axis = 0U; axis < 3U; ++axis) g68CenterWCS[axis] = 0.0;
     if (nc) nc->MacroSys.SetVar('$', 16, 69.0);
     RtPrintf("[G69] 2D Rotation OFF.\n");
 }
@@ -821,70 +1876,114 @@ void CoordinateManager::CancelG68Rotation(NCManager* nc)
 // ==========================================================
 // 🌟 G51 啟動縮放 / G50 關閉縮放
 // ==========================================================
-void CoordinateManager::SetScaling(const double* centerPos, const bool* hasAxis, double factor, NCManager* nc) {
+void CoordinateManager::SetScaling(const double* centerPos, const bool* hasAxis,
+    double factor, NCManager* nc)
+{
+    if (!centerPos || !hasAxis || !std::isfinite(factor) || factor <= 0.0)
+    { RejectCoordinateMutation("G51", "INPUT", nc, true); return; }
+    double center[8] = {};
+    bool selected[8] = {};
+    if (!IsTranslationRunBound()) GetCommandedWCS(center);
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if ((axis >= 3U && hasAxis[axis]) ||
+            (axis < 3U && IsTranslationRunBound() && !hasAxis[axis]))
+        { RejectCoordinateMutation("G51", "XYZ_CENTER_REQUIRED", nc, true); return; }
+        if (axis < 3U)
+        {
+            if (hasAxis[axis]) center[axis] = centerPos[axis];
+            selected[axis] = true;
+        }
+        else center[axis] = 0.0;
+    }
+    NCTranslationSnapshot source{};
+    source.scalingMode = isScalingActive ? 51 : 50;
+    source.scalingFactor = scaleFactor;
+    for (unsigned axis = 0U; axis < 3U; ++axis) source.scalingCenterMM[axis] = scalingCenterWCS[axis];
+    NCTranslationSnapshot next{};
+    if (!BuildScaleMirrorSelection(51, center, selected, factor, source, next))
+    { RejectCoordinateMutation("G51", "CENTER_OR_FACTOR", nc, true); return; }
+    const bool unchanged = SameNCTranslationSnapshot(source, next);
+    if (unchanged && m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
+    { RejectCoordinateMutation("G51", "SOURCE_CHANGED", nc, true); return; }
+    if (!unchanged && !GuardCoordinateMutation("G51", nc)) return;
     isScalingActive = true;
     scaleFactor = factor;
-
-    double currentWCS[8];
-    GetActualWCS(currentWCS);
-
-    for (int i = 0; i < 8; i++) {
-        scalingCenterWCS[i] = hasAxis[i] ? centerPos[i] : currentWCS[i];
-    }
+    for (unsigned axis = 0U; axis < 8U; ++axis) scalingCenterWCS[axis] = center[axis];
     if (nc) nc->MacroSys.SetVar('$', 11, 51.0);
 }
 
-void CoordinateManager::CancelScaling(NCManager* nc) {
+void CoordinateManager::CancelScaling(NCManager* nc)
+{
+    bool changed = isScalingActive || scaleFactor != 1.0;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        changed = changed || scalingCenterWCS[axis] != 0.0 || std::signbit(scalingCenterWCS[axis]);
+    if (changed && !GuardCoordinateMutation("G50", nc)) return;
+    if (!changed && m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
+    { RejectCoordinateMutation("G50", "SOURCE_CHANGED", nc, true); return; }
     isScalingActive = false;
     scaleFactor = 1.0;
+    for (unsigned axis = 0U; axis < 8U; ++axis) scalingCenterWCS[axis] = 0.0;
     if (nc) nc->MacroSys.SetVar('$', 11, 50.0);
 }
 
-// ==========================================================
-// 🌟 G151 啟動鏡像 / G150 關閉鏡像
-// ==========================================================
-void CoordinateManager::SetMirror(const double* mirrorPos, const bool* hasAxis, NCManager* nc) {
-    double currentWCS[8];
-    GetActualWCS(currentWCS);
-
-    for (int i = 0; i < 8; i++) {
-        if (hasAxis[i]) {
-            isMirrorActive[i] = true;
-            mirrorCenterWCS[i] = mirrorPos[i]; // 以指令指定的座標為鏡像對稱線
-        }
+void CoordinateManager::SetMirror(const double* mirrorPos, const bool* hasAxis, NCManager* nc)
+{
+    NCTranslationSnapshot source{};
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if (axis >= 3U && isMirrorActive[axis])
+        { RejectCoordinateMutation("G151", "XYZ_ONLY", nc, true); return; }
+        if (axis < 3U && isMirrorActive[axis])
+        { source.mirrorMask |= 1U << axis; source.mirrorCenterMM[axis] = mirrorCenterWCS[axis]; }
+    }
+    NCTranslationSnapshot next{};
+    if (!BuildScaleMirrorSelection(151, mirrorPos, hasAxis, 1.0, source, next))
+    { RejectCoordinateMutation("G151", "XYZ_CENTER_REQUIRED", nc, true); return; }
+    const bool unchanged = SameNCTranslationSnapshot(source, next);
+    if (unchanged && m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
+    { RejectCoordinateMutation("G151", "SOURCE_CHANGED", nc, true); return; }
+    if (!unchanged && !GuardCoordinateMutation("G151", nc)) return;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        isMirrorActive[axis] = axis < 3U && (next.mirrorMask & (1U << axis)) != 0U;
+        mirrorCenterWCS[axis] = axis < 3U ? next.mirrorCenterMM[axis] : 0.0;
     }
 }
 
-void CoordinateManager::CancelMirror(const bool* hasAxis, NCManager* nc) {
-    // 🌟 1. 系統先假設你要「全部取消」 (cancelAll = true)
-    bool cancelAll = true;
-
-    // 🌟 2. 檢查你有沒有輸入特定的軸？
-    for (int i = 0; i < 8; i++) {
-        if (hasAxis[i]) {
-            cancelAll = false; // 如果你有打 X 或 Y，就把「全部取消」關掉
-        }
+void CoordinateManager::CancelMirror(const bool* hasAxis, NCManager* nc)
+{
+    if (!hasAxis) { RejectCoordinateMutation("G150", "INPUT", nc, true); return; }
+    bool any = false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        any = any || hasAxis[axis];
+        if (axis >= 3U && hasAxis[axis])
+        { RejectCoordinateMutation("G150", "XYZ_ONLY", nc, true); return; }
     }
-
-    // 🌟 3. 執行關閉動作
-    for (int i = 0; i < 8; i++) {
-        // 如果是「全部取消」，或者「這個軸剛好有被點名」，就把它的鏡像關掉！
-        if (cancelAll || hasAxis[i]) {
-            isMirrorActive[i] = false;
-        }
-    }
+    bool changed = false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        if (!any || hasAxis[axis]) changed = changed || isMirrorActive[axis] ||
+            mirrorCenterWCS[axis] != 0.0 || std::signbit(mirrorCenterWCS[axis]);
+    if (changed && !GuardCoordinateMutation("G150", nc)) return;
+    if (!changed && m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
+    { RejectCoordinateMutation("G150", "SOURCE_CHANGED", nc, true); return; }
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        if (!any || hasAxis[axis]) { isMirrorActive[axis] = false; mirrorCenterWCS[axis] = 0.0; }
 }
 
 // ==========================================================
 // 🌟 G16 啟動極座標 / G15 關閉極座標
 // ==========================================================
 void CoordinateManager::SetPolarCoordinate(NCManager* nc) {
+    if (!isPolarCoordinateActive && !GuardCoordinateMutation("G16", nc)) return;
     isPolarCoordinateActive = true;
     if (nc) nc->MacroSys.SetVar('$', 17, 16.0); // 更新群組 17
     RtPrintf("[G16] Polar Coordinate System ON.\n");
 }
 
 void CoordinateManager::CancelPolarCoordinate(NCManager* nc) {
+    if (isPolarCoordinateActive && !GuardCoordinateMutation("G15", nc)) return;
     isPolarCoordinateActive = false;
     if (nc) nc->MacroSys.SetVar('$', 17, 15.0);
     RtPrintf("[G15] Polar Coordinate System OFF.\n");
@@ -896,6 +1995,8 @@ void CoordinateManager::SetToolRadiusCompensation(int gCode, int dCode, NCManage
 {
     if (gCode == 41 || gCode == 42) {
         if (dCode > 0 && dCode <= m_ToolOffset.size()) {
+            if ((toolRadiusMode != gCode || currentDCode != dCode) &&
+                !GuardCoordinateMutation("TOOL_RADIUS", nc)) return;
             toolRadiusMode = gCode;
             currentDCode = dCode;
             if (nc) nc->MacroSys.SetVar('$', 7, (double)gCode);
@@ -910,6 +2011,8 @@ void CoordinateManager::SetToolRadiusCompensation(int gCode, int dCode, NCManage
 // 🌟 取消 G40
 void CoordinateManager::CancelToolRadiusCompensation(NCManager* nc)
 {
+    if ((toolRadiusMode != 40 || currentDCode != 0) &&
+        !GuardCoordinateMutation("G40", nc)) return;
     toolRadiusMode = 40;
     currentDCode = 0; // 通常 D 碼保留，只改狀態
     if (nc) nc->MacroSys.SetVar('$', 7, 40.0);
@@ -994,11 +2097,13 @@ void CoordinateManager::GetDistanceToGo(double* outDTG, NCManager* nc) const
 void CoordinateManager::SetUnitMode(int gCode, NCManager* nc)
 {
     if (gCode == 20) {
+        if (!isInchMode && !GuardCoordinateMutation("G20", nc)) return;
         isInchMode = true;
         if (nc) nc->MacroSys.SetVar('$', 6, 20.0); // 更新群組 6 巨集變數
         // RtPrintf("[G20] Inch Mode Active.\n");
     }
     else if (gCode == 21) {
+        if (isInchMode && !GuardCoordinateMutation("G21", nc)) return;
         isInchMode = false;
         if (nc) nc->MacroSys.SetVar('$', 6, 21.0);
         // RtPrintf("[G21] Metric Mode Active.\n");

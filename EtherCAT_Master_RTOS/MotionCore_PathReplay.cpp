@@ -186,6 +186,15 @@ namespace
         std::memset(static_cast<void*>(&command), 0, sizeof(command));
         command.execution.sourceBlockId = MOTION_SOURCE_BLOCK_ID_INVALID;
         command.sourceWCS = 54;
+        command.sourceTranslation.schema = 8U;
+        command.sourceTranslation.scalingMode = 50;
+        command.sourceTranslation.scalingFactor = 1.0;
+        command.sourceTranslation.distanceMode = 90;
+        command.sourceTranslation.unitsMode = 21;
+        command.sourceTranslation.toolLengthMode = 49;
+        command.sourceTranslation.workMode = 169;
+        command.sourceTranslation.rotationMode = 69;
+        command.sourceTranslation.rotationPlane = 17;
         command.sourceToolLengthMode = 49;
         command.sourceToolRadiusMode = 40;
         command.sourceIsAbsoluteMode = true;
@@ -247,7 +256,7 @@ bool MotionCore::TryPathCoreRetainedIntervalMoveTransactionalTail(
     const MotionCommandSource source = m_pendingCommandSource.load(std::memory_order_acquire);
     if (m_pContexts == nullptr || m_pContexts->empty() || m_pContexts->size() > 8U ||
         travelGuard.check == nullptr || !std::isfinite(feedMMMin) || feedMMMin <= 0.0 || feedMMMin > 100.0 ||
-        !IsNCPathCoreRetainedGeometryValid(geometry) ||
+        (geometry.kind == NCPathCoreRetainedKind::LINE_ARC || !IsNCPathCoreRetainedGeometryValid(geometry)) ||
         !IsMotionRetainedIntervalBoundsValid(startU, endU, geometry.lengthPulse, intervalDistance) ||
         !IsMotionRetainedIntervalBoundsValid(startU, endU, geometry.lengthMM, intervalDistanceMM))
     {
@@ -258,9 +267,9 @@ bool MotionCore::TryPathCoreRetainedIntervalMoveTransactionalTail(
         source != MotionCommandSource::NC_MEMORY ||
         !m_programBlockMotionCaptureActive || m_programBlockMotionCapture.overflow ||
         m_programBlockMotionCapture.count != 0U || HasPendingSafetyOrRecoveryRequests() ||
-        !RetainedNormalOverride(*this) || m_pendingSourceWCS != 54 ||
-        m_pendingToolMode != 49 || m_pendingToolRadMode != 40 || !m_pendingIsAbsoluteMode ||
-        m_pendingG68Active || m_pendingG168Active || m_pendingG51Active ||
+        !RetainedNormalOverride(*this) || !IsPendingFixedTranslationSourceAllowed() ||
+        m_pendingToolRadMode != 40 || !m_pendingIsAbsoluteMode ||
+        m_pendingG51Active ||
         m_pendingMirrorMask != 0U || m_pendingG16Active || m_pendingG162Active || m_pendingPlaneMode != 17)
     {
         result.code = MotionPathCoreRetainedCode::NOT_READY; return false;
@@ -306,6 +315,7 @@ bool MotionCore::TryPathCoreRetainedIntervalMoveTransactionalTail(
     cmd.pathCoreRetainedReverse = reverse;
     cmd.sourceLinePC = m_pendingSourcePC;
     cmd.sourceWCS = m_pendingSourceWCS;
+    cmd.sourceTranslation = m_pendingTranslation;
     cmd.sourceToolLengthMode = m_pendingToolMode;
     cmd.sourceHCode = m_pendingHCode;
     cmd.sourceToolRadiusMode = m_pendingToolRadMode;
@@ -343,6 +353,7 @@ bool MotionCore::TryPathCoreRetainedIntervalMoveTransactionalTail(
     }
     AssignExecutionIdentity(cmd, publishedEpoch, source, plannedOwner);
     result.identity = cmd.execution;
+    result.translationGeneration = cmd.sourceTranslation.generation;
     result.ownerLease = cmd.ownerLease;
     result.commandAccepted = TryEnqueueMotionCommand(cmd);
     if (!result.commandAccepted)
@@ -394,7 +405,8 @@ bool MotionCore::TryPathCoreRetainedIntervalMoveTransactionalTail(
     }
     const MotionProgramBlockSubmission& submission =
         m_programBlockMotionCapture.submissions[0U];
-    result.captureBound = submission.producerAccepted &&
+    result.captureBound = submission.translationGeneration == result.translationGeneration &&
+        submission.producerAccepted &&
         submission.immediateRejectReason == MotionRejectReason::NONE &&
         submission.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
         submission.identity.epoch == result.identity.epoch &&

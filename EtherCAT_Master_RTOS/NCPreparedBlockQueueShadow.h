@@ -1,4 +1,5 @@
 #pragma once
+#include "NCTranslationSnapshot.h"
 
 #include "NCProgramCache.h"
 #include "NCGCodeSemantics.h"
@@ -136,6 +137,7 @@ struct NCPreparedModalSnapshot
     int unitsMode = 21;
     int planeMode = 17;
     int workCoordinateCode = 54;
+    NCTranslationSnapshot translation{};
     int storedStrokeMode = 23;
 
     int toolLengthMode = 49;
@@ -453,8 +455,8 @@ static_assert(
     std::is_trivially_copyable<NCPreparedBlockQueueCounters>::value,
     "NCPreparedBlockQueueCounters must remain trivially copyable.");
 static_assert(
-    sizeof(NCPreparedBlockEntrySnapshot) <= 1024U,
-    "A K.1 Prepared Entry must remain a bounded value snapshot.");
+    sizeof(NCPreparedBlockEntrySnapshot) <= 1632U,
+    "A Prepared Entry, including two fixed scale/mirror coordinate proofs, must remain bounded.");
 static_assert(
-    sizeof(NCPreparedBlockQueueShadow) <= 32768U,
-    "The complete fixed K.1 Shadow Queue must remain below 32 KiB.");
+    sizeof(NCPreparedBlockQueueShadow) <= 55296U,
+    "The fixed Shadow Queue, including 67 scale/mirror proofs (+4288 bytes), must remain at most 54 KiB.");

@@ -11,7 +11,7 @@ namespace
 #elif defined(__GNUC__) || defined(__clang__)
     __attribute__((noinline))
 #endif
-        bool FeedLineNormalOverride(const MotionCore& motion) noexcept
+        bool FeedLineNormalOverride(const MotionCore& motion, bool buffered = false) noexcept
     {
         // Existing coherent RT publication; never read raw m_Group state here.
         // M00/Feed Hold resumes to 1.0 before NC admits the next G01.
@@ -19,6 +19,12 @@ namespace
             motion.GetFeedHoldStopSnapshot();
         // A failed publication read returns groupDone=false. Override=1 alone
         // is a default value and cannot authorize a new transaction.
+        if (buffered)
+            return (snapshot.groupActive || snapshot.groupDone || snapshot.commandQueueDepth != 0U ||
+                snapshot.commandIngressDepth != 0U || snapshot.commandReplayDepth != 0U) &&
+            std::isfinite(snapshot.feedrateOverride) && snapshot.feedrateOverride == 1.0 &&
+            !snapshot.overrideZero && !snapshot.groupFaulted && !snapshot.groupEmergencyStopped &&
+            !snapshot.safetyOrRecoveryPending && snapshot.faultedAxes == 0U;
         return std::isfinite(snapshot.feedrateOverride) &&
             snapshot.feedrateOverride == 1.0 && !snapshot.overrideZero &&
             snapshot.groupDone && !snapshot.groupActive &&
@@ -34,7 +40,9 @@ namespace
         const std::vector<int>& axes,
         const std::vector<double>& targetMCS,
         const double* commandedTail,
-        MotionFeedLineWorkspace& workspace) noexcept
+        MotionFeedLineWorkspace& workspace,
+        const MotionCncPathTail* predecessor = nullptr,
+        std::uint32_t endpointAxisMask = 0U) noexcept
     {
         MotionFeedLineReceipt& result = workspace.receipt;
         // Rebuild the ABORTING successor baseline for every existing axis.
@@ -59,7 +67,8 @@ namespace
                 continue;
             }
             const AxisContext& axis = (*contexts)[slot];
-            const double logicalPulse = axis.logicalCmdPos.Load();
+            const double logicalPulse = predecessor != nullptr ?
+                predecessor->endPulse[slot] : axis.logicalCmdPos.Load();
             if (!std::isfinite(logicalPulse) ||
                 !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
                 !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0)
@@ -67,8 +76,19 @@ namespace
                 result.code = MotionFeedLineCode::INVALID_INPUT;
                 return false;
             }
-            double baseline = logicalPulse * axis.finalLead / axis.resolution_PPR;
-            if (axis.axisType == AxisType::LINEAR && std::isfinite(baseline))
+            if (predecessor != nullptr &&
+                ((predecessor->validAxisMask & (1U << static_cast<unsigned>(slot))) == 0U ||
+                    commandedTail[slot] != predecessor->endMCS[slot]))
+            {
+                result.code = MotionFeedLineCode::NOT_READY;
+                return false;
+            }
+            double baseline = predecessor != nullptr ? predecessor->endMCS[slot] :
+                logicalPulse * axis.finalLead / axis.resolution_PPR;
+            // EG: a buffered predecessor owns its exact MCS representation,
+            // including signed zero; do not replace it with an equal NC spelling.
+            if (predecessor == nullptr && axis.axisType == AxisType::LINEAR &&
+                std::isfinite(baseline))
             {
                 // Keep the commanded MCS representation only after its forward
                 // conversion exactly matches the sampled pulse. A round trip
@@ -122,9 +142,10 @@ namespace
             const std::size_t slot = static_cast<std::size_t>(axisIndex);
             const std::uint32_t bit = (1U << static_cast<unsigned>(axisIndex));
             const AxisContext& axis = (*contexts)[slot];
+            const bool programmed = endpointAxisMask == 0U || (endpointAxisMask & bit) != 0U;
             if ((validMask & bit) == 0U ||
                 (workspace.input.axisMask & bit) != 0U ||
-                axis.axisType != AxisType::LINEAR || !std::isfinite(targetMCS[index]) ||
+                axis.axisType != AxisType::LINEAR || (programmed && !std::isfinite(targetMCS[index])) ||
                 !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ||
                 !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ||
                 !std::isfinite(axis.G00_dec_time) || axis.G00_dec_time < 0.0)
@@ -133,7 +154,11 @@ namespace
                 return false;
             }
             const double pulsePerMM = axis.resolution_PPR / axis.finalLead;
-            const double targetPulse = targetMCS[index] * pulsePerMM;
+            // The omitted endpoint keeps native sampled/committed bits. Its
+            // absent payload is never read or converted through MCS arithmetic.
+            const double targetPulse = programmed ? targetMCS[index] * pulsePerMM :
+                workspace.input.startPulse[slot];
+            const double target = programmed ? targetMCS[index] : workspace.input.startMCS[slot];
             if (!std::isfinite(pulsePerMM) || pulsePerMM <= 0.0 ||
                 !std::isfinite(targetPulse))
             {
@@ -141,10 +166,10 @@ namespace
                 return false;
             }
             workspace.input.axisMask |= bit;
-            workspace.input.endMCS[slot] = targetMCS[index];
+            workspace.input.endMCS[slot] = target;
             workspace.input.endPulse[slot] = targetPulse;
             workspace.input.maxVelocityPPS[slot] = axis.maxVel_PPS;
-            workspace.stagedMCS[slot] = targetMCS[index];
+            workspace.stagedMCS[slot] = target;
             workspace.stagedPulse[slot] = targetPulse;
             workspace.targetPulse.push_back(targetPulse); // capacity checked above
             workspace.accTime = (std::max)(workspace.accTime, axis.G00_acc_time);
@@ -197,6 +222,46 @@ bool MotionCore::TryG01MoveTransactionalTail(
     double(&commandedMCSTail)[MAX_AXES],
     MotionFeedLineWorkspace& workspace)
 {
+    return TryG01MoveTransactionalTail(axes, targetMCS, feedMMMin,
+        commandedMCSTail, workspace, nullptr);
+}
+
+bool MotionCore::TryG01MoveTransactionalTail(
+    const std::vector<int>& axes, const std::vector<double>& targetMCS,
+    double feedMMMin, double(&commandedMCSTail)[MAX_AXES],
+    MotionFeedLineWorkspace& workspace, const MotionFeedLineReceipt* predecessor)
+{
+    return TryG01MoveTransactionalTail(axes, targetMCS, feedMMMin,
+        commandedMCSTail, workspace, predecessor, false);
+}
+
+bool MotionCore::TryG01MoveTransactionalTail(
+    const std::vector<int>& axes, const std::vector<double>& targetMCS,
+    double feedMMMin, double(&commandedMCSTail)[MAX_AXES],
+    MotionFeedLineWorkspace& workspace, const MotionFeedLineReceipt* predecessor,
+    bool cncFeedLookahead)
+{
+    if (predecessor == &workspace.receipt)
+    {
+        workspace.receipt.Clear();
+        workspace.receipt.code = MotionFeedLineCode::NOT_READY;
+        return false;
+    }
+    if (predecessor != nullptr) workspace.predecessorTail.Assign(*predecessor);
+    return TryG01MoveTransactionalCncTail(axes, targetMCS, feedMMMin,
+        commandedMCSTail, workspace, predecessor != nullptr ? &workspace.predecessorTail : nullptr,
+        cncFeedLookahead);
+}
+
+bool MotionCore::TryG01MoveTransactionalCncTail(
+    const std::vector<int>& axes, const std::vector<double>& targetMCS,
+    double feedMMMin, double(&commandedMCSTail)[MAX_AXES],
+    MotionFeedLineWorkspace& workspace, const MotionCncPathTail* predecessor,
+    bool cncFeedLookahead,
+    const std::array<double, 8U>* cornerNextMCS, double cornerToleranceMM,
+    const MotionArcTravelGuard* cornerTravelGuard, double cornerNextFeedMMMin,
+    std::uint32_t endpointAxisMask, bool requirePlanarBaselineMatch)
+{
     static_assert(MAX_AXES == 8, "BX fixed workspace must match Motion axes.");
     MotionFeedLineReceipt& result = workspace.receipt;
     result.Clear();
@@ -210,14 +275,47 @@ bool MotionCore::TryG01MoveTransactionalTail(
     const MotionOwnerLease plannedOwner = GetMotionOwnerLease();
     const MotionCommandSource source =
         m_pendingCommandSource.load(std::memory_order_acquire);
-    if (m_pContexts == nullptr || m_pContexts->size() > 8U ||
+    const bool rotatedEndpoint = NCTranslationHasPlanarRotation(m_pendingTranslation);
+    const bool rotatedQueuedLine = rotatedEndpoint && cncFeedLookahead;
+    if (!IsPendingFixedTranslationSourceAllowed() ||
+        (m_pendingTranslation.distanceMode == 91 &&
+            (cncFeedLookahead || cornerNextMCS != nullptr)) ||
+        (rotatedEndpoint && cornerNextMCS != nullptr && !cncFeedLookahead) ||
+        (rotatedQueuedLine && (m_pendingTranslation.distanceMode != 90 ||
+            axes.size() != 2U || axes[0] != 0 || axes[1] != 1 || endpointAxisMask != 0U)) ||
+        m_pContexts == nullptr || m_pContexts->size() > 8U ||
         axes.empty() || axes.size() > 3U ||
         axes.size() != targetMCS.size() ||
+        (endpointAxisMask != 0U &&
+            ((endpointAxisMask != 1U && endpointAxisMask != 2U) || !cncFeedLookahead ||
+                axes.size() != 2U || axes[0] != 0 || axes[1] != 1 ||
+                cornerNextMCS != nullptr || cornerToleranceMM != 0.0 ||
+                cornerTravelGuard != nullptr || cornerNextFeedMMMin != 0.0)) ||
         !std::isfinite(feedMMMin) || feedMMMin <= 0.0 || feedMMMin > 100.0 ||
         workspace.targetPulse.capacity() < 8U)
     {
         result.code = MotionFeedLineCode::INVALID_INPUT;
         return false;
+    }
+    const bool buffered = predecessor != nullptr;
+    if (buffered)
+    {
+        std::uint32_t mask = 0U;
+        for (int axis : axes)
+        {
+            if (axis < 0 || axis > 2 || (mask & (1U << static_cast<unsigned>(axis))) != 0U)
+            {
+                result.code = MotionFeedLineCode::INVALID_INPUT;
+                return false;
+            }
+            mask |= (1U << static_cast<unsigned>(axis));
+        }
+        if (!IsCncPathProducerTailCurrent(*predecessor, mask, commandedMCSTail,
+            plannedEpoch, plannedOwner, source))
+        {
+            result.code = MotionFeedLineCode::NOT_READY;
+            return false;
+        }
     }
     if (plannedEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
         !plannedOwner.IsValid() || plannedOwner.owner != MotionOwner::AUTO ||
@@ -226,23 +324,115 @@ bool MotionCore::TryG01MoveTransactionalTail(
         m_programBlockMotionCapture.overflow ||
         m_programBlockMotionCapture.count != 0U ||
         HasPendingSafetyOrRecoveryRequests() ||
-        !FeedLineNormalOverride(*this))
+        !FeedLineNormalOverride(*this, buffered))
     {
         result.code = MotionFeedLineCode::NOT_READY;
         return false;
     }
 
     if (!PrepareFeedLineGeometry(m_pContexts, axes, targetMCS,
-        commandedMCSTail, workspace))
+        commandedMCSTail, workspace, predecessor, endpointAxisMask))
     {
         return false;
     }
 
+    const bool incrementalEndpoint = m_pendingTranslation.distanceMode == 91;
+    const std::uint32_t requiredBaselineMask =
+        ((requirePlanarBaselineMatch || rotatedQueuedLine) ? 3U : 0U) |
+        (incrementalEndpoint ? workspace.input.axisMask : 0U);
+    // A first rotated plain/Q line uses the same sampled native basis as geometry.
+    // A buffered line already proved its immutable accepted predecessor above;
+    // live axes can still be inside an earlier segment and must not replace it.
+    if (((requirePlanarBaselineMatch || incrementalEndpoint) &&
+            !rotatedQueuedLine && (buffered || cncFeedLookahead)) ||
+        ((requirePlanarBaselineMatch || rotatedQueuedLine || incrementalEndpoint) && !buffered &&
+            !IsPlanarEndpointBasisCurrent(commandedMCSTail,
+                workspace.input.startPulse, result.validAxisMask, requiredBaselineMask)))
+    {
+        result.code = MotionFeedLineCode::NOT_READY;
+        return false;
+    }
+
+    if (cornerNextMCS != nullptr)
+    {
+        // Zero is the compatibility spelling for an explicitly same-F producer.
+        const double nextFeed = cornerNextFeedMMMin == 0.0 ? feedMMMin : cornerNextFeedMMMin;
+        if (!std::isfinite(nextFeed) || nextFeed <= 0.0 || nextFeed > 100.0)
+        {
+            result.code = MotionFeedLineCode::INVALID_INPUT; return false;
+        }
+        if (!cncFeedLookahead || axes.size() != 2U || axes[0] != 0 || axes[1] != 1 ||
+            cornerTravelGuard == nullptr || cornerTravelGuard->check == nullptr)
+        {
+            result.code = MotionFeedLineCode::GEOMETRY_REJECTED; return false;
+        }
+        const std::array<double, 2U> ppm = { {(*m_pContexts)[0].resolution_PPR / (*m_pContexts)[0].finalLead,
+            (*m_pContexts)[1].resolution_PPR / (*m_pContexts)[1].finalLead} };
+        // DH_FIX1: preview supplies only XY. Unselected axes must still match
+        // the NC tail, then inherit the exact sampled/committed native baseline.
+        // Never snap native pulses to a nominal NC target or relax geometry Q.
+        std::array<double, 8U> anchoredCornerNext = workspace.input.startMCS;
+        for (std::size_t i = 0U; i < 8U; ++i)
+        {
+            if (!std::isfinite((*cornerNextMCS)[i]) ||
+                (i >= 2U && (*cornerNextMCS)[i] != commandedMCSTail[i]))
+            {
+                result.code = MotionFeedLineCode::GEOMETRY_REJECTED; return false;
+            }
+        }
+        anchoredCornerNext[0] = (*cornerNextMCS)[0];
+        anchoredCornerNext[1] = (*cornerNextMCS)[1];
+        if (!BuildNCPathCoreCornerBlend(workspace.input, anchoredCornerNext, cornerToleranceMM, ppm,
+            result.line, workspace.cornerArcInput, workspace.cornerArc, result.blendGeometry, result.blendMetadata))
+        {
+            result.code = MotionFeedLineCode::GEOMETRY_REJECTED; return false;
+        }
+        for (unsigned i = 0U; i < 2U; ++i)
+        {
+            if (!cornerTravelGuard->check(cornerTravelGuard->context, int(i), result.blendGeometry.boundsMinMCS[i]) ||
+                !cornerTravelGuard->check(cornerTravelGuard->context, int(i), result.blendGeometry.boundsMaxMCS[i]))
+            {
+                result.code = MotionFeedLineCode::GEOMETRY_REJECTED; return false;
+            }
+            workspace.targetPulse[i] = result.blendGeometry.endPulse[i];
+        }
+        // DI packet min still governs the fillet, source seams and future horizon.
+        // DK separately transports Fi for the loaded straight prefix; retain the
+        // canonical arc's exact scalar conversion, including same-F equality.
+        result.cornerNextFeedMMMin = nextFeed;
+        result.cornerDispatchFeedMMMin = (std::min)(feedMMMin, nextFeed);
+        double capVelocity = workspace.cornerArc.velocityPPS;
+        if (nextFeed < feedMMMin)
+        {
+            int ef = 0, es = 0;
+            const double mf = std::frexp(nextFeed, &ef);
+            const double ms = std::frexp(ppm[0], &es);
+            capVelocity = (std::min)(capVelocity, std::ldexp((mf * ms) / 60.0, ef + es));
+        }
+        if (!std::isfinite(capVelocity) || capVelocity < 1.0 ||
+            !std::isfinite(capVelocity / workspace.accTime) ||
+            !std::isfinite(capVelocity / workspace.decTime))
+        {
+            result.code = MotionFeedLineCode::GEOMETRY_REJECTED; return false;
+        }
+        result.cornerDispatchVelocityPPS = capVelocity;
+        workspace.stagedMCS = result.blendGeometry.endMCS;
+        workspace.stagedPulse = result.blendGeometry.endPulse;
+    }
+    else if (cornerToleranceMM != 0.0 || cornerTravelGuard != nullptr || cornerNextFeedMMMin != 0.0)
+    {
+        result.code = MotionFeedLineCode::INVALID_INPUT; return false;
+    }
+
     const bool accepted = TryLineMove(
-        axes, workspace.targetPulse, result.line.velocityPPS,
-        workspace.accTime, workspace.decTime, BufferMode::ABORTING,
-        MotionCommandPathMode::EXACT_STOP,
-        &result.identity, &result.ownerLease, plannedEpoch, &plannedOwner);
+        axes, workspace.targetPulse, result.blendGeometry.valid ? result.cornerDispatchVelocityPPS : result.line.velocityPPS,
+        workspace.accTime, workspace.decTime, buffered ? BufferMode::BUFFERED : BufferMode::ABORTING,
+        cncFeedLookahead ? MotionCommandPathMode::CONTINUOUS : MotionCommandPathMode::EXACT_STOP,
+        &result.identity, &result.ownerLease, plannedEpoch, &plannedOwner, cncFeedLookahead,
+        result.blendGeometry.valid ? &result.blendGeometry : nullptr,
+        result.blendGeometry.valid ? workspace.cornerArc.velocityPPS : 0.0,
+        !cncFeedLookahead && !buffered); // DT: exact native G01 source only.
+    result.translationGeneration = m_pendingTranslation.generation;
     result.commandAccepted = accepted;
     if (!accepted)
     {
@@ -293,9 +483,11 @@ bool MotionCore::TryG01MoveTransactionalTail(
     }
     const MotionProgramBlockSubmission& submission =
         m_programBlockMotionCapture.submissions[0U];
-    result.captureBound = submission.producerAccepted &&
+    result.captureBound = submission.translationGeneration == result.translationGeneration &&
+        submission.producerAccepted &&
         submission.immediateRejectReason == MotionRejectReason::NONE &&
-        submission.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        submission.commandPathMode == (cncFeedLookahead ?
+            MotionCommandPathMode::CONTINUOUS : MotionCommandPathMode::EXACT_STOP) &&
         submission.identity.epoch == result.identity.epoch &&
         submission.identity.segmentId == result.identity.segmentId &&
         submission.identity.sourceBlockId == result.identity.sourceBlockId &&
@@ -329,5 +521,31 @@ bool MotionCore::TryG01MoveTransactionalTail(
     }
     result.code = MotionFeedLineCode::COMMITTED;
     result.valid = true;
+    return true;
+}
+
+// Both mixed producers validate the same tagged tail. No current-position sample
+// may substitute for an already committed successor's start.
+bool MotionCore::IsCncPathProducerTailCurrent(const MotionCncPathTail& tail,
+    std::uint32_t mask, const double* commandedTail, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& owner, MotionCommandSource source) const noexcept
+{
+    if (commandedTail == nullptr || !tail.valid || tail.axisMask != mask ||
+        tail.translationGeneration != m_pendingTranslation.generation ||
+        !IsPendingFixedTranslationSourceAllowed() ||
+        !tail.identity.IsAssigned() || tail.identity.source != source || tail.identity.epoch != epoch ||
+        tail.identity.sourceBlockId >= static_cast<MotionSourceBlockId>((std::numeric_limits<int>::max)()) ||
+        m_pendingSourcePC != static_cast<int>(tail.identity.sourceBlockId) + 1 ||
+        m_nextSegmentId.load(std::memory_order_acquire) !=
+        static_cast<MotionSegmentId>(tail.identity.segmentId + 1ULL) ||
+        !tail.ownerLease.Matches(owner) || m_g00ProducerQueueTailEpoch != epoch ||
+        !m_g00ProducerQueueTailOwnerLease.Matches(owner) ||
+        m_g00ProducerQueueTailValidMask != tail.validAxisMask) return false;
+    for (std::size_t i = 0U; i < 8U; ++i)
+    {
+        if ((tail.validAxisMask & (1U << static_cast<unsigned>(i))) == 0U) continue;
+        if (!std::isfinite(tail.endMCS[i]) || !std::isfinite(tail.endPulse[i]) ||
+            commandedTail[i] != tail.endMCS[i] || m_g00ProducerQueueTailPulse[i] != tail.endPulse[i]) return false;
+    }
     return true;
 }

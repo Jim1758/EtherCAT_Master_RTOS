@@ -15,8 +15,10 @@
 #include "CompensationEngine.h" // 引入剛寫好的標頭檔
 #include "SHM_Types.h"
 #include "MotionExecutionContract.h"
+#include "MotionNCTranslationProof.h"
 #include "MotionCommandPathModeTransport.h"
 #include "MotionQueueTailTransaction.h"
+#include "MotionRotaryTarget.h"
 #include "MotionCommandedEndpointReceipt.h" // BQ producer-only data export
 #include "MotionFeedLineReceipt.h" // BX G01 producer-owned workspace
 #include "MotionFeedArcReceipt.h" // BY G02/G03 producer-owned workspace
@@ -563,7 +565,7 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     double endRadius = 0.0;
 
     int dir = 0; // 方向 (1=CCW, -1=CW)
-    // BY: consume the existing padding after dir; transport stays 560 bytes.
+    // BY used the existing dir padding in the original 560-byte layout.
     bool pathCorePlanarCircle = false;
     bool pathCoreFullCircle = false;
     // BZ: canonical geometry uses mem_* only while this fresh traversal is active.
@@ -579,6 +581,9 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     // True only for an RT replay transport copy whose lifecycle identity was
     // already terminal before B2 pushed it back in front of the path.
     bool replayTerminalAlreadyPublished = false;
+    bool cncFeedLookahead = false; // DE uses the existing x64 padding byte at offset 201.
+    bool cncCornerBlend = false; // DH compound LINE + ARC; consumes padding at offset 202.
+    bool pathCoreFeedExactStop = false; // DT: nonbuffered native G01 provenance, padding byte 203.
     double mem_startPos[MAX_AXES] = { 0.0 };
     double mem_ratio[MAX_AXES] = { 0.0 };
     double mem_radius = 0.0;
@@ -628,7 +633,118 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     MotionCommandPathMode commandPathMode =
         MotionCommandPathMode::UNSPECIFIED;
     int sourcePlaneMode = 17;
+
+    // DK: immutable authored Fi scalar cap for a Q straight prefix only.
+    // Zero retains the legacy DJ packet cap. Arc/seam dynamics use targetVel.
+    double cncPrefixVelocityPPS = 0.0;
+
+    // Immutable fixed-translation source; all prior transport offsets stay unchanged.
+    NCTranslationSnapshot sourceTranslation{};
 };
+
+inline bool IsMotionFixedTranslationToolSourceAllowed(const MotionCommand& command) noexcept
+{
+    // An empty legacy descriptor never authorizes an active H vector.
+    if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
+        return command.sourceToolLengthMode == 49;
+    return IsNCTranslationToolModeAllowed(command.sourceToolLengthMode, command.sourceTranslation) &&
+        command.sourceHCode == command.sourceTranslation.toolHCode &&
+        (command.sourceToolLengthMode == 49 || !command.sourceG162Active);
+}
+
+// Fixed G68 / WORK yaw is baked into native XY geometry. The bounded
+// G90 G17 queue accepts plain XY lines, canonical circles and bounded Q
+// line/arc blends with this frozen descriptor; retained/reverse paths stay excluded.
+inline bool IsMotionFixedRotationPathAllowed(const MotionCommand& command) noexcept
+{
+    if (command.commandPathMode == MotionCommandPathMode::EXACT_STOP)
+        return !command.cncFeedLookahead && !command.cncCornerBlend;
+    const bool plainXYLine = command.mode == InterpolationMode::LINEAR &&
+        !command.cncCornerBlend && !command.pathCorePlanarCircle && !command.pathCoreFullCircle && command.dir == 0 &&
+        command.startRadius == 0.0 && command.endRadius == 0.0 &&
+        command.mem_radius == 0.0 && command.mem_totalAngle == 0.0;
+    const bool planarCircle = !command.cncCornerBlend && command.pathCorePlanarCircle &&
+        ((command.mode == InterpolationMode::CIRCULAR_CW && command.dir == -1) ||
+            (command.mode == InterpolationMode::CIRCULAR_CCW && command.dir == 1));
+    // This is a source-shape gate. The consumer separately proves the complete
+    // canonical prefix/fillet geometry, equal XY pulse scale and speed bounds.
+    const bool cornerBlend = command.cncCornerBlend && command.mode == InterpolationMode::LINEAR &&
+        !command.pathCorePlanarCircle && !command.pathCoreFullCircle &&
+        (command.dir == -1 || command.dir == 1) && std::isfinite(command.mem_radius) &&
+        command.mem_radius > 0.0 && command.startRadius == command.mem_radius &&
+        command.endRadius == command.mem_radius;
+    return command.commandPathMode == MotionCommandPathMode::CONTINUOUS &&
+        command.cncFeedLookahead && (plainXYLine || planarCircle || cornerBlend) &&
+        !command.pathCoreFeedExactStop &&
+        !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse &&
+        !command.replayTerminalAlreadyPublished && !command.mem_enableTransform &&
+        command.execution.source == MotionCommandSource::NC_MEMORY &&
+        command.ownerLease.owner == MotionOwner::AUTO && !command.sourceG162Active &&
+        command.sourceIsAbsoluteMode && command.sourceTranslation.distanceMode == 90 &&
+        command.sourcePlaneMode == 17 && command.axisCount == 2 &&
+        command.axisIndices[0] == 0 && command.axisIndices[1] == 1;
+}
+
+inline bool IsMotionFixedTranslationWorkSourceAllowed(const MotionCommand& command) noexcept
+{
+    // Physical G168/W tags require the complete frozen WORK row and MCS center.
+    // Empty legacy descriptors cannot authorize active WORK, even with G49.
+    if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
+        return !command.sourceG168Active &&
+            (command.execution.source != MotionCommandSource::NC_MEMORY || command.sourceWCode == 0);
+    return IsNCTranslationWorkModeAllowed(command.sourceG168Active, command.sourceWCode,
+        command.sourceTranslation) && (!command.sourceG168Active || !command.sourceG162Active) &&
+        (command.sourceTranslation.workOffset[3] == 0.0 ||
+            IsMotionFixedRotationPathAllowed(command));
+}
+
+inline bool IsMotionFixedTranslationRotationSourceAllowed(const MotionCommand& command) noexcept
+{
+    // A G68 tag never authorizes an unfrozen MEMORY transform. MDI keeps its
+    // legacy lane; native fixed geometry carries the exact source descriptor.
+    if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
+        return !command.sourceG68Active;
+    return IsNCTranslationRotationModeAllowed(command.sourceG68Active,
+        command.sourceG68Angle, command.sourcePlaneMode, command.sourceTranslation) &&
+        (!command.sourceG68Active || (!command.sourceG162Active &&
+            IsMotionFixedRotationPathAllowed(command)));
+}
+
+inline bool IsMotionFixedTranslationScaleMirrorSourceAllowed(const MotionCommand& command) noexcept
+{
+    // Native packet geometry already includes the complete fixed transform.
+    // Tags prove provenance only; RT must never apply scale or mirror again.
+    const NCTranslationSnapshot& s = command.sourceTranslation;
+    if (IsNCTranslationSnapshotEmpty(s))
+        return !command.sourceG51Active && command.sourceMirrorMask == 0U;
+    return IsNCTranslationSnapshotValid(s) &&
+        command.sourceG51Active == (s.scalingMode == 51) &&
+        std::memcmp(&command.sourceScaleRatio, &s.scalingFactor, sizeof(double)) == 0 &&
+        static_cast<std::uint32_t>(command.sourceMirrorMask) == s.mirrorMask &&
+        (!NCTranslationHasScaleMirror(s) || !command.sourceG162Active);
+}
+
+inline bool IsMotionFixedTranslationSourceAllowed(const MotionCommand& command) noexcept
+{
+    if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
+        return command.sourceWCS == 54 && IsMotionFixedTranslationToolSourceAllowed(command) &&
+            IsMotionFixedTranslationWorkSourceAllowed(command) &&
+            IsMotionFixedTranslationRotationSourceAllowed(command) &&
+            IsMotionFixedTranslationScaleMirrorSourceAllowed(command);
+    // G49 with no WORK leaves the G00 C-offset flag dormant. Active H or
+    // WORK requires its frozen identity and G163; no dynamic transform authority.
+    return IsNCTranslationSourceAllowed(command.sourceWCS, command.sourceTranslation) &&
+        (command.sourceIsAbsoluteMode ? 90 : 91) == command.sourceTranslation.distanceMode &&
+        (command.sourceTranslation.distanceMode != 91 ||
+            (command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+                !command.cncFeedLookahead && !command.cncCornerBlend &&
+                !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse)) &&
+        command.sourcePlaneMode == 17 &&
+        IsMotionFixedTranslationToolSourceAllowed(command) && command.sourceToolRadiusMode == 40 &&
+        IsMotionFixedTranslationRotationSourceAllowed(command) && IsMotionFixedTranslationWorkSourceAllowed(command) &&
+        IsMotionFixedTranslationScaleMirrorSourceAllowed(command) && !command.sourceG16Active && !command.mem_enableTransform &&
+        command.axisCount >= 1 && command.axisCount <= 3;
+}
 
 static_assert(
     std::is_trivially_copyable<MotionCommand>::value,
@@ -639,8 +755,12 @@ static_assert(
 
 #if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
 static_assert(
-    sizeof(MotionCommand) == 560U && alignof(MotionCommand) == 8U,
-    "K.6 must consume existing x64 padding without changing MotionCommand ABI size.");
+    sizeof(MotionCommand) == 992U && alignof(MotionCommand) == 8U,
+    "Fixed scale/mirror source proof appends 424 bytes; rebuild every RTSS translation unit.");
+static_assert(offsetof(MotionCommand, sourceTranslation) == 568U,
+    "Fixed translation must preserve every pre-existing command offset.");
+static_assert(offsetof(MotionCommand, cncPrefixVelocityPPS) == 560U,
+    "DK must preserve every pre-existing MotionCommand offset.");
 static_assert(
     offsetof(MotionCommand, commandPathMode) == 555U &&
     offsetof(MotionCommand, sourcePlaneMode) == 556U,
@@ -651,6 +771,13 @@ static_assert(offsetof(MotionCommand, pathCorePlanarCircle) == 172U &&
 static_assert(offsetof(MotionCommand, pathCoreRetainedTraversal) == 174U &&
     offsetof(MotionCommand, pathCoreRetainedReverse) == 175U,
     "BZ traversal flags must consume the remaining dir padding only.");
+#endif
+
+#if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
+static_assert(offsetof(MotionCommand, cncFeedLookahead) == 201U, "DE must not grow command transport.");
+static_assert(offsetof(MotionCommand, cncCornerBlend) == 202U, "DH must use existing command padding.");
+static_assert(offsetof(MotionCommand, pathCoreFeedExactStop) == 203U &&
+    offsetof(MotionCommand, mem_startPos) == 208U, "DT must preserve command size and all previous offsets.");
 #endif
 
 // Stage NC-0.2D：NC Producer 在單一 Program Block 派送期間，
@@ -664,6 +791,7 @@ struct MotionProgramBlockSubmission
     MotionCommandPathMode commandPathMode =
         MotionCommandPathMode::UNSPECIFIED;
     MotionQueueTailCommitReceipt queueTailReceipt{};
+    std::uint64_t translationGeneration = 0ULL;
     bool producerAccepted = false;
     MotionRejectReason immediateRejectReason = MotionRejectReason::NONE;
 };
@@ -1576,6 +1704,13 @@ enum class ResetControlledStopPhase : std::uint32_t
 // 核心運動控制類別 (MotionCore Class)
 // 職責：處理單軸運動、多軸插補、PID 閉迴路、以及 EDM 路徑伺服
 // ==========================================
+enum class MotionNCTranslationTransitionResult : std::uint8_t
+{
+    ACCEPTED,
+    DEFERRED,
+    UNSUPPORTED_PREDECESSOR
+};
+
 class MotionCore
 {
 public:
@@ -1648,7 +1783,7 @@ public:
 
     void InitAxis(AxisContext& axis, double resolution = 16777216.0);// 初始化軸參數 (如解析度、預設極限、PID)
     void InitSmoothBuffer(AxisContext& axis, double smoothTime_ms);// 初始化 S-Curve 平滑濾波緩衝區
-    void MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time);// 下達 P2P 絕對位置移動指令 (Trapezoidal 梯形加減速)
+    bool MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time);// 下達 P2P 絕對位置移動指令 (Trapezoidal 梯形加減速)
     void VelocityMove(AxisContext& axis, double velocity, double acc_time = 0.0);// 下達速度模式指令 (用於放電或手動連續移動)
     void MPGMove(AxisContext& axis, double targetPos, double maxVel, double acc_time, double dec_time);
     void StopMove(AxisContext& axis, double dec_time = 0.0);// 正常減速停止單軸
@@ -1720,7 +1855,7 @@ public:
     void ArcMove(const std::vector<int>& axes, const std::vector<double>& targetPos, const std::vector<double>& centerPos, int dir, double targetVel, double acc_time, double dec_time, BufferMode mode = BufferMode::ABORTING);// 圓弧插補指令
     void UpdateInterpolation();// 插補群組更新 (計算虛擬主軸並分配位移給實體軸)
     void InitVirtualAxisSmooth(int windowSize); // 初始化虛擬主軸的 S-Curve 平滑設定
-    void LoadNextCommand();// 從指令佇列 (Queue) 載入下一段任務  
+    void LoadNextCommand(bool cncBoundaryCrossing = false);// 從指令佇列 (Queue) 載入下一段任務  
     void GetDirectionVector(const MotionCommand& cmd, double startX, double startY, double& vx, double& vy);// 取得當前路徑的方向向量
     void StopGroup();// 插補群組整體停止與急停
     void EmergencyStopGroup();//緊急停止
@@ -1794,6 +1929,83 @@ public:
     static constexpr std::size_t IDLE_HOLD_DIAGNOSTIC_DRAIN_BUDGET = 8U;
     bool TryPopIdleHoldDiagnostic(IdleHoldDiagnosticEvent& event) noexcept;
     std::uint32_t GetIdleHoldDiagnosticDroppedCount() const noexcept;
+
+    // DC: RT-only producer / existing HMI diagnostic-task consumer.
+    enum class CncP1Event : std::uint8_t
+    {
+        LOAD_EMPTY, LOAD_READY, PROMOTED, KEEP_STOP, LEAVE
+    };
+    enum class CncP1Reason : std::uint8_t
+    {
+        NONE, SCOPE, AUTHORITY, MAPPING, GEOMETRY, DIRECTION,
+        SPEED, CURRENT_DISTANCE, NEXT_DISTANCE, TERMINAL, OVERRIDE, QUEUE_EMPTY
+    };
+    struct CncP1Diagnostic
+    {
+        std::uint64_t runtimeTick = 0ULL;
+        std::uint64_t sequence = 0ULL;
+        MotionSegmentId segment = MOTION_SEGMENT_ID_INVALID;
+        MotionSegmentId nextSegment = MOTION_SEGMENT_ID_INVALID;
+        double commandVelocity = 0.0;
+        double endVelocity = 0.0;
+        double remainingPulse = 0.0;
+        double nextLengthPulse = 0.0;
+        MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
+        MotionOwnerGeneration generation = 0U;
+        std::int32_t sourcePC = -1;
+        std::int32_t nextSourcePC = -1;
+        std::uint32_t axisMask = 0U;
+        std::uint32_t queueDepth = 0U;
+        MotionOwner owner = MotionOwner::NONE;
+        CncP1Event event = CncP1Event::LOAD_EMPTY;
+        CncP1Reason reason = CncP1Reason::NONE;
+        bool tickValid = false;
+    };
+    static_assert(sizeof(CncP1Diagnostic) <= 112U &&
+        std::is_trivially_copyable<CncP1Diagnostic>::value,
+        "DC diagnostic record must remain bounded POD.");
+    static constexpr std::size_t CNC_P1_DIAGNOSTIC_CAPACITY = 32U;
+    static constexpr std::size_t CNC_P1_DIAGNOSTIC_DRAIN_BUDGET = 16U;
+    bool TryPopCncP1Diagnostic(CncP1Diagnostic& event) noexcept;
+    std::uint32_t GetCncP1DiagnosticDroppedCount() const noexcept;
+
+    // DF: per-command feed limits on the existing immutable opt-in and RT/HMI boundary.
+    enum class CncFeedPlanEvent : std::uint8_t { LOAD, EXTEND, KEEP_PLAN, LEAVE, BLEND_ENTER, PREFIX_FAST, PREFIX_BRAKE, PREFIX_AUTHORED };
+    enum class CncFeedPlanStop : std::uint8_t
+    {
+        QUEUE_END, HORIZON, SCOPE, AUTHORITY, MAPPING, DIRECTION, SPEED, SHORT_SEGMENT, LATE
+    };
+    struct CncFeedPlanDiagnostic
+    {
+        std::uint64_t runtimeTick = 0ULL, sequence = 0ULL;
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        MotionSegmentId lastSegment = 0ULL;
+        double commandVelocity = 0.0, outputVelocity = 0.0;
+        double endVelocity = 0.0, cruiseVelocity = 0.0, remainingPulse = 0.0;
+        double horizonPulse = 0.0, reservePulse = 0.0;
+        std::array<double, 4U> exitVelocity{};
+        std::array<double, 4U> nominalVelocity{};
+        std::array<double, 4U> limitedVelocity{};
+        double radiusPulse = 0.0;
+        // DJ/DK companion diagnostics: pulse distances and distinct prefix caps.
+        double prefixLengthPulse = 0.0, prefixRemainingPulse = 0.0;
+        double prefixLimitPPS = 0.0, prefixReservePulse = 0.0;
+        double authoredPrefixPPS = 0.0;
+        double entryCarry = 0.0;
+        MotionSegmentId handoffFrom = MOTION_SEGMENT_ID_INVALID;
+        std::uint32_t horizon = 0U, axisMask = 0U, circleMask = 0U, blendMask = 0U;
+        CncFeedPlanEvent event = CncFeedPlanEvent::LOAD;
+        CncFeedPlanStop stop = CncFeedPlanStop::QUEUE_END;
+        bool tickValid = false;
+    };
+    static constexpr std::size_t CNC_FEED_PLAN_CAPACITY = 32U;
+    static constexpr std::size_t CNC_FEED_PLAN_DRAIN_BUDGET = 16U;
+    // DK adds one 8-byte authored cap; capacity and drain budget stay fixed.
+    static_assert(sizeof(CncFeedPlanDiagnostic) <= 296U &&
+        std::is_trivially_copyable<CncFeedPlanDiagnostic>::value, "DK bounded diagnostic value.");
+    bool TryPopCncFeedPlanDiagnostic(CncFeedPlanDiagnostic& event) noexcept;
+    std::uint32_t GetCncFeedPlanDiagnosticDroppedCount() const noexcept;
 
     bool TryAcquireMotionOwner(
         MotionOwner requestedOwner,
@@ -1989,6 +2201,8 @@ public:
         std::uint64_t expectedProvenanceGeneration,
         bool requestResetAllFaults) noexcept;
 
+    // CQ_FIX1: read actual safety intent separately from a normal source epoch publication.
+    bool HasPendingSafetyIntent() const noexcept;
     bool HasPendingSafetyOrRecoveryRequests() const noexcept;
 
     std::size_t GetAxisCommandMailboxDepth() const noexcept
@@ -2395,6 +2609,21 @@ public:
     int GetPhysicalExecutionPlaneMode() const { return m_Group.currentExecutionPlaneMode; }
 
     // 🌟 4. 終極標籤機：現在一次貼 6 張標籤！
+    void SetNextCommandTranslation(const NCTranslationSnapshot& snapshot) noexcept
+    { m_pendingTranslation = snapshot; }
+    bool PublishNCTranslation(const NCTranslationSnapshot& snapshot) noexcept
+    { return m_translationPublication.Publish(snapshot); }
+    // NC writer only: replace the distance interpretation after exact RT drain.
+    // Geometry, run identity and the accepted native endpoint remain unchanged.
+    MotionNCTranslationTransitionResult TryTransitionNCTranslation(const NCTranslationSnapshot& previous,
+        const NCTranslationSnapshot& next, MotionExecutionEpoch executionEpoch,
+        const MotionOwnerLease& ownerLease) noexcept;
+    void RetireNCTranslation() noexcept { m_translationPublication.Retire(); }
+    bool MatchesNCTranslation(const NCTranslationSnapshot& snapshot) const noexcept
+    { return m_translationPublication.Matches(snapshot); }
+    std::uint64_t GetActiveTranslationGeneration() const noexcept
+    { return m_translationPublication.Generation(); }
+
     void SetNextCommandState(int pc, int wcs, int tLenMode, int hCode, int tRadMode, int dCode, bool isAbsMode, bool isG68, double g68Angle, bool isG168, int wCode, bool isG51, double scaleRatio, uint8_t mirrorMask, bool isG16, bool isG162, int planeMode) {
         m_pendingSourcePC = pc;
         m_pendingSourceWCS = wcs;
@@ -2482,6 +2711,8 @@ public:
     void SetPendingResetExecutionState(
         const MotionNCResetExecutionState& executionState) noexcept;
 
+
+    // Compatibility helper only: all three arguments must use the same unit.
     double CalculateShortestTarget(double currentPos, double targetPos, double modulo);
 
     // 🌟 消滅幽靈座標專用 API：將大腦預讀起點，強制同步為馬達當下真實位置
@@ -2512,6 +2743,7 @@ private:
         std::uint64_t generation = 0ULL;
         std::uint64_t settleSequence = 0ULL;
         std::uint64_t expectedTransitionSequence = 0ULL;
+        std::uint64_t translationGeneration = 0ULL;
         std::uint32_t cycleLimit = 1U;
         double lengthMM = 0.0, lengthPulse = 0.0, distanceMM = 0.0, feedMMMin = 0.0;
         double sourceFeedMMMin = 0.0, sourceVelocityPPS = 0.0;
@@ -2551,6 +2783,7 @@ private:
         bool unionActive = false, crossGeometryActive = false;
         bool prelaunchRejected = false; // zero-motion distance rejection owns a stationary source fence
     } m_pathHold{};
+    MotionCommand m_pathHoldAdmissionFront{}; // RT-only bounded queue-peek scratch.
     static constexpr std::size_t PATH_HOLD_WORD_COUNT =
         (sizeof(MotionPathCoreHoldExcursionSnapshot) + 7U) / 8U;
     struct PathCoreHoldAtomicBank
@@ -2569,13 +2802,20 @@ private:
     bool IsPathCoreHoldExcursionDriving() const noexcept;
     bool IsPathCoreHoldEffectiveMappingValid() const noexcept;
     bool ValidatePathCoreHoldCrossSource() const noexcept;
-    bool ExpandPathCoreHoldAxisUnion() noexcept;
+    bool ExpandPathCoreHoldAxisUnion(bool& waitForSettle) noexcept;
     void RestorePathCoreHoldAxisUnion() noexcept;
     bool BeginPathCoreHoldSpan(std::uint32_t ordinal, double startS, double targetS) noexcept;
     bool MapPathCoreHoldExcursionGeometry(const AxisCommand& command) noexcept;
     bool IsPathCoreHoldStrictlyStopped() const noexcept;
     bool IsPathCoreHoldSourceCurrent() const noexcept;
     bool ClosePathCoreHoldEndpoint(AxisCommand& command) noexcept;
+    bool IsPathCoreAdmissionWaitAxisHealthy(const AxisContext& axis) const noexcept;
+    void ResetPathCoreAdmissionCorrectionDiagnostic() noexcept;
+    MotionPathCoreAdmissionCorrectionDecision ResolvePathCoreAdmissionPositionCorrection(
+        AxisContext& axis, const AxisCommand& command,
+        const MotionServoInputSnapshot& input, double& velocityPPS) noexcept;
+    std::uint64_t m_pathAdmissionCorrectionFrameGeneration = 0ULL; // RT only.
+    std::uint32_t m_pathAdmissionCorrectionScopeMask = 0U; // Exact LoadNext admission members.
     void UpdatePathCoreHoldExcursionEvidence() noexcept;
     void PublishPathCoreHoldExcursionSnapshot() noexcept;
     void SetPathCoreHoldPhase(MotionPathCoreHoldExcursionPhase phase, std::uint32_t reason = 0U) noexcept;
@@ -3145,7 +3385,11 @@ private:
         MotionExecutionIdentity* producedIdentity,
         MotionOwnerLease* producedOwnerLease,
         MotionExecutionEpoch plannedTailEpoch,
-        const MotionOwnerLease* plannedTailOwnerLease) noexcept;
+        const MotionOwnerLease* plannedTailOwnerLease,
+        bool cncFeedLookahead = false,
+        const NCPathCoreRetainedGeometry* cncCorner = nullptr,
+        double cncPrefixVelocityPPS = 0.0,
+        bool pathCoreFeedExactStop = false) noexcept;
     bool TryG00MoveInternal(
         const std::vector<int>& axes,
         const std::vector<double>& targetPos,
@@ -3154,7 +3398,21 @@ private:
         double rapidOverrideCandidate,
         double* commandedMCSTail,
         bool transactionalTail,
-        MotionCommandedEndpointReceiptV1* commandedEndpointReceipt = nullptr);
+        MotionCommandedEndpointReceiptV1* commandedEndpointReceipt = nullptr,
+        bool requirePlanarBaselineMatch = false);
+    // RT-only natural completion for frozen planar or incremental NC lines.
+    bool IsFixedPlanarLineEndpointScope() const noexcept;
+    bool IsCncLineEndpointScope() const noexcept;
+    bool IsCncArcEndpointScope() const noexcept;
+    void InvalidateCncLineEndpointProof() noexcept;
+    bool HasCompletedCncLineEndpointProof(const MotionCommand& source,
+        const NCTranslationSnapshot& previous, MotionExecutionEpoch epoch) const noexcept;
+    bool TryCompleteFixedPlanarLineEndpoint(AxisCommand& command) noexcept;
+    // Producer-only native baseline proof for dependent endpoints; never reads feedback.
+    // The default mask preserves the accepted sparse planar endpoint proof.
+    bool IsPlanarEndpointBasisCurrent(const double* referenceMCS,
+        const std::array<double, 8U>& startPulse,
+        std::uint32_t validAxisMask, std::uint32_t requiredAxisMask = 3U) const noexcept;
     void ObserveCommandPathModeProducer(
         const MotionCommand& command,
         bool accepted) noexcept;
@@ -3195,6 +3453,11 @@ private:
     bool m_feedbackTrackedAccepted = false;
     bool m_feedbackTrackedStarted = false;
     bool m_feedbackTrackedTerminal = true;
+    // Shared queued LINEAR / ARC candidate is RT-local. NC reads only the
+    // atomic completion marker after exact drain, while a lifecycle reservation
+    // keeps currentCmd immutable. Existing names preserve the lifecycle seams.
+    MotionExecutionIdentity m_cncLineEndpointCandidate{};
+    std::atomic<MotionSegmentId> m_cncLineEndpointCompletedSegment{ MOTION_SEGMENT_ID_INVALID };
 
     std::atomic<std::uint64_t> m_motionFeedbackOverflowCount{ 0ULL };
     std::atomic<std::uint64_t> m_motionFeedbackProducerNoticeOverflowCount{ 0ULL };
@@ -3261,7 +3524,6 @@ private:
     MotionOwnerLease TryTakeSafetyMotionOwnerForTicket(
         std::uint32_t safetyRequestTicket) noexcept;
     bool HasUnacknowledgedSafetyMotionRequest() const noexcept;
-    bool HasPendingSafetyIntent() const noexcept;
     void TryAcknowledgeAppliedSafetyMotionRequests() noexcept;
     bool IsSafetyControlledStopAuthorized(
         int contextAxisSlot) const noexcept;
@@ -3313,6 +3575,11 @@ private:
     bool TryDequeueNextMotionCommand(MotionCommand& command) noexcept;
     bool TryRequeueMotionCommandFront(const MotionCommand& command) noexcept;
 
+    bool HasExactExecutionDrainAcknowledgementImpl(
+        MotionExecutionEpoch executionEpoch,
+        const MotionOwnerLease& ownerLease,
+        bool ownsCommitReservation) const noexcept;
+
     bool TryAcquireLifecycleCommitReservation(
         const MotionExecutionIdentity& execution,
         std::uint64_t& reservationToken) noexcept;
@@ -3354,6 +3621,41 @@ private:
     void DiscardStaleQueuedCommands();
     void ApplyPendingExecutionEpochChange();
 
+    NCTranslationSnapshot m_pendingTranslation{}; // NC producer only.
+    MotionNCTranslationPublication m_translationPublication{};
+    bool IsPendingCommandTranslationValid(MotionCommandSource source) const noexcept
+    {
+        if (source != MotionCommandSource::NC_MEMORY) return true;
+        if (IsNCTranslationSnapshotEmpty(m_pendingTranslation))
+            return m_pendingToolMode == 49 && !m_pendingG168Active && m_pendingWCode == 0 &&
+                !m_pendingG68Active && !m_pendingG51Active && m_pendingMirrorMask == 0U &&
+                GetActiveTranslationGeneration() == 0ULL;
+        return IsNCTranslationSourceAllowed(m_pendingSourceWCS, m_pendingTranslation) &&
+            (m_pendingIsAbsoluteMode ? 90 : 91) == m_pendingTranslation.distanceMode &&
+            m_pendingPlaneMode == 17 &&
+            IsNCTranslationToolModeAllowed(m_pendingToolMode, m_pendingTranslation) &&
+            m_pendingHCode == m_pendingTranslation.toolHCode &&
+            (m_pendingToolMode == 49 || !m_pendingG162Active) && m_pendingToolRadMode == 40 &&
+            IsNCTranslationRotationModeAllowed(m_pendingG68Active, m_pendingG68Angle,
+                m_pendingPlaneMode, m_pendingTranslation) &&
+            (!m_pendingG68Active || !m_pendingG162Active) &&
+            IsNCTranslationWorkModeAllowed(m_pendingG168Active, m_pendingWCode, m_pendingTranslation) &&
+            (!m_pendingG168Active || !m_pendingG162Active) &&
+            m_pendingG51Active == (m_pendingTranslation.scalingMode == 51) &&
+            std::memcmp(&m_pendingScaleRatio, &m_pendingTranslation.scalingFactor, sizeof(double)) == 0 &&
+            static_cast<std::uint32_t>(m_pendingMirrorMask) == m_pendingTranslation.mirrorMask &&
+            (!NCTranslationHasScaleMirror(m_pendingTranslation) || !m_pendingG162Active) &&
+            !m_pendingG16Active &&
+            MatchesNCTranslation(m_pendingTranslation);
+    }
+    bool IsPendingFixedTranslationSourceAllowed() const noexcept
+    {
+        return IsNCTranslationSnapshotEmpty(m_pendingTranslation) ?
+            (m_pendingSourceWCS == 54 && m_pendingToolMode == 49 && !m_pendingG168Active && m_pendingWCode == 0 &&
+                !m_pendingG68Active && !m_pendingG51Active && m_pendingMirrorMask == 0U &&
+                GetActiveTranslationGeneration() == 0ULL) :
+            IsPendingCommandTranslationValid(MotionCommandSource::NC_MEMORY);
+    }
     int m_pendingSourcePC = 0;
     int m_pendingSourceWCS = 54; // 預設 G54
 
@@ -3389,7 +3691,8 @@ private:
     // 執行 PID 運算、前饋控制以及安全 Lag 監控--------------------------------------------------------------------
     template <typename DriveType>
 
-    void Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd);
+    void Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd,
+        const MotionServoInputSnapshot& input);
     void DetermineActiveGainSet(AxisContext& axis); // 👈 必須要有這行宣告
 
     double PlanTrapezoidal(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
@@ -3433,6 +3736,7 @@ private:
         std::uint64_t ownerState = 0ULL;
         std::uint64_t executionPublication = 0ULL;
         std::uint64_t frameSafetyIntentState = 0ULL;
+        std::uint64_t admissionCorrectionGeneration = 0ULL;
         std::uint64_t alarmSafetyIntentState = 0ULL;
         std::uint64_t generation = 0ULL;
         std::uint32_t alarmUpdateCount = 0U;
@@ -3499,6 +3803,62 @@ private:
         IdleHoldDiagnosticReason reason = IdleHoldDiagnosticReason::NONE,
         int axisIndex = -1,
         MotionOwnerLease nextLease = MotionOwnerLease{}) noexcept;
+
+    struct CncP1LateJunction
+    {
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        MotionCommand successor{};
+        bool loaded = false;
+        bool pending = false;
+        FixedCapacitySpscRing<CncP1Diagnostic, CNC_P1_DIAGNOSTIC_CAPACITY> events{};
+        CncP1Diagnostic producerEvent{};
+        std::uint64_t sequence = 0ULL;
+        std::atomic<std::uint32_t> dropped{ 0U };
+    };
+    static_assert(sizeof(CncP1LateJunction) + sizeof(CncP1Diagnostic) +
+        sizeof(std::uint32_t) <= 8192U,
+        "DC total diagnostic/refresh workspace must not exceed 8 KiB.");
+    CncP1LateJunction m_cncP1Late{};
+    struct CncFeedLookahead
+    {
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        MotionCommand scratch{};
+        std::array<double, 4U> lengths{}, speeds{}, nominalSpeeds{}, accelerations{}, decelerations{};
+        std::array<double, 5U> boundaries{};
+        CncFeedPlanDiagnostic plan{}, event{};
+        double entryCarry = 0.0;
+        MotionSegmentId handoffFrom = MOTION_SEGMENT_ID_INVALID;
+        FixedCapacitySpscRing<CncFeedPlanDiagnostic, CNC_FEED_PLAN_CAPACITY> events{};
+        std::atomic<std::uint32_t> dropped{ 0U };
+        std::uint64_t sequence = 0ULL;
+        std::size_t observedDepth = (std::numeric_limits<std::size_t>::max)();
+        std::size_t zeroInputCycles = 0U;
+        bool loaded = false, blendEntered = false;
+        // RT-local DJ prefix schedule. It cannot relax the arc or source seam.
+        double prefixLength = 0.0, prefixLimit = 0.0, prefixReserve = 0.0;
+        double prefixPreviousRaw = 0.0;
+        bool prefixEnabled = false, prefixFastSeen = false, prefixBrakeSeen = false;
+        bool prefixAuthoredSeen = false;
+    };
+    static_assert(sizeof(CncFeedLookahead) <= 12288U, "DG RT-owned storage budget.");
+    CncFeedLookahead m_cncFeedLookahead{};
+    static bool BuildCncFeedStopPlan(const std::array<double, 4U>& length,
+        const std::array<double, 4U>& speed, const std::array<double, 4U>& acceleration,
+        const std::array<double, 4U>& deceleration, std::size_t count, double entry,
+        std::array<double, 5U>& boundary) noexcept;
+    void RefreshCncFeedLookahead(bool loading = false) noexcept;
+    void FinishCncFeedLookahead() noexcept;
+    void QueueCncFeedPlanDiagnostic(CncFeedPlanEvent event) noexcept;
+
+
+    bool IsCncP1LateJunctionScope() const noexcept;
+    void ArmCncP1LateJunction(bool nextVisible, const MotionCommand& next) noexcept;
+    void RefreshCncP1LateJunction() noexcept;
+    void FinishCncP1Diagnostic() noexcept;
+    void QueueCncP1Diagnostic(CncP1Event event, CncP1Reason reason,
+        const MotionCommand* next = nullptr, double nextLength = 0.0) noexcept;
 
     void InvalidateServoOutputImageProof() noexcept;
     bool ZeroAllServoTargetVelocityForFrame() noexcept;
@@ -3595,7 +3955,8 @@ public:
         MotionCommandPathMode commandPathMode,
         double rapidOverrideCandidate,
         double(&commandedMCSTail)[MAX_AXES],
-        MotionCommandedEndpointReceiptV1* commandedEndpointReceipt);
+        MotionCommandedEndpointReceiptV1* commandedEndpointReceipt,
+        bool requirePlanarBaselineMatch = false);
     // BX: G01 uses mm/min along the physical XYZ chord, exact-stop only.
     bool TryG01MoveTransactionalTail(
         const std::vector<int>& axes,
@@ -3603,6 +3964,35 @@ public:
         double feedMMMin,
         double(&commandedMCSTail)[MAX_AXES],
         MotionFeedLineWorkspace& workspace);
+    // DD: a non-null predecessor selects BUFFERED/EXACT_STOP, same tuple/mapping.
+    bool TryG01MoveTransactionalTail(
+        const std::vector<int>& axes,
+        const std::vector<double>& targetMCS,
+        double feedMMMin,
+        double(&commandedMCSTail)[MAX_AXES],
+        MotionFeedLineWorkspace& workspace,
+        const MotionFeedLineReceipt* predecessor);
+    // DE only: the selected DD route explicitly opts into the bounded RT planner.
+    bool TryG01MoveTransactionalTail(
+        const std::vector<int>& axes, const std::vector<double>& targetMCS,
+        double feedMMMin, double(&commandedMCSTail)[MAX_AXES],
+        MotionFeedLineWorkspace& workspace, const MotionFeedLineReceipt* predecessor,
+        bool cncFeedLookahead);
+    // DG: mixed LINE/ARC producer chain; the anchor has no synthetic line geometry.
+    bool TryG01MoveTransactionalCncTail(
+        const std::vector<int>& axes, const std::vector<double>& targetMCS,
+        double feedMMMin, double(&commandedMCSTail)[MAX_AXES],
+        MotionFeedLineWorkspace& workspace, const MotionCncPathTail* predecessor,
+        bool cncFeedLookahead,
+        const std::array<double, 8U>* cornerNextMCS = nullptr, double cornerToleranceMM = 0.0,
+        // DI: zero preserves the existing same-F caller; NC passes explicit next-row F.
+        const MotionArcTravelGuard* cornerTravelGuard = nullptr, double cornerNextFeedMMMin = 0.0,
+        // EG: 0 preserves explicit legacy axes; 1/2 retain the omitted planar endpoint.
+        std::uint32_t endpointAxisMask = 0U,
+        bool requirePlanarBaselineMatch = false);
+    bool IsCncPathProducerTailCurrent(const MotionCncPathTail& tail,
+        std::uint32_t mask, const double* commandedTail, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& owner, MotionCommandSource source) const noexcept;
     // BY: synchronous borrowed travel guard, caller-owned command scratch.
     bool TryG02G03MoveTransactionalTail(
         const std::array<double, 8U>& targetMCS,
@@ -3612,6 +4002,18 @@ public:
         double(&commandedMCSTail)[MAX_AXES],
         MotionFeedArcWorkspace& workspace,
         MotionCommand& commandWorkspace);
+
+    bool TryG02G03MoveTransactionalCncTail(
+        const std::array<double, 8U>& targetMCS,
+        const std::array<double, 2U>& centerOffsetMM,
+        int direction, bool fullCircle, double feedMMMin,
+        const MotionArcTravelGuard& travelGuard,
+        double(&commandedMCSTail)[MAX_AXES], MotionFeedArcWorkspace& workspace,
+        MotionCommand& commandWorkspace, const MotionCncPathTail* predecessor,
+        bool cncFeedLookahead,
+        // EF: endpoint-word presence, distinct from the physical XY arc mask.
+        std::uint32_t endpointAxisMask = 3U,
+        bool requirePlanarBaselineMatch = false);
 
     // BZ: evaluate the original canonical line/circle in either direction.
     bool TryPathCoreRetainedMoveTransactionalTail(

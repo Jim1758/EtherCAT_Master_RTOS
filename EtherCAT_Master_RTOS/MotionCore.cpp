@@ -231,7 +231,8 @@ namespace
     {
         const int lhsAxisCount = ClampMotionAxisCount(lhs.axisCount);
         const int rhsAxisCount = ClampMotionAxisCount(rhs.axisCount);
-        if (lhsAxisCount == 0 ||
+        if (!SameNCTranslationSnapshot(lhs.sourceTranslation, rhs.sourceTranslation) ||
+            lhsAxisCount == 0 ||
             lhsAxisCount != lhs.axisCount ||
             rhsAxisCount != rhs.axisCount ||
             lhsAxisCount != rhsAxisCount)
@@ -277,9 +278,9 @@ namespace
             return false;
         if (command.replayTerminalAlreadyPublished || command.mem_enableTransform ||
             command.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
-            command.sourceWCS != 54 || command.sourceToolLengthMode != 49 ||
+            !IsMotionFixedTranslationSourceAllowed(command) || !IsMotionFixedTranslationToolSourceAllowed(command) ||
             command.sourceToolRadiusMode != 40 || !command.sourceIsAbsoluteMode ||
-            command.sourceG68Active || command.sourceG168Active || command.sourceG51Active ||
+            !IsMotionFixedTranslationRotationSourceAllowed(command) || !IsMotionFixedTranslationWorkSourceAllowed(command) || command.sourceG51Active ||
             command.sourceMirrorMask != 0U || command.sourceG16Active || command.sourceG162Active ||
             command.sourcePlaneMode != 17 || command.targetVel < 0.0 ||
             command.accTime <= 0.0 || command.decTime <= 0.0 ||
@@ -408,10 +409,147 @@ namespace
         return true;
     }
 
+    // DG: the existing scalar planner uses a bounded planar circle.  Split
+    // its feed-derived acceleration budget between tangential and centripetal
+    // components.  No physical axis limit or configured timing is rewritten.
+    bool ComputeCncPathDynamics(const MotionCommand& command,
+        double& speed, double& acceleration, double& deceleration) noexcept
+    {
+        speed = command.targetVel;
+        acceleration = command.accTime < 0.0001 ? 1.0e10 : speed / command.accTime;
+        const double t = command.decTime < 0.0 ? command.accTime : command.decTime;
+        deceleration = t < 0.0001 ? 1.0e10 : speed / t;
+        if (!std::isfinite(speed) || speed < 1.0 ||
+            !std::isfinite(acceleration) || acceleration <= 0.0 ||
+            !std::isfinite(deceleration) || deceleration <= 0.0) return false;
+        if (command.pathCorePlanarCircle || command.cncCornerBlend)
+        {
+            if (!std::isfinite(command.startRadius) || command.startRadius <= 0.0) return false;
+            acceleration *= 0.5;
+            deceleration *= 0.5;
+            const double cap = std::sqrt((std::min)(acceleration, deceleration)) * std::sqrt(command.startRadius);
+            speed = (std::min)(speed, cap);
+        }
+        return std::isfinite(speed) && speed >= 1.0 && acceleration > 0.0 && deceleration > 0.0;
+    }
+
+    bool ResolveCncCornerBlend(const MotionCommand& c, double& prefix) noexcept
+    {
+        prefix = 0.0;
+        if (!c.cncCornerBlend || !c.cncFeedLookahead || c.mode != InterpolationMode::LINEAR ||
+            c.pathCorePlanarCircle || c.pathCoreFullCircle || c.pathCoreRetainedTraversal ||
+            c.pathCoreRetainedReverse || c.mem_enableTransform || c.axisCount != 2 ||
+            c.axisIndices[0] != 0 || c.axisIndices[1] != 1 || (c.dir != -1 && c.dir != 1) ||
+            !std::isfinite(c.mem_radius) || c.mem_radius <= 0.0 || c.startRadius != c.mem_radius || c.endRadius != c.mem_radius ||
+            !std::isfinite(c.mem_startAngle) || !std::isfinite(c.mem_totalAngle) ||
+            std::fabs(c.mem_totalAngle) < 0.0872664625997164 || std::fabs(c.mem_totalAngle) > 2.356194490192345 ||
+            (c.dir == 1) != (c.mem_totalAngle > 0.0) || !std::isfinite(c.mem_totalDist) || c.mem_totalDist <= 0.0 ||
+            c.mem_centerX != c.centerPos[0] || c.mem_centerY != c.centerPos[1]) return false;
+        prefix = std::hypot(c.mem_ratio[0] - c.mem_startPos[0], c.mem_ratio[1] - c.mem_startPos[1]);
+        if (!std::isfinite(prefix) || prefix <= 0.0) return false;
+        const double total = prefix + c.mem_radius * std::fabs(c.mem_totalAngle);
+        if (std::fabs(total - c.mem_totalDist) > 128.0 * std::numeric_limits<double>::epsilon() * (std::max)(1.0, total)) return false;
+        // DJ_FIX1: the shared radius/angle carry roundoff from both XY axes.
+        // Match the planar-circle resolver's two-coordinate scale instead of
+        // letting a near-zero endpoint erase the other axis's subtraction error.
+        // The 64-epsilon factor, exact stored entry, tangent, mapping, identity
+        // and source-seam checks remain unchanged; no packet value is modified.
+        double reconstructionScale = (std::max)(1.0, c.mem_radius);
+        for (unsigned i = 0U; i < 2U; ++i)
+        {
+            if (!std::isfinite(c.centerPos[i]) || !std::isfinite(c.targetPos[i]) ||
+                !std::isfinite(c.mem_ratio[i])) return false;
+            reconstructionScale = (std::max)(reconstructionScale,
+                (std::max)(std::fabs(c.mem_ratio[i]),
+                    (std::max)(std::fabs(c.centerPos[i]), std::fabs(c.targetPos[i]))));
+        }
+        for (unsigned i = 0U; i < 2U; ++i)
+        {
+            const double angle = c.mem_startAngle + c.mem_totalAngle;
+            const double tangent = i == 0U ? -double(c.dir) * std::sin(c.mem_startAngle) : double(c.dir) * std::cos(c.mem_startAngle);
+            const double expected = c.centerPos[i] + c.mem_radius * (i == 0U ? std::cos(angle) : std::sin(angle));
+            const double entry = c.centerPos[i] + c.mem_radius * (i == 0U ? std::cos(c.mem_startAngle) : std::sin(c.mem_startAngle));
+            if (!std::isfinite(c.mem_startPos[i]) || !std::isfinite(c.mem_ratio[i]) || !std::isfinite(expected) ||
+                !std::isfinite(c.targetPos[i]) || std::fabs(expected - c.targetPos[i]) > 64.0 * std::numeric_limits<double>::epsilon() * reconstructionScale ||
+                entry != c.mem_ratio[i] || std::fabs((entry - c.mem_startPos[i]) / prefix - tangent) > 1e-11) return false;
+        }
+        return true;
+    }
+
+    bool ResolveCncPlanarCircle(const MotionCommand& command, NCPathCoreArcPulseGeometry& circle) noexcept
+    {
+        // ED: full-circle closure is immutable packet geometry, including signed zero.
+        if (command.pathCoreFullCircle &&
+            (std::memcmp(&command.mem_startPos[0], &command.targetPos[0], sizeof(double)) != 0 ||
+                std::memcmp(&command.mem_startPos[1], &command.targetPos[1], sizeof(double)) != 0)) return false;
+        if (!command.cncFeedLookahead || !command.pathCorePlanarCircle ||
+            command.pathCoreRetainedTraversal || command.axisCount != 2 ||
+            command.axisIndices[0] != 0 || command.axisIndices[1] != 1 ||
+            !((command.mode == InterpolationMode::CIRCULAR_CCW && command.dir == 1) ||
+                (command.mode == InterpolationMode::CIRCULAR_CW && command.dir == -1)) ||
+            command.startRadius != command.endRadius || command.mem_radius != command.startRadius ||
+            !ResolveNCPathCorePlanarCirclePulse(command.mem_startPos[0], command.mem_startPos[1],
+                command.targetPos[0], command.targetPos[1], command.centerPos[0], command.centerPos[1],
+                command.startRadius, command.dir, command.pathCoreFullCircle, circle)) return false;
+        return command.mem_startAngle == circle.startAngle && command.mem_totalAngle == circle.sweepRadians &&
+            command.mem_totalDist == circle.lengthPulse;
+    }
+
+    bool CncCircleStartMatches(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts) noexcept
+    {
+        if (contexts == nullptr || contexts->size() < 2U) return false;
+        for (std::size_t i = 0U; i < 2U; ++i)
+        {
+            const auto& axis = (*contexts)[i];
+            const double actual = axis.logicalCmdPos.Load();
+            const double expected = command.mem_startPos[i];
+            const double ppm = axis.resolution_PPR / axis.finalLead;
+            const double scale = (std::max)(1.0, (std::max)(command.startRadius,
+                (std::max)(std::abs(command.centerPos[i]), (std::max)(std::abs(expected), std::abs(command.targetPos[i])))));
+            const double error = std::abs(actual - expected);
+            if (!std::isfinite(actual) || !std::isfinite(expected) || !std::isfinite(ppm) || ppm <= 0.0 ||
+                error > 64.0 * std::numeric_limits<double>::epsilon() * scale || error / ppm > 5e-8) return false;
+        }
+        return true;
+    }
+
     bool IsMotionCommandConsumerGeometryValid(
         const MotionCommand& command,
         const std::vector<AxisContext>* contexts) noexcept
     {
+        if (!IsNCTranslationSnapshotEmpty(command.sourceTranslation) &&
+            !IsMotionFixedTranslationSourceAllowed(command)) return false;
+        // DT records native exact-stop G01 provenance, not new Motion authority.
+        // Terminal history copies keep the marker; the runtime tail rule below
+        // excludes replay. Reject incompatible source geometry, not that copy.
+        if (command.pathCoreFeedExactStop &&
+            (command.mode != InterpolationMode::LINEAR ||
+                command.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+                command.axisCount < 1 || command.axisCount > 3 ||
+                command.cncFeedLookahead || command.cncCornerBlend ||
+                command.pathCorePlanarCircle || command.pathCoreFullCircle ||
+                command.pathCoreRetainedTraversal || command.pathCoreRetainedReverse ||
+                command.execution.source != MotionCommandSource::NC_MEMORY || command.ownerLease.owner != MotionOwner::AUTO ||
+                !IsMotionFixedTranslationRotationSourceAllowed(command) || !IsMotionFixedTranslationWorkSourceAllowed(command) ||
+                !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) || command.sourceG16Active || command.sourceG162Active ||
+                (!command.sourceIsAbsoluteMode && IsNCTranslationSnapshotEmpty(command.sourceTranslation)) ||
+                !IsMotionFixedTranslationSourceAllowed(command) || command.sourcePlaneMode != 17 ||
+                !IsMotionFixedTranslationToolSourceAllowed(command) || command.sourceToolRadiusMode != 40)) return false;
+
+        if (command.cncFeedLookahead &&
+            ((command.mode != InterpolationMode::LINEAR && !command.pathCorePlanarCircle) ||
+                command.axisCount < 1 || command.axisCount > 3 ||
+                command.commandPathMode != MotionCommandPathMode::CONTINUOUS ||
+                command.pathCoreRetainedTraversal || command.pathCoreRetainedReverse ||
+                (command.mode == InterpolationMode::LINEAR && command.pathCorePlanarCircle) ||
+                command.replayTerminalAlreadyPublished ||
+                command.execution.source != MotionCommandSource::NC_MEMORY || command.ownerLease.owner != MotionOwner::AUTO ||
+                !IsMotionFixedTranslationRotationSourceAllowed(command) || !IsMotionFixedTranslationWorkSourceAllowed(command) ||
+                !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) || command.sourceG16Active || command.sourceG162Active ||
+                !command.sourceIsAbsoluteMode || !IsMotionFixedTranslationSourceAllowed(command) || command.sourcePlaneMode != 17 ||
+                !IsMotionFixedTranslationToolSourceAllowed(command) || command.sourceToolRadiusMode != 40)) return false;
+
         if (contexts == nullptr ||
             command.axisCount <= 0 ||
             command.axisCount > MAX_AXES ||
@@ -436,13 +574,49 @@ namespace
         if (command.pathCorePlanarCircle &&
             (command.axisCount != 2 ||
                 command.axisIndices[0] != 0 || command.axisIndices[1] != 1 ||
-                command.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+                command.commandPathMode != (command.cncFeedLookahead ?
+                    MotionCommandPathMode::CONTINUOUS : MotionCommandPathMode::EXACT_STOP) ||
                 !std::isfinite(command.startRadius) || command.startRadius <= 0.0 ||
                 command.startRadius != command.endRadius ||
                 !((command.mode == InterpolationMode::CIRCULAR_CW && command.dir == -1) ||
                     (command.mode == InterpolationMode::CIRCULAR_CCW && command.dir == 1))))
         {
             return false;
+        }
+
+        // DK metadata is legal only on the existing qualified Q compound.
+        // Reject malformed transport; never silently clamp it into permission.
+        if (!std::isfinite(command.cncPrefixVelocityPPS) ||
+            (command.cncCornerBlend ?
+                (command.cncPrefixVelocityPPS != 0.0 && command.cncPrefixVelocityPPS < command.targetVel) :
+                command.cncPrefixVelocityPPS != 0.0)) return false;
+        if (command.cncCornerBlend && (!command.cncFeedLookahead || command.pathCorePlanarCircle)) return false;
+        if (command.cncFeedLookahead && command.mode == InterpolationMode::LINEAR && !command.cncCornerBlend &&
+            (command.dir != 0 || command.startRadius != 0.0 || command.endRadius != 0.0 ||
+                command.mem_radius != 0.0 || command.mem_totalAngle != 0.0)) return false;
+        if (command.cncFeedLookahead && (command.pathCorePlanarCircle || command.cncCornerBlend))
+        {
+            NCPathCoreArcPulseGeometry circle{};
+            double speed = 0.0, acc = 0.0, dec = 0.0;
+            double prefix = 0.0;
+            if (!(command.cncCornerBlend ? ResolveCncCornerBlend(command, prefix) : ResolveCncPlanarCircle(command, circle)) ||
+                !ComputeCncPathDynamics(command, speed, acc, dec)) return false;
+            double ppm = 0.0;
+            for (std::size_t i = 0U; i < 2U; ++i)
+            {
+                if (contexts->size() <= i) return false;
+                const auto& axis = (*contexts)[i];
+                const double next = axis.resolution_PPR / axis.finalLead;
+                if (!std::isfinite(next) || next <= 0.0 || (i != 0U && ppm != next) ||
+                    !std::isfinite(axis.maxVel_PPS) || command.targetVel > axis.maxVel_PPS) return false;
+                // The authored prefix uses the same native XY scalar metric.
+                // It may exceed packet min, never either live axis cap or F100.
+                if (command.cncPrefixVelocityPPS != 0.0 &&
+                    (command.cncPrefixVelocityPPS > axis.maxVel_PPS ||
+                        command.cncPrefixVelocityPPS / next > (100.0 / 60.0) *
+                            (1.0 + 16.0 * std::numeric_limits<double>::epsilon()))) return false;
+                ppm = next;
+            }
         }
 
         std::array<bool, MAX_AXES> seen{};
@@ -458,6 +632,9 @@ namespace
             {
                 return false;
             }
+            if ((command.cncFeedLookahead || command.pathCoreFeedExactStop ||
+                !IsNCTranslationSnapshotEmpty(command.sourceTranslation)) && (axisIndex > 2 ||
+                (*contexts)[axisIndex].axisType != AxisType::LINEAR)) return false;
             seen[static_cast<std::size_t>(axisIndex)] = true;
         }
 
@@ -1534,6 +1711,7 @@ void MotionCore::ApplyNCResetScalarRebase() noexcept
                 (transformAxis == transformComponent) ? 1.0 : 0.0;
         }
     }
+    InvalidateCncLineEndpointProof();
     m_Group.currentCmd = MotionCommand{};
     m_Group.jumpManager.state = JumpState::IDLE;
     m_Group.jumpManager.triggerPos = 0.0;
@@ -5643,6 +5821,7 @@ void MotionCore::AbortActiveExecutionForResetSafetyBatch() noexcept
         }
     }
 
+    InvalidateCncLineEndpointProof();
     m_Group.currentCmd.execution = MotionExecutionIdentity{};
     m_Group.currentCmd.ownerLease = MotionOwnerLease{};
 }
@@ -6193,9 +6372,10 @@ void MotionCore::DrainAxisCommandMailbox() noexcept
             const bool originalShortestPath = axis.useShortestPath;
             axis.useShortestPath =
                 (command.flags & MOTION_AXIS_COMMAND_FLAG_USE_SHORTEST_PATH) != 0U;
-            MoveToPosition(
+            applied = MoveToPosition(
                 axis, command.value0, command.value1, command.value2, command.value3);
             axis.useShortestPath = originalShortestPath;
+            if (!applied) rejectReason = MotionRejectReason::INVALID_GEOMETRY;
             break;
         }
 
@@ -6685,6 +6865,7 @@ void MotionCore::RecordProgramBlockMotionSubmission(
         m_programBlockMotionCapture.submissions[
             m_programBlockMotionCapture.count++];
     submission.identity = command.execution;
+    submission.translationGeneration = command.sourceTranslation.generation;
     submission.commandPathMode = command.commandPathMode;
     submission.producerAccepted = producerAccepted;
     submission.immediateRejectReason = immediateRejectReason;
@@ -6860,6 +7041,11 @@ static std::uint64_t FoldCommandPathModeTransportFingerprint(
         fingerprint,
         static_cast<std::uint64_t>(command.axisCount));
 
+    if (command.cncFeedLookahead)
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E434445ULL);
+    if (command.pathCoreFeedExactStop)
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E434454ULL);
+
     const int boundedAxisCount =
         (command.axisCount < 0)
         ? 0
@@ -6872,6 +7058,15 @@ static std::uint64_t FoldCommandPathModeTransportFingerprint(
             fingerprint,
             static_cast<std::uint64_t>(
                 static_cast<std::int64_t>(command.axisIndices[slot])));
+    }
+    if (command.cncCornerBlend)
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E434448ULL);
+    if (command.cncPrefixVelocityPPS != 0.0)
+    {
+        std::uint64_t prefixBits = 0ULL;
+        std::memcpy(&prefixBits, &command.cncPrefixVelocityPPS, sizeof(prefixBits));
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E43444BULL);
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, prefixBits);
     }
     return fingerprint;
 }
@@ -7399,6 +7594,19 @@ MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
         return MotionRejectReason::OWNER_CONFLICT;
     }
 
+    // A live fixed run requires its exact immutable descriptor on every MEMORY
+    // command. Manual/safety sources and unextended legacy G00 remain separate.
+    const bool emptyTranslation = IsNCTranslationSnapshotEmpty(command.sourceTranslation);
+    if ((!emptyTranslation && (command.execution.source != MotionCommandSource::NC_MEMORY ||
+            command.ownerLease.owner != MotionOwner::AUTO ||
+            !IsMotionFixedTranslationSourceAllowed(command) ||
+            !MatchesNCTranslation(command.sourceTranslation))) ||
+        (emptyTranslation && command.execution.source == MotionCommandSource::NC_MEMORY &&
+            (GetActiveTranslationGeneration() != 0ULL || command.sourceToolLengthMode != 49 ||
+                command.sourceG168Active || command.sourceWCode != 0 || command.sourceG68Active ||
+                command.sourceG51Active || command.sourceMirrorMask != 0U)))
+        return MotionRejectReason::NOT_READY;
+
     return MotionRejectReason::NONE;
 }
 
@@ -7595,6 +7803,7 @@ void MotionCore::TrackMotionCommandAccepted(
         AbortTrackedMotionCommand();
     }
 
+    InvalidateCncLineEndpointProof();
     m_feedbackTrackedIdentity =
         command.execution;
 
@@ -7648,19 +7857,25 @@ void MotionCore::CompleteTrackedMotionCommand(
         return;
     }
 
-    PublishMotionFeedbackForCommand(
+    const bool completedPublished = PublishMotionFeedbackForCommand(
         command,
         MotionFeedbackType::COMPLETED,
         MotionRejectReason::NONE,
         0U,
         1.0);
 
+    if (completedPublished &&
+        MotionExecutionIdentityExactlyMatches(m_feedbackTrackedIdentity, command.execution) &&
+        MotionExecutionIdentityExactlyMatches(m_cncLineEndpointCandidate, command.execution) &&
+        m_feedbackTrackedOwnerLease.Matches(command.ownerLease))
+        m_cncLineEndpointCompletedSegment.store(command.execution.segmentId, std::memory_order_release);
     m_feedbackTrackedTerminal = true;
 }
 
 
 void MotionCore::AbortTrackedMotionCommand() noexcept
 {
+    InvalidateCncLineEndpointProof();
     if (!m_feedbackTrackedAccepted ||
         m_feedbackTrackedTerminal ||
         !m_feedbackTrackedIdentity.IsAssigned())
@@ -7687,6 +7902,7 @@ void MotionCore::FaultTrackedMotionCommand(
     std::uint32_t errorCode,
     MotionRejectReason reason) noexcept
 {
+    InvalidateCncLineEndpointProof();
     if (!m_feedbackTrackedAccepted ||
         m_feedbackTrackedTerminal ||
         !m_feedbackTrackedIdentity.IsAssigned())
@@ -7744,6 +7960,7 @@ void MotionCore::RejectMotionCommand(
             m_feedbackTrackedIdentity,
             command.execution))
     {
+        InvalidateCncLineEndpointProof();
         // B2 may keep a replay copy of the currently tracked segment.  Once
         // an Epoch stop has terminated that identity, retiring the replay
         // transport copy must not publish a conflicting second terminal.
@@ -8385,6 +8602,7 @@ void MotionCore::ApplyPendingExecutionEpochChange()
 
     if (!m_Group.isActive)
     {
+        InvalidateCncLineEndpointProof();
         m_Group.currentCmd.execution =
             MotionExecutionIdentity{};
 
@@ -9769,6 +9987,8 @@ bool MotionCore::PublishServoOutputImageProof(
     proof.ownerState = ownerState;
     proof.executionPublication = executionPublication;
     proof.frameSafetyIntentState = frameSafetyIntentState;
+    proof.admissionCorrectionGeneration = mode == ServoOutputImageProofMode::NORMAL
+        ? m_pathAdmissionCorrectionFrameGeneration : 0ULL;
     proof.alarmSafetyIntentState = alarmSafetyIntentState;
     proof.alarmUpdateCount = alarmUpdateCount;
     proof.generation = ++m_servoOutputImageProofGeneration;
@@ -9913,6 +10133,9 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
     }
     else if (proof.mode == ServoOutputImageProofMode::NORMAL)
     {
+        if (proof.admissionCorrectionGeneration != 0ULL &&
+            proof.admissionCorrectionGeneration != m_pathHoldGeneration.load(std::memory_order_acquire))
+            return scrubAndInvalidate();
         const MotionOwnerLease lease =
             UnpackMotionOwnerState(baseOwnerState);
         if (lease.owner == MotionOwner::NONE ||
@@ -10018,6 +10241,10 @@ bool MotionCore::FinalizeServoOutputFrameAtSendPoint(
     if ((m_servoOutputImageProof.mode == ServoOutputImageProofMode::IDLE_HOLD &&
         !IsIdlePositionHoldImageCurrent(reservation.baseOwnerState,
             reservation.baseExecutionPublication)) ||
+        (m_servoOutputImageProof.mode == ServoOutputImageProofMode::NORMAL &&
+            m_servoOutputImageProof.admissionCorrectionGeneration != 0ULL &&
+            m_servoOutputImageProof.admissionCorrectionGeneration !=
+            m_pathHoldGeneration.load(std::memory_order_acquire)) ||
         m_motionOwnerState.load(std::memory_order_acquire) !=
         reservation.reservedOwnerState ||
         m_executionEpochPublication.load(
@@ -10111,6 +10338,7 @@ void MotionCore::EndServoOutputFrameAfterSend(
 // 檔案：MotionCore.cpp
 void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 {
+    m_pathAdmissionCorrectionFrameGeneration = 0ULL;
     InvalidateServoOutputImageProof();
     AlarmManager& motionAlarms = AlarmManager::GetInstance();
     const std::uint64_t imageEntryAlarmSafetyIntentState =
@@ -10543,6 +10771,10 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         }
     }
 
+    if (m_pathAdmissionCorrectionFrameGeneration != 0ULL &&
+        m_pathAdmissionCorrectionFrameGeneration != m_pathHoldGeneration.load(std::memory_order_acquire))
+        imageAuthorized = false;
+
     if (m_idlePositionHold.passRequested &&
         !IsIdlePositionHoldImageCurrent(imageExitOwnerState,
             imageExitExecutionPublication))
@@ -10760,6 +10992,8 @@ void MotionCore::UpdateServoState(
     }
 }
 
+// Compatibility utility: currentPos, targetPos and modulo must share one unit.
+// Motion pulse admission uses TryResolveMotionTargetPulse instead.
 double MotionCore::CalculateShortestTarget(double currentPos, double targetPos, double modulo)
 {
     // 防呆
@@ -10789,30 +11023,27 @@ double MotionCore::CalculateShortestTarget(double currentPos, double targetPos, 
     // 範例： 7696.0 + diff
     return currentPos + diff;
 }
-void MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time)
+bool MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time)
 {
 
-    // =========================================================
-    // 🌟 [新增] 旋轉軸最短路徑展開
-    // =========================================================
-    if (axis.axisType == AxisType::ROTARY && axis.useShortestPath)
+    // Resolve against the same start that the existing idle/error rebase uses.
+    // Validate first: failure must not alter any axis trajectory or position.
+    const bool rebaseStart = axis.state == MotionState::MotionState_IDLE ||
+        axis.state == MotionState::MotionState_ERROR;
+    const double motionStartPulse = rebaseStart ? axis.currentActPos : axis.currentCmdPos;
+    const bool rotaryShortestPath =
+        axis.axisType == AxisType::ROTARY && axis.useShortestPath;
+    double pulsePerUnit = 1.0;
+    if (!std::isfinite(targetVel) || !std::isfinite(acc_time) ||
+        !std::isfinite(dec_time) || !std::isfinite(axis.maxVel_PPS) ||
+        axis.maxVel_PPS <= 0.0 ||
+        (rotaryShortestPath && !TryGetMotionPulsePerUnit(
+            axis.resolution_PPR, axis.finalLead, true, pulsePerUnit)) ||
+        !TryResolveMotionTargetPulse(motionStartPulse, targetPos, pulsePerUnit,
+            rotaryShortestPath, axis.rotaryModulo, targetPos))
     {
-        // 將指令的目標度數 (例如 10度)，依據現在的絕對度數 (例如 350度)
-        // 轉換為真實要走的物理連續度數 (變成 370度，往前走 20度)
-        targetPos = CalculateShortestTarget(axis.currentCmdPos, targetPos, axis.rotaryModulo);
-    }
-
-
-    // =========================================================
-    //  1. 【起跑線對齊 (Bumpless Transfer)】
-    // 防止 PID 瞬間爆衝，消除高達上億的 Lag Error！
-    // =========================================================
-    if (axis.state == MotionState::MotionState_IDLE ||
-        axis.state == MotionState::MotionState_ERROR)
-    {
-        axis.currentCmdPos = axis.currentActPos;
-        axis.logicalCmdPos = axis.currentActPos; // 🟢 同步起跑線
-        axis.currentCmdVel = 0.0;
+        AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID, 0, axis.axisIndex);
+        return false;
     }
 
     // =========================================================
@@ -10830,7 +11061,7 @@ void MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targ
     //  3. 【儲存原始指令速度】
     // 把它鎖進保險箱，供 UpdateMotion 乘上進給倍率 (Feedrate Override)
     // =========================================================
-    axis.programmedVel_PPS = targetVel;
+    // Commit this value only after derived acceleration validation below.
 
     // =========================================================
  //  4. 【計算真實加減速度 (PPS^2)】
@@ -10887,6 +11118,19 @@ void MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targ
         calc_dec = 10000.0;
     }
 
+    if (!std::isfinite(calc_acc) || !std::isfinite(calc_dec))
+    {
+        AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID, 0, axis.axisIndex);
+        return false;
+    }
+    if (rebaseStart)
+    {
+        axis.currentCmdPos = motionStartPulse;
+        axis.logicalCmdPos = motionStartPulse;
+        axis.currentCmdVel = 0.0;
+    }
+    axis.programmedVel_PPS = targetVel;
+
     // =========================================================
     //  5. 【設定運動參數給軌跡規劃器】
     // =========================================================
@@ -10917,6 +11161,7 @@ void MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targ
     axis.state = MotionState::MotionState_MOVING;
     axis.inPosition = false;
     axis.isFault = false;
+    return true;
 }
 
 void MotionCore::VelocityMove(AxisContext& axis, double velocity, double acc_time)
@@ -11754,6 +11999,263 @@ void MotionCore::ResetAllFaultsImpl(
         m_Group.jumpManager.jumpVel = 0.0;
     }
 }
+void MotionCore::InvalidateCncLineEndpointProof() noexcept
+{
+    m_cncLineEndpointCandidate = MotionExecutionIdentity{};
+    m_cncLineEndpointCompletedSegment.store(MOTION_SEGMENT_ID_INVALID, std::memory_order_release);
+}
+
+// Runtime-only scope for the G90 queued LINEAR terminal, including fixed XY rotation.
+// A tangent ARC/blend predecessor may transfer a sub-cycle distance into the
+// original loaded line frame. Only the stopped natural terminal can prove it.
+bool MotionCore::IsCncLineEndpointScope() const noexcept
+{
+    const MotionCommand& source = m_Group.currentCmd;
+    const auto& lookahead = m_cncFeedLookahead;
+    if (!source.cncFeedLookahead || source.mode != InterpolationMode::LINEAR ||
+        source.commandPathMode != MotionCommandPathMode::CONTINUOUS ||
+        m_Group.pathMode != PathMode::CONTINUOUS ||
+        source.sourceTranslation.distanceMode != 90 || !source.sourceIsAbsoluteMode ||
+        source.sourceG162Active || !IsMotionFixedTranslationSourceAllowed(source) ||
+        !lookahead.loaded || lookahead.blendEntered || source.cncCornerBlend ||
+        m_Group.virtualAxis.targetEndVel != 0.0 ||
+        !MotionExecutionIdentityExactlyMatches(lookahead.identity, source.execution) ||
+        !lookahead.lease.Matches(source.ownerLease) ||
+        !std::isfinite(lookahead.entryCarry) || lookahead.entryCarry < 0.0 ||
+        !IsMotionCommandConsumerGeometryValid(source, m_pContexts)) return false;
+    if (lookahead.handoffFrom == MOTION_SEGMENT_ID_INVALID)
+    {
+        if (lookahead.entryCarry != 0.0) return false;
+    }
+    else if (lookahead.handoffFrom == (std::numeric_limits<MotionSegmentId>::max)() ||
+        source.execution.segmentId != lookahead.handoffFrom + 1ULL)
+        return false;
+
+    // The LINEAR loader uses the predecessor's immutable native endpoint for a
+    // carried start. Unlike ARC packets, LINEAR mem_* is not a canonical frame.
+    // Rebuild its original length in the loader's hypot order; do not infer
+    // completion from the virtual finalTargetPos overwritten on entering IDLE.
+    if (lookahead.entryCarry != 0.0)
+    {
+        if (m_Group.mode != source.mode || m_Group.axisCount != source.axisCount)
+            return false;
+        double distance = 0.0;
+        for (int slot = 0; slot < source.axisCount; ++slot)
+        {
+            const double delta = source.targetPos[slot] - m_Group.startPos[slot];
+            if (m_Group.axisIndices[slot] != source.axisIndices[slot] ||
+                !std::isfinite(m_Group.startPos[slot]) || !std::isfinite(delta)) return false;
+            distance = std::hypot(distance, delta);
+        }
+        if (!std::isfinite(distance) || lookahead.entryCarry >= distance) return false;
+    }
+    return true;
+}
+
+// A queued circle retains its original canonical native frame even when its
+// first RT sample carries distance from a tangent predecessor. Only its stopped
+// natural terminal may establish the endpoint proof; a nonzero exit cannot.
+bool MotionCore::IsCncArcEndpointScope() const noexcept
+{
+    const MotionCommand& source = m_Group.currentCmd;
+    const auto& lookahead = m_cncFeedLookahead;
+    NCPathCoreArcPulseGeometry circle{};
+    if (!source.cncFeedLookahead || !source.pathCorePlanarCircle ||
+        source.cncCornerBlend || source.commandPathMode != MotionCommandPathMode::CONTINUOUS ||
+        m_Group.pathMode != PathMode::CONTINUOUS ||
+        source.sourceTranslation.distanceMode != 90 || !source.sourceIsAbsoluteMode ||
+        !lookahead.loaded || lookahead.blendEntered ||
+        !MotionExecutionIdentityExactlyMatches(lookahead.identity, source.execution) ||
+        !lookahead.lease.Matches(source.ownerLease) ||
+        m_Group.virtualAxis.targetEndVel != 0.0 ||
+        !std::isfinite(lookahead.entryCarry) || lookahead.entryCarry < 0.0 ||
+        !IsMotionCommandConsumerGeometryValid(source, m_pContexts) ||
+        !ResolveCncPlanarCircle(source, circle) || lookahead.entryCarry >= circle.lengthPulse)
+        return false;
+    if (lookahead.handoffFrom == MOTION_SEGMENT_ID_INVALID)
+    {
+        if (lookahead.entryCarry != 0.0) return false;
+    }
+    else if (lookahead.handoffFrom == (std::numeric_limits<MotionSegmentId>::max)() ||
+        source.execution.segmentId != lookahead.handoffFrom + 1ULL)
+        return false;
+    return m_Group.mode == source.mode && m_Group.axisCount == 2 &&
+        m_Group.axisIndices[0] == 0 && m_Group.axisIndices[1] == 1 &&
+        std::memcmp(m_Group.startPos, source.mem_startPos, 2U * sizeof(double)) == 0 &&
+        m_Group.centerX == source.centerPos[0] && m_Group.centerY == source.centerPos[1] &&
+        m_Group.radius == circle.radius && m_Group.startAngle == circle.startAngle &&
+        m_Group.totalAngle == circle.sweepRadians && m_Group.totalDist3D == circle.lengthPulse;
+}
+
+// Called only with the exact RT drain acknowledgement and lifecycle reservation.
+// currentCmd is then stable. The marker belongs to that immutable packet: every
+// command replacement invalidates it BEFORE replacing any part of the packet.
+bool MotionCore::HasCompletedCncLineEndpointProof(const MotionCommand& source,
+    const NCTranslationSnapshot& previous, MotionExecutionEpoch epoch) const noexcept
+{
+    NCPathCoreArcPulseGeometry circle{};
+    const bool queuedLine = source.mode == InterpolationMode::LINEAR &&
+        !source.pathCorePlanarCircle && !source.pathCoreFullCircle &&
+        IsMotionCommandConsumerGeometryValid(source, m_pContexts);
+    const bool queuedArc = source.pathCorePlanarCircle &&
+        (source.mode == InterpolationMode::CIRCULAR_CW || source.mode == InterpolationMode::CIRCULAR_CCW) &&
+        IsMotionCommandConsumerGeometryValid(source, m_pContexts) && ResolveCncPlanarCircle(source, circle);
+    if (!source.execution.IsAssigned() || source.execution.epoch != epoch ||
+        source.execution.source != MotionCommandSource::NC_MEMORY ||
+        !source.ownerLease.IsValid() || source.ownerLease.owner != MotionOwner::AUTO ||
+        m_cncLineEndpointCompletedSegment.load(std::memory_order_acquire) != source.execution.segmentId ||
+        !source.cncFeedLookahead || (!queuedLine && !queuedArc) ||
+        source.commandPathMode != MotionCommandPathMode::CONTINUOUS ||
+        source.axisCount < 1 || source.axisCount > 3 || source.cncCornerBlend ||
+        source.pathCoreRetainedTraversal ||
+        source.pathCoreRetainedReverse || source.replayTerminalAlreadyPublished ||
+        !IsNCTranslationSnapshotValid(source.sourceTranslation) ||
+        source.sourceTranslation.distanceMode != 90 ||
+        source.sourceTranslation.generation > previous.generation ||
+        source.sourceTranslation.revision > previous.revision ||
+        previous.generation - source.sourceTranslation.generation !=
+            previous.revision - source.sourceTranslation.revision) return false;
+    NCTranslationSnapshot expected = source.sourceTranslation;
+    // Standalone units/distance/WCS/H/G68/WORK/scale/mirror selections preserve the accepted native endpoint.
+    // The old immutable packet still owns its completion marker. Only these
+    // selected-frame fields may differ; EXT remains frozen.
+    // The original queued packet must be G90; fixed rotation requires canonical XY geometry.
+    expected.distanceMode = previous.distanceMode;
+    expected.unitsMode = previous.unitsMode;
+    expected.wcsCode = previous.wcsCode;
+    std::memcpy(expected.wcsOffsetMM, previous.wcsOffsetMM, sizeof(expected.wcsOffsetMM));
+    expected.toolLengthMode = previous.toolLengthMode;
+    expected.toolHCode = previous.toolHCode;
+    std::memcpy(expected.toolOffsetMM, previous.toolOffsetMM, sizeof(expected.toolOffsetMM));
+    expected.rotationMode = previous.rotationMode;
+    expected.rotationPlane = previous.rotationPlane;
+    std::memcpy(expected.rotationCenterMM, previous.rotationCenterMM, sizeof(expected.rotationCenterMM));
+    expected.rotationAngleDeg = previous.rotationAngleDeg;
+    expected.workMode = previous.workMode;
+    expected.workWCode = previous.workWCode;
+    std::memcpy(expected.workOffset, previous.workOffset, sizeof(expected.workOffset));
+    std::memcpy(expected.workRotationCenterMM, previous.workRotationCenterMM,
+        sizeof(expected.workRotationCenterMM));
+    expected.scalingMode = previous.scalingMode;
+    expected.scalingFactor = previous.scalingFactor;
+    std::memcpy(expected.scalingCenterMM, previous.scalingCenterMM, sizeof(expected.scalingCenterMM));
+    expected.mirrorMask = previous.mirrorMask;
+    std::memcpy(expected.mirrorCenterMM, previous.mirrorCenterMM, sizeof(expected.mirrorCenterMM));
+    expected.generation = previous.generation;
+    expected.revision = previous.revision;
+    return SameNCTranslationSnapshot(expected, previous);
+}
+
+// Fixed XYZ NC lines must finish on the same native target bits their producer
+// committed, including G90 before a later G91 distance-mode handoff. This scope
+// excludes replay/EDM and accepts only the separately proved queued LINEAR scope.
+bool MotionCore::IsFixedPlanarLineEndpointScope() const noexcept
+{
+    const MotionCommand& source = m_Group.currentCmd;
+    if (m_pContexts == nullptr || !m_Group.isActive ||
+        m_Group.mode != InterpolationMode::LINEAR || source.mode != InterpolationMode::LINEAR ||
+        (!IsCncLineEndpointScope() &&
+            (source.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+                m_Group.pathMode != PathMode::EXACT_STOP || source.cncFeedLookahead)) ||
+        source.axisCount < 1 || source.axisCount > 3 || source.axisCount != m_Group.axisCount ||
+        !source.execution.IsAssigned() || source.execution.source != MotionCommandSource::NC_MEMORY ||
+        !source.ownerLease.IsValid() || source.ownerLease.owner != MotionOwner::AUTO ||
+        !IsNCTranslationSnapshotValid(source.sourceTranslation) ||
+        source.cncCornerBlend || source.pathCorePlanarCircle ||
+        source.pathCoreFullCircle || source.pathCoreRetainedTraversal || source.pathCoreRetainedReverse ||
+        source.replayTerminalAlreadyPublished || m_Group.enableHistory || m_Group.enableTransform ||
+        m_Group.jumpManager.state != JumpState::IDLE || m_pathHold.sourceSeen ||
+        m_safetyControlledStopInProgress || IsPathCoreHoldExcursionDriving()) return false;
+    unsigned mask = 0U;
+    for (int slot = 0; slot < source.axisCount; ++slot)
+    {
+        const int axis = source.axisIndices[slot];
+        if (axis < 0 || axis > 2 || static_cast<std::size_t>(axis) >= m_pContexts->size() ||
+            m_Group.axisIndices[slot] != axis || (mask & (1U << axis)) != 0U ||
+            !(*m_pContexts)[axis].isExist || (*m_pContexts)[axis].axisType != AxisType::LINEAR) return false;
+        mask |= 1U << axis;
+    }
+    return true;
+}
+
+bool MotionCore::TryCompleteFixedPlanarLineEndpoint(AxisCommand& command) noexcept
+{
+    AxisContext& virtualAxis = m_Group.virtualAxis;
+    const MotionCommand& source = m_Group.currentCmd;
+    if (!IsFixedPlanarLineEndpointScope() || virtualAxis.state != MotionState::MotionState_IDLE)
+        return false;
+    if (HasPendingSafetyOrRecoveryRequests() ||
+        GetCommandAuthorizationFailure(source) != MotionRejectReason::NONE) return false;
+    LifecycleCommitReservationGuard endpointCommit(*this, source.execution);
+    if (!endpointCommit.IsAcquired() || HasPendingSafetyOrRecoveryRequests() ||
+        GetCommandAuthorizationFailure(source) != MotionRejectReason::NONE) return false;
+
+    // IDLE canonicalization overwrites finalTargetPos with currentCmdPos.
+    // Rebuild the ORIGINAL loaded length from its unchanged start and packet
+    // targets, using exactly the LoadNextCommand hypot order. Never trust that
+    // overwritten scalar as proof of reaching the program endpoint.
+    double distance = 0.0;
+    bool valid = virtualAxis.isVirtualAxis && virtualAxis.inPosition &&
+        !virtualAxis.isFault && !virtualAxis.isLagAlarm &&
+        std::isfinite(command.instantCmdPos) && std::isfinite(command.instantCmdVel) &&
+        virtualAxis.currentCmdPos == command.instantCmdPos &&
+        virtualAxis.planningPos == virtualAxis.currentCmdPos &&
+        virtualAxis.finalTargetPos == virtualAxis.currentCmdPos &&
+        virtualAxis.currentCmdVel == 0.0 && virtualAxis.logicalCmdVel == 0.0 &&
+        virtualAxis.targetVelocity == 0.0 && virtualAxis.targetEndVel == 0.0 &&
+        command.instantCmdVel == 0.0 && virtualAxis.bufferSum == 0.0 &&
+        std::all_of(virtualAxis.velBuffer.begin(), virtualAxis.velBuffer.end(),
+            [](double velocity) { return velocity == 0.0; });
+    for (int slot = 0; valid && slot < source.axisCount; ++slot)
+    {
+        const double delta = source.targetPos[slot] - m_Group.startPos[slot];
+        valid = std::isfinite(source.targetPos[slot]) && std::isfinite(m_Group.startPos[slot]) &&
+            std::isfinite(delta) && std::isfinite(m_Group.ratio[slot]);
+        distance = std::hypot(distance, delta);
+        valid = valid && std::isfinite(distance);
+    }
+    const double error = std::abs(distance - command.instantCmdPos);
+    // Same finite relative/physical rounding limits as the existing EC arc
+    // completion. This closes numerical residue only, never a partial stop.
+    valid = valid && std::isfinite(error) && error <= 1e-12 * distance;
+    for (int slot = 0; valid && slot < source.axisCount; ++slot)
+    {
+        const AxisContext& axis = (*m_pContexts)[source.axisIndices[slot]];
+        const double delta = source.targetPos[slot] - m_Group.startPos[slot];
+        const double mapped = m_Group.startPos[slot] + command.instantCmdPos * m_Group.ratio[slot];
+        const double pulsePerMM = axis.resolution_PPR / axis.finalLead;
+        const double scalarErrorMM = error / pulsePerMM;
+        const double axisErrorMM = std::abs(source.targetPos[slot] - mapped) / pulsePerMM;
+        valid = !axis.isFault && !axis.isLagAlarm &&
+            std::isfinite(axis.resolution_PPR) && axis.resolution_PPR > 0.0 &&
+            std::isfinite(axis.finalLead) && axis.finalLead > 0.0 &&
+            std::isfinite(pulsePerMM) && pulsePerMM > 0.0 && std::isfinite(mapped) &&
+            (distance > 0.0 ? m_Group.ratio[slot] == delta / distance : delta == 0.0) &&
+            std::isfinite(scalarErrorMM) && scalarErrorMM <= 5e-8 &&
+            std::isfinite(axisErrorMM) && axisErrorMM <= 5e-8;
+    }
+    if (!valid)
+    {
+        endpointCommit.Release();
+        TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return false;
+    }
+    // All axes and the complete lifecycle tuple passed before the first write.
+    virtualAxis.currentCmdPos = distance;
+    virtualAxis.planningPos = distance;
+    virtualAxis.finalTargetPos = distance;
+    command.instantCmdPos = distance;
+    for (int slot = 0; slot < source.axisCount; ++slot)
+    {
+        AxisContext& axis = (*m_pContexts)[source.axisIndices[slot]];
+        axis.logicalCmdPos = source.targetPos[slot];
+        axis.logicalCmdVel = 0.0;
+    }
+    if (source.cncFeedLookahead)
+        m_cncLineEndpointCandidate = source.execution;
+    return true;
+}
+
 void MotionCore::Calc_Trajectory_Trapezoidal(
     AxisContext& axis,
     AxisCommand& outCmd)
@@ -11795,6 +12297,23 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // 規劃器是否已經到最後一個 Cycle
     bool isPlanDone = (planDist <= stepDist) || (planDist < 0.001);
 
+    // DR: the sub-pulse endpoint shortcut must not create a raw CNC
+    // velocity above the active cruise/curve ceiling. Keep the existing
+    // step-reachable and nonzero-seam cases; defer only an over-limit
+    // tolerance snap to the normal acceleration/deceleration planner.
+    if (planDist < 0.001 && planDist > stepDist &&
+        axis.isVirtualAxis && &axis == &m_Group.virtualAxis && m_Group.isActive &&
+        m_Group.currentCmd.cncFeedLookahead &&
+        m_Group.pathMode == PathMode::CONTINUOUS &&
+        !m_Group.enableHistory && !m_Group.enableTransform &&
+        m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
+        !m_safetyControlledStopInProgress && !IsPathCoreHoldExcursionDriving() &&
+        std::abs(axis.targetEndVel) <= 0.1 &&
+        planDist / dt > (std::max)(0.0, axis.cruiseVel_PPS))
+    {
+        isPlanDone = false;
+    }
+
 
     // =========================================================
     // 2. 規劃終點處理
@@ -11810,7 +12329,17 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // -----------------------------------------------------
         if (std::abs(axis.targetEndVel) > 0.1)
         {
-            axis.currentCmdVel = dir * std::abs(axis.targetEndVel);
+            if (axis.isVirtualAxis && &axis == &m_Group.virtualAxis &&
+                m_Group.currentCmd.cncFeedLookahead && !m_safetyControlledStopInProgress)
+            {
+                // DE never jumps to an endpoint speed or re-accelerates through HOLD.
+                const double target = (std::min)(std::abs(axis.targetEndVel), axis.cruiseVel_PPS);
+                const double old = std::abs(axis.currentCmdVel);
+                const double next = old > target ? (std::max)(target, old - axis.dec_PPS2 * dt) :
+                    (std::min)(target, old + axis.acc_PPS2 * dt);
+                axis.currentCmdVel = dir * next;
+            }
+            else axis.currentCmdVel = dir * std::abs(axis.targetEndVel);
         }
 
         // -----------------------------------------------------
@@ -11833,6 +12362,34 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // 最大巡航速度
         // -----------------------------------------------------
         double max_v = axis.cruiseVel_PPS;
+
+        const auto& prefix = m_cncFeedLookahead;
+        const bool djPrefix = axis.isVirtualAxis && &axis == &m_Group.virtualAxis &&
+            prefix.loaded && prefix.prefixEnabled && m_Group.currentCmd.cncCornerBlend &&
+            MotionExecutionIdentityExactlyMatches(prefix.identity, m_Group.currentCmd.execution) &&
+            prefix.lease.Matches(m_Group.currentCmd.ownerLease) &&
+            !m_safetyControlledStopInProgress && !HasPendingExecutionEpochChange() &&
+            !HasPendingSafetyOrRecoveryRequests() &&
+            GetCommandAuthorizationFailure(m_Group.currentCmd) == MotionRejectReason::NONE &&
+            m_Group.pathMode == PathMode::CONTINUOUS && !m_Group.enableHistory && !m_Group.enableTransform &&
+            m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen && !IsPathCoreHoldExcursionDriving();
+        if (djPrefix)
+        {
+            // Bound against BOTH raw and filtered progress. A full peak-speed
+            // filter window is consumed at arc speed before the true arc entry.
+            const double position = (std::max)(axis.planningPos, axis.currentCmdPos);
+            const double distance = (std::max)(0.0, prefix.prefixLength - position - prefix.prefixReserve);
+            const double ddt = axis.dec_PPS2 * dt;
+            const double square = axis.maxVel_PPS * axis.maxVel_PPS +
+                2.0 * axis.dec_PPS2 * distance + ddt * ddt;
+            if (std::isfinite(position) && std::isfinite(square) && square >= 0.0 &&
+                std::isfinite(m_Group.feedrateOverride))
+            {
+                const double allowed = (std::max)(axis.maxVel_PPS, std::sqrt(square) - ddt);
+                const double overrideValue = (std::max)(0.0, (std::min)(1.0, m_Group.feedrateOverride));
+                max_v = (std::min)(prefix.prefixLimit, allowed) * overrideValue;
+            }
+        }
 
         if (max_v < 0.0)
         {
@@ -11862,7 +12419,18 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         //
         // v² = u² + 2as
         // -----------------------------------------------------
-        double max_allowable_vel = std::sqrt(v_end * v_end + 2.0 * dec * planDist);
+        double brakingDistance = planDist;
+        if (axis.isVirtualAxis && &axis == &m_Group.virtualAxis &&
+            m_Group.currentCmd.cncFeedLookahead && !m_safetyControlledStopInProgress && v_end > 0.1)
+        {
+            // DE reserves a full inherited velocity-filter window before a
+            // nonzero seam. The filtered output must not overtake a raw
+            // deceleration that was planned only against the geometric end.
+            const double reserve = djPrefix ? prefix.prefixReserve :
+                axis.maxVel_PPS * dt * (double(axis.velBuffer.size()) + 4.0);
+            brakingDistance = (std::max)(0.0, planDist - reserve);
+        }
+        double max_allowable_vel = std::sqrt(v_end * v_end + 2.0 * dec * brakingDistance);
 
 
         if (max_allowable_vel > max_v)
@@ -12017,6 +12585,20 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         axis.bufferSum += axis.currentCmdVel;
         axis.bufferIndex = (axis.bufferIndex + 1) % (int)axis.velBuffer.size();
         finalOutputVel = axis.bufferSum / (double)axis.velBuffer.size();
+        if (axis.isVirtualAxis && &axis == &m_Group.virtualAxis &&
+            m_Group.currentCmd.cncFeedLookahead && !m_safetyControlledStopInProgress)
+        {
+            auto& zero = m_cncFeedLookahead.zeroInputCycles;
+            if (axis.currentCmdVel != 0.0) zero = 0U;
+            else if (zero < axis.velBuffer.size()) ++zero;
+            if (zero >= axis.velBuffer.size())
+            {
+                // Every slot has really received zero; remove only accumulated
+                // floating-sum residue, without scanning or snapping position.
+                axis.bufferSum = 0.0;
+                finalOutputVel = 0.0;
+            }
+        }
     }
 
 
@@ -12110,14 +12692,72 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     if (isStopping)
     {
         isHandoverReady = (isPlanDone && isBufferDry);
+        // DT and fixed XYZ NC lines: the sub-PPS FIR tail is still
+        // motion, including G90 ordinary G00 before G91. Drain it before IDLE can
+        // erase the final samples and invalidate the next sparse endpoint.
+        const MotionCommand& dtCommand = m_Group.currentCmd;
+        const bool dtFeedTail = isHandoverReady && axis.isVirtualAxis &&
+            &axis == &m_Group.virtualAxis && m_Group.isActive &&
+            (dtCommand.pathCoreFeedExactStop || IsFixedPlanarLineEndpointScope()) &&
+            dtCommand.mode == InterpolationMode::LINEAR &&
+            dtCommand.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+            m_Group.pathMode == PathMode::EXACT_STOP &&
+            !dtCommand.cncFeedLookahead && !dtCommand.cncCornerBlend &&
+            !dtCommand.pathCorePlanarCircle && !dtCommand.pathCoreFullCircle &&
+            !dtCommand.pathCoreRetainedTraversal && !dtCommand.pathCoreRetainedReverse &&
+            !dtCommand.replayTerminalAlreadyPublished &&
+            dtCommand.execution.IsAssigned() && dtCommand.execution.source == MotionCommandSource::NC_MEMORY &&
+            dtCommand.ownerLease.IsValid() && dtCommand.ownerLease.owner == MotionOwner::AUTO &&
+            !m_Group.enableHistory && !m_Group.enableTransform &&
+            m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
+            !m_safetyControlledStopInProgress && !IsPathCoreHoldExcursionDriving() &&
+            !HasPendingSafetyOrRecoveryRequests() &&
+            GetCommandAuthorizationFailure(dtCommand) == MotionRejectReason::NONE;
+        // EC: ordinary native G17 arcs have the same sub-PPS FIR tail as
+        // DT lines. Only this exact NC source may extend the drain gate;
+        // controlled stops, retained/EDM paths and queued arcs keep theirs.
+        const bool ecArcTail = isHandoverReady && axis.isVirtualAxis &&
+            &axis == &m_Group.virtualAxis && m_Group.isActive &&
+            dtCommand.pathCorePlanarCircle && !dtCommand.pathCoreFeedExactStop &&
+            (dtCommand.mode == InterpolationMode::CIRCULAR_CW ||
+                dtCommand.mode == InterpolationMode::CIRCULAR_CCW) &&
+            m_Group.mode == dtCommand.mode &&
+            dtCommand.axisCount == 2 && m_Group.axisCount == 2 &&
+            dtCommand.axisIndices[0] == 0 && dtCommand.axisIndices[1] == 1 &&
+            m_Group.axisIndices[0] == 0 && m_Group.axisIndices[1] == 1 &&
+            dtCommand.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+            m_Group.pathMode == PathMode::EXACT_STOP &&
+            !dtCommand.cncFeedLookahead && !dtCommand.cncCornerBlend &&
+            !dtCommand.pathCoreRetainedTraversal && !dtCommand.pathCoreRetainedReverse &&
+            !dtCommand.replayTerminalAlreadyPublished &&
+            dtCommand.execution.IsAssigned() && dtCommand.execution.source == MotionCommandSource::NC_MEMORY &&
+            dtCommand.ownerLease.IsValid() && dtCommand.ownerLease.owner == MotionOwner::AUTO &&
+            !m_Group.enableHistory && !m_Group.enableTransform &&
+            m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
+            !m_safetyControlledStopInProgress && !IsPathCoreHoldExcursionDriving() &&
+            !HasPendingSafetyOrRecoveryRequests() &&
+            GetCommandAuthorizationFailure(dtCommand) == MotionRejectReason::NONE;
         if (isHandoverReady && axis.isVirtualAxis &&
             &axis == &m_Group.virtualAxis && m_Group.isActive &&
-            (m_Group.currentCmd.pathCoreRetainedTraversal || IsPathCoreHoldExcursionDriving()) &&
+            (dtFeedTail || ecArcTail || m_Group.currentCmd.pathCoreRetainedTraversal || m_Group.currentCmd.cncFeedLookahead ||
+                IsPathCoreHoldExcursionDriving() ||
+                (m_pathHold.sourceSeen &&
+                    (m_pathHold.status.phase == MotionPathCoreHoldExcursionPhase::ARMED ||
+                        m_pathHold.status.phase == MotionPathCoreHoldExcursionPhase::COMPLETE) &&
+                    IsPathCoreHoldSourceCurrent())) &&
             !m_safetyControlledStopInProgress && axis.velBuffer.size() > 1)
         {
             // BZ_FIX1: sub-pulse paths can have a filtered velocity below
             // 1 PPS while their last step is still inside the filter. Drain
             // every pending sample before IDLE erases the remaining tail.
+            // CR_FIX2: a bound NORMAL source is ARMED, not excursion-driving.
+            // CS: COMPLETE also uses the ordinary planner for the original
+            // remainder after its exact return. Both must drain the same tail
+            // before the next retained source uses the command endpoint.
+            // DG marked paths also drain the remaining sub-PPS samples at a
+            // zero junction, before a canonical queued circle may start.
+            // Keep the exact source/owner/safety guards; do not snap axes or
+            // relax geometry checks.
             // An endpoint clamp has already cleared this buffer and passes.
             isHandoverReady = std::all_of(axis.velBuffer.begin(), axis.velBuffer.end(),
                 [](double velocity) { return velocity == 0.0; });
@@ -12871,8 +13511,116 @@ void MotionCore::DetermineActiveGainSet(AxisContext& axis)// PID 依照狀態切
 // ==========================================
 // [Layer 2] 伺服迴路 (Servo Loop)
 // ==========================================
+MotionPathCoreAdmissionCorrectionDecision MotionCore::ResolvePathCoreAdmissionPositionCorrection(
+    AxisContext& axis, const AxisCommand& command,
+    const MotionServoInputSnapshot& input, double& velocityPPS) noexcept
+{
+    using Decision = MotionPathCoreAdmissionCorrectionDecision;
+    using Reason = MotionPathCoreAdmissionCorrectionReason;
+    velocityPPS = 0.0;
+    auto& s = m_pathHold.status;
+    if (!s.admissionPending || axis.axisIndex < 0 || axis.axisIndex >= MAX_AXES ||
+        (m_pathAdmissionCorrectionScopeMask & (1U << static_cast<unsigned>(axis.axisIndex))) == 0U)
+        return Decision::NOT_APPLICABLE;
+
+    const auto finish = [this, &s, &axis, &velocityPPS](Decision decision, Reason reason) noexcept
+    {
+        if (axis.axisIndex == s.admissionWaitAxis)
+        {
+            s.admissionCorrectionTick = m_ncSettleRuntimeCycleTick;
+            s.admissionCorrectionDecision = decision;
+            s.admissionCorrectionReason = reason;
+            s.admissionCorrectionKp = axis.Pid_IDLE.Kp;
+            s.admissionCorrectionVelocityPPS = velocityPPS;
+            if (decision == Decision::AUTHORIZED)
+            {
+                if (s.admissionCorrectionCycles == 0ULL)
+                    s.admissionCorrectionFirstIntegral = axis.pid.integralAcc;
+                if (s.admissionCorrectionCycles != (std::numeric_limits<std::uint32_t>::max)())
+                    ++s.admissionCorrectionCycles;
+            }
+        }
+        if (decision == Decision::AUTHORIZED && axis.axisIndex >= 0 && axis.axisIndex < MAX_AXES)
+            s.admissionCorrectionMask |= 1U << static_cast<unsigned>(axis.axisIndex);
+        return decision;
+    };
+    if (!m_ncSettleRuntimeObserved || !m_ncSettleRuntimeCycleValid ||
+        !m_ncSettleRuntimeCycleContiguous || m_ncSettleRuntimeCycleTick == 0ULL ||
+        s.admissionWaitTick != m_ncSettleRuntimeCycleTick)
+        return finish(Decision::BLOCKED, Reason::STALE_RUNTIME);
+    if (m_Group.isActive || m_pathHold.sourceSeen || m_pathHold.startPending ||
+        s.phase != MotionPathCoreHoldExcursionPhase::ARMED ||
+        m_pathHold.generation == 0ULL ||
+        m_pathHold.generation != m_pathHoldGeneration.load(std::memory_order_acquire) ||
+        s.requestGeneration != m_pathHold.generation ||
+        s.ownerLease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(s.ownerLease) ||
+        s.identity.epoch != GetCurrentExecutionEpoch() || HasPendingExecutionEpochChange() ||
+        HasPendingSafetyOrRecoveryRequests() || AlarmManager::GetInstance().HasAlarm())
+        return finish(Decision::BLOCKED, Reason::AUTHORITY);
+    if (m_pContexts == nullptr || axis.axisIndex < 0 || axis.axisIndex >= MAX_AXES ||
+        static_cast<std::size_t>(axis.axisIndex) >= m_pContexts->size() ||
+        &(*m_pContexts)[axis.axisIndex] != &axis ||
+        !TryPeekNextMotionCommand(m_pathHoldAdmissionFront) ||
+        !MotionExecutionIdentityExactlyMatches(m_pathHoldAdmissionFront.execution, s.identity) ||
+        !m_pathHoldAdmissionFront.ownerLease.Matches(s.ownerLease) ||
+        GetCommandAuthorizationFailure(m_pathHoldAdmissionFront) != MotionRejectReason::NONE ||
+        !IsMotionCommandConsumerGeometryValid(m_pathHoldAdmissionFront, m_pContexts) ||
+        s.holdRequestSequence != 0ULL || s.completedHoldRequestSequence != 0ULL ||
+        s.retreatCount != 0ULL || s.returnCount != 0ULL)
+        return finish(Decision::BLOCKED, Reason::SOURCE_IDENTITY);
+    if (!MotionCommandHasAxis(m_pathHoldAdmissionFront, axis.axisIndex))
+        return finish(Decision::BLOCKED, Reason::SOURCE_IDENTITY);
+    if (axis.isVirtualAxis || axis.axisType != AxisType::LINEAR ||
+        axis.fbMode != FeedbackSource::MOTOR_ENCODER || axis.enablePitch || axis.enableBacklash ||
+        !std::isfinite(axis.currentCompOffset_unit) || axis.currentCompOffset_unit != 0.0)
+        return finish(Decision::BLOCKED, Reason::AXIS_SCOPE);
+    if ((input.StatusWord & 0x006FU) != 0x0027U || input.ModesOfOperationDisplay != 9 ||
+        axis.targetMode != 9 || !axis.isServoOn)
+        return finish(Decision::BLOCKED, Reason::RAW_SERVO);
+    if (!IsPathCoreAdmissionWaitAxisHealthy(axis) || axis.homeRuntime.active)
+        return finish(Decision::BLOCKED, Reason::AXIS_STATE);
+    if (axis.currentCmdVel != 0.0 || axis.logicalCmdVel != 0.0 ||
+        axis.targetVelocity != 0.0 || axis.targetEndVel != 0.0 ||
+        axis.currentCmdPos != axis.logicalCmdPos || axis.currentCmdPos != axis.planningPos ||
+        axis.currentCmdPos != axis.finalTargetPos || command.instantCmdPos != axis.currentCmdPos ||
+        command.instantCmdVel != 0.0)
+        return finish(Decision::BLOCKED, Reason::COMMAND_CHANGED);
+    if (!std::isfinite(axis.Pid_IDLE.Kp) || axis.Pid_IDLE.Kp <= 0.0 ||
+        !std::isfinite(axis.pid.integralAcc) || !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ||
+        !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+        !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0)
+        return finish(Decision::BLOCKED, Reason::NUMERIC);
+    const double unitsPerPulse = axis.finalLead / axis.resolution_PPR;
+    const double cap = (std::min)(axis.maxVel_PPS, 0.1 / unitsPerPulse);
+    const double error = axis.currentCmdPos - axis.currentActPos;
+    const double proportional = error * axis.Pid_IDLE.Kp;
+    if (!std::isfinite(unitsPerPulse) || unitsPerPulse <= 0.0 ||
+        !std::isfinite(cap) || cap <= 0.0 ||
+        cap > static_cast<double>((std::numeric_limits<std::int32_t>::max)()) ||
+        !std::isfinite(error) || !std::isfinite(proportional))
+        return finish(Decision::BLOCKED, Reason::NUMERIC);
+    const double correction = (std::max)(-cap, (std::min)(cap, proportional));
+    if (m_pCoordMgr != nullptr) m_pCoordMgr->UpdateSoftwareTravelLimitState(axis);
+    if ((correction > 0.0 && (axis.hardLimitPositive ||
+        (m_pCoordMgr != nullptr && !m_pCoordMgr->CanMoveSoftwarePositive(axis)))) ||
+        (correction < 0.0 && (axis.hardLimitNegative ||
+            (m_pCoordMgr != nullptr && !m_pCoordMgr->CanMoveSoftwareNegative(axis)))))
+        return finish(Decision::BLOCKED, Reason::TRAVEL_LIMIT);
+    // Revalidate after the bounded geometry and travel checks. Final image/send
+    // checks additionally bind this generation to the output frame.
+    if (m_pathHold.generation != m_pathHoldGeneration.load(std::memory_order_acquire) ||
+        !IsMotionOwnerLeaseCurrent(s.ownerLease) || HasPendingExecutionEpochChange() ||
+        s.identity.epoch != GetCurrentExecutionEpoch() || HasPendingSafetyOrRecoveryRequests() ||
+        AlarmManager::GetInstance().HasAlarm())
+        return finish(Decision::BLOCKED, Reason::AUTHORITY);
+    velocityPPS = correction;
+    m_pathAdmissionCorrectionFrameGeneration = m_pathHold.generation;
+    return finish(Decision::AUTHORIZED, Reason::NONE);
+}
+
 template <typename DriveType>
-void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd)
+void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd,
+    const MotionServoInputSnapshot& input)
 {
 
     DetermineActiveGainSet(axis); // PID 依照狀態切換
@@ -13018,6 +13766,15 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     }
 
 
+    double admissionCorrectionVelocity = 0.0;
+    const auto admissionCorrection = ResolvePathCoreAdmissionPositionCorrection(
+        axis, cmd, input, admissionCorrectionVelocity);
+    if (admissionCorrection == MotionPathCoreAdmissionCorrectionDecision::BLOCKED)
+    {
+        WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+        return;
+    }
+
     // 2. [Lag Monitor] 跟隨誤差檢查 (此時的 ActPos 絕對不會溢位)
     double error = cmd.instantCmdPos - axis.currentActPos;
 
@@ -13044,32 +13801,26 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     }
 
 
-    // 3. [PID Calculation]
-    // P term
+    // CU_FIX1: only the exact live queued-source wait discards prior motion I.
+    // Every other owner/state retains its existing PI calculation.
     double p_term = error * axis.pid.Kp;
-
-    // I term
-    axis.pid.integralAcc += (error * CYCLE_TIME_SEC);
-    // Anti-windup
-    if (axis.pid.integralAcc > axis.pid.MaxIntegral) axis.pid.integralAcc = axis.pid.MaxIntegral;
-    if (axis.pid.integralAcc < -axis.pid.MaxIntegral) axis.pid.integralAcc = -axis.pid.MaxIntegral;
-    double i_term = axis.pid.integralAcc * axis.pid.Ki;
-
-    // D term (CSV Mode usually 0)
-    double d_term = 0.0;
-
-    // 4. [Feedforward] 前饋控制 (關鍵！)
-    // 最終輸出 = 理論速度(VFF) + PID修正量
-  // 🌟 [修改這行] 將理論速度乘上 Kvff 增益
-    double finalVel = (cmd.instantCmdVel * axis.pid.Kvff) + (p_term + i_term + d_term);
-
-
-
-
-
-
-
-
+    double i_term = 0.0;
+    double finalVel = 0.0;
+    if (admissionCorrection == MotionPathCoreAdmissionCorrectionDecision::AUTHORIZED)
+    {
+        axis.pid.prevError = 0.0;
+        axis.pid.integralAcc = 0.0;
+        finalVel = admissionCorrectionVelocity;
+    }
+    else
+    {
+        axis.pid.integralAcc += error * CYCLE_TIME_SEC;
+        if (axis.pid.integralAcc > axis.pid.MaxIntegral) axis.pid.integralAcc = axis.pid.MaxIntegral;
+        if (axis.pid.integralAcc < -axis.pid.MaxIntegral) axis.pid.integralAcc = -axis.pid.MaxIntegral;
+        i_term = axis.pid.integralAcc * axis.pid.Ki;
+        const double d_term = 0.0;
+        finalVel = (cmd.instantCmdVel * axis.pid.Kvff) + (p_term + i_term + d_term);
+    }
 
     // =======================================================
     // 🌟 [修正] 狀態切換瞬間快照 (解決 %f 與洗頻問題)
@@ -13156,6 +13907,18 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         if (blockedPositiveMotion ||
             blockedNegativeMotion)
         {
+            if (admissionCorrection == MotionPathCoreAdmissionCorrectionDecision::AUTHORIZED)
+            {
+                // A newly observed travel block cannot rebase the held CMD.
+                if (axis.axisIndex == m_pathHold.status.admissionCorrectionAxis)
+                {
+                    m_pathHold.status.admissionCorrectionDecision = MotionPathCoreAdmissionCorrectionDecision::BLOCKED;
+                    m_pathHold.status.admissionCorrectionReason = MotionPathCoreAdmissionCorrectionReason::TRAVEL_LIMIT;
+                    m_pathHold.status.admissionCorrectionVelocityPPS = 0.0;
+                }
+                WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+                return;
+            }
             // =================================================
             // A. Interpolation Group
             //
@@ -13385,6 +14148,19 @@ void MotionCore::UpdateMotion(
 
     // 🌟 [優先權最高] 大腦監視實體馬達
     if (!isServoOn || opMode != 9) {
+        if (m_pathHold.status.admissionPending)
+        {
+            AxisCommand heldCommand{};
+            heldCommand.instantCmdPos = axis.currentCmdPos;
+            heldCommand.instantCmdVel = 0.0;
+            double ignoredVelocity = 0.0;
+            if (ResolvePathCoreAdmissionPositionCorrection(axis, heldCommand, input, ignoredVelocity) !=
+                MotionPathCoreAdmissionCorrectionDecision::NOT_APPLICABLE)
+            {
+                WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+                return;
+            }
+        }
         if (axis.state != MotionState::MotionState_ERROR && axis.state != MotionState::MotionState_IDLE) {
             RtPrintf("[ALARM] Axis %d LOST SERVO POWER DURING MOTION!\\n", axis.axisIndex);
             axis.isFault = true; // 🚨 這裡必須觸發嚴重錯誤！
@@ -13615,7 +14391,7 @@ void MotionCore::UpdateMotion(
 
 
 
-    Run_Servo_Loop(servo, axis, cmd);
+    Run_Servo_Loop(servo, axis, cmd, input);
 }
 
 
@@ -13792,7 +14568,11 @@ bool MotionCore::TryLineMove(
     MotionExecutionIdentity* producedIdentity,
     MotionOwnerLease* producedOwnerLease,
     MotionExecutionEpoch plannedTailEpoch,
-    const MotionOwnerLease* plannedTailOwnerLease) noexcept
+    const MotionOwnerLease* plannedTailOwnerLease,
+    bool cncFeedLookahead,
+    const NCPathCoreRetainedGeometry* cncCorner,
+    double cncPrefixVelocityPPS,
+    bool pathCoreFeedExactStop) noexcept
 {
     if (producedIdentity != nullptr)
     {
@@ -13835,7 +14615,24 @@ bool MotionCore::TryLineMove(
     invalidCommand.sourceLinePC = m_pendingSourcePC;
     invalidCommand.commandPathMode = commandPathMode;
 
-    if (plannedTailRequested && !plannedTailWellFormed)
+    // Permit only the native XY queue lane under a frozen rotation. A supplied
+    // Q compound must also pass full canonical geometry validation below, before
+    // an aborting epoch can be published; exact-stop retains its existing lane.
+    const bool fixedRotatedQueuedLine = commandSource == MotionCommandSource::NC_MEMORY &&
+        IsPendingFixedTranslationSourceAllowed() && plannedTailWellFormed &&
+        commandOwnerLease.owner == MotionOwner::AUTO && m_pendingIsAbsoluteMode &&
+        m_pendingTranslation.distanceMode == 90 && !m_pendingG162Active &&
+        cncFeedLookahead && commandPathMode == MotionCommandPathMode::CONTINUOUS &&
+        !pathCoreFeedExactStop && (cncCorner != nullptr || cncPrefixVelocityPPS == 0.0) &&
+        axes.size() == 2U && axes[0] == 0 && axes[1] == 1;
+    if (!IsPendingCommandTranslationValid(commandSource) ||
+        (commandSource == MotionCommandSource::NC_MEMORY && NCTranslationHasPlanarRotation(m_pendingTranslation) &&
+            !fixedRotatedQueuedLine && (commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+                cncFeedLookahead || cncCorner != nullptr)) ||
+        (plannedTailRequested && !plannedTailWellFormed) ||
+        (pathCoreFeedExactStop && (!plannedTailWellFormed || cncFeedLookahead || cncCorner != nullptr ||
+            mode != BufferMode::ABORTING || commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+            commandSource != MotionCommandSource::NC_MEMORY || commandOwnerLease.owner != MotionOwner::AUTO)))
     {
         RejectInvalidProducerMotionCommand(
             invalidCommand,
@@ -13854,7 +14651,10 @@ bool MotionCore::TryLineMove(
         !IsValidMotionCommandPathMode(commandPathMode) ||
         !std::isfinite(targetVel) ||
         !std::isfinite(acc_time) ||
-        !std::isfinite(dec_time))
+        !std::isfinite(dec_time) ||
+        !std::isfinite(cncPrefixVelocityPPS) ||
+        (cncCorner == nullptr ? cncPrefixVelocityPPS != 0.0 :
+            (cncPrefixVelocityPPS != 0.0 && cncPrefixVelocityPPS < std::abs(targetVel))))
     {
         RejectInvalidProducerMotionCommand(
             invalidCommand,
@@ -13875,6 +14675,9 @@ bool MotionCore::TryLineMove(
             axisIndex >= static_cast<int>(m_pContexts->size()) ||
             seenAxis[static_cast<std::size_t>(axisIndex)] ||
             !(*m_pContexts)[axisIndex].isExist ||
+            (commandSource == MotionCommandSource::NC_MEMORY &&
+                !IsNCTranslationSnapshotEmpty(m_pendingTranslation) &&
+                (axisIndex > 2 || (*m_pContexts)[axisIndex].axisType != AxisType::LINEAR)) ||
             !std::isfinite(targetPos[slot]))
         {
             RejectInvalidProducerMotionCommand(
@@ -13894,6 +14697,9 @@ bool MotionCore::TryLineMove(
     cmd.mode = InterpolationMode::LINEAR;
     cmd.axisCount = (int)axes.size();
     cmd.commandPathMode = commandPathMode;
+    cmd.cncFeedLookahead = cncFeedLookahead;
+    cmd.pathCoreFeedExactStop = pathCoreFeedExactStop;
+    cmd.cncPrefixVelocityPPS = cncPrefixVelocityPPS;
 
     // 將座標與參數抄寫到包裹裡
     for (int i = 0; i < cmd.axisCount; ++i) {
@@ -13908,6 +14714,7 @@ bool MotionCore::TryLineMove(
     // 🌟 貼上標籤！記錄這條路徑是來自哪一行 G-Code
     cmd.sourceLinePC = m_pendingSourcePC;
     cmd.sourceWCS = m_pendingSourceWCS;
+    if (commandSource == MotionCommandSource::NC_MEMORY) cmd.sourceTranslation = m_pendingTranslation;
 
     // 🌟 貼上刀具標籤！
     cmd.sourceToolLengthMode = m_pendingToolMode;
@@ -13937,6 +14744,69 @@ bool MotionCore::TryLineMove(
 
     // 🔍 [加入這行] 確認收到指令
     //RtPrintf("[DBG-1] LineMove Queueing! AxisCnt:%d | FirstAxis:%d | TargetPulse:%d\n",cmd.axisCount, cmd.axisIndices[0], (int)cmd.targetPos[0]);
+
+    if (cncCorner != nullptr)
+    {
+        if (!cncFeedLookahead || cncCorner->kind != NCPathCoreRetainedKind::LINE_ARC ||
+            !IsNCPathCoreRetainedGeometryValid(*cncCorner) || axes.size() != 2U || axes[0] != 0 || axes[1] != 1 ||
+            targetPos[0] != cncCorner->endPulse[0] || targetPos[1] != cncCorner->endPulse[1])
+        {
+            RejectInvalidProducerMotionCommand(invalidCommand, commandEpoch, commandSource,
+                commandOwnerLease, producedIdentity, producedOwnerLease);
+            return false;
+        }
+        // DK producer validates its extra speed permission before an aborting
+        // epoch can be published. TryEnqueue checks authority, not this geometry.
+        if (cncPrefixVelocityPPS != 0.0)
+        {
+            double ppm = 0.0;
+            for (unsigned i = 0U; i < 2U; ++i)
+            {
+                const auto& axis = (*m_pContexts)[i];
+                const double next = axis.resolution_PPR / axis.finalLead;
+                if (!std::isfinite(next) || next <= 0.0 || (i != 0U && ppm != next) ||
+                    !std::isfinite(axis.maxVel_PPS) || cncPrefixVelocityPPS > axis.maxVel_PPS ||
+                    cncPrefixVelocityPPS / next > (100.0 / 60.0) *
+                        (1.0 + 16.0 * std::numeric_limits<double>::epsilon()))
+                {
+                    RejectInvalidProducerMotionCommand(invalidCommand, commandEpoch, commandSource,
+                        commandOwnerLease, producedIdentity, producedOwnerLease);
+                    return false;
+                }
+                ppm = next;
+            }
+        }
+        cmd.cncCornerBlend = true;
+        cmd.dir = cncCorner->direction;
+        cmd.startRadius = cmd.endRadius = cmd.mem_radius = cncCorner->radiusPulse;
+        cmd.mem_startAngle = cncCorner->startAngle; cmd.mem_totalAngle = cncCorner->sweepRadians;
+        cmd.mem_totalDist = cncCorner->lengthPulse;
+        cmd.centerPos[0] = cmd.mem_centerX = cncCorner->centerPulse[0];
+        cmd.centerPos[1] = cmd.mem_centerY = cncCorner->centerPulse[1];
+        for (unsigned i = 0U; i < 2U; ++i)
+        {
+            cmd.mem_startPos[i] = cncCorner->startPulse[i];
+            cmd.mem_ratio[i] = cncCorner->centerPulse[i] + cncCorner->radiusPulse *
+                (i == 0U ? std::cos(cncCorner->startAngle) : std::sin(cncCorner->startAngle));
+        }
+    }
+
+    // The rotated Q lane proves the actual native packet against the current
+    // axis configuration before any aborting epoch or transport publication.
+    // These private source tags authorize validation only; the execution
+    // identity is assigned after the existing epoch/owner transaction below.
+    if (cncCorner != nullptr && commandSource == MotionCommandSource::NC_MEMORY &&
+        NCTranslationHasPlanarRotation(m_pendingTranslation))
+    {
+        cmd.execution.source = commandSource;
+        cmd.ownerLease = commandOwnerLease;
+        if (!IsMotionCommandConsumerGeometryValid(cmd, m_pContexts))
+        {
+            RejectInvalidProducerMotionCommand(invalidCommand, commandEpoch, commandSource,
+                commandOwnerLease, producedIdentity, producedOwnerLease);
+            return false;
+        }
+    }
 
     // 2. 判斷是「乖乖排隊」還是「緊急覆寫」？
     if (mode == BufferMode::ABORTING)
@@ -14220,7 +15090,664 @@ static double CalcSpiralProgressFromPathLength(double pathLength, double totalLe
 
     return progress;
 }
-void MotionCore::LoadNextCommand()
+// DC: one late-successor attempt per loaded NC_MEMORY/P1 straight segment.
+// This promotes only a cruise-reachable, same-speed collinear pair whose next
+// segment can stop on its own. It is not a multi-block or contour-blend planner.
+bool MotionCore::IsCncP1LateJunctionScope() const noexcept
+{
+    const MotionCommand& cmd = m_Group.currentCmd;
+    // DM: NC_MEMORY/AUTO and NC_MDI/MDI use the same bounded late-arrival
+    // proof. Never admit a source under the other mode's owner lease.
+    const bool matchedNcOwner =
+        (cmd.execution.source == MotionCommandSource::NC_MEMORY &&
+            cmd.ownerLease.owner == MotionOwner::AUTO) ||
+        (cmd.execution.source == MotionCommandSource::NC_MDI &&
+            cmd.ownerLease.owner == MotionOwner::MDI);
+    return cmd.execution.IsAssigned() && matchedNcOwner && cmd.ownerLease.IsValid() &&
+        cmd.commandPathMode == MotionCommandPathMode::CONTINUOUS && !cmd.cncFeedLookahead &&
+        cmd.mode == InterpolationMode::LINEAR && cmd.axisCount > 0 && cmd.axisCount <= 3 &&
+        !cmd.pathCoreRetainedTraversal && !cmd.replayTerminalAlreadyPublished &&
+        !cmd.sourceG68Active && IsMotionFixedTranslationWorkSourceAllowed(cmd) && !cmd.sourceG51Active &&
+        cmd.sourceMirrorMask == 0U && !cmd.sourceG16Active &&
+        m_Group.pathMode == PathMode::CONTINUOUS && !m_Group.enableHistory &&
+        !m_Group.enableTransform && m_Group.jumpManager.state == JumpState::IDLE &&
+        !m_pathHold.sourceSeen && !IsPathCoreHoldExcursionDriving();
+}
+
+void MotionCore::QueueCncP1Diagnostic(CncP1Event event, CncP1Reason reason,
+    const MotionCommand* next, double nextLength) noexcept
+{
+    CncP1Diagnostic& d = m_cncP1Late.producerEvent;
+    d = CncP1Diagnostic{};
+    const MotionCommand& cmd = m_Group.currentCmd;
+    const AxisContext& axis = m_Group.virtualAxis;
+    d.runtimeTick = m_ncSettleRuntimeCycleTick;
+    d.tickValid = m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+        m_ncSettleRuntimeCycleContiguous && d.runtimeTick != 0ULL;
+    d.sequence = ++m_cncP1Late.sequence;
+    d.epoch = cmd.execution.epoch;
+    d.segment = cmd.execution.segmentId;
+    d.sourcePC = cmd.sourceLinePC;
+    d.owner = cmd.ownerLease.owner;
+    d.generation = cmd.ownerLease.generation;
+    d.axisMask = BuildMotionCommandAxisMask(cmd);
+    d.queueDepth = static_cast<std::uint32_t>(m_Group.cmdQueue.size());
+    d.commandVelocity = axis.currentCmdVel;
+    d.endVelocity = axis.targetEndVel;
+    d.remainingPulse = axis.finalTargetPos - axis.planningPos;
+    d.nextLengthPulse = nextLength;
+    d.event = event;
+    d.reason = reason;
+    if (next != nullptr)
+    {
+        d.nextSegment = next->execution.segmentId;
+        d.nextSourcePC = next->sourceLinePC;
+    }
+    if (!m_cncP1Late.events.ProducerTryPush(d))
+        m_cncP1Late.dropped.fetch_add(1U, std::memory_order_relaxed);
+}
+
+bool MotionCore::TryPopCncP1Diagnostic(CncP1Diagnostic& event) noexcept
+{
+    return m_cncP1Late.events.ConsumerTryPop(event);
+}
+
+std::uint32_t MotionCore::GetCncP1DiagnosticDroppedCount() const noexcept
+{
+    return m_cncP1Late.dropped.load(std::memory_order_acquire);
+}
+
+void MotionCore::ArmCncP1LateJunction(bool nextVisible, const MotionCommand& next) noexcept
+{
+    m_cncP1Late.loaded = false;
+    m_cncP1Late.pending = false;
+    if (!IsCncP1LateJunctionScope()) return;
+    m_cncP1Late.identity = m_Group.currentCmd.execution;
+    m_cncP1Late.lease = m_Group.currentCmd.ownerLease;
+    m_cncP1Late.loaded = true;
+    m_cncP1Late.pending = !nextVisible && m_Group.virtualAxis.targetEndVel == 0.0;
+    QueueCncP1Diagnostic(nextVisible ? CncP1Event::LOAD_READY : CncP1Event::LOAD_EMPTY,
+        CncP1Reason::NONE, nextVisible ? &next : nullptr);
+}
+
+void MotionCore::FinishCncP1Diagnostic() noexcept
+{
+    if (!m_cncP1Late.loaded ||
+        !MotionExecutionIdentityExactlyMatches(m_cncP1Late.identity, m_Group.currentCmd.execution) ||
+        !m_cncP1Late.lease.Matches(m_Group.currentCmd.ownerLease)) return;
+    QueueCncP1Diagnostic(CncP1Event::LEAVE,
+        m_cncP1Late.pending ? CncP1Reason::QUEUE_EMPTY : CncP1Reason::NONE);
+    m_cncP1Late.pending = false;
+    m_cncP1Late.loaded = false;
+}
+
+void MotionCore::RefreshCncP1LateJunction() noexcept
+{
+    if (!m_cncP1Late.pending) return;
+    AxisContext& v = m_Group.virtualAxis;
+    const MotionCommand& cmd = m_Group.currentCmd;
+    if (!m_Group.isActive || !IsCncP1LateJunctionScope() ||
+        !MotionExecutionIdentityExactlyMatches(m_cncP1Late.identity, cmd.execution) ||
+        !m_cncP1Late.lease.Matches(cmd.ownerLease))
+    {
+        m_cncP1Late.pending = false;
+        return;
+    }
+    const auto keepStop = [this](CncP1Reason reason, const MotionCommand* next = nullptr,
+        double length = 0.0) noexcept
+    {
+        m_cncP1Late.pending = false;
+        QueueCncP1Diagnostic(CncP1Event::KEEP_STOP, reason, next, length);
+    };
+    if (m_safetyControlledStopInProgress || HasPendingSafetyOrRecoveryRequests() ||
+        HasPendingExecutionEpochChange() || GetCommandAuthorizationFailure(cmd) != MotionRejectReason::NONE)
+    {
+        keepStop(CncP1Reason::AUTHORITY);
+        return;
+    }
+    if (m_Group.feedrateOverride != 1.0)
+    {
+        keepStop(CncP1Reason::OVERRIDE);
+        return;
+    }
+    if (v.state != MotionState::MotionState_MOVING || v.inPosition || v.targetEndVel != 0.0)
+    {
+        keepStop(CncP1Reason::TERMINAL);
+        return;
+    }
+    MotionCommand& next = m_cncP1Late.successor;
+    if (!TryPeekNextMotionCommand(next)) return; // No waiting and no queue scan.
+    m_cncP1Late.pending = false; // Exactly one visible-front attempt for this source.
+    if (!next.execution.IsAssigned() || GetCommandAuthorizationFailure(next) != MotionRejectReason::NONE ||
+        next.execution.epoch != cmd.execution.epoch || !next.ownerLease.Matches(cmd.ownerLease) ||
+        next.execution.source != cmd.execution.source ||
+        next.execution.segmentId == cmd.execution.segmentId)
+    {
+        keepStop(CncP1Reason::AUTHORITY, &next);
+        return;
+    }
+    if (next.cncFeedLookahead || next.commandPathMode != MotionCommandPathMode::CONTINUOUS ||
+        next.mode != InterpolationMode::LINEAR || next.pathCoreRetainedTraversal ||
+        next.replayTerminalAlreadyPublished || next.sourceG68Active ||
+        !IsMotionFixedTranslationWorkSourceAllowed(next) ||
+        next.sourceG51Active || next.sourceMirrorMask != 0U || next.sourceG16Active ||
+        next.sourceG162Active != cmd.sourceG162Active)
+    {
+        keepStop(CncP1Reason::SCOPE, &next);
+        return;
+    }
+    if (!MotionCommandsHaveIdenticalAxisMapping(cmd, next))
+    {
+        keepStop(CncP1Reason::MAPPING, &next);
+        return;
+    }
+    if (!IsMotionCommandConsumerGeometryValid(next, m_pContexts) ||
+        !IsMotionCommandConsumerGeometryValid(cmd, m_pContexts))
+    {
+        keepStop(CncP1Reason::GEOMETRY, &next);
+        return;
+    }
+    double currentLength = 0.0, nextLength = 0.0;
+    for (int slot = 0; slot < cmd.axisCount; ++slot)
+    {
+        const int index = cmd.axisIndices[slot];
+        if ((*m_pContexts)[index].axisType != AxisType::LINEAR)
+        {
+            keepStop(CncP1Reason::SCOPE, &next);
+            return;
+        }
+        currentLength = std::hypot(currentLength, cmd.targetPos[slot] - m_Group.startPos[slot]);
+        nextLength = std::hypot(nextLength, next.targetPos[slot] - cmd.targetPos[slot]);
+    }
+    if (!std::isfinite(currentLength) || !std::isfinite(nextLength) ||
+        currentLength <= 0.0 || nextLength <= 0.0)
+    {
+        keepStop(CncP1Reason::GEOMETRY, &next, nextLength);
+        return;
+    }
+    for (int slot = 0; slot < cmd.axisCount; ++slot)
+    {
+        const double a = (cmd.targetPos[slot] - m_Group.startPos[slot]) / currentLength;
+        const double b = (next.targetPos[slot] - cmd.targetPos[slot]) / nextLength;
+        // DV_FIX1: a stopped multi-axis positioning move can leave a tiny
+        // floating residue on a nominally stationary axis. Use the existing
+        // unit-tangent tolerance for zero components too; an exact-zero
+        // classification must not override that same bounded comparison.
+        // Targets, axis mapping and all speed/stopping-distance proofs stay exact.
+        if (!std::isfinite(a) || !std::isfinite(b) ||
+            std::abs(a - b) > 32.0 * std::numeric_limits<double>::epsilon())
+        {
+            keepStop(CncP1Reason::DIRECTION, &next, nextLength);
+            return;
+        }
+    }
+    // DO: an equal/faster successor can inherit the current cruise.
+    // Keep the full current-cruise and next-stop distance proofs below;
+    // a downshift still requires a separate raw/FIR deceleration proof.
+    const double speed = v.cruiseVel_PPS;
+    if (!std::isfinite(speed) || speed <= 0.1 || speed != cmd.targetVel ||
+        !std::isfinite(next.targetVel) || next.targetVel < cmd.targetVel ||
+        next.accTime != cmd.accTime || next.decTime != cmd.decTime ||
+        !std::isfinite(v.currentCmdVel) || v.currentCmdVel < 0.0 || v.currentCmdVel > speed ||
+        !std::isfinite(v.acc_PPS2) || v.acc_PPS2 <= 0.0 ||
+        !std::isfinite(v.dec_PPS2) || v.dec_PPS2 <= 0.0 || v.velBuffer.size() > 4096U)
+    {
+        keepStop(CncP1Reason::SPEED, &next, nextLength);
+        return;
+    }
+    if (next.targetVel > speed)
+    {
+        // Match LoadNextCommand, including its time clamp and dec fallback.
+        // A finite higher F must not overflow the future dynamics or weaken
+        // the current-speed stopping proof used for the next segment.
+        const double nextAcc = next.accTime < 0.0001 ? 1e10 : next.targetVel / next.accTime;
+        const double nextDecTime = next.decTime < 0.0 ? next.accTime : next.decTime;
+        const double nextDec = nextDecTime < 0.0001 ? 1e10 : next.targetVel / nextDecTime;
+        if (!std::isfinite(nextAcc) || !std::isfinite(nextDec) ||
+            nextAcc <= 0.0 || nextDec <= 0.0 ||
+            nextAcc < v.acc_PPS2 || nextDec < v.dec_PPS2)
+        {
+            keepStop(CncP1Reason::SPEED, &next, nextLength);
+            return;
+        }
+    }
+    // Conservative full-filter-distance reserve, not a contour error allowance.
+    const double margin = speed * ((static_cast<double>(v.velBuffer.size()) + 4.0) * CYCLE_TIME_SEC) + 1.0;
+    const double accelerate = (speed - v.currentCmdVel) * (speed + v.currentCmdVel) / (2.0 * v.acc_PPS2);
+    const double brake = (speed / (2.0 * v.dec_PPS2)) * speed;
+    const double remaining = v.finalTargetPos - v.planningPos;
+    if (!std::isfinite(margin) || !std::isfinite(accelerate) || !std::isfinite(brake) ||
+        !std::isfinite(remaining) || !std::isfinite(v.planningPos) || v.planningPos < 0.0 ||
+        remaining <= accelerate + margin)
+    {
+        keepStop(CncP1Reason::CURRENT_DISTANCE, &next, nextLength);
+        return;
+    }
+    if (nextLength <= brake + margin)
+    {
+        keepStop(CncP1Reason::NEXT_DISTANCE, &next, nextLength);
+        return;
+    }
+    if (HasPendingSafetyOrRecoveryRequests() || HasPendingExecutionEpochChange() ||
+        GetCommandAuthorizationFailure(cmd) != MotionRejectReason::NONE ||
+        GetCommandAuthorizationFailure(next) != MotionRejectReason::NONE)
+    {
+        keepStop(CncP1Reason::AUTHORITY, &next, nextLength);
+        return;
+    }
+    v.targetEndVel = speed; // Existing planner/filtered handoff; never force current velocity.
+    QueueCncP1Diagnostic(CncP1Event::PROMOTED, CncP1Reason::NONE, &next, nextLength);
+}
+
+// DF: bounded per-command-feed collinear horizon. Unknown continuation ends at zero.
+bool MotionCore::BuildCncFeedStopPlan(const std::array<double, 4U>& length,
+    const std::array<double, 4U>& speed, const std::array<double, 4U>& acceleration,
+    const std::array<double, 4U>& deceleration, std::size_t count, double entry,
+    std::array<double, 5U>& boundary) noexcept
+{
+    boundary.fill(0.0);
+    if (count == 0U || count > 4U || !std::isfinite(entry) || entry < 0.0) return false;
+    for (std::size_t i = 0U; i < count; ++i)
+    {
+        if (!std::isfinite(length[i]) || length[i] < 0.0 || !std::isfinite(speed[i]) || speed[i] <= 0.0 ||
+            !std::isfinite(acceleration[i]) || acceleration[i] <= 0.0 ||
+            !std::isfinite(deceleration[i]) || deceleration[i] <= 0.0) return false;
+        if (i != 0U) boundary[i] = (std::min)(speed[i - 1U], speed[i]);
+    }
+    for (std::size_t i = count - 1U; i > 0U; --i)
+    {
+        const double square = boundary[i + 1U] * boundary[i + 1U] + 2.0 * deceleration[i] * length[i];
+        if (!std::isfinite(square) || square < 0.0) { boundary.fill(0.0); return false; }
+        boundary[i] = (std::min)(boundary[i], std::sqrt(square));
+    }
+    boundary[0U] = entry;
+    for (std::size_t i = 0U; i + 1U < count; ++i)
+    {
+        const double square = boundary[i] * boundary[i] + 2.0 * acceleration[i] * length[i];
+        if (!std::isfinite(square) || square < 0.0) { boundary.fill(0.0); return false; }
+        boundary[i + 1U] = (std::min)(boundary[i + 1U], std::sqrt(square));
+    }
+    return true;
+}
+
+void MotionCore::QueueCncFeedPlanDiagnostic(CncFeedPlanEvent event) noexcept
+{
+    auto& s = m_cncFeedLookahead;
+    auto& e = s.event;
+    const auto& v = m_Group.virtualAxis;
+    e = s.plan;
+    e.runtimeTick = m_ncSettleRuntimeCycleTick;
+    e.tickValid = m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+        m_ncSettleRuntimeCycleContiguous && e.runtimeTick != 0ULL;
+    e.sequence = ++s.sequence;
+    e.identity = m_Group.currentCmd.execution;
+    e.lease = m_Group.currentCmd.ownerLease;
+    e.axisMask = BuildMotionCommandAxisMask(m_Group.currentCmd);
+    e.commandVelocity = v.currentCmdVel;
+    e.outputVelocity = v.logicalCmdVel;
+    e.endVelocity = v.targetEndVel;
+    e.cruiseVelocity = v.maxVel_PPS;
+    e.remainingPulse = (std::max)(0.0, v.finalTargetPos - v.planningPos);
+    e.event = event;
+    e.prefixLengthPulse = s.prefixLength;
+    e.prefixRemainingPulse = s.prefixEnabled ? (std::max)(0.0, s.prefixLength - v.currentCmdPos) : 0.0;
+    e.prefixLimitPPS = s.prefixLimit;
+    e.prefixReservePulse = s.prefixReserve;
+    e.authoredPrefixPPS = m_Group.currentCmd.cncPrefixVelocityPPS;
+    if (!s.events.ProducerTryPush(e)) s.dropped.fetch_add(1U, std::memory_order_relaxed);
+}
+
+bool MotionCore::TryPopCncFeedPlanDiagnostic(CncFeedPlanDiagnostic& event) noexcept
+{
+    return m_cncFeedLookahead.events.ConsumerTryPop(event);
+}
+
+std::uint32_t MotionCore::GetCncFeedPlanDiagnosticDroppedCount() const noexcept
+{
+    return m_cncFeedLookahead.dropped.load(std::memory_order_acquire);
+}
+
+void MotionCore::FinishCncFeedLookahead() noexcept
+{
+    auto& s = m_cncFeedLookahead;
+    if (s.loaded && MotionExecutionIdentityExactlyMatches(s.identity, m_Group.currentCmd.execution) &&
+        s.lease.Matches(m_Group.currentCmd.ownerLease)) QueueCncFeedPlanDiagnostic(CncFeedPlanEvent::LEAVE);
+    s.loaded = false;
+}
+
+void MotionCore::RefreshCncFeedLookahead(bool loading) noexcept
+{
+    auto& s = m_cncFeedLookahead;
+    const auto& cmd = m_Group.currentCmd;
+    auto& v = m_Group.virtualAxis;
+    if (loading)
+    {
+        s.loaded = false;
+        s.zeroInputCycles = 0U; s.blendEntered = false;
+        s.prefixLength = s.prefixLimit = s.prefixReserve = s.prefixPreviousRaw = 0.0;
+        s.prefixEnabled = s.prefixFastSeen = s.prefixBrakeSeen = false;
+        s.prefixAuthoredSeen = false;
+        s.observedDepth = (std::numeric_limits<std::size_t>::max)();
+        s.plan = CncFeedPlanDiagnostic{};
+    }
+    if (!cmd.cncFeedLookahead || (cmd.mode != InterpolationMode::LINEAR && !cmd.pathCorePlanarCircle) || cmd.axisCount < 1 || cmd.axisCount > 3 ||
+        !m_Group.isActive || m_safetyControlledStopInProgress ||
+        HasPendingExecutionEpochChange() || HasPendingSafetyOrRecoveryRequests() ||
+        GetCommandAuthorizationFailure(cmd) != MotionRejectReason::NONE) return;
+    if (!loading && (!s.loaded || !MotionExecutionIdentityExactlyMatches(s.identity, cmd.execution) ||
+        !s.lease.Matches(cmd.ownerLease))) return;
+    if (m_Group.pathMode != PathMode::CONTINUOUS || m_Group.enableHistory || m_Group.enableTransform ||
+        m_Group.jumpManager.state != JumpState::IDLE || m_pathHold.sourceSeen || IsPathCoreHoldExcursionDriving()) return;
+    if (!std::isfinite(v.maxVel_PPS) || v.maxVel_PPS <= 0.0 || !std::isfinite(v.acc_PPS2) || v.acc_PPS2 <= 0.0 ||
+        !std::isfinite(v.dec_PPS2) || v.dec_PPS2 <= 0.0 || v.velBuffer.size() > 400U ||
+        !std::isfinite(v.currentCmdVel) || v.currentCmdVel < 0.0 || !std::isfinite(v.planningPos) ||
+        !std::isfinite(v.finalTargetPos) || v.finalTargetPos <= 0.0) return;
+    if (loading)
+    {
+        s.identity = cmd.execution; s.lease = cmd.ownerLease; s.loaded = true;
+        // DK only changes the loaded prefix ceiling. Arc acceleration, curve
+        // cap, future-source limits and every source seam remain DI/DJ values.
+        double prefix = 0.0;
+        if (cmd.cncCornerBlend && ResolveCncCornerBlend(cmd, prefix))
+        {
+            bool boundedHistory = v.currentCmdVel <= v.maxVel_PPS * (1.0 + 1e-12);
+            double historyPeak = 0.0;
+            // One scan of at most 400 slots on load, no extra per-cycle scan.
+            for (std::size_t i = 0U; i < v.velBuffer.size(); ++i)
+            {
+                if (!std::isfinite(v.velBuffer[i]) || v.velBuffer[i] < 0.0) boundedHistory = false;
+                else historyPeak = (std::max)(historyPeak, v.velBuffer[i]);
+            }
+            // DL keeps the full-authored and packet/no-boost gates. Only a
+            // finite, distance-limited authored miss above a proven packet
+            // schedule may select an intermediate loaded-prefix peak.
+            const double authored = cmd.cncPrefixVelocityPPS == 0.0 ? cmd.targetVel : cmd.cncPrefixVelocityPPS;
+            const double available = prefix - (std::max)(v.planningPos, v.currentCmdPos);
+            bool authoredDistanceLimited = false;
+            bool packetDistanceLimited = false;
+            for (unsigned attempt = 0U; attempt < 2U && !s.prefixEnabled; ++attempt)
+            {
+                const double candidate = attempt == 0U ? authored : cmd.targetVel;
+                if (attempt != 0U && authored == cmd.targetVel) break;
+                if (!std::isfinite(candidate) || candidate < cmd.targetVel ||
+                    candidate <= v.maxVel_PPS * (1.0 + 1e-12)) continue;
+                const double reserve = candidate * CYCLE_TIME_SEC * (double(v.velBuffer.size()) + 8.0);
+                const double rise = (candidate * candidate - v.currentCmdVel * v.currentCmdVel) / (2.0 * v.acc_PPS2);
+                const double fall = (candidate * candidate - v.maxVel_PPS * v.maxVel_PPS) / (2.0 * v.dec_PPS2);
+                const double required = reserve + (std::max)(0.0, rise) + fall;
+                if (!boundedHistory || historyPeak > candidate * (1.0 + 1e-12) ||
+                    !std::isfinite(reserve) || !std::isfinite(rise) || !std::isfinite(fall) ||
+                    !std::isfinite(required)) continue;
+                if (!(available > required))
+                {
+                    // DP: both authored and packet candidates passed every
+                    // finite/history gate and failed only on distance.
+                    // DQ: explicit equal/rising-F metadata uses one identical
+                    // authored/packet candidate. Legacy zero metadata stays out.
+                    packetDistanceLimited = std::isfinite(available) &&
+                        ((attempt == 1U && authoredDistanceLimited) ||
+                         (attempt == 0U && cmd.cncPrefixVelocityPPS > 0.0 &&
+                          cmd.cncPrefixVelocityPPS == cmd.targetVel));
+                    authoredDistanceLimited = attempt == 0U && std::isfinite(available) &&
+                        cmd.cncPrefixVelocityPPS > cmd.targetVel;
+                    continue;
+                }
+                double selected = candidate;
+                double selectedReserve = reserve;
+                if (attempt == 1U && authoredDistanceLimited)
+                {
+                    // Known-fitting lower endpoint, known-non-fitting upper.
+                    // At most 24 scalar probes on load, no additional history
+                    // scan, per-cycle search, packet edit, or source boundary.
+                    double lower = candidate, upper = authored;
+                    bool finiteSearch = true;
+                    const auto fits = [&](double peak, double& peakReserve) noexcept
+                    {
+                        peakReserve = peak * CYCLE_TIME_SEC * (double(v.velBuffer.size()) + 8.0);
+                        const double peakRise = (peak * peak - v.currentCmdVel * v.currentCmdVel) / (2.0 * v.acc_PPS2);
+                        const double peakFall = (peak * peak - v.maxVel_PPS * v.maxVel_PPS) / (2.0 * v.dec_PPS2);
+                        const double peakRequired = peakReserve + (std::max)(0.0, peakRise) + peakFall;
+                        if (!std::isfinite(peakReserve) || !std::isfinite(peakRise) ||
+                            !std::isfinite(peakFall) || !std::isfinite(peakRequired))
+                        {
+                            finiteSearch = false;
+                            return false;
+                        }
+                        return available > peakRequired;
+                    };
+                    for (unsigned probe = 0U; probe < 24U; ++probe)
+                    {
+                        const double middle = lower + (upper - lower) * 0.5;
+                        if (!(middle > lower && middle < upper)) break;
+                        double probeReserve = 0.0;
+                        if (fits(middle, probeReserve)) lower = middle;
+                        else upper = middle;
+                        if (!finiteSearch) break;
+                    }
+                    double verifiedReserve = 0.0;
+                    if (finiteSearch && lower > candidate && lower < authored &&
+                        fits(lower, verifiedReserve))
+                    {
+                        selected = lower;
+                        selectedReserve = verifiedReserve;
+                    }
+                }
+                s.prefixLength = prefix; s.prefixLimit = selected; s.prefixReserve = selectedReserve;
+                s.prefixPreviousRaw = v.currentCmdVel; s.prefixEnabled = true;
+            }
+            // DP/DQ: a qualified Q prefix may be too short even for the
+            // packet ceiling. Search below that ceiling only when the curve
+            // speed itself fits and bounds the entire inherited raw/FIR state.
+            // Full-authored, packet, and DL selections above stay unchanged.
+            if (!s.prefixEnabled && packetDistanceLimited && boundedHistory &&
+                v.currentCmdVel <= v.maxVel_PPS && historyPeak <= v.maxVel_PPS)
+            {
+                double lower = v.maxVel_PPS, upper = cmd.targetVel;
+                bool finiteSearch = true;
+                const auto fits = [&](double peak, double& peakReserve) noexcept
+                {
+                    peakReserve = peak * CYCLE_TIME_SEC * (double(v.velBuffer.size()) + 8.0);
+                    const double peakRise = (peak * peak - v.currentCmdVel * v.currentCmdVel) / (2.0 * v.acc_PPS2);
+                    const double peakFall = (peak * peak - v.maxVel_PPS * v.maxVel_PPS) / (2.0 * v.dec_PPS2);
+                    const double peakRequired = peakReserve + (std::max)(0.0, peakRise) + peakFall;
+                    if (!std::isfinite(peakReserve) || !std::isfinite(peakRise) ||
+                        !std::isfinite(peakFall) || !std::isfinite(peakRequired))
+                    {
+                        finiteSearch = false;
+                        return false;
+                    }
+                    return available > peakRequired;
+                };
+                double lowerReserve = 0.0;
+                if (fits(lower, lowerReserve))
+                {
+                    // One load-time search: at most 24 scalar probes, then
+                    // revalidate the selected peak with the same strict proof.
+                    for (unsigned probe = 0U; probe < 24U; ++probe)
+                    {
+                        const double middle = lower + (upper - lower) * 0.5;
+                        if (!(middle > lower && middle < upper)) break;
+                        double probeReserve = 0.0;
+                        if (fits(middle, probeReserve)) lower = middle;
+                        else upper = middle;
+                        if (!finiteSearch) break;
+                    }
+                    double verifiedReserve = 0.0;
+                    if (finiteSearch && lower > v.maxVel_PPS * (1.0 + 1e-12) &&
+                        lower < cmd.targetVel && fits(lower, verifiedReserve))
+                    {
+                        s.prefixLength = prefix; s.prefixLimit = lower; s.prefixReserve = verifiedReserve;
+                        s.prefixPreviousRaw = v.currentCmdVel; s.prefixEnabled = true;
+                    }
+                }
+            }
+        }
+    }
+    if (v.inPosition || v.state != MotionState::MotionState_MOVING) return;
+    const std::size_t depth = (std::min)(std::size_t(3U), m_Group.cmdQueue.size());
+    if (!loading && s.observedDepth == depth) return;
+    s.observedDepth = depth;
+    s.lengths.fill(0.0); s.speeds.fill(v.maxVel_PPS);
+    s.accelerations.fill(v.acc_PPS2); s.decelerations.fill(v.dec_PPS2);
+    const double stepReserve = v.maxVel_PPS * CYCLE_TIME_SEC * 4.0;
+    const double reserve = v.maxVel_PPS * CYCLE_TIME_SEC * (double(v.velBuffer.size()) + 4.0);
+    const double remaining = (std::max)(0.0, v.finalTargetPos - v.planningPos);
+    s.lengths[0U] = (std::max)(0.0, remaining - stepReserve);
+    std::array<double, 3U> previous{}, tangent{};
+    for (int i = 0; i < cmd.axisCount; ++i)
+    {
+        previous[std::size_t(i)] = cmd.targetPos[i];
+        tangent[std::size_t(i)] = m_Group.ratio[i];
+    }
+    std::uint32_t circleMask = 0U, blendMask = cmd.cncCornerBlend ? 1U : 0U;
+    if (cmd.pathCorePlanarCircle || cmd.cncCornerBlend)
+    {
+        circleMask = 1U;
+        const double dx = cmd.targetPos[0] - cmd.centerPos[0];
+        const double dy = cmd.targetPos[1] - cmd.centerPos[1];
+        const double r = std::hypot(dx, dy);
+        if (!std::isfinite(r) || r <= 0.0) return;
+        tangent[0] = -double(cmd.dir) * dy / r; tangent[1] = double(cmd.dir) * dx / r;
+    }
+    s.nominalSpeeds.fill(0.0); s.nominalSpeeds[0U] = cmd.targetVel;
+    MotionSegmentId previousSegment = cmd.execution.segmentId;
+    int previousPC = cmd.sourceLinePC;
+    CncFeedPlanStop stop = CncFeedPlanStop::QUEUE_END;
+    std::size_t count = 1U;
+    double horizon = s.lengths[0U];
+    double prefixSpeed = v.maxVel_PPS;
+    for (std::size_t i = 0U; i < depth; ++i)
+    {
+        auto& next = s.scratch;
+        if (!TryPeekQueuedMotionCommandAt(i, next)) break;
+        if (GetCommandAuthorizationFailure(next) != MotionRejectReason::NONE ||
+            next.execution.epoch != cmd.execution.epoch || !next.ownerLease.Matches(cmd.ownerLease) ||
+            previousSegment == (std::numeric_limits<MotionSegmentId>::max)() ||
+            next.execution.segmentId != previousSegment + 1ULL || previousPC == (std::numeric_limits<int>::max)() ||
+            next.sourceLinePC != previousPC + 1 || next.execution.sourceBlockId != next.sourceLinePC)
+        {
+            stop = CncFeedPlanStop::AUTHORITY; break;
+        }
+        if (!next.cncFeedLookahead || !IsMotionCommandConsumerGeometryValid(next, m_pContexts))
+        {
+            stop = CncFeedPlanStop::SCOPE; break;
+        }
+        if (!MotionCommandsHaveIdenticalAxisMapping(cmd, next)) { stop = CncFeedPlanStop::MAPPING; break; }
+        const auto same = [](double a, double b) noexcept
+        { return std::isfinite(a) && std::isfinite(b) && std::abs(a - b) <= 1.0e-12 * (std::max)(1.0, (std::max)(std::abs(a), std::abs(b))); };
+        // F may change; timing/configuration changes remain a stop boundary.
+        // Match the actual LoadNextCommand acceleration law for EACH packet.
+        if (!std::isfinite(next.targetVel) || next.targetVel < 1.0 ||
+            !same(next.accTime, cmd.accTime) || !same(next.decTime, cmd.decTime))
+        {
+            stop = CncFeedPlanStop::SPEED; break;
+        }
+        double nextSpeed = 0.0, nextAcc = 0.0, nextDec = 0.0;
+        if (!ComputeCncPathDynamics(next, nextSpeed, nextAcc, nextDec))
+        {
+            stop = CncFeedPlanStop::SPEED; break;
+        }
+        // A downshift can inherit a faster filter history. Never budget a
+        // future segment using only its smaller local F.
+        const double nextPrefixSpeed = (std::max)(prefixSpeed, nextSpeed);
+        const double nextReserve = nextPrefixSpeed * CYCLE_TIME_SEC * (double(v.velBuffer.size()) + 4.0);
+        if (!std::isfinite(nextReserve)) { stop = CncFeedPlanStop::SPEED; break; }
+        double length = 0.0;
+        std::array<double, 3U> startTangent{}, endTangent{};
+        if (next.cncCornerBlend)
+        {
+            double prefix = 0.0;
+            if (next.mem_startPos[0] != previous[0] || next.mem_startPos[1] != previous[1] ||
+                !ResolveCncCornerBlend(next, prefix)) {
+                stop = CncFeedPlanStop::SCOPE; break;
+            }
+            length = next.mem_totalDist;
+            startTangent[0] = (next.mem_ratio[0] - next.mem_startPos[0]) / prefix;
+            startTangent[1] = (next.mem_ratio[1] - next.mem_startPos[1]) / prefix;
+            const double angle = next.mem_startAngle + next.mem_totalAngle;
+            endTangent[0] = -double(next.dir) * std::sin(angle); endTangent[1] = double(next.dir) * std::cos(angle);
+        }
+        else if (next.pathCorePlanarCircle)
+        {
+            NCPathCoreArcPulseGeometry circle{};
+            if (next.mem_startPos[0] != previous[0] || next.mem_startPos[1] != previous[1] ||
+                !ResolveCncPlanarCircle(next, circle)) {
+                stop = CncFeedPlanStop::SCOPE; break;
+            }
+            length = circle.lengthPulse;
+            const double sx = previous[0] - next.centerPos[0], sy = previous[1] - next.centerPos[1];
+            const double ex = next.targetPos[0] - next.centerPos[0], ey = next.targetPos[1] - next.centerPos[1];
+            const double sr = std::hypot(sx, sy), er = std::hypot(ex, ey);
+            if (!std::isfinite(sr) || !std::isfinite(er) || sr <= 0.0 || er <= 0.0)
+            {
+                stop = CncFeedPlanStop::SCOPE; break;
+            }
+            startTangent[0] = -double(next.dir) * sy / sr; startTangent[1] = double(next.dir) * sx / sr;
+            endTangent[0] = -double(next.dir) * ey / er; endTangent[1] = double(next.dir) * ex / er;
+        }
+        else
+        {
+            for (int j = 0; j < cmd.axisCount; ++j)
+            {
+                startTangent[std::size_t(j)] = next.targetPos[j] - previous[std::size_t(j)];
+                length = std::hypot(length, startTangent[std::size_t(j)]);
+            }
+            if (std::isfinite(length) && length > 0.0)
+                for (int j = 0; j < cmd.axisCount; ++j) startTangent[std::size_t(j)] /= length;
+            endTangent = startTangent;
+        }
+        if (!std::isfinite(length) || length <= nextReserve) { stop = CncFeedPlanStop::SHORT_SEGMENT; break; }
+        bool tangentMatch = true;
+        for (int j = 0; j < cmd.axisCount; ++j)
+            if (!same(startTangent[std::size_t(j)], tangent[std::size_t(j)])) tangentMatch = false;
+        if (!tangentMatch) { stop = CncFeedPlanStop::DIRECTION; break; }
+        tangent = endTangent;
+        if (next.pathCorePlanarCircle || next.cncCornerBlend) circleMask |= (1U << static_cast<unsigned>(count));
+        if (next.cncCornerBlend) blendMask |= (1U << static_cast<unsigned>(count));
+        s.lengths[count] = length - nextReserve;
+        s.speeds[count] = nextSpeed;
+        s.nominalSpeeds[count] = next.targetVel;
+        s.accelerations[count] = nextAcc;
+        s.decelerations[count] = nextDec;
+        prefixSpeed = nextPrefixSpeed;
+        horizon += s.lengths[count];
+        ++count;
+        previousSegment = next.execution.segmentId; previousPC = next.sourceLinePC;
+        for (int j = 0; j < cmd.axisCount; ++j) previous[std::size_t(j)] = next.targetPos[j];
+        if (count == 4U) stop = CncFeedPlanStop::HORIZON;
+    }
+    if (!BuildCncFeedStopPlan(s.lengths, s.speeds, s.accelerations, s.decelerations, count,
+        v.currentCmdVel, s.boundaries)) return;
+    const double proposed = count > 1U ? s.boundaries[1U] : 0.0;
+    // New arrivals can relax only a still-reachable target. No backward edits of
+    // queued packets, no waiting for the NC task, and no deletion of a stop fence.
+    const bool late = !loading && remaining <= reserve;
+    const bool increase = proposed > v.targetEndVel + 0.1 && !late;
+    if (HasPendingExecutionEpochChange() || HasPendingSafetyOrRecoveryRequests() ||
+        GetCommandAuthorizationFailure(cmd) != MotionRejectReason::NONE) return;
+    if (increase) v.targetEndVel = proposed;
+    s.plan.horizon = static_cast<std::uint32_t>(count);
+    s.plan.horizonPulse = horizon; s.plan.reservePulse = reserve;
+    s.plan.lastSegment = previousSegment;
+    s.plan.stop = late && proposed > v.targetEndVel + 0.1 ? CncFeedPlanStop::LATE : stop;
+    s.plan.exitVelocity.fill(0.0);
+    s.plan.nominalVelocity.fill(0.0); s.plan.limitedVelocity.fill(0.0);
+    s.plan.circleMask = circleMask; s.plan.blendMask = blendMask;
+    s.plan.radiusPulse = (cmd.pathCorePlanarCircle || cmd.cncCornerBlend) ? cmd.startRadius : 0.0;
+    s.plan.entryCarry = s.entryCarry;
+    s.plan.handoffFrom = s.handoffFrom;
+    for (std::size_t i = 0U; i < count; ++i)
+    {
+        s.plan.exitVelocity[i] = s.boundaries[i + 1U];
+        s.plan.nominalVelocity[i] = s.nominalSpeeds[i];
+        s.plan.limitedVelocity[i] = s.speeds[i];
+    }
+    s.plan.exitVelocity[0U] = v.targetEndVel;
+    QueueCncFeedPlanDiagnostic(loading ? CncFeedPlanEvent::LOAD :
+        increase ? CncFeedPlanEvent::EXTEND : CncFeedPlanEvent::KEEP_PLAN);
+}
+
+void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
 {
     // ======================================================
     // 1. 派單保護
@@ -14359,6 +15886,70 @@ void MotionCore::LoadNextCommand()
             static_cast<std::uint32_t>(
                 AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY));
         return;
+    }
+
+    // DG same-cycle path split: no physical command beyond the old endpoint
+    // has been distributed yet. Transfer the sub-cycle residual along the
+    // next authorized primitive, not along an extension of the old tangent.
+    std::array<double, MAX_AXES> crossingStart{};
+    double crossingDistance = 0.0;
+    MotionSegmentId crossingFrom = MOTION_SEGMENT_ID_INVALID;
+    if (cncBoundaryCrossing)
+    {
+        const MotionCommand& previous = m_Group.currentCmd;
+        const auto& proof = m_cncFeedLookahead.plan;
+        crossingDistance = vAxis.currentCmdPos - vAxis.finalTargetPos;
+        const double oneStep = vAxis.maxVel_PPS * 0.00025;
+        if (!m_Group.isActive || !vAxis.inPosition || m_safetyControlledStopInProgress ||
+            HasPendingSafetyOrRecoveryRequests() || m_Group.enableTransform ||
+            m_Group.jumpManager.state != JumpState::IDLE || m_pathHold.unionActive ||
+            !previous.cncFeedLookahead || !frontCommand.cncFeedLookahead ||
+            !(previous.pathCorePlanarCircle || frontCommand.pathCorePlanarCircle || previous.cncCornerBlend || frontCommand.cncCornerBlend) ||
+            !MotionCommandsHaveIdenticalAxisMapping(previous, frontCommand) ||
+            GetCommandAuthorizationFailure(previous) != MotionRejectReason::NONE ||
+            previous.execution.epoch != frontCommand.execution.epoch ||
+            !previous.ownerLease.Matches(frontCommand.ownerLease) ||
+            previous.execution.segmentId == (std::numeric_limits<MotionSegmentId>::max)() ||
+            frontCommand.execution.segmentId != previous.execution.segmentId + 1ULL ||
+            frontCommand.execution.sourceBlockId != previous.execution.sourceBlockId + 1U ||
+            !m_cncFeedLookahead.loaded ||
+            !MotionExecutionIdentityExactlyMatches(m_cncFeedLookahead.identity, previous.execution) ||
+            !m_cncFeedLookahead.lease.Matches(previous.ownerLease) || proof.horizon < 2U ||
+            vAxis.targetEndVel <= 0.1 || !std::isfinite(crossingDistance) || crossingDistance < 0.0 ||
+            !std::isfinite(oneStep) || crossingDistance > oneStep * (1.0 + 1e-10)) return;
+        for (int slot = 0; slot < previous.axisCount; ++slot)
+        {
+            crossingStart[slot] = previous.targetPos[slot];
+            if (!std::isfinite(crossingStart[slot]) ||
+                ((frontCommand.pathCorePlanarCircle || frontCommand.cncCornerBlend) && frontCommand.mem_startPos[slot] != crossingStart[slot])) return;
+        }
+        crossingFrom = previous.execution.segmentId;
+    }
+    else if (m_Group.isActive && vAxis.inPosition &&
+        m_Group.currentCmd.cncFeedLookahead && frontCommand.cncFeedLookahead &&
+        m_Group.currentCmd.mode == InterpolationMode::LINEAR &&
+        frontCommand.mode == InterpolationMode::LINEAR &&
+        !m_Group.currentCmd.cncCornerBlend && !frontCommand.cncCornerBlend &&
+        !m_Group.currentCmd.pathCorePlanarCircle && !frontCommand.pathCorePlanarCircle &&
+        vAxis.targetEndVel > 0.1 && vAxis.currentCmdVel > 0.0 && vAxis.logicalCmdVel > 0.0 &&
+        !m_safetyControlledStopInProgress && !HasPendingSafetyOrRecoveryRequests() &&
+        !HasPendingExecutionEpochChange() && !m_pathHold.unionActive &&
+        m_cncFeedLookahead.loaded && m_cncFeedLookahead.plan.horizon >= 2U &&
+        MotionExecutionIdentityExactlyMatches(m_cncFeedLookahead.identity, m_Group.currentCmd.execution) &&
+        m_cncFeedLookahead.lease.Matches(m_Group.currentCmd.ownerLease) &&
+        MotionCommandsHaveIdenticalAxisMapping(m_Group.currentCmd, frontCommand) &&
+        GetCommandAuthorizationFailure(m_Group.currentCmd) == MotionRejectReason::NONE &&
+        m_Group.currentCmd.execution.epoch == frontCommand.execution.epoch &&
+        m_Group.currentCmd.ownerLease.Matches(frontCommand.ownerLease) &&
+        m_Group.currentCmd.execution.segmentId != (std::numeric_limits<MotionSegmentId>::max)() &&
+        frontCommand.execution.segmentId == m_Group.currentCmd.execution.segmentId + 1ULL &&
+        m_Group.currentCmd.execution.sourceBlockId != (std::numeric_limits<decltype(m_Group.currentCmd.execution.sourceBlockId)>::max)() &&
+        frontCommand.execution.sourceBlockId == m_Group.currentCmd.execution.sourceBlockId + 1U)
+    {
+        // EK: identify the successful pure-line predecessor in diagnostics.
+        // The existing line loader still uses its actual start and zero carry;
+        // this does not select the DG geometric boundary-crossing path.
+        crossingFrom = m_Group.currentCmd.execution.segmentId;
     }
 
     const bool pathModeDriverOverrideActive =
@@ -14619,6 +16210,31 @@ void MotionCore::LoadNextCommand()
         if (!IsIncomingPhysicalAxisReadyForGroup(incomingAxis) &&
             IsIncomingPhysicalAxisReadinessTransient(incomingAxis))
         {
+            // Distinguish a live, exact queued source waiting only for physical
+            // following from an unavailable source. This never admits motion.
+            const double following = std::abs(incomingAxis.currentCmdPos - incomingAxis.currentActPos);
+            if (!m_Group.isActive && !m_pathHold.sourceSeen &&
+                m_pathHold.status.phase == MotionPathCoreHoldExcursionPhase::ARMED &&
+                m_pathHold.generation == m_pathHoldGeneration.load(std::memory_order_acquire) &&
+                MotionExecutionIdentityExactlyMatches(frontCommand.execution, m_pathHold.status.identity) &&
+                frontCommand.ownerLease.Matches(m_pathHold.status.ownerLease) &&
+                IsPathCoreAdmissionWaitAxisHealthy(incomingAxis) &&
+                std::isfinite(following) && following > incomingAxis.inPositionWindow_Pulse &&
+                m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+                m_ncSettleRuntimeCycleContiguous && m_ncSettleRuntimeCycleTick != 0ULL)
+            {
+                if (m_pathHold.status.admissionCorrectionAxis != axisIndex)
+                {
+                    ResetPathCoreAdmissionCorrectionDiagnostic();
+                    m_pathHold.status.admissionCorrectionAxis = axisIndex;
+                }
+                m_pathAdmissionCorrectionScopeMask = BuildMotionCommandAxisMask(frontCommand);
+                m_pathHold.status.admissionPending = true;
+                m_pathHold.status.admissionWaitTick = m_ncSettleRuntimeCycleTick;
+                m_pathHold.status.admissionWaitAxis = axisIndex;
+                m_pathHold.status.admissionFollowingError = following;
+                m_pathHold.status.admissionWindowPulse = incomingAxis.inPositionWindow_Pulse;
+            }
             return;
         }
     }
@@ -14971,6 +16587,8 @@ void MotionCore::LoadNextCommand()
     // ======================================================
     if (m_Group.isActive && vAxis.inPosition)
     {
+        FinishCncP1Diagnostic();
+        FinishCncFeedLookahead();
         CompleteTrackedMotionCommand(
             m_Group.currentCmd);
     }
@@ -14992,6 +16610,7 @@ void MotionCore::LoadNextCommand()
     }
 
     // 保存目前執行指令
+    InvalidateCncLineEndpointProof();
     m_Group.currentCmd = cmd;
 
     // Stage NC-0.2K.6.1: the fully authorized, post-pop command becomes the
@@ -15315,6 +16934,27 @@ void MotionCore::LoadNextCommand()
             realAxis.inPosition = false;
         }
     }
+    else if (cmd.cncCornerBlend)
+    {
+        double prefix = 0.0;
+        if (!ResolveCncCornerBlend(cmd, prefix) || m_Group.enableTransform || m_Group.enableHistory ||
+            (!cncBoundaryCrossing && !CncCircleStartMatches(cmd, m_pContexts)))
+        {
+            FailDerivedConsumerGeometry(); return;
+        }
+        if (HasInvalidZeroVelocity()) return;
+        for (unsigned i = 0U; i < 2U; ++i)
+        {
+            m_Group.axisIndices[i] = cmd.axisIndices[i];
+            m_Group.startPos[i] = cmd.mem_startPos[i];
+            m_Group.ratio[i] = (cmd.mem_ratio[i] - cmd.mem_startPos[i]) / prefix;
+            AxisContext& axis = (*m_pContexts)[i];
+            axis.state = MotionState::MotionState_INTERPOLATING; axis.inPosition = false;
+        }
+        m_Group.radius = cmd.mem_radius; m_Group.startAngle = cmd.mem_startAngle; m_Group.totalAngle = cmd.mem_totalAngle;
+        m_Group.centerX = cmd.mem_centerX; m_Group.centerY = cmd.mem_centerY;
+        m_Group.totalDist3D = cmd.mem_totalDist; vAxis.finalTargetPos = cmd.mem_totalDist; vAxis.inPosition = false;
+    }
     else if (m_Group.mode == InterpolationMode::LINEAR)
     {
         double totalDist = 0.0;
@@ -15334,7 +16974,7 @@ void MotionCore::LoadNextCommand()
             // ----------------------------------------------
             // 起點使用 Logical Command Position
             // ----------------------------------------------
-            m_Group.startPos[i] = realAxis.logicalCmdPos;
+            m_Group.startPos[i] = cncBoundaryCrossing ? crossingStart[i] : realAxis.logicalCmdPos.Load();
 
 
             // ----------------------------------------------
@@ -15348,7 +16988,29 @@ void MotionCore::LoadNextCommand()
             // ----------------------------------------------
             if (realAxis.axisType == AxisType::ROTARY && realAxis.useShortestPath)
             {
-                actualTarget = CalculateShortestTarget(m_Group.startPos[i], actualTarget, realAxis.rotaryModulo);
+                double pulsePerUnit = 0.0;
+                if (!TryGetMotionPulsePerUnit(realAxis.resolution_PPR, realAxis.finalLead,
+                    true, pulsePerUnit) ||
+                    !TryResolveMotionTargetPulse(m_Group.startPos[i], actualTarget,
+                        pulsePerUnit, true, realAxis.rotaryModulo, actualTarget))
+                {
+                    derivedGeometryValid = false;
+                    break;
+                }
+                const double resolvedTargetUnits = actualTarget / pulsePerUnit;
+                if (!std::isfinite(resolvedTargetUnits))
+                {
+                    derivedGeometryValid = false;
+                    break;
+                }
+                if (m_pCoordMgr != nullptr &&
+                    !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(realAxis, resolvedTargetUnits))
+                {
+                    AlarmManager::GetInstance().Trigger(
+                        AlarmManager::PROGRAMMED_OVER_TRAVEL, cmd.sourceLinePC, idx);
+                    derivedGeometryValid = false;
+                    break;
+                }
 
 
                 // local cmd
@@ -15420,7 +17082,10 @@ void MotionCore::LoadNextCommand()
         // ==================================================
         // 已經在目標視窗
         // ==================================================
-        if (alreadyAtTarget)
+        // DQ_FIX1: CNC lookahead lines need real interpolation/START even
+        // inside the physical settling window. Preserve ordinary positioning
+        // and the mathematical tiny-distance guard below.
+        if (alreadyAtTarget && !cmd.cncFeedLookahead)
         {
             CompleteWithoutMotion();
             return;
@@ -15505,9 +17170,9 @@ void MotionCore::LoadNextCommand()
         // ----------------------------------------------
         // 起點
         // ----------------------------------------------
-        m_Group.startPos[0] = (*m_pContexts)[axisX].logicalCmdPos;
+        m_Group.startPos[0] = cncBoundaryCrossing ? crossingStart[0] : (*m_pContexts)[axisX].logicalCmdPos.Load();
 
-        m_Group.startPos[1] = (*m_pContexts)[axisY].logicalCmdPos;
+        m_Group.startPos[1] = cncBoundaryCrossing ? crossingStart[1] : (*m_pContexts)[axisY].logicalCmdPos.Load();
 
 
         // ----------------------------------------------
@@ -15560,12 +17225,22 @@ void MotionCore::LoadNextCommand()
         if (cmd.pathCorePlanarCircle)
         {
             NCPathCoreArcPulseGeometry circle{};
-            if (m_Group.pathMode != PathMode::EXACT_STOP || m_Group.enableTransform ||
-                !ResolveNCPathCorePlanarCirclePulse(sx, sy, ex, ey, cx, cy,
-                    cmd.startRadius, cmd.dir, cmd.pathCoreFullCircle, circle))
+            // ED: queued full circles use the immutable closed start/end below.
+            // At a zero-speed seam the sampled start may carry prior FIR roundoff;
+            // retain CncCircleStartMatches bounds before using canonical geometry.
+            if (m_Group.pathMode != (cmd.cncFeedLookahead ? PathMode::CONTINUOUS : PathMode::EXACT_STOP) ||
+                m_Group.enableTransform || (cmd.cncFeedLookahead && !cncBoundaryCrossing && !CncCircleStartMatches(cmd, m_pContexts)) ||
+                (!(cmd.cncFeedLookahead && cmd.pathCoreFullCircle) &&
+                    !ResolveNCPathCorePlanarCirclePulse(sx, sy, ex, ey, cx, cy,
+                        cmd.startRadius, cmd.dir, cmd.pathCoreFullCircle, circle)))
             {
                 FailDerivedConsumerGeometry();
                 return;
+            }
+            if (cmd.cncFeedLookahead)
+            {
+                if (!ResolveCncPlanarCircle(cmd, circle)) { FailDerivedConsumerGeometry(); return; }
+                m_Group.startPos[0] = cmd.mem_startPos[0]; m_Group.startPos[1] = cmd.mem_startPos[1];
             }
             // Both radii are intentionally identical. A rounding seam in the
             // observed start must never select the variable-radius integral.
@@ -15751,11 +17426,16 @@ void MotionCore::LoadNextCommand()
     // 8. Virtual Axis 軌跡初始化
     // ======================================================
 
+    if (cncBoundaryCrossing && crossingDistance >= vAxis.finalTargetPos)
+    {
+        FailDerivedConsumerGeometry(); return;
+    }
+
     // S-Curve 前一段殘留距離
-    vAxis.planningPos = trappedDist;
+    vAxis.planningPos = trappedDist + crossingDistance;
 
     // 新路徑 Virtual Position 從 0 開始
-    vAxis.currentCmdPos = 0.0;
+    vAxis.currentCmdPos = crossingDistance;
 
 
     // EXACT_STOP 必須從 0 速度起跑
@@ -15782,6 +17462,15 @@ void MotionCore::LoadNextCommand()
 
 
     vAxis.dec_PPS2 = (f_dec < 0.0001) ? 1e10 : (vAxis.maxVel_PPS / f_dec);
+
+    if (cmd.cncFeedLookahead && (cmd.pathCorePlanarCircle || cmd.cncCornerBlend))
+    {
+        if (!ComputeCncPathDynamics(cmd, vAxis.maxVel_PPS, vAxis.acc_PPS2, vAxis.dec_PPS2))
+        {
+            FailDerivedConsumerGeometry(); return;
+        }
+        vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
+    }
 
     if (!std::isfinite(vAxis.maxVel_PPS) ||
         !std::isfinite(vAxis.cruiseVel_PPS) ||
@@ -15810,8 +17499,9 @@ void MotionCore::LoadNextCommand()
 
     MotionCommand nextCmd{};
 
-    if (m_Group.pathMode == PathMode::CONTINUOUS &&
-        TryPeekNextMotionCommand(nextCmd) &&
+    const bool cncNextVisible = !cmd.cncFeedLookahead && m_Group.pathMode == PathMode::CONTINUOUS &&
+        TryPeekNextMotionCommand(nextCmd);
+    if (cncNextVisible && !nextCmd.cncFeedLookahead &&
         GetCommandAuthorizationFailure(nextCmd) ==
         MotionRejectReason::NONE &&
         IsMotionCommandConsumerGeometryValid(nextCmd, m_pContexts))
@@ -16022,6 +17712,10 @@ void MotionCore::LoadNextCommand()
 
     TrackMotionCommandStarted(
         m_Group.currentCmd);
+    ArmCncP1LateJunction(cncNextVisible, nextCmd);
+    m_cncFeedLookahead.entryCarry = crossingDistance;
+    m_cncFeedLookahead.handoffFrom = crossingFrom;
+    RefreshCncFeedLookahead(true);
 
 
     // ======================================================
@@ -16159,6 +17853,9 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
             axisIndex >= static_cast<int>(m_pContexts->size()) ||
             seenAxis[static_cast<std::size_t>(axisIndex)] ||
             !(*m_pContexts)[axisIndex].isExist ||
+            (commandSource == MotionCommandSource::NC_MEMORY &&
+                !IsNCTranslationSnapshotEmpty(m_pendingTranslation) &&
+                (axisIndex > 2 || (*m_pContexts)[axisIndex].axisType != AxisType::LINEAR)) ||
             !std::isfinite(targetPos[slot]))
         {
             RejectInvalidProducerMotionCommand(
@@ -16169,6 +17866,13 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
             return;
         }
         seenAxis[static_cast<std::size_t>(axisIndex)] = true;
+    }
+
+    if (!IsPendingCommandTranslationValid(commandSource))
+    {
+        RejectNonGeometryProducerMotionCommand(invalidCommand, commandEpoch,
+            commandSource, commandOwnerLease, MotionRejectReason::NOT_READY);
+        return;
     }
 
     // 1. 打包包裹
@@ -16193,6 +17897,7 @@ void MotionCore::ArcMove(const std::vector<int>& axes, const std::vector<double>
     // 🌟 貼上標籤！記錄這條路徑是來自哪一行 G-Code
     cmd.sourceLinePC = m_pendingSourcePC;
     cmd.sourceWCS = m_pendingSourceWCS; // 🌟 貼上 WCS 標籤！
+    if (commandSource == MotionCommandSource::NC_MEMORY) cmd.sourceTranslation = m_pendingTranslation;
     // 🌟 貼上刀具標籤！
     cmd.sourceToolLengthMode = m_pendingToolMode;
     cmd.sourceHCode = m_pendingHCode;
@@ -17461,6 +19166,7 @@ void MotionCore::Process_Forward_Crossing()
         m_Group.historyQueue.pop_front();
     }
 
+    InvalidateCncLineEndpointProof();
     m_Group.currentCmd = nextCommand;
 
     // ==========================================
@@ -17670,6 +19376,13 @@ double MotionCore::PlanTrapezoidal_B2(double currentPos, double targetPos, doubl
 }
 void MotionCore::UpdateInterpolation()
 {
+    // A waiting heartbeat must be earned anew by this pass's real load gate.
+    m_pathAdmissionCorrectionScopeMask = 0U;
+    m_pathHold.status.admissionPending = false;
+    m_pathHold.status.admissionWaitTick = 0ULL;
+    m_pathHold.status.admissionWaitAxis = -1;
+    m_pathHold.status.admissionFollowingError = 0.0;
+    m_pathHold.status.admissionWindowPulse = 0.0;
     // 所有 Stale 清理 Helper 共用這一份 250 us Pass 額度。
     m_staleCommandDiscardBudgetRemaining =
         MOTION_COMMAND_STALE_DISCARD_LIMIT_PER_RUNTIME_PASS;
@@ -17767,6 +19480,18 @@ void MotionCore::UpdateInterpolation()
         (m_Group.enableHistory || m_Group.enableTransform ||
             m_Group.jumpManager.state != JumpState::IDLE ||
             m_Group.pathMode != PathMode::EXACT_STOP))
+    {
+        TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return;
+    }
+
+    // DH geometry has no legacy history/transform interpretation. Ordinary
+    // HOLD uses [0,1] override; an unsupported speed-up must not bypass the
+    // compound's curvature cap. The protected safety-stop path stays prior.
+    if (m_Group.isActive && m_Group.currentCmd.cncCornerBlend && !m_safetyControlledStopInProgress &&
+        (m_Group.enableHistory || m_Group.enableTransform || m_Group.jumpManager.state != JumpState::IDLE ||
+            m_Group.pathMode != PathMode::CONTINUOUS || !std::isfinite(m_Group.feedrateOverride) ||
+            m_Group.feedrateOverride < 0.0 || m_Group.feedrateOverride > 1.0))
     {
         TriggerGroupMappingIntegrityEmergencyStop(-1, true);
         return;
@@ -18267,6 +19992,7 @@ void MotionCore::UpdateInterpolation()
     // ======================================================
     else
     {
+        bool cncBoundaryFrameReady = false;
         // 拆包裹邏輯
         // ✅ 換成這段 [工業級 G00/G61 準停檢查邏輯]：
         if (!m_Group.isActive || vAxis.inPosition)
@@ -18304,20 +20030,67 @@ void MotionCore::UpdateInterpolation()
             // 大腦算完了，且實體馬達也都擠進視窗了，才准拆下一個包裹！
             if (allAxesInPos && !m_Group.cmdQueue.empty())
             {
-                LoadNextCommand();
+                MotionCommand boundaryNext{};
+                const bool carriedFrame = m_Group.isActive && m_Group.currentCmd.cncFeedLookahead &&
+                    vAxis.targetEndVel > 0.1 && TryPeekNextMotionCommand(boundaryNext) &&
+                    boundaryNext.cncFeedLookahead &&
+                    (m_Group.currentCmd.pathCorePlanarCircle || boundaryNext.pathCorePlanarCircle || m_Group.currentCmd.cncCornerBlend || boundaryNext.cncCornerBlend);
+                if (carriedFrame)
+                {
+                    const MotionExecutionIdentity outgoing = m_Group.currentCmd.execution;
+                    const double outputVelocity = vAxis.logicalCmdVel;
+                    LoadNextCommand(true);
+                    if (!m_Group.isActive || MotionExecutionIdentityExactlyMatches(outgoing, m_Group.currentCmd.execution)) return;
+                    cncBoundaryFrameReady = true;
+                    vCmd.instantCmdPos = vAxis.currentCmdPos;
+                    vCmd.instantCmdVel = outputVelocity;
+                }
+                else LoadNextCommand();
             }
         }
 
         if (!m_Group.isActive) return;
-        vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
+        if (!cncBoundaryFrameReady)
+        {
+            vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
+            RefreshCncP1LateJunction();
+            if (m_Group.currentCmd.cncFeedLookahead)
+                vAxis.cruiseVel_PPS = (std::min)(vAxis.cruiseVel_PPS, vAxis.maxVel_PPS);
+            RefreshCncFeedLookahead();
 
-        if (vAxis.state == MotionState::MotionState_STOPPING)
-        {
-            Calc_Trajectory_Velocity(vAxis, vCmd);
-        }
-        else
-        {
-            Calc_Trajectory_Trapezoidal(vAxis, vCmd);
+            if (vAxis.state == MotionState::MotionState_STOPPING)
+            {
+                Calc_Trajectory_Velocity(vAxis, vCmd);
+            }
+            else
+            {
+                Calc_Trajectory_Trapezoidal(vAxis, vCmd);
+            }
+            if (m_Group.currentCmd.cncFeedLookahead && vAxis.inPosition &&
+                vAxis.targetEndVel > 0.1 && !m_safetyControlledStopInProgress &&
+                m_Group.pathMode == PathMode::CONTINUOUS && !HasPendingSafetyOrRecoveryRequests())
+            {
+                MotionCommand next{};
+                if (TryPeekNextMotionCommand(next) && next.cncFeedLookahead &&
+                    (m_Group.currentCmd.pathCorePlanarCircle || next.pathCorePlanarCircle || m_Group.currentCmd.cncCornerBlend || next.cncCornerBlend))
+                {
+                    const MotionExecutionIdentity outgoing = m_Group.currentCmd.execution;
+                    const double outputVelocity = vCmd.instantCmdVel;
+                    vAxis.logicalCmdVel = outputVelocity;
+                    LoadNextCommand(true);
+                    if (!m_Group.isActive || MotionExecutionIdentityExactlyMatches(outgoing, m_Group.currentCmd.execution))
+                    {
+                        // The existing lifecycle/authorization boundary may deny this
+                        // handoff (including its existing stale rejection). Do not
+                        // publish an overshoot or integrate another scalar sample.
+                        return;
+                    }
+                    // The filter was advanced exactly once this cycle. Geometry
+                    // now distributes only the carried residual on the new path.
+                    vCmd.instantCmdPos = vAxis.currentCmdPos;
+                    vCmd.instantCmdVel = outputVelocity;
+                }
+            }
         }
     }
 
@@ -18408,6 +20181,7 @@ void MotionCore::UpdateInterpolation()
                     return;
                 }
 
+                InvalidateCncLineEndpointProof();
                 m_Group.currentCmd = m_Group.historyQueue.back();
                 m_Group.historyQueue.pop_back();
 
@@ -18600,13 +20374,80 @@ void MotionCore::UpdateInterpolation()
                 (derivative / retained.mem_totalDist) * traversalVelocity;
         }
     }
+    else if (m_Group.currentCmd.cncCornerBlend)
+    {
+        const MotionCommand& c = m_Group.currentCmd;
+        const double prefix = std::hypot(c.mem_ratio[0] - c.mem_startPos[0], c.mem_ratio[1] - c.mem_startPos[1]);
+        const double distance = (std::max)(0.0, (std::min)(c.mem_totalDist, vCmd.instantCmdPos));
+        const bool inArc = distance >= prefix;
+        const double angle = c.mem_startAngle + (inArc ? (distance - prefix) / c.mem_radius * double(c.dir) : 0.0);
+        for (unsigned i = 0U; i < 2U; ++i)
+        {
+            AxisContext& axis = (*m_pContexts)[i];
+            double position = 0.0, tangent = 0.0;
+            if (!inArc) { tangent = (c.mem_ratio[i] - c.mem_startPos[i]) / prefix; position = c.mem_startPos[i] + distance * tangent; }
+            else {
+                position = c.centerPos[i] + c.mem_radius * (i == 0U ? std::cos(angle) : std::sin(angle));
+                tangent = i == 0U ? -double(c.dir) * std::sin(angle) : double(c.dir) * std::cos(angle);
+            }
+            if (distance == 0.0) position = c.mem_startPos[i];
+            if (distance == c.mem_totalDist) position = c.targetPos[i];
+            if (!std::isfinite(position) || !std::isfinite(tangent) || !std::isfinite(vCmd.instantCmdVel))
+            {
+                TriggerGroupMappingIntegrityEmergencyStop(-1, true); return;
+            }
+            axis.logicalCmdPos = position; axis.logicalCmdVel = tangent * vCmd.instantCmdVel;
+        }
+        auto& prefixState = m_cncFeedLookahead;
+        if (prefixState.prefixEnabled && prefixState.loaded &&
+            MotionExecutionIdentityExactlyMatches(prefixState.identity, c.execution) &&
+            prefixState.lease.Matches(c.ownerLease) && !m_safetyControlledStopInProgress)
+        {
+            // Observe actual filtered output, not just a requested ceiling.
+            vAxis.logicalCmdVel = vCmd.instantCmdVel;
+            if (!inArc && !prefixState.prefixFastSeen &&
+                vAxis.currentCmdVel > vAxis.maxVel_PPS * 1.01 && vCmd.instantCmdVel > vAxis.maxVel_PPS * 1.01)
+            {
+                prefixState.prefixFastSeen = true;
+                QueueCncFeedPlanDiagnostic(CncFeedPlanEvent::PREFIX_FAST);
+            }
+            if (!inArc && !prefixState.prefixAuthoredSeen &&
+                prefixState.prefixLimit > c.targetVel * 1.01 &&
+                vAxis.currentCmdVel > c.targetVel * 1.01 && vCmd.instantCmdVel > c.targetVel * 1.01)
+            {
+                prefixState.prefixAuthoredSeen = true;
+                QueueCncFeedPlanDiagnostic(CncFeedPlanEvent::PREFIX_AUTHORED);
+            }
+            if (!inArc && prefixState.prefixFastSeen && !prefixState.prefixBrakeSeen &&
+                m_Group.feedrateOverride >= 1.0 &&
+                vAxis.currentCmdVel < prefixState.prefixPreviousRaw - vAxis.dec_PPS2 * CYCLE_TIME_SEC * 0.1)
+            {
+                prefixState.prefixBrakeSeen = true;
+                QueueCncFeedPlanDiagnostic(CncFeedPlanEvent::PREFIX_BRAKE);
+            }
+            prefixState.prefixPreviousRaw = vAxis.currentCmdVel;
+        }
+        if (inArc && !m_cncFeedLookahead.blendEntered)
+        {
+            m_cncFeedLookahead.blendEntered = true;
+            vAxis.logicalCmdVel = vCmd.instantCmdVel;
+            QueueCncFeedPlanDiagnostic(CncFeedPlanEvent::BLEND_ENTER);
+        }
+    }
     else if (m_Group.mode == InterpolationMode::LINEAR)
     {
-        for (int i = 0; i < m_Group.axisCount; ++i) {
-            int idx = m_Group.axisIndices[i];
-            AxisContext& realAxis = (*m_pContexts)[idx];
-            realAxis.logicalCmdPos = m_Group.startPos[i] + (vCmd.instantCmdPos * m_Group.ratio[i]);
-            realAxis.logicalCmdVel = vCmd.instantCmdVel * m_Group.ratio[i];
+        if (IsFixedPlanarLineEndpointScope() && vAxis.state == MotionState::MotionState_IDLE)
+        {
+            if (!TryCompleteFixedPlanarLineEndpoint(vCmd)) return;
+        }
+        else
+        {
+            for (int i = 0; i < m_Group.axisCount; ++i) {
+                int idx = m_Group.axisIndices[i];
+                AxisContext& realAxis = (*m_pContexts)[idx];
+                realAxis.logicalCmdPos = m_Group.startPos[i] + (vCmd.instantCmdPos * m_Group.ratio[i]);
+                realAxis.logicalCmdVel = vCmd.instantCmdVel * m_Group.ratio[i];
+            }
         }
     }
     else if (m_Group.mode == InterpolationMode::CIRCULAR_CW || m_Group.mode == InterpolationMode::CIRCULAR_CCW)
@@ -18647,6 +20488,94 @@ void MotionCore::UpdateInterpolation()
         //
         // 因為 Spiral 每個 progress 的實際距離不同。
         // =====================================================
+        // EC: PID1073 left an ordinary full circle a few scalar ULPs
+        // short after IDLE canonicalization. Complete only the drained,
+        // authorized normal source to its loaded immutable path length.
+        // The existing progress>=1 branch then emits its exact target bits.
+        const MotionCommand& ecCommand = m_Group.currentCmd;
+        const bool ecArcTerminal = vAxis.state == MotionState::MotionState_IDLE &&
+            m_Group.isActive && ecCommand.pathCorePlanarCircle && !ecCommand.pathCoreFeedExactStop &&
+            (ecCommand.mode == InterpolationMode::CIRCULAR_CW ||
+                ecCommand.mode == InterpolationMode::CIRCULAR_CCW) &&
+            m_Group.mode == ecCommand.mode &&
+            ecCommand.axisCount == 2 && m_Group.axisCount == 2 &&
+            ecCommand.axisIndices[0] == 0 && ecCommand.axisIndices[1] == 1 &&
+            m_Group.axisIndices[0] == 0 && m_Group.axisIndices[1] == 1 &&
+            ((ecCommand.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+                m_Group.pathMode == PathMode::EXACT_STOP && !ecCommand.cncFeedLookahead) ||
+                IsCncArcEndpointScope()) && !ecCommand.cncCornerBlend &&
+            !ecCommand.pathCoreRetainedTraversal && !ecCommand.pathCoreRetainedReverse &&
+            !ecCommand.replayTerminalAlreadyPublished &&
+            ecCommand.execution.IsAssigned() && ecCommand.execution.source == MotionCommandSource::NC_MEMORY &&
+            ecCommand.ownerLease.IsValid() && ecCommand.ownerLease.owner == MotionOwner::AUTO &&
+            !m_Group.enableHistory && !m_Group.enableTransform &&
+            m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
+            !m_safetyControlledStopInProgress && !IsPathCoreHoldExcursionDriving();
+        if (ecArcTerminal)
+        {
+            if (HasPendingSafetyOrRecoveryRequests() ||
+                GetCommandAuthorizationFailure(ecCommand) != MotionRejectReason::NONE)
+            {
+                return;
+            }
+            LifecycleCommitReservationGuard endpointCommit(*this, ecCommand.execution);
+            if (!endpointCommit.IsAcquired() || HasPendingSafetyOrRecoveryRequests() ||
+                GetCommandAuthorizationFailure(ecCommand) != MotionRejectReason::NONE)
+            {
+                return;
+            }
+            const double distance = m_Group.totalDist3D;
+            const double error = std::abs(distance - vCmd.instantCmdPos);
+            bool endpointValid = vAxis.isVirtualAxis && vAxis.inPosition &&
+                !vAxis.isFault && !vAxis.isLagAlarm &&
+                std::isfinite(distance) && distance > 1e-12 && std::isfinite(error) &&
+                error <= 1e-12 * distance &&
+                std::isfinite(startRadius) && startRadius > 0.0 && startRadius == endRadius &&
+                startRadius == m_Group.radius && std::isfinite(m_Group.startAngle) &&
+                std::isfinite(totalAngle) && totalAngle != 0.0 &&
+                distance == startRadius * std::abs(totalAngle) &&
+                m_Group.centerX == ecCommand.centerPos[0] && m_Group.centerY == ecCommand.centerPos[1] &&
+                std::isfinite(ecCommand.targetPos[0]) && std::isfinite(ecCommand.targetPos[1]) &&
+                std::isfinite(ecCommand.centerPos[0]) && std::isfinite(ecCommand.centerPos[1]) &&
+                vAxis.currentCmdPos == vCmd.instantCmdPos &&
+                vAxis.planningPos == vAxis.currentCmdPos && vAxis.finalTargetPos == vAxis.currentCmdPos &&
+                vAxis.currentCmdVel == 0.0 && vAxis.logicalCmdVel == 0.0 &&
+                vAxis.targetVelocity == 0.0 && vAxis.targetEndVel == 0.0 && vCmd.instantCmdVel == 0.0 &&
+                vAxis.bufferSum == 0.0 &&
+                std::all_of(vAxis.velBuffer.begin(), vAxis.velBuffer.end(),
+                    [](double velocity) { return velocity == 0.0; });
+            for (int slot = 0; endpointValid && slot < 2; ++slot)
+            {
+                const AxisContext& realAxis = (*m_pContexts)[m_Group.axisIndices[slot]];
+                const double pulsePerMM = realAxis.resolution_PPR / realAxis.finalLead;
+                const double errorMM = error / pulsePerMM;
+                endpointValid = std::isfinite(realAxis.resolution_PPR) && realAxis.resolution_PPR > 0.0 &&
+                    std::isfinite(realAxis.finalLead) && realAxis.finalLead > 0.0 &&
+                    std::isfinite(pulsePerMM) && pulsePerMM > 0.0 &&
+                    std::isfinite(errorMM) && errorMM <= 5e-8;
+            }
+            if (!endpointValid)
+            {
+                endpointCommit.Release();
+                TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+                return;
+            }
+            vAxis.currentCmdPos = distance;
+            vAxis.planningPos = distance;
+            vAxis.finalTargetPos = distance;
+            vCmd.instantCmdPos = distance;
+            if (ecCommand.cncFeedLookahead)
+            {
+                // Emit both exact packet endpoints under the same reservation
+                // before recording the RT-local candidate. Only successful
+                // tracked COMPLETED feedback publishes its NC-visible marker.
+                realX.logicalCmdPos = ecCommand.targetPos[0];
+                realY.logicalCmdPos = ecCommand.targetPos[1];
+                realX.logicalCmdVel = 0.0;
+                realY.logicalCmdVel = 0.0;
+                m_cncLineEndpointCandidate = ecCommand.execution;
+            }
+        }
         double progressRatio = CalcSpiralProgressFromPathLength(vCmd.instantCmdPos, m_Group.totalDist3D, startRadius, endRadius, totalAngle, deltaZ);
 
 
@@ -19431,6 +21360,7 @@ void MotionCore::UpdateInterpolation()
                 }
 
                 m_Group.isActive = false;
+                InvalidateCncLineEndpointProof();
                 m_Group.currentCmd.execution = MotionExecutionIdentity{};
                 m_Group.currentCmd.ownerLease = MotionOwnerLease{};
                 m_safetyControlledStopInProgress = false;
@@ -19478,6 +21408,8 @@ void MotionCore::UpdateInterpolation()
                 return;
             }
 
+            FinishCncP1Diagnostic();
+            FinishCncFeedLookahead();
             CompleteTrackedMotionCommand(
                 m_Group.currentCmd);
 
@@ -22238,6 +24170,14 @@ bool MotionCore::HasExactExecutionDrainAcknowledgement(
     MotionExecutionEpoch executionEpoch,
     const MotionOwnerLease& ownerLease) const noexcept
 {
+    return HasExactExecutionDrainAcknowledgementImpl(executionEpoch, ownerLease, false);
+}
+
+bool MotionCore::HasExactExecutionDrainAcknowledgementImpl(
+    MotionExecutionEpoch executionEpoch,
+    const MotionOwnerLease& ownerLease,
+    bool ownsCommitReservation) const noexcept
+{
     if (executionEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
         !ownerLease.IsValid())
     {
@@ -22259,9 +24199,13 @@ bool MotionCore::HasExactExecutionDrainAcknowledgement(
             std::memory_order_acquire);
     const MotionOwnerLease entryOwnerLease =
         UnpackMotionOwnerState(entryOwnerState);
+    // Only the transition caller may admit its own acquired reservation.
+    // Public drain queries continue to reject every reservation as before.
+    const std::uint64_t expectedReservation = ownsCommitReservation
+        ? EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED : 0ULL;
     if ((entryExecutionPublication &
         (EXECUTION_EPOCH_PUBLICATION_PENDING |
-            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != expectedReservation ||
         UnpackExecutionEpochPublication(entryExecutionPublication) !=
         executionEpoch ||
         !entryOwnerLease.Matches(ownerLease) ||
@@ -22340,8 +24284,171 @@ bool MotionCore::HasExactExecutionDrainAcknowledgement(
         exitObservedDrainRevocationGeneration &&
         (exitExecutionPublication &
             (EXECUTION_EPOCH_PUBLICATION_PENDING |
-                EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL &&
+                EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == expectedReservation &&
         !HasPendingSafetyOrRecoveryRequests();
+}
+
+
+MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const NCTranslationSnapshot& previous,
+    const NCTranslationSnapshot& next, MotionExecutionEpoch executionEpoch,
+    const MotionOwnerLease& ownerLease) noexcept
+{
+    if (!IsNCTranslationSnapshotValid(previous) || !IsNCTranslationSnapshotValid(next) ||
+        previous.generation == (std::numeric_limits<std::uint64_t>::max)() ||
+        previous.revision == (std::numeric_limits<std::uint64_t>::max)() ||
+        next.generation != previous.generation + 1ULL ||
+        next.revision != previous.revision + 1ULL ||
+        !ownerLease.IsValid() || ownerLease.owner != MotionOwner::AUTO) return MotionNCTranslationTransitionResult::DEFERRED;
+    // Exactly one standalone selection per drained transaction.
+    // EXT and all fields outside that selection remain frozen.
+    const bool distanceChanged = previous.distanceMode != next.distanceMode;
+    const bool unitsChanged = previous.unitsMode != next.unitsMode;
+    const bool workCoordinateChanged = previous.wcsCode != next.wcsCode;
+    const bool toolLengthChanged = previous.toolLengthMode != next.toolLengthMode ||
+        previous.toolHCode != next.toolHCode;
+    const bool planarRotationChanged = previous.rotationMode != next.rotationMode ||
+        std::memcmp(previous.rotationCenterMM, next.rotationCenterMM, sizeof(next.rotationCenterMM)) != 0 ||
+        std::memcmp(&previous.rotationAngleDeg, &next.rotationAngleDeg, sizeof(double)) != 0;
+    const bool scalingChanged = previous.scalingMode != next.scalingMode ||
+        std::memcmp(&previous.scalingFactor, &next.scalingFactor, sizeof(double)) != 0 ||
+        std::memcmp(previous.scalingCenterMM, next.scalingCenterMM, sizeof(next.scalingCenterMM)) != 0;
+    const bool mirrorChanged = previous.mirrorMask != next.mirrorMask ||
+        std::memcmp(previous.mirrorCenterMM, next.mirrorCenterMM, sizeof(next.mirrorCenterMM)) != 0;
+    const bool workCompensationChanged = previous.workMode != next.workMode ||
+        previous.workWCode != next.workWCode ||
+        std::memcmp(previous.workOffset, next.workOffset, sizeof(next.workOffset)) != 0 ||
+        std::memcmp(previous.workRotationCenterMM, next.workRotationCenterMM,
+            sizeof(next.workRotationCenterMM)) != 0;
+    if (static_cast<unsigned>(distanceChanged) + static_cast<unsigned>(workCoordinateChanged) +
+        static_cast<unsigned>(toolLengthChanged) + static_cast<unsigned>(planarRotationChanged) +
+        static_cast<unsigned>(workCompensationChanged) + static_cast<unsigned>(unitsChanged) +
+        static_cast<unsigned>(scalingChanged) + static_cast<unsigned>(mirrorChanged) != 1U)
+        return MotionNCTranslationTransitionResult::DEFERRED;
+    if (planarRotationChanged)
+    {
+        const double canonicalZero = 0.0;
+        if ((next.rotationMode == 68 && previous.distanceMode != 90) ||
+            (next.rotationMode == 69 &&
+                (std::memcmp(&next.rotationCenterMM[0], &canonicalZero, sizeof(double)) != 0 ||
+                 std::memcmp(&next.rotationCenterMM[1], &canonicalZero, sizeof(double)) != 0 ||
+                 std::memcmp(&next.rotationAngleDeg, &canonicalZero, sizeof(double)) != 0)))
+            return MotionNCTranslationTransitionResult::DEFERRED;
+    }
+    if (workCompensationChanged)
+    {
+        const double canonicalZero = 0.0;
+        const bool cancelled = next.workMode == 169;
+        if (next.workMode == 168 && next.workOffset[3] != 0.0 && previous.distanceMode != 90)
+            return MotionNCTranslationTransitionResult::DEFERRED;
+        if (cancelled || next.workOffset[3] == 0.0)
+        {
+            for (unsigned axis = 0U; axis < 2U; ++axis)
+                if (std::memcmp(&next.workRotationCenterMM[axis], &canonicalZero, sizeof(double)) != 0)
+                    return MotionNCTranslationTransitionResult::DEFERRED;
+        }
+        if (cancelled)
+        {
+            for (unsigned axis = 0U; axis < 8U; ++axis)
+                if (std::memcmp(&next.workOffset[axis], &canonicalZero, sizeof(double)) != 0)
+                    return MotionNCTranslationTransitionResult::DEFERRED;
+        }
+    }
+    NCTranslationSnapshot expected = previous;
+    if (distanceChanged) expected.distanceMode = next.distanceMode;
+    else if (unitsChanged) expected.unitsMode = next.unitsMode;
+    else if (workCoordinateChanged)
+    {
+        expected.wcsCode = next.wcsCode;
+        std::memcpy(expected.wcsOffsetMM, next.wcsOffsetMM, sizeof(expected.wcsOffsetMM));
+    }
+    else if (toolLengthChanged)
+    {
+        expected.toolLengthMode = next.toolLengthMode;
+        expected.toolHCode = next.toolHCode;
+        std::memcpy(expected.toolOffsetMM, next.toolOffsetMM, sizeof(expected.toolOffsetMM));
+    }
+    else if (planarRotationChanged)
+    {
+        expected.rotationMode = next.rotationMode;
+        std::memcpy(expected.rotationCenterMM, next.rotationCenterMM, sizeof(expected.rotationCenterMM));
+        expected.rotationAngleDeg = next.rotationAngleDeg;
+    }
+    else if (scalingChanged)
+    {
+        expected.scalingMode = next.scalingMode;
+        expected.scalingFactor = next.scalingFactor;
+        std::memcpy(expected.scalingCenterMM, next.scalingCenterMM, sizeof(expected.scalingCenterMM));
+    }
+    else if (mirrorChanged)
+    {
+        expected.mirrorMask = next.mirrorMask;
+        std::memcpy(expected.mirrorCenterMM, next.mirrorCenterMM, sizeof(expected.mirrorCenterMM));
+    }
+    else
+    {
+        expected.workMode = next.workMode;
+        expected.workWCode = next.workWCode;
+        std::memcpy(expected.workOffset, next.workOffset, sizeof(expected.workOffset));
+        std::memcpy(expected.workRotationCenterMM, next.workRotationCenterMM,
+            sizeof(expected.workRotationCenterMM));
+    }
+    expected.generation = next.generation;
+    expected.revision = next.revision;
+    if (!SameNCTranslationSnapshot(expected, next) || !MatchesNCTranslation(previous) ||
+        !HasExactExecutionDrainAcknowledgement(executionEpoch, ownerLease)) return MotionNCTranslationTransitionResult::DEFERRED;
+
+    // This identity is only an epoch reservation key. It is never submitted,
+    // allocated as a real segment, entered in a ledger or published as feedback.
+    MotionExecutionIdentity reservationIdentity{};
+    reservationIdentity.epoch = executionEpoch;
+    reservationIdentity.segmentId = 1ULL; // Existing reservation requires IsAssigned().
+    reservationIdentity.source = MotionCommandSource::NC_MEMORY;
+    LifecycleCommitReservationGuard transition(*this, reservationIdentity);
+    if (!transition.IsAcquired() || GetQueueSize() != 0U ||
+        GetCommandIngressSize() != 0U || GetCommandReplaySize() != 0U ||
+        !MatchesNCTranslation(previous) ||
+        !HasExactExecutionDrainAcknowledgementImpl(executionEpoch, ownerLease, true)) return MotionNCTranslationTransitionResult::DEFERRED;
+
+    // Completed queued LINEAR and canonical ARC endpoints carry the same exact
+    // native endpoint contract as ordinary fixed XYZ commands. Inspect
+    // the now-stable last physical source, including an older epoch retained
+    // across a zero-point command. Consecutive mode-only blocks keep this run
+    // and lease but intentionally have newer translation generations.
+    const MotionCommand& predecessor = m_Group.currentCmd;
+    if (predecessor.execution.IsAssigned() &&
+        predecessor.execution.source == MotionCommandSource::NC_MEMORY &&
+        predecessor.ownerLease.Matches(ownerLease) &&
+        predecessor.sourceTranslation.runToken == previous.runToken &&
+        (predecessor.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+            predecessor.cncFeedLookahead || predecessor.cncCornerBlend ||
+            predecessor.pathCoreRetainedTraversal || predecessor.pathCoreRetainedReverse ||
+            predecessor.replayTerminalAlreadyPublished) &&
+        !HasCompletedCncLineEndpointProof(predecessor, previous, executionEpoch))
+        return MotionNCTranslationTransitionResult::UNSUPPORTED_PREDECESSOR;
+
+    // A single NC writer owns this publication. Valid next=previous+1 and an
+    // exact current match make this retire/publish monotonic. RT has no active
+    // or queued source, and epoch replacement is excluded by the reservation.
+    m_translationPublication.Retire();
+    if (!m_translationPublication.Publish(next)) return MotionNCTranslationTransitionResult::DEFERRED;
+    if (predecessor.cncFeedLookahead && predecessor.pathCorePlanarCircle &&
+        predecessor.execution.IsAssigned() && predecessor.execution.epoch == executionEpoch &&
+        predecessor.execution.source == MotionCommandSource::NC_MEMORY &&
+        predecessor.ownerLease.Matches(ownerLease) &&
+        predecessor.sourceTranslation.runToken == previous.runToken)
+    {
+        // Capture stable packet scalars, then release the lifecycle reservation
+        // before NC-side console I/O. No I/O is added to the 250 us path.
+        const MotionSegmentId completedSegment = predecessor.execution.segmentId;
+        const int completedSourcePC = predecessor.sourceLinePC;
+        transition.Release();
+        RtPrintf("[COORD][ARC-ENDPOINT] run=%llu epoch=%llu seg=%llu sourcePC=%d generation=%llu completed=1 drained=1\n",
+            static_cast<unsigned long long>(previous.runToken),
+            static_cast<unsigned long long>(executionEpoch),
+            static_cast<unsigned long long>(completedSegment), completedSourcePC,
+            static_cast<unsigned long long>(next.generation));
+    }
+    return MotionNCTranslationTransitionResult::ACCEPTED;
 }
 
 
@@ -22725,4 +24832,5 @@ template void MotionCore::UpdateMotion<ENI_ServoDrive>(
     ENI_ServoDrive&,
     AxisContext&,
     const MotionServoInputSnapshot&);
-template void MotionCore::Run_Servo_Loop<ENI_ServoDrive>(ENI_ServoDrive&, AxisContext&, const AxisCommand&);
+template void MotionCore::Run_Servo_Loop<ENI_ServoDrive>(ENI_ServoDrive&, AxisContext&, const AxisCommand&,
+    const MotionServoInputSnapshot&);

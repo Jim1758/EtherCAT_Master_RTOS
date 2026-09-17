@@ -8,7 +8,7 @@
 
 // BZ: immutable canonical geometry. No execution authority or provenance is
 // stored here. All calls are single-threaded, bounded and allocation-free.
-enum class NCPathCoreRetainedKind : std::uint8_t { NONE = 0U, LINE = 1U, ARC = 2U };
+enum class NCPathCoreRetainedKind : std::uint8_t { NONE = 0U, LINE = 1U, ARC = 2U, LINE_ARC = 3U };
 
 struct NCPathCoreRetainedGeometry
 {
@@ -29,6 +29,20 @@ bool BuildNCPathCoreRetainedLine(const NCPathCoreFeedLineV2& source,
     NCPathCoreRetainedGeometry& output) noexcept;
 bool BuildNCPathCoreRetainedArc(const NCPathCoreFeedArcV2& source,
     NCPathCoreRetainedGeometry& output) noexcept;
+// DH: a trimmed line followed by its tangent corner arc in ONE source row.
+// Original vertex/next endpoint authorize only this local corner; Q is not modal.
+struct NCPathCoreCornerMetadata
+{
+    std::array<double, 2U> vertex{}, next{}, entry{}, exit{};
+    double toleranceMM = 0.0, trimMM = 0.0, deviationMM = 0.0; // conservative bound includes arithmetic allowance
+};
+bool BuildNCPathCoreCornerBlend(NCPathCoreFeedLineInput& lineInput,
+    const std::array<double, 8U>& nextMCS, double toleranceMM,
+    const std::array<double, 2U>& pulsePerMM,
+    NCPathCoreFeedLineV2& prefix, NCPathCoreFeedArcInput& arcInput,
+    NCPathCoreFeedArcV2& arc, NCPathCoreRetainedGeometry& output,
+    NCPathCoreCornerMetadata& metadata) noexcept;
+
 bool IsNCPathCoreRetainedGeometryValid(const NCPathCoreRetainedGeometry& geometry) noexcept;
 
 // u is the ORIGINAL canonical parameter, regardless of traversal direction.
@@ -122,3 +136,5 @@ static_assert(sizeof(NCPathCoreRetainedPath) == 6208U,
 static_assert(std::is_standard_layout<NCPathCoreRetainedGeometry>::value&&
     std::is_trivially_copyable<NCPathCoreRetainedGeometry>::value,
     "BZ canonical geometry must remain a plain value.");
+
+static_assert(sizeof(NCPathCoreCornerMetadata) == 88U, "DH fixed corner metadata budget changed.");

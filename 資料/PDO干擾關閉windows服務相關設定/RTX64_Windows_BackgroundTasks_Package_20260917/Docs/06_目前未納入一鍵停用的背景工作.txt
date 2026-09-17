@@ -1,0 +1,23 @@
+﻿目前未納入 OneClick 的已觀察背景工作
+
+以下項目在 2026-09-17 TaskScheduler/Operational 中曾被觀察到，
+但目前故意不一次全部關閉，以保留 A/B 可追溯性：
+
+- \Microsoft\Windows\WindowsUpdate\Scheduled Start
+- \Microsoft\Windows\UpdateOrchestrator\USO_UxBroker
+- \Microsoft\Windows\UpdateOrchestrator\Schedule Scan
+- \Microsoft\Windows\UpdateOrchestrator\Backup Scan
+- \Microsoft\Windows\PushToInstall\Registration
+- \Microsoft\Windows\InstallService\ScanForUpdates
+- \Microsoft\Office\Office Automatic Updates 2.0
+- \Microsoft\Office\Office Feature Updates Logon
+- \Microsoft\Windows\LanguageComponentsInstaller\Installation
+- \MicrosoftEdgeUpdateTaskMachineUA
+- \Adobe Acrobat Update Task
+- \OneDrive Startup Task-*
+
+其中包括 Windows Update / UpdateOrchestrator、Office、Edge、Adobe、OneDrive、
+Language Components Installer 等。
+
+後續若 EtherCAT Diagnostic 再證明某一項與 Master/NAL RX 長尾高度對時，
+再加入正式 Profile。

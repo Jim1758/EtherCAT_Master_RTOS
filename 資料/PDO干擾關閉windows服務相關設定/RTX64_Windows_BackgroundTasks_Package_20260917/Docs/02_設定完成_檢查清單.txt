@@ -1,0 +1,74 @@
+﻿RTX64 / EtherCAT Windows 背景排程
+設定完成驗收清單
+
+操作人員：
+日期：
+IPC 編號：
+Windows 版本：
+RTX64 版本：
+EtherCAT Cycle：
+
+============================================================
+一、執行結果
+============================================================
+
+[ ] OneClick 使用 Administrator/UAC 執行成功
+[ ] TaskScheduler/Operational logging enabled
+[ ] SYSTEM helper 建立成功
+[ ] SYSTEM helper 執行成功
+[ ] FINAL CHECK 顯示所有現有目標 Task = Disabled / PASS
+[ ] TaskScheduler Operational Log = PASS
+[ ] 桌面已產生 RTX64_BackgroundTasks_Check_*.txt
+[ ] 程式最後停在「按 Enter 關閉此視窗」
+
+最終畫面應看到：
+PASS: All existing target tasks are Disabled.
+
+============================================================
+二、必檢 Task
+============================================================
+
+Application Experience
+[ ] Microsoft Compatibility Appraiser = Disabled
+
+Device Information
+[ ] Device = Disabled
+
+Memory Diagnostic
+[ ] RunFullMemoryDiagnostic = Disabled
+[ ] ProcessMemoryDiagnosticEvents = Disabled
+
+.NET Framework
+[ ] .NET Framework NGEN v4.0.30319 = Disabled
+[ ] .NET Framework NGEN v4.0.30319 64 = Disabled
+[ ] .NET Framework NGEN v4.0.30319 Critical = Disabled
+[ ] .NET Framework NGEN v4.0.30319 64 Critical = Disabled
+
+System Restore
+[ ] SR = Disabled
+
+CEIP
+[ ] Consolidator = Disabled
+
+DeviceDirectoryClient
+[ ] RegisterDevicePeriodic24 = Disabled
+[ ] RegisterDeviceLocationRightsChange = Disabled
+[ ] RegisterDeviceProtectionStateChanged = Disabled
+[ ] RegisterUserDevice = Disabled
+
+============================================================
+三、EtherCAT 後續驗證
+============================================================
+
+[ ] RtssRelease
+[ ] 250 us cycle
+[ ] OP 穩定
+[ ] WKC 正常
+[ ] RX Hard Timeout 無異常 burst
+[ ] ReceivePacket 無 190~225 us 類 long-tail burst
+[ ] PDO Exec / Combined Max 未出現異常同步尖峰
+[ ] ESC Physical/Invalid/Forwarded/LostLink Delta 有另外監看
+
+注意：
+如果 ESC Physical/Invalid Delta 增加，這屬於 Physical/link 類問題，
+不可只歸因於 Windows 背景排程。

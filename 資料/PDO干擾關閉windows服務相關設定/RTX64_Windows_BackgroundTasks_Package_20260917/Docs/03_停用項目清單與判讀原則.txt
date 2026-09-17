@@ -1,0 +1,72 @@
+﻿本版 OneClick 會停用的 Scheduled Tasks
+
+\Microsoft\Windows\Application Experience\\
+  Microsoft Compatibility Appraiser
+  說明：相容性評估 / 背景掃描
+
+\Microsoft\Windows\Device Information\\
+  Device
+  說明：裝置資訊背景工作
+
+\Microsoft\Windows\MemoryDiagnostic\\
+  RunFullMemoryDiagnostic
+  說明：完整記憶體診斷
+
+\Microsoft\Windows\MemoryDiagnostic\\
+  ProcessMemoryDiagnosticEvents
+  說明：記憶體診斷事件處理
+
+\Microsoft\Windows\.NET Framework\\
+  .NET Framework NGEN v4.0.30319 64
+  說明：.NET NGEN 背景最佳化
+
+\Microsoft\Windows\.NET Framework\\
+  .NET Framework NGEN v4.0.30319
+  說明：.NET NGEN 背景最佳化
+
+\Microsoft\Windows\.NET Framework\\
+  .NET Framework NGEN v4.0.30319 64 Critical
+  說明：.NET NGEN Critical
+
+\Microsoft\Windows\.NET Framework\\
+  .NET Framework NGEN v4.0.30319 Critical
+  說明：.NET NGEN Critical
+
+\Microsoft\Windows\SystemRestore\\
+  SR
+  說明：System Restore / VSS 排程還原點
+
+\Microsoft\Windows\Customer Experience Improvement Program\\
+  Consolidator
+  說明：CEIP / 相容性與遙測彙整
+
+\Microsoft\Windows\DeviceDirectoryClient\\
+  RegisterDevicePeriodic24
+  說明：裝置目錄週期性註冊
+
+\Microsoft\Windows\DeviceDirectoryClient\\
+  RegisterDeviceLocationRightsChange
+  說明：裝置位置權限變更註冊
+
+\Microsoft\Windows\DeviceDirectoryClient\\
+  RegisterDeviceProtectionStateChanged
+  說明：裝置保護狀態註冊
+
+\Microsoft\Windows\DeviceDirectoryClient\\
+  RegisterUserDevice
+  說明：使用者裝置註冊
+
+判讀原則
+========
+
+Windows / Master-NAL 類：
+- ReceivePacket 可能出現 190~225 us 長尾
+- ESC Physical Delta = 0
+- Windows Task / Maintenance / VSS 等活動與事件時間可能高度相關
+
+EtherCAT Physical 類：
+- ReceivePacket 本身很快
+- ESC Physical / Invalid / Forwarded / LostLink Delta 增加
+- 優先查線材、接頭、PHY、Slave ingress domain、EMI、PE/ground
+
+兩類問題可能同時存在，不能混為同一根因。

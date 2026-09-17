@@ -115,6 +115,48 @@ bool MotionCore::TryG00MoveTransactionalTail(
 }
 
 
+// Sparse NC endpoints were completed from the accepted native tail. Prove that
+// reference against the SAME start sample used by this producer before enqueue.
+// Both exact arithmetic representations are valid: accepted forward conversion,
+// or the division-built baseline produced by START/RESET. No tolerance hides drift.
+bool MotionCore::IsPlanarEndpointBasisCurrent(const double* referenceMCS,
+    const std::array<double, 8U>& startPulse, std::uint32_t validAxisMask,
+    std::uint32_t requiredAxisMask) const noexcept
+{
+    if (referenceMCS == nullptr || m_pContexts == nullptr || requiredAxisMask == 0U ||
+        (requiredAxisMask & ~7U) != 0U || (validAxisMask & requiredAxisMask) != requiredAxisMask ||
+        !IsNCTranslationSnapshotValid(m_pendingTranslation) || !IsPendingFixedTranslationSourceAllowed() ||
+        (!NCTranslationHasPlanarRotation(m_pendingTranslation) &&
+            m_pendingTranslation.distanceMode != 91)) return false;
+    for (std::size_t slot = 0U; slot < 3U; ++slot)
+    {
+        if ((requiredAxisMask & (1U << static_cast<unsigned>(slot))) == 0U) continue;
+        if (slot >= m_pContexts->size()) return false;
+        const AxisContext& axis = (*m_pContexts)[slot];
+        if (!axis.isExist || axis.axisType != AxisType::LINEAR ||
+            !std::isfinite(referenceMCS[slot]) || !std::isfinite(startPulse[slot]) ||
+            !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0) return false;
+        const double pulsePerMM = axis.resolution_PPR / axis.finalLead;
+        if (!std::isfinite(pulsePerMM) || pulsePerMM <= 0.0) return false;
+        const double forwardPulse = referenceMCS[slot] * pulsePerMM;
+        const double reverseMCS = startPulse[slot] * axis.finalLead / axis.resolution_PPR;
+        if (!(std::isfinite(forwardPulse) && forwardPulse == startPulse[slot]) &&
+            !(std::isfinite(reverseMCS) && reverseMCS == referenceMCS[slot]))
+        {
+            // Producer-thread diagnostic only; preserve the exact rejection.
+            RtPrintf("[ROTATION][BASIS_REJECT] axis=%u referenceMMBits=%llu sampledPulseBits=%llu expectedPulseBits=%llu\n",
+                static_cast<unsigned>(slot),
+                static_cast<unsigned long long>(QueueTailDoubleBits(referenceMCS[slot])),
+                static_cast<unsigned long long>(QueueTailDoubleBits(startPulse[slot])),
+                static_cast<unsigned long long>(QueueTailDoubleBits(forwardPulse)));
+            return false;
+        }
+    }
+    return true;
+}
+
+
 // BQ: the caller owns the output workspace; no Motion capture ABI changes.
 bool MotionCore::TryG00MoveTransactionalTail(
     const std::vector<int>& axes,
@@ -123,7 +165,8 @@ bool MotionCore::TryG00MoveTransactionalTail(
     MotionCommandPathMode commandPathMode,
     double rapidOverrideCandidate,
     double(&commandedMCSTail)[MAX_AXES],
-    MotionCommandedEndpointReceiptV1* commandedEndpointReceipt)
+    MotionCommandedEndpointReceiptV1* commandedEndpointReceipt,
+    bool requirePlanarBaselineMatch)
 {
     return TryG00MoveInternal(
         axes,
@@ -133,7 +176,8 @@ bool MotionCore::TryG00MoveTransactionalTail(
         rapidOverrideCandidate,
         commandedMCSTail,
         true,
-        commandedEndpointReceipt);
+        commandedEndpointReceipt,
+        requirePlanarBaselineMatch);
 }
 
 
@@ -145,7 +189,8 @@ bool MotionCore::TryG00MoveInternal(
     double rapidOverrideCandidate,
     double* commandedMCSTail,
     bool transactionalTail,
-    MotionCommandedEndpointReceiptV1* commandedEndpointReceipt)
+    MotionCommandedEndpointReceiptV1* commandedEndpointReceipt,
+    bool requirePlanarBaselineMatch)
 {
     // BQ: every invocation starts unpublished, including every rejection path.
     if (commandedEndpointReceipt != nullptr)
@@ -387,6 +432,22 @@ bool MotionCore::TryG00MoveInternal(
                 double baselineMCS =
                     logicalPulse * axis.finalLead /
                     axis.resolution_PPR;
+                // Preserve the accepted dependent-endpoint MCS representation only when
+                // it converts exactly to this sampled native pulse. Otherwise
+                // retain the reconstructed baseline (and the baseline proof
+                // rejects stale axes). Consecutive receipt seams stay bit-exact.
+                if (commandSource == MotionCommandSource::NC_MEMORY &&
+                    (NCTranslationHasPlanarRotation(m_pendingTranslation) ||
+                        m_pendingTranslation.distanceMode == 91) &&
+                    axis.axisType == AxisType::LINEAR)
+                {
+                    const double pulsePerMM = axis.resolution_PPR / axis.finalLead;
+                    const double reference = commandedMCSTail[axisSlot];
+                    const double referencePulse = reference * pulsePerMM;
+                    if (std::isfinite(pulsePerMM) && pulsePerMM > 0.0 &&
+                        std::isfinite(reference) && std::isfinite(referencePulse) &&
+                        referencePulse == logicalPulse) baselineMCS = reference;
+                }
                 if (axis.axisType == AxisType::ROTARY &&
                     std::isfinite(axis.rotaryModulo) &&
                     axis.rotaryModulo > 0.0)
@@ -409,6 +470,31 @@ bool MotionCore::TryG00MoveInternal(
                 stagedCommandedMCS[axisSlot] = baselineMCS;
             }
         }
+    }
+
+    // Every incremental endpoint depends on its sampled native start, even
+    // full XY and Z-only blocks. Preserve the old XY proof for sparse G90.
+    const bool incrementalEndpoint = commandSource == MotionCommandSource::NC_MEMORY &&
+        m_pendingTranslation.distanceMode == 91;
+    std::uint32_t requiredBaselineMask = requirePlanarBaselineMatch ? 3U : 0U;
+    if (incrementalEndpoint)
+    {
+        std::uint32_t selectedMask = 0U;
+        for (int axis : axes)
+        {
+            if (axis < 0 || axis > 2 || (selectedMask & (1U << axis)) != 0U)
+                return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
+            selectedMask |= 1U << axis;
+        }
+        requiredBaselineMask |= selectedMask;
+    }
+    if ((requirePlanarBaselineMatch || incrementalEndpoint) &&
+        (!transactionalTail || mode != BufferMode::ABORTING ||
+            commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+            !IsPlanarEndpointBasisCurrent(commandedMCSTail, stagedQueueTailPulse,
+                stagedValidMask, requiredBaselineMask)))
+    {
+        return rejectWithoutTailMutation(false, true, MotionRejectReason::NOT_READY);
     }
 
     // BQ: retain the exact staged baseline before programmed targets replace
@@ -486,13 +572,11 @@ bool MotionCore::TryG00MoveInternal(
                             MotionRejectReason::NOT_READY);
                     }
 
-                    double lead = axis.finalLead;
-                    if (lead < 1.0e-6)
-                    {
-                        lead = 1.0;
-                    }
-                    const double pulsePerUnit = axis.resolution_PPR / lead;
-                    if (!std::isfinite(pulsePerUnit) || pulsePerUnit <= 0.0)
+                    const bool rotaryShortestPath =
+                        axis.axisType == AxisType::ROTARY && axis.useShortestPath;
+                    double pulsePerUnit = 0.0;
+                    if (!TryGetMotionPulsePerUnit(axis.resolution_PPR, axis.finalLead,
+                        rotaryShortestPath, pulsePerUnit))
                     {
                         return rejectWithoutTailMutation(
                             true,
@@ -512,27 +596,31 @@ bool MotionCore::TryG00MoveInternal(
                             MotionRejectReason::INVALID_GEOMETRY);
                     }
 
-                    if (axis.axisType == AxisType::ROTARY && axis.useShortestPath)
-                    {
-                        if (!std::isfinite(axis.rotaryModulo) ||
-                            axis.rotaryModulo <= 0.0)
-                        {
-                            return rejectWithoutTailMutation(
-                                true,
-                                true,
-                                MotionRejectReason::INVALID_GEOMETRY);
-                        }
-                        targetPulse = CalculateShortestTarget(
-                            startPulse,
-                            targetPulse,
-                            axis.rotaryModulo);
-                    }
-                    if (!std::isfinite(targetPulse))
+                    if (!TryResolveMotionTargetPulse(startPulse, targetPulse,
+                        pulsePerUnit, rotaryShortestPath, axis.rotaryModulo, targetPulse))
                     {
                         return rejectWithoutTailMutation(
                             true,
                             true,
                             MotionRejectReason::INVALID_GEOMETRY);
+                    }
+                    if (rotaryShortestPath)
+                    {
+                        const double resolvedTargetUnits = targetPulse / pulsePerUnit;
+                        if (!std::isfinite(resolvedTargetUnits))
+                        {
+                            return rejectWithoutTailMutation(
+                                true, true, MotionRejectReason::INVALID_GEOMETRY);
+                        }
+                        // Check the actual unwrapped endpoint before queue/tail commit.
+                        if (m_pCoordMgr != nullptr &&
+                            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, resolvedTargetUnits))
+                        {
+                            AlarmManager::GetInstance().Trigger(
+                                AlarmManager::PROGRAMMED_OVER_TRAVEL, m_pendingSourcePC, axisIndex);
+                            return rejectWithoutTailMutation(
+                                true, true, MotionRejectReason::INVALID_GEOMETRY);
+                        }
                     }
 
                     seenAxis[static_cast<std::size_t>(axisIndex)] = true;

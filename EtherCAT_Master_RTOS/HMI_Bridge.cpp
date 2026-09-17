@@ -113,6 +113,182 @@ namespace HMI_Bridge
             }
         }
 
+        long long CncP1MilliValue(double value) noexcept
+        {
+            if (!std::isfinite(value) || std::abs(value) > 9000000000000000.0)
+                return (-9223372036854775807LL - 1LL);
+            return static_cast<long long>(value * 1000.0);
+        }
+
+        const char* CncP1EventName(MotionCore::CncP1Event event) noexcept
+        {
+            using E = MotionCore::CncP1Event;
+            switch (event)
+            {
+            case E::LOAD_EMPTY: return "LOAD_EMPTY";
+            case E::LOAD_READY: return "LOAD_READY";
+            case E::PROMOTED: return "PROMOTED";
+            case E::KEEP_STOP: return "KEEP_STOP";
+            case E::LEAVE: return "LEAVE";
+            default: return "UNKNOWN";
+            }
+        }
+        const char* CncP1ReasonName(MotionCore::CncP1Reason reason) noexcept
+        {
+            using R = MotionCore::CncP1Reason;
+            switch (reason)
+            {
+            case R::NONE: return "NONE";
+            case R::SCOPE: return "SCOPE";
+            case R::AUTHORITY: return "AUTHORITY";
+            case R::MAPPING: return "MAPPING";
+            case R::GEOMETRY: return "GEOMETRY";
+            case R::DIRECTION: return "DIRECTION";
+            case R::SPEED: return "SPEED";
+            case R::CURRENT_DISTANCE: return "CURRENT_DISTANCE";
+            case R::NEXT_DISTANCE: return "NEXT_DISTANCE";
+            case R::TERMINAL: return "TERMINAL";
+            case R::OVERRIDE: return "OVERRIDE";
+            case R::QUEUE_EMPTY: return "QUEUE_EMPTY";
+            default: return "UNKNOWN";
+            }
+        }
+        const char* CncFeedPlanEventName(MotionCore::CncFeedPlanEvent event) noexcept
+        {
+            using E = MotionCore::CncFeedPlanEvent;
+            switch (event) {
+            case E::LOAD: return "LOAD"; case E::EXTEND: return "EXTEND";
+            case E::KEEP_PLAN: return "KEEP_PLAN"; case E::LEAVE: return "LEAVE";
+            case E::BLEND_ENTER: return "BLEND_ENTER";
+            case E::PREFIX_FAST: return "PREFIX_FAST";
+            case E::PREFIX_BRAKE: return "PREFIX_BRAKE";
+            case E::PREFIX_AUTHORED: return "PREFIX_AUTHORED";
+            default: return "INVALID";
+            }
+        }
+        const char* CncFeedPlanStopName(MotionCore::CncFeedPlanStop stop) noexcept
+        {
+            using S = MotionCore::CncFeedPlanStop;
+            switch (stop) {
+            case S::QUEUE_END: return "QUEUE_END"; case S::HORIZON: return "HORIZON";
+            case S::SCOPE: return "SCOPE"; case S::AUTHORITY: return "AUTHORITY";
+            case S::MAPPING: return "MAPPING"; case S::DIRECTION: return "DIRECTION";
+            case S::SPEED: return "SPEED"; case S::SHORT_SEGMENT: return "SHORT_SEGMENT";
+            case S::LATE: return "LATE"; default: return "INVALID";
+            }
+        }
+        HMI_DIAG_NOINLINE void DrainCncFeedPlanDiagnostics(MotionCore& motion)
+        {
+            static MotionCore::CncFeedPlanDiagnostic event{};
+            static std::uint32_t lastDropped = 0U;
+            for (std::size_t i = 0U; i < MotionCore::CNC_FEED_PLAN_DRAIN_BUDGET; ++i)
+            {
+                if (!motion.TryPopCncFeedPlanDiagnostic(event)) break;
+                if (event.blendMask & 1U)
+                {
+                    // DQ adds explicit equal/rising-F below-packet peaks; DP
+                    // retains descending-F peaks. DL/DK classifications remain.
+                    // Every value and tag is derived from the same RT event.
+                    const char* prefixTag = event.prefixLimitPPS > event.cruiseVelocity &&
+                        event.prefixLimitPPS < event.nominalVelocity[0] ?
+                        (event.authoredPrefixPPS > 0.0 &&
+                            event.authoredPrefixPPS == event.nominalVelocity[0] ? "CNC-DQ" : "CNC-DP") :
+                        event.prefixLimitPPS > event.nominalVelocity[0] &&
+                        event.prefixLimitPPS < event.authoredPrefixPPS ? "CNC-DL" : "CNC-DK";
+                    RtPrintf("[%s] event=%s rtTick=%llu tickValid=%u seq=%llu epoch=%u seg=%llu pc=%d owner=%u gen=%u packetPPSm=%lld authoredPPSm=%lld selectedPPSm=%lld rawPPSm=%lld outPPSm=%lld arcPPSm=%lld leftPm=%lld\n",
+                        prefixTag, CncFeedPlanEventName(event.event), static_cast<unsigned long long>(event.runtimeTick),
+                        event.tickValid ? 1U : 0U, static_cast<unsigned long long>(event.sequence),
+                        static_cast<unsigned>(event.identity.epoch), static_cast<unsigned long long>(event.identity.segmentId),
+                        static_cast<int>(event.identity.sourceBlockId), static_cast<unsigned>(event.lease.owner),
+                        static_cast<unsigned>(event.lease.generation), CncP1MilliValue(event.nominalVelocity[0]),
+                        CncP1MilliValue(event.authoredPrefixPPS), CncP1MilliValue(event.prefixLimitPPS),
+                        CncP1MilliValue(event.commandVelocity), CncP1MilliValue(event.outputVelocity),
+                        CncP1MilliValue(event.cruiseVelocity), CncP1MilliValue(event.prefixRemainingPulse));
+                    if (event.event != MotionCore::CncFeedPlanEvent::PREFIX_AUTHORED)
+                        RtPrintf("[CNC-DJ] event=%s rtTick=%llu tickValid=%u seq=%llu epoch=%u seg=%llu pc=%d owner=%u gen=%u rawPPSm=%lld outPPSm=%lld arcPPSm=%lld prefixPPSm=%lld prefixPm=%lld leftPm=%lld reservePm=%lld endPPSm=%lld\n",
+                            CncFeedPlanEventName(event.event), static_cast<unsigned long long>(event.runtimeTick),
+                            event.tickValid ? 1U : 0U, static_cast<unsigned long long>(event.sequence),
+                            static_cast<unsigned>(event.identity.epoch), static_cast<unsigned long long>(event.identity.segmentId),
+                            static_cast<int>(event.identity.sourceBlockId), static_cast<unsigned>(event.lease.owner),
+                            static_cast<unsigned>(event.lease.generation), CncP1MilliValue(event.commandVelocity),
+                            CncP1MilliValue(event.outputVelocity), CncP1MilliValue(event.cruiseVelocity),
+                            CncP1MilliValue(event.prefixLimitPPS), CncP1MilliValue(event.prefixLengthPulse),
+                            CncP1MilliValue(event.prefixRemainingPulse), CncP1MilliValue(event.prefixReservePulse),
+                            CncP1MilliValue(event.endVelocity));
+                }
+                if (event.event == MotionCore::CncFeedPlanEvent::PREFIX_FAST ||
+                    event.event == MotionCore::CncFeedPlanEvent::PREFIX_BRAKE ||
+                    event.event == MotionCore::CncFeedPlanEvent::PREFIX_AUTHORED) continue;
+                // EE: one popped RT event is emitted as four bounded rows. Join
+                // CNC-DH / PLAN / FEED / GEOM only by the same (seq, epoch, seg)
+                // within one runtime capture; all values below use this event.
+                // Console loss can leave partial records: missing rows/fields
+                // remain unknown, never copied from a neighbouring event. A
+                // DIAG_DROPPED change reports ring loss, not console completeness.
+                RtPrintf("[CNC-DH] event=%s stop=%s rtTick=%llu tickValid=%u seq=%llu epoch=%u seg=%llu pc=%d owner=%u gen=%u cmdPPSm=%lld outPPSm=%lld endPPSm=%lld fromSeg=%llu\n",
+                    CncFeedPlanEventName(event.event), CncFeedPlanStopName(event.stop),
+                    static_cast<unsigned long long>(event.runtimeTick), event.tickValid ? 1U : 0U,
+                    static_cast<unsigned long long>(event.sequence), static_cast<unsigned>(event.identity.epoch),
+                    static_cast<unsigned long long>(event.identity.segmentId), static_cast<int>(event.identity.sourceBlockId),
+                    static_cast<unsigned>(event.lease.owner), static_cast<unsigned>(event.lease.generation),
+                    CncP1MilliValue(event.commandVelocity), CncP1MilliValue(event.outputVelocity),
+                    CncP1MilliValue(event.endVelocity), static_cast<unsigned long long>(event.handoffFrom));
+                RtPrintf("[CNC-DH-PLAN] seq=%llu epoch=%u seg=%llu horizon=%u lastSeg=%llu cruisePPSm=%lld remainPm=%lld horizonPm=%lld reservePm=%lld\n",
+                    static_cast<unsigned long long>(event.sequence), static_cast<unsigned>(event.identity.epoch),
+                    static_cast<unsigned long long>(event.identity.segmentId), event.horizon,
+                    static_cast<unsigned long long>(event.lastSegment), CncP1MilliValue(event.cruiseVelocity),
+                    CncP1MilliValue(event.remainingPulse), CncP1MilliValue(event.horizonPulse), CncP1MilliValue(event.reservePulse));
+                RtPrintf("[CNC-DH-FEED] seq=%llu epoch=%u seg=%llu exit0PPSm=%lld exit1PPSm=%lld exit2PPSm=%lld exit3PPSm=%lld nominal0PPSm=%lld nominal1PPSm=%lld nominal2PPSm=%lld nominal3PPSm=%lld limit0PPSm=%lld limit1PPSm=%lld limit2PPSm=%lld limit3PPSm=%lld\n",
+                    static_cast<unsigned long long>(event.sequence), static_cast<unsigned>(event.identity.epoch),
+                    static_cast<unsigned long long>(event.identity.segmentId),
+                    CncP1MilliValue(event.exitVelocity[0]), CncP1MilliValue(event.exitVelocity[1]),
+                    CncP1MilliValue(event.exitVelocity[2]), CncP1MilliValue(event.exitVelocity[3]),
+                    CncP1MilliValue(event.nominalVelocity[0]), CncP1MilliValue(event.nominalVelocity[1]),
+                    CncP1MilliValue(event.nominalVelocity[2]), CncP1MilliValue(event.nominalVelocity[3]),
+                    CncP1MilliValue(event.limitedVelocity[0]), CncP1MilliValue(event.limitedVelocity[1]),
+                    CncP1MilliValue(event.limitedVelocity[2]), CncP1MilliValue(event.limitedVelocity[3]));
+                RtPrintf("[CNC-DH-GEOM] seq=%llu epoch=%u seg=%llu mask=%u circleMask=%u blendMask=%u radiusPm=%lld carryPm=%lld\n",
+                    static_cast<unsigned long long>(event.sequence), static_cast<unsigned>(event.identity.epoch),
+                    static_cast<unsigned long long>(event.identity.segmentId), event.axisMask,
+                    static_cast<unsigned>(event.circleMask), static_cast<unsigned>(event.blendMask),
+                    CncP1MilliValue(event.radiusPulse), CncP1MilliValue(event.entryCarry));
+            }
+            const std::uint32_t dropped = motion.GetCncFeedPlanDiagnosticDroppedCount();
+            if (dropped != lastDropped) {
+                RtPrintf("[CNC-DH] DIAG_DROPPED total=%u capacity=%u drainBudget=%u\n", dropped,
+                    static_cast<unsigned>(MotionCore::CNC_FEED_PLAN_CAPACITY),
+                    static_cast<unsigned>(MotionCore::CNC_FEED_PLAN_DRAIN_BUDGET));
+                lastDropped = dropped;
+            }
+        }
+
+        HMI_DIAG_NOINLINE void DrainCncP1Diagnostics(MotionCore& motion)
+        {
+            static MotionCore::CncP1Diagnostic event{};
+            static std::uint32_t lastDropped = 0U;
+            for (std::size_t i = 0U; i < MotionCore::CNC_P1_DIAGNOSTIC_DRAIN_BUDGET; ++i)
+            {
+                if (!motion.TryPopCncP1Diagnostic(event)) break;
+                RtPrintf("[CNC-DC] event=%s reason=%s rtTick=%llu tickValid=%u seq=%llu epoch=%u seg=%llu pc=%d owner=%u gen=%u mask=%u q=%u nextSeg=%llu nextPC=%d cmdPPSm=%lld endPPSm=%lld remainPm=%lld nextLenPm=%lld\n",
+                    CncP1EventName(event.event), CncP1ReasonName(event.reason),
+                    static_cast<unsigned long long>(event.runtimeTick), event.tickValid ? 1U : 0U,
+                    static_cast<unsigned long long>(event.sequence), event.epoch,
+                    static_cast<unsigned long long>(event.segment), event.sourcePC,
+                    static_cast<unsigned>(event.owner), event.generation, event.axisMask, event.queueDepth,
+                    static_cast<unsigned long long>(event.nextSegment), event.nextSourcePC,
+                    CncP1MilliValue(event.commandVelocity), CncP1MilliValue(event.endVelocity),
+                    CncP1MilliValue(event.remainingPulse), CncP1MilliValue(event.nextLengthPulse));
+            }
+            const std::uint32_t dropped = motion.GetCncP1DiagnosticDroppedCount();
+            if (dropped != lastDropped)
+            {
+                RtPrintf("[CNC-DC] DIAG_DROPPED total=%u capacity=%u drainBudget=%u\n", dropped,
+                    static_cast<unsigned>(MotionCore::CNC_P1_DIAGNOSTIC_CAPACITY),
+                    static_cast<unsigned>(MotionCore::CNC_P1_DIAGNOSTIC_DRAIN_BUDGET));
+                lastDropped = dropped;
+            }
+        }
+
         const char* NCBlockLifecycleStateToDiagnosticName(
             NCBlockLifecycleState state) noexcept
         {
@@ -1541,6 +1717,36 @@ namespace HMI_Bridge
             bool hasPreparedQueueTail{};
         };
 
+        HMI_DIAG_NOINLINE bool PrintGapActiveCompactDiagnosticSameThread(
+            NCManager& nc, MotionCore& motion,
+            Hmi1000msDiagnosticWorkspace& workspace) noexcept
+        {
+            if (!nc.IsGapPathSimulationActiveSameThread()) return false;
+            workspace.feedHoldNCSettleSnapshot = {};
+            workspace.feedHoldNCSettleCounters = {};
+            const bool coherent = motion.TryGetNCSettleEvidence(
+                MotionNCSettleProfile::FEED_HOLD_GROUP,
+                workspace.feedHoldNCSettleSnapshot,
+                workspace.feedHoldNCSettleCounters);
+            const MotionNCSettleSnapshot& snapshot = workspace.feedHoldNCSettleSnapshot;
+            RtPrintf("[GAP-CO-FIX1-J5] Coh:%u Req:%llu Proof:%llu Epoch:%u Owner:%u/%u "
+                "Mask:%u Valid:%u Contig:%u Set:%u Dwell:%u/%u rtTick:%llu bulkDeferred=1\n",
+                coherent ? 1U : 0U,
+                static_cast<unsigned long long>(coherent ? snapshot.requestSequence : 0ULL),
+                static_cast<unsigned long long>(coherent ? snapshot.proofSequence : 0ULL),
+                static_cast<unsigned>(coherent ? snapshot.executionEpoch : 0U),
+                coherent ? static_cast<unsigned>(snapshot.owner) : 0U,
+                static_cast<unsigned>(coherent ? snapshot.ownerGeneration : 0U),
+                static_cast<unsigned>(coherent ? snapshot.scopeMask : 0U),
+                coherent && snapshot.runtimeCycleValid ? 1U : 0U,
+                coherent && snapshot.runtimeCycleContiguous ? 1U : 0U,
+                coherent && snapshot.settled ? 1U : 0U,
+                static_cast<unsigned>(coherent ? snapshot.dwellCycles : 0U),
+                static_cast<unsigned>(coherent ? snapshot.requiredCycles : 0U),
+                static_cast<unsigned long long>(coherent ? snapshot.runtimeCycleTick : 0ULL));
+            return true;
+        }
+
         HMI_DIAG_NOINLINE void CapturePathCoreCompactDiagnosticFamily(
             NCManager& nc,
             Hmi1000msDiagnosticWorkspace& workspace)
@@ -2425,7 +2631,7 @@ namespace HMI_Bridge
 
         if (pShm->Coord_Command.reqSwitchWCS)
         {
-            nc->CoordSys.SetWCS(pShm->Coord_Command.targetWCS_GCode, nc);
+            nc->CoordSys.SetWCS(pShm->Coord_Command.targetWCS_GCode, nc, false);
             pShm->Coord_Command.reqSwitchWCS = false;
         }
 
@@ -2657,6 +2863,18 @@ namespace HMI_Bridge
         // 假設 pShm->NC_Status 有這兩個變數供 UI 綁定
         pShm->NC_Status.currentToolLengthMode = isMachineIdle ? interpreterToolMode : physicalToolMode;
         pShm->NC_Status.currentHCode = isMachineIdle ? interpreterHCode : physicalHCode;
+        // Frozen inverse coordinates and their modal labels share one source,
+        // including HOLD and RESET cleanup before complete retirement.
+        if (nc->CoordSys.IsTranslationRunFrozen())
+        {
+            const NCTranslationSnapshot frozenDisplay = nc->CoordSys.GetTranslationSnapshot();
+            if (IsNCTranslationSnapshotValid(frozenDisplay))
+            {
+                pShm->NC_Status.currentWCS_GCode = frozenDisplay.wcsCode;
+                pShm->NC_Status.currentToolLengthMode = frozenDisplay.toolLengthMode;
+                pShm->NC_Status.currentHCode = frozenDisplay.toolHCode;
+            }
+        }
 
         // 4. 🌟 刀徑補正顯示 (Tool Radius Comp)
         int interpreterTRadMode = nc->CoordSys.toolRadiusMode;
@@ -2702,6 +2920,19 @@ namespace HMI_Bridge
         // 寫入 SHM 供 HMI 讀取
         pShm->NC_Status.currentG168State = (isMachineIdle ? interpreterG168 : physicalG168) ? 1 : 0;
         pShm->NC_Status.currentWCode = isMachineIdle ? interpreterWCode : physicalWCode;
+        if (nc->CoordSys.IsTranslationRunFrozen())
+        {
+            const NCTranslationSnapshot frozenDisplay = nc->CoordSys.GetTranslationSnapshot();
+            if (IsNCTranslationSnapshotValid(frozenDisplay))
+            {
+                pShm->NC_Status.currentG168State = frozenDisplay.workMode == 168 ? 1 : 0;
+                pShm->NC_Status.currentWCode = frozenDisplay.workWCode;
+                // Coordinate inverse and rotation labels use the same source,
+                // also while RESET cleans live modes before source retirement.
+                pShm->NC_Status.currentG68State = frozenDisplay.rotationMode == 68 ? 1 : 0;
+                pShm->NC_Status.currentG68Angle = frozenDisplay.rotationAngleDeg;
+            }
+        }
 
 
         // 🌟 7. G51 縮放狀態顯示
@@ -2778,35 +3009,45 @@ namespace HMI_Bridge
              // =========================================================
         if (pShm->Coord_Command.reqWriteOffset)
         {
-            // 🌟 宣告 unitScale 讓這個區塊也能用公英制轉換
-            double unitScale = nc->CoordSys.isInchMode ? (1.0 / 25.4) : 1.0;
-
-            int row = pShm->Coord_Command.rowIndex;
-            int axis = pShm->Coord_Command.axisIndex;
-            double val = pShm->Coord_Command.writeValue;
-
-            if (axis >= 0 && axis < 8)
+            bool offsetWriteAccepted = false;
+            const int row = pShm->Coord_Command.rowIndex;
+            const int axis = pShm->Coord_Command.axisIndex;
+            const int type = pShm->Coord_Command.offsetType;
+            const double requestedValue = pShm->Coord_Command.writeValue;
+            if (axis < 0 || axis >= 8)
             {
-                // 🌟 取得對應軸的屬性，旋轉軸(度數)不套用英制轉換
-                AxisType type = nc->m_motion.GetAxisContext(axis).axisType;
-                double axisScale = (type == AxisType::ROTARY || type == AxisType::ROTARY_CONTINUOUS) ? 1.0 : unitScale;
-
-                // 🌟 關鍵：將 HMI 輸入的數值 (可能為 inch) 除以倍率，還原回系統底層的公制 (mm)
-                double systemVal = val / axisScale;
-
-                switch (pShm->Coord_Command.offsetType)
+                offsetWriteAccepted = nc->CoordSys.ApplyCoordinateTableValues(type, row, nullptr, nullptr, nc, false);
+            }
+            else
+            {
+                const double unitScale = nc->CoordSys.isInchMode ? (1.0 / 25.4) : 1.0;
+                const AxisType axisType = nc->m_motion.GetAxisContext(axis).axisType;
+                const double axisScale = (axisType == AxisType::ROTARY ||
+                    axisType == AxisType::ROTARY_CONTINUOUS) ? 1.0 : unitScale;
+                // WORK columns describe XYZ / angles / reserved, not axes.
+                const double fieldScale = type == 3 ? (axis < 3 ? unitScale : 1.0) : axisScale;
+                const double internalValue = requestedValue / fieldScale;
+                if (type == 10)
                 {
-                case 0: nc->CoordSys.extOffset[axis] = systemVal; break;
-                case 1: if (row >= 0 && row < 60)  nc->CoordSys.m_WCSTable[row][axis] = systemVal; break;
-                case 2: if (row >= 0 && row < 100) nc->CoordSys.m_ToolOffset[row][axis] = systemVal; break;
-                case 3: if (row >= 0 && row < 100) nc->CoordSys.m_WorkOffset[row][axis] = systemVal; break;
-                case 10:
-                    // G54 等原點設定功能：此處 systemVal 是從 HMI 傳入的期望座標
-                    nc->CoordSys.m_WCSTable[nc->CoordSys.currentWCSIndex][axis] =
-                        nc->CoordSys.actualMCS[axis] - nc->CoordSys.extOffset[axis] - systemVal;
-                    break;
+                    offsetWriteAccepted = nc->CoordSys.ApplyCoordinateOrigin(axis, internalValue, nc, false);
+                }
+                else
+                {
+                    bool fields[8] = {};
+                    double values[8] = {};
+                    fields[axis] = true;
+                    values[axis] = internalValue;
+                    offsetWriteAccepted = nc->CoordSys.ApplyCoordinateTableValues(type, row, fields, values, nc, false);
                 }
             }
+            if (!offsetWriteAccepted && pShm->Coord_Command.reqSave)
+            {
+                RtPrintf("[COORD][REJECT] op=HMI_SAVE reason=EDIT_REJECTED saveType=%d\n",
+                    pShm->Coord_Command.saveType);
+                pShm->Coord_Command.reqSave = false;
+            }
+            // Rejection is explicit in the console; no ABI field is added and
+            // a rejected HMI edit neither changes the run nor raises an alarm.
             pShm->Coord_Command.reqWriteOffset = false;
         }
 
@@ -2903,7 +3144,8 @@ namespace HMI_Bridge
 
             // D. G168 獨立工件補正表
             for (size_t row = 0; row < 100 && row < nc->CoordSys.m_WorkOffset.size(); ++row) {
-                pShm->Coord_Table.workOffset[row][col] = nc->CoordSys.m_WorkOffset[row][col] * axisScale;
+                const double workScale = col < 3 ? unitScale : 1.0;
+                pShm->Coord_Table.workOffset[row][col] = nc->CoordSys.m_WorkOffset[row][col] * workScale;
             }
         }
 
@@ -2974,8 +3216,14 @@ namespace HMI_Bridge
     {
         if (nc == nullptr) return;
         MotionCore& motion = nc->GetMotion();
+        // CO_FIX1: defer bulk output while GAP needs fresh supervisory service.
+        // Early return preserves all ordinary diagnostic event tokens.
+        if (PrintGapActiveCompactDiagnosticSameThread(
+            *nc, motion, g_hmi1000msDiagnosticWorkspace)) return;
         // CJ FIX1: unconditional drain before SHM/ordinary diagnostic gates.
         DrainIdleHoldDiagnostics(motion);
+        DrainCncP1Diagnostics(motion);
+        DrainCncFeedPlanDiagnostics(motion);
         SHM_Data* pShm = SHMManager::GetInstance().GetData();
         if (pShm == nullptr) return;
 

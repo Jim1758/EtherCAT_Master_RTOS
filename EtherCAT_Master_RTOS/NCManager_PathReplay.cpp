@@ -16,6 +16,11 @@
 
 namespace
 {
+    bool ReplayTranslationCurrent(const CoordinateManager& coord, std::uint64_t generation) noexcept
+    {
+        return generation != 0ULL && coord.IsTranslationRunFrozen() &&
+            coord.IsTranslationRunCurrent() && coord.GetTranslationSnapshot().generation == generation;
+    }
     bool ReplayFullIdentity(const MotionExecutionIdentity& a, const MotionExecutionIdentity& b) noexcept
     {
         return a.IsAssigned() && b.IsAssigned() && a.epoch == b.epoch &&
@@ -147,6 +152,7 @@ void NCManager::ValidatePathCoreReplaySameThread()
     }
     if (!m_pathReplay.pending) return;
     if (!IsPathCoreReplayConfigurationValid() ||
+        !ReplayTranslationCurrent(CoordSys, m_pathReplayMotion.receipt.translationGeneration) ||
         m_pathReplayMotion.receipt.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
         !m_pathReplayMotion.receipt.ownerLease.Matches(m_programMotionLease))
     {
@@ -210,7 +216,7 @@ void NCManager::BeginPathCoreReplayCaptureSameThread(const NCBlock& block, NCBlo
     if (block.isEmpty || plainStop) return;
     // CD: only a well-formed explicit cross-segment arm preserves completed
     // canonical history. Ordinary G178/G179 keep their established CC boundary.
-    if (block.gCode == 178 && block.has('P') && (block.val('P') == 1.0 || block.val('P') == 2.0 || block.val('P') == 3.0 || block.val('P') == 4.0 || block.val('P') == 5.0) &&
+    if (block.gCode == 178 && block.has('P') && (block.val('P') == 1.0 || block.val('P') == 2.0 || block.val('P') == 3.0 || block.val('P') == 4.0 || block.val('P') == 5.0 || block.val('P') == 6.0 || block.val('P') == 7.0 || block.val('P') == 8.0 || block.val('P') == 9.0 || block.val('P') == 10.0 || block.val('P') == 11.0 || block.val('P') == 12.0 || block.val('P') == 13.0 || block.val('P') == 14.0 || block.val('P') == 15.0 || (block.val('P') == 16.0 || (block.val('P') == 17.0 || block.val('P') == 18.0 || (block.val('P') == 19.0 || block.val('P') == 20.0 || block.val('P') == 21.0)))) &&
         IsPathCoreHoldBlockShapeValid(block)) return;
     ClearPathCoreReplayHistorySameThread();
 }
@@ -222,6 +228,7 @@ void NCManager::RetainPathCoreFeedSameThread() noexcept
     if (!m_pathFeed.bound || !m_pathFeed.completed || !m_pathFeed.consumerAccepted ||
         (!m_pathFeedMotion.receipt.line.point && !m_pathFeed.consumerStarted) ||
         !m_pathFeedMotion.receipt.valid ||
+        !ReplayTranslationCurrent(CoordSys, m_pathFeedMotion.receipt.translationGeneration) ||
         !BuildNCPathCoreRetainedLine(m_pathFeedMotion.receipt.line, m_pathReplayGeometry))
     {
         m_pathReplayStore.Fail(NCPathCoreRetainedFault::LIFECYCLE);
@@ -230,7 +237,7 @@ void NCManager::RetainPathCoreFeedSameThread() noexcept
     }
     AppendPathCoreReplayGeometrySameThread(m_pathFeedMotion.receipt.identity,
         m_pathFeedMotion.receipt.validAxisMask, m_pathFeed.dispatch, m_pathFeed.commit,
-        m_pathFeed.sourcePC, m_pathFeed.sourceLine);
+        m_pathFeedMotion.receipt.translationGeneration, m_pathFeed.sourcePC, m_pathFeed.sourceLine);
 }
 
 NC_PATH_REPLAY_NOINLINE
@@ -239,6 +246,7 @@ void NCManager::RetainPathCoreArcSameThread() noexcept
     if (!m_pathReplay.armed || m_pathReplayStore.Fault() != NCPathCoreRetainedFault::NONE) return;
     if (!m_pathArc.bound || !m_pathArc.completed || !m_pathArc.consumerAccepted || !m_pathArc.consumerStarted ||
         !m_pathArcMotion.receipt.valid ||
+        !ReplayTranslationCurrent(CoordSys, m_pathArcMotion.receipt.translationGeneration) ||
         !BuildNCPathCoreRetainedArc(m_pathArcMotion.receipt.arc, m_pathReplayGeometry))
     {
         m_pathReplayStore.Fail(NCPathCoreRetainedFault::LIFECYCLE);
@@ -247,23 +255,25 @@ void NCManager::RetainPathCoreArcSameThread() noexcept
     }
     AppendPathCoreReplayGeometrySameThread(m_pathArcMotion.receipt.identity,
         m_pathArcMotion.receipt.validAxisMask, m_pathArc.dispatch, m_pathArc.commit,
-        m_pathArc.sourcePC, m_pathArc.sourceLine);
+        m_pathArcMotion.receipt.translationGeneration, m_pathArc.sourcePC, m_pathArc.sourceLine);
 }
 
 NC_PATH_REPLAY_NOINLINE
 void NCManager::AppendPathCoreReplayGeometrySameThread(const MotionExecutionIdentity& identity,
     std::uint32_t validAxisMask, std::uint64_t dispatch, std::uint64_t commit,
-    int sourcePC, int sourceLine) noexcept
+    std::uint64_t translationGeneration, int sourcePC, int sourceLine) noexcept
 {
     const std::uint32_t count = m_pathReplayStore.Count();
-    if (!IsPathCoreReplayConfigurationValid() || !identity.IsAssigned() || identity.source != MotionCommandSource::NC_MEMORY ||
+    if (!IsPathCoreReplayConfigurationValid() || !ReplayTranslationCurrent(CoordSys, translationGeneration) ||
+        !identity.IsAssigned() || identity.source != MotionCommandSource::NC_MEMORY ||
         identity.sourceBlockId != static_cast<MotionSourceBlockId>(sourcePC) || sourcePC < 0 ||
         sourceLine <= 0 || dispatch == 0ULL || commit == 0ULL ||
         !m_pathReplayLease.Matches(m_programMotionLease) ||
         !m_motion.IsMotionOwnerLeaseCurrent(m_pathReplayLease) ||
         m_pathReplay.run != m_pathCoreLiveBookkeeping.currentRunToken ||
         m_pathReplay.cache != GetBaseProgramCache().GetGeneration() ||
-        (count != 0U && (dispatch <= m_pathReplaySource[count - 1U].dispatch ||
+        (count != 0U && (translationGeneration != m_pathReplaySource[count - 1U].translationGeneration ||
+            dispatch <= m_pathReplaySource[count - 1U].dispatch ||
             commit <= m_pathReplaySource[count - 1U].commit)))
     {
         m_pathReplayStore.Fail(NCPathCoreRetainedFault::LIFECYCLE);
@@ -285,8 +295,13 @@ void NCManager::AppendPathCoreReplayGeometrySameThread(const MotionExecutionIden
     source.identity = identity;
     source.dispatch = dispatch;
     source.commit = commit;
+    source.translationGeneration = translationGeneration;
     source.sourcePC = sourcePC;
     source.sourceLine = sourceLine;
+    RtPrintf("[CNC-TRANSLATION-PATH] phase=RETAINED kind=HISTORY translationGen=%llu wcs=%d dispatch=%llu epoch=%llu seg=%llu sourcePC=%d\n",
+        static_cast<unsigned long long>(source.translationGeneration), CoordSys.GetTranslationSnapshot().wcsCode,
+        static_cast<unsigned long long>(dispatch), static_cast<unsigned long long>(identity.epoch),
+        static_cast<unsigned long long>(identity.segmentId), sourcePC);
     LogPathCoreReplaySameThread("SAVED");
     LogPathCoreReplayGeometrySameThread(count + 1U, false);
 }
@@ -378,6 +393,12 @@ WaitConditionFunc NCManager::StartPathCoreReplaySameThread(const NCBlock& block)
         RejectPathCoreReplaySameThread(4U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
     }
+    const PathReplaySource& source = m_pathReplaySource[m_pathReplay.ordinal - 1U];
+    if (!ReplayTranslationCurrent(CoordSys, source.translationGeneration))
+    {
+        RejectPathCoreReplaySameThread(4U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        return nullptr;
+    }
     if (distance)
     {
         m_pathReplay.requestedD = block.val('D');
@@ -416,8 +437,9 @@ WaitConditionFunc NCManager::StartPathCoreReplaySameThread(const NCBlock& block)
         return nullptr;
     }
     const MotionPathCoreRetainedReceipt& receipt = m_pathReplayMotion.receipt;
-    const PathReplaySource& source = m_pathReplaySource[m_pathReplay.ordinal - 1U];
     if (!receipt.valid || !receipt.commandAccepted || !receipt.tailCommitted || !receipt.captureBound ||
+        !ReplayTranslationCurrent(CoordSys, receipt.translationGeneration) ||
+        receipt.translationGeneration != source.translationGeneration ||
         receipt.travelLimitRejected || !receipt.identity.IsAssigned() ||
         (distance && (!m_pathReplayCommand.pathCoreRetainedTraversal || m_pathReplayCommand.mem_enableTransform ||
             m_pathReplayCommand.pathCoreRetainedReverse != m_pathReplay.reverse ||
@@ -462,6 +484,10 @@ void NCManager::CommitPathCoreReplayCaptureSameThread(NCBlockDispatchId dispatch
         commit.scope != NCProgramScope::MEMORY || commit.frameId != NC_PROGRAM_FRAME_ID_INVALID ||
         commit.cacheGeneration != m_pathReplay.cache || !ReplaySameSource(commit, ledger.programTarget) ||
         !ReplaySameSource(commit, ledger.programCommit) || commit.sequence != ledger.programCommit.sequence ||
+        !ReplayTranslationCurrent(CoordSys, r.translationGeneration) ||
+        capture.submissions[0U].translationGeneration != r.translationGeneration ||
+        m_pathReplay.ordinal == 0U || m_pathReplay.ordinal > m_pathReplayStore.Count() ||
+        m_pathReplaySource[m_pathReplay.ordinal - 1U].translationGeneration != r.translationGeneration ||
         !capture.submissions[0U].producerAccepted ||
         capture.submissions[0U].immediateRejectReason != MotionRejectReason::NONE ||
         capture.submissions[0U].commandPathMode != MotionCommandPathMode::EXACT_STOP ||
@@ -478,6 +504,10 @@ void NCManager::CommitPathCoreReplayCaptureSameThread(NCBlockDispatchId dispatch
     }
     m_pathReplay.commit = commit.sequence;
     m_pathReplay.bound = true;
+    RtPrintf("[CNC-TRANSLATION-PATH] phase=BOUND kind=REPLAY translationGen=%llu wcs=%d dispatch=%llu epoch=%llu seg=%llu sourcePC=%d\n",
+        static_cast<unsigned long long>(r.translationGeneration), CoordSys.GetTranslationSnapshot().wcsCode,
+        static_cast<unsigned long long>(dispatchId), static_cast<unsigned long long>(r.identity.epoch),
+        static_cast<unsigned long long>(r.identity.segmentId), sourcePC);
     LogPathCoreReplaySameThread("BOUND");
 }
 
@@ -487,7 +517,8 @@ void NCManager::ObservePathCoreReplayFeedbackSameThread(const MotionFeedbackEven
 {
     if (!m_pathReplay.pending || !m_pathReplay.bound ||
         !ReplayFullIdentity(event.identity, m_pathReplayMotion.receipt.identity)) return;
-    if (!ledgerAccepted || event.sequence == 0ULL || event.sequence <= m_pathReplay.lastSequence ||
+    if (!ReplayTranslationCurrent(CoordSys, m_pathReplayMotion.receipt.translationGeneration) ||
+        !ledgerAccepted || event.sequence == 0ULL || event.sequence <= m_pathReplay.lastSequence ||
         event.owner != m_pathReplayMotion.receipt.ownerLease.owner ||
         event.ownerGeneration != m_pathReplayMotion.receipt.ownerLease.generation)
     {
@@ -651,7 +682,7 @@ void NCManager::LogPathCoreReplayGeometrySameThread(std::uint32_t ordinal, bool 
             static_cast<unsigned long long>(ReplayDoubleBits(g->endPulse[i])),
             static_cast<unsigned long long>(ReplayDoubleBits(traversalStart)),
             static_cast<unsigned long long>(ReplayDoubleBits(traversalEnd)));
-        if (g->kind == NCPathCoreRetainedKind::ARC && i < 2U)
+        if ((g->kind == NCPathCoreRetainedKind::ARC || g->kind == NCPathCoreRetainedKind::LINE_ARC) && i < 2U)
             RtPrintf("[PCORE-BZ-CIRCLE] run=%llu dispatch=%llu ordinal=%u axis=%u centerBits=%llu centerPulseBits=%llu minBits=%llu maxBits=%llu\n",
                 static_cast<unsigned long long>(m_pathReplay.run), static_cast<unsigned long long>(m_pathReplay.dispatch),
                 static_cast<unsigned int>(ordinal), static_cast<unsigned int>(i),

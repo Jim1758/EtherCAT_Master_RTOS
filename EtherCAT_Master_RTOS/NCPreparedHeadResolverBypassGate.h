@@ -1456,6 +1456,7 @@ private:
             prepared.unitsMode != live.unitsMode ||
             prepared.planeMode != live.planeMode ||
             prepared.workCoordinateCode != live.workCoordinateCode ||
+            !SameNCTranslationSnapshot(prepared.translation, live.translation) ||
             prepared.storedStrokeMode != live.storedStrokeMode ||
             prepared.toolLengthMode != live.toolLengthMode ||
             prepared.hCode != live.hCode ||

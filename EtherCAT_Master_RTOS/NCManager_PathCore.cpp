@@ -1,4 +1,4 @@
-// NC-0.2L.2AS / Path Core Shadow Implementation Unit Isolation.
+﻿// NC-0.2L.2AS / Path Core Shadow Implementation Unit Isolation.
 // These eight NCManager method definitions are moved verbatim from AR.
 // The existing caller, member layout and observer order are unchanged.
 // This is a translation-unit boundary, NOT a thread, queue or lifecycle
@@ -6,6 +6,7 @@
 // No source snapshot, new runtime state or validation shortcut is added.
 // Compile this file exactly once together with the matching NCManager.cpp.
 #include "NCManager.h"
+#include "GMCodeHandlers.h"
 #include <cstdint>
 #include <type_traits>
 #include <cstring>
@@ -671,12 +672,16 @@ bool NCManager::IsPathCoreLiveNativeConfigCurrentSameThread() noexcept
 {
     if (CoordSys.IsTranslationRunFrozen() &&
         (!CoordSys.IsTranslationRunCurrent() || !IsFixedTranslationTravelCurrentSameThread())) return false;
-    if (!m_pathCoreLiveBookkeeping.nativeBound) return false;
+    if (!m_pathCoreLiveBookkeeping.nativeBound ||
+        (CoordSys.IsTranslationRunBound() && !CoordSys.IsTranslationAxisIdentityCurrent())) return false;
     for (std::size_t axis = 0U; axis < 8U; ++axis)
     {
         const AxisContext& native = m_motion.GetAxisContext(static_cast<int>(axis));
         const std::uint32_t type = static_cast<std::uint32_t>(native.axisType);
-        if (type > static_cast<std::uint32_t>(AxisType::ROTARY_CONTINUOUS) ||
+        if ((native.isExist && (native.axisIndex != static_cast<int>(axis) ||
+                !std::isfinite(native.finalLead) || native.finalLead <= 0.0 ||
+                !std::isfinite(native.resolution_PPR) || native.resolution_PPR <= 0.0)) ||
+            type > static_cast<std::uint32_t>(AxisType::ROTARY_CONTINUOUS) ||
             static_cast<std::int32_t>(native.axisIndex) != m_pathCoreLiveNative.axisIndex[axis] ||
             type != static_cast<std::uint32_t>(m_pathCoreLiveNative.axisType[axis]) ||
             m_axisNames[axis] != m_pathCoreLiveNative.axisName[axis] ||
@@ -1459,6 +1464,13 @@ NC_PATH_CORE_NOINLINE
 void NCManager::BeginPathCoreCommandedCaptureSameThread(const NCBlock& block,
     NCBlockDispatchId dispatchId) noexcept
 {
+    // BASE-PLANE-2 does not export non-XY rapids into the old commanded
+    // return store. Close the whole older run, not just this one receipt.
+    if (CoordSys.activePlane != 17)
+    {
+        ClosePathCoreCommittedRunSameThread();
+        return;
+    }
     ObservePathCoreReturnDispatchSameThread(block);
     // A later dispatch must never overwrite an unadmitted committed receipt.
     // This revokes only BQ data if RT requests are still pending; NC continues.
@@ -2465,7 +2477,7 @@ namespace
         for (char word = 'A'; word <= 'Z'; ++word)
             if (block.has(word) && ((word != 'N' && word != 'G') ||
                 !std::isfinite(block.val(word)))) return false;
-        return mode == 15 || (coord.isAbsoluteMode && coord.activePlane == 17 &&
+        return mode == 15 || (coord.isAbsoluteMode && coord.IsBaseArcPlaneSelectionSupported(coord.activePlane) &&
             !coord.isCAxisOffsetRotationEnabled && coord.toolRadiusMode == 40);
     }
 
@@ -2508,8 +2520,8 @@ namespace
                 !hasAxis[0] || !hasAxis[1] || !hasAxis[2]) return false;
         }
         if (code == 151 && !hasAxis[0] && !hasAxis[1] && !hasAxis[2]) return false;
-        if ((code == 51 || code == 151) && (coord.isCAxisOffsetRotationEnabled || coord.activePlane != 17 ||
-            coord.toolRadiusMode != 40)) return false;
+        if ((code == 51 || code == 151) && (coord.isCAxisOffsetRotationEnabled ||
+            !coord.IsBaseArcPlaneSelectionSupported(coord.activePlane) || coord.toolRadiusMode != 40)) return false;
         return true;
     }
 }
@@ -2556,11 +2568,29 @@ void NCManager::RetireFixedTranslationSameThread() noexcept
 
 bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode)
 {
+    // Recheck the selected plane at the motion entry, before a legacy/MDI
+    // caller or an unfrozen G00 fallback could bypass the whole-block gate.
+    if (CoordSys.activePlane != 17 && (gCode == 0 || gCode == 1) &&
+        (m_mode != NCOperationMode::MEMORY || !CoordSys.IsTranslationRunBound() ||
+            !CoordSys.IsBaseArcPlaneSelectionSupported(CoordSys.activePlane) ||
+            !IsPathCoreBasePlaneLinearBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21,
+                CoordSys.isPolarCoordinateActive, CoordSys.activePlane) ||
+            gCode != block.gCode || m_cncFeed.selected || m_cncFeed.active ||
+            m_pathHold.armed || m_pathHold.bound || m_pathReplay.pending ||
+            m_gapDryRun.active || m_gapPath.active || m_gapWindow.active ||
+            m_isG66Active || !m_macroStack.empty()))
+    {
+        RtPrintf("[PLANE][REJECT] plane=%d g=%d reason=LINE_SCOPE beforeSubmit=1\n", CoordSys.activePlane, gCode);
+        AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+        ChangeState(NCState::HOLD);
+        return false;
+    }
     if (CoordSys.toolRadiusMode != 40 &&
         (m_mode != NCOperationMode::MEMORY || !CoordSys.IsTranslationRunBound() ||
-            !CoordSys.isAbsoluteMode || CoordSys.activePlane != 17 || CoordSys.isCAxisOffsetRotationEnabled ||
-            CoordSys.isPolarCoordinateActive || gCode != block.gCode ||
-            !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21)))
+            !IsNCTranslationCutterNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode ? 90 : 91,
+                CoordSys.isPolarCoordinateActive ? 16 : 15) || !IsNCArcPlaneCode(CoordSys.activePlane) || CoordSys.isCAxisOffsetRotationEnabled ||
+            gCode != block.gCode ||
+            !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive)))
     {
         RtPrintf("[CUTTER][REJECT] reason=MOTION_SCOPE beforeSubmit=1\n");
         AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
@@ -2569,7 +2599,8 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
     }
     if (CoordSys.isPolarCoordinateActive &&
         (m_mode != NCOperationMode::MEMORY || !CoordSys.IsTranslationRunBound() ||
-            !CoordSys.isAbsoluteMode || CoordSys.activePlane != 17 || CoordSys.isCAxisOffsetRotationEnabled))
+            !CoordSys.isAbsoluteMode || !CoordSys.IsBaseArcPlaneSelectionSupported(CoordSys.activePlane) ||
+            CoordSys.isCAxisOffsetRotationEnabled))
     {
         RtPrintf("[POLAR][REJECT] reason=MOTION_SCOPE beforeSubmit=1\n");
         AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
@@ -2577,6 +2608,13 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         return false;
     }
     if (m_mode != NCOperationMode::MEMORY) return true;
+    if (CoordSys.IsTranslationRunBound() && !IsPathCoreLiveNativeConfigCurrentSameThread())
+    {
+        AlarmManager::GetInstance().Trigger(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        m_state = NCState::ALARM;
+        m_motion.RequestEmergencyStopAllAxes();
+        return false;
+    }
     if (gCode >= 0 && gCode <= 3)
     {
         for (int axisIndex = 0; axisIndex < 8; ++axisIndex)
@@ -2599,7 +2637,7 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) && block.has('P') && block.val('P') == 1.0;
     const bool rotatedQueuedCorner = CoordSys.isAbsoluteMode && CoordSys.activePlane == 17 &&
         !CoordSys.isCAxisOffsetRotationEnabled && gCode == 1 && block.gCode == 1 &&
-        IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) && block.has('Q');
+        IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane) && block.has('Q');
     if ((CoordSys.IsFixedPlanarRotationActive() || CoordSys.IsScaleMirrorActive() || CoordSys.isPolarCoordinateActive || !CoordSys.isAbsoluteMode) && gCode >= 0 && gCode <= 3 &&
         (block.has('P') || block.has('Q')) && !rotatedQueuedArc && !rotatedQueuedCorner)
     {
@@ -2639,7 +2677,7 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
     {
         // Existing uncompensated rapid fallback remains available. Active H
         // or WORK cannot bypass the fixed source contract through legacy G00.
-        if (gCode == 0 && !CoordSys.isInchMode && CoordSys.isAbsoluteMode && CoordSys.toolLengthMode == 49 && !CoordSys.isG68Active &&
+        if (gCode == 0 && CoordSys.activePlane == 17 && !CoordSys.isInchMode && CoordSys.isAbsoluteMode && CoordSys.toolLengthMode == 49 && !CoordSys.isG68Active &&
             !CoordSys.isWorkpieceRotationActive && CoordSys.currentWCode == 0 && !CoordSys.IsScaleMirrorActive() &&
             !CoordSys.isPolarCoordinateActive && CoordSys.toolRadiusMode == 40) return true;
         RtPrintf("[COORD][REJECT] op=FEED_SCOPE g=%d run=%llu beforeSubmit=1\n", gCode,
@@ -2702,6 +2740,15 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         return false;
     }
     // Use the existing integer transport: the target RtPrintf prints float conversions as "f".
+    RtPrintf("[AXIS-IDENTITY][FROZEN] schema=%u run=%llu generation=%llu exists=%u%u%u%u%u%u%u%u role=%u mode=%u ecc=%u\n",
+        frozen.schema, static_cast<unsigned long long>(frozen.runToken),
+        static_cast<unsigned long long>(frozen.generation),
+        static_cast<unsigned>(frozen.axisIdentity.exists[0]), static_cast<unsigned>(frozen.axisIdentity.exists[1]),
+        static_cast<unsigned>(frozen.axisIdentity.exists[2]), static_cast<unsigned>(frozen.axisIdentity.exists[3]),
+        static_cast<unsigned>(frozen.axisIdentity.exists[4]), static_cast<unsigned>(frozen.axisIdentity.exists[5]),
+        static_cast<unsigned>(frozen.axisIdentity.exists[6]), static_cast<unsigned>(frozen.axisIdentity.exists[7]),
+        static_cast<unsigned>(frozen.axisIdentity.electrodeAxisPlusOne), static_cast<unsigned>(frozen.axisIdentity.systemMode),
+        static_cast<unsigned>(frozen.axisIdentity.eccentricEnabled));
     RtPrintf("[COORD][FROZEN] run=%llu generation=%llu revision=%llu wcs=%d offsetXMMBits=%llu offsetYMMBits=%llu offsetZMMBits=%llu\n",
         static_cast<unsigned long long>(frozen.runToken),
         static_cast<unsigned long long>(frozen.generation),
@@ -2727,26 +2774,97 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         static_cast<unsigned long long>(PathCoreReturnDoubleBits(NCTranslationAxisOffsetMM(frozen, 0U))),
         static_cast<unsigned long long>(PathCoreReturnDoubleBits(NCTranslationAxisOffsetMM(frozen, 1U))),
         static_cast<unsigned long long>(PathCoreReturnDoubleBits(NCTranslationAxisOffsetMM(frozen, 2U))));
-    RtPrintf("[ROTATION][FROZEN] run=%llu generation=%llu schema=%u mode=%d plane=%d centerXMMBits=%llu centerYMMBits=%llu angleDegBits=%llu\n",
+    RtPrintf("[ROTATION][FROZEN] run=%llu generation=%llu schema=%u mode=%d plane=%d centerUMMBits=%llu centerVMMBits=%llu angleDegBits=%llu\n",
         static_cast<unsigned long long>(frozen.runToken),
         static_cast<unsigned long long>(frozen.generation),
         static_cast<unsigned int>(frozen.schema), frozen.rotationMode, frozen.rotationPlane,
         static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.rotationCenterMM[0])),
         static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.rotationCenterMM[1])),
         static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.rotationAngleDeg)));
-    RtPrintf("[WORK-ROTATION][FROZEN] run=%llu generation=%llu schema=%u mode=%d W=%d centerXMMBits=%llu centerYMMBits=%llu yawDegBits=%llu matrix=0\n",
+    RtPrintf("[WORK-ROTATION][FROZEN] run=%llu generation=%llu schema=%u mode=%d W=%d plane=%d centerUMMBits=%llu centerVMMBits=%llu yawDegBits=%llu pitchDegBits=%llu rollDegBits=%llu matrix=0\n",
         static_cast<unsigned long long>(frozen.runToken),
         static_cast<unsigned long long>(frozen.generation),
         static_cast<unsigned int>(frozen.schema), frozen.workMode, frozen.workWCode,
+        frozen.rotationPlane,
         static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.workRotationCenterMM[0])),
         static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.workRotationCenterMM[1])),
-        static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.workOffset[CoordinateManager::WO_ANGLE_XY_YAW])));
+        static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.workOffset[CoordinateManager::WO_ANGLE_XY_YAW])),
+        static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.workOffset[CoordinateManager::WO_ANGLE_XZ_PITCH])),
+        static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.workOffset[CoordinateManager::WO_ANGLE_YZ_ROLL])));
     return true;
+}
+
+int NCManager::GetG53NativeScopeAlarmSameThread()
+{
+    if (!CoordSys.isAbsoluteMode || CoordSys.activePlane != 17 ||
+        CoordSys.toolRadiusMode != 40 || CoordSys.currentDCode != 0 ||
+        m_cutterLine.leadOutRequired || m_pathHold.armed || m_pathHold.bound ||
+        m_pathReplay.pending || m_gapDryRun.active || m_gapPath.active || m_gapWindow.active ||
+        !m_macroStack.empty() || m_isG66Active)
+        return AlarmManager::G_Code_Invalid_parameter;
+    if (CoordSys.IsTranslationRunBound() &&
+        (!CoordSys.IsTranslationAxisIdentityCurrent() || !IsPathCoreLiveNativeConfigCurrentSameThread()))
+        return AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY;
+    if (!CoordSys.IsTranslationRunFrozen())
+        return (CoordSys.toolLengthMode != 49 || CoordSys.isG68Active ||
+            CoordSys.isWorkpieceRotationActive || CoordSys.currentWCode != 0 ||
+            CoordSys.IsScaleMirrorActive() || CoordSys.isPolarCoordinateActive)
+            ? AlarmManager::G_Code_Invalid_parameter : 0;
+    if (m_mode != NCOperationMode::MEMORY || m_state != NCState::RUN ||
+        Close_System_Com_flag || AlarmManager::GetInstance().HasAlarm() || Homing.IsActive() ||
+        IsFeedHoldActive() || CoordSys.isCAxisOffsetRotationEnabled ||
+        m_pathFeed.pending || m_pathArc.pending || m_cncFeed.active || m_cncFeed.selected ||
+        m_cncFeed.count != 0U || m_pathCoreCommittedBookkeeping.pendingAdmission)
+        return AlarmManager::G_Code_Invalid_parameter;
+    if (!CoordSys.IsTranslationRunCurrent() || !IsFixedTranslationTravelCurrentSameThread() ||
+        !m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot()))
+        return AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY;
+    return 0;
+}
+
+bool NCManager::PrepareG53NativeHandoffSameThread()
+{
+    if (!CoordSys.IsTranslationRunFrozen()) return true;
+    int alarm = GetG53NativeScopeAlarmSameThread();
+    if (alarm == 0)
+    {
+        const MotionNCTranslationTransitionResult result = m_motion.CheckG53NativeHandoff(
+            CoordSys.GetTranslationSnapshot(), m_motion.GetCurrentExecutionEpoch(), m_programMotionLease);
+        if (result == MotionNCTranslationTransitionResult::ACCEPTED) return true;
+        if (result == MotionNCTranslationTransitionResult::DEFERRED &&
+            CoordSys.IsTranslationRunCurrent() && m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot()))
+            return false; // No dispatch, mutation or console I/O while RT publication is busy.
+        alarm = result == MotionNCTranslationTransitionResult::UNSUPPORTED_PREDECESSOR
+            ? static_cast<int>(AlarmManager::G_Code_Invalid_parameter)
+            : static_cast<int>(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+    }
+    RtPrintf("[G53][REJECT] alarm=%d reason=HANDOFF beforeCommit=1\n", alarm);
+    AlarmManager::GetInstance().Trigger(alarm);
+    ChangeState(alarm == AlarmManager::G_Code_Invalid_parameter ? NCState::HOLD : NCState::ALARM);
+    return false;
+}
+
+void NCManager::CommitG53NativeHandoffSameThread() noexcept
+{
+    // G53 is a positioning boundary, never a retained cutting segment. Only
+    // the accepted native tail may sever old history. The coordinate descriptor
+    // stays identical; the aborting motion epoch fences every older packet.
+    ClearPathCoreReplayHistorySameThread();
+    ClosePathCoreCommittedRunSameThread();
+    if (CoordSys.IsTranslationRunFrozen())
+    {
+        const NCTranslationSnapshot& frame = CoordSys.GetTranslationSnapshot();
+        RtPrintf("[G53][HANDOFF] run=%llu generation=%llu epoch=%u native=1 historyCleared=1\n",
+            static_cast<unsigned long long>(frame.runToken),
+            static_cast<unsigned long long>(frame.generation),
+            static_cast<unsigned int>(m_motion.GetCurrentExecutionEpoch()));
+    }
 }
 
 bool NCManager::RequiresFixedTranslationSelectionTransitionSameThread(const NCBlock& block) const
 {
     if (!CoordSys.IsTranslationRunFrozen()) return false;
+    if (NCGCodeSemantics::Contains(block, 53)) return true;
     if (NCGCodeSemantics::Contains(block, 22) || NCGCodeSemantics::Contains(block, 23))
         return (NCGCodeSemantics::Contains(block, 22) ? 22 : 23) !=
             CoordSys.GetTranslationSnapshot().storedStrokeMode;
@@ -2786,19 +2904,30 @@ bool NCManager::RequiresFixedTranslationSelectionTransitionSameThread(const NCBl
              wCode != CoordSys.currentWCode || (workMode == 168 &&
                 (block.has('X') || block.has('Y'))))) return true;
     }
+    NCArcPlaneAxes rotationAxes{};
+    if (!TryGetNCArcPlaneAxes(CoordSys.activePlane, rotationAxes)) return true;
     if ((NCGCodeSemantics::Contains(block, 69) && CoordSys.isG68Active) ||
         (NCGCodeSemantics::Contains(block, 68) &&
             (!CoordSys.isG68Active ||
-             PathCoreReturnDoubleBits(CoordSys.ToInternalUnit(block.val('X'), false)) != PathCoreReturnDoubleBits(CoordSys.g68CenterWCS[0]) ||
-             PathCoreReturnDoubleBits(CoordSys.ToInternalUnit(block.val('Y'), false)) != PathCoreReturnDoubleBits(CoordSys.g68CenterWCS[1]) ||
+             PathCoreReturnDoubleBits(CoordSys.ToInternalUnit(block.val(rotationAxes.uAddress), false)) != PathCoreReturnDoubleBits(CoordSys.g68CenterWCS[rotationAxes.u]) ||
+             PathCoreReturnDoubleBits(CoordSys.ToInternalUnit(block.val(rotationAxes.vAddress), false)) != PathCoreReturnDoubleBits(CoordSys.g68CenterWCS[rotationAxes.v]) ||
              PathCoreReturnDoubleBits(block.val('R')) != PathCoreReturnDoubleBits(CoordSys.g68Angle)))) return true;
+    for (int plane : {17, 18, 19})
+        if (NCGCodeSemantics::Contains(block, plane) && CoordSys.activePlane != plane) return true;
     if ((!CoordSys.isInchMode && NCGCodeSemantics::Contains(block, 20)) ||
         (CoordSys.isInchMode && NCGCodeSemantics::Contains(block, 21))) return true;
     if ((CoordSys.isAbsoluteMode && NCGCodeSemantics::Contains(block, 91)) ||
         (!CoordSys.isAbsoluteMode && NCGCodeSemantics::Contains(block, 90))) return true;
-    for (int code = 54; code <= 59; ++code)
-        if (NCGCodeSemantics::Contains(block, code) && code != CoordSys.currentWCSIndex + 54)
+    // The project has ten banks of six WCS rows. Iterate stored codes, not
+    // a continuous numeric range; invalid bank gaps are never selectors.
+    if (block.gCount > NC_MAX_G_CODES_PER_BLOCK) return true;
+    const int wcsCount = block.gCount > 0 ? block.gCount : (block.hasG ? 1 : 0);
+    for (int i = 0; i < wcsCount; ++i)
+    {
+        const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
+        if (IsNCWorkCoordinateCode(code) && code != CoordSys.GetCurrentWCSGCode())
             return true;
+    }
     for (int code : {43, 44, 49})
     {
         int toolMode = 49, hCode = 0;
@@ -2812,6 +2941,12 @@ bool NCManager::RequiresFixedTranslationSelectionTransitionSameThread(const NCBl
 bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& block)
 {
     if (!CoordSys.IsTranslationRunFrozen()) return true;
+    if (NCGCodeSemantics::Contains(block, 53))
+        return GCodeHandlers::ValidateG53Block(block, this) && PrepareG53NativeHandoffSameThread();
+    const int arcPlane = NCGCodeSemantics::Contains(block, 18) ? 18 :
+        (NCGCodeSemantics::Contains(block, 19) ? 19 : (NCGCodeSemantics::Contains(block, 17) ? 17 : 0));
+    const bool planeSelection = arcPlane != 0;
+    if (planeSelection && !IsFixedTranslationBlockAllowedSameThread(block)) return false;
     const int strokeMode = NCGCodeSemantics::Contains(block, 22) ? 22 :
         (NCGCodeSemantics::Contains(block, 23) ? 23 : 0);
     const bool strokeSelection = strokeMode != 0;
@@ -2837,9 +2972,16 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
     const int mode = NCGCodeSemantics::Contains(block, 91) ? 91 :
         (NCGCodeSemantics::Contains(block, 90) ? 90 : 0);
     int wcs = 0;
-    for (int code = 54; code <= 59; ++code)
-        if (NCGCodeSemantics::Contains(block, code)) wcs = code;
+    const int wcsCount = block.gCount > 0 ?
+        (std::min)(block.gCount, NC_MAX_G_CODES_PER_BLOCK) : (block.hasG ? 1 : 0);
+    for (int i = 0; i < wcsCount; ++i)
+    {
+        const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
+        if (IsNCWorkCoordinateCode(code)) wcs = code;
+    }
     const bool workCoordinateSelection = wcs != 0;
+    // An equal extended selector is still a checked standalone operation.
+    if (wcs > 59 && !IsFixedTranslationBlockAllowedSameThread(block)) return false;
     int toolMode = 49, hCode = 0;
     bool toolSelection = false;
     for (int code : {43, 44, 49})
@@ -2852,14 +2994,26 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
         if (NCGCodeSemantics::Contains(block, code) &&
             TryDecodeNCWorkSelection(code, block.has('W'), block.val('W'), workMode, wCode))
             workpieceSelection = true;
-    const bool hasWorkCenter = workpieceSelection && (block.has('X') || block.has('Y'));
-    const double workCenterX = hasWorkCenter ? CoordSys.ToInternalUnit(block.val('X'), false) : 0.0;
-    const double workCenterY = hasWorkCenter ? CoordSys.ToInternalUnit(block.val('Y'), false) : 0.0;
+    NCArcPlaneAxes workAxes{};
+    if (!TryGetNCArcPlaneAxes(CoordSys.activePlane, workAxes)) return false;
+    const bool hasWorkCenter = workpieceSelection &&
+        (block.has(workAxes.uAddress) || block.has(workAxes.vAddress));
+    const double workCenterU = hasWorkCenter ?
+        CoordSys.ToInternalUnit(block.val(workAxes.uAddress), false) : 0.0;
+    const double workCenterV = hasWorkCenter ?
+        CoordSys.ToInternalUnit(block.val(workAxes.vAddress), false) : 0.0;
     const int rotationMode = NCGCodeSemantics::Contains(block, 68) ? 68 :
         (NCGCodeSemantics::Contains(block, 69) ? 69 : 0);
     const bool rotationSelection = rotationMode != 0;
+    NCArcPlaneAxes rotationAxes{};
+    if (!TryGetNCArcPlaneAxes(CoordSys.activePlane, rotationAxes)) return false;
+    // Idempotent new-plane rotation/affine/H/WORK selections must still
+    // pass whole-block validation; no settings or T/M effects can hide here.
+    if ((rotationSelection || affineSelection || toolSelection || workpieceSelection) &&
+        CoordSys.activePlane != 17 &&
+        !IsFixedTranslationBlockAllowedSameThread(block)) return false;
     if (!RequiresFixedTranslationSelectionTransitionSameThread(block)) return true;
-    const char* selectionKind = strokeSelection ? "STROKE" : cutterSelection ? "CUTTER" : polarSelection ? "POLAR" : affineSelection ? "SCALE-MIRROR" : (workpieceSelection ? "WORK" : (rotationSelection ? "ROTATION" :
+    const char* selectionKind = planeSelection ? "PLANE" : strokeSelection ? "STROKE" : cutterSelection ? "CUTTER" : polarSelection ? "POLAR" : affineSelection ? "SCALE-MIRROR" : (workpieceSelection ? "WORK" : (rotationSelection ? "ROTATION" :
         (toolSelection ? "TOOL" : (workCoordinateSelection ? "WCS" : (unitsSelection ? "UNITS" : "MODE")))));
     const auto reject = [this, selectionKind](const char* reason) -> bool
     {
@@ -2874,12 +3028,12 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
         if (word != 'N' && word != 'G' && !(toolSelection && word == 'H') &&
             !(cutterSelection && cutterMode != 40 && word == 'D') &&
             !(workpieceSelection && (word == 'W' ||
-                (workMode == 168 && (word == 'X' || word == 'Y')))) &&
-            !(rotationMode == 68 && (word == 'X' || word == 'Y' || word == 'R')) &&
+                (workMode == 168 && (word == workAxes.uAddress || word == workAxes.vAddress)))) &&
+            !(rotationMode == 68 && (word == rotationAxes.uAddress || word == rotationAxes.vAddress || word == 'R')) &&
             !(affineSelection && (word == 'X' || word == 'Y' || word == 'Z' || (affineCode == 51 && word == 'P'))) &&
             block.has(word)) return reject("SHAPE");
-    if ((rotationMode == 68 && (!block.has('X') || !block.has('Y') || !block.has('R'))) ||
-        (workpieceSelection && block.has('X') != block.has('Y')))
+    if ((rotationMode == 68 && (!block.has(rotationAxes.uAddress) || !block.has(rotationAxes.vAddress) || !block.has('R'))) ||
+        (workpieceSelection && block.has(workAxes.uAddress) != block.has(workAxes.vAddress)))
         return reject("SHAPE");
     // Completion includes NC receipts and RT ingress/replay/physical drain.
     // Never invalidate outstanding work to make a coordinate change appear ready.
@@ -2898,14 +3052,16 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
     if (!CoordSys.IsTranslationRunCurrent() ||
         !m_motion.MatchesNCTranslation(previous)) return reject("SOURCE");
     bool prepared = false;
-    if (strokeSelection) prepared = CoordSys.PrepareStoredStrokeTransition(strokeMode, next);
+    if (planeSelection) prepared = CoordSys.PrepareArcPlaneTransition(arcPlane, next);
+    else if (strokeSelection) prepared = CoordSys.PrepareStoredStrokeTransition(strokeMode, next);
     else if (cutterSelection) prepared = CoordSys.PrepareToolRadiusSelectionTransition(cutterMode, cutterD, next);
     else if (polarSelection) prepared = CoordSys.PreparePolarTransition(polarMode, next);
     else if (affineSelection) prepared = CoordSys.PrepareScaleMirrorTransition(affineCode, affineValues, affineAxes, affineFactor, next);
-    else if (workpieceSelection) prepared = CoordSys.PrepareWorkpieceTransition(workMode, wCode, hasWorkCenter, workCenterX, workCenterY, next);
+    else if (workpieceSelection) prepared = CoordSys.PrepareWorkpieceTransition(workMode, wCode,
+        hasWorkCenter, workCenterU, workCenterV, next);
     else if (rotationSelection) prepared = CoordSys.PreparePlanarRotationTransition(rotationMode,
-        rotationMode == 68 ? CoordSys.ToInternalUnit(block.val('X'), false) : 0.0,
-        rotationMode == 68 ? CoordSys.ToInternalUnit(block.val('Y'), false) : 0.0,
+        rotationMode == 68 ? CoordSys.ToInternalUnit(block.val(rotationAxes.uAddress), false) : 0.0,
+        rotationMode == 68 ? CoordSys.ToInternalUnit(block.val(rotationAxes.vAddress), false) : 0.0,
         rotationMode == 68 ? block.val('R') : 0.0, next);
     else if (toolSelection) prepared = CoordSys.PrepareToolLengthTransition(toolMode, hCode, next);
     else if (workCoordinateSelection) prepared = CoordSys.PrepareWorkCoordinateTransition(wcs, next);
@@ -2913,7 +3069,7 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
     else prepared = CoordSys.PrepareDistanceModeTransition(mode, next);
     if (!prepared)
     {
-        if (!workCoordinateSelection && !toolSelection && !rotationSelection && !workpieceSelection && !affineSelection && !polarSelection && !cutterSelection)
+        if (!planeSelection && !workCoordinateSelection && !toolSelection && !rotationSelection && !workpieceSelection && !affineSelection && !polarSelection && !cutterSelection)
             return reject("SOURCE");
         RtPrintf("[COORD][%s-REJECT] wcs=%d H=%d W=%d reason=TARGET_FRAME beforeCommit=1\n",
             selectionKind, wcs, hCode, wCode);
@@ -2929,7 +3085,7 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
         if (!m_motion.HasExactExecutionDrainAcknowledgement(epoch, m_programMotionLease))
             return false;
         if (!CoordSys.CommitWorkpieceTransition(workMode, wCode, hasWorkCenter,
-            workCenterX, workCenterY, next)) return reject("COMMIT");
+            workCenterU, workCenterV, next)) return reject("COMMIT");
         RtPrintf("[COORD][WORK-NOOP] run=%llu generation=%llu revision=%llu W=%d epoch=%u drained=1\n",
             static_cast<unsigned long long>(next.runToken), static_cast<unsigned long long>(next.generation),
             static_cast<unsigned long long>(next.revision), next.workWCode, static_cast<unsigned int>(epoch));
@@ -2954,11 +3110,13 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
         return reject("SOURCE_CHANGED");
     }
     bool committed = false;
-    if (strokeSelection) committed = CoordSys.CommitStoredStrokeTransition(next);
+    if (planeSelection) committed = CoordSys.CommitArcPlaneTransition(next);
+    else if (strokeSelection) committed = CoordSys.CommitStoredStrokeTransition(next);
     else if (cutterSelection) committed = CoordSys.CommitToolRadiusSelectionTransition(next);
     else if (polarSelection) committed = CoordSys.CommitPolarTransition(next);
     else if (affineSelection) committed = CoordSys.CommitScaleMirrorTransition(next);
-    else if (workpieceSelection) committed = CoordSys.CommitWorkpieceTransition(workMode, wCode, hasWorkCenter, workCenterX, workCenterY, next);
+    else if (workpieceSelection) committed = CoordSys.CommitWorkpieceTransition(workMode, wCode,
+        hasWorkCenter, workCenterU, workCenterV, next);
     else if (rotationSelection) committed = CoordSys.CommitPlanarRotationTransition(next);
     else if (toolSelection) committed = CoordSys.CommitToolLengthTransition(next);
     else if (workCoordinateSelection) committed = CoordSys.CommitWorkCoordinateTransition(next);
@@ -2973,9 +3131,9 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
     const int newAffineSelection = affineCode <= 51 ? next.scalingMode : static_cast<int>(next.mirrorMask);
     RtPrintf("[COORD][%s-SWITCH] run=%llu from=%d to=%d oldGeneration=%llu generation=%llu revision=%llu epoch=%u drained=1\n",
         selectionKind, static_cast<unsigned long long>(next.runToken),
-        strokeSelection ? previous.storedStrokeMode : cutterSelection ? previous.cutterMode : polarSelection ? previous.polarMode : affineSelection ? oldAffineSelection : workpieceSelection ? previous.workMode : (rotationSelection ? previous.rotationMode :
+        planeSelection ? previous.rotationPlane : strokeSelection ? previous.storedStrokeMode : cutterSelection ? previous.cutterMode : polarSelection ? previous.polarMode : affineSelection ? oldAffineSelection : workpieceSelection ? previous.workMode : (rotationSelection ? previous.rotationMode :
             (toolSelection ? previous.toolLengthMode : (workCoordinateSelection ? previous.wcsCode : (unitsSelection ? previous.unitsMode : previous.distanceMode)))),
-        strokeSelection ? next.storedStrokeMode : cutterSelection ? next.cutterMode : polarSelection ? next.polarMode : affineSelection ? newAffineSelection : workpieceSelection ? next.workMode : (rotationSelection ? next.rotationMode :
+        planeSelection ? next.rotationPlane : strokeSelection ? next.storedStrokeMode : cutterSelection ? next.cutterMode : polarSelection ? next.polarMode : affineSelection ? newAffineSelection : workpieceSelection ? next.workMode : (rotationSelection ? next.rotationMode :
             (toolSelection ? next.toolLengthMode : (workCoordinateSelection ? next.wcsCode : (unitsSelection ? next.unitsMode : next.distanceMode)))),
         static_cast<unsigned long long>(previous.generation), static_cast<unsigned long long>(next.generation),
         static_cast<unsigned long long>(next.revision), static_cast<unsigned int>(epoch));
@@ -2998,17 +3156,19 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
             static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.mirrorCenterMM[1])),
             static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.mirrorCenterMM[2])));
     if (workpieceSelection)
-        RtPrintf("[WORK][SELECTED] run=%llu generation=%llu mode=%d oldW=%d W=%d rawXMMBits=%llu rawYMMBits=%llu rawZMMBits=%llu yawDegBits=%llu nativeCenterXMMBits=%llu nativeCenterYMMBits=%llu matrix=0\n",
+        RtPrintf("[WORK][SELECTED] run=%llu generation=%llu mode=%d oldW=%d W=%d plane=%d rawXMMBits=%llu rawYMMBits=%llu rawZMMBits=%llu yawDegBits=%llu pitchDegBits=%llu rollDegBits=%llu nativeCenterUMMBits=%llu nativeCenterVMMBits=%llu matrix=0\n",
             static_cast<unsigned long long>(next.runToken), static_cast<unsigned long long>(next.generation),
-            next.workMode, previous.workWCode, next.workWCode,
+            next.workMode, previous.workWCode, next.workWCode, next.rotationPlane,
             static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.workOffset[0])),
             static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.workOffset[1])),
             static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.workOffset[2])),
-            static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.workOffset[3])),
+            static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.workOffset[CoordinateManager::WO_ANGLE_XY_YAW])),
+            static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.workOffset[CoordinateManager::WO_ANGLE_XZ_PITCH])),
+            static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.workOffset[CoordinateManager::WO_ANGLE_YZ_ROLL])),
             static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.workRotationCenterMM[0])),
             static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.workRotationCenterMM[1])));
     if (rotationSelection)
-        RtPrintf("[ROTATION][SELECTED] run=%llu generation=%llu mode=%d plane=%d centerXMMBits=%llu centerYMMBits=%llu angleDegBits=%llu matrix=0\n",
+        RtPrintf("[ROTATION][SELECTED] run=%llu generation=%llu mode=%d plane=%d centerUMMBits=%llu centerVMMBits=%llu angleDegBits=%llu matrix=0\n",
             static_cast<unsigned long long>(next.runToken), static_cast<unsigned long long>(next.generation),
             next.rotationMode, next.rotationPlane,
             static_cast<unsigned long long>(PathCoreReturnDoubleBits(next.rotationCenterMM[0])),
@@ -3030,12 +3190,227 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     // same block can commit. H is a tool index only for G43/G44/G49: accepted
     // G178 gap-time H and G65/G66 macro arguments retain their own semantics.
     const int codeCount = block.gCount > 0 ? block.gCount : (block.hasG ? 1 : 0);
+    if (codeCount > NC_MAX_G_CODES_PER_BLOCK)
+    {
+        RtPrintf("[COORD][WCS-REJECT] reason=CODE_COUNT beforeCommit=1\n");
+        AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+        ChangeState(NCState::HOLD);
+        return false;
+    }
     if (block.isEmpty && codeCount == 0 && block.mCount == 0 && !block.isGoto)
     {
         bool emptyWords = true;
         for (char word = 'A'; word <= 'Z'; ++word)
             if (block.has(word)) emptyWords = false;
         if (emptyWords) return true;
+    }
+    // BASE-PLANE-6 adds standalone H and translation-only WORK selections to
+    // the scale/mirror/G68/polar stopped lane. Reject mixed selectors, unsupported transforms, macros
+    // and retained/EDM controls before any setter or T/M side effect. G17 is unchanged.
+    int requestedPlane = 0;
+    for (int i = 0; i < codeCount; ++i)
+    {
+        const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
+        if (IsNCArcPlaneCode(code)) requestedPlane = code;
+    }
+    const bool basePlaneLane = CoordSys.activePlane != 17 || requestedPlane == 18 || requestedPlane == 19;
+    if (CoordSys.IsTranslationRunBound() && basePlaneLane)
+    {
+        bool allowed = !block.isGoto && !block.isBlockSkip &&
+            !m_pathHold.armed && !m_pathHold.bound &&
+            !m_pathReplay.pending && !m_gapDryRun.active && !m_gapPath.active &&
+            !m_gapWindow.active && m_macroStack.empty() && !m_isG66Active;
+        if (requestedPlane != 0)
+        {
+            allowed = allowed && codeCount == 1 && block.mCount == 0 &&
+                CoordSys.IsBaseArcPlaneSelectionSupported(requestedPlane) &&
+                (!(CoordSys.isG68Active || CoordSys.isPolarCoordinateActive) || requestedPlane == CoordSys.activePlane);
+            for (char word = 'A'; word <= 'Z'; ++word)
+                if (block.has(word) && ((word != 'N' && word != 'G') ||
+                    !std::isfinite(block.val(word)))) allowed = false;
+        }
+        else
+        {
+            // Neutral XYZ lines/rapids, circles, dwell, unit/distance/WCS
+            // selectors and M00/M30. All new-plane motion is exact-stop.
+            allowed = allowed && CoordSys.IsBaseArcPlaneSelectionSupported(CoordSys.activePlane) &&
+                codeCount <= 1 && block.mCount >= 0 && block.mCount <= 1;
+            const int action = codeCount == 1 ? (block.gCount > 0 ? block.gCodes[0] : block.gCode) : -1;
+            const bool arc = action == 2 || action == 3;
+            const bool linear = action == 0 || action == 1;
+            const bool dwell = action == 4;
+            const bool rotation = action == 68 || action == 69;
+            const bool affine = action == 50 || action == 51 || action == 150 || action == 151;
+            const bool tool = action == 43 || action == 44 || action == 49;
+            const bool work = action == 168 || action == 169;
+            const bool cutter = action == 40 || action == 41 || action == 42;
+            const bool selector = action == 15 || action == 16 || action == 20 || action == 21 || action == 90 || action == 91 ||
+                IsNCWorkCoordinateCode(action);
+            if (codeCount != 0 && !arc && !linear && !dwell && !selector && !rotation &&
+                !affine && !tool && !work && !cutter) allowed = false;
+            if (codeCount != 0 && block.mCount != 0) allowed = false;
+            if (block.mCount == 1 && block.mCode[0] != 0 && block.mCode[0] != 30) allowed = false;
+            if (linear)
+                allowed = allowed && IsPathCoreBasePlaneLinearBlockShapeValid(block,
+                    CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane);
+            else if (arc)
+                allowed = allowed && IsPathCoreArcBlockShapeValid(block, true,
+                    CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane,
+                    IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode),
+            IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode));
+            else if (cutter)
+            {
+                int mode = 40, dCode = 0;
+                allowed = allowed && PathCoreDecodeCutterSelection(block, CoordSys, mode, dCode);
+            }
+            else if (tool || work)
+            {
+                // One whole block owns this descriptor selection. H/W are
+                // row indices, never motion axes. A bounded nonzero G168 may
+                // additionally own exactly the active plane's centre pair.
+                int mode = tool ? 49 : 169, row = 0;
+                allowed = allowed && (tool ?
+                    (TryDecodeNCToolLengthSelection(action, block.has('H'), block.val('H'), mode, row) &&
+                        CoordSys.IsToolLengthSelectionSupported(mode, row)) :
+                    (TryDecodeNCWorkSelection(action, block.has('W'), block.val('W'), mode, row) &&
+                        CoordSys.IsWorkpieceSelectionSupported(mode, row)));
+                NCArcPlaneAxes workPlane{};
+                bool allowWorkCenter = false;
+                if (work && action == 168 && allowed && TryGetNCArcPlaneAxes(CoordSys.activePlane, workPlane))
+                {
+                    const unsigned angleField = CoordSys.activePlane == 18 ?
+                        CoordinateManager::WO_ANGLE_XZ_PITCH : (CoordSys.activePlane == 19 ?
+                            CoordinateManager::WO_ANGLE_YZ_ROLL : CoordinateManager::WO_ANGLE_XY_YAW);
+                    const bool rotatedWork = CoordSys.m_WorkOffset[row - 1][angleField] != 0.0;
+                    const bool sameWork = CoordSys.isWorkpieceRotationActive && CoordSys.currentWCode == row;
+                    const bool hasU = block.has(workPlane.uAddress);
+                    const bool hasV = block.has(workPlane.vAddress);
+                    allowWorkCenter = hasU && hasV;
+                    if (rotatedWork)
+                        allowed = allowed && ((allowWorkCenter && CoordSys.isAbsoluteMode) ||
+                            (!hasU && !hasV && sameWork));
+                    else
+                        allowed = allowed && !hasU && !hasV;
+                }
+                for (char word = 'A'; word <= 'Z'; ++word)
+                {
+                    if (!block.has(word)) continue;
+                    const bool permitted = word == 'N' || word == 'G' || word == (tool ? 'H' : 'W') ||
+                        (work && action == 168 && allowWorkCenter &&
+                            (word == workPlane.uAddress || word == workPlane.vAddress));
+                    if (!permitted || !std::isfinite(block.val(word))) allowed = false;
+                }
+            }
+            else if (affine)
+            {
+                int code = 0; double values[8] = {}; bool selected[8] = {}; double factor = 1.0;
+                allowed = allowed && PathCoreDecodeScaleMirrorSelection(block,
+                    CoordSys, code, values, selected, factor);
+            }
+            else if (rotation)
+            {
+                NCArcPlaneAxes axes{};
+                allowed = allowed && TryGetNCArcPlaneAxes(CoordSys.activePlane, axes);
+                if (action == 68)
+                    allowed = allowed && CoordSys.isAbsoluteMode &&
+                        block.has(axes.uAddress) && block.has(axes.vAddress) && block.has('R') &&
+                        std::isfinite(CoordSys.ToInternalUnit(block.val(axes.uAddress), false)) &&
+                        std::isfinite(CoordSys.ToInternalUnit(block.val(axes.vAddress), false)) &&
+                        std::isfinite(block.val('R')) && std::fabs(block.val('R')) <= 360.0;
+                for (char word = 'A'; word <= 'Z'; ++word)
+                    if (block.has(word) && ((word != 'N' && word != 'G' &&
+                        !(action == 68 && (word == axes.uAddress || word == axes.vAddress || word == 'R'))) ||
+                        !std::isfinite(block.val(word)))) allowed = false;
+            }
+            else
+                for (char word = 'A'; word <= 'Z'; ++word)
+                    if (block.has(word) && ((word != 'N' && word != 'G' &&
+                        !(dwell && (word == 'P' || word == 'X'))) ||
+                        !std::isfinite(block.val(word)))) allowed = false;
+        }
+        if (!allowed)
+        {
+            RtPrintf("[PLANE][REJECT] plane=%d requested=%d reason=BASE_SCOPE beforeCommit=1\n",
+                CoordSys.activePlane, requestedPlane);
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            ChangeState(NCState::HOLD);
+            return false;
+        }
+    }
+    // This decoder owns every word of a standalone G53. Its absolute native
+    // axis words bypass polar/scale/rotation interpretation, while immutable
+    // source, cutter, travel and retained-excursion gates remain mandatory.
+    if (NCGCodeSemantics::Contains(block, 53))
+        return GCodeHandlers::ValidateG53Block(block, this);
+    // Validate the entire G92 request against the prior native frame before
+    // ExecuteBlock can commit any same-row T, WCS, unit or M side effect.
+    if (NCGCodeSemantics::Contains(block, 92))
+    {
+        bool fields[8] = {};
+        double targets[8] = {};
+        if (!CoordSys.TryDecodeG92Origin(block, this, fields, targets))
+        {
+            RtPrintf("[ORIGIN][REJECT] g=92 reason=INPUT_OR_FRAME beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            ChangeState(NCState::HOLD);
+            return false;
+        }
+    }
+    // Ordinary G10 owns one complete table-write block. Validate before any
+    // WCS/unit/tool setting or M side effect can run from the same source line.
+    // G10 L12 keeps its existing scalar-radius decoder below.
+    if (NCGCodeSemantics::Contains(block, 10) && !block.has('L'))
+    {
+        int row = -1;
+        bool fields[8] = {};
+        double values[8] = {};
+        if (!CoordSys.TryDecodeToolTableWrite(block, this, row, fields, values))
+        {
+            RtPrintf("[TOOL][REJECT] g=10 reason=TABLE_INPUT beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            ChangeState(NCState::HOLD);
+            return false;
+        }
+    }
+    bool extendedWCSSelection = false;
+    for (int i = 0; i < codeCount; ++i)
+    {
+        const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
+        extendedWCSSelection = extendedWCSSelection || (code > 59 && IsNCWorkCoordinateCode(code));
+    }
+    if (CoordSys.IsTranslationRunBound() && extendedWCSSelection)
+    {
+        // New banks use one standalone selector even before first motion.
+        // Preserve legacy G54..G59 pre-freeze setup compatibility.
+        bool shapeValid = codeCount == 1 && block.mCount == 0 && !block.isGoto && !block.isBlockSkip;
+        for (char word = 'A'; word <= 'Z'; ++word)
+            if (block.has(word) && ((word != 'N' && word != 'G') ||
+                !std::isfinite(block.val(word)))) shapeValid = false;
+        const bool scopeValid = m_mode == NCOperationMode::MEMORY &&
+            CoordSys.toolRadiusMode == 40 && !m_cutterLine.leadOutRequired &&
+            !m_pathHold.armed && !m_pathHold.bound && !m_pathReplay.pending &&
+            !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active &&
+            m_macroStack.empty() && !m_isG66Active;
+        if (!shapeValid || !scopeValid)
+        {
+            RtPrintf("[COORD][WCS-REJECT] reason=%s beforeCommit=1\n",
+                shapeValid ? "ACTION_SCOPE" : "BLOCK_SHAPE");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            ChangeState(NCState::HOLD);
+            return false;
+        }
+        if (!CoordSys.IsTranslationAxisIdentityCurrent() || !IsPathCoreLiveNativeConfigCurrentSameThread() ||
+            (CoordSys.IsTranslationRunFrozen() &&
+                (!CoordSys.IsTranslationRunCurrent() || !IsFixedTranslationTravelCurrentSameThread() ||
+                    !m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot()))))
+        {
+            RtPrintf("[COORD][WCS-REJECT] reason=SOURCE_CHANGED beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+            m_state = NCState::ALARM;
+            return false;
+        }
     }
     const bool strokeSelection = NCGCodeSemantics::Contains(block, 22) ||
         NCGCodeSemantics::Contains(block, 23);
@@ -3099,7 +3474,8 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
             valid = false;
         if (mode != 40)
             valid = valid && m_mode == NCOperationMode::MEMORY && CoordSys.IsTranslationRunBound() &&
-                CoordSys.isAbsoluteMode && CoordSys.activePlane == 17 && !CoordSys.isPolarCoordinateActive &&
+                IsNCTranslationCutterNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode ? 90 : 91,
+                    CoordSys.isPolarCoordinateActive ? 16 : 15) && IsNCArcPlaneCode(CoordSys.activePlane) &&
                 !CoordSys.isCAxisOffsetRotationEnabled && !m_pathHold.armed && !m_pathHold.bound &&
                 !m_pathReplay.pending && !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active &&
                 m_macroStack.empty() && !m_isG66Active;
@@ -3116,8 +3492,8 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     const bool committedCutterCancel = cutterSelection && codeCount == 1 &&
         NCGCodeSemantics::Contains(block, 40) && CoordSys.toolRadiusMode == 40;
     if (m_cutterLine.leadOutRequired && !committedCutterCancel &&
-        (!block.has('X') || !block.has('Y') || block.has('Z') || block.has('Q') || block.isBlockSkip ||
-            !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, false)))
+        (block.gCode != 1 || !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive) ||
+            (CoordSys.activePlane != 17 && m_cutterLine.plane != CoordSys.activePlane)))
     {
         RtPrintf("[CUTTER][REJECT] reason=LEAD_OUT_REQUIRED beforeCommit=1\n");
         AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
@@ -3127,11 +3503,12 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     if (CoordSys.toolRadiusMode != 40)
     {
         const bool valid = m_mode == NCOperationMode::MEMORY && CoordSys.IsTranslationRunBound() &&
-            CoordSys.isAbsoluteMode && CoordSys.activePlane == 17 && !CoordSys.isPolarCoordinateActive &&
+            IsNCTranslationCutterNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode ? 90 : 91,
+                    CoordSys.isPolarCoordinateActive ? 16 : 15) && IsNCArcPlaneCode(CoordSys.activePlane) &&
             !CoordSys.isCAxisOffsetRotationEnabled && !m_pathHold.armed && !m_pathHold.bound &&
             !m_pathReplay.pending && !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active &&
             m_macroStack.empty() && !m_isG66Active && !block.isBlockSkip &&
-            (cutterSelection || IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21));
+            (cutterSelection || IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive));
         if (!valid)
         {
             RtPrintf("[CUTTER][REJECT] reason=ACTION_SCOPE beforeCommit=1\n");
@@ -3160,17 +3537,19 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     if (CoordSys.isPolarCoordinateActive)
     {
         bool valid = m_mode == NCOperationMode::MEMORY && CoordSys.IsTranslationRunBound() &&
-            CoordSys.isAbsoluteMode && CoordSys.activePlane == 17 && !CoordSys.isCAxisOffsetRotationEnabled &&
-            CoordSys.toolRadiusMode == 40 && !m_pathHold.armed && !m_pathHold.bound && !m_pathReplay.pending &&
+            CoordSys.isAbsoluteMode && CoordSys.IsBaseArcPlaneSelectionSupported(CoordSys.activePlane) &&
+            !CoordSys.isCAxisOffsetRotationEnabled &&
+            (CoordSys.toolRadiusMode == 40 || IsNCTranslationCutterNotationAllowed(CoordSys.activePlane,
+                CoordSys.isAbsoluteMode ? 90 : 91, 16)) && !m_pathHold.armed && !m_pathHold.bound && !m_pathReplay.pending &&
             !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active;
         for (int i = 0; i < codeCount; ++i)
         {
             const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
-            const int suffix = code % 100;
-            const bool extendedWCS = code > 59 && code <= 959 && suffix >= 54 && suffix <= 59;
             if ((NCGCodeSemantics::IsMotionAction(code) && !(code >= 0 && code <= 3)) ||
-                (code >= 171 && code <= 180) || code == 18 || code == 19 || code == 91 ||
-                code == 41 || code == 42 || code == 162 || code == 92 || extendedWCS) valid = false;
+                (code >= 171 && code <= 180) ||
+                (IsNCArcPlaneCode(code) && code != CoordSys.activePlane) || code == 91 ||
+                ((code == 41 || code == 42) && !IsNCTranslationCutterNotationAllowed(CoordSys.activePlane,
+                    CoordSys.isAbsoluteMode ? 90 : 91, 16)) || code == 162 || code == 92) valid = false;
         }
         // A setting-only row cannot silently discard polar endpoint words.
         // Coordinate centres retain their existing Cartesian parameter owners.
@@ -3182,17 +3561,28 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
             (block.has('X') || block.has('Y') || block.has('Z') || block.has('I') || block.has('J') ||
                 block.has('K') || block.has('R') || block.has('F') || block.has('Q') || block.has('P'))) valid = false;
         if (NCGCodeSemantics::Contains(block, 1) &&
-            !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, true)) valid = false;
+            !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, true, CoordSys.activePlane)) valid = false;
         if ((NCGCodeSemantics::Contains(block, 2) || NCGCodeSemantics::Contains(block, 3)) &&
-            !IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, true)) valid = false;
+            !IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, true,
+                CoordSys.activePlane, IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode),
+            IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode))) valid = false;
         if (NCGCodeSemantics::Contains(block, 0))
         {
             if (codeCount != 1 || block.mCount != 0) valid = false;
             for (char word = 'A'; word <= 'Z'; ++word)
                 if (block.has(word) && ((word != 'N' && word != 'G' && word != 'X' &&
                     word != 'Y' && word != 'Z' && word != 'F') || !std::isfinite(block.val(word)))) valid = false;
-            if ((block.has('X') && (!std::isfinite(CoordSys.ToInternalUnit(block.val('X'), false)) || block.val('X') < 0.0)) ||
-                (block.has('Z') && !std::isfinite(CoordSys.ToInternalUnit(block.val('Z'), false)))) valid = false;
+            NCArcPlaneAxes basis{};
+            if (!TryGetNCArcPlaneAxes(CoordSys.activePlane, basis)) valid = false;
+            else
+            {
+                if (block.has(basis.uAddress) && block.val(basis.uAddress) < 0.0) valid = false;
+                for (char word : {'X', 'Y', 'Z'})
+                    if (block.has(word) && word != basis.vAddress &&
+                        !std::isfinite(CoordSys.ToInternalUnit(block.val(word), false))) valid = false;
+            }
         }
         if (!valid)
         {
@@ -3224,17 +3614,19 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         for (int i = 0; i < codeCount; ++i)
         {
             const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
-            const int suffix = code % 100;
-            const bool extendedWCS = code > 59 && code <= 959 && suffix >= 54 && suffix <= 59;
             if ((NCGCodeSemantics::IsMotionAction(code) && !(code >= 0 && code <= 3)) ||
-                (code >= 171 && code <= 180) || code == 18 || code == 19 || code == 162 || code == 92 || extendedWCS) allowed = false;
+                (code >= 171 && code <= 180) || code == 162 || code == 92) allowed = false;
         }
         if (m_pathHold.armed || m_pathHold.bound || m_pathReplay.pending || m_gapDryRun.active ||
             m_gapPath.active || m_gapWindow.active) allowed = false;
         if (NCGCodeSemantics::Contains(block, 1) &&
-            !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive)) allowed = false;
+            !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane)) allowed = false;
         if ((NCGCodeSemantics::Contains(block, 2) || NCGCodeSemantics::Contains(block, 3)) &&
-            !IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive)) allowed = false;
+            !IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21,
+                CoordSys.isPolarCoordinateActive, CoordSys.activePlane, IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode),
+            IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode))) allowed = false;
         if (NCGCodeSemantics::Contains(block, 0))
         {
             if (codeCount != 1 || block.mCount != 0) allowed = false;
@@ -3272,7 +3664,8 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         }
         if (inchSelection || metricSelection)
         {
-            bool unsupportedInchFrame = CoordSys.toolRadiusMode != 40 || CoordSys.activePlane != 17;
+            bool unsupportedInchFrame = CoordSys.toolRadiusMode != 40 ||
+                !CoordSys.IsBaseArcPlaneSelectionSupported(CoordSys.activePlane);
             for (unsigned axis = 3U; axis < 8U; ++axis)
                 unsupportedInchFrame = unsupportedInchFrame || CoordSys.isMirrorActive[axis];
             bool shapeValid = !(inchSelection && metricSelection) &&
@@ -3300,8 +3693,8 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
             {
                 const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
                 if ((code >= 171 && code <= 180) ||
-                    code == 18 || code == 19 ||
-                    (NCGCodeSemantics::IsMotionAction(code) && !(code >= 0 && code <= 3)))
+                    // G53 passed its standalone native-unit decoder above.
+                    (NCGCodeSemantics::IsMotionAction(code) && code != 53 && !(code >= 0 && code <= 3)))
                 {
                     RtPrintf("[COORD][UNITS-REJECT] reason=ACTION_SCOPE beforeCommit=1\n");
                     AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
@@ -3316,9 +3709,12 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     if (CoordSys.IsTranslationRunFrozen())
     {
         bool changesWCS = false;
-        for (int code = 54; code <= 59; ++code)
-            if (NCGCodeSemantics::Contains(block, code) && code != CoordSys.currentWCSIndex + 54)
+        for (int i = 0; i < codeCount; ++i)
+        {
+            const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
+            if (IsNCWorkCoordinateCode(code) && code != CoordSys.GetCurrentWCSGCode())
                 changesWCS = true;
+        }
         if (changesWCS)
         {
             bool shapeValid = codeCount == 1 && block.mCount == 0;
@@ -3361,12 +3757,11 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
             for (int i = 0; i < codeCount; ++i)
             {
                 const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
-                const int suffix = code % 100;
-                const bool extendedWCS = code > 59 && code <= 959 && suffix >= 54 && suffix <= 59;
                 if ((NCGCodeSemantics::IsMotionAction(code) && !(code >= 0 && code <= 3)) ||
-                    (code >= 171 && code <= 180) || code == 18 || code == 19 ||
-                    code == 41 || code == 42 ||
-                    code == 16 || code == 162 || code == 92 || extendedWCS)
+                    (code >= 171 && code <= 180) ||
+                    ((code == 41 || code == 42) &&
+                        !IsNCTranslationCutterDistanceModeAllowed(CoordSys.activePlane, 91)) ||
+                    code == 16 || code == 162 || code == 92)
                     incrementalShapeValid = false;
             }
             const bool orphanGeometry = NCGCodeSemantics::GetPrimaryActionCode(block) < 0 &&
@@ -3397,15 +3792,17 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         bool rotationShapeValid = true;
         if (selectRotation)
         {
-            rotationShapeValid = codeCount == 1 && block.mCount == 0 &&
-                block.has('X') && block.has('Y') && block.has('R') &&
-                std::isfinite(CoordSys.ToInternalUnit(block.val('X'), false)) &&
-                std::isfinite(CoordSys.ToInternalUnit(block.val('Y'), false)) &&
+            NCArcPlaneAxes axes{};
+            rotationShapeValid = TryGetNCArcPlaneAxes(CoordSys.activePlane, axes) &&
+                codeCount == 1 && block.mCount == 0 &&
+                block.has(axes.uAddress) && block.has(axes.vAddress) && block.has('R') &&
+                std::isfinite(CoordSys.ToInternalUnit(block.val(axes.uAddress), false)) &&
+                std::isfinite(CoordSys.ToInternalUnit(block.val(axes.vAddress), false)) &&
                 std::isfinite(block.val('R')) && std::fabs(block.val('R')) <= 360.0 &&
                 CoordSys.isAbsoluteMode &&
-                CoordSys.activePlane == 17 && !CoordSys.isCAxisOffsetRotationEnabled;
+                CoordSys.IsBaseArcPlaneSelectionSupported(CoordSys.activePlane) && !CoordSys.isCAxisOffsetRotationEnabled;
             for (char word = 'A'; word <= 'Z'; ++word)
-                if (word != 'N' && word != 'G' && word != 'X' && word != 'Y' &&
+                if (word != 'N' && word != 'G' && word != axes.uAddress && word != axes.vAddress &&
                     word != 'R' && block.has(word)) rotationShapeValid = false;
         }
         if (cancelRotation)
@@ -3423,11 +3820,15 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         const bool explicitMotion = NCGCodeSemantics::Contains(block, 0) ||
             NCGCodeSemantics::Contains(block, 1) || NCGCodeSemantics::Contains(block, 2) ||
             NCGCodeSemantics::Contains(block, 3);
-        const bool workYawActive = CoordSys.isWorkpieceRotationActive &&
+        const unsigned workAngleField = CoordSys.activePlane == 18 ?
+            CoordinateManager::WO_ANGLE_XZ_PITCH : (CoordSys.activePlane == 19 ?
+                CoordinateManager::WO_ANGLE_YZ_ROLL : CoordinateManager::WO_ANGLE_XY_YAW);
+        const bool workPlaneRotationActive = CoordSys.isWorkpieceRotationActive &&
             CoordSys.IsWorkpieceSelectionSupported(168, CoordSys.currentWCode) &&
-            CoordSys.m_WorkOffset[CoordSys.currentWCode - 1][CoordinateManager::WO_ANGLE_XY_YAW] != 0.0;
+            CoordSys.m_WorkOffset[CoordSys.currentWCode - 1][workAngleField] != 0.0;
         const bool cancelWorkRotation = NCGCodeSemantics::Contains(block, 169);
-        if ((CoordSys.isG68Active && !cancelRotation) || (workYawActive && !cancelWorkRotation))
+        if ((CoordSys.isG68Active && !cancelRotation) ||
+            (workPlaneRotationActive && !cancelWorkRotation))
         {
             // Fixed rotation cannot enter an older machine-motion handler,
             // nor commit incompatible modal/T/M changes before motion rejects.
@@ -3435,12 +3836,10 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
             {
                 const int code = block.gCount > 0 ? block.gCodes[i] : block.gCode;
                 const bool retainedControl = code >= 171 && code <= 179;
-                const int suffix = code % 100;
-                const bool extendedWCS = code > 59 && code <= 959 && suffix >= 54 && suffix <= 59;
                 if ((NCGCodeSemantics::IsMotionAction(code) &&
                         !(code >= 0 && code <= 3) && !retainedControl) ||
-                    code == 18 || code == 19 ||
-                    code == 162 || code == 92 || extendedWCS)
+                    (IsNCArcPlaneCode(code) && code != CoordSys.activePlane) ||
+                    code == 162 || code == 92)
                     rotationShapeValid = false;
             }
             // This controller dispatches explicit motion codes. Endpoint/feed
@@ -3455,7 +3854,7 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
                 IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) && block.has('P') && block.val('P') == 1.0;
             const bool rotatedQueuedCorner = CoordSys.isAbsoluteMode && CoordSys.activePlane == 17 &&
                 !CoordSys.isCAxisOffsetRotationEnabled &&
-                IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) && block.has('Q');
+                IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane) && block.has('Q');
             if ((!selectRotation && !affineSelection && orphanGeometry) ||
                 (explicitMotion && (block.has('P') || block.has('Q')) &&
                     !rotatedQueuedArc && !rotatedQueuedCorner))
@@ -3497,14 +3896,17 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         bool shapeValid = true;
         if (CoordSys.IsTranslationRunBound() && code == 168)
         {
+            NCArcPlaneAxes plane{};
+            shapeValid = TryGetNCArcPlaneAxes(CoordSys.activePlane, plane);
             shapeValid = codeCount == 1 && block.mCount == 0 &&
-                !CoordSys.isCAxisOffsetRotationEnabled;
+                !CoordSys.isCAxisOffsetRotationEnabled && shapeValid;
             for (char word = 'A'; word <= 'Z'; ++word)
-                if (word != 'N' && word != 'G' && word != 'W' && word != 'X' &&
-                    word != 'Y' && block.has(word)) shapeValid = false;
-            shapeValid = shapeValid && block.has('X') == block.has('Y') &&
-                (!block.has('X') || (std::isfinite(CoordSys.ToInternalUnit(block.val('X'), false)) &&
-                    std::isfinite(CoordSys.ToInternalUnit(block.val('Y'), false))));
+                if (word != 'N' && word != 'G' && word != 'W' &&
+                    word != plane.uAddress && word != plane.vAddress && block.has(word)) shapeValid = false;
+            shapeValid = shapeValid && block.has(plane.uAddress) == block.has(plane.vAddress) &&
+                (!block.has(plane.uAddress) ||
+                    (std::isfinite(CoordSys.ToInternalUnit(block.val(plane.uAddress), false)) &&
+                     std::isfinite(CoordSys.ToInternalUnit(block.val(plane.vAddress), false))));
         }
         if (CoordSys.IsTranslationRunFrozen() && code == 169 &&
             (CoordSys.isWorkpieceRotationActive || CoordSys.currentWCode != 0))
@@ -3518,12 +3920,19 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
             (!CoordSys.IsTranslationRunBound() || CoordSys.IsWorkpieceSelectionSupported(mode, wCode));
         if (shapeValid && selectionValid && CoordSys.IsTranslationRunBound() && code == 168)
         {
-            const bool hasYaw = CoordSys.m_WorkOffset[wCode - 1][CoordinateManager::WO_ANGLE_XY_YAW] != 0.0;
+            NCArcPlaneAxes plane{};
+            shapeValid = TryGetNCArcPlaneAxes(CoordSys.activePlane, plane);
+            const unsigned angleField = CoordSys.activePlane == 18 ?
+                CoordinateManager::WO_ANGLE_XZ_PITCH : (CoordSys.activePlane == 19 ?
+                    CoordinateManager::WO_ANGLE_YZ_ROLL : CoordinateManager::WO_ANGLE_XY_YAW);
+            const bool hasPlaneRotation =
+                CoordSys.m_WorkOffset[wCode - 1][angleField] != 0.0;
             const bool sameWork = CoordSys.isWorkpieceRotationActive && CoordSys.currentWCode == wCode;
             // Validate the complete prior source before resolving an explicit
             // centre; centre-free selection is only idempotent for a proven W.
-            shapeValid = hasYaw ? (CoordSys.IsTranslationRunCurrent() &&
-                (block.has('X') ? CoordSys.isAbsoluteMode : sameWork)) : !block.has('X');
+            shapeValid = shapeValid && (hasPlaneRotation ? (CoordSys.IsTranslationRunCurrent() &&
+                (block.has(plane.uAddress) ? CoordSys.isAbsoluteMode : sameWork)) :
+                !block.has(plane.uAddress));
         }
         if (!shapeValid || !selectionValid ||
             (hasWorkSelection && (selectedWorkMode != mode || selectedW != wCode)))
@@ -3604,8 +4013,8 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         if (code == 90 || code == 91 ||
             code == 20 || code == 21 ||
             ((code == 22 || code == 23) && strokeSelection) ||
-            (code == 17 && CoordSys.activePlane == 17) ||
-            (code >= 54 && code <= 59) ||
+            IsNCArcPlaneCode(code) ||
+            IsNCWorkCoordinateCode(code) ||
             ((code == 43 || code == 44 || code == 49) && hasToolSelection) ||
             ((code == 40 || code == 41 || code == 42) && cutterSelection) ||
             code == 69 || code == 68 ||
@@ -3614,8 +4023,7 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
             ((code == 15 || code == 16) && polarSelection) ||
             (code == 163 && !CoordSys.isCAxisOffsetRotationEnabled) ||
             (code == 162 && CoordSys.isCAxisOffsetRotationEnabled)) continue;
-        const int suffix = code % 100;
-        const bool workCoordinate = code >= 54 && code <= 959 && suffix >= 54 && suffix <= 59;
+        const bool workCoordinate = IsNCWorkCoordinateCode(code);
         const bool mutation = workCoordinate || code == 10 || code == 92 || code == 160 ||
             code == 20 || code == 21 || code == 17 || code == 18 || code == 19 ||
             code == 22 || code == 23 || code == 90 || code == 91 ||

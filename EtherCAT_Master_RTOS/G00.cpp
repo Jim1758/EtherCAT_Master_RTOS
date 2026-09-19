@@ -74,17 +74,11 @@ namespace GCodeHandlers
                 AxisType type = nc->m_motion.GetAxisContext(i).axisType;
                 double axisScale = (type == AxisType::ROTARY || type == AxisType::ROTARY_CONTINUOUS) ? 1.0 : unitScale;
 
-                // 🌟 [神級防呆] 針對 G16 極座標模式的特殊處理
-                // 在極座標下，第二軸是「角度」，角度不能變成英制！
-                if (nc->CoordSys.isPolarCoordinateActive) {
-                    int angleAxisIdx = 1; // 預設 G17 的 Y 軸 (Index 1) 是角度
-                    if (nc->CoordSys.activePlane == 18) angleAxisIdx = 2; // G18: Z 軸
-                    if (nc->CoordSys.activePlane == 19) angleAxisIdx = 2; // G19: Z 軸
-
-                    if (i == angleAxisIdx) {
-                        axisScale = 1.0; // 強制角度維持度數，不乘 25.4
-                    }
-                }
+                // Endpoint angle only: G17 Y, G18 X, G19 Z. IJK/table
+                // parameters are owned elsewhere and remain native lengths.
+                if (IsNCPolarAngleAxis(nc->CoordSys.isPolarCoordinateActive,
+                    nc->CoordSys.activePlane, static_cast<unsigned>(i)))
+                    axisScale = 1.0;
 
                 axisProgrammed[i] = true;
 
@@ -118,12 +112,17 @@ namespace GCodeHandlers
         // 🌟 條件加入 isG16Active
         const bool fixedPlanarRotation = nc->CoordSys.IsTranslationRunFrozen() &&
             NCTranslationHasPlanarRotation(nc->CoordSys.GetTranslationSnapshot());
-        const bool requirePlanarBaselineMatch = (fixedPlanarRotation || isG16Active) &&
+        const bool requirePlanarBaselineMatch = nc->CoordSys.activePlane == 17 && (fixedPlanarRotation || isG16Active) &&
             (axisProgrammed[0] != axisProgrammed[1]);
         const unsigned rawXYMask = (axisProgrammed[0] ? 1U : 0U) |
             (axisProgrammed[1] ? 2U : 0U);
         // Fixed rotation completes only sparse XY. Z-only native XY stays untouched.
-        if (!isG16Active && !fixedPlanarRotation && !(nc->CoordSys.IsTranslationRunFrozen() && !nc->CoordSys.isAbsoluteMode) &&
+        // BASE-PLANE-6: a fixed new-plane WORK selection is native XYZ
+        // translation only. Do not expand absent axes through the legacy
+        // 3D-rotation round trip; the canonical completion below owns the
+        // actual selected plane, including its untouched normal-axis bits.
+        if (!(nc->CoordSys.IsTranslationRunFrozen() && nc->CoordSys.activePlane != 17) &&
+            !isG16Active && !fixedPlanarRotation && !(nc->CoordSys.IsTranslationRunFrozen() && !nc->CoordSys.isAbsoluteMode) &&
             (isG168Active || isG68Active) && moveXYZ)
         {
             double currentWCS[8] = { 0.0 };
@@ -201,7 +200,12 @@ namespace GCodeHandlers
 
             AxisContext& axis = nc->m_motion.GetAxisContext(i);
 
-            const bool targetWithinSoftwareLimit = nc->CoordSys.IsTargetWithinSoftwareTravelLimit(axis, targetMCS[i]);
+            // BASE-PLANE-2 neutral straight geometry has no interior extrema:
+            // both endpoints bound the entire selected-axis path. Motion proves
+            // this same commanded native start against its sampled pulse basis.
+            const bool targetWithinSoftwareLimit = nc->CoordSys.IsTargetWithinSoftwareTravelLimit(axis, targetMCS[i]) &&
+                (nc->CoordSys.activePlane == 17 ||
+                    nc->CoordSys.IsTargetWithinSoftwareTravelLimit(axis, nc->CoordSys.commandedMCS[i]));
 
             if (!targetWithinSoftwareLimit)
             {

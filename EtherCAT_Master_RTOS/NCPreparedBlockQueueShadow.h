@@ -454,9 +454,11 @@ static_assert(
 static_assert(
     std::is_trivially_copyable<NCPreparedBlockQueueCounters>::value,
     "NCPreparedBlockQueueCounters must remain trivially copyable.");
+// Schema 12 adds two 48-byte identities per prepared entry and three
+// standalone modal images: 67 identities, 3216 fixed bytes in this observer.
 static_assert(
-    sizeof(NCPreparedBlockEntrySnapshot) <= 1680U,
-    "A Prepared Entry, including two fixed cutter coordinate proofs, must remain bounded.");
+    sizeof(NCPreparedBlockEntrySnapshot) == 1776U,
+    "A prepared entry includes two schema-12 coordinate proofs; reviewed size is 1776 bytes.");
 static_assert(
-    sizeof(NCPreparedBlockQueueShadow) <= 56320U,
-    "The fixed Shadow Queue, including 67 fixed coordinate proofs, must remain at most 55 KiB.");
+    sizeof(NCPreparedBlockQueueShadow) == 59376U,
+    "The fixed shadow queue includes 67 schema-12 coordinate proofs; reviewed size is 59376 bytes.");

@@ -3718,11 +3718,11 @@ void NCManager::ProcessTask()
         return;
     }
 
-    if (CoordSys.IsTranslationRunFrozen() &&
+    if (CoordSys.IsTranslationRunBound() &&
         (m_state == NCState::RUN || m_state == NCState::HOLD) &&
-        (!CoordSys.IsTranslationRunCurrent() || !IsFixedTranslationTravelCurrentSameThread()))
+        !IsPathCoreLiveNativeConfigCurrentSameThread())
     {
-        RtPrintf("[COORD][FAULT] fixed translation or travel policy changed\n");
+        RtPrintf("[COORD][FAULT] axis identity, native configuration, translation or travel policy changed\n");
         TriggerMappingIntegrityAlarmOnce();
         m_state = NCState::ALARM;
         m_motion.RequestEmergencyStopAllAxes();
@@ -6231,7 +6231,11 @@ void NCManager::ExecuteBlock(
     }
     // BY-ARC-BEGIN: whole-block guard before any setting/tool/M side effect.
     const bool explicitArc = NCGCodeSemantics::Contains(block, 2) || NCGCodeSemantics::Contains(block, 3);
-    if ((explicitArc && (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive) || m_pathFeed.pending)) ||
+    if ((explicitArc && (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21,
+        CoordSys.isPolarCoordinateActive, CoordSys.activePlane, IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode),
+            IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode)) || m_pathFeed.pending)) ||
         IsPathCoreArcInputOmission(block) ||
         (m_pathArc.pending && (explicitArc || NCGCodeSemantics::Contains(block, 0) || NCGCodeSemantics::Contains(block, 1))))
     {
@@ -6257,7 +6261,7 @@ void NCManager::ExecuteBlock(
     }
     // BY-ARC-END
     // BX-FEED: reject unsupported shape before setting/tool/M-code side effects.
-    if ((NCGCodeSemantics::Contains(block, 1) && !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive)) ||
+    if ((NCGCodeSemantics::Contains(block, 1) && !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane)) ||
         IsPathCoreFeedInputOmission(block))
     {
         if (!m_pathFeed.pending)
@@ -6514,6 +6518,13 @@ void NCManager::ExecuteBlock(
 // =========================================================
 void NCManager::LoadAxisConfiguration()
 {
+    if (CoordSys.IsTranslationRunBound())
+    {
+        TriggerMappingIntegrityAlarmOnce();
+        m_state = NCState::ALARM;
+        m_motion.RequestEmergencyStopAllAxes();
+        return;
+    }
     FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::AXIS_CONFIG);
     InvalidatePathCoreFeedSameThread(); // BX-FEED
     InvalidatePathCoreArcSameThread(); // BY-ARC
@@ -7493,7 +7504,8 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     // Reserve the run identity now; the values freeze at its first motion.
     RetireFixedTranslationSameThread();
     if (m_mode == NCOperationMode::MEMORY &&
-        !CoordSys.BeginTranslationRun(m_pathCoreLiveBookkeeping.currentRunToken))
+        (!CoordSys.BeginTranslationRun(m_pathCoreLiveBookkeeping.currentRunToken, this) ||
+            !IsPathCoreLiveNativeConfigCurrentSameThread()))
     {
         TriggerMappingIntegrityAlarmOnce();
         m_state = NCState::ALARM;

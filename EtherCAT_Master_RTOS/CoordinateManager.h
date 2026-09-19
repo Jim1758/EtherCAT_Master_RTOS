@@ -12,9 +12,14 @@ public:
 
     // One NC-thread writer owns the run descriptor. The RT position update
     // writes actualMCS only; it never reads or mutates this descriptor.
-    bool BeginTranslationRun(std::uint64_t runToken) noexcept;
+    bool BeginTranslationRun(std::uint64_t runToken, NCManager* nc) noexcept;
+    bool IsTranslationAxisIdentityCurrent() const noexcept;
     NCTranslationSnapshot GetTranslationSnapshot() const noexcept;
     bool FreezeTranslationRun() noexcept;
+    // BASE-PLANE-1: standalone, drained arc-plane change; no table/tail rewrite.
+    bool IsBaseArcPlaneSelectionSupported(int plane) const noexcept;
+    bool PrepareArcPlaneTransition(int plane, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitArcPlaneTransition(const NCTranslationSnapshot& candidate) noexcept;
     // NC-only staged distance change; frame geometry and native tail stay fixed.
     bool PrepareDistanceModeTransition(int mode, NCTranslationSnapshot& candidate) const noexcept;
     bool CommitDistanceModeTransition(const NCTranslationSnapshot& candidate) noexcept;
@@ -50,12 +55,13 @@ public:
     bool PreparePlanarRotationTransition(int mode, double centerX, double centerY,
         double angle, NCTranslationSnapshot& candidate) const noexcept;
     bool CommitPlanarRotationTransition(const NCTranslationSnapshot& candidate) noexcept;
-    // Drained WORK selection. Explicit XY belongs to the complete prior frame.
+    // Drained WORK selection. Explicit canonical plane (u,v) belongs to the
+    // complete prior frame: XY / ZX / YZ for G17 / G18 / G19.
     // A valid identical selection returns the unchanged descriptor.
     bool PrepareWorkpieceTransition(int mode, int wCode, bool hasCenter,
-        double centerX, double centerY, NCTranslationSnapshot& candidate) const noexcept;
+        double centerU, double centerV, NCTranslationSnapshot& candidate) const noexcept;
     bool CommitWorkpieceTransition(int mode, int wCode, bool hasCenter,
-        double centerX, double centerY, const NCTranslationSnapshot& candidate) noexcept;
+        double centerU, double centerV, const NCTranslationSnapshot& candidate) noexcept;
     bool IsTranslationRunCurrent() const noexcept;
     bool IsTranslationRunFrozen() const noexcept;
     bool IsTranslationRunBound() const noexcept;
@@ -70,6 +76,10 @@ public:
     bool ApplyCoordinateTableValues(int offsetType, int row,
         const bool* hasField, const double* values, NCManager* nc,
         bool reportAlarm = true);
+    // Ordinary G10 owns P plus existing configured native-axis addresses.
+    // Decode all inputs before any table, setting, tool or file can change.
+    bool TryDecodeToolTableWrite(const NCBlock& block, NCManager* nc,
+        int& rowIndex, bool* fields, double* values) const noexcept;
     // G160 uses fixed table fields XYZ / IJK, never configured axis letters.
     bool TryDecodeWorkTableWrite(const NCBlock& block, int& rowIndex,
         bool* fields, double* values) const noexcept;
@@ -85,9 +95,14 @@ public:
     double commandedMCS[8] = { 0.0 };
 
     // ==========================================
-    // 🌟 定義 C 軸的索引位置 (通常第四軸為 index 3)
+    // 電極旋轉軸角色：依客戶設定，不以第四軸或 C 字母推定
     // ==========================================
-    const int C_AXIS_INDEX = 3;
+    // Optional NCConfig ElectrodeRotationAxis: 0 = none; 4..8 = physical slot.
+    // Startup only, once per instance. Letter mapping is deliberately independent.
+    bool ConfigureElectrodeRotationAxis(int oneBasedAxis,
+        const std::vector<AxisContext>& axes, NCManager* nc);
+    int GetElectrodeRotationAxisIndex() const noexcept;
+    double GetElectrodeRotationAngleMCS(const double* nativeMCS) const noexcept;
     // ==========================================
     // 🌟 C 軸電極偏心旋轉補償開關 (預設開啟)
     // ==========================================
@@ -277,7 +292,9 @@ public:
 
 
     // 🌟 新增：G92 相關 API
-    void ApplyG92(const bool* axisProgrammed, const double* targetPos, NCManager* nc);
+    bool TryDecodeG92Origin(const NCBlock& block, NCManager* nc,
+        bool* fields, double* nativeTargets) const noexcept;
+    bool ApplyG92(const bool* axisProgrammed, const double* targetPos, NCManager* nc);
 
     void GetActualMCS(double* outMCS) const; // 取出當前的真實機械座標
      // 🌟 新增：獲取當前純粹的數學命令座標 (Commanded WCS) - 供 G92 等內部數學計算用
@@ -566,7 +583,14 @@ public:
 
     bool m_programmableTravelLimitEnabled = false;
 private:
-    bool m_workRotationCenterFixed = false; // Only explicit fixed G168 XY selection grants this proof.
+    // Retain the vector object, never an element/data pointer. Lifetime is the
+    // machine/NC lifetime; startup configuration finishes before RT threads.
+    const std::vector<AxisContext>* m_electrodeRotationAxes = nullptr;
+    int m_electrodeRotationAxisIndex = -1;
+    int m_electrodeRotationAxisType = -1;
+    bool m_electrodeRotationConfigured = false;
+    bool IsElectrodeOffsetRotationRequested() const noexcept;
+    bool m_workRotationCenterFixed = false; // Only explicit fixed G168 plane-centre selection grants this proof.
     // One-use confirmation for the ordinary G168 handler after staged publication.
     // It binds the original words, avoiding reinterpretation in the new frame.
     struct WorkCenterConfirmation
@@ -576,12 +600,15 @@ private:
         std::uint64_t generation = 0ULL;
         std::uint64_t revision = 0ULL;
         int wCode = 0;
-        double inputXY[2] = {};
+        double inputXY[2] = {}; // Canonical active-plane (u,v) authored words.
     };
     WorkCenterConfirmation m_workCenterConfirmation{};
+    bool TryBuildAxisIdentity(const NCManager* nc, NCAxisIdentitySnapshot& identity) const noexcept;
     NCTranslationSnapshot BuildCurrentCoordinateSnapshot() const noexcept;
     NCTranslationSnapshot BuildLiveTranslationSnapshot() const noexcept;
     bool IsTranslationModeSupported() const noexcept;
+    bool TryPrepareG92Origin(const bool* fields, const double* nativeTargets,
+        NCManager* nc, double* proposed, bool& changed) const noexcept;
     bool BuildScaleMirrorSelection(int code, const double* values, const bool* hasAxis,
         double factor, const NCTranslationSnapshot& source, NCTranslationSnapshot& candidate) const noexcept;
     bool IsToolOffsetRowValid(int hCode, bool xyzOnly) const noexcept;
@@ -595,6 +622,8 @@ private:
     bool m_translationFrozen = false;
     bool m_translationResetBypass = false;
     NCTranslationSnapshot m_frozenTranslation{};
+    const NCManager* m_translationAxisSource = nullptr; // NC-thread startup/run source only.
+    NCAxisIdentitySnapshot m_runAxisIdentity{}; // START identity; G162 remains modal until freeze.
 
     void Transform_WCS_to_MCS_Internal(
         const double* targetWCS,

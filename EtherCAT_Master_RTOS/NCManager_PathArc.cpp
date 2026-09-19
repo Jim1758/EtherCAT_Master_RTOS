@@ -1,4 +1,5 @@
-// BY / Path Core V2-02. Explicit G17 XY arcs use a distinct exact-stop producer.
+// BASE-PLANE-1. Plane-bearing G17/G18/G19 circles share one audited native producer.
+// New planes are exact-stop only; G17 queued/compensated contracts are unchanged.
 #include "NCManager.h"
 #include "AlarmManager.h"
 #include "NCPathCoreRadiusArc.h"
@@ -52,32 +53,45 @@ namespace
 }
 
 NC_PATH_ARC_NOINLINE
-bool NCManager::IsPathCoreArcBlockShapeValid(const NCBlock& block, bool allowMissingFeed, int unitsMode, bool polar) noexcept
+bool NCManager::IsPathCoreArcBlockShapeValid(const NCBlock& block, bool allowMissingFeed, int unitsMode, bool polar, int plane, bool allowPlanarPolarRadius, bool allowSparsePolarRadius) noexcept
 {
+    NCArcPlaneAxes axes{};
+    if (!TryGetNCArcPlaneAxes(plane, axes) || (plane != 17 && block.has('P'))) return false;
     if (unitsMode != 20 && unitsMode != 21) return false;
     const bool radiusFormat = block.has('R');
     const double feedMMMin = block.has('F') ? NCTranslationLengthToMM(block.val('F'), unitsMode) : 0.0;
     if (block.isEmpty || block.isGoto || !block.hasG ||
         (block.gCode != 2 && block.gCode != 3) || block.gCount != 1 ||
         block.gCodes[0] != block.gCode || block.mCount != 0 ||
-        (!radiusFormat && !block.has('I') && !block.has('J')) ||
+        (!radiusFormat && !block.has(axes.uCenter) && !block.has(axes.vCenter)) ||
         (!block.has('F') && !allowMissingFeed) ||
         (block.has('F') && (!std::isfinite(feedMMMin) ||
             feedMMMin <= 0.0 || feedMMMin > 100.0))) return false;
-    // Radius and centre formats are mutually exclusive. This first R scope
-    // is Cartesian exact-stop only; a full circle requires explicit I/J.
-    if (radiusFormat && (polar || block.has('I') || block.has('J') || block.has('P') ||
-        (!block.has('X') && !block.has('Y')) || block.val('R') == 0.0)) return false;
+    // BASE-PLANE-20: sparse R syntax is explicitly requested by the
+    // G90 G17/G18/G19 G40 lane or the existing G18/G19 cutter lanes.
+    // G40 resolves from the accepted native tail;
+    // cutter resolves only from its proved NOMINAL contour. At least one
+    // authored endpoint word remains mandatory in either sparse lane.
+    // Mixed IJK, P and R full-circle inference are still rejected.
+    // This is syntax only, not a frozen-source or Motion ownership permit.
+    const bool planarPolarRadiusShape = allowPlanarPolarRadius && polar &&
+        IsNCArcPlaneCode(plane) &&
+        ((block.has(axes.uAddress) && block.has(axes.vAddress)) ||
+            (allowSparsePolarRadius && (block.has(axes.uAddress) || block.has(axes.vAddress))));
+    if (radiusFormat && ((polar && !planarPolarRadiusShape) || block.has('I') || block.has('J') || block.has('K') || block.has('P') ||
+        (!block.has(axes.uAddress) && !block.has(axes.vAddress)) || block.val('R') == 0.0)) return false;
     for (int i = 0; i < 26; ++i)
     {
         if (!block.hasParam[i]) continue;
         const char address = static_cast<char>('A' + i);
-        if (address != 'N' && address != 'F' && address != 'X' && address != 'Y' && address != 'I' && address != 'J' && address != 'P' && address != 'R') return false;
+        if (address != 'N' && address != 'F' && address != axes.uAddress && address != axes.vAddress &&
+            address != axes.uCenter && address != axes.vCenter && address != 'P' && address != 'R') return false;
         if (!std::isfinite(block.val(address))) return false;
-        if ((address == 'X' || (!polar && address == 'Y') || address == 'I' || address == 'J' || address == 'R') &&
+        if ((address == axes.uAddress || (!polar && address == axes.vAddress) ||
+            address == axes.uCenter || address == axes.vCenter || address == 'R') &&
             !std::isfinite(NCTranslationLengthToMM(block.val(address), unitsMode))) return false;
     }
-    if (polar && block.has('X') && block.val('X') < 0.0) return false;
+    if (polar && block.has(axes.uAddress) && block.val(axes.uAddress) < 0.0) return false;
     // P1 is this controller's explicit queued planar-transition request;
     // EF: either endpoint word may be omitted; only both omitted is a full circle.
     // P remains a queued transition request, not a turn count.
@@ -93,7 +107,7 @@ bool NCManager::IsPathCoreArcInputOmission(const NCBlock& block) const noexcept
     // The dispatcher calls this before any M/tool side effect. Explicit G10,
     // G68 and other settings continue to own their own R parameter.
     return block.has('R') || (m_pathArc.explicitArc &&
-        (block.has('X') || block.has('Y') || block.has('Z') || block.has('F') || block.has('I') || block.has('J')));
+        (block.has('X') || block.has('Y') || block.has('Z') || block.has('F') || block.has('I') || block.has('J') || block.has('K')));
 }
 
 NC_PATH_ARC_NOINLINE
@@ -102,7 +116,8 @@ bool NCManager::IsPathCoreArcConfigurationValid() noexcept
     const NCTranslationSnapshot translation = CoordSys.GetTranslationSnapshot();
     if (!IsNCTranslationDistanceModeAllowed(CoordSys.isAbsoluteMode, translation) ||
         !IsNCTranslationUnitModeAllowed(CoordSys.isInchMode, translation) || !IsNCTranslationSourceAllowed(CoordSys.GetCurrentWCSGCode(), translation) ||
-        CoordSys.activePlane != 17 || !IsNCTranslationToolModeAllowed(CoordSys.toolLengthMode, translation) ||
+        CoordSys.activePlane != translation.rotationPlane || !IsNCArcPlaneCode(CoordSys.activePlane) ||
+        !IsNCTranslationToolModeAllowed(CoordSys.toolLengthMode, translation) ||
         CoordSys.currentHCode != translation.toolHCode || CoordSys.toolRadiusMode != translation.cutterMode ||
         (translation.cutterMode != 40 && (CoordSys.currentDCode != translation.cutterD ||
             ArcDoubleBits(CoordSys.GetActiveToolRadius()) != ArcDoubleBits(translation.cutterRadiusMM))) ||
@@ -246,11 +261,22 @@ void NCManager::RejectPathCoreArcSameThread(std::uint32_t code, int alarmCode)
 NC_PATH_ARC_NOINLINE
 WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
 {
-    if (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive))
+    if (!IsPathCoreArcBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21,
+        CoordSys.isPolarCoordinateActive, CoordSys.activePlane, IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode),
+            IsNCPolarRadiusArcNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode,
+                CoordSys.isPolarCoordinateActive, CoordSys.toolRadiusMode)))
     {
         RejectPathCoreArcSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
     }
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(CoordSys.activePlane, plane))
+    {
+        RejectPathCoreArcSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return nullptr;
+    }
+    const unsigned planeSlots[2] = { plane.u, plane.v };
     // A bad active policy is a configuration error, not an out-of-range point.
     // HOME-before-limits and G23/Limit1 semantics are owned by CoordinateManager.
     for (int axisIndex = 0; axisIndex < 3; ++axisIndex)
@@ -265,7 +291,8 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     }
     const bool radiusFormat = block.has('R');
     const bool cutter = CoordSys.toolRadiusMode != 40;
-    if ((cutter && !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21)) ||
+    const bool polarRadius = radiusFormat && !cutter && CoordSys.isPolarCoordinateActive;
+    if ((cutter && !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive)) ||
         m_cutterLine.leadOutRequired)
     {
         RejectPathCoreArcSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
@@ -310,37 +337,38 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
         return nullptr;
     }
     const double effectiveFeed = m_pathArc.capturedFeed.feedMMMin;
-    const std::uint32_t sourceEndpointAxisMask = (block.has('X') ? 1U : 0U) |
-        (block.has('Y') ? 2U : 0U);
-    const bool fullCircle = sourceEndpointAxisMask == 0U;
+    const std::uint32_t sourceEndpointAxisMask = (block.has(plane.uAddress) ? (1U << plane.u) : 0U) |
+        (block.has(plane.vAddress) ? (1U << plane.v) : 0U);
+    bool fullCircle = sourceEndpointAxisMask == 0U;
     const NCTranslationSnapshot arcSource = CoordSys.GetTranslationSnapshot();
-    const bool mirroredXY = ((arcSource.mirrorMask & 1U) != 0U) !=
-        ((arcSource.mirrorMask & 2U) != 0U);
-    int direction = (block.gCode == 2 ? -1 : 1) * (mirroredXY ? -1 : 1);
+    const bool mirroredPlane = ((arcSource.mirrorMask & (1U << plane.u)) != 0U) !=
+        ((arcSource.mirrorMask & (1U << plane.v)) != 0U);
+    int direction = (block.gCode == 2 ? -1 : 1) * (mirroredPlane ? -1 : 1);
     m_pathArcProgrammed.fill(false);
     m_pathArcWCS.fill(0.0);
     m_pathArcCandidate.fill(0.0);
     // EB: omitted I or J is +0 for this source, never a modal carry.
     // Read only present parameter slots; keep original presence bits intact.
-    m_pathArcCenterOffset[0U] = block.has('I') ?
-        NCTranslationLengthToMM(block.val('I'), CoordSys.isInchMode ? 20 : 21) : 0.0;
-    m_pathArcCenterOffset[1U] = block.has('J') ?
-        NCTranslationLengthToMM(block.val('J'), CoordSys.isInchMode ? 20 : 21) : 0.0;
+    m_pathArcCenterOffset[0U] = block.has(plane.uCenter) ?
+        NCTranslationLengthToMM(block.val(plane.uCenter), CoordSys.isInchMode ? 20 : 21) : 0.0;
+    m_pathArcCenterOffset[1U] = block.has(plane.vCenter) ?
+        NCTranslationLengthToMM(block.val(plane.vCenter), CoordSys.isInchMode ? 20 : 21) : 0.0;
     // I/J are program-space vectors. Apply signed scale then rotate in mm, without
     // adding the G68 center or EXT/WCS/H/WORK translation. Native arc start
     // and full-circle endpoint bits remain owned by the Motion producer.
     double rotatedI = 0.0, rotatedJ = 0.0;
-    NCTranslationRotateXYVector(CoordSys.GetTranslationSnapshot(),
+    const bool rotated = NCTranslationRotateArcVector(arcSource,
         m_pathArcCenterOffset[0U], m_pathArcCenterOffset[1U], rotatedI, rotatedJ);
     m_pathArcCenterOffset[0U] = rotatedI;
     m_pathArcCenterOffset[1U] = rotatedJ;
-    if (!std::isfinite(rotatedI) || !std::isfinite(rotatedJ))
+    if (!rotated)
     {
         RejectPathCoreArcSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
     }
-    for (std::size_t i = 0U; i < 2U; ++i)
+    for (unsigned component = 0U; component < 2U; ++component)
     {
+        const unsigned i = planeSlots[component];
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
         if (!axis.isExist || axis.axisType != AxisType::LINEAR)
         {
@@ -348,37 +376,80 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
             return nullptr;
         }
         m_pathArcProgrammed[i] = block.has(m_axisNames[i]);
-        if (m_pathArcProgrammed[i]) m_pathArcWCS[i] = CoordSys.isPolarCoordinateActive && i == 1U ?
+        if (m_pathArcProgrammed[i]) m_pathArcWCS[i] = IsNCPolarAngleAxis(CoordSys.isPolarCoordinateActive, CoordSys.activePlane, i) ?
             block.val(m_axisNames[i]) : NCTranslationLengthToMM(block.val(m_axisNames[i]), CoordSys.isInchMode ? 20 : 21);
     }
     const bool sparsePlanarBaselineMatch = cutter || (CoordSys.IsTranslationRunFrozen() &&
         (NCTranslationHasPlanarRotation(CoordSys.GetTranslationSnapshot()) || CoordSys.isPolarCoordinateActive) &&
-        (m_pathArcProgrammed[0] != m_pathArcProgrammed[1]));
+        (m_pathArcProgrammed[plane.u] != m_pathArcProgrammed[plane.v]));
     // R centre resolution depends on the accepted start even for full XY G90.
     const bool requirePlanarBaselineMatch = radiusFormat || sparsePlanarBaselineMatch;
-    if (!CoordSys.CompleteFixedPlanarEndpoint(m_pathArcWCS.data(), m_pathArcProgrammed.data()))
+    // Polar cutter endpoints use their nominal-source decoder below. Do not
+    // infer a nominal coordinate from the physical offset tail, nor decode
+    // radius/angle a second time through the generic sparse endpoint path.
+    if (!polarRadius && !(cutter && CoordSys.isPolarCoordinateActive) &&
+        !CoordSys.CompleteFixedPlanarEndpoint(m_pathArcWCS.data(), m_pathArcProgrammed.data()))
     {
         RejectPathCoreArcSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
     }
-    const std::uint32_t endpointAxisMask = (m_pathArcProgrammed[0] ? 1U : 0U) |
-        (m_pathArcProgrammed[1] ? 2U : 0U);
-    if (sparsePlanarBaselineMatch)
-        RtPrintf("[ROTATION][SPARSE_XY] g=%d rawXYMask=%u effectiveXYMask=3 beforeSubmit=1\n",
-            block.gCode, sourceEndpointAxisMask);
-    if (!CoordSys.isAbsoluteMode)
-        RtPrintf("[INCREMENTAL][TARGET] g=%d rawMask=%u effectiveMask=%u fullCircle=%u beforeSubmit=1\n",
-            block.gCode, static_cast<unsigned>(sourceEndpointAxisMask),
-            static_cast<unsigned>(endpointAxisMask), fullCircle ? 1U : 0U);
     // Full-circle classification uses original presence, never the effective
     // rotated endpoint mask. I/J above remain vectors in program space.
-    CoordSys.Preview_WCS_to_MCS(m_pathArcWCS.data(), m_pathArcProgrammed.data(), m_pathArcCandidate.data());
+    if (polarRadius)
+    {
+        // BASE-PLANE-17. Resolve omitted polar words from the SAME accepted
+        // native tail through the immutable affine inverse, not a modal cache.
+        // The helper decodes and solves native R atomically. Never transform
+        // its native centre again. Origin-direction ambiguity fails closed.
+        NCPathPolarRadiusArcNative native{};
+        if (!TryResolveNCPathPolarRadiusArcEndpoint(arcSource, CoordSys.commandedMCS,
+            sourceEndpointAxisMask, block.val(plane.uAddress), block.val(plane.vAddress), block.val('R'),
+            block.gCode == 2 ? -1 : 1, native))
+        {
+            RejectPathCoreArcSameThread(5U, AlarmManager::PATH_GEOMETRY_INVALID);
+            return nullptr;
+        }
+        std::memcpy(m_pathArcCandidate.data(), native.endMCS, sizeof(native.endMCS));
+        m_pathArcCenterOffset[0U] = native.centerOffsetMM[0U];
+        m_pathArcCenterOffset[1U] = native.centerOffsetMM[1U];
+        direction = native.direction;
+        fullCircle = false;
+        // Authored polar presence is NOT native axis selection. Changing
+        // only radius or angle may move both plane axes. Preserve the raw
+        // mask above but bind/prove both effective native endpoints.
+        m_pathArcProgrammed[plane.u] = m_pathArcProgrammed[plane.v] = true;
+    }
+    else if (cutter && CoordSys.isPolarCoordinateActive)
+    {
+        if (!PreviewCutterPolarEndpointSameThread(block, m_pathArcCandidate))
+        {
+            RejectPathCoreArcSameThread(5U, AlarmManager::PATH_GEOMETRY_INVALID);
+            return nullptr;
+        }
+        // Authored polar presence is not native motion selection. Both axes
+        // must be proved even when only radius OR angle was written. Preview
+        // and immutable lookahead use the same accepted NOMINAL source, while
+        // untouched axes retain the accepted physical-tail bits.
+        m_pathArcProgrammed[plane.u] = m_pathArcProgrammed[plane.v] = true;
+    }
+    else if (cutter && !CoordSys.isAbsoluteMode)
+    {
+        if (!PreviewCutterIncrementalEndpointSameThread(block, m_pathArcCandidate))
+        {
+            RejectPathCoreArcSameThread(5U, AlarmManager::PATH_GEOMETRY_INVALID);
+            return nullptr;
+        }
+    }
+    else CoordSys.Preview_WCS_to_MCS(m_pathArcWCS.data(), m_pathArcProgrammed.data(), m_pathArcCandidate.data());
     if (cutter && !BuildCutterContourSameThread(block, m_pathArc.sourcePC, m_pathArc.run,
         m_pathArc.cache, m_pathArc.dispatch, m_pathArcCandidate, m_pathArcCenterOffset, direction))
     {
         RejectPathCoreArcSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
     }
+    // BASE-PLANE-10: cutter full-circle classification comes only from
+    // the proved authored seam, never from a zero native endpoint delta.
+    if (cutter) fullCircle = m_cutterLine.stagedPrimitive.fullCircle;
     for (std::size_t i = 0U; i < 8U; ++i)
     {
         if (!std::isfinite(m_pathArcCandidate[i]))
@@ -389,27 +460,36 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     }
     // Cutter construction already resolved the nominal R circle and produced
     // its physical centre/endpoint. Do not solve R again from that offset path.
-    if (radiusFormat && !cutter)
+    if (radiusFormat && !cutter && !polarRadius)
     {
         // The endpoint is already native. R receives units and positive uniform
         // scaling once; the direction above already accounts for XY reflection.
         // The resulting centre offset must not pass through the affine map again.
         const double signedRadiusMM = NCTranslationLengthToMM(block.val('R'), arcSource.unitsMode) *
             (arcSource.scalingMode == 51 ? arcSource.scalingFactor : 1.0);
-        if (!TryResolveNCPathRadiusArcCenter(CoordSys.commandedMCS[0], CoordSys.commandedMCS[1],
-            m_pathArcCandidate[0], m_pathArcCandidate[1], signedRadiusMM, direction,
+        if (!TryResolveNCPathRadiusArcCenter(CoordSys.commandedMCS[plane.u], CoordSys.commandedMCS[plane.v],
+            m_pathArcCandidate[plane.u], m_pathArcCandidate[plane.v], signedRadiusMM, direction,
             m_pathArcCenterOffset[0], m_pathArcCenterOffset[1]))
         {
             RejectPathCoreArcSameThread(5U, AlarmManager::PATH_GEOMETRY_INVALID);
             return nullptr;
         }
     }
+    const std::uint32_t endpointAxisMask = (m_pathArcProgrammed[plane.u] ? (1U << plane.u) : 0U) |
+        (m_pathArcProgrammed[plane.v] ? (1U << plane.v) : 0U);
+    if (sparsePlanarBaselineMatch)
+        RtPrintf("[ROTATION][SPARSE_PLANE] g=%d plane=%d rawMask=%u effectiveMask=%u beforeSubmit=1\n",
+            block.gCode, CoordSys.activePlane, sourceEndpointAxisMask, endpointAxisMask);
+    if (!CoordSys.isAbsoluteMode)
+        RtPrintf("[INCREMENTAL][TARGET] g=%d rawMask=%u effectiveMask=%u fullCircle=%u beforeSubmit=1\n",
+            block.gCode, static_cast<unsigned>(sourceEndpointAxisMask),
+            static_cast<unsigned>(endpointAxisMask), fullCircle ? 1U : 0U);
     MotionArcTravelGuard travelGuard{};
     travelGuard.context = this;
     travelGuard.check = [](const void* context, int axisIndex, double target) -> bool
     {
         const NCManager* nc = static_cast<const NCManager*>(context);
-        return axisIndex >= 0 && axisIndex < 2 &&
+        return axisIndex >= 0 && axisIndex < 3 &&
             nc->CoordSys.IsTargetWithinSoftwareTravelLimit(nc->m_motion.GetAxisContext(axisIndex), target);
     };
     const bool accepted = m_motion.TryG02G03MoveTransactionalCncTail(m_pathArcCandidate,
@@ -427,7 +507,7 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     const MotionFeedArcReceipt& receipt = m_pathArcMotion.receipt;
     for (std::size_t i = 0U; i < 8U; ++i)
     {
-        if (i < 2U && m_pathArcProgrammed[i])
+        if ((i == plane.u || i == plane.v) && m_pathArcProgrammed[i])
         {
             if (ArcDoubleBits(m_pathArcCandidate[i]) != ArcDoubleBits(receipt.arc.endMCS[i]))
             {
@@ -444,7 +524,7 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     }
     for (std::size_t i = 0U; i < 2U; ++i)
     {
-        const double expectedCenter = receipt.arc.startMCS[i] + m_pathArcCenterOffset[i];
+        const double expectedCenter = receipt.arc.startMCS[planeSlots[i]] + m_pathArcCenterOffset[i];
         if (!std::isfinite(expectedCenter) ||
             ArcDoubleBits(receipt.arc.centerMCS[i]) != ArcDoubleBits(expectedCenter))
         {
@@ -454,10 +534,11 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     }
     if (!receipt.valid || !receipt.commandAccepted || !receipt.tailCommitted || !receipt.captureBound ||
         !ArcTranslationCurrent(CoordSys, receipt.translationGeneration) ||
-        receipt.travelLimitRejected || !receipt.arc.valid || receipt.arc.axisMask != 3U ||
+        receipt.travelLimitRejected || !receipt.arc.valid || receipt.arc.axisMask != plane.mask ||
+        receipt.arc.plane != CoordSys.activePlane ||
         receipt.arc.direction != direction || receipt.arc.fullCircle != fullCircle ||
         ArcDoubleBits(receipt.arc.feedMMMin) != ArcDoubleBits(effectiveFeed) ||
-        (receipt.validAxisMask & 3U) != 3U || !receipt.identity.IsAssigned() ||
+        (receipt.validAxisMask & plane.mask) != plane.mask || !receipt.identity.IsAssigned() ||
         receipt.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
         receipt.identity.source != MotionCommandSource::NC_MEMORY ||
         !receipt.ownerLease.Matches(m_programMotionLease))
@@ -610,8 +691,8 @@ bool NCManager::CompletePathCoreArcSameThread()
     if (!m_pathArc.bound || !m_pathArc.completed || m_motion.HasPendingSafetyOrRecoveryRequests() ||
         !m_motion.IsGroupDone()) return false;
     if (m_gapWindow.active && m_gapWindow.normalSource && !m_gapWindow.normalProven) return false;
-    if (CoordSys.toolRadiusMode == 40)
-        RetainPathCoreArcSameThread(); // Cutter retained replay is a later stage.
+    if (CoordSys.toolRadiusMode == 40 && CoordSys.activePlane == 17)
+        RetainPathCoreArcSameThread(); // Cutter and G18/G19 replay remain a later stage.
     m_pathArc.pending = false;
     ++m_pathArc.done;
     LogPathCoreArcSameThread("COMPLETED");
@@ -655,9 +736,11 @@ NC_PATH_ARC_NOINLINE
 void NCManager::LogPathCoreArcGeometrySameThread() const noexcept
 {
     const NCPathCoreFeedArcV2& g = m_pathArcMotion.receipt.arc;
-    RtPrintf("[PCORE-BY-GEO] run=%llu dispatch=%llu mask=%u validMask=%u direction=%d fullCircle=%u FBits=%llu radiusMMBits=%llu radiusPulseBits=%llu startAngleBits=%llu sweepBits=%llu lengthMMBits=%llu lengthPulseBits=%llu velocityPPSBits=%llu\n",
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(g.plane, plane)) return;
+    RtPrintf("[PCORE-BY-GEO] run=%llu dispatch=%llu plane=%u mask=%u validMask=%u direction=%d fullCircle=%u FBits=%llu radiusMMBits=%llu radiusPulseBits=%llu startAngleBits=%llu sweepBits=%llu lengthMMBits=%llu lengthPulseBits=%llu velocityPPSBits=%llu\n",
         static_cast<unsigned long long>(m_pathArc.run), static_cast<unsigned long long>(m_pathArc.dispatch),
-        static_cast<unsigned int>(g.axisMask), static_cast<unsigned int>(m_pathArcMotion.receipt.validAxisMask),
+        static_cast<unsigned int>(g.plane), static_cast<unsigned int>(g.axisMask), static_cast<unsigned int>(m_pathArcMotion.receipt.validAxisMask),
         g.direction, g.fullCircle ? 1U : 0U,
         static_cast<unsigned long long>(ArcDoubleBits(g.feedMMMin)),
         static_cast<unsigned long long>(ArcDoubleBits(g.radiusMM)),
@@ -671,21 +754,24 @@ void NCManager::LogPathCoreArcGeometrySameThread() const noexcept
     {
         RtPrintf("[PCORE-BY-AXIS] run=%llu dispatch=%llu axis=%u selected=%u programmed=%u startBits=%llu endBits=%llu targetBits=%llu startPulseBits=%llu endPulseBits=%llu\n",
             static_cast<unsigned long long>(m_pathArc.run), static_cast<unsigned long long>(m_pathArc.dispatch),
-            static_cast<unsigned int>(i), i < 2U ? 1U : 0U, m_pathArcProgrammed[i] ? 1U : 0U,
+            static_cast<unsigned int>(i), (i == plane.u || i == plane.v) ? 1U : 0U, m_pathArcProgrammed[i] ? 1U : 0U,
             static_cast<unsigned long long>(ArcDoubleBits(g.startMCS[i])),
             static_cast<unsigned long long>(ArcDoubleBits(g.endMCS[i])),
-            static_cast<unsigned long long>(ArcDoubleBits(i < 2U && m_pathArcProgrammed[i] ? m_pathArcCandidate[i] : g.startMCS[i])),
+            static_cast<unsigned long long>(ArcDoubleBits((i == plane.u || i == plane.v) && m_pathArcProgrammed[i] ? m_pathArcCandidate[i] : g.startMCS[i])),
             static_cast<unsigned long long>(ArcDoubleBits(g.startPulse[i])),
             static_cast<unsigned long long>(ArcDoubleBits(g.endPulse[i])));
-        if (i < 2U)
+        if (i == plane.u || i == plane.v)
+        {
+            const unsigned component = i == plane.u ? 0U : 1U;
             RtPrintf("[PCORE-BY-CIRCLE] run=%llu dispatch=%llu axis=%u offsetBits=%llu centerBits=%llu centerPulseBits=%llu minBits=%llu maxBits=%llu\n",
                 static_cast<unsigned long long>(m_pathArc.run), static_cast<unsigned long long>(m_pathArc.dispatch),
                 static_cast<unsigned int>(i),
-                static_cast<unsigned long long>(ArcDoubleBits(m_pathArcCenterOffset[i])),
-                static_cast<unsigned long long>(ArcDoubleBits(g.centerMCS[i])),
-                static_cast<unsigned long long>(ArcDoubleBits(g.centerPulse[i])),
-                static_cast<unsigned long long>(ArcDoubleBits(g.boundsMinMCS[i])),
-                static_cast<unsigned long long>(ArcDoubleBits(g.boundsMaxMCS[i])));
+                static_cast<unsigned long long>(ArcDoubleBits(m_pathArcCenterOffset[component])),
+                static_cast<unsigned long long>(ArcDoubleBits(g.centerMCS[component])),
+                static_cast<unsigned long long>(ArcDoubleBits(g.centerPulse[component])),
+                static_cast<unsigned long long>(ArcDoubleBits(g.boundsMinMCS[component])),
+                static_cast<unsigned long long>(ArcDoubleBits(g.boundsMaxMCS[component])));
+        }
     }
 }
 #undef NC_PATH_ARC_NOINLINE

@@ -6,6 +6,9 @@
 #include <cstring>
 #include <limits>
 #include <type_traits>
+#include "NCAxisIdentitySnapshot.h"
+#include "NCWorkCoordinateCode.h"
+#include "NCArcPlane.h"
 
 // Fixed XYZ translation and planar rotation source contract. Native MCS/pulse geometry remains
 // authoritative after admission; this value never grants Motion ownership.
@@ -17,7 +20,7 @@ struct NCTranslationSnapshot
     std::uint64_t generation = 0ULL;
     std::uint64_t revision = 0ULL;
     std::int32_t wcsCode = 0;
-    std::uint32_t schema = 11U;
+    std::uint32_t schema = 31U;
     double extOffsetMM[8] = {};
     double wcsOffsetMM[8] = {};
     std::int32_t toolLengthMode = 49;
@@ -27,10 +30,13 @@ struct NCTranslationSnapshot
     std::int32_t workWCode = 0;
     double workOffset[8] = {}; // XYZ mm, yaw/pitch/roll degrees, two reserved fields.
     std::int32_t rotationMode = 69;
-    std::int32_t rotationPlane = 17;
-    double rotationCenterMM[2] = {};
+    std::int32_t rotationPlane = 17; // Active arc/G68 plane. G18/G19 also admit fixed native XYZ H/WORK offsets.
+    double rotationCenterMM[2] = {}; // Canonical (u,v): XY / ZX / YZ. Schema 17.
     double rotationAngleDeg = 0.0;
-    double workRotationCenterMM[2] = {}; // Fixed G168 centre in native MCS millimetres.
+    // Canonical active-plane (u,v) centre in native MCS millimetres.
+    // G17=(X,Y), G18=(Z,X), G19=(Y,Z).  BASE-PLANE-7 permits only the
+    // matching normal-axis WORK rotation: yaw / pitch / roll respectively.
+    double workRotationCenterMM[2] = {};
     std::int32_t distanceMode = 90; // Fixed G90 point or G91 displacement semantics.
     std::int32_t unitsMode = 21; // Authored G20/G21; all stored geometry remains native mm/degrees.
     std::int32_t scalingMode = 50;
@@ -43,6 +49,7 @@ struct NCTranslationSnapshot
     std::int32_t cutterMode = 40;
     std::int32_t cutterD = 0;
     double cutterRadiusMM = 0.0; // Physical tool radius, independent of contour scaling.
+    NCAxisIdentitySnapshot axisIdentity{}; // Frozen physical slots, dimensions and electrode role.
 };
 
 inline bool TryDecodeNCWorkSelection(int gCode, bool hasW, double wValue,
@@ -106,10 +113,39 @@ inline double NCTranslationAxisOffsetMM(const NCTranslationSnapshot& s,
         (s.workMode == 168 && axis < 3U ? s.workOffset[axis] : 0.0);
 }
 
+inline unsigned NCTranslationWorkPlaneAngleIndex(int plane) noexcept
+{
+    return plane == 18 ? 4U : (plane == 19 ? 5U : 3U);
+}
+
+inline bool TryGetNCTranslationWorkPlaneAngle(const NCTranslationSnapshot& s,
+    double& angle) noexcept
+{
+    angle = 0.0;
+    if (!IsNCArcPlaneCode(s.rotationPlane)) return false;
+    if (s.workMode == 169) return s.workWCode == 0;
+    if (s.workMode != 168 || s.workWCode < 1 || s.workWCode > 100) return false;
+    const unsigned selected = NCTranslationWorkPlaneAngleIndex(s.rotationPlane);
+    for (unsigned field = 3U; field <= 5U; ++field)
+    {
+        if (!std::isfinite(s.workOffset[field]) || std::fabs(s.workOffset[field]) > 360.0)
+            return false;
+        if (field != selected && s.workOffset[field] != 0.0) return false;
+    }
+    angle = s.workOffset[selected];
+    return true;
+}
+
+inline bool NCTranslationHasWorkPlaneRotation(const NCTranslationSnapshot& s) noexcept
+{
+    double angle = 0.0;
+    return TryGetNCTranslationWorkPlaneAngle(s, angle) && angle != 0.0;
+}
+
 inline bool IsNCTranslationSnapshotEmpty(const NCTranslationSnapshot& s) noexcept
 {
     if (s.runToken != 0ULL || s.generation != 0ULL || s.revision != 0ULL ||
-        s.wcsCode != 0 || s.schema != 11U || s.toolLengthMode != 49 ||
+        s.wcsCode != 0 || s.schema != 31U || s.toolLengthMode != 49 ||
         s.toolHCode != 0 || s.workMode != 169 || s.workWCode != 0 ||
         s.rotationMode != 69 || s.rotationPlane != 17 ||
         s.rotationCenterMM[0] != 0.0 || s.rotationCenterMM[1] != 0.0 ||
@@ -118,7 +154,8 @@ inline bool IsNCTranslationSnapshotEmpty(const NCTranslationSnapshot& s) noexcep
         s.unitsMode != 21 || s.scalingMode != 50 || s.mirrorMask != 0U ||
         s.scalingFactor != 1.0 || s.polarMode != 15 || s.storedStrokeMode != 23 ||
         s.cutterMode != 40 || s.cutterD != 0 || s.cutterRadiusMM != 0.0 ||
-        std::signbit(s.cutterRadiusMM)) return false;
+        std::signbit(s.cutterRadiusMM) ||
+        !IsNCAxisIdentitySnapshotEmpty(s.axisIdentity)) return false;
     for (unsigned axis = 0U; axis < 3U; ++axis)
         if (s.scalingCenterMM[axis] != 0.0 || std::signbit(s.scalingCenterMM[axis]) ||
             s.mirrorCenterMM[axis] != 0.0 || std::signbit(s.mirrorCenterMM[axis])) return false;
@@ -128,10 +165,75 @@ inline bool IsNCTranslationSnapshotEmpty(const NCTranslationSnapshot& s) noexcep
     return true;
 }
 
+// BASE-PLANE-20: syntax opt-in only. All three planes admit G40 G90/G16
+// radius-format partial arcs (complete or sparse endpoint). Polar cutter
+// notation remains qualified on G18/G19 only. This predicate does not grant
+// ownership, a frozen source, continuous motion, replay, or an R full circle.
+inline bool IsNCPolarRadiusArcNotationAllowed(int plane, bool absolute,
+    bool polar, int cutterMode) noexcept
+{
+    return IsNCArcPlaneCode(plane) && absolute && polar &&
+        (cutterMode == 40 || ((plane == 18 || plane == 19) &&
+            (cutterMode == 41 || cutterMode == 42)));
+}
+
+// BASE-PLANE-11: incremental cutter contours are qualified only for the
+// native G18/G19 lane. G17 keeps its established G90-only cutter contract.
+inline bool IsNCTranslationCutterDistanceModeAllowed(int plane, int mode) noexcept
+{
+    return IsNCArcPlaneCode(plane) &&
+        (mode == 90 || (mode == 91 && (plane == 18 || plane == 19)));
+}
+
+// BASE-PLANE-18: G16 cutter notation is admitted only as G90 native
+// G18/G19. NC shape/lookahead allow nominal-tail sparse G01 chords
+// and IJK/signed-R partial arcs or explicitly proved IJK seam circles.
+// R is resolved on the NC nominal contour
+// before native circle admission. G17 and all G91 polar remain closed.
+inline bool IsNCTranslationCutterNotationAllowed(int plane, int distance, int polar) noexcept
+{
+    return IsNCTranslationCutterDistanceModeAllowed(plane, distance) &&
+        (polar == 15 || (polar == 16 && distance == 90 && (plane == 18 || plane == 19)));
+}
+
+// BASE-PLANE-15 shared producer/consumer scope: G18/G19 also admit an
+// NC-proved G90/G16 IJK single revolution. NC must prove the repeated literal
+// polar pair BEFORE trigonometric/affine rounding and a forward tangent-line
+// seam. Native endpoints, including full-circle start/end bits, are rechecked
+// by Motion. This predicate alone grants no motion, circle count or replay.
+inline bool IsNCTranslationCutterArcNotationAllowed(int plane, int distance,
+    int polar, bool fullCircle) noexcept
+{
+    return IsNCTranslationCutterNotationAllowed(plane, distance, polar) &&
+        (!fullCircle || plane != 17);
+}
+
+inline bool IsNCTranslationBaseArcPlaneFrame(const NCTranslationSnapshot& s) noexcept
+{
+    double workPlaneAngle = 0.0;
+    const bool workPlaneValid = TryGetNCTranslationWorkPlaneAngle(s, workPlaneAngle);
+    return IsNCArcPlaneCode(s.rotationPlane) &&
+        (s.rotationPlane == 17 || ((s.rotationMode == 68 || s.rotationMode == 69) &&
+            // BASE-PLANE-7: H is a signed native XYZ vector. WORK may add a
+            // plane-preserving normal-axis rotation only: G18 pitch or G19 roll.
+            // Any cross-plane/multi-angle 3D tilt remains outside this lane.
+            workPlaneValid &&
+            (s.toolLengthMode == 49 || s.toolLengthMode == 43 || s.toolLengthMode == 44) &&
+            // Cartesian G90/G91 and G90 polar-line notation are qualified here.
+            // Cartesian partial/seam-circle
+            // cutter contours. Payload/producer guards prove the canonical
+            // plane, physical XYZ start and full offset-path travel bounds.
+            (s.cutterMode == 40 || ((s.cutterMode == 41 || s.cutterMode == 42) &&
+                IsNCTranslationCutterNotationAllowed(s.rotationPlane, s.distanceMode, s.polarMode))) &&
+            (s.polarMode == 15 || (s.polarMode == 16 && s.distanceMode == 90)) &&
+            s.axisIdentity.eccentricEnabled == 0U));
+}
+
 inline bool IsNCTranslationSnapshotValid(const NCTranslationSnapshot& s) noexcept
 {
     if (s.runToken == 0ULL || s.generation == 0ULL || s.revision == 0ULL ||
-        s.schema != 11U || s.wcsCode < 54 || s.wcsCode > 59 ||
+        s.schema != 31U || !IsNCAxisIdentitySnapshotValid(s.axisIdentity) ||
+        !IsNCWorkCoordinateCode(s.wcsCode) ||
         (s.distanceMode != 90 && s.distanceMode != 91) || (s.unitsMode != 20 && s.unitsMode != 21)) return false;
     if ((s.polarMode != 15 && s.polarMode != 16) || (s.storedStrokeMode != 22 && s.storedStrokeMode != 23) ||
         (s.polarMode == 16 && s.distanceMode != 90)) return false;
@@ -142,8 +244,8 @@ inline bool IsNCTranslationSnapshotValid(const NCTranslationSnapshot& s) noexcep
     }
     else if ((s.cutterMode != 41 && s.cutterMode != 42) ||
         s.cutterD < 1 || s.cutterD > 100 || !std::isfinite(s.cutterRadiusMM) ||
-        s.cutterRadiusMM <= 0.0 || s.distanceMode != 90 || s.polarMode != 15) return false;
-    if ((s.rotationMode != 68 && s.rotationMode != 69) || s.rotationPlane != 17 ||
+        s.cutterRadiusMM <= 0.0 || !IsNCTranslationCutterNotationAllowed(s.rotationPlane, s.distanceMode, s.polarMode)) return false;
+    if ((s.rotationMode != 68 && s.rotationMode != 69) || !IsNCTranslationBaseArcPlaneFrame(s) ||
         !std::isfinite(s.rotationCenterMM[0]) || !std::isfinite(s.rotationCenterMM[1]) ||
         !std::isfinite(s.rotationAngleDeg) || std::fabs(s.rotationAngleDeg) > 360.0 ||
         (s.rotationMode == 69 && (s.rotationCenterMM[0] != 0.0 ||
@@ -167,10 +269,11 @@ inline bool IsNCTranslationSnapshotValid(const NCTranslationSnapshot& s) noexcep
     const bool workCancelled = s.workMode == 169;
     if (workCancelled ? s.workWCode != 0 :
         (s.workMode != 168 || s.workWCode < 1 || s.workWCode > 100)) return false;
-    if (!std::isfinite(s.workRotationCenterMM[0]) ||
+    double workPlaneAngle = 0.0;
+    if (!TryGetNCTranslationWorkPlaneAngle(s, workPlaneAngle) ||
+        !std::isfinite(s.workRotationCenterMM[0]) ||
         !std::isfinite(s.workRotationCenterMM[1]) ||
-        !std::isfinite(s.workOffset[3]) || std::fabs(s.workOffset[3]) > 360.0 ||
-        ((workCancelled || s.workOffset[3] == 0.0) &&
+        ((workCancelled || workPlaneAngle == 0.0) &&
             (s.workRotationCenterMM[0] != 0.0 || s.workRotationCenterMM[1] != 0.0))) return false;
     for (unsigned i = 0U; i < 8U; ++i)
     {
@@ -179,7 +282,7 @@ inline bool IsNCTranslationSnapshotValid(const NCTranslationSnapshot& s) noexcep
             !std::isfinite(s.extOffsetMM[i] + s.wcsOffsetMM[i]) ||
             !std::isfinite(NCTranslationAxisOffsetMM(s, i))) return false;
         if ((cancelled || i >= 3U) && s.toolOffsetMM[i] != 0.0) return false;
-        if ((workCancelled || i >= 4U) && s.workOffset[i] != 0.0) return false;
+        if ((workCancelled || i >= 6U) && s.workOffset[i] != 0.0) return false;
     }
     return true;
 }
@@ -196,6 +299,7 @@ inline bool SameNCTranslationSnapshot(const NCTranslationSnapshot& a,
         a.scalingMode == b.scalingMode && a.mirrorMask == b.mirrorMask &&
         a.polarMode == b.polarMode && a.storedStrokeMode == b.storedStrokeMode &&
         a.cutterMode == b.cutterMode && a.cutterD == b.cutterD &&
+        SameNCAxisIdentitySnapshot(a.axisIdentity, b.axisIdentity) &&
         std::memcmp(&a.cutterRadiusMM, &b.cutterRadiusMM, sizeof(double)) == 0 &&
         std::memcmp(&a.scalingFactor, &b.scalingFactor, sizeof(a.scalingFactor)) == 0 &&
         std::memcmp(a.scalingCenterMM, b.scalingCenterMM, sizeof(a.scalingCenterMM)) == 0 &&
@@ -326,7 +430,7 @@ inline double NCTranslationInverseScaleMirrorAxisPoint(const NCTranslationSnapsh
 // independent axis pulse scaling. RT validation never calls these helpers.
 inline bool NCTranslationHasPlanarRotation(const NCTranslationSnapshot& s) noexcept
 {
-    return s.rotationMode == 68 || (s.workMode == 168 && s.workOffset[3] != 0.0);
+    return s.rotationMode == 68 || NCTranslationHasWorkPlaneRotation(s);
 }
 
 inline void NCTranslationPlanarCoefficients(double angle,
@@ -371,15 +475,91 @@ inline void NCTranslationRotateXYVector(const NCTranslationSnapshot& s,
     NCTranslationRotationCoefficients(s, cosine, sine);
     double afterG68X = 0.0, afterG68Y = 0.0;
     NCTranslationRotatePlanarVector(x, y, cosine, sine, afterG68X, afterG68Y);
-    NCTranslationPlanarCoefficients(s.workMode == 168 ? s.workOffset[3] : 0.0,
-        cosine, sine);
+    double workAngle = 0.0;
+    (void)TryGetNCTranslationWorkPlaneAngle(s, workAngle);
+    NCTranslationPlanarCoefficients(workAngle, cosine, sine);
     // I/J are vectors: neither rotation centre nor fixed offsets participate.
     NCTranslationRotatePlanarVector(afterG68X, afterG68Y, cosine, sine, outputX, outputY);
+}
+
+// BASE-PLANE-4: signed uniform XYZ scale precedes the same right-handed G68
+// rotation for endpoints and IJK vectors. Centers/offsets never enter vectors.
+// Only reflections of the two circle axes reverse its direction (producer).
+// G17 delegates to its unchanged scale/G68/WORK arithmetic.
+inline bool NCTranslationRotateArcVector(const NCTranslationSnapshot& s,
+    double u, double v, double& outputU, double& outputV) noexcept
+{
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(s.rotationPlane, plane)) return false;
+    double a = 0.0, b = 0.0;
+    if (s.rotationPlane == 17)
+        NCTranslationRotateXYVector(s, u, v, a, b);
+    else
+    {
+        double cosine = 1.0, sine = 0.0;
+        NCTranslationRotationCoefficients(s, cosine, sine);
+        u = NCTranslationScaleMirrorAxisVector(s, u, plane.u);
+        v = NCTranslationScaleMirrorAxisVector(s, v, plane.v);
+        NCTranslationRotatePlanarVector(u, v, cosine, sine, a, b);
+        double workAngle = 0.0;
+        if (!TryGetNCTranslationWorkPlaneAngle(s, workAngle)) return false;
+        NCTranslationPlanarCoefficients(workAngle, cosine, sine);
+        NCTranslationRotatePlanarVector(a, b, cosine, sine, u, v);
+        a = u;
+        b = v;
+    }
+    if (!std::isfinite(a) || !std::isfinite(b)) return false;
+    outputU = a; outputV = b;
+    return true;
+}
+
+inline bool NCTranslationHasSparseRotatedEndpoint(const NCTranslationSnapshot& s,
+    const bool* hasAxis) noexcept
+{
+    NCArcPlaneAxes plane{};
+    return hasAxis != nullptr && NCTranslationHasPlanarRotation(s) &&
+        TryGetNCArcPlaneAxes(s.rotationPlane, plane) && hasAxis[plane.u] != hasAxis[plane.v];
 }
 
 inline void NCTranslationForwardPoint(const NCTranslationSnapshot& s,
     const double* wcs, double* mcs) noexcept
 {
+    // BASE-PLANE-7: XYZ scale -> XYZ mirror -> plane G68 -> fixed offsets ->
+    // plane-preserving G168. The normal axis is scaled/mirrored and translated,
+    // but the planar rotations never mix it. Keep the old G17 arithmetic order.
+    if (s.rotationPlane == 18 || s.rotationPlane == 19)
+    {
+        NCArcPlaneAxes plane{};
+        (void)TryGetNCArcPlaneAxes(s.rotationPlane, plane);
+        double u = NCTranslationScaleMirrorAxisPoint(s, wcs[plane.u], plane.u);
+        double v = NCTranslationScaleMirrorAxisPoint(s, wcs[plane.v], plane.v);
+        double cosine = 1.0, sine = 0.0;
+        NCTranslationRotationCoefficients(s, cosine, sine);
+        if (cosine != 1.0 || sine != 0.0)
+        {
+            NCTranslationRotatePlanarVector(u - s.rotationCenterMM[0],
+                v - s.rotationCenterMM[1], cosine, sine, u, v);
+            u += s.rotationCenterMM[0]; v += s.rotationCenterMM[1];
+        }
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            mcs[axis] = NCTranslationScaleMirrorAxisPoint(s, wcs[axis], axis) +
+                NCTranslationAxisOffsetMM(s, axis);
+        mcs[plane.u] = u + NCTranslationAxisOffsetMM(s, plane.u);
+        mcs[plane.v] = v + NCTranslationAxisOffsetMM(s, plane.v);
+        double workAngle = 0.0;
+        (void)TryGetNCTranslationWorkPlaneAngle(s, workAngle);
+        NCTranslationPlanarCoefficients(workAngle, cosine, sine);
+        if (cosine != 1.0 || sine != 0.0)
+        {
+            NCTranslationRotatePlanarVector(
+                mcs[plane.u] - s.workRotationCenterMM[0],
+                mcs[plane.v] - s.workRotationCenterMM[1],
+                cosine, sine, u, v);
+            mcs[plane.u] = s.workRotationCenterMM[0] + u;
+            mcs[plane.v] = s.workRotationCenterMM[1] + v;
+        }
+        return;
+    }
     double x = NCTranslationScaleMirrorAxisPoint(s, wcs[0], 0U);
     double y = NCTranslationScaleMirrorAxisPoint(s, wcs[1], 1U);
     if (s.rotationMode == 68 && s.rotationAngleDeg != 0.0 &&
@@ -396,11 +576,12 @@ inline void NCTranslationForwardPoint(const NCTranslationSnapshot& s,
     // G168 rotates their complete result about its separate MCS centre.
     mcs[0] = x + NCTranslationAxisOffsetMM(s, 0U);
     mcs[1] = y + NCTranslationAxisOffsetMM(s, 1U);
-    if (s.workMode == 168 && s.workOffset[3] != 0.0 &&
-        s.workOffset[3] != 360.0 && s.workOffset[3] != -360.0)
+    double workAngle = 0.0;
+    (void)TryGetNCTranslationWorkPlaneAngle(s, workAngle);
+    if (workAngle != 0.0 && workAngle != 360.0 && workAngle != -360.0)
     {
         double cosine = 1.0, sine = 0.0;
-        NCTranslationPlanarCoefficients(s.workOffset[3], cosine, sine);
+        NCTranslationPlanarCoefficients(workAngle, cosine, sine);
         NCTranslationRotatePlanarVector(mcs[0] - s.workRotationCenterMM[0],
             mcs[1] - s.workRotationCenterMM[1], cosine, sine, x, y);
         mcs[0] = s.workRotationCenterMM[0] + x;
@@ -413,12 +594,44 @@ inline void NCTranslationForwardPoint(const NCTranslationSnapshot& s,
 inline void NCTranslationInversePoint(const NCTranslationSnapshot& s,
     const double* mcs, double* wcs) noexcept
 {
+    if (s.rotationPlane == 18 || s.rotationPlane == 19)
+    {
+        NCArcPlaneAxes plane{};
+        (void)TryGetNCArcPlaneAxes(s.rotationPlane, plane);
+        double unrotated[8] = {};
+        for (unsigned axis = 0U; axis < 8U; ++axis) unrotated[axis] = mcs[axis];
+        double workAngle = 0.0;
+        (void)TryGetNCTranslationWorkPlaneAngle(s, workAngle);
+        double cosine = 1.0, sine = 0.0;
+        NCTranslationPlanarCoefficients(workAngle, cosine, sine);
+        if (cosine != 1.0 || sine != 0.0)
+        {
+            const double du = mcs[plane.u] - s.workRotationCenterMM[0];
+            const double dv = mcs[plane.v] - s.workRotationCenterMM[1];
+            unrotated[plane.u] = s.workRotationCenterMM[0] + (du * cosine + dv * sine);
+            unrotated[plane.v] = s.workRotationCenterMM[1] + (-du * sine + dv * cosine);
+        }
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            wcs[axis] = unrotated[axis] - NCTranslationAxisOffsetMM(s, axis);
+        NCTranslationRotationCoefficients(s, cosine, sine);
+        if (cosine != 1.0 || sine != 0.0)
+        {
+            const double du = wcs[plane.u] - s.rotationCenterMM[0];
+            const double dv = wcs[plane.v] - s.rotationCenterMM[1];
+            wcs[plane.u] = s.rotationCenterMM[0] + (du * cosine + dv * sine);
+            wcs[plane.v] = s.rotationCenterMM[1] + (-du * sine + dv * cosine);
+        }
+        for (unsigned axis = 0U; axis < 3U; ++axis)
+            wcs[axis] = NCTranslationInverseScaleMirrorAxisPoint(s, wcs[axis], axis);
+        return;
+    }
     double unrotatedX = mcs[0], unrotatedY = mcs[1];
-    if (s.workMode == 168 && s.workOffset[3] != 0.0 &&
-        s.workOffset[3] != 360.0 && s.workOffset[3] != -360.0)
+    double workAngle = 0.0;
+    (void)TryGetNCTranslationWorkPlaneAngle(s, workAngle);
+    if (workAngle != 0.0 && workAngle != 360.0 && workAngle != -360.0)
     {
         double cosine = 1.0, sine = 0.0;
-        NCTranslationPlanarCoefficients(s.workOffset[3], cosine, sine);
+        NCTranslationPlanarCoefficients(workAngle, cosine, sine);
         const double dx = mcs[0] - s.workRotationCenterMM[0];
         const double dy = mcs[1] - s.workRotationCenterMM[1];
         unrotatedX = s.workRotationCenterMM[0] + (dx * cosine + dy * sine);
@@ -443,46 +656,51 @@ inline void NCTranslationInversePoint(const NCTranslationSnapshot& s,
         wcs[axis] = NCTranslationInverseScaleMirrorAxisPoint(s, wcs[axis], axis);
 }
 
-// Producer boundary only: X is radius in native mm, Y is an angle in degrees.
+// Producer boundary only: canonical u is radius in native mm, v is degrees.
+// G17 X/Y, G18 Z/X, G19 Y/Z. The normal axis remains a Cartesian length.
 // The accepted native tail supplies omitted polar words through the Cartesian
 // affine inverse. No modal radius/angle cache can diverge from the native tail.
-// On success the selected XY pair is Cartesian; do not decode it a second time.
+// On success the selected plane pair is Cartesian; decode exactly once.
 inline bool TryCompleteNCTranslationPolarEndpoint(const NCTranslationSnapshot& s,
     const double* baselineMCS, double* targetWCS, bool* hasAxis) noexcept
 {
     if (!baselineMCS || !targetWCS || !hasAxis ||
         !IsNCTranslationSnapshotValid(s) || s.polarMode != 16 ||
-        s.distanceMode != 90 || s.rotationPlane != 17) return false;
+        s.distanceMode != 90) return false;
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(s.rotationPlane, plane)) return false;
+    const unsigned u = plane.u, v = plane.v, normal = plane.normal;
     for (unsigned axis = 0U; axis < 8U; ++axis)
         if (!std::isfinite(baselineMCS[axis]) ||
             (hasAxis[axis] && (axis >= 3U || !std::isfinite(targetWCS[axis])))) return false;
-    // A Z-only block does not manufacture XY presence or rewrite omitted words.
-    if (!hasAxis[0] && !hasAxis[1]) return true;
-    double radius = hasAxis[0] ? targetWCS[0] : 0.0;
-    double angle = hasAxis[1] ? targetWCS[1] : 0.0;
-    if (!hasAxis[0] || !hasAxis[1])
+    // A normal-only block does not manufacture plane presence or rewrite words.
+    if (!hasAxis[u] && !hasAxis[v]) return true;
+    double radius = hasAxis[u] ? targetWCS[u] : 0.0;
+    double angle = hasAxis[v] ? targetWCS[v] : 0.0;
+    if (!hasAxis[u] || !hasAxis[v])
     {
         double baselineWCS[8] = {};
         NCTranslationInversePoint(s, baselineMCS, baselineWCS);
-        if (!std::isfinite(baselineWCS[0]) || !std::isfinite(baselineWCS[1])) return false;
-        const double baselineRadius = std::hypot(baselineWCS[0], baselineWCS[1]);
+        if (!std::isfinite(baselineWCS[u]) || !std::isfinite(baselineWCS[v])) return false;
+        const double baselineRadius = std::hypot(baselineWCS[u], baselineWCS[v]);
         if (!std::isfinite(baselineRadius)) return false;
-        if (!hasAxis[0]) radius = baselineRadius;
-        if (!hasAxis[1])
+        if (!hasAxis[u]) radius = baselineRadius;
+        if (!hasAxis[v])
         {
             // A transformed origin can inverse-map to a tiny nonzero residue.
             // Do not infer an arbitrary direction from cancellation/roundoff.
             double originWCS[8] = {}, originMCS[8] = {};
             NCTranslationForwardPoint(s, originWCS, originMCS);
             double magnitude = 1.0;
-            for (unsigned axis = 0U; axis < 2U; ++axis)
+            for (unsigned component = 0U; component < 2U; ++component)
             {
+                const unsigned axis = component == 0U ? u : v;
                 const double scaledCenter = s.scalingCenterMM[axis] * s.scalingFactor;
                 const double terms[] = { baselineMCS[axis], originMCS[axis],
                     s.extOffsetMM[axis], s.wcsOffsetMM[axis], s.toolOffsetMM[axis],
                     s.workOffset[axis], s.scalingCenterMM[axis], scaledCenter,
-                    s.mirrorCenterMM[axis], s.rotationCenterMM[axis],
-                    s.workRotationCenterMM[axis] };
+                    s.mirrorCenterMM[axis], s.rotationCenterMM[component],
+                    s.workRotationCenterMM[component] };
                 for (double term : terms)
                 {
                     if (!std::isfinite(term)) return false;
@@ -491,9 +709,9 @@ inline bool TryCompleteNCTranslationPolarEndpoint(const NCTranslationSnapshot& s
             }
             const double originBudget = 64.0 * (std::numeric_limits<double>::epsilon)() * magnitude;
             if (baselineRadius == 0.0 ||
-                std::hypot(baselineMCS[0] - originMCS[0],
-                    baselineMCS[1] - originMCS[1]) <= originBudget) return false;
-            angle = std::atan2(baselineWCS[1], baselineWCS[0]) *
+                std::hypot(baselineMCS[u] - originMCS[u],
+                    baselineMCS[v] - originMCS[v]) <= originBudget) return false;
+            angle = std::atan2(baselineWCS[v], baselineWCS[u]) *
                 (180.0 / 3.14159265358979323846);
         }
     }
@@ -506,18 +724,102 @@ inline bool TryCompleteNCTranslationPolarEndpoint(const NCTranslationSnapshot& s
     const double y = radius == 0.0 ? 0.0 : radius * sine;
     if (!std::isfinite(x) || !std::isfinite(y)) return false;
     double cartesian[8] = {};
-    cartesian[0] = x;
-    cartesian[1] = y;
-    if (hasAxis[2]) cartesian[2] = targetWCS[2];
+    cartesian[u] = x;
+    cartesian[v] = y;
+    if (hasAxis[normal]) cartesian[normal] = targetWCS[normal];
     double native[8] = {};
     NCTranslationForwardPoint(s, cartesian, native);
-    if (!std::isfinite(native[0]) || !std::isfinite(native[1]) ||
-        (hasAxis[2] && !std::isfinite(native[2]))) return false;
-    targetWCS[0] = x;
-    targetWCS[1] = y;
-    hasAxis[0] = true;
-    hasAxis[1] = true;
+    if (!std::isfinite(native[u]) || !std::isfinite(native[v]) ||
+        (hasAxis[normal] && !std::isfinite(native[normal]))) return false;
+    targetWCS[u] = x;
+    targetWCS[v] = y;
+    hasAxis[u] = true;
+    hasAxis[v] = true;
     return true;
+}
+
+// BASE-PLANE-13 NC-only complete G90 polar cutter endpoint. Historical
+// function name retained: the same point decoder serves a chord or partial arc. The caller
+// supplies both radius (mm) and angle (degrees); no inverse or modal fallback
+// may use the physical offset tail as a nominal polar baseline. Decode once,
+// then apply the SAME immutable affine point transform as non-cutter G16.
+// All untouched physical axes, including the normal, are preserved bitwise.
+// On any failure outputMCS is unchanged. This helper grants no motion permit.
+inline bool TryNCTranslationCutterPolarLineEndpoint(const NCTranslationSnapshot& s,
+    const double* physicalMCS, double radiusMM, double angleDeg, double* outputMCS) noexcept
+{
+    NCArcPlaneAxes plane{};
+    if (!physicalMCS || !outputMCS || !IsNCTranslationSnapshotValid(s) ||
+        !IsNCTranslationCutterNotationAllowed(s.rotationPlane, s.distanceMode, s.polarMode) ||
+        s.polarMode != 16 || !TryGetNCArcPlaneAxes(s.rotationPlane, plane)) return false;
+    double decoded[8] = {}, transformed[8] = {}, candidate[8] = {};
+    bool selected[8] = {};
+    selected[plane.u] = selected[plane.v] = true;
+    decoded[plane.u] = radiusMM; decoded[plane.v] = angleDeg;
+    if (!TryCompleteNCTranslationPolarEndpoint(s, physicalMCS, decoded, selected)) return false;
+    NCTranslationForwardPoint(s, decoded, transformed);
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        candidate[axis] = selected[axis] ? transformed[axis] : physicalMCS[axis];
+        if (!std::isfinite(candidate[axis])) return false;
+    }
+    std::memcpy(outputMCS, candidate, sizeof(candidate));
+    return true;
+}
+
+// BASE-PLANE-19 NC-only sparse G90 polar cutter endpoint.
+// Shared by a G01 chord/lead-out or a PARTIAL G02/G03 primitive. This helper
+// decodes a point only and never authorizes a full circle or a Motion packet.
+// Missing words come from the accepted NOMINAL contour, never the offset
+// physical tool-centre tail. Physical unselected axes are copied unchanged.
+// Authored radius is already in mm; an inferred radius is never converted twice.
+// Both arrays remain separate even during G40 lead-out. This grants no permit;
+// the NC caller proves run/cache/generation/plane and physical-tail continuity.
+// Complete-pair calls retain the established decoder and numerical operation order.
+// Failure is atomic, including aliased input/output storage.
+inline bool TryNCTranslationCutterSparsePolarEndpoint(const NCTranslationSnapshot& s,
+    const double* nominalMCS, const double* physicalMCS, double radiusMM,
+    double angleDeg, std::uint32_t authoredEndpointMask, double* outputMCS) noexcept
+{
+    NCArcPlaneAxes plane{};
+    if (!nominalMCS || !physicalMCS || !outputMCS ||
+        !IsNCTranslationSnapshotValid(s) || s.polarMode != 16 ||
+        !IsNCTranslationCutterNotationAllowed(s.rotationPlane, s.distanceMode, s.polarMode) ||
+        !TryGetNCArcPlaneAxes(s.rotationPlane, plane) ||
+        authoredEndpointMask == 0U || (authoredEndpointMask & ~plane.mask) != 0U) return false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if (!std::isfinite(nominalMCS[axis]) || !std::isfinite(physicalMCS[axis])) return false;
+        if (axis != plane.u && axis != plane.v &&
+            std::memcmp(&nominalMCS[axis], &physicalMCS[axis], sizeof(double)) != 0) return false;
+    }
+    if (authoredEndpointMask == plane.mask)
+        return TryNCTranslationCutterPolarLineEndpoint(s, physicalMCS, radiusMM, angleDeg, outputMCS);
+    double decoded[8] = {}, transformed[8] = {}, candidate[8] = {};
+    bool selected[8] = {};
+    selected[plane.u] = (authoredEndpointMask & (1U << plane.u)) != 0U;
+    selected[plane.v] = (authoredEndpointMask & (1U << plane.v)) != 0U;
+    if (selected[plane.u]) decoded[plane.u] = radiusMM;
+    if (selected[plane.v]) decoded[plane.v] = angleDeg;
+    if (!TryCompleteNCTranslationPolarEndpoint(s, nominalMCS, decoded, selected)) return false;
+    NCTranslationForwardPoint(s, decoded, transformed);
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        candidate[axis] = (axis == plane.u || axis == plane.v) ? transformed[axis] : physicalMCS[axis];
+        if (!std::isfinite(candidate[axis])) return false;
+    }
+    std::memcpy(outputMCS, candidate, sizeof(candidate));
+    return true;
+}
+
+// Preserve the BASE-PLANE-18 line-only entry name and numerical path for
+// existing callers. Motion/arc classification remains owned by the NC caller.
+inline bool TryNCTranslationCutterSparsePolarLineEndpoint(const NCTranslationSnapshot& s,
+    const double* nominalMCS, const double* physicalMCS, double radiusMM,
+    double angleDeg, std::uint32_t authoredEndpointMask, double* outputMCS) noexcept
+{
+    return TryNCTranslationCutterSparsePolarEndpoint(s, nominalMCS, physicalMCS,
+        radiusMM, angleDeg, authoredEndpointMask, outputMCS);
 }
 
 // Fixed G91 uses displacement vectors, not points: neither rotation centre,
@@ -530,7 +832,7 @@ inline bool TryNCTranslationIncrementalTarget(const NCTranslationSnapshot& s,
 {
     if (!commandedMCS || !deltaWCS || !hasAxis || !outputMCS ||
         !IsNCTranslationSnapshotValid(s) || s.distanceMode != 91 ||
-        (NCTranslationHasPlanarRotation(s) && hasAxis[0] != hasAxis[1])) return false;
+        NCTranslationHasSparseRotatedEndpoint(s, hasAxis)) return false;
     double delta[8] = {};
     double candidate[8] = {};
     for (unsigned axis = 0U; axis < 8U; ++axis)
@@ -540,15 +842,32 @@ inline bool TryNCTranslationIncrementalTarget(const NCTranslationSnapshot& s,
         candidate[axis] = commandedMCS[axis];
         if (hasAxis[axis]) delta[axis] = deltaWCS[axis];
     }
-    if (hasAxis[0] || hasAxis[1])
+    if (s.rotationPlane != 17)
     {
-        double rotatedX = 0.0, rotatedY = 0.0;
-        NCTranslationRotateXYVector(s, delta[0], delta[1], rotatedX, rotatedY);
-        if (!std::isfinite(rotatedX) || !std::isfinite(rotatedY)) return false;
-        delta[0] = rotatedX;
-        delta[1] = rotatedY;
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(s.rotationPlane, plane)) return false;
+        if (hasAxis[plane.u] || hasAxis[plane.v])
+        {
+            double u = 0.0, v = 0.0;
+            if (!NCTranslationRotateArcVector(s, delta[plane.u], delta[plane.v], u, v)) return false;
+            delta[plane.u] = u; delta[plane.v] = v;
+        }
+        // A normal-axis LINEAR displacement still uses XYZ scaling/mirror.
+        // No circle is permitted to move this axis in the current scope.
+        delta[plane.normal] = NCTranslationScaleMirrorAxisVector(s, delta[plane.normal], plane.normal);
     }
-    delta[2] = NCTranslationScaleMirrorAxisVector(s, delta[2], 2U);
+    else
+    {
+        if (hasAxis[0] || hasAxis[1])
+        {
+            double rotatedX = 0.0, rotatedY = 0.0;
+            NCTranslationRotateXYVector(s, delta[0], delta[1], rotatedX, rotatedY);
+            if (!std::isfinite(rotatedX) || !std::isfinite(rotatedY)) return false;
+            delta[0] = rotatedX;
+            delta[1] = rotatedY;
+        }
+        delta[2] = NCTranslationScaleMirrorAxisVector(s, delta[2], 2U);
+    }
     for (unsigned axis = 0U; axis < 8U; ++axis)
     {
         if (hasAxis[axis]) candidate[axis] = commandedMCS[axis] + delta[axis];
@@ -570,9 +889,11 @@ inline bool TryCompleteNCTranslationIncrementalEndpoint(const NCTranslationSnaps
         candidateDelta[axis] = deltaWCS[axis];
         candidateMask[axis] = hasAxis[axis];
     }
-    if (NCTranslationHasPlanarRotation(s) && hasAxis[0] != hasAxis[1])
+    if (NCTranslationHasSparseRotatedEndpoint(s, hasAxis))
     {
-        const unsigned omitted = hasAxis[0] ? 1U : 0U;
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(s.rotationPlane, plane)) return false;
+        const unsigned omitted = hasAxis[plane.u] ? plane.v : plane.u;
         candidateDelta[omitted] = 0.0;
         candidateMask[omitted] = true;
     }
@@ -596,27 +917,29 @@ inline bool TryCompleteNCTranslationPlanarEndpoint(const NCTranslationSnapshot& 
     if (!commandedMCS || !targetWCS || !hasAxis) return false;
     if (s.distanceMode == 91)
         return TryCompleteNCTranslationIncrementalEndpoint(s, commandedMCS, targetWCS, hasAxis);
-    if (hasAxis[0] == hasAxis[1] || !NCTranslationHasPlanarRotation(s)) return true;
+    if (!NCTranslationHasSparseRotatedEndpoint(s, hasAxis)) return true;
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(s.rotationPlane, plane)) return false;
     if (!IsNCTranslationSnapshotValid(s) ||
-        !std::isfinite(commandedMCS[0]) || !std::isfinite(commandedMCS[1])) return false;
-    const unsigned present = hasAxis[0] ? 0U : 1U;
-    const unsigned omitted = 1U - present;
+        !std::isfinite(commandedMCS[plane.u]) || !std::isfinite(commandedMCS[plane.v])) return false;
+    const unsigned present = hasAxis[plane.u] ? plane.u : plane.v;
+    const unsigned omitted = hasAxis[plane.u] ? plane.v : plane.u;
     if (!std::isfinite(targetWCS[present])) return false;
     double currentWCS[8] = {};
     NCTranslationInversePoint(s, commandedMCS, currentWCS);
-    if (!std::isfinite(currentWCS[0]) || !std::isfinite(currentWCS[1])) return false;
+    if (!std::isfinite(currentWCS[plane.u]) || !std::isfinite(currentWCS[plane.v])) return false;
     double candidateWCS[8] = {};
     candidateWCS[present] = targetWCS[present];
     candidateWCS[omitted] = currentWCS[omitted];
     double candidateMCS[8] = {};
     NCTranslationForwardPoint(s, candidateWCS, candidateMCS);
-    if (!std::isfinite(candidateMCS[0]) || !std::isfinite(candidateMCS[1])) return false;
+    if (!std::isfinite(candidateMCS[plane.u]) || !std::isfinite(candidateMCS[plane.v])) return false;
     targetWCS[omitted] = candidateWCS[omitted];
     hasAxis[omitted] = true;
     return true;
 }
 
-static_assert(sizeof(NCTranslationSnapshot) == 448U &&
+static_assert(sizeof(NCTranslationSnapshot) == 496U &&
     alignof(NCTranslationSnapshot) == 8U,
     "Fixed translation descriptor layout must remain explicit.");
 static_assert(std::is_trivially_copyable<NCTranslationSnapshot>::value &&
@@ -652,5 +975,6 @@ static_assert(offsetof(NCTranslationSnapshot, runToken) == 0U &&
     offsetof(NCTranslationSnapshot, storedStrokeMode) == 428U &&
     offsetof(NCTranslationSnapshot, cutterMode) == 432U &&
     offsetof(NCTranslationSnapshot, cutterD) == 436U &&
-    offsetof(NCTranslationSnapshot, cutterRadiusMM) == 440U,
+    offsetof(NCTranslationSnapshot, cutterRadiusMM) == 440U &&
+    offsetof(NCTranslationSnapshot, axisIdentity) == 448U,
     "Atomic exact comparison requires a padding-free translation descriptor.");

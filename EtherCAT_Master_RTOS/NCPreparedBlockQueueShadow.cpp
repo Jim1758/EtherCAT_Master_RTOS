@@ -1,4 +1,5 @@
 #include "NCPreparedBlockQueueShadow.h"
+#include "NCWorkCoordinateCode.h"
 
 #include <cerrno>
 #include <cmath>
@@ -83,16 +84,7 @@ namespace
 
     bool IsExtendedWorkCoordinateCode(int code) noexcept
     {
-        if (code < 54 || code > 959)
-        {
-            return false;
-        }
-
-        const int suffix = code % 100;
-        const int prefix = code / 100;
-        return
-            suffix >= 54 && suffix <= 59 &&
-            prefix >= 0 && prefix <= 9;
+        return IsNCWorkCoordinateCode(code);
     }
 
     int BarrierPriority(NCPreparedBarrierKind kind) noexcept

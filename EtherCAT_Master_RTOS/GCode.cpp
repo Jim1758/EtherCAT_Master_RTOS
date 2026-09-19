@@ -5,6 +5,7 @@
 #include "AlarmManager.h"
 #include "SHMManager.h"
 #include <cmath>
+#include <cstring>
 
 namespace GCodeHandlers
 {
@@ -152,47 +153,16 @@ namespace GCodeHandlers
 
         case 92:
         {
-            // 1. 準備空陣列給 CoordinateManager
-            bool axisProgrammed[8] = { false };
-            double axisTarget[8] = { 0.0 };
-
-            bool hasAnyAxis = false; // 用來檢查這行 G92 到底有沒有帶任何軸座標
-
-            // 🌟 2. 直接走訪機台定義的 8 個軸
-            for (int i = 0; i < 8; i++)
+            bool fields[8] = {};
+            double targets[8] = {};
+            if (!nc->CoordSys.TryDecodeG92Origin(block, nc, fields, targets))
             {
-                char axisLetter = nc->m_axisNames[i]; // 拿出設定檔定義的字母 (如 'X', 'Y', 'Z')
-
-                // 防呆：如果這個軸未啟用 (空白字元) 則跳過
-                if (axisLetter == ' ' || axisLetter == '\0' || axisLetter == 'N') continue;
-
-                // 🌟 3. 利用你 NCBlock 寫好的神級 API，一句話完成判斷與取值！
-                if (block.has(axisLetter))
-                {
-                    axisProgrammed[i] = true;
-                    axisTarget[i] = nc->CoordSys.ToInternalUnit(block.val(axisLetter),
-                        (nc->GetMotion().GetAxisContext(i).axisType == AxisType::ROTARY ||
-                         nc->GetMotion().GetAxisContext(i).axisType == AxisType::ROTARY_CONTINUOUS));
-                    hasAnyAxis = true;
-                }
-            }
-
-            // 4. 如果有讀到至少一個軸，就呼叫底層計算並覆寫表格
-            if (hasAnyAxis)
-            {
-                nc->CoordSys.ApplyG92(axisProgrammed, axisTarget,nc);
-
-                // 💡 提示：如果需要，可以在這裡補上觸發 HMI 存檔的旗標
-                 //pShm->Coord_Command.reqSave = 1;
-                 //pShm->Coord_Command.saveType = 3; // 3 代表 WCS
-            }
-            else
-            {
-                // 報警：下達了 G92 卻沒有給任何座標
-                printf("[Warning] G92 executed without any valid axis coordinate.\n");
+                RtPrintf("[ORIGIN][REJECT] g=92 reason=INPUT_OR_FRAME beforeCommit=1\n");
                 AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+                nc->ChangeState(NCState::HOLD);
+                return nullptr;
             }
-
+            if (!nc->CoordSys.ApplyG92(fields, targets, nc)) return nullptr;
             break;
         }
 
@@ -247,53 +217,33 @@ namespace GCodeHandlers
                 RtPrintf("[CUTTER][TABLE] D=%d storage=RAM_ONLY\n", dCode);
             return [](NCManager*) { return true; };
         }
-        // 防呆：必須指定 P (刀號)
-        if (!block.has('P')) {
-            RtPrintf(">>> [ALARM] G10 missing 'P' (Tool Index) parameter!\n");
-            return [](NCManager*) { return true; };
-        }
-
-        const double requestedRow = block.val('P');
-        if (!std::isfinite(requestedRow) || requestedRow < 1.0 ||
-            requestedRow > static_cast<double>(nc->CoordSys.m_ToolOffset.size()) ||
-            std::floor(requestedRow) != requestedRow)
-        {
-            nc->CoordSys.ApplyCoordinateTableValues(2, -1, nullptr, nullptr, nc);
-            return [](NCManager*) { return true; };
-        }
+        int arrayIndex = -1;
         bool writeFields[8] = {};
         double writeValues[8] = {};
-        int pCode = static_cast<int>(requestedRow);
-        int arrayIndex = pCode - 1; // P1 對應陣列 [0]
-
-        // 防呆：檢查陣列範圍
-        if (arrayIndex >= 0 && arrayIndex < nc->CoordSys.m_ToolOffset.size())
+        if (!nc->CoordSys.TryDecodeToolTableWrite(block, nc, arrayIndex,
+            writeFields, writeValues))
         {
-            // 動態掃描機台啟用的 8 個軸
-            for (int i = 0; i < 8; i++) {
-                char axisLetter = nc->m_axisNames[i];
-                if (axisLetter != ' ' && axisLetter != '\0' && axisLetter != 'N') {
-                    // 如果 G 碼有下達這個軸，就覆寫表格內的數值
-                    if (block.has(axisLetter)) {
-                        writeFields[i] = true;
-                        writeValues[i] = nc->CoordSys.ToInternalUnit(block.val(axisLetter),
-                            (nc->GetMotion().GetAxisContext(i).axisType == AxisType::ROTARY ||
-                             nc->GetMotion().GetAxisContext(i).axisType == AxisType::ROTARY_CONTINUOUS));
-                    }
-                }
-            }
-
-            // 🌟 貼心功能：設定完自動存檔，確保重開機數值還在
-            if (!nc->CoordSys.ApplyCoordinateTableValues(2, arrayIndex,
-                writeFields, writeValues, nc)) return [](NCManager*) { return true; };
-            nc->CoordSys.SaveToolOffset();
-            RtPrintf("[G10] Tool Offset P%d updated and saved.\n", pCode);
+            RtPrintf("[TOOL][REJECT] g=10 reason=TABLE_INPUT beforeCommit=1\n");
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return true; };
         }
-        else {
-            RtPrintf(">>> [ALARM] G10 P%d is out of range!\n", pCode);
+        bool changed = false;
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            if (writeFields[axis] && std::memcmp(&writeValues[axis],
+                &nc->CoordSys.m_ToolOffset[arrayIndex][axis], sizeof(double)) != 0) changed = true;
+        if (!changed)
+        {
+            RtPrintf("[TOOL][TABLE] P=%d changed=0 saveRequested=0\n", arrayIndex + 1);
+            return [](NCManager*) { return true; };
         }
-
-        return [](NCManager*) { return true; }; // 瞬間設定完成
+        if (!nc->CoordSys.ApplyCoordinateTableValues(2, arrayIndex,
+            writeFields, writeValues, nc)) return [](NCManager*) { return true; };
+        // Preserve ordinary G10 persistence after the complete row commits.
+        // This void API reports a request, not proof of successful disk I/O.
+        nc->CoordSys.SaveToolOffset();
+        RtPrintf("[TOOL][TABLE] P=%d changed=1 saveRequested=1\n", arrayIndex + 1);
+        return [](NCManager*) { return true; };
     }
 
     // ==========================================================
@@ -370,19 +320,26 @@ namespace GCodeHandlers
             block.val('W'), workMode, wCode);
         if (nc->CoordSys.IsTranslationRunBound())
         {
+            NCArcPlaneAxes plane{};
+            valid = valid && TryGetNCArcPlaneAxes(nc->CoordSys.activePlane, plane);
             valid = valid && nc->CoordSys.IsWorkpieceSelectionSupported(workMode, wCode) &&
                 block.gCount == 1 && block.mCount == 0;
             for (char letter = 'A'; letter <= 'Z'; ++letter)
                 if (block.has(letter) && letter != 'G' && letter != 'N' && letter != 'W' &&
-                    letter != 'X' && letter != 'Y') valid = false;
-            valid = valid && block.has('X') == block.has('Y') &&
-                (!block.has('X') || (std::isfinite(block.val('X')) && std::isfinite(block.val('Y'))));
+                    letter != plane.uAddress && letter != plane.vAddress) valid = false;
+            valid = valid && block.has(plane.uAddress) == block.has(plane.vAddress) &&
+                (!block.has(plane.uAddress) || (std::isfinite(block.val(plane.uAddress)) &&
+                    std::isfinite(block.val(plane.vAddress))));
             if (valid)
             {
-                const bool hasYaw = nc->CoordSys.m_WorkOffset[wCode - 1][CoordinateManager::WO_ANGLE_XY_YAW] != 0.0;
+                const unsigned angleField = nc->CoordSys.activePlane == 18 ?
+                    CoordinateManager::WO_ANGLE_XZ_PITCH : (nc->CoordSys.activePlane == 19 ?
+                        CoordinateManager::WO_ANGLE_YZ_ROLL : CoordinateManager::WO_ANGLE_XY_YAW);
+                const bool hasPlaneRotation =
+                    nc->CoordSys.m_WorkOffset[wCode - 1][angleField] != 0.0;
                 const bool sameWork = nc->CoordSys.isWorkpieceRotationActive && nc->CoordSys.currentWCode == wCode;
-                valid = hasYaw ? (nc->CoordSys.IsTranslationRunCurrent() &&
-                    (block.has('X') || sameWork)) : !block.has('X');
+                valid = hasPlaneRotation ? (nc->CoordSys.IsTranslationRunCurrent() &&
+                    (block.has(plane.uAddress) || sameWork)) : !block.has(plane.uAddress);
             }
         }
         if (!valid)

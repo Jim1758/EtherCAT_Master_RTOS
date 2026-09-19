@@ -79,15 +79,17 @@ void NCPathCoreFeedArcV2::Clear() noexcept
     radiusMM = radiusPulse = startAngle = sweepRadians = 0.0;
     lengthMM = lengthPulse = feedMMMin = velocityPPS = 0.0;
     direction = 0; axisMask = 0U; fullCircle = false; valid = false;
+    sourceRoundoffMM = 0.0f; plane = 17U;
 }
 
 bool ResolveNCPathCorePlanarCirclePulse(const double sx, const double sy,
     const double ex, const double ey, const double cx, const double cy,
     const double expectedRadius, const int direction, const bool fullCircle,
-    NCPathCoreArcPulseGeometry& output) noexcept
+    NCPathCoreArcPulseGeometry& output, const double additionalTolerance) noexcept
 {
     output.radius = output.startAngle = output.sweepRadians = output.lengthPulse = 0.0;
-    if ((direction != -1 && direction != 1) ||
+    if (!std::isfinite(additionalTolerance) || additionalTolerance < 0.0 ||
+        std::signbit(additionalTolerance) || (direction != -1 && direction != 1) ||
         !std::isfinite(sx) || !std::isfinite(sy) ||
         !std::isfinite(ex) || !std::isfinite(ey) ||
         !std::isfinite(cx) || !std::isfinite(cy) ||
@@ -99,7 +101,9 @@ bool ResolveNCPathCorePlanarCirclePulse(const double sx, const double sy,
         !std::isfinite(dx1) || !std::isfinite(dy1)) return false;
     const double radius = std::hypot(dx0, dy0);
     const double endRadius = std::hypot(dx1, dy1);
-    const double tolerance = CoordinateBudget(sx, sy, ex, ey, cx, cy, expectedRadius);
+    const double tolerance = CoordinateBudget(sx, sy, ex, ey, cx, cy, expectedRadius) +
+        additionalTolerance;
+    if (!std::isfinite(tolerance)) return false;
     if (!std::isfinite(radius) || !std::isfinite(endRadius) ||
         radius <= tolerance || endRadius <= tolerance ||
         !Near(radius, expectedRadius, tolerance) ||
@@ -129,10 +133,17 @@ bool ResolveNCPathCorePlanarCirclePulse(const double sx, const double sy,
 }
 
 NCPathCoreFeedArcCode BuildNCPathCoreFeedArc(
-    const NCPathCoreFeedArcInput& input, NCPathCoreFeedArcV2& output) noexcept
+    const NCPathCoreFeedArcInput& input, NCPathCoreFeedArcV2& output,
+    const float sourceRoundoffMM) noexcept
 {
     using Code = NCPathCoreFeedArcCode;
     output.Clear();
+    NCArcPlaneAxes axes{};
+    if (!TryGetNCArcPlaneAxes(input.plane, axes)) return Code::INVALID_PLANE;
+    const unsigned slots[2] = { axes.u, axes.v };
+    if (!std::isfinite(sourceRoundoffMM) || sourceRoundoffMM < 0.0f ||
+        std::signbit(sourceRoundoffMM) || sourceRoundoffMM > MaximumBudgetMM)
+        return Code::PRECISION_BUDGET;
     if (input.direction != -1 && input.direction != 1) return Code::INVALID_DIRECTION;
     if (!std::isfinite(input.feedMMMin) || input.feedMMMin <= 0.0 ||
         input.feedMMMin > 100.0) return Code::INVALID_FEED;
@@ -141,7 +152,7 @@ NCPathCoreFeedArcCode BuildNCPathCoreFeedArc(
         if (!std::isfinite(input.startMCS[axis]) || !std::isfinite(input.endMCS[axis]) ||
             !std::isfinite(input.startPulse[axis]) || !std::isfinite(input.endPulse[axis]))
             return Code::NONFINITE_COORDINATE;
-        if (axis >= 2U && (!SameBits(input.startMCS[axis], input.endMCS[axis]) ||
+        if (axis != axes.u && axis != axes.v && (!SameBits(input.startMCS[axis], input.endMCS[axis]) ||
             !SameBits(input.startPulse[axis], input.endPulse[axis])))
             return Code::OUTSIDE_AXIS_CHANGED;
     }
@@ -151,8 +162,8 @@ NCPathCoreFeedArcCode BuildNCPathCoreFeedArc(
         if (!std::isfinite(input.pulsePerMM[axis]) || input.pulsePerMM[axis] <= 0.0 ||
             !std::isfinite(input.maxVelocityPPS[axis]) || input.maxVelocityPPS[axis] <= 0.0)
             return Code::INVALID_AXIS_CONFIGURATION;
-        if (input.fullCircle && (!SameBits(input.startMCS[axis], input.endMCS[axis]) ||
-            !SameBits(input.startPulse[axis], input.endPulse[axis])))
+        if (input.fullCircle && (!SameBits(input.startMCS[slots[axis]], input.endMCS[slots[axis]]) ||
+            !SameBits(input.startPulse[slots[axis]], input.endPulse[slots[axis]])))
             return Code::INVALID_FULL_CIRCLE;
     }
     if (input.pulsePerMM[0] != input.pulsePerMM[1]) return Code::UNEQUAL_AXIS_SCALE;
@@ -165,28 +176,34 @@ NCPathCoreFeedArcCode BuildNCPathCoreFeedArc(
     for (std::uint32_t axis = 0U; axis < 2U; ++axis)
     {
         const double offsetPulse = input.centerOffsetMM[axis] * scale;
-        centerMM[axis] = input.startMCS[axis] + input.centerOffsetMM[axis];
-        centerPulse[axis] = input.startPulse[axis] + offsetPulse;
+        centerMM[axis] = input.startMCS[slots[axis]] + input.centerOffsetMM[axis];
+        centerPulse[axis] = input.startPulse[slots[axis]] + offsetPulse;
         if (!std::isfinite(offsetPulse) || !std::isfinite(centerMM[axis]) ||
             !std::isfinite(centerPulse[axis])) return Code::NONFINITE_GEOMETRY;
         if (input.centerOffsetMM[axis] != 0.0 && offsetPulse == 0.0)
             return Code::SPACE_MISMATCH;
     }
-    const double pulseRadius = std::hypot(input.startPulse[0] - centerPulse[0],
-        input.startPulse[1] - centerPulse[1]);
+    const double pulseRadius = std::hypot(input.startPulse[axes.u] - centerPulse[0],
+        input.startPulse[axes.v] - centerPulse[1]);
     if (!std::isfinite(pulseRadius) || pulseRadius <= 0.0) return Code::INVALID_RADIUS;
-    const double mmTolerance = CoordinateBudget(input.startMCS[0], input.startMCS[1],
-        input.endMCS[0], input.endMCS[1], centerMM[0], centerMM[1], nominalRadius);
-    const double pulseTolerance = CoordinateBudget(input.startPulse[0], input.startPulse[1],
-        input.endPulse[0], input.endPulse[1], centerPulse[0], centerPulse[1], pulseRadius);
+    const double mmTolerance = CoordinateBudget(input.startMCS[axes.u], input.startMCS[axes.v],
+        input.endMCS[axes.u], input.endMCS[axes.v], centerMM[0], centerMM[1], nominalRadius) +
+        static_cast<double>(sourceRoundoffMM);
+    const double pulseTolerance = CoordinateBudget(input.startPulse[axes.u], input.startPulse[axes.v],
+        input.endPulse[axes.u], input.endPulse[axes.v], centerPulse[0], centerPulse[1], pulseRadius) +
+        static_cast<double>(sourceRoundoffMM) * scale;
     const double budgetMM = mmTolerance + pulseTolerance / scale;
-    if (!std::isfinite(budgetMM) || budgetMM > MaximumBudgetMM)
+    // The consumer can reconstruct the pulse-space bound from its immutable
+    // packet and native axis scale. Enforce that same cap before publication.
+    const double consumerBudgetMM = 2.0 * (pulseTolerance / scale);
+    if (!std::isfinite(budgetMM) || budgetMM > MaximumBudgetMM ||
+        !std::isfinite(consumerBudgetMM) || consumerBudgetMM > MaximumBudgetMM)
         return Code::PRECISION_BUDGET;
     for (std::uint32_t axis = 0U; axis < 2U; ++axis)
     {
-        const double deltaMM = input.endMCS[axis] - input.startMCS[axis];
-        const double deltaPulseMM = (input.endPulse[axis] - input.startPulse[axis]) / scale;
-        const double centerPulseMM = (centerPulse[axis] - input.startPulse[axis]) / scale;
+        const double deltaMM = input.endMCS[slots[axis]] - input.startMCS[slots[axis]];
+        const double deltaPulseMM = (input.endPulse[slots[axis]] - input.startPulse[slots[axis]]) / scale;
+        const double centerPulseMM = (centerPulse[axis] - input.startPulse[slots[axis]]) / scale;
         if (!std::isfinite(deltaMM) || !std::isfinite(deltaPulseMM) ||
             !std::isfinite(centerPulseMM)) return Code::NONFINITE_GEOMETRY;
         if (!Near(deltaMM, deltaPulseMM, budgetMM) ||
@@ -196,12 +213,13 @@ NCPathCoreFeedArcCode BuildNCPathCoreFeedArc(
 
     NCPathCoreArcPulseGeometry mmGeometry;
     NCPathCoreArcPulseGeometry pulseGeometry;
-    if (!ResolveNCPathCorePlanarCirclePulse(input.startMCS[0], input.startMCS[1],
-        input.endMCS[0], input.endMCS[1], centerMM[0], centerMM[1], nominalRadius,
-        input.direction, input.fullCircle, mmGeometry)) return Code::RADIUS_MISMATCH;
-    if (!ResolveNCPathCorePlanarCirclePulse(input.startPulse[0], input.startPulse[1],
-        input.endPulse[0], input.endPulse[1], centerPulse[0], centerPulse[1], pulseRadius,
-        input.direction, input.fullCircle, pulseGeometry)) return Code::RADIUS_MISMATCH;
+    if (!ResolveNCPathCorePlanarCirclePulse(input.startMCS[axes.u], input.startMCS[axes.v],
+        input.endMCS[axes.u], input.endMCS[axes.v], centerMM[0], centerMM[1], nominalRadius,
+        input.direction, input.fullCircle, mmGeometry, sourceRoundoffMM)) return Code::RADIUS_MISMATCH;
+    if (!ResolveNCPathCorePlanarCirclePulse(input.startPulse[axes.u], input.startPulse[axes.v],
+        input.endPulse[axes.u], input.endPulse[axes.v], centerPulse[0], centerPulse[1], pulseRadius,
+        input.direction, input.fullCircle, pulseGeometry,
+        static_cast<double>(sourceRoundoffMM) * scale)) return Code::RADIUS_MISMATCH;
     const double radiusMM = pulseGeometry.radius / scale;
     const double lengthMM = pulseGeometry.lengthPulse / scale;
     // Resolve angle wrapping consistently across spaces, including branch cuts.
@@ -224,8 +242,8 @@ NCPathCoreFeedArcCode BuildNCPathCoreFeedArc(
     double lower[2] = { 0.0, 0.0 }, upper[2] = { 0.0, 0.0 };
     for (std::uint32_t axis = 0U; axis < 2U; ++axis)
     {
-        lower[axis] = input.startMCS[axis] < input.endMCS[axis] ? input.startMCS[axis] : input.endMCS[axis];
-        upper[axis] = input.startMCS[axis] > input.endMCS[axis] ? input.startMCS[axis] : input.endMCS[axis];
+        lower[axis] = input.startMCS[slots[axis]] < input.endMCS[slots[axis]] ? input.startMCS[slots[axis]] : input.endMCS[slots[axis]];
+        upper[axis] = input.startMCS[slots[axis]] > input.endMCS[slots[axis]] ? input.startMCS[slots[axis]] : input.endMCS[slots[axis]];
     }
     for (std::uint32_t cardinal = 0U; cardinal < 4U; ++cardinal)
     {
@@ -261,8 +279,10 @@ NCPathCoreFeedArcCode BuildNCPathCoreFeedArc(
     output.startAngle = pulseGeometry.startAngle; output.sweepRadians = pulseGeometry.sweepRadians;
     output.lengthMM = lengthMM; output.lengthPulse = pulseGeometry.lengthPulse;
     output.feedMMMin = input.feedMMMin; output.velocityPPS = velocity;
-    output.direction = input.direction; output.axisMask = 3U;
-    output.fullCircle = input.fullCircle; output.valid = true;
+    output.direction = input.direction; output.axisMask = axes.mask;
+    output.plane = input.plane;
+    output.fullCircle = input.fullCircle; output.sourceRoundoffMM = sourceRoundoffMM;
+    output.valid = true;
     return Code::BUILT_ARC;
 }
 
@@ -271,7 +291,11 @@ bool EvaluateNCPathCoreFeedArcAxis(const NCPathCoreFeedArcV2& arc,
     double& outputMCS) noexcept
 {
     outputMCS = 0.0;
-    if (!arc.valid || arc.axisMask != 3U || axisIndex >= 8U ||
+    NCArcPlaneAxes axes{};
+    if (!TryGetNCArcPlaneAxes(arc.plane, axes)) return false;
+    if (!arc.valid || !std::isfinite(arc.sourceRoundoffMM) ||
+        arc.sourceRoundoffMM < 0.0f || std::signbit(arc.sourceRoundoffMM) ||
+        arc.sourceRoundoffMM > MaximumBudgetMM || arc.axisMask != axes.mask || axisIndex >= 8U ||
         (arc.direction != -1 && arc.direction != 1) ||
         !std::isfinite(unitParameter) || unitParameter < 0.0 || unitParameter > 1.0)
         return false;
@@ -279,17 +303,18 @@ bool EvaluateNCPathCoreFeedArcAxis(const NCPathCoreFeedArcV2& arc,
     if (!std::isfinite(start) || !std::isfinite(end)) return false;
     if (unitParameter == 0.0) { outputMCS = start; return true; }
     if (unitParameter == 1.0) { outputMCS = end; return true; }
-    if (axisIndex >= 2U)
+    if (axisIndex != axes.u && axisIndex != axes.v)
     {
         if (!SameBits(start, end)) return false;
         outputMCS = start; return true;
     }
-    if (!std::isfinite(arc.centerMCS[axisIndex]) || !std::isfinite(arc.radiusMM) ||
+    const unsigned component = axisIndex == axes.u ? 0U : 1U;
+    if (!std::isfinite(arc.centerMCS[component]) || !std::isfinite(arc.radiusMM) ||
         arc.radiusMM <= 0.0 || !std::isfinite(arc.startAngle) ||
         !std::isfinite(arc.sweepRadians) || arc.sweepRadians == 0.0) return false;
     const double angle = arc.startAngle + unitParameter * arc.sweepRadians;
-    const double coordinate = arc.centerMCS[axisIndex] + arc.radiusMM *
-        (axisIndex == 0U ? std::cos(angle) : std::sin(angle));
+    const double coordinate = arc.centerMCS[component] + arc.radiusMM *
+        (component == 0U ? std::cos(angle) : std::sin(angle));
     if (!std::isfinite(coordinate)) return false;
     outputMCS = coordinate;
     return true;

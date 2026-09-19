@@ -49,7 +49,8 @@ namespace
 NC_PATH_REPLAY_NOINLINE
 bool NCManager::IsPathCoreReplayConfigurationValid() noexcept
 {
-    if (!IsPathCoreFeedConfigurationValid()) return false;
+    // Exact-stop feed can now use other planes; retained replay still cannot.
+    if (CoordSys.activePlane != 17 || !IsPathCoreFeedConfigurationValid()) return false;
     for (std::size_t i = 0U; i < 8U; ++i)
     {
         const double& modulo = m_motion.GetAxisContext(static_cast<int>(i)).rotaryModulo;
@@ -173,6 +174,8 @@ void NCManager::BeginPathCoreReplayCaptureSameThread(const NCBlock& block, NCBlo
     const bool feed = NCGCodeSemantics::Contains(block, 1) ||
         NCGCodeSemantics::Contains(block, 2) || NCGCodeSemantics::Contains(block, 3);
     if (m_pathReplay.pending) return; // Execute's guard rejects without erasing a live receipt.
+    // Native positioning clears history only after transactional admission.
+    if (NCGCodeSemantics::Contains(block, 53)) return;
     if (replay)
     {
         ClosePathCoreCommittedRunSameThread();
@@ -224,6 +227,9 @@ void NCManager::BeginPathCoreReplayCaptureSameThread(const NCBlock& block, NCBlo
 NC_PATH_REPLAY_NOINLINE
 void NCManager::RetainPathCoreFeedSameThread() noexcept
 {
+    // Never publish an isolated line while neighbouring non-XY circles are
+    // intentionally absent from the old G17 retained store.
+    if (CoordSys.activePlane != 17) return;
     if (!m_pathReplay.armed || m_pathReplayStore.Fault() != NCPathCoreRetainedFault::NONE) return;
     if (!m_pathFeed.bound || !m_pathFeed.completed || !m_pathFeed.consumerAccepted ||
         (!m_pathFeedMotion.receipt.line.point && !m_pathFeed.consumerStarted) ||
@@ -243,6 +249,8 @@ void NCManager::RetainPathCoreFeedSameThread() noexcept
 NC_PATH_REPLAY_NOINLINE
 void NCManager::RetainPathCoreArcSameThread() noexcept
 {
+    // Do not let a future caller inject a non-XY arc into the old XY store.
+    if (m_pathArcMotion.receipt.arc.plane != 17U) return;
     if (!m_pathReplay.armed || m_pathReplayStore.Fault() != NCPathCoreRetainedFault::NONE) return;
     if (!m_pathArc.bound || !m_pathArc.completed || !m_pathArc.consumerAccepted || !m_pathArc.consumerStarted ||
         !m_pathArcMotion.receipt.valid ||

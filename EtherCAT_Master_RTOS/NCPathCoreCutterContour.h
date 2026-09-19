@@ -24,7 +24,8 @@ enum class NCPathCoreCutterContourCode : unsigned char
     FULL_CIRCLE = 18U, ARC_RADIUS_COLLAPSE = 19U,
     JUNCTION_MISMATCH = 20U, NO_INTERSECTION = 21U,
     AMBIGUOUS_INTERSECTION = 22U, NEXT_ARC_CONSUMED = 23U,
-    TRIMMED_ARC_REVERSED = 24U
+    TRIMMED_ARC_REVERSED = 24U,
+    FULL_CIRCLE_SCOPE = 25U, FULL_CIRCLE_SEAM = 26U
 };
 
 struct NCPathCoreCutterPrimitive
@@ -34,6 +35,10 @@ struct NCPathCoreCutterPrimitive
     double end[2] = {};
     double centre[2] = {};
     bool clockwise = false;
+    // BASE-PLANE-10: explicit NC-owned authored-endpoint proof. The legacy
+    // builder does not infer a full revolution from a short/rounded chord.
+    // Only the opt-in seam-circle builder below accepts this marker.
+    bool fullCircle = false;
 };
 struct NCPathCoreCutterContourInput
 {
@@ -194,6 +199,7 @@ inline NCPathCoreCutterContourCode BuildNCPathCoreCutterContour(
     using namespace NCPathCoreCutterContourDetail;
     output = NCPathCoreCutterContourOutput{};
     const auto fail = [&output](Code code) noexcept { output.reason = code; return code; };
+    if (input.current.fullCircle || input.next.fullCircle) return fail(Code::FULL_CIRCLE);
     double magnitude = 0.0;
     const NCPathCoreCutterPrimitive* primitives[2] = { &input.current, &input.next };
     for (unsigned i = 0U; i < 2U; ++i)
@@ -384,3 +390,135 @@ static_assert(std::is_standard_layout<NCPathCoreCutterContourInput>::value &&
     std::is_standard_layout<NCPathCoreCutterContourOutput>::value &&
     std::is_trivially_copyable<NCPathCoreCutterContourOutput>::value,
     "Cutter contour inputs and output must remain bounded copyable values.");
+
+
+// BASE-PLANE-10: an untrimmed, one-revolution IJK circle with a proved seam.
+// Opt-in only. NC must prove the two authored endpoint values equal the prior
+// nominal endpoint values BEFORE affine rounding, and keep this marker in its
+// immutable lookahead identity. Native coincidence alone grants no revolution.
+// A full circle must be preceded by a forward tangent LINE; its successor is
+// either a forward tangent LINE or a separately validated G40 + linear lead-out.
+// No circle/circle, corner intersection, trimming, repeated-turn or arc entry
+// is admitted in this bounded extension. The old partial-arc builder is used
+// unchanged for every input without an explicit circle marker.
+inline NCPathCoreCutterContourCode BuildNCPathCoreCutterSeamCircle(
+    const NCPathCoreCutterContourInput& input, NCPathCoreCutterContourOutput& output) noexcept
+{
+    using namespace NCPathCoreCutterContourDetail;
+    if (!input.current.fullCircle && !input.next.fullCircle)
+        return BuildNCPathCoreCutterContour(input, output);
+    output = NCPathCoreCutterContourOutput{};
+    const auto fail = [&output](Code code) noexcept { output.reason = code; return code; };
+    const bool full = input.current.fullCircle;
+    if ((input.next.fullCircle && !input.hasNext) ||
+        (full && (input.current.kind != NCPathCoreCutterPrimitiveKind::ARC || input.entry ||
+            (input.hasNext && input.next.kind != NCPathCoreCutterPrimitiveKind::LINE))) ||
+        (!full && (input.current.kind != NCPathCoreCutterPrimitiveKind::LINE ||
+            input.next.kind != NCPathCoreCutterPrimitiveKind::ARC)) ||
+        (full && input.next.fullCircle)) return fail(Code::FULL_CIRCLE_SCOPE);
+
+    double magnitude = 0.0;
+    const NCPathCoreCutterPrimitive* primitives[2] = { &input.current, &input.next };
+    for (unsigned i = 0U; i < 2U; ++i)
+    {
+        const NCPathCoreCutterPrimitive& q = *primitives[i];
+        if (q.kind != NCPathCoreCutterPrimitiveKind::LINE && q.kind != NCPathCoreCutterPrimitiveKind::ARC)
+            return fail(Code::INVALID_PRIMITIVE);
+        const double* points[3] = { q.start, q.end, q.centre };
+        for (unsigned j = 0U; j < 3U; ++j)
+            for (unsigned axis = 0U; axis < 2U; ++axis)
+            {
+                const double value = points[j][axis];
+                if (!std::isfinite(value)) return fail(Code::NONFINITE_INPUT);
+                if ((i == 0U || input.hasNext) && (j != 2U || q.kind == NCPathCoreCutterPrimitiveKind::ARC) &&
+                    std::fabs(value) > magnitude) magnitude = std::fabs(value);
+            }
+    }
+    for (unsigned i = 0U; i < 2U; ++i)
+    {
+        if (!std::isfinite(input.actualStart[i])) return fail(Code::NONFINITE_INPUT);
+        if (std::fabs(input.actualStart[i]) > magnitude) magnitude = std::fabs(input.actualStart[i]);
+    }
+    if (!std::isfinite(input.signedRadius)) return fail(Code::NONFINITE_INPUT);
+    const double radius = std::fabs(input.signedRadius);
+    if (radius == 0.0) return fail(Code::INVALID_RADIUS);
+    if (radius > magnitude) magnitude = radius;
+    const double budget = 64.0 * std::numeric_limits<double>::epsilon() * magnitude;
+    if (!std::isfinite(budget) || radius <= budget) return fail(Code::PRECISION_BUDGET);
+    if (input.hasNext && Distance(input.current.end, input.next.start) > budget)
+        return fail(Code::JUNCTION_MISMATCH);
+
+    const NCPathCoreCutterPrimitive& circle = full ? input.current : input.next;
+    // A tiny nonzero chord stays a partial arc (or a precision rejection), never
+    // a full circle. Copying the original start later preserves all endpoint bits.
+    if (circle.start[0] != circle.end[0] || circle.start[1] != circle.end[1])
+        return fail(Code::FULL_CIRCLE_SCOPE);
+    const double r0 = Distance(circle.start, circle.centre);
+    if (!std::isfinite(r0)) return fail(Code::NONFINITE_GEOMETRY);
+    if (r0 <= budget) return fail(Code::PRECISION_BUDGET);
+    const double direction = circle.clockwise ? -1.0 : 1.0;
+    Curve arc;
+    arc.arc = true; arc.sweep = Tau; arc.radius = r0 - direction * input.signedRadius;
+    if (!std::isfinite(arc.radius)) return fail(Code::NONFINITE_GEOMETRY);
+    if (arc.radius <= budget) return fail(Code::ARC_RADIUS_COLLAPSE);
+    const double sx = (circle.start[0] - circle.centre[0]) / r0;
+    const double sy = (circle.start[1] - circle.centre[1]) / r0;
+    arc.ux = arc.endTX = -direction * sy;
+    arc.uy = arc.endTY = direction * sx;
+    arc.offsetStart[0] = arc.offsetEnd[0] = circle.centre[0] + arc.radius * sx;
+    arc.offsetStart[1] = arc.offsetEnd[1] = circle.centre[1] + arc.radius * sy;
+    if (!std::isfinite(arc.offsetStart[0]) || !std::isfinite(arc.offsetStart[1]))
+        return fail(Code::NONFINITE_GEOMETRY);
+
+    Curve line;
+    if (!full || input.hasNext)
+    {
+        const Code code = Prepare(full ? input.next : input.current, input.signedRadius, budget, line);
+        if (code != Code::BUILT) return fail(code);
+        const double cross = line.ux * arc.uy - line.uy * arc.ux;
+        const double dot = line.ux * arc.ux + line.uy * arc.uy;
+        const double span = line.length > r0 ? line.length : r0;
+        const double* lineSeam = full ? line.offsetStart : line.offsetEnd;
+        if (!std::isfinite(cross) || !std::isfinite(dot) || dot <= 0.0 ||
+            (std::fabs(cross) > 64.0 * std::numeric_limits<double>::epsilon() &&
+                std::fabs(cross) * span > budget) ||
+            Distance(lineSeam, arc.offsetStart) > budget)
+            return fail(Code::FULL_CIRCLE_SEAM);
+    }
+    if (full)
+    {
+        if (Distance(input.actualStart, arc.offsetStart) > budget ||
+            std::fabs(Distance(input.actualStart, circle.centre) - arc.radius) > budget)
+            return fail(Code::OFFSET_BASELINE_MISMATCH);
+        // Do not re-spell the seam from a trig result, the circle centre, or the
+        // successor's offset formula. Full-circle MCS and pulse endpoints must
+        // remain identical to their accepted physical start, including sign bits.
+        output.endpoint[0] = input.actualStart[0]; output.endpoint[1] = input.actualStart[1];
+        output.centre[0] = circle.centre[0]; output.centre[1] = circle.centre[1];
+        output.radius = arc.radius; output.sweepRadians = Tau;
+    }
+    else
+    {
+        if (input.entry)
+        {
+            if (Distance(input.actualStart, input.current.start) > budget)
+                return fail(Code::ENTRY_BASELINE_MISMATCH);
+            if (line.length - radius <= budget) return fail(Code::ENTRY_TOO_SHORT);
+        }
+        else
+        {
+            const double dx = input.actualStart[0] - input.current.start[0];
+            const double dy = input.actualStart[1] - input.current.start[1];
+            const double residual = -line.uy * dx + line.ux * dy - input.signedRadius;
+            if (!std::isfinite(residual)) return fail(Code::NONFINITE_GEOMETRY);
+            if (std::fabs(residual) > budget) return fail(Code::OFFSET_BASELINE_MISMATCH);
+        }
+        const double forward = (line.offsetEnd[0] - input.actualStart[0]) * line.ux +
+            (line.offsetEnd[1] - input.actualStart[1]) * line.uy;
+        if (!std::isfinite(forward)) return fail(Code::NONFINITE_GEOMETRY);
+        if (forward <= budget) return fail(Code::TRIMMED_LINE_REVERSED);
+        // Reuse the tangent line's spelling before publishing either segment.
+        output.endpoint[0] = line.offsetEnd[0]; output.endpoint[1] = line.offsetEnd[1];
+    }
+    output.reason = Code::BUILT; output.valid = true; return output.reason;
+}

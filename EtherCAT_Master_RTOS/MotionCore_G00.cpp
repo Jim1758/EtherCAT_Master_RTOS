@@ -190,7 +190,8 @@ bool MotionCore::TryG00MoveInternal(
     double* commandedMCSTail,
     bool transactionalTail,
     MotionCommandedEndpointReceiptV1* commandedEndpointReceipt,
-    bool requirePlanarBaselineMatch)
+    bool requirePlanarBaselineMatch,
+    bool useG53Profile)
 {
     // BQ: every invocation starts unpublished, including every rejection path.
     if (commandedEndpointReceipt != nullptr)
@@ -305,6 +306,37 @@ bool MotionCore::TryG00MoveInternal(
             true,
             true,
             MotionRejectReason::INVALID_GEOMETRY);
+    }
+
+    // BASE-PLANE-3: a mismatched G17 tag must not downgrade a non-XY
+    // frozen source into the legacy rapid lane before source rejection.
+    const bool basePlaneLinear = m_pendingPlaneMode != 17 ||
+        (!IsNCTranslationSnapshotEmpty(m_pendingTranslation) && m_pendingTranslation.rotationPlane != 17);
+    if (basePlaneLinear && (commandSource != MotionCommandSource::NC_MEMORY ||
+        !transactionalTail || useG53Profile || !IsNCTranslationSnapshotValid(m_pendingTranslation) ||
+        !IsPendingFixedTranslationSourceAllowed() || !IsNCTranslationBaseArcPlaneFrame(m_pendingTranslation) ||
+        m_pendingPlaneMode != m_pendingTranslation.rotationPlane ||
+        !IsNCNativeXYZLinearMapping(static_cast<int>(axes.size()), axes.data()) ||
+        plannedTailOwnerLease.owner != MotionOwner::AUTO || mode != BufferMode::ABORTING ||
+        commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+        HasPendingSafetyOrRecoveryRequests() || !IsGroupDone() ||
+        GetCommandIngressSize() != 0U || GetCommandReplaySize() != 0U))
+    {
+        return rejectWithoutTailMutation(false, true, MotionRejectReason::NOT_READY);
+    }
+
+    // G53 owns native endpoints and its own dynamics. A frozen descriptor
+    // proves source only; no transform is applied to the machine targets.
+    if (useG53Profile && (mode != BufferMode::ABORTING ||
+        commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+        (commandSource == MotionCommandSource::NC_MEMORY &&
+            (!m_pendingIsAbsoluteMode || m_pendingPlaneMode != 17 ||
+                (!IsNCTranslationSnapshotEmpty(m_pendingTranslation) &&
+                    (!IsPendingFixedTranslationSourceAllowed() ||
+                        CheckG53NativeHandoff(m_pendingTranslation, plannedTailEpoch, plannedTailOwnerLease) !=
+                            MotionNCTranslationTransitionResult::ACCEPTED))))))
+    {
+        return rejectWithoutTailMutation(false, true, MotionRejectReason::NOT_READY);
     }
 
     if (mode != BufferMode::BUFFERED &&
@@ -439,7 +471,7 @@ bool MotionCore::TryG00MoveInternal(
                 // rejects stale axes). Consecutive receipt seams stay bit-exact.
                 if (commandSource == MotionCommandSource::NC_MEMORY &&
                     (NCTranslationHasPlanarRotation(m_pendingTranslation) ||
-                        m_pendingTranslation.distanceMode == 91) &&
+                        m_pendingTranslation.distanceMode == 91 || basePlaneLinear) &&
                     axis.axisType == AxisType::LINEAR)
                 {
                     const double pulsePerMM = axis.resolution_PPR / axis.finalLead;
@@ -478,7 +510,7 @@ bool MotionCore::TryG00MoveInternal(
     const bool incrementalEndpoint = commandSource == MotionCommandSource::NC_MEMORY &&
         m_pendingTranslation.distanceMode == 91;
     std::uint32_t requiredBaselineMask = requirePlanarBaselineMatch ? 3U : 0U;
-    if (incrementalEndpoint)
+    if (incrementalEndpoint || basePlaneLinear)
     {
         std::uint32_t selectedMask = 0U;
         for (int axis : axes)
@@ -489,7 +521,7 @@ bool MotionCore::TryG00MoveInternal(
         }
         requiredBaselineMask |= selectedMask;
     }
-    if ((requirePlanarBaselineMatch || incrementalEndpoint) &&
+    if ((requirePlanarBaselineMatch || incrementalEndpoint || basePlaneLinear) &&
         (!transactionalTail || mode != BufferMode::ABORTING ||
             commandPathMode != MotionCommandPathMode::EXACT_STOP ||
             !IsPlanarEndpointBasisCurrent(commandedMCSTail, stagedQueueTailPulse,
@@ -546,12 +578,38 @@ bool MotionCore::TryG00MoveInternal(
                 MotionRejectReason::INVALID_GEOMETRY);
         }
 
+        if (useG53Profile)
+        {
+            if (axis.axisIndex != axisIndex ||
+                (axis.axisType != AxisType::LINEAR && axis.axisType != AxisType::ROTARY &&
+                    axis.axisType != AxisType::ROTARY_CONTINUOUS))
+                return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
+            if (!axis.isHomed)
+            {
+                AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_Homed,
+                    m_pendingSourcePC, axisIndex);
+                return rejectWithoutTailMutation(false, true, MotionRejectReason::NOT_READY);
+            }
+            if (m_pCoordMgr != nullptr &&
+                !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, targetPos_mm[slot]))
+            {
+                AlarmManager::GetInstance().Trigger(m_pCoordMgr->GetSoftwareTravelLimitAlarmCode(
+                    axis, AlarmManager::PROGRAMMED_OVER_TRAVEL), m_pendingSourcePC, axisIndex);
+                return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
+            }
+        }
+        const double axisAccTime = useG53Profile ? axis.G53_acc_time : axis.G00_acc_time;
+        const double axisDecTime = useG53Profile ? axis.G53_dec_time : axis.G00_dec_time;
+        const double axisMaxPPS = useG53Profile ? axis.G53_PPS : axis.G00_PPS;
+        if (useG53Profile && (axisAccTime < 0.0 || axisDecTime < 0.0 || axisMaxPPS <= 0.0))
+            return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
+
         const std::uint32_t axisBit =
             static_cast<std::uint32_t>(1U << axisIndex);
 
-        if (!std::isfinite(axis.G00_acc_time) ||
-            !std::isfinite(axis.G00_dec_time) ||
-            !std::isfinite(axis.G00_PPS) ||
+        if (!std::isfinite(axisAccTime) ||
+            !std::isfinite(axisDecTime) ||
+            !std::isfinite(axisMaxPPS) ||
             !std::isfinite(axis.finalLead) ||
             !std::isfinite(axis.resolution_PPR) ||
             !std::isfinite(
@@ -588,7 +646,14 @@ bool MotionCore::TryG00MoveInternal(
                     const double startPulse =
                         stagedQueueTailPulse[
                             static_cast<std::size_t>(axisIndex)];
-                    double targetPulse = targetPos_mm[slot] * pulsePerUnit;
+                    // BASE-PLANE-3: a coupled selected axis can be exactly
+                    // stationary after G68. Keep its proven native start pulse
+                    // instead of introducing a forward/reverse-conversion ULP.
+                    // G17 and legacy/nontransactional rapid arithmetic is unchanged.
+                    const bool stationaryNative = basePlaneLinear && transactionalTail &&
+                        targetPos_mm[slot] == stagedCommandedMCS[static_cast<std::size_t>(axisIndex)];
+                    double targetPulse = stationaryNative ? startPulse :
+                        targetPos_mm[slot] * pulsePerUnit;
                     if (!std::isfinite(targetPulse))
                     {
                         return rejectWithoutTailMutation(
@@ -643,10 +708,10 @@ bool MotionCore::TryG00MoveInternal(
 
                     groupAccTime = std::max<double>(
                         groupAccTime,
-                        axis.G00_acc_time);
+                        axisAccTime);
                     groupDecTime = std::max<double>(
                         groupDecTime,
-                        axis.G00_dec_time);
+                        axisDecTime);
 
                     const double distancePulse =
                         std::abs(targetPulse - startPulse);
@@ -655,9 +720,9 @@ bool MotionCore::TryG00MoveInternal(
                     sumSquaredUnit += distanceUnit * distanceUnit;
 
                     const double currentAxisMaxPPS =
-                        axis.G00_PPS * rapidOverrideCandidate;
+                        useG53Profile ? axisMaxPPS : axisMaxPPS * rapidOverrideCandidate;
                     if (std::isfinite(currentAxisMaxPPS) &&
-                        currentAxisMaxPPS > 1.0)
+                        currentAxisMaxPPS > (useG53Profile ? 0.0 : 1.0))
                     {
                         maxTimeNeeded = std::max<double>(
                             maxTimeNeeded,
@@ -681,7 +746,11 @@ bool MotionCore::TryG00MoveInternal(
     const double targetFeedrateUnitPerMinute = 5000.0;
     const double targetFeedrateUnitPerSecond =
         targetFeedrateUnitPerMinute / 60.0;
-    if (totalDistanceUnit > 0.0001 &&
+    if (useG53Profile)
+    {
+        if (maxTimeNeeded > 0.0) groupG00VelocityPPS = totalDistancePulse / maxTimeNeeded;
+    }
+    else if (totalDistanceUnit > 0.0001 &&
         targetFeedrateUnitPerSecond > 0.0)
     {
         const double exactTimeNeeded =
@@ -813,6 +882,34 @@ bool MotionCore::TryG00MoveInternal(
         producedOwnerLease))
     {
         return failAcceptedCommit(false);
+    }
+
+    if (useG53Profile && commandSource == MotionCommandSource::NC_MEMORY)
+    {
+        bool captureMatches = false;
+        if (m_programBlockMotionCaptureActive && !m_programBlockMotionCapture.overflow &&
+            m_programBlockMotionCapture.count == 1U)
+        {
+            const MotionProgramBlockSubmission& submission = m_programBlockMotionCapture.submissions[0U];
+            captureMatches = submission.producerAccepted &&
+                submission.immediateRejectReason == MotionRejectReason::NONE &&
+                submission.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+                submission.translationGeneration == m_pendingTranslation.generation &&
+                submission.identity.epoch == producedIdentity.epoch &&
+                submission.identity.segmentId == producedIdentity.segmentId &&
+                submission.identity.sourceBlockId == producedIdentity.sourceBlockId &&
+                submission.identity.source == producedIdentity.source;
+        }
+        if (!IsNCTranslationSnapshotEmpty(m_pendingTranslation) &&
+            (!IsPendingFixedTranslationSourceAllowed() || !MatchesNCTranslation(m_pendingTranslation)))
+            captureMatches = false;
+        if (!captureMatches)
+        {
+            m_g00ProducerQueueTailEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+            m_g00ProducerQueueTailOwnerLease = MotionOwnerLease{};
+            m_g00ProducerQueueTailValidMask = 0U;
+            return failAcceptedCommit(false);
+        }
     }
 
     // ProducerTryPush() is the enqueue linearization point. Everything below

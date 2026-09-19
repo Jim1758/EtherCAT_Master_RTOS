@@ -1,4 +1,5 @@
 #include "MotionCore.h"
+#include "NCTranslationArcPrecision.h"
 
 #include <algorithm>
 #include <cmath>
@@ -33,9 +34,18 @@ namespace
         const std::array<double, 8U>& targetMCS,
         const double* commandedTail,
         MotionFeedArcWorkspace& workspace, const MotionCncPathTail* predecessor,
-        std::uint32_t endpointAxisMask) noexcept
+        std::uint32_t endpointAxisMask,
+        const NCTranslationSnapshot& sourceTranslation) noexcept
     {
         MotionFeedArcReceipt& result = workspace.receipt;
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(workspace.input.plane, plane) || contexts == nullptr ||
+            contexts->size() <= plane.u || contexts->size() <= plane.v)
+        {
+            result.code = MotionFeedArcCode::INVALID_INPUT;
+            return false;
+        }
+        const unsigned planeSlots[2] = { plane.u, plane.v };
         // Sample every existing native command baseline, exactly as BX/G00.
         // logicalCmdPos is already machine-referenced after HOME; do not apply
         // machineCoordinateOffsetPulse again. NC preview already applied WCS.
@@ -109,8 +119,9 @@ namespace
         workspace.input.endPulse = workspace.stagedPulse;
         workspace.accTime = 0.0;
         workspace.decTime = 0.0;
-        for (std::size_t slot = 0U; slot < 2U; ++slot)
+        for (std::size_t component = 0U; component < 2U; ++component)
         {
+            const unsigned slot = planeSlots[component];
             const AxisContext& axis = (*contexts)[slot];
             if ((validMask & (1U << static_cast<unsigned>(slot))) == 0U ||
                 axis.axisType != AxisType::LINEAR ||
@@ -133,7 +144,15 @@ namespace
             if (!workspace.input.fullCircle &&
                 (endpointAxisMask & (1U << static_cast<unsigned>(slot))) != 0U)
             {
-                const double targetPulse = targetMCS[slot] * pulsePerMM;
+                // BASE-PLANE-20: preserve an exactly unchanged native component
+                // selected by planar rotation or G17 polar endpoint expansion.
+                // The other circular component is
+                // still interpolated; no endpoint delta is tolerance-collapsed.
+                const bool stationaryNative = (workspace.input.plane != 17 ||
+                    sourceTranslation.polarMode == 16) &&
+                    targetMCS[slot] == workspace.input.startMCS[slot];
+                const double targetPulse = stationaryNative ? workspace.input.startPulse[slot] :
+                    targetMCS[slot] * pulsePerMM;
                 if (!std::isfinite(targetMCS[slot]) || !std::isfinite(targetPulse))
                 {
                     result.code = MotionFeedArcCode::INVALID_INPUT;
@@ -144,15 +163,25 @@ namespace
                 workspace.stagedMCS[slot] = targetMCS[slot];
                 workspace.stagedPulse[slot] = targetPulse;
             }
-            workspace.input.pulsePerMM[slot] = pulsePerMM;
-            workspace.input.maxVelocityPPS[slot] = axis.maxVel_PPS;
+            workspace.input.pulsePerMM[component] = pulsePerMM;
+            workspace.input.maxVelocityPPS[component] = axis.maxVel_PPS;
             workspace.accTime = (std::max)(workspace.accTime, axis.G00_acc_time);
             workspace.decTime = (std::max)(workspace.decTime, axis.G00_dec_time);
         }
         if (workspace.accTime < 0.001) workspace.accTime = 0.2;
         if (workspace.decTime < 0.001) workspace.decTime = 0.2;
+        // Only the already-authorized frozen source can supply cancellation
+        // roundoff. Empty native callers retain the strict original budget.
+        float sourceRoundoffMM = 0.0F;
+        if (!IsNCTranslationSnapshotEmpty(sourceTranslation) &&
+            !TryGetNCTranslationArcRoundoffMM(sourceTranslation, sourceRoundoffMM, workspace.input.fullCircle))
+        {
+            result.geometryCode = static_cast<std::uint32_t>(NCPathCoreFeedArcCode::PRECISION_BUDGET);
+            result.code = MotionFeedArcCode::GEOMETRY_REJECTED;
+            return false;
+        }
         result.geometryCode = static_cast<std::uint32_t>(
-            BuildNCPathCoreFeedArc(workspace.input, result.arc));
+            BuildNCPathCoreFeedArc(workspace.input, result.arc, sourceRoundoffMM));
         if (!result.arc.valid || result.arc.velocityPPS < 1.0 ||
             !std::isfinite(result.arc.velocityPPS / workspace.accTime) ||
             !std::isfinite(result.arc.velocityPPS / workspace.decTime))
@@ -172,18 +201,7 @@ namespace
         std::memset(static_cast<void*>(&command), 0, sizeof(command));
         command.execution.sourceBlockId = MOTION_SOURCE_BLOCK_ID_INVALID;
         command.sourceWCS = 54;
-        command.sourceTranslation.schema = 11U;
-        command.sourceTranslation.storedStrokeMode = 23;
-        command.sourceTranslation.cutterMode = 40;
-        command.sourceTranslation.polarMode = 15;
-        command.sourceTranslation.scalingMode = 50;
-        command.sourceTranslation.scalingFactor = 1.0;
-        command.sourceTranslation.distanceMode = 90;
-        command.sourceTranslation.unitsMode = 21;
-        command.sourceTranslation.toolLengthMode = 49;
-        command.sourceTranslation.workMode = 169;
-        command.sourceTranslation.rotationMode = 69;
-        command.sourceTranslation.rotationPlane = 17;
+        command.sourceTranslation = NCTranslationSnapshot{};
         command.sourceToolLengthMode = 49;
         command.sourceToolRadiusMode = 40;
         command.sourceIsAbsoluteMode = true;
@@ -249,6 +267,13 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     static_assert(MAX_AXES == 8, "BY fixed workspace must match Motion axes.");
     MotionFeedArcReceipt& result = workspace.receipt;
     result.Clear();
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(m_pendingPlaneMode, plane))
+    {
+        result.code = MotionFeedArcCode::INVALID_INPUT;
+        return false;
+    }
+    workspace.input.plane = static_cast<std::uint8_t>(m_pendingPlaneMode);
     workspace.input.feedMMMin = feedMMMin;
     workspace.input.centerOffsetMM = centerOffsetMM;
     workspace.input.direction = direction;
@@ -261,31 +286,62 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
         m_pendingCommandSource.load(std::memory_order_acquire);
     const bool cutterActive = m_pendingTranslation.cutterMode != 40;
     if (!IsPendingFixedTranslationSourceAllowed() ||
+        (m_pendingPlaneMode != 17 && (IsNCTranslationSnapshotEmpty(m_pendingTranslation) ||
+            !IsNCTranslationBaseArcPlaneFrame(m_pendingTranslation) ||
+            cncFeedLookahead || predecessor != nullptr)) ||
         preparedCutterArc != cutterActive ||
-        (cutterActive && (cncFeedLookahead || predecessor != nullptr || fullCircle ||
-            endpointAxisMask != 3U || !requirePlanarBaselineMatch ||
-            m_pendingTranslation.distanceMode != 90 || !m_pendingIsAbsoluteMode ||
-            m_pendingPlaneMode != 17 || m_pendingG16Active || m_pendingG162Active)) ||
+        (cutterActive && (cncFeedLookahead || predecessor != nullptr ||
+            !IsNCTranslationCutterArcNotationAllowed(m_pendingPlaneMode, m_pendingTranslation.distanceMode,
+                m_pendingTranslation.polarMode, fullCircle) ||
+            endpointAxisMask != plane.mask || !requirePlanarBaselineMatch ||
+            !IsNCTranslationCutterDistanceModeAllowed(m_pendingPlaneMode, m_pendingTranslation.distanceMode) ||
+            m_pendingIsAbsoluteMode != (m_pendingTranslation.distanceMode == 90) ||
+            m_pendingG16Active != (m_pendingTranslation.polarMode == 16) || m_pendingG162Active)) ||
         (cncFeedLookahead && (m_pendingTranslation.distanceMode != 90 ||
             !m_pendingIsAbsoluteMode || m_pendingPlaneMode != 17 || m_pendingG162Active)) ||
-        m_pContexts == nullptr || m_pContexts->size() < 2U ||
+        m_pContexts == nullptr || m_pContexts->size() <= plane.u || m_pContexts->size() <= plane.v ||
         m_pContexts->size() > 8U || travelGuard.check == nullptr ||
         !std::isfinite(feedMMMin) || feedMMMin <= 0.0 || feedMMMin > 100.0 ||
         (direction != -1 && direction != 1) ||
-        (fullCircle ? (endpointAxisMask != 0U && endpointAxisMask != 3U) :
-            (endpointAxisMask == 0U || endpointAxisMask > 3U)) ||
+        (fullCircle ? (endpointAxisMask != 0U && endpointAxisMask != plane.mask) :
+            (endpointAxisMask == 0U || (endpointAxisMask & ~plane.mask) != 0U)) ||
         !std::isfinite(centerOffsetMM[0]) || !std::isfinite(centerOffsetMM[1]))
     {
         result.code = MotionFeedArcCode::INVALID_INPUT;
         return false;
     }
-    // A prepared XY circle may never hide a Z or auxiliary-axis endpoint.
-    // XYZ is the bounded contour scope; all other axes retain their source tail.
+    // A prepared canonical circle may never hide a normal or auxiliary-axis
+    // endpoint. Its packet order is u/v, not ascending physical XYZ slots.
+    // G17 retains the established numeric test; new planes additionally
+    // retain the bit-exact unselected-axis test immediately below.
     if (cutterActive)
     {
-        for (std::size_t slot = 2U; slot < 8U; ++slot)
+        for (std::size_t slot = 0U; slot < 8U; ++slot)
         {
+            // Full circles cannot discard a supplied target and silently
+            // reinterpret it as the sampled start. Check it before preparing
+            // geometry, publishing an epoch, or changing any queue/tail.
+            if (fullCircle && (std::memcmp(&targetMCS[slot], &commandedMCSTail[slot], sizeof(double)) != 0))
+            {
+                result.code = MotionFeedArcCode::INVALID_INPUT;
+                return false;
+            }
+            if (slot == plane.u || slot == plane.v) continue;
             if (!std::isfinite(targetMCS[slot]) || targetMCS[slot] != commandedMCSTail[slot])
+            {
+                result.code = MotionFeedArcCode::INVALID_INPUT;
+                return false;
+            }
+        }
+    }
+    // BASE-PLANE-20: G17 polar exact-stop also proves all unselected XYZ.
+    if (m_pendingPlaneMode != 17 || (m_pendingG16Active && !cncFeedLookahead))
+    {
+        for (unsigned slot = 0U; slot < 8U; ++slot)
+        {
+            if (slot == plane.u || slot == plane.v) continue;
+            if (!std::isfinite(targetMCS[slot]) ||
+                std::memcmp(&targetMCS[slot], &commandedMCSTail[slot], sizeof(double)) != 0)
             {
                 result.code = MotionFeedArcCode::INVALID_INPUT;
                 return false;
@@ -311,17 +367,17 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
         return false;
     }
     if (!PrepareFeedArcGeometry(m_pContexts, targetMCS, commandedMCSTail,
-        workspace, predecessor, endpointAxisMask))
+        workspace, predecessor, endpointAxisMask, m_pendingTranslation))
         return false;
     // A first rotated/dependent endpoint is tied to the sampled native basis.
     // A buffered arc already proved its accepted predecessor tuple above;
     // PrepareFeedArcGeometry preserves that canonical MCS/pulse tail, while
     // live axes may still be moving on an earlier queued segment.
-    if ((requirePlanarBaselineMatch ||
+    if ((m_pendingPlaneMode != 17 || requirePlanarBaselineMatch ||
             (cncFeedLookahead && NCTranslationHasPlanarRotation(m_pendingTranslation)) ||
             m_pendingTranslation.distanceMode == 91) && !buffered &&
         !IsPlanarEndpointBasisCurrent(commandedMCSTail,
-            workspace.input.startPulse, result.validAxisMask, cutterActive ? 7U : 3U))
+            workspace.input.startPulse, result.validAxisMask, (cutterActive || m_pendingPlaneMode != 17 || m_pendingG16Active) ? 7U : plane.mask))
     {
         result.code = MotionFeedArcCode::NOT_READY;
         return false;
@@ -342,8 +398,9 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     for (int axis = 0; axis < 2; ++axis)
     {
         const std::size_t slot = static_cast<std::size_t>(axis);
-        if (!travelGuard.check(travelGuard.context, axis, result.arc.boundsMinMCS[slot]) ||
-            !travelGuard.check(travelGuard.context, axis, result.arc.boundsMaxMCS[slot]))
+        const int physicalAxis = static_cast<int>(axis == 0 ? plane.u : plane.v);
+        if (!travelGuard.check(travelGuard.context, physicalAxis, result.arc.boundsMinMCS[slot]) ||
+            !travelGuard.check(travelGuard.context, physicalAxis, result.arc.boundsMaxMCS[slot]))
         {
             result.travelLimitRejected = true;
             result.code = MotionFeedArcCode::GEOMETRY_REJECTED;
@@ -351,14 +408,27 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
         }
     }
 
+    // BASE-PLANE-20: a stationary normal is part of the full XYZ path
+    // for ALL polar circles as well as new-plane prepared cutter circles.
+    // Use the existing HOME/Limit1/2/3 policy. This also closes the same
+    // normal-axis gap for earlier G16 IJK arcs; their geometry is unchanged.
+    if (((cutterActive && m_pendingPlaneMode != 17) || m_pendingG16Active) &&
+        !travelGuard.check(travelGuard.context, static_cast<int>(plane.normal),
+            result.arc.startMCS[plane.normal]))
+    {
+        result.travelLimitRejected = true;
+        result.code = MotionFeedArcCode::GEOMETRY_REJECTED;
+        return false;
+    }
+
     MotionCommand& cmd = commandWorkspace;
     ClearFeedArcCommand(cmd);
     cmd.mode = direction == 1 ? InterpolationMode::CIRCULAR_CCW : InterpolationMode::CIRCULAR_CW;
     cmd.axisCount = 2;
-    cmd.axisIndices[0] = 0;
-    cmd.axisIndices[1] = 1;
-    cmd.targetPos[0] = result.arc.endPulse[0];
-    cmd.targetPos[1] = result.arc.endPulse[1];
+    cmd.axisIndices[0] = static_cast<int>(plane.u);
+    cmd.axisIndices[1] = static_cast<int>(plane.v);
+    cmd.targetPos[0] = result.arc.endPulse[plane.u];
+    cmd.targetPos[1] = result.arc.endPulse[plane.v];
     cmd.centerPos[0] = result.arc.centerPulse[0];
     cmd.centerPos[1] = result.arc.centerPulse[1];
     cmd.startRadius = result.arc.radiusPulse;
@@ -371,8 +441,9 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     cmd.cncFeedLookahead = cncFeedLookahead;
     if (cncFeedLookahead || cutterActive)
     {
-        // Prepared cutter circles freeze XYZ start pulses as a read-only proof.
-        // Their native curve is resolved again at the consumer before loading.
+        // Prepared cutter circles freeze PHYSICAL XYZ start pulses as a
+        // read-only proof. Targets/centres are canonical packet u/v slots;
+        // the consumer must map between them before resolving/loading.
         for (std::size_t i = 0U; i < (cutterActive ? 3U : 2U); ++i)
             cmd.mem_startPos[i] = result.arc.startPulse[i];
         cmd.mem_radius = result.arc.radiusPulse;

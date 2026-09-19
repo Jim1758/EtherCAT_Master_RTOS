@@ -42,7 +42,8 @@ namespace
         const double* commandedTail,
         MotionFeedLineWorkspace& workspace,
         const MotionCncPathTail* predecessor = nullptr,
-        std::uint32_t endpointAxisMask = 0U) noexcept
+        std::uint32_t endpointAxisMask = 0U,
+        bool preserveStationaryNativePulse = false) noexcept
     {
         MotionFeedLineReceipt& result = workspace.receipt;
         // Rebuild the ABORTING successor baseline for every existing axis.
@@ -156,9 +157,16 @@ namespace
             const double pulsePerMM = axis.resolution_PPR / axis.finalLead;
             // The omitted endpoint keeps native sampled/committed bits. Its
             // absent payload is never read or converted through MCS arithmetic.
-            const double targetPulse = programmed ? targetMCS[index] * pulsePerMM :
-                workspace.input.startPulse[slot];
             const double target = programmed ? targetMCS[index] : workspace.input.startMCS[slot];
+            // BASE-PLANE-3: rotation can select a coupled axis whose native
+            // endpoint is exactly unchanged. Preserve the sampled pulse in
+            // that case, including a baseline obtained by pulse*lead/PPR.
+            // This is exact equality, not an epsilon or a drift correction;
+            // the independent native-start proof still runs before dispatch.
+            const bool stationaryNative = preserveStationaryNativePulse &&
+                target == workspace.input.startMCS[slot];
+            const double targetPulse = programmed && !stationaryNative ?
+                targetMCS[index] * pulsePerMM : workspace.input.startPulse[slot];
             if (!std::isfinite(pulsePerMM) || pulsePerMM <= 0.0 ||
                 !std::isfinite(targetPulse))
             {
@@ -277,16 +285,27 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
         m_pendingCommandSource.load(std::memory_order_acquire);
     // G16 sparse radius/angle depends on the same accepted XY predecessor as
     // rotated Cartesian endpoints, even when G68 and WORK yaw are both zero.
+    const bool basePlaneLinear = m_pendingPlaneMode != 17;
     const bool cutterActive = m_pendingTranslation.cutterMode != 40;
+    NCArcPlaneAxes cutterPlane{};
+    const bool cutterPlaneValid = TryGetNCArcPlaneAxes(m_pendingPlaneMode, cutterPlane);
     const bool coupledPlanarEndpoint = NCTranslationHasPlanarRotation(m_pendingTranslation) ||
         m_pendingTranslation.polarMode == 16;
     const bool coupledPlanarQueuedLine = coupledPlanarEndpoint && cncFeedLookahead;
     if (!IsPendingFixedTranslationSourceAllowed() ||
+        (basePlaneLinear && (!IsNCTranslationSnapshotValid(m_pendingTranslation) ||
+            !IsNCTranslationBaseArcPlaneFrame(m_pendingTranslation) ||
+            m_pendingPlaneMode != m_pendingTranslation.rotationPlane ||
+            !IsNCNativeXYZLinearMapping(static_cast<int>(axes.size()), axes.data()) ||
+            cncFeedLookahead || predecessor != nullptr || cornerNextMCS != nullptr ||
+            cornerToleranceMM != 0.0 || cornerTravelGuard != nullptr || cornerNextFeedMMMin != 0.0 ||
+            (!cutterActive && (endpointAxisMask != 0U || requirePlanarBaselineMatch)))) ||
         (cutterActive && (cncFeedLookahead || predecessor != nullptr ||
             cornerNextMCS != nullptr || cornerToleranceMM != 0.0 ||
             cornerTravelGuard != nullptr || cornerNextFeedMMMin != 0.0 ||
-            axes.size() != 2U || axes[0] != 0 || axes[1] != 1 ||
-            endpointAxisMask != 3U || !requirePlanarBaselineMatch)) ||
+            !cutterPlaneValid || !IsNCPlaneLinearPairMapping(m_pendingPlaneMode,
+                static_cast<int>(axes.size()), axes.data()) ||
+            endpointAxisMask != cutterPlane.mask || !requirePlanarBaselineMatch)) ||
         (m_pendingTranslation.distanceMode == 91 &&
             (cncFeedLookahead || cornerNextMCS != nullptr)) ||
         (coupledPlanarEndpoint && cornerNextMCS != nullptr && !cncFeedLookahead) ||
@@ -340,21 +359,24 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     }
 
     if (!PrepareFeedLineGeometry(m_pContexts, axes, targetMCS,
-        commandedMCSTail, workspace, predecessor, endpointAxisMask))
+        commandedMCSTail, workspace, predecessor, endpointAxisMask, basePlaneLinear))
     {
         return false;
     }
 
     const bool incrementalEndpoint = m_pendingTranslation.distanceMode == 91;
     const std::uint32_t requiredBaselineMask =
-        ((requirePlanarBaselineMatch || coupledPlanarQueuedLine) ? 3U : 0U) |
-        (incrementalEndpoint ? workspace.input.axisMask : 0U);
+        ((requirePlanarBaselineMatch || coupledPlanarQueuedLine) ?
+            (basePlaneLinear && cutterActive ? 7U : 3U) : 0U) |
+        ((incrementalEndpoint || basePlaneLinear) ? workspace.input.axisMask : 0U);
     // A first coupled XY plain/Q line proves the sampled native basis used by geometry.
     // A buffered line already proved its immutable accepted predecessor above;
     // live axes can still be inside an earlier segment and must not replace it.
-    if (((requirePlanarBaselineMatch || incrementalEndpoint) &&
+    // New-plane straight envelopes were checked at both native endpoints
+    // by NC. Prove that same sampled start even for absolute sparse G00/G01.
+    if (((requirePlanarBaselineMatch || incrementalEndpoint || basePlaneLinear) &&
             !coupledPlanarQueuedLine && (buffered || cncFeedLookahead)) ||
-        ((requirePlanarBaselineMatch || coupledPlanarQueuedLine || incrementalEndpoint) && !buffered &&
+        ((requirePlanarBaselineMatch || coupledPlanarQueuedLine || incrementalEndpoint || basePlaneLinear) && !buffered &&
             !IsPlanarEndpointBasisCurrent(commandedMCSTail,
                 workspace.input.startPulse, result.validAxisMask, requiredBaselineMask)))
     {

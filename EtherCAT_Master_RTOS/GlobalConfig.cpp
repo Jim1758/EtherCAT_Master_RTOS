@@ -12,6 +12,8 @@
 #include "SHMManager.h" 
 #include "NCManager.h" 
 #include "HomePersistenceManager.h"
+#include "NCElectrodeRotationConfig.h"
+#include "AlarmManager.h"
 #include <cmath>
 
 bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisContext>& axis, MotionCore& motion)
@@ -390,6 +392,30 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
 
 bool GlobalConfig::LoadNCConfig(const std::string& filePath, std::vector<AxisContext>& axis, MotionCore& motion, NCManager* nc)
 {
+    // Legacy absent-file defaults remain safe: no electrode axis is inferred.
+    // An opened file must be read and validated completely before any write.
+    int electrodeAxis = 0;
+    std::ifstream config(filePath);
+    NCElectrodeRotationConfig::ParseError error = NCElectrodeRotationConfig::ParseError::None;
+    if (config.is_open() && !NCElectrodeRotationConfig::Read(config, electrodeAxis, error))
+    {
+        RtPrintf("[NC-CONFIG][REJECT] key=ElectrodeRotationAxis reason=%s\n",
+            NCElectrodeRotationConfig::ErrorText(error));
+        if (nc != nullptr)
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+        return false;
+    }
+    if (motion.m_pCoordMgr == nullptr)
+    {
+        RtPrintf("[NC-CONFIG][REJECT] key=ElectrodeRotationAxis reason=COORDINATE_MANAGER_MISSING\n");
+        if (nc != nullptr)
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+        return false;
+    }
+    if (!motion.m_pCoordMgr->ConfigureElectrodeRotationAxis(electrodeAxis, axis, nc))
+        return false; // The coordinate mutation guard supplies the rejection.
+    RtPrintf("[NC-CONFIG][ELECTRODE-ROLE] axis=%d enabled=%d\n", electrodeAxis,
+        motion.m_pCoordMgr->isCAxisOffsetRotationEnabled ? 1 : 0);
 
     //第一軟體極限保護G22 G23 啟動時預設 0為G23 1為G22
     bool programmableTravelLimitEnabled = (ConfigUtil::ReadParam(filePath, "ProgrammableTravelLimitEnabled", 0.0) == 1.0);
@@ -1090,7 +1116,7 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
     if (!GlobalConfig::GetInstance().LoadNCConfig(NCConfigPath, master.m_Axes, master.m_Motion, master.m_NC))
     {
         DEBUG_PRINT("LoadConfig Error！>>NCConfig.txt\n");
-        return -1;
+        return false;
     }
 
     //載入Home設定

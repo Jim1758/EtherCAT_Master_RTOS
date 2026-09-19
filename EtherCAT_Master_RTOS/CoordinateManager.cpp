@@ -9,6 +9,30 @@
 #include "GlobalConfig.h"
 #include "EtherCatMaster.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
+
+namespace
+{
+bool TryGetFixedWorkPlaneAngle(const std::vector<double>& row, int plane,
+    double& angle) noexcept
+{
+    angle = 0.0;
+    if (row.size() != 8U || !IsNCArcPlaneCode(plane)) return false;
+    const unsigned selected = plane == 18 ? CoordinateManager::WO_ANGLE_XZ_PITCH :
+        (plane == 19 ? CoordinateManager::WO_ANGLE_YZ_ROLL :
+            CoordinateManager::WO_ANGLE_XY_YAW);
+    for (unsigned field = CoordinateManager::WO_ANGLE_XY_YAW;
+        field <= CoordinateManager::WO_ANGLE_YZ_ROLL; ++field)
+    {
+        if (!std::isfinite(row[field]) || std::fabs(row[field]) > 360.0) return false;
+        if (field != selected && row[field] != 0.0) return false;
+    }
+    if (row[CoordinateManager::WO_RESERVED_6] != 0.0 ||
+        row[CoordinateManager::WO_RESERVED_7] != 0.0) return false;
+    angle = row[selected];
+    return true;
+}
+}
+
 CoordinateManager::CoordinateManager()
 {
     // 初始化表格大小 (8軸)
@@ -28,12 +52,114 @@ CoordinateManager::CoordinateManager()
 
 }
 
-bool CoordinateManager::BeginTranslationRun(std::uint64_t runToken) noexcept
+bool CoordinateManager::ConfigureElectrodeRotationAxis(int oneBasedAxis,
+    const std::vector<AxisContext>& axes, NCManager* nc)
+{
+    // This setting is immutable after startup, including unchanged requests.
+    // RESET is a modal reset, never authorization to replace the axis role.
+    if (m_electrodeRotationConfigured || m_translationRunToken != 0ULL ||
+        m_translationFrozen || m_translationResetBypass ||
+        m_translationGenerationCounter != 0ULL ||
+        (nc != nullptr && nc->GetState() != NCState::IDLE))
+        return RejectCoordinateMutation("ELECTRODE_ROLE", "STARTUP_ONLY", nc, true);
+    if (oneBasedAxis != 0 && (oneBasedAxis < 4 || oneBasedAxis > 8))
+        return RejectCoordinateMutation("ELECTRODE_ROLE", "AXIS_NUMBER", nc, true);
+    const int index = oneBasedAxis == 0 ? -1 : oneBasedAxis - 1;
+    int type = -1;
+    if (index >= 0)
+    {
+        if (static_cast<std::size_t>(index) >= axes.size() ||
+            !axes[index].isExist || axes[index].axisIndex != index ||
+            (axes[index].axisType != AxisType::ROTARY &&
+             axes[index].axisType != AxisType::ROTARY_CONTINUOUS))
+            return RejectCoordinateMutation("ELECTRODE_ROLE", "EXISTING_ROTARY_AXIS_REQUIRED", nc, true);
+        type = static_cast<int>(axes[index].axisType);
+    }
+    if (!GuardCoordinateMutation("ELECTRODE_ROLE", nc)) return false;
+    m_electrodeRotationAxes = &axes;
+    m_translationAxisSource = nc;
+    m_electrodeRotationAxisIndex = index;
+    m_electrodeRotationAxisType = type;
+    m_electrodeRotationConfigured = true;
+    return true;
+}
+
+int CoordinateManager::GetElectrodeRotationAxisIndex() const noexcept
+{
+    const int index = m_electrodeRotationAxisIndex;
+    if (!m_electrodeRotationConfigured || index < 3 || index >= 8 ||
+        m_electrodeRotationAxes == nullptr ||
+        static_cast<std::size_t>(index) >= m_electrodeRotationAxes->size()) return -1;
+    const AxisContext& axis = (*m_electrodeRotationAxes)[index];
+    if (!axis.isExist || axis.axisIndex != index ||
+        static_cast<int>(axis.axisType) != m_electrodeRotationAxisType ||
+        (axis.axisType != AxisType::ROTARY &&
+         axis.axisType != AxisType::ROTARY_CONTINUOUS)) return -1;
+    return index;
+}
+
+// Native rotary coordinates are degrees. No unit conversion, WCS subtraction,
+// angle wrapping, or configured letter lookup belongs at this read boundary.
+double CoordinateManager::GetElectrodeRotationAngleMCS(const double* nativeMCS) const noexcept
+{
+    const int index = GetElectrodeRotationAxisIndex();
+    if (nativeMCS == nullptr || index < 0 || !std::isfinite(nativeMCS[index]))
+        return (std::numeric_limits<double>::quiet_NaN)();
+    return nativeMCS[index];
+}
+
+bool CoordinateManager::IsElectrodeOffsetRotationRequested() const noexcept
+{
+    if (!isCAxisOffsetRotationEnabled ||
+        GlobalConfig::GetInstance().systemMode != SystemMode::EDM_SINKER_MODE ||
+        (toolLengthMode != 43 && toolLengthMode != 44)) return false;
+    // A malformed selected H is unsupported too; never let a partial legacy
+    // transform commit NaN values before discovering the invalid table row.
+    if (!IsToolOffsetRowValid(currentHCode, false)) return true;
+    const std::vector<double>& row = m_ToolOffset[currentHCode - 1];
+    return row[0] != 0.0 || row[1] != 0.0;
+}
+
+bool CoordinateManager::TryBuildAxisIdentity(const NCManager* nc,
+    NCAxisIdentitySnapshot& identity) const noexcept
+{
+    if (nc == nullptr || !m_electrodeRotationConfigured ||
+        m_electrodeRotationAxes == nullptr ||
+        (m_electrodeRotationAxisIndex >= 0 && GetElectrodeRotationAxisIndex() < 0)) return false;
+    char addresses[8]{};
+    for (int axis = 0; axis < 8; ++axis)
+    {
+        const char name = nc->GetAxisName(axis);
+        addresses[axis] = name == '?' || name == ' ' ? '\0' : name;
+    }
+    return TryCaptureNCAxisIdentitySnapshot(*m_electrodeRotationAxes, addresses,
+        m_electrodeRotationAxisIndex, static_cast<int>(GlobalConfig::GetInstance().systemMode),
+        isCAxisOffsetRotationEnabled, identity);
+}
+
+bool CoordinateManager::IsTranslationAxisIdentityCurrent() const noexcept
+{
+    if (m_translationRunToken == 0ULL) return false;
+    NCAxisIdentitySnapshot live{};
+    if (!TryBuildAxisIdentity(m_translationAxisSource, live)) return false;
+    NCAxisIdentitySnapshot expected = m_runAxisIdentity;
+    // G162/G163 is a guarded modal selection, not a new physical axis layout.
+    // Once frozen, the full coordinate snapshot also compares this switch.
+    expected.eccentricEnabled = live.eccentricEnabled;
+    return SameNCAxisIdentitySnapshot(live, expected);
+}
+
+bool CoordinateManager::BeginTranslationRun(std::uint64_t runToken, NCManager* nc) noexcept
 {
     if (runToken == 0ULL || m_translationRunToken != 0ULL ||
         m_translationFrozen || m_translationGenerationCounter ==
-            (std::numeric_limits<std::uint64_t>::max)()) return false;
+            (std::numeric_limits<std::uint64_t>::max)() ||
+        (m_translationAxisSource != nullptr && m_translationAxisSource != nc)) return false;
+    NCAxisIdentitySnapshot identity{};
+    if (!TryBuildAxisIdentity(nc, identity)) return false;
     m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationAxisSource = nc;
+    m_runAxisIdentity = identity;
     m_translationRunToken = runToken;
     m_translationGeneration = ++m_translationGenerationCounter;
     m_translationResetBypass = false;
@@ -56,7 +182,10 @@ bool CoordinateManager::IsToolLengthSelectionSupported(int normalizedMode,
     int normalizedH) const noexcept
 {
     if (normalizedMode == 49) return normalizedH == 0;
+    // The bounded XYZ path requires G163 before any active H selection,
+    // even for a zero XY row. Reject here before the selector can be committed.
     return (normalizedMode == 43 || normalizedMode == 44) &&
+        (m_translationRunToken == 0ULL || !isCAxisOffsetRotationEnabled) &&
         IsToolOffsetRowValid(normalizedH, true);
 }
 
@@ -67,9 +196,13 @@ bool CoordinateManager::IsWorkOffsetRowValid(int wCode, bool fixedPlanar) const 
     const std::vector<double>& row = m_WorkOffset[wCode - 1];
     if (row.size() != 8U) return false;
     for (unsigned field = 0U; field < 8U; ++field)
-        if (!std::isfinite(row[field]) ||
-            (fixedPlanar && ((field == 3U && std::fabs(row[field]) > 360.0) ||
-                (field >= 4U && row[field] != 0.0)))) return false;
+        if (!std::isfinite(row[field])) return false;
+    if (fixedPlanar)
+    {
+        for (unsigned field = WO_ANGLE_XY_YAW; field <= WO_ANGLE_YZ_ROLL; ++field)
+            if (std::fabs(row[field]) > 360.0) return false;
+        if (row[WO_RESERVED_6] != 0.0 || row[WO_RESERVED_7] != 0.0) return false;
+    }
     return true;
 }
 
@@ -77,13 +210,22 @@ bool CoordinateManager::IsWorkpieceSelectionSupported(int normalizedMode,
     int normalizedW) const noexcept
 {
     if (normalizedMode == 169) return normalizedW == 0;
-    return normalizedMode == 168 && IsWorkOffsetRowValid(normalizedW, true);
+    if (normalizedMode != 168 || !IsWorkOffsetRowValid(normalizedW, true)) return false;
+    // BASE-PLANE-7 binds one WORK rotation component to the active plane's
+    // positive normal: G17 yaw, G18 pitch, G19 roll. Cross-plane/multi-angle
+    // rows remain explicit rejects; the unbound legacy 3D matrix is unchanged.
+    if (!IsTranslationRunBound()) return true;
+    double angle = 0.0;
+    return TryGetFixedWorkPlaneAngle(m_WorkOffset[normalizedW - 1], activePlane, angle);
 }
 
 bool CoordinateManager::IsFixedPlanarRotationActive() const noexcept
 {
-    return isG68Active || (isWorkpieceRotationActive &&
-        IsWorkOffsetRowValid(currentWCode, true) && m_WorkOffset[currentWCode - 1][3] != 0.0);
+    if (isG68Active) return true;
+    if (!isWorkpieceRotationActive || !IsWorkOffsetRowValid(currentWCode, true)) return false;
+    double angle = 0.0;
+    return TryGetFixedWorkPlaneAngle(m_WorkOffset[currentWCode - 1], activePlane, angle) &&
+        angle != 0.0;
 }
 
 bool CoordinateManager::IsScaleMirrorActive() const noexcept
@@ -94,19 +236,57 @@ bool CoordinateManager::IsScaleMirrorActive() const noexcept
     return false;
 }
 
+bool CoordinateManager::IsBaseArcPlaneSelectionSupported(int plane) const noexcept
+{
+    if (!IsNCArcPlaneCode(plane)) return false;
+    if (plane == 17) return true; // Preserve every accepted G17 combination.
+    if ((toolRadiusMode == 40 ? currentDCode != 0 :
+            (!IsToolRadiusSelectionSupported(toolRadiusMode, currentDCode) ||
+                !IsNCTranslationCutterNotationAllowed(plane, isAbsoluteMode ? 90 : 91,
+                    isPolarCoordinateActive ? 16 : 15) || plane != activePlane)) ||
+        !IsToolLengthSelectionSupported(toolLengthMode, currentHCode) ||
+        (isPolarCoordinateActive && !isAbsoluteMode) || isCAxisOffsetRotationEnabled) return false;
+    // Fixed native XYZ H/WORK vectors are added after scale/mirror/G68.
+    // A WORK rotation is bound to the plane that gives its matching normal;
+    // a plane change must not reinterpret yaw/pitch/roll.
+    if (isWorkpieceRotationActive)
+    {
+        double angle = 0.0;
+        if (!IsWorkOffsetRowValid(currentWCode, true) ||
+            !TryGetFixedWorkPlaneAngle(m_WorkOffset[currentWCode - 1], plane, angle)) return false;
+    }
+    else if (currentWCode != 0) return false;
+    // BASE-PLANE-4 keeps scale/mirror in fixed XYZ slots, independent of
+    // circle (u,v). Inactive fields cannot authorize an auxiliary-axis map.
+    if (isScalingActive && (!std::isfinite(scaleFactor) || scaleFactor <= 0.0)) return false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if (axis >= 3U && (isMirrorActive[axis] ||
+            (isScalingActive && scalingCenterWCS[axis] != 0.0))) return false;
+        if (axis < 3U && ((isScalingActive && !std::isfinite(scalingCenterWCS[axis])) ||
+            (isMirrorActive[axis] && !std::isfinite(mirrorCenterWCS[axis])))) return false;
+    }
+    return true;
+}
+
 bool CoordinateManager::IsTranslationModeSupported() const noexcept
 {
-    if (activePlane != 17 ||
+    // Out-of-band axis metadata edits invalidate a selected role and its run.
+    if (m_electrodeRotationAxisIndex >= 0 && GetElectrodeRotationAxisIndex() < 0) return false;
+    if (!IsBaseArcPlaneSelectionSupported(activePlane) ||
         !IsToolRadiusSelectionSupported(toolRadiusMode, currentDCode) ||
-        (toolRadiusMode != 40 && (!isAbsoluteMode || isPolarCoordinateActive ||
+        (toolRadiusMode != 40 && (!IsNCTranslationCutterNotationAllowed(activePlane, isAbsoluteMode ? 90 : 91,
+                isPolarCoordinateActive ? 16 : 15) ||
             isCAxisOffsetRotationEnabled)) ||
         currentWCSIndex < 0 ||
-        currentWCSIndex > 5 ||
+        currentWCSIndex >= 60 ||
         static_cast<std::size_t>(currentWCSIndex) >= m_WCSTable.size()) return false;
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(activePlane, plane)) return false;
     if (isG68Active && (isCAxisOffsetRotationEnabled || !std::isfinite(g68Angle) ||
-        std::fabs(g68Angle) > 360.0 || !std::isfinite(g68CenterWCS[0]) ||
-        !std::isfinite(g68CenterWCS[1]) || g68CenterWCS[2] != 0.0 ||
-        std::signbit(g68CenterWCS[2]))) return false;
+        std::fabs(g68Angle) > 360.0 || !std::isfinite(g68CenterWCS[plane.u]) ||
+        !std::isfinite(g68CenterWCS[plane.v]) || g68CenterWCS[plane.normal] != 0.0 ||
+        std::signbit(g68CenterWCS[plane.normal]))) return false;
     if (isPolarCoordinateActive && (!isAbsoluteMode || isCAxisOffsetRotationEnabled)) return false;
     if (IsScaleMirrorActive() && isCAxisOffsetRotationEnabled) return false;
     if (isScalingActive && (!std::isfinite(scaleFactor) || scaleFactor <= 0.0)) return false;
@@ -128,25 +308,42 @@ bool CoordinateManager::IsTranslationModeSupported() const noexcept
     {
         if (isCAxisOffsetRotationEnabled || !IsWorkOffsetRowValid(currentWCode, true))
             return false;
-        if (m_WorkOffset[currentWCode - 1][WO_ANGLE_XY_YAW] != 0.0 &&
+        double angle = 0.0;
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(activePlane, plane) ||
+            !TryGetFixedWorkPlaneAngle(m_WorkOffset[currentWCode - 1], activePlane, angle)) return false;
+        if (angle != 0.0 &&
             (!m_workRotationCenterFixed ||
-             !std::isfinite(rotationCenterMCS[0]) || !std::isfinite(rotationCenterMCS[1]) ||
-             rotationCenterMCS[2] != 0.0 || std::signbit(rotationCenterMCS[2])))
+             !std::isfinite(rotationCenterMCS[plane.u]) ||
+             !std::isfinite(rotationCenterMCS[plane.v]) ||
+             rotationCenterMCS[plane.normal] != 0.0 ||
+             std::signbit(rotationCenterMCS[plane.normal])))
             return false;
     }
     else if (currentWCode != 0) return false;
     // G162 remains dormant only without active H/WORK. Active fixed offsets
     // require G163 so their source is independent of any C-axis position.
-    return m_WCSTable[currentWCSIndex].size() >= 8U;
+    return m_WCSTable[currentWCSIndex].size() == 8U;
 }
 
 NCTranslationSnapshot CoordinateManager::BuildCurrentCoordinateSnapshot() const noexcept
 {
     NCTranslationSnapshot result{};
+    int wcsCode = 0;
+    if (!TryEncodeNCWorkCoordinateCode(currentWCSIndex, wcsCode) ||
+        static_cast<std::size_t>(currentWCSIndex) >= m_WCSTable.size() ||
+        m_WCSTable[currentWCSIndex].size() != 8U ||
+        !TryBuildAxisIdentity(m_translationAxisSource, result.axisIdentity)) return result;
+    if (m_translationRunToken != 0ULL)
+    {
+        NCAxisIdentitySnapshot expected = m_runAxisIdentity;
+        expected.eccentricEnabled = result.axisIdentity.eccentricEnabled;
+        if (!SameNCAxisIdentitySnapshot(expected, result.axisIdentity)) return NCTranslationSnapshot{};
+    }
     result.runToken = m_translationRunToken;
     result.generation = m_translationGeneration;
     result.revision = m_translationRevision;
-    result.wcsCode = currentWCSIndex + 54;
+    result.wcsCode = wcsCode;
     result.distanceMode = isAbsoluteMode ? 90 : 91;
     result.unitsMode = isInchMode ? 20 : 21;
     result.polarMode = isPolarCoordinateActive ? 16 : 15;
@@ -159,7 +356,7 @@ NCTranslationSnapshot CoordinateManager::BuildCurrentCoordinateSnapshot() const 
     result.workMode = isWorkpieceRotationActive ? 168 : 169;
     result.workWCode = currentWCode;
     result.rotationMode = isG68Active ? 68 : 69;
-    result.rotationPlane = 17;
+    result.rotationPlane = activePlane;
     result.scalingMode = isScalingActive ? 51 : 50;
     result.scalingFactor = isScalingActive ? scaleFactor : 1.0;
     for (unsigned axis = 0U; axis < 3U; ++axis)
@@ -173,8 +370,10 @@ NCTranslationSnapshot CoordinateManager::BuildCurrentCoordinateSnapshot() const 
     }
     if (isG68Active)
     {
-        result.rotationCenterMM[0] = g68CenterWCS[0];
-        result.rotationCenterMM[1] = g68CenterWCS[1];
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(activePlane, plane)) return NCTranslationSnapshot{};
+        result.rotationCenterMM[0] = g68CenterWCS[plane.u];
+        result.rotationCenterMM[1] = g68CenterWCS[plane.v];
         result.rotationAngleDeg = g68Angle;
     }
     for (unsigned axis = 0U; axis < 8U; ++axis)
@@ -186,10 +385,15 @@ NCTranslationSnapshot CoordinateManager::BuildCurrentCoordinateSnapshot() const 
         if (isWorkpieceRotationActive)
             result.workOffset[axis] = m_WorkOffset[currentWCode - 1][axis];
     }
-    if (isWorkpieceRotationActive && result.workOffset[WO_ANGLE_XY_YAW] != 0.0)
+    double workPlaneAngle = 0.0;
+    if (isWorkpieceRotationActive &&
+        TryGetFixedWorkPlaneAngle(m_WorkOffset[currentWCode - 1], activePlane, workPlaneAngle) &&
+        workPlaneAngle != 0.0)
     {
-        result.workRotationCenterMM[0] = rotationCenterMCS[0];
-        result.workRotationCenterMM[1] = rotationCenterMCS[1];
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(activePlane, plane)) return NCTranslationSnapshot{};
+        result.workRotationCenterMM[0] = rotationCenterMCS[plane.u];
+        result.workRotationCenterMM[1] = rotationCenterMCS[plane.v];
     }
     return result;
 }
@@ -213,6 +417,41 @@ bool CoordinateManager::FreezeTranslationRun() noexcept
     if (!IsNCTranslationSnapshotValid(candidate)) return false;
     m_frozenTranslation = candidate;
     m_translationFrozen = true;
+    return true;
+}
+
+bool CoordinateManager::PrepareArcPlaneTransition(int plane,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    // Never reinterpret an active G68 center/angle in a different plane.
+    if (isG68Active || isPolarCoordinateActive || toolRadiusMode != 40 || !IsBaseArcPlaneSelectionSupported(plane) || !m_translationFrozen ||
+        m_translationResetBypass || plane == m_frozenTranslation.rotationPlane ||
+        !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
+        m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.rotationPlane = plane;
+    next.generation = m_translationGenerationCounter + 1ULL;
+    next.revision = m_translationRevision + 1ULL;
+    if (!IsNCTranslationSnapshotValid(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitArcPlaneTransition(
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    NCTranslationSnapshot expected{};
+    if (!PrepareArcPlaneTransition(candidate.rotationPlane, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    // Motion publication and exact drain were reserved first. Native MCS,
+    // pulse tails, HOME state and every offset table remain untouched.
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    activePlane = candidate.rotationPlane;
+    m_frozenTranslation = candidate;
     return true;
 }
 
@@ -328,7 +567,7 @@ bool CoordinateManager::PreparePolarTransition(int code,
     if ((code != 15 && code != 16) || !m_translationFrozen ||
         m_translationResetBypass || !IsTranslationRunCurrent() ||
         m_translationGeneration != m_translationGenerationCounter ||
-        (code == 16 && (!isAbsoluteMode || activePlane != 17 ||
+        (code == 16 && (!isAbsoluteMode || !IsBaseArcPlaneSelectionSupported(activePlane) ||
             isCAxisOffsetRotationEnabled))) return false;
     NCTranslationSnapshot next = m_frozenTranslation;
     if (next.polarMode != code)
@@ -374,8 +613,9 @@ bool CoordinateManager::PrepareToolRadiusSelectionTransition(int mode, int dCode
     if (!m_translationFrozen || m_translationResetBypass || !IsTranslationRunCurrent() ||
         m_translationGeneration != m_translationGenerationCounter ||
         !IsToolRadiusSelectionSupported(mode, dCode) ||
-        (mode != 40 && (!isAbsoluteMode || activePlane != 17 ||
-            isPolarCoordinateActive || isCAxisOffsetRotationEnabled))) return false;
+        (mode != 40 && (!IsNCTranslationCutterNotationAllowed(activePlane, isAbsoluteMode ? 90 : 91,
+            isPolarCoordinateActive ? 16 : 15) || !IsBaseArcPlaneSelectionSupported(activePlane) ||
+            isCAxisOffsetRotationEnabled))) return false;
     NCTranslationSnapshot next = m_frozenTranslation;
     next.cutterMode = mode;
     next.cutterD = dCode;
@@ -547,13 +787,14 @@ bool CoordinateManager::CommitScaleMirrorTransition(const NCTranslationSnapshot&
 bool CoordinateManager::PrepareWorkCoordinateTransition(int wcsCode,
     NCTranslationSnapshot& candidate) const noexcept
 {
-    if (toolRadiusMode != 40) return false;
+    int selectedRow = 0;
+    if (toolRadiusMode != 40 || !TryDecodeNCWorkCoordinateCode(wcsCode, selectedRow)) return false;
     if (!m_translationFrozen || m_translationResetBypass ||
-        wcsCode < 54 || wcsCode > 59 || wcsCode == m_frozenTranslation.wcsCode ||
+        wcsCode == m_frozenTranslation.wcsCode ||
         !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
         m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
         m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
-    const std::size_t rowIndex = static_cast<std::size_t>(wcsCode - 54);
+    const std::size_t rowIndex = static_cast<std::size_t>(selectedRow);
     if (rowIndex >= m_WCSTable.size() || m_WCSTable[rowIndex].size() != 8U) return false;
     NCTranslationSnapshot next = m_frozenTranslation;
     next.wcsCode = wcsCode;
@@ -569,17 +810,19 @@ bool CoordinateManager::PrepareWorkCoordinateTransition(int wcsCode,
 bool CoordinateManager::CommitWorkCoordinateTransition(
     const NCTranslationSnapshot& candidate) noexcept
 {
-    m_workCenterConfirmation = WorkCenterConfirmation{};
+    int selectedRow = 0;
     NCTranslationSnapshot expected{};
-    if (!PrepareWorkCoordinateTransition(candidate.wcsCode, expected) ||
+    if (!TryDecodeNCWorkCoordinateCode(candidate.wcsCode, selectedRow) ||
+        !PrepareWorkCoordinateTransition(candidate.wcsCode, expected) ||
         !SameNCTranslationSnapshot(expected, candidate)) return false;
+    m_workCenterConfirmation = WorkCenterConfirmation{};
     // The Motion publication is accepted first under its lifecycle reservation.
     // G68 keeps its WCS centre; G168 keeps its separately fixed MCS centre.
     // Selection changes neither the accepted native endpoint nor any table row.
     m_translationGenerationCounter = candidate.generation;
     m_translationGeneration = candidate.generation;
     m_translationRevision = candidate.revision;
-    currentWCSIndex = candidate.wcsCode - 54;
+    currentWCSIndex = selectedRow;
     m_frozenTranslation = candidate;
     return true;
 }
@@ -671,24 +914,26 @@ bool CoordinateManager::CommitPlanarRotationTransition(
     m_translationGeneration = candidate.generation;
     m_translationRevision = candidate.revision;
     isG68Active = candidate.rotationMode == 68;
-    g68CenterWCS[0] = candidate.rotationCenterMM[0];
-    g68CenterWCS[1] = candidate.rotationCenterMM[1];
-    g68CenterWCS[2] = 0.0;
+    NCArcPlaneAxes plane{};
+    (void)TryGetNCArcPlaneAxes(candidate.rotationPlane, plane); // validated candidate
+    for (unsigned axis = 0U; axis < 3U; ++axis) g68CenterWCS[axis] = 0.0;
+    g68CenterWCS[plane.u] = candidate.rotationCenterMM[0];
+    g68CenterWCS[plane.v] = candidate.rotationCenterMM[1];
     g68Angle = candidate.rotationAngleDeg;
     m_frozenTranslation = candidate;
     return true;
 }
 
 bool CoordinateManager::PrepareWorkpieceTransition(int mode, int wCode,
-    bool hasCenter, double centerX, double centerY,
+    bool hasCenter, double centerU, double centerV,
     NCTranslationSnapshot& candidate) const noexcept
 {
     if (toolRadiusMode != 40) return false;
     if (!m_translationFrozen || m_translationResetBypass ||
         !IsWorkpieceSelectionSupported(mode, wCode) ||
-        !std::isfinite(centerX) || !std::isfinite(centerY) ||
-        (!hasCenter && (centerX != 0.0 || centerY != 0.0 ||
-            std::signbit(centerX) || std::signbit(centerY))) ||
+        !std::isfinite(centerU) || !std::isfinite(centerV) ||
+        (!hasCenter && (centerU != 0.0 || centerV != 0.0 ||
+            std::signbit(centerU) || std::signbit(centerV))) ||
         (mode == 169 && hasCenter) ||
         (mode == 168 && isCAxisOffsetRotationEnabled) ||
         !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
@@ -702,19 +947,26 @@ bool CoordinateManager::PrepareWorkpieceTransition(int mode, int wCode,
         next.workOffset[field] = mode == 168 ? m_WorkOffset[wCode - 1][field] : 0.0;
     next.workRotationCenterMM[0] = 0.0;
     next.workRotationCenterMM[1] = 0.0;
-    if (mode == 168 && next.workOffset[WO_ANGLE_XY_YAW] != 0.0)
+    double workAngle = 0.0;
+    if (mode == 168 && !TryGetNCTranslationWorkPlaneAngle(next, workAngle)) return false;
+    if (mode == 168 && workAngle != 0.0)
     {
         if (hasCenter)
         {
             if (!isAbsoluteMode) return false;
-            // The input point uses the entire OLD frozen G68/H/WCS/WORK frame.
-            // Do not use Actual, update native tail, or reinterpret after commit.
-            const double input[8] = { centerX, centerY };
+            NCArcPlaneAxes plane{};
+            if (!TryGetNCArcPlaneAxes(m_frozenTranslation.rotationPlane, plane)) return false;
+            // The canonical plane centre uses the entire OLD frozen
+            // G68/H/WCS/WORK frame. Omitted normal/auxiliary axes cannot mix
+            // into a plane-preserving rotation.
+            double input[8] = {};
+            input[plane.u] = centerU;
+            input[plane.v] = centerV;
             double native[8] = {};
             NCTranslationForwardPoint(m_frozenTranslation, input, native);
-            if (!std::isfinite(native[0]) || !std::isfinite(native[1])) return false;
-            next.workRotationCenterMM[0] = native[0];
-            next.workRotationCenterMM[1] = native[1];
+            if (!std::isfinite(native[plane.u]) || !std::isfinite(native[plane.v])) return false;
+            next.workRotationCenterMM[0] = native[plane.u];
+            next.workRotationCenterMM[1] = native[plane.v];
         }
         else
         {
@@ -738,12 +990,12 @@ bool CoordinateManager::PrepareWorkpieceTransition(int mode, int wCode,
 }
 
 bool CoordinateManager::CommitWorkpieceTransition(int mode, int wCode,
-    bool hasCenter, double centerX, double centerY,
+    bool hasCenter, double centerU, double centerV,
     const NCTranslationSnapshot& candidate) noexcept
 {
     m_workCenterConfirmation = WorkCenterConfirmation{};
     NCTranslationSnapshot expected{};
-    if (!PrepareWorkpieceTransition(mode, wCode, hasCenter, centerX, centerY, expected) ||
+    if (!PrepareWorkpieceTransition(mode, wCode, hasCenter, centerU, centerV, expected) ||
         !SameNCTranslationSnapshot(expected, candidate)) return false;
     // Revalidate the original words against the old source and current target row.
     // Only the selected descriptor changes; native positions and tables do not.
@@ -752,11 +1004,14 @@ bool CoordinateManager::CommitWorkpieceTransition(int mode, int wCode,
     m_translationRevision = candidate.revision;
     isWorkpieceRotationActive = candidate.workMode == 168;
     currentWCode = candidate.workWCode;
+    double workAngle = 0.0;
     m_workRotationCenterFixed = isWorkpieceRotationActive &&
-        candidate.workOffset[WO_ANGLE_XY_YAW] != 0.0;
-    rotationCenterMCS[0] = candidate.workRotationCenterMM[0];
-    rotationCenterMCS[1] = candidate.workRotationCenterMM[1];
-    rotationCenterMCS[2] = 0.0;
+        TryGetNCTranslationWorkPlaneAngle(candidate, workAngle) && workAngle != 0.0;
+    for (unsigned axis = 0U; axis < 3U; ++axis) rotationCenterMCS[axis] = 0.0;
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(candidate.rotationPlane, plane)) return false;
+    rotationCenterMCS[plane.u] = candidate.workRotationCenterMM[0];
+    rotationCenterMCS[plane.v] = candidate.workRotationCenterMM[1];
     m_frozenTranslation = candidate;
     if (hasCenter)
     {
@@ -765,8 +1020,8 @@ bool CoordinateManager::CommitWorkpieceTransition(int mode, int wCode,
         m_workCenterConfirmation.generation = candidate.generation;
         m_workCenterConfirmation.revision = candidate.revision;
         m_workCenterConfirmation.wCode = wCode;
-        m_workCenterConfirmation.inputXY[0] = centerX;
-        m_workCenterConfirmation.inputXY[1] = centerY;
+        m_workCenterConfirmation.inputXY[0] = centerU;
+        m_workCenterConfirmation.inputXY[1] = centerV;
     }
     return true;
 }
@@ -797,6 +1052,7 @@ void CoordinateManager::RetireTranslationRun() noexcept
     m_translationGeneration = 0ULL;
     m_translationResetBypass = false;
     m_frozenTranslation = NCTranslationSnapshot{};
+    m_runAxisIdentity = NCAxisIdentitySnapshot{};
 }
 
 void CoordinateManager::BeginTranslationReset() noexcept
@@ -868,6 +1124,76 @@ bool CoordinateManager::ApplyCoordinateTableValues(int offsetType, int row,
         else if (offsetType == 2) m_ToolOffset[row][axis] = values[axis];
         else m_WorkOffset[row][axis] = values[axis];
     }
+    return true;
+}
+
+bool CoordinateManager::TryDecodeToolTableWrite(const NCBlock& block,
+    NCManager* nc, int& rowIndex, bool* fields, double* values) const noexcept
+{
+    const int codeCount = block.gCount > 0 ? block.gCount : (block.hasG ? 1 : 0);
+    if (nc == nullptr || &nc->CoordSys != this || fields == nullptr || values == nullptr ||
+        block.gCount < 0 || !block.hasG || codeCount != 1 || block.gCode != 10 ||
+        (block.has('G') && block.val('G') != 10.0) ||
+        (block.gCount > 0 && block.gCodes[0] != 10) ||
+        block.mCount != 0 || block.isGoto || block.isBlockSkip || !block.has('P') ||
+        IsTranslationRunFrozen() ||
+        (IsTranslationRunBound() && (m_translationAxisSource != nc ||
+            !IsTranslationAxisIdentityCurrent()))) return false;
+    const double requested = block.val('P');
+    if (!std::isfinite(requested) || requested < 1.0 || requested > 100.0 ||
+        std::floor(requested) != requested ||
+        requested > static_cast<double>(m_ToolOffset.size())) return false;
+    const int candidateRow = static_cast<int>(requested) - 1;
+    if (m_ToolOffset[candidateRow].size() != 8U) return false;
+
+    int owners[26];
+    for (unsigned letter = 0U; letter < 26U; ++letter) owners[letter] = -1;
+    bool rotary[8] = {};
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        const AxisContext& native = nc->GetMotion().GetAxisContext(static_cast<int>(axis));
+        if (!native.isExist) continue;
+        const char letter = nc->m_axisNames[axis];
+        // Control words never become tool-offset axes through configuration.
+        // I/J/K may be native axes here; G160 owns those fixed WORK angles.
+        if (native.axisIndex != static_cast<int>(axis) ||
+            (native.axisType != AxisType::LINEAR && native.axisType != AxisType::ROTARY &&
+                native.axisType != AxisType::ROTARY_CONTINUOUS) ||
+            letter < 'A' || letter > 'Z' || letter == 'G' || letter == 'N' ||
+            letter == 'P' || letter == 'L' || letter == 'M' || letter == 'T' || letter == 'H' ||
+            owners[letter - 'A'] >= 0) return false;
+        owners[letter - 'A'] = static_cast<int>(axis);
+        rotary[axis] = native.axisType != AxisType::LINEAR;
+    }
+    bool candidateFields[8] = {};
+    double candidateValues[8] = {};
+    bool hasAxis = false;
+    for (char letter = 'A'; letter <= 'Z'; ++letter)
+    {
+        if (!block.has(letter)) continue;
+        const double value = block.val(letter);
+        if (!std::isfinite(value)) return false;
+        if (letter == 'G' || letter == 'N' || letter == 'P') continue;
+        const int axis = owners[letter - 'A'];
+        if (axis < 0) return false;
+        const double nativeValue = ToInternalUnit(value, rotary[axis]);
+        if (!std::isfinite(nativeValue)) return false;
+        candidateFields[axis] = true;
+        candidateValues[axis] = nativeValue;
+        hasAxis = true;
+    }
+    if (!hasAxis) return false;
+    // A partial write must leave a complete finite row. Selected bad fields
+    // can be repaired; unselected fields retain their exact native values.
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        if (!std::isfinite(candidateFields[axis] ? candidateValues[axis] :
+                m_ToolOffset[candidateRow][axis])) return false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        fields[axis] = candidateFields[axis];
+        values[axis] = candidateValues[axis];
+    }
+    rowIndex = candidateRow;
     return true;
 }
 
@@ -956,6 +1282,13 @@ bool CoordinateManager::SetCAxisOffsetRotationEnabled(bool enabled, NCManager* n
 {
     if (enabled && isPolarCoordinateActive && !m_translationResetBypass)
         return RejectCoordinateMutation("G162", "POLAR_ACTIVE", nc, true);
+    if (enabled && !m_translationResetBypass &&
+        GlobalConfig::GetInstance().systemMode == SystemMode::EDM_SINKER_MODE &&
+        (toolLengthMode == 43 || toolLengthMode == 44) &&
+        IsToolOffsetRowValid(currentHCode, false) &&
+        (m_ToolOffset[currentHCode - 1][0] != 0.0 || m_ToolOffset[currentHCode - 1][1] != 0.0) &&
+        GetElectrodeRotationAxisIndex() < 0)
+        return RejectCoordinateMutation("G162", "ELECTRODE_ROLE_REQUIRED", nc, true);
     if (isCAxisOffsetRotationEnabled == enabled) return true;
     if (!GuardCoordinateMutation("G162_G163", nc)) return false;
     isCAxisOffsetRotationEnabled = enabled;
@@ -964,34 +1297,25 @@ bool CoordinateManager::SetCAxisOffsetRotationEnabled(bool enabled, NCManager* n
 
 bool CoordinateManager::SetWCS(int gCode, NCManager* nc, bool reportAlarm)
 {
-    int calculatedIndex = -1;
-
-    // 處理 G54~G59
-    if (gCode >= 54 && gCode <= 59) {
-        calculatedIndex = gCode - 54;
+    int calculatedIndex = 0;
+    if (nc == nullptr || !TryDecodeNCWorkCoordinateCode(gCode, calculatedIndex))
+        return RejectCoordinateMutation("WCS_SELECT", "INDEX", nc, reportAlarm);
+    // A bound run must never select an unreadable or nonfinite native row.
+    // Unbound legacy table editing/selection retains its existing behaviour.
+    if (m_translationRunToken != 0ULL)
+    {
+        if (static_cast<std::size_t>(calculatedIndex) >= m_WCSTable.size() ||
+            m_WCSTable[calculatedIndex].size() != 8U)
+            return RejectCoordinateMutation("WCS_SELECT", "ROW", nc, reportAlarm);
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            if (!std::isfinite(m_WCSTable[calculatedIndex][axis]))
+                return RejectCoordinateMutation("WCS_SELECT", "ROW", nc, reportAlarm);
     }
-    // 處理 G154~G959
-    else if (gCode >= 154 && gCode <= 959) {
-        int hundred = gCode / 100;
-        int tail = gCode % 100;
-        if (tail >= 54 && tail <= 59) {
-            calculatedIndex = (hundred - 1) * 6 + (tail - 54) + 6;
-        }
-    }
-
-    // 如果計算成功
-    if (calculatedIndex != -1 && nc != nullptr) {
-        if (calculatedIndex != currentWCSIndex &&
-            !GuardCoordinateMutation("WCS_SELECT", nc, reportAlarm)) return false;
-        currentWCSIndex = calculatedIndex;
-
-        // 🌟 使用你原本的呼叫方式，直接設定 #14
-        nc->MacroSys.SetVar('$', 14, (double)gCode);
-
-        return true;
-    }
-
-    return RejectCoordinateMutation("WCS_SELECT", "INDEX", nc, reportAlarm);
+    if (calculatedIndex != currentWCSIndex &&
+        !GuardCoordinateMutation("WCS_SELECT", nc, reportAlarm)) return false;
+    currentWCSIndex = calculatedIndex;
+    nc->MacroSys.SetVar('$', 14, static_cast<double>(gCode));
+    return true;
 }
 
 void CoordinateManager::SyncMachinePosition(const double* actualMCS) {
@@ -1024,6 +1348,7 @@ bool CoordinateManager::CompleteFixedPlanarEndpoint(
         if (!m_translationFrozen && !IsTranslationModeSupported()) return false;
         NCTranslationSnapshot source = m_translationFrozen ?
             m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        if (!IsNCAxisIdentitySnapshotValid(source.axisIdentity)) return false;
         if (!m_translationFrozen)
         {
             source.runToken = 1ULL;
@@ -1039,8 +1364,7 @@ bool CoordinateManager::CompleteFixedPlanarEndpoint(
         return TryCompleteNCTranslationIncrementalEndpoint(m_frozenTranslation,
             commandedMCS, targetWCS, hasAxis);
     }
-    if (hasAxis[0] == hasAxis[1] ||
-        !NCTranslationHasPlanarRotation(m_frozenTranslation)) return true;
+    if (!NCTranslationHasSparseRotatedEndpoint(m_frozenTranslation, hasAxis)) return true;
     if (!IsTranslationRunCurrent()) return false;
     return TryCompleteNCTranslationPlanarEndpoint(m_frozenTranslation,
         commandedMCS, targetWCS, hasAxis);
@@ -1064,6 +1388,15 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
     double* outputMCS,
     bool commitCommandedMCS)
 {
+    // Role binding establishes angle identity, not a compensated trajectory.
+    // Until the continuous generated-XY path/envelope is implemented, reject
+    // active eccentric forward requests atomically (including C-only and ZC).
+    if (IsElectrodeOffsetRotationRequested())
+    {
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            outputMCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+        return;
+    }
     // Polar motion is owned by the audited NC preview/admission path only.
     // Legacy direct-transform callers must not treat raw radius/angle as XY.
     if (commitCommandedMCS && (isPolarCoordinateActive ||
@@ -1077,6 +1410,15 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
     {
         const NCTranslationSnapshot source = m_translationFrozen ?
             m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        // A failed identity capture must never become an identity transform.
+        // Validate before any output selection or commanded endpoint write.
+        if (!IsNCAxisIdentitySnapshotValid(source.axisIdentity) ||
+            (m_translationFrozen && !IsTranslationRunCurrent()))
+        {
+            for (unsigned axis = 0U; axis < 8U; ++axis)
+                outputMCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+            return;
+        }
         if (source.distanceMode == 91)
         {
             double candidate[8] = {};
@@ -1104,7 +1446,7 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
         }
         // Audited producers complete sparse planar endpoints before Preview.
         // Keep this guard for callers that have not proved their native baseline.
-        if (NCTranslationHasPlanarRotation(source) && hasAxis[0] != hasAxis[1])
+        if (NCTranslationHasSparseRotatedEndpoint(source, hasAxis))
         {
             for (unsigned axis = 0U; axis < 8U; ++axis)
                 outputMCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
@@ -1204,25 +1546,9 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
         }
     }
 
-    // ==========================================================
-    // 🌟 【EDM 神級預判】：預先算出 C 軸 (第四軸) 的目標機械角度
-    // 讓 X 和 Y 軸在計算時，可以吃到最新的 C 軸角度偏心量！
-    // ==========================================================
-    double targetCAngleMCS = commandedMCS[C_AXIS_INDEX]; // 預設為停留在原地
-
-    if (hasAxis[C_AXIS_INDEX]) {
-        double offsetC = extOffset[C_AXIS_INDEX]
-            + m_WCSTable[currentWCSIndex][C_AXIS_INDEX]
-            + GetActiveWorkOffset(C_AXIS_INDEX);
-
-        if (isAbsoluteMode) {
-            targetCAngleMCS = finalTargetWCS[C_AXIS_INDEX] + offsetC;
-        }
-        else {
-            // G91 增量模式，C 軸目標為「當前位置 + 增量」
-            targetCAngleMCS = commandedMCS[C_AXIS_INDEX] + targetWCS[C_AXIS_INDEX];
-        }
-    }
+    // Active eccentric forward paths were refused above. Fixed H offsets do
+    // not depend on any rotary angle; never read an unrelated fourth axis.
+    const double targetCAngleMCS = 0.0;
 
     // ==========================================================
     // 後續維持原本的偏移疊加運算 (注意要把 targetWCS 換成 finalTargetWCS)
@@ -1367,19 +1693,9 @@ void CoordinateManager::LoadTableFromFile(const std::string& filename, std::vect
 }
 int CoordinateManager::GetCurrentWCSGCode() const
 {
-    // 處理 G54 ~ G59 (Index 0 ~ 5)
-    if (currentWCSIndex >= 0 && currentWCSIndex <= 5) {
-        return currentWCSIndex + 54;
-    }
-    // 處理 G154 ~ G959 (Index 6 ~ 59)
-    else if (currentWCSIndex >= 6 && currentWCSIndex <= 59) {
-        int offset = currentWCSIndex - 6;
-        int hundred = (offset / 6) + 1; // 算出百位數 (1 ~ 9)
-        int tail = (offset % 6) + 54;   // 算出尾數 (54 ~ 59)
-        return (hundred * 100) + tail;
-    }
-
-    return 54; // 預設防呆回傳 G54
+    int code = 0;
+    // Zero is an invalid/unavailable selection, never an implicit G54 fallback.
+    return TryEncodeNCWorkCoordinateCode(currentWCSIndex, code) ? code : 0;
 }
 
 // 🌟 更新機械座標 (未來由 EtherCAT 更新)
@@ -1397,6 +1713,12 @@ void CoordinateManager::GetActualWCS(double* outWCS) const {
     {
         const NCTranslationSnapshot source = m_translationFrozen ?
             m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        if (!IsNCAxisIdentitySnapshotValid(source.axisIdentity))
+        {
+            for (unsigned axis = 0U; axis < 8U; ++axis)
+                outWCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+            return;
+        }
         NCTranslationInversePoint(source, actualMCS, outWCS);
         return;
     }
@@ -1454,7 +1776,7 @@ void CoordinateManager::GetActualWCS(double* outWCS) const {
         double wcsOffset = m_WCSTable[currentWCSIndex][i];
 
         // 🌟 傳入 EtherCAT 讀回來的真實 C 軸物理角度
-        double toolOffset = GetActiveToolOffset(i, actualMCS[C_AXIS_INDEX]);
+        double toolOffset = GetActiveToolOffset(i, GetElectrodeRotationAngleMCS(actualMCS));
 
         double workOffset = GetActiveWorkOffset(i);
 
@@ -1500,6 +1822,12 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
     {
         const NCTranslationSnapshot source = m_translationFrozen ?
             m_frozenTranslation : BuildCurrentCoordinateSnapshot();
+        if (!IsNCAxisIdentitySnapshotValid(source.axisIdentity))
+        {
+            for (unsigned axis = 0U; axis < 8U; ++axis)
+                outWCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+            return;
+        }
         NCTranslationInversePoint(source, commandedMCS, outWCS);
         return;
     }
@@ -1558,7 +1886,7 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
         double wcsOffset = m_WCSTable[currentWCSIndex][i];
 
         // 🌟 傳入大腦記錄的理論 C 軸角度
-        double toolOffset = GetActiveToolOffset(i, commandedMCS[C_AXIS_INDEX]); // 🌟 唯一差別：吃 commandedMCS
+        double toolOffset = GetActiveToolOffset(i, GetElectrodeRotationAngleMCS(commandedMCS)); // 🌟 唯一差別：吃 commandedMCS
 
         double workOffset = GetActiveWorkOffset(i);
 
@@ -1597,64 +1925,142 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
         }
     }
 }
-// 🌟 2. 實作 ApplyG92 (直接覆寫當前表格！)
-void CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targetPos, NCManager* nc) {
-    if (IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive)
+// G92 preserves commanded machine position and changes only the selected
+// work-coordinate row. Decode and prepare are pure, including every rejection.
+bool CoordinateManager::TryDecodeG92Origin(const NCBlock& block, NCManager* nc,
+    bool* fields, double* nativeTargets) const noexcept
+{
+    const int count = block.gCount > 0 ? block.gCount : (block.hasG ? 1 : 0);
+    if (nc == nullptr || &nc->CoordSys != this || fields == nullptr || nativeTargets == nullptr ||
+        block.gCount < 0 || !block.hasG || count != 1 || block.gCode != 92 ||
+        (block.gCount > 0 && block.gCodes[0] != 92) ||
+        (block.has('G') && block.val('G') != 92.0) ||
+        block.mCount != 0 || block.isGoto || block.isBlockSkip) return false;
+    int owners[26];
+    for (unsigned letter = 0U; letter < 26U; ++letter) owners[letter] = -1;
+    bool rotary[8] = {};
+    for (unsigned axis = 0U; axis < 8U; ++axis)
     {
-        RejectCoordinateMutation("G92", "ROTATION_ACTIVE", nc, true);
-        return;
+        const AxisContext& native = nc->GetMotion().GetAxisContext(static_cast<int>(axis));
+        if (!native.isExist) continue;
+        const char letter = nc->m_axisNames[axis];
+        if (native.axisIndex != static_cast<int>(axis) ||
+            (native.axisType != AxisType::LINEAR && native.axisType != AxisType::ROTARY &&
+                native.axisType != AxisType::ROTARY_CONTINUOUS) ||
+            letter < 'A' || letter > 'Z' || letter == 'G' || letter == 'N' ||
+            letter == 'P' || letter == 'L' || letter == 'M' || letter == 'T' || letter == 'H' ||
+            owners[letter - 'A'] >= 0) return false;
+        owners[letter - 'A'] = static_cast<int>(axis);
+        rotary[axis] = native.axisType != AxisType::LINEAR;
     }
-    if (axisProgrammed == nullptr || targetPos == nullptr ||
-        currentWCSIndex < 0 || static_cast<std::size_t>(currentWCSIndex) >= m_WCSTable.size() ||
-        m_WCSTable[currentWCSIndex].size() < 8U)
+    bool selected[8] = {};
+    double targets[8] = {};
+    for (char letter = 'A'; letter <= 'Z'; ++letter)
     {
-        RejectCoordinateMutation("G92", "INPUT", nc, true);
-        return;
+        if (!block.has(letter)) continue;
+        if (!std::isfinite(block.val(letter))) return false;
+        if (letter == 'G' || letter == 'N') continue;
+        const int axis = owners[letter - 'A'];
+        if (axis < 0) return false;
+        selected[axis] = true;
+        targets[axis] = ToInternalUnit(block.val(letter), rotary[axis]);
+        if (!std::isfinite(targets[axis])) return false;
     }
-    if (m_translationFrozen && !m_translationResetBypass)
-    {
-        GuardCoordinateMutation("G92", nc);
-        return;
-    }
+    double proposed[8] = {};
+    bool changed = false;
+    if (!TryPrepareG92Origin(selected, targets, nc, proposed, changed)) return false;
+    std::memcpy(fields, selected, sizeof(selected));
+    std::memcpy(nativeTargets, targets, sizeof(targets));
+    return true;
+}
 
-    // 1. 取得「當下」包含所有補正(刀長、旋轉等)的純粹命令工作座標
-    double currentCmdWCS[8] = { 0.0 };
+bool CoordinateManager::TryPrepareG92Origin(const bool* fields, const double* nativeTargets,
+    NCManager* nc, double* proposed, bool& changed) const noexcept
+{
+    if (nc == nullptr || &nc->CoordSys != this || fields == nullptr || nativeTargets == nullptr ||
+        proposed == nullptr || m_translationFrozen || m_translationResetBypass ||
+        (m_translationAxisSource != nullptr && m_translationAxisSource != nc) ||
+        (IsTranslationRunBound() && !IsTranslationAxisIdentityCurrent()) ||
+        !isAbsoluteMode || !IsTranslationModeSupported() || isG68Active || IsScaleMirrorActive() ||
+        isPolarCoordinateActive || toolRadiusMode != 40 || currentDCode != 0 ||
+        IsElectrodeOffsetRotationRequested()) return false;
+    NCAxisIdentitySnapshot identity{};
+    if (!TryBuildAxisIdentity(nc, identity)) return false;
+    if (isWorkpieceRotationActive)
+        for (unsigned field = WO_ANGLE_XY_YAW; field <= WO_ANGLE_YZ_ROLL; ++field)
+            if (m_WorkOffset[currentWCode - 1][field] != 0.0) return false;
 
-    // 🌟 呼叫剛剛寫好的神級函式！不吃實際位置！
-    GetCommandedWCS(currentCmdWCS);
-    double proposedWCS[8] = {};
-    for (int i = 0; i < 8; ++i)
+    // Check configured owners again for direct array callers, including a
+    // no-op. Dormant slots never acquire a coordinate-table write implicitly.
+    bool owners[26] = {};
+    bool any = false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
     {
-        if (!axisProgrammed[i]) continue;
-        if (m_WCSTable[currentWCSIndex].size() <= static_cast<std::size_t>(i))
+        const AxisContext& native = nc->GetMotion().GetAxisContext(static_cast<int>(axis));
+        if (native.isExist)
         {
-            RejectCoordinateMutation("G92", "ROW_SHAPE", nc, true);
-            return;
+            const char letter = nc->m_axisNames[axis];
+            if (native.axisIndex != static_cast<int>(axis) ||
+                (native.axisType != AxisType::LINEAR && native.axisType != AxisType::ROTARY &&
+                    native.axisType != AxisType::ROTARY_CONTINUOUS) ||
+                letter < 'A' || letter > 'Z' || letter == 'G' || letter == 'N' ||
+                letter == 'P' || letter == 'L' || letter == 'M' || letter == 'T' || letter == 'H' ||
+                owners[letter - 'A']) return false;
+            owners[letter - 'A'] = true;
         }
-        proposedWCS[i] = m_WCSTable[currentWCSIndex][i] + (currentCmdWCS[i] - targetPos[i]);
-        if (!std::isfinite(targetPos[i]) || !std::isfinite(proposedWCS[i]))
-        {
-            RejectCoordinateMutation("G92", "NONFINITE", nc, true);
-            return;
-        }
+        if (fields[axis] && (!native.isExist || !std::isfinite(nativeTargets[axis]))) return false;
+        any = any || fields[axis];
+        if (!std::isfinite(commandedMCS[axis]) || !std::isfinite(extOffset[axis]) ||
+            !std::isfinite(m_WCSTable[currentWCSIndex][axis])) return false;
     }
-    if (!GuardCoordinateMutation("G92", nc)) return;
-
-    for (int i = 0; i < 8; i++) {
-        if (axisProgrammed[i]) {
-
-            // 2. 算出差值 (你現在理應顯示的數字 - 你想變成的數字)
-            double shift = currentCmdWCS[i] - targetPos[i];
-
-            // 3. 將差值疊加到目前的 WCS 表格上
-            m_WCSTable[currentWCSIndex][i] += shift;
-
-            //DEBUG_PRINT("[Coordinate] G92 Shift on Axis %d: Shift %f (CmdWCS %f -> Target %f)\n",i, shift, currentCmdWCS[i], targetPos[i]);
-        }
+    if (!any) return false;
+    double current[8] = {};
+    GetCommandedWCS(current);
+    double candidate[8] = {};
+    bool candidateChanged = false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if (!std::isfinite(current[axis])) return false;
+        const double oldValue = m_WCSTable[currentWCSIndex][axis];
+        // Equal commanded coordinates preserve the exact old field, even -0.
+        candidate[axis] = fields[axis] && current[axis] != nativeTargets[axis] ?
+            oldValue + (current[axis] - nativeTargets[axis]) : oldValue;
+        if (!std::isfinite(candidate[axis])) return false;
+        // Recompose the actual unrotated inverse path in its evaluation order.
+        // Finite row fields alone do not prove a finite coordinate frame.
+        const double offset = extOffset[axis] + candidate[axis] +
+            GetActiveToolOffset(static_cast<int>(axis), GetElectrodeRotationAngleMCS(commandedMCS)) +
+            GetActiveWorkOffset(static_cast<int>(axis));
+        const double readback = commandedMCS[axis] - offset;
+        if (!std::isfinite(offset) || !std::isfinite(readback)) return false;
+        const bool fieldChanged = std::memcmp(&candidate[axis], &oldValue, sizeof(double)) != 0;
+        // A nonzero requested shift must survive both storage and readback.
+        // General rounded coordinates need not equal their decimal input bits.
+        if (fields[axis] && current[axis] != nativeTargets[axis] &&
+            (!fieldChanged || readback == current[axis])) return false;
+        candidateChanged = candidateChanged || fieldChanged;
     }
+    if (candidateChanged && m_translationRevision ==
+        (std::numeric_limits<std::uint64_t>::max)()) return false;
+    std::memcpy(proposed, candidate, sizeof(candidate));
+    changed = candidateChanged;
+    return true;
+}
 
-    // 🌟 覆寫完畢後，如果能取得 NCManager 指標，建議在這裡也刷新一次（或靠 ExecuteBlock 刷）：
-    nc->UpdateSystemVariables();
+bool CoordinateManager::ApplyG92(const bool* axisProgrammed, const double* targetPos, NCManager* nc)
+{
+    double proposed[8] = {};
+    bool changed = false;
+    if (!TryPrepareG92Origin(axisProgrammed, targetPos, nc, proposed, changed))
+        return RejectCoordinateMutation("G92", "INPUT_OR_FRAME", nc, true);
+    if (changed)
+    {
+        if (!GuardCoordinateMutation("G92", nc)) return false;
+        std::memcpy(m_WCSTable[currentWCSIndex].data(), proposed, sizeof(proposed));
+        nc->UpdateSystemVariables();
+    }
+    RtPrintf("[ORIGIN][G92] wcs=%d changed=%d saveRequested=0\n", GetCurrentWCSGCode(), changed ? 1 : 0);
+    return true;
 }
 
 void CoordinateManager::GetActualMCS(double* outMCS) const {
@@ -1712,6 +2118,19 @@ void CoordinateManager::SetToolLengthCompensation(int gCode, int hCode, NCManage
         RejectCoordinateMutation("TOOL_LENGTH", "H_ROW", nc, true);
         return;
     }
+    if (m_translationRunToken != 0ULL && isCAxisOffsetRotationEnabled)
+    {
+        RejectCoordinateMutation("TOOL_LENGTH", "G163_REQUIRED_FOR_BOUND_H", nc, true);
+        return;
+    }
+    if (isCAxisOffsetRotationEnabled &&
+        GlobalConfig::GetInstance().systemMode == SystemMode::EDM_SINKER_MODE &&
+        (m_ToolOffset[hCode - 1][0] != 0.0 || m_ToolOffset[hCode - 1][1] != 0.0) &&
+        GetElectrodeRotationAxisIndex() < 0)
+    {
+        RejectCoordinateMutation("TOOL_LENGTH", "ELECTRODE_ROLE_REQUIRED", nc, true);
+        return;
+    }
     if ((toolLengthMode != gCode || currentHCode != hCode) &&
         !GuardCoordinateMutation("TOOL_LENGTH", nc)) return;
     toolLengthMode = gCode;
@@ -1753,8 +2172,10 @@ double CoordinateManager::GetActiveToolOffset(int axisIndex, double cAngleMCS) c
      // 🌟 【EDM 偏心補償】：只有在「功能啟動 (isCAxisOffsetRotationEnabled == true)」
      // 且計算 X (0) 或 Y (1) 時，才套用 C 軸旋轉矩陣
      // =========================================================
-    if (isCAxisOffsetRotationEnabled && (axisIndex == 0 || axisIndex == 1))
+    if (IsElectrodeOffsetRotationRequested() && (axisIndex == 0 || axisIndex == 1))
     {
+        if (GetElectrodeRotationAxisIndex() < 0 || !std::isfinite(cAngleMCS))
+            return (std::numeric_limits<double>::quiet_NaN)();
         double offsetX = m_ToolOffset[arrayIndex][0];
         double offsetY = m_ToolOffset[arrayIndex][1];
 
@@ -1782,7 +2203,8 @@ void CoordinateManager::SetWorkpieceRotation(int wCode, const bool* hasAxis, con
     const WorkCenterConfirmation confirmation = m_workCenterConfirmation;
     m_workCenterConfirmation = WorkCenterConfirmation{};
     const bool fixedRun = IsTranslationRunBound();
-    if (!hasAxis || !targetWCS || !IsWorkOffsetRowValid(wCode, fixedRun))
+    if (!hasAxis || !targetWCS || !IsWorkOffsetRowValid(wCode, fixedRun) ||
+        (fixedRun && !IsWorkpieceSelectionSupported(168, wCode)))
     {
         RejectCoordinateMutation("G168", "W_SELECTION", nc, true);
         return;
@@ -1799,23 +2221,36 @@ void CoordinateManager::SetWorkpieceRotation(int wCode, const bool* hasAxis, con
     }
     if (fixedRun)
     {
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(activePlane, plane))
+        {
+            RejectCoordinateMutation("G168", "PLANE", nc, true);
+            return;
+        }
         // The descriptor owns all fixed geometry. Never also enable the legacy
         // Motion matrix, and never sample Actual to choose a fixed centre.
-        const bool hasYaw = m_WorkOffset[wCode - 1][WO_ANGLE_XY_YAW] != 0.0;
+        double workAngle = 0.0;
+        if (!TryGetFixedWorkPlaneAngle(m_WorkOffset[wCode - 1], activePlane, workAngle))
+        {
+            RejectCoordinateMutation("G168", "PLANE_ANGLE", nc, true);
+            return;
+        }
+        const bool hasPlaneRotation = workAngle != 0.0;
         if (confirmation.armed)
         {
-            bool exactXY = hasAxis[0] && hasAxis[1];
-            for (unsigned axis = 2U; axis < 8U; ++axis)
-                exactXY = exactXY && !hasAxis[axis];
-            if (!m_translationFrozen || m_translationResetBypass || !exactXY ||
-                !hasYaw || !isAbsoluteMode || !isWorkpieceRotationActive ||
+            bool exactPlane = hasAxis[plane.u] && hasAxis[plane.v];
+            for (unsigned axis = 0U; axis < 8U; ++axis)
+                if (axis != plane.u && axis != plane.v) exactPlane = exactPlane && !hasAxis[axis];
+            const double inputUV[2] = { targetWCS[plane.u], targetWCS[plane.v] };
+            if (!m_translationFrozen || m_translationResetBypass || !exactPlane ||
+                !hasPlaneRotation || !isAbsoluteMode || !isWorkpieceRotationActive ||
                 currentWCode != wCode || !m_workRotationCenterFixed ||
                 confirmation.runToken != m_translationRunToken ||
                 confirmation.generation != m_translationGeneration ||
                 m_translationGeneration != m_translationGenerationCounter ||
                 confirmation.revision != m_translationRevision ||
                 confirmation.wCode != wCode ||
-                std::memcmp(confirmation.inputXY, targetWCS, sizeof confirmation.inputXY) != 0 ||
+                std::memcmp(confirmation.inputXY, inputUV, sizeof confirmation.inputXY) != 0 ||
                 !IsTranslationRunCurrent())
             {
                 RejectCoordinateMutation("G168", "CENTER_CONFIRMATION", nc, true);
@@ -1827,12 +2262,12 @@ void CoordinateManager::SetWorkpieceRotation(int wCode, const bool* hasAxis, con
         }
         if (isWorkpieceRotationActive && currentWCode == wCode && !hasAnyCenter)
         {
-            if (hasYaw && !m_workRotationCenterFixed)
+            if (hasPlaneRotation && !m_workRotationCenterFixed)
             {
-                RejectCoordinateMutation("G168", "FIXED_XY_CENTER_REQUIRED", nc, true);
+                RejectCoordinateMutation("G168", "FIXED_PLANE_CENTER_REQUIRED", nc, true);
                 return;
             }
-            if (!hasYaw) m_workRotationCenterFixed = false;
+            if (!hasPlaneRotation) m_workRotationCenterFixed = false;
             if (m_translationFrozen)
             {
                 if (!IsTranslationRunCurrent())
@@ -1847,14 +2282,17 @@ void CoordinateManager::SetWorkpieceRotation(int wCode, const bool* hasAxis, con
             GuardCoordinateMutation("G168", nc);
             return;
         }
-        if ((hasYaw && (!hasAxis[0] || !hasAxis[1] || hasAxis[2])) ||
-            (!hasYaw && hasAnyCenter))
+        bool exactPlaneCenter = hasAxis[plane.u] && hasAxis[plane.v];
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            if (axis != plane.u && axis != plane.v) exactPlaneCenter = exactPlaneCenter && !hasAxis[axis];
+        if ((hasPlaneRotation && !exactPlaneCenter) ||
+            (!hasPlaneRotation && hasAnyCenter))
         {
-            RejectCoordinateMutation("G168", "FIXED_XY_CENTER_REQUIRED", nc, true);
+            RejectCoordinateMutation("G168", "FIXED_PLANE_CENTER_REQUIRED", nc, true);
             return;
         }
         double center[2] = {};
-        if (hasYaw)
+        if (hasPlaneRotation)
         {
             if (!isAbsoluteMode || !IsTranslationModeSupported() || isCAxisOffsetRotationEnabled)
             {
@@ -1865,10 +2303,11 @@ void CoordinateManager::SetWorkpieceRotation(int wCode, const bool* hasAxis, con
             // Both XY words are present; omitted native axes remain untouched.
             double convertedMCS[8] = {};
             Preview_WCS_to_MCS(targetWCS, hasAxis, convertedMCS);
-            for (unsigned axis = 0U; axis < 2U; ++axis)
+            const unsigned slots[2] = { plane.u, plane.v };
+            for (unsigned component = 0U; component < 2U; ++component)
             {
-                center[axis] = convertedMCS[axis];
-                if (!std::isfinite(center[axis]))
+                center[component] = convertedMCS[slots[component]];
+                if (!std::isfinite(center[component]))
                 {
                     RejectCoordinateMutation("G168", "CENTER_NONFINITE", nc, true);
                     return;
@@ -1878,12 +2317,13 @@ void CoordinateManager::SetWorkpieceRotation(int wCode, const bool* hasAxis, con
         if (!GuardCoordinateMutation("G168", nc)) return;
         currentWCode = wCode;
         isWorkpieceRotationActive = true;
-        rotationCenterMCS[0] = center[0];
-        rotationCenterMCS[1] = center[1];
-        rotationCenterMCS[2] = 0.0;
-        m_workRotationCenterFixed = hasYaw;
+        for (unsigned axis = 0U; axis < 3U; ++axis) rotationCenterMCS[axis] = 0.0;
+        rotationCenterMCS[plane.u] = center[0];
+        rotationCenterMCS[plane.v] = center[1];
+        m_workRotationCenterFixed = hasPlaneRotation;
         if (nc) nc->GetMotion().SetCoordinateTransform(false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        RtPrintf("[WORK][SELECT] mode=168 W=%d fixedXYZ=1 fixedYaw=%d matrix=0\n", wCode, hasYaw ? 1 : 0);
+        RtPrintf("[WORK][SELECT] mode=168 W=%d plane=%d fixedXYZ=1 fixedAngle=%d matrix=0\n",
+            wCode, activePlane, hasPlaneRotation ? 1 : 0);
         return;
     }
 
@@ -1962,8 +2402,13 @@ double CoordinateManager::GetActiveWorkOffset(int axisIndex) const
 void CoordinateManager::SetActivePlane(int gCode, NCManager* nc)
 {
     if (gCode == 17 || gCode == 18 || gCode == 19) {
-        if (isPolarCoordinateActive && gCode != 17 && !m_translationResetBypass)
+        if (IsTranslationRunBound() && !m_translationResetBypass &&
+            !IsBaseArcPlaneSelectionSupported(gCode))
+        { RejectCoordinateMutation("PLANE", "BASE_FRAME_REQUIRED", nc, true); return; }
+        if (isPolarCoordinateActive && gCode != activePlane && !m_translationResetBypass)
         { RejectCoordinateMutation("PLANE", "POLAR_ACTIVE", nc, true); return; }
+        if (activePlane != gCode && isG68Active && !m_translationResetBypass)
+        { RejectCoordinateMutation("PLANE", "CANCEL_G68_FIRST", nc, true); return; }
         if (activePlane != gCode && !GuardCoordinateMutation("PLANE", nc)) return;
         activePlane = gCode;
 
@@ -1985,13 +2430,16 @@ void CoordinateManager::SetG68Rotation(const double* centerPos, const bool* hasA
         return;
     }
     const bool fixedRun = IsTranslationRunBound();
-    if (fixedRun && (activePlane != 17 || !isAbsoluteMode ||
-        isCAxisOffsetRotationEnabled || !hasAxis[0] || !hasAxis[1] || hasAxis[2]))
+    NCArcPlaneAxes plane{};
+    const bool planeValid = TryGetNCArcPlaneAxes(activePlane, plane);
+    if (fixedRun && (!planeValid || !isAbsoluteMode ||
+        !IsBaseArcPlaneSelectionSupported(activePlane) ||
+        isCAxisOffsetRotationEnabled || !hasAxis[plane.u] || !hasAxis[plane.v] || hasAxis[plane.normal]))
     {
-        RejectCoordinateMutation("G68", "FIXED_XY_SCOPE", nc, true);
+        RejectCoordinateMutation("G68", "FIXED_PLANE_SCOPE", nc, true);
         return;
     }
-    if (activePlane != 17 && activePlane != 18 && activePlane != 19)
+    if (!planeValid)
     {
         RejectCoordinateMutation("G68", "PLANE", nc, true);
         return;
@@ -2004,7 +2452,7 @@ void CoordinateManager::SetG68Rotation(const double* centerPos, const bool* hasA
     double proposedCenter[3] = {};
     for (unsigned axis = 0U; axis < 3U; ++axis)
     {
-        proposedCenter[axis] = fixedRun && axis == 2U ? 0.0 :
+        proposedCenter[axis] = fixedRun && axis == plane.normal ? 0.0 :
             (hasAxis[axis] ? centerPos[axis] : priorWCS[axis]);
         if (!std::isfinite(proposedCenter[axis]))
         {
@@ -2031,8 +2479,8 @@ void CoordinateManager::SetG68Rotation(const double* centerPos, const bool* hasA
     g68Angle = angle;
     for (unsigned axis = 0U; axis < 3U; ++axis) g68CenterWCS[axis] = proposedCenter[axis];
     if (nc) nc->MacroSys.SetVar('$', 16, 68.0);
-    RtPrintf("[G68] 2D Rotation ON. Plane:%d, Center:(%.3f, %.3f), Angle:%.3f\n",
-        activePlane, g68CenterWCS[0], g68CenterWCS[1], g68Angle);
+    RtPrintf("[G68] 2D Rotation ON. Plane:%d, CenterUV:(%.3f, %.3f), Angle:%.3f\n",
+        activePlane, g68CenterWCS[plane.u], g68CenterWCS[plane.v], g68Angle);
 }
 
 void CoordinateManager::CancelG68Rotation(NCManager* nc)
@@ -2151,9 +2599,9 @@ void CoordinateManager::CancelMirror(const bool* hasAxis, NCManager* nc)
 // ==========================================================
 void CoordinateManager::SetPolarCoordinate(NCManager* nc)
 {
-    if (!IsTranslationRunBound() || !isAbsoluteMode || activePlane != 17 ||
+    if (!IsTranslationRunBound() || !isAbsoluteMode || !IsNCArcPlaneCode(activePlane) ||
         isCAxisOffsetRotationEnabled || !IsTranslationModeSupported())
-    { RejectCoordinateMutation("G16", "G17_G90_G163_SCOPE", nc, true); return; }
+    { RejectCoordinateMutation("G16", "PLANE_G90_G163_SCOPE", nc, true); return; }
     if (isPolarCoordinateActive)
     {
         if (m_translationFrozen && !m_translationResetBypass && !IsTranslationRunCurrent())
@@ -2162,7 +2610,7 @@ void CoordinateManager::SetPolarCoordinate(NCManager* nc)
     else if (!GuardCoordinateMutation("G16", nc)) return;
     isPolarCoordinateActive = true;
     if (nc) nc->MacroSys.SetVar('$', 17, 16.0);
-    RtPrintf("[G16] Polar endpoint notation ON (XY, G90).\n");
+    RtPrintf("[G16] Polar endpoint notation ON (plane=%d, G90).\n", activePlane);
 }
 
 void CoordinateManager::CancelPolarCoordinate(NCManager* nc)
@@ -2180,9 +2628,10 @@ void CoordinateManager::CancelPolarCoordinate(NCManager* nc)
 void CoordinateManager::SetToolRadiusCompensation(int gCode, int dCode, NCManager* nc)
 {
     if (!IsTranslationRunBound() || !IsToolRadiusSelectionSupported(gCode, dCode) ||
-        (gCode != 41 && gCode != 42) || !isAbsoluteMode || activePlane != 17 ||
-        isPolarCoordinateActive || isCAxisOffsetRotationEnabled)
-    { RejectCoordinateMutation("TOOL_RADIUS", "G17_G90_G15_G163_D_RADIUS", nc, true); return; }
+        (gCode != 41 && gCode != 42) || !IsNCTranslationCutterNotationAllowed(activePlane, isAbsoluteMode ? 90 : 91,
+        isPolarCoordinateActive ? 16 : 15) || !IsBaseArcPlaneSelectionSupported(activePlane) ||
+        isCAxisOffsetRotationEnabled)
+    { RejectCoordinateMutation("TOOL_RADIUS", "PLANE_DISTANCE_NOTATION_G163_D_RADIUS", nc, true); return; }
     const bool changed = toolRadiusMode != gCode || currentDCode != dCode;
     if (changed && toolRadiusMode != 40)
     { RejectCoordinateMutation("TOOL_RADIUS", "REQUIRES_G40", nc, true); return; }

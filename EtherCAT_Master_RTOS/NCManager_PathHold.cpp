@@ -46,6 +46,7 @@ namespace
             a.radiusMM == b.radiusMM && a.radiusPulse == b.radiusPulse &&
             a.startAngle == b.startAngle && a.sweepRadians == b.sweepRadians &&
             a.lengthMM == b.lengthMM && a.lengthPulse == b.lengthPulse &&
+            std::memcmp(&a.sourceRoundoffMM, &b.sourceRoundoffMM, sizeof(a.sourceRoundoffMM)) == 0 &&
             a.axisMask == b.axisMask && a.direction == b.direction && a.kind == b.kind &&
             a.fullCircle == b.fullCircle && a.point == b.point && a.valid == b.valid;
     }

@@ -126,13 +126,17 @@ void NCPathCoreRetainedGeometry::Clear() noexcept
     boundsMinMCS.fill(0.0); boundsMaxMCS.fill(0.0);
     radiusMM = radiusPulse = startAngle = sweepRadians = lengthMM = lengthPulse = 0.0;
     axisMask = 0U; direction = 0; kind = NCPathCoreRetainedKind::NONE;
-    fullCircle = point = valid = false;
+    fullCircle = point = valid = false; sourceRoundoffMM = 0.0f;
 }
 
 static bool ValidateRetainedGeometry(const NCPathCoreRetainedGeometry& g,
     bool generatedArc) noexcept
 {
-    if (!g.valid || g.axisMask == 0U || (g.axisMask & ~7U) != 0U ||
+    if (!g.valid || !std::isfinite(g.sourceRoundoffMM) ||
+        g.sourceRoundoffMM < 0.0f || std::signbit(g.sourceRoundoffMM) ||
+        g.sourceRoundoffMM > MaximumSeamMM ||
+        (g.kind != NCPathCoreRetainedKind::ARC && g.sourceRoundoffMM != 0.0f) ||
+        g.axisMask == 0U || (g.axisMask & ~7U) != 0U ||
         !std::isfinite(g.lengthMM) || !std::isfinite(g.lengthPulse) ||
         g.lengthMM < 0.0 || g.lengthPulse < 0.0) return false;
     for (std::uint32_t axis = 0U; axis < 8U; ++axis)
@@ -212,20 +216,23 @@ static bool ValidateRetainedGeometry(const NCPathCoreRetainedGeometry& g,
             (std::fabs(g.sweepRadians) < 1.0e-12 || std::fabs(g.sweepRadians) >= TwoPi))) return false;
     if (!g.fullCircle && ((g.startPulse[0] == g.endPulse[0] && g.startPulse[1] == g.endPulse[1]) ||
         (g.startMCS[0] == g.endMCS[0] && g.startMCS[1] == g.endMCS[1]))) return false;
-    // DJ_FIX1: ONLY Q-generated arc scratch uses a two-coordinate roundoff
-    // budget. Its radius/angle come from both XY pulse coordinates; near-zero
-    // X still carries subtraction roundoff from a large Y center, and vice versa.
-    // Ordinary ARC retention/replay/PathHold keeps its original per-axis checks.
-    // Neither branch changes Q, any stored geometry, or source-to-source seams.
+    // Generated Q scratch retains its two-coordinate reconstruction bound.
+    // Ordinary arcs retain per-axis checks, with only the source allowance
+    // carried by their accepted receipt. Seams never consume this allowance.
     double pulsePerMM = 1.0, reconstructionBudgetMM = 0.0;
-    if (generatedArc)
+    if (generatedArc || g.sourceRoundoffMM != 0.0f)
     {
         pulsePerMM = g.radiusPulse / g.radiusMM;
         if (!std::isfinite(pulsePerMM) || pulsePerMM <= 0.0) return false;
         const double mmMagnitude = Maximum(Magnitude(g, 0U, false), Magnitude(g, 1U, false));
         const double pulseMagnitude = Maximum(Magnitude(g, 0U, true), Magnitude(g, 1U, true));
         reconstructionBudgetMM = EpsilonBudget * mmMagnitude +
-            (EpsilonBudget * pulseMagnitude) / pulsePerMM;
+            (EpsilonBudget * pulseMagnitude) / pulsePerMM +
+            2.0 * static_cast<double>(g.sourceRoundoffMM);
+        const double consumerBudgetMM = 2.0 * ((EpsilonBudget * pulseMagnitude) /
+            pulsePerMM + static_cast<double>(g.sourceRoundoffMM));
+        if (g.sourceRoundoffMM != 0.0f &&
+            (!std::isfinite(consumerBudgetMM) || consumerBudgetMM > MaximumSeamMM)) return false;
         if (!std::isfinite(reconstructionBudgetMM) || reconstructionBudgetMM > 1.0e-7)
             return false;
     }
@@ -239,10 +246,20 @@ static bool ValidateRetainedGeometry(const NCPathCoreRetainedGeometry& g,
         const double trigEnd = axis == 0U ? std::cos(endAngle) : std::sin(endAngle);
         if (!generatedArc)
         {
-            if (!Near(g.centerMCS[axis] + g.radiusMM * trigStart, g.startMCS[axis], Magnitude(g, axis, false)) ||
-                !Near(g.centerMCS[axis] + g.radiusMM * trigEnd, g.endMCS[axis], Magnitude(g, axis, false)) ||
-                !Near(g.centerPulse[axis] + g.radiusPulse * trigStart, g.startPulse[axis], Magnitude(g, axis, true)) ||
-                !Near(g.centerPulse[axis] + g.radiusPulse * trigEnd, g.endPulse[axis], Magnitude(g, axis, true))) return false;
+            const double mmTolerance = EpsilonBudget * Magnitude(g, axis, false) +
+                static_cast<double>(g.sourceRoundoffMM);
+            const double pulseTolerance = EpsilonBudget * Magnitude(g, axis, true) +
+                static_cast<double>(g.sourceRoundoffMM) * pulsePerMM;
+            const double startMMError = (g.centerMCS[axis] + g.radiusMM * trigStart) - g.startMCS[axis];
+            const double endMMError = (g.centerMCS[axis] + g.radiusMM * trigEnd) - g.endMCS[axis];
+            const double startPulseError = (g.centerPulse[axis] + g.radiusPulse * trigStart) - g.startPulse[axis];
+            const double endPulseError = (g.centerPulse[axis] + g.radiusPulse * trigEnd) - g.endPulse[axis];
+            if (!std::isfinite(mmTolerance) || !std::isfinite(pulseTolerance) ||
+                !std::isfinite(startMMError) || !std::isfinite(endMMError) ||
+                !std::isfinite(startPulseError) || !std::isfinite(endPulseError) ||
+                std::fabs(startMMError) > mmTolerance || std::fabs(endMMError) > mmTolerance ||
+                std::fabs(startPulseError) > pulseTolerance || std::fabs(endPulseError) > pulseTolerance)
+                return false;
         }
         else
         {
@@ -300,7 +317,7 @@ static bool BuildRetainedArc(const NCPathCoreFeedArcV2& source,
     NCPathCoreRetainedGeometry& output, bool generatedArc) noexcept
 {
     output.Clear();
-    if (!source.valid) return false;
+    if (!source.valid || source.plane != 17U) return false;
     output.startMCS = source.startMCS; output.endMCS = source.endMCS;
     output.startPulse = source.startPulse; output.endPulse = source.endPulse;
     output.centerMCS = source.centerMCS; output.centerPulse = source.centerPulse;
@@ -309,7 +326,8 @@ static bool BuildRetainedArc(const NCPathCoreFeedArcV2& source,
     output.startAngle = source.startAngle; output.sweepRadians = source.sweepRadians;
     output.lengthMM = source.lengthMM; output.lengthPulse = source.lengthPulse;
     output.axisMask = source.axisMask; output.direction = source.direction;
-    output.fullCircle = source.fullCircle; output.kind = NCPathCoreRetainedKind::ARC; output.valid = true;
+    output.fullCircle = source.fullCircle; output.kind = NCPathCoreRetainedKind::ARC;
+    output.sourceRoundoffMM = source.sourceRoundoffMM; output.valid = true;
     if (ValidateRetainedGeometry(output, generatedArc)) return true;
     output.Clear(); return false;
 }

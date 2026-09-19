@@ -323,6 +323,8 @@ public:
         // BQ: NC-thread producer workspace and published native-MCS commanded run.
         // Outputs are disjoint caller-owned heap values, never Motion authority.
     MotionCommandedEndpointReceiptV1* GetPathCoreCommandedReceiptWorkspaceSameThread() noexcept;
+    int GetG53NativeScopeAlarmSameThread();
+    void CommitG53NativeHandoffSameThread() noexcept;
     bool ReadPathCoreCommittedRunPieceSameThread(std::uint32_t index,
         NCPathCoreCommittedRecordV1& output) noexcept;
     bool EvaluatePathCoreCommittedRunPieceSameThread(std::uint32_t index, double u,
@@ -1431,6 +1433,7 @@ private:
     std::uint64_t m_fixedTranslationTravelGeneration = 0ULL;
     bool IsFixedTranslationTravelCurrentSameThread() const noexcept;
     bool PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode);
+    bool PrepareG53NativeHandoffSameThread();
     bool IsFixedTranslationBlockAllowedSameThread(const NCBlock& block);
     bool RequiresFixedTranslationSelectionTransitionSameThread(const NCBlock& block) const;
     bool TransitionFixedTranslationSelectionSameThread(const NCBlock& block);
@@ -2342,18 +2345,32 @@ private:
     struct CutterLineState
     {
         std::array<double, 8U> nominal{}, stagedNominal{};
-        std::array<double, 2U> physicalTail{}, expectedNext{}, stagedNext{};
+        std::array<double, 8U> physicalTail{};
+        std::array<double, 2U> expectedNext{}, stagedNext{}; // canonical (u,v), not physical XY
         NCPathCoreCutterPrimitive expectedPrimitive{}, stagedPrimitive{}, stagedNextPrimitive{};
         NCPathCoreCutterContourOutput stagedGeometry{};
         std::uint64_t stagedRun = 0ULL, stagedCache = 0ULL, stagedGeneration = 0ULL, stagedDispatch = 0ULL;
         int stagedPC = -1;
+        int plane = 17, stagedPlane = 17;
+        int distanceMode = 90, stagedDistanceMode = 90;
+        int polarMode = 15, stagedPolarMode = 15;
         std::uint64_t run = 0ULL, cache = 0ULL, generation = 0ULL;
         std::uint64_t commit = 0ULL, dispatch = 0ULL;
         int nextPC = -1, stagedNextPC = -1;
         bool valid = false, staged = false, terminal = false, stagedTerminal = false;
         bool leadOutRequired = false;
     } m_cutterLine{};
-    static bool IsCutterContourBlockShapeValid(const NCBlock& block, int unitsMode) noexcept;
+    static bool IsCutterContourBlockShapeValid(const NCBlock& block, int unitsMode, int planeCode = 17, bool polar = false) noexcept;
+    // G91 cutter and G40 lead-out use the committed NOMINAL contour tail,
+    // not the already offset Motion tail. This preview never commits state.
+    bool PreviewCutterIncrementalEndpointSameThread(const NCBlock& block,
+        std::array<double, 8U>& endpoint) const noexcept;
+    // Literal G90 G16 endpoints and a G40 lead-out use one source identity.
+    // Sparse G01 and PARTIAL G02/G03 infer omitted words only from the
+    // accepted NOMINAL tail. Full circles retain exact complete authored
+    // pairs in both the preceding line and circle, plus their seam proof.
+    bool PreviewCutterPolarEndpointSameThread(const NCBlock& block,
+        std::array<double, 8U>& endpoint) const noexcept;
     bool BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
         std::uint64_t run, std::uint64_t cache, std::uint64_t dispatch,
         std::array<double, 8U>& endpoint, std::array<double, 2U>& nativeCenterOffset, int& direction);
@@ -2380,8 +2397,11 @@ private:
         bool consumerStarted = false, completed = false, explicitFeed = false;
         bool invalidatedByGoto = false; // Diagnostic cause only; never a motion permit.
     } m_pathFeed{};
+    // BASE-PLANE-5: explicit XYZ G00/G01, Cartesian or G90 plane-polar; no P/Q/extra axes.
+    static bool IsPathCoreBasePlaneLinearBlockShapeValid(const NCBlock& block,
+        int unitsMode, bool polar = false, int plane = 17) noexcept;
     static bool IsPathCoreFeedBlockShapeValid(const NCBlock& block,
-        bool allowMissingFeed = false, int unitsMode = 21, bool polar = false) noexcept;
+        bool allowMissingFeed = false, int unitsMode = 21, bool polar = false, int plane = 17) noexcept;
     bool IsPathCoreFeedInputOmission(const NCBlock& block) const noexcept;
     bool IsCutterContourEndAllowedSameThread(int sourceLine);
     bool IsPathCoreFeedConfigurationValid() noexcept;
@@ -2492,7 +2512,8 @@ private:
         bool invalidatedByGoto = false; // Diagnostic cause only; never a motion permit.
     } m_pathArc{};
     static bool IsPathCoreArcBlockShapeValid(const NCBlock& block,
-        bool allowMissingFeed = false, int unitsMode = 21, bool polar = false) noexcept;
+        bool allowMissingFeed = false, int unitsMode = 21, bool polar = false, int plane = 17,
+        bool allowPlanarPolarRadius = false, bool allowSparsePolarRadius = false) noexcept;
     bool IsPathCoreArcInputOmission(const NCBlock& block) const noexcept;
     bool IsPathCoreArcConfigurationValid() noexcept;
     void ArmPathCoreArcSameThread() noexcept;

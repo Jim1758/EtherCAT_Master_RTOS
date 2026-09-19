@@ -7,6 +7,7 @@
 #include "CoordinateManager.h"
 #include "MotionCore.h"
 #include "MacroEngine.h"
+#include <limits>
 
 // 🌟 注意這裡：只要掛上 NCManager::，它就還是 NCManager 的一部分！
 void NCManager::UpdateSystemVariables()
@@ -14,20 +15,23 @@ void NCManager::UpdateSystemVariables()
    
     // 🌟 新增：取得目前的顯示單位倍率 (公制=1.0, 英制=1/25.4)
     // RESET may clean live modes before the frozen display frame is retired.
-    const bool displayInch = CoordSys.IsTranslationRunFrozen() ?
-        CoordSys.GetTranslationSnapshot().unitsMode == 20 : CoordSys.isInchMode;
+    const bool displayFrozen = CoordSys.IsTranslationRunFrozen();
+    const NCTranslationSnapshot display = displayFrozen ?
+        CoordSys.GetTranslationSnapshot() : NCTranslationSnapshot{};
+    const bool displayInch = displayFrozen ? display.unitsMode == 20 : CoordSys.isInchMode;
     const double unitScale = displayInch ? (1.0 / 25.4) : 1.0;
     double axisUnitScale[8] = {};
     for (int axis = 0; axis < 8; ++axis)
-        axisUnitScale[axis] = (m_motion.GetAxisContext(axis).axisType == AxisType::ROTARY ||
-            m_motion.GetAxisContext(axis).axisType == AxisType::ROTARY_CONTINUOUS) ?
-            1.0 : unitScale;
+        axisUnitScale[axis] = (displayFrozen ? display.axisIdentity.nativeUnit[axis] == 2U :
+            (m_motion.GetAxisContext(axis).axisType == AxisType::ROTARY ||
+             m_motion.GetAxisContext(axis).axisType == AxisType::ROTARY_CONTINUOUS)) ? 1.0 : unitScale;
 
     // =========================================================
     // 1. 軸啟用狀態 ($30 ~ $37)
     // =========================================================
     for (int i = 0; i < 8; i++) {
-        bool isExist = m_motion.GetAxisContext(i).isExist;
+        const bool isExist = displayFrozen ? display.axisIdentity.exists[i] == 1U :
+            m_motion.GetAxisContext(i).isExist;
         MacroSys.SetVar('$', 30 + i, isExist ? 1.0 : 0.0);
     }
 
@@ -62,8 +66,8 @@ void NCManager::UpdateSystemVariables()
     // =========================================================
     for (int i = 0; i < 8; i++) {
         double rawWCS = CoordSys.commandedMCS[i]
-            - CoordSys.extOffset[i]
-            - CoordSys.m_WCSTable[CoordSys.currentWCSIndex][i];
+            - (displayFrozen ? display.extOffsetMM[i] : CoordSys.extOffset[i])
+            - (displayFrozen ? display.wcsOffsetMM[i] : CoordSys.m_WCSTable[CoordSys.currentWCSIndex][i]);
         // 🌟 修改：乘上 unitScale
         MacroSys.SetVar('$', 120 + i, rawWCS * axisUnitScale[i]);
     }
@@ -71,25 +75,45 @@ void NCManager::UpdateSystemVariables()
     // =========================================================
     // 5. 刀長補償實際值 ($130 ~ $137) 與 刀徑半徑 ($138)
     // =========================================================
-    double cAngleMCS = CoordSys.commandedMCS[CoordSys.C_AXIS_INDEX];
+    double cAngleMCS = CoordSys.GetElectrodeRotationAngleMCS(CoordSys.commandedMCS);
     for (int i = 0; i < 8; i++) {
-        double activeToolLen = CoordSys.GetActiveToolOffset(i, cAngleMCS);
+        const double activeToolLen = displayFrozen ? NCTranslationToolOffsetMM(display, i) :
+            CoordSys.GetActiveToolOffset(i, cAngleMCS);
         MacroSys.SetVar('$', 130 + i, activeToolLen * axisUnitScale[i]);
     }
-    double activeToolRad = CoordSys.GetActiveToolRadius();
+    const double activeToolRad = displayFrozen ? display.cutterRadiusMM : CoordSys.GetActiveToolRadius();
     MacroSys.SetVar('$', 138, activeToolRad * unitScale); // 🌟 修改
 
     // =========================================================
     // 6. G68 旋轉參數 ($150 ~ $153)
     // =========================================================
-    if (CoordSys.IsTranslationRunFrozen())
+    if (displayFrozen)
     {
         // Report the frame used by commanded/actual inverse coordinates.
         // Interpreter modal group $16 retains its existing RESET semantics.
-        const NCTranslationSnapshot display = CoordSys.GetTranslationSnapshot();
-        MacroSys.SetVar('$', 150, display.rotationCenterMM[0] * unitScale);
-        MacroSys.SetVar('$', 151, display.rotationCenterMM[1] * unitScale);
-        MacroSys.SetVar('$', 152, 0.0); // Fixed G17 has no Z rotation centre.
+        if (display.rotationPlane == 17)
+        {
+            MacroSys.SetVar('$', 150, display.rotationCenterMM[0] * unitScale);
+            MacroSys.SetVar('$', 151, display.rotationCenterMM[1] * unitScale);
+            MacroSys.SetVar('$', 152, 0.0);
+        }
+        else
+        {
+            // BASE-PLANE-3: the snapshot owns canonical UV, but $150..152
+            // remain physical X/Y/Z centre readback, including during RESET.
+            NCArcPlaneAxes plane{};
+            double center[3] = {};
+            if (TryGetNCArcPlaneAxes(display.rotationPlane, plane))
+            {
+                center[plane.u] = display.rotationCenterMM[0];
+                center[plane.v] = display.rotationCenterMM[1];
+            }
+            else
+                for (unsigned axis = 0U; axis < 3U; ++axis)
+                    center[axis] = (std::numeric_limits<double>::quiet_NaN)();
+            for (unsigned axis = 0U; axis < 3U; ++axis)
+                MacroSys.SetVar('$', 150 + axis, center[axis] * unitScale);
+        }
         MacroSys.SetVar('$', 153, display.rotationAngleDeg);
     }
     else
@@ -107,14 +131,22 @@ void NCManager::UpdateSystemVariables()
     double workCenterY = CoordSys.rotationCenterMCS[1];
     double workCenterZ = CoordSys.rotationCenterMCS[2];
     double yaw = 0.0, pitch = 0.0, roll = 0.0;
-    if (CoordSys.IsTranslationRunFrozen())
+    if (displayFrozen)
     {
         // The displayed frame stays on the same source while RESET cleans
-        // live modes; a Z center does not participate in the fixed yaw map.
-        const NCTranslationSnapshot display = CoordSys.GetTranslationSnapshot();
-        workCenterX = display.workRotationCenterMM[0];
-        workCenterY = display.workRotationCenterMM[1];
-        workCenterZ = 0.0;
+        // live modes. The frozen G168 centre is canonical active-plane (u,v),
+        // so publish it back into physical XYZ system-variable slots.
+        workCenterX = workCenterY = workCenterZ = 0.0;
+        NCArcPlaneAxes plane{};
+        if (TryGetNCArcPlaneAxes(display.rotationPlane, plane))
+        {
+            double* center[3] = { &workCenterX, &workCenterY, &workCenterZ };
+            *center[plane.u] = display.workRotationCenterMM[0];
+            *center[plane.v] = display.workRotationCenterMM[1];
+        }
+        else
+            workCenterX = workCenterY = workCenterZ =
+                (std::numeric_limits<double>::quiet_NaN)();
         yaw = display.workOffset[CoordinateManager::WO_ANGLE_XY_YAW];
         pitch = display.workOffset[CoordinateManager::WO_ANGLE_XZ_PITCH];
         roll = display.workOffset[CoordinateManager::WO_ANGLE_YZ_ROLL];
@@ -136,8 +168,7 @@ void NCManager::UpdateSystemVariables()
     // 8. G51 縮放倍率 ($166)
     // =========================================================
     // Keep this parameter on the same immutable frame as WCS during RESET.
-    const double displayScale = CoordSys.IsTranslationRunFrozen() ?
-        CoordSys.GetTranslationSnapshot().scalingFactor :
+    const double displayScale = displayFrozen ? display.scalingFactor :
         (CoordSys.isScalingActive ? CoordSys.scaleFactor : 1.0);
     MacroSys.SetVar('$', 166, displayScale);
 

@@ -4,6 +4,7 @@
 #include "NCPathCoreFeedArc.h"
 #include <array>
 #include <cstdint>
+#include <cstddef>
 #include <type_traits>
 
 // BZ: immutable canonical geometry. No execution authority or provenance is
@@ -22,6 +23,9 @@ struct NCPathCoreRetainedGeometry
     int direction = 0;
     NCPathCoreRetainedKind kind = NCPathCoreRetainedKind::NONE;
     bool fullCircle = false, point = false, valid = false;
+    // Inherited numeric allowance only; source/owner checks stay with caller.
+    // Stored in existing tail padding. Lines and generated Q arcs keep zero.
+    float sourceRoundoffMM = 0.0f;
     void Clear() noexcept;
 };
 
@@ -129,6 +133,8 @@ private:
     double m_currentU = 0.0, m_selectedStartU = 0.0, m_selectedEndU = 0.0;
 };
 
+static_assert(offsetof(NCPathCoreRetainedGeometry, sourceRoundoffMM) == 380U,
+    "Source roundoff must occupy the existing retained tail padding.");
 static_assert(sizeof(NCPathCoreRetainedGeometry) == 384U,
     "BZ canonical geometry fixed storage budget changed.");
 static_assert(sizeof(NCPathCoreRetainedPath) == 6208U,

@@ -911,6 +911,9 @@
     <ClInclude Include="MotionFeedArcReceipt.h">
       <Filter>Header Files\Motion</Filter>
     </ClInclude>
+    <ClInclude Include="NCArcPlane.h">
+      <Filter>Header Files\NC\NC\NCPathCore</Filter>
+    </ClInclude>
     <ClInclude Include="NCPathCoreFeedArc.h">
       <Filter>Header Files\NC\NC\NCPathCore</Filter>
     </ClInclude>

@@ -1,5 +1,6 @@
 #include "MotionCore.h"
 #include "MotionRetainedInterval.h"
+#include "NCTranslationArcPrecision.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -186,18 +187,7 @@ namespace
         std::memset(static_cast<void*>(&command), 0, sizeof(command));
         command.execution.sourceBlockId = MOTION_SOURCE_BLOCK_ID_INVALID;
         command.sourceWCS = 54;
-        command.sourceTranslation.schema = 11U;
-        command.sourceTranslation.storedStrokeMode = 23;
-        command.sourceTranslation.cutterMode = 40;
-        command.sourceTranslation.polarMode = 15;
-        command.sourceTranslation.scalingMode = 50;
-        command.sourceTranslation.scalingFactor = 1.0;
-        command.sourceTranslation.distanceMode = 90;
-        command.sourceTranslation.unitsMode = 21;
-        command.sourceTranslation.toolLengthMode = 49;
-        command.sourceTranslation.workMode = 169;
-        command.sourceTranslation.rotationMode = 69;
-        command.sourceTranslation.rotationPlane = 17;
+        command.sourceTranslation = NCTranslationSnapshot{};
         command.sourceToolLengthMode = 49;
         command.sourceToolRadiusMode = 40;
         command.sourceIsAbsoluteMode = true;
@@ -276,6 +266,17 @@ bool MotionCore::TryPathCoreRetainedIntervalMoveTransactionalTail(
         m_pendingMirrorMask != 0U || m_pendingG16Active || m_pendingG162Active || m_pendingPlaneMode != 17)
     {
         result.code = MotionPathCoreRetainedCode::NOT_READY; return false;
+    }
+    // Retained arithmetic metadata carries no authority: bind every positive
+    // allowance to this fresh submission's current frozen source.
+    float sourceRoundoffMM = 0.0F;
+    if (geometry.sourceRoundoffMM != 0.0F &&
+        (IsNCTranslationSnapshotEmpty(m_pendingTranslation) ||
+            !TryGetNCTranslationArcRoundoffMM(m_pendingTranslation, sourceRoundoffMM, geometry.fullCircle) ||
+            geometry.sourceRoundoffMM != sourceRoundoffMM))
+    {
+        result.code = MotionPathCoreRetainedCode::GEOMETRY_REJECTED;
+        return false;
     }
     if (!PrepareRetainedTraversal(m_pContexts, geometry, startU, endU, feedMMMin,
         travelGuard, commandedMCSTail, workspace))

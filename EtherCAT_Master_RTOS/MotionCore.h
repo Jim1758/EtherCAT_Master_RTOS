@@ -652,9 +652,9 @@ inline bool IsMotionFixedTranslationToolSourceAllowed(const MotionCommand& comma
         (command.sourceToolLengthMode == 49 || !command.sourceG162Active);
 }
 
-// Fixed G68 / WORK yaw is baked into native XY geometry. The bounded
-// G90 G17 queue accepts plain XY lines, canonical circles and bounded Q
-// line/arc blends with this frozen descriptor; retained/reverse paths stay excluded.
+// Fixed G68 / plane-preserving WORK rotation is baked into native geometry.
+// G17 yaw retains its queued scope; G18 pitch / G19 roll remain EXACT_STOP in
+// BASE-PLANE-7. Retained/reverse paths stay excluded.
 inline bool IsMotionFixedRotationPathAllowed(const MotionCommand& command) noexcept
 {
     if (command.commandPathMode == MotionCommandPathMode::EXACT_STOP)
@@ -694,7 +694,7 @@ inline bool IsMotionFixedTranslationWorkSourceAllowed(const MotionCommand& comma
             (command.execution.source != MotionCommandSource::NC_MEMORY || command.sourceWCode == 0);
     return IsNCTranslationWorkModeAllowed(command.sourceG168Active, command.sourceWCode,
         command.sourceTranslation) && (!command.sourceG168Active || !command.sourceG162Active) &&
-        (command.sourceTranslation.workOffset[3] == 0.0 ||
+        (!NCTranslationHasWorkPlaneRotation(command.sourceTranslation) ||
             IsMotionFixedRotationPathAllowed(command));
 }
 
@@ -735,12 +735,14 @@ inline bool IsMotionFixedTranslationPolarSourceAllowed(const MotionCommand& comm
     return command.execution.source == MotionCommandSource::NC_MEMORY &&
         command.ownerLease.owner == MotionOwner::AUTO &&
         command.sourceIsAbsoluteMode && s.distanceMode == 90 &&
-        command.sourcePlaneMode == 17 && !command.sourceG162Active &&
+        IsNCArcPlaneCode(command.sourcePlaneMode) &&
+        command.sourcePlaneMode == s.rotationPlane && !command.sourceG162Active &&
         !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse &&
         !command.replayTerminalAlreadyPublished && !command.mem_enableTransform &&
         ((command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
             !command.cncFeedLookahead && !command.cncCornerBlend) ||
-         (command.commandPathMode == MotionCommandPathMode::CONTINUOUS &&
+         (command.sourcePlaneMode == 17 &&
+            command.commandPathMode == MotionCommandPathMode::CONTINUOUS &&
             command.cncFeedLookahead));
 }
 
@@ -752,12 +754,19 @@ inline bool IsMotionFixedTranslationCutterSourceAllowed(const MotionCommand& com
     if (!IsNCTranslationSnapshotValid(s) || command.sourceToolRadiusMode != s.cutterMode ||
         command.sourceDCode != s.cutterD) return false;
     if (s.cutterMode == 40) return true;
-    // The NC contour planner has already offset the native geometry. Only
-    // stopped XY lines or prepared partial circles carry cutter provenance.
+    // NC has already offset the physical tool-centre geometry. Lines use
+    // ascending physical XYZ; prepared circles use canonical u/v. BASE-PLANE-10
+    // admits explicit closed cutter circles in G18/G19; BASE-PLANE-11 also
+    // carries the frozen G91 identity, never reinterpreting native endpoints. It
+    // proves bit-exact physical seam, full sweep and frozen start geometry.
+    // A frozen frame alone grants neither replay nor blending.
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(s.rotationPlane, plane)) return false;
     const bool line = command.mode == InterpolationMode::LINEAR &&
         command.pathCoreFeedExactStop && !command.pathCorePlanarCircle && !command.pathCoreFullCircle;
     const bool arc = command.pathCorePlanarCircle && !command.pathCoreFeedExactStop &&
-        !command.pathCoreFullCircle &&
+        IsNCTranslationCutterArcNotationAllowed(s.rotationPlane, s.distanceMode,
+            s.polarMode, command.pathCoreFullCircle) &&
         ((command.mode == InterpolationMode::CIRCULAR_CW && command.dir == -1) ||
             (command.mode == InterpolationMode::CIRCULAR_CCW && command.dir == 1));
     return command.execution.source == MotionCommandSource::NC_MEMORY &&
@@ -766,13 +775,64 @@ inline bool IsMotionFixedTranslationCutterSourceAllowed(const MotionCommand& com
         !command.cncFeedLookahead && !command.cncCornerBlend &&
         !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse &&
         !command.replayTerminalAlreadyPublished && !command.mem_enableTransform &&
-        command.sourceIsAbsoluteMode && command.sourcePlaneMode == 17 &&
-        !command.sourceG16Active && !command.sourceG162Active &&
-        command.axisCount == 2 && command.axisIndices[0] == 0 && command.axisIndices[1] == 1;
+        IsNCTranslationCutterDistanceModeAllowed(s.rotationPlane, s.distanceMode) &&
+        command.sourceIsAbsoluteMode == (s.distanceMode == 90) && command.sourcePlaneMode == s.rotationPlane &&
+        command.sourceG16Active == (s.polarMode == 16) && !command.sourceG162Active &&
+        // BASE-PLANE-15: G16 also grants NC-proved IJK seam circles here.
+        // Rapid, replay and incremental polar remain closed. RT checks native
+        // circle geometry/start/end bits, never authored angles or turn counts.
+        IsNCTranslationCutterNotationAllowed(s.rotationPlane, s.distanceMode, s.polarMode) &&
+        ((line && IsNCPlaneLinearPairMapping(s.rotationPlane, command.axisCount, command.axisIndices)) ||
+            (arc && command.axisCount == 2 &&
+                command.axisIndices[0] == static_cast<int>(plane.u) &&
+                command.axisIndices[1] == static_cast<int>(plane.v)));
+}
+
+// Canonical circle coordinates are packet slots 0/1; physical axes depend
+// on the frozen plane. Keep the RT endpoint/drain proof tied to both maps.
+inline bool IsMotionArcPlaneGroupMapping(const MotionCommand& command,
+    int groupAxisCount, const int* groupAxes) noexcept
+{
+    NCArcPlaneAxes plane{};
+    return groupAxes != nullptr && TryGetNCArcPlaneAxes(command.sourcePlaneMode, plane) &&
+        command.axisCount == 2 && groupAxisCount == 2 &&
+        command.axisIndices[0] == static_cast<int>(plane.u) &&
+        command.axisIndices[1] == static_cast<int>(plane.v) &&
+        groupAxes[0] == command.axisIndices[0] && groupAxes[1] == command.axisIndices[1];
+}
+
+// BASE-PLANE-2: non-XY source authorizes one neutral stopped native XYZ
+// line or plane-mapped circle. Keep this existing helper name for callers.
+// Retained replay, queued blending, helix and legacy callers stay G17;
+// the cutter source gate independently checks literal-contour payload shape.
+inline bool IsMotionBaseArcPlaneSourceAllowed(const MotionCommand& command) noexcept
+{
+    if (command.sourcePlaneMode == 17) return true;
+    NCArcPlaneAxes plane{};
+    return TryGetNCArcPlaneAxes(command.sourcePlaneMode, plane) &&
+        IsNCTranslationSnapshotValid(command.sourceTranslation) &&
+        IsNCTranslationBaseArcPlaneFrame(command.sourceTranslation) &&
+        command.sourcePlaneMode == command.sourceTranslation.rotationPlane &&
+        command.execution.source == MotionCommandSource::NC_MEMORY &&
+        command.ownerLease.owner == MotionOwner::AUTO &&
+        command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        !command.cncFeedLookahead && !command.cncCornerBlend &&
+        !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse &&
+        !command.replayTerminalAlreadyPublished && !command.mem_enableTransform &&
+        ((command.pathCorePlanarCircle && !command.pathCoreFeedExactStop &&
+            command.axisCount == 2 && command.axisIndices[0] == static_cast<int>(plane.u) &&
+            command.axisIndices[1] == static_cast<int>(plane.v) &&
+            ((command.mode == InterpolationMode::CIRCULAR_CW && command.dir == -1) ||
+                (command.mode == InterpolationMode::CIRCULAR_CCW && command.dir == 1))) ||
+         (command.mode == InterpolationMode::LINEAR && !command.pathCorePlanarCircle &&
+            !command.pathCoreFullCircle && IsNCNativeXYZLinearMapping(command.axisCount, command.axisIndices) &&
+            command.dir == 0 && command.startRadius == 0.0 && command.endRadius == 0.0 &&
+            command.cncPrefixVelocityPPS == 0.0));
 }
 
 inline bool IsMotionFixedTranslationSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (!IsMotionBaseArcPlaneSourceAllowed(command)) return false;
     if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
         return command.sourceWCS == 54 && IsMotionFixedTranslationToolSourceAllowed(command) &&
             IsMotionFixedTranslationWorkSourceAllowed(command) &&
@@ -783,12 +843,13 @@ inline bool IsMotionFixedTranslationSourceAllowed(const MotionCommand& command) 
     // G49 with no WORK leaves the G00 C-offset flag dormant. Active H or
     // WORK requires its frozen identity and G163; no dynamic transform authority.
     return IsNCTranslationSourceAllowed(command.sourceWCS, command.sourceTranslation) &&
+        (command.sourceG162Active ? 1U : 0U) == command.sourceTranslation.axisIdentity.eccentricEnabled &&
         (command.sourceIsAbsoluteMode ? 90 : 91) == command.sourceTranslation.distanceMode &&
         (command.sourceTranslation.distanceMode != 91 ||
             (command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
                 !command.cncFeedLookahead && !command.cncCornerBlend &&
                 !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse)) &&
-        command.sourcePlaneMode == 17 &&
+        command.sourcePlaneMode == command.sourceTranslation.rotationPlane &&
         IsMotionFixedTranslationToolSourceAllowed(command) && IsMotionFixedTranslationCutterSourceAllowed(command) &&
         IsMotionFixedTranslationRotationSourceAllowed(command) && IsMotionFixedTranslationWorkSourceAllowed(command) &&
         IsMotionFixedTranslationScaleMirrorSourceAllowed(command) &&
@@ -805,8 +866,8 @@ static_assert(
 
 #if defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__)
 static_assert(
-    sizeof(MotionCommand) == 1016U && alignof(MotionCommand) == 8U,
-    "Fixed cutter source proof appends 448 bytes; rebuild every RTSS translation unit.");
+    sizeof(MotionCommand) == 1064U && alignof(MotionCommand) == 8U,
+    "Fixed axis/coordinate source proof appends 496 bytes; rebuild every RTSS translation unit.");
 static_assert(offsetof(MotionCommand, sourceTranslation) == 568U,
     "Fixed translation must preserve every pre-existing command offset.");
 static_assert(offsetof(MotionCommand, cncPrefixVelocityPPS) == 560U,
@@ -2662,15 +2723,18 @@ public:
     void SetNextCommandTranslation(const NCTranslationSnapshot& snapshot) noexcept
     { m_pendingTranslation = snapshot; }
     bool PublishNCTranslation(const NCTranslationSnapshot& snapshot) noexcept
-    { return m_translationPublication.Publish(snapshot); }
+    { return IsNCTranslationAxisIdentityCurrent(snapshot) && m_translationPublication.Publish(snapshot); }
     // NC writer only: replace the distance interpretation after exact RT drain.
     // Geometry, run identity and the accepted native endpoint remain unchanged.
     MotionNCTranslationTransitionResult TryTransitionNCTranslation(const NCTranslationSnapshot& previous,
         const NCTranslationSnapshot& next, MotionExecutionEpoch executionEpoch,
         const MotionOwnerLease& ownerLease) noexcept;
     void RetireNCTranslation() noexcept { m_translationPublication.Retire(); }
+    // Read-only bounded drain/predecessor proof for a native G53 handoff.
+    MotionNCTranslationTransitionResult CheckG53NativeHandoff(const NCTranslationSnapshot& snapshot,
+        MotionExecutionEpoch executionEpoch, const MotionOwnerLease& ownerLease) noexcept;
     bool MatchesNCTranslation(const NCTranslationSnapshot& snapshot) const noexcept
-    { return m_translationPublication.Matches(snapshot); }
+    { return IsNCTranslationAxisIdentityCurrent(snapshot) && m_translationPublication.Matches(snapshot); }
     std::uint64_t GetActiveTranslationGeneration() const noexcept
     { return m_translationPublication.Generation(); }
 
@@ -3449,7 +3513,8 @@ private:
         double* commandedMCSTail,
         bool transactionalTail,
         MotionCommandedEndpointReceiptV1* commandedEndpointReceipt = nullptr,
-        bool requirePlanarBaselineMatch = false);
+        bool requirePlanarBaselineMatch = false,
+        bool useG53Profile = false);
     // RT-only natural completion for frozen planar or incremental NC lines.
     bool IsFixedPlanarLineEndpointScope() const noexcept;
     bool IsCncLineEndpointScope() const noexcept;
@@ -3671,6 +3736,7 @@ private:
     void DiscardStaleQueuedCommands();
     void ApplyPendingExecutionEpochChange();
 
+    bool IsNCTranslationAxisIdentityCurrent(const NCTranslationSnapshot& snapshot) const noexcept;
     NCTranslationSnapshot m_pendingTranslation{}; // NC producer only.
     MotionNCTranslationPublication m_translationPublication{};
     bool IsPendingCommandTranslationValid(MotionCommandSource source) const noexcept
@@ -3681,15 +3747,17 @@ private:
                 !m_pendingG68Active && !m_pendingG51Active && m_pendingMirrorMask == 0U &&
                 !m_pendingG16Active && GetActiveTranslationGeneration() == 0ULL;
         return IsNCTranslationSourceAllowed(m_pendingSourceWCS, m_pendingTranslation) &&
+            (m_pendingG162Active ? 1U : 0U) == m_pendingTranslation.axisIdentity.eccentricEnabled &&
             (m_pendingIsAbsoluteMode ? 90 : 91) == m_pendingTranslation.distanceMode &&
-            m_pendingPlaneMode == 17 &&
+            m_pendingPlaneMode == m_pendingTranslation.rotationPlane &&
             IsNCTranslationToolModeAllowed(m_pendingToolMode, m_pendingTranslation) &&
             m_pendingHCode == m_pendingTranslation.toolHCode &&
             (m_pendingToolMode == 49 || !m_pendingG162Active) &&
             m_pendingToolRadMode == m_pendingTranslation.cutterMode &&
             m_pendingDCode == m_pendingTranslation.cutterD &&
             (m_pendingTranslation.cutterMode == 40 ||
-                (m_pendingIsAbsoluteMode && !m_pendingG16Active && !m_pendingG162Active)) &&
+                (IsNCTranslationCutterNotationAllowed(m_pendingPlaneMode, m_pendingIsAbsoluteMode ? 90 : 91,
+                    m_pendingG16Active ? 16 : 15) && !m_pendingG162Active)) &&
             IsNCTranslationRotationModeAllowed(m_pendingG68Active, m_pendingG68Angle,
                 m_pendingPlaneMode, m_pendingTranslation) &&
             (!m_pendingG68Active || !m_pendingG162Active) &&
@@ -4069,7 +4137,7 @@ public:
         // EF: endpoint-word presence, distinct from the physical XY arc mask.
         std::uint32_t endpointAxisMask = 3U,
         bool requirePlanarBaselineMatch = false,
-        // NC contour geometry only: fully resolved partial XY cutter circle.
+        // NC contour geometry only: fully resolved partial canonical-plane cutter circle.
         bool preparedCutterArc = false);
 
     // BZ: evaluate the original canonical line/circle in either direction.
@@ -4090,6 +4158,10 @@ public:
 
     void G07_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G07 快速定位 API
     void G161_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G161 快速定位 API
+    // Native mm/degrees, absolute exact-stop. Commits MCS/pulse tails only
+    // after the same epoch/owner/enqueue proof used by transactional G00.
+    bool TryG53MoveTransactionalTail(const std::vector<int>& axes,
+        const std::vector<double>& nativeTargets, double* commandedMCSTail);
     void G53_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G53 機械定位 API
     void G28_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm, const std::vector<double>* intermediatePos_mm, BufferMode mode);// G28 參考點賦歸 API
     void G30_Move(const std::vector<int>& axes, const std::vector<double>& refPos_mm, const std::vector<double>* intermediatePos_mm, BufferMode mode);// G30 參考點賦歸 API

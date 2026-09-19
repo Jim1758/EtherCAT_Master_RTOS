@@ -13,6 +13,8 @@ namespace GCodeHandlers
     WaitConditionFunc Handle_G28(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G30(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G32(const NCBlock& block, NCManager* nc);
+    // Whole-block preflight before any same-line settings, T or M side effect.
+    bool ValidateG53Block(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G53(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G04(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G68(const NCBlock& block, NCManager* nc);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "NCTranslationSnapshot.h"
+
 #include <cmath>
 #include <limits>
 
@@ -95,4 +97,89 @@ inline bool TryResolveNCPathRadiusArcCenter(
     offsetX = candidateX;
     offsetY = candidateY;
     return true;
+}
+
+
+// BASE-PLANE-20. NC-side G17/G18/G19 G40 G90 G16 R partial arc.
+// A nonempty authored plane mask permits radius-only or angle-only endpoints.
+// Missing values come from the accepted native tail, never a stale polar cache.
+// Authored radius and R are in the selected length unit, angle is in degrees.
+// Outputs are native XYZ and canonical (u,v) centre offsets. No RT resampling,
+// allocation, queue publication, modal mutation or ownership is performed.
+// Caller must still prove the accepted native/pulse start immediately before
+// publishing and check the complete circle bounds using the actual axis policy.
+struct NCPathPolarRadiusArcNative
+{
+    double endMCS[8] = {};
+    double centerOffsetMM[2] = {};
+    int direction = 0;
+};
+
+inline bool TryResolveNCPathPolarRadiusArcEndpoint(const NCTranslationSnapshot& source,
+    const double* acceptedMCS, std::uint32_t authoredEndpointAxisMask,
+    double authoredRadius, double angleDeg,
+    double authoredArcRadius, int programmedDirection,
+    NCPathPolarRadiusArcNative& output) noexcept
+{
+    NCArcPlaneAxes plane{};
+    if (!acceptedMCS || !IsNCTranslationSnapshotValid(source) ||
+        !IsNCArcPlaneCode(source.rotationPlane) || source.axisIdentity.eccentricEnabled != 0U ||
+        source.distanceMode != 90 || source.polarMode != 16 || source.cutterMode != 40 ||
+        !TryGetNCArcPlaneAxes(source.rotationPlane, plane) ||
+        authoredEndpointAxisMask == 0U || (authoredEndpointAxisMask & ~plane.mask) != 0U ||
+        (programmedDirection != -1 && programmedDirection != 1) ||
+        !std::isfinite(authoredArcRadius) || authoredArcRadius == 0.0)
+        return false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        if (!std::isfinite(acceptedMCS[axis])) return false;
+
+    const bool hasRadius = (authoredEndpointAxisMask & (1U << plane.u)) != 0U;
+    const bool hasAngle = (authoredEndpointAxisMask & (1U << plane.v)) != 0U;
+    // Absent word storage is not a value. Ignore even NaN sentinels there.
+    if ((hasRadius && (!std::isfinite(authoredRadius) || authoredRadius < 0.0)) ||
+        (hasAngle && !std::isfinite(angleDeg))) return false;
+    const double radiusMM = hasRadius ? NCTranslationLengthToMM(authoredRadius, source.unitsMode) : 0.0;
+    const double signedArcRadiusMM = NCTranslationLengthToMM(authoredArcRadius, source.unitsMode) *
+        (source.scalingMode == 51 ? source.scalingFactor : 1.0);
+    if (!std::isfinite(radiusMM) || !std::isfinite(signedArcRadiusMM) || signedArcRadiusMM == 0.0)
+        return false;
+    double words[8] = {}, nativePoint[8] = {};
+    bool selected[8] = {};
+    words[plane.u] = radiusMM;
+    words[plane.v] = hasAngle ? angleDeg : 0.0;
+    selected[plane.u] = hasRadius;
+    selected[plane.v] = hasAngle;
+    // The existing polar decoder owns affine inverse, unit-native baseline,
+    // modulo-degree reduction and conservative transformed-origin rejection.
+    // It also validates the full-pair path without any inverse inference.
+    if (!TryCompleteNCTranslationPolarEndpoint(source, acceptedMCS, words, selected)) return false;
+    NCTranslationForwardPoint(source, words, nativePoint);
+    NCPathPolarRadiusArcNative candidate{};
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        candidate.endMCS[axis] = (axis == plane.u || axis == plane.v) ? nativePoint[axis] : acceptedMCS[axis];
+        if (!std::isfinite(candidate.endMCS[axis])) return false;
+    }
+    const bool mirrored = ((source.mirrorMask & (1U << plane.u)) != 0U) !=
+        ((source.mirrorMask & (1U << plane.v)) != 0U);
+    candidate.direction = programmedDirection * (mirrored ? -1 : 1);
+    // Reject coincident/alias/rounded-collapse endpoints and undersized R.
+    // The existing strict native roundoff budget is unchanged.
+    if (!TryResolveNCPathRadiusArcCenter(acceptedMCS[plane.u], acceptedMCS[plane.v],
+        candidate.endMCS[plane.u], candidate.endMCS[plane.v], signedArcRadiusMM,
+        candidate.direction, candidate.centerOffsetMM[0], candidate.centerOffsetMM[1])) return false;
+    output = candidate;
+    return true;
+}
+
+// Preserve the established complete-pair call contract and arithmetic order.
+inline bool TryResolveNCPathPolarRadiusArc(const NCTranslationSnapshot& source,
+    const double* acceptedMCS, double authoredRadius, double angleDeg,
+    double authoredArcRadius, int programmedDirection,
+    NCPathPolarRadiusArcNative& output) noexcept
+{
+    NCArcPlaneAxes plane{};
+    if (!TryGetNCArcPlaneAxes(source.rotationPlane, plane)) return false;
+    return TryResolveNCPathPolarRadiusArcEndpoint(source, acceptedMCS, plane.mask,
+        authoredRadius, angleDeg, authoredArcRadius, programmedDirection, output);
 }

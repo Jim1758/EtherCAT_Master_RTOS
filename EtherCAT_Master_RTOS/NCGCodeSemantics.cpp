@@ -1,4 +1,5 @@
 #include "NCGCodeSemantics.h"
+#include "NCWorkCoordinateCode.h"
 #include <algorithm>
 
 namespace
@@ -25,19 +26,7 @@ namespace
 
     bool IsExtendedWorkCoordinateCode(int code) noexcept
     {
-        if (code < 54 || code > 959)
-        {
-            return false;
-        }
-
-        const int suffix = code % 100;
-        const int prefix = code / 100;
-
-        return
-            suffix >= 54 &&
-            suffix <= 59 &&
-            prefix >= 0 &&
-            prefix <= 9;
+        return IsNCWorkCoordinateCode(code);
     }
 
     int SafeStoredGCodeCount(const NCBlock& block) noexcept
@@ -93,6 +82,10 @@ namespace NCGCodeSemantics
             // ---------------------------------------------------------
             // Primary motion / machine actions
             // ---------------------------------------------------------
+        case 53: // Standalone, non-modal machine positioning.
+            descriptor = MakeDescriptor(code, NCGCodeModalGroup::NONE,
+                NCGCodeRole::PRIMARY_ACTION, 200, true, true, true);
+            return true;
         case 0:
         case 1: // BX: explicit G01 feed line, mm/min.
         case 2: // BY-ARC: explicit G17 XY arc, exact stop.
@@ -101,7 +94,6 @@ namespace NCGCodeSemantics
         case 28:
         case 30:
         case 32:
-        case 53:
         case 81:
         case 161:
             descriptor = MakeDescriptor(

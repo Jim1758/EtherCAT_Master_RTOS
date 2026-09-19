@@ -8,6 +8,7 @@
 #include "SHM_Types.h"
 #include "AlarmManager.h"
 #include "NCPathCoreFeedArc.h" // BY fixed planar circle consumer geometry
+#include "NCTranslationArcPrecision.h"
 #include "MotionRetainedInterval.h" // CA canonical interval transport and evaluation
 
 namespace
@@ -266,6 +267,66 @@ namespace
         return mask;
     }
 
+    // Source-derived arithmetic tolerance is recomputed from the immutable
+    // packet; no new packet bytes, live coordinate tables or execution authority.
+    bool TryGetMotionArcSourceRoundoffPulse(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts, double& outputPulse, double& outputMM) noexcept
+    {
+        outputPulse = outputMM = 0.0;
+        if (IsNCTranslationSnapshotEmpty(command.sourceTranslation)) return true;
+        float sourceRoundoffMM = 0.0F;
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(command.sourcePlaneMode, plane)) return false;
+        const unsigned planeSlots[2] = { plane.u, plane.v };
+        if (!IsMotionFixedTranslationSourceAllowed(command) || contexts == nullptr ||
+            contexts->size() <= plane.u || contexts->size() <= plane.v || contexts->size() > MAX_AXES ||
+            !TryGetNCTranslationArcRoundoffMM(command.sourceTranslation, sourceRoundoffMM, command.pathCoreFullCircle)) return false;
+        double pulsePerMM = 0.0;
+        for (std::size_t axisIndex = 0U; axisIndex < 2U; ++axisIndex)
+        {
+            const AxisContext& axis = (*contexts)[planeSlots[axisIndex]];
+            if (!axis.isExist || axis.axisType != AxisType::LINEAR ||
+                !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+                !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0) return false;
+            const double scale = axis.resolution_PPR / axis.finalLead;
+            if (!std::isfinite(scale) || scale <= 0.0 ||
+                (axisIndex != 0U && scale != pulsePerMM)) return false;
+            pulsePerMM = scale;
+        }
+        const double value = static_cast<double>(sourceRoundoffMM) * pulsePerMM;
+        if (!std::isfinite(value) || value < 0.0 ||
+            (sourceRoundoffMM > 0.0F && value == 0.0)) return false;
+        outputPulse = value;
+        outputMM = static_cast<double>(sourceRoundoffMM);
+        return true;
+    }
+
+    bool IsMotionArcPulsePrecisionWithinBudget(const std::vector<AxisContext>* contexts,
+        double sx, double sy, double ex, double ey, double cx, double cy,
+        double radius, double sourceRoundoffMM, int activePlane = 17) noexcept
+    {
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(activePlane, plane) || contexts == nullptr ||
+            contexts->size() <= plane.u || contexts->size() <= plane.v) return false;
+        const AxisContext& axis = (*contexts)[plane.u];
+        const double pulsePerMM = axis.resolution_PPR / axis.finalLead;
+        if (!std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+            !std::isfinite(pulsePerMM) || pulsePerMM <= 0.0 ||
+            !std::isfinite(sourceRoundoffMM) || sourceRoundoffMM < 0.0) return false;
+        double magnitude = 0.0;
+        const double values[] = { sx, sy, ex, ey, cx, cy, radius };
+        for (double value : values)
+        {
+            if (!std::isfinite(value)) return false;
+            magnitude = (std::max)(magnitude, std::fabs(value));
+        }
+        const double nativeBudgetMM =
+            (64.0 * std::numeric_limits<double>::epsilon() * magnitude) / pulsePerMM;
+        const double combinedMM = 2.0 * (nativeBudgetMM + sourceRoundoffMM);
+        return std::isfinite(combinedMM) && combinedMM <= 1.0e-7;
+    }
+
     // BZ uses the two remaining dir-padding flags and existing mem_* bytes.
     // These values are canonical path data, never a legacy history snapshot.
     bool IsMotionCommandRetainedGeometryValid(const MotionCommand& command,
@@ -339,6 +400,11 @@ namespace
                 ((length == 0.0 && command.mem_totalDist == 0.0 && command.targetVel == 0.0) ||
                     (length > 0.0 && command.mem_totalDist > 0.0 && command.targetVel >= 1.0));
         }
+        double sourceRoundoffPulse = 0.0, sourceRoundoffMM = 0.0;
+        if (!TryGetMotionArcSourceRoundoffPulse(command, contexts, sourceRoundoffPulse, sourceRoundoffMM) ||
+            !IsMotionArcPulsePrecisionWithinBudget(contexts,
+                command.mem_startPos[0], command.mem_startPos[1], command.mem_ratio[0], command.mem_ratio[1],
+                command.mem_centerX, command.mem_centerY, command.mem_radius, sourceRoundoffMM)) return false;
         // Validate the queued canonical circle without deriving a replacement
         // radius, start angle or sweep. A corrupted angle cannot authorize an
         // interior jump merely because its target endpoint still looks valid.
@@ -360,7 +426,7 @@ namespace
                 const double expected = end == 0 ? command.mem_startPos[axis] : command.mem_ratio[axis];
                 const double error = std::abs(evaluated - expected);
                 if (!std::isfinite(evaluated) ||
-                    error > 64.0 * std::numeric_limits<double>::epsilon() * scale || error / ppm > 5e-8)
+                    error > 64.0 * std::numeric_limits<double>::epsilon() * scale + sourceRoundoffPulse || error / ppm > 5e-8)
                     return false;
             }
         }
@@ -476,8 +542,14 @@ namespace
         return true;
     }
 
-    bool ResolveCncPlanarCircle(const MotionCommand& command, NCPathCoreArcPulseGeometry& circle) noexcept
+    bool ResolveCncPlanarCircle(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts, NCPathCoreArcPulseGeometry& circle) noexcept
     {
+        double sourceRoundoffPulse = 0.0, sourceRoundoffMM = 0.0;
+        if (!TryGetMotionArcSourceRoundoffPulse(command, contexts, sourceRoundoffPulse, sourceRoundoffMM) ||
+            !IsMotionArcPulsePrecisionWithinBudget(contexts,
+                command.mem_startPos[0], command.mem_startPos[1], command.targetPos[0], command.targetPos[1],
+                command.centerPos[0], command.centerPos[1], command.startRadius, sourceRoundoffMM)) return false;
         // ED: full-circle closure is immutable packet geometry, including signed zero.
         if (command.pathCoreFullCircle &&
             (std::memcmp(&command.mem_startPos[0], &command.targetPos[0], sizeof(double)) != 0 ||
@@ -490,20 +562,35 @@ namespace
             command.startRadius != command.endRadius || command.mem_radius != command.startRadius ||
             !ResolveNCPathCorePlanarCirclePulse(command.mem_startPos[0], command.mem_startPos[1],
                 command.targetPos[0], command.targetPos[1], command.centerPos[0], command.centerPos[1],
-                command.startRadius, command.dir, command.pathCoreFullCircle, circle)) return false;
+                command.startRadius, command.dir, command.pathCoreFullCircle, circle, sourceRoundoffPulse)) return false;
         return command.mem_startAngle == circle.startAngle && command.mem_totalAngle == circle.sweepRadians &&
             command.mem_totalDist == circle.lengthPulse;
     }
 
-    bool ResolveCutterPlanarCircle(const MotionCommand& command, NCPathCoreArcPulseGeometry& circle) noexcept
+    bool ResolveCutterPlanarCircle(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts, NCPathCoreArcPulseGeometry& circle) noexcept
     {
+        NCArcPlaneAxes plane{};
+        if (!TryGetNCArcPlaneAxes(command.sourcePlaneMode, plane)) return false;
+        // mem_startPos is PHYSICAL XYZ; target/centre arrays are packet u/v.
+        // Validate the exact same metric and circle used by the producer.
+        double sourceRoundoffPulse = 0.0, sourceRoundoffMM = 0.0;
+        if (!TryGetMotionArcSourceRoundoffPulse(command, contexts, sourceRoundoffPulse, sourceRoundoffMM) ||
+            !IsMotionArcPulsePrecisionWithinBudget(contexts,
+                command.mem_startPos[plane.u], command.mem_startPos[plane.v], command.targetPos[0], command.targetPos[1],
+                command.centerPos[0], command.centerPos[1], command.startRadius, sourceRoundoffMM,
+                command.sourcePlaneMode)) return false;
+        if (command.pathCoreFullCircle &&
+            (command.sourcePlaneMode == 17 ||
+                std::memcmp(&command.mem_startPos[plane.u], &command.targetPos[0], sizeof(double)) != 0 ||
+                std::memcmp(&command.mem_startPos[plane.v], &command.targetPos[1], sizeof(double)) != 0)) return false;
         if (command.sourceTranslation.cutterMode == 40 ||
             !IsMotionFixedTranslationCutterSourceAllowed(command) || !command.pathCorePlanarCircle ||
             command.startRadius != command.endRadius || command.mem_radius != command.startRadius ||
-            !std::isfinite(command.mem_startPos[2]) ||
-            !ResolveNCPathCorePlanarCirclePulse(command.mem_startPos[0], command.mem_startPos[1],
+            !std::isfinite(command.mem_startPos[plane.normal]) ||
+            !ResolveNCPathCorePlanarCirclePulse(command.mem_startPos[plane.u], command.mem_startPos[plane.v],
                 command.targetPos[0], command.targetPos[1], command.centerPos[0], command.centerPos[1],
-                command.startRadius, command.dir, false, circle)) return false;
+                command.startRadius, command.dir, command.pathCoreFullCircle, circle, sourceRoundoffPulse)) return false;
         return command.mem_startAngle == circle.startAngle && command.mem_totalAngle == circle.sweepRadians &&
             command.mem_totalDist == circle.lengthPulse;
     }
@@ -546,6 +633,7 @@ namespace
         const MotionCommand& command,
         const std::vector<AxisContext>* contexts) noexcept
     {
+        if (!IsMotionBaseArcPlaneSourceAllowed(command)) return false;
         if ((!IsNCTranslationSnapshotEmpty(command.sourceTranslation) ||
                 command.sourceToolRadiusMode != 40) &&
             !IsMotionFixedTranslationSourceAllowed(command)) return false;
@@ -564,7 +652,7 @@ namespace
                 !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) ||
                 !IsMotionFixedTranslationPolarSourceAllowed(command) || command.sourceG162Active ||
                 (!command.sourceIsAbsoluteMode && IsNCTranslationSnapshotEmpty(command.sourceTranslation)) ||
-                !IsMotionFixedTranslationSourceAllowed(command) || command.sourcePlaneMode != 17 ||
+                !IsMotionFixedTranslationSourceAllowed(command) || !IsNCArcPlaneCode(command.sourcePlaneMode) ||
                 !IsMotionFixedTranslationToolSourceAllowed(command) || !IsMotionFixedTranslationCutterSourceAllowed(command))) return false;
 
         if (command.cncFeedLookahead &&
@@ -596,7 +684,9 @@ namespace
         if (!IsMotionCommandRetainedGeometryValid(command, contexts))
             return false;
 
-        // BY: flags authorize only the bounded native XY circle contract.
+        NCArcPlaneAxes arcPlane{};
+        if (command.pathCorePlanarCircle && !TryGetNCArcPlaneAxes(command.sourcePlaneMode, arcPlane)) return false;
+        // Plane-bearing flags authorize only the bounded native circle contract.
         // Legacy LINEAR / spiral commands keep both flags false.
         if (command.pathCoreFullCircle && !command.pathCorePlanarCircle)
         {
@@ -604,7 +694,8 @@ namespace
         }
         if (command.pathCorePlanarCircle &&
             (command.axisCount != 2 ||
-                command.axisIndices[0] != 0 || command.axisIndices[1] != 1 ||
+                command.axisIndices[0] != static_cast<int>(arcPlane.u) ||
+                command.axisIndices[1] != static_cast<int>(arcPlane.v) ||
                 command.commandPathMode != (command.cncFeedLookahead ?
                     MotionCommandPathMode::CONTINUOUS : MotionCommandPathMode::EXACT_STOP) ||
                 !std::isfinite(command.startRadius) || command.startRadius <= 0.0 ||
@@ -630,7 +721,7 @@ namespace
             NCPathCoreArcPulseGeometry circle{};
             double speed = 0.0, acc = 0.0, dec = 0.0;
             double prefix = 0.0;
-            if (!(command.cncCornerBlend ? ResolveCncCornerBlend(command, prefix) : ResolveCncPlanarCircle(command, circle)) ||
+            if (!(command.cncCornerBlend ? ResolveCncCornerBlend(command, prefix) : ResolveCncPlanarCircle(command, contexts, circle)) ||
                 !ComputeCncPathDynamics(command, speed, acc, dec)) return false;
             double ppm = 0.0;
             for (std::size_t i = 0U; i < 2U; ++i)
@@ -653,10 +744,11 @@ namespace
         if (command.pathCorePlanarCircle && command.sourceTranslation.cutterMode != 40)
         {
             NCPathCoreArcPulseGeometry circle{};
-            if (!ResolveCutterPlanarCircle(command, circle) || contexts->size() < 3U ||
+            if (!ResolveCutterPlanarCircle(command, contexts, circle) || contexts->size() < 3U ||
                 command.targetVel < 1.0 || command.accTime <= 0.0 || command.decTime <= 0.0)
                 return false;
             double ppm = 0.0;
+            unsigned planeAxesSeen = 0U;
             for (std::size_t i = 0U; i < 3U; ++i)
             {
                 const AxisContext& axis = (*contexts)[i];
@@ -665,14 +757,38 @@ namespace
                     !std::isfinite(scale) || scale <= 0.0 ||
                     !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
                     !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0) return false;
-                if (i < 2U)
+                if (i == arcPlane.u || i == arcPlane.v)
                 {
-                    if ((i != 0U && scale != ppm) || !std::isfinite(axis.maxVel_PPS) ||
+                    if ((planeAxesSeen != 0U && scale != ppm) || !std::isfinite(axis.maxVel_PPS) ||
                         command.targetVel > axis.maxVel_PPS ||
                         command.targetVel / scale > (100.0 / 60.0) *
                             (1.0 + 16.0 * std::numeric_limits<double>::epsilon())) return false;
                     ppm = scale;
+                    ++planeAxesSeen;
                 }
+            }
+            if (planeAxesSeen != 2U) return false;
+        }
+        // BASE-PLANE-20: G17 polar circles use the same axis metric and speed proof.
+        if (command.pathCorePlanarCircle && (command.sourcePlaneMode != 17 || command.sourceG16Active))
+        {
+            if (command.targetVel < 1.0 || command.accTime <= 0.0 || command.decTime <= 0.0) return false;
+            double ppm = 0.0;
+            for (unsigned component = 0U; component < 2U; ++component)
+            {
+                const unsigned slot = component == 0U ? arcPlane.u : arcPlane.v;
+                if (contexts->size() <= slot) return false;
+                const AxisContext& axis = (*contexts)[slot];
+                const double scale = axis.resolution_PPR / axis.finalLead;
+                if (!axis.isExist || axis.axisType != AxisType::LINEAR ||
+                    !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+                    !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+                    !std::isfinite(scale) || scale <= 0.0 ||
+                    (component != 0U && scale != ppm) || !std::isfinite(axis.maxVel_PPS) ||
+                    command.targetVel > axis.maxVel_PPS ||
+                    command.targetVel / scale > (100.0 / 60.0) *
+                        (1.0 + 16.0 * std::numeric_limits<double>::epsilon())) return false;
+                ppm = scale;
             }
         }
         std::array<bool, MAX_AXES> seen{};
@@ -7632,6 +7748,32 @@ bool MotionCore::IsCommandOwnerLeaseCurrent(
 }
 
 
+// Axis configuration is established before runtime startup. RT only reads its
+// own bounded physical context vector; NC letters, role and system mode are
+// frozen in the atomic source publication, never fetched through NC pointers.
+bool MotionCore::IsNCTranslationAxisIdentityCurrent(
+    const NCTranslationSnapshot& snapshot) const noexcept
+{
+    if (!IsNCAxisIdentitySnapshotValid(snapshot.axisIdentity) ||
+        m_pContexts == nullptr || m_pContexts->size() > 8U) return false;
+    for (std::size_t slot = 0U; slot < 8U; ++slot)
+    {
+        const bool exists = slot < m_pContexts->size() && (*m_pContexts)[slot].isExist;
+        if ((exists ? 1U : 0U) != snapshot.axisIdentity.exists[slot]) return false;
+        // Missing and configured-but-disabled axes use the same canonical
+        // absent identity. Do not read GetAxisContext's shared dummy here.
+        if (!exists) continue;
+        const AxisContext& axis = (*m_pContexts)[slot];
+        const std::uint32_t type = static_cast<std::uint32_t>(axis.axisType);
+        if (axis.axisIndex != static_cast<int>(slot) ||
+            snapshot.axisIdentity.physicalIndexPlusOne[slot] != slot + 1U ||
+            type > static_cast<std::uint32_t>(AxisType::ROTARY_CONTINUOUS) ||
+            type != snapshot.axisIdentity.axisType[slot]) return false;
+    }
+    return true;
+}
+
+
 MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
     const MotionCommand& command) const noexcept
 {
@@ -12126,7 +12268,7 @@ bool MotionCore::IsCncArcEndpointScope() const noexcept
         m_Group.virtualAxis.targetEndVel != 0.0 ||
         !std::isfinite(lookahead.entryCarry) || lookahead.entryCarry < 0.0 ||
         !IsMotionCommandConsumerGeometryValid(source, m_pContexts) ||
-        !ResolveCncPlanarCircle(source, circle) || lookahead.entryCarry >= circle.lengthPulse)
+        !ResolveCncPlanarCircle(source, m_pContexts, circle) || lookahead.entryCarry >= circle.lengthPulse)
         return false;
     if (lookahead.handoffFrom == MOTION_SEGMENT_ID_INVALID)
     {
@@ -12155,7 +12297,7 @@ bool MotionCore::HasCompletedCncLineEndpointProof(const MotionCommand& source,
         IsMotionCommandConsumerGeometryValid(source, m_pContexts);
     const bool queuedArc = source.pathCorePlanarCircle &&
         (source.mode == InterpolationMode::CIRCULAR_CW || source.mode == InterpolationMode::CIRCULAR_CCW) &&
-        IsMotionCommandConsumerGeometryValid(source, m_pContexts) && ResolveCncPlanarCircle(source, circle);
+        IsMotionCommandConsumerGeometryValid(source, m_pContexts) && ResolveCncPlanarCircle(source, m_pContexts, circle);
     if (!source.execution.IsAssigned() || source.execution.epoch != epoch ||
         source.execution.source != MotionCommandSource::NC_MEMORY ||
         !source.ownerLease.IsValid() || source.ownerLease.owner != MotionOwner::AUTO ||
@@ -12779,7 +12921,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             !m_safetyControlledStopInProgress && !IsPathCoreHoldExcursionDriving() &&
             !HasPendingSafetyOrRecoveryRequests() &&
             GetCommandAuthorizationFailure(dtCommand) == MotionRejectReason::NONE;
-        // EC: ordinary native G17 arcs have the same sub-PPS FIR tail as
+        // EC: ordinary native plane arcs have the same sub-PPS FIR tail as
         // DT lines. Only this exact NC source may extend the drain gate;
         // controlled stops, retained/EDM paths and queued arcs keep theirs.
         const bool ecArcTail = isHandoverReady && axis.isVirtualAxis &&
@@ -12788,9 +12930,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             (dtCommand.mode == InterpolationMode::CIRCULAR_CW ||
                 dtCommand.mode == InterpolationMode::CIRCULAR_CCW) &&
             m_Group.mode == dtCommand.mode &&
-            dtCommand.axisCount == 2 && m_Group.axisCount == 2 &&
-            dtCommand.axisIndices[0] == 0 && dtCommand.axisIndices[1] == 1 &&
-            m_Group.axisIndices[0] == 0 && m_Group.axisIndices[1] == 1 &&
+            IsMotionArcPlaneGroupMapping(dtCommand, m_Group.axisCount, m_Group.axisIndices) &&
             dtCommand.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
             m_Group.pathMode == PathMode::EXACT_STOP &&
             !dtCommand.cncFeedLookahead && !dtCommand.cncCornerBlend &&
@@ -14711,13 +14851,26 @@ bool MotionCore::TryLineMove(
         cncFeedLookahead && commandPathMode == MotionCommandPathMode::CONTINUOUS &&
         !pathCoreFeedExactStop && (cncCorner != nullptr || cncPrefixVelocityPPS == 0.0) &&
         axes.size() == 2U && axes[0] == 0 && axes[1] == 1;
-    if (!IsPendingCommandTranslationValid(commandSource) ||
+    // BASE-PLANE-2 producer gate precedes every aborting epoch/queue commit.
+    // Native XYZ lines do not inherit the circle's ordered (u,v) axis mapping.
+    const bool basePlaneLinear = m_pendingPlaneMode != 17;
+    const bool basePlaneLinearAllowed = commandSource == MotionCommandSource::NC_MEMORY &&
+        plannedTailWellFormed && commandOwnerLease.owner == MotionOwner::AUTO &&
+        IsNCTranslationSnapshotValid(m_pendingTranslation) &&
+        IsNCTranslationBaseArcPlaneFrame(m_pendingTranslation) &&
+        m_pendingPlaneMode == m_pendingTranslation.rotationPlane &&
+        IsNCNativeXYZLinearMapping(static_cast<int>(axes.size()), axes.data()) &&
+        mode == BufferMode::ABORTING && commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        !cncFeedLookahead && cncCorner == nullptr && cncPrefixVelocityPPS == 0.0;
+    if ((basePlaneLinear && !basePlaneLinearAllowed) ||
+        !IsPendingCommandTranslationValid(commandSource) ||
         (commandSource == MotionCommandSource::NC_MEMORY && m_pendingToolRadMode != 40 &&
             (!pathCoreFeedExactStop || !plannedTailWellFormed ||
                 commandOwnerLease.owner != MotionOwner::AUTO ||
                 mode != BufferMode::ABORTING || commandPathMode != MotionCommandPathMode::EXACT_STOP ||
                 cncFeedLookahead || cncCorner != nullptr || cncPrefixVelocityPPS != 0.0 ||
-                axes.size() != 2U || axes[0] != 0 || axes[1] != 1)) ||
+                !IsNCPlaneLinearPairMapping(m_pendingPlaneMode,
+                    static_cast<int>(axes.size()), axes.data()))) ||
         (commandSource == MotionCommandSource::NC_MEMORY && NCTranslationHasPlanarRotation(m_pendingTranslation) &&
             !fixedRotatedQueuedLine && (commandPathMode != MotionCommandPathMode::EXACT_STOP ||
                 cncFeedLookahead || cncCorner != nullptr)) ||
@@ -15763,7 +15916,7 @@ void MotionCore::RefreshCncFeedLookahead(bool loading) noexcept
         {
             NCPathCoreArcPulseGeometry circle{};
             if (next.mem_startPos[0] != previous[0] || next.mem_startPos[1] != previous[1] ||
-                !ResolveCncPlanarCircle(next, circle)) {
+                !ResolveCncPlanarCircle(next, m_pContexts, circle)) {
                 stop = CncFeedPlanStop::SCOPE; break;
             }
             length = circle.lengthPulse;
@@ -17329,29 +17482,40 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         if (cmd.pathCorePlanarCircle)
         {
             NCPathCoreArcPulseGeometry circle{};
+            double sourceRoundoffPulse = 0.0, sourceRoundoffMM = 0.0;
+            if (!TryGetMotionArcSourceRoundoffPulse(cmd, m_pContexts, sourceRoundoffPulse, sourceRoundoffMM) ||
+                !IsMotionArcPulsePrecisionWithinBudget(m_pContexts, sx, sy, ex, ey, cx, cy,
+                    cmd.startRadius, sourceRoundoffMM, cmd.sourcePlaneMode))
+            {
+                FailDerivedConsumerGeometry();
+                return;
+            }
             // ED: queued full circles use the immutable closed start/end below.
             // At a zero-speed seam the sampled start may carry prior FIR roundoff;
             // retain CncCircleStartMatches bounds before using canonical geometry.
             if (m_Group.pathMode != (cmd.cncFeedLookahead ? PathMode::CONTINUOUS : PathMode::EXACT_STOP) ||
                 m_Group.enableTransform || (cmd.cncFeedLookahead && !cncBoundaryCrossing && !CncCircleStartMatches(cmd, m_pContexts)) ||
                 (cmd.sourceTranslation.cutterMode != 40 &&
-                    (!ResolveCutterPlanarCircle(cmd, circle) || !CutterCircleStartMatches(cmd, m_pContexts))) ||
+                    (!ResolveCutterPlanarCircle(cmd, m_pContexts, circle) || !CutterCircleStartMatches(cmd, m_pContexts))) ||
                 (!(cmd.cncFeedLookahead && cmd.pathCoreFullCircle) &&
                     !ResolveNCPathCorePlanarCirclePulse(sx, sy, ex, ey, cx, cy,
-                        cmd.startRadius, cmd.dir, cmd.pathCoreFullCircle, circle)))
+                        cmd.startRadius, cmd.dir, cmd.pathCoreFullCircle, circle, sourceRoundoffPulse)))
             {
                 FailDerivedConsumerGeometry();
                 return;
             }
             if (cmd.cncFeedLookahead)
             {
-                if (!ResolveCncPlanarCircle(cmd, circle)) { FailDerivedConsumerGeometry(); return; }
+                if (!ResolveCncPlanarCircle(cmd, m_pContexts, circle)) { FailDerivedConsumerGeometry(); return; }
                 m_Group.startPos[0] = cmd.mem_startPos[0]; m_Group.startPos[1] = cmd.mem_startPos[1];
             }
             if (cmd.sourceTranslation.cutterMode != 40)
             {
-                if (!ResolveCutterPlanarCircle(cmd, circle)) { FailDerivedConsumerGeometry(); return; }
-                m_Group.startPos[0] = cmd.mem_startPos[0]; m_Group.startPos[1] = cmd.mem_startPos[1];
+                if (!ResolveCutterPlanarCircle(cmd, m_pContexts, circle)) { FailDerivedConsumerGeometry(); return; }
+                // Group startPos is packet-ordered; the saved proof is XYZ.
+                // Source/mapping validation above has proved both indices.
+                m_Group.startPos[0] = cmd.mem_startPos[cmd.axisIndices[0]];
+                m_Group.startPos[1] = cmd.mem_startPos[cmd.axisIndices[1]];
             }
             // Both radii are intentionally identical. A rounding seam in the
             // observed start must never select the variable-radius integral.
@@ -20610,9 +20774,7 @@ void MotionCore::UpdateInterpolation()
             (ecCommand.mode == InterpolationMode::CIRCULAR_CW ||
                 ecCommand.mode == InterpolationMode::CIRCULAR_CCW) &&
             m_Group.mode == ecCommand.mode &&
-            ecCommand.axisCount == 2 && m_Group.axisCount == 2 &&
-            ecCommand.axisIndices[0] == 0 && ecCommand.axisIndices[1] == 1 &&
-            m_Group.axisIndices[0] == 0 && m_Group.axisIndices[1] == 1 &&
+            IsMotionArcPlaneGroupMapping(ecCommand, m_Group.axisCount, m_Group.axisIndices) &&
             ((ecCommand.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
                 m_Group.pathMode == PathMode::EXACT_STOP && !ecCommand.cncFeedLookahead) ||
                 IsCncArcEndpointScope()) && !ecCommand.cncCornerBlend &&
@@ -24413,6 +24575,14 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
         !ownerLease.IsValid() || ownerLease.owner != MotionOwner::AUTO) return MotionNCTranslationTransitionResult::DEFERRED;
     // Exactly one standalone selection per drained transaction.
     // EXT and all fields outside that selection remain frozen.
+    const bool planeChanged = previous.rotationPlane != next.rotationPlane;
+    // A plane change must never reinterpret an active G68 frame, even from a
+    // direct publisher that did not pass through the NC whole-block decoder.
+    if (planeChanged && (previous.rotationMode != 69 || next.rotationMode != 69 ||
+        previous.polarMode != 15 || next.polarMode != 15 ||
+        NCTranslationHasWorkPlaneRotation(previous) ||
+        NCTranslationHasWorkPlaneRotation(next)))
+        return MotionNCTranslationTransitionResult::DEFERRED;
     const bool distanceChanged = previous.distanceMode != next.distanceMode;
     const bool unitsChanged = previous.unitsMode != next.unitsMode;
     const bool strokeChanged = previous.storedStrokeMode != next.storedStrokeMode;
@@ -24441,7 +24611,7 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
         static_cast<unsigned>(workCompensationChanged) + static_cast<unsigned>(unitsChanged) +
         static_cast<unsigned>(scalingChanged) + static_cast<unsigned>(mirrorChanged) +
         static_cast<unsigned>(polarChanged) + static_cast<unsigned>(cutterChanged) +
-        static_cast<unsigned>(strokeChanged) != 1U)
+        static_cast<unsigned>(strokeChanged) + static_cast<unsigned>(planeChanged) != 1U)
         return MotionNCTranslationTransitionResult::DEFERRED;
     // A selected contour owns one immutable frame and one physical radius.
     // Cancel it before changing its side, D row, radius or coordinate frame.
@@ -24462,9 +24632,12 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
     {
         const double canonicalZero = 0.0;
         const bool cancelled = next.workMode == 169;
-        if (next.workMode == 168 && next.workOffset[3] != 0.0 && previous.distanceMode != 90)
+        double workAngle = 0.0;
+        if (!TryGetNCTranslationWorkPlaneAngle(next, workAngle))
             return MotionNCTranslationTransitionResult::DEFERRED;
-        if (cancelled || next.workOffset[3] == 0.0)
+        if (next.workMode == 168 && workAngle != 0.0 && previous.distanceMode != 90)
+            return MotionNCTranslationTransitionResult::DEFERRED;
+        if (cancelled || workAngle == 0.0)
         {
             for (unsigned axis = 0U; axis < 2U; ++axis)
                 if (std::memcmp(&next.workRotationCenterMM[axis], &canonicalZero, sizeof(double)) != 0)
@@ -24478,7 +24651,8 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
         }
     }
     NCTranslationSnapshot expected = previous;
-    if (distanceChanged) expected.distanceMode = next.distanceMode;
+    if (planeChanged) expected.rotationPlane = next.rotationPlane;
+    else if (distanceChanged) expected.distanceMode = next.distanceMode;
     else if (unitsChanged) expected.unitsMode = next.unitsMode;
     else if (strokeChanged) expected.storedStrokeMode = next.storedStrokeMode;
     else if (polarChanged) expected.polarMode = next.polarMode;
@@ -24562,7 +24736,7 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
     // exact current match make this retire/publish monotonic. RT has no active
     // or queued source, and epoch replacement is excluded by the reservation.
     m_translationPublication.Retire();
-    if (!m_translationPublication.Publish(next)) return MotionNCTranslationTransitionResult::DEFERRED;
+    if (!PublishNCTranslation(next)) return MotionNCTranslationTransitionResult::DEFERRED;
     if (predecessor.cncFeedLookahead && predecessor.pathCorePlanarCircle &&
         predecessor.execution.IsAssigned() && predecessor.execution.epoch == executionEpoch &&
         predecessor.execution.source == MotionCommandSource::NC_MEMORY &&

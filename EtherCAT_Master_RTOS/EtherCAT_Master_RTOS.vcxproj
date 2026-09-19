@@ -188,6 +188,7 @@
     <ClInclude Include="NCPathCoreCommittedRun.h" />
     <ClInclude Include="NCPathCoreCompletedSnapshot.h" />
     <ClInclude Include="NCPathCoreExecutionLink.h" />
+    <ClInclude Include="NCArcPlane.h" />
     <ClInclude Include="NCPathCoreFeedArc.h" />
     <ClInclude Include="NCPathCoreFeedLine.h" />
     <ClInclude Include="NCPathCoreFrontierReadContract.h" />

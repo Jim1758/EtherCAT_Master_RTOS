@@ -41,31 +41,43 @@ namespace
     }
 }
 
-bool NCManager::IsCutterContourBlockShapeValid(const NCBlock& block, int unitsMode, int planeCode, bool polar) noexcept
+bool NCManager::IsCutterContourBlockShapeValid(const NCBlock& block, int unitsMode, int planeCode, bool polar, int distanceMode) noexcept
 {
     NCArcPlaneAxes plane{};
     if (!TryGetNCArcPlaneAxes(planeCode, plane) || block.isBlockSkip ||
         block.has(static_cast<char>('X' + plane.normal)) || block.has('Q') || block.has('P')) return false;
-    // BASE-PLANE-19: G90 polar lines and PARTIAL arcs may omit radius OR
-    // angle. No omission grants a circle; full revolutions still require
-    // the unchanged exact repeated, complete authored-pair proof below.
-    const bool sparsePolarContour = polar && planeCode != 17 &&
+    // BASE-PLANE-26: all three planes admit a sparse G90/G16 G01 or
+    // PARTIAL G02/G03 endpoint. The missing radius/angle is decoded only
+    // from this segment's accepted NOMINAL contour (or the current nominal
+    // endpoint for immutable lookahead), never the physical cutter tail.
+    // Syntax grants a point decode, not a Motion permit or a revolution.
+    const bool sparsePolarContour = polar &&
         (block.gCode == 1 || block.gCode == 2 || block.gCode == 3);
-    if (sparsePolarContour ? (!block.has(plane.uAddress) && !block.has(plane.vAddress)) :
+    const bool sparseCartesianLine = block.gCode == 1 &&
+        IsNCTranslationCutterSparseLineNotationAllowed(planeCode, distanceMode, polar ? 16 : 15);
+    const bool sparseCartesianArc = (block.gCode == 2 || block.gCode == 3) &&
+        IsNCTranslationCutterSparseArcNotationAllowed(planeCode, distanceMode, polar ? 16 : 15);
+    if ((sparsePolarContour || sparseCartesianLine || sparseCartesianArc) ?
+        (!block.has(plane.uAddress) && !block.has(plane.vAddress)) :
         (!block.has(plane.uAddress) || !block.has(plane.vAddress))) return false;
-    // Complete polar G01/IJK/R syntax retains its numerical path. An IJK circle
-    // is opt-in only after exact repeated authored radius/angle and tangent
-    // seams are proved below. R, aliases and rounded coincidence cannot
-    // manufacture a circle. Sparse syntax is only a point-decoding permit.
+    // R and IJK remain mutually exclusive. A circle still requires the
+    // exact repeated COMPLETE authored pair and forward-tangent line seams
+    // proved below. Sparse coincidence, aliases and rounded endpoints never
+    // confer that marker. Entry and G40 lead-out remain G01.
+    // The same gate is used for the current block and bounded lookahead.
     if (polar)
-        return planeCode != 17 &&
-            (IsPathCoreFeedBlockShapeValid(block, true, unitsMode, true, planeCode) ||
-                IsPathCoreArcBlockShapeValid(block, true, unitsMode, true, planeCode, true, true));
+        return IsPathCoreFeedBlockShapeValid(block, true, unitsMode, true, planeCode) ||
+            IsPathCoreArcBlockShapeValid(block, true, unitsMode, true, planeCode, true, true);
     // BASE-PLANE-11: canonical literal contours; an IJK full revolution
     // needs G90 equal endpoints or G91 zero deltas, plus tangent-line seams.
     // The immutable
     // lookahead proves that classification before the preceding line moves.
-    // Entry and G40 lead-out remain straight; G17 keeps its prior scope.
+    // Entry and G40 lead-out remain straight. BASE-PLANE-29 adds G17/G91
+    // explicit-XY-zero IJK seam circles; sparse words never imply a circle.
+    // BASE-PLANE-31 relaxes the G17/G91 Cartesian G01 endpoint pair.
+    // BASE-PLANE-32 also permits sparse PARTIAL G02/G03. The full-circle
+    // classifier below still requires both explicit zero endpoint words;
+    // sparse zero displacement must fail as degenerate partial geometry.
     return IsPathCoreFeedBlockShapeValid(block, true, unitsMode, false, planeCode) ||
         IsPathCoreArcBlockShapeValid(block, true, unitsMode, false, planeCode);
 }
@@ -77,12 +89,14 @@ bool NCManager::PreviewCutterIncrementalEndpointSameThread(const NCBlock& block,
 {
     const NCTranslationSnapshot source = CoordSys.GetTranslationSnapshot();
     NCArcPlaneAxes plane{};
-    if (CoordSys.isAbsoluteMode || source.distanceMode != 91 || source.rotationPlane == 17 ||
+    if (CoordSys.isAbsoluteMode || source.distanceMode != 91 ||
+        (block.gCode != 1 && !IsNCTranslationCutterArcNotationAllowed(
+            source.rotationPlane, source.distanceMode, source.polarMode, false)) ||
         !TryGetNCArcPlaneAxes(source.rotationPlane, plane) ||
         !IsNCTranslationSnapshotValid(source) || !CoordSys.IsTranslationRunFrozen() ||
         !CoordSys.IsTranslationRunCurrent() || CoordSys.activePlane != source.rotationPlane ||
         CoordSys.isPolarCoordinateActive || CoordSys.isCAxisOffsetRotationEnabled ||
-        !IsCutterContourBlockShapeValid(block, source.unitsMode, source.rotationPlane, source.polarMode == 16)) return false;
+        !IsCutterContourBlockShapeValid(block, source.unitsMode, source.rotationPlane, source.polarMode == 16, source.distanceMode)) return false;
     const bool leadOut = m_cutterLine.leadOutRequired;
     const bool continuing = m_cutterLine.valid || leadOut;
     if (leadOut ? (source.cutterMode != 40 || block.gCode != 1 || m_cutterLine.valid || !m_cutterLine.terminal) :
@@ -106,8 +120,10 @@ bool NCManager::PreviewCutterIncrementalEndpointSameThread(const NCBlock& block,
     std::array<double, 8U> delta{}, candidate{};
     std::array<bool, 8U> selected{};
     selected[plane.u] = selected[plane.v] = true;
-    delta[plane.u] = NCTranslationLengthToMM(block.val(plane.uAddress), source.unitsMode);
-    delta[plane.v] = NCTranslationLengthToMM(block.val(plane.vAddress), source.unitsMode);
+    delta[plane.u] = block.has(plane.uAddress) ?
+        NCTranslationLengthToMM(block.val(plane.uAddress), source.unitsMode) : 0.0;
+    delta[plane.v] = block.has(plane.vAddress) ?
+        NCTranslationLengthToMM(block.val(plane.vAddress), source.unitsMode) : 0.0;
     const double* nominal = continuing ? m_cutterLine.nominal.data() : CoordSys.commandedMCS;
     if (!TryNCTranslationIncrementalTarget(source, nominal, delta.data(), selected.data(), candidate.data())) return false;
     // Untouched native axes are copied bit-exactly from the accepted physical tail.
@@ -118,18 +134,69 @@ bool NCManager::PreviewCutterIncrementalEndpointSameThread(const NCBlock& block,
     return true;
 }
 
+// BASE-PLANE-37: all-plane absolute Cartesian G01 and existing G17 sparse partial arcs use the same nominal identity
+// checks as incremental/polar contours, including the one-generation G40
+// handoff. This preview only decodes; immutable literal and next-PC checks
+// remain in BuildCutterContourSameThread, and no tail commits here.
+bool NCManager::PreviewCutterAbsoluteEndpointSameThread(const NCBlock& block,
+    std::array<double, 8U>& endpoint) const noexcept
+{
+    const NCTranslationSnapshot source = CoordSys.GetTranslationSnapshot();
+    NCArcPlaneAxes plane{};
+    if (!CoordSys.isAbsoluteMode || CoordSys.isPolarCoordinateActive ||
+        !TryGetNCArcPlaneAxes(source.rotationPlane, plane) || source.distanceMode != 90 || source.polarMode != 15 ||
+        (block.gCode != 1 && ((block.gCode != 2 && block.gCode != 3) ||
+            !IsNCTranslationCutterSparseArcNotationAllowed(source.rotationPlane, 90, 15))) ||
+        !IsNCTranslationSnapshotValid(source) ||
+        !CoordSys.IsTranslationRunFrozen() || !CoordSys.IsTranslationRunCurrent() ||
+        CoordSys.activePlane != source.rotationPlane || CoordSys.isCAxisOffsetRotationEnabled ||
+        !IsCutterContourBlockShapeValid(block, source.unitsMode, source.rotationPlane, false, 90)) return false;
+    const bool leadOut = m_cutterLine.leadOutRequired;
+    const bool continuing = m_cutterLine.valid || leadOut;
+    if (leadOut ? (source.cutterMode != 40 || block.gCode != 1 || m_cutterLine.valid || !m_cutterLine.terminal) :
+        (source.cutterMode == 40)) return false;
+    if (!continuing && block.gCode != 1) return false;
+    if (continuing)
+    {
+        if (m_cutterLine.run != source.runToken || m_cutterLine.cache != GetBaseProgramCache().GetGeneration() ||
+            m_cutterLine.commit == 0ULL || m_cutterLine.dispatch == 0ULL ||
+            m_cutterLine.plane != source.rotationPlane || m_cutterLine.distanceMode != 90 || m_cutterLine.polarMode != 15)
+            return false;
+        if (leadOut ? (m_cutterLine.generation == (std::numeric_limits<std::uint64_t>::max)() ||
+                source.generation != m_cutterLine.generation + 1ULL) :
+            (source.generation != m_cutterLine.generation)) return false;
+        for (unsigned axis = 0U; axis < 3U; ++axis)
+            if (CutterDoubleBits(CoordSys.commandedMCS[axis]) !=
+                CutterDoubleBits(m_cutterLine.physicalTail[axis])) return false;
+    }
+    return TryNCTranslationCutterAbsoluteEndpoint(source,
+        continuing ? m_cutterLine.nominal.data() : CoordSys.commandedMCS,
+        CoordSys.commandedMCS,
+        block.has(plane.uAddress) ? NCTranslationLengthToMM(block.val(plane.uAddress), source.unitsMode) : 0.0,
+        block.has(plane.vAddress) ? NCTranslationLengthToMM(block.val(plane.vAddress), source.unitsMode) : 0.0,
+        (block.has(plane.uAddress) ? (1U << plane.u) : 0U) |
+        (block.has(plane.vAddress) ? (1U << plane.v) : 0U), endpoint.data());
+}
+
+// Retain the existing G01/G40 entry point without granting arc lead-out.
+bool NCManager::PreviewCutterAbsoluteLineEndpointSameThread(const NCBlock& block,
+    std::array<double, 8U>& endpoint) const noexcept
+{
+    return block.gCode == 1 && PreviewCutterAbsoluteEndpointSameThread(block, endpoint);
+}
+
 bool NCManager::PreviewCutterPolarEndpointSameThread(const NCBlock& block,
     std::array<double, 8U>& endpoint) const noexcept
 {
     const NCTranslationSnapshot source = CoordSys.GetTranslationSnapshot();
     NCArcPlaneAxes plane{};
     if (!CoordSys.isAbsoluteMode || !CoordSys.isPolarCoordinateActive ||
-        source.distanceMode != 90 || source.polarMode != 16 || source.rotationPlane == 17 ||
+        source.distanceMode != 90 || source.polarMode != 16 ||
         !TryGetNCArcPlaneAxes(source.rotationPlane, plane) ||
         !IsNCTranslationSnapshotValid(source) || !CoordSys.IsTranslationRunFrozen() ||
         !CoordSys.IsTranslationRunCurrent() || CoordSys.activePlane != source.rotationPlane ||
         CoordSys.isCAxisOffsetRotationEnabled ||
-        !IsCutterContourBlockShapeValid(block, source.unitsMode, source.rotationPlane, true)) return false;
+        !IsCutterContourBlockShapeValid(block, source.unitsMode, source.rotationPlane, true, source.distanceMode)) return false;
     const bool leadOut = m_cutterLine.leadOutRequired;
     const bool continuing = m_cutterLine.valid || leadOut;
     if (leadOut ? (source.cutterMode != 40 || block.gCode != 1 || m_cutterLine.valid || !m_cutterLine.terminal) :
@@ -182,13 +249,13 @@ bool NCManager::BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
         CoordSys.activePlane != source.rotationPlane || CoordSys.isCAxisOffsetRotationEnabled ||
         m_cutterLine.leadOutRequired || sourcePC < 0 || dispatch == 0ULL ||
         run != source.runToken || cache != GetBaseProgramCache().GetGeneration() ||
-        !IsCutterContourBlockShapeValid(block, source.unitsMode, source.rotationPlane, source.polarMode == 16)) return reject("SCOPE");
+        !IsCutterContourBlockShapeValid(block, source.unitsMode, source.rotationPlane, source.polarMode == 16, source.distanceMode)) return reject("SCOPE");
 
     const NCProgramCacheLine* current = GetBaseProgramCache().TryGetLine(sourcePC);
     NCBlock literal{};
     if (!current || current->parsedBlock.isBlockSkip ||
         !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(current->parsedBlock, literal) ||
-        !IsCutterContourBlockShapeValid(literal, source.unitsMode, source.rotationPlane, source.polarMode == 16) ||
+        !IsCutterContourBlockShapeValid(literal, source.unitsMode, source.rotationPlane, source.polarMode == 16, source.distanceMode) ||
         !CutterSameLiteral(literal, block)) return reject("LITERAL_CONTOUR_REQUIRED");
 
     const bool entry = !m_cutterLine.valid;
@@ -199,30 +266,51 @@ bool NCManager::BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
         m_cutterLine.nextPC != sourcePC || m_cutterLine.plane != source.rotationPlane ||
         m_cutterLine.distanceMode != source.distanceMode || m_cutterLine.polarMode != source.polarMode)) return reject("NOMINAL_SOURCE");
     if (!entry)
-        for (unsigned i = 0U; i < (source.rotationPlane == 17 ? 2U : 3U); ++i)
+        for (unsigned i = 0U; i < 3U; ++i)
             if (CutterDoubleBits(CoordSys.commandedMCS[i]) !=
                 CutterDoubleBits(m_cutterLine.physicalTail[i])) return reject("PHYSICAL_CONTINUITY");
     // No authored normal-axis word and no tilted frame is allowed. Prove the
     // unselected normal as well, rather than just discarding a transformed Z/Y/X.
-    if (source.rotationPlane != 17 &&
-        CutterDoubleBits(endpoint[plane.normal]) != CutterDoubleBits(CoordSys.commandedMCS[plane.normal]))
+    if (CutterDoubleBits(endpoint[plane.normal]) != CutterDoubleBits(CoordSys.commandedMCS[plane.normal]))
         return reject("NORMAL_CONTINUITY");
 
+    // The same scope predicate is rechecked by the Motion producer and consumer.
+    // G17 G90/G16 uses exact repeated polar words; G15/G91 uses explicit
+    // zero XY displacements. BASE-PLANE-30 G15/G90 uses exact repeated
+    // COMPLETE authored XY words, proved by the immutable lookahead below.
+    // Neither source lane may infer a revolution from rounded native points.
+    // The circle marker still needs nominal continuity and tangent seams.
+    const bool seamCircleLane = IsNCTranslationCutterArcNotationAllowed(
+        source.rotationPlane, source.distanceMode, source.polarMode, true);
     const bool mirrored = ((source.mirrorMask & (1U << plane.u)) != 0U) != ((source.mirrorMask & (1U << plane.v)) != 0U);
-    const auto primitive = [this, &source, &plane, mirrored](const NCBlock& row, const double* start,
+    const auto primitive = [this, &source, &plane, mirrored, seamCircleLane](const NCBlock& row, const double* start,
         bool fullCircle, NCPathCoreCutterPrimitive& result) -> bool
     {
         result = NCPathCoreCutterPrimitive{};
         result.kind = row.gCode == 1 ? NCPathCoreCutterPrimitiveKind::LINE : NCPathCoreCutterPrimitiveKind::ARC;
-        if (fullCircle && (source.rotationPlane == 17 || row.gCode == 1 || row.has('R')))
+        // Current AND immutable NEXT geometry share the accepted nominal
+        // source. BASE-PLANE-29 permits only explicit zero XY IJK circles
+        // in G17/G15/G91; a tiny nonzero delta lost in rounding is not zero.
+        // Recheck authored proof even when a stored marker requests full.
+        if (row.gCode != 1 && !IsNCTranslationCutterArcNotationAllowed(
+            source.rotationPlane, source.distanceMode, source.polarMode, fullCircle)) return false;
+        if (fullCircle && (!seamCircleLane || row.gCode == 1 || row.has('R')))
+            return false;
+        if (fullCircle && source.rotationPlane == 17 && source.polarMode == 15 &&
+            (!row.has(plane.uAddress) || !row.has(plane.vAddress) ||
+                (source.distanceMode == 91 &&
+                    (row.val(plane.uAddress) != 0.0 || row.val(plane.vAddress) != 0.0))))
             return false;
         result.fullCircle = fullCircle;
         std::array<double, 8U> wcs{}, mcs{};
         std::array<bool, 8U> programmed{};
         programmed[plane.u] = programmed[plane.v] = true;
-        wcs[plane.u] = NCTranslationLengthToMM(row.val(plane.uAddress), source.unitsMode);
-        wcs[plane.v] = source.polarMode == 16 ? row.val(plane.vAddress) :
-            NCTranslationLengthToMM(row.val(plane.vAddress), source.unitsMode);
+        // Never read an absent parameter slot. Sparse Cartesian G91 contours
+        // use a zero delta; polar omission retains its own nominal decoder.
+        wcs[plane.u] = row.has(plane.uAddress) ?
+            NCTranslationLengthToMM(row.val(plane.uAddress), source.unitsMode) : 0.0;
+        wcs[plane.v] = row.has(plane.vAddress) ? (source.polarMode == 16 ?
+            row.val(plane.vAddress) : NCTranslationLengthToMM(row.val(plane.vAddress), source.unitsMode)) : 0.0;
         if (source.polarMode == 16)
         {
             const std::uint32_t authoredMask = (row.has(plane.uAddress) ? (1U << plane.u) : 0U) |
@@ -255,6 +343,22 @@ bool NCManager::BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
             if (!TryNCTranslationIncrementalTarget(source, nominal.data(), wcs.data(),
                 programmed.data(), mcs.data())) return false;
         }
+        else if ((row.gCode == 1 && IsNCTranslationCutterSparseLineNotationAllowed(
+                source.rotationPlane, source.distanceMode, source.polarMode)) ||
+            (IsNCTranslationCutterSparseArcNotationAllowed(source.rotationPlane, source.distanceMode, 15) &&
+                (!row.has(plane.uAddress) || !row.has(plane.vAddress))))
+        {
+            // BASE-PLANE-37: NEXT's omitted absolute author coordinate is
+            // recovered from CURRENT nominal end in canonical XY / ZX / YZ.
+            // Neither the physical offset endpoint nor a remembered word is used.
+            std::array<double, 8U> nominal{};
+            for (unsigned axis = 0U; axis < 8U; ++axis) nominal[axis] = CoordSys.commandedMCS[axis];
+            nominal[plane.u] = start[0]; nominal[plane.v] = start[1];
+            if (!TryNCTranslationCutterAbsoluteEndpoint(source, nominal.data(),
+                CoordSys.commandedMCS, wcs[plane.u], wcs[plane.v],
+                (row.has(plane.uAddress) ? (1U << plane.u) : 0U) |
+                (row.has(plane.vAddress) ? (1U << plane.v) : 0U), mcs.data())) return false;
+        }
         else CoordSys.Preview_WCS_to_MCS(wcs.data(), programmed.data(), mcs.data());
         for (unsigned i = 0U; i < 2U; ++i)
         {
@@ -269,7 +373,11 @@ bool NCManager::BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
             // polar circle. Equal decoded coordinates alone (360-degree alias,
             // zero radius or rounding collapse) still fail. A proved circle
             // must retain both nominal endpoint bits; no tolerance/pinning.
-            if (source.polarMode == 16)
+            // BASE-PLANE-30: a proved absolute Cartesian circle must also
+            // retain the native nominal seam bits. Do not pin/re-spell a
+            // nearly equal transformed endpoint to manufacture a revolution.
+            if (source.polarMode == 16 ||
+                (source.rotationPlane == 17 && source.distanceMode == 90 && fullCircle))
             {
                 if (fullCircle)
                 {
@@ -322,7 +430,7 @@ bool NCManager::BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
     // The previous immutable lookahead compared AUTHORED endpoint words,
     // not transformed coordinates. A current circle inherits that proved
     // marker only with the same run/cache/plane/source and primitive below.
-    const bool currentFull = !entry && source.rotationPlane != 17 &&
+    const bool currentFull = !entry && seamCircleLane &&
         m_cutterLine.expectedPrimitive.fullCircle;
     if (!primitive(literal, nominalStart, currentFull, input.current)) return reject("NONFINITE_NOMINAL");
     for (unsigned i = 0U; i < 2U; ++i)
@@ -359,7 +467,7 @@ bool NCManager::BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
     input.hasNext = !terminal;
     if (!terminal)
     {
-        if (!IsCutterContourBlockShapeValid(following, source.unitsMode, source.rotationPlane, source.polarMode == 16))
+        if (!IsCutterContourBlockShapeValid(following, source.unitsMode, source.rotationPlane, source.polarMode == 16, source.distanceMode))
             return reject("NEXT_PLANAR_CONTOUR_OR_G40_REQUIRED");
         // No tolerance, inverse transform or angular normalization grants a
         // revolution. G90 polar requires exactly repeated authored radius AND
@@ -372,18 +480,32 @@ bool NCManager::BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
             following.has(plane.uAddress) && following.has(plane.vAddress) &&
             CutterDoubleBits(following.val(plane.uAddress)) == CutterDoubleBits(literal.val(plane.uAddress)) &&
             CutterDoubleBits(following.val(plane.vAddress)) == CutterDoubleBits(literal.val(plane.vAddress));
-        const bool nextFull = source.rotationPlane != 17 && following.gCode != 1 && !following.has('R') &&
+        const bool nextFull = seamCircleLane && following.gCode != 1 && !following.has('R') &&
             (source.polarMode == 16 ?
                 (source.distanceMode == 90 && literal.val(plane.uAddress) > 0.0 && repeatedWords) :
                 (source.distanceMode == 91 ?
-                    (following.val(plane.uAddress) == 0.0 && following.val(plane.vAddress) == 0.0) : repeatedWords));
+                    (following.has(plane.uAddress) && following.has(plane.vAddress) &&
+                        following.val(plane.uAddress) == 0.0 && following.val(plane.vAddress) == 0.0) : repeatedWords));
         if (!primitive(following, input.current.end, nextFull, input.next))
             return reject("NEXT_PLANAR_CONTOUR_OR_G40_REQUIRED");
     }
 
+    // BASE-PLANE-30: include the fixed normal in the newly admitted
+    // G17/G90 Cartesian circle AND its incoming tangent-line seam. Existing
+    // partial-only G17 contours keep their original behavior. A supplied
+    // native normal must not be dropped when the plane pair is prepared.
+    if (source.rotationPlane == 17 && source.distanceMode == 90 && source.polarMode == 15 &&
+        (input.current.fullCircle || (input.hasNext && input.next.fullCircle)))
+    {
+        if (CutterDoubleBits(endpoint[plane.normal]) !=
+            CutterDoubleBits(CoordSys.commandedMCS[plane.normal])) return reject("NORMAL_CONTINUITY");
+        if (!entry && CutterDoubleBits(CoordSys.commandedMCS[plane.normal]) !=
+            CutterDoubleBits(m_cutterLine.physicalTail[plane.normal])) return reject("PHYSICAL_CONTINUITY");
+    }
+
     NCPathCoreCutterContourOutput output{};
-    if (source.rotationPlane == 17) BuildNCPathCoreCutterContour(input, output);
-    else BuildNCPathCoreCutterSeamCircle(input, output);
+    if (seamCircleLane) BuildNCPathCoreCutterSeamCircle(input, output);
+    else BuildNCPathCoreCutterContour(input, output);
     if (!output.valid)
     {
         RtPrintf("[CUTTER][GEOMETRY_REJECT] code=%u g=%d entry=%u beforeSubmit=1\n",
@@ -432,7 +554,16 @@ bool NCManager::CommitCutterContourSameThread(std::uint64_t run, std::uint64_t c
         CoordSys.activePlane != m_cutterLine.stagedPlane ||
         (CoordSys.isAbsoluteMode ? 90 : 91) != m_cutterLine.stagedDistanceMode ||
         (CoordSys.isPolarCoordinateActive ? 16 : 15) != m_cutterLine.stagedPolarMode) return false;
-    if (m_cutterLine.stagedDistanceMode == 91 || m_cutterLine.stagedPolarMode == 16)
+    const bool absoluteXYCircleSeam = m_cutterLine.stagedPlane == 17 &&
+        m_cutterLine.stagedDistanceMode == 90 && m_cutterLine.stagedPolarMode == 15 &&
+        (m_cutterLine.stagedPrimitive.fullCircle || m_cutterLine.stagedNextPrimitive.fullCircle);
+    const bool absoluteCartesianContour =
+        m_cutterLine.stagedDistanceMode == 90 && m_cutterLine.stagedPolarMode == 15 &&
+        ((m_cutterLine.stagedPrimitive.kind == NCPathCoreCutterPrimitiveKind::LINE &&
+            IsNCTranslationCutterSparseLineNotationAllowed(m_cutterLine.stagedPlane, 90, 15)) ||
+         (m_cutterLine.stagedPlane == 17 &&
+            m_cutterLine.stagedPrimitive.kind == NCPathCoreCutterPrimitiveKind::ARC));
+    if (m_cutterLine.stagedDistanceMode == 91 || m_cutterLine.stagedPolarMode == 16 || absoluteXYCircleSeam || absoluteCartesianContour)
     {
         const NCTranslationSnapshot source = CoordSys.GetTranslationSnapshot();
         if (!IsNCTranslationSnapshotValid(source) || !CoordSys.IsTranslationRunCurrent() ||
@@ -444,7 +575,8 @@ bool NCManager::CommitCutterContourSameThread(std::uint64_t run, std::uint64_t c
     for (unsigned i = 0U; i < 2U; ++i)
         if (CutterDoubleBits(physicalEnd[i == 0U ? plane.u : plane.v]) !=
             CutterDoubleBits(m_cutterLine.stagedGeometry.endpoint[i])) return false;
-    if (m_cutterLine.stagedPlane != 17 &&
+    if ((m_cutterLine.stagedPlane != 17 || m_cutterLine.stagedPolarMode == 16 ||
+            m_cutterLine.stagedDistanceMode == 91 || absoluteXYCircleSeam || absoluteCartesianContour) &&
         CutterDoubleBits(physicalEnd[plane.normal]) !=
             CutterDoubleBits(m_cutterLine.stagedNominal[plane.normal])) return false;
     m_cutterLine.nominal = m_cutterLine.stagedNominal;

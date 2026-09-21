@@ -149,7 +149,8 @@ namespace
                 // The other circular component is
                 // still interpolated; no endpoint delta is tolerance-collapsed.
                 const bool stationaryNative = (workspace.input.plane != 17 ||
-                    sourceTranslation.polarMode == 16) &&
+                    sourceTranslation.polarMode == 16 ||
+                    (sourceTranslation.cutterMode != 40 && sourceTranslation.distanceMode == 90)) &&
                     targetMCS[slot] == workspace.input.startMCS[slot];
                 const double targetPulse = stationaryNative ? workspace.input.startPulse[slot] :
                     targetMCS[slot] * pulsePerMM;
@@ -334,8 +335,11 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
             }
         }
     }
-    // BASE-PLANE-20: G17 polar exact-stop also proves all unselected XYZ.
-    if (m_pendingPlaneMode != 17 || (m_pendingG16Active && !cncFeedLookahead))
+    // BASE-PLANE-34: G17/G90 as well as G91 cutter arcs preserve every unselected
+    // native axis bit, including signed zero, just like the G18/G19 lanes.
+    // This is a packet/start invariant, not an endpoint epsilon.
+    if (m_pendingPlaneMode != 17 || (m_pendingG16Active && !cncFeedLookahead) ||
+        (cutterActive && (m_pendingTranslation.distanceMode == 90 || m_pendingTranslation.distanceMode == 91)))
     {
         for (unsigned slot = 0U; slot < 8U; ++slot)
         {
@@ -412,7 +416,12 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     // for ALL polar circles as well as new-plane prepared cutter circles.
     // Use the existing HOME/Limit1/2/3 policy. This also closes the same
     // normal-axis gap for earlier G16 IJK arcs; their geometry is unchanged.
-    if (((cutterActive && m_pendingPlaneMode != 17) || m_pendingG16Active) &&
+    // BASE-PLANE-30: the stationary normal is also part of the newly
+    // admitted G17/G90 Cartesian cutter full circle; it is not a moved axis.
+    // BASE-PLANE-34 includes G17/G90 partial cutter arcs as well.
+    // Retain the caller's existing HOME/Limit policy; do not bypass it.
+    if (((cutterActive && (m_pendingPlaneMode != 17 ||
+            m_pendingTranslation.distanceMode == 90 || m_pendingTranslation.distanceMode == 91 || fullCircle)) || m_pendingG16Active) &&
         !travelGuard.check(travelGuard.context, static_cast<int>(plane.normal),
             result.arc.startMCS[plane.normal]))
     {

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <cmath>
 #include <cstddef>
@@ -20,7 +20,7 @@ struct NCTranslationSnapshot
     std::uint64_t generation = 0ULL;
     std::uint64_t revision = 0ULL;
     std::int32_t wcsCode = 0;
-    std::uint32_t schema = 31U;
+    std::uint32_t schema = 48U;
     double extOffsetMM[8] = {};
     double wcsOffsetMM[8] = {};
     std::int32_t toolLengthMode = 49;
@@ -145,7 +145,7 @@ inline bool NCTranslationHasWorkPlaneRotation(const NCTranslationSnapshot& s) no
 inline bool IsNCTranslationSnapshotEmpty(const NCTranslationSnapshot& s) noexcept
 {
     if (s.runToken != 0ULL || s.generation != 0ULL || s.revision != 0ULL ||
-        s.wcsCode != 0 || s.schema != 31U || s.toolLengthMode != 49 ||
+        s.wcsCode != 0 || s.schema != 48U || s.toolLengthMode != 49 ||
         s.toolHCode != 0 || s.workMode != 169 || s.workWCode != 0 ||
         s.rotationMode != 69 || s.rotationPlane != 17 ||
         s.rotationCenterMM[0] != 0.0 || s.rotationCenterMM[1] != 0.0 ||
@@ -165,47 +165,87 @@ inline bool IsNCTranslationSnapshotEmpty(const NCTranslationSnapshot& s) noexcep
     return true;
 }
 
-// BASE-PLANE-20: syntax opt-in only. All three planes admit G40 G90/G16
-// radius-format partial arcs (complete or sparse endpoint). Polar cutter
-// notation remains qualified on G18/G19 only. This predicate does not grant
-// ownership, a frozen source, continuous motion, replay, or an R full circle.
+// BASE-PLANE-23: syntax opt-in only. All three planes admit G40 G90/G16
+// radius-format partial arcs (complete or sparse endpoint). G17 polar cutter
+// R is COMPLETE-pair only, enforced by IsCutterContourBlockShapeValid for both
+// dispatch and immutable lookahead; G18/G19 retain their sparse contract.
+// This predicate grants no ownership, frozen source, continuous motion,
+// replay, sparse cutter endpoint or R full-circle permission by itself.
 inline bool IsNCPolarRadiusArcNotationAllowed(int plane, bool absolute,
     bool polar, int cutterMode) noexcept
 {
     return IsNCArcPlaneCode(plane) && absolute && polar &&
-        (cutterMode == 40 || ((plane == 18 || plane == 19) &&
-            (cutterMode == 41 || cutterMode == 42)));
+        (cutterMode == 40 || cutterMode == 41 || cutterMode == 42);
 }
 
-// BASE-PLANE-11: incremental cutter contours are qualified only for the
-// native G18/G19 lane. G17 keeps its established G90-only cutter contract.
+// BASE-PLANE-29: G17 Cartesian G91 keeps complete literal XY lines and
+// partial arcs, and adds an NC-proved IJK single revolution with explicit
+// X0/Y0 and tangent-line seams. G18/G19 retain their existing contours.
+// Distance mode alone never grants a circle, ownership or continuity.
 inline bool IsNCTranslationCutterDistanceModeAllowed(int plane, int mode) noexcept
 {
     return IsNCArcPlaneCode(plane) &&
-        (mode == 90 || (mode == 91 && (plane == 18 || plane == 19)));
+        (mode == 90 || mode == 91);
 }
 
-// BASE-PLANE-18: G16 cutter notation is admitted only as G90 native
-// G18/G19. NC shape/lookahead allow nominal-tail sparse G01 chords
-// and IJK/signed-R partial arcs or explicitly proved IJK seam circles.
-// R is resolved on the NC nominal contour
-// before native circle admission. G17 and all G91 polar remain closed.
+// G16 cutter notation is G90 only. G18/G19 retain nominal-tail sparse
+// G01 chords, IJK/signed-R partial arcs and NC-proved IJK seam circles.
+// BASE-PLANE-24 adds NC-proved complete-pair G17 G90/G16 IJK seam circles.
+// BASE-PLANE-26 also admits sparse G17 polar partial arcs beside G01.
+// Block shape, nominal-source identity and circle classification stay separate.
+// This general notation predicate alone
+// never grants a motion permit, a revolution, blending or replay.
 inline bool IsNCTranslationCutterNotationAllowed(int plane, int distance, int polar) noexcept
 {
     return IsNCTranslationCutterDistanceModeAllowed(plane, distance) &&
-        (polar == 15 || (polar == 16 && distance == 90 && (plane == 18 || plane == 19)));
+        (polar == 15 || (polar == 16 && distance == 90 && IsNCArcPlaneCode(plane)));
 }
 
-// BASE-PLANE-15 shared producer/consumer scope: G18/G19 also admit an
-// NC-proved G90/G16 IJK single revolution. NC must prove the repeated literal
-// polar pair BEFORE trigonometric/affine rounding and a forward tangent-line
-// seam. Native endpoints, including full-circle start/end bits, are rechecked
-// by Motion. This predicate alone grants no motion, circle count or replay.
+// BASE-PLANE-37: Cartesian G90 sparse G01 now also uses the accepted
+// NOMINAL contour tail in G18 (Z/X) and G19 (Y/Z). At least one canonical
+// plane word is required. G90 retains the omitted AUTHOR coordinate, whereas
+// G91 supplies zero omitted delta. Both native plane endpoints are carried,
+// including G40's physical offset removal. This grants neither sparse G90
+// arcs/circles nor G16, ownership, nonzero-speed junctions or replay.
+inline bool IsNCTranslationCutterSparseLineNotationAllowed(int plane,
+    int distance, int polar) noexcept
+{
+    return polar == 15 && IsNCArcPlaneCode(plane) &&
+        (distance == 90 || distance == 91);
+}
+
+// BASE-PLANE-36: Cartesian G91 PARTIAL G02/G03 may omit one canonical
+// plane word in G18 (Z/X) or G19 (Y/Z), alongside the existing G17 lane.
+// NC requires at least one in-plane literal and decodes the missing author
+// delta as zero from the ACCEPTED NOMINAL contour tail, for both current
+// dispatch and immutable lookahead. The producer still proves BOTH native
+// plane endpoints, the fixed normal axis and the complete offset arc bounds.
+// A sparse zero chord never grants a circle: the existing COMPLETE authored
+// explicit-zero/repeated-pair proof and tangent-line seams remain mandatory.
+// G17/G90 keeps its existing absolute decoder; G18/G19 G90, G16, ownership,
+// nonzero-speed junctions, replay and multi-turn arcs are NOT relaxed.
+inline bool IsNCTranslationCutterSparseArcNotationAllowed(int plane,
+    int distance, int polar) noexcept
+{
+    return polar == 15 &&
+        ((plane == 17 && (distance == 90 || distance == 91)) ||
+         ((plane == 18 || plane == 19) && distance == 91));
+}
+
+// Shared NC lookahead / Motion producer / Motion consumer circle scope.
+// BASE-PLANE-30 adds G17/G15/G90 IJK single revolutions. The immutable
+// NC lookahead must prove the COMPLETE authored XY pair repeats bit-for-bit
+// BEFORE affine rounding; current dispatch is bound to that nominal-source
+// primitive and forward-tangent line seams. G91 retains explicit zero deltas
+// and G90/G16 retains its positive-radius repeated-pair proof. No sparse
+// coincidence, rounded chord, R circle, P request, arc entry, blending or
+// replay is authorized by this syntax gate. Native packet guards still apply.
 inline bool IsNCTranslationCutterArcNotationAllowed(int plane, int distance,
     int polar, bool fullCircle) noexcept
 {
     return IsNCTranslationCutterNotationAllowed(plane, distance, polar) &&
-        (!fullCircle || plane != 17);
+        (!fullCircle || plane != 17 || (distance == 90 && (polar == 15 || polar == 16)) ||
+            (distance == 91 && polar == 15));
 }
 
 inline bool IsNCTranslationBaseArcPlaneFrame(const NCTranslationSnapshot& s) noexcept
@@ -232,7 +272,7 @@ inline bool IsNCTranslationBaseArcPlaneFrame(const NCTranslationSnapshot& s) noe
 inline bool IsNCTranslationSnapshotValid(const NCTranslationSnapshot& s) noexcept
 {
     if (s.runToken == 0ULL || s.generation == 0ULL || s.revision == 0ULL ||
-        s.schema != 31U || !IsNCAxisIdentitySnapshotValid(s.axisIdentity) ||
+        s.schema != 48U || !IsNCAxisIdentitySnapshotValid(s.axisIdentity) ||
         !IsNCWorkCoordinateCode(s.wcsCode) ||
         (s.distanceMode != 90 && s.distanceMode != 91) || (s.unitsMode != 20 && s.unitsMode != 21)) return false;
     if ((s.polarMode != 15 && s.polarMode != 16) || (s.storedStrokeMode != 22 && s.storedStrokeMode != 23) ||
@@ -767,7 +807,9 @@ inline bool TryNCTranslationCutterPolarLineEndpoint(const NCTranslationSnapshot&
     return true;
 }
 
-// BASE-PLANE-19 NC-only sparse G90 polar cutter endpoint.
+// NC-only sparse G90 polar cutter endpoint. BASE-PLANE-26 uses the same
+// nominal-source decoder for G17 G01 and partial G02/G03, as for G18/G19.
+// This pure helper has no block/opcode and grants no arc/full-circle admission.
 // Shared by a G01 chord/lead-out or a PARTIAL G02/G03 primitive. This helper
 // decodes a point only and never authorizes a full circle or a Motion packet.
 // Missing words come from the accepted NOMINAL contour, never the offset
@@ -820,6 +862,69 @@ inline bool TryNCTranslationCutterSparsePolarLineEndpoint(const NCTranslationSna
 {
     return TryNCTranslationCutterSparsePolarEndpoint(s, nominalMCS, physicalMCS,
         radiusMM, angleDeg, authoredEndpointMask, outputMCS);
+}
+
+// BASE-PLANE-33/34 NC-only G17/G15/G90 contour endpoint. The caller proves
+// run/cache/generation/primitive identity and G01 or a permitted PARTIAL arc.
+// G40 lead-out is still G01; full-circle proof remains a separate contract.
+// Missing author coordinates come only from the accepted nominal contour.
+// Full pairs retain the established forward-point arithmetic. Without planar
+// rotations the omitted native NOMINAL axis is separable and copied bitwise;
+// do not inject an inverse/forward rounding displacement on that fixed axis.
+// With rotations, inverse the nominal point, replace only authored values,
+// then forward both axes in the same frozen frame. D is not part of this map.
+// All unselected physical axes are copied bitwise. No mutation on failure,
+// even if output aliases either input. No circle or Motion permit is granted.
+// BASE-PLANE-37: uMM/vMM are canonical plane values (XY / ZX / YZ).
+// authoredMask retains native XYZ bit positions; never reinterpret G18 as X/Z.
+inline bool TryNCTranslationCutterAbsoluteEndpoint(const NCTranslationSnapshot& s,
+    const double* nominalMCS, const double* physicalMCS, double uMM, double vMM,
+    std::uint32_t authoredMask, double* outputMCS) noexcept
+{
+    NCArcPlaneAxes plane{};
+    if (!nominalMCS || !physicalMCS || !outputMCS ||
+        !IsNCTranslationSnapshotValid(s) || !TryGetNCArcPlaneAxes(s.rotationPlane, plane) ||
+        s.distanceMode != 90 || s.polarMode != 15 ||
+        s.axisIdentity.eccentricEnabled != 0U ||
+        !IsNCTranslationCutterSparseLineNotationAllowed(s.rotationPlane, s.distanceMode, s.polarMode) ||
+        authoredMask == 0U || (authoredMask & ~plane.mask) != 0U) return false;
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if (!std::isfinite(nominalMCS[axis]) || !std::isfinite(physicalMCS[axis])) return false;
+        if (axis != plane.u && axis != plane.v &&
+            std::memcmp(&nominalMCS[axis], &physicalMCS[axis], sizeof(double)) != 0)
+            return false;
+    }
+    if (((authoredMask & (1U << plane.u)) != 0U && !std::isfinite(uMM)) ||
+        ((authoredMask & (1U << plane.v)) != 0U && !std::isfinite(vMM))) return false;
+    double decoded[8] = {}, transformed[8] = {}, candidate[8] = {};
+    const bool rotated = NCTranslationHasPlanarRotation(s);
+    if (authoredMask != plane.mask && rotated)
+    {
+        NCTranslationInversePoint(s, nominalMCS, decoded);
+        if (!std::isfinite(decoded[plane.u]) || !std::isfinite(decoded[plane.v])) return false;
+    }
+    if ((authoredMask & (1U << plane.u)) != 0U) decoded[plane.u] = uMM;
+    if ((authoredMask & (1U << plane.v)) != 0U) decoded[plane.v] = vMM;
+    NCTranslationForwardPoint(s, decoded, transformed);
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        candidate[axis] = (axis == plane.u || axis == plane.v) ?
+            ((!rotated && (authoredMask & (1U << axis)) == 0U) ? nominalMCS[axis] : transformed[axis]) :
+            physicalMCS[axis];
+        if (!std::isfinite(candidate[axis])) return false;
+    }
+    std::memcpy(outputMCS, candidate, sizeof(candidate));
+    return true;
+}
+
+// Preserve the established line-only call site interface.
+inline bool TryNCTranslationCutterAbsoluteLineEndpoint(const NCTranslationSnapshot& s,
+    const double* nominalMCS, const double* physicalMCS, double uMM, double vMM,
+    std::uint32_t authoredMask, double* outputMCS) noexcept
+{
+    return TryNCTranslationCutterAbsoluteEndpoint(s, nominalMCS, physicalMCS,
+        uMM, vMM, authoredMask, outputMCS);
 }
 
 // Fixed G91 uses displacement vectors, not points: neither rotation centre,

@@ -580,8 +580,13 @@ namespace
                 command.mem_startPos[plane.u], command.mem_startPos[plane.v], command.targetPos[0], command.targetPos[1],
                 command.centerPos[0], command.centerPos[1], command.startRadius, sourceRoundoffMM,
                 command.sourcePlaneMode)) return false;
+        // BASE-PLANE-24: G17 permits NC-proved G90/G16 seam circles,
+        // not Cartesian full circles or an arbitrary same-endpoint packet.
+        // Recheck the shared source scope AND bit-exact physical closure here
+        // before the consumer/LoadNextCommand accepts a complete revolution.
         if (command.pathCoreFullCircle &&
-            (command.sourcePlaneMode == 17 ||
+            (!IsNCTranslationCutterArcNotationAllowed(command.sourcePlaneMode,
+                command.sourceTranslation.distanceMode, command.sourceTranslation.polarMode, true) ||
                 std::memcmp(&command.mem_startPos[plane.u], &command.targetPos[0], sizeof(double)) != 0 ||
                 std::memcmp(&command.mem_startPos[plane.v], &command.targetPos[1], sizeof(double)) != 0)) return false;
         if (command.sourceTranslation.cutterMode == 40 ||

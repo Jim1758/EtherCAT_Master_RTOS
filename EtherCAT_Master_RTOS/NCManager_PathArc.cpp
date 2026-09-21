@@ -292,7 +292,7 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     const bool radiusFormat = block.has('R');
     const bool cutter = CoordSys.toolRadiusMode != 40;
     const bool polarRadius = radiusFormat && !cutter && CoordSys.isPolarCoordinateActive;
-    if ((cutter && !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive)) ||
+    if ((cutter && !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive, CoordSys.isAbsoluteMode ? 90 : 91)) ||
         m_cutterLine.leadOutRequired)
     {
         RejectPathCoreArcSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
@@ -341,6 +341,9 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
         (block.has(plane.vAddress) ? (1U << plane.v) : 0U);
     bool fullCircle = sourceEndpointAxisMask == 0U;
     const NCTranslationSnapshot arcSource = CoordSys.GetTranslationSnapshot();
+    const bool sparseCartesianCutter = cutter && sourceEndpointAxisMask != plane.mask &&
+        IsNCTranslationCutterSparseArcNotationAllowed(arcSource.rotationPlane,
+            arcSource.distanceMode, arcSource.polarMode);
     const bool mirroredPlane = ((arcSource.mirrorMask & (1U << plane.u)) != 0U) !=
         ((arcSource.mirrorMask & (1U << plane.v)) != 0U);
     int direction = (block.gCode == 2 ? -1 : 1) * (mirroredPlane ? -1 : 1);
@@ -387,7 +390,10 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
     // Polar cutter endpoints use their nominal-source decoder below. Do not
     // infer a nominal coordinate from the physical offset tail, nor decode
     // radius/angle a second time through the generic sparse endpoint path.
-    if (!polarRadius && !(cutter && CoordSys.isPolarCoordinateActive) &&
+    // BASE-PLANE-34: sparse G90/G91 cutter arcs are completed by the nominal
+    // preview, never the generic physical-tail endpoint path. Presence bits
+    // above remain the author's words and cannot grant a full revolution.
+    if (!polarRadius && !(cutter && CoordSys.isPolarCoordinateActive) && !sparseCartesianCutter &&
         !CoordSys.CompleteFixedPlanarEndpoint(m_pathArcWCS.data(), m_pathArcProgrammed.data()))
     {
         RejectPathCoreArcSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
@@ -439,6 +445,23 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
             RejectPathCoreArcSameThread(5U, AlarmManager::PATH_GEOMETRY_INVALID);
             return nullptr;
         }
+        // An omitted author delta is NOT an unselected physical axis: the
+        // offset-circle endpoint (and any planar rotation) can move it.
+        // Keep both candidate endpoints through the producer/readback guard.
+        if (sparseCartesianCutter)
+            m_pathArcProgrammed[plane.u] = m_pathArcProgrammed[plane.v] = true;
+    }
+    else if (sparseCartesianCutter && CoordSys.isAbsoluteMode)
+    {
+        // The omitted absolute author coordinate is decoded from the accepted
+        // nominal source, not from the offset physical tail. The frozen frame
+        // and source identity are checked before any Motion submission.
+        if (!PreviewCutterAbsoluteEndpointSameThread(block, m_pathArcCandidate))
+        {
+            RejectPathCoreArcSameThread(5U, AlarmManager::PATH_GEOMETRY_INVALID);
+            return nullptr;
+        }
+        m_pathArcProgrammed[plane.u] = m_pathArcProgrammed[plane.v] = true;
     }
     else CoordSys.Preview_WCS_to_MCS(m_pathArcWCS.data(), m_pathArcProgrammed.data(), m_pathArcCandidate.data());
     if (cutter && !BuildCutterContourSameThread(block, m_pathArc.sourcePC, m_pathArc.run,

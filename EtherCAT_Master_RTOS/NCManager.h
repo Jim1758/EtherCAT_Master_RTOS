@@ -2360,7 +2360,7 @@ private:
         bool valid = false, staged = false, terminal = false, stagedTerminal = false;
         bool leadOutRequired = false;
     } m_cutterLine{};
-    static bool IsCutterContourBlockShapeValid(const NCBlock& block, int unitsMode, int planeCode = 17, bool polar = false) noexcept;
+    static bool IsCutterContourBlockShapeValid(const NCBlock& block, int unitsMode, int planeCode = 17, bool polar = false, int distanceMode = 90) noexcept;
     // G91 cutter and G40 lead-out use the committed NOMINAL contour tail,
     // not the already offset Motion tail. This preview never commits state.
     bool PreviewCutterIncrementalEndpointSameThread(const NCBlock& block,
@@ -2370,6 +2370,12 @@ private:
     // accepted NOMINAL tail. Full circles retain exact complete authored
     // pairs in both the preceding line and circle, plus their seam proof.
     bool PreviewCutterPolarEndpointSameThread(const NCBlock& block,
+        std::array<double, 8U>& endpoint) const noexcept;
+    // BASE-PLANE-33: Cartesian G90 G01 and G40 lead-out decode a missing
+    // absolute word from the accepted NOMINAL tail, never the cutter tail.
+    bool PreviewCutterAbsoluteLineEndpointSameThread(const NCBlock& block,
+        std::array<double, 8U>& endpoint) const noexcept;
+    bool PreviewCutterAbsoluteEndpointSameThread(const NCBlock& block,
         std::array<double, 8U>& endpoint) const noexcept;
     bool BuildCutterContourSameThread(const NCBlock& block, int sourcePC,
         std::uint64_t run, std::uint64_t cache, std::uint64_t dispatch,

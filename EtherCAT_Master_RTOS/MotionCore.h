@@ -4112,7 +4112,10 @@ public:
         const MotionArcTravelGuard* cornerTravelGuard = nullptr, double cornerNextFeedMMMin = 0.0,
         // EG: 0 preserves explicit legacy axes; 1/2 retain the omitted planar endpoint.
         std::uint32_t endpointAxisMask = 0U,
-        bool requirePlanarBaselineMatch = false);
+        bool requirePlanarBaselineMatch = false,
+        // BASE-PLANE-21: G17 polar cutter G40 lead-out must also prove
+        // its stationary native Z basis. Active cutter enforces this itself.
+        bool requireNativeXYZBaselineMatch = false);
     bool IsCncPathProducerTailCurrent(const MotionCncPathTail& tail,
         std::uint32_t mask, const double* commandedTail, MotionExecutionEpoch epoch,
         const MotionOwnerLease& owner, MotionCommandSource source) const noexcept;

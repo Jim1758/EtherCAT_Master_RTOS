@@ -2590,7 +2590,7 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
             !IsNCTranslationCutterNotationAllowed(CoordSys.activePlane, CoordSys.isAbsoluteMode ? 90 : 91,
                 CoordSys.isPolarCoordinateActive ? 16 : 15) || !IsNCArcPlaneCode(CoordSys.activePlane) || CoordSys.isCAxisOffsetRotationEnabled ||
             gCode != block.gCode ||
-            !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive)))
+            !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive, CoordSys.isAbsoluteMode ? 90 : 91)))
     {
         RtPrintf("[CUTTER][REJECT] reason=MOTION_SCOPE beforeSubmit=1\n");
         AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
@@ -3492,7 +3492,7 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     const bool committedCutterCancel = cutterSelection && codeCount == 1 &&
         NCGCodeSemantics::Contains(block, 40) && CoordSys.toolRadiusMode == 40;
     if (m_cutterLine.leadOutRequired && !committedCutterCancel &&
-        (block.gCode != 1 || !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive) ||
+        (block.gCode != 1 || !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive, CoordSys.isAbsoluteMode ? 90 : 91) ||
             (CoordSys.activePlane != 17 && m_cutterLine.plane != CoordSys.activePlane)))
     {
         RtPrintf("[CUTTER][REJECT] reason=LEAD_OUT_REQUIRED beforeCommit=1\n");
@@ -3508,7 +3508,7 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
             !CoordSys.isCAxisOffsetRotationEnabled && !m_pathHold.armed && !m_pathHold.bound &&
             !m_pathReplay.pending && !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active &&
             m_macroStack.empty() && !m_isG66Active && !block.isBlockSkip &&
-            (cutterSelection || IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive));
+            (cutterSelection || IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive, CoordSys.isAbsoluteMode ? 90 : 91));
         if (!valid)
         {
             RtPrintf("[CUTTER][REJECT] reason=ACTION_SCOPE beforeCommit=1\n");

@@ -682,11 +682,18 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
         }
     }
     const bool cutter = CoordSys.toolRadiusMode != 40;
+    // BASE-PLANE-37: G18/G19 Cartesian G90 lines and pending G40 lead-out
+    // join G17's nominal-tail/native-XYZ contract. Do not re-route ordinary
+    // no-cutter G01, queued feeds, or the existing G18/G19 G91/G16 lanes.
+    const bool nominalCutterLine = (cutter || m_cutterLine.leadOutRequired) &&
+        (CoordSys.activePlane == 17 || (CoordSys.isAbsoluteMode &&
+            IsNCTranslationCutterSparseLineNotationAllowed(CoordSys.activePlane, 90,
+                CoordSys.isPolarCoordinateActive ? 16 : 15)));
     NCArcPlaneAxes cutterPlane{};
     if (!TryGetNCArcPlaneAxes(CoordSys.activePlane, cutterPlane))
     { RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter); return nullptr; }
     if ((cutter || m_cutterLine.leadOutRequired) &&
-        !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive))
+        !IsCutterContourBlockShapeValid(block, CoordSys.isInchMode ? 20 : 21, CoordSys.activePlane, CoordSys.isPolarCoordinateActive, CoordSys.isAbsoluteMode ? 90 : 91))
     {
         RtPrintf("[CUTTER][REJECT] reason=FULL_PLANE_LINE_REQUIRED beforeSubmit=1\n");
         RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
@@ -750,13 +757,22 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
         m_pathFeedWCS[i] = IsNCPolarAngleAxis(CoordSys.isPolarCoordinateActive, CoordSys.activePlane, static_cast<unsigned>(i)) ? block.val(letter) :
             NCTranslationLengthToMM(block.val(letter), CoordSys.isInchMode ? 20 : 21);
     }
-    const bool requirePlanarBaselineMatch = cutter || (CoordSys.activePlane == 17 && CoordSys.IsTranslationRunFrozen() &&
+    const bool requirePlanarBaselineMatch = cutter || nominalCutterLine || (CoordSys.activePlane == 17 && CoordSys.IsTranslationRunFrozen() &&
         (NCTranslationHasPlanarRotation(CoordSys.GetTranslationSnapshot()) || CoordSys.isPolarCoordinateActive) &&
         (m_pathFeedProgrammed[0] != m_pathFeedProgrammed[1]));
     const unsigned rawXYMask = (m_pathFeedProgrammed[0] ? 1U : 0U) |
         (m_pathFeedProgrammed[1] ? 2U : 0U);
-    if (CoordSys.isPolarCoordinateActive && (cutter || m_cutterLine.leadOutRequired))
+    if ((CoordSys.isPolarCoordinateActive ||
+            IsNCTranslationCutterSparseLineNotationAllowed(CoordSys.activePlane,
+                CoordSys.isAbsoluteMode ? 90 : 91, CoordSys.isPolarCoordinateActive ? 16 : 15)) &&
+        (cutter || m_cutterLine.leadOutRequired))
     {
+        // BASE-PLANE-31: an omitted G91 author delta can still require a
+        // physical offset move on that native axis, including G40 X0/Y0.
+        // Carry BOTH native endpoints through travel checks and Motion.
+        // G91 supplies zero omitted deltas. BASE-PLANE-33 G90 instead
+        // retains the absolute author coordinate decoded from the nominal
+        // source. Neither may use physical-tail generic completion.
         // BASE-PLANE-18: never let the generic decoder infer a missing word
         // from the already compensated physical tail. The nominal source
         // preview below owns completion. Both native plane axes are selected
@@ -803,6 +819,14 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
             return nullptr;
         }
     }
+    else if (nominalCutterLine)
+    {
+        if (!PreviewCutterAbsoluteLineEndpointSameThread(block, m_pathFeedCandidate))
+        {
+            RejectPathCoreFeedSameThread(5U, AlarmManager::PATH_GEOMETRY_INVALID);
+            return nullptr;
+        }
+    }
     else CoordSys.Preview_WCS_to_MCS(m_pathFeedWCS.data(), m_pathFeedProgrammed.data(), m_pathFeedCandidate.data());
     if (!cutter && !m_cutterLine.leadOutRequired)
         FeedPreserveInchReadbackEndpoint(block, CoordSys, m_motion,
@@ -822,7 +846,8 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
     // The new-plane contour envelope includes its stationary normal axis.
     // It is not a motion axis, but a homed out-of-range normal coordinate
     // must not disappear from the full physical tool-centre path check.
-    if ((cutter || (m_cutterLine.leadOutRequired && (!CoordSys.isAbsoluteMode || CoordSys.isPolarCoordinateActive))) && CoordSys.activePlane != 17)
+    if (((cutter || (m_cutterLine.leadOutRequired && (!CoordSys.isAbsoluteMode || CoordSys.isPolarCoordinateActive))) &&
+            CoordSys.activePlane != 17) || nominalCutterLine)
     {
         const AxisContext& normal = m_motion.GetAxisContext(static_cast<int>(cutterPlane.normal));
         if (!CoordSys.IsTargetWithinSoftwareTravelLimit(normal, m_pathFeedCandidate[cutterPlane.normal]))
@@ -844,7 +869,7 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
         if (m_pathFeedProgrammed[i] &&
             (!CoordSys.IsTargetWithinSoftwareTravelLimit(axis, m_pathFeedCandidate[i]) ||
-                ((cutter || CoordSys.activePlane != 17) &&
+                ((cutter || CoordSys.activePlane != 17 || nominalCutterLine) &&
                     !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, CoordSys.commandedMCS[i]))))
         {
             RejectPathCoreFeedSameThread(7U, CoordSys.GetSoftwareTravelLimitAlarmCode(axis, AlarmManager::PROGRAMMED_OVER_TRAVEL));
@@ -912,7 +937,7 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
     const bool accepted = m_motion.TryG01MoveTransactionalCncTail(m_pathFeedAxes, m_pathFeedTargets,
         effectiveFeed, CoordSys.commandedMCS, m_pathFeedMotion, buffered ? &m_cncFeed.tail : nullptr, queued,
         corner ? &cornerNext : nullptr, cornerToleranceMM, corner ? &cornerGuard : nullptr, cornerNextFeed,
-        endpointAxisMask, requirePlanarBaselineMatch);
+        endpointAxisMask, requirePlanarBaselineMatch, nominalCutterLine);
     if (!accepted)
     {
         RejectPathCoreFeedSameThread(6U, m_pathFeedMotion.receipt.commandAccepted ?

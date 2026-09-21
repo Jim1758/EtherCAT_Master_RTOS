@@ -268,7 +268,8 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     bool cncFeedLookahead,
     const std::array<double, 8U>* cornerNextMCS, double cornerToleranceMM,
     const MotionArcTravelGuard* cornerTravelGuard, double cornerNextFeedMMMin,
-    std::uint32_t endpointAxisMask, bool requirePlanarBaselineMatch)
+    std::uint32_t endpointAxisMask, bool requirePlanarBaselineMatch,
+    bool requireNativeXYZBaselineMatch)
 {
     static_assert(MAX_AXES == 8, "BX fixed workspace must match Motion axes.");
     MotionFeedLineReceipt& result = workspace.receipt;
@@ -287,19 +288,39 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     // rotated Cartesian endpoints, even when G68 and WORK yaw are both zero.
     const bool basePlaneLinear = m_pendingPlaneMode != 17;
     const bool cutterActive = m_pendingTranslation.cutterMode != 40;
+    // BASE-PLANE-37: add only G18/G19 Cartesian G90 nominal lines and
+    // their explicitly requested G40 lead-out native-XYZ proof. Native line
+    // slots remain ascending X/Z or Y/Z, NOT the canonical circle order.
+    // Ordinary non-cutter and queued G01 keep their previous route.
+    const bool nominalLineNotation = (m_pendingPlaneMode == 17 &&
+        ((m_pendingTranslation.polarMode == 16 && m_pendingTranslation.distanceMode == 90 && m_pendingIsAbsoluteMode) ||
+         (m_pendingTranslation.polarMode == 15 &&
+            ((m_pendingTranslation.distanceMode == 91 && !m_pendingIsAbsoluteMode) ||
+             (m_pendingTranslation.distanceMode == 90 && m_pendingIsAbsoluteMode))))) ||
+        ((m_pendingPlaneMode == 18 || m_pendingPlaneMode == 19) && m_pendingIsAbsoluteMode &&
+            m_pendingTranslation.distanceMode == 90 && m_pendingTranslation.polarMode == 15 &&
+            IsNCTranslationCutterSparseLineNotationAllowed(m_pendingPlaneMode, 90, 15));
+    const bool nativeXYZBaseline = requireNativeXYZBaselineMatch ||
+        (nominalLineNotation && cutterActive);
     NCArcPlaneAxes cutterPlane{};
     const bool cutterPlaneValid = TryGetNCArcPlaneAxes(m_pendingPlaneMode, cutterPlane);
     const bool coupledPlanarEndpoint = NCTranslationHasPlanarRotation(m_pendingTranslation) ||
         m_pendingTranslation.polarMode == 16;
     const bool coupledPlanarQueuedLine = coupledPlanarEndpoint && cncFeedLookahead;
     if (!IsPendingFixedTranslationSourceAllowed() ||
+        (nativeXYZBaseline && (!nominalLineNotation ||
+            !IsNCTranslationSnapshotValid(m_pendingTranslation) ||
+            !IsNCPlaneLinearPairMapping(m_pendingPlaneMode, static_cast<int>(axes.size()), axes.data()) ||
+            cncFeedLookahead || predecessor != nullptr || cornerNextMCS != nullptr ||
+            cornerToleranceMM != 0.0 || cornerTravelGuard != nullptr || cornerNextFeedMMMin != 0.0)) ||
         (basePlaneLinear && (!IsNCTranslationSnapshotValid(m_pendingTranslation) ||
             !IsNCTranslationBaseArcPlaneFrame(m_pendingTranslation) ||
             m_pendingPlaneMode != m_pendingTranslation.rotationPlane ||
             !IsNCNativeXYZLinearMapping(static_cast<int>(axes.size()), axes.data()) ||
             cncFeedLookahead || predecessor != nullptr || cornerNextMCS != nullptr ||
             cornerToleranceMM != 0.0 || cornerTravelGuard != nullptr || cornerNextFeedMMMin != 0.0 ||
-            (!cutterActive && (endpointAxisMask != 0U || requirePlanarBaselineMatch)))) ||
+            (!cutterActive && (endpointAxisMask != 0U ||
+                (requirePlanarBaselineMatch && !nativeXYZBaseline))))) ||
         (cutterActive && (cncFeedLookahead || predecessor != nullptr ||
             cornerNextMCS != nullptr || cornerToleranceMM != 0.0 ||
             cornerTravelGuard != nullptr || cornerNextFeedMMMin != 0.0 ||
@@ -359,7 +380,7 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     }
 
     if (!PrepareFeedLineGeometry(m_pContexts, axes, targetMCS,
-        commandedMCSTail, workspace, predecessor, endpointAxisMask, basePlaneLinear))
+        commandedMCSTail, workspace, predecessor, endpointAxisMask, basePlaneLinear || nativeXYZBaseline))
     {
         return false;
     }
@@ -368,15 +389,16 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     const std::uint32_t requiredBaselineMask =
         ((requirePlanarBaselineMatch || coupledPlanarQueuedLine) ?
             (basePlaneLinear && cutterActive ? 7U : 3U) : 0U) |
-        ((incrementalEndpoint || basePlaneLinear) ? workspace.input.axisMask : 0U);
+        ((incrementalEndpoint || basePlaneLinear) ? workspace.input.axisMask : 0U) |
+        (nativeXYZBaseline ? 7U : 0U);
     // A first coupled XY plain/Q line proves the sampled native basis used by geometry.
     // A buffered line already proved its immutable accepted predecessor above;
     // live axes can still be inside an earlier segment and must not replace it.
     // New-plane straight envelopes were checked at both native endpoints
     // by NC. Prove that same sampled start even for absolute sparse G00/G01.
-    if (((requirePlanarBaselineMatch || incrementalEndpoint || basePlaneLinear) &&
+    if (((requirePlanarBaselineMatch || incrementalEndpoint || basePlaneLinear || nativeXYZBaseline) &&
             !coupledPlanarQueuedLine && (buffered || cncFeedLookahead)) ||
-        ((requirePlanarBaselineMatch || coupledPlanarQueuedLine || incrementalEndpoint || basePlaneLinear) && !buffered &&
+        ((requirePlanarBaselineMatch || coupledPlanarQueuedLine || incrementalEndpoint || basePlaneLinear || nativeXYZBaseline) && !buffered &&
             !IsPlanarEndpointBasisCurrent(commandedMCSTail,
                 workspace.input.startPulse, result.validAxisMask, requiredBaselineMask)))
     {

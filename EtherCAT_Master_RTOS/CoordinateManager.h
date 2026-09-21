@@ -467,6 +467,10 @@ public:
     // ----------------------------------------------------------
     bool IsTargetWithinSoftwareTravelLimit(const AxisContext& axis, double targetMCS) const;
 
+    // Checks configured native MCS ranges even before HOME; no state mutation.
+    bool IsTargetWithinConfiguredSoftwareTravelLimit(
+        const AxisContext& axis, double targetMCS) const;
+
 
     // ----------------------------------------------------------
     // Manual Direction Permission

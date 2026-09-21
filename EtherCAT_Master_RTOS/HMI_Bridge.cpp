@@ -65,7 +65,7 @@ namespace HMI_Bridge
                 switch (event.eventType)
                 {
                 case EventType::ACTIVE:
-                    RtPrintf("[IDLE-CJ] ACTIVE owner=%u generation=%u epoch=%u mask=%u capUMs=100 rtTick=%llu diagSeq=%llu\n",
+                    RtPrintf("[IDLE-CJ] ACTIVE owner=%u generation=%u epoch=%u mask=%u capUMs=100 rtTick=%llu diagSeq=%llu diag=BASE48_DIAG1\n",
                         static_cast<unsigned>(event.owner), event.generation,
                         event.epoch, event.mask,
                         static_cast<unsigned long long>(event.runtimeTick),
@@ -99,6 +99,33 @@ namespace HMI_Bridge
                         event.epoch, event.mask, event.axisIndex,
                         static_cast<unsigned long long>(event.runtimeTick),
                         static_cast<unsigned long long>(event.sequence));
+                    if (event.eventType == EventType::FAILED &&
+                        event.reason == MotionCore::IdleHoldDiagnosticReason::FOLLOWING_ERROR)
+                    {
+                        RtPrintf("[IDLE-CJ] FAULT_POSITION axis=%d generation=%u epoch=%u cmdPulseBits=%08X%08X actPulseBits=%08X%08X windowPulseBits=%08X%08X rtTick=%llu diagSeq=%llu\n",
+                            event.axisIndex, event.generation, event.epoch,
+                            static_cast<unsigned>(event.cmdPulseBits >> 32U), static_cast<unsigned>(event.cmdPulseBits),
+                            static_cast<unsigned>(event.actPulseBits >> 32U), static_cast<unsigned>(event.actPulseBits),
+                            static_cast<unsigned>(event.windowPulseBits >> 32U), static_cast<unsigned>(event.windowPulseBits),
+                            static_cast<unsigned long long>(event.runtimeTick), static_cast<unsigned long long>(event.sequence));
+                    }
+                    break;
+                case EventType::FOLLOWING_ERROR_SAMPLE:
+                    RtPrintf("[IDLE-CJ] FAULT_SAMPLE axis=%d generation=%u epoch=%u prevActPulseBits=%08X%08X boundPulseBits=%08X%08X previousImagePpsBits=%08X%08X rtTick=%llu diagSeq=%llu\n",
+                        event.axisIndex, event.generation, event.epoch,
+                        static_cast<unsigned>(event.cmdPulseBits >> 32U), static_cast<unsigned>(event.cmdPulseBits),
+                        static_cast<unsigned>(event.actPulseBits >> 32U), static_cast<unsigned>(event.actPulseBits),
+                        static_cast<unsigned>(event.windowPulseBits >> 32U), static_cast<unsigned>(event.windowPulseBits),
+                        static_cast<unsigned long long>(event.runtimeTick), static_cast<unsigned long long>(event.sequence));
+                    break;
+                case EventType::FOLLOWING_ERROR_CONTROL:
+                    RtPrintf("[IDLE-CJ] FAULT_CONTROL axis=%d generation=%u epoch=%u kpBits=%08X%08X unitsPerPulseBits=%08X%08X capPpsBits=%08X%08X reverse=%u rtTick=%llu diagSeq=%llu\n",
+                        event.axisIndex, event.generation, event.epoch,
+                        static_cast<unsigned>(event.cmdPulseBits >> 32U), static_cast<unsigned>(event.cmdPulseBits),
+                        static_cast<unsigned>(event.actPulseBits >> 32U), static_cast<unsigned>(event.actPulseBits),
+                        static_cast<unsigned>(event.windowPulseBits >> 32U), static_cast<unsigned>(event.windowPulseBits),
+                        event.nextGeneration,
+                        static_cast<unsigned long long>(event.runtimeTick), static_cast<unsigned long long>(event.sequence));
                     break;
                 }
             }

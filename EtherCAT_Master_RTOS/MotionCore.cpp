@@ -8288,6 +8288,48 @@ bool MotionCore::TryEnqueueMotionCommand(
 }
 
 
+bool MotionCore::TryEnqueueMotionCommandPair(
+    const MotionCommand& first, const MotionCommand& second) noexcept
+{
+    const MotionRejectReason firstFailure = GetCommandAuthorizationFailure(first);
+    const MotionRejectReason secondFailure = GetCommandAuthorizationFailure(second);
+    const MotionRejectReason authorizationFailure =
+        firstFailure != MotionRejectReason::NONE ? firstFailure : secondFailure;
+    if (authorizationFailure == MotionRejectReason::NONE &&
+        m_Group.cmdQueue.ProducerTryPushPair(first, second))
+    {
+        ObserveCommandPathModeProducer(first, true);
+        RecordProgramBlockMotionSubmission(first, true, MotionRejectReason::NONE);
+        ObserveCommandPathModeProducer(second, true);
+        RecordProgramBlockMotionSubmission(second, true, MotionRejectReason::NONE);
+        return true;
+    }
+
+    // This transaction either admits both original identities or rejects both.
+    // A later RESET still retires the pair through the existing Epoch filter.
+    const MotionRejectReason reason = authorizationFailure == MotionRejectReason::NONE
+        ? MotionRejectReason::QUEUE_FULL : authorizationFailure;
+    const std::uint32_t errorCode = reason == MotionRejectReason::QUEUE_FULL
+        ? static_cast<std::uint32_t>(AlarmManager::MOTION_COMMAND_QUEUE_FULL) : 0U;
+    const MotionCommand* commands[2] = { &first, &second };
+    for (const MotionCommand* command : commands)
+    {
+        if (reason == MotionRejectReason::QUEUE_FULL)
+            m_commandQueueFullRejectCount.fetch_add(1ULL, std::memory_order_relaxed);
+        else if (reason == MotionRejectReason::STALE_EPOCH)
+            m_staleCommandDiscardCount.fetch_add(1ULL, std::memory_order_relaxed);
+        else
+            m_motionOwnerConflictRejectCount.fetch_add(1ULL, std::memory_order_relaxed);
+        m_lastRejectedSegmentId.store(command->execution.segmentId, std::memory_order_relaxed);
+        TryQueueProducerFeedbackNotice(*command, MotionFeedbackType::REJECTED, reason, errorCode, 0.0);
+        ObserveCommandPathModeProducer(*command, false);
+        RecordProgramBlockMotionSubmission(*command, false, reason);
+    }
+    if (reason == MotionRejectReason::QUEUE_FULL)
+        AlarmManager::GetInstance().Trigger(AlarmManager::MOTION_COMMAND_QUEUE_FULL, first.sourceLinePC);
+    return false;
+}
+
 bool MotionCore::TryPeekNextMotionCommand(
     MotionCommand& command) const noexcept
 {
@@ -9837,7 +9879,8 @@ std::uint32_t MotionCore::GetIdleHoldDiagnosticDroppedCount() const noexcept
 
 void MotionCore::QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType eventType,
     IdleHoldDiagnosticReason reason, int axisIndex,
-    MotionOwnerLease nextLease) noexcept
+    MotionOwnerLease nextLease, const std::array<double, 3>* detail,
+    std::uint32_t detailFlags) noexcept
 {
     // RT sole producer. Capture immutable values only; never format, allocate,
     // wait, retry, or give a diagnostic failure authority over Motion.
@@ -9862,7 +9905,9 @@ void MotionCore::QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType eventType,
     event.nextOwner = nextLease.owner;
     event.eventType = eventType;
     event.reason = reason;
-    if (eventType == IdleHoldDiagnosticEventType::REFERENCE &&
+    if ((eventType == IdleHoldDiagnosticEventType::REFERENCE ||
+        (eventType == IdleHoldDiagnosticEventType::FAILED &&
+            reason == IdleHoldDiagnosticReason::FOLLOWING_ERROR)) &&
         axisIndex >= 0 && axisIndex < MAX_AXES && m_pContexts != nullptr &&
         static_cast<std::size_t>(axisIndex) < m_pContexts->size())
     {
@@ -9871,6 +9916,15 @@ void MotionCore::QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType eventType,
         std::memcpy(&event.actPulseBits, &(*m_pContexts)[slot].currentActPos,
             sizeof(event.actPulseBits));
         std::memcpy(&event.windowPulseBits, &hold.window[slot], sizeof(event.windowPulseBits));
+    }
+    // BASE48 DIAG1: fixed-size immutable fault payloads. The existing queue,
+    // capacity, drain budget and control authority are unchanged.
+    if (detail != nullptr)
+    {
+        std::memcpy(&event.cmdPulseBits, &(*detail)[0], sizeof(event.cmdPulseBits));
+        std::memcpy(&event.actPulseBits, &(*detail)[1], sizeof(event.actPulseBits));
+        std::memcpy(&event.windowPulseBits, &(*detail)[2], sizeof(event.windowPulseBits));
+        event.nextGeneration = detailFlags;
     }
     if (!diagnostics.events.ProducerTryPush(event))
     {
@@ -9974,6 +10028,11 @@ void MotionCore::UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& ax
     const MotionServoInputSnapshot& input) noexcept
 {
     IdlePositionHoldState& hold = m_idlePositionHold;
+    // Observe the prior local output image before the existing zero write.
+    // This is not an acknowledgement that the drive received that velocity.
+    const double previousActualPulse = axis.lastActPos;
+    const std::int32_t previousImageVelocityPPS =
+        output != nullptr ? output->TargetVelocity : 0;
     WriteServoTargetVelocityCommand(output, axis.axisIndex, 0);
     axis.pid.prevError = axis.pid.integralAcc = 0.0;
     axis.Pid_IDLE.prevError = axis.Pid_IDLE.integralAcc = 0.0;
@@ -10074,6 +10133,17 @@ void MotionCore::UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& ax
     if (!std::isfinite(error) || !std::isfinite(bound) || std::abs(error) > bound)
     {
         CancelIdlePositionHold(IdleHoldDiagnosticReason::FOLLOWING_ERROR, true, axis.axisIndex);
+        // Control stop and alarm precede these two best-effort records. No
+        // retry, allocation, formatting, or change to the failure threshold.
+        const std::array<double, 3> sample = {{ previousActualPulse, bound,
+            static_cast<double>(previousImageVelocityPPS) }};
+        QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType::FOLLOWING_ERROR_SAMPLE,
+            IdleHoldDiagnosticReason::FOLLOWING_ERROR, axis.axisIndex,
+            MotionOwnerLease{}, &sample);
+        const std::array<double, 3> control = {{ hold.kp[index], unitsPerPulse, cap }};
+        QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType::FOLLOWING_ERROR_CONTROL,
+            IdleHoldDiagnosticReason::FOLLOWING_ERROR, axis.axisIndex,
+            MotionOwnerLease{}, &control, reverse ? 1U : 0U);
         return;
     }
     double velocity = error * hold.kp[index];
@@ -14803,8 +14873,10 @@ bool MotionCore::TryLineMove(
     bool cncFeedLookahead,
     const NCPathCoreRetainedGeometry* cncCorner,
     double cncPrefixVelocityPPS,
-    bool pathCoreFeedExactStop) noexcept
+    bool pathCoreFeedExactStop,
+    MotionCommand* preparedCommand) noexcept
 {
+    if (preparedCommand != nullptr) *preparedCommand = MotionCommand{};
     if (producedIdentity != nullptr)
     {
         *producedIdentity = MotionExecutionIdentity{};
@@ -14867,7 +14939,17 @@ bool MotionCore::TryLineMove(
         IsNCNativeXYZLinearMapping(static_cast<int>(axes.size()), axes.data()) &&
         mode == BufferMode::ABORTING && commandPathMode == MotionCommandPathMode::EXACT_STOP &&
         !cncFeedLookahead && cncCorner == nullptr && cncPrefixVelocityPPS == 0.0;
-    if ((basePlaneLinear && !basePlaneLinearAllowed) ||
+    // Stage-only preparation is private to the bounded reference pair. It
+    // executes the complete line validation/stamping path, but cannot publish
+    // an epoch, allocate an identity, enqueue or report an accepted capture.
+    const bool invalidPreparationScope = preparedCommand != nullptr &&
+        (commandSource != MotionCommandSource::NC_MEMORY ||
+            !plannedTailWellFormed || commandOwnerLease.owner != MotionOwner::AUTO ||
+            mode != BufferMode::ABORTING || commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+            m_pendingPlaneMode != 17 || m_pendingToolRadMode != 40 ||
+            cncFeedLookahead || cncCorner != nullptr || cncPrefixVelocityPPS != 0.0 ||
+            pathCoreFeedExactStop);
+    if (invalidPreparationScope || (basePlaneLinear && !basePlaneLinearAllowed) ||
         !IsPendingCommandTranslationValid(commandSource) ||
         (commandSource == MotionCommandSource::NC_MEMORY && m_pendingToolRadMode != 40 &&
             (!pathCoreFeedExactStop || !plannedTailWellFormed ||
@@ -15041,12 +15123,13 @@ bool MotionCore::TryLineMove(
         }
     }
 
-    // The rotated Q lane proves the actual native packet against the current
-    // axis configuration before any aborting epoch or transport publication.
+    // BASE48: every NC Q compound proves the actual native packet against
+    // the current axis configuration before any aborting epoch or transport
+    // publication. This includes curvature-limited dynamics on an unrotated
+    // path; the consumer must never be the first to reject a committed tail.
     // These private source tags authorize validation only; the execution
     // identity is assigned after the existing epoch/owner transaction below.
-    if (cncCorner != nullptr && commandSource == MotionCommandSource::NC_MEMORY &&
-        NCTranslationHasPlanarRotation(m_pendingTranslation))
+    if (cncCorner != nullptr && commandSource == MotionCommandSource::NC_MEMORY)
     {
         cmd.execution.source = commandSource;
         cmd.ownerLease = commandOwnerLease;
@@ -15056,6 +15139,27 @@ bool MotionCore::TryLineMove(
                 commandOwnerLease, producedIdentity, producedOwnerLease);
             return false;
         }
+    }
+
+    if (preparedCommand != nullptr)
+    {
+        // A stale preparation receives the existing formal rejection, while
+        // the successful result remains entirely private and unassigned.
+        const bool ownerCurrent = plannedTailOwnerLease->Matches(entryOwnerLease) &&
+            IsMotionOwnerLeaseCurrent(*plannedTailOwnerLease);
+        const bool epochCurrent = plannedTailEpoch == entryEpoch &&
+            GetCurrentExecutionEpoch() == plannedTailEpoch;
+        if (!ownerCurrent || !epochCurrent || HasUnacknowledgedSafetyMotionRequest())
+        {
+            RejectNonGeometryProducerMotionCommand(invalidCommand, plannedTailEpoch,
+                commandSource, *plannedTailOwnerLease,
+                !ownerCurrent || HasUnacknowledgedSafetyMotionRequest()
+                    ? MotionRejectReason::OWNER_CONFLICT : MotionRejectReason::STALE_EPOCH,
+                producedIdentity, producedOwnerLease);
+            return false;
+        }
+        *preparedCommand = cmd;
+        return true;
     }
 
     // 2. 判斷是「乖乖排隊」還是「緊急覆寫」？

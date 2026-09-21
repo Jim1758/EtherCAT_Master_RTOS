@@ -134,7 +134,7 @@ bool NCManager::PreviewCutterIncrementalEndpointSameThread(const NCBlock& block,
     return true;
 }
 
-// BASE-PLANE-37: all-plane absolute Cartesian G01 and existing G17 sparse partial arcs use the same nominal identity
+// BASE-PLANE-38: all-plane absolute Cartesian G01 and permitted sparse partial arcs use the same nominal identity
 // checks as incremental/polar contours, including the one-generation G40
 // handoff. This preview only decodes; immutable literal and next-PC checks
 // remain in BuildCutterContourSameThread, and no tail commits here.
@@ -557,12 +557,15 @@ bool NCManager::CommitCutterContourSameThread(std::uint64_t run, std::uint64_t c
     const bool absoluteXYCircleSeam = m_cutterLine.stagedPlane == 17 &&
         m_cutterLine.stagedDistanceMode == 90 && m_cutterLine.stagedPolarMode == 15 &&
         (m_cutterLine.stagedPrimitive.fullCircle || m_cutterLine.stagedNextPrimitive.fullCircle);
+    // BASE-PLANE-38: revalidate the frozen source at commit for G18/G19
+    // absolute arcs too, not only at preview/build. No stale descriptor may
+    // advance the accepted nominal tail after staging succeeds.
     const bool absoluteCartesianContour =
         m_cutterLine.stagedDistanceMode == 90 && m_cutterLine.stagedPolarMode == 15 &&
         ((m_cutterLine.stagedPrimitive.kind == NCPathCoreCutterPrimitiveKind::LINE &&
             IsNCTranslationCutterSparseLineNotationAllowed(m_cutterLine.stagedPlane, 90, 15)) ||
-         (m_cutterLine.stagedPlane == 17 &&
-            m_cutterLine.stagedPrimitive.kind == NCPathCoreCutterPrimitiveKind::ARC));
+         (m_cutterLine.stagedPrimitive.kind == NCPathCoreCutterPrimitiveKind::ARC &&
+            IsNCTranslationCutterSparseArcNotationAllowed(m_cutterLine.stagedPlane, 90, 15)));
     if (m_cutterLine.stagedDistanceMode == 91 || m_cutterLine.stagedPolarMode == 16 || absoluteXYCircleSeam || absoluteCartesianContour)
     {
         const NCTranslationSnapshot source = CoordSys.GetTranslationSnapshot();

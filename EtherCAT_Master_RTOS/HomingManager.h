@@ -165,6 +165,7 @@ public:
     // Reset / Abort：受控停止後清除尚未完成的 HOME Runtime，不可恢復。
     void Cancel();
 
+    // Active requests cancel first. Retry after owner retirement to clear.
     void Reset();
 
 
@@ -286,6 +287,11 @@ private:
     MotionOwnerLease GetProbeCommandLease() const noexcept;
 
     bool QueueHomeStop(int axisIndex, double decelerationTime) noexcept;
+    bool QueueHomeControlStop(int axisIndex, double decelerationTime) noexcept;
+    bool PollHomeCommandResult(
+        int axisIndex, MotionAxisCommandSequence& sequence,
+        MotionAxisCommandType commandType) noexcept;
+    bool IsHomeAxisControlStopped(int axisIndex, AxisContext& axis) noexcept;
     bool QueueHomeVelocity(
         int axisIndex, double velocity, double accelerationTime) noexcept;
     bool QueueHomeMove(
@@ -314,9 +320,15 @@ private:
     // Request Initialization
     // ========================================================
 
-    bool ValidateAndInitializeRequest(
+    bool ValidateRequest(
         const HomeRequest& request,
         uint8_t selectedAxisMask);
+
+    HomeErrorReason ValidateAxisForHome(
+        const AxisContext& axis,
+        HomeSequenceMode sequenceMode) const;
+
+    void InitializeRequest(uint8_t selectedAxisMask);
 
     void ResetAxisRuntime(
         AxisContext& axis);
@@ -357,6 +369,9 @@ private:
         int axisIndex,
         AxisContext& axis,
         double cycleTimeSec);
+
+    void ProcessBackoffPointMove(
+        int axisIndex, AxisContext& axis, double distanceUnit);
 
     void ProcessCancel();
     void ProcessHold(double cycleTimeSec);
@@ -445,6 +460,10 @@ private:
         m_pendingApplyHomeSequence[HOME_AXIS_COUNT]{};
     MotionAxisCommandSequence
         m_pendingProbeDisarmSequence[HOME_AXIS_COUNT]{};
+    // Control-thread receipts only; no HomeRuntime / RT_SHARED ABI changes.
+    MotionAxisCommandSequence m_pendingMoveSequence[HOME_AXIS_COUNT]{};
+    MotionAxisCommandSequence m_pendingControlStopSequence[HOME_AXIS_COUNT]{};
+    bool m_controlStopIssued[HOME_AXIS_COUNT]{};
 
     // ========================================================
     // Request State

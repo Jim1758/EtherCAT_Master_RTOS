@@ -288,18 +288,16 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     // rotated Cartesian endpoints, even when G68 and WORK yaw are both zero.
     const bool basePlaneLinear = m_pendingPlaneMode != 17;
     const bool cutterActive = m_pendingTranslation.cutterMode != 40;
-    // BASE-PLANE-37: add only G18/G19 Cartesian G90 nominal lines and
-    // their explicitly requested G40 lead-out native-XYZ proof. Native line
-    // slots remain ascending X/Z or Y/Z, NOT the canonical circle order.
-    // Ordinary non-cutter and queued G01 keep their previous route.
-    const bool nominalLineNotation = (m_pendingPlaneMode == 17 &&
-        ((m_pendingTranslation.polarMode == 16 && m_pendingTranslation.distanceMode == 90 && m_pendingIsAbsoluteMode) ||
-         (m_pendingTranslation.polarMode == 15 &&
-            ((m_pendingTranslation.distanceMode == 91 && !m_pendingIsAbsoluteMode) ||
-             (m_pendingTranslation.distanceMode == 90 && m_pendingIsAbsoluteMode))))) ||
-        ((m_pendingPlaneMode == 18 || m_pendingPlaneMode == 19) && m_pendingIsAbsoluteMode &&
-            m_pendingTranslation.distanceMode == 90 && m_pendingTranslation.polarMode == 15 &&
-            IsNCTranslationCutterSparseLineNotationAllowed(m_pendingPlaneMode, 90, 15));
+    // BASE-PLANE-39: the NC-requested G40 lead-out proof covers every
+    // already-admitted cutter notation, including G18/G19 G91 and G90/G16.
+    // The stationary normal must match the accepted XYZ basis before enqueue
+    // or tail commit. Native line slots stay ascending; ordinary and queued
+    // G01 retain their previous route and all source/geometry gates below.
+    const bool nominalLineNotation =
+        IsNCTranslationCutterNotationAllowed(m_pendingPlaneMode,
+            m_pendingTranslation.distanceMode, m_pendingTranslation.polarMode) &&
+        m_pendingIsAbsoluteMode == (m_pendingTranslation.distanceMode == 90) &&
+        m_pendingG16Active == (m_pendingTranslation.polarMode == 16);
     const bool nativeXYZBaseline = requireNativeXYZBaselineMatch ||
         (nominalLineNotation && cutterActive);
     NCArcPlaneAxes cutterPlane{};

@@ -181,6 +181,19 @@ bool MotionCore::TryG00MoveTransactionalTail(
 }
 
 
+bool MotionCore::TryPositioningMoveTransactionalTail(
+    const std::vector<int>& axes, const std::vector<double>& nativeTargets,
+    int profileCode, double* commandedMCSTail)
+{
+    // Profile 0 is reserved for G00; never let an invalid public selector
+    // silently downgrade a positioning request into the rapid lane.
+    const int selected = profileCode == 0 ? -1 : profileCode;
+    return TryG00MoveInternal(axes, nativeTargets, BufferMode::ABORTING,
+        MotionCommandPathMode::EXACT_STOP, G00_overrideRatio,
+        commandedMCSTail, true, nullptr, false, false, selected);
+}
+
+
 bool MotionCore::TryG00MoveInternal(
     const std::vector<int>& axes,
     const std::vector<double>& targetPos_mm,
@@ -191,7 +204,8 @@ bool MotionCore::TryG00MoveInternal(
     bool transactionalTail,
     MotionCommandedEndpointReceiptV1* commandedEndpointReceipt,
     bool requirePlanarBaselineMatch,
-    bool useG53Profile)
+    bool useG53Profile,
+    int positioningProfile)
 {
     // BQ: every invocation starts unpublished, including every rejection path.
     if (commandedEndpointReceipt != nullptr)
@@ -308,12 +322,22 @@ bool MotionCore::TryG00MoveInternal(
             MotionRejectReason::INVALID_GEOMETRY);
     }
 
+    // BASE41: exact-stop positioning shares G00's admission and tail transaction.
+    // Profiles are explicit; F/rapid override never select positioning dynamics.
+    const bool positioning = positioningProfile != 0;
+    const bool referencePositioning = positioningProfile == 28 ||
+        positioningProfile == 30 || positioningProfile == 32;
+    const bool positionBoundary = useG53Profile || positioning;
+    if (positioning && (useG53Profile ||
+        (positioningProfile != 7 && positioningProfile != 161 && !referencePositioning)))
+        return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
+
     // BASE-PLANE-3: a mismatched G17 tag must not downgrade a non-XY
     // frozen source into the legacy rapid lane before source rejection.
     const bool basePlaneLinear = m_pendingPlaneMode != 17 ||
         (!IsNCTranslationSnapshotEmpty(m_pendingTranslation) && m_pendingTranslation.rotationPlane != 17);
     if (basePlaneLinear && (commandSource != MotionCommandSource::NC_MEMORY ||
-        !transactionalTail || useG53Profile || !IsNCTranslationSnapshotValid(m_pendingTranslation) ||
+        !transactionalTail || positionBoundary || !IsNCTranslationSnapshotValid(m_pendingTranslation) ||
         !IsPendingFixedTranslationSourceAllowed() || !IsNCTranslationBaseArcPlaneFrame(m_pendingTranslation) ||
         m_pendingPlaneMode != m_pendingTranslation.rotationPlane ||
         !IsNCNativeXYZLinearMapping(static_cast<int>(axes.size()), axes.data()) ||
@@ -327,7 +351,7 @@ bool MotionCore::TryG00MoveInternal(
 
     // G53 owns native endpoints and its own dynamics. A frozen descriptor
     // proves source only; no transform is applied to the machine targets.
-    if (useG53Profile && (mode != BufferMode::ABORTING ||
+    if (positionBoundary && (mode != BufferMode::ABORTING ||
         commandPathMode != MotionCommandPathMode::EXACT_STOP ||
         (commandSource == MotionCommandSource::NC_MEMORY &&
             (!m_pendingIsAbsoluteMode || m_pendingPlaneMode != 17 ||
@@ -550,6 +574,7 @@ bool MotionCore::TryG00MoveInternal(
     double maxTimeNeeded = 0.0;
     double sumSquaredPulse = 0.0;
     double sumSquaredUnit = 0.0;
+    bool hasPulseDisplacement = false;
 
     for (std::size_t slot = 0U; slot < axes.size(); ++slot)
     {
@@ -578,13 +603,13 @@ bool MotionCore::TryG00MoveInternal(
                 MotionRejectReason::INVALID_GEOMETRY);
         }
 
-        if (useG53Profile)
+        if (positionBoundary)
         {
             if (axis.axisIndex != axisIndex ||
                 (axis.axisType != AxisType::LINEAR && axis.axisType != AxisType::ROTARY &&
                     axis.axisType != AxisType::ROTARY_CONTINUOUS))
                 return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
-            if (!axis.isHomed)
+            if ((useG53Profile || referencePositioning) && !axis.isHomed)
             {
                 AlarmManager::GetInstance().Trigger(AlarmManager::axis_is_not_Homed,
                     m_pendingSourcePC, axisIndex);
@@ -598,11 +623,28 @@ bool MotionCore::TryG00MoveInternal(
                 return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
             }
         }
-        const double axisAccTime = useG53Profile ? axis.G53_acc_time : axis.G00_acc_time;
-        const double axisDecTime = useG53Profile ? axis.G53_dec_time : axis.G00_dec_time;
-        const double axisMaxPPS = useG53Profile ? axis.G53_PPS : axis.G00_PPS;
-        if (useG53Profile && (axisAccTime < 0.0 || axisDecTime < 0.0 || axisMaxPPS <= 0.0))
+        double axisAccTime = useG53Profile ? axis.G53_acc_time : axis.G00_acc_time;
+        double axisDecTime = useG53Profile ? axis.G53_dec_time : axis.G00_dec_time;
+        double axisMaxPPS = useG53Profile ? axis.G53_PPS : axis.G00_PPS;
+        switch (positioningProfile)
+        {
+        case 7: axisAccTime = axis.G07_acc_time; axisDecTime = axis.G07_dec_time; axisMaxPPS = axis.G07_PPS; break;
+        case 161: axisAccTime = axis.G161_acc_time; axisDecTime = axis.G161_dec_time; axisMaxPPS = axis.G161_PPS; break;
+        case 28: axisAccTime = axis.G28_acc_time; axisDecTime = axis.G28_dec_time; axisMaxPPS = axis.G28_PPS; break;
+        case 30: axisAccTime = axis.G30_acc_time; axisDecTime = axis.G30_dec_time; axisMaxPPS = axis.G30_PPS; break;
+        case 32: axisAccTime = axis.G32_acc_time; axisDecTime = axis.G32_dec_time; axisMaxPPS = axis.G32_PPS; break;
+        default: break;
+        }
+        if (positionBoundary && (axisAccTime < 0.0 || axisDecTime < 0.0 || axisMaxPPS <= 0.0))
             return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
+        // BASE47: G53 uses the same per-axis ceiling as other positioning.
+        // Validate before min/max: NaN must not be hidden by the other operand.
+        if (positionBoundary)
+        {
+            if (!std::isfinite(axisMaxPPS) || !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0)
+                return rejectWithoutTailMutation(true, true, MotionRejectReason::INVALID_GEOMETRY);
+            axisMaxPPS = (std::min)(axisMaxPPS, axis.maxVel_PPS);
+        }
 
         const std::uint32_t axisBit =
             static_cast<std::uint32_t>(1U << axisIndex);
@@ -716,13 +758,14 @@ bool MotionCore::TryG00MoveInternal(
                     const double distancePulse =
                         std::abs(targetPulse - startPulse);
                     const double distanceUnit = distancePulse / pulsePerUnit;
+                    hasPulseDisplacement = hasPulseDisplacement || distancePulse > 0.0;
                     sumSquaredPulse += distancePulse * distancePulse;
                     sumSquaredUnit += distanceUnit * distanceUnit;
 
                     const double currentAxisMaxPPS =
-                        useG53Profile ? axisMaxPPS : axisMaxPPS * rapidOverrideCandidate;
+                        positionBoundary ? axisMaxPPS : axisMaxPPS * rapidOverrideCandidate;
                     if (std::isfinite(currentAxisMaxPPS) &&
-                        currentAxisMaxPPS > (useG53Profile ? 0.0 : 1.0))
+                        currentAxisMaxPPS > (positionBoundary ? 0.0 : 1.0))
                     {
                         maxTimeNeeded = std::max<double>(
                             maxTimeNeeded,
@@ -746,11 +789,11 @@ bool MotionCore::TryG00MoveInternal(
     const double targetFeedrateUnitPerMinute = 5000.0;
     const double targetFeedrateUnitPerSecond =
         targetFeedrateUnitPerMinute / 60.0;
-    if (useG53Profile)
+    if (useG53Profile || (positioning && positioningProfile != 7))
     {
         if (maxTimeNeeded > 0.0) groupG00VelocityPPS = totalDistancePulse / maxTimeNeeded;
     }
-    else if (totalDistanceUnit > 0.0001 &&
+    else if (totalDistanceUnit > (positioning ? 0.0 : 0.0001) &&
         targetFeedrateUnitPerSecond > 0.0)
     {
         const double exactTimeNeeded =
@@ -764,12 +807,25 @@ bool MotionCore::TryG00MoveInternal(
         }
     }
 
-    if (!std::isfinite(groupG00VelocityPPS))
+    if (!std::isfinite(groupG00VelocityPPS) ||
+        (positionBoundary && (!std::isfinite(totalDistancePulse) || !std::isfinite(totalDistanceUnit) ||
+            !std::isfinite(maxTimeNeeded) || (hasPulseDisplacement && groupG00VelocityPPS <= 0.0))))
     {
         return rejectWithoutTailMutation(
             true,
             true,
             MotionRejectReason::INVALID_GEOMETRY);
+    }
+
+    // Positioning must survive the RT group's minimum speed and derived dynamics
+    // checks before committing any producer tail. Zero displacement is valid.
+    if (positionBoundary && hasPulseDisplacement &&
+        (groupG00VelocityPPS < 1.0 ||
+            !std::isfinite(groupG00VelocityPPS / groupAccTime) ||
+            !std::isfinite(groupG00VelocityPPS / groupDecTime)))
+    {
+        return rejectWithoutTailMutation(
+            true, true, MotionRejectReason::INVALID_GEOMETRY);
     }
 
     const std::uint64_t stagedCommittedFingerprint =
@@ -884,7 +940,7 @@ bool MotionCore::TryG00MoveInternal(
         return failAcceptedCommit(false);
     }
 
-    if (useG53Profile && commandSource == MotionCommandSource::NC_MEMORY)
+    if (positionBoundary && commandSource == MotionCommandSource::NC_MEMORY)
     {
         bool captureMatches = false;
         if (m_programBlockMotionCaptureActive && !m_programBlockMotionCapture.overflow &&

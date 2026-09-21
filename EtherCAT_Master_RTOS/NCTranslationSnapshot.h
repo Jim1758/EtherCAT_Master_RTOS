@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <cmath>
 #include <cstddef>
@@ -20,7 +20,7 @@ struct NCTranslationSnapshot
     std::uint64_t generation = 0ULL;
     std::uint64_t revision = 0ULL;
     std::int32_t wcsCode = 0;
-    std::uint32_t schema = 48U;
+    std::uint32_t schema = 50U;
     double extOffsetMM[8] = {};
     double wcsOffsetMM[8] = {};
     std::int32_t toolLengthMode = 49;
@@ -145,7 +145,7 @@ inline bool NCTranslationHasWorkPlaneRotation(const NCTranslationSnapshot& s) no
 inline bool IsNCTranslationSnapshotEmpty(const NCTranslationSnapshot& s) noexcept
 {
     if (s.runToken != 0ULL || s.generation != 0ULL || s.revision != 0ULL ||
-        s.wcsCode != 0 || s.schema != 48U || s.toolLengthMode != 49 ||
+        s.wcsCode != 0 || s.schema != 50U || s.toolLengthMode != 49 ||
         s.toolHCode != 0 || s.workMode != 169 || s.workWCode != 0 ||
         s.rotationMode != 69 || s.rotationPlane != 17 ||
         s.rotationCenterMM[0] != 0.0 || s.rotationCenterMM[1] != 0.0 ||
@@ -205,7 +205,7 @@ inline bool IsNCTranslationCutterNotationAllowed(int plane, int distance, int po
 // NOMINAL contour tail in G18 (Z/X) and G19 (Y/Z). At least one canonical
 // plane word is required. G90 retains the omitted AUTHOR coordinate, whereas
 // G91 supplies zero omitted delta. Both native plane endpoints are carried,
-// including G40's physical offset removal. This grants neither sparse G90
+// including G40's physical offset removal. This line gate alone grants neither
 // arcs/circles nor G16, ownership, nonzero-speed junctions or replay.
 inline bool IsNCTranslationCutterSparseLineNotationAllowed(int plane,
     int distance, int polar) noexcept
@@ -214,22 +214,21 @@ inline bool IsNCTranslationCutterSparseLineNotationAllowed(int plane,
         (distance == 90 || distance == 91);
 }
 
-// BASE-PLANE-36: Cartesian G91 PARTIAL G02/G03 may omit one canonical
-// plane word in G18 (Z/X) or G19 (Y/Z), alongside the existing G17 lane.
-// NC requires at least one in-plane literal and decodes the missing author
-// delta as zero from the ACCEPTED NOMINAL contour tail, for both current
-// dispatch and immutable lookahead. The producer still proves BOTH native
-// plane endpoints, the fixed normal axis and the complete offset arc bounds.
-// A sparse zero chord never grants a circle: the existing COMPLETE authored
-// explicit-zero/repeated-pair proof and tangent-line seams remain mandatory.
-// G17/G90 keeps its existing absolute decoder; G18/G19 G90, G16, ownership,
-// nonzero-speed junctions, replay and multi-turn arcs are NOT relaxed.
+// BASE-PLANE-38: Cartesian PARTIAL G02/G03 may omit one canonical
+// plane word in all three planes, for G90 as well as G91. G18 uses Z/X,
+// G19 uses Y/Z. NC requires an in-plane literal and obtains the missing
+// absolute AUTHOR coordinate only from the ACCEPTED NOMINAL contour tail;
+// G91 supplies zero omitted delta. Current dispatch and the immutable
+// 32-line lookahead use the same source/plane/generation checked decoder.
+// BOTH physical plane endpoints, the fixed normal and full offset-arc
+// bounds remain required. A sparse coincident endpoint NEVER grants an
+// IJK revolution: complete authored-pair proof and tangent seams are separate.
+// No G16/G91, R circle, multiple turns, ownership, blending or replay is granted.
 inline bool IsNCTranslationCutterSparseArcNotationAllowed(int plane,
     int distance, int polar) noexcept
 {
-    return polar == 15 &&
-        ((plane == 17 && (distance == 90 || distance == 91)) ||
-         ((plane == 18 || plane == 19) && distance == 91));
+    return polar == 15 && IsNCArcPlaneCode(plane) &&
+        (distance == 90 || distance == 91);
 }
 
 // Shared NC lookahead / Motion producer / Motion consumer circle scope.
@@ -272,7 +271,7 @@ inline bool IsNCTranslationBaseArcPlaneFrame(const NCTranslationSnapshot& s) noe
 inline bool IsNCTranslationSnapshotValid(const NCTranslationSnapshot& s) noexcept
 {
     if (s.runToken == 0ULL || s.generation == 0ULL || s.revision == 0ULL ||
-        s.schema != 48U || !IsNCAxisIdentitySnapshotValid(s.axisIdentity) ||
+        s.schema != 50U || !IsNCAxisIdentitySnapshotValid(s.axisIdentity) ||
         !IsNCWorkCoordinateCode(s.wcsCode) ||
         (s.distanceMode != 90 && s.distanceMode != 91) || (s.unitsMode != 20 && s.unitsMode != 21)) return false;
     if ((s.polarMode != 15 && s.polarMode != 16) || (s.storedStrokeMode != 22 && s.storedStrokeMode != 23) ||
@@ -864,7 +863,8 @@ inline bool TryNCTranslationCutterSparsePolarLineEndpoint(const NCTranslationSna
         radiusMM, angleDeg, authoredEndpointMask, outputMCS);
 }
 
-// BASE-PLANE-33/34 NC-only G17/G15/G90 contour endpoint. The caller proves
+// BASE-PLANE-38 NC-only Cartesian G90 endpoint in canonical XY / ZX / YZ.
+// The caller proves
 // run/cache/generation/primitive identity and G01 or a permitted PARTIAL arc.
 // G40 lead-out is still G01; full-circle proof remains a separate contract.
 // Missing author coordinates come only from the accepted nominal contour.

@@ -2824,6 +2824,11 @@ int NCManager::GetG53NativeScopeAlarmSameThread()
 
 bool NCManager::PrepareG53NativeHandoffSameThread()
 {
+    return PreparePositioningHandoffSameThread(53);
+}
+
+bool NCManager::PreparePositioningHandoffSameThread(int profileCode)
+{
     if (!CoordSys.IsTranslationRunFrozen()) return true;
     int alarm = GetG53NativeScopeAlarmSameThread();
     if (alarm == 0)
@@ -2838,7 +2843,7 @@ bool NCManager::PrepareG53NativeHandoffSameThread()
             ? static_cast<int>(AlarmManager::G_Code_Invalid_parameter)
             : static_cast<int>(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
     }
-    RtPrintf("[G53][REJECT] alarm=%d reason=HANDOFF beforeCommit=1\n", alarm);
+    RtPrintf("[G%d][REJECT] alarm=%d reason=HANDOFF beforeCommit=1\n", profileCode, alarm);
     AlarmManager::GetInstance().Trigger(alarm);
     ChangeState(alarm == AlarmManager::G_Code_Invalid_parameter ? NCState::HOLD : NCState::ALARM);
     return false;
@@ -2846,7 +2851,12 @@ bool NCManager::PrepareG53NativeHandoffSameThread()
 
 void NCManager::CommitG53NativeHandoffSameThread() noexcept
 {
-    // G53 is a positioning boundary, never a retained cutting segment. Only
+    CommitPositioningHandoffSameThread(53);
+}
+
+void NCManager::CommitPositioningHandoffSameThread(int profileCode) noexcept
+{
+    // Positioning is a boundary, never a retained cutting segment. Only
     // the accepted native tail may sever old history. The coordinate descriptor
     // stays identical; the aborting motion epoch fences every older packet.
     ClearPathCoreReplayHistorySameThread();
@@ -2854,8 +2864,8 @@ void NCManager::CommitG53NativeHandoffSameThread() noexcept
     if (CoordSys.IsTranslationRunFrozen())
     {
         const NCTranslationSnapshot& frame = CoordSys.GetTranslationSnapshot();
-        RtPrintf("[G53][HANDOFF] run=%llu generation=%llu epoch=%u native=1 historyCleared=1\n",
-            static_cast<unsigned long long>(frame.runToken),
+        RtPrintf("[G%d][HANDOFF] run=%llu generation=%llu epoch=%u native=1 historyCleared=1\n",
+            profileCode, static_cast<unsigned long long>(frame.runToken),
             static_cast<unsigned long long>(frame.generation),
             static_cast<unsigned int>(m_motion.GetCurrentExecutionEpoch()));
     }
@@ -2863,8 +2873,20 @@ void NCManager::CommitG53NativeHandoffSameThread() noexcept
 
 bool NCManager::RequiresFixedTranslationSelectionTransitionSameThread(const NCBlock& block) const
 {
+    // BASE42: an unfrozen two-leg reference also needs the exact current
+    // epoch/owner drain proof before dispatch. An older HOME/START sample or
+    // a busy RT publication must defer this PC, not fail inside pair admission.
+    // Direct reference blocks retain their existing pre-dispatch contract.
+    if (NCGCodeSemantics::Contains(block, 28) || NCGCodeSemantics::Contains(block, 30) ||
+        NCGCodeSemantics::Contains(block, 32))
+        for (int axis = 0; axis < 8; ++axis)
+        {
+            const char letter = m_axisNames[axis];
+            if (letter >= 'A' && letter <= 'Z' && letter != 'N' && block.has(letter)) return true;
+        }
     if (!CoordSys.IsTranslationRunFrozen()) return false;
-    if (NCGCodeSemantics::Contains(block, 53)) return true;
+    for (int positioning : {7, 28, 30, 32, 53, 161})
+        if (NCGCodeSemantics::Contains(block, positioning)) return true;
     if (NCGCodeSemantics::Contains(block, 22) || NCGCodeSemantics::Contains(block, 23))
         return (NCGCodeSemantics::Contains(block, 22) ? 22 : 23) !=
             CoordSys.GetTranslationSnapshot().storedStrokeMode;
@@ -2943,6 +2965,14 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
     if (!CoordSys.IsTranslationRunFrozen()) return true;
     if (NCGCodeSemantics::Contains(block, 53))
         return GCodeHandlers::ValidateG53Block(block, this) && PrepareG53NativeHandoffSameThread();
+    for (int positioning : {7, 161})
+        if (NCGCodeSemantics::Contains(block, positioning))
+            return GCodeHandlers::ValidatePositioningBlock(block, this, positioning) &&
+                PreparePositioningHandoffSameThread(positioning);
+    for (int reference : {28, 30, 32})
+        if (NCGCodeSemantics::Contains(block, reference))
+            return GCodeHandlers::ValidateReferencePositionBlock(block, this) &&
+                PreparePositioningHandoffSameThread(reference);
     const int arcPlane = NCGCodeSemantics::Contains(block, 18) ? 18 :
         (NCGCodeSemantics::Contains(block, 19) ? 19 : (NCGCodeSemantics::Contains(block, 17) ? 17 : 0));
     const bool planeSelection = arcPlane != 0;
@@ -3197,6 +3227,16 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         ChangeState(NCState::HOLD);
         return false;
     }
+    // BASE41: these commands own their entire row. Check them before any
+    // ExecuteBlock setting, T/M effect or HOME retention fence can commit.
+    if (NCGCodeSemantics::Contains(block, 81) &&
+        !GCodeHandlers::ValidateG81Block(block, this)) return false;
+    for (int positioning : {7, 161})
+        if (NCGCodeSemantics::Contains(block, positioning) &&
+            !GCodeHandlers::ValidatePositioningBlock(block, this, positioning)) return false;
+    if ((NCGCodeSemantics::Contains(block, 28) || NCGCodeSemantics::Contains(block, 30) ||
+        NCGCodeSemantics::Contains(block, 32)) &&
+        !GCodeHandlers::ValidateReferencePositionBlock(block, this)) return false;
     if (block.isEmpty && codeCount == 0 && block.mCount == 0 && !block.isGoto)
     {
         bool emptyWords = true;

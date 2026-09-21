@@ -89,6 +89,43 @@ public:
         return true;
     }
 
+    // Producer-only capacity proof. With exactly one producer, the consumer
+    // can only make additional space until that producer's next publication.
+    // Unlike size(), this reads the exact producer write position.
+    bool ProducerHasCapacity(std::size_t count) const noexcept
+    {
+        if (count > Capacity) return false;
+        const std::uint64_t writeSequence =
+            m_writeSequence.load(std::memory_order_relaxed);
+        const std::uint64_t readSequence =
+            m_readSequence.load(std::memory_order_acquire);
+        const std::uint64_t occupied = writeSequence - readSequence;
+        return occupied <= static_cast<std::uint64_t>(Capacity) &&
+            static_cast<std::uint64_t>(count) <=
+                static_cast<std::uint64_t>(Capacity) - occupied;
+    }
+
+    // BASE42: both slots become visible at one release publication. A failed
+    // capacity check copies neither command; the RT consumer cannot observe
+    // the first leg alone, including when the pair straddles the ring end.
+    bool ProducerTryPushPair(const T& first, const T& second) noexcept
+    {
+        const std::uint64_t writeSequence =
+            m_writeSequence.load(std::memory_order_relaxed);
+        const std::uint64_t readSequence =
+            m_readSequence.load(std::memory_order_acquire);
+        const std::uint64_t occupied = writeSequence - readSequence;
+        if (Capacity < 2U || occupied > static_cast<std::uint64_t>(Capacity) ||
+            static_cast<std::uint64_t>(Capacity) - occupied < 2ULL)
+            return false;
+        m_storage[static_cast<std::size_t>(
+            writeSequence % static_cast<std::uint64_t>(Capacity))] = first;
+        m_storage[static_cast<std::size_t>(
+            (writeSequence + 1ULL) % static_cast<std::uint64_t>(Capacity))] = second;
+        m_writeSequence.store(writeSequence + 2ULL, std::memory_order_release);
+        return true;
+    }
+
     // Consumer thread only.
     bool ConsumerTryPeek(T& outValue) const noexcept
     {
@@ -341,6 +378,17 @@ public:
     bool ProducerTryPush(const T& value) noexcept
     {
         return m_ingress.ProducerTryPush(value);
+    }
+
+    // NC / MDI producer only; preserve the ingress pair linearization point.
+    bool ProducerHasCapacity(std::size_t count) const noexcept
+    {
+        return m_ingress.ProducerHasCapacity(count);
+    }
+
+    bool ProducerTryPushPair(const T& first, const T& second) noexcept
+    {
+        return m_ingress.ProducerTryPushPair(first, second);
     }
 
     // 250 us Motion consumer only.  Replay commands always have priority,

@@ -325,6 +325,7 @@ public:
     MotionCommandedEndpointReceiptV1* GetPathCoreCommandedReceiptWorkspaceSameThread() noexcept;
     int GetG53NativeScopeAlarmSameThread();
     void CommitG53NativeHandoffSameThread() noexcept;
+    void CommitPositioningHandoffSameThread(int profileCode) noexcept;
     bool ReadPathCoreCommittedRunPieceSameThread(std::uint32_t index,
         NCPathCoreCommittedRecordV1& output) noexcept;
     bool EvaluatePathCoreCommittedRunPieceSameThread(std::uint32_t index, double u,
@@ -1434,6 +1435,7 @@ private:
     bool IsFixedTranslationTravelCurrentSameThread() const noexcept;
     bool PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode);
     bool PrepareG53NativeHandoffSameThread();
+    bool PreparePositioningHandoffSameThread(int profileCode);
     bool IsFixedTranslationBlockAllowedSameThread(const NCBlock& block);
     bool RequiresFixedTranslationSelectionTransitionSameThread(const NCBlock& block) const;
     bool TransitionFixedTranslationSelectionSameThread(const NCBlock& block);

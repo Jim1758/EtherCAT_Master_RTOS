@@ -682,13 +682,13 @@ WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
         }
     }
     const bool cutter = CoordSys.toolRadiusMode != 40;
-    // BASE-PLANE-37: G18/G19 Cartesian G90 lines and pending G40 lead-out
-    // join G17's nominal-tail/native-XYZ contract. Do not re-route ordinary
-    // no-cutter G01, queued feeds, or the existing G18/G19 G91/G16 lanes.
+    // BASE-PLANE-39: every admitted cutter line and G40 lead-out proves
+    // the accepted native XYZ basis, including the stationary normal. This
+    // closes the G18/G19 G91 and G90/G16 lead-out gap without changing
+    // ordinary G01, notation, queueing, or the physical plane-axis mapping.
     const bool nominalCutterLine = (cutter || m_cutterLine.leadOutRequired) &&
-        (CoordSys.activePlane == 17 || (CoordSys.isAbsoluteMode &&
-            IsNCTranslationCutterSparseLineNotationAllowed(CoordSys.activePlane, 90,
-                CoordSys.isPolarCoordinateActive ? 16 : 15)));
+        IsNCTranslationCutterNotationAllowed(CoordSys.activePlane,
+            CoordSys.isAbsoluteMode ? 90 : 91, CoordSys.isPolarCoordinateActive ? 16 : 15);
     NCArcPlaneAxes cutterPlane{};
     if (!TryGetNCArcPlaneAxes(CoordSys.activePlane, cutterPlane))
     { RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter); return nullptr; }

@@ -2006,7 +2006,8 @@ public:
     // Only the existing Priority-50 HMI 1000 ms task may consume this queue.
     enum class IdleHoldDiagnosticEventType : std::uint8_t
     {
-        ACTIVE, REFERENCE, RELEASED, CANCELLED, FAILED
+        ACTIVE, REFERENCE, RELEASED, CANCELLED, FAILED,
+        FOLLOWING_ERROR_SAMPLE, FOLLOWING_ERROR_CONTROL
     };
     enum class IdleHoldDiagnosticReason : std::uint8_t
     {
@@ -3503,7 +3504,8 @@ private:
         bool cncFeedLookahead = false,
         const NCPathCoreRetainedGeometry* cncCorner = nullptr,
         double cncPrefixVelocityPPS = 0.0,
-        bool pathCoreFeedExactStop = false) noexcept;
+        bool pathCoreFeedExactStop = false,
+        MotionCommand* preparedCommand = nullptr) noexcept;
     bool TryG00MoveInternal(
         const std::vector<int>& axes,
         const std::vector<double>& targetPos,
@@ -3514,7 +3516,8 @@ private:
         bool transactionalTail,
         MotionCommandedEndpointReceiptV1* commandedEndpointReceipt = nullptr,
         bool requirePlanarBaselineMatch = false,
-        bool useG53Profile = false);
+        bool useG53Profile = false,
+        int positioningProfile = 0);
     // RT-only natural completion for frozen planar or incremental NC lines.
     bool IsFixedPlanarLineEndpointScope() const noexcept;
     bool IsCncLineEndpointScope() const noexcept;
@@ -3683,6 +3686,8 @@ private:
     double GetTrackedMotionProgress() const noexcept;
 
     bool TryEnqueueMotionCommand(const MotionCommand& command) noexcept;
+    bool TryEnqueueMotionCommandPair(
+        const MotionCommand& first, const MotionCommand& second) noexcept;
     bool TryPeekNextMotionCommand(MotionCommand& command) const noexcept;
     bool TryPeekQueuedMotionCommandAt(
         std::size_t offset,
@@ -3925,7 +3930,9 @@ private:
     void QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType eventType,
         IdleHoldDiagnosticReason reason = IdleHoldDiagnosticReason::NONE,
         int axisIndex = -1,
-        MotionOwnerLease nextLease = MotionOwnerLease{}) noexcept;
+        MotionOwnerLease nextLease = MotionOwnerLease{},
+        const std::array<double, 3>* detail = nullptr,
+        std::uint32_t detailFlags = 0U) noexcept;
 
     struct CncP1LateJunction
     {
@@ -4159,6 +4166,17 @@ public:
         MotionPathCoreRetainedWorkspace& workspace,
         MotionCommand& commandWorkspace);
 
+    // BASE41: profile 7/161 uses WCS-resolved native endpoints; 28/30/32 uses
+    // direct reference MCS. Single exact-stop command; success-only tail commit.
+    bool TryPositioningMoveTransactionalTail(const std::vector<int>& axes,
+        const std::vector<double>& nativeTargets, int profileCode, double* commandedMCSTail);
+    // BASE42: two native reference legs share one epoch and one atomic ingress
+    // publication. Intermediate mask bits are native axis indices; other axes
+    // retain their exact sampled pulse until the final reference leg.
+    bool TryReferencePositionPairTransactionalTail(const std::vector<int>& axes,
+        const std::vector<double>& intermediateNativeTargets,
+        const std::vector<double>& finalNativeTargets, std::uint32_t intermediateMask,
+        int profileCode, double* commandedMCSTail);
     void G07_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G07 快速定位 API
     void G161_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G161 快速定位 API
     // Native mm/degrees, absolute exact-stop. Commits MCS/pulse tails only

@@ -1,5 +1,6 @@
 #include "HomingManager.h"
 #include "MotionCore.h"
+#include "MotionRotaryTarget.h"
 #include "NCManager.h"
 #include "AlarmManager.h"
 #include "HomePersistenceManager.h"
@@ -246,8 +247,25 @@ void HomingManager::RestoreOrReleaseHomeMotionOwner() noexcept
         {
             m_pendingProbeDisarmSequence[i] =
                 MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+            m_pendingMoveSequence[i] = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+            m_pendingControlStopSequence[i] = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+            m_controlStopIssued[i] = false;
         }
         return;
+    }
+
+    // A HOME fault must await SAFETY takeover, never restore a program owner.
+    if (m_hasError)
+    {
+        m_returnMotionOwner = MotionOwner::NONE;
+        return;
+    }
+    for (int i = 0; i < HOME_AXIS_COUNT; ++i)
+    {
+        if (!PollHomeCommandResult(i, m_pendingMoveSequence[i],
+            MotionAxisCommandType::MOVE_TO_POSITION)) return;
+        if (!PollHomeCommandResult(i, m_pendingControlStopSequence[i],
+            MotionAxisCommandType::STOP_MOVE)) return;
     }
 
     // A zero queue depth is not sufficient: RT may already have popped the
@@ -291,8 +309,12 @@ void HomingManager::RestoreOrReleaseHomeMotionOwner() noexcept
                 m_nc->ChangeState(NCState::ALARM);
             }
 
-            m_homeMotionLease = MotionOwnerLease{};
+            // Safety may still be waiting for an RT reservation. Preserve
+            // the exact lease for the inactive Process() retry until takeover;
+            // a failed disarm must never restore the old program owner.
             m_returnMotionOwner = MotionOwner::NONE;
+            if (m_motion.IsMotionOwnerLeaseCurrent(homeLease)) return;
+            m_homeMotionLease = MotionOwnerLease{};
             return;
         }
     }
@@ -302,23 +324,39 @@ void HomingManager::RestoreOrReleaseHomeMotionOwner() noexcept
         returnOwner == MotionOwner::MANUAL_AUTO)
     {
         MotionOwnerLease restoredLease{};
-        if (m_motion.TryTransferMotionOwner(
+        if (!m_motion.TryTransferMotionOwner(
             homeLease, returnOwner, restoredLease))
         {
-            const bool adopted =
-                m_nc != nullptr &&
-                m_nc->AdoptProgramMotionLease(restoredLease);
+            // A 250 us output reservation or pending safety ticket is
+            // transient. Keep this exact retry key; never spin here.
+            return;
+        }
 
-            if (!adopted)
-            {
-                // Do not leave an owner with no corresponding NC program lease.
-                m_motion.ReleaseMotionOwner(restoredLease);
-            }
+        const bool adopted =
+            m_nc != nullptr &&
+            m_nc->AdoptProgramMotionLease(restoredLease);
+        if (!adopted)
+        {
+            // Transfer succeeded but NC cannot own the returned lease.
+            // Contain the orphaned program owner with the existing Safety
+            // request; do not report successful HOME completion to NC.
+            m_hasError = true;
+            m_completed = false;
+            m_lastError = HomeErrorReason::MOTION_FAULT;
+            m_lastErrorAxis = -1;
+            if (!AlarmManager::GetInstance().HasAlarm())
+                AlarmManager::GetInstance().Trigger(AlarmManager::HOME_MOTION_FAULT);
+            m_motion.RequestEmergencyStopAllAxes();
+            if (m_nc != nullptr) m_nc->ChangeState(NCState::ALARM);
         }
     }
     else
     {
-        m_motion.ReleaseMotionOwner(homeLease);
+        if (!m_motion.ReleaseMotionOwner(homeLease))
+        {
+            // Preserve the pending release for the next 10 ms Process pass.
+            return;
+        }
     }
 
     m_homeMotionLease = MotionOwnerLease{};
@@ -364,10 +402,98 @@ bool HomingManager::QueueHomeMove(
     double accelerationTime, double decelerationTime,
     bool useShortestPath) noexcept
 {
-    return m_motion.SubmitAxisMoveToPosition(
+    if (m_pendingMoveSequence[axisIndex] !=
+        MOTION_AXIS_COMMAND_SEQUENCE_INVALID) return false;
+
+    MotionAxisCommandSequence sequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+    if (!m_motion.SubmitAxisMoveToPosition(
         axisIndex, targetPosition, targetVelocity, accelerationTime,
         decelerationTime, useShortestPath, MotionCommandSource::HOME,
-        m_homeMotionLease);
+        m_homeMotionLease, &sequence)) return false;
+
+    m_pendingMoveSequence[axisIndex] = sequence;
+    return true;
+}
+
+// Queue acceptance is not RT admission. Retire each receipt promptly; an
+// APPLIED receipt permits the existing motion-state check, not a position claim.
+bool HomingManager::PollHomeCommandResult(
+    int axisIndex, MotionAxisCommandSequence& sequence,
+    MotionAxisCommandType commandType) noexcept
+{
+    if (sequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID) return true;
+
+    if (!m_motion.IsMotionOwnerLeaseCurrent(m_homeMotionLease))
+    {
+        sequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        m_returnMotionOwner = MotionOwner::NONE;
+        // SAFETY can revoke the lease between Cancel's entry check and poll.
+        if (m_cancelRequested) return true;
+        SetAxisError(axisIndex, m_motion.GetAxisContext(axisIndex),
+            HomeErrorReason::MOTION_FAULT);
+        return false;
+    }
+
+    MotionAxisCommandResult result{};
+    if (!m_motion.TryGetAxisCommandResult(sequence, result)) return false;
+
+    const bool applied =
+        result.sequence == sequence && result.axisIndex == axisIndex &&
+        result.commandType == commandType &&
+        result.owner == MotionOwner::HOME &&
+        result.ownerGeneration == m_homeMotionLease.generation &&
+        result.resultType == MotionAxisCommandResultType::APPLIED &&
+        result.rejectReason == MotionRejectReason::NONE;
+    sequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+    if (!applied)
+    {
+        m_returnMotionOwner = MotionOwner::NONE;
+        SetAxisError(axisIndex, m_motion.GetAxisContext(axisIndex),
+            HomeErrorReason::MOTION_FAULT);
+        return false;
+    }
+    return true;
+}
+
+bool HomingManager::QueueHomeControlStop(
+    int axisIndex, double decelerationTime) noexcept
+{
+    if (m_controlStopIssued[axisIndex]) return true;
+    // A newer SAFETY/RESET owner supplies the stop for revoked HOME work.
+    if (!m_motion.IsMotionOwnerLeaseCurrent(m_homeMotionLease)) return false;
+    MotionAxisCommandSequence sequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+    if (!m_motion.SubmitAxisStopMove(
+        axisIndex, decelerationTime, MotionCommandSource::HOME,
+        m_homeMotionLease, &sequence)) return false;
+    m_pendingControlStopSequence[axisIndex] = sequence;
+    m_controlStopIssued[axisIndex] = true;
+    return true;
+}
+
+bool HomingManager::IsHomeAxisControlStopped(
+    int axisIndex, AxisContext& axis) noexcept
+{
+    (void)PollHomeCommandResult(axisIndex, m_pendingMoveSequence[axisIndex],
+        MotionAxisCommandType::MOVE_TO_POSITION);
+    if (m_hasError) return false;
+    (void)PollHomeCommandResult(axisIndex,
+        m_pendingControlStopSequence[axisIndex], MotionAxisCommandType::STOP_MOVE);
+    if (m_hasError) return false;
+
+    const bool movePending = m_pendingMoveSequence[axisIndex] !=
+        MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+    if (movePending || (axis.state != MotionState::MotionState_IDLE &&
+        axis.state != MotionState::MotionState_STOPPING))
+    {
+        // A FIFO stop also fences a P2P which is queued while feedback is IDLE.
+        // Keep the issued flag after its ACK until HOLD/cancel finishes, even
+        // when the move receipt is delivered later than the stop receipt.
+        (void)QueueHomeControlStop(axisIndex, GetHoldDecTime(axis));
+    }
+    return !movePending &&
+        m_pendingControlStopSequence[axisIndex] ==
+            MOTION_AXIS_COMMAND_SEQUENCE_INVALID &&
+        axis.state == MotionState::MotionState_IDLE;
 }
 
 bool HomingManager::QueueHomeProbeFunction(
@@ -405,6 +531,16 @@ bool HomingManager::Start(
         return false;
     }
 
+    // BASE43: an inactive request can still own its final disarm result or
+    // owner-return retry. Only inactive Process() may retire that exact key.
+    // Do not erase it, or replace its original program return owner.
+    if (m_homeMotionLease.IsValid())
+    {
+        m_lastError = HomeErrorReason::MOTION_BUSY;
+        m_lastErrorAxis = -1;
+        return false;
+    }
+
 
     // 清除上一個 Request 的結果。
     m_completed = false;
@@ -434,6 +570,9 @@ bool HomingManager::Start(
             MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
         m_pendingProbeDisarmSequence[i] =
             MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        m_pendingMoveSequence[i] = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        m_pendingControlStopSequence[i] = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        m_controlStopIssued[i] = false;
     }
 
 
@@ -471,19 +610,26 @@ bool HomingManager::Start(
     // 驗證並初始化全部 Selected Axis。
     // --------------------------------------------------------
 
+    // Validate every selected order group before changing owner or homed
+    // state. Recheck after acquisition before committing any axis runtime.
+    if (!ValidateRequest(request, selectedAxisMask))
+    {
+        return false;
+    }
+
     if (!AcquireHomeMotionOwner())
     {
         m_lastError = HomeErrorReason::MOTION_BUSY;
         return false;
     }
 
-    if (!ValidateAndInitializeRequest(
-        request,
-        selectedAxisMask))
+    if (!ValidateRequest(request, selectedAxisMask))
     {
         RestoreOrReleaseHomeMotionOwner();
         return false;
     }
+
+    InitializeRequest(selectedAxisMask);
 
 
     m_sequenceMode =
@@ -572,7 +718,9 @@ void HomingManager::Process(
 
     // 外部 E-Stop / Safety / Servo Alarm 在 RUNNING、Hold 減速、
     // PAUSED 任一狀態都必須讓 HOME 失效，不可 Resume。
+    // Authority is still required after an APPLIED receipt was retired.
     if (AlarmManager::GetInstance().HasAlarm() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_homeMotionLease) ||
         (m_nc != nullptr &&
             m_nc->GetState() == NCState::ALARM))
     {
@@ -606,6 +754,16 @@ void HomingManager::Process(
         return;
     }
 
+
+    for (int i = 0; i < HOME_AXIS_COUNT; ++i)
+    {
+        (void)PollHomeCommandResult(i, m_pendingMoveSequence[i],
+            MotionAxisCommandType::MOVE_TO_POSITION);
+        if (m_hasError) return;
+        (void)PollHomeCommandResult(i, m_pendingControlStopSequence[i],
+            MotionAxisCommandType::STOP_MOVE);
+        if (m_hasError) return;
+    }
 
     // Feed Hold：只處理 Controlled Stop、Sensor / INDEX Capture。
     // 不執行正常 State Machine，也不累加 State Timeout。
@@ -804,13 +962,24 @@ void HomingManager::Cancel()
 
 void HomingManager::Reset()
 {
+    // Runtime clearing is quiescent. Active requests use the same controlled
+    // cancellation as NC RESET; a later Reset may clear the retired request.
+    if (m_active)
+    {
+        Cancel();
+        return;
+    }
     RestoreOrReleaseHomeMotionOwner();
+    if (m_homeMotionLease.IsValid()) return;
     for (int i = 0; i < HOME_AXIS_COUNT; ++i)
     {
         m_pendingApplyHomeSequence[i] =
             MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
         m_pendingProbeDisarmSequence[i] =
             MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        m_pendingMoveSequence[i] = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        m_pendingControlStopSequence[i] = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        m_controlStopIssued[i] = false;
     }
 
     m_sequenceMode =
@@ -1282,206 +1451,262 @@ uint8_t HomingManager::BuildEnabledAxisMask() const
 // Request Validation / Initialization
 // ============================================================
 
-bool HomingManager::ValidateAndInitializeRequest(
+bool HomingManager::ValidateRequest(
     const HomeRequest& request,
     uint8_t selectedAxisMask)
 {
-    // --------------------------------------------------------
-    // Sequence Mode 防呆
-    // --------------------------------------------------------
-
-    if (request.sequenceMode !=
-        HomeSequenceMode::SIMULTANEOUS &&
-        request.sequenceMode !=
-        HomeSequenceMode::BY_ORDER)
+    if (selectedAxisMask == 0 ||
+        (request.sequenceMode != HomeSequenceMode::SIMULTANEOUS &&
+            request.sequenceMode != HomeSequenceMode::BY_ORDER))
     {
-        m_lastError =
-            HomeErrorReason::INVALID_CONFIG;
-
+        m_lastError = HomeErrorReason::INVALID_CONFIG;
+        m_lastErrorAxis = -1;
         return false;
     }
 
-
-    // --------------------------------------------------------
-    // 第一輪只做 Validation。
-    //
-    // 驗證全部通過後才真正修改 HomeRuntime，
-    // 避免檢查到一半失敗造成部分軸已被改狀態。
-    // --------------------------------------------------------
-
-    for (int i = 0;
-        i < HOME_AXIS_COUNT;
-        ++i)
+    for (int i = 0; i < HOME_AXIS_COUNT; ++i)
     {
-        if (!IsAxisRequested(
-            selectedAxisMask,
-            i))
+        if (!IsAxisRequested(selectedAxisMask, i)) continue;
+        const HomeErrorReason error = ValidateAxisForHome(
+            m_motion.GetAxisContext(i), request.sequenceMode);
+        if (error != HomeErrorReason::NONE)
         {
-            continue;
-        }
-
-
-        AxisContext& axis =
-            m_motion.GetAxisContext(i);
-
-
-        if (!axis.isExist)
-        {
-            m_lastError =
-                HomeErrorReason::AXIS_NOT_EXIST;
-
-            m_lastErrorAxis =
-                i;
-
-            return false;
-        }
-
-
-        if (!axis.home.enabled)
-        {
-            m_lastError =
-                HomeErrorReason::INVALID_CONFIG;
-
-            m_lastErrorAxis =
-                i;
-
-            return false;
-        }
-
-
-        if (!axis.isServoOn)
-        {
-            m_lastError =
-                HomeErrorReason::SERVO_NOT_READY;
-
-            m_lastErrorAxis =
-                i;
-
-            return false;
-        }
-
-
-        if (axis.isFault ||
-            axis.isLagAlarm ||
-            axis.state ==
-            MotionState::MotionState_ERROR ||
-            axis.state ==
-            MotionState::MotionState_ESTOP)
-        {
-            m_lastError =
-                HomeErrorReason::SERVO_FAULT;
-
-            m_lastErrorAxis =
-                i;
-
-            return false;
-        }
-
-
-        // HOME 第一版只允許從完全 IDLE 接管軸。
-        //
-        // 不允許搶：
-        //
-        // JOG
-        // MPG
-        // INCH
-        // G00
-        // Interpolation
-        // STOPPING
-        if (axis.state !=
-            MotionState::MotionState_IDLE)
-        {
-            m_lastError =
-                HomeErrorReason::MOTION_BUSY;
-
-            m_lastErrorAxis =
-                i;
-
-            return false;
-        }
-
-
-        if (axis.home.direction != -1 &&
-            axis.home.direction != 1)
-        {
-            m_lastError =
-                HomeErrorReason::INVALID_CONFIG;
-
-            m_lastErrorAxis =
-                i;
-
-            return false;
-        }
-
-
-        // 第一版尚未實作 Mechanical Stop Homing。
-        if (axis.home.method ==
-            HomeMethod::MECHANICAL_STOP)
-        {
-            m_lastError =
-                HomeErrorReason::INVALID_CONFIG;
-
-            m_lastErrorAxis =
-                i;
-
-            return false;
-        }
-
-
-        // 需要 INDEX 的模式不允許 ReferenceSource = NONE。
-        if (UsesIndexReference(
-            axis.home.method) &&
-            axis.home.referenceSource ==
-            HomeReferenceSource::NONE)
-        {
-            m_lastError =
-                HomeErrorReason::INVALID_CONFIG;
-
-            m_lastErrorAxis =
-                i;
-
-            return false;
-        }
-
-
-        // ABSOLUTE_REFERENCE 尚未接入 Delta Absolute Position Provider。
-        // 不可用「目前位置」或 60BA 假裝成 Absolute Home。
-        if (axis.home.method ==
-            HomeMethod::ABSOLUTE_REFERENCE)
-        {
-            m_lastError =
-                HomeErrorReason::INVALID_CONFIG;
-
-            m_lastErrorAxis =
-                i;
-
-            return false;
-        }
-
-
-        if (UsesIndexReference(axis.home.method) &&
-            (axis.home.referenceSource ==
-                HomeReferenceSource::MOTOR_ENCODER_INDEX ||
-                axis.home.referenceSource ==
-                HomeReferenceSource::LINEAR_SCALE_INDEX_DRIVE) &&
-            !ValidateDriveProbeConfig(axis))
-        {
-            m_lastError =
-                HomeErrorReason::INVALID_CONFIG;
-
-            m_lastErrorAxis =
-                i;
-
+            m_lastError = error;
+            m_lastErrorAxis = i;
             return false;
         }
     }
+    return true;
+}
 
 
-    // --------------------------------------------------------
-    // 第二輪：全部驗證成功後，
-    // 才建立本次 HOME Runtime。
-    // --------------------------------------------------------
+HomeErrorReason HomingManager::ValidateAxisForHome(
+    const AxisContext& axis,
+    HomeSequenceMode sequenceMode) const
+{
+    // Shared by request preflight and each group's PREPARE. This function
+    // reads configuration/state only; it never acquires an owner, submits a
+    // command, or changes runtime, position, gain or homed state.
+    if (!axis.isExist) return HomeErrorReason::AXIS_NOT_EXIST;
+    if (!axis.home.enabled) return HomeErrorReason::INVALID_CONFIG;
+    if (!axis.isServoOn) return HomeErrorReason::SERVO_NOT_READY;
+    if (axis.isFault || axis.isLagAlarm ||
+        axis.state == MotionState::MotionState_ERROR ||
+        axis.state == MotionState::MotionState_ESTOP)
+        return HomeErrorReason::SERVO_FAULT;
+    if (axis.state != MotionState::MotionState_IDLE)
+        return HomeErrorReason::MOTION_BUSY;
+    if ((axis.home.direction != -1 && axis.home.direction != 1) ||
+        (sequenceMode == HomeSequenceMode::BY_ORDER && axis.home.order < 0))
+        return HomeErrorReason::INVALID_CONFIG;
 
+    switch (axis.home.method)
+    {
+    case HomeMethod::DOG_INDEX:
+    case HomeMethod::LIMIT_INDEX:
+    case HomeMethod::DOG_ONLY:
+    case HomeMethod::LIMIT_ONLY:
+    case HomeMethod::INDEX_ONLY:
+    case HomeMethod::CURRENT_POSITION:
+        break;
+    default:
+        // Absolute and mechanical-stop providers are not implemented.
+        return HomeErrorReason::INVALID_CONFIG;
+    }
+
+    const auto positive = [](double value) -> bool
+    {
+        return std::isfinite(value) && value > 0.0;
+    };
+    const auto nonnegative = [](double value) -> bool
+    {
+        return std::isfinite(value) && value >= 0.0;
+    };
+    const auto finiteGain = [](const HomeGainConfig& gain) -> bool
+    {
+        return std::isfinite(gain.Kp) && std::isfinite(gain.Ki) &&
+            std::isfinite(gain.Kd) && std::isfinite(gain.Kvff);
+    };
+
+    if (!positive(axis.resolution_PPR) || !std::isfinite(axis.finalLead) ||
+        std::abs(axis.finalLead) < 1.0e-12)
+        return HomeErrorReason::INVALID_CONFIG;
+    const double pulsePerUnit = axis.resolution_PPR / std::abs(axis.finalLead);
+    const double unitPerPulse = std::abs(axis.finalLead) / axis.resolution_PPR;
+    if (!positive(pulsePerUnit) || !positive(unitPerPulse) ||
+        !std::isfinite(axis.home.homeOffset_unit) ||
+        !std::isfinite(axis.home.homeOffset_unit * pulsePerUnit) ||
+        !std::isfinite(axis.home.searchDecTime))
+        return HomeErrorReason::INVALID_CONFIG;
+
+    const bool usesSwitch = UsesDogSwitch(axis.home.method) ||
+        UsesHardLimitSwitch(axis.home.method);
+    const bool usesIndex = UsesIndexReference(axis.home.method);
+    if ((usesSwitch || usesIndex || axis.home.moveToZero) &&
+        !positive(axis.maxVel_PPS))
+        return HomeErrorReason::INVALID_CONFIG;
+
+    // Mirror the existing single-axis consumers' finite timing fallbacks.
+    // In particular, finite zero/negative times must not acquire new meaning.
+    const auto validVelocity = [&](double speed, double accTime) -> bool
+    {
+        if (!positive(speed) || !std::isfinite(accTime)) return false;
+        const double slope = accTime < 0.001 ? 0.0 :
+            (speed < 1.0 ? axis.maxVel_PPS : speed) / accTime;
+        return std::isfinite(slope) &&
+            (slope > 0.0 || positive(axis.acc_PPS2));
+    };
+    const auto effectivePointSpeed = [&](double speed) -> double
+    {
+        double value = speed > axis.maxVel_PPS ? axis.maxVel_PPS : speed;
+        if (value <= 1.0) value = axis.maxVel_PPS * 0.1;
+        return value;
+    };
+    const auto validPointMove = [&](double speed, double accTime,
+        double decTime) -> bool
+    {
+        if (!positive(speed) || !std::isfinite(accTime) ||
+            !std::isfinite(decTime)) return false;
+        const double effectiveSpeed = effectivePointSpeed(speed);
+        const double safeAcc = accTime < 0.001 ? 0.2 : accTime;
+        const double safeDec = decTime < 0.001 ? safeAcc : decTime;
+        double acceleration = effectiveSpeed / safeAcc;
+        double deceleration = effectiveSpeed / safeDec;
+        if (acceleration <= 10.0) acceleration = 10000.0;
+        if (deceleration <= 10.0) deceleration = 10000.0;
+        return positive(effectiveSpeed) && positive(acceleration) &&
+            positive(deceleration);
+    };
+    const auto validStop = [&](double speed, double decTime,
+        bool pointMove) -> bool
+    {
+        if (!positive(speed) || !std::isfinite(decTime)) return false;
+        // StopMove canonicalizes a wholly sub-0.1 PPS command to IDLE.
+        if (speed < 0.1) return true;
+        const double safeDec = decTime < 0.001 ? 0.2 : decTime;
+        const double deceleration = speed / safeDec;
+        if (!positive(deceleration)) return false;
+        if (!pointMove) return true;
+        const double squareSpeed = speed * speed;
+        const double denominator = 2.0 * deceleration;
+        return positive(squareSpeed) && positive(denominator) &&
+            nonnegative(squareSpeed / denominator);
+    };
+
+    bool usesPointMove = axis.home.moveToZero;
+    if (usesSwitch)
+    {
+        if (!validVelocity(axis.home.searchSpeed_PPS, axis.home.searchAccTime) ||
+            !positive(axis.home.searchMaxDistance_unit) ||
+            !positive(axis.home.switchStopDecTime) ||
+            !positive(axis.home.backoffSpeed_PPS) ||
+            !positive(axis.home.backoffMaxDistance_unit) ||
+            !nonnegative(axis.home.searchTimeoutSec) ||
+            !nonnegative(axis.home.switchStopMaxDistance_unit) ||
+            !nonnegative(axis.home.backoffTimeoutSec) ||
+            !std::isfinite(axis.home.backoffAccTime) ||
+            !std::isfinite(axis.home.backoffDecTime) ||
+            !finiteGain(axis.home.searchGain) ||
+            !validStop(axis.home.searchSpeed_PPS, axis.home.switchStopDecTime, false) ||
+            !validStop(axis.home.searchSpeed_PPS, axis.home.searchDecTime, false))
+            return HomeErrorReason::INVALID_CONFIG;
+
+        bool backoffPointMove = false;
+        if (axis.home.backoffMode == HomeBackoffMode::FIXED_DISTANCE)
+        {
+            if (!positive(axis.home.backoffDistance_unit) ||
+                axis.home.backoffDistance_unit >= axis.home.backoffMaxDistance_unit ||
+                !std::isfinite(axis.home.backoffDistance_unit * pulsePerUnit))
+                return HomeErrorReason::INVALID_CONFIG;
+            backoffPointMove = true;
+        }
+        else if (axis.home.backoffMode == HomeBackoffMode::UNTIL_DOG_OFF_PLUS_DISTANCE)
+        {
+            if (!nonnegative(axis.home.backoffExtraDistance_unit) ||
+                axis.home.backoffExtraDistance_unit >= axis.home.backoffMaxDistance_unit ||
+                !std::isfinite(axis.home.backoffExtraDistance_unit * pulsePerUnit) ||
+                !validVelocity(axis.home.backoffSpeed_PPS, axis.home.backoffAccTime) ||
+                !validStop(axis.home.backoffSpeed_PPS, axis.home.backoffDecTime, false))
+                return HomeErrorReason::INVALID_CONFIG;
+            backoffPointMove = axis.home.backoffExtraDistance_unit > 0.0;
+        }
+        else return HomeErrorReason::INVALID_CONFIG;
+
+        if (backoffPointMove &&
+            (!validPointMove(axis.home.backoffSpeed_PPS, axis.home.backoffAccTime,
+                axis.home.backoffDecTime) ||
+                !validStop(effectivePointSpeed(axis.home.backoffSpeed_PPS),
+                    axis.home.backoffDecTime, true)))
+            return HomeErrorReason::INVALID_CONFIG;
+        usesPointMove = usesPointMove || backoffPointMove;
+        if (UsesDogSwitch(axis.home.method) && m_plc == nullptr)
+            return HomeErrorReason::INVALID_CONFIG;
+    }
+
+    if (usesIndex)
+    {
+        if (!validVelocity(axis.home.indexSearchSpeed_PPS, axis.home.indexSearchAccTime) ||
+            !positive(axis.home.indexStopDecTime) ||
+            !positive(axis.home.indexMaxDistance_unit) ||
+            !nonnegative(axis.home.indexTimeoutSec) ||
+            !finiteGain(axis.home.indexGain) ||
+            !validStop(axis.home.indexSearchSpeed_PPS, axis.home.indexStopDecTime, false) ||
+            !validStop(axis.home.indexSearchSpeed_PPS, axis.home.searchDecTime, false))
+            return HomeErrorReason::INVALID_CONFIG;
+
+        if (axis.home.referenceSource == HomeReferenceSource::MOTOR_ENCODER_INDEX ||
+            axis.home.referenceSource == HomeReferenceSource::LINEAR_SCALE_INDEX_DRIVE)
+        {
+            if (axis.home.captureMode != HomeReferenceCaptureMode::DRIVE_HARDWARE_LATCH ||
+                !ValidateDriveProbeConfig(axis))
+                return HomeErrorReason::INVALID_CONFIG;
+            if (axis.home.referenceSource == HomeReferenceSource::LINEAR_SCALE_INDEX_DRIVE &&
+                axis.fbMode == FeedbackSource::LINEAR_SCALE &&
+                (!std::isfinite(axis.scaleToMotorRatio) || axis.scaleToMotorRatio == 0.0 ||
+                    !std::isfinite(2147483648.0 * axis.scaleToMotorRatio)))
+                return HomeErrorReason::INVALID_CONFIG;
+        }
+        else if (axis.home.referenceSource == HomeReferenceSource::EXTERNAL_IO_INDEX)
+        {
+            if (axis.home.captureMode != HomeReferenceCaptureMode::SOFTWARE_SAMPLE ||
+                m_plc == nullptr || axis.home.externalReferenceCPoint < -1 ||
+                axis.home.externalReferenceCPoint >= MAX_PLC_C)
+                return HomeErrorReason::INVALID_CONFIG;
+        }
+        else return HomeErrorReason::INVALID_CONFIG;
+    }
+
+    // A later P1 group must not begin HOME when its eventual machine zero
+    // is already forbidden. Query configuration without faking HOME state.
+    if (axis.home.moveToZero &&
+        (m_nc == nullptr ||
+            !m_nc->CoordSys.IsTargetWithinConfiguredSoftwareTravelLimit(axis, 0.0)))
+        return HomeErrorReason::INVALID_CONFIG;
+
+    if (axis.home.moveToZero &&
+        (!validPointMove(axis.home.moveToZeroSpeed_PPS, axis.home.moveToZeroAccTime,
+            axis.home.moveToZeroDecTime) ||
+            !validStop(effectivePointSpeed(axis.home.moveToZeroSpeed_PPS),
+                axis.home.moveToZeroDecTime, true)))
+        return HomeErrorReason::INVALID_CONFIG;
+
+    if (usesPointMove && axis.axisType == AxisType::ROTARY && axis.useShortestPath)
+    {
+        double rotaryPulsePerUnit = 0.0;
+        double resolvedStaticTarget = 0.0;
+        if (!TryGetMotionPulsePerUnit(axis.resolution_PPR, axis.finalLead,
+                true, rotaryPulsePerUnit) ||
+            !TryResolveMotionTargetPulse(0.0, 0.0, rotaryPulsePerUnit,
+                true, axis.rotaryModulo, resolvedStaticTarget))
+            return HomeErrorReason::INVALID_CONFIG;
+    }
+
+    return HomeErrorReason::NONE;
+}
+
+
+void HomingManager::InitializeRequest(uint8_t selectedAxisMask)
+{
     for (int i = 0;
         i < HOME_AXIS_COUNT;
         ++i)
@@ -1511,7 +1736,6 @@ bool HomingManager::ValidateAndInitializeRequest(
     }
 
 
-    return true;
 }
 
 
@@ -1871,6 +2095,17 @@ void HomingManager::AdvanceScheduler()
 
 void HomingManager::ProcessCancel()
 {
+    if (!m_motion.IsMotionOwnerLeaseCurrent(m_homeMotionLease))
+    {
+        // RESET/SAFETY revoked the generation. Its stale HOME commands cannot
+        // be admitted; wait for stopped feedback without faulting on old ACKs.
+        for (int i = 0; i < HOME_AXIS_COUNT; ++i)
+        {
+            m_pendingMoveSequence[i] = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+            m_pendingControlStopSequence[i] = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+            m_controlStopIssued[i] = false;
+        }
+    }
     bool allStopped =
         true;
 
@@ -1896,21 +2131,8 @@ void HomingManager::ProcessCancel()
         }
 
 
-        if (axis.state !=
-            MotionState::MotionState_IDLE)
-        {
-            allStopped =
-                false;
-
-            const double dec =
-                GetHoldDecTime(axis);
-
-            if (axis.state !=
-                MotionState::MotionState_STOPPING)
-            {
-                QueueHomeStop(i, dec);
-            }
-        }
+        if (!IsHomeAxisControlStopped(i, axis)) allStopped = false;
+        if (m_hasError) return;
     }
 
 
@@ -1919,6 +2141,9 @@ void HomingManager::ProcessCancel()
         return;
     }
 
+
+    for (int i = 0; i < HOME_AXIS_COUNT; ++i)
+        m_controlStopIssued[i] = false;
 
     bool allDisarmQueued = true;
 
@@ -2066,18 +2291,8 @@ void HomingManager::ProcessHold(
         }
 
 
-        if (axis.state !=
-            MotionState::MotionState_IDLE)
-        {
-            allStopped =
-                false;
-
-            if (axis.state !=
-                MotionState::MotionState_STOPPING)
-            {
-                QueueHomeStop(i, GetHoldDecTime(axis));
-            }
-        }
+        if (!IsHomeAxisControlStopped(i, axis)) allStopped = false;
+        if (m_hasError) return;
     }
 
 
@@ -2112,6 +2327,9 @@ void HomingManager::ProcessHold(
         }
     }
 
+
+    for (int i = 0; i < HOME_AXIS_COUNT; ++i)
+        m_controlStopIssued[i] = false;
 
     m_runControlState =
         HomeRunControlState::PAUSED;
@@ -3364,6 +3582,89 @@ double HomingManager::GetTravelDistanceUnit(const AxisContext& axis, double star
     return std::abs(m_motion.GetRawLogicalPositionPulse(axis) - startRawPulse) / ppu;
 }
 
+// Fixed and switch-release-plus-extra backoff share one directed P2P phase.
+// stateTargetValid separates it from the preceding release/stop phase and
+// preserves the exact machine-pulse endpoint across mailbox retry and HOLD.
+void HomingManager::ProcessBackoffPointMove(
+    int axisIndex, AxisContext& axis, double distanceUnit)
+{
+    if (axis.homeRuntime.motionCommandIssued)
+    {
+        if (!PollHomeCommandResult(axisIndex, m_pendingMoveSequence[axisIndex],
+            MotionAxisCommandType::MOVE_TO_POSITION)) return;
+        if (axis.state == MotionState::MotionState_IDLE)
+            EnterState(axis, HomeState::VALIDATE_RELEASE);
+        else if (axis.state != MotionState::MotionState_MOVING &&
+            axis.state != MotionState::MotionState_STOPPING)
+            SetAxisError(axisIndex, axis, HomeErrorReason::MOTION_FAULT);
+        return;
+    }
+    if (axis.state != MotionState::MotionState_IDLE) return;
+
+    const double ppu = GetPulsePerUnit(axis);
+    const double currentPulse = axis.currentActPos;
+    const double rawCurrent = m_motion.GetRawLogicalPositionPulse(axis);
+    if (!std::isfinite(ppu) || ppu <= 0.0 ||
+        !std::isfinite(currentPulse) || !std::isfinite(rawCurrent) ||
+        !std::isfinite(axis.homeRuntime.backoffStartPulse))
+    {
+        SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+        return;
+    }
+
+    double targetPulse = axis.homeRuntime.stateTargetPulse;
+    if (!axis.homeRuntime.stateTargetValid)
+    {
+        const double direction = -static_cast<double>(axis.home.direction);
+        const double distancePulse = distanceUnit * ppu;
+        targetPulse = currentPulse + direction * distancePulse;
+        // Positive configured distance must remain a representable, directed
+        // displacement. A resumed target may already equal currentPulse.
+        if (!std::isfinite(distanceUnit) || distanceUnit <= 0.0 ||
+            !std::isfinite(distancePulse) || distancePulse <= 0.0 ||
+            !std::isfinite(targetPulse) ||
+            !std::isfinite(targetPulse - currentPulse) ||
+            direction * (targetPulse - currentPulse) <= 0.0)
+        {
+            SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+            return;
+        }
+    }
+
+    double checkedTarget = 0.0;
+    if (!TryResolveMotionTargetPulse(currentPulse, targetPulse,
+            1.0, false, 0.0, checkedTarget))
+    {
+        SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+        return;
+    }
+    // The budget origin is raw logical pulse, while the command is machine
+    // pulse. Project through the current raw/machine relationship; an old
+    // machine offset must not be counted as HOME travel.
+    const double rawTarget = rawCurrent + (checkedTarget - currentPulse);
+    const double rawTravel = rawTarget - axis.homeRuntime.backoffStartPulse;
+    const double plannedDistance = std::abs(rawTravel) / ppu;
+    if (!std::isfinite(rawTarget) || !std::isfinite(rawTravel) ||
+        !std::isfinite(plannedDistance))
+    {
+        SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+        return;
+    }
+    if (plannedDistance >= axis.home.backoffMaxDistance_unit)
+    {
+        SetAxisError(axisIndex, axis, HomeErrorReason::BACKOFF_MAX_DISTANCE);
+        return;
+    }
+
+    axis.homeRuntime.stateTargetPulse = checkedTarget;
+    axis.homeRuntime.stateTargetValid = true;
+    // Backoff specifies a direction and distance, including for rotary axes.
+    // Do not allow the RT consumer to choose a nearer equivalent endpoint.
+    if (QueueHomeMove(axisIndex, checkedTarget, axis.home.backoffSpeed_PPS,
+            axis.home.backoffAccTime, axis.home.backoffDecTime, false))
+        axis.homeRuntime.motionCommandIssued = true;
+}
+
 void HomingManager::EnterState(AxisContext& axis, HomeState state)
 {
     axis.homeRuntime.state = state;
@@ -3417,409 +3718,16 @@ void HomingManager::ProcessAxis(
     if (axis.homeRuntime.state ==
         HomeState::PREPARE)
     {
-        // ----------------------------------------------------
-        // A. Runtime 基本狀態再次確認
-        //
-        // Start() 到 Process() 之間即使狀態發生變化，
-        // 也不能直接進入 HOME Motion。
-        // ----------------------------------------------------
-
-        if (!axis.isExist)
+        const HomeErrorReason preparationError =
+            ValidateAxisForHome(axis, m_sequenceMode);
+        if (preparationError != HomeErrorReason::NONE)
         {
-            SetAxisError(
-                axisIndex,
-                axis,
-                HomeErrorReason::AXIS_NOT_EXIST);
-
+            SetAxisError(axisIndex, axis, preparationError);
             return;
         }
 
-
-        if (!axis.home.enabled)
-        {
-            SetAxisError(
-                axisIndex,
-                axis,
-                HomeErrorReason::INVALID_CONFIG);
-
-            return;
-        }
-
-
-        if (!axis.isServoOn)
-        {
-            SetAxisError(
-                axisIndex,
-                axis,
-                HomeErrorReason::SERVO_NOT_READY);
-
-            return;
-        }
-
-
-        if (axis.isFault ||
-            axis.isLagAlarm ||
-            axis.state ==
-            MotionState::MotionState_ERROR ||
-            axis.state ==
-            MotionState::MotionState_ESTOP)
-        {
-            SetAxisError(
-                axisIndex,
-                axis,
-                HomeErrorReason::SERVO_FAULT);
-
-            return;
-        }
-
-
-        if (axis.state !=
-            MotionState::MotionState_IDLE)
-        {
-            SetAxisError(
-                axisIndex,
-                axis,
-                HomeErrorReason::MOTION_BUSY);
-
-            return;
-        }
-
-
-        if (axis.home.direction != -1 &&
-            axis.home.direction != 1)
-        {
-            SetAxisError(
-                axisIndex,
-                axis,
-                HomeErrorReason::INVALID_CONFIG);
-
-            return;
-        }
-
-
-        // HOME 距離與速度換算都依賴 Encoder Resolution
-        // 與 Final Lead，這兩個機械參數必須有效。
-        if (!std::isfinite(axis.resolution_PPR) ||
-            !std::isfinite(axis.finalLead) ||
-            axis.resolution_PPR <= 0.0 ||
-            std::abs(axis.finalLead) < 1.0e-12)
-        {
-            SetAxisError(
-                axisIndex,
-                axis,
-                HomeErrorReason::INVALID_CONFIG);
-
-            return;
-        }
-
-
-        // ----------------------------------------------------
-        // B. 共用參數防呆
-        // ----------------------------------------------------
-
-        auto IsPositiveFinite =
-            [](double value) -> bool
-        {
-            return
-                std::isfinite(value) &&
-                value > 0.0;
-        };
-
-
-        auto IsNonNegativeFinite =
-            [](double value) -> bool
-        {
-            return
-                std::isfinite(value) &&
-                value >= 0.0;
-        };
-
-
-        const bool usesSwitch =
-            UsesDogSwitch(
-                axis.home.method) ||
-            UsesHardLimitSwitch(
-                axis.home.method);
-
-
-        const bool usesIndex =
-            UsesIndexReference(
-                axis.home.method);
-
-
-        // ----------------------------------------------------
-        // C. DOG / LIMIT Search 參數
-        //
-        // 需要搜尋 Switch 的模式：
-        //
-        // DOG_INDEX
-        // LIMIT_INDEX
-        // DOG_ONLY
-        // LIMIT_ONLY
-        //
-        // 必須具備：
-        //
-        // Search Speed
-        // Search Max Distance
-        // Controlled Stop Dec Time
-        // Backoff Speed
-        // Backoff Max Distance
-        // ----------------------------------------------------
-
-        if (usesSwitch)
-        {
-            if (!IsPositiveFinite(
-                axis.home.searchSpeed_PPS) ||
-                !IsPositiveFinite(
-                    axis.home.searchMaxDistance_unit) ||
-                !IsPositiveFinite(
-                    axis.home.switchStopDecTime) ||
-                !IsPositiveFinite(
-                    axis.home.backoffSpeed_PPS) ||
-                !IsPositiveFinite(
-                    axis.home.backoffMaxDistance_unit))
-            {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::INVALID_CONFIG);
-
-                return;
-            }
-
-
-            if (!IsNonNegativeFinite(
-                axis.home.searchTimeoutSec) ||
-                !IsNonNegativeFinite(
-                    axis.home.switchStopMaxDistance_unit) ||
-                !IsNonNegativeFinite(
-                    axis.home.backoffTimeoutSec))
-            {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::INVALID_CONFIG);
-
-                return;
-            }
-
-
-            // ------------------------------------------------
-            // Backoff Mode 專用距離檢查
-            // ------------------------------------------------
-
-            if (axis.home.backoffMode ==
-                HomeBackoffMode::FIXED_DISTANCE)
-            {
-                if (!IsPositiveFinite(
-                    axis.home.backoffDistance_unit))
-                {
-                    SetAxisError(
-                        axisIndex,
-                        axis,
-                        HomeErrorReason::INVALID_CONFIG);
-
-                    return;
-                }
-            }
-            else if (axis.home.backoffMode ==
-                HomeBackoffMode::UNTIL_DOG_OFF_PLUS_DISTANCE)
-            {
-                if (!IsNonNegativeFinite(
-                    axis.home.backoffExtraDistance_unit))
-                {
-                    SetAxisError(
-                        axisIndex,
-                        axis,
-                        HomeErrorReason::INVALID_CONFIG);
-
-                    return;
-                }
-            }
-            else
-            {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::INVALID_CONFIG);
-
-                return;
-            }
-
-
-            // DOG Mode 必須要有 PLC，
-            // 因為 HOME DOG 是 PLC C Point。
-            if (UsesDogSwitch(
-                axis.home.method) &&
-                m_plc == nullptr)
-            {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::INVALID_CONFIG);
-
-                return;
-            }
-        }
-
-
-        // ----------------------------------------------------
-        // D. INDEX Search 參數
-        //
-        // 需要 INDEX 的模式：
-        //
-        // DOG_INDEX
-        // LIMIT_INDEX
-        // INDEX_ONLY
-        //
-        // HomeIndexMaxDistance 強制要求 > 0。
-        //
-        // 不允許無限搜尋 INDEX。
-        // ----------------------------------------------------
-
-        if (usesIndex)
-        {
-            if (!IsPositiveFinite(
-                axis.home.indexSearchSpeed_PPS) ||
-                !IsPositiveFinite(
-                    axis.home.indexStopDecTime) ||
-                !IsPositiveFinite(
-                    axis.home.indexMaxDistance_unit) ||
-                !IsNonNegativeFinite(
-                    axis.home.indexTimeoutSec))
-            {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::INVALID_CONFIG);
-
-                return;
-            }
-
-
-            if (axis.home.referenceSource ==
-                HomeReferenceSource::NONE)
-            {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::INVALID_CONFIG);
-
-                return;
-            }
-
-
-            // ------------------------------------------------
-            // Reference Source / Capture Mode 組合驗證
-            //
-            // 第一版正式可測組合：
-            //
-            // 1. Motor / Drive Scale INDEX
-            //      -> DRIVE_HARDWARE_LATCH
-            //
-            // 2. External IO INDEX
-            //      -> SOFTWARE_SAMPLE
-            //
-            // EXTERNAL_HARDWARE_LATCH 需要外部板子的
-            // Capture Register API，目前尚未提供，不能假裝支援。
-            // ------------------------------------------------
-
-            if (axis.home.referenceSource ==
-                HomeReferenceSource::MOTOR_ENCODER_INDEX ||
-                axis.home.referenceSource ==
-                HomeReferenceSource::LINEAR_SCALE_INDEX_DRIVE)
-            {
-                if (axis.home.captureMode !=
-                    HomeReferenceCaptureMode::DRIVE_HARDWARE_LATCH)
-                {
-                    SetAxisError(
-                        axisIndex,
-                        axis,
-                        HomeErrorReason::INVALID_CONFIG);
-
-                    return;
-                }
-            }
-            else if (axis.home.referenceSource ==
-                HomeReferenceSource::EXTERNAL_IO_INDEX)
-            {
-                if (axis.home.captureMode !=
-                    HomeReferenceCaptureMode::SOFTWARE_SAMPLE ||
-                    m_plc == nullptr)
-                {
-                    SetAxisError(
-                        axisIndex,
-                        axis,
-                        HomeErrorReason::INVALID_CONFIG);
-
-                    return;
-                }
-            }
-            else
-            {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::INVALID_CONFIG);
-
-                return;
-            }
-
-
-            if (UsesDriveTouchProbe(axis) &&
-                !ValidateDriveProbeConfig(axis))
-            {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::INVALID_CONFIG);
-
-                return;
-            }
-        }
-
-
-        // ----------------------------------------------------
-        // E. Absolute Reference
-        //
-        // 目前沒有 Delta Absolute Position / Multi-turn Provider，
-        // 因此明確拒絕，不用目前位置冒充 Absolute Reference。
-        // ----------------------------------------------------
-
-        if (axis.home.method ==
-            HomeMethod::ABSOLUTE_REFERENCE)
-        {
-            SetAxisError(
-                axisIndex,
-                axis,
-                HomeErrorReason::INVALID_CONFIG);
-
-            return;
-        }
-
-
-        // ----------------------------------------------------
-        // F. Mechanical Stop
-        //
-        // 第一版尚未實作。
-        // ----------------------------------------------------
-
-        if (axis.home.method ==
-            HomeMethod::MECHANICAL_STOP)
-        {
-            SetAxisError(
-                axisIndex,
-                axis,
-                HomeErrorReason::INVALID_CONFIG);
-
-            return;
-        }
-
-
-        // ----------------------------------------------------
-        // G. Runtime Snapshot 初始化
-        // ----------------------------------------------------
-
+        // Configuration/state may change after Start or an earlier P1 group.
+        // Snapshot this group's runtime only after the shared recheck passes.
         axis.homeRuntime.error =
             HomeErrorReason::NONE;
 
@@ -4394,7 +4302,24 @@ void HomingManager::ProcessAxis(
             return;
         }
 
-        if (GetTravelDistanceUnit(axis, axis.homeRuntime.backoffStartPulse) >= axis.home.backoffMaxDistance_unit)
+        const double ppu = GetPulsePerUnit(axis);
+        const double rawCurrent = m_motion.GetRawLogicalPositionPulse(axis);
+        const double rawTravel = rawCurrent - axis.homeRuntime.backoffStartPulse;
+        const double travelled = std::abs(rawTravel) / ppu;
+        if ((axis.home.direction != -1 && axis.home.direction != 1) ||
+            !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+            !std::isfinite(axis.finalLead) || std::abs(axis.finalLead) < 1.0e-12 ||
+            !std::isfinite(ppu) || ppu <= 0.0 ||
+            !std::isfinite(rawCurrent) || !std::isfinite(rawTravel) ||
+            !std::isfinite(travelled) ||
+            !std::isfinite(axis.home.backoffMaxDistance_unit) ||
+            axis.home.backoffMaxDistance_unit <= 0.0 ||
+            !std::isfinite(axis.home.backoffTimeoutSec) || axis.home.backoffTimeoutSec < 0.0)
+        {
+            SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+            return;
+        }
+        if (travelled >= axis.home.backoffMaxDistance_unit)
         {
             SetAxisError(axisIndex, axis, HomeErrorReason::BACKOFF_MAX_DISTANCE);
             return;
@@ -4405,69 +4330,17 @@ void HomingManager::ProcessAxis(
             return;
         }
 
-        const double dir = -static_cast<double>(axis.home.direction);
-        const double ppu = GetPulsePerUnit(axis);
-
-        if (axis.home.backoffMode == HomeBackoffMode::FIXED_DISTANCE)
+        // A latched point leg remains obligatory even if its source distance
+        // or mode is edited while HOLD or a mailbox retry is pending.
+        if (axis.homeRuntime.stateTargetValid ||
+            axis.home.backoffMode == HomeBackoffMode::FIXED_DISTANCE)
         {
-            if (!axis.homeRuntime.stateTargetValid)
-            {
-                axis.homeRuntime.stateTargetPulse =
-                    axis.currentActPos +
-                    dir *
-                    axis.home.backoffDistance_unit *
-                    ppu;
-
-                axis.homeRuntime.stateTargetValid =
-                    true;
-            }
-
-
-            if (!axis.homeRuntime.motionCommandIssued)
-            {
-                if (axis.state !=
-                    MotionState::MotionState_IDLE)
-                {
-                    return;
-                }
-
-                if (!QueueHomeMove(
-                    axisIndex, axis.homeRuntime.stateTargetPulse,
-                    axis.home.backoffSpeed_PPS, axis.home.backoffAccTime,
-                    axis.home.backoffDecTime, axis.useShortestPath))
-                {
-                    return;
-                }
-
-                axis.homeRuntime.motionCommandIssued =
-                    true;
-
-                return;
-            }
-
-
-            if (axis.state ==
-                MotionState::MotionState_IDLE)
-            {
-                EnterState(
-                    axis,
-                    HomeState::VALIDATE_RELEASE);
-
-                return;
-            }
-
-
-            if (axis.state !=
-                MotionState::MotionState_MOVING &&
-                axis.state !=
-                MotionState::MotionState_STOPPING)
-            {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::MOTION_FAULT);
-            }
-
+            ProcessBackoffPointMove(axisIndex, axis, axis.home.backoffDistance_unit);
+            return;
+        }
+        if (axis.home.backoffMode != HomeBackoffMode::UNTIL_DOG_OFF_PLUS_DISTANCE)
+        {
+            SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
             return;
         }
 
@@ -4487,7 +4360,8 @@ void HomingManager::ProcessAxis(
                     SetAxisError(axisIndex, axis, HomeErrorReason::MOTION_FAULT);
                     return;
                 }
-                QueueHomeVelocity(axisIndex, dir * axis.home.backoffSpeed_PPS, axis.home.backoffAccTime);
+                const double direction = -static_cast<double>(axis.home.direction);
+                QueueHomeVelocity(axisIndex, direction * axis.home.backoffSpeed_PPS, axis.home.backoffAccTime);
                 return;
             }
 
@@ -4497,52 +4371,27 @@ void HomingManager::ProcessAxis(
             return;
         }
 
+        // This stop gate belongs only to the release-velocity phase. Once
+        // the P2P target is latched, the shared point-move phase above owns it.
         if (axis.state != MotionState::MotionState_IDLE)
         {
             if (axis.state != MotionState::MotionState_STOPPING) QueueHomeStop(axisIndex, axis.home.backoffDecTime);
             return;
         }
 
-        if (axis.home.backoffExtraDistance_unit <= 0.0)
+        if (!std::isfinite(axis.home.backoffExtraDistance_unit) ||
+            axis.home.backoffExtraDistance_unit < 0.0)
+        {
+            SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+            return;
+        }
+        if (axis.home.backoffExtraDistance_unit == 0.0)
         {
             EnterState(axis, HomeState::VALIDATE_RELEASE);
             return;
         }
 
-        if (!axis.homeRuntime.stateTargetValid)
-        {
-            axis.homeRuntime.stateTargetPulse =
-                axis.currentActPos +
-                dir *
-                axis.home.backoffExtraDistance_unit *
-                ppu;
-
-            axis.homeRuntime.stateTargetValid =
-                true;
-        }
-
-
-        if (!axis.homeRuntime.motionCommandIssued)
-        {
-            if (!QueueHomeMove(
-                axisIndex, axis.homeRuntime.stateTargetPulse,
-                axis.home.backoffSpeed_PPS, axis.home.backoffAccTime,
-                axis.home.backoffDecTime, axis.useShortestPath))
-            {
-                return;
-            }
-
-            axis.homeRuntime.motionCommandIssued =
-                true;
-
-            return;
-        }
-
-        if (axis.state == MotionState::MotionState_IDLE)
-        {
-            EnterState(axis, HomeState::VALIDATE_RELEASE);
-            return;
-        }
+        ProcessBackoffPointMove(axisIndex, axis, axis.home.backoffExtraDistance_unit);
         return;
     }
 
@@ -4792,6 +4641,15 @@ void HomingManager::ProcessAxis(
 
         if (pendingSequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID)
         {
+            // PREPARE may precede this point by a complete sensor search.
+            // Reject a newly forbidden zero before submitting the rebase.
+            if (axis.home.moveToZero &&
+                (m_nc == nullptr ||
+                    !m_nc->CoordSys.IsTargetWithinConfiguredSoftwareTravelLimit(axis, 0.0)))
+            {
+                SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+                return;
+            }
             if (!m_motion.SubmitApplyMachineHome(
                 axisIndex, axis.homeRuntime.capturedReferencePulse,
                 axis.home.homeOffset_unit, m_homeMotionLease,
@@ -4842,42 +4700,68 @@ void HomingManager::ProcessAxis(
             SetAxisError(axisIndex, axis, HomeErrorReason::OPPOSITE_HARD_LIMIT);
             return;
         }
-        if (!axis.homeRuntime.stateTargetValid)
-        {
-            // ApplyMachineHome 後 Machine Zero 對應 MotionCore Pulse = 0。
-            axis.homeRuntime.stateTargetPulse =
-                0.0;
-
-            axis.homeRuntime.stateTargetValid =
-                true;
-        }
-
-
         if (!axis.homeRuntime.motionCommandIssued)
         {
-            if (axis.state !=
-                MotionState::MotionState_IDLE)
+            if (axis.state != MotionState::MotionState_IDLE)
             {
                 return;
             }
 
-            if (m_nc != nullptr &&
-                !m_nc->CoordSys.IsTargetWithinSoftwareTravelLimit(
-                    axis,
-                    0.0))
+            // Once this state is entered, a changed moveToZero flag must not
+            // bypass target checks. A missing coordinate provider cannot
+            // establish the configured travel contract either.
+            if (m_nc == nullptr ||
+                !m_nc->CoordSys.IsTargetWithinConfiguredSoftwareTravelLimit(axis, 0.0) ||
+                !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+                !std::isfinite(axis.finalLead) || std::abs(axis.finalLead) < 1.0e-12)
             {
-                SetAxisError(
-                    axisIndex,
-                    axis,
-                    HomeErrorReason::INVALID_CONFIG);
-
+                SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+                return;
+            }
+            const double unitPerPulse = axis.finalLead / axis.resolution_PPR;
+            if (!std::isfinite(unitPerPulse) || unitPerPulse == 0.0)
+            {
+                SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
                 return;
             }
 
+            double targetPulse = axis.homeRuntime.stateTargetPulse;
+            if (!axis.homeRuntime.stateTargetValid)
+            {
+                // Resolve the authored zero once against the same idle start
+                // used by MoveToPosition. Rotary zero may be an unwrapped
+                // equivalent such as 360 degrees; it needs its own limit proof.
+                const bool shortestPath = axis.axisType == AxisType::ROTARY &&
+                    axis.useShortestPath;
+                double pulsePerUnit = 1.0;
+                if ((shortestPath && !TryGetMotionPulsePerUnit(
+                        axis.resolution_PPR, axis.finalLead, true, pulsePerUnit)) ||
+                    !TryResolveMotionTargetPulse(axis.currentActPos, 0.0,
+                        pulsePerUnit, shortestPath, axis.rotaryModulo, targetPulse))
+                {
+                    SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+                    return;
+                }
+            }
+
+            const double targetMCS = targetPulse * unitPerPulse;
+            if (!std::isfinite(targetMCS) ||
+                !m_nc->CoordSys.IsTargetWithinConfiguredSoftwareTravelLimit(axis, targetMCS) ||
+                !TryResolveMotionTargetPulse(axis.currentActPos, targetPulse,
+                    1.0, false, 0.0, targetPulse))
+            {
+                SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
+                return;
+            }
+
+            // Retain this exact endpoint for mailbox retries and HOLD/Resume.
+            // Submit absolute pulses so the RT consumer cannot wrap it again.
+            axis.homeRuntime.stateTargetPulse = targetPulse;
+            axis.homeRuntime.stateTargetValid = true;
             if (!QueueHomeMove(
-                axisIndex, axis.homeRuntime.stateTargetPulse,
+                axisIndex, targetPulse,
                 axis.home.moveToZeroSpeed_PPS, axis.home.moveToZeroAccTime,
-                axis.home.moveToZeroDecTime, axis.useShortestPath))
+                axis.home.moveToZeroDecTime, false))
             {
                 return;
             }
@@ -4887,6 +4771,8 @@ void HomingManager::ProcessAxis(
 
             return;
         }
+        if (!PollHomeCommandResult(axisIndex, m_pendingMoveSequence[axisIndex],
+            MotionAxisCommandType::MOVE_TO_POSITION)) return;
         if (axis.state == MotionState::MotionState_IDLE)
         {
             CompleteAxis(axisIndex, axis);

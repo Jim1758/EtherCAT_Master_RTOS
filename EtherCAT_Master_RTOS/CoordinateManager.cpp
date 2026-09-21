@@ -1652,7 +1652,7 @@ void CoordinateManager::SaveWCSTable() { SaveTableToFile("WCS_TABLE.txt", m_WCST
 void CoordinateManager::SaveToolOffset() { SaveTableToFile("TOOL_OFFSET.txt", m_ToolOffset); }
 void CoordinateManager::SaveWorkOffset() { SaveTableToFile("WORK_OFFSET.txt", m_WorkOffset); }
 void CoordinateManager::SaveToolRadius() { SaveTableToFile("TOOL_RADIUS.txt", m_ToolRadius); }
-void CoordinateManager::SaveRefPoints() { SaveTableToFile("TOOL_REFPOINTS.txt", m_RefPoints); }
+void CoordinateManager::SaveRefPoints() { SaveTableToFile("REFPOINTS.txt", m_RefPoints); }
 
 // ==========================================
 // 🌟 共用底層：表格陣列讀寫引擎

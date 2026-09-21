@@ -239,6 +239,7 @@
     <ClInclude Include="NicDriver.h" />
     <ClInclude Include="PlcCore.h" />
     <ClInclude Include="PLCManager.h" />
+    <ClInclude Include="ReferencePositionBlock.h" />
     <ClInclude Include="SHMManager.h" />
     <ClInclude Include="SHM_Types.h" />
     <ClInclude Include="tinyxml2.h" />

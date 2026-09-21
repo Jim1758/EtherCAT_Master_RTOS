@@ -227,7 +227,8 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
 {
     //讀取參數確定軸數量-----------------------------------------------------------------
     int axisCount = System_axisCount;
-    DEBUG_PRINT("LoadPIDConfig Axis Count>>%d\n", axisCount);
+    DEBUG_PRINT("[SPEED-CONFIG][BASE40] AxisCount=%d parameterMapping=OWN_KEY\n", axisCount);
+    DEBUG_PRINT("[POSITIONING][BASE48] exactStopProfiles=7,28,30,32,161 referenceAtomicPair=1 homeWholeBlock=1 homeRequestPreflight=1 homePendingHandoffGuard=1 homeZeroTravelPreflight=1 homeZeroResolvedTarget=1 homeBackoffDirected=1 homeBackoffBudget=1 homeMoveAckGate=1 homeControlStopAckGate=1 g53VelocityCeiling=1 positioningDynamicsPreflight=1 cornerConsumerPreflight=1\n");
     if (axisCount == 0)
     {
 
@@ -257,7 +258,7 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             axis[i].JOG_acc_time = Jog_acc_time;
 
             double Jog_dec_time = ConfigUtil::ReadParam(filePath, prefix + "JOG_dec_time", 0);
-            axis[i].JOG_dec_time = Jog_acc_time;
+            axis[i].JOG_dec_time = Jog_dec_time;
 
 
             double FINE_JOG_0001_PPS_user = ConfigUtil::ReadParam(filePath, prefix + "FINE_JOG_0001_PPS", 0);
@@ -311,17 +312,17 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             axis[i].G00_acc_time = G00_acc_time;
 
             double G00_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G00_dec_time", 0);
-            axis[i].G00_dec_time = G00_acc_time;
+            axis[i].G00_dec_time = G00_dec_time;
 
 
             double g07_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G07_Speed", 0);
-            axis[i].G07_PPS = MotionCore::UnitPerMinToPps(g00_speed_user, axis[i].resolution_PPR, axis[i].finalLead);
+            axis[i].G07_PPS = MotionCore::UnitPerMinToPps(g07_speed_user, axis[i].resolution_PPR, axis[i].finalLead);
 
             double G07_acc_time = ConfigUtil::ReadParam(filePath, prefix + "G07_acc_time", 0);
             axis[i].G07_acc_time = G07_acc_time;
 
             double G07_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G07_dec_time", 0);
-            axis[i].G07_dec_time = G07_acc_time;
+            axis[i].G07_dec_time = G07_dec_time;
 
             double g161_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G161_Speed", 0);
             axis[i].G161_PPS = MotionCore::UnitPerMinToPps(g161_speed_user, axis[i].resolution_PPR, axis[i].finalLead);
@@ -330,7 +331,7 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             axis[i].G161_acc_time = G161_acc_time;
 
             double G161_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G161_dec_time", 0);
-            axis[i].G161_dec_time = G161_acc_time;
+            axis[i].G161_dec_time = G161_dec_time;
 
 
 
@@ -344,7 +345,7 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             axis[i].G28_acc_time = G28_acc_time;
 
             double G28_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G28_dec_time", 0);
-            axis[i].G28_dec_time = G28_acc_time;
+            axis[i].G28_dec_time = G28_dec_time;
 
 
 
@@ -355,7 +356,7 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             axis[i].G30_acc_time = G30_acc_time;
 
             double G30_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G30_dec_time", 0);
-            axis[i].G30_dec_time = G30_acc_time;
+            axis[i].G30_dec_time = G30_dec_time;
 
 
             double g32_speed_user = ConfigUtil::ReadParam(filePath, prefix + "G32_Speed", 0);
@@ -365,7 +366,7 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             axis[i].G32_acc_time = G32_acc_time;
 
             double G32_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G32_dec_time", 0);
-            axis[i].G32_dec_time = G32_acc_time;
+            axis[i].G32_dec_time = G32_dec_time;
 
 
 
@@ -376,7 +377,7 @@ bool GlobalConfig::LoadSpeedConfig(const std::string& filePath, std::vector<Axis
             axis[i].G53_acc_time = G53_acc_time;
 
             double G53_dec_time = ConfigUtil::ReadParam(filePath, prefix + "G53_dec_time", 0);
-            axis[i].G53_dec_time = G53_acc_time;
+            axis[i].G53_dec_time = G53_dec_time;
 
 
 

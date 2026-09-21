@@ -52,6 +52,50 @@ namespace
     }
 
 
+    // Configuration-only query: HOME state never weakens configured ranges.
+    // Callers retain their own existence / HOME policy without copying axes.
+    unsigned GetInvalidConfiguredSoftwareTravelLimitMask(
+        const AxisContext& axis, bool strokeEnabled)
+    {
+        const bool enabled[3] = { axis.travelLimit1Enable && strokeEnabled,
+            axis.travelLimit2Enable, axis.travelLimit3Enable };
+        const double negative[3] = { axis.travelLimit1Negative_unit,
+            axis.travelLimit2Negative_unit, axis.travelLimit3Negative_unit };
+        const double positive[3] = { axis.travelLimit1Positive_unit,
+            axis.travelLimit2Positive_unit, axis.travelLimit3Positive_unit };
+        unsigned invalidMask = 0U;
+        unsigned validCount = 0U;
+        double intersectionNegative = 0.0;
+        double intersectionPositive = 0.0;
+        for (unsigned group = 0U; group < 3U; ++group)
+        {
+            if (!enabled[group]) continue;
+            if (!IsValidTravelLimitRange(negative[group], positive[group]))
+            {
+                invalidMask |= 1U << group;
+                continue;
+            }
+            if (validCount == 0U)
+            {
+                intersectionNegative = negative[group];
+                intersectionPositive = positive[group];
+            }
+            else
+            {
+                if (negative[group] > intersectionNegative)
+                    intersectionNegative = negative[group];
+                if (positive[group] < intersectionPositive)
+                    intersectionPositive = positive[group];
+            }
+            ++validCount;
+        }
+        // Inclusive target limits retain a shared single point as valid.
+        if (validCount > 1U && intersectionNegative > intersectionPositive)
+            invalidMask |= 8U;
+        return invalidMask;
+    }
+
+
     // ========================================================
     // Get Actual Machine Position
     //
@@ -137,42 +181,7 @@ unsigned CoordinateManager::GetInvalidSoftwareTravelLimitMask(
     if (!axis.isExist || !axis.isHomed) return 0U;
     const bool strokeEnabled = storedStrokeMode == 0 ?
         m_programmableTravelLimitEnabled : storedStrokeMode == 22;
-    const bool enabled[3] = { axis.travelLimit1Enable && strokeEnabled,
-        axis.travelLimit2Enable, axis.travelLimit3Enable };
-    const double negative[3] = { axis.travelLimit1Negative_unit,
-        axis.travelLimit2Negative_unit, axis.travelLimit3Negative_unit };
-    const double positive[3] = { axis.travelLimit1Positive_unit,
-        axis.travelLimit2Positive_unit, axis.travelLimit3Positive_unit };
-    unsigned invalidMask = 0U;
-    unsigned validCount = 0U;
-    double intersectionNegative = 0.0;
-    double intersectionPositive = 0.0;
-    for (unsigned group = 0U; group < 3U; ++group)
-    {
-        if (!enabled[group]) continue;
-        if (!IsValidTravelLimitRange(negative[group], positive[group]))
-        {
-            invalidMask |= 1U << group;
-            continue;
-        }
-        if (validCount == 0U)
-        {
-            intersectionNegative = negative[group];
-            intersectionPositive = positive[group];
-        }
-        else
-        {
-            if (negative[group] > intersectionNegative)
-                intersectionNegative = negative[group];
-            if (positive[group] < intersectionPositive)
-                intersectionPositive = positive[group];
-        }
-        ++validCount;
-    }
-    // Inclusive target limits retain a shared single point as valid.
-    if (validCount > 1U && intersectionNegative > intersectionPositive)
-        invalidMask |= 8U;
-    return invalidMask;
+    return GetInvalidConfiguredSoftwareTravelLimitMask(axis, strokeEnabled);
 }
 
 int CoordinateManager::GetSoftwareTravelLimitAlarmCode(
@@ -399,7 +408,20 @@ bool CoordinateManager::IsTargetWithinSoftwareTravelLimit(
         return true;
     }
 
-    if (GetInvalidSoftwareTravelLimitMask(axis) != 0U) return false;
+    return IsTargetWithinConfiguredSoftwareTravelLimit(axis, targetMCS);
+}
+
+
+// Explicit configuration query for targets that will be used after HOME.
+// It never marks an axis homed and never publishes an alarm.
+bool CoordinateManager::IsTargetWithinConfiguredSoftwareTravelLimit(
+    const AxisContext& axis,
+    double targetMCS) const
+{
+    if (!axis.isExist) return true;
+    if (!std::isfinite(targetMCS)) return false;
+    if (GetInvalidConfiguredSoftwareTravelLimitMask(
+        axis, m_programmableTravelLimitEnabled) != 0U) return false;
 
 
     // ========================================================

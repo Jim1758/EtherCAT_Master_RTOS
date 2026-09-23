@@ -3227,6 +3227,9 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         ChangeState(NCState::HOLD);
         return false;
     }
+    // BASE50: reject invalid dwell duration before same-row settings/T/M effects.
+    if (NCGCodeSemantics::Contains(block, 4) &&
+        !GCodeHandlers::ValidateG04Block(block, this)) return false;
     // BASE41: these commands own their entire row. Check them before any
     // ExecuteBlock setting, T/M effect or HOME retention fence can commit.
     if (NCGCodeSemantics::Contains(block, 81) &&

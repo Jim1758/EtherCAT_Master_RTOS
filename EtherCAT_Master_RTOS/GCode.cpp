@@ -232,17 +232,23 @@ namespace GCodeHandlers
         for (unsigned axis = 0U; axis < 8U; ++axis)
             if (writeFields[axis] && std::memcmp(&writeValues[axis],
                 &nc->CoordSys.m_ToolOffset[arrayIndex][axis], sizeof(double)) != 0) changed = true;
-        if (!changed)
+        if (!changed && !nc->CoordSys.IsToolOffsetSaveRetryRequired())
         {
             RtPrintf("[TOOL][TABLE] P=%d changed=0 saveRequested=0\n", arrayIndex + 1);
             return [](NCManager*) { return true; };
         }
-        if (!nc->CoordSys.ApplyCoordinateTableValues(2, arrayIndex,
+        if (changed && !nc->CoordSys.ApplyCoordinateTableValues(2, arrayIndex,
             writeFields, writeValues, nc)) return [](NCManager*) { return true; };
-        // Preserve ordinary G10 persistence after the complete row commits.
-        // This void API reports a request, not proof of successful disk I/O.
-        nc->CoordSys.SaveToolOffset();
-        RtPrintf("[TOOL][TABLE] P=%d changed=1 saveRequested=1\n", arrayIndex + 1);
+        if (!nc->CoordSys.SaveToolOffset())
+        {
+            RtPrintf("[COORD-SAVE][BASE51] source=G10 P=%d result=FAILED ramRetained=1 retryRequired=1\n",
+                arrayIndex + 1);
+            AlarmManager::GetInstance().Trigger(AlarmManager::COORDINATE_SAVE_FAILED);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return false; };
+        }
+        RtPrintf("[TOOL][TABLE] P=%d changed=%d saveRequested=1 ioOk=1 durable=0\n",
+            arrayIndex + 1, changed ? 1 : 0);
         return [](NCManager*) { return true; };
     }
 
@@ -265,8 +271,15 @@ namespace GCodeHandlers
         }
         if (!nc->CoordSys.ApplyCoordinateTableValues(3, arrayIndex,
             writeFields, writeValues, nc)) return [](NCManager*) { return true; };
-        nc->CoordSys.SaveWorkOffset();
-        RtPrintf("[G160] Work Offset P%d updated and saved.\n", arrayIndex + 1);
+        if (!nc->CoordSys.SaveWorkOffset())
+        {
+            RtPrintf("[COORD-SAVE][BASE51] source=G160 P=%d result=FAILED ramRetained=1\n",
+                arrayIndex + 1);
+            AlarmManager::GetInstance().Trigger(AlarmManager::COORDINATE_SAVE_FAILED);
+            nc->ChangeState(NCState::HOLD);
+            return [](NCManager*) { return false; };
+        }
+        RtPrintf("[G160] Work Offset P%d updated; file write/close/readback OK (BASE52 backup policy, durable=0).\n", arrayIndex + 1);
         return [](NCManager*) { return true; };
     }
 

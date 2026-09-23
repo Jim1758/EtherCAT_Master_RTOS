@@ -3080,16 +3080,30 @@ namespace HMI_Bridge
 
         if (pShm->Coord_Command.reqSave)
         {
-            switch (pShm->Coord_Command.saveType)
+            const int saveType = pShm->Coord_Command.saveType;
+            bool saved = false;
+            switch (saveType)
             {
-            case 0: nc->CoordSys.SaveAllParameters(); break;
-            case 1: nc->CoordSys.SaveWCSStatus(); break;
-            case 2: nc->CoordSys.SaveExtOffset(); break;
-            case 3: nc->CoordSys.SaveWCSTable(); break;
-            case 4: nc->CoordSys.SaveToolOffset(); break;
-            case 5: nc->CoordSys.SaveWorkOffset(); break;
+            case 0: saved = nc->CoordSys.SaveAllParameters(); break;
+            case 1: saved = nc->CoordSys.SaveWCSStatus(); break;
+            case 2: saved = nc->CoordSys.SaveExtOffset(); break;
+            case 3: saved = nc->CoordSys.SaveWCSTable(); break;
+            case 4: saved = nc->CoordSys.SaveToolOffset(); break;
+            case 5: saved = nc->CoordSys.SaveWorkOffset(); break;
+            default:
+                RtPrintf("[COORD-SAVE][BASE51] source=HMI result=REJECTED reason=SAVE_TYPE saveType=%d\n", saveType);
+                break;
             }
+            // Consume exactly once, regardless of success. This legacy ABI flag
+            // is NOT a success acknowledgment; failures latch the core alarm.
             pShm->Coord_Command.reqSave = false;
+            RtPrintf("[COORD-SAVE][BASE51] source=HMI saveType=%d result=%s durable=0\n",
+                saveType, saved ? "WRITTEN" : "FAILED");
+            if (!saved)
+            {
+                AlarmManager::GetInstance().Trigger(AlarmManager::COORDINATE_SAVE_FAILED);
+                nc->ChangeState(NCState::HOLD);
+            }
         }
 
 

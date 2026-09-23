@@ -507,6 +507,7 @@ void NCManager::ChangeMode(NCOperationMode newMode)
 {
     // 只有在 IDLE 或 READY 狀態才能切換模式
     if (m_state == NCState::IDLE || m_state == NCState::READY || m_state == NCState::P_END) {
+        GCodeHandlers::Reset_G04(this);
         CancelGapDryRunSameThread("MODE_CHANGE");
         FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::MODE_CHANGE);
         InvalidatePathCoreFeedSameThread(); // BX-FEED
@@ -533,6 +534,10 @@ void NCManager::ChangeMode(NCOperationMode newMode)
 }
 
 void NCManager::ChangeState(NCState newState) {
+    // A clock fault must keep ALARM instead of being overwritten by HOLD.
+    if (newState == NCState::HOLD && !GCodeHandlers::Pause_G04(this)) return;
+    if (newState != NCState::RUN && newState != NCState::HOLD)
+        GCodeHandlers::Reset_G04(this);
     if (newState == NCState::HOLD) PauseGapDryRunSameThread("STATE_HOLD");
     else if (newState != NCState::RUN) CancelGapDryRunSameThread("STATE_CHANGE");
     // BN: public state writes cannot arm or resume retained geometry.
@@ -547,6 +552,7 @@ void NCManager::ChangeState(NCState newState) {
         InvalidatePathCoreHoldSameThread(); // CB: revoke unconsumed arm and original-source excursion.
     }
     m_state = newState;
+    if (newState == NCState::RUN) (void)GCodeHandlers::Resume_G04(this);
 }
 
 bool NCManager::TryCommitHomingResume(
@@ -847,6 +853,7 @@ void NCManager::FeedHoldInternal()
 
     if (m_state == NCState::RUN)
     {
+        if (!GCodeHandlers::Pause_G04(this)) return;
         PausePathCoreLiveRetentionSameThread();
         // NC-0.2J.5: arm one fresh RT proof before publishing the PROGRAM
         // Feed Hold boundary.  The observer will only accept a settled proof
@@ -9488,6 +9495,9 @@ bool NCManager::ApplyProgramHoldResume(
             return false;
         }
     }
+
+    // BASE50: rebase dwell only after successful admission and every rollback gate.
+    if (!GCodeHandlers::Resume_G04(this)) return false;
 
     // A Cycle Start is considered applied only after the admission End CAS.
     m_singleBlockBoundaryShadow.ObserveLegacyResume();

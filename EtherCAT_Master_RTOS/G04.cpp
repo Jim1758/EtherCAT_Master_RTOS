@@ -1,101 +1,185 @@
 ﻿#include "GMCodeHandlers.h"
 #include "NCManager.h"
-#include "GlobalConfig.h"
+#include "AlarmManager.h"
+#include <cmath>
+#include <limits>
 #include <windows.h>
-#include <rtapi.h> // 🌟 RTX64 專用 API
-namespace GCodeHandlers 
-{
-    // 🌟 換成 RTX64 專用的 64 位元大整數，用來記錄硬體 Ticks
-    static LARGE_INTEGER s_g04_startTime;
-    static LARGE_INTEGER s_perfFreq = { 0 }; // 系統計時頻率
-    static double s_g04_targetMs = 0.0;
+#include <rtapi.h>
 
-    // ==========================================
-    // 🌟 新增：專屬於 G04 的重置邏輯
-    // ==========================================
-    void Reset_G04(NCManager* nc)
+namespace GCodeHandlers
+{
+    namespace
     {
-        if (nc != nullptr) {
-            nc->SetG04TimeMs(0.0); // 歸零
-            //DEBUG_PRINT("[NC] G04 Timer Reset\n");
+        using Timer = NCManager::G04TimerState;
+
+        bool RejectG04(NCManager* nc, const char* reason)
+        {
+            if (nc == nullptr) return false;
+            Reset_G04(nc);
+            RtPrintf("[G04][BASE50] REJECT reason=%s alarm=2009\n", reason);
+            AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+            nc->GetMotion().RequestEmergencyStopAllAxes();
+            nc->ChangeState(NCState::ALARM);
+            return false;
+        }
+
+        bool ReadCounter(std::uint64_t& ticks)
+        {
+            LARGE_INTEGER sample{};
+            if (!RtQueryPerformanceCounter(&sample) || sample.QuadPart < 0) return false;
+            ticks = static_cast<std::uint64_t>(sample.QuadPart);
+            return true;
+        }
+
+        bool DecodeG04(const NCBlock& block, NCManager* nc, Timer& decoded)
+        {
+            // Preserve X precedence and the no-argument/zero no-op contract.
+            // X is seconds and P is milliseconds, independent of G20/G21.
+            const bool seconds = block.has('X');
+            const double value = seconds ? block.val('X') :
+                (block.has('P') ? block.val('P') : 0.0);
+            if (!std::isfinite(value) || value < 0.0)
+                return RejectG04(nc, "DURATION");
+            if (value == 0.0) return true;
+
+            LARGE_INTEGER frequency{};
+            if (!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+                return RejectG04(nc, "FREQUENCY");
+            const double infinity = (std::numeric_limits<double>::infinity)();
+            const double secondsUpper = seconds ? value :
+                std::nextafter(value / 1000.0, infinity);
+            const double frequencyUpper = std::nextafter(
+                static_cast<double>(frequency.QuadPart), infinity);
+            const double ticks = secondsUpper * frequencyUpper;
+            // Round outward before converting. The strict 2^63 bound avoids
+            // an out-of-range float-to-integer cast on MSVC as well as HOST.
+            const double rounded = std::ceil(std::nextafter(ticks,
+                (std::numeric_limits<double>::infinity)()));
+            if (!std::isfinite(rounded) || rounded >= 9223372036854775808.0)
+                return RejectG04(nc, "TICK_RANGE");
+            decoded.frequency = static_cast<std::uint64_t>(frequency.QuadPart);
+            decoded.targetTicks = static_cast<std::uint64_t>(rounded);
+            if (decoded.targetTicks == 0ULL) decoded.targetTicks = 1ULL;
+            return true;
+        }
+
+        void PublishRemaining(NCManager* nc)
+        {
+            const Timer& timer = nc->GetG04TimerSameThread();
+            const std::uint64_t remaining = timer.targetTicks - timer.elapsedTicks;
+            nc->SetG04TimeMs(timer.frequency == 0ULL ? 0.0 :
+                (static_cast<double>(remaining) / static_cast<double>(timer.frequency)) * 1000.0);
+        }
+
+        bool SampleActive(NCManager* nc)
+        {
+            Timer& timer = nc->GetG04TimerSameThread();
+            std::uint64_t now = 0ULL;
+            if (!ReadCounter(now) || now < timer.lastTick)
+                return RejectG04(nc, "COUNTER");
+            const std::uint64_t delta = now - timer.lastTick;
+            const std::uint64_t remaining = timer.targetTicks - timer.elapsedTicks;
+            // Saturating accumulation cannot overflow even after a long
+            // scheduling gap. No time is inferred from callback count.
+            timer.elapsedTicks += delta < remaining ? delta : remaining;
+            timer.lastTick = now;
+            PublishRemaining(nc);
+            return true;
+        }
+
+        bool CheckG04Done(NCManager* nc)
+        {
+            if (nc == nullptr || nc->GetState() != NCState::RUN ||
+                AlarmManager::GetInstance().HasAlarm()) return false;
+            Timer& timer = nc->GetG04TimerSameThread();
+            if (timer.completed) return true;
+            if (!timer.active) return false; // Cancelled waits cannot retire a block.
+            if (timer.paused && !Resume_G04(nc)) return false;
+            if (!SampleActive(nc)) return false;
+            if (timer.elapsedTicks < timer.targetTicks) return false;
+            timer.active = false;
+            timer.completed = true;
+            RtPrintf("[G04][BASE50] DONE targetTicks=%llu freq=%llu counter=%llu\n",
+                static_cast<unsigned long long>(timer.targetTicks),
+                static_cast<unsigned long long>(timer.frequency),
+                static_cast<unsigned long long>(timer.lastTick));
+            return true;
         }
     }
-    // 🌟 專屬的檢查邏輯
-    static bool CheckG04Done(NCManager* nc)
+
+    void Reset_G04(NCManager* nc)
     {
-        double timeMs = nc->GetG04TimeMs();
+        if (nc == nullptr) return;
+        Timer& timer = nc->GetG04TimerSameThread();
+        if (timer.active)
+            RtPrintf("[G04][BASE50] CANCEL remainingTicks=%llu freq=%llu\n",
+                static_cast<unsigned long long>(timer.targetTicks - timer.elapsedTicks),
+                static_cast<unsigned long long>(timer.frequency));
+        timer = Timer{};
+        nc->SetG04TimeMs(0.0);
+    }
 
-        timeMs -= 10.0;
-        nc->SetG04TimeMs(timeMs);
-
-        if (timeMs > 0.0) {
-            return false; // 還沒結束
-        }
-
-        // 🌟 G04 結束！取得當下的硬體 Ticks
-        
-        LARGE_INTEGER endTime;
-        RtQueryPerformanceCounter(&endTime);
-
-        // 🌟 算出實際經過的毫秒數：(結束 Ticks - 開始 Ticks) * 1000.0 / 頻率
-        double elapsedMs = (double)(endTime.QuadPart - s_g04_startTime.QuadPart) * 1000.0 / (double)s_perfFreq.QuadPart;
-
-        double targetMs = s_g04_targetMs;
-        double errorMs = elapsedMs - targetMs;
-
-        // ==========================================
-        // 🛠️ RTX64 安全寫法：拆解浮點數為整數與小數 (精準到小數後三位)
-        // ==========================================
-        
-        int i_target = (int)targetMs;
-        int f_target = (int)((targetMs - i_target) * 1000);
-        f_target = f_target < 0 ? -f_target : f_target;
-
-        int i_elapsed = (int)elapsedMs;
-        int f_elapsed = (int)((elapsedMs - i_elapsed) * 1000);
-        f_elapsed = f_elapsed < 0 ? -f_elapsed : f_elapsed;
-
-        int i_error = (int)errorMs;
-        int f_error = (int)((errorMs - i_error) * 1000);
-        f_error = f_error < 0 ? -f_error : f_error;
-
-        const char* sign = (errorMs < 0 && i_error == 0) ? "-" : "";
-
-        DEBUG_PRINT("========================================\n");
-        DEBUG_PRINT(" [G04 Precision Report] \n");
-        DEBUG_PRINT(" Target Dwell   : %d.%03d ms\n", i_target, f_target);
-        DEBUG_PRINT(" Actual Elapsed : %d.%03d ms\n", i_elapsed, f_elapsed);
-        DEBUG_PRINT(" System Jitter  : %s%d.%03d ms\n", sign, i_error, f_error);
-        DEBUG_PRINT("========================================\n");
-        
+    bool Pause_G04(NCManager* nc)
+    {
+        if (nc == nullptr) return false;
+        Timer& timer = nc->GetG04TimerSameThread();
+        if (!timer.active || timer.paused) return true;
+        if (!SampleActive(nc)) return false;
+        timer.paused = true;
+        RtPrintf("[G04][BASE50] PAUSE remainingTicks=%llu freq=%llu counter=%llu\n",
+            static_cast<unsigned long long>(timer.targetTicks - timer.elapsedTicks),
+            static_cast<unsigned long long>(timer.frequency),
+            static_cast<unsigned long long>(timer.lastTick));
         return true;
+    }
+
+    bool Resume_G04(NCManager* nc)
+    {
+        if (nc == nullptr) return false;
+        Timer& timer = nc->GetG04TimerSameThread();
+        if (!timer.active || !timer.paused) return true;
+        if (nc->GetState() != NCState::RUN || AlarmManager::GetInstance().HasAlarm()) return false;
+        std::uint64_t now = 0ULL;
+        if (!ReadCounter(now) || now < timer.lastTick)
+            return RejectG04(nc, "RESUME_COUNTER");
+        timer.lastTick = now; // Explicitly exclude the complete HOLD interval.
+        timer.paused = false;
+        RtPrintf("[G04][BASE50] RESUME remainingTicks=%llu freq=%llu counter=%llu\n",
+            static_cast<unsigned long long>(timer.targetTicks - timer.elapsedTicks),
+            static_cast<unsigned long long>(timer.frequency),
+            static_cast<unsigned long long>(timer.lastTick));
+        return true;
+    }
+
+    bool ValidateG04Block(const NCBlock& block, NCManager* nc)
+    {
+        if (nc == nullptr) return false;
+        Timer decoded{};
+        return DecodeG04(block, nc, decoded);
     }
 
     WaitConditionFunc Handle_G04(const NCBlock& block, NCManager* nc)
     {
-        double seconds = 0.0;
-        if (block.has('X')) seconds = block.val('X');
-        else if (block.has('P')) seconds = block.val('P') / 1000.0;
-
-        if (seconds <= 0.0) return nullptr;
-
-        // 🌟 第一次執行時，取得 RTX64 系統的硬體計時頻率
-        if (s_perfFreq.QuadPart == 0) {
-            RtQueryPerformanceFrequency(&s_perfFreq);
-            // 註：如果編譯器找不到 Rt 開頭的，請改用標準的 QueryPerformanceFrequency
+        if (nc == nullptr) return nullptr;
+        Timer decoded{};
+        if (!DecodeG04(block, nc, decoded)) return CheckG04Done;
+        if (decoded.targetTicks == 0ULL)
+        {
+            Reset_G04(nc);
+            return nullptr;
         }
-
-        double totalMs = seconds * 1000.0;
-        nc->SetG04TimeMs(totalMs);
-
-        s_g04_targetMs = totalMs;
-
-        // 🌟 記錄開始的硬體 Ticks
-        RtQueryPerformanceCounter(&s_g04_startTime);
-        // 註：同上，若報錯可改為 QueryPerformanceCounter
-
-        //DEBUG_PRINT("[NC] G04 Dwell Started: %.3f sec\n", seconds);
-
+        if (!ReadCounter(decoded.lastTick))
+        {
+            RejectG04(nc, "START_COUNTER");
+            return CheckG04Done;
+        }
+        decoded.active = true;
+        nc->GetG04TimerSameThread() = decoded;
+        PublishRemaining(nc);
+        RtPrintf("[G04][BASE50] START targetTicks=%llu freq=%llu counter=%llu holdPauses=1\n",
+            static_cast<unsigned long long>(decoded.targetTicks),
+            static_cast<unsigned long long>(decoded.frequency),
+            static_cast<unsigned long long>(decoded.lastTick));
         return CheckG04Done;
     }
-} // end namespace
+}

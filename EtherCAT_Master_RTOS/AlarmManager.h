@@ -77,6 +77,7 @@ public:
         GAP_PATH_SIMULATION_FAILED = NC_BASE + 21, // 2021: GAP 路徑模擬訊號異常 / GAP path simulation signal invalid; see [GAP-CH].
         IDLE_POSITION_HOLD_FAILED = NC_BASE + 22, // 2022: 程序結束後保持位置無效 /Post-program position hold invalid; see [IDLE-CJ].
         PATH_INVALIDATED_BY_GOTO = NC_BASE + 23, // 2023: GOTO 後無法接續路徑運動 / Path motion invalidated by GOTO
+        COORDINATE_SAVE_FAILED = NC_BASE + 24, // 2024: 座標或補正檔保存失敗 / Coordinate save failed; see [COORD-SAVE]. RAM edits are not rolled back.
     };
 
     // 🌟 4. 運動軸控警報 (3000 ~ 3999)

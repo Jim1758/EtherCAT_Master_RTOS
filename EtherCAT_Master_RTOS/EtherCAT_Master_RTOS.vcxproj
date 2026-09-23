@@ -95,6 +95,7 @@
     <ClInclude Include="AlarmManager.h" />
     <ClInclude Include="CompensationEngine.h" />
     <ClInclude Include="ConfigReader.h" />
+    <ClInclude Include="CoordinateFileSave.h" />
     <ClInclude Include="CoordinateManager.h" />
     <ClInclude Include="EDMGapSignal.h" />
     <ClInclude Include="EtherCatDcQualificationDiagContract.h" />

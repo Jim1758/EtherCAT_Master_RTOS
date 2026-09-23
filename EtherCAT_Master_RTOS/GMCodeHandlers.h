@@ -20,6 +20,9 @@ namespace GCodeHandlers
     bool ValidateReferencePositionBlock(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G53(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G04(const NCBlock& block, NCManager* nc);
+    bool ValidateG04Block(const NCBlock& block, NCManager* nc);
+    bool Pause_G04(NCManager* nc);
+    bool Resume_G04(NCManager* nc);
     WaitConditionFunc Handle_G68(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G69(const NCBlock& block, NCManager* nc);
     WaitConditionFunc Handle_G168(const NCBlock& block, NCManager* nc);

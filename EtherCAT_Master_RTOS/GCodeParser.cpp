@@ -231,36 +231,57 @@ namespace
         }
     }
 
+    // BASE54: recognize comments on the raw source before stripping whitespace
+    // or handling ';'. The shared MacroParser cleaner must remain unchanged:
+    // it evaluates expressions, whereas this lexer owns NC source comments.
     bool CleanGCodeSourceLine(
         const std::string& input,
         std::string& output)
     {
-        // Preserve the established handling of whitespace, case conversion,
-        // ';' end-of-line comments and C-style /* ... */ comments.
-        const std::string normalized =
-            MacroParser::CleanExpression(input);
-
         output.clear();
-        output.reserve(normalized.size());
+        output.reserve(input.size());
 
-        int expressionParenDepth = 0;
-        int bracketDepth = 0;
-        int commentDepth = 0;
+        std::size_t expressionParenDepth = 0U;
+        std::size_t bracketDepth = 0U;
+        std::size_t commentDepth = 0U;
+        bool inCStyleComment = false;
 
-        for (char c : normalized)
+        for (std::size_t i = 0U; i < input.size(); ++i)
         {
-            if (commentDepth > 0)
+            const char raw = input[i];
+
+            // Inside an NC parenthesis comment, ';', '/*', '*/', addresses
+            // and macro text are inert. Preserve existing nested comments.
+            if (commentDepth > 0U)
             {
-                if (c == '(')
+                if (raw == '(') ++commentDepth;
+                else if (raw == ')') --commentDepth;
+                continue;
+            }
+
+            // Inside a C-style comment, only '*/' ends the comment. This is
+            // the existing non-nested form; parentheses and ';' are inert.
+            if (inCStyleComment)
+            {
+                if (raw == '*' && i + 1U < input.size() && input[i + 1U] == '/')
                 {
-                    ++commentDepth;
-                }
-                else if (c == ')')
-                {
-                    --commentDepth;
+                    inCStyleComment = false;
+                    ++i;
                 }
                 continue;
             }
+
+            if (raw == '/' && i + 1U < input.size() && input[i + 1U] == '*')
+            {
+                inCStyleComment = true;
+                ++i;
+                continue;
+            }
+            if (raw == ';') break; // End-of-line comment outside other comments.
+
+            const unsigned char u = static_cast<unsigned char>(raw);
+            if (std::isspace(u) != 0) continue;
+            const char c = static_cast<char>(std::toupper(u));
 
             if (c == '[')
             {
@@ -268,24 +289,21 @@ namespace
                 output += c;
                 continue;
             }
-
             if (c == ']')
             {
-                if (bracketDepth > 0)
-                {
-                    --bracketDepth;
-                }
+                if (bracketDepth > 0U) --bracketDepth;
                 output += c;
                 continue;
             }
-
             if (c == '(')
             {
+                // Keep the established expression/comment classification.
+                // X(...), SIN(...), IF(...), assignments and bracket grouping
+                // remain expressions, not comments, even with whitespace.
                 const bool expressionParenthesis =
-                    expressionParenDepth > 0 ||
-                    bracketDepth > 0 ||
+                    expressionParenDepth > 0U ||
+                    bracketDepth > 0U ||
                     IsExpressionParenthesisStart(output);
-
                 if (expressionParenthesis)
                 {
                     ++expressionParenDepth;
@@ -293,31 +311,24 @@ namespace
                 }
                 else
                 {
-                    commentDepth = 1;
+                    commentDepth = 1U;
                 }
                 continue;
             }
-
             if (c == ')')
             {
-                if (expressionParenDepth <= 0)
-                {
-                    // Unmatched ')' is neither a valid expression delimiter
-                    // nor a complete NC comment.
-                    return false;
-                }
-
+                if (expressionParenDepth == 0U) return false;
                 --expressionParenDepth;
                 output += c;
                 continue;
             }
-
             output += c;
         }
 
-        // An unterminated '(COMMENT' is a syntax error.  Expression delimiter
-        // balance remains the responsibility of the normal parser below.
-        return commentDepth == 0;
+        // ParseLine is line-local. Never accept a partial executable prefix
+        // when either comment form is unclosed. Expression delimiter checks
+        // stay in the parser/resolver; no macro evaluation or side effects here.
+        return commentDepth == 0U && !inCStyleComment;
     }
 }
 

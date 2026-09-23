@@ -12,6 +12,23 @@ namespace
     constexpr std::size_t MAX_MACRO_EXPRESSION_LENGTH = 4096u;
     constexpr std::uint32_t MAX_MACRO_RECURSION_DEPTH = 128u;
 
+    // BASE55: every evaluated operand must be finite before an enclosing
+    // comparison, logical operator or function can turn it into a finite value.
+    // Preserve the first error and the existing TryEvaluate failure result.
+    double RequireFiniteMacroValue(double value, MacroEvalError& error) noexcept
+    {
+        if (error != MacroEvalError::NONE)
+        {
+            return 0.0;
+        }
+        if (!std::isfinite(value))
+        {
+            error = MacroEvalError::NON_FINITE_RESULT;
+            return 0.0;
+        }
+        return value;
+    }
+
     bool IsVariablePrefix(char value) noexcept
     {
         return value == '#' || value == '@' || value == '$';
@@ -393,6 +410,9 @@ double MacroParser::parseAddSub()
         {
             break;
         }
+
+        // Check each step, not only the final result of a chained expression.
+        left = RequireFiniteMacroValue(left, m_error);
     }
     return left;
 }
@@ -420,6 +440,9 @@ double MacroParser::parseMulDiv()
         {
             break;
         }
+
+        // Check each step, not only the final result of a chained expression.
+        left = RequireFiniteMacroValue(left, m_error);
     }
     return left;
 }
@@ -453,7 +476,9 @@ double MacroParser::parseUnary()
     }
 
     --m_recursionDepth;
-    return result;
+    // Covers literals, #/@/$ reads, grouped values, function results and unary
+    // operands. Recursive unary evaluation also prevents NOT from hiding NaN/Inf.
+    return RequireFiniteMacroValue(result, m_error);
 }
 
 bool MacroParser::parseDelimitedExpression(double& value)

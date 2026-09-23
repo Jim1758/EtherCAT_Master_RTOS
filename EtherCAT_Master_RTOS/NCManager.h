@@ -410,7 +410,20 @@ public:
     // ======================================================
     MotionCore& GetMotion() { return m_motion; }
 
-    // 開放 Ticks 讓外部檢查函式可以使用
+    // BASE50: owned by the existing NC supervisory thread, never the 250 us task.
+    struct G04TimerState
+    {
+        std::uint64_t frequency = 0ULL;
+        std::uint64_t targetTicks = 0ULL;
+        std::uint64_t elapsedTicks = 0ULL;
+        std::uint64_t lastTick = 0ULL;
+        bool active = false;
+        bool paused = false;
+        bool completed = false;
+    };
+    G04TimerState& GetG04TimerSameThread() { return m_g04Timer; }
+
+    // Remaining milliseconds are a display mirror, not the timing authority.
     void SetG04TimeMs(double ms) { m_G04_TimeMs = ms; }
     double GetG04TimeMs() const { return m_G04_TimeMs; }
 
@@ -1697,6 +1710,7 @@ public:
 
     int m_simulatedTicks = 0; // (測試用) 模擬馬達跑了多久
     double m_G04_TimeMs = 0.0;
+    G04TimerState m_g04Timer{};
 
 
     // 🌟 MDI 專屬變數

@@ -277,17 +277,23 @@ public:
     // ==========================================
 
     void LoadAllParameters();
-    void SaveAllParameters();
+    // BASE52: supervisor-thread synchronous I/O only. true requires checked
+    // write/close and byte-exact readback. A complete existing file must first
+    // be validated and copied to .bak, then verified. Missing target = first save.
+    // Incomplete/corrupt existing files fail closed without rotating the backup.
+    // Not atomic/durable, no auto-recovery. Accepted RAM edits survive failure.
+    bool SaveAllParameters();
+    bool IsToolOffsetSaveRetryRequired() const noexcept { return m_toolOffsetSaveRetryRequired; }
 
     // 針對單一表格的讀寫 (如果你 HMI 只改了刀具，可以單獨呼叫 SaveToolOffset)
-    void SaveWCSStatus();   // 🌟 改名：讓函式名稱更明確
-    void SaveExtOffset();
-    void SaveToolOffset();
-    void SaveToolRadius();
-    void SaveRefPoints();
-    void SaveWorkOffset();
+    bool SaveWCSStatus();   // 🌟 改名：讓函式名稱更明確
+    bool SaveExtOffset();
+    bool SaveToolOffset();
+    bool SaveToolRadius();
+    bool SaveRefPoints();
+    bool SaveWorkOffset();
 
-    void SaveWCSTable();
+    bool SaveWCSTable();
     int GetCurrentWCSGCode() const;
 
 
@@ -635,8 +641,11 @@ private:
         double* outputMCS,
         bool commitCommandedMCS);
 
-    // 底層輔助函式：負責讀寫 8 軸二維陣列，並確保原子寫入防護
-    void SaveTableToFile(const std::string& filename, const std::vector<std::vector<double>>& table);
+    // BASE52: validate all RAM rows before any file I/O, then verified backup
+    // before touching the target. No rollback or automatic backup loading.
+    bool m_toolOffsetSaveRetryRequired = false; // deliberately survives NC RESET
+    bool SaveTableToFile(const std::string& filename,
+        const std::vector<std::vector<double>>& table, std::size_t expectedRows);
     void LoadTableFromFile(const std::string& filename, std::vector<std::vector<double>>& table, int maxRows);
 
     // ==========================================================

@@ -1,4 +1,7 @@
-﻿#include "CoordinateManager.h"
+﻿#include <windows.h>
+#include "CoordinateManager.h"
+#include "CoordinateFileSave.h"
+#include <atomic>
 #include "NCManager.h"
 #include <fstream>
 #include <sstream>
@@ -6,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <locale>
 #include "GlobalConfig.h"
 #include "EtherCatMaster.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
@@ -31,6 +35,312 @@ bool TryGetFixedWorkPlaneAngle(const std::vector<double>& row, int plane,
     angle = row[selected];
     return true;
 }
+// BASE49 persistence parsing helpers. Called only by explicit file loads,
+// never by the cyclic Motion path. Each caller owns an uncommitted candidate.
+std::string CoordinateFileContent(const std::string& raw, std::size_t lineNumber)
+{
+    std::size_t begin = 0U;
+    if (lineNumber == 1U && raw.size() >= 3U &&
+        static_cast<unsigned char>(raw[0]) == 0xEFU &&
+        static_cast<unsigned char>(raw[1]) == 0xBBU &&
+        static_cast<unsigned char>(raw[2]) == 0xBFU) begin = 3U;
+    const std::size_t comment = raw.find(';', begin);
+    std::string text = raw.substr(begin, comment == std::string::npos ?
+        std::string::npos : comment - begin);
+    const char* whitespace = " \t\r\n\v\f";
+    const std::size_t first = text.find_first_not_of(whitespace);
+    if (first == std::string::npos) return std::string();
+    return text.substr(first, text.find_last_not_of(whitespace) - first + 1U);
+}
+
+bool TryCoordinateFileNumber(const std::string& token, double& value)
+{
+    std::istringstream number(token);
+    number.imbue(std::locale::classic());
+    return static_cast<bool>(number >> value) && std::isfinite(value) &&
+        number.peek() == std::char_traits<char>::eof();
+}
+
+bool ReadCoordinateTableCandidate(std::istream& input,
+    std::vector<std::vector<double>>& candidate, std::size_t maxRows,
+    std::size_t& rows, std::size_t& lineNumber, const char*& reason)
+{
+    rows = 0U;
+    lineNumber = 0U;
+    std::string raw;
+    while (std::getline(input, raw))
+    {
+        const std::string text = CoordinateFileContent(raw, ++lineNumber);
+        if (text.empty()) continue;
+        if (rows >= maxRows) { reason = "TOO_MANY_ROWS"; return false; }
+        if (rows >= candidate.size() || candidate[rows].size() != 8U)
+        { reason = "TABLE_SHAPE"; return false; }
+        std::istringstream columns(text);
+        columns.imbue(std::locale::classic());
+        std::string token;
+        for (std::size_t axis = 0U; axis < 8U; ++axis)
+        {
+            if (!(columns >> token)) { reason = "SHORT_ROW"; return false; }
+            if (!TryCoordinateFileNumber(token, candidate[rows][axis]))
+            { reason = "INVALID_NUMBER"; return false; }
+        }
+        if (columns >> token) { reason = "EXTRA_COLUMN"; return false; }
+        ++rows;
+    }
+    if (input.bad() || !input.eof()) { reason = "READ_ERROR"; return false; }
+    return true;
+}
+
+bool ReadCoordinateExtCandidate(std::istream& input, double (&candidate)[8],
+    std::size_t& fields, std::size_t& lineNumber, const char*& reason)
+{
+    fields = 0U;
+    lineNumber = 0U;
+    std::string raw;
+    while (std::getline(input, raw))
+    {
+        std::istringstream columns(CoordinateFileContent(raw, ++lineNumber));
+        columns.imbue(std::locale::classic());
+        std::string token;
+        while (columns >> token)
+        {
+            if (fields >= 8U) { reason = "EXTRA_COLUMN"; return false; }
+            if (!TryCoordinateFileNumber(token, candidate[fields]))
+            { reason = "INVALID_NUMBER"; return false; }
+            ++fields;
+        }
+    }
+    if (input.bad() || !input.eof()) { reason = "READ_ERROR"; return false; }
+    if (fields != 0U && fields != 8U) { reason = "SHORT_ROW"; return false; }
+    return true;
+}
+
+bool ReadCoordinateStatusCandidate(std::istream& input, int& candidate,
+    bool& found, std::size_t& lineNumber, const char*& reason)
+{
+    found = false;
+    lineNumber = 0U;
+    std::string raw;
+    while (std::getline(input, raw))
+    {
+        const std::string text = CoordinateFileContent(raw, ++lineNumber);
+        if (text.empty()) continue;
+        const std::size_t equals = text.find('=');
+        const std::string key = CoordinateFileContent(text.substr(0U, equals), 0U);
+        // Preserve unrelated INI keys and section lines for compatibility.
+        if (key != "LastWCSIndex") continue;
+        if (found) { reason = "DUPLICATE_KEY"; return false; }
+        if (equals == std::string::npos) { reason = "MISSING_VALUE"; return false; }
+        const std::string value = CoordinateFileContent(text.substr(equals + 1U), 0U);
+        std::istringstream number(value);
+        number.imbue(std::locale::classic());
+        int index = 0;
+        if (!(number >> index) || number.peek() != std::char_traits<char>::eof() ||
+            index < 0 || index >= 60)
+        { reason = "INVALID_INDEX"; return false; }
+        candidate = index;
+        found = true;
+    }
+    if (input.bad() || !input.eof()) { reason = "READ_ERROR"; return false; }
+    return true;
+}
+
+void ReportCoordinateFileLoad(const std::string& filename, const char* result,
+    std::size_t lineNumber, std::size_t count, const char* reason)
+{
+    // At most one result per file per explicit load, with no cyclic output.
+    RtPrintf("[COORD-LOAD][BASE49] file=%s result=%s line=%llu count=%llu reason=%s\n",
+        filename.c_str(), result, static_cast<unsigned long long>(lineNumber),
+        static_cast<unsigned long long>(count), reason);
+}
+// END BASE49 persistence parsing helpers.
+
+// BASE52: supervisor-only verified backup, followed by checked target write.
+// Only supported RTX64 file APIs are used. FILE_FLAG_WRITE_THROUGH is requested,
+// but readback/close are NOT a proof of durable media or power-loss consistency.
+// No rename/automatic rollback/automatic backup load is introduced.
+// BASE53 also refuses a missing target when its backup exists or cannot be
+// read-checked. Only two confirmed missing files authorize a first save.
+bool ReportCoordinateFileSave(const std::string& filename, const char* result,
+    const char* reason, std::size_t rows, bool targetMayBePartial,
+    const char* detail = "OK", std::uint32_t error = 0U,
+    bool hadPrevious = false, bool backupVerified = false,
+    bool backupMayBePartial = false, bool readbackVerified = false,
+    const char* backupProbe = "NOT_NEEDED", bool firstSaveAllowed = false)
+{
+    RtPrintf("[COORD-SAVE][BASE53] file=%s result=%s reason=%s detail=%s error=%lu rows=%llu previous=%d backupVerified=%d backupMayBePartial=%d targetMayBePartial=%d readback=%d backupProbe=%s firstSaveAllowed=%d durable=0\n",
+        filename.c_str(), result, reason, detail, static_cast<unsigned long>(error),
+        static_cast<unsigned long long>(rows), hadPrevious ? 1 : 0,
+        backupVerified ? 1 : 0, backupMayBePartial ? 1 : 0,
+        targetMayBePartial ? 1 : 0, readbackVerified ? 1 : 0,
+        backupProbe, firstSaveAllowed ? 1 : 0);
+    return std::strcmp(result, "WRITTEN") == 0;
+}
+
+class CoordinateFileHandle
+{
+public:
+    explicit CoordinateFileHandle(HANDLE value) noexcept : m_value(value) {}
+    ~CoordinateFileHandle() { if (m_value != INVALID_HANDLE_VALUE) CloseHandle(m_value); }
+    CoordinateFileHandle(const CoordinateFileHandle&) = delete;
+    CoordinateFileHandle& operator=(const CoordinateFileHandle&) = delete;
+    HANDLE Get() const noexcept { return m_value; }
+    HANDLE Release() noexcept { const HANDLE value = m_value; m_value = INVALID_HANDLE_VALUE; return value; }
+    CoordinateFileSave::IOResult Close(CoordinateFileSave::IOResult prior)
+    {
+        const HANDLE value = m_value;
+        m_value = INVALID_HANDLE_VALUE;
+        const BOOL closed = CloseHandle(value);
+        const DWORD error = closed ? ERROR_SUCCESS : GetLastError();
+        if (!closed && prior.code == CoordinateFileSave::IOCode::OK)
+            return { CoordinateFileSave::IOCode::CLOSE, static_cast<std::uint32_t>(error) };
+        return prior; // preserve the first failure, not a later close's error
+    }
+private:
+    HANDLE m_value;
+};
+
+struct CoordinateWindowsFileIO
+{
+    HANDLE previous = INVALID_HANDLE_VALUE;
+    ~CoordinateWindowsFileIO() { if (previous != INVALID_HANDLE_VALUE) CloseHandle(previous); }
+    CoordinateWindowsFileIO() = default;
+    CoordinateWindowsFileIO(const CoordinateWindowsFileIO&) = delete;
+    CoordinateWindowsFileIO& operator=(const CoordinateWindowsFileIO&) = delete;
+    CoordinateFileSave::IOResult ClosePrevious()
+    {
+        if (previous == INVALID_HANDLE_VALUE) return {};
+        CoordinateFileHandle file(previous);
+        previous = INVALID_HANDLE_VALUE;
+        return file.Close({ CoordinateFileSave::IOCode::OK, 0U });
+    }
+    CoordinateFileSave::IOResult ReadPrevious(const std::string& path, std::string& text)
+    { return ReadInternal(path, text, true); }
+    CoordinateFileSave::IOResult Read(const std::string& path, std::string& text)
+    { return ReadInternal(path, text, false); }
+    CoordinateFileSave::IOResult ReadInternal(const std::string& path,
+        std::string& text, bool retain)
+    {
+        using namespace CoordinateFileSave;
+        text.clear();
+        CoordinateFileHandle file(CreateFileA(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        if (file.Get() == INVALID_HANDLE_VALUE)
+        {
+            const DWORD error = GetLastError();
+            return { error == ERROR_FILE_NOT_FOUND ? IOCode::MISSING : IOCode::OPEN,
+                static_cast<std::uint32_t>(error) };
+        }
+        char buffer[4096];
+        for (;;)
+        {
+            DWORD count = 0U;
+            if (!ReadFile(file.Get(), buffer, static_cast<DWORD>(sizeof(buffer)), &count, nullptr))
+                return file.Close({ IOCode::READ, static_cast<std::uint32_t>(GetLastError()) });
+            if (count > sizeof(buffer) || count > MaxFileBytes - text.size())
+                return file.Close({ IOCode::SIZE, 0U });
+            if (count == 0U) break;
+            text.append(buffer, static_cast<std::size_t>(count));
+        }
+        if (retain) { previous = file.Release(); return {}; }
+        return file.Close({ IOCode::OK, 0U });
+    }
+    CoordinateFileSave::IOResult Write(const std::string& path,
+        const std::string& text, CoordinateFileSave::WriteMode mode)
+    {
+        using namespace CoordinateFileSave;
+        const DWORD disposition = mode == WriteMode::BACKUP_REPLACE ? CREATE_ALWAYS :
+            (mode == WriteMode::TARGET_NEW ? CREATE_NEW : TRUNCATE_EXISTING);
+        CoordinateFileHandle file(CreateFileA(path.c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ, nullptr, disposition,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr));
+        if (file.Get() == INVALID_HANDLE_VALUE)
+            return { IOCode::OPEN, static_cast<std::uint32_t>(GetLastError()) };
+        std::size_t offset = 0U;
+        while (offset < text.size())
+        {
+            const DWORD chunk = static_cast<DWORD>((std::min)(text.size() - offset,
+                static_cast<std::size_t>(4096U)));
+            DWORD written = 0U;
+            const BOOL ok = WriteFile(file.Get(), text.data() + offset, chunk, &written, nullptr);
+            if (!ok) return file.Close({ IOCode::WRITE, static_cast<std::uint32_t>(GetLastError()) });
+            // A short successful write is a failure, not an unbounded retry.
+            if (written != chunk) return file.Close({ IOCode::WRITE, ERROR_WRITE_FAULT });
+            offset += written;
+        }
+        return file.Close({ IOCode::OK, 0U });
+    }
+};
+
+// Do not rotate an empty/partial/corrupt target into a prior good .bak. This
+// deliberately requires complete save shapes, unlike the legacy short-table
+// LOAD compatibility. A failed precheck changes neither file. Manual repair
+// of an incomplete prior file is required; RESET does not bypass this guard.
+const char* ValidateCoordinateBackupSource(const std::string& filename,
+    const std::string& text, std::size_t expectedRows)
+{
+    std::istringstream input(text);
+    std::size_t line = 0U, count = 0U;
+    const char* reason = "OK";
+    if (filename == "WCS_STATUS.ini")
+    {
+        int index = 0; bool found = false;
+        if (!ReadCoordinateStatusCandidate(input, index, found, line, reason)) return reason;
+        return found ? nullptr : "NO_KEY";
+    }
+    if (filename == "EXT_OFFSET.txt")
+    {
+        double values[8]{};
+        if (!ReadCoordinateExtCandidate(input, values, count, line, reason)) return reason;
+        return count == 8U ? nullptr : "INCOMPLETE";
+    }
+    if ((filename == "WCS_TABLE.txt" && expectedRows != 60U) ||
+        (filename != "WCS_TABLE.txt" && expectedRows != 100U)) return "TABLE_SHAPE";
+    std::vector<std::vector<double>> candidate(expectedRows, std::vector<double>(8U, 0.0));
+    if (!ReadCoordinateTableCandidate(input, candidate, expectedRows, count, line, reason)) return reason;
+    return count == expectedRows ? nullptr : "INCOMPLETE";
+}
+
+std::atomic_flag coordinateSaveBusy = ATOMIC_FLAG_INIT;
+struct CoordinateSaveLease
+{
+    bool acquired = !coordinateSaveBusy.test_and_set(std::memory_order_acquire);
+    ~CoordinateSaveLease() { if (acquired) coordinateSaveBusy.clear(std::memory_order_release); }
+    CoordinateSaveLease() = default;
+    CoordinateSaveLease(const CoordinateSaveLease&) = delete;
+    CoordinateSaveLease& operator=(const CoordinateSaveLease&) = delete;
+};
+
+bool WriteCoordinateFileText(const std::string& filename,
+    const std::ostringstream& serialized, std::size_t rows)
+{
+    if (!serialized.good())
+        return ReportCoordinateFileSave(filename, "REJECTED", "SERIALIZE", rows, false);
+    const std::string text = serialized.str();
+    if (text.empty() || text.size() > CoordinateFileSave::MaxFileBytes / 2U)
+        return ReportCoordinateFileSave(filename, "REJECTED", "TEXT_SIZE", rows, false);
+    // Preserve the Windows text-mode output of the previous std::ofstream:
+    // fixed4, tabs, CRLF, no BOM. Prior-file backup is binary/byte-exact instead.
+    std::string payload;
+    payload.reserve(text.size() + rows);
+    for (char ch : text) { if (ch == '\n') payload.push_back('\r'); payload.push_back(ch); }
+    CoordinateSaveLease lease;
+    if (!lease.acquired)
+        return ReportCoordinateFileSave(filename, "REJECTED", "SAVE_BUSY", rows, false);
+    CoordinateWindowsFileIO io;
+    const std::string path = GlobalConfig::GetInstance().NCDataDir + filename;
+    const auto result = CoordinateFileSave::Write(io, path, payload,
+        [&filename, rows](const std::string& previous) {
+            return ValidateCoordinateBackupSource(filename, previous, rows);
+        });
+    return ReportCoordinateFileSave(filename, result.ok ? "WRITTEN" : "FAILED",
+        result.reason, rows, result.targetMayBePartial, result.detail, result.error,
+        result.hadPrevious, result.backupVerified, result.backupMayBePartial,
+        result.readbackVerified, result.backupProbe, result.firstSaveAllowed);
+}
+// END BASE52 persistence save helpers.
+
 }
 
 CoordinateManager::CoordinateManager()
@@ -1582,114 +1892,166 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
 // ==========================================
 void CoordinateManager::LoadAllParameters() {
     if (!GuardCoordinateMutation("LOAD_TABLES", nullptr, false)) return;
-    // 🌟 1. 檔名改為 WCS_STATUS.ini
-    std::ifstream inStatus(GlobalConfig::GetInstance().NCDataDir + "WCS_STATUS.ini");
-    if (inStatus.is_open()) {
-        std::string line, key;
-        while (std::getline(inStatus, line)) {
-            std::stringstream ss(line);
-            if (std::getline(ss, key, '=') && key == "LastWCSIndex") {
-                ss >> currentWCSIndex;
-                if (currentWCSIndex < 0 || currentWCSIndex >= 60) currentWCSIndex = 0;
-            }
+    // Files are saved independently. Commit each complete valid file, while
+    // preserving the previous RAM value for absent, empty or rejected files.
+    // This is a per-file transaction, not a cross-file generation protocol.
+    RtPrintf("[COORD-LOAD][BASE49] begin perFileCommit=1 finiteColumns=8 maxWCSRows=60 maxOtherRows=100\n");
+    const std::string directory = GlobalConfig::GetInstance().NCDataDir;
+    {
+        const std::string filename = "WCS_STATUS.ini";
+        std::ifstream input(directory + filename);
+        int candidate = currentWCSIndex;
+        bool found = false;
+        std::size_t lineNumber = 0U;
+        const char* reason = "OK";
+        if (!input.is_open())
+            ReportCoordinateFileLoad(filename, "UNCHANGED", 0U, 0U, "NOT_OPEN");
+        else if (!ReadCoordinateStatusCandidate(input, candidate, found, lineNumber, reason))
+            ReportCoordinateFileLoad(filename, "REJECTED", lineNumber, 0U, reason);
+        else if (!found)
+            ReportCoordinateFileLoad(filename, "UNCHANGED", lineNumber, 0U, "NO_KEY");
+        else
+        {
+            currentWCSIndex = candidate;
+            ReportCoordinateFileLoad(filename, "APPLIED", lineNumber, 1U, "OK");
         }
-        inStatus.close();
+    }
+    {
+        const std::string filename = "EXT_OFFSET.txt";
+        std::ifstream input(directory + filename);
+        double candidate[8]{};
+        std::size_t fields = 0U, lineNumber = 0U;
+        const char* reason = "OK";
+        if (!input.is_open())
+            ReportCoordinateFileLoad(filename, "UNCHANGED", 0U, 0U, "NOT_OPEN");
+        else if (!ReadCoordinateExtCandidate(input, candidate, fields, lineNumber, reason))
+            ReportCoordinateFileLoad(filename, "REJECTED", lineNumber, fields, reason);
+        else if (fields == 0U)
+            ReportCoordinateFileLoad(filename, "UNCHANGED", lineNumber, 0U, "EMPTY");
+        else
+        {
+            std::memcpy(extOffset, candidate, sizeof(candidate));
+            ReportCoordinateFileLoad(filename, "APPLIED", lineNumber, fields, "OK");
+        }
     }
 
-    // 讀取 EXT_OFFSET
-    std::ifstream inExt(GlobalConfig::GetInstance().NCDataDir + "EXT_OFFSET.txt");
-    if (inExt.is_open()) {
-        for (int i = 0; i < 8; i++) inExt >> extOffset[i];
-        inExt.close();
-    }
-
-
-
-
-    // 讀取三大表格
     LoadTableFromFile("WCS_TABLE.txt", m_WCSTable, 60);
     LoadTableFromFile("TOOL_OFFSET.txt", m_ToolOffset, 100);
     LoadTableFromFile("TOOL_RADIUS.txt", m_ToolRadius, 100);
     LoadTableFromFile("WORK_OFFSET.txt", m_WorkOffset, 100);
     LoadTableFromFile("REFPOINTS.txt", m_RefPoints, 100);
-
 }
 
-void CoordinateManager::SaveAllParameters() {
-    SaveWCSStatus();
-    SaveExtOffset();
-    SaveWCSTable();
-    SaveToolOffset();
-    SaveWorkOffset();
-    SaveToolRadius();
-    SaveRefPoints();
+bool CoordinateManager::SaveAllParameters() {
+    // Do not short-circuit: report every file, including failures after an
+    // earlier success. These remain independent files, not a seven-file commit.
+    RtPrintf("[COORD-SAVE][BASE53] begin files=7 perFileResult=1 verifiedBackup=1 missingBackupGuard=1 atomicReplace=0 durable=0 precision=4\n");
+    unsigned written = 0U;
+    if (SaveWCSStatus()) ++written;
+    if (SaveExtOffset()) ++written;
+    if (SaveWCSTable()) ++written;
+    if (SaveToolOffset()) ++written;
+    if (SaveWorkOffset()) ++written;
+    if (SaveToolRadius()) ++written;
+    if (SaveRefPoints()) ++written;
+    RtPrintf("[COORD-SAVE][BASE53] summary result=%s written=%u failed=%u durable=0\n",
+        written == 7U ? "WRITTEN" : (written == 0U ? "FAILED" : "PARTIAL"),
+        written, 7U - written);
+    return written == 7U;
 }
 
-// ==========================================
-// 🌟 單獨儲存函式 (RTX64 相容版)
-// ==========================================
-void CoordinateManager::SaveWCSStatus() { // 🌟 3. 函式改名
-    std::string path = GlobalConfig::GetInstance().NCDataDir + "WCS_STATUS.ini"; // 🌟 檔名改為 WCS_STATUS.ini
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open()) return;
-
-    out << "LastWCSIndex=" << currentWCSIndex << "\n";
-    out.close();
+bool CoordinateManager::SaveWCSStatus() {
+    const std::string filename = "WCS_STATUS.ini";
+    if (currentWCSIndex < 0 || currentWCSIndex >= 60)
+        return ReportCoordinateFileSave(filename, "REJECTED", "INVALID_INDEX", 0U, false);
+    std::ostringstream text;
+    text.imbue(std::locale::classic());
+    text << "LastWCSIndex=" << currentWCSIndex << "\n";
+    return WriteCoordinateFileText(filename, text, 1U);
 }
 
-void CoordinateManager::SaveExtOffset() {
-    std::string path = GlobalConfig::GetInstance().NCDataDir + "EXT_OFFSET.txt";
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open()) return;
-
-    out << std::fixed << std::setprecision(4);
-    for (int i = 0; i < 8; i++) out << extOffset[i] << (i == 7 ? "" : "\t");
-    out << "\n";
-    out.close();
+bool CoordinateManager::SaveExtOffset() {
+    const std::string filename = "EXT_OFFSET.txt";
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        if (!std::isfinite(extOffset[axis]))
+            return ReportCoordinateFileSave(filename, "REJECTED", "INVALID_NUMBER", 0U, false);
+    std::ostringstream text;
+    text.imbue(std::locale::classic());
+    text << std::fixed << std::setprecision(4);
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+        text << extOffset[axis] << (axis == 7U ? "" : "\t");
+    text << "\n";
+    return WriteCoordinateFileText(filename, text, 1U);
 }
 
-void CoordinateManager::SaveWCSTable() { SaveTableToFile("WCS_TABLE.txt", m_WCSTable); }
-void CoordinateManager::SaveToolOffset() { SaveTableToFile("TOOL_OFFSET.txt", m_ToolOffset); }
-void CoordinateManager::SaveWorkOffset() { SaveTableToFile("WORK_OFFSET.txt", m_WorkOffset); }
-void CoordinateManager::SaveToolRadius() { SaveTableToFile("TOOL_RADIUS.txt", m_ToolRadius); }
-void CoordinateManager::SaveRefPoints() { SaveTableToFile("REFPOINTS.txt", m_RefPoints); }
+bool CoordinateManager::SaveWCSTable() { return SaveTableToFile("WCS_TABLE.txt", m_WCSTable, 60U); }
+bool CoordinateManager::SaveToolOffset() {
+    const bool saved = SaveTableToFile("TOOL_OFFSET.txt", m_ToolOffset, 100U);
+    // A failed G10 leaves its accepted RAM edit intact. Even an unchanged G10
+    // must retry that failed save after RESET, rather than silently skipping it.
+    m_toolOffsetSaveRetryRequired = !saved;
+    return saved;
+}
+bool CoordinateManager::SaveWorkOffset() { return SaveTableToFile("WORK_OFFSET.txt", m_WorkOffset, 100U); }
+bool CoordinateManager::SaveToolRadius() { return SaveTableToFile("TOOL_RADIUS.txt", m_ToolRadius, 100U); }
+bool CoordinateManager::SaveRefPoints() { return SaveTableToFile("REFPOINTS.txt", m_RefPoints, 100U); }
 
-// ==========================================
-// 🌟 共用底層：表格陣列讀寫引擎
-// ==========================================
-void CoordinateManager::SaveTableToFile(const std::string& filename, const std::vector<std::vector<double>>& table) {
-    std::string path = GlobalConfig::GetInstance().NCDataDir + filename;
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open()) {
-        // 若發生此問題，通常是因為 D 槽權限不足，或是 HMI 忘記建資料夾
-        return;
+bool CoordinateManager::SaveTableToFile(const std::string& filename,
+    const std::vector<std::vector<double>>& table, std::size_t expectedRows) {
+    if ((expectedRows != 60U && expectedRows != 100U) || table.size() != expectedRows)
+        return ReportCoordinateFileSave(filename, "REJECTED", "TABLE_SHAPE", 0U, false);
+    for (std::size_t row = 0U; row < expectedRows; ++row) {
+        if (table[row].size() != 8U)
+            return ReportCoordinateFileSave(filename, "REJECTED", "TABLE_SHAPE", row, false);
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            if (!std::isfinite(table[row][axis]))
+                return ReportCoordinateFileSave(filename, "REJECTED", "INVALID_NUMBER", row, false);
     }
-
-    out << std::fixed << std::setprecision(4);
-    for (size_t i = 0; i < table.size(); i++) {
-        for (int j = 0; j < 8; j++) {
-            out << table[i][j] << (j == 7 ? "" : "\t");
-        }
-        out << "\n";
+    std::ostringstream text;
+    text.imbue(std::locale::classic());
+    text << std::fixed << std::setprecision(4);
+    for (std::size_t row = 0U; row < expectedRows; ++row) {
+        for (unsigned axis = 0U; axis < 8U; ++axis)
+            text << table[row][axis] << (axis == 7U ? "" : "\t");
+        text << "\n";
     }
-    out.close();
+    return WriteCoordinateFileText(filename, text, expectedRows);
 }
 
 void CoordinateManager::LoadTableFromFile(const std::string& filename, std::vector<std::vector<double>>& table, int maxRows) {
-    std::ifstream in(GlobalConfig::GetInstance().NCDataDir + filename);
-    if (!in.is_open()) return; // 沒檔案就放空，維持 0.0
-
-    std::string line;
-    int row = 0;
-    while (std::getline(in, line) && row < maxRows) {
-        if (line.empty() || line[0] == ';') continue;
-        std::stringstream ss(line);
-        for (int i = 0; i < 8; i++) {
-            ss >> table[row][i];
-        }
-        row++;
+    std::ifstream input(GlobalConfig::GetInstance().NCDataDir + filename);
+    if (!input.is_open())
+    {
+        ReportCoordinateFileLoad(filename, "UNCHANGED", 0U, 0U, "NOT_OPEN");
+        return;
     }
-    in.close();
+    if (maxRows <= 0 || table.size() < static_cast<std::size_t>(maxRows))
+    {
+        ReportCoordinateFileLoad(filename, "REJECTED", 0U, 0U, "TABLE_SHAPE");
+        return;
+    }
+    // Legacy files may contain fewer complete rows than the table capacity.
+    // Preserve all unprovided rows. A partial row or invalid later row rejects
+    // the entire file, including the earlier candidate rows.
+    std::vector<std::vector<double>> candidate = table;
+    std::size_t rows = 0U, lineNumber = 0U;
+    const char* reason = "OK";
+    if (!ReadCoordinateTableCandidate(input, candidate,
+        static_cast<std::size_t>(maxRows), rows, lineNumber, reason))
+    {
+        ReportCoordinateFileLoad(filename, "REJECTED", lineNumber, rows, reason);
+        return;
+    }
+    if (rows == 0U)
+    {
+        ReportCoordinateFileLoad(filename, "UNCHANGED", lineNumber, 0U, "EMPTY");
+        return;
+    }
+    // Keep the public table/row storage stable for existing readers. Validation
+    // and allocation have finished; this commit cannot fail during file I/O.
+    for (std::size_t row = 0U; row < rows; ++row)
+        std::memcpy(table[row].data(), candidate[row].data(), 8U * sizeof(double));
+    ReportCoordinateFileLoad(filename, "APPLIED", lineNumber, rows, "OK");
 }
 int CoordinateManager::GetCurrentWCSGCode() const
 {

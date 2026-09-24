@@ -2567,11 +2567,12 @@ namespace HMI_Bridge
             // 🌟 3. 判斷是否為旋轉軸 (旋轉軸永遠是度數 deg，絕對不可以套用 inch 轉換)
             double axisScale = (type == AxisType::ROTARY || type == AxisType::ROTARY_CONTINUOUS) ? 1.0 : unitScale;
 
-            double currentComp = axis.currentCompOffset_unit;
-
-            // 🌟 4. 扣除補償量，並套用公英制倍率
-            double displayMCS = (nc->CoordSys.actualMCS[i] - currentComp) * axisScale;
-            double displayWCS = (currentWCS[i] - currentComp) * axisScale;
+            // PBC-2: Motion publishes nominal-equivalent MCS after removing
+            // mechanical compensation in machine-axis space. GetActualWCS
+            // already inversely rotates/scales that point. NEVER subtract an
+            // unrotated machine-axis correction again in WCS (or in DTG).
+            double displayMCS = nc->CoordSys.actualMCS[i] * axisScale;
+            double displayWCS = currentWCS[i] * axisScale;
 
             // 把 DTG 塞進共享記憶體，同樣套用倍率
             pShm->NC_Status.DistanceToGo[i] = currentDTG[i] * axisScale;

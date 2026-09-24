@@ -1,56 +1,55 @@
 ﻿#pragma once
+#include "MechanicalCompensationCoordinates.h"
+#include <atomic>
 #include <vector>
-#include <cmath>
 
-// 🌟 1. 刪除 #include "MotionCore.h" 或類似的引入
-// 🌟 2. 改用「前置宣告」來打破循環引用
 struct AxisContext;
 struct AxisCommand;
-// ==========================================
-// 單軸的補償參數結構
-// ==========================================
-struct AxisCompensation {
-    // --- 1. 背隙補償 (Backlash) ---
-    bool enableBacklash = false;
-    // 🌟 將單一參數改成雙向獨立參數
-    double backlashAmount_Pos_mm = 0.0; // 正向補償量
-    double backlashAmount_Neg_mm = 0.0; // 負向補償量
-    double backlashSpeed_mm_s = 2.0;    // 漸變速度 (可視需求調整)
-    // 背隙動態狀態 (內部計算用)
-    int lastDir = 1;                  // 1=正轉, -1=反轉
-    double currentBacklash_mm = 0.0;  // 當前已注入的背隙量
-    double targetBacklash_mm = 0.0;   // 目標背隙量
 
-    // --- 2. 節距補償 (Pitch Error) ---
-    bool enablePitch = false;
-    double pitchStartPos_mm = 0.0;    // 表格起點的機械座標 (例如 0.0)
-    double pitchStep_mm = 10.0;       // 表格每一格的間距 (例如每 10mm 補一格)
-    double currentPitch_mm = 0.0;  // 目前已注入的節距補償量
-    double targetPitch_mm = 0.0;   // 目標節距補償量
-    double pitchSpeed_mm_s = 2.0; // 節距補償的平滑速度
-    std::vector<double> pitchErrors_Pos; // 正向誤差表
-    std::vector<double> pitchErrors_Neg; // 負向誤差表
-};
-
-// ==========================================
-// 補償引擎類別
-// ==========================================
-class CompensationEngine {
+// PBC-2: nominal feedback / completion read-side integration is installed.
+// Non-zero runtime injection remains LOCKED. HOME, RESET, Servo transitions,
+// owner/send authority and held-position control still require integration.
+// Changing this constant alone is NOT an implementation of those contracts.
+class CompensationEngine
+{
 public:
-    CompensationEngine();
+    static constexpr bool MotionIntegrationReleased = false;
+    CompensationEngine() = default;
 
-    // 🌟 初始化介面更新：加入 backlashSpeed 與 pitchSpeed
-    //void InitAxisCompensation(int axisIndex, bool enBacklash, double b_Pos, double b_Neg, double b_Speed, bool enPitch, double step_mm, double p_Speed);
-    void InitAxisCompensation(int axisIndex, bool enBacklash, double b_Pos, double b_Neg, double b_Speed, bool enPitch, double startPos, double step_mm, double p_Speed);
-    // 🌟 設定雙向節距表
-    void SetPitchTables(int axisIndex, const std::vector<double>& posErrors, const std::vector<double>& negErrors);
+    bool InitAxisCompensation(int axisIndex, bool enBacklash, double b_Pos,
+        double b_Neg, double b_Speed, bool enPitch, double startPos,
+        double step, double p_Speed);
+    bool SetAxisPolicy(int axisIndex, const pbc::Policy& policy);
+    bool SetPitchTables(int axisIndex, const std::vector<double>& pos,
+        const std::vector<double>& neg);
+    bool SetPitchTablePos(int axisIndex, const std::vector<double>& errors);
+    bool SetPitchTableNeg(int axisIndex, const std::vector<double>& errors);
 
-    // 因為這裡只是「傳遞參考 (&)」，編譯器不需要知道結構的完整大小，所以前置宣告就足夠了！
-    void ApplyCompensation(int axisIndex, AxisContext& axis, AxisCommand& cmd, double dt_sec);
+    // Boot thread only. All axis candidates validate before any commit.
+    // Success seals the configuration for the lifetime of this engine.
+    bool FinalizeConfiguration(const std::vector<AxisContext>& axes, pbc::Diagnostic& d);
+    bool HasEnabledPitch() const noexcept;
+    bool IsSealed() const noexcept { return m_sealed.load(std::memory_order_acquire); }
+    unsigned EnabledAxisCount() const noexcept;
+    unsigned CoordinateContractChecks() const noexcept { return m_coordinateContractChecks; }
 
-    void SetPitchTablePos(int axisIndex, const std::vector<double>& errors);
-    void SetPitchTableNeg(int axisIndex, const std::vector<double>& errors);
+    // Existing caller compatibility. The only released runtime path in PBC-1
+    // is all-disabled/no-offset and is bit-for-bit command preserving.
+    bool ApplyCompensation(int axisIndex, AxisContext& axis, AxisCommand& cmd, double dt);
 
 private:
-    AxisCompensation m_CompData[8];
+    struct Pending
+    {
+        pbc::Config config{};
+        std::vector<double> positive;
+        std::vector<double> negative;
+        bool initialized = false;
+        bool explicitPolicy = false;
+    };
+    std::array<Pending, pbc::AxisCount> m_pending{};
+    std::array<pbc::AxisModel, pbc::AxisCount> m_models{};
+    std::array<bool, pbc::AxisCount> m_runtimeFaultReported{};
+    std::atomic<bool> m_sealed{ false };
+    unsigned m_coordinateContractChecks = 0U; // boot writer only
+    bool CanConfigure(int axisIndex) const noexcept;
 };

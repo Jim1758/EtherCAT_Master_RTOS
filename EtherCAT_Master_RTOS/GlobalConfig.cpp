@@ -15,11 +15,126 @@
 #include "NCElectrodeRotationConfig.h"
 #include "AlarmManager.h"
 #include <cmath>
+#include "CompensationConfigIO.h"
+
+
+namespace
+{
+    bool PbcBootFailure(int alarm, const pbc::Diagnostic& d, const char* source)
+    {
+        DEBUG_PRINT("[PBC-1][AL%d] source=%s axis=%d reason=%s lineOrRow=%u column=%u\n",
+            alarm, source, d.axis, pbc::ErrorName(d.error),
+            static_cast<unsigned>(d.line), static_cast<unsigned>(d.column));
+        AlarmManager::GetInstance().Trigger(alarm, 0, d.axis);
+        return false;
+    }
+
+    bool ReadPbcAxisParameters(const pbc::ParameterMap& values, int index,
+        AxisContext& axis, CompensationEngine& engine, pbc::Diagnostic& d)
+    {
+        d = pbc::Diagnostic{};
+        d.axis = index;
+        const std::string key = std::to_string(index) + "_";
+        pbc::Config config{};
+        config.policy.periodic = axis.axisType == AxisType::ROTARY ||
+            axis.axisType == AxisType::ROTARY_CONTINUOUS;
+        if (!pbc::Flag(values, key + "EnableBacklash", false, config.backlash, d) ||
+            !pbc::Flag(values, key + "EnablePitch", false, config.pitch, d) ||
+            !pbc::Number(values, key + "backlashAmount_Pos_mm", 0.0, config.backlashPositive, d) ||
+            !pbc::Number(values, key + "backlashAmount_Neg_mm", 0.0, config.backlashNegative, d) ||
+            !pbc::Number(values, key + "backlashSpeed", 3.0, config.backlashSpeed, d) ||
+            !pbc::Number(values, key + "PitchStartPos", 0.0, config.pitchStart, d) ||
+            !pbc::Number(values, key + "PitchStep", 10.0, config.pitchStep, d) ||
+            !pbc::Number(values, key + "PitchSpeed_mm_s", 3.0, config.pitchSpeed, d) ||
+            !pbc::Number(values, key + "CompMaxAbsOffset_unit", 0.1, config.policy.maxAbsOffset, d) ||
+            !pbc::Number(values, key + "CompMaxAbsSlope", 0.01, config.policy.maxAbsSlope, d) ||
+            !pbc::Flag(values, key + "PitchPeriodic", config.policy.periodic, config.policy.periodic, d) ||
+            !pbc::Flag(values, key + "CompAllowDirectionalPitchWithBacklash", false,
+                config.policy.allowDirectionalPitchWithBacklash, d)) return false;
+        if (config.backlashPositive < 0.0 || config.backlashNegative < 0.0 ||
+            config.backlashSpeed <= 0.0 || config.backlashSpeed > 100.0 ||
+            config.pitchStep <= 0.0 || config.pitchSpeed <= 0.0 || config.pitchSpeed > 100.0 ||
+            config.policy.maxAbsOffset <= 0.0 || config.policy.maxAbsOffset > 1.0 ||
+            config.policy.maxAbsSlope <= 0.0 || config.policy.maxAbsSlope > 0.1)
+        { d.error = pbc::Error::ParameterRange; return false; }
+        if (!engine.InitAxisCompensation(index, config.backlash, config.backlashPositive,
+                config.backlashNegative, config.backlashSpeed, config.pitch,
+                config.pitchStart, config.pitchStep, config.pitchSpeed) ||
+            !engine.SetAxisPolicy(index, config.policy))
+        { d.error = pbc::Error::ConfigurationSealed; return false; }
+        axis.enableBacklash = config.backlash;
+        axis.backlashAmount_Pos_mm = config.backlashPositive;
+        axis.backlashAmount_Neg_mm = config.backlashNegative;
+        axis.backlashSpeed = config.backlashSpeed;
+        axis.enablePitch = config.pitch;
+        axis.pitchStartPos_mm = config.pitchStart;
+        axis.pitchStep_mm = config.pitchStep;
+        axis.pitchSpeed_mm_s = config.pitchSpeed;
+        return true;
+    }
+
+    bool StagePbcPitchPair(const std::string& directory, CompensationEngine& engine)
+    {
+        if (engine.IsSealed())
+        {
+            pbc::Diagnostic d{}; d.error = pbc::Error::ConfigurationSealed;
+            return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID, d, "TABLE_PAIR");
+        }
+        pbc::PitchColumns positive{}, negative{};
+        pbc::Diagnostic posDiagnostic{}, negDiagnostic{};
+        const bool posOk = pbc::ReadPitchFile(directory + "PITCH_TABLE_Pos.txt", positive, posDiagnostic);
+        const bool negOk = pbc::ReadPitchFile(directory + "PITCH_TABLE_Neg.txt", negative, negDiagnostic);
+        bool pairOk = posOk && negOk;
+        pbc::Diagnostic problem = !posOk ? posDiagnostic : negDiagnostic;
+        const char* source = !posOk ? "PITCH_TABLE_Pos.txt" : "PITCH_TABLE_Neg.txt";
+        if (pairOk && positive[0].size() != negative[0].size())
+        { pairOk = false; problem.error = pbc::Error::TablePair; source = "TABLE_PAIR_ROWS"; }
+        if (!pairOk)
+        {
+            if (engine.HasEnabledPitch())
+                return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_TABLE_INVALID, problem, source);
+            DEBUG_PRINT("[PBC-1] UNUSED_TABLE_REJECT source=%s reason=%s line=%u; no pitch axis enabled\n",
+                source, pbc::ErrorName(problem.error), static_cast<unsigned>(problem.line));
+            // Neither direction is committed. No mixed new/old table state.
+            positive = pbc::PitchColumns{};
+            negative = pbc::PitchColumns{};
+        }
+        for (std::size_t i = 0U; i < pbc::AxisCount; ++i)
+        {
+            if (!engine.SetPitchTables(static_cast<int>(i), positive[i], negative[i]))
+            {
+                pbc::Diagnostic d{}; d.error = pbc::Error::Allocation; d.axis = static_cast<int>(i);
+                return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID, d, "TABLE_PAIR_STAGE");
+            }
+        }
+        if (pairOk)
+            DEBUG_PRINT("[PBC-1] TABLE_PAIR=PARSED rows=%u columns=8; dormant data is not calibration acceptance\n",
+                static_cast<unsigned>(positive[0].size()));
+        return true;
+    }
+}
 
 bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisContext>& axis, MotionCore& motion)
 {
-    //讀取參數確定軸數量-----------------------------------------------------------------
-    int axisCount = (int)ConfigUtil::ReadParam(filePath, "AxisCount", 0.0);
+    // PBC-1: parsing/validation happens before resize or compensation mutation.
+    if (motion.m_CompEngine.IsSealed())
+    {
+        pbc::Diagnostic d{}; d.error = pbc::Error::ConfigurationSealed;
+        return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID, d, "AxisConfig.txt");
+    }
+    pbc::ParameterMap pbcParameters;
+    pbc::Diagnostic pbcDiagnostic{};
+    if (!pbc::ReadParameterFile(filePath, pbcParameters, pbcDiagnostic))
+        return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID, pbcDiagnostic, "AxisConfig.txt");
+    double requestedAxisCount = 0.0;
+    if (!pbc::Number(pbcParameters, "AxisCount", 0.0, requestedAxisCount, pbcDiagnostic) ||
+        requestedAxisCount < 1.0 || requestedAxisCount > 8.0 ||
+        std::floor(requestedAxisCount) != requestedAxisCount)
+    {
+        if (pbcDiagnostic.error == pbc::Error::None) pbcDiagnostic.error = pbc::Error::AxisIndex;
+        return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID, pbcDiagnostic, "AxisConfig.txt");
+    }
+    int axisCount = static_cast<int>(requestedAxisCount);
     System_axisCount = axisCount;
     DEBUG_PRINT("LoadAxisConfig Axis Count>>%d\n", axisCount);
     if (axisCount == 0)
@@ -117,21 +232,11 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
             axis[i].rotaryModulo = ConfigUtil::ReadParam(filePath, prefix + "RotaryModulo", 360.0);
             axis[i].useShortestPath = (ConfigUtil::ReadParam(filePath, prefix + "ShortestPath", 0.0) == 1.0);
 
-            axis[i].enableBacklash = (ConfigUtil::ReadParam(filePath, prefix + "EnableBacklash", 0.0) == 1.0);
-            axis[i].backlashAmount_Pos_mm = ConfigUtil::ReadParam(filePath, prefix + "backlashAmount_Pos_mm", 0.0);
-            axis[i].backlashAmount_Neg_mm = ConfigUtil::ReadParam(filePath, prefix + "backlashAmount_Neg_mm", 0.0);
-            axis[i].backlashSpeed = ConfigUtil::ReadParam(filePath, prefix + "backlashSpeed", 3);
-
-
-            axis[i].enablePitch = (ConfigUtil::ReadParam(filePath, prefix + "EnablePitch", 0.0) == 1.0);
-            axis[i].pitchStartPos_mm = ConfigUtil::ReadParam(filePath, prefix + "PitchStartPos", 0.0);
-            axis[i].pitchStep_mm = ConfigUtil::ReadParam(filePath, prefix + "PitchStep", 10.0);
-            axis[i].pitchSpeed_mm_s = ConfigUtil::ReadParam(filePath, prefix + "PitchSpeed_mm_s", 3);
-
-
-
-            motion.m_CompEngine.InitAxisCompensation(i, axis[i].enableBacklash, axis[i].backlashAmount_Pos_mm, axis[i].backlashAmount_Neg_mm, axis[i].backlashSpeed, axis[i].enablePitch, axis[i].pitchStartPos_mm, axis[i].pitchStep_mm, axis[i].pitchSpeed_mm_s);
-
+            // Native units are mm for linear axes, degrees for rotary axes.
+            // Legacy key spelling is retained; no automatic unit conversion.
+            if (!ReadPbcAxisParameters(pbcParameters, i, axis[i], motion.m_CompEngine, pbcDiagnostic))
+                return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID,
+                    pbcDiagnostic, "AxisConfig.txt/compensation");
 
 
             //極限設定-------------------------------------------------------------
@@ -1037,35 +1142,24 @@ void GlobalConfig::LoadFromFile(const std::string& filePath)
 // 🌟 增加一個 bool isPositive 參數
 bool GlobalConfig::LoadPitchTable(const std::string& filePath, CompensationEngine& compEngine, bool isPositive)
 {
-    std::ifstream in(filePath);
-    if (!in.is_open()) {
-        DEBUG_PRINT("[WARN] File not found: %s\n", filePath.c_str());
+    // Compatibility staging API only. Runtime uses sealed, paired data;
+    // this function never commits one direction into a running model.
+    if (compEngine.IsSealed()) return false;
+    pbc::PitchColumns columns{};
+    pbc::Diagnostic d{};
+    if (!pbc::ReadPitchFile(filePath, columns, d))
+    {
+        DEBUG_PRINT("[PBC-1] TABLE_REJECT source=%s reason=%s line=%u column=%u\n",
+            filePath.c_str(), pbc::ErrorName(d.error),
+            static_cast<unsigned>(d.line), static_cast<unsigned>(d.column));
         return false;
     }
-
-    std::string line;
-    std::vector<double> pitchData[8]; // 暫存 8 軸的資料
-
-    while (std::getline(in, line)) {
-        if (line.empty() || line[0] == ';' || line[0] == '/' || line[0] == '#') continue;
-
-        std::stringstream ss(line);
-        double val;
-        for (int i = 0; i < 8; ++i) {
-            if (ss >> val) pitchData[i].push_back(val);
-            else pitchData[i].push_back(0.0);
-        }
+    for (std::size_t i = 0U; i < pbc::AxisCount; ++i)
+    {
+        const bool staged = isPositive ? compEngine.SetPitchTablePos(static_cast<int>(i), columns[i]) :
+            compEngine.SetPitchTableNeg(static_cast<int>(i), columns[i]);
+        if (!staged) return false;
     }
-    in.close();
-
-    // 🌟 根據 isPositive 決定呼叫哪一個 Setter
-    for (int i = 0; i < 8; ++i) {
-        if (!pitchData[i].empty()) {
-            if (isPositive) compEngine.SetPitchTablePos(i, pitchData[i]);
-            else compEngine.SetPitchTableNeg(i, pitchData[i]);
-        }
-    }
-
     return true;
 }
 
@@ -1081,7 +1175,7 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
     if (!GlobalConfig::GetInstance().LoadAxisConfig(axisConfigPath, master.m_Axes, master.m_Motion))
     {
         DEBUG_PRINT("LoadConfig Error！>>AxisConfig.txt\n");
-        return -1;
+        return false; // PBC-1: bool(-1) is true, never use it for failure.
     }
 
 
@@ -1089,22 +1183,31 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
     if (!GlobalConfig::GetInstance().LoadPIDConfig(pidConfigPath, master.m_Axes, master.m_Motion))
     {
         DEBUG_PRINT("LoadConfig Error！>>PIDConfig.txt\n");
-        return -1;
+        return false; // PBC-1: bool(-1) is true, never use it for failure.
     }
 
     std::string speedConfigPath = GlobalConfig::GetInstance().ParameterDir + "SpeedConfig.txt";
     if (!GlobalConfig::GetInstance().LoadSpeedConfig(speedConfigPath, master.m_Axes, master.m_Motion))
     {
         DEBUG_PRINT("LoadConfigPathConfig Error！>>SpeedConfig.txt\n");
-        return -1;
+        return false; // PBC-1: bool(-1) is true, never use it for failure.
     }
 
-    // 2. 🌟 讀取螺距誤差表，並寫入 CompensationEngine
-    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE_Pos.txt", master.m_Motion.m_CompEngine, true);
-
-    // 2. 🌟 讀取螺距誤差表，並寫入 CompensationEngine
-    GlobalConfig::LoadPitchTable(GlobalConfig::GetInstance().ParameterDir + "PITCH_TABLE_Neg.txt", master.m_Motion.m_CompEngine, false);
-
+    // PBC-1: validate a complete pair and every axis before sealing the model.
+    if (!StagePbcPitchPair(GlobalConfig::GetInstance().ParameterDir, master.m_Motion.m_CompEngine))
+        return false;
+    pbc::Diagnostic compensationDiagnostic{};
+    if (!master.m_Motion.m_CompEngine.FinalizeConfiguration(master.m_Axes, compensationDiagnostic))
+    {
+        const int code = compensationDiagnostic.error == pbc::Error::IntegrationPending ?
+            AlarmManager::MECHANICAL_COMPENSATION_NOT_INTEGRATED :
+            AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID;
+        return PbcBootFailure(code, compensationDiagnostic, "COMPENSATION_FINALIZE");
+    }
+    DEBUG_PRINT("[PBC-1] CONFIG=PASS axes=%u enabled=%u MOTION_INTEGRATION=LOCKED\n",
+        static_cast<unsigned>(master.m_Axes.size()), master.m_Motion.m_CompEngine.EnabledAxisCount());
+    DEBUG_PRINT("[PBC-2] COORDINATE_CONTRACT=PASS checks=%u FEEDBACK=NOMINAL BEFORE_WCS=1 MOTION_INTEGRATION=LOCKED\n",
+        master.m_Motion.m_CompEngine.CoordinateContractChecks());
 
     //坐標系初始化
     master.m_NC->CoordSys.SetWCS(master.m_NC->CoordSys.GetCurrentWCSGCode(), master.m_NC);
@@ -1125,7 +1228,7 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
     if (!GlobalConfig::GetInstance().LoadHomeConfig(HomeConfigPath, master.m_Axes, master.m_Motion, master.m_NC))
     {
         DEBUG_PRINT("LoadConfig Error！>>HomeConfig.txt\n");
-        return -1;
+        return false; // PBC-1: bool(-1) is true, never use it for failure.
     }
 
 
@@ -1135,7 +1238,7 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
     // Snapshot / History 固定放在：
     //
     // GlobalConfig::NCDataDir
-    // = D:\EtherCAT_Master_Data\Data\
+    // = D:\EtherCAT_Master_Data\Data\ (directory)
     //
     // 啟動時會載入「上一次成功 HOME」供診斷，
     // 但一定強制所有軸 isHomed=false。

@@ -634,11 +634,169 @@ namespace
         return true;
     }
 
+    // BASE69 transports a canonical G90/G91 rotary feed, already resolved in
+    // native pulse space. Prove G90 authorship/policy before rebuilding finite
+    // canonical geometry and degree speed; RT never chooses a second path.
+    bool IsMotionRotaryFeedGeometryValid(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts) noexcept
+    {
+        if (!IsMotionRotaryFeedSourceAllowed(command) || contexts == nullptr ||
+            contexts->size() > 8U) return false;
+        const unsigned selected = static_cast<unsigned>(command.axisIndices[0]);
+        if (selected >= contexts->size()) return false;
+        const AxisContext& axis = (*contexts)[selected];
+        if (!axis.isExist || axis.axisIndex != static_cast<int>(selected) || axis.axisType != AxisType::ROTARY ||
+            !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+            !std::isfinite(axis.rotaryModulo) || axis.rotaryModulo <= 0.0 ||
+            !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ||
+            !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ||
+            !std::isfinite(axis.G00_dec_time) || axis.G00_dec_time < 0.0 ||
+            command.accTime != (axis.G00_acc_time < 0.001 ? 0.2 : axis.G00_acc_time) ||
+            command.decTime != (axis.G00_dec_time < 0.001 ? 0.2 : axis.G00_dec_time) ||
+            command.mem_ratio[0] != axis.resolution_PPR / axis.finalLead ||
+            command.dir != 0 || command.startRadius != 0.0 || command.endRadius != 0.0 ||
+            command.centerPos[0] != 0.0 || command.centerPos[1] != 0.0 ||
+            command.mem_startAngle != 0.0 || command.mem_totalAngle != 0.0 ||
+            command.mem_centerX != 0.0 || command.mem_centerY != 0.0 ||
+            command.cncPrefixVelocityPPS != 0.0) return false;
+        const bool absolute = command.sourceIsAbsoluteMode;
+        for (unsigned slot = 1U; slot < 8U; ++slot)
+            if ((slot > (absolute ? 3U : 1U) &&
+                    (command.mem_startPos[slot] != 0.0 || command.mem_ratio[slot] != 0.0)) ||
+                command.targetPos[slot] != 0.0 || command.axisIndices[slot] != 0) return false;
+        if (absolute)
+        {
+            const double authoredWCS = command.mem_startPos[2];
+            const double authoredMCS = authoredWCS +
+                NCTranslationAxisOffsetMM(command.sourceTranslation, selected);
+            NCRotaryAbsoluteFeedTarget resolved{};
+            if (!std::isfinite(authoredWCS) || !std::isfinite(authoredMCS) ||
+                !NCRotaryFeedDetail::SameBits(authoredMCS, command.mem_ratio[2]) ||
+                !NCRotaryFeedDetail::SameBits(command.mem_startPos[3], axis.rotaryModulo) ||
+                !NCRotaryFeedDetail::SameBits(command.mem_ratio[3], axis.useShortestPath ? 1.0 : 0.0) ||
+                !TryResolveNCRotaryAbsoluteFeedTarget(command.mem_startPos[1],
+                    command.mem_startPos[0], authoredMCS, command.mem_ratio[0],
+                    axis.useShortestPath, axis.rotaryModulo, resolved) || !resolved.valid ||
+                !NCRotaryFeedDetail::SameBits(resolved.endPulse, command.targetPos[0]) ||
+                !NCRotaryFeedDetail::SameBits(resolved.endMCS, command.mem_ratio[1]) ||
+                resolved.sweepDeg != command.mem_totalDist) return false;
+        }
+        NCRotaryFeedLineInput input{};
+        NCRotaryFeedLineValue geometry{};
+        input.axisIdentity = command.sourceTranslation.axisIdentity;
+        input.axisMask = 1U << selected;
+        input.startPulse[selected] = command.mem_startPos[0];
+        input.endPulse[selected] = command.targetPos[0];
+        input.startMCS[selected] = command.mem_startPos[1];
+        input.endMCS[selected] = command.mem_ratio[1];
+        input.feedDegMin = command.mem_radius;
+        input.pulsePerDegree = command.mem_ratio[0];
+        input.maxVelocityPPS = axis.maxVel_PPS;
+        (void)BuildNCRotaryFeedLine(input, geometry);
+        return geometry.valid && geometry.sweepDeg == command.mem_totalDist &&
+            command.targetVel == geometry.velocityPPS &&
+            std::isfinite(command.targetVel / command.accTime) &&
+            std::isfinite(command.targetVel / command.decTime);
+    }
+
+    // Rebuild the common-time line before any group state is mutated. G91
+    // retains its authored deltas; G90 independently resolves the frozen raw
+    // WCS/MCS targets and C policy, then proves the transported effective path.
+    bool IsMotionZCFeedGeometryValid(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts) noexcept
+    {
+        if (!IsMotionZCFeedSourceAllowed(command) || contexts == nullptr ||
+            contexts->size() < 4U || contexts->size() > 8U ||
+            command.dir != 0 || command.startRadius != 0.0 || command.endRadius != 0.0 ||
+            command.centerPos[0] != 0.0 || command.centerPos[1] != 0.0 ||
+            command.mem_centerX != 0.0 || command.mem_centerY != 0.0 ||
+            command.cncPrefixVelocityPPS != 0.0) return false;
+        const bool absolute = command.sourceIsAbsoluteMode;
+        for (unsigned slot = 2U; slot < 8U; ++slot)
+            if (command.axisIndices[slot] != 0 || command.targetPos[slot] != 0.0 ||
+                (!absolute && slot > 4U &&
+                    (command.mem_startPos[slot] != 0.0 || command.mem_ratio[slot] != 0.0)))
+                return false;
+        NCZCFeedLineInput input{};
+        NCZCFeedLineValue geometry{};
+        input.axisIdentity = command.sourceTranslation.axisIdentity;
+        input.axisMask = (1U << 2U) | (1U << 3U);
+        for (unsigned slot = 0U; slot < 2U; ++slot)
+        {
+            const unsigned selected = slot + 2U;
+            const AxisContext& axis = (*contexts)[selected];
+            if (!axis.isExist || axis.axisIndex != static_cast<int>(selected) ||
+                axis.axisType != (selected == 2U ? AxisType::LINEAR : AxisType::ROTARY) ||
+                !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+                !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+                command.mem_ratio[slot] != axis.resolution_PPR / axis.finalLead ||
+                (selected == 3U && (!std::isfinite(axis.rotaryModulo) || axis.rotaryModulo <= 0.0))) return false;
+            input.startPulse[selected] = command.mem_startPos[slot];
+            input.endPulse[selected] = command.targetPos[slot];
+            input.startMCS[selected] = command.mem_startPos[slot + 2U];
+            input.endMCS[selected] = command.mem_ratio[slot + 2U];
+        }
+        if (absolute)
+        {
+            const double requestedZMCS = command.mem_startPos[5] +
+                NCTranslationAxisOffsetMM(command.sourceTranslation, 2U);
+            const double requestedCMCS = command.mem_ratio[5] +
+                NCTranslationAxisOffsetMM(command.sourceTranslation, 3U);
+            const AxisContext& rotary = (*contexts)[3];
+            NCZCAbsoluteFeedTarget resolved{};
+            if (!std::isfinite(command.mem_startPos[5]) || !std::isfinite(command.mem_ratio[5]) ||
+                !std::isfinite(requestedZMCS) || !std::isfinite(requestedCMCS) ||
+                !NCZCFeedDetail::SameBits(requestedZMCS, command.mem_startPos[6]) ||
+                !NCZCFeedDetail::SameBits(requestedCMCS, command.mem_ratio[6]) ||
+                !NCZCFeedDetail::SameBits(command.mem_startPos[7], rotary.rotaryModulo) ||
+                !NCZCFeedDetail::SameBits(command.mem_ratio[7], rotary.useShortestPath ? 1.0 : 0.0) ||
+                !TryResolveNCZCAbsoluteFeedTarget(command.mem_startPos[2], command.mem_startPos[0],
+                    command.mem_startPos[3], command.mem_startPos[1], requestedZMCS, requestedCMCS,
+                    command.mem_ratio[0], command.mem_ratio[1], rotary.useShortestPath,
+                    rotary.rotaryModulo, resolved) || !resolved.valid ||
+                !NCZCFeedDetail::SameBits(resolved.endZPulse, command.targetPos[0]) ||
+                !NCZCFeedDetail::SameBits(resolved.endCPulse, command.targetPos[1]) ||
+                !NCZCFeedDetail::SameBits(resolved.endZMCS, command.mem_ratio[2]) ||
+                !NCZCFeedDetail::SameBits(resolved.endCMCS, command.mem_ratio[3]) ||
+                !NCZCFeedDetail::SameBits(resolved.deltaZMM, command.mem_startPos[4]) ||
+                !NCZCFeedDetail::SameBits(resolved.deltaCDeg, command.mem_ratio[4])) return false;
+            input.absolute = true;
+            input.absoluteTargetZMCS = requestedZMCS;
+            input.absoluteTargetCMCS = requestedCMCS;
+            input.rotaryModulo = rotary.rotaryModulo;
+            input.rotaryShortestPath = rotary.useShortestPath;
+        }
+        input.deltaZMM = command.mem_startPos[4];
+        input.deltaCDeg = command.mem_ratio[4];
+        input.feedMMMin = command.mem_radius;
+        input.pulsePerMM = command.mem_ratio[0];
+        input.pulsePerDegree = command.mem_ratio[1];
+        input.maxLinearVelocityPPS = (*contexts)[2].maxVel_PPS;
+        input.maxRotaryVelocityPPS = (*contexts)[3].maxVel_PPS;
+        input.linearAccTime = (*contexts)[2].G00_acc_time;
+        input.rotaryAccTime = (*contexts)[3].G00_acc_time;
+        input.linearDecTime = (*contexts)[2].G00_dec_time;
+        input.rotaryDecTime = (*contexts)[3].G00_dec_time;
+        (void)BuildNCZCFeedLine(input, geometry);
+        return geometry.valid && command.mem_totalDist == geometry.lengthPulse &&
+            command.mem_startAngle == geometry.nominalSeconds &&
+            command.mem_totalAngle == geometry.rotaryFeedDegMin &&
+            command.targetVel == geometry.velocityPPS && command.accTime == geometry.accTime &&
+            command.decTime == geometry.decTime &&
+            std::isfinite(command.targetVel / command.accTime) &&
+            std::isfinite(command.targetVel / command.decTime);
+    }
+
     bool IsMotionCommandConsumerGeometryValid(
         const MotionCommand& command,
         const std::vector<AxisContext>* contexts) noexcept
     {
         if (!IsMotionBaseArcPlaneSourceAllowed(command)) return false;
+        if (command.pathCoreZCFeedExactStop)
+            return IsMotionZCFeedGeometryValid(command, contexts);
+        if (command.pathCoreRotaryFeedExactStop)
+            return IsMotionRotaryFeedGeometryValid(command, contexts);
         if ((!IsNCTranslationSnapshotEmpty(command.sourceTranslation) ||
                 command.sourceToolRadiusMode != 40) &&
             !IsMotionFixedTranslationSourceAllowed(command)) return false;
@@ -830,7 +988,7 @@ namespace
         const AxisContext& axis) noexcept
     {
         const double followingError =
-            std::abs(axis.currentCmdPos - axis.currentActPos);
+            std::abs(axis.GetMechanicalFollowingErrorPulse());
         return
             axis.isExist &&
             axis.isServoOn &&
@@ -840,6 +998,7 @@ namespace
             !axis.isLagAlarm &&
             axis.state == MotionState::MotionState_IDLE &&
             axis.inPosition &&
+            axis.IsMechanicalCompensationReadyForCompletion() &&
             std::isfinite(axis.currentCmdPos) &&
             std::isfinite(axis.currentActPos) &&
             std::isfinite(axis.logicalCmdPos) &&
@@ -7222,6 +7381,10 @@ static std::uint64_t FoldCommandPathModeTransportFingerprint(
         fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E434445ULL);
     if (command.pathCoreFeedExactStop)
         fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E434454ULL);
+    if (command.pathCoreRotaryFeedExactStop)
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433638ULL);
+    if (command.pathCoreZCFeedExactStop)
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433730ULL);
 
     const int boundedAxisCount =
         (command.axisCount < 0)
@@ -10924,16 +11087,18 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     if (m_pCoordMgr != nullptr)
     {
         double tempMCS[8] = { 0.0 };
+        double tempUnwrappedMCS[8] = { 0.0 }; // PBC-2 native DTG feedback
 
         for (size_t i = 0; i < 8; ++i)
         {
             if (i < m_pContexts->size())
             {
                 AxisContext& axis = (*m_pContexts)[i];
-                double rawPulse = axis.currentActPos;
+                double rawPulse = axis.GetNominalActualPositionPulse(); // PBC-2: inverse compensation BEFORE WCS
                 double unitsPerPulse = (axis.resolution_PPR > 0) ? (axis.finalLead / axis.resolution_PPR) : 0.0;
 
                 double physicalPos = rawPulse * unitsPerPulse;
+                tempUnwrappedMCS[i] = physicalPos;
 
                 // 🌟 [新增顯示過濾] 如果是標準旋轉軸，顯示時強制 Modulo 360
                 if (axis.axisType == AxisType::ROTARY)
@@ -10957,7 +11122,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
             }
         }
 
-        m_pCoordMgr->UpdateActualMCS(tempMCS);
+        m_pCoordMgr->UpdateActualMCS(tempMCS, tempUnwrappedMCS);
     }
 
 
@@ -11223,8 +11388,8 @@ void MotionCore::ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputIn
 
         // 2. 基礎數值匯出
         outDebugArray[i].CmdPos = axis.currentCmdPos * (outputInMM ? unitsPerPulse : 1.0);
-        outDebugArray[i].ActPos = axis.currentActPos * (outputInMM ? unitsPerPulse : 1.0);
-        outDebugArray[i].LagError = (axis.currentCmdPos - axis.currentActPos) * (outputInMM ? unitsPerPulse : 1.0);
+        outDebugArray[i].ActPos = axis.GetNominalActualPositionPulse() * (outputInMM ? unitsPerPulse : 1.0);
+        outDebugArray[i].LagError = axis.GetMechanicalFollowingErrorPulse() * (outputInMM ? unitsPerPulse : 1.0);
         outDebugArray[i].CmdVel = axis.currentCmdVel * (outputInMM ? unitsPerPulse : 1.0);
         outDebugArray[i].ActVel = axis.currentActVel * (outputInMM ? unitsPerPulse : 1.0);
         outDebugArray[i].MaxLagLimit = axis.pid.MaxLag * (outputInMM ? unitsPerPulse : 1.0);
@@ -12571,9 +12736,16 @@ bool MotionCore::IsFixedPlanarLineEndpointScope() const noexcept
     for (int slot = 0; slot < source.axisCount; ++slot)
     {
         const int axis = source.axisIndices[slot];
-        if (axis < 0 || axis > 2 || static_cast<std::size_t>(axis) >= m_pContexts->size() ||
+        const bool rotary = source.pathCoreRotaryFeedExactStop;
+        const bool zc = source.pathCoreZCFeedExactStop;
+        if (axis < 0 || axis >= MAX_AXES || static_cast<std::size_t>(axis) >= m_pContexts->size() ||
             m_Group.axisIndices[slot] != axis || (mask & (1U << axis)) != 0U ||
-            !(*m_pContexts)[axis].isExist || (*m_pContexts)[axis].axisType != AxisType::LINEAR) return false;
+            !(*m_pContexts)[axis].isExist ||
+            (zc ? (!IsMotionZCFeedSourceAllowed(source) || axis != slot + 2 ||
+                (*m_pContexts)[axis].axisType != (axis == 2 ? AxisType::LINEAR : AxisType::ROTARY)) :
+             rotary ? (!IsMotionRotaryFeedSourceAllowed(source) || axis < 3 ||
+                (*m_pContexts)[axis].axisType != AxisType::ROTARY) :
+                (axis > 2 || (*m_pContexts)[axis].axisType != AxisType::LINEAR))) return false;
         mask |= 1U << axis;
     }
     return true;
@@ -12616,24 +12788,27 @@ bool MotionCore::TryCompleteFixedPlanarLineEndpoint(AxisCommand& command) noexce
         valid = valid && std::isfinite(distance);
     }
     const double error = std::abs(distance - command.instantCmdPos);
-    // Same finite relative/physical rounding limits as the existing EC arc
-    // completion. This closes numerical residue only, never a partial stop.
+    // Same finite numerical endpoint closure bound as the existing EC arc:
+    // XYZ uses native millimetres; BASE68 uses native degrees. The 5e-8
+    // native-unit bound only closes roundoff after full motion/FIR completion;
+    // it is not the servo in-position window (rotary stays +/-0.005 degrees)
+    // and does not define or combine a mixed millimetre/degree path metric.
     valid = valid && std::isfinite(error) && error <= 1e-12 * distance;
     for (int slot = 0; valid && slot < source.axisCount; ++slot)
     {
         const AxisContext& axis = (*m_pContexts)[source.axisIndices[slot]];
         const double delta = source.targetPos[slot] - m_Group.startPos[slot];
         const double mapped = m_Group.startPos[slot] + command.instantCmdPos * m_Group.ratio[slot];
-        const double pulsePerMM = axis.resolution_PPR / axis.finalLead;
-        const double scalarErrorMM = error / pulsePerMM;
-        const double axisErrorMM = std::abs(source.targetPos[slot] - mapped) / pulsePerMM;
+        const double pulsePerNativeUnit = axis.resolution_PPR / axis.finalLead;
+        const double scalarErrorNative = error / pulsePerNativeUnit;
+        const double axisErrorNative = std::abs(source.targetPos[slot] - mapped) / pulsePerNativeUnit;
         valid = !axis.isFault && !axis.isLagAlarm &&
             std::isfinite(axis.resolution_PPR) && axis.resolution_PPR > 0.0 &&
             std::isfinite(axis.finalLead) && axis.finalLead > 0.0 &&
-            std::isfinite(pulsePerMM) && pulsePerMM > 0.0 && std::isfinite(mapped) &&
+            std::isfinite(pulsePerNativeUnit) && pulsePerNativeUnit > 0.0 && std::isfinite(mapped) &&
             (distance > 0.0 ? m_Group.ratio[slot] == delta / distance : delta == 0.0) &&
-            std::isfinite(scalarErrorMM) && scalarErrorMM <= 5e-8 &&
-            std::isfinite(axisErrorMM) && axisErrorMM <= 5e-8;
+            std::isfinite(scalarErrorNative) && scalarErrorNative <= 5e-8 &&
+            std::isfinite(axisErrorNative) && axisErrorNative <= 5e-8;
     }
     if (!valid)
     {
@@ -12702,10 +12877,14 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // velocity above the active cruise/curve ceiling. Keep the existing
     // step-reachable and nonzero-seam cases; defer only an over-limit
     // tolerance snap to the normal acceleration/deceleration planner.
+    // BASE68 applies the same bound to its explicit degree-feed exact stop.
     if (planDist < 0.001 && planDist > stepDist &&
         axis.isVirtualAxis && &axis == &m_Group.virtualAxis && m_Group.isActive &&
-        m_Group.currentCmd.cncFeedLookahead &&
-        m_Group.pathMode == PathMode::CONTINUOUS &&
+        ((m_Group.currentCmd.cncFeedLookahead && m_Group.pathMode == PathMode::CONTINUOUS) ||
+            (m_Group.currentCmd.pathCoreRotaryFeedExactStop && m_Group.pathMode == PathMode::EXACT_STOP &&
+                IsMotionRotaryFeedSourceAllowed(m_Group.currentCmd)) ||
+            (m_Group.currentCmd.pathCoreZCFeedExactStop && m_Group.pathMode == PathMode::EXACT_STOP &&
+                IsMotionZCFeedSourceAllowed(m_Group.currentCmd))) &&
         !m_Group.enableHistory && !m_Group.enableTransform &&
         m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
         !m_safetyControlledStopInProgress && !IsPathCoreHoldExcursionDriving() &&
@@ -13099,7 +13278,9 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         const MotionCommand& dtCommand = m_Group.currentCmd;
         const bool dtFeedTail = isHandoverReady && axis.isVirtualAxis &&
             &axis == &m_Group.virtualAxis && m_Group.isActive &&
-            (dtCommand.pathCoreFeedExactStop || IsFixedPlanarLineEndpointScope()) &&
+            (dtCommand.pathCoreFeedExactStop || dtCommand.pathCoreRotaryFeedExactStop ||
+                dtCommand.pathCoreZCFeedExactStop ||
+                IsFixedPlanarLineEndpointScope()) &&
             dtCommand.mode == InterpolationMode::LINEAR &&
             dtCommand.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
             m_Group.pathMode == PathMode::EXACT_STOP &&
@@ -13189,8 +13370,10 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
 
     if (!axis.isVirtualAxis)
     {
-        double currentLag = std::abs(axis.currentCmdPos - axis.currentActPos);
-        isPhysicalInPos = (currentLag <= axis.inPositionWindow_Pulse);
+        double currentLag = std::abs(axis.GetMechanicalFollowingErrorPulse());
+        isPhysicalInPos = std::isfinite(currentLag) &&
+            currentLag <= axis.inPositionWindow_Pulse &&
+            axis.IsMechanicalCompensationReadyForCompletion();
     }
 
 
@@ -14797,9 +14980,14 @@ void MotionCore::UpdateMotion(
     // ==========================================
     // 🌟 2. [Layer 2.5] 進入補償層 (動態加入螺距與背隙誤差)
     // ==========================================
-    // 將大腦算出來的純淨理論座標 (cmd.instantCmdPos) 丟進去查表
-    // 引擎會自動將背隙與螺距誤差疊加上去，保護 PID 與機構
-    m_CompEngine.ApplyCompensation(axis.axisIndex, axis, cmd, CYCLE_TIME_SEC);
+    // PBC-2: this production seam is still OFF-only. Enabled compensation is
+    // rejected at boot and here until lifecycle/authority integration releases
+    // it. The coordinate-frame model is NOT permission to bypass that gate.
+    if (!m_CompEngine.ApplyCompensation(axis.axisIndex, axis, cmd, CYCLE_TIME_SEC))
+    {
+        WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+        return; // PBC-2: rejected frame must never reach Run_Servo_Loop.
+    }
 
     // ==========================================
     // 2. [Layer 2] 執行伺服控制
@@ -14992,7 +15180,11 @@ bool MotionCore::TryLineMove(
     const NCPathCoreRetainedGeometry* cncCorner,
     double cncPrefixVelocityPPS,
     bool pathCoreFeedExactStop,
-    MotionCommand* preparedCommand) noexcept
+    MotionCommand* preparedCommand,
+    bool pathCoreRotaryFeedExactStop,
+    const NCRotaryFeedLineValue* rotaryGeometry,
+    bool pathCoreZCFeedExactStop,
+    const NCZCFeedLineValue* zcGeometry) noexcept
 {
     if (preparedCommand != nullptr) *preparedCommand = MotionCommand{};
     if (producedIdentity != nullptr)
@@ -15067,7 +15259,36 @@ bool MotionCore::TryLineMove(
             m_pendingPlaneMode != 17 || m_pendingToolRadMode != 40 ||
             cncFeedLookahead || cncCorner != nullptr || cncPrefixVelocityPPS != 0.0 ||
             pathCoreFeedExactStop);
-    if (invalidPreparationScope || (basePlaneLinear && !basePlaneLinearAllowed) ||
+    const bool rotaryScope = pathCoreRotaryFeedExactStop && !pathCoreZCFeedExactStop &&
+        zcGeometry == nullptr && rotaryGeometry != nullptr &&
+        rotaryGeometry->valid && axes.size() == 1U && axes[0] >= 3 && axes[0] < MAX_AXES &&
+        rotaryGeometry->axisMask == (1U << static_cast<unsigned>(axes[0])) &&
+        targetPos.size() == 1U && targetPos[0] == rotaryGeometry->endPulse[static_cast<unsigned>(axes[0])] &&
+        targetVel == rotaryGeometry->velocityPPS &&
+        commandSource == MotionCommandSource::NC_MEMORY && plannedTailWellFormed &&
+        commandOwnerLease.owner == MotionOwner::AUTO && mode == BufferMode::ABORTING &&
+        commandPathMode == MotionCommandPathMode::EXACT_STOP && !pathCoreFeedExactStop &&
+        !cncFeedLookahead && cncCorner == nullptr && cncPrefixVelocityPPS == 0.0 &&
+        preparedCommand == nullptr && IsNCRotaryFeedNeutralFrame(m_pendingTranslation) &&
+        (m_pendingTranslation.distanceMode == 90 || m_pendingTranslation.distanceMode == 91) &&
+        m_pendingIsAbsoluteMode == (m_pendingTranslation.distanceMode == 90);
+    const bool zcScope = pathCoreZCFeedExactStop && !pathCoreRotaryFeedExactStop &&
+        rotaryGeometry == nullptr && zcGeometry != nullptr && zcGeometry->valid &&
+        axes.size() == 2U && axes[0] == 2 && axes[1] == 3 && zcGeometry->axisMask == 12U &&
+        targetPos.size() == 2U && targetPos[0] == zcGeometry->endPulse[2] &&
+        targetPos[1] == zcGeometry->endPulse[3] && targetVel == zcGeometry->velocityPPS &&
+        acc_time == zcGeometry->accTime && dec_time == zcGeometry->decTime &&
+        commandSource == MotionCommandSource::NC_MEMORY && plannedTailWellFormed &&
+        commandOwnerLease.owner == MotionOwner::AUTO && mode == BufferMode::ABORTING &&
+        commandPathMode == MotionCommandPathMode::EXACT_STOP && !pathCoreFeedExactStop &&
+        !cncFeedLookahead && cncCorner == nullptr && cncPrefixVelocityPPS == 0.0 &&
+        preparedCommand == nullptr && IsNCZCFeedNeutralFrame(m_pendingTranslation) &&
+        (m_pendingTranslation.distanceMode == 90 || m_pendingTranslation.distanceMode == 91) &&
+        m_pendingIsAbsoluteMode == (m_pendingTranslation.distanceMode == 90) &&
+        zcGeometry->absolute == m_pendingIsAbsoluteMode;
+    if ((pathCoreRotaryFeedExactStop ? !rotaryScope : rotaryGeometry != nullptr) ||
+        (pathCoreZCFeedExactStop ? !zcScope : zcGeometry != nullptr) ||
+        invalidPreparationScope || (basePlaneLinear && !basePlaneLinearAllowed) ||
         !IsPendingCommandTranslationValid(commandSource) ||
         (commandSource == MotionCommandSource::NC_MEMORY && m_pendingToolRadMode != 40 &&
             (!pathCoreFeedExactStop || !plannedTailWellFormed ||
@@ -15127,7 +15348,11 @@ bool MotionCore::TryLineMove(
             !(*m_pContexts)[axisIndex].isExist ||
             (commandSource == MotionCommandSource::NC_MEMORY &&
                 !IsNCTranslationSnapshotEmpty(m_pendingTranslation) &&
-                (axisIndex > 2 || (*m_pContexts)[axisIndex].axisType != AxisType::LINEAR)) ||
+                (zcScope ? ((*m_pContexts)[axisIndex].axisType != (axisIndex == 2 ? AxisType::LINEAR : AxisType::ROTARY) ||
+                    !NCRotaryFeedDetail::SameBits((*m_pContexts)[axisIndex].logicalCmdPos.Load(), zcGeometry->startPulse[static_cast<unsigned>(axisIndex)])) :
+                 rotaryScope ? ((*m_pContexts)[axisIndex].axisType != AxisType::ROTARY ||
+                    (*m_pContexts)[axisIndex].logicalCmdPos.Load() != rotaryGeometry->startPulse[static_cast<unsigned>(axisIndex)]) :
+                    (axisIndex > 2 || (*m_pContexts)[axisIndex].axisType != AxisType::LINEAR))) ||
             !std::isfinite(targetPos[slot]))
         {
             RejectInvalidProducerMotionCommand(
@@ -15149,6 +15374,50 @@ bool MotionCore::TryLineMove(
     cmd.commandPathMode = commandPathMode;
     cmd.cncFeedLookahead = cncFeedLookahead;
     cmd.pathCoreFeedExactStop = pathCoreFeedExactStop;
+    cmd.pathCoreRotaryFeedExactStop = pathCoreRotaryFeedExactStop;
+    cmd.pathCoreZCFeedExactStop = pathCoreZCFeedExactStop;
+    if (zcScope)
+    {
+        for (unsigned slot = 0U; slot < 2U; ++slot)
+        {
+            cmd.mem_startPos[slot] = zcGeometry->startPulse[slot + 2U];
+            cmd.mem_startPos[slot + 2U] = zcGeometry->startMCS[slot + 2U];
+            cmd.mem_ratio[slot + 2U] = zcGeometry->endMCS[slot + 2U];
+        }
+        cmd.mem_ratio[0] = zcGeometry->pulsePerMM;
+        cmd.mem_ratio[1] = zcGeometry->pulsePerDegree;
+        cmd.mem_startPos[4] = zcGeometry->deltaZMM;
+        cmd.mem_ratio[4] = zcGeometry->deltaCDeg;
+        cmd.mem_totalDist = zcGeometry->lengthPulse;
+        cmd.mem_radius = zcGeometry->feedMMMin;
+        cmd.mem_startAngle = zcGeometry->nominalSeconds;
+        cmd.mem_totalAngle = zcGeometry->rotaryFeedDegMin;
+        if (m_pendingIsAbsoluteMode)
+        {
+            cmd.mem_startPos[5] = zcGeometry->absoluteTargetZWCS;
+            cmd.mem_ratio[5] = zcGeometry->absoluteTargetCWCS;
+            cmd.mem_startPos[6] = zcGeometry->absoluteTargetZMCS;
+            cmd.mem_ratio[6] = zcGeometry->absoluteTargetCMCS;
+            cmd.mem_startPos[7] = zcGeometry->rotaryModulo;
+            cmd.mem_ratio[7] = zcGeometry->rotaryShortestPath ? 1.0 : 0.0;
+        }
+    }
+    if (rotaryScope)
+    {
+        cmd.mem_startPos[0] = rotaryGeometry->startPulse[static_cast<unsigned>(axes[0])];
+        cmd.mem_ratio[0] = rotaryGeometry->pulsePerDegree;
+        cmd.mem_startPos[1] = rotaryGeometry->startMCS[static_cast<unsigned>(axes[0])];
+        cmd.mem_ratio[1] = rotaryGeometry->endMCS[static_cast<unsigned>(axes[0])];
+        cmd.mem_totalDist = rotaryGeometry->sweepDeg;
+        cmd.mem_radius = rotaryGeometry->feedDegMin;
+        if (m_pendingIsAbsoluteMode)
+        {
+            cmd.mem_startPos[2] = rotaryGeometry->absoluteTargetWCS;
+            cmd.mem_ratio[2] = rotaryGeometry->absoluteTargetMCS;
+            cmd.mem_startPos[3] = rotaryGeometry->rotaryModulo;
+            cmd.mem_ratio[3] = rotaryGeometry->rotaryShortestPath ? 1.0 : 0.0;
+        }
+    }
     cmd.cncPrefixVelocityPPS = cncPrefixVelocityPPS;
 
     // 將座標與參數抄寫到包裹裡
@@ -15247,7 +15516,7 @@ bool MotionCore::TryLineMove(
     // path; the consumer must never be the first to reject a committed tail.
     // These private source tags authorize validation only; the execution
     // identity is assigned after the existing epoch/owner transaction below.
-    if (cncCorner != nullptr && commandSource == MotionCommandSource::NC_MEMORY)
+    if ((cncCorner != nullptr || rotaryScope || zcScope) && commandSource == MotionCommandSource::NC_MEMORY)
     {
         cmd.execution.source = commandSource;
         cmd.ownerLease = commandOwnerLease;
@@ -16278,9 +16547,42 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         return;
     }
 
+    bool zcStartAndTravelValid = true;
+    if (frontCommand.pathCoreZCFeedExactStop)
+    {
+        zcStartAndTravelValid = IsMotionZCFeedGeometryValid(frontCommand, m_pContexts) &&
+            !m_Group.enableHistory && !m_Group.enableTransform &&
+            m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
+            std::isfinite(m_Group.feedrateOverride) && m_Group.feedrateOverride >= 0.0 &&
+            m_Group.feedrateOverride <= 1.0 && m_pCoordMgr != nullptr;
+        for (unsigned slot = 0U; zcStartAndTravelValid && slot < 2U; ++slot)
+        {
+            const AxisContext& axis = (*m_pContexts)[slot + 2U];
+            zcStartAndTravelValid = NCRotaryFeedDetail::SameBits(axis.logicalCmdPos.Load(), frontCommand.mem_startPos[slot]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,
+                    frontCommand.mem_startPos[slot] / frontCommand.mem_ratio[slot]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,
+                    frontCommand.targetPos[slot] / frontCommand.mem_ratio[slot]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, frontCommand.mem_startPos[slot + 2U]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, frontCommand.mem_ratio[slot + 2U]) &&
+                (!frontCommand.sourceIsAbsoluteMode ||
+                    m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,
+                        slot == 0U ? frontCommand.mem_startPos[6] : frontCommand.mem_ratio[6]));
+        }
+    }
     if (!IsMotionCommandConsumerGeometryValid(
         frontCommand,
-        m_pContexts))
+        m_pContexts) || !zcStartAndTravelValid ||
+        (frontCommand.pathCoreRotaryFeedExactStop &&
+            (m_Group.enableHistory || m_Group.enableTransform ||
+                m_Group.jumpManager.state != JumpState::IDLE || m_pathHold.sourceSeen ||
+                !std::isfinite(m_Group.feedrateOverride) || m_Group.feedrateOverride < 0.0 ||
+                m_Group.feedrateOverride > 1.0 || m_pCoordMgr == nullptr ||
+                (*m_pContexts)[frontCommand.axisIndices[0]].logicalCmdPos.Load() != frontCommand.mem_startPos[0] ||
+                !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit((*m_pContexts)[frontCommand.axisIndices[0]],
+                    frontCommand.mem_startPos[0] / frontCommand.mem_ratio[0]) ||
+                !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit((*m_pContexts)[frontCommand.axisIndices[0]],
+                    frontCommand.targetPos[0] / frontCommand.mem_ratio[0]))))
     {
         MotionCommand invalidCommand{};
         // The lifecycle tuple may win after the peek. Never overwrite a
@@ -16590,7 +16892,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
 
                 const AxisContext& axis = (*m_pContexts)[axisIndex];
                 const double followingError =
-                    std::abs(axis.currentCmdPos - axis.currentActPos);
+                    std::abs(axis.GetMechanicalFollowingErrorPulse());
                 const bool stateAllowed =
                     axis.state == MotionState::MotionState_INTERPOLATING ||
                     axis.state == MotionState::MotionState_STOPPING ||
@@ -16621,7 +16923,8 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
                     std::abs(axis.currentCmdVel) <= 1.0 &&
                     std::abs(axis.logicalCmdVel) <= 1.0 &&
                     std::isfinite(followingError) &&
-                    followingError <= axis.inPositionWindow_Pulse;
+                    followingError <= axis.inPositionWindow_Pulse &&
+                    axis.IsMechanicalCompensationReadyForCompletion();
             }
         }
 
@@ -16684,7 +16987,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         {
             // Distinguish a live, exact queued source waiting only for physical
             // following from an unavailable source. This never admits motion.
-            const double following = std::abs(incomingAxis.currentCmdPos - incomingAxis.currentActPos);
+            const double following = std::abs(incomingAxis.GetMechanicalFollowingErrorPulse());
             if (!m_Group.isActive && !m_pathHold.sourceSeen &&
                 m_pathHold.status.phase == MotionPathCoreHoldExcursionPhase::ARMED &&
                 m_pathHold.generation == m_pathHoldGeneration.load(std::memory_order_acquire) &&
@@ -17460,7 +17763,15 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
             // ----------------------------------------------
             // Rotary shortest path
             // ----------------------------------------------
-            if (realAxis.axisType == AxisType::ROTARY && realAxis.useShortestPath)
+            if ((cmd.pathCoreRotaryFeedExactStop && m_Group.startPos[i] != cmd.mem_startPos[0]) ||
+                (cmd.pathCoreZCFeedExactStop &&
+                    !NCRotaryFeedDetail::SameBits(m_Group.startPos[i], cmd.mem_startPos[i])))
+            {
+                derivedGeometryValid = false;
+                break; // The admission start is immutable; never rebase a feed.
+            }
+            if (!cmd.pathCoreRotaryFeedExactStop && !cmd.pathCoreZCFeedExactStop &&
+                realAxis.axisType == AxisType::ROTARY && realAxis.useShortestPath)
             {
                 double pulsePerUnit = 0.0;
                 if (!TryGetMotionPulsePerUnit(realAxis.resolution_PPR, realAxis.finalLead,
@@ -17547,16 +17858,18 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
             // 如果實體馬達自己還沒追進視窗
             // 也不能直接宣告完成
             // ----------------------------------------------
-            double physicalLag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
+            double physicalLag = std::abs(realAxis.GetMechanicalFollowingErrorPulse());
 
-            if (physicalLag > realAxis.inPositionWindow_Pulse)
+            if (!std::isfinite(physicalLag) || physicalLag > realAxis.inPositionWindow_Pulse ||
+                !realAxis.IsMechanicalCompensationReadyForCompletion())
             {
                 alreadyAtTarget = false;
             }
         }
 
 
-        if (!derivedGeometryValid || !std::isfinite(totalDist))
+        if (!derivedGeometryValid || !std::isfinite(totalDist) ||
+            (cmd.pathCoreZCFeedExactStop && totalDist != cmd.mem_totalDist))
         {
             FailDerivedConsumerGeometry();
             return;
@@ -17569,7 +17882,8 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         // DQ_FIX1: CNC lookahead lines need real interpolation/START even
         // inside the physical settling window. Preserve ordinary positioning
         // and the mathematical tiny-distance guard below.
-        if (alreadyAtTarget && !cmd.cncFeedLookahead)
+        if (alreadyAtTarget && !cmd.cncFeedLookahead &&
+            !cmd.pathCoreRotaryFeedExactStop && !cmd.pathCoreZCFeedExactStop)
         {
             CompleteWithoutMotion();
             return;
@@ -19988,6 +20302,21 @@ void MotionCore::UpdateInterpolation()
         return;
     }
 
+    // BASE68 native degrees have no history/B2/transform interpretation.
+    // A genuine HOLD is override zero and keeps the same signed native path.
+    // Safety's controlled stop already took priority above.
+    if (m_Group.isActive && (m_Group.currentCmd.pathCoreRotaryFeedExactStop ||
+            m_Group.currentCmd.pathCoreZCFeedExactStop) &&
+        !m_safetyControlledStopInProgress &&
+        (m_Group.enableHistory || m_Group.enableTransform || m_Group.jumpManager.state != JumpState::IDLE ||
+            m_pathHold.sourceSeen || m_Group.pathMode != PathMode::EXACT_STOP ||
+            !std::isfinite(m_Group.feedrateOverride) || m_Group.feedrateOverride < 0.0 ||
+            m_Group.feedrateOverride > 1.0))
+    {
+        TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return;
+    }
+
     // DH geometry has no legacy history/transform interpretation. Ordinary
     // HOLD uses [0,1] override; an unsupported speed-up must not bypass the
     // compound's curvature cap. The protected safety-stop path stays prior.
@@ -20413,10 +20742,11 @@ void MotionCore::UpdateInterpolation()
                     int idx = m_Group.axisIndices[i];
                     AxisContext& realAxis = (*m_pContexts)[idx];
 
-                    double lag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
+                    double lag = std::abs(realAxis.GetMechanicalFollowingErrorPulse());
 
                     // 只要有一軸還沒擠進視窗 (例如 0.005mm)，就不准換下一行！
-                    if (lag > realAxis.inPositionWindow_Pulse) {
+                    if (!std::isfinite(lag) || lag > realAxis.inPositionWindow_Pulse ||
+                        !realAxis.IsMechanicalCompensationReadyForCompletion()) {
                         allAxesInPos = false;
                         // 🟢 [加入 LOG 2]：觀察實體馬達的誤差是不是卡住了
                         if (m_Group.cmdQueue.empty() && vAxis.inPosition) {
@@ -20509,10 +20839,11 @@ void MotionCore::UpdateInterpolation()
                     int idx = m_Group.axisIndices[i];
                     AxisContext& realAxis = (*m_pContexts)[idx];
 
-                    double lag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
+                    double lag = std::abs(realAxis.GetMechanicalFollowingErrorPulse());
 
                     // 只要有一軸還沒擠進視窗 (例如 0.005mm)，就不准換下一行！
-                    if (lag > realAxis.inPositionWindow_Pulse)
+                    if (!std::isfinite(lag) || lag > realAxis.inPositionWindow_Pulse ||
+                        !realAxis.IsMechanicalCompensationReadyForCompletion())
                     {
                         allAxesInPos = false;
 
@@ -21806,7 +22137,7 @@ void MotionCore::UpdateInterpolation()
             AxisContext& realAxis = (*m_pContexts)[idx];
 
             // 計算大腦完美位置與實體馬達位置的落差
-            double currentLag = std::abs(realAxis.currentCmdPos - realAxis.currentActPos);
+            double currentLag = std::abs(realAxis.GetMechanicalFollowingErrorPulse());
 
             // 只要有一軸還沒擠進到位視窗，就判定尚未結束！
             if (!std::isfinite(realAxis.currentCmdPos) ||
@@ -21825,7 +22156,8 @@ void MotionCore::UpdateInterpolation()
                 std::abs(realAxis.currentCmdVel) > 1.0 ||
                 std::abs(realAxis.logicalCmdVel) > 1.0 ||
                 !std::isfinite(currentLag) ||
-                currentLag > realAxis.inPositionWindow_Pulse)
+                currentLag > realAxis.inPositionWindow_Pulse ||
+                !realAxis.IsMechanicalCompensationReadyForCompletion())
             {
                 allPhysicalInPos = false;
                 break; // 退堂！繼續等！
@@ -23027,9 +23359,17 @@ void MotionCore::UpdateNCSettleProducer(
                         blockerAxisIndex = publishedAxisIndex;
                     }
 
+                    // PBC-2: no settle proof while a compensation ramp is
+                    // pending/stale. Raw encoder excursion below is preserved.
+                    if (blocker == MotionNCSettleBlocker::NONE &&
+                        !axis.IsMechanicalCompensationReadyForCompletion())
+                    {
+                        blocker = MotionNCSettleBlocker::COMPENSATION_ACTIVE;
+                        blockerAxisIndex = publishedAxisIndex;
+                    }
                     const double window = axis.inPositionWindow_Pulse;
                     const double followingError =
-                        std::abs(axis.currentCmdPos - axis.currentActPos);
+                        std::abs(axis.GetMechanicalFollowingErrorPulse());
                     const double followingRatio =
                         (std::isfinite(window) && window > 0.0)
                         ? followingError / window
@@ -23611,7 +23951,7 @@ void MotionCore::PublishStopSettleEvidence() noexcept
             }
 
             const double followingErrorAbsPulse =
-                std::abs(axis.currentCmdPos - axis.currentActPos);
+                std::abs(axis.GetMechanicalFollowingErrorPulse());
             const double inPositionWindowAbsPulse =
                 std::abs(axis.inPositionWindow_Pulse);
             const double unitsPerPulse =

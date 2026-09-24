@@ -2061,9 +2061,10 @@ int CoordinateManager::GetCurrentWCSGCode() const
 }
 
 // 🌟 更新機械座標 (未來由 EtherCAT 更新)
-void CoordinateManager::UpdateActualMCS(const double* newMCS) {
+void CoordinateManager::UpdateActualMCS(const double* newMCS, const double* unwrappedMCS) {
     for (int i = 0; i < 8; i++) {
         actualMCS[i] = newMCS[i];
+        actualUnwrappedMCS[i] = unwrappedMCS ? unwrappedMCS[i] : newMCS[i];
     }
 }
 
@@ -3083,7 +3084,10 @@ void CoordinateManager::GetDistanceToGo(double* outDTG, NCManager* nc) const
     {
         for (int i = 0; i < 8; i++) {
             // mm 減去 mm，結果完美！
-            outDTG[i] = targetMCS_mm[i] - actualMCS[i];
+            // PBC-2: both operands are nominal-equivalent, UNWRAPPED native
+            // axis units. Subtracting a 0..360 display angle creates a false
+            // whole-turn DTG and must not be used for multi-turn targets.
+            outDTG[i] = targetMCS_mm[i] - actualUnwrappedMCS[i];
 
             if (std::abs(outDTG[i]) < 0.001) {
                 outDTG[i] = 0.0;

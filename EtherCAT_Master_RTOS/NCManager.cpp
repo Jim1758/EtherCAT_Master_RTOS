@@ -5,6 +5,8 @@
 #include "GCodeParser.h"
 #include "NCGCodeSemantics.h"
 #include "NCXYZFeedScope.h"
+#include "NCRotaryFeedScope.h"
+#include "NCZCFeedScope.h"
 #include "NCExpressionResolver.h"
 #include "NCProgramCache.h"
 #include "NCBlockLifecycleLedger.h"
@@ -6370,7 +6372,12 @@ void NCManager::ExecuteBlock(
     }
     // BY-ARC-END
     // BX-FEED: reject unsupported shape before setting/tool/M-code side effects.
-    if ((NCGCodeSemantics::Contains(block, 1) && !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane)) ||
+    // BASE70-FIX1: use the same bounded Z+C admission as the motion entry.
+    // Without this branch, ExecuteBlock rejects a valid pair before dispatch.
+    if ((NCGCodeSemantics::Contains(block, 1) &&
+        !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane) &&
+        !IsNCRotaryFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
+        !IsNCZCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block)) ||
         IsPathCoreFeedInputOmission(block))
     {
         if (!m_pathFeed.pending)

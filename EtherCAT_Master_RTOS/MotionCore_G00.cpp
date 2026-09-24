@@ -141,7 +141,23 @@ bool MotionCore::IsPlanarEndpointBasisCurrent(const double* referenceMCS,
         if (!std::isfinite(pulsePerMM) || pulsePerMM <= 0.0) return false;
         const double forwardPulse = referenceMCS[slot] * pulsePerMM;
         const double reverseMCS = startPulse[slot] * axis.finalLead / axis.resolution_PPR;
-        if (!(std::isfinite(forwardPulse) && forwardPulse == startPulse[slot]) &&
+        // BASE70: retain the exact proven Z spelling across mixed Z/C and
+        // subsequent single-C motion. This is only a native-basis proof; the
+        // caller's original G00/G01/source/travel gates still own permission.
+        const MotionCncPathTail& zc = m_zcFeedProducerTail;
+        const MotionOwnerLease owner = GetMotionOwnerLease();
+        const MotionExecutionEpoch epoch = GetCurrentExecutionEpoch();
+        const bool acceptedZBasis = slot == 2U && zc.valid && (zc.axisMask & 4U) != 0U &&
+            (zc.validAxisMask & 4U) != 0U && zc.identity.IsAssigned() &&
+            zc.identity.source == MotionCommandSource::NC_MEMORY &&
+            m_pendingCommandSource.load(std::memory_order_acquire) == MotionCommandSource::NC_MEMORY &&
+            owner.IsValid() && owner.owner == MotionOwner::AUTO && zc.ownerLease.Matches(owner) &&
+            zc.identity.epoch == epoch && m_g00ProducerQueueTailEpoch == epoch &&
+            m_g00ProducerQueueTailOwnerLease.Matches(owner) && (m_g00ProducerQueueTailValidMask & 4U) != 0U &&
+            NCRotaryFeedDetail::SameBits(zc.endMCS[2], referenceMCS[2]) &&
+            zc.endPulse[2] == startPulse[2] && m_g00ProducerQueueTailPulse[2] == startPulse[2] &&
+            axis.logicalCmdPos.Load() == startPulse[2];
+        if (!acceptedZBasis && !(std::isfinite(forwardPulse) && forwardPulse == startPulse[slot]) &&
             !(std::isfinite(reverseMCS) && reverseMCS == referenceMCS[slot]))
         {
             // Producer-thread diagnostic only; preserve the exact rejection.

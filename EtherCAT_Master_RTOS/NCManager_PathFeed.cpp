@@ -2,6 +2,8 @@
 #include "NCManager.h"
 #include "AlarmManager.h"
 #include "NCExpressionResolver.h"
+#include "NCRotaryFeedScope.h"
+#include "NCZCFeedScope.h"
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -486,8 +488,13 @@ bool NCManager::IsPathCoreFeedBlockShapeValid(const NCBlock& block, bool allowMi
 NC_PATH_FEED_NOINLINE
 bool NCManager::IsPathCoreFeedInputOmission(const NCBlock& block) const noexcept
 {
-    return m_pathFeed.armed && m_pathFeed.explicitFeed && !block.hasG && block.gCount == 0 &&
-        (block.has('X') || block.has('Y') || block.has('Z') || block.has('F'));
+    if (!m_pathFeed.armed || !m_pathFeed.explicitFeed || block.hasG || block.gCount != 0) return false;
+    if (block.has('X') || block.has('Y') || block.has('Z') || block.has('F')) return true;
+    // BASE68 keeps G01 explicit on every native rotary row as well.
+    const NCAxisIdentitySnapshot& axes = CoordSys.GetTranslationSnapshot().axisIdentity;
+    for (unsigned axis = 3U; axis < 8U; ++axis)
+        if (axes.address[axis] >= 'A' && axes.address[axis] <= 'Z' && block.has(axes.address[axis])) return true;
+    return false;
 }
 
 NC_PATH_FEED_NOINLINE
@@ -574,6 +581,18 @@ void NCManager::ValidatePathCoreFeedSameThread()
         return;
     }
     if (!m_pathFeed.pending) return;
+    const MotionFeedLineReceipt& receipt = m_pathFeedMotion.receipt;
+    if ((receipt.rotaryFeed || receipt.zcFeed) &&
+        ((receipt.zcFeed ? (!IsNCZCFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
+            receipt.zc.absolute != (CoordSys.GetTranslationSnapshot().distanceMode == 90)) :
+            !IsNCRotaryFeedNeutralFrame(CoordSys.GetTranslationSnapshot())) ||
+        !IsFixedTranslationTravelCurrentSameThread() || m_cncFeed.selected || m_cncFeed.active ||
+        m_cncFeed.count != 0U || m_pathArc.pending || m_pathReplay.pending ||
+        m_pathHold.armed || m_pathHold.bound || m_gapDryRun.active || m_gapPath.active || m_gapWindow.active))
+    {
+        RejectPathCoreFeedSameThread(12U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        return;
+    }
     if (!IsPathCoreFeedConfigurationValid() ||
         !FeedTranslationCurrent(CoordSys, m_pathFeedMotion.receipt.translationGeneration) ||
         m_pathFeedMotion.receipt.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
@@ -660,8 +679,369 @@ void NCManager::RejectPathCoreFeedSameThread(std::uint32_t code, int alarmCode)
 }
 
 NC_PATH_FEED_NOINLINE
+WaitConditionFunc NCManager::StartPathCoreRotaryFeedSameThread(const NCBlock& block)
+{
+    const NCTranslationSnapshot& source = CoordSys.GetTranslationSnapshot();
+    unsigned selectedAxis = 0U;
+    if (!TryGetNCRotaryFeedAxis(source.axisIdentity, block, selectedAxis) ||
+        !IsNCRotaryFeedBlockAllowed(source, block))
+    {
+        RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return nullptr;
+    }
+    const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(selectedAxis));
+    const unsigned invalidMask = CoordSys.GetInvalidSoftwareTravelLimitMask(axis);
+    if (invalidMask != 0U)
+    {
+        RtPrintf("[TRAVEL-CONFIG][REJECT] unit=ROTARY_FEED axis=%u invalidMask=%u beforeSubmit=1\n",
+            selectedAxis, invalidMask);
+        RejectPathCoreFeedSameThread(7U, AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG);
+        return nullptr;
+    }
+    if (!m_pathFeed.armed || m_pathFeed.pending || Close_System_Com_flag || m_state != NCState::RUN ||
+        m_mode != NCOperationMode::MEMORY || m_isG66Active || !m_macroStack.empty() || Homing.IsActive() ||
+        IsFeedHoldActive() || !IsPathCoreFeedConfigurationValid() ||
+        !IsFixedTranslationTravelCurrentSameThread() || !FeedTranslationCurrent(CoordSys, source.generation) ||
+        !m_motion.MatchesNCTranslation(source) || AlarmManager::GetInstance().HasAlarm() ||
+        m_currentExecutingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        m_pathFeed.dispatch != m_currentExecutingBlockDispatchId ||
+        m_pathFeed.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        m_pathFeed.cache != GetBaseProgramCache().GetGeneration() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !m_motion.IsGroupDone() ||
+        m_motion.GetCommandIngressSize() != 0U || m_motion.GetCommandReplaySize() != 0U ||
+        m_cncFeed.selected || m_cncFeed.active || m_cncFeed.count != 0U ||
+        m_pathArc.pending || m_pathReplay.pending || m_pathReplayStore.Pending() ||
+        m_pathHold.armed || m_pathHold.bound || m_gapDryRun.active || m_gapPath.active || m_gapWindow.active ||
+        m_cutterLine.valid || m_cutterLine.leadOutRequired || !axis.isExist || axis.axisType != AxisType::ROTARY ||
+        source.axisIdentity.address[selectedAxis] != m_axisNames[selectedAxis])
+    {
+        RejectPathCoreFeedSameThread(3U, (!m_pathFeed.armed && m_pathFeed.invalidatedByGoto) ?
+            AlarmManager::PATH_INVALIDATED_BY_GOTO : AlarmManager::G_Code_Invalid_parameter);
+        return nullptr;
+    }
+    if (m_motion.GetMotionFeedbackOverflowCount() != 0ULL ||
+        m_motion.GetMotionFeedbackProducerNoticeOverflowCount() != 0ULL ||
+        m_motionFeedbackSequenceGapCount != 0ULL || !FeedLedgerTransportHealthy(m_blockLifecycleLedger))
+    {
+        RejectPathCoreFeedSameThread(11U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        return nullptr;
+    }
+
+    // Native angular F is always explicit, in deg/min. It cannot seed or
+    // inherit the independent XYZ mm/min modal feed or retained-path history.
+    ClearCncModalFeedSameThread();
+    ClearPathCoreReplayHistorySameThread();
+    m_pathFeedProgrammed.fill(false);
+    m_pathFeedWCS.fill(0.0);
+    m_pathFeedCandidate.fill(0.0);
+    m_pathFeedAxes.clear();
+    m_pathFeedTargets.clear();
+    const double programmedValue = block.val(source.axisIdentity.address[selectedAxis]);
+    const bool absolute = source.distanceMode == 90;
+    const double feedDegMin = block.val('F');
+    m_pathFeedProgrammed[selectedAxis] = true;
+    m_pathFeedWCS[selectedAxis] = programmedValue;
+    CoordSys.Preview_WCS_to_MCS(m_pathFeedWCS.data(), m_pathFeedProgrammed.data(), m_pathFeedCandidate.data());
+    for (unsigned i = 0U; i < 8U; ++i)
+    {
+        if (!std::isfinite(CoordSys.commandedMCS[i]) || !std::isfinite(m_pathFeedCandidate[i]) ||
+            (i != selectedAxis && FeedDoubleBits(m_pathFeedCandidate[i]) != FeedDoubleBits(CoordSys.commandedMCS[i])))
+        {
+            RejectPathCoreFeedSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
+            return nullptr;
+        }
+    }
+    const double authoredStart = CoordSys.commandedMCS[selectedAxis];
+    const double expectedTarget = absolute ?
+        programmedValue + NCTranslationAxisOffsetMM(source, selectedAxis) : authoredStart + programmedValue;
+    if (!std::isfinite(expectedTarget) || FeedDoubleBits(m_pathFeedCandidate[selectedAxis]) != FeedDoubleBits(expectedTarget))
+    {
+        RejectPathCoreFeedSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
+        return nullptr;
+    }
+    // The producer also checks the physical unwrapped pulse envelope; this
+    // authored MCS check alone is insufficient at a rotary modulo crossing.
+    if (!CoordSys.IsTargetWithinSoftwareTravelLimit(axis, CoordSys.commandedMCS[selectedAxis]) ||
+        !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, m_pathFeedCandidate[selectedAxis]))
+    {
+        RejectPathCoreFeedSameThread(7U, CoordSys.GetSoftwareTravelLimitAlarmCode(axis, AlarmManager::PROGRAMMED_OVER_TRAVEL));
+        return nullptr;
+    }
+    const bool accepted = m_motion.TryG01RotaryMoveTransactionalTail(static_cast<int>(selectedAxis),
+        programmedValue, m_pathFeedCandidate[selectedAxis], feedDegMin, CoordSys.commandedMCS, m_pathFeedMotion);
+    if (!accepted)
+    {
+        RejectPathCoreFeedSameThread(6U, m_pathFeedMotion.receipt.commandAccepted ?
+            static_cast<int>(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY) :
+            static_cast<int>(AlarmManager::G_Code_Invalid_parameter));
+        return nullptr;
+    }
+    const MotionFeedLineReceipt& receipt = m_pathFeedMotion.receipt;
+    const NCRotaryFeedLineValue& geometry = receipt.rotary;
+    const std::uint32_t expectedMask = 1U << selectedAxis;
+    double canonicalTarget = expectedTarget;
+    if (absolute)
+    {
+        NCRotaryAbsoluteFeedTarget resolved{};
+        if (!TryResolveNCRotaryAbsoluteFeedTarget(authoredStart, geometry.startPulse[selectedAxis],
+                expectedTarget, axis.resolution_PPR / axis.finalLead,
+                axis.useShortestPath, axis.rotaryModulo, resolved) ||
+            FeedDoubleBits(resolved.endPulse) != FeedDoubleBits(geometry.endPulse[selectedAxis]) ||
+            FeedDoubleBits(geometry.absoluteTargetWCS) != FeedDoubleBits(programmedValue) ||
+            FeedDoubleBits(geometry.absoluteTargetMCS) != FeedDoubleBits(expectedTarget) ||
+            FeedDoubleBits(geometry.rotaryModulo) != FeedDoubleBits(axis.rotaryModulo) ||
+            geometry.rotaryShortestPath != axis.useShortestPath)
+        {
+            RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+            return nullptr;
+        }
+        canonicalTarget = resolved.endMCS;
+    }
+    if (!receipt.rotaryFeed || !receipt.valid || !receipt.commandAccepted || !receipt.tailCommitted ||
+        !receipt.captureBound || !geometry.valid || geometry.axisMask != expectedMask ||
+        !FeedTranslationCurrent(CoordSys, receipt.translationGeneration) ||
+        (receipt.validAxisMask & expectedMask) != expectedMask ||
+        FeedDoubleBits(geometry.feedDegMin) != FeedDoubleBits(feedDegMin) ||
+        FeedDoubleBits(geometry.startMCS[selectedAxis]) != FeedDoubleBits(authoredStart) ||
+        FeedDoubleBits(geometry.sweepDeg) != FeedDoubleBits(canonicalTarget - authoredStart) ||
+        receipt.identity.source != MotionCommandSource::NC_MEMORY ||
+        receipt.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !receipt.ownerLease.Matches(m_programMotionLease))
+    {
+        RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        return nullptr;
+    }
+    for (unsigned i = 0U; i < 8U; ++i)
+    {
+        if (!std::isfinite(geometry.startMCS[i]) || !std::isfinite(geometry.endMCS[i]) ||
+            !std::isfinite(geometry.startPulse[i]) || !std::isfinite(geometry.endPulse[i]) ||
+            FeedDoubleBits(geometry.endMCS[i]) != FeedDoubleBits(i == selectedAxis ? canonicalTarget : m_pathFeedCandidate[i]) ||
+            (i != selectedAxis && (FeedDoubleBits(geometry.startMCS[i]) != FeedDoubleBits(geometry.endMCS[i]) ||
+                FeedDoubleBits(geometry.startPulse[i]) != FeedDoubleBits(geometry.endPulse[i]))))
+        {
+            RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+            return nullptr;
+        }
+    }
+    ++m_pathFeed.submitted;
+    m_pathFeed.pending = true;
+    m_pathFeed.explicitFeed = true;
+    m_pathFeed.code = 1U;
+    LogPathCoreFeedSameThread("SUBMITTED");
+    LogPathCoreFeedGeometrySameThread();
+    return [](NCManager* nc) { return nc->CompletePathCoreFeedSameThread(); };
+}
+
+NC_PATH_FEED_NOINLINE
+WaitConditionFunc NCManager::StartPathCoreZCFeedSameThread(const NCBlock& block)
+{
+    const NCTranslationSnapshot& source = CoordSys.GetTranslationSnapshot();
+    if (!IsNCZCFeedBlockAllowed(source, block))
+    {
+        RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+        return nullptr;
+    }
+    const AxisContext& zAxis = m_motion.GetAxisContext(2);
+    const AxisContext& cAxis = m_motion.GetAxisContext(3);
+    for (int i = 2; i <= 3; ++i)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(i);
+        const unsigned invalidMask = CoordSys.GetInvalidSoftwareTravelLimitMask(axis);
+        if (invalidMask != 0U)
+        {
+            RtPrintf("[TRAVEL-CONFIG][REJECT] unit=ZC_FEED axis=%d invalidMask=%u beforeSubmit=1\n", i, invalidMask);
+            RejectPathCoreFeedSameThread(7U, AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG);
+            return nullptr;
+        }
+    }
+    if (!m_pathFeed.armed || m_pathFeed.pending || Close_System_Com_flag || m_state != NCState::RUN ||
+        m_mode != NCOperationMode::MEMORY || m_isG66Active || !m_macroStack.empty() || Homing.IsActive() ||
+        IsFeedHoldActive() || !IsPathCoreFeedConfigurationValid() ||
+        !IsFixedTranslationTravelCurrentSameThread() || !FeedTranslationCurrent(CoordSys, source.generation) ||
+        !m_motion.MatchesNCTranslation(source) || AlarmManager::GetInstance().HasAlarm() ||
+        m_currentExecutingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        m_pathFeed.dispatch != m_currentExecutingBlockDispatchId ||
+        m_pathFeed.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        m_pathFeed.cache != GetBaseProgramCache().GetGeneration() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !m_motion.IsGroupDone() ||
+        m_motion.GetCommandIngressSize() != 0U || m_motion.GetCommandReplaySize() != 0U ||
+        m_cncFeed.selected || m_cncFeed.active || m_cncFeed.count != 0U ||
+        m_pathArc.pending || m_pathReplay.pending || m_pathReplayStore.Pending() ||
+        m_pathHold.armed || m_pathHold.bound || m_gapDryRun.active || m_gapPath.active || m_gapWindow.active ||
+        m_cutterLine.valid || m_cutterLine.leadOutRequired ||
+        !zAxis.isExist || zAxis.axisType != AxisType::LINEAR ||
+        !cAxis.isExist || cAxis.axisType != AxisType::ROTARY ||
+        m_axisNames[2] != 'Z' || m_axisNames[3] != 'C')
+    {
+        RejectPathCoreFeedSameThread(3U, (!m_pathFeed.armed && m_pathFeed.invalidatedByGoto) ?
+            AlarmManager::PATH_INVALIDATED_BY_GOTO : AlarmManager::G_Code_Invalid_parameter);
+        return nullptr;
+    }
+    if (m_motion.GetMotionFeedbackOverflowCount() != 0ULL ||
+        m_motion.GetMotionFeedbackProducerNoticeOverflowCount() != 0ULL ||
+        m_motionFeedbackSequenceGapCount != 0ULL || !FeedLedgerTransportHealthy(m_blockLifecycleLedger))
+    {
+        RejectPathCoreFeedSameThread(11U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        return nullptr;
+    }
+    // Z-distance F has its own explicit common-time contract. It cannot seed
+    // modal XYZ feed, cutter nominal geometry, or the retained replay lane.
+    ClearCncModalFeedSameThread();
+    ClearPathCoreReplayHistorySameThread();
+    m_pathFeedProgrammed.fill(false);
+    m_pathFeedWCS.fill(0.0);
+    m_pathFeedCandidate.fill(0.0);
+    m_pathFeedAxes.clear();
+    m_pathFeedTargets.clear();
+    const double programmedZ = block.val('Z'), programmedC = block.val('C'), feedMMMin = block.val('F');
+    const bool absolute = source.distanceMode == 90;
+    m_pathFeedProgrammed[2] = m_pathFeedProgrammed[3] = true;
+    m_pathFeedWCS[2] = programmedZ;
+    m_pathFeedWCS[3] = programmedC;
+    CoordSys.Preview_WCS_to_MCS(m_pathFeedWCS.data(), m_pathFeedProgrammed.data(), m_pathFeedCandidate.data());
+    std::array<double, 8U> authoredStart{};
+    for (unsigned i = 0U; i < 8U; ++i)
+    {
+        authoredStart[i] = CoordSys.commandedMCS[i];
+        const double expected = i == 2U ? (absolute ? programmedZ + NCTranslationAxisOffsetMM(source, i) :
+            authoredStart[i] + programmedZ) : (i == 3U ? (absolute ? programmedC + NCTranslationAxisOffsetMM(source, i) :
+                authoredStart[i] + programmedC) : authoredStart[i]);
+        if (!std::isfinite(authoredStart[i]) || !std::isfinite(expected) ||
+            FeedDoubleBits(m_pathFeedCandidate[i]) != FeedDoubleBits(expected))
+        {
+            RejectPathCoreFeedSameThread(5U, AlarmManager::G_Code_Invalid_parameter);
+            return nullptr;
+        }
+    }
+    // Prove the raw native start/end interval on BOTH axes. The producer
+    // independently proves the unwrapped physical pulse interval as well.
+    for (int i = 2; i <= 3; ++i)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(i);
+        if (!CoordSys.IsTargetWithinSoftwareTravelLimit(axis, authoredStart[i]) ||
+            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, m_pathFeedCandidate[i]))
+        {
+            RejectPathCoreFeedSameThread(7U, CoordSys.GetSoftwareTravelLimitAlarmCode(axis, AlarmManager::PROGRAMMED_OVER_TRAVEL));
+            return nullptr;
+        }
+    }
+    const bool accepted = m_motion.TryG01ZCMoveTransactionalTail(programmedZ, programmedC,
+        m_pathFeedCandidate[2], m_pathFeedCandidate[3], feedMMMin, CoordSys.commandedMCS, m_pathFeedMotion);
+    if (!accepted)
+    {
+        RejectPathCoreFeedSameThread(6U, m_pathFeedMotion.receipt.commandAccepted ?
+            static_cast<int>(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY) :
+            static_cast<int>(AlarmManager::G_Code_Invalid_parameter));
+        return nullptr;
+    }
+    const MotionFeedLineReceipt& receipt = m_pathFeedMotion.receipt;
+    const NCZCFeedLineValue& geometry = receipt.zc;
+    // Resolve the absolute endpoints independently from the receipt's immutable
+    // starts. C uses the existing modulo/shortest policy exactly once; Z stays
+    // the raw absolute MCS target. F derives from their effective native deltas.
+    NCZCAbsoluteFeedTarget resolved{};
+    if (absolute && !TryResolveNCZCAbsoluteFeedTarget(authoredStart[2], geometry.startPulse[2],
+            authoredStart[3], geometry.startPulse[3], m_pathFeedCandidate[2], m_pathFeedCandidate[3],
+            zAxis.resolution_PPR / zAxis.finalLead, cAxis.resolution_PPR / cAxis.finalLead,
+            cAxis.useShortestPath, cAxis.rotaryModulo, resolved))
+    {
+        RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        return nullptr;
+    }
+    const double deltaZ = absolute ? resolved.deltaZMM : programmedZ;
+    const double deltaC = absolute ? resolved.deltaCDeg : programmedC;
+
+    const double nominalSeconds = NCZCFeedDetail::ProductRatio(std::fabs(deltaZ), 60.0, feedMMMin);
+    const double rotaryFeedDegMin = NCZCFeedDetail::ProductRatio(std::fabs(deltaC), 60.0, nominalSeconds);
+    const double pulsePerMM = zAxis.resolution_PPR / zAxis.finalLead;
+    const double pulsePerDegree = cAxis.resolution_PPR / cAxis.finalLead;
+    const double deltaZPulse = geometry.endPulse[2] - geometry.startPulse[2];
+    const double deltaCPulse = geometry.endPulse[3] - geometry.startPulse[3];
+    const double lengthPulse = std::hypot(deltaZPulse, deltaCPulse);
+    const double velocityPPS = NCZCFeedDetail::ProductRatio(lengthPulse, 1.0, nominalSeconds);
+    const double linearVelocityPPS = std::fabs(velocityPPS * (deltaZPulse / lengthPulse));
+    const double rotaryVelocityPPS = std::fabs(velocityPPS * (deltaCPulse / lengthPulse));
+    const double accTime = NCZCFeedDetail::Maximum(NCZCFeedDetail::EffectiveTime(zAxis.G00_acc_time),
+        NCZCFeedDetail::EffectiveTime(cAxis.G00_acc_time));
+    const double decTime = NCZCFeedDetail::Maximum(NCZCFeedDetail::EffectiveTime(zAxis.G00_dec_time),
+        NCZCFeedDetail::EffectiveTime(cAxis.G00_dec_time));
+    if (!receipt.zcFeed || receipt.rotaryFeed || !receipt.valid || !receipt.commandAccepted ||
+        !receipt.tailCommitted || !receipt.captureBound || !geometry.valid || geometry.axisMask != 12U ||
+        geometry.absolute != absolute ||
+        FeedDoubleBits(geometry.absoluteTargetZWCS) != FeedDoubleBits(absolute ? programmedZ : 0.0) ||
+        FeedDoubleBits(geometry.absoluteTargetCWCS) != FeedDoubleBits(absolute ? programmedC : 0.0) ||
+        FeedDoubleBits(geometry.absoluteTargetZMCS) != FeedDoubleBits(absolute ? m_pathFeedCandidate[2] : 0.0) ||
+        FeedDoubleBits(geometry.absoluteTargetCMCS) != FeedDoubleBits(absolute ? m_pathFeedCandidate[3] : 0.0) ||
+        FeedDoubleBits(geometry.rotaryModulo) != FeedDoubleBits(absolute ? cAxis.rotaryModulo : 0.0) ||
+        geometry.rotaryShortestPath != (absolute && cAxis.useShortestPath) ||
+        !FeedTranslationCurrent(CoordSys, receipt.translationGeneration) ||
+        (receipt.validAxisMask & 12U) != 12U ||
+        FeedDoubleBits(geometry.feedMMMin) != FeedDoubleBits(feedMMMin) ||
+        FeedDoubleBits(geometry.deltaZMM) != FeedDoubleBits(deltaZ) ||
+        FeedDoubleBits(geometry.deltaCDeg) != FeedDoubleBits(deltaC) ||
+        FeedDoubleBits(geometry.pulsePerMM) != FeedDoubleBits(pulsePerMM) ||
+        FeedDoubleBits(geometry.pulsePerDegree) != FeedDoubleBits(pulsePerDegree) ||
+        FeedDoubleBits(geometry.nominalSeconds) != FeedDoubleBits(nominalSeconds) ||
+        FeedDoubleBits(geometry.rotaryFeedDegMin) != FeedDoubleBits(rotaryFeedDegMin) ||
+        FeedDoubleBits(geometry.lengthPulse) != FeedDoubleBits(lengthPulse) ||
+        FeedDoubleBits(geometry.velocityPPS) != FeedDoubleBits(velocityPPS) ||
+        FeedDoubleBits(geometry.linearVelocityPPS) != FeedDoubleBits(linearVelocityPPS) ||
+        FeedDoubleBits(geometry.rotaryVelocityPPS) != FeedDoubleBits(rotaryVelocityPPS) ||
+        FeedDoubleBits(geometry.accTime) != FeedDoubleBits(accTime) ||
+        FeedDoubleBits(geometry.decTime) != FeedDoubleBits(decTime) ||
+        !std::isfinite(lengthPulse) || lengthPulse <= 0.0 || !std::isfinite(velocityPPS) || velocityPPS < 1.0 ||
+        !std::isfinite(rotaryFeedDegMin) || rotaryFeedDegMin <= 0.0 || rotaryFeedDegMin > 100.0 ||
+        !std::isfinite(geometry.linearVelocityPPS) || geometry.linearVelocityPPS <= 0.0 ||
+        geometry.linearVelocityPPS > zAxis.maxVel_PPS ||
+        !std::isfinite(geometry.rotaryVelocityPPS) || geometry.rotaryVelocityPPS <= 0.0 ||
+        geometry.rotaryVelocityPPS > cAxis.maxVel_PPS ||
+        receipt.identity.source != MotionCommandSource::NC_MEMORY ||
+        receipt.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !receipt.ownerLease.Matches(m_programMotionLease))
+    {
+        RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        return nullptr;
+    }
+    for (unsigned i = 0U; i < 8U; ++i)
+    {
+        const double expectedNative = absolute && i == 3U ? resolved.endCMCS : m_pathFeedCandidate[i];
+        const double expectedPulse = i == 2U ? (absolute ? resolved.endZPulse :
+            geometry.startPulse[i] + deltaZ * pulsePerMM) : (i == 3U ? (absolute ? resolved.endCPulse :
+                geometry.startPulse[i] + deltaC * pulsePerDegree) : geometry.startPulse[i]);
+        if (!std::isfinite(geometry.startMCS[i]) || !std::isfinite(geometry.endMCS[i]) ||
+            !std::isfinite(geometry.startPulse[i]) || !std::isfinite(geometry.endPulse[i]) ||
+            FeedDoubleBits(geometry.startMCS[i]) != FeedDoubleBits(authoredStart[i]) ||
+            FeedDoubleBits(geometry.endMCS[i]) != FeedDoubleBits(expectedNative) ||
+            FeedDoubleBits(geometry.endMCS[i]) != FeedDoubleBits(CoordSys.commandedMCS[i]) ||
+            FeedDoubleBits(geometry.endPulse[i]) != FeedDoubleBits(expectedPulse))
+        {
+            RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+            return nullptr;
+        }
+    }
+    ++m_pathFeed.submitted;
+    m_pathFeed.pending = true;
+    m_pathFeed.explicitFeed = true;
+    m_pathFeed.code = 1U;
+    LogPathCoreFeedSameThread("SUBMITTED");
+    LogPathCoreFeedGeometrySameThread();
+    return [](NCManager* nc) { return nc->CompletePathCoreFeedSameThread(); };
+}
+
+NC_PATH_FEED_NOINLINE
 WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
 {
+    // Classify any addressed extra physical slot before XYZ admission, so a
+    // mixed, multi-rotary or omitted-F candidate cannot fall into another lane.
+    const NCAxisIdentitySnapshot& nativeAxes = CoordSys.GetTranslationSnapshot().axisIdentity;
+    // Classify the exact physical Z+C pair first; the dedicated scope helper
+    // accepts G90/G91 only with explicit F, valid effective components and a neutral frame.
+    if (block.has('Z') && block.has('C')) return StartPathCoreZCFeedSameThread(block);
+    for (unsigned axis = 3U; axis < 8U; ++axis)
+        if (nativeAxes.address[axis] >= 'A' && nativeAxes.address[axis] <= 'Z' && block.has(nativeAxes.address[axis]))
+            return StartPathCoreRotaryFeedSameThread(block);
     if (!IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane) ||
         (CoordSys.activePlane != 17 && !IsPathCoreBasePlaneLinearBlockShapeValid(block,
             CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane)))
@@ -1005,9 +1385,21 @@ void NCManager::CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId
     m_pathFeed.sourcePC = sourcePC;
     m_pathFeed.sourceLine = sourceLine;
     const MotionFeedLineReceipt& r = m_pathFeedMotion.receipt;
-    if (!IsCncFeedValueCurrentSameThread(m_pathFeed.capturedFeed) ||
-        FeedDoubleBits(r.line.feedMMMin) != FeedDoubleBits(m_pathFeed.capturedFeed.feedMMMin) ||
-        !r.valid || !committed || !commit.IsValid() || !ledgerFound ||
+    const bool feedValueCurrent = r.zcFeed ?
+        (r.zc.valid && !r.rotaryFeed && r.zc.axisMask == 12U &&
+            r.zc.absolute == (CoordSys.GetTranslationSnapshot().distanceMode == 90) &&
+            std::isfinite(r.zc.feedMMMin) && r.zc.feedMMMin > 0.0 && r.zc.feedMMMin <= 100.0 &&
+            std::isfinite(r.zc.rotaryFeedDegMin) && r.zc.rotaryFeedDegMin > 0.0 && r.zc.rotaryFeedDegMin <= 100.0 &&
+            !m_pathFeed.capturedFeed.valid && !m_cncFeed.selected && !m_cncFeed.active && m_cncFeed.count == 0U &&
+            IsNCZCFeedNeutralFrame(CoordSys.GetTranslationSnapshot())) : r.rotaryFeed ?
+        (r.rotary.valid && r.rotary.axisMask != 0U && (r.rotary.axisMask & ~0xf8U) == 0U &&
+            (r.rotary.axisMask & (r.rotary.axisMask - 1U)) == 0U &&
+            std::isfinite(r.rotary.feedDegMin) && r.rotary.feedDegMin > 0.0 && r.rotary.feedDegMin <= 100.0 &&
+            !m_pathFeed.capturedFeed.valid && !m_cncFeed.selected && !m_cncFeed.active && m_cncFeed.count == 0U &&
+            IsNCRotaryFeedNeutralFrame(CoordSys.GetTranslationSnapshot())) :
+        (IsCncFeedValueCurrentSameThread(m_pathFeed.capturedFeed) &&
+            FeedDoubleBits(r.line.feedMMMin) == FeedDoubleBits(m_pathFeed.capturedFeed.feedMMMin));
+    if (!feedValueCurrent || !r.valid || !committed || !commit.IsValid() || !ledgerFound ||
         capture.count != 1U || capture.overflow || ledger.dispatchId != dispatchId ||
         !ledger.programCommitted || ledger.ncDispatchFailed || ledger.motionCaptureOverflow ||
         ledger.motionSegmentCount != 1U || ledger.sourceLineNumber != sourceLine ||
@@ -1049,7 +1441,8 @@ void NCManager::CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId
     }
     m_pathFeed.commit = commit.sequence;
     m_pathFeed.bound = true;
-    RtPrintf("[CNC-TRANSLATION-PATH] phase=BOUND kind=LINE translationGen=%llu wcs=%d dispatch=%llu epoch=%llu seg=%llu sourcePC=%d\n",
+    RtPrintf("[CNC-TRANSLATION-PATH] phase=BOUND kind=%s translationGen=%llu wcs=%d dispatch=%llu epoch=%llu seg=%llu sourcePC=%d\n",
+        r.zcFeed ? "ZC_LINE" : r.rotaryFeed ? "ROTARY_LINE" : "LINE",
         static_cast<unsigned long long>(r.translationGeneration), CoordSys.GetTranslationSnapshot().wcsCode,
         static_cast<unsigned long long>(dispatchId), static_cast<unsigned long long>(r.identity.epoch),
         static_cast<unsigned long long>(r.identity.segmentId), sourcePC);
@@ -1058,7 +1451,8 @@ void NCManager::CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId
         CommitCncFeedSameThread();
         return;
     }
-    CommitCncModalFeedSameThread(m_pathFeed.capturedFeed, dispatchId, commit.sequence, sourcePC, sourceLine);
+    if (!r.rotaryFeed && !r.zcFeed)
+        CommitCncModalFeedSameThread(m_pathFeed.capturedFeed, dispatchId, commit.sequence, sourcePC, sourceLine);
     LogPathCoreFeedSameThread("BOUND");
 }
 
@@ -1091,7 +1485,9 @@ void NCManager::ObservePathCoreFeedFeedbackSameThread(const MotionFeedbackEvent&
         ++m_pathFeed.started;
         return;
     case MotionFeedbackType::COMPLETED:
-        if (!m_pathFeed.consumerAccepted || m_pathFeed.completed || event.rejectReason != MotionRejectReason::NONE || event.errorCode != 0U) break;
+        if (!m_pathFeed.consumerAccepted || m_pathFeed.completed || event.rejectReason != MotionRejectReason::NONE || event.errorCode != 0U ||
+            ((m_pathFeedMotion.receipt.zcFeed ||
+                (m_pathFeedMotion.receipt.rotaryFeed && !m_pathFeedMotion.receipt.rotary.point)) && !m_pathFeed.consumerStarted)) break;
         m_pathFeed.completed = true;
         return;
     case MotionFeedbackType::PROGRESS:
@@ -1135,11 +1531,12 @@ bool NCManager::CompletePathCoreFeedSameThread()
     if (!m_pathFeed.bound || !m_pathFeed.completed || m_motion.HasPendingSafetyOrRecoveryRequests() ||
         !m_motion.IsGroupDone()) return false;
     if (m_gapWindow.active && m_gapWindow.normalSource && !m_gapWindow.normalProven) return false;
-    if (CoordSys.toolRadiusMode == 40)
-        RetainPathCoreFeedSameThread(); // Cutter replay is a later stage.
+    if (CoordSys.toolRadiusMode == 40 && !m_pathFeedMotion.receipt.rotaryFeed && !m_pathFeedMotion.receipt.zcFeed)
+        RetainPathCoreFeedSameThread(); // Native rotary/mixed paths do not enter XYZ retained geometry.
     m_pathFeed.pending = false;
     ++m_pathFeed.done;
     LogPathCoreFeedSameThread("COMPLETED");
+    if (m_pathFeedMotion.receipt.rotaryFeed || m_pathFeedMotion.receipt.zcFeed) return true;
     return CompleteGapPathSourceSameThread(true);
 }
 
@@ -1180,6 +1577,86 @@ void NCManager::LogPathCoreFeedSameThread(const char* phase) const noexcept
 NC_PATH_FEED_NOINLINE
 void NCManager::LogPathCoreFeedGeometrySameThread() const noexcept
 {
+    if (m_pathFeedMotion.receipt.zcFeed)
+    {
+        const NCZCFeedLineValue& zc = m_pathFeedMotion.receipt.zc;
+        // Bounded proof rows on the NC thread only. Each row retains run and
+        // dispatch identity; no maximum-width uint64 formatting can exceed the
+        // RT console's fixed line buffer or hide deceleration/newline fields.
+        RtPrintf("[BASE71][ZC-TARGET] run=%llu dispatch=%llu mode=%d zWCSBits=%llu cWCSBits=%llu zMCSBits=%llu cMCSBits=%llu moduloBits=%llu shortest=%u\n",
+            static_cast<unsigned long long>(m_pathFeed.run), static_cast<unsigned long long>(m_pathFeed.dispatch),
+            zc.absolute ? 90 : 91,
+            static_cast<unsigned long long>(FeedDoubleBits(zc.absoluteTargetZWCS)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.absoluteTargetCWCS)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.absoluteTargetZMCS)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.absoluteTargetCMCS)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.rotaryModulo)), zc.rotaryShortestPath ? 1U : 0U);
+        RtPrintf("[BASE71][ZC-GEO] run=%llu dispatch=%llu mask=%u validMask=%u FMMMinBits=%llu deltaZMMBits=%llu deltaCDegBits=%llu nominalSecondsBits=%llu rotaryFeedDegMinBits=%llu\n",
+            static_cast<unsigned long long>(m_pathFeed.run), static_cast<unsigned long long>(m_pathFeed.dispatch),
+            static_cast<unsigned int>(zc.axisMask), static_cast<unsigned int>(m_pathFeedMotion.receipt.validAxisMask),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.feedMMMin)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.deltaZMM)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.deltaCDeg)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.nominalSeconds)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.rotaryFeedDegMin)));
+        RtPrintf("[BASE71][ZC-DYN] run=%llu dispatch=%llu pulsePerMMBits=%llu pulsePerDegreeBits=%llu lengthPulseBits=%llu velocityPPSBits=%llu linearVelocityPPSBits=%llu rotaryVelocityPPSBits=%llu\n",
+            static_cast<unsigned long long>(m_pathFeed.run), static_cast<unsigned long long>(m_pathFeed.dispatch),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.pulsePerMM)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.pulsePerDegree)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.lengthPulse)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.velocityPPS)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.linearVelocityPPS)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.rotaryVelocityPPS)));
+        RtPrintf("[BASE71][ZC-TIME] run=%llu dispatch=%llu accTimeBits=%llu decTimeBits=%llu\n",
+            static_cast<unsigned long long>(m_pathFeed.run), static_cast<unsigned long long>(m_pathFeed.dispatch),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.accTime)),
+            static_cast<unsigned long long>(FeedDoubleBits(zc.decTime)));
+        for (unsigned i = 0U; i < 8U; ++i)
+        {
+            const bool selected = (zc.axisMask & (1U << i)) != 0U;
+            RtPrintf("[BASE71][ZC-AXIS] run=%llu dispatch=%llu axis=%u selected=%u programmed=%u startBits=%llu endBits=%llu targetBits=%llu startPulseBits=%llu endPulseBits=%llu\n",
+                static_cast<unsigned long long>(m_pathFeed.run), static_cast<unsigned long long>(m_pathFeed.dispatch),
+                i, selected ? 1U : 0U, m_pathFeedProgrammed[i] ? 1U : 0U,
+                static_cast<unsigned long long>(FeedDoubleBits(zc.startMCS[i])),
+                static_cast<unsigned long long>(FeedDoubleBits(zc.endMCS[i])),
+                static_cast<unsigned long long>(FeedDoubleBits(m_pathFeedCandidate[i])),
+                static_cast<unsigned long long>(FeedDoubleBits(zc.startPulse[i])),
+                static_cast<unsigned long long>(FeedDoubleBits(zc.endPulse[i])));
+        }
+        return;
+    }
+    if (m_pathFeedMotion.receipt.rotaryFeed)
+    {
+        const NCRotaryFeedLineValue& rotary = m_pathFeedMotion.receipt.rotary;
+        // NC-thread-only proof row; no per-cycle RT printing or allocations.
+        RtPrintf("[BASE69][ROTARY-TARGET] run=%llu dispatch=%llu mode=%d absoluteWCSBits=%llu absoluteMCSBits=%llu moduloBits=%llu shortest=%u\n",
+            static_cast<unsigned long long>(m_pathFeed.run), static_cast<unsigned long long>(m_pathFeed.dispatch),
+            CoordSys.GetTranslationSnapshot().distanceMode,
+            static_cast<unsigned long long>(FeedDoubleBits(rotary.absoluteTargetWCS)),
+            static_cast<unsigned long long>(FeedDoubleBits(rotary.absoluteTargetMCS)),
+            static_cast<unsigned long long>(FeedDoubleBits(rotary.rotaryModulo)), rotary.rotaryShortestPath ? 1U : 0U);
+        RtPrintf("[BASE68][ROTARY-GEO] run=%llu dispatch=%llu mask=%u validMask=%u FDegMinBits=%llu sweepDegBits=%llu pulsePerDegreeBits=%llu lengthPulseBits=%llu velocityPPSBits=%llu point=%u\n",
+            static_cast<unsigned long long>(m_pathFeed.run), static_cast<unsigned long long>(m_pathFeed.dispatch),
+            static_cast<unsigned int>(rotary.axisMask), static_cast<unsigned int>(m_pathFeedMotion.receipt.validAxisMask),
+            static_cast<unsigned long long>(FeedDoubleBits(rotary.feedDegMin)),
+            static_cast<unsigned long long>(FeedDoubleBits(rotary.sweepDeg)),
+            static_cast<unsigned long long>(FeedDoubleBits(rotary.pulsePerDegree)),
+            static_cast<unsigned long long>(FeedDoubleBits(rotary.lengthPulse)),
+            static_cast<unsigned long long>(FeedDoubleBits(rotary.velocityPPS)), rotary.point ? 1U : 0U);
+        for (unsigned i = 0U; i < 8U; ++i)
+        {
+            const bool selected = (rotary.axisMask & (1U << i)) != 0U;
+            RtPrintf("[BASE68][ROTARY-AXIS] run=%llu dispatch=%llu axis=%u selected=%u programmed=%u startBits=%llu endBits=%llu targetBits=%llu startPulseBits=%llu endPulseBits=%llu\n",
+                static_cast<unsigned long long>(m_pathFeed.run), static_cast<unsigned long long>(m_pathFeed.dispatch),
+                i, selected ? 1U : 0U, m_pathFeedProgrammed[i] ? 1U : 0U,
+                static_cast<unsigned long long>(FeedDoubleBits(rotary.startMCS[i])),
+                static_cast<unsigned long long>(FeedDoubleBits(rotary.endMCS[i])),
+                static_cast<unsigned long long>(FeedDoubleBits(m_pathFeedCandidate[i])),
+                static_cast<unsigned long long>(FeedDoubleBits(rotary.startPulse[i])),
+                static_cast<unsigned long long>(FeedDoubleBits(rotary.endPulse[i])));
+        }
+        return;
+    }
     const NCPathCoreFeedLineV2& g = m_pathFeedMotion.receipt.line;
     RtPrintf("[PCORE-BX-GEO] run=%llu dispatch=%llu mask=%u validMask=%u FBits=%llu lengthMMBits=%llu lengthPulseBits=%llu velocityPPSBits=%llu point=%u\n",
         static_cast<unsigned long long>(m_pathFeed.run), static_cast<unsigned long long>(m_pathFeed.dispatch),

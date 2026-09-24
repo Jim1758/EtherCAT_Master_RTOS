@@ -12,6 +12,7 @@
 #include <type_traits>
 #include <deque>
 #include "CoordinateManager.h"
+#include "MechanicalCompensationCoordinates.h" // PBC-2 dual-coordinate contract
 #include "CompensationEngine.h" // 引入剛寫好的標頭檔
 #include "SHM_Types.h"
 #include "MotionExecutionContract.h"
@@ -20,6 +21,9 @@
 #include "MotionQueueTailTransaction.h"
 #include "MotionRotaryTarget.h"
 #include "MotionCommandedEndpointReceipt.h" // BQ producer-only data export
+#include "NCRotaryFeedScope.h" // BASE68 pure rotary admission
+#include "NCZCFeedLine.h" // BASE70 common-time Z/C geometry
+#include "NCZCFeedScope.h" // BASE70 explicit G91 Z/C admission
 #include "MotionFeedLineReceipt.h" // BX G01 producer-owned workspace
 #include "MotionFeedArcReceipt.h" // BY G02/G03 producer-owned workspace
 #include "MotionPathCoreRetainedReceipt.h" // BZ immutable traversal workspace
@@ -420,6 +424,29 @@ struct AxisContext//軸參數與狀態
     // 🌟 [新增] 紀錄當前總共加上了多少補償 (mm/deg)
     double currentCompOffset_unit = 0.0;
 
+    // PBC-2: RT-owned local command frame. NOT proof of PDO delivery. The raw
+    // currentActPos remains untouched for servo feedback, HOME and limit checks.
+    pbc::CoordinateFrame mechanicalCompensationFrame{};
+
+    double GetNominalActualPositionPulse() const noexcept
+    {
+        return pbc::NominalFeedbackPulse(enablePitch || enableBacklash,
+            currentCompOffset_unit, currentActPos, resolution_PPR, finalLead,
+            mechanicalCompensationFrame);
+    }
+    double GetMechanicalFollowingErrorPulse() const noexcept
+    {
+        return pbc::FollowingErrorPulse(enablePitch || enableBacklash,
+            currentCompOffset_unit, currentCmdPos, currentActPos,
+            resolution_PPR, finalLead, mechanicalCompensationFrame);
+    }
+    bool IsMechanicalCompensationReadyForCompletion() const noexcept
+    {
+        return pbc::CoordinateCompletionReady(enablePitch || enableBacklash,
+            currentCompOffset_unit, currentCmdPos, resolution_PPR, finalLead,
+            mechanicalCompensationFrame);
+    }
+
     // --- 1. 馬達/編碼器參數 ---
 
     bool isReverse = false;             // 方向反轉 (1=反轉, 0=正轉)
@@ -585,6 +612,22 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     bool cncFeedLookahead = false; // DE uses the existing x64 padding byte at offset 201.
     bool cncCornerBlend = false; // DH compound LINE + ARC; consumes padding at offset 202.
     bool pathCoreFeedExactStop = false; // DT: nonbuffered native G01 provenance, padding byte 203.
+    bool pathCoreRotaryFeedExactStop = false; // BASE68: degree feed; existing padding byte 204.
+    bool pathCoreZCFeedExactStop = false; // BASE70: common-time Z/C; padding byte 205.
+    // With this marker only: mem_startPos[0]=native start pulse, mem_ratio[0]=PPD,
+    // mem_startPos[1]/mem_ratio[1]=accepted MCS start/end degrees;
+    // mem_totalDist=signed resolved degree sweep, mem_radius=F deg/min.
+    // BASE69 G90 only: mem_startPos[2]/mem_ratio[2]=authored WCS/MCS target,
+    // mem_startPos[3]=frozen modulo, mem_ratio[3]=shortest-path flag (0 or 1).
+    // G91 keeps these four fields zero and preserves its signed authored delta.
+    // These immutable fields are admission provenance, never replay geometry.
+    // BASE70 Z/C only (the rotary marker above is false): compact axes [2,3],
+    // targetPos[0,1]=end pulses; mem_startPos[0,1]=start pulses,
+    // mem_startPos[2,3]=start MCS, mem_ratio[0,1]=PPU,
+    // mem_ratio[2,3]=end MCS; mem_startPos[4]/mem_ratio[4]=authored dZ/dC.
+    // mem_totalDist=scalar pulse length, mem_radius=F mm/min along Z,
+    // mem_startAngle=nominal common seconds, mem_totalAngle=C deg/min.
+    // These scalars are provenance only; LINEAR maps both axes by one lambda.
     double mem_startPos[MAX_AXES] = { 0.0 };
     double mem_ratio[MAX_AXES] = { 0.0 };
     double mem_radius = 0.0;
@@ -831,8 +874,61 @@ inline bool IsMotionBaseArcPlaneSourceAllowed(const MotionCommand& command) noex
             command.cncPrefixVelocityPPS == 0.0));
 }
 
+// BASE69: one G90/G91 positional rotary axis with a frozen neutral source.
+// This marker never grants rapid, mixed-axis, lookahead, replay or EDM authority.
+inline bool IsMotionRotaryFeedSourceAllowed(const MotionCommand& command) noexcept
+{
+    const NCTranslationSnapshot& source = command.sourceTranslation;
+    if (!command.pathCoreRotaryFeedExactStop || command.pathCoreFeedExactStop || command.pathCoreZCFeedExactStop ||
+        command.mode != InterpolationMode::LINEAR || command.axisCount != 1 ||
+        command.axisIndices[0] < 3 || command.axisIndices[0] >= MAX_AXES ||
+        command.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+        command.cncFeedLookahead || command.cncCornerBlend || command.pathCorePlanarCircle ||
+        command.pathCoreFullCircle || command.pathCoreRetainedTraversal || command.pathCoreRetainedReverse ||
+        command.replayTerminalAlreadyPublished || command.mem_enableTransform ||
+        command.execution.source != MotionCommandSource::NC_MEMORY || command.ownerLease.owner != MotionOwner::AUTO ||
+        !IsNCRotaryFeedNeutralFrame(source) ||
+        (source.distanceMode != 90 && source.distanceMode != 91) ||
+        command.sourceIsAbsoluteMode != (source.distanceMode == 90) || command.sourcePlaneMode != 17 ||
+        command.sourceG162Active || command.sourceG168Active || command.sourceWCode != 0 ||
+        command.sourceG68Active || command.sourceG68Angle != 0.0 ||
+        command.sourceG51Active || command.sourceScaleRatio != 1.0 || command.sourceMirrorMask != 0U ||
+        command.sourceG16Active || command.sourceToolLengthMode != 49 || command.sourceHCode != 0 ||
+        command.sourceToolRadiusMode != 40 || command.sourceDCode != 0 ||
+        !IsNCTranslationSourceAllowed(command.sourceWCS, source)) return false;
+    const unsigned axis = static_cast<unsigned>(command.axisIndices[0]);
+    return source.axisIdentity.exists[axis] == 1U && source.axisIdentity.axisType[axis] == 1U &&
+        source.axisIdentity.nativeUnit[axis] == 2U;
+}
+
+// BASE71 admission is limited to one explicit G90/G91 Z/C line.
+// Z remains linear millimetres and C positional rotary degrees. The scalar
+// pulse path transports common progress, never a mixed physical feed metric.
+inline bool IsMotionZCFeedSourceAllowed(const MotionCommand& command) noexcept
+{
+    const NCTranslationSnapshot& source = command.sourceTranslation;
+    return command.pathCoreZCFeedExactStop && !command.pathCoreFeedExactStop &&
+        !command.pathCoreRotaryFeedExactStop && command.mode == InterpolationMode::LINEAR &&
+        command.axisCount == 2 && command.axisIndices[0] == 2 && command.axisIndices[1] == 3 &&
+        command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        !command.cncFeedLookahead && !command.cncCornerBlend && !command.pathCorePlanarCircle &&
+        !command.pathCoreFullCircle && !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse &&
+        !command.replayTerminalAlreadyPublished && !command.mem_enableTransform &&
+        command.execution.source == MotionCommandSource::NC_MEMORY && command.ownerLease.owner == MotionOwner::AUTO &&
+        IsNCZCFeedNeutralFrame(source) &&
+        command.sourceIsAbsoluteMode == (source.distanceMode == 90) && command.sourcePlaneMode == 17 &&
+        !command.sourceG162Active && !command.sourceG168Active && command.sourceWCode == 0 &&
+        !command.sourceG68Active && command.sourceG68Angle == 0.0 &&
+        !command.sourceG51Active && command.sourceScaleRatio == 1.0 && command.sourceMirrorMask == 0U &&
+        !command.sourceG16Active && command.sourceToolLengthMode == 49 && command.sourceHCode == 0 &&
+        command.sourceToolRadiusMode == 40 && command.sourceDCode == 0 &&
+        IsNCTranslationSourceAllowed(command.sourceWCS, source);
+}
+
 inline bool IsMotionFixedTranslationSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreZCFeedExactStop) return IsMotionZCFeedSourceAllowed(command);
+    if (command.pathCoreRotaryFeedExactStop) return IsMotionRotaryFeedSourceAllowed(command);
     if (!IsMotionBaseArcPlaneSourceAllowed(command)) return false;
     if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
         return command.sourceWCS == 54 && IsMotionFixedTranslationToolSourceAllowed(command) &&
@@ -890,6 +986,10 @@ static_assert(offsetof(MotionCommand, cncFeedLookahead) == 201U, "DE must not gr
 static_assert(offsetof(MotionCommand, cncCornerBlend) == 202U, "DH must use existing command padding.");
 static_assert(offsetof(MotionCommand, pathCoreFeedExactStop) == 203U &&
     offsetof(MotionCommand, mem_startPos) == 208U, "DT must preserve command size and all previous offsets.");
+static_assert(offsetof(MotionCommand, pathCoreRotaryFeedExactStop) == 204U,
+    "BASE68 must consume existing command padding only.");
+static_assert(offsetof(MotionCommand, pathCoreZCFeedExactStop) == 205U,
+    "BASE70 must consume existing command padding only.");
 #endif
 
 // Stage NC-0.2D：NC Producer 在單一 Program Block 派送期間，
@@ -2617,7 +2717,7 @@ public:
             if (m_pContexts != nullptr && i < m_pContexts->size() && (*m_pContexts)[i].isExist) {
                 const AxisContext& axis = (*m_pContexts)[i];
                 double pulsePerUnit = axis.resolution_PPR / axis.finalLead;
-                outTarget_mm[i] = axis.currentActPos / pulsePerUnit;
+                outTarget_mm[i] = axis.GetNominalActualPositionPulse() / pulsePerUnit;
             }
             else {
                 outTarget_mm[i] = 0.0;
@@ -3523,7 +3623,11 @@ private:
         const NCPathCoreRetainedGeometry* cncCorner = nullptr,
         double cncPrefixVelocityPPS = 0.0,
         bool pathCoreFeedExactStop = false,
-        MotionCommand* preparedCommand = nullptr) noexcept;
+        MotionCommand* preparedCommand = nullptr,
+        bool pathCoreRotaryFeedExactStop = false,
+        const NCRotaryFeedLineValue* rotaryGeometry = nullptr,
+        bool pathCoreZCFeedExactStop = false,
+        const NCZCFeedLineValue* zcGeometry = nullptr) noexcept;
     bool TryG00MoveInternal(
         const std::vector<int>& axes,
         const std::vector<double>& targetPos,
@@ -3760,6 +3864,12 @@ private:
     void ApplyPendingExecutionEpochChange();
 
     bool IsNCTranslationAxisIdentityCurrent(const NCTranslationSnapshot& snapshot) const noexcept;
+    // BASE68 producer-only accepted rotary source. Its owner/epoch and shared
+    // pulse-tail tag must still match; RESET/restart/other motions revoke it.
+    MotionCncPathTail m_rotaryFeedProducerTail{};
+    // BASE70 private native-basis proof, never queued geometry authority.
+    // axisMask records proved Z/C native bits: 12 after ZC, 8 or 12 after C.
+    MotionCncPathTail m_zcFeedProducerTail{};
     NCTranslationSnapshot m_pendingTranslation{}; // NC producer only.
     MotionNCTranslationPublication m_translationPublication{};
     bool IsPendingCommandTranslationValid(MotionCommandSource source) const noexcept
@@ -4117,6 +4227,14 @@ public:
         double feedMMMin,
         double(&commandedMCSTail)[MAX_AXES],
         MotionFeedLineWorkspace& workspace);
+    // BASE69: G90 absolute or G91 signed degrees; resolve the native path once.
+    bool TryG01RotaryMoveTransactionalTail(int axisIndex, double programmedValue,
+        double targetMCS, double feedDegMin, double(&commandedMCSTail)[MAX_AXES],
+        MotionFeedLineWorkspace& workspace);
+    // BASE71: explicit G90/G91 Z/C, F measures Z millimetres/minute; one common clock.
+    bool TryG01ZCMoveTransactionalTail(double programmedZ, double programmedC,
+        double targetZMCS, double targetCMCS, double feedMMMin,
+        double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace);
     // DD: a non-null predecessor selects BUFFERED/EXACT_STOP, same tuple/mapping.
     bool TryG01MoveTransactionalTail(
         const std::vector<int>& axes,

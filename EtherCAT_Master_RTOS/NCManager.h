@@ -1452,8 +1452,12 @@ private:
     {
         double minimum[3] = {}, maximum[3] = {};
         bool enabled[3] = {}, homed = false;
+        // BASE70: rotary interpretation and rotary/Z profiles cannot drift after freeze.
+        double rotaryModulo = 0.0, maximumVelocity = 0.0;
+        double accelerationTime = 0.0, decelerationTime = 0.0;
+        bool positionalRotary = false, shortestPath = false;
     };
-    std::array<FixedTranslationTravelPolicy, 3U> m_fixedTranslationTravel{};
+    std::array<FixedTranslationTravelPolicy, 8U> m_fixedTranslationTravel{};
     std::uint64_t m_fixedTranslationTravelGeneration = 0ULL;
     bool IsFixedTranslationTravelCurrentSameThread() const noexcept;
     bool PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode);
@@ -2443,6 +2447,8 @@ private:
     void BeginPathCoreFeedCaptureSameThread(const NCBlock& block,
         NCBlockDispatchId dispatchId) noexcept;
     WaitConditionFunc StartPathCoreFeedSameThread(const NCBlock& block);
+    WaitConditionFunc StartPathCoreRotaryFeedSameThread(const NCBlock& block);
+    WaitConditionFunc StartPathCoreZCFeedSameThread(const NCBlock& block);
     void CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId,
         const MotionProgramBlockCapture& capture, const NCProgramCommitSnapshot& commit,
         bool committed, bool ledgerFound, const NCBlockLifecycleSnapshot& ledger,
@@ -2509,8 +2515,10 @@ private:
             active = selected = capacityLogged = drainLogged = faulted = false;
         }
     } m_cncFeed{};
-    static_assert(sizeof(CncFeedFlight) <= 1536U, "DG mixed receipt row storage budget changed.");
-    static_assert(sizeof(CncFeedQueue) <= 7168U, "DG NC-owned mixed queue storage budget changed.");
+    // BASE70: bounded native Z+C proof adds 392 bytes per receipt including alignment.
+    // Four existing heap-owned rows add 1568 bytes; capacity stays fixed.
+    static_assert(sizeof(CncFeedFlight) <= 2248U, "BASE70 mixed receipt row storage budget changed.");
+    static_assert(sizeof(CncFeedQueue) <= 10016U, "BASE70 NC-owned mixed queue storage budget changed.");
     static bool IsCncPathQueuedBlockShapeValid(const NCBlock& block, int unitsMode = 21, bool polar = false) noexcept;
     bool IsCncFeedScopeSameThread() noexcept;
     bool PrepareCncFeedDispatchSameThread(const NCParsedBlock* parsed, int pc);

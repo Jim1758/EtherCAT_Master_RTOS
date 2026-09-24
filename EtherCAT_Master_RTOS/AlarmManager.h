@@ -117,7 +117,13 @@ public:
         MOTION_COMMAND_QUEUE_FULL = AXIS_BASE + 19, // 3019: NC -> Motion SPSC Ingress 已滿
         MOTION_REPLAY_QUEUE_FULL = AXIS_BASE + 20,  // 3020: B2 RT Replay 固定緩衝區已滿
         MOTION_GROUP_MAPPING_INTEGRITY = AXIS_BASE + 21, // 3021: 插補映射／孤兒軸完整性失敗
-        SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG = AXIS_BASE + 22 // 3022:軟體行程限位配置無效 / Active software travel-limit configuration invalid
+        SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG = AXIS_BASE + 22, // 3022:軟體行程限位配置無效 / Active software travel-limit configuration invalid
+
+        // PBC-1: boot validation / motion-integration release / runtime containment.
+        MECHANICAL_COMPENSATION_CONFIG_INVALID = AXIS_BASE + 30, // 3030: invalid parameters / table geometry / magnitude
+        MECHANICAL_COMPENSATION_TABLE_INVALID = AXIS_BASE + 31, // 3031: required paired table unreadable / malformed
+        MECHANICAL_COMPENSATION_NOT_INTEGRATED = AXIS_BASE + 32, // 3032: enabled compensation not released into Motion
+        MECHANICAL_COMPENSATION_RUNTIME_REJECTED = AXIS_BASE + 33 // 3033: forbidden live config / uncommitted engine
 
     };
 

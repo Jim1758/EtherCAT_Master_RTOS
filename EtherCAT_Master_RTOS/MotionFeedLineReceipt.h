@@ -2,6 +2,8 @@
 
 #include "MotionExecutionContract.h"
 #include "NCPathCoreFeedLine.h"
+#include "NCRotaryFeedLine.h"
+#include "NCZCFeedLine.h"
 #include "NCPathCoreRetainedPath.h"
 
 #include <array>
@@ -24,6 +26,12 @@ enum class MotionFeedLineCode : std::uint8_t
 struct MotionFeedLineReceipt
 {
     NCPathCoreFeedLineV2 line{};
+    // BASE68 keeps native rotary degree/rate data separate from millimetre geometry.
+    NCRotaryFeedLineValue rotary{};
+    bool rotaryFeed = false;
+    // BASE70 stores native Z/C units and their common nominal time separately.
+    NCZCFeedLineValue zc{};
+    bool zcFeed = false;
     NCPathCoreRetainedGeometry blendGeometry{};
     NCPathCoreCornerMetadata blendMetadata{};
     // DI timing permission; canonical geometry and authored source F stay unchanged.
@@ -44,7 +52,9 @@ struct MotionFeedLineReceipt
 
     void Clear() noexcept
     {
-        line.Clear(); blendGeometry.Clear(); blendMetadata = NCPathCoreCornerMetadata{};
+        line.Clear(); rotary.Clear(); rotaryFeed = false;
+        zc.Clear(); zcFeed = false;
+        blendGeometry.Clear(); blendMetadata = NCPathCoreCornerMetadata{};
         cornerNextFeedMMMin = cornerDispatchFeedMMMin = cornerDispatchVelocityPPS = 0.0;
         identity = MotionExecutionIdentity{};
         ownerLease = MotionOwnerLease{};
@@ -79,6 +89,8 @@ struct MotionCncPathTail
     }
     void Assign(const MotionFeedLineReceipt& receipt) noexcept
     {
+        // Rotary or Z+C exact-stop receipts cannot become XYZ queued-feed tails.
+        if (receipt.rotaryFeed || receipt.zcFeed) { Clear(); return; }
         endMCS = receipt.blendGeometry.valid ? receipt.blendGeometry.endMCS : receipt.line.endMCS;
         endPulse = receipt.blendGeometry.valid ? receipt.blendGeometry.endPulse : receipt.line.endPulse;
         identity = receipt.identity; ownerLease = receipt.ownerLease;
@@ -95,6 +107,9 @@ static_assert(sizeof(MotionCncPathTail) <= 192U &&
 struct MotionFeedLineWorkspace
 {
     NCPathCoreFeedLineInput input{};
+    NCRotaryFeedLineInput rotaryInput{};
+    NCZCFeedLineInput zcInput{};
+    std::vector<int> rotaryAxes;
     NCPathCoreFeedArcInput cornerArcInput{};
     NCPathCoreFeedArcV2 cornerArc{};
     MotionFeedLineReceipt receipt{};
@@ -108,5 +123,6 @@ struct MotionFeedLineWorkspace
     MotionFeedLineWorkspace()
     {
         targetPulse.reserve(8U);
+        rotaryAxes.reserve(8U);
     }
 };

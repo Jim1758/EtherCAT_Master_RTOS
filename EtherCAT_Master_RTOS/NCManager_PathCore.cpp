@@ -8,6 +8,8 @@
 #include "NCManager.h"
 #include "GMCodeHandlers.h"
 #include "NCXYZFeedScope.h"
+#include "NCRotaryFeedScope.h"
+#include "NCZCFeedScope.h"
 #include <cstdint>
 #include <type_traits>
 #include <cstring>
@@ -2527,13 +2529,13 @@ namespace
     }
 }
 
-// Fixed XYZ translation. All methods run on the existing NC producer thread.
+// Fixed native translation. All methods run on the existing NC producer thread.
 bool NCManager::IsFixedTranslationTravelCurrentSameThread() const noexcept
 {
     if (!CoordSys.IsTranslationRunFrozen()) return true;
     const NCTranslationSnapshot snapshot = CoordSys.GetTranslationSnapshot();
     if (snapshot.generation != m_fixedTranslationTravelGeneration) return false;
-    for (unsigned i = 0U; i < 3U; ++i)
+    for (unsigned i = 0U; i < 8U; ++i)
     {
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
         const FixedTranslationTravelPolicy& captured = m_fixedTranslationTravel[i];
@@ -2544,6 +2546,15 @@ bool NCManager::IsFixedTranslationTravelCurrentSameThread() const noexcept
         const bool enabled[3] = { axis.travelLimit1Enable,
             axis.travelLimit2Enable, axis.travelLimit3Enable };
         if (captured.homed != axis.isHomed) return false;
+        const bool positionalRotary = axis.isExist && axis.axisType == AxisType::ROTARY;
+        if (captured.positionalRotary != positionalRotary) return false;
+        if (positionalRotary && (captured.shortestPath != axis.useShortestPath ||
+            std::memcmp(&captured.rotaryModulo, &axis.rotaryModulo, sizeof(double)) != 0)) return false;
+        // BASE70: the physical Z profile is part of the frozen common-time proof.
+        if ((positionalRotary || (i == 2U && axis.isExist && axis.axisType == AxisType::LINEAR)) &&
+            (std::memcmp(&captured.maximumVelocity, &axis.maxVel_PPS, sizeof(double)) != 0 ||
+            std::memcmp(&captured.accelerationTime, &axis.G00_acc_time, sizeof(double)) != 0 ||
+            std::memcmp(&captured.decelerationTime, &axis.G00_dec_time, sizeof(double)) != 0)) return false;
         for (unsigned j = 0U; j < 3U; ++j)
             if (captured.enabled[j] != enabled[j] ||
                 std::memcmp(&captured.minimum[j], &minimum[j], sizeof(double)) != 0 ||
@@ -2582,9 +2593,19 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         !m_pathReplay.pending && !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active &&
         !m_cutterLine.leadOutRequired;
     const bool xyzFeedMemoryBound = m_mode == NCOperationMode::MEMORY && CoordSys.IsTranslationRunBound();
-    const NCXYZFeedScopeDecision xyzFeedDecision = EvaluateNCXYZFeedScope(
-        xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
-        xyzFeedMemoryBound, xyzFeedRuntimeClear);
+    // BASE68 is a separate degree-domain producer. Only its complete
+    // neutral, explicit, single-axis shape may replace an XYZ-only rejection.
+    const bool rotaryFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCRotaryFeedBlockAllowed(xyzFeedSource, block);
+    // BASE70 is independently classified; it never broadens the XYZ lane.
+    const bool zcFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCZCFeedBlockAllowed(xyzFeedSource, block);
+    const NCXYZFeedScopeDecision xyzFeedDecision = (rotaryFeedAllowed || zcFeedAllowed) ?
+        NCXYZFeedScopeDecision::ALLOWED : EvaluateNCXYZFeedScope(
+            xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
+            xyzFeedMemoryBound, xyzFeedRuntimeClear);
     // Preserve the existing formal mapping-integrity stop for source drift;
     // a changed live configuration must not become a syntax-only rejection.
     if (xyzFeedDecision != NCXYZFeedScopeDecision::UNCHANGED && xyzFeedMemoryBound &&
@@ -2706,15 +2727,23 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
     const NCTranslationSnapshot candidate = CoordSys.GetTranslationSnapshot();
     // BASE60: qualifying G01/G02/G03 may freeze the native XYZ source.
     // Unfrozen G00 retains its existing fallback and never opens this lane.
+    const bool extraAxisRotaryFeed = gCode == 1 && !xyzFeedFrozen && rotaryFeedAllowed;
+    const bool extraAxisZCFeed = gCode == 1 && !xyzFeedFrozen && zcFeedAllowed;
     const bool extraAxisXYZFeed = gCode >= 1 && gCode <= 3 && !xyzFeedFrozen &&
-        xyzFeedDecision == NCXYZFeedScopeDecision::ALLOWED;
+        !extraAxisRotaryFeed && !extraAxisZCFeed && xyzFeedDecision == NCXYZFeedScopeDecision::ALLOWED;
+    unsigned rotaryAxis = 8U;
+    if (extraAxisRotaryFeed &&
+        !TryGetNCRotaryFeedAxis(candidate.axisIdentity, block, rotaryAxis)) return false;
     bool scopeValid = IsNCTranslationSnapshotValid(candidate) &&
         m_axisNames[0] == 'X' && m_axisNames[1] == 'Y' && m_axisNames[2] == 'Z';
     for (int i = 0; i < 8; ++i)
     {
         const AxisContext& axis = m_motion.GetAxisContext(i);
         if (i < 3 && (!axis.isExist || axis.axisType != AxisType::LINEAR)) scopeValid = false;
-        if (i >= 3 && ((axis.isExist && !extraAxisXYZFeed) || (m_axisNames[i] != ' ' && block.has(m_axisNames[i])))) scopeValid = false;
+        if (i >= 3 && ((axis.isExist && !extraAxisXYZFeed && !extraAxisRotaryFeed && !extraAxisZCFeed) ||
+            (m_axisNames[i] != ' ' && block.has(m_axisNames[i]) &&
+                !(extraAxisRotaryFeed && static_cast<unsigned>(i) == rotaryAxis) &&
+                !(extraAxisZCFeed && i == 3)))) scopeValid = false;
     }
     if (!scopeValid)
     {
@@ -2735,7 +2764,7 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         m_state = NCState::ALARM;
         return false;
     }
-    for (unsigned i = 0U; i < 3U; ++i)
+    for (unsigned i = 0U; i < 8U; ++i)
     {
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
         FixedTranslationTravelPolicy& captured = m_fixedTranslationTravel[i];
@@ -2749,6 +2778,12 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         captured.enabled[1] = axis.travelLimit2Enable;
         captured.enabled[2] = axis.travelLimit3Enable;
         captured.homed = axis.isHomed;
+        captured.positionalRotary = axis.isExist && axis.axisType == AxisType::ROTARY;
+        captured.shortestPath = axis.useShortestPath;
+        captured.rotaryModulo = axis.rotaryModulo;
+        captured.maximumVelocity = axis.maxVel_PPS;
+        captured.accelerationTime = axis.G00_acc_time;
+        captured.decelerationTime = axis.G00_dec_time;
     }
     const NCTranslationSnapshot frozen = CoordSys.GetTranslationSnapshot();
     RtPrintf("[COORD][DISTANCE] run=%llu generation=%llu mode=%d frozen=1\n",
@@ -2782,6 +2817,15 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         m_state = NCState::ALARM;
         return false;
     }
+    if (extraAxisRotaryFeed)
+        RtPrintf("[BASE69][ROTARY-FEED-ADMITTED] run=%llu generation=%llu axis=%u presentMask=%u mode=%d unit=DEG_MIN exactStop=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), rotaryAxis,
+            static_cast<unsigned>(xyzFeedPresentMask), frozen.distanceMode);
+    if (extraAxisZCFeed)
+        RtPrintf("[BASE71][ZC-FEED-ADMITTED] run=%llu generation=%llu mask=12 presentMask=%u mode=%d unit=Z_MM_MIN exactStop=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), static_cast<unsigned>(xyzFeedPresentMask), frozen.distanceMode);
     if (extraAxisXYZFeed)
     {
         RtPrintf("[BASE58][XYZ-FEED-ADMITTED] run=%llu generation=%llu presentMask=%u auxiliaryMask=%u feedAxisLimit=7 exactStop=1 beforeSubmit=1\n",
@@ -2816,6 +2860,17 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
             static_cast<unsigned long long>(frozen.generation), frozen.wcsCode,
             frozen.rotationPlane, frozen.distanceMode, frozen.toolLengthMode, frozen.toolHCode,
             frozen.workMode, frozen.workWCode);
+        RtPrintf("[BASE66][XYZ-ROTATION-SCOPE] run=%llu generation=%llu plane=%d mode=%d rotation=%d work=%d W=%d exactStop=1 auxiliaryStationary=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation),
+            frozen.rotationPlane, frozen.distanceMode, frozen.rotationMode,
+            frozen.workMode, frozen.workWCode);
+        RtPrintf("[BASE67][XYZ-SCALE-MIRROR-SCOPE] run=%llu generation=%llu plane=%d mode=%d scaling=%d mirrorMask=%u factorBits=%llu exactStop=1 auxiliaryStationary=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation),
+            frozen.rotationPlane, frozen.distanceMode, frozen.scalingMode,
+            static_cast<unsigned>(frozen.mirrorMask),
+            static_cast<unsigned long long>(PathCoreReturnDoubleBits(frozen.scalingFactor)));
     }
     // Use the existing integer transport: the target RtPrintf prints float conversions as "f".
     RtPrintf("[AXIS-IDENTITY][FROZEN] schema=%u run=%llu generation=%llu exists=%u%u%u%u%u%u%u%u role=%u mode=%u ecc=%u\n",
@@ -3307,9 +3362,19 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         !m_pathReplay.pending && !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active &&
         !m_cutterLine.leadOutRequired;
     const bool xyzFeedMemoryBound = m_mode == NCOperationMode::MEMORY && CoordSys.IsTranslationRunBound();
-    const NCXYZFeedScopeDecision xyzFeedDecision = EvaluateNCXYZFeedScope(
-        xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
-        xyzFeedMemoryBound, xyzFeedRuntimeClear);
+    // BASE68 is a separate degree-domain producer. Only its complete
+    // neutral, explicit, single-axis shape may replace an XYZ-only rejection.
+    const bool rotaryFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCRotaryFeedBlockAllowed(xyzFeedSource, block);
+    // BASE70 is independently classified; it never broadens the XYZ lane.
+    const bool zcFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCZCFeedBlockAllowed(xyzFeedSource, block);
+    const NCXYZFeedScopeDecision xyzFeedDecision = (rotaryFeedAllowed || zcFeedAllowed) ?
+        NCXYZFeedScopeDecision::ALLOWED : EvaluateNCXYZFeedScope(
+            xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
+            xyzFeedMemoryBound, xyzFeedRuntimeClear);
     // Preserve the existing formal mapping-integrity stop for source drift;
     // a changed live configuration must not become a syntax-only rejection.
     if (xyzFeedDecision != NCXYZFeedScopeDecision::UNCHANGED && xyzFeedMemoryBound &&

@@ -119,7 +119,10 @@ public:
     // 🌟 即時座標資料區
     // ==========================================
     // 儲存 8 軸的真實機械位置 (未來由 EtherCAT 的 RxPDO/TxPDO 更新)
-    double actualMCS[8] = { 0.0 };    // 🌟 新增：真實機械位置
+    double actualMCS[8] = { 0.0 }; // PBC-2 nominal-equivalent display MCS
+    // Same RT producer, before rotary display modulo. DTG is a signed distance
+    // to the retained execution endpoint, not a difference of wrapped angles.
+    double actualUnwrappedMCS[8] = { 0.0 };
 
     // 🌟 新增：刀長補正狀態 (G43/G44/G49, 群組 8)
     int toolLengthMode = 49; // 預設 G49 關閉
@@ -222,7 +225,7 @@ public:
     // 🌟 新增：座標計算 API
     // ==========================================
     // 1. 把外部 (EtherCAT) 讀到的新座標更新進來
-    void UpdateActualMCS(const double* newMCS);
+    void UpdateActualMCS(const double* newMCS, const double* unwrappedMCS = nullptr);
 
     // 2. 獲取當前真實的工件座標 (WCS)
     void GetActualWCS(double* outWCS) const;

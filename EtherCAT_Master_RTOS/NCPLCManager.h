@@ -64,6 +64,8 @@ private:
     PLCManager& m_plc;                // PLC Runtime / Memory ºÞ²z¾¹
 
     // Global State
+    // BASE65 START_DIAG1: independent observation; never used for C12 dispatch.
+    bool m_startDiagnosticLevel = false;
     bool m_servoReady = false;          // C11 Servo / Machine Ready ª¬ºA
     bool m_edmProtectionBypass = false; // C20 EDM Protection Bypass ª¬ºA
 

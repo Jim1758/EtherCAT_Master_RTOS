@@ -370,6 +370,8 @@ public:
 
     // 2. 指令交握介面 (給 HMI 人機介面呼叫的)
     void CycleStart();  // 按下啟動鍵
+    // BASE65 START_DIAG1: supervisory-thread observation only; no admission.
+    void PrintProgramStartDiagnostic() const noexcept;
     void FeedHold();    // 按下暫停鍵
     void Reset();       // 按下重置鍵
     // =========================================================
@@ -1170,6 +1172,14 @@ private:
     // the 250 us runtime publishes clean standstill evidence.
     bool m_bootProgramImageLoaded = false;
     bool m_programLoadStartBlocked = false;
+    // Diagnostic strings below are static literals, never control inputs.
+    const char* m_programLoadRejectDiagnostic = "NONE";
+    const char* m_programLoadContextDiagnostic = "NONE";
+    const char* m_startDiagnosticEvent = "NONE";
+    const char* m_startDiagnosticFinish = "NONE";
+    std::uint64_t m_startDiagnosticRequests = 0ULL;
+    std::uint64_t m_startDiagnosticWaitScans = 0ULL;
+    std::uint64_t m_startDiagnosticCancelled = 0ULL;
     bool m_bootSafetyHandoffPending = true;
 
     // Stage NC-0.2F：已追蹤 Motion Block 的 Wait Callback 採 Dual-Key

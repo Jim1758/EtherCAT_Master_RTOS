@@ -944,6 +944,12 @@
     <ClInclude Include="CoordinateFileSave.h">
       <Filter>Header Files\NC\Coordinate</Filter>
     </ClInclude>
+    <ClInclude Include="NCXYZFeedScope.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="RotaryPidDiagnostic.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="DC同步_相關設定說明.txt">

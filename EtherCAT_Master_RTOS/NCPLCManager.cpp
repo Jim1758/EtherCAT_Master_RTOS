@@ -6,6 +6,7 @@
 #include "AlarmManager.h"
 #include <cstdint>
 #include <cmath>
+#include <rtapi.h> // BASE65 START_DIAG1: supervisory diagnostics only.
 
 // =========================================================
 // Constructor
@@ -112,6 +113,16 @@ void NCPLCManager::Process()
         }
     }
 
+    // Observe both levels even when the safety gate skips ProcessGlobalInputs.
+    // The original m_prevCycleStart and every dispatch gate remain untouched.
+    const bool diagnosticStartLevel = m_plc.Get_C(NCPLC::C::CYCLE_START);
+    if (diagnosticStartLevel != m_startDiagnosticLevel)
+    {
+        m_startDiagnosticLevel = diagnosticStartLevel;
+        RtPrintf("[PLC-START-DIAG] LEVEL C12=%u C11=%u safety=%u previousDispatchLevel=%u nc=%d\n",
+            diagnosticStartLevel ? 1U : 0U, m_plc.Get_C(NCPLC::C::SERVO_READY) ? 1U : 0U,
+            safetyInputActive ? 1U : 0U, m_prevCycleStart ? 1U : 0U, static_cast<int>(m_nc.GetState()));
+    }
     if (safetyInputActive)
     {
         m_lastMPGCount = static_cast<int32_t>(m_plc.GetMemory("DR", NCPLC::DR::MPG_ENCODER_COUNT)); // Safety gate skips ProcessManualInputs(). Keep DR200 baseline synchronized so clearing safety cannot replay handwheel counts accumulated during the stop.
@@ -231,9 +242,14 @@ void NCPLCManager::ProcessGlobalInputs()
             !manualMoveModeActive &&
             !jogAxisActive &&
             noHomeOwnershipConflict;
+        RtPrintf("[PLC-START-DIAG] EDGE result=%s servo=%u limit=%u manual=%u jog=%u homeOK=%u nc=%d\n",
+            cycleStartAllowed ? "DISPATCH" : "BLOCKED", m_servoReady ? 1U : 0U,
+            hardLimitActive ? 1U : 0U, manualMoveModeActive ? 1U : 0U,
+            jogAxisActive ? 1U : 0U, noHomeOwnershipConflict ? 1U : 0U, static_cast<int>(m_nc.GetState()));
         if (cycleStartAllowed)
         {
             m_nc.CycleStart();
+            m_nc.PrintProgramStartDiagnostic();
         }
     }
     m_prevCycleStart = cycleStart;

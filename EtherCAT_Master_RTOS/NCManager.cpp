@@ -4,6 +4,7 @@
 #include "MacroParser.h"
 #include "GCodeParser.h"
 #include "NCGCodeSemantics.h"
+#include "NCXYZFeedScope.h"
 #include "NCExpressionResolver.h"
 #include "NCProgramCache.h"
 #include "NCBlockLifecycleLedger.h"
@@ -283,17 +284,54 @@ m_pathCoreLiveRetention(AllocatePathCoreLiveOwnerTagStartup())
         MotionCommandSource::NC_MEMORY);
 }
 
+// BASE65 START_DIAG1: called only on the existing NC/HMI supervisory thread.
+// Values are observations, not a coherent RT permission or a new interlock.
+void NCManager::PrintProgramStartDiagnostic() const noexcept
+{
+    const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    RtPrintf("[NC-START-DIAG] build=BASE65_START_FIX1 rx=%llu event=%s finish=%s "
+        "nc=%d mode=%d pending=%u phase=%u scans=%llu cancelled=%llu "
+        "origin=%d cache=%llu/%llu owner=%u/%u expectedOwner=%u/%u epoch=%u/%u "
+        "alarm=%u alarmRev=%u/%u extReady=%u safety=%u loadLock=%u "
+        "loadReason=%s loadContext=%s file=%.160s\n",
+        static_cast<unsigned long long>(m_startDiagnosticRequests),
+        m_startDiagnosticEvent, m_startDiagnosticFinish,
+        static_cast<int>(GetState()), static_cast<int>(m_mode),
+        m_programRunStartPending ? 1U : 0U,
+        static_cast<unsigned>(m_pendingProgramRunPhase),
+        static_cast<unsigned long long>(m_startDiagnosticWaitScans),
+        static_cast<unsigned long long>(m_startDiagnosticCancelled),
+        static_cast<int>(m_pendingProgramRunOriginState),
+        static_cast<unsigned long long>(GetBaseProgramCache().GetGeneration()),
+        static_cast<unsigned long long>(m_pendingProgramRunCacheGeneration),
+        static_cast<unsigned>(owner.owner), owner.generation,
+        static_cast<unsigned>(m_pendingProgramRunOwnerLease.owner),
+        m_pendingProgramRunOwnerLease.generation,
+        m_motion.GetCurrentExecutionEpoch(), m_pendingProgramRunExecutionEpoch,
+        alarms.HasAlarm() ? 1U : 0U, alarms.GetUpdateCount(),
+        m_pendingProgramRunAlarmUpdateCount,
+        m_externalReadyInterlock ? 1U : 0U,
+        m_motion.HasPendingSafetyOrRecoveryRequests() ? 1U : 0U,
+        m_programLoadStartBlocked ? 1U : 0U,
+        m_programLoadRejectDiagnostic, m_programLoadContextDiagnostic,
+        m_mainProgramName.c_str());
+}
+
 bool NCManager::RejectProgramLoad(
     const char* reason, const std::string& filepath) noexcept
 {
+    m_programLoadRejectDiagnostic = reason;
     m_programLoadStartBlocked = true;
     RtPrintf("[NC-LOAD-CJ] REJECTED reason=%s requested=%.240s current=%.240s startBlocked=1\n",
         reason, filepath.c_str(), m_mainProgramName.c_str());
+    PrintProgramStartDiagnostic();
     return false;
 }
 
 bool NCManager::LoadProgram(const std::string& filepath)
 {
+    m_programLoadContextDiagnostic = "ENTRY";
     const NCState originState = m_state.load(std::memory_order_acquire);
     if (originState != NCState::IDLE && originState != NCState::READY &&
         originState != NCState::P_END)
@@ -310,6 +348,7 @@ bool NCManager::LoadProgram(const std::string& filepath)
 
     const auto contextCurrent = [&]() noexcept -> bool
     {
+        m_programLoadContextDiagnostic = "IDENTITY_OR_START_HOME";
         const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
         if (m_state != originState || m_mode != originMode ||
             m_programCache.GetGeneration() != originCache ||
@@ -318,11 +357,13 @@ bool NCManager::LoadProgram(const std::string& filepath)
             m_programRunStartPending || Homing.IsActive()) return false;
         // The retained boot SAFETY owner still belongs to startup, not a LOAD.
         if (bootstrapProgramLoad) return true;
+        m_programLoadContextDiagnostic = "ALARM_SAFETY_LIFECYCLE_OWNER";
         if (alarms.HasAlarm() || alarms.GetUpdateCount() != alarmRevision ||
             m_motion.HasPendingSafetyOrRecoveryRequests() ||
             m_lifecycleInterruptionShadow.IsActive() ||
             (owner.owner != MotionOwner::NONE && owner.owner != MotionOwner::IDLE_HOLD))
             return false;
+        m_programLoadContextDiagnostic = "TRANSPORT_OR_CALLBACK";
         const NCLifecycleInterruptionSample sample = BuildLifecycleInterruptionSample();
         if (sample.activeBlocks != 0U || sample.axisCommandDepth != 0U ||
             sample.axisResultDepth != 0U || sample.commandQueueDepth != 0U ||
@@ -333,22 +374,32 @@ bool NCManager::LoadProgram(const std::string& filepath)
             sample.safetyOrRecoveryPending || !m_motion.IsGroupNCDrained()) return false;
         if (owner.owner == MotionOwner::IDLE_HOLD)
         {
+            // BASE65 START_FIX1: replacing an inert NC image is not another
+            // Program End handoff. IDLE_HOLD retains the same owner/epoch and
+            // holding output throughout LOAD. Its rolling physical dwell can
+            // restart after M30 has already completed; requiring settled here
+            // rejects a valid file selection and latches START on the old image.
+            // Require an exact RT drain with stopped commands instead. A fresh
+            // START still needs its own epoch acknowledgement and physical
+            // readiness; M30 / HOLD / RESET keep their existing settle proofs.
+            m_programLoadContextDiagnostic = "IDLE_HOLD_DRAIN";
             MotionNCSettleSnapshot proof{};
             MotionNCSettleCounters counters{};
             if (!m_motion.TryGetNCSettleEvidence(MotionNCSettleProfile::GROUP_COMPLETION,
                 proof, counters) ||
                 proof.profile != MotionNCSettleProfile::GROUP_COMPLETION ||
-                proof.publicationGeneration == 0ULL || proof.proofSequence == 0ULL ||
+                proof.publicationGeneration == 0ULL ||
                 proof.executionEpoch != originEpoch || proof.owner != owner.owner ||
                 proof.ownerGeneration != owner.generation || proof.scopeMask == 0U ||
                 !proof.runtimeObserved || !proof.runtimeCycleValid ||
                 !proof.runtimeCycleContiguous || !proof.groupDrained || proof.groupActive ||
-                !proof.settled || proof.safetyOrRecoveryPending ||
-                proof.requiredCycles != MOTION_NC_SETTLE_REQUIRED_CYCLES ||
-                proof.dwellCycles < proof.requiredCycles || proof.commandQueueDepth != 0U ||
+                proof.safetyOrRecoveryPending || proof.anyAxisFaultOrEstop ||
+                !proof.virtualCommandStopped || !proof.allAxisCommandStopped ||
+                proof.commandQueueDepth != 0U ||
                 proof.commandIngressDepth != 0U || proof.commandReplayDepth != 0U)
                 return false;
         }
+        m_programLoadContextDiagnostic = "FINAL_IDENTITY";
         const MotionOwnerLease checkedOwner = m_motion.GetMotionOwnerLease();
         return checkedOwner.owner == originOwner.owner &&
             checkedOwner.generation == originOwner.generation &&
@@ -494,6 +545,8 @@ bool NCManager::LoadProgram(const std::string& filepath)
         return RejectProgramLoad("POST_COMMIT_SUPERSEDED", filepath);
     }
     m_programLoadStartBlocked = false;
+    m_programLoadRejectDiagnostic = "NONE";
+    m_programLoadContextDiagnostic = "LOADED";
     m_bootProgramImageLoaded = true;
     RtPrintf("[NC-LOAD-CJ] LOADED file=%.240s cache=%llu owner=%u generation=%u epoch=%u keepHold=%u startBlocked=0\n",
         m_mainProgramName.c_str(), static_cast<unsigned long long>(m_programCache.GetGeneration()),
@@ -607,9 +660,13 @@ void NCManager::TryRollbackHomingResume() noexcept
 // ==========================================
 void NCManager::CycleStart()
 {
+    ++m_startDiagnosticRequests;
+    m_startDiagnosticEvent = "RECEIVED";
+    PrintProgramStartDiagnostic();
     if (m_programLoadStartBlocked && m_mode == NCOperationMode::MEMORY &&
         (m_state == NCState::READY || m_state == NCState::P_END || m_state == NCState::IDLE))
     {
+        m_startDiagnosticEvent = "LOAD_LOCK";
         RtPrintf("[NC-LOAD-CJ] START_BLOCKED current=%.240s action=LOAD_OR_RESET\n",
             m_mainProgramName.c_str());
         return;
@@ -621,6 +678,7 @@ void NCManager::CycleStart()
     if (AlarmManager::GetInstance().HasAlarm() ||
         m_state == NCState::ALARM)
     {
+        m_startDiagnosticEvent = "ALARM_REJECTED";
         return;
     }
 
@@ -634,6 +692,7 @@ void NCManager::CycleStart()
     if (m_state == NCState::HOLD &&
         Homing.IsActive())
     {
+        m_startDiagnosticEvent = "HOME_RESUME";
         const HomingManager::ResumeResult resumeResult =
             Homing.Resume();
 
@@ -670,6 +729,7 @@ void NCManager::CycleStart()
     if (m_state == NCState::HOLD &&
         m_singleBlockHoldGate.IsHoldApplied())
     {
+        m_startDiagnosticEvent = "SINGLE_BLOCK_RESUME";
         if (!ArmHoldResumeAlarmAdmission(
             HoldResumeAdmissionKind::CONTROLLED_SINGLE_BLOCK))
         {
@@ -688,6 +748,7 @@ void NCManager::CycleStart()
     // =========================================================
     if (m_state == NCState::HOLD)
     {
+        m_startDiagnosticEvent = "HOLD_RESUME";
         if (!ArmHoldResumeAlarmAdmission(
             HoldResumeAdmissionKind::PROGRAM_HOLD))
         {
@@ -755,6 +816,7 @@ void NCManager::CycleStart()
         // can create an endless START_DIRTY loop under repeated HMI polling.
         if (m_programRunStartPending)
         {
+            m_startDiagnosticEvent = "DUPLICATE_PENDING";
             return;
         }
 
@@ -774,6 +836,7 @@ void NCManager::CycleStart()
             alarmUpdateBefore != alarmUpdateAfter ||
             alarmIntentBefore != alarmIntentAfter)
         {
+            m_startDiagnosticEvent = "ALARM_REVISION_REJECTED";
             return;
         }
 
@@ -792,8 +855,15 @@ void NCManager::CycleStart()
             GetBaseProgramCache().GetGeneration();
         m_pendingProgramRunAlarmUpdateCount = alarmUpdateBefore;
         m_pendingProgramRunAlarmSafetyIntentState = alarmIntentBefore;
+        m_startDiagnosticWaitScans = 0ULL;
+        m_startDiagnosticFinish = "NONE";
+        m_startDiagnosticEvent = "LATCHED";
         m_programRunStartPending = true;
         (void)ProcessPendingProgramRunStart();
+    }
+    else
+    {
+        m_startDiagnosticEvent = "STATE_NOT_STARTABLE";
     }
 }
 
@@ -3750,6 +3820,7 @@ void NCManager::ProcessTask()
         // a fresh operator edge after the machine is READY again.
         if (m_programRunStartPending)
         {
+            m_startDiagnosticEvent = "MACHINE_NOT_READY_CANCEL";
             ReleasePendingProgramRunMotionOwner();
             CancelProgramEndBoundary();
         }
@@ -4245,6 +4316,37 @@ void NCManager::ProcessExecutionEngine()
                 return;
             }
         }
+
+        // BASE58-PARSED-BEGIN: these branches never enter ExecuteBlock.
+        // Reject before optional skip advances PC or control expressions are
+        // evaluated. Variable reads inside allowed XYZ words remain supported.
+        if (CoordSys.IsTranslationRunFrozen() &&
+            (parsedBlock.controlType != NCParsedControlType::NONE || parsedBlock.isBlockSkip))
+        {
+            const NCTranslationSnapshot controlSource = CoordSys.GetTranslationSnapshot();
+            std::uint32_t controlPresentMask = NCXYZFeedPresentMask(controlSource.axisIdentity);
+            for (int axis = 3; axis < 8; ++axis)
+                if (m_motion.GetAxisContext(axis).isExist) controlPresentMask |= 1U << axis;
+            if ((controlPresentMask & ~7U) != 0U)
+            {
+                NCBlock controlGuard{};
+                controlGuard.isEmpty = false;
+                controlGuard.isGoto = true;
+                controlGuard.isBlockSkip = parsedBlock.isBlockSkip;
+                // Reuse the exact whole-block policy and formal source-drift
+                // failure. The sentinel cannot become an allowed empty row.
+                if (IsFixedTranslationBlockAllowedSameThread(controlGuard))
+                {
+                    // Fail closed if a future policy ever admits this sentinel.
+                    AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter, sourceLineNumber);
+                    ChangeState(NCState::HOLD);
+                }
+                markDispatchFailed(static_cast<std::uint32_t>(m_state == NCState::ALARM ?
+                    AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY : AlarmManager::G_Code_Invalid_parameter));
+                return;
+            }
+        }
+        // BASE58-PARSED-END: original three-axis control branches follow.
 
         // 選擇性跳躍開啟時，整行不求值、不 Commit 任何 Macro Side Effect。
         if (parsedBlock.isBlockSkip && m_isBlockSkipEnabled)
@@ -7151,6 +7253,11 @@ void NCManager::ReleasePendingProgramRunMotionOwner() noexcept
 
 void NCManager::ClearPendingProgramRunStart(bool cancelled) noexcept
 {
+    if (cancelled && m_programRunStartPending)
+    {
+        ++m_startDiagnosticCancelled;
+        m_startDiagnosticFinish = "CANCELLED";
+    }
     if (cancelled &&
         m_programRunStartPending &&
         m_pendingProgramRunMode == NCOperationMode::MANUAL)
@@ -7227,6 +7334,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         return false;
     }
 
+    ++m_startDiagnosticWaitScans;
     const auto cancelPendingStart = [this](bool alarmSuperseded) noexcept
     {
         ReleasePendingProgramRunMotionOwner();
@@ -7254,6 +7362,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     // Never retarget a pending start to a newer owner or execution Epoch.
     if (!IsPendingProgramRunStartIdentityCurrent())
     {
+        m_startDiagnosticEvent = "IDENTITY_CANCEL";
         cancelPendingStart(false);
         return true;
     }
@@ -7275,6 +7384,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         cancelPendingStart(startAlarms.HasAlarm());
         return true;
     }
+    m_startDiagnosticEvent = "CHECK_LOAD_AND_REPLACEMENT";
     const auto replacement = m_lifecycleInterruptionShadow.GetSnapshot();
     if (replacement.active &&
         replacement.cause == NCLifecycleInterruptionCause::PROGRAM_REPLACED &&
@@ -7282,6 +7392,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     {
         // Ordinary NC observations close the inert replacement before START
         // can publish an epoch. Never count two observations inside LOAD.
+        m_startDiagnosticEvent = "WAIT_REPLACEMENT";
         if (!alarmIdentityCurrent()) cancelPendingStart(startAlarms.HasAlarm());
         return true;
     }
@@ -7295,6 +7406,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
             return true;
         }
 
+        m_startDiagnosticEvent = "WAIT_ALARM_ADMISSION";
         AlarmManager::MotionAdmissionReservation admission{};
         const AlarmManager::MotionAdmissionResult beginResult =
             startAlarms.TryBeginMotionAdmission(
@@ -7322,6 +7434,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
             return true;
         }
 
+        m_startDiagnosticEvent = "WAIT_OWNER";
         if (!AcquireProgramMotionOwner())
         {
             if (!startAlarms.EndMotionAdmission(admission))
@@ -7347,6 +7460,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         }
         m_pauseAfterBlock = false;
 
+        m_startDiagnosticEvent = "WAIT_EPOCH_PUBLISH";
         const MotionExecutionEpoch executionEpoch =
             m_motion.BeginNewExecutionEpoch(
                 GetMotionCommandSourceForMode(
@@ -7365,6 +7479,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         m_pendingProgramRunExecutionEpoch = executionEpoch;
         m_pendingProgramRunOwnerLease = m_programMotionLease;
         m_pendingProgramRunPhase = ProgramRunStartPhase::EPOCH_ACK;
+        m_startDiagnosticEvent = "WAIT_RT_ACK";
         if (!startAlarms.EndMotionAdmission(admission))
         {
             cancelPendingStart(true);
@@ -7380,6 +7495,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
 
     const MotionExecutionEpoch pendingEpoch =
         m_pendingProgramRunExecutionEpoch;
+    m_startDiagnosticEvent = "WAIT_RT_ACK";
     if (m_motion.HasPendingSafetyOrRecoveryRequests() ||
         !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
             pendingEpoch,
@@ -7388,6 +7504,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         return true;
     }
 
+    m_startDiagnosticEvent = "WAIT_RUN_ADMISSION";
     AlarmManager::MotionAdmissionReservation runAdmission{};
     const AlarmManager::MotionAdmissionResult runAdmissionResult =
         startAlarms.TryBeginMotionAdmission(
@@ -7418,6 +7535,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         return true;
     }
 
+    m_startDiagnosticEvent = "BEGIN_RUN_BOUNDARY";
     if (!BeginProgramRunBoundary(pendingEpoch))
     {
         const bool ended = startAlarms.EndMotionAdmission(runAdmission);
@@ -7425,6 +7543,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         return true;
     }
 
+    m_startDiagnosticEvent = "SYNC_QUEUE_TAIL";
     m_motion.SyncVirtualEndPosition();
     double synchronizedQueueTailMCS[MAX_AXES] = {};
     if (!m_motion.TryGetSynchronizedG00QueueTailMCS(
@@ -7441,6 +7560,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         return true;
     }
 
+    m_startDiagnosticEvent = "SYNC_COORDINATE";
     CoordSys.SyncMachinePosition(synchronizedQueueTailMCS);
     if (!IsPendingProgramRunStartIdentityCurrent() ||
         !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
@@ -7454,6 +7574,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         return true;
     }
 
+    m_startDiagnosticEvent = "COMMIT_RUN";
     const NCState originState = m_pendingProgramRunOriginState;
     const bool startManualAuto =
         m_pendingProgramRunMode == NCOperationMode::MANUAL &&
@@ -7506,6 +7627,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     }
 
     // BN: this is the completed fresh-start admission, never a provisional RUN.
+    m_startDiagnosticEvent = "ARM_RUN_SOURCE";
     ArmPathCoreLiveRetentionSameThread();
     // The fresh Start has already proved quiescence and committed ownership.
     // Reserve the run identity now; the values freeze at its first motion.
@@ -7524,6 +7646,8 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     ArmPathCoreArcSameThread(); // BY-ARC: fresh NC Start only.
     ArmPathCoreReplaySameThread(); // BZ: completed fresh run, never M00 resume.
     InvalidatePathCoreHoldSameThread(); // CB: a fresh run never inherits an old arm.
+    m_startDiagnosticEvent = "STARTED";
+    m_startDiagnosticFinish = "COMMITTED";
     ClearPendingProgramRunStart(false);
     UpdateSystemVariables();
 

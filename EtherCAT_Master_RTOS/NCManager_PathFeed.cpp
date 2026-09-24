@@ -1213,6 +1213,10 @@ bool NCManager::IsCncPathQueuedBlockShapeValid(const NCBlock& block, int unitsMo
 NC_PATH_FEED_NOINLINE
 bool NCManager::IsCncFeedScopeSameThread() noexcept
 {
+    // BASE58 keeps auxiliary-axis configurations on the explicit XYZ
+    // exact-stop lane. Consecutive G01 rows must not opt in automatically.
+    for (int axis = 3; axis < 8; ++axis)
+        if (m_motion.GetAxisContext(axis).isExist) return false;
     // Fixed rotation retains G90/G17 and the lifecycle gates below. Candidate
     // gates limit motion to XY G01, bounded full-XY Q and P1 planar arcs.
     // BASE-PLANE-2 expands exact-stop feed only, not this XY lookahead lane.

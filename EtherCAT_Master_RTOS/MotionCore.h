@@ -26,6 +26,7 @@
 #include "MotionPathCoreHoldExcursion.h" // CB same-source held excursion
 #include "MotionCommandRing.h"
 #include "MotionFeedbackRing.h"
+#include "RotaryPidDiagnostic.h" // ROTPID_DIAG1 observation-only sidecar
 #include "MotionAxisCommandMailbox.h"
 #include "AlarmManager.h"
 
@@ -2027,6 +2028,9 @@ public:
         MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
         MotionOwnerGeneration generation = 0U;
         std::uint32_t mask = 0U;
+        // BASE57 event-local payload: ACTIVE = captured rotary mask;
+        // REFERENCE = native unit (1 mm, 2 degree); RELEASED = next generation;
+        // FOLLOWING_ERROR_CONTROL retains the BASE48_DIAG1 reverse flag.
         MotionOwnerGeneration nextGeneration = 0U;
         std::int32_t axisIndex = -1;
         MotionOwner owner = MotionOwner::NONE;
@@ -2037,10 +2041,24 @@ public:
     static_assert(sizeof(IdleHoldDiagnosticEvent) == 64U &&
         std::is_trivially_copyable<IdleHoldDiagnosticEvent>::value,
         "CJ FIX1 diagnostic records must remain fixed 64-byte POD values.");
-    static constexpr std::size_t IDLE_HOLD_DIAGNOSTIC_CAPACITY = 8U;
+    // BASE57 native-unit policies. ROTPID_TUNE1: unloaded position-rotary
+    // trial only: 0.5 deg/s hold correction cap; linear remains 0.1 mm/s.
+    // Position reference, P-only law, owner fences and fault multiplier stay
+    // unchanged. This is not a positioning-accuracy or hardware PASS claim.
+    static constexpr std::uint32_t IDLE_HOLD_LINEAR_CAP_UMS = 100U;
+    static constexpr std::uint32_t IDLE_HOLD_ROTARY_CAP_MDEGS = 500U;
+    // Six-axis ACTIVE + 6 REFERENCE + 3 fault records + RELEASED = 11.
+    // Keep the existing drain work bound; only fixed burst storage grows.
+    static constexpr std::size_t IDLE_HOLD_DIAGNOSTIC_CAPACITY = 16U;
     static constexpr std::size_t IDLE_HOLD_DIAGNOSTIC_DRAIN_BUDGET = 8U;
     bool TryPopIdleHoldDiagnostic(IdleHoldDiagnosticEvent& event) noexcept;
     std::uint32_t GetIdleHoldDiagnosticDroppedCount() const noexcept;
+
+    // ROTPID_DIAG1: immutable low-rate observations, never control authority.
+    bool TryPopRotaryPidDiagnostic(RotaryPidDiagnosticEvent& event) noexcept
+    { return m_rotaryPidDiagnosticMonitor.TryPop(event); }
+    std::uint32_t GetRotaryPidDiagnosticDroppedCount() const noexcept
+    { return m_rotaryPidDiagnosticMonitor.Dropped(); }
 
     // DC: RT-only producer / existing HMI diagnostic-task consumer.
     enum class CncP1Event : std::uint8_t
@@ -3890,6 +3908,7 @@ private:
         std::uint32_t capturedMask = 0U;
         std::uint32_t frameMask = 0U;
         std::uint32_t reverseMask = 0U;
+        std::uint32_t rotaryMask = 0U; // Captured LINEAR / ROTARY identity.
         std::uint64_t runtimeTick = 0ULL;
         bool active = false;
         bool passRequested = false;
@@ -3924,8 +3943,12 @@ private:
     // Transport + RT workspace + HMI's one record and last-drop scalar.
     // Separate from (and does not relax) the original 512-byte hold budget.
     static_assert(sizeof(IdleHoldDiagnostics) + sizeof(IdleHoldDiagnosticEvent) +
-        sizeof(std::uint32_t) <= 1024U,
-        "CJ FIX1 total fixed diagnostic workspace must not exceed 1 KiB.");
+        sizeof(std::uint32_t) <= 1536U,
+        "BASE57 total fixed diagnostic workspace must not exceed 1.5 KiB.");
+    RotaryPidDiagnosticMonitor m_rotaryPidDiagnosticMonitor{};
+    RotaryPidDiagnosticSample m_rotaryPidDiagnosticProducerSample{};
+    void CaptureRotaryPidDiagnostics(bool imageAuthorized) noexcept;
+
     IdleHoldDiagnostics m_idleHoldDiagnostics{};
     void QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType eventType,
         IdleHoldDiagnosticReason reason = IdleHoldDiagnosticReason::NONE,

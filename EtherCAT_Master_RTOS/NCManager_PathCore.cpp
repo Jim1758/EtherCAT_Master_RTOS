@@ -7,6 +7,7 @@
 // Compile this file exactly once together with the matching NCManager.cpp.
 #include "NCManager.h"
 #include "GMCodeHandlers.h"
+#include "NCXYZFeedScope.h"
 #include <cstdint>
 #include <type_traits>
 #include <cstring>
@@ -2568,6 +2569,44 @@ void NCManager::RetireFixedTranslationSameThread() noexcept
 
 bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode)
 {
+    // BASE58-BEGIN: repeatable side-effect-free extra-axis XYZ feed policy.
+    std::uint32_t xyzFeedPresentMask = 0U;
+    for (int axis = 0; axis < 8; ++axis)
+        if (m_motion.GetAxisContext(axis).isExist) xyzFeedPresentMask |= 1U << axis;
+    const NCTranslationSnapshot xyzFeedSource = CoordSys.GetTranslationSnapshot();
+    const bool xyzFeedFrozen = CoordSys.IsTranslationRunFrozen();
+    const bool xyzFeedRuntimeClear = m_state == NCState::RUN &&
+        !m_isG66Active && m_macroStack.empty() && !Homing.IsActive() &&
+        !m_cncFeed.selected && !m_cncFeed.active && m_cncFeed.count == 0U &&
+        !m_pathFeed.pending && !m_pathArc.pending && !m_pathHold.armed && !m_pathHold.bound &&
+        !m_pathReplay.pending && !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active &&
+        !m_cutterLine.leadOutRequired;
+    const bool xyzFeedMemoryBound = m_mode == NCOperationMode::MEMORY && CoordSys.IsTranslationRunBound();
+    const NCXYZFeedScopeDecision xyzFeedDecision = EvaluateNCXYZFeedScope(
+        xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
+        xyzFeedMemoryBound, xyzFeedRuntimeClear);
+    // Preserve the existing formal mapping-integrity stop for source drift;
+    // a changed live configuration must not become a syntax-only rejection.
+    if (xyzFeedDecision != NCXYZFeedScopeDecision::UNCHANGED && xyzFeedMemoryBound &&
+        !IsPathCoreLiveNativeConfigCurrentSameThread())
+    {
+        AlarmManager::GetInstance().Trigger(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        m_state = NCState::ALARM;
+        m_motion.RequestEmergencyStopAllAxes();
+        return false;
+    }
+    if (xyzFeedDecision == NCXYZFeedScopeDecision::REJECTED ||
+        (xyzFeedDecision == NCXYZFeedScopeDecision::ALLOWED && gCode != block.gCode))
+    {
+        RtPrintf("[BASE58][XYZ-FEED-REJECT] run=%llu presentMask=%u auxiliaryMask=%u frozen=%u beforeSubmit=1\n",
+            static_cast<unsigned long long>(xyzFeedSource.runToken),
+            static_cast<unsigned>(xyzFeedPresentMask), static_cast<unsigned>(xyzFeedPresentMask & ~7U),
+            xyzFeedFrozen ? 1U : 0U);
+        AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+        ChangeState(NCState::HOLD);
+        return false;
+    }
+    // BASE58-END: existing source/currentness and Motion authority gates follow.
     // Recheck the selected plane at the motion entry, before a legacy/MDI
     // caller or an unfrozen G00 fallback could bypass the whole-block gate.
     if (CoordSys.activePlane != 17 && (gCode == 0 || gCode == 1) &&
@@ -2665,13 +2704,17 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         if (!hasProgrammedAxis) return true;
     }
     const NCTranslationSnapshot candidate = CoordSys.GetTranslationSnapshot();
+    // BASE60: qualifying G01/G02/G03 may freeze the native XYZ source.
+    // Unfrozen G00 retains its existing fallback and never opens this lane.
+    const bool extraAxisXYZFeed = gCode >= 1 && gCode <= 3 && !xyzFeedFrozen &&
+        xyzFeedDecision == NCXYZFeedScopeDecision::ALLOWED;
     bool scopeValid = IsNCTranslationSnapshotValid(candidate) &&
         m_axisNames[0] == 'X' && m_axisNames[1] == 'Y' && m_axisNames[2] == 'Z';
     for (int i = 0; i < 8; ++i)
     {
         const AxisContext& axis = m_motion.GetAxisContext(i);
         if (i < 3 && (!axis.isExist || axis.axisType != AxisType::LINEAR)) scopeValid = false;
-        if (i >= 3 && (axis.isExist || (m_axisNames[i] != ' ' && block.has(m_axisNames[i])))) scopeValid = false;
+        if (i >= 3 && ((axis.isExist && !extraAxisXYZFeed) || (m_axisNames[i] != ' ' && block.has(m_axisNames[i])))) scopeValid = false;
     }
     if (!scopeValid)
     {
@@ -2738,6 +2781,41 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         AlarmManager::GetInstance().Trigger(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         m_state = NCState::ALARM;
         return false;
+    }
+    if (extraAxisXYZFeed)
+    {
+        RtPrintf("[BASE58][XYZ-FEED-ADMITTED] run=%llu generation=%llu presentMask=%u auxiliaryMask=%u feedAxisLimit=7 exactStop=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation),
+            static_cast<unsigned>(xyzFeedPresentMask), static_cast<unsigned>(xyzFeedPresentMask & ~7U));
+        RtPrintf("[BASE59][XYZ-FEED-MODE] run=%llu generation=%llu mode=%d exactStop=1 auxiliaryStationary=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), frozen.distanceMode);
+        RtPrintf("[BASE60][XYZ-ARC-SCOPE] run=%llu generation=%llu firstG=%d plane=%d mode=%d exactStop=1 auxiliaryStationary=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), gCode,
+            frozen.rotationPlane, frozen.distanceMode);
+        RtPrintf("[BASE61][XYZ-PLANE-SCOPE] run=%llu generation=%llu firstG=%d plane=%d mode=%d exactStop=1 auxiliaryStationary=1 nativeXYZ=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), gCode,
+            frozen.rotationPlane, frozen.distanceMode);
+        RtPrintf("[BASE62][XYZ-ARC-PLANES] run=%llu generation=%llu firstG=%d plane=%d mode=%d exactStop=1 auxiliaryStationary=1 nativePlane=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), gCode,
+            frozen.rotationPlane, frozen.distanceMode);
+        RtPrintf("[BASE63][XYZ-WCS-SCOPE] run=%llu generation=%llu wcs=%d plane=%d mode=%d exactStop=1 auxiliaryStationary=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), frozen.wcsCode,
+            frozen.rotationPlane, frozen.distanceMode);
+        RtPrintf("[BASE64][XYZ-TOOL-SCOPE] run=%llu generation=%llu wcs=%d plane=%d mode=%d tool=%d H=%d exactStop=1 auxiliaryStationary=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), frozen.wcsCode,
+            frozen.rotationPlane, frozen.distanceMode, frozen.toolLengthMode, frozen.toolHCode);
+        RtPrintf("[BASE65][XYZ-WORK-SCOPE] run=%llu generation=%llu wcs=%d plane=%d mode=%d tool=%d H=%d work=%d W=%d exactStop=1 auxiliaryStationary=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), frozen.wcsCode,
+            frozen.rotationPlane, frozen.distanceMode, frozen.toolLengthMode, frozen.toolHCode,
+            frozen.workMode, frozen.workWCode);
     }
     // Use the existing integer transport: the target RtPrintf prints float conversions as "f".
     RtPrintf("[AXIS-IDENTITY][FROZEN] schema=%u run=%llu generation=%llu exists=%u%u%u%u%u%u%u%u role=%u mode=%u ecc=%u\n",
@@ -3216,6 +3294,43 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
 
 bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
 {
+    // BASE58-BEGIN: repeatable side-effect-free extra-axis XYZ feed policy.
+    std::uint32_t xyzFeedPresentMask = 0U;
+    for (int axis = 0; axis < 8; ++axis)
+        if (m_motion.GetAxisContext(axis).isExist) xyzFeedPresentMask |= 1U << axis;
+    const NCTranslationSnapshot xyzFeedSource = CoordSys.GetTranslationSnapshot();
+    const bool xyzFeedFrozen = CoordSys.IsTranslationRunFrozen();
+    const bool xyzFeedRuntimeClear = m_state == NCState::RUN &&
+        !m_isG66Active && m_macroStack.empty() && !Homing.IsActive() &&
+        !m_cncFeed.selected && !m_cncFeed.active && m_cncFeed.count == 0U &&
+        !m_pathFeed.pending && !m_pathArc.pending && !m_pathHold.armed && !m_pathHold.bound &&
+        !m_pathReplay.pending && !m_gapDryRun.active && !m_gapPath.active && !m_gapWindow.active &&
+        !m_cutterLine.leadOutRequired;
+    const bool xyzFeedMemoryBound = m_mode == NCOperationMode::MEMORY && CoordSys.IsTranslationRunBound();
+    const NCXYZFeedScopeDecision xyzFeedDecision = EvaluateNCXYZFeedScope(
+        xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
+        xyzFeedMemoryBound, xyzFeedRuntimeClear);
+    // Preserve the existing formal mapping-integrity stop for source drift;
+    // a changed live configuration must not become a syntax-only rejection.
+    if (xyzFeedDecision != NCXYZFeedScopeDecision::UNCHANGED && xyzFeedMemoryBound &&
+        !IsPathCoreLiveNativeConfigCurrentSameThread())
+    {
+        AlarmManager::GetInstance().Trigger(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        m_state = NCState::ALARM;
+        m_motion.RequestEmergencyStopAllAxes();
+        return false;
+    }
+    if (xyzFeedDecision == NCXYZFeedScopeDecision::REJECTED)
+    {
+        RtPrintf("[BASE58][XYZ-FEED-REJECT] run=%llu presentMask=%u auxiliaryMask=%u frozen=%u beforeCommit=1\n",
+            static_cast<unsigned long long>(xyzFeedSource.runToken),
+            static_cast<unsigned>(xyzFeedPresentMask), static_cast<unsigned>(xyzFeedPresentMask & ~7U),
+            xyzFeedFrozen ? 1U : 0U);
+        AlarmManager::GetInstance().Trigger(AlarmManager::G_Code_Invalid_parameter);
+        ChangeState(NCState::HOLD);
+        return false;
+    }
+    // BASE58-END: existing source/currentness and Motion authority gates follow.
     // Validate the complete tool selection before earlier settings/T/M in this
     // same block can commit. H is a tool index only for G43/G44/G49: accepted
     // G178 gap-time H and G65/G66 macro arguments retain their own semantics.

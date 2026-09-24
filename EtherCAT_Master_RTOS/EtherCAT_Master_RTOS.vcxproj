@@ -236,11 +236,13 @@
     <ClInclude Include="NCSingleBlockBoundary.h" />
     <ClInclude Include="NCSingleBlockHoldGate.h" />
     <ClInclude Include="NCTranslationSnapshot.h" />
+    <ClInclude Include="NCXYZFeedScope.h" />
     <ClInclude Include="NC_Types.h" />
     <ClInclude Include="NicDriver.h" />
     <ClInclude Include="PlcCore.h" />
     <ClInclude Include="PLCManager.h" />
     <ClInclude Include="ReferencePositionBlock.h" />
+    <ClInclude Include="RotaryPidDiagnostic.h" />
     <ClInclude Include="SHMManager.h" />
     <ClInclude Include="SHM_Types.h" />
     <ClInclude Include="tinyxml2.h" />

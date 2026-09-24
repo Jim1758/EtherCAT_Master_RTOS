@@ -9905,6 +9905,19 @@ void MotionCore::QueueIdleHoldDiagnostic(IdleHoldDiagnosticEventType eventType,
     event.nextOwner = nextLease.owner;
     event.eventType = eventType;
     event.reason = reason;
+    // BASE57: capture units with the reference, never consult live axes in HMI.
+    // Reuse event-local payload space; preserve the fixed 64-byte transport.
+    if (eventType == IdleHoldDiagnosticEventType::ACTIVE)
+    {
+        event.nextGeneration = hold.rotaryMask & hold.requiredMask;
+    }
+    else if (eventType == IdleHoldDiagnosticEventType::REFERENCE &&
+        axisIndex >= 0 && axisIndex < MAX_AXES &&
+        (hold.capturedMask & (1U << static_cast<unsigned>(axisIndex))) != 0U)
+    {
+        event.nextGeneration =
+            (hold.rotaryMask & (1U << static_cast<unsigned>(axisIndex))) != 0U ? 2U : 1U;
+    }
     if ((eventType == IdleHoldDiagnosticEventType::REFERENCE ||
         (eventType == IdleHoldDiagnosticEventType::FAILED &&
             reason == IdleHoldDiagnosticReason::FOLLOWING_ERROR)) &&
@@ -10075,8 +10088,14 @@ void MotionCore::UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& ax
         CancelIdlePositionHold(IdleHoldDiagnosticReason::COMPENSATION_NONFINITE, true, axis.axisIndex);
         return;
     }
+    // BASE57: only position axes with a native mm or degree policy. Continuous
+    // spindle rotation, external scales and physical compensation remain outside
+    // this hold contract. All existing axes must qualify; there is no partial hold.
+    const bool linearPositionAxis = axis.axisType == AxisType::LINEAR;
+    const bool rotaryPositionAxis = axis.axisType == AxisType::ROTARY;
     if ((hold.requiredMask & bit) == 0U || axis.isVirtualAxis ||
-        axis.axisType != AxisType::LINEAR || axis.fbMode != FeedbackSource::MOTOR_ENCODER ||
+        (!linearPositionAxis && !rotaryPositionAxis) ||
+        axis.fbMode != FeedbackSource::MOTOR_ENCODER ||
         axis.enableBacklash || axis.enablePitch || axis.currentCompOffset_unit != 0.0)
     {
         CancelIdlePositionHold(IdleHoldDiagnosticReason::UNSUPPORTED_SCOPE, hold.active, axis.axisIndex);
@@ -10098,7 +10117,11 @@ void MotionCore::UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& ax
         return;
     }
     const double unitsPerPulse = axis.finalLead / axis.resolution_PPR;
-    const double cap = (std::min)(axis.maxVel_PPS, 0.1 / unitsPerPulse);
+    // P uses native, unwrapped pulse error. A display modulo / shortest-path
+    // rewrite here could turn a stopped rotary axis into a full-turn command.
+    const double nativeCapPerSecond = static_cast<double>(rotaryPositionAxis ?
+        IDLE_HOLD_ROTARY_CAP_MDEGS : IDLE_HOLD_LINEAR_CAP_UMS) / 1000.0;
+    const double cap = (std::min)(axis.maxVel_PPS, nativeCapPerSecond / unitsPerPulse);
     const bool reverse = axis.isReverse != axis.Axis_Reverse;
     if (!std::isfinite(unitsPerPulse) || unitsPerPulse <= 0.0 ||
         !std::isfinite(cap) || cap <= 0.0 ||
@@ -10116,9 +10139,11 @@ void MotionCore::UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& ax
         hold.maxVelocity[index] = axis.maxVel_PPS;
         hold.machineOffset[index] = axis.machineCoordinateOffsetPulse;
         if (reverse) hold.reverseMask |= bit;
+        if (rotaryPositionAxis) hold.rotaryMask |= bit;
         hold.capturedMask |= bit;
     }
-    if (axis.currentCmdPos != hold.reference[index] ||
+    if (rotaryPositionAxis != ((hold.rotaryMask & bit) != 0U) ||
+        axis.currentCmdPos != hold.reference[index] ||
         unitsPerPulse != hold.unitsPerPulse[index] ||
         axis.inPositionWindow_Pulse != hold.window[index] ||
         axis.Pid_IDLE.Kp != hold.kp[index] || axis.maxVel_PPS != hold.maxVelocity[index] ||
@@ -11088,6 +11113,99 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     m_ncSettleMotionPassCompleted = motionInputComplete;
     PublishStartupLagArmingEvidence();
     PublishStopSettleEvidence();
+    // ROTPID_DIAG1: read-only capture after the existing local image guards.
+    // This is NOT an acknowledgement of final send or drive consumption.
+    CaptureRotaryPidDiagnostics(imageAuthorized);
+}
+
+void MotionCore::CaptureRotaryPidDiagnostics(bool imageAuthorized) noexcept
+{
+    // RT-only observer. No RtPrintf, heap allocation, blocking, controller
+    // mutation, PDO write, command rebase, threshold or completion changes.
+    const MotionOwnerLease lease = GetMotionOwnerLease();
+    const bool fresh = m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+        m_ncSettleRuntimeCycleContiguous && m_ncSettleMotionPassCompleted &&
+        m_pContexts != nullptr && m_pDrives != nullptr && lease.IsValid();
+    const IdlePositionHoldState& hold = m_idlePositionHold;
+    // DIAG2: observe the existing P-only idle controller as a distinct scope.
+    // Never report axis.pid (a different/stale controller) as the idle gain.
+    const bool idleScope = fresh && lease.owner == MotionOwner::IDLE_HOLD &&
+        hold.passRequested && hold.active && !hold.cancelled &&
+        hold.lease.Matches(lease) && hold.epoch == GetCurrentExecutionEpoch() &&
+        hold.runtimeTick == m_ncSettleRuntimeCycleTick;
+    const bool groupTerminal = fresh && m_Group.isActive &&
+        m_Group.virtualAxis.state == MotionState::MotionState_IDLE;
+    std::uint32_t terminalMask = 0U;
+    if (groupTerminal)
+    {
+        const int count = ClampMotionAxisCount(m_Group.axisCount);
+        for (int i = 0; i < count; ++i)
+        {
+            const int axis = m_Group.axisIndices[i];
+            if (axis >= 0 && axis < MAX_AXES)
+                terminalMask |= (1U << static_cast<unsigned>(axis));
+        }
+    }
+    for (std::size_t slot = 0U; slot < RotaryPidDiagnosticMonitor::AxisCount; ++slot)
+    {
+        if (!fresh || slot >= m_pContexts->size() || slot >= m_pDrives->size())
+        {
+            m_rotaryPidDiagnosticMonitor.Close(slot, 3U);
+            continue;
+        }
+        const AxisContext& axis = (*m_pContexts)[slot];
+        const bool groupMember = (terminalMask & (1U << slot)) != 0U;
+        const bool idleMember = idleScope &&
+            (hold.requiredMask & (1U << slot)) != 0U &&
+            (hold.capturedMask & (1U << slot)) != 0U &&
+            axis.state == MotionState::MotionState_IDLE &&
+            axis.currentCmdPos == hold.reference[slot];
+        const bool independentStoppedCommand = !m_Group.isActive &&
+            (axis.state == MotionState::MotionState_MOVING ||
+                axis.state == MotionState::MotionState_STOPPING) &&
+            std::isfinite(axis.currentCmdVel) && std::abs(axis.currentCmdVel) <= 1.0 &&
+            std::isfinite(axis.logicalCmdVel) && std::abs(axis.logicalCmdVel) <= 1.0;
+        if ((!groupMember && !independentStoppedCommand && !idleMember) || !axis.isExist ||
+            axis.axisIndex != static_cast<int>(slot) || axis.isVirtualAxis ||
+            axis.axisType != AxisType::ROTARY || axis.homeRuntime.active ||
+            axis.fbMode != FeedbackSource::MOTOR_ENCODER ||
+            axis.enablePitch || axis.enableBacklash ||
+            !std::isfinite(axis.currentCompOffset_unit) || axis.currentCompOffset_unit != 0.0 ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+            !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+            (*m_pDrives)[slot].pOutput == nullptr)
+        {
+            m_rotaryPidDiagnosticMonitor.Close(slot, 1U);
+            continue;
+        }
+        RotaryPidDiagnosticSample& sample = m_rotaryPidDiagnosticProducerSample;
+        sample.tick = m_ncSettleRuntimeCycleTick;
+        sample.segment = groupMember ? m_Group.currentCmd.execution.segmentId : 0ULL;
+        sample.commandPulse = axis.currentCmdPos;
+        sample.actualPulse = axis.currentActPos;
+        sample.windowPulse = axis.inPositionWindow_Pulse;
+        sample.unitsPerPulse = axis.finalLead / axis.resolution_PPR;
+        sample.kp = idleMember ? hold.kp[slot] : axis.pid.Kp;
+        sample.ki = idleMember ? 0.0 : axis.pid.Ki;
+        sample.kvff = idleMember ? 0.0 : axis.pid.Kvff;
+        sample.integral = idleMember ? 0.0 : axis.pid.integralAcc;
+        sample.scope = idleMember ? 1U : 0U;
+        sample.capVelocityPps = idleMember ? (std::min)(axis.maxVel_PPS,
+            (static_cast<double>(IDLE_HOLD_ROTARY_CAP_MDEGS) / 1000.0) /
+                sample.unitsPerPulse) : 0.0;
+        sample.commandVelocityPps = axis.currentCmdVel;
+        sample.logicalVelocityPps = axis.logicalCmdVel;
+        sample.epoch = GetCurrentExecutionEpoch();
+        sample.generation = lease.generation;
+        sample.groupMask = idleMember ? hold.requiredMask : terminalMask;
+        sample.axis = static_cast<std::int32_t>(slot);
+        sample.imageVelocityPps = (*m_pDrives)[slot].pOutput->TargetVelocity;
+        sample.owner = static_cast<std::uint32_t>(lease.owner);
+        sample.state = static_cast<std::uint32_t>(axis.state);
+        sample.flags = (imageAuthorized ? 1U : 0U) |
+            ((axis.isReverse != axis.Axis_Reverse) ? 2U : 0U) | (groupMember ? 4U : 0U);
+        m_rotaryPidDiagnosticMonitor.Observe(sample);
+    }
 }
 
 void MotionCore::ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputInMM)

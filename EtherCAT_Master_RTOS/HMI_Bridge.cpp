@@ -54,7 +54,7 @@ namespace HMI_Bridge
         {
             // CJ FIX1 sole consumer, on the existing Priority-50 1000 ms task.
             // No live AxisContext/hold reads: even delayed rows retain RT values.
-            // Fixed workspace is included in MotionCore's 1 KiB diagnostic budget.
+            // Fixed workspace is included in MotionCore's 1.5 KiB diagnostic budget.
             static MotionCore::IdleHoldDiagnosticEvent event{};
             static std::uint32_t lastReportedDropped = 0U;
             using EventType = MotionCore::IdleHoldDiagnosticEventType;
@@ -65,15 +65,19 @@ namespace HMI_Bridge
                 switch (event.eventType)
                 {
                 case EventType::ACTIVE:
-                    RtPrintf("[IDLE-CJ] ACTIVE owner=%u generation=%u epoch=%u mask=%u capUMs=100 rtTick=%llu diagSeq=%llu diag=BASE48_DIAG1\n",
+                    RtPrintf("[IDLE-CJ] ACTIVE owner=%u generation=%u epoch=%u mask=%u linearMask=%u rotaryMask=%u capLinearUMs=%u capRotaryMdegPs=%u rtTick=%llu diagSeq=%llu policy=BASE57 diag=BASE48_DIAG1\n",
                         static_cast<unsigned>(event.owner), event.generation,
-                        event.epoch, event.mask,
+                        event.epoch, event.mask, event.mask & ~event.nextGeneration,
+                        event.nextGeneration, MotionCore::IDLE_HOLD_LINEAR_CAP_UMS,
+                        MotionCore::IDLE_HOLD_ROTARY_CAP_MDEGS,
                         static_cast<unsigned long long>(event.runtimeTick),
                         static_cast<unsigned long long>(event.sequence));
                     break;
                 case EventType::REFERENCE:
-                    RtPrintf("[IDLE-CJ] REFERENCE axis=%u generation=%u epoch=%u cmdPulseBits=%08X%08X actPulseBits=%08X%08X windowPulseBits=%08X%08X rtTick=%llu diagSeq=%llu\n",
+                    RtPrintf("[IDLE-CJ] REFERENCE axis=%u generation=%u epoch=%u unit=%s cmdPulseBits=%08X%08X actPulseBits=%08X%08X windowPulseBits=%08X%08X rtTick=%llu diagSeq=%llu\n",
                         static_cast<unsigned>(event.axisIndex), event.generation, event.epoch,
+                        event.nextGeneration == 1U ? "mm" :
+                            (event.nextGeneration == 2U ? "deg" : "UNKNOWN"),
                         static_cast<unsigned>(event.cmdPulseBits >> 32U),
                         static_cast<unsigned>(event.cmdPulseBits),
                         static_cast<unsigned>(event.actPulseBits >> 32U),
@@ -137,6 +141,70 @@ namespace HMI_Bridge
                     dropped, static_cast<unsigned>(MotionCore::IDLE_HOLD_DIAGNOSTIC_CAPACITY),
                     static_cast<unsigned>(MotionCore::IDLE_HOLD_DIAGNOSTIC_DRAIN_BUDGET));
                 lastReportedDropped = dropped;
+            }
+        }
+
+        long long RotaryPidScaledDiagnosticValue(double value, double scale) noexcept
+        {
+            const double scaled = value * scale;
+            if (!std::isfinite(scaled) || std::abs(scaled) > 9000000000000000000.0)
+                return (-9223372036854775807LL - 1LL);
+            return static_cast<long long>(scaled);
+        }
+
+        HMI_DIAG_NOINLINE void DrainRotaryPidDiagnostics(MotionCore& motion)
+        {
+            // Sole consumer. Immutable RT events only; never read live axes.
+            static RotaryPidDiagnosticEvent event{};
+            static std::uint32_t lastDropped = 0U;
+            static bool announced = false;
+            if (!announced)
+            {
+                RtPrintf("[ROT-PID] ENABLED build=ROTPID_DIAG2 observationOnly=1 scopes=TAIL,IDLE_HOLD sampleMs=500,2000,5000 capacity=16 drainBudget=4 unit=deg image=LOCAL_NOT_SEND_ACK\n");
+                announced = true;
+            }
+            for (std::size_t n = 0U; n < RotaryPidDiagnosticMonitor::DrainBudget; ++n)
+            {
+                if (!motion.TryPopRotaryPidDiagnostic(event)) break;
+                const RotaryPidDiagnosticSample& s = event.sample;
+                const double err = s.commandPulse - s.actualPulse;
+                const double degreeScale = s.unitsPerPulse * 1000000.0;
+                const char* scope = s.scope == 1U ? "IDLE_HOLD" : "TAIL";
+                const char* kind = event.kind == 4U ? "SAMPLE" :
+                    event.kind == 0U ? "WAIT" :
+                    event.kind == 1U ? "END_SCOPE" :
+                    event.kind == 2U ? "END_IDENTITY" : "END_INPUT_GAP";
+                RtPrintf("[ROT-PID] %s scope=%s q=%llu axis=%d epoch=%u seg=%llu gen=%u owner=%u state=%u mask=%u elapsedMs=%u errUdeg=%lld winUdeg=%lld minUdeg=%lld maxUdeg=%lld avgActUdegPs=%lld outside=%u/%u errFlips=%u tick=%llu\n",
+                    kind, scope, static_cast<unsigned long long>(event.sequence), s.axis,
+                    s.epoch, static_cast<unsigned long long>(s.segment), s.generation,
+                    s.owner, s.state, s.groupMask, event.elapsedUs / 1000U,
+                    RotaryPidScaledDiagnosticValue(err, degreeScale),
+                    RotaryPidScaledDiagnosticValue(s.windowPulse, degreeScale),
+                    RotaryPidScaledDiagnosticValue(event.minErrorPulse, degreeScale),
+                    RotaryPidScaledDiagnosticValue(event.maxErrorPulse, degreeScale),
+                    RotaryPidScaledDiagnosticValue(event.averageActualVelocityPps, degreeScale),
+                    event.outsideSamples, event.samples, event.errorSignChanges,
+                    static_cast<unsigned long long>(s.tick));
+                RtPrintf("[ROT-PID-CTRL] q=%llu axis=%d scope=%s kpMilli=%lld kiMilli=%lld kvffMilli=%lld pPps=%lld iPps=%lld cmdPps=%lld logicalPps=%lld imagePps=%d capPps=%lld minImagePps=%d maxImagePps=%d sat=%u/%u imageFlips=%u authMiss=%u flags=%u dUsed=0 image=LOCAL_NOT_SEND_ACK\n",
+                    static_cast<unsigned long long>(event.sequence), s.axis, scope,
+                    RotaryPidScaledDiagnosticValue(s.kp, 1000.0),
+                    RotaryPidScaledDiagnosticValue(s.ki, 1000.0),
+                    RotaryPidScaledDiagnosticValue(s.kvff, 1000.0),
+                    RotaryPidScaledDiagnosticValue(err * s.kp, 1.0),
+                    RotaryPidScaledDiagnosticValue(s.integral * s.ki, 1.0),
+                    RotaryPidScaledDiagnosticValue(s.commandVelocityPps, 1.0),
+                    RotaryPidScaledDiagnosticValue(s.logicalVelocityPps, 1.0),
+                    s.imageVelocityPps,
+                    RotaryPidScaledDiagnosticValue(s.capVelocityPps, 1.0),
+                    event.minImageVelocityPps, event.maxImageVelocityPps,
+                    event.saturatedSamples, event.samples, event.imageSignChanges,
+                    event.unauthorizedSamples, s.flags);
+            }
+            const std::uint32_t dropped = motion.GetRotaryPidDiagnosticDroppedCount();
+            if (dropped != lastDropped)
+            {
+                RtPrintf("[ROT-PID] DIAG_DROPPED total=%u\n", dropped);
+                lastDropped = dropped;
             }
         }
 
@@ -2549,6 +2617,14 @@ namespace HMI_Bridge
         const bool loadRequested = pShm->NC_Command.loadProgramReq;
         const bool startRequested = pShm->NC_Command.cycleStart;
         if (startRequested) pShm->NC_Command.cycleStart = false;
+        // BASE65 START_DIAG1: log the already-consumed request and its priority.
+        if (startRequested)
+        {
+            RtPrintf("[HMI-START-DIAG] RECEIVED nc=%d mode=%d close=%u reset=%u hold=%u modeReq=%u load=%u\n",
+                static_cast<int>(nc->GetState()), static_cast<int>(nc->GetMode()),
+                closeRequested ? 1U : 0U, resetRequested ? 1U : 0U,
+                holdRequested ? 1U : 0U, modeRequested ? 1U : 0U, loadRequested ? 1U : 0U);
+        }
 
         if (pShm->NC_Command.Close_System)
         {
@@ -2608,7 +2684,16 @@ namespace HMI_Bridge
             !pShm->NC_Command.feedHold && !pShm->NC_Command.reqChangeMode &&
             !pShm->NC_Command.loadProgramReq)
         {
+            RtPrintf("[HMI-START-DIAG] DISPATCH\n");
             nc->CycleStart();
+            nc->PrintProgramStartDiagnostic();
+        }
+        else if (startRequested)
+        {
+            RtPrintf("[HMI-START-DIAG] DISCARDED reason=PRIORITY_OR_LATE_CONTROL close=%u reset=%u hold=%u modeReq=%u load=%u\n",
+                pShm->NC_Command.Close_System ? 1U : 0U, pShm->NC_Command.reset ? 1U : 0U,
+                pShm->NC_Command.feedHold ? 1U : 0U, pShm->NC_Command.reqChangeMode ? 1U : 0U,
+                pShm->NC_Command.loadProgramReq ? 1U : 0U);
         }
         // CJ LOAD FIX1: end of ordered control request dispatch.
 
@@ -3263,6 +3348,7 @@ namespace HMI_Bridge
             *nc, motion, g_hmi1000msDiagnosticWorkspace)) return;
         // CJ FIX1: unconditional drain before SHM/ordinary diagnostic gates.
         DrainIdleHoldDiagnostics(motion);
+        DrainRotaryPidDiagnostics(motion); // ROTPID_DIAG1 bounded observation drain
         DrainCncP1Diagnostics(motion);
         DrainCncFeedPlanDiagnostics(motion);
         SHM_Data* pShm = SHMManager::GetInstance().GetData();
@@ -4260,6 +4346,7 @@ namespace HMI_Bridge
             quietDiagnosticSamples = 0U;
             RunHmiDiagnosticOutputFamily([&]()
                 {
+                    nc->PrintProgramStartDiagnostic();
                     RtPrintf(
                         "[NC-DIAG] Policy:ARC_FIX1 Sample:%llu Full:%llu "
                         "NC:%d Mode:%d Owner:%u/%u Safety:%u Busy:%u "
@@ -4371,6 +4458,16 @@ namespace HMI_Bridge
                             lifecycleCommit.releaseFailures == 0ULL)
                         ? 1U
                         : 0U);
+
+                    // Same supervisory diagnostic cadence as NC01F-RT.
+                    nc->PrintProgramStartDiagnostic();
+                    RtPrintf("[HMI-START-DIAG] INPUT plcAvailable=%u C12=%u C11=%u C5=%u reset=%u hold=%u modeReq=%u load=%u\n",
+                        g_PLC != nullptr ? 1U : 0U,
+                        (g_PLC != nullptr && g_PLC->Get_C(NCPLC::C::CYCLE_START)) ? 1U : 0U,
+                        (g_PLC != nullptr && g_PLC->Get_C(NCPLC::C::SERVO_READY)) ? 1U : 0U,
+                        (g_PLC != nullptr && g_PLC->Get_C(NCPLC::C::EMERGENCY_STOP)) ? 1U : 0U,
+                        pShm->NC_Command.reset ? 1U : 0U, pShm->NC_Command.feedHold ? 1U : 0U,
+                        pShm->NC_Command.reqChangeMode ? 1U : 0U, pShm->NC_Command.loadProgramReq ? 1U : 0U);
 
                     RtPrintf(
                         "[NC01F-RT] NC:%d Mode:%d Owner:%s(%u) Gen:%u "

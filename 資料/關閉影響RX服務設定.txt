@@ -1,0 +1,87 @@
+
+//關閉-----------------------------------------------------------
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Application Experience\" `
+  -TaskName "Microsoft Compatibility Appraiser"
+
+
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Device Information\" `
+  -TaskName "Device"
+
+
+
+//確認關閉-----------------------------------------------------------
+
+Get-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Application Experience\" `
+  -TaskName "Microsoft Compatibility Appraiser"
+
+Get-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Device Information\" `
+  -TaskName "Device"
+
+
+//恢復開啟-----------------------------------------------------------
+
+
+Enable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Application Experience\" `
+  -TaskName "Microsoft Compatibility Appraiser"
+
+Enable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\Device Information\" `
+  -TaskName "Device"
+
+
+
+
+-------------------------------------------------------------------------------------------------
+
+
+
+
+//關閉-----------------------------------------------------------
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\MemoryDiagnostic\" `
+  -TaskName "RunFullMemoryDiagnostic"
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\.NET Framework\" `
+  -TaskName ".NET Framework NGEN v4.0.30319 64"
+
+Disable-ScheduledTask `
+  -TaskPath "\Microsoft\Windows\.NET Framework\" `
+  -TaskName ".NET Framework NGEN v4.0.30319"
+
+
+
+
+
+//確認--------------------------------------------------------------
+Get-ScheduledTask |
+Where-Object {
+    $_.TaskName -match 'RunFullMemoryDiagnostic|NGEN'
+} |
+Select TaskPath,TaskName,State
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

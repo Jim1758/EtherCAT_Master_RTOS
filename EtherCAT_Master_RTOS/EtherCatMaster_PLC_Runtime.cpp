@@ -13,8 +13,12 @@
 //PLC ¤¤Â_§@·~----------------------------------------------------------
 void RTAPI GlobalTimerHandler_PLC(void* nContext)
 {
-    EtherCatMaster* pMaster =
-        (EtherCatMaster*)nContext;
+    CoreTimerCallbackContext* timerContext =
+        static_cast<CoreTimerCallbackContext*>(nContext);
+    if (timerContext == nullptr) return;
+    CoreTimerCallbackScope callbackScope(timerContext->Gate);
+    if (!callbackScope) return;
+    EtherCatMaster* pMaster = static_cast<EtherCatMaster*>(timerContext->Owner);
 
     if (pMaster == nullptr)
     {

@@ -1127,7 +1127,8 @@ namespace
         uint16_t length,
         const uint8_t* writeData,
         uint8_t* readData,
-        uint64_t deadlineNs)
+        uint64_t deadlineNs,
+        NicTxCaller caller = NicTxCaller::RuntimeSDO)
     {
         if (pMaster == nullptr ||
             pMaster->m_pNic == nullptr ||
@@ -1202,9 +1203,11 @@ namespace
         const uint64_t startNs =
             pMaster->GetCurrentMasterTimeNs();
 
+        NicTxCallContext txContext{};
+        txContext.caller = caller;
         if (!pMaster->m_pNic->SendPacket(
             txFrame,
-            static_cast<unsigned int>(totalFrameBytes)))
+            static_cast<unsigned int>(totalFrameBytes), nullptr, &txContext))
         {
             return -2;
         }
@@ -3098,7 +3101,8 @@ namespace
                 readLength,
                 nullptr,
                 readBuffer,
-                OSCARMAX_ECAT_ESC_DIAG_STEP_DEADLINE_NS);
+                OSCARMAX_ECAT_ESC_DIAG_STEP_DEADLINE_NS,
+                NicTxCaller::RuntimeEscDiag);
 
         InterlockedIncrement(&g_ecatEscDiagRtShadow.Sequence);
         MemoryBarrier();
@@ -5538,8 +5542,12 @@ g_pdoOneShotInfraFinalLateCount =
 // ============================================================================
 void RTAPI GlobalTimerHandler_PDO(void* nContext)
 {
-    EtherCatMaster* pMaster =
-        (EtherCatMaster*)nContext;
+    CoreTimerCallbackContext* timerContext =
+        static_cast<CoreTimerCallbackContext*>(nContext);
+    if (timerContext == nullptr) return;
+    CoreTimerCallbackScope callbackScope(timerContext->Gate);
+    if (!callbackScope) return;
+    EtherCatMaster* pMaster = static_cast<EtherCatMaster*>(timerContext->Owner);
 
 
     if (pMaster == nullptr)
@@ -11091,7 +11099,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
         }
 
 
-        if (g_pdoOneShotTimerHandle != NULL)
+        if (!timerContext->Gate.StopRequested() && g_pdoOneShotTimerHandle != NULL)
         {
             rearmOk =
                 RtSetTimerRelative(
@@ -11207,7 +11215,7 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                 FALSE;
 
 
-            if (g_pdoOneShotTimerHandle != NULL)
+            if (!timerContext->Gate.StopRequested() && g_pdoOneShotTimerHandle != NULL)
             {
                 emergencyOk =
                     RtSetTimerRelative(
@@ -18653,6 +18661,13 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             // 只有 LRW Process Data 有效才更新 shadow input，避免應用層讀到
                             // timeout／WKC 錯誤週期的半成品。PDO Handler 是 IO Map 唯一 Owner。
                             // =========================================================
+
+                            // Selected GAP A/D is captured every PDO cycle. Invalid
+                            // LRW status is published without refreshing last-good data.
+                            // qpcDcAfter uses the same QPC epoch as NC GAP services.
+                            pMaster->CaptureGapAnalogInputSnapshot(
+                                qpcDcAfterValid ? qpcDcAfter.QuadPart : -1LL,
+                                qpcFrequency, processDataValid);
 
                             if (processDataValid)
                             {

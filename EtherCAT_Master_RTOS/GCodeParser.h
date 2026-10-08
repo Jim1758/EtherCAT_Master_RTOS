@@ -69,6 +69,7 @@ struct NCParsedBlock
     int mCount = 0;
     std::array<std::string, NC_MAX_M_CODES_PER_BLOCK> mExpressions{};
 
+    std::uint32_t duplicateAddressMask = 0U; // EDM16: authored duplicates; legacy values still last-word-wins.
     std::array<bool, 26> hasParam{};
     std::array<std::string, 26> paramExpressions{};
 

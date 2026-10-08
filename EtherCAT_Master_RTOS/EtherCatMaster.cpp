@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdio.h>
 #include "GlobalConfig.h"
+#include "EtherCatMaster_DC_Internal.h"
 #include "PLCManager.h" // 🌟 1. 記得 include PLCManager 標頭檔
 #define MAX_MBX_SIZE 1024
 EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m_mboxCnt(0)
@@ -36,8 +37,31 @@ EtherCatMaster::EtherCatMaster() : m_pNic(nullptr), m_pEni(nullptr), m_idx(0), m
     // 🌟 將全域指標指向這顆唯一真正有在跑的 PLC 大腦！
     g_PLC = &this->m_plcManager;
 }
+void EtherCatMaster::StopCyclicRuntime()
+{
+    const bool hadTimers = m_hPdoTimer != NULL || m_hPlcTimer != NULL || m_hProbeTimer != NULL;
+    // Close ALL admission gates before waiting for either callback. The counter
+    // covers the full handler, including a PDO wait inside the NAL receive path.
+    m_pdoTimerContext->Gate.RequestStop();
+    m_plcTimerContext->Gate.RequestStop();
+    m_probeTimerContext->Gate.RequestStop();
+    if (hadTimers) RtPrintf("[CORE-CLOSE1] BEGIN callbacks=CLOSED resources=RETAINED\n");
+    CoreTimerShutdown::Cancel(m_hPdoTimer, "PDO", "REQUEST");
+    CoreTimerShutdown::Cancel(m_hPlcTimer, "PLC", "REQUEST");
+    CoreTimerShutdown::Cancel(m_hProbeTimer, "PROBE", "REQUEST");
+    CoreTimerShutdown::DrainAndDelete(m_hPlcTimer, *m_plcTimerContext, "PLC");
+    CoreTimerShutdown::DrainAndDelete(m_hPdoTimer, *m_pdoTimerContext, "PDO");
+    CoreTimerShutdown::DrainAndDelete(m_hProbeTimer, *m_probeTimerContext, "PROBE");
+    // These callback-visible aliases stay valid until the PDO lease is drained.
+    g_pdoOneShotTimerHandle = NULL;
+    InterlockedExchange(&g_pdoOneShotStartupMode, 0);
+    if (hadTimers) RtPrintf("[CORE-CLOSE1] QUIESCENT pdo=0 plc=0 probe=0 cleanup=ALLOWED\n");
+}
+
 EtherCatMaster::~EtherCatMaster()
 {
+    StopCyclicRuntime();
+    if (g_PLC == &m_plcManager) g_PLC = nullptr;
     if (m_NC != nullptr)
     {
         delete m_NC;
@@ -3956,3 +3980,72 @@ void EtherCatMaster::LinkCoordinateManager(CoordinateManager* pCoord)
 
 
 
+
+// ============================================================================
+// EDM18 selected real A/D input. These functions do not issue EtherCAT traffic
+// or control motion/discharge. The PDO owner alone captures live process data.
+// ============================================================================
+bool EtherCatMaster::ConfigureGapAnalogInputBeforeStart(
+    std::uint32_t adIndex, std::uint32_t expectedDeviceId) noexcept
+{
+    if (m_gapAnalogInputRouteBuilt) return false;
+    m_gapAnalogInputRequestedIndex = adIndex;
+    m_gapAnalogInputExpectedDeviceId = expectedDeviceId;
+    return adIndex != 0U;
+}
+
+bool EtherCatMaster::BuildGapAnalogInputRouteBeforeStart(bool validatedCompositeContract)
+{
+    if (m_gapAnalogInputRouteBuilt) return m_gapAnalogInputBinding.configured;
+    m_gapAnalogInputRouteBuilt = true;
+    std::vector<EDMAnalogInput::Layout> layouts;
+    layouts.reserve(m_CompositeApplicationDescriptorsShadow.size());
+    for (const auto& descriptor : m_CompositeApplicationDescriptorsShadow)
+    {
+        EDMAnalogInput::Layout layout{};
+        layout.analogInput = std::strcmp(descriptor.kind, "AnalogInput") == 0;
+        layout.dataType = descriptor.dataType;
+        layout.sampleMode = descriptor.sampleMode;
+        layout.slaveIndex = descriptor.slaveIndex;
+        layout.inputBitOffset = descriptor.inputBitOffset;
+        layout.inputBitLength = descriptor.inputBitLength;
+        layout.elementBits = descriptor.elementBits;
+        layout.channelCount = descriptor.channelCount;
+        if (descriptor.slaveIndex >= 0 && descriptor.slaveIndex < 128)
+            layout.deviceId = m_slaveInfo[descriptor.slaveIndex].configAddr;
+        layouts.push_back(layout);
+    }
+    m_gapAnalogInputBinding = EDMAnalogInput::Resolve(layouts.data(), layouts.size(),
+        m_gapAnalogInputRequestedIndex, m_gapAnalogInputExpectedDeviceId,
+        m_IoMapSize > 0 ? static_cast<std::uint32_t>(m_IoMapSize) : 0U,
+        validatedCompositeContract);
+    m_gapAnalogInputPublisher.ConfigureBeforeStart(m_gapAnalogInputBinding);
+    DEBUG_PRINT("[EDM18-AD] route=%s reason=%s AD=%u count=%u device=%u slave=%d inputBit=%d type=%s physicalDischarge=0\n",
+        m_gapAnalogInputBinding.configured ? "READY" : "DISABLED",
+        EDMAnalogInput::ReasonName(m_gapAnalogInputBinding.reason),
+        static_cast<unsigned int>(m_gapAnalogInputBinding.adIndex),
+        static_cast<unsigned int>(m_gapAnalogInputBinding.channelCount),
+        static_cast<unsigned int>(m_gapAnalogInputBinding.deviceId),
+        static_cast<int>(m_gapAnalogInputBinding.slaveIndex),
+        static_cast<int>(m_gapAnalogInputBinding.inputBitOffset),
+        m_gapAnalogInputBinding.unsignedRaw ? "UInt16" : "Int16");
+    return m_gapAnalogInputBinding.configured;
+}
+
+void EtherCatMaster::CaptureGapAnalogInputSnapshot(
+    std::int64_t qpcTicks, std::uint64_t qpcFrequency, bool processDataValid) noexcept
+{
+    if (!m_gapAnalogInputBinding.configured) return;
+    std::int32_t rawCode = 0;
+    const bool readSucceeded = processDataValid && EDMAnalogInput::ReadRaw16(
+        reinterpret_cast<const std::uint8_t*>(m_IoMap),
+        m_IoMapSize > 0 ? static_cast<std::uint32_t>(m_IoMapSize) : 0U,
+        m_gapAnalogInputBinding.inputBitOffset, m_gapAnalogInputBinding.unsignedRaw, rawCode);
+    m_gapAnalogInputPublisher.ObserveFromPdo(rawCode, readSucceeded,
+        qpcTicks, qpcFrequency, processDataValid);
+}
+
+bool EtherCatMaster::ReadGapAnalogInputSnapshot(EDMAnalogInput::Snapshot& snapshot) const noexcept
+{
+    return m_gapAnalogInputPublisher.Read(snapshot);
+}

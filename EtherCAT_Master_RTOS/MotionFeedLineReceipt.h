@@ -4,6 +4,8 @@
 #include "NCPathCoreFeedLine.h"
 #include "NCRotaryFeedLine.h"
 #include "NCZCFeedLine.h"
+#include "NCXYZCFeedLine.h"
+#include "NCXYZCUVFeedLine.h"
 #include "NCPathCoreRetainedPath.h"
 
 #include <array>
@@ -32,6 +34,14 @@ struct MotionFeedLineReceipt
     // BASE70 stores native Z/C units and their common nominal time separately.
     NCZCFeedLineValue zc{};
     bool zcFeed = false;
+    // BASE72: XYZ linear path feed and positional C share one clock.
+    NCXYZCFeedLineValue xyzc{};
+    bool xyzcFeed = false;
+    // BASE73: XYZ linear path feed with positional C/U/V on one clock.
+    NCXYZCUVFeedLineValue xyzcuv{};
+    bool xyzcuvFeed = false;
+    // BASE79G: curved XY/C is a separate exact-stop receipt family.
+    bool eccentricFeed = false;
     NCPathCoreRetainedGeometry blendGeometry{};
     NCPathCoreCornerMetadata blendMetadata{};
     // DI timing permission; canonical geometry and authored source F stay unchanged.
@@ -54,6 +64,8 @@ struct MotionFeedLineReceipt
     {
         line.Clear(); rotary.Clear(); rotaryFeed = false;
         zc.Clear(); zcFeed = false;
+        xyzc.Clear(); xyzcFeed = false;
+        xyzcuv.Clear(); xyzcuvFeed = false; eccentricFeed = false;
         blendGeometry.Clear(); blendMetadata = NCPathCoreCornerMetadata{};
         cornerNextFeedMMMin = cornerDispatchFeedMMMin = cornerDispatchVelocityPPS = 0.0;
         identity = MotionExecutionIdentity{};
@@ -89,8 +101,8 @@ struct MotionCncPathTail
     }
     void Assign(const MotionFeedLineReceipt& receipt) noexcept
     {
-        // Rotary or Z+C exact-stop receipts cannot become XYZ queued-feed tails.
-        if (receipt.rotaryFeed || receipt.zcFeed) { Clear(); return; }
+        // Native rotary/mixed exact-stop receipts cannot become XYZ queued-feed tails.
+        if (receipt.eccentricFeed || receipt.rotaryFeed || receipt.zcFeed || receipt.xyzcFeed || receipt.xyzcuvFeed) { Clear(); return; }
         endMCS = receipt.blendGeometry.valid ? receipt.blendGeometry.endMCS : receipt.line.endMCS;
         endPulse = receipt.blendGeometry.valid ? receipt.blendGeometry.endPulse : receipt.line.endPulse;
         identity = receipt.identity; ownerLease = receipt.ownerLease;
@@ -109,6 +121,8 @@ struct MotionFeedLineWorkspace
     NCPathCoreFeedLineInput input{};
     NCRotaryFeedLineInput rotaryInput{};
     NCZCFeedLineInput zcInput{};
+    NCXYZCFeedLineInput xyzcInput{};
+    NCXYZCUVFeedLineInput xyzcuvInput{};
     std::vector<int> rotaryAxes;
     NCPathCoreFeedArcInput cornerArcInput{};
     NCPathCoreFeedArcV2 cornerArc{};

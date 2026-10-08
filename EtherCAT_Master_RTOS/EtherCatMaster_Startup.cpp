@@ -1715,6 +1715,21 @@ bool EtherCatMaster::InitializeMaster(
     // 這些 Stage 4B 再納入。
     // =========================================================
 
+    // EDM18: resolve the requested global AD index after topology/address
+    // verification and before any cyclic writer starts. A missing GAP binding
+    // disables hardware GAP acquisition while ordinary CNC remains available.
+    // Only Stage 11C.1/11C.2 validate this selected shadow AD route. The
+    // Stage 11A legacy SimpleProjection compatibility audit is not this gate:
+    // an IOM UInt16 channel remains valid inside its audited GenericIO envelope.
+    const bool gapAnalogInputContractValidated =
+        compositeRuntimeShadowAuditPass &&
+        compositeAdapterShadowBuildPass &&
+        compositeAdapterShadowAuditPass;
+    if (!BuildGapAnalogInputRouteBeforeStart(gapAnalogInputContractValidated))
+    {
+        DEBUG_PRINT("[EDM18-AD] route=DISABLED cncStartup=CONTINUE\n");
+    }
+
     MarkStartupReady();
 
 

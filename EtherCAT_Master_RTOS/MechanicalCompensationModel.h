@@ -23,7 +23,7 @@ enum class Error : unsigned
     ParameterNumber, ParameterRange, Geometry, FeedbackUnsupported, TablePair,
     OffsetLimit, SlopeLimit, PeriodicGrid, PeriodicClosure, CombinedDirectional,
     ConfigurationSealed, NotConfigured, IntegrationPending, RuntimeNumber,
-    RuntimeVelocity, Allocation, CoordinateContract
+    RuntimeVelocity, Allocation, CoordinateContract, LifecycleContract, LifecycleRejected, OutputUncertain
 };
 
 inline const char* ErrorName(Error e) noexcept
@@ -57,6 +57,9 @@ inline const char* ErrorName(Error e) noexcept
     case Error::RuntimeNumber: return "RUNTIME_NUMBER_INVALID";
     case Error::RuntimeVelocity: return "NOMINAL_VELOCITY_EXCEEDS_AXIS_LIMIT";
     case Error::Allocation: return "CONFIGURATION_ALLOCATION_FAILED";
+    case Error::LifecycleContract: return "LIFECYCLE_CONTRACT_SELF_CHECK_FAILED";
+    case Error::LifecycleRejected: return "LIFECYCLE_TRANSACTION_REJECTED";
+    case Error::OutputUncertain: return "NIC_HANDOFF_OUTCOME_UNCERTAIN";
     case Error::CoordinateContract: return "COORDINATE_CONTRACT_SELF_CHECK_FAILED";
     }
     return "UNKNOWN";
@@ -143,6 +146,7 @@ struct CoordinateFrame; // PBC-2 local command/feedback frame
 
 class AxisModel
 {
+    friend class AxisLifecycle; // PBC-3A: preview/commit without copying table storage.
 public:
     const Config& Configuration() const noexcept { return m_config; }
     const State& Runtime() const noexcept { return m_state; }

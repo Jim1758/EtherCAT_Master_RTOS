@@ -42,10 +42,12 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
 
 
     //PDO 中斷宣告---------------------------------------------------------------
-    HANDLE hTimer_PDO = NULL;
+    if (m_hPdoTimer != NULL || m_hPlcTimer != NULL ||
+        m_pdoTimerContext->Gate.StopRequested() || m_plcTimerContext->Gate.StopRequested()) return;
+    HANDLE& hTimer_PDO = m_hPdoTimer;
     LARGE_INTEGER liPeriod_PDO;
     liPeriod_PDO.QuadPart = 2500; // 250us
-    hTimer_PDO = RtCreateTimer(NULL, 0, GlobalTimerHandler_PDO, this, 64, CLOCK_2);//PSECURITY_ATTRIBUTES,StackSize,pRoutine,Context,Priority (請填入一個優先權數值，0~127),Clock
+    hTimer_PDO = RtCreateTimer(NULL, 0, GlobalTimerHandler_PDO, m_pdoTimerContext, 64, CLOCK_2);//PSECURITY_ATTRIBUTES,StackSize,pRoutine,Context,Priority (請填入一個優先權數值，0~127),Clock
     if (hTimer_PDO == NULL)
     {
         DEBUG_PRINT("GlobalTimerHandler_PDO Error>>%d\n", GetLastError());
@@ -61,10 +63,10 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
     }
 
     //PLC 中斷宣告---------------------------------------------------------------
-    HANDLE hTimer_PLC = NULL;// 用來存放計時器的 Handle
+    HANDLE& hTimer_PLC = m_hPlcTimer;// 用來存放計時器的 Handle
     LARGE_INTEGER liPeriod_PLC;
     liPeriod_PLC.QuadPart = 10000; // 1ms
-    hTimer_PLC = RtCreateTimer(NULL, 0, GlobalTimerHandler_PLC, this, 63, CLOCK_2);//PSECURITY_ATTRIBUTES,StackSize,pRoutine,Context,Priority (請填入一個優先權數值，0~127),Clock
+    hTimer_PLC = RtCreateTimer(NULL, 0, GlobalTimerHandler_PLC, m_plcTimerContext, 63, CLOCK_2);//PSECURITY_ATTRIBUTES,StackSize,pRoutine,Context,Priority (請填入一個優先權數值，0~127),Clock
 
     if (hTimer_PLC == NULL)
     {
@@ -76,6 +78,7 @@ void EtherCatMaster::RunRealTimeCycle_EXAMPLE_MODE()//主要程式迴圈執行 �
         if (!RtSetTimerRelative(hTimer_PLC, &liPeriod_PLC, &liPeriod_PLC))
         {
             DEBUG_PRINT("GlobalTimerHandler_PLC Error>>RtSetTimerRelative\n");
+            return; // Common main-thread exit owns timer cleanup.
         }
     }
 

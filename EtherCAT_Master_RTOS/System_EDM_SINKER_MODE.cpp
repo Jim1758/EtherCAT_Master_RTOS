@@ -5564,6 +5564,8 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         if (m_NC->Close_System_Com_flag == true)//關閉核心命令
         {
             MarkRuntimeStopping();
+            // Freeze callback-owned state before persistence and resource release.
+            StopCyclicRuntime();
 
 
             m_NC->CoordSys.SaveAllParameters();//儲存座標系統相關參數

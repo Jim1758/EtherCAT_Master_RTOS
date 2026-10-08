@@ -10,7 +10,7 @@
 #include <limits>
 #include <type_traits>
 
-// ROTPID_DIAG2: observation only. No controller, alarm, in-position, owner,
+// ROTPID_DIAG3: observation only. No controller, alarm, in-position, owner,
 // epoch, PDO, parameter or NC-completion writes are possible through this API.
 // Sole producer: 250-us Motion owner. Sole consumer: HMI 1000-ms task.
 struct RotaryPidDiagnosticSample
@@ -70,6 +70,7 @@ public:
     static constexpr std::size_t Capacity = 16U;
     static constexpr std::size_t DrainBudget = 4U;
     static constexpr std::uint32_t CycleUs = 250U;
+    static constexpr std::uint32_t IdleRefreshSamples = 10000000U / CycleUs;
 
     void Observe(const RotaryPidDiagnosticSample& sample) noexcept
     {
@@ -115,10 +116,22 @@ public:
             (sample.imageVelocityPps < 0 ? -1 : 0),
             state.lastImageSign, state.imageChanges);
 
-        // Three snapshots per episode only: 0.5, 2 and 5 seconds.
-        // No continuing log stream if a machine remains stuck indefinitely.
+        // Preserve the 0.5, 2 and 5 second milestones and bounded TAIL output.
+        // IDLE_HOLD also refreshes every 10 seconds, retaining cumulative extrema
+        // and counts so late console exports still expose earlier deviations.
+        // A separate countdown keeps refreshing after the sample count saturates.
+        bool idleRefreshDue = false;
+        if (sample.scope == 1U)
+        {
+            if (state.idleRefreshCountdown > 1U) --state.idleRefreshCountdown;
+            else
+            {
+                state.idleRefreshCountdown = IdleRefreshSamples;
+                idleRefreshDue = true;
+            }
+        }
         const bool due = state.samples == 2001U || state.samples == 8001U ||
-            state.samples == 20001U;
+            state.samples == 20001U || idleRefreshDue;
         if (due && (state.outside != 0U || sample.scope == 1U))
         {
             Emit(state, sample.scope == 1U ? 4U : 0U);
@@ -163,6 +176,7 @@ private:
         std::uint32_t imageChanges = 0U;
         bool active = false;
         bool reported = false;
+        std::uint32_t idleRefreshCountdown = IdleRefreshSamples + 1U;
     };
     std::array<State, AxisCount> states_{};
     FixedCapacitySpscRing<RotaryPidDiagnosticEvent, Capacity> events_{};
@@ -238,4 +252,4 @@ private:
 };
 static_assert(sizeof(RotaryPidDiagnosticMonitor) + sizeof(RotaryPidDiagnosticSample) +
     sizeof(RotaryPidDiagnosticEvent) <= 8192U,
-    "ROTPID_DIAG2 transport, producer and consumer workspace must fit 8 KiB.");
+    "ROTPID_DIAG3 transport, producer and consumer workspace must fit 8 KiB.");

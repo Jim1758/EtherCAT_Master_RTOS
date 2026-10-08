@@ -1,6 +1,35 @@
 ﻿#pragma once
 #include "NC_Types.h"
 #include "EDMGapSignal.h"
+#include "EDMGapInput.h"
+#include "EDMProcessProfile.h"
+#include "EDMProcessTuningContract.h" // EDM20 owner-thread shadow calculations only.
+class EtherCatMaster;
+#include "EDMProcessSimulationTest.h" // EDM01: no physical output or motion.
+#include "EDMFeedRetreatSimulationTest.h" // EDM02: simulated consumer only.
+#include "EDMGapAcquisitionSimulationTest.h" // EDM14: synthetic ADC shadow only.
+#include "EDMVoltageSimulationTest.h" // EDM15: parameterized synthetic voltage.
+#include "EDMRecipeControl.h" // EDM17: exact-generation owner-thread recipe edits.
+#include "EDMRecipeSimulationTest.h" // EDM16: immutable catalog / shadow recipe selection.
+#include "EDMShortFlushSimulationTest.h" // EDM22: isolated synthetic short/flush executor.
+#include "EDMAutomaticFlushSimulationTest.h" // EDM23: isolated automatic cycle fixtures.
+#include "EDMLiveAutomaticFlush.h" // EDM24: actual COND/GAP, virtual actuator only.
+#include "EDMProcessCoordinatorSimulationTest.h" // EDM25: isolated feed/short/flush arbitration.
+#include "EDMGapServoRTSession.h" // EDM55: SIM-only continuous RT servo; no axis/PDO output.
+#include "EDMRTShadowChannel.h" // EDM48: actual RT shadow transport, no motor output.
+#include "EDMExecutionCompletion.h" // EDM49: local RT physical terminal proof; no drive ACK.
+#include "EDMExecutionHandoff.h" // EDM47: local shadow handoff; no RT or drive receipts.
+#include "EDMProcessMotionIntent.h" // EDM46: bounded linear-axis intent; shadow only.
+#include "EDMLiveProcessCoordinator.h" // EDM26: current COND/GAP into one virtual EDM action.
+#include "EDMMotionReplaySimulationTest.h" // EDM27: isolated SIM intent/receipt bridge; no Motion calls.
+#include "EDMZGapShortReplanFixture.h"
+#include "EDMZGapFeedFixture.h"
+#include "EDMZGapRapidFixture.h"
+#include "EDMZGapReplanFixture.h" // EDM40: finite motion interrupted by fresh simulated GAP changes.
+#include "EDMZGapCurveFixture.h" // EDM39: fixed real voltage curve for scoped finite segments.
+#include "EDMZGapShortFixture.h" // EDM37: fixed SIM voltage into the real short detector.
+#include "EDMZFixtureSession.h" // EDM28/29: explicit unloaded local Z finite-position diagnostics.
+#include "EDMAutomaticFlushRecipe.h" // EDM23: read-only actual recipe binding.
 #include "MotionCore.h"
 #include "HomingManager.h"
 #include "CoordinateManager.h"
@@ -77,6 +106,8 @@
 // BQ-BEGIN
 #include "NCPathCoreCommittedRun.h"
 #include "MotionFeedLineReceipt.h"
+#include "MotionEccentricCProducer.h"
+#include <memory>
 #include "NCPathCoreCutterContour.h"
 #include "NCPathCoreRetainedPath.h"
 #include "MotionPathCoreRetainedReceipt.h"
@@ -91,6 +122,7 @@
 #include <map>                 // Parsed Macro Cache 使用穩定節點位址
 #include <stack>               // 🌟 新增：為了支援副程式返回堆疊
 #include <cstdint>
+#include <limits>
 #include <atomic>
 #include <type_traits>
 class NCManager;
@@ -248,6 +280,89 @@ static_assert(
 class NCManager {
 public:
     NCManager(MotionCore& motion);
+    // EDM16: one boot ownership transfer, before NC/RT cyclic threads start.
+    bool InstallEDMRecipeCatalogBeforeStart(std::unique_ptr<EDMRecipe::Catalog> catalog) noexcept;
+    // One startup logical selection: restore the last COND, always load E1.
+    // Called before cyclic threads; an alarm does not hide the loaded values.
+    bool SelectEDMRecipeAtStartupBeforeStart(std::uint32_t tableId, bool recoveryDisplayOnly = false) noexcept;
+    bool IsEDMRecipeSelectionPersistenceAllowedSameThread() const noexcept { return !m_recipeRecoveryDisplayOnly; }
+    // Same NC owning thread only. Summary may retain logical HOLD selection;
+    // bool reports usable RUN state. Field false clears caller-owned small output.
+    bool ReadEDMRecipeSummarySameThread(EDMRecipe::Summary& output) noexcept;
+    bool ReadEDMRecipeFieldSameThread(std::uint16_t fieldId, EDMRecipe::ParameterSnapshot& output) noexcept;
+    // Owner NC thread only; no reentrancy, queued transport or shared ABI.
+    // Caller-owned outputs must be disjoint from this manager and inputs.
+    struct EDMRecipeEditContext
+    {
+        EDMRecipeControl::Key key{};
+        MotionOwnerLease lease{};
+        MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
+        std::uint64_t run = 0ULL, cache = 0ULL, controlGeneration = 0ULL;
+    };
+    bool ReadEDMRecipeEditContextSameThread(std::uint16_t fieldId,
+        EDMRecipeEditContext& context, EDMRecipe::ParameterSnapshot& field) noexcept;
+    bool ApplyEDMRecipeEditSameThread(const EDMRecipeEditContext& context,
+        const EDMRecipeControl::Request& request, EDMRecipeControl::Result& result) noexcept;
+    // EDM19 owner-thread bridge. Detached optimistic context; no motion permit.
+    void ReadEDMRecipeHmiContextSameThread(EDMRecipeControl::HmiContext& output) noexcept;
+    bool ApplyEDMRecipeHmiCommandSameThread(const EDMRecipeControl::HmiContext& expected,
+        const EDMRecipeControl::HmiCommand& command, EDMRecipeControl::HmiResult& result) noexcept;
+    // Worker must validate candidate in full and retain exclusive ownership.
+    // Success swaps pointers only; worker must release retired off the NC thread.
+    bool ReloadValidatedEDMRecipeCatalogSameThread(const EDMRecipeControl::HmiContext& expected,
+        std::unique_ptr<EDMRecipe::Catalog>& candidate, std::unique_ptr<const EDMRecipe::Catalog>& retired,
+        EDMRecipeControl::HmiResult& result) noexcept;
+    // EDM15 boot-only, before NC service starts; immutable one-attempt profile install.
+    // No runtime reload, HMI/SHM/API access or cross-thread polling is introduced.
+    // EDM18 observation only; the NC owner reads the PDO-owned atomic snapshot.
+    bool InstallEDMGapInputBeforeStart(const EDMGapInput::Profile& profile, EtherCatMaster* master) noexcept;
+    EDMGapInput::Snapshot ReadEDMGapInputSnapshotSameThread() noexcept;
+    // EDM20: boot-only install; gains are copied from CNC parameters for data
+    // resolution only. Neither this interface nor the snapshot writes Motion.
+    enum class EDMProcessShadowReason : std::uint8_t
+    {
+        ConfigUnavailable, Closing, ClockInvalid, GapInvalid, RecoveryDisplay,
+        RecipeUnavailable, MachineProfileMismatch, SemanticUnitMismatch,
+        Alarm, Reset, Hold, NotReady, AwaitFreshSample, SampleIdentity,
+        CurveInvalid, Ready
+    };
+    struct EDMProcessShadowSnapshot
+    {
+        bool profileReady = false, recipeReady = false, previewAvailable = false;
+        std::uint32_t configRevision = 0U, machineProfileId = 0U;
+        std::uint32_t tableId = 0U, activeAxisMask = 0U;
+        std::uint16_t eCode = 0U;
+        std::uint64_t recipeGeneration = 0ULL, observedAtMs = 0ULL, sampleSequence = 0ULL;
+        EDMGap::Source source = EDMGap::Source::NONE;
+        EDMProcessShadowReason reason = EDMProcessShadowReason::ConfigUnavailable;
+        double voltageV = 0.0, referenceV = 0.0, overridePercent = 0.0;
+        double previewSpeedMmPerMin = 0.0;
+        double machiningScenarioSpeedMmPerMin = 0.0; // Hypothetical machining short policy only.
+        EDMGapServo::Result curve{};
+        EDMGapServo::ShortResult idleShort{}, machiningShort{};
+        EDMGapServo::RetreatResult shortRetreatPreview{};
+        std::array<EDM20::GainResolution, 8> dischargeGains{}, flushGains{};
+        constexpr bool PhysicalMotionEnabled() const noexcept { return false; }
+        constexpr bool PhysicalDischargeEnabled() const noexcept { return false; }
+    };
+    bool InstallEDMProcessProfileBeforeStart(const EDM20::ProcessProfile& profile,
+        const AxisContext* axes, std::size_t axisCount) noexcept;
+    // Copy of the last owner-thread observation, not a cross-thread SDK or
+    // current motion authorization. Caller owns output; no mutable reference.
+    void ReadEDMProcessShadowSnapshotSameThread(EDMProcessShadowSnapshot& output) const noexcept;
+    // NC owner only. SDK transport calls these through the independent mailbox.
+    void ReadEDMProcessTuningSameThread(EDMProcessTuningContext& context, EDMProcessTuningValues& values) const noexcept;
+    EDMProcessTuningStatus ApplyEDMProcessTuningSameThread(const EDMProcessTuningRequest& request) noexcept;
+    void ReadEDMRecipeDisplaySameThread(EDMRecipe::ActiveSnapshot& output) noexcept;
+    const EDMRecipe::Catalog* ReadEDMRecipeCatalogSameThread() const noexcept { return m_recipe.GetCatalog(); }
+    bool InstallEDMVoltageProfileBeforeStart(const EDMVoltage::Profile& profile) noexcept;
+    // Diagnostic copy of the last synthetic VIRTUAL_CASES observation only.
+    // Same NC owning thread, no reentrancy. Not a physical reading or control permit.
+    // captured/observed/ageMs describe that virtual observation, not wall-clock freshness.
+    EDMVoltage::Snapshot ReadEDMVoltageSnapshotSameThread() noexcept;
+    bool InitializeEccentricCProducer() noexcept;
+    bool IsEccentricCProducerReady() const noexcept;
+    std::size_t EccentricCProducerStorageBytes() const noexcept;
 
     // NC-0.2L.2AJ: internal NC-thread diagnostic only; NEVER HMI/SHM/API polling.
     // No reentrancy/owner mutation during the entire call. Caller-owned output
@@ -349,11 +464,21 @@ public:
         return m_state.load(std::memory_order_acquire);
     }
 
-    // CO_FIX1: read only on the existing NC/HMI supervisory thread.
+    // CO_FIX1 / EDM01_FIX1: same-thread diagnostic deferral only.
+    // G180 P1/P2 also need prompt NC service, including while paused.
+    // This getter is consumed only by the compact HMI diagnostic route.
     bool IsGapPathSimulationActiveSameThread() const noexcept
     {
-        return m_gapPath.active || m_gapWindow.active;
+        return m_gapDryRun.active || m_gapPath.active || m_gapWindow.active;
     }
+
+    // EDM13 FIX2: NC-thread diagnostics only; neither method grants motion.
+    bool IsEDMDiagnosticQuietSameThread() const noexcept;
+    // EDM35 FIX2: defer passive console IO while the physical fixture needs NC service.
+    bool IsEDMZFixtureDiagnosticQuietSameThread() const noexcept;
+    void DrainEDMDiagnosticsSameThread() noexcept;
+    // EDM40 FIX1: at most one deferred console line after fresh RT release.
+    bool DrainEDMGapReplanDiagnosticsSameThread() noexcept;
 
     NCOperationMode GetMode() const
     {
@@ -1455,12 +1580,15 @@ private:
         // BASE70: rotary interpretation and rotary/Z profiles cannot drift after freeze.
         double rotaryModulo = 0.0, maximumVelocity = 0.0;
         double accelerationTime = 0.0, decelerationTime = 0.0;
+        double stopDecelerationTime = 0.0;
         bool positionalRotary = false, shortestPath = false;
     };
     std::array<FixedTranslationTravelPolicy, 8U> m_fixedTranslationTravel{};
     std::uint64_t m_fixedTranslationTravelGeneration = 0ULL;
     bool IsFixedTranslationTravelCurrentSameThread() const noexcept;
     bool PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode);
+    bool IsEDMPathXYZTranslationBlockAllowedSameThread(const NCBlock& block,
+        const NCTranslationSnapshot& source, std::uint32_t presentMask);
     bool PrepareG53NativeHandoffSameThread();
     bool PreparePositioningHandoffSameThread(int profileCode);
     bool IsFixedTranslationBlockAllowedSameThread(const NCBlock& block);
@@ -2417,6 +2545,7 @@ private:
 
     // BX-FEED-BEGIN: fixed startup-owned G01 state, distinct from V1 G00 history.
     MotionFeedLineWorkspace m_pathFeedMotion{};
+    std::unique_ptr<MotionEccentricCProducerWorkspace> m_eccentricProducer;
     std::vector<int> m_pathFeedAxes = std::vector<int>(3U, 0);
     std::vector<double> m_pathFeedTargets = std::vector<double>(3U, 0.0);
     std::array<double, 8U> m_pathFeedWCS{}, m_pathFeedCandidate{};
@@ -2424,6 +2553,8 @@ private:
     struct PathFeedState
     {
         CncFeedValueSnapshot capturedFeed{};
+        // BASE79J: original literal F; ZC uses Z mm/min, C-only deg/min.
+        double eccentricProgrammedFeed = 0.0;
         std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL, commit = 0ULL;
         MotionFeedbackSequence lastSequence = 0ULL;
         std::uint32_t submitted = 0U, accepted = 0U, started = 0U, done = 0U;
@@ -2448,7 +2579,14 @@ private:
         NCBlockDispatchId dispatchId) noexcept;
     WaitConditionFunc StartPathCoreFeedSameThread(const NCBlock& block);
     WaitConditionFunc StartPathCoreRotaryFeedSameThread(const NCBlock& block);
+    WaitConditionFunc StartPathCoreEccentricCFeedSameThread(const NCBlock& block);
     WaitConditionFunc StartPathCoreZCFeedSameThread(const NCBlock& block);
+    WaitConditionFunc StartPathCoreXYZCFeedSameThread(const NCBlock& block);
+    bool IsXYZCFeedProfileCurrentSameThread() const noexcept;
+    bool IsEccentricCFeedProfileCurrentSameThread() const noexcept;
+    bool IsEccentricCFeedReceiptCurrentSameThread() const noexcept;
+    WaitConditionFunc StartPathCoreXYZCUVFeedSameThread(const NCBlock& block);
+    bool IsXYZCUVFeedProfileCurrentSameThread() const noexcept;
     void CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId,
         const MotionProgramBlockCapture& capture, const NCProgramCommitSnapshot& commit,
         bool committed, bool ledgerFound, const NCBlockLifecycleSnapshot& ledger,
@@ -2515,10 +2653,13 @@ private:
             active = selected = capacityLogged = drainLogged = faulted = false;
         }
     } m_cncFeed{};
-    // BASE70: bounded native Z+C proof adds 392 bytes per receipt including alignment.
-    // Four existing heap-owned rows add 1568 bytes; capacity stays fixed.
-    static_assert(sizeof(CncFeedFlight) <= 2248U, "BASE70 mixed receipt row storage budget changed.");
-    static_assert(sizeof(CncFeedQueue) <= 10016U, "BASE70 NC-owned mixed queue storage budget changed.");
+    // BASE74 keeps one six-axis proof per existing heap-owned receipt row.
+    // Its sizeof includes the bounded G90 raw targets and three rotary policies.
+    // Four-row capacity stays fixed; geometry owns its separate value-size bound.
+    static_assert(sizeof(CncFeedFlight) <= 2248U + sizeof(NCXYZCFeedLineValue) + 8U + sizeof(NCXYZCUVFeedLineValue) + 8U,
+        "BASE74 mixed receipt row storage budget changed.");
+    static_assert(sizeof(CncFeedQueue) <= 10016U + 4U * (sizeof(NCXYZCFeedLineValue) + 8U + sizeof(NCXYZCUVFeedLineValue) + 8U),
+        "BASE74 NC-owned mixed queue storage budget changed.");
     static bool IsCncPathQueuedBlockShapeValid(const NCBlock& block, int unitsMode = 21, bool polar = false) noexcept;
     bool IsCncFeedScopeSameThread() noexcept;
     bool PrepareCncFeedDispatchSameThread(const NCParsedBlock* parsed, int pc);
@@ -2633,7 +2774,102 @@ private:
     // BZ-REPLAY-END
 
     // CG-GAP-BEGIN: explicit simulation, fixed NC-owned data; no RT observer.
+    void ObserveEDMProcessShadowSameThread(const EDMGapInput::Snapshot& gap) noexcept;
+    void LogEDMProcessShadowSameThread() noexcept;
+    EDM20::ProcessProfile m_edmProcessProfile{};
+    std::array<EDM20::AxisGains, 8> m_edmCncGainBaseline{};
+    std::uint64_t m_edmProcessTuningGeneration = 0ULL;
+    bool m_edmProcessBootTraceSeen = false;
+    EDMProcessShadowSnapshot m_edmProcessShadow{};
+    std::array<EDM20::GainResolution, 8> m_edmDischargeGains{}, m_edmFlushGains{};
+    EDMGapServo::ShortDetector m_edmIdleShortDetector{}, m_edmMachiningShortDetector{};
+    EDMGapServo::ShortResult m_edmIdleShortResult{}, m_edmMachiningShortResult{};
+    EDMGapInput::Snapshot m_edmProcessLastGap{};
+    EDMGapInput::Snapshot m_edmProcessObservedGap{}; // EDM24: current raw observer input, including invalid identity changes.
+    std::uint64_t m_edmProcessLastObservedMs = 0ULL, m_edmProcessLastLogMs = 0ULL;
+    std::uint64_t m_edmProcessLastRecipeGeneration = 0ULL;
+    std::uint32_t m_edmProcessActiveAxisMask = 0U;
+    bool m_edmProcessInstallAttempted = false, m_edmProcessReady = false;
+    bool m_edmProcessHaveGap = false, m_edmProcessHaveClock = false;
+    bool m_edmProcessNeedFreshSample = true, m_edmProcessLogSeen = false;
+    EDMGapInput::Channel m_edmGapChannel{};
+    EtherCatMaster* m_edmGapMaster = nullptr;
+    std::uint64_t m_edmGapFrequency = 0ULL, m_edmGapLastLogMs = 0ULL;
+    EDMGapInput::InputStatus m_edmGapLastLogStatus = EDMGapInput::InputStatus::NotConfigured;
+    EDMGap::Band m_edmGapLastLogBand = EDMGap::Band::UNKNOWN;
+    bool m_edmGapLogSeen = false;
     EDMGap::Monitor m_gapInput{};
+    EDMProcessSimulationTest::Scenario m_edmProcessTest{};
+    EDMFeedRetreatSimulationTest::Scenario m_edmFeedRetreatTest{};
+    EDMGapAcquisitionSimulationTest::Scenario m_edmAcquisitionTest{};
+    EDMVoltageSimulationTest::Scenario m_edmVoltageTest{};
+    EDMShortFlushSimulationTest::Scenario m_edmShortFlushTest{};
+    EDMAutomaticFlushSimulationTest::Scenario m_edmAutomaticFlushTest{};
+    EDMProcessCoordinatorSimulationTest::Scenario m_edmProcessCoordinatorTest{};
+    // Catalog vectors are boot-owned heap storage. Declaration order keeps the
+    // store alive until both fixed runtime controllers have been destroyed.
+    EDMRecipe::CatalogStore m_recipeStore{};
+    EDMRecipe::Controller m_recipe{};
+    EDMRecipeSimulationTest::Scenario m_edmRecipeTest{};
+    std::uint64_t m_recipeRun = 0ULL, m_recipeCache = 0ULL;
+    MotionOwnerLease m_recipeLease{};
+    MotionExecutionEpoch m_recipeEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    // m_recipeIdleSelection means logical-only, including across START/P_END;
+    // it carries no program edit or motion authorization.
+    bool m_recipeHoldSeen = false, m_recipeIdleSelection = false;
+    bool m_recipeStartupSelectionAttempted = false;
+    bool m_recipeRecoveryDisplayOnly = false; // Emergency in-memory values require validated disk reload.
+    struct RecipeSelectionPrepared
+    {
+        MotionOwnerLease lease{};
+        MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
+        std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL;
+        std::uint32_t id = 0U;
+        int line = 0;
+        bool table = false, ready = false;
+    } m_recipePrepared{};
+    std::uint64_t m_recipeControlGeneration = 1ULL;
+    bool m_recipeControlExhausted = false;
+    struct RecipeEditPrepared
+    {
+        EDMRecipeEditContext context{};
+        EDMRecipeControl::Request request{};
+        NCBlockDispatchId dispatch = NC_BLOCK_DISPATCH_ID_INVALID;
+        int sourcePC = -1, line = 0;
+        bool ready = false;
+    } m_recipeEditPrepared{};
+    static bool IsEDMRecipeEditRequest(const NCBlock& block) noexcept;
+    static bool IsEDMRecipeEditBlockShapeValid(const NCBlock& block) noexcept;
+    static bool DecodeEDMRecipeEditBlock(const NCBlock& block, const NCParsedBlock& parsed,
+        EDMRecipeControl::Request& request) noexcept;
+    bool IsEDMRecipeStoppedAuthorityCurrentSameThread();
+    bool IsEDMRecipeIdleAuthorityCurrentSameThread() const noexcept;
+    bool IsEDMRecipeHmiEditAllowedSameThread() const noexcept;
+    bool AreEDMRecipeAxesDrainedSameThread() const noexcept;
+    void InvalidateEDMRecipeEditContextsSameThread() noexcept;
+    void FenceEDMRecipeHoldSameThread() noexcept;
+    bool PrepareEDMRecipeEditSameThread(const NCBlock& block, int sourcePC, int line, NCBlockDispatchId dispatch);
+    bool CommitEDMRecipeEditSameThread(const NCBlock& block);
+    void RejectEDMRecipeEditSameThread(int line, const char* reason, EDMRecipe::Error domainError);
+    static bool IsEDMRecipeSelectionRequest(const NCBlock& block) noexcept;
+    static bool DecodeEDMRecipeSelectionBlock(const NCBlock& block, bool& table, std::uint32_t& id) noexcept;
+    bool IsEDMRecipeStoppedSelectionAllowedSameThread(const NCBlock& block);
+    bool PrepareEDMRecipeSelectionSameThread(const NCBlock& block, int sourcePC, int line, NCBlockDispatchId dispatch);
+    bool CommitEDMRecipeSelectionSameThread(const NCBlock& block);
+    void RejectEDMRecipeSelectionSameThread(int line, const char* reason, int alarmCode = 0);
+    void ClearEDMRecipeSelectionSameThread() noexcept;
+    void RetainEDMRecipeSelectionSameThread() noexcept;
+    void ValidateEDMRecipeSelectionSameThread() noexcept;
+    static_assert(sizeof(EDMFeedRetreatSimulationTest::Scenario) <= 2048U,
+        "EDM02 must remain fixed NC-owned simulation storage.");
+    static_assert(sizeof(EDMProcessSimulationTest::Scenario) <= 1024U,
+        "EDM01 process simulation must remain fixed NC-owned storage.");
+    static_assert(sizeof(EDMShortFlushSimulationTest::Scenario) <= 4096U,
+        "EDM22 must remain bounded NC-owned synthetic storage.");
+    static_assert(sizeof(EDMAutomaticFlushSimulationTest::Scenario) <= 8192U,
+        "EDM23 must remain bounded NC-owned synthetic storage.");
+    static_assert(sizeof(EDMProcessCoordinatorSimulationTest::Scenario) <= 16384U,
+        "EDM25 must remain bounded NC-owned synthetic storage.");
     struct GapDryRunState
     {
         MotionOwnerLease lease{};
@@ -2646,14 +2882,417 @@ private:
         std::uint32_t restarts = 0U, result = 0U; // result: pending / pass / cancelled / fail.
         int sourceLine = 0;
         bool active = false, paused = false;
+        bool processTest = false; // G180 P2; P1 retains its existing input test.
+        bool feedRetreatTest = false; // G180 P3: continuous virtual consumer session.
+        bool adcShadowTest = false; // G180 P4: adapter contract, no machining input.
+        bool voltageTest = false; // G180 P5: installed profile, synthetic virtual voltage only.
+        bool recipeTest = false; // G180 P6: independent shadow recipe controller.
+        bool shortFlushTest = false; // G180 P7: synthetic short/flush state executor.
+        bool automaticFlushTest = false; // G180 P8: independent automatic flush cycle fixtures.
+        bool liveAutomaticFlushTest = false; // G180 P9: explicit actual COND/GAP shadow session.
+        bool processCoordinatorTest = false; // G180 P10: isolated feed/short/flush coordinator.
+        bool liveProcessTest = false; // G180 P11: installed COND/GAP virtual coordinator session.
+        bool motionBridgeTest = false; // G180 P12: isolated SIM single-Z admission/receipt contract.
+        bool runtimeServoTest = false; // G180 P33/P34: RT SIM servo calculation only.
+        bool physicalZFixtureTest = false; // G180 P13/P14/P15: fixed local unloaded physical Z profiles.
     } m_gapDryRun{};
     std::uint64_t m_gapDryRunSerial = 0ULL;
+    struct EDMGapServoRTControlState
+    {
+        EDM55RT::Scope scope{};
+        EDM55RT::Feedback feedback{};
+        EDM55RT::Profile profile = EDM55RT::Profile::Normal;
+        std::uint64_t startedUs = 0ULL, lastClockUs = 0ULL, lastFreshUs = 0ULL;
+        std::uint64_t admissionStartUs = 0ULL, admissionCheckUs = 0ULL;
+        std::uint64_t resumeWaitUs = 0ULL, authorityWaitUs = 0ULL;
+        std::uint64_t terminalPublication = 0ULL, terminalObservedTick = 0ULL;
+        std::uint64_t terminalIdentityTick = 0ULL, zeroIdentityTick = 0ULL;
+        std::uint32_t restartCount = 0U, admissionStalledPolls = 0U;
+        std::uint32_t stalledPolls = 0U, loggedStage = (std::numeric_limits<std::uint32_t>::max)();
+        bool ackLogged = false, retirePending = false, retired = false;
+        bool admissionPending = false; // No RT request has been issued for this scope.
+    } m_edmGapServoRT{};
+    static_assert(sizeof(EDMGapServoRTControlState) <= 1024U,
+        "EDM55 NC supervision must remain bounded.");
+
+    // EDM24_FIX1: START may follow this scan's HOLD observer. Admission waits
+    // for a new RUN sample, without stepping the retained virtual cycle.
+    struct EDMLiveAutomaticFlushResumeState
+    {
+        EDMGapInput::Snapshot gapFloor{};
+        std::uint64_t startMs = 0ULL, lastClockMs = 0ULL;
+        std::uint64_t configRevision = 0ULL, recipeGeneration = 0ULL;
+        std::uint32_t stalledCalls = 0U;
+        bool pending = false;
+    } m_edmLiveAutomaticFlushResume{};
+    EDMLiveAutomaticFlushResumeState m_edmLiveProcessResume{};
+    EDMLiveAutomaticFlushResumeState m_edmLiveProcessReceiptWait{};
+    static_assert(sizeof(EDMLiveAutomaticFlushResumeState) <= 512U,
+        "EDM24 resume admission must remain fixed bounded storage.");
+    EDM24::LiveAutomaticFlushSession m_edmLiveAutomaticFlush{};
+    EDM23::RecipeBindingSnapshot m_edmLiveAutomaticFlushBinding{};
+    std::uint64_t m_edmLiveAutomaticFlushLogMs = 0ULL, m_edmLiveAutomaticFlushClockMs = 0ULL;
+    std::uint64_t m_edmLiveAutomaticFlushLoggedCycles = 0ULL;
+    std::uint8_t m_edmLiveAutomaticFlushLoggedState = 255U, m_edmLiveAutomaticFlushLoggedReason = 255U;
+    std::uint8_t m_edmLiveAutomaticFlushLoggedCycleState = 255U;
+    static_assert(sizeof(EDM24::LiveAutomaticFlushSession) <= 8192U, "EDM24 live shadow storage must remain bounded.");
+    EDM26::LiveProcessSession m_edmLiveProcess{};
+    EDM46::IntentAdapter m_edmProcessMotionIntent{};
+    EDM47::ShadowExecution m_edmProcessExecution{};
+    struct EDMRTShadowControlState
+    {
+        EDM46::Scope scope{};
+        EDM47::Packet submitted{};
+        EDM48::Feedback feedback{};
+        std::uint64_t lastFeedbackMs = 0ULL, lastPollMs = 0ULL, logMs = 0ULL;
+        bool observed = false, current = false, cancelled = false, cancelPending = false;
+        bool drainSubmitted = false, completedLogged = false;
+    };
+    EDMRTShadowControlState m_edmRTShadowControl{};
+    static_assert(sizeof(EDMRTShadowControlState) <= 2048U,
+        "EDM48 NC readback must remain bounded.");
+    static_assert(sizeof(EDM47::ShadowExecution) <= 8192U,
+        "EDM47 local execution handoff storage must remain bounded.");
+    static_assert(sizeof(EDM46::IntentAdapter) <= 2048U,
+        "EDM46 intent storage must remain fixed and bounded.");
+    EDM26::ProcessRecipeBinding m_edmLiveProcessBinding{};
+    std::uint64_t m_edmLiveProcessLogMs = 0ULL, m_edmLiveProcessClockMs = 0ULL;
+    std::uint64_t m_edmLiveProcessLoggedCycles = 0ULL;
+    std::uint8_t m_edmLiveProcessLoggedState = 255U, m_edmLiveProcessLoggedReason = 255U;
+    std::uint8_t m_edmLiveProcessLoggedCycleState = 255U, m_edmLiveProcessLoggedAction = 255U;
+    bool m_edmLiveProcessConfigLogPending = false;
+    static_assert(sizeof(EDM26::LiveProcessSession) <= 12288U, "EDM26 live process storage must remain bounded.");
+    EDMMotionReplaySimulationTest::Scenario m_edmMotionReplay{};
+    std::uint64_t m_edmMotionReplayClockMs = 0ULL, m_edmMotionReplayLogMs = 0ULL;
+    std::uint64_t m_edmMotionReplayReceiptStartMs = 0ULL, m_edmMotionReplayReceiptClockMs = 0ULL;
+    std::uint32_t m_edmMotionReplayReceiptStalledCalls = 0U;
+    std::uint8_t m_edmMotionReplayLoggedAction = 255U, m_edmMotionReplayLoggedAdmission = 255U;
+    bool m_edmMotionReplayPreflightPending = false, m_edmMotionReplayReceiptPending = false;
+    static_assert(sizeof(EDMMotionReplaySimulationTest::Scenario) <= 16384U, "EDM27 SIM bridge storage must remain bounded.");
     static_assert(sizeof(GapDryRunState) + sizeof(EDMGap::Monitor) <= 512U,
         "CG fixed NC storage budget changed.");
     static bool IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept;
     WaitConditionFunc StartGapDryRunSameThread(const NCBlock& block);
     static bool WaitForGapDryRunCallback(NCManager* nc);
     bool ProcessGapDryRunSameThread();
+    WaitConditionFunc StartEDMGapServoRTSameThread(const NCBlock& block);
+    bool ProcessEDMGapServoRTSameThread();
+    void ValidateEDMGapServoRTSameThread();
+    bool RestartEDMGapServoRTSameThread(std::uint64_t nowUs);
+    bool ReadEDMGapServoClockSameThread(std::uint64_t& nowUs) noexcept;
+    bool IsEDMGapServoRunReadySameThread(std::uint64_t* reasonMask = nullptr,
+        MotionStopSettleSnapshot* diagnostic = nullptr) const noexcept;
+    void LogEDMGapServoAdmissionSameThread(EDM55RT::Profile profile, std::uint64_t mask,
+        const MotionStopSettleSnapshot& diagnostic, const char* reason) noexcept;
+    void PrepareEDMGapServoAdmissionSameThread(std::uint64_t nowUs);
+    bool IsEDMGapServoScopeCurrentSameThread(bool allowHold) const noexcept;
+    void PauseEDMGapServoRTSameThread(const char* reason) noexcept;
+    void EndEDMGapServoRTSameThread(bool failed, const char* reason) noexcept;
+    void ServiceEDMGapServoRetirementSameThread() noexcept;
+    void LogEDMGapServoRTSameThread(const char* event, const char* reason) noexcept;
+
+    bool ProcessEDMProcessDryRunCaseSameThread(std::uint64_t nowMs);
+    bool ProcessEDMFeedRetreatDryRunCaseSameThread(std::uint64_t nowMs);
+    bool ProcessEDMAcquisitionDryRunCaseSameThread(std::uint64_t nowMs);
+    bool ProcessEDMVoltageDryRunCaseSameThread(std::uint64_t nowMs);
+    bool ProcessEDMRecipeDryRunCaseSameThread(std::uint64_t nowMs);
+    bool ProcessEDMShortFlushDryRunCaseSameThread(std::uint64_t nowMs);
+    bool ProcessEDMAutomaticFlushDryRunCaseSameThread(std::uint64_t nowMs);
+    bool ProcessEDMCoordinatorDryRunCaseSameThread(std::uint64_t nowMs);
+    bool IsEDMCoordinatorAuthorityCurrentSameThread() noexcept;
+    enum class EDMLiveProcessReceiptStatus : std::uint8_t { Ready, Wait, Invalid };
+    enum class EDMZFixturePhase : std::uint8_t
+    { PreArm, ArmPending, Positive, Negative, ShortStop, ShortRearm, Origin, FinalStop, Disarm, Receipt, Finished, Cancelled, Retreat, ShortClearWait };
+    struct EDMZFixtureState
+    {
+        EDM28::Scope scope{};
+        EDM28::Config config{};
+        EDM28::Feedback feedback{};
+        EDMZFixturePhase phase = EDMZFixturePhase::PreArm;
+        EDMZFixturePhase armNextPhase = EDMZFixturePhase::Positive;
+        EDM28::RequestKind pendingKind = EDM28::RequestKind::Arm;
+        std::uint64_t requestSequence = 0ULL, pendingSequence = 0ULL;
+        std::uint64_t windowStartMs = 0ULL, phaseStartMs = 0ULL, lastClockMs = 0ULL, logMs = 0ULL;
+        std::uint64_t lastFreshMs = 0ULL;
+        std::uint64_t publicationFloor = 0ULL, tickFloor = 0ULL, appliedTick = 0ULL;
+        std::uint64_t receiptPublication = 0ULL, receiptTick = 0ULL, receiptUs = 0ULL, receiptProof = 0ULL;
+        std::uint64_t resetStartMs = 0ULL;
+        std::uint64_t resumeStartMs = 0ULL;
+        std::uint64_t shortStopProof = 0ULL, shortStopProofTick = 0ULL;
+        std::uint64_t shortStopAppliedSequence = 0ULL, shortStopAppliedTick = 0ULL, shortStopAppliedMonotonicUs = 0ULL;
+        std::uint64_t shortSourceTest = 0ULL; // P17 immutable injection identity across HOLD windows.
+        std::uint64_t endpointProofSequence = 0ULL, endpointAppliedSequence = 0ULL, endpointAppliedTick = 0ULL, endpointAppliedMonotonicUs = 0ULL;
+        std::uint64_t terminalStopAppliedSequence = 0ULL, terminalStopAppliedTick = 0ULL, terminalStopAppliedMonotonicUs = 0ULL;
+        std::uint8_t endpointProofKind = 0U; // P17: 1 exact Held Stop, 2 exact Retreat Position.
+        EDM37::GapShortFixture gapShort{}; // P21 recovery / P22 persistent SIM detector.
+        bool gapShortLow = false;
+        // P23 owns a fresh finite script after each proved HOLD restart.
+        EDM28::Config gapCurveConfig{};
+        bool gapCurveProfile = false, curveTerminalHold = false, curvePreArmHold = false;
+        bool terminalResumeFloorSet = false; // EDM49: one new source baseline per terminal HOLD.
+        std::uint64_t curvePreArmSequence = 0ULL;
+        std::uint8_t curveStep = 0U;
+        std::uint32_t curvePositions = 0U, curveZeros = 0U;
+        std::uint64_t curveLastTick = 0ULL, curveLastUs = 0ULL;
+        std::uint64_t curveSequence = 0ULL, curveSourceTick = 0ULL, curveSourceUs = 0ULL;
+        std::uint64_t curveBoundaryProof = 0ULL, curveZeroStartUs = 0ULL, curveZeroStartTick = 0ULL;
+        double curveVoltage = 60.0, curveSignedMmMin = 0.0, curveTargetMm = 0.0, curveAppliedVoltage = 0.0;
+
+        // P24 keeps the old applied Position and the later change sample distinct.
+        bool gapCurveReplanProfile = false, replanLaunchCounted = false;
+        std::uint32_t replanInterrupts = 0U, replanReturns = 0U;
+        double replanLaunchActual = 0.0, replanLaunchCommand = 0.0, replanLaunchPlanning = 0.0;
+        std::uint64_t replanChangeTick = 0ULL, replanChangeUs = 0ULL, replanPriorProof = 0ULL;
+        double replanChangeVoltage = 0.0, replanChangeMmMin = 0.0;
+        std::uint64_t replanPositionSequence = 0ULL, replanPositionTick = 0ULL, replanPositionUs = 0ULL;
+        std::uint64_t replanPositionSourceTick = 0ULL, replanPositionSourceUs = 0ULL;
+        double replanPositionVoltage = 0.0, replanPositionMmMin = 0.0, replanPositionTargetMm = 0.0;
+        std::uint64_t replanStopSequence = 0ULL, replanStopTick = 0ULL, replanStopUs = 0ULL, replanStopProof = 0ULL;
+        // A never-applied first Arm may inherit only this exact retired fault
+        // receipt through priority queue cancellation during pre-arm HOLD.
+        std::uint64_t replanRetiredFaultSession = 0ULL;
+        std::uint64_t replanRetiredFaultDisarmSequence = 0ULL, replanRetiredFaultDisarmTick = 0ULL, replanRetiredFaultDisarmUs = 0ULL;
+        std::uint64_t replanRetiredFaultStopSequence = 0ULL, replanRetiredFaultStopTick = 0ULL, replanRetiredFaultStopUs = 0ULL;
+        EDM28::Reason replanRetiredFaultReason = EDM28::Reason::None;
+
+        // EDM38: admission and sample identity survive HOLD. Only the detector
+        // observation chain is rebuilt once after formal stop/current authority.
+        EDM28::Config gapPersistentConfig{};
+        bool gapPersistentProfile = false, gapPersistentResumeObserved = false;
+        std::uint64_t gapPersistentLastTick = 0ULL, gapPersistentLastUs = 0ULL;
+        std::uint64_t gapPersistentEntryUs = 0ULL;
+        std::uint64_t gapClearProof = 0ULL, gapClearAppliedSequence = 0ULL, gapClearAppliedTick = 0ULL, gapClearAppliedUs = 0ULL;
+        std::uint64_t gapClearPublication = 0ULL, gapClearTick = 0ULL, gapClearUs = 0ULL, gapClearHighUs = 0ULL;
+        double gapClearTargetPulse = 0.0;
+        bool persistentShortLatched = false; // P17/P22; cleared by a new fully admitted session.
+        std::uint8_t operatorWindowQ = 0U; // EDM33: explicit P17 Q2/Q3 only; no-Q behavior stays unchanged.
+        bool operatorWindowActive = false, operatorWindowConsumed = false;
+        std::uint64_t operatorWindowStartMs = 0ULL, operatorWindowProof = 0ULL;
+        std::uint64_t operatorWindowStopSequence = 0ULL, operatorWindowStopTick = 0ULL, operatorWindowStopUs = 0ULL;
+        double originPulse = 0.0;
+        double shortStopMaxPulse = 0.0; // P16 formal stopped max(actual, command, planning).
+        std::uint32_t cycles = 0U, stalledCalls = 0U, resetPolls = 0U;
+        std::uint32_t simulatedShortStops = 0U, verifiedShortClears = 0U, verifiedRetreats = 0U;
+        bool pending = false, originPinned = false, motionApplied = false, shortDone = false, beginPending = true;
+        bool cleanupPending = false, resetPending = false, resetReleased = false, resetBypass = false;
+        // EDM45: bounded NC-only cleanup observations; never motion/proof authority.
+        std::uint32_t cleanupPolls = 0U, cleanupReadBlocked = 0U, cleanupScopeBlocked = 0U;
+        std::uint32_t cleanupWaitStop = 0U, cleanupWaitReceipt = 0U, cleanupSubmitFailed = 0U, cleanupSubmitted = 0U;
+        // Last service outcome: 0 none, 1 read, 2 scope, 3 stop, 4 receipt,
+        // 5 submit failed, 6 submitted, 7 exact completion.
+        std::uint8_t cleanupLastBlock = 0U;
+        bool cleanupTimeoutLogged = false;
+        // EDM35 FIX1: retire failed fixture intent into a bounded visible alarm.
+        bool failureAlarmPending = false;
+        std::uint64_t failureStartMs = 0ULL;
+        std::uint32_t failurePolls = 0U;
+        std::uint8_t failureRtReason = 0U;
+        char failureReason[48]{};
+    } m_edmZFixture{};
+    std::uint64_t m_edmZFixtureSessionSerial = 0ULL;
+    static_assert(sizeof(EDMZFixtureState) <= 2048U, "EDM28 NC fixture storage must remain bounded.");
+    WaitConditionFunc StartEDMZFixtureSameThread(const NCBlock& block);
+    bool IsEDMZFixtureM30ContinuationSameThread() const noexcept;
+    bool ProcessEDMZFixtureSameThread();
+    bool ProcessEDMPersistentShortSameThread();
+    struct EDMGapShortReplanState
+    {
+        EDM28::Profile profile = EDM28::Profile::P13Unloaded;
+        bool active = false, persistent = false, shortIntent = false, pendingClear = false;
+        bool recovering = false, terminalAlarm = false, entryProven = false, clearProven = false;
+        bool originStopPending = false, terminalResumeObserved = false;
+        std::uint32_t entries = 0U, clears = 0U;
+        std::uint64_t lowTick = 0ULL, lowUs = 0ULL, highTick = 0ULL, highUs = 0ULL;
+        std::uint64_t entryTick = 0ULL, entryUs = 0ULL, clearTick = 0ULL, clearUs = 0ULL;
+    } m_edmGapShortReplan{};
+    static_assert(sizeof(EDMGapShortReplanState) <= 512U, "EDM41 NC state must remain bounded.");
+    // EDM42 keeps the first Position receipt distinct from subsequent feed receipts.
+    struct EDMGapFeedUpdateState
+    {
+        EDMGapShortReplanState shortState{};
+        std::uint32_t updates = 0U, legUpdates = 0U;
+        std::uint64_t launchSequence = 0ULL, launchTick = 0ULL, launchUs = 0ULL;
+        std::uint64_t launchSourceTick = 0ULL, launchSourceUs = 0ULL;
+        std::uint64_t acceptedSequence = 0ULL, acceptedTick = 0ULL, acceptedUs = 0ULL;
+        double launchVoltage = 0.0, launchMmMin = 0.0, launchTargetMm = 0.0;
+        double acceptedActual = 0.0, acceptedCommand = 0.0, acceptedPlanning = 0.0;
+        std::uint64_t acceptedSourceTick = 0ULL, acceptedSourceUs = 0ULL;
+        double acceptedVoltage = 0.0, acceptedMmMin = 0.0, acceptedTargetMm = 0.0;
+    } m_edmGapFeedUpdate{};
+    static_assert(sizeof(EDMGapFeedUpdateState) <= 768U, "EDM42 NC state must remain bounded.");
+    struct EDMGapRapidSpeedProof
+    {
+        std::uint64_t launchSequence = 0ULL, launchTick = 0ULL, launchUs = 0ULL;
+        std::uint64_t startTick = 0ULL, startUs = 0ULL, endTick = 0ULL, endUs = 0ULL;
+        double startActual = 0.0, startCommand = 0.0, startPlanning = 0.0;
+        double endActual = 0.0, endCommand = 0.0, endPlanning = 0.0;
+        double actualMmS = 0.0, commandMmS = 0.0, planningMmS = 0.0, cmdMmS = 0.0, pdoMmS = 0.0;
+        std::uint32_t samples = 0U;
+        bool proven = false;
+    };
+    struct EDMGapRapidState
+    {
+        EDMGapShortReplanState shortState{};
+        EDMGapRapidSpeedProof speed{};
+        std::uint32_t advanceProofs = 0U, retreatProofs = 0U;
+        bool stopSourceRestarted = false;
+    } m_edmGapRapid{};
+    static_assert(sizeof(EDMGapRapidState) <= 768U, "EDM43 NC state must remain bounded.");
+    bool ProcessEDMGapRapidFixtureSameThread();
+    bool IsEDMGapRapidConfigValidSameThread(bool requireFrozen) const noexcept;
+    bool IsEDMGapRapidRetiredFaultSameThread() const noexcept;
+    EDM49::Result EvaluateEDMGapRapidCompletionSameThread(EDM49::Stage stage) const noexcept;
+    bool IsEDMGapRapidCompletionProfileSameThread() const noexcept;
+    bool IsEDMGapRapidReleasedSameThread() const noexcept;
+    void LogEDMGapRapidCompletionSameThread(const char* event, EDM49::Stage stage, const EDM49::Result& result) noexcept;
+    bool IsEDMGapRapidTriggerSameThread() const noexcept;
+    bool IsEDMGapRapidStoppedSameThread() const noexcept;
+    bool IsEDMGapRapidPositionSameThread(bool endpoint) const noexcept;
+    void ObserveEDMGapRapidSpeedSameThread() noexcept;
+    bool ObserveEDMGapRapidSameThread() noexcept;
+    bool RaiseEDMGapRapidAlarmSameThread();
+    bool ProcessEDMGapFeedUpdateFixtureSameThread();
+    bool IsEDMGapFeedUpdateConfigValidSameThread(bool requireFrozen) const noexcept;
+    bool IsEDMGapFeedUpdateRetiredFaultSameThread() const noexcept;
+    bool IsEDMGapFeedUpdateReleasedSameThread() const noexcept;
+    bool IsEDMGapFeedUpdateTriggerSameThread() const noexcept;
+    bool IsEDMGapFeedUpdateStoppedSameThread() const noexcept;
+    bool IsEDMGapFeedUpdatePositionSameThread(bool endpoint) const noexcept;
+    bool IsEDMGapFeedUpdateEligibleSameThread() const noexcept;
+    bool ObserveEDMGapFeedUpdateSameThread() noexcept;
+    bool RaiseEDMGapFeedUpdateAlarmSameThread();
+    bool ProcessEDMGapShortReplanFixtureSameThread();
+    bool IsEDMGapShortReplanConfigValidSameThread(bool requireFrozen) const noexcept;
+    bool IsEDMGapShortReplanRetiredFaultSameThread() const noexcept;
+    bool IsEDMGapShortReplanReleasedSameThread() const noexcept;
+    bool IsEDMGapShortReplanTriggerSameThread() const noexcept;
+    bool IsEDMGapShortReplanStoppedSameThread() const noexcept;
+    bool ObserveEDMGapShortReplanSameThread() noexcept;
+    bool RaiseEDMGapShortReplanAlarmSameThread();
+    bool ProcessEDMGapReplanFixtureSameThread();
+    bool IsEDMGapReplanConfigValidSameThread(bool requireFrozen) const noexcept;
+    bool IsEDMGapReplanRetiredFaultSameThread() const noexcept;
+    bool IsEDMGapReplanReleasedSameThread() const noexcept;
+    bool IsEDMGapReplanTriggerSameThread() const noexcept;
+    bool IsEDMGapReplanStoppedSameThread() const noexcept;
+    void LogEDMGapReplanFixtureSameThread(const char* event, const char* result, const char* reason) noexcept;
+    struct EDMGapReplanDiagnosticRecord
+    {
+        char event[17]{}, result[11]{}, reason[41]{};
+        EDM28::Scope scope{};
+        std::uint64_t evt = 0ULL, test = 0ULL, run = 0ULL, elapsedMs = 0ULL;
+        std::uint64_t sampleTick = 0ULL, sampleUs = 0ULL;
+        std::uint64_t curveSequence = 0ULL, curveSourceTick = 0ULL, curveSourceUs = 0ULL;
+        std::uint64_t zeroTick = 0ULL, zeroUs = 0ULL;
+        std::uint64_t positionSequence = 0ULL, positionTick = 0ULL, positionUs = 0ULL;
+        std::uint64_t changeTick = 0ULL, changeUs = 0ULL, priorProof = 0ULL;
+        std::uint64_t stopSequence = 0ULL, stopTick = 0ULL, stopUs = 0ULL, stopProof = 0ULL;
+        std::uint64_t appliedSequence = 0ULL, appliedTick = 0ULL, appliedUs = 0ULL;
+        std::uint64_t appliedCurveSequence = 0ULL, appliedCurveTick = 0ULL, appliedCurveUs = 0ULL;
+        std::uint64_t rtStopSequence = 0ULL, rtStopTick = 0ULL, rtStopUs = 0ULL;
+        std::uint64_t proof = 0ULL, tick = 0ULL, us = 0ULL, publication = 0ULL;
+        double originPulse = 0.0, actualPulse = 0.0, simVoltage = 0.0;
+        double requestVoltage = 0.0, requestFeed = 0.0, targetMm = 0.0;
+        double oldVoltage = 0.0, oldFeed = 0.0, newVoltage = 0.0, newFeed = 0.0;
+        double appliedCurveVoltage = 0.0, appliedCurveFeed = 0.0, cmdSpeedMmS = 0.0;
+        std::uint32_t phase = 0U, step = 0U, cycles = 0U, launches = 0U;
+        std::uint32_t interrupts = 0U, returns = 0U, zeros = 0U, restart = 0U;
+        std::uint32_t kind = 0U, state = 0U, gapFault = 0U, rtReason = 0U;
+        std::uint32_t stableCycles = 0U, profile = 0U;
+        std::uint32_t shortEntries = 0U, shortClears = 0U, shortState = 0U;
+        std::uint64_t lowTick = 0ULL, lowUs = 0ULL, highTick = 0ULL, highUs = 0ULL;
+        std::uint64_t entryTick = 0ULL, entryUs = 0ULL, clearTick = 0ULL, clearUs = 0ULL;
+        std::uint32_t feedUpdates = 0U, legFeedUpdates = 0U;
+        std::uint64_t launchSequence = 0ULL, launchTick = 0ULL, launchUs = 0ULL;
+        std::uint64_t launchSourceTick = 0ULL, launchSourceUs = 0ULL;
+        double launchVoltage = 0.0, launchFeed = 0.0, launchTargetMm = 0.0;
+        EDMGapRapidSpeedProof rapid{};
+        std::uint32_t advanceSpeedProofs = 0U, retreatSpeedProofs = 0U, zeroDwellMs = 0U;
+        double configTargetHalfMm = 0.0, configOuterHalfMm = 0.0, configCapMmS = 0.0;
+        double configFeedMmMin = 0.0, configAccelerationSec = 0.0, configDecelerationSec = 0.0;
+        bool shortIntent = false, pendingClear = false, terminalAlarm = false;
+        bool inhibit = false, targetProven = false, idle = false;
+        bool sourceFresh = false, pdoValid = false, contiguous = false, clockValid = false;
+        bool frame = false, cap = false, zero = false, fault = false;
+        bool stopLatched = false, stopped = false, sameScope = false;
+    };
+    static_assert(sizeof(EDMGapReplanDiagnosticRecord) <= 1024U,
+        "EDM40 diagnostics must remain bounded numeric snapshots.");
+    struct EDMGapReplanDiagnosticState
+    {
+        static constexpr std::uint32_t Capacity = 512U;
+        EDMGapReplanDiagnosticRecord records[Capacity]{};
+        std::uint64_t captured = 0ULL, enqueued = 0ULL, drained = 0ULL, dropped = 0ULL;
+        std::uint64_t coalesced = 0ULL; // EDM44 middle-cycle details; never a lost required snapshot.
+        std::uint64_t formatFailures = 0ULL;
+        std::uint64_t lastDroppedEvent = 0ULL, lastDroppedTest = 0ULL;
+        std::uint64_t drainTick = 0ULL, drainUs = 0ULL;
+        std::uint64_t clockFrequency = 0ULL;
+        std::uint32_t read = 0U, write = 0U, count = 0U;
+        std::uint32_t lastProfile = 0U;
+        std::uint8_t part = 0U;
+        bool endPending = false, saturated = false;
+    };
+    // Sole producer/consumer is the NC thread. RESET and a new fixture never
+    // clear unread evidence; overflow is reported and grants no control state.
+    EDMGapReplanDiagnosticState m_edmGapReplanDiagnostics{};
+    bool ProcessEDMGapCurveFixtureSameThread();
+    bool IsEDMGapCurveConfigValidSameThread(bool requireFrozen) const noexcept;
+    bool IsEDMGapCurvePositionSameThread(bool endpoint) const noexcept;
+    bool IsEDMGapCurveReleasedSameThread() const noexcept;
+
+    bool IsEDMGapPersistentConfigValidSameThread(bool requireFrozen) const noexcept;
+    bool IsEDMGapPersistentActiveSameThread() const noexcept;
+    bool ObserveEDMGapPersistentShortSameThread(bool restart) noexcept;
+    bool RearmEDMPersistentShortSameThread(std::uint64_t nowMs, bool restart) noexcept;
+    bool ServiceEDMPersistentShortOperatorWindowSameThread(std::uint64_t nowMs, std::uint8_t q) noexcept;
+    void LogEDMPersistentShortOperatorWindowSameThread(const char* edge, const char* reason) noexcept;
+    bool PrepareEDMPersistentShortAlarmSameThread(bool positionProof) noexcept;
+    bool AlarmEDMPersistentShortAtOriginSameThread(bool positionProof) noexcept;
+    bool IsEDMZFixtureAuthorityCurrentSameThread(bool allowHeld) noexcept;
+    bool ReadEDMZFixtureFeedbackSameThread(bool requireNew) noexcept;
+    bool SubmitEDMZFixtureSameThread(EDM28::RequestKind kind, double targetMm = 0.0) noexcept;
+    bool RearmEDMZFixtureSameThread(std::uint64_t nowMs, bool restart) noexcept;
+    bool IsEDMZFixtureAppliedSameThread(EDM28::RequestKind kind) const noexcept;
+    bool IsEDMZFixtureStoppedSameThread() const noexcept;
+    bool IsEDMPersistentShortReleasedSameThread() const noexcept;
+    void PauseEDMZFixtureSameThread(const char* reason) noexcept;
+    void EndEDMZFixtureSameThread(const char* result, const char* reason) noexcept;
+    void LogEDMZFixtureSameThread(const char* event, const char* result, const char* reason) noexcept;
+    void ServiceEDMZFixtureCleanupSameThread() noexcept;
+    void LogEDMZFixtureCleanupSameThread(const char* stage) noexcept;
+    void ServiceEDMZFixtureFailureAlarmSameThread() noexcept;
+    bool AdmitEDMZFixtureResetSameThread() noexcept;
+    bool PollEDMZFixtureResetSameThread() noexcept;
+    EDM27::Scope MakeEDMMotionReplayScopeSameThread() const noexcept;
+    bool RestartEDMMotionReplaySameThread(std::uint64_t nowMs);
+    bool ProcessEDMMotionReplaySameThread(std::uint64_t nowMs);
+    EDMLiveProcessReceiptStatus CheckEDMMotionReplayReceiptSameThread(std::uint64_t nowMs) noexcept;
+    void EndEDMMotionReplaySameThread(const char* result, const char* reason, std::uint64_t nowMs);
+    void LogEDMMotionReplayPreflightSameThread();
+    EDM46::Scope MakeEDMProcessIntentScopeSameThread() const noexcept;
+    bool StartEDMProcessIntentSameThread(std::uint64_t nowMs) noexcept;
+    bool RevokeEDMLiveProcessSameThread(bool drainShadow = false, std::uint64_t nowMs = 0ULL) noexcept;
+    void LogEDMProcessExecutionSameThread(const char* event) noexcept;
+    bool ReadEDMRTShadowSameThread(std::uint64_t nowMs) noexcept;
+    bool SubmitEDMRTShadowSameThread() noexcept;
+    void CancelEDMRTShadowSameThread() noexcept;
+    void ServiceEDMRTShadowCancelSameThread() noexcept;
+    void LogEDMRTShadowSameThread(const char* event) noexcept;
+    void LogEDMProcessIntentSameThread(const char* event) noexcept;
+    bool RestartEDMLiveProcessSameThread(std::uint64_t nowMs);
+    bool ProcessEDMLiveProcessResumeSameThread();
+    bool ProcessEDMLiveProcessSameThread(std::uint64_t nowMs);
+    EDM26::LiveObservation MakeEDMLiveProcessObservationSameThread(std::uint64_t nowMs) const noexcept;
+    EDMLiveProcessReceiptStatus CheckEDMLiveProcessReceiptSameThread(std::uint64_t nowMs) noexcept;
+    void EndEDMLiveProcessSameThread(const char* result, const char* reason, std::uint64_t nowMs, std::uint16_t failedField = 0U);
+    bool IsEDMShortFlushRunReadySameThread() const noexcept;
+    bool RestartEDMLiveAutomaticFlushSameThread(std::uint64_t nowMs);
+    bool ProcessEDMLiveAutomaticFlushResumeSameThread();
+    bool ProcessEDMLiveAutomaticFlushSameThread(std::uint64_t nowMs);
+    EDM24::LiveObservation MakeEDMLiveAutomaticFlushObservationSameThread(std::uint64_t nowMs) const noexcept;
+    bool IsEDMLiveAutomaticFlushReceiptCurrentSameThread(std::uint64_t nowMs) const noexcept;
+    void EndEDMLiveAutomaticFlushSameThread(const char* result, const char* reason, std::uint64_t nowMs, std::uint16_t failedField = 0U);
     bool RestartGapDryRunSameThread();
     bool ReadGapDryRunClockSameThread(std::uint64_t& nowMs) noexcept;
     void ValidateGapDryRunSameThread();
@@ -2881,6 +3520,125 @@ private:
     bool StartGapPathSimulationSameThread(bool automaticResume = false, bool repeating = false,
         bool lowRetreat = false, bool repeatedLowRetreat = false, bool returnLowTest = false,
         bool repeatedReturnLow = false, std::uint8_t returnProbeLimit = 1U) noexcept;
+    // EDM03: opt-in P22 is the existing single-cycle P5 profile plus a
+    // simulated GAP decision gate. This state never issues Motion or IO writes.
+    struct EDMPathProcessState
+    {
+        EDMProcessSimulation::Controller controller{};
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        std::uint64_t run = 0ULL, cache = 0ULL, dispatch = 0ULL, commit = 0ULL;
+        std::uint64_t translationGeneration = 0ULL, publication = 0ULL;
+        std::uint64_t requestGeneration = 0ULL, stopSequence = 0ULL;
+        std::uint64_t returnStopSequence = 0ULL, completedFence = 0ULL;
+        std::uint64_t heldSBits = 0ULL, returnedSBits = 0ULL;
+        bool active = false, started = false, bound = false;
+        bool retreatSeen = false, returnSeen = false, returnProven = false;
+        // EDM04 retains prior completion separately from the current cycle.
+        std::uint64_t previousCompletedFence = 0ULL, previousPublication = 0ULL;
+        std::uint64_t previousReturnedSBits = 0ULL, stopPublication = 0ULL, returnStopPublication = 0ULL;
+        std::uint64_t returnNormalSequenceFloor = 0ULL, returnNormalTimeFloor = 0ULL;
+        std::uint8_t cycleLimit = 1U, cycleIndex = 1U, completedCycles = 0U;
+        bool repeated = false;
+        // EDM05 has one return-leg probe; the original return request stays intact.
+        std::uint64_t probeStopSequence = 0ULL, probeStopPublication = 0ULL;
+        std::uint64_t probeNormalSequenceFloor = 0ULL, probeNormalTimeFloor = 0ULL;
+        std::uint64_t probeStopSBits = 0ULL, probeResumePublication = 0ULL;
+        std::uint32_t probeStopOrdinal = 0U;
+        bool returnProbe = false, probeResumeProven = false, probeAdvanceSeen = false;
+        // EDM12: a proven endpoint/probe stop owns one non-refreshable wait.
+        std::uint64_t recoveryWaitStopSequence = 0ULL, recoveryWaitStartMs = 0ULL;
+        std::uint64_t recoveryReturnAppliedSequence = 0ULL, recoveryProbeAppliedSequence = 0ULL;
+        std::uint32_t recoveryLimitMs = 0U;
+        std::uint8_t recoveryWaitKind = 0U; // 0=inactive, 2=endpoint, 3=return probe.
+        // EDM13 bounds NC acceptance of each fresh J5 request, before H begins.
+        std::uint64_t stopWaitStartMs = 0ULL, stopWaitNowMs = 0ULL;
+        std::uint64_t stopWaitSequence = 0ULL, stopWaitBoundarySequence = 0ULL;
+        std::uint32_t stopAckLimitMs = 0U, stopProvenElapsedMs[3]{};
+        std::uint8_t stopWaitKind = 0U, stopWaitSource = 0U, stopWaitCycle = 0U, stopProvenMask = 0U;
+    } m_edmPathProcess{};
+    static_assert(sizeof(EDMPathProcessState) <= 512U,
+        "EDM03 must remain fixed NC-owned process/evidence storage.");
+    // Bounded source sessions keep every cycle's P24 return-probe proof above.
+    // This record carries completion evidence, never a previous resume grant.
+    struct EDMSourceSessionState
+    {
+        MotionExecutionIdentity previousIdentity{};
+        MotionOwnerLease lease{};
+        std::uint64_t run = 0ULL, cache = 0ULL, translationGeneration = 0ULL;
+        std::uint64_t previousDispatch = 0ULL, previousCommit = 0ULL;
+        std::uint64_t previousFence = 0ULL, previousPublication = 0ULL, previousRequestGeneration = 0ULL;
+        double distanceMM = 0.0, feedMMMin = 0.0, intervalMM = 0.0;
+        std::uint32_t initialHistoryCount = 0U;
+        std::uint8_t sourceIndex = 1U, sourceLimit = 2U, completedSources = 0U;
+        bool configured = false, active = false;
+        std::uint8_t cyclesPerSource = 1U;
+        std::uint32_t recoveryLimitMs = 0U; // P26=0; P27 immutable H seconds.
+        std::uint32_t stopAckLimitMs = 0U; // P28 immutable J milliseconds; earlier profiles=0.
+    } m_edmSourceSession{};
+    static_assert(sizeof(EDMSourceSessionState) <= 160U,
+        "EDM08 source session must remain bounded NC-owned storage.");
+    enum class EDMDeferredDiagnosticKind : std::uint8_t
+    {
+        SESSION_ARMED, SOURCE_FRESH, STOP_PROVEN, RETURN_STOP_PROVEN,
+        RETURN_LOW_STOP_PROVEN, RESUME_APPLIED, RETURN_LOW_RESUME_PROVEN,
+        RETURN_LOW_ADVANCE_PROVEN, CYCLE_PASS, REARMED_FRESH_NORMAL,
+        TAIL_NORMAL_PROVEN, SOURCE_PASS, SUMMARY_PASS, SUMMARY_FAIL, SUMMARY_CANCELLED
+    };
+    struct EDMDeferredDiagnosticRecord
+    {
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease lease{};
+        std::uint64_t evt = 0ULL, run = 0ULL, dispatch = 0ULL, cache = 0ULL, commit = 0ULL;
+        std::uint64_t translationGeneration = 0ULL, requestGeneration = 0ULL;
+        std::uint64_t serviceMs = 0ULL, sampleMs = 0ULL, sampleSequence = 0ULL;
+        std::uint64_t stop = 0ULL, returnStop = 0ULL, probeStop = 0ULL;
+        std::uint64_t jStop = 0ULL, jStartMs = 0ULL, jNowMs = 0ULL;
+        std::uint64_t hStop = 0ULL, hStartMs = 0ULL, applied2 = 0ULL, applied3 = 0ULL;
+        std::uint64_t previousFence = 0ULL, fence = 0ULL, heldS = 0ULL, returnedS = 0ULL;
+        std::uint64_t publication = 0ULL, tailPublication = 0ULL;
+        std::uint32_t stopAckLimitMs = 0U, recoveryLimitMs = 0U, ackMs[3]{}, retained = 0U;
+        EDMDeferredDiagnosticKind kind = EDMDeferredDiagnosticKind::SESSION_ARMED;
+        std::uint8_t source = 0U, completed = 0U, limit = 0U;
+        std::uint8_t cycle = 0U, completedCycles = 0U, cyclesPerSource = 0U;
+        std::uint8_t jKind = 0U, jMask = 0U, hKind = 0U, flags = 0U;
+    };
+    static_assert(sizeof(EDMDeferredDiagnosticRecord) <= 384U,
+        "EDM deferred diagnostics must remain fixed numeric records.");
+    struct EDMDeferredDiagnosticState
+    {
+        static constexpr std::uint32_t Capacity = 1024U;
+        EDMDeferredDiagnosticRecord records[Capacity]{};
+        std::uint64_t captureSequence = 0ULL, enqueued = 0ULL, drained = 0ULL, dropped = 0ULL;
+        std::uint64_t lastDroppedSequence = 0ULL, lastDroppedRun = 0ULL;
+        std::uint32_t read = 0U, write = 0U, count = 0U;
+        bool endPending = false, serialSaturated = false;
+        std::uint8_t diagPart = 0U; // FIX3: retain the front record through all four output parts.
+    };
+    // Sole producer and consumer are the NC thread. RESET/new-run never clear
+    // this FIFO: captured identities stay attached to unread older evidence.
+    mutable EDMDeferredDiagnosticState m_edmDiagnostics{};
+    void CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind kind) const noexcept;
+    bool IsEDMSourceSessionScopeValidSameThread() const noexcept;
+    bool IsEDMSourceReturnProofValidSameThread() const noexcept;
+    bool CompleteEDMSourceSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool StartNextEDMSourceSameThread() noexcept;
+    void FinishEDMSourceSessionSameThread(const char* reason, bool failed) noexcept;
+    bool ServiceEDMPathProcessSameThread() noexcept;
+    bool ArmEDMRecoveryWaitSameThread(std::uint8_t kind) noexcept;
+    bool ValidateEDMRecoveryWaitSameThread() noexcept;
+    bool CompleteEDMRecoveryWaitSameThread() noexcept;
+    bool ReadEDMStopClockSameThread(std::uint64_t& nowMs) noexcept;
+    bool ArmEDMStopWaitSameThread(std::uint8_t kind, std::uint64_t requestOriginMs) noexcept;
+    bool ValidateEDMStopWaitSameThread() noexcept;
+    bool CompleteEDMStopWaitSameThread(std::uint8_t kind, std::uint64_t exactStop) noexcept;
+    bool IsEDMPathProcessSignalSameThread(bool normal) const noexcept;
+    bool ObserveEDMPathProcessMotionSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool ObserveEDMReturnProbeMotionSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool ObserveEDMRepeatedPathProcessMotionSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    bool RearmEDMPathProcessCycleSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
+    void FinishEDMPathProcessSameThread(const char* reason, bool failed = false) noexcept;
+    void LogEDMPathProcessSameThread(const char* phase) const noexcept;
     bool IsGapPathAutomaticResumeSignalSameThread() const noexcept;
     bool IsGapPathAutomaticNormalSameThread() const noexcept;
     bool ValidateGapPathAutomaticResumeSameThread() noexcept;
@@ -2888,6 +3646,10 @@ private:
         const char* site = "AUTOMATIC", bool returningSample = false,
         const MotionPathCoreHoldExcursionSnapshot* pendingAdmission = nullptr,
         const MotionPathCoreHoldExcursionSnapshot* sourcePublication = nullptr) noexcept;
+    bool ServiceGapPathSimulationImplSameThread(double activeS, bool publishSample,
+        const char* site, bool returningSample,
+        const MotionPathCoreHoldExcursionSnapshot* pendingAdmission,
+        const MotionPathCoreHoldExcursionSnapshot* sourcePublication) noexcept;
     bool ValidateGapPathRepeatedReturnLowSnapshotSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
     bool ValidateGapPathReturnLowSnapshotSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;
     bool ProcessGapPathReturnLowHoldSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept;

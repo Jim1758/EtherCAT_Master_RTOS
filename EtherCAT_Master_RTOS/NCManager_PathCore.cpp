@@ -10,6 +10,9 @@
 #include "NCXYZFeedScope.h"
 #include "NCRotaryFeedScope.h"
 #include "NCZCFeedScope.h"
+#include "NCXYZCFeedScope.h"
+#include "NCXYZCUVFeedScope.h"
+#include "NCEccentricCFeedScope.h"
 #include <cstdint>
 #include <type_traits>
 #include <cstring>
@@ -2530,6 +2533,62 @@ namespace
 }
 
 // Fixed native translation. All methods run on the existing NC producer thread.
+// The XYZC lane additionally freezes the X/Y profiles. Existing XYZ, rotary
+// and ZC admission keeps its prior currentness contract on unselected axes.
+bool NCManager::IsXYZCFeedProfileCurrentSameThread() const noexcept
+{
+    if (!CoordSys.IsTranslationRunFrozen()) return true;
+    if (CoordSys.GetTranslationSnapshot().generation != m_fixedTranslationTravelGeneration) return false;
+    for (unsigned i = 0U; i < 4U; ++i)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
+        const FixedTranslationTravelPolicy& captured = m_fixedTranslationTravel[i];
+        if (!axis.isExist || axis.axisType != (i < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+            std::memcmp(&captured.maximumVelocity, &axis.maxVel_PPS, sizeof(double)) != 0 ||
+            std::memcmp(&captured.accelerationTime, &axis.G00_acc_time, sizeof(double)) != 0 ||
+            std::memcmp(&captured.decelerationTime, &axis.G00_dec_time, sizeof(double)) != 0 ||
+            (i >= 3U && (captured.shortestPath != axis.useShortestPath ||
+                std::memcmp(&captured.rotaryModulo, &axis.rotaryModulo, sizeof(double)) != 0))) return false;
+    }
+    return true;
+}
+
+// The six-axis lane freezes the profiles of all selected physical axes.
+bool NCManager::IsXYZCUVFeedProfileCurrentSameThread() const noexcept
+{
+    if (!CoordSys.IsTranslationRunFrozen()) return true;
+    if (CoordSys.GetTranslationSnapshot().generation != m_fixedTranslationTravelGeneration) return false;
+    for (unsigned i = 0U; i < 6U; ++i)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
+        const FixedTranslationTravelPolicy& captured = m_fixedTranslationTravel[i];
+        if (!axis.isExist || axis.axisType != (i < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+            std::memcmp(&captured.maximumVelocity, &axis.maxVel_PPS, sizeof(double)) != 0 ||
+            std::memcmp(&captured.accelerationTime, &axis.G00_acc_time, sizeof(double)) != 0 ||
+            std::memcmp(&captured.decelerationTime, &axis.G00_dec_time, sizeof(double)) != 0 ||
+            (i >= 3U && (captured.shortestPath != axis.useShortestPath ||
+                std::memcmp(&captured.rotaryModulo, &axis.rotaryModulo, sizeof(double)) != 0))) return false;
+    }
+    return true;
+}
+
+// BASE79J: generated X/Y and authored C or Z/C share one immutable profile.
+// XYZC already checks the captured V/A/D and C modulo policy bit-for-bit; the
+// shared source classifier additionally fixes the role, units and H radius.
+bool NCManager::IsEccentricCFeedProfileCurrentSameThread() const noexcept
+{
+    if (!IsNCEccentricCFeedFrame(CoordSys.GetTranslationSnapshot()) ||
+        !IsXYZCFeedProfileCurrentSameThread()) return false;
+    if (!CoordSys.IsTranslationRunFrozen()) return true;
+    for (unsigned i = 0U; i < 4U; ++i)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
+        if (std::memcmp(&m_fixedTranslationTravel[i].stopDecelerationTime,
+            &axis.Stop_dec_time, sizeof(double)) != 0) return false;
+    }
+    return true;
+}
+
 bool NCManager::IsFixedTranslationTravelCurrentSameThread() const noexcept
 {
     if (!CoordSys.IsTranslationRunFrozen()) return true;
@@ -2578,6 +2637,103 @@ void NCManager::RetireFixedTranslationSameThread() noexcept
     m_fixedTranslationTravelGeneration = 0ULL;
 }
 
+// EDM03 FIX1 through EDM12: opt-in P22-P27 retain their XYZ-only source lane while
+// GAP/PathHold owns admission. P26/P27 grant only their bounded proven source-window
+// slots. Ordinary runtimeClear and every native/legacy lane remain unchanged.
+// This whole-block classification grants no Motion authority.
+bool NCManager::IsEDMPathXYZTranslationBlockAllowedSameThread(const NCBlock& block,
+    const NCTranslationSnapshot& source, std::uint32_t presentMask)
+{
+    if (m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY ||
+        !CoordSys.IsTranslationRunBound() || !CoordSys.IsTranslationRunFrozen() ||
+        !CoordSys.IsTranslationRunCurrent() || !IsNCXYZFeedNeutralFrame(source) ||
+        presentMask != NCXYZFeedPresentMask(source.axisIdentity) ||
+        source.runToken == 0ULL || source.runToken != m_pathCoreLiveBookkeeping.currentRunToken ||
+        source.rotationPlane != 17 || source.unitsMode != 21 || source.distanceMode != 90 ||
+        source.toolLengthMode != 49 || source.rotationMode != 69 || source.workMode != 169 ||
+        source.scalingMode != 50 || source.mirrorMask != 0U ||
+        Close_System_Com_flag || AlarmManager::GetInstance().HasAlarm() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        m_isG66Active || !m_macroStack.empty() || Homing.IsActive() ||
+        m_cncFeed.selected || m_cncFeed.active || m_cncFeed.count != 0U ||
+        m_pathFeed.pending || m_pathArc.pending || m_pathReplay.pending ||
+        m_gapDryRun.active || m_cutterLine.leadOutRequired) return false;
+    const bool arm = IsNCXYZFeedSingleGBlock(block, 178) && block.has('P') &&
+        (block.val('P') == 22.0 || block.val('P') == 23.0 || block.val('P') == 24.0 || block.val('P') == 25.0 || block.val('P') == 26.0 || block.val('P') == 27.0 || block.val('P') == 28.0) && IsPathCoreHoldBlockShapeValid(block);
+    if (arm)
+        return !m_pathHold.armed && !m_pathHold.bound && !m_gapPath.active && !m_edmPathProcess.active &&
+            !m_gapWindow.active && !m_edmSourceSession.active;
+    const auto& session = m_edmSourceSession;
+    const bool edmWindow = session.active;
+    if (edmWindow)
+    {
+        if (!IsEDMSourceSessionScopeValidSameThread() || !m_pathHold.armed || m_pathHold.bound ||
+            m_gapWindow.budgetProven || m_gapTail.active || !m_edmPathProcess.active ||
+            !m_edmPathProcess.returnProbe ||
+            m_edmPathProcess.repeated != (session.cyclesPerSource > 1U) ||
+            m_edmPathProcess.cycleLimit != session.cyclesPerSource ||
+            session.translationGeneration != source.generation)
+            return false;
+    }
+    else
+    {
+        if (m_gapWindow.active) return false; // P10-P21 never inherit P26's six-axis lane.
+        if (session.configured)
+        {
+            // Final source completion clears PathHold. Keep only scoped G179
+            // cleanup after completion/cancellation, never an extra source slot.
+            return IsNCXYZFeedSingleGBlock(block, 179) && IsPathCoreHoldBlockShapeValid(block) &&
+                !m_pathHold.armed && !m_pathHold.bound && !m_pathHold.automaticEnabled &&
+                !m_pathHold.automaticHoldOwned && !m_pathHold.automaticAdmissionOwned &&
+                !m_gapPath.active && !m_gapTail.active && !m_edmPathProcess.active &&
+                session.sourceLimit >= 2U && session.sourceLimit <= 8U &&
+                session.cyclesPerSource >= 1U && session.cyclesPerSource <= 8U &&
+                (session.recoveryLimitMs == 0U || (session.recoveryLimitMs >= 1000U &&
+                    session.recoveryLimitMs <= 30000U && session.recoveryLimitMs % 1000U == 0U)) &&
+                session.stopAckLimitMs <= 30000U &&
+                (session.stopAckLimitMs == 0U || session.recoveryLimitMs != 0U) &&
+                session.sourceIndex >= 1U && session.sourceIndex <= session.sourceLimit &&
+                session.completedSources <= session.sourceLimit &&
+                session.run == source.runToken && session.cache != 0ULL &&
+                session.cache == GetBaseProgramCache().GetGeneration() &&
+                session.translationGeneration == source.generation &&
+                session.lease.Matches(m_programMotionLease);
+        }
+    }
+    // A successful P22-P25 records this source generation before its next G01.
+    // Revocation keeps the record for manual takeover/cleanup. Every newly
+    // admitted G178/G179 clears it, so a legacy arm cannot inherit this lane.
+    const auto& process = m_edmPathProcess;
+    if (process.run == 0ULL || process.run != source.runToken || process.run != m_pathHold.run ||
+        process.cache == 0ULL || process.cache != GetBaseProgramCache().GetGeneration() ||
+        process.cache != m_pathHold.cache || process.translationGeneration != source.generation ||
+        !process.lease.Matches(m_programMotionLease) || !process.lease.Matches(m_pathHold.lease) ||
+        !m_pathHold.crossSegment || !m_pathHold.requireReturnAuthorization ||
+        (process.returnProbe && !process.repeated && process.cycleLimit != 1U) ||
+        (process.repeated ? (process.cycleLimit < 2U || process.cycleLimit > 8U ||
+            m_pathHold.cycleLimit != process.cycleLimit) : m_pathHold.cycleLimit != 1U) ||
+        m_pathHold.bound || m_pathHold.blocked) return false;
+    if (m_gapPath.active)
+    {
+        if (!process.active || !m_pathHold.armed || !m_pathHold.automaticEnabled ||
+            !m_gapPath.automaticResume || !m_gapPath.repeating || !m_gapPath.lowRetreat ||
+            (process.returnProbe ? (!m_gapPath.repeatedLowRetreat || !m_gapPath.returnLowTest ||
+                !m_gapPath.repeatedReturnLow || m_gapPath.returnProbeLimit != 1U) :
+                (m_gapPath.repeatedLowRetreat != process.repeated || m_gapPath.returnLowTest || m_gapPath.repeatedReturnLow)))
+            return false;
+    }
+    else if (process.active || m_pathHold.automaticEnabled || m_pathHold.automaticHoldOwned ||
+        m_pathHold.automaticAdmissionOwned) return false;
+    if (!edmWindow && IsNCXYZFeedSingleGBlock(block, 179) && IsPathCoreHoldBlockShapeValid(block)) return true;
+    // P26/P27 also admit explicit XYIJF G17 arcs; P22-P25 keep their line-only lane.
+    // Even C0/U0/V0, mixed modal rows and rotary producers remain rejected.
+    // A bound source resumes through its existing J5 Prepare/Commit transaction;
+    // it is never resubmitted or reauthorized by this block-scope exception.
+    return m_pathHold.armed && (IsNCXYZFeedLineBlockAllowed(block, 1) ||
+        (edmWindow && IsNCEDMSourceArcBlockAllowed(block)));
+}
+
 bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode)
 {
     // BASE58-BEGIN: repeatable side-effect-free extra-axis XYZ feed policy.
@@ -2602,14 +2758,48 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
     const bool zcFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
         xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
         IsNCZCFeedBlockAllowed(xyzFeedSource, block);
-    const NCXYZFeedScopeDecision xyzFeedDecision = (rotaryFeedAllowed || zcFeedAllowed) ?
+    const bool xyzcFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCXYZCFeedBlockAllowed(xyzFeedSource, block);
+    const bool xyzcuvFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCXYZCUVFeedBlockAllowed(xyzFeedSource, block);
+    const bool eccentricFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCEccentricCFeedBlockAllowed(xyzFeedSource, block);
+    const bool eccentricSelectionRequested = xyzFeedMemoryBound &&
+        (NCGCodeSemantics::Contains(block, 162) || NCGCodeSemantics::Contains(block, 163));
+    const bool eccentricSelectionAllowed = eccentricSelectionRequested && xyzFeedRuntimeClear &&
+        IsNCEccentricCRotationSelectionBlockAllowed(block) &&
+        CoordSys.IsEccentricRotationSelectionSupported(block.gCode == 162);
+    const bool activeEccentricH = xyzFeedMemoryBound && CoordSys.isCAxisOffsetRotationEnabled &&
+        (CoordSys.toolLengthMode == 43 || CoordSys.toolLengthMode == 44);
+    const bool edmPathXYZAllowed = IsEDMPathXYZTranslationBlockAllowedSameThread(block, xyzFeedSource, xyzFeedPresentMask);
+    NCXYZFeedScopeDecision xyzFeedDecision = (edmPathXYZAllowed || eccentricFeedAllowed || rotaryFeedAllowed || zcFeedAllowed || xyzcFeedAllowed || xyzcuvFeedAllowed) ?
         NCXYZFeedScopeDecision::ALLOWED : EvaluateNCXYZFeedScope(
             xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
             xyzFeedMemoryBound, xyzFeedRuntimeClear);
+    // Active eccentric H can never fall back into legacy endpoint transforms,
+    // macro motion or neutral XYZ/native producers. Cancel G163 before frame
+    // edits. Initial standalone distance selection is interpretation only.
+    if (eccentricSelectionRequested)
+        xyzFeedDecision = eccentricSelectionAllowed ?
+            NCXYZFeedScopeDecision::ALLOWED : NCXYZFeedScopeDecision::REJECTED;
+    else if (activeEccentricH)
+        xyzFeedDecision = eccentricFeedAllowed ||
+            (xyzFeedRuntimeClear && IsNCTranslationSnapshotValid(xyzFeedSource) &&
+                xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+                (IsNCEccentricCFrozenNonMotionBlockAllowed(block) ||
+                    (!xyzFeedFrozen && IsNCXYZFeedDistanceBlockAllowed(block)))) ?
+            NCXYZFeedScopeDecision::ALLOWED : NCXYZFeedScopeDecision::REJECTED;
     // Preserve the existing formal mapping-integrity stop for source drift;
     // a changed live configuration must not become a syntax-only rejection.
     if (xyzFeedDecision != NCXYZFeedScopeDecision::UNCHANGED && xyzFeedMemoryBound &&
-        !IsPathCoreLiveNativeConfigCurrentSameThread())
+        (!IsPathCoreLiveNativeConfigCurrentSameThread() ||
+            (xyzcFeedAllowed && !IsXYZCFeedProfileCurrentSameThread()) ||
+            (xyzcuvFeedAllowed && !IsXYZCUVFeedProfileCurrentSameThread()) ||
+            (eccentricFeedAllowed && !IsEccentricCFeedProfileCurrentSameThread()) ||
+            (activeEccentricH && !IsXYZCFeedProfileCurrentSameThread())))
     {
         AlarmManager::GetInstance().Trigger(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         m_state = NCState::ALARM;
@@ -2729,8 +2919,12 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
     // Unfrozen G00 retains its existing fallback and never opens this lane.
     const bool extraAxisRotaryFeed = gCode == 1 && !xyzFeedFrozen && rotaryFeedAllowed;
     const bool extraAxisZCFeed = gCode == 1 && !xyzFeedFrozen && zcFeedAllowed;
+    const bool extraAxisXYZCFeed = gCode == 1 && !xyzFeedFrozen && xyzcFeedAllowed;
+    const bool extraAxisXYZCUVFeed = gCode == 1 && !xyzFeedFrozen && xyzcuvFeedAllowed;
+    const bool extraAxisEccentricCFeed = gCode == 1 && !xyzFeedFrozen && eccentricFeedAllowed;
     const bool extraAxisXYZFeed = gCode >= 1 && gCode <= 3 && !xyzFeedFrozen &&
-        !extraAxisRotaryFeed && !extraAxisZCFeed && xyzFeedDecision == NCXYZFeedScopeDecision::ALLOWED;
+        !extraAxisRotaryFeed && !extraAxisZCFeed && !extraAxisXYZCFeed && !extraAxisXYZCUVFeed &&
+        !extraAxisEccentricCFeed && xyzFeedDecision == NCXYZFeedScopeDecision::ALLOWED;
     unsigned rotaryAxis = 8U;
     if (extraAxisRotaryFeed &&
         !TryGetNCRotaryFeedAxis(candidate.axisIdentity, block, rotaryAxis)) return false;
@@ -2740,10 +2934,11 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
     {
         const AxisContext& axis = m_motion.GetAxisContext(i);
         if (i < 3 && (!axis.isExist || axis.axisType != AxisType::LINEAR)) scopeValid = false;
-        if (i >= 3 && ((axis.isExist && !extraAxisXYZFeed && !extraAxisRotaryFeed && !extraAxisZCFeed) ||
+        if (i >= 3 && ((axis.isExist && !extraAxisXYZFeed && !extraAxisRotaryFeed && !extraAxisZCFeed && !extraAxisXYZCFeed && !extraAxisXYZCUVFeed && !extraAxisEccentricCFeed) ||
             (m_axisNames[i] != ' ' && block.has(m_axisNames[i]) &&
                 !(extraAxisRotaryFeed && static_cast<unsigned>(i) == rotaryAxis) &&
-                !(extraAxisZCFeed && i == 3)))) scopeValid = false;
+                !((extraAxisZCFeed || extraAxisXYZCFeed || extraAxisEccentricCFeed) && i == 3) &&
+                !(extraAxisXYZCUVFeed && i >= 3 && i < 6)))) scopeValid = false;
     }
     if (!scopeValid)
     {
@@ -2784,6 +2979,7 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         captured.maximumVelocity = axis.maxVel_PPS;
         captured.accelerationTime = axis.G00_acc_time;
         captured.decelerationTime = axis.G00_dec_time;
+        captured.stopDecelerationTime = axis.Stop_dec_time;
     }
     const NCTranslationSnapshot frozen = CoordSys.GetTranslationSnapshot();
     RtPrintf("[COORD][DISTANCE] run=%llu generation=%llu mode=%d frozen=1\n",
@@ -2817,6 +3013,14 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         m_state = NCState::ALARM;
         return false;
     }
+    if (extraAxisEccentricCFeed)
+        RtPrintf("[BASE79M][ECC-C-FEED-ADMITTED] run=%llu generation=%llu role=4 H=%d sign=%d presentMask=%u mode=%d unit=%s zc=%u xyzc=%u maxSweepDeg=10 maxZMM=1 maxLinearMM=1 maxRadiusMM=2 exactStop=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), frozen.toolHCode,
+            frozen.toolLengthMode == 43 ? 1 : -1, static_cast<unsigned>(xyzFeedPresentMask),
+            frozen.distanceMode, (block.has('X') || block.has('Y')) ? "XYZ_MM_MIN" :
+                block.has('Z') ? "Z_MM_MIN" : "DEG_MIN", block.has('Z') ? 1U : 0U,
+            (block.has('X') || block.has('Y')) ? 1U : 0U);
     if (extraAxisRotaryFeed)
         RtPrintf("[BASE69][ROTARY-FEED-ADMITTED] run=%llu generation=%llu axis=%u presentMask=%u mode=%d unit=DEG_MIN exactStop=1 beforeSubmit=1\n",
             static_cast<unsigned long long>(frozen.runToken),
@@ -2824,6 +3028,14 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
             static_cast<unsigned>(xyzFeedPresentMask), frozen.distanceMode);
     if (extraAxisZCFeed)
         RtPrintf("[BASE71][ZC-FEED-ADMITTED] run=%llu generation=%llu mask=12 presentMask=%u mode=%d unit=Z_MM_MIN exactStop=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken),
+            static_cast<unsigned long long>(frozen.generation), static_cast<unsigned>(xyzFeedPresentMask), frozen.distanceMode);
+    if (extraAxisXYZCUVFeed)
+        RtPrintf("[BASE74][XYZCUV-FEED-ADMITTED] run=%llu generation=%llu mask=63 presentMask=%u mode=%d unit=XYZ_MM_MIN exactStop=1 beforeSubmit=1\n",
+            static_cast<unsigned long long>(frozen.runToken), static_cast<unsigned long long>(frozen.generation),
+            static_cast<unsigned>(xyzFeedPresentMask), frozen.distanceMode);
+    if (extraAxisXYZCFeed)
+        RtPrintf("[BASE75][XYZC-FEED-ADMITTED] run=%llu generation=%llu mask=15 presentMask=%u mode=%d unit=XYZ_MM_MIN exactStop=1 beforeSubmit=1\n",
             static_cast<unsigned long long>(frozen.runToken),
             static_cast<unsigned long long>(frozen.generation), static_cast<unsigned>(xyzFeedPresentMask), frozen.distanceMode);
     if (extraAxisXYZFeed)
@@ -3018,6 +3230,10 @@ bool NCManager::RequiresFixedTranslationSelectionTransitionSameThread(const NCBl
             if (letter >= 'A' && letter <= 'Z' && letter != 'N' && block.has(letter)) return true;
         }
     if (!CoordSys.IsTranslationRunFrozen()) return false;
+    if (NCGCodeSemantics::Contains(block, 162) || NCGCodeSemantics::Contains(block, 163))
+        return !IsNCEccentricCRotationSelectionBlockAllowed(block) ||
+            !CoordSys.IsEccentricRotationSelectionSupported(block.gCode == 162) ||
+            CoordSys.isCAxisOffsetRotationEnabled != (block.gCode == 162);
     for (int positioning : {7, 28, 30, 32, 53, 161})
         if (NCGCodeSemantics::Contains(block, positioning)) return true;
     if (NCGCodeSemantics::Contains(block, 22) || NCGCodeSemantics::Contains(block, 23))
@@ -3106,6 +3322,10 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
         if (NCGCodeSemantics::Contains(block, reference))
             return GCodeHandlers::ValidateReferencePositionBlock(block, this) &&
                 PreparePositioningHandoffSameThread(reference);
+    const bool eccentricSelection = NCGCodeSemantics::Contains(block, 162) ||
+        NCGCodeSemantics::Contains(block, 163);
+    if (eccentricSelection && !IsFixedTranslationBlockAllowedSameThread(block)) return false;
+    const bool eccentricEnabled = block.gCode == 162;
     const int arcPlane = NCGCodeSemantics::Contains(block, 18) ? 18 :
         (NCGCodeSemantics::Contains(block, 19) ? 19 : (NCGCodeSemantics::Contains(block, 17) ? 17 : 0));
     const bool planeSelection = arcPlane != 0;
@@ -3176,7 +3396,7 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
         CoordSys.activePlane != 17 &&
         !IsFixedTranslationBlockAllowedSameThread(block)) return false;
     if (!RequiresFixedTranslationSelectionTransitionSameThread(block)) return true;
-    const char* selectionKind = planeSelection ? "PLANE" : strokeSelection ? "STROKE" : cutterSelection ? "CUTTER" : polarSelection ? "POLAR" : affineSelection ? "SCALE-MIRROR" : (workpieceSelection ? "WORK" : (rotationSelection ? "ROTATION" :
+    const char* selectionKind = eccentricSelection ? "ECCENTRIC" : planeSelection ? "PLANE" : strokeSelection ? "STROKE" : cutterSelection ? "CUTTER" : polarSelection ? "POLAR" : affineSelection ? "SCALE-MIRROR" : (workpieceSelection ? "WORK" : (rotationSelection ? "ROTATION" :
         (toolSelection ? "TOOL" : (workCoordinateSelection ? "WCS" : (unitsSelection ? "UNITS" : "MODE")))));
     const auto reject = [this, selectionKind](const char* reason) -> bool
     {
@@ -3215,7 +3435,8 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
     if (!CoordSys.IsTranslationRunCurrent() ||
         !m_motion.MatchesNCTranslation(previous)) return reject("SOURCE");
     bool prepared = false;
-    if (planeSelection) prepared = CoordSys.PrepareArcPlaneTransition(arcPlane, next);
+    if (eccentricSelection) prepared = CoordSys.PrepareEccentricRotationTransition(eccentricEnabled, next);
+    else if (planeSelection) prepared = CoordSys.PrepareArcPlaneTransition(arcPlane, next);
     else if (strokeSelection) prepared = CoordSys.PrepareStoredStrokeTransition(strokeMode, next);
     else if (cutterSelection) prepared = CoordSys.PrepareToolRadiusSelectionTransition(cutterMode, cutterD, next);
     else if (polarSelection) prepared = CoordSys.PreparePolarTransition(polarMode, next);
@@ -3232,7 +3453,7 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
     else prepared = CoordSys.PrepareDistanceModeTransition(mode, next);
     if (!prepared)
     {
-        if (!planeSelection && !workCoordinateSelection && !toolSelection && !rotationSelection && !workpieceSelection && !affineSelection && !polarSelection && !cutterSelection)
+        if (!eccentricSelection && !planeSelection && !workCoordinateSelection && !toolSelection && !rotationSelection && !workpieceSelection && !affineSelection && !polarSelection && !cutterSelection)
             return reject("SOURCE");
         RtPrintf("[COORD][%s-REJECT] wcs=%d H=%d W=%d reason=TARGET_FRAME beforeCommit=1\n",
             selectionKind, wcs, hCode, wCode);
@@ -3273,7 +3494,8 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
         return reject("SOURCE_CHANGED");
     }
     bool committed = false;
-    if (planeSelection) committed = CoordSys.CommitArcPlaneTransition(next);
+    if (eccentricSelection) committed = CoordSys.CommitEccentricRotationTransition(next);
+    else if (planeSelection) committed = CoordSys.CommitArcPlaneTransition(next);
     else if (strokeSelection) committed = CoordSys.CommitStoredStrokeTransition(next);
     else if (cutterSelection) committed = CoordSys.CommitToolRadiusSelectionTransition(next);
     else if (polarSelection) committed = CoordSys.CommitPolarTransition(next);
@@ -3294,9 +3516,9 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
     const int newAffineSelection = affineCode <= 51 ? next.scalingMode : static_cast<int>(next.mirrorMask);
     RtPrintf("[COORD][%s-SWITCH] run=%llu from=%d to=%d oldGeneration=%llu generation=%llu revision=%llu epoch=%u drained=1\n",
         selectionKind, static_cast<unsigned long long>(next.runToken),
-        planeSelection ? previous.rotationPlane : strokeSelection ? previous.storedStrokeMode : cutterSelection ? previous.cutterMode : polarSelection ? previous.polarMode : affineSelection ? oldAffineSelection : workpieceSelection ? previous.workMode : (rotationSelection ? previous.rotationMode :
+        eccentricSelection ? (previous.axisIdentity.eccentricEnabled ? 162 : 163) : planeSelection ? previous.rotationPlane : strokeSelection ? previous.storedStrokeMode : cutterSelection ? previous.cutterMode : polarSelection ? previous.polarMode : affineSelection ? oldAffineSelection : workpieceSelection ? previous.workMode : (rotationSelection ? previous.rotationMode :
             (toolSelection ? previous.toolLengthMode : (workCoordinateSelection ? previous.wcsCode : (unitsSelection ? previous.unitsMode : previous.distanceMode)))),
-        planeSelection ? next.rotationPlane : strokeSelection ? next.storedStrokeMode : cutterSelection ? next.cutterMode : polarSelection ? next.polarMode : affineSelection ? newAffineSelection : workpieceSelection ? next.workMode : (rotationSelection ? next.rotationMode :
+        eccentricSelection ? (next.axisIdentity.eccentricEnabled ? 162 : 163) : planeSelection ? next.rotationPlane : strokeSelection ? next.storedStrokeMode : cutterSelection ? next.cutterMode : polarSelection ? next.polarMode : affineSelection ? newAffineSelection : workpieceSelection ? next.workMode : (rotationSelection ? next.rotationMode :
             (toolSelection ? next.toolLengthMode : (workCoordinateSelection ? next.wcsCode : (unitsSelection ? next.unitsMode : next.distanceMode)))),
         static_cast<unsigned long long>(previous.generation), static_cast<unsigned long long>(next.generation),
         static_cast<unsigned long long>(next.revision), static_cast<unsigned int>(epoch));
@@ -3349,6 +3571,22 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
 
 bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
 {
+    // This pure shape gate may run before dispatch for a frozen frame. Exact
+    // authored-source preflight still precedes every ExecuteBlock side effect.
+    if (IsEDMRecipeEditRequest(block))
+    {
+        if (IsEDMRecipeEditBlockShapeValid(block) && IsEDMRecipeStoppedAuthorityCurrentSameThread()) return true;
+        RejectEDMRecipeEditSameThread(0, "FIXED_EDIT_SCOPE", EDMRecipe::Error::None);
+        return false;
+    }
+    // EDM16 selectors interpret no geometry. Keep the captured frame untouched,
+    // including frozen XYZ/rotary/plane profiles, and prove stopped authority.
+    if (IsEDMRecipeSelectionRequest(block))
+    {
+        if (IsEDMRecipeStoppedSelectionAllowedSameThread(block)) return true;
+        RejectEDMRecipeSelectionSameThread(0, "FIXED_SELECTION_SCOPE");
+        return false;
+    }
     // BASE58-BEGIN: repeatable side-effect-free extra-axis XYZ feed policy.
     std::uint32_t xyzFeedPresentMask = 0U;
     for (int axis = 0; axis < 8; ++axis)
@@ -3371,14 +3609,48 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
     const bool zcFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
         xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
         IsNCZCFeedBlockAllowed(xyzFeedSource, block);
-    const NCXYZFeedScopeDecision xyzFeedDecision = (rotaryFeedAllowed || zcFeedAllowed) ?
+    const bool xyzcFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCXYZCFeedBlockAllowed(xyzFeedSource, block);
+    const bool xyzcuvFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCXYZCUVFeedBlockAllowed(xyzFeedSource, block);
+    const bool eccentricFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
+        xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+        IsNCEccentricCFeedBlockAllowed(xyzFeedSource, block);
+    const bool eccentricSelectionRequested = xyzFeedMemoryBound &&
+        (NCGCodeSemantics::Contains(block, 162) || NCGCodeSemantics::Contains(block, 163));
+    const bool eccentricSelectionAllowed = eccentricSelectionRequested && xyzFeedRuntimeClear &&
+        IsNCEccentricCRotationSelectionBlockAllowed(block) &&
+        CoordSys.IsEccentricRotationSelectionSupported(block.gCode == 162);
+    const bool activeEccentricH = xyzFeedMemoryBound && CoordSys.isCAxisOffsetRotationEnabled &&
+        (CoordSys.toolLengthMode == 43 || CoordSys.toolLengthMode == 44);
+    const bool edmPathXYZAllowed = IsEDMPathXYZTranslationBlockAllowedSameThread(block, xyzFeedSource, xyzFeedPresentMask);
+    NCXYZFeedScopeDecision xyzFeedDecision = (edmPathXYZAllowed || eccentricFeedAllowed || rotaryFeedAllowed || zcFeedAllowed || xyzcFeedAllowed || xyzcuvFeedAllowed) ?
         NCXYZFeedScopeDecision::ALLOWED : EvaluateNCXYZFeedScope(
             xyzFeedSource, block, xyzFeedPresentMask, xyzFeedFrozen,
             xyzFeedMemoryBound, xyzFeedRuntimeClear);
+    // Active eccentric H can never fall back into legacy endpoint transforms,
+    // macro motion or neutral XYZ/native producers. Cancel G163 before frame
+    // edits. Initial standalone distance selection is interpretation only.
+    if (eccentricSelectionRequested)
+        xyzFeedDecision = eccentricSelectionAllowed ?
+            NCXYZFeedScopeDecision::ALLOWED : NCXYZFeedScopeDecision::REJECTED;
+    else if (activeEccentricH)
+        xyzFeedDecision = eccentricFeedAllowed ||
+            (xyzFeedRuntimeClear && IsNCTranslationSnapshotValid(xyzFeedSource) &&
+                xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
+                (IsNCEccentricCFrozenNonMotionBlockAllowed(block) ||
+                    (!xyzFeedFrozen && IsNCXYZFeedDistanceBlockAllowed(block)))) ?
+            NCXYZFeedScopeDecision::ALLOWED : NCXYZFeedScopeDecision::REJECTED;
     // Preserve the existing formal mapping-integrity stop for source drift;
     // a changed live configuration must not become a syntax-only rejection.
     if (xyzFeedDecision != NCXYZFeedScopeDecision::UNCHANGED && xyzFeedMemoryBound &&
-        !IsPathCoreLiveNativeConfigCurrentSameThread())
+        (!IsPathCoreLiveNativeConfigCurrentSameThread() ||
+            (xyzcFeedAllowed && !IsXYZCFeedProfileCurrentSameThread()) ||
+            (xyzcuvFeedAllowed && !IsXYZCUVFeedProfileCurrentSameThread()) ||
+            (eccentricFeedAllowed && !IsEccentricCFeedProfileCurrentSameThread()) ||
+            (activeEccentricH && !IsXYZCFeedProfileCurrentSameThread())))
     {
         AlarmManager::GetInstance().Trigger(AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         m_state = NCState::ALARM;
@@ -3984,7 +4256,7 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
                     (code >= 171 && code <= 180) ||
                     ((code == 41 || code == 42) &&
                         !IsNCTranslationCutterDistanceModeAllowed(CoordSys.activePlane, 91)) ||
-                    code == 16 || code == 162 || code == 92)
+                    code == 16 || (code == 162 && !eccentricSelectionAllowed) || code == 92)
                     incrementalShapeValid = false;
             }
             const bool orphanGeometry = NCGCodeSemantics::GetPrimaryActionCode(block) < 0 &&
@@ -4244,8 +4516,7 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
             ((code == 168 || code == 169) && hasWorkSelection) ||
             ((code == 50 || code == 51 || code == 150 || code == 151) && affineSelection) ||
             ((code == 15 || code == 16) && polarSelection) ||
-            (code == 163 && !CoordSys.isCAxisOffsetRotationEnabled) ||
-            (code == 162 && CoordSys.isCAxisOffsetRotationEnabled)) continue;
+            ((code == 162 || code == 163) && eccentricSelectionAllowed)) continue;
         const bool workCoordinate = IsNCWorkCoordinateCode(code);
         const bool mutation = workCoordinate || code == 10 || code == 92 || code == 160 ||
             code == 20 || code == 21 || code == 17 || code == 18 || code == 19 ||

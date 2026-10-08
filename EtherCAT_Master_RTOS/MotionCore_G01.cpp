@@ -11,12 +11,15 @@ namespace
 #elif defined(__GNUC__) || defined(__clang__)
     __attribute__((noinline))
 #endif
-        bool FeedLineNormalOverride(const MotionCore& motion, bool buffered = false) noexcept
+        bool FeedLineNormalOverride(const MotionCore& motion, bool buffered = false,
+            MotionFeedHoldStopSnapshot* diagnosticSnapshot = nullptr) noexcept
     {
         // Existing coherent RT publication; never read raw m_Group state here.
         // M00/Feed Hold resumes to 1.0 before NC admits the next G01.
         const MotionFeedHoldStopSnapshot snapshot =
             motion.GetFeedHoldStopSnapshot();
+        // BASE79M-DIAG1: copy the exact evaluated publication; observation only.
+        if (diagnosticSnapshot != nullptr) *diagnosticSnapshot = snapshot;
         // A failed publication read returns groupDone=false. Override=1 alone
         // is a default value and cannot authorize a new transaction.
         if (buffered)
@@ -43,7 +46,9 @@ namespace
         MotionFeedLineWorkspace& workspace,
         const MotionCncPathTail* predecessor = nullptr,
         std::uint32_t endpointAxisMask = 0U,
-        bool preserveStationaryNativePulse = false) noexcept
+        bool preserveStationaryNativePulse = false,
+        const MotionCncPathTail* nativeBasis = nullptr,
+        const std::array<double, 8U>* nativeBasisPulseTail = nullptr) noexcept
     {
         MotionFeedLineReceipt& result = workspace.receipt;
         // Rebuild the ABORTING successor baseline for every existing axis.
@@ -86,6 +91,17 @@ namespace
             }
             double baseline = predecessor != nullptr ? predecessor->endMCS[slot] :
                 logicalPulse * axis.finalLead / axis.resolution_PPR;
+            // BASE73: a mixed predecessor can own an XYZ/C/U/V native spelling
+            // that differs by rounding from pulse*lead/PPR. Keep it only when
+            // its previously proved bit and BOTH pulse tails match this sample.
+            const std::uint32_t nativeBit = 1U << static_cast<unsigned>(slot);
+            const bool retainedNativeBasis = predecessor == nullptr && nativeBasis != nullptr &&
+                nativeBasisPulseTail != nullptr && slot < 6U &&
+                (axis.axisType == AxisType::LINEAR || axis.axisType == AxisType::ROTARY) &&
+                (nativeBasis->axisMask & nativeBit) != 0U && (nativeBasis->validAxisMask & nativeBit) != 0U &&
+                nativeBasis->endPulse[slot] == logicalPulse && (*nativeBasisPulseTail)[slot] == logicalPulse &&
+                NCRotaryFeedDetail::SameBits(nativeBasis->endMCS[slot], commandedTail[slot]);
+            if (retainedNativeBasis) baseline = commandedTail[slot];
             // EG: a buffered predecessor owns its exact MCS representation,
             // including signed zero; do not replace it with an equal NC spelling.
             if (predecessor == nullptr && axis.axisType == AxisType::LINEAR &&
@@ -109,10 +125,12 @@ namespace
                     result.code = MotionFeedLineCode::INVALID_INPUT;
                     return false;
                 }
-                baseline = std::fmod(baseline, axis.rotaryModulo);
-                if (baseline < 0.0)
+                // A proved stationary mixed-axis endpoint retains its native
+                // spelling; only a fresh baseline is reduced to modulo.
+                if (!retainedNativeBasis)
                 {
-                    baseline += axis.rotaryModulo;
+                    baseline = std::fmod(baseline, axis.rotaryModulo);
+                    if (baseline < 0.0) baseline += axis.rotaryModulo;
                 }
             }
             if (!std::isfinite(baseline))
@@ -377,8 +395,18 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
         return false;
     }
 
+    // This private anchor supplies native representation only, never queued
+    // geometry or motion authority. All caller and sampled-basis gates remain.
+    const MotionCncPathTail* nativeBasis = nullptr;
+    if (!buffered && m_zcFeedProducerTail.valid && m_zcFeedProducerTail.identity.IsAssigned() &&
+        m_zcFeedProducerTail.identity.epoch == plannedEpoch && m_zcFeedProducerTail.identity.source == source &&
+        m_zcFeedProducerTail.ownerLease.Matches(plannedOwner) &&
+        m_g00ProducerQueueTailEpoch == plannedEpoch && m_g00ProducerQueueTailOwnerLease.Matches(plannedOwner) &&
+        (m_g00ProducerQueueTailValidMask & m_zcFeedProducerTail.axisMask) == m_zcFeedProducerTail.axisMask)
+        nativeBasis = &m_zcFeedProducerTail;
     if (!PrepareFeedLineGeometry(m_pContexts, axes, targetMCS,
-        commandedMCSTail, workspace, predecessor, endpointAxisMask, basePlaneLinear || nativeXYZBaseline))
+        commandedMCSTail, workspace, predecessor, endpointAxisMask, basePlaneLinear || nativeXYZBaseline,
+        nativeBasis, nativeBasis != nullptr ? &m_g00ProducerQueueTailPulse : nullptr))
     {
         return false;
     }
@@ -492,6 +520,22 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
         return false; // TryLineMove owns formal producer rejection accounting.
     }
 
+    std::uint32_t carryNativeBasisMask = 0U;
+    if (nativeBasis != nullptr)
+    {
+        for (unsigned axis = 0U; axis < 6U; ++axis)
+        {
+            const std::uint32_t bit = 1U << axis;
+            if ((nativeBasis->axisMask & bit) != 0U && (nativeBasis->validAxisMask & bit) != 0U &&
+                (result.validAxisMask & bit) != 0U &&
+                nativeBasis->endPulse[axis] == workspace.input.startPulse[axis] &&
+                nativeBasis->endPulse[axis] == workspace.input.endPulse[axis] &&
+                m_g00ProducerQueueTailPulse[axis] == workspace.input.startPulse[axis] &&
+                NCRotaryFeedDetail::SameBits(nativeBasis->endMCS[axis], workspace.input.startMCS[axis]) &&
+                NCRotaryFeedDetail::SameBits(nativeBasis->endMCS[axis], workspace.input.endMCS[axis]))
+                carryNativeBasisMask |= bit;
+        }
+    }
     const auto tupleStable = [&]() -> bool
     {
         const std::uint64_t state1 = m_motionOwnerState.load(std::memory_order_acquire);
@@ -570,6 +614,17 @@ bool MotionCore::TryG01MoveTransactionalCncTail(
     if (!tupleStable())
     {
         return revokeAccepted(MotionFeedLineCode::STALE_AFTER_ACCEPT);
+    }
+    if (nativeBasis != nullptr && !buffered && !cncFeedLookahead && cornerNextMCS == nullptr)
+    {
+        m_zcFeedProducerTail.endMCS = workspace.input.endMCS;
+        m_zcFeedProducerTail.endPulse = workspace.input.endPulse;
+        m_zcFeedProducerTail.identity = result.identity;
+        m_zcFeedProducerTail.ownerLease = result.ownerLease;
+        m_zcFeedProducerTail.translationGeneration = result.translationGeneration;
+        m_zcFeedProducerTail.axisMask = (workspace.input.axisMask & 7U) | carryNativeBasisMask;
+        m_zcFeedProducerTail.validAxisMask = result.validAxisMask;
+        m_zcFeedProducerTail.valid = true;
     }
     result.code = MotionFeedLineCode::COMMITTED;
     result.valid = true;
@@ -684,17 +739,24 @@ bool MotionCore::TryG01RotaryMoveTransactionalTail(int axisIndex, double program
         NCRotaryFeedDetail::SameBits(previous.endMCS[selected], commandedMCSTail[selected]);
     // BASE70 mixed predecessors retain the exact C native spelling as well.
     const MotionCncPathTail& zcPrevious = m_zcFeedProducerTail;
-    // The private Z/C anchor carries only already-proved native bases. A
-    // single C move may preserve its stationary Z proof, but an arbitrary
-    // unselected Z sampled by a rotary producer is never promoted to one.
-    const bool carryZBasis = selected == 3U && zcPrevious.valid && zcPrevious.identity.IsAssigned() &&
-        (zcPrevious.axisMask & 4U) != 0U && (zcPrevious.validAxisMask & 4U) != 0U &&
-        zcPrevious.identity.epoch == plannedEpoch && zcPrevious.identity.source == source &&
-        zcPrevious.ownerLease.Matches(plannedOwner) &&
-        m_g00ProducerQueueTailEpoch == plannedEpoch && m_g00ProducerQueueTailOwnerLease.Matches(plannedOwner) &&
-        (m_g00ProducerQueueTailValidMask & 4U) != 0U &&
-        zcPrevious.endPulse[2] == input.startPulse[2] && m_g00ProducerQueueTailPulse[2] == input.startPulse[2] &&
-        NCRotaryFeedDetail::SameBits(zcPrevious.endMCS[2], commandedMCSTail[2]);
+    // BASE73: retain proven stationary XYZ/C/U/V bits across one rotary command.
+    // Each bit must already exist and match the same shared pulse/tail tuple.
+    std::uint32_t carryStationaryBasisMask = 0U;
+    for (unsigned linear = 0U; linear < 6U; ++linear)
+    {
+        const std::uint32_t bit = 1U << linear;
+        if (linear != selected && selected < 6U && zcPrevious.valid && zcPrevious.identity.IsAssigned() &&
+            (zcPrevious.axisMask & bit) != 0U && (zcPrevious.validAxisMask & bit) != 0U &&
+            (result.validAxisMask & bit) != 0U &&
+            zcPrevious.identity.epoch == plannedEpoch && zcPrevious.identity.source == source &&
+            zcPrevious.ownerLease.Matches(plannedOwner) &&
+            m_g00ProducerQueueTailEpoch == plannedEpoch && m_g00ProducerQueueTailOwnerLease.Matches(plannedOwner) &&
+            (m_g00ProducerQueueTailValidMask & bit) != 0U &&
+            zcPrevious.endPulse[linear] == input.startPulse[linear] &&
+            m_g00ProducerQueueTailPulse[linear] == input.startPulse[linear] &&
+            NCRotaryFeedDetail::SameBits(zcPrevious.endMCS[linear], commandedMCSTail[linear]))
+            carryStationaryBasisMask |= bit;
+    }
     const bool acceptedZCBaseline = zcPrevious.valid && zcPrevious.identity.IsAssigned() &&
         (zcPrevious.axisMask & selectedBit) != 0U && (zcPrevious.validAxisMask & selectedBit) != 0U &&
         zcPrevious.identity.epoch == plannedEpoch && zcPrevious.identity.source == source &&
@@ -839,11 +901,11 @@ bool MotionCore::TryG01RotaryMoveTransactionalTail(int axisIndex, double program
     m_rotaryFeedProducerTail.axisMask = selectedBit;
     m_rotaryFeedProducerTail.validAxisMask = result.validAxisMask;
     m_rotaryFeedProducerTail.valid = true;
-    if (selected == 3U)
+    if (selected < 6U)
     {
         m_zcFeedProducerTail = m_rotaryFeedProducerTail;
         // This private mask denotes proven native bases, not command axes.
-        m_zcFeedProducerTail.axisMask = 8U | (carryZBasis ? 4U : 0U);
+        m_zcFeedProducerTail.axisMask = selectedBit | carryStationaryBasisMask;
     }
     result.code = MotionFeedLineCode::COMMITTED;
     result.valid = true;
@@ -967,6 +1029,11 @@ bool MotionCore::TryG01ZCMoveTransactionalTail(double programmedZ, double progra
             m_g00ProducerQueueTailPulse[selected] == input.startPulse[selected] &&
             NCRotaryFeedDetail::SameBits(previous.endMCS[selected], commandedMCSTail[selected]);
     };
+    std::uint32_t carryStationaryBasisMask = 0U;
+    for (unsigned stationary = 0U; stationary < 6U; ++stationary)
+        if ((selectedMask & (1U << stationary)) == 0U &&
+            (result.validAxisMask & (1U << stationary)) != 0U &&
+            acceptedBaseline(m_zcFeedProducerTail, stationary)) carryStationaryBasisMask |= 1U << stationary;
     for (unsigned selected = 2U; selected <= 3U; ++selected)
     {
         const AxisContext& axis = (*m_pContexts)[selected];
@@ -1138,6 +1205,570 @@ bool MotionCore::TryG01ZCMoveTransactionalTail(double programmedZ, double progra
     m_zcFeedProducerTail.identity = result.identity;
     m_zcFeedProducerTail.ownerLease = result.ownerLease;
     m_zcFeedProducerTail.translationGeneration = result.translationGeneration;
+    m_zcFeedProducerTail.axisMask = selectedMask | carryStationaryBasisMask;
+    m_zcFeedProducerTail.validAxisMask = result.validAxisMask;
+    m_zcFeedProducerTail.valid = true;
+    result.code = MotionFeedLineCode::COMMITTED;
+    result.valid = true;
+    return true;
+}
+
+
+// BASE75: raw G90 XYZ/C targets or signed G91 increments share the XYZ feed clock.
+// C retains its own native angular unit, continuous pulses and absolute policy.
+bool MotionCore::TryG01XYZCMoveTransactionalTail(
+    const std::array<double, 4U>& programmedValues,
+    const std::array<double, 4U>& targetMCS, double feedMMMin,
+    double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace)
+{
+    MotionFeedLineReceipt& result = workspace.receipt;
+    result.Clear();
+    result.xyzcFeed = true;
+    workspace.targetPulse.clear();
+    workspace.rotaryAxes.clear();
+    workspace.xyzcInput = NCXYZCFeedLineInput{};
+    const bool absolute = m_pendingTranslation.distanceMode == 90;
+    const MotionExecutionEpoch plannedEpoch = GetCurrentExecutionEpoch();
+    const MotionOwnerLease plannedOwner = GetMotionOwnerLease();
+    const MotionCommandSource source = m_pendingCommandSource.load(std::memory_order_acquire);
+    if (m_pContexts == nullptr || m_pContexts->size() < 4U || m_pContexts->size() > 8U ||
+        m_pCoordMgr == nullptr || !IsNCXYZCFeedNeutralFrame(m_pendingTranslation) ||
+        !IsPendingFixedTranslationSourceAllowed() || m_pendingIsAbsoluteMode != absolute ||
+        !std::isfinite(feedMMMin) || feedMMMin <= 0.0 || feedMMMin > 100.0 ||
+        workspace.targetPulse.capacity() < 8U || workspace.rotaryAxes.capacity() < 8U)
+    {
+        result.code = MotionFeedLineCode::INVALID_INPUT;
+        return false;
+    }
+    if (plannedEpoch == MOTION_EXECUTION_EPOCH_INVALID || !plannedOwner.IsValid() ||
+        plannedOwner.owner != MotionOwner::AUTO || source != MotionCommandSource::NC_MEMORY ||
+        !m_programBlockMotionCaptureActive || m_programBlockMotionCapture.overflow ||
+        m_programBlockMotionCapture.count != 0U || HasPendingSafetyOrRecoveryRequests() ||
+        !FeedLineNormalOverride(*this))
+    {
+        result.code = MotionFeedLineCode::NOT_READY;
+        return false;
+    }
+    const std::uint32_t selectedMask = 15U;
+    NCXYZCFeedLineInput& input = workspace.xyzcInput;
+    input.axisIdentity = m_pendingTranslation.axisIdentity;
+    input.axisMask = selectedMask;
+    input.feedMMMin = feedMMMin;
+    input.absolute = absolute;
+    if (absolute) input.absoluteTargetMCS = targetMCS;
+    else input.deltaNative = programmedValues;
+    for (unsigned selected = 0U; selected < 4U; ++selected)
+    {
+        const AxisContext& axis = (*m_pContexts)[selected];
+        if (!std::isfinite(programmedValues[selected]) || (!absolute && programmedValues[selected] == 0.0) ||
+            !std::isfinite(targetMCS[selected]) || !axis.isExist ||
+            axis.axisIndex != static_cast<int>(selected) ||
+            axis.axisType != (selected < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+            !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+            !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ||
+            !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ||
+            !std::isfinite(axis.G00_dec_time) || axis.G00_dec_time < 0.0 ||
+            (selected >= 3U && (!std::isfinite(axis.rotaryModulo) || axis.rotaryModulo <= 0.0)))
+        {
+            result.code = MotionFeedLineCode::INVALID_INPUT;
+            return false;
+        }
+        input.pulsePerUnit[selected] = axis.resolution_PPR / axis.finalLead;
+        input.maxVelocityPPS[selected] = axis.maxVel_PPS;
+        input.axisAccTime[selected] = axis.G00_acc_time;
+        input.axisDecTime[selected] = axis.G00_dec_time;
+        if (absolute && selected >= 3U)
+        {
+            input.rotaryModulo = axis.rotaryModulo;
+            input.rotaryShortestPath = axis.useShortestPath;
+        }
+    }
+    result.validAxisMask = 0U;
+    for (unsigned slot = 0U; slot < 8U; ++slot)
+    {
+        const bool liveExists = slot < m_pContexts->size() && (*m_pContexts)[slot].isExist;
+        if (!std::isfinite(commandedMCSTail[slot]) ||
+            input.axisIdentity.exists[slot] != (liveExists ? 1U : 0U) ||
+            (liveExists && ((*m_pContexts)[slot].axisIndex != static_cast<int>(slot) ||
+                static_cast<unsigned>((*m_pContexts)[slot].axisType) != input.axisIdentity.axisType[slot])))
+        {
+            result.code = MotionFeedLineCode::INVALID_INPUT;
+            return false;
+        }
+        input.startMCS[slot] = input.endMCS[slot] = commandedMCSTail[slot];
+        const double pulse = liveExists ? (*m_pContexts)[slot].logicalCmdPos.Load() : 0.0;
+        if (!std::isfinite(pulse))
+        {
+            result.code = MotionFeedLineCode::INVALID_INPUT;
+            return false;
+        }
+        input.startPulse[slot] = input.endPulse[slot] = pulse;
+        if (liveExists) result.validAxisMask |= 1U << slot;
+    }
+
+    const auto acceptedBaseline = [&](const MotionCncPathTail& previous, unsigned selected) -> bool
+    {
+        const std::uint32_t bit = 1U << selected;
+        return previous.valid && previous.identity.IsAssigned() && (previous.axisMask & bit) != 0U &&
+            previous.identity.epoch == plannedEpoch && previous.identity.source == source && previous.ownerLease.Matches(plannedOwner) &&
+            (previous.validAxisMask & bit) != 0U &&
+            m_g00ProducerQueueTailEpoch == plannedEpoch &&
+            m_g00ProducerQueueTailOwnerLease.Matches(plannedOwner) &&
+            (m_g00ProducerQueueTailValidMask & bit) != 0U &&
+            previous.endPulse[selected] == input.startPulse[selected] &&
+            m_g00ProducerQueueTailPulse[selected] == input.startPulse[selected] &&
+            NCRotaryFeedDetail::SameBits(previous.endMCS[selected], commandedMCSTail[selected]);
+    };
+    std::uint32_t carryStationaryBasisMask = 0U;
+    for (unsigned stationary = 4U; stationary < 6U; ++stationary)
+        if ((result.validAxisMask & (1U << stationary)) != 0U &&
+            acceptedBaseline(m_zcFeedProducerTail, stationary)) carryStationaryBasisMask |= 1U << stationary;
+    for (unsigned selected = 0U; selected < 4U; ++selected)
+    {
+        const AxisContext& axis = (*m_pContexts)[selected];
+        const double programmed = programmedValues[selected];
+        const double target = targetMCS[selected];
+        const double ppu = input.pulsePerUnit[selected];
+        const double authoredTarget = absolute ?
+            programmed + NCTranslationAxisOffsetMM(m_pendingTranslation, selected) :
+            commandedMCSTail[selected] + programmed;
+        const double startPulse = input.startPulse[selected];
+        const double nativeBaseline = startPulse * axis.finalLead / axis.resolution_PPR;
+        const double forwardPulse = commandedMCSTail[selected] * ppu;
+        double moduloBaseline = 0.0;
+        if (selected >= 3U)
+        {
+            moduloBaseline = std::fmod(nativeBaseline, axis.rotaryModulo);
+            if (moduloBaseline < 0.0) moduloBaseline += axis.rotaryModulo;
+        }
+        if (!std::isfinite(ppu) || ppu <= 0.0 || !std::isfinite(authoredTarget) ||
+            !NCXYZCFeedDetail::SameBits(target, authoredTarget) || (!absolute && target == commandedMCSTail[selected]))
+        {
+            result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+            return false;
+        }
+        if (!acceptedBaseline(m_zcFeedProducerTail, selected) &&
+            !acceptedBaseline(m_rotaryFeedProducerTail, selected) &&
+            !(std::isfinite(forwardPulse) && forwardPulse == startPulse) &&
+            !(std::isfinite(nativeBaseline) && nativeBaseline == commandedMCSTail[selected]) &&
+            !(selected >= 3U && std::isfinite(moduloBaseline) && moduloBaseline == commandedMCSTail[selected]))
+        {
+            result.code = MotionFeedLineCode::NOT_READY;
+            return false;
+        }
+        if (!absolute)
+        {
+            const double deltaPulse = programmed * ppu;
+            const double targetPulse = startPulse + deltaPulse;
+            if (!std::isfinite(deltaPulse) || !std::isfinite(targetPulse) ||
+                deltaPulse == 0.0 || targetPulse == startPulse)
+            {
+                result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+                return false;
+            }
+            input.endMCS[selected] = target;
+            input.endPulse[selected] = targetPulse;
+        }
+    }
+    if (absolute)
+    {
+        std::array<double, 4U> startMCS{}, startPulse{};
+        for (unsigned selected = 0U; selected < 4U; ++selected)
+        {
+            startMCS[selected] = input.startMCS[selected];
+            startPulse[selected] = input.startPulse[selected];
+        }
+        NCXYZCAbsoluteFeedTarget resolved{};
+        if (!TryResolveNCXYZCAbsoluteFeedTarget(startMCS, startPulse, targetMCS,
+            input.pulsePerUnit, input.rotaryShortestPath, input.rotaryModulo, resolved))
+        {
+            result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+            return false;
+        }
+        for (unsigned selected = 0U; selected < 4U; ++selected)
+        {
+            input.endMCS[selected] = resolved.endMCS[selected];
+            input.endPulse[selected] = resolved.endPulse[selected];
+        }
+        input.deltaNative = resolved.deltaNative;
+    }
+    result.geometryCode = static_cast<std::uint32_t>(BuildNCXYZCFeedLine(input, result.xyzc));
+    if (!result.xyzc.valid)
+    {
+        result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+        return false;
+    }
+    if (absolute) result.xyzc.absoluteTargetWCS = programmedValues;
+    workspace.accTime = result.xyzc.accTime;
+    workspace.decTime = result.xyzc.decTime;
+    for (unsigned selected = 0U; selected < 4U; ++selected)
+    {
+        const AxisContext& axis = (*m_pContexts)[selected];
+        const double ppu = input.pulsePerUnit[selected];
+        const double physicalStart = input.startPulse[selected] / ppu;
+        const double physicalEnd = input.endPulse[selected] / ppu;
+        if (!std::isfinite(physicalStart) || !std::isfinite(physicalEnd) ||
+            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, input.startMCS[selected]) ||
+            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, input.endMCS[selected]) ||
+            (absolute && !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, targetMCS[selected])) ||
+            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, physicalStart) ||
+            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, physicalEnd))
+        {
+            result.travelLimitRejected = true;
+            result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+            return false;
+        }
+        workspace.rotaryAxes.push_back(static_cast<int>(selected));
+        workspace.targetPulse.push_back(input.endPulse[selected]);
+    }
+    const bool accepted = TryLineMove(workspace.rotaryAxes, workspace.targetPulse,
+        result.xyzc.velocityPPS, workspace.accTime, workspace.decTime,
+        BufferMode::ABORTING, MotionCommandPathMode::EXACT_STOP,
+        &result.identity, &result.ownerLease, plannedEpoch, &plannedOwner,
+        false, nullptr, 0.0, false, nullptr, false, nullptr, false, nullptr, true, &result.xyzc);
+    result.translationGeneration = m_pendingTranslation.generation;
+    result.commandAccepted = accepted;
+    if (!accepted)
+    {
+        result.code = MotionFeedLineCode::PRODUCER_REJECTED;
+        return false;
+    }
+    const auto tupleStable = [&]() -> bool
+    {
+        const std::uint64_t state1 = m_motionOwnerState.load(std::memory_order_acquire);
+        const MotionExecutionEpoch epoch1 = GetCurrentExecutionEpoch();
+        const MotionOwnerLease owner1 = UnpackMotionOwnerState(state1);
+        const MotionExecutionEpoch epoch2 = GetCurrentExecutionEpoch();
+        const std::uint64_t state2 = m_motionOwnerState.load(std::memory_order_acquire);
+        const MotionOwnerLease owner2 = UnpackMotionOwnerState(state2);
+        return result.identity.IsAssigned() && result.ownerLease.IsValid() &&
+            result.identity.source == source && result.identity.sourceBlockId == m_pendingSourcePC &&
+            result.ownerLease.Matches(plannedOwner) && epoch1 == result.identity.epoch && epoch2 == result.identity.epoch &&
+            owner1.IsValid() && owner2.IsValid() && owner1.Matches(result.ownerLease) && owner2.Matches(result.ownerLease) &&
+            state1 == state2 && !UnpackMotionOwnerSafetyHandshake(state2) &&
+            UnpackMotionOwnerSafetyRequestTicket(state2) == m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire);
+    };
+    const auto revokeAccepted = [&](MotionFeedLineCode code) -> bool
+    {
+        result.code = code;
+        result.valid = false;
+        m_zcFeedProducerTail.Clear();
+        m_g00ProducerQueueTailEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        m_g00ProducerQueueTailOwnerLease = MotionOwnerLease{};
+        m_g00ProducerQueueTailValidMask = 0U;
+        (void)TryPublishGroupMappingIntegrityAlarmRequest(GetCurrentExecutionEpoch());
+        RequestEmergencyStopAllAxes();
+        return false;
+    };
+    if (!tupleStable()) return revokeAccepted(MotionFeedLineCode::STALE_AFTER_ACCEPT);
+    if (!m_programBlockMotionCaptureActive || m_programBlockMotionCapture.overflow ||
+        m_programBlockMotionCapture.count != 1U) return revokeAccepted(MotionFeedLineCode::CAPTURE_MISMATCH);
+    const MotionProgramBlockSubmission& submission = m_programBlockMotionCapture.submissions[0U];
+    result.captureBound = submission.translationGeneration == result.translationGeneration &&
+        submission.producerAccepted && submission.immediateRejectReason == MotionRejectReason::NONE &&
+        submission.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        submission.identity.epoch == result.identity.epoch && submission.identity.segmentId == result.identity.segmentId &&
+        submission.identity.sourceBlockId == result.identity.sourceBlockId && submission.identity.source == result.identity.source;
+    if (!result.captureBound) return revokeAccepted(MotionFeedLineCode::CAPTURE_MISMATCH);
+    m_g00ProducerQueueTailPulse = input.endPulse;
+    for (unsigned slot = 0U; slot < 8U; ++slot)
+    {
+        if ((result.validAxisMask & (1U << slot)) != 0U)
+            (*m_pContexts)[slot].lastQueuedPulse.Store(input.endPulse[slot]);
+        commandedMCSTail[slot] = input.endMCS[slot];
+    }
+    result.tailCommitted = true;
+    m_g00ProducerQueueTailValidMask = result.validAxisMask;
+    if (!tupleStable()) return revokeAccepted(MotionFeedLineCode::STALE_AFTER_ACCEPT);
+    m_g00ProducerQueueTailEpoch = result.identity.epoch;
+    m_g00ProducerQueueTailOwnerLease = result.ownerLease;
+    if (!tupleStable()) return revokeAccepted(MotionFeedLineCode::STALE_AFTER_ACCEPT);
+    m_zcFeedProducerTail.endMCS = input.endMCS;
+    m_zcFeedProducerTail.endPulse = input.endPulse;
+    m_zcFeedProducerTail.identity = result.identity;
+    m_zcFeedProducerTail.ownerLease = result.ownerLease;
+    m_zcFeedProducerTail.translationGeneration = result.translationGeneration;
+    m_zcFeedProducerTail.axisMask = selectedMask | carryStationaryBasisMask;
+    m_zcFeedProducerTail.validAxisMask = result.validAxisMask;
+    m_zcFeedProducerTail.valid = true;
+    result.code = MotionFeedLineCode::COMMITTED;
+    result.valid = true;
+    return true;
+}
+
+
+// BASE74: G90 resolves native XYZ and each positional C/U/V target once.
+// G91 keeps its full signed increments; only XYZ defines the millimetre clock.
+bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
+    const std::array<double, 6U>& programmedValues,
+    const std::array<double, 6U>& targetMCS, double feedMMMin,
+    double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace)
+{
+    MotionFeedLineReceipt& result = workspace.receipt;
+    result.Clear();
+    result.xyzcuvFeed = true;
+    workspace.targetPulse.clear();
+    workspace.rotaryAxes.clear();
+    workspace.xyzcuvInput = NCXYZCUVFeedLineInput{};
+    const bool absolute = m_pendingTranslation.distanceMode == 90;
+    const MotionExecutionEpoch plannedEpoch = GetCurrentExecutionEpoch();
+    const MotionOwnerLease plannedOwner = GetMotionOwnerLease();
+    const MotionCommandSource source = m_pendingCommandSource.load(std::memory_order_acquire);
+    if (m_pContexts == nullptr || m_pContexts->size() < 6U || m_pContexts->size() > 8U ||
+        m_pCoordMgr == nullptr || !IsNCXYZCUVFeedNeutralFrame(m_pendingTranslation) ||
+        !IsPendingFixedTranslationSourceAllowed() || m_pendingIsAbsoluteMode != absolute ||
+        !std::isfinite(feedMMMin) || feedMMMin <= 0.0 || feedMMMin > 100.0 ||
+        workspace.targetPulse.capacity() < 8U || workspace.rotaryAxes.capacity() < 8U)
+    {
+        result.code = MotionFeedLineCode::INVALID_INPUT;
+        return false;
+    }
+    if (plannedEpoch == MOTION_EXECUTION_EPOCH_INVALID || !plannedOwner.IsValid() ||
+        plannedOwner.owner != MotionOwner::AUTO || source != MotionCommandSource::NC_MEMORY ||
+        !m_programBlockMotionCaptureActive || m_programBlockMotionCapture.overflow ||
+        m_programBlockMotionCapture.count != 0U || HasPendingSafetyOrRecoveryRequests() ||
+        !FeedLineNormalOverride(*this))
+    {
+        result.code = MotionFeedLineCode::NOT_READY;
+        return false;
+    }
+    const std::uint32_t selectedMask = 63U;
+    NCXYZCUVFeedLineInput& input = workspace.xyzcuvInput;
+    input.axisIdentity = m_pendingTranslation.axisIdentity;
+    input.axisMask = selectedMask;
+    input.feedMMMin = feedMMMin;
+    input.absolute = absolute;
+    if (absolute) input.absoluteTargetMCS = targetMCS;
+    else input.deltaNative = programmedValues;
+    for (unsigned selected = 0U; selected < 6U; ++selected)
+    {
+        const AxisContext& axis = (*m_pContexts)[selected];
+        if (!std::isfinite(programmedValues[selected]) || (!absolute && programmedValues[selected] == 0.0) ||
+            !std::isfinite(targetMCS[selected]) || !axis.isExist ||
+            axis.axisIndex != static_cast<int>(selected) ||
+            axis.axisType != (selected < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+            !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+            !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ||
+            !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ||
+            !std::isfinite(axis.G00_dec_time) || axis.G00_dec_time < 0.0 ||
+            (selected >= 3U && (!std::isfinite(axis.rotaryModulo) || axis.rotaryModulo <= 0.0)))
+        {
+            result.code = MotionFeedLineCode::INVALID_INPUT;
+            return false;
+        }
+        input.pulsePerUnit[selected] = axis.resolution_PPR / axis.finalLead;
+        input.maxVelocityPPS[selected] = axis.maxVel_PPS;
+        input.axisAccTime[selected] = axis.G00_acc_time;
+        input.axisDecTime[selected] = axis.G00_dec_time;
+        if (absolute && selected >= 3U)
+        {
+            input.rotaryModulo[selected - 3U] = axis.rotaryModulo;
+            input.rotaryShortestPath[selected - 3U] = axis.useShortestPath;
+        }
+    }
+    result.validAxisMask = 0U;
+    for (unsigned slot = 0U; slot < 8U; ++slot)
+    {
+        const bool liveExists = slot < m_pContexts->size() && (*m_pContexts)[slot].isExist;
+        if (!std::isfinite(commandedMCSTail[slot]) ||
+            input.axisIdentity.exists[slot] != (liveExists ? 1U : 0U) ||
+            (liveExists && ((*m_pContexts)[slot].axisIndex != static_cast<int>(slot) ||
+                static_cast<unsigned>((*m_pContexts)[slot].axisType) != input.axisIdentity.axisType[slot])))
+        {
+            result.code = MotionFeedLineCode::INVALID_INPUT;
+            return false;
+        }
+        input.startMCS[slot] = input.endMCS[slot] = commandedMCSTail[slot];
+        const double pulse = liveExists ? (*m_pContexts)[slot].logicalCmdPos.Load() : 0.0;
+        if (!std::isfinite(pulse))
+        {
+            result.code = MotionFeedLineCode::INVALID_INPUT;
+            return false;
+        }
+        input.startPulse[slot] = input.endPulse[slot] = pulse;
+        if (liveExists) result.validAxisMask |= 1U << slot;
+    }
+
+    const auto acceptedBaseline = [&](const MotionCncPathTail& previous, unsigned selected) -> bool
+    {
+        const std::uint32_t bit = 1U << selected;
+        return previous.valid && previous.identity.IsAssigned() && (previous.axisMask & bit) != 0U &&
+            previous.identity.epoch == plannedEpoch && previous.identity.source == source && previous.ownerLease.Matches(plannedOwner) &&
+            (previous.validAxisMask & bit) != 0U &&
+            m_g00ProducerQueueTailEpoch == plannedEpoch &&
+            m_g00ProducerQueueTailOwnerLease.Matches(plannedOwner) &&
+            (m_g00ProducerQueueTailValidMask & bit) != 0U &&
+            previous.endPulse[selected] == input.startPulse[selected] &&
+            m_g00ProducerQueueTailPulse[selected] == input.startPulse[selected] &&
+            NCRotaryFeedDetail::SameBits(previous.endMCS[selected], commandedMCSTail[selected]);
+    };
+    for (unsigned selected = 0U; selected < 6U; ++selected)
+    {
+        const AxisContext& axis = (*m_pContexts)[selected];
+        const double programmed = programmedValues[selected];
+        const double target = targetMCS[selected];
+        const double ppu = input.pulsePerUnit[selected];
+        const double authoredTarget = absolute ?
+            programmed + NCTranslationAxisOffsetMM(m_pendingTranslation, selected) :
+            commandedMCSTail[selected] + programmed;
+        const double startPulse = input.startPulse[selected];
+        const double nativeBaseline = startPulse * axis.finalLead / axis.resolution_PPR;
+        const double forwardPulse = commandedMCSTail[selected] * ppu;
+        double moduloBaseline = 0.0;
+        if (selected >= 3U)
+        {
+            moduloBaseline = std::fmod(nativeBaseline, axis.rotaryModulo);
+            if (moduloBaseline < 0.0) moduloBaseline += axis.rotaryModulo;
+        }
+        if (!std::isfinite(ppu) || ppu <= 0.0 || !std::isfinite(authoredTarget) ||
+            !NCXYZCUVFeedDetail::SameBits(target, authoredTarget) || (!absolute && target == commandedMCSTail[selected]))
+        {
+            result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+            return false;
+        }
+        if (!acceptedBaseline(m_zcFeedProducerTail, selected) &&
+            !acceptedBaseline(m_rotaryFeedProducerTail, selected) &&
+            !(std::isfinite(forwardPulse) && forwardPulse == startPulse) &&
+            !(std::isfinite(nativeBaseline) && nativeBaseline == commandedMCSTail[selected]) &&
+            !(selected >= 3U && std::isfinite(moduloBaseline) && moduloBaseline == commandedMCSTail[selected]))
+        {
+            result.code = MotionFeedLineCode::NOT_READY;
+            return false;
+        }
+        if (!absolute)
+        {
+            const double deltaPulse = programmed * ppu;
+            const double targetPulse = startPulse + deltaPulse;
+            if (!std::isfinite(deltaPulse) || !std::isfinite(targetPulse) ||
+                deltaPulse == 0.0 || targetPulse == startPulse)
+            {
+                result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+                return false;
+            }
+            input.endMCS[selected] = target;
+            input.endPulse[selected] = targetPulse;
+        }
+    }
+    if (absolute)
+    {
+        std::array<double, 6U> startMCS{}, startPulse{};
+        for (unsigned selected = 0U; selected < 6U; ++selected)
+        {
+            startMCS[selected] = input.startMCS[selected];
+            startPulse[selected] = input.startPulse[selected];
+        }
+        NCXYZCUVAbsoluteFeedTarget resolved{};
+        if (!TryResolveNCXYZCUVAbsoluteFeedTarget(startMCS, startPulse, targetMCS,
+            input.pulsePerUnit, input.rotaryShortestPath, input.rotaryModulo, resolved))
+        {
+            result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+            return false;
+        }
+        for (unsigned selected = 0U; selected < 6U; ++selected)
+        {
+            input.endMCS[selected] = resolved.endMCS[selected];
+            input.endPulse[selected] = resolved.endPulse[selected];
+        }
+        input.deltaNative = resolved.deltaNative;
+    }
+    result.geometryCode = static_cast<std::uint32_t>(BuildNCXYZCUVFeedLine(input, result.xyzcuv));
+    if (!result.xyzcuv.valid)
+    {
+        result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+        return false;
+    }
+    if (absolute) result.xyzcuv.absoluteTargetWCS = programmedValues;
+    workspace.accTime = result.xyzcuv.accTime;
+    workspace.decTime = result.xyzcuv.decTime;
+    for (unsigned selected = 0U; selected < 6U; ++selected)
+    {
+        const AxisContext& axis = (*m_pContexts)[selected];
+        const double ppu = input.pulsePerUnit[selected];
+        const double physicalStart = input.startPulse[selected] / ppu;
+        const double physicalEnd = input.endPulse[selected] / ppu;
+        if (!std::isfinite(physicalStart) || !std::isfinite(physicalEnd) ||
+            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, input.startMCS[selected]) ||
+            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, input.endMCS[selected]) ||
+            (absolute && !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, targetMCS[selected])) ||
+            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, physicalStart) ||
+            !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, physicalEnd))
+        {
+            result.travelLimitRejected = true;
+            result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
+            return false;
+        }
+        workspace.rotaryAxes.push_back(static_cast<int>(selected));
+        workspace.targetPulse.push_back(input.endPulse[selected]);
+    }
+    const bool accepted = TryLineMove(workspace.rotaryAxes, workspace.targetPulse,
+        result.xyzcuv.velocityPPS, workspace.accTime, workspace.decTime,
+        BufferMode::ABORTING, MotionCommandPathMode::EXACT_STOP,
+        &result.identity, &result.ownerLease, plannedEpoch, &plannedOwner,
+        false, nullptr, 0.0, false, nullptr, false, nullptr, false, nullptr, false, nullptr, true, &result.xyzcuv);
+    result.translationGeneration = m_pendingTranslation.generation;
+    result.commandAccepted = accepted;
+    if (!accepted)
+    {
+        result.code = MotionFeedLineCode::PRODUCER_REJECTED;
+        return false;
+    }
+    const auto tupleStable = [&]() -> bool
+    {
+        const std::uint64_t state1 = m_motionOwnerState.load(std::memory_order_acquire);
+        const MotionExecutionEpoch epoch1 = GetCurrentExecutionEpoch();
+        const MotionOwnerLease owner1 = UnpackMotionOwnerState(state1);
+        const MotionExecutionEpoch epoch2 = GetCurrentExecutionEpoch();
+        const std::uint64_t state2 = m_motionOwnerState.load(std::memory_order_acquire);
+        const MotionOwnerLease owner2 = UnpackMotionOwnerState(state2);
+        return result.identity.IsAssigned() && result.ownerLease.IsValid() &&
+            result.identity.source == source && result.identity.sourceBlockId == m_pendingSourcePC &&
+            result.ownerLease.Matches(plannedOwner) && epoch1 == result.identity.epoch && epoch2 == result.identity.epoch &&
+            owner1.IsValid() && owner2.IsValid() && owner1.Matches(result.ownerLease) && owner2.Matches(result.ownerLease) &&
+            state1 == state2 && !UnpackMotionOwnerSafetyHandshake(state2) &&
+            UnpackMotionOwnerSafetyRequestTicket(state2) == m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire);
+    };
+    const auto revokeAccepted = [&](MotionFeedLineCode code) -> bool
+    {
+        result.code = code;
+        result.valid = false;
+        m_zcFeedProducerTail.Clear();
+        m_g00ProducerQueueTailEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        m_g00ProducerQueueTailOwnerLease = MotionOwnerLease{};
+        m_g00ProducerQueueTailValidMask = 0U;
+        (void)TryPublishGroupMappingIntegrityAlarmRequest(GetCurrentExecutionEpoch());
+        RequestEmergencyStopAllAxes();
+        return false;
+    };
+    if (!tupleStable()) return revokeAccepted(MotionFeedLineCode::STALE_AFTER_ACCEPT);
+    if (!m_programBlockMotionCaptureActive || m_programBlockMotionCapture.overflow ||
+        m_programBlockMotionCapture.count != 1U) return revokeAccepted(MotionFeedLineCode::CAPTURE_MISMATCH);
+    const MotionProgramBlockSubmission& submission = m_programBlockMotionCapture.submissions[0U];
+    result.captureBound = submission.translationGeneration == result.translationGeneration &&
+        submission.producerAccepted && submission.immediateRejectReason == MotionRejectReason::NONE &&
+        submission.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        submission.identity.epoch == result.identity.epoch && submission.identity.segmentId == result.identity.segmentId &&
+        submission.identity.sourceBlockId == result.identity.sourceBlockId && submission.identity.source == result.identity.source;
+    if (!result.captureBound) return revokeAccepted(MotionFeedLineCode::CAPTURE_MISMATCH);
+    m_g00ProducerQueueTailPulse = input.endPulse;
+    for (unsigned slot = 0U; slot < 8U; ++slot)
+    {
+        if ((result.validAxisMask & (1U << slot)) != 0U)
+            (*m_pContexts)[slot].lastQueuedPulse.Store(input.endPulse[slot]);
+        commandedMCSTail[slot] = input.endMCS[slot];
+    }
+    result.tailCommitted = true;
+    m_g00ProducerQueueTailValidMask = result.validAxisMask;
+    if (!tupleStable()) return revokeAccepted(MotionFeedLineCode::STALE_AFTER_ACCEPT);
+    m_g00ProducerQueueTailEpoch = result.identity.epoch;
+    m_g00ProducerQueueTailOwnerLease = result.ownerLease;
+    if (!tupleStable()) return revokeAccepted(MotionFeedLineCode::STALE_AFTER_ACCEPT);
+    m_zcFeedProducerTail.endMCS = input.endMCS;
+    m_zcFeedProducerTail.endPulse = input.endPulse;
+    m_zcFeedProducerTail.identity = result.identity;
+    m_zcFeedProducerTail.ownerLease = result.ownerLease;
+    m_zcFeedProducerTail.translationGeneration = result.translationGeneration;
     m_zcFeedProducerTail.axisMask = selectedMask;
     m_zcFeedProducerTail.validAxisMask = result.validAxisMask;
     m_zcFeedProducerTail.valid = true;
@@ -1172,3 +1803,6 @@ bool MotionCore::IsCncPathProducerTailCurrent(const MotionCncPathTail& tail,
     }
     return true;
 }
+
+// BASE79G: dedicated NC producer, separate from the RT consumer storage.
+#include "MotionCore_EccentricCProducer.h"

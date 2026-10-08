@@ -26,6 +26,151 @@ namespace HMI_Bridge
 {
     namespace
     {
+        HMI_DIAG_NOINLINE void PublishEDMObservationSameThread(NCManager& nc) noexcept
+        {
+            SHM_EDM_DiagData* target = GetEDMDiagnosticSharedMemoryData();
+            if (target == nullptr) return;
+            // Fixed workspaces avoid a 37 KiB RT stack frame or any allocation.
+            // This function has one writer: NC's existing 100 ms owner task.
+            static SHM_EDM_DiagData publication{};
+            static EDMRecipe::ActiveSnapshot recipeSnapshot{};
+            const EDMGapInput::Snapshot input = nc.ReadEDMGapInputSnapshotSameThread();
+            nc.ReadEDMRecipeDisplaySameThread(recipeSnapshot);
+            const EDMRecipe::Catalog* catalog = nc.ReadEDMRecipeCatalogSameThread();
+            std::memset(&publication, 0, sizeof(publication));
+            publication.Header.Magic = SHM_EDM_DIAG_MAGIC;
+            publication.Header.VersionMajor = SHM_EDM_DIAG_VERSION_MAJOR;
+            publication.Header.VersionMinor = SHM_EDM_DIAG_VERSION_MINOR;
+            publication.Header.StructSize = SHM_EDM_DIAG_SIZE;
+            publication.Header.Heartbeat = target->Header.Heartbeat + 1U;
+            publication.Header.Flags = SHM_EDM_DIAG_PUBLISHED |
+                (input.ownerClockValid ? SHM_EDM_DIAG_CLOCK_VALID : 0U);
+            publication.Header.PublishCount = target->Header.PublishCount;
+            if (publication.Header.PublishCount != (std::numeric_limits<std::uint64_t>::max)())
+                ++publication.Header.PublishCount;
+            publication.Header.ObservedAtMs = input.observedAtMs;
+
+            SHM_EDM_DiagGap& gap = publication.Gap;
+            gap.ConfiguredSource = static_cast<std::uint8_t>(input.configuredSource);
+            gap.Source = static_cast<std::uint8_t>(input.gap.source);
+            gap.Quality = static_cast<std::uint8_t>(input.gap.quality);
+            gap.Status = static_cast<std::uint8_t>(input.inputStatus);
+            const bool live = input.liveVoltageValid && input.ownerClockValid && input.configValid &&
+                input.sampleSequence != 0ULL && input.ageKnown && input.ageMs <= input.maxAgeMs &&
+                input.gap.quality == EDMGap::Quality::VALID && input.gap.source == input.configuredSource &&
+                (input.configuredSource == EDMGap::Source::SIMULATED ||
+                    (input.configuredSource == EDMGap::Source::PHYSICAL && input.calibrationConfirmed));
+            gap.Band = static_cast<std::uint8_t>(live ? input.gap.band : EDMGap::Band::UNKNOWN);
+            gap.PendingBand = static_cast<std::uint8_t>(live ? input.gap.pendingBand : EDMGap::Band::UNKNOWN);
+            gap.Flags = static_cast<std::uint8_t>((input.configValid ? SHM_EDM_GAP_CONFIG_VALID : 0U) |
+                (live ? SHM_EDM_GAP_LIVE_VALID : 0U) |
+                (input.rawAvailable ? SHM_EDM_GAP_RAW_AVAILABLE : 0U) |
+                (input.lastGoodAvailable ? SHM_EDM_GAP_LAST_GOOD_AVAILABLE : 0U) |
+                (input.ageKnown ? SHM_EDM_GAP_AGE_KNOWN : 0U) |
+                (input.calibrationConfirmed ? SHM_EDM_GAP_CALIBRATION_CONFIRMED : 0U) |
+                (input.boardVoltageValid && input.ownerClockValid ? SHM_EDM_GAP_BOARD_VOLTAGE_VALID : 0U));
+            gap.SelectedAd = input.adIndex;
+            gap.DeviceId = input.deviceId;
+            gap.ChannelId = input.channelId;
+            gap.ProfileRevision = input.profileRevision;
+            gap.CalibrationRevision = input.calibrationRevision;
+            gap.RawCode = input.rawAvailable ? input.rawCode : 0;
+            gap.VoltageMv = live ? input.voltageMv : 0;
+            gap.LastGoodRawCode = input.lastGoodAvailable ? input.lastGoodRawCode : 0;
+            gap.LastGoodVoltageMv = input.lastGoodAvailable ? input.lastGoodVoltageMv : 0;
+            gap.RawMin = input.rawMin;
+            gap.RawMax = input.rawMax;
+            gap.MvAtMin = input.mvAtMin;
+            gap.MvAtMax = input.mvAtMax;
+            gap.PdoOffset = input.pdoOffset;
+            gap.SampleSequence = input.sampleSequence;
+            gap.SampledAtMs = input.sampledAtMs;
+            gap.ObservedAtMs = input.observedAtMs;
+            gap.AgeMs = input.ageKnown ? input.ageMs : 0ULL;
+            gap.LastGoodSequence = input.lastGoodAvailable ? input.lastGoodSequence : 0ULL;
+            gap.LastGoodAtMs = input.lastGoodAvailable ? input.lastGoodAtMs : 0ULL;
+            gap.MaxAgeMs = input.maxAgeMs;
+            gap.DwellMs = input.dwellMs;
+            gap.BoardVoltageMv = input.boardVoltageValid && input.ownerClockValid ? input.boardVoltageMv : 0;
+
+            SHM_EDM_DiagRecipe& recipe = publication.Recipe;
+            recipe.FieldCapacity = static_cast<std::uint16_t>(SHM_EDM_DIAG_FIELD_CAPACITY);
+            recipe.FieldRecordSize = static_cast<std::uint16_t>(SHM_EDM_DIAG_FIELD_SIZE);
+            const EDMRecipe::Summary& summary = recipeSnapshot.summary;
+            recipe.LastError = static_cast<std::uint8_t>(summary.lastError);
+            recipe.Generation = summary.generation;
+            static_assert(EDMRecipe::MaximumFields == SHM_EDM_DIAG_FIELD_CAPACITY,
+                "EDM recipe and diagnostic field capacity must agree");
+            if (catalog != nullptr && summary.catalogReady &&
+                catalog->fields.size() <= SHM_EDM_DIAG_FIELD_CAPACITY)
+            {
+                recipe.CatalogReady = 1U;
+                recipe.TableSelected = summary.tableSelected ? 1U : 0U;
+                recipe.RowSelected = summary.rowSelected ? 1U : 0U;
+                recipe.Mode = static_cast<std::uint8_t>(catalog->mode);
+                recipe.CatalogRevision = summary.catalogRevision;
+                recipe.TableId = summary.tableId;
+                recipe.TableRevision = summary.tableRevision;
+                recipe.ECode = summary.eCode;
+                recipe.FieldCount = static_cast<std::uint16_t>(catalog->fields.size());
+                recipe.ConfiguredCount = summary.configuredCount;
+                recipe.ModifiedCount = summary.modifiedCount;
+                recipe.Schema = catalog->schemaVersion;
+                recipe.ReservedTail32[0] = catalog->profileId;
+                recipe.ReservedTail32[1] = catalog->definitionRevision;
+                if (summary.tableSelected)
+                {
+                    for (const auto& table : catalog->tables)
+                    {
+                        if (table.id != summary.tableId) continue;
+                        std::memcpy(recipe.TableName, table.name, sizeof(recipe.TableName));
+                        recipe.TableName[sizeof(recipe.TableName) - 1U] = '\0';
+                        break;
+                    }
+                }
+                for (std::size_t index = 0U; index < catalog->fields.size(); ++index)
+                {
+                    const EDMRecipe::FieldDefinition& definition = catalog->fields[index];
+                    SHM_EDM_DiagField& field = publication.Fields[index];
+                    field.FieldId = definition.id;
+                    field.Decimals = definition.decimals;
+                    field.Minimum = definition.minimum;
+                    field.Maximum = definition.maximum;
+                    std::memcpy(field.Name, definition.name, sizeof(field.Name));
+                    field.Name[sizeof(field.Name) - 1U] = '\0';
+                    std::memcpy(field.Unit, definition.unit, sizeof(field.Unit));
+                    field.Unit[sizeof(field.Unit) - 1U] = '\0';
+                    const EDMRecipe::ParameterSnapshot& selected = recipeSnapshot.fields[index];
+                    if (!summary.rowSelected || !selected.configured || selected.fieldId != definition.id) continue;
+                    field.RowKind = static_cast<std::uint8_t>(selected.rowKind);
+                    field.Flags = static_cast<std::uint8_t>(SHM_EDM_FIELD_CONFIGURED |
+                        (selected.overridePresent ? SHM_EDM_FIELD_OVERRIDE_PRESENT : 0U) |
+                        (selected.modified ? SHM_EDM_FIELD_MODIFIED : 0U));
+                    field.StageId = selected.stageId;
+                    field.RowStageId = selected.rowStageId;
+                    field.RowBaseValue = selected.rowBaseValue;
+                    field.BaseValue = selected.baseValue;
+                    field.ActualValue = selected.actualValue;
+                }
+            }
+
+            // Sequence itself is never copied by memcpy. An even, unchanged
+            // sequence guarantees one coherent GAP + E-code + field set.
+            const std::uint32_t writing = (target->Header.Sequence + 1U) | 1U;
+            auto* sequence = reinterpret_cast<volatile LONG*>(&target->Header.Sequence);
+            InterlockedExchange(sequence, static_cast<LONG>(writing));
+            MemoryBarrier();
+            constexpr std::size_t sequenceOffset = offsetof(SHM_EDM_DiagHeader, Sequence);
+            auto* destinationBytes = reinterpret_cast<unsigned char*>(target);
+            const auto* sourceBytes = reinterpret_cast<const unsigned char*>(&publication);
+            std::memcpy(destinationBytes, sourceBytes, sequenceOffset);
+            std::memcpy(destinationBytes + sequenceOffset + sizeof(std::uint32_t),
+                sourceBytes + sequenceOffset + sizeof(std::uint32_t),
+                sizeof(publication) - sequenceOffset - sizeof(std::uint32_t));
+            MemoryBarrier();
+            InterlockedExchange(sequence, static_cast<LONG>(writing + 1U));
+        }
+
         const char* IdleHoldDiagnosticReasonToName(
             MotionCore::IdleHoldDiagnosticReason reason) noexcept
         {
@@ -160,7 +305,7 @@ namespace HMI_Bridge
             static bool announced = false;
             if (!announced)
             {
-                RtPrintf("[ROT-PID] ENABLED build=ROTPID_DIAG2 observationOnly=1 scopes=TAIL,IDLE_HOLD sampleMs=500,2000,5000 capacity=16 drainBudget=4 unit=deg image=LOCAL_NOT_SEND_ACK\n");
+                RtPrintf("[ROT-PID] ENABLED build=ROTPID_DIAG3 observationOnly=1 scopes=TAIL,IDLE_HOLD sampleMs=500,2000,5000 idleRefreshMs=10000 cumulative=1 capacity=16 drainBudget=4 unit=deg image=LOCAL_NOT_SEND_ACK\n");
                 announced = true;
             }
             for (std::size_t n = 0U; n < RotaryPidDiagnosticMonitor::DrainBudget; ++n)
@@ -204,6 +349,170 @@ namespace HMI_Bridge
             if (dropped != lastDropped)
             {
                 RtPrintf("[ROT-PID] DIAG_DROPPED total=%u\n", dropped);
+                lastDropped = dropped;
+            }
+        }
+
+        HMI_DIAG_NOINLINE void DrainServoHandoffDiagnostics(MotionCore& motion)
+        {
+            // Sole consumer of immutable RT events. Never read live AxisContext.
+            static MotionServoHandoffEvent event{};
+            static std::uint32_t lastDropped = 0U;
+            static bool announced = false;
+            if (!announced)
+            {
+                RtPrintf("[PBC3-TX] ENABLED build=PBC3B observationOnly=1 source=FINAL_IMAGE_AND_NIC_API driveAck=UNKNOWN sampleMs=500,2000,5000 capacity=32 drainBudget=4\n");
+                announced = true;
+            }
+            for (std::size_t n = 0U; n < MotionServoHandoffMonitor::DrainBudget; ++n)
+            {
+                if (!motion.TryPopServoHandoffDiagnostic(event)) break;
+                const char* kind = event.kind == 1U ? "SAMPLE" :
+                    event.kind == 2U ? "END_SCOPE" : "END_IDENTITY";
+                RtPrintf("[PBC3-TX] %s axis=%u epoch=%u gen=%u owner=%u seq=%llu frame=%llu sourceTick=%llu elapsedMs=%llu samples=%u attempted=%u apiOK=%u apiFail=%u noSend=%u scrub=%u changed=%u unchecked=%u missingImage=%u missingInput=%u sourceNotReady=%u tickGaps=%u proposedPps=%d copiedPps=%d acceptedMinPps=%d acceptedMaxPps=%d rangeValid=%u sourceSW=%u sourceMode=%d reversed=%u driveAck=UNKNOWN\n",
+                    kind, event.axis, event.epoch, event.ownerGeneration, event.owner,
+                    static_cast<unsigned long long>(event.sequence),
+                    static_cast<unsigned long long>(event.frameGeneration),
+                    static_cast<unsigned long long>(event.sourceTick),
+                    static_cast<unsigned long long>(event.elapsedUs / 1000ULL),
+                    event.samples, event.attempted, event.apiAccepted, event.apiFailed,
+                    event.notAttempted, event.scrubbed, event.changed, event.unchecked,
+                    event.missingImage, event.missingInput, event.sourceNotReady, event.sourceTickGaps,
+                    event.proposedVelocity, event.copiedVelocity,
+                    event.minAcceptedVelocity, event.maxAcceptedVelocity,
+                    event.acceptedRangeValid ? 1U : 0U, static_cast<unsigned>(event.sourceStatusWord),
+                    static_cast<int>(event.sourceMode), event.reversed ? 1U : 0U);
+            }
+            const std::uint32_t dropped = motion.GetServoHandoffDiagnosticDroppedCount();
+            if (dropped != lastDropped)
+            {
+                RtPrintf("[PBC3-TX] DIAG_DROPPED total=%u\n", dropped);
+                lastDropped = dropped;
+            }
+        }
+
+        long long PbcXNanometres(double pulse, double pulsePerUnit) noexcept
+        {
+            if (!std::isfinite(pulse) || !std::isfinite(pulsePerUnit) || pulsePerUnit <= 0.0)
+                return (-9223372036854775807LL - 1LL);
+            const double nm = pulse / pulsePerUnit * 1000000.0;
+            if (!std::isfinite(nm) || std::abs(nm) > 9000000000000000000.0)
+                return (-9223372036854775807LL - 1LL);
+            return static_cast<long long>(nm);
+        }
+
+        HMI_DIAG_NOINLINE void DrainPbcReferenceDiagnostics(MotionCore& motion)
+        {
+            static MotionPbcReferenceEvent event{};
+            static std::uint32_t lastDropped = 0U;
+            for (std::size_t n = 0; n < MotionPbcReferenceAudit::DrainBudget; ++n)
+            {
+                if (!motion.TryPopPbcReferenceDiagnostic(event)) break;
+                const char* action = event.action == MotionPbcReferenceAction::Home ? "HOME" :
+                    event.action == MotionPbcReferenceAction::Reset ? "RESET" :
+                    event.action == MotionPbcReferenceAction::StartupSnap ? "STARTUP_SNAP" :
+                    event.action == MotionPbcReferenceAction::FaultSnap ? "FAULT_SNAP" :
+                    event.action == MotionPbcReferenceAction::ServoSnap ? "SERVO_SNAP" : "LIMIT_SNAP";
+                const char* result = event.result == MotionPbcReferenceResult::Applied ? "APPLIED" :
+                    event.result == MotionPbcReferenceResult::NumericSnap ? "NUMERIC_ONLY" :
+                    event.result == MotionPbcReferenceResult::Uncertain ? "UNCERTAIN" :
+                    event.result == MotionPbcReferenceResult::Deferred ? "DEFERRED" : "REJECTED";
+                RtPrintf("[PBC3D-REF] axis=0 action=%s result=%s seq=%llu tick=%llu epoch=%llu gen=%llu request=%llu ticket=%llu refgen=%llu phase=%u modelAction=%u homed=%u stopped=%u queues=%u reserved=%u rawNm=%lld nominalNm=%lld offsetNm=%lld error=%u applied=%llu rejected=%llu uncertain=%llu snaps=%llu deferred=%llu NONZERO=LOCKED\n",
+                    action, result, static_cast<unsigned long long>(event.sequence),
+                    static_cast<unsigned long long>(event.tick), static_cast<unsigned long long>(event.epoch),
+                    static_cast<unsigned long long>(event.ownerGeneration), static_cast<unsigned long long>(event.request),
+                    static_cast<unsigned long long>(event.ticket), static_cast<unsigned long long>(event.referenceGeneration),
+                    static_cast<unsigned>(event.phase), static_cast<unsigned>(event.modelAction),
+                    event.homed ? 1U : 0U, event.stopped ? 1U : 0U,
+                    event.queuesDrained ? 1U : 0U, event.reserved ? 1U : 0U,
+                    PbcXNanometres(event.rawPulse, event.pulsePerUnit),
+                    PbcXNanometres(event.nominalPulse, event.pulsePerUnit),
+                    PbcXNanometres(event.offsetPulse, event.pulsePerUnit),
+                    static_cast<unsigned>(event.error), static_cast<unsigned long long>(event.applied),
+                    static_cast<unsigned long long>(event.rejected), static_cast<unsigned long long>(event.uncertain),
+                    static_cast<unsigned long long>(event.snaps), static_cast<unsigned long long>(event.deferred));
+            }
+            const std::uint32_t dropped = motion.GetPbcReferenceDiagnosticDroppedCount();
+            if (dropped != lastDropped)
+            {
+                RtPrintf("[PBC3D-REF] DIAG_DROPPED total=%u\n", dropped);
+                lastDropped = dropped;
+            }
+        }
+
+        HMI_DIAG_NOINLINE void DrainPbcXSendDiagnostics(MotionCore& motion)
+        {
+            static MotionPbcXSendEvent event{};
+            static std::uint32_t lastDropped = 0U;
+            static bool announced = false;
+            if (!announced)
+            {
+                RtPrintf("[PBC3C-X] ENABLED axis=0 mode=SHADOW_ZERO cumulative=PROCESS commandSource=SERVO_ENTRY sampleMs=500 issueMinMs=100 capacity=32 drainBudget=4 shadowModelCommit=0 driveAck=UNKNOWN\n");
+                RtPrintf("[PBC3E-X] ENABLED axis=0 mode=OFF_REAL modelCommit=NIC_API_RESULT control=PID_IDLE_P nonzero=LOCKED driveAck=UNKNOWN\n");
+                announced = true;
+            }
+            for (std::size_t n = 0U; n < MotionPbcXSendAudit::DrainBudget; ++n)
+            {
+                if (!motion.TryPopPbcXSendDiagnostic(event)) break;
+                const MotionPbcXSendSample& s = event.sample;
+                const char* result = s.result == pbc::SendResult::HandoffAccepted ? "SHADOW_OK" :
+                    s.result == pbc::SendResult::FenceAccepted ? "FENCE_OK" :
+                    s.result == pbc::SendResult::Discarded ? "DISCARDED" :
+                    s.result == pbc::SendResult::OutputUncertain ? "UNCERTAIN" : "BYPASS";
+                RtPrintf("[PBC3C-X] %s seq=%llu frame=%llu sourceTick=%llu epoch=%u gen=%u owner=%u proofMode=%u result=%s ticket=%llu sourceValid=%u sourceReady=%u homed=%u eligible=%u prepared=%u sealed=%u final=%u image=%u scrub=%u attempted=%u apiOK=%u stickyUncertain=%u proposedPps=%d copiedPps=%d nominalNm=%lld rawNm=%lld offsetNm=%lld sourceSW=%u sourceMode=%d\n",
+                    event.kind == 2U ? "ISSUE" : "SAMPLE",
+                    static_cast<unsigned long long>(s.sequence),
+                    static_cast<unsigned long long>(s.identity.frame),
+                    static_cast<unsigned long long>(s.identity.tick),
+                    s.epoch, s.ownerGeneration, s.owner, s.identity.mode, result,
+                    static_cast<unsigned long long>(s.ticket),
+                    s.source.valid ? 1U : 0U, s.sourceReady ? 1U : 0U, s.source.homed ? 1U : 0U,
+                    s.eligible ? 1U : 0U, s.prepared ? 1U : 0U, s.sealed ? 1U : 0U,
+                    s.finalChecked ? 1U : 0U, s.imagePresent ? 1U : 0U,
+                    s.scrubbed ? 1U : 0U, s.attempted ? 1U : 0U, s.apiAccepted ? 1U : 0U,
+                    s.stickyUncertain ? 1U : 0U, s.proposedVelocity, s.finalVelocity,
+                    PbcXNanometres(s.source.frame.nominalCommandPulse, s.source.frame.pulsePerUnit),
+                    PbcXNanometres(s.source.rawFeedbackPulse, s.source.frame.pulsePerUnit),
+                    PbcXNanometres(s.source.frame.offsetPulse, s.source.frame.pulsePerUnit),
+                    static_cast<unsigned>(s.sourceStatusWord), static_cast<int>(s.sourceMode));
+                RtPrintf("[PBC3C-X] TOTAL seq=%llu n=%llu prepared=%llu sealed=%llu shadowOK=%llu fence=%llu discarded=%llu uncertain=%llu bypass=%llu normal=%llu stop=%llu idle=%llu zeroOnly=%llu invalid=%llu apiFail=%llu noSend=%llu scrub=%llu changed=%llu missingImage=%llu sourceNotReady=%llu prepareReject=%llu tickGaps=%llu identityChanges=%llu lastIssue=%u issueSeq=%llu issueFrame=%llu issueTick=%llu\n",
+                    static_cast<unsigned long long>(s.sequence),
+                    static_cast<unsigned long long>(event.total), static_cast<unsigned long long>(event.prepared),
+                    static_cast<unsigned long long>(event.sealed), static_cast<unsigned long long>(event.shadowOK),
+                    static_cast<unsigned long long>(event.fence), static_cast<unsigned long long>(event.discarded),
+                    static_cast<unsigned long long>(event.uncertain), static_cast<unsigned long long>(event.bypassed),
+                    static_cast<unsigned long long>(event.normal), static_cast<unsigned long long>(event.stop),
+                    static_cast<unsigned long long>(event.idle), static_cast<unsigned long long>(event.zeroOnly),
+                    static_cast<unsigned long long>(event.invalid), static_cast<unsigned long long>(event.apiFail),
+                    static_cast<unsigned long long>(event.noSend), static_cast<unsigned long long>(event.scrub),
+                    static_cast<unsigned long long>(event.changed), static_cast<unsigned long long>(event.missingImage),
+                    static_cast<unsigned long long>(event.sourceNotReady), static_cast<unsigned long long>(event.prepareRejected),
+                    static_cast<unsigned long long>(event.tickGaps), static_cast<unsigned long long>(event.identityChanges),
+                    event.lastIssue, static_cast<unsigned long long>(event.lastIssueSequence),
+                    static_cast<unsigned long long>(event.lastIssueFrame), static_cast<unsigned long long>(event.lastIssueTick));
+                const char* modelResult = s.modelResult == pbc::SendResult::HandoffAccepted ? (s.modelFinished ? "APPLIED" : "REJECTED") :
+                    s.modelResult == pbc::SendResult::FenceAccepted ? "FENCE_DISCARD" :
+                    s.modelResult == pbc::SendResult::Discarded ? "DISCARDED" :
+                    s.modelResult == pbc::SendResult::OutputUncertain ? "UNCERTAIN" :
+                    (s.modelError != pbc::Error::None || s.source.cycleError != pbc::Error::None ? "REJECTED" : "BYPASS");
+                RtPrintf("[PBC3E-X] seq=%llu result=%s ticket=%llu tick=%llu refgen=%llu cycleMode=%u prep=%u used=%u sealed=%u finished=%u error=%u cyclePrep=%llu controlUsed=%llu cycleSeal=%llu applied=%llu zeroApplied=%llu discard=%llu fence=%llu uncertain=%llu rejected=%llu unsent=%llu NONZERO=LOCKED\n",
+                    static_cast<unsigned long long>(s.sequence), modelResult,
+                    static_cast<unsigned long long>(s.source.cycle.ticket),
+                    static_cast<unsigned long long>(s.source.cycle.authority.identity.tick),
+                    static_cast<unsigned long long>(s.source.cycle.authority.identity.referenceGeneration),
+                    static_cast<unsigned>(s.source.cycle.authority.mode), s.source.cycle.prepared ? 1U : 0U,
+                    s.source.controlUsed ? 1U : 0U, s.modelSealed ? 1U : 0U, s.modelFinished ? 1U : 0U,
+                    static_cast<unsigned>(s.modelError != pbc::Error::None ? s.modelError : s.source.cycleError),
+                    static_cast<unsigned long long>(event.cyclePrepared), static_cast<unsigned long long>(event.controlUsed),
+                    static_cast<unsigned long long>(event.cycleSealed), static_cast<unsigned long long>(event.modelApplied),
+                    static_cast<unsigned long long>(event.zeroApplied), static_cast<unsigned long long>(event.modelDiscarded),
+                    static_cast<unsigned long long>(event.modelFence), static_cast<unsigned long long>(event.modelUncertain),
+                    static_cast<unsigned long long>(event.modelRejected), static_cast<unsigned long long>(event.unsentCancelled));
+            }
+            const std::uint32_t dropped = motion.GetPbcXSendDiagnosticDroppedCount();
+            if (dropped != lastDropped)
+            {
+                RtPrintf("[PBC3C-X] DIAG_DROPPED total=%u\n", dropped);
                 lastDropped = dropped;
             }
         }
@@ -1816,7 +2125,8 @@ namespace HMI_Bridge
             NCManager& nc, MotionCore& motion,
             Hmi1000msDiagnosticWorkspace& workspace) noexcept
         {
-            if (!nc.IsGapPathSimulationActiveSameThread()) return false;
+            const bool fixtureQuiet = nc.IsEDMZFixtureDiagnosticQuietSameThread();
+            if (!nc.IsGapPathSimulationActiveSameThread() && !fixtureQuiet) return false;
             workspace.feedHoldNCSettleSnapshot = {};
             workspace.feedHoldNCSettleCounters = {};
             const bool coherent = motion.TryGetNCSettleEvidence(
@@ -1824,6 +2134,9 @@ namespace HMI_Bridge
                 workspace.feedHoldNCSettleSnapshot,
                 workspace.feedHoldNCSettleCounters);
             const MotionNCSettleSnapshot& snapshot = workspace.feedHoldNCSettleSnapshot;
+            // Keep the sampled J5 workspace current without passive console IO
+            // while P28 or a physical Z fixture requires prompt NC supervision.
+            if (nc.IsEDMDiagnosticQuietSameThread() || fixtureQuiet) return true;
             RtPrintf("[GAP-CO-FIX1-J5] Coh:%u Req:%llu Proof:%llu Epoch:%u Owner:%u/%u "
                 "Mask:%u Valid:%u Contig:%u Set:%u Dwell:%u/%u rtTick:%llu bulkDeferred=1\n",
                 coherent ? 1U : 0U,
@@ -2871,7 +3184,13 @@ namespace HMI_Bridge
             }
             pShm->PLC_Command.writeByNameReq = false;
         }
-
+        // Same NC thread, after high-priority commands. The callee permits
+        // one line only when all GAP activity and control transitions are idle.
+        // EDM40 FIX1: share a single idle console budget. Fixture cleanup
+        // also suppresses the older EDM13 queue until RT service is released.
+        if (!nc->DrainEDMGapReplanDiagnosticsSameThread() &&
+            !nc->IsEDMZFixtureDiagnosticQuietSameThread())
+            nc->DrainEDMDiagnosticsSameThread();
     }
 
     // =========================================================================
@@ -2881,6 +3200,9 @@ namespace HMI_Bridge
     {
         SHM_Data* pShm = SHMManager::GetInstance().GetData();
         if (pShm == nullptr || nc == nullptr) return;
+
+        ProcessEDMConditionServiceSameThread(*nc);
+        PublishEDMObservationSameThread(*nc);
 
 
         // --- 警報檢查 (自帶條件判斷，極快) ---
@@ -3202,12 +3524,6 @@ namespace HMI_Bridge
         // =======================================================
         // 取代你原本手寫的 for 迴圈與 m_pContexts
         nc->GetMotion().ExportDebugInfo(pShm->axisDebug, true);
-
-
-
-
-
-
     }
 
     // =========================================================================
@@ -3350,6 +3666,9 @@ namespace HMI_Bridge
         // CJ FIX1: unconditional drain before SHM/ordinary diagnostic gates.
         DrainIdleHoldDiagnostics(motion);
         DrainRotaryPidDiagnostics(motion); // ROTPID_DIAG1 bounded observation drain
+        DrainServoHandoffDiagnostics(motion); // PBC-3A bounded NIC-result observer
+        DrainPbcXSendDiagnostics(motion); // PBC-3C bounded X transaction observer
+        DrainPbcReferenceDiagnostics(motion); // PBC-3D actual reference commits, immutable records
         DrainCncP1Diagnostics(motion);
         DrainCncFeedPlanDiagnostics(motion);
         SHM_Data* pShm = SHMManager::GetInstance().GetData();

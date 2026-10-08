@@ -41,7 +41,7 @@
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(KS_SDK_DIR)\lib\rtss\x64;$(KS_SDK_DIR)\lib\amd64;$(RTX64SDKDir4)lib\$(Rtx64Platform);$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>RtNal.lib;RtTcpip.lib;startupCRT.lib;libcmtd.lib;libcpmtd.lib;libucrtd.lib;libvcruntimed.lib;rtx_rtss.lib;ksapi_rtss.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>RtNal.lib;RtTcpip.lib;startupCRT.lib;libcmtd.lib;libcpmtd.lib;libucrtd.lib;libvcruntimed.lib;rtx_rtss.lib;ksapi_rtss.lib</AdditionalDependencies>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <EntryPointSymbol>_RtapiProcessEntryCRT</EntryPointSymbol>
       <SubSystem>Native</SubSystem>
@@ -67,7 +67,7 @@
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(KS_SDK_DIR)\lib\rtss\x64;$(KS_SDK_DIR)\lib\amd64;$(RTX64SDKDir4)lib\$(Rtx64Platform);$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>RtNal.lib;RtTcpip.lib;startupCRT.lib;libcmt.lib;libcpmt.lib;libucrt.lib;libvcruntime.lib;rtx_rtss.lib;ksapi_rtss.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>RtNal.lib;RtTcpip.lib;startupCRT.lib;libcmt.lib;libcpmt.lib;libucrt.lib;libvcruntime.lib;rtx_rtss.lib;ksapi_rtss.lib</AdditionalDependencies>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <EntryPointSymbol>_RtapiProcessEntryCRT</EntryPointSymbol>
       <SubSystem>Native</SubSystem>
@@ -97,6 +97,12 @@
     <ClInclude Include="ConfigReader.h" />
     <ClInclude Include="CoordinateFileSave.h" />
     <ClInclude Include="CoordinateManager.h" />
+    <ClInclude Include="EDMFlushExecution.h" />
+    <ClInclude Include="EDMShortFlushSimulationTest.h" />
+    <ClInclude Include="EDMAutomaticFlushCycle.h" />
+    <ClInclude Include="EDMLiveAutomaticFlush.h" />
+    <ClInclude Include="EDMAutomaticFlushRecipe.h" />
+    <ClInclude Include="EDMAutomaticFlushSimulationTest.h" />
     <ClInclude Include="EDMGapSignal.h" />
     <ClInclude Include="EtherCatDcQualificationDiagContract.h" />
     <ClInclude Include="EtherCatDcV1aDiagContract.h" />
@@ -105,6 +111,18 @@
     <ClInclude Include="EtherCatFrame.h" />
     <ClInclude Include="EtherCatMailbox.h" />
     <ClInclude Include="EtherCatMaster.h" />
+    <ClInclude Include="EDMAnalogInput.h" />
+    <ClInclude Include="EDMGapInput.h" />
+    <ClInclude Include="EDMGapInputConfigIO.h" />
+    <ClInclude Include="EDMGapServo.h" />
+    <ClInclude Include="EDMFlushPlan.h" />
+    <ClInclude Include="EDMAxisGainProfiles.h" />
+    <ClInclude Include="EDMProcessProfile.h" />
+    <ClInclude Include="EDMProcessTuningContract.h" />
+    <ClInclude Include="EDMProcessTuningCodec.h" />
+    <ClInclude Include="EDMProcessTuningService.h" />
+    <ClInclude Include="EDMProcessConfigIO.h" />
+    <ClInclude Include="EDMDataDiagContract.h" />
     <ClInclude Include="EtherCatMaster_DC_Internal.h" />
     <ClInclude Include="EtherCatMaster_DC_Topology.h" />
     <ClInclude Include="EtherCatMaster_DC_Tuning.h" />
@@ -130,6 +148,7 @@
     <ClInclude Include="HomingManager.h" />
     <ClInclude Include="MacroEngine.h" />
     <ClInclude Include="MacroParser.h" />
+    <ClInclude Include="MechanicalCompensationSendContract.h" />
     <ClInclude Include="MotionAxisCommandMailbox.h" />
     <ClInclude Include="MotionCommandedEndpointReceipt.h" />
     <ClInclude Include="MotionCommandPathModeTransport.h" />
@@ -142,6 +161,7 @@
     <ClInclude Include="MotionNCTranslationProof.h" />
     <ClInclude Include="MotionPathCoreHoldExcursion.h" />
     <ClInclude Include="MotionPathCoreRetainedReceipt.h" />
+    <ClInclude Include="MotionPbcXSendAudit.h" />
     <ClInclude Include="MotionQueueTailTransaction.h" />
     <ClInclude Include="MotionRotaryTarget.h" />
     <ClInclude Include="MotionRetainedInterval.h" />
@@ -244,6 +264,10 @@
     <ClInclude Include="ReferencePositionBlock.h" />
     <ClInclude Include="RotaryPidDiagnostic.h" />
     <ClInclude Include="SHMManager.h" />
+    <ClInclude Include="EDMConditionCommandContract.h" />
+    <ClInclude Include="EDMConditionService.h" />
+    <ClInclude Include="EDMConditionStartupIO.h" />
+    <ClInclude Include="EDMConditionDefaults.h" />
     <ClInclude Include="SHM_Types.h" />
     <ClInclude Include="tinyxml2.h" />
   </ItemGroup>
@@ -319,6 +343,7 @@
     <ClCompile Include="NCLifecycleInterruptionBoundary.cpp" />
     <ClCompile Include="NCManager.cpp" />
     <ClCompile Include="NCManager_Gap.cpp" />
+    <ClCompile Include="NCManager_EDMServo.cpp" />
     <ClCompile Include="NCManager_Cutter.cpp" />
     <ClCompile Include="NCManager_PathArc.cpp" />
     <ClCompile Include="NCManager_PathCore.cpp" />
@@ -359,6 +384,8 @@
     <ClCompile Include="PlcCore.cpp" />
     <ClCompile Include="PLCManager.cpp" />
     <ClCompile Include="SHMManager.cpp" />
+    <ClCompile Include="EDMConditionService.cpp" />
+    <ClCompile Include="EDMProcessTuningService.cpp" />
     <ClCompile Include="System_EDM_SINKER_MODE.cpp" />
     <ClCompile Include="System_EXAMPLE_MODE.cpp" />
     <ClCompile Include="tinyxml2.cpp" />

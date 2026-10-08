@@ -1,6 +1,8 @@
 ﻿#pragma once
 
 #include "SHM_Types.h"
+#include "EDMDataDiagContract.h"
+#include "EDMConditionService.h"
 #include "EtherCatSmDiagContract.h"
 #include "EtherCatFmmuDiagContract.h"
 #include "EtherCatWatchdogDiagContract.h"
@@ -93,6 +95,9 @@ GetEtherCatRxCorrelationDiagSharedMemoryData();
 SHM_ECAT_RxForensicsData*
 GetEtherCatRxForensicsSharedMemoryData();
 
+
+// Separate Windows-read-only EDM18 GAP / condition observation contract.
+SHM_EDM_DiagData* GetEDMDiagnosticSharedMemoryData();
 
 class SHMManager
 {

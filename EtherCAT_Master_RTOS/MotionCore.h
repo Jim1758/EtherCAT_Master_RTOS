@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include <vector>
+#include <memory>
 #include "EtherCatTypes.h" // 必須包含這個，才能認識 ServoDrive
 #include "HomeTypes.h"
 #include <cmath>
@@ -16,6 +17,11 @@
 #include "CompensationEngine.h" // 引入剛寫好的標頭檔
 #include "SHM_Types.h"
 #include "MotionExecutionContract.h"
+
+class NCEccentricCRuntimeValue; // BASE79D read-only pre-start binding
+struct MotionEccentricCConsumerState;
+struct MotionEccentricCContext;
+struct NCEccentricCProfilePoint;
 #include "MotionNCTranslationProof.h"
 #include "MotionCommandPathModeTransport.h"
 #include "MotionQueueTailTransaction.h"
@@ -23,15 +29,34 @@
 #include "MotionCommandedEndpointReceipt.h" // BQ producer-only data export
 #include "NCRotaryFeedScope.h" // BASE68 pure rotary admission
 #include "NCZCFeedLine.h" // BASE70 common-time Z/C geometry
+#include "NCXYZCFeedLine.h"
+#include "NCXYZCAbsoluteFeedTarget.h"
+#include "NCXYZCFeedScope.h"
+#include "NCXYZCUVFeedLine.h"
+#include "NCXYZCUVAbsoluteFeedTarget.h"
+#include "NCXYZCUVFeedScope.h"
 #include "NCZCFeedScope.h" // BASE70 explicit G91 Z/C admission
 #include "MotionFeedLineReceipt.h" // BX G01 producer-owned workspace
+
+struct MotionEccentricCProducerWorkspace;
 #include "MotionFeedArcReceipt.h" // BY G02/G03 producer-owned workspace
 #include "MotionPathCoreRetainedReceipt.h" // BZ immutable traversal workspace
 #include "MotionPathCoreHoldExcursion.h" // CB same-source held excursion
 #include "MotionCommandRing.h"
 #include "MotionFeedbackRing.h"
 #include "RotaryPidDiagnostic.h" // ROTPID_DIAG1 observation-only sidecar
+#include "MotionServoHandoffDiagnostic.h" // PBC-3A NIC handoff observation, not drive ACK
+#include "MotionPbcXSendAudit.h" // PBC-3C zero-offset send transaction rehearsal
+#include "MotionPbcReferenceContract.h"
+#include "MotionPbcHomeStopProof.h"
+#include "MotionPbcHomeCaptureProof.h"
 #include "MotionAxisCommandMailbox.h"
+#include "EDMZFixtureSession.h" // EDM28 isolated, finite single-Z diagnostic
+#include "EDMExecutionCancelFence.h"
+#include "EDMExecutionFeedbackChannel.h"
+#include "EDMExecutionFrameIdentity.h"
+#include "EDMRTShadowChannel.h" // EDM48 bounded NC -> RT shadow transport
+#include "EDMGapServoRTSession.h" // EDM55 continuous RT SIM servo, advisory values only
 #include "AlarmManager.h"
 
 class EtherCatMaster;
@@ -614,6 +639,8 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     bool pathCoreFeedExactStop = false; // DT: nonbuffered native G01 provenance, padding byte 203.
     bool pathCoreRotaryFeedExactStop = false; // BASE68: degree feed; existing padding byte 204.
     bool pathCoreZCFeedExactStop = false; // BASE70: common-time Z/C; padding byte 205.
+    bool pathCoreXYZCFeedExactStop = false; // BASE75: G90/G91 XYZ/C; padding byte 206.
+    bool pathCoreXYZCUVFeedExactStop = false; // BASE73: G91 XYZ/C/U/V; padding byte 207.
     // With this marker only: mem_startPos[0]=native start pulse, mem_ratio[0]=PPD,
     // mem_startPos[1]/mem_ratio[1]=accepted MCS start/end degrees;
     // mem_totalDist=signed resolved degree sweep, mem_radius=F deg/min.
@@ -628,6 +655,21 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     // mem_totalDist=scalar pulse length, mem_radius=F mm/min along Z,
     // mem_startAngle=nominal common seconds, mem_totalAngle=C deg/min.
     // These scalars are provenance only; LINEAR maps both axes by one lambda.
+    // BASE75 XYZC-only provenance (no transform/history permission):
+    // mem_startPos[0..3]=start pulses; [4..7]=start MCS XYZC;
+    // mem_ratio[0..3]=PPU; [4..7]=G91 deltas or G90 RAW WCS targets.
+    // G90 mem_centerX=C modulo, mem_centerY=shortest flag (exact +0 or 1).
+    // G91 keeps mem_centerX/Y zero. Existing scalar length/F/time/C rate stay.
+    // BASE73 six-axis-only provenance (never a transform/history snapshot):
+    // mem_startPos[0..5]=start pulses; mem_ratio[0..5]=PPU; slots6/7 stay zero.
+    // mem_transformOrigin=start MCS XYZ; matrix[0]=start MCS CUV,
+    // G91 matrix[1]=authored XYZ deltas; matrix[2]=authored CUV deltas.
+    // BASE74 G90 uses these six matrix values for RAW programmed WCS targets;
+    // mem_startPos[6,7]=frozen C/U modulo; mem_ratio[6]=V modulo,
+    // mem_ratio[7]=frozen shortest-path bits C/U/V (exact integer 0..7).
+    // G91 retains zero spare slots. Resolve canonical ends without a second wrap.
+    // mem_enableTransform is false. mem_radius=XYZ F, mem_startAngle=time,
+    // mem_totalDist=pulse length; mem_totalAngle/mem_centerX/mem_centerY=CUV rates.
     double mem_startPos[MAX_AXES] = { 0.0 };
     double mem_ratio[MAX_AXES] = { 0.0 };
     double mem_radius = 0.0;
@@ -639,6 +681,7 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
 
     // 時光機專用：記憶當時的空間旋轉狀態
     bool mem_enableTransform = false;
+    bool pathCoreEccentricCFeedExactStop = false; // BASE79B: existing padding byte 385; live admission closed.
     double mem_transformOrigin[3] = { 0.0, 0.0, 0.0 };
     double mem_transformMatrix[3][3] = {
         { 1.0, 0.0, 0.0 },
@@ -688,6 +731,7 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
 
 inline bool IsMotionFixedTranslationToolSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     // An empty legacy descriptor never authorizes an active H vector.
     if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
         return command.sourceToolLengthMode == 49;
@@ -701,6 +745,7 @@ inline bool IsMotionFixedTranslationToolSourceAllowed(const MotionCommand& comma
 // BASE-PLANE-7. Retained/reverse paths stay excluded.
 inline bool IsMotionFixedRotationPathAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     if (command.commandPathMode == MotionCommandPathMode::EXACT_STOP)
         return !command.cncFeedLookahead && !command.cncCornerBlend;
     const bool plainXYLine = command.mode == InterpolationMode::LINEAR &&
@@ -731,6 +776,7 @@ inline bool IsMotionFixedRotationPathAllowed(const MotionCommand& command) noexc
 
 inline bool IsMotionFixedTranslationWorkSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     // Physical G168/W tags require the complete frozen WORK row and MCS center.
     // Empty legacy descriptors cannot authorize active WORK, even with G49.
     if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
@@ -744,6 +790,7 @@ inline bool IsMotionFixedTranslationWorkSourceAllowed(const MotionCommand& comma
 
 inline bool IsMotionFixedTranslationRotationSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     // A G68 tag never authorizes an unfrozen MEMORY transform. MDI keeps its
     // legacy lane; native fixed geometry carries the exact source descriptor.
     if (IsNCTranslationSnapshotEmpty(command.sourceTranslation))
@@ -756,6 +803,7 @@ inline bool IsMotionFixedTranslationRotationSourceAllowed(const MotionCommand& c
 
 inline bool IsMotionFixedTranslationScaleMirrorSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     // Native packet geometry already includes the complete fixed transform.
     // Tags prove provenance only; RT must never apply scale or mirror again.
     const NCTranslationSnapshot& s = command.sourceTranslation;
@@ -770,6 +818,7 @@ inline bool IsMotionFixedTranslationScaleMirrorSourceAllowed(const MotionCommand
 
 inline bool IsMotionFixedTranslationPolarSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     // G16 has already become native Cartesian geometry at the NC boundary.
     // RT checks only immutable provenance; it never interprets radius or angle.
     const NCTranslationSnapshot& s = command.sourceTranslation;
@@ -792,6 +841,7 @@ inline bool IsMotionFixedTranslationPolarSourceAllowed(const MotionCommand& comm
 
 inline bool IsMotionFixedTranslationCutterSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     const NCTranslationSnapshot& s = command.sourceTranslation;
     if (IsNCTranslationSnapshotEmpty(s))
         return command.sourceToolRadiusMode == 40 && command.sourceDCode == 0;
@@ -837,6 +887,7 @@ inline bool IsMotionFixedTranslationCutterSourceAllowed(const MotionCommand& com
 inline bool IsMotionArcPlaneGroupMapping(const MotionCommand& command,
     int groupAxisCount, const int* groupAxes) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     NCArcPlaneAxes plane{};
     return groupAxes != nullptr && TryGetNCArcPlaneAxes(command.sourcePlaneMode, plane) &&
         command.axisCount == 2 && groupAxisCount == 2 &&
@@ -851,6 +902,7 @@ inline bool IsMotionArcPlaneGroupMapping(const MotionCommand& command,
 // the cutter source gate independently checks literal-contour payload shape.
 inline bool IsMotionBaseArcPlaneSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     if (command.sourcePlaneMode == 17) return true;
     NCArcPlaneAxes plane{};
     return TryGetNCArcPlaneAxes(command.sourcePlaneMode, plane) &&
@@ -878,8 +930,10 @@ inline bool IsMotionBaseArcPlaneSourceAllowed(const MotionCommand& command) noex
 // This marker never grants rapid, mixed-axis, lookahead, replay or EDM authority.
 inline bool IsMotionRotaryFeedSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     const NCTranslationSnapshot& source = command.sourceTranslation;
     if (!command.pathCoreRotaryFeedExactStop || command.pathCoreFeedExactStop || command.pathCoreZCFeedExactStop ||
+        command.pathCoreXYZCFeedExactStop || command.pathCoreXYZCUVFeedExactStop ||
         command.mode != InterpolationMode::LINEAR || command.axisCount != 1 ||
         command.axisIndices[0] < 3 || command.axisIndices[0] >= MAX_AXES ||
         command.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
@@ -906,8 +960,10 @@ inline bool IsMotionRotaryFeedSourceAllowed(const MotionCommand& command) noexce
 // pulse path transports common progress, never a mixed physical feed metric.
 inline bool IsMotionZCFeedSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     const NCTranslationSnapshot& source = command.sourceTranslation;
-    return command.pathCoreZCFeedExactStop && !command.pathCoreFeedExactStop &&
+    return command.pathCoreZCFeedExactStop && !command.pathCoreXYZCFeedExactStop &&
+        !command.pathCoreXYZCUVFeedExactStop && !command.pathCoreFeedExactStop &&
         !command.pathCoreRotaryFeedExactStop && command.mode == InterpolationMode::LINEAR &&
         command.axisCount == 2 && command.axisIndices[0] == 2 && command.axisIndices[1] == 3 &&
         command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
@@ -925,8 +981,174 @@ inline bool IsMotionZCFeedSourceAllowed(const MotionCommand& command) noexcept
         IsNCTranslationSourceAllowed(command.sourceWCS, source);
 }
 
+// BASE75 exact G90/G91 XYZ/C mapping; physical units remain separate.
+inline bool IsMotionXYZCFeedSourceAllowed(const MotionCommand& command) noexcept
+{
+    if (command.pathCoreEccentricCFeedExactStop) return false;
+    const NCTranslationSnapshot& source = command.sourceTranslation;
+    return command.pathCoreXYZCFeedExactStop && !command.pathCoreXYZCUVFeedExactStop &&
+        !command.pathCoreZCFeedExactStop && !command.pathCoreFeedExactStop &&
+        !command.pathCoreRotaryFeedExactStop && command.mode == InterpolationMode::LINEAR &&
+        command.axisCount == 4 && command.axisIndices[0] == 0 && command.axisIndices[1] == 1 &&
+        command.axisIndices[2] == 2 && command.axisIndices[3] == 3 &&
+        command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        !command.cncFeedLookahead && !command.cncCornerBlend && !command.pathCorePlanarCircle &&
+        !command.pathCoreFullCircle && !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse &&
+        !command.replayTerminalAlreadyPublished && !command.mem_enableTransform &&
+        command.execution.source == MotionCommandSource::NC_MEMORY && command.ownerLease.owner == MotionOwner::AUTO &&
+        IsNCXYZCFeedNeutralFrame(source) &&
+        command.sourceIsAbsoluteMode == (source.distanceMode == 90) &&
+        (source.distanceMode == 90 || source.distanceMode == 91) && command.sourcePlaneMode == 17 &&
+        !command.sourceG162Active && !command.sourceG168Active && command.sourceWCode == 0 &&
+        !command.sourceG68Active && command.sourceG68Angle == 0.0 &&
+        !command.sourceG51Active && command.sourceScaleRatio == 1.0 && command.sourceMirrorMask == 0U &&
+        !command.sourceG16Active && command.sourceToolLengthMode == 49 && command.sourceHCode == 0 &&
+        command.sourceToolRadiusMode == 40 && command.sourceDCode == 0 &&
+        IsNCTranslationSourceAllowed(command.sourceWCS, source);
+}
+
+inline double MotionXYZCStartMCS(const MotionCommand& command, unsigned slot) noexcept
+{
+    return command.mem_startPos[slot + 4U];
+}
+// G91 signed increment; G90 raw authored WCS coordinate.
+inline double MotionXYZCProgrammedValue(const MotionCommand& command, unsigned slot) noexcept
+{
+    return command.mem_ratio[slot + 4U];
+}
+inline double MotionXYZCRequestedMCS(const MotionCommand& command, unsigned slot) noexcept
+{
+    return MotionXYZCProgrammedValue(command, slot) +
+        NCTranslationAxisOffsetMM(command.sourceTranslation, slot);
+}
+inline bool TryResolveMotionXYZCAbsoluteTarget(const MotionCommand& command,
+    NCXYZCAbsoluteFeedTarget& resolved) noexcept
+{
+    resolved = NCXYZCAbsoluteFeedTarget{};
+    // Check represented +0/1 directly; no conversion of arbitrary floating data.
+    if (!command.sourceIsAbsoluteMode || !IsMotionXYZCFeedSourceAllowed(command) ||
+        (!NCRotaryFeedDetail::SameBits(command.mem_centerY, 0.0) &&
+            !NCRotaryFeedDetail::SameBits(command.mem_centerY, 1.0))) return false;
+    std::array<double, 4U> startMCS{}, startPulse{}, requestedMCS{}, pulsePerUnit{};
+    for (unsigned axis = 0U; axis < 4U; ++axis)
+    {
+        startMCS[axis] = MotionXYZCStartMCS(command, axis);
+        startPulse[axis] = command.mem_startPos[axis];
+        requestedMCS[axis] = MotionXYZCRequestedMCS(command, axis);
+        pulsePerUnit[axis] = command.mem_ratio[axis];
+        if (!std::isfinite(MotionXYZCProgrammedValue(command, axis)) ||
+            !std::isfinite(requestedMCS[axis])) return false;
+    }
+    return TryResolveNCXYZCAbsoluteFeedTarget(startMCS, startPulse, requestedMCS,
+        pulsePerUnit, command.mem_centerY == 1.0, command.mem_centerX, resolved) && resolved.valid;
+}
+
+
+// BASE74 exact G90/G91 XYZ/C/U/V mapping; physical units remain separate.
+inline bool IsMotionXYZCUVFeedSourceAllowed(const MotionCommand& command) noexcept
+{
+    if (command.pathCoreEccentricCFeedExactStop) return false;
+    const NCTranslationSnapshot& source = command.sourceTranslation;
+    return command.pathCoreXYZCUVFeedExactStop && !command.pathCoreXYZCFeedExactStop &&
+        !command.pathCoreZCFeedExactStop && !command.pathCoreFeedExactStop &&
+        !command.pathCoreRotaryFeedExactStop && command.mode == InterpolationMode::LINEAR &&
+        command.axisCount == 6 && command.axisIndices[0] == 0 && command.axisIndices[1] == 1 &&
+        command.axisIndices[2] == 2 && command.axisIndices[3] == 3 &&
+        command.axisIndices[4] == 4 && command.axisIndices[5] == 5 &&
+        command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        !command.cncFeedLookahead && !command.cncCornerBlend && !command.pathCorePlanarCircle &&
+        !command.pathCoreFullCircle && !command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse &&
+        !command.replayTerminalAlreadyPublished && !command.mem_enableTransform &&
+        command.execution.source == MotionCommandSource::NC_MEMORY && command.ownerLease.owner == MotionOwner::AUTO &&
+        IsNCXYZCUVFeedNeutralFrame(source) &&
+        command.sourceIsAbsoluteMode == (source.distanceMode == 90) &&
+        (source.distanceMode == 90 || source.distanceMode == 91) && command.sourcePlaneMode == 17 &&
+        !command.sourceG162Active && !command.sourceG168Active && command.sourceWCode == 0 &&
+        !command.sourceG68Active && command.sourceG68Angle == 0.0 &&
+        !command.sourceG51Active && command.sourceScaleRatio == 1.0 && command.sourceMirrorMask == 0U &&
+        !command.sourceG16Active && command.sourceToolLengthMode == 49 && command.sourceHCode == 0 &&
+        command.sourceToolRadiusMode == 40 && command.sourceDCode == 0 &&
+        IsNCTranslationSourceAllowed(command.sourceWCS, source);
+}
+
+inline double MotionXYZCUVStartMCS(const MotionCommand& command, unsigned slot) noexcept
+{
+    return slot < 3U ? command.mem_transformOrigin[slot] : command.mem_transformMatrix[0][slot - 3U];
+}
+
+// G91: signed native increment. G90: raw authored WCS coordinate.
+inline double MotionXYZCUVProgrammedValue(const MotionCommand& command, unsigned slot) noexcept
+{
+    return command.mem_transformMatrix[slot < 3U ? 1U : 2U][slot % 3U];
+}
+
+inline double MotionXYZCUVRequestedMCS(const MotionCommand& command, unsigned slot) noexcept
+{
+    return MotionXYZCUVProgrammedValue(command, slot) +
+        NCTranslationAxisOffsetMM(command.sourceTranslation, slot);
+}
+
+inline double MotionXYZCUVRotaryModulo(const MotionCommand& command, unsigned rotary) noexcept
+{
+    return rotary < 2U ? command.mem_startPos[6U + rotary] : command.mem_ratio[6U];
+}
+
+inline bool TryResolveMotionXYZCUVAbsoluteTarget(const MotionCommand& command,
+    NCXYZCUVAbsoluteFeedTarget& resolved) noexcept
+{
+    resolved = NCXYZCUVAbsoluteFeedTarget{};
+    const double maskValue = command.mem_ratio[7U];
+    if (!command.sourceIsAbsoluteMode || command.sourceTranslation.distanceMode != 90 ||
+        !IsMotionXYZCUVFeedSourceAllowed(command) ||
+        !std::isfinite(maskValue) || maskValue < 0.0 || maskValue > 7.0 ||
+        maskValue != std::floor(maskValue)) return false;
+    // Validate before floating-to-integer conversion: malformed packets must
+    // never invoke undefined behavior for NaN, infinity or out-of-range masks.
+    const unsigned mask = static_cast<unsigned>(maskValue);
+    if (!NCRotaryFeedDetail::SameBits(maskValue, static_cast<double>(mask))) return false;
+    std::array<double, 6U> startMCS{}, startPulse{}, requestedMCS{}, pulsePerUnit{};
+    std::array<double, 3U> modulo{};
+    std::array<bool, 3U> shortest{};
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        startMCS[axis] = MotionXYZCUVStartMCS(command, axis);
+        startPulse[axis] = command.mem_startPos[axis];
+        requestedMCS[axis] = MotionXYZCUVRequestedMCS(command, axis);
+        pulsePerUnit[axis] = command.mem_ratio[axis];
+        if (!std::isfinite(MotionXYZCUVProgrammedValue(command, axis)) ||
+            !std::isfinite(requestedMCS[axis])) return false;
+    }
+    for (unsigned rotary = 0U; rotary < 3U; ++rotary)
+    {
+        modulo[rotary] = MotionXYZCUVRotaryModulo(command, rotary);
+        shortest[rotary] = (mask & (1U << rotary)) != 0U;
+    }
+    return TryResolveNCXYZCUVAbsoluteFeedTarget(startMCS, startPulse, requestedMCS,
+        pulsePerUnit, shortest, modulo, resolved) && resolved.valid;
+}
+
+inline double MotionXYZCUVDeltaNative(const MotionCommand& command, unsigned slot) noexcept
+{
+    if (!command.sourceIsAbsoluteMode) return MotionXYZCUVProgrammedValue(command, slot);
+    NCXYZCUVAbsoluteFeedTarget resolved{};
+    return TryResolveMotionXYZCUVAbsoluteTarget(command, resolved) ?
+        resolved.deltaNative[slot] : (std::numeric_limits<double>::quiet_NaN)();
+}
+
+inline double MotionXYZCUVEndMCS(const MotionCommand& command, unsigned slot) noexcept
+{
+    if (!command.sourceIsAbsoluteMode)
+        return MotionXYZCUVStartMCS(command, slot) + MotionXYZCUVProgrammedValue(command, slot);
+    NCXYZCUVAbsoluteFeedTarget resolved{};
+    return TryResolveMotionXYZCUVAbsoluteTarget(command, resolved) ?
+        resolved.endMCS[slot] : (std::numeric_limits<double>::quiet_NaN)();
+}
+
 inline bool IsMotionFixedTranslationSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
+    if (command.pathCoreXYZCUVFeedExactStop) return IsMotionXYZCUVFeedSourceAllowed(command);
+    if (command.pathCoreXYZCFeedExactStop) return IsMotionXYZCFeedSourceAllowed(command);
     if (command.pathCoreZCFeedExactStop) return IsMotionZCFeedSourceAllowed(command);
     if (command.pathCoreRotaryFeedExactStop) return IsMotionRotaryFeedSourceAllowed(command);
     if (!IsMotionBaseArcPlaneSourceAllowed(command)) return false;
@@ -990,6 +1212,12 @@ static_assert(offsetof(MotionCommand, pathCoreRotaryFeedExactStop) == 204U,
     "BASE68 must consume existing command padding only.");
 static_assert(offsetof(MotionCommand, pathCoreZCFeedExactStop) == 205U,
     "BASE70 must consume existing command padding only.");
+static_assert(offsetof(MotionCommand, pathCoreXYZCFeedExactStop) == 206U,
+    "BASE72 must preserve the 1064-byte command transport.");
+static_assert(offsetof(MotionCommand, pathCoreXYZCUVFeedExactStop) == 207U,
+    "BASE73 must preserve the 1064-byte command transport.");
+static_assert(offsetof(MotionCommand, pathCoreEccentricCFeedExactStop) == 385U,
+    "BASE79B must preserve the 1064-byte command and every existing offset.");
 #endif
 
 // Stage NC-0.2D：NC Producer 在單一 Program Block 派送期間，
@@ -1777,17 +2005,18 @@ struct MotionNCSettleSnapshot
     double maxCommandVelocityAbsPps = 0.0;
     double feedrateOverride = 1.0;
     double virtualCommandVelocityAbsPps = 0.0;
-    std::int32_t worstCommandVelocityAxisIndex = -1;
     double worstFollowingErrorAbsPulse = 0.0;
     double worstFollowingWindowPulse = 0.0;
-    std::int32_t worstFollowingErrorAxisIndex = -1;
     double worstActualExcursionPulse = 0.0;
     double worstActualExcursionLimitPulse = 0.0;
-    std::int32_t worstActualExcursionAxisIndex = -1;
 
     // Advisory only.  Neither value can block or revoke settled=true.
     double advisoryMaxActualVelocityAbsPps = 0.0;
     std::uint32_t advisoryMaxPdoTargetVelocityAbs = 0U;
+    // Group 32-bit metadata to avoid padding in the fixed RT publication.
+    std::int32_t worstCommandVelocityAxisIndex = -1;
+    std::int32_t worstFollowingErrorAxisIndex = -1;
+    std::int32_t worstActualExcursionAxisIndex = -1;
 };
 
 // Modal/physical tags captured by NC when Reset starts.  The RT rebase ACK
@@ -1850,6 +2079,9 @@ struct MotionNCResetRebaseAck
     MotionNCResetExecutionState executionState{};
     double actualPulse[MAX_AXES] = { 0.0 };
     double actualMcsUnit[MAX_AXES] = { 0.0 };
+    // PBC-3F: only physical X has an integrated retained-offset reference.
+    // Keep raw measurements above intact and the existing RT payload budget.
+    double xNominalMcsUnit = 0.0;
 };
 
 static_assert(
@@ -1927,6 +2159,11 @@ class MotionCore
 {
 public:
     MotionCore();
+    ~MotionCore();
+    // BASE79F: initialize once before any cyclic work; no cyclic allocation.
+    bool InitializeEccentricCConsumer() noexcept;
+    bool IsEccentricCConsumerReady() const noexcept;
+    std::size_t EccentricCConsumerStorageBytes() const noexcept;
 
 
 
@@ -1962,6 +2199,14 @@ public:
     // packed Owner/Epoch reservations before the final LRW payload capture;
     // Finalize verifies them and End keeps both held through SendPacket. On a
     // race the live image is scrubbed and copied once more as all-zero.
+    struct PbcHomeProbeCommand
+    {
+        MotionPbcHomeCaptureKey key{};
+        std::uint64_t sequence = 0ULL, tick = 0ULL;
+        std::uint16_t value = 0U;
+        bool pending = false;
+    };
+
     struct ServoOutputFrameReservation
     {
         AlarmManager::MotionAdmissionReservation alarmAdmission{};
@@ -1972,6 +2217,19 @@ public:
         std::uint64_t safetyIntentState = 0ULL;
         bool acquired = false;
         bool recopyRequired = false;
+        // Same RT thread: exact image identity and final API outcome only.
+        MotionServoHandoffSample handoff{};
+        MotionPbcXSendSample pbcX{};
+        bool handoffPending = false;
+        PbcHomeProbeCommand homeProbe{};
+        bool homeProbeSerializedExact = false;
+        // EDM28 seals the actual serialized CSV velocities, not a drive ACK.
+        std::uint64_t edmZStopTicket = 0ULL;
+        std::uint64_t edmZStopSession = 0ULL;
+        bool edmZStopFenceCurrent = false;
+        std::uint64_t edmZFeedbackPublication = 0ULL;
+        bool edmZGuardHeld = false;
+        bool edmZSerializedExact = false;
     };
 
     bool BeginServoOutputFrameAtSendPoint(
@@ -1979,7 +2237,18 @@ public:
     bool FinalizeServoOutputFrameAtSendPoint(
         ServoOutputFrameReservation& reservation) noexcept;
     void EndServoOutputFrameAfterSend(
-        ServoOutputFrameReservation& reservation) noexcept;
+        ServoOutputFrameReservation& reservation,
+        bool sendAttempted, bool sendSucceeded) noexcept;
+
+    bool SealPbcXHomeProbeSerializedImage(ServoOutputFrameReservation& reservation,
+        const std::uint8_t* ioMapBase, std::size_t ioMapSize,
+        const std::uint8_t* serializedPayload, std::size_t payloadSize) noexcept;
+    bool IsPbcXPhysicalHomeCaptureSupported(int axisIndex) const noexcept;
+    bool IsPbcXZeroOnlyHomeIdentity(int axisIndex) const noexcept;
+    bool IsPbcXStagedHomeEntryIdentity(int axisIndex) const noexcept;
+    bool IsPbcXConfiguredDisabledHomeIdentity(int axisIndex) const noexcept;
+    bool GetPbcXPhysicalHomeCaptureSnapshot(int axisIndex,
+        MotionPbcHomeCaptureSnapshot& out) const noexcept;
 
     // Stage 11D.6:
     // Input arrives through MotionServoInputSnapshot.
@@ -1990,6 +2259,25 @@ public:
         const MotionServoInputSnapshot& input);
 
     void ExportDebugInfo(SHM_AxisDebugInfo* outDebugArray, bool outputInMM = false);
+    // Sole NC producer -> 250 us RT owner. These APIs grant no EDM/discharge
+    // permit. An acknowledgement denotes local RT planner application only.
+    bool SubmitEDMZFixtureRequest(const EDM28::Request& request) noexcept;
+    void RequestEDMZFixtureStop(std::uint64_t session) noexcept;
+    bool ReadEDMZFixtureFeedback(EDM28::Feedback& feedback) const noexcept;
+    // EDM48 receipts describe the RT shadow consumer only. These wrappers
+    // neither grant physical motion/discharge authority nor touch a planner.
+    bool StartEDMRTShadow(const EDM46::Config& config, const EDM46::Scope& scope,
+        const EDM46::IntentSnapshot& initial, std::uint64_t nowMs) noexcept;
+    bool SubmitEDMRTShadow(const EDM47::Packet& packet) noexcept;
+    void NeutralizeEDMRTShadow(std::uint64_t session, std::uint64_t commandFloor) noexcept;
+    void CancelEDMRTShadow(std::uint64_t session) noexcept;
+    bool ReadEDMRTShadowFeedback(EDM48::Feedback& feedback) const noexcept;
+    bool StartEDMGapServoRT(const EDM55RT::Scope& scope, EDM55RT::Profile profile,
+        std::uint64_t nowUs) noexcept;
+    void CancelEDMGapServoRT(std::uint64_t session) noexcept;
+    void RetireEDMGapServoRT(std::uint64_t session) noexcept;
+    bool TouchEDMGapServoRT(std::uint64_t session, std::uint64_t nowUs) noexcept;
+    bool ReadEDMGapServoRT(EDM55RT::Feedback& feedback) const noexcept;
     //單軸運動 API--------------------------------------------------------------------
 
 
@@ -2051,7 +2339,8 @@ public:
         AxisContext& axis,
         double capturedReferencePulse,
         double homeOffsetUnit,
-        const MotionOwnerLease& ownerLease);
+        const MotionOwnerLease& ownerLease,
+        bool* outDeferred = nullptr, std::uint64_t homeCaptureToken = 0ULL);
 
     //多軸插補功能區塊--------------------------------------------------------------------
 
@@ -2159,6 +2448,20 @@ public:
     { return m_rotaryPidDiagnosticMonitor.TryPop(event); }
     std::uint32_t GetRotaryPidDiagnosticDroppedCount() const noexcept
     { return m_rotaryPidDiagnosticMonitor.Dropped(); }
+    bool TryPopServoHandoffDiagnostic(MotionServoHandoffEvent& event) noexcept
+    { return m_servoHandoffMonitor.TryPop(event); }
+    std::uint32_t GetServoHandoffDiagnosticDroppedCount() const noexcept
+    { return m_servoHandoffMonitor.Dropped(); }
+
+    bool TryPopPbcXSendDiagnostic(MotionPbcXSendEvent& event) noexcept
+    { return m_pbcXSendAudit.TryPop(event); }
+    std::uint32_t GetPbcXSendDiagnosticDroppedCount() const noexcept
+    { return m_pbcXSendAudit.Dropped(); }
+
+    bool TryPopPbcReferenceDiagnostic(MotionPbcReferenceEvent& event) noexcept
+    { return m_pbcReferenceAudit.TryPop(event); }
+    std::uint32_t GetPbcReferenceDiagnosticDroppedCount() const noexcept
+    { return m_pbcReferenceAudit.Dropped(); }
 
     // DC: RT-only producer / existing HMI diagnostic-task consumer.
     enum class CncP1Event : std::uint8_t
@@ -2350,7 +2653,7 @@ public:
         bool useShortestPath,
         MotionCommandSource source,
         const MotionOwnerLease& ownerLease,
-        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+        MotionAxisCommandSequence* outSequence = nullptr, bool* outIngressBusy = nullptr) noexcept;
 
     bool SubmitAxisVelocityMove(
         int axisIndex,
@@ -2358,7 +2661,7 @@ public:
         double accelerationTime,
         MotionCommandSource source,
         const MotionOwnerLease& ownerLease,
-        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+        MotionAxisCommandSequence* outSequence = nullptr, bool* outIngressBusy = nullptr) noexcept;
 
     bool SubmitAxisMPGMove(
         int axisIndex,
@@ -2375,20 +2678,21 @@ public:
         double decelerationTime,
         MotionCommandSource source,
         const MotionOwnerLease& ownerLease,
-        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+        MotionAxisCommandSequence* outSequence = nullptr, bool* outIngressBusy = nullptr) noexcept;
 
     bool SubmitApplyMachineHome(
         int axisIndex,
         double capturedReferencePulse,
         double homeOffsetUnit,
         const MotionOwnerLease& ownerLease,
-        MotionAxisCommandSequence& outSequence) noexcept;
+        MotionAxisCommandSequence& outSequence, bool* outIngressBusy = nullptr,
+        std::uint64_t homeCaptureToken = 0ULL) noexcept;
 
     bool SubmitDriveTouchProbeFunction(
         int axisIndex,
         std::uint16_t value,
         const MotionOwnerLease& ownerLease,
-        MotionAxisCommandSequence* outSequence = nullptr) noexcept;
+        MotionAxisCommandSequence* outSequence = nullptr, bool* outIngressBusy = nullptr) noexcept;
 
     // Single consumer: NCPLC 10 ms task.
     void ProcessAxisCommandResults() noexcept;
@@ -2407,6 +2711,7 @@ public:
     // taking the SAFETY owner in the NC/HMI thread.  The 250 us runtime
     // consumes this mailbox and creates the exact ticket/epoch together,
     // preventing a one-frame zero-PDO seam before controlled deceleration.
+    bool RequiresPbcXRetainRecoveryReset() const noexcept;
     void RequestResetControlledStop() noexcept;
     ResetControlledStopPhase GetResetControlledStopPhase() const noexcept;
     bool ConsumeCompletedResetControlledStop() noexcept;
@@ -2960,6 +3265,60 @@ public:
 
 
 private:
+    // EDM48 has its own NC producer / RT consumer channel. Its applied values
+    // are shadow observations, never axis, planner or PDO output storage.
+    EDM48::Channel m_edmRTShadow{};
+    EDM55RT::Session m_edmGapServoRT{};
+    void ObserveEDMGapServoRTRuntimeCycle(const EDM48::Facts& facts) noexcept;
+    void ObserveEDMRTShadowRuntimeCycle(std::uint64_t tick,
+        bool pdoCycleValid, bool contiguous) noexcept;
+
+    // EDM28 owns a separate bounded channel; the generic axis mailbox and all
+    // installed axis/PID/COND parameters remain untouched.
+    struct EDMZQueuedRequest
+    {
+        EDM28::Request request{};
+        std::uint64_t stopTicket = 0ULL;
+    };
+    FixedCapacitySpscRing<EDMZQueuedRequest, 8U> m_edmZRequests{};
+    EDM28::RTPolicy m_edmZPolicy{};
+    EDM28::Observation m_edmZObservation{};
+    EDM52::CancelFence m_edmZCancelFence{};
+    std::uint64_t m_edmZObservedStopTicket = 0ULL;
+    std::uint64_t m_edmZHeartbeatDeadlineUs = 0ULL;
+    std::uint64_t m_edmZSourceTick = 0ULL;
+    std::uint64_t m_edmZReviewedCycleTick = 0ULL;
+    std::uint64_t m_edmZLastActualTick = 0ULL;
+    std::uint64_t m_edmZLastActualUs = 0ULL;
+    double m_edmZLastActualPulse = 0.0;
+    double m_edmZActualVelocityPps = 0.0;
+    EDM54::FrameIdentity<64U> m_edmZConfigIdentity{};
+    EDM54::FrameIdentity<64U> m_edmZMapIdentity{};
+    std::uint64_t m_edmZClockFrequency = 0ULL;
+    std::uint64_t m_edmZClockCounter = 0ULL;
+    std::uint64_t m_edmZMonotonicUs = 0ULL;
+    bool m_edmZClockValid = false;
+    bool m_edmZInputSemantic = false;
+    bool m_edmZFrameIntegrityStopLatched = false;
+    EDM53::Channel<EDM28::Feedback> m_edmZFeedback{};
+    void ObserveEDMZFixtureRuntimeClock(std::uint64_t tick, bool valid, bool contiguous) noexcept;
+    EDM28::Observation BuildEDMZFixtureObservation(const AxisContext& axis,
+        const MotionServoInputSnapshot* input, bool sourceFresh) noexcept;
+    void ProcessEDMZFixtureAxis(AxisContext& axis, const MotionServoInputSnapshot& input) noexcept;
+    void FinishEDMZFixtureMotionPass() noexcept;
+    void ApplyEDMZFixtureDecision(const EDM28::Decision& decision) noexcept;
+    void PublishEDMZFixtureFeedback() noexcept;
+    void StopEDMZFixtureFromRuntime() noexcept;
+    void LatchEDMZFixtureFrameIntegrityFailure() noexcept;
+    double GuardEDMZFixtureVelocity(int axisIndex, double value) noexcept;
+    bool GuardEDMZFixtureOutputImage() noexcept;
+    bool ValidateEDMZFixtureSendClock() noexcept;
+    bool SealEDMZFixtureSerializedImage(ServoOutputFrameReservation& reservation,
+        const std::uint8_t* ioMapBase, std::size_t ioMapSize,
+        const std::uint8_t* payload, std::size_t payloadSize) noexcept;
+    static_assert(sizeof(EDM28::Feedback) <= 2048U &&
+        std::is_trivially_copyable<EDM28::Feedback>::value,
+        "EDM28 coherent feedback must remain fixed, bounded value storage.");
     // ========================================================================
     // Stage NC-0.2J.4 - Atomic Stop / Settle Evidence Publication
     //
@@ -3279,7 +3638,7 @@ private:
     bool HasNCResetActiveCompensation() const noexcept;
     MotionNCSettleBlocker ValidateNCResetCommitSeam() const noexcept;
     void BlockNCResetCommit(MotionNCSettleBlocker blocker) noexcept;
-    void ApplyNCResetScalarRebase() noexcept;
+    bool ApplyNCResetScalarRebase() noexcept;
     bool ClearNCResetBuffersWithBudget() noexcept;
     bool VerifyNCResetRebaseState() const noexcept;
     bool TryPublishNCResetSafetyReleaseAuthorization() noexcept;
@@ -3407,7 +3766,7 @@ private:
     MotionAxisCommandSequence AllocateAxisCommandSequence() noexcept;
     bool SubmitAxisCommand(
         MotionAxisCommand command,
-        MotionAxisCommandSequence* outSequence) noexcept;
+        MotionAxisCommandSequence* outSequence, bool* outIngressBusy = nullptr) noexcept;
     void ApplyPendingSafetyAndRecoveryRequests() noexcept;
     void ApplyPendingResetControlledStopRequest() noexcept;
     bool HasResetControlledStopPriorityWinner() const noexcept;
@@ -3627,7 +3986,11 @@ private:
         bool pathCoreRotaryFeedExactStop = false,
         const NCRotaryFeedLineValue* rotaryGeometry = nullptr,
         bool pathCoreZCFeedExactStop = false,
-        const NCZCFeedLineValue* zcGeometry = nullptr) noexcept;
+        const NCZCFeedLineValue* zcGeometry = nullptr,
+        bool pathCoreXYZCFeedExactStop = false,
+        const NCXYZCFeedLineValue* xyzcGeometry = nullptr,
+        bool pathCoreXYZCUVFeedExactStop = false,
+        const NCXYZCUVFeedLineValue* xyzcuvGeometry = nullptr) noexcept;
     bool TryG00MoveInternal(
         const std::vector<int>& axes,
         const std::vector<double>& targetPos,
@@ -3713,6 +4076,43 @@ private:
         const MotionOwnerLease& exactOwnerLease) noexcept;
     bool IsCommandFromCurrentEpoch(const MotionCommand& command) const noexcept;
     bool IsCommandOwnerLeaseCurrent(const MotionCommand& command) const noexcept;
+    // BASE79F: private RT-owned curve storage is allocated outside the group.
+    std::unique_ptr<MotionEccentricCConsumerState> m_eccentricCConsumer;
+    void ClearEccentricCConsumer() noexcept;
+    bool LoadEccentricCCommand(const MotionCommand& command) noexcept;
+    bool IsEccentricCCommandLiveValid(const MotionCommand& command,
+        const NCEccentricCRuntimeValue& runtime, bool requireStart) const noexcept;
+    MotionEccentricCContext GetEccentricCContext() const noexcept;
+    bool StepEccentricCProfile(AxisCommand& command, NCEccentricCProfilePoint& point) noexcept;
+    bool BindEccentricCStop(const MotionEccentricCContext& context) noexcept;
+    bool RetireEccentricCCommand() noexcept;
+
+    // BASE79F: private RT sample reservation, never an NC admission token.
+    struct EccentricCCommitReservation
+    {
+        AlarmManager::MotionAdmissionReservation alarmAdmission{};
+        std::uint64_t baseOwnerState = 0ULL;
+        std::uint64_t reservedOwnerState = 0ULL;
+        std::uint64_t baseExecutionPublication = 0ULL;
+        std::uint64_t reservedExecutionPublication = 0ULL;
+        std::uint64_t safetyIntentState = 0ULL;
+        std::uint64_t revocationGeneration = 0ULL;
+        MotionExecutionIdentity sourceExecution{};
+        MotionOwnerLease sourceOwner{};
+        bool ownerAcquired = false;
+        bool epochAcquired = false;
+        bool acquired = false;
+        bool releaseFailed = false;
+    };
+    bool TryAcquireEccentricCCommitReservation(const MotionEccentricCContext& context,
+        EccentricCCommitReservation& reservation) noexcept;
+    bool IsEccentricCCommitReservationCurrent(const MotionEccentricCContext& context,
+        const EccentricCCommitReservation& reservation) const noexcept;
+    bool ReleaseEccentricCCommitReservation(EccentricCCommitReservation& reservation) noexcept;
+
+    // BASE79D: RT-owned preflight only; does not grant admission or write outputs.
+    bool IsEccentricCStartBindingCurrent(const MotionCommand& command,
+        const NCEccentricCRuntimeValue& runtime) const noexcept;
     MotionRejectReason GetCommandAuthorizationFailure(
         const MotionCommand& command) const noexcept;
 
@@ -3766,7 +4166,8 @@ private:
     bool HasUnacknowledgedSafetyMotionRequest() const noexcept;
     void TryAcknowledgeAppliedSafetyMotionRequests() noexcept;
     bool IsSafetyControlledStopAuthorized(
-        int contextAxisSlot) const noexcept;
+        int contextAxisSlot,
+        const ServoOutputFrameReservation* sendReservation = nullptr) const noexcept;
     void BeginExecutionDrainAcknowledgementRevocation() noexcept;
     bool BeginResetSafetyProvenanceOperation(
         std::uint64_t expectedProvenanceGeneration,
@@ -3868,7 +4269,8 @@ private:
     // pulse-tail tag must still match; RESET/restart/other motions revoke it.
     MotionCncPathTail m_rotaryFeedProducerTail{};
     // BASE70 private native-basis proof, never queued geometry authority.
-    // axisMask records proved Z/C native bits: 12 after ZC, 8 or 12 after C.
+    // axisMask records only independently proved native XYZ/C bases; shared
+    // pulse tail and owner/epoch bind every retained bit. No queue permission.
     MotionCncPathTail m_zcFeedProducerTail{};
     NCTranslationSnapshot m_pendingTranslation{}; // NC producer only.
     MotionNCTranslationPublication m_translationPublication{};
@@ -4000,6 +4402,14 @@ private:
         ServoOutputImageProofMode mode =
             ServoOutputImageProofMode::INVALID;
         std::array<std::int32_t, MAX_AXES> targetVelocity{};
+        std::uint64_t sourceRuntimeTick = 0ULL;
+        std::uint32_t diagnosticAxisMask = 0U;
+        std::uint32_t sourceInputMask = 0U;
+        std::uint32_t reverseMask = 0U;
+        std::array<std::uint16_t, MAX_AXES> sourceStatusWord{};
+        std::array<std::int8_t, MAX_AXES> sourceMode{};
+        MotionPbcXSource pbcXSource{};
+        PbcHomeProbeCommand homeProbe{};
     };
 
     // These fields are single-writer/single-reader on the same Priority-64
@@ -4007,6 +4417,109 @@ private:
     // frame round trip, and EtherCAT captures it at the following send point.
     ServoOutputImageProof m_servoOutputImageProof{};
     std::uint64_t m_servoOutputImageProofGeneration = 0ULL;
+    MotionServoHandoffMonitor m_servoHandoffMonitor{};
+    // PBC-3D: one atomic ingress state closes both command producer channels
+    // during an actual coordinate commit. No RT spinning or heap work.
+    MotionPbcIngressGate m_pbcReferenceIngress{};
+    MotionPbcReferenceAudit m_pbcReferenceAudit{};
+    std::uint64_t m_pbcXFeedbackTick = 0ULL;
+    std::uint64_t m_pbcResetPreproofTick = 0ULL;
+    MotionNCSettleRequestSequence m_pbcResetPreproofRequest = 0ULL;
+    MotionExecutionEpoch m_pbcResetPreproofEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    MotionOwnerGeneration m_pbcResetPreproofOwner = MOTION_OWNER_GENERATION_INVALID;
+    std::atomic<bool> m_pbcXRetainRecoveryRequired{ false };
+    std::uint64_t m_pbcXRetainLossSequence = 0ULL;
+    std::uint64_t m_pbcXRetainCommittedLossSequence = 0ULL;
+    std::uint64_t m_pbcXRetainRecoveryTicket = 0ULL;
+    pbc::CoordinateFrame m_pbcXRetainFrame{};
+    CompensationEngine::XRetainRecoveryKind m_pbcXRetainRecoveryKind =
+        CompensationEngine::XRetainRecoveryKind::None;
+    std::uint64_t m_pbcXRetainOriginReference = 0ULL;
+    std::uint64_t m_pbcXRetainAppliedReference = 0ULL;
+    MotionNCSettleRequestSequence m_pbcXRetainResetRequest = 0ULL;
+    bool LatchPbcXRetainRecovery(AxisContext& axis,
+        CompensationEngine::XRetainRecoveryKind kind) noexcept;
+    bool HoldPbcXRetainRecoveryOutput(AxisContext& axis, ServoOutput* output) noexcept;
+    bool IsPbcXRetainRecoveryPreproofEligible(const AxisContext& axis) const noexcept;
+    void CompletePbcXRetainRecoveryAfterReset() noexcept;
+    bool IsPbcXFeedbackCurrent(const AxisContext& axis) const noexcept;
+    // PBC-3I: one RT writer; supervisory readers use a bounded atomic snapshot.
+    MotionPbcHomeCaptureProof m_pbcXHomeCaptureProof{};
+    PbcHomeProbeCommand m_pbcXHomeProbeCommand{};
+    ServoOutputFrameReservation m_pbcXHomeProbeCanonicalSend{};
+    bool m_pbcXHomeProbeSendPending = false;
+    bool m_pbcXHomeCaptureSemanticSource = false;
+    static constexpr std::size_t PBC_HOME_CAPTURE_WORDS =
+        (sizeof(MotionPbcHomeCaptureSnapshot) + sizeof(std::uint64_t) - 1U) / sizeof(std::uint64_t);
+    std::array<std::atomic<std::uint64_t>, PBC_HOME_CAPTURE_WORDS> m_pbcXHomeCaptureWords{};
+    std::atomic<std::uint64_t> m_pbcXHomeCapturePublication{ 0ULL };
+    std::atomic<bool> m_pbcXHomeCaptureSupported{ false };
+    bool IsPbcXHomeCaptureConfiguration(const AxisContext& axis) const noexcept;
+    bool BuildPbcXHomeCaptureKey(const AxisContext& axis, MotionPbcHomeCaptureKey& key,
+        const ServoOutputFrameReservation* send = nullptr) const noexcept;
+    void ObservePbcXHomeCapture(const AxisContext& axis,
+        const MotionServoInputSnapshot& input, bool semanticSource) noexcept;
+    void PublishPbcXHomeCaptureSnapshot() noexcept;
+    void InvalidatePbcXHomeCapture() noexcept;
+    // PBC-3J: only sealed physical-X exact zero calibration joins OFF identity.
+    bool IsPbcCoordinateIdentity(const AxisContext& axis) const noexcept;
+    bool IsPbcXHomeRawIdentity(const AxisContext& axis) const noexcept;
+    bool IsPbcControlScope(const AxisContext& axis) const noexcept;
+    void PublishPbcXZeroOnlyHomeIdentity() noexcept;
+    std::atomic<bool> m_pbcXZeroOnlyHomeIdentity{ false };
+    std::atomic<bool> m_pbcXStagedHomeEntryIdentity{ false };
+    std::atomic<bool> m_pbcXConfiguredDisabledHomeIdentity{ false };
+    MotionPbcHomeStopProof m_pbcXHomeStopProof{};
+    bool m_pbcXHomeStopSemanticSource = false;
+    bool BuildPbcXHomeStopKey(const AxisContext& axis,
+        MotionPbcHomeStopKey& key) const noexcept;
+    void ObservePbcXHomeStop(const AxisContext& axis,
+        const MotionServoInputSnapshot& input, bool semanticSource) noexcept;
+    bool IsPbcXHomeStopped(const AxisContext& axis) const noexcept;
+    bool HasPbcXUnresolvedActiveOutput() const noexcept;
+    bool IsMechanicalCompensationReadyForStop(const AxisContext& axis) const noexcept;
+    bool ArePhysicalGroupAxesReadyForTerminal() const noexcept;
+    std::array<double, MAX_AXES> m_pbcResetNominalReferencePulse{};
+    std::uint64_t m_pbcResetReferenceGeneration = 0ULL;
+    double m_pbcResetRetainedOffsetPulse = 0.0;
+    bool m_pbcLastSnapAccepted = true;
+    std::uint64_t m_pbcLastSnapTick = 0ULL;
+    MotionPbcReferenceAction m_pbcLastSnapAction = MotionPbcReferenceAction::Reset;
+    bool TryPbcNominalSnap(AxisContext& axis, double& nominal,
+        MotionPbcReferenceAction action) noexcept;
+    void PublishPbcReference(const AxisContext& axis,
+        const CompensationEngine::XReferenceTransaction& tx,
+        MotionPbcReferenceResult result, pbc::Error error) noexcept;
+    struct PbcHomeReservation
+    {
+        AlarmManager::MotionAdmissionReservation alarm{};
+        std::uint64_t owner = 0ULL, epoch = 0ULL, safety = 0ULL, drain = 0ULL;
+        bool ingress = false, ownerHeld = false, epochHeld = false;
+    };
+    bool AcquirePbcHomeReservation(const MotionOwnerLease& lease,
+        PbcHomeReservation& reservation) noexcept;
+    bool IsPbcHomeReservationCurrent(const PbcHomeReservation& reservation) const noexcept;
+    void ReleasePbcHomeReservation(PbcHomeReservation& reservation) noexcept;
+    MotionPbcXSource m_pbcXSource{};
+    pbc::SendContract m_pbcXSendContract{};
+    MotionPbcXSendAudit m_pbcXSendAudit{};
+    void CapturePbcXCommand(const AxisContext& axis, const AxisCommand& cmd) noexcept;
+    static pbc::SendIdentity PbcXSendIdentity(const ServoOutputImageProof& proof) noexcept;
+    bool SealPbcXSend(ServoOutputFrameReservation& reservation, bool authorityCurrent) noexcept;
+    CompensationEngine::XCycleTransaction m_pbcXCycle{};
+    std::uint64_t m_pbcXCycleSendSequence = 0ULL;
+    std::uint64_t m_pbcXSendTicket = 0ULL, m_pbcXSendSequence = 0ULL;
+    pbc::SendIdentity m_pbcXCanonicalSendIdentity{};
+    bool PreparePbcXControl(const AxisContext& axis, const AxisCommand& command,
+        pbc::ControlFrame& control) noexcept;
+    void ReceiptPbcXControl(const AxisContext& axis, const AxisCommand& command,
+        std::int32_t outputVelocity) noexcept;
+    void DiscardPbcXUnsentCycle() noexcept;
+    std::uint64_t m_servoHandoffSequence = 0ULL;
+    std::uint32_t m_servoSourceInputMask = 0U;
+    std::array<std::uint16_t, MAX_AXES> m_servoSourceStatusWord{};
+    std::array<std::int8_t, MAX_AXES> m_servoSourceMode{};
+    void CaptureServoHandoffImage(ServoOutputFrameReservation& reservation) const noexcept;
 
     // NC writes only the atomic grant; the 250 us owner owns all hold state.
     std::atomic<std::uint64_t> m_programEndIdleHoldGrant{ 0ULL };
@@ -4227,6 +4740,16 @@ public:
         double feedMMMin,
         double(&commandedMCSTail)[MAX_AXES],
         MotionFeedLineWorkspace& workspace);
+    // BASE79K: bounded C-only or Z+C G90/G91 with generated XY; F is raw NC F.
+    bool TryG01EccentricCMoveTransactionalTail(double programmedC, double programmedFeed,
+        double(&commandedMCSTail)[MAX_AXES], MotionEccentricCProducerWorkspace& workspace,
+        MotionFeedLineReceipt& result, double programmedZ = 0.0, bool hasProgrammedZ = false);
+    // BASE79L: sparse authored G91 XYZ+C; F measures the authored XYZ line.
+    // XY-absent masks retain the existing G90/G91 C-only and Z+C contracts.
+    bool TryG01EccentricXYZCMoveTransactionalTail(double programmedC, double programmedFeed,
+        double(&commandedMCSTail)[MAX_AXES], MotionEccentricCProducerWorkspace& workspace,
+        MotionFeedLineReceipt& result, const std::array<double, 3>& programmedXYZ,
+        std::uint32_t linearMask);
     // BASE69: G90 absolute or G91 signed degrees; resolve the native path once.
     bool TryG01RotaryMoveTransactionalTail(int axisIndex, double programmedValue,
         double targetMCS, double feedDegMin, double(&commandedMCSTail)[MAX_AXES],
@@ -4234,6 +4757,16 @@ public:
     // BASE71: explicit G90/G91 Z/C, F measures Z millimetres/minute; one common clock.
     bool TryG01ZCMoveTransactionalTail(double programmedZ, double programmedC,
         double targetZMCS, double targetCMCS, double feedMMMin,
+        double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace);
+    // BASE72: G91 XYZ path mm/min plus C degrees under one common time.
+    // BASE75 first array: raw WCS in G90, signed native increments in G91.
+    bool TryG01XYZCMoveTransactionalTail(const std::array<double, 4U>& programmedValues,
+        const std::array<double, 4U>& targetMCS, double feedMMMin,
+        double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace);
+    // BASE74: G90 absolute targets or G91 XYZ path increments plus C/U/V degrees.
+    // First array is raw programmed WCS in G90; second is requested MCS.
+    bool TryG01XYZCUVMoveTransactionalTail(const std::array<double, 6U>& programmedDelta,
+        const std::array<double, 6U>& targetMCS, double feedMMMin,
         double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace);
     // DD: a non-null predecessor selects BUFFERED/EXACT_STOP, same tuple/mapping.
     bool TryG01MoveTransactionalTail(

@@ -506,6 +506,9 @@ void NCLifecycleInterruptionBoundaryShadow::Begin(
     }
 
     m_baseline = sample;
+    m_idleAlarmStopClosureEligible = false;
+    m_idleAlarmStopClosureRejected = false;
+    m_idleAlarmSafetyGeneration = MOTION_OWNER_GENERATION_INVALID;
     m_alarmAbortCandidateCount = 0ULL;
     m_alarmOwnerConflictRejectCandidateCount = 0ULL;
     m_alarmStaleEpochRejectCandidateCount = 0ULL;
@@ -679,6 +682,47 @@ void NCLifecycleInterruptionBoundaryShadow::RecordAlarmStopAcknowledged(
     m_snapshot.decision =
         NCLifecycleInterruptionDecision::EPOCH_PUBLICATION_OBSERVED;
 }
+
+bool NCLifecycleInterruptionBoundaryShadow::RecordIdleAlarmStopAcknowledged(
+    std::uint64_t lifecycleSequence,
+    MotionExecutionEpoch requestEpoch,
+    MotionExecutionEpoch appliedEpoch,
+    MotionOwnerGeneration safetyGeneration) noexcept
+{
+    MotionExecutionEpoch successor = requestEpoch + 1U;
+    if (successor == MOTION_EXECUTION_EPOCH_INVALID) successor = 1U;
+    if (!MatchesIdleAlarmRequestForSafetyTakeover(
+            lifecycleSequence, requestEpoch, safetyGeneration) ||
+        appliedEpoch != successor || !m_snapshot.alarmStopAcknowledged ||
+        !m_snapshot.runtimeAlarmEpochChangeObserved ||
+        !m_snapshot.epochPublicationObserved ||
+        m_snapshot.publishedExecutionEpoch != appliedEpoch)
+    {
+        return false;
+    }
+    // An exact idle EDM import was attempted for this boundary. Its no-work
+    // preconditions are mandatory: a later generic transport drain cannot
+    // turn a rejected idle receipt into a successful stop closure.
+    m_idleAlarmStopClosureRejected = true;
+    if (m_snapshot.unexpectedEpochChangeObserved ||
+        m_snapshot.postInterruptionDispatchObserved ||
+        m_snapshot.terminalFailureObserved || m_snapshot.evidenceGap ||
+        m_snapshot.superseded || m_baseline.activeBlocks != 0U ||
+        m_baseline.axisCommandDepth != 0U || m_baseline.axisResultDepth != 0U ||
+        m_baseline.commandQueueDepth != 0U || m_baseline.commandIngressDepth != 0U ||
+        m_baseline.commandReplayDepth != 0U || m_baseline.feedbackDepth != 0U ||
+        m_baseline.feedbackNoticeDepth != 0U ||
+        m_baseline.lastPublishedFeedbackSequence != m_baseline.lastConsumedFeedbackSequence)
+    {
+        return false;
+    }
+    m_idleAlarmStopClosureRejected = false;
+    if (m_idleAlarmStopClosureEligible) return false;
+    m_idleAlarmStopClosureEligible = true;
+    m_idleAlarmSafetyGeneration = safetyGeneration;
+    return true;
+}
+
 
 void NCLifecycleInterruptionBoundaryShadow::RecordTerminalFeedback(
     const MotionFeedbackEvent& event,
@@ -1112,6 +1156,46 @@ void NCLifecycleInterruptionBoundaryShadow::Observe(
         return;
     }
 
+
+    // A rejected idle EDM no-work receipt remains rejected after queues drain.
+    // NC_PROGRAM and active-execution Alarm paths never set this private gate.
+    if (m_snapshot.cause == NCLifecycleInterruptionCause::ALARM &&
+        m_idleAlarmStopClosureRejected)
+    {
+        SetWaitDecision(
+            NCLifecycleInterruptionDecision::WAIT_ALARM_STOP_TERMINAL);
+        return;
+    }
+
+    // EDM33: exact idle EDM stop closure requires the same current SAFETY
+    // receipt and no terminal or raw failure. It retains the existing ALARM
+    // stop-closure contract below, never physical quiescence or Reset release.
+    if (m_snapshot.cause == NCLifecycleInterruptionCause::ALARM &&
+        m_idleAlarmStopClosureEligible)
+    {
+        if (sample.ownerLease.owner != MotionOwner::SAFETY ||
+            sample.ownerLease.generation != m_idleAlarmSafetyGeneration)
+        {
+            SetWaitDecision(
+                NCLifecycleInterruptionDecision::WAIT_ALARM_STOP_ACKNOWLEDGEMENT);
+            return;
+        }
+        if (m_snapshot.terminalFailureObserved ||
+            !m_snapshot.terminalFeedbackLedgerAccepted ||
+            !m_snapshot.alarmTerminalClassificationValid ||
+            m_snapshot.postInterruptionDispatchObserved ||
+            m_snapshot.unexpectedEpochChangeObserved ||
+            m_snapshot.blockFailureDelta != 0ULL ||
+            m_snapshot.feedbackRejectedDelta != 0ULL ||
+            m_snapshot.feedbackAbortedDelta != 0ULL ||
+            m_snapshot.feedbackCancelledDelta != 0ULL ||
+            m_snapshot.feedbackFaultedDelta != 0ULL)
+        {
+            SetWaitDecision(
+                NCLifecycleInterruptionDecision::WAIT_ALARM_STOP_TERMINAL);
+            return;
+        }
+    }
 
     // J.6.3.1 closes the program lifecycle side of an acknowledged Alarm stop
     // once Ledger/transport evidence is drained and every raw failure is either

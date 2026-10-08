@@ -629,7 +629,7 @@ void NCManager::CommitPathCoreArcCaptureSameThread(NCBlockDispatchId dispatchId,
     }
     m_pathArc.commit = commit.sequence;
     m_pathArc.bound = true;
-    RtPrintf("[CNC-TRANSLATION-PATH] phase=BOUND kind=ARC translationGen=%llu wcs=%d dispatch=%llu epoch=%llu seg=%llu sourcePC=%d\n",
+    if (!IsEDMDiagnosticQuietSameThread()) RtPrintf("[CNC-TRANSLATION-PATH] phase=BOUND kind=ARC translationGen=%llu wcs=%d dispatch=%llu epoch=%llu seg=%llu sourcePC=%d\n",
         static_cast<unsigned long long>(r.translationGeneration), CoordSys.GetTranslationSnapshot().wcsCode,
         static_cast<unsigned long long>(dispatchId), static_cast<unsigned long long>(r.identity.epoch),
         static_cast<unsigned long long>(r.identity.segmentId), sourcePC);
@@ -737,6 +737,9 @@ void NCManager::FinalizePathCoreArcSameThread() noexcept
 NC_PATH_ARC_NOINLINE
 void NCManager::LogPathCoreArcSameThread(const char* phase) const noexcept
 {
+    if (IsEDMDiagnosticQuietSameThread() && phase != nullptr &&
+        (std::strcmp(phase, "SUBMITTED") == 0 || std::strcmp(phase, "BOUND") == 0 ||
+            std::strcmp(phase, "COMPLETED") == 0 || std::strcmp(phase, "FINALIZED") == 0)) return;
     const PathArcState& s = m_pathArc;
     const MotionFeedArcReceipt& r = m_pathArcMotion.receipt;
     RtPrintf("[PCORE-BY] run=%llu dispatch=%llu phase=%s code=%u pc=%d line=%d commit=%llu pending=%u bound=%u\n",
@@ -758,6 +761,7 @@ void NCManager::LogPathCoreArcSameThread(const char* phase) const noexcept
 NC_PATH_ARC_NOINLINE
 void NCManager::LogPathCoreArcGeometrySameThread() const noexcept
 {
+    if (IsEDMDiagnosticQuietSameThread()) return;
     const NCPathCoreFeedArcV2& g = m_pathArcMotion.receipt.arc;
     NCArcPlaneAxes plane{};
     if (!TryGetNCArcPlaneAxes(g.plane, plane)) return;

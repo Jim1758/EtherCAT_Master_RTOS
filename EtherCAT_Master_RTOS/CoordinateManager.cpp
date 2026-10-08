@@ -1,6 +1,7 @@
 ﻿#include <windows.h>
 #include "CoordinateManager.h"
 #include "CoordinateFileSave.h"
+#include "NCEccentricCPath.h" // BASE79G frozen signed-H inverse; no endpoint-motion permission.
 #include <atomic>
 #include "NCManager.h"
 #include <fstream>
@@ -16,6 +17,39 @@
 
 namespace
 {
+// BASE79G only opens the fixed native C-role frame. G90 may describe setup;
+// the NC producer separately requires explicit G91 C-only motion.
+bool IsCoordinateEccentricSnapshotAllowed(const NCTranslationSnapshot& source) noexcept
+{
+    if (source.axisIdentity.eccentricEnabled == 0U || source.toolLengthMode == 49)
+        return true;
+    unsigned role = 8U;
+    return NCEccentricCDetail::Scope(source) && NCEccentricCDetail::Role(source, role) &&
+        role == 3U && source.axisIdentity.address[0] == 'X' &&
+        source.axisIdentity.address[1] == 'Y' && source.axisIdentity.address[2] == 'Z' &&
+        source.axisIdentity.address[3] == 'C';
+}
+
+bool TryCoordinateEccentricInverse(const NCTranslationSnapshot& source,
+    const double* physicalMCS, double physicalAngleDeg, double* outputWCS) noexcept
+{
+    if (!physicalMCS || !outputWCS || !IsCoordinateEccentricSnapshotAllowed(source) ||
+        !NCEccentricCDetail::Scope(source)) return false;
+    std::array<double, 3U> signedOffset{};
+    if (!NCEccentricCDetail::Offset(source, physicalAngleDeg, signedOffset)) return false;
+    double candidate[8] = {};
+    for (unsigned axis = 0U; axis < 8U; ++axis)
+    {
+        if (!std::isfinite(physicalMCS[axis])) return false;
+        // Match the path's nominal inverse arithmetic and preserve native C.
+        const double nominal = axis < 3U ? physicalMCS[axis] - signedOffset[axis] : physicalMCS[axis];
+        candidate[axis] = nominal - (source.extOffsetMM[axis] + source.wcsOffsetMM[axis]);
+        if (!std::isfinite(candidate[axis])) return false;
+    }
+    std::memcpy(outputWCS, candidate, sizeof(candidate));
+    return true;
+}
+
 bool TryGetFixedWorkPlaneAngle(const std::vector<double>& row, int plane,
     double& angle) noexcept
 {
@@ -418,6 +452,41 @@ double CoordinateManager::GetElectrodeRotationAngleMCS(const double* nativeMCS) 
     return nativeMCS[index];
 }
 
+double CoordinateManager::GetEccentricCommandAngleMCS() const noexcept
+{
+    const unsigned role = m_translationFrozen ?
+        static_cast<unsigned>(m_frozenTranslation.axisIdentity.electrodeAxisPlusOne) :
+        static_cast<unsigned>(GetElectrodeRotationAxisIndex() + 1);
+    if (role == 0U || role > 8U) return (std::numeric_limits<double>::quiet_NaN)();
+    // Once a producer replaces any native endpoint word, its continuous
+    // authored endpoint owns the angle. Never substitute current RT position.
+    if (!m_commandedRotationAliasValid ||
+        std::memcmp(commandedMCS, m_commandedRotationAliasMCS, sizeof(commandedMCS)) != 0)
+        return commandedMCS[role - 1U];
+    NCAxisIdentitySnapshot live{};
+    if (role != 4U || m_commandedRotationAliasRun != m_translationRunToken ||
+        !TryBuildAxisIdentity(m_translationAxisSource, live) ||
+        m_electrodeRotationAxes == nullptr || m_electrodeRotationAxes->size() <= 3U)
+        return (std::numeric_limits<double>::quiet_NaN)();
+    NCAxisIdentitySnapshot captured = m_commandedRotationAliasIdentity;
+    // G162/G163 is modal; physical mapping and native units stay immutable.
+    captured.eccentricEnabled = live.eccentricEnabled;
+    if (!SameNCAxisIdentitySnapshot(captured, live))
+        return (std::numeric_limits<double>::quiet_NaN)();
+    if (m_translationFrozen)
+    {
+        captured.eccentricEnabled = m_frozenTranslation.axisIdentity.eccentricEnabled;
+        if (!SameNCAxisIdentitySnapshot(captured, m_frozenTranslation.axisIdentity))
+            return (std::numeric_limits<double>::quiet_NaN)();
+    }
+    const AxisContext& axis = (*m_electrodeRotationAxes)[3U];
+    if (!std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+        !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+        !NCEccentricCDetail::Same(axis.resolution_PPR / axis.finalLead, m_commandedRotationAliasPPU))
+        return (std::numeric_limits<double>::quiet_NaN)();
+    return m_commandedRotationAliasAngle;
+}
+
 bool CoordinateManager::IsElectrodeOffsetRotationRequested() const noexcept
 {
     if (!isCAxisOffsetRotationEnabled ||
@@ -471,6 +540,14 @@ bool CoordinateManager::BeginTranslationRun(std::uint64_t runToken, NCManager* n
     m_translationAxisSource = nc;
     m_runAxisIdentity = identity;
     m_translationRunToken = runToken;
+    if (m_commandedRotationAliasValid)
+    {
+        NCAxisIdentitySnapshot captured = m_commandedRotationAliasIdentity;
+        captured.eccentricEnabled = identity.eccentricEnabled;
+        m_commandedRotationAliasValid = SameNCAxisIdentitySnapshot(captured, identity) &&
+            std::memcmp(commandedMCS, m_commandedRotationAliasMCS, sizeof(commandedMCS)) == 0;
+        m_commandedRotationAliasRun = m_commandedRotationAliasValid ? runToken : 0ULL;
+    }
     m_translationGeneration = ++m_translationGenerationCounter;
     m_translationResetBypass = false;
     return true;
@@ -492,11 +569,40 @@ bool CoordinateManager::IsToolLengthSelectionSupported(int normalizedMode,
     int normalizedH) const noexcept
 {
     if (normalizedMode == 49) return normalizedH == 0;
-    // The bounded XYZ path requires G163 before any active H selection,
-    // even for a zero XY row. Reject here before the selector can be committed.
+    // Active G162 H is admitted only in the dedicated BASE79G source frame.
+    // This source selection never grants ordinary XYZ/rotary motion permission.
     return (normalizedMode == 43 || normalizedMode == 44) &&
-        (m_translationRunToken == 0ULL || !isCAxisOffsetRotationEnabled) &&
+        (m_translationRunToken == 0ULL || !isCAxisOffsetRotationEnabled ||
+            IsEccentricToolLengthSelectionSupported(normalizedMode, normalizedH)) &&
         IsToolOffsetRowValid(normalizedH, true);
+}
+
+bool CoordinateManager::IsEccentricToolLengthSelectionSupported(int mode, int hCode) const noexcept
+{
+    if ((mode != 43 && mode != 44) || !IsToolOffsetRowValid(hCode, true) ||
+        GlobalConfig::GetInstance().systemMode != SystemMode::EDM_SINKER_MODE ||
+        GetElectrodeRotationAxisIndex() != 3 || activePlane != 17 || isInchMode ||
+        isPolarCoordinateActive || toolRadiusMode != 40 || currentDCode != 0 ||
+        isG68Active || isWorkpieceRotationActive || currentWCode != 0 || IsScaleMirrorActive()) return false;
+    NCAxisIdentitySnapshot identity{};
+    if (!TryBuildAxisIdentity(m_translationAxisSource, identity) ||
+        !IsNCAxisIdentitySnapshotValid(identity) || identity.electrodeAxisPlusOne != 4U ||
+        identity.systemMode != 1U || identity.address[3] != 'C' ||
+        identity.exists[3] != 1U || identity.axisType[3] != 1U || identity.nativeUnit[3] != 2U)
+        return false;
+    for (unsigned axis = 0U; axis < 3U; ++axis)
+        if (identity.exists[axis] != 1U || identity.axisType[axis] != 0U ||
+            identity.nativeUnit[axis] != 1U || identity.address[axis] != "XYZ"[axis]) return false;
+    return true;
+}
+
+bool CoordinateManager::IsEccentricRotationSelectionSupported(bool enabled) const noexcept
+{
+    if (!enabled) return true;
+    if (isPolarCoordinateActive) return false;
+    // Keep the pre-existing dormant G162/G49 setup independent of role binding.
+    if (toolLengthMode == 49) return currentHCode == 0;
+    return IsEccentricToolLengthSelectionSupported(toolLengthMode, currentHCode);
 }
 
 bool CoordinateManager::IsWorkOffsetRowValid(int wCode, bool fixedPlanar) const noexcept
@@ -612,7 +718,9 @@ bool CoordinateManager::IsTranslationModeSupported() const noexcept
         if (currentHCode != 0) return false;
     }
     else if ((toolLengthMode != 43 && toolLengthMode != 44) ||
-        isCAxisOffsetRotationEnabled || !IsToolOffsetRowValid(currentHCode, true))
+        (isCAxisOffsetRotationEnabled &&
+            !IsEccentricToolLengthSelectionSupported(toolLengthMode, currentHCode)) ||
+        !IsToolOffsetRowValid(currentHCode, true))
         return false;
     if (isWorkpieceRotationActive)
     {
@@ -631,8 +739,8 @@ bool CoordinateManager::IsTranslationModeSupported() const noexcept
             return false;
     }
     else if (currentWCode != 0) return false;
-    // G162 remains dormant only without active H/WORK. Active fixed offsets
-    // require G163 so their source is independent of any C-axis position.
+    // Active G162 H is a dedicated frozen source; generic endpoint transforms
+    // remain closed and only the restricted producer may generate its XY curve.
     return m_WCSTable[currentWCSIndex].size() == 8U;
 }
 
@@ -743,7 +851,7 @@ bool CoordinateManager::PrepareArcPlaneTransition(int plane,
     next.rotationPlane = plane;
     next.generation = m_translationGenerationCounter + 1ULL;
     next.revision = m_translationRevision + 1ULL;
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -765,6 +873,42 @@ bool CoordinateManager::CommitArcPlaneTransition(
     return true;
 }
 
+bool CoordinateManager::PrepareEccentricRotationTransition(bool enabled,
+    NCTranslationSnapshot& candidate) const noexcept
+{
+    if (!m_translationFrozen || m_translationResetBypass ||
+        !IsEccentricRotationSelectionSupported(enabled) ||
+        enabled == (m_frozenTranslation.axisIdentity.eccentricEnabled == 1U) ||
+        !IsTranslationRunCurrent() || m_translationGeneration != m_translationGenerationCounter ||
+        m_translationGenerationCounter == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_translationRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    NCTranslationSnapshot next = m_frozenTranslation;
+    next.axisIdentity.eccentricEnabled = enabled ? 1U : 0U;
+    next.generation = m_translationGenerationCounter + 1ULL;
+    next.revision = m_translationRevision + 1ULL;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
+    candidate = next;
+    return true;
+}
+
+bool CoordinateManager::CommitEccentricRotationTransition(
+    const NCTranslationSnapshot& candidate) noexcept
+{
+    if (candidate.axisIdentity.eccentricEnabled > 1U) return false;
+    NCTranslationSnapshot expected{};
+    if (!PrepareEccentricRotationTransition(candidate.axisIdentity.eccentricEnabled == 1U, expected) ||
+        !SameNCTranslationSnapshot(expected, candidate)) return false;
+    // Caller published the source under the exact stopped Motion reservation.
+    // No physical endpoint, pulse tail, HOME or table value changes here.
+    m_workCenterConfirmation = WorkCenterConfirmation{};
+    m_translationGenerationCounter = candidate.generation;
+    m_translationGeneration = candidate.generation;
+    m_translationRevision = candidate.revision;
+    isCAxisOffsetRotationEnabled = candidate.axisIdentity.eccentricEnabled == 1U;
+    m_frozenTranslation = candidate;
+    return true;
+}
+
 bool CoordinateManager::PrepareDistanceModeTransition(int mode,
     NCTranslationSnapshot& candidate) const noexcept
 {
@@ -778,7 +922,7 @@ bool CoordinateManager::PrepareDistanceModeTransition(int mode,
     next.distanceMode = mode;
     next.generation = m_translationGenerationCounter + 1ULL;
     next.revision = m_translationRevision + 1ULL;
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -813,7 +957,7 @@ bool CoordinateManager::PrepareStoredStrokeTransition(int mode,
     next.storedStrokeMode = mode;
     next.generation = m_translationGenerationCounter + 1ULL;
     next.revision = m_translationRevision + 1ULL;
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -848,7 +992,7 @@ bool CoordinateManager::PrepareUnitModeTransition(int mode,
     next.unitsMode = mode;
     next.generation = m_translationGenerationCounter + 1ULL;
     next.revision = m_translationRevision + 1ULL;
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -888,7 +1032,7 @@ bool CoordinateManager::PreparePolarTransition(int code,
         next.generation = m_translationGenerationCounter + 1ULL;
         next.revision = m_translationRevision + 1ULL;
     }
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -939,7 +1083,7 @@ bool CoordinateManager::PrepareToolRadiusSelectionTransition(int mode, int dCode
         next.generation = m_translationGenerationCounter + 1ULL;
         next.revision = m_translationRevision + 1ULL;
     }
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -1033,7 +1177,7 @@ bool CoordinateManager::PrepareScaleMirrorTransition(int code, const double* val
         next.generation = m_translationGenerationCounter + 1ULL;
         next.revision = m_translationRevision + 1ULL;
     }
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -1112,7 +1256,7 @@ bool CoordinateManager::PrepareWorkCoordinateTransition(int wcsCode,
         next.wcsOffsetMM[axis] = m_WCSTable[rowIndex][axis];
     next.generation = m_translationGenerationCounter + 1ULL;
     next.revision = m_translationRevision + 1ULL;
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -1159,7 +1303,7 @@ bool CoordinateManager::PrepareToolLengthTransition(int normalizedMode,
             m_ToolOffset[normalizedH - 1][axis];
     next.generation = m_translationGenerationCounter + 1ULL;
     next.revision = m_translationRevision + 1ULL;
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -1204,7 +1348,7 @@ bool CoordinateManager::PreparePlanarRotationTransition(int mode, double centerX
     if (SameNCTranslationSnapshot(next, m_frozenTranslation)) return false;
     next.generation = m_translationGenerationCounter + 1ULL;
     next.revision = m_translationRevision + 1ULL;
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -1294,7 +1438,7 @@ bool CoordinateManager::PrepareWorkpieceTransition(int mode, int wCode,
         next.generation = m_translationGenerationCounter + 1ULL;
         next.revision = m_translationRevision + 1ULL;
     }
-    if (!IsNCTranslationSnapshotValid(next)) return false;
+    if (!IsNCTranslationSnapshotValid(next) || !IsCoordinateEccentricSnapshotAllowed(next)) return false;
     candidate = next;
     return true;
 }
@@ -1359,6 +1503,7 @@ void CoordinateManager::RetireTranslationRun() noexcept
     m_workCenterConfirmation = WorkCenterConfirmation{};
     m_translationFrozen = false;
     m_translationRunToken = 0ULL;
+    m_commandedRotationAliasRun = 0ULL;
     m_translationGeneration = 0ULL;
     m_translationResetBypass = false;
     m_frozenTranslation = NCTranslationSnapshot{};
@@ -1554,6 +1699,12 @@ bool CoordinateManager::TryDecodeWorkTableWrite(const NCBlock& block,
 bool CoordinateManager::ApplyCoordinateOrigin(int axis, double desiredWCS,
     NCManager* nc, bool reportAlarm)
 {
+    // Origin editing still owns only fixed H. Do not reinterpret a live or
+    // RESET-retained rotating source through that legacy fixed-offset formula.
+    if ((isCAxisOffsetRotationEnabled && (toolLengthMode == 43 || toolLengthMode == 44)) ||
+        (m_translationFrozen && m_frozenTranslation.axisIdentity.eccentricEnabled == 1U &&
+            m_frozenTranslation.toolLengthMode != 49))
+        return RejectCoordinateMutation("ORIGIN_WRITE", "ECCENTRIC_SOURCE", nc, reportAlarm);
     if (IsFixedPlanarRotationActive() || IsScaleMirrorActive() || isPolarCoordinateActive)
         return RejectCoordinateMutation("ORIGIN_WRITE", "ROTATION_ACTIVE", nc, reportAlarm);
     if (axis < 0 || axis >= 8 || currentWCSIndex < 0 ||
@@ -1590,6 +1741,9 @@ bool CoordinateManager::ApplyCoordinateOrigin(int axis, double desiredWCS,
 
 bool CoordinateManager::SetCAxisOffsetRotationEnabled(bool enabled, NCManager* nc)
 {
+    if (enabled && !m_translationResetBypass && IsTranslationRunBound() &&
+        !IsEccentricRotationSelectionSupported(true))
+        return RejectCoordinateMutation("G162", "ECCENTRIC_FRAME_REQUIRED", nc, true);
     if (enabled && isPolarCoordinateActive && !m_translationResetBypass)
         return RejectCoordinateMutation("G162", "POLAR_ACTIVE", nc, true);
     if (enabled && !m_translationResetBypass &&
@@ -1629,10 +1783,46 @@ bool CoordinateManager::SetWCS(int gCode, NCManager* nc, bool reportAlarm)
 }
 
 void CoordinateManager::SyncMachinePosition(const double* actualMCS) {
-    // 將 EtherCAT 真實的機械座標同步到理論座標，確保 G91 接續移動的安全
-    for (int i = 0; i < 8; i++) {
-        commandedMCS[i] = actualMCS[i];
+    // The caller owns START/RESET/HOME drain authority. Keep its exact native
+    // representation, including legacy modulo C, while recording a matching
+    // stopped LOGICAL image for the later eccentric display source.
+    m_commandedRotationAliasValid = false;
+    if (actualMCS == nullptr) return;
+    for (int i = 0; i < 8; i++) commandedMCS[i] = actualMCS[i];
+    NCAxisIdentitySnapshot identity{};
+    if (GetElectrodeRotationAxisIndex() != 3 ||
+        !TryBuildAxisIdentity(m_translationAxisSource, identity) ||
+        identity.systemMode != 1U || identity.address[3] != 'C' ||
+        identity.axisType[3] != 1U || m_electrodeRotationAxes == nullptr ||
+        m_electrodeRotationAxes->size() > 8U) return;
+    double angle = 0.0, cPPU = 0.0;
+    for (unsigned slot = 0U; slot < 8U; ++slot)
+    {
+        if (!std::isfinite(commandedMCS[slot])) return;
+        if (slot >= m_electrodeRotationAxes->size() || !(*m_electrodeRotationAxes)[slot].isExist) continue;
+        const AxisContext& axis = (*m_electrodeRotationAxes)[slot];
+        if (axis.state != MotionState::MotionState_IDLE || axis.logicalCmdVel != 0.0 ||
+            axis.currentCmdVel != 0.0 || !std::isfinite(axis.resolution_PPR) ||
+            axis.resolution_PPR <= 0.0 || !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0) return;
+        const double pulse = axis.logicalCmdPos.Load();
+        const double native = pulse * axis.finalLead / axis.resolution_PPR;
+        double represented = native;
+        if (axis.axisType == AxisType::ROTARY && std::isfinite(axis.rotaryModulo) && axis.rotaryModulo > 0.0)
+        {
+            represented = std::fmod(native, axis.rotaryModulo);
+            if (represented < 0.0) represented += axis.rotaryModulo;
+        }
+        if (!std::isfinite(native) ||
+            (commandedMCS[slot] != native && commandedMCS[slot] != represented)) return;
+        if (slot == 3U) { angle = native; cPPU = axis.resolution_PPR / axis.finalLead; }
     }
+    if (!std::isfinite(cPPU) || cPPU <= 0.0 || !std::isfinite(angle)) return;
+    std::memcpy(m_commandedRotationAliasMCS, commandedMCS, sizeof(commandedMCS));
+    m_commandedRotationAliasAngle = angle;
+    m_commandedRotationAliasPPU = cPPU;
+    m_commandedRotationAliasIdentity = identity;
+    m_commandedRotationAliasRun = m_translationRunToken;
+    m_commandedRotationAliasValid = true;
 }
 
 void CoordinateManager::Transform_WCS_to_MCS(
@@ -1698,9 +1888,9 @@ void CoordinateManager::Transform_WCS_to_MCS_Internal(
     double* outputMCS,
     bool commitCommandedMCS)
 {
-    // Role binding establishes angle identity, not a compensated trajectory.
-    // Until the continuous generated-XY path/envelope is implemented, reject
-    // active eccentric forward requests atomically (including C-only and ZC).
+    // Role binding is not permission for an endpoint-only transform. BASE79G
+    // generates the complete curve in its dedicated producer; generic forward
+    // requests remain closed atomically (including C-only and ZC).
     if (IsElectrodeOffsetRotationRequested())
     {
         for (unsigned axis = 0U; axis < 8U; ++axis)
@@ -2082,7 +2272,18 @@ void CoordinateManager::GetActualWCS(double* outWCS) const {
                 outWCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
             return;
         }
-        NCTranslationInversePoint(source, actualMCS, outWCS);
+        if (m_translationFrozen && source.axisIdentity.eccentricEnabled == 1U &&
+            source.toolLengthMode != 49)
+        {
+            // actualMCS may wrap at a configured modulo other than 360 degrees.
+            // Frozen role and unwrapped physical angle own the signed-H inverse.
+            const unsigned role = source.axisIdentity.electrodeAxisPlusOne;
+            if (role == 0U || role > 8U || !TryCoordinateEccentricInverse(source,
+                actualMCS, actualUnwrappedMCS[role - 1U], outWCS))
+                for (unsigned axis = 0U; axis < 8U; ++axis)
+                    outWCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+        }
+        else NCTranslationInversePoint(source, actualMCS, outWCS);
         return;
     }
     // 1. 複製一份真實的物理機械座標
@@ -2139,7 +2340,7 @@ void CoordinateManager::GetActualWCS(double* outWCS) const {
         double wcsOffset = m_WCSTable[currentWCSIndex][i];
 
         // 🌟 傳入 EtherCAT 讀回來的真實 C 軸物理角度
-        double toolOffset = GetActiveToolOffset(i, GetElectrodeRotationAngleMCS(actualMCS));
+        double toolOffset = GetActiveToolOffset(i, GetElectrodeRotationAngleMCS(actualUnwrappedMCS));
 
         double workOffset = GetActiveWorkOffset(i);
 
@@ -2191,7 +2392,16 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
                 outWCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
             return;
         }
-        NCTranslationInversePoint(source, commandedMCS, outWCS);
+        if (m_translationFrozen && source.axisIdentity.eccentricEnabled == 1U &&
+            source.toolLengthMode != 49)
+        {
+            const unsigned role = source.axisIdentity.electrodeAxisPlusOne;
+            if (role == 0U || role > 8U || !TryCoordinateEccentricInverse(source,
+                commandedMCS, GetEccentricCommandAngleMCS(), outWCS))
+                for (unsigned axis = 0U; axis < 8U; ++axis)
+                    outWCS[axis] = (std::numeric_limits<double>::quiet_NaN)();
+        }
+        else NCTranslationInversePoint(source, commandedMCS, outWCS);
         return;
     }
     // 1. 複製一份大腦的理論命令機械座標 (Commanded MCS)
@@ -2249,7 +2459,7 @@ void CoordinateManager::GetCommandedWCS(double* outWCS) const {
         double wcsOffset = m_WCSTable[currentWCSIndex][i];
 
         // 🌟 傳入大腦記錄的理論 C 軸角度
-        double toolOffset = GetActiveToolOffset(i, GetElectrodeRotationAngleMCS(commandedMCS)); // 🌟 唯一差別：吃 commandedMCS
+        double toolOffset = GetActiveToolOffset(i, GetEccentricCommandAngleMCS()); // 🌟 唯一差別：吃 commandedMCS
 
         double workOffset = GetActiveWorkOffset(i);
 
@@ -2481,9 +2691,10 @@ void CoordinateManager::SetToolLengthCompensation(int gCode, int hCode, NCManage
         RejectCoordinateMutation("TOOL_LENGTH", "H_ROW", nc, true);
         return;
     }
-    if (m_translationRunToken != 0ULL && isCAxisOffsetRotationEnabled)
+    if (m_translationRunToken != 0ULL && isCAxisOffsetRotationEnabled &&
+        !IsEccentricToolLengthSelectionSupported(gCode, hCode))
     {
-        RejectCoordinateMutation("TOOL_LENGTH", "G163_REQUIRED_FOR_BOUND_H", nc, true);
+        RejectCoordinateMutation("TOOL_LENGTH", "ECCENTRIC_FRAME_REQUIRED", nc, true);
         return;
     }
     if (isCAxisOffsetRotationEnabled &&

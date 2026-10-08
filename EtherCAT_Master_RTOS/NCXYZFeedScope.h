@@ -114,6 +114,16 @@ inline bool IsNCXYZFeedArcBlockAllowed(const NCBlock& block, int planeCode = 17)
     return block.has(plane.uCenter) || block.has(plane.vCenter);
 }
 
+// EDM11 source grammar is narrower than ordinary native arcs. Explicit XY
+// makes the existing producer select fullCircle=false; its geometry validator
+// rejects an equal endpoint or a zero/full sweep. I/J remain relative centers.
+// The caller separately proves an active P26 session and its neutral G17 frame.
+inline bool IsNCEDMSourceArcBlockAllowed(const NCBlock& block) noexcept
+{
+    return block.has('X') && block.has('Y') && block.has('I') && block.has('J') &&
+        block.has('F') && !block.has('R') && IsNCXYZFeedArcBlockAllowed(block, 17);
+}
+
 // Distance selection only admits the standalone spelling. The existing NC
 // transition path still requires receipt/RT drain, reserves publication and
 // changes the frozen source generation before the normal modal setter runs.

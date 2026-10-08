@@ -10,6 +10,8 @@
 #include "NCPathCoreFeedArc.h" // BY fixed planar circle consumer geometry
 #include "NCTranslationArcPrecision.h"
 #include "MotionRetainedInterval.h" // CA canonical interval transport and evaluation
+#include "MotionEccentricCBinding.h" // BASE79D pre-start binding
+#include "MotionEccentricCConsumer.h" // BASE79F caller-owned heap consumer
 
 namespace
 {
@@ -788,11 +790,168 @@ namespace
             std::isfinite(command.targetVel / command.decTime);
     }
 
+    // BASE75: four explicit G90/G91 native coordinates share the XYZ linear path
+    // time. Rebuild both native and physical endpoints before runtime mutation;
+    // millimetres and rotary degrees never form the programmed feed metric.
+    bool IsMotionXYZCFeedGeometryValid(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts,
+        NCXYZCFeedLineValue* validatedGeometry = nullptr) noexcept
+    {
+        if (validatedGeometry != nullptr) validatedGeometry->Clear();
+        if (!IsMotionXYZCFeedSourceAllowed(command) || contexts == nullptr ||
+            contexts->size() < 4U || contexts->size() > 8U ||
+            command.dir != 0 || command.startRadius != 0.0 || command.endRadius != 0.0 ||
+            command.centerPos[0] != 0.0 || command.centerPos[1] != 0.0 ||
+            command.cncPrefixVelocityPPS != 0.0) return false;
+        if (!command.sourceIsAbsoluteMode && (command.mem_centerX != 0.0 || command.mem_centerY != 0.0)) return false;
+        for (unsigned slot = 4U; slot < 8U; ++slot)
+            if (command.axisIndices[slot] != 0 || command.targetPos[slot] != 0.0) return false;
+        NCXYZCFeedLineInput input{};
+        NCXYZCFeedLineValue geometry{};
+        input.axisIdentity = command.sourceTranslation.axisIdentity;
+        input.axisMask = 15U;
+        input.feedMMMin = command.mem_radius;
+        input.absolute = command.sourceIsAbsoluteMode;
+        NCXYZCAbsoluteFeedTarget resolved{};
+        if (input.absolute && !TryResolveMotionXYZCAbsoluteTarget(command, resolved)) return false;
+        for (unsigned selected = 0U; selected < 4U; ++selected)
+        {
+            const AxisContext& axis = (*contexts)[selected];
+            if (!axis.isExist || axis.axisIndex != static_cast<int>(selected) ||
+                axis.axisType != (selected < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+                !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+                !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+                command.mem_ratio[selected] != axis.resolution_PPR / axis.finalLead ||
+                (selected >= 3U && (!std::isfinite(axis.rotaryModulo) || axis.rotaryModulo <= 0.0))) return false;
+            input.startPulse[selected] = command.mem_startPos[selected];
+            input.endPulse[selected] = command.targetPos[selected];
+            input.startMCS[selected] = MotionXYZCStartMCS(command, selected);
+            if (input.absolute)
+            {
+                input.absoluteTargetMCS[selected] = MotionXYZCRequestedMCS(command, selected);
+                input.deltaNative[selected] = resolved.deltaNative[selected];
+                input.endMCS[selected] = resolved.endMCS[selected];
+                if (!NCRotaryFeedDetail::SameBits(input.endPulse[selected], resolved.endPulse[selected])) return false;
+                if (selected >= 3U)
+                {
+                    input.rotaryModulo = command.mem_centerX;
+                    input.rotaryShortestPath = command.mem_centerY == 1.0;
+                    if (!NCRotaryFeedDetail::SameBits(input.rotaryModulo, axis.rotaryModulo) ||
+                        input.rotaryShortestPath != axis.useShortestPath) return false;
+                }
+            }
+            else
+            {
+                input.deltaNative[selected] = MotionXYZCProgrammedValue(command, selected);
+                input.endMCS[selected] = input.startMCS[selected] + input.deltaNative[selected];
+            }
+            input.pulsePerUnit[selected] = command.mem_ratio[selected];
+            input.maxVelocityPPS[selected] = axis.maxVel_PPS;
+            input.axisAccTime[selected] = axis.G00_acc_time;
+            input.axisDecTime[selected] = axis.G00_dec_time;
+        }
+        (void)BuildNCXYZCFeedLine(input, geometry);
+        const bool valid = geometry.valid && command.mem_totalDist == geometry.lengthPulse &&
+            command.mem_startAngle == geometry.nominalSeconds &&
+            command.mem_totalAngle == geometry.rotaryFeedDegMin &&
+            command.targetVel == geometry.velocityPPS && command.accTime == geometry.accTime &&
+            command.decTime == geometry.decTime &&
+            std::isfinite(command.targetVel / command.accTime) &&
+            std::isfinite(command.targetVel / command.decTime);
+        if (valid && validatedGeometry != nullptr) *validatedGeometry = geometry;
+        return valid;
+    }
+
+    // BASE74: six explicit G90/G91 native coordinates share the XYZ linear path
+    // time. Rebuild both native and physical endpoints before runtime mutation;
+    // millimetres and rotary degrees never form the programmed feed metric.
+    bool IsMotionXYZCUVFeedGeometryValid(const MotionCommand& command,
+        const std::vector<AxisContext>* contexts,
+        NCXYZCUVFeedLineValue* validatedGeometry = nullptr) noexcept
+    {
+        if (validatedGeometry != nullptr) validatedGeometry->Clear();
+        if (!IsMotionXYZCUVFeedSourceAllowed(command) || contexts == nullptr ||
+            contexts->size() < 6U || contexts->size() > 8U ||
+            command.dir != 0 || command.startRadius != 0.0 || command.endRadius != 0.0 ||
+            command.centerPos[0] != 0.0 || command.centerPos[1] != 0.0 ||
+            command.cncPrefixVelocityPPS != 0.0) return false;
+        for (unsigned slot = 6U; slot < 8U; ++slot)
+            if (command.axisIndices[slot] != 0 || command.targetPos[slot] != 0.0 ||
+                (!command.sourceIsAbsoluteMode &&
+                    (command.mem_startPos[slot] != 0.0 || command.mem_ratio[slot] != 0.0))) return false;
+        NCXYZCUVFeedLineInput input{};
+        NCXYZCUVFeedLineValue geometry{};
+        input.axisIdentity = command.sourceTranslation.axisIdentity;
+        input.axisMask = 63U;
+        input.feedMMMin = command.mem_radius;
+        input.absolute = command.sourceIsAbsoluteMode;
+        NCXYZCUVAbsoluteFeedTarget resolved{};
+        if (input.absolute && !TryResolveMotionXYZCUVAbsoluteTarget(command, resolved)) return false;
+        for (unsigned selected = 0U; selected < 6U; ++selected)
+        {
+            const AxisContext& axis = (*contexts)[selected];
+            if (!axis.isExist || axis.axisIndex != static_cast<int>(selected) ||
+                axis.axisType != (selected < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+                !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR <= 0.0 ||
+                !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+                command.mem_ratio[selected] != axis.resolution_PPR / axis.finalLead ||
+                (selected >= 3U && (!std::isfinite(axis.rotaryModulo) || axis.rotaryModulo <= 0.0))) return false;
+            input.startPulse[selected] = command.mem_startPos[selected];
+            input.endPulse[selected] = command.targetPos[selected];
+            input.startMCS[selected] = MotionXYZCUVStartMCS(command, selected);
+            if (input.absolute)
+            {
+                input.absoluteTargetMCS[selected] = MotionXYZCUVRequestedMCS(command, selected);
+                input.deltaNative[selected] = resolved.deltaNative[selected];
+                input.endMCS[selected] = resolved.endMCS[selected];
+                if (!NCRotaryFeedDetail::SameBits(input.endPulse[selected], resolved.endPulse[selected])) return false;
+                if (selected >= 3U)
+                {
+                    const unsigned rotary = selected - 3U;
+                    const unsigned shortestMask = static_cast<unsigned>(command.mem_ratio[7U]); // validated above
+                    input.rotaryModulo[rotary] = MotionXYZCUVRotaryModulo(command, rotary);
+                    input.rotaryShortestPath[rotary] = (shortestMask & (1U << rotary)) != 0U;
+                    if (!NCRotaryFeedDetail::SameBits(input.rotaryModulo[rotary], axis.rotaryModulo) ||
+                        input.rotaryShortestPath[rotary] != axis.useShortestPath) return false;
+                }
+            }
+            else
+            {
+                input.deltaNative[selected] = MotionXYZCUVProgrammedValue(command, selected);
+                input.endMCS[selected] = input.startMCS[selected] + input.deltaNative[selected];
+            }
+            input.pulsePerUnit[selected] = command.mem_ratio[selected];
+            input.maxVelocityPPS[selected] = axis.maxVel_PPS;
+            input.axisAccTime[selected] = axis.G00_acc_time;
+            input.axisDecTime[selected] = axis.G00_dec_time;
+        }
+        (void)BuildNCXYZCUVFeedLine(input, geometry);
+        const bool valid = geometry.valid && command.mem_totalDist == geometry.lengthPulse &&
+            command.mem_startAngle == geometry.nominalSeconds &&
+            command.mem_totalAngle == geometry.rotaryFeedDegMin[0] &&
+            command.mem_centerX == geometry.rotaryFeedDegMin[1] &&
+            command.mem_centerY == geometry.rotaryFeedDegMin[2] &&
+            command.targetVel == geometry.velocityPPS && command.accTime == geometry.accTime &&
+            command.decTime == geometry.decTime &&
+            std::isfinite(command.targetVel / command.accTime) &&
+            std::isfinite(command.targetVel / command.decTime);
+        if (valid && validatedGeometry != nullptr) *validatedGeometry = geometry;
+        return valid;
+    }
+
     bool IsMotionCommandConsumerGeometryValid(
         const MotionCommand& command,
         const std::vector<AxisContext>* contexts) noexcept
     {
+        // BASE79F: generic probes are structural only. Full packet decode,
+        // frozen start binding and reservation belong to the dedicated loader.
+        if (command.pathCoreEccentricCFeedExactStop)
+            return contexts != nullptr && IsMotionEccentricCFeedSourceAllowed(command);
         if (!IsMotionBaseArcPlaneSourceAllowed(command)) return false;
+        if (command.pathCoreXYZCUVFeedExactStop)
+            return IsMotionXYZCUVFeedGeometryValid(command, contexts);
+        if (command.pathCoreXYZCFeedExactStop)
+            return IsMotionXYZCFeedGeometryValid(command, contexts);
         if (command.pathCoreZCFeedExactStop)
             return IsMotionZCFeedGeometryValid(command, contexts);
         if (command.pathCoreRotaryFeedExactStop)
@@ -1057,7 +1216,7 @@ namespace
         const MotionCommand& command) noexcept
     {
         const int axisCount = ClampMotionAxisCount(command.axisCount);
-        if (command.pathCoreRetainedTraversal || command.pathCoreRetainedReverse ||
+        if (command.pathCoreEccentricCFeedExactStop || command.pathCoreRetainedTraversal || command.pathCoreRetainedReverse ||
             axisCount <= 0 ||
             axisCount != command.axisCount ||
             !std::isfinite(command.mem_totalDist) ||
@@ -1653,6 +1812,791 @@ MotionCore::RequestResetNCSettleAndRebase(
 }
 
 
+// EDM48 control methods are single-NC-producer operations; only the runtime
+// observation hook invokes the channel's RT consumer.
+bool MotionCore::StartEDMRTShadow(const EDM46::Config& config,
+    const EDM46::Scope& scope, const EDM46::IntentSnapshot& initial,
+    std::uint64_t nowMs) noexcept
+{
+    return m_edmRTShadow.ControlStart(config, scope, initial, nowMs);
+}
+
+bool MotionCore::SubmitEDMRTShadow(const EDM47::Packet& packet) noexcept
+{
+    return m_edmRTShadow.ControlSubmit(packet);
+}
+
+void MotionCore::NeutralizeEDMRTShadow(std::uint64_t session,
+    std::uint64_t commandFloor) noexcept
+{
+    m_edmRTShadow.ControlNeutralize(session, commandFloor);
+}
+
+void MotionCore::CancelEDMRTShadow(std::uint64_t session) noexcept
+{
+    m_edmRTShadow.ControlCancel(session);
+}
+
+bool MotionCore::ReadEDMRTShadowFeedback(EDM48::Feedback& feedback) const noexcept
+{
+    return m_edmRTShadow.ControlRead(feedback);
+}
+
+bool MotionCore::StartEDMGapServoRT(const EDM55RT::Scope& scope,
+    EDM55RT::Profile profile, std::uint64_t nowUs) noexcept
+{
+    return m_edmGapServoRT.ControlStart(scope, profile, nowUs);
+}
+
+void MotionCore::CancelEDMGapServoRT(std::uint64_t session) noexcept
+{
+    m_edmGapServoRT.ControlCancel(session);
+}
+
+void MotionCore::RetireEDMGapServoRT(std::uint64_t session) noexcept
+{
+    m_edmGapServoRT.ControlRetire(session);
+}
+
+bool MotionCore::TouchEDMGapServoRT(std::uint64_t session, std::uint64_t nowUs) noexcept
+{
+    return m_edmGapServoRT.ControlTouch(session, nowUs);
+}
+
+bool MotionCore::ReadEDMGapServoRT(EDM55RT::Feedback& feedback) const noexcept
+{
+    return m_edmGapServoRT.ControlRead(feedback);
+}
+
+void MotionCore::ObserveEDMGapServoRTRuntimeCycle(const EDM48::Facts& observed) noexcept
+{
+    // Reuse the actual callback's clock/PDO/authority observation. No second
+    // clock read, output operation or RT diagnostic formatting is introduced.
+    EDM55RT::Facts facts{};
+    facts.tick = observed.tick; facts.nowUs = observed.nowUs;
+    facts.executionEpoch = observed.executionEpoch; facts.ownerLease = observed.ownerLease;
+    facts.clockValid = observed.clockValid; facts.pdoValid = observed.pdoValid;
+    facts.contiguous = observed.contiguous; facts.authorityReady = observed.authorityReady;
+    m_edmGapServoRT.RuntimeCycle(facts);
+}
+
+void MotionCore::ObserveEDMRTShadowRuntimeCycle(std::uint64_t tick,
+    bool pdoCycleValid, bool contiguous) noexcept
+{
+    // Reuse this cycle's EDM28 QPC observation. No clock read, blocking call,
+    // diagnostic output or physical motion operation belongs in this seam.
+    EDM48::Facts facts{};
+    facts.tick = tick;
+    facts.nowUs = m_edmZMonotonicUs;
+    facts.clockValid = m_edmZClockValid;
+    facts.pdoValid = pdoCycleValid;
+    facts.contiguous = contiguous;
+
+    // These authority inputs are published atomically by their existing
+    // owners. Stable rechecks reject a mixed observation without taking an
+    // output or alarm admission reservation for this shadow-only consumer.
+    const std::uint64_t ownerState = m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t execution = m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t safety = m_frameSafetyIntentState.load(std::memory_order_acquire);
+    const MotionOwnerLease lease = UnpackMotionOwnerState(ownerState);
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    const std::uint64_t alarmIntent = alarms.GetMotionSafetyIntentState();
+    const std::uint32_t alarmUpdate = alarms.GetUpdateCount();
+    facts.executionEpoch = static_cast<std::uint64_t>(UnpackExecutionEpochPublication(execution));
+    facts.ownerLease = (static_cast<std::uint64_t>(lease.owner) << 32U) |
+        static_cast<std::uint64_t>(lease.generation);
+    facts.authorityReady = lease.IsValid() && lease.owner == MotionOwner::AUTO &&
+        facts.executionEpoch != static_cast<std::uint64_t>(MOTION_EXECUTION_EPOCH_INVALID) &&
+        !UnpackMotionOwnerSafetyHandshake(ownerState) &&
+        !UnpackMotionOwnerSafetyActionPending(ownerState) &&
+        (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL &&
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) ==
+            m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire) &&
+        (execution & (EXECUTION_EPOCH_PUBLICATION_PENDING |
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL &&
+        static_cast<std::uint32_t>(safety) == 0U &&
+        static_cast<std::uint32_t>(AlarmManager::MotionAdmissionBaseState(alarmIntent)) == 0U &&
+        !HasPendingSafetyOrRecoveryRequests() && !alarms.HasAlarm() &&
+        m_motionOwnerState.load(std::memory_order_acquire) == ownerState &&
+        m_executionEpochPublication.load(std::memory_order_acquire) == execution &&
+        m_frameSafetyIntentState.load(std::memory_order_acquire) == safety &&
+        alarms.GetMotionSafetyIntentState() == alarmIntent &&
+        alarms.GetUpdateCount() == alarmUpdate &&
+        !HasPendingSafetyOrRecoveryRequests() && !alarms.HasAlarm();
+
+    // Always run, including invalid PDO/clock/authority cycles: the consumer
+    // must see revocation even when UpdateAllMotion is deliberately skipped.
+    m_edmRTShadow.RuntimeCycle(facts);
+    ObserveEDMGapServoRTRuntimeCycle(facts);
+}
+
+// EDM28: fixed-channel transport. Only the NC thread produces requests and
+// only the RT thread owns policy/planner state. Priority stop never queues.
+bool MotionCore::SubmitEDMZFixtureRequest(const EDM28::Request& request) noexcept
+{
+    if (request.scope.session == 0ULL || request.sequence == 0ULL ||
+        request.issueTick == 0ULL || request.scope.owner != static_cast<std::uint8_t>(MotionOwner::AUTO)) return false;
+    const bool cleanup = request.kind == EDM28::RequestKind::Stop || request.kind == EDM28::RequestKind::Disarm;
+    if (!cleanup && m_edmZFeedback.Current().status == EDM53::Status::Closed) return false;
+    EDMZQueuedRequest queued{};
+    queued.request = request;
+    const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+    if (!EDM52::Valid(stop)) return false;
+    if (!cleanup && EDM52::RetiresSession(stop, request.scope.session)) return false;
+    queued.stopTicket = stop.revision;
+    return m_edmZRequests.ProducerTryPush(queued);
+}
+
+void MotionCore::RequestEDMZFixtureStop(std::uint64_t session) noexcept
+{
+    m_edmZCancelFence.RequestStop(session);
+}
+
+bool MotionCore::ReadEDMZFixtureFeedback(EDM28::Feedback& feedback) const noexcept
+{
+    const EDM53::Stamp stamp = m_edmZFeedback.Read(feedback);
+    if (!stamp.Ready()) return false;
+    feedback.publicationSequence = stamp.publication;
+    return true;
+}
+
+void MotionCore::PublishEDMZFixtureFeedback() noexcept
+{
+    EDM28::Feedback feedback = m_edmZPolicy.Snapshot();
+    if (!m_edmZClockValid)
+    {
+        feedback.clockValid = feedback.sourceFresh = feedback.pdoValid = false;
+        feedback.stopProven = feedback.targetProven = false;
+        feedback.stableCycles = 0U;
+    }
+    if (!m_edmZFeedback.Publish(feedback))
+    {
+        // A permanently closed transport cannot publish a new receipt. Use
+        // the genuine observation for Stop and retain scoped zero containment.
+        StopEDMZFixtureFromRuntime();
+        (void)GuardEDMZFixtureOutputImage();
+    }
+}
+
+void MotionCore::ApplyEDMZFixtureDecision(const EDM28::Decision& supplied) noexcept
+{
+    if (supplied.action == EDM28::Action::None && !supplied.requiresCommit &&
+        !m_edmZPolicy.HasPendingApplication()) return;
+    EDM28::Decision decision = supplied;
+    if (supplied.requiresCommit && m_edmZPolicy.HasPendingApplication())
+    {
+        const EDM28::Request& request = m_edmZPolicy.PendingRequest();
+        const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+        const bool pendingStop = EDM52::Valid(stop) &&
+            (EDM52::AffectsSince(stop, request.scope.session, m_edmZObservedStopTicket) ||
+                EDM52::RetiresSession(stop, request.scope.session));
+        // An unavailable publication establishes no scoped cancellation. The
+        // existing local application may finish; every PDO/send gate zeros it.
+        if (request.kind == EDM28::RequestKind::Arm || request.kind == EDM28::RequestKind::Position ||
+            request.kind == EDM28::RequestKind::FeedUpdate)
+        {
+            if (m_edmZFeedback.Current().status == EDM53::Status::Closed)
+                decision = m_edmZPolicy.PriorityStop(m_edmZPolicy.Snapshot().scope.session, m_edmZObservation);
+            else if (pendingStop)
+                decision = m_edmZPolicy.CancelBeforeApplication(request, m_edmZObservation);
+        }
+    }
+    decision = m_edmZPolicy.PrepareApplication(decision, m_edmZObservation);
+    // One admitted application and at most one immediate Stop recovery. A
+    // failed Stop remains capped/faulted without a fabricated application ACK.
+    for (unsigned applicationAttempt = 0U; applicationAttempt < 2U; ++applicationAttempt)
+    {
+    if (decision.action == EDM28::Action::None && !decision.requiresCommit) return;
+    const EDM28::Request pending = m_edmZPolicy.PendingRequest();
+    bool applied = m_pContexts != nullptr && m_pContexts->size() > 2U &&
+        (*m_pContexts)[2].axisIndex == 2 && (*m_pContexts)[2].isExist;
+    if (applied)
+    {
+        AxisContext& axis = (*m_pContexts)[2];
+        if (decision.action == EDM28::Action::Move)
+        {
+            // The historical leaf otherwise promotes <=1 PPS and <=10 PPS^2
+            // to unrelated defaults. Neither promotion belongs to P13.
+            applied = decision.accepted && decision.requiresCommit && pending.kind == EDM28::RequestKind::Position &&
+                axis.axisType == AxisType::LINEAR && !axis.isVirtualAxis && !axis.isFault &&
+                std::isfinite(axis.maxVel_PPS) && axis.maxVel_PPS > 0.0 &&
+                std::isfinite(decision.nativeTargetPulse) &&
+                std::isfinite(decision.accelerationTimeSec) && decision.accelerationTimeSec >= .001 &&
+                std::isfinite(decision.decelerationTimeSec) && decision.decelerationTimeSec >= .001 &&
+                std::isfinite(decision.nativeVelocityPps) && decision.nativeVelocityPps <= axis.maxVel_PPS &&
+                decision.nativeVelocityPps > 1.0 &&
+                decision.nativeVelocityPps / decision.accelerationTimeSec > 10.0 &&
+                decision.nativeVelocityPps / decision.decelerationTimeSec > 10.0 &&
+                MoveToPosition(axis, decision.nativeTargetPulse, decision.nativeVelocityPps,
+                    decision.accelerationTimeSec, decision.decelerationTimeSec);
+            if (applied)
+                applied = axis.state == MotionState::MotionState_MOVING &&
+                    axis.finalTargetPos == decision.nativeTargetPulse &&
+                    axis.programmedVel_PPS == decision.nativeVelocityPps &&
+                    axis.cruiseVel_PPS == decision.nativeVelocityPps &&
+                    axis.acc_PPS2 == decision.nativeVelocityPps / decision.accelerationTimeSec &&
+                    axis.dec_PPS2 == decision.nativeVelocityPps / decision.decelerationTimeSec &&
+                    axis.targetEndVel == 0.0;
+        }
+        else if (decision.action == EDM28::Action::FeedUpdate)
+        {
+            // EDM42 changes the speed of this exact finite move. Re-entering
+            // MoveToPosition would rebase planning and clear the live FIR;
+            // a velocity-mode command would discard the finite endpoint.
+            const EDM28::Feedback& feedback = m_edmZPolicy.Snapshot();
+            const EDM28::Config& config = feedback.frozenConfig;
+            const double slow = 10.0 * config.pulsePerMm / 60.0;
+            const double fast = 20.0 * config.pulsePerMm / 60.0;
+            const double direction = pending.signedCurveMmMin > 0.0 ? -1.0 : 1.0;
+            const double remaining = .004 * config.pulsePerMm;
+            const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+            const bool pendingStop = EDM52::Valid(stop) &&
+                (EDM52::AffectsSince(stop, feedback.scope.session, m_edmZObservedStopTicket) ||
+                    EDM52::RetiresSession(stop, feedback.scope.session));
+            applied = decision.accepted && decision.requiresCommit &&
+                pending.kind == EDM28::RequestKind::FeedUpdate &&
+                EDM28::IsGapFeedUpdateProfile(config.profile) &&
+                feedback.capHeld && !feedback.stopLatched && !feedback.latchedFault && !pendingStop &&
+                feedback.state == EDM28::State::Moving &&
+                (feedback.lastAppliedKind == EDM28::RequestKind::Position ||
+                    feedback.lastAppliedKind == EDM28::RequestKind::FeedUpdate) &&
+                axis.state == MotionState::MotionState_MOVING && !axis.isVirtualAxis && !axis.isFault &&
+                std::isfinite(decision.nativeTargetPulse) &&
+                decision.nativeTargetPulse == feedback.targetPulse &&
+                axis.finalTargetPos == feedback.targetPulse && axis.targetEndVel == 0.0 &&
+                axis.feedrateOverride == 1.0 &&
+                config.accelerationTimeSec == .2 && config.decelerationTimeSec == .2 &&
+                decision.accelerationTimeSec == config.accelerationTimeSec &&
+                decision.decelerationTimeSec == config.decelerationTimeSec &&
+                std::isfinite(slow) && std::isfinite(fast) && slow > 1.0 &&
+                std::isfinite(decision.nativeVelocityPps) &&
+                (decision.nativeVelocityPps == slow || decision.nativeVelocityPps == fast) &&
+                decision.nativeVelocityPps <= axis.maxVel_PPS &&
+                decision.nativeVelocityPps <= config.pdoCapMmS * config.pulsePerMm &&
+                decision.nativeVelocityPps <= 2147483647.0 &&
+                std::isfinite(axis.programmedVel_PPS) &&
+                (axis.programmedVel_PPS == slow || axis.programmedVel_PPS == fast) &&
+                axis.programmedVel_PPS != decision.nativeVelocityPps &&
+                axis.cruiseVel_PPS == axis.programmedVel_PPS &&
+                std::isfinite(axis.acc_PPS2) && std::isfinite(axis.dec_PPS2) &&
+                axis.acc_PPS2 > 10.0 && axis.dec_PPS2 > 10.0 &&
+                (axis.acc_PPS2 == slow / config.accelerationTimeSec ||
+                    axis.acc_PPS2 == fast / config.accelerationTimeSec) &&
+                axis.dec_PPS2 == axis.acc_PPS2 &&
+                std::isfinite(axis.currentCmdVel) && direction * axis.currentCmdVel > 1.0 &&
+                std::isfinite(axis.currentActPos) && std::isfinite(axis.currentCmdPos) &&
+                std::isfinite(axis.planningPos) &&
+                direction * (feedback.targetPulse - axis.currentActPos) > remaining &&
+                direction * (feedback.targetPulse - axis.currentCmdPos) > remaining &&
+                direction * (feedback.targetPulse - axis.planningPos) > remaining;
+            if (applied)
+            {
+                // Preserve all positions, velocities, launch-time slopes,
+                // motion state and filter history. UpdateAxis will continue
+                // deriving cruise from this programmed speed at override 1.
+                axis.programmedVel_PPS = decision.nativeVelocityPps;
+                axis.cruiseVel_PPS = decision.nativeVelocityPps;
+            }
+        }
+        else if (decision.action == EDM28::Action::Stop || decision.action == EDM28::Action::Fault)
+        {
+            const EDM28::Feedback& feedback = m_edmZPolicy.Snapshot();
+            if (EDM28::IsGapRapidProfile(feedback.frozenConfig.profile))
+            {
+                // EDM43 keeps a late operator Stop inside the current finite
+                // endpoint. The ordinary stop planner still owns deceleration;
+                // this fence cannot reverse the raw planning direction.
+                const EDM28::Config& config = feedback.frozenConfig;
+                const double endpoint = feedback.targetPulse;
+                const double planning = axis.planningPos;
+                const double previousDeceleration = axis.dec_PPS2;
+                double directionVelocity = axis.currentCmdVel;
+                if (std::abs(directionVelocity) < .1) directionVelocity = axis.logicalCmdVel;
+                if (std::abs(directionVelocity) < .1) directionVelocity = axis.targetVelocity;
+                const double direction = directionVelocity > 0.0 ? 1.0 : directionVelocity < 0.0 ? -1.0 : 0.0;
+                const bool fence = feedback.capHeld && feedback.originValid && feedback.frameCurrent &&
+                    axis.state == MotionState::MotionState_MOVING && !axis.isVirtualAxis &&
+                    config.feedMmMin == EDM43::FeedMmMin && config.pdoCapMmS == EDM43::PdoCapMmS &&
+                    config.targetHalfMm == EDM43::TargetHalfMm && config.outerHalfMm == EDM43::OuterHalfMm &&
+                    config.accelerationTimeSec == EDM43::AccelerationTimeSec &&
+                    config.decelerationTimeSec == EDM43::DecelerationTimeSec &&
+                    decision.decelerationTimeSec == config.decelerationTimeSec &&
+                    m_edmZObservation.axisMapGeneration == feedback.scope.axisMapGeneration &&
+                    m_edmZObservation.configGeneration == feedback.scope.configGeneration &&
+                    m_edmZObservation.pulsePerMm == config.pulsePerMm &&
+                    m_edmZObservation.referenceOffsetPulse == config.referenceOffsetPulse &&
+                    m_edmZObservation.hardwareSign == config.hardwareSign &&
+                    std::isfinite(endpoint) && std::isfinite(feedback.outerOriginPulse) &&
+                    std::isfinite(config.pulsePerMm) && config.pulsePerMm > 0.0 &&
+                    (endpoint == feedback.outerOriginPulse ||
+                        endpoint == feedback.outerOriginPulse - EDM43::TargetHalfMm * config.pulsePerMm) &&
+                    std::isfinite(planning) && std::isfinite(directionVelocity) && direction != 0.0 &&
+                    std::isfinite(previousDeceleration) && previousDeceleration > 0.0 &&
+                    (endpoint - planning) * direction >= 0.0;
+                StopMove(axis, decision.decelerationTimeSec);
+                if (fence && axis.state == MotionState::MotionState_MOVING &&
+                    std::isfinite(axis.finalTargetPos) && std::isfinite(axis.dec_PPS2) && axis.dec_PPS2 > 0.0 &&
+                    (axis.finalTargetPos - endpoint) * direction > 0.0)
+                {
+                    axis.finalTargetPos = endpoint;
+                    axis.dec_PPS2 = (std::max)(previousDeceleration, axis.dec_PPS2);
+                }
+            }
+            else StopMove(axis, decision.decelerationTimeSec);
+        }
+        else
+            applied = decision.action == EDM28::Action::None && decision.requiresCommit &&
+                (pending.kind == EDM28::RequestKind::Arm || pending.kind == EDM28::RequestKind::Disarm);
+    }
+    if (decision.requiresCommit)
+    {
+        if (applied && (pending.kind == EDM28::RequestKind::Arm || pending.kind == EDM28::RequestKind::Disarm))
+        {
+            // Transient history, not PID tuning. No integral accumulated under
+            // the diagnostic output cap may be released into ordinary motion.
+            for (auto& axis : *m_pContexts)
+            {
+                axis.pid.integralAcc = axis.pid.prevError = 0.0;
+                axis.Pid_IDLE.integralAcc = axis.Pid_IDLE.prevError = 0.0;
+                axis.Pid_G00.integralAcc = axis.Pid_G00.prevError = 0.0;
+            }
+        }
+        const EDM28::Decision recovery = m_edmZPolicy.CommitApplied(pending, decision, applied, m_edmZObservation);
+        if (recovery.action != EDM28::Action::Stop && recovery.action != EDM28::Action::Fault) return;
+        decision = m_edmZPolicy.PrepareApplication(recovery, m_edmZObservation);
+    }
+    else return;
+    }
+}
+
+void MotionCore::StopEDMZFixtureFromRuntime() noexcept
+{
+    const std::uint64_t session = m_edmZPolicy.Snapshot().scope.session;
+    ApplyEDMZFixtureDecision(m_edmZPolicy.PriorityStop(session, m_edmZObservation));
+}
+
+void MotionCore::LatchEDMZFixtureFrameIntegrityFailure() noexcept
+{
+    if (m_edmZFrameIntegrityStopLatched) return;
+    m_edmZFrameIntegrityStopLatched = true;
+    // A changed physical frame cannot retire the old drive from another
+    // source sample. Keep the scoped zero fence and enter existing AL3021 /
+    // SAFETY containment once. No zero delivery or physical stop is asserted.
+    StopEDMZFixtureFromRuntime();
+    m_edmZObservation.pdoValid = false;
+    ApplyEDMZFixtureDecision(m_edmZPolicy.RefreshFacts(m_edmZObservation));
+    TriggerGroupMappingIntegrityEmergencyStop(2, true);
+}
+
+void MotionCore::ObserveEDMZFixtureRuntimeClock(
+    std::uint64_t tick, bool valid, bool contiguous) noexcept
+{
+    LARGE_INTEGER frequency{}, counter{};
+    if (m_edmZClockFrequency == 0ULL && RtQueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0)
+        m_edmZClockFrequency = static_cast<std::uint64_t>(frequency.QuadPart);
+    const bool read = m_edmZClockFrequency != 0ULL &&
+        RtQueryPerformanceCounter(&counter) && counter.QuadPart >= 0;
+    m_edmZClockValid = false;
+    if (read)
+    {
+        const std::uint64_t now = static_cast<std::uint64_t>(counter.QuadPart);
+        const std::uint64_t whole = now / m_edmZClockFrequency;
+        const std::uint64_t remainder = now % m_edmZClockFrequency;
+        const std::uint64_t maximum = (std::numeric_limits<std::uint64_t>::max)();
+        if (whole <= maximum / 1000000ULL && remainder <= maximum / 1000000ULL)
+        {
+            const std::uint64_t wholeUs = whole * 1000000ULL;
+            const std::uint64_t fractionalUs = remainder * 1000000ULL / m_edmZClockFrequency;
+            if (fractionalUs <= maximum - wholeUs)
+            {
+                m_edmZClockValid = m_edmZClockCounter == 0ULL || now > m_edmZClockCounter;
+                m_edmZClockCounter = now;
+                m_edmZMonotonicUs = wholeUs + fractionalUs;
+            }
+        }
+    }
+    const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+    m_edmZObservation.tick = tick;
+    m_edmZObservation.monotonicUs = m_edmZMonotonicUs;
+    m_edmZObservation.clockValid = m_edmZClockValid;
+    m_edmZObservation.pdoValid = false; // source is acquired later in this pass
+    if (EDM52::Valid(stop))
+    {
+        const auto& feedback = m_edmZPolicy.Snapshot();
+        if (feedback.capHeld && EDM52::AffectsSince(stop, feedback.scope.session, m_edmZObservedStopTicket))
+            StopEDMZFixtureFromRuntime();
+        m_edmZObservedStopTicket = stop.revision;
+    }
+    if (!valid || !contiguous || !m_edmZClockValid)
+    {
+        // Runs even when invalid LRW makes the Runtime skip UpdateAllMotion.
+        // Old actual values remain explicitly invalid; no cached PDO proof.
+        m_edmZObservation.tick = tick;
+        m_edmZObservation.monotonicUs = m_edmZMonotonicUs;
+        m_edmZObservation.pdoValid = false;
+        m_edmZObservation.contiguous = contiguous;
+        m_edmZObservation.clockValid = m_edmZClockValid;
+        ApplyEDMZFixtureDecision(m_edmZPolicy.OnCycle(m_edmZObservation));
+        m_edmZReviewedCycleTick = tick;
+        (void)GuardEDMZFixtureOutputImage();
+        PublishEDMZFixtureFeedback();
+    }
+}
+
+EDM28::Observation MotionCore::BuildEDMZFixtureObservation(
+    const AxisContext& axis, const MotionServoInputSnapshot* input, bool sourceFresh) noexcept
+{
+    EDM28::Observation observation{};
+    observation.tick = m_ncSettleRuntimeCycleTick;
+    observation.monotonicUs = m_edmZMonotonicUs;
+    observation.clockValid = m_edmZClockValid;
+    observation.pdoValid = sourceFresh && m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid;
+    observation.contiguous = m_ncSettleRuntimeCycleContiguous;
+    const MotionOwnerLease lease = GetMotionOwnerLease();
+    observation.currentOwner = static_cast<std::uint8_t>(lease.owner);
+    observation.currentOwnerGeneration = lease.generation;
+    observation.currentEpoch = GetCurrentExecutionEpoch();
+    observation.axisExists = axis.axisIndex == 2 && axis.isExist && !axis.isVirtualAxis;
+    observation.linear = axis.axisType == AxisType::LINEAR;
+    observation.axisIdle = axis.state == MotionState::MotionState_IDLE;
+    observation.statusWord = input != nullptr ? input->StatusWord : m_servoSourceStatusWord[2];
+    observation.modeValue = input != nullptr ? input->ModesOfOperationDisplay : m_servoSourceMode[2];
+    observation.servoReady = axis.startupLagMonitorArmed &&
+        (observation.statusWord & 0x006FU) == 0x0027U;
+    observation.modeReady = observation.modeValue == 9;
+    observation.fault = axis.isFault || axis.isLagAlarm ||
+        (observation.statusWord & 0x0008U) != 0U ||
+        axis.state == MotionState::MotionState_ERROR || axis.state == MotionState::MotionState_ESTOP ||
+        AlarmManager::GetInstance().HasAlarm() || HasPendingSafetyOrRecoveryRequests();
+    observation.pulsePerMm = axis.resolution_PPR / axis.finalLead;
+    observation.referenceOffsetPulse = axis.machineCoordinateOffsetPulse;
+    observation.maximumVelocityPps = axis.maxVel_PPS;
+    observation.feedrateOverride = axis.feedrateOverride;
+    observation.hardwareSign = axis.isReverse != axis.Axis_Reverse ? -1 : 1;
+    observation.actualPulse = axis.currentActPos;
+    observation.commandPulse = axis.currentCmdPos;
+    observation.planningPulse = axis.planningPos;
+    observation.cmdVelocityPps = axis.currentCmdVel;
+    observation.logicalVelocityPps = axis.logicalCmdVel;
+    observation.targetVelocityPps = axis.targetVelocity;
+    observation.actualVelocityPps = m_edmZActualVelocityPps;
+    if (m_pDrives != nullptr && m_pDrives->size() > 2U && (*m_pDrives)[2].pOutput != nullptr)
+        observation.pdoVelocityPps = static_cast<double>((*m_pDrives)[2].pOutput->TargetVelocity) *
+            static_cast<double>(observation.hardwareSign);
+    else observation.pdoValid = false;
+    observation.noCompensation = !axis.enablePitch && !axis.enableBacklash &&
+        axis.currentCompOffset_unit == 0.0;
+    observation.motorEncoderSource = axis.fbMode == FeedbackSource::MOTOR_ENCODER;
+    observation.homeFact = axis.isHomed;
+    observation.softLimitsFact = axis.travelLimit1Enable || axis.travelLimit2Enable || axis.travelLimit3Enable;
+    observation.hardPositive = axis.hardLimitPositive || axis.positiveTravelBlocked;
+    observation.hardNegative = axis.hardLimitNegative || axis.negativeTravelBlocked;
+    observation.groupQuiet = !m_Group.isActive && m_Group.cmdQueue.empty() &&
+        !m_pathHold.sourceSeen && !m_pathHold.startPending && !m_pathHold.status.admissionPending;
+    observation.axisMailboxQuiet = m_axisCommandChannel.command_size() == 0U;
+    observation.allOtherAxesIdle = m_pContexts != nullptr && m_pDrives != nullptr &&
+        m_pContexts->size() == m_pDrives->size() && m_pContexts->size() <= MAX_AXES;
+    if (m_pContexts != nullptr)
+    {
+        for (std::size_t i = 0U; i < m_pContexts->size(); ++i)
+        {
+            if (i == 2U || !(*m_pContexts)[i].isExist) continue;
+            const AxisContext& other = (*m_pContexts)[i];
+            observation.allOtherAxesIdle = observation.allOtherAxesIdle &&
+                other.axisIndex == static_cast<int>(i) && other.state == MotionState::MotionState_IDLE &&
+                !other.isFault && std::isfinite(other.currentCmdVel) && std::isfinite(other.logicalCmdVel) &&
+                std::isfinite(other.targetVelocity) && std::abs(other.currentCmdVel) <= 1.0 &&
+                std::abs(other.logicalCmdVel) <= 1.0 && std::abs(other.targetVelocity) <= 1.0;
+        }
+    }
+    // Compare exact field images, not a collision-prone hash or an NC claim.
+    std::array<std::uint64_t, 64U> config{};
+    std::size_t word = 0U;
+    const auto addDouble = [&config, &word](double value) noexcept
+    { std::memcpy(&config[word++], &value, sizeof(value)); };
+    addDouble(axis.resolution_PPR); addDouble(axis.finalLead); addDouble(axis.machineCoordinateOffsetPulse);
+    addDouble(axis.maxVel_PPS); addDouble(axis.feedrateOverride); addDouble(axis.smoothTime_ms);
+    config[word++] = static_cast<std::uint64_t>(axis.axisType);
+    config[word++] = static_cast<std::uint64_t>(axis.fbMode);
+    config[word++] = static_cast<std::uint64_t>(axis.isReverse) | (static_cast<std::uint64_t>(axis.Axis_Reverse) << 1U) |
+        (static_cast<std::uint64_t>(axis.enablePitch) << 2U) | (static_cast<std::uint64_t>(axis.enableBacklash) << 3U) |
+        (static_cast<std::uint64_t>(axis.isHomed) << 4U) | (static_cast<std::uint64_t>(axis.isVirtualAxis) << 5U);
+    config[word++] = static_cast<std::uint64_t>(axis.velBuffer.size());
+    addDouble(axis.Pid_IDLE.Kp); addDouble(axis.Pid_IDLE.Ki); addDouble(axis.Pid_IDLE.Kd); addDouble(axis.Pid_IDLE.Kvff);
+    addDouble(axis.Pid_G00.Kp); addDouble(axis.Pid_G00.Ki); addDouble(axis.Pid_G00.Kd); addDouble(axis.Pid_G00.Kvff);
+    addDouble(axis.pid.MaxLag); addDouble(axis.pid.MaxIntegral);
+    config[word++] = static_cast<std::uint64_t>(axis.pid.EnableLagCheck);
+    config[word++] = static_cast<std::uint64_t>(axis.travelLimit1Enable) |
+        (static_cast<std::uint64_t>(axis.travelLimit2Enable) << 1U) | (static_cast<std::uint64_t>(axis.travelLimit3Enable) << 2U);
+    addDouble(axis.travelLimit1Positive_unit); addDouble(axis.travelLimit1Negative_unit);
+    addDouble(axis.travelLimit2Positive_unit); addDouble(axis.travelLimit2Negative_unit);
+    addDouble(axis.travelLimit3Positive_unit); addDouble(axis.travelLimit3Negative_unit);
+    addDouble(axis.currentCompOffset_unit);
+    const EDM54::Stamp configIdentity = m_edmZConfigIdentity.Observe(config);
+    if (!configIdentity.Ready()) observation.pdoValid = false;
+    static_assert(3U + MAX_AXES * 6U <= 64U, "EDM mapping image must cover every configured axis.");
+    std::array<std::uint64_t, 64U> mapping{};
+    if (m_pContexts != nullptr && m_pDrives != nullptr &&
+        m_pContexts->size() == m_pDrives->size() && m_pContexts->size() <= MAX_AXES)
+    {
+        mapping[0] = static_cast<std::uint64_t>(m_pContexts->size());
+        mapping[1] = reinterpret_cast<std::uintptr_t>(m_pStructuredServoReadShadowMaster);
+        mapping[2] = static_cast<std::uint64_t>(m_edmZInputSemantic);
+        for (std::size_t i = 0U; i < m_pContexts->size(); ++i)
+        {
+            mapping[3U + i * 6U] = static_cast<std::uint64_t>((*m_pContexts)[i].axisIndex);
+            mapping[4U + i * 6U] = static_cast<std::uint64_t>((*m_pDrives)[i].slaveIndex);
+            mapping[5U + i * 6U] = reinterpret_cast<std::uintptr_t>((*m_pDrives)[i].pOutput);
+            mapping[6U + i * 6U] = reinterpret_cast<std::uintptr_t>((*m_pDrives)[i].pInput);
+            mapping[7U + i * 6U] = (*m_pDrives)[i].vendorId;
+            mapping[8U + i * 6U] = (*m_pDrives)[i].productCode;
+        }
+    }
+    else observation.pdoValid = false;
+    const EDM54::Stamp mapIdentity = m_edmZMapIdentity.Observe(mapping);
+    if (!mapIdentity.Ready()) observation.pdoValid = false;
+    observation.axisMapGeneration = mapIdentity.generation;
+    observation.configGeneration = configIdentity.generation;
+    return observation;
+}
+
+void MotionCore::ProcessEDMZFixtureAxis(AxisContext& axis,
+    const MotionServoInputSnapshot& input) noexcept
+{
+    if (axis.axisIndex != 2 || m_pContexts == nullptr || m_pContexts->size() <= 2U ||
+        &axis != &(*m_pContexts)[2]) return;
+    const bool adjacent = m_edmZLastActualTick != 0ULL &&
+        m_ncSettleRuntimeCycleTick == m_edmZLastActualTick + 1ULL &&
+        m_edmZMonotonicUs > m_edmZLastActualUs;
+    m_edmZActualVelocityPps = adjacent ? (axis.currentActPos - m_edmZLastActualPulse) *
+        1000000.0 / static_cast<double>(m_edmZMonotonicUs - m_edmZLastActualUs) : 0.0;
+    m_edmZSourceTick = m_ncSettleRuntimeCycleTick;
+    m_edmZObservation = BuildEDMZFixtureObservation(axis, &input,
+        (m_servoSourceInputMask & 4U) != 0U);
+    const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+    // Do not consume a command or invent cancellation from a partial/closed
+    // publication. The output guards independently hold all scoped PDOs zero.
+    if (!EDM52::Valid(stop)) return;
+    if (stop.revision != m_edmZObservedStopTicket)
+    {
+        const auto& feedback = m_edmZPolicy.Snapshot();
+        if (feedback.capHeld && EDM52::AffectsSince(stop, feedback.scope.session, m_edmZObservedStopTicket))
+            StopEDMZFixtureFromRuntime();
+        m_edmZObservedStopTicket = stop.revision;
+    }
+    // One request per pass bounds RT work and preserves a visible application
+    // identity; heartbeats may never coalesce over a pending stop/position.
+    EDMZQueuedRequest queued{};
+    if (m_edmZRequests.ConsumerTryPeek(queued))
+    {
+        const bool cleanup = queued.request.kind == EDM28::RequestKind::Stop ||
+            queued.request.kind == EDM28::RequestKind::Disarm;
+        // Closed feedback denies new work without consuming its queue head
+        // or inventing an ACK. Priority Stop remains an independent path.
+        if (!cleanup && m_edmZFeedback.Current().status == EDM53::Status::Closed) return;
+        // The producer may have published Stop and then this request after
+        // the earlier runtime read. Acquire the front first, then its fence;
+        // an unavailable/regressed snapshot cannot consume or cancel it.
+        const EDM52::Snapshot admissionStop = m_edmZCancelFence.Read();
+        if (!EDM52::Valid(admissionStop) || admissionStop.revision < queued.stopTicket) return;
+        if (!m_edmZRequests.ConsumerTryPop(queued)) return;
+        const bool cancelledBeforeApplication = !cleanup &&
+            (EDM52::AffectsSince(admissionStop, queued.request.scope.session, queued.stopTicket) ||
+                EDM52::RetiresSession(admissionStop, queued.request.scope.session));
+        const bool retiredUnarmedSession = queued.request.kind == EDM28::RequestKind::Arm &&
+            !m_edmZPolicy.Snapshot().capHeld && queued.request.scope.session <= admissionStop.throughSession;
+        if (cancelledBeforeApplication || retiredUnarmedSession)
+            ApplyEDMZFixtureDecision(m_edmZPolicy.CancelBeforeApplication(queued.request, m_edmZObservation));
+        else
+        {
+            const EDM28::Decision decision = m_edmZPolicy.OnRequest(queued.request, m_edmZObservation);
+            if (decision.accepted && (queued.request.kind == EDM28::RequestKind::Arm ||
+                queued.request.kind == EDM28::RequestKind::Heartbeat))
+                m_edmZHeartbeatDeadlineUs = queued.request.issueMonotonicUs + 50000ULL;
+            ApplyEDMZFixtureDecision(decision);
+        }
+    }
+}
+
+double MotionCore::GuardEDMZFixtureVelocity(int axisIndex, double value) noexcept
+{
+    const EDM28::Feedback& feedback = m_edmZPolicy.Snapshot();
+    if (!feedback.capHeld) return value;
+    if (axisIndex != 2) return 0.0;
+    const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+    // Once this Stop revision is observed, the existing bounded Stop planner
+    // must retain its deceleration/correction output until physical settle.
+    // Retirement blocks new motion admission, not this formal Stop's output.
+    const bool pendingStop = EDM52::AffectsSince(stop, feedback.scope.session, m_edmZObservedStopTicket);
+    if (pendingStop || m_edmZFeedback.Current().status == EDM53::Status::Closed ||
+        !m_edmZConfigIdentity.Current().Ready() || !m_edmZMapIdentity.Current().Ready() ||
+        feedback.forceZeroOutput || !m_edmZClockValid ||
+        !m_ncSettleRuntimeCycleValid || m_edmZSourceTick != m_ncSettleRuntimeCycleTick) return 0.0;
+    const double cap = std::floor(feedback.frozenConfig.pdoCapMmS * feedback.frozenConfig.pulsePerMm);
+    if (!std::isfinite(value) || !std::isfinite(cap) || cap < 1.0 || cap > 2147483647.0)
+    { StopEDMZFixtureFromRuntime(); return 0.0; }
+    return (std::max)(-cap, (std::min)(cap, value));
+}
+
+bool MotionCore::GuardEDMZFixtureOutputImage() noexcept
+{
+    if (!m_edmZPolicy.Snapshot().capHeld) return true;
+    if (m_pDrives == nullptr || m_pContexts == nullptr || m_pDrives->size() != m_pContexts->size() ||
+        m_pDrives->size() > MAX_AXES) { StopEDMZFixtureFromRuntime(); return false; }
+    bool exact = true;
+    for (std::size_t i = 0U; i < m_pDrives->size(); ++i)
+    {
+        ServoOutput* output = (*m_pDrives)[i].pOutput;
+        if (output == nullptr) { exact = false; continue; }
+        const double guarded = GuardEDMZFixtureVelocity(i == 2U && (*m_pContexts)[i].axisIndex == 2 ? 2 : -1,
+            static_cast<double>(output->TargetVelocity));
+        const std::int32_t native = static_cast<std::int32_t>(guarded);
+        if (native != output->TargetVelocity)
+            WriteServoTargetVelocityCommand(output, (*m_pContexts)[i].axisIndex, native);
+    }
+    if (!exact) StopEDMZFixtureFromRuntime();
+    return exact;
+}
+
+void MotionCore::FinishEDMZFixtureMotionPass() noexcept
+{
+    (void)GuardEDMZFixtureOutputImage();
+    if (m_edmZReviewedCycleTick == m_ncSettleRuntimeCycleTick) return;
+    if (m_pContexts != nullptr && m_pContexts->size() > 2U)
+        m_edmZObservation = BuildEDMZFixtureObservation((*m_pContexts)[2], nullptr,
+            m_edmZSourceTick == m_ncSettleRuntimeCycleTick && (m_servoSourceInputMask & 4U) != 0U);
+    else
+    {
+        m_edmZObservation = EDM28::Observation{};
+        m_edmZObservation.tick = m_ncSettleRuntimeCycleTick;
+        m_edmZObservation.monotonicUs = m_edmZMonotonicUs;
+        m_edmZObservation.clockValid = m_edmZClockValid;
+    }
+    ApplyEDMZFixtureDecision(m_edmZPolicy.OnCycle(m_edmZObservation));
+    const EDM28::Feedback& frameFeedback = m_edmZPolicy.Snapshot();
+    if (frameFeedback.capHeld &&
+        (m_edmZObservation.axisMapGeneration == 0ULL || m_edmZObservation.configGeneration == 0ULL ||
+            m_edmZObservation.axisMapGeneration != frameFeedback.scope.axisMapGeneration ||
+            m_edmZObservation.configGeneration != frameFeedback.scope.configGeneration))
+        LatchEDMZFixtureFrameIntegrityFailure();
+    m_edmZReviewedCycleTick = m_ncSettleRuntimeCycleTick;
+    (void)GuardEDMZFixtureOutputImage();
+    if (m_pContexts != nullptr && m_pContexts->size() > 2U)
+    {
+        m_edmZObservation = BuildEDMZFixtureObservation((*m_pContexts)[2], nullptr,
+            m_edmZSourceTick == m_ncSettleRuntimeCycleTick && (m_servoSourceInputMask & 4U) != 0U);
+        ApplyEDMZFixtureDecision(m_edmZPolicy.RefreshFacts(m_edmZObservation));
+        (void)GuardEDMZFixtureOutputImage();
+        m_edmZObservation = BuildEDMZFixtureObservation((*m_pContexts)[2], nullptr,
+            m_edmZSourceTick == m_ncSettleRuntimeCycleTick && (m_servoSourceInputMask & 4U) != 0U);
+        ApplyEDMZFixtureDecision(m_edmZPolicy.RefreshFacts(m_edmZObservation));
+    }
+    if (m_edmZObservation.pdoValid)
+    {
+        m_edmZLastActualTick = m_ncSettleRuntimeCycleTick;
+        m_edmZLastActualUs = m_edmZMonotonicUs;
+        m_edmZLastActualPulse = m_edmZObservation.actualPulse;
+    }
+    else m_edmZLastActualTick = 0ULL;
+    PublishEDMZFixtureFeedback();
+}
+
+bool MotionCore::ValidateEDMZFixtureSendClock() noexcept
+{
+    const EDM28::Feedback& feedback = m_edmZPolicy.Snapshot();
+    if (!feedback.capHeld) return true;
+    LARGE_INTEGER counter{};
+    const std::uint64_t maximum = (std::numeric_limits<std::uint64_t>::max)();
+    bool current = m_edmZClockFrequency != 0ULL && RtQueryPerformanceCounter(&counter) && counter.QuadPart >= 0;
+    std::uint64_t micros = 0ULL;
+    if (current)
+    {
+        const std::uint64_t now = static_cast<std::uint64_t>(counter.QuadPart);
+        const std::uint64_t whole = now / m_edmZClockFrequency;
+        const std::uint64_t remainder = now % m_edmZClockFrequency;
+        current = now >= m_edmZClockCounter && whole <= maximum / 1000000ULL && remainder <= maximum / 1000000ULL;
+        if (current)
+        {
+            const std::uint64_t wholeUs = whole * 1000000ULL;
+            const std::uint64_t fractionalUs = remainder * 1000000ULL / m_edmZClockFrequency;
+            current = fractionalUs <= maximum - wholeUs;
+            if (current)
+            {
+                micros = wholeUs + fractionalUs;
+                // Begin / Finalize / Seal each retain the latest accepted
+                // QPC floor; a rollback between send phases also fails closed.
+                m_edmZClockCounter = now;
+            }
+        }
+    }
+    current = current && micros >= m_edmZObservation.monotonicUs &&
+        micros - m_edmZObservation.monotonicUs <= 50000ULL &&
+        (feedback.stopLatched || (m_edmZHeartbeatDeadlineUs != 0ULL && micros < m_edmZHeartbeatDeadlineUs));
+    if (!current)
+    {
+        // The Runtime sends before its next Motion callback. Sample QPC here
+        // as well: an old, locally valid image cannot survive a >50 ms stall.
+        m_edmZClockValid = false;
+        m_edmZObservation.clockValid = m_edmZObservation.pdoValid = false;
+        StopEDMZFixtureFromRuntime();
+        ApplyEDMZFixtureDecision(m_edmZPolicy.RefreshFacts(m_edmZObservation));
+        (void)GuardEDMZFixtureOutputImage();
+        PublishEDMZFixtureFeedback();
+    }
+    return current;
+}
+
+bool MotionCore::SealEDMZFixtureSerializedImage(ServoOutputFrameReservation& reservation,
+    const std::uint8_t* ioMapBase, std::size_t ioMapSize,
+    const std::uint8_t* payload, std::size_t payloadSize) noexcept
+{
+    if (!reservation.edmZGuardHeld) return !m_edmZPolicy.Snapshot().capHeld;
+    const bool currentClock = ValidateEDMZFixtureSendClock();
+    reservation.edmZSerializedExact = false;
+    if (!m_edmZPolicy.Snapshot().capHeld || ioMapBase == nullptr || payload == nullptr ||
+        payloadSize != ioMapSize || m_pDrives == nullptr || m_pContexts == nullptr ||
+        m_pDrives->size() != m_pContexts->size() || m_pDrives->size() > MAX_AXES ||
+        m_pContexts->size() <= 2U) return false;
+    // Recheck the actual mapping/configuration at the final-copy boundary.
+    // A late pointer swap must not hide the previously mapped output slot.
+    const EDM28::Observation currentFrame = BuildEDMZFixtureObservation((*m_pContexts)[2], nullptr, false);
+    const EDM28::Scope& frozenScope = m_edmZPolicy.Snapshot().scope;
+    if (currentFrame.axisMapGeneration == 0ULL || currentFrame.configGeneration == 0ULL ||
+        currentFrame.axisMapGeneration != frozenScope.axisMapGeneration ||
+        currentFrame.configGeneration != frozenScope.configGeneration)
+    {
+        LatchEDMZFixtureFrameIntegrityFailure();
+        (void)GuardEDMZFixtureOutputImage();
+        PublishEDMZFixtureFeedback();
+        return false;
+    }
+    const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+    const EDM53::Stamp feedbackStamp = m_edmZFeedback.Current();
+    const bool currentIdentity = reservation.edmZStopFenceCurrent &&
+        reservation.edmZStopSession == frozenScope.session &&
+        !EDM52::AffectsSince(stop, reservation.edmZStopSession, reservation.edmZStopTicket) &&
+        feedbackStamp.Ready() && reservation.edmZFeedbackPublication != 0ULL &&
+        reservation.edmZFeedbackPublication == feedbackStamp.publication;
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(ioMapBase);
+    for (std::size_t i = 0U; i < m_pDrives->size(); ++i)
+    {
+        const ServoOutput* output = (*m_pDrives)[i].pOutput;
+        const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(output);
+        if (output == nullptr || address < base || address - base > ioMapSize) return false;
+        const std::size_t offset = static_cast<std::size_t>(address - base);
+        if (offset > ioMapSize || sizeof(ServoOutput) > ioMapSize - offset) return false;
+        std::int32_t value = 0;
+        std::memcpy(&value, payload + offset + offsetof(ServoOutput, TargetVelocity), sizeof(value));
+        // A scrubbed all-zero frame stays sendable even after source/heartbeat
+        // invalidation. It grants no application or physical-stop receipt.
+        if (value != 0 && (!currentClock || !currentIdentity)) return false;
+        if (static_cast<double>(value) != GuardEDMZFixtureVelocity(
+            i == 2U && (*m_pContexts)[i].axisIndex == 2 ? 2 : -1, static_cast<double>(value))) return false;
+    }
+    reservation.edmZSerializedExact = true;
+    return true;
+}
+
 void MotionCore::ObserveNCSettleRuntimeCycle(
     std::uint64_t runtimeCycleTick,
     bool pdoCycleValid) noexcept
@@ -1671,12 +2615,27 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
 
     m_ncSettlePreviousRuntimeCycleTick = runtimeCycleTick;
     m_ncSettlePreviousRuntimeCycleValid = pdoCycleValid;
+    ObserveEDMZFixtureRuntimeClock(runtimeCycleTick, pdoCycleValid, adjacentToPrevious);
+    ObserveEDMRTShadowRuntimeCycle(runtimeCycleTick, pdoCycleValid, adjacentToPrevious);
+
+    // HOME proof cannot survive a skipped/invalid/duplicate runtime pass.
+    // This runs even when the runtime deliberately skips UpdateAllMotion.
+    if (!pdoCycleValid || !adjacentToPrevious)
+    {
+        m_pbcXHomeStopProof.Invalidate();
+        InvalidatePbcXHomeCapture();
+        m_pbcXZeroOnlyHomeIdentity.store(false, std::memory_order_release);
+        m_pbcXStagedHomeEntryIdentity.store(false, std::memory_order_release);
+        m_pbcXConfiguredDisabledHomeIdentity.store(false, std::memory_order_release);
+    }
 
     // The invalid-first-cycle Runtime path intentionally skips
     // UpdateAllMotion().  Publish the invalidation here so no old proof can
     // survive until a later valid Motion pass.
     if (!pdoCycleValid)
     {
+        m_pbcXFeedbackTick = 0ULL;
+        m_pbcResetPreproofTick = 0ULL;
         InvalidateServoOutputImageProof();
         PublishStopSettleEvidence();
     }
@@ -1821,6 +2780,46 @@ bool MotionCore::HasNCResetUnsupportedMotion() const noexcept
 }
 
 
+bool MotionCore::HasPbcXUnresolvedActiveOutput() const noexcept
+{
+    // Configuration is immutable after startup; only this quarantine query
+    // crosses to command producers, through its acquire-load publication.
+    return m_pContexts != nullptr && !m_pContexts->empty() &&
+        (((*m_pContexts)[0].enablePitch || (*m_pContexts)[0].enableBacklash) ||
+            (m_CompEngine.IsXZeroOnlyAdmitted() || m_CompEngine.IsXStagedProfileAdmitted())) &&
+        m_pbcXSendContract.HasUnresolvedActiveOutput();
+}
+
+bool MotionCore::RequiresPbcXRetainRecoveryReset() const noexcept
+{
+    return m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+        HasPbcXUnresolvedActiveOutput();
+}
+
+bool MotionCore::IsMechanicalCompensationReadyForStop(const AxisContext& axis) const noexcept
+{
+    const bool physicalX = m_pContexts != nullptr && !m_pContexts->empty() &&
+        &(*m_pContexts)[0] == &axis;
+    if ((physicalX || axis.axisIndex == 0) && m_CompEngine.IsXZeroOnlyAdmitted() &&
+        !m_CompEngine.IsXZeroOnlyCoordinateIdentity(axis)) return false;
+    if ((physicalX || axis.axisIndex == 0) && m_CompEngine.IsXStagedProfileAdmitted() &&
+        !m_CompEngine.IsXStagedProfileConfiguration(axis)) return false;
+    if (!axis.enablePitch && !axis.enableBacklash)
+        return axis.IsMechanicalCompensationReadyForCompletion();
+    if (m_pbcXSendContract.HasUnresolvedActiveOutput()) return false;
+    if (axis.axisIndex == 0 && m_CompEngine.XReferenceGeneration() == 0ULL &&
+        !m_CompEngine.HasPendingXCycle() &&
+        (m_CompEngine.IsXZeroOnlyCoordinateIdentity(axis) ||
+            m_CompEngine.IsXBootstrapCoordinateIdentity(axis)) &&
+        axis.IsMechanicalCompensationReadyForCompletion()) return true;
+    // A stopped ramp is not an endpoint completion. Only an applied, known
+    // physical-X frame may use the separate frozen-stop proof.
+    return m_CompEngine.IsXFrozenStopReady(axis) ||
+        (m_CompEngine.IsXKnownOffsetReferenceReady(axis) &&
+            axis.IsMechanicalCompensationReadyForCompletion());
+}
+
+
 bool MotionCore::HasNCResetActiveCompensation() const noexcept
 {
     if (m_pContexts == nullptr)
@@ -1839,10 +2838,24 @@ bool MotionCore::HasNCResetActiveCompensation() const noexcept
             continue;
         }
 
-        // J.5 rebase is intentionally not compensation-aware.  Any enabled
-        // backlash/pitch path is therefore unsupported, even when its
-        // currently injected offset happens to be zero.
-        if (axis.enableBacklash || axis.enablePitch)
+        if ((axisSlot == 0U || axis.axisIndex == 0) && m_CompEngine.IsXZeroOnlyAdmitted() &&
+            !m_CompEngine.IsXZeroOnlyCoordinateIdentity(axis)) return true;
+
+        if ((axisSlot == 0U || axis.axisIndex == 0) && m_CompEngine.IsXStagedProfileAdmitted() &&
+            !m_CompEngine.IsXStagedProfileConfiguration(axis)) return true;
+
+        // PBC-3F: only this sealed physical X may retain a known committed
+        // offset across RESET. Flags, frame shape or an offset of zero alone
+        // do not establish reference authority. Every other active axis blocks.
+        if ((axis.enableBacklash || axis.enablePitch) &&
+            (m_pbcXSendContract.HasUnresolvedActiveOutput() ||
+                (!m_CompEngine.IsXKnownOffsetReferenceReady(axis) &&
+                    !m_CompEngine.IsXFrozenStopReady(axis) &&
+                    !(m_CompEngine.XReferenceGeneration() == 0ULL &&
+                        !m_CompEngine.HasPendingXCycle() &&
+                        (m_CompEngine.IsXZeroOnlyCoordinateIdentity(axis) ||
+                            m_CompEngine.IsXBootstrapCoordinateIdentity(axis)) &&
+                        axis.IsMechanicalCompensationReadyForCompletion()))))
         {
             return true;
         }
@@ -1892,8 +2905,648 @@ void MotionCore::ResetNCSettleCandidate(
 }
 
 
-void MotionCore::ApplyNCResetScalarRebase() noexcept
+// PBC-3D reference commits use the previous completed feedback sample only
+// when this is its adjacent valid runtime pass. This never establishes HOME.
+bool MotionCore::IsPbcXFeedbackCurrent(const AxisContext& axis) const noexcept
 {
+    return m_pContexts != nullptr && !m_pContexts->empty() &&
+        &(*m_pContexts)[0] == &axis && axis.axisIndex == 0 && axis.isExist &&
+        !axis.isVirtualAxis && axis.axisType == AxisType::LINEAR &&
+        axis.fbMode == FeedbackSource::MOTOR_ENCODER &&
+        m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+        m_ncSettleRuntimeCycleContiguous && m_pbcXFeedbackTick != 0ULL &&
+        m_pbcXFeedbackTick + 1ULL == m_ncSettleRuntimeCycleTick &&
+        (m_servoSourceInputMask & 1U) != 0U &&
+        (m_servoSourceStatusWord[0] & 0x006FU) == 0x0027U &&
+        m_servoSourceMode[0] == 9 && axis.startupLagMonitorArmed &&
+        std::isfinite(axis.currentActPos);
+}
+
+// PBC-3H: all evidence is produced/consumed on the 250 us Motion thread.
+// The key is independent of the supervisory APPLY_HOME retry sequence.
+// No software ActualVelocity value contributes to the 200 raw samples.
+bool MotionCore::BuildPbcXHomeStopKey(const AxisContext& axis,
+    MotionPbcHomeStopKey& key) const noexcept
+{
+    key = MotionPbcHomeStopKey{};
+    if (m_pContexts == nullptr || m_pContexts->empty() ||
+        m_pDrives == nullptr || m_pDrives->size() != m_pContexts->size() ||
+        m_pContexts->size() > MAX_AXES || &(*m_pContexts)[0] != &axis ||
+        axis.axisIndex != 0 || !axis.isExist || axis.isVirtualAxis ||
+        axis.axisType != AxisType::LINEAR || axis.fbMode != FeedbackSource::MOTOR_ENCODER ||
+        (*m_pDrives)[0].pOutput == nullptr || (*m_pDrives)[0].slaveIndex < 0 ||
+        !axis.startupLagMonitorArmed || !axis.isServoOn || axis.targetMode != 9 ||
+        axis.isFault || axis.isLagAlarm || m_Group.isActive ||
+        axis.state != MotionState::MotionState_IDLE ||
+        axis.currentCmdVel != 0.0 || axis.logicalCmdVel != 0.0 ||
+        axis.targetVelocity != 0.0 || axis.targetEndVel != 0.0 ||
+        !IsPbcXHomeRawIdentity(axis) ||
+        m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+        HasPbcXUnresolvedActiveOutput() || HasPendingSafetyOrRecoveryRequests() ||
+        AlarmManager::GetInstance().HasAlarm()) return false;
+    const std::uint64_t owner = m_motionOwnerState.load(std::memory_order_acquire);
+    const MotionOwnerLease lease = UnpackMotionOwnerState(owner);
+    const std::uint64_t epoch = m_executionEpochPublication.load(std::memory_order_acquire);
+    if (!lease.IsValid() || lease.owner != MotionOwner::HOME ||
+        UnpackMotionOwnerSafetyHandshake(owner) || UnpackMotionOwnerSafetyActionPending(owner) ||
+        (owner & MOTION_OWNER_FRAME_SEND_RESERVED) != 0ULL ||
+        (epoch & EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        UnpackExecutionEpochPublication(epoch) == MOTION_EXECUTION_EPOCH_INVALID ||
+        HasUnacknowledgedSafetyMotionRequest()) return false;
+    double rawLogicalPulse = axis.isReverse ? -axis.unwrappedActPos : axis.unwrappedActPos;
+    if (axis.Axis_Reverse) rawLogicalPulse = -rawLogicalPulse;
+    if (!std::isfinite(rawLogicalPulse) ||
+        axis.currentActPos != rawLogicalPulse - axis.machineCoordinateOffsetPulse) return false;
+    key.ownerGeneration = lease.generation;
+    key.epoch = UnpackExecutionEpochPublication(epoch);
+    key.referenceGeneration = m_CompEngine.XReferenceGeneration();
+    key.incidentGeneration = m_pbcXSendContract.UncertainIncidentGeneration();
+    // Both routes are the exact current RT process-image sample. A route or
+    // physical-axis mapping transition starts a new interval; no compatibility
+    // getter or cross-thread position read is used as raw proof.
+    key.sourceIdentity = (static_cast<std::uint64_t>((*m_pDrives)[0].slaveIndex) + 1ULL) *
+        2ULL + (m_pbcXHomeStopSemanticSource ? 1ULL : 0ULL);
+    key.resolutionPPR = axis.resolution_PPR;
+    key.finalLead = axis.finalLead;
+    key.machineOffsetPulse = axis.machineCoordinateOffsetPulse;
+    key.windowPulse = axis.inPositionWindow_Pulse;
+    key.commandPulse = axis.currentCmdPos;
+    key.logicalCommandPulse = axis.logicalCmdPos.Load();
+    key.enablePitch = axis.enablePitch;
+    key.enableBacklash = axis.enableBacklash;
+    key.isReverse = axis.isReverse;
+    key.axisReverse = axis.Axis_Reverse;
+    return true;
+}
+
+void MotionCore::ObservePbcXHomeStop(const AxisContext& axis,
+    const MotionServoInputSnapshot& input, bool semanticSource) noexcept
+{
+    m_pbcXHomeStopSemanticSource = semanticSource;
+    MotionPbcHomeStopKey key{};
+    MotionPbcHomeStopSample sample{};
+    sample.tick = m_ncSettleRuntimeCycleTick;
+    sample.rawPosition = static_cast<std::uint32_t>(input.ActualPosition);
+    sample.unwrappedPulse = axis.unwrappedActPos;
+    sample.valid = m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid;
+    sample.contiguous = m_ncSettleRuntimeCycleContiguous;
+    sample.eligible = BuildPbcXHomeStopKey(axis, key) &&
+        (m_servoSourceInputMask & 1U) != 0U && m_pbcXFeedbackTick == sample.tick &&
+        static_cast<std::uint32_t>(axis.lastRawActPos) == sample.rawPosition &&
+        (input.StatusWord & 0x006FU) == 0x0027U && input.ModesOfOperationDisplay == 9;
+    (void)m_pbcXHomeStopProof.Observe(key, sample);
+}
+
+bool MotionCore::IsPbcXHomeStopped(const AxisContext& axis) const noexcept
+{
+    MotionPbcHomeStopKey key{};
+    return IsPbcXFeedbackCurrent(axis) && BuildPbcXHomeStopKey(axis, key) &&
+        std::isfinite(axis.currentActVel) &&
+        std::abs(axis.currentActVel) <= 1.0 / CYCLE_TIME_SEC &&
+        m_pbcXHomeStopProof.IsReady(m_ncSettleRuntimeCycleTick, key,
+            static_cast<std::uint32_t>(axis.lastRawActPos), axis.unwrappedActPos);
+}
+
+// PBC-3I: strict X INDEX_ONLY proof. All mutable proof fields have one RT writer.
+bool MotionCore::IsPbcXHomeCaptureConfiguration(const AxisContext& axis) const noexcept
+{
+    const HomeConfig& h = axis.home;
+    return axis.axisIndex == 0 && axis.isExist && !axis.isVirtualAxis &&
+        axis.axisType == AxisType::LINEAR && axis.fbMode == FeedbackSource::MOTOR_ENCODER &&
+        IsPbcXHomeRawIdentity(axis) &&
+        h.method == HomeMethod::INDEX_ONLY && h.referenceSource == HomeReferenceSource::MOTOR_ENCODER_INDEX &&
+        h.captureMode == HomeReferenceCaptureMode::DRIVE_HARDWARE_LATCH &&
+        h.driveProbeArmMode == HomeDriveProbeArmMode::CONTROLLER_60B8 &&
+        h.driveProbeDisarmValue == 0U && h.driveProbeArmValue == 0x0015U &&
+        h.driveProbeArmedMask == 1U && h.driveProbeCapturedMask == 2U &&
+        h.driveProbeCaptureToggleMask == 0U && h.driveProbeSourceMask == 0x0040U &&
+        h.driveProbeExpectedSourceValue == 0x0040U && h.driveProbeRequireArmedStatus &&
+        h.driveProbeRequireNewCapture && h.driveProbeDisarmAfterCapture &&
+        !h.driveProbeAllowPositionChangeDetection;
+}
+
+bool MotionCore::BuildPbcXHomeCaptureKey(const AxisContext& axis,
+    MotionPbcHomeCaptureKey& key, const ServoOutputFrameReservation* send) const noexcept
+{
+    key = MotionPbcHomeCaptureKey{};
+    if (!IsPbcXHomeCaptureConfiguration(axis) || m_pContexts == nullptr ||
+        m_pContexts->empty() || &(*m_pContexts)[0] != &axis || m_pDrives == nullptr ||
+        m_pDrives->size() != m_pContexts->size() || m_pContexts->size() > MAX_AXES ||
+        (*m_pDrives)[0].slaveIndex < 0 || (*m_pDrives)[0].pOutput == nullptr ||
+        (*m_pDrives)[0].pInput == nullptr ||
+        !axis.startupLagMonitorArmed || !axis.isServoOn || axis.targetMode != 9 ||
+        axis.isFault || axis.isLagAlarm || m_Group.isActive ||
+        (axis.state != MotionState::MotionState_IDLE &&
+            axis.state != MotionState::MotionState_VELOCITY &&
+            axis.state != MotionState::MotionState_STOPPING) ||
+        !IsPbcXHomeRawIdentity(axis) ||
+        m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+        m_pbcXSendContract.HasUnresolvedActiveOutput() || HasPendingSafetyOrRecoveryRequests() ||
+        HasUnacknowledgedSafetyMotionRequest() || AlarmManager::GetInstance().HasAlarm()) return false;
+    std::uint64_t owner = m_motionOwnerState.load(std::memory_order_acquire);
+    std::uint64_t epoch = m_executionEpochPublication.load(std::memory_order_acquire);
+    if (send != nullptr)
+    {
+        if (!send->acquired || owner != send->reservedOwnerState ||
+            epoch != send->reservedExecutionPublication ||
+            send->reservedOwnerState != (send->baseOwnerState | MOTION_OWNER_FRAME_SEND_RESERVED) ||
+            send->reservedExecutionPublication != (send->baseExecutionPublication |
+                EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) ||
+            !AlarmManager::GetInstance().IsMotionAdmissionCurrent(send->alarmAdmission) ||
+            m_frameSafetyIntentState.load(std::memory_order_acquire) != send->safetyIntentState)
+            return false;
+        owner = send->baseOwnerState;
+        epoch = send->baseExecutionPublication;
+    }
+    const MotionOwnerLease lease = UnpackMotionOwnerState(owner);
+    if (!lease.IsValid() || lease.owner != MotionOwner::HOME ||
+        UnpackMotionOwnerSafetyHandshake(owner) || UnpackMotionOwnerSafetyActionPending(owner) ||
+        (owner & (MOTION_OWNER_FRAME_SEND_RESERVED | MOTION_OWNER_OUTPUT_COMMIT_RESERVED)) != 0ULL ||
+        (epoch & EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        UnpackExecutionEpochPublication(epoch) == MOTION_EXECUTION_EPOCH_INVALID ||
+        static_cast<std::uint32_t>(m_frameSafetyIntentState.load(std::memory_order_acquire)) != 0U ||
+        m_executionDrainRevocationPublishersInProgress.load(std::memory_order_acquire) != 0U)
+        return false;
+    double raw = axis.isReverse ? -axis.unwrappedActPos : axis.unwrappedActPos;
+    if (axis.Axis_Reverse) raw = -raw;
+    if (!std::isfinite(raw) || axis.currentActPos != raw - axis.machineCoordinateOffsetPulse)
+        return false;
+    key.ownerGeneration = lease.generation;
+    key.epoch = UnpackExecutionEpochPublication(epoch);
+    key.referenceGeneration = m_CompEngine.XReferenceGeneration();
+    key.incidentGeneration = m_pbcXSendContract.UncertainIncidentGeneration();
+    key.sourceIdentity = (static_cast<std::uint64_t>((*m_pDrives)[0].slaveIndex) + 1ULL) *
+        2ULL + (m_pbcXHomeCaptureSemanticSource ? 1ULL : 0ULL);
+    key.frameSafetyGeneration = m_frameSafetyIntentState.load(std::memory_order_acquire);
+    // Reservation ownership is checked independently. Normalize only its bit;
+    // producer activity and monotonic Alarm history remain part of this key.
+    key.alarmSafetyGeneration = AlarmManager::MotionAdmissionBaseState(
+        AlarmManager::GetInstance().GetMotionSafetyIntentState());
+    key.alarmUpdateCount = AlarmManager::GetInstance().GetUpdateCount();
+    key.drainGeneration = m_executionDrainRevocationGeneration.load(std::memory_order_acquire);
+    key.inputIdentity = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>((*m_pDrives)[0].pInput));
+    key.outputIdentity = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>((*m_pDrives)[0].pOutput));
+    key.axisIndex = axis.axisIndex;
+    key.slaveIndex = (*m_pDrives)[0].slaveIndex;
+    key.resolutionPPR = axis.resolution_PPR;
+    key.finalLead = axis.finalLead;
+    key.machineOffsetPulse = axis.machineCoordinateOffsetPulse;
+    key.enablePitch = axis.enablePitch;
+    key.enableBacklash = axis.enableBacklash;
+    key.isReverse = axis.isReverse;
+    key.axisReverse = axis.Axis_Reverse;
+    key.home = axis.home;
+    return MotionPbcHomeCaptureProof::IsConfigurationValid(key);
+}
+
+void MotionCore::PublishPbcXHomeCaptureSnapshot() noexcept
+{
+    const MotionPbcHomeCaptureSnapshot snapshot = m_pbcXHomeCaptureProof.Snapshot();
+    std::array<std::uint64_t, PBC_HOME_CAPTURE_WORDS> words{};
+    std::memcpy(words.data(), &snapshot, sizeof(snapshot));
+    // Atomic payload words avoid a C++ data race even if the reader is preempted.
+    // One bounded attempt at the reader; neither side retries or waits.
+    m_pbcXHomeCapturePublication.fetch_add(1ULL, std::memory_order_seq_cst);
+    for (std::size_t i = 0U; i < words.size(); ++i)
+        m_pbcXHomeCaptureWords[i].store(words[i], std::memory_order_seq_cst);
+    m_pbcXHomeCapturePublication.fetch_add(1ULL, std::memory_order_seq_cst);
+}
+
+bool MotionCore::GetPbcXPhysicalHomeCaptureSnapshot(int axisIndex,
+    MotionPbcHomeCaptureSnapshot& out) const noexcept
+{
+    out = MotionPbcHomeCaptureSnapshot{};
+    if (axisIndex != 0) return false;
+    const std::uint64_t before = m_pbcXHomeCapturePublication.load(std::memory_order_seq_cst);
+    if (before == 0ULL || (before & 1ULL) != 0ULL) return false;
+    std::array<std::uint64_t, PBC_HOME_CAPTURE_WORDS> words{};
+    for (std::size_t i = 0U; i < words.size(); ++i)
+        words[i] = m_pbcXHomeCaptureWords[i].load(std::memory_order_seq_cst);
+    if (m_pbcXHomeCapturePublication.load(std::memory_order_seq_cst) != before) return false;
+    std::memcpy(&out, words.data(), sizeof(out));
+    return true;
+}
+
+bool MotionCore::IsPbcCoordinateIdentity(const AxisContext& axis) const noexcept
+{
+    const bool physicalX = m_pContexts != nullptr && !m_pContexts->empty() &&
+        &(*m_pContexts)[0] == &axis;
+    if ((physicalX || axis.axisIndex == 0) && m_CompEngine.IsSealed())
+    {
+        if (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+            HasPbcXUnresolvedActiveOutput()) return false;
+        // OFF is bound to the sealed configuration too: changing enable flags
+        // back to false cannot turn a zero-enabled boot into a legacy bypass.
+        return m_CompEngine.IsXConfiguredDisabledIdentity(axis) ||
+            m_CompEngine.IsXZeroOnlyCoordinateIdentity(axis);
+    }
+    return pbc::HasDisabledCoordinateIdentity(axis.enablePitch || axis.enableBacklash,
+        axis.currentCompOffset_unit, axis.mechanicalCompensationFrame);
+}
+
+// PBC-3K keeps raw HOME identity distinct from a compensated control frame.
+// A nonzero table does not authorize a numeric raw/nominal bypass.
+bool MotionCore::IsPbcXHomeRawIdentity(const AxisContext& axis) const noexcept
+{
+    if (IsPbcCoordinateIdentity(axis)) return true;
+    return m_pContexts != nullptr && !m_pContexts->empty() &&
+        &(*m_pContexts)[0] == &axis && axis.axisIndex == 0 &&
+        !m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) &&
+        !HasPbcXUnresolvedActiveOutput() &&
+        m_CompEngine.IsXHomeControlCoordinateIdentity(axis);
+}
+
+bool MotionCore::IsPbcControlScope(const AxisContext& axis) const noexcept
+{
+    if (IsPbcCoordinateIdentity(axis)) return true;
+    return m_pContexts != nullptr && !m_pContexts->empty() &&
+        &(*m_pContexts)[0] == &axis && axis.axisIndex == 0 &&
+        !m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) &&
+        !HasPbcXUnresolvedActiveOutput() &&
+        m_CompEngine.IsXKnownAppliedControlFrame(axis);
+}
+
+void MotionCore::PublishPbcXZeroOnlyHomeIdentity() noexcept
+{
+    const bool current = m_pContexts != nullptr && !m_pContexts->empty() &&
+        m_ncSettleMotionPassCompleted && m_ncSettleRuntimeObserved &&
+        m_ncSettleRuntimeCycleValid && m_ncSettleRuntimeCycleContiguous &&
+        m_pbcXFeedbackTick == m_ncSettleRuntimeCycleTick && (m_servoSourceInputMask & 1U) != 0U &&
+        !m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) &&
+        !HasPbcXUnresolvedActiveOutput();
+    m_pbcXZeroOnlyHomeIdentity.store(current &&
+        m_CompEngine.IsXZeroOnlyCoordinateIdentity((*m_pContexts)[0]), std::memory_order_release);
+    m_pbcXStagedHomeEntryIdentity.store(current &&
+        m_CompEngine.IsXStagedProfileConfiguration((*m_pContexts)[0]) &&
+        m_CompEngine.IsXHomeEntryCoordinateIdentity((*m_pContexts)[0]), std::memory_order_release);
+    m_pbcXConfiguredDisabledHomeIdentity.store(current &&
+        m_CompEngine.IsXConfiguredDisabledIdentity((*m_pContexts)[0]), std::memory_order_release);
+}
+
+bool MotionCore::IsPbcXZeroOnlyHomeIdentity(int axisIndex) const noexcept
+{
+    // Supervisory preflight only. Final RT HOME repeats the exact Engine,
+    // raw-stop, capture-token and reservation checks before any scalar write.
+    return axisIndex == 0 && m_pbcXZeroOnlyHomeIdentity.load(std::memory_order_acquire) &&
+        !m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) &&
+        !HasPbcXUnresolvedActiveOutput();
+}
+
+bool MotionCore::IsPbcXStagedHomeEntryIdentity(int axisIndex) const noexcept
+{
+    return axisIndex == 0 && m_pbcXStagedHomeEntryIdentity.load(std::memory_order_acquire) &&
+        !m_CompEngine.IsXPhysicalHomeEstablished() &&
+        !m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) &&
+        !HasPbcXUnresolvedActiveOutput();
+}
+
+bool MotionCore::IsPbcXConfiguredDisabledHomeIdentity(int axisIndex) const noexcept
+{
+    return axisIndex == 0 && m_pbcXConfiguredDisabledHomeIdentity.load(std::memory_order_acquire) &&
+        !m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) &&
+        !HasPbcXUnresolvedActiveOutput();
+}
+
+bool MotionCore::IsPbcXPhysicalHomeCaptureSupported(int axisIndex) const noexcept
+{
+    return axisIndex == 0 && m_pbcXHomeCaptureSupported.load(std::memory_order_acquire);
+}
+
+void MotionCore::InvalidatePbcXHomeCapture() noexcept
+{
+    m_pbcXHomeCaptureProof.Invalidate();
+    m_pbcXHomeProbeCommand.pending = false;
+    PublishPbcXHomeCaptureSnapshot();
+}
+
+void MotionCore::ObservePbcXHomeCapture(const AxisContext& axis,
+    const MotionServoInputSnapshot& input, bool semanticSource) noexcept
+{
+    m_pbcXHomeCaptureSemanticSource = semanticSource;
+    m_pbcXHomeCaptureSupported.store(IsPbcXHomeCaptureConfiguration(axis), std::memory_order_release);
+    MotionPbcHomeCaptureKey key{};
+    MotionPbcHomeCaptureSample sample{};
+    sample.tick = m_ncSettleRuntimeCycleTick;
+    sample.rawPosition = static_cast<std::uint32_t>(input.ActualPosition);
+    sample.capturedRawPosition = static_cast<std::uint32_t>(input.TouchProbePosition);
+    sample.unwrappedPulse = axis.unwrappedActPos;
+    sample.probeStatus = input.TouchProbeStatus;
+    sample.valid = m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid;
+    sample.contiguous = m_ncSettleRuntimeCycleContiguous;
+    sample.eligible = BuildPbcXHomeCaptureKey(axis, key) &&
+        (m_servoSourceInputMask & 1U) != 0U && m_pbcXFeedbackTick == sample.tick &&
+        static_cast<std::uint32_t>(axis.lastRawActPos) == sample.rawPosition &&
+        (input.StatusWord & 0x006FU) == 0x0027U && input.ModesOfOperationDisplay == 9;
+    (void)m_pbcXHomeCaptureProof.Observe(key, sample);
+    if (m_pbcXHomeCaptureProof.Snapshot().failed) m_pbcXHomeProbeCommand.pending = false;
+    PublishPbcXHomeCaptureSnapshot();
+}
+
+bool MotionCore::SealPbcXHomeProbeSerializedImage(ServoOutputFrameReservation& reservation,
+    const std::uint8_t* ioMapBase, std::size_t ioMapSize,
+    const std::uint8_t* serializedPayload, std::size_t payloadSize) noexcept
+{
+    if (!SealEDMZFixtureSerializedImage(reservation, ioMapBase, ioMapSize,
+        serializedPayload, payloadSize)) return false;
+    if (!m_pbcXHomeProbeSendPending) return !reservation.homeProbe.pending;
+    const ServoOutputFrameReservation& canonical = m_pbcXHomeProbeCanonicalSend;
+    if (reservation.handoff.sequence != canonical.handoff.sequence) return false;
+    reservation.homeProbeSerializedExact = false;
+    MotionPbcHomeCaptureKey key{};
+    if (!reservation.homeProbe.pending || !reservation.acquired ||
+        !canonical.acquired || !canonical.handoff.finalChecked || canonical.handoff.scrubbed ||
+        reservation.handoff.scrubbed || !reservation.handoff.finalChecked ||
+        !reservation.handoffPending ||
+        reservation.handoff.frameGeneration != canonical.handoff.frameGeneration ||
+        reservation.handoff.sourceTick != canonical.handoff.sourceTick ||
+        canonical.handoff.sourceTick != m_ncSettleRuntimeCycleTick ||
+        !m_ncSettleRuntimeObserved || !m_ncSettleRuntimeCycleValid || !m_ncSettleRuntimeCycleContiguous ||
+        reservation.safetyIntentState != canonical.safetyIntentState ||
+        reservation.homeProbe.sequence != canonical.homeProbe.sequence ||
+        reservation.homeProbe.tick != canonical.homeProbe.tick ||
+        reservation.homeProbe.value != canonical.homeProbe.value ||
+        reservation.baseOwnerState != canonical.baseOwnerState ||
+        reservation.reservedOwnerState != canonical.reservedOwnerState ||
+        reservation.baseExecutionPublication != canonical.baseExecutionPublication ||
+        reservation.reservedExecutionPublication != canonical.reservedExecutionPublication ||
+        reservation.alarmAdmission.baseState != canonical.alarmAdmission.baseState ||
+        reservation.alarmAdmission.reservedState != canonical.alarmAdmission.reservedState ||
+        reservation.alarmAdmission.expectedUpdateCount != canonical.alarmAdmission.expectedUpdateCount ||
+        reservation.alarmAdmission.requireNoAlarm != canonical.alarmAdmission.requireNoAlarm ||
+        reservation.alarmAdmission.acquired != canonical.alarmAdmission.acquired ||
+        m_pContexts == nullptr || m_pContexts->empty() ||
+        !BuildPbcXHomeCaptureKey((*m_pContexts)[0], key, &reservation) ||
+        !MotionPbcHomeCaptureProof::SameIdentityKey(key, canonical.homeProbe.key) ||
+        !MotionPbcHomeCaptureProof::SameIdentityKey(reservation.homeProbe.key, canonical.homeProbe.key) ||
+        ioMapBase == nullptr || serializedPayload == nullptr || payloadSize != ioMapSize ||
+        m_pDrives == nullptr || m_pDrives->empty() || (*m_pDrives)[0].pOutput == nullptr)
+        return false;
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(ioMapBase);
+    const std::uintptr_t output = reinterpret_cast<std::uintptr_t>((*m_pDrives)[0].pOutput);
+    if (output < base || output - base > ioMapSize) return false;
+    const std::size_t offset = static_cast<std::size_t>(output - base);
+    if (offset > ioMapSize || sizeof(ServoOutput) > ioMapSize - offset) return false;
+    const std::size_t field = offset + offsetof(ServoOutput, TouchProbeFunc);
+    const std::uint16_t value = static_cast<std::uint16_t>(serializedPayload[field]) |
+        static_cast<std::uint16_t>(static_cast<std::uint16_t>(serializedPayload[field + 1U]) << 8U);
+    if (value != canonical.homeProbe.value ||
+        (*m_pDrives)[0].pOutput->TouchProbeFunc != canonical.homeProbe.value ||
+        !m_pbcXHomeProbeCommand.pending ||
+        m_pbcXHomeProbeCommand.sequence != canonical.homeProbe.sequence) return false;
+    reservation.homeProbeSerializedExact = true;
+    m_pbcXHomeProbeCanonicalSend = reservation;
+    return true;
+}
+
+void MotionCore::PublishPbcReference(const AxisContext& axis,
+    const CompensationEngine::XReferenceTransaction& tx,
+    MotionPbcReferenceResult result, pbc::Error error) noexcept
+{
+    MotionPbcReferenceEvent event{};
+    event.tick = tx.authority.tick; event.epoch = tx.authority.epoch;
+    event.ownerGeneration = tx.authority.ownerGeneration;
+    event.request = tx.authority.requestSequence; event.ticket = tx.plan.ticket;
+    event.referenceGeneration = m_CompEngine.XReferenceGeneration();
+    event.rawPulse = axis.currentActPos; event.nominalPulse = axis.currentCmdPos;
+    event.offsetPulse = axis.mechanicalCompensationFrame.offsetPulse;
+    event.pulsePerUnit = axis.resolution_PPR / axis.finalLead;
+    event.action = tx.plan.action == pbc::ReferenceAction::HomeClear ?
+        MotionPbcReferenceAction::Home : MotionPbcReferenceAction::Reset;
+    event.modelAction = tx.plan.action; event.result = result; event.error = error;
+    event.phase = m_CompEngine.XReferencePhase(); event.homed = axis.isHomed;
+    event.stopped = tx.authority.stopped; event.queuesDrained = tx.authority.queuesDrained;
+    event.reserved = tx.authority.coordinateReservation;
+    m_pbcReferenceAudit.Publish(event);
+}
+
+// PBC-3G: numeric loss paths only request recovery. They never establish
+// a stopped coordinate or advance the reference generation themselves.
+bool MotionCore::LatchPbcXRetainRecovery(AxisContext& axis,
+    CompensationEngine::XRetainRecoveryKind kind) noexcept
+{
+    if (kind == CompensationEngine::XRetainRecoveryKind::None ||
+        (kind != CompensationEngine::XRetainRecoveryKind::Servo &&
+            kind != CompensationEngine::XRetainRecoveryKind::Fault &&
+            kind != CompensationEngine::XRetainRecoveryKind::Limit)) return false;
+    if (axis.axisIndex == 0)
+    {
+        // A callback still owns any nonzero send sequence. Only an image that
+        // never entered Begin may be discarded as an unsent proposal.
+        if (m_pbcXCycleSendSequence != 0ULL || m_pbcXSendSequence != 0ULL) return false;
+        DiscardPbcXUnsentCycle();
+    }
+    if (m_pbcXSendContract.HasUnresolvedActiveOutput() ||
+        !m_CompEngine.IsXKnownOffsetReferenceReady(axis) ||
+        m_pbcXRetainLossSequence == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    ++m_pbcXRetainLossSequence;
+    m_pbcXRetainCommittedLossSequence = 0ULL;
+    m_pbcXRetainRecoveryTicket = 0ULL;
+    m_pbcXRetainFrame = axis.mechanicalCompensationFrame;
+    if (!m_pbcXRetainRecoveryRequired) m_pbcXRetainRecoveryKind = kind;
+    m_pbcXRetainRecoveryRequired = true;
+    m_pbcXRetainOriginReference = m_CompEngine.XReferenceGeneration();
+    m_pbcXRetainAppliedReference = 0ULL;
+    m_pbcXRetainResetRequest = 0ULL;
+    axis.currentCmdVel = axis.logicalCmdVel = 0.0;
+    axis.targetVelocity = axis.targetEndVel = 0.0;
+    axis.pid.prevError = axis.pid.integralAcc = 0.0;
+    axis.Pid_IDLE.prevError = axis.Pid_IDLE.integralAcc = 0.0;
+    axis.Pid_G00.prevError = axis.Pid_G00.integralAcc = 0.0;
+    axis.inPosition = false;
+    axis.isFault = true;
+    axis.state = MotionState::MotionState_ERROR;
+    return true;
+}
+
+bool MotionCore::HoldPbcXRetainRecoveryOutput(AxisContext& axis, ServoOutput* output) noexcept
+{
+    if (axis.axisIndex != 0 || !m_pbcXRetainRecoveryRequired) return false;
+    const std::uint64_t expected = m_pbcXRetainAppliedReference != 0ULL ?
+        m_pbcXRetainAppliedReference : m_pbcXRetainOriginReference;
+    const bool rawReady = (m_servoSourceInputMask & 1U) != 0U &&
+        (m_servoSourceStatusWord[0] & 0x006FU) == 0x0027U && m_servoSourceMode[0] == 9;
+    if (!rawReady)
+    {
+        axis.isServoOn = false;
+        if (m_pbcXRetainAppliedReference != 0ULL && m_pbcXRetainCommittedLossSequence != 0ULL)
+        {
+            if (m_pbcXRetainLossSequence != (std::numeric_limits<std::uint64_t>::max)())
+                ++m_pbcXRetainLossSequence;
+            // A new power/mode loss invalidates this RESET's postproof. Only
+            // another explicit request can prove and apply a fresh recovery.
+            m_pbcXRetainCommittedLossSequence = 0ULL;
+            m_pbcXRetainRecoveryTicket = 0ULL;
+        }
+    }
+    if (m_pbcXSendContract.HasUnresolvedActiveOutput() ||
+        m_CompEngine.XReferenceGeneration() != expected ||
+        !m_CompEngine.IsXKnownOffsetReferenceReady(axis) ||
+        !pbc::SameControlCoordinateFrame(axis.mechanicalCompensationFrame, m_pbcXRetainFrame))
+    {
+        axis.isFault = true;
+        axis.state = MotionState::MotionState_ERROR;
+    }
+    // Keep measuring raw feedback. Zero command output is not proof that the
+    // motor stopped, and must not manufacture a zero actual-velocity sample.
+    axis.currentActVel = (axis.currentActPos - axis.lastActPos) / CYCLE_TIME_SEC;
+    axis.lastActPos = axis.currentActPos;
+    axis.currentCmdVel = axis.logicalCmdVel = 0.0;
+    axis.targetVelocity = axis.targetEndVel = 0.0;
+    axis.inPosition = false;
+    WriteServoTargetVelocityCommand(output, axis.axisIndex, 0);
+    return true;
+}
+
+bool MotionCore::IsPbcXRetainRecoveryPreproofEligible(const AxisContext& axis) const noexcept
+{
+    return m_pbcXRetainRecoveryRequired && !m_pbcXSendContract.HasUnresolvedActiveOutput() &&
+        m_pbcXRetainAppliedReference == 0ULL &&
+        m_pbcXRetainOriginReference == m_CompEngine.XReferenceGeneration() &&
+        m_CompEngine.IsXKnownOffsetReferenceReady(axis) &&
+        pbc::SameControlCoordinateFrame(axis.mechanicalCompensationFrame, m_pbcXRetainFrame) &&
+        !m_Group.isActive && axis.startupLagMonitorArmed && !axis.isFault && !axis.isLagAlarm &&
+        axis.state == MotionState::MotionState_IDLE &&
+        axis.currentCmdVel == 0.0 && axis.logicalCmdVel == 0.0 &&
+        axis.targetVelocity == 0.0 && axis.targetEndVel == 0.0 &&
+        std::isfinite(axis.currentActVel) && m_ncSettleRuntimeObserved &&
+        m_ncSettleRuntimeCycleValid && m_ncSettleRuntimeCycleContiguous &&
+        m_pbcXFeedbackTick == m_ncSettleRuntimeCycleTick &&
+        (m_servoSourceInputMask & 1U) != 0U &&
+        (m_servoSourceStatusWord[0] & 0x006FU) == 0x0027U &&
+        m_servoSourceMode[0] == 9 && axis.isServoOn && axis.targetMode == 9;
+}
+
+void MotionCore::CompletePbcXRetainRecoveryAfterReset() noexcept
+{
+    if (!m_pbcXRetainRecoveryRequired || m_pbcXRetainAppliedReference == 0ULL ||
+        m_pbcXRetainRecoveryTicket == 0ULL || m_pbcXRetainLossSequence == 0ULL ||
+        m_pbcXRetainCommittedLossSequence != m_pbcXRetainLossSequence ||
+        m_pbcXRetainAppliedReference != m_CompEngine.XReferenceGeneration() ||
+        m_ncResetRebasePhase != MotionNCResetRebasePhase::ACKNOWLEDGED ||
+        m_pbcXRetainResetRequest != m_ncResetRebaseAckProducer.requestSequence ||
+        !m_ncResetRebaseAckProducer.acked || !m_ncResetRebaseAckProducer.postVerifyPassed ||
+        !VerifyNCResetRebaseState()) return;
+    m_pbcXRetainRecoveryRequired = false;
+    m_pbcXRetainRecoveryKind = CompensationEngine::XRetainRecoveryKind::None;
+    m_pbcXRetainOriginReference = m_pbcXRetainAppliedReference = 0ULL;
+    m_pbcXRetainResetRequest = 0ULL;
+    m_pbcXRetainCommittedLossSequence = m_pbcXRetainRecoveryTicket = 0ULL;
+    m_pbcXRetainFrame = pbc::CoordinateFrame{};
+}
+
+bool MotionCore::TryPbcNominalSnap(AxisContext& axis, double& nominal,
+    MotionPbcReferenceAction action) noexcept
+{
+    CompensationEngine::XRetainRecoveryKind recovery = CompensationEngine::XRetainRecoveryKind::None;
+    if (action == MotionPbcReferenceAction::ServoSnap) recovery = CompensationEngine::XRetainRecoveryKind::Servo;
+    else if (action == MotionPbcReferenceAction::FaultSnap) recovery = CompensationEngine::XRetainRecoveryKind::Fault;
+    else if (action == MotionPbcReferenceAction::LimitSnap) recovery = CompensationEngine::XRetainRecoveryKind::Limit;
+    const bool recoveryPending = (axis.enablePitch || axis.enableBacklash) &&
+        LatchPbcXRetainRecovery(axis, recovery);
+    const bool outputKnown = axis.axisIndex != 0 ||
+        (!m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) &&
+            !HasPbcXUnresolvedActiveOutput());
+    const bool accepted = !recoveryPending && outputKnown &&
+        m_CompEngine.TryNominalSnapPulse(axis.axisIndex, axis, nominal);
+    if (axis.axisIndex == 0 && (m_pbcLastSnapTick + 1ULL != m_ncSettleRuntimeCycleTick ||
+        m_pbcLastSnapAction != action || m_pbcLastSnapAccepted != accepted))
+    {
+        MotionPbcReferenceEvent event{};
+        const MotionOwnerLease owner = GetMotionOwnerLease();
+        event.tick = m_ncSettleRuntimeCycleTick; event.epoch = GetCurrentExecutionEpoch();
+        event.ownerGeneration = owner.generation; event.action = action;
+        event.result = accepted ? MotionPbcReferenceResult::NumericSnap : MotionPbcReferenceResult::Rejected;
+        event.error = accepted ? pbc::Error::None : pbc::Error::LifecycleRejected;
+        event.referenceGeneration = m_CompEngine.XReferenceGeneration();
+        event.phase = m_CompEngine.XReferencePhase(); event.homed = axis.isHomed;
+        event.rawPulse = axis.currentActPos; event.nominalPulse = accepted ? nominal : axis.currentCmdPos;
+        event.offsetPulse = axis.mechanicalCompensationFrame.offsetPulse;
+        event.pulsePerUnit = axis.resolution_PPR / axis.finalLead;
+        m_pbcReferenceAudit.Publish(event);
+    }
+    if (axis.axisIndex == 0)
+    {
+        m_pbcLastSnapTick = m_ncSettleRuntimeCycleTick;
+        m_pbcLastSnapAction = action;
+        m_pbcLastSnapAccepted = accepted;
+    }
+    if (!accepted && !recoveryPending)
+    {
+        axis.isFault = true; axis.state = MotionState::MotionState_ERROR;
+        axis.currentCmdVel = 0.0; axis.logicalCmdVel = 0.0;
+        axis.targetVelocity = 0.0; axis.targetEndVel = 0.0; axis.inPosition = false;
+    }
+    return accepted;
+}
+
+bool MotionCore::AcquirePbcHomeReservation(const MotionOwnerLease& lease,
+    PbcHomeReservation& r) noexcept
+{
+    r = PbcHomeReservation{};
+    if (!m_pbcReferenceIngress.TryReserve()) return false;
+    r.ingress = true;
+    const auto fail = [this, &r]() noexcept { ReleasePbcHomeReservation(r); return false; };
+    std::uint64_t owner = m_motionOwnerState.load(std::memory_order_acquire);
+    std::uint64_t epoch = m_executionEpochPublication.load(std::memory_order_acquire);
+    r.safety = m_frameSafetyIntentState.load(std::memory_order_acquire);
+    r.drain = m_executionDrainRevocationGeneration.load(std::memory_order_acquire);
+    if (!lease.IsValid() || lease.owner != MotionOwner::HOME ||
+        !UnpackMotionOwnerState(owner).Matches(lease) ||
+        UnpackMotionOwnerSafetyHandshake(owner) || UnpackMotionOwnerSafetyActionPending(owner) ||
+        (owner & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        (epoch & (EXECUTION_EPOCH_PUBLICATION_PENDING | EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+        UnpackExecutionEpochPublication(epoch) == MOTION_EXECUTION_EPOCH_INVALID ||
+        static_cast<std::uint32_t>(r.safety) != 0U || HasPendingSafetyOrRecoveryRequests() ||
+        HasUnacknowledgedSafetyMotionRequest() || m_executionDrainRevocationPublishersInProgress.load(std::memory_order_acquire) != 0U ||
+        !m_Group.cmdQueue.empty() || m_axisCommandChannel.command_size() != 0U)
+        return fail();
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    if (!alarms.BeginMotionAdmission(alarms.GetUpdateCount(), r.alarm)) return fail();
+    r.owner = owner | MOTION_OWNER_EPOCH_COMMIT_RESERVED;
+    if (!m_motionOwnerState.compare_exchange_strong(owner, r.owner,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return fail();
+    r.ownerHeld = true;
+    r.epoch = epoch | EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED;
+    if (!m_executionEpochPublication.compare_exchange_strong(epoch, r.epoch,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return fail();
+    r.epochHeld = true;
+    if (!IsPbcHomeReservationCurrent(r)) return fail();
+    return true;
+}
+
+bool MotionCore::IsPbcHomeReservationCurrent(const PbcHomeReservation& r) const noexcept
+{
+    return r.ingress && r.ownerHeld && r.epochHeld && m_pbcReferenceIngress.IsReserved() &&
+        m_motionOwnerState.load(std::memory_order_acquire) == r.owner &&
+        m_executionEpochPublication.load(std::memory_order_acquire) == r.epoch &&
+        m_frameSafetyIntentState.load(std::memory_order_acquire) == r.safety &&
+        m_executionDrainRevocationGeneration.load(std::memory_order_acquire) == r.drain &&
+        m_executionDrainRevocationPublishersInProgress.load(std::memory_order_acquire) == 0U &&
+        AlarmManager::GetInstance().IsMotionAdmissionCurrent(r.alarm) &&
+        m_Group.cmdQueue.empty() && m_axisCommandChannel.command_size() == 0U;
+}
+
+void MotionCore::ReleasePbcHomeReservation(PbcHomeReservation& r) noexcept
+{
+    if (r.epochHeld)
+    {
+        std::uint64_t expected = r.epoch;
+        if (!m_executionEpochPublication.compare_exchange_strong(expected,
+            r.epoch & ~EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+            m_executionEpochPublication.fetch_and(~EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED, std::memory_order_acq_rel);
+    }
+    if (r.ownerHeld) ReleaseExactResetNCSettleReservation(r.owner);
+    if (r.alarm.acquired) (void)AlarmManager::GetInstance().EndMotionAdmission(r.alarm);
+    if (r.ingress) m_pbcReferenceIngress.Release();
+    r = PbcHomeReservation{};
+}
+
+bool MotionCore::ApplyNCResetScalarRebase() noexcept
+{
+    DiscardPbcXUnsentCycle(); // The prior image was never submitted to transport.
+    m_pbcResetReferenceGeneration = 0ULL;
+    m_pbcResetRetainedOffsetPulse = 0.0;
     const std::uint32_t axisMask =
         m_ncResetRebaseAckProducer.requestedAxisMask;
     const std::size_t axisCount =
@@ -1901,6 +3554,74 @@ void MotionCore::ApplyNCResetScalarRebase() noexcept
         ? (std::min)(m_pContexts->size(),
             static_cast<std::size_t>(MAX_AXES))
         : 0U;
+
+    CompensationEngine::XReferenceTransaction xReference{};
+    pbc::Diagnostic xDiagnostic{};
+    AlarmManager::MotionAdmissionReservation xAlarm{};
+    const bool referenceX = axisCount != 0U && (axisMask & 1U) != 0U &&
+        (*m_pContexts)[0].axisType == AxisType::LINEAR &&
+        (*m_pContexts)[0].fbMode == FeedbackSource::MOTOR_ENCODER;
+    const std::uint64_t reservedOwner = m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t execution = m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t safety = m_frameSafetyIntentState.load(std::memory_order_acquire);
+    if (referenceX)
+    {
+        const AxisContext& x = (*m_pContexts)[0];
+        const MotionNCSettleRequest& request = m_activeResetNCSettleRequest;
+        pbc::ReferenceAuthority authority{};
+        authority.tick = m_ncSettleRuntimeCycleTick;
+        authority.epoch = request.executionEpoch;
+        authority.ownerGeneration = request.ownerLease.generation;
+        // The token is minted only by the successful 200-cycle RESET preproof.
+        // PBC-3D Fix1: the proof uses bounded raw-position excursion, not
+        // the one-cycle encoder derivative (which includes count jitter).
+        // Keep finite feedback and the adjacent proof/source/owner checks.
+        // Old smoothing history is cleared below while interpolation is frozen;
+        // queuesDrained denotes actual command queues, never buffer contents.
+        authority.stopped = m_pbcResetPreproofTick != 0ULL &&
+            m_pbcResetPreproofTick + 1ULL == m_ncSettleRuntimeCycleTick &&
+            m_pbcResetPreproofRequest == request.requestSequence &&
+            m_pbcResetPreproofEpoch == request.executionEpoch &&
+            m_pbcResetPreproofOwner == request.ownerLease.generation &&
+            IsPbcXFeedbackCurrent(x) && !x.isFault &&
+            std::isfinite(x.currentActVel) &&
+            std::isfinite(x.currentCmdVel) && std::abs(x.currentCmdVel) <= 1.0 &&
+            std::isfinite(x.logicalCmdVel) && std::abs(x.logicalCmdVel) <= 1.0;
+        authority.queuesDrained = m_pbcReferenceIngress.IsReserved() &&
+            m_Group.cmdQueue.empty() && m_axisCommandChannel.command_size() == 0U;
+        authority.coordinateReservation =
+            (reservedOwner & MOTION_OWNER_EPOCH_COMMIT_RESERVED) != 0ULL &&
+            UnpackMotionOwnerState(reservedOwner).Matches(request.ownerLease) &&
+            UnpackExecutionEpochPublication(execution) == request.executionEpoch &&
+            (execution & EXECUTION_EPOCH_PUBLICATION_PENDING) == 0ULL &&
+            AlarmManager::GetInstance().BeginMotionAdmission(
+                AlarmManager::GetInstance().GetUpdateCount(), xAlarm);
+        authority.coordinateReservation = authority.coordinateReservation &&
+            m_executionDrainRevocationPublishersInProgress.load(std::memory_order_acquire) == 0U &&
+            m_executionDrainRevocationGeneration.load(std::memory_order_acquire) == request.safetyProvenanceGeneration &&
+            m_motionOwnerState.load(std::memory_order_acquire) == reservedOwner &&
+            m_executionEpochPublication.load(std::memory_order_acquire) == execution &&
+            m_frameSafetyIntentState.load(std::memory_order_acquire) == safety &&
+            AlarmManager::GetInstance().IsMotionAdmissionCurrent(xAlarm);
+        const bool recoveryPending = m_pbcXRetainRecoveryRequired &&
+            (x.enablePitch || x.enableBacklash);
+        const bool recoveryCurrent = !recoveryPending ||
+            (m_pbcXRetainAppliedReference == 0ULL &&
+                m_pbcXRetainOriginReference == m_CompEngine.XReferenceGeneration());
+        const bool outputKnown = !(x.enablePitch || x.enableBacklash) ||
+            !m_pbcXSendContract.HasUnresolvedActiveOutput();
+        const bool prepared = outputKnown && recoveryCurrent && (recoveryPending ?
+            m_CompEngine.PrepareXRetainRecoveryReference(x, m_pbcXRetainRecoveryKind,
+                authority, xReference, xDiagnostic) :
+            m_CompEngine.PrepareXResetReference(x, authority, xReference, xDiagnostic));
+        if (!prepared)
+        {
+            if (xReference.authority.tick == 0ULL) xReference.authority = authority;
+            PublishPbcReference(x, xReference, MotionPbcReferenceResult::Rejected, xDiagnostic.error);
+            if (xAlarm.acquired) (void)AlarmManager::GetInstance().EndMotionAdmission(xAlarm);
+            return false;
+        }
+    }
 
     for (std::size_t axisSlot = 0U; axisSlot < axisCount; ++axisSlot)
     {
@@ -1932,12 +3653,21 @@ void MotionCore::ApplyNCResetScalarRebase() noexcept
         }
         m_ncResetRebaseAckProducer.actualMcsUnit[axisSlot] = actualUnit;
 
-        axis.currentCmdPos = actualPulse;
-        axis.logicalCmdPos = actualPulse;
-        axis.planningPos = actualPulse;
-        axis.finalTargetPos = actualPulse;
-        axis.startCmdPos = actualPulse;
-        axis.lastQueuedPulse = actualPulse;
+        const double nominalPulse = axisSlot == 0U && referenceX ?
+            xReference.plan.nominalCommandPulse : actualPulse;
+        m_pbcResetNominalReferencePulse[axisSlot] = nominalPulse;
+        // NC planning consumes nominal MCS; raw ACK fields remain encoder
+        // evidence. Preserve the exact historical OFF conversion/modulo bits.
+        if (axisSlot == 0U)
+            m_ncResetRebaseAckProducer.xNominalMcsUnit =
+                referenceX && (axis.enablePitch || axis.enableBacklash) ?
+                    nominalPulse * axis.finalLead / axis.resolution_PPR : actualUnit;
+        axis.currentCmdPos = nominalPulse;
+        axis.logicalCmdPos = nominalPulse;
+        axis.planningPos = nominalPulse;
+        axis.finalTargetPos = nominalPulse;
+        axis.startCmdPos = nominalPulse;
+        axis.lastQueuedPulse = nominalPulse;
         axis.lastActPos = actualPulse;
 
         axis.currentCmdVel = 0.0;
@@ -1964,6 +3694,43 @@ void MotionCore::ApplyNCResetScalarRebase() noexcept
         axis.state = MotionState::MotionState_IDLE;
         axis.inPosition = true;
         axis.resetRequest = false;
+    }
+
+    if (referenceX)
+    {
+        pbc::ReferenceAuthority current = xReference.authority;
+        current.coordinateReservation = m_pbcReferenceIngress.IsReserved() &&
+            m_motionOwnerState.load(std::memory_order_acquire) == reservedOwner &&
+            m_executionEpochPublication.load(std::memory_order_acquire) == execution &&
+            m_frameSafetyIntentState.load(std::memory_order_acquire) == safety &&
+            m_executionDrainRevocationPublishersInProgress.load(std::memory_order_acquire) == 0U &&
+            m_executionDrainRevocationGeneration.load(std::memory_order_acquire) ==
+                m_activeResetNCSettleRequest.safetyProvenanceGeneration &&
+            AlarmManager::GetInstance().IsMotionAdmissionCurrent(xAlarm);
+        AxisContext& x = (*m_pContexts)[0];
+        const bool finished = m_CompEngine.FinishXReference(x, xReference, current,
+            pbc::ReferenceCommitResult::Applied, xDiagnostic);
+        PublishPbcReference(x, xReference, finished ? MotionPbcReferenceResult::Applied :
+            MotionPbcReferenceResult::Uncertain, xDiagnostic.error);
+        (void)AlarmManager::GetInstance().EndMotionAdmission(xAlarm);
+        if (!finished)
+        {
+            x.isFault = true; x.state = MotionState::MotionState_ERROR;
+            if ((x.enablePitch || x.enableBacklash) &&
+                m_CompEngine.XReferencePhase() == pbc::LifecyclePhase::OutputUncertain)
+                m_pbcXSendContract.QuarantineActiveOutput();
+            return false;
+        }
+        m_pbcResetReferenceGeneration = m_CompEngine.XReferenceGeneration();
+        m_pbcResetRetainedOffsetPulse = x.mechanicalCompensationFrame.offsetPulse;
+        if (m_pbcXRetainRecoveryRequired)
+        {
+            m_pbcXRetainAppliedReference = m_pbcResetReferenceGeneration;
+            m_pbcXRetainResetRequest = m_activeResetNCSettleRequest.requestSequence;
+            m_pbcXRetainRecoveryTicket = xReference.plan.ticket;
+            m_pbcXRetainCommittedLossSequence = m_pbcXRetainLossSequence;
+            m_pbcXRetainFrame = x.mechanicalCompensationFrame;
+        }
     }
 
     AxisContext& virtualAxis = m_Group.virtualAxis;
@@ -2018,6 +3785,7 @@ void MotionCore::ApplyNCResetScalarRebase() noexcept
     m_Group.currentExecutionPlaneMode = tags.physicalPlaneMode;
 
     m_Group.isActive = false;
+    ClearEccentricCConsumer();
     m_Group.axisCount = 0;
     m_Group.mode = InterpolationMode::LINEAR;
     m_Group.feedrateOverride = 1.0;
@@ -2069,6 +3837,7 @@ void MotionCore::ApplyNCResetScalarRebase() noexcept
     m_ncResetScalarRebaseApplied = true;
     m_ncResetBufferClearAxisSlot = 0U;
     m_ncResetBufferClearElement = 0U;
+    return true;
 }
 
 
@@ -2129,6 +3898,14 @@ bool MotionCore::VerifyNCResetRebaseState() const noexcept
     const AxisContext& virtualAxis = m_Group.virtualAxis;
     const PathJumpManager& jump = m_Group.jumpManager;
 
+    if (m_pContexts != nullptr && !m_pContexts->empty() &&
+        ((*m_pContexts)[0].enablePitch || (*m_pContexts)[0].enableBacklash) &&
+        m_pbcXSendContract.HasUnresolvedActiveOutput()) return false;
+    if (m_pbcXRetainRecoveryRequired &&
+        (m_pbcXRetainRecoveryTicket == 0ULL || m_pbcXRetainLossSequence == 0ULL ||
+            m_pbcXRetainCommittedLossSequence != m_pbcXRetainLossSequence ||
+            m_pbcXRetainAppliedReference != m_pbcResetReferenceGeneration ||
+            m_pbcXRetainResetRequest != ack.requestSequence)) return false;
     if (!m_ncResetScalarRebaseApplied ||
         !ack.rebaseApplied ||
         ack.requestedAxisMask == 0U ||
@@ -2270,7 +4047,32 @@ bool MotionCore::VerifyNCResetRebaseState() const noexcept
         }
 
         const AxisContext& axis = (*m_pContexts)[axisSlot];
-        const double reference = ack.actualPulse[axisSlot];
+        // ACK actualPulse remains the raw encoder reference. Command scalars
+        // are nominal and therefore differ by the retained applied X offset.
+        const double reference = m_pbcResetNominalReferencePulse[axisSlot];
+        const bool activeCompensation = axis.enablePitch || axis.enableBacklash;
+        if (axisSlot == 0U)
+        {
+            const double nominalMcsUnit = activeCompensation ?
+                reference * axis.finalLead / axis.resolution_PPR : ack.actualMcsUnit[axisSlot];
+            if (!std::isfinite(nominalMcsUnit) || ack.xNominalMcsUnit != nominalMcsUnit)
+                return false;
+        }
+        if (axisSlot == 0U && m_pbcResetReferenceGeneration != 0ULL)
+        {
+            const double reconstructed = activeCompensation ?
+                reference + m_pbcResetRetainedOffsetPulse : reference;
+            if (m_CompEngine.XReferenceGeneration() != m_pbcResetReferenceGeneration ||
+                !std::isfinite(reconstructed) ||
+                !IsFiniteNearlyEqual(reconstructed, ack.actualPulse[axisSlot], 0.25) ||
+                axis.mechanicalCompensationFrame.offsetPulse != m_pbcResetRetainedOffsetPulse ||
+                !axis.IsMechanicalCompensationReadyForCompletion() ||
+                (activeCompensation && !m_CompEngine.IsXKnownOffsetReferenceReady(axis)))
+                return false;
+        }
+        else if (activeCompensation ||
+            !IsFiniteNearlyEqual(reference, ack.actualPulse[axisSlot], 0.25))
+            return false;
         if (!axis.isExist ||
             !IsFiniteNearlyEqual(axis.currentCmdPos, reference, 0.5) ||
             !IsFiniteNearlyEqual(axis.logicalCmdPos, reference, 0.5) ||
@@ -2823,6 +4625,19 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
     if (m_ncResetRebasePhase ==
         MotionNCResetRebasePhase::CLEARING_BUFFERS)
     {
+        // A deferred producer or invalid PDO interval cannot reuse an aged
+        // stopped proof. Recollect the existing 200-cycle proof, without
+        // mutating coordinates or turning a transient busy edge into failure.
+        if (!m_ncResetScalarRebaseApplied &&
+            (m_pbcResetPreproofTick == 0ULL ||
+                m_pbcResetPreproofTick + 1ULL != m_ncSettleRuntimeCycleTick))
+        {
+            m_ncResetRebasePhase = MotionNCResetRebasePhase::WAIT_PREPROOF;
+            m_ncResetRebaseAckProducer.phase = MotionNCResetRebasePhase::WAIT_PREPROOF;
+            ResetNCSettleCandidate(MotionNCSettleProfile::RESET_ALL,
+                MotionNCSettleBlocker::RUNTIME_GAP);
+            return true;
+        }
         const MotionNCSettleBlocker currentCommitBlocker =
             ValidateNCResetCommitSeam();
         if (currentCommitBlocker != MotionNCSettleBlocker::NONE)
@@ -2842,12 +4657,32 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
             return true;
         }
 
+        // Producers use the same single atomic gate before publishing either
+        // command channel. A busy producer defers this bounded RT pass.
+        if (!m_pbcReferenceIngress.TryReserve())
+        {
+            ReleaseExactResetNCSettleReservation(reservedOwnerState);
+            return true;
+        }
+        if (!m_Group.cmdQueue.empty() || m_axisCommandChannel.command_size() != 0U)
+        {
+            m_pbcReferenceIngress.Release();
+            ReleaseExactResetNCSettleReservation(reservedOwnerState);
+            BlockNCResetCommit(MotionNCSettleBlocker::COMMAND_QUEUE);
+            return true;
+        }
         if (!m_ncResetScalarRebaseApplied)
         {
             // Commit-time reservation is held through the scalar rebase and
             // this pass's bounded buffer-clear chunk.  Every later chunk
             // reacquires and revalidates the same exact Reset identity.
-            ApplyNCResetScalarRebase();
+            if (!ApplyNCResetScalarRebase())
+            {
+                m_pbcReferenceIngress.Release();
+                ReleaseExactResetNCSettleReservation(reservedOwnerState);
+                BlockNCResetCommit(MotionNCSettleBlocker::REBASE_VERIFY_FAILED);
+                return true;
+            }
         }
 
         if (ClearNCResetBuffersWithBudget())
@@ -2862,6 +4697,7 @@ bool MotionCore::ProcessNCSettleRequestsAndResetRebase() noexcept
                 MotionNCSettleBlocker::REBASE_IN_PROGRESS);
         }
 
+        m_pbcReferenceIngress.Release();
         ReleaseExactResetNCSettleReservation(
             reservedOwnerState);
 
@@ -4812,7 +6648,8 @@ void MotionCore::TryAcknowledgeAppliedSafetyMotionRequests() noexcept
 
 
 bool MotionCore::IsSafetyControlledStopAuthorized(
-    int contextAxisSlot) const noexcept
+    int contextAxisSlot,
+    const ServoOutputFrameReservation* sendReservation) const noexcept
 {
     if (!m_safetyControlledStopInProgress ||
         contextAxisSlot < 0 ||
@@ -4851,8 +6688,30 @@ bool MotionCore::IsSafetyControlledStopAuthorized(
         return false;
     }
 
-    const std::uint64_t publication =
+    std::uint64_t publication =
         m_executionEpochPublication.load(std::memory_order_acquire);
+    if (sendReservation != nullptr)
+    {
+        // PBC3E Fix1: Finalize already owns this exact Owner/Epoch reservation.
+        // Only that reservation may inspect the original unreserved authority.
+        // Ordinary control callers still reject every reserved publication.
+        const ServoOutputFrameReservation& reserved = *sendReservation;
+        if (!reserved.acquired ||
+            (reserved.baseOwnerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+            reserved.reservedOwnerState !=
+                (reserved.baseOwnerState | MOTION_OWNER_FRAME_SEND_RESERVED) ||
+            ownerState != reserved.reservedOwnerState ||
+            (reserved.baseExecutionPublication &
+                (EXECUTION_EPOCH_PUBLICATION_PENDING |
+                    EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
+            reserved.reservedExecutionPublication !=
+                (reserved.baseExecutionPublication | EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) ||
+            publication != reserved.reservedExecutionPublication)
+        {
+            return false;
+        }
+        publication = reserved.baseExecutionPublication;
+    }
     if ((publication &
         (EXECUTION_EPOCH_PUBLICATION_PENDING |
             EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) != 0ULL ||
@@ -4897,13 +6756,19 @@ MotionAxisCommandSequence MotionCore::AllocateAxisCommandSequence() noexcept
 
 bool MotionCore::SubmitAxisCommand(
     MotionAxisCommand command,
-    MotionAxisCommandSequence* outSequence) noexcept
+    MotionAxisCommandSequence* outSequence, bool* outIngressBusy) noexcept
 {
+    if (outIngressBusy != nullptr) *outIngressBusy = false;
     if (outSequence != nullptr)
     {
         *outSequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
     }
 
+    if (command.axisIndex == 0 &&
+        (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) || HasPbcXUnresolvedActiveOutput()) &&
+        (command.type == MotionAxisCommandType::MOVE_TO_POSITION ||
+            command.type == MotionAxisCommandType::VELOCITY_MOVE ||
+            command.type == MotionAxisCommandType::MPG_MOVE)) return false;
     const MotionOwner expectedOwner =
         ResolveMotionOwnerForSource(command.source);
 
@@ -4916,6 +6781,13 @@ bool MotionCore::SubmitAxisCommand(
         return false;
     }
 
+    MotionPbcIngressGate::Producer ingress(m_pbcReferenceIngress);
+    if (!ingress.Entered())
+    {
+        if (outIngressBusy != nullptr) *outIngressBusy = true;
+        return false;
+    }
+    if (!IsMotionOwnerLeaseCurrent(command.ownerLease)) return false;
     command.sequence = AllocateAxisCommandSequence();
 
     if (!m_axisCommandChannel.ControlTrySubmit(command))
@@ -4941,7 +6813,7 @@ bool MotionCore::SubmitAxisMoveToPosition(
     bool useShortestPath,
     MotionCommandSource source,
     const MotionOwnerLease& ownerLease,
-    MotionAxisCommandSequence* outSequence) noexcept
+    MotionAxisCommandSequence* outSequence, bool* outIngressBusy) noexcept
 {
     MotionAxisCommand command{};
     command.type = MotionAxisCommandType::MOVE_TO_POSITION;
@@ -4955,7 +6827,7 @@ bool MotionCore::SubmitAxisMoveToPosition(
     command.flags = useShortestPath
         ? MOTION_AXIS_COMMAND_FLAG_USE_SHORTEST_PATH
         : MOTION_AXIS_COMMAND_FLAG_NONE;
-    return SubmitAxisCommand(command, outSequence);
+    return SubmitAxisCommand(command, outSequence, outIngressBusy);
 }
 
 bool MotionCore::SubmitAxisVelocityMove(
@@ -4964,7 +6836,7 @@ bool MotionCore::SubmitAxisVelocityMove(
     double accelerationTime,
     MotionCommandSource source,
     const MotionOwnerLease& ownerLease,
-    MotionAxisCommandSequence* outSequence) noexcept
+    MotionAxisCommandSequence* outSequence, bool* outIngressBusy) noexcept
 {
     MotionAxisCommand command{};
     command.type = MotionAxisCommandType::VELOCITY_MOVE;
@@ -4973,7 +6845,7 @@ bool MotionCore::SubmitAxisVelocityMove(
     command.ownerLease = ownerLease;
     command.value0 = targetVelocity;
     command.value1 = accelerationTime;
-    return SubmitAxisCommand(command, outSequence);
+    return SubmitAxisCommand(command, outSequence, outIngressBusy);
 }
 
 bool MotionCore::SubmitAxisMPGMove(
@@ -5003,7 +6875,7 @@ bool MotionCore::SubmitAxisStopMove(
     double decelerationTime,
     MotionCommandSource source,
     const MotionOwnerLease& ownerLease,
-    MotionAxisCommandSequence* outSequence) noexcept
+    MotionAxisCommandSequence* outSequence, bool* outIngressBusy) noexcept
 {
     MotionAxisCommand command{};
     command.type = MotionAxisCommandType::STOP_MOVE;
@@ -5011,7 +6883,7 @@ bool MotionCore::SubmitAxisStopMove(
     command.source = source;
     command.ownerLease = ownerLease;
     command.value0 = decelerationTime;
-    return SubmitAxisCommand(command, outSequence);
+    return SubmitAxisCommand(command, outSequence, outIngressBusy);
 }
 
 bool MotionCore::SubmitApplyMachineHome(
@@ -5019,7 +6891,8 @@ bool MotionCore::SubmitApplyMachineHome(
     double capturedReferencePulse,
     double homeOffsetUnit,
     const MotionOwnerLease& ownerLease,
-    MotionAxisCommandSequence& outSequence) noexcept
+    MotionAxisCommandSequence& outSequence, bool* outIngressBusy,
+    std::uint64_t homeCaptureToken) noexcept
 {
     MotionAxisCommand command{};
     command.type = MotionAxisCommandType::APPLY_MACHINE_HOME;
@@ -5028,14 +6901,16 @@ bool MotionCore::SubmitApplyMachineHome(
     command.ownerLease = ownerLease;
     command.value0 = capturedReferencePulse;
     command.value1 = homeOffsetUnit;
-    return SubmitAxisCommand(command, &outSequence);
+    command.expectedEpoch = GetCurrentExecutionEpoch();
+    command.homeCaptureToken = homeCaptureToken;
+    return SubmitAxisCommand(command, &outSequence, outIngressBusy);
 }
 
 bool MotionCore::SubmitDriveTouchProbeFunction(
     int axisIndex,
     std::uint16_t value,
     const MotionOwnerLease& ownerLease,
-    MotionAxisCommandSequence* outSequence) noexcept
+    MotionAxisCommandSequence* outSequence, bool* outIngressBusy) noexcept
 {
     MotionAxisCommand command{};
     command.type = MotionAxisCommandType::SET_TOUCH_PROBE_FUNCTION;
@@ -5043,7 +6918,8 @@ bool MotionCore::SubmitDriveTouchProbeFunction(
     command.source = ResolveMotionCommandSourceForOwner(ownerLease.owner);
     command.ownerLease = ownerLease;
     command.wordValue = value;
-    return SubmitAxisCommand(command, outSequence);
+    command.expectedEpoch = GetCurrentExecutionEpoch();
+    return SubmitAxisCommand(command, outSequence, outIngressBusy);
 }
 
 void MotionCore::ProcessAxisCommandResults() noexcept
@@ -5971,6 +7847,7 @@ bool MotionCore::HasResetControlledStopPriorityWinner() const noexcept
     // not enough here because an already materialized Alarm has no required
     // mailbox bit yet.
     return
+        RequiresPbcXRetainRecoveryReset() ||
         AlarmManager::GetInstance().HasAlarm() ||
         (m_emergencyStopRequestPublication.load(
             std::memory_order_acquire) &
@@ -6098,6 +7975,7 @@ void MotionCore::AbortActiveExecutionForResetSafetyBatch() noexcept
     m_Group.historyQueue.clear();
 
     m_Group.isActive = false;
+    ClearEccentricCConsumer();
     m_safetyControlledStopInProgress = false;
     m_safetyControlledStopOwnerLease = MotionOwnerLease{};
     m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
@@ -6480,6 +8358,15 @@ void MotionCore::CompleteResetControlledStop() noexcept
 
 void MotionCore::ApplyPendingResetControlledStopRequest() noexcept
 {
+    // NC may have selected the clean-run prephase before a new loss. Retire
+    // that request terminally; only a new explicit RESET may use the full
+    // retained-reference path. No logical abort is reported as standstill.
+    if (RequiresPbcXRetainRecoveryReset())
+    {
+        SupersedeResetControlledStop();
+        return;
+    }
+
     std::uint32_t expectedPhase =
         static_cast<std::uint32_t>(ResetControlledStopPhase::PENDING);
     if (!m_resetControlledStopPhase.compare_exchange_strong(
@@ -6661,10 +8548,22 @@ void MotionCore::DrainAxisCommandMailbox() noexcept
             break;
         }
 
+        if (m_edmZPolicy.Snapshot().capHeld && command.type != MotionAxisCommandType::STOP_MOVE)
+        {
+            StopEDMZFixtureFromRuntime();
+            PublishAxisCommandResult(command, MotionAxisCommandResultType::REJECTED,
+                MotionRejectReason::OWNER_CONFLICT);
+            continue;
+        }
+
         const MotionOwner expectedOwner =
             ResolveMotionOwnerForSource(command.source);
 
-        if (expectedOwner == MotionOwner::NONE ||
+        if (((command.type == MotionAxisCommandType::SET_TOUCH_PROBE_FUNCTION ||
+                command.type == MotionAxisCommandType::APPLY_MACHINE_HOME) &&
+            (command.expectedEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+                command.expectedEpoch != GetCurrentExecutionEpoch())) ||
+            expectedOwner == MotionOwner::NONE ||
             command.ownerLease.owner != expectedOwner ||
             !IsMotionOwnerLeaseCurrent(command.ownerLease))
         {
@@ -6699,6 +8598,7 @@ void MotionCore::DrainAxisCommandMailbox() noexcept
         }
 
         bool applied = true;
+        bool referenceDeferred = false;
         MotionRejectReason rejectReason = MotionRejectReason::NONE;
 
         switch (command.type)
@@ -6733,14 +8633,56 @@ void MotionCore::DrainAxisCommandMailbox() noexcept
                 axis,
                 command.value0,
                 command.value1,
-                command.ownerLease);
+                command.ownerLease, &referenceDeferred, command.homeCaptureToken);
             if (!applied) rejectReason = MotionRejectReason::NOT_READY;
             break;
 
         case MotionAxisCommandType::SET_TOUCH_PROBE_FUNCTION:
-            applied = SetDriveTouchProbeFunction(command.axisIndex, command.wordValue);
+        {
+            const bool physicalX = command.axisIndex == 0 &&
+                axis.home.method == HomeMethod::INDEX_ONLY &&
+                axis.home.referenceSource == HomeReferenceSource::MOTOR_ENCODER_INDEX &&
+                command.ownerLease.owner == MotionOwner::HOME;
+            const MotionPbcHomeCaptureSnapshot captureState = m_pbcXHomeCaptureProof.Snapshot();
+            const bool terminalCleanup = physicalX && command.wordValue == 0U &&
+                captureState.ownerGeneration == command.ownerLease.generation &&
+                captureState.epoch == command.expectedEpoch &&
+                (captureState.phase == MotionPbcHomeCapturePhase::Consumed ||
+                    captureState.phase == MotionPbcHomeCapturePhase::Failed);
+            MotionPbcHomeCaptureKey key{};
+            if (terminalCleanup)
+            {
+                // Completion/cancellation may queue a second disarm. It is not
+                // a new attempt under the already consumed/failed HOME request.
+                applied = SetDriveTouchProbeFunction(command.axisIndex, 0U);
+            }
+            else if (physicalX && (!BuildPbcXHomeCaptureKey(axis, key) ||
+                !m_pbcXHomeCaptureProof.Request(key, m_ncSettleRuntimeCycleTick,
+                    command.sequence, command.wordValue)))
+            {
+                InvalidatePbcXHomeCapture();
+                // Cleanup remains possible after a failed capture chain. A local
+                // safe disarm grants no capture/send receipt or coordinate right.
+                applied = command.wordValue == 0U &&
+                    SetDriveTouchProbeFunction(command.axisIndex, 0U);
+            }
+            else
+            {
+                applied = SetDriveTouchProbeFunction(command.axisIndex, command.wordValue);
+                if (physicalX && applied)
+                {
+                    m_pbcXHomeProbeCommand.key = key;
+                    m_pbcXHomeProbeCommand.sequence = command.sequence;
+                    m_pbcXHomeProbeCommand.tick = m_ncSettleRuntimeCycleTick;
+                    m_pbcXHomeProbeCommand.value = command.wordValue;
+                    m_pbcXHomeProbeCommand.pending = true;
+                    PublishPbcXHomeCaptureSnapshot();
+                }
+                else if (physicalX) InvalidatePbcXHomeCapture();
+            }
             if (!applied) rejectReason = MotionRejectReason::NOT_READY;
             break;
+        }
 
         case MotionAxisCommandType::NONE:
         default:
@@ -6751,9 +8693,8 @@ void MotionCore::DrainAxisCommandMailbox() noexcept
 
         PublishAxisCommandResult(
             command,
-            applied
-            ? MotionAxisCommandResultType::APPLIED
-            : MotionAxisCommandResultType::REJECTED,
+            referenceDeferred ? MotionAxisCommandResultType::DEFERRED :
+            (applied ? MotionAxisCommandResultType::APPLIED : MotionAxisCommandResultType::REJECTED),
             rejectReason);
     }
 }
@@ -7377,6 +9318,8 @@ static std::uint64_t FoldCommandPathModeTransportFingerprint(
         fingerprint,
         static_cast<std::uint64_t>(command.axisCount));
 
+    if (command.pathCoreEccentricCFeedExactStop)
+        fingerprint = FoldMotionEccentricCTransportFingerprint(fingerprint, command);
     if (command.cncFeedLookahead)
         fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E434445ULL);
     if (command.pathCoreFeedExactStop)
@@ -7385,6 +9328,54 @@ static std::uint64_t FoldCommandPathModeTransportFingerprint(
         fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433638ULL);
     if (command.pathCoreZCFeedExactStop)
         fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433730ULL);
+    if (command.pathCoreXYZCFeedExactStop)
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433732ULL);
+    if (command.pathCoreXYZCUVFeedExactStop)
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433733ULL);
+    if (command.pathCoreXYZCFeedExactStop && command.sourceIsAbsoluteMode)
+    {
+        // BASE75 mode-specific provenance; preserve every existing G91 digest.
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433735ULL);
+        const auto foldDouble = [&](double value) noexcept
+        {
+            std::uint64_t bits = 0ULL;
+            std::memcpy(&bits, &value, sizeof(bits));
+            fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, bits);
+        };
+        for (unsigned axis = 0U; axis < 4U; ++axis)
+        {
+            foldDouble(MotionXYZCProgrammedValue(command, axis));
+            foldDouble(NCTranslationAxisOffsetMM(command.sourceTranslation, axis));
+            foldDouble(MotionXYZCStartMCS(command, axis));
+            foldDouble(command.mem_startPos[axis]);
+            foldDouble(command.mem_ratio[axis]);
+            foldDouble(command.targetPos[axis]);
+        }
+        foldDouble(command.mem_centerX); foldDouble(command.mem_centerY);
+    }
+
+    if (command.pathCoreXYZCUVFeedExactStop && command.sourceIsAbsoluteMode)
+    {
+        // BASE74 mode-specific provenance; preserve every existing G91 digest.
+        fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, 0x434E433734ULL);
+        const auto foldDouble = [&](double value) noexcept
+        {
+            std::uint64_t bits = 0ULL;
+            std::memcpy(&bits, &value, sizeof(bits));
+            fingerprint = FoldCommandPathModeTransportFingerprintValue(fingerprint, bits);
+        };
+        for (unsigned axis = 0U; axis < 6U; ++axis)
+        {
+            foldDouble(MotionXYZCUVProgrammedValue(command, axis));
+            foldDouble(NCTranslationAxisOffsetMM(command.sourceTranslation, axis));
+            foldDouble(MotionXYZCUVStartMCS(command, axis));
+            foldDouble(command.mem_startPos[axis]);
+            foldDouble(command.mem_ratio[axis]);
+            foldDouble(command.targetPos[axis]);
+        }
+        foldDouble(command.mem_startPos[6U]); foldDouble(command.mem_startPos[7U]);
+        foldDouble(command.mem_ratio[6U]); foldDouble(command.mem_ratio[7U]);
+    }
 
     const int boundedAxisCount =
         (command.axisCount < 0)
@@ -7942,9 +9933,54 @@ bool MotionCore::IsNCTranslationAxisIdentityCurrent(
 }
 
 
+// BASE79D/F: read-only preflight before the dedicated consumer's reservation.
+// Live NC admission remains closed. This helper does not allocate, consult H
+// tables, write axes, mutate the queue or publish feedback.
+bool MotionCore::IsEccentricCStartBindingCurrent(const MotionCommand& command,
+    const NCEccentricCRuntimeValue& runtime) const noexcept
+{
+    if (!IsMotionEccentricCStartSourceBound(command, runtime) ||
+        m_pContexts == nullptr || m_pContexts->empty() || m_pContexts->size() > 8U ||
+        m_pCoordMgr == nullptr || m_Group.isActive || m_Group.virtualAxis.isFault ||
+        m_Group.virtualAxis.isLagAlarm || m_Group.virtualAxis.currentCmdVel != 0.0 ||
+        m_Group.virtualAxis.logicalCmdVel != 0.0 || m_Group.enableHistory || m_Group.enableTransform ||
+        m_Group.jumpManager.state != JumpState::IDLE || m_pathHold.sourceSeen ||
+        !std::isfinite(m_Group.feedrateOverride) || m_Group.feedrateOverride != 1.0 ||
+        m_safetyControlledStopInProgress || HasPendingExecutionEpochChange() ||
+        HasPendingSafetyOrRecoveryRequests() || !IsCommandFromCurrentEpoch(command) ||
+        !IsCommandOwnerLeaseCurrent(command) ||
+        !IsNCTranslationAxisIdentityCurrent(command.sourceTranslation) ||
+        !MatchesNCTranslation(command.sourceTranslation)) return false;
+    const auto& extended = runtime.ExtendedPath();
+    for (unsigned index = 0U; index < 8U; ++index)
+    {
+        const AxisContext* axis = index < m_pContexts->size() ? &(*m_pContexts)[index] : nullptr;
+        bool travelAllowed = false;
+        if (axis != nullptr && axis->isExist)
+        {
+            const double ppu = runtime.PulsePerNative()[index];
+            travelAllowed = m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(*axis, extended.minMCS[index]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(*axis, extended.maxMCS[index]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(*axis, runtime.MinimumPulse()[index] / ppu) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(*axis, runtime.MaximumPulse()[index] / ppu);
+        }
+        if (!IsMotionEccentricCStartAxisBound(command, runtime, index, axis, travelAllowed)) return false;
+    }
+    // A source/owner/epoch change during preflight invalidates the result.
+    // The dedicated consumer separately reserves the exact owner and epoch;
+    // this read-only check cannot close the race between return and a write.
+    return !HasPendingExecutionEpochChange() && !HasPendingSafetyOrRecoveryRequests() &&
+        IsCommandFromCurrentEpoch(command) && IsCommandOwnerLeaseCurrent(command) &&
+        IsNCTranslationAxisIdentityCurrent(command.sourceTranslation) &&
+        MatchesNCTranslation(command.sourceTranslation);
+}
+
+
 MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
     const MotionCommand& command) const noexcept
 {
+    if (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+        HasPbcXUnresolvedActiveOutput()) return MotionRejectReason::NOT_READY;
     if (HasUnacknowledgedSafetyMotionRequest())
     {
         return MotionRejectReason::OWNER_CONFLICT;
@@ -7960,12 +9996,17 @@ MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
         return MotionRejectReason::OWNER_CONFLICT;
     }
 
+    // BASE79F: a marked packet cannot borrow empty/legacy source authority.
+    if (command.pathCoreEccentricCFeedExactStop && !IsMotionEccentricCFeedSourceAllowed(command))
+        return MotionRejectReason::NOT_READY;
+
     // A live fixed run requires its exact immutable descriptor on every MEMORY
     // command. Manual/safety sources and unextended legacy G00 remain separate.
     const bool emptyTranslation = IsNCTranslationSnapshotEmpty(command.sourceTranslation);
     if ((!emptyTranslation && (command.execution.source != MotionCommandSource::NC_MEMORY ||
             command.ownerLease.owner != MotionOwner::AUTO ||
-            !IsMotionFixedTranslationSourceAllowed(command) ||
+            !(command.pathCoreEccentricCFeedExactStop ? IsMotionEccentricCFeedSourceAllowed(command) :
+                IsMotionFixedTranslationSourceAllowed(command)) ||
             !MatchesNCTranslation(command.sourceTranslation))) ||
         (emptyTranslation && command.execution.source == MotionCommandSource::NC_MEMORY &&
             (GetActiveTranslationGeneration() != 0ULL || command.sourceToolLengthMode != 49 ||
@@ -8370,6 +10411,8 @@ void MotionCore::RejectMotionCommand(
 bool MotionCore::TryEnqueueMotionCommand(
     const MotionCommand& command) noexcept
 {
+    MotionPbcIngressGate::Producer ingress(m_pbcReferenceIngress);
+    if (!ingress.Entered()) return false;
     const MotionRejectReason authorizationFailure =
         GetCommandAuthorizationFailure(command);
 
@@ -8454,6 +10497,8 @@ bool MotionCore::TryEnqueueMotionCommand(
 bool MotionCore::TryEnqueueMotionCommandPair(
     const MotionCommand& first, const MotionCommand& second) noexcept
 {
+    MotionPbcIngressGate::Producer ingress(m_pbcReferenceIngress);
+    if (!ingress.Entered()) return false;
     const MotionRejectReason firstFailure = GetCommandAuthorizationFailure(first);
     const MotionRejectReason secondFailure = GetCommandAuthorizationFailure(second);
     const MotionRejectReason authorizationFailure =
@@ -8593,6 +10638,7 @@ bool MotionCore::TryDequeueNextMotionCommand(
 bool MotionCore::TryRequeueMotionCommandFront(
     const MotionCommand& command) noexcept
 {
+    if (command.pathCoreEccentricCFeedExactStop) return false;
     MotionCommand replayCommand = command;
     replayCommand.replayTerminalAlreadyPublished =
         command.replayTerminalAlreadyPublished ||
@@ -8962,6 +11008,7 @@ void MotionCore::ApplyPendingExecutionEpochChange()
     if (abortActiveCommand)
     {
         m_Group.isActive = false;
+        ClearEccentricCConsumer();
         m_safetyControlledStopInProgress = false;
         m_safetyControlledStopOwnerLease = MotionOwnerLease{};
         m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
@@ -9101,6 +11148,8 @@ void MotionCore::WriteServoTargetVelocityCommand(
     {
         return;
     }
+    if (m_edmZPolicy.Snapshot().capHeld)
+        value = static_cast<std::int32_t>(GuardEDMZFixtureVelocity(axisIndex, static_cast<double>(value)));
 
     const auto writeTarget =
         [&](int32_t exactValue)
@@ -9571,8 +11620,9 @@ bool MotionCore::ApplyMachineHome(
     AxisContext& axis,
     double capturedReferencePulse,
     double homeOffsetUnit,
-    const MotionOwnerLease& ownerLease)
+    const MotionOwnerLease& ownerLease, bool* outDeferred, std::uint64_t homeCaptureToken)
 {
+    if (outDeferred != nullptr) *outDeferred = false;
     if (!axis.isExist ||
         axis.state != MotionState::MotionState_IDLE ||
         !std::isfinite(capturedReferencePulse) ||
@@ -9591,15 +11641,21 @@ bool MotionCore::ApplyMachineHome(
     const double oldOffset = axis.machineCoordinateOffsetPulse;
     const double newOffset = capturedReferencePulse - homeOffsetPulse;
     const double shift = oldOffset - newOffset;
+    const bool referenceX = m_pContexts != nullptr && !m_pContexts->empty() &&
+        &(*m_pContexts)[0] == &axis && axis.axisIndex == 0;
+    // Clearing calibration must preserve servo following error. OFF takes
+    // the exact legacy addition, without gratuitous subtract/add round trips.
+    const double commandShift = referenceX && (axis.enablePitch || axis.enableBacklash) ?
+        shift + axis.mechanicalCompensationFrame.offsetPulse : shift;
     const double oldLogicalCmdPos = axis.logicalCmdPos.Load();
     const double oldLastQueuedPulse = axis.lastQueuedPulse.Load();
     const double shiftedCurrentActPos = axis.currentActPos + shift;
-    const double shiftedCurrentCmdPos = axis.currentCmdPos + shift;
-    const double shiftedLogicalCmdPos = oldLogicalCmdPos + shift;
-    const double shiftedPlanningPos = axis.planningPos + shift;
-    const double shiftedFinalTargetPos = axis.finalTargetPos + shift;
-    const double shiftedStartCmdPos = axis.startCmdPos + shift;
-    const double shiftedLastQueuedPulse = oldLastQueuedPulse + shift;
+    const double shiftedCurrentCmdPos = axis.currentCmdPos + commandShift;
+    const double shiftedLogicalCmdPos = oldLogicalCmdPos + commandShift;
+    const double shiftedPlanningPos = axis.planningPos + commandShift;
+    const double shiftedFinalTargetPos = axis.finalTargetPos + commandShift;
+    const double shiftedStartCmdPos = axis.startCmdPos + commandShift;
+    const double shiftedLastQueuedPulse = oldLastQueuedPulse + commandShift;
     const double shiftedLastActPos = axis.lastActPos + shift;
 
     if (!std::isfinite(pulsePerUnit) ||
@@ -9621,6 +11677,106 @@ bool MotionCore::ApplyMachineHome(
         return false;
     }
 
+    // Selection is deliberately broader than strict configuration validity:
+    // malformed physical INDEX_ONLY settings cannot fall through HOME6 logic.
+    if (referenceX && (axis.enablePitch || axis.enableBacklash))
+    {
+        const bool zeroHome = m_CompEngine.IsXZeroOnlyConfiguration(axis) &&
+            (axis.home.method == HomeMethod::CURRENT_POSITION ||
+                IsPbcXHomeCaptureConfiguration(axis));
+        // K/L staged profiles admit one physical INDEX reference. A later HOME cannot erase
+        // a known nonzero offset, even if a mutable HOME bit was cleared.
+        const bool firstStagedHome = m_CompEngine.IsXStagedProfileConfiguration(axis) &&
+            m_CompEngine.IsXHomeEntryCoordinateIdentity(axis) &&
+            IsPbcXHomeCaptureConfiguration(axis);
+        if (!zeroHome && !firstStagedHome) return false;
+    }
+    const bool physicalCaptureRequired = referenceX &&
+        axis.home.method == HomeMethod::INDEX_ONLY &&
+        axis.home.referenceSource == HomeReferenceSource::MOTOR_ENCODER_INDEX;
+    const auto captureCurrent = [this, &axis, homeCaptureToken,
+        capturedReferencePulse, homeOffsetUnit, physicalCaptureRequired]() noexcept -> bool
+    {
+        if (!physicalCaptureRequired) return homeCaptureToken == 0ULL;
+        MotionPbcHomeCaptureKey key{};
+        return BuildPbcXHomeCaptureKey(axis, key) &&
+            m_pbcXHomeCaptureProof.IsCaptureReady(m_ncSettleRuntimeCycleTick,
+                key, homeCaptureToken, capturedReferencePulse, homeOffsetUnit);
+    };
+    if (!captureCurrent()) return false;
+    if (referenceX) DiscardPbcXUnsentCycle();
+    PbcHomeReservation reservation{};
+    CompensationEngine::XReferenceTransaction reference{};
+    pbc::Diagnostic diagnostic{};
+    if (referenceX)
+    {
+        pbc::ReferenceAuthority authority{};
+        authority.tick = m_ncSettleRuntimeCycleTick;
+        authority.epoch = GetCurrentExecutionEpoch();
+        authority.ownerGeneration = ownerLease.generation;
+        authority.homeOwner = ownerLease.owner == MotionOwner::HOME;
+        authority.stopped = IsPbcXHomeStopped(axis);
+        const bool acquired = authority.stopped && AcquirePbcHomeReservation(ownerLease, reservation);
+        // Recheck the exact raw interval/key after owner/epoch/ingress/alarm
+        // reservation. A pre-reservation proof is never commit authority.
+        const bool proofCurrent = acquired && IsPbcXHomeStopped(axis) && captureCurrent();
+        authority.stopped = proofCurrent;
+        if (acquired) authority.epoch = UnpackExecutionEpochPublication(reservation.epoch);
+        authority.coordinateReservation = proofCurrent && IsPbcHomeReservationCurrent(reservation);
+        authority.queuesDrained = acquired && m_pbcReferenceIngress.IsReserved() &&
+            m_Group.cmdQueue.empty() && m_axisCommandChannel.command_size() == 0U;
+        if (!proofCurrent || !m_CompEngine.PrepareXHomeReference(
+            axis, shift, authority, reference, diagnostic))
+        {
+            if (reference.authority.tick == 0ULL) reference.authority = authority;
+            reference.plan.action = pbc::ReferenceAction::HomeClear;
+            // Source/stop/ingress reservation can be temporarily unavailable,
+            // including a producer preempted after queue publication. Defer
+            // only before preparation/writes, under the same healthy HOME.
+            const bool deferred = !acquired && axis.axisType == AxisType::LINEAR &&
+                axis.fbMode == FeedbackSource::MOTOR_ENCODER && !axis.isFault &&
+                IsMotionOwnerLeaseCurrent(ownerLease) &&
+                !HasPendingSafetyOrRecoveryRequests() && !AlarmManager::GetInstance().HasAlarm();
+            if (outDeferred != nullptr) *outDeferred = deferred;
+            PublishPbcReference(axis, reference, deferred ? MotionPbcReferenceResult::Deferred :
+                MotionPbcReferenceResult::Rejected,
+                diagnostic.error == pbc::Error::None ? pbc::Error::LifecycleRejected : diagnostic.error);
+            ReleasePbcHomeReservation(reservation);
+            return false;
+        }
+        if (reference.plan.nominalCommandPulse != shiftedCurrentCmdPos ||
+            reference.plan.rawFeedbackPulse != shiftedCurrentActPos)
+        {
+            (void)m_CompEngine.FinishXReference(axis, reference, reference.authority,
+                pbc::ReferenceCommitResult::NotApplied, diagnostic);
+            PublishPbcReference(axis, reference, MotionPbcReferenceResult::Rejected, pbc::Error::LifecycleRejected);
+            ReleasePbcHomeReservation(reservation);
+            return false;
+        }
+    }
+    const auto rejectReference = [this, &axis, &reference, &reservation, &diagnostic, referenceX, physicalCaptureRequired, homeCaptureToken]
+        (bool possiblyWritten) noexcept
+    {
+        if (!referenceX) return;
+        if (possiblyWritten)
+        {
+            m_pbcXHomeStopProof.Consume();
+            if (physicalCaptureRequired)
+            {
+                (void)m_pbcXHomeCaptureProof.Consume(homeCaptureToken);
+                PublishPbcXHomeCaptureSnapshot();
+            }
+        }
+        pbc::ReferenceAuthority current = reference.authority;
+        current.coordinateReservation = IsPbcHomeReservationCurrent(reservation);
+        (void)m_CompEngine.FinishXReference(axis, reference, current,
+            possiblyWritten ? pbc::ReferenceCommitResult::Uncertain : pbc::ReferenceCommitResult::NotApplied,
+            diagnostic);
+        PublishPbcReference(axis, reference, possiblyWritten ? MotionPbcReferenceResult::Uncertain :
+            MotionPbcReferenceResult::Rejected, diagnostic.error);
+        ReleasePbcHomeReservation(reservation);
+    };
+
     // The two cross-thread mirrors commit before every RT-private scalar.
     // Each edge is one strong CAS; contention is an ownership breach, not a
     // condition under which the 250 us thread may retry or spin.
@@ -9628,8 +11784,20 @@ bool MotionCore::ApplyMachineHome(
         oldLogicalCmdPos,
         shiftedLogicalCmdPos))
     {
+        rejectReference(false);
         EmergencyStopAllAxes();
         return false;
+    }
+    // The first successful mirror write consumes this interval even if a
+    // later CAS/reservation/Engine completion fails and rolls coordinates back.
+    if (referenceX)
+    {
+        m_pbcXHomeStopProof.Consume();
+        if (physicalCaptureRequired)
+        {
+            (void)m_pbcXHomeCaptureProof.Consume(homeCaptureToken);
+            PublishPbcXHomeCaptureSnapshot();
+        }
     }
     if (!axis.lastQueuedPulse.TryCompareExchange(
         oldLastQueuedPulse,
@@ -9638,6 +11806,7 @@ bool MotionCore::ApplyMachineHome(
         (void)axis.logicalCmdPos.TryCompareExchange(
             shiftedLogicalCmdPos,
             oldLogicalCmdPos);
+        rejectReference(true);
         EmergencyStopAllAxes();
         return false;
     }
@@ -9645,7 +11814,8 @@ bool MotionCore::ApplyMachineHome(
     // Close owner transfer after the pair commit but before any RT-private
     // field is changed.  Exact rollback is bounded; regardless of rollback
     // success, containment makes the rejected HOME command fail closed.
-    if (!IsMotionOwnerLeaseCurrent(ownerLease))
+    if (!IsMotionOwnerLeaseCurrent(ownerLease) ||
+        (referenceX && !IsPbcHomeReservationCurrent(reservation)))
     {
         (void)axis.lastQueuedPulse.TryCompareExchange(
             shiftedLastQueuedPulse,
@@ -9653,6 +11823,7 @@ bool MotionCore::ApplyMachineHome(
         (void)axis.logicalCmdPos.TryCompareExchange(
             shiftedLogicalCmdPos,
             oldLogicalCmdPos);
+        rejectReference(true);
         EmergencyStopAllAxes();
         return false;
     }
@@ -9678,10 +11849,27 @@ bool MotionCore::ApplyMachineHome(
     axis.bufferIndex = 0;
     axis.inPosition = true;
 
-    if (!IsMotionOwnerLeaseCurrent(ownerLease))
+    if (!IsMotionOwnerLeaseCurrent(ownerLease) ||
+        (referenceX && !IsPbcHomeReservationCurrent(reservation)))
     {
+        rejectReference(true);
         EmergencyStopAllAxes();
         return false;
+    }
+    if (referenceX)
+    {
+        pbc::ReferenceAuthority current = reference.authority;
+        current.coordinateReservation = IsPbcHomeReservationCurrent(reservation);
+        const bool finished = m_CompEngine.FinishXReference(axis, reference, current,
+            pbc::ReferenceCommitResult::Applied, diagnostic);
+        PublishPbcReference(axis, reference, finished ? MotionPbcReferenceResult::Applied :
+            MotionPbcReferenceResult::Uncertain, diagnostic.error);
+        ReleasePbcHomeReservation(reservation);
+        if (!finished)
+        {
+            EmergencyStopAllAxes();
+            return false;
+        }
     }
     return true;
 }
@@ -9694,7 +11882,8 @@ bool MotionCore::ApplyMachineHome(
 void MotionCore::AlignStartupAxisCommandToActual(
     AxisContext& axis) noexcept
 {
-    const double actualPosition = axis.currentActPos;
+    double actualPosition = 0.0;
+    if (!TryPbcNominalSnap(axis, actualPosition, MotionPbcReferenceAction::StartupSnap)) return;
 
     axis.startCmdPos = actualPosition;
     axis.planningPos = actualPosition;
@@ -9706,7 +11895,7 @@ void MotionCore::AlignStartupAxisCommandToActual(
     axis.currentCmdVel = 0.0;
     axis.logicalCmdVel = 0.0;
     axis.currentActVel = 0.0;
-    axis.lastActPos = actualPosition;
+    axis.lastActPos = axis.currentActPos;
     axis.targetVelocity = 0.0;
     axis.targetEndVel = 0.0;
     axis.cruiseVel_PPS = 0.0;
@@ -9720,6 +11909,21 @@ void MotionCore::AlignStartupAxisCommandToActual(
     axis.bufferSum = 0.0;
     axis.bufferIndex = 0;
     axis.inPosition = true;
+    if (axis.axisIndex == 0 && (m_CompEngine.IsXZeroOnlyConfiguration(axis) ||
+        m_CompEngine.IsXStagedProfileConfiguration(axis)))
+    {
+        pbc::Diagnostic diagnostic{};
+        if (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+            m_pbcXSendContract.HasUnresolvedActiveOutput() ||
+            !(m_CompEngine.IsXStagedProfileConfiguration(axis) ?
+                m_CompEngine.RefreshXBootstrapFrame(axis, diagnostic) :
+                m_CompEngine.RefreshXZeroOnlyBootstrapFrame(axis, diagnostic)))
+        {
+            axis.isFault = true;
+            axis.inPosition = false;
+            axis.state = MotionState::MotionState_ERROR;
+        }
+    }
 }
 
 
@@ -9807,6 +12011,7 @@ bool MotionCore::ObserveStartupLagMonitorArming(
     if (std::isfinite(axis.currentActPos))
     {
         AlignStartupAxisCommandToActual(axis);
+        if (axis.isFault) return false;
     }
 
     if (!trustworthyFeedback)
@@ -10252,14 +12457,14 @@ void MotionCore::UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& ax
         return;
     }
     // BASE57: only position axes with a native mm or degree policy. Continuous
-    // spindle rotation, external scales and physical compensation remain outside
-    // this hold contract. All existing axes must qualify; there is no partial hold.
+    // spindle rotation and external scales remain outside this hold contract.
+    // Sealed X uses its exact committed frame and a frozen model proposal.
+    // All existing axes must qualify; there is no partial hold.
     const bool linearPositionAxis = axis.axisType == AxisType::LINEAR;
     const bool rotaryPositionAxis = axis.axisType == AxisType::ROTARY;
     if ((hold.requiredMask & bit) == 0U || axis.isVirtualAxis ||
         (!linearPositionAxis && !rotaryPositionAxis) ||
-        axis.fbMode != FeedbackSource::MOTOR_ENCODER ||
-        axis.enableBacklash || axis.enablePitch || axis.currentCompOffset_unit != 0.0)
+        axis.fbMode != FeedbackSource::MOTOR_ENCODER || !IsPbcControlScope(axis))
     {
         CancelIdlePositionHold(IdleHoldDiagnosticReason::UNSUPPORTED_SCOPE, hold.active, axis.axisIndex);
         return;
@@ -10316,7 +12521,15 @@ void MotionCore::UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& ax
         CancelIdlePositionHold(IdleHoldDiagnosticReason::REFERENCE_OR_CONFIG_CHANGED, true, axis.axisIndex);
         return;
     }
-    const double error = hold.reference[index] - axis.currentActPos;
+    AxisCommand heldCommand{};
+    heldCommand.instantCmdPos = hold.reference[index]; heldCommand.instantCmdVel = 0.0;
+    pbc::ControlFrame control{};
+    if (!PreparePbcXControl(axis, heldCommand, control))
+    {
+        CancelIdlePositionHold(IdleHoldDiagnosticReason::AXIS_CONFIG_OR_COMMAND, true, axis.axisIndex);
+        return;
+    }
+    const double error = control.followingErrorPulse;
     const double bound = hold.window[index] * (hold.active ? 2.0 : 1.0);
     if (!std::isfinite(error) || !std::isfinite(bound) || std::abs(error) > bound)
     {
@@ -10353,6 +12566,7 @@ void MotionCore::UpdateIdlePositionHoldAxis(ServoOutput* output, AxisContext& ax
     }
     if (reverse) velocity = -velocity;
     WriteServoTargetVelocityCommand(output, axis.axisIndex, static_cast<std::int32_t>(velocity));
+    ReceiptPbcXControl(axis, heldCommand, static_cast<std::int32_t>(velocity));
     hold.frameMask |= bit;
     if (!hold.active && hold.frameMask == hold.requiredMask &&
         hold.capturedMask == hold.requiredMask)
@@ -10436,6 +12650,207 @@ bool MotionCore::ZeroAllServoTargetVelocityForFrame() noexcept
 }
 
 
+// PBC-3C: these values are frozen on the RT producer. They are NOT a HOME
+// reference and never overwrite the axis's command, feedback, PID or offset.
+void MotionCore::CapturePbcXCommand(const AxisContext& axis, const AxisCommand& cmd) noexcept
+{
+    if (axis.axisIndex != 0) return;
+    MotionPbcXSource next{};
+    next.tick = m_ncSettleRuntimeCycleTick;
+    next.homed = axis.isHomed;
+    next.rawFeedbackPulse = axis.currentActPos;
+    if (m_pContexts != nullptr && !m_pContexts->empty() && &(*m_pContexts)[0] == &axis &&
+        axis.isExist && !axis.isVirtualAxis && axis.axisType == AxisType::LINEAR &&
+        axis.fbMode == FeedbackSource::MOTOR_ENCODER && axis.isServoOn && axis.targetMode == 9 &&
+        !axis.isFault && !axis.isLagAlarm && !axis.homeRuntime.active &&
+        m_CompEngine.IsSealed() && m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+        m_ncSettleRuntimeCycleContiguous && next.tick != 0ULL &&
+        IsPbcControlScope(axis) &&
+        std::isfinite(axis.currentActPos) && std::isfinite(axis.resolution_PPR) && axis.resolution_PPR > 0.0 &&
+        std::isfinite(axis.finalLead) && axis.finalLead > 0.0)
+    {
+        pbc::CoordinateFrame& f = next.frame;
+        f.nominalCommandPulse = f.servoCommandPulse = cmd.instantCmdPos;
+        f.nominalVelocityPPS = f.servoVelocityPPS = cmd.instantCmdVel;
+        f.pulsePerUnit = axis.resolution_PPR / axis.finalLead;
+        f.valid = f.settled = true;
+        next.valid = pbc::IsCoordinateFrameValid(f);
+    }
+    m_pbcXSource = next;
+}
+
+// PBC-3E: a private proposal survives until its exact transport completion.
+// Invalidating an image cannot silently commit or retire this proposal.
+void MotionCore::DiscardPbcXUnsentCycle() noexcept
+{
+    if (!m_pbcXCycle.prepared) return;
+    pbc::Diagnostic diagnostic{};
+    const bool cancelled = m_CompEngine.CancelXCycle(m_pbcXCycle, diagnostic);
+    MotionPbcXSource source = m_pbcXSource;
+    source.cycle = m_pbcXCycle;
+    m_pbcXSendAudit.ObserveUnsentCycle(source, cancelled);
+    if (cancelled || !m_CompEngine.HasPendingXCycle())
+    {
+        m_pbcXCycle = CompensationEngine::XCycleTransaction{};
+        m_pbcXCycleSendSequence = 0ULL;
+    }
+}
+
+bool MotionCore::PreparePbcXControl(const AxisContext& axis, const AxisCommand& command,
+    pbc::ControlFrame& control) noexcept
+{
+    // Preserve the exact historical OFF arithmetic for every bypass and axis.
+    control = pbc::ControlFrame{};
+    control.servoCommandPulse = command.instantCmdPos;
+    control.servoVelocityPPS = command.instantCmdVel;
+    control.followingErrorPulse = command.instantCmdPos - axis.currentActPos;
+    const bool disabledIdentity = !(axis.enablePitch || axis.enableBacklash) &&
+        IsPbcCoordinateIdentity(axis);
+    if (axis.axisIndex != 0) return disabledIdentity;
+    const MotionOwnerLease owner = GetMotionOwnerLease();
+    // Only a current HOME owner may use the exact-zero numerical transform
+    // while HOME is frozen or the first reference has not yet been committed.
+    // Ordinary enabled-zero motion below always prepares a real model cycle.
+    const bool zeroHomeIdentity = owner.owner == MotionOwner::HOME &&
+        IsPbcXHomeRawIdentity(axis) && m_CompEngine.IsXHomeControlCoordinateIdentity(axis) &&
+        m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid && m_ncSettleRuntimeCycleContiguous &&
+        (m_servoSourceInputMask & 1U) != 0U &&
+        (m_servoSourceStatusWord[0] & 0x006FU) == 0x0027U && m_servoSourceMode[0] == 9 &&
+        axis.isServoOn && axis.targetMode == 9 && !axis.isFault && !axis.isLagAlarm &&
+        !HasPendingSafetyOrRecoveryRequests() && !AlarmManager::GetInstance().HasAlarm();
+    if (m_pbcXRetainRecoveryRequired ||
+        (!disabledIdentity && m_pbcXSendContract.HasUnresolvedActiveOutput())) return false;
+    if (m_pbcXCycle.prepared || m_CompEngine.HasPendingXCycle())
+    {
+        // A duplicate controller entry may fence this image, but cannot erase
+        // the private handle required to cancel the first unsubmitted proposal.
+        m_pbcXSource.controlUsed = false;
+        m_pbcXSource.cycleError = pbc::Error::LifecycleRejected;
+        return false;
+    }
+    CapturePbcXCommand(axis, command);
+    // Ordinary identity bypass remains OFF-only. Exact sealed zero HOME may
+    // use the same numerical transform while its physical reference is frozen.
+    if (!m_pbcXSource.valid) return disabledIdentity || zeroHomeIdentity;
+    pbc::CycleAuthority authority{};
+    authority.identity.tick = m_ncSettleRuntimeCycleTick;
+    authority.identity.epoch = GetCurrentExecutionEpoch();
+    authority.identity.ownerGeneration = owner.generation;
+    authority.identity.referenceGeneration = m_CompEngine.XReferenceGeneration();
+    authority.sourceCurrent = m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+        m_ncSettleRuntimeCycleContiguous && (m_servoSourceInputMask & 1U) != 0U;
+    authority.rawServoReady = (m_servoSourceStatusWord[0] & 0x006FU) == 0x0027U &&
+        m_servoSourceMode[0] == 9 && axis.isServoOn && axis.targetMode == 9;
+    authority.homed = axis.isHomed;
+    bool groupHoldOrStop = false;
+    if (m_Group.isActive && (m_Group.feedrateOverride == 0.0 ||
+        m_Group.virtualAxis.state == MotionState::MotionState_STOPPING))
+    {
+        for (int slot = 0; slot < m_Group.axisCount && slot < MAX_AXES; ++slot)
+            if (m_Group.axisIndices[slot] == 0) { groupHoldOrStop = true; break; }
+    }
+    if (owner.owner == MotionOwner::HOME || axis.homeRuntime.active)
+        authority.mode = pbc::CycleMode::HomeFrozen;
+    else if (owner.owner == MotionOwner::IDLE_HOLD)
+        authority.mode = pbc::CycleMode::Hold;
+    else if (IsSafetyControlledStopAuthorized(0) || groupHoldOrStop ||
+        axis.state == MotionState::MotionState_STOPPING)
+        authority.mode = pbc::CycleMode::ControlledStop;
+    else
+        authority.mode = pbc::CycleMode::Motion;
+    // Recovery/startup samples continue through the established OFF controller.
+    // They do not mint a compensation proposal or a successful model commit.
+    if (!authority.rawServoReady || !authority.sourceCurrent ||
+        owner.owner == MotionOwner::NONE || (owner.owner == MotionOwner::SAFETY &&
+            authority.mode != pbc::CycleMode::ControlledStop)) return disabledIdentity;
+    pbc::Diagnostic diagnostic{};
+    const auto result = m_CompEngine.PrepareXCycle(axis, command, authority,
+        CYCLE_TIME_SEC, m_pbcXCycle, diagnostic);
+    m_pbcXSource.cycleError = diagnostic.error;
+    if (result == CompensationEngine::XCyclePrepareResult::Bypassed)
+        return disabledIdentity || zeroHomeIdentity;
+    if (result != CompensationEngine::XCyclePrepareResult::Prepared) return false;
+    m_pbcXSource.cycle = m_pbcXCycle;
+    m_pbcXSource.frame = m_pbcXCycle.frame;
+    if (!pbc::ResolveControlFrame(m_pbcXCycle.frame, command.instantCmdPos,
+        command.instantCmdVel, axis.currentActPos, control))
+    {
+        m_pbcXSource.cycleError = pbc::Error::RuntimeNumber;
+        return false;
+    }
+    return true;
+}
+
+void MotionCore::ReceiptPbcXControl(const AxisContext& axis, const AxisCommand& command,
+    std::int32_t outputVelocity) noexcept
+{
+    if (axis.axisIndex != 0 || !m_pbcXSource.cycle.prepared) return;
+    const auto& cycle = m_pbcXSource.cycle;
+    if (cycle.ticket != m_pbcXCycle.ticket || !m_pbcXCycle.prepared ||
+        cycle.authority.identity.tick != m_ncSettleRuntimeCycleTick ||
+        cycle.frame.nominalCommandPulse != command.instantCmdPos ||
+        cycle.frame.nominalVelocityPPS != command.instantCmdVel) return;
+    // Only the normal write tail reaches this receipt; all early fences lack it.
+    m_pbcXSource.controlVelocity = outputVelocity;
+    m_pbcXSource.controlUsed = true;
+}
+
+pbc::SendIdentity MotionCore::PbcXSendIdentity(const ServoOutputImageProof& proof) noexcept
+{
+    static_assert(static_cast<unsigned>(ServoOutputImageProofMode::NORMAL) == 2U &&
+        static_cast<unsigned>(ServoOutputImageProofMode::CONTROLLED_STOP) == 3U &&
+        static_cast<unsigned>(ServoOutputImageProofMode::IDLE_HOLD) == 4U,
+        "PBC send modes must match the transport proof.");
+    pbc::SendIdentity id{};
+    id.frame = proof.generation; id.tick = proof.sourceRuntimeTick;
+    id.ownerState = proof.ownerState; id.execution = proof.executionPublication;
+    id.safety = proof.frameSafetyIntentState; id.alarmSafety = proof.alarmSafetyIntentState;
+    id.admissionGeneration = proof.admissionCorrectionGeneration;
+    id.alarmUpdate = proof.alarmUpdateCount; id.mode = static_cast<std::uint32_t>(proof.mode);
+    return id;
+}
+
+bool MotionCore::SealPbcXSend(ServoOutputFrameReservation& reservation, bool authorityCurrent) noexcept
+{
+    MotionPbcXSendSample& x = reservation.pbcX;
+    x.scrubbed = reservation.handoff.scrubbed;
+    x.finalChecked = reservation.handoff.finalChecked;
+    x.imagePresent = (reservation.handoff.observedMask & 1U) != 0U;
+    x.finalVelocity = reservation.handoff.copiedVelocity[0];
+    if (m_pbcXCycle.prepared != x.source.cycle.prepared)
+    {
+        x.modelError = pbc::Error::LifecycleRejected;
+        if (m_pbcXCycle.prepared) x.source.cycle = m_pbcXCycle;
+        return x.scrubbed; // Presence cannot be downgraded to a shadow-only send.
+    }
+    if (!x.prepared || !x.finalChecked)
+        return !x.source.cycle.prepared || x.scrubbed;
+    // A scrub authorizes only a zero fence, never the original model candidate.
+    const pbc::SendIdentity current = x.scrubbed ? x.identity : PbcXSendIdentity(m_servoOutputImageProof);
+    const bool decided = m_pbcXSendContract.Seal(x.ticket, current,
+        m_servoOutputImageProof.pbcXSource.frame, x.finalVelocity, x.imagePresent,
+        authorityCurrent && reservation.acquired, x.scrubbed);
+    x.sealed = decided && !x.scrubbed && authorityCurrent && reservation.acquired;
+    if (!x.source.cycle.prepared || x.scrubbed) return true;
+    if (!x.sealed || !x.source.controlUsed ||
+        x.source.controlVelocity != x.finalVelocity)
+    {
+        x.modelError = pbc::Error::LifecycleRejected;
+        return false;
+    }
+    pbc::CycleIdentity cycleIdentity = x.source.cycle.authority.identity;
+    cycleIdentity.tick = m_servoOutputImageProof.sourceRuntimeTick;
+    cycleIdentity.epoch = UnpackExecutionEpochPublication(reservation.baseExecutionPublication);
+    cycleIdentity.ownerGeneration = UnpackMotionOwnerState(reservation.baseOwnerState).generation;
+    cycleIdentity.referenceGeneration = m_CompEngine.XReferenceGeneration();
+    pbc::Diagnostic diagnostic{};
+    x.modelSealed = m_CompEngine.SealXCycle(x.source.cycle, cycleIdentity,
+        m_servoOutputImageProof.pbcXSource.frame, diagnostic);
+    x.modelError = diagnostic.error;
+    return x.modelSealed;
+}
+
+
 bool MotionCore::PublishServoOutputImageProof(
     std::uint64_t ownerState,
     std::uint64_t executionPublication,
@@ -10454,6 +12869,25 @@ bool MotionCore::PublishServoOutputImageProof(
     proof.alarmUpdateCount = alarmUpdateCount;
     proof.generation = ++m_servoOutputImageProofGeneration;
     proof.mode = mode;
+    proof.sourceRuntimeTick = m_ncSettleRuntimeCycleTick;
+    proof.sourceInputMask = m_servoSourceInputMask;
+    proof.sourceStatusWord = m_servoSourceStatusWord;
+    proof.sourceMode = m_servoSourceMode;
+    proof.pbcXSource = m_pbcXSource;
+    proof.homeProbe = m_pbcXHomeProbeCommand;
+    if (m_pContexts != nullptr)
+    {
+        const std::size_t count = (std::min)(m_pContexts->size(), static_cast<std::size_t>(MAX_AXES));
+        for (std::size_t slot = 0U; slot < count; ++slot)
+        {
+            const AxisContext& axis = (*m_pContexts)[slot];
+            if (axis.axisIndex == static_cast<int>(slot) && axis.isExist &&
+                !axis.isVirtualAxis && axis.axisType == AxisType::ROTARY)
+                proof.diagnosticAxisMask |= 1U << static_cast<unsigned>(slot);
+            if (axis.isReverse != axis.Axis_Reverse)
+                proof.reverseMask |= 1U << static_cast<unsigned>(slot);
+        }
+    }
 
     if (m_pDrives == nullptr ||
         m_pDrives->size() > MAX_AXES ||
@@ -10491,19 +12925,104 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
     ServoOutputFrameReservation& reservation) noexcept
 {
     reservation = ServoOutputFrameReservation{};
+    // Capture before the first scrub. A Stop arriving between this capture
+    // and Guard must invalidate the old image and request a recopy at Finalize.
+    const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+    reservation.edmZGuardHeld = m_edmZPolicy.Snapshot().capHeld;
+    reservation.edmZStopSession = m_edmZPolicy.Snapshot().scope.session;
+    reservation.edmZStopFenceCurrent = EDM52::Valid(stop);
+    reservation.edmZStopTicket = stop.revision;
+    (void)ValidateEDMZFixtureSendClock();
+    if (!GuardEDMZFixtureOutputImage()) return false;
+    const EDM53::Stamp feedbackStamp = m_edmZFeedback.Current();
+    reservation.edmZFeedbackPublication = feedbackStamp.Ready() ? feedbackStamp.publication : 0ULL;
+    // A nested Begin cannot replace the canonical owner of an in-flight probe.
+    if (m_pbcXHomeProbeSendPending) return false;
     const ServoOutputImageProof proof =
         m_servoOutputImageProof;
+    // Observe the pre-scrub proof; never report a zeroed image as the original.
+    MotionServoHandoffSample& handoff = reservation.handoff;
+    if (m_servoHandoffSequence != (std::numeric_limits<std::uint64_t>::max)())
+        ++m_servoHandoffSequence;
+    handoff.sequence = m_servoHandoffSequence;
+    handoff.frameGeneration = proof.generation;
+    handoff.sourceTick = proof.sourceRuntimeTick;
+    const MotionOwnerLease sourceLease = UnpackMotionOwnerState(proof.ownerState);
+    handoff.owner = static_cast<std::uint32_t>(sourceLease.owner);
+    handoff.ownerGeneration = sourceLease.generation;
+    handoff.epoch = UnpackExecutionEpochPublication(proof.executionPublication);
+    handoff.idleScope = sourceLease.owner == MotionOwner::IDLE_HOLD;
+    handoff.slotMask = proof.slotMask;
+    handoff.diagnosticMask = proof.diagnosticAxisMask;
+    handoff.sourceInputMask = proof.sourceInputMask;
+    handoff.reverseMask = proof.reverseMask;
+    handoff.proposedVelocity = proof.targetVelocity;
+    handoff.sourceStatusWord = proof.sourceStatusWord;
+    handoff.sourceMode = proof.sourceMode;
+    reservation.handoffPending = true;
+    reservation.homeProbe = proof.homeProbe;
+    if (proof.homeProbe.pending)
+    {
+        // Private identity is the completion authority; public copies are not.
+        m_pbcXHomeProbeCanonicalSend = reservation;
+        m_pbcXHomeProbeSendPending = true;
+    }
+    // PBC-3C: bind the exact X servo-command source to this output image.
+    MotionPbcXSendSample& x = reservation.pbcX;
+    x.identity = PbcXSendIdentity(proof); x.source = proof.pbcXSource;
+    x.sequence = handoff.sequence; x.epoch = handoff.epoch;
+    x.owner = handoff.owner; x.ownerGeneration = handoff.ownerGeneration;
+    x.proposedVelocity = proof.targetVelocity[0];
+    x.sourceStatusWord = proof.sourceStatusWord[0]; x.sourceMode = proof.sourceMode[0];
+    x.sourceReady = (proof.sourceInputMask & 1U) != 0U &&
+        (x.sourceStatusWord & 0x006FU) == 0x0027U && x.sourceMode == 9;
+    x.modelError = x.source.cycleError;
+    const bool realSourceCurrent = !x.source.cycle.prepared ||
+        (x.source.controlUsed && x.source.controlVelocity == x.proposedVelocity &&
+            x.source.cycle.authority.identity.tick == proof.sourceRuntimeTick &&
+            x.source.cycle.authority.identity.epoch == handoff.epoch &&
+            x.source.cycle.authority.identity.ownerGeneration == handoff.ownerGeneration &&
+            x.source.cycle.authority.identity.referenceGeneration == m_CompEngine.XReferenceGeneration());
+    x.eligible = x.source.valid && x.source.tick == proof.sourceRuntimeTick && x.sourceReady &&
+        realSourceCurrent && (proof.slotMask & 1U) != 0U &&
+        x.identity.mode >= 2U && x.identity.mode <= 4U;
+    if (m_pbcXCycle.prepared && m_pbcXCycleSendSequence == 0ULL)
+        m_pbcXCycleSendSequence = handoff.sequence;
+    if (x.eligible)
+    {
+        x.prepared = m_pbcXSendContract.Prepare(x.identity, x.source.frame,
+            x.proposedVelocity, x.sourceReady, x.ticket);
+        if (x.prepared)
+        {
+            m_pbcXSendTicket = x.ticket; m_pbcXSendSequence = handoff.sequence;
+            m_pbcXCanonicalSendIdentity = x.identity;
+        }
+    }
     const std::uint64_t entrySafetyIntentState =
         m_frameSafetyIntentState.load(
             std::memory_order_acquire);
 
-    const auto scrubAndInvalidate = [this]() noexcept -> bool
+    const auto scrubAndInvalidate = [this, &reservation]() noexcept -> bool
     {
+        reservation.handoff.scrubbed = true;
         const bool scrubbed =
             ZeroAllServoTargetVelocityForFrame();
         InvalidateServoOutputImageProof();
         return scrubbed;
     };
+
+    if (m_pbcXCycle.prepared != x.source.cycle.prepared)
+    {
+        x.modelError = pbc::Error::LifecycleRejected;
+        if (m_pbcXCycle.prepared) x.source.cycle = m_pbcXCycle;
+        return scrubAndInvalidate();
+    }
+    if (x.source.cycle.prepared && (!x.eligible || !x.prepared))
+    {
+        // Receipt/identity mismatches may not reach the NIC as model output.
+        x.modelError = pbc::Error::LifecycleRejected;
+        return scrubAndInvalidate();
+    }
 
     if (proof.mode == ServoOutputImageProofMode::INVALID ||
         proof.generation == 0ULL ||
@@ -10543,7 +13062,7 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
         return scrubAndInvalidate();
     }
 
-    if (!observedNonZero)
+    if (!observedNonZero && !x.source.cycle.prepared && !reservation.homeProbe.pending)
     {
         return
             proof.mode == ServoOutputImageProofMode::ZERO_ONLY
@@ -10616,7 +13135,8 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
             slot < m_pDrives->size();
             ++slot)
         {
-            if (proof.targetVelocity[slot] == 0)
+            if (proof.targetVelocity[slot] == 0 &&
+                !(slot == 0U && x.source.cycle.prepared))
             {
                 continue;
             }
@@ -10668,6 +13188,7 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
         std::memory_order_acq_rel,
         std::memory_order_acquire))
     {
+        reservation.handoff.scrubbed = true;
         const bool scrubbed = ZeroAllServoTargetVelocityForFrame();
         m_motionOwnerState.fetch_and(
             ~MOTION_OWNER_FRAME_SEND_RESERVED,
@@ -10687,6 +13208,7 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
     reservation.safetyIntentState =
         entrySafetyIntentState;
     reservation.acquired = true;
+    if (reservation.homeProbe.pending) m_pbcXHomeProbeCanonicalSend = reservation;
     return true;
 }
 
@@ -10694,12 +13216,40 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
 bool MotionCore::FinalizeServoOutputFrameAtSendPoint(
     ServoOutputFrameReservation& reservation) noexcept
 {
+    if (reservation.edmZGuardHeld)
+    {
+        const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+        const bool cancellationChanged = !reservation.edmZStopFenceCurrent ||
+            reservation.edmZStopSession != m_edmZPolicy.Snapshot().scope.session ||
+            EDM52::AffectsSince(stop, reservation.edmZStopSession, reservation.edmZStopTicket);
+        const bool feedbackClosed = m_edmZFeedback.Current().status == EDM53::Status::Closed;
+        const bool clockValid = ValidateEDMZFixtureSendClock();
+        const bool guarded = GuardEDMZFixtureOutputImage();
+        if (cancellationChanged || feedbackClosed || !clockValid || !guarded)
+        {
+            // Busy/closed cancellation only proves that nonzero output is
+            // unavailable. It cannot mint a scoped Stop or observed revision.
+            // A coherent stop for an older session does not stop the new one.
+            // Closed feedback independently requests real Stop containment.
+            if ((EDM52::Valid(stop) && EDM52::AffectsSince(stop,
+                m_edmZPolicy.Snapshot().scope.session, reservation.edmZStopTicket)) || feedbackClosed || !clockValid || !guarded)
+                StopEDMZFixtureFromRuntime();
+            (void)ZeroAllServoTargetVelocityForFrame();
+            reservation.recopyRequired = true;
+        }
+    }
     if (!reservation.acquired)
     {
+        CaptureServoHandoffImage(reservation);
+        reservation.handoff.finalChecked = true;
+        SealPbcXSend(reservation, false);
         return true;
     }
 
-    if ((m_servoOutputImageProof.mode == ServoOutputImageProofMode::IDLE_HOLD &&
+    if ((reservation.pbcX.source.cycle.prepared &&
+        m_servoOutputImageProof.mode == ServoOutputImageProofMode::CONTROLLED_STOP &&
+        !IsSafetyControlledStopAuthorized(0, &reservation)) ||
+        (m_servoOutputImageProof.mode == ServoOutputImageProofMode::IDLE_HOLD &&
         !IsIdlePositionHoldImageCurrent(reservation.baseOwnerState,
             reservation.baseExecutionPublication)) ||
         (m_servoOutputImageProof.mode == ServoOutputImageProofMode::NORMAL &&
@@ -10723,6 +13273,7 @@ bool MotionCore::FinalizeServoOutputFrameAtSendPoint(
             std::memory_order_acquire) !=
         reservation.safetyIntentState)
     {
+        reservation.handoff.scrubbed = true;
         const bool scrubbed = ZeroAllServoTargetVelocityForFrame();
         reservation.recopyRequired = true;
         m_motionOwnerState.fetch_and(
@@ -10744,6 +13295,19 @@ bool MotionCore::FinalizeServoOutputFrameAtSendPoint(
         (void)AlarmManager::GetInstance().EndMotionAdmission(
             reservation.alarmAdmission);
         reservation.acquired = false;
+        CaptureServoHandoffImage(reservation);
+        reservation.handoff.finalChecked = scrubbed;
+        SealPbcXSend(reservation, false);
+        if (m_pbcXHomeProbeSendPending && reservation.handoff.sequence ==
+            m_pbcXHomeProbeCanonicalSend.handoff.sequence)
+        {
+            // Finalize released the original holds; never copy mutable public
+            // identity fields back into the canonical completion authority.
+            m_pbcXHomeProbeCanonicalSend.acquired = false;
+            m_pbcXHomeProbeCanonicalSend.alarmAdmission.acquired = false;
+            m_pbcXHomeProbeCanonicalSend.handoff.scrubbed = true;
+            m_pbcXHomeProbeCanonicalSend.handoff.finalChecked = scrubbed;
+        }
         return scrubbed;
     }
 
@@ -10751,54 +13315,279 @@ bool MotionCore::FinalizeServoOutputFrameAtSendPoint(
     // ticket publication refuses FRAME_SEND_RESERVED, and ordinary lifecycle
     // publishers refuse the execution commit bit, so the physical frame is
     // ordered before every request that begins while SendPacket is in flight.
+    CaptureServoHandoffImage(reservation);
+    reservation.handoff.finalChecked = true;
+    if (!SealPbcXSend(reservation, true))
+    {
+        // No frame is sent when either canonical seal fails. End(false,false)
+        // retires the original candidate while these reservations remain held.
+        reservation.handoff.scrubbed = true;
+        (void)ZeroAllServoTargetVelocityForFrame();
+        InvalidateServoOutputImageProof();
+        CaptureServoHandoffImage(reservation);
+        return false;
+    }
+    if (m_pbcXHomeProbeSendPending && reservation.handoff.sequence ==
+        m_pbcXHomeProbeCanonicalSend.handoff.sequence)
+    {
+        m_pbcXHomeProbeCanonicalSend.handoff.finalChecked = true;
+        m_pbcXHomeProbeCanonicalSend.handoff.scrubbed = reservation.handoff.scrubbed;
+        m_pbcXHomeProbeCanonicalSend.handoff.observedMask = reservation.handoff.observedMask;
+        m_pbcXHomeProbeCanonicalSend.handoff.copiedVelocity = reservation.handoff.copiedVelocity;
+        m_pbcXHomeProbeCanonicalSend.pbcX = reservation.pbcX;
+    }
     return true;
 }
 
 
-void MotionCore::EndServoOutputFrameAfterSend(
-    ServoOutputFrameReservation& reservation) noexcept
+void MotionCore::CaptureServoHandoffImage(ServoOutputFrameReservation& reservation) const noexcept
 {
-    if (!reservation.acquired)
+    MotionServoHandoffSample& sample = reservation.handoff;
+    sample.observedMask = 0U;
+    sample.copiedVelocity.fill(0);
+    if (m_pDrives == nullptr) return;
+    const std::size_t count = (std::min)(m_pDrives->size(), static_cast<std::size_t>(MAX_AXES));
+    for (std::size_t slot = 0U; slot < count; ++slot)
     {
-        return;
+        if ((*m_pDrives)[slot].pOutput == nullptr) continue;
+        sample.observedMask |= 1U << static_cast<unsigned>(slot);
+        sample.copiedVelocity[slot] = (*m_pDrives)[slot].pOutput->TargetVelocity;
+    }
+}
+
+
+void MotionCore::EndServoOutputFrameAfterSend(
+    ServoOutputFrameReservation& reservation,
+    bool sendAttempted, bool sendSucceeded) noexcept
+{
+    if (reservation.edmZGuardHeld &&
+        (!sendAttempted || !sendSucceeded || !reservation.edmZSerializedExact))
+    {
+        StopEDMZFixtureFromRuntime();
+        PublishEDMZFixtureFeedback();
+    }
+    if (m_pbcXHomeProbeSendPending)
+    {
+        const ServoOutputFrameReservation canonical = m_pbcXHomeProbeCanonicalSend;
+        // An old completion must not release a newer transaction's packed bits.
+        if (reservation.handoff.sequence != canonical.handoff.sequence) return;
+        const bool exact = reservation.homeProbe.pending &&
+            reservation.homeProbe.sequence == canonical.homeProbe.sequence &&
+            reservation.homeProbe.tick == canonical.homeProbe.tick &&
+            reservation.homeProbe.value == canonical.homeProbe.value &&
+            reservation.baseOwnerState == canonical.baseOwnerState &&
+            reservation.reservedOwnerState == canonical.reservedOwnerState &&
+            reservation.baseExecutionPublication == canonical.baseExecutionPublication &&
+            reservation.reservedExecutionPublication == canonical.reservedExecutionPublication &&
+            reservation.acquired == canonical.acquired &&
+            reservation.safetyIntentState == canonical.safetyIntentState &&
+            reservation.alarmAdmission.baseState == canonical.alarmAdmission.baseState &&
+            reservation.alarmAdmission.reservedState == canonical.alarmAdmission.reservedState &&
+            reservation.alarmAdmission.expectedUpdateCount == canonical.alarmAdmission.expectedUpdateCount &&
+            reservation.alarmAdmission.requireNoAlarm == canonical.alarmAdmission.requireNoAlarm &&
+            reservation.alarmAdmission.acquired == canonical.alarmAdmission.acquired &&
+            reservation.handoffPending && canonical.handoffPending &&
+            reservation.handoff.frameGeneration == canonical.handoff.frameGeneration &&
+            reservation.handoff.sourceTick == canonical.handoff.sourceTick &&
+            MotionPbcHomeCaptureProof::SameIdentityKey(reservation.homeProbe.key, canonical.homeProbe.key) &&
+            reservation.homeProbeSerializedExact && canonical.homeProbeSerializedExact &&
+            !reservation.handoff.scrubbed && reservation.handoff.finalChecked;
+        MotionPbcHomeCaptureKey key{};
+        const bool current = exact && canonical.handoff.sourceTick == m_ncSettleRuntimeCycleTick &&
+            m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid && m_ncSettleRuntimeCycleContiguous &&
+            m_pContexts != nullptr && !m_pContexts->empty() &&
+            BuildPbcXHomeCaptureKey((*m_pContexts)[0], key, &reservation);
+        if (current)
+            (void)m_pbcXHomeCaptureProof.CompleteSend(key, canonical.handoff.sourceTick,
+                canonical.homeProbe.sequence, canonical.homeProbe.value, true,
+                sendAttempted && sendSucceeded);
+        else m_pbcXHomeCaptureProof.Invalidate();
+        if (m_pbcXHomeProbeCommand.sequence == canonical.homeProbe.sequence)
+            m_pbcXHomeProbeCommand.pending = false;
+        m_pbcXHomeProbeSendPending = false;
+        if (!exact)
+        {
+            // Restore only our canonical reservation ownership for retirement.
+            reservation = canonical;
+            // A malformed completion cannot grant model/capture adoption.
+            // Preserve actual scrub status: an attempted image may be uncertain.
+            reservation.pbcX.source.controlUsed = false;
+            reservation.pbcX.modelSealed = false;
+        }
+        PublishPbcXHomeCaptureSnapshot();
+    }
+    else if (reservation.homeProbe.pending)
+    {
+        const bool ownsOrdinaryCycle =
+            (m_pbcXCycle.prepared && m_pbcXCycleSendSequence == reservation.handoff.sequence) ||
+            (m_pbcXSendTicket != 0ULL && m_pbcXSendSequence == reservation.handoff.sequence);
+        if (!ownsOrdinaryCycle) return; // retired/duplicate probe receipt
+        // A spurious public flag cannot orphan an ordinary canonical cycle.
+        reservation.homeProbe.pending = false;
+        reservation.homeProbeSerializedExact = false;
     }
 
-    std::uint64_t expectedReservedOwner =
-        reservation.reservedOwnerState;
-    if (!m_motionOwnerState.compare_exchange_strong(
-        expectedReservedOwner,
-        reservation.baseOwnerState,
-        std::memory_order_acq_rel,
-        std::memory_order_acquire))
+    // Complete the OFF model cycle while the real reservations still span
+    // the NIC call. HandoffAccepted is this software boundary, not drive ACK.
+    // HOME/reference authority is unchanged; only this sealed cycle may commit.
+    const bool ownsPrivateCompletion =
+        (m_pbcXCycle.prepared && m_pbcXCycleSendSequence == reservation.handoff.sequence) ||
+        (m_pbcXSendTicket != 0ULL && m_pbcXSendSequence == reservation.handoff.sequence);
+    if (!reservation.handoffPending && ownsPrivateCompletion)
     {
-        m_motionOwnerState.fetch_and(
-            ~MOTION_OWNER_FRAME_SEND_RESERVED,
-            std::memory_order_acq_rel);
+        // A lost public completion marker must not orphan the exact private
+        // send. Restore retirement only, never the missing successful receipt.
+        reservation.handoffPending = true;
+        reservation.pbcX.source.controlUsed = false;
+        reservation.pbcX.modelSealed = false;
+        reservation.pbcX.modelError = pbc::Error::LifecycleRejected;
     }
-
-    std::uint64_t expectedReservedExecution =
-        reservation.reservedExecutionPublication;
-    if (!m_executionEpochPublication.compare_exchange_strong(
-        expectedReservedExecution,
-        reservation.baseExecutionPublication,
-        std::memory_order_acq_rel,
-        std::memory_order_acquire))
+    if (reservation.handoffPending)
     {
-        m_executionEpochPublication.fetch_and(
-            ~EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED,
-            std::memory_order_acq_rel);
+        MotionPbcXSendSample& x = reservation.pbcX;
+        x.attempted = sendAttempted; x.apiAccepted = sendAttempted && sendSucceeded;
+        x.scrubbed = reservation.handoff.scrubbed;
+        if (x.prepared)
+            x.result = m_pbcXSendContract.Finish(x.ticket, x.identity, sendAttempted, sendSucceeded);
+        const bool ownsSend = m_pbcXSendTicket != 0ULL &&
+            m_pbcXSendSequence == reservation.handoff.sequence;
+        if (ownsSend && m_pbcXSendContract.HasPending())
+        {
+            // A malformed public ticket cannot orphan the private transaction.
+            // Only this Begin's sequence can retire it; an old End cannot consume
+            // a newer proposal. A possibly adopted unsealed image stays uncertain.
+            const bool uncertain = sendAttempted && !x.scrubbed;
+            const auto retired = m_pbcXSendContract.Finish(m_pbcXSendTicket,
+                m_pbcXCanonicalSendIdentity, uncertain, false);
+            if (retired == pbc::SendResult::OutputUncertain) x.result = retired;
+        }
+        if (!m_pbcXSendContract.HasPending())
+        {
+            m_pbcXSendTicket = 0ULL; m_pbcXSendSequence = 0ULL;
+            m_pbcXCanonicalSendIdentity = pbc::SendIdentity{};
+        }
+        x.stickyUncertain = m_pbcXSendContract.SawUncertainOutput();
+        const bool ownsCycle = m_pbcXCycle.prepared &&
+            m_pbcXCycleSendSequence == reservation.handoff.sequence;
+        if (ownsCycle && !x.source.cycle.prepared)
+        {
+            // The public proof cannot turn a possibly submitted private
+            // candidate into an orphan later mistaken for an unsent proposal.
+            // Retire the canonical cycle; the lost receipt forbids commit.
+            x.source.cycle = m_pbcXCycle;
+            x.source.controlUsed = false;
+            x.modelSealed = false;
+            x.modelError = pbc::Error::LifecycleRejected;
+        }
+        if (x.source.cycle.prepared)
+        {
+            // Report the fate of the original candidate, not merely that some
+            // packet (possibly scrubbed) was accepted by the NIC API.
+            x.modelResult = !sendAttempted && sendSucceeded ? pbc::SendResult::OutputUncertain :
+                !sendAttempted ? pbc::SendResult::Discarded :
+                !sendSucceeded ? pbc::SendResult::OutputUncertain :
+                x.scrubbed ? pbc::SendResult::FenceAccepted :
+                x.sealed && x.modelSealed && x.source.controlUsed &&
+                    x.result == pbc::SendResult::HandoffAccepted ? pbc::SendResult::HandoffAccepted :
+                    pbc::SendResult::OutputUncertain;
+            pbc::Diagnostic diagnostic{};
+            if (m_pContexts != nullptr && !m_pContexts->empty())
+                x.modelFinished = m_CompEngine.FinishXCycle((*m_pContexts)[0], x.source.cycle,
+                    x.source.cycle.authority.identity, x.modelResult, diagnostic);
+            else
+                x.modelFinished = m_CompEngine.CancelXCycle(x.source.cycle, diagnostic);
+            if (diagnostic.error != pbc::Error::None) x.modelError = diagnostic.error;
+            if (m_pContexts != nullptr && !m_pContexts->empty() &&
+                m_CompEngine.XReferencePhase() == pbc::LifecyclePhase::OutputUncertain)
+            {
+                AxisContext& axis = (*m_pContexts)[0];
+                if (axis.enablePitch || axis.enableBacklash)
+                {
+                    m_pbcXSendContract.QuarantineActiveOutput();
+                    x.stickyUncertain = m_pbcXSendContract.SawUncertainOutput();
+                    // No ownership recursion while the NIC reservation is held.
+                    // The next motion pass retains the existing runtime alarm.
+                    axis.isFault = true; axis.state = MotionState::MotionState_ERROR;
+                    axis.currentCmdVel = axis.logicalCmdVel = 0.0;
+                    axis.targetVelocity = axis.targetEndVel = 0.0;
+                    axis.pid.prevError = axis.pid.integralAcc = 0.0;
+                    axis.inPosition = false;
+                    if (m_pDrives != nullptr && !m_pDrives->empty())
+                        WriteServoTargetVelocityCommand((*m_pDrives)[0].pOutput, 0, 0);
+                }
+            }
+            // The proof is a copy, not the owner of the engine proposal. If a
+            // malformed copy was fenced before adoption, cancel by the private
+            // canonical handle. Never drop that handle while the model is pending.
+            if (!x.modelFinished && m_CompEngine.HasPendingXCycle() &&
+                m_pbcXCycle.prepared && m_pbcXCycleSendSequence == reservation.handoff.sequence &&
+                (!sendAttempted || x.scrubbed))
+            {
+                pbc::Diagnostic cancelDiagnostic{};
+                x.modelFinished = m_CompEngine.CancelXCycle(m_pbcXCycle, cancelDiagnostic);
+                if (cancelDiagnostic.error != pbc::Error::None) x.modelError = cancelDiagnostic.error;
+            }
+            if (!m_CompEngine.HasPendingXCycle())
+            {
+                m_pbcXCycle = CompensationEngine::XCycleTransaction{};
+                m_pbcXCycleSendSequence = 0ULL;
+            }
+        }
     }
+    if (reservation.acquired)
+    {
+        std::uint64_t expectedReservedOwner =
+            reservation.reservedOwnerState;
+        if (!m_motionOwnerState.compare_exchange_strong(
+            expectedReservedOwner,
+            reservation.baseOwnerState,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            m_motionOwnerState.fetch_and(
+                ~MOTION_OWNER_FRAME_SEND_RESERVED,
+                std::memory_order_acq_rel);
+        }
 
-    (void)AlarmManager::GetInstance().EndMotionAdmission(
-        reservation.alarmAdmission);
+        std::uint64_t expectedReservedExecution =
+            reservation.reservedExecutionPublication;
+        if (!m_executionEpochPublication.compare_exchange_strong(
+            expectedReservedExecution,
+            reservation.baseExecutionPublication,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        {
+            m_executionEpochPublication.fetch_and(
+                ~EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED,
+                std::memory_order_acq_rel);
+        }
 
-    reservation.acquired = false;
+        (void)AlarmManager::GetInstance().EndMotionAdmission(
+            reservation.alarmAdmission);
+
+        reservation.acquired = false;
+    }
+    // PBC-3A: zero-only, scrubbed and failed sends are observations too.
+    // This is local NIC acceptance; never change motion/completion from it.
+    if (reservation.handoffPending)
+    {
+        reservation.handoff.attempted = sendAttempted;
+        reservation.handoff.apiAccepted = sendAttempted && sendSucceeded;
+        m_servoHandoffMonitor.Observe(reservation.handoff);
+        m_pbcXSendAudit.Observe(reservation.pbcX);
+        reservation.handoffPending = false;
+    }
 }
 
 
 // 檔案：MotionCore.cpp
 void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 {
+    m_edmZSourceTick = 0ULL;
+    DiscardPbcXUnsentCycle();
+    m_pbcXFeedbackTick = 0ULL;
+    m_servoSourceInputMask = 0U; // PBC-3A: stale source samples never count as current.
+    m_pbcXSource = MotionPbcXSource{}; // PBC-3C: no stale command survives a new pass.
     m_pathAdmissionCorrectionFrameGeneration = 0ULL;
     InvalidateServoOutputImageProof();
     AlarmManager& motionAlarms = AlarmManager::GetInstance();
@@ -10818,6 +13607,12 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 
     // 1. 防呆：確保指標沒丟失
     if (m_pDrives == nullptr || m_pContexts == nullptr) {
+        m_pbcXHomeStopProof.Invalidate();
+        InvalidatePbcXHomeCapture();
+        m_pbcXHomeCaptureSupported.store(false, std::memory_order_release);
+        m_pbcXZeroOnlyHomeIdentity.store(false, std::memory_order_release);
+        m_pbcXStagedHomeEntryIdentity.store(false, std::memory_order_release);
+        m_pbcXConfiguredDisabledHomeIdentity.store(false, std::memory_order_release);
         if (ZeroAllServoTargetVelocityForFrame())
         {
             (void)PublishServoOutputImageProof(
@@ -10830,6 +13625,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                 motionAlarms.GetUpdateCount(),
                 ServoOutputImageProofMode::ZERO_ONLY);
         }
+        FinishEDMZFixtureMotionPass();
         PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
         return;
@@ -10837,6 +13633,12 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 
     // 2. 防呆：確保兩個清單長度一致
     if (m_pDrives->size() != m_pContexts->size()) {
+        m_pbcXHomeStopProof.Invalidate();
+        InvalidatePbcXHomeCapture();
+        m_pbcXHomeCaptureSupported.store(false, std::memory_order_release);
+        m_pbcXZeroOnlyHomeIdentity.store(false, std::memory_order_release);
+        m_pbcXStagedHomeEntryIdentity.store(false, std::memory_order_release);
+        m_pbcXConfiguredDisabledHomeIdentity.store(false, std::memory_order_release);
         // 這裡可以丟個錯誤 log
         if (ZeroAllServoTargetVelocityForFrame())
         {
@@ -10850,6 +13652,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                 motionAlarms.GetUpdateCount(),
                 ServoOutputImageProofMode::ZERO_ONLY);
         }
+        FinishEDMZFixtureMotionPass();
         PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
         return;
@@ -10926,6 +13729,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     {
         MotionServoInputSnapshot
             input;
+        bool semanticInput = false;
 
 
         if (legacyNormalPathRetired &&
@@ -10945,6 +13749,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                 TryReadRetiredMotionServoInputByAxisIndex(
                     (*m_pContexts)[i].axisIndex,
                     input);
+            semanticInput = semanticPass;
 
 
             if (!semanticPass)
@@ -11018,7 +13823,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
             if (m_pStructuredServoReadShadowMaster !=
                 nullptr)
             {
-                m_pStructuredServoReadShadowMaster->
+                semanticInput = m_pStructuredServoReadShadowMaster->
                     TryReadControlledMotionServoInputByAxisIndex(
                         (*m_pContexts)[i].axisIndex,
                         input);
@@ -11037,11 +13842,24 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                     input);
         }
 
+        if (i < static_cast<std::size_t>(MAX_AXES))
+        {
+            if (i == 2U) m_edmZInputSemantic = semanticInput;
+            m_servoSourceInputMask |= 1U << static_cast<unsigned>(i);
+            m_servoSourceStatusWord[i] = input.StatusWord;
+            m_servoSourceMode[i] = input.ModesOfOperationDisplay;
+        }
 
         UpdateMotion(
             (*m_pDrives)[i],
             (*m_pContexts)[i],
             input);
+        if (i == 0U)
+        {
+            m_pbcXFeedbackTick = m_ncSettleRuntimeCycleTick;
+            ObservePbcXHomeStop((*m_pContexts)[i], input, semanticInput);
+            ObservePbcXHomeCapture((*m_pContexts)[i], input, semanticInput);
+        }
 
 
         UpdateServoState(
@@ -11081,6 +13899,12 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         }
     }
 
+
+    if (!motionInputComplete || (m_servoSourceInputMask & 1U) == 0U)
+    {
+        m_pbcXHomeStopProof.Invalidate();
+        InvalidatePbcXHomeCapture();
+    }
 
     //座標轉換：直接使用內部的 m_pCoordMgr 指標
 
@@ -11129,6 +13953,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 
 
 
+    FinishEDMZFixtureMotionPass();
     const std::uint64_t imageExitExecutionPublication =
         m_executionEpochPublication.load(std::memory_order_acquire);
     const std::uint64_t imageExitOwnerState =
@@ -11162,7 +13987,8 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         ServoOutputImageProofMode::INVALID;
     bool imageAuthorized =
         imageMappingComplete && motionInputComplete;
-    if (!imageHasNonZeroTargetVelocity)
+    const bool realPbcControlImage = m_pbcXSource.cycle.prepared && m_pbcXSource.controlUsed;
+    if (!imageHasNonZeroTargetVelocity && !realPbcControlImage && !m_pbcXHomeProbeCommand.pending)
     {
         imageProofMode = ServoOutputImageProofMode::ZERO_ONLY;
     }
@@ -11204,7 +14030,8 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                 ++slot)
             {
                 if ((*m_pDrives)[slot].pOutput == nullptr ||
-                    (*m_pDrives)[slot].pOutput->TargetVelocity == 0)
+                    ((*m_pDrives)[slot].pOutput->TargetVelocity == 0 &&
+                        !(slot == 0U && realPbcControlImage)))
                 {
                     continue;
                 }
@@ -11276,6 +14103,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
     // Keep publication at the end of the completed Motion pass so final PDO
     // TargetVelocity and encoder-derived Actual Velocity describe this cycle.
     m_ncSettleMotionPassCompleted = motionInputComplete;
+    PublishPbcXZeroOnlyHomeIdentity();
     PublishStartupLagArmingEvidence();
     PublishStopSettleEvidence();
     // ROTPID_DIAG1: read-only capture after the existing local image guards.
@@ -11581,6 +14409,8 @@ double MotionCore::CalculateShortestTarget(double currentPos, double targetPos, 
 }
 bool MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targetVel, double acc_time, double dec_time)
 {
+    if (axis.axisIndex == 0 && (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+        HasPbcXUnresolvedActiveOutput())) return false;
 
     // Resolve against the same start that the existing idle/error rebase uses.
     // Validate first: failure must not alter any axis trajectory or position.
@@ -11722,6 +14552,8 @@ bool MotionCore::MoveToPosition(AxisContext& axis, double targetPos, double targ
 
 void MotionCore::VelocityMove(AxisContext& axis, double velocity, double acc_time)
 {
+    if (axis.axisIndex == 0 && (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+        HasPbcXUnresolvedActiveOutput())) return;
 
 
 
@@ -11807,6 +14639,8 @@ void MotionCore::MPGMove(
     double acc_time,
     double dec_time)
 {
+    if (axis.axisIndex == 0 && (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+        HasPbcXUnresolvedActiveOutput())) return;
     // =====================================================
     // Basic Parameter Validation
     // =====================================================
@@ -12335,6 +15169,7 @@ void MotionCore::EmergencyStopAllAxesImpl(
 
     // 防止 UpdateInterpolation 繼續對實體軸寫入新的命令。
     m_Group.isActive = false;
+    ClearEccentricCConsumer();
     m_safetyControlledStopInProgress = false;
     m_safetyControlledStopOwnerLease = MotionOwnerLease{};
     m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
@@ -12465,6 +15300,41 @@ void MotionCore::ResetFault(AxisContext& axis)
         axis.isLagAlarm ||
         (axis.state == MotionState::MotionState_ESTOP);
 
+    // PBC-3J FIX1: the boot fault-reset runs before a HOME/reference exists.
+    // A sealed all-zero X needs no retained-offset recovery at that point.
+    // Keep the original explicit reset and subsequent eight-sample startup
+    // alignment; never extend this exception to a post-startup loss or unknown IO.
+    const bool zeroBootstrap = !axis.startupLagMonitorArmed && !axis.isHomed &&
+        m_CompEngine.XReferenceGeneration() == 0ULL &&
+        (m_CompEngine.IsXZeroOnlyCoordinateIdentity(axis) ||
+            m_CompEngine.IsXBootstrapCoordinateIdentity(axis)) &&
+        !m_CompEngine.HasPendingXCycle() && !m_pbcXCycle.prepared &&
+        m_pbcXCycleSendSequence == 0ULL && m_pbcXSendSequence == 0ULL &&
+        !m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) &&
+        !m_pbcXSendContract.HasUnresolvedActiveOutput();
+    if (!axis.isVirtualAxis && (axis.enablePitch || axis.enableBacklash) &&
+        !zeroBootstrap &&
+        (needPhysicalSnap || (axis.axisIndex == 0 && m_pbcXRetainRecoveryRequired)))
+    {
+        // The existing explicit fault-reset request may clear software fault
+        // flags, but cannot release active position output or snap coordinates.
+        axis.resetRequest = true;
+        if (LatchPbcXRetainRecovery(axis, CompensationEngine::XRetainRecoveryKind::Fault))
+        {
+            axis.isFault = axis.isLagAlarm = false;
+            axis.state = MotionState::MotionState_IDLE;
+        }
+        else
+        {
+            axis.isFault = true;
+            axis.state = MotionState::MotionState_ERROR;
+            axis.currentCmdVel = axis.logicalCmdVel = 0.0;
+            axis.targetVelocity = axis.targetEndVel = 0.0;
+            axis.inPosition = false;
+        }
+        return;
+    }
+
     // 2. 清除所有異常旗標與 PID 歷史
     axis.resetRequest = true;
     axis.isFault = false;
@@ -12488,9 +15358,11 @@ void MotionCore::ResetFault(AxisContext& axis)
     {
         // 【嚴重脫節的實體軸】：大腦必須向實體馬達低頭，重新對齊起跑線
         // 否則下次一 Servo On，就會瞬間衝向原本的 CmdPos 造成撞機！
-        axis.currentCmdPos = axis.currentActPos;
-        axis.logicalCmdPos = axis.currentActPos;
-        axis.planningPos = axis.currentActPos;
+        double nominal = 0.0;
+        if (!TryPbcNominalSnap(axis, nominal, MotionPbcReferenceAction::FaultSnap)) return;
+        axis.currentCmdPos = nominal;
+        axis.logicalCmdPos = nominal;
+        axis.planningPos = nominal;
         axis.currentCmdVel = 0.0;
     }
     // else 
@@ -12542,6 +15414,7 @@ void MotionCore::ResetAllFaultsImpl(
     }
 
     m_Group.isActive = false;
+    ClearEccentricCConsumer();
     m_safetyControlledStopInProgress = false;
     m_safetyControlledStopOwnerLease = MotionOwnerLease{};
     m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
@@ -12715,18 +15588,35 @@ bool MotionCore::HasCompletedCncLineEndpointProof(const MotionCommand& source,
 // Fixed XYZ NC lines must finish on the same native target bits their producer
 // committed, including G90 before a later G91 distance-mode handoff. This scope
 // excludes replay/EDM and accepts only the separately proved queued LINEAR scope.
+// BASE79M-FIX1 also covers neutral G90 XYZC positioning before G43/G44+G162.
+// Its empty translation is intentional: all four packet endpoints are already
+// native pulses. The same drained scalar, bounded roundoff and lifecycle proof
+// below must pass before publishing those exact immutable endpoint bits.
 bool MotionCore::IsFixedPlanarLineEndpointScope() const noexcept
 {
     const MotionCommand& source = m_Group.currentCmd;
+    const bool nativeXYZCPositioning = source.axisCount == 4 &&
+        IsNCTranslationSnapshotEmpty(source.sourceTranslation) &&
+        source.sourceIsAbsoluteMode && source.sourcePlaneMode == 17 &&
+        source.sourceToolLengthMode == 49 && source.sourceToolRadiusMode == 40 &&
+        !source.sourceG162Active && !source.sourceG68Active &&
+        !source.sourceG168Active && source.sourceWCode == 0 &&
+        !source.sourceG51Active && source.sourceMirrorMask == 0U && !source.sourceG16Active &&
+        !source.pathCoreFeedExactStop && !source.pathCoreRotaryFeedExactStop &&
+        !source.pathCoreZCFeedExactStop && !source.pathCoreXYZCFeedExactStop &&
+        !source.pathCoreXYZCUVFeedExactStop && !source.pathCoreEccentricCFeedExactStop &&
+        !source.cncFeedLookahead;
     if (m_pContexts == nullptr || !m_Group.isActive ||
         m_Group.mode != InterpolationMode::LINEAR || source.mode != InterpolationMode::LINEAR ||
         (!IsCncLineEndpointScope() &&
             (source.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
                 m_Group.pathMode != PathMode::EXACT_STOP || source.cncFeedLookahead)) ||
-        source.axisCount < 1 || source.axisCount > 3 || source.axisCount != m_Group.axisCount ||
+        source.axisCount < 1 || source.axisCount > (source.pathCoreXYZCUVFeedExactStop ? 6 :
+            (source.pathCoreXYZCFeedExactStop || nativeXYZCPositioning) ? 4 : 3) ||
+        source.axisCount != m_Group.axisCount ||
         !source.execution.IsAssigned() || source.execution.source != MotionCommandSource::NC_MEMORY ||
         !source.ownerLease.IsValid() || source.ownerLease.owner != MotionOwner::AUTO ||
-        !IsNCTranslationSnapshotValid(source.sourceTranslation) ||
+        (!nativeXYZCPositioning && !IsNCTranslationSnapshotValid(source.sourceTranslation)) ||
         source.cncCornerBlend || source.pathCorePlanarCircle ||
         source.pathCoreFullCircle || source.pathCoreRetainedTraversal || source.pathCoreRetainedReverse ||
         source.replayTerminalAlreadyPublished || m_Group.enableHistory || m_Group.enableTransform ||
@@ -12738,10 +15628,18 @@ bool MotionCore::IsFixedPlanarLineEndpointScope() const noexcept
         const int axis = source.axisIndices[slot];
         const bool rotary = source.pathCoreRotaryFeedExactStop;
         const bool zc = source.pathCoreZCFeedExactStop;
+        const bool xyzc = source.pathCoreXYZCFeedExactStop;
+        const bool xyzcuv = source.pathCoreXYZCUVFeedExactStop;
         if (axis < 0 || axis >= MAX_AXES || static_cast<std::size_t>(axis) >= m_pContexts->size() ||
             m_Group.axisIndices[slot] != axis || (mask & (1U << axis)) != 0U ||
             !(*m_pContexts)[axis].isExist ||
-            (zc ? (!IsMotionZCFeedSourceAllowed(source) || axis != slot + 2 ||
+            (nativeXYZCPositioning ? (axis != slot ||
+                (*m_pContexts)[axis].axisType != (axis < 3 ? AxisType::LINEAR : AxisType::ROTARY)) :
+             xyzcuv ? (!IsMotionXYZCUVFeedSourceAllowed(source) || axis != slot ||
+                (*m_pContexts)[axis].axisType != (axis < 3 ? AxisType::LINEAR : AxisType::ROTARY)) :
+             xyzc ? (!IsMotionXYZCFeedSourceAllowed(source) || axis != slot ||
+                (*m_pContexts)[axis].axisType != (axis < 3 ? AxisType::LINEAR : AxisType::ROTARY)) :
+             zc ? (!IsMotionZCFeedSourceAllowed(source) || axis != slot + 2 ||
                 (*m_pContexts)[axis].axisType != (axis == 2 ? AxisType::LINEAR : AxisType::ROTARY)) :
              rotary ? (!IsMotionRotaryFeedSourceAllowed(source) || axis < 3 ||
                 (*m_pContexts)[axis].axisType != AxisType::ROTARY) :
@@ -12884,7 +15782,11 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             (m_Group.currentCmd.pathCoreRotaryFeedExactStop && m_Group.pathMode == PathMode::EXACT_STOP &&
                 IsMotionRotaryFeedSourceAllowed(m_Group.currentCmd)) ||
             (m_Group.currentCmd.pathCoreZCFeedExactStop && m_Group.pathMode == PathMode::EXACT_STOP &&
-                IsMotionZCFeedSourceAllowed(m_Group.currentCmd))) &&
+                IsMotionZCFeedSourceAllowed(m_Group.currentCmd)) ||
+            (m_Group.currentCmd.pathCoreXYZCFeedExactStop && m_Group.pathMode == PathMode::EXACT_STOP &&
+                IsMotionXYZCFeedSourceAllowed(m_Group.currentCmd)) ||
+            (m_Group.currentCmd.pathCoreXYZCUVFeedExactStop && m_Group.pathMode == PathMode::EXACT_STOP &&
+                IsMotionXYZCUVFeedSourceAllowed(m_Group.currentCmd))) &&
         !m_Group.enableHistory && !m_Group.enableTransform &&
         m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
         !m_safetyControlledStopInProgress && !IsPathCoreHoldExcursionDriving() &&
@@ -13164,6 +16066,17 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         axis.velBuffer[axis.bufferIndex] = axis.currentCmdVel;
         axis.bufferSum += axis.currentCmdVel;
         axis.bufferIndex = (axis.bufferIndex + 1) % (int)axis.velBuffer.size();
+        // PBC-3J FIX2: a fully drained FIR has an exact zero sum. Remove only
+        // floating accumulation residue after every retained sample is zero;
+        // a real sub-PPS tail must still run through the normal integration.
+        if (axis.currentCmdVel == 0.0 && std::isfinite(axis.bufferSum) &&
+            axis.bufferSum != 0.0 &&
+            std::all_of(axis.velBuffer.begin(), axis.velBuffer.end(),
+                [](double velocity) { return velocity == 0.0; }))
+        {
+            axis.bufferSum = 0.0;
+        }
+
         finalOutputVel = axis.bufferSum / (double)axis.velBuffer.size();
         if (axis.isVirtualAxis && &axis == &m_Group.virtualAxis &&
             m_Group.currentCmd.cncFeedLookahead && !m_safetyControlledStopInProgress)
@@ -13279,7 +16192,8 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         const bool dtFeedTail = isHandoverReady && axis.isVirtualAxis &&
             &axis == &m_Group.virtualAxis && m_Group.isActive &&
             (dtCommand.pathCoreFeedExactStop || dtCommand.pathCoreRotaryFeedExactStop ||
-                dtCommand.pathCoreZCFeedExactStop ||
+                dtCommand.pathCoreZCFeedExactStop || dtCommand.pathCoreXYZCFeedExactStop ||
+                dtCommand.pathCoreXYZCUVFeedExactStop ||
                 IsFixedPlanarLineEndpointScope()) &&
             dtCommand.mode == InterpolationMode::LINEAR &&
             dtCommand.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
@@ -14153,8 +17067,7 @@ MotionPathCoreAdmissionCorrectionDecision MotionCore::ResolvePathCoreAdmissionPo
     if (!MotionCommandHasAxis(m_pathHoldAdmissionFront, axis.axisIndex))
         return finish(Decision::BLOCKED, Reason::SOURCE_IDENTITY);
     if (axis.isVirtualAxis || axis.axisType != AxisType::LINEAR ||
-        axis.fbMode != FeedbackSource::MOTOR_ENCODER || axis.enablePitch || axis.enableBacklash ||
-        !std::isfinite(axis.currentCompOffset_unit) || axis.currentCompOffset_unit != 0.0)
+        axis.fbMode != FeedbackSource::MOTOR_ENCODER || !IsPbcControlScope(axis))
         return finish(Decision::BLOCKED, Reason::AXIS_SCOPE);
     if ((input.StatusWord & 0x006FU) != 0x0027U || input.ModesOfOperationDisplay != 9 ||
         axis.targetMode != 9 || !axis.isServoOn)
@@ -14174,7 +17087,20 @@ MotionPathCoreAdmissionCorrectionDecision MotionCore::ResolvePathCoreAdmissionPo
         return finish(Decision::BLOCKED, Reason::NUMERIC);
     const double unitsPerPulse = axis.finalLead / axis.resolution_PPR;
     const double cap = (std::min)(axis.maxVel_PPS, 0.1 / unitsPerPulse);
-    const double error = axis.currentCmdPos - axis.currentActPos;
+    double error = axis.currentCmdPos - axis.currentActPos;
+    if (!IsPbcCoordinateIdentity(axis))
+    {
+        // No proposal is prepared here: Run_Servo_Loop owns that single
+        // transaction. Admission correction can only retain a settled target.
+        const pbc::CoordinateFrame& frame = axis.mechanicalCompensationFrame;
+        pbc::ControlFrame retained{};
+        if (!m_CompEngine.IsXKnownAppliedControlFrame(axis) || !frame.settled ||
+            frame.offsetVelocityPPS != 0.0 || frame.servoVelocityPPS != 0.0 ||
+            !pbc::ResolveControlFrame(frame, command.instantCmdPos, 0.0,
+                axis.currentActPos, retained))
+            return finish(Decision::BLOCKED, Reason::AXIS_SCOPE);
+        error = retained.followingErrorPulse;
+    }
     const double proportional = error * axis.Pid_IDLE.Kp;
     if (!std::isfinite(unitsPerPulse) || unitsPerPulse <= 0.0 ||
         !std::isfinite(cap) || cap <= 0.0 ||
@@ -14348,6 +17274,13 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     // is an authority-state reset only: it does not rebase command position,
     // change planner state, or modify G00 / Reset deceleration behavior.
     // =========================================================
+    // P13 single-Z isolation freezes every other controller's integral after
+    // retaining fresh feedback and normal travel-limit observation.
+    if (m_edmZPolicy.Snapshot().capHeld && axis.axisIndex != 2)
+    {
+        WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+        return;
+    }
     const MotionOwnerLease servoLoopOwnerLease =
         GetMotionOwnerLease();
     if (servoLoopOwnerLease.owner == MotionOwner::NONE ||
@@ -14378,7 +17311,13 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     }
 
     // 2. [Lag Monitor] 跟隨誤差檢查 (此時的 ActPos 絕對不會溢位)
-    double error = cmd.instantCmdPos - axis.currentActPos;
+    pbc::ControlFrame control{};
+    if (!PreparePbcXControl(axis, cmd, control))
+    {
+        WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+        return;
+    }
+    double error = control.followingErrorPulse;
 
     if (axis.pid.EnableLagCheck == true)
     {
@@ -14406,6 +17345,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     // CU_FIX1: only the exact live queued-source wait discards prior motion I.
     // Every other owner/state retains its existing PI calculation.
     double p_term = error * axis.pid.Kp;
+    const double edmZIntegralBefore = axis.pid.integralAcc;
     double i_term = 0.0;
     double finalVel = 0.0;
     if (admissionCorrection == MotionPathCoreAdmissionCorrectionDecision::AUTHORIZED)
@@ -14421,7 +17361,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         if (axis.pid.integralAcc < -axis.pid.MaxIntegral) axis.pid.integralAcc = -axis.pid.MaxIntegral;
         i_term = axis.pid.integralAcc * axis.pid.Ki;
         const double d_term = 0.0;
-        finalVel = (cmd.instantCmdVel * axis.pid.Kvff) + (p_term + i_term + d_term);
+        finalVel = (control.servoVelocityPPS * axis.pid.Kvff) + (p_term + i_term + d_term);
     }
 
     // =======================================================
@@ -14577,17 +17517,16 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
             // 此刻實際 Machine Position。
             // =================================================
 
-            axis.currentCmdPos =
-                axis.currentActPos;
-
-            axis.logicalCmdPos =
-                axis.currentActPos;
-
-            axis.planningPos =
-                axis.currentActPos;
-
-            axis.finalTargetPos =
-                axis.currentActPos;
+            double nominal = 0.0;
+            if (!TryPbcNominalSnap(axis, nominal, MotionPbcReferenceAction::LimitSnap))
+            {
+                WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+                return;
+            }
+            axis.currentCmdPos = nominal;
+            axis.logicalCmdPos = nominal;
+            axis.planningPos = nominal;
+            axis.finalTargetPos = nominal;
 
 
             // =================================================
@@ -14646,12 +17585,22 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         finalVel = -finalVel;
     }
 
+    // Scope cap and finite validation precede the int32 conversion. Undo
+    // integral accumulation on saturation or a zero fence; gains are unchanged.
+    if (m_edmZPolicy.Snapshot().capHeld)
+    {
+        const double guardedVelocity = GuardEDMZFixtureVelocity(axis.axisIndex, finalVel);
+        if (guardedVelocity != finalVel || !std::isfinite(finalVel))
+            axis.pid.integralAcc = edmZIntegralBefore;
+        finalVel = guardedVelocity;
+    }
     // 6. [Write PDO] 寫入 EtherCAT
     WriteServoTargetVelocityCommand(
         servo.pOutput,
         axis.axisIndex,
         static_cast<int32_t>(
             finalVel));
+    ReceiptPbcXControl(axis, cmd, static_cast<std::int32_t>(finalVel));
 }
 
 
@@ -14705,12 +17654,38 @@ void MotionCore::UpdateMotion(
     }
 
     axis.currentActPos = rawLogicalActPos - axis.machineCoordinateOffsetPulse;
+    ProcessEDMZFixtureAxis(axis, input);
 
     // =========================================================
 
     const int opMode = input.ModesOfOperationDisplay;
     const bool rawOperationEnabled =
         (input.StatusWord & 0x006FU) == 0x0027U;
+
+    if (HoldPbcXRetainRecoveryOutput(axis, servo.pOutput)) return;
+    // PBC-3J FIX1: CiA402 not-ready is normal before the one-shot startup
+    // alignment. Let the existing arming path mirror this proven-zero boot
+    // coordinate while holding PDO velocity at zero; it still requires eight
+    // adjacent enabled/mode-9 samples and preserves real ERROR/ESTOP evidence.
+    const bool zeroBootstrap = !axis.startupLagMonitorArmed && !axis.isHomed &&
+        m_CompEngine.XReferenceGeneration() == 0ULL &&
+        (m_CompEngine.IsXZeroOnlyCoordinateIdentity(axis) ||
+            m_CompEngine.IsXBootstrapCoordinateIdentity(axis)) &&
+        !m_CompEngine.HasPendingXCycle() && !m_pbcXCycle.prepared &&
+        m_pbcXCycleSendSequence == 0ULL && m_pbcXSendSequence == 0ULL &&
+        !m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) &&
+        !m_pbcXSendContract.HasUnresolvedActiveOutput();
+    if ((axis.enablePitch || axis.enableBacklash) && !zeroBootstrap &&
+        (!rawOperationEnabled || opMode != 9))
+    {
+        // Active power/mode loss is observed immediately, without waiting for
+        // the historical OFF debounce. No numeric inverse is applied here.
+        double ignoredNominal = 0.0;
+        (void)TryPbcNominalSnap(axis, ignoredNominal, MotionPbcReferenceAction::ServoSnap);
+        (void)HoldPbcXRetainRecoveryOutput(axis, servo.pOutput);
+        WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+        return;
+    }
 
     if (m_idlePositionHold.passRequested ||
         GetMotionOwnerLease().owner == MotionOwner::IDLE_HOLD)
@@ -14768,8 +17743,14 @@ void MotionCore::UpdateMotion(
             axis.isFault = true; // 🚨 這裡必須觸發嚴重錯誤！
         }
 
-        axis.currentCmdPos = axis.currentActPos;
-        axis.logicalCmdPos = axis.currentActPos;
+        double nominal = 0.0;
+        if (!TryPbcNominalSnap(axis, nominal, MotionPbcReferenceAction::ServoSnap))
+        {
+            WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+            return;
+        }
+        axis.currentCmdPos = nominal;
+        axis.logicalCmdPos = nominal;
         axis.currentCmdVel = 0.0;
         axis.logicalCmdVel = 0.0;
         axis.pid.integralAcc = 0.0;
@@ -14980,9 +17961,9 @@ void MotionCore::UpdateMotion(
     // ==========================================
     // 🌟 2. [Layer 2.5] 進入補償層 (動態加入螺距與背隙誤差)
     // ==========================================
-    // PBC-2: this production seam is still OFF-only. Enabled compensation is
-    // rejected at boot and here until lifecycle/authority integration releases
-    // it. The coordinate-frame model is NOT permission to bypass that gate.
+    // PBC-3J: this seam admits OFF or sealed physical-X zero calibration.
+    // Nonzero remains locked; real enabled cycles are prepared by the servo
+    // controller and committed only through the exact final-image NIC receipt.
     if (!m_CompEngine.ApplyCompensation(axis.axisIndex, axis, cmd, CYCLE_TIME_SEC))
     {
         WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
@@ -15012,6 +17993,7 @@ void MotionCore::InitVirtualAxisSmooth(int windowSize)
     // 1. 初始化插補群組 (m_Group) 的大腦狀態
     // ==========================================
     m_Group.isActive = false;
+    ClearEccentricCConsumer();
     m_Group.mode = InterpolationMode::LINEAR; // 預設為直線模式
     m_Group.feedrateOverride = 1.0;           // 倍率預設 100%
     m_Group.axisCount = 0;
@@ -15184,7 +18166,11 @@ bool MotionCore::TryLineMove(
     bool pathCoreRotaryFeedExactStop,
     const NCRotaryFeedLineValue* rotaryGeometry,
     bool pathCoreZCFeedExactStop,
-    const NCZCFeedLineValue* zcGeometry) noexcept
+    const NCZCFeedLineValue* zcGeometry,
+    bool pathCoreXYZCFeedExactStop,
+    const NCXYZCFeedLineValue* xyzcGeometry,
+    bool pathCoreXYZCUVFeedExactStop,
+    const NCXYZCUVFeedLineValue* xyzcuvGeometry) noexcept
 {
     if (preparedCommand != nullptr) *preparedCommand = MotionCommand{};
     if (producedIdentity != nullptr)
@@ -15260,6 +18246,8 @@ bool MotionCore::TryLineMove(
             cncFeedLookahead || cncCorner != nullptr || cncPrefixVelocityPPS != 0.0 ||
             pathCoreFeedExactStop);
     const bool rotaryScope = pathCoreRotaryFeedExactStop && !pathCoreZCFeedExactStop &&
+        !pathCoreXYZCFeedExactStop && xyzcGeometry == nullptr &&
+        !pathCoreXYZCUVFeedExactStop && xyzcuvGeometry == nullptr &&
         zcGeometry == nullptr && rotaryGeometry != nullptr &&
         rotaryGeometry->valid && axes.size() == 1U && axes[0] >= 3 && axes[0] < MAX_AXES &&
         rotaryGeometry->axisMask == (1U << static_cast<unsigned>(axes[0])) &&
@@ -15273,6 +18261,8 @@ bool MotionCore::TryLineMove(
         (m_pendingTranslation.distanceMode == 90 || m_pendingTranslation.distanceMode == 91) &&
         m_pendingIsAbsoluteMode == (m_pendingTranslation.distanceMode == 90);
     const bool zcScope = pathCoreZCFeedExactStop && !pathCoreRotaryFeedExactStop &&
+        !pathCoreXYZCFeedExactStop && xyzcGeometry == nullptr &&
+        !pathCoreXYZCUVFeedExactStop && xyzcuvGeometry == nullptr &&
         rotaryGeometry == nullptr && zcGeometry != nullptr && zcGeometry->valid &&
         axes.size() == 2U && axes[0] == 2 && axes[1] == 3 && zcGeometry->axisMask == 12U &&
         targetPos.size() == 2U && targetPos[0] == zcGeometry->endPulse[2] &&
@@ -15286,8 +18276,56 @@ bool MotionCore::TryLineMove(
         (m_pendingTranslation.distanceMode == 90 || m_pendingTranslation.distanceMode == 91) &&
         m_pendingIsAbsoluteMode == (m_pendingTranslation.distanceMode == 90) &&
         zcGeometry->absolute == m_pendingIsAbsoluteMode;
+    bool xyzcScope = pathCoreXYZCFeedExactStop && !pathCoreZCFeedExactStop &&
+        !pathCoreXYZCUVFeedExactStop && xyzcuvGeometry == nullptr &&
+        !pathCoreRotaryFeedExactStop && rotaryGeometry == nullptr && zcGeometry == nullptr &&
+        xyzcGeometry != nullptr && xyzcGeometry->valid && xyzcGeometry->axisMask == 15U &&
+        axes.size() == 4U && targetPos.size() == 4U && targetVel == xyzcGeometry->velocityPPS &&
+        acc_time == xyzcGeometry->accTime && dec_time == xyzcGeometry->decTime &&
+        commandSource == MotionCommandSource::NC_MEMORY && plannedTailWellFormed &&
+        commandOwnerLease.owner == MotionOwner::AUTO && mode == BufferMode::ABORTING &&
+        commandPathMode == MotionCommandPathMode::EXACT_STOP && !pathCoreFeedExactStop &&
+        !cncFeedLookahead && cncCorner == nullptr && cncPrefixVelocityPPS == 0.0 &&
+        preparedCommand == nullptr && IsNCXYZCFeedNeutralFrame(m_pendingTranslation) &&
+        m_pendingIsAbsoluteMode == (m_pendingTranslation.distanceMode == 90) &&
+        xyzcGeometry->absolute == m_pendingIsAbsoluteMode;
+    for (unsigned slot = 0U; xyzcScope && slot < 4U; ++slot)
+        xyzcScope = axes[slot] == static_cast<int>(slot) &&
+            NCRotaryFeedDetail::SameBits(targetPos[slot], xyzcGeometry->endPulse[slot]) &&
+            (xyzcGeometry->absolute ?
+                (std::isfinite(xyzcGeometry->absoluteTargetWCS[slot]) &&
+                    NCRotaryFeedDetail::SameBits(xyzcGeometry->absoluteTargetMCS[slot],
+                        xyzcGeometry->absoluteTargetWCS[slot] +
+                            NCTranslationAxisOffsetMM(m_pendingTranslation, slot))) :
+                NCRotaryFeedDetail::SameBits(xyzcGeometry->endMCS[slot],
+                    xyzcGeometry->startMCS[slot] + xyzcGeometry->deltaNative[slot]));
+    bool xyzcuvScope = pathCoreXYZCUVFeedExactStop && !pathCoreZCFeedExactStop &&
+        !pathCoreXYZCFeedExactStop && xyzcGeometry == nullptr &&
+        !pathCoreRotaryFeedExactStop && rotaryGeometry == nullptr && zcGeometry == nullptr &&
+        xyzcuvGeometry != nullptr && xyzcuvGeometry->valid && xyzcuvGeometry->axisMask == 63U &&
+        axes.size() == 6U && targetPos.size() == 6U && targetVel == xyzcuvGeometry->velocityPPS &&
+        acc_time == xyzcuvGeometry->accTime && dec_time == xyzcuvGeometry->decTime &&
+        commandSource == MotionCommandSource::NC_MEMORY && plannedTailWellFormed &&
+        commandOwnerLease.owner == MotionOwner::AUTO && mode == BufferMode::ABORTING &&
+        commandPathMode == MotionCommandPathMode::EXACT_STOP && !pathCoreFeedExactStop &&
+        !cncFeedLookahead && cncCorner == nullptr && cncPrefixVelocityPPS == 0.0 &&
+        preparedCommand == nullptr && IsNCXYZCUVFeedNeutralFrame(m_pendingTranslation) &&
+        m_pendingIsAbsoluteMode == (m_pendingTranslation.distanceMode == 90) &&
+        xyzcuvGeometry->absolute == m_pendingIsAbsoluteMode;
+    for (unsigned slot = 0U; xyzcuvScope && slot < 6U; ++slot)
+        xyzcuvScope = axes[slot] == static_cast<int>(slot) &&
+            NCRotaryFeedDetail::SameBits(targetPos[slot], xyzcuvGeometry->endPulse[slot]) &&
+            (xyzcuvGeometry->absolute ?
+                (std::isfinite(xyzcuvGeometry->absoluteTargetWCS[slot]) &&
+                    NCRotaryFeedDetail::SameBits(xyzcuvGeometry->absoluteTargetMCS[slot],
+                        xyzcuvGeometry->absoluteTargetWCS[slot] +
+                            NCTranslationAxisOffsetMM(m_pendingTranslation, slot))) :
+                NCRotaryFeedDetail::SameBits(xyzcuvGeometry->endMCS[slot],
+                    xyzcuvGeometry->startMCS[slot] + xyzcuvGeometry->deltaNative[slot]));
     if ((pathCoreRotaryFeedExactStop ? !rotaryScope : rotaryGeometry != nullptr) ||
         (pathCoreZCFeedExactStop ? !zcScope : zcGeometry != nullptr) ||
+        (pathCoreXYZCFeedExactStop ? !xyzcScope : xyzcGeometry != nullptr) ||
+        (pathCoreXYZCUVFeedExactStop ? !xyzcuvScope : xyzcuvGeometry != nullptr) ||
         invalidPreparationScope || (basePlaneLinear && !basePlaneLinearAllowed) ||
         !IsPendingCommandTranslationValid(commandSource) ||
         (commandSource == MotionCommandSource::NC_MEMORY && m_pendingToolRadMode != 40 &&
@@ -15348,7 +18386,11 @@ bool MotionCore::TryLineMove(
             !(*m_pContexts)[axisIndex].isExist ||
             (commandSource == MotionCommandSource::NC_MEMORY &&
                 !IsNCTranslationSnapshotEmpty(m_pendingTranslation) &&
-                (zcScope ? ((*m_pContexts)[axisIndex].axisType != (axisIndex == 2 ? AxisType::LINEAR : AxisType::ROTARY) ||
+                (xyzcuvScope ? ((*m_pContexts)[axisIndex].axisType != (axisIndex < 3 ? AxisType::LINEAR : AxisType::ROTARY) ||
+                    !NCRotaryFeedDetail::SameBits((*m_pContexts)[axisIndex].logicalCmdPos.Load(), xyzcuvGeometry->startPulse[static_cast<unsigned>(axisIndex)])) :
+                 xyzcScope ? ((*m_pContexts)[axisIndex].axisType != (axisIndex < 3 ? AxisType::LINEAR : AxisType::ROTARY) ||
+                    !NCRotaryFeedDetail::SameBits((*m_pContexts)[axisIndex].logicalCmdPos.Load(), xyzcGeometry->startPulse[static_cast<unsigned>(axisIndex)])) :
+                 zcScope ? ((*m_pContexts)[axisIndex].axisType != (axisIndex == 2 ? AxisType::LINEAR : AxisType::ROTARY) ||
                     !NCRotaryFeedDetail::SameBits((*m_pContexts)[axisIndex].logicalCmdPos.Load(), zcGeometry->startPulse[static_cast<unsigned>(axisIndex)])) :
                  rotaryScope ? ((*m_pContexts)[axisIndex].axisType != AxisType::ROTARY ||
                     (*m_pContexts)[axisIndex].logicalCmdPos.Load() != rotaryGeometry->startPulse[static_cast<unsigned>(axisIndex)]) :
@@ -15376,6 +18418,56 @@ bool MotionCore::TryLineMove(
     cmd.pathCoreFeedExactStop = pathCoreFeedExactStop;
     cmd.pathCoreRotaryFeedExactStop = pathCoreRotaryFeedExactStop;
     cmd.pathCoreZCFeedExactStop = pathCoreZCFeedExactStop;
+    cmd.pathCoreXYZCFeedExactStop = pathCoreXYZCFeedExactStop;
+    cmd.pathCoreXYZCUVFeedExactStop = pathCoreXYZCUVFeedExactStop;
+    if (xyzcuvScope)
+    {
+        for (unsigned slot = 0U; slot < 6U; ++slot)
+        {
+            cmd.mem_startPos[slot] = xyzcuvGeometry->startPulse[slot];
+            cmd.mem_ratio[slot] = xyzcuvGeometry->pulsePerUnit[slot];
+            if (slot < 3U) cmd.mem_transformOrigin[slot] = xyzcuvGeometry->startMCS[slot];
+            else cmd.mem_transformMatrix[0][slot - 3U] = xyzcuvGeometry->startMCS[slot];
+            cmd.mem_transformMatrix[slot < 3U ? 1U : 2U][slot % 3U] = xyzcuvGeometry->absolute ?
+                xyzcuvGeometry->absoluteTargetWCS[slot] : xyzcuvGeometry->deltaNative[slot];
+        }
+        cmd.mem_totalDist = xyzcuvGeometry->lengthPulse;
+        cmd.mem_radius = xyzcuvGeometry->feedMMMin;
+        cmd.mem_startAngle = xyzcuvGeometry->nominalSeconds;
+        cmd.mem_totalAngle = xyzcuvGeometry->rotaryFeedDegMin[0];
+        cmd.mem_centerX = xyzcuvGeometry->rotaryFeedDegMin[1];
+        cmd.mem_centerY = xyzcuvGeometry->rotaryFeedDegMin[2];
+        if (xyzcuvGeometry->absolute)
+        {
+            cmd.mem_startPos[6U] = xyzcuvGeometry->rotaryModulo[0U];
+            cmd.mem_startPos[7U] = xyzcuvGeometry->rotaryModulo[1U];
+            cmd.mem_ratio[6U] = xyzcuvGeometry->rotaryModulo[2U];
+            unsigned mask = 0U;
+            for (unsigned rotary = 0U; rotary < 3U; ++rotary)
+                if (xyzcuvGeometry->rotaryShortestPath[rotary]) mask |= 1U << rotary;
+            cmd.mem_ratio[7U] = static_cast<double>(mask);
+        }
+    }
+    if (xyzcScope)
+    {
+        for (unsigned slot = 0U; slot < 4U; ++slot)
+        {
+            cmd.mem_startPos[slot] = xyzcGeometry->startPulse[slot];
+            cmd.mem_startPos[slot + 4U] = xyzcGeometry->startMCS[slot];
+            cmd.mem_ratio[slot] = xyzcGeometry->pulsePerUnit[slot];
+            cmd.mem_ratio[slot + 4U] = xyzcGeometry->absolute ?
+                xyzcGeometry->absoluteTargetWCS[slot] : xyzcGeometry->deltaNative[slot];
+        }
+        cmd.mem_totalDist = xyzcGeometry->lengthPulse;
+        cmd.mem_radius = xyzcGeometry->feedMMMin;
+        cmd.mem_startAngle = xyzcGeometry->nominalSeconds;
+        cmd.mem_totalAngle = xyzcGeometry->rotaryFeedDegMin;
+        if (xyzcGeometry->absolute)
+        {
+            cmd.mem_centerX = xyzcGeometry->rotaryModulo;
+            cmd.mem_centerY = xyzcGeometry->rotaryShortestPath ? 1.0 : 0.0;
+        }
+    }
     if (zcScope)
     {
         for (unsigned slot = 0U; slot < 2U; ++slot)
@@ -15516,11 +18608,25 @@ bool MotionCore::TryLineMove(
     // path; the consumer must never be the first to reject a committed tail.
     // These private source tags authorize validation only; the execution
     // identity is assigned after the existing epoch/owner transaction below.
-    if ((cncCorner != nullptr || rotaryScope || zcScope) && commandSource == MotionCommandSource::NC_MEMORY)
+    if ((cncCorner != nullptr || rotaryScope || zcScope || xyzcScope || xyzcuvScope) && commandSource == MotionCommandSource::NC_MEMORY)
     {
         cmd.execution.source = commandSource;
         cmd.ownerLease = commandOwnerLease;
-        if (!IsMotionCommandConsumerGeometryValid(cmd, m_pContexts))
+        NCXYZCFeedLineValue rebuiltFour{};
+        NCXYZCUVFeedLineValue rebuiltSix{};
+        bool geometryValid = xyzcuvScope ? IsMotionXYZCUVFeedGeometryValid(cmd, m_pContexts, &rebuiltSix) :
+            xyzcScope ? IsMotionXYZCFeedGeometryValid(cmd, m_pContexts, &rebuiltFour) :
+            IsMotionCommandConsumerGeometryValid(cmd, m_pContexts);
+        // The accepted native tail belongs to the canonical absolute target,
+        // never start+delta reconstructed after cancellation. Validate the
+        // producer receipt as well as its packed command before epoch commit.
+        for (unsigned slot = 0U; geometryValid && xyzcuvScope && slot < 6U; ++slot)
+            geometryValid = NCRotaryFeedDetail::SameBits(rebuiltSix.endMCS[slot], xyzcuvGeometry->endMCS[slot]) &&
+                NCRotaryFeedDetail::SameBits(rebuiltSix.deltaNative[slot], xyzcuvGeometry->deltaNative[slot]);
+        for (unsigned slot = 0U; geometryValid && xyzcScope && slot < 4U; ++slot)
+            geometryValid = NCRotaryFeedDetail::SameBits(rebuiltFour.endMCS[slot], xyzcGeometry->endMCS[slot]) &&
+                NCRotaryFeedDetail::SameBits(rebuiltFour.deltaNative[slot], xyzcGeometry->deltaNative[slot]);
+        if (!geometryValid)
         {
             RejectInvalidProducerMotionCommand(invalidCommand, commandEpoch, commandSource,
                 commandOwnerLease, producedIdentity, producedOwnerLease);
@@ -16490,6 +19596,10 @@ void MotionCore::RefreshCncFeedLookahead(bool loading) noexcept
 
 void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
 {
+    // A marked outgoing segment always retires with both authority words
+    // reserved. Never complete/clear it through the legacy native handoff.
+    if (m_Group.isActive && m_Group.currentCmd.pathCoreEccentricCFeedExactStop) return;
+    if (!m_Group.isActive) ClearEccentricCConsumer();
     // ======================================================
     // 1. 派單保護
     // ======================================================
@@ -16547,6 +19657,64 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         return;
     }
 
+    // BASE79F: a curve packet owns its complete decode/pop/start transaction.
+    // Let an outgoing exact-stop group retire through the common endpoint
+    // path first; never overwrite its cursor or dispatch through legacy FIR.
+    if (frontCommand.pathCoreEccentricCFeedExactStop)
+    {
+        if (m_Group.isActive || cncBoundaryCrossing) return;
+        (void)LoadEccentricCCommand(frontCommand);
+        return;
+    }
+
+    bool xyzcuvStartAndTravelValid = true;
+    if (frontCommand.pathCoreXYZCUVFeedExactStop)
+    {
+        NCXYZCUVFeedLineValue resolvedGeometry{};
+        xyzcuvStartAndTravelValid = IsMotionXYZCUVFeedGeometryValid(frontCommand, m_pContexts, &resolvedGeometry) &&
+            !m_Group.enableHistory && !m_Group.enableTransform &&
+            m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
+            std::isfinite(m_Group.feedrateOverride) && m_Group.feedrateOverride >= 0.0 &&
+            m_Group.feedrateOverride <= 1.0 && m_pCoordMgr != nullptr;
+        for (unsigned slot = 0U; xyzcuvStartAndTravelValid && slot < 6U; ++slot)
+        {
+            const AxisContext& axis = (*m_pContexts)[slot];
+            const double endMCS = resolvedGeometry.endMCS[slot];
+            xyzcuvStartAndTravelValid = NCRotaryFeedDetail::SameBits(axis.logicalCmdPos.Load(), frontCommand.mem_startPos[slot]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,
+                    frontCommand.mem_startPos[slot] / frontCommand.mem_ratio[slot]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,
+                    frontCommand.targetPos[slot] / frontCommand.mem_ratio[slot]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, MotionXYZCUVStartMCS(frontCommand, slot)) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, endMCS) &&
+                (!frontCommand.sourceIsAbsoluteMode ||
+                    m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, resolvedGeometry.absoluteTargetMCS[slot]));
+        }
+    }
+    bool xyzcStartAndTravelValid = true;
+    if (frontCommand.pathCoreXYZCFeedExactStop)
+    {
+        NCXYZCFeedLineValue resolvedGeometry{};
+        xyzcStartAndTravelValid = IsMotionXYZCFeedGeometryValid(frontCommand, m_pContexts, &resolvedGeometry) &&
+            !m_Group.enableHistory && !m_Group.enableTransform &&
+            m_Group.jumpManager.state == JumpState::IDLE && !m_pathHold.sourceSeen &&
+            std::isfinite(m_Group.feedrateOverride) && m_Group.feedrateOverride >= 0.0 &&
+            m_Group.feedrateOverride <= 1.0 && m_pCoordMgr != nullptr;
+        for (unsigned slot = 0U; xyzcStartAndTravelValid && slot < 4U; ++slot)
+        {
+            const AxisContext& axis = (*m_pContexts)[slot];
+            const double endMCS = resolvedGeometry.endMCS[slot];
+            xyzcStartAndTravelValid = NCRotaryFeedDetail::SameBits(axis.logicalCmdPos.Load(), frontCommand.mem_startPos[slot]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,
+                    frontCommand.mem_startPos[slot] / frontCommand.mem_ratio[slot]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,
+                    frontCommand.targetPos[slot] / frontCommand.mem_ratio[slot]) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, MotionXYZCStartMCS(frontCommand, slot)) &&
+                m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, endMCS) &&
+                (!frontCommand.sourceIsAbsoluteMode ||
+                    m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, resolvedGeometry.absoluteTargetMCS[slot]));
+        }
+    }
     bool zcStartAndTravelValid = true;
     if (frontCommand.pathCoreZCFeedExactStop)
     {
@@ -16572,7 +19740,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
     }
     if (!IsMotionCommandConsumerGeometryValid(
         frontCommand,
-        m_pContexts) || !zcStartAndTravelValid ||
+        m_pContexts) || !zcStartAndTravelValid || !xyzcStartAndTravelValid || !xyzcuvStartAndTravelValid ||
         (frontCommand.pathCoreRotaryFeedExactStop &&
             (m_Group.enableHistory || m_Group.enableTransform ||
                 m_Group.jumpManager.state != JumpState::IDLE || m_pathHold.sourceSeen ||
@@ -17122,7 +20290,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         return true;
     };
 
-    if (!exactPeekedIdentity ||
+    if (!exactPeekedIdentity || cmd.pathCoreEccentricCFeedExactStop ||
         commandPathModeAuthorityDecision !=
         frontPathModeAuthorityDecision ||
         !IsMotionCommandConsumerGeometryValid(cmd, m_pContexts) ||
@@ -17371,7 +20539,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
     }
 
     if (m_Group.isActive &&
-        m_Group.enableHistory && !m_Group.currentCmd.pathCoreRetainedTraversal &&
+        m_Group.enableHistory && !m_Group.currentCmd.pathCoreEccentricCFeedExactStop && !m_Group.currentCmd.pathCoreRetainedTraversal &&
         GetCommandAuthorizationFailure(m_Group.currentCmd) ==
         MotionRejectReason::NONE)
     {
@@ -17388,6 +20556,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
 
     // 保存目前執行指令
     InvalidateCncLineEndpointProof();
+    ClearEccentricCConsumer();
     m_Group.currentCmd = cmd;
 
     // Stage NC-0.2K.6.1: the fully authorized, post-pop command becomes the
@@ -17563,6 +20732,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         vAxis.inPosition = true;
         vAxis.state = MotionState::MotionState_IDLE;
         m_Group.isActive = false;
+        ClearEccentricCConsumer();
 
         // 合法但不需要實際位移的 Segment，仍有完整生命週期：
         // ACCEPTED -> COMPLETED；不發布 STARTED。
@@ -17764,14 +20934,14 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
             // Rotary shortest path
             // ----------------------------------------------
             if ((cmd.pathCoreRotaryFeedExactStop && m_Group.startPos[i] != cmd.mem_startPos[0]) ||
-                (cmd.pathCoreZCFeedExactStop &&
+                ((cmd.pathCoreZCFeedExactStop || cmd.pathCoreXYZCFeedExactStop || cmd.pathCoreXYZCUVFeedExactStop) &&
                     !NCRotaryFeedDetail::SameBits(m_Group.startPos[i], cmd.mem_startPos[i])))
             {
                 derivedGeometryValid = false;
                 break; // The admission start is immutable; never rebase a feed.
             }
             if (!cmd.pathCoreRotaryFeedExactStop && !cmd.pathCoreZCFeedExactStop &&
-                realAxis.axisType == AxisType::ROTARY && realAxis.useShortestPath)
+                !cmd.pathCoreXYZCFeedExactStop && !cmd.pathCoreXYZCUVFeedExactStop && realAxis.axisType == AxisType::ROTARY && realAxis.useShortestPath)
             {
                 double pulsePerUnit = 0.0;
                 if (!TryGetMotionPulsePerUnit(realAxis.resolution_PPR, realAxis.finalLead,
@@ -17869,7 +21039,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
 
 
         if (!derivedGeometryValid || !std::isfinite(totalDist) ||
-            (cmd.pathCoreZCFeedExactStop && totalDist != cmd.mem_totalDist))
+            ((cmd.pathCoreZCFeedExactStop || cmd.pathCoreXYZCFeedExactStop || cmd.pathCoreXYZCUVFeedExactStop) && totalDist != cmd.mem_totalDist))
         {
             FailDerivedConsumerGeometry();
             return;
@@ -17883,7 +21053,8 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         // inside the physical settling window. Preserve ordinary positioning
         // and the mathematical tiny-distance guard below.
         if (alreadyAtTarget && !cmd.cncFeedLookahead &&
-            !cmd.pathCoreRotaryFeedExactStop && !cmd.pathCoreZCFeedExactStop)
+            !cmd.pathCoreRotaryFeedExactStop && !cmd.pathCoreZCFeedExactStop && !cmd.pathCoreXYZCFeedExactStop &&
+            !cmd.pathCoreXYZCUVFeedExactStop)
         {
             CompleteWithoutMotion();
             return;
@@ -18228,6 +21399,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
         vAxis.isFault = true;
 
         m_Group.isActive = false;
+        ClearEccentricCConsumer();
 
         RejectMotionCommand(
             m_Group.currentCmd,
@@ -18537,7 +21709,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
     // ======================================================
     // 13. History 幾何快照
     // ======================================================
-    if (m_Group.enableHistory && !m_Group.currentCmd.pathCoreRetainedTraversal)
+    if (m_Group.enableHistory && !m_Group.currentCmd.pathCoreEccentricCFeedExactStop && !m_Group.currentCmd.pathCoreRetainedTraversal)
     {
         for (int i = 0; i < 8; ++i)
         {
@@ -18810,6 +21982,9 @@ void MotionCore::StopGroup()
 void MotionCore::StopGroupImpl(
     bool publishExecutionEpoch)
 {
+    const MotionExecutionEpoch previousSafetyEpoch = m_safetyControlledStopEpoch;
+    const MotionOwnerLease previousSafetyOwner = m_safetyControlledStopOwnerLease;
+    const std::uint32_t previousSafetyTicket = m_safetyControlledStopRequestTicket;
     const MotionOwnerLease safetyLease = GetMotionOwnerLease();
     if (safetyLease.owner != MotionOwner::SAFETY ||
         !IsMotionOwnerLeaseCurrent(safetyLease))
@@ -18883,6 +22058,39 @@ void MotionCore::StopGroupImpl(
         return;
     }
 
+    if (m_Group.currentCmd.pathCoreEccentricCFeedExactStop)
+    {
+        // Bind the exact stop request while its action-bearing epoch is being
+        // applied. This changes private control state only; the applied-token
+        // trajectory driver commits the next axis sample under reservation.
+        MotionEccentricCContext context{};
+        context.execution = m_Group.currentCmd.execution;
+        context.sourceOwner = m_Group.currentCmd.ownerLease;
+        context.currentEpoch = GetCurrentExecutionEpoch();
+        context.currentOwner = GetMotionOwnerLease();
+        context.safetyTicket = m_safetyControlledStopRequestTicket;
+        context.previousSafetyEpoch = previousSafetyEpoch;
+        context.previousSafetyOwner = previousSafetyOwner;
+        context.previousSafetyTicket = previousSafetyTicket;
+        context.fault = m_Group.virtualAxis.isFault || m_Group.virtualAxis.isLagAlarm;
+        const std::uint64_t ownerState = m_motionOwnerState.load(std::memory_order_acquire);
+        context.safetyRequestAuthorized = context.currentOwner.Matches(safetyLease) &&
+            context.currentEpoch == controlledStopEpoch && context.safetyTicket != 0ULL &&
+            UnpackMotionOwnerState(ownerState).Matches(safetyLease) &&
+            UnpackMotionOwnerSafetyRequestTicket(ownerState) == context.safetyTicket &&
+            !UnpackMotionOwnerSafetyHandshake(ownerState) &&
+            (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL;
+        if (!BindEccentricCStop(context))
+        {
+            EmergencyStopAllAxesImpl(false);
+            return;
+        }
+        // Do not truncate/replan this curve through the legacy scalar FIR.
+        m_Group.virtualAxis.inPosition = false;
+        m_Group.virtualAxis.state = MotionState::MotionState_STOPPING;
+        return;
+    }
+
     // =========================================================
     // 🌟 自動計算群組的「最小減速度」 (即尋找最長的減速時間)
     // =========================================================
@@ -18936,6 +22144,7 @@ void MotionCore::EmergencyStopGroup()
 
     // 1. 關閉群組插補引擎，防止 UpdateInterpolation 繼續寫入位置
     m_Group.isActive = false;
+    ClearEccentricCConsumer();
 
     // 2. 徹底殺掉虛擬主軸 (清空 Buffer 是關鍵)
     EmergencyStop(m_Group.virtualAxis);
@@ -20191,8 +23400,58 @@ double MotionCore::PlanTrapezoidal_B2(double currentPos, double targetPos, doubl
 
     return currentPos + (currentVel * dt);
 }
+bool MotionCore::ArePhysicalGroupAxesReadyForTerminal() const noexcept
+{
+    if (m_pContexts == nullptr || m_Group.axisCount <= 0 || m_Group.axisCount > MAX_AXES)
+        return false;
+    for (int slot = 0; slot < m_Group.axisCount; ++slot)
+        if (m_Group.axisIndices[slot] < 0 ||
+            static_cast<std::size_t>(m_Group.axisIndices[slot]) >= m_pContexts->size())
+            return false;
+    bool allPhysicalInPos = true;
+
+    // 遍歷檢查群組內的所有實體軸，是不是真的都走到終點了？
+    for (int i = 0; i < m_Group.axisCount; ++i)
+    {
+        int idx = m_Group.axisIndices[i];
+        const AxisContext& realAxis = (*m_pContexts)[idx];
+
+        // 計算大腦完美位置與實體馬達位置的落差
+        double currentLag = std::abs(realAxis.GetMechanicalFollowingErrorPulse());
+
+        // 只要有一軸還沒擠進到位視窗，就判定尚未結束！
+        if (!std::isfinite(realAxis.currentCmdPos) ||
+            !std::isfinite(realAxis.currentActPos) ||
+            !std::isfinite(realAxis.inPositionWindow_Pulse) ||
+            realAxis.inPositionWindow_Pulse <= 0.0 ||
+            !std::isfinite(realAxis.currentCmdVel) ||
+            !std::isfinite(realAxis.logicalCmdVel) ||
+            !std::isfinite(realAxis.targetVelocity) ||
+            !std::isfinite(realAxis.targetEndVel) ||
+            realAxis.isFault ||
+            realAxis.isLagAlarm ||
+            (realAxis.state != MotionState::MotionState_INTERPOLATING &&
+                realAxis.state != MotionState::MotionState_STOPPING &&
+                realAxis.state != MotionState::MotionState_IDLE) ||
+            std::abs(realAxis.currentCmdVel) > 1.0 ||
+            std::abs(realAxis.logicalCmdVel) > 1.0 ||
+            !std::isfinite(currentLag) ||
+            currentLag > realAxis.inPositionWindow_Pulse ||
+            !(m_safetyControlledStopInProgress ?
+                IsMechanicalCompensationReadyForStop(realAxis) :
+                realAxis.IsMechanicalCompensationReadyForCompletion()))
+        {
+            allPhysicalInPos = false;
+            break; // 退堂！繼續等！
+        }
+    }
+
+    return allPhysicalInPos;
+}
+
 void MotionCore::UpdateInterpolation()
 {
+    if (!m_Group.isActive) ClearEccentricCConsumer();
     // A waiting heartbeat must be earned anew by this pass's real load gate.
     m_pathAdmissionCorrectionScopeMask = 0U;
     m_pathHold.status.admissionPending = false;
@@ -20238,6 +23497,12 @@ void MotionCore::UpdateInterpolation()
         TryAcknowledgeAppliedSafetyMotionRequests();
     }
 
+    // Keep competing ordinary motion fenced immediately. The existing J.5
+    // settle consumer below must still service P13 PROGRAM HOLD requests.
+    if (m_edmZPolicy.Snapshot().capHeld)
+    {
+        if (m_Group.isActive || !m_Group.cmdQueue.empty()) StopEDMZFixtureFromRuntime();
+    }
     // A producer can publish a newer Epoch while the bounded CAS seam above
     // is running.  Safety/recovery requests have already had priority; all
     // ordinary settle/mailbox/planner work now waits until that exact packed
@@ -20273,6 +23538,13 @@ void MotionCore::UpdateInterpolation()
     // path. Once StopGroupImpl() changes the virtual axis to STOPPING, that
     // bounded stop trajectory is the only unauthorized active state allowed
     // to continue. Emergency/Reset paths deactivate or similarly stop it.
+    if (m_Group.isActive && m_Group.currentCmd.pathCoreEccentricCFeedExactStop &&
+        !m_safetyControlledStopInProgress && !HasPendingExecutionEpochChange() &&
+        GetCommandAuthorizationFailure(m_Group.currentCmd) == MotionRejectReason::NOT_READY)
+    {
+        TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return;
+    }
     if (m_Group.isActive &&
         !m_safetyControlledStopInProgress &&
         GetCommandAuthorizationFailure(m_Group.currentCmd) !=
@@ -20290,7 +23562,30 @@ void MotionCore::UpdateInterpolation()
         return;
     }
 
+    // P13 retains its output cap/non-Z zero fence through real stop proof.
+    // Only ordinary mailbox/planner execution is excluded; J.5 is serviced.
+    if (m_edmZPolicy.Snapshot().capHeld) return;
+
     DrainAxisCommandMailbox();
+    // Recovery requests, stale draining and RESET proof processing above keep
+    // running. Ordinary interpolation cannot advance behind zero CSV output.
+    if (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
+        HasPbcXUnresolvedActiveOutput()) return;
+
+    // BASE79F: the curve is immutable and uses its own scalar planner. Only
+    // ordinary HOLD (0) and full authored feed (1) are admitted here.
+    if (!m_Group.isActive) ClearEccentricCConsumer();
+    if (m_Group.isActive && m_Group.currentCmd.pathCoreEccentricCFeedExactStop &&
+        (m_pContexts == nullptr || m_pContexts->empty() || m_pContexts->size() > MAX_AXES ||
+            m_Group.axisCount <= 0 || m_Group.axisCount > MAX_AXES ||
+            m_Group.enableHistory || m_Group.enableTransform || m_pathHold.sourceSeen ||
+            m_Group.jumpManager.state != JumpState::IDLE || m_Group.pathMode != PathMode::EXACT_STOP ||
+            !std::isfinite(m_Group.feedrateOverride) ||
+            (m_Group.feedrateOverride != 0.0 && m_Group.feedrateOverride != 1.0)))
+    {
+        TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return;
+    }
 
     // BZ canonical storage has no history/B2/transform interpretation.
     if (m_Group.isActive && m_Group.currentCmd.pathCoreRetainedTraversal &&
@@ -20306,7 +23601,8 @@ void MotionCore::UpdateInterpolation()
     // A genuine HOLD is override zero and keeps the same signed native path.
     // Safety's controlled stop already took priority above.
     if (m_Group.isActive && (m_Group.currentCmd.pathCoreRotaryFeedExactStop ||
-            m_Group.currentCmd.pathCoreZCFeedExactStop) &&
+            m_Group.currentCmd.pathCoreZCFeedExactStop || m_Group.currentCmd.pathCoreXYZCFeedExactStop ||
+            m_Group.currentCmd.pathCoreXYZCUVFeedExactStop) &&
         !m_safetyControlledStopInProgress &&
         (m_Group.enableHistory || m_Group.enableTransform || m_Group.jumpManager.state != JumpState::IDLE ||
             m_pathHold.sourceSeen || m_Group.pathMode != PathMode::EXACT_STOP ||
@@ -20433,12 +23729,20 @@ void MotionCore::UpdateInterpolation()
                 //RtPrintf("[DBG-3] BLOCKED! Axis %d is NOT ServoOn. Group aborted.\\n", axisIdx);
             }
 
+            if (m_Group.isActive && m_Group.currentCmd.pathCoreEccentricCFeedExactStop)
+            {
+                // Contain every generated member in the same pass; a cleared
+                // cursor must never leave INTERPOLATING orphan velocities.
+                TriggerGroupMappingIntegrityEmergencyStop(axisIdx, true);
+                return;
+            }
             FaultTrackedMotionCommand(
                 static_cast<std::uint32_t>(
                     AlarmManager::SERVO_ERROR),
                 MotionRejectReason::NOT_READY);
 
             m_Group.isActive = false;
+            ClearEccentricCConsumer();
 
             // 🚨 新增：宣告群組與虛擬主軸進入錯誤狀態，防止 G-code 繼續下單！
             m_Group.virtualAxis.state = MotionState::MotionState_ERROR;
@@ -20455,6 +23759,7 @@ void MotionCore::UpdateInterpolation()
     double dt = CYCLE_TIME_SEC;
     PathJumpManager& jm = m_Group.jumpManager;
     AxisCommand vCmd{}; // 準備統一收集速度與位置
+    NCEccentricCProfilePoint eccentricPoint{};
     bool virtualCommandResynchronized = false;
 
     if (m_safetyControlledStopInProgress &&
@@ -20476,7 +23781,11 @@ void MotionCore::UpdateInterpolation()
         // consult PATH_SERVO/Jump velocity sources while the stale command is
         // being retired. StopMove selected either the original trapezoidal
         // deceleration target or STOPPING velocity ramp.
-        if (vAxis.state == MotionState::MotionState_STOPPING)
+        if (m_Group.currentCmd.pathCoreEccentricCFeedExactStop)
+        {
+            if (!StepEccentricCProfile(vCmd, eccentricPoint)) return;
+        }
+        else if (vAxis.state == MotionState::MotionState_STOPPING)
         {
             Calc_Trajectory_Velocity(vAxis, vCmd);
         }
@@ -20884,7 +24193,11 @@ void MotionCore::UpdateInterpolation()
         }
 
         if (!m_Group.isActive) return;
-        if (!cncBoundaryFrameReady)
+        if (m_Group.currentCmd.pathCoreEccentricCFeedExactStop)
+        {
+            if (!StepEccentricCProfile(vCmd, eccentricPoint)) return;
+        }
+        else if (!cncBoundaryFrameReady)
         {
             vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
             RefreshCncP1LateJunction();
@@ -21082,7 +24395,8 @@ void MotionCore::UpdateInterpolation()
         }
     }
 
-    vCmd.instantCmdPos = vAxis.currentCmdPos;
+    if (!m_Group.currentCmd.pathCoreEccentricCFeedExactStop)
+        vCmd.instantCmdPos = vAxis.currentCmdPos;
     if (virtualCommandResynchronized)
     {
         // History/B2 crossing mutates the raw virtual command after the
@@ -21091,7 +24405,8 @@ void MotionCore::UpdateInterpolation()
         // filtered/clamped instantCmdVel instead of restoring raw cruise speed.
         vCmd.instantCmdVel = vAxis.currentCmdVel;
     }
-    vAxis.logicalCmdVel = vCmd.instantCmdVel;
+    if (!m_Group.currentCmd.pathCoreEccentricCFeedExactStop)
+        vAxis.logicalCmdVel = vCmd.instantCmdVel;
 
 
 
@@ -21100,7 +24415,17 @@ void MotionCore::UpdateInterpolation()
     // ======================================================
     // 🌟 以下完全保留你原本的幾何分配與空間旋轉 (原封不動！)
     // ======================================================
-    if (m_pathHold.unionActive)
+    if (m_Group.currentCmd.pathCoreEccentricCFeedExactStop)
+    {
+        // The transaction committed the complete logical image. Preserve the
+        // common physical pass-through and downstream PBC exactly once.
+        if (!eccentricPoint.valid)
+        {
+            TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+            return;
+        }
+    }
+    else if (m_pathHold.unionActive)
     {
         if (!MapPathCoreHoldExcursionGeometry(vCmd))
         {
@@ -21276,10 +24601,41 @@ void MotionCore::UpdateInterpolation()
         }
         else
         {
+            // PBC-3N FIX2: exact-stop LINEAR mapping can round just outside
+            // its immutable endpoint (large start plus a cancelling delta).
+            // The later exact endpoint write must not manufacture a reverse
+            // nominal step and re-arm backlash. Close only floating roundoff;
+            // do not add a physical displacement/velocity deadband or change
+            // the raw scalar and existing terminal/lifecycle proof below.
+            const bool closeFixedLineRoundoff =
+                m_Group.currentCmd.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+                m_Group.pathMode == PathMode::EXACT_STOP &&
+                !m_Group.currentCmd.cncFeedLookahead && IsFixedPlanarLineEndpointScope();
             for (int i = 0; i < m_Group.axisCount; ++i) {
                 int idx = m_Group.axisIndices[i];
                 AxisContext& realAxis = (*m_pContexts)[idx];
-                realAxis.logicalCmdPos = m_Group.startPos[i] + (vCmd.instantCmdPos * m_Group.ratio[i]);
+                const double start = m_Group.startPos[i];
+                const double mappedTerm = vCmd.instantCmdPos * m_Group.ratio[i];
+                double mapped = start + mappedTerm;
+                if (closeFixedLineRoundoff)
+                {
+                    const double target = m_Group.currentCmd.targetPos[i];
+                    if (std::isfinite(start) && std::isfinite(target) &&
+                        std::isfinite(mappedTerm) && std::isfinite(mapped))
+                    {
+                        const double lower = (std::min)(start, target);
+                        const double upper = (std::max)(start, target);
+                        const double boundary = mapped < lower ? lower : mapped > upper ? upper : mapped;
+                        const double scale = (std::max)((std::max)(1.0, std::abs(start)),
+                            (std::max)(std::abs(target), std::abs(mappedTerm)));
+                        const double roundoff = 8.0 * std::numeric_limits<double>::epsilon() * scale;
+                        if (std::isfinite(roundoff) && std::abs(boundary - mapped) <= roundoff)
+                            mapped = boundary;
+                    }
+                    // Larger/nonfinite errors retain their original values;
+                    // this correction cannot turn them into a valid endpoint.
+                }
+                realAxis.logicalCmdPos = mapped;
                 realAxis.logicalCmdVel = vCmd.instantCmdVel * m_Group.ratio[i];
             }
         }
@@ -22128,45 +25484,16 @@ void MotionCore::UpdateInterpolation()
     if (vAxis.state == MotionState::MotionState_IDLE &&
         (!IsPathCoreHoldExcursionDriving() || m_safetyControlledStopInProgress))
     {
-        bool allPhysicalInPos = true;
-
-        // 遍歷檢查群組內的所有實體軸，是不是真的都走到終點了？
-        for (int i = 0; i < m_Group.axisCount; ++i)
-        {
-            int idx = m_Group.axisIndices[i];
-            AxisContext& realAxis = (*m_pContexts)[idx];
-
-            // 計算大腦完美位置與實體馬達位置的落差
-            double currentLag = std::abs(realAxis.GetMechanicalFollowingErrorPulse());
-
-            // 只要有一軸還沒擠進到位視窗，就判定尚未結束！
-            if (!std::isfinite(realAxis.currentCmdPos) ||
-                !std::isfinite(realAxis.currentActPos) ||
-                !std::isfinite(realAxis.inPositionWindow_Pulse) ||
-                realAxis.inPositionWindow_Pulse <= 0.0 ||
-                !std::isfinite(realAxis.currentCmdVel) ||
-                !std::isfinite(realAxis.logicalCmdVel) ||
-                !std::isfinite(realAxis.targetVelocity) ||
-                !std::isfinite(realAxis.targetEndVel) ||
-                realAxis.isFault ||
-                realAxis.isLagAlarm ||
-                (realAxis.state != MotionState::MotionState_INTERPOLATING &&
-                    realAxis.state != MotionState::MotionState_STOPPING &&
-                    realAxis.state != MotionState::MotionState_IDLE) ||
-                std::abs(realAxis.currentCmdVel) > 1.0 ||
-                std::abs(realAxis.logicalCmdVel) > 1.0 ||
-                !std::isfinite(currentLag) ||
-                currentLag > realAxis.inPositionWindow_Pulse ||
-                !realAxis.IsMechanicalCompensationReadyForCompletion())
-            {
-                allPhysicalInPos = false;
-                break; // 退堂！繼續等！
-            }
-        }
+        const bool allPhysicalInPos = ArePhysicalGroupAxesReadyForTerminal();
 
         // 🌟 神級收尾：大腦算完，且實體馬達"全部"都擠進視窗後，才准切換為 IDLE！
         if (allPhysicalInPos)
         {
+            if (m_Group.currentCmd.pathCoreEccentricCFeedExactStop)
+            {
+                (void)RetireEccentricCCommand();
+                return;
+            }
             if (m_safetyControlledStopInProgress)
             {
                 // The prior segment was already terminalized ABORTED when
@@ -22193,6 +25520,7 @@ void MotionCore::UpdateInterpolation()
                 }
 
                 m_Group.isActive = false;
+                ClearEccentricCConsumer();
                 InvalidateCncLineEndpointProof();
                 m_Group.currentCmd.execution = MotionExecutionIdentity{};
                 m_Group.currentCmd.ownerLease = MotionOwnerLease{};
@@ -22246,7 +25574,7 @@ void MotionCore::UpdateInterpolation()
             CompleteTrackedMotionCommand(
                 m_Group.currentCmd);
 
-            if (m_Group.enableHistory && !m_Group.currentCmd.pathCoreRetainedTraversal &&
+            if (m_Group.enableHistory && !m_Group.currentCmd.pathCoreEccentricCFeedExactStop && !m_Group.currentCmd.pathCoreRetainedTraversal &&
                 GetCommandAuthorizationFailure(m_Group.currentCmd) ==
                 MotionRejectReason::NONE)
             {
@@ -22274,6 +25602,7 @@ void MotionCore::UpdateInterpolation()
             }
 
             m_Group.isActive = false;
+            ClearEccentricCConsumer();
             std::uint64_t retiredAxisCount = 0ULL;
             for (int i = 0; i < m_Group.axisCount; ++i)
             {
@@ -23359,10 +26688,20 @@ void MotionCore::UpdateNCSettleProducer(
                         blockerAxisIndex = publishedAxisIndex;
                     }
 
-                    // PBC-2: no settle proof while a compensation ramp is
-                    // pending/stale. Raw encoder excursion below is preserved.
-                    if (blocker == MotionNCSettleBlocker::NONE &&
-                        !axis.IsMechanicalCompensationReadyForCompletion())
+                    // PBC-3F: HOLD and RESET preproof establish a frozen stop,
+                    // not completion of an interrupted compensation ramp.
+                    // Normal completion and RESET postproof remain strict.
+                    const bool frozenStopProof = profile == MotionNCSettleProfile::FEED_HOLD_GROUP ||
+                        (profile == MotionNCSettleProfile::RESET_ALL && !resetPostProof);
+                    const bool retainedRecoveryPreproof =
+                        profile == MotionNCSettleProfile::RESET_ALL && !resetPostProof &&
+                        IsPbcXRetainRecoveryPreproofEligible(axis);
+                    const bool recoveryPreproofRequired = axis.axisIndex == 0 &&
+                        m_pbcXRetainRecoveryRequired && profile == MotionNCSettleProfile::RESET_ALL && !resetPostProof;
+                    const bool compensationReady = recoveryPreproofRequired ? retainedRecoveryPreproof :
+                        (frozenStopProof ? IsMechanicalCompensationReadyForStop(axis) :
+                            axis.IsMechanicalCompensationReadyForCompletion());
+                    if (blocker == MotionNCSettleBlocker::NONE && !compensationReady)
                     {
                         blocker = MotionNCSettleBlocker::COMPENSATION_ACTIVE;
                         blockerAxisIndex = publishedAxisIndex;
@@ -23565,6 +26904,10 @@ void MotionCore::UpdateNCSettleProducer(
                         m_ncResetRebasePhase ==
                         MotionNCResetRebasePhase::WAIT_PREPROOF)
                     {
+                        m_pbcResetPreproofTick = m_ncSettleRuntimeCycleTick;
+                        m_pbcResetPreproofRequest = tracker.requestSequence;
+                        m_pbcResetPreproofEpoch = tracker.executionEpoch;
+                        m_pbcResetPreproofOwner = tracker.ownerLease.generation;
                         m_ncResetRebasePhase =
                             MotionNCResetRebasePhase::CLEARING_BUFFERS;
                         m_ncResetRebaseAckProducer.phase =
@@ -23649,6 +26992,7 @@ void MotionCore::UpdateNCSettleProducer(
         // Retry the bounded seqlock publication on each fresh RT sample.  A
         // transient owner/frame reservation can delay authorization, but an
         // older request sequence can never authorize this Reset's release.
+        CompletePbcXRetainRecoveryAfterReset();
         (void)TryPublishNCResetSafetyReleaseAuthorization();
     }
 
@@ -25150,6 +28494,7 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
         NCTranslationHasWorkPlaneRotation(previous) ||
         NCTranslationHasWorkPlaneRotation(next)))
         return MotionNCTranslationTransitionResult::DEFERRED;
+    const bool eccentricChanged = previous.axisIdentity.eccentricEnabled != next.axisIdentity.eccentricEnabled;
     const bool distanceChanged = previous.distanceMode != next.distanceMode;
     const bool unitsChanged = previous.unitsMode != next.unitsMode;
     const bool strokeChanged = previous.storedStrokeMode != next.storedStrokeMode;
@@ -25178,7 +28523,8 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
         static_cast<unsigned>(workCompensationChanged) + static_cast<unsigned>(unitsChanged) +
         static_cast<unsigned>(scalingChanged) + static_cast<unsigned>(mirrorChanged) +
         static_cast<unsigned>(polarChanged) + static_cast<unsigned>(cutterChanged) +
-        static_cast<unsigned>(strokeChanged) + static_cast<unsigned>(planeChanged) != 1U)
+        static_cast<unsigned>(strokeChanged) + static_cast<unsigned>(planeChanged) +
+        static_cast<unsigned>(eccentricChanged) != 1U)
         return MotionNCTranslationTransitionResult::DEFERRED;
     // A selected contour owns one immutable frame and one physical radius.
     // Cancel it before changing its side, D row, radius or coordinate frame.
@@ -25218,7 +28564,8 @@ MotionNCTranslationTransitionResult MotionCore::TryTransitionNCTranslation(const
         }
     }
     NCTranslationSnapshot expected = previous;
-    if (planeChanged) expected.rotationPlane = next.rotationPlane;
+    if (eccentricChanged) expected.axisIdentity.eccentricEnabled = next.axisIdentity.eccentricEnabled;
+    else if (planeChanged) expected.rotationPlane = next.rotationPlane;
     else if (distanceChanged) expected.distanceMode = next.distanceMode;
     else if (unitsChanged) expected.unitsMode = next.unitsMode;
     else if (strokeChanged) expected.storedStrokeMode = next.storedStrokeMode;
@@ -25707,3 +29054,137 @@ template void MotionCore::UpdateMotion<ENI_ServoDrive>(
     const MotionServoInputSnapshot&);
 template void MotionCore::Run_Servo_Loop<ENI_ServoDrive>(ENI_ServoDrive&, AxisContext&, const AxisCommand&,
     const MotionServoInputSnapshot&);
+
+// BASE79F definitions share this translation unit's existing authority seams.
+#include "MotionCore_EccentricCReservation.h"
+#include "MotionCore_EccentricC.h"
+
+// Marked-only terminal path; native exact-stop retirement above is unchanged.
+// The profile point is already emitted and physically settled before entry.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+bool MotionCore::RetireEccentricCCommand() noexcept
+{
+    if (!m_Group.isActive || !m_Group.currentCmd.pathCoreEccentricCFeedExactStop ||
+        !m_eccentricCConsumer || !m_eccentricCConsumer->transaction.IsValid())
+    {
+        TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return false;
+    }
+    const bool safety = m_safetyControlledStopInProgress;
+    const MotionEccentricCContext context = GetEccentricCContext();
+    if (!safety && (HasPendingExecutionEpochChange() || HasPendingSafetyOrRecoveryRequests() ||
+        GetCommandAuthorizationFailure(m_Group.currentCmd) != MotionRejectReason::NONE)) return false;
+
+    MotionCommand nextCommand{};
+    const bool nextCommandValid = !safety && TryPeekNextMotionCommand(nextCommand) &&
+        GetCommandAuthorizationFailure(nextCommand) == MotionRejectReason::NONE &&
+        IsMotionCommandConsumerGeometryValid(nextCommand, m_pContexts);
+    const bool mappingChanged = nextCommandValid &&
+        !MotionCommandsHaveIdenticalAxisMapping(m_Group.currentCmd, nextCommand);
+
+    EccentricCCommitReservation reservation{};
+    if (!TryAcquireEccentricCCommitReservation(context, reservation))
+    {
+        if (!ReleaseEccentricCCommitReservation(reservation)) EmergencyStopAllAxesImpl(false);
+        return false;
+    }
+    const auto& transaction = m_eccentricCConsumer->transaction;
+    const auto& executor = transaction.Committed();
+    const auto& point = executor.Current();
+    const bool authoredComplete = point.state == NCEccentricCProfileState::AUTHORED_COMPLETE;
+    const bool stopped = point.state == NCEccentricCProfileState::STOPPED_BEFORE_END ||
+        point.state == NCEccentricCProfileState::STOPPED_AT_OR_BEYOND_END;
+    auto& virtualAxis = m_Group.virtualAxis;
+    bool imageValid = point.valid && point.runtime.valid &&
+        (authoredComplete || (safety && stopped)) &&
+        point.velocityPulsePerSec == 0.0 &&
+        (!authoredComplete || point.scalarPulse == executor.Runtime().AuthoredScalarPulse()) &&
+        MotionEccentricCConsumerDetail::SamePacket(m_Group.currentCmd, transaction.Command()) &&
+        IsEccentricCCommandLiveValid(m_Group.currentCmd, executor.Runtime(), false) &&
+        MotionEccentricCConsumerDetail::PreviousImage(m_Group, m_pContexts, executor) &&
+        virtualAxis.state == MotionState::MotionState_IDLE && virtualAxis.inPosition &&
+        virtualAxis.finalTargetPos == point.scalarPulse &&
+        virtualAxis.targetVelocity == 0.0 && virtualAxis.targetEndVel == 0.0;
+    for (int slot = 0; imageValid && slot < m_Group.axisCount; ++slot)
+    {
+        const int index = m_Group.axisIndices[slot];
+        imageValid = CanCanonicalizeInactivePhysicalAxisCommandState((*m_pContexts)[index]);
+    }
+    const bool sourceCurrent = safety || MatchesNCTranslation(m_Group.currentCmd.sourceTranslation);
+    const bool authorityCurrent = IsEccentricCCommitReservationCurrent(context, reservation);
+    if (!imageValid || !sourceCurrent || !authorityCurrent)
+    {
+        const bool released = ReleaseEccentricCCommitReservation(reservation);
+        if (!released) EmergencyStopAllAxesImpl(false);
+        else if (!imageValid && sourceCurrent && authorityCurrent)
+            TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return false;
+    }
+
+    // Final authorization precedes the first canonicalization write. All
+    // following mutations are bounded and performed by this sole RT writer.
+    if (!TryCanonicalizeIdleAxisCommandState(virtualAxis))
+    {
+        const bool released = ReleaseEccentricCCommitReservation(reservation);
+        if (!released) EmergencyStopAllAxesImpl(false);
+        else TriggerGroupMappingIntegrityEmergencyStop(-1, true);
+        return false;
+    }
+    std::uint64_t retiredAxisCount = 0ULL;
+    for (int slot = 0; slot < m_Group.axisCount; ++slot)
+    {
+        const int index = m_Group.axisIndices[slot];
+        if (!TryCanonicalizeInactivePhysicalAxisCommandState((*m_pContexts)[index]))
+        {
+            const bool released = ReleaseEccentricCCommitReservation(reservation);
+            if (!released) EmergencyStopAllAxesImpl(false);
+            else TriggerGroupMappingIntegrityEmergencyStop(index, true);
+            return false;
+        }
+        if (mappingChanged && !MotionCommandHasAxis(nextCommand, index)) ++retiredAxisCount;
+    }
+    if (!safety)
+    {
+        FinishCncP1Diagnostic();
+        FinishCncFeedLookahead();
+        CompleteTrackedMotionCommand(m_Group.currentCmd);
+        if (mappingChanged)
+        {
+            m_p1MappingBoundaryStopCount.fetch_add(1ULL, std::memory_order_relaxed);
+            m_p1LastPreviousAxisMask.store(BuildMotionCommandAxisMask(m_Group.currentCmd), std::memory_order_release);
+            m_p1LastNextAxisMask.store(BuildMotionCommandAxisMask(nextCommand), std::memory_order_release);
+        }
+        if (retiredAxisCount != 0ULL)
+            m_p1DroppedAxisRetirementCount.fetch_add(retiredAxisCount, std::memory_order_relaxed);
+    }
+    m_Group.isActive = false;
+    ClearEccentricCConsumer();
+    if (safety)
+    {
+        // The applied SAFETY epoch already published ABORTED, never DONE.
+        InvalidateCncLineEndpointProof();
+        m_Group.currentCmd.execution = MotionExecutionIdentity{};
+        m_Group.currentCmd.ownerLease = MotionOwnerLease{};
+        m_safetyControlledStopInProgress = false;
+        m_safetyControlledStopOwnerLease = MotionOwnerLease{};
+        m_safetyControlledStopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        m_safetyControlledStopRequestTicket = 0U;
+    }
+    if (!ReleaseEccentricCCommitReservation(reservation))
+    {
+        EmergencyStopAllAxesImpl(false);
+        return false;
+    }
+    if (safety)
+    {
+        // ACK and Reset continuation may themselves inspect/change authority.
+        // Both reservation bits must already be released before calling them.
+        TryAcknowledgeAppliedSafetyMotionRequests();
+        CompleteResetControlledStop();
+    }
+    return true;
+}

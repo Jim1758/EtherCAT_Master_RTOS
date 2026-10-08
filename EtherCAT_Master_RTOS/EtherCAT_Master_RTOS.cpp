@@ -10,6 +10,7 @@
 #include "EtherCatMaster.h"
 #include "ConfigReader.h"
 #include "GlobalConfig.h"
+#include "SHMManager.h"
 
 // RTX64 Boilerplate (標準 RTX64 樣板)
 #ifndef NUM_REGISTERS
@@ -135,8 +136,12 @@ int _tmain(int argc, _TCHAR* argv[])//
 
 
 Exit:
-    DEBUG_PRINT("EtherCAT_Master Close !\n");
+    Master.StopCyclicRuntime(); // Includes partial PDO/PLC startup failures.
+    SHMManager::GetInstance().Shutdown(); // Idempotent; waits for condition-worker shared work to finish.
+    DEBUG_PRINT("[CORE-CLOSE1] NIC_CLOSE_BEGIN\n");
     MyNic.Close();
+    DEBUG_PRINT("[CORE-CLOSE1] COMPLETE\n");
+    DEBUG_PRINT("EtherCAT_Master Close !\n");
     return 0;
 }
 

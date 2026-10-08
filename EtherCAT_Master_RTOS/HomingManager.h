@@ -9,6 +9,7 @@ class MotionCore;
 class PLCManager;
 class NCManager;
 struct AxisContext;
+struct MotionPbcHomeCaptureSnapshot;
 
 
 // ============================================================
@@ -391,6 +392,14 @@ private:
 
     // Delta / CiA402 Drive Touch Probe Provider
     bool UsesDriveTouchProbe(const AxisContext& axis) const;
+    bool UsesPbcXPhysicalHomeCapture(const AxisContext& axis) const noexcept;
+    void ClearPbcXHomeCaptureRuntime() noexcept;
+    void LogPbcXHomeCaptureEvent(const char* event,
+        const MotionPbcHomeCaptureSnapshot& snapshot, bool coherent = true,
+        HomeErrorReason homeError = HomeErrorReason::NONE) const noexcept;
+    bool ProcessPbcXDriveProbeArm(int axisIndex, AxisContext& axis);
+    bool TryCapturePbcXDriveProbe(int axisIndex, AxisContext& axis,
+        bool& detected, double& capturedPulse);
     bool ValidateDriveProbeConfig(const AxisContext& axis) const;
     bool ProcessDriveProbeArm(int axisIndex, AxisContext& axis, double cycleTimeSec);
     bool TryCaptureDriveProbe(int axisIndex, AxisContext& axis, bool& detected, double& capturedPulse);
@@ -464,6 +473,13 @@ private:
     MotionAxisCommandSequence m_pendingMoveSequence[HOME_AXIS_COUNT]{};
     MotionAxisCommandSequence m_pendingControlStopSequence[HOME_AXIS_COUNT]{};
     bool m_controlStopIssued[HOME_AXIS_COUNT]{};
+
+    // PBC-3I control-thread identity; no HomeRuntime / RT_SHARED layout change.
+    bool m_pbcXHomeCaptureRequired = false;
+    MotionAxisCommandSequence m_pbcXHomeDisarmSequence = 0ULL;
+    MotionAxisCommandSequence m_pbcXHomeArmSequence = 0ULL;
+    std::uint64_t m_pbcXHomeCaptureToken = 0ULL;
+    double m_pbcXHomeCapturedPulse = 0.0;
 
     // ========================================================
     // Request State

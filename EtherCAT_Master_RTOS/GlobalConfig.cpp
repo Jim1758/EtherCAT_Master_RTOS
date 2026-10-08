@@ -13,9 +13,23 @@
 #include "NCManager.h" 
 #include "HomePersistenceManager.h"
 #include "NCElectrodeRotationConfig.h"
+#include "NCEccentricCSelfCheck.h"
+#include "NCEccentricCRuntimeSelfCheck.h"
+#include "NCEccentricCProfileSelfCheck.h"
+#include "NCEccentricCExecutorSelfCheck.h"
+#include "NCEccentricCTransportSelfCheck.h"
+#include "NCEccentricCPipelineSelfCheck.h"
+#include "NCEccentricCBindingSelfCheck.h"
+#include "NCEccentricCTransactionSelfCheck.h"
+#include "CNCStartupStackDiagnostic.h"
 #include "AlarmManager.h"
 #include <cmath>
 #include "CompensationConfigIO.h"
+#include "EDMVoltageConfigIO.h"
+#include "EDMGapInputConfigIO.h"
+#include "EDMRecipeConfigIO.h"
+#include "EDMConditionStartupIO.h"
+#include "EDMProcessConfigIO.h"
 
 
 namespace
@@ -200,7 +214,9 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
 
             double smoothTime = ConfigUtil::ReadParam(filePath, prefix + "SmoothTime", 100.0);
             motion.InitSmoothBuffer(axis[i], smoothTime);
+            PrintCNCStartupStackCheckpoint("VIRTUAL_INIT_ENTER", i);
             motion.InitVirtualAxisSmooth(smoothTime);
+            PrintCNCStartupStackCheckpoint("VIRTUAL_INIT_EXIT", i);
 
             // ----------------------------------------------------
             // 4. 雙閉環與 PID 參數
@@ -522,6 +538,95 @@ bool GlobalConfig::LoadNCConfig(const std::string& filePath, std::vector<AxisCon
         return false; // The coordinate mutation guard supplies the rejection.
     RtPrintf("[NC-CONFIG][ELECTRODE-ROLE] axis=%d enabled=%d\n", electrodeAxis,
         motion.m_pCoordMgr->isCAxisOffsetRotationEnabled ? 1 : 0);
+    // BASE76 verifies only a synthetic fixed-Z geometry model at startup.
+    // The startup-only live role is reported, never inferred or changed here.
+    // Existing G162 Motion admission remains closed until its dedicated curved
+    // consumer and stopping envelope are implemented and verified separately.
+    PrintCNCStartupStackCheckpoint("STARTUP_CORE_ENTER");
+    const NCEccentricCSelfCheckResult eccentricCore = RunNCEccentricCSelfCheck();
+    RtPrintf("[BASE76][ECC-CORE] selfcheck=%s checks=%u failed=%u role=%d roleAssigned=%u dynamicMotion=1 restrictedNc=1\n",
+        eccentricCore.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricCore.checks), static_cast<unsigned>(eccentricCore.failedCheck),
+        electrodeAxis, electrodeAxis != 0 ? 1U : 0U);
+    if (!eccentricCore.passed)
+    {
+        AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID);
+        return false;
+    }
+    // BASE77 is a synthetic prepared-pulse/stop-envelope model. The source
+    // is local to the check; no live axis or table is altered or authorized.
+    PrintCNCStartupStackCheckpoint("STARTUP_RUNTIME_ENTER");
+    const NCEccentricCRuntimeSelfCheckResult eccentricRuntime = RunNCEccentricCRuntimeSelfCheck();
+    RtPrintf("[BASE77][ECC-RUNTIME] selfcheck=%s checks=%u failed=%u role=%d roleAssigned=%u cycleUs=250 modelOnly=1 dynamicMotion=1 restrictedNc=1 phase=STARTUP\n",
+        eccentricRuntime.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricRuntime.checks), static_cast<unsigned>(eccentricRuntime.failedCheck),
+        electrodeAxis, electrodeAxis != 0 ? 1U : 0U);
+    if (!eccentricRuntime.passed)
+    {
+        AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID);
+        return false;
+    }
+    // BASE78 checks a dedicated sampled scalar profile and controlled STOP.
+    // Synthetic only: these samples bypass the legacy FIR and have no live owner.
+    PrintCNCStartupStackCheckpoint("STARTUP_PROFILE_ENTER");
+    const NCEccentricCProfileSelfCheckResult eccentricProfile = RunNCEccentricCProfileSelfCheck();
+    RtPrintf("[BASE78][ECC-PROFILE] selfcheck=%s checks=%u failed=%u role=%d roleAssigned=%u cycleUs=250 modelOnly=1 dynamicMotion=1 restrictedNc=1 legacyFir=0 phase=STARTUP\n",
+        eccentricProfile.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricProfile.checks), static_cast<unsigned>(eccentricProfile.failedCheck),
+        electrodeAxis, electrodeAxis != 0 ? 1U : 0U);
+    if (!eccentricProfile.passed)
+    {
+        AlarmManager::GetInstance().Trigger(AlarmManager::PATH_GEOMETRY_INVALID);
+        return false;
+    }
+
+    // BASE79A: synthetic owned-executor diagnostics; no axis output is made by this check.
+    // No new alarm/admission decision is made by this isolated test result.
+    PrintCNCStartupStackCheckpoint("STARTUP_EXEC_ENTER");
+    const NCEccentricCExecutorSelfCheckResult eccentricExecutor = RunNCEccentricCExecutorSelfCheck();
+    PrintCNCStartupStackCheckpoint("STARTUP_EXEC_EXIT");
+    RtPrintf("[BASE79A][ECC-EXECUTOR] selfcheck=%s checks=%u failed=%u configuredRole=%d isolated=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=STARTUP\n",
+        eccentricExecutor.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricExecutor.checks), static_cast<unsigned>(eccentricExecutor.failedCheck),
+        electrodeAxis);
+
+    // BASE79B_FIX1: heap-backed transport diagnostics; live NC admission remains closed.
+    PrintCNCStartupStackCheckpoint("STARTUP_TRANSPORT_ENTER");
+    const NCEccentricCTransportSelfCheckResult eccentricTransport = RunNCEccentricCTransportSelfCheck();
+    PrintCNCStartupStackCheckpoint("STARTUP_TRANSPORT_EXIT");
+    RtPrintf("[BASE79B-FIX1][ECC-TRANSPORT] selfcheck=%s checks=%u failed=%u configuredRole=%d heapScratch=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=STARTUP\n",
+        eccentricTransport.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricTransport.checks), static_cast<unsigned>(eccentricTransport.failedCheck),
+        electrodeAxis);
+
+    // BASE79C: copied packet -> decoded plan -> isolated executor diagnostics.
+    // Keep live NC admission closed and the machine role unchanged.
+    PrintCNCStartupStackCheckpoint("STARTUP_PIPELINE_ENTER");
+    const NCEccentricCPipelineSelfCheckResult eccentricPipeline = RunNCEccentricCPipelineSelfCheck();
+    PrintCNCStartupStackCheckpoint("STARTUP_PIPELINE_EXIT");
+    RtPrintf("[BASE79C][ECC-PIPELINE] selfcheck=%s checks=%u failed=%u configuredRole=%d heapScratch=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=STARTUP\n",
+        eccentricPipeline.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricPipeline.checks), static_cast<unsigned>(eccentricPipeline.failedCheck),
+        electrodeAxis);
+
+    // BASE79D: synthetic checks of the read-only consumer start binding.
+    PrintCNCStartupStackCheckpoint("STARTUP_BINDING_ENTER");
+    const NCEccentricCBindingSelfCheckResult eccentricBinding = RunNCEccentricCBindingSelfCheck();
+    PrintCNCStartupStackCheckpoint("STARTUP_BINDING_EXIT");
+    RtPrintf("[BASE79D][ECC-BINDING] selfcheck=%s checks=%u failed=%u configuredRole=%d bindingOnly=1 heapScratch=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=STARTUP\n",
+        eccentricBinding.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricBinding.checks), static_cast<unsigned>(eccentricBinding.failedCheck),
+        electrodeAxis);
+
+    // BASE79E: private candidate/commit diagnostics; this check makes no axis output.
+    PrintCNCStartupStackCheckpoint("STARTUP_TRANSACTION_ENTER");
+    const NCEccentricCTransactionSelfCheckResult eccentricTransaction = RunNCEccentricCTransactionSelfCheck();
+    PrintCNCStartupStackCheckpoint("STARTUP_TRANSACTION_EXIT");
+    RtPrintf("[BASE79E][ECC-TRANSACTION] selfcheck=%s checks=%u failed=%u configuredRole=%d stagedCommit=1 heapScratch=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=STARTUP\n",
+        eccentricTransaction.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricTransaction.checks), static_cast<unsigned>(eccentricTransaction.failedCheck),
+        electrodeAxis);
+
 
     //第一軟體極限保護G22 G23 啟動時預設 0為G23 1為G22
     bool programmableTravelLimitEnabled = (ConfigUtil::ReadParam(filePath, "ProgrammableTravelLimitEnabled", 0.0) == 1.0);
@@ -1165,10 +1270,31 @@ bool GlobalConfig::LoadPitchTable(const std::string& filePath, CompensationEngin
 
 bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
 {
+    PrintCNCStartupStackCheckpoint("SYS_INIT_ENTER");
+    RtPrintf("[BASE79N][BUILD] base=BASE79M_FIX1 nativeXYZCEndpoint=1 resolvedRotaryTail=1 lifecycleRegression=1 notReadyDiag=1 absoluteC=1 incrementalC=1 incrementalZC=1 absoluteZC=1 incrementalXYZC=1 absoluteXYZC=1 nominalXYTargets=1 zFeedMMMin=1 xyzFeedMMMin=1 holdResume=1 heldResetCurved=1 lateResumeReject=2014 motionConsumer=1 heapScratch=1 dynamicMotion=1 restrictedNc=1 packetBytes=%u motionCoreBytes=%u groupBytes=%u\n",
+        static_cast<unsigned>(sizeof(MotionCommand)), static_cast<unsigned>(sizeof(MotionCore)),
+        static_cast<unsigned>(sizeof(InterpolationGroup)));
     DEBUG_PRINT("========== Starting system parameter loading and initialization ==========\n");
 
     // 1. 綁定硬體指標 (必須最先做，後面的參數載入才會寫入正確的實體)
     master.m_Motion.Link(&master.m_ServoList, &master.m_Axes);
+
+    // BASE79F: reserve the sole consumer workspace before configuration or
+    // cyclic threads can use Motion. Runtime and NC LOAD never allocate it.
+    PrintCNCStartupStackCheckpoint("ECC_STORAGE_ENTER");
+    const bool eccentricStorageReady = master.m_Motion.InitializeEccentricCConsumer();
+    PrintCNCStartupStackCheckpoint("ECC_STORAGE_EXIT");
+    RtPrintf("[BASE79K][ECC-STORAGE] ready=%u storageBytes=%u motionConsumer=1 heapStorage=1 dynamicMotion=1 restrictedNc=1 phase=STARTUP\n",
+        eccentricStorageReady ? 1U : 0U,
+        static_cast<unsigned>(master.m_Motion.EccentricCConsumerStorageBytes()));
+    if (!eccentricStorageReady) return false;
+    PrintCNCStartupStackCheckpoint("ECC_PRODUCER_STORAGE_ENTER");
+    const bool eccentricProducerReady = master.m_NC && master.m_NC->InitializeEccentricCProducer();
+    PrintCNCStartupStackCheckpoint("ECC_PRODUCER_STORAGE_EXIT");
+    RtPrintf("[BASE79K][ECC-PRODUCER-STORAGE] ready=%u storageBytes=%u restrictedNc=1 phase=STARTUP\n",
+        eccentricProducerReady ? 1U : 0U,
+        master.m_NC ? static_cast<unsigned>(master.m_NC->EccentricCProducerStorageBytes()) : 0U);
+    if (!eccentricProducerReady) return false;
 
     // 2. 🌟 一鍵載入參數並初始化所有軸！
     std::string axisConfigPath = GlobalConfig::GetInstance().ParameterDir + "AxisConfig.txt";
@@ -1204,10 +1330,92 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
             AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID;
         return PbcBootFailure(code, compensationDiagnostic, "COMPENSATION_FINALIZE");
     }
-    DEBUG_PRINT("[PBC-1] CONFIG=PASS axes=%u enabled=%u MOTION_INTEGRATION=LOCKED\n",
+    DEBUG_PRINT("[PBC-1] CONFIG=PASS axes=%u enabled=%u GENERAL_NONZERO=LOCKED\n",
         static_cast<unsigned>(master.m_Axes.size()), master.m_Motion.m_CompEngine.EnabledAxisCount());
-    DEBUG_PRINT("[PBC-2] COORDINATE_CONTRACT=PASS checks=%u FEEDBACK=NOMINAL BEFORE_WCS=1 MOTION_INTEGRATION=LOCKED\n",
+    DEBUG_PRINT("[PBC-2] COORDINATE_CONTRACT=PASS checks=%u FEEDBACK=NOMINAL BEFORE_WCS=1 GENERAL_NONZERO=LOCKED\n",
         master.m_Motion.m_CompEngine.CoordinateContractChecks());
+    DEBUG_PRINT("[PBC-3B] LIFECYCLE_MODEL=PASS checks=%u TX_SEAM=NIC_API_RESULT GENERAL_NONZERO=LOCKED\n",
+        master.m_Motion.m_CompEngine.LifecycleContractChecks());
+
+    unsigned sendContractChecks = 0U;
+    if (!pbc::CheckSendContract(sendContractChecks))
+    {
+        compensationDiagnostic.error = pbc::Error::LifecycleContract;
+        return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID,
+            compensationDiagnostic, "X_SEND_CONTRACT");
+    }
+    DEBUG_PRINT("[PBC-3C] X_SEND_CONTRACT=PASS checks=%u mode=SHADOW_ZERO GENERAL_NONZERO=LOCKED\n",
+        sendContractChecks);
+    DEBUG_PRINT("[PBC-3D] X_REFERENCE_CONTRACT=PASS checks=%u LIVE_COMMIT=HOME_RESET SNAP=NUMERIC_ONLY GENERAL_NONZERO=LOCKED\n",
+        master.m_Motion.m_CompEngine.XReferenceChecks());
+    DEBUG_PRINT("[PBC-3E] X_CONTROL_CONTRACT=PASS checks=%u LIVE_CYCLE=OFF_OR_X_ZERO_OR_K_PITCH_OR_L_BACKLASH_OR_M_COMBINED_OR_N_ASYMMETRIC_OR_O_DIRECTIONAL_PITCH_OR_P_DIRECTIONAL_COMBINED MODEL_COMMIT=NIC_API_RESULT ZERO_CANDIDATE=RESERVED GENERAL_NONZERO=LOCKED\n",
+        master.m_Motion.m_CompEngine.XControlChecks());
+    DEBUG_PRINT("[PBC-3E-FIX1] STOP_SEND_RESERVATION=EXACT GENERAL_NONZERO=LOCKED\n");
+    DEBUG_PRINT("[PBC-3F] FROZEN_STOP=COMMITTED_ONLY RESET=RETAIN_KNOWN_OFFSET INVALID_ACTIVE=FENCED GENERAL_NONZERO=LOCKED\n");
+    DEBUG_PRINT("[PBC-3G] KNOWN_RECOVERY=RESET_RETAIN LOSS_SNAP=INHIBITED UNKNOWN_OUTPUT=QUARANTINED ACTIVE_HOME=X_ZERO_OR_STAGED_FIRST_INDEX GENERAL_NONZERO=LOCKED\n");
+    unsigned homeStopProofChecks = 0U;
+    if (!CheckMotionPbcHomeStopProof(homeStopProofChecks))
+    {
+        compensationDiagnostic.error = pbc::Error::LifecycleContract;
+        return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID,
+            compensationDiagnostic, "X_HOME_RAW_STOP_PROOF");
+    }
+    DEBUG_PRINT("[PBC-3H] X_HOME_RAW_STOP=PASS checks=%u samples=%u STOP_PROOF_ONLY=1 GENERAL_NONZERO=LOCKED\n",
+        homeStopProofChecks, MotionPbcHomeStopProof::RequiredSamples);
+    unsigned homeCaptureProofChecks = 0U;
+    if (!CheckMotionPbcHomeCaptureProof(homeCaptureProofChecks))
+    {
+        compensationDiagnostic.error = pbc::Error::LifecycleContract;
+        return PbcBootFailure(AlarmManager::MECHANICAL_COMPENSATION_CONFIG_INVALID,
+            compensationDiagnostic, "X_HOME_CAPTURE_PROOF");
+    }
+    DEBUG_PRINT("[PBC-3I] X_CAPTURE_CONTRACT=PASS checks=%u TX=SERIALIZED_NIC INPUT=RT_CURRENT HOME=TOKEN_REQUIRED UNKNOWN_RECOVERY=LOCKED GENERAL_NONZERO=LOCKED\n",
+        homeCaptureProofChecks);
+
+    // Public FinalizeConfiguration has already validated the numerical boot
+    // frame before any CoordSys/NC consumer. This does not establish HOME.
+    const AxisContext* zeroOnlyX = master.m_Axes.empty() ? nullptr : &master.m_Axes[0];
+    DEBUG_PRINT("[PBC-3J] X_ZERO_ONLY=%u PITCH=%u BACKLASH=%u BOOT_FRAME=VALIDATED HOME=REQUIRED UNKNOWN_RECOVERY=LOCKED GENERAL_NONZERO=LOCKED\n",
+        zeroOnlyX && master.m_Motion.m_CompEngine.IsXZeroOnlyConfiguration(*zeroOnlyX) ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enablePitch ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enableBacklash ? 1U : 0U);
+
+    // PBC-3K releases only the sealed, bounded, equal-direction X pitch profile.
+    // Legacy low-frequency NONZERO=LOCKED labels refer to general integration.
+    DEBUG_PRINT("[PBC-3K] X_PITCH_ONLY=%u PITCH=%u BACKLASH=%u MAX_OFFSET_NM=10000 MAX_SLOPE_PPM=10000 FIRST_HOME=PHYSICAL_INDEX REHOME=REJECTED RESET=RETAIN_KNOWN UNKNOWN_RECOVERY=LOCKED GENERAL_BACKLASH=LOCKED OTHER_AXES=LOCKED\n",
+        zeroOnlyX && master.m_Motion.m_CompEngine.IsXPitchOnlyConfiguration(*zeroOnlyX) ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enablePitch ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enableBacklash ? 1U : 0U);
+
+    // PBC-3L is a separate backlash-only profile; pitch mixing stays locked.
+    DEBUG_PRINT("[PBC-3L] X_BACKLASH_ONLY=%u PITCH=%u BACKLASH=%u MAX_BRANCH_NM=10000 DIRECTION=POS_PLUS_NEG_MINUS FIRST_HOME=PHYSICAL_INDEX REHOME=REJECTED RESET=RETAIN_CANCEL_TARGET UNKNOWN_RECOVERY=LOCKED GENERAL_PITCH_MIX=LOCKED OTHER_AXES=LOCKED\n",
+        zeroOnlyX && master.m_Motion.m_CompEngine.IsXBacklashOnlyConfiguration(*zeroOnlyX) ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enablePitch ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enableBacklash ? 1U : 0U);
+
+    // PBC-3M combines bounded same-direction pitch with symmetric X backlash.
+    DEBUG_PRINT("[PBC-3M] X_COMBINED=%u PITCH=%u BACKLASH=%u MAX_ABS_SUM_NM=10000 PITCH_PAIR=SAME BRANCHES=SYMMETRIC FIRST_HOME=PHYSICAL_INDEX REHOME=REJECTED RESET=RETAIN_BOTH_CANCEL_TARGETS UNKNOWN_RECOVERY=LOCKED OTHER_AXES=LOCKED\n",
+        zeroOnlyX && master.m_Motion.m_CompEngine.IsXCombinedConfiguration(*zeroOnlyX) ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enablePitch ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enableBacklash ? 1U : 0U);
+
+    // PBC-3N retains paired pitch and admits distinct positive/negative backlash magnitudes.
+    DEBUG_PRINT("[PBC-3N] X_ASYMMETRIC_COMBINED=%u PITCH=%u BACKLASH=%u MAX_ABS_SUM_NM=10000 PITCH_PAIR=SAME BRANCHES=ASYMMETRIC_POS_PLUS_NEG_MINUS FIRST_HOME=PHYSICAL_INDEX REHOME=REJECTED RESET=RETAIN_BOTH_CANCEL_TARGETS UNKNOWN_RECOVERY=LOCKED OTHER_AXES=LOCKED\n",
+        zeroOnlyX && master.m_Motion.m_CompEngine.IsXAsymmetricCombinedConfiguration(*zeroOnlyX) ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enablePitch ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enableBacklash ? 1U : 0U);
+
+    // PBC-3O releases signed, distinct PN pitch tables with backlash OFF/zero.
+    DEBUG_PRINT("[PBC-3O] X_DIRECTIONAL_PITCH_ONLY=%u PITCH=%u BACKLASH=%u MAX_OFFSET_NM=10000 MAX_SLOPE_PPM=10000 PITCH_PAIR=DIRECTIONAL_SIGNED FIRST_HOME=PHYSICAL_INDEX REHOME=REJECTED RESET=RETAIN_CANCEL_TARGET DIRECTIONAL_MIX=LOCKED UNKNOWN_RECOVERY=LOCKED OTHER_AXES=LOCKED\n",
+        zeroOnlyX && master.m_Motion.m_CompEngine.IsXDirectionalPitchOnlyConfiguration(*zeroOnlyX) ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enablePitch ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enableBacklash ? 1U : 0U);
+
+    // PBC-3P requires an explicit directional-mixing policy and asymmetric backlash.
+    DEBUG_PRINT("[PBC-3P] X_DIRECTIONAL_COMBINED=%u PITCH=%u BACKLASH=%u POLICY=EXPLICIT_ACK_REQUIRED MAX_ABS_SUM_NM=10000 MAX_SLOPE_PPM=10000 PITCH_PAIR=DIRECTIONAL_SIGNED BRANCHES=ASYMMETRIC FIRST_HOME=PHYSICAL_INDEX REHOME=REJECTED RESET=RETAIN_BOTH_CANCEL_TARGETS UNKNOWN_RECOVERY=LOCKED OTHER_AXES=LOCKED\n",
+        zeroOnlyX && master.m_Motion.m_CompEngine.IsXDirectionalCombinedConfiguration(*zeroOnlyX) ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enablePitch ? 1U : 0U,
+        zeroOnlyX && zeroOnlyX->enableBacklash ? 1U : 0U);
 
     //坐標系初始化
     master.m_NC->CoordSys.SetWCS(master.m_NC->CoordSys.GetCurrentWCSGCode(), master.m_NC);
@@ -1217,12 +1425,130 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
 
     //載入NC設定
     std::string NCConfigPath = GlobalConfig::GetInstance().ParameterDir + "NCConfig.txt";
+    PrintCNCStartupStackCheckpoint("NC_CONFIG_ENTER");
     if (!GlobalConfig::GetInstance().LoadNCConfig(NCConfigPath, master.m_Axes, master.m_Motion, master.m_NC))
     {
         DEBUG_PRINT("LoadConfig Error！>>NCConfig.txt\n");
         return false;
     }
 
+    // EDM18 selected ADC/simulation input. Missing/invalid configuration disables
+    // the new observation channel only; no implicit fallback to simulation.
+    {
+        const std::string gapPath = GlobalConfig::GetInstance().ParameterDir + "EDMGapInputConfig.txt";
+        EDMGapInput::Profile gapProfile{};
+        EDMGapInputConfigIO::Diagnostic gapDiagnostic{};
+        const bool loaded = EDMGapInputConfigIO::LoadFile(gapPath.c_str(), gapProfile, gapDiagnostic);
+        const bool installed = master.m_NC->InstallEDMGapInputBeforeStart(gapProfile, &master);
+        master.ConfigureGapAnalogInputBeforeStart(loaded ? gapProfile.adIndex : 0U,
+            loaded ? gapProfile.expectedDeviceId : 0U);
+        DEBUG_PRINT("[EDM18] event=PROFILE result=%s reason=%s key=%s line=%u source=%s AD=%u expectedDevice=%u gainMillionths=%lld offsetMv=%d calibrated=%u physicalPermit=0 discharge=0\n",
+            loaded && installed ? "READY" : "DISABLED", loaded ? (installed ? "NONE" : "INSTALL") : EDMGapInputConfigIO::ErrorName(gapDiagnostic.error),
+            gapDiagnostic.key, static_cast<unsigned>(gapDiagnostic.line), EDMGap::SourceName(gapProfile.source),
+            static_cast<unsigned>(gapProfile.adIndex), static_cast<unsigned>(gapProfile.expectedDeviceId),
+            static_cast<long long>(gapProfile.voltageGainMillionths), static_cast<int>(gapProfile.voltageOffsetMv),
+            gapProfile.calibrationConfirmed ? 1U : 0U);
+        if (loaded && installed)
+            DEBUG_PRINT("[EDM18-CAL2] schema=%u profile=%u calibration=%u rawValid=%d:%d calRaw=%d:%d boardMv=%d:%d zeroClampBoardUv=%u gainMillionths=%lld offsetMv=%d\n",
+                static_cast<unsigned>(gapProfile.schemaVersion), static_cast<unsigned>(gapProfile.profileRevision),
+                static_cast<unsigned>(gapProfile.calibrationRevision), static_cast<int>(gapProfile.rawMin), static_cast<int>(gapProfile.rawMax),
+                static_cast<int>(gapProfile.schemaVersion == 2U ? gapProfile.calibrationRawMin : gapProfile.rawMin),
+                static_cast<int>(gapProfile.schemaVersion == 2U ? gapProfile.calibrationRawMax : gapProfile.rawMax),
+                static_cast<int>(gapProfile.boardMvAtMin), static_cast<int>(gapProfile.boardMvAtMax),
+                static_cast<unsigned>(gapProfile.zeroClampBoardUv), static_cast<long long>(gapProfile.voltageGainMillionths),
+                static_cast<int>(gapProfile.voltageOffsetMv));
+    }
+
+    // EDM15 optional boot profile: strict parsing, no fallback and no runtime I/O.
+    // Invalid/missing profile disables only G180 P5; existing CNC remains available.
+    {
+        const std::string voltagePath = GlobalConfig::GetInstance().ParameterDir + "EDMVoltageConfig.txt";
+        EDMVoltage::Profile voltageProfile{};
+        EDMVoltageConfigIO::Diagnostic voltageDiagnostic{};
+        const bool voltageLoaded = EDMVoltageConfigIO::LoadFile(voltagePath.c_str(),
+            voltageProfile, voltageDiagnostic);
+        const bool voltageInstalled = master.m_NC->InstallEDMVoltageProfileBeforeStart(voltageProfile);
+        if (!voltageLoaded || !voltageInstalled)
+            DEBUG_PRINT("[EDM15] event=PROFILE result=DISABLED reason=%s key=%s line=%u detail=%s syntheticOnly=1 physicalPermit=0 discharge=0\n",
+                voltageLoaded ? "INSTALL" : EDMVoltageConfigIO::ErrorName(voltageDiagnostic.error),
+                voltageDiagnostic.key, static_cast<unsigned int>(voltageDiagnostic.line),
+                EDMVoltage::ProfileErrorName(voltageDiagnostic.profileError));
+        else
+            DEBUG_PRINT("[EDM15] event=PROFILE result=READY profile=%u calibration=%u rawMin=%d rawMax=%d mvMin=%d mvMax=%d syntheticOnly=1 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned int>(voltageProfile.profileRevision),
+                static_cast<unsigned int>(voltageProfile.calibrationRevision),
+                static_cast<int>(voltageProfile.rawMin), static_cast<int>(voltageProfile.rawMax),
+                static_cast<int>(voltageProfile.mvAtMin), static_cast<int>(voltageProfile.mvAtMax));
+    }
+
+    // EDM19 FIX4: all creation/validation and journal reads occur before NC starts.
+    // A recovery display is explicit and remains read-only even after alarm RESET.
+    {
+        const std::string recipeDirectory = GlobalConfig::GetInstance().BaseDataDir + "Data\\EDM\\";
+        std::unique_ptr<EDMRecipe::Catalog> recipeCatalog;
+        EDMConditionStartupIO::StartupResult startup{};
+        const bool recipeLoaded = EDMConditionStartupIO::LoadForStartup(recipeDirectory.c_str(), recipeCatalog, startup);
+        if (!recipeLoaded)
+        {
+            startup.emergencyDisplay = true; startup.allowPersistence = false;
+            if (startup.tableId == 0U) startup.tableId = 1U;
+            try { recipeCatalog = EDMConditionDefaults::MakeEmergencyCatalog(startup.tableId); }
+            catch (...) { recipeCatalog.reset(); }
+        }
+        const bool recipeInstalled = master.m_NC->InstallEDMRecipeCatalogBeforeStart(std::move(recipeCatalog));
+        const bool recipeSelected = recipeInstalled && master.m_NC->SelectEDMRecipeAtStartupBeforeStart(startup.tableId, startup.emergencyDisplay);
+        if (!recipeLoaded || !recipeInstalled || !recipeSelected || startup.emergencyDisplay)
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::EDM_CONDITION_CATALOG_INVALID);
+            DEBUG_PRINT("[EDM19_FIX4] event=STARTUP_COND result=RECOVERY_DISPLAY table=%u E=1 readonly=1 reason=%s file=%s key=%s physicalPermit=0 discharge=0\n",
+                static_cast<unsigned>(startup.tableId), EDMRecipeConfigIO::ErrorName(startup.diagnostic.error), startup.diagnostic.file, startup.diagnostic.key);
+        }
+        else
+        {
+            if (startup.recovered || startup.generated)
+                AlarmManager::GetInstance().Trigger(AlarmManager::EDM_CONDITION_STARTUP_RECOVERED);
+            if (startup.saveFailed)
+                AlarmManager::GetInstance().Trigger(AlarmManager::EDM_CONDITION_SELECTION_SAVE_FAILED);
+            DEBUG_PRINT("[EDM19_FIX4] event=STARTUP_COND result=READY table=%u E=1 generated=%u recovered=%u saveFailed=%u mode=SHADOW_ONLY physicalPermit=0 discharge=0\n",
+                static_cast<unsigned>(startup.tableId), startup.generated ? 1U : 0U, startup.recovered ? 1U : 0U, startup.saveFailed ? 1U : 0U);
+        }
+    }
+
+    // EDM20 boot loads a complete bundle. NC-owner live tuning replaces only
+    // the validated runtime copy. Missing/invalid startup configuration
+    // raises AL4020; no default write and no physical EDM enable are performed.
+    {
+        const std::string processDirectory = GlobalConfig::GetInstance().ParameterDir;
+        const std::string processPath = processDirectory + "EDMProcessConfig.ini";
+        PrintCNCStartupStackCheckpoint("EDM20_PROCESS_LOAD_ENTER");
+        RtPrintf("[EDM20_FIX1][BOOT] phase=PROCESS_BUNDLE_ENTER directory=%.400s\n", processDirectory.c_str());
+        EDM20::ProcessProfile processProfile{};
+        EDMProcessConfigIO::Diagnostic processDiagnostic{};
+        bool processLoaded = false;
+        try { processLoaded = EDMProcessConfigIO::LoadBundle(processDirectory, processProfile, processDiagnostic); }
+        catch (...) { processDiagnostic.reason = "exception while loading process profile"; }
+        RtPrintf("[EDM20_FIX1][BOOT] phase=PROCESS_BUNDLE_EXIT ok=%u file=%.200s line=%u key=%.64s reason=%.128s\n",
+            processLoaded ? 1U : 0U, processDiagnostic.path.c_str(), static_cast<unsigned>(processDiagnostic.line),
+            processDiagnostic.key.c_str(), processDiagnostic.reason.c_str());
+        PrintCNCStartupStackCheckpoint("EDM20_PROCESS_LOAD_EXIT");
+        RtPrintf("[EDM20_FIX1][BOOT] phase=INSTALL_ENTER axes=%u\n", static_cast<unsigned>(master.m_Axes.size()));
+        const bool processInstalled = processLoaded && master.m_NC->InstallEDMProcessProfileBeforeStart(
+            processProfile, master.m_Axes.empty() ? nullptr : &master.m_Axes[0], master.m_Axes.size());
+        RtPrintf("[EDM20_FIX1][BOOT] phase=INSTALL_EXIT ready=%u\n", processInstalled ? 1U : 0U);
+        if (!processLoaded || !processInstalled)
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::EDM_PROCESS_CONFIG_INVALID);
+            DEBUG_PRINT("[EDM20] event=PROFILE result=REJECT alarm=4020 file=%.160s line=%u key=%.64s reason=%.112s mode=SHADOW_ONLY physicalPermit=0 discharge=0\n",
+                processDiagnostic.path.empty() ? processPath.c_str() : processDiagnostic.path.c_str(), static_cast<unsigned>(processDiagnostic.line), processDiagnostic.key.c_str(),
+                processLoaded ? "INSTALL_OR_AXIS_GAINS" : processDiagnostic.reason.c_str());
+        }
+        else
+            DEBUG_PRINT("[EDM20] event=PROFILE result=READY revision=%u machine=%u axisCount=%u gainApplied=0 mode=SHADOW_ONLY cadence=NC_10MS physicalPermit=0 discharge=0\n",
+                static_cast<unsigned>(processProfile.revision), static_cast<unsigned>(processProfile.machineProfileId),
+                static_cast<unsigned>(master.m_Axes.size()));
+    }
+
+    PrintCNCStartupStackCheckpoint("NC_CONFIG_EXIT");
     //載入Home設定
     std::string HomeConfigPath = GlobalConfig::GetInstance().ParameterDir + "HomeConfig.txt";
     if (!GlobalConfig::GetInstance().LoadHomeConfig(HomeConfigPath, master.m_Axes, master.m_Motion, master.m_NC))
@@ -1254,7 +1580,9 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
 
     //載入初始NC檔案---------------------------------------------------------------------
     std::string Initial_NcPath = GlobalConfig::GetInstance().NCProgramDir + "Null.nc";
+    PrintCNCStartupStackCheckpoint("BOOT_NC_LOAD_ENTER");
     master.m_NC->LoadProgram(Initial_NcPath);
+    PrintCNCStartupStackCheckpoint("SYS_INIT_EXIT");
 
     return true;
 }

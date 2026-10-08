@@ -7,6 +7,7 @@
 #include "CoordinateManager.h"
 #include "MotionCore.h"
 #include "MacroEngine.h"
+#include "NCEccentricCPath.h" // Frozen signed rotated H, identical to the path kernel.
 #include <limits>
 
 // 🌟 注意這裡：只要掛上 NCManager::，它就還是 NCManager 的一部分！
@@ -75,10 +76,21 @@ void NCManager::UpdateSystemVariables()
     // =========================================================
     // 5. 刀長補償實際值 ($130 ~ $137) 與 刀徑半徑 ($138)
     // =========================================================
-    double cAngleMCS = CoordSys.GetElectrodeRotationAngleMCS(CoordSys.commandedMCS);
+    double cAngleMCS = CoordSys.GetEccentricCommandAngleMCS();
+    const bool eccentricDisplay = displayFrozen && display.axisIdentity.eccentricEnabled == 1U &&
+        display.toolLengthMode != 49;
+    std::array<double, 3U> frozenRotatedH{};
+    unsigned frozenRole = 8U;
+    const bool eccentricDisplayValid = !eccentricDisplay ||
+        (NCEccentricCDetail::Scope(display) && NCEccentricCDetail::Role(display, frozenRole) &&
+            frozenRole == 3U && display.axisIdentity.address[3] == 'C' &&
+            NCEccentricCDetail::Offset(display, cAngleMCS, frozenRotatedH));
     for (int i = 0; i < 8; i++) {
-        const double activeToolLen = displayFrozen ? NCTranslationToolOffsetMM(display, i) :
-            CoordSys.GetActiveToolOffset(i, cAngleMCS);
+        const double activeToolLen = eccentricDisplay ?
+            (eccentricDisplayValid ? (i < 3 ? frozenRotatedH[static_cast<unsigned>(i)] : 0.0) :
+                (std::numeric_limits<double>::quiet_NaN)()) :
+            (displayFrozen ? NCTranslationToolOffsetMM(display, i) :
+                CoordSys.GetActiveToolOffset(i, cAngleMCS));
         MacroSys.SetVar('$', 130 + i, activeToolLen * axisUnitScale[i]);
     }
     const double activeToolRad = displayFrozen ? display.cutterRadiusMM : CoordSys.GetActiveToolRadius();

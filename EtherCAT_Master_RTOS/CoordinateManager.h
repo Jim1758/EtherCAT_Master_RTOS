@@ -20,6 +20,10 @@ public:
     bool IsBaseArcPlaneSelectionSupported(int plane) const noexcept;
     bool PrepareArcPlaneTransition(int plane, NCTranslationSnapshot& candidate) const noexcept;
     bool CommitArcPlaneTransition(const NCTranslationSnapshot& candidate) noexcept;
+    // BASE79G standalone stopped G162/G163; source selection never moves axes.
+    bool IsEccentricRotationSelectionSupported(bool enabled) const noexcept;
+    bool PrepareEccentricRotationTransition(bool enabled, NCTranslationSnapshot& candidate) const noexcept;
+    bool CommitEccentricRotationTransition(const NCTranslationSnapshot& candidate) noexcept;
     // NC-only staged distance change; frame geometry and native tail stay fixed.
     bool PrepareDistanceModeTransition(int mode, NCTranslationSnapshot& candidate) const noexcept;
     bool CommitDistanceModeTransition(const NCTranslationSnapshot& candidate) noexcept;
@@ -103,6 +107,8 @@ public:
         const std::vector<AxisContext>& axes, NCManager* nc);
     int GetElectrodeRotationAxisIndex() const noexcept;
     double GetElectrodeRotationAngleMCS(const double* nativeMCS) const noexcept;
+    // NC-thread commanded endpoint angle, including a proven START/RESET modulo alias.
+    double GetEccentricCommandAngleMCS() const noexcept;
     // ==========================================
     // 🌟 C 軸電極偏心旋轉補償開關 (預設開啟)
     // ==========================================
@@ -603,6 +609,15 @@ private:
     int m_electrodeRotationAxisType = -1;
     bool m_electrodeRotationConfigured = false;
     bool IsElectrodeOffsetRotationRequested() const noexcept;
+    bool IsEccentricToolLengthSelectionSupported(int mode, int hCode) const noexcept;
+    // SyncMachinePosition records one stopped logical image before START binds
+    // its source. This is display provenance only, never a motion permission.
+    double m_commandedRotationAliasMCS[8] = {};
+    double m_commandedRotationAliasAngle = 0.0;
+    double m_commandedRotationAliasPPU = 0.0;
+    NCAxisIdentitySnapshot m_commandedRotationAliasIdentity{};
+    std::uint64_t m_commandedRotationAliasRun = 0ULL;
+    bool m_commandedRotationAliasValid = false;
     bool m_workRotationCenterFixed = false; // Only explicit fixed G168 plane-centre selection grants this proof.
     // One-use confirmation for the ordinary G168 handler after staged publication.
     // It binds the original words, avoiding reinterpretation in the new frame.

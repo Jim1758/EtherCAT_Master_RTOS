@@ -886,8 +886,11 @@ WarmedCoarseFineQpcSchedulerProbeHandler(
 {
     // 此 callback 屬於 disposable probe timer（Priority 62），不是正式 PDO callback。
     // 所有狀態均為本檔 static，啟動執行緒只在 callback 完成後讀取結果。
-    UNREFERENCED_PARAMETER(
-        context);
+    CoreTimerCallbackContext* timerContext =
+        static_cast<CoreTimerCallbackContext*>(context);
+    if (timerContext == nullptr) return;
+    CoreTimerCallbackScope callbackScope(timerContext->Gate);
+    if (!callbackScope) return;
 
 
     const LONG TARGET_CALLBACKS =
@@ -1292,7 +1295,7 @@ WarmedCoarseFineQpcSchedulerProbeHandler(
 
 
         BOOL rearmOk =
-            RtSetTimerRelative(
+            !timerContext->Gate.StopRequested() && RtSetTimerRelative(
                 g_coarseFineProbeTimer,
                 &relativeExpiration,
                 NULL);
@@ -1521,7 +1524,13 @@ int EtherCatMaster::StartDcPdoRuntime()
     // absolute 啟動失敗時改用 relative fallback。
     // 本函式由非即時啟動執行緒呼叫，因此允許 RtPrintf 與 bounded RtSleep 等待。
     // ========================================================================
-    HANDLE hTimer_PDO = NULL;
+    if (m_hPdoTimer != NULL || m_hProbeTimer != NULL ||
+        m_pdoTimerContext->Gate.StopRequested() || m_probeTimerContext->Gate.StopRequested())
+    {
+        RtPrintf("[CORE-CLOSE1] PDO_START_REJECTED already-started-or-stopping\n");
+        return -1;
+    }
+    HANDLE& hTimer_PDO = m_hPdoTimer;
     LARGE_INTEGER liPeriod_PDO;
     liPeriod_PDO.QuadPart = 2500; // CLOCK_2 以 100 ns 為單位：2500 = 250 us。
 
@@ -1837,13 +1846,14 @@ int EtherCatMaster::StartDcPdoRuntime()
                     NULL,
                     0,
                     WarmedCoarseFineQpcSchedulerProbeHandler,
-                    NULL,
+                    m_probeTimerContext,
                     62,
                     CLOCK_2);
 
             // Probe Priority 62 低於真正 PDO timer Priority 80；兩者不會同時存在。
 
 
+            m_hProbeTimer = g_coarseFineProbeTimer;
             if (g_coarseFineProbeTimer == NULL)
             {
                 RtPrintf(
@@ -2134,6 +2144,11 @@ int EtherCatMaster::StartDcPdoRuntime()
                 }
 
 
+                // Freeze probe statistics even when its completion wait timed out.
+                CoreTimerShutdown::DrainAndDelete(m_hProbeTimer,
+                    *m_probeTimerContext, "PROBE");
+                g_coarseFineProbeTimer = NULL;
+
                 MemoryBarrier();
 
 
@@ -2337,22 +2352,6 @@ int EtherCatMaster::StartDcPdoRuntime()
                     g_coarseFineProbeRearmCostMaxNs);
 
 
-                if (!RtDeleteTimer(
-                    g_coarseFineProbeTimer))
-                {
-                    RtPrintf(
-                        "[COARSE-FINE-QPC-PROBE] "
-                        "DELETE FAILED | "
-                        "Error:%lu\n",
-
-                        (unsigned long)
-                        GetLastError());
-                }
-
-
-                // 無論 PASS/FAIL 都不再使用 probe timer；正式 PDO timer 在後面另建。
-                g_coarseFineProbeTimer =
-                    NULL;
             }
         }
     }
@@ -2376,7 +2375,7 @@ int EtherCatMaster::StartDcPdoRuntime()
             NULL,
             0,
             GlobalTimerHandler_PDO,
-            this,
+            m_pdoTimerContext,
             80,
             CLOCK_2);
 

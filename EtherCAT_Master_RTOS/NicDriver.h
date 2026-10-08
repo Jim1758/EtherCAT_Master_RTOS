@@ -7,7 +7,7 @@
  * 功能：
  * 1. 封裝 RTX64 NAL 的 TX/RX Queue。
  * 2. 提供 EtherCAT Master 使用的 SendPacket()/ReceivePacket()。
- * 3. 管理一個由 RtNalAllocateFrame() 建立的 zero-copy TX Frame。
+ * 3. 管理固定四個由 RtNalAllocateFrame() 建立的 zero-copy TX Frame。
  * 4. 對外提供 TX ownership 與送出失敗的累積診斷計數。
  *
  * 執行緒規則：
@@ -29,6 +29,10 @@
 #include <tchar.h>
 #include <string.h>
 #include "EtherCatRxForensics.h"
+#include "NicTxReceipt.h"
+#include "NicTxFailureTrace.h"
+#include "NicTxOwnershipTrace.h"
+#include "NicTxFrameLifecycle.h"
 
  // RTX64 NAL 設定的最大 Ethernet Frame 大小。
 #define MAX_ETHER_FRAME_SIZE 1514
@@ -64,7 +68,13 @@ public:
 
     // 將一個 Ethernet Frame 交給 RTX64 NAL 傳送。
     // 回傳 true 表示一個 Frame 已成功提交；false 表示未提交。
-    bool SendPacket(unsigned char* pData, unsigned int length);
+    bool SendPacket(unsigned char* pData, unsigned int length,
+        NicTxReceipt* receipt = nullptr,
+        const NicTxCallContext* context = nullptr);
+
+    // Same accepted transaction only, after the caller validates its current
+    // EtherCAT response. This never returns NAL ownership or grants motion.
+    bool ObserveValidatedTxResponse(const NicTxReceipt& receipt) noexcept;
 
     // 嘗試取得一個 RX Frame。無資料或接收失敗時回傳 0。
     unsigned int ReceivePacket(unsigned char* pBuffer);
@@ -79,7 +89,7 @@ public:
     bool IsReceiveNotificationAvailable() const;
 
     // Copy the outcome of the most recent RtNalReceive() call.
-    // The same Priority-64 queue owner reads this immediately after
+    // The same communications queue owner reads this immediately after
     // ReceivePacket(); no second queue consumer or blocking lock is added.
     bool GetLastReceiveCallDiagnostic(
         NicRxCallDiagnostic* pDiagnostic) const;
@@ -121,6 +131,11 @@ private:
     bool AcquireRxQueueInternal();
 
     // Queue handles 僅在 Open() 成功後有效。
+    NicTxOwnershipTraceState m_TxOwnershipTrace[NicTxFrameLifecycle::SlotCount]{};
+    NicTxFrameLifecycle m_TxLifecycle{};
+    std::atomic<std::uint32_t> m_TxProducerActive{ 0U };
+    NicTxInterfaceObservation m_TxInterfaceObservation{};
+    std::uint64_t m_TxOpenGeneration = 0ULL; // Diagnostic identity; Open/Close are quiescent only.
     RTNAL_QUEUE_HANDLE m_hTxQueue;
     RTNAL_QUEUE_HANDLE m_hRxQueue;
 
@@ -129,8 +144,9 @@ private:
     RTNAL_QUEUE_EVENTS m_RxQueueEvents;
 
     // zero-copy TX Frame；ownership 可能在 Application 與 NAL 之間切換。
-    PRTNAL_FRAME m_pTxFrame;
-    PRTNAL_FRAME m_pTxFrameArray[1];
+    // EDM45: fixed Open-preallocated pool. Protocol response evidence can
+    // permit a later submission; only NAL ownership permits slot reuse.
+    PRTNAL_FRAME m_TxFrames[NicTxFrameLifecycle::SlotCount]{};
 
     // Ethernet Header 使用的來源 MAC。
     unsigned char m_MacAddress[6];

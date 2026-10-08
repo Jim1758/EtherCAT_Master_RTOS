@@ -1,6 +1,7 @@
 // CB/CC/CD. Bounded Feed Hold excursions under the original unfinished identity.
 #include "NCManager.h"
 #include "AlarmManager.h"
+#include "NCXYZFeedScope.h"
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -75,6 +76,81 @@ namespace
 NC_PATH_HOLD_NOINLINE
 bool NCManager::IsPathCoreHoldBlockShapeValid(const NCBlock& block) noexcept
 {
+    if (block.gCode == 178 && block.has('P') && block.val('P') == 28.0)
+    {
+        if (!block.has('J') || !std::isfinite(block.val('J')) || block.val('J') < 1.0 ||
+            block.val('J') > 30000.0 || std::floor(block.val('J')) != block.val('J')) return false;
+        NCBlock profile = block;
+        profile.param['P' - 'A'] = 27.0;
+        profile.hasParam['J' - 'A'] = false;
+        profile.param['J' - 'A'] = 0.0;
+        return IsPathCoreHoldBlockShapeValid(profile);
+    }
+    // H is P27's recovery deadline, never the legacy P10 hook parameter.
+    if (block.gCode == 178 && block.has('P') && block.val('P') == 27.0)
+    {
+        if (!block.has('H') || !std::isfinite(block.val('H')) || block.val('H') < 1.0 ||
+            block.val('H') > 30.0 || std::floor(block.val('H')) != block.val('H')) return false;
+        NCBlock profile = block;
+        profile.param['P' - 'A'] = 26.0;
+        profile.hasParam['H' - 'A'] = false;
+        profile.param['H' - 'A'] = 0.0;
+        return IsPathCoreHoldBlockShapeValid(profile);
+    }
+    // EDM10 gives each bounded P26 source one through eight cycles. R stays internal.
+    if (block.gCode == 178 && block.has('P') && block.val('P') == 26.0)
+    {
+        if (!block.has('L') || !std::isfinite(block.val('L')) || block.val('L') < 1.0 ||
+            block.val('L') > 8.0 || std::floor(block.val('L')) != block.val('L') || !block.has('K') ||
+            !std::isfinite(block.val('K')) || block.val('K') < 2.0 || block.val('K') > 8.0 ||
+            std::floor(block.val('K')) != block.val('K') ||
+            block.has('R') || block.has('H') || block.has('U') || block.has('V')) return false;
+        NCBlock profile = block;
+        profile.param['P' - 'A'] = 10.0;
+        profile.hasParam['R' - 'A'] = true;
+        profile.param['R' - 'A'] = 1.0;
+        return IsPathCoreHoldBlockShapeValid(profile);
+    }
+    // P25 repeats the P24 return-probe contract with one probe per cycle.
+    if (block.gCode == 178 && block.has('P') && block.val('P') == 25.0)
+    {
+        if (!block.has('L') || !std::isfinite(block.val('L')) || block.val('L') < 2.0 ||
+            block.val('L') > 8.0 || block.has('R') || block.has('K') || block.has('H') ||
+            block.has('U') || block.has('V')) return false;
+        NCBlock profile = block;
+        profile.param['P' - 'A'] = 9.0;
+        profile.hasParam['R' - 'A'] = true;
+        profile.param['R' - 'A'] = 1.0;
+        return IsPathCoreHoldBlockShapeValid(profile);
+    }
+    // P24 exposes one excursion and one return probe. R is internal only.
+    if (block.gCode == 178 && block.has('P') && block.val('P') == 24.0)
+    {
+        if (!block.has('L') || block.val('L') != 1.0 || block.has('R') ||
+            block.has('K') || block.has('H') || block.has('U') || block.has('V')) return false;
+        NCBlock profile = block;
+        profile.param['P' - 'A'] = 9.0;
+        profile.hasParam['R' - 'A'] = true;
+        profile.param['R' - 'A'] = 1.0;
+        return IsPathCoreHoldBlockShapeValid(profile);
+    }
+    // P23 reuses the bounded P6 engine, with an explicit smaller test budget.
+    if (block.gCode == 178 && block.has('P') && block.val('P') == 23.0)
+    {
+        if (!block.has('L') || !std::isfinite(block.val('L')) ||
+            block.val('L') < 2.0 || block.val('L') > 8.0) return false;
+        NCBlock profile = block;
+        profile.param['P' - 'A'] = 6.0;
+        return IsPathCoreHoldBlockShapeValid(profile);
+    }
+    // P22 has exactly P5's single-cycle grammar. Normalize a fixed-size local
+    // copy, then reuse every original shape check; never broaden P1-P21.
+    if (block.gCode == 178 && block.has('P') && block.val('P') == 22.0)
+    {
+        NCBlock profile = block;
+        profile.param['P' - 'A'] = 5.0;
+        return IsPathCoreHoldBlockShapeValid(profile);
+    }
     if (block.isEmpty || block.isGoto || !block.hasG ||
         (block.gCode != 178 && block.gCode != 179) || block.gCount != 1 ||
         block.gCodes[0] != block.gCode || block.mCount != 0) return false;
@@ -169,6 +245,7 @@ NC_PATH_HOLD_NOINLINE
 void NCManager::RejectPathCoreHoldSameThread(std::uint32_t code, int alarmCode,
     const MotionPathCoreHoldExcursionSnapshot* observed)
 {
+    FinishEDMPathProcessSameThread("PATH_REJECTED", true);
     const NCPathCoreRetainedFault historyFault = m_pathReplayStore.Fault();
     if (alarmCode == AlarmManager::G_Code_Invalid_parameter)
     {
@@ -194,9 +271,35 @@ void NCManager::RejectPathCoreHoldSameThread(std::uint32_t code, int alarmCode,
 }
 
 NC_PATH_HOLD_NOINLINE
-WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& block)
+WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& inputBlock)
 {
-    if (!IsPathCoreHoldBlockShapeValid(block))
+    const bool edm03 = inputBlock.gCode == 178 && inputBlock.has('P') && inputBlock.val('P') == 22.0;
+    const bool edm04 = inputBlock.gCode == 178 && inputBlock.has('P') && inputBlock.val('P') == 23.0;
+    const bool edm05 = inputBlock.gCode == 178 && inputBlock.has('P') && inputBlock.val('P') == 24.0;
+    const bool edm06 = inputBlock.gCode == 178 && inputBlock.has('P') && inputBlock.val('P') == 25.0;
+    const bool edm13 = inputBlock.gCode == 178 && inputBlock.has('P') && inputBlock.val('P') == 28.0;
+    const bool edm12 = edm13 || (inputBlock.gCode == 178 && inputBlock.has('P') && inputBlock.val('P') == 27.0);
+    const bool edm08 = edm12 || (inputBlock.gCode == 178 && inputBlock.has('P') && inputBlock.val('P') == 26.0);
+    NCBlock profile = inputBlock;
+    if (edm03 || edm04 || edm05 || edm06) profile.param['P' - 'A'] = (edm05 || edm06) ? 9.0 : (edm04 ? 6.0 : 5.0);
+    if (edm08) profile.param['P' - 'A'] = 10.0;
+    if (edm12)
+    {
+        profile.hasParam['H' - 'A'] = false;
+        profile.param['H' - 'A'] = 0.0;
+    }
+    if (edm13)
+    {
+        profile.hasParam['J' - 'A'] = false;
+        profile.param['J' - 'A'] = 0.0;
+    }
+    if (edm05 || edm06 || edm08)
+    {
+        profile.hasParam['R' - 'A'] = true;
+        profile.param['R' - 'A'] = 1.0;
+    }
+    const NCBlock& block = profile;
+    if (!IsPathCoreHoldBlockShapeValid(inputBlock))
     {
         RejectPathCoreHoldSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
@@ -214,6 +317,9 @@ WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& block)
         return nullptr;
     }
     InvalidatePathCoreHoldSameThread();
+    // EDM03 FIX1: a new control admission cannot inherit a prior P22 XYZ lane.
+    m_edmPathProcess = EDMPathProcessState{};
+    m_edmSourceSession = EDMSourceSessionState{};
     m_pathHold = PathHoldState{};
     m_pathHoldLastFault = PathHoldLastFault{}; // Only a newly admitted G178/G179 clears it.
     m_gapServiceCurrent = GapServiceDiagnostic{};
@@ -300,7 +406,7 @@ WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& block)
         }
         if (m_gapWindow.repeatedCumulativeStation)
             m_gapWindow.stationLimit = block.has('L') ? static_cast<std::uint32_t>(block.val('L')) : 1U;
-        LogGapPathSourceWindowSameThread("WINDOW_ARMED");
+        if (!edm13) LogGapPathSourceWindowSameThread("WINDOW_ARMED");
     }
     m_pathHold.armed = true;
     m_pathHold.code = 1U;
@@ -312,6 +418,74 @@ WaitConditionFunc NCManager::StartPathCoreHoldSameThread(const NCBlock& block)
             block.val('P') == 7.0 || block.val('P') == 8.0 || (block.val('P') == 9.0 || block.val('P') == 10.0 || block.val('P') == 11.0 || block.val('P') == 12.0 || block.val('P') == 13.0 || (block.val('P') == 14.0 || (block.val('P') == 15.0 || (block.val('P') == 16.0 || (block.val('P') == 17.0 || block.val('P') == 18.0 || (block.val('P') == 19.0 || block.val('P') == 20.0 || block.val('P') == 21.0)))))),
             (block.val('P') == 9.0 || block.val('P') == 10.0 || block.val('P') == 11.0 || block.val('P') == 12.0 || block.val('P') == 13.0 || (block.val('P') == 14.0 || (block.val('P') == 15.0 || (block.val('P') == 16.0 || (block.val('P') == 17.0 || block.val('P') == 18.0 || (block.val('P') == 19.0 || block.val('P') == 20.0 || block.val('P') == 21.0)))))), block.has('R') ? static_cast<std::uint8_t>(block.val('R')) : 1U))
         return nullptr;
+    if (edm03 || edm04 || edm05 || edm06 || edm08)
+    {
+        m_edmPathProcess = EDMPathProcessState{};
+        m_edmPathProcess.repeated = edm04 || edm06 || (edm08 && m_pathHold.cycleLimit > 1U);
+        m_edmPathProcess.returnProbe = edm05 || edm06 || edm08;
+        m_edmPathProcess.cycleLimit = static_cast<std::uint8_t>(m_pathHold.cycleLimit);
+        m_edmPathProcess.recoveryLimitMs = edm12 ? static_cast<std::uint32_t>(inputBlock.val('H')) * 1000U : 0U;
+        m_edmPathProcess.stopAckLimitMs = edm13 ? static_cast<std::uint32_t>(inputBlock.val('J')) : 0U;
+        m_edmPathProcess.active = true;
+        m_edmPathProcess.run = m_pathHold.run;
+        m_edmPathProcess.cache = m_pathHold.cache;
+        m_edmPathProcess.lease = m_pathHold.lease;
+        m_edmPathProcess.translationGeneration = m_pathHoldView.translationGeneration;
+        if (edm08)
+        {
+            m_edmSourceSession.configured = m_edmSourceSession.active = true;
+            m_edmSourceSession.run = m_pathHold.run;
+            m_edmSourceSession.cache = m_pathHold.cache;
+            m_edmSourceSession.lease = m_pathHold.lease;
+            m_edmSourceSession.translationGeneration = m_pathHoldView.translationGeneration;
+            m_edmSourceSession.initialHistoryCount = m_gapWindow.initialHistoryCount;
+            m_edmSourceSession.sourceLimit = static_cast<std::uint8_t>(m_gapWindow.sourceLimit);
+            m_edmSourceSession.cyclesPerSource = static_cast<std::uint8_t>(m_pathHold.cycleLimit);
+            m_edmSourceSession.recoveryLimitMs = m_edmPathProcess.recoveryLimitMs;
+            m_edmSourceSession.stopAckLimitMs = m_edmPathProcess.stopAckLimitMs;
+            m_edmSourceSession.distanceMM = m_pathHold.distanceMM;
+            m_edmSourceSession.feedMMMin = m_pathHold.feedMMMin;
+            m_edmSourceSession.intervalMM = m_pathHold.automaticIntervalMM;
+            m_gapWindow.tailSupervision = true;
+            if (edm13)
+                CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::SESSION_ARMED);
+            else if (edm12)
+                RtPrintf("[EDM12] phase=SESSION_ARMED build=EDM12_FIX1 P=27 source=1 completed=0 limit=%u cycle=1 completedCycles=0 cyclesPerSource=%u recoveryLimitMs=%u probesPerCycle=1 run=%llu physicalPermit=0 discharge=0\n",
+                    static_cast<unsigned int>(m_edmSourceSession.sourceLimit),
+                    static_cast<unsigned int>(m_edmSourceSession.cyclesPerSource),
+                    static_cast<unsigned int>(m_edmSourceSession.recoveryLimitMs),
+                    static_cast<unsigned long long>(m_edmSourceSession.run));
+            else if (m_edmSourceSession.cyclesPerSource > 1U)
+                RtPrintf("[EDM10] phase=SESSION_ARMED build=EDM10 source=1 completed=0 limit=%u cycle=1 completedCycles=0 cyclesPerSource=%u probesPerCycle=1 run=%llu physicalPermit=0 discharge=0\n",
+                    static_cast<unsigned int>(m_edmSourceSession.sourceLimit),
+                    static_cast<unsigned int>(m_edmSourceSession.cyclesPerSource),
+                    static_cast<unsigned long long>(m_edmSourceSession.run));
+            else RtPrintf("[%s] phase=SESSION_ARMED build=%s sources=%u cyclesPerSource=1 probesPerCycle=1 run=%llu physicalPermit=0 discharge=0\n",
+                m_edmSourceSession.sourceLimit == 2U ? "EDM08" : "EDM09",
+                m_edmSourceSession.sourceLimit == 2U ? "EDM08" : "EDM09",
+                static_cast<unsigned int>(m_edmSourceSession.sourceLimit),
+                static_cast<unsigned long long>(m_edmSourceSession.run));
+        }
+        if (!edm08) LogEDMPathProcessSameThread("ARMED");
+        if (edm06)
+            RtPrintf("[EDM06] phase=XYZ_SCOPE_ARMED build=EDM06_FIX1 run=%llu generation=%llu limit=%u probesPerCycle=1 feedAxisLimit=7 nextG=1 unit=MM mode=90 plane=17 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned long long>(m_edmPathProcess.run),
+                static_cast<unsigned long long>(m_edmPathProcess.translationGeneration),
+                static_cast<unsigned int>(m_edmPathProcess.cycleLimit));
+        else if (edm05)
+            RtPrintf("[EDM05] phase=XYZ_SCOPE_ARMED build=EDM05_FIX1 run=%llu generation=%llu limit=1 probes=1 feedAxisLimit=7 nextG=1 unit=MM mode=90 plane=17 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned long long>(m_edmPathProcess.run),
+                static_cast<unsigned long long>(m_edmPathProcess.translationGeneration));
+        else if (edm04)
+            RtPrintf("[EDM04] phase=XYZ_SCOPE_ARMED build=EDM04 run=%llu generation=%llu limit=%u feedAxisLimit=7 nextG=1 unit=MM mode=90 plane=17 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned long long>(m_edmPathProcess.run),
+                static_cast<unsigned long long>(m_edmPathProcess.translationGeneration),
+                static_cast<unsigned int>(m_edmPathProcess.cycleLimit));
+        else if (!edm08)
+            RtPrintf("[EDM03] phase=XYZ_SCOPE_ARMED build=EDM03_FIX1 run=%llu generation=%llu feedAxisLimit=7 nextG=1 unit=MM mode=90 plane=17 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned long long>(m_edmPathProcess.run),
+                static_cast<unsigned long long>(m_edmPathProcess.translationGeneration));
+    }
     LogPathCoreHoldSameThread("ARMED");
     if (m_pathHold.automaticEnabled) LogPathCoreHoldAutomaticSameThread("ARMED");
     return nullptr;
@@ -428,6 +602,16 @@ NC_PATH_HOLD_NOINLINE
 void NCManager::BeginPathCoreHoldCaptureSameThread(const NCBlock& block,
     NCBlockDispatchId dispatchId) noexcept
 {
+    if (m_edmSourceSession.active && !block.isEmpty)
+    {
+        const bool source = IsNCXYZFeedLineBlockAllowed(block, 1) ||
+            (CoordSys.activePlane == 17 && IsNCEDMSourceArcBlockAllowed(block));
+        if (!source || !IsEDMSourceSessionScopeValidSameThread())
+        {
+            RejectGapPathSimulationSameThread("EDM08_SOURCE_BLOCK");
+            return;
+        }
+    }
     if (m_gapWindow.active && !block.isEmpty &&
         !NCGCodeSemantics::Contains(block, 178) && !NCGCodeSemantics::Contains(block, 179) &&
         (!block.hasG || block.gCount != 1 || block.mCount != 0 || block.isGoto ||
@@ -570,7 +754,7 @@ void NCManager::CommitPathCoreHoldCaptureSameThread(NCBlockDispatchId dispatchId
     }
     m_pathHold.armed = false;
     m_pathHold.bound = true;
-    RtPrintf("[CNC-TRANSLATION-PATH] phase=BOUND kind=HOLD translationGen=%llu wcs=%d dispatch=%llu epoch=%llu seg=%llu sourcePC=%d\n",
+    if (!IsEDMDiagnosticQuietSameThread()) RtPrintf("[CNC-TRANSLATION-PATH] phase=BOUND kind=HOLD translationGen=%llu wcs=%d dispatch=%llu epoch=%llu seg=%llu sourcePC=%d\n",
         static_cast<unsigned long long>(m_pathHoldView.translationGeneration), CoordSys.GetTranslationSnapshot().wcsCode,
         static_cast<unsigned long long>(dispatchId), static_cast<unsigned long long>(m_pathHold.identity.epoch),
         static_cast<unsigned long long>(m_pathHold.identity.segmentId), m_pathHold.sourcePC);
@@ -762,6 +946,7 @@ void NCManager::ObservePathCoreHoldSameThread(bool bindingCurrentSource)
                 return;
             }
             m_pathHold.automaticObservedReturns = terminal.returnCount;
+            if (!ObserveEDMPathProcessMotionSameThread(terminal)) return;
             if (m_gapWindow.active && m_gapWindow.multipleStationsPerSource)
             {
                 m_pathHold.automaticNextS = 0.0;
@@ -911,6 +1096,7 @@ void NCManager::LogGapServiceFaultSameThread() const noexcept
 NC_PATH_HOLD_NOINLINE
 void NCManager::LogGapPathAdmissionSameThread(const char* phase, std::uint64_t nowMs) const noexcept
 {
+    if (IsEDMDiagnosticQuietSameThread()) return;
     RtPrintf("[GAP-ADMISSION] phase=%s dispatch=%llu epoch=%llu owner=%u gen=%u requestGen=%llu pendingPub=%llu loadedPub=%llu tick=%llu axis=%d error=%016llX window=%016llX elapsedMs=%llu closed=%u sample=%llu\n",
         phase, static_cast<unsigned long long>(m_pathHold.dispatch), static_cast<unsigned long long>(m_pathHold.identity.epoch),
         static_cast<unsigned int>(m_pathHold.lease.owner), static_cast<unsigned int>(m_pathHold.lease.generation),
@@ -933,7 +1119,7 @@ bool NCManager::HasGapPathSourceConsumerAcceptedSameThread() const noexcept
         (m_pathFeed.consumerAccepted || m_pathFeed.consumerStarted || m_pathFeed.completed)) ||
         (m_pathArc.dispatch == m_pathHold.dispatch &&
             (m_pathArcMotion.receipt.translationGeneration == m_pathHoldView.translationGeneration &&
-            HoldIdentityEqual(m_pathArcMotion.receipt.identity, m_pathHold.identity)) &&
+                HoldIdentityEqual(m_pathArcMotion.receipt.identity, m_pathHold.identity)) &&
             (m_pathArc.consumerAccepted || m_pathArc.consumerStarted || m_pathArc.completed));
 }
 
@@ -949,13 +1135,13 @@ bool NCManager::ServiceGapPathAdmissionSameThread(const MotionPathCoreHoldExcurs
             m_pathFeedMotion.receipt.tailCommitted && m_pathFeedMotion.receipt.captureBound &&
             m_pathFeed.commit == m_pathHold.commit &&
             (m_pathFeedMotion.receipt.translationGeneration == m_pathHoldView.translationGeneration &&
-            HoldIdentityEqual(m_pathFeedMotion.receipt.identity, m_pathHold.identity)) &&
+                HoldIdentityEqual(m_pathFeedMotion.receipt.identity, m_pathHold.identity)) &&
             m_pathFeedMotion.receipt.ownerLease.Matches(m_pathHold.lease)) :
         (m_pathArcMotion.receipt.valid && m_pathArcMotion.receipt.commandAccepted &&
             m_pathArcMotion.receipt.tailCommitted && m_pathArcMotion.receipt.captureBound &&
             m_pathArc.commit == m_pathHold.commit &&
             (m_pathArcMotion.receipt.translationGeneration == m_pathHoldView.translationGeneration &&
-            HoldIdentityEqual(m_pathArcMotion.receipt.identity, m_pathHold.identity)) &&
+                HoldIdentityEqual(m_pathArcMotion.receipt.identity, m_pathHold.identity)) &&
             m_pathArcMotion.receipt.ownerLease.Matches(m_pathHold.lease));
     if (!snapshot.admissionPending || snapshot.publicationSequence == 0ULL ||
         snapshot.admissionWaitTick == 0ULL || snapshot.admissionWaitAxis < 0 || snapshot.admissionWaitAxis >= 8 ||
@@ -1626,8 +1812,1847 @@ void NCManager::LogGapPathSampleInletSameThread(const char* phase, std::uint64_t
         m_gapInlet.freezeStarted ? 1U : 0U);
 }
 
+// EDM03 wraps the established P5 service so age-only polls also reach the
+// process controller. No process result can bypass the existing Motion gates.
+NC_PATH_HOLD_NOINLINE
+bool NCManager::IsEDMSourceSessionScopeValidSameThread() const noexcept
+{
+    const auto& s = m_edmSourceSession;
+    const auto& w = m_gapWindow;
+    if (!s.configured || !s.active || s.sourceLimit < 2U || s.sourceLimit > 8U ||
+        (s.recoveryLimitMs != 0U && (s.recoveryLimitMs < 1000U || s.recoveryLimitMs > 30000U ||
+            s.recoveryLimitMs % 1000U != 0U)) || m_edmPathProcess.recoveryLimitMs != s.recoveryLimitMs ||
+        s.stopAckLimitMs > 30000U || (s.stopAckLimitMs != 0U && s.recoveryLimitMs == 0U) ||
+        m_edmPathProcess.stopAckLimitMs != s.stopAckLimitMs ||
+        s.cyclesPerSource < 1U || s.cyclesPerSource > 8U ||
+        s.sourceIndex < 1U || s.sourceIndex > s.sourceLimit ||
+        s.completedSources + 1U != s.sourceIndex || !w.active || w.sourceLimit != s.sourceLimit ||
+        w.sourceIndex != s.sourceIndex || w.cycleLimit != s.cyclesPerSource || w.probeLimit != 1U ||
+        !w.tailSupervision || w.tailVoltage != 50U || w.allowNormalSources || w.normalSource || w.normalProven ||
+        w.cumulativeStation || w.stationConsumed || w.repeatedCumulativeStation || w.multipleStationsPerSource ||
+        w.allowSeamStations || w.continuousSignal || w.sourceGapMs != 0U || w.sampledInput || w.queuedInput ||
+        w.recoverQueuedInput || w.pendingLowAcrossSources || m_gapSignal.active || m_gapInlet.active ||
+        m_gapQueue.active || m_gapRecovery.active || m_gapPending.active ||
+        w.stationLimit != 0U || w.completedStations != 0U || w.completedForwardMM != 0.0 ||
+        w.seamPublication != 0ULL || w.normalPublication != 0ULL || w.normalGeneration != 0ULL ||
+        s.initialHistoryCount == 0U || s.initialHistoryCount > NCPathCoreRetainedPath::Capacity - s.sourceLimit ||
+        w.initialHistoryCount != s.initialHistoryCount || s.run == 0ULL || s.cache == 0ULL ||
+        s.run != w.run || s.run != m_pathHold.run || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        s.cache != w.cache || s.cache != m_pathHold.cache || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !s.lease.Matches(w.lease) || !s.lease.Matches(m_pathHold.lease) || !s.lease.Matches(m_programMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || !HoldTranslationCurrent(CoordSys, s.translationGeneration) ||
+        !std::isfinite(s.distanceMM) || s.distanceMM <= 0.0 || !std::isfinite(s.feedMMMin) ||
+        s.feedMMMin <= 0.0 || s.feedMMMin > 100.0 || !std::isfinite(s.intervalMM) || s.intervalMM <= 0.0 ||
+        w.distanceMM != s.distanceMM || w.feedMMMin != s.feedMMMin || w.intervalMM != s.intervalMM ||
+        m_pathHold.distanceMM != s.distanceMM || m_pathHold.feedMMMin != s.feedMMMin ||
+        m_pathHold.cycleLimit != s.cyclesPerSource || m_edmPathProcess.cycleLimit != s.cyclesPerSource ||
+        m_edmPathProcess.repeated != (s.cyclesPerSource > 1U) ||
+        (!w.budgetProven && m_pathHold.automaticIntervalMM != s.intervalMM)) return false;
+    if (s.sourceIndex == 1U)
+        return !s.previousIdentity.IsAssigned() && s.previousDispatch == 0ULL && s.previousCommit == 0ULL &&
+        s.previousFence == 0ULL && s.previousPublication == 0ULL && s.previousRequestGeneration == 0ULL;
+    return s.previousIdentity.IsAssigned() && s.previousDispatch != 0ULL && s.previousCommit != 0ULL &&
+        s.previousFence != 0ULL && s.previousPublication != 0ULL && s.previousRequestGeneration != 0ULL &&
+        HoldIdentityEqual(s.previousIdentity, w.previousIdentity) && s.previousDispatch == w.previousDispatch &&
+        s.previousCommit == w.previousCommit;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::IsEDMSourceReturnProofValidSameThread() const noexcept
+{
+    const auto& p = m_edmPathProcess;
+    const auto& s = m_edmSourceSession;
+    return IsEDMSourceSessionScopeValidSameThread() && p.active && p.started && p.bound &&
+        p.returnProbe && p.repeated == (s.cyclesPerSource > 1U) && p.cycleLimit == s.cyclesPerSource &&
+        p.cycleIndex == s.cyclesPerSource && p.completedCycles == s.cyclesPerSource &&
+        (p.stopAckLimitMs == 0U || (p.stopWaitKind == 0U && p.stopProvenMask == 7U &&
+            p.stopWaitSequence == p.probeStopSequence && p.stopWaitCycle == p.cycleIndex &&
+            p.stopWaitSource == s.sourceIndex && p.stopProvenElapsedMs[0] < p.stopAckLimitMs &&
+            p.stopProvenElapsedMs[1] < p.stopAckLimitMs && p.stopProvenElapsedMs[2] < p.stopAckLimitMs)) &&
+        (p.recoveryLimitMs == 0U || (p.recoveryWaitKind == 0U &&
+            p.recoveryReturnAppliedSequence == p.returnStopSequence &&
+            p.recoveryProbeAppliedSequence == p.probeStopSequence)) &&
+        p.retreatSeen && p.returnSeen && p.returnProven && p.probeResumeProven && p.probeAdvanceSeen &&
+        p.run == m_pathHold.run && p.cache == m_pathHold.cache && p.dispatch == m_pathHold.dispatch &&
+        p.commit == m_pathHold.commit && HoldIdentityEqual(p.identity, m_pathHold.identity) &&
+        p.identity.epoch == m_motion.GetCurrentExecutionEpoch() && p.lease.Matches(m_pathHold.lease) &&
+        p.translationGeneration == m_edmSourceSession.translationGeneration &&
+        p.translationGeneration == m_pathHoldView.translationGeneration &&
+        p.requestGeneration != 0ULL && p.requestGeneration != m_edmSourceSession.previousRequestGeneration &&
+        p.previousCompletedFence >= s.previousFence && p.stopSequence > p.previousCompletedFence &&
+        p.returnStopSequence > p.stopSequence &&
+        p.probeStopSequence > p.returnStopSequence && p.completedFence >= p.probeStopSequence &&
+        p.previousPublication >= s.previousPublication && p.stopPublication > p.previousPublication &&
+        p.returnStopPublication > p.stopPublication &&
+        p.probeStopPublication > p.returnStopPublication && p.publication > p.probeResumePublication &&
+        p.heldSBits == p.returnedSBits && m_state == NCState::RUN && m_mode == NCOperationMode::MEMORY &&
+        !Close_System_Com_flag && !AlarmManager::GetInstance().HasAlarm() &&
+        !m_motion.HasPendingSafetyOrRecoveryRequests() && !m_pathHold.automaticHoldOwned &&
+        !m_pathHold.automaticAdmissionOwned && m_pathHold.bound && m_pathHold.requested && m_pathHold.startCommitted &&
+        m_pathHold.requestedHoldSequence == p.returnStopSequence &&
+        m_pathHold.automaticObservedReturns == s.cyclesPerSource &&
+        m_gapPath.returnLowTest && m_gapPath.repeatedReturnLow && m_gapPath.returnProbeLimit == 1U &&
+        m_gapPath.returnProbeHoldCount == 1U && m_gapPath.returnProbeResumeCount == 1U &&
+        m_gapPath.returnLowInjected && m_gapPath.returnRehold && m_gapPath.returnResumeApplied &&
+        m_gapPath.returnReholdSequence == p.probeStopSequence && IsGapPathAutomaticNormalSameThread();
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::CompleteEDMSourceSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept
+{
+    if (!m_edmSourceSession.active) return true;
+    auto& s = m_edmSourceSession;
+    auto& p = m_edmPathProcess;
+    const std::uint32_t retainedCount = s.initialHistoryCount + s.sourceIndex;
+    // Select the current canonical producer, never an older completed line.
+    // A matching line and arc at once is contradictory lifecycle evidence.
+    const auto& lineReceipt = m_pathFeedMotion.receipt;
+    const auto& arcReceipt = m_pathArcMotion.receipt;
+    const bool lineCompleted = m_pathFeed.armed && m_pathFeed.bound && m_pathFeed.completed &&
+        !m_pathFeed.pending && m_pathFeed.consumerAccepted && m_pathFeed.consumerStarted &&
+        lineReceipt.valid && lineReceipt.line.valid && !lineReceipt.line.point &&
+        m_pathFeed.dispatch == p.dispatch && m_pathFeed.commit == p.commit &&
+        lineReceipt.translationGeneration == p.translationGeneration &&
+        HoldIdentityEqual(lineReceipt.identity, p.identity) && lineReceipt.ownerLease.Matches(p.lease);
+    const bool arcCompleted = m_pathArc.armed && m_pathArc.bound && m_pathArc.completed &&
+        !m_pathArc.pending && m_pathArc.consumerAccepted && m_pathArc.consumerStarted &&
+        arcReceipt.valid && arcReceipt.arc.valid && arcReceipt.arc.plane == 17U && !arcReceipt.arc.fullCircle &&
+        m_pathArc.dispatch == p.dispatch && m_pathArc.commit == p.commit &&
+        arcReceipt.translationGeneration == p.translationGeneration &&
+        HoldIdentityEqual(arcReceipt.identity, p.identity) && arcReceipt.ownerLease.Matches(p.lease);
+    const bool sourceCompleted = lineCompleted != arcCompleted &&
+        ((m_pathHoldView.original.kind == NCPathCoreRetainedKind::LINE && lineCompleted) ||
+            (m_pathHoldView.original.kind == NCPathCoreRetainedKind::ARC && arcCompleted));
+    if (!IsEDMSourceReturnProofValidSameThread() || !m_gapWindow.budgetProven || !m_gapTail.active ||
+        !m_gapTail.endProven || !m_gapTail.sampleSeen || !ValidateGapPathTailSnapshotSameThread(snapshot) ||
+        m_gapTail.publication <= m_gapTail.budgetPublication || snapshot.publicationSequence != m_gapTail.publication ||
+        snapshot.requestGeneration != p.requestGeneration || snapshot.completedHoldRequestSequence != p.completedFence ||
+        snapshot.publicationSequence < p.publication || !sourceCompleted ||
+        !m_motion.IsGroupDone() || m_motion.GetCommandIngressSize() != 0U ||
+        m_motion.GetCommandReplaySize() != 0U || m_pathReplayStore.Count() != retainedCount ||
+        retainedCount == 0U || retainedCount > NCPathCoreRetainedPath::Capacity ||
+        m_pathReplayStore.Get(retainedCount - 1U) == nullptr ||
+        !HoldGeometryEqual(*m_pathReplayStore.Get(retainedCount - 1U), m_pathHoldView.original))
+    {
+        RejectGapPathSimulationSameThread("EDM08_SOURCE_NOT_PROVEN", &snapshot);
+        return false;
+    }
+    ++s.completedSources;
+    s.previousIdentity = p.identity;
+    s.previousDispatch = p.dispatch;
+    s.previousCommit = p.commit;
+    s.previousFence = p.completedFence;
+    s.previousPublication = snapshot.publicationSequence;
+    s.previousRequestGeneration = p.requestGeneration;
+    if (s.stopAckLimitMs != 0U)
+        CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::SOURCE_PASS);
+    else if (s.recoveryLimitMs != 0U)
+        RtPrintf("[EDM12] phase=SOURCE_PASS source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u recoveryLimitMs=%u run=%llu dispatch=%llu applied2=%llu applied3=%llu fence=%llu tailPub=%llu retained=%u heldS=%016llX returnedS=%016llX physicalPermit=0 discharge=0\n",
+            static_cast<unsigned int>(s.sourceIndex), static_cast<unsigned int>(s.completedSources),
+            static_cast<unsigned int>(s.sourceLimit), static_cast<unsigned int>(p.cycleIndex),
+            static_cast<unsigned int>(p.completedCycles), static_cast<unsigned int>(s.cyclesPerSource),
+            static_cast<unsigned int>(s.recoveryLimitMs), static_cast<unsigned long long>(s.run),
+            static_cast<unsigned long long>(p.dispatch), static_cast<unsigned long long>(p.recoveryReturnAppliedSequence),
+            static_cast<unsigned long long>(p.recoveryProbeAppliedSequence), static_cast<unsigned long long>(p.completedFence),
+            static_cast<unsigned long long>(s.previousPublication), retainedCount,
+            static_cast<unsigned long long>(p.heldSBits), static_cast<unsigned long long>(p.returnedSBits));
+    else if (s.cyclesPerSource > 1U)
+        RtPrintf("[EDM10] phase=SOURCE_PASS source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u run=%llu dispatch=%llu previousFence=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu tailPub=%llu retained=%u heldS=%016llX returnedS=%016llX physicalPermit=0 discharge=0\n",
+            static_cast<unsigned int>(s.sourceIndex), static_cast<unsigned int>(s.completedSources),
+            static_cast<unsigned int>(s.sourceLimit), static_cast<unsigned int>(p.cycleIndex),
+            static_cast<unsigned int>(p.completedCycles), static_cast<unsigned int>(s.cyclesPerSource),
+            static_cast<unsigned long long>(s.run), static_cast<unsigned long long>(p.dispatch),
+            static_cast<unsigned long long>(p.previousCompletedFence), static_cast<unsigned long long>(p.stopSequence),
+            static_cast<unsigned long long>(p.returnStopSequence), static_cast<unsigned long long>(p.probeStopSequence),
+            static_cast<unsigned long long>(p.completedFence), static_cast<unsigned long long>(s.previousPublication),
+            retainedCount, static_cast<unsigned long long>(p.heldSBits), static_cast<unsigned long long>(p.returnedSBits));
+    else RtPrintf("[%s] phase=SOURCE_PASS source=%u completed=%u limit=%u run=%llu dispatch=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu tailPub=%llu retained=%u heldS=%016llX returnedS=%016llX physicalPermit=0 discharge=0\n",
+        s.sourceLimit == 2U ? "EDM08" : "EDM09",
+        static_cast<unsigned int>(s.sourceIndex), static_cast<unsigned int>(s.completedSources),
+        static_cast<unsigned int>(s.sourceLimit), static_cast<unsigned long long>(s.run),
+        static_cast<unsigned long long>(p.dispatch), static_cast<unsigned long long>(p.stopSequence),
+        static_cast<unsigned long long>(p.returnStopSequence), static_cast<unsigned long long>(p.probeStopSequence),
+        static_cast<unsigned long long>(p.completedFence), static_cast<unsigned long long>(s.previousPublication),
+        retainedCount, static_cast<unsigned long long>(p.heldSBits), static_cast<unsigned long long>(p.returnedSBits));
+    p.controller.Revoke();
+    p.active = false;
+    if (s.completedSources == s.sourceLimit)
+    {
+        s.active = false;
+        if (s.stopAckLimitMs != 0U)
+            CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::SUMMARY_PASS);
+        else if (s.recoveryLimitMs != 0U)
+            RtPrintf("[EDM12] SUMMARY result=PASS reason=SOURCES_RETAINED P=27 completed=%u limit=%u cyclesPerSource=%u completedCycles=%u totalCycles=%u recoveryLimitMs=%u run=%llu fence=%llu physicalPermit=0 discharge=0\n",
+                static_cast<unsigned int>(s.completedSources), static_cast<unsigned int>(s.sourceLimit),
+                static_cast<unsigned int>(s.cyclesPerSource), static_cast<unsigned int>(p.completedCycles),
+                static_cast<unsigned int>(s.completedSources) * static_cast<unsigned int>(s.cyclesPerSource),
+                static_cast<unsigned int>(s.recoveryLimitMs), static_cast<unsigned long long>(s.run),
+                static_cast<unsigned long long>(s.previousFence));
+        else if (s.cyclesPerSource > 1U)
+            RtPrintf("[EDM10] SUMMARY result=PASS reason=SOURCES_RETAINED completed=%u limit=%u cyclesPerSource=%u completedCycles=%u totalCycles=%u run=%llu fence=%llu physicalPermit=0 discharge=0\n",
+                static_cast<unsigned int>(s.completedSources), static_cast<unsigned int>(s.sourceLimit),
+                static_cast<unsigned int>(s.cyclesPerSource), static_cast<unsigned int>(p.completedCycles),
+                static_cast<unsigned int>(s.completedSources) * static_cast<unsigned int>(s.cyclesPerSource),
+                static_cast<unsigned long long>(s.run), static_cast<unsigned long long>(s.previousFence));
+        else RtPrintf("[%s] SUMMARY result=PASS reason=SOURCES_RETAINED completed=%u limit=%u run=%llu fence=%llu physicalPermit=0 discharge=0\n",
+            s.sourceLimit == 2U ? "EDM08" : "EDM09",
+            static_cast<unsigned int>(s.completedSources), static_cast<unsigned int>(s.sourceLimit),
+            static_cast<unsigned long long>(s.run), static_cast<unsigned long long>(s.previousFence));
+    }
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::StartNextEDMSourceSameThread() noexcept
+{
+    if (!m_edmSourceSession.active) return true;
+    auto& s = m_edmSourceSession;
+    if (s.sourceLimit < 2U || s.sourceLimit > 8U || s.sourceIndex < 1U || s.sourceIndex >= s.sourceLimit ||
+        s.completedSources != s.sourceIndex || m_gapWindow.sourceIndex != s.sourceIndex + 1U ||
+        m_edmPathProcess.active || m_gapTail.active || !m_pathHold.armed || m_pathHold.bound ||
+        (s.stopAckLimitMs != 0U && (m_edmPathProcess.stopWaitKind != 0U ||
+            m_edmPathProcess.stopProvenMask != 7U ||
+            m_edmPathProcess.stopWaitSequence != m_edmPathProcess.probeStopSequence)) ||
+        !m_gapPath.active || m_gapPath.sequence != 0ULL || m_gapInput.Current().sequence != 0ULL)
+    {
+        RejectGapPathSimulationSameThread("EDM08_NEXT_SOURCE_RESET");
+        return false;
+    }
+    s.sourceIndex = static_cast<std::uint8_t>(m_gapWindow.sourceIndex);
+    if (!IsEDMSourceSessionScopeValidSameThread())
+    {
+        RejectGapPathSimulationSameThread("EDM08_NEXT_SOURCE_SCOPE");
+        return false;
+    }
+    m_edmPathProcess = EDMPathProcessState{};
+    auto& p = m_edmPathProcess;
+    p.active = p.returnProbe = true;
+    p.repeated = s.cyclesPerSource > 1U;
+    p.cycleLimit = s.cyclesPerSource;
+    p.recoveryLimitMs = s.recoveryLimitMs;
+    p.stopAckLimitMs = s.stopAckLimitMs;
+    p.run = s.run; p.cache = s.cache; p.lease = s.lease;
+    p.translationGeneration = s.translationGeneration;
+    p.previousCompletedFence = s.previousFence;
+    p.previousPublication = s.previousPublication;
+    LogEDMPathProcessSameThread("NEXT_SOURCE_FRESH_START");
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+void NCManager::FinishEDMSourceSessionSameThread(const char* reason, bool failed) noexcept
+{
+    auto& s = m_edmSourceSession;
+    if (!s.active) return;
+    if (s.stopAckLimitMs != 0U)
+        CaptureEDMDiagnosticSameThread(failed ? EDMDeferredDiagnosticKind::SUMMARY_FAIL : EDMDeferredDiagnosticKind::SUMMARY_CANCELLED);
+    s.active = false;
+    m_edmPathProcess.controller.Revoke();
+    m_edmPathProcess.active = false;
+    if (s.stopAckLimitMs != 0U)
+        RtPrintf("[EDM13] SUMMARY result=%s reason=%s P=28 source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u stopAckLimitMs=%u jKind=%u jStop=%llu jStartMs=%llu jNowMs=%llu jMask=%u ack1Ms=%u ack2Ms=%u ack3Ms=%u recoveryLimitMs=%u wait=%u startMs=%llu nowMs=%llu run=%llu dispatch=%llu retreatSeen=%u waitJ5Logged=%u tailActive=%u tailFresh=%u tailEnd=%u physicalPermit=0 discharge=0\n",
+            failed ? "FAIL" : "CANCELLED", reason != nullptr ? reason : "NONE",
+            static_cast<unsigned int>(s.sourceIndex), static_cast<unsigned int>(s.completedSources),
+            static_cast<unsigned int>(s.sourceLimit), static_cast<unsigned int>(m_edmPathProcess.cycleIndex),
+            static_cast<unsigned int>(m_edmPathProcess.completedCycles), static_cast<unsigned int>(s.cyclesPerSource),
+            static_cast<unsigned int>(s.stopAckLimitMs), static_cast<unsigned int>(m_edmPathProcess.stopWaitKind),
+            static_cast<unsigned long long>(m_edmPathProcess.stopWaitSequence),
+            static_cast<unsigned long long>(m_edmPathProcess.stopWaitStartMs),
+            static_cast<unsigned long long>(m_edmPathProcess.stopWaitNowMs),
+            static_cast<unsigned int>(m_edmPathProcess.stopProvenMask),
+            static_cast<unsigned int>(m_edmPathProcess.stopProvenElapsedMs[0]),
+            static_cast<unsigned int>(m_edmPathProcess.stopProvenElapsedMs[1]),
+            static_cast<unsigned int>(m_edmPathProcess.stopProvenElapsedMs[2]),
+            static_cast<unsigned int>(s.recoveryLimitMs), static_cast<unsigned int>(m_edmPathProcess.recoveryWaitKind),
+            static_cast<unsigned long long>(m_edmPathProcess.recoveryWaitStartMs),
+            static_cast<unsigned long long>(m_gapPath.lastServiceMs), static_cast<unsigned long long>(s.run),
+            static_cast<unsigned long long>(m_pathHold.dispatch),
+            m_edmPathProcess.retreatSeen ? 1U : 0U, m_gapPath.waitJ5Logged ? 1U : 0U,
+            m_gapTail.active ? 1U : 0U, m_gapTail.sampleSeen ? 1U : 0U, m_gapTail.endProven ? 1U : 0U);
+    else if (s.recoveryLimitMs != 0U)
+        RtPrintf("[EDM12] SUMMARY result=%s reason=%s P=27 source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u recoveryLimitMs=%u wait=%u waitStop=%llu startMs=%llu nowMs=%llu run=%llu dispatch=%llu fence=%llu retreatSeen=%u waitJ5Logged=%u physicalPermit=0 discharge=0\n",
+            failed ? "FAIL" : "CANCELLED", reason != nullptr ? reason : "NONE",
+            static_cast<unsigned int>(s.sourceIndex), static_cast<unsigned int>(s.completedSources),
+            static_cast<unsigned int>(s.sourceLimit), static_cast<unsigned int>(m_edmPathProcess.cycleIndex),
+            static_cast<unsigned int>(m_edmPathProcess.completedCycles), static_cast<unsigned int>(s.cyclesPerSource),
+            static_cast<unsigned int>(s.recoveryLimitMs), static_cast<unsigned int>(m_edmPathProcess.recoveryWaitKind),
+            static_cast<unsigned long long>(m_edmPathProcess.recoveryWaitStopSequence),
+            static_cast<unsigned long long>(m_edmPathProcess.recoveryWaitStartMs),
+            static_cast<unsigned long long>(m_gapPath.lastServiceMs), static_cast<unsigned long long>(s.run),
+            static_cast<unsigned long long>(m_pathHold.dispatch), static_cast<unsigned long long>(s.previousFence),
+            m_edmPathProcess.retreatSeen ? 1U : 0U, m_gapPath.waitJ5Logged ? 1U : 0U);
+    else if (s.cyclesPerSource > 1U)
+        RtPrintf("[EDM10] SUMMARY result=%s reason=%s source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u run=%llu dispatch=%llu fence=%llu physicalPermit=0 discharge=0\n",
+            failed ? "FAIL" : "CANCELLED", reason != nullptr ? reason : "NONE",
+            static_cast<unsigned int>(s.sourceIndex), static_cast<unsigned int>(s.completedSources),
+            static_cast<unsigned int>(s.sourceLimit), static_cast<unsigned int>(m_edmPathProcess.cycleIndex),
+            static_cast<unsigned int>(m_edmPathProcess.completedCycles), static_cast<unsigned int>(s.cyclesPerSource),
+            static_cast<unsigned long long>(s.run), static_cast<unsigned long long>(m_pathHold.dispatch),
+            static_cast<unsigned long long>(s.previousFence));
+    else RtPrintf("[%s] SUMMARY result=%s reason=%s source=%u completed=%u limit=%u run=%llu dispatch=%llu fence=%llu physicalPermit=0 discharge=0\n",
+        s.sourceLimit == 2U ? "EDM08" : "EDM09", failed ? "FAIL" : "CANCELLED",
+        reason != nullptr ? reason : "NONE", static_cast<unsigned int>(s.sourceIndex),
+        static_cast<unsigned int>(s.completedSources), static_cast<unsigned int>(s.sourceLimit),
+        static_cast<unsigned long long>(s.run),
+        static_cast<unsigned long long>(m_pathHold.dispatch), static_cast<unsigned long long>(s.previousFence));
+    m_edmPathProcess.recoveryWaitKind = 0U;
+    m_edmPathProcess.stopWaitKind = m_edmPathProcess.stopProvenMask = 0U;
+    m_edmPathProcess.stopWaitSource = m_edmPathProcess.stopWaitCycle = 0U;
+    m_edmPathProcess.stopWaitStartMs = m_edmPathProcess.stopWaitNowMs = 0ULL;
+    m_edmPathProcess.stopWaitSequence = m_edmPathProcess.stopWaitBoundarySequence = 0ULL;
+    for (auto& elapsed : m_edmPathProcess.stopProvenElapsedMs) elapsed = 0U;
+}
+
 NC_PATH_HOLD_NOINLINE
 bool NCManager::ServiceGapPathSimulationSameThread(double activeS, bool publishSample, const char* site,
+    bool returningSample, const MotionPathCoreHoldExcursionSnapshot* pendingAdmission,
+    const MotionPathCoreHoldExcursionSnapshot* sourcePublication) noexcept
+{
+    if (!ServiceGapPathSimulationImplSameThread(activeS, publishSample, site,
+        returningSample, pendingAdmission, sourcePublication)) return false;
+    return ServiceEDMPathProcessSameThread();
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ReadEDMStopClockSameThread(std::uint64_t& nowMs) noexcept
+{
+    auto& p = m_edmPathProcess;
+    nowMs = 0ULL;
+    if (p.stopAckLimitMs == 0U || !m_edmSourceSession.active) return true;
+    LARGE_INTEGER counter{};
+    if (m_gapPath.frequency == 0ULL || m_gapPath.frequency >
+        (std::numeric_limits<std::uint64_t>::max)() / 1000ULL ||
+        !RtQueryPerformanceCounter(&counter) || counter.QuadPart < 0)
+    {
+        RejectGapPathSimulationSameThread("EDM13_STOP_CLOCK");
+        return false;
+    }
+    const std::uint64_t ticks = static_cast<std::uint64_t>(counter.QuadPart);
+    const std::uint64_t seconds = ticks / m_gapPath.frequency;
+    const std::uint64_t fraction = (ticks % m_gapPath.frequency) * 1000ULL / m_gapPath.frequency;
+    if (seconds > ((std::numeric_limits<std::uint64_t>::max)() - fraction) / 1000ULL)
+    {
+        RejectGapPathSimulationSameThread("EDM13_STOP_CLOCK");
+        return false;
+    }
+    nowMs = seconds * 1000ULL + fraction;
+    if (nowMs < p.stopWaitNowMs || nowMs < m_gapPath.lastServiceMs)
+    {
+        RejectGapPathSimulationSameThread("EDM13_STOP_CLOCK");
+        return false;
+    }
+    // This clock is evidence for J only. Never publish/age a GAP sample here.
+    p.stopWaitNowMs = nowMs;
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ArmEDMStopWaitSameThread(std::uint8_t kind, std::uint64_t requestOriginMs) noexcept
+{
+    auto& p = m_edmPathProcess;
+    if (p.stopAckLimitMs == 0U || !m_edmSourceSession.active) return true;
+    const std::uint8_t expectedMask = kind >= 1U && kind <= 3U ?
+        static_cast<std::uint8_t>((1U << (kind - 1U)) - 1U) : 255U;
+    if (!IsEDMSourceSessionScopeValidSameThread() || !p.active || !p.started || !p.bound ||
+        kind < 1U || kind > 3U || p.stopWaitKind != 0U || p.stopProvenMask != expectedMask ||
+        requestOriginMs != p.stopWaitNowMs || p.recoveryWaitKind != 0U ||
+        !m_pathHold.automaticHoldOwned || m_pathHold.automaticAdmissionOwned ||
+        m_pathHold.automaticBoundarySequence == 0ULL || m_pathHold.automaticSettleSequence == 0ULL)
+    {
+        RejectGapPathSimulationSameThread("EDM13_STOP_ARM_SCOPE");
+        return false;
+    }
+    p.stopWaitKind = kind;
+    p.stopWaitSource = m_edmSourceSession.sourceIndex;
+    p.stopWaitCycle = p.cycleIndex;
+    p.stopWaitStartMs = requestOriginMs;
+    p.stopWaitSequence = m_pathHold.automaticSettleSequence;
+    p.stopWaitBoundarySequence = m_pathHold.automaticBoundarySequence;
+    return ValidateEDMStopWaitSameThread();
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ValidateEDMStopWaitSameThread() noexcept
+{
+    auto& p = m_edmPathProcess;
+    if (p.stopAckLimitMs == 0U || !m_edmSourceSession.active) return true;
+    if (!IsEDMSourceSessionScopeValidSameThread() || !p.active ||
+        p.stopWaitKind > 3U || (p.stopProvenMask != 0U && p.stopProvenMask != 1U &&
+            p.stopProvenMask != 3U && p.stopProvenMask != 7U))
+    {
+        RejectGapPathSimulationSameThread("EDM13_STOP_SCOPE");
+        return false;
+    }
+    if (p.stopWaitKind == 0U)
+    {
+        if (m_pathHold.automaticHoldOwned)
+        {
+            const std::uint8_t kind = !m_gapPath.returnHold ? 1U : (m_gapPath.returnRehold ? 3U : 2U);
+            const std::uint64_t proven = kind == 1U ? p.stopSequence :
+                (kind == 2U ? p.returnStopSequence : p.probeStopSequence);
+            if ((p.stopProvenMask & (1U << (kind - 1U))) == 0U || proven == 0ULL ||
+                proven != m_pathHold.automaticSettleSequence || proven != p.stopWaitSequence ||
+                p.stopWaitBoundarySequence != m_pathHold.automaticBoundarySequence ||
+                p.stopWaitSource != m_edmSourceSession.sourceIndex || p.stopWaitCycle != p.cycleIndex)
+            {
+                RejectGapPathSimulationSameThread("EDM13_STOP_WAIT_MISSING");
+                return false;
+            }
+        }
+        return true;
+    }
+    const std::uint8_t kind = p.stopWaitKind;
+    const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
+    const std::uint64_t previous = kind == 1U ? p.previousCompletedFence :
+        (kind == 2U ? p.stopSequence : p.returnStopSequence);
+    const std::uint64_t unproven = kind == 1U ? p.stopSequence :
+        (kind == 2U ? p.returnStopSequence : p.probeStopSequence);
+    if (!p.started || !p.bound || !m_pathHold.bound || p.dispatch != m_pathHold.dispatch || p.commit != m_pathHold.commit ||
+        !HoldIdentityEqual(p.identity, m_pathHold.identity) ||
+        p.identity.epoch != m_motion.GetCurrentExecutionEpoch() || !p.lease.Matches(m_pathHold.lease) ||
+        p.translationGeneration != m_pathHoldView.translationGeneration || m_state != NCState::HOLD ||
+        !m_pathHold.automaticHoldOwned || m_pathHold.automaticAdmissionOwned || p.recoveryWaitKind != 0U ||
+        p.stopWaitSource != m_edmSourceSession.sourceIndex || p.stopWaitCycle != p.cycleIndex ||
+        p.stopProvenMask != static_cast<std::uint8_t>((1U << (kind - 1U)) - 1U) || unproven != 0ULL ||
+        (kind != 1U && previous == 0ULL) || p.stopWaitSequence <= previous ||
+        p.stopWaitSequence != m_pathHold.automaticSettleSequence ||
+        p.stopWaitSequence != m_feedHoldNCSettleRequestSequence ||
+        p.stopWaitBoundarySequence == 0ULL || p.stopWaitBoundarySequence != m_pathHold.automaticBoundarySequence ||
+        boundary.sequence != p.stopWaitBoundarySequence || boundary.dispatchId != p.dispatch ||
+        boundary.requestExecutionEpoch != p.identity.epoch || boundary.requestOwner != p.lease.owner ||
+        boundary.requestOwnerGeneration != p.lease.generation ||
+        boundary.expectedSettleRequestSequence != p.stopWaitSequence ||
+        boundary.failed || boundary.cancelled || boundary.acknowledgeLost || boundary.resumeApplied ||
+        !m_gapPath.held || m_gapPath.returnHold != (kind != 1U) || m_gapPath.returnRehold != (kind == 3U) ||
+        (kind == 3U && m_gapPath.returnReholdSequence != p.stopWaitSequence))
+    {
+        RejectGapPathSimulationSameThread("EDM13_STOP_REQUEST_CHANGED");
+        return false;
+    }
+    std::uint64_t nowMs = 0ULL;
+    if (!ReadEDMStopClockSameThread(nowMs)) return false;
+    if (nowMs < p.stopWaitStartMs)
+    {
+        RejectGapPathSimulationSameThread("EDM13_STOP_CLOCK");
+        return false;
+    }
+    if (nowMs - p.stopWaitStartMs >= p.stopAckLimitMs)
+    {
+        RejectGapPathSimulationSameThread(kind == 1U ? "EDM13_INITIAL_STOP_TIMEOUT" :
+            (kind == 2U ? "EDM13_RETURN_STOP_TIMEOUT" : "EDM13_PROBE_STOP_TIMEOUT"));
+        return false;
+    }
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::CompleteEDMStopWaitSameThread(std::uint8_t kind, std::uint64_t exactStop) noexcept
+{
+    auto& p = m_edmPathProcess;
+    if (p.stopAckLimitMs == 0U || !m_edmSourceSession.active) return true;
+    if (kind < 1U || kind > 3U || p.stopWaitKind != kind || exactStop == 0ULL ||
+        exactStop != p.stopWaitSequence || !m_feedHoldBoundaryShadow.GetSnapshot().acknowledged)
+    {
+        RejectGapPathSimulationSameThread("EDM13_STOP_PROOF_SCOPE");
+        return false;
+    }
+    // Re-read QPC immediately before accepting proof, even if the service
+    // poll was timely. A late ACK in this same scan must not retire J.
+    if (!ValidateEDMStopWaitSameThread()) return false;
+    p.stopProvenElapsedMs[kind - 1U] = static_cast<std::uint32_t>(p.stopWaitNowMs - p.stopWaitStartMs);
+    p.stopProvenMask = static_cast<std::uint8_t>(p.stopProvenMask | (1U << (kind - 1U)));
+    p.stopWaitKind = 0U;
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ArmEDMRecoveryWaitSameThread(std::uint8_t kind) noexcept
+{
+    auto& p = m_edmPathProcess;
+    if (p.recoveryLimitMs == 0U) return true;
+    const bool probe = kind == 3U;
+    const std::uint64_t stop = probe ? p.probeStopSequence : p.returnStopSequence;
+    const std::uint64_t origin = probe ? p.probeNormalTimeFloor : p.returnNormalTimeFloor;
+    if ((kind != 2U && kind != 3U) || p.recoveryWaitKind != 0U || stop == 0ULL ||
+        origin != m_gapPath.lastServiceMs || p.recoveryProbeAppliedSequence != 0ULL ||
+        (probe ? (p.recoveryReturnAppliedSequence != p.returnStopSequence ||
+            stop <= p.returnStopSequence) : (p.recoveryReturnAppliedSequence != 0ULL || stop <= p.stopSequence)))
+    {
+        RejectGapPathSimulationSameThread("EDM12_RECOVERY_ARM_SCOPE");
+        return false;
+    }
+    p.recoveryWaitKind = kind;
+    p.recoveryWaitStopSequence = stop;
+    p.recoveryWaitStartMs = origin;
+    return ValidateEDMRecoveryWaitSameThread();
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ValidateEDMRecoveryWaitSameThread() noexcept
+{
+    const auto& p = m_edmPathProcess;
+    if (p.recoveryLimitMs == 0U) return true;
+    if (!IsEDMSourceSessionScopeValidSameThread() || !p.active ||
+        (p.recoveryWaitKind != 0U && p.recoveryWaitKind != 2U && p.recoveryWaitKind != 3U))
+    {
+        RejectGapPathSimulationSameThread("EDM12_RECOVERY_SCOPE");
+        return false;
+    }
+    if (p.recoveryWaitKind == 0U)
+    {
+        const std::uint64_t stop = m_gapPath.returnRehold ? p.probeStopSequence : p.returnStopSequence;
+        const std::uint64_t applied = m_gapPath.returnRehold ?
+            p.recoveryProbeAppliedSequence : p.recoveryReturnAppliedSequence;
+        if (m_pathHold.automaticHoldOwned && m_gapPath.returnHold && stop != 0ULL && applied != stop)
+        {
+            RejectGapPathSimulationSameThread("EDM12_RECOVERY_WAIT_MISSING");
+            return false;
+        }
+        return true;
+    }
+    const bool probe = p.recoveryWaitKind == 3U;
+    const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
+    if (!p.started || !p.bound || !m_pathHold.bound ||
+        p.dispatch != m_pathHold.dispatch || p.commit != m_pathHold.commit ||
+        !HoldIdentityEqual(p.identity, m_pathHold.identity) ||
+        p.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        p.translationGeneration != m_pathHoldView.translationGeneration ||
+        !p.lease.Matches(m_pathHold.lease) || !m_pathHold.automaticHoldOwned ||
+        !m_gapPath.returnHold || m_gapPath.returnRehold != probe ||
+        p.recoveryWaitStopSequence == 0ULL ||
+        p.recoveryWaitStopSequence != (probe ? p.probeStopSequence : p.returnStopSequence) ||
+        p.recoveryWaitStartMs != (probe ? p.probeNormalTimeFloor : p.returnNormalTimeFloor) ||
+        m_pathHold.automaticSettleSequence != p.recoveryWaitStopSequence ||
+        m_feedHoldNCSettleRequestSequence != p.recoveryWaitStopSequence ||
+        boundary.sequence == 0ULL || boundary.sequence != m_pathHold.automaticBoundarySequence ||
+        boundary.dispatchId != p.dispatch || boundary.requestExecutionEpoch != p.identity.epoch ||
+        boundary.requestOwner != p.lease.owner || boundary.requestOwnerGeneration != p.lease.generation ||
+        boundary.expectedSettleRequestSequence != p.recoveryWaitStopSequence ||
+        !boundary.acknowledged || boundary.failed || boundary.cancelled || boundary.acknowledgeLost ||
+        boundary.resumeApplied || (m_state != NCState::HOLD && m_state != NCState::RUN))
+    {
+        RejectGapPathSimulationSameThread("EDM12_RECOVERY_STOP_CHANGED");
+        return false;
+    }
+    if (m_gapPath.lastServiceMs < p.recoveryWaitStartMs)
+    {
+        RejectGapPathSimulationSameThread("EDM12_RECOVERY_CLOCK");
+        return false;
+    }
+    // Check before Controller.Step and before either admission transaction.
+    // A new NORMAL, duplicate publication, or busy resume never restarts H.
+    if (m_gapPath.lastServiceMs - p.recoveryWaitStartMs >= p.recoveryLimitMs)
+    {
+        RejectGapPathSimulationSameThread(probe ?
+            "EDM12_PROBE_RECOVERY_TIMEOUT" : "EDM12_RETURN_RECOVERY_TIMEOUT");
+        return false;
+    }
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::CompleteEDMRecoveryWaitSameThread() noexcept
+{
+    auto& p = m_edmPathProcess;
+    if (p.recoveryLimitMs == 0U) return true;
+    if (!m_gapPath.returnHold && p.recoveryWaitKind == 0U) return true; // Initial retreat.
+    const bool probe = p.recoveryWaitKind == 3U;
+    const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
+    // Apply has succeeded. Its final pre-commit service accepted the deadline;
+    // never re-read wall time after Commit/logging and revoke it retroactively.
+    if (!p.active || !IsEDMSourceSessionScopeValidSameThread() || m_state != NCState::RUN ||
+        (p.recoveryWaitKind != 2U && p.recoveryWaitKind != 3U) ||
+        !m_gapPath.returnHold || m_gapPath.returnRehold != probe || !m_pathHold.automaticHoldOwned ||
+        p.recoveryWaitStopSequence != (probe ? p.probeStopSequence : p.returnStopSequence) ||
+        p.recoveryWaitStopSequence != m_feedHoldNCSettleRequestSequence ||
+        boundary.expectedSettleRequestSequence != p.recoveryWaitStopSequence ||
+        boundary.dispatchId != p.dispatch || boundary.requestExecutionEpoch != p.identity.epoch ||
+        boundary.requestOwner != p.lease.owner || boundary.requestOwnerGeneration != p.lease.generation ||
+        !boundary.acknowledged || !boundary.resumeApplied || boundary.failed || boundary.cancelled ||
+        boundary.acknowledgeLost || !IsEDMPathProcessSignalSameThread(true))
+    {
+        RejectGapPathSimulationSameThread("EDM12_RECOVERY_APPLY_PROOF");
+        return false;
+    }
+    if (probe) p.recoveryProbeAppliedSequence = p.recoveryWaitStopSequence;
+    else p.recoveryReturnAppliedSequence = p.recoveryWaitStopSequence;
+    p.recoveryWaitKind = 0U;
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ServiceEDMPathProcessSameThread() noexcept
+{
+    auto& process = m_edmPathProcess;
+    if (!process.active)
+    {
+        if (!m_edmSourceSession.active) return true;
+        RejectGapPathSimulationSameThread("EDM08_SOURCE_PROCESS_REVOKED");
+        return false;
+    }
+    const bool edmWindow = m_edmSourceSession.active && IsEDMSourceSessionScopeValidSameThread();
+    // Tail acquisition updates GAP before this wrapper sees it. Compare the
+    // immutable tail authority here, not its pre-acquisition sample counter.
+    const bool edmTail = edmWindow && m_gapTail.active && m_gapWindow.budgetProven && process.returnProven &&
+        m_gapTail.run == process.run && m_gapTail.cache == process.cache &&
+        m_gapTail.dispatch == process.dispatch && m_gapTail.commit == process.commit &&
+        HoldIdentityEqual(m_gapTail.identity, process.identity) && m_gapTail.lease.Matches(process.lease) &&
+        m_gapTail.generation == process.requestGeneration && m_gapTail.fence == process.completedFence &&
+        m_gapTail.request == process.returnStopSequence && m_gapTail.latestStop == process.probeStopSequence &&
+        m_gapTail.returnedSBits == process.returnedSBits && !m_pathHold.automaticHoldOwned &&
+        !m_pathHold.automaticAdmissionOwned;
+    const bool cycleProfileValid = process.returnProbe ?
+        ((process.repeated ? (process.cycleLimit >= 2U && process.cycleLimit <= 8U) : process.cycleLimit == 1U) &&
+            m_pathHold.cycleLimit == process.cycleLimit &&
+            m_gapPath.repeatedLowRetreat && m_gapPath.returnLowTest && m_gapPath.repeatedReturnLow &&
+            m_gapPath.returnProbeLimit == 1U) :
+        (!m_gapPath.returnLowTest && !m_gapPath.repeatedReturnLow && (process.repeated ?
+            (process.cycleLimit >= 2U && process.cycleLimit <= 8U &&
+                m_pathHold.cycleLimit == process.cycleLimit && m_gapPath.repeatedLowRetreat) :
+            (m_pathHold.cycleLimit == 1U && !m_gapPath.repeatedLowRetreat)));
+    if (!m_gapPath.active || !m_gapPath.automaticResume || !m_gapPath.repeating ||
+        !m_gapPath.lowRetreat || !cycleProfileValid || (m_gapWindow.active && !edmWindow) ||
+        (m_edmSourceSession.active && !edmWindow) ||
+        (!m_pathHold.automaticEnabled && !edmTail) || !m_pathHold.requireReturnAuthorization ||
+        process.run == 0ULL || process.run != m_pathHold.run ||
+        process.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        process.cache == 0ULL || process.cache != m_pathHold.cache ||
+        process.cache != GetBaseProgramCache().GetGeneration() ||
+        !process.lease.Matches(m_pathHold.lease) || !process.lease.Matches(m_programMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(process.lease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || Close_System_Com_flag ||
+        AlarmManager::GetInstance().HasAlarm() || m_mode != NCOperationMode::MEMORY ||
+        (m_state != NCState::RUN && m_state != NCState::HOLD) ||
+        Homing.IsActive() || m_isG66Active || !m_macroStack.empty() ||
+        !IsPathCoreReplayConfigurationValid() || !m_gapPath.clockStarted)
+    {
+        RejectGapPathSimulationSameThread("EDM03_PROCESS_SCOPE");
+        return false;
+    }
+    bool sourceBoundNow = false;
+    if (m_pathHold.bound)
+    {
+        if (!m_pathHold.identity.IsAssigned() || m_pathHold.dispatch == NC_BLOCK_DISPATCH_ID_INVALID ||
+            m_pathHold.commit == 0ULL || m_pathHold.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+            !HoldTranslationCurrent(CoordSys, m_pathHoldView.translationGeneration) ||
+            (process.bound && (!HoldIdentityEqual(process.identity, m_pathHold.identity) ||
+                process.dispatch != m_pathHold.dispatch || process.commit != m_pathHold.commit ||
+                process.translationGeneration != m_pathHoldView.translationGeneration)) ||
+            (edmWindow && m_edmSourceSession.sourceIndex > 1U &&
+                (m_pathHold.identity.epoch <= m_edmSourceSession.previousIdentity.epoch ||
+                    m_pathHold.identity.segmentId == m_edmSourceSession.previousIdentity.segmentId ||
+                    m_pathHold.identity.sourceBlockId <= m_edmSourceSession.previousIdentity.sourceBlockId ||
+                    m_pathHold.dispatch <= m_edmSourceSession.previousDispatch ||
+                    m_pathHold.commit <= m_edmSourceSession.previousCommit)))
+        {
+            RejectGapPathSimulationSameThread("EDM03_SOURCE_CHANGED");
+            return false;
+        }
+        if (!process.bound)
+        {
+            process.identity = m_pathHold.identity;
+            process.dispatch = m_pathHold.dispatch;
+            process.commit = m_pathHold.commit;
+            process.translationGeneration = m_pathHoldView.translationGeneration;
+            process.bound = true;
+            sourceBoundNow = edmWindow;
+            LogEDMPathProcessSameThread("BOUND");
+        }
+    }
+    else if (process.bound)
+    {
+        RejectGapPathSimulationSameThread("EDM03_SOURCE_UNBOUND");
+        return false;
+    }
+    if (!ValidateEDMStopWaitSameThread() || !ValidateEDMRecoveryWaitSameThread()) return false;
+    const auto previousState = process.controller.Current().state;
+    const auto previousReason = process.controller.Current().reason;
+    const bool previousPermit = process.controller.Current().simulatedPermit;
+    // Each newly bound source fences out its first sample, including any
+    // pending-admission/age-only service that ran before that binding.
+    const bool firstService = !process.started || sourceBoundNow;
+    process.started = true;
+    const auto& decision = process.controller.Step(firstService ? EDMProcessSimulation::Command::Start :
+        EDMProcessSimulation::Command::None, m_gapInput.Current(), m_gapPath.lastServiceMs);
+    if (firstService || previousState != decision.state || previousReason != decision.reason ||
+        previousPermit != decision.simulatedPermit)
+        LogEDMPathProcessSameThread(firstService ? "START_FENCE" : "SIGNAL");
+    if (decision.state == EDMProcessSimulation::State::Fault)
+    {
+        RejectGapPathSimulationSameThread("EDM03_PROCESS_FAULT");
+        return false;
+    }
+    // The P5 test only recovers after retreat. A LOW before any fresh NORMAL
+    // cannot be admitted by this controller, so reject instead of waiting forever.
+    const auto& gap = m_gapInput.Current();
+    if (gap.band == EDMGap::Band::LOW && gap.pendingBand == EDMGap::Band::UNKNOWN &&
+        !decision.retreatRequested)
+    {
+        RejectGapPathSimulationSameThread("EDM03_LOW_BEFORE_NORMAL");
+        return false;
+    }
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::IsEDMPathProcessSignalSameThread(bool normal) const noexcept
+{
+    const auto& process = m_edmPathProcess;
+    // A live P26/P27 session cannot fall back to the legacy/manual no-gate path.
+    if (!process.active) return !m_edmSourceSession.active;
+    const auto& decision = process.controller.Current();
+    const auto& gap = m_gapInput.Current();
+    if (process.stopAckLimitMs != 0U && m_pathHold.automaticHoldOwned)
+    {
+        const std::uint8_t kind = !m_gapPath.returnHold ? 1U : (m_gapPath.returnRehold ? 3U : 2U);
+        if (process.stopWaitKind != 0U || (process.stopProvenMask & (1U << (kind - 1U))) == 0U ||
+            process.stopWaitSequence != m_pathHold.automaticSettleSequence ||
+            process.stopWaitBoundarySequence != m_pathHold.automaticBoundarySequence ||
+            process.stopWaitCycle != process.cycleIndex ||
+            process.stopWaitSource != m_edmSourceSession.sourceIndex) return false;
+    }
+    if (!process.started || !process.bound || !m_gapPath.active ||
+        process.run != m_pathHold.run || process.cache != m_pathHold.cache ||
+        process.dispatch != m_pathHold.dispatch || process.commit != m_pathHold.commit ||
+        !process.lease.Matches(m_pathHold.lease) || !HoldIdentityEqual(process.identity, m_pathHold.identity) ||
+        process.translationGeneration != m_pathHoldView.translationGeneration ||
+        decision.sampleSequence != gap.sequence || decision.sampledAtMs != gap.sampledAtMs ||
+        decision.observedAtMs != m_gapPath.lastServiceMs || gap.observedAtMs != m_gapPath.lastServiceMs ||
+        gap.sampledAtMs > m_gapPath.lastServiceMs ||
+        m_gapPath.lastServiceMs - gap.sampledAtMs > EDMProcessSimulation::Controller::MaximumSampleAgeMs)
+        return false;
+    if (process.returnProbe)
+    {
+        if (normal && m_gapPath.returnHold)
+        {
+            if (process.returnStopSequence <= process.stopSequence ||
+                gap.sequence <= process.returnNormalSequenceFloor ||
+                gap.sampledAtMs <= process.returnNormalTimeFloor) return false;
+            if (m_gapPath.returnRehold &&
+                (process.probeStopSequence <= process.returnStopSequence ||
+                    process.probeStopSequence != m_gapPath.returnReholdSequence ||
+                    gap.sequence <= process.probeNormalSequenceFloor ||
+                    gap.sampledAtMs <= process.probeNormalTimeFloor)) return false;
+        }
+        if (!normal && (process.stopSequence == 0ULL || process.stopPublication == 0ULL)) return false;
+    }
+    if (process.repeated)
+    {
+        if (normal && m_gapPath.returnHold &&
+            (process.returnStopSequence <= process.stopSequence ||
+                gap.sequence <= process.returnNormalSequenceFloor ||
+                gap.sampledAtMs <= process.returnNormalTimeFloor)) return false;
+        if (!normal && (process.stopSequence <= process.previousCompletedFence ||
+            process.stopPublication <= process.previousPublication)) return false;
+    }
+    if (normal)
+    {
+        if (process.recoveryLimitMs != 0U && m_pathHold.automaticHoldOwned && m_gapPath.returnHold)
+        {
+            const std::uint8_t kind = m_gapPath.returnRehold ? 3U : 2U;
+            if (process.recoveryLimitMs != m_edmSourceSession.recoveryLimitMs ||
+                process.recoveryWaitKind != kind ||
+                process.recoveryWaitStopSequence != (kind == 3U ? process.probeStopSequence : process.returnStopSequence) ||
+                process.recoveryWaitStopSequence == 0ULL || m_gapPath.lastServiceMs < process.recoveryWaitStartMs ||
+                m_gapPath.lastServiceMs - process.recoveryWaitStartMs >= process.recoveryLimitMs) return false;
+        }
+        return decision.state == EDMProcessSimulation::State::Active && decision.simulatedPermit &&
+            !decision.retreatRequested && decision.feedIntent == EDMProcessSimulation::FeedIntent::Feed;
+    }
+    return decision.state == EDMProcessSimulation::State::Low && !decision.simulatedPermit &&
+        decision.retreatRequested && decision.feedIntent == EDMProcessSimulation::FeedIntent::Retreat;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ObserveEDMPathProcessMotionSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept
+{
+    auto& process = m_edmPathProcess;
+    if (process.returnProbe) return ObserveEDMReturnProbeMotionSameThread(snapshot);
+    if (process.repeated) return ObserveEDMRepeatedPathProcessMotionSameThread(snapshot);
+    if (!process.active) return true;
+    // These are unavailable evidence, never grants. Established callers wait
+    // before reaching any admission or final-return acceptance in these states.
+    if (!process.bound || !m_pathHold.bound || snapshot.publicationSequence == 0ULL ||
+        snapshot.admissionPending)
+    {
+        if (m_pathHold.automaticObservedReturns == 1ULL)
+        {
+            RejectGapPathSimulationSameThread("EDM03_RETURN_EVIDENCE_UNAVAILABLE", &snapshot);
+            return false;
+        }
+        return true;
+    }
+    if (!m_gapPath.active || m_pathHold.cycleLimit != 1U ||
+        process.run != m_pathHold.run || process.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        process.cache != m_pathHold.cache || process.cache != GetBaseProgramCache().GetGeneration() ||
+        process.dispatch != m_pathHold.dispatch || process.commit != m_pathHold.commit ||
+        !HoldIdentityEqual(process.identity, m_pathHold.identity) ||
+        !HoldTranslationIdentityEqual(snapshot, process.identity, CoordSys, process.translationGeneration) ||
+        process.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !process.lease.Matches(m_pathHold.lease) || !snapshot.ownerLease.Matches(process.lease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(process.lease) ||
+        !snapshot.crossSegment || !snapshot.requireReturnAuthorization || snapshot.boundaryOnly ||
+        snapshot.cycleLimit != 1U || snapshot.historyCount != m_pathHoldView.completedCount ||
+        snapshot.publicationSequence < process.publication || snapshot.requestGeneration == 0ULL ||
+        (process.requestGeneration != 0ULL && process.requestGeneration != snapshot.requestGeneration))
+    {
+        RejectGapPathSimulationSameThread("EDM03_MOTION_EVIDENCE_SCOPE", &snapshot);
+        return false;
+    }
+    process.publication = snapshot.publicationSequence;
+    process.requestGeneration = snapshot.requestGeneration;
+    const bool originalStop = snapshot.phase == MotionPathCoreHoldExcursionPhase::ARMED &&
+        !m_gapPath.returnHold && snapshot.retreatCount == 0ULL && snapshot.returnCount == 0ULL;
+    const bool retreatComplete = snapshot.phase == MotionPathCoreHoldExcursionPhase::WAIT_RETURN &&
+        snapshot.retreatCount == 1ULL && snapshot.returnCount == 0ULL &&
+        process.requestGeneration != 0ULL && snapshot.requestGeneration == process.requestGeneration &&
+        m_pathHold.requested && m_pathHold.startCommitted &&
+        m_pathHold.requestedHoldSequence == process.stopSequence && process.stopSequence != 0ULL;
+    if (retreatComplete && !process.retreatSeen)
+    {
+        process.retreatSeen = true;
+        LogEDMPathProcessSameThread("RETREAT_ENDPOINT");
+    }
+    if (m_state == NCState::HOLD && m_pathHold.automaticHoldOwned && IsProgramFeedHoldResumeCandidate())
+    {
+        const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
+        const bool exactStop = boundary.sequence == m_pathHold.automaticBoundarySequence &&
+            boundary.sequence != 0ULL && boundary.dispatchId == process.dispatch &&
+            boundary.requestExecutionEpoch == process.identity.epoch &&
+            boundary.requestOwner == process.lease.owner && boundary.requestOwnerGeneration == process.lease.generation &&
+            boundary.expectedSettleRequestSequence == m_pathHold.automaticSettleSequence &&
+            m_pathHold.automaticSettleSequence != MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
+            m_feedHoldNCSettleRequestSequence == m_pathHold.automaticSettleSequence &&
+            boundary.acknowledged && !boundary.failed && !boundary.cancelled && !boundary.acknowledgeLost &&
+            !boundary.resumeApplied && boundary.motion.settleProofValid && boundary.motion.ncSettled &&
+            boundary.motion.settleRequestSequence == m_pathHold.automaticSettleSequence;
+        if (exactStop && originalStop && process.stopSequence == 0ULL)
+        {
+            process.stopSequence = m_pathHold.automaticSettleSequence;
+            LogEDMPathProcessSameThread("STOP_PROVEN");
+        }
+        if (exactStop && retreatComplete && m_gapPath.returnHold && process.returnStopSequence == 0ULL &&
+            m_pathHold.automaticSettleSequence > process.stopSequence)
+        {
+            process.returnStopSequence = m_pathHold.automaticSettleSequence;
+            LogEDMPathProcessSameThread("RETURN_STOP_PROVEN");
+        }
+    }
+    if (snapshot.phase == MotionPathCoreHoldExcursionPhase::RETURNING && process.retreatSeen &&
+        process.returnStopSequence > process.stopSequence && !process.returnSeen)
+    {
+        process.returnSeen = true;
+        LogEDMPathProcessSameThread("RETURNING");
+    }
+    // This latch is reached only after the ordinary code accepted and counted
+    // the final return. Recheck exact endpoint, both stop fences and fresh NORMAL.
+    if (!process.returnProven && process.retreatSeen && process.stopSequence != 0ULL &&
+        process.returnStopSequence > process.stopSequence && m_state == NCState::RUN &&
+        !m_pathHold.automaticHoldOwned && !m_pathHold.automaticAdmissionOwned &&
+        m_pathHold.requested && m_pathHold.startCommitted &&
+        m_pathHold.requestedHoldSequence == process.returnStopSequence &&
+        m_pathHold.automaticObservedReturns == 1ULL &&
+        snapshot.phase == MotionPathCoreHoldExcursionPhase::COMPLETE &&
+        snapshot.retreatCount == 1ULL && snapshot.returnCount == 1ULL &&
+        snapshot.activeOrdinal == snapshot.historyCount &&
+        snapshot.requestGeneration != 0ULL && snapshot.requestGeneration == process.requestGeneration &&
+        snapshot.completedHoldRequestSequence >= process.returnStopSequence &&
+        std::isfinite(snapshot.lengthPulse) && snapshot.lengthPulse > 0.0 &&
+        std::isfinite(snapshot.heldS) && snapshot.heldS >= 0.0 && snapshot.heldS <= snapshot.lengthPulse &&
+        HoldDoubleBits(snapshot.returnedS) == HoldDoubleBits(snapshot.heldS) &&
+        IsGapPathAutomaticNormalSameThread() && IsGapPathCurrentSampleProvenSameThread())
+    {
+        process.completedFence = snapshot.completedHoldRequestSequence;
+        process.heldSBits = HoldDoubleBits(snapshot.heldS);
+        process.returnedSBits = HoldDoubleBits(snapshot.returnedS);
+        process.returnProven = true;
+        LogEDMPathProcessSameThread("RETURN_PROVEN");
+    }
+    if (m_pathHold.automaticObservedReturns == 1ULL && !process.returnProven)
+    {
+        // Both final-return callers stop this scan on false. No BUDGET_DONE,
+        // source continuation, or PASS follows incomplete EDM03 evidence.
+        RejectGapPathSimulationSameThread("EDM03_RETURN_EVIDENCE_INCOMPLETE", &snapshot);
+        return false;
+    }
+    return true;
+}
+
+// EDM05 verifies one return-leg interruption. EDM06 repeats that full proof
+// without reusing a prior cycle. J5 #3 never replaces return authorization #2.
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ObserveEDMReturnProbeMotionSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept
+{
+    auto& process = m_edmPathProcess;
+    if (!process.active) return true;
+    const std::uint64_t current = process.repeated ? process.cycleIndex : 1ULL;
+    const std::uint64_t base = current == 0ULL ? 0ULL : current - 1ULL;
+    if (!process.returnProbe ||
+        (process.repeated ? (process.cycleLimit < 2U || process.cycleLimit > 8U ||
+            current == 0ULL || current > process.cycleLimit ||
+            process.completedCycles != (process.returnProven ? current : base)) : process.cycleLimit != 1U) ||
+        m_pathHold.cycleLimit != process.cycleLimit || !m_gapPath.active || !m_gapPath.repeatedLowRetreat ||
+        !m_gapPath.returnLowTest || !m_gapPath.repeatedReturnLow || m_gapPath.returnProbeLimit != 1U ||
+        m_gapPath.returnProbeHoldCount > 1U || m_gapPath.returnProbeResumeCount > m_gapPath.returnProbeHoldCount ||
+        m_pathHold.automaticObservedReturns < base || m_pathHold.automaticObservedReturns > current)
+    {
+        RejectGapPathSimulationSameThread("EDM05_PROBE_STATE", &snapshot);
+        return false;
+    }
+    if (!process.bound || !m_pathHold.bound || snapshot.publicationSequence == 0ULL || snapshot.admissionPending)
+    {
+        if (m_pathHold.automaticObservedReturns == current)
+        {
+            RejectGapPathSimulationSameThread("EDM05_RETURN_EVIDENCE_UNAVAILABLE", &snapshot);
+            return false;
+        }
+        return true;
+    }
+    if (process.run != m_pathHold.run || process.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        process.cache != m_pathHold.cache || process.cache != GetBaseProgramCache().GetGeneration() ||
+        process.dispatch != m_pathHold.dispatch || process.commit != m_pathHold.commit ||
+        !HoldIdentityEqual(process.identity, m_pathHold.identity) ||
+        !HoldTranslationIdentityEqual(snapshot, process.identity, CoordSys, process.translationGeneration) ||
+        process.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !process.lease.Matches(m_pathHold.lease) || !process.lease.Matches(m_programMotionLease) ||
+        !snapshot.ownerLease.Matches(process.lease) || !m_motion.IsMotionOwnerLeaseCurrent(process.lease) ||
+        !snapshot.crossSegment || !snapshot.requireReturnAuthorization || snapshot.boundaryOnly ||
+        snapshot.cycleLimit != process.cycleLimit || snapshot.historyCount != m_pathHoldView.completedCount ||
+        snapshot.activeOrdinal > snapshot.historyCount ||
+        snapshot.publicationSequence < process.publication || snapshot.requestGeneration == 0ULL ||
+        (m_edmSourceSession.active && (!IsEDMSourceSessionScopeValidSameThread() ||
+            snapshot.publicationSequence <= m_edmSourceSession.previousPublication ||
+            snapshot.requestGeneration == m_edmSourceSession.previousRequestGeneration)) ||
+        (process.requestGeneration != 0ULL && process.requestGeneration != snapshot.requestGeneration) ||
+        snapshot.returnCount < base || snapshot.returnCount > current ||
+        snapshot.retreatCount < base || snapshot.retreatCount > current || snapshot.retreatCount < snapshot.returnCount ||
+        (process.repeated && snapshot.phase != MotionPathCoreHoldExcursionPhase::ARMED &&
+            snapshot.phase != MotionPathCoreHoldExcursionPhase::RETREATING &&
+            snapshot.phase != MotionPathCoreHoldExcursionPhase::WAIT_RETURN &&
+            snapshot.phase != MotionPathCoreHoldExcursionPhase::RETURNING &&
+            snapshot.phase != MotionPathCoreHoldExcursionPhase::COMPLETE) ||
+        !std::isfinite(snapshot.activeS) || snapshot.activeS < 0.0)
+    {
+        RejectGapPathSimulationSameThread("EDM05_MOTION_EVIDENCE_SCOPE", &snapshot);
+        return false;
+    }
+    // RT may retain the preceding COMPLETE while the original source moves
+    // forward and while a new start waits to be consumed. It is not this cycle.
+    const bool priorComplete = process.repeated && base != 0ULL &&
+        snapshot.phase == MotionPathCoreHoldExcursionPhase::COMPLETE &&
+        snapshot.retreatCount == base && snapshot.returnCount == base;
+    if (priorComplete && (process.previousCompletedFence == 0ULL ||
+        snapshot.completedHoldRequestSequence != process.previousCompletedFence ||
+        snapshot.publicationSequence < process.previousPublication ||
+        HoldDoubleBits(snapshot.heldS) != process.previousReturnedSBits ||
+        HoldDoubleBits(snapshot.returnedS) != process.previousReturnedSBits))
+    {
+        RejectGapPathSimulationSameThread("EDM06_PRIOR_COMPLETION_CHANGED", &snapshot);
+        return false;
+    }
+    if (process.retreatSeen &&
+        (snapshot.phase == MotionPathCoreHoldExcursionPhase::WAIT_RETURN ||
+            snapshot.phase == MotionPathCoreHoldExcursionPhase::RETURNING ||
+            snapshot.phase == MotionPathCoreHoldExcursionPhase::COMPLETE) &&
+        HoldDoubleBits(snapshot.heldS) != process.heldSBits)
+    {
+        RejectGapPathSimulationSameThread("EDM05_ENDPOINT_CHANGED", &snapshot);
+        return false;
+    }
+    process.publication = snapshot.publicationSequence;
+    process.requestGeneration = snapshot.requestGeneration;
+    const bool originalStop = !m_gapPath.returnHold && snapshot.retreatCount == base && snapshot.returnCount == base &&
+        (base == 0ULL ? snapshot.phase == MotionPathCoreHoldExcursionPhase::ARMED : priorComplete);
+    const bool retreatComplete = snapshot.phase == MotionPathCoreHoldExcursionPhase::WAIT_RETURN &&
+        snapshot.retreatCount == current && snapshot.returnCount == base &&
+        process.stopSequence > process.previousCompletedFence && m_pathHold.requested && m_pathHold.startCommitted &&
+        m_pathHold.requestedHoldSequence == process.stopSequence;
+    if (retreatComplete && !process.retreatSeen)
+    {
+        if (!std::isfinite(snapshot.heldS) || !std::isfinite(snapshot.lengthPulse) ||
+            snapshot.lengthPulse != m_pathHoldView.original.lengthPulse || snapshot.lengthPulse <= 0.0 ||
+            snapshot.heldS < 0.0 || snapshot.heldS > snapshot.lengthPulse)
+        {
+            RejectGapPathSimulationSameThread("EDM05_RETREAT_ENDPOINT_INVALID", &snapshot);
+            return false;
+        }
+        process.retreatSeen = true;
+        process.heldSBits = HoldDoubleBits(snapshot.heldS);
+        process.returnNormalSequenceFloor = m_gapInput.Current().sequence;
+        process.returnNormalTimeFloor = m_gapPath.lastServiceMs;
+        LogEDMPathProcessSameThread("RETREAT_ENDPOINT");
+    }
+    const bool returning = snapshot.phase == MotionPathCoreHoldExcursionPhase::RETURNING &&
+        process.retreatSeen && process.returnStopSequence > process.stopSequence &&
+        snapshot.retreatCount == current && snapshot.returnCount == base &&
+        m_pathHold.requested && m_pathHold.startCommitted && m_pathHold.returnHoldRequested &&
+        m_pathHold.returnHoldRetreatCount == current && m_pathHold.requestedHoldSequence == process.returnStopSequence &&
+        snapshot.holdRequestSequence == process.returnStopSequence &&
+        HoldDoubleBits(snapshot.heldS) == process.heldSBits &&
+        snapshot.completedHoldRequestSequence < process.returnStopSequence;
+    if (returning && !process.returnSeen)
+    {
+        process.returnSeen = true;
+        LogEDMPathProcessSameThread("RETURNING");
+    }
+    if (m_state == NCState::HOLD && m_pathHold.automaticHoldOwned && IsProgramFeedHoldResumeCandidate())
+    {
+        const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
+        const bool exactStop = boundary.sequence == m_pathHold.automaticBoundarySequence &&
+            boundary.sequence != 0ULL && boundary.dispatchId == process.dispatch &&
+            boundary.requestExecutionEpoch == process.identity.epoch &&
+            boundary.requestOwner == process.lease.owner && boundary.requestOwnerGeneration == process.lease.generation &&
+            boundary.expectedSettleRequestSequence == m_pathHold.automaticSettleSequence &&
+            m_pathHold.automaticSettleSequence != MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
+            m_feedHoldNCSettleRequestSequence == m_pathHold.automaticSettleSequence &&
+            boundary.acknowledged && !boundary.failed && !boundary.cancelled && !boundary.acknowledgeLost &&
+            !boundary.resumeApplied && boundary.motion.settleProofValid && boundary.motion.ncSettled &&
+            boundary.motion.settleRequestSequence == m_pathHold.automaticSettleSequence;
+        if (m_edmSourceSession.active && exactStop && originalStop && process.stopSequence == 0ULL &&
+            m_pathHold.automaticSettleSequence <= m_edmSourceSession.previousFence)
+        {
+            RejectGapPathSimulationSameThread("EDM08_REUSED_SOURCE_STOP", &snapshot);
+            return false;
+        }
+        if (exactStop && originalStop && process.stopSequence == 0ULL && snapshot.ready &&
+            snapshot.holdRequestSequence == m_pathHold.automaticSettleSequence &&
+            m_pathHold.automaticSettleSequence > process.previousCompletedFence &&
+            snapshot.publicationSequence > process.previousPublication)
+        {
+            if (!CompleteEDMStopWaitSameThread(1U, m_pathHold.automaticSettleSequence)) return false;
+            process.stopSequence = m_pathHold.automaticSettleSequence;
+            process.stopPublication = snapshot.publicationSequence;
+            LogEDMPathProcessSameThread("STOP_PROVEN");
+        }
+        if (exactStop && retreatComplete && m_gapPath.returnHold && process.returnStopSequence == 0ULL &&
+            snapshot.ready && snapshot.holdRequestSequence == m_pathHold.automaticSettleSequence &&
+            m_pathHold.automaticSettleSequence > process.stopSequence &&
+            snapshot.publicationSequence > process.stopPublication)
+        {
+            if (!CompleteEDMStopWaitSameThread(2U, m_pathHold.automaticSettleSequence)) return false;
+            process.returnStopSequence = m_pathHold.automaticSettleSequence;
+            process.returnStopPublication = snapshot.publicationSequence;
+            process.returnNormalSequenceFloor = m_gapInput.Current().sequence;
+            process.returnNormalTimeFloor = m_gapPath.lastServiceMs;
+            if (!ArmEDMRecoveryWaitSameThread(2U)) return false;
+            LogEDMPathProcessSameThread("RETURN_STOP_PROVEN");
+        }
+        // RETURNING intentionally keeps snapshot.holdRequestSequence at #2.
+        // Its coherent J5 boundary proves #3 even though snapshot.ready is false.
+        if (exactStop && returning && m_gapPath.returnRehold && m_gapPath.returnLowInjected &&
+            !m_gapPath.returnResumeApplied && m_gapPath.returnProbeHoldCount == 1U &&
+            m_gapPath.returnProbeResumeCount == 0U && process.probeStopSequence == 0ULL &&
+            m_gapPath.returnReholdSequence == m_pathHold.automaticSettleSequence &&
+            m_pathHold.automaticSettleSequence > process.returnStopSequence &&
+            snapshot.publicationSequence > process.returnStopPublication)
+        {
+            if (!CompleteEDMStopWaitSameThread(3U, m_pathHold.automaticSettleSequence)) return false;
+            process.probeStopSequence = m_pathHold.automaticSettleSequence;
+            process.probeStopPublication = snapshot.publicationSequence;
+            process.probeStopOrdinal = snapshot.activeOrdinal;
+            process.probeStopSBits = HoldDoubleBits(snapshot.activeS);
+            process.probeNormalSequenceFloor = m_gapInput.Current().sequence;
+            process.probeNormalTimeFloor = m_gapPath.lastServiceMs;
+            if (!ArmEDMRecoveryWaitSameThread(3U)) return false;
+            LogEDMPathProcessSameThread("RETURN_LOW_STOP_PROVEN");
+        }
+    }
+    if (m_gapPath.returnResumeApplied && !process.probeResumeProven)
+    {
+        const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
+        if (!returning || m_state != NCState::RUN || m_pathHold.automaticHoldOwned || m_pathHold.automaticAdmissionOwned ||
+            process.probeStopSequence <= process.returnStopSequence ||
+            m_gapPath.returnReholdSequence != process.probeStopSequence ||
+            m_feedHoldNCSettleRequestSequence != process.probeStopSequence ||
+            m_gapPath.returnProbeHoldCount != 1U || m_gapPath.returnProbeResumeCount != 1U ||
+            snapshot.publicationSequence < process.probeStopPublication ||
+            boundary.sequence == 0ULL || boundary.dispatchId != process.dispatch ||
+            boundary.requestExecutionEpoch != process.identity.epoch || boundary.requestOwner != process.lease.owner ||
+            boundary.requestOwnerGeneration != process.lease.generation ||
+            boundary.expectedSettleRequestSequence != process.probeStopSequence ||
+            !boundary.acknowledged || boundary.failed || boundary.cancelled || boundary.acknowledgeLost ||
+            // Live settle evidence may be withdrawn once Apply releases the
+            // override. The exact pre-Apply J5 proof is retained above.
+            !boundary.resumeApplied ||
+            // Prepare/Commit age-only polls can cross a millisecond after the
+            // admission sample. Verify that same bounded, qualified NORMAL;
+            // successful Apply does not acquire another sample in this scan.
+            !IsGapPathAutomaticNormalSameThread())
+        {
+            RejectGapPathSimulationSameThread("EDM05_SAME_LEG_RESUME_PROOF", &snapshot);
+            return false;
+        }
+        process.probeResumeProven = true;
+        process.probeResumePublication = snapshot.publicationSequence;
+        process.probeStopOrdinal = snapshot.activeOrdinal;
+        process.probeStopSBits = HoldDoubleBits(snapshot.activeS);
+        LogEDMPathProcessSameThread("RETURN_LOW_RESUME_PROVEN");
+    }
+    const bool complete = snapshot.phase == MotionPathCoreHoldExcursionPhase::COMPLETE &&
+        snapshot.returnCount == current && snapshot.retreatCount == current;
+    double stoppedS = 0.0;
+    std::memcpy(&stoppedS, &process.probeStopSBits, sizeof(stoppedS));
+    double previousReturnedS = 0.0;
+    std::memcpy(&previousReturnedS, &process.previousReturnedSBits, sizeof(previousReturnedS));
+    const double advanceS = complete ? snapshot.returnedS : snapshot.activeS;
+    const bool pastStop = std::isfinite(stoppedS) && std::isfinite(advanceS) &&
+        (snapshot.activeOrdinal > process.probeStopOrdinal ||
+            (snapshot.activeOrdinal == process.probeStopOrdinal && advanceS > stoppedS));
+    // A new COMPLETE can also prove movement if NC did not observe an
+    // intermediate RETURNING publication. Local S resets at historical seams.
+    if (process.probeResumeProven && !process.probeAdvanceSeen && (returning || complete) &&
+        m_state == NCState::RUN && !m_pathHold.automaticHoldOwned && !m_pathHold.automaticAdmissionOwned &&
+        snapshot.publicationSequence > process.probeResumePublication && pastStop)
+    {
+        process.probeAdvanceSeen = true;
+        LogEDMPathProcessSameThread("RETURN_LOW_ADVANCE_PROVEN");
+    }
+    // The ordinary P9 validator already ran before the accepted return count
+    // changes to current. Do not run that pre-count validator again in this hook.
+    if (!process.returnProven && m_pathHold.automaticObservedReturns == current && complete &&
+        (process.stopAckLimitMs == 0U || (process.stopWaitKind == 0U && process.stopProvenMask == 7U &&
+            process.stopWaitSequence == process.probeStopSequence && process.stopWaitCycle == process.cycleIndex &&
+            process.stopWaitSource == m_edmSourceSession.sourceIndex &&
+            process.stopProvenElapsedMs[0] < process.stopAckLimitMs &&
+            process.stopProvenElapsedMs[1] < process.stopAckLimitMs &&
+            process.stopProvenElapsedMs[2] < process.stopAckLimitMs)) &&
+        (process.recoveryLimitMs == 0U || (process.recoveryWaitKind == 0U &&
+            process.recoveryReturnAppliedSequence == process.returnStopSequence &&
+            process.recoveryProbeAppliedSequence == process.probeStopSequence)) &&
+        (!process.repeated || process.completedCycles == base) &&
+        process.retreatSeen && process.returnSeen && process.stopSequence != 0ULL &&
+        process.returnStopSequence > process.stopSequence && process.probeStopSequence > process.returnStopSequence &&
+        process.stopSequence > process.previousCompletedFence && process.stopPublication > process.previousPublication &&
+        process.returnStopPublication > process.stopPublication &&
+        process.probeStopPublication > process.returnStopPublication && process.probeResumeProven && process.probeAdvanceSeen && pastStop &&
+        m_state == NCState::RUN && !m_pathHold.automaticHoldOwned && !m_pathHold.automaticAdmissionOwned &&
+        m_pathHold.requested && m_pathHold.startCommitted && m_pathHold.requestedHoldSequence == process.returnStopSequence &&
+        m_gapPath.returnLowInjected && m_gapPath.returnRehold && m_gapPath.returnResumeApplied &&
+        m_gapPath.returnProbeHoldCount == 1U && m_gapPath.returnProbeResumeCount == 1U &&
+        m_gapPath.returnReholdSequence == process.probeStopSequence &&
+        snapshot.retreatCount == current && snapshot.returnCount == current && snapshot.activeOrdinal == snapshot.historyCount &&
+        (snapshot.holdRequestSequence == process.returnStopSequence || snapshot.holdRequestSequence == process.probeStopSequence) &&
+        snapshot.completedHoldRequestSequence >= process.probeStopSequence &&
+        snapshot.publicationSequence > process.probeResumePublication &&
+        std::isfinite(snapshot.lengthPulse) && snapshot.lengthPulse > 0.0 && snapshot.lengthPulse == m_pathHoldView.original.lengthPulse &&
+        std::isfinite(snapshot.heldS) && snapshot.heldS >= 0.0 && snapshot.heldS <= snapshot.lengthPulse &&
+        (base == 0ULL || (std::isfinite(previousReturnedS) && snapshot.heldS > previousReturnedS)) &&
+        HoldDoubleBits(snapshot.heldS) == process.heldSBits &&
+        HoldDoubleBits(snapshot.returnedS) == process.heldSBits &&
+        IsGapPathAutomaticNormalSameThread() && IsGapPathCurrentSampleProvenSameThread())
+    {
+        process.completedFence = snapshot.completedHoldRequestSequence;
+        process.heldSBits = HoldDoubleBits(snapshot.heldS);
+        process.returnedSBits = HoldDoubleBits(snapshot.returnedS);
+        process.returnProven = true;
+        process.completedCycles = static_cast<std::uint8_t>(current);
+        LogEDMPathProcessSameThread(process.repeated ? "CYCLE_PASS" : "RETURN_PROVEN");
+    }
+    if (m_pathHold.automaticObservedReturns == current && !process.returnProven)
+    {
+        RejectGapPathSimulationSameThread("EDM05_RETURN_EVIDENCE_INCOMPLETE", &snapshot);
+        return false;
+    }
+    return true;
+}
+
+// EDM04 keeps P22's single-cycle observer unchanged. These proofs belong to
+// one bounded P23 source, with a separate prior-completion fence for each loop.
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ObserveEDMRepeatedPathProcessMotionSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept
+{
+    auto& process = m_edmPathProcess;
+    if (!process.active) return true;
+    if (!process.repeated || process.cycleLimit < 2U || process.cycleLimit > 8U ||
+        process.cycleIndex < 1U || process.cycleIndex > process.cycleLimit ||
+        process.completedCycles != (process.returnProven ? process.cycleIndex : process.cycleIndex - 1U))
+    {
+        RejectGapPathSimulationSameThread("EDM04_CYCLE_STATE", &snapshot);
+        return false;
+    }
+    const std::uint64_t base = process.cycleIndex - 1U;
+    const std::uint64_t current = process.cycleIndex;
+    if (!process.bound || !m_pathHold.bound || snapshot.publicationSequence == 0ULL || snapshot.admissionPending)
+    {
+        if (m_pathHold.automaticObservedReturns > process.completedCycles)
+        {
+            RejectGapPathSimulationSameThread("EDM04_RETURN_EVIDENCE_UNAVAILABLE", &snapshot);
+            return false;
+        }
+        return true;
+    }
+    if (!m_gapPath.active || !m_gapPath.repeatedLowRetreat ||
+        m_pathHold.cycleLimit != process.cycleLimit ||
+        process.run != m_pathHold.run || process.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        process.cache != m_pathHold.cache || process.cache != GetBaseProgramCache().GetGeneration() ||
+        process.dispatch != m_pathHold.dispatch || process.commit != m_pathHold.commit ||
+        !HoldIdentityEqual(process.identity, m_pathHold.identity) ||
+        !HoldTranslationIdentityEqual(snapshot, process.identity, CoordSys, process.translationGeneration) ||
+        process.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !process.lease.Matches(m_pathHold.lease) || !process.lease.Matches(m_programMotionLease) ||
+        !snapshot.ownerLease.Matches(process.lease) || !m_motion.IsMotionOwnerLeaseCurrent(process.lease) ||
+        !snapshot.crossSegment || !snapshot.requireReturnAuthorization || snapshot.boundaryOnly ||
+        snapshot.cycleLimit != process.cycleLimit || snapshot.historyCount != m_pathHoldView.completedCount ||
+        snapshot.publicationSequence < process.publication || snapshot.requestGeneration == 0ULL ||
+        (process.requestGeneration != 0ULL && process.requestGeneration != snapshot.requestGeneration) ||
+        m_pathHold.automaticObservedReturns < base || m_pathHold.automaticObservedReturns > current ||
+        snapshot.retreatCount < base || snapshot.retreatCount > current ||
+        snapshot.returnCount < base || snapshot.returnCount > current || snapshot.returnCount > snapshot.retreatCount ||
+        (snapshot.phase != MotionPathCoreHoldExcursionPhase::ARMED &&
+            snapshot.phase != MotionPathCoreHoldExcursionPhase::RETREATING &&
+            snapshot.phase != MotionPathCoreHoldExcursionPhase::WAIT_RETURN &&
+            snapshot.phase != MotionPathCoreHoldExcursionPhase::RETURNING &&
+            snapshot.phase != MotionPathCoreHoldExcursionPhase::COMPLETE))
+    {
+        RejectGapPathSimulationSameThread("EDM04_MOTION_EVIDENCE_SCOPE", &snapshot);
+        return false;
+    }
+    // A repeated start can remain unconsumed while RT republishes the previous
+    // COMPLETE. Keep that exact completion valid without counting it again.
+    const bool priorComplete = base != 0ULL && snapshot.phase == MotionPathCoreHoldExcursionPhase::COMPLETE &&
+        snapshot.returnCount == base && snapshot.retreatCount == base;
+    if (priorComplete && (process.previousCompletedFence == 0ULL ||
+        snapshot.completedHoldRequestSequence != process.previousCompletedFence ||
+        snapshot.publicationSequence < process.previousPublication ||
+        HoldDoubleBits(snapshot.heldS) != process.previousReturnedSBits ||
+        HoldDoubleBits(snapshot.returnedS) != process.previousReturnedSBits))
+    {
+        RejectGapPathSimulationSameThread("EDM04_PRIOR_COMPLETION_CHANGED", &snapshot);
+        return false;
+    }
+    process.publication = snapshot.publicationSequence;
+    process.requestGeneration = snapshot.requestGeneration;
+    const bool originalStop = !m_gapPath.returnHold && snapshot.retreatCount == base && snapshot.returnCount == base &&
+        (base == 0ULL ? snapshot.phase == MotionPathCoreHoldExcursionPhase::ARMED : priorComplete);
+    const bool retreatComplete = snapshot.phase == MotionPathCoreHoldExcursionPhase::WAIT_RETURN &&
+        snapshot.retreatCount == current && snapshot.returnCount == base &&
+        process.stopSequence > process.previousCompletedFence &&
+        m_pathHold.requested && m_pathHold.startCommitted &&
+        m_pathHold.requestedHoldSequence == process.stopSequence;
+    if (retreatComplete && !process.retreatSeen)
+    {
+        process.retreatSeen = true;
+        process.returnNormalSequenceFloor = m_gapInput.Current().sequence;
+        process.returnNormalTimeFloor = m_gapPath.lastServiceMs;
+        LogEDMPathProcessSameThread("RETREAT_ENDPOINT");
+    }
+    if (m_state == NCState::HOLD && m_pathHold.automaticHoldOwned && IsProgramFeedHoldResumeCandidate())
+    {
+        const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
+        const bool exactStop = boundary.sequence == m_pathHold.automaticBoundarySequence &&
+            boundary.sequence != 0ULL && boundary.dispatchId == process.dispatch &&
+            boundary.requestExecutionEpoch == process.identity.epoch &&
+            boundary.requestOwner == process.lease.owner && boundary.requestOwnerGeneration == process.lease.generation &&
+            boundary.expectedSettleRequestSequence == m_pathHold.automaticSettleSequence &&
+            m_pathHold.automaticSettleSequence != MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID &&
+            m_feedHoldNCSettleRequestSequence == m_pathHold.automaticSettleSequence &&
+            boundary.acknowledged && !boundary.failed && !boundary.cancelled && !boundary.acknowledgeLost &&
+            !boundary.resumeApplied && boundary.motion.settleProofValid && boundary.motion.ncSettled &&
+            boundary.motion.settleRequestSequence == m_pathHold.automaticSettleSequence &&
+            snapshot.ready && snapshot.holdRequestSequence == m_pathHold.automaticSettleSequence;
+        if (exactStop && originalStop && process.stopSequence == 0ULL &&
+            m_pathHold.automaticSettleSequence > process.previousCompletedFence &&
+            snapshot.publicationSequence > process.previousPublication)
+        {
+            process.stopSequence = m_pathHold.automaticSettleSequence;
+            process.stopPublication = snapshot.publicationSequence;
+            LogEDMPathProcessSameThread("STOP_PROVEN");
+        }
+        if (exactStop && retreatComplete && m_gapPath.returnHold && process.returnStopSequence == 0ULL &&
+            m_pathHold.automaticSettleSequence > process.stopSequence &&
+            snapshot.publicationSequence > process.stopPublication)
+        {
+            process.returnStopSequence = m_pathHold.automaticSettleSequence;
+            process.returnStopPublication = snapshot.publicationSequence;
+            // Do not Start the Controller while LOW. Only fence the return
+            // signal; a subsequently acquired NORMAL must authorize this leg.
+            process.returnNormalSequenceFloor = m_gapInput.Current().sequence;
+            process.returnNormalTimeFloor = m_gapPath.lastServiceMs;
+            LogEDMPathProcessSameThread("RETURN_STOP_PROVEN");
+        }
+    }
+    if (snapshot.phase == MotionPathCoreHoldExcursionPhase::RETURNING && process.retreatSeen &&
+        process.returnStopSequence > process.stopSequence && !process.returnSeen)
+    {
+        process.returnSeen = true;
+        LogEDMPathProcessSameThread("RETURNING");
+    }
+    double previousReturnedS = 0.0;
+    std::memcpy(&previousReturnedS, &process.previousReturnedSBits, sizeof(previousReturnedS));
+    // The first observer call may see new COMPLETE before ordinary code
+    // accepts returnCount. Only its second, post-validation call records PASS.
+    if (!process.returnProven && m_pathHold.automaticObservedReturns == current &&
+        process.completedCycles == base && process.retreatSeen &&
+        process.stopSequence > process.previousCompletedFence && process.returnStopSequence > process.stopSequence &&
+        process.stopPublication > process.previousPublication && process.returnStopPublication > process.stopPublication &&
+        m_state == NCState::RUN && !m_pathHold.automaticHoldOwned && !m_pathHold.automaticAdmissionOwned &&
+        m_pathHold.requested && m_pathHold.startCommitted &&
+        m_pathHold.requestedHoldSequence == process.returnStopSequence &&
+        snapshot.phase == MotionPathCoreHoldExcursionPhase::COMPLETE &&
+        snapshot.retreatCount == current && snapshot.returnCount == current &&
+        snapshot.activeOrdinal == snapshot.historyCount && snapshot.holdRequestSequence == process.returnStopSequence &&
+        snapshot.completedHoldRequestSequence >= process.returnStopSequence &&
+        snapshot.publicationSequence > process.returnStopPublication &&
+        std::isfinite(snapshot.lengthPulse) && snapshot.lengthPulse > 0.0 &&
+        snapshot.lengthPulse == m_pathHoldView.original.lengthPulse &&
+        std::isfinite(snapshot.heldS) && snapshot.heldS >= 0.0 && snapshot.heldS <= snapshot.lengthPulse &&
+        (base == 0ULL || (std::isfinite(previousReturnedS) && snapshot.heldS > previousReturnedS)) &&
+        HoldDoubleBits(snapshot.returnedS) == HoldDoubleBits(snapshot.heldS) &&
+        IsGapPathAutomaticNormalSameThread() && IsGapPathCurrentSampleProvenSameThread())
+    {
+        process.completedFence = snapshot.completedHoldRequestSequence;
+        process.heldSBits = HoldDoubleBits(snapshot.heldS);
+        process.returnedSBits = HoldDoubleBits(snapshot.returnedS);
+        process.returnProven = true;
+        process.completedCycles = process.cycleIndex;
+        LogEDMPathProcessSameThread("CYCLE_PASS");
+    }
+    if (m_pathHold.automaticObservedReturns == current && !process.returnProven)
+    {
+        RejectGapPathSimulationSameThread("EDM04_RETURN_EVIDENCE_INCOMPLETE", &snapshot);
+        return false;
+    }
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::RearmEDMPathProcessCycleSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept
+{
+    auto& process = m_edmPathProcess;
+    if (!process.active || !process.repeated) return true;
+    const bool probeCycleProven = !process.returnProbe ||
+        (process.probeResumeProven && process.probeAdvanceSeen &&
+            process.probeStopSequence > process.returnStopSequence && process.completedFence >= process.probeStopSequence &&
+            process.probeStopPublication > process.returnStopPublication &&
+            process.probeResumePublication >= process.probeStopPublication &&
+            m_gapPath.returnCompletedFence == process.completedFence &&
+            m_gapPath.returnCompletedHold == process.returnStopSequence &&
+            m_gapPath.returnCompletedRehold == process.probeStopSequence &&
+            m_gapPath.returnCompletedSBits == process.returnedSBits &&
+            !m_gapPath.returnWatchStarted && !m_gapPath.returnLowInjected &&
+            !m_gapPath.returnRehold && !m_gapPath.returnResumeApplied &&
+            m_gapPath.returnProbeHoldCount == 0U && m_gapPath.returnProbeResumeCount == 0U);
+    if (!process.returnProven || process.completedCycles != process.cycleIndex ||
+        (process.stopAckLimitMs != 0U && (process.stopWaitKind != 0U || process.stopProvenMask != 7U ||
+            process.stopWaitSequence != process.probeStopSequence || process.stopWaitCycle != process.cycleIndex ||
+            process.stopWaitSource != m_edmSourceSession.sourceIndex ||
+            process.stopProvenElapsedMs[0] >= process.stopAckLimitMs ||
+            process.stopProvenElapsedMs[1] >= process.stopAckLimitMs ||
+            process.stopProvenElapsedMs[2] >= process.stopAckLimitMs)) ||
+        (process.recoveryLimitMs != 0U && (process.recoveryWaitKind != 0U ||
+            process.recoveryReturnAppliedSequence != process.returnStopSequence ||
+            process.recoveryProbeAppliedSequence != process.probeStopSequence)) ||
+        !probeCycleProven ||
+        process.cycleIndex >= process.cycleLimit || process.cycleLimit < 2U || process.cycleLimit > 8U ||
+        m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY || Close_System_Com_flag ||
+        AlarmManager::GetInstance().HasAlarm() || m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        !m_pathHold.bound || !m_pathHold.automaticEnabled || m_pathHold.automaticHoldOwned ||
+        m_pathHold.automaticAdmissionOwned || m_pathHold.cycleLimit != process.cycleLimit ||
+        process.run != m_pathHold.run || process.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        process.cache != m_pathHold.cache || process.cache != GetBaseProgramCache().GetGeneration() ||
+        process.dispatch != m_pathHold.dispatch || process.commit != m_pathHold.commit ||
+        !HoldIdentityEqual(process.identity, m_pathHold.identity) ||
+        process.identity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !process.lease.Matches(m_programMotionLease) || !process.lease.Matches(m_pathHold.lease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(process.lease) ||
+        snapshot.phase != MotionPathCoreHoldExcursionPhase::COMPLETE ||
+        snapshot.retreatCount != process.completedCycles || snapshot.returnCount != process.completedCycles ||
+        m_pathHold.automaticObservedReturns != process.completedCycles ||
+        snapshot.completedHoldRequestSequence != process.completedFence ||
+        snapshot.requestGeneration != process.requestGeneration || snapshot.publicationSequence != process.publication ||
+        HoldDoubleBits(snapshot.heldS) != process.heldSBits || HoldDoubleBits(snapshot.returnedS) != process.returnedSBits ||
+        !HoldTranslationIdentityEqual(snapshot, process.identity, CoordSys, process.translationGeneration) ||
+        !snapshot.ownerLease.Matches(process.lease) ||
+        m_pathHold.requestedHoldSequence != process.returnStopSequence ||
+        !std::isfinite(m_pathHold.automaticNextS) || m_pathHold.automaticNextS <= snapshot.returnedS ||
+        m_pathHold.automaticNextS >= snapshot.lengthPulse ||
+        !IsEDMPathProcessSignalSameThread(true) || m_gapPath.held || m_gapPath.lowInjected ||
+        m_gapPath.returnHold || m_gapPath.recoveryInjected)
+    {
+        RejectGapPathSimulationSameThread("EDM04_CYCLE_REARM_PROOF", &snapshot);
+        return false;
+    }
+    process.previousCompletedFence = process.completedFence;
+    process.previousPublication = snapshot.publicationSequence;
+    process.previousReturnedSBits = process.returnedSBits;
+    ++process.cycleIndex;
+    process.stopSequence = process.returnStopSequence = process.completedFence = 0ULL;
+    process.stopPublication = process.returnStopPublication = 0ULL;
+    process.heldSBits = process.returnedSBits = 0ULL;
+    process.returnNormalSequenceFloor = process.returnNormalTimeFloor = 0ULL;
+    process.recoveryWaitKind = 0U;
+    process.recoveryWaitStopSequence = process.recoveryWaitStartMs = 0ULL;
+    process.recoveryReturnAppliedSequence = process.recoveryProbeAppliedSequence = 0ULL;
+    process.stopWaitKind = process.stopProvenMask = 0U;
+    process.stopWaitSource = process.stopWaitCycle = 0U;
+    process.stopWaitStartMs = process.stopWaitNowMs = 0ULL;
+    process.stopWaitSequence = process.stopWaitBoundarySequence = 0ULL;
+    for (auto& elapsed : process.stopProvenElapsedMs) elapsed = 0U;
+    process.retreatSeen = process.returnSeen = process.returnProven = false;
+    if (process.returnProbe)
+    {
+        process.probeStopSequence = process.probeStopPublication = 0ULL;
+        process.probeNormalSequenceFloor = process.probeNormalTimeFloor = 0ULL;
+        process.probeStopSBits = process.probeResumePublication = 0ULL;
+        process.probeStopOrdinal = 0U;
+        process.probeResumeProven = process.probeAdvanceSeen = false;
+    }
+    const auto& decision = process.controller.Step(EDMProcessSimulation::Command::Start,
+        m_gapInput.Current(), m_gapPath.lastServiceMs);
+    if (decision.state != EDMProcessSimulation::State::WaitGap || decision.simulatedPermit || decision.retreatRequested)
+    {
+        RejectGapPathSimulationSameThread("EDM04_CYCLE_START_FENCE", &snapshot);
+        return false;
+    }
+    LogEDMPathProcessSameThread("REARMED_FRESH_NORMAL");
+    return true;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::IsEDMDiagnosticQuietSameThread() const noexcept
+{
+    return m_edmSourceSession.active && m_edmSourceSession.stopAckLimitMs != 0U;
+}
+
+NC_PATH_HOLD_NOINLINE
+void NCManager::CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind kind) const noexcept
+{
+    const auto& s = m_edmSourceSession;
+    if (!s.configured || s.stopAckLimitMs == 0U) return;
+    auto& q = m_edmDiagnostics;
+    const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+    q.endPending = true;
+    if (q.captureSequence == maximum) q.serialSaturated = true;
+    else ++q.captureSequence;
+    if (q.serialSaturated || q.count == EDMDeferredDiagnosticState::Capacity)
+    {
+        if (q.dropped != maximum) ++q.dropped;
+        q.lastDroppedSequence = q.captureSequence;
+        q.lastDroppedRun = s.run;
+        return; // Diagnostic loss cannot revoke or grant any control authority.
+    }
+    auto& r = q.records[q.write];
+    const auto& p = m_edmPathProcess;
+    const auto& gap = m_gapInput.Current();
+    r.kind = kind; r.evt = q.captureSequence; r.run = s.run;
+    r.dispatch = p.dispatch; r.identity = p.identity; r.lease = p.lease;
+    r.cache = s.cache; r.commit = p.commit;
+    r.translationGeneration = s.translationGeneration; r.requestGeneration = p.requestGeneration;
+    r.serviceMs = m_gapPath.lastServiceMs; r.sampleMs = gap.sampledAtMs;
+    r.sampleSequence = gap.sequence;
+    r.stop = p.stopSequence; r.returnStop = p.returnStopSequence; r.probeStop = p.probeStopSequence;
+    r.jStop = p.stopWaitSequence; r.jStartMs = p.stopWaitStartMs; r.jNowMs = p.stopWaitNowMs;
+    r.hStop = p.recoveryWaitStopSequence; r.hStartMs = p.recoveryWaitStartMs;
+    r.applied2 = p.recoveryReturnAppliedSequence; r.applied3 = p.recoveryProbeAppliedSequence;
+    r.previousFence = p.previousCompletedFence; r.fence = p.completedFence;
+    r.heldS = p.heldSBits; r.returnedS = p.returnedSBits;
+    r.publication = p.publication; r.tailPublication = m_gapTail.publication;
+    r.stopAckLimitMs = s.stopAckLimitMs; r.recoveryLimitMs = s.recoveryLimitMs;
+    for (unsigned int i = 0U; i < 3U; ++i) r.ackMs[i] = p.stopProvenElapsedMs[i];
+    r.retained = m_pathReplayStore.Count();
+    r.source = s.sourceIndex; r.completed = s.completedSources; r.limit = s.sourceLimit;
+    r.cycle = p.cycleIndex; r.completedCycles = p.completedCycles; r.cyclesPerSource = s.cyclesPerSource;
+    r.jKind = p.stopWaitKind; r.jMask = p.stopProvenMask; r.hKind = p.recoveryWaitKind;
+    r.flags = static_cast<std::uint8_t>((p.retreatSeen ? 1U : 0U) |
+        (p.probeResumeProven ? 2U : 0U) | (p.probeAdvanceSeen ? 4U : 0U) |
+        (p.returnProven ? 8U : 0U) | (m_gapTail.active ? 16U : 0U) |
+        (m_gapTail.sampleSeen ? 32U : 0U) | (m_gapTail.endProven ? 64U : 0U));
+    q.write = (q.write + 1U) % EDMDeferredDiagnosticState::Capacity;
+    ++q.count;
+    if (q.enqueued != maximum) ++q.enqueued;
+}
+
+NC_PATH_HOLD_NOINLINE
+void NCManager::DrainEDMDiagnosticsSameThread() noexcept
+{
+    auto& q = m_edmDiagnostics;
+    if (!q.endPending) return;
+    const auto state = m_state.load(std::memory_order_acquire);
+    if ((state != NCState::IDLE && state != NCState::READY && state != NCState::P_END) ||
+        IsGapPathSimulationActiveSameThread() || m_gapTail.active || m_edmSourceSession.active ||
+        m_edmPathProcess.active || m_gapSignal.active || m_gapInlet.active || m_gapQueue.active ||
+        m_gapRecovery.active || m_gapPending.active || Close_System_Com_flag ||
+        AlarmManager::GetInstance().HasAlarm() || Homing.IsActive() ||
+        m_resetContinuationPhase != ResetContinuationPhase::IDLE || m_resetSafetyOutputHoldActive ||
+        m_programRunStartPending || m_pendingProgramRunPhase != ProgramRunStartPhase::IDLE ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !m_motion.IsGroupDone() ||
+        m_motion.GetCommandIngressSize() != 0U || m_motion.GetCommandReplaySize() != 0U) return;
+    const auto owner = m_motion.GetMotionOwnerLease().owner;
+    if ((owner != MotionOwner::NONE && owner != MotionOwner::IDLE_HOLD) ||
+        m_motion.GetAxisCommandMailboxDepth() != 0U) return;
+    if (q.count == 0U)
+    {
+        RtPrintf("[EDM13] phase=DIAG_END build=EDM13_FIX3 deferred=1 captured=%llu enqueued=%llu drained=%llu dropped=%llu lastDroppedEvt=%llu lastDroppedRun=%llu saturated=%u complete=%u\n",
+            static_cast<unsigned long long>(q.captureSequence), static_cast<unsigned long long>(q.enqueued),
+            static_cast<unsigned long long>(q.drained), static_cast<unsigned long long>(q.dropped),
+            static_cast<unsigned long long>(q.lastDroppedSequence), static_cast<unsigned long long>(q.lastDroppedRun),
+            q.serialSaturated ? 1U : 0U, (!q.serialSaturated && q.dropped == 0ULL && q.drained == q.enqueued) ? 1U : 0U);
+        q.endPending = false;
+        return; // The end marker is this loop's only console call.
+    }
+    const auto& r = q.records[q.read];
+    const char* phase = "UNKNOWN";
+    switch (r.kind)
+    {
+    case EDMDeferredDiagnosticKind::SESSION_ARMED: phase = "SESSION_ARMED"; break;
+    case EDMDeferredDiagnosticKind::SOURCE_FRESH: phase = "SOURCE_FRESH"; break;
+    case EDMDeferredDiagnosticKind::STOP_PROVEN: phase = "STOP_PROVEN"; break;
+    case EDMDeferredDiagnosticKind::RETURN_STOP_PROVEN: phase = "RETURN_STOP_PROVEN"; break;
+    case EDMDeferredDiagnosticKind::RETURN_LOW_STOP_PROVEN: phase = "RETURN_LOW_STOP_PROVEN"; break;
+    case EDMDeferredDiagnosticKind::RESUME_APPLIED: phase = "RESUME_APPLIED"; break;
+    case EDMDeferredDiagnosticKind::RETURN_LOW_RESUME_PROVEN: phase = "RETURN_LOW_RESUME_PROVEN"; break;
+    case EDMDeferredDiagnosticKind::RETURN_LOW_ADVANCE_PROVEN: phase = "RETURN_LOW_ADVANCE_PROVEN"; break;
+    case EDMDeferredDiagnosticKind::CYCLE_PASS: phase = "CYCLE_PASS"; break;
+    case EDMDeferredDiagnosticKind::REARMED_FRESH_NORMAL: phase = "REARMED_FRESH_NORMAL"; break;
+    case EDMDeferredDiagnosticKind::TAIL_NORMAL_PROVEN: phase = "TAIL_NORMAL_PROVEN"; break;
+    case EDMDeferredDiagnosticKind::SOURCE_PASS: phase = "SOURCE_PASS"; break;
+    case EDMDeferredDiagnosticKind::SUMMARY_PASS: phase = "SUMMARY_PASS"; break;
+    case EDMDeferredDiagnosticKind::SUMMARY_FAIL: phase = "SUMMARY_FAIL"; break;
+    case EDMDeferredDiagnosticKind::SUMMARY_CANCELLED: phase = "SUMMARY_CANCELLED"; break;
+    }
+    // FIX3: the real console truncates a call at 511 bytes. These four rows
+    // include LF and remain <=399/350/376/455 bytes even at full numeric widths.
+    // evt/run identify the same immutable record; phase is carried in part 1.
+    switch (q.diagPart)
+    {
+    case 0U:
+        RtPrintf("[EDM13] build=EDM13_FIX3 deferred=1 evt=%llu run=%llu part=1/4 phase=%s dispatch=%llu epoch=%llu seg=%llu idPC=%u idSource=%u owner=%u/%u cache=%llu commit=%llu translation=%llu generation=%llu end=0\n",
+            static_cast<unsigned long long>(r.evt), static_cast<unsigned long long>(r.run), phase,
+            static_cast<unsigned long long>(r.dispatch), static_cast<unsigned long long>(r.identity.epoch),
+            static_cast<unsigned long long>(r.identity.segmentId), static_cast<unsigned int>(r.identity.sourceBlockId),
+            static_cast<unsigned int>(r.identity.source), static_cast<unsigned int>(r.lease.owner),
+            static_cast<unsigned int>(r.lease.generation), static_cast<unsigned long long>(r.cache),
+            static_cast<unsigned long long>(r.commit), static_cast<unsigned long long>(r.translationGeneration),
+            static_cast<unsigned long long>(r.requestGeneration));
+        break;
+    case 1U:
+        RtPrintf("[EDM13] build=EDM13_FIX3 deferred=1 evt=%llu run=%llu part=2/4 source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u serviceMs=%llu sampleMs=%llu sample=%llu publication=%llu end=0\n",
+            static_cast<unsigned long long>(r.evt), static_cast<unsigned long long>(r.run),
+            static_cast<unsigned int>(r.source), static_cast<unsigned int>(r.completed), static_cast<unsigned int>(r.limit),
+            static_cast<unsigned int>(r.cycle), static_cast<unsigned int>(r.completedCycles),
+            static_cast<unsigned int>(r.cyclesPerSource), static_cast<unsigned long long>(r.serviceMs),
+            static_cast<unsigned long long>(r.sampleMs), static_cast<unsigned long long>(r.sampleSequence),
+            static_cast<unsigned long long>(r.publication));
+        break;
+    case 2U:
+        RtPrintf("[EDM13] build=EDM13_FIX3 deferred=1 evt=%llu run=%llu part=3/4 stop=%llu returnStop=%llu probeStop=%llu J=%u jKind=%u jMask=%u jStop=%llu jStartMs=%llu jNowMs=%llu ack1Ms=%u ack2Ms=%u ack3Ms=%u end=0\n",
+            static_cast<unsigned long long>(r.evt), static_cast<unsigned long long>(r.run),
+            static_cast<unsigned long long>(r.stop), static_cast<unsigned long long>(r.returnStop),
+            static_cast<unsigned long long>(r.probeStop), static_cast<unsigned int>(r.stopAckLimitMs),
+            static_cast<unsigned int>(r.jKind), static_cast<unsigned int>(r.jMask),
+            static_cast<unsigned long long>(r.jStop), static_cast<unsigned long long>(r.jStartMs),
+            static_cast<unsigned long long>(r.jNowMs), static_cast<unsigned int>(r.ackMs[0]),
+            static_cast<unsigned int>(r.ackMs[1]), static_cast<unsigned int>(r.ackMs[2]));
+        break;
+    case 3U:
+        RtPrintf("[EDM13] build=EDM13_FIX3 deferred=1 evt=%llu run=%llu part=4/4 H=%u hKind=%u hStop=%llu hStartMs=%llu applied2=%llu applied3=%llu previousFence=%llu fence=%llu heldS=%016llX returnedS=%016llX tailPub=%llu retained=%u flags=%u physicalPermit=0 discharge=0 end=1\n",
+            static_cast<unsigned long long>(r.evt), static_cast<unsigned long long>(r.run),
+            static_cast<unsigned int>(r.recoveryLimitMs), static_cast<unsigned int>(r.hKind),
+            static_cast<unsigned long long>(r.hStop), static_cast<unsigned long long>(r.hStartMs),
+            static_cast<unsigned long long>(r.applied2), static_cast<unsigned long long>(r.applied3),
+            static_cast<unsigned long long>(r.previousFence), static_cast<unsigned long long>(r.fence),
+            static_cast<unsigned long long>(r.heldS), static_cast<unsigned long long>(r.returnedS),
+            static_cast<unsigned long long>(r.tailPublication), static_cast<unsigned int>(r.retained),
+            static_cast<unsigned int>(r.flags));
+        break;
+    default:
+        return; // A bad diagnostic cursor grants no output or record retirement.
+    }
+    if (q.diagPart < 3U)
+    {
+        ++q.diagPart;
+        return;
+    }
+    q.diagPart = 0U;
+    q.read = (q.read + 1U) % EDMDeferredDiagnosticState::Capacity;
+    --q.count;
+    if (q.drained != (std::numeric_limits<std::uint64_t>::max)()) ++q.drained;
+}
+
+NC_PATH_HOLD_NOINLINE
+void NCManager::LogEDMPathProcessSameThread(const char* phase) const noexcept
+{
+    const auto& process = m_edmPathProcess;
+    if (!process.active) return;
+    if (IsEDMDiagnosticQuietSameThread())
+    {
+        if (phase == nullptr) return;
+        if (std::strcmp(phase, "START_FENCE") == 0) CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::SOURCE_FRESH);
+        else if (std::strcmp(phase, "STOP_PROVEN") == 0) CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::STOP_PROVEN);
+        else if (std::strcmp(phase, "RETURN_STOP_PROVEN") == 0) CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::RETURN_STOP_PROVEN);
+        else if (std::strcmp(phase, "RETURN_LOW_STOP_PROVEN") == 0) CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::RETURN_LOW_STOP_PROVEN);
+        else if (std::strcmp(phase, "RETURN_LOW_RESUME_PROVEN") == 0) CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::RETURN_LOW_RESUME_PROVEN);
+        else if (std::strcmp(phase, "RETURN_LOW_ADVANCE_PROVEN") == 0) CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::RETURN_LOW_ADVANCE_PROVEN);
+        else if (std::strcmp(phase, "CYCLE_PASS") == 0 || std::strcmp(phase, "RETURN_PROVEN") == 0)
+            CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::CYCLE_PASS);
+        else if (std::strcmp(phase, "REARMED_FRESH_NORMAL") == 0) CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::REARMED_FRESH_NORMAL);
+        return;
+    }
+    // P27: the endpoint latch is already retained for RETURN_STOP_PROVEN,
+    // CYCLE_PASS and fault evidence. Avoid this redundant synchronous output
+    // while waiting for J5; do not refresh samples or alter the caller's latch.
+    if (m_edmSourceSession.active && m_edmSourceSession.recoveryLimitMs != 0U &&
+        phase != nullptr && std::strcmp(phase, "RETREAT_ENDPOINT") == 0) return;
+    const auto& decision = process.controller.Current();
+    if (m_edmSourceSession.active)
+    {
+        // Keep one call per phase, including repeated-cycle handoff bursts.
+        if (m_edmSourceSession.stopAckLimitMs != 0U)
+            RtPrintf("[EDM13] phase=%s source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u stopAckLimitMs=%u jKind=%u jStop=%llu jStartMs=%llu jNowMs=%llu jMask=%u ack1Ms=%u ack2Ms=%u ack3Ms=%u recoveryLimitMs=%u wait=%u run=%llu dispatch=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu heldS=%016llX returnedS=%016llX physicalPermit=0 discharge=0\n",
+                phase, static_cast<unsigned int>(m_edmSourceSession.sourceIndex),
+                static_cast<unsigned int>(m_edmSourceSession.completedSources), static_cast<unsigned int>(m_edmSourceSession.sourceLimit),
+                static_cast<unsigned int>(process.cycleIndex), static_cast<unsigned int>(process.completedCycles),
+                static_cast<unsigned int>(m_edmSourceSession.cyclesPerSource), static_cast<unsigned int>(process.stopAckLimitMs),
+                static_cast<unsigned int>(process.stopWaitKind), static_cast<unsigned long long>(process.stopWaitSequence),
+                static_cast<unsigned long long>(process.stopWaitStartMs), static_cast<unsigned long long>(process.stopWaitNowMs),
+                static_cast<unsigned int>(process.stopProvenMask), static_cast<unsigned int>(process.stopProvenElapsedMs[0]),
+                static_cast<unsigned int>(process.stopProvenElapsedMs[1]), static_cast<unsigned int>(process.stopProvenElapsedMs[2]),
+                static_cast<unsigned int>(process.recoveryLimitMs), static_cast<unsigned int>(process.recoveryWaitKind),
+                static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+                static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+                static_cast<unsigned long long>(process.probeStopSequence), static_cast<unsigned long long>(process.completedFence),
+                static_cast<unsigned long long>(process.heldSBits), static_cast<unsigned long long>(process.returnedSBits));
+        else if (m_edmSourceSession.recoveryLimitMs != 0U)
+            RtPrintf("[EDM12] phase=%s source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u recoveryLimitMs=%u wait=%u waitStop=%llu startMs=%llu nowMs=%llu applied2=%llu applied3=%llu run=%llu dispatch=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu heldS=%016llX returnedS=%016llX physicalPermit=0 discharge=0\n",
+                phase, static_cast<unsigned int>(m_edmSourceSession.sourceIndex),
+                static_cast<unsigned int>(m_edmSourceSession.completedSources), static_cast<unsigned int>(m_edmSourceSession.sourceLimit),
+                static_cast<unsigned int>(process.cycleIndex), static_cast<unsigned int>(process.completedCycles),
+                static_cast<unsigned int>(m_edmSourceSession.cyclesPerSource), static_cast<unsigned int>(process.recoveryLimitMs),
+                static_cast<unsigned int>(process.recoveryWaitKind), static_cast<unsigned long long>(process.recoveryWaitStopSequence),
+                static_cast<unsigned long long>(process.recoveryWaitStartMs), static_cast<unsigned long long>(m_gapPath.lastServiceMs),
+                static_cast<unsigned long long>(process.recoveryReturnAppliedSequence), static_cast<unsigned long long>(process.recoveryProbeAppliedSequence),
+                static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+                static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+                static_cast<unsigned long long>(process.probeStopSequence), static_cast<unsigned long long>(process.completedFence),
+                static_cast<unsigned long long>(process.heldSBits), static_cast<unsigned long long>(process.returnedSBits));
+        else if (m_edmSourceSession.cyclesPerSource > 1U)
+            RtPrintf("[EDM10] phase=%s source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u run=%llu dispatch=%llu epoch=%llu sample=%llu previousFence=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu heldS=%016llX returnedS=%016llX signalPermit=%u physicalPermit=0 discharge=0\n",
+                phase, static_cast<unsigned int>(m_edmSourceSession.sourceIndex),
+                static_cast<unsigned int>(m_edmSourceSession.completedSources),
+                static_cast<unsigned int>(m_edmSourceSession.sourceLimit), static_cast<unsigned int>(process.cycleIndex),
+                static_cast<unsigned int>(process.completedCycles), static_cast<unsigned int>(m_edmSourceSession.cyclesPerSource),
+                static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+                static_cast<unsigned long long>(process.identity.epoch), static_cast<unsigned long long>(decision.sampleSequence),
+                static_cast<unsigned long long>(process.previousCompletedFence), static_cast<unsigned long long>(process.stopSequence),
+                static_cast<unsigned long long>(process.returnStopSequence), static_cast<unsigned long long>(process.probeStopSequence),
+                static_cast<unsigned long long>(process.completedFence), static_cast<unsigned long long>(process.heldSBits),
+                static_cast<unsigned long long>(process.returnedSBits), decision.simulatedPermit ? 1U : 0U);
+        else RtPrintf("[%s] phase=%s source=%u completed=%u limit=%u run=%llu dispatch=%llu epoch=%llu sample=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu signalPermit=%u physicalPermit=0 discharge=0\n",
+            m_edmSourceSession.sourceLimit == 2U ? "EDM08" : "EDM09", phase,
+            static_cast<unsigned int>(m_edmSourceSession.sourceIndex), static_cast<unsigned int>(m_edmSourceSession.completedSources),
+            static_cast<unsigned int>(m_edmSourceSession.sourceLimit),
+            static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+            static_cast<unsigned long long>(process.identity.epoch), static_cast<unsigned long long>(decision.sampleSequence),
+            static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+            static_cast<unsigned long long>(process.probeStopSequence), static_cast<unsigned long long>(process.completedFence),
+            decision.simulatedPermit ? 1U : 0U);
+        return;
+    }
+    const char* admission = "WAIT";
+    if (m_pathHold.automaticHoldOwned)
+    {
+        if (!m_gapPath.returnHold && process.stopSequence != 0ULL &&
+            process.stopSequence == m_pathHold.automaticSettleSequence && IsEDMPathProcessSignalSameThread(false))
+            admission = "RETREAT";
+        else if (m_gapPath.returnHold && process.returnStopSequence > process.stopSequence &&
+            process.returnStopSequence == m_pathHold.automaticSettleSequence && IsEDMPathProcessSignalSameThread(true))
+            admission = "RETURN";
+        else if (process.returnProbe && m_gapPath.returnRehold && process.probeStopSequence > process.returnStopSequence &&
+            process.probeStopSequence == m_pathHold.automaticSettleSequence && IsEDMPathProcessSignalSameThread(true))
+            admission = "RETURN_RESUME";
+    }
+    if (process.returnProbe)
+    {
+        if (process.repeated)
+        {
+            // A completed cycle and its rearm share one acquired GAP sample.
+            // Reduce this synchronous diagnostic burst; never refresh that
+            // sample or relax its age to compensate for output latency.
+            if (phase != nullptr && (std::strcmp(phase, "CYCLE_PASS") == 0 ||
+                std::strcmp(phase, "REARMED_FRESH_NORMAL") == 0))
+            {
+                RtPrintf("[EDM06] phase=%s run=%llu dispatch=%llu cycle=%u completed=%u limit=%u previousFence=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu probeHold=%u probeResume=%u resumeProven=%u advance=%u heldS=%016llX returnedS=%016llX physicalPermit=0 motion=1 discharge=0\n",
+                    phase, static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+                    static_cast<unsigned int>(process.cycleIndex), static_cast<unsigned int>(process.completedCycles),
+                    static_cast<unsigned int>(process.cycleLimit), static_cast<unsigned long long>(process.previousCompletedFence),
+                    static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+                    static_cast<unsigned long long>(process.probeStopSequence), static_cast<unsigned long long>(process.completedFence),
+                    static_cast<unsigned int>(m_gapPath.returnProbeHoldCount), static_cast<unsigned int>(m_gapPath.returnProbeResumeCount),
+                    process.probeResumeProven ? 1U : 0U, process.probeAdvanceSeen ? 1U : 0U,
+                    static_cast<unsigned long long>(process.heldSBits), static_cast<unsigned long long>(process.returnedSBits));
+                return;
+            }
+            // Keep cycle acceptance fields together before supplemental identity.
+            RtPrintf("[EDM06] phase=%s cycle=%u completed=%u limit=%u previousFence=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu probeHold=%u probeResume=%u resumeProven=%u advance=%u heldS=%016llX returnedS=%016llX physicalPermit=0 motion=1 discharge=0\n",
+                phase, static_cast<unsigned int>(process.cycleIndex), static_cast<unsigned int>(process.completedCycles),
+                static_cast<unsigned int>(process.cycleLimit), static_cast<unsigned long long>(process.previousCompletedFence),
+                static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+                static_cast<unsigned long long>(process.probeStopSequence), static_cast<unsigned long long>(process.completedFence),
+                static_cast<unsigned int>(m_gapPath.returnProbeHoldCount), static_cast<unsigned int>(m_gapPath.returnProbeResumeCount),
+                process.probeResumeProven ? 1U : 0U, process.probeAdvanceSeen ? 1U : 0U,
+                static_cast<unsigned long long>(process.heldSBits), static_cast<unsigned long long>(process.returnedSBits));
+            RtPrintf("[EDM06-ID] phase=%s cycle=%u process=%s reason=%s signalPermit=%u admission=%s run=%llu dispatch=%llu owner=%u ownerGeneration=%llu epoch=%llu sample=%llu ms=%llu publication=%llu generation=%llu probeNormalSeq=%llu probeNormalMs=%llu probeResumePub=%llu stopOrdinal=%u stopS=%016llX\n",
+                phase, static_cast<unsigned int>(process.cycleIndex), EDMProcessSimulation::StateName(decision.state),
+                EDMProcessSimulation::ReasonName(decision.reason), decision.simulatedPermit ? 1U : 0U, admission,
+                static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+                static_cast<unsigned int>(process.lease.owner), static_cast<unsigned long long>(process.lease.generation),
+                static_cast<unsigned long long>(process.identity.epoch), static_cast<unsigned long long>(decision.sampleSequence),
+                static_cast<unsigned long long>(decision.observedAtMs), static_cast<unsigned long long>(process.publication),
+                static_cast<unsigned long long>(process.requestGeneration),
+                static_cast<unsigned long long>(process.probeNormalSequenceFloor), static_cast<unsigned long long>(process.probeNormalTimeFloor),
+                static_cast<unsigned long long>(process.probeResumePublication), static_cast<unsigned int>(process.probeStopOrdinal),
+                static_cast<unsigned long long>(process.probeStopSBits));
+            return;
+        }
+        RtPrintf("[EDM05] phase=%s completed=%u limit=1 process=%s reason=%s signalPermit=%u admission=%s run=%llu dispatch=%llu owner=%u ownerGeneration=%llu epoch=%llu sample=%llu ms=%llu publication=%llu generation=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu probeHold=%u probeResume=%u resumeProven=%u advance=%u probeNormalSeq=%llu probeNormalMs=%llu probeResumePub=%llu stopOrdinal=%u stopS=%016llX heldS=%016llX returnedS=%016llX physicalPermit=0 motion=1 discharge=0\n",
+            phase, static_cast<unsigned int>(process.completedCycles), EDMProcessSimulation::StateName(decision.state),
+            EDMProcessSimulation::ReasonName(decision.reason), decision.simulatedPermit ? 1U : 0U, admission,
+            static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+            static_cast<unsigned int>(process.lease.owner), static_cast<unsigned long long>(process.lease.generation),
+            static_cast<unsigned long long>(process.identity.epoch), static_cast<unsigned long long>(decision.sampleSequence),
+            static_cast<unsigned long long>(decision.observedAtMs), static_cast<unsigned long long>(process.publication),
+            static_cast<unsigned long long>(process.requestGeneration), static_cast<unsigned long long>(process.stopSequence),
+            static_cast<unsigned long long>(process.returnStopSequence), static_cast<unsigned long long>(process.probeStopSequence),
+            static_cast<unsigned long long>(process.completedFence), static_cast<unsigned int>(m_gapPath.returnProbeHoldCount),
+            static_cast<unsigned int>(m_gapPath.returnProbeResumeCount), process.probeResumeProven ? 1U : 0U,
+            process.probeAdvanceSeen ? 1U : 0U, static_cast<unsigned long long>(process.probeNormalSequenceFloor),
+            static_cast<unsigned long long>(process.probeNormalTimeFloor), static_cast<unsigned long long>(process.probeResumePublication),
+            static_cast<unsigned int>(process.probeStopOrdinal), static_cast<unsigned long long>(process.probeStopSBits),
+            static_cast<unsigned long long>(process.heldSBits), static_cast<unsigned long long>(process.returnedSBits));
+        return;
+    }
+    if (process.repeated)
+    {
+        RtPrintf("[EDM04] phase=%s cycle=%u completed=%u limit=%u process=%s reason=%s signalPermit=%u admission=%s run=%llu dispatch=%llu owner=%u ownerGeneration=%llu epoch=%llu sample=%llu ms=%llu publication=%llu generation=%llu previousFence=%llu stop=%llu returnStop=%llu fence=%llu returnNormalSeq=%llu returnNormalMs=%llu heldS=%016llX returnedS=%016llX physicalPermit=0 motion=1 discharge=0\n",
+            phase, static_cast<unsigned int>(process.cycleIndex), static_cast<unsigned int>(process.completedCycles),
+            static_cast<unsigned int>(process.cycleLimit), EDMProcessSimulation::StateName(decision.state),
+            EDMProcessSimulation::ReasonName(decision.reason), decision.simulatedPermit ? 1U : 0U, admission,
+            static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+            static_cast<unsigned int>(process.lease.owner), static_cast<unsigned long long>(process.lease.generation),
+            static_cast<unsigned long long>(process.identity.epoch), static_cast<unsigned long long>(decision.sampleSequence),
+            static_cast<unsigned long long>(decision.observedAtMs), static_cast<unsigned long long>(process.publication),
+            static_cast<unsigned long long>(process.requestGeneration), static_cast<unsigned long long>(process.previousCompletedFence),
+            static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+            static_cast<unsigned long long>(process.completedFence), static_cast<unsigned long long>(process.returnNormalSequenceFloor),
+            static_cast<unsigned long long>(process.returnNormalTimeFloor), static_cast<unsigned long long>(process.heldSBits),
+            static_cast<unsigned long long>(process.returnedSBits));
+        return;
+    }
+    RtPrintf("[EDM03] phase=%s process=%s reason=%s intent=%s signalPermit=%u admission=%s run=%llu dispatch=%llu owner=%u ownerGeneration=%llu epoch=%llu sample=%llu ms=%llu publication=%llu request=%llu generation=%llu stop=%llu returnStop=%llu fence=%llu retreat=%u returned=%u physicalPermit=0 motion=1 discharge=0\n",
+        phase, EDMProcessSimulation::StateName(decision.state), EDMProcessSimulation::ReasonName(decision.reason),
+        EDMProcessSimulation::FeedIntentName(decision.feedIntent), decision.simulatedPermit ? 1U : 0U, admission,
+        static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+        static_cast<unsigned int>(process.lease.owner), static_cast<unsigned long long>(process.lease.generation),
+        static_cast<unsigned long long>(process.identity.epoch), static_cast<unsigned long long>(decision.sampleSequence),
+        static_cast<unsigned long long>(decision.observedAtMs), static_cast<unsigned long long>(process.publication),
+        static_cast<unsigned long long>(m_pathHold.requestedHoldSequence), static_cast<unsigned long long>(process.requestGeneration),
+        static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+        static_cast<unsigned long long>(process.completedFence), process.retreatSeen ? 1U : 0U, process.returnProven ? 1U : 0U);
+}
+
+NC_PATH_HOLD_NOINLINE
+void NCManager::FinishEDMPathProcessSameThread(const char* reason, bool failed) noexcept
+{
+    auto& process = m_edmPathProcess;
+    if (m_edmSourceSession.active)
+    {
+        // Only the validated retained callback retires a source internally.
+        // Manual/RESET/alarm paths revoke the whole session before clearing it.
+        if (!process.active && reason != nullptr && std::strcmp(reason, "TAIL_SOURCE_DONE") == 0 &&
+            m_gapTail.active && m_gapTail.endProven &&
+            m_edmSourceSession.completedSources == m_gapWindow.sourceIndex) return;
+        FinishEDMSourceSessionSameThread(reason, failed);
+        return;
+    }
+    if (!process.active) return;
+    const bool budgetDone = reason != nullptr && std::strcmp(reason, "BUDGET_DONE") == 0;
+    const bool passed = !failed && budgetDone && process.started && process.bound && process.returnProven &&
+        process.retreatSeen && process.stopSequence != 0ULL && process.returnStopSequence > process.stopSequence &&
+        process.completedFence >= process.returnStopSequence && process.requestGeneration != 0ULL &&
+        process.heldSBits == process.returnedSBits && m_state == NCState::RUN &&
+        m_mode == NCOperationMode::MEMORY && !Close_System_Com_flag &&
+        !AlarmManager::GetInstance().HasAlarm() && !m_motion.HasPendingSafetyOrRecoveryRequests() &&
+        !m_pathHold.automaticHoldOwned && !m_pathHold.automaticAdmissionOwned &&
+        HoldTranslationCurrent(CoordSys, process.translationGeneration) &&
+        process.run == m_pathCoreLiveBookkeeping.currentRunToken && process.run == m_pathHold.run &&
+        process.cache == GetBaseProgramCache().GetGeneration() && process.cache == m_pathHold.cache &&
+        process.dispatch == m_pathHold.dispatch && process.commit == m_pathHold.commit &&
+        HoldIdentityEqual(process.identity, m_pathHold.identity) &&
+        process.identity.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        process.lease.Matches(m_pathHold.lease) && m_motion.IsMotionOwnerLeaseCurrent(process.lease) &&
+        m_pathHold.requestedHoldSequence == process.returnStopSequence &&
+        (process.repeated ? (process.cycleLimit >= 2U && process.cycleLimit <= 8U &&
+            process.cycleIndex == process.cycleLimit && process.completedCycles == process.cycleLimit &&
+            m_pathHold.automaticObservedReturns == process.cycleLimit &&
+            process.stopSequence > process.previousCompletedFence &&
+            process.stopPublication > process.previousPublication &&
+            process.returnStopPublication > process.stopPublication) : m_pathHold.automaticObservedReturns == 1ULL) &&
+        (!process.returnProbe || ((process.repeated ?
+            (process.cycleLimit >= 2U && process.cycleLimit <= 8U && process.cycleIndex == process.cycleLimit &&
+                process.completedCycles == process.cycleLimit) : (process.cycleLimit == 1U && process.completedCycles == 1U)) &&
+            process.probeStopSequence > process.returnStopSequence && process.completedFence >= process.probeStopSequence &&
+            process.probeStopPublication > process.returnStopPublication &&
+            process.returnStopPublication > process.stopPublication && process.probeResumeProven && process.probeAdvanceSeen &&
+            m_gapPath.returnLowTest && m_gapPath.repeatedReturnLow && m_gapPath.returnProbeLimit == 1U &&
+            m_gapPath.returnProbeHoldCount == 1U && m_gapPath.returnProbeResumeCount == 1U &&
+            m_gapPath.returnLowInjected && m_gapPath.returnRehold && m_gapPath.returnResumeApplied &&
+            m_gapPath.returnReholdSequence == process.probeStopSequence)) &&
+        IsGapPathAutomaticNormalSameThread();
+    process.controller.Revoke();
+    LogEDMPathProcessSameThread("REVOKED");
+    if (process.returnProbe)
+    {
+        if (process.repeated)
+        {
+            RtPrintf("[EDM06] SUMMARY result=%s reason=%s completed=%u limit=%u cycle=%u probeHold=%u probeResume=%u resumeProven=%u advance=%u run=%llu dispatch=%llu previousFence=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu heldS=%016llX returnedS=%016llX physicalPermit=0 motion=1 discharge=0\n",
+                passed ? "PASS" : ((failed || budgetDone) ? "FAIL" : "CANCELLED"), reason != nullptr ? reason : "NONE",
+                static_cast<unsigned int>(process.completedCycles), static_cast<unsigned int>(process.cycleLimit),
+                static_cast<unsigned int>(process.cycleIndex), static_cast<unsigned int>(m_gapPath.returnProbeHoldCount),
+                static_cast<unsigned int>(m_gapPath.returnProbeResumeCount), process.probeResumeProven ? 1U : 0U,
+                process.probeAdvanceSeen ? 1U : 0U, static_cast<unsigned long long>(process.run),
+                static_cast<unsigned long long>(process.dispatch), static_cast<unsigned long long>(process.previousCompletedFence),
+                static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+                static_cast<unsigned long long>(process.probeStopSequence), static_cast<unsigned long long>(process.completedFence),
+                static_cast<unsigned long long>(process.heldSBits), static_cast<unsigned long long>(process.returnedSBits));
+            process.active = false;
+            return;
+        }
+        RtPrintf("[EDM05] SUMMARY result=%s reason=%s completed=%u limit=1 probeHold=%u probeResume=%u resumeProven=%u advance=%u run=%llu dispatch=%llu stop=%llu returnStop=%llu probeStop=%llu fence=%llu heldS=%016llX returnedS=%016llX physicalPermit=0 motion=1 discharge=0\n",
+            passed ? "PASS" : ((failed || budgetDone) ? "FAIL" : "CANCELLED"), reason != nullptr ? reason : "NONE",
+            static_cast<unsigned int>(process.completedCycles), static_cast<unsigned int>(m_gapPath.returnProbeHoldCount),
+            static_cast<unsigned int>(m_gapPath.returnProbeResumeCount), process.probeResumeProven ? 1U : 0U,
+            process.probeAdvanceSeen ? 1U : 0U, static_cast<unsigned long long>(process.run),
+            static_cast<unsigned long long>(process.dispatch), static_cast<unsigned long long>(process.stopSequence),
+            static_cast<unsigned long long>(process.returnStopSequence), static_cast<unsigned long long>(process.probeStopSequence),
+            static_cast<unsigned long long>(process.completedFence), static_cast<unsigned long long>(process.heldSBits),
+            static_cast<unsigned long long>(process.returnedSBits));
+        process.active = false;
+        return;
+    }
+    if (process.repeated)
+    {
+        RtPrintf("[EDM04] SUMMARY result=%s reason=%s completed=%u limit=%u cycle=%u run=%llu dispatch=%llu previousFence=%llu stop=%llu returnStop=%llu fence=%llu heldS=%016llX returnedS=%016llX physicalPermit=0 motion=1 discharge=0\n",
+            passed ? "PASS" : ((failed || budgetDone) ? "FAIL" : "CANCELLED"), reason != nullptr ? reason : "NONE",
+            static_cast<unsigned int>(process.completedCycles), static_cast<unsigned int>(process.cycleLimit),
+            static_cast<unsigned int>(process.cycleIndex), static_cast<unsigned long long>(process.run),
+            static_cast<unsigned long long>(process.dispatch), static_cast<unsigned long long>(process.previousCompletedFence),
+            static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+            static_cast<unsigned long long>(process.completedFence), static_cast<unsigned long long>(process.heldSBits),
+            static_cast<unsigned long long>(process.returnedSBits));
+        process.active = false;
+        return;
+    }
+    RtPrintf("[EDM03] SUMMARY result=%s reason=%s run=%llu dispatch=%llu stop=%llu returnStop=%llu fence=%llu heldS=%016llX returnedS=%016llX physicalPermit=0 motion=1 discharge=0\n",
+        passed ? "PASS" : ((failed || budgetDone) ? "FAIL" : "CANCELLED"), reason != nullptr ? reason : "NONE",
+        static_cast<unsigned long long>(process.run), static_cast<unsigned long long>(process.dispatch),
+        static_cast<unsigned long long>(process.stopSequence), static_cast<unsigned long long>(process.returnStopSequence),
+        static_cast<unsigned long long>(process.completedFence), static_cast<unsigned long long>(process.heldSBits),
+        static_cast<unsigned long long>(process.returnedSBits));
+    process.active = false;
+}
+
+NC_PATH_HOLD_NOINLINE
+bool NCManager::ServiceGapPathSimulationImplSameThread(double activeS, bool publishSample, const char* site,
     bool returningSample, const MotionPathCoreHoldExcursionSnapshot* pendingAdmission,
     const MotionPathCoreHoldExcursionSnapshot* sourcePublication) noexcept
 {
@@ -1999,14 +4024,29 @@ bool NCManager::ServiceGapPathSimulationSameThread(double activeS, bool publishS
         }
     }
     // CM_TEST1: give the operator a visible second-round test window.
-    const bool secondRoundTestWindow = m_gapPath.repeatedLowRetreat && m_gapPath.returnHold &&
+    const bool secondRoundTestWindow = !(m_edmPathProcess.active && m_edmPathProcess.repeated) &&
+        m_gapPath.repeatedLowRetreat && m_gapPath.returnHold &&
         m_pathHold.automaticObservedReturns == 1ULL && m_pathHold.returnHoldRetreatCount == 2ULL;
-    const std::uint64_t recoveryDelayMs = (secondRoundTestWindow || m_gapPath.returnRehold) ? 30000ULL :
+    const bool edm05Rehold = m_edmPathProcess.active && m_edmPathProcess.returnProbe && m_gapPath.returnRehold;
+    const std::uint64_t recoveryDelayMs = edm05Rehold ? 3000ULL :
+        (secondRoundTestWindow || m_gapPath.returnRehold) ? 30000ULL :
         (m_gapPath.automaticResume ? 3000ULL : 1000ULL);
+    // Only P27's simulator anchors its three-second NORMAL injection at the
+    // same proven stop as H. A slow J5 cannot consume the negative-test delay.
+    // Before that proof there is no recovery clock and the simulated input stays LOW.
+    const bool boundedRecovery = m_edmSourceSession.active && m_edmSourceSession.recoveryLimitMs != 0U;
+    const std::uint8_t recoveryKind = m_gapPath.returnRehold ? 3U : 2U;
+    const bool recoveryClockReady = !boundedRecovery ||
+        (m_edmPathProcess.recoveryWaitKind == recoveryKind &&
+            m_edmPathProcess.recoveryWaitStopSequence != 0ULL &&
+            m_edmPathProcess.recoveryWaitStopSequence == (recoveryKind == 3U ?
+                m_edmPathProcess.probeStopSequence : m_edmPathProcess.returnStopSequence));
+    const std::uint64_t recoveryOriginMs = boundedRecovery ?
+        m_edmPathProcess.recoveryWaitStartMs : m_gapPath.holdStartMs;
     if (m_gapPath.held && (!m_gapPath.lowRetreat || m_gapPath.returnHold) &&
         (!m_gapPath.returnLowInjected || m_gapPath.returnRehold) && !m_gapPath.recoveryInjected &&
-        nowMs >= m_gapPath.holdStartMs &&
-        nowMs - m_gapPath.holdStartMs >= recoveryDelayMs)
+        recoveryClockReady && nowMs >= recoveryOriginMs &&
+        nowMs - recoveryOriginMs >= recoveryDelayMs)
     {
         m_gapPath.recoveryInjected = true;
         recoveryEvent = true;
@@ -2075,7 +4115,8 @@ NC_PATH_HOLD_NOINLINE
 bool NCManager::IsGapPathAutomaticNormalSameThread() const noexcept
 {
     const EDMGap::Snapshot& gap = m_gapInput.Current();
-    return m_gapPath.active && m_gapPath.automaticResume && m_gapPath.held &&
+    return IsEDMPathProcessSignalSameThread(true) &&
+        m_gapPath.active && m_gapPath.automaticResume && m_gapPath.held &&
         m_gapPath.lowInjected && m_gapPath.recoveryInjected && gap.configured &&
         gap.source == EDMGap::Source::SIMULATED && gap.quality == EDMGap::Quality::VALID &&
         gap.band == EDMGap::Band::NORMAL && gap.pendingBand == EDMGap::Band::UNKNOWN &&
@@ -2090,7 +4131,8 @@ bool NCManager::IsGapPathAutomaticResumeSignalSameThread() const noexcept
     if (!m_gapPath.lowRetreat || m_gapPath.returnHold)
         return IsGapPathAutomaticNormalSameThread();
     const EDMGap::Snapshot& gap = m_gapInput.Current();
-    return m_gapPath.active && m_gapPath.automaticResume && m_gapPath.held &&
+    return IsEDMPathProcessSignalSameThread(false) &&
+        m_gapPath.active && m_gapPath.automaticResume && m_gapPath.held &&
         m_gapPath.lowInjected && !m_gapPath.recoveryInjected && gap.configured &&
         gap.source == EDMGap::Source::SIMULATED && gap.quality == EDMGap::Quality::VALID &&
         gap.band == EDMGap::Band::LOW && gap.pendingBand == EDMGap::Band::UNKNOWN &&
@@ -2127,6 +4169,17 @@ bool NCManager::ValidateGapPathAutomaticResumeSameThread() noexcept
 NC_PATH_HOLD_NOINLINE
 void NCManager::LogGapPathSimulationSameThread(const char* phase) const noexcept
 {
+    if (IsEDMDiagnosticQuietSameThread())
+    {
+        if (phase != nullptr && std::strcmp(phase, "RESUME_APPLIED") == 0)
+            CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::RESUME_APPLIED);
+        return;
+    }
+    // P27 keeps waitJ5Logged and all stop/admission checks unchanged. The
+    // successful stop proof or existing fault summary carries this progress;
+    // omit only the redundant WAIT_J5 console call on the critical service path.
+    if (m_edmSourceSession.active && m_edmSourceSession.recoveryLimitMs != 0U &&
+        phase != nullptr && std::strcmp(phase, "WAIT_J5") == 0) return;
     const EDMGap::Snapshot& gap = m_gapInput.Current();
     if (m_gapPath.repeatedReturnLow)
     {
@@ -2264,7 +4317,8 @@ bool NCManager::IsGapPathSourceWindowScopeValidSameThread(bool bindingCurrentSou
                 !(m_gapRecovery.active && m_gapWindow.sourceGapMs == 40U)) ||
             (m_gapWindow.sourceGapMs == 150U && m_gapWindow.tailVoltage != 50U))) ||
         (!m_gapWindow.continuousSignal && m_gapWindow.sourceGapMs != 0U)) return false;
-    if ((m_gapWindow.tailSupervision && (!m_gapWindow.allowSeamStations ||
+    if (m_edmSourceSession.active && !IsEDMSourceSessionScopeValidSameThread()) return false;
+    if ((m_gapWindow.tailSupervision && ((!m_gapWindow.allowSeamStations && !IsEDMSourceSessionScopeValidSameThread()) ||
         (m_gapWindow.tailVoltage != 50U && m_gapWindow.tailVoltage != 20U))) ||
         (!m_gapWindow.tailSupervision && m_gapWindow.tailVoltage != 50U)) return false;
     if (m_gapWindow.allowSeamStations && (!m_gapWindow.multipleStationsPerSource ||
@@ -2498,6 +4552,12 @@ bool NCManager::IsGapPathNextStationBeyondSourceSameThread(double prefixMM, doub
 NC_PATH_HOLD_NOINLINE
 void NCManager::LogGapPathSourceWindowSameThread(const char* phase, const char* reason) const noexcept
 {
+    if (IsEDMDiagnosticQuietSameThread() && phase != nullptr &&
+        (std::strcmp(phase, "SOURCE_BOUND") == 0 || std::strcmp(phase, "SOURCE_EPOCH_PENDING_BOUND") == 0)) return;
+    // EDM08 emits the aggregate SOURCE_PASS/NEXT_SOURCE_FRESH_START records.
+    if (m_edmSourceSession.configured && phase != nullptr &&
+        (std::strcmp(phase, "SOURCE_BUDGET_PROVEN") == 0 || std::strcmp(phase, "SOURCE_RETAINED") == 0 ||
+            std::strcmp(phase, "NEXT_SOURCE_ARMED") == 0 || std::strcmp(phase, "WINDOW_COMPLETED") == 0)) return;
     RtPrintf("[%s] phase=%s reason=%s sourceIndex=%u sourceLimit=%u run=%llu cache=%llu dispatch=%llu commit=%llu epoch=%llu segment=%llu sourceBlock=%llu previousDispatch=%llu previousCommit=%llu previousEpoch=%llu previousSegment=%llu history=%u budget=%u fence=%llu request=%llu latestStop=%llu returnedS=%016llX R=%u L=%u motion=1 discharge=0\n",
         m_gapWindow.tailSupervision ? "GAP-CW" : m_gapWindow.allowSeamStations ? "GAP-CV" : m_gapWindow.multipleStationsPerSource ? "GAP-CU" : m_gapWindow.repeatedCumulativeStation ? "GAP-CT" : m_gapWindow.cumulativeStation ? "GAP-CS" : (m_gapWindow.allowNormalSources ? "GAP-CR" : "GAP-CQ"), phase, reason, static_cast<unsigned int>(m_gapWindow.sourceIndex), static_cast<unsigned int>(m_gapWindow.sourceLimit),
         static_cast<unsigned long long>(m_gapWindow.run), static_cast<unsigned long long>(m_gapWindow.cache),
@@ -2781,7 +4841,8 @@ bool NCManager::StartGapPathTailSameThread(const MotionPathCoreHoldExcursionSnap
 NC_PATH_HOLD_NOINLINE
 bool NCManager::ValidateGapPathTailScopeSameThread() noexcept
 {
-    if (!m_gapTail.active || !m_gapWindow.tailSupervision || !m_gapWindow.allowSeamStations ||
+    if (!m_gapTail.active || !m_gapWindow.tailSupervision ||
+        (!m_gapWindow.allowSeamStations && !IsEDMSourceSessionScopeValidSameThread()) ||
         !m_gapWindow.budgetProven || m_gapWindow.normalSource || !m_gapPath.active ||
         !IsGapPathSourceWindowScopeValidSameThread() || m_state != NCState::RUN ||
         m_edmState == EDMState::NOT_READY || !m_pathHold.bound || !m_pathHold.requested ||
@@ -2959,6 +5020,56 @@ bool NCManager::CompleteGapPathTailProofSameThread(const MotionPathCoreHoldExcur
 NC_PATH_HOLD_NOINLINE
 void NCManager::LogGapPathTailSameThread(const char* phase) const noexcept
 {
+    if (IsEDMDiagnosticQuietSameThread() && phase != nullptr &&
+        std::strcmp(phase, "TAIL_LOW") != 0 && std::strcmp(phase, "TAIL_CANCELLED") != 0)
+    {
+        if (std::strcmp(phase, "TAIL_NORMAL_PROVEN") == 0)
+            CaptureEDMDiagnosticSameThread(EDMDeferredDiagnosticKind::TAIL_NORMAL_PROVEN);
+        return;
+    }
+    if (m_edmSourceSession.configured)
+    {
+        if (phase != nullptr && std::strcmp(phase, "TAIL_COMPLETED") == 0) return;
+        // P28 already logged the exact CYCLE_PASS before this tail transition.
+        // Omit its redundant progress output between genuine GAP polls; keep
+        // the tail state and later fresh/end/failure evidence unchanged.
+        if (m_edmSourceSession.active && m_edmSourceSession.stopAckLimitMs != 0U &&
+            phase != nullptr && std::strcmp(phase, "TAIL_ARMED") == 0) return;
+        if (m_edmSourceSession.stopAckLimitMs != 0U)
+            RtPrintf("[EDM13] phase=%s source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u stopAckLimitMs=%u jMask=%u recoveryLimitMs=%u run=%llu dispatch=%llu publication=%llu sample=%llu fresh=%u end=%u physicalPermit=0 discharge=0\n",
+                phase, static_cast<unsigned int>(m_edmSourceSession.sourceIndex),
+                static_cast<unsigned int>(m_edmSourceSession.completedSources), static_cast<unsigned int>(m_edmSourceSession.sourceLimit),
+                static_cast<unsigned int>(m_edmPathProcess.cycleIndex), static_cast<unsigned int>(m_edmPathProcess.completedCycles),
+                static_cast<unsigned int>(m_edmSourceSession.cyclesPerSource), static_cast<unsigned int>(m_edmSourceSession.stopAckLimitMs),
+                static_cast<unsigned int>(m_edmPathProcess.stopProvenMask), static_cast<unsigned int>(m_edmSourceSession.recoveryLimitMs),
+                static_cast<unsigned long long>(m_edmSourceSession.run), static_cast<unsigned long long>(m_edmPathProcess.dispatch),
+                static_cast<unsigned long long>(m_gapTail.publication), static_cast<unsigned long long>(m_gapTail.sequence),
+                m_gapTail.sampleSeen ? 1U : 0U, m_gapTail.endProven ? 1U : 0U);
+        else if (m_edmSourceSession.recoveryLimitMs != 0U)
+            RtPrintf("[EDM12] phase=%s source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u recoveryLimitMs=%u run=%llu dispatch=%llu publication=%llu sample=%llu fresh=%u end=%u physicalPermit=0 discharge=0\n",
+                phase, static_cast<unsigned int>(m_edmSourceSession.sourceIndex),
+                static_cast<unsigned int>(m_edmSourceSession.completedSources), static_cast<unsigned int>(m_edmSourceSession.sourceLimit),
+                static_cast<unsigned int>(m_edmPathProcess.cycleIndex), static_cast<unsigned int>(m_edmPathProcess.completedCycles),
+                static_cast<unsigned int>(m_edmSourceSession.cyclesPerSource), static_cast<unsigned int>(m_edmSourceSession.recoveryLimitMs),
+                static_cast<unsigned long long>(m_gapTail.run), static_cast<unsigned long long>(m_gapTail.dispatch),
+                static_cast<unsigned long long>(m_gapTail.publication), static_cast<unsigned long long>(m_gapTail.sequence),
+                m_gapTail.sampleSeen ? 1U : 0U, m_gapTail.endProven ? 1U : 0U);
+        else if (m_edmSourceSession.cyclesPerSource > 1U)
+            RtPrintf("[EDM10] phase=%s source=%u completed=%u limit=%u cycle=%u completedCycles=%u cyclesPerSource=%u run=%llu dispatch=%llu publication=%llu sample=%llu fresh=%u end=%u physicalPermit=0 discharge=0\n",
+                phase, static_cast<unsigned int>(m_edmSourceSession.sourceIndex),
+                static_cast<unsigned int>(m_edmSourceSession.completedSources),
+                static_cast<unsigned int>(m_edmSourceSession.sourceLimit), static_cast<unsigned int>(m_edmPathProcess.cycleIndex),
+                static_cast<unsigned int>(m_edmPathProcess.completedCycles), static_cast<unsigned int>(m_edmSourceSession.cyclesPerSource),
+                static_cast<unsigned long long>(m_gapTail.run), static_cast<unsigned long long>(m_gapTail.dispatch),
+                static_cast<unsigned long long>(m_gapTail.publication), static_cast<unsigned long long>(m_gapTail.sequence),
+                m_gapTail.sampleSeen ? 1U : 0U, m_gapTail.endProven ? 1U : 0U);
+        else RtPrintf("[%s] phase=%s source=%u run=%llu dispatch=%llu publication=%llu sample=%llu fresh=%u end=%u physicalPermit=0 discharge=0\n",
+            m_edmSourceSession.sourceLimit == 2U ? "EDM08" : "EDM09", phase,
+            static_cast<unsigned int>(m_edmSourceSession.sourceIndex), static_cast<unsigned long long>(m_gapTail.run),
+            static_cast<unsigned long long>(m_gapTail.dispatch), static_cast<unsigned long long>(m_gapTail.publication),
+            static_cast<unsigned long long>(m_gapTail.sequence), m_gapTail.sampleSeen ? 1U : 0U, m_gapTail.endProven ? 1U : 0U);
+        return;
+    }
     const auto& gap = m_gapInput.Current();
     RtPrintf("[GAP-CW-TAIL] phase=%s run=%llu cache=%llu dispatch=%llu commit=%llu epoch=%llu segment=%llu owner=%u ownerGeneration=%llu sourceIndex=%u history=%u generation=%llu publication=%llu budgetPublication=%llu sample=%llu ms=%llu V=%u quality=%s band=%s pending=%s activeS=%016llX length=%016llX returnedS=%016llX retreat=%u return=%u request=%llu latestStop=%llu fence=%llu freshTail=%u endProven=%u motion=1 discharge=0\n",
         phase, static_cast<unsigned long long>(m_gapTail.run), static_cast<unsigned long long>(m_gapTail.cache),
@@ -2981,6 +5092,11 @@ void NCManager::LogGapPathTailSameThread(const char* phase) const noexcept
 NC_PATH_HOLD_NOINLINE
 bool NCManager::CompleteGapPathSourceBudgetSameThread(const MotionPathCoreHoldExcursionSnapshot& snapshot) noexcept
 {
+    if (m_edmSourceSession.active && !IsEDMSourceReturnProofValidSameThread())
+    {
+        RejectGapPathSimulationSameThread("EDM08_BUDGET_NOT_PROVEN", &snapshot);
+        return false;
+    }
     if (!IsGapPathSourceWindowScopeValidSameThread() || m_gapWindow.budgetProven || m_gapWindow.normalSource ||
         m_state != NCState::RUN || !m_pathHold.bound || !m_pathHold.requested || !m_pathHold.startCommitted ||
         !m_pathHold.automaticEnabled || m_pathHold.automaticHoldOwned || m_pathHold.automaticAdmissionOwned ||
@@ -3037,12 +5153,12 @@ bool NCManager::CompleteGapPathSourceSameThread(bool line) noexcept
             m_pathFeed.consumerAccepted && m_pathFeed.consumerStarted && m_pathFeedMotion.receipt.valid &&
             m_pathFeed.dispatch == m_pathHold.dispatch && m_pathFeed.commit == m_pathHold.commit &&
             (m_pathFeedMotion.receipt.translationGeneration == m_pathHoldView.translationGeneration &&
-            HoldIdentityEqual(m_pathFeedMotion.receipt.identity, m_pathHold.identity))) :
+                HoldIdentityEqual(m_pathFeedMotion.receipt.identity, m_pathHold.identity))) :
         (m_pathArc.armed && !m_pathArc.pending && m_pathArc.bound && m_pathArc.completed &&
             m_pathArc.consumerAccepted && m_pathArc.consumerStarted && m_pathArcMotion.receipt.valid &&
             m_pathArc.dispatch == m_pathHold.dispatch && m_pathArc.commit == m_pathHold.commit &&
             (m_pathArcMotion.receipt.translationGeneration == m_pathHoldView.translationGeneration &&
-            HoldIdentityEqual(m_pathArcMotion.receipt.identity, m_pathHold.identity)));
+                HoldIdentityEqual(m_pathArcMotion.receipt.identity, m_pathHold.identity)));
     const std::uint32_t expectedCount = m_gapWindow.initialHistoryCount + m_gapWindow.sourceIndex;
     const bool normal = m_gapWindow.allowNormalSources && m_gapWindow.normalSource;
     if (!IsGapPathSourceWindowScopeValidSameThread() || m_state != NCState::RUN ||
@@ -3190,6 +5306,7 @@ bool NCManager::CompleteGapPathSourceSameThread(bool line) noexcept
             return false;
         }
     }
+    if (!CompleteEDMSourceSameThread(terminal)) return false;
     if (m_gapTail.active)
     {
         LogGapPathTailSameThread("TAIL_COMPLETED");
@@ -3243,6 +5360,7 @@ bool NCManager::CompleteGapPathSourceSameThread(bool line) noexcept
     }
     else if (!StartGapPathSimulationSameThread(true, true, true, true, true, true,
         static_cast<std::uint8_t>(m_gapWindow.probeLimit))) return false;
+    if (!StartNextEDMSourceSameThread()) return false;
     LogGapPathSourceWindowSameThread("NEXT_SOURCE_ARMED");
     return true;
 }
@@ -3562,6 +5680,8 @@ void NCManager::LogGapPathSignalSessionSameThread(const char* phase) const noexc
 NC_PATH_HOLD_NOINLINE
 void NCManager::CancelPathCoreHoldAutomaticSameThread(const char* reason) noexcept
 {
+    // Window reset must not erase the evidence needed by the session summary.
+    FinishEDMSourceSessionSameThread(reason, false);
     if (m_gapWindow.active)
     {
         LogGapPathSourceWindowSameThread("WINDOW_CANCELLED", reason);
@@ -3574,6 +5694,7 @@ void NCManager::CancelPathCoreHoldAutomaticSameThread(const char* reason) noexce
 NC_PATH_HOLD_NOINLINE
 void NCManager::ClearPathCoreHoldAutomaticStateSameThread(const char* reason) noexcept
 {
+    FinishEDMPathProcessSameThread(reason);
     if (m_gapSignal.active) LogGapPathSignalSessionSameThread("SIGNAL_CANCELLED");
     m_gapSignal = GapPathSignalSessionState{};
     m_gapInlet = GapPathSampleInletState{};
@@ -3656,6 +5777,8 @@ bool NCManager::ProcessPathCoreReturnWaitSameThread() noexcept
         return true;
     }
     if (m_gapPath.active && !ServiceGapPathSimulationSameThread(0.0, true, "RETURN_HOLD", false, nullptr, &snapshot)) return true;
+    std::uint64_t stopRequestOriginMs = 0ULL;
+    if (!ReadEDMStopClockSameThread(stopRequestOriginMs)) return true;
     if (m_state == NCState::RUN) FeedHoldInternal();
     else
     {
@@ -3695,9 +5818,11 @@ bool NCManager::ProcessPathCoreReturnWaitSameThread() noexcept
         m_gapPath.ackLogged = false;
         m_gapPath.waitJ5Logged = false;
     }
+    if (!ArmEDMStopWaitSameThread(2U, stopRequestOriginMs)) return true;
     LogPathCoreHoldAutomaticSameThread("RETURN_HOLD_REQUESTED");
     if (m_gapPath.active && m_gapPath.repeatedLowRetreat && m_gapPath.returnHold &&
-        m_pathHold.automaticObservedReturns == 1ULL && snapshot.retreatCount == 2ULL)
+        m_pathHold.automaticObservedReturns == 1ULL && snapshot.retreatCount == 2ULL &&
+        !(m_edmPathProcess.active && m_edmPathProcess.repeated))
         LogGapPathSimulationSameThread("TEST_SECOND_ROUND_WAIT_30S");
     return true;
 }
@@ -3881,11 +6006,15 @@ bool NCManager::ProcessGapPathReturnLowHoldSameThread(
     if (gap.quality != EDMGap::Quality::VALID || gap.source != EDMGap::Source::SIMULATED ||
         gap.band != EDMGap::Band::LOW || gap.pendingBand != EDMGap::Band::UNKNOWN ||
         gap.sequence != m_gapPath.sequence || !IsGapPathCurrentSampleProvenSameThread()) return false;
+    if (m_edmPathProcess.active && m_edmPathProcess.returnProbe &&
+        !IsEDMPathProcessSignalSameThread(false)) return false;
     if (m_holdResumeAdmissionKind != HoldResumeAdmissionKind::NONE || m_feedHoldResumeGate.GetSnapshot().active)
     {
         RejectGapPathSimulationSameThread("RETURN_LOW_CONTROL_CONFLICT");
         return true;
     }
+    std::uint64_t stopRequestOriginMs = 0ULL;
+    if (!ReadEDMStopClockSameThread(stopRequestOriginMs)) return true;
     FeedHoldInternal();
     const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
     if (m_state != NCState::HOLD || !IsProgramFeedHoldResumeCandidate() ||
@@ -3913,7 +6042,9 @@ bool NCManager::ProcessGapPathReturnLowHoldSameThread(
     m_gapPath.holdStartMs = m_gapPath.lastServiceMs;
     m_gapPath.ackLogged = false;
     m_gapPath.waitJ5Logged = false;
-    LogGapPathSimulationSameThread("RETURN_LOW_HOLD_30S");
+    if (!ArmEDMStopWaitSameThread(3U, stopRequestOriginMs)) return true;
+    LogGapPathSimulationSameThread(m_edmPathProcess.active && m_edmPathProcess.returnProbe ?
+        "RETURN_LOW_HOLD_3S" : "RETURN_LOW_HOLD_30S");
     return true;
 }
 
@@ -4058,6 +6189,7 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
         if (!ServiceGapPathSimulationSameThread(gapReturnPending ? 0.0 : snapshot.activeS,
             true, "AUTOMATIC", returningSample, nullptr, &snapshot)) return true;
     }
+    if (!ObserveEDMPathProcessMotionSameThread(snapshot)) return true;
     if (m_pathHold.automaticHoldOwned)
     {
         const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
@@ -4129,6 +6261,7 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
         }
         if (m_feedHoldResumeGate.ShouldApplyResume() && ApplyProgramHoldResume(true))
         {
+            if (!CompleteEDMRecoveryWaitSameThread()) return true;
             LogPathCoreHoldAutomaticSameThread("RESUME_APPLIED");
             if (m_gapPath.repeatedReturnLow && m_gapPath.returnHold)
             {
@@ -4166,6 +6299,8 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
             m_pathHold.automaticAdmissionOwned = false;
             m_pathHold.automaticBoundarySequence = 0ULL;
             m_pathHold.automaticSettleSequence = MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+            if (m_edmPathProcess.active && m_edmPathProcess.returnProbe && m_gapPath.returnResumeApplied &&
+                !ObserveEDMPathProcessMotionSameThread(snapshot)) return true;
         }
         // BUSY preserves exact ownership, so the next operator Hold can cancel it.
         return true;
@@ -4224,6 +6359,7 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
             m_gapPath.returnCompletedSBits = HoldDoubleBits(snapshot.returnedS);
         }
         m_pathHold.automaticObservedReturns = snapshot.returnCount;
+        if (!ObserveEDMPathProcessMotionSameThread(snapshot)) return true;
         if (m_gapWindow.active && m_gapWindow.multipleStationsPerSource)
         {
             if (!IsGapPathSourceWindowScopeValidSameThread() ||
@@ -4302,6 +6438,7 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
                 m_gapPath.returnWatchSBits = 0ULL;
                 m_gapPath.returnWatchOrdinal = 0U;
             }
+            if (!RearmEDMPathProcessCycleSameThread(snapshot)) return true;
             LogPathCoreHoldAutomaticSameThread("REARMED");
             return false;
         }
@@ -4353,6 +6490,8 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
         CancelPathCoreHoldAutomaticSameThread("CONTROL_CONFLICT");
         return false;
     }
+    std::uint64_t stopRequestOriginMs = 0ULL;
+    if (!ReadEDMStopClockSameThread(stopRequestOriginMs)) return true;
     FeedHoldInternal();
     const auto boundary = m_feedHoldBoundaryShadow.GetSnapshot();
     if (m_state != NCState::HOLD || !IsProgramFeedHoldResumeCandidate() ||
@@ -4375,6 +6514,7 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
         m_gapPath.held = true;
         m_gapPath.holdStartMs = m_gapPath.lastServiceMs;
     }
+    if (!ArmEDMStopWaitSameThread(1U, stopRequestOriginMs)) return true;
     LogPathCoreHoldAutomaticSameThread("HOLD_REQUESTED");
     return true;
 }
@@ -4382,6 +6522,12 @@ bool NCManager::ProcessPathCoreHoldAutomaticSameThread() noexcept
 NC_PATH_HOLD_NOINLINE
 void NCManager::LogPathCoreHoldAutomaticSameThread(const char* phase) const noexcept
 {
+    if (m_edmSourceSession.configured && phase != nullptr &&
+        (std::strcmp(phase, "RETURNED") == 0 || std::strcmp(phase, "TAIL_SOURCE_DONE") == 0)) return;
+    // P25 already reports the accepted cycle and rearm with their exact proof.
+    // Avoid two duplicate GAP lines in the same sample-to-service interval.
+    if (m_edmPathProcess.active && m_edmPathProcess.repeated && m_edmPathProcess.returnProbe &&
+        phase != nullptr && (std::strcmp(phase, "RETURNED") == 0 || std::strcmp(phase, "REARMED") == 0)) return;
     if (m_gapPath.active)
     {
         LogGapPathSimulationSameThread(phase);
@@ -4535,6 +6681,10 @@ bool NCManager::CommitPathCoreHoldResumeSameThread() noexcept
 NC_PATH_HOLD_NOINLINE
 void NCManager::LogPathCoreHoldSameThread(const char* phase) const noexcept
 {
+    if (IsEDMDiagnosticQuietSameThread() && phase != nullptr &&
+        (std::strcmp(phase, "ARMED") == 0 || std::strcmp(phase, "BOUND") == 0 ||
+            std::strcmp(phase, "RT_PHASE") == 0 || std::strcmp(phase, "REQUESTED") == 0 ||
+            std::strcmp(phase, "RESUME_COMMITTED") == 0 || std::strcmp(phase, "SOURCE_COMPLETED") == 0)) return;
     const PathHoldState& s = m_pathHold;
     RtPrintf("[PCORE-CB] run=%llu dispatch=%llu phase=%s code=%u pc=%d line=%d commit=%llu armed=%u bound=%u requested=%u blocked=%u L=%u\n",
         static_cast<unsigned long long>(s.run), static_cast<unsigned long long>(s.dispatch), phase,

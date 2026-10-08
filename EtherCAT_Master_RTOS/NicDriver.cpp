@@ -12,8 +12,8 @@
  * 不處理 EtherCAT Datagram、DC 控制、Motion 或 NC 邏輯。
  *
  * 正式候選測試設定：
- * - RTX64 NAL Interrupt thread priority：70
- * - RTX64 NAL Transmit complete thread priority：70
+ * - NAL priorities are observed from the acquired TX interface at Open.
+ * - NIC-TX-CONFIG is startup readback, not proof of live thread scheduling.
  * - RX Mode：STANDARD_BUFFER_V2
  * - EtherType filter：0x88A4
  */
@@ -34,12 +34,278 @@ volatile LONGLONG g_nicTxSubmitFail = 0;
 volatile LONGLONG g_nicTxSubmitted0 = 0;
 volatile LONG g_nicTxLastError = ERROR_SUCCESS;
 
+// PBC3J FIX3: failure-only cumulative diagnostics. Each field is atomic but
+// fields are NOT a coherent transaction; safety uses the caller-local receipt.
+struct NicTxFailureAdvisory
+{
+    volatile LONGLONG count;
+    volatile LONGLONG lastCallSequence;
+    volatile LONG error;
+    volatile LONG errorValid;
+    volatile LONG submitted;
+};
+static NicTxFailureAdvisory g_nicTxFailureAdvisory[4] = {};
+static volatile LONGLONG g_nicTxFailurePublications = 0;
+static volatile LONGLONG g_nicTxOwnershipNotOwner = 0;
+static volatile LONGLONG g_nicTxOwnershipInvalidAddress = 0;
+static volatile LONGLONG g_nicTxOwnershipNotReady = 0;
+static volatile LONGLONG g_nicTxOwnershipOther = 0;
+// EDM30 process-lifetime trace: Open starts a new call identity but never
+// resets or overwrites diagnostics still owned by the low-priority consumer.
+static volatile LONGLONG g_nicTxOpenGeneration = 0;
+static NicTxFailureTrace g_nicTxFailureTrace{};
+
+// Diagnostic reads preserve the exact caller thread error. Never inspect a
+// NAL-owned frame: packet identity always comes from this caller-owned image.
+template<typename T>
+static void CaptureNicTxDatagram(T& value, const unsigned char* data,
+    unsigned int length) noexcept
+{
+    if (data == nullptr || length < 26U || length > MAX_ETHER_FRAME_SIZE ||
+        data[12] != 0x88U || data[13] != 0xA4U) return;
+    value.datagramValid = 1U;
+    value.command = data[16]; value.index = data[17];
+    value.addressLow = static_cast<std::uint32_t>(data[18]) |
+        (static_cast<std::uint32_t>(data[19]) << 8U);
+    value.addressHigh = static_cast<std::uint32_t>(data[20]) |
+        (static_cast<std::uint32_t>(data[21]) << 8U);
+}
+
+static void CaptureNicTxObservation(NicTxFailureEvent& event) noexcept
+{
+    const DWORD savedError = GetLastError();
+    LARGE_INTEGER qpc{};
+    const BOOL qpcResult = RtQueryPerformanceCounter(&qpc);
+    if (qpcResult && qpc.QuadPart >= 0)
+    {
+        event.failureQpc = qpc.QuadPart;
+        event.failureQpcValid = 1U;
+    }
+    const int priority = RtGetThreadPriority(GetCurrentThread());
+    event.observedThreadPriority = priority;
+    if (priority != THREAD_PRIORITY_ERROR_RETURN && priority >= 0 && priority <= 127)
+    {
+        event.observedThreadPriorityValid = 1U;
+    }
+    SetLastError(savedError);
+}
+
+// Startup-only bounded readback. A partial enumeration, duplicate MAC match,
+// or error is explicitly invalid. No NAL setting is changed.
+static NicTxInterfaceObservation ObserveNicTxInterface(
+    const unsigned char* mac) noexcept
+{
+    NicTxInterfaceObservation result{};
+    const DWORD savedError = GetLastError();
+    for (DWORD index = 0U; index < 64U; ++index)
+    {
+        RTNAL_INTERFACE info{};
+        if (!RtNalEnumInterfaceInfo(&info, index))
+        {
+            result.enumerationError = GetLastError();
+            result.enumerationComplete =
+                result.enumerationError == ERROR_NO_MORE_ITEMS ? 1U : 0U;
+            break;
+        }
+        ++result.enumerated;
+        if (memcmp(info.MacAddress, mac, 6U) != 0) continue;
+        ++result.matches;
+        result.version = info.Version;
+        result.intPriority = info.IntPriority;
+        result.intIdealProcessor = info.IntIdealProcessor;
+        result.txCompletePriority = info.TxCompletePriority;
+        result.txCompleteIdealProcessor = info.TxCompleteIdealProcessor;
+        result.numTxBuffers = info.NumTxBuffers;
+    }
+    if (result.enumerationComplete == 0U)
+        result.status = result.enumerated == 64U ? 3U : 2U;
+    else if (result.matches == 0U) result.status = 4U;
+    else if (result.matches != 1U) result.status = 5U;
+    else if (result.intPriority > 127U || result.txCompletePriority > 127U)
+        result.status = 6U;
+    else result.status = 1U;
+    result.valid = result.status == 1U ? 1U : 0U;
+    SetLastError(savedError);
+    return result;
+}
+
+static const char* NicTxCallerName(NicTxCaller caller) noexcept
+{
+    switch (caller)
+    {
+    case NicTxCaller::ControlDatagram: return "CONTROL_DATAGRAM";
+    case NicTxCaller::RuntimeLRW: return "RUNTIME_LRW";
+    case NicTxCaller::RuntimeLRW_FRMW: return "RUNTIME_LRW_FRMW";
+    case NicTxCaller::RuntimeSDO: return "RUNTIME_SDO";
+    case NicTxCaller::RuntimeEscDiag: return "RUNTIME_ESC_DIAG";
+    case NicTxCaller::OtherLRW: return "OTHER_LRW";
+    case NicTxCaller::OtherLRW_FRMW: return "OTHER_LRW_FRMW";
+    default: return "UNSPECIFIED";
+    }
+}
+
+static void PrintNicTxFailureTrace() noexcept
+{
+    for (std::size_t drained = 0U; drained < NicTxFailureTrace::Capacity; ++drained)
+    {
+        NicTxFailureEvent event{};
+        if (!g_nicTxFailureTrace.TryPop(event)) break;
+        const NicTxReceipt& call = event.receipt;
+        const NicTxCallContext& c = event.context;
+        const NicTxPreviousInvocation& previous = event.previous;
+        const NicTxCallContext& pc = previous.context;
+        const NicTxInterfaceObservation& config = event.interfaceObservation;
+        // Each bounded row joins by publication/open/call. These are software
+        // observations; neither NAL return nor ownership observation is drive ACK.
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=RECEIPT publication=%llu open=%llu call=%llu coherent=1 failureOnly=%lu kind=%s notDriveAck=1 caller=%s reason=%lu length=%lu nalInvoked=%lu apiResult=%ld submitted=%lu error=0x%08lX errorValid=%lu\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration),
+            static_cast<unsigned long long>(call.callSequence),
+            event.kind == NicTxEventKind::Failure ? 1UL : 0UL,
+            event.kind == NicTxEventKind::Failure ? "FAILURE" : "OWNERSHIP_RETURNED",
+            NicTxCallerName(c.caller), static_cast<unsigned long>(call.reason),
+            static_cast<unsigned long>(call.length), static_cast<unsigned long>(call.nalInvoked),
+            static_cast<long>(call.apiResult), static_cast<unsigned long>(call.submitted),
+            static_cast<unsigned long>(call.error), static_cast<unsigned long>(call.errorValid));
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=POOL publication=%llu open=%llu call=%llu frameSlot=%lu observedFrameSlot=%lu previousFrameSlot=%lu slots=%lu applicationOwned=%lu protocolFence=%lu producerOverlap=%lu slotState=%lu responseTrustTainted=%lu responseTrustValid=%lu readOnlyEscSlot=%lu cyclicFrame=%lu historyScope=FRAME responseIsNotOwnership=1\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration),
+            static_cast<unsigned long long>(call.callSequence),
+            static_cast<unsigned long>(call.frameSlot),
+            static_cast<unsigned long>(event.observedFrameSlot),
+            static_cast<unsigned long>(previous.receipt.frameSlot),
+            static_cast<unsigned long>(event.poolSlotCount),
+            static_cast<unsigned long>(event.poolOwnedCount),
+            static_cast<unsigned long>(event.protocolFence),
+            static_cast<unsigned long>(event.producerOverlap),
+            static_cast<unsigned long>(event.slotState),
+            static_cast<unsigned long>(event.responseTrustTainted),
+            static_cast<unsigned long>(event.responseTrustValid),
+            static_cast<unsigned long>(event.slotReadOnlyEsc),
+            static_cast<unsigned long>(event.currentCyclicFrame));
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=PACKET publication=%llu open=%llu call=%llu observationQpc=%lld qpcValid=%lu datagramValid=%lu cmd=%lu idx=%lu addressLow=0x%04lX addressHigh=0x%04lX notDriveAck=1\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration),
+            static_cast<unsigned long long>(call.callSequence), static_cast<long long>(event.failureQpc),
+            static_cast<unsigned long>(event.failureQpcValid), static_cast<unsigned long>(event.datagramValid),
+            static_cast<unsigned long>(event.command), static_cast<unsigned long>(event.index),
+            static_cast<unsigned long>(event.addressLow), static_cast<unsigned long>(event.addressHigh));
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=AUTHORITY publication=%llu open=%llu call=%llu pdoTick=%llu pdoTickValid=%lu sourceTick=%llu sourceTickValid=%lu authorityHeld=%lu packedOwner=0x%016llX packedEpoch=0x%016llX edmGuardHeld=%lu edmFeedbackPublication=%llu notDriveAck=1\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration),
+            static_cast<unsigned long long>(call.callSequence),
+            static_cast<unsigned long long>(c.pdoTick), static_cast<unsigned long>(c.pdoTickValid),
+            static_cast<unsigned long long>(c.sourceTick), static_cast<unsigned long>(c.sourceTickValid),
+            static_cast<unsigned long>(c.authorityValid), static_cast<unsigned long long>(c.packedOwnerState),
+            static_cast<unsigned long long>(c.packedExecutionPublication), static_cast<unsigned long>(c.edmGuardHeld),
+            static_cast<unsigned long long>(c.edmFeedbackPublication));
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=PREVIOUS publication=%llu open=%llu call=%llu historyCoherent=%lu historyGaps=%llu previousValid=%lu previousOpen=%llu previousCall=%llu caller=%s reason=%lu length=%lu nalInvoked=%lu apiResult=%ld submitted=%lu error=0x%08lX errorValid=%lu\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration),
+            static_cast<unsigned long long>(call.callSequence), static_cast<unsigned long>(event.historyCoherent),
+            static_cast<unsigned long long>(event.historyGaps), static_cast<unsigned long>(previous.valid),
+            static_cast<unsigned long long>(previous.openGeneration),
+            static_cast<unsigned long long>(previous.receipt.callSequence), NicTxCallerName(pc.caller),
+            static_cast<unsigned long>(previous.receipt.reason), static_cast<unsigned long>(previous.receipt.length),
+            static_cast<unsigned long>(previous.receipt.nalInvoked), static_cast<long>(previous.receipt.apiResult),
+            static_cast<unsigned long>(previous.receipt.submitted), static_cast<unsigned long>(previous.receipt.error),
+            static_cast<unsigned long>(previous.receipt.errorValid));
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=PREV_PACKET publication=%llu open=%llu call=%llu datagramValid=%lu cmd=%lu idx=%lu addressLow=0x%04lX addressHigh=0x%04lX pdoTick=%llu pdoTickValid=%lu sourceTick=%llu sourceTickValid=%lu\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration), static_cast<unsigned long long>(call.callSequence),
+            static_cast<unsigned long>(previous.datagramValid), static_cast<unsigned long>(previous.command),
+            static_cast<unsigned long>(previous.index), static_cast<unsigned long>(previous.addressLow),
+            static_cast<unsigned long>(previous.addressHigh), static_cast<unsigned long long>(pc.pdoTick),
+            static_cast<unsigned long>(pc.pdoTickValid), static_cast<unsigned long long>(pc.sourceTick),
+            static_cast<unsigned long>(pc.sourceTickValid));
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=PREV_AUTHORITY publication=%llu open=%llu call=%llu authorityHeld=%lu packedOwner=0x%016llX packedEpoch=0x%016llX edmGuardHeld=%lu edmFeedbackPublication=%llu notDriveAck=1\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration), static_cast<unsigned long long>(call.callSequence),
+            static_cast<unsigned long>(pc.authorityValid), static_cast<unsigned long long>(pc.packedOwnerState),
+            static_cast<unsigned long long>(pc.packedExecutionPublication), static_cast<unsigned long>(pc.edmGuardHeld),
+            static_cast<unsigned long long>(pc.edmFeedbackPublication));
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=TIMING publication=%llu open=%llu call=%llu previousReturnQpc=%lld previousReturnQpcValid=%lu previousAgeQpc=%llu ageValid=%lu frequency=%llu frequencyValid=%lu boundary=NAL_RETURN_TO_OBSERVATION notCompletionLatency=1\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration), static_cast<unsigned long long>(call.callSequence),
+            static_cast<long long>(previous.returnQpc), static_cast<unsigned long>(previous.returnQpcValid),
+            static_cast<unsigned long long>(event.previousAgeQpc), static_cast<unsigned long>(event.previousAgeQpcValid),
+            static_cast<unsigned long long>(event.qpcFrequency), static_cast<unsigned long>(event.qpcFrequencyValid));
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=BUSY publication=%llu open=%llu call=%llu firstCall=%llu lastCall=%llu count=%llu firstQpc=%lld firstQpcValid=%lu lastQpc=%lld lastQpcValid=%lu observationOnly=1\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration), static_cast<unsigned long long>(call.callSequence),
+            static_cast<unsigned long long>(event.busy.firstCall), static_cast<unsigned long long>(event.busy.lastCall),
+            static_cast<unsigned long long>(event.busy.count), static_cast<long long>(event.busy.firstQpc),
+            static_cast<unsigned long>(event.busy.firstQpcValid), static_cast<long long>(event.busy.lastQpc),
+            static_cast<unsigned long>(event.busy.lastQpcValid));
+        RtPrintf("[NIC-TX-EVENT] build=EDM45 part=SCHEDULING publication=%llu open=%llu call=%llu observedPriority=%ld observedPriorityValid=%lu configAtOpen=1 configValid=%lu configStatus=%lu intPriority=%lu intProcessor=%lu txPriority=%lu txProcessor=%lu txBuffers=%lu noPriorityChange=1\n",
+            static_cast<unsigned long long>(event.publicationSequence),
+            static_cast<unsigned long long>(event.openGeneration), static_cast<unsigned long long>(call.callSequence),
+            static_cast<long>(event.observedThreadPriority), static_cast<unsigned long>(event.observedThreadPriorityValid),
+            static_cast<unsigned long>(config.valid), static_cast<unsigned long>(config.status),
+            static_cast<unsigned long>(config.intPriority), static_cast<unsigned long>(config.intIdealProcessor),
+            static_cast<unsigned long>(config.txCompletePriority), static_cast<unsigned long>(config.txCompleteIdealProcessor),
+            static_cast<unsigned long>(config.numTxBuffers));
+    }
+    static std::uint64_t lastPrintedDropped = 0ULL;
+    const std::uint64_t dropped = g_nicTxFailureTrace.Dropped();
+    if (dropped != lastPrintedDropped)
+    {
+        lastPrintedDropped = dropped;
+        RtPrintf("[NIC-TX-TRACE-LOSS] build=EDM45 countersAdvisory=1 scope=PROCESS attempts=%llu dropped=%llu capacity=16 noRecoveryAuthority=1\n",
+            static_cast<unsigned long long>(g_nicTxFailureTrace.Attempts()),
+            static_cast<unsigned long long>(dropped));
+    }
+}
+
+void PrintNicTransmitFailureDiagnostic() noexcept
+{
+    PrintNicTxFailureTrace();
+    // Called by the existing low-priority diagnostic consumer. No queue/NAL
+    // operations, retries or producer-side formatting are introduced.
+    static LONGLONG lastPrintedPublications = 0;
+    const LONGLONG publications =
+        InterlockedCompareExchange64(&g_nicTxFailurePublications, 0, 0);
+    if (publications == 0 || publications == lastPrintedPublications) return;
+    lastPrintedPublications = publications;
+    const auto read64 = [](volatile LONGLONG* value) noexcept -> LONGLONG
+    { return InterlockedCompareExchange64(value, 0, 0); };
+    RtPrintf("[NIC-TX-FAIL] build=EDM45 part=TOTAL cumulative=1 advisory=1 coherent=0 failureScope=PROCESS callScope=OPEN failures=%llu calls=%llu accepted=%llu preInvalid=%llu preOwnership=%llu nalFailed=%llu countMismatch=%llu\n",
+        static_cast<unsigned long long>(publications),
+        static_cast<unsigned long long>(read64(&g_nicTxCalls)),
+        static_cast<unsigned long long>(read64(&g_nicTxSuccess)),
+        static_cast<unsigned long long>(read64(&g_nicTxFailureAdvisory[0].count)),
+        static_cast<unsigned long long>(read64(&g_nicTxFailureAdvisory[1].count)),
+        static_cast<unsigned long long>(read64(&g_nicTxFailureAdvisory[2].count)),
+        static_cast<unsigned long long>(read64(&g_nicTxFailureAdvisory[3].count)));
+    RtPrintf("[NIC-TX-FAIL] build=EDM45 part=OWNERSHIP cumulative=1 advisory=1 coherent=0 failures=%llu ownershipNotOwner=%llu ownershipInvalidAddress=%llu ownershipNotReady=%llu ownershipOther=%llu legacyFrameBusy=%llu legacyNotOwner=%llu legacySubmitFail=%llu legacySubmitted0=%llu\n",
+        static_cast<unsigned long long>(publications),
+        static_cast<unsigned long long>(read64(&g_nicTxOwnershipNotOwner)),
+        static_cast<unsigned long long>(read64(&g_nicTxOwnershipInvalidAddress)),
+        static_cast<unsigned long long>(read64(&g_nicTxOwnershipNotReady)),
+        static_cast<unsigned long long>(read64(&g_nicTxOwnershipOther)),
+        static_cast<unsigned long long>(read64(&g_nicTxFrameBusy)),
+        static_cast<unsigned long long>(read64(&g_nicTxNotOwner)),
+        static_cast<unsigned long long>(read64(&g_nicTxSubmitFail)),
+        static_cast<unsigned long long>(read64(&g_nicTxSubmitted0)));
+    const char* const names[4] = {
+        "PRE_INVALID", "PRE_OWNERSHIP", "NAL_FAILED", "COUNT_MISMATCH" };
+    for (unsigned i = 0U; i < 4U; ++i)
+    {
+        NicTxFailureAdvisory& slot = g_nicTxFailureAdvisory[i];
+        if (read64(&slot.count) == 0) continue;
+        RtPrintf("[NIC-TX-REASON] build=PBC3J_FIX3 advisory=1 coherent=0 reason=%s count=%llu lastCall=%llu lastError=0x%08lX errorValid=%lu submitted=%lu\n",
+            names[i], static_cast<unsigned long long>(read64(&slot.count)),
+            static_cast<unsigned long long>(read64(&slot.lastCallSequence)),
+            static_cast<unsigned long>(InterlockedCompareExchange(&slot.error, 0, 0)),
+            static_cast<unsigned long>(InterlockedCompareExchange(&slot.errorValid, 0, 0)),
+            static_cast<unsigned long>(InterlockedCompareExchange(&slot.submitted, 0, 0)));
+    }
+}
+
 CNicDriver::CNicDriver()
     : m_hTxQueue(NULL),
-    m_hRxQueue(NULL),
-    m_pTxFrame(NULL)
+    m_hRxQueue(NULL)
 {
-    memset(m_pTxFrameArray, 0, sizeof(m_pTxFrameArray));
     memset(m_MacAddress, 0, sizeof(m_MacAddress));
     memset(&m_RxQueueEvents, 0, sizeof(m_RxQueueEvents));
     memset(&m_RxPacket, 0, sizeof(m_RxPacket));
@@ -184,16 +450,18 @@ bool CNicDriver::Open()
         DEBUG_PRINT("CNicDriver: EtherCAT Filter (0x88A4) Applied.\n");
     }
 
-    // 配置一個由 NAL 管理 ownership 的 zero-copy TX Frame。
-    m_pTxFrame = RtNalAllocateFrame(MAX_ETHER_FRAME_SIZE);
-    if (m_pTxFrame == NULL)
+    // EDM45: allocate the bounded pool only while Open/Close are quiescent.
+    // Each slot stays untouched while NAL owns it; there is no runtime growth.
+    for (std::size_t i = 0U; i < NicTxFrameLifecycle::SlotCount; ++i)
     {
-        DEBUG_PRINT("CNicDriver Error: Failed to allocate TX frame.\n");
-        Close();
-        return false;
+        m_TxFrames[i] = RtNalAllocateFrame(MAX_ETHER_FRAME_SIZE);
+        if (m_TxFrames[i] == NULL)
+        {
+            DEBUG_PRINT("CNicDriver Error: Failed to allocate TX frame pool.\n");
+            Close();
+            return false;
+        }
     }
-
-    m_pTxFrameArray[0] = m_pTxFrame;
     m_RxPacket.Owner = this;
     m_RxPacket.Length = 0;
     m_RxCallCounter = 0ULL;
@@ -208,19 +476,49 @@ bool CNicDriver::Open()
     InterlockedExchange64(&g_nicTxSubmitted0, 0);
     InterlockedExchange(&g_nicTxLastError, ERROR_SUCCESS);
 
+    // FIX3 advisory failure counters intentionally span all Open calls in this process.
+    m_TxOpenGeneration = static_cast<std::uint64_t>(
+        InterlockedIncrement64(&g_nicTxOpenGeneration));
+
+    const DWORD txDiagnosticSavedError = GetLastError();
+    LARGE_INTEGER txQpcFrequency{};
+    const BOOL txQpcFrequencyResult = RtQueryPerformanceFrequency(&txQpcFrequency);
+    const bool txQpcFrequencyValid = txQpcFrequencyResult && txQpcFrequency.QuadPart > 0;
+    m_TxLifecycle.Reset(m_TxOpenGeneration);
+    for (std::size_t i = 0U; i < NicTxFrameLifecycle::SlotCount; ++i)
+        m_TxOwnershipTrace[i].Reset(txQpcFrequencyValid ?
+            static_cast<std::uint64_t>(txQpcFrequency.QuadPart) : 0ULL, txQpcFrequencyValid);
+    m_TxInterfaceObservation = ObserveNicTxInterface(m_MacAddress);
+    const NicTxInterfaceObservation& config = m_TxInterfaceObservation;
+    DEBUG_PRINT("[NIC-TX-CONFIG] build=EDM45 open=%llu valid=%lu status=%lu matches=%lu enumerationComplete=%lu enumerationError=0x%08lX enumerated=%lu cap=64 version=%lu intPriority=%lu intProcessor=%lu txPriority=%lu txProcessor=%lu txBuffers=%lu observedOnly=1 poolSlots=4 protocolFence=1 responseIsNotOwnership=1\n",
+        static_cast<unsigned long long>(m_TxOpenGeneration),
+        static_cast<unsigned long>(config.valid), static_cast<unsigned long>(config.status),
+        static_cast<unsigned long>(config.matches),
+        static_cast<unsigned long>(config.enumerationComplete),
+        static_cast<unsigned long>(config.enumerationError), static_cast<unsigned long>(config.enumerated),
+        static_cast<unsigned long>(config.version), static_cast<unsigned long>(config.intPriority),
+        static_cast<unsigned long>(config.intIdealProcessor), static_cast<unsigned long>(config.txCompletePriority),
+        static_cast<unsigned long>(config.txCompleteIdealProcessor), static_cast<unsigned long>(config.numTxBuffers));
+
+    SetLastError(txDiagnosticSavedError);
     DEBUG_PRINT("--- Network Interface Ready ---\n");
     return true;
 }
 
 void CNicDriver::Close()
 {
-    // RtNalFreeFrame() 會等待 NAL 歸還尚在傳送中的 Frame。
-    if (m_pTxFrame != NULL)
+    // Quiescent teardown only: NAL defers reclamation of its owned frames.
+    // FreeFrame is not a documented synchronous completion barrier. Partial
+    // Open failure follows the same cleanup; no callback lifetime is added.
+    for (std::size_t i = 0U; i < NicTxFrameLifecycle::SlotCount; ++i)
     {
-        RtNalFreeFrame(m_pTxFrame);
-        m_pTxFrame = NULL;
-        m_pTxFrameArray[0] = NULL;
+        if (m_TxFrames[i] != NULL)
+        {
+            RtNalFreeFrame(m_TxFrames[i]);
+            m_TxFrames[i] = NULL;
+        }
     }
+    m_TxLifecycle.Invalidate();
 
     if (m_hTxQueue != NULL)
     {
@@ -238,76 +536,261 @@ void CNicDriver::Close()
     m_RxPacket.Length = 0;
 }
 
-bool CNicDriver::SendPacket(unsigned char* pData, unsigned int length)
+bool CNicDriver::SendPacket(unsigned char* pData, unsigned int length,
+    NicTxReceipt* receipt, const NicTxCallContext* context)
 {
-    // Calls 包含成功、輸入錯誤、ownership busy 與提交失敗。
-    InterlockedIncrement64(&g_nicTxCalls);
+    NicTxReceipt call{};
+    call.callSequence = static_cast<std::uint64_t>(
+        InterlockedIncrement64(&g_nicTxCalls));
+    call.length = static_cast<std::uint32_t>(length);
+    call.openGeneration = m_TxOpenGeneration;
+    NicTxProducerScope producerScope(m_TxProducerActive);
+    std::size_t observedSlot = NicTxFrameLifecycle::NoSlot;
+    std::uint32_t ownedCount = 0U;
+    bool protocolFence = false;
+    const bool isLrwFrame = NicTxFrameLifecycle::IsCyclicFrame(pData, length, false);
+    const bool isLrwFrmwFrame = NicTxFrameLifecycle::IsCyclicFrame(pData, length, true);
+    const bool currentIsRuntimeCyclic = context != nullptr &&
+        ((context->caller == NicTxCaller::RuntimeLRW && isLrwFrame) ||
+         (context->caller == NicTxCaller::RuntimeLRW_FRMW && isLrwFrmwFrame));
+    const bool readOnlyEscProbe = context != nullptr &&
+        context->caller == NicTxCaller::RuntimeEscDiag &&
+        NicTxFrameLifecycle::IsReadOnlyEscProbe(pData, length);
+    LARGE_INTEGER nalReturnQpc{};
+    bool nalReturnQpcValid = false;
 
-    // 在接觸 NAL Frame 前先驗證 Handle、資料位址與長度。
-    if (m_hTxQueue == NULL ||
-        m_pTxFrame == NULL ||
-        pData == NULL ||
-        length == 0 ||
-        length > MAX_ETHER_FRAME_SIZE)
+    const auto populateEvent = [&](NicTxFailureEvent& event) noexcept
     {
+        event.receipt = call;
+        if (context != nullptr) event.context = *context;
+        event.openGeneration = call.openGeneration;
+        event.interfaceObservation = m_TxInterfaceObservation;
+        event.poolOwnedCount = ownedCount;
+        event.protocolFence = protocolFence ? 1U : 0U;
+        event.producerOverlap = producerScope.Held() ? 0U : 1U;
+        event.currentCyclicFrame = currentIsRuntimeCyclic ? 1U : 0U;
+        if (producerScope.Held())
+        {
+            event.responseTrustValid = 1U;
+            event.responseTrustTainted = m_TxLifecycle.ResponseTrustTainted() ? 1U : 0U;
+        }
+        if (observedSlot < NicTxFrameLifecycle::SlotCount)
+        {
+            event.observedFrameSlot = static_cast<std::uint32_t>(observedSlot + 1U);
+            event.slotState = static_cast<std::uint32_t>(m_TxLifecycle.SlotState(observedSlot));
+            event.slotReadOnlyEsc = m_TxLifecycle.IsReadOnlyEscSlot(observedSlot) ? 1U : 0U;
+        }
+        CaptureNicTxObservation(event);
+    };
+    const auto finish = [&](NicTxReason reason, bool accepted) noexcept -> bool
+    {
+        call.reason = reason;
+        if (call.nalInvoked != 0U && observedSlot < NicTxFrameLifecycle::SlotCount)
+        {
+            // Mailbox/control FPRD/FPWR share index identities with startup
+            // traffic. Their RX cannot grant response-only pool advancement.
+            const bool responseTrustRelevant = isLrwFrame || isLrwFrmwFrame ||
+                (context != nullptr &&
+                    (context->caller == NicTxCaller::RuntimeLRW ||
+                     context->caller == NicTxCaller::RuntimeLRW_FRMW ||
+                     context->caller == NicTxCaller::OtherLRW ||
+                     context->caller == NicTxCaller::OtherLRW_FRMW));
+            m_TxLifecycle.RecordInvocation(observedSlot, call,
+                currentIsRuntimeCyclic, responseTrustRelevant, readOnlyEscProbe);
+        }
+        if (!accepted)
+        {
+            unsigned advisoryIndex = 3U;
+            if (reason == NicTxReason::PreSubmitInvalidInput) advisoryIndex = 0U;
+            else if (reason == NicTxReason::PreSubmitOwnershipRejected) advisoryIndex = 1U;
+            else if (reason == NicTxReason::NalCallFailed) advisoryIndex = 2U;
+            NicTxFailureAdvisory& advisory = g_nicTxFailureAdvisory[advisoryIndex];
+            InterlockedExchange64(&advisory.lastCallSequence,
+                static_cast<LONGLONG>(call.callSequence));
+            InterlockedExchange(&advisory.error, static_cast<LONG>(call.error));
+            InterlockedExchange(&advisory.errorValid, static_cast<LONG>(call.errorValid));
+            InterlockedExchange(&advisory.submitted, static_cast<LONG>(call.submitted));
+            InterlockedIncrement64(&advisory.count);
+            InterlockedIncrement64(&g_nicTxFailurePublications);
+            NicTxFailureEvent event{};
+            populateEvent(event);
+            if (reason != NicTxReason::PreSubmitInvalidInput)
+                CaptureNicTxDatagram(event, pData, length);
+            if (observedSlot < NicTxFrameLifecycle::SlotCount)
+            {
+                NicTxOwnershipTraceState& trace = m_TxOwnershipTrace[observedSlot];
+                NicTxOwnershipTraceState::CallScope diagnosticScope(trace);
+                trace.ObserveFailure(diagnosticScope, event,
+                    call.errorValid != 0U && call.error == ERROR_NOT_OWNER);
+                trace.ValidateEvent(diagnosticScope, event);
+            }
+            (void)g_nicTxFailureTrace.TryPublish(event);
+        }
+        if (call.nalInvoked != 0U && observedSlot < NicTxFrameLifecycle::SlotCount)
+        {
+            // Every NAL invocation is retained, including ambiguous failures.
+            // Nothing here reclassifies such a receipt as definitely unsent.
+            NicTxPreviousInvocation invocation{};
+            invocation.receipt = call;
+            if (context != nullptr) invocation.context = *context;
+            invocation.openGeneration = call.openGeneration;
+            invocation.returnQpc = nalReturnQpcValid ? nalReturnQpc.QuadPart : 0;
+            invocation.returnQpcValid = nalReturnQpcValid ? 1U : 0U;
+            CaptureNicTxDatagram(invocation, pData, length);
+            NicTxOwnershipTraceState& trace = m_TxOwnershipTrace[observedSlot];
+            NicTxOwnershipTraceState::CallScope diagnosticScope(trace);
+            trace.RecordInvocation(diagnosticScope, invocation);
+        }
+        if (receipt != nullptr) *receipt = call;
+        return accepted;
+    };
+
+    // A losing producer never reads pool state or calls NAL. This is a real
+    // pre-submit rejection, unlike the older diagnostic-only CallScope.
+    if (!producerScope.Held())
+    {
+        call.error = ERROR_BUSY;
+        call.errorValid = 1U;
+        InterlockedIncrement64(&g_nicTxFrameBusy);
+        InterlockedExchange(&g_nicTxLastError, ERROR_BUSY);
+        SetLastError(ERROR_BUSY);
+        return finish(NicTxReason::PreSubmitOwnershipRejected, false);
+    }
+    if (m_hTxQueue == NULL || pData == NULL ||
+        length == 0 || length > MAX_ETHER_FRAME_SIZE)
+    {
+        call.error = ERROR_INVALID_PARAMETER;
+        call.errorValid = 1U;
         InterlockedIncrement64(&g_nicTxSubmitFail);
         InterlockedExchange(&g_nicTxLastError, ERROR_INVALID_PARAMETER);
-        return false;
+        return finish(NicTxReason::PreSubmitInvalidInput, false);
     }
 
-    // 只有 Application 擁有 Frame 時才能修改 frameSize 與資料緩衝區。
-    // 若 NAL 尚未完成上一筆 TX，直接回傳 false，絕不覆寫使用中的 Frame。
-    if (!RtNalIsApplicationFrame(m_pTxFrame))
+    bool owned[NicTxFrameLifecycle::SlotCount] = {};
+    DWORD ownershipError[NicTxFrameLifecycle::SlotCount] = {};
+    std::size_t availableSlot = NicTxFrameLifecycle::NoSlot;
+    std::size_t ownershipFaultSlot = NicTxFrameLifecycle::NoSlot;
+    // One fixed scan: no spin, retry, allocation, or assumed return latency.
+    // Ownership-only reuse remains available after cyclic trust is tainted.
+    for (std::size_t i = 0U; i < NicTxFrameLifecycle::SlotCount; ++i)
     {
-        const DWORD error = GetLastError();
+        if (m_TxFrames[i] == NULL)
+        {
+            call.error = ERROR_INVALID_PARAMETER;
+            call.errorValid = 1U;
+            InterlockedIncrement64(&g_nicTxSubmitFail);
+            InterlockedExchange(&g_nicTxLastError, ERROR_INVALID_PARAMETER);
+                return finish(NicTxReason::PreSubmitInvalidInput, false);
+        }
+        owned[i] = RtNalIsApplicationFrame(m_TxFrames[i]) != FALSE;
+        if (owned[i])
+        {
+            ++ownedCount;
+            if (availableSlot == NicTxFrameLifecycle::NoSlot) availableSlot = i;
+        }
+        else
+        {
+            ownershipError[i] = GetLastError();
+            if (ownershipError[i] != ERROR_NOT_OWNER &&
+                ownershipFaultSlot == NicTxFrameLifecycle::NoSlot)
+                ownershipFaultSlot = i;
+        }
+    }
+    for (std::size_t i = 0U; i < NicTxFrameLifecycle::SlotCount; ++i)
+    {
+        if (!owned[i]) continue;
+        observedSlot = i;
+        NicTxOwnershipTraceState& trace = m_TxOwnershipTrace[i];
+        NicTxOwnershipTraceState::CallScope diagnosticScope(trace);
+        if (trace.HasBusyEpisode(diagnosticScope))
+        {
+            NicTxFailureEvent event{};
+            populateEvent(event);
+            CaptureNicTxDatagram(event, pData, length);
+            if (trace.ObserveOwnershipReturn(diagnosticScope, event))
+            {
+                trace.ValidateEvent(diagnosticScope, event);
+                (void)g_nicTxFailureTrace.TryPublish(event);
+            }
+        }
+        m_TxLifecycle.ObserveApplicationOwnership(i);
+    }
+    observedSlot = m_TxLifecycle.BlockingSlot(currentIsRuntimeCyclic);
+    protocolFence = observedSlot != NicTxFrameLifecycle::NoSlot;
+    if (ownershipFaultSlot != NicTxFrameLifecycle::NoSlot ||
+        protocolFence || availableSlot == NicTxFrameLifecycle::NoSlot)
+    {
+        // Even a free slot cannot pass an older unresolved/uncertain frame.
+        // A pool-exhausted event identifies slot 1 as a concrete busy frame;
+        // it does not claim that slot contains the globally previous call.
+        if (ownershipFaultSlot != NicTxFrameLifecycle::NoSlot)
+        {
+            // INVALID_ADDRESS/NOT_READY/other errors are never hidden by a
+            // spare frame, even when the bad slot has no recorded invocation.
+            observedSlot = ownershipFaultSlot;
+            protocolFence = false;
+        }
+        else if (!protocolFence) observedSlot = 0U;
+        const DWORD error = ownershipError[observedSlot];
+        call.error = static_cast<std::uint32_t>(error);
+        call.errorValid = 1U;
         InterlockedIncrement64(&g_nicTxFrameBusy);
         InterlockedExchange(&g_nicTxLastError, static_cast<LONG>(error));
-        return false;
+        if (error == ERROR_NOT_OWNER) InterlockedIncrement64(&g_nicTxOwnershipNotOwner);
+        else if (error == ERROR_INVALID_ADDRESS) InterlockedIncrement64(&g_nicTxOwnershipInvalidAddress);
+        else if (error == ERROR_NOT_READY) InterlockedIncrement64(&g_nicTxOwnershipNotReady);
+        else InterlockedIncrement64(&g_nicTxOwnershipOther);
+        SetLastError(error);
+        return finish(NicTxReason::PreSubmitOwnershipRejected, false);
     }
 
-    // Ownership 已確認，現在才可安全填入 Ethernet Frame。
-    memcpy(m_pTxFrame->frameBufferVirtualAddr, pData, length);
-    m_pTxFrame->frameSize = length;
-
+    observedSlot = availableSlot;
+    call.frameSlot = static_cast<std::uint32_t>(availableSlot + 1U);
+    PRTNAL_FRAME frame = m_TxFrames[availableSlot];
+    memcpy(frame->frameBufferVirtualAddr, pData, length);
+    frame->frameSize = length;
     ULONG submitted = 0;
-    // RtNalTransmitEx() 成功後 ownership 交給 NAL，直到 TX complete 歸還。
-    const BOOL result = RtNalTransmitEx(
-        m_hTxQueue,
-        m_pTxFrameArray,
-        1,
-        &submitted);
+    call.nalInvoked = 1U;
+    const BOOL result = RtNalTransmitEx(m_hTxQueue, &m_TxFrames[availableSlot], 1, &submitted);
+    const DWORD nalThreadError = GetLastError();
+    const BOOL nalReturnQpcResult = RtQueryPerformanceCounter(&nalReturnQpc);
+    nalReturnQpcValid = nalReturnQpcResult && nalReturnQpc.QuadPart >= 0;
+    SetLastError(nalThreadError);
+    call.apiResult = static_cast<std::int32_t>(result);
+    call.submitted = static_cast<std::uint32_t>(submitted);
 
-    // API 失敗時保留 submitted 與 GetLastError()，供長時間測試定位。
+    // NAL failure/count mismatch remains possibly submitted and quarantined
+    // until actual ownership return. A response cannot clear uncertainty.
     if (result != TRUE)
     {
         const DWORD error = GetLastError();
+        call.error = static_cast<std::uint32_t>(error);
+        call.errorValid = submitted == 0 ? 1U : 0U;
         InterlockedIncrement64(&g_nicTxSubmitFail);
-
-        if (submitted == 0)
-            InterlockedIncrement64(&g_nicTxSubmitted0);
-
-        if (error == ERROR_NOT_OWNER)
-            InterlockedIncrement64(&g_nicTxNotOwner);
-
+        if (submitted == 0) InterlockedIncrement64(&g_nicTxSubmitted0);
+        if (error == ERROR_NOT_OWNER) InterlockedIncrement64(&g_nicTxNotOwner);
         InterlockedExchange(&g_nicTxLastError, static_cast<LONG>(error));
-        return false;
+        return finish(NicTxReason::NalCallFailed, false);
     }
-
-    // 本版本一次只提交一個 Frame，成功條件必須嚴格等於 1。
     if (submitted != 1)
     {
-        const DWORD error = GetLastError();
+        const DWORD error = submitted == 0 ? GetLastError() : ERROR_SUCCESS;
+        call.error = static_cast<std::uint32_t>(error);
+        call.errorValid = submitted == 0 ? 1U : 0U;
         InterlockedIncrement64(&g_nicTxSubmitFail);
-
-        if (submitted == 0)
-            InterlockedIncrement64(&g_nicTxSubmitted0);
-
+        if (submitted == 0) InterlockedIncrement64(&g_nicTxSubmitted0);
         InterlockedExchange(&g_nicTxLastError, static_cast<LONG>(error));
-        return false;
+        return finish(NicTxReason::SubmittedCountMismatch, false);
     }
-
     InterlockedIncrement64(&g_nicTxSuccess);
-    return true;
+    return finish(NicTxReason::Accepted, true);
+}
+
+bool CNicDriver::ObserveValidatedTxResponse(const NicTxReceipt& receipt) noexcept
+{
+    NicTxProducerScope producerScope(m_TxProducerActive);
+    if (!producerScope.Held() || m_hTxQueue == NULL) return false;
+    return m_TxLifecycle.ObserveValidatedResponse(receipt);
 }
 
 void CNicDriver::PublishReceiveCallDiagnostic(
@@ -323,7 +806,7 @@ void CNicDriver::PublishReceiveCallDiagnostic(
     diagnostic.LastError = lastError;
     diagnostic.Length = static_cast<uint32_t>(length);
 
-    // The same Priority-64 owner reads this immediately after ReceivePacket().
+    // The same communications owner reads this immediately after ReceivePacket().
     m_LastRxCallDiagnostic = diagnostic;
 }
 

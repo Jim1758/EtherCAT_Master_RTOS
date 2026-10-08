@@ -217,6 +217,11 @@ void NCManager::BeginPathCoreReplayCaptureSameThread(const NCBlock& block, NCBlo
     for (int i = 0; plainStop && i < 26; ++i)
         if (block.hasParam[i] && i != ('N' - 'A')) plainStop = false;
     if (block.isEmpty || plainStop) return;
+    // EDM03-12 preserve history only for a validated opt-in P22-P27 arm.
+    // P26/P27 retain primers; later sources are appended only by the existing
+    // real completion callback.
+    if (block.gCode == 178 && block.has('P') && (block.val('P') == 22.0 || block.val('P') == 23.0 || block.val('P') == 24.0 || block.val('P') == 25.0 || block.val('P') == 26.0 || block.val('P') == 27.0 || block.val('P') == 28.0) &&
+        IsPathCoreHoldBlockShapeValid(block)) return;
     // CD: only a well-formed explicit cross-segment arm preserves completed
     // canonical history. Ordinary G178/G179 keep their established CC boundary.
     if (block.gCode == 178 && block.has('P') && (block.val('P') == 1.0 || block.val('P') == 2.0 || block.val('P') == 3.0 || block.val('P') == 4.0 || block.val('P') == 5.0 || block.val('P') == 6.0 || block.val('P') == 7.0 || block.val('P') == 8.0 || block.val('P') == 9.0 || block.val('P') == 10.0 || block.val('P') == 11.0 || block.val('P') == 12.0 || block.val('P') == 13.0 || block.val('P') == 14.0 || block.val('P') == 15.0 || (block.val('P') == 16.0 || (block.val('P') == 17.0 || block.val('P') == 18.0 || (block.val('P') == 19.0 || block.val('P') == 20.0 || block.val('P') == 21.0)))) &&
@@ -306,6 +311,19 @@ void NCManager::AppendPathCoreReplayGeometrySameThread(const MotionExecutionIden
     source.translationGeneration = translationGeneration;
     source.sourcePC = sourcePC;
     source.sourceLine = sourceLine;
+    // P26 retains the completed source before its final fresh-tail check.
+    // Avoid thirteen synchronous success diagnostics in that live sample-age
+    // interval. SOURCE_PASS reports this row only after exact retained and
+    // terminal-tail proofs succeed; failed saves and legacy diagnostics stay.
+    // Tail endProven is deliberately not required: this callback proves it next.
+    if (m_edmSourceSession.active && m_gapWindow.active && m_gapWindow.budgetProven &&
+        m_gapTail.active && m_edmSourceSession.run == m_pathReplay.run &&
+        m_edmSourceSession.cache == m_pathReplay.cache &&
+        m_edmSourceSession.translationGeneration == translationGeneration &&
+        m_edmSourceSession.lease.Matches(m_pathReplayLease) &&
+        m_gapTail.run == m_pathReplay.run && m_gapTail.cache == m_pathReplay.cache &&
+        m_gapTail.dispatch == dispatch && m_gapTail.commit == commit &&
+        ReplayFullIdentity(m_gapTail.identity, identity)) return;
     RtPrintf("[CNC-TRANSLATION-PATH] phase=RETAINED kind=HISTORY translationGen=%llu wcs=%d dispatch=%llu epoch=%llu seg=%llu sourcePC=%d\n",
         static_cast<unsigned long long>(source.translationGeneration), CoordSys.GetTranslationSnapshot().wcsCode,
         static_cast<unsigned long long>(dispatch), static_cast<unsigned long long>(identity.epoch),

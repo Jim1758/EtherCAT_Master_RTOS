@@ -42,7 +42,8 @@ enum class MotionAxisCommandResultType : std::uint8_t
 {
     NONE = 0,
     APPLIED = 1,
-    REJECTED = 2
+    REJECTED = 2,
+    DEFERRED = 3 // PBC-3D HOME reference: no coordinate mutation; supervisory retry.
 };
 
 enum MotionAxisCommandFlags : std::uint8_t
@@ -58,6 +59,9 @@ struct MotionAxisCommand
     std::int32_t axisIndex = -1;
     MotionCommandSource source = MotionCommandSource::UNKNOWN;
     MotionOwnerLease ownerLease{};
+    // Internal request provenance; no wire or SHM layout is changed.
+    MotionExecutionEpoch expectedEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    std::uint64_t homeCaptureToken = 0ULL;
 
     double value0 = 0.0;
     double value1 = 0.0;

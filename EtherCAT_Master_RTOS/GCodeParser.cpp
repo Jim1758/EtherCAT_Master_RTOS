@@ -640,6 +640,7 @@ NCParsedBlock GCodeParser::ParseLine(
         {
             const std::size_t index =
                 static_cast<std::size_t>(currentAddress - 'A');
+            if (block.hasParam[index]) block.duplicateAddressMask |= (1U << index);
             block.hasParam[index] = true;
             block.paramExpressions[index] = currentValue;
         }

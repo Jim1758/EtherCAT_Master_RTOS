@@ -341,6 +341,16 @@ public:
         bool epochChangeRequired,
         bool preLatchedRTApplication = false) noexcept;
 
+    // EDM33: the caller must first prove the exact idle EDM_PROCESS typed
+    // RT acknowledgement, including its current SAFETY handshake. This
+    // bounded import grants only observer stop-closure eligibility; it cannot
+    // release Safety, synthesize terminal feedback or waive an unread queue.
+    bool RecordIdleAlarmStopAcknowledged(
+        std::uint64_t lifecycleSequence,
+        MotionExecutionEpoch requestEpoch,
+        MotionExecutionEpoch appliedEpoch,
+        MotionOwnerGeneration safetyGeneration) noexcept;
+
     // BR FIX2: a borrowed scalar check against this exact idle NC Alarm
     // request. No snapshot copy, owner/epoch mutation or recovery authority.
     // The caller must additionally prove the current SAFETY handshake and
@@ -421,6 +431,13 @@ private:
     NCLifecycleInterruptionSnapshot m_snapshot{};
     NCLifecycleInterruptionCounters m_counters{};
     std::uint64_t m_nextSequence = 1ULL;
+    // Private, same-boundary idle EDM closure evidence. Public snapshots and their
+    // ABI remain unchanged; Begin retires this receipt before a new boundary.
+    bool m_idleAlarmStopClosureEligible = false;
+    bool m_idleAlarmStopClosureRejected = false;
+    MotionOwnerGeneration m_idleAlarmSafetyGeneration =
+        MOTION_OWNER_GENERATION_INVALID;
+
 
     // Stage NC-0.2J.6.3.1: terminal events may arrive before the exact J.6
     // acknowledgement is imported.  Keep bounded candidate counts here and

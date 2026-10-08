@@ -8,6 +8,8 @@
 #include "NCManager.h"
 #include "PLCManager.h" // 🌟 1. 記得 include PLCManager 標頭檔
 #include <atomic>
+#include "CoreTimerShutdown.h"
+#include "EDMAnalogInput.h"
 #pragma pack(push, 1)
 
 // 標準 Mailbox 標頭 (6 Bytes)
@@ -329,6 +331,17 @@ class EtherCatMaster
 public:
     EtherCatMaster();
     ~EtherCatMaster();
+
+    // CORE_CLOSE1: main-thread owned handles; contexts deliberately remain
+    // allocated until process exit so late rejected dispatch never reads Master.
+    HANDLE m_hPdoTimer = NULL;
+    HANDLE m_hPlcTimer = NULL;
+    HANDLE m_hProbeTimer = NULL;
+    CoreTimerCallbackContext* const m_pdoTimerContext = new CoreTimerCallbackContext(this);
+    CoreTimerCallbackContext* const m_plcTimerContext = new CoreTimerCallbackContext(this);
+    CoreTimerCallbackContext* const m_probeTimerContext = new CoreTimerCallbackContext(this);
+    void StopCyclicRuntime(); // Idempotent; main/startup thread only, never callback.
+
 
 
     // 🌟 2. 新增綁定 API
@@ -1158,6 +1171,16 @@ public:
         int64_t& value) const;
 
     bool AuditRuntimeCompositeReadConsumerLiveRoute();
+
+    // EDM18 selected A/D channel. Configure is boot-thread-only; only the
+    // PDO owner reads m_IoMap. NC/UI readers consume an atomic snapshot.
+    bool ConfigureGapAnalogInputBeforeStart(std::uint32_t adIndex,
+        std::uint32_t expectedDeviceId) noexcept;
+    bool BuildGapAnalogInputRouteBeforeStart(bool validatedCompositeContract);
+    void CaptureGapAnalogInputSnapshot(std::int64_t qpcTicks,
+        std::uint64_t qpcFrequency, bool processDataValid) noexcept;
+    bool ReadGapAnalogInputSnapshot(EDMAnalogInput::Snapshot& snapshot) const noexcept;
+
 
 
     // =========================================================
@@ -2436,6 +2459,12 @@ public:
     // Stage 11C.6 active semantic consumer API route.
     bool m_CompositeReadConsumerLiveRouteEnabled =
         false;
+
+    std::uint32_t m_gapAnalogInputRequestedIndex = 0U;
+    std::uint32_t m_gapAnalogInputExpectedDeviceId = 0U;
+    bool m_gapAnalogInputRouteBuilt = false;
+    EDMAnalogInput::Binding m_gapAnalogInputBinding{};
+    EDMAnalogInput::Publisher m_gapAnalogInputPublisher;
 
     // System Function
     int BuildIoMap();   // 自動掃描並建立清單

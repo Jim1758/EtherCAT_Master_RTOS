@@ -123,6 +123,8 @@ namespace NCGCodeSemantics
                 NCGCodeRole::PRIMARY_ACTION, 200, true, true, true);
             return true;
             // BR-END
+        case 39: // EDM17: controlled live recipe operation, no Motion frame change.
+        case 38: // EDM16: standalone shadow table selection; no Motion frame change.
         case 180: // CG: explicit, nonmodal input-only diagnostic barrier.
             descriptor = MakeDescriptor(code, NCGCodeModalGroup::NONE,
                 NCGCodeRole::PRIMARY_ACTION, 200, true, false, true);
@@ -479,6 +481,9 @@ namespace NCGCodeSemantics
     bool IsBlockBarrier(
         const NCBlock& block) noexcept
     {
+        // Standalone recipe E is a data-selection barrier, never implicit motion.
+        // G65/G66 continue owning their E macro argument.
+        if (block.has('E') && !Contains(block, 65) && !Contains(block, 66)) return true;
         const int count = SafeStoredGCodeCount(block);
 
         for (int i = 0; i < count; ++i)
@@ -538,6 +543,9 @@ namespace NCGCodeSemantics
     bool BlockSuppressesImplicitMotion(
         const NCBlock& block) noexcept
     {
+        // Standalone recipe E is a data-selection barrier, never implicit motion.
+        // G65/G66 continue owning their E macro argument.
+        if (block.has('E') && !Contains(block, 65) && !Contains(block, 66)) return true;
         const int count = SafeStoredGCodeCount(block);
         for (int i = 0; i < count; ++i)
         {

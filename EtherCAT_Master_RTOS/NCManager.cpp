@@ -1,4 +1,5 @@
 ﻿#include "NCManager.h"
+#include "EDMProcessTuningService.h"
 #include "MacroEngine.h"
 #include <memory>
 #include "MacroParser.h"
@@ -7,6 +8,19 @@
 #include "NCXYZFeedScope.h"
 #include "NCRotaryFeedScope.h"
 #include "NCZCFeedScope.h"
+#include "NCXYZCFeedScope.h"
+#include "NCXYZCUVFeedScope.h"
+#include "NCEccentricCFeedScope.h"
+#include <new>
+#include "NCEccentricCSelfCheck.h"
+#include "NCEccentricCRuntimeSelfCheck.h"
+#include "NCEccentricCProfileSelfCheck.h"
+#include "NCEccentricCExecutorSelfCheck.h"
+#include "NCEccentricCTransportSelfCheck.h"
+#include "NCEccentricCPipelineSelfCheck.h"
+#include "NCEccentricCBindingSelfCheck.h"
+#include "NCEccentricCTransactionSelfCheck.h"
+#include "CNCStartupStackDiagnostic.h"
 #include "NCExpressionResolver.h"
 #include "NCProgramCache.h"
 #include "NCBlockLifecycleLedger.h"
@@ -14,6 +28,7 @@
 #include "NCProgramEndBoundary.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 #include "AlarmManager.h"
+#include "NicTxReceipt.h"
 #include "GMCodeHandlers.h" // 🌟 引入 G 碼處理器總表
 #include <fstream>
 #include <iostream>
@@ -21,6 +36,7 @@
 #include <limits>
 #include <utility>
 #include <cmath>
+#include <cstring>
 #include <windows.h>
 #include <rtapi.h>
 // NC-0.2L.2AT / Split-Unit Link Pairing Guard.
@@ -286,10 +302,24 @@ m_pathCoreLiveRetention(AllocatePathCoreLiveOwnerTagStartup())
         MotionCommandSource::NC_MEMORY);
 }
 
+// BASE79G: called only during startup, before NC/RT cyclic threads exist.
+// LOAD and the producer observe readiness; neither allocates nor replaces it.
+bool NCManager::InitializeEccentricCProducer() noexcept
+{
+    if (m_eccentricProducer) return true;
+    m_eccentricProducer.reset(new (std::nothrow) MotionEccentricCProducerWorkspace());
+    return m_eccentricProducer != nullptr;
+}
+bool NCManager::IsEccentricCProducerReady() const noexcept { return m_eccentricProducer != nullptr; }
+std::size_t NCManager::EccentricCProducerStorageBytes() const noexcept
+{ return sizeof(MotionEccentricCProducerWorkspace); }
+
 // BASE65 START_DIAG1: called only on the existing NC/HMI supervisory thread.
 // Values are observations, not a coherent RT permission or a new interlock.
 void NCManager::PrintProgramStartDiagnostic() const noexcept
 {
+    // PBC-3J FIX3: failure-only cumulative NIC observations; never on PDO.
+    PrintNicTransmitFailureDiagnostic();
     const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
     AlarmManager& alarms = AlarmManager::GetInstance();
     RtPrintf("[NC-START-DIAG] build=BASE65_START_FIX1 rx=%llu event=%s finish=%s "
@@ -333,6 +363,7 @@ bool NCManager::RejectProgramLoad(
 
 bool NCManager::LoadProgram(const std::string& filepath)
 {
+    PrintCNCStartupStackCheckpoint("NC_LOAD_ENTER");
     m_programLoadContextDiagnostic = "ENTRY";
     const NCState originState = m_state.load(std::memory_order_acquire);
     if (originState != NCState::IDLE && originState != NCState::READY &&
@@ -410,6 +441,18 @@ bool NCManager::LoadProgram(const std::string& filepath)
     };
     if (!contextCurrent()) return RejectProgramLoad("CONTEXT_BUSY", filepath);
 
+    // BASE79F: read-only readiness observation. Storage belongs to startup;
+    // a LOAD must never allocate or replace the RT consumer's workspace.
+    const bool eccentricStorageReady = m_motion.IsEccentricCConsumerReady();
+    RtPrintf("[BASE79M][ECC-STORAGE] ready=%u storageBytes=%u motionConsumer=1 heapStorage=1 dynamicMotion=1 restrictedNc=1 phase=NC_LOAD\n",
+        eccentricStorageReady ? 1U : 0U,
+        static_cast<unsigned>(m_motion.EccentricCConsumerStorageBytes()));
+    if (!eccentricStorageReady) return RejectProgramLoad("ECC_STORAGE_NOT_READY", filepath);
+
+    RtPrintf("[BASE79M][ECC-PRODUCER-STORAGE] ready=%u storageBytes=%u restrictedNc=1 phase=NC_LOAD\n",
+        IsEccentricCProducerReady() ? 1U : 0U, static_cast<unsigned>(EccentricCProducerStorageBytes()));
+    if (!IsEccentricCProducerReady()) return RejectProgramLoad("ECC_PRODUCER_STORAGE_NOT_READY", filepath);
+
     NCProgramCache newProgramCache;
     std::string newProgramName;
     std::unique_ptr<MacroEngine> newMacroState;
@@ -431,6 +474,92 @@ bool NCManager::LoadProgram(const std::string& filepath)
     {
         return RejectProgramLoad("IMAGE_ALLOCATION", filepath);
     }
+
+    // BASE77: repeat the bounded synthetic checks on the non-RT LOAD thread,
+    // before the admission reservation and before any program-image swap.
+    // This also retains evidence when startup console history has rolled off.
+    const int eccentricRole = CoordSys.GetElectrodeRotationAxisIndex() + 1;
+    PrintCNCStartupStackCheckpoint("LOAD_CORE_ENTER");
+    const NCEccentricCSelfCheckResult eccentricCore = RunNCEccentricCSelfCheck();
+    RtPrintf("[BASE76][ECC-CORE] selfcheck=%s checks=%u failed=%u role=%d roleAssigned=%u dynamicMotion=1 restrictedNc=1 phase=NC_LOAD\n",
+        eccentricCore.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricCore.checks), static_cast<unsigned>(eccentricCore.failedCheck),
+        eccentricRole, eccentricRole != 0 ? 1U : 0U);
+    if (!eccentricCore.passed)
+    {
+        alarms.Trigger(AlarmManager::PATH_GEOMETRY_INVALID);
+        return RejectProgramLoad("ECC_CORE_SELF_CHECK", filepath);
+    }
+    PrintCNCStartupStackCheckpoint("LOAD_RUNTIME_ENTER");
+    const NCEccentricCRuntimeSelfCheckResult eccentricRuntime = RunNCEccentricCRuntimeSelfCheck();
+    RtPrintf("[BASE77][ECC-RUNTIME] selfcheck=%s checks=%u failed=%u role=%d roleAssigned=%u cycleUs=250 modelOnly=1 dynamicMotion=1 restrictedNc=1 phase=NC_LOAD\n",
+        eccentricRuntime.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricRuntime.checks), static_cast<unsigned>(eccentricRuntime.failedCheck),
+        eccentricRole, eccentricRole != 0 ? 1U : 0U);
+    if (!eccentricRuntime.passed)
+    {
+        alarms.Trigger(AlarmManager::PATH_GEOMETRY_INVALID);
+        return RejectProgramLoad("ECC_RUNTIME_SELF_CHECK", filepath);
+    }
+    // BASE78 remains outside the admission reservation and cache swap.
+    PrintCNCStartupStackCheckpoint("LOAD_PROFILE_ENTER");
+    const NCEccentricCProfileSelfCheckResult eccentricProfile = RunNCEccentricCProfileSelfCheck();
+    RtPrintf("[BASE78][ECC-PROFILE] selfcheck=%s checks=%u failed=%u role=%d roleAssigned=%u cycleUs=250 modelOnly=1 dynamicMotion=1 restrictedNc=1 legacyFir=0 phase=NC_LOAD\n",
+        eccentricProfile.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricProfile.checks), static_cast<unsigned>(eccentricProfile.failedCheck),
+        eccentricRole, eccentricRole != 0 ? 1U : 0U);
+    if (!eccentricProfile.passed)
+    {
+        alarms.Trigger(AlarmManager::PATH_GEOMETRY_INVALID);
+        return RejectProgramLoad("ECC_PROFILE_SELF_CHECK", filepath);
+    }
+
+    // BASE79A: synthetic owned-executor diagnostics; no axis output is made by this check.
+    // No new alarm/admission decision is made by this isolated test result.
+    PrintCNCStartupStackCheckpoint("LOAD_EXEC_ENTER");
+    const NCEccentricCExecutorSelfCheckResult eccentricExecutor = RunNCEccentricCExecutorSelfCheck();
+    PrintCNCStartupStackCheckpoint("LOAD_EXEC_EXIT");
+    RtPrintf("[BASE79A][ECC-EXECUTOR] selfcheck=%s checks=%u failed=%u configuredRole=%d isolated=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=NC_LOAD\n",
+        eccentricExecutor.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricExecutor.checks), static_cast<unsigned>(eccentricExecutor.failedCheck),
+        eccentricRole);
+
+    // BASE79B_FIX1: heap-backed transport diagnostics; live NC admission remains closed.
+    PrintCNCStartupStackCheckpoint("LOAD_TRANSPORT_ENTER");
+    const NCEccentricCTransportSelfCheckResult eccentricTransport = RunNCEccentricCTransportSelfCheck();
+    PrintCNCStartupStackCheckpoint("LOAD_TRANSPORT_EXIT");
+    RtPrintf("[BASE79B-FIX1][ECC-TRANSPORT] selfcheck=%s checks=%u failed=%u configuredRole=%d heapScratch=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=NC_LOAD\n",
+        eccentricTransport.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricTransport.checks), static_cast<unsigned>(eccentricTransport.failedCheck),
+        eccentricRole);
+
+    // BASE79C: copied packet -> decoded plan -> isolated executor diagnostics.
+    // Keep live NC admission closed and the machine role unchanged.
+    PrintCNCStartupStackCheckpoint("LOAD_PIPELINE_ENTER");
+    const NCEccentricCPipelineSelfCheckResult eccentricPipeline = RunNCEccentricCPipelineSelfCheck();
+    PrintCNCStartupStackCheckpoint("LOAD_PIPELINE_EXIT");
+    RtPrintf("[BASE79C][ECC-PIPELINE] selfcheck=%s checks=%u failed=%u configuredRole=%d heapScratch=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=NC_LOAD\n",
+        eccentricPipeline.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricPipeline.checks), static_cast<unsigned>(eccentricPipeline.failedCheck),
+        eccentricRole);
+
+    // BASE79D: synthetic checks of the read-only consumer start binding.
+    PrintCNCStartupStackCheckpoint("LOAD_BINDING_ENTER");
+    const NCEccentricCBindingSelfCheckResult eccentricBinding = RunNCEccentricCBindingSelfCheck();
+    PrintCNCStartupStackCheckpoint("LOAD_BINDING_EXIT");
+    RtPrintf("[BASE79D][ECC-BINDING] selfcheck=%s checks=%u failed=%u configuredRole=%d bindingOnly=1 heapScratch=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=NC_LOAD\n",
+        eccentricBinding.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricBinding.checks), static_cast<unsigned>(eccentricBinding.failedCheck),
+        eccentricRole);
+
+    // BASE79E: private candidate/commit diagnostics; this check makes no axis output.
+    PrintCNCStartupStackCheckpoint("LOAD_TRANSACTION_ENTER");
+    const NCEccentricCTransactionSelfCheckResult eccentricTransaction = RunNCEccentricCTransactionSelfCheck();
+    PrintCNCStartupStackCheckpoint("LOAD_TRANSACTION_EXIT");
+    RtPrintf("[BASE79E][ECC-TRANSACTION] selfcheck=%s checks=%u failed=%u configuredRole=%d stagedCommit=1 heapScratch=1 diagnosticOnly=1 dynamicMotion=1 restrictedNc=1 phase=NC_LOAD\n",
+        eccentricTransaction.passed ? "PASS" : "FAIL",
+        static_cast<unsigned>(eccentricTransaction.checks), static_cast<unsigned>(eccentricTransaction.failedCheck),
+        eccentricRole);
 
     if (!contextCurrent()) return RejectProgramLoad("CONTEXT_CHANGED", filepath);
     const auto committedContextCurrent = [&]() noexcept -> bool
@@ -550,10 +679,12 @@ bool NCManager::LoadProgram(const std::string& filepath)
     m_programLoadRejectDiagnostic = "NONE";
     m_programLoadContextDiagnostic = "LOADED";
     m_bootProgramImageLoaded = true;
+    RetainEDMRecipeSelectionSameThread(); // Preserve operator values; retire the old program receipt.
     RtPrintf("[NC-LOAD-CJ] LOADED file=%.240s cache=%llu owner=%u generation=%u epoch=%u keepHold=%u startBlocked=0\n",
         m_mainProgramName.c_str(), static_cast<unsigned long long>(m_programCache.GetGeneration()),
         static_cast<unsigned>(originOwner.owner), originOwner.generation, originEpoch,
         originOwner.owner == MotionOwner::IDLE_HOLD ? 1U : 0U);
+    PrintCNCStartupStackCheckpoint("NC_LOAD_ACCEPT");
     return true;
 }
 
@@ -564,6 +695,7 @@ void NCManager::ChangeMode(NCOperationMode newMode)
     if (m_state == NCState::IDLE || m_state == NCState::READY || m_state == NCState::P_END) {
         GCodeHandlers::Reset_G04(this);
         CancelGapDryRunSameThread("MODE_CHANGE");
+        RetainEDMRecipeSelectionSameThread();
         FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::MODE_CHANGE);
         InvalidatePathCoreFeedSameThread(); // BX-FEED
         InvalidatePathCoreArcSameThread(); // BY-ARC
@@ -593,8 +725,10 @@ void NCManager::ChangeState(NCState newState) {
     if (newState == NCState::HOLD && !GCodeHandlers::Pause_G04(this)) return;
     if (newState != NCState::RUN && newState != NCState::HOLD)
         GCodeHandlers::Reset_G04(this);
-    if (newState == NCState::HOLD) PauseGapDryRunSameThread("STATE_HOLD");
+    if (newState == NCState::HOLD) { FenceEDMRecipeHoldSameThread(); PauseGapDryRunSameThread("STATE_HOLD"); }
     else if (newState != NCState::RUN) CancelGapDryRunSameThread("STATE_CHANGE");
+    // ALARM keeps operator values visible while retiring every NC receipt.
+    if (newState != NCState::RUN && newState != NCState::HOLD) RetainEDMRecipeSelectionSameThread();
     // BN: public state writes cannot arm or resume retained geometry.
     if (newState == NCState::HOLD)
         PausePathCoreLiveRetentionSameThread();
@@ -662,6 +796,37 @@ void NCManager::TryRollbackHomingResume() noexcept
 // ==========================================
 void NCManager::CycleStart()
 {
+    // EDM34 FIX1: cancelled fixture requires RESET before START.
+    if (m_gapDryRun.physicalZFixtureTest && m_gapDryRun.active && m_gapDryRun.paused &&
+        (m_state == NCState::HOLD || m_state == NCState::RUN) &&
+        ReadEDMZFixtureFeedbackSameThread(false) &&
+        EDM28::SameScope(m_edmZFixture.feedback.scope, m_edmZFixture.scope) &&
+        m_edmZFixture.feedback.capHeld && m_edmZFixture.feedback.latchedFault)
+    {
+        LogEDMZFixtureSameThread("RT_STOP", "FAULT", "HOLD_RT_LATCHED_FAULT");
+        EndEDMZFixtureSameThread("FAIL", "RT_LATCHED_FAULT");
+    }
+    // A retired fixture must not block HOLD/START in a later program run.
+    // Detached cleanup and RESET remain guarded independently below.
+    if (m_gapDryRun.physicalZFixtureTest && !m_gapDryRun.active &&
+        m_gapDryRun.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        m_gapDryRun.cache == GetBaseProgramCache().GetGeneration() &&
+        m_edmZFixture.phase == EDMZFixturePhase::Cancelled &&
+        (m_state == NCState::HOLD || m_state == NCState::RUN))
+    {
+        RtPrintf("[EDM34-FIX1] event=START_BLOCKED reason=RESET_REQUIRED test=%llu session=%llu result=%u cleanup=%u reset=%u\n",
+            static_cast<unsigned long long>(m_gapDryRun.test),
+            static_cast<unsigned long long>(m_edmZFixture.scope.session),
+            static_cast<unsigned>(m_gapDryRun.result),
+            m_edmZFixture.cleanupPending ? 1U : 0U, m_edmZFixture.resetPending ? 1U : 0U);
+        return;
+    }
+    // EDM34 FIX1: end cancelled fixture START guard.
+    // EDM28 never starts a new run over detached physical cleanup. A HOLD
+    // resume first needs the scoped RT stop proof, not group-idle alone.
+    if (m_edmZFixture.cleanupPending || m_edmZFixture.resetPending) return;
+    if (m_gapDryRun.physicalZFixtureTest && m_gapDryRun.active && m_gapDryRun.paused &&
+        (!ReadEDMZFixtureFeedbackSameThread(false) || !IsEDMZFixtureStoppedSameThread())) return;
     ++m_startDiagnosticRequests;
     m_startDiagnosticEvent = "RECEIVED";
     PrintProgramStartDiagnostic();
@@ -884,6 +1049,7 @@ void NCManager::FeedHold()
             HoldResumeAdmissionKind::PROGRAM_HOLD);
     }
     FeedHoldInternal();
+    if (m_state == NCState::HOLD) FenceEDMRecipeHoldSameThread();
 }
 
 void NCManager::FeedHoldInternal()
@@ -953,8 +1119,27 @@ void NCManager::FeedHoldInternal()
 
 void NCManager::Reset()
 {
+    // EDM28 only: retain AUTO authority for bounded physical stop/Disarm
+    // before entering the existing Reset safety batch. Never wait here.
+    if (!AdmitEDMZFixtureResetSameThread()) return;
+    // BASE79H: preserve this admission before invalidating the NC receipt.
+    // RESET during an eccentric HOLD may still overlap its curved braking
+    // tail; it must use the same controlled stop as a running group.
+    const bool heldEccentricFeed = m_state == NCState::HOLD &&
+        m_pathFeed.pending && m_pathFeed.bound &&
+        m_pathFeedMotion.receipt.eccentricFeed &&
+        m_pathFeedMotion.receipt.valid && m_pathFeedMotion.receipt.commandAccepted;
+    // BASE79H-FIX1: RESET supersedes this NC HOLD at the button boundary.
+    // Retire its observer and pending resume before RESET_STATE can be
+    // sampled with the previous RT owner/Epoch and latched HOLD ACK.
+    // The RT eccentric cursor remains intact for the controlled stop below.
+    if (heldEccentricFeed)
+    {
+        CancelFeedHoldBoundaryShadow(true);
+    }
     m_programLoadStartBlocked = false;
     CancelGapDryRunSameThread("RESET");
+    RetainEDMRecipeSelectionSameThread(); // Retain settings only; RESET still blocks every HMI write.
     // BN: revoke only commanded-retention reads at the operator boundary.
     FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::RESET);
     InvalidatePathCoreFeedSameThread(); // BX-FEED
@@ -992,7 +1177,8 @@ void NCManager::Reset()
         ResetContinuationPhase::CLEANUP ||
         m_resetContinuationPhase ==
         ResetContinuationPhase::SETTLE;
-    bool bypassResetStateIdempotence = false;
+    bool bypassResetStateIdempotence = m_edmZFixture.resetBypass;
+    m_edmZFixture.resetBypass = false;
 
     if (m_resetContinuationPhase ==
         ResetContinuationPhase::CLEANUP)
@@ -1088,10 +1274,11 @@ void NCManager::Reset()
         const MotionStopSettleSnapshot resetStopSnapshot =
             m_motion.GetStopSettleSnapshot();
         const bool cleanProgramRunReset =
-            m_state == NCState::RUN &&
+            (m_state == NCState::RUN || heldEccentricFeed) &&
             resetStopSnapshot.publicationGeneration != 0ULL &&
             resetStopSnapshot.groupActive &&
             !m_resetSafetyOutputHoldActive &&
+            !m_motion.RequiresPbcXRetainRecoveryReset() &&
             !AlarmManager::GetInstance().HasAlarm();
         if (cleanProgramRunReset)
         {
@@ -2341,7 +2528,46 @@ void NCManager::BeginLifecycleInterruptionShadow(
     NCLifecycleInterruptionCause cause,
     bool expectsEpochChange) noexcept
 {
+    // BASE79H: AL2014 may reach NC before or after the RT emergency action.
+    // Capture the exact NC-owned execution identity before invalidating its
+    // receipt below. This seeds only the observer's expected old Epoch; the
+    // existing J.6 coherent from/to/apply proof still owns Alarm retirement
+    // classification and no Reset/release permission comes from this seed.
+    MotionExecutionEpoch eccentricAlarmEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    const MotionFeedLineReceipt& eccentricReceipt = m_pathFeedMotion.receipt;
+    if (cause == NCLifecycleInterruptionCause::ALARM &&
+        !m_lifecycleInterruptionShadow.IsActive() &&
+        m_resetContinuationPhase == ResetContinuationPhase::IDLE &&
+        m_mode == NCOperationMode::MEMORY && m_pathFeed.pending && m_pathFeed.bound &&
+        eccentricReceipt.valid && eccentricReceipt.eccentricFeed &&
+        eccentricReceipt.commandAccepted && eccentricReceipt.captureBound &&
+        eccentricReceipt.tailCommitted && eccentricReceipt.identity.IsAssigned() &&
+        eccentricReceipt.identity.source == MotionCommandSource::NC_MEMORY &&
+        eccentricReceipt.ownerLease.IsValid() &&
+        eccentricReceipt.ownerLease.owner == MotionOwner::AUTO &&
+        eccentricReceipt.ownerLease.Matches(m_programMotionLease) &&
+        m_eccentricProducer &&
+        eccentricReceipt.identity.Matches(m_eccentricProducer->command.execution) &&
+        eccentricReceipt.identity.sourceBlockId == m_eccentricProducer->command.execution.sourceBlockId &&
+        eccentricReceipt.identity.source == m_eccentricProducer->command.execution.source &&
+        eccentricReceipt.ownerLease.Matches(m_eccentricProducer->command.ownerLease))
+    {
+        const AlarmManager& alarms = AlarmManager::GetInstance();
+        const int alarmCount = alarms.GetAlarmCount();
+        for (int i = 0; i < alarmCount; ++i)
+        {
+            if (alarms.GetAlarmId(i) == AlarmManager::PATH_EXECUTION_NOT_READY)
+            {
+                eccentricAlarmEpoch = eccentricReceipt.identity.epoch;
+                break;
+            }
+        }
+    }
+
     CancelGapDryRunSameThread("LIFECYCLE");
+    // Retained recipe data is a display state, never a motion admission.
+    // Keep it through ALARM/fault so the operator can inspect the exact values.
+    RetainEDMRecipeSelectionSameThread();
     FencePathCoreLiveRetentionSameThread(PathCoreLiveFenceReason::INTERRUPTION);
     // Carry only the immediate invalidation cause; RESET/ALARM/replacement
     // and all ordinary invalidations clear it through the default argument.
@@ -2358,6 +2584,10 @@ void NCManager::BeginLifecycleInterruptionShadow(
 
     NCLifecycleInterruptionSample sample =
         BuildLifecycleInterruptionSample();
+    if (eccentricAlarmEpoch != MOTION_EXECUTION_EPOCH_INVALID)
+    {
+        sample.executionEpoch = eccentricAlarmEpoch;
+    }
 
     // K.2.1 internal mapping faults are detected and contained by the 250 us
     // Runtime in the same pass. If the 10 ms NC observer arrives later, its
@@ -2516,15 +2746,16 @@ void NCManager::ObserveAlarmEmergencyStopShadow() noexcept
         m_alarmEmergencyStopShadow.GetSnapshot();
     if (alarmStop.acknowledged)
     {
-        // BR FIX2: an idle NC Alarm may have no execution to invalidate,
-        // while its AUTO -> SAFETY ownership takeover still publishes an
-        // Epoch. Import that change only with the exact existing handshake
-        // acknowledgement, not merely because a runtime Epoch changed.
+        // BR FIX2 / EDM33: an idle NC or EDM process Alarm may have no
+        // execution to invalidate, while AUTO -> SAFETY still publishes an
+        // Epoch. Import only the exact typed acknowledgement and current
+        // handshake. An idle EDM closure additionally proves no unread work.
         MotionExecutionEpoch successor = alarmStop.requestExecutionEpoch + 1U;
         if (successor == MOTION_EXECUTION_EPOCH_INVALID) successor = 1U;
         bool idleSafetyTakeoverProven = false;
         if (!alarmStop.epochChangeRequired && !alarmStop.hadExecutionToInvalidate &&
-            alarmStop.trigger == NCAlarmEmergencyStopTrigger::NC_PROGRAM &&
+            (alarmStop.trigger == NCAlarmEmergencyStopTrigger::NC_PROGRAM ||
+                alarmStop.trigger == NCAlarmEmergencyStopTrigger::EDM_PROCESS) &&
             alarmStop.phase == NCAlarmEmergencyStopPhase::ACKNOWLEDGED &&
             alarmStop.emergencyEvidenceCoherent && alarmStop.motionPublicationGeneration != 0ULL &&
             alarmStop.emergencyRequestObserved && alarmStop.rtApplyObserved &&
@@ -2557,6 +2788,20 @@ void NCManager::ObserveAlarmEmergencyStopShadow() noexcept
             alarmStop.lastAppliedExecutionEpoch,
             alarmStop.epochChangeRequired || idleSafetyTakeoverProven,
             alarmStop.preLatchedRTApplication);
+        if (idleSafetyTakeoverProven &&
+            alarmStop.trigger == NCAlarmEmergencyStopTrigger::EDM_PROCESS)
+        {
+            if (m_lifecycleInterruptionShadow.RecordIdleAlarmStopAcknowledged(
+                    alarmStop.lifecycleSequence, alarmStop.requestExecutionEpoch,
+                    alarmStop.lastAppliedExecutionEpoch, alarmStop.currentOwnerGeneration))
+            {
+                RtPrintf("[NC02J-ALARM-IDLE] event=ACK_IMPORT source=EDM_PROCESS lifecycle=%llu epoch=%u>%u safetyGeneration=%u terminal=NONE noExecution=1 unread=0 queues=0 observerOnly=1 stopClosureOnly=1 physicalQuiescent=0 release=0\n",
+                    static_cast<unsigned long long>(alarmStop.lifecycleSequence),
+                    static_cast<unsigned>(alarmStop.requestExecutionEpoch),
+                    static_cast<unsigned>(alarmStop.lastAppliedExecutionEpoch),
+                    static_cast<unsigned>(alarmStop.currentOwnerGeneration));
+            }
+        }
     }
 }
 
@@ -2989,6 +3234,50 @@ void NCManager::ProcessMotionFeedback() noexcept
             }
         }
 
+        // BASE79H: an RT late-HOLD refusal has latched AL2014 before its
+        // safety-epoch ABORT. Open that exact active eccentric Alarm boundary
+        // before the Ledger consumes it. Earlier Alarm/Reset boundaries keep
+        // their original identity. No generic failure or unrelated receipt is
+        // promoted into this scoped observer path.
+        const MotionFeedLineReceipt& eccentricReceipt = m_pathFeedMotion.receipt;
+        if (event.type == MotionFeedbackType::ABORTED &&
+            event.rejectReason == MotionRejectReason::NONE && event.errorCode == 0U &&
+            !m_lifecycleInterruptionAlarmLatched &&
+            !m_lifecycleInterruptionShadow.IsActive() &&
+            m_resetContinuationPhase == ResetContinuationPhase::IDLE &&
+            m_mode == NCOperationMode::MEMORY && m_pathFeed.pending && m_pathFeed.bound &&
+            eccentricReceipt.valid && eccentricReceipt.eccentricFeed &&
+            eccentricReceipt.commandAccepted && eccentricReceipt.captureBound &&
+            eccentricReceipt.tailCommitted && eccentricReceipt.identity.IsAssigned() &&
+            eccentricReceipt.identity.source == MotionCommandSource::NC_MEMORY &&
+            eccentricReceipt.ownerLease.IsValid() &&
+            eccentricReceipt.ownerLease.owner == MotionOwner::AUTO &&
+            eccentricReceipt.ownerLease.Matches(m_programMotionLease) &&
+            event.identity.Matches(eccentricReceipt.identity) &&
+            event.identity.sourceBlockId == eccentricReceipt.identity.sourceBlockId &&
+            event.identity.source == eccentricReceipt.identity.source &&
+            event.owner == eccentricReceipt.ownerLease.owner &&
+            event.ownerGeneration == eccentricReceipt.ownerLease.generation &&
+            m_eccentricProducer &&
+            eccentricReceipt.identity.Matches(m_eccentricProducer->command.execution) &&
+            eccentricReceipt.identity.sourceBlockId == m_eccentricProducer->command.execution.sourceBlockId &&
+            eccentricReceipt.identity.source == m_eccentricProducer->command.execution.source &&
+            eccentricReceipt.ownerLease.Matches(m_eccentricProducer->command.ownerLease))
+        {
+            const AlarmManager& alarms = AlarmManager::GetInstance();
+            const int alarmCount = alarms.GetAlarmCount();
+            for (int alarmIndex = 0; alarmIndex < alarmCount; ++alarmIndex)
+            {
+                if (alarms.GetAlarmId(alarmIndex) == AlarmManager::PATH_EXECUTION_NOT_READY)
+                {
+                    BeginLifecycleInterruptionShadow(NCLifecycleInterruptionCause::ALARM, false);
+                    m_lifecycleInterruptionAlarmLatched = true;
+                    BeginAlarmEmergencyStopShadow();
+                    break;
+                }
+            }
+        }
+
         // Capture the pre-event state. This must happen before the sequence
         // check and Ledger apply so a gap revealed by this terminal event and
         // the active Block that it is expected to close remain observable.
@@ -3207,6 +3496,17 @@ void NCManager::ObserveBootstrapSafetyHandoff() noexcept
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
+    // EDM28 priority stop continues in RT while this nonblocking poll owns
+    // RESET_STATE. A 1 s / 100 poll limit falls through to legacy safety.
+    if (m_edmZFixture.resetPending)
+    {
+        if (PollEDMZFixtureResetSameThread()) Reset();
+        if (m_edmZFixture.resetPending) return;
+    }
+    ValidateEDMRecipeSelectionSameThread(); // EDM16: fail closed even for direct NC state changes.
+    ProcessEDMProcessTuningServiceSameThread(*this); // One owner, bounded runtime-only updates.
+    const EDMGapInput::Snapshot edmGap = ReadEDMGapInputSnapshotSameThread();
+    ObserveEDMProcessShadowSameThread(edmGap); // EDM20: 10 ms shadow preview, no Motion/IO writes.
     ValidateGapDryRunSameThread(); // CG: revoke/pause before early control returns.
     ValidatePathCoreFeedSameThread(); // BX-FEED: observe lifecycle before early returns.
     ValidatePathCoreArcSameThread(); // BY-ARC
@@ -3747,8 +4047,14 @@ void NCManager::ProcessTask()
                 // End is the Alarm commit point. Coordinate synchronization
                 // is applied only after that exact quiet transaction commits;
                 // output hold and owner NONE still prevent physical motion.
-                CoordSys.SyncMachinePosition(
-                    releaseResetRebaseAck.actualMcsUnit);
+                // Only X can retain compensation here. Preserve every other
+                // raw OFF coordinate, including its legacy rotary modulo bits.
+                double resetNominalMcsUnit[MAX_AXES];
+                std::memcpy(resetNominalMcsUnit, releaseResetRebaseAck.actualMcsUnit,
+                    sizeof(resetNominalMcsUnit));
+                if ((releaseResetRebaseAck.requestedAxisMask & 1U) != 0U)
+                    resetNominalMcsUnit[0] = releaseResetRebaseAck.xNominalMcsUnit;
+                CoordSys.SyncMachinePosition(resetNominalMcsUnit);
                 if (!resetSupervisoryIdentityCurrent())
                 {
                     releaseSucceeded = false;
@@ -6181,6 +6487,12 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
     case 2: // BY-ARC: G17 XY circular interpolation, exact stop.
     case 3:
         return StartPathCoreArcSameThread(block);
+    case 39: // EDM17: prevalidated owner-thread recipe operation.
+        (void)CommitEDMRecipeEditSameThread(block);
+        return nullptr;
+    case 38: // EDM16: prevalidated standalone table selector.
+        (void)CommitEDMRecipeSelectionSameThread(block);
+        return nullptr;
     case 180: // CG: standalone simulated GAP input self-test.
         return StartGapDryRunSameThread(block);
     case 178: // CB: arm one Feed Hold excursion on the next original source.
@@ -6292,7 +6604,27 @@ void NCManager::ExecuteBlock(
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
+    // EDM17 validates the complete literal command before any setting/T/M/frame.
+    if (IsEDMRecipeEditRequest(block) &&
+        !PrepareEDMRecipeEditSameThread(block, sourcePC, sourceLineNumber, dispatchId)) return;
+    // EDM16 whole authored row is validated before frame/settings/T/M side effects.
+    if (IsEDMRecipeSelectionRequest(block) &&
+        !PrepareEDMRecipeSelectionSameThread(block, sourcePC, sourceLineNumber, dispatchId)) return;
     if (!IsFixedTranslationBlockAllowedSameThread(block)) return;
+    // BASE79G: resolved doubles alone cannot prove literal authorship. Bind
+    // the restricted feed to the immutable MEMORY cache before settings/capture.
+    if (CoordSys.isCAxisOffsetRotationEnabled && CoordSys.toolLengthMode != 49 &&
+        NCGCodeSemantics::Contains(block, 1))
+    {
+        const NCProgramCacheLine* line = GetBaseProgramCache().TryGetLine(sourcePC);
+        if (m_mode != NCOperationMode::MEMORY || !m_macroStack.empty() || !line ||
+            line->sourceLineNumber != sourceLineNumber ||
+            !IsNCEccentricCFeedParsedBlockAllowed(line->parsedBlock))
+        {
+            RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
+            return;
+        }
+    }
     // CG: reject mixed/implicit test commands before settings, tools or M outputs.
     if (NCGCodeSemantics::Contains(block, 180))
     {
@@ -6377,7 +6709,10 @@ void NCManager::ExecuteBlock(
     if ((NCGCodeSemantics::Contains(block, 1) &&
         !IsPathCoreFeedBlockShapeValid(block, true, CoordSys.isInchMode ? 20 : 21, CoordSys.isPolarCoordinateActive, CoordSys.activePlane) &&
         !IsNCRotaryFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
-        !IsNCZCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block)) ||
+        !IsNCZCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
+        !IsNCXYZCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
+        !IsNCXYZCUVFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
+        !IsNCEccentricCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block)) ||
         IsPathCoreFeedInputOmission(block))
     {
         if (!m_pathFeed.pending)
@@ -6498,9 +6833,9 @@ void NCManager::ExecuteBlock(
     }
 
     // 瞬間完成的設定。
-    if (block.has('E'))
+    if (block.has('E') && IsEDMRecipeSelectionRequest(block))
     {
-        // m_edmManager.ApplyE(block.val('E'));
+        if (!CommitEDMRecipeSelectionSameThread(block)) return;
     }
     if (block.has('B'))
     {
@@ -6532,7 +6867,9 @@ void NCManager::ExecuteBlock(
 
         // 關鍵順序：同一 Block 的 G20/G17/G90/G54/G43/G40... 已先 Commit，
         // 再擷取 Motion Frame Snapshot，最後才派送唯一 Primary Action。
-        if (descriptor.role == NCGCodeRole::PRIMARY_ACTION)
+        // A recipe selector changes no geometry or Motion pending frame.
+        // Its own exact stopped/authority gate was checked before any setting.
+        if (descriptor.role == NCGCodeRole::PRIMARY_ACTION && gCode != 38 && gCode != 39)
         {
             if (!PrepareFixedTranslationMotionSameThread(block, gCode)) return;
             CapturePendingCommandState(sourcePC);
@@ -7192,6 +7529,7 @@ bool NCManager::BeginProgramRunBoundary(
     MotionExecutionEpoch executionEpoch) noexcept
 {
     CancelGapDryRunSameThread("NEW_RUN");
+    RetainEDMRecipeSelectionSameThread();
     m_programEndAlarmRaised = false;
     return m_programEndBoundary.BeginRun(
         GetBaseProgramScope(),
@@ -7849,6 +8187,7 @@ void NCManager::FinalizeProgramEnd()
         return;
     }
 
+    RetainEDMRecipeSelectionSameThread(); // Finalized M02/M30/EOF: retain operator values, not the run receipt.
     // BP-BEGIN
     PublishPathCoreCompletedSnapshotSameThread();
     // BP-END

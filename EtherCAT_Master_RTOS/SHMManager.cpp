@@ -1,4 +1,5 @@
 ﻿#include "SHMManager.h"
+#include "EDMProcessTuningService.h"
 
 #include "EtherCatSmDiagContract.h"
 #include "EtherCatFmmuDiagContract.h"
@@ -15,6 +16,64 @@
 
 namespace
 {
+    // EDM18: this producer mapping is intentionally independent of EDM_CNC_SHM.
+    // NC's existing 100 ms owner-thread HMI task is its only publisher.
+    constexpr const wchar_t* EDM_DIAG_SHM_NAME = L"OSCARMAX_EDM_DIAG";
+    HANDLE g_hEdmDiagShm = NULL;
+    SHM_EDM_DiagData* g_pEdmDiagData = nullptr;
+
+    bool InitializeEDMDiagnosticSharedMemory()
+    {
+        if (g_pEdmDiagData != nullptr) return true;
+        void* location = nullptr;
+        g_hEdmDiagShm = RtCreateSharedMemory(PAGE_READWRITE, 0,
+            sizeof(SHM_EDM_DiagData), EDM_DIAG_SHM_NAME, &location);
+        if (g_hEdmDiagShm == NULL || location == nullptr)
+        {
+            if (g_hEdmDiagShm != NULL) RtCloseHandle(g_hEdmDiagShm);
+            g_hEdmDiagShm = NULL;
+            g_pEdmDiagData = nullptr;
+            DEBUG_PRINT("[EDM18-SHM] WARNING create failed; GAP/recipe display unavailable.\n");
+            return false;
+        }
+        g_pEdmDiagData = static_cast<SHM_EDM_DiagData*>(location);
+        // A reader may retain the mapping through an RT restart. Mark it odd
+        // before clearing either payload or header; never expose a torn old row.
+        const std::uint32_t writing = (g_pEdmDiagData->Header.Sequence + 1U) | 1U;
+        auto* sequence = reinterpret_cast<volatile LONG*>(
+            &g_pEdmDiagData->Header.Sequence);
+        InterlockedExchange(sequence, static_cast<LONG>(writing));
+        MemoryBarrier();
+        constexpr std::size_t beforeSequence = offsetof(SHM_EDM_DiagHeader, Sequence);
+        auto* bytes = reinterpret_cast<unsigned char*>(g_pEdmDiagData);
+        std::memset(bytes, 0, beforeSequence);
+        std::memset(bytes + beforeSequence + sizeof(std::uint32_t), 0,
+            sizeof(SHM_EDM_DiagData) - beforeSequence - sizeof(std::uint32_t));
+        g_pEdmDiagData->Header.Magic = SHM_EDM_DIAG_MAGIC;
+        g_pEdmDiagData->Header.VersionMajor = SHM_EDM_DIAG_VERSION_MAJOR;
+        g_pEdmDiagData->Header.VersionMinor = SHM_EDM_DIAG_VERSION_MINOR;
+        g_pEdmDiagData->Header.StructSize = SHM_EDM_DIAG_SIZE;
+        g_pEdmDiagData->Recipe.FieldCapacity =
+            static_cast<std::uint16_t>(SHM_EDM_DIAG_FIELD_CAPACITY);
+        g_pEdmDiagData->Recipe.FieldRecordSize =
+            static_cast<std::uint16_t>(SHM_EDM_DIAG_FIELD_SIZE);
+        MemoryBarrier();
+        InterlockedExchange(sequence, static_cast<LONG>(writing + 1U));
+        DEBUG_PRINT("[EDM18-SHM] READY name=OSCARMAX_EDM_DIAG version=1.0 size=%u fields=%u readonly=1 legacyAbiUnchanged=1\n",
+            SHM_EDM_DIAG_SIZE, SHM_EDM_DIAG_FIELD_CAPACITY);
+        return true;
+    }
+
+    void ShutdownEDMDiagnosticSharedMemory()
+    {
+        g_pEdmDiagData = nullptr;
+        if (g_hEdmDiagShm != NULL)
+        {
+            RtCloseHandle(g_hEdmDiagShm);
+            g_hEdmDiagShm = NULL;
+        }
+    }
+
     // =====================================================================
     // Stage 12A.2 - OSCARMAX EtherCAT Online Diagnosis Shared Memory
     // =====================================================================
@@ -1601,6 +1660,12 @@ GetEtherCatRxForensicsSharedMemoryData()
 }
 
 
+SHM_EDM_DiagData* GetEDMDiagnosticSharedMemoryData()
+{
+    return g_pEdmDiagData;
+}
+
+
 // =====================================================================
 // SHMManager
 // =====================================================================
@@ -1627,6 +1692,10 @@ bool SHMManager::Initialize(
         InitializeEtherCatRxForensicsSharedMemory();
 
         InitializeEtherCatServiceSharedMemory();
+
+        InitializeEDMDiagnosticSharedMemory();
+        InitializeEDMProcessTuningService();
+        InitializeEDMConditionService((GlobalConfig::GetInstance().BaseDataDir + "Data\\EDM\\").c_str());
 
         return true;
     }
@@ -1718,6 +1787,10 @@ bool SHMManager::Initialize(
 
     InitializeEtherCatServiceSharedMemory();
 
+    InitializeEDMDiagnosticSharedMemory();
+    InitializeEDMProcessTuningService();
+    InitializeEDMConditionService((GlobalConfig::GetInstance().BaseDataDir + "Data\\EDM\\").c_str());
+
 
     return true;
 }
@@ -1725,6 +1798,10 @@ bool SHMManager::Initialize(
 
 void SHMManager::Shutdown()
 {
+    ShutdownEDMProcessTuningService();
+    ShutdownEDMConditionService();
+    ShutdownEDMDiagnosticSharedMemory();
+
     ShutdownEtherCatServiceSharedMemory();
 
     ShutdownEtherCatRxForensicsSharedMemory();

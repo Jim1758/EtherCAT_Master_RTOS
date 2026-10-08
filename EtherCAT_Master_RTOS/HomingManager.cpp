@@ -7,11 +7,24 @@
 #include "PLCManager.h"
 #include "NCPLCMap.h"
 #include <cmath>
+#include <cstring>
 #include <rtapi.h>
 #include <rtssapi.h>
 
 namespace
 {
+    // A transient RT reference reservation may defer HOME for a few scans;
+    // never wait forever if source validity or stopped proof cannot recover.
+    constexpr double PBC_HOME_REFERENCE_RETRY_TIMEOUT_SEC = 10.0;
+
+    template <typename SequenceCollection>
+    bool PbcHomeReferencePending(const SequenceCollection& sequences) noexcept
+    {
+        for (const MotionAxisCommandSequence sequence : sequences)
+            if (sequence != MOTION_AXIS_COMMAND_SEQUENCE_INVALID) return true;
+        return false;
+    }
+
     // ========================================================
     // HOME Error -> Alarm Code
     //
@@ -392,6 +405,9 @@ bool HomingManager::QueueHomeStop(
 bool HomingManager::QueueHomeVelocity(
     int axisIndex, double velocity, double accelerationTime) noexcept
 {
+    // Preserve the current search velocity until the peer's exact reference
+    // receipt retires. Sensor/limit checks and all stop submissions still run.
+    if (PbcHomeReferencePending(m_pendingApplyHomeSequence)) return false;
     return m_motion.SubmitAxisVelocityMove(
         axisIndex, velocity, accelerationTime, MotionCommandSource::HOME,
         m_homeMotionLease);
@@ -402,6 +418,7 @@ bool HomingManager::QueueHomeMove(
     double accelerationTime, double decelerationTime,
     bool useShortestPath) noexcept
 {
+    if (PbcHomeReferencePending(m_pendingApplyHomeSequence)) return false;
     if (m_pendingMoveSequence[axisIndex] !=
         MOTION_AXIS_COMMAND_SEQUENCE_INVALID) return false;
 
@@ -502,6 +519,8 @@ bool HomingManager::QueueHomeProbeFunction(
 {
     const MotionOwnerLease lease = GetProbeCommandLease();
     if (!lease.IsValid()) return false;
+    // Completion/cancellation disarm must remain available even while a
+    // reference receipt is pending. Only normal WRITE_* arm phases defer.
     return m_motion.SubmitDriveTouchProbeFunction(
         axisIndex, value, lease, outSequence);
 }
@@ -564,6 +583,8 @@ bool HomingManager::Start(
     m_currentOrder =
         -1;
 
+    ClearPbcXHomeCaptureRuntime();
+    m_pbcXHomeCaptureRequired = false;
     for (int i = 0; i < HOME_AXIS_COUNT; ++i)
     {
         m_pendingApplyHomeSequence[i] =
@@ -955,6 +976,7 @@ void HomingManager::Cancel()
     }
 
 
+    ClearPbcXHomeCaptureRuntime();
     m_cancelRequested =
         true;
 }
@@ -971,6 +993,8 @@ void HomingManager::Reset()
     }
     RestoreOrReleaseHomeMotionOwner();
     if (m_homeMotionLease.IsValid()) return;
+    ClearPbcXHomeCaptureRuntime();
+    m_pbcXHomeCaptureRequired = false;
     for (int i = 0; i < HOME_AXIS_COUNT; ++i)
     {
         m_pendingApplyHomeSequence[i] =
@@ -1496,6 +1520,30 @@ HomeErrorReason HomingManager::ValidateAxisForHome(
         return HomeErrorReason::SERVO_FAULT;
     if (axis.state != MotionState::MotionState_IDLE)
         return HomeErrorReason::MOTION_BUSY;
+    // PBC-3J: the RT-published sealed zero-only identity is an admission
+    // hint for this exact physical X. It never substitutes for the current
+    // RT capture/stopped/commit checks and cannot clear unknown output.
+    const bool physicalX = &axis == &m_motion.GetAxisContext(0);
+    const bool zeroOnlyX = axis.axisIndex == 0 && physicalX && !axis.isVirtualAxis &&
+        axis.axisType == AxisType::LINEAR && axis.fbMode == FeedbackSource::MOTOR_ENCODER &&
+        (axis.enablePitch || axis.enableBacklash) &&
+        (axis.home.method == HomeMethod::CURRENT_POSITION || UsesPbcXPhysicalHomeCapture(axis)) &&
+        m_motion.IsPbcXZeroOnlyHomeIdentity(0);
+    const bool firstStagedHome = axis.axisIndex == 0 && physicalX &&
+        UsesPbcXPhysicalHomeCapture(axis) && m_motion.IsPbcXStagedHomeEntryIdentity(0);
+    const bool disabledIdentity = pbc::HasDisabledCoordinateIdentity(
+        axis.enablePitch || axis.enableBacklash, axis.currentCompOffset_unit,
+        axis.mechanicalCompensationFrame) && ((!physicalX && axis.axisIndex != 0) ||
+            (physicalX && axis.axisIndex == 0 && m_motion.IsPbcXConfiguredDisabledHomeIdentity(0)));
+    // Clearing live enable bits/frame cannot disguise an enabled-zero boot
+    // as the old OFF path; RT publishes the independently sealed OFF identity.
+    if (!disabledIdentity && !zeroOnlyX && !firstStagedHome)
+        return HomeErrorReason::REFERENCE_INVALID;
+    // PBC-3I: X motor INDEX uses an exact RT capture receipt. Configuration
+    // which cannot establish that receipt is rejected before HOME ownership.
+    if (UsesPbcXPhysicalHomeCapture(axis) &&
+        !m_motion.IsPbcXPhysicalHomeCaptureSupported(axis.axisIndex))
+        return HomeErrorReason::INVALID_CONFIG;
     if ((axis.home.direction != -1 && axis.home.direction != 1) ||
         (sequenceMode == HomeSequenceMode::BY_ORDER && axis.home.order < 0))
         return HomeErrorReason::INVALID_CONFIG;
@@ -1742,6 +1790,11 @@ void HomingManager::InitializeRequest(uint8_t selectedAxisMask)
 void HomingManager::ResetAxisRuntime(
     AxisContext& axis)
 {
+    if (axis.axisIndex == 0)
+    {
+        ClearPbcXHomeCaptureRuntime();
+        m_pbcXHomeCaptureRequired = false;
+    }
     axis.homeRuntime =
         HomeRuntime{};
 }
@@ -1750,6 +1803,11 @@ void HomingManager::ResetAxisRuntime(
 void HomingManager::PrepareSelectedAxis(
     AxisContext& axis)
 {
+    if (axis.axisIndex == 0)
+    {
+        ClearPbcXHomeCaptureRuntime();
+        m_pbcXHomeCaptureRequired = UsesPbcXPhysicalHomeCapture(axis);
+    }
     axis.homeRuntime.selected =
         true;
 
@@ -2955,6 +3013,8 @@ bool HomingManager::UsesDriveTouchProbe(
 bool HomingManager::ValidateDriveProbeConfig(
     const AxisContext& axis) const
 {
+    if (UsesPbcXPhysicalHomeCapture(axis) &&
+        !m_motion.IsPbcXPhysicalHomeCaptureSupported(axis.axisIndex)) return false;
     if (!UsesDriveTouchProbe(axis))
     {
         return true;
@@ -3030,6 +3090,7 @@ bool HomingManager::IsDriveProbeSourceStatusValid(
 void HomingManager::ResetDriveProbeRuntime(
     AxisContext& axis)
 {
+    if (axis.axisIndex == 0) ClearPbcXHomeCaptureRuntime();
     axis.homeRuntime.driveProbePhase =
         HomeDriveProbePhase::IDLE;
 
@@ -3121,6 +3182,208 @@ bool HomingManager::DisarmDriveProbe(
 }
 
 
+bool HomingManager::UsesPbcXPhysicalHomeCapture(
+    const AxisContext& axis) const noexcept
+{
+    return axis.axisIndex == 0 && axis.home.method == HomeMethod::INDEX_ONLY &&
+        axis.home.referenceSource == HomeReferenceSource::MOTOR_ENCODER_INDEX;
+}
+
+void HomingManager::ClearPbcXHomeCaptureRuntime() noexcept
+{
+    m_pbcXHomeDisarmSequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+    m_pbcXHomeArmSequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+    m_pbcXHomeCaptureToken = 0ULL;
+    m_pbcXHomeCapturedPulse = 0.0;
+}
+
+// Supervisor-only event diagnostics. No RT observer or cyclic sample prints.
+// Each caller is a HOME state transition or a single terminal error/ACK.
+void HomingManager::LogPbcXHomeCaptureEvent(const char* event,
+    const MotionPbcHomeCaptureSnapshot& snapshot, bool coherent,
+    HomeErrorReason homeError) const noexcept
+{
+    // This deployment printed the floating-point field as literal f. Preserve
+    // the exact double representation using the integer format used by RT logs.
+    std::uint64_t pulseBits = 0ULL;
+    std::memcpy(&pulseBits, &snapshot.capturedReferencePulse, sizeof(pulseBits));
+    RtPrintf("[PBC3I-HOME] event=%s axis=0 coherent=%u phase=%u reason=%u homeError=%u "
+        "token=%llu localToken=%llu owner=%llu epoch=%llu disarmSeq=%llu armSeq=%llu "
+        "sendTick=%llu sampleTick=%llu captureTick=%llu status=0x%04X raw=%u pulseBits=%016llX\n",
+        event, coherent ? 1U : 0U, static_cast<unsigned>(snapshot.phase),
+        static_cast<unsigned>(snapshot.reason), static_cast<unsigned>(homeError),
+        static_cast<unsigned long long>(snapshot.token),
+        static_cast<unsigned long long>(m_pbcXHomeCaptureToken),
+        static_cast<unsigned long long>(snapshot.ownerGeneration),
+        static_cast<unsigned long long>(snapshot.epoch),
+        static_cast<unsigned long long>(snapshot.disarmSequence),
+        static_cast<unsigned long long>(snapshot.armSequence),
+        static_cast<unsigned long long>(snapshot.lastSendTick),
+        static_cast<unsigned long long>(snapshot.lastSampleTick),
+        static_cast<unsigned long long>(snapshot.captureTick),
+        static_cast<unsigned>(snapshot.lastStatus),
+        static_cast<unsigned>(snapshot.capturedRawPosition),
+        static_cast<unsigned long long>(pulseBits));
+}
+
+bool HomingManager::ProcessPbcXDriveProbeArm(int axisIndex, AxisContext& axis)
+{
+    if (!UsesPbcXPhysicalHomeCapture(axis) ||
+        !m_motion.IsPbcXPhysicalHomeCaptureSupported(axisIndex) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_homeMotionLease))
+    {
+        SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
+        return false;
+    }
+
+    MotionPbcHomeCaptureSnapshot snapshot{};
+    const bool coherent = m_motion.GetPbcXPhysicalHomeCaptureSnapshot(axisIndex, snapshot);
+    const bool current = coherent && snapshot.ownerGeneration == m_homeMotionLease.generation &&
+        snapshot.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        m_pbcXHomeDisarmSequence != MOTION_AXIS_COMMAND_SEQUENCE_INVALID &&
+        snapshot.disarmSequence == m_pbcXHomeDisarmSequence;
+    if (current && snapshot.failed)
+    {
+        SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
+        return false;
+    }
+    if (current)
+    {
+        axis.homeRuntime.driveProbeLastStatus = snapshot.lastStatus;
+        axis.homeRuntime.driveProbeLastPosition = static_cast<int32_t>(snapshot.capturedRawPosition);
+    }
+
+    switch (axis.homeRuntime.driveProbePhase)
+    {
+    case HomeDriveProbePhase::IDLE:
+        axis.homeRuntime.driveProbePhase = HomeDriveProbePhase::WRITE_DISARM;
+        axis.homeRuntime.driveProbePhaseElapsedSec = 0.0;
+        return false;
+    case HomeDriveProbePhase::WRITE_DISARM:
+    {
+        if (PbcHomeReferencePending(m_pendingApplyHomeSequence)) return false;
+        bool ingressBusy = false;
+        MotionAxisCommandSequence sequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        if (!m_motion.SubmitDriveTouchProbeFunction(axisIndex,
+            axis.home.driveProbeDisarmValue, GetProbeCommandLease(), &sequence, &ingressBusy))
+        {
+            if (!ingressBusy) SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
+            return false;
+        }
+        m_pbcXHomeDisarmSequence = sequence;
+        m_pbcXHomeArmSequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        axis.homeRuntime.driveProbeControlWritten = true;
+        axis.homeRuntime.driveProbeLastFunction = axis.home.driveProbeDisarmValue;
+        axis.homeRuntime.driveProbePhase = HomeDriveProbePhase::WAIT_CLEAR;
+        axis.homeRuntime.driveProbePhaseElapsedSec = 0.0;
+        return false;
+    }
+    case HomeDriveProbePhase::WAIT_CLEAR:
+        // Enqueued/APPLIED is insufficient: clearReady proves a later input
+        // after this exact disarm image was accepted at the real send seam.
+        if (current && snapshot.clearReady)
+        {
+            LogPbcXHomeCaptureEvent("CLEAR", snapshot);
+            axis.homeRuntime.driveProbeClearConfirmed = true;
+            axis.homeRuntime.driveProbePhase = HomeDriveProbePhase::WRITE_ARM;
+            axis.homeRuntime.driveProbePhaseElapsedSec = 0.0;
+        }
+        else if (axis.homeRuntime.driveProbePhaseElapsedSec >= axis.home.driveProbeClearTimeoutSec)
+            SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_NOT_ARMED);
+        return false;
+    case HomeDriveProbePhase::WRITE_ARM:
+    {
+        if (PbcHomeReferencePending(m_pendingApplyHomeSequence)) return false;
+        // Do not arm from stale cached clear evidence after an RT revocation.
+        if (!current || !snapshot.clearReady)
+        {
+            if (axis.homeRuntime.driveProbePhaseElapsedSec >= axis.home.driveProbeClearTimeoutSec)
+                SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_NOT_ARMED);
+            return false;
+        }
+        bool ingressBusy = false;
+        MotionAxisCommandSequence sequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+        if (!m_motion.SubmitDriveTouchProbeFunction(axisIndex,
+            axis.home.driveProbeArmValue, GetProbeCommandLease(), &sequence, &ingressBusy))
+        {
+            if (!ingressBusy) SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
+            return false;
+        }
+        m_pbcXHomeArmSequence = sequence;
+        axis.homeRuntime.driveProbeLastFunction = axis.home.driveProbeArmValue;
+        axis.homeRuntime.driveProbePhase = HomeDriveProbePhase::WAIT_ARMED;
+        axis.homeRuntime.driveProbePhaseElapsedSec = 0.0;
+        return false;
+    }
+    case HomeDriveProbePhase::WAIT_ARMED:
+        if (current && m_pbcXHomeArmSequence != MOTION_AXIS_COMMAND_SEQUENCE_INVALID &&
+            snapshot.armSequence == m_pbcXHomeArmSequence && (snapshot.armed || snapshot.captured))
+        {
+            LogPbcXHomeCaptureEvent("ARMED", snapshot);
+            axis.homeRuntime.driveProbeArmedConfirmed = true;
+            axis.homeRuntime.driveProbePhase = HomeDriveProbePhase::READY;
+            axis.homeRuntime.driveProbePhaseElapsedSec = 0.0;
+            axis.homeRuntime.referenceArmed = true;
+            // This scalar is the legacy travel-budget origin, never capture
+            // or HOME commit authority. Capture conversion stays RT-owned.
+            axis.homeRuntime.indexSearchStartPulse = m_motion.GetRawLogicalPositionPulse(axis);
+            return true;
+        }
+        if (axis.homeRuntime.driveProbePhaseElapsedSec >= axis.home.driveProbeArmTimeoutSec)
+            SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_NOT_ARMED);
+        return false;
+    case HomeDriveProbePhase::READY:
+    case HomeDriveProbePhase::CAPTURED:
+    case HomeDriveProbePhase::DISARM_AFTER_CAPTURE:
+        return axis.homeRuntime.referenceArmed;
+    default:
+        SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
+        return false;
+    }
+}
+
+bool HomingManager::TryCapturePbcXDriveProbe(int axisIndex, AxisContext& axis,
+    bool& detected, double& capturedPulse)
+{
+    detected = false;
+    capturedPulse = 0.0;
+    if (!UsesPbcXPhysicalHomeCapture(axis) ||
+        !m_motion.IsPbcXPhysicalHomeCaptureSupported(axisIndex) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_homeMotionLease) ||
+        m_pbcXHomeArmSequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID) return false;
+    MotionPbcHomeCaptureSnapshot snapshot{};
+    // A bounded publication collision is merely unavailable on this scan.
+    // Existing search time/distance limits continue to bound the wait.
+    if (!m_motion.GetPbcXPhysicalHomeCaptureSnapshot(axisIndex, snapshot)) return true;
+    if (snapshot.ownerGeneration != m_homeMotionLease.generation ||
+        snapshot.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        snapshot.disarmSequence != m_pbcXHomeDisarmSequence ||
+        snapshot.armSequence != m_pbcXHomeArmSequence || snapshot.failed) return false;
+    axis.homeRuntime.driveProbeLastStatus = snapshot.lastStatus;
+    if (!snapshot.captured) return true;
+    if (snapshot.token == 0ULL || !std::isfinite(snapshot.capturedReferencePulse)) return false;
+
+    if (m_pbcXHomeCaptureToken != snapshot.token)
+        LogPbcXHomeCaptureEvent("CAPTURED", snapshot);
+    m_pbcXHomeCaptureToken = snapshot.token;
+    m_pbcXHomeCapturedPulse = snapshot.capturedReferencePulse;
+    axis.homeRuntime.capturedReferenceRaw = static_cast<int32_t>(snapshot.capturedRawPosition);
+    axis.homeRuntime.driveProbeLastPosition = axis.homeRuntime.capturedReferenceRaw;
+    axis.homeRuntime.driveProbeCaptureConfirmed = true;
+    axis.homeRuntime.driveProbePhase = HomeDriveProbePhase::CAPTURED;
+    capturedPulse = snapshot.capturedReferencePulse;
+    detected = true;
+    if (axis.home.driveProbeDisarmAfterCapture)
+    {
+        // Cleanup disarm preserves the RT receipt and this typed token.
+        // CompleteAxis retains its existing exact disarm/release wait.
+        if (DisarmDriveProbe(axisIndex, axis))
+            axis.homeRuntime.driveProbePhase = HomeDriveProbePhase::DISARM_AFTER_CAPTURE;
+    }
+    return true;
+}
+
+
 bool HomingManager::ProcessDriveProbeArm(
     int axisIndex,
     AxisContext& axis,
@@ -3143,6 +3406,9 @@ bool HomingManager::ProcessDriveProbeArm(
         axis.homeRuntime.driveProbePhaseElapsedSec +=
             cycleTimeSec;
     }
+
+    if (axisIndex == 0 && m_pbcXHomeCaptureRequired)
+        return ProcessPbcXDriveProbeArm(axisIndex, axis);
 
     uint16_t functionValue =
         0;
@@ -3248,11 +3514,15 @@ bool HomingManager::ProcessDriveProbeArm(
 
 
     case HomeDriveProbePhase::WRITE_DISARM:
-
-        if (!QueueHomeProbeFunction(
-            axisIndex,
-            axis.home.driveProbeDisarmValue))
+    {
+        if (PbcHomeReferencePending(m_pendingApplyHomeSequence)) return false;
+        bool ingressBusy = false;
+        // Mixed-method HOME can arm this probe while a peer is committing
+        // its reference. Only the exact ingress-busy rejection is retryable.
+        if (!m_motion.SubmitDriveTouchProbeFunction(axisIndex,
+            axis.home.driveProbeDisarmValue, GetProbeCommandLease(), nullptr, &ingressBusy))
         {
+            if (ingressBusy) return false;
             SetAxisError(
                 axisIndex,
                 axis,
@@ -3274,6 +3544,7 @@ bool HomingManager::ProcessDriveProbeArm(
             0.0;
 
         return false;
+    }
 
 
     case HomeDriveProbePhase::WAIT_CLEAR:
@@ -3321,11 +3592,15 @@ bool HomingManager::ProcessDriveProbeArm(
 
 
     case HomeDriveProbePhase::WRITE_ARM:
-
-        if (!QueueHomeProbeFunction(
-            axisIndex,
-            axis.home.driveProbeArmValue))
+    {
+        if (PbcHomeReferencePending(m_pendingApplyHomeSequence)) return false;
+        bool ingressBusy = false;
+        // Mixed-method HOME can arm this probe while a peer is committing
+        // its reference. Only the exact ingress-busy rejection is retryable.
+        if (!m_motion.SubmitDriveTouchProbeFunction(axisIndex,
+            axis.home.driveProbeArmValue, GetProbeCommandLease(), nullptr, &ingressBusy))
         {
+            if (ingressBusy) return false;
             SetAxisError(
                 axisIndex,
                 axis,
@@ -3344,6 +3619,7 @@ bool HomingManager::ProcessDriveProbeArm(
             0.0;
 
         return false;
+    }
 
 
     case HomeDriveProbePhase::WAIT_ARMED:
@@ -3451,6 +3727,9 @@ bool HomingManager::TryCaptureDriveProbe(
     {
         return false;
     }
+
+    if (axisIndex == 0 && m_pbcXHomeCaptureRequired)
+        return TryCapturePbcXDriveProbe(axisIndex, axis, detected, capturedPulse);
 
     uint16_t functionValue =
         0;
@@ -4631,6 +4910,14 @@ void HomingManager::ProcessAxis(
     // ========================================================
     if (axis.homeRuntime.state == HomeState::APPLY_HOME)
     {
+        // ProcessAxis owns this clock; DEFERRED/ingress retries do not reset
+        // it. The established HOLD/PAUSED path does not run ProcessAxis.
+        if (!std::isfinite(axis.homeRuntime.stateElapsedSec) ||
+            axis.homeRuntime.stateElapsedSec >= PBC_HOME_REFERENCE_RETRY_TIMEOUT_SEC)
+        {
+            SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
+            return;
+        }
         if (axis.state != MotionState::MotionState_IDLE || !axis.homeRuntime.referenceDetected || !std::isfinite(axis.homeRuntime.capturedReferencePulse))
         {
             SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
@@ -4639,8 +4926,17 @@ void HomingManager::ProcessAxis(
         MotionAxisCommandSequence& pendingSequence =
             m_pendingApplyHomeSequence[axisIndex];
 
-        if (pendingSequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID)
+        // A completed RT reference is not resubmitted when completion's
+        // probe-disarm queue operation must retry. PrepareSelectedAxis clears
+        // isHomed, and only an exact APPLIED receipt below establishes it.
+        if (pendingSequence == MOTION_AXIS_COMMAND_SEQUENCE_INVALID && !axis.isHomed)
         {
+            // Grouped HOME searches may run together, but reference commits
+            // are serialized. A queued peer cannot make X's drained-queue
+            // proof false merely because both reached APPLY_HOME this scan.
+            for (int other = 0; other < HOME_AXIS_COUNT; ++other)
+                if (other != axisIndex && m_pendingApplyHomeSequence[other] !=
+                    MOTION_AXIS_COMMAND_SEQUENCE_INVALID) return;
             // PREPARE may precede this point by a complete sensor search.
             // Reject a newly forbidden zero before submitting the rebase.
             if (axis.home.moveToZero &&
@@ -4650,32 +4946,57 @@ void HomingManager::ProcessAxis(
                 SetAxisError(axisIndex, axis, HomeErrorReason::INVALID_CONFIG);
                 return;
             }
+            if (axisIndex == 0 && m_pbcXHomeCaptureRequired &&
+                (m_pbcXHomeCaptureToken == 0ULL ||
+                    !m_motion.IsPbcXPhysicalHomeCaptureSupported(axisIndex) ||
+                    axis.homeRuntime.capturedReferencePulse != m_pbcXHomeCapturedPulse))
+            {
+                SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
+                return;
+            }
+            bool ingressBusy = false;
             if (!m_motion.SubmitApplyMachineHome(
                 axisIndex, axis.homeRuntime.capturedReferencePulse,
                 axis.home.homeOffset_unit, m_homeMotionLease,
-                pendingSequence))
+                pendingSequence, &ingressBusy,
+                axisIndex == 0 && m_pbcXHomeCaptureRequired ? m_pbcXHomeCaptureToken : 0ULL))
             {
+                if (ingressBusy) return; // bounded RT reference commit; retry next scan
                 SetAxisError(axisIndex, axis, HomeErrorReason::MOTION_FAULT);
             }
             return;
         }
 
-        MotionAxisCommandResult applyResult{};
-        if (!m_motion.TryGetAxisCommandResult(pendingSequence, applyResult))
+        if (!axis.isHomed)
         {
-            return;
+            MotionAxisCommandResult applyResult{};
+            if (!m_motion.TryGetAxisCommandResult(pendingSequence, applyResult)) return;
+            const bool exact = applyResult.sequence == pendingSequence &&
+                applyResult.axisIndex == axisIndex &&
+                applyResult.commandType == MotionAxisCommandType::APPLY_MACHINE_HOME &&
+                applyResult.owner == MotionOwner::HOME &&
+                applyResult.ownerGeneration == m_homeMotionLease.generation &&
+                m_motion.IsMotionOwnerLeaseCurrent(m_homeMotionLease);
+            pendingSequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
+            if (exact && applyResult.resultType == MotionAxisCommandResultType::DEFERRED &&
+                applyResult.rejectReason == MotionRejectReason::NOT_READY)
+                return; // no scalar was written; collect a fresh stopped proof
+            if (!exact || applyResult.resultType != MotionAxisCommandResultType::APPLIED ||
+                applyResult.rejectReason != MotionRejectReason::NONE)
+            {
+                SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
+                return;
+            }
+            if (axisIndex == 0 && m_pbcXHomeCaptureRequired)
+            {
+                MotionPbcHomeCaptureSnapshot snapshot{};
+                const bool coherent = m_motion.GetPbcXPhysicalHomeCaptureSnapshot(axisIndex, snapshot);
+                LogPbcXHomeCaptureEvent("APPLIED", snapshot, coherent);
+            }
+            axis.isHomed = true;
+            if (m_nc != nullptr)
+                m_nc->CoordSys.commandedMCS[axisIndex] = axis.currentActPos * (axis.finalLead / axis.resolution_PPR);
         }
-
-        pendingSequence = MOTION_AXIS_COMMAND_SEQUENCE_INVALID;
-        if (applyResult.resultType != MotionAxisCommandResultType::APPLIED)
-        {
-            SetAxisError(axisIndex, axis, HomeErrorReason::REFERENCE_INVALID);
-            return;
-        }
-
-        axis.isHomed = true;
-        if (m_nc != nullptr)
-            m_nc->CoordSys.commandedMCS[axisIndex] = axis.currentActPos * (axis.finalLead / axis.resolution_PPR);
 
         if (axis.home.moveToZero)
         {
@@ -4866,6 +5187,13 @@ void HomingManager::SetAxisError(
     const bool firstHomeError =
         m_lastError ==
         HomeErrorReason::NONE;
+    if (firstHomeError && axisIndex == 0 && m_pbcXHomeCaptureRequired)
+    {
+        MotionPbcHomeCaptureSnapshot snapshot{};
+        const bool coherent = m_motion.GetPbcXPhysicalHomeCaptureSnapshot(axisIndex, snapshot);
+        LogPbcXHomeCaptureEvent("FAILED", snapshot, coherent, error);
+    }
+    ClearPbcXHomeCaptureRuntime();
 
     const int immediateAlarmCode = GetHomeAlarmCode(error);
     if (immediateAlarmCode != 0)

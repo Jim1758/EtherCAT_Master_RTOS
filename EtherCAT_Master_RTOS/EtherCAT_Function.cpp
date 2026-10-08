@@ -30,6 +30,7 @@
 #include "EtherCatMaster.h"
 #include "EtherCatMaster_DC_Internal.h"
 #include "EtherCatRxForensics.h"
+#include "NicTxReceipt.h"
 #include "ConfigReader.h"
 #include "GlobalConfig.h" // 如果你有用到 DEBUG_PRINT 等功能
 #include <windows.h> 
@@ -178,7 +179,9 @@ int EtherCatMaster::ecx_BRD(uint16_t ADP, uint16_t ADO, uint16_t length, int tim
 
     // --- 5. 發送封包 ---
     int total_send_len = 14 + 2 + 10 + length + 2;
-    m_pNic->SendPacket(frame, total_send_len);
+    NicTxCallContext txContext{};
+    txContext.caller = NicTxCaller::ControlDatagram;
+    m_pNic->SendPacket(frame, total_send_len, nullptr, &txContext);
 
     // --- 6. 接收回應 (Receive Loop) ---
     int max_retries = timeout * 100;
@@ -262,7 +265,9 @@ int EtherCatMaster::ecx_BWR(uint16_t ADP, uint16_t ADO, uint16_t length, const v
 
     // --- 5. 發送 ---
     int total_send_len = 14 + 2 + 10 + length + 2;
-    m_pNic->SendPacket(frame, total_send_len);
+    NicTxCallContext txContext{};
+    txContext.caller = NicTxCaller::ControlDatagram;
+    m_pNic->SendPacket(frame, total_send_len, nullptr, &txContext);
 
     // --- 6. 接收回應 ---
     int max_retries = timeout * 100;
@@ -343,7 +348,9 @@ int EtherCatMaster::ecx_APRD(uint16_t ADP, uint16_t ADO, uint16_t length, void* 
 
     // 發送
     int total_send_len = 14 + 2 + 10 + length + 2;
-    m_pNic->SendPacket(frame, total_send_len);
+    NicTxCallContext txContext{};
+    txContext.caller = NicTxCaller::ControlDatagram;
+    m_pNic->SendPacket(frame, total_send_len, nullptr, &txContext);
 
     // 接收迴圈 (Index Matching)
     int max_retries = timeout * 100;
@@ -429,7 +436,9 @@ int EtherCatMaster::ecx_APWR(uint16_t ADP, uint16_t ADO, uint16_t length, const 
 
     // 發送
     int total_send_len = 14 + 2 + 10 + length + 2;
-    m_pNic->SendPacket(frame, total_send_len);
+    NicTxCallContext txContext{};
+    txContext.caller = NicTxCaller::ControlDatagram;
+    m_pNic->SendPacket(frame, total_send_len, nullptr, &txContext);
 
     // 接收迴圈
     int max_retries = timeout * 100;
@@ -555,6 +564,7 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
         !m_Motion.BeginServoOutputFrameAtSendPoint(
             frameReservation))
     {
+        m_Motion.EndServoOutputFrameAfterSend(frameReservation, false, false);
         return -1;
     }
     if (length > 0U && data != nullptr)
@@ -565,6 +575,7 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
         !m_Motion.FinalizeServoOutputFrameAtSendPoint(
             frameReservation))
     {
+        m_Motion.EndServoOutputFrameAfterSend(frameReservation, false, false);
         return -1;
     }
     if (frameReservation.recopyRequired &&
@@ -572,12 +583,42 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
     {
         memcpy(&frame[26], data, length);
     }
+    // PBC-3I: seal the actual serialized LRW bytes after every final copy.
+    // A local 60B8 write is not evidence of what the NIC was handed.
+    if (isRuntimeProcessImage &&
+        !m_Motion.SealPbcXHomeProbeSerializedImage(
+            frameReservation, static_cast<const uint8_t*>(data), length, &frame[26], length))
+    {
+        m_Motion.EndServoOutputFrameAfterSend(frameReservation, false, false);
+        return -1;
+    }
+    // PBC-3J FIX3: only this call's explicit pre-NAL rejection can prove
+    // no handoff. NAL-call failures and missing receipts remain uncertain.
+    NicTxCallContext txContext{};
+    txContext.caller = isRuntimeProcessImage ? NicTxCaller::RuntimeLRW : NicTxCaller::OtherLRW;
+    if (isRuntimeProcessImage)
+    {
+        txContext.pdoTick = static_cast<std::uint64_t>(tickCount_PDO);
+        txContext.pdoTickValid = 1U;
+        txContext.sourceTick = frameReservation.handoff.sourceTick;
+        txContext.sourceTickValid = frameReservation.handoff.sourceTick != 0ULL ? 1U : 0U;
+        txContext.authorityValid = frameReservation.acquired ? 1U : 0U;
+        if (frameReservation.acquired)
+        {
+            txContext.packedOwnerState = frameReservation.baseOwnerState;
+            txContext.packedExecutionPublication = frameReservation.baseExecutionPublication;
+        }
+        txContext.edmGuardHeld = frameReservation.edmZGuardHeld ? 1U : 0U;
+        txContext.edmFeedbackPublication = frameReservation.edmZGuardHeld ?
+            frameReservation.edmZFeedbackPublication : 0ULL;
+    }
+    NicTxReceipt txReceipt{};
     const bool sendSucceeded =
-        m_pNic->SendPacket(frame, total_send_len);
+        m_pNic->SendPacket(frame, total_send_len, &txReceipt, &txContext);
     if (isRuntimeProcessImage)
     {
         m_Motion.EndServoOutputFrameAfterSend(
-            frameReservation);
+            frameReservation, txReceipt.WasTransmissionAttempted(), sendSucceeded);
     }
     if (!sendSucceeded)
     {
@@ -591,7 +632,8 @@ int EtherCatMaster::ecx_LRW(uint32_t LogAddr, uint16_t length, void* data, int t
     while (max_retries-- > 0)
     {
         int rxLen = m_pNic->ReceivePacket(m_rxBuffer);
-        if (rxLen > 0)
+        // Bound every header/data access, including the input-image copy.
+        if (rxLen >= total_send_len)
         {
             // 檢查 EtherType
             if (m_rxBuffer[12] == 0x88 && m_rxBuffer[13] == 0xA4)
@@ -1162,9 +1204,11 @@ int EtherCatMaster::SendAndReceiveRegister(
     // =========================================================
     // 7. Send
     // =========================================================
+    NicTxCallContext txContext{};
+    txContext.caller = NicTxCaller::ControlDatagram;
     m_pNic->SendPacket(
         sendBuf,
-        idx);
+        idx, nullptr, &txContext);
 
 
     // =========================================================
@@ -6143,6 +6187,7 @@ int EtherCatMaster::ecx_LRW_FRMW(
         !m_Motion.BeginServoOutputFrameAtSendPoint(
             frameReservation))
     {
+        m_Motion.EndServoOutputFrameAfterSend(frameReservation, false, false);
         return -1;
     }
     memcpy(
@@ -6153,6 +6198,7 @@ int EtherCatMaster::ecx_LRW_FRMW(
         !m_Motion.FinalizeServoOutputFrameAtSendPoint(
             frameReservation))
     {
+        m_Motion.EndServoOutputFrameAfterSend(frameReservation, false, false);
         return -1;
     }
     if (frameReservation.recopyRequired)
@@ -6161,6 +6207,15 @@ int EtherCatMaster::ecx_LRW_FRMW(
             &frame[lrwDataOffset],
             data,
             length);
+    }
+
+    // PBC-3I: the exact final payload, not live pOutput, seals 60B8.
+    if (isRuntimeProcessImage &&
+        !m_Motion.SealPbcXHomeProbeSerializedImage(
+            frameReservation, static_cast<const uint8_t*>(data), length, &frame[lrwDataOffset], length))
+    {
+        m_Motion.EndServoOutputFrameAfterSend(frameReservation, false, false);
+        return -1;
     }
 
     // =============================================================
@@ -6197,11 +6252,39 @@ int EtherCatMaster::ecx_LRW_FRMW(
     // Actual NIC Send API
     // =============================================================
 
+    // PBC-3J FIX3: the receipt belongs to this exact SendPacket call.
+    NicTxCallContext txContext{};
+    txContext.caller = isRuntimeProcessImage ? NicTxCaller::RuntimeLRW_FRMW : NicTxCaller::OtherLRW_FRMW;
+    if (isRuntimeProcessImage)
+    {
+        txContext.pdoTick = static_cast<std::uint64_t>(tickCount_PDO);
+        txContext.pdoTickValid = 1U;
+        txContext.sourceTick = frameReservation.handoff.sourceTick;
+        txContext.sourceTickValid = frameReservation.handoff.sourceTick != 0ULL ? 1U : 0U;
+        txContext.authorityValid = frameReservation.acquired ? 1U : 0U;
+        if (frameReservation.acquired)
+        {
+            txContext.packedOwnerState = frameReservation.baseOwnerState;
+            txContext.packedExecutionPublication = frameReservation.baseExecutionPublication;
+        }
+        txContext.edmGuardHeld = frameReservation.edmZGuardHeld ? 1U : 0U;
+        txContext.edmFeedbackPublication = frameReservation.edmZGuardHeld ?
+            frameReservation.edmZFeedbackPublication : 0ULL;
+    }
+    NicTxReceipt txReceipt{};
+    // Freeze this transaction's immutable wire identity before submission.
+    uint8_t etherCatTxHeader[2] = {};
+    uint8_t lrwTxHeader[8] = {};
+    uint8_t frmwTxHeader[8] = {};
+    memcpy(etherCatTxHeader, &frame[14], sizeof(etherCatTxHeader));
+    memcpy(lrwTxHeader, &frame[lrwOffset], sizeof(lrwTxHeader));
+    memcpy(frmwTxHeader, &frame[frmwOffset], sizeof(frmwTxHeader));
     const bool sendSucceeded =
         m_pNic->
             SendPacket(
                 frame,
-                totalFrameLength);
+                totalFrameLength,
+                &txReceipt, &txContext);
 
     // DC-RX.3D: capture the SendPacket() return boundary before any
     // reservation-release bookkeeping. This keeps the exact TX software
@@ -6223,7 +6306,7 @@ int EtherCatMaster::ecx_LRW_FRMW(
     if (isRuntimeProcessImage)
     {
         m_Motion.EndServoOutputFrameAfterSend(
-            frameReservation);
+            frameReservation, txReceipt.WasTransmissionAttempted(), sendSucceeded);
     }
     if (!sendSucceeded)
     {
@@ -7855,6 +7938,33 @@ int EtherCatMaster::ecx_LRW_FRMW(
         *dcWkc =
             (int)
             receivedDcWkc;
+
+        // EDM45: observe only this accepted transaction after the existing
+        // hard-deadline, frame-bounds and both command/index checks above.
+        // C (circulated) and IRQ are mutable; the EtherCAT header, addresses,
+        // lengths and M chain flags must still equal the serialized request.
+        const bool immutableTxHeadersMatch =
+            memcmp(&m_rxBuffer[14], etherCatTxHeader, 2U) == 0 &&
+            memcmp(&m_rxBuffer[lrwOffset], lrwTxHeader, 7U) == 0 &&
+            (m_rxBuffer[lrwOffset + 7] & 0xBFU) ==
+                (lrwTxHeader[7] & 0xBFU) &&
+            memcmp(&m_rxBuffer[frmwOffset], frmwTxHeader, 7U) == 0 &&
+            (m_rxBuffer[frmwOffset + 7] & 0xBFU) ==
+                (frmwTxHeader[7] & 0xBFU);
+        if (isRuntimeProcessImage &&
+            rxDeadlineValid && rxAfterReceiveQpcValid && rxAttemptStartQpcValid &&
+            rxAttemptStartQpc >= rxStartQpc.QuadPart &&
+            rxAfterReceiveQpc.QuadPart >= rxAttemptStartQpc &&
+            rxAfterReceiveQpc.QuadPart < rxHardDeadlineQpc &&
+            EXPECTED_WKC_PDO > 0 &&
+            static_cast<int>(lrwWkc) == EXPECTED_WKC_PDO &&
+            receivedDcWkc > 0U &&
+            immutableTxHeadersMatch)
+        {
+            // A false result leaves current PDO/DC validity unchanged. A true
+            // result is neither NAL ownership return nor a drive/motion ACK.
+            (void)m_pNic->ObserveValidatedTxResponse(txReceipt);
+        }
 
 
         if (rxAttemptSoftLate)

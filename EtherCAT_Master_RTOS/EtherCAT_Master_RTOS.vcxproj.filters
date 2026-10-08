@@ -929,6 +929,24 @@
     <ClInclude Include="MotionPathCoreHoldExcursion.h">
       <Filter>Header Files\Motion</Filter>
     </ClInclude>
+    <ClInclude Include="EDMFlushExecution.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMShortFlushSimulationTest.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMAutomaticFlushCycle.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMLiveAutomaticFlush.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMAutomaticFlushRecipe.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMAutomaticFlushSimulationTest.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
     <ClInclude Include="EDMGapSignal.h">
       <Filter>Header Files\EDM</Filter>
     </ClInclude>
@@ -948,6 +966,12 @@
       <Filter>Header Files\Motion</Filter>
     </ClInclude>
     <ClInclude Include="RotaryPidDiagnostic.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="MechanicalCompensationSendContract.h">
+      <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="MotionPbcXSendAudit.h">
       <Filter>Header Files\Motion</Filter>
     </ClInclude>
   </ItemGroup>

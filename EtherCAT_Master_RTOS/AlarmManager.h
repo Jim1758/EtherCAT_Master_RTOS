@@ -131,7 +131,12 @@ public:
     enum EDMAlarm {
         SHORT_CIRCUIT = EDM_BASE + 1,  // 4001: 極間嚴重短路
         FLUID_LOW = EDM_BASE + 2,  // 4002: 加工液位過低
-        TEMP_HIGH = EDM_BASE + 3   // 4003: 加工液溫度過高
+        TEMP_HIGH = EDM_BASE + 3,  // 4003: 加工液溫度過高
+        EDM_CONDITION_TABLE_NOT_FOUND = EDM_BASE + 10, // 4010: G38 requested COND is absent
+        EDM_CONDITION_STARTUP_RECOVERED = EDM_BASE + 11, // 4011: missing startup COND regenerated
+        EDM_CONDITION_CATALOG_INVALID = EDM_BASE + 12, // 4012: COND catalog/startup recovery failed
+        EDM_CONDITION_SELECTION_SAVE_FAILED = EDM_BASE + 13, // 4013: last selected COND could not be saved
+        EDM_PROCESS_CONFIG_INVALID = EDM_BASE + 20 // 4020: EDM process profile missing/invalid
     };
 
     // 取得單例

@@ -141,23 +141,24 @@ bool MotionCore::IsPlanarEndpointBasisCurrent(const double* referenceMCS,
         if (!std::isfinite(pulsePerMM) || pulsePerMM <= 0.0) return false;
         const double forwardPulse = referenceMCS[slot] * pulsePerMM;
         const double reverseMCS = startPulse[slot] * axis.finalLead / axis.resolution_PPR;
-        // BASE70: retain the exact proven Z spelling across mixed Z/C and
-        // subsequent single-C motion. This is only a native-basis proof; the
-        // caller's original G00/G01/source/travel gates still own permission.
+        // BASE72: retain only independently proven XYZ native spellings.
+        // The per-axis bit, live pulse and shared tuple remain mandatory;
+        // an unselected sampled coordinate never creates a proof bit.
         const MotionCncPathTail& zc = m_zcFeedProducerTail;
+        const std::uint32_t bit = 1U << static_cast<unsigned>(slot);
         const MotionOwnerLease owner = GetMotionOwnerLease();
         const MotionExecutionEpoch epoch = GetCurrentExecutionEpoch();
-        const bool acceptedZBasis = slot == 2U && zc.valid && (zc.axisMask & 4U) != 0U &&
-            (zc.validAxisMask & 4U) != 0U && zc.identity.IsAssigned() &&
+        const bool acceptedLinearBasis = zc.valid && (zc.axisMask & bit) != 0U &&
+            (zc.validAxisMask & bit) != 0U && zc.identity.IsAssigned() &&
             zc.identity.source == MotionCommandSource::NC_MEMORY &&
             m_pendingCommandSource.load(std::memory_order_acquire) == MotionCommandSource::NC_MEMORY &&
             owner.IsValid() && owner.owner == MotionOwner::AUTO && zc.ownerLease.Matches(owner) &&
             zc.identity.epoch == epoch && m_g00ProducerQueueTailEpoch == epoch &&
-            m_g00ProducerQueueTailOwnerLease.Matches(owner) && (m_g00ProducerQueueTailValidMask & 4U) != 0U &&
-            NCRotaryFeedDetail::SameBits(zc.endMCS[2], referenceMCS[2]) &&
-            zc.endPulse[2] == startPulse[2] && m_g00ProducerQueueTailPulse[2] == startPulse[2] &&
-            axis.logicalCmdPos.Load() == startPulse[2];
-        if (!acceptedZBasis && !(std::isfinite(forwardPulse) && forwardPulse == startPulse[slot]) &&
+            m_g00ProducerQueueTailOwnerLease.Matches(owner) && (m_g00ProducerQueueTailValidMask & bit) != 0U &&
+            NCRotaryFeedDetail::SameBits(zc.endMCS[slot], referenceMCS[slot]) &&
+            zc.endPulse[slot] == startPulse[slot] && m_g00ProducerQueueTailPulse[slot] == startPulse[slot] &&
+            axis.logicalCmdPos.Load() == startPulse[slot];
+        if (!acceptedLinearBasis && !(std::isfinite(forwardPulse) && forwardPulse == startPulse[slot]) &&
             !(std::isfinite(reverseMCS) && reverseMCS == referenceMCS[slot]))
         {
             // Producer-thread diagnostic only; preserve the exact rejection.
@@ -582,6 +583,32 @@ bool MotionCore::TryG00MoveInternal(
             : MotionCommandedBaselineOrigin::BUFFERED_TAIL;
     }
 
+    // BASE79N: only the neutral full XYZC exact-stop handoff already
+    // canonicalized by BASE79M-FIX1 publishes resolved native C coordinates.
+    // The shortest-path packet itself, its branch/tie choice and travel checks
+    // are unchanged. Buffered, MDI and native positioning profiles retain
+    // their accepted representation contracts.
+    bool resolvedNativeXYZCTail = transactionalTail &&
+        commandSource == MotionCommandSource::NC_MEMORY &&
+        plannedTailOwnerLease.owner == MotionOwner::AUTO && !positionBoundary &&
+        mode == BufferMode::ABORTING &&
+        commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+        IsNCTranslationSnapshotEmpty(m_pendingTranslation) &&
+        m_pendingIsAbsoluteMode && m_pendingPlaneMode == 17 &&
+        m_pendingToolMode == 49 && m_pendingHCode == 0 &&
+        m_pendingToolRadMode == 40 && m_pendingDCode == 0 &&
+        !m_pendingG162Active && !m_pendingG68Active &&
+        !m_pendingG168Active && m_pendingWCode == 0 &&
+        !m_pendingG51Active && m_pendingMirrorMask == 0U && !m_pendingG16Active &&
+        axes.size() == 4U && m_pContexts->size() >= 4U;
+    for (std::size_t slot = 0U; resolvedNativeXYZCTail && slot < 4U; ++slot)
+    {
+        const AxisContext& axis = (*m_pContexts)[slot];
+        resolvedNativeXYZCTail = axes[slot] == static_cast<int>(slot) &&
+            axis.axisIndex == static_cast<int>(slot) && axis.isExist && !axis.isVirtualAxis &&
+            axis.axisType == (slot < 3U ? AxisType::LINEAR : AxisType::ROTARY);
+    }
+
     std::vector<double> targetPosPulse(axes.size(), 0.0);
     std::uint32_t stagedAxisMask = 0U;
 
@@ -728,6 +755,7 @@ bool MotionCore::TryG00MoveInternal(
                             true,
                             MotionRejectReason::INVALID_GEOMETRY);
                     }
+                    double committedTargetMCS = targetPos_mm[slot];
                     if (rotaryShortestPath)
                     {
                         const double resolvedTargetUnits = targetPulse / pulsePerUnit;
@@ -736,6 +764,8 @@ bool MotionCore::TryG00MoveInternal(
                             return rejectWithoutTailMutation(
                                 true, true, MotionRejectReason::INVALID_GEOMETRY);
                         }
+                        if (resolvedNativeXYZCTail)
+                            committedTargetMCS = resolvedTargetUnits;
                         // Check the actual unwrapped endpoint before queue/tail commit.
                         if (m_pCoordMgr != nullptr &&
                             !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis, resolvedTargetUnits))
@@ -752,9 +782,10 @@ bool MotionCore::TryG00MoveInternal(
                         targetPulse;
                     if (transactionalTail)
                     {
+                        // Publish the finite native representation of the same
+                        // admitted pulse endpoint for the scoped XYZC handoff.
                         stagedCommandedMCS[
-                            static_cast<std::size_t>(axisIndex)] =
-                            targetPos_mm[slot];
+                            static_cast<std::size_t>(axisIndex)] = committedTargetMCS;
                     }
                     targetPosPulse[slot] = targetPulse;
                     stagedAxisMask |= axisBit;

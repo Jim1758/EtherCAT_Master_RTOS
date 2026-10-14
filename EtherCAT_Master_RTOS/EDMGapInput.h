@@ -157,6 +157,63 @@ namespace EDMGapInput
         EDMGap::Monitor check{};
         return check.Configure(p.gap, p.source);
     }
+    struct ConversionResult
+    {
+        InputStatus inputStatus = InputStatus::ConfigurationError;
+        bool boardVoltageValid = false, zeroClamped = false, gapInRange = false;
+        std::int32_t boardVoltageMv = 0, voltageMv = 0;
+    };
+    // Pure shared calibration path for the NC observer and RT raw ingress.
+    // PRECONDITION: Validate(profile) succeeded and the frozen profile has not
+    // changed. This bounds every signed product without repeating setup-time
+    // Monitor validation at each RT tick. Unconfirmed/out-of-range results must
+    // not be treated as live voltage.
+    inline ConversionResult ConvertRawValidated(const Profile& profile, std::int32_t rawCode) noexcept
+    {
+        ConversionResult result{};
+        if (rawCode < profile.rawMin || rawCode > profile.rawMax)
+        { result.inputStatus = InputStatus::RawOutOfRange; return result; }
+        if (profile.schemaVersion == 1U)
+        {
+            const std::int64_t numerator = (static_cast<std::int64_t>(rawCode) - profile.rawMin) *
+                (profile.boardMvAtMax - profile.boardMvAtMin);
+            const std::int64_t denominator = static_cast<std::int64_t>(profile.rawMax) - profile.rawMin;
+            result.boardVoltageMv = profile.boardMvAtMin + static_cast<std::int32_t>(numerator / denominator);
+            // Preserve schema 1 truncation exactly, including fractional gain.
+            const std::int64_t boardWhole = profile.boardMvAtMin + numerator / denominator;
+            const std::int64_t boardRemainder = numerator % denominator;
+            const std::int64_t scaled = boardWhole * profile.voltageGainMillionths +
+                boardRemainder * profile.voltageGainMillionths / denominator;
+            result.voltageMv = static_cast<std::int32_t>(scaled / GainScale + profile.voltageOffsetMv);
+            result.gapInRange = result.voltageMv >= profile.gap.minMv &&
+                result.voltageMv <= profile.gap.maxMv;
+        }
+        else
+        {
+            std::int64_t denominator = 0;
+            std::int64_t numerator = Detail::BoardNumerator(profile, rawCode, denominator);
+            // Compare the unrounded rational in microvolts. Only the
+            // configured narrow negative-zero window may be clamped.
+            if (numerator < 0 && profile.zeroClampBoardUv != 0U &&
+                -numerator * 1000LL <= static_cast<std::int64_t>(profile.zeroClampBoardUv) * denominator)
+            {
+                numerator = 0; result.zeroClamped = true;
+            }
+            result.boardVoltageMv = static_cast<std::int32_t>(Detail::RoundSigned(numerator, denominator));
+            result.voltageMv = static_cast<std::int32_t>(Detail::GapFromRational(profile, numerator, denominator));
+            // Rounding must not silently convert an out-of-range value
+            // (including an unclamped negative fraction) into valid zero.
+            result.gapInRange = Detail::GapInRange(profile, numerator, denominator,
+                profile.gap.minMv, profile.gap.maxMv);
+        }
+        result.boardVoltageValid = true;
+        result.inputStatus = profile.calibrationConfirmed ? InputStatus::Valid : InputStatus::CalibrationRequired;
+        return result;
+    }
+    inline ConversionResult ConvertRaw(const Profile& profile, std::int32_t rawCode) noexcept
+    {
+        return Validate(profile) ? ConvertRawValidated(profile, rawCode) : ConversionResult{};
+    }
     struct Snapshot
     {
         EDMGap::Source configuredSource = EDMGap::Source::NONE;
@@ -245,39 +302,15 @@ namespace EDMGapInput
                 result.inputStatus = InputStatus::RawOutOfRange;
             else
             {
-                if (m_profile.schemaVersion == 1U)
-                {
-                    const std::int64_t numerator = (static_cast<std::int64_t>(input.rawCode) - m_profile.rawMin) *
-                        (m_profile.boardMvAtMax - m_profile.boardMvAtMin);
-                    const std::int64_t denominator = static_cast<std::int64_t>(m_profile.rawMax) - m_profile.rawMin;
-                    result.boardVoltageMv = m_profile.boardMvAtMin + static_cast<std::int32_t>(numerator / denominator);
-                    // Preserve schema 1 truncation exactly, including fractional gain.
-                    const std::int64_t boardWhole = m_profile.boardMvAtMin + numerator / denominator;
-                    const std::int64_t boardRemainder = numerator % denominator;
-                    const std::int64_t scaled = boardWhole * m_profile.voltageGainMillionths +
-                        boardRemainder * m_profile.voltageGainMillionths / denominator;
-                    result.voltageMv = static_cast<std::int32_t>(scaled / GainScale + m_profile.voltageOffsetMv);
-                }
-                else
-                {
-                    std::int64_t denominator = 0;
-                    std::int64_t numerator = Detail::BoardNumerator(m_profile, input.rawCode, denominator);
-                    // Compare the unrounded rational in microvolts. Only the
-                    // configured narrow negative-zero window may be clamped.
-                    if (numerator < 0 && m_profile.zeroClampBoardUv != 0U &&
-                        -numerator * 1000LL <= static_cast<std::int64_t>(m_profile.zeroClampBoardUv) * denominator)
-                    {
-                        numerator = 0; result.zeroClamped = true;
-                    }
-                    result.boardVoltageMv = static_cast<std::int32_t>(Detail::RoundSigned(numerator, denominator));
-                    result.voltageMv = static_cast<std::int32_t>(Detail::GapFromRational(m_profile, numerator, denominator));
-                    // Rounding must not silently convert an out-of-range value
-                    // (including an unclamped negative fraction) into valid zero.
-                    convertedGapInRange = Detail::GapInRange(m_profile, numerator, denominator,
-                        m_profile.gap.minMv, m_profile.gap.maxMv);
-                }
-                result.boardVoltageValid = true;
-                result.inputStatus = m_profile.calibrationConfirmed ? InputStatus::Valid : InputStatus::CalibrationRequired;
+                const ConversionResult converted = ConvertRawValidated(m_profile, input.rawCode);
+                result.boardVoltageMv = converted.boardVoltageMv;
+                result.voltageMv = converted.voltageMv;
+                result.zeroClamped = converted.zeroClamped;
+                result.boardVoltageValid = converted.boardVoltageValid;
+                result.inputStatus = converted.inputStatus;
+                // Schema 1 still delegates its integer range decision to
+                // Monitor::Publish, retaining every legacy diagnostic field.
+                convertedGapInRange = m_profile.schemaVersion == 1U || converted.gapInRange;
             }
             if (m_clockFault) { result.inputStatus = InputStatus::ClockInvalid; return FinishInvalid(result, EDMGap::Quality::CLOCK_ERROR); }
             if (m_profile.source == EDMGap::Source::SIMULATED)

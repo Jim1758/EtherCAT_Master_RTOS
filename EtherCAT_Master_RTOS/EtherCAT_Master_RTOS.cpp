@@ -11,6 +11,8 @@
 #include "ConfigReader.h"
 #include "GlobalConfig.h"
 #include "SHMManager.h"
+#include <RtssApi.h>
+#include "NCMainThreadStackPolicy.h"
 
 // RTX64 Boilerplate (標準 RTX64 樣板)
 #ifndef NUM_REGISTERS
@@ -27,8 +29,34 @@ EtherCatMaster Master;
 bool InitEtherCATMaster();//初始化 EtherCAT 主站
 
 
+// EDM85 FIX1: validate the actual main-thread allocation before runtime
+// initialization can start the NIC, Motion/PDO or PLC timer threads.
+// This is an entry-time observation, not a whole-program stack high-water proof.
+static bool ValidateNCMainThreadStackBeforeInitialization() noexcept
+{
+    const DWORD incomingError = GetLastError();
+    DWORD bytes = 0U, available = 0U;
+    ULONG_PTR base = 0U, limit = 0U, top = 0U;
+    const bool queried = RtGetThreadStack(GetCurrentThread(), &bytes, &available,
+        &base, &limit, &top);
+    const DWORD error = queried ? 0U : GetLastError();
+    const auto result = NCMainStack::Evaluate(queried, bytes, available, base, limit, top);
+    RtPrintf("[EDM105] event=MAIN_STACK build=EDM105_20261014 result=%s reason=%s threadId=%lu requiredBytes=%llu requiredStartupFreeBytes=%llu stackBytes=%lu availableBytes=%lu base=%llu limit=%llu top=%llu topInRange=%u error=%lu phase=BEFORE_RUNTIME_INIT\n",
+        result == NCMainStack::Result::Ready ? "PASS" : "BLOCKED", NCMainStack::Name(result),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(NCMainStack::RequiredBytes),
+        static_cast<unsigned long long>(NCMainStack::RequiredStartupFreeBytes),
+        static_cast<unsigned long>(bytes), static_cast<unsigned long>(available),
+        static_cast<unsigned long long>(base), static_cast<unsigned long long>(limit),
+        static_cast<unsigned long long>(top), NCMainStack::ContainsTop(base, limit, top) ? 1U : 0U,
+        static_cast<unsigned long>(error));
+    SetLastError(incomingError);
+    return result == NCMainStack::Result::Ready;
+}
+
 int _tmain(int argc, _TCHAR* argv[])//
 {
+    if (!ValidateNCMainThreadStackBeforeInitialization()) return -1;
 
     // ==============================================================
     // 🌟 1. 設定 CPU 核心親和性 (自動偵測安全版)

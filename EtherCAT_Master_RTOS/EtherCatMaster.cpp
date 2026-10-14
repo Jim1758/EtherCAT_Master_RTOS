@@ -4043,9 +4043,53 @@ void EtherCatMaster::CaptureGapAnalogInputSnapshot(
         m_gapAnalogInputBinding.inputBitOffset, m_gapAnalogInputBinding.unsignedRaw, rawCode);
     m_gapAnalogInputPublisher.ObserveFromPdo(rawCode, readSucceeded,
         qpcTicks, qpcFrequency, processDataValid);
+    // EDM70-FIX1: startup PDO callbacks run before OP/Motion/SHM setup is
+    // complete and need not have the normal runtime cadence. Keep raw AD
+    // publication live, but establish the shadow's first baseline only after
+    // the master has reached Running/Pass. The cycle counter belongs to this
+    // PDO owner and never resets: once observed, every callback still reaches
+    // both shadows, including bad clocks/PDO and shutdown. No fault is rearmed
+    // and no source-age or tick-gap deadline is relaxed.
+    if (m_gapPhysicalRTShadow.SnapshotFromOwner().cycle == 0ULL)
+    {
+        const EtherCatRuntimeSnapshot runtime = GetRuntimeSnapshot();
+        if (runtime.stage != EtherCatRuntimeStage::Running ||
+            runtime.result != EtherCatRuntimeResult::Pass) return;
+    }
+    // Reuse this callback's exact snapshot and supplied host PDO receipt clock.
+    // The shadow has no Motion, safety-gate, planner or discharge authority.
+    std::uint64_t nowUs = 0ULL;
+    const bool shadowClockValid = EDMAnalogInput::Publisher::QpcMicroseconds(qpcTicks, qpcFrequency, nowUs);
+    m_gapPhysicalRTShadow.ObserveFromPdo(m_gapAnalogInputPublisher.SnapshotFromOwner(),
+        nowUs, shadowClockValid, qpcFrequency);
+    m_gapPhysicalRecipeRTShadow.ObserveFromPdo(m_gapPhysicalRTShadow.SnapshotFromOwner(),
+        nowUs, shadowClockValid, qpcFrequency);
 }
 
 bool EtherCatMaster::ReadGapAnalogInputSnapshot(EDMAnalogInput::Snapshot& snapshot) const noexcept
 {
     return m_gapAnalogInputPublisher.Read(snapshot);
+}
+
+// Boot thread only, before the PDO owner starts. Diagnostic initialization
+// failure does not change the existing SIM source or its admission result.
+bool EtherCatMaster::ConfigureGapPhysicalRTShadowBeforeStart(const EDMGapInput::Profile& profile) noexcept
+{
+    return m_gapPhysicalRTShadow.InitializeBeforeStart(profile);
+}
+
+EDM53::Stamp EtherCatMaster::ReadGapPhysicalRTShadow(EDM64::Snapshot& snapshot) const noexcept
+{
+    return m_gapPhysicalRTShadow.ReadRaw(snapshot);
+}
+
+// Single NC writer; failures are diagnostic only and never change admission.
+bool EtherCatMaster::PublishGapPhysicalRecipeRTShadow(const EDM65::Request& request) noexcept
+{
+    return m_gapPhysicalRecipeRTShadow.PublishFromNC(request);
+}
+
+EDM53::Stamp EtherCatMaster::ReadGapPhysicalRecipeRTShadow(EDM65::Snapshot& snapshot) const noexcept
+{
+    return m_gapPhysicalRecipeRTShadow.ReadRaw(snapshot);
 }

@@ -8,6 +8,12 @@
 #include "EDMZGapRapidFixture.h"
 #include "EDMZGapEnduranceFixture.h"
 #include "EDMExecutionCommand.h"
+#include "EDMPhysicalBidirectionalFlushContract.h"
+#include "EDMPhysicalServoMotion.h"
+#include "EDMGapServoPhysicalRuntime.h" // EDM56/57 RT tracking telemetry; no policy authority
+#include "EDMFlushPhysicalRuntime.h" // Frozen unloaded flush recipe; no I/O authority
+#include "EDMGapServoRecipeBinding.h" // Frozen SIM Servo recipe; no I/O authority
+#include "EDMGapServoFlushContract.h" // One combined admission snapshot
 
 // EDM28/EDM29/EDM30/EDM31/EDM32/EDM34/EDM35/EDM36 local, unloaded single-Z policy. This computes no trajectory and
 // performs no I/O. The RT adapter alone invokes the existing finite-position
@@ -19,7 +25,26 @@ namespace EDM28
     constexpr std::uint32_t SettleCycles=200U;
     // P14 is a separate, fixed opt-in speed step. It is never a promotion of
     // P13 by F, feed override, installed COND, PID or AD parameters.
-    enum class Profile:std::uint8_t { P13Unloaded=13U,P14UnloadedSpeed=14U,P15UnloadedRepeat=15U,P16UnloadedRetreat=16U,P17PersistentShort=17U,P18UnloadedSpeedRetreat=18U,P19UnloadedSpeedRetreat=19U,P20UnloadedSpeedRetreat=20U,P21GapShortRetreat=21U,P22GapPersistentShort=22U,P23GapCurveSegments=23U,P24GapCurveReplan=24U,P25GapShortReplan=25U,P26GapPersistentReplan=26U,P27GapFeedUpdate=27U,P28GapFeedPersistent=28U,P29GapRapid=29U,P30GapRapidPersistent=30U,P31GapEndurance=31U,P32GapEndurancePersistent=32U };
+    enum class Profile:std::uint8_t { P13Unloaded=13U,P14UnloadedSpeed=14U,P15UnloadedRepeat=15U,P16UnloadedRetreat=16U,P17PersistentShort=17U,P18UnloadedSpeedRetreat=18U,P19UnloadedSpeedRetreat=19U,P20UnloadedSpeedRetreat=20U,P21GapShortRetreat=21U,P22GapPersistentShort=22U,P23GapCurveSegments=23U,P24GapCurveReplan=24U,P25GapShortReplan=25U,P26GapPersistentReplan=26U,P27GapFeedUpdate=27U,P28GapFeedPersistent=28U,P29GapRapid=29U,P30GapRapidPersistent=30U,P31GapEndurance=31U,P32GapEndurancePersistent=32U,P35GapDynamic=35U,P36GapDynamicPersistent=36U,P37GapDynamicStale=37U,P38GapFlush=38U,P39GapFlushBlocked=39U,P40GapFlushPersistent=40U,P41GapFlushStale=41U,P42GapFlushRecipe=42U,P43GapFlushRecipeBlocked=43U,P44GapFlushRecipePersistent=44U,P45GapFlushRecipeStale=45U,P46GapServoRecipe=46U,P47GapServoRecipePersistent=47U,P48GapServoRecipeStale=48U,P49GapServoFlush=49U,P50GapServoFlushBlocked=50U,P51GapServoFlushPersistent=51U,P52GapServoFlushStale=52U,P56PhysicalServo=56U,P57PhysicalServoFlush=57U,P58PhysicalRetreat=58U,P59PhysicalRetreatCycle=59U,P60PhysicalBidirectional=60U,P61PhysicalBidirectionalFlush=61U,P62PhysicalBidirectionalFlushEndurance=62U };
+    constexpr bool IsPhysicalServoFlushProfile(Profile profile)noexcept {return profile==Profile::P57PhysicalServoFlush;}
+    constexpr bool IsPhysicalRetreatProfile(Profile profile)noexcept {return profile==Profile::P58PhysicalRetreat;}
+    constexpr bool IsPhysicalRetreatCycleProfile(Profile profile)noexcept {return profile==Profile::P59PhysicalRetreatCycle;}
+    constexpr bool IsPhysicalBidirectionalProfile(Profile profile)noexcept {return profile==Profile::P60PhysicalBidirectional;}
+    constexpr bool IsPhysicalBidirectionalFlushProfile(Profile profile)noexcept {return profile==Profile::P61PhysicalBidirectionalFlush;}
+    constexpr bool IsPhysicalBidirectionalFlushEnduranceProfile(Profile profile)noexcept {return profile==Profile::P62PhysicalBidirectionalFlushEndurance;}
+    constexpr bool IsPhysicalBidirectionalFlushFamilyProfile(Profile profile)noexcept {return IsPhysicalBidirectionalFlushProfile(profile)||IsPhysicalBidirectionalFlushEnduranceProfile(profile);}
+    constexpr bool IsPhysicalNegativeProfile(Profile profile)noexcept {return IsPhysicalRetreatProfile(profile)||IsPhysicalRetreatCycleProfile(profile);}
+    constexpr bool IsPhysicalServoProfile(Profile profile)noexcept {return profile==Profile::P56PhysicalServo||IsPhysicalServoFlushProfile(profile)||IsPhysicalNegativeProfile(profile)||IsPhysicalBidirectionalProfile(profile)||IsPhysicalBidirectionalFlushFamilyProfile(profile);}
+    constexpr bool IsGapServoFlushProfile(Profile profile)noexcept
+    {return profile==Profile::P49GapServoFlush||profile==Profile::P50GapServoFlushBlocked||profile==Profile::P51GapServoFlushPersistent||profile==Profile::P52GapServoFlushStale;}
+    constexpr bool IsGapConditionServoProfile(Profile profile)noexcept
+    {return profile==Profile::P46GapServoRecipe||profile==Profile::P47GapServoRecipePersistent||profile==Profile::P48GapServoRecipeStale||IsGapServoFlushProfile(profile)||IsPhysicalServoProfile(profile);}
+    constexpr bool IsGapConditionFlushProfile(Profile profile)noexcept
+    {return profile==Profile::P42GapFlushRecipe||profile==Profile::P43GapFlushRecipeBlocked||profile==Profile::P44GapFlushRecipePersistent||profile==Profile::P45GapFlushRecipeStale||IsGapServoFlushProfile(profile)||IsPhysicalBidirectionalFlushFamilyProfile(profile);}
+    constexpr bool IsGapFlushProfile(Profile profile)noexcept
+    {return profile==Profile::P38GapFlush||profile==Profile::P39GapFlushBlocked||profile==Profile::P40GapFlushPersistent||profile==Profile::P41GapFlushStale||IsGapConditionFlushProfile(profile);}
+    constexpr bool IsGapDynamicProfile(Profile profile)noexcept
+    {return profile==Profile::P35GapDynamic||profile==Profile::P36GapDynamicPersistent||profile==Profile::P37GapDynamicStale||IsGapFlushProfile(profile)||IsGapConditionServoProfile(profile);}
     constexpr bool IsGapEnduranceProfile(Profile profile)noexcept
     {return profile==Profile::P31GapEndurance||profile==Profile::P32GapEndurancePersistent;}
     constexpr bool IsGapRapidPersistentProfile(Profile profile)noexcept
@@ -53,7 +78,7 @@ namespace EDM28
     constexpr double ProfilePdoCapMmS(Profile profile)noexcept
     {return IsGapRapidProfile(profile)?EDM43::PdoCapMmS:(profile==Profile::P20UnloadedSpeedRetreat||profile==Profile::P21GapShortRetreat||IsGapCurveProfile(profile))?.35:profile==Profile::P19UnloadedSpeedRetreat?.3:profile==Profile::P18UnloadedSpeedRetreat?.2:
         (profile==Profile::P13Unloaded||profile==Profile::P14UnloadedSpeed||profile==Profile::P15UnloadedRepeat||profile==Profile::P16UnloadedRetreat||profile==Profile::P17PersistentShort||profile==Profile::P22GapPersistentShort)?.1:0.0;}
-    enum class RequestKind:std::uint8_t { Arm,Position,Heartbeat,Stop,Disarm,FeedUpdate=5U };
+    enum class RequestKind:std::uint8_t { Arm,Position,Heartbeat,Stop,Disarm,FeedUpdate=5U,ServoStart=6U };
     enum class State:std::uint8_t { Idle,Armed,Moving,AtTarget,Stopping,Held,Disarmed,Fault };
     enum class Reason:std::uint8_t
     { None,InvalidConfig,InvalidScope,InvalidRequest,Sequence,IssueClock,StaleRequest,
@@ -61,7 +86,7 @@ namespace EDM28
       Deadman,OuterBound,FollowingError,CompetingMotion,HardLimit,ApplyFailed,
       AwaitStop,StopTimeout,NativeRange,NativeSpeed,NotAtTarget,CancelledBeforeApply };
     enum class Ack:std::uint8_t { None,Accepted,Rejected,LocalRtApplied };
-    enum class Action:std::uint8_t { None,Move,Stop,Fault,FeedUpdate=4U };
+    enum class Action:std::uint8_t { None,Move,Stop,Fault,FeedUpdate=4U,ServoStart=5U };
     struct Scope
     {
         std::uint64_t session=0U,runGeneration=0U,cacheGeneration=0U,dispatchGeneration=0U;
@@ -88,7 +113,12 @@ namespace EDM28
         std::uint64_t heartbeatTicks=HeartbeatTicks,maximumIssueAgeTicks=80U,stopTimeoutTicks=4000U;
         std::uint32_t settleCycles=SettleCycles;
         Profile profile=Profile::P13Unloaded; // Frozen with the first Arm, including HOLD re-arm.
+        EDM57::Recipe flush{}; // P38..P45/P49..P52; frozen with FIRST_ARM identity.
+        EDM59::Recipe servoRecipe{}; // E8/E9 and process tuning freeze at admission.
+        EDM69::Request physicalInput{}; // P56..P62 only; immutable real AD identity and NC scope.
     };
+    inline bool ValidateGapServoFlushConfig(const Config& config) noexcept
+    {return EDM60::ValidateConfig(config);}
     struct Request
     {
         RequestKind kind=RequestKind::Heartbeat;
@@ -155,6 +185,10 @@ namespace EDM28
         // Its sequence identifies that exact application; a later Stop is not a curve ack.
         std::uint64_t lastCurveSequence=0U,lastCurveSampleTick=0U,lastCurveSampleUs=0U;
         double lastCurveVoltage=0.0,lastSignedCurveMmMin=0.0;
+        // Filled into the publication copy by the same RT owner. Controller
+        // telemetry cannot grant policy admission, physical stop or release.
+        EDM56::Feedback dynamic{};
+        EDM70::Proof physical{}; // P56..P62 source/window evidence, never a Stop receipt.
         constexpr bool GlobalEDMPhysicalPermit()const noexcept{return false;}
         constexpr bool PhysicalDischargeEnabled()const noexcept{return false;}
     };
@@ -196,8 +230,11 @@ namespace EDM28
             if(r.kind==RequestKind::Arm)return Arm(r,o);
             if(!Active()||!SameScope(r.scope,f_.scope))
             {if(!f_.latchedFault)f_.reason=Reason::InvalidScope;return Active()&&r.scope.session==f_.scope.session?Trip(Reason::InvalidScope,o):View();}
-            if(static_cast<unsigned>(r.kind)>static_cast<unsigned>(RequestKind::FeedUpdate)||
-                (r.kind==RequestKind::FeedUpdate&&!IsGapFeedUpdateProfile(f_.frozenConfig.profile)))return Trip(Reason::InvalidRequest,o);
+            if(static_cast<unsigned>(r.kind)>static_cast<unsigned>(RequestKind::ServoStart)||
+                (r.kind==RequestKind::FeedUpdate&&!IsGapFeedUpdateProfile(f_.frozenConfig.profile))||
+                (r.kind==RequestKind::ServoStart&&!IsGapDynamicProfile(f_.frozenConfig.profile))||
+                (IsGapDynamicProfile(f_.frozenConfig.profile)&&
+                    (r.kind==RequestKind::Position||r.kind==RequestKind::FeedUpdate)))return Trip(Reason::InvalidRequest,o);
             if(!RequestFresh(r,o))return Trip(f_.reason,o);
             if(r.kind==RequestKind::Stop)return LatchStop(r,o);
             if(r.kind==RequestKind::Disarm)
@@ -212,6 +249,30 @@ namespace EDM28
             if(r.kind==RequestKind::Heartbeat)
             {deadlineTick_=r.issueTick+f_.frozenConfig.heartbeatTicks;deadlineUs_=r.issueMonotonicUs+50000U;
              f_.ack=Ack::Accepted;Decision d=View();d.accepted=true;return d;}
+            if(r.kind==RequestKind::ServoStart)
+            {
+                // One NC request starts the RT-owned stream. Per-tick updates
+                // use their own controller identity, never this request ring.
+                // Raw differentiated velocity and PDO holding correction are
+                // advisory, exactly as for the existing Arm/stop proofs.
+                if(f_.state!=State::Armed)return Trip(Reason::Busy,o);
+                if(r.relativeTargetMm!=0.0||!EmptyCurve(r))return Trip(Reason::InvalidRequest,o);
+                const Config&c=f_.frozenConfig;
+                if(!o.axisIdle||!o.allOtherAxesIdle||!o.groupQuiet||!o.axisMailboxQuiet||
+                    o.hardPositive||o.hardNegative||o.feedrateOverride!=1.0||
+                    std::fabs(o.cmdVelocityPps)>1.0||std::fabs(o.logicalVelocityPps)>1.0||
+                    std::fabs(o.targetVelocityPps)>1.0||
+                    std::fabs(o.actualPulse-o.commandPulse)>c.positionToleranceMm*c.pulsePerMm||
+                    std::fabs(o.actualPulse-f_.outerOriginPulse)>c.outerHalfMm*c.pulsePerMm||
+                    std::fabs(o.commandPulse-f_.outerOriginPulse)>c.outerHalfMm*c.pulsePerMm||
+                    std::fabs(o.planningPulse-f_.outerOriginPulse)>c.outerHalfMm*c.pulsePerMm)
+                    return Trip(Reason::NotReady,o);
+                Seal(r,o);f_.stopProven=f_.targetProven=false;f_.stableCycles=0U;haveCandidate_=false;
+                Decision d=View();d.action=Action::ServoStart;d.accepted=d.requiresCommit=true;
+                d.nativeTargetPulse=o.commandPulse;d.nativeVelocityPps=0.0;
+                d.accelerationTimeSec=c.accelerationTimeSec;d.decelerationTimeSec=c.decelerationTimeSec;
+                return BindApplication(d);
+            }
             if(r.kind==RequestKind::FeedUpdate)
             {
                 double velocity=0.0;
@@ -291,6 +352,8 @@ namespace EDM28
             {f_.state=State::Moving; // The finite target and first origin remain bit-exact.
              f_.lastCurveSequence=r.sequence;f_.lastCurveSampleTick=r.curveSampleTick;f_.lastCurveSampleUs=r.curveSampleUs;
              f_.lastCurveVoltage=r.curveVoltage;f_.lastSignedCurveMmMin=r.signedCurveMmMin;}
+            else if(r.kind==RequestKind::ServoStart)
+            {f_.state=State::Moving;f_.targetPulse=f_.outerOriginPulse;}
             else if(r.kind==RequestKind::Stop){f_.state=State::Stopping;stopSinceTick_=o.tick;stopSinceUs_=o.monotonicUs;
               f_.stopAppliedSequence=r.sequence;f_.stopAppliedTick=o.tick;f_.stopAppliedMonotonicUs=o.monotonicUs;}
             else if(r.kind==RequestKind::Disarm)
@@ -445,7 +508,9 @@ namespace EDM28
             const bool shape=(pending_.kind==RequestKind::Arm&&d.action==Action::None)||
                 (pending_.kind==RequestKind::Disarm&&d.action==Action::None)||
                 (pending_.kind==RequestKind::Position&&d.action==Action::Move)||
-                (pending_.kind==RequestKind::FeedUpdate&&d.action==Action::FeedUpdate);
+                (pending_.kind==RequestKind::FeedUpdate&&d.action==Action::FeedUpdate)||
+                (pending_.kind==RequestKind::ServoStart&&d.action==Action::ServoStart&&
+                    IsGapDynamicProfile(f_.frozenConfig.profile));
             if(!shape)return Reason::InvalidRequest;
             if(!Frame(o)||frameLost_)return Reason::FrameChanged;
             if(!Source(o))return Reason::InvalidSource;
@@ -658,13 +723,38 @@ namespace EDM28
                 c.positionToleranceMm==.001&&c.excursionToleranceMm==.001&&
                 c.heartbeatTicks==HeartbeatTicks&&c.maximumIssueAgeTicks==80U&&c.stopTimeoutTicks==4000U&&c.settleCycles==SettleCycles&&
                 o.feedrateOverride==1.0&&Native(capPps)&&std::floor(capPps)>=1.0&&capPps<=o.maximumVelocityPps;
-            return (legacyP13||fixedLater||fixedP18||fixedP19||fixedP20||fixedP21||fixedP23||fixedP24||fixedShortReplan||fixedFeedUpdate||fixedRapid)&&
+            // EDM56 has the same proven unloaded envelope as P29, but a
+            // distinct opt-in command contract. No finite curve helper gains
+            // access to the continuous RT stream.
+            const bool fixedDynamic=IsGapDynamicProfile(c.profile)&&!IsPhysicalServoProfile(c.profile)&&c.feedMmMin==30.0&&
+                c.outerHalfMm==.4&&c.targetHalfMm==.25&&c.pdoCapMmS==.5&&
+                c.accelerationTimeSec==.3&&c.decelerationTimeSec==.3&&c.followingLimitMm==.02&&
+                c.positionToleranceMm==.001&&c.excursionToleranceMm==.001&&
+                c.heartbeatTicks==HeartbeatTicks&&c.maximumIssueAgeTicks==80U&&c.stopTimeoutTicks==4000U&&c.settleCycles==SettleCycles&&
+                o.feedrateOverride==1.0&&Native(capPps)&&std::floor(capPps)>=1.0&&capPps<=o.maximumVelocityPps;
+            // EDM57 remains its exact fixed fixture. EDM58 admits only a validated
+            // condition snapshot; all recipe values and identity stay frozen by
+            // SameConfig at pending application and same-origin HOLD re-arm.
+            // Other profiles retain the canonical inactive recipe.
+            const bool recipeValid=IsPhysicalBidirectionalFlushFamilyProfile(c.profile)?EDM75::ValidateRecipe(c.flush):
+                IsPhysicalServoFlushProfile(c.profile)?EDM71::ValidateRecipe(c.flush):
+                IsGapFlushProfile(c.profile)?EDM57::ValidateRecipeForProfile(c.flush,static_cast<unsigned>(c.profile)):
+                EDM57::SameRecipe(c.flush,EDM57::Recipe{});
+            const bool servoRecipeValid=(IsPhysicalBidirectionalProfile(c.profile)||IsPhysicalBidirectionalFlushFamilyProfile(c.profile))?EDM74::ValidateRecipe(c.servoRecipe):
+                IsPhysicalNegativeProfile(c.profile)?EDM72::ValidateRecipe(c.servoRecipe):
+                IsGapConditionServoProfile(c.profile)?EDM59::ValidateRecipe(c.servoRecipe):EDM59::SameRecipe(c.servoRecipe,EDM59::Recipe{});
+            const bool fixedPhysical=EDM70::ValidConfig(c)&&o.feedrateOverride==1.0&&
+                Native(capPps)&&std::floor(capPps)>=1.0&&capPps<=o.maximumVelocityPps;
+            const bool physicalValid=IsPhysicalServoProfile(c.profile)?fixedPhysical:
+                EDM69::SameRequest(c.physicalInput,EDM69::Request{});
+            return recipeValid&&servoRecipeValid&&physicalValid&&
+                (!IsGapServoFlushProfile(c.profile)||ValidateGapServoFlushConfig(c))&&(legacyP13||fixedLater||fixedP18||fixedP19||fixedP20||fixedP21||fixedP23||fixedP24||fixedShortReplan||fixedFeedUpdate||fixedRapid||fixedDynamic||fixedPhysical)&&
                 (c.profile!=Profile::P22GapPersistentShort||(Native(capPps)&&std::floor(capPps)>=1.0&&capPps<=o.maximumVelocityPps))&&c.axisIndex==2U&&c.pulsePerMm==o.pulsePerMm&&c.pulsePerMm>=1000.0&&c.pulsePerMm<=1000000000.0&&
                 c.referenceOffsetPulse==o.referenceOffsetPulse&&(c.hardwareSign==1||c.hardwareSign==-1)&&c.hardwareSign==o.hardwareSign&&
-                Finite(c.outerHalfMm)&&c.outerHalfMm>0.0&&(c.outerHalfMm<=.1||(fixedRapid&&c.outerHalfMm==EDM43::OuterHalfMm))&&
-                Finite(c.targetHalfMm)&&c.targetHalfMm>0.0&&(c.targetHalfMm<=.02||((fixedP24||fixedShortReplan||fixedFeedUpdate)&&c.targetHalfMm==EDM40::TargetHalfMm)||(fixedRapid&&c.targetHalfMm==EDM43::TargetHalfMm))&&c.targetHalfMm<c.outerHalfMm&&
+                Finite(c.outerHalfMm)&&c.outerHalfMm>0.0&&(c.outerHalfMm<=.1||(fixedRapid&&c.outerHalfMm==EDM43::OuterHalfMm)||(fixedDynamic&&c.outerHalfMm==.4))&&
+                Finite(c.targetHalfMm)&&c.targetHalfMm>0.0&&(c.targetHalfMm<=.02||((fixedP24||fixedShortReplan||fixedFeedUpdate)&&c.targetHalfMm==EDM40::TargetHalfMm)||(fixedRapid&&c.targetHalfMm==EDM43::TargetHalfMm)||(fixedDynamic&&c.targetHalfMm==.25)||(fixedPhysical&&c.targetHalfMm==EDM70::DepthMm))&&c.targetHalfMm<c.outerHalfMm&&
                 Finite(c.feedMmMin)&&c.feedMmMin>0.0&&Finite(c.pdoCapMmS)&&
-                c.pdoCapMmS>=c.feedMmMin/60.0&&(c.pdoCapMmS<=.1||(fixedP18&&c.pdoCapMmS==.2)||(fixedP19&&c.pdoCapMmS==.3)||((fixedP20||fixedP21||fixedP23||fixedP24||fixedShortReplan||fixedFeedUpdate)&&c.pdoCapMmS==.35)||(fixedRapid&&c.pdoCapMmS==EDM43::PdoCapMmS))&&
+                c.pdoCapMmS>=c.feedMmMin/60.0&&(c.pdoCapMmS<=.1||(fixedP18&&c.pdoCapMmS==.2)||(fixedP19&&c.pdoCapMmS==.3)||((fixedP20||fixedP21||fixedP23||fixedP24||fixedShortReplan||fixedFeedUpdate)&&c.pdoCapMmS==.35)||(fixedRapid&&c.pdoCapMmS==EDM43::PdoCapMmS)||(fixedDynamic&&c.pdoCapMmS==.5))&&
                 Finite(c.accelerationTimeSec)&&c.accelerationTimeSec>=.001&&c.accelerationTimeSec<=1.0&&
                 Finite(c.decelerationTimeSec)&&c.decelerationTimeSec>=.001&&c.decelerationTimeSec<=1.0&&
                 Native(v)&&v>1.0&&Finite(o.maximumVelocityPps)&&v<=o.maximumVelocityPps&&
@@ -682,7 +772,9 @@ namespace EDM28
           a.decelerationTimeSec==b.decelerationTimeSec&&a.followingLimitMm==b.followingLimitMm&&
           a.positionToleranceMm==b.positionToleranceMm&&a.excursionToleranceMm==b.excursionToleranceMm&&
           a.heartbeatTicks==b.heartbeatTicks&&a.maximumIssueAgeTicks==b.maximumIssueAgeTicks&&
-          a.stopTimeoutTicks==b.stopTimeoutTicks&&a.settleCycles==b.settleCycles&&a.profile==b.profile;}
+          a.stopTimeoutTicks==b.stopTimeoutTicks&&a.settleCycles==b.settleCycles&&a.profile==b.profile&&
+          EDM57::SameRecipe(a.flush,b.flush)&&EDM59::SameRecipe(a.servoRecipe,b.servoRecipe)&&
+          EDM69::SameRequest(a.physicalInput,b.physicalInput);}
         bool RequestFresh(const Request&r,const Observation&o)noexcept
         {
             if(!r.sequence||r.sequence==UINT64_MAX||r.sequence<=f_.lastRequestSequence){if(!f_.latchedFault)f_.reason=Reason::Sequence;return false;}
@@ -697,6 +789,8 @@ namespace EDM28
         }
         Decision Arm(const Request&r,const Observation&o)noexcept
         {
+            if(IsPhysicalServoProfile(r.config.profile)&&!EDM70::MatchesScope(r.config.physicalInput,r.scope))
+            {if(!f_.latchedFault)f_.reason=Reason::InvalidScope;return View();}
             if(!ValidScope(r.scope)||r.scope.owner!=o.currentOwner||r.scope.ownerGeneration!=o.currentOwnerGeneration||
                 r.scope.executionEpoch!=o.currentEpoch||r.scope.axisMapGeneration!=o.axisMapGeneration||r.scope.configGeneration!=o.configGeneration)
             {if(!f_.latchedFault)f_.reason=Reason::InvalidScope;return View();}
@@ -796,7 +890,7 @@ namespace EDM28
         // cannot extend it: stopProven is cleared immediately by the caller.
         void BeginRapidStopProofRenewal(const Observation&o)noexcept
         {
-            if(IsGapRapidProfile(f_.frozenConfig.profile)&&f_.state==State::Held&&
+            if((IsGapRapidProfile(f_.frozenConfig.profile)||IsGapDynamicProfile(f_.frozenConfig.profile))&&f_.state==State::Held&&
                 f_.capHeld&&f_.originValid&&f_.stopLatched&&f_.stopProven&&
                 !f_.latchedFault&&!f_.forceZeroOutput&&!frameLost_&&!pendingValid_&&
                 f_.sourceFresh&&Source(o)&&Frame(o)&&Authority(o)&&o.axisIdle&&

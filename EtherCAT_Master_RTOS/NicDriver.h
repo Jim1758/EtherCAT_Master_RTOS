@@ -7,7 +7,7 @@
  * 功能：
  * 1. 封裝 RTX64 NAL 的 TX/RX Queue。
  * 2. 提供 EtherCAT Master 使用的 SendPacket()/ReceivePacket()。
- * 3. 管理固定四個由 RtNalAllocateFrame() 建立的 zero-copy TX Frame。
+ * 3. 管理固定十六個由 RtNalAllocateFrame() 建立的 zero-copy TX Frame。
  * 4. 對外提供 TX ownership 與送出失敗的累積診斷計數。
  *
  * 執行緒規則：
@@ -18,8 +18,8 @@
  * 重要限制：
  * - NAL 擁有 TX Frame 時，不可修改 Frame 結構或資料緩衝區。
  * - SendPacket() 必須先經過 RtNalIsApplicationFrame() 確認 ownership。
- * - 本類別目前使用單一 TX Frame；TxFrameBusy 可用來判斷 Frame 是否
- *   尚未由 TX complete thread 歸還。
+ * - 本類別使用固定 TX Frame pool；所有 Frame 尚未歸還時，
+ *   SendPacket() 拒絕送出，等待 NAL 歸還 ownership。
  */
 
 #include <windows.h>

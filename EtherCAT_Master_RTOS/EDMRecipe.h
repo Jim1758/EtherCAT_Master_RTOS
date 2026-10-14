@@ -390,6 +390,42 @@ namespace EDMRecipe
         Controller(Controller&&) = delete;
         Controller& operator=(Controller&&) = delete;
 
+        // EDM78 owner-thread semantic preview. A preview borrows the immutable
+        // catalog; its fixed active RAM and generation are independent. Only a
+        // fresh, never-bound destination or a previous preview may be imported.
+        // A normal bound controller can never be overwritten through this API.
+        // The source and its stable store must outlive the synchronous preview;
+        // catalog exchange and concurrent owner-thread changes are prohibited.
+        bool ForkPreviewFrom(const Controller& source) noexcept
+        {
+            if (this == &source || (m_boundAttempted && !m_isPreview)) return false;
+            if (source.m_isPreview || !source.Ready())
+            {
+                m_isPreview = true;
+                m_boundAttempted = true;
+                DiscardPreview();
+                return false;
+            }
+            m_active = source.m_active;
+            m_store = source.m_store;
+            m_tableIndex = source.m_tableIndex;
+            m_boundAttempted = source.m_boundAttempted;
+            m_boundGood = source.m_boundGood;
+            m_exhausted = source.m_exhausted;
+            m_isPreview = true;
+            return true;
+        }
+        // Never clears a live controller, consumes a live generation, or owns
+        // the catalog. Clearing also prevents stale preview use after failure.
+        void DiscardPreview() noexcept
+        {
+            if (!m_isPreview) return;
+            m_boundGood = false;
+            m_store = nullptr;
+            m_exhausted = false;
+            ClearActive(Error::NotReady);
+        }
+
         // BOOT ONLY; the stable store must outlive this controller.
         bool Bind(const CatalogStore& store) noexcept
         {
@@ -699,6 +735,7 @@ namespace EDMRecipe
         const CatalogStore* m_store = nullptr;
         std::size_t m_tableIndex = MaximumTables;
         bool m_boundAttempted = false, m_boundGood = false, m_exhausted = false;
+        bool m_isPreview = false;
     };
 
     static_assert(sizeof(Cell) <= 16U, "EDM16 catalog cell budget");

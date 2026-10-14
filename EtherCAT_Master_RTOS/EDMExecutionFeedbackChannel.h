@@ -20,10 +20,10 @@ namespace EDM53
         bool Ready()const noexcept{return status==Status::Ready&&publication!=0U;}
     };
 
-    template<class Value>
+    template<class Value, std::size_t MaximumBytes = 2048U>
     class Channel
     {
-        static_assert(std::is_trivially_copyable<Value>::value&&sizeof(Value)<=2048U,
+        static_assert(std::is_trivially_copyable<Value>::value&&sizeof(Value)<=MaximumBytes && MaximumBytes<=4096U,
             "EDM feedback must remain a bounded, trivially copyable value.");
         static_assert(ATOMIC_LLONG_LOCK_FREE==2,
             "EDM feedback requires always lock-free 64-bit atomic words.");

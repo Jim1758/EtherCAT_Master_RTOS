@@ -52,11 +52,24 @@ struct MotionEccentricCProducerWorkspace;
 #include "MotionPbcHomeCaptureProof.h"
 #include "MotionAxisCommandMailbox.h"
 #include "EDMZFixtureSession.h" // EDM28 isolated, finite single-Z diagnostic
+#include "EDMGapRTRawSource.h" // EDM62 bounded raw capture and calibrated source
 #include "EDMExecutionCancelFence.h"
 #include "EDMExecutionFeedbackChannel.h"
 #include "EDMExecutionFrameIdentity.h"
 #include "EDMRTShadowChannel.h" // EDM48 bounded NC -> RT shadow transport
 #include "EDMGapServoRTSession.h" // EDM55 continuous RT SIM servo, advisory values only
+#include "EDMPhysicalServoRTSession.h" // EDM69 active PHYSICAL input, advisory values only
+#include "EDMCNCRetainedRTSession.h" // EDM83 retained-path calculation; never an axis command
+#include "EDMCoordinatedRTSession.h" // EDM84 six-axis composition; diagnostic values only
+#include "EDMSixAxisPhysicalGuard.h"
+#include "EDMSixAxisGapBoundary.h"
+#include "EDMSixAxisGapSegment.h"
+#include "EDMSixAxisGapTuning.h"
+#include "EDMSixAxisGapContinuous.h"
+#include "EDMSixAxisGapEndurance.h"
+#include "EDMSixAxisGapPairedPath.h"
+#include "EDMSixAxisGapFlushPath.h"
+#include "EDMSixAxisSerializedGuard.h"
 #include "AlarmManager.h"
 
 class EtherCatMaster;
@@ -2155,6 +2168,9 @@ enum class MotionNCTranslationTransitionResult : std::uint8_t
     UNSUPPORTED_PREDECESSOR
 };
 
+// FIX15: transient lifecycle sampling never substitutes for mapping validity.
+enum class MotionQueueTailSyncResult { Ready, Retry, InvalidMapping };
+
 class MotionCore
 {
 public:
@@ -2230,6 +2246,7 @@ public:
         std::uint64_t edmZFeedbackPublication = 0ULL;
         bool edmZGuardHeld = false;
         bool edmZSerializedExact = false;
+        EDM94Serialized::Receipt edm94{};
     };
 
     bool BeginServoOutputFrameAtSendPoint(
@@ -2278,6 +2295,102 @@ public:
     void RetireEDMGapServoRT(std::uint64_t session) noexcept;
     bool TouchEDMGapServoRT(std::uint64_t session, std::uint64_t nowUs) noexcept;
     bool ReadEDMGapServoRT(EDM55RT::Feedback& feedback) const noexcept;
+    // EDM83 executes private retained geometry once per observed RT callback.
+    // These wrappers never acquire an axis/output permit or publish a setpoint.
+    bool StartEDMCNCRetainedRT(const EDM83RT::Request& request) noexcept;
+    bool TouchEDMCNCRetainedRT(std::uint64_t session, std::uint64_t nowUs) noexcept;
+    void CancelEDMCNCRetainedRT(std::uint64_t session) noexcept;
+    bool ReadEDMCNCRetainedRT(EDM83RT::Feedback& feedback) const noexcept;
+    std::uint64_t ReadEDMCNCRetainedRTLatestSession() const noexcept;
+    // EDM84 owns a private coordinated calculator, never physical axes.
+    bool StartEDMCoordinatedRT(const EDM84RT::Request& request) noexcept;
+    bool TouchEDMCoordinatedRT(std::uint64_t session, std::uint64_t nowUs) noexcept;
+    void CancelEDMCoordinatedRT(std::uint64_t session) noexcept;
+    bool ReadEDMCoordinatedRT(EDM84RT::Feedback& feedback) const noexcept;
+    std::uint64_t ReadEDMCoordinatedRTLatestSession() const noexcept;
+    // EDM94 brackets ordinary NC six-axis moves with a physical CSV guard.
+    bool SubmitEDM94Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease) noexcept;
+    bool SubmitEDM95Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease) noexcept;
+    bool ReadEDM95Feedback(EDM95::Feedback& feedback) const noexcept;
+    bool SubmitEDM96Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease) noexcept;
+    bool SubmitEDM97Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool SubmitEDM98Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool SubmitEDM99Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool SubmitEDM100Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool SubmitEDM102Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool SubmitEDM104Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool SubmitEDM105Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool ReadEDM96Feedback(EDM96::Feedback& feedback) const noexcept;
+    void RequestEDM94Finish(std::uint64_t session) noexcept;
+    void RequestEDM94Cancel(std::uint64_t session, bool externalStop = false) noexcept;
+    void RequestEDM94Release(std::uint64_t session) noexcept;
+    bool RequestEDM94CompletionRelease(std::uint64_t session,
+        MotionExecutionEpoch armEpoch, const MotionOwnerLease& armLease,
+        MotionExecutionEpoch completionEpoch, const MotionOwnerLease& idleLease,
+        MotionOwnerGeneration& expectedNoneGeneration) noexcept;
+    bool ReadEDM94Feedback(EDM94::Feedback& feedback) const noexcept;
+    bool AuthorizeEDM94Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease) noexcept;
+    bool AuthorizeEDM95Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM95::Permit& permit) noexcept;
+    bool AuthorizeEDM96Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease) noexcept;
+    bool AuthorizeEDM97Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool AuthorizeEDM98Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool AuthorizeEDM99Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool AuthorizeEDM100Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool AuthorizeEDM102Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool AuthorizeEDM104Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool AuthorizeEDM105Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+    bool CheckEDM94Endpoint(const std::array<double, 6U>& nativePulse,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease) const noexcept;
+    // EDM69 routes real A/D into a scoped RT calculation only. It owns no
+    // axis/planner/output permit; zero feedback is not physical stop proof.
+    // Boot thread only, once before the PDO callback starts. This binding
+    // is independent of structured servo input/output qualification.
+    bool BindEDMPhysicalSourceBeforeStart(EtherCatMaster* master) noexcept;
+    bool StartEDMPhysicalServoRT(const EDM69::Request& request) noexcept;
+    bool TouchEDMPhysicalServoRT(std::uint64_t session, std::uint64_t nowUs) noexcept;
+    void CancelEDMPhysicalServoRT(std::uint64_t session) noexcept;
+    bool ReadEDMPhysicalServoRT(EDM69::Feedback& feedback) const noexcept;
+    std::uint64_t ReadEDMPhysicalServoRTLatestSession() const noexcept;
     //單軸運動 API--------------------------------------------------------------------
 
 
@@ -3257,6 +3370,10 @@ public:
     void SyncVirtualEndPosition();
     bool TryGetSynchronizedG00QueueTailMCS(
         double(&outputMCS)[MAX_AXES]) const noexcept;
+    MotionQueueTailSyncResult TrySynchronizeProgramStartQueueTailMCS(
+        MotionExecutionEpoch expectedEpoch,
+        const MotionOwnerLease& expectedLease,
+        double(&outputMCS)[MAX_AXES]) noexcept;
 
     //G碼參數專區------------------------------------------------------------
     double G00_overrideRatio = 1;//G00 專屬速度比例
@@ -3265,13 +3382,174 @@ public:
 
 
 private:
+    MotionQueueTailSyncResult SyncVirtualEndPositionResult() noexcept;
+    MotionQueueTailSyncResult GetSynchronizedG00QueueTailMCSResult(
+        double(&outputMCS)[MAX_AXES]) const noexcept;
     // EDM48 has its own NC producer / RT consumer channel. Its applied values
     // are shadow observations, never axis, planner or PDO output storage.
     EDM48::Channel m_edmRTShadow{};
     EDM55RT::Session m_edmGapServoRT{};
+    EDM83RT::Session m_edmCNCRetainedRT{};
+    EDM84RT::Session m_edmCoordinatedRT{};
+    struct EDM94ArmRequest
+    {
+        std::uint64_t session = 0ULL;
+        MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
+        MotionOwnerLease lease{};
+        bool gapBoundary = false;
+        bool gapSegment = false;
+        bool proportional = false;
+        bool noise = false;
+        bool burst = false;
+        bool continuous = false;
+        bool endurance = false;
+        bool paired = false;
+        bool flush = false;
+        EDM97::Tuning tuning{0.0, 0.0, 0.0};
+    };
+    // FIX4: NC is the sole authorization/message producer; the serialized
+    // Motion/send owner alone consumes and mutates the transient zero bridge.
+    struct EDM94FeedAuthorization
+    {
+        std::uint64_t session = 0ULL, run = 0ULL, cache = 0ULL, dispatch = 0ULL;
+        int sourcePC = -1;
+        unsigned step = 0U;
+        std::array<double, 6U> increment{};
+        double feedMMMin = 0.0;
+        MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
+        MotionOwnerLease lease{};
+        EDM95::Permit gapPermit{};
+        bool gapSegment = false;
+        bool proportional = false;
+        bool noise = false;
+        bool burst = false;
+        bool continuous = false;
+        bool endurance = false;
+        bool paired = false;
+        bool flush = false;
+        EDM97::Tuning tuning{0.0, 0.0, 0.0};
+    };
+    struct EDM94HandoffMessage
+    {
+        EDM94FeedAuthorization authorization{};
+        MotionExecutionEpoch nextEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+        MotionExecutionIdentity command{};
+        std::array<double, 6U> targetPulse{};
+        std::array<double, 6U> gapSegmentStartPulse{};
+        double targetVelocity = 0.0, acceleration = 0.0, deceleration = 0.0;
+        std::uint64_t ownerWord = 0ULL, executionWord = 0ULL;
+        std::uint64_t safetyWord = 0ULL, alarmSafetyWord = 0ULL;
+        std::uint32_t alarmRevision = 0U;
+        bool committed = false;
+    };
+    EDM94FeedAuthorization m_edm94FeedAuthorization{}; // NC-thread only
+    FixedCapacitySpscRing<EDM94HandoffMessage, 4U> m_edm94HandoffMessages{};
+    EDM94HandoffMessage m_edm94Handoff{}; // RT owner only
+    bool m_edm94HandoffPending = false;
+    bool m_edm94HandoffCommitted = false;
+    std::uint64_t m_edm94HandoffStartedUs = 0ULL;
+    std::uint64_t m_edm94LastHandoffDispatch = 0ULL;
+    unsigned m_edm94NextHandoffStep = 0U;
+    MotionExecutionEpoch m_edm94ExpectedEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    EDM95::Boundary m_edm95{}; // RT owner only; does not create references.
+    EDM53::Channel<EDM95::Feedback, 512U> m_edm95Feedback{};
+    bool m_edm95Profile = false;
+    void ServiceEDM95Boundary(bool complete) noexcept;
+    void PublishEDM95Feedback() noexcept;
+    EDM96::Segment m_edm96{}; // RT scalar only; ordinary mapping and CSV writer remain authoritative.
+    EDM53::Channel<EDM96::Feedback, 512U> m_edm96Feedback{};
+    bool m_edm96Profile = false;
+    bool m_edm97Profile = false;
+    bool m_edm98Profile = false;
+    bool m_edm99Profile = false;
+    bool m_edm100Profile = false;
+    bool m_edm102Profile = false;
+    bool m_edm104Profile = false;
+    bool m_edm105Profile = false;
+    void ServiceEDM96Source() noexcept;
+    void PublishEDM96Feedback() noexcept;
+    bool BeginEDM96Segment() noexcept;
+    bool StepEDM96Segment(AxisCommand& command) noexcept;
+    bool AuthorizeEDM94FeedScoped(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step,
+        const std::array<double, 6U>& increment, double feedMMMin,
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, bool endurance, bool paired = false, bool flush = false) noexcept;
+    bool IsEDM102FeedProfileCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
+    bool TakeEDM94FeedAuthorization(const std::array<double, 6U>& increment,
+        double feedMMMin, EDM94FeedAuthorization& result) noexcept;
+    bool PublishEDM94Handoff(const EDM94FeedAuthorization& authorization,
+        const MotionCommand& command, EDM94HandoffMessage& message) noexcept;
+    void ObserveEDM94Handoff(bool freshMotionFrame) noexcept;
+    bool IsEDM94HandoffAuthorityCurrent() const noexcept;
+    bool IsEDM94HandoffCommandCurrent() const noexcept;
+    EDM94::Engine m_edm94{};
+    EDM94::Frame m_edm94Frame{};
+    EDM94::Config m_edm94ObservedConfig{};
+    EDM53::Channel<EDM94::Feedback, 4096U> m_edm94Feedback{};
+    FixedCapacitySpscRing<EDM94ArmRequest, 2U> m_edm94ArmRequests{};
+    std::atomic<std::uint64_t> m_edm94Claim{0ULL};
+    std::atomic<std::uint64_t> m_edm94CancelSession{0ULL};
+    std::atomic<std::uint64_t> m_edm94ExternalStopSession{0ULL};
+    std::atomic<std::uint64_t> m_edm94FinishSession{0ULL};
+    std::atomic<std::uint64_t> m_edm94ReleaseSession{0ULL};
+    struct EDM94CompletionReleaseRequest
+    {
+        EDM94::Identity armIdentity{};
+        MotionOwnerLease idleLease{};
+        MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
+        std::uint64_t idleGrant = 0ULL;
+        std::uint64_t safetyIntent = 0ULL, alarmIntent = 0ULL;
+        std::uint32_t alarmRevision = 0U;
+    };
+    FixedCapacitySpscRing<EDM94CompletionReleaseRequest, 2U> m_edm94CompletionRequests{};
+    EDM94CompletionReleaseRequest m_edm94CompletionRequest{}; // RT owner only
+    bool m_edm94CompletionPending = false;
+    bool m_edm94CompletionRevoked = false;
+    bool m_edm94CompletionOwnerReleased = false;
+    // Claim pins the session; this CAS orders NC cancel against normal release.
+    // 0=open, 1=cancel won, 2=normal release committed.
+    std::atomic<unsigned> m_edm94CompletionDecision{0U};
+    std::uint64_t m_edm94CompletionOwnerReleaseTick = 0ULL;
+    void FinishEDM94CompletionRelease(ServoOutputFrameReservation& reservation,
+        bool exactSent, bool handedOff) noexcept;
+    std::uint64_t m_edm94LastSession = 0ULL;
+    std::uint64_t m_edm94ArmUs = 0ULL;
+    std::uint64_t m_edm94ClockCounter = 0ULL;
+    MotionNCSettleRequestSequence m_edm94ResetFloor = 0ULL;
+    bool m_edm94FormalStopRequested = false;
+    std::array<EDM54::FrameIdentity<64U>, 6U> m_edm94ConfigIdentity{};
+    EDM54::FrameIdentity<64U> m_edm94MapIdentity{};
+    std::array<ServoOutput*, 6U> m_edm94FrozenOutput{};
+    std::array<const ServoInput*, 6U> m_edm94FrozenInput{};
+    EDM94Serialized::Mapping m_edm94FrozenSerializedMapping{};
+    EDM94::Frame CaptureEDM94Frame(bool complete) noexcept;
+    void ServiceEDM94MotionPass(bool complete) noexcept;
+    void ObserveEDM94Cancellation() noexcept;
+    void EnsureEDM94FormalStop() noexcept;
+    double GuardEDM94Velocity(int axisIndex, double value) noexcept;
+    bool GuardEDM94OutputImage() noexcept;
+    bool EDM94ConfigurationCurrent() noexcept;
+    bool ValidateEDM94SendClock() noexcept;
+    void TripEDM94(EDM94::Reason reason, EDM94::FaultSite site = EDM94::FaultSite::EngineFault) noexcept;
+    void PublishEDM94Feedback() noexcept;
+    bool BeginEDM94Send(ServoOutputFrameReservation& reservation) noexcept;
+    bool FinalizeEDM94Send(ServoOutputFrameReservation& reservation) noexcept;
+    bool SealEDM94SerializedImage(ServoOutputFrameReservation& reservation,
+        const std::uint8_t* base, std::size_t size,
+        const std::uint8_t* payload, std::size_t payloadSize) noexcept;
+    void FinishEDM94Send(ServoOutputFrameReservation& reservation,
+        bool attempted, bool succeeded) noexcept;
+    // EDM90: exact identities for a read-only six-axis native preview. These
+    // RT-owned observers never write AxisContext, planner or PDO state.
+    std::array<EDM54::FrameIdentity<64U>, 6U> m_edmMultiAxisConfigIdentity{};
+    EDM54::FrameIdentity<64U> m_edmMultiAxisMapIdentity{};
+    void ObserveEDMMultiAxisMachineRuntime(bool complete) noexcept;
+    EDM69::Session m_edmPhysicalServoRT{};
+    EtherCatMaster* m_pEDMPhysicalSourceMaster = nullptr; // Immutable after boot binding.
     void ObserveEDMGapServoRTRuntimeCycle(const EDM48::Facts& facts) noexcept;
     void ObserveEDMRTShadowRuntimeCycle(std::uint64_t tick,
-        bool pdoCycleValid, bool contiguous) noexcept;
+        bool pdoCycleValid, bool contiguous, bool servicePhysical,
+        const EDM64::Snapshot& physical, const EDM53::Stamp& physicalStamp) noexcept;
 
     // EDM28 owns a separate bounded channel; the generic axis mailbox and all
     // installed axis/PID/COND parameters remain untouched.
@@ -3282,6 +3560,9 @@ private:
     };
     FixedCapacitySpscRing<EDMZQueuedRequest, 8U> m_edmZRequests{};
     EDM28::RTPolicy m_edmZPolicy{};
+    EDM56::Controller m_edmGapPhysical{};
+    EDM70::Controller m_edmPhysicalMotion{};
+    EDM62::SimRawSource m_edmGapRTSource{};
     EDM28::Observation m_edmZObservation{};
     EDM52::CancelFence m_edmZCancelFence{};
     std::uint64_t m_edmZObservedStopTicket = 0ULL;
@@ -3305,6 +3586,7 @@ private:
     EDM28::Observation BuildEDMZFixtureObservation(const AxisContext& axis,
         const MotionServoInputSnapshot* input, bool sourceFresh) noexcept;
     void ProcessEDMZFixtureAxis(AxisContext& axis, const MotionServoInputSnapshot& input) noexcept;
+    bool GenerateEDMGapPhysicalCommand(AxisContext& axis, AxisCommand& command) noexcept;
     void FinishEDMZFixtureMotionPass() noexcept;
     void ApplyEDMZFixtureDecision(const EDM28::Decision& decision) noexcept;
     void PublishEDMZFixtureFeedback() noexcept;
@@ -3990,7 +4272,8 @@ private:
         bool pathCoreXYZCFeedExactStop = false,
         const NCXYZCFeedLineValue* xyzcGeometry = nullptr,
         bool pathCoreXYZCUVFeedExactStop = false,
-        const NCXYZCUVFeedLineValue* xyzcuvGeometry = nullptr) noexcept;
+        const NCXYZCUVFeedLineValue* xyzcuvGeometry = nullptr,
+        const EDM94FeedAuthorization* edm94Authorization = nullptr) noexcept;
     bool TryG00MoveInternal(
         const std::vector<int>& axes,
         const std::vector<double>& targetPos,
@@ -4351,7 +4634,7 @@ private:
 
     void Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd,
         const MotionServoInputSnapshot& input);
-    void DetermineActiveGainSet(AxisContext& axis); // 👈 必須要有這行宣告
+    void DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold = nullptr);
 
     double PlanTrapezoidal(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
     double PlanTrapezoidal_B2(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);

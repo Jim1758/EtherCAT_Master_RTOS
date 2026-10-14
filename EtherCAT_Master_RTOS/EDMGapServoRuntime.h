@@ -207,7 +207,8 @@ namespace EDM55
         // Call once per real RT tick with the retained source sample. Duplicate
         // source samples may drive the continuous ramp, but cannot refresh age,
         // filter state or short-circuit source-time dwell.
-        Output Step(const Sample& sample, std::uint64_t nowUs, std::uint64_t tick) noexcept
+        Output Step(const Sample& sample, std::uint64_t nowUs, std::uint64_t tick,
+            bool motionEnabled = true) noexcept
         {
             if (!m_running) return m_output;
             m_output.fresh = false;
@@ -275,6 +276,11 @@ namespace EDM55
                 target = -m_config.curve.shortRetreatMmPerMin * (m_config.overridePercent / 100.0);
             else if (m_output.feedInhibited && target > 0.0) target = 0.0;
             if (!std::isfinite(target)) return Fail(Fault::Arithmetic);
+            // EDM60: jump/settle phases retain continuous source validation,
+            // filtering and short detection without accumulating a hidden
+            // machining speed. The existing ramp brakes its advisory state
+            // to zero; the physical owner independently proves its stop.
+            if (!motionEnabled) target = 0.0;
             m_output.targetMmPerMin = target;
             m_output.valid = true;
             m_output.running = true;

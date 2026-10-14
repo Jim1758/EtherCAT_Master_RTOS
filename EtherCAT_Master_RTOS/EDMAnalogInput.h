@@ -135,8 +135,21 @@ namespace EDMAnalogInput
         std::uint32_t adIndex = 0U, deviceId = 0U, channelId = 0U, channelCount = 0U;
         std::int32_t slaveIndex = -1, inputBitOffset = -1, rawCode = 0;
         std::uint64_t sequence = 0ULL, capturedAtMs = 0ULL, observedAtMs = 0ULL;
+        // Native QPC PDO receipt times for the RT ingress, not proof of the
+        // device's ADC conversion time/counter. They are not derived from the
+        // rounded legacy milliseconds. Sequence counts accepted PDO reads.
+        // This is an internal payload, not a shared-memory/API layout.
+        std::uint64_t capturedAtUs = 0ULL, observedAtUs = 0ULL;
         bool configured = false, hasSample = false, transportValid = false, clockValid = false, unsignedRaw = false;
+        bool rtClockValid = false, rtSampleValid = false;
         Reason reason = Reason::NotConfigured;
+        // ConfigureBeforeStart attempt identity for this Publisher object's
+        // lifetime, including rejected bindings. It is not an ADC boot ID or
+        // persistent process identity. Zero is unconfigured or exhausted.
+        std::uint64_t producerGeneration = 0ULL;
+        // The fixed host QPC frequency established by the RT clock check.
+        // Retained on a bad observation; consumers must also check RT flags.
+        std::uint64_t qpcFrequency = 0ULL;
     };
     static_assert(std::is_trivially_copyable<Snapshot>::value, "A/D snapshot must be a plain atomic-copy payload.");
     static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "The x64 PDO snapshot must use lock-free atomics.");
@@ -156,6 +169,19 @@ namespace EDMAnalogInput
             m_writer.configured = binding.configured;
             m_writer.unsignedRaw = binding.unsignedRaw;
             m_writer.reason = binding.reason;
+            m_rtFrequency = 0ULL;
+            m_rtLastTicks = 0ULL;
+            // Boot-only serialized configuration consumes a fresh identity on
+            // every attempt. Snapshot resets must never reset this highwater.
+            if (m_producerGeneration == (std::numeric_limits<std::uint64_t>::max)())
+            {
+                m_writer.configured = false;
+                m_writer.reason = Reason::ContractInvalid;
+            }
+            else
+            {
+                m_writer.producerGeneration = ++m_producerGeneration;
+            }
             Publish();
         }
 
@@ -170,11 +196,34 @@ namespace EDMAnalogInput
             std::uint64_t nowMs = 0ULL;
             m_writer.clockValid = QpcMilliseconds(qpcTicks, frequency, nowMs) && nowMs >= m_writer.observedAtMs;
             if (m_writer.clockValid) m_writer.observedAtMs = nowMs;
+            std::uint64_t nowUs = 0ULL;
+            m_writer.rtClockValid = QpcMicroseconds(qpcTicks, frequency, nowUs) &&
+                (m_rtFrequency == 0ULL || (frequency == m_rtFrequency &&
+                    static_cast<std::uint64_t>(qpcTicks) >= m_rtLastTicks)) &&
+                nowUs >= m_writer.observedAtUs;
+            if (m_writer.rtClockValid)
+            {
+                m_rtFrequency = frequency;
+                m_writer.qpcFrequency = m_rtFrequency;
+                m_rtLastTicks = static_cast<std::uint64_t>(qpcTicks);
+                m_writer.observedAtUs = nowUs;
+            }
+            // Legacy sequence saturation remains diagnostic-compatible. The
+            // RT contract rejects exhaustion instead of accepting changed raw
+            // data under an old sequence number. A fresh RT sample also needs
+            // a positive, strictly advancing PDO receipt timestamp.
+            m_writer.rtSampleValid = false;
             if (!transportValid) m_writer.reason = Reason::TransportInvalid;
             else if (!m_writer.clockValid) m_writer.reason = Reason::ClockInvalid;
             else if (!readSucceeded) m_writer.reason = Reason::ReadError;
             else
             {
+                if (m_writer.rtClockValid && nowUs > m_writer.capturedAtUs &&
+                    m_writer.sequence != (std::numeric_limits<std::uint64_t>::max)())
+                {
+                    m_writer.capturedAtUs = nowUs;
+                    m_writer.rtSampleValid = true;
+                }
                 m_writer.rawCode = rawCode;
                 m_writer.capturedAtMs = nowMs;
                 if (m_writer.sequence != (std::numeric_limits<std::uint64_t>::max)()) ++m_writer.sequence;
@@ -183,6 +232,11 @@ namespace EDMAnalogInput
             }
             Publish();
         }
+
+        // Same serialized PDO owner only, immediately after ObserveFromPdo.
+        // Cross-thread consumers must use Read(); this is never a second PDO
+        // read, clock acquisition, or atomic-bank round trip.
+        const Snapshot& SnapshotFromOwner() const noexcept { return m_writer; }
 
         bool Read(Snapshot& result) const noexcept
         {
@@ -218,6 +272,19 @@ namespace EDMAnalogInput
             return true;
         }
 
+        static bool QpcMicroseconds(std::int64_t ticks, std::uint64_t frequency, std::uint64_t& nowUs) noexcept
+        {
+            nowUs = 0ULL;
+            const std::uint64_t maximum = (std::numeric_limits<std::uint64_t>::max)();
+            if (ticks < 0 || frequency == 0ULL || frequency > maximum / 1000000ULL) return false;
+            const std::uint64_t value = static_cast<std::uint64_t>(ticks);
+            const std::uint64_t seconds = value / frequency;
+            const std::uint64_t fraction = (value % frequency) * 1000000ULL / frequency;
+            if (seconds > (maximum - fraction) / 1000000ULL) return false;
+            nowUs = seconds * 1000000ULL + fraction;
+            return true;
+        }
+
     private:
         static constexpr std::size_t WordCount = (sizeof(Snapshot) + sizeof(std::uint64_t) - 1U) / sizeof(std::uint64_t);
         void Publish() noexcept
@@ -229,6 +296,8 @@ namespace EDMAnalogInput
             m_sequence.store(odd + 1ULL, std::memory_order_release);
         }
         Snapshot m_writer{};
+        std::uint64_t m_producerGeneration = 0ULL;
+        std::uint64_t m_rtFrequency = 0ULL, m_rtLastTicks = 0ULL;
         alignas(8) std::atomic<std::uint64_t> m_sequence{0ULL};
         alignas(8) std::atomic<std::uint64_t> m_words[WordCount]{};
     };

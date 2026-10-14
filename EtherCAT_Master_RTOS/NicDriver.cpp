@@ -54,6 +54,10 @@ static volatile LONGLONG g_nicTxOwnershipOther = 0;
 // resets or overwrites diagnostics still owned by the low-priority consumer.
 static volatile LONGLONG g_nicTxOpenGeneration = 0;
 static NicTxFailureTrace g_nicTxFailureTrace{};
+// EDM103: one coherent allocation-at-Open observation, replayed by the
+// supervisory consumer. Zero means unavailable (not a successful empty pool).
+// No frame/queue pointers or live ownership are published or read here.
+static volatile LONG g_nicTxAllocatedPoolSlots = 0;
 
 // Diagnostic reads preserve the exact caller thread error. Never inspect a
 // NAL-owned frame: packet identity always comes from this caller-owned image.
@@ -259,13 +263,26 @@ static void PrintNicTxFailureTrace() noexcept
 
 void PrintNicTransmitFailureDiagnostic() noexcept
 {
+    const DWORD diagnosticSavedError = GetLastError();
+    const LONG allocatedSlots =
+        InterlockedCompareExchange(&g_nicTxAllocatedPoolSlots, 0, 0);
+    // Replay even when no TX failure exists, so rolling logs retain capacity
+    // evidence. This is one atomic snapshot, not current free/owned-slot proof.
+    RtPrintf("[NIC-TX-POOL] build=EDM103_20261014 event=CAPACITY_SNAPSHOT allocationValid=%lu slots=%lu frameBytes=%lu observedAt=OPEN publication=ATOMIC currentOwnership=UNOBSERVED consumer=SUPERVISORY noMotionAuthority=1\n",
+        allocatedSlots > 0 ? 1UL : 0UL,
+        static_cast<unsigned long>(allocatedSlots),
+        static_cast<unsigned long>(MAX_ETHER_FRAME_SIZE));
     PrintNicTxFailureTrace();
     // Called by the existing low-priority diagnostic consumer. No queue/NAL
     // operations, retries or producer-side formatting are introduced.
     static LONGLONG lastPrintedPublications = 0;
     const LONGLONG publications =
         InterlockedCompareExchange64(&g_nicTxFailurePublications, 0, 0);
-    if (publications == 0 || publications == lastPrintedPublications) return;
+    if (publications == 0 || publications == lastPrintedPublications)
+    {
+        SetLastError(diagnosticSavedError);
+        return;
+    }
     lastPrintedPublications = publications;
     const auto read64 = [](volatile LONGLONG* value) noexcept -> LONGLONG
     { return InterlockedCompareExchange64(value, 0, 0); };
@@ -300,6 +317,7 @@ void PrintNicTransmitFailureDiagnostic() noexcept
             static_cast<unsigned long>(InterlockedCompareExchange(&slot.errorValid, 0, 0)),
             static_cast<unsigned long>(InterlockedCompareExchange(&slot.submitted, 0, 0)));
     }
+    SetLastError(diagnosticSavedError);
 }
 
 CNicDriver::CNicDriver()
@@ -377,6 +395,7 @@ VOID CNicDriver::StubDecodePacket(
 
 bool CNicDriver::Open()
 {
+    InterlockedExchange(&g_nicTxAllocatedPoolSlots, 0);
     // RtNalInit 必須在任何 Queue/Frame API 之前成功。
     if (!RtNalInit(RTNAL_API_VERSION))
     {
@@ -490,7 +509,7 @@ bool CNicDriver::Open()
             static_cast<std::uint64_t>(txQpcFrequency.QuadPart) : 0ULL, txQpcFrequencyValid);
     m_TxInterfaceObservation = ObserveNicTxInterface(m_MacAddress);
     const NicTxInterfaceObservation& config = m_TxInterfaceObservation;
-    DEBUG_PRINT("[NIC-TX-CONFIG] build=EDM45 open=%llu valid=%lu status=%lu matches=%lu enumerationComplete=%lu enumerationError=0x%08lX enumerated=%lu cap=64 version=%lu intPriority=%lu intProcessor=%lu txPriority=%lu txProcessor=%lu txBuffers=%lu observedOnly=1 poolSlots=4 protocolFence=1 responseIsNotOwnership=1\n",
+    DEBUG_PRINT("[NIC-TX-CONFIG] build=EDM45 open=%llu valid=%lu status=%lu matches=%lu enumerationComplete=%lu enumerationError=0x%08lX enumerated=%lu cap=64 version=%lu intPriority=%lu intProcessor=%lu txPriority=%lu txProcessor=%lu txBuffers=%lu observedOnly=1 poolSlots=%lu protocolFence=1 responseIsNotOwnership=1\n",
         static_cast<unsigned long long>(m_TxOpenGeneration),
         static_cast<unsigned long>(config.valid), static_cast<unsigned long>(config.status),
         static_cast<unsigned long>(config.matches),
@@ -498,8 +517,15 @@ bool CNicDriver::Open()
         static_cast<unsigned long>(config.enumerationError), static_cast<unsigned long>(config.enumerated),
         static_cast<unsigned long>(config.version), static_cast<unsigned long>(config.intPriority),
         static_cast<unsigned long>(config.intIdealProcessor), static_cast<unsigned long>(config.txCompletePriority),
-        static_cast<unsigned long>(config.txCompleteIdealProcessor), static_cast<unsigned long>(config.numTxBuffers));
+        static_cast<unsigned long>(config.txCompleteIdealProcessor), static_cast<unsigned long>(config.numTxBuffers),
+        static_cast<unsigned long>(NicTxFrameLifecycle::SlotCount));
+    RtPrintf("[NIC-TX-POOL] build=EDM101_FIX1 slots=%lu frameBytes=%lu allocation=OPEN_ONLY scan=BOUNDED ownership=NAL_ONLY exhaustion=REJECT\n",
+        static_cast<unsigned long>(NicTxFrameLifecycle::SlotCount),
+        static_cast<unsigned long>(MAX_ETHER_FRAME_SIZE));
 
+    // Publish only after all slot allocations and Open initialization succeed.
+    InterlockedExchange(&g_nicTxAllocatedPoolSlots,
+        static_cast<LONG>(NicTxFrameLifecycle::SlotCount));
     SetLastError(txDiagnosticSavedError);
     DEBUG_PRINT("--- Network Interface Ready ---\n");
     return true;
@@ -507,6 +533,8 @@ bool CNicDriver::Open()
 
 void CNicDriver::Close()
 {
+    // Invalidate before freeing any frame; consumers never dereference frames.
+    InterlockedExchange(&g_nicTxAllocatedPoolSlots, 0);
     // Quiescent teardown only: NAL defers reclamation of its owned frames.
     // FreeFrame is not a documented synchronous completion barrier. Partial
     // Open failure follows the same cleanup; no callback lifetime is added.
@@ -565,6 +593,7 @@ bool CNicDriver::SendPacket(unsigned char* pData, unsigned int length,
         if (context != nullptr) event.context = *context;
         event.openGeneration = call.openGeneration;
         event.interfaceObservation = m_TxInterfaceObservation;
+        event.poolSlotCount = static_cast<std::uint32_t>(NicTxFrameLifecycle::SlotCount);
         event.poolOwnedCount = ownedCount;
         event.protocolFence = protocolFence ? 1U : 0U;
         event.producerOverlap = producerScope.Held() ? 0U : 1U;

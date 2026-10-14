@@ -320,6 +320,7 @@ void NCManager::PrintProgramStartDiagnostic() const noexcept
 {
     // PBC-3J FIX3: failure-only cumulative NIC observations; never on PDO.
     PrintNicTransmitFailureDiagnostic();
+    LogEDM103AcceptanceSameThread();
     const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
     AlarmManager& alarms = AlarmManager::GetInstance();
     RtPrintf("[NC-START-DIAG] build=BASE65_START_FIX1 rx=%llu event=%s finish=%s "
@@ -363,12 +364,41 @@ bool NCManager::RejectProgramLoad(
 
 bool NCManager::LoadProgram(const std::string& filepath)
 {
+    // Selecting another image cancels a waiting explicit START, including a
+    // failed selection. It must never start the old image after this intent.
+    if (m_programRunStartPending && m_pendingProgramRunPhase == ProgramRunStartPhase::EDM94_RELEASE)
+    {
+        m_startDiagnosticEvent = "EDM94_RETIRE_LOAD_CANCEL";
+        ClearPendingProgramRunStart(true);
+    }
     PrintCNCStartupStackCheckpoint("NC_LOAD_ENTER");
     m_programLoadContextDiagnostic = "ENTRY";
     const NCState originState = m_state.load(std::memory_order_acquire);
     if (originState != NCState::IDLE && originState != NCState::READY &&
         originState != NCState::P_END)
         return RejectProgramLoad("STATE_NOT_IDLE", filepath);
+
+    // FIX16_LOAD_BEGIN
+    // Completed M30 retirement belongs to the old physical session, not to
+    // the selected image. Repeated inert selections preserve that transaction.
+    ServiceEDM94SameThread();
+    const bool preserveCompletedEDM94 =
+        (originState == NCState::P_END || originState == NCState::READY) &&
+        m_edm94.latched && IsEDM94CompletionSelectionCurrentSameThread();
+    const std::uint64_t completionSession = preserveCompletedEDM94 ? m_edm94.session : 0ULL;
+    const auto completedGuardCurrent = [&]() noexcept -> bool
+    {
+        if (!preserveCompletedEDM94) return !m_edm94.latched;
+        return m_edm94.session == completionSession && IsEDM94CompletionSelectionCurrentSameThread();
+    };
+    if (!completedGuardCurrent())
+    {
+        const bool resetPending = m_edm94.resetSeen || m_edm94.resetCommitted || m_edm94.releaseRequested;
+        m_programLoadContextDiagnostic = "EDM94_SESSION_LATCHED";
+        LogEDM94SameThread("LOAD_BLOCKED", resetPending ? "RESET_RELEASE_PENDING" : "RESET_REQUIRED");
+        return RejectProgramLoad(resetPending ? "EDM94_RESET_RELEASE_PENDING" : "EDM94_RESET_REQUIRED", filepath);
+    }
+    // FIX16_LOAD_END
 
     const NCOperationMode originMode = m_mode;
     const NCProgramCacheGeneration originCache = m_programCache.GetGeneration();
@@ -378,6 +408,14 @@ bool NCManager::LoadProgram(const std::string& filepath)
     const MotionExecutionEpoch originEpoch = m_motion.GetCurrentExecutionEpoch();
     AlarmManager& alarms = AlarmManager::GetInstance();
     const std::uint32_t alarmRevision = alarms.GetUpdateCount();
+    const auto ownerCurrent = [&](const MotionOwnerLease& owner) noexcept -> bool
+    {
+        // Only this announced completed-session transition may change owner
+        // during inert LOAD. This grants no release proof or START authority.
+        return preserveCompletedEDM94
+            ? m_edm94.session == completionSession && IsEDM94CompletionOwnerSameThread(owner)
+            : owner.Matches(originOwner);
+    };
 
     const auto contextCurrent = [&]() noexcept -> bool
     {
@@ -385,9 +423,9 @@ bool NCManager::LoadProgram(const std::string& filepath)
         const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
         if (m_state != originState || m_mode != originMode ||
             m_programCache.GetGeneration() != originCache ||
-            owner.owner != originOwner.owner || owner.generation != originOwner.generation ||
+            !ownerCurrent(owner) ||
             m_motion.GetCurrentExecutionEpoch() != originEpoch ||
-            m_programRunStartPending || Homing.IsActive()) return false;
+            m_programRunStartPending || Homing.IsActive() || !completedGuardCurrent()) return false;
         // The retained boot SAFETY owner still belongs to startup, not a LOAD.
         if (bootstrapProgramLoad) return true;
         m_programLoadContextDiagnostic = "ALARM_SAFETY_LIFECYCLE_OWNER";
@@ -405,11 +443,12 @@ bool NCManager::LoadProgram(const std::string& filepath)
             sample.lastPublishedFeedbackSequence != sample.lastConsumedFeedbackSequence ||
             sample.waitCallbackActive || sample.completionBindingActive ||
             sample.safetyOrRecoveryPending || !m_motion.IsGroupNCDrained()) return false;
-        if (owner.owner == MotionOwner::IDLE_HOLD)
+        if (owner.owner == MotionOwner::IDLE_HOLD || preserveCompletedEDM94)
         {
             // BASE65 START_FIX1: replacing an inert NC image is not another
-            // Program End handoff. IDLE_HOLD retains the same owner/epoch and
-            // holding output throughout LOAD. Its rolling physical dwell can
+            // Program End handoff. Ordinary IDLE_HOLD keeps its identity;
+            // completed EDM94 alone may retire to its announced NONE identity
+            // with zero output. Its rolling physical dwell can
             // restart after M30 has already completed; requiring settled here
             // rejects a valid file selection and latches START on the old image.
             // Require an exact RT drain with stopped commands instead. A fresh
@@ -422,8 +461,10 @@ bool NCManager::LoadProgram(const std::string& filepath)
                 proof, counters) ||
                 proof.profile != MotionNCSettleProfile::GROUP_COMPLETION ||
                 proof.publicationGeneration == 0ULL ||
-                proof.executionEpoch != originEpoch || proof.owner != owner.owner ||
-                proof.ownerGeneration != owner.generation || proof.scopeMask == 0U ||
+                proof.executionEpoch != originEpoch ||
+                (preserveCompletedEDM94
+                    ? !ownerCurrent(MotionOwnerLease{ proof.owner, proof.ownerGeneration })
+                    : proof.owner != owner.owner || proof.ownerGeneration != owner.generation) || proof.scopeMask == 0U ||
                 !proof.runtimeObserved || !proof.runtimeCycleValid ||
                 !proof.runtimeCycleContiguous || !proof.groupDrained || proof.groupActive ||
                 proof.safetyOrRecoveryPending || proof.anyAxisFaultOrEstop ||
@@ -434,8 +475,7 @@ bool NCManager::LoadProgram(const std::string& filepath)
         }
         m_programLoadContextDiagnostic = "FINAL_IDENTITY";
         const MotionOwnerLease checkedOwner = m_motion.GetMotionOwnerLease();
-        return checkedOwner.owner == originOwner.owner &&
-            checkedOwner.generation == originOwner.generation &&
+        return ownerCurrent(checkedOwner) &&
             m_motion.GetCurrentExecutionEpoch() == originEpoch &&
             m_state == originState && !m_motion.HasPendingSafetyOrRecoveryRequests();
     };
@@ -565,8 +605,7 @@ bool NCManager::LoadProgram(const std::string& filepath)
     const auto committedContextCurrent = [&]() noexcept -> bool
     {
         const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
-        return m_mode == originMode && owner.owner == originOwner.owner &&
-            owner.generation == originOwner.generation &&
+        return completedGuardCurrent() && m_mode == originMode && ownerCurrent(owner) &&
             m_motion.GetCurrentExecutionEpoch() == originEpoch &&
             (bootstrapProgramLoad || (!alarms.HasAlarm() &&
                 alarms.GetUpdateCount() == alarmRevision &&
@@ -598,7 +637,7 @@ bool NCManager::LoadProgram(const std::string& filepath)
     if (!bootstrapProgramLoad)
     {
         BeginLifecycleInterruptionShadow(
-            NCLifecycleInterruptionCause::PROGRAM_REPLACED, false);
+            NCLifecycleInterruptionCause::PROGRAM_REPLACED, false, preserveCompletedEDM94);
         CancelProgramEndBoundary();
         ClearCompletionWaitBoundary(true);
         CancelGMBlockTransaction(true);
@@ -684,7 +723,10 @@ bool NCManager::LoadProgram(const std::string& filepath)
         m_mainProgramName.c_str(), static_cast<unsigned long long>(m_programCache.GetGeneration()),
         static_cast<unsigned>(originOwner.owner), originOwner.generation, originEpoch,
         originOwner.owner == MotionOwner::IDLE_HOLD ? 1U : 0U);
+    ObserveEDM103RunSameThread(true, static_cast<unsigned>(originState));
     PrintCNCStartupStackCheckpoint("NC_LOAD_ACCEPT");
+    if (preserveCompletedEDM94)
+        LogEDM94SameThread("IMAGE_SELECTED", "OLD_SESSION_NORMAL_RETIREMENT_PRESERVED");
     return true;
 }
 
@@ -796,6 +838,28 @@ void NCManager::TryRollbackHomingResume() noexcept
 // ==========================================
 void NCManager::CycleStart()
 {
+    // FIX13: record every explicit START, including a consumed EDM94 rejection.
+    ++m_startDiagnosticRequests;
+    m_startDiagnosticEvent = "RECEIVED";
+    PrintProgramStartDiagnostic();
+    ServiceEDM94SameThread();
+    const bool waitForEDM94Completion = m_edm94.latched &&
+        m_edm94.normalEndCommitted && m_edm94.completionReleaseRequested &&
+        m_edm94.complete && !m_edm94.cancelled && !m_edm94.rtFaultReported &&
+        !m_edm94.resetSeen && !m_edm94.resetCommitted && !m_edm94.releaseRequested &&
+        m_mode == NCOperationMode::MEMORY &&
+        (m_state == NCState::READY || m_state == NCState::P_END);
+    if (m_edm94.latched && !waitForEDM94Completion)
+    {
+        const bool resetPending = m_edm94.resetSeen || m_edm94.resetCommitted || m_edm94.releaseRequested;
+        m_startDiagnosticEvent = resetPending ? "EDM94_RESET_RELEASE_PENDING" : "EDM94_RESET_REQUIRED";
+        m_startDiagnosticFinish = "BLOCKED";
+        LogEDM94SameThread("START_BLOCKED", resetPending ? "RESET_RELEASE_PENDING" : "RESET_REQUIRED");
+        PrintProgramStartDiagnostic();
+        // Consumed, never queued: release completion requires a new START edge.
+        return;
+    }
+    (void)InspectEDM94ProgramSameThread();
     // EDM34 FIX1: cancelled fixture requires RESET before START.
     if (m_gapDryRun.physicalZFixtureTest && m_gapDryRun.active && m_gapDryRun.paused &&
         (m_state == NCState::HOLD || m_state == NCState::RUN) &&
@@ -806,6 +870,14 @@ void NCManager::CycleStart()
         LogEDMZFixtureSameThread("RT_STOP", "FAULT", "HOLD_RT_LATCHED_FAULT");
         EndEDMZFixtureSameThread("FAIL", "RT_LATCHED_FAULT");
     }
+    // EDM77: single-block completion can enter HOLD without the normal pause
+    // callback. Revoke a released sequence boundary before a queued START can
+    // resume it, even if periodic validation has not observed HOLD yet.
+    if (m_edmGapDynamic.sequenceMode && m_gapDryRun.physicalZFixtureTest &&
+        !m_gapDryRun.active && m_edmZFixture.phase == EDMZFixturePhase::Finished &&
+        m_gapDryRun.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        m_gapDryRun.cache == GetBaseProgramCache().GetGeneration() && m_state == NCState::HOLD)
+        EndEDMZFixtureSameThread("CANCELLED", "EDM77_BOUNDARY_HOLD_RESET_REQUIRED");
     // A retired fixture must not block HOLD/START in a later program run.
     // Detached cleanup and RESET remain guarded independently below.
     if (m_gapDryRun.physicalZFixtureTest && !m_gapDryRun.active &&
@@ -827,9 +899,6 @@ void NCManager::CycleStart()
     if (m_edmZFixture.cleanupPending || m_edmZFixture.resetPending) return;
     if (m_gapDryRun.physicalZFixtureTest && m_gapDryRun.active && m_gapDryRun.paused &&
         (!ReadEDMZFixtureFeedbackSameThread(false) || !IsEDMZFixtureStoppedSameThread())) return;
-    ++m_startDiagnosticRequests;
-    m_startDiagnosticEvent = "RECEIVED";
-    PrintProgramStartDiagnostic();
     if (m_programLoadStartBlocked && m_mode == NCOperationMode::MEMORY &&
         (m_state == NCState::READY || m_state == NCState::P_END || m_state == NCState::IDLE))
     {
@@ -987,7 +1056,16 @@ void NCManager::CycleStart()
             return;
         }
 
+        if (waitForEDM94Completion &&
+            (Close_System_Com_flag || !m_externalReadyInterlock || m_edmState == EDMState::NOT_READY))
+        {
+            m_startDiagnosticEvent = "EDM94_RETIRE_INTERLOCK_REJECTED";
+            return;
+        }
+
         AlarmManager& startAlarms = AlarmManager::GetInstance();
+        const std::uint64_t safetyProvenanceBefore =
+            m_motion.GetSafetyProvenanceGeneration();
         const std::uint32_t alarmUpdateBefore =
             startAlarms.GetUpdateCount();
         const std::uint64_t alarmIntentBefore =
@@ -999,7 +1077,8 @@ void NCManager::CycleStart()
         const std::uint64_t alarmIntentAfter =
             AlarmManager::MotionAdmissionBaseState(
                 startAlarms.GetMotionSafetyIntentState());
-        if (alarmPresent ||
+        if (alarmPresent || m_motion.HasPendingSafetyIntent() ||
+            safetyProvenanceBefore != m_motion.GetSafetyProvenanceGeneration() ||
             alarmUpdateBefore != alarmUpdateAfter ||
             alarmIntentBefore != alarmIntentAfter)
         {
@@ -1011,7 +1090,12 @@ void NCManager::CycleStart()
         // A benign PDO Alarm reservation is retried by ProcessTask against
         // this immutable revision; a later Alarm can only cancel it.
         m_pendingProgramRunPhase =
-            ProgramRunStartPhase::ALARM_ADMISSION;
+            waitForEDM94Completion ? ProgramRunStartPhase::EDM94_RELEASE :
+                ProgramRunStartPhase::ALARM_ADMISSION;
+        m_pendingProgramRunEDM94Session = waitForEDM94Completion ? m_edm94.session : 0ULL;
+        m_pendingProgramRunEDM94Epoch = waitForEDM94Completion ? m_edm94.completionEpoch : MOTION_EXECUTION_EPOCH_INVALID;
+        m_pendingProgramRunEDM94IdleLease = waitForEDM94Completion ? m_edm94.completionIdleLease : MotionOwnerLease{};
+        m_pendingProgramRunEDM94NoneGeneration = waitForEDM94Completion ? m_edm94.completionNoneGeneration : MOTION_OWNER_GENERATION_INVALID;
         m_pendingProgramRunExecutionEpoch =
             MOTION_EXECUTION_EPOCH_INVALID;
         m_pendingProgramRunOwnerLease = MotionOwnerLease{};
@@ -1022,6 +1106,7 @@ void NCManager::CycleStart()
             GetBaseProgramCache().GetGeneration();
         m_pendingProgramRunAlarmUpdateCount = alarmUpdateBefore;
         m_pendingProgramRunAlarmSafetyIntentState = alarmIntentBefore;
+        m_pendingProgramRunSafetyProvenanceGeneration = safetyProvenanceBefore;
         m_startDiagnosticWaitScans = 0ULL;
         m_startDiagnosticFinish = "NONE";
         m_startDiagnosticEvent = "LATCHED";
@@ -1036,6 +1121,12 @@ void NCManager::CycleStart()
 
 void NCManager::FeedHold()
 {
+    // P_END HOLD need not change state. It still consumes a waiting button.
+    if (m_programRunStartPending && m_pendingProgramRunPhase == ProgramRunStartPhase::EDM94_RELEASE)
+    {
+        m_startDiagnosticEvent = "EDM94_RETIRE_HOLD_CANCEL";
+        ClearPendingProgramRunStart(true);
+    }
     PauseGapDryRunSameThread("MANUAL_HOLD");
     // Operator Hold revokes an automatic resume even when already in HOLD.
     CancelPathCoreHoldAutomaticSameThread("MANUAL_HOLD");
@@ -1119,6 +1210,7 @@ void NCManager::FeedHoldInternal()
 
 void NCManager::Reset()
 {
+    ResetEDM94SameThread();
     // EDM28 only: retain AUTO authority for bounded physical stop/Disarm
     // before entering the existing Reset safety batch. Never wait here.
     if (!AdmitEDMZFixtureResetSameThread()) return;
@@ -1274,6 +1366,7 @@ void NCManager::Reset()
         const MotionStopSettleSnapshot resetStopSnapshot =
             m_motion.GetStopSettleSnapshot();
         const bool cleanProgramRunReset =
+            !m_edm94.latched && // EDM94 cancellation owns zero containment; use the existing Reset hold/batch.
             (m_state == NCState::RUN || heldEccentricFeed) &&
             resetStopSnapshot.publicationGeneration != 0ULL &&
             resetStopSnapshot.groupActive &&
@@ -2526,7 +2619,8 @@ NCManager::BuildLifecycleInterruptionSample() const noexcept
 
 void NCManager::BeginLifecycleInterruptionShadow(
     NCLifecycleInterruptionCause cause,
-    bool expectsEpochChange) noexcept
+    bool expectsEpochChange,
+    bool preserveCompletedEDM94) noexcept
 {
     // BASE79H: AL2014 may reach NC before or after the RT emergency action.
     // Capture the exact NC-owned execution identity before invalidating its
@@ -2564,7 +2658,10 @@ void NCManager::BeginLifecycleInterruptionShadow(
         }
     }
 
-    CancelGapDryRunSameThread("LIFECYCLE");
+    // Only the admitted inert completed-session replacement preserves EDM94.
+    // All other GAP/lifecycle cleanup remains active, including RESET/ALARM.
+    CancelGapDryRunSameThread("LIFECYCLE", preserveCompletedEDM94 &&
+        cause == NCLifecycleInterruptionCause::PROGRAM_REPLACED && !expectsEpochChange);
     // Retained recipe data is a display state, never a motion admission.
     // Keep it through ALARM/fault so the operator can inspect the exact values.
     RetainEDMRecipeSelectionSameThread();
@@ -3496,6 +3593,7 @@ void NCManager::ObserveBootstrapSafetyHandoff() noexcept
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
+    ServiceEDM94SameThread(); // Independent physical bracket service before early returns.
     // EDM28 priority stop continues in RT while this nonblocking poll owns
     // RESET_STATE. A 1 s / 100 poll limit falls through to legacy safety.
     if (m_edmZFixture.resetPending)
@@ -4092,6 +4190,7 @@ void NCManager::ProcessTask()
                 m_resetContinuationExecutionState =
                     MotionNCResetExecutionState{};
                 RetireFixedTranslationSameThread();
+                ReleaseEDM94AfterResetSameThread(); // Exact existing reset/rebase release commit only.
                 m_state = NCState::READY;
                 UpdateSystemVariables();
             }
@@ -6604,6 +6703,7 @@ void NCManager::ExecuteBlock(
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
+    if (!GuardEDM94BlockSameThread(block, sourcePC, sourceLineNumber)) return;
     // EDM17 validates the complete literal command before any setting/T/M/frame.
     if (IsEDMRecipeEditRequest(block) &&
         !PrepareEDMRecipeEditSameThread(block, sourcePC, sourceLineNumber, dispatchId)) return;
@@ -6630,7 +6730,7 @@ void NCManager::ExecuteBlock(
     {
         if (!IsGapDryRunBlockShapeValid(block))
         {
-            RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter,
+            RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter,
                 sourceLineNumber, "BLOCK_SHAPE");
             return;
         }
@@ -6871,7 +6971,11 @@ void NCManager::ExecuteBlock(
         // Its own exact stopped/authority gate was checked before any setting.
         if (descriptor.role == NCGCodeRole::PRIMARY_ACTION && gCode != 38 && gCode != 39)
         {
-            if (!PrepareFixedTranslationMotionSameThread(block, gCode)) return;
+            // FIX11: exact EDM94 P85/P86 bracket controls do not prepare
+            // geometry. Keep pending-source capture for normal NC provenance.
+            const bool edm94BracketControl = gCode == 180 &&
+                IsEDM94TranslationBracketAllowedSameThread(block);
+            if (!edm94BracketControl && !PrepareFixedTranslationMotionSameThread(block, gCode)) return;
             CapturePendingCommandState(sourcePC);
         }
 
@@ -7556,10 +7660,25 @@ bool NCManager::IsPendingProgramRunStartIdentityCurrent() const noexcept
         return false;
     }
 
+    if (m_pendingProgramRunPhase == ProgramRunStartPhase::EDM94_RELEASE)
+    {
+        return m_pendingProgramRunExecutionEpoch == MOTION_EXECUTION_EPOCH_INVALID &&
+            !m_pendingProgramRunOwnerLease.IsValid() &&
+            IsEDM94CompletionStartIdentityCurrentSameThread();
+    }
+
     if (m_pendingProgramRunPhase ==
         ProgramRunStartPhase::ALARM_ADMISSION)
     {
+        // A completed-retirement button retains its NONE/epoch identity
+        // while an ordinary Alarm reservation is busy. Do not absorb a
+        // later external owner transaction before acquiring our own lease.
+        const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
+        const bool retirementIdentityCurrent = m_pendingProgramRunEDM94Session == 0ULL ||
+            (IsEDM94CompletionStartIdentityCurrentSameThread() &&
+                owner.owner == MotionOwner::NONE && owner.generation == m_pendingProgramRunEDM94NoneGeneration);
         return
+            retirementIdentityCurrent &&
             m_pendingProgramRunExecutionEpoch ==
             MOTION_EXECUTION_EPOCH_INVALID &&
             !m_pendingProgramRunOwnerLease.IsValid();
@@ -7622,6 +7741,11 @@ void NCManager::ClearPendingProgramRunStart(bool cancelled) noexcept
         NC_PROGRAM_CACHE_GENERATION_INVALID;
     m_pendingProgramRunAlarmUpdateCount = 0U;
     m_pendingProgramRunAlarmSafetyIntentState = 0ULL;
+    m_pendingProgramRunSafetyProvenanceGeneration = 0ULL;
+    m_pendingProgramRunEDM94Session = 0ULL;
+    m_pendingProgramRunEDM94Epoch = MOTION_EXECUTION_EPOCH_INVALID;
+    m_pendingProgramRunEDM94IdleLease = MotionOwnerLease{};
+    m_pendingProgramRunEDM94NoneGeneration = MOTION_OWNER_GENERATION_INVALID;
 }
 
 bool NCManager::ArmPendingGotoQueueTailRebase(
@@ -7724,6 +7848,35 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
             !startAlarms.HasAlarm();
     };
 
+    // FIX15: a retry belongs to the original button edge. Never absorb a
+    // completed Safety request merely because its pending bit is clear now.
+    const auto safetyIdentityCurrent = [this]() noexcept
+    {
+        return m_motion.GetSafetyProvenanceGeneration() ==
+            m_pendingProgramRunSafetyProvenanceGeneration &&
+            !m_motion.HasPendingSafetyIntent();
+    };
+    const auto cancelIfSuperseded = [&]() noexcept
+    {
+        if (IsPendingProgramRunStartIdentityCurrent() &&
+            alarmIdentityCurrent() && safetyIdentityCurrent()) return false;
+        m_startDiagnosticEvent = "START_SUPERSEDED";
+        cancelPendingStart(startAlarms.HasAlarm());
+        return true;
+    };
+    if (cancelIfSuperseded()) return true;
+
+    if (m_pendingProgramRunPhase == ProgramRunStartPhase::EDM94_RELEASE &&
+        m_startDiagnosticWaitScans > 100ULL)
+    {
+        // Bound the operator edge, not the RT zero-containment transaction.
+        // A later retirement cannot start a program from an old button.
+        m_startDiagnosticEvent = "RETIRE_WAIT_TIMEOUT";
+        LogEDM94SameThread("START_CANCELLED", "RETIRE_WAIT_TIMEOUT_PRESS_START_AGAIN");
+        cancelPendingStart(false);
+        return true;
+    }
+
     if (m_programLoadStartBlocked && m_pendingProgramRunMode == NCOperationMode::MEMORY)
     {
         cancelPendingStart(startAlarms.HasAlarm());
@@ -7738,18 +7891,38 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         // Ordinary NC observations close the inert replacement before START
         // can publish an epoch. Never count two observations inside LOAD.
         m_startDiagnosticEvent = "WAIT_REPLACEMENT";
-        if (!alarmIdentityCurrent()) cancelPendingStart(startAlarms.HasAlarm());
+        (void)cancelIfSuperseded();
         return true;
+    }
+
+    if (m_pendingProgramRunPhase == ProgramRunStartPhase::EDM94_RELEASE)
+    {
+        // A selected image and a predicted NONE owner are not a release ACK.
+        // The RT guard must complete its new NONE-identity zero window first.
+        if (m_edm94.latched)
+        {
+            m_startDiagnosticEvent = "WAIT_EDM94_RETIRE";
+            (void)cancelIfSuperseded();
+            return true;
+        }
+        const MotionOwnerLease owner = m_motion.GetMotionOwnerLease();
+        if (!HasEDM94CompletionReleaseAcknowledgementSameThread(m_edm94.feedback) ||
+            owner.owner != MotionOwner::NONE ||
+            owner.generation != m_pendingProgramRunEDM94NoneGeneration)
+        {
+            m_startDiagnosticEvent = "EDM94_RETIRE_ACK_CANCEL";
+            cancelPendingStart(startAlarms.HasAlarm());
+            return true;
+        }
+        if (cancelIfSuperseded()) return true;
+        m_pendingProgramRunPhase = ProgramRunStartPhase::ALARM_ADMISSION;
+        m_startDiagnosticEvent = "EDM94_RETIRE_READY";
     }
 
     if (m_pendingProgramRunPhase ==
         ProgramRunStartPhase::ALARM_ADMISSION)
     {
-        if (!alarmIdentityCurrent())
-        {
-            cancelPendingStart(startAlarms.HasAlarm());
-            return true;
-        }
+        if (cancelIfSuperseded()) return true;
 
         m_startDiagnosticEvent = "WAIT_ALARM_ADMISSION";
         AlarmManager::MotionAdmissionReservation admission{};
@@ -7761,6 +7934,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
                 true);
         if (beginResult == AlarmManager::MotionAdmissionResult::BUSY)
         {
+            (void)cancelIfSuperseded();
             return true;
         }
         if (beginResult !=
@@ -7771,6 +7945,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         }
 
         if (!IsPendingProgramRunStartIdentityCurrent() ||
+            !alarmIdentityCurrent() || !safetyIdentityCurrent() ||
             admission.baseState !=
             m_pendingProgramRunAlarmSafetyIntentState)
         {
@@ -7786,6 +7961,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
             {
                 cancelPendingStart(true);
             }
+            else (void)cancelIfSuperseded();
             return true;
         }
 
@@ -7818,6 +7994,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
             {
                 cancelPendingStart(true);
             }
+            else (void)cancelIfSuperseded();
             return true;
         }
 
@@ -7829,14 +8006,11 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         {
             cancelPendingStart(true);
         }
+        else (void)cancelIfSuperseded();
         return true;
     }
 
-    if (!alarmIdentityCurrent())
-    {
-        cancelPendingStart(startAlarms.HasAlarm());
-        return true;
-    }
+    if (cancelIfSuperseded()) return true;
 
     const MotionExecutionEpoch pendingEpoch =
         m_pendingProgramRunExecutionEpoch;
@@ -7846,6 +8020,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
             pendingEpoch,
             m_pendingProgramRunOwnerLease))
     {
+        (void)cancelIfSuperseded();
         return true;
     }
 
@@ -7860,6 +8035,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     if (runAdmissionResult ==
         AlarmManager::MotionAdmissionResult::BUSY)
     {
+        (void)cancelIfSuperseded();
         return true;
     }
     if (runAdmissionResult !=
@@ -7869,52 +8045,93 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
         return true;
     }
 
-    if (!IsPendingProgramRunStartIdentityCurrent() ||
-        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
-            pendingEpoch,
-            m_pendingProgramRunOwnerLease) ||
-        m_motion.HasPendingSafetyOrRecoveryRequests())
+    const auto endAdmissionAndWait = [&](const char* event) noexcept
+    {
+        if (!startAlarms.EndMotionAdmission(runAdmission))
+        {
+            m_startDiagnosticEvent = "START_ADMISSION_SUPERSEDED";
+            cancelPendingStart(true);
+        }
+        else if (!cancelIfSuperseded()) m_startDiagnosticEvent = event;
+    };
+    const auto admissionIdentityCurrent = [&]() noexcept
+    {
+        return IsPendingProgramRunStartIdentityCurrent() &&
+            alarmIdentityCurrent() && safetyIdentityCurrent() &&
+            startAlarms.IsMotionAdmissionCurrent(runAdmission);
+    };
+    if (!admissionIdentityCurrent())
     {
         const bool ended = startAlarms.EndMotionAdmission(runAdmission);
+        m_startDiagnosticEvent = "START_SUPERSEDED";
         cancelPendingStart(!ended || startAlarms.HasAlarm());
         return true;
     }
-
-    m_startDiagnosticEvent = "BEGIN_RUN_BOUNDARY";
-    if (!BeginProgramRunBoundary(pendingEpoch))
+    if (!m_motion.HasExactProgramStartQuiescenceAcknowledgement(
+        pendingEpoch, m_pendingProgramRunOwnerLease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests())
     {
-        const bool ended = startAlarms.EndMotionAdmission(runAdmission);
-        cancelPendingStart(!ended || startAlarms.HasAlarm());
+        endAdmissionAndWait("WAIT_RT_ACK");
         return true;
     }
 
     m_startDiagnosticEvent = "SYNC_QUEUE_TAIL";
-    m_motion.SyncVirtualEndPosition();
     double synchronizedQueueTailMCS[MAX_AXES] = {};
-    if (!m_motion.TryGetSynchronizedG00QueueTailMCS(
-        synchronizedQueueTailMCS) ||
-        !IsPendingProgramRunStartIdentityCurrent() ||
+    const MotionQueueTailSyncResult synchronized =
+        m_motion.TrySynchronizeProgramStartQueueTailMCS(
+            pendingEpoch, m_pendingProgramRunOwnerLease, synchronizedQueueTailMCS);
+    if (!admissionIdentityCurrent())
+    {
+        const bool ended = startAlarms.EndMotionAdmission(runAdmission);
+        m_startDiagnosticEvent = "START_SUPERSEDED";
+        cancelPendingStart(!ended || startAlarms.HasAlarm());
+        return true;
+    }
+    if (synchronized == MotionQueueTailSyncResult::InvalidMapping)
+    {
+        const bool ended = startAlarms.EndMotionAdmission(runAdmission);
+        if (!ended) cancelPendingStart(true);
+        else if (!cancelIfSuperseded())
+        {
+            m_startDiagnosticEvent = "SYNC_QUEUE_TAIL_INVALID";
+            TriggerMappingIntegrityAlarmOnce();
+            cancelPendingStart(true);
+        }
+        return true;
+    }
+    if (synchronized == MotionQueueTailSyncResult::Retry ||
         !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
-            pendingEpoch,
-            m_pendingProgramRunOwnerLease) ||
+            pendingEpoch, m_pendingProgramRunOwnerLease) ||
         m_motion.HasPendingSafetyOrRecoveryRequests())
     {
-        (void)startAlarms.EndMotionAdmission(runAdmission);
-        TriggerMappingIntegrityAlarmOnce();
-        cancelPendingStart(true);
+        endAdmissionAndWait("WAIT_SYNC_QUEUE_TAIL");
         return true;
     }
 
     m_startDiagnosticEvent = "SYNC_COORDINATE";
     CoordSys.SyncMachinePosition(synchronizedQueueTailMCS);
-    if (!IsPendingProgramRunStartIdentityCurrent() ||
-        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
-            pendingEpoch,
-            m_pendingProgramRunOwnerLease) ||
-        m_motion.HasPendingSafetyOrRecoveryRequests() ||
-        !startAlarms.IsMotionAdmissionCurrent(runAdmission))
+    if (!admissionIdentityCurrent())
     {
         const bool ended = startAlarms.EndMotionAdmission(runAdmission);
+        m_startDiagnosticEvent = "START_SUPERSEDED";
+        cancelPendingStart(!ended || startAlarms.HasAlarm());
+        return true;
+    }
+    if (!m_motion.HasExactProgramStartQuiescenceAcknowledgement(
+        pendingEpoch, m_pendingProgramRunOwnerLease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests())
+    {
+        endAdmissionAndWait("WAIT_COORDINATE_PROOF");
+        return true;
+    }
+
+    // All retryable samples precede BeginRun, which allocates the run identity.
+    // After this seam a failed final commit consumes the edge, never retries it.
+    m_startDiagnosticEvent = "BEGIN_RUN_BOUNDARY";
+    if (!BeginProgramRunBoundary(pendingEpoch) || !admissionIdentityCurrent())
+    {
+        const bool ended = startAlarms.EndMotionAdmission(runAdmission);
+        m_startDiagnosticEvent = "BEGIN_RUN_CANCEL";
         cancelPendingStart(!ended || startAlarms.HasAlarm());
         return true;
     }
@@ -7935,7 +8152,12 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
             NCState::RUN,
             std::memory_order_acq_rel,
             std::memory_order_acquire);
-    if (!committedRun ||
+    if (!committedRun || m_state != NCState::RUN ||
+        !alarmIdentityCurrent() || !safetyIdentityCurrent() ||
+        m_mode != m_pendingProgramRunMode ||
+        GetBaseProgramScope() != m_pendingProgramRunScope ||
+        GetBaseProgramCache().GetGeneration() != m_pendingProgramRunCacheGeneration ||
+        m_motion.GetCurrentExecutionEpoch() != pendingEpoch ||
         !m_motion.IsMotionOwnerLeaseCurrent(
             m_pendingProgramRunOwnerLease) ||
         !m_motion.HasExactProgramStartQuiescenceAcknowledgement(
@@ -7952,13 +8174,21 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
                 std::memory_order_acquire);
         }
         m_manualAutoRunning = false;
+        m_startDiagnosticEvent = "COMMIT_RT_PROOF_CANCEL";
         const bool ended =
             startAlarms.EndMotionAdmission(runAdmission);
         cancelPendingStart(!ended || startAlarms.HasAlarm());
         return true;
     }
 
-    if (!startAlarms.EndMotionAdmission(runAdmission))
+    const bool runAdmissionEnded = startAlarms.EndMotionAdmission(runAdmission);
+    if (!runAdmissionEnded || m_state != NCState::RUN ||
+        !alarmIdentityCurrent() || !safetyIdentityCurrent() ||
+        m_mode != m_pendingProgramRunMode ||
+        GetBaseProgramScope() != m_pendingProgramRunScope ||
+        GetBaseProgramCache().GetGeneration() != m_pendingProgramRunCacheGeneration ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_pendingProgramRunOwnerLease) ||
+        m_motion.GetCurrentExecutionEpoch() != pendingEpoch)
     {
         NCState provisionalRun = NCState::RUN;
         (void)m_state.compare_exchange_strong(
@@ -7967,7 +8197,8 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
             std::memory_order_acq_rel,
             std::memory_order_acquire);
         m_manualAutoRunning = false;
-        cancelPendingStart(true);
+        m_startDiagnosticEvent = "COMMIT_SUPERSEDED";
+        cancelPendingStart(!runAdmissionEnded || startAlarms.HasAlarm());
         return true;
     }
 
@@ -7993,6 +8224,7 @@ bool NCManager::ProcessPendingProgramRunStart() noexcept
     InvalidatePathCoreHoldSameThread(); // CB: a fresh run never inherits an old arm.
     m_startDiagnosticEvent = "STARTED";
     m_startDiagnosticFinish = "COMMITTED";
+    ObserveEDM103RunSameThread(false, static_cast<unsigned>(originState));
     ClearPendingProgramRunStart(false);
     UpdateSystemVariables();
 
@@ -8006,6 +8238,8 @@ bool NCManager::RequestProgramEnd(
     int sourceLineNumber,
     NCBlockDispatchId markerDispatchId) noexcept
 {
+    if (!ValidateEDMPhysicalSequenceEndSameThread(cause, sourcePC,
+        sourceLineNumber, markerDispatchId, false)) return false;
     ClearPendingGotoQueueTailRebase();
     m_pauseAfterBlock = false;
     m_legacySingleBlockPausePending = false;
@@ -8120,6 +8354,17 @@ void NCManager::FinalizeProgramEnd()
         return;
     }
 
+    // EDM80: HMI edits can arrive while the ordinary end gate drains. Recheck
+    // the pinned Q2 terminal immediately before its original permission action.
+    const auto edmEnd = m_programEndBoundary.GetSnapshot();
+    if (!ValidateEDMPhysicalSequenceEndSameThread(edmEnd.cause, edmEnd.sourcePC,
+        edmEnd.sourceLineNumber, edmEnd.markerDispatchId, true))
+    {
+        DiscardPathCoreCompletedSnapshotSameThread();
+        ClosePathCoreCommittedRunSameThread();
+        return;
+    }
+
     // CJ: hand the exact, freshly settled Program lease to output-only idle
     // holding before NC cleanup. A busy reservation preserves the pending End
     // transaction; ordinary producers cannot create this holding authority.
@@ -8229,12 +8474,19 @@ void NCManager::FinalizeProgramEnd()
         m_manualAutoRunning = false;
     }
     NCState expectedState = entryState;
-    (void)m_state.compare_exchange_strong(expectedState, endState,
-        std::memory_order_acq_rel, std::memory_order_acquire);
+    if (m_state.compare_exchange_strong(expectedState, endState,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        CommitEDMPhysicalSequenceEndSameThread();
+        CompleteEDM94ProgramEndSameThread(edmEnd, releaseSample.executionEpoch);
+    }
+    else
+        InvalidateEDMPhysicalSequencePlanSameThread();
 }
 
 void NCManager::CancelProgramEndBoundary() noexcept
 {
+    InvalidateEDMPhysicalSequencePlanSameThread();
     ClearPendingGotoQueueTailRebase();
     m_programEndBoundary.Cancel();
     m_programEndAlarmRaised = false;

@@ -45,6 +45,9 @@
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <EntryPointSymbol>_RtapiProcessEntryCRT</EntryPointSymbol>
       <SubSystem>Native</SubSystem>
+      <!-- EDM85 FIX1: fixed main/NC stack; RTSS uses the Commit value. -->
+      <StackReserveSize>131072</StackReserveSize>
+      <StackCommitSize>131072</StackCommitSize>
       <Driver>Driver</Driver>
       <AdditionalOptions>/FORCE:MULTIPLE %(AdditionalOptions)</AdditionalOptions>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -71,6 +74,9 @@
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <EntryPointSymbol>_RtapiProcessEntryCRT</EntryPointSymbol>
       <SubSystem>Native</SubSystem>
+      <!-- EDM85 FIX1: fixed main/NC stack; RTSS uses the Commit value. -->
+      <StackReserveSize>131072</StackReserveSize>
+      <StackCommitSize>131072</StackCommitSize>
       <Driver>Driver</Driver>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -115,6 +121,8 @@
     <ClInclude Include="EDMGapInput.h" />
     <ClInclude Include="EDMGapInputConfigIO.h" />
     <ClInclude Include="EDMGapServo.h" />
+    <ClInclude Include="EDMGapServoPhysicalRuntime.h" />
+    <ClInclude Include="EDMFlushPhysicalRuntime.h" />
     <ClInclude Include="EDMFlushPlan.h" />
     <ClInclude Include="EDMAxisGainProfiles.h" />
     <ClInclude Include="EDMProcessProfile.h" />
@@ -174,6 +182,8 @@
     <ClInclude Include="NCGCodeSemantics.h" />
     <ClInclude Include="NCLifecycleInterruptionBoundary.h" />
     <ClInclude Include="NCManager.h" />
+    <ClInclude Include="NCMainThreadStackPolicy.h" />
+    <ClInclude Include="EDMToolHeadKinematics.h" />
     <ClInclude Include="NCPathCoreCutterContour.h" />
     <ClInclude Include="NCPathCoreCutterLine.h" />
     <ClInclude Include="NCOrdinaryG00BufferedExactStopAdmissionShadow.h" />

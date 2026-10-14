@@ -1578,6 +1578,11 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
             return nullptr;
         }
     }
+    if (!GuardEDM94FeedSameThread(block))
+    {
+        RejectEDM94SameThread("ENDPOINT_OR_SCOPE", m_gapDryRun.sourceLine);
+        return nullptr;
+    }
     const bool accepted = m_motion.TryG01XYZCUVMoveTransactionalTail(programmedWords, targetMCS,
         feedMMMin, CoordSys.commandedMCS, m_pathFeedMotion);
     if (!accepted)
@@ -2231,7 +2236,8 @@ bool NCManager::CompletePathCoreFeedSameThread()
             RejectPathCoreFeedSameThread(12U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
         return false;
     }
-    if (m_state == NCState::ALARM) return false;
+    if (m_state == NCState::ALARM)
+    { m_edm94.boundary = EDM94NCState::FeedBoundary{}; return false; }
     if (!m_pathFeed.pending)
     {
         if (m_gapWindow.active && (m_gapWindow.budgetProven || m_gapWindow.normalProven) && m_pathFeed.completed &&
@@ -2241,7 +2247,8 @@ bool NCManager::CompletePathCoreFeedSameThread()
         }
         return m_pathFeed.completed;
     }
-    if (IsFeedHoldActive()) return false;
+    if (IsFeedHoldActive())
+    { m_edm94.boundary = EDM94NCState::FeedBoundary{}; return false; }
     ValidatePathCoreFeedSameThread();
     if (!m_pathFeed.armed)
     {
@@ -2252,6 +2259,10 @@ bool NCManager::CompletePathCoreFeedSameThread()
     if (!m_pathFeed.bound || !m_pathFeed.completed || m_motion.HasPendingSafetyOrRecoveryRequests() ||
         !m_motion.IsGroupDone()) return false;
     if (m_gapWindow.active && m_gapWindow.normalSource && !m_gapWindow.normalProven) return false;
+    // FIX8: retain the completed EDM94 G1 and its correction authority until
+    // the exact old Epoch is physically ready for the next ordinary command.
+    if (m_edm94.latched && m_pathFeedMotion.receipt.xyzcuvFeed &&
+        !WaitEDM94FeedBoundarySameThread()) return false;
     if (CoordSys.toolRadiusMode == 40 && !m_pathFeedMotion.receipt.eccentricFeed && !m_pathFeedMotion.receipt.rotaryFeed && !m_pathFeedMotion.receipt.zcFeed && !m_pathFeedMotion.receipt.xyzcFeed && !m_pathFeedMotion.receipt.xyzcuvFeed)
         RetainPathCoreFeedSameThread(); // Native rotary/mixed paths do not enter XYZ retained geometry.
     m_pathFeed.pending = false;

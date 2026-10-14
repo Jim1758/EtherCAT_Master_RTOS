@@ -10,6 +10,8 @@
 #include <atomic>
 #include "CoreTimerShutdown.h"
 #include "EDMAnalogInput.h"
+#include "EDMGapPhysicalRTShadow.h"
+#include "EDMGapPhysicalRecipeRTShadow.h"
 #pragma pack(push, 1)
 
 // 標準 Mailbox 標頭 (6 Bytes)
@@ -1180,6 +1182,15 @@ public:
     void CaptureGapAnalogInputSnapshot(std::int64_t qpcTicks,
         std::uint64_t qpcFrequency, bool processDataValid) noexcept;
     bool ReadGapAnalogInputSnapshot(EDMAnalogInput::Snapshot& snapshot) const noexcept;
+    // EDM64 diagnostic model only: configured before callbacks begin, then
+    // solely advanced by the PDO owner. Readers copy before their clock and
+    // use ValidateRead to expire stopped PDO telemetry.
+    bool ConfigureGapPhysicalRTShadowBeforeStart(const EDMGapInput::Profile& profile) noexcept;
+    EDM53::Stamp ReadGapPhysicalRTShadow(EDM64::Snapshot& snapshot) const noexcept;
+    // NC publishes a frozen recipe for observation; only the PDO owner advances
+    // its physical shadow. These ports never authorize physical motion.
+    bool PublishGapPhysicalRecipeRTShadow(const EDM65::Request& request) noexcept;
+    EDM53::Stamp ReadGapPhysicalRecipeRTShadow(EDM65::Snapshot& snapshot) const noexcept;
 
 
 
@@ -2465,6 +2476,8 @@ public:
     bool m_gapAnalogInputRouteBuilt = false;
     EDMAnalogInput::Binding m_gapAnalogInputBinding{};
     EDMAnalogInput::Publisher m_gapAnalogInputPublisher;
+    EDM64::PhysicalRTShadow m_gapPhysicalRTShadow;
+    EDM65::PhysicalRecipeRTShadow m_gapPhysicalRecipeRTShadow;
 
     // System Function
     int BuildIoMap();   // 自動掃描並建立清單

@@ -29,7 +29,7 @@ private:
 class NicTxFrameLifecycle
 {
 public:
-    static constexpr std::size_t SlotCount = 4U;
+    static constexpr std::size_t SlotCount = 16U;
     static constexpr std::size_t NoSlot = SlotCount;
     enum class State : std::uint32_t
     {

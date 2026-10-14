@@ -1,9 +1,19 @@
-// CG / EDM01 / EDM02: NC-owned simulation tests. No Motion or IO writes.
+﻿// CG / EDM01 / EDM02: NC-owned simulation tests. No Motion or IO writes.
 #include "NCManager.h"
+#include "NCXYZCUVFeedScope.h"
+#include "EDMCNCRetainedRTFixture.h"
+#include "EDMCoordinatedRTFixture.h"
+#include "NCMainThreadStackPolicy.h"
 #include "AlarmManager.h"
 #include "EDMConditionService.h"
 #include "EtherCatMaster.h"
 #include "NCGCodeSemantics.h"
+#include "EDMPhysicalServoFlushContract.h"
+#include "EDMPhysicalRetreatContract.h"
+#include "EDMPhysicalBidirectionalContract.h"
+#include "EDMPhysicalBidirectionalFlushContract.h"
+#include "EDMPhysicalRecipeSequence.h"
+#include "EDMPhysicalRecipePreflight.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -11,9 +21,107 @@
 #include <limits>
 #include <windows.h>
 #include <rtapi.h>
+#include <RtssApi.h>
 
 namespace
 {
+    // Each part is one bounded native console record. Shared keys identify one
+    // copied bank; captured scope describes provenance, never current NC state.
+    void LogEDM65PhysicalRecipeShadow(const EDM65::Snapshot& value) noexcept
+    {
+        char text[480]{};
+        const auto publication = static_cast<unsigned long long>(value.publication);
+        const auto recipePub = static_cast<unsigned long long>(value.recipePublication);
+        const auto cycle = static_cast<unsigned long long>(value.cycle);
+        const auto& request = value.request;
+        const auto& recipe = request.recipe;
+        const auto& key = recipe.binding;
+        const bool usable = value.readerState == EDM64::ReaderState::Fresh &&
+            value.state == EDM65::State::Valid && value.output.valid;
+        int length = std::snprintf(text, sizeof(text),
+            "[EDM65] event=RT_RECIPE_SHADOW part=STATE publication=%llu recipePub=%llu cycle=%llu state=%s reason=%s reader=%s kernelFault=%s usable=%u outputValid=%u mode=FROZEN_SIM_RECIPE_PHYSICAL_SHADOW appliedToMotion=0 physicalPermit=0 discharge=0\n",
+            publication, recipePub, cycle, EDM65::StateName(value.state), EDM65::ReasonName(value.reason),
+            EDM64::ReaderStateName(value.readerState), EDM64::FaultName(value.output.fault),
+            usable ? 1U : 0U, value.output.valid ? 1U : 0U);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM65] event=RT_RECIPE_SHADOW part=STATE publication=%llu recipePub=%llu cycle=%llu reason=LOG_FORMAT appliedToMotion=0 physicalPermit=0 discharge=0\n", publication, recipePub, cycle);
+        length = std::snprintf(text, sizeof(text),
+            "[EDM65] event=RT_RECIPE_SHADOW part=SCOPE publication=%llu recipePub=%llu cycle=%llu session=%llu run=%llu cache=%llu dispatch=%llu epoch=%llu owner=%u ownerGen=%llu capturedUs=%llu qpcHz=%llu capturedNotActive=1 captureClock=HOST_NC_RECEIPT\n",
+            publication, recipePub, cycle,
+            static_cast<unsigned long long>(request.scope.session), static_cast<unsigned long long>(request.scope.run),
+            static_cast<unsigned long long>(request.scope.cache), static_cast<unsigned long long>(request.scope.dispatch),
+            static_cast<unsigned long long>(request.scope.epoch), static_cast<unsigned>(request.scope.owner),
+            static_cast<unsigned long long>(request.scope.ownerGeneration),
+            static_cast<unsigned long long>(request.capturedUs), static_cast<unsigned long long>(request.qpcFrequency));
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM65] event=RT_RECIPE_SHADOW part=SCOPE publication=%llu recipePub=%llu cycle=%llu reason=LOG_FORMAT appliedToMotion=0 physicalPermit=0 discharge=0\n", publication, recipePub, cycle);
+        const bool recipeFinite = std::isfinite(recipe.referenceV) && std::isfinite(recipe.overridePercent) &&
+            std::isfinite(recipe.curve.maxFeedMmPerMin) && std::isfinite(recipe.curve.maxRetreatMmPerMin);
+        length = recipeFinite ? std::snprintf(text, sizeof(text),
+            "[EDM65] event=RT_RECIPE_SHADOW part=RECIPE publication=%llu recipePub=%llu cycle=%llu table=%u E=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu processRev=%u tuningGen=%llu referenceV=%.9g overridePct=%.9g feedCap=%.9g retreatCap=%.9g curve=FROZEN_E8_E9_PN\n",
+            publication, recipePub, cycle, key.tableId, static_cast<unsigned>(key.eCode), key.catalogRevision,
+            key.tableRevision, key.profileId, key.definitionRevision, static_cast<unsigned long long>(key.generation),
+            key.processRevision, static_cast<unsigned long long>(key.tuningGeneration), recipe.referenceV,
+            recipe.overridePercent, recipe.curve.maxFeedMmPerMin, recipe.curve.maxRetreatMmPerMin) : -1;
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM65] event=RT_RECIPE_SHADOW part=RECIPE publication=%llu recipePub=%llu cycle=%llu reason=%s appliedToMotion=0 physicalPermit=0 discharge=0\n", publication, recipePub, cycle, recipeFinite ? "LOG_FORMAT" : "NONFINITE_VALUES");
+        const bool valuesFinite = std::isfinite(value.output.rawVoltageV) && std::isfinite(value.output.filteredVoltageV) &&
+            std::isfinite(value.output.targetMmPerMin) && std::isfinite(value.output.speedMmPerMin);
+        length = valuesFinite ? std::snprintf(text, sizeof(text),
+            "[EDM65] event=RT_RECIPE_SHADOW part=VALUES publication=%llu recipePub=%llu cycle=%llu seq=%llu sourceGen=%llu sourceCapturedUs=%llu observedUs=%llu readerAgeUs=%llu ageKnown=%u rawV=%.9g filteredV=%.9g targetMmMin=%.9g advisoryMmMin=%.9g short=%u feedInhibit=%u appliedToMotion=0 physicalPermit=0 discharge=0\n",
+            publication, recipePub, cycle, static_cast<unsigned long long>(value.sourceSequence),
+            static_cast<unsigned long long>(value.sourceGeneration), static_cast<unsigned long long>(value.sourceCapturedUs),
+            static_cast<unsigned long long>(value.observedUs), static_cast<unsigned long long>(value.sourceAgeUs),
+            value.sourceAgeKnown ? 1U : 0U, value.output.rawVoltageV, value.output.filteredVoltageV,
+            value.output.targetMmPerMin, value.output.speedMmPerMin,
+            value.output.shortActive ? 1U : 0U, value.output.feedInhibited ? 1U : 0U) : -1;
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM65] event=RT_RECIPE_SHADOW part=VALUES publication=%llu recipePub=%llu cycle=%llu reason=%s appliedToMotion=0 physicalPermit=0 discharge=0\n", publication, recipePub, cycle, valuesFinite ? "LOG_FORMAT" : "NONFINITE_VALUES");
+    }
+
+    // EDM66: these are historical PDO observations for the frozen recipe.
+    // Reader freshness controls current usability, never erases earlier evidence.
+    // Every part retains the same copied-bank keys; no RT-thread console work.
+    void LogEDM66PhysicalCoverage(const EDM65::Snapshot& value) noexcept
+    {
+        char text[480]{};
+        const auto publication = static_cast<unsigned long long>(value.publication);
+        const auto recipePub = static_cast<unsigned long long>(value.recipePublication);
+        const auto session = static_cast<unsigned long long>(value.request.scope.session);
+        const auto& c = value.coverage;
+        const bool usable = value.readerState == EDM64::ReaderState::Fresh &&
+            value.state == EDM65::State::Valid && value.output.valid;
+        int length = std::snprintf(text, sizeof(text),
+            "[EDM66] event=PHYSICAL_COVERAGE part=WINDOW publication=%llu recipePub=%llu session=%llu hasSamples=%u saturated=%u reader=%s liveUsable=%u firstUs=%llu lastUs=%llu historyOnly=1 scope=FROZEN_RECIPE appliedToMotion=0 physicalPermit=0 discharge=0\n",
+            publication, recipePub, session, c.hasSamples ? 1U : 0U, c.saturated ? 1U : 0U,
+            EDM64::ReaderStateName(value.readerState), usable ? 1U : 0U,
+            static_cast<unsigned long long>(c.firstObservedUs), static_cast<unsigned long long>(c.lastObservedUs));
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM66] event=PHYSICAL_COVERAGE part=WINDOW publication=%llu recipePub=%llu session=%llu reason=LOG_FORMAT historyOnly=1\n", publication, recipePub, session);
+        length = std::snprintf(text, sizeof(text),
+            "[EDM66] event=PHYSICAL_COVERAGE part=SAMPLES publication=%llu recipePub=%llu session=%llu firstSeq=%llu lastSeq=%llu validTicks=%llu freshSamples=%llu repeatSamples=%llu historyOnly=1 source=PHYSICAL sampleUnit=HOST_PDO_RECEIPT\n",
+            publication, recipePub, session, static_cast<unsigned long long>(c.firstSourceSequence),
+            static_cast<unsigned long long>(c.lastSourceSequence), static_cast<unsigned long long>(c.validTicks),
+            static_cast<unsigned long long>(c.freshSamples), static_cast<unsigned long long>(c.repeatSamples));
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM66] event=PHYSICAL_COVERAGE part=SAMPLES publication=%llu recipePub=%llu session=%llu reason=LOG_FORMAT historyOnly=1\n", publication, recipePub, session);
+        length = std::snprintf(text, sizeof(text),
+            "[EDM66] event=PHYSICAL_COVERAGE part=RESPONSE publication=%llu recipePub=%llu session=%llu advanceTicks=%llu retreatTicks=%llu zeroTicks=%llu shortTicks=%llu feedInhibitTicks=%llu historyOnly=1 direction=TARGET_NOT_AXIS\n",
+            publication, recipePub, session, static_cast<unsigned long long>(c.advanceTicks),
+            static_cast<unsigned long long>(c.retreatTicks), static_cast<unsigned long long>(c.zeroTicks),
+            static_cast<unsigned long long>(c.shortTicks), static_cast<unsigned long long>(c.feedInhibitTicks));
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM66] event=PHYSICAL_COVERAGE part=RESPONSE publication=%llu recipePub=%llu session=%llu reason=LOG_FORMAT historyOnly=1\n", publication, recipePub, session);
+        const bool finite = std::isfinite(c.minRawV) && std::isfinite(c.maxRawV);
+        length = finite ? std::snprintf(text, sizeof(text),
+            "[EDM66] event=PHYSICAL_COVERAGE part=SHORT_RANGE publication=%llu recipePub=%llu session=%llu shortEntries=%llu shortExits=%llu initialShort=%u lastShort=%u minRawV=%.9g maxRawV=%.9g historyOnly=1 initialShortIsEntry=0\n",
+            publication, recipePub, session, static_cast<unsigned long long>(c.shortEntries),
+            static_cast<unsigned long long>(c.shortExits), c.initialShort ? 1U : 0U, c.lastShort ? 1U : 0U,
+            c.minRawV, c.maxRawV) : -1;
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM66] event=PHYSICAL_COVERAGE part=SHORT_RANGE publication=%llu recipePub=%llu session=%llu reason=%s historyOnly=1\n", publication, recipePub, session, finite ? "LOG_FORMAT" : "NONFINITE_VALUES");
+    }
+
     constexpr std::uint32_t GapCaseCount = 16U;
     constexpr std::uint32_t GapAllCases = (1U << GapCaseCount) - 1U;
     constexpr std::uint64_t GapCaseMs = 750ULL;
@@ -813,11 +921,16 @@ bool NCManager::InstallEDMGapInputBeforeStart(const EDMGapInput::Profile& profil
     if (RtQueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0 &&
         static_cast<std::uint64_t>(frequency.QuadPart) <= (std::numeric_limits<std::uint64_t>::max)() / 1000ULL)
         m_edmGapFrequency = static_cast<std::uint64_t>(frequency.QuadPart);
-    return m_edmGapChannel.Initialize(profile);
+    const bool initialized = m_edmGapChannel.Initialize(profile);
+    (void)m_edmGapPhysicalShadow.Initialize(profile); // Frozen configured calibration; observer only.
+    (void)master->ConfigureGapPhysicalRTShadowBeforeStart(profile); // PDO-owned diagnostic only; SIM result unchanged.
+    (void)m_motion.BindEDMPhysicalSourceBeforeStart(master); // Separate source binding; no legacy motion permit.
+    return initialized;
 }
 
 bool NCManager::IsEDMZFixtureDiagnosticQuietSameThread() const noexcept
 {
+    if ((m_gapDryRun.physicalRecipeCaptureTest || m_gapDryRun.physicalServoRTTest) && m_gapDryRun.active) return true;
     return m_gapDryRun.physicalZFixtureTest &&
         (m_gapDryRun.active || m_edmZFixture.phase == EDMZFixturePhase::Receipt ||
             m_edmZFixture.cleanupPending || m_edmZFixture.resetPending ||
@@ -827,7 +940,21 @@ bool NCManager::IsEDMZFixtureDiagnosticQuietSameThread() const noexcept
 EDMGapInput::Snapshot NCManager::ReadEDMGapInputSnapshotSameThread() noexcept
 {
     EDMAnalogInput::Snapshot input{};
-    if (m_edmGapMaster != nullptr) (void)m_edmGapMaster->ReadGapAnalogInputSnapshot(input);
+    const bool readSucceeded = m_edmGapMaster != nullptr && m_edmGapMaster->ReadGapAnalogInputSnapshot(input);
+    // Read before the existing QPC acquisition: a later PDO publication must
+    // never be compared with an earlier NC clock. Only READY/quiet NC reads
+    // this diagnostic bank; formatting and logging remain on the 1 Hz guard.
+    const bool rtShadowDiagnostic = !IsEDMZFixtureDiagnosticQuietSameThread() &&
+        m_state.load(std::memory_order_relaxed) == NCState::READY;
+    EDM64::Snapshot rtPhysical{};
+    EDM53::Stamp rtPhysicalStamp{};
+    EDM65::Snapshot recipePhysical{};
+    EDM53::Stamp recipePhysicalStamp{};
+    if (rtShadowDiagnostic && m_edmGapMaster != nullptr)
+    {
+        rtPhysicalStamp = m_edmGapMaster->ReadGapPhysicalRTShadow(rtPhysical);
+        recipePhysicalStamp = m_edmGapMaster->ReadGapPhysicalRecipeRTShadow(recipePhysical);
+    }
     LARGE_INTEGER counter{};
     bool clockValid = m_edmGapFrequency != 0ULL && RtQueryPerformanceCounter(&counter) && counter.QuadPart >= 0;
     std::uint64_t nowMs = 0ULL;
@@ -839,6 +966,13 @@ EDMGapInput::Snapshot NCManager::ReadEDMGapInputSnapshotSameThread() noexcept
         clockValid = seconds <= ((std::numeric_limits<std::uint64_t>::max)() - fraction) / 1000ULL;
         if (clockValid) nowMs = seconds * 1000ULL + fraction;
     }
+    // Reuse the exact PDO copy and QPC reading used above. The physical shadow
+    // never becomes a Motion source and never changes the legacy millisecond path.
+    std::uint64_t nowUs = 0ULL;
+    const bool shadowClockValid = clockValid &&
+        EDMAnalogInput::Publisher::QpcMicroseconds(counter.QuadPart, m_edmGapFrequency, nowUs);
+    const EDM63::Receipt physical = m_edmGapPhysicalShadow.Observe(
+        input, readSucceeded, nowUs, shadowClockValid, m_edmGapFrequency);
     const EDMGapInput::Snapshot value = m_edmGapChannel.Observe(input, nowMs, clockValid);
     if (!m_edmGapLogSeen || (clockValid && nowMs >= m_edmGapLastLogMs && nowMs - m_edmGapLastLogMs >= 1000ULL))
     {
@@ -849,6 +983,95 @@ EDMGapInput::Snapshot NCManager::ReadEDMGapInputSnapshotSameThread() noexcept
                 value.zeroClamped ? 1U : 0U, static_cast<int>(value.voltageMv), value.liveVoltageValid ? 1U : 0U, value.calibrationConfirmed ? 1U : 0U,
                 EDMGapInput::StatusName(value.inputStatus), EDMGap::QualityName(value.gap.quality), EDMGap::BandName(value.gap.band),
                 static_cast<unsigned long long>(value.sampleSequence), static_cast<unsigned long long>(value.ageMs));
+        // Logging remains on the existing cadence. A READY-only shadow line
+        // adds no console IO to running, holding, or stopping NC motion.
+        if (!IsEDMZFixtureDiagnosticQuietSameThread() && m_state.load(std::memory_order_relaxed) == NCState::READY)
+        {
+            char line[896]{};
+            const int length = std::snprintf(line, sizeof(line),
+                "[EDM64] event=PHYSICAL_SOURCE mode=SHADOW_ONLY state=%s reason=%s usable=%u observerGen=%llu AD=%u device=%u channel=%u producerGeneration=%llu qpcHz=%llu seq=%llu capturedUs=%llu ageUs=%llu ageKnown=%u raw=%d gapMv=%d expectedProfile=%u expectedCalibration=%u calibrationEvidence=CONFIGURED timestamp=HOST_PDO_RECEIPT producerScope=OBJECT_LIFETIME physicalPermit=0 discharge=0\n",
+                EDM63::StateName(physical.state), EDM63::ReasonName(physical.reason), physical.Usable() ? 1U : 0U,
+                static_cast<unsigned long long>(physical.observerGeneration),
+                static_cast<unsigned>(physical.sample.adIndex), static_cast<unsigned>(physical.sample.deviceId),
+                static_cast<unsigned>(physical.sample.channelId),
+                static_cast<unsigned long long>(physical.sample.producerGeneration),
+                static_cast<unsigned long long>(physical.sample.qpcFrequency),
+                static_cast<unsigned long long>(physical.sample.sequence),
+                static_cast<unsigned long long>(physical.sample.capturedAtUs),
+                static_cast<unsigned long long>(physical.ageUs), physical.ageKnown ? 1U : 0U,
+                static_cast<int>(physical.sample.rawCode), static_cast<int>(physical.conversion.voltageMv),
+                static_cast<unsigned>(physical.expectedProfileRevision),
+                static_cast<unsigned>(physical.expectedCalibrationRevision));
+            if (length > 0 && static_cast<std::size_t>(length) < sizeof(line)) RtPrintf("%s", line);
+            else RtPrintf("[EDM64] event=PHYSICAL_SOURCE reason=LOG_FORMAT physicalPermit=0 discharge=0\n");
+            // This is the previously copied bank, projected against the later
+            // NC clock. A silent/stopped PDO producer is explicitly not usable.
+            EDM64::PhysicalRTShadow::ValidateRead(rtPhysical, rtPhysicalStamp,
+                nowUs, shadowClockValid, m_edmGapFrequency);
+            const bool rtAgeKnown = shadowClockValid && rtPhysical.input.sample.capturedAtUs != 0ULL &&
+                nowUs >= rtPhysical.input.sample.capturedAtUs;
+            const std::uint64_t rtAgeUs = rtAgeKnown ? nowUs - rtPhysical.input.sample.capturedAtUs : 0ULL;
+            const bool rtUsable = rtPhysical.readerState == EDM64::ReaderState::Fresh &&
+                rtPhysical.state == EDM64::State::Valid && rtPhysical.output.valid;
+            // EDM64-FIX1: native console records are clipped after 511 bytes.
+            // Keep each complete part below that boundary, including its newline.
+            // Shared publication/cycle/seq identify the same copied RT snapshot.
+            char rtLine[480]{};
+            int rtLength = std::snprintf(rtLine, sizeof(rtLine),
+                "[EDM64-FIX1] event=RT_PHYSICAL_SHADOW part=STATE publication=%llu cycle=%llu seq=%llu state=%s reason=%s reader=%s inputState=%s inputReason=%s kernelFault=%s usable=%u outputValid=%u appliedToMotion=0 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned long long>(rtPhysical.publication),
+                static_cast<unsigned long long>(rtPhysical.cycle),
+                static_cast<unsigned long long>(rtPhysical.input.sample.sequence),
+                EDM64::StateName(rtPhysical.state), EDM64::ReasonName(rtPhysical.reason),
+                EDM64::ReaderStateName(rtPhysical.readerState), EDM63::StateName(rtPhysical.input.state),
+                EDM63::ReasonName(rtPhysical.input.reason), EDM64::FaultName(rtPhysical.output.fault),
+                rtUsable ? 1U : 0U, rtPhysical.output.valid ? 1U : 0U);
+            if (rtLength > 0 && static_cast<std::size_t>(rtLength) < sizeof(rtLine)) RtPrintf("%s", rtLine);
+            else RtPrintf("[EDM64-FIX1] event=RT_PHYSICAL_SHADOW part=STATE publication=%llu cycle=%llu seq=%llu reason=LOG_FORMAT appliedToMotion=0 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned long long>(rtPhysical.publication),
+                static_cast<unsigned long long>(rtPhysical.cycle),
+                static_cast<unsigned long long>(rtPhysical.input.sample.sequence));
+            rtLength = std::snprintf(rtLine, sizeof(rtLine),
+                "[EDM64-FIX1] event=RT_PHYSICAL_SHADOW part=SOURCE publication=%llu cycle=%llu seq=%llu observerGen=%llu producerGen=%llu capturedUs=%llu observedUs=%llu ageUs=%llu ageKnown=%u maxAgeUs=%llu maxTickGapUs=%llu timestamp=HOST_PDO_RECEIPT\n",
+                static_cast<unsigned long long>(rtPhysical.publication),
+                static_cast<unsigned long long>(rtPhysical.cycle),
+                static_cast<unsigned long long>(rtPhysical.input.sample.sequence),
+                static_cast<unsigned long long>(rtPhysical.input.observerGeneration),
+                static_cast<unsigned long long>(rtPhysical.input.sample.producerGeneration),
+                static_cast<unsigned long long>(rtPhysical.input.sample.capturedAtUs),
+                static_cast<unsigned long long>(rtPhysical.observedUs),
+                static_cast<unsigned long long>(rtAgeUs), rtAgeKnown ? 1U : 0U,
+                static_cast<unsigned long long>(rtPhysical.maxAgeUs),
+                static_cast<unsigned long long>(rtPhysical.maxTickGapUs));
+            if (rtLength > 0 && static_cast<std::size_t>(rtLength) < sizeof(rtLine)) RtPrintf("%s", rtLine);
+            else RtPrintf("[EDM64-FIX1] event=RT_PHYSICAL_SHADOW part=SOURCE publication=%llu cycle=%llu seq=%llu reason=LOG_FORMAT appliedToMotion=0 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned long long>(rtPhysical.publication),
+                static_cast<unsigned long long>(rtPhysical.cycle),
+                static_cast<unsigned long long>(rtPhysical.input.sample.sequence));
+            const bool rtValuesFinite = std::isfinite(rtPhysical.output.rawVoltageV) &&
+                std::isfinite(rtPhysical.output.filteredVoltageV) &&
+                std::isfinite(rtPhysical.output.targetMmPerMin) &&
+                std::isfinite(rtPhysical.output.speedMmPerMin);
+            rtLength = rtValuesFinite ? std::snprintf(rtLine, sizeof(rtLine),
+                "[EDM64-FIX1] event=RT_PHYSICAL_SHADOW part=VALUES publication=%llu cycle=%llu seq=%llu configRevision=%llu mode=RT_SHADOW_ONLY config=FIXED_SHADOW rawV=%.3f filteredV=%.3f targetMmMin=%.3f advisoryMmMin=%.3f short=%u feedInhibit=%u referenceV=60 capMmMin=30 calibrationEvidence=CONFIGURED appliedToMotion=0 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned long long>(rtPhysical.publication),
+                static_cast<unsigned long long>(rtPhysical.cycle),
+                static_cast<unsigned long long>(rtPhysical.input.sample.sequence),
+                static_cast<unsigned long long>(rtPhysical.configRevision),
+                rtPhysical.output.rawVoltageV, rtPhysical.output.filteredVoltageV,
+                rtPhysical.output.targetMmPerMin, rtPhysical.output.speedMmPerMin,
+                rtPhysical.output.shortActive ? 1U : 0U, rtPhysical.output.feedInhibited ? 1U : 0U) : -1;
+            if (rtLength > 0 && static_cast<std::size_t>(rtLength) < sizeof(rtLine)) RtPrintf("%s", rtLine);
+            else RtPrintf("[EDM64-FIX1] event=RT_PHYSICAL_SHADOW part=VALUES publication=%llu cycle=%llu seq=%llu reason=%s appliedToMotion=0 physicalPermit=0 discharge=0\n",
+                static_cast<unsigned long long>(rtPhysical.publication),
+                static_cast<unsigned long long>(rtPhysical.cycle),
+                static_cast<unsigned long long>(rtPhysical.input.sample.sequence),
+                rtValuesFinite ? "LOG_FORMAT" : "NONFINITE_VALUES");
+            EDM65::PhysicalRecipeRTShadow::ValidateRead(recipePhysical, recipePhysicalStamp,
+                nowUs, shadowClockValid, m_edmGapFrequency);
+            LogEDM65PhysicalRecipeShadow(recipePhysical);
+            LogEDM66PhysicalCoverage(recipePhysical);
+        }
         m_edmGapLogSeen = true; m_edmGapLastLogMs = nowMs;
         m_edmGapLastLogStatus = value.inputStatus; m_edmGapLastLogBand = value.gap.band;
     }
@@ -890,18 +1113,92 @@ EDMVoltage::Snapshot NCManager::ReadEDMVoltageSnapshotSameThread() noexcept
 
 bool NCManager::IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept
 {
+    if (block.has('P') && (block.val('P') == 85.0 || block.val('P') == 86.0 ||
+        block.val('P') == 87.0 || block.val('P') == 88.0 ||
+        block.val('P') == 89.0 || block.val('P') == 90.0 ||
+        block.val('P') == 91.0 || block.val('P') == 92.0 ||
+        block.val('P') == 93.0 || block.val('P') == 94.0 ||
+        block.val('P') == 95.0 || block.val('P') == 96.0 ||
+        block.val('P') == 97.0 || block.val('P') == 98.0 ||
+        block.val('P') == 99.0 || block.val('P') == 100.0 ||
+        block.val('P') == 101.0 || block.val('P') == 102.0 ||
+        block.val('P') == 103.0 || block.val('P') == 104.0))
+    {
+        if (block.isEmpty || block.isGoto || block.isBlockSkip || !block.hasG || block.gCode != 180 ||
+            block.gCount != 1 || block.gCodes[0] != 180 || block.mCount != 0) return false;
+        const bool noiseArm = block.val('P') == 93.0;
+        const bool burstArm = block.val('P') == 95.0;
+        const bool continuousArm = block.val('P') == 97.0;
+        const bool enduranceArm = block.val('P') == 99.0;
+        const bool pairedArm = block.val('P') == 101.0;
+        const bool flushArm = block.val('P') == 103.0;
+        const bool tuningArm = block.val('P') == 91.0 || noiseArm || burstArm || continuousArm || enduranceArm || pairedArm || flushArm;
+        for (char a = 'A'; a <= 'Z'; ++a)
+            if (block.has(a) && ((a != 'N' && a != 'P' &&
+                (!tuningArm || (a != 'Q' && a != 'R' && a != 'S'))) ||
+                !std::isfinite(block.val(a)))) return false;
+        if (tuningArm)
+        {
+            if (!block.has('Q') || !block.has('R') || !block.has('S')) return false;
+            const EDM97::Tuning tuning{ block.val('Q'), block.val('R'), block.val('S') };
+            if (!(noiseArm ? EDM98::ValidTuning(tuning) : EDM97::ValidTuning(tuning))) return false;
+        }
+        return true;
+    }
+    // EDM82 FIX1: record the actual decoded block BEFORE admission. This is
+    // NC-thread diagnostics only; accepted profiles and all rejection rules
+    // below remain unchanged. RtPrintf cannot format floating-point values.
+    const auto reportShape = [&block](bool accepted, const char* reason, char badAddress) noexcept
+    {
+        const bool edm82Profile = block.has('P') &&
+            (block.val('P') == 65.0 || block.val('P') == 66.0);
+        if (accepted && !edm82Profile) return accepted;
+        unsigned mask = 0U;
+        for (unsigned i = 0U; i < 26U; ++i)
+            if (block.hasParam[i]) mask |= 1U << i;
+        char text[480]{};
+        const int length = std::snprintf(text, sizeof(text),
+            "[EDM82_FIX1] event=SHAPE build=EDM82_FIX1_20261011 accepted=%u reason=%s empty=%u goto=%u skip=%u hasG=%u G=%d gCount=%d G0=%d mCount=%d mask=%08X hasP=%u P=%.17g Pfinite=%u bad=%c badValue=%.17g output=NONE\n",
+            accepted ? 1U : 0U, reason,
+            block.isEmpty ? 1U : 0U, block.isGoto ? 1U : 0U,
+            block.isBlockSkip ? 1U : 0U, block.hasG ? 1U : 0U,
+            block.gCode, block.gCount, block.gCodes[0], block.mCount, mask,
+            block.has('P') ? 1U : 0U, block.val('P'),
+            std::isfinite(block.val('P')) ? 1U : 0U, badAddress,
+            badAddress >= 'A' && badAddress <= 'Z' ? block.val(badAddress) : 0.0);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM82_FIX1] event=SHAPE build=EDM82_FIX1_20261011 accepted=%u reason=LOG_FORMAT output=NONE\n",
+            accepted ? 1U : 0U);
+        return accepted;
+    };
     if (block.isEmpty || block.isGoto || !block.hasG || block.gCode != 180 ||
         block.gCount != 1 || block.gCodes[0] != 180 || block.mCount != 0 ||
-        !block.has('P') || (block.val('P') != 1.0 && block.val('P') != 2.0 && block.val('P') != 3.0 && block.val('P') != 4.0 && block.val('P') != 5.0 && block.val('P') != 6.0 && block.val('P') != 7.0 && block.val('P') != 8.0 && block.val('P') != 9.0 && block.val('P') != 10.0 && block.val('P') != 11.0 && block.val('P') != 12.0 && block.val('P') != 13.0 && block.val('P') != 14.0 && block.val('P') != 15.0 && block.val('P') != 16.0 && block.val('P') != 17.0 && block.val('P') != 18.0 && block.val('P') != 19.0 && block.val('P') != 20.0 && block.val('P') != 21.0 && block.val('P') != 22.0 && block.val('P') != 23.0 && block.val('P') != 24.0 && block.val('P') != 25.0 && block.val('P') != 26.0 && block.val('P') != 27.0 && block.val('P') != 28.0 && block.val('P') != 29.0 && block.val('P') != 30.0 && block.val('P') != 31.0 && block.val('P') != 32.0 && block.val('P') != 33.0 && block.val('P') != 34.0)) return false;
+        !block.has('P') || (block.val('P') != 1.0 && block.val('P') != 2.0 && block.val('P') != 3.0 && block.val('P') != 4.0 && block.val('P') != 5.0 && block.val('P') != 6.0 && block.val('P') != 7.0 && block.val('P') != 8.0 && block.val('P') != 9.0 && block.val('P') != 10.0 && block.val('P') != 11.0 && block.val('P') != 12.0 && block.val('P') != 13.0 && block.val('P') != 14.0 && block.val('P') != 15.0 && block.val('P') != 16.0 && block.val('P') != 17.0 && block.val('P') != 18.0 && block.val('P') != 19.0 && block.val('P') != 20.0 && block.val('P') != 21.0 && block.val('P') != 22.0 && block.val('P') != 23.0 && block.val('P') != 24.0 && block.val('P') != 25.0 && block.val('P') != 26.0 && block.val('P') != 27.0 && block.val('P') != 28.0 && block.val('P') != 29.0 && block.val('P') != 30.0 && block.val('P') != 31.0 && block.val('P') != 32.0 && block.val('P') != 33.0 && block.val('P') != 34.0 && block.val('P') != 35.0 && block.val('P') != 36.0 && block.val('P') != 37.0 && block.val('P') != 38.0 && block.val('P') != 39.0 && block.val('P') != 40.0 && block.val('P') != 41.0 && block.val('P') != 42.0 && block.val('P') != 43.0 && block.val('P') != 44.0 && block.val('P') != 45.0 && block.val('P') != 46.0 && block.val('P') != 47.0 && block.val('P') != 48.0 && block.val('P') != 49.0 && block.val('P') != 50.0 && block.val('P') != 51.0 && block.val('P') != 52.0 && block.val('P') != 53.0 && block.val('P') != 54.0 && block.val('P') != 55.0 && block.val('P') != 56.0 && block.val('P') != 57.0 && block.val('P') != 58.0 && block.val('P') != 59.0 && block.val('P') != 60.0 && block.val('P') != 61.0 && block.val('P') != 62.0 && block.val('P') != 63.0 && block.val('P') != 64.0 && block.val('P') != 65.0 && block.val('P') != 66.0 && block.val('P') != 67.0 && block.val('P') != 68.0 && block.val('P') != 69.0 && block.val('P') != 70.0 && block.val('P') != 71.0 && block.val('P') != 72.0 && block.val('P') != 73.0 && block.val('P') != 74.0 && block.val('P') != 75.0 && block.val('P') != 76.0 && block.val('P') != 77.0 && block.val('P') != 78.0 && block.val('P') != 79.0 && block.val('P') != 80.0 && block.val('P') != 81.0 && block.val('P') != 82.0 && block.val('P') != 83.0 && block.val('P') != 84.0)) return reportShape(false, "HEADER_OR_PROFILE", '-');
     for (int i = 0; i < 26; ++i)
     {
         if (!block.hasParam[i]) continue;
         const bool operatorWindow = i == ('Q' - 'A') && (block.val('P') == 17.0 || block.val('P') == 22.0) &&
             (block.param[i] == 2.0 || block.param[i] == 3.0);
-        if ((i != ('N' - 'A') && i != ('P' - 'A') && !operatorWindow) ||
-            !std::isfinite(block.param[i])) return false;
+        const bool recipeSequence = i == ('Q' - 'A') &&
+            (block.val('P') == 61.0 || block.val('P') == 62.0) &&
+            (block.param[i] == 1.0 || block.param[i] == 2.0);
+        const bool coordinatedScenario = i == ('Q' - 'A') &&
+            (block.val('P') == 69.0 || block.val('P') == 70.0 || block.val('P') == 71.0 || block.val('P') == 72.0 || block.val('P') == 73.0 || block.val('P') == 74.0 || block.val('P') == 75.0 || block.val('P') == 76.0 || block.val('P') == 77.0 || block.val('P') == 78.0 || block.val('P') == 79.0 || block.val('P') == 80.0 || block.val('P') == 81.0 || block.val('P') == 82.0 || block.val('P') == 83.0 || block.val('P') == 84.0) &&
+            (block.param[i] == 1.0 || block.param[i] == 2.0 || block.param[i] == 3.0 ||
+                ((block.val('P') == 71.0 || block.val('P') == 72.0 || block.val('P') == 73.0 || block.val('P') == 74.0 || block.val('P') == 75.0 || block.val('P') == 76.0 || block.val('P') == 77.0 || block.val('P') == 78.0 || block.val('P') == 79.0 || block.val('P') == 80.0 || block.val('P') == 81.0 || block.val('P') == 82.0 || block.val('P') == 83.0 || block.val('P') == 84.0) && block.param[i] == 4.0));
+        const bool toolHeadProfile = i == ('R' - 'A') &&
+            (block.val('P') == 71.0 || block.val('P') == 72.0 || block.val('P') == 73.0 || block.val('P') == 74.0 || block.val('P') == 75.0 || block.val('P') == 76.0 || block.val('P') == 77.0 || block.val('P') == 78.0 || block.val('P') == 79.0 || block.val('P') == 80.0 || block.val('P') == 81.0 || block.val('P') == 82.0 || block.val('P') == 83.0 || block.val('P') == 84.0) &&
+            block.has('Q') && block.val('Q') == 4.0 && std::isfinite(block.param[i]) &&
+            block.param[i] >= 1.0 && block.param[i] <= static_cast<double>(EDM87::MaximumProfiles) &&
+            std::floor(block.param[i]) == block.param[i];
+        // S is a local sampled-source diagnostic selector, never a spindle command.
+        const bool sampledSource = i == ('S' - 'A') &&
+            (block.val('P') == 73.0 || block.val('P') == 74.0 || block.val('P') == 75.0 || block.val('P') == 76.0 || block.val('P') == 77.0 || block.val('P') == 78.0 || block.val('P') == 79.0 || block.val('P') == 80.0 || block.val('P') == 81.0 || block.val('P') == 82.0 || block.val('P') == 83.0 || block.val('P') == 84.0) &&
+            (block.param[i] == 0.0 || block.param[i] == 1.0 || block.param[i] == 2.0 || block.param[i] == 3.0);
+        if ((i != ('N' - 'A') && i != ('P' - 'A') && !operatorWindow && !recipeSequence && !coordinatedScenario && !toolHeadProfile && !sampledSource) ||
+            !std::isfinite(block.param[i])) return reportShape(false, std::isfinite(block.param[i]) ? "ADDRESS_OR_Q_VALUE" : "NONFINITE_ADDRESS", static_cast<char>('A' + i));
     }
-    return true;
+    return reportShape(true, "VALID", '-');
 }
 
 bool NCManager::IsEDMShortFlushRunReadySameThread() const noexcept
@@ -915,8 +1212,78 @@ bool NCManager::IsEDMShortFlushRunReadySameThread() const noexcept
         !AlarmManager::GetInstance().HasAlarm() && !Homing.IsActive();
 }
 
+void NCManager::InvalidateEDMPhysicalSequencePlanSameThread() noexcept
+{
+    auto& plan = m_edmPhysicalSequencePlan;
+    plan.plan.Invalidate();
+    plan.run = plan.cache = 0ULL;
+    plan.epoch = MOTION_EXECUTION_EPOCH_INVALID;
+    plan.lease = MotionOwnerLease{};
+    plan.firstPC = -1; plan.next = 0U;
+    plan.dispatch = NC_BLOCK_DISPATCH_ID_INVALID; plan.legPending = false;
+    plan.terminalPC = -1; plan.terminalDispatch = NC_BLOCK_DISPATCH_ID_INVALID;
+}
+
+// Only for a new dispatch rejected before it creates a fixture session. Real
+// active/retiring work still takes the existing containment path, including the
+// early ExecuteBlock shape check that runs before Start's busy guards.
+void NCManager::RejectEDMGapAdmissionSameThread(int alarmCode, int line, const char* reason)
+{
+    if (m_gapDryRun.active || m_edmZFixture.cleanupPending || m_edmZFixture.resetPending ||
+        m_edmZFixture.failureAlarmPending || m_edmPhysicalServoRT.retirePending ||
+        m_edmCoordinatedRT.retirePending || (m_edmCoordinatedRT.submitted && !m_edmCoordinatedRT.retired) ||
+        m_edmGapServoRT.retirePending || m_edmCNCRetainedRT.retirePending ||
+        (m_edmCNCRetainedRT.submitted && !m_edmCNCRetainedRT.retired))
+    { RejectGapDryRunSameThread(alarmCode, line, reason); return; }
+    InvalidateEDMPhysicalSequencePlanSameThread();
+    RtPrintf("[EDM79] event=ADMISSION_REJECT result=REJECT reason=%s run=%llu cache=%llu dispatch=%llu line=%d newSession=0 armIssued=0 discharge=0\n",
+        reason ? reason : "UNKNOWN", static_cast<unsigned long long>(m_pathCoreLiveBookkeeping.currentRunToken),
+        static_cast<unsigned long long>(GetBaseProgramCache().GetGeneration()),
+        static_cast<unsigned long long>(m_currentExecutingBlockDispatchId), line);
+    AlarmManager::GetInstance().Trigger(alarmCode, line);
+    ChangeState(NCState::ALARM);
+}
+
 void NCManager::RejectGapDryRunSameThread(int alarmCode, int line, const char* reason)
 {
+    if (m_gapDryRun.coordinatedRTTest || m_edmCoordinatedRT.retirePending ||
+        (m_edmCoordinatedRT.submitted && !m_edmCoordinatedRT.retired))
+    {
+        EndEDMCoordinatedRTSameThread(true, reason);
+        AlarmManager::GetInstance().Trigger(alarmCode, line);
+        ChangeState(NCState::ALARM);
+        return;
+    }
+    if (m_gapDryRun.cncRetainedRTTest || m_edmCNCRetainedRT.retirePending ||
+        (m_edmCNCRetainedRT.submitted && !m_edmCNCRetainedRT.retired))
+    {
+        EndEDMCNCRetainedRTSameThread(true, reason);
+        AlarmManager::GetInstance().Trigger(alarmCode, line);
+        ChangeState(NCState::ALARM);
+        return;
+    }
+    if (m_gapDryRun.cncRetainedSimulationTest)
+    {
+        EndEDMCNCRetainedSimulationSameThread(true, reason);
+        AlarmManager::GetInstance().Trigger(alarmCode, line);
+        ChangeState(NCState::ALARM);
+        return;
+    }
+    if (m_gapDryRun.multiAxisSimulationTest)
+    {
+        EndEDMMultiAxisSimulationSameThread(true, reason);
+        AlarmManager::GetInstance().Trigger(alarmCode, line); ChangeState(NCState::ALARM); return;
+    }
+    if (m_gapDryRun.physicalServoRTTest)
+    {
+        EndEDMPhysicalServoRTSameThread(true, reason);
+        AlarmManager::GetInstance().Trigger(alarmCode, line); ChangeState(NCState::ALARM); return;
+    }
+    if (m_gapDryRun.physicalRecipeCaptureTest)
+    {
+        EndEDMPhysicalRecipeCaptureSameThread(true, reason);
+        AlarmManager::GetInstance().Trigger(alarmCode, line); ChangeState(NCState::ALARM); return;
+    }
     if (m_gapDryRun.runtimeServoTest)
     {
         EndEDMGapServoRTSameThread(true, reason);
@@ -1043,6 +1410,16 @@ bool NCManager::ReadGapDryRunClockSameThread(std::uint64_t& nowMs) noexcept
 
 bool NCManager::RestartGapDryRunSameThread()
 {
+    if (m_gapDryRun.physicalServoRTTest)
+    {
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED,
+            m_gapDryRun.sourceLine, "EDM69_EXPLICIT_RESTART_REQUIRED"); return false;
+    }
+    if (m_gapDryRun.physicalRecipeCaptureTest)
+    {
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED,
+            m_gapDryRun.sourceLine, m_gapDryRun.physicalRecipeWindowTest ? "EDM68_EXPLICIT_RECAPTURE_REQUIRED" : "EDM67_EXPLICIT_RECAPTURE_REQUIRED"); return false;
+    }
     if ((m_gapDryRun.shortFlushTest || m_gapDryRun.automaticFlushTest || m_gapDryRun.liveAutomaticFlushTest || m_gapDryRun.processCoordinatorTest || m_gapDryRun.liveProcessTest || m_gapDryRun.motionBridgeTest) && !IsEDMShortFlushRunReadySameThread())
     {
         RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED,
@@ -1281,7 +1658,38 @@ bool NCManager::RestartGapDryRunSameThread()
 
 WaitConditionFunc NCManager::StartGapDryRunSameThread(const NCBlock& block)
 {
+    if (block.has('P') && (block.val('P') == 85.0 || block.val('P') == 86.0 ||
+        block.val('P') == 87.0 || block.val('P') == 88.0 ||
+        block.val('P') == 89.0 || block.val('P') == 90.0 ||
+        block.val('P') == 91.0 || block.val('P') == 92.0 ||
+        block.val('P') == 93.0 || block.val('P') == 94.0 ||
+        block.val('P') == 95.0 || block.val('P') == 96.0 ||
+        block.val('P') == 97.0 || block.val('P') == 98.0 ||
+        block.val('P') == 99.0 || block.val('P') == 100.0 ||
+        block.val('P') == 101.0 || block.val('P') == 102.0 ||
+        block.val('P') == 103.0 || block.val('P') == 104.0)) return StartEDM94SameThread(block);
+    ServiceEDMCoordinatedRTRetirementSameThread();
+    if (m_edmCoordinatedRT.retirePending || (m_edmCoordinatedRT.submitted && !m_edmCoordinatedRT.retired))
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, m_gapDryRun.sourceLine, "EDM84_PREVIOUS_SESSION_BUSY"); return nullptr; }
+    ServiceEDMCNCRetainedRTRetirementSameThread();
+    if (m_edmCNCRetainedRT.retirePending || (m_edmCNCRetainedRT.submitted && !m_edmCNCRetainedRT.retired))
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, m_gapDryRun.sourceLine, "EDM83_PREVIOUS_SESSION_BUSY"); return nullptr; }
+    if (block.has('P') && (block.val('P') == 69.0 || block.val('P') == 70.0 || block.val('P') == 71.0 || block.val('P') == 72.0 || block.val('P') == 73.0 || block.val('P') == 74.0 || block.val('P') == 75.0 || block.val('P') == 76.0 || block.val('P') == 77.0 || block.val('P') == 78.0 || block.val('P') == 79.0 || block.val('P') == 80.0 || block.val('P') == 81.0 || block.val('P') == 82.0 || block.val('P') == 83.0 || block.val('P') == 84.0))
+        return StartEDMCoordinatedRTSameThread(block);
+    if (block.has('P') && (block.val('P') == 67.0 || block.val('P') == 68.0))
+        return StartEDMCNCRetainedRTSameThread(block);
+    if (block.has('P') && (block.val('P') == 65.0 || block.val('P') == 66.0))
+        return StartEDMCNCRetainedSimulationSameThread(block);
+    if (block.has('P') && (block.val('P') == 63.0 || block.val('P') == 64.0))
+        return StartEDMMultiAxisSimulationSameThread(block);
     ServiceEDMGapServoRetirementSameThread();
+    if (m_edmPhysicalServoRT.retirePending)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, m_gapDryRun.sourceLine, "EDM69_RETIREMENT_PENDING"); return nullptr; }
+    if (block.has('P') && block.val('P') == 55.0) return StartEDMPhysicalServoRTSameThread(block);
+    if (block.has('P') && (block.val('P') == 53.0 || block.val('P') == 54.0))
+        return StartEDMPhysicalRecipeCaptureSameThread(block);
+    if (block.has('P') && (block.val('P') == 35.0 || block.val('P') == 36.0 || block.val('P') == 37.0 || block.val('P') == 38.0 || block.val('P') == 39.0 || block.val('P') == 40.0 || block.val('P') == 41.0 || block.val('P') == 42.0 || block.val('P') == 43.0 || block.val('P') == 44.0 || block.val('P') == 45.0 || block.val('P') == 46.0 || block.val('P') == 47.0 || block.val('P') == 48.0 || block.val('P') == 49.0 || block.val('P') == 50.0 || block.val('P') == 51.0 || block.val('P') == 52.0 || block.val('P') == 56.0 || block.val('P') == 57.0 || block.val('P') == 58.0 || block.val('P') == 59.0 || block.val('P') == 60.0 || block.val('P') == 61.0 || block.val('P') == 62.0))
+        return StartEDMGapDynamicSameThread(block);
     if (block.has('P') && (block.val('P') == 33.0 || block.val('P') == 34.0))
         return StartEDMGapServoRTSameThread(block);
 
@@ -1353,6 +1761,16 @@ WaitConditionFunc NCManager::StartGapDryRunSameThread(const NCBlock& block)
 
 void NCManager::PauseGapDryRunSameThread(const char* reason) noexcept
 {
+    CancelEDM94SameThread(reason);
+    if (m_gapDryRun.coordinatedRTTest) { EndEDMCoordinatedRTSameThread(false, reason); return; }
+    if (m_gapDryRun.cncRetainedRTTest) { EndEDMCNCRetainedRTSameThread(false, reason); return; }
+    if (m_gapDryRun.cncRetainedSimulationTest) { EndEDMCNCRetainedSimulationSameThread(false, reason); return; }
+    if (m_gapDryRun.multiAxisSimulationTest) { EndEDMMultiAxisSimulationSameThread(false, reason); return; }
+    if (m_gapDryRun.physicalServoRTTest) { EndEDMPhysicalServoRTSameThread(false, reason); return; }
+    // P53/P54 HOLD cancels only the NC wait; RESET and an explicit
+    // new command are required. No silent recapture or retained window credit.
+    if (m_gapDryRun.physicalRecipeCaptureTest)
+    { EndEDMPhysicalRecipeCaptureSameThread(false, reason); return; }
     if (m_gapDryRun.runtimeServoTest) { PauseEDMGapServoRTSameThread(reason); return; }
     if (m_gapDryRun.physicalZFixtureTest) { PauseEDMZFixtureSameThread(reason); return; }
     // A second HOLD supersedes the pending START, even while already paused.
@@ -1412,8 +1830,23 @@ void NCManager::PauseGapDryRunSameThread(const char* reason) noexcept
         static_cast<unsigned int>(m_gapDryRun.phase), reason);
 }
 
-void NCManager::CancelGapDryRunSameThread(const char* reason) noexcept
+void NCManager::CancelGapDryRunSameThread(const char* reason, bool preserveCompletedEDM94) noexcept
 {
+    // The caller's completed-session LOAD admission preserves only the old
+    // EDM94 zero latch. It does not suppress any other GAP cleanup.
+    if (!preserveCompletedEDM94) CancelEDM94SameThread(reason);
+    if (m_gapDryRun.coordinatedRTTest) { EndEDMCoordinatedRTSameThread(false, reason); return; }
+    if (m_edmCoordinatedRT.retirePending || (m_edmCoordinatedRT.submitted && !m_edmCoordinatedRT.retired))
+        EndEDMCoordinatedRTSameThread(false, reason);
+    if (m_gapDryRun.cncRetainedRTTest) { EndEDMCNCRetainedRTSameThread(false, reason); return; }
+    if (m_edmCNCRetainedRT.retirePending || (m_edmCNCRetainedRT.submitted && !m_edmCNCRetainedRT.retired))
+        EndEDMCNCRetainedRTSameThread(false, reason);
+    InvalidateEDMPhysicalSequencePlanSameThread();
+    if (m_gapDryRun.cncRetainedSimulationTest) { EndEDMCNCRetainedSimulationSameThread(false, reason); return; }
+    if (m_gapDryRun.multiAxisSimulationTest) { EndEDMMultiAxisSimulationSameThread(false, reason); return; }
+    if (m_gapDryRun.physicalServoRTTest) { EndEDMPhysicalServoRTSameThread(false, reason); return; }
+    if (m_gapDryRun.physicalRecipeCaptureTest)
+    { EndEDMPhysicalRecipeCaptureSameThread(false, reason); return; }
     if (m_gapDryRun.runtimeServoTest) { EndEDMGapServoRTSameThread(false, reason); return; }
     if (m_gapDryRun.physicalZFixtureTest)
     {
@@ -1495,13 +1928,26 @@ void NCManager::CancelGapDryRunSameThread(const char* reason) noexcept
 
 void NCManager::ValidateGapDryRunSameThread()
 {
+    ServiceEDMCoordinatedRTRetirementSameThread();
+    if (m_gapDryRun.coordinatedRTTest) { ValidateEDMCoordinatedRTSameThread(); return; }
+    // Deliberately independent of the flag RESET may have already cleared.
+    ServiceEDMCNCRetainedRTRetirementSameThread();
+    if (m_gapDryRun.cncRetainedRTTest) { ValidateEDMCNCRetainedRTSameThread(); return; }
+    if (m_gapDryRun.cncRetainedSimulationTest) { ValidateEDMCNCRetainedSimulationSameThread(); return; }
+    if (m_gapDryRun.multiAxisSimulationTest) { ValidateEDMMultiAxisSimulationSameThread(); return; }
+    ServiceEDMPhysicalServoRetirementSameThread();
+    if (m_gapDryRun.physicalServoRTTest) { ValidateEDMPhysicalServoRTSameThread(); return; }
     if (m_gapDryRun.runtimeServoTest) { ValidateEDMGapServoRTSameThread(); return; }
     ServiceEDMGapServoRetirementSameThread();
     // Read-only cancellation acknowledgement. This never submits or services
     // runtime work before the latest NC input/safety observation.
     ServiceEDMRTShadowCancelSameThread();
+    if (m_gapDryRun.physicalRecipeCaptureTest)
+    { ValidateEDMPhysicalRecipeCaptureSameThread(); return; }
     if (m_gapDryRun.physicalZFixtureTest)
     {
+        if (EDM28::IsGapDynamicProfile(m_edmZFixture.config.profile))
+        { ValidateEDMGapDynamicSameThread(); return; }
         if (m_edmZFixture.cleanupPending) ServiceEDMZFixtureCleanupSameThread();
         ServiceEDMZFixtureFailureAlarmSameThread();
         if (!m_gapDryRun.active) return;
@@ -1569,6 +2015,12 @@ bool NCManager::WaitForGapDryRunCallback(NCManager* nc)
 
 bool NCManager::ProcessGapDryRunSameThread()
 {
+    if (m_gapDryRun.coordinatedRTTest) return ProcessEDMCoordinatedRTSameThread();
+    if (m_gapDryRun.cncRetainedRTTest) return ProcessEDMCNCRetainedRTSameThread();
+    if (m_gapDryRun.cncRetainedSimulationTest) return ProcessEDMCNCRetainedSimulationSameThread();
+    if (m_gapDryRun.multiAxisSimulationTest) return ProcessEDMMultiAxisSimulationSameThread();
+    if (m_gapDryRun.physicalServoRTTest) return ProcessEDMPhysicalServoRTSameThread();
+    if (m_gapDryRun.physicalRecipeCaptureTest) return ProcessEDMPhysicalRecipeCaptureSameThread();
     if (m_gapDryRun.runtimeServoTest) return ProcessEDMGapServoRTSameThread();
     if (m_gapDryRun.physicalZFixtureTest) return ProcessEDMZFixtureSameThread();
     const bool adcWasActive = (m_gapDryRun.adcShadowTest || m_gapDryRun.voltageTest || m_gapDryRun.recipeTest || m_gapDryRun.shortFlushTest || m_gapDryRun.automaticFlushTest || m_gapDryRun.liveAutomaticFlushTest || m_gapDryRun.processCoordinatorTest || m_gapDryRun.liveProcessTest || m_gapDryRun.motionBridgeTest) && m_gapDryRun.active;
@@ -1937,6 +2389,1812 @@ bool NCManager::ProcessGapDryRunSameThread()
     return true;
 }
 
+// EDM81 is a detached NC-owned simulation. Virtual 250 us steps are bounded
+// calculation batches at NC service cadence, never EtherCAT timing evidence.
+WaitConditionFunc NCManager::StartEDMMultiAxisSimulationSameThread(const NCBlock& block)
+{
+    const int line = m_gapDryRun.sourceLine;
+    if (m_gapDryRun.active || m_edmZFixture.cleanupPending || m_edmZFixture.resetPending ||
+        m_edmZFixture.failureAlarmPending || m_edmPhysicalServoRT.retirePending || m_edmGapServoRT.retirePending)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM81_PREVIOUS_SESSION_BUSY"); return nullptr; }
+    const unsigned profile = block.has('P') && block.val('P') == 64.0 ? 64U : 63U;
+    const int pc = GetActiveDispatchPC();
+    const NCProgramCacheLine* authored = pc >= 0 ? GetBaseProgramCache().TryGetLine(pc) : nullptr;
+    bool literal = authored && authored->sourceLineNumber == line &&
+        EDM77::Detail::Clean(authored->parsedBlock) && !authored->parsedBlock.isEmpty &&
+        authored->parsedBlock.gCount == 1 && authored->parsedBlock.mCount == 0 &&
+        EDM77::Detail::EqualLiteral(authored->parsedBlock.gExpressions[0], 180U) &&
+        EDM77::Detail::OnlyAddresses(authored->parsedBlock, "NP") &&
+        authored->parsedBlock.has('P') &&
+        EDM77::Detail::EqualLiteral(authored->parsedBlock.expression('P'), profile);
+    if (literal)
+    {
+        for (char letter = 'A'; letter <= 'Z'; ++letter)
+        {
+            if (block.has(letter) != authored->parsedBlock.has(letter)) { literal = false; break; }
+            if (!block.has(letter)) continue;
+            std::uint32_t value = 0U;
+            if (!EDM77::Detail::UnsignedLiteral(authored->parsedBlock.expression(letter),
+                (std::numeric_limits<std::uint32_t>::max)(), value) || block.val(letter) != static_cast<double>(value))
+            { literal = false; break; }
+        }
+    }
+    if (!IsGapDryRunBlockShapeValid(block) || block.isBlockSkip || !literal || !IsEDMZFixtureM30ContinuationSameThread())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM81_LITERAL_FIXTURE_M30_REQUIRED"); return nullptr; }
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    // Retain owner/epoch, quiescent queues and interlocks. The axis Arm proof
+    // is deliberately irrelevant: this fixture has no Motion/PDO consumer.
+    if ((mask & ~(1ULL << 9U)) || !m_edmProcessReady ||
+        m_currentExecutingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        m_motion.GetCurrentExecutionEpoch() == MOTION_EXECUTION_EPOCH_INVALID ||
+        !m_pathCoreLiveBookkeeping.currentRunToken || !GetBaseProgramCache().GetGeneration() ||
+        m_gapDryRunSerial == (std::numeric_limits<std::uint64_t>::max)())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM81_NOT_READY"); return nullptr; }
+    EDMRecipe::Summary summary{};
+    if (!ReadEDMRecipeSummarySameThread(summary))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM81_RECIPE_SCOPE"); return nullptr; }
+    const auto servo = EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    const auto flush = EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+    if (!servo.ready || !flush.ready || !EDM75::SameAdmission(flush.recipe, servo.recipe))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM81_RECIPE_BIND_REJECTED"); return nullptr; }
+    LARGE_INTEGER frequency{};
+    if (!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(frequency.QuadPart) > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM81_CLOCK_FREQUENCY"); return nullptr; }
+    // A cancelled earlier Q2 fixture cannot lend its retained mode to this
+    // detached diagnostic in a fresh run. All physical busy guards passed.
+    InvalidateEDMPhysicalSequencePlanSameThread();
+    m_edmGapDynamic.strictSequenceMode = false;
+    m_gapDryRun = GapDryRunState{};
+    m_gapDryRun.multiAxisSimulationTest = true;
+    m_gapDryRun.sourceLine = line;
+    m_gapDryRun.test = ++m_gapDryRunSerial;
+    m_gapDryRun.run = m_pathCoreLiveBookkeeping.currentRunToken;
+    m_gapDryRun.cache = GetBaseProgramCache().GetGeneration();
+    m_gapDryRun.dispatch = m_currentExecutingBlockDispatchId;
+    m_gapDryRun.epoch = m_motion.GetCurrentExecutionEpoch();
+    m_gapDryRun.lease = m_programMotionLease;
+    m_gapDryRun.frequency = static_cast<std::uint64_t>(frequency.QuadPart);
+    auto& control = m_edmMultiAxisSimulation;
+    control.profile = profile; control.sourcePC = pc;
+    control.servo = servo.recipe; control.flush = flush.recipe;
+    control.startedUs = control.lastClockUs = control.lastServiceUs = 0ULL;
+    control.stalledPolls = 0U;
+    control.minimumUs = profile == 64U ? 20000000ULL : 1000000ULL;
+    control.deadlineUs = profile == 64U ? 35000000ULL : 30000000ULL;
+    m_gapDryRun.active = true;
+    if (!control.suite.Start(control.servo.curve, control.servo.referenceV, control.servo.overridePercent))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM81_SUITE_START_REJECTED"); return nullptr; }
+    RtPrintf("[EDM81] event=BEGIN P=%u test=%llu run=%llu dispatch=%llu windowMs=%llu source=SIM clock=VIRTUAL_250US executor=NC_10MS output=NONE axes=XYZCUV hold=CANCEL_RESET_REQUIRED motion=0 physicalPermit=0 discharge=0\n",
+        profile, static_cast<unsigned long long>(m_gapDryRun.test),
+        static_cast<unsigned long long>(m_gapDryRun.run), static_cast<unsigned long long>(m_gapDryRun.dispatch),
+        static_cast<unsigned long long>(control.minimumUs / 1000ULL));
+    char recipeText[480]{};
+    const int recipeLength = std::snprintf(recipeText, sizeof(recipeText),
+        "[EDM81] event=RECIPE_FROZEN table=%u E=%u generation=%llu processRev=%u tuningGen=%llu E8=%.6f E9=%.6f curve=INSTALLED input=SYNTHETIC apply=SIMULATION_ONLY motion=0 physicalPermit=0 discharge=0\n",
+        control.servo.binding.tableId, static_cast<unsigned>(control.servo.binding.eCode),
+        static_cast<unsigned long long>(control.servo.binding.generation), control.servo.binding.processRevision,
+        static_cast<unsigned long long>(control.servo.binding.tuningGeneration),
+        control.servo.overridePercent, control.servo.referenceV);
+    if (recipeLength < 0 || static_cast<std::size_t>(recipeLength) >= sizeof(recipeText))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM81_RECIPE_LOG_FORMAT"); return nullptr; }
+    RtPrintf("%s", recipeText);
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM81_CLOCK_READ"); return nullptr; }
+    control.startedUs = control.lastClockUs = control.lastServiceUs = nowUs;
+    return WaitForGapDryRunCallback;
+}
+
+bool NCManager::IsEDMMultiAxisSimulationScopeCurrentSameThread() const noexcept
+{
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    return m_gapDryRun.multiAxisSimulationTest && !(mask & ~(1ULL << 9U)) &&
+        !m_edmPhysicalServoRT.retirePending && !m_edmGapServoRT.retirePending &&
+        m_gapDryRun.run != 0ULL && m_gapDryRun.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        m_gapDryRun.cache != 0ULL && m_gapDryRun.cache == GetBaseProgramCache().GetGeneration() &&
+        m_gapDryRun.dispatch != NC_BLOCK_DISPATCH_ID_INVALID && m_gapDryRun.dispatch == m_waitingBlockDispatchId &&
+        m_gapDryRun.epoch != MOTION_EXECUTION_EPOCH_INVALID &&
+        m_gapDryRun.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        m_gapDryRun.lease.Matches(m_programMotionLease) &&
+        m_motion.IsMotionOwnerLeaseCurrent(m_gapDryRun.lease);
+}
+
+bool NCManager::IsEDMMultiAxisSimulationRecipeCurrentSameThread() const noexcept
+{
+    if (!m_edmProcessReady || m_recipeRecoveryDisplayOnly || m_recipeIdleSelection || m_recipeHoldSeen ||
+        m_recipeRun != m_gapDryRun.run || m_recipeCache != m_gapDryRun.cache ||
+        m_recipeEpoch != m_gapDryRun.epoch || !m_recipeLease.Matches(m_gapDryRun.lease)) return false;
+    const auto servo = EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    const auto flush = EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+    return servo.ready && flush.ready && EDM75::SameAdmission(flush.recipe, servo.recipe) &&
+        EDM59::SameRecipe(servo.recipe, m_edmMultiAxisSimulation.servo) &&
+        EDM57::SameRecipe(flush.recipe, m_edmMultiAxisSimulation.flush);
+}
+
+void NCManager::EndEDMMultiAxisSimulationSameThread(bool failed, const char* reason) noexcept
+{
+    if (!m_gapDryRun.active && m_gapDryRun.result == 3U) return;
+    const bool report = m_gapDryRun.active || (failed && m_gapDryRun.result != 3U);
+    const auto prior = m_edmMultiAxisSimulation.suite.Report();
+    m_edmMultiAxisSimulation.suite.Cancel();
+    m_gapDryRun.active = m_gapDryRun.paused = false;
+    m_gapDryRun.result = failed ? 3U : 2U;
+    if (report)
+        RtPrintf("[EDM81] event=SUMMARY result=%s reason=%.64s P=%u test=%llu cases=%u checks=%u virtualTicks=%u resetRequired=1 source=SIM output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            failed ? "FAIL" : "CANCELLED", reason ? reason : "UNKNOWN", m_edmMultiAxisSimulation.profile,
+            static_cast<unsigned long long>(m_gapDryRun.test), prior.casesPassed, prior.checks, prior.virtualTicks);
+}
+
+void NCManager::ValidateEDMMultiAxisSimulationSameThread()
+{
+    if (!m_gapDryRun.active) return;
+    if (m_state == NCState::HOLD || m_edmState == EDMState::HOLD)
+    { EndEDMMultiAxisSimulationSameThread(false, "HOLD_RESET_REQUIRED"); return; }
+    if (!IsEDMMultiAxisSimulationScopeCurrentSameThread())
+    { EndEDMMultiAxisSimulationSameThread(false, "NC_SCOPE_REVOKED"); return; }
+    if (!IsEDMMultiAxisSimulationRecipeCurrentSameThread())
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM81_LIVE_RECIPE_CHANGED"); return; }
+    auto& control = m_edmMultiAxisSimulation;
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs) || nowUs < control.lastClockUs || nowUs < control.startedUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM81_CLOCK_INVALID"); return; }
+    // This is a permissive NC supervisor watchdog, not a 250 us RT claim.
+    if (nowUs - control.lastServiceUs > 1000000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM81_NC_SERVICE_GAP"); return; }
+    if (nowUs == control.lastClockUs) ++control.stalledPolls;
+    else { control.lastClockUs = nowUs; control.stalledPolls = 0U; }
+    if (control.stalledPolls >= 10000U || nowUs - control.startedUs >= control.deadlineUs)
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine,
+            control.stalledPolls >= 10000U ? "EDM81_CLOCK_STALLED" : "EDM81_WINDOW_TIMEOUT");
+}
+
+bool NCManager::ProcessEDMMultiAxisSimulationSameThread()
+{
+    ValidateEDMMultiAxisSimulationSameThread();
+    if (!m_gapDryRun.active)
+    {
+        if (m_gapDryRun.result == 1U && m_edmMultiAxisSimulation.suite.Report().complete &&
+            m_edmMultiAxisSimulation.suite.Report().passed && IsEDMMultiAxisSimulationScopeCurrentSameThread() &&
+            IsEDMMultiAxisSimulationRecipeCurrentSameThread()) return true;
+        if ((m_gapDryRun.result == 1U || m_gapDryRun.result == 2U) && m_state == NCState::RUN &&
+            !AlarmManager::GetInstance().HasAlarm() && m_resetContinuationPhase == ResetContinuationPhase::IDLE)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM81_CANCELLED_CALLBACK_RESET_REQUIRED");
+        return false;
+    }
+    auto& control = m_edmMultiAxisSimulation;
+    // The suite advances a fixed maximum of 128 virtual steps per callback.
+    // Never catch up against wall time and never touch an axis command path.
+    const auto& report = control.suite.Advance();
+    if (report.complete && !report.passed)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine,
+        report.failedCase ? report.failedCase : "EDM81_SUITE_FAILED"); return false; }
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs) || nowUs < control.lastClockUs || nowUs < control.startedUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM81_CLOCK_INVALID"); return false; }
+    control.lastClockUs = control.lastServiceUs = nowUs;
+    if (!report.complete || nowUs - control.startedUs < control.minimumUs) return false;
+    if (nowUs - control.startedUs >= control.deadlineUs || !IsEDMMultiAxisSimulationScopeCurrentSameThread() ||
+        !IsEDMMultiAxisSimulationRecipeCurrentSameThread())
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM81_FINAL_SCOPE_REVOKED"); return false; }
+    m_gapDryRun.active = false; m_gapDryRun.result = 1U;
+    RtPrintf("[EDM81] event=SUMMARY result=PASS P=%u test=%llu cases=%u checks=%u virtualTicks=%u observedMs=%llu source=SIM clock=VIRTUAL_250US executor=NC_10MS output=NONE rtxTimingVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+        control.profile, static_cast<unsigned long long>(m_gapDryRun.test), report.casesPassed, report.checks,
+        report.virtualTicks, static_cast<unsigned long long>((nowUs - control.startedUs) / 1000ULL));
+    return true;
+}
+
+// EDM82 is a detached NC-owned simulation. Virtual 250 us steps are bounded
+// calculation batches at NC service cadence, never EtherCAT timing evidence.
+WaitConditionFunc NCManager::StartEDMCNCRetainedSimulationSameThread(const NCBlock& block)
+{
+    const int line = m_gapDryRun.sourceLine;
+    if (m_gapDryRun.active || m_edmZFixture.cleanupPending || m_edmZFixture.resetPending ||
+        m_edmZFixture.failureAlarmPending || m_edmPhysicalServoRT.retirePending || m_edmGapServoRT.retirePending)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM82_PREVIOUS_SESSION_BUSY"); return nullptr; }
+    const unsigned profile = block.has('P') && block.val('P') == 66.0 ? 66U : 65U;
+    const int pc = GetActiveDispatchPC();
+    const NCProgramCacheLine* authored = pc >= 0 ? GetBaseProgramCache().TryGetLine(pc) : nullptr;
+    bool literal = authored && authored->sourceLineNumber == line &&
+        EDM77::Detail::Clean(authored->parsedBlock) && !authored->parsedBlock.isEmpty &&
+        authored->parsedBlock.gCount == 1 && authored->parsedBlock.mCount == 0 &&
+        EDM77::Detail::EqualLiteral(authored->parsedBlock.gExpressions[0], 180U) &&
+        EDM77::Detail::OnlyAddresses(authored->parsedBlock, "NP") &&
+        authored->parsedBlock.has('P') &&
+        EDM77::Detail::EqualLiteral(authored->parsedBlock.expression('P'), profile);
+    if (literal)
+    {
+        for (char letter = 'A'; letter <= 'Z'; ++letter)
+        {
+            if (block.has(letter) != authored->parsedBlock.has(letter)) { literal = false; break; }
+            if (!block.has(letter)) continue;
+            std::uint32_t value = 0U;
+            if (!EDM77::Detail::UnsignedLiteral(authored->parsedBlock.expression(letter),
+                (std::numeric_limits<std::uint32_t>::max)(), value) || block.val(letter) != static_cast<double>(value))
+            { literal = false; break; }
+        }
+    }
+    if (!IsGapDryRunBlockShapeValid(block) || block.isBlockSkip || !literal || !IsEDMZFixtureM30ContinuationSameThread())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM82_LITERAL_FIXTURE_M30_REQUIRED"); return nullptr; }
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    // Retain owner/epoch, quiescent queues and interlocks. The axis Arm proof
+    // is deliberately irrelevant: this fixture has no Motion/PDO consumer.
+    if ((mask & ~(1ULL << 9U)) || !m_edmProcessReady ||
+        m_currentExecutingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        m_motion.GetCurrentExecutionEpoch() == MOTION_EXECUTION_EPOCH_INVALID ||
+        !m_pathCoreLiveBookkeeping.currentRunToken || !GetBaseProgramCache().GetGeneration() ||
+        m_gapDryRunSerial == (std::numeric_limits<std::uint64_t>::max)())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM82_NOT_READY"); return nullptr; }
+    EDMRecipe::Summary summary{};
+    if (!ReadEDMRecipeSummarySameThread(summary))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM82_RECIPE_SCOPE"); return nullptr; }
+    const auto servo = EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    const auto flush = EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+    if (!servo.ready || !flush.ready || !EDM75::SameAdmission(flush.recipe, servo.recipe))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM82_RECIPE_BIND_REJECTED"); return nullptr; }
+    LARGE_INTEGER frequency{};
+    if (!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(frequency.QuadPart) > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM82_CLOCK_FREQUENCY"); return nullptr; }
+    // A cancelled earlier Q2 fixture cannot lend its retained mode to this
+    // detached diagnostic in a fresh run. All physical busy guards passed.
+    InvalidateEDMPhysicalSequencePlanSameThread();
+    m_edmGapDynamic.strictSequenceMode = false;
+    m_gapDryRun = GapDryRunState{};
+    m_gapDryRun.cncRetainedSimulationTest = true;
+    m_gapDryRun.sourceLine = line;
+    m_gapDryRun.test = ++m_gapDryRunSerial;
+    m_gapDryRun.run = m_pathCoreLiveBookkeeping.currentRunToken;
+    m_gapDryRun.cache = GetBaseProgramCache().GetGeneration();
+    m_gapDryRun.dispatch = m_currentExecutingBlockDispatchId;
+    m_gapDryRun.epoch = m_motion.GetCurrentExecutionEpoch();
+    m_gapDryRun.lease = m_programMotionLease;
+    m_gapDryRun.frequency = static_cast<std::uint64_t>(frequency.QuadPart);
+    auto& control = m_edmCNCRetainedSimulation;
+    control.profile = profile; control.sourcePC = pc;
+    control.servo = servo.recipe; control.flush = flush.recipe;
+    control.startedUs = control.lastClockUs = control.lastServiceUs = 0ULL;
+    control.stalledPolls = 0U; control.clockStarted = false;
+    control.minimumUs = profile == 66U ? 20000000ULL : 1000000ULL;
+    control.deadlineUs = profile == 66U ? 35000000ULL : 30000000ULL;
+    m_gapDryRun.active = true;
+    if (!control.suite.Start(control.servo.curve, control.servo.referenceV, control.servo.overridePercent))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM82_SUITE_START_REJECTED"); return nullptr; }
+    RtPrintf("[EDM82] event=BEGIN build=EDM82_FIX1_20261011 P=%u test=%llu run=%llu dispatch=%llu windowMs=%llu source=SIM clock=VIRTUAL_250US executor=NC_10MS output=NONE axes=XYZCUV rotary=HELD geometry=CNC_RETAINED_LINEAR_ARC plan=DIAGNOSTIC_PRIVATE livePath=0 hold=CANCEL_RESET_REQUIRED motion=0 physicalPermit=0 discharge=0\n",
+        profile, static_cast<unsigned long long>(m_gapDryRun.test),
+        static_cast<unsigned long long>(m_gapDryRun.run), static_cast<unsigned long long>(m_gapDryRun.dispatch),
+        static_cast<unsigned long long>(control.minimumUs / 1000ULL));
+    char recipeText[480]{};
+    const int recipeLength = std::snprintf(recipeText, sizeof(recipeText),
+        "[EDM82] event=RECIPE_FROZEN table=%u E=%u generation=%llu processRev=%u tuningGen=%llu E8=%.6f E9=%.6f curve=INSTALLED input=SYNTHETIC apply=SIMULATION_ONLY motion=0 physicalPermit=0 discharge=0\n",
+        control.servo.binding.tableId, static_cast<unsigned>(control.servo.binding.eCode),
+        static_cast<unsigned long long>(control.servo.binding.generation), control.servo.binding.processRevision,
+        static_cast<unsigned long long>(control.servo.binding.tuningGeneration),
+        control.servo.overridePercent, control.servo.referenceV);
+    if (recipeLength < 0 || static_cast<std::size_t>(recipeLength) >= sizeof(recipeText))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM82_RECIPE_LOG_FORMAT"); return nullptr; }
+    RtPrintf("%s", recipeText);
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM82_CLOCK_READ"); return nullptr; }
+    control.startedUs = control.lastClockUs = control.lastServiceUs = nowUs;
+    control.clockStarted = true;
+    return WaitForGapDryRunCallback;
+}
+
+bool NCManager::IsEDMCNCRetainedSimulationScopeCurrentSameThread() const noexcept
+{
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    return m_gapDryRun.cncRetainedSimulationTest && !(mask & ~(1ULL << 9U)) &&
+        !m_edmPhysicalServoRT.retirePending && !m_edmGapServoRT.retirePending &&
+        m_gapDryRun.run != 0ULL && m_gapDryRun.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        m_gapDryRun.cache != 0ULL && m_gapDryRun.cache == GetBaseProgramCache().GetGeneration() &&
+        m_gapDryRun.dispatch != NC_BLOCK_DISPATCH_ID_INVALID && m_gapDryRun.dispatch == m_waitingBlockDispatchId &&
+        m_gapDryRun.epoch != MOTION_EXECUTION_EPOCH_INVALID &&
+        m_gapDryRun.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        m_gapDryRun.lease.Matches(m_programMotionLease) &&
+        m_motion.IsMotionOwnerLeaseCurrent(m_gapDryRun.lease);
+}
+
+bool NCManager::IsEDMCNCRetainedSimulationRecipeCurrentSameThread() const noexcept
+{
+    if (!m_edmProcessReady || m_recipeRecoveryDisplayOnly || m_recipeIdleSelection || m_recipeHoldSeen ||
+        m_recipeRun != m_gapDryRun.run || m_recipeCache != m_gapDryRun.cache ||
+        m_recipeEpoch != m_gapDryRun.epoch || !m_recipeLease.Matches(m_gapDryRun.lease)) return false;
+    const auto servo = EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    const auto flush = EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+    return servo.ready && flush.ready && EDM75::SameAdmission(flush.recipe, servo.recipe) &&
+        EDM59::SameRecipe(servo.recipe, m_edmCNCRetainedSimulation.servo) &&
+        EDM57::SameRecipe(flush.recipe, m_edmCNCRetainedSimulation.flush);
+}
+
+void NCManager::EndEDMCNCRetainedSimulationSameThread(bool failed, const char* reason) noexcept
+{
+    if (!m_gapDryRun.active && m_gapDryRun.result == 3U) return;
+    const bool report = m_gapDryRun.active || (failed && m_gapDryRun.result != 3U);
+    const auto& control = m_edmCNCRetainedSimulation;
+    std::uint64_t cancelledUs = 0ULL;
+    const bool clockValid = control.clockStarted && ReadEDMGapServoClockSameThread(cancelledUs) &&
+        cancelledUs >= control.startedUs && cancelledUs >= control.lastClockUs;
+    const std::uint64_t observedMs = clockValid ? (cancelledUs - control.startedUs) / 1000ULL : 0ULL;
+    const auto prior = m_edmCNCRetainedSimulation.suite.Report();
+    m_edmCNCRetainedSimulation.suite.Cancel();
+    m_gapDryRun.active = m_gapDryRun.paused = false;
+    m_gapDryRun.result = failed ? 3U : 2U;
+    if (report)
+        RtPrintf("[EDM82] event=SUMMARY result=%s reason=%.64s P=%u test=%llu cases=%u checks=%u virtualTicks=%u observedMs=%llu clockValid=%u resetRequired=1 source=SIM output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            failed ? "FAIL" : "CANCELLED", reason ? reason : "UNKNOWN", m_edmCNCRetainedSimulation.profile,
+            static_cast<unsigned long long>(m_gapDryRun.test), prior.casesPassed, prior.checks, prior.virtualTicks,
+            static_cast<unsigned long long>(observedMs), clockValid ? 1U : 0U);
+}
+
+void NCManager::ValidateEDMCNCRetainedSimulationSameThread()
+{
+    if (!m_gapDryRun.active) return;
+    if (m_state == NCState::HOLD || m_edmState == EDMState::HOLD)
+    { EndEDMCNCRetainedSimulationSameThread(false, "HOLD_RESET_REQUIRED"); return; }
+    if (!IsEDMCNCRetainedSimulationScopeCurrentSameThread())
+    { EndEDMCNCRetainedSimulationSameThread(false, "NC_SCOPE_REVOKED"); return; }
+    if (!IsEDMCNCRetainedSimulationRecipeCurrentSameThread())
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM82_LIVE_RECIPE_CHANGED"); return; }
+    auto& control = m_edmCNCRetainedSimulation;
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs) || nowUs < control.lastClockUs || nowUs < control.startedUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM82_CLOCK_INVALID"); return; }
+    // This is a permissive NC supervisor watchdog, not a 250 us RT claim.
+    if (nowUs - control.lastServiceUs > 1000000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM82_NC_SERVICE_GAP"); return; }
+    if (nowUs == control.lastClockUs) ++control.stalledPolls;
+    else { control.lastClockUs = nowUs; control.stalledPolls = 0U; }
+    if (control.stalledPolls >= 10000U || nowUs - control.startedUs >= control.deadlineUs)
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine,
+            control.stalledPolls >= 10000U ? "EDM82_CLOCK_STALLED" : "EDM82_WINDOW_TIMEOUT");
+}
+
+bool NCManager::ProcessEDMCNCRetainedSimulationSameThread()
+{
+    ValidateEDMCNCRetainedSimulationSameThread();
+    if (!m_gapDryRun.active)
+    {
+        if (m_gapDryRun.result == 1U && m_edmCNCRetainedSimulation.suite.Report().complete &&
+            m_edmCNCRetainedSimulation.suite.Report().passed && IsEDMCNCRetainedSimulationScopeCurrentSameThread() &&
+            IsEDMCNCRetainedSimulationRecipeCurrentSameThread()) return true;
+        if ((m_gapDryRun.result == 1U || m_gapDryRun.result == 2U) && m_state == NCState::RUN &&
+            !AlarmManager::GetInstance().HasAlarm() && m_resetContinuationPhase == ResetContinuationPhase::IDLE)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM82_CANCELLED_CALLBACK_RESET_REQUIRED");
+        return false;
+    }
+    auto& control = m_edmCNCRetainedSimulation;
+    // The suite advances a fixed maximum of 128 virtual steps per callback.
+    // Never catch up against wall time and never touch an axis command path.
+    const auto& report = control.suite.Advance();
+    if (report.complete && !report.passed)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine,
+        report.failedCase ? report.failedCase : "EDM82_SUITE_FAILED"); return false; }
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs) || nowUs < control.lastClockUs || nowUs < control.startedUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM82_CLOCK_INVALID"); return false; }
+    control.lastClockUs = control.lastServiceUs = nowUs;
+    if (!report.complete || nowUs - control.startedUs < control.minimumUs) return false;
+    if (nowUs - control.startedUs >= control.deadlineUs || !IsEDMCNCRetainedSimulationScopeCurrentSameThread() ||
+        !IsEDMCNCRetainedSimulationRecipeCurrentSameThread())
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM82_FINAL_SCOPE_REVOKED"); return false; }
+    m_gapDryRun.active = false; m_gapDryRun.result = 1U;
+    RtPrintf("[EDM82] event=SUMMARY result=PASS P=%u test=%llu cases=%u checks=%u virtualTicks=%u observedMs=%llu source=SIM clock=VIRTUAL_250US executor=NC_10MS output=NONE rtxTimingVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+        control.profile, static_cast<unsigned long long>(m_gapDryRun.test), report.casesPassed, report.checks,
+        report.virtualTicks, static_cast<unsigned long long>((nowUs - control.startedUs) / 1000ULL));
+    return true;
+}
+
+// EDM83 supervises an explicit private retained-path calculator in Motion's RT
+// callback. None of these methods publishes an axis target or discharge permit.
+WaitConditionFunc NCManager::StartEDMCNCRetainedRTSameThread(const NCBlock& block)
+{
+    const int line = m_gapDryRun.sourceLine;
+    ServiceEDMCNCRetainedRTRetirementSameThread();
+    ServiceEDMGapServoRetirementSameThread();
+    ServiceEDMPhysicalServoRetirementSameThread();
+    if (m_gapDryRun.active || m_edmCNCRetainedRT.retirePending ||
+        (m_edmCNCRetainedRT.submitted && !m_edmCNCRetainedRT.retired) ||
+        m_edmZFixture.cleanupPending || m_edmZFixture.resetPending || m_edmZFixture.failureAlarmPending ||
+        m_edmPhysicalServoRT.retirePending || m_edmGapServoRT.retirePending)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM83_PREVIOUS_SESSION_BUSY"); return nullptr; }
+    const unsigned profile = block.has('P') && block.val('P') == 68.0 ? 68U : 67U;
+    const int pc = GetActiveDispatchPC();
+    const NCProgramCacheLine* authored = pc >= 0 ? GetBaseProgramCache().TryGetLine(pc) : nullptr;
+    bool literal = authored && authored->sourceLineNumber == line &&
+        EDM77::Detail::Clean(authored->parsedBlock) && !authored->parsedBlock.isEmpty &&
+        authored->parsedBlock.gCount == 1 && authored->parsedBlock.mCount == 0 &&
+        EDM77::Detail::EqualLiteral(authored->parsedBlock.gExpressions[0], 180U) &&
+        EDM77::Detail::OnlyAddresses(authored->parsedBlock, "NP") && authored->parsedBlock.has('P') &&
+        EDM77::Detail::EqualLiteral(authored->parsedBlock.expression('P'), profile);
+    if (literal)
+    {
+        for (char letter = 'A'; letter <= 'Z'; ++letter)
+        {
+            if (block.has(letter) != authored->parsedBlock.has(letter)) { literal = false; break; }
+            if (!block.has(letter)) continue;
+            std::uint32_t value = 0U;
+            if (!EDM77::Detail::UnsignedLiteral(authored->parsedBlock.expression(letter),
+                (std::numeric_limits<std::uint32_t>::max)(), value) || block.val(letter) != static_cast<double>(value))
+            { literal = false; break; }
+        }
+    }
+    if (!IsGapDryRunBlockShapeValid(block) || block.isBlockSkip || !literal || !IsEDMZFixtureM30ContinuationSameThread())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM83_LITERAL_FIXTURE_M30_REQUIRED"); return nullptr; }
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    if ((mask & ~(1ULL << 9U)) || !m_edmProcessReady ||
+        m_currentExecutingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        m_motion.GetCurrentExecutionEpoch() == MOTION_EXECUTION_EPOCH_INVALID ||
+        !m_pathCoreLiveBookkeeping.currentRunToken || !GetBaseProgramCache().GetGeneration())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM83_NOT_READY"); return nullptr; }
+    EDMRecipe::Summary summary{};
+    if (!ReadEDMRecipeSummarySameThread(summary))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM83_RECIPE_SCOPE"); return nullptr; }
+    const auto servo = EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    const auto flush = EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+    if (!servo.ready || !flush.ready || !EDM75::SameAdmission(flush.recipe, servo.recipe))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM83_RECIPE_BIND_REJECTED"); return nullptr; }
+    LARGE_INTEGER frequency{};
+    if (!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(frequency.QuadPart) > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM83_CLOCK_FREQUENCY"); return nullptr; }
+    const auto latest = m_motion.ReadEDMCNCRetainedRTLatestSession();
+    const auto serial = latest > m_gapDryRunSerial ? latest : m_gapDryRunSerial;
+    if (serial == (std::numeric_limits<std::uint64_t>::max)())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM83_SESSION_OVERFLOW"); return nullptr; }
+    m_edmCNCRetainedRT = EDMCNCRetainedRTControlState{};
+    auto& control = m_edmCNCRetainedRT;
+    control.servo = servo.recipe; control.flush = flush.recipe;
+    auto& request = control.request;
+    request.session = serial + 1ULL;
+    request.profile = profile == 68U ? EDM83RT::Profile::OperatorWindow : EDM83RT::Profile::Normal;
+    request.qpcFrequency = static_cast<std::uint64_t>(frequency.QuadPart);
+    request.scope.run = m_pathCoreLiveBookkeeping.currentRunToken;
+    request.scope.cache = GetBaseProgramCache().GetGeneration();
+    request.scope.dispatch = m_currentExecutingBlockDispatchId;
+    request.scope.executionEpoch = m_motion.GetCurrentExecutionEpoch();
+    request.scope.ownerLease = (static_cast<std::uint64_t>(m_programMotionLease.owner) << 32U) |
+        static_cast<std::uint64_t>(m_programMotionLease.generation);
+    // Fixed private fixture geometry/frame/kinematics revision, not live TCP.
+    request.scope.configRevision = request.scope.frameRevision = request.scope.kinematicsRevision = 1ULL;
+    request.scope.recipeGeneration = servo.recipe.binding.generation;
+    request.scope.sourceGeneration = request.session;
+    if (!ReadEDMCNCRetainedRTClockSameThread(request.issuedUs))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM83_CLOCK_READ"); return nullptr; }
+    if (!EDM83RT::BuildFixtureRequest(request, servo.recipe.curve, servo.recipe.referenceV, servo.recipe.overridePercent))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM83_FIXTURE_BUILD"); return nullptr; }
+    InvalidateEDMPhysicalSequencePlanSameThread();
+    m_edmGapDynamic.strictSequenceMode = false;
+    m_gapDryRun = GapDryRunState{};
+    m_gapDryRun.cncRetainedRTTest = m_gapDryRun.active = true;
+    m_gapDryRun.sourceLine = line; m_gapDryRun.test = request.session;
+    m_gapDryRunSerial = request.session;
+    m_gapDryRun.run = request.scope.run; m_gapDryRun.cache = request.scope.cache;
+    m_gapDryRun.dispatch = request.scope.dispatch;
+    m_gapDryRun.epoch = m_motion.GetCurrentExecutionEpoch(); m_gapDryRun.lease = m_programMotionLease;
+    control.lastClockUs = control.lastServiceUs = control.lastFeedbackUs = request.issuedUs;
+    control.deadlineUs = profile == 68U ? 35000000ULL : 27000000ULL;
+    // Mark before submission: a failing transport may already have reserved
+    // the session. Cancellation and a later RT receipt are still mandatory.
+    control.submitted = true; control.retired = false;
+    if (!m_motion.StartEDMCNCRetainedRT(request))
+    {
+        // A request rejected before reservation has no RT-owned state to retire.
+        if (m_motion.ReadEDMCNCRetainedRTLatestSession() < request.session)
+        { control.submitted = false; control.retired = true; }
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM83_START_REJECTED"); return nullptr;
+    }
+    RtPrintf("[EDM83] event=BEGIN build=EDM83_20261011 P=%u session=%llu run=%llu dispatch=%llu source=SIM executor=RT_CALLBACK modelStepUs=250 output=NONE axes=XYZCUV rotary=HELD geometry=CNC_RETAINED_LINEAR_ARC plan=DIAGNOSTIC_PRIVATE livePath=0 hold=CANCEL_RESET_REQUIRED wcetVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+        profile, static_cast<unsigned long long>(request.session), static_cast<unsigned long long>(request.scope.run),
+        static_cast<unsigned long long>(request.scope.dispatch));
+    char text[480]{};
+    const int length = std::snprintf(text, sizeof(text),
+        "[EDM83] event=RECIPE_FROZEN table=%u E=%u generation=%llu processRev=%u tuningGen=%llu E8=%.6f E9=%.6f curve=INSTALLED input=SYNTHETIC output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        control.servo.binding.tableId, static_cast<unsigned>(control.servo.binding.eCode),
+        static_cast<unsigned long long>(control.servo.binding.generation), control.servo.binding.processRevision,
+        static_cast<unsigned long long>(control.servo.binding.tuningGeneration), control.servo.overridePercent, control.servo.referenceV);
+    if (length < 0 || static_cast<std::size_t>(length) >= sizeof(text))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM83_RECIPE_LOG_FORMAT"); return nullptr; }
+    RtPrintf("%s", text);
+    return WaitForGapDryRunCallback;
+}
+
+bool NCManager::ReadEDMCNCRetainedRTClockSameThread(std::uint64_t& nowUs) noexcept
+{
+    auto& control = m_edmCNCRetainedRT;
+    const auto frequency = control.request.qpcFrequency;
+    LARGE_INTEGER counter{};
+    if (!frequency || frequency > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL ||
+        !RtQueryPerformanceCounter(&counter) || counter.QuadPart < 0) return false;
+    const auto ticks = static_cast<std::uint64_t>(counter.QuadPart);
+    if (ticks < control.lastTicks) return false;
+    const auto seconds = ticks / frequency;
+    if (seconds > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL) return false;
+    const auto fraction = (ticks % frequency) * 1000000ULL / frequency;
+    if (seconds * 1000000ULL > (std::numeric_limits<std::uint64_t>::max)() - fraction) return false;
+    nowUs = seconds * 1000000ULL + fraction;
+    control.lastTicks = ticks;
+    return true;
+}
+
+bool NCManager::IsEDMCNCRetainedRTScopeCurrentSameThread() const noexcept
+{
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    return m_gapDryRun.cncRetainedRTTest && !(mask & ~(1ULL << 9U)) &&
+        !m_edmPhysicalServoRT.retirePending && !m_edmGapServoRT.retirePending &&
+        m_gapDryRun.run != 0ULL && m_gapDryRun.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        m_gapDryRun.cache != 0ULL && m_gapDryRun.cache == GetBaseProgramCache().GetGeneration() &&
+        m_gapDryRun.dispatch != NC_BLOCK_DISPATCH_ID_INVALID && m_gapDryRun.dispatch == m_waitingBlockDispatchId &&
+        m_gapDryRun.epoch != MOTION_EXECUTION_EPOCH_INVALID && m_gapDryRun.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        m_gapDryRun.lease.Matches(m_programMotionLease) && m_motion.IsMotionOwnerLeaseCurrent(m_gapDryRun.lease);
+}
+
+bool NCManager::IsEDMCNCRetainedRTRecipeCurrentSameThread() const noexcept
+{
+    if (!m_edmProcessReady || m_recipeRecoveryDisplayOnly || m_recipeIdleSelection || m_recipeHoldSeen ||
+        m_recipeRun != m_gapDryRun.run || m_recipeCache != m_gapDryRun.cache ||
+        m_recipeEpoch != m_gapDryRun.epoch || !m_recipeLease.Matches(m_gapDryRun.lease)) return false;
+    const auto servo = EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    const auto flush = EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+    return servo.ready && flush.ready && EDM75::SameAdmission(flush.recipe, servo.recipe) &&
+        EDM59::SameRecipe(servo.recipe, m_edmCNCRetainedRT.servo) && EDM57::SameRecipe(flush.recipe, m_edmCNCRetainedRT.flush);
+}
+
+void NCManager::LogEDMCNCRetainedRTSameThread(const char* event, const char* reason) noexcept
+{
+    const auto& c = m_edmCNCRetainedRT;
+    const auto& f = c.feedback;
+    const char* result = std::strcmp(event ? event : "", "SUMMARY") == 0 ? "PASS" :
+        std::strcmp(event ? event : "", "FAIL") == 0 ? "FAIL" :
+        std::strcmp(event ? event : "", "CANCEL") == 0 ? "CANCELLED" : "PENDING";
+    RtPrintf("[EDM83] event=%.24s result=%s reason=%.64s P=%u session=%llu state=%s rtReason=%s kernelReason=%u stage=%u pub=%llu rtTick=%llu terminalTick=%llu quiescentTick=%llu quiescent=%u output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        event ? event : "UNKNOWN", result, reason ? reason : "NONE", static_cast<unsigned>(c.request.profile),
+        static_cast<unsigned long long>(c.request.session), EDM83RT::StateName(f.state), EDM83RT::ReasonName(f.reason),
+        static_cast<unsigned>(f.kernelReason), static_cast<unsigned>(f.stage), static_cast<unsigned long long>(f.publication), static_cast<unsigned long long>(f.rtTick),
+        static_cast<unsigned long long>(f.terminalTick), static_cast<unsigned long long>(f.quiescentTick), f.quiescent ? 1U : 0U);
+}
+
+void NCManager::EndEDMCNCRetainedRTSameThread(bool failed, const char* reason) noexcept
+{
+    auto& c = m_edmCNCRetainedRT;
+    const bool report = m_gapDryRun.cncRetainedRTTest &&
+        (m_gapDryRun.active || m_gapDryRun.result == 1U || (failed && m_gapDryRun.result == 2U));
+    if (c.submitted && !c.retired)
+    {
+        // Publish the exact-session cancellation before any console work.
+        m_motion.CancelEDMCNCRetainedRT(c.request.session);
+        if (!c.retirePending)
+        {
+            c.cancelPublication = c.feedback.publication; c.cancelTick = c.feedback.rtTick;
+            c.cancelUs = c.lastClockUs; c.retirePending = true;
+        }
+    }
+    c.completionPending = false;
+    if (m_gapDryRun.cncRetainedRTTest)
+    {
+        m_gapDryRun.active = m_gapDryRun.paused = false;
+        if (report) m_gapDryRun.result = failed ? 3U : 2U;
+    }
+    if (report) LogEDMCNCRetainedRTSameThread(failed ? "FAIL" : "CANCEL", reason);
+}
+
+void NCManager::ServiceEDMCNCRetainedRTRetirementSameThread() noexcept
+{
+    auto& c = m_edmCNCRetainedRT;
+    if (!c.retirePending) return;
+    EDM83RT::Feedback receipt{};
+    if (m_motion.ReadEDMCNCRetainedRT(receipt) && receipt.session == c.request.session &&
+        receipt.latestSession == c.request.session && receipt.profile == c.request.profile &&
+        EDM81::SameScope(receipt.scope, c.request.scope) && receipt.cancelThroughSession >= c.request.session &&
+        receipt.publication > c.cancelPublication && receipt.rtTick > c.cancelTick &&
+        receipt.state == EDM83RT::State::Cancelled && receipt.quiescent &&
+        receipt.terminalTick > c.cancelTick && receipt.quiescentTick > receipt.terminalTick &&
+        receipt.rtTick >= receipt.quiescentTick)
+    {
+        c.feedback = receipt; c.retired = true; c.retirePending = false;
+        LogEDMCNCRetainedRTSameThread("RETIRED", "EXACT_SESSION_RT_QUIESCENT");
+        return;
+    }
+    std::uint64_t nowUs = 0ULL;
+    if (!c.retirementWarning && ReadEDMCNCRetainedRTClockSameThread(nowUs) &&
+        nowUs >= c.cancelUs && nowUs - c.cancelUs >= 2000000ULL)
+    {
+        c.retirementWarning = true;
+        LogEDMCNCRetainedRTSameThread("RETIRE_WAIT", "NO_VALID_RT_QUIESCENT_ACK_START_BLOCKED");
+    }
+}
+
+void NCManager::ValidateEDMCNCRetainedRTSameThread()
+{
+    auto& c = m_edmCNCRetainedRT;
+    if (!m_gapDryRun.active) return;
+    if (m_state == NCState::HOLD || m_edmState == EDMState::HOLD)
+    { EndEDMCNCRetainedRTSameThread(false, "HOLD_RESET_REQUIRED"); return; }
+    if (!IsEDMCNCRetainedRTScopeCurrentSameThread())
+    { EndEDMCNCRetainedRTSameThread(false, "NC_SCOPE_REVOKED"); return; }
+    if (!IsEDMCNCRetainedRTRecipeCurrentSameThread())
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_LIVE_RECIPE_CHANGED"); return; }
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMCNCRetainedRTClockSameThread(nowUs) || nowUs < c.lastClockUs || nowUs < c.request.issuedUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_CLOCK_INVALID"); return; }
+    if (nowUs - c.lastServiceUs > 100000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_NC_SERVICE_GAP"); return; }
+    if (nowUs == c.lastClockUs) ++c.stalledPolls;
+    else { c.lastClockUs = nowUs; c.stalledPolls = 0U; }
+    if (c.stalledPolls >= 10000U || nowUs - c.request.issuedUs >= c.deadlineUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine,
+        c.stalledPolls >= 10000U ? "EDM83_CLOCK_STALLED" : "EDM83_WINDOW_TIMEOUT"); return; }
+    c.lastServiceUs = nowUs;
+    if (!c.completionPending && !m_motion.TouchEDMCNCRetainedRT(c.request.session, nowUs))
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_HEARTBEAT_REJECTED");
+}
+
+bool NCManager::ProcessEDMCNCRetainedRTSameThread()
+{
+    ServiceEDMCNCRetainedRTRetirementSameThread();
+    ValidateEDMCNCRetainedRTSameThread();
+    auto& c = m_edmCNCRetainedRT;
+    if (!m_gapDryRun.active)
+    {
+        if (m_gapDryRun.result == 1U && c.retired && IsEDMCNCRetainedRTScopeCurrentSameThread() &&
+            IsEDMCNCRetainedRTRecipeCurrentSameThread()) return true;
+        if ((m_gapDryRun.result == 1U || m_gapDryRun.result == 2U) && m_state == NCState::RUN &&
+            !AlarmManager::GetInstance().HasAlarm() && m_resetContinuationPhase == ResetContinuationPhase::IDLE)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_CANCELLED_CALLBACK_RESET_REQUIRED");
+        return false;
+    }
+    if (c.completionPending)
+    {
+        if (!c.retired) return false;
+        // Scope/recipe were rechecked above AFTER exact-session retirement.
+        m_gapDryRun.active = false; m_gapDryRun.result = 1U;
+        LogEDMCNCRetainedRTSameThread("SUMMARY", "PASS");
+        RtPrintf("[EDM83] event=TIMING result=PASS session=%llu callbackSteps=%llu modelUs=%llu observedUs=%llu minCallbackUs=%llu maxCallbackUs=%llu coverage=%llu clock=QPC modelStepUs=250 wcetVerified=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            static_cast<unsigned long long>(c.request.session), static_cast<unsigned long long>(c.completedSteps),
+            static_cast<unsigned long long>(c.completedModelUs), static_cast<unsigned long long>(c.lastClockUs - c.request.issuedUs),
+            static_cast<unsigned long long>(c.feedback.minimumStepUs), static_cast<unsigned long long>(c.feedback.maximumStepUs),
+            static_cast<unsigned long long>(c.completedCoverage));
+        return true;
+    }
+    EDM83RT::Feedback receipt{};
+    if (!m_motion.ReadEDMCNCRetainedRT(receipt) || !receipt.publication || !receipt.session)
+    {
+        if (c.lastClockUs - c.lastFeedbackUs >= 1000000ULL)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_RT_RECEIPT_TIMEOUT");
+        return false;
+    }
+    // A new asynchronous request can initially read the previous session's
+    // terminal bank. It grants no credit and is bounded by the start timeout.
+    if (!c.lastPublication && receipt.session < c.request.session)
+    {
+        if (c.lastClockUs - c.lastFeedbackUs >= 1000000ULL)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_RT_START_ACK_TIMEOUT");
+        return false;
+    }
+    if (receipt.session != c.request.session || receipt.latestSession != c.request.session ||
+        receipt.profile != c.request.profile || !EDM81::SameScope(receipt.scope, c.request.scope) ||
+        receipt.cancelThroughSession >= c.request.session || receipt.publication < c.lastPublication || receipt.rtTick < c.lastRTTick)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_RT_RECEIPT_SCOPE"); return false; }
+    // Read the NC clock AFTER copying the RT bank: normal RT preemption may
+    // publish a sample newer than Validate's earlier QPC reading.
+    std::uint64_t observedUs = 0ULL;
+    if (!ReadEDMCNCRetainedRTClockSameThread(observedUs) || observedUs < c.lastClockUs ||
+        observedUs - c.lastServiceUs > 100000ULL || observedUs - c.request.issuedUs >= c.deadlineUs ||
+        receipt.qpcFrequency != c.request.qpcFrequency || !receipt.nowUs ||
+        receipt.nowUs > observedUs || observedUs - receipt.nowUs > 100000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_RT_RECEIPT_CLOCK"); return false; }
+    c.lastClockUs = observedUs;
+    c.feedback = receipt;
+    if (receipt.publication > c.lastPublication && receipt.rtTick > c.lastRTTick)
+    { c.lastFeedbackUs = c.lastClockUs; c.lastPublication = receipt.publication; c.lastRTTick = receipt.rtTick; }
+    else if (c.lastClockUs - c.lastFeedbackUs >= 1000000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_RT_RECEIPT_STALLED"); return false; }
+    if (receipt.state == EDM83RT::State::Fault || receipt.state == EDM83RT::State::Cancelled)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, EDM83RT::ReasonName(receipt.reason)); return false; }
+    if (receipt.state != EDM83RT::State::Completed || !receipt.startAcknowledged || !receipt.quiescent ||
+        !receipt.terminalTick || receipt.quiescentTick <= receipt.terminalTick || receipt.rtTick < receipt.quiescentTick)
+        return false;
+    if (receipt.reason != EDM83RT::Reason::None || receipt.coverageMask != EDM83RT::RequiredCoverage ||
+        !receipt.runtimeSteps || receipt.modelUs < EDM83RT::DurationUs(c.request.profile))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_COMPLETION_EVIDENCE"); return false; }
+    if (!c.completedPublication)
+    {
+        c.completedPublication = receipt.publication; c.completedTick = receipt.rtTick;
+        c.completedTerminalTick = receipt.terminalTick; c.completedQuiescentTick = receipt.quiescentTick;
+        c.completedSteps = receipt.runtimeSteps;
+        c.completedModelUs = receipt.modelUs; c.completedCoverage = receipt.coverageMask;
+        LogEDMCNCRetainedRTSameThread("COMPLETE_OBSERVED", "WAIT_SECOND_PUBLICATION");
+        return false;
+    }
+    if (receipt.publication <= c.completedPublication || receipt.rtTick <= c.completedTick) return false;
+    if (receipt.terminalTick != c.completedTerminalTick || receipt.quiescentTick != c.completedQuiescentTick ||
+        receipt.runtimeSteps != c.completedSteps ||
+        receipt.modelUs != c.completedModelUs || receipt.coverageMask != c.completedCoverage ||
+        !IsEDMCNCRetainedRTScopeCurrentSameThread() || !IsEDMCNCRetainedRTRecipeCurrentSameThread())
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM83_TERMINAL_RECEIPT_CHANGED"); return false; }
+    // Even PASS retires the exact RT session. M30 cannot consume this wait
+    // until a later valid callback proves the cancelled calculator quiescent.
+    m_motion.CancelEDMCNCRetainedRT(c.request.session);
+    c.cancelPublication = receipt.publication; c.cancelTick = receipt.rtTick; c.cancelUs = c.lastClockUs;
+    c.retirePending = c.completionPending = true;
+    LogEDMCNCRetainedRTSameThread("RETIRE_REQUEST", "COMPLETED_TWO_PUBLICATIONS");
+    return false;
+}
+
+// EDM87 installation is a boot-only, single attempt. Failure disables only
+// explicit Q4 R selection; old Q4 and all other CNC/EDM routes remain usable.
+bool NCManager::InstallEDMToolHeadCatalogBeforeStart(const EDM87::Catalog& catalog) noexcept
+{
+    if (m_edmToolHeadCatalogAttempted) return false;
+    m_edmToolHeadCatalogAttempted = true;
+    if (m_state != NCState::IDLE || m_gapDryRun.active || m_gapDryRunSerial != 0ULL ||
+        m_pathCoreLiveBookkeeping.currentRunToken != 0ULL ||
+        m_edmCoordinatedRT.submitted || m_edmCoordinatedRT.retirePending ||
+        !EDM87::ValidCatalog(catalog)) return false;
+    m_edmToolHeadCatalog = catalog;
+    m_edmToolHeadCatalogReady = true;
+    return true;
+}
+
+// EDM84 requires every inspected source line to be clean BEFORE an empty
+// line can be skipped. A malformed empty comment or block skip is a rejection.
+bool NCManager::IsEDMCoordinatedRTM30ContinuationSameThread() const noexcept
+{
+    const int pc = GetActiveDispatchPC();
+    if (pc < 0 || pc > (std::numeric_limits<int>::max)() - 33) return false;
+    for (int offset = 1; offset <= 32; ++offset)
+    {
+        const NCProgramCacheLine* line = GetBaseProgramCache().TryGetLine(pc + offset);
+        if (!line || !EDM77::Detail::Clean(line->parsedBlock)) return false;
+        if (EDM77::Detail::Empty(line->parsedBlock)) continue;
+        return EDM77::Detail::Terminal(line->parsedBlock);
+    }
+    return false;
+}
+
+// EDM86: bounded NC-only records. Keep formatting frames outside admission
+// and completion; no console work is performed in the real-time callback.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static bool LogEDM86ToolHeadConfiguration(const EDM84RT::Request& request) noexcept
+{
+    if (request.scenario != EDM84RT::Scenario::ToolHeadCUVCompensation) return true;
+    const char* tag = EDM84RT::DiagnosticTag(request);
+    const auto& selection = request.toolHeadSelection;
+    if (!EDM87::IsEmptySelection(selection))
+        RtPrintf("[%s] event=PROFILE_FROZEN session=%llu id=%u profileRevision=%llu catalogRevision=%llu fingerprint=%llu source=BOOT_FILE calibration=REFERENCE_ONLY livePath=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            tag, static_cast<unsigned long long>(request.session), selection.profile.id,
+            static_cast<unsigned long long>(selection.profile.revision),
+            static_cast<unsigned long long>(selection.catalogRevision),
+            static_cast<unsigned long long>(selection.fingerprint));
+    const auto& mapping = request.config.mapping;
+    const auto& direction = request.config.direction.unit;
+    char record[640]{};
+    int count = std::snprintf(record, sizeof(record),
+        "[%s] event=KINEMATICS_CONFIG session=%llu model=SERIAL_HEAD_CUV calibration=REFERENCE_ONLY transform=PARENT_TRANSLATION_THEN_ROTATION theta=SIGN_TIMES_Q_PLUS_ZERO tipMm=%.9g,%.9g,%.9g localDirection=%.9g,%.9g,%.9g frameRev=%llu kinematicsRev=%llu livePath=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        tag, static_cast<unsigned long long>(request.session),
+        mapping.toolOffsetMm[0], mapping.toolOffsetMm[1], mapping.toolOffsetMm[2],
+        direction[0], direction[1], direction[2],
+        static_cast<unsigned long long>(request.config.direction.revision),
+        static_cast<unsigned long long>(mapping.revision));
+    if (count < 0 || static_cast<std::size_t>(count) >= sizeof(record)) return false;
+    RtPrintf("%s", record);
+    for (unsigned order = 0U; order < 3U; ++order)
+    {
+        const auto& joint = mapping.chain.joints[order];
+        if (joint.channel < 3U || joint.channel > 5U) return false;
+        const char channel = joint.channel == 3U ? 'C' : joint.channel == 4U ? 'U' : 'V';
+        count = std::snprintf(record, sizeof(record),
+            "[%s] event=KINEMATICS_JOINT session=%llu order=%u channel=%c axisParent=%.9g,%.9g,%.9g parentToPivotMm=%.9g,%.9g,%.9g sign=%d zeroDeg=%.9g output=NONE\n",
+            tag, static_cast<unsigned long long>(request.session), order + 1U, channel,
+            joint.axis[0], joint.axis[1], joint.axis[2],
+            joint.parentToPivotMm[0], joint.parentToPivotMm[1], joint.parentToPivotMm[2],
+            joint.sign, joint.zeroAngleDeg);
+        if (count < 0 || static_cast<std::size_t>(count) >= sizeof(record)) return false;
+        RtPrintf("%s", record);
+    }
+    return true;
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void LogEDM86ToolHeadCompletion(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback) noexcept
+{
+    if (request.scenario != EDM84RT::Scenario::ToolHeadCUVCompensation) return;
+    const char* tag = EDM84RT::DiagnosticTag(request);
+    if (!EDM87::IsEmptySelection(request.toolHeadSelection))
+        RtPrintf("[%s] event=PROFILE_EVIDENCE result=PASS session=%llu id=%u profileRevision=%llu catalogRevision=%llu fingerprint=%llu immutable=1 machineCalibrated=0 livePath=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            tag, static_cast<unsigned long long>(request.session), feedback.toolHeadProfileId,
+            static_cast<unsigned long long>(feedback.toolHeadProfileRevision),
+            static_cast<unsigned long long>(feedback.toolHeadCatalogRevision),
+            static_cast<unsigned long long>(feedback.toolHeadFingerprint));
+    const auto& resolved = feedback.resolvedDirectionUnit;
+    const auto& frozen = feedback.sample.frozenDirection;
+    char record[640]{};
+    const int count = std::snprintf(record, sizeof(record),
+        "[%s] event=KINEMATICS_EVIDENCE result=PASS session=%llu model=SERIAL_HEAD_CUV orientationSamples=%llu runtimeSteps=%llu resolvedDirection=%.12g,%.12g,%.12g lastFrozenDirection=%.12g,%.12g,%.12g maxOrientationNormError=%.12g maxFrozenDirectionError=%.12g machineCalibrated=0 livePath=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        tag, static_cast<unsigned long long>(request.session),
+        static_cast<unsigned long long>(feedback.orientationSamples),
+        static_cast<unsigned long long>(feedback.runtimeSteps),
+        resolved[0], resolved[1], resolved[2], frozen[0], frozen[1], frozen[2],
+        feedback.maxOrientationNormError, feedback.maxFrozenDirectionError);
+    if (count > 0 && static_cast<std::size_t>(count) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[%s] event=KINEMATICS_EVIDENCE result=LOG_FORMAT_ERROR output=NONE\n", tag);
+}
+
+// EDM89: source-time decisions are logged only by the NC owner. Holding a
+// conversion does not advance short-entry/exit evidence on the control clock.
+static void LogEDM89GapDecisionConfiguration(const EDM84RT::Request& request) noexcept
+{
+    if (!EDM84RT::IsSampled(request.profile)) return;
+    const auto c = EDM89::FrozenConfig(request.config.motion.servo);
+    char record[480]{};
+    const int count = std::snprintf(record, sizeof(record),
+        "[%s] event=GAP_DECISION_CONFIG session=%llu policy=SOURCE_CAPTURE_US held=REUSE_ONLY enabled=%u revision=%u thresholdV=%.12g hysteresisV=%.12g enterUs=%llu exitUs=%llu pulseProbe=%u physicalAD=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        EDM84RT::DiagnosticTag(request), static_cast<unsigned long long>(request.session),
+        c.enabled ? 1U : 0U, static_cast<unsigned>(c.revision), c.thresholdV, c.hysteresisV,
+        static_cast<unsigned long long>(c.enterUs), static_cast<unsigned long long>(c.exitUs),
+        EDM84RT::IsSourceDwell(request.profile) ? 1U : 0U);
+    if (count > 0 && static_cast<std::size_t>(count) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[%s] event=GAP_DECISION_CONFIG result=LOG_FORMAT_ERROR output=NONE\n",
+        EDM84RT::DiagnosticTag(request));
+}
+
+static void LogEDM89GapDwellEvidence(const EDM84RT::Request& request,
+    const char* result, const char* kind, const EDM89::Mark& start,
+    const EDM89::Mark& confirm, std::uint64_t requiredUs) noexcept
+{
+    const bool confirmed = confirm.sequence != 0ULL && start.sequence != 0ULL &&
+        confirm.capturedAtUs >= start.capturedAtUs;
+    const std::uint64_t elapsedUs = confirmed ? confirm.capturedAtUs - start.capturedAtUs : 0ULL;
+    RtPrintf("[%s] event=GAP_DWELL_EVIDENCE result=%s session=%llu kind=%s confirmed=%u startSeq=%llu confirmSeq=%llu startUs=%llu confirmUs=%llu requiredUs=%llu elapsedUs=%llu clock=SOURCE_CAPTURE_US physicalAD=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        EDM84RT::DiagnosticTag(request), result, static_cast<unsigned long long>(request.session), kind,
+        confirmed ? 1U : 0U, static_cast<unsigned long long>(start.sequence),
+        static_cast<unsigned long long>(confirm.sequence), static_cast<unsigned long long>(start.capturedAtUs),
+        static_cast<unsigned long long>(confirm.capturedAtUs), static_cast<unsigned long long>(requiredUs),
+        static_cast<unsigned long long>(elapsedUs));
+}
+
+static void LogEDM89GapDecisionEvidence(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback, const char* result) noexcept
+{
+    if (!EDM84RT::IsSampled(request.profile)) return;
+    const auto& e = feedback.sampledDecision;
+    RtPrintf("[%s] event=GAP_DECISION_EVIDENCE result=%s session=%llu reason=%s faulted=%u state=%s processed=%llu held=%llu rejected=%llu enterCount=%llu exitCount=%llu entryAborts=%llu exitRestarts=%llu inhibit=%u shortActive=%u physicalAD=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        EDM84RT::DiagnosticTag(request), result, static_cast<unsigned long long>(request.session),
+        EDM89::ReasonName(e.reason), e.faulted ? 1U : 0U, EDM89::StateName(e.state),
+        static_cast<unsigned long long>(e.processedFrames), static_cast<unsigned long long>(e.heldReads),
+        static_cast<unsigned long long>(e.rejectedFrames), static_cast<unsigned long long>(e.enterCount),
+        static_cast<unsigned long long>(e.exitCount), static_cast<unsigned long long>(e.entryAborts),
+        static_cast<unsigned long long>(e.exitRestarts), e.feedInhibited ? 1U : 0U, e.shortActive ? 1U : 0U);
+    LogEDM89GapDwellEvidence(request, result, "ENTER", e.enterStart, e.enterConfirm, e.config.enterUs);
+    LogEDM89GapDwellEvidence(request, result, "EXIT", e.exitStart, e.exitConfirm, e.config.exitUs);
+}
+
+// EDM88: all console evidence remains on the NC owner. Source acquisition
+// timestamps are synthetic-original timestamps, not the QPC callback clock.
+static void LogEDM88SampledSourceConfiguration(const EDM84RT::Request& request) noexcept
+{
+    if (!EDM84RT::IsSampled(request.profile)) return;
+    const auto& c = request.config.gapSource;
+    const auto& id = c.identity;
+    RtPrintf("[%s] event=GAP_SOURCE_CONFIG session=%llu source=SIMULATED_SAMPLE_HOLD samplePeriodUs=%llu maxAgeUs=%llu faultMode=%u producer=%llu device=%u channel=%u configRev=%llu calibrationRev=%llu physicalAD=0 sourceClock=MODEL_ACQUISITION controlStepUs=250 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        EDM84RT::DiagnosticTag(request), static_cast<unsigned long long>(request.session), static_cast<unsigned long long>(c.samplePeriodUs),
+        static_cast<unsigned long long>(c.maxAgeUs), static_cast<unsigned>(request.sampledFault),
+        static_cast<unsigned long long>(id.producerGeneration), static_cast<unsigned>(id.deviceId),
+        static_cast<unsigned>(id.channelId), static_cast<unsigned long long>(id.configRevision),
+        static_cast<unsigned long long>(id.calibrationRevision));
+    LogEDM89GapDecisionConfiguration(request);
+}
+
+static void LogEDM88SampledSourceEvidence(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback, const char* result) noexcept
+{
+    if (!EDM84RT::IsSampled(request.profile)) return;
+    const auto& evidence = feedback.sampledSource;
+    RtPrintf("[%s] event=GAP_SOURCE_EVIDENCE result=%s session=%llu faultMode=%u reason=%s faulted=%u controlSteps=%llu freshFrames=%llu heldFrames=%llu rejectedFrames=%llu maximumAgeUs=%llu lastSequence=%llu capturedAtUs=%llu physicalAD=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        EDM84RT::DiagnosticTag(request), result, static_cast<unsigned long long>(request.session), static_cast<unsigned>(feedback.sampledFault),
+        EDM88::ReasonName(evidence.reason), evidence.faulted ? 1U : 0U,
+        static_cast<unsigned long long>(feedback.runtimeSteps), static_cast<unsigned long long>(evidence.freshFrames),
+        static_cast<unsigned long long>(evidence.heldFrames), static_cast<unsigned long long>(evidence.rejectedFrames),
+        static_cast<unsigned long long>(evidence.maximumAgeUs), static_cast<unsigned long long>(evidence.lastFrame.sequence),
+        static_cast<unsigned long long>(evidence.lastFrame.capturedAtUs));
+    LogEDM89GapDecisionEvidence(request, feedback, result);
+}
+
+// EDM90 formats only NC-owned copies of the RT preview receipt. These records
+// describe candidate values; no formatter performs axis or PDO output.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void LogEDM90OutputPreviewConfiguration(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback) noexcept
+{
+    if (!EDM84RT::IsOutputPreview(request.profile)) return;
+    const auto& config = feedback.previewConfig;
+    const auto& machine = config.machine;
+    RtPrintf("[EDM90] event=OUTPUT_PREVIEW_CONFIG session=%llu captureTick=%llu captureUs=%llu mapGeneration=%llu axisCount=%u mode=LIVE_NATIVE_PULSE_PREVIEW anchor=CURRENT_COMMAND delta=COMPOSED_FROM_INITIAL periodUs=%llu compensation=UNSUPPORTED actualOutput=NONE motion=0 physicalPermit=0 discharge=0\n",
+        static_cast<unsigned long long>(config.session), static_cast<unsigned long long>(machine.tick),
+        static_cast<unsigned long long>(machine.nowUs), static_cast<unsigned long long>(machine.mapGeneration), machine.axisCount,
+        static_cast<unsigned long long>(config.periodUs));
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const auto& a = machine.axes[axis];
+        const char name = "XYZCUV"[axis];
+        char text[512]{};
+        const int length = std::snprintf(text, sizeof(text),
+            "[EDM90] event=OUTPUT_PREVIEW_AXIS session=%llu axis=%c id=%u units=%s pulsesPerUnit=%.12g anchorPulse=%.12g actualPulse=%.12g hardwareSign=%d referenceOffsetPulse=%.12g initialPose=%.12g velocityCapUnitsMin=%.12g travelCapUnits=%.12g output=NONE\n",
+            static_cast<unsigned long long>(request.session), name, a.axisId, axis < 3U ? "mm" : "deg",
+            a.pulsesPerUnit, a.anchorNativePulse, a.actualNativePulse, a.hardwareSign,
+            a.referenceOffsetPulse, config.initialPose[axis], a.maxVelocityUnitsPerMin, EDM90::MaximumTravelUnits(axis));
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM90] event=OUTPUT_PREVIEW_AXIS result=LOG_FORMAT_ERROR axis=%c output=NONE\n", name);
+        const int limitLength = std::snprintf(text, sizeof(text), "[EDM90] event=OUTPUT_PREVIEW_LIMIT session=%llu axis=%c minEnabled=%u minPulse=%.12g maxEnabled=%u maxPulse=%.12g configGeneration=%llu noCompensation=%u diagnosticVelocityCapUnitsSec=%.12g output=NONE\n",
+            static_cast<unsigned long long>(request.session), name, a.hasMinLimit ? 1U : 0U, a.minNativePulse,
+            a.hasMaxLimit ? 1U : 0U, a.maxNativePulse, static_cast<unsigned long long>(a.configGeneration),
+            a.noCompensation ? 1U : 0U, EDM90::MaximumVelocityUnitsPerSecond(axis));
+        if (limitLength > 0 && static_cast<std::size_t>(limitLength) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM90] event=OUTPUT_PREVIEW_LIMIT result=LOG_FORMAT_ERROR axis=%c output=NONE\n", name);
+    }
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void LogEDM90OutputPreviewEvidence(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback, const char* result) noexcept
+{
+    if (!EDM84RT::IsOutputPreview(request.profile)) return;
+    const auto& e = feedback.previewEvidence;
+    const char* kernelState = feedback.sample.state == EDM81::State::ShortRetreat ? "SHORT_RETREAT" :
+        feedback.sample.state == EDM81::State::JumpRetreat ? "JUMP_RETREAT" :
+        feedback.sample.state == EDM81::State::Returning ? "RETURNING" :
+        feedback.sample.state == EDM81::State::Running ? "RUNNING" : "TERMINAL";
+    char text[512]{};
+    const int length = std::snprintf(text, sizeof(text), "[EDM90] event=OUTPUT_PREVIEW_EVIDENCE result=%s session=%llu state=%u reason=%s machineRejectMask=%llu frames=%llu captureTick=%llu lastTick=%llu sequence=%llu axisMask=%u rejectedAxis=%u candidateValid=%u kernelState=%s offsetMm=%.12g actualOutput=NONE motion=0 physicalPermit=0 discharge=0 physicalStopProven=0\n",
+        result, static_cast<unsigned long long>(request.session), static_cast<unsigned>(e.state), EDM90::ReasonName(e.reason),
+        static_cast<unsigned long long>(feedback.previewMachineRejectMask),
+        static_cast<unsigned long long>(e.processedFrames), static_cast<unsigned long long>(e.captureTick),
+        static_cast<unsigned long long>(e.lastTick), static_cast<unsigned long long>(e.lastSequence), e.axisMovedMask,
+        e.rejectedAxis, e.candidateValid ? 1U : 0U, kernelState, feedback.sample.offsetMm);
+    if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+    else RtPrintf("[EDM90] event=OUTPUT_PREVIEW_EVIDENCE result=LOG_FORMAT_ERROR output=NONE\n");
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const int targetLength = std::snprintf(text, sizeof(text), "[EDM90] event=OUTPUT_PREVIEW_TARGET result=%s session=%llu axis=%c targetPulse=%.12g velocityPps=%.12g maxVelocityPps=%.12g maxAccelerationPps2=%.12g maxTravelUnits=%.12g accelerationValidated=0 actualOutput=NONE\n",
+            result, static_cast<unsigned long long>(request.session), "XYZCUV"[axis], e.nativeTarget[axis],
+            e.nativeVelocityPps[axis], e.maximumVelocityPps[axis], e.maximumAccelerationPps2[axis], e.maximumTravelUnits[axis]);
+        if (targetLength > 0 && static_cast<std::size_t>(targetLength) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM90] event=OUTPUT_PREVIEW_TARGET result=LOG_FORMAT_ERROR output=NONE\n");
+    }
+}
+
+// EDM91 formats frozen numerical trajectory receipts only on the NC thread.
+// Joint-coordinate filtering changes the path and is not calibrated TCP output.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void LogEDM91TrajectoryConfiguration(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback) noexcept
+{
+    if (!EDM84RT::IsTrajectoryPreview(request.profile)) return;
+    const auto& config = feedback.previewConfig;
+    RtPrintf("[EDM91] event=TRAJECTORY_CONFIG session=%llu filter=JOINT_POSITION_FIR clock=MODEL_250US taps=64 periodUs=%llu history=INITIAL_POSE delayUs=7875 maximumDrainUs=16000 maximumStopUs=8000 maximumStopTicks=32 stop=COMMON_VELOCITY_RAMP limitSpace=JOINT pathPreserved=0 tcpValidated=0 accelerationValidation=NUMERIC_ONLY jerkValidated=0 actualOutput=NONE physicalStop=0 discharge=0\n",
+        static_cast<unsigned long long>(request.session), static_cast<unsigned long long>(config.periodUs));
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        char text[448]{};
+        const int length = std::snprintf(text, sizeof(text),
+            "[EDM91] event=TRAJECTORY_AXIS_CONFIG session=%llu axis=%c units=%s inputVelocityCap=%.12g accelerationCap=%.12g stopReserveUnits=%.12g actualOutput=NONE physicalStop=0\n",
+            static_cast<unsigned long long>(request.session), "XYZCUV"[axis], axis < 3U ? "mm" : "deg",
+            EDM91::VelocityLimitUnitsPerSecond(config, axis), EDM91::AccelerationLimitUnitsPerSecond2(config, axis),
+            EDM91::VelocityLimitUnitsPerSecond(config, axis) * 0.004);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM91] event=TRAJECTORY_AXIS_CONFIG result=LOG_FORMAT_ERROR actualOutput=NONE\n");
+    }
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void LogEDM91TrajectoryEvidence(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback, const char* result) noexcept
+{
+    if (!EDM84RT::IsTrajectoryPreview(request.profile)) return;
+    const auto& e = feedback.trajectoryEvidence;
+    RtPrintf("[EDM91] event=TRAJECTORY_EVIDENCE result=%s phase=RT_ACKNOWLEDGED clock=MODEL_250US session=%llu state=%s reason=%s rawFrames=%llu shapeSteps=%llu tailSteps=%llu drainSteps=%llu stopSteps=%llu stopTicks=%llu lastTick=%llu candidateValid=%u numericalStopped=%u rejectedAxis=%u accelerationValidation=NUMERIC_ONLY actualOutput=NONE motion=0 physicalPermit=0 physicalStop=0 discharge=0\n",
+        result, static_cast<unsigned long long>(request.session), EDM91::StateName(e.state), EDM91::ReasonName(e.reason),
+        static_cast<unsigned long long>(e.rawFrames), static_cast<unsigned long long>(e.shapeSteps),
+        static_cast<unsigned long long>(e.tailSteps), static_cast<unsigned long long>(e.drainSteps),
+        static_cast<unsigned long long>(e.stopSteps), static_cast<unsigned long long>(e.stopTicks),
+        static_cast<unsigned long long>(e.lastTick), e.candidateValid ? 1U : 0U, e.numericalStopped ? 1U : 0U, e.rejectedAxis);
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        char text[608]{};
+        const int length = std::snprintf(text, sizeof(text),
+            "[EDM91] event=TRAJECTORY_AXIS result=%s session=%llu axis=%c rawPose=%.12g shapedPose=%.12g targetPulse=%.12g velocityUnitsSec=%.12g maxVelocityUnitsSec=%.12g maxAccelerationUnitsSec2=%.12g maxTravelUnits=%.12g maxTrackingErrorUnits=%.12g terminalPose=%.12g numericalStopped=%u actualOutput=NONE physicalStop=0\n",
+            result, static_cast<unsigned long long>(request.session), "XYZCUV"[axis], e.sourcePose[axis], e.shapedPose[axis], e.nativeTarget[axis],
+            e.velocityUnitsPerSecond[axis], e.maximumVelocityUnitsPerSecond[axis], e.maximumAccelerationUnitsPerSecond2[axis],
+            e.maximumTravelUnits[axis], e.maximumTrackingErrorUnits[axis], e.shapedPose[axis], e.numericalStopped ? 1U : 0U);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM91] event=TRAJECTORY_AXIS result=LOG_FORMAT_ERROR actualOutput=NONE\n");
+    }
+}
+
+// EDM92 validates logical six-axis pre-PID batches in a private RT shadow.
+// These accepted values never enter the ordinary axis or PDO writers.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void LogEDM92CommandBatchConfiguration(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback) noexcept
+{
+    if (!EDM84RT::IsCommandBatch(request.profile)) return;
+    RtPrintf("[EDM92] event=COMMAND_BATCH_CONFIG session=%llu mode=PRE_PID_SEMANTIC_SHADOW axes=XYZCUV batchSize=6 anchor=CURRENT_COMMAND coordinates=LOGICAL_NATIVE targetUnits=pulse velocityUnits=pulse_per_sec hardwareSignApplied=0 atomicity=PRIVATE_ACCEPTANCE_ONLY actualOutput=NONE physicalPermit=0 physicalStop=0 discharge=0\n",
+        static_cast<unsigned long long>(request.session));
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const auto& a = feedback.previewConfig.machine.axes[axis];
+        char text[384]{};
+        const int length = std::snprintf(text, sizeof(text),
+            "[EDM92] event=COMMAND_BATCH_AXIS_CONFIG session=%llu axis=%c id=%u anchorPulse=%.12g pulsesPerUnit=%.12g hardwareSign=%d signUse=OBSERVER_ONLY actualOutput=NONE\n",
+            static_cast<unsigned long long>(request.session), "XYZCUV"[axis], a.axisId,
+            a.anchorNativePulse, a.pulsesPerUnit, a.hardwareSign);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM92] event=COMMAND_BATCH_AXIS_CONFIG result=LOG_FORMAT_ERROR actualOutput=NONE\n");
+    }
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void LogEDM92CommandBatchEvidence(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback, const char* result) noexcept
+{
+    if (!EDM84RT::IsCommandBatch(request.profile)) return;
+    const auto& e = feedback.batchEvidence;
+    const auto& t = e.trajectory;
+    const char* cancelPhase = feedback.batchCancelPhase == EDM81::State::ShortRetreat ? "SHORT_RETREAT" :
+        feedback.batchCancelPhase == EDM81::State::JumpRetreat ? "JUMP_RETREAT" :
+        feedback.batchCancelPhase == EDM81::State::Returning ? "RETURNING" :
+        feedback.batchCancelPhase == EDM81::State::Running ? "RUNNING" :
+        feedback.batchCancelPhase == EDM81::State::Completed ? "COMPLETED" :
+        feedback.batchCancelPhase == EDM81::State::Fault ? "FAULT" : "IDLE";
+    RtPrintf("[EDM92] event=COMMAND_BATCH_EVIDENCE result=%s phase=RT_ACKNOWLEDGED session=%llu state=%s reason=%s kind=%s accepted=%llu raw=%llu drain=%llu stop=%llu lastTick=%llu candidateValid=%u numericalStopped=%u revoked=%u rejectedAxis=%u cancelTick=%llu cancelModelUs=%llu cancelPhase=%s cancelStage=%u actualOutput=NONE physicalPermit=0 physicalStop=0 discharge=0\n",
+        result, static_cast<unsigned long long>(request.session), EDM92::StateName(e.state), EDM92::ReasonName(e.reason), EDM92::KindName(e.lastKind),
+        static_cast<unsigned long long>(e.acceptedBatches), static_cast<unsigned long long>(e.rawBatches),
+        static_cast<unsigned long long>(e.drainBatches), static_cast<unsigned long long>(e.stopBatches),
+        static_cast<unsigned long long>(t.lastTick), e.candidateValid ? 1U : 0U,
+        e.numericalStopped ? 1U : 0U, e.revoked ? 1U : 0U, e.rejectedAxis,
+        static_cast<unsigned long long>(feedback.batchCancelTick),
+        static_cast<unsigned long long>(feedback.batchCancelModelUs), cancelPhase, feedback.batchCancelStage);
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        char text[384]{};
+        const int length = std::snprintf(text, sizeof(text),
+            "[EDM92] event=COMMAND_BATCH_AXIS result=%s session=%llu axis=%c targetPulse=%.12g velocityPps=%.12g positionUnits=%.12g velocityUnitsSec=%.12g numericalStopped=%u actualOutput=NONE physicalStop=0\n",
+            result, static_cast<unsigned long long>(request.session), "XYZCUV"[axis],
+            t.nativeTarget[axis], e.nativeVelocityPps[axis], t.shapedPose[axis],
+            t.velocityUnitsPerSecond[axis], e.numericalStopped ? 1U : 0U);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM92] event=COMMAND_BATCH_AXIS result=LOG_FORMAT_ERROR actualOutput=NONE\n");
+    }
+}
+
+// EDM93 formats private ideal-plant receipts only on the NC thread. The PI
+// gains are captured by Motion from G00; this never changes machine tuning.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void LogEDM93ServoSimulationConfiguration(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback) noexcept
+{
+    if (!EDM84RT::IsServoSimulation(request.profile)) return;
+    RtPrintf("[EDM93] event=SERVO_SIM_CONFIG session=%llu plant=IDEAL_CSV_INTEGRATOR idealPlant=1 zeroLoad=1 noInertia=1 friction=0 transportDelay=0 seed=CURRENT_COMMAND feedback=PRIVATE_MODEL controller=SHARED_G00_PI derivative=DISABLED gains=FROZEN_G00 controllerFingerprint=%llu periodUs=%llu physicalOutput=NONE discharge=0\n",
+        static_cast<unsigned long long>(request.session),
+        static_cast<unsigned long long>(feedback.servoEvidence.controllerFingerprint),
+        static_cast<unsigned long long>(feedback.previewConfig.periodUs));
+    char settleText[384]{};
+    const int settleLength = std::snprintf(settleText, sizeof(settleText),
+        "[EDM93] event=SERVO_SIM_SETTLE_CONFIG session=%llu samples=%u tolerancePulse=%.12g maxTicks=%llu clock=MODEL_250US condition=ALL_SIX_ZERO_CSV_AND_ERROR_WINDOW simulatedStopOnly=1 physicalOutput=NONE physicalStop=0\n",
+        static_cast<unsigned long long>(request.session), EDM93::SettleSamples,
+        EDM93::SettleTolerancePulse, static_cast<unsigned long long>(EDM93::MaximumSettleTicks));
+    if (settleLength > 0 && static_cast<std::size_t>(settleLength) < sizeof(settleText)) RtPrintf("%s", settleText);
+    else RtPrintf("[EDM93] event=SERVO_SIM_SETTLE_CONFIG result=LOG_FORMAT_ERROR physicalOutput=NONE\n");
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const auto& a = feedback.previewConfig.machine.axes[axis];
+        char text[448]{};
+        const int length = std::snprintf(text, sizeof(text),
+            "[EDM93] event=SERVO_SIM_AXIS_CONFIG session=%llu axis=%c id=%u anchorPulse=%.12g pulsesPerUnit=%.12g velocityCapPps=%.12g hardwareSign=%d signUse=PRIVATE_CSV_ONCE simulatedFeedback=IDEAL_INTEGRATOR physicalOutput=NONE\n",
+            static_cast<unsigned long long>(request.session), "XYZCUV"[axis], a.axisId,
+            a.anchorNativePulse, a.pulsesPerUnit,
+            EDM93::VelocityCap(feedback.previewConfig, axis), a.hardwareSign);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM93] event=SERVO_SIM_AXIS_CONFIG result=LOG_FORMAT_ERROR physicalOutput=NONE\n");
+    }
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void LogEDM93ServoSimulationEvidence(const EDM84RT::Request& request,
+    const EDM84RT::Feedback& feedback, const char* result) noexcept
+{
+    if (!EDM84RT::IsServoSimulation(request.profile)) return;
+    const auto& e = feedback.servoEvidence;
+    RtPrintf("[EDM93] event=SERVO_SIM_EVIDENCE result=%s phase=RT_ACKNOWLEDGED session=%llu state=%s reason=%s accepted=%llu modelTicks=%llu settleTicks=%llu lastTick=%llu settledSamples=%u numericalStopped=%u modelSettled=%u revoked=%u saturationMask=%u everSaturationMask=%u rejectedAxis=%u controllerFingerprint=%llu idealPlant=1 zeroLoad=1 noInertia=1 physicalOutput=NONE physicalStop=0 discharge=0\n",
+        result, static_cast<unsigned long long>(request.session), EDM93::StateName(e.state), EDM93::ReasonName(e.reason),
+        static_cast<unsigned long long>(e.acceptedBatches), static_cast<unsigned long long>(e.modelTicks),
+        static_cast<unsigned long long>(e.settleTicks), static_cast<unsigned long long>(e.lastTick),
+        e.settledSamples, e.modelSettled ? 1U : 0U, e.modelSettled ? 1U : 0U, e.revoked ? 1U : 0U,
+        e.saturationMask, e.everSaturationMask, e.rejectedAxis,
+        static_cast<unsigned long long>(e.controllerFingerprint));
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        char text[512]{};
+        const double target = feedback.batchEvidence.trajectory.nativeTarget[axis];
+        const int length = std::snprintf(text, sizeof(text),
+            "[EDM93] event=SERVO_SIM_AXIS result=%s session=%llu axis=%c targetPulse=%.12g simulatedPulse=%.12g followingErrorPulse=%.12g signedCsvPps=%ld integralAcc=%.12g maxFollowingErrorPulse=%.12g maxLogicalVelocityPps=%.12g numericalStopped=%u physicalOutput=NONE physicalStop=0\n",
+            result, static_cast<unsigned long long>(request.session), "XYZCUV"[axis], target,
+            e.positionNativePulse[axis], target - e.positionNativePulse[axis], static_cast<long>(e.csv[axis]),
+            e.integralAcc[axis], e.maximumFollowingErrorPulse[axis], e.maximumLogicalVelocityPps[axis],
+            e.modelSettled ? 1U : 0U);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[EDM93] event=SERVO_SIM_AXIS result=LOG_FORMAT_ERROR physicalOutput=NONE\n");
+    }
+}
+
+// NC-thread snapshots only, never called by the cyclic RT callback. These
+// observations identify startup boundaries; they are not stack high-water or
+// callback execution-time proofs. Preserve the caller's OS last-error value.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+void NCManager::LogEDMCoordinatedRTStartupStageSameThread(const char* stage) noexcept
+{
+    const DWORD incomingError = GetLastError();
+    DWORD stackBytes = 0U, availableBytes = 0U;
+    ULONG_PTR stackBase = 0U, stackLimit = 0U, stackTop = 0U;
+    const bool queried = RtGetThreadStack(GetCurrentThread(), &stackBytes, &availableBytes,
+        &stackBase, &stackLimit, &stackTop);
+    const DWORD queryError = queried ? 0U : GetLastError();
+    const DWORD rawStackBytes = stackBytes, rawAvailableBytes = availableBytes;
+    const bool valid = queried && stackBytes != 0U && availableBytes <= stackBytes;
+    if (!valid) { stackBytes = 0U; availableBytes = 0U; }
+    RtPrintf("[%s] event=STARTUP_STAGE build=EDM93_20261012 stage=%.16s session=%llu P=%u Q=%u stackQuery=%s stackBytes=%lu availableBytes=%lu error=%lu rawStackBytes=%lu rawAvailableBytes=%lu threadId=%lu base=%llu limit=%llu top=%llu topInRange=%u output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        EDM84RT::DiagnosticTag(m_edmCoordinatedRT.request), stage ? stage : "UNKNOWN", static_cast<unsigned long long>(m_edmCoordinatedRT.request.session),
+        static_cast<unsigned>(m_edmCoordinatedRT.request.profile), static_cast<unsigned>(m_edmCoordinatedRT.request.scenario),
+        valid ? "OK" : queried ? "INVALID" : "FAILED", static_cast<unsigned long>(stackBytes),
+        static_cast<unsigned long>(availableBytes), static_cast<unsigned long>(queryError),
+        static_cast<unsigned long>(rawStackBytes), static_cast<unsigned long>(rawAvailableBytes),
+        static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(stackBase),
+        static_cast<unsigned long long>(stackLimit), static_cast<unsigned long long>(stackTop),
+        queried && NCMainStack::ContainsTop(stackBase, stackLimit, stackTop) ? 1U : 0U);
+    SetLastError(incomingError);
+}
+
+// EDM84 supervises an explicit private retained-path calculator in Motion's RT
+// callback. None of these methods publishes an axis target or discharge permit.
+WaitConditionFunc NCManager::StartEDMCoordinatedRTSameThread(const NCBlock& block)
+{
+    const int line = m_gapDryRun.sourceLine;
+    ServiceEDMCoordinatedRTRetirementSameThread();
+    ServiceEDMCNCRetainedRTRetirementSameThread();
+    ServiceEDMGapServoRetirementSameThread();
+    ServiceEDMPhysicalServoRetirementSameThread();
+    if (m_gapDryRun.active || m_edmCNCRetainedRT.retirePending ||
+        (m_edmCNCRetainedRT.submitted && !m_edmCNCRetainedRT.retired) || m_edmCoordinatedRT.retirePending ||
+        (m_edmCoordinatedRT.submitted && !m_edmCoordinatedRT.retired) ||
+        m_edmZFixture.cleanupPending || m_edmZFixture.resetPending || m_edmZFixture.failureAlarmPending ||
+        m_edmPhysicalServoRT.retirePending || m_edmGapServoRT.retirePending)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM84_PREVIOUS_SESSION_BUSY"); return nullptr; }
+    const unsigned profile = block.has('P') && block.val('P') == 84.0 ? 84U :
+        block.has('P') && block.val('P') == 83.0 ? 83U :
+        block.has('P') && block.val('P') == 82.0 ? 82U :
+        block.has('P') && block.val('P') == 81.0 ? 81U :
+        block.has('P') && block.val('P') == 80.0 ? 80U :
+        block.has('P') && block.val('P') == 79.0 ? 79U :
+        block.has('P') && block.val('P') == 78.0 ? 78U :
+        block.has('P') && block.val('P') == 77.0 ? 77U :
+        block.has('P') && block.val('P') == 76.0 ? 76U :
+        block.has('P') && block.val('P') == 75.0 ? 75U :
+        block.has('P') && block.val('P') == 74.0 ? 74U :
+        block.has('P') && block.val('P') == 73.0 ? 73U :
+        block.has('P') && block.val('P') == 72.0 ? 72U :
+        block.has('P') && block.val('P') == 71.0 ? 71U :
+        block.has('P') && block.val('P') == 70.0 ? 70U : 69U;
+    const bool ncAuthored = EDM84RT::IsAuthored(static_cast<EDM84RT::Profile>(profile));
+    const bool sampled = EDM84RT::IsSampled(static_cast<EDM84RT::Profile>(profile));
+    const char* tag = EDM84RT::IsServoSimulation(static_cast<EDM84RT::Profile>(profile)) ? "EDM93" :
+        EDM84RT::IsCommandBatch(static_cast<EDM84RT::Profile>(profile)) ? "EDM92" :
+        EDM84RT::IsTrajectoryPreview(static_cast<EDM84RT::Profile>(profile)) ? "EDM91" :
+        EDM84RT::IsOutputPreview(static_cast<EDM84RT::Profile>(profile)) ? "EDM90" :
+        EDM84RT::IsSourceDwell(static_cast<EDM84RT::Profile>(profile)) ? "EDM89" :
+        sampled ? "EDM88" : block.has('R') ? "EDM87" : EDM84RT::DiagnosticTag(static_cast<EDM84RT::Profile>(profile),
+        block.has('Q') && block.val('Q') == 4.0 ? EDM84RT::Scenario::ToolHeadCUVCompensation : EDM84RT::Scenario::SixAxisPath);
+    const int pc = GetActiveDispatchPC();
+    const NCProgramCacheLine* authored = pc >= 0 ? GetBaseProgramCache().TryGetLine(pc) : nullptr;
+    bool literal = authored && authored->sourceLineNumber == line &&
+        EDM77::Detail::Clean(authored->parsedBlock) && !authored->parsedBlock.isEmpty &&
+        authored->parsedBlock.gCount == 1 && authored->parsedBlock.mCount == 0 &&
+        EDM77::Detail::EqualLiteral(authored->parsedBlock.gExpressions[0], 180U) &&
+        EDM77::Detail::OnlyAddresses(authored->parsedBlock, sampled ? "NPQRS" : "NPQR") && authored->parsedBlock.has('P') &&
+        EDM77::Detail::EqualLiteral(authored->parsedBlock.expression('P'), profile) &&
+        authored->parsedBlock.has('Q') && block.has('Q') &&
+        (block.val('Q') == 1.0 || block.val('Q') == 2.0 || block.val('Q') == 3.0 ||
+            (ncAuthored && block.val('Q') == 4.0));
+    if (literal)
+    {
+        for (char letter = 'A'; letter <= 'Z'; ++letter)
+        {
+            if (block.has(letter) != authored->parsedBlock.has(letter)) { literal = false; break; }
+            if (!block.has(letter)) continue;
+            std::uint32_t value = 0U;
+            if (!EDM77::Detail::UnsignedLiteral(authored->parsedBlock.expression(letter),
+                (std::numeric_limits<std::uint32_t>::max)(), value) || block.val(letter) != static_cast<double>(value))
+            { literal = false; break; }
+        }
+    }
+    if (!IsGapDryRunBlockShapeValid(block) || block.isBlockSkip || !literal || !IsEDMCoordinatedRTM30ContinuationSameThread())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM84_LITERAL_FIXTURE_M30_REQUIRED"); return nullptr; }
+    const EDM87::HeadProfile* selectedToolHead = nullptr;
+    if (block.has('R'))
+    {
+        if (!m_edmToolHeadCatalogReady || !EDM87::ValidCatalog(m_edmToolHeadCatalog))
+        { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM87_PROFILE_CATALOG_DISABLED"); return nullptr; }
+        selectedToolHead = EDM87::FindProfile(m_edmToolHeadCatalog, static_cast<unsigned>(block.val('R')));
+        if (!selectedToolHead)
+        { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM87_PROFILE_ID_UNAVAILABLE"); return nullptr; }
+    }
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    if ((mask & ~(1ULL << 9U)) || !m_edmProcessReady ||
+        m_currentExecutingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        m_motion.GetCurrentExecutionEpoch() == MOTION_EXECUTION_EPOCH_INVALID ||
+        !m_pathCoreLiveBookkeeping.currentRunToken || !GetBaseProgramCache().GetGeneration())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM84_NOT_READY"); return nullptr; }
+    EDMRecipe::Summary summary{};
+    if (!ReadEDMRecipeSummarySameThread(summary))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM84_RECIPE_SCOPE"); return nullptr; }
+    const auto servo = EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    const auto flush = EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+    if (!servo.ready || !flush.ready || !EDM75::SameAdmission(flush.recipe, servo.recipe))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM84_RECIPE_BIND_REJECTED"); return nullptr; }
+    LARGE_INTEGER frequency{};
+    if (!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(frequency.QuadPart) > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM84_CLOCK_FREQUENCY"); return nullptr; }
+    const auto latest = m_motion.ReadEDMCoordinatedRTLatestSession();
+    const auto serial = latest > m_gapDryRunSerial ? latest : m_gapDryRunSerial;
+    if (serial == (std::numeric_limits<std::uint64_t>::max)())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM84_SESSION_OVERFLOW"); return nullptr; }
+    EDM84RT::FixtureDetail::ResetInPlace(m_edmCoordinatedRT);
+    auto& control = m_edmCoordinatedRT;
+    control.servo = servo.recipe; control.flush = flush.recipe;
+    auto& request = control.request;
+    request.session = serial + 1ULL;
+    request.profile = static_cast<EDM84RT::Profile>(profile);
+    request.sampledFault = block.has('S') ?
+        static_cast<EDM84RT::SampledFault>(static_cast<unsigned>(block.val('S'))) : EDM84RT::SampledFault::Normal;
+    request.scenario = static_cast<EDM84RT::Scenario>(static_cast<unsigned>(block.val('Q')));
+    request.qpcFrequency = static_cast<std::uint64_t>(frequency.QuadPart);
+    request.scope.run = m_pathCoreLiveBookkeeping.currentRunToken;
+    request.scope.cache = GetBaseProgramCache().GetGeneration();
+    request.scope.dispatch = m_currentExecutingBlockDispatchId;
+    request.scope.executionEpoch = m_motion.GetCurrentExecutionEpoch();
+    request.scope.ownerLease = (static_cast<std::uint64_t>(m_programMotionLease.owner) << 32U) |
+        static_cast<std::uint64_t>(m_programMotionLease.generation);
+    // Fixed diagnostic coordinates/frame/kinematics revision; not live CNC/TCP.
+    request.scope.configRevision = request.scope.frameRevision = request.scope.kinematicsRevision = 1ULL;
+    if (selectedToolHead)
+    {
+        request.toolHeadSelection.catalogRevision = m_edmToolHeadCatalog.revision;
+        request.toolHeadSelection.profile = *selectedToolHead;
+        request.toolHeadSelection.fingerprint = EDM87::Fingerprint(*selectedToolHead);
+        if (!EDM87::ValidSelection(request.toolHeadSelection))
+        { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM87_PROFILE_SELECTION_INVALID"); return nullptr; }
+        // The copied canonical path freezes this same scope during Capture.
+        request.scope.configRevision = request.toolHeadSelection.catalogRevision;
+        request.scope.frameRevision = request.scope.kinematicsRevision = selectedToolHead->revision;
+    }
+    request.scope.recipeGeneration = servo.recipe.binding.generation;
+    request.scope.sourceGeneration = request.session;
+    if (!ReadEDMCoordinatedRTClockSameThread(request.issuedUs))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM84_CLOCK_READ"); return nullptr; }
+    LogEDMCoordinatedRTStartupStageSameThread("PREPARE");
+    if (ncAuthored)
+    {
+        // The first M30 stays in normal dispatch. Data AFTER it is read-only:
+        // never advance/jump the PC, resolve macros, or dispatch its G0/G1/G2/G3.
+        if (pc < 0 || pc > (std::numeric_limits<int>::max)() - 97)
+        { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM85_SOURCE_RANGE"); return nullptr; }
+        const auto get = [this, pc](unsigned offset) noexcept -> const NCParsedBlock*
+        {
+            const auto* row = GetBaseProgramCache().TryGetLine(pc + static_cast<int>(offset));
+            return row ? &row->parsedBlock : nullptr;
+        };
+        control.authoredCapture = EDM85NC::Capture(request, control.authoredWorkspace, get);
+        if (!control.authoredCapture.valid)
+        {
+            RtPrintf("[%s] event=CAPTURE_REJECT reason=%s sourcePC=%d sourceOffset=%u newSession=0 armIssued=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+                tag, EDM85NC::ErrorName(control.authoredCapture.error), pc,
+                control.authoredCapture.errorOffset);
+            RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM85_AUTHORED_PATH_REJECTED"); return nullptr;
+        }
+        if (!EDM84RT::BuildAuthoredRequest(request, servo.recipe.curve,
+            servo.recipe.referenceV, servo.recipe.overridePercent, control.authoredCapture.feedMmMin))
+        { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM85_PATH_CONFIG_OR_BUDGET"); return nullptr; }
+    }
+    else if (!EDM84RT::BuildFixtureRequest(request, control.workspace, servo.recipe.curve, servo.recipe.referenceV, servo.recipe.overridePercent))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM84_FIXTURE_BUILD"); return nullptr; }
+    if (ncAuthored)
+    {
+        char detail[640]{};
+        const int count = std::snprintf(detail, sizeof(detail),
+            "[%s] event=PATH_CAPTURE session=%llu plan=NC_AUTHORED_AFTER_M30 sourcePC=%d terminalOffset=%u segments=%u lines=%u arcs=%u expectedAxisMask=%u expectedRowMask=%u lengthMm=%.9f authoredF=%.6f effectiveF=%.6f modelBudgetUs=%llu livePath=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            tag, static_cast<unsigned long long>(request.session), pc, control.authoredCapture.terminalOffset,
+            control.authoredCapture.segmentCount, control.authoredCapture.lineCount, control.authoredCapture.arcCount,
+            request.expectedAxisMask, request.expectedRowMask, request.path.LengthMm(),
+            control.authoredCapture.feedMmMin, request.config.motion.maxScalarMmMin,
+            static_cast<unsigned long long>(EDM84RT::DurationUs(request)));
+        if (count < 0 || static_cast<std::size_t>(count) >= sizeof(detail))
+        { RejectEDMGapAdmissionSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM85_CAPTURE_LOG_FORMAT"); return nullptr; }
+        RtPrintf("%s", detail);
+    }
+    if (!LogEDM86ToolHeadConfiguration(request))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM86_KINEMATICS_LOG_FORMAT"); return nullptr; }
+    LogEDM88SampledSourceConfiguration(request);
+    LogEDMCoordinatedRTStartupStageSameThread("BUILT");
+    // Preparation/console latency must not age a request before it is even
+    // submitted. This refresh occurs only before RT publication, never as an
+    // extension of an active session's heartbeat or completion deadline.
+    const auto preparedUs = request.issuedUs;
+    if (!ReadEDMCoordinatedRTClockSameThread(request.issuedUs) || request.issuedUs < preparedUs)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM84_SUBMIT_CLOCK_READ"); return nullptr; }
+    InvalidateEDMPhysicalSequencePlanSameThread();
+    m_edmGapDynamic.strictSequenceMode = false;
+    m_gapDryRun = GapDryRunState{};
+    m_gapDryRun.coordinatedRTTest = m_gapDryRun.active = true;
+    m_gapDryRun.sourceLine = line; m_gapDryRun.test = request.session;
+    m_gapDryRunSerial = request.session;
+    m_gapDryRun.run = request.scope.run; m_gapDryRun.cache = request.scope.cache;
+    m_gapDryRun.dispatch = request.scope.dispatch;
+    m_gapDryRun.epoch = m_motion.GetCurrentExecutionEpoch(); m_gapDryRun.lease = m_programMotionLease;
+    control.lastClockUs = control.lastServiceUs = control.lastFeedbackUs = request.issuedUs;
+    control.deadlineUs = EDM84RT::DurationUs(request) + 15000000ULL;
+    // Mark before submission: a failing transport may already have reserved
+    // the session. Cancellation and a later RT receipt are still mandatory.
+    control.submitted = true; control.retired = false;
+    if (!m_motion.StartEDMCoordinatedRT(request))
+    {
+        // A request rejected before reservation has no RT-owned state to retire.
+        if (m_motion.ReadEDMCoordinatedRTLatestSession() < request.session)
+        { control.submitted = false; control.retired = true; }
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM84_START_REJECTED"); return nullptr;
+    }
+    LogEDMCoordinatedRTStartupStageSameThread("SUBMITTED");
+    RtPrintf("[%s] event=BEGIN build=EDM93_20261012 P=%u Q=%u scenario=%s session=%llu run=%llu dispatch=%llu source=SIM executor=RT_CALLBACK modelStepUs=250 output=NONE axes=XYZCUV rotary=COORDINATED geometry=CNC_RETAINED_COMPOSITION livePath=0 hold=CANCEL_RESET_REQUIRED wcetVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+        tag, profile, static_cast<unsigned>(request.scenario), EDM84RT::ScenarioName(request.scenario), static_cast<unsigned long long>(request.session), static_cast<unsigned long long>(request.scope.run),
+        static_cast<unsigned long long>(request.scope.dispatch));
+    char text[480]{};
+    const int length = std::snprintf(text, sizeof(text),
+        "[%s] event=RECIPE_FROZEN table=%u E=%u generation=%llu processRev=%u tuningGen=%llu E8=%.6f E9=%.6f curve=INSTALLED input=SYNTHETIC output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        tag, control.servo.binding.tableId, static_cast<unsigned>(control.servo.binding.eCode),
+        static_cast<unsigned long long>(control.servo.binding.generation), control.servo.binding.processRevision,
+        static_cast<unsigned long long>(control.servo.binding.tuningGeneration), control.servo.overridePercent, control.servo.referenceV);
+    if (length < 0 || static_cast<std::size_t>(length) >= sizeof(text))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM84_RECIPE_LOG_FORMAT"); return nullptr; }
+    RtPrintf("%s", text);
+    return WaitForGapDryRunCallback;
+}
+
+bool NCManager::ReadEDMCoordinatedRTClockSameThread(std::uint64_t& nowUs) noexcept
+{
+    auto& control = m_edmCoordinatedRT;
+    const auto frequency = control.request.qpcFrequency;
+    LARGE_INTEGER counter{};
+    if (!frequency || frequency > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL ||
+        !RtQueryPerformanceCounter(&counter) || counter.QuadPart < 0) return false;
+    const auto ticks = static_cast<std::uint64_t>(counter.QuadPart);
+    if (ticks < control.lastTicks) return false;
+    const auto seconds = ticks / frequency;
+    if (seconds > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL) return false;
+    const auto fraction = (ticks % frequency) * 1000000ULL / frequency;
+    if (seconds * 1000000ULL > (std::numeric_limits<std::uint64_t>::max)() - fraction) return false;
+    nowUs = seconds * 1000000ULL + fraction;
+    control.lastTicks = ticks;
+    return true;
+}
+
+bool NCManager::IsEDMCoordinatedRTScopeCurrentSameThread() const noexcept
+{
+    const auto& selection = m_edmCoordinatedRT.request.toolHeadSelection;
+    if (!EDM87::IsEmptySelection(selection))
+    {
+        const auto* profile = m_edmToolHeadCatalogReady ?
+            EDM87::FindProfile(m_edmToolHeadCatalog, selection.profile.id) : nullptr;
+        if (!profile || !EDM87::ValidSelection(selection) ||
+            selection.catalogRevision != m_edmToolHeadCatalog.revision ||
+            !EDM87::ProfilesEqual(selection.profile, *profile)) return false;
+    }
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    return m_gapDryRun.coordinatedRTTest && !(mask & ~(1ULL << 9U)) &&
+        !m_edmPhysicalServoRT.retirePending && !m_edmGapServoRT.retirePending &&
+        !m_edmCNCRetainedRT.retirePending && (!m_edmCNCRetainedRT.submitted || m_edmCNCRetainedRT.retired) &&
+        m_gapDryRun.run != 0ULL && m_gapDryRun.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        m_gapDryRun.cache != 0ULL && m_gapDryRun.cache == GetBaseProgramCache().GetGeneration() &&
+        m_gapDryRun.dispatch != NC_BLOCK_DISPATCH_ID_INVALID && m_gapDryRun.dispatch == m_waitingBlockDispatchId &&
+        m_gapDryRun.epoch != MOTION_EXECUTION_EPOCH_INVALID && m_gapDryRun.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        m_gapDryRun.lease.Matches(m_programMotionLease) && m_motion.IsMotionOwnerLeaseCurrent(m_gapDryRun.lease);
+}
+
+bool NCManager::IsEDMCoordinatedRTRecipeCurrentSameThread() const noexcept
+{
+    if (!m_edmProcessReady || m_recipeRecoveryDisplayOnly || m_recipeIdleSelection || m_recipeHoldSeen ||
+        m_recipeRun != m_gapDryRun.run || m_recipeCache != m_gapDryRun.cache ||
+        m_recipeEpoch != m_gapDryRun.epoch || !m_recipeLease.Matches(m_gapDryRun.lease)) return false;
+    const auto servo = EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    const auto flush = EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+    return servo.ready && flush.ready && EDM75::SameAdmission(flush.recipe, servo.recipe) &&
+        EDM59::SameRecipe(servo.recipe, m_edmCoordinatedRT.servo) && EDM57::SameRecipe(flush.recipe, m_edmCoordinatedRT.flush);
+}
+
+void NCManager::LogEDMCoordinatedRTSameThread(const char* event, const char* reason) noexcept
+{
+    const auto& c = m_edmCoordinatedRT;
+    const auto& f = c.feedback;
+    const char* result = std::strcmp(event ? event : "", "SUMMARY") == 0 ? "PASS" :
+        std::strcmp(event ? event : "", "FAIL") == 0 ? "FAIL" :
+        std::strcmp(event ? event : "", "CANCEL") == 0 ? "CANCELLED" : "PENDING";
+    RtPrintf("[%s] event=%.24s result=%s reason=%.64s P=%u Q=%u session=%llu state=%s rtReason=%s kernelReason=%u stage=%u pub=%llu rtTick=%llu terminalTick=%llu quiescentTick=%llu quiescent=%u output=NONE motion=0 physicalPermit=0 discharge=0\n",
+        EDM84RT::DiagnosticTag(c.request), event ? event : "UNKNOWN", result, reason ? reason : "NONE", static_cast<unsigned>(c.request.profile), static_cast<unsigned>(c.request.scenario),
+        static_cast<unsigned long long>(c.request.session), EDM84RT::StateName(f.state), EDM84RT::ReasonName(f.reason),
+        static_cast<unsigned>(f.kernelReason), static_cast<unsigned>(f.stage), static_cast<unsigned long long>(f.publication), static_cast<unsigned long long>(f.rtTick),
+        static_cast<unsigned long long>(f.terminalTick), static_cast<unsigned long long>(f.quiescentTick), f.quiescent ? 1U : 0U);
+}
+
+void NCManager::EndEDMCoordinatedRTSameThread(bool failed, const char* reason) noexcept
+{
+    auto& c = m_edmCoordinatedRT;
+    const bool report = m_gapDryRun.coordinatedRTTest &&
+        (m_gapDryRun.active || m_gapDryRun.result == 1U || (failed && m_gapDryRun.result == 2U));
+    if (c.submitted && !c.retired)
+    {
+        // Publish the exact-session cancellation before any console work.
+        m_motion.CancelEDMCoordinatedRT(c.request.session);
+        if (!c.retirePending)
+        {
+            c.cancelPublication = c.feedback.publication; c.cancelTick = c.feedback.rtTick;
+            c.cancelUs = c.lastClockUs; c.retirePending = true;
+        }
+    }
+    c.completionPending = false;
+    if (m_gapDryRun.coordinatedRTTest)
+    {
+        m_gapDryRun.active = m_gapDryRun.paused = false;
+        if (report) m_gapDryRun.result = failed ? 3U : 2U;
+    }
+    if (report)
+    {
+        if (EDM84RT::IsTrajectoryPreview(c.request.profile))
+        {
+            // The NC copy may predate this cancellation. Report the request
+            // now; report numerical stop/abort evidence only after RT receipt.
+            c.trajectoryCancelLogPending = true;
+            c.trajectoryCancelFailed = c.trajectoryCancelFailed || failed;
+            LogEDMCoordinatedRTSameThread(failed ? "FAIL_REQUEST" : "CANCEL_REQUEST", reason);
+        }
+        else
+        {
+            LogEDMCoordinatedRTSameThread(failed ? "FAIL" : "CANCEL", reason);
+            LogEDM88SampledSourceEvidence(c.request, c.feedback, failed ? "FAIL" : "CANCELLED");
+            LogEDM90OutputPreviewEvidence(c.request, c.feedback, failed ? "FAIL" : "CANCELLED");
+        }
+    }
+}
+
+void NCManager::ServiceEDMCoordinatedRTRetirementSameThread() noexcept
+{
+    auto& c = m_edmCoordinatedRT;
+    if (!c.retirePending) return;
+    EDM84RT::Feedback receipt{};
+    if (m_motion.ReadEDMCoordinatedRT(receipt) && receipt.session == c.request.session &&
+        receipt.latestSession == c.request.session && receipt.profile == c.request.profile && receipt.scenario == c.request.scenario &&
+        EDM84RT::ToolHeadFeedbackIdentityValid(c.request, receipt) &&
+        EDM84RT::SampledFeedbackIdentityValid(c.request, receipt) &&
+        EDM84RT::PreviewFeedbackIdentityValid(c.request, receipt) &&
+        EDM84RT::TrajectoryFeedbackIdentityValid(c.request, receipt) &&
+        EDM84RT::TrajectoryRetirementValid(c.request, receipt) &&
+        EDM84RT::BatchFeedbackIdentityValid(c.request, receipt) &&
+        EDM84RT::BatchRetirementValid(c.request, receipt) &&
+        EDM84RT::ServoFeedbackIdentityValid(c.request, receipt) &&
+        EDM84RT::ServoRetirementValid(c.request, receipt) &&
+        (!c.machinePreviewSeen || EDM90::SameConfig(c.acceptedPreviewConfig, receipt.previewConfig)) &&
+        (!c.completionPending || EDM84RT::SameSampledTerminalEvidence(receipt, c.completedFeedback)) &&
+        EDM81::SameScope(receipt.scope, c.request.scope) && receipt.cancelThroughSession >= c.request.session &&
+        receipt.publication > c.cancelPublication && receipt.rtTick > c.cancelTick &&
+        receipt.state == EDM84RT::State::Cancelled && receipt.quiescent &&
+        receipt.terminalTick > c.cancelTick && receipt.quiescentTick > receipt.terminalTick &&
+        receipt.rtTick >= receipt.quiescentTick && receipt.qpcFrequency == c.request.qpcFrequency)
+    {
+        // RT stops republishing after exact cancellation and quiescence. This
+        // immutable acknowledgement remains valid after a long NC HOLD/RESET.
+        c.feedback = receipt; c.retired = true; c.retirePending = false;
+        LogEDMCoordinatedRTSameThread("RETIRED", "EXACT_SESSION_RT_QUIESCENT");
+        if (c.trajectoryCancelLogPending)
+        {
+            const char* result = c.trajectoryCancelFailed ? "FAIL" : "CANCELLED";
+            LogEDM88SampledSourceEvidence(c.request, receipt, result);
+            LogEDM90OutputPreviewEvidence(c.request, receipt, result);
+            LogEDM91TrajectoryEvidence(c.request, receipt, result);
+            LogEDM92CommandBatchEvidence(c.request, receipt, result);
+            LogEDM93ServoSimulationEvidence(c.request, receipt, result);
+            c.trajectoryCancelLogPending = false;
+        }
+        return;
+    }
+    std::uint64_t nowUs = 0ULL;
+    const std::uint64_t retirementWarningUs = EDM84RT::IsServoSimulation(c.request.profile) ? 6000000ULL : 2000000ULL;
+    if (!c.retirementWarning && ReadEDMCoordinatedRTClockSameThread(nowUs) &&
+        nowUs >= c.cancelUs && nowUs - c.cancelUs >= retirementWarningUs)
+    {
+        c.retirementWarning = true;
+        LogEDMCoordinatedRTSameThread("RETIRE_WAIT", "NO_VALID_RT_QUIESCENT_ACK_START_BLOCKED");
+    }
+}
+
+void NCManager::ValidateEDMCoordinatedRTSameThread()
+{
+    auto& c = m_edmCoordinatedRT;
+    if (!m_gapDryRun.active) return;
+    if (m_state == NCState::HOLD || m_edmState == EDMState::HOLD)
+    { EndEDMCoordinatedRTSameThread(false, "HOLD_RESET_REQUIRED"); return; }
+    if (!IsEDMCoordinatedRTScopeCurrentSameThread())
+    { EndEDMCoordinatedRTSameThread(false, "NC_SCOPE_REVOKED"); return; }
+    if (!IsEDMCoordinatedRTRecipeCurrentSameThread())
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_LIVE_RECIPE_CHANGED"); return; }
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMCoordinatedRTClockSameThread(nowUs) || nowUs < c.lastClockUs || nowUs < c.request.issuedUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_CLOCK_INVALID"); return; }
+    if (nowUs - c.lastServiceUs > 100000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_NC_SERVICE_GAP"); return; }
+    if (nowUs == c.lastClockUs) ++c.stalledPolls;
+    else { c.lastClockUs = nowUs; c.stalledPolls = 0U; }
+    if (c.stalledPolls >= 10000U || nowUs - c.request.issuedUs >= c.deadlineUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine,
+        c.stalledPolls >= 10000U ? "EDM84_CLOCK_STALLED" : "EDM84_WINDOW_TIMEOUT"); return; }
+    c.lastServiceUs = nowUs;
+    if (!c.completionPending && !m_motion.TouchEDMCoordinatedRT(c.request.session, nowUs))
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_HEARTBEAT_REJECTED");
+}
+
+bool NCManager::ProcessEDMCoordinatedRTSameThread()
+{
+    ServiceEDMCoordinatedRTRetirementSameThread();
+    ValidateEDMCoordinatedRTSameThread();
+    auto& c = m_edmCoordinatedRT;
+    const char* tag = EDM84RT::DiagnosticTag(c.request);
+    if (!m_gapDryRun.active)
+    {
+        if (m_gapDryRun.result == 1U && c.retired && IsEDMCoordinatedRTScopeCurrentSameThread() &&
+            IsEDMCoordinatedRTRecipeCurrentSameThread()) return true;
+        if ((m_gapDryRun.result == 1U || m_gapDryRun.result == 2U) && m_state == NCState::RUN &&
+            !AlarmManager::GetInstance().HasAlarm() && m_resetContinuationPhase == ResetContinuationPhase::IDLE)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_CANCELLED_CALLBACK_RESET_REQUIRED");
+        return false;
+    }
+    if (c.completionPending)
+    {
+        if (!c.retired) return false;
+        // Scope/recipe were rechecked above AFTER exact-session retirement.
+        m_gapDryRun.active = false; m_gapDryRun.result = 1U;
+        LogEDMCoordinatedRTSameThread("SUMMARY", "PASS");
+        RtPrintf("[%s] event=TIMING result=PASS session=%llu Q=%u axisMask=%u callbackSteps=%llu modelUs=%llu observedUs=%llu minCallbackUs=%llu maxCallbackUs=%llu coverage=%llu clock=QPC modelStepUs=250 wcetVerified=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            tag, static_cast<unsigned long long>(c.request.session), static_cast<unsigned>(c.request.scenario),
+            c.completedFeedback.axisMovedMask, static_cast<unsigned long long>(c.completedSteps),
+            static_cast<unsigned long long>(c.completedModelUs), static_cast<unsigned long long>(c.lastClockUs - c.request.issuedUs),
+            static_cast<unsigned long long>(c.feedback.minimumStepUs), static_cast<unsigned long long>(c.feedback.maximumStepUs),
+            static_cast<unsigned long long>(c.completedCoverage));
+        const auto& final = c.completedFeedback;
+        LogEDM86ToolHeadCompletion(c.request, final);
+        LogEDM88SampledSourceEvidence(c.request, final, "PASS");
+        LogEDM90OutputPreviewEvidence(c.request, final, "PASS");
+        LogEDM91TrajectoryEvidence(c.request, final, "PASS");
+        LogEDM92CommandBatchEvidence(c.request, final, "PASS");
+        LogEDM93ServoSimulationEvidence(c.request, final, "PASS");
+        if (EDM84RT::IsAuthored(c.request.profile))
+            RtPrintf("[%s] event=PATH_EVIDENCE result=PASS session=%llu nominalAxisMask=%u expectedAxisMask=%u visitedRowMask=%u expectedRowMask=%u modelBudgetUs=%llu plan=NC_AUTHORED_AFTER_M30 livePath=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+                tag, static_cast<unsigned long long>(c.request.session), final.nominalAxisMovedMask, c.request.expectedAxisMask,
+                final.visitedRowMask, c.request.expectedRowMask, static_cast<unsigned long long>(EDM84RT::DurationUs(c.request)));
+        const auto& nominal = final.sample.nominal; const auto& pose = final.sample.pose;
+        char composition[1280]{};
+        const int length = std::snprintf(composition, sizeof(composition),
+            "[%s] event=COMPOSITION result=PASS session=%llu Q=%u axisMask=%u nominalXYZCUV=%.9f,%.9f,%.9f,%.9f,%.9f,%.9f composedXYZCUV=%.9f,%.9f,%.9f,%.9f,%.9f,%.9f maxLinearErrorMm=%.12g maxRotaryErrorDeg=%.12g maxMappingErrorMm=%.12g maxOffsetErrorMm=%.12g cursorMm=%.9f offsetMm=%.9f scopeRun=%llu scopeCache=%llu scopeDispatch=%llu livePath=0 output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            tag, static_cast<unsigned long long>(c.request.session), static_cast<unsigned>(c.request.scenario), final.axisMovedMask,
+            nominal[0], nominal[1], nominal[2], nominal[3], nominal[4], nominal[5],
+            pose[0], pose[1], pose[2], pose[3], pose[4], pose[5],
+            final.maxLinearErrorMm, final.maxRotaryErrorDeg, final.maxMappingErrorMm, final.maxOffsetErrorMm,
+            final.sample.cursorMm, final.sample.offsetMm, static_cast<unsigned long long>(c.request.scope.run),
+            static_cast<unsigned long long>(c.request.scope.cache), static_cast<unsigned long long>(c.request.scope.dispatch));
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(composition)) RtPrintf("%s", composition);
+        return true;
+    }
+    EDM84RT::Feedback receipt{};
+    if (!m_motion.ReadEDMCoordinatedRT(receipt) || !receipt.publication || !receipt.session)
+    {
+        if (c.lastClockUs - c.lastFeedbackUs >= 1000000ULL)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_RT_RECEIPT_TIMEOUT");
+        return false;
+    }
+    // A new asynchronous request can initially read the previous session's
+    // terminal bank. It grants no credit and is bounded by the start timeout.
+    if (!c.lastPublication && receipt.session < c.request.session)
+    {
+        if (c.lastClockUs - c.lastFeedbackUs >= 1000000ULL)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_RT_START_ACK_TIMEOUT");
+        return false;
+    }
+    if (receipt.session != c.request.session || receipt.latestSession != c.request.session ||
+        receipt.profile != c.request.profile || receipt.scenario != c.request.scenario || !EDM81::SameScope(receipt.scope, c.request.scope) ||
+        !EDM84RT::ToolHeadFeedbackIdentityValid(c.request, receipt) ||
+        !EDM84RT::SampledFeedbackIdentityValid(c.request, receipt) ||
+        !EDM84RT::PreviewFeedbackIdentityValid(c.request, receipt) ||
+        !EDM84RT::TrajectoryFeedbackIdentityValid(c.request, receipt) ||
+        !EDM84RT::BatchFeedbackIdentityValid(c.request, receipt) ||
+        !EDM84RT::ServoFeedbackIdentityValid(c.request, receipt) ||
+        receipt.cancelThroughSession >= c.request.session || receipt.publication < c.lastPublication || receipt.rtTick < c.lastRTTick)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_RT_RECEIPT_SCOPE"); return false; }
+    // Read the NC clock AFTER copying the RT bank: normal RT preemption may
+    // publish a sample newer than Validate's earlier QPC reading.
+    std::uint64_t observedUs = 0ULL;
+    if (!ReadEDMCoordinatedRTClockSameThread(observedUs) || observedUs < c.lastClockUs ||
+        observedUs - c.lastServiceUs > 100000ULL || observedUs - c.request.issuedUs >= c.deadlineUs ||
+        receipt.qpcFrequency != c.request.qpcFrequency || !receipt.nowUs ||
+        receipt.nowUs > observedUs || observedUs - receipt.nowUs > 100000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_RT_RECEIPT_CLOCK"); return false; }
+    c.lastClockUs = observedUs;
+    if (EDM84RT::IsOutputPreview(c.request.profile) && receipt.startAcknowledged)
+    {
+        if (c.machinePreviewSeen && !EDM90::SameConfig(c.acceptedPreviewConfig, receipt.previewConfig))
+        { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM90_PREVIEW_CONFIG_CHANGED"); return false; }
+        if (!c.machinePreviewSeen)
+        {
+            c.acceptedPreviewConfig = receipt.previewConfig;
+            c.machinePreviewSeen = true;
+            LogEDM90OutputPreviewConfiguration(c.request, receipt);
+            LogEDM91TrajectoryConfiguration(c.request, receipt);
+            LogEDM92CommandBatchConfiguration(c.request, receipt);
+            LogEDM93ServoSimulationConfiguration(c.request, receipt);
+        }
+    }
+    c.feedback = receipt;
+    if (receipt.publication > c.lastPublication && receipt.rtTick > c.lastRTTick)
+    { c.lastFeedbackUs = c.lastClockUs; c.lastPublication = receipt.publication; c.lastRTTick = receipt.rtTick; }
+    else if (c.lastClockUs - c.lastFeedbackUs >= 1000000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_RT_RECEIPT_STALLED"); return false; }
+    if (receipt.state == EDM84RT::State::Fault || receipt.state == EDM84RT::State::Cancelled)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, EDM84RT::ReasonName(receipt.reason)); return false; }
+    // Bounded NC-side milestones only; never log inside the 250 us callback.
+    const auto kernelState = static_cast<unsigned>(receipt.sample.state);
+    if (receipt.startAcknowledged && kernelState != c.lastLoggedKernelState && c.excursionLogCount < 24U)
+    {
+        const char* name = receipt.sample.state == EDM81::State::ShortRetreat ? "SHORT_RETREAT" :
+            receipt.sample.state == EDM81::State::JumpRetreat ? "JUMP_RETREAT" :
+            receipt.sample.state == EDM81::State::Returning ? "RETURNING" :
+            receipt.sample.state == EDM81::State::Running ? "RUNNING" : "TERMINAL";
+        char milestone[480]{};
+        const int length = std::snprintf(milestone, sizeof(milestone),
+            "[%s] event=EXCURSION state=%s session=%llu Q=%u stage=%u modelUs=%llu cursorMm=%.9f anchorMm=%.9f offsetMm=%.9f output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            tag, name, static_cast<unsigned long long>(c.request.session), static_cast<unsigned>(c.request.scenario),
+            receipt.stage, static_cast<unsigned long long>(receipt.modelUs),
+            receipt.sample.cursorMm, receipt.sample.anchorMm, receipt.sample.offsetMm);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(milestone)) RtPrintf("%s", milestone);
+        c.lastLoggedKernelState = kernelState; ++c.excursionLogCount;
+    }
+    if (receipt.state != EDM84RT::State::Completed || !receipt.startAcknowledged || !receipt.quiescent ||
+        !receipt.terminalTick || receipt.quiescentTick <= receipt.terminalTick || receipt.rtTick < receipt.quiescentTick)
+        return false;
+    if (receipt.reason != EDM84RT::Reason::None || !EDM84RT::CompletionCoverageValid(c.request, receipt) ||
+        !EDM84RT::BatchCompletionValid(c.request, receipt) ||
+        !EDM84RT::ServoCompletionValid(c.request, receipt) ||
+        !receipt.runtimeSteps || receipt.modelUs < EDM84RT::DurationUs(c.request) ||
+        receipt.sample.state != EDM81::State::Completed || receipt.sample.reason != EDM81::Reason::None ||
+        !EDM81::SameScope(receipt.sample.scope, c.request.scope) ||
+        receipt.sample.offsetMm != 0.0 || receipt.sample.cursorMm != receipt.sample.pathLengthMm ||
+        !std::isfinite(receipt.maxLinearErrorMm) || !std::isfinite(receipt.maxRotaryErrorDeg) ||
+        !std::isfinite(receipt.maxMappingErrorMm) || !std::isfinite(receipt.maxOffsetErrorMm) ||
+        receipt.maxLinearErrorMm < 0.0 || receipt.maxLinearErrorMm > 1e-10 ||
+        receipt.maxRotaryErrorDeg < 0.0 || receipt.maxRotaryErrorDeg > 1e-10 ||
+        receipt.maxMappingErrorMm < 0.0 || receipt.maxMappingErrorMm > 1e-10 ||
+        receipt.maxOffsetErrorMm < 0.0 || receipt.maxOffsetErrorMm > 1e-10)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_COMPLETION_EVIDENCE"); return false; }
+    if (!c.completedPublication)
+    {
+        c.completedFeedback = receipt;
+        c.completedPublication = receipt.publication; c.completedTick = receipt.rtTick;
+        c.completedTerminalTick = receipt.terminalTick; c.completedQuiescentTick = receipt.quiescentTick;
+        c.completedSteps = receipt.runtimeSteps;
+        c.completedModelUs = receipt.modelUs; c.completedCoverage = receipt.coverageMask;
+        LogEDMCoordinatedRTSameThread("COMPLETE_OBSERVED", "WAIT_SECOND_PUBLICATION");
+        return false;
+    }
+    if (receipt.publication <= c.completedPublication || receipt.rtTick <= c.completedTick) return false;
+    bool samePose = true;
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+        samePose = samePose && receipt.sample.pose[axis] == c.completedFeedback.sample.pose[axis] &&
+            receipt.sample.nominal[axis] == c.completedFeedback.sample.nominal[axis] &&
+            receipt.sample.anchorPose[axis] == c.completedFeedback.sample.anchorPose[axis];
+    for (unsigned axis = 0U; axis < 3U; ++axis)
+        samePose = samePose && receipt.sample.frozenDirection[axis] == c.completedFeedback.sample.frozenDirection[axis];
+    for (unsigned axis = 0U; axis < 3U; ++axis)
+        samePose = samePose && receipt.resolvedDirectionUnit[axis] == c.completedFeedback.resolvedDirectionUnit[axis];
+    if (!samePose || !EDM84RT::SameSampledTerminalEvidence(receipt, c.completedFeedback) ||
+        receipt.toolHeadProfileId != c.completedFeedback.toolHeadProfileId ||
+        receipt.toolHeadProfileRevision != c.completedFeedback.toolHeadProfileRevision ||
+        receipt.toolHeadCatalogRevision != c.completedFeedback.toolHeadCatalogRevision ||
+        receipt.toolHeadFingerprint != c.completedFeedback.toolHeadFingerprint ||
+        receipt.orientationSamples != c.completedFeedback.orientationSamples ||
+        receipt.maxOrientationNormError != c.completedFeedback.maxOrientationNormError ||
+        receipt.maxFrozenDirectionError != c.completedFeedback.maxFrozenDirectionError ||
+        receipt.sample.anchorMm != c.completedFeedback.sample.anchorMm ||
+        receipt.sample.ordinal != c.completedFeedback.sample.ordinal || receipt.sample.u != c.completedFeedback.sample.u ||
+        receipt.sample.steps != c.completedFeedback.sample.steps || receipt.stageMask != c.completedFeedback.stageMask ||
+        receipt.axisMovedMask != c.completedFeedback.axisMovedMask ||
+        receipt.nominalAxisMovedMask != c.completedFeedback.nominalAxisMovedMask ||
+        receipt.visitedRowMask != c.completedFeedback.visitedRowMask ||
+        receipt.source != c.completedFeedback.source || receipt.durationUs != c.completedFeedback.durationUs ||
+        receipt.maxLinearErrorMm != c.completedFeedback.maxLinearErrorMm ||
+        receipt.maxRotaryErrorDeg != c.completedFeedback.maxRotaryErrorDeg ||
+        receipt.maxMappingErrorMm != c.completedFeedback.maxMappingErrorMm ||
+        receipt.maxOffsetErrorMm != c.completedFeedback.maxOffsetErrorMm ||
+        receipt.terminalTick != c.completedTerminalTick || receipt.quiescentTick != c.completedQuiescentTick ||
+        receipt.runtimeSteps != c.completedSteps ||
+        receipt.modelUs != c.completedModelUs || receipt.coverageMask != c.completedCoverage ||
+        !IsEDMCoordinatedRTScopeCurrentSameThread() || !IsEDMCoordinatedRTRecipeCurrentSameThread())
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM84_TERMINAL_RECEIPT_CHANGED"); return false; }
+    // Even PASS retires the exact RT session. M30 cannot consume this wait
+    // until a later valid callback proves the cancelled calculator quiescent.
+    m_motion.CancelEDMCoordinatedRT(c.request.session);
+    c.cancelPublication = receipt.publication; c.cancelTick = receipt.rtTick; c.cancelUs = c.lastClockUs;
+    c.retirePending = c.completionPending = true;
+    LogEDMCoordinatedRTSameThread("RETIRE_REQUEST", "COMPLETED_TWO_PUBLICATIONS");
+    return false;
+}
+
 // EDM55: NC supervises a SIM-only RT servo session. No axis or PDO output.
 bool NCManager::ReadEDMGapServoClockSameThread(std::uint64_t& nowUs) noexcept
 {
@@ -2115,6 +4373,9 @@ bool NCManager::RestartEDMGapServoRTSameThread(std::uint64_t nowUs)
 
 WaitConditionFunc NCManager::StartEDMGapServoRTSameThread(const NCBlock& block)
 {
+    ServiceEDMPhysicalServoRetirementSameThread();
+    if (m_edmPhysicalServoRT.retirePending)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, m_gapDryRun.sourceLine, "EDM69_RETIREMENT_PENDING"); return nullptr; }
     const int line = m_gapDryRun.sourceLine;
     const auto profile = block.val('P') == 34.0 ? EDM55RT::Profile::Stale : EDM55RT::Profile::Normal;
     const auto entryEpoch = m_motion.GetCurrentExecutionEpoch();
@@ -2188,6 +4449,7 @@ WaitConditionFunc NCManager::StartEDMGapServoRTSameThread(const NCBlock& block)
 
 void NCManager::ServiceEDMGapServoRetirementSameThread() noexcept
 {
+    ServiceEDMPhysicalServoRetirementSameThread();
     auto& control = m_edmGapServoRT;
     if (!control.retirePending || control.retired || !control.scope.session) return;
     EDM55RT::Feedback feedback{};
@@ -2475,8 +4737,2302 @@ bool NCManager::ProcessEDMGapServoRTSameThread()
     return false;
 }
 
+// EDM69 owns a live, explicitly cancellable physical-source RT calculation.
+// It has no axis output/arm path; terminal zero proves this consumer only.
+WaitConditionFunc NCManager::StartEDMPhysicalServoRTSameThread(const NCBlock& block)
+{
+    ServiceEDMPhysicalServoRetirementSameThread();
+    const int line = m_gapDryRun.sourceLine;
+    if (m_gapDryRun.active || m_edmPhysicalServoRT.retirePending ||
+        m_edmZFixture.cleanupPending || m_edmZFixture.resetPending ||
+        m_edmZFixture.failureAlarmPending || m_edmGapServoRT.retirePending)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM69_PREVIOUS_SESSION_BUSY"); return nullptr; }
+    m_gapDryRun = GapDryRunState{};
+    m_gapDryRun.physicalServoRTTest = true; m_gapDryRun.sourceLine = line;
+    m_edmPhysicalServoRT = EDMPhysicalServoRTControlState{};
+    if (!IsGapDryRunBlockShapeValid(block) || !block.has('P') || block.val('P') != 55.0)
+    { RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM69_BLOCK_SHAPE"); return nullptr; }
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    if ((mask & ~(1ULL << 9U)) || m_edmGapMaster == nullptr || !m_edmProcessReady ||
+        m_currentExecutingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        !m_pathCoreLiveBookkeeping.currentRunToken || !GetBaseProgramCache().GetGeneration() ||
+        m_gapDryRunSerial == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_edmZFixtureSessionSerial == (std::numeric_limits<std::uint64_t>::max)())
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM69_NOT_READY"); return nullptr; }
+    EDMRecipe::Summary summary{};
+    if (!ReadEDMRecipeSummarySameThread(summary))
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM69_RECIPE_SCOPE"); return nullptr; }
+    const auto binding = EDM59::BindPhysicalServoRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    if (!binding.ready)
+    { RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM69_RECIPE_BIND_REJECTED"); return nullptr; }
+    LARGE_INTEGER frequency{};
+    if (!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(frequency.QuadPart) > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM69_CLOCK_FREQUENCY"); return nullptr; }
+    m_gapDryRun.frequency = static_cast<std::uint64_t>(frequency.QuadPart);
+    m_gapDryRun.test = ++m_gapDryRunSerial;
+    m_gapDryRun.run = m_pathCoreLiveBookkeeping.currentRunToken;
+    m_gapDryRun.cache = GetBaseProgramCache().GetGeneration();
+    m_gapDryRun.dispatch = m_currentExecutingBlockDispatchId;
+    m_gapDryRun.epoch = m_motion.GetCurrentExecutionEpoch(); m_gapDryRun.lease = m_programMotionLease;
+    RtPrintf("[EDM69] event=BUILD P=55 mode=PHYSICAL_RT_CONSUMER windowMs=10000 ackTimeoutMs=500 totalTimeoutMs=12000 heartbeatMs=100 terminal=TWO_FRESH_ZERO_READS hold=CANCEL_RESET_REQUIRED consumerOnly=1 axisReceipt=0 physicalLowShortVerified=0 motion=0 physicalPermit=0 discharge=0\n");
+    // Read physical data before the NC clock. No console work follows START
+    // until this session has stopped and cancellation has been requested.
+    EDM64::Snapshot physical{};
+    const auto stamp = m_edmGapMaster->ReadGapPhysicalRTShadow(physical);
+    std::uint64_t nowUs = 0ULL;
+    const bool clockValid = ReadEDMGapServoClockSameThread(nowUs);
+    EDM64::PhysicalRTShadow::ValidateRead(physical, stamp, nowUs, clockValid, m_gapDryRun.frequency);
+    if (!clockValid || !stamp.Ready() || physical.readerState != EDM64::ReaderState::Fresh ||
+        physical.state != EDM64::State::Valid || !physical.output.valid ||
+        physical.identity.source != EDM55::SourceKind::Physical || !physical.input.Usable() ||
+        physical.physicalPermit || physical.discharge)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM69_PHYSICAL_SOURCE_NOT_READY"); return nullptr; }
+    auto& control = m_edmPhysicalServoRT;
+    auto& request = control.request;
+    request.capture.recipe = binding.recipe;
+    // Share the existing serial without publishing an EDM65 historical recipe.
+    request.capture.scope.session = ++m_edmZFixtureSessionSerial;
+    request.capture.scope.run = m_gapDryRun.run; request.capture.scope.cache = m_gapDryRun.cache;
+    request.capture.scope.dispatch = m_gapDryRun.dispatch; request.capture.scope.epoch = m_gapDryRun.epoch;
+    request.capture.scope.owner = static_cast<std::uint32_t>(m_gapDryRun.lease.owner);
+    request.capture.scope.ownerGeneration = m_gapDryRun.lease.generation;
+    request.capture.capturedUs = nowUs; request.capture.qpcFrequency = m_gapDryRun.frequency;
+    request.physicalIdentity = physical.identity;
+    request.route = EDM63::ProducerRoute(physical.input.sample);
+    request.baselineSequence = physical.input.sample.sequence;
+    request.baselineCapturedUs = physical.input.sample.capturedAtUs;
+    request.maxAgeUs = physical.maxAgeUs; request.maxTickGapUs = physical.maxTickGapUs;
+    control.submittedUs = control.lastClockUs = control.lastFreshUs = nowUs;
+    m_gapDryRun.active = true; m_gapDryRun.lastServiceMs = nowUs / 1000ULL;
+    const bool started = m_motion.StartEDMPhysicalServoRT(request);
+    // A transport failure may still have reserved the identity and queued a
+    // cancellation. Track that reservation even when START returned false.
+    control.issued = m_motion.ReadEDMPhysicalServoRTLatestSession() == request.capture.scope.session;
+    if (!started || !control.issued)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM69_START_REJECTED"); return nullptr; }
+    if (!m_motion.TouchEDMPhysicalServoRT(request.capture.scope.session, nowUs))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, line, "EDM69_INITIAL_HEARTBEAT_REJECTED"); return nullptr; }
+    return WaitForGapDryRunCallback;
+}
+
+bool NCManager::IsEDMPhysicalServoScopeCurrentSameThread() const noexcept
+{
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    return m_gapDryRun.physicalServoRTTest && !(mask & ~(1ULL << 9U)) &&
+        m_gapDryRun.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        m_gapDryRun.cache == GetBaseProgramCache().GetGeneration() &&
+        m_gapDryRun.dispatch == m_waitingBlockDispatchId &&
+        m_gapDryRun.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        m_gapDryRun.lease.Matches(m_programMotionLease) &&
+        m_motion.IsMotionOwnerLeaseCurrent(m_gapDryRun.lease);
+}
+
+void NCManager::EndEDMPhysicalServoRTSameThread(bool failed, const char* reason) noexcept
+{
+    // ChangeState(ALARM) re-enters generic cancellation; never downgrade FAIL.
+    if (!m_gapDryRun.active && m_gapDryRun.result == 3U) return;
+    auto& control = m_edmPhysicalServoRT;
+    const bool report = m_gapDryRun.active || (failed && m_gapDryRun.result != 3U);
+    // Atomic cancellation precedes console IO and NC result bookkeeping.
+    if (control.issued && !control.retired)
+    {
+        m_motion.CancelEDMPhysicalServoRT(control.request.capture.scope.session);
+        if (!control.retirePending)
+        {
+            control.retirePending = true; control.retireStartedUs = control.lastClockUs;
+            control.retirePolls = 0U;
+        }
+    }
+    m_gapDryRun.active = false; m_gapDryRun.paused = false;
+    m_gapDryRun.result = failed ? 3U : 2U;
+    if (report)
+        RtPrintf("[EDM69] event=SUMMARY result=%s reason=%.64s P=55 session=%llu retainedCredit=0 next=RESET_THEN_EXPLICIT_P55 consumerOnly=1 axisReceipt=0 physicalLowShortVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+            failed ? "FAIL" : "CANCELLED", reason ? reason : "UNKNOWN",
+            static_cast<unsigned long long>(control.request.capture.scope.session));
+}
+
+void NCManager::ServiceEDMPhysicalServoRetirementSameThread() noexcept
+{
+    auto& control = m_edmPhysicalServoRT;
+    if (!control.retirePending || control.retired || !control.issued) return;
+    EDM69::Feedback feedback{};
+    const bool captured = m_motion.ReadEDMPhysicalServoRT(feedback);
+    std::uint64_t nowUs = 0ULL;
+    const bool clockValid = ReadEDMGapServoClockSameThread(nowUs);
+    // During recovery a failed NC clock cannot erase an exact later RT zero
+    // receipt. This proves channel retirement only, never physical standstill.
+    const bool fresh = !clockValid || (feedback.nowUs && feedback.nowUs <= nowUs &&
+        nowUs - feedback.nowUs <= EDM69::HeartbeatMaximumAgeUs);
+    if (captured && fresh && EDM69::SameRequest(feedback.request, control.request) &&
+        feedback.latestSession == control.request.capture.scope.session &&
+        feedback.cancelThroughSession >= control.request.capture.scope.session &&
+        feedback.publication && feedback.rtTick && feedback.terminalTick && feedback.zeroReceipt &&
+        feedback.zeroReceiptTick > feedback.terminalTick && feedback.rtTick >= feedback.zeroReceiptTick &&
+        feedback.output.targetMmPerMin == 0.0 && feedback.output.speedMmPerMin == 0.0 &&
+        !feedback.physicalPermit && !feedback.discharge &&
+        (feedback.state == EDM69::State::Cancelled || feedback.state == EDM69::State::Fault))
+    {
+        control.feedback = feedback; control.retired = true; control.retirePending = false;
+        RtPrintf("[EDM69] event=RETIRED session=%llu terminalTick=%llu zeroTick=%llu consumerOnly=1 axisReceipt=0 physicalLowShortVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+            static_cast<unsigned long long>(control.request.capture.scope.session),
+            static_cast<unsigned long long>(feedback.terminalTick), static_cast<unsigned long long>(feedback.zeroReceiptTick));
+        return;
+    }
+    if (control.retirePolls < 4096U) ++control.retirePolls;
+    const bool expired = clockValid && nowUs >= control.retireStartedUs &&
+        nowUs - control.retireStartedUs >= 1000000ULL;
+    if (!control.retireTimeoutReported && (expired || control.retirePolls >= 4096U))
+    {
+        control.retireTimeoutReported = true;
+        RtPrintf("[EDM69] event=RETIREMENT_TIMEOUT result=FAIL session=%llu pending=1 consumerOnly=1 axisReceipt=0 physicalLowShortVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+            static_cast<unsigned long long>(control.request.capture.scope.session));
+        if (!AlarmManager::GetInstance().HasAlarm())
+        { AlarmManager::GetInstance().Trigger(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine); ChangeState(NCState::ALARM); }
+    }
+}
+
+void NCManager::ValidateEDMPhysicalServoRTSameThread()
+{
+    ServiceEDMPhysicalServoRetirementSameThread();
+    if (!m_gapDryRun.active && m_gapDryRun.result != 1U) return;
+    // Classify HOLD locally before observing the RT owner's authority fault.
+    if (m_state == NCState::HOLD || m_edmState == EDMState::HOLD)
+    { EndEDMPhysicalServoRTSameThread(false, "HOLD_RESET_REQUIRED"); return; }
+    if (!IsEDMPhysicalServoScopeCurrentSameThread())
+    { EndEDMPhysicalServoRTSameThread(false, "NC_SCOPE_REVOKED"); return; }
+    auto& control = m_edmPhysicalServoRT;
+    // Read only the already-bound owner-thread recipe while active. The idle
+    // summary reader deliberately rejects active diagnostics and stays intact.
+    const auto binding = EDM59::BindPhysicalServoRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    if (!m_edmProcessReady || m_recipeRecoveryDisplayOnly || m_recipeIdleSelection || m_recipeHoldSeen ||
+        m_recipeRun != m_gapDryRun.run || m_recipeCache != m_gapDryRun.cache ||
+        m_recipeEpoch != m_gapDryRun.epoch || !m_recipeLease.Matches(m_gapDryRun.lease) || !binding.ready ||
+        !EDM59::SameRecipe(binding.recipe, control.request.capture.recipe))
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_LIVE_RECIPE_CHANGED"); return; }
+    if (control.completed && m_gapDryRun.result == 1U) return;
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs) || nowUs < control.lastClockUs || nowUs < control.submittedUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_CLOCK_INVALID"); return; }
+    if (nowUs == control.lastClockUs) ++control.stalledPolls;
+    else { control.lastClockUs = nowUs; control.stalledPolls = 0U; }
+    if (control.stalledPolls >= 4096U || nowUs - control.submittedUs >= EDM69::TotalDeadlineUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine,
+        control.stalledPolls >= 4096U ? "EDM69_CLOCK_STALLED" : "EDM69_TOTAL_TIMEOUT"); return; }
+    if (!m_motion.TouchEDMPhysicalServoRT(control.request.capture.scope.session, nowUs))
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_HEARTBEAT_REJECTED");
+}
+
+bool NCManager::ProcessEDMPhysicalServoRTSameThread()
+{
+    ValidateEDMPhysicalServoRTSameThread();
+    auto& control = m_edmPhysicalServoRT;
+    if (!m_gapDryRun.active)
+    {
+        if (m_gapDryRun.result == 1U && control.completed && IsEDMPhysicalServoScopeCurrentSameThread()) return true;
+        if (m_gapDryRun.result == 2U && m_state == NCState::RUN &&
+            !AlarmManager::GetInstance().HasAlarm() && m_resetContinuationPhase == ResetContinuationPhase::IDLE)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_CANCELLED_CALLBACK_RESET_REQUIRED");
+        return false;
+    }
+    EDM69::Feedback feedback{};
+    const bool captured = m_motion.ReadEDMPhysicalServoRT(feedback);
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs) || nowUs < control.lastClockUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_READBACK_CLOCK"); return false; }
+    const bool matching = captured && EDM69::SameRequest(feedback.request, control.request) &&
+        feedback.latestSession == control.request.capture.scope.session;
+    const bool fresh = matching && feedback.publication && feedback.rtTick && feedback.nowUs &&
+        feedback.qpcFrequency == control.request.capture.qpcFrequency && feedback.nowUs <= nowUs &&
+        nowUs - feedback.nowUs <= EDM69::HeartbeatMaximumAgeUs;
+    if (!fresh)
+    {
+        if ((captured && feedback.latestSession > control.request.capture.scope.session) ||
+            (!control.feedback.startAcknowledged && nowUs - control.submittedUs >= EDM69::StartDeadlineUs) ||
+            (control.feedback.startAcknowledged && nowUs - control.lastFreshUs >= EDM69::HeartbeatMaximumAgeUs))
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_RECEIPT_TIMEOUT_OR_SCOPE");
+        return false;
+    }
+    if (feedback.publication < control.feedback.publication || feedback.rtTick < control.feedback.rtTick ||
+        feedback.physicalPermit || feedback.discharge ||
+        feedback.state == EDM69::State::Fault || feedback.state == EDM69::State::Cancelled)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine,
+        feedback.state == EDM69::State::Fault ? EDM69::ReasonName(feedback.reason) : "EDM69_RECEIPT_REVOKED"); return false; }
+    const bool advanced = feedback.publication > control.feedback.publication && feedback.rtTick > control.feedback.rtTick;
+    if (advanced) control.lastFreshUs = nowUs;
+    control.feedback = feedback;
+    if (!feedback.startAcknowledged && nowUs - control.submittedUs >= EDM69::StartDeadlineUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_START_ACK_TIMEOUT"); return false; }
+    if (!advanced)
+    {
+        if (nowUs - control.lastFreshUs >= EDM69::HeartbeatMaximumAgeUs)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_FROZEN_FEEDBACK");
+        return false;
+    }
+    if (feedback.state != EDM69::State::Completed) return false;
+    auto identity = control.request.physicalIdentity; identity.session = control.request.capture.scope.session;
+    const auto& coverage = feedback.coverage;
+    const bool validTerminal = feedback.startAcknowledged && feedback.zeroReceipt && feedback.terminalTick &&
+        feedback.zeroReceiptTick > feedback.terminalTick && feedback.rtTick >= feedback.zeroReceiptTick &&
+        feedback.output.targetMmPerMin == 0.0 && feedback.output.speedMmPerMin == 0.0 &&
+        EDM55::SameIdentity(feedback.kernelIdentity, identity) &&
+        coverage.hasSamples && !coverage.saturated && coverage.freshSamples >= 2ULL &&
+        coverage.validTicks == feedback.runtimeSteps && coverage.freshSamples <= coverage.validTicks &&
+        feedback.firstSourceCapturedUs > control.request.baselineCapturedUs &&
+        feedback.output.capturedAtUs >= feedback.firstSourceCapturedUs &&
+        feedback.output.capturedAtUs - feedback.firstSourceCapturedUs >= EDM69::DurationUs &&
+        feedback.sourceCapturedUs >= feedback.output.capturedAtUs &&
+        coverage.lastObservedUs >= coverage.firstObservedUs &&
+        coverage.lastObservedUs - coverage.firstObservedUs >= EDM69::DurationUs &&
+        coverage.firstSourceSequence > control.request.baselineSequence &&
+        coverage.lastSourceSequence >= coverage.firstSourceSequence &&
+        feedback.output.sequence == coverage.lastSourceSequence &&
+        feedback.sourceSequence >= coverage.lastSourceSequence && feedback.minimumStepUs &&
+        feedback.maximumStepUs <= control.request.maxTickGapUs &&
+        feedback.maximumSourceAgeUs <= control.request.maxAgeUs &&
+        std::isfinite(feedback.maximumTargetError) && feedback.maximumTargetError <= 1e-8;
+    if (!validTerminal)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_TERMINAL_PROOF_INVALID"); return false; }
+    if (!control.terminalPublication)
+    {
+        control.terminalPublication = feedback.publication; control.terminalObservedTick = feedback.rtTick;
+        control.terminalIdentityTick = feedback.terminalTick; control.zeroIdentityTick = feedback.zeroReceiptTick;
+        return false;
+    }
+    if (feedback.terminalTick != control.terminalIdentityTick || feedback.zeroReceiptTick != control.zeroIdentityTick)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM69_TERMINAL_IDENTITY_CHANGED"); return false; }
+    if (feedback.publication <= control.terminalPublication || feedback.rtTick <= control.terminalObservedTick) return false;
+    // Completion is a stored two-read proof. Retire asynchronously before logs;
+    // an outer completion poll can retain this proof without relabelling Cancelled.
+    m_motion.CancelEDMPhysicalServoRT(control.request.capture.scope.session);
+    control.retirePending = true; control.retireStartedUs = nowUs; control.retirePolls = 0U;
+    control.completed = true; m_gapDryRun.active = false; m_gapDryRun.result = 1U;
+    char text[480]{};
+    int size = std::snprintf(text, sizeof(text),
+        "[EDM69] event=PASS result=PASS P=55 session=%llu observedMs=%llu steps=%llu fresh=%llu E8=%.6f E9=%.6f terminalTick=%llu zeroTick=%llu targetCheck=PASS consumerOnly=1 axisReceipt=0 physicalLowShortVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+        static_cast<unsigned long long>(control.request.capture.scope.session),
+        static_cast<unsigned long long>((feedback.output.capturedAtUs-feedback.firstSourceCapturedUs)/1000ULL),
+        static_cast<unsigned long long>(feedback.runtimeSteps), static_cast<unsigned long long>(coverage.freshSamples),
+        control.request.capture.recipe.overridePercent, control.request.capture.recipe.referenceV,
+        static_cast<unsigned long long>(feedback.terminalTick), static_cast<unsigned long long>(feedback.zeroReceiptTick));
+    if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+    size = std::snprintf(text, sizeof(text),
+        "[EDM69] event=SOURCE session=%llu source=PHYSICAL sourceId=%llu sourceGen=%llu calibration=%llu firstSeq=%llu lastSeq=%llu maxSourceAgeUs=%llu minStepUs=%llu maxStepUs=%llu scope=MOTION_RT_CONSUMER consumerOnly=1 axisReceipt=0 physicalLowShortVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+        static_cast<unsigned long long>(control.request.capture.scope.session),
+        static_cast<unsigned long long>(identity.sourceId), static_cast<unsigned long long>(identity.sourceGeneration),
+        static_cast<unsigned long long>(identity.calibrationRevision), static_cast<unsigned long long>(coverage.firstSourceSequence),
+        static_cast<unsigned long long>(coverage.lastSourceSequence), static_cast<unsigned long long>(feedback.maximumSourceAgeUs),
+        static_cast<unsigned long long>(feedback.minimumStepUs), static_cast<unsigned long long>(feedback.maximumStepUs));
+    if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+    size = std::snprintf(text, sizeof(text),
+        "[EDM69] event=RANGE session=%llu rawMinV=%.6f rawMaxV=%.6f advanceTicks=%llu retreatTicks=%llu shortTicks=%llu shortEntries=%llu shortExits=%llu maxTargetError=%.9g scope=MOTION_RT_CONSUMER consumerOnly=1 axisReceipt=0 physicalLowShortVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+        static_cast<unsigned long long>(control.request.capture.scope.session), coverage.minRawV, coverage.maxRawV,
+        static_cast<unsigned long long>(coverage.advanceTicks), static_cast<unsigned long long>(coverage.retreatTicks),
+        static_cast<unsigned long long>(coverage.shortTicks), static_cast<unsigned long long>(coverage.shortEntries),
+        static_cast<unsigned long long>(coverage.shortExits), feedback.maximumTargetError);
+    if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+    return true;
+}
+
+// EDM67 owns only an NC-side receipt for an independent PDO diagnostic.
+// It never starts, cancels, rearms or acknowledges axis motion.
+WaitConditionFunc NCManager::StartEDMPhysicalRecipeCaptureSameThread(const NCBlock& block)
+{
+    ServiceEDMPhysicalServoRetirementSameThread();
+    if (m_edmPhysicalServoRT.retirePending)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, m_gapDryRun.sourceLine, "EDM69_RETIREMENT_PENDING"); return nullptr; }
+    const int line = m_gapDryRun.sourceLine;
+    const bool window = block.has('P') && block.val('P') == 54.0;
+    const char* tag = window ? "EDM68" : "EDM67";
+    if (m_gapDryRun.active || m_edmZFixture.cleanupPending || m_edmZFixture.resetPending ||
+        m_edmZFixture.failureAlarmPending || m_edmGapServoRT.retirePending)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, (window ? "EDM68_PREVIOUS_SESSION_BUSY" : "EDM67_PREVIOUS_SESSION_BUSY")); return nullptr; }
+    m_gapDryRun = GapDryRunState{};
+    m_gapDryRun.physicalRecipeCaptureTest = true; m_gapDryRun.physicalRecipeWindowTest = window;
+    m_gapDryRun.sourceLine = line;
+    m_edmPhysicalRecipeCapture = EDMPhysicalRecipeCaptureState{};
+    m_edmPhysicalRecipeWindow = EDM68::WindowReceipt{};
+    if (!IsGapDryRunBlockShapeValid(block))
+    { RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter, line, (window ? "EDM68_BLOCK_SHAPE" : "EDM67_BLOCK_SHAPE")); return nullptr; }
+    std::uint64_t mask = 0ULL;
+    (void)IsEDMGapServoRunReadySameThread(&mask);
+    // No axis application is requested. Retain program/queue/interlock
+    // quiescence, but the axis-specific Arm proof (bit 9) is not required.
+    if ((mask & ~(1ULL << 9U)) || m_edmGapMaster == nullptr || !m_edmProcessReady ||
+        m_currentExecutingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        !m_pathCoreLiveBookkeeping.currentRunToken || !GetBaseProgramCache().GetGeneration() ||
+        m_gapDryRunSerial == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_edmZFixtureSessionSerial == (std::numeric_limits<std::uint64_t>::max)())
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, (window ? "EDM68_NOT_READY" : "EDM67_NOT_READY")); return nullptr; }
+    EDMRecipe::Summary summary{};
+    if (!ReadEDMRecipeSummarySameThread(summary))
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, (window ? "EDM68_RECIPE_SCOPE" : "EDM67_RECIPE_SCOPE")); return nullptr; }
+    const auto binding = EDM59::BindPhysicalServoRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    if (!binding.ready)
+    {
+        RtPrintf("[%s] event=RECIPE_BIND result=REJECT reason=%s field=%u motion=0 physicalPermit=0 discharge=0\n",
+            tag, EDM59::BindingErrorName(binding.error), static_cast<unsigned>(binding.failedFieldId));
+        RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter, line, (window ? "EDM68_RECIPE_BIND_REJECTED" : "EDM67_RECIPE_BIND_REJECTED")); return nullptr;
+    }
+    LARGE_INTEGER frequency{};
+    if (!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(frequency.QuadPart) > (std::numeric_limits<std::uint64_t>::max)() / 1000000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, (window ? "EDM68_CLOCK_FREQUENCY" : "EDM67_CLOCK_FREQUENCY")); return nullptr; }
+    m_gapDryRun.frequency = static_cast<std::uint64_t>(frequency.QuadPart);
+    m_gapDryRun.test = ++m_gapDryRunSerial;
+    m_gapDryRun.run = m_pathCoreLiveBookkeeping.currentRunToken;
+    m_gapDryRun.cache = GetBaseProgramCache().GetGeneration();
+    m_gapDryRun.dispatch = m_currentExecutingBlockDispatchId;
+    m_gapDryRun.epoch = m_motion.GetCurrentExecutionEpoch(); m_gapDryRun.lease = m_programMotionLease;
+    if (window)
+        RtPrintf("[EDM68] event=BUILD P=54 mode=PHYSICAL_RECIPE_WINDOW windowMs=10000 ackTimeoutMs=500 totalTimeoutMs=12000 consumerGapMs=100 targetCheck=FROZEN_CURVE hold=CANCEL_RESET_REQUIRED reset=EXPLICIT_RECAPTURE motion=0 physicalPermit=0 discharge=0\n");
+    else
+        RtPrintf("[EDM67] event=BUILD P=53 mode=PHYSICAL_RECIPE_CAPTURE_ONLY receipt=TWO_FRESH_PDO_OBSERVATIONS ackTimeoutMs=500 freeze=EXPLICIT_CAPTURE hold=CANCEL_WAIT reset=RECAPTURE_EXPLICIT E8range=50..100 E9range=55..65 motion=0 physicalPermit=0 discharge=0\n");
+    // Console work is complete before the two source copies and consumer
+    // clock. The request's 100ms PDO adoption window starts after these reads.
+    EDM64::Snapshot physical{}; EDM65::Snapshot previous{};
+    const auto physicalStamp = m_edmGapMaster->ReadGapPhysicalRTShadow(physical);
+    const auto previousStamp = m_edmGapMaster->ReadGapPhysicalRecipeRTShadow(previous);
+    std::uint64_t nowUs = 0ULL;
+    const bool clockValid = ReadEDMGapServoClockSameThread(nowUs);
+    EDM64::PhysicalRTShadow::ValidateRead(physical, physicalStamp, nowUs, clockValid, m_gapDryRun.frequency);
+    EDM65::PhysicalRecipeRTShadow::ValidateRead(previous, previousStamp, nowUs, clockValid, m_gapDryRun.frequency);
+    if (!clockValid || !physicalStamp.Ready() || physical.readerState != EDM64::ReaderState::Fresh ||
+        physical.state != EDM64::State::Valid || !physical.output.valid ||
+        physical.identity.source != EDM55::SourceKind::Physical || !physical.input.Usable() ||
+        !previousStamp.Ready() || previous.readerState != EDM64::ReaderState::Fresh ||
+        previous.state == EDM65::State::Revoked || previous.physicalPermit || previous.discharge ||
+        previous.request.scope.session > m_edmZFixtureSessionSerial)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, (window ? "EDM68_PHYSICAL_SOURCE_NOT_READY" : "EDM67_PHYSICAL_SOURCE_NOT_READY")); return nullptr; }
+    EDM65::Request request{};
+    request.recipe = binding.recipe;
+    // P49..P54 share one monotonically increasing capture identity.
+    // A separate counter would regress EDM65 and permanently revoke it.
+    request.scope.session = ++m_edmZFixtureSessionSerial;
+    request.scope.run = m_gapDryRun.run; request.scope.cache = m_gapDryRun.cache;
+    request.scope.dispatch = m_gapDryRun.dispatch; request.scope.epoch = m_gapDryRun.epoch;
+    request.scope.owner = static_cast<std::uint32_t>(m_gapDryRun.lease.owner);
+    request.scope.ownerGeneration = m_gapDryRun.lease.generation;
+    request.capturedUs = nowUs; request.qpcFrequency = m_gapDryRun.frequency;
+    auto& control = m_edmPhysicalRecipeCapture;
+    const bool begun = window ?
+        m_edmPhysicalRecipeWindow.Begin(request, previousStamp.publication, physical.input.sample.sequence) :
+        control.receipt.Begin(request, previousStamp.publication, physical.input.sample.sequence);
+    if (!begun)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, (window ? "EDM68_REQUEST_INVALID" : "EDM67_REQUEST_INVALID")); return nullptr; }
+    control.submittedUs = control.lastClockUs = nowUs;
+    m_gapDryRun.active = true; m_gapDryRun.lastServiceMs = nowUs / 1000ULL;
+    if (!m_edmGapMaster->PublishGapPhysicalRecipeRTShadow(request))
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, (window ? "EDM68_PUBLISH_REJECTED" : "EDM67_PUBLISH_REJECTED")); return nullptr; }
+    // Publication alone never grants PASS. No console IO before readback.
+    return WaitForGapDryRunCallback;
+}
+
+void NCManager::EndEDMPhysicalRecipeCaptureSameThread(bool failed, const char* reason) noexcept
+{
+    if (!m_gapDryRun.active && m_gapDryRun.result == 3U) return;
+    const bool report = m_gapDryRun.active || failed || m_gapDryRun.result == 0U;
+    m_gapDryRun.active = m_gapDryRun.paused = false;
+    m_gapDryRun.result = failed ? 3U : 2U;
+    m_edmPhysicalRecipeCapture.receipt.Cancel();
+    m_edmPhysicalRecipeWindow.Cancel();
+    // This cancels only the NC receipt. The already-published immutable
+    // shadow recipe and its history continue until an explicit new capture.
+    if (report)
+        RtPrintf("[%s] event=SUMMARY result=%s reason=%.64s test=%llu session=%llu observerRetained=1 resetRequired=1 motion=0 physicalPermit=0 discharge=0\n",
+            m_gapDryRun.physicalRecipeWindowTest ? "EDM68" : "EDM67", failed ? "FAIL" : "CANCELLED", reason ? reason : "UNKNOWN",
+            static_cast<unsigned long long>(m_gapDryRun.test),
+            static_cast<unsigned long long>(m_gapDryRun.physicalRecipeWindowTest ?
+                m_edmPhysicalRecipeWindow.Request().scope.session : m_edmPhysicalRecipeCapture.receipt.Request().scope.session));
+    if (report && m_gapDryRun.physicalRecipeWindowTest)
+    {
+        const auto& window = m_edmPhysicalRecipeWindow.Report();
+        RtPrintf("[EDM68] event=WINDOW_CANCELLED session=%llu observedMs=%llu reads=%llu pdoDelta=%llu retainedCredit=0 next=RESET_THEN_EXPLICIT_P54 motion=0 physicalPermit=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edmPhysicalRecipeWindow.Request().scope.session),
+            static_cast<unsigned long long>(window.durationUs / 1000ULL),
+            static_cast<unsigned long long>(window.freshObservations), static_cast<unsigned long long>(window.sourcePdoDelta));
+    }
+}
+
+void NCManager::ValidateEDMPhysicalRecipeCaptureSameThread()
+{
+    if (!m_gapDryRun.active && m_gapDryRun.result != 1U) return;
+    if (m_state == NCState::HOLD || m_edmState == EDMState::HOLD)
+    { EndEDMPhysicalRecipeCaptureSameThread(false, "HOLD_RESET_REQUIRED"); return; }
+    if (!IsEDMShortFlushRunReadySameThread() ||
+        m_gapDryRun.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        m_gapDryRun.cache != GetBaseProgramCache().GetGeneration() ||
+        m_gapDryRun.dispatch != m_waitingBlockDispatchId ||
+        m_gapDryRun.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !m_gapDryRun.lease.Matches(m_programMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_gapDryRun.lease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !m_motion.IsGroupDone() ||
+        m_motion.GetCommandIngressSize() != 0U || m_motion.GetCommandReplaySize() != 0U ||
+        m_isG66Active || !m_macroStack.empty())
+    { EndEDMPhysicalRecipeCaptureSameThread(false, "NC_SCOPE_REVOKED"); return; }
+    if (m_gapDryRun.physicalRecipeWindowTest)
+    {
+        // An external recipe/tuning edit cannot silently replace a running
+        // diagnostic's frozen configuration. A new explicit P54 is required.
+        // ReadEDMRecipeSummarySameThread is an idle/admission reader and
+        // deliberately rejects active diagnostics. Keep that guard intact;
+        // verify the already-bound recipe authority without rebinding it.
+        const auto binding = EDM59::BindPhysicalServoRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+        if (!m_edmProcessReady || m_recipeRecoveryDisplayOnly || m_recipeIdleSelection || m_recipeHoldSeen ||
+            m_recipeRun != m_gapDryRun.run || m_recipeCache != m_gapDryRun.cache ||
+            m_recipeEpoch != m_gapDryRun.epoch || !m_recipeLease.Matches(m_gapDryRun.lease) || !binding.ready ||
+            !EDM59::SameRecipe(binding.recipe, m_edmPhysicalRecipeWindow.Request().recipe))
+        { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, "EDM68_LIVE_RECIPE_CHANGED"); return; }
+    }
+    auto& control = m_edmPhysicalRecipeCapture;
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs) || nowUs < control.lastClockUs || nowUs < control.submittedUs)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, (m_gapDryRun.physicalRecipeWindowTest ? "EDM68_CLOCK_INVALID" : "EDM67_CLOCK_INVALID")); return; }
+    if (nowUs == control.lastClockUs) ++control.stalledPolls;
+    else { control.lastClockUs = nowUs; control.stalledPolls = 0U; }
+    const auto deadline = m_gapDryRun.physicalRecipeWindowTest ? EDM68::TotalDeadlineUs : EDM67::ReceiptDeadlineUs;
+    if (nowUs - control.submittedUs >= deadline || control.stalledPolls >= EDM67::MaximumStalledCalls)
+        RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine,
+            control.stalledPolls >= EDM67::MaximumStalledCalls ?
+                (m_gapDryRun.physicalRecipeWindowTest ? "EDM68_CLOCK_STALLED" : "EDM67_CLOCK_STALLED") :
+            m_gapDryRun.physicalRecipeWindowTest ? "EDM68_WINDOW_TIMEOUT" : "EDM67_CAPTURE_TIMEOUT");
+}
+
+bool NCManager::ProcessEDMPhysicalRecipeCaptureSameThread()
+{
+    ValidateEDMPhysicalRecipeCaptureSameThread();
+    if (!m_gapDryRun.active && m_gapDryRun.result != 1U)
+    {
+        if (m_gapDryRun.result == 2U && m_state == NCState::RUN &&
+            !AlarmManager::GetInstance().HasAlarm() && m_resetContinuationPhase == ResetContinuationPhase::IDLE)
+            RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, (m_gapDryRun.physicalRecipeWindowTest ? "EDM68_CANCELLED_CALLBACK_RESET_REQUIRED" : "EDM67_CANCELLED_CALLBACK_RESET_REQUIRED"));
+        return false; // Cancellation never restarts or republishes the capture.
+    }
+    if (m_edmGapMaster == nullptr)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, (m_gapDryRun.physicalRecipeWindowTest ? "EDM68_MASTER_UNAVAILABLE" : "EDM67_MASTER_UNAVAILABLE")); return false; }
+    if (m_gapDryRun.physicalRecipeWindowTest) return ProcessEDMPhysicalRecipeWindowSameThread();
+    EDM65::Snapshot raw{};
+    const auto stamp = m_edmGapMaster->ReadGapPhysicalRecipeRTShadow(raw);
+    std::uint64_t nowUs = 0ULL;
+    const bool clockValid = ReadEDMGapServoClockSameThread(nowUs);
+    auto& receipt = m_edmPhysicalRecipeCapture.receipt;
+    const auto result = receipt.Observe(raw, stamp, nowUs, clockValid, m_gapDryRun.frequency);
+    if (result == EDM67::Status::Invalid)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, receipt.ReasonText()); return false; }
+    if (result != EDM67::Status::Ready) return false;
+    // An outer completion guard may poll again before retiring this block.
+    // Keep the same request and revalidate fresh evidence without reprinting
+    // PASS or mistaking the previous copied bank for a new observation.
+    if (m_gapDryRun.result == 1U) return true;
+    const auto& value = receipt.Current(); const auto& request = receipt.Request();
+    m_gapDryRun.active = false; m_gapDryRun.result = 1U;
+    char text[480]{};
+    int size = std::snprintf(text, sizeof(text),
+        "[EDM67] event=PASS result=PASS reason=FROZEN_RECIPE_TWO_FRESH_PDO P=53 session=%llu recipePub=%llu publication=%llu seq=%llu freshSamples=%llu E8=%.6f E9=%.6f receipt=PHYSICAL_SHADOW_ONLY axisReceipt=0 physicalLowShortVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+        static_cast<unsigned long long>(request.scope.session), static_cast<unsigned long long>(value.recipePublication),
+        static_cast<unsigned long long>(value.publication), static_cast<unsigned long long>(value.sourceSequence),
+        static_cast<unsigned long long>(value.coverage.freshSamples), request.recipe.overridePercent, request.recipe.referenceV);
+    if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+    else RtPrintf("[EDM67] event=LOG reason=LOG_FORMAT motion=0 physicalPermit=0 discharge=0\n");
+    size = std::snprintf(text, sizeof(text),
+        "[EDM67] event=VALUES session=%llu recipePub=%llu source=PHYSICAL sourceId=%llu sourceGen=%llu calibration=%llu rawV=%.6f filteredV=%.6f targetMmMin=%.6f advisoryMmMin=%.6f short=%u feedInhibit=%u appliedToMotion=0 physicalPermit=0 discharge=0\n",
+        static_cast<unsigned long long>(request.scope.session), static_cast<unsigned long long>(value.recipePublication),
+        static_cast<unsigned long long>(value.identity.sourceId), static_cast<unsigned long long>(value.identity.sourceGeneration),
+        static_cast<unsigned long long>(value.identity.calibrationRevision), value.output.rawVoltageV, value.output.filteredVoltageV,
+        value.output.targetMmPerMin, value.output.speedMmPerMin, value.output.shortActive ? 1U : 0U,
+        value.output.feedInhibited ? 1U : 0U);
+    if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+    else RtPrintf("[EDM67] event=LOG reason=LOG_FORMAT motion=0 physicalPermit=0 discharge=0\n");
+    return true;
+}
+
+// Called only after the shared NC authority/recipe validation and master check.
+// P54 uses source time and fresh evidence, never just the NC's elapsed timer.
+bool NCManager::ProcessEDMPhysicalRecipeWindowSameThread()
+{
+    EDM65::Snapshot raw{};
+    const auto stamp = m_edmGapMaster->ReadGapPhysicalRecipeRTShadow(raw);
+    std::uint64_t nowUs = 0ULL;
+    const bool clockValid = ReadEDMGapServoClockSameThread(nowUs);
+    auto& receipt = m_edmPhysicalRecipeWindow;
+    const auto result = receipt.Observe(raw, stamp, nowUs, clockValid, m_gapDryRun.frequency);
+    if (result == EDM68::Status::Invalid)
+    { RejectGapDryRunSameThread(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine, receipt.ReasonText()); return false; }
+    if (result != EDM68::Status::Ready) return false;
+    if (m_gapDryRun.result == 1U) return true; // Freshly revalidated outer completion poll.
+    const auto& value = receipt.Current(); const auto& request = receipt.Request();
+    const auto& report = receipt.Report();
+    m_gapDryRun.active = false; m_gapDryRun.result = 1U;
+    char text[480]{};
+    int size = std::snprintf(text, sizeof(text),
+        "[EDM68] event=PASS result=PASS P=54 session=%llu recipePub=%llu observedMs=%llu reads=%llu pdoDelta=%llu E8=%.6f E9=%.6f targetCheck=PASS receipt=PHYSICAL_SHADOW_ONLY axisReceipt=0 physicalLowShortVerified=0 motion=0 physicalPermit=0 discharge=0\n",
+        static_cast<unsigned long long>(request.scope.session), static_cast<unsigned long long>(value.recipePublication),
+        static_cast<unsigned long long>(report.durationUs / 1000ULL), static_cast<unsigned long long>(report.freshObservations),
+        static_cast<unsigned long long>(report.sourcePdoDelta), request.recipe.overridePercent, request.recipe.referenceV);
+    if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+    else RtPrintf("[EDM68] event=LOG reason=LOG_FORMAT motion=0 physicalPermit=0 discharge=0\n");
+    size = std::snprintf(text, sizeof(text),
+        "[EDM68] event=SOURCE session=%llu source=PHYSICAL sourceId=%llu sourceGen=%llu calibration=%llu firstSeq=%llu lastSeq=%llu maxSourceAgeUs=%llu maxConsumerGapUs=%llu scope=NC_FRESH_READS motion=0 physicalPermit=0 discharge=0\n",
+        static_cast<unsigned long long>(request.scope.session), static_cast<unsigned long long>(value.identity.sourceId),
+        static_cast<unsigned long long>(value.identity.sourceGeneration), static_cast<unsigned long long>(value.identity.calibrationRevision),
+        static_cast<unsigned long long>(report.firstSourceSequence), static_cast<unsigned long long>(report.lastSourceSequence),
+        static_cast<unsigned long long>(report.maxSourceAgeUs), static_cast<unsigned long long>(report.maxConsumerGapUs));
+    if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+    else RtPrintf("[EDM68] event=LOG reason=LOG_FORMAT motion=0 physicalPermit=0 discharge=0\n");
+    size = std::snprintf(text, sizeof(text),
+        "[EDM68] event=RANGE session=%llu rawMinV=%.6f rawMaxV=%.6f targetMinMmMin=%.6f targetMaxMmMin=%.6f advisoryMinMmMin=%.6f advisoryMaxMmMin=%.6f maxTargetError=%.9g shortReads=%llu inhibitReads=%llu scope=NC_FRESH_READS appliedToMotion=0 physicalPermit=0 discharge=0\n",
+        static_cast<unsigned long long>(request.scope.session), report.minRawV, report.maxRawV,
+        report.minTargetMmPerMin, report.maxTargetMmPerMin, report.minSpeedMmPerMin, report.maxSpeedMmPerMin,
+        report.maxTargetErrorMmPerMin, static_cast<unsigned long long>(report.shortObservations),
+        static_cast<unsigned long long>(report.feedInhibitObservations));
+    if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+    else RtPrintf("[EDM68] event=LOG reason=LOG_FORMAT motion=0 physicalPermit=0 discharge=0\n");
+    return true;
+}
+
 // P13/P14/P15/P16 own only a bounded, finite-position diagnostic channel. Their receipts
 // are coherent RT observations; no APPLIED mailbox result proves motion done.
+// EDM56: NC owns admission/lifecycle only. The 250 us RT adapter owns all
+// synthetic voltage, servo calculations and continuous physical references.
+WaitConditionFunc NCManager::StartEDMGapDynamicSameThread(const NCBlock& block)
+{
+    ServiceEDMPhysicalServoRetirementSameThread();
+    if (m_edmPhysicalServoRT.retirePending)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, m_gapDryRun.sourceLine, "EDM69_RETIREMENT_PENDING"); return nullptr; }
+    const int line = m_gapDryRun.sourceLine;
+    const auto profile = static_cast<EDM28::Profile>(static_cast<unsigned>(block.val('P')));
+    const bool servoFlush = EDM28::IsGapServoFlushProfile(profile);
+    const bool physicalServo = EDM28::IsPhysicalServoProfile(profile);
+    const bool physicalFlush = EDM28::IsPhysicalServoFlushProfile(profile);
+    const bool physicalRetreat = EDM28::IsPhysicalRetreatProfile(profile);
+    const bool physicalRetreatCycle = EDM28::IsPhysicalRetreatCycleProfile(profile);
+    const bool physicalEndurance = EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(profile);
+    const bool physicalBidirectionalFlush = EDM28::IsPhysicalBidirectionalFlushFamilyProfile(profile);
+    const bool physicalBidirectional = EDM28::IsPhysicalBidirectionalProfile(profile) || physicalBidirectionalFlush;
+    const bool physicalNegative = EDM28::IsPhysicalNegativeProfile(profile);
+    const char* flushBuild = physicalEndurance ? "EDM76" : physicalBidirectionalFlush ? "EDM75" : physicalFlush ? "EDM71" : servoFlush ? "EDM65" : "EDM58";
+    const char* servoBuild = physicalEndurance ? "EDM76" : physicalBidirectionalFlush ? "EDM75" : physicalBidirectional ? "EDM74" : physicalRetreatCycle ? "EDM73" : physicalRetreat ? "EDM72" : physicalFlush ? "EDM71" : servoFlush ? "EDM65" : "EDM59";
+    if (m_gapDryRun.active || m_edmZFixture.cleanupPending || m_edmZFixture.resetPending ||
+        m_edmZFixture.failureAlarmPending || (physicalServo && m_edmGapServoRT.retirePending))
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM56_PREVIOUS_SESSION_BUSY"); return nullptr; }
+    const bool sequenceMode = physicalBidirectionalFlush && block.has('Q') &&
+        (block.val('Q') == 1.0 || block.val('Q') == 2.0);
+    const bool strictSequenceMode = sequenceMode && block.val('Q') == 2.0;
+    if (!IsGapDryRunBlockShapeValid(block))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM56_REQUIRES_STANDALONE_M30"); return nullptr; }
+    if (m_edmPhysicalSequencePlan.run != m_pathCoreLiveBookkeeping.currentRunToken)
+        InvalidateEDMPhysicalSequencePlanSameThread();
+    const bool capturePlan = strictSequenceMode && !m_edmPhysicalSequencePlan.plan.valid;
+    unsigned terminalOffset = 0U;
+    if (sequenceMode)
+    {
+        // A pure authoring rejection belongs to this dispatch, never the
+        // retained session from a completed/cancelled previous program.
+        const auto rejectAdmission = [this, line](int alarmCode, const char* reason)
+        { RejectEDMGapAdmissionSameThread(alarmCode, line, reason); };
+        // Authoring is validated from the immutable parse cache. Evaluated Q1
+        // must never promote a macro/expression into an explicit opt-in.
+        const int pc = GetActiveDispatchPC();
+        const NCProgramCacheLine* current = pc >= 0 ? GetBaseProgramCache().TryGetLine(pc) : nullptr;
+        if (!current || !EDM77::NumericFixtureMatches(current->parsedBlock, block) ||
+            pc > (std::numeric_limits<int>::max)() - 128)
+        { rejectAdmission(AlarmManager::G_Code_Invalid_parameter, "EDM77_LITERAL_SEQUENCE_REQUIRED"); return nullptr; }
+        const auto suffix = EDM77::ValidateSuffix(current->parsedBlock, [this, pc](unsigned offset) noexcept -> const NCParsedBlock*
+        {
+            const NCProgramCacheLine* next = GetBaseProgramCache().TryGetLine(pc + static_cast<int>(offset));
+            return next ? &next->parsedBlock : nullptr;
+        });
+        if (!suffix.valid)
+        {
+            RtPrintf("[EDM77] event=SEQUENCE_ADMISSION result=REJECT error=%u offset=%u armIssued=0 discharge=0\n",
+                static_cast<unsigned>(suffix.error), static_cast<unsigned>(suffix.errorOffset));
+            rejectAdmission(AlarmManager::G_Code_Invalid_parameter, "EDM77_SEQUENCE_SUFFIX_REJECTED"); return nullptr;
+        }
+        terminalOffset = suffix.terminalOffset;
+        // EDM78 checks the remaining recipe program in isolated fixed scratch.
+        // It grants no motion/selection authority: every real leg still performs
+        // its current stopped-boundary, catalog and frozen-recipe checks below.
+        if (!m_edmProcessReady)
+        {
+            RtPrintf("[EDM78] event=SEQUENCE_PREFLIGHT result=REJECT reason=PROCESS_UNAVAILABLE offset=0 fixture=1 armIssued=0 discharge=0\n");
+            rejectAdmission(AlarmManager::PATH_EXECUTION_NOT_READY, "EDM78_PROCESS_UNAVAILABLE"); return nullptr;
+        }
+        const auto preflight = EDM78::Preflight(m_recipe, m_edmRecipeSequencePreview,
+            current->parsedBlock, [this, pc](unsigned offset) noexcept -> const NCParsedBlock*
+        {
+            const NCProgramCacheLine* next = GetBaseProgramCache().TryGetLine(pc + static_cast<int>(offset));
+            return next ? &next->parsedBlock : nullptr;
+        }, m_edmProcessProfile, m_edmProcessTuningGeneration,
+            capturePlan ? &m_edmPhysicalSequencePlan.plan : nullptr);
+        if (!preflight.valid)
+        {
+            RtPrintf("[EDM78] event=SEQUENCE_PREFLIGHT result=REJECT reason=%s offset=%u fixture=%u field=%u recipe=%s control=%s flush=%s servo=%s armIssued=0 discharge=0\n",
+                EDM78::ErrorName(preflight.error), static_cast<unsigned>(preflight.errorOffset),
+                static_cast<unsigned>(preflight.fixtureOrdinal), static_cast<unsigned>(preflight.failedFieldId),
+                EDMRecipe::ErrorName(preflight.recipeError), EDMRecipeControl::ReasonName(preflight.controlError),
+                EDM58::BindingErrorName(preflight.flushError), EDM59::BindingErrorName(preflight.servoError));
+            rejectAdmission(AlarmManager::G_Code_Invalid_parameter, "EDM78_SEQUENCE_PREFLIGHT_REJECTED"); return nullptr;
+        }
+        RtPrintf("[EDM78] event=SEQUENCE_PREFLIGHT result=ACCEPT fixtures=%u operations=%u initialGeneration=%llu previewGeneration=%llu liveUnchanged=1 armIssued=0 discharge=0\n",
+            static_cast<unsigned>(preflight.fixtureCount), static_cast<unsigned>(preflight.operationCount),
+            static_cast<unsigned long long>(preflight.initialGeneration), static_cast<unsigned long long>(preflight.finalGeneration));
+        RtPrintf("[EDM77] event=SEQUENCE_ADMISSION result=VALIDATED P=%u Q=%u futureFixtures=%u physicalLines=%u terminalOffset=%u run=%llu cache=%llu dispatch=%llu armIssued=0 discharge=0\n",
+            static_cast<unsigned>(profile), strictSequenceMode ? 2U : 1U, static_cast<unsigned>(suffix.futureFixtures), static_cast<unsigned>(suffix.physicalLineCount),
+            static_cast<unsigned>(suffix.terminalOffset), static_cast<unsigned long long>(m_pathCoreLiveBookkeeping.currentRunToken),
+            static_cast<unsigned long long>(GetBaseProgramCache().GetGeneration()), static_cast<unsigned long long>(m_currentExecutingBlockDispatchId));
+    }
+    else if (!IsEDMZFixtureM30ContinuationSameThread())
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM56_REQUIRES_STANDALONE_M30"); return nullptr; }
+    // The old release must be re-read and proved before any previous state is
+    // discarded. A new dispatch intentionally differs from the old scope.
+    if (m_gapDryRun.physicalZFixtureTest && m_gapDryRun.run != 0ULL &&
+        m_gapDryRun.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        (sequenceMode || m_edmGapDynamic.sequenceMode) &&
+        (!sequenceMode || !IsEDMPhysicalSequenceBoundarySameThread()))
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM77_PREVIOUS_RELEASE_REQUIRED"); return nullptr; }
+    if (m_gapDryRun.physicalZFixtureTest && m_gapDryRun.run != 0ULL &&
+        m_gapDryRun.run == m_pathCoreLiveBookkeeping.currentRunToken && m_edmGapDynamic.sequenceMode &&
+        (m_edmGapDynamic.strictSequenceMode != strictSequenceMode ||
+            (m_edmGapDynamic.strictSequenceMode && capturePlan)))
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM79_PLAN_LOST_OR_MODE_CHANGED"); return nullptr; }
+    if (m_edmPhysicalSequencePlan.plan.valid && !strictSequenceMode)
+    { RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM79_SEQUENCE_MODE_CHANGED"); return nullptr; }
+    if (strictSequenceMode)
+    {
+        auto& plan = m_edmPhysicalSequencePlan;
+        const int pc = GetActiveDispatchPC();
+        if (capturePlan)
+        {
+            plan.run = m_pathCoreLiveBookkeeping.currentRunToken;
+            plan.cache = GetBaseProgramCache().GetGeneration();
+            plan.epoch = m_motion.GetCurrentExecutionEpoch(); plan.lease = m_programMotionLease;
+            plan.firstPC = pc; plan.next = 0U;
+            plan.dispatch = NC_BLOCK_DISPATCH_ID_INVALID; plan.legPending = false;
+        }
+        const bool scope = plan.plan.valid && plan.plan.count > 0U &&
+            plan.plan.count <= EDM77::MaximumFixtures && plan.next < plan.plan.count &&
+            !plan.legPending && plan.run != 0ULL && plan.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+            plan.cache != 0ULL && plan.cache == GetBaseProgramCache().GetGeneration() &&
+            plan.epoch == m_motion.GetCurrentExecutionEpoch() && plan.lease.Matches(m_programMotionLease) &&
+            m_motion.IsMotionOwnerLeaseCurrent(plan.lease) && plan.firstPC >= 0 && pc >= plan.firstPC &&
+            plan.firstPC <= (std::numeric_limits<int>::max)() - static_cast<int>(EDM77::MaximumPhysicalLines) &&
+            pc <= (std::numeric_limits<int>::max)() - static_cast<int>(EDM77::MaximumPhysicalLines) &&
+            plan.plan.terminalOffset > 0U && plan.plan.terminalOffset <= EDM77::MaximumPhysicalLines &&
+            pc + static_cast<int>(terminalOffset) == plan.firstPC + static_cast<int>(plan.plan.terminalOffset) &&
+            m_currentExecutingBlockDispatchId != NC_BLOCK_DISPATCH_ID_INVALID &&
+            (capturePlan || m_currentExecutingBlockDispatchId > plan.dispatch);
+        const auto match = scope ? EDM79::MatchCheckpoint(plan.plan.checkpoints[plan.next],
+            static_cast<unsigned>(pc - plan.firstPC), static_cast<unsigned>(profile), m_recipe,
+            m_edmProcessProfile, m_edmProcessTuningGeneration) : EDM79::MatchError::Source;
+        if (!scope || match != EDM79::MatchError::None)
+        {
+            RtPrintf("[EDM79] event=PLAN_REJECT result=REJECT reason=%s fixture=%u count=%u run=%llu cache=%llu dispatch=%llu newSession=0 armIssued=0 discharge=0\n",
+                scope ? EDM79::MatchErrorName(match) : "PLAN_SCOPE", plan.next + 1U, plan.plan.count,
+                static_cast<unsigned long long>(m_pathCoreLiveBookkeeping.currentRunToken),
+                static_cast<unsigned long long>(GetBaseProgramCache().GetGeneration()),
+                static_cast<unsigned long long>(m_currentExecutingBlockDispatchId));
+            RejectEDMGapAdmissionSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM79_PLAN_CHANGED"); return nullptr;
+        }
+        if (capturePlan)
+            RtPrintf("[EDM79] event=PLAN_CAPTURE result=PASS Q=2 count=%u run=%llu cache=%llu firstPC=%d terminalPC=%d generation=%llu armIssued=0 discharge=0\n",
+                plan.plan.count, static_cast<unsigned long long>(plan.run), static_cast<unsigned long long>(plan.cache),
+                plan.firstPC, plan.firstPC + static_cast<int>(plan.plan.terminalOffset),
+                static_cast<unsigned long long>(plan.plan.checkpoints[0].key.generation));
+        RtPrintf("[EDM79] event=PLAN_MATCH result=PASS fixture=%u count=%u P=%u run=%llu dispatch=%llu generation=%llu armIssued=0 discharge=0\n",
+            plan.next + 1U, plan.plan.count, static_cast<unsigned>(profile), static_cast<unsigned long long>(plan.run),
+            static_cast<unsigned long long>(m_currentExecutingBlockDispatchId),
+            static_cast<unsigned long long>(plan.plan.checkpoints[plan.next].key.generation));
+        plan.dispatch = m_currentExecutingBlockDispatchId; plan.legPending = true;
+    }
+    m_gapDryRun = GapDryRunState{}; m_gapDryRun.physicalZFixtureTest = true; m_gapDryRun.sourceLine = line;
+    m_edmZFixture = EDMZFixtureState{}; m_edmZFixture.config.profile = profile;
+    m_edmGapDynamic = EDMGapDynamicState{}; m_edmGapDynamic.active = true; m_edmGapDynamic.sequenceMode = sequenceMode;
+    m_edmGapDynamic.strictSequenceMode = strictSequenceMode;
+    m_edmGapRapid = EDMGapRapidState{}; m_edmGapFeedUpdate = EDMGapFeedUpdateState{};
+    m_edmGapShortReplan = EDMGapShortReplanState{};
+    // Capture the immutable seed before formal readiness; a changed lease or
+    // epoch may wait for HOLD classification, but never silently rebinds Arm.
+    m_gapDryRun.epoch = m_motion.GetCurrentExecutionEpoch(); m_gapDryRun.lease = m_programMotionLease;
+    std::uint64_t mask = 0ULL; MotionStopSettleSnapshot raw{};
+    (void)IsEDMGapServoRunReadySameThread(&mask, &raw);
+    if (m_currentExecutingBlockDispatchId == NC_BLOCK_DISPATCH_ID_INVALID ||
+        !m_pathCoreLiveBookkeeping.currentRunToken || !GetBaseProgramCache().GetGeneration()) mask |= 1ULL << 10U;
+    if (m_gapDryRunSerial == (std::numeric_limits<std::uint64_t>::max)() ||
+        m_edmZFixtureSessionSerial == (std::numeric_limits<std::uint64_t>::max)()) mask |= 1ULL << 11U;
+    if (mask & ~(1ULL << 9U))
+    { LogEDMGapDynamicAdmissionSameThread(mask, raw, "REJECT"); RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM56_ADMISSION_REJECTED"); return nullptr; }
+    LARGE_INTEGER frequency{};
+    if (!RtQueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(frequency.QuadPart) > (std::numeric_limits<std::uint64_t>::max)() / 1000ULL)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM56_CLOCK_FREQUENCY"); return nullptr; }
+    m_gapDryRun.frequency = static_cast<std::uint64_t>(frequency.QuadPart);
+    std::uint64_t now = 0ULL;
+    if (!ReadGapDryRunClockSameThread(now) || !ReadEDMZFixtureFeedbackSameThread(false))
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM56_NO_COHERENT_SOURCE"); return nullptr; }
+    auto& s = m_edmZFixture; auto& d = m_edmGapDynamic; const auto& f = s.feedback;
+    if (f.capHeld || !std::isfinite(f.pulsePerMm) || f.pulsePerMm < 1000.0 || f.pulsePerMm > 1000000000.0 ||
+        !f.axisMapGeneration || !f.configGeneration || !std::isfinite(f.referenceOffsetPulse) ||
+        (f.hardwareSign != 1 && f.hardwareSign != -1))
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, "EDM56_PREFLIGHT_BLOCKED"); return nullptr; }
+    // Capture the effective owner-thread condition once, before any physical
+    // Arm submission. Admission waits and HOLD preserve this same snapshot;
+    // a fresh G180 after RESET captures a new condition generation.
+    if (physicalBidirectionalFlush || physicalFlush || EDM57::IsBoundProfile(static_cast<unsigned>(profile)))
+    {
+        EDMRecipe::Summary summary{};
+        if (!m_edmProcessReady || !ReadEDMRecipeSummarySameThread(summary))
+        { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, physicalEndurance ? "EDM76_FLUSH_CONDITION_SCOPE" : physicalBidirectionalFlush ? "EDM75_FLUSH_CONDITION_SCOPE" : physicalFlush ? "EDM71_FLUSH_CONDITION_SCOPE" : servoFlush ? "EDM60_FLUSH_CONDITION_SCOPE" : "EDM58_CONDITION_SCOPE"); return nullptr; }
+        const auto binding = physicalBidirectionalFlush ? EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId) :
+            physicalFlush ? EDM71::BindPhysicalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId) :
+            EDM58::BindPhysicalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+        if (!binding.ready)
+        {
+            RtPrintf("[%s] event=RECIPE_BIND result=REJECT reason=%s field=%u armIssued=0 discharge=0\n",
+                flushBuild, EDM58::BindingErrorName(binding.error), static_cast<unsigned>(binding.failedFieldId));
+            RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter, line, physicalEndurance ? "EDM76_FLUSH_BIND_REJECTED" : physicalBidirectionalFlush ? "EDM75_FLUSH_BIND_REJECTED" : physicalFlush ? "EDM71_FLUSH_BIND_REJECTED" : servoFlush ? "EDM60_FLUSH_CONDITION_BIND_REJECTED" : "EDM58_CONDITION_BIND_REJECTED"); return nullptr;
+        }
+        s.config.flush = binding.recipe;
+        if (servoFlush) { s.config.flush.revision = 3U; s.config.flush.workDepthMm = .125; }
+    }
+    if (EDM28::IsGapConditionServoProfile(profile))
+    {
+        EDMRecipe::Summary summary{};
+        if (!m_edmProcessReady || !ReadEDMRecipeSummarySameThread(summary))
+        { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, line, physicalEndurance ? "EDM76_SERVO_CONDITION_SCOPE" : physicalBidirectionalFlush ? "EDM75_SERVO_CONDITION_SCOPE" : physicalBidirectional ? "EDM74_SERVO_CONDITION_SCOPE" : physicalRetreatCycle ? "EDM73_SERVO_CONDITION_SCOPE" : physicalRetreat ? "EDM72_SERVO_CONDITION_SCOPE" : physicalFlush ? "EDM71_SERVO_CONDITION_SCOPE" : servoFlush ? "EDM60_SERVO_CONDITION_SCOPE" : "EDM59_CONDITION_SCOPE"); return nullptr; }
+        const auto binding = physicalBidirectional ? EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration) :
+            physicalNegative ? EDM72::BindPhysicalRetreatRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration) :
+            EDM59::BindPhysicalServoRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+        if (!binding.ready)
+        {
+            RtPrintf("[%s] event=RECIPE_BIND result=REJECT reason=%s field=%u armIssued=0 discharge=0\n",
+                servoBuild, EDM59::BindingErrorName(binding.error), static_cast<unsigned>(binding.failedFieldId));
+            RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter, line, physicalEndurance ? "EDM76_SERVO_BIND_REJECTED" : physicalBidirectionalFlush ? "EDM75_SERVO_BIND_REJECTED" : physicalBidirectional ? "EDM74_SERVO_BIND_REJECTED" : physicalRetreatCycle ? "EDM73_SERVO_BIND_REJECTED" : physicalRetreat ? "EDM72_SERVO_BIND_REJECTED" : physicalFlush ? "EDM71_SERVO_BIND_REJECTED" : servoFlush ? "EDM60_SERVO_CONDITION_BIND_REJECTED" : "EDM59_CONDITION_BIND_REJECTED"); return nullptr;
+        }
+        s.config.servoRecipe = binding.recipe;
+    }
+    m_gapDryRun.active = true; m_gapDryRun.test = ++m_gapDryRunSerial;
+    m_gapDryRun.run = m_pathCoreLiveBookkeeping.currentRunToken;
+    m_gapDryRun.cache = GetBaseProgramCache().GetGeneration(); m_gapDryRun.dispatch = m_currentExecutingBlockDispatchId;
+    s.scope.session = ++m_edmZFixtureSessionSerial;
+    s.scope.runGeneration = m_gapDryRun.run; s.scope.cacheGeneration = m_gapDryRun.cache;
+    s.scope.dispatchGeneration = m_gapDryRun.dispatch; s.scope.executionEpoch = m_gapDryRun.epoch;
+    s.scope.owner = static_cast<std::uint8_t>(m_gapDryRun.lease.owner); s.scope.ownerGeneration = m_gapDryRun.lease.generation;
+    s.scope.axisMapGeneration = f.axisMapGeneration; s.scope.configGeneration = f.configGeneration;
+    s.config.pulsePerMm = f.pulsePerMm; s.config.referenceOffsetPulse = f.referenceOffsetPulse; s.config.hardwareSign = f.hardwareSign;
+    s.config.feedMmMin = 30.0; s.config.pdoCapMmS = .5; s.config.targetHalfMm = .25; s.config.outerHalfMm = .4;
+    if (physicalServo)
+    { s.config.feedMmMin = EDM70::FeedMmMin; s.config.pdoCapMmS = EDM70::PdoCapMmS;
+      s.config.targetHalfMm = EDM70::DepthMm; s.config.outerHalfMm = EDM70::OuterMm; }
+    s.config.accelerationTimeSec = s.config.decelerationTimeSec = .3;
+    s.config.positionToleranceMm = s.config.excursionToleranceMm = .001;
+    if (!physicalServo && EDM28::IsGapFlushProfile(profile) && !EDM57::IsBoundProfile(static_cast<unsigned>(profile)))
+        s.config.flush = EDM57::FixtureRecipe();
+    if (servoFlush && !EDM28::ValidateGapServoFlushConfig(s.config))
+    {
+        RtPrintf("[EDM65] event=RECIPE_BIND result=REJECT reason=COMBINED_IDENTITY_OR_TRAVEL armIssued=0 discharge=0\n");
+        RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM60_COMBINED_BIND_REJECTED"); return nullptr;
+    }
+    if (physicalBidirectionalFlush && (!EDM75::ValidateRecipe(s.config.flush) ||
+        !EDM71::SameAdmission(s.config.flush, s.config.servoRecipe)))
+    { RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter, line, physicalEndurance ? "EDM76_COMBINED_BIND_REJECTED" : "EDM75_COMBINED_BIND_REJECTED"); return nullptr; }
+    if (physicalFlush && (!EDM71::ValidateRecipe(s.config.flush) ||
+        !EDM71::SameAdmission(s.config.flush, s.config.servoRecipe)))
+    { RejectGapDryRunSameThread(AlarmManager::G_Code_Invalid_parameter, line, "EDM71_COMBINED_BIND_REJECTED"); return nullptr; }
+    d.frozenConfig = s.config; d.admissionPending = true; d.admissionStartMs = d.validationClockMs = now;
+    // Capture the already validated immutable SIM recipe once per G180. HOLD
+    // cannot recapture it. Publication failure is diagnostic, never admission.
+    if (servoFlush)
+    {
+        EDM65::Request request{};
+        request.recipe = d.frozenConfig.servoRecipe;
+        request.scope.session = s.scope.session;
+        request.scope.run = s.scope.runGeneration;
+        request.scope.cache = s.scope.cacheGeneration;
+        request.scope.dispatch = s.scope.dispatchGeneration;
+        request.scope.epoch = s.scope.executionEpoch;
+        request.scope.owner = s.scope.owner;
+        request.scope.ownerGeneration = s.scope.ownerGeneration;
+        request.qpcFrequency = m_gapDryRun.frequency;
+        const bool captureClockValid = m_gapDryRun.lastTicks <=
+            static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()) &&
+            EDMAnalogInput::Publisher::QpcMicroseconds(static_cast<std::int64_t>(m_gapDryRun.lastTicks),
+                m_gapDryRun.frequency, request.capturedUs) && request.capturedUs != 0ULL;
+        const bool published = captureClockValid && m_edmGapMaster != nullptr &&
+            m_edmGapMaster->PublishGapPhysicalRecipeRTShadow(request);
+        RtPrintf("[EDM65] event=RECIPE_SHADOW_CAPTURE session=%llu result=%s reason=%s capturedUs=%llu qpcHz=%llu capture=FROZEN_SIM_ADMISSION capturedNotActive=1 appliedToMotion=0 physicalPermit=0 discharge=0\n",
+            static_cast<unsigned long long>(request.scope.session), published ? "PUBLISHED" : "REJECTED",
+            !captureClockValid ? "CLOCK_RANGE" : m_edmGapMaster == nullptr ? "NO_MASTER" : published ? "NONE" : "PUBLISH_REJECTED",
+            static_cast<unsigned long long>(request.capturedUs),
+            static_cast<unsigned long long>(request.qpcFrequency));
+    }
+    s.phase = EDMZFixturePhase::PreArm;
+    s.lastFreshMs = s.lastClockMs = s.phaseStartMs = m_gapDryRun.lastServiceMs = now;
+    if (physicalServo)
+    {
+        if (physicalBidirectionalFlush)
+        {
+            RtPrintf("[%s] event=BUILD build=%s P=%u source=PHYSICAL axis=Z workMs=%llu commandWorkHalfMm=.03 maxLiftMm=.03 commandZMinMm=-.03 commandZMaxMm=.06 motion=LIVE_AD_BIDIRECTIONAL_FLUSH minCycles=%u originHandoff=RESET_ACTIVE_I_ONCE_PER_SETTLE_ENTRY return=BOUNDED_FIXTURE anchor=FIRST_ARM settleUs=50000 feedCapMmMin=5 pdoCapMmS=.1 outerHalfMm=.1 lowShort=FORMAL_STOP directionCoverage=OBSERVED_ONLY physicalShortRecoveryVerified=0 hold=CANCEL_RESET_REQUIRED stop=PHYSICAL_RELEASE discharge=0\n", flushBuild, flushBuild, static_cast<unsigned>(profile),
+                static_cast<unsigned long long>(EDM69::DurationUsFor(physicalEndurance ? EDM69::RecipeFamily::PhysicalBidirectionalEndurance : EDM69::RecipeFamily::PhysicalBidirectional) / 1000ULL),
+                EDM70::MinimumSignedFlushCyclesFor(static_cast<unsigned>(profile)));
+            const auto& flush = s.config.flush; const auto& servo = s.config.servoRecipe;
+            const auto& key = flush.binding;
+            char text[768]{};
+            const int size = std::snprintf(text, sizeof(text), "[%s] event=RECIPE_FROZEN P=%u session=%llu table=%u E=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu fields=%u/%u/%u/%u/%u/%u/%u processRev=%u tuningGen=%llu E5us=%llu E6=%.6f E7=%.3f E8=%.3f E9=%.3f E21=%u E22=%.6f maxLiftMm=%.6f freeze=ADMISSION apply=NEXT_G180 source=PHYSICAL discharge=0\n",
+                flushBuild, static_cast<unsigned>(profile), static_cast<unsigned long long>(s.scope.session), key.tableId, static_cast<unsigned>(key.eCode),
+                key.catalogRevision, key.tableRevision, key.profileId, key.definitionRevision,
+                static_cast<unsigned long long>(key.generation), static_cast<unsigned>(key.fieldIds[0]),
+                static_cast<unsigned>(key.fieldIds[1]), static_cast<unsigned>(key.fieldIds[2]),
+                static_cast<unsigned>(servo.binding.fieldIds[0]), static_cast<unsigned>(servo.binding.fieldIds[1]),
+                static_cast<unsigned>(key.fieldIds[3]), static_cast<unsigned>(key.fieldIds[4]),
+                servo.binding.processRevision, static_cast<unsigned long long>(servo.binding.tuningGeneration),
+                static_cast<unsigned long long>(flush.workTimeUs), flush.baseHeightMm, flush.jumpSpeedOverridePercent,
+                servo.overridePercent, servo.referenceV, flush.deepInterval, flush.deepMultiplier, EDM71::MaximumLiftHeight(flush));
+            if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+            else RtPrintf("[%s] event=RECIPE_FROZEN result=FAIL reason=LOG_FORMAT discharge=0\n", flushBuild);
+        }
+        else if (physicalBidirectional)
+        {
+            RtPrintf("[EDM74] event=BUILD build=EDM74_FIX2 originHandoff=RESET_ACTIVE_I_ONCE originDiag=RETAINED_ONLY P=60 source=PHYSICAL axis=Z workMs=10000 commandHalfMm=.03 motion=LIVE_AD_BIDIRECTIONAL return=BOUNDED_FIXTURE anchor=FIRST_ARM originSettleUs=50000 feedCapMmMin=5 pdoCapMmS=.1 outerHalfMm=.1 lowShort=FORMAL_STOP directionCoverage=OBSERVED_ONLY physicalShortRecoveryVerified=0 hold=CANCEL_RESET_REQUIRED stop=PHYSICAL_RELEASE discharge=0\n");
+            const auto& recipe = s.config.servoRecipe; const auto& key = recipe.binding;
+            char text[640]{};
+            const int size = std::snprintf(text, sizeof(text), "[EDM74] event=RECIPE_FROZEN P=60 session=%llu table=%u E=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu fields=%u/%u processRev=%u tuningGen=%llu E8=%.6f E9=%.6f freeze=ADMISSION apply=NEXT_G180 source=PHYSICAL motion=LIVE_AD_BIDIRECTIONAL return=BOUNDED_FIXTURE anchor=FIRST_ARM discharge=0\n",
+                static_cast<unsigned long long>(s.scope.session), key.tableId, static_cast<unsigned>(key.eCode),
+                key.catalogRevision, key.tableRevision, key.profileId, key.definitionRevision,
+                static_cast<unsigned long long>(key.generation), static_cast<unsigned>(key.fieldIds[0]),
+                static_cast<unsigned>(key.fieldIds[1]), key.processRevision,
+                static_cast<unsigned long long>(key.tuningGeneration), recipe.overridePercent, recipe.referenceV);
+            if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+            else RtPrintf("[EDM74] event=RECIPE_FROZEN result=FAIL reason=LOG_FORMAT discharge=0\n");
+        }
+        else if (physicalRetreatCycle)
+        {
+            RtPrintf("[EDM73] event=BUILD build=EDM73 P=59 source=PHYSICAL axis=Z workMs=10000 retreatMm=.03 motion=REAL_AD_NEGATIVE_RETREAT_CYCLE return=BOUNDED_FIXTURE anchor=FIRST_ARM minCycles=2 endpointSettleUs=50000 originSettleUs=50000 feedCapMmMin=5 pdoCapMmS=.1 outerHalfMm=.1 lowShort=FORMAL_STOP physicalShortRecoveryVerified=0 hold=CANCEL_RESET_REQUIRED stop=PHYSICAL_RELEASE discharge=0\n");
+            const auto& recipe = s.config.servoRecipe; const auto& key = recipe.binding;
+            char text[640]{};
+            const int size = std::snprintf(text, sizeof(text), "[EDM73] event=RECIPE_FROZEN P=59 session=%llu table=%u E=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu fields=%u/%u processRev=%u tuningGen=%llu E8=%.6f E9=%.6f freeze=ADMISSION apply=NEXT_G180 source=PHYSICAL motion=REAL_AD_NEGATIVE_RETREAT_CYCLE return=BOUNDED_FIXTURE anchor=FIRST_ARM discharge=0\n",
+                static_cast<unsigned long long>(s.scope.session), key.tableId, static_cast<unsigned>(key.eCode),
+                key.catalogRevision, key.tableRevision, key.profileId, key.definitionRevision,
+                static_cast<unsigned long long>(key.generation), static_cast<unsigned>(key.fieldIds[0]),
+                static_cast<unsigned>(key.fieldIds[1]), key.processRevision,
+                static_cast<unsigned long long>(key.tuningGeneration), recipe.overridePercent, recipe.referenceV);
+            if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+            else RtPrintf("[EDM73] event=RECIPE_FROZEN result=FAIL reason=LOG_FORMAT discharge=0\n");
+        }
+        else if (physicalRetreat)
+        {
+            RtPrintf("[EDM72] event=BUILD build=EDM72 P=58 source=PHYSICAL axis=Z workMs=10000 retreatMm=.03 motion=REAL_AD_NEGATIVE_RETREAT endpoint=HOLD_NO_RETURN feedCapMmMin=5 pdoCapMmS=.1 outerHalfMm=.1 short=FORMAL_STOP physicalShortRecoveryVerified=0 hold=CANCEL_RESET_REQUIRED stop=PHYSICAL_RELEASE discharge=0\n");
+            const auto& recipe = s.config.servoRecipe; const auto& key = recipe.binding;
+            char text[640]{};
+            const int size = std::snprintf(text, sizeof(text), "[EDM72] event=RECIPE_FROZEN P=58 session=%llu table=%u E=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu fields=%u/%u processRev=%u tuningGen=%llu E8=%.6f E9=%.6f freeze=ADMISSION apply=NEXT_G180 source=PHYSICAL motion=REAL_AD_NEGATIVE_RETREAT endpoint=HOLD_NO_RETURN discharge=0\n",
+                static_cast<unsigned long long>(s.scope.session), key.tableId, static_cast<unsigned>(key.eCode),
+                key.catalogRevision, key.tableRevision, key.profileId, key.definitionRevision,
+                static_cast<unsigned long long>(key.generation), static_cast<unsigned>(key.fieldIds[0]),
+                static_cast<unsigned>(key.fieldIds[1]), key.processRevision,
+                static_cast<unsigned long long>(key.tuningGeneration), recipe.overridePercent, recipe.referenceV);
+            if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+            else RtPrintf("[EDM72] event=RECIPE_FROZEN result=FAIL reason=LOG_FORMAT discharge=0\n");
+        }
+        else if (physicalFlush)
+        {
+            RtPrintf("[EDM71] event=BUILD build=EDM71 P=57 source=PHYSICAL axis=Z workMs=10000 depthMm=.03 forward=AD_SERVO flush=E5_E6_E7_E21_E22 feedCapMmMin=5 pdoCapMmS=.1 outerHalfMm=.1 lowInput=FORMAL_STOP hold=CANCEL_RESET_REQUIRED stop=PHYSICAL_RELEASE discharge=0\n");
+            const auto& flush = s.config.flush; const auto& key = flush.binding;
+            char line[768]{};
+            const int size = std::snprintf(line, sizeof(line), "[EDM71] event=RECIPE_FROZEN P=57 session=%llu table=%u E=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu fields=%u/%u/%u/%u/%u E5us=%llu E6=%.6f E7=%.3f E8=%.3f E9=%.3f E21=%u E22=%.6f maxLiftMm=%.6f freeze=ADMISSION apply=NEXT_G180 discharge=0\n",
+                static_cast<unsigned long long>(s.scope.session), key.tableId, static_cast<unsigned>(key.eCode),
+                key.catalogRevision, key.tableRevision, key.profileId, key.definitionRevision,
+                static_cast<unsigned long long>(key.generation), static_cast<unsigned>(key.fieldIds[0]),
+                static_cast<unsigned>(key.fieldIds[1]), static_cast<unsigned>(key.fieldIds[2]),
+                static_cast<unsigned>(key.fieldIds[3]), static_cast<unsigned>(key.fieldIds[4]),
+                static_cast<unsigned long long>(flush.workTimeUs), flush.baseHeightMm, flush.jumpSpeedOverridePercent,
+                s.config.servoRecipe.overridePercent, s.config.servoRecipe.referenceV,
+                flush.deepInterval, flush.deepMultiplier, EDM71::MaximumLiftHeight(flush));
+            if (size >= 0 && static_cast<std::size_t>(size) < sizeof(line)) RtPrintf("%s", line);
+            else RtPrintf("[EDM71] event=RECIPE_FROZEN result=FAIL reason=LOG_FORMAT discharge=0\n");
+        }
+        else
+            RtPrintf("[EDM70] event=BUILD build=EDM70_FIX1 P=56 source=PHYSICAL axis=Z workMs=10000 depthMm=.03 forward=AD_SERVO return=FIXTURE feedCapMmMin=5 pdoCapMmS=.1 outerHalfMm=.1 lowInput=FORMAL_STOP hold=CANCEL_RESET_REQUIRED stop=PHYSICAL_RELEASE discharge=0\n");
+        EDM64::Snapshot physical{}; EDM53::Stamp stamp{};
+        if (m_edmGapMaster) stamp = m_edmGapMaster->ReadGapPhysicalRTShadow(physical);
+        std::uint64_t nowUs = 0ULL;
+        const bool clockValid = ReadEDMGapServoClockSameThread(nowUs);
+        EDM64::PhysicalRTShadow::ValidateRead(physical, stamp, nowUs, clockValid, m_gapDryRun.frequency);
+        if (!m_edmGapMaster || !clockValid || !stamp.Ready() ||
+            physical.readerState != EDM64::ReaderState::Fresh || physical.state != EDM64::State::Valid ||
+            !physical.output.valid || !physical.input.Usable() || physical.physicalPermit || physical.discharge)
+        {
+            // Admission boundary only, before Arm: retain the actual source
+            // failure instead of labelling an unusable receipt as low voltage.
+            RtPrintf("[%s] event=SOURCE_REJECT session=%llu state=%s reason=%s reader=%s seq=%llu observedUs=%llu nowUs=%llu clock=%u maxAgeUs=%llu maxTickGapUs=%llu armIssued=0 discharge=0\n",
+                physicalEndurance ? "EDM76" : physicalBidirectionalFlush ? "EDM75" : physicalBidirectional ? "EDM74" : physicalRetreatCycle ? "EDM73" : physicalRetreat ? "EDM72" : physicalFlush ? "EDM71" : "EDM70-FIX1", static_cast<unsigned long long>(s.scope.session), EDM64::StateName(physical.state),
+                EDM64::ReasonName(physical.reason), EDM64::ReaderStateName(physical.readerState),
+                static_cast<unsigned long long>(physical.input.sample.sequence),
+                static_cast<unsigned long long>(physical.observedUs), static_cast<unsigned long long>(nowUs),
+                clockValid ? 1U : 0U, static_cast<unsigned long long>(physical.maxAgeUs),
+                static_cast<unsigned long long>(physical.maxTickGapUs));
+            EndEDMZFixtureSameThread("FAIL", physicalEndurance ? "EDM76_PHYSICAL_SOURCE_NOT_READY" : physicalBidirectionalFlush ? "EDM75_PHYSICAL_SOURCE_NOT_READY" : physicalBidirectional ? "EDM74_PHYSICAL_SOURCE_NOT_READY" : physicalRetreatCycle ? "EDM73_PHYSICAL_SOURCE_NOT_READY" : physicalRetreat ? "EDM72_PHYSICAL_SOURCE_NOT_READY" : physicalFlush ? "EDM71_PHYSICAL_SOURCE_NOT_READY" : "EDM70_PHYSICAL_SOURCE_NOT_READY"); return nullptr;
+        }
+        const double inputV = static_cast<double>(physical.input.conversion.voltageMv)/1000.0;
+        if (physicalBidirectional ? !EDM74::InputAllowed(s.config.servoRecipe, inputV) :
+            physicalNegative ? !EDM72::NegativeInputAllowed(s.config.servoRecipe, inputV) :
+            inputV <= s.config.servoRecipe.referenceV + s.config.servoRecipe.curve.deadbandV)
+        { EndEDMZFixtureSameThread("FAIL", physicalEndurance ? "EDM76_PHYSICAL_INPUT_REJECTED" : physicalBidirectionalFlush ? "EDM75_PHYSICAL_INPUT_REJECTED" : physicalBidirectional ? "EDM74_PHYSICAL_INPUT_REJECTED" : physicalRetreatCycle ? "EDM73_PHYSICAL_NEGATIVE_INPUT_REQUIRED" : physicalRetreat ? "EDM72_PHYSICAL_NEGATIVE_INPUT_REQUIRED" :
+            physicalFlush ? "EDM71_PHYSICAL_HIGH_INPUT_REQUIRED" : "EDM70_PHYSICAL_HIGH_INPUT_REQUIRED"); return nullptr; }
+        auto& request = s.config.physicalInput;
+        request.recipeFamily = physicalEndurance ? EDM69::RecipeFamily::PhysicalBidirectionalEndurance : physicalBidirectional ? EDM69::RecipeFamily::PhysicalBidirectional : physicalNegative ? EDM69::RecipeFamily::PhysicalRetreat : EDM69::RecipeFamily::Legacy;
+        request.capture.recipe = s.config.servoRecipe;
+        request.capture.scope.session = s.scope.session; request.capture.scope.run = s.scope.runGeneration;
+        request.capture.scope.cache = s.scope.cacheGeneration; request.capture.scope.dispatch = s.scope.dispatchGeneration;
+        request.capture.scope.epoch = s.scope.executionEpoch; request.capture.scope.owner = s.scope.owner;
+        request.capture.scope.ownerGeneration = s.scope.ownerGeneration;
+        request.capture.capturedUs = nowUs; request.capture.qpcFrequency = m_gapDryRun.frequency;
+        request.physicalIdentity = physical.identity; request.route = EDM63::ProducerRoute(physical.input.sample);
+        request.baselineSequence = physical.input.sample.sequence; request.baselineCapturedUs = physical.input.sample.capturedAtUs;
+        request.maxAgeUs = physical.maxAgeUs; request.maxTickGapUs = physical.maxTickGapUs;
+        if (!EDM70::ValidConfig(s.config) || !EDM70::MatchesScope(request, s.scope))
+        { EndEDMZFixtureSameThread("FAIL", physicalEndurance ? "EDM76_PHYSICAL_BINDING_REJECTED" : physicalBidirectionalFlush ? "EDM75_PHYSICAL_BINDING_REJECTED" : physicalBidirectional ? "EDM74_PHYSICAL_BINDING_REJECTED" : physicalRetreatCycle ? "EDM73_PHYSICAL_BINDING_REJECTED" : physicalRetreat ? "EDM72_PHYSICAL_BINDING_REJECTED" : physicalFlush ? "EDM71_PHYSICAL_BINDING_REJECTED" : "EDM70_PHYSICAL_BINDING_REJECTED"); return nullptr; }
+        d.frozenConfig = s.config;
+        d.admissionStartMs = d.validationClockMs = nowUs / 1000ULL;
+        s.lastFreshMs = s.lastClockMs = s.phaseStartMs = m_gapDryRun.lastServiceMs = nowUs / 1000ULL;
+        return WaitForGapDryRunCallback;
+    }
+    if (EDM57::IsBoundProfile(static_cast<unsigned>(profile)))
+    {
+        const auto& r = s.config.flush; const auto& key = r.binding;
+        char text[480]{};
+        const int size = std::snprintf(text, sizeof(text), "[%s] event=RECIPE_FROZEN session=%llu table=%u E=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu fields=%u/%u/%u/%u/%u E5us=%llu E6=%.6f E7=%.6f E21=%u E22=%.6f freeze=ADMISSION apply=NEXT_G180 discharge=0\n",
+            flushBuild, static_cast<unsigned long long>(s.scope.session), key.tableId, static_cast<unsigned>(key.eCode),
+            key.catalogRevision, key.tableRevision, key.profileId, key.definitionRevision,
+            static_cast<unsigned long long>(key.generation), static_cast<unsigned>(key.fieldIds[0]),
+            static_cast<unsigned>(key.fieldIds[1]), static_cast<unsigned>(key.fieldIds[2]),
+            static_cast<unsigned>(key.fieldIds[3]), static_cast<unsigned>(key.fieldIds[4]),
+            static_cast<unsigned long long>(r.workTimeUs), r.baseHeightMm, r.jumpSpeedOverridePercent,
+            r.deepInterval, r.deepMultiplier);
+        if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[%s] event=RECIPE_FROZEN result=FAIL reason=LOG_FORMAT discharge=0\n", flushBuild);
+    }
+    if (EDM28::IsGapConditionServoProfile(profile))
+    {
+        const auto& r = s.config.servoRecipe; const auto& key = r.binding; const auto& c = r.curve;
+        char text[480]{};
+        int size = std::snprintf(text, sizeof(text), "[%s] event=RECIPE_FROZEN session=%llu table=%u E=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu fields=%u/%u processRev=%u tuningGen=%llu E8=%.6f E9=%.6f freeze=ADMISSION apply=NEXT_G180 source=SIM discharge=0\n",
+            servoBuild, static_cast<unsigned long long>(s.scope.session), key.tableId, static_cast<unsigned>(key.eCode),
+            key.catalogRevision, key.tableRevision, key.profileId, key.definitionRevision,
+            static_cast<unsigned long long>(key.generation), static_cast<unsigned>(key.fieldIds[0]),
+            static_cast<unsigned>(key.fieldIds[1]), key.processRevision,
+            static_cast<unsigned long long>(key.tuningGeneration), r.overridePercent, r.referenceV);
+        if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[%s] event=RECIPE_FROZEN result=FAIL reason=LOG_FORMAT discharge=0\n", servoBuild);
+        const auto advance = EDMGapServo::Evaluate(c, 80.0, r.referenceV, r.overridePercent);
+        const auto returning = EDMGapServo::Evaluate(c, 50.0, r.referenceV, r.overridePercent);
+        size = std::snprintf(text, sizeof(text), "[%s] event=SERVO_CURVE session=%llu P=%.6g/%.6g/%.6g N=%.6g/%.6g/%.6g Pbreak=%.6g/%.6g Nbreak=%.6g/%.6g scale=%.9g deadband=%.6g feedCap=%.6g retreatCap=%.6g short=%.6g v80=%.6g v50=%.6g v20=%.6g shortGate=25/5 %s cycles=6 limitsConfirmed=%u fixturePermit=1 discharge=0\n",
+            servoBuild, static_cast<unsigned long long>(s.scope.session), c.positiveGain[0], c.positiveGain[1], c.positiveGain[2],
+            c.negativeGain[0], c.negativeGain[1], c.negativeGain[2], c.positiveBreakV[0], c.positiveBreakV[1],
+            c.negativeBreakV[0], c.negativeBreakV[1], c.cuttingScaleMmPerVoltMin, c.deadbandV,
+            c.maxFeedMmPerMin, c.maxRetreatMmPerMin, c.shortRetreatMmPerMin,
+            advance.limitedSpeedMmPerMin, returning.limitedSpeedMmPerMin,
+            -c.shortRetreatMmPerMin * r.overridePercent / 100.0,
+            servoFlush ? "work=GAP_SERVO flush=FROZEN_E5_E6_E7_E21_E22" : "fixtureDepth=.03 shortClear=.005", c.limitsConfirmed ? 1U : 0U);
+        if (size >= 0 && static_cast<std::size_t>(size) < sizeof(text)) RtPrintf("%s", text);
+        else RtPrintf("[%s] event=SERVO_CURVE result=FAIL reason=LOG_FORMAT discharge=0\n", servoBuild);
+    }
+    if (servoFlush)
+    {
+        RtPrintf("[EDM65] event=BUILD build=EDM65 P=%u work=GAP_SERVO flush=RT_RECIPE sourcePort=61 sourceBinding=FROZEN_SIM sourceId=60 rawPort=62 rawSource=SIM rawCalibration=SYNTHETIC physicalInput=REJECTED physicalPort=63 physicalMode=SHADOW_ONLY rtPhysicalPort=64 rtPhysicalMode=RT_SHADOW_ONLY recipeShadowPort=65 recipeIdentity=COMMON_ADMISSION originSettle=1 dwellUs=50000 positionMm=.00075 excursionMm=.00025 pdoGate=0 endpointIdleGain=1 retiredFaultGuard=1 discharge=0\n",
+            static_cast<unsigned>(profile));
+        RtPrintf("[EDM66-FIX2] event=DIAGNOSTICS observationOnly=1 liveFixtureConsole=OFF armToFreshRelease=QUIET boundary=PASS_HOLD_FAULT readyCadenceMs=1000 logCost=1 deadmanMs=50 masks=REF:1,POSITION:2,RANGE:8,TIME:16,TICKS:32 pdoHighInformational=1 discharge=0\n");
+        RtPrintf("[EDM66] event=BUILD feature=PHYSICAL_RECIPE_COVERAGE accumulate=PDO log=READY_1HZ reset=NEW_RECIPE historyOnly=1 direction=TARGET_NOT_AXIS appliedToMotion=0 physicalPermit=0 discharge=0\n");
+    }
+    else
+    {
+        RtPrintf("[EDM59-FIX2] event=BUILD P=%u originSettle=%u dwellUs=50000 positionMm=.00075 excursionMm=.00025 pdoGate=0 pdoHighMmS=.002 endpointIdleGain=%u retiredFaultGuard=1 discharge=0\n",
+            static_cast<unsigned>(profile), EDM28::IsGapConditionServoProfile(profile) ? 1U : 0U,
+            EDM28::IsGapConditionServoProfile(profile) ? 1U : 0U);
+        RtPrintf("[EDM59-FIX2] event=DIAGNOSTICS observationOnly=1 cadenceMs=1000 masks=REF:1,POSITION:2,RANGE:8,TIME:16,TICKS:32 pdoHighInformational=1 discharge=0\n");
+    }
+    LogEDMGapDynamicAdmissionSameThread(mask, raw, mask ? "WAIT_FORMAL_RT" : "READY_WAIT_ARM");
+    return WaitForGapDryRunCallback;
+}
+
+void NCManager::LogEDMGapDynamicAdmissionSameThread(std::uint64_t mask,
+    const MotionStopSettleSnapshot& raw, const char* reason) noexcept
+{
+    if (EDM28::IsPhysicalServoProfile(m_edmZFixture.config.profile))
+    {
+        // The first Arm also starts the physical profile's 50 ms heartbeat deadline.
+        // Never put console output between submission and its RT receipt.
+        if (m_edmGapDynamic.armIssued) return;
+        RtPrintf("[%s] event=ADMISSION reason=%.32s P=%u session=%llu mask=0x%llX source=PHYSICAL axis=Z armIssued=0 discharge=0\n",
+            EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(m_edmZFixture.config.profile) ? "EDM76" : EDM28::IsPhysicalBidirectionalFlushFamilyProfile(m_edmZFixture.config.profile) ? "EDM75" : EDM28::IsPhysicalBidirectionalProfile(m_edmZFixture.config.profile) ? "EDM74" :
+            EDM28::IsPhysicalRetreatCycleProfile(m_edmZFixture.config.profile) ? "EDM73" :
+            EDM28::IsPhysicalRetreatProfile(m_edmZFixture.config.profile) ? "EDM72" :
+            EDM28::IsPhysicalServoFlushProfile(m_edmZFixture.config.profile) ? "EDM71" : "EDM70",
+            reason ? reason : "UNKNOWN", static_cast<unsigned>(m_edmZFixture.config.profile),
+            static_cast<unsigned long long>(m_edmZFixture.scope.session),
+            static_cast<unsigned long long>(mask));
+        return;
+    }
+    // EDM66-FIX2: admission diagnostics are allowed only before Arm. Once
+    // submitted, console latency must not consume the application deadline.
+    if (EDM28::IsGapServoFlushProfile(m_edmZFixture.config.profile) &&
+        m_edmGapDynamic.armIssued) return;
+    const bool flush = EDM28::IsGapFlushProfile(m_edmZFixture.config.profile);
+    const char* build = EDM28::IsGapServoFlushProfile(m_edmZFixture.config.profile) ? "EDM65" : EDM28::IsGapConditionServoProfile(m_edmZFixture.config.profile) ? "EDM59" : EDM57::IsBoundProfile(static_cast<unsigned>(m_edmZFixture.config.profile)) ? "EDM58" : flush ? "EDM57" : "EDM56";
+    char line[480]{};
+    const int n = std::snprintf(line, sizeof(line),
+        "[%s] event=ADMISSION build=%s reason=%.32s P=%u session=%llu mask=0x%llX formal=%u rawDiagOnly=1 rawStand=%u nonIdle=%u cmdMove=%u actMove=%u source=SIM axis=Z discharge=0\n",
+        build, build, reason ? reason : "UNKNOWN", static_cast<unsigned>(m_edmZFixture.config.profile),
+        static_cast<unsigned long long>(m_edmZFixture.scope.session), static_cast<unsigned long long>(mask),
+        (mask & (1ULL << 9U)) ? 0U : 1U, raw.standstill ? 1U : 0U,
+        raw.nonIdleAxisCount, raw.commandMovingAxisCount, raw.actualMovingAxisCount);
+    if (n >= 0 && static_cast<std::size_t>(n) < sizeof(line)) RtPrintf("%s", line);
+    else if (flush) RtPrintf("[%s] event=ADMISSION reason=LOG_FORMAT discharge=0\n", build);
+    else RtPrintf("[EDM56] event=ADMISSION reason=LOG_FORMAT discharge=0\n");
+    const auto& s = m_edmZFixture; const auto& f = s.feedback;
+    if (!f.latchedFault) return;
+    // Admission entry/timeout only, never the polling path. These current
+    // readback facts distinguish a retired receipt from proof renewal or a
+    // real fault without changing RT state or manufacturing readiness.
+    const int receipt = std::snprintf(line, sizeof(line),
+        "[%s] event=RETIRED_FAULT detail=%.32s part=RECEIPT session=%llu oldSession=%llu rtReason=%u state=%u cap=%u origin=%u stopLatch=%u zero=%u retired=%u stop=%llu disarm=%llu kind=%u discharge=0\n",
+        build, reason ? reason : "UNKNOWN", static_cast<unsigned long long>(s.scope.session),
+        static_cast<unsigned long long>(f.scope.session), static_cast<unsigned>(f.reason), static_cast<unsigned>(f.state),
+        f.capHeld ? 1U : 0U, f.originValid ? 1U : 0U, f.stopLatched ? 1U : 0U, f.forceZeroOutput ? 1U : 0U,
+        IsEDMGapDynamicRetiredFaultSameThread() ? 1U : 0U, static_cast<unsigned long long>(f.stopAppliedSequence),
+        static_cast<unsigned long long>(f.lastAppliedSequence), static_cast<unsigned>(f.lastAppliedKind));
+    if (receipt >= 0 && static_cast<std::size_t>(receipt) < sizeof(line)) RtPrintf("%s", line);
+    const double pulsePerMm = std::isfinite(f.pulsePerMm) && f.pulsePerMm > 0.0 ? f.pulsePerMm : 1.0;
+    const int proof = std::snprintf(line, sizeof(line),
+        "[%s] event=RETIRED_FAULT detail=%.32s part=PROOF tick=%llu fresh=%u clock=%u pdoValid=%u frame=%u idle=%u armReady=%u stopProven=%u stable=%u proof=%llu cmdMmS=%.9g pdoMmS=%.9g commandErrorMm=%.9g planningErrorMm=%.9g discharge=0\n",
+        build, reason ? reason : "UNKNOWN", static_cast<unsigned long long>(f.sampledTick),
+        f.sourceFresh ? 1U : 0U, f.clockValid ? 1U : 0U, f.pdoValid ? 1U : 0U, f.frameCurrent ? 1U : 0U,
+        f.axisIdle ? 1U : 0U, f.armReady ? 1U : 0U, f.stopProven ? 1U : 0U, f.stableCycles,
+        static_cast<unsigned long long>(f.proofSequence), f.cmdSpeedMmS, f.pdoSpeedMmS,
+        (f.actualPulse - f.commandPulse) / pulsePerMm, (f.actualPulse - f.planningPulse) / pulsePerMm);
+    if (proof >= 0 && static_cast<std::size_t>(proof) < sizeof(line)) RtPrintf("%s", line);
+}
+
+void NCManager::LogEDMGapDynamicSameThread(const char* event, const char* result, const char* reason) noexcept
+{
+    const auto& s = m_edmZFixture; const auto& f = s.feedback; const auto& r = f.dynamic;
+    if (EDM28::IsPhysicalServoProfile(s.config.profile))
+    {
+        if (m_gapDryRun.active && !m_gapDryRun.paused && !s.failureAlarmPending) return;
+        const auto& p = f.physical;
+        const bool current = r.session == s.scope.session && r.generation == m_edmGapDynamic.generation &&
+            r.profile == static_cast<std::uint8_t>(s.config.profile) && p.session == s.scope.session && p.generation == r.generation;
+        // Format floating values on this inactive NC boundary, then send the
+        // completed string to RtPrintf (native logs previously printed Z=f).
+        const bool physicalFlush = EDM28::IsPhysicalServoFlushProfile(s.config.profile);
+        const bool physicalRetreat = EDM28::IsPhysicalRetreatProfile(s.config.profile);
+        const bool physicalRetreatCycle = EDM28::IsPhysicalRetreatCycleProfile(s.config.profile);
+        const bool physicalEndurance = EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(s.config.profile);
+        const bool physicalBidirectionalFlush = EDM28::IsPhysicalBidirectionalFlushFamilyProfile(s.config.profile);
+        const bool physicalBidirectional = EDM28::IsPhysicalBidirectionalProfile(s.config.profile) || physicalBidirectionalFlush;
+        const char* build = physicalEndurance ? "EDM76" : physicalBidirectionalFlush ? "EDM75" : physicalBidirectional ? "EDM74" : physicalRetreatCycle ? "EDM73" : physicalRetreat ? "EDM72" : physicalFlush ? "EDM71" : "EDM70";
+        char line[768]{};
+        int size = std::snprintf(line, sizeof(line), "[%s] event=%.16s result=%.12s reason=%.48s P=%u session=%llu gen=%llu current=%u phase=%u cycles=%u Z=%.6f stop=%llu disarm=%llu source=PHYSICAL axis=Z %s driveAck=0 discharge=0\n",
+            build, event ? event : "UNKNOWN", result ? result : "UNKNOWN", reason ? reason : "NONE",
+            static_cast<unsigned>(s.config.profile),
+            static_cast<unsigned long long>(s.scope.session), static_cast<unsigned long long>(m_edmGapDynamic.generation),
+            current ? 1U : 0U, r.phase, r.cycles, s.originPinned ? (f.actualPulse-s.originPulse)/s.config.pulsePerMm : 0.0,
+            static_cast<unsigned long long>(f.stopAppliedSequence),
+            static_cast<unsigned long long>(f.lastAppliedKind == EDM28::RequestKind::Disarm ? f.lastAppliedSequence : 0ULL),
+            (physicalBidirectional || physicalRetreatCycle) ? "return=BOUNDED_FIXTURE anchor=FIRST_ARM" :
+            physicalRetreat ? "endpoint=HOLD_NO_RETURN" : "return=FIXTURE");
+        if (size >= 0 && static_cast<std::size_t>(size) < sizeof(line)) RtPrintf("%s", line);
+        else RtPrintf("[%s] event=SUMMARY result=FAIL reason=LOG_FORMAT discharge=0\n", build);
+        if (current)
+        {
+            if (physicalBidirectional)
+                size = std::snprintf(line, sizeof(line), "[%s] event=SOURCE session=%llu windowMs=%llu steps=%llu fresh=%llu firstSeq=%llu lastSeq=%llu maxAgeUs=%llu maxStepUs=%llu rawMinV=%.3f rawMaxV=%.3f filteredMinV=%.3f filteredMaxV=%.3f E8=%.3f E9=%.3f maxTargetError=%.9g windowComplete=%u lowInput=%u inputReason=%s physicalShortRecoveryVerified=0 discharge=0\n",
+                    build, static_cast<unsigned long long>(p.session), static_cast<unsigned long long>(p.windowUs/1000ULL),
+                    static_cast<unsigned long long>(p.runtimeSteps), static_cast<unsigned long long>(p.freshSamples),
+                    static_cast<unsigned long long>(p.firstSequence), static_cast<unsigned long long>(p.lastSequence),
+                    static_cast<unsigned long long>(p.maximumSourceAgeUs), static_cast<unsigned long long>(p.maximumStepUs),
+                    p.minimumRawV, p.maximumRawV, p.minimumFilteredV, p.maximumFilteredV,
+                    s.config.servoRecipe.overridePercent, s.config.servoRecipe.referenceV, p.maximumTargetError,
+                    p.completedWindow ? 1U : 0U, p.lowInput ? 1U : 0U, EDM69::ReasonName(p.inputReason));
+            else if (physicalRetreatCycle)
+                size = std::snprintf(line, sizeof(line), "[EDM73] event=SOURCE session=%llu windowMs=%llu steps=%llu fresh=%llu firstSeq=%llu lastSeq=%llu maxAgeUs=%llu maxStepUs=%llu maxRetreatMm=%.6f negativeTargetTicks=%llu negativeAppliedTicks=%llu fixtureReturnTicks=%llu retreatEndpointCount=%u partialRetreatAborted=%u rawMinV=%.3f rawMaxV=%.3f E8=%.3f E9=%.3f maxTargetError=%.9g windowComplete=%u lowInput=%u inputReason=%s physicalShortRecoveryVerified=0 discharge=0\n",
+                    static_cast<unsigned long long>(p.session), static_cast<unsigned long long>(p.windowUs/1000ULL),
+                    static_cast<unsigned long long>(p.runtimeSteps), static_cast<unsigned long long>(p.freshSamples),
+                    static_cast<unsigned long long>(p.firstSequence), static_cast<unsigned long long>(p.lastSequence),
+                    static_cast<unsigned long long>(p.maximumSourceAgeUs), static_cast<unsigned long long>(p.maximumStepUs),
+                    p.maximumActualRetreatMm, static_cast<unsigned long long>(p.negativeTargetTicks),
+                    static_cast<unsigned long long>(p.negativeAppliedTicks), static_cast<unsigned long long>(p.fixtureReturnTicks),
+                    p.retreatEndpointCount, p.partialRetreatAborted ? 1U : 0U, p.minimumRawV, p.maximumRawV,
+                    s.config.servoRecipe.overridePercent, s.config.servoRecipe.referenceV, p.maximumTargetError,
+                    p.completedWindow ? 1U : 0U, p.lowInput ? 1U : 0U, EDM69::ReasonName(p.inputReason));
+            else if (physicalRetreat)
+                size = std::snprintf(line, sizeof(line), "[EDM72] event=SOURCE session=%llu windowMs=%llu steps=%llu fresh=%llu firstSeq=%llu lastSeq=%llu maxAgeUs=%llu maxStepUs=%llu maxRetreatMm=%.6f negativeTargetTicks=%llu negativeAppliedTicks=%llu rawMinV=%.3f rawMaxV=%.3f E8=%.3f E9=%.3f maxTargetError=%.9g windowComplete=%u lowInput=%u inputReason=%s physicalShortRecoveryVerified=0 discharge=0\n",
+                    static_cast<unsigned long long>(p.session), static_cast<unsigned long long>(p.windowUs/1000ULL),
+                    static_cast<unsigned long long>(p.runtimeSteps), static_cast<unsigned long long>(p.freshSamples),
+                    static_cast<unsigned long long>(p.firstSequence), static_cast<unsigned long long>(p.lastSequence),
+                    static_cast<unsigned long long>(p.maximumSourceAgeUs), static_cast<unsigned long long>(p.maximumStepUs),
+                    p.maximumActualRetreatMm, static_cast<unsigned long long>(p.negativeTargetTicks),
+                    static_cast<unsigned long long>(p.negativeAppliedTicks), p.minimumRawV, p.maximumRawV,
+                    s.config.servoRecipe.overridePercent, s.config.servoRecipe.referenceV, p.maximumTargetError,
+                    p.completedWindow ? 1U : 0U, p.lowInput ? 1U : 0U, EDM69::ReasonName(p.inputReason));
+            else
+                size = std::snprintf(line, sizeof(line), "[%s] event=SOURCE session=%llu windowMs=%llu steps=%llu fresh=%llu firstSeq=%llu lastSeq=%llu maxAgeUs=%llu maxStepUs=%llu maxDepthMm=%.6f rawMinV=%.3f rawMaxV=%.3f E8=%.3f E9=%.3f maxTargetError=%.9g windowComplete=%u lowInput=%u inputReason=%s discharge=0\n",
+                build, static_cast<unsigned long long>(p.session), static_cast<unsigned long long>(p.windowUs/1000ULL),
+                static_cast<unsigned long long>(p.runtimeSteps), static_cast<unsigned long long>(p.freshSamples),
+                static_cast<unsigned long long>(p.firstSequence), static_cast<unsigned long long>(p.lastSequence),
+                static_cast<unsigned long long>(p.maximumSourceAgeUs), static_cast<unsigned long long>(p.maximumStepUs),
+                p.maximumActualDepthMm, p.minimumRawV, p.maximumRawV, s.config.servoRecipe.overridePercent,
+                s.config.servoRecipe.referenceV, p.maximumTargetError, p.completedWindow ? 1U : 0U,
+                p.lowInput ? 1U : 0U, EDM69::ReasonName(p.inputReason));
+            if (size >= 0 && static_cast<std::size_t>(size) < sizeof(line)) RtPrintf("%s", line);
+            else RtPrintf("[%s] event=SOURCE result=FAIL reason=LOG_FORMAT discharge=0\n", build);
+            if (physicalBidirectional)
+            {
+                size = std::snprintf(line, sizeof(line), "[%s] event=DIRECTION session=%llu motion=LIVE_AD_BIDIRECTIONAL workTicks=%llu positiveTargetTicks=%llu negativeTargetTicks=%llu positiveAppliedTicks=%llu negativeAppliedTicks=%llu workReversals=%u bidirectionalObserved=%u maxCommandDepthMm=%.6f maxCommandRetreatMm=%.6f fixtureReturnTicks=%llu directionCoverage=OBSERVED_ONLY return=BOUNDED_FIXTURE discharge=0\n",
+                    build, static_cast<unsigned long long>(p.session), static_cast<unsigned long long>(p.workTicks),
+                    static_cast<unsigned long long>(p.positiveTargetTicks), static_cast<unsigned long long>(p.negativeTargetTicks),
+                    static_cast<unsigned long long>(p.positiveAppliedTicks), static_cast<unsigned long long>(p.negativeAppliedTicks),
+                    p.workReversals, p.bidirectionalObserved ? 1U : 0U, p.maximumWorkCommandDepthMm,
+                    p.maximumWorkCommandRetreatMm, static_cast<unsigned long long>(p.fixtureReturnTicks));
+                if (size >= 0 && static_cast<std::size_t>(size) < sizeof(line)) RtPrintf("%s", line);
+                else RtPrintf("[%s] event=DIRECTION result=FAIL reason=LOG_FORMAT discharge=0\n", build);
+                size = std::snprintf(line, sizeof(line), "[%s] event=CONTROLLER detail=%.16s session=%llu gen=%llu rtReason=%u phase=%u active=%u terminal=%u completed=%u needStop=%u elapsedMs=%llu observationOnly=1 discharge=0\n",
+                    physicalEndurance ? "EDM76" : physicalBidirectionalFlush ? "EDM75" : "EDM74-FIX2", event ? event : "UNKNOWN", static_cast<unsigned long long>(r.session),
+                    static_cast<unsigned long long>(r.generation), static_cast<unsigned>(r.reason), r.phase,
+                    r.active ? 1U : 0U, r.terminal ? 1U : 0U, r.completed ? 1U : 0U, r.needFormalStop ? 1U : 0U,
+                    static_cast<unsigned long long>(r.nowUs >= r.startedUs ? (r.nowUs-r.startedUs)/1000ULL : 0ULL));
+                if (size >= 0 && static_cast<std::size_t>(size) < sizeof(line)) RtPrintf("%s", line);
+                else RtPrintf("[%s] event=LOG_FORMAT part=CONTROLLER discharge=0\n", physicalEndurance ? "EDM76" : physicalBidirectionalFlush ? "EDM75" : "EDM74-FIX2");
+                LogEDMGapOriginSettleSameThread(event, true);
+            }
+            if (physicalFlush || physicalBidirectionalFlush)
+            {
+                const auto& flush = r.flush; const auto& recipe = s.config.flush;
+                size = std::snprintf(line, sizeof(line), "[%s] event=FLUSH P=%u session=%llu phase=%s cycles=%u deep=%u topDwell=%u slowApproach=%u workPointMm=%.6f topMm=%.6f destinationMm=%.6f liftMm=%.6f complete=%u E5us=%llu E6=%.6f E7=%.3f E21=%u E22=%.6f discharge=0\n",
+                    build, static_cast<unsigned>(s.config.profile), static_cast<unsigned long long>(s.scope.session), EDM57::PhaseName(flush.phase),
+                    flush.cycles, flush.deepCycles, flush.topDwellCount, flush.slowApproachCount,
+                    flush.workPointMm, flush.topMm, flush.destinationMm, flush.liftHeightMm, flush.complete ? 1U : 0U,
+                    static_cast<unsigned long long>(recipe.workTimeUs), recipe.baseHeightMm,
+                    recipe.jumpSpeedOverridePercent, recipe.deepInterval, recipe.deepMultiplier);
+                if (size >= 0 && static_cast<std::size_t>(size) < sizeof(line)) RtPrintf("%s", line);
+                else RtPrintf("[%s] event=FLUSH result=FAIL reason=LOG_FORMAT discharge=0\n", build);
+            }
+        }
+        return;
+    }
+    // EDM66-FIX2: no formatting, clock reads or console IO on the live
+    // Arm/controller/Stop/Disarm/fresh-release path. PASS clears active first;
+    // HOLD sets paused after requesting Stop; a post-Arm failure sets
+    // failureAlarmPending after priority Stop. Cancellation requests Stop before clearing
+    // active. These boundaries retain their full cached diagnostic snapshot.
+    // Never refresh service time or relax any watchdog to pay for logging.
+    if (EDM28::IsGapServoFlushProfile(s.config.profile) &&
+        m_gapDryRun.active && !m_gapDryRun.paused && !s.failureAlarmPending) return;
+    const bool measureLog = EDM28::IsGapServoFlushProfile(s.config.profile);
+    // Read the same counter without changing the control clock's regression
+    // floor or service timestamps. This measures elapsed time across the log
+    // batch (including any preemption), not console CPU time or RT progress.
+    const auto observeMs = [this](std::uint64_t& value) noexcept
+    {
+        LARGE_INTEGER counter{};
+        const std::uint64_t frequency = m_gapDryRun.frequency;
+        if (!frequency || !RtQueryPerformanceCounter(&counter) || counter.QuadPart < 0)
+            return false;
+        const std::uint64_t ticks = static_cast<std::uint64_t>(counter.QuadPart);
+        if (ticks < m_gapDryRun.lastTicks) return false;
+        const std::uint64_t limit = (std::numeric_limits<std::uint64_t>::max)();
+        const std::uint64_t seconds = ticks / frequency, remainder = ticks % frequency;
+        if (remainder > limit / 1000ULL) return false;
+        const std::uint64_t fraction = remainder * 1000ULL / frequency;
+        if (seconds > (limit - fraction) / 1000ULL) return false;
+        value = seconds * 1000ULL + fraction;
+        return true;
+    };
+    std::uint64_t logStartMs = 0ULL;
+    const bool logClockValid = measureLog && observeMs(logStartMs);
+    const double relative = s.originPinned && s.config.pulsePerMm > 0.0 ?
+        (f.actualPulse - s.originPulse) / s.config.pulsePerMm : 0.0;
+    const bool flush = EDM28::IsGapFlushProfile(m_edmZFixture.config.profile);
+    const char* build = EDM28::IsGapServoFlushProfile(m_edmZFixture.config.profile) ? "EDM65" : EDM28::IsGapConditionServoProfile(m_edmZFixture.config.profile) ? "EDM59" : EDM57::IsBoundProfile(static_cast<unsigned>(m_edmZFixture.config.profile)) ? "EDM58" : flush ? "EDM57" : "EDM56";
+    const bool currentTelemetry = m_edmGapDynamic.generation && r.session == s.scope.session &&
+        r.generation == m_edmGapDynamic.generation && r.profile == static_cast<std::uint8_t>(s.config.profile);
+    char line[480]{};
+    int n = 0;
+    if (measureLog && !currentTelemetry)
+    {
+        // Arm and pre-Arm failures can still carry the last controller's
+        // snapshot. Attribute that history explicitly; it is not this run's
+        // voltage, servo speed, phase or flush work point.
+        n = std::snprintf(line, sizeof(line),
+            "[%s] event=%.16s result=%.12s reason=%.40s P=%u session=%llu gen=%llu tick=%llu telemetry=RETAINED rtSession=%llu rtGen=%llu Z=%.6f stop=%llu disarm=%llu source=SIM axis=Z driveAck=0 discharge=0\n",
+            build, event ? event : "UNKNOWN", result ? result : "UNKNOWN", reason ? reason : "NONE",
+            static_cast<unsigned>(s.config.profile), static_cast<unsigned long long>(s.scope.session),
+            static_cast<unsigned long long>(m_edmGapDynamic.generation), static_cast<unsigned long long>(f.sampledTick),
+            static_cast<unsigned long long>(r.session), static_cast<unsigned long long>(r.generation), relative,
+            static_cast<unsigned long long>(f.stopAppliedSequence),
+            static_cast<unsigned long long>(f.lastAppliedKind == EDM28::RequestKind::Disarm ? f.lastAppliedSequence : 0ULL));
+    }
+    else n = std::snprintf(line, sizeof(line),
+        "[%s] event=%.16s result=%.12s reason=%.40s P=%u session=%llu gen=%llu tick=%llu phase=%u cycles=%u raw=%.1f filt=%.1f target=%.2f applied=%.2f Z=%.6f stop=%llu disarm=%llu source=SIM axis=Z driveAck=0 discharge=0\n",
+        build, event ? event : "UNKNOWN", result ? result : "UNKNOWN", reason ? reason : "NONE",
+        static_cast<unsigned>(s.config.profile), static_cast<unsigned long long>(s.scope.session),
+        static_cast<unsigned long long>(m_edmGapDynamic.generation), static_cast<unsigned long long>(f.sampledTick),
+        static_cast<unsigned>(r.phase), static_cast<unsigned>(r.cycles), r.rawVoltageV, r.filteredVoltageV,
+        r.targetMmMin, r.appliedMmMin, relative, static_cast<unsigned long long>(f.stopAppliedSequence),
+        static_cast<unsigned long long>(f.lastAppliedKind == EDM28::RequestKind::Disarm ? f.lastAppliedSequence : 0ULL));
+    if (n >= 0 && static_cast<std::size_t>(n) < sizeof(line)) RtPrintf("%s", line);
+    else if (flush) RtPrintf("[%s] event=LOG result=FAIL reason=LOG_FORMAT discharge=0\n", build);
+    else RtPrintf("[EDM56] event=LOG result=FAIL reason=LOG_FORMAT discharge=0\n");
+    if (measureLog && currentTelemetry && (!event || std::strcmp(event, "PHASE") != 0))
+    {
+        // Expected binding is frozen by the RT source contract; only sequence
+        // and capture time below are serialized producer observations. Never
+        // present a computed identity as an independently observed IO value.
+        const bool ageValid = r.sourceSequence && r.sourceCapturedAtUs &&
+            r.sourceCapturedAtUs <= f.monotonicUs;
+        n = std::snprintf(line, sizeof(line),
+            "[EDM65] event=SOURCE detail=%.16s session=%llu gen=%llu expectedKind=SIM expectedId=60 expectedGeneration=%llu expectedCalibration=1 seq=%llu capturedUs=%llu ageUs=%llu ageValid=%u rtActive=%u sourcePort=61 observationOnly=1 discharge=0\n",
+            event ? event : "UNKNOWN", static_cast<unsigned long long>(r.session),
+            static_cast<unsigned long long>(r.generation), static_cast<unsigned long long>(r.generation),
+            static_cast<unsigned long long>(r.sourceSequence), static_cast<unsigned long long>(r.sourceCapturedAtUs),
+            static_cast<unsigned long long>(ageValid ? f.monotonicUs - r.sourceCapturedAtUs : 0ULL),
+            ageValid ? 1U : 0U, r.active ? 1U : 0U);
+        if (n >= 0 && static_cast<std::size_t>(n) < sizeof(line)) RtPrintf("%s", line);
+        else RtPrintf("[EDM65] event=SOURCE reason=LOG_FORMAT discharge=0\n");
+    }
+    if (flush) LogEDMGapFlushSameThread(event);
+    // Servo-flush diagnostics now reach only stopped/failure/completed NC
+    // boundaries. Other condition-servo profiles retain their WAIT cadence.
+    if (!measureLog || !event || std::strcmp(event, "PHASE") != 0)
+        LogEDMGapOriginSettleSameThread(event, true);
+    if (measureLog)
+    {
+        std::uint64_t logEndMs = 0ULL;
+        const bool valid = logClockValid && observeMs(logEndMs) && logEndMs >= logStartMs;
+        m_edmZFixture.lastDynamicLogEndMs = valid ? logEndMs : 0ULL;
+        m_edmZFixture.lastDynamicLogDurationMs = valid ? logEndMs - logStartMs : 0ULL;
+    }
+}
+
+void NCManager::LogEDMGapOriginSettleSameThread(const char* event, bool force) noexcept
+{
+    const bool physicalEndurance = EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(m_edmZFixture.config.profile);
+    const bool physicalBidirectionalFlush = EDM28::IsPhysicalBidirectionalFlushFamilyProfile(m_edmZFixture.config.profile);
+    const bool physicalBidirectional = EDM28::IsPhysicalBidirectionalProfile(m_edmZFixture.config.profile) || physicalBidirectionalFlush;
+    if (EDM28::IsPhysicalServoProfile(m_edmZFixture.config.profile) && !physicalBidirectional) return;
+    const auto& s = m_edmZFixture; const auto& f = s.feedback; const auto& r = f.dynamic;
+    // FIX1 diagnostics remain silent during Arm/work/return/Stop/Disarm.
+    // Format only the retained observations at an already-inactive boundary.
+    if (physicalBidirectional && m_gapDryRun.active && !m_gapDryRun.paused && !s.failureAlarmPending) return;
+    // Also guard the direct active WAIT call; do not advance log cadence when
+    // silent, so the eventual boundary can still print the retained sample.
+    if (EDM28::IsGapServoFlushProfile(s.config.profile) &&
+        m_gapDryRun.active && !m_gapDryRun.paused && !s.failureAlarmPending) return;
+    const auto& q = r.originSettle; auto& d = m_edmGapDynamic;
+    // Last validated RT observations remain explicitly timestamped across a
+    // terminal/fault. Logging owns only its two cadence words, not a receipt.
+    if (!EDM28::IsGapConditionServoProfile(s.config.profile) ||
+        !d.generation || r.session != s.scope.session || r.generation != d.generation ||
+        r.profile != static_cast<std::uint8_t>(s.config.profile) || !q.enteredUs ||
+        !q.sampledTick || !q.sampledUs || q.sampledUs < q.enteredUs ||
+        r.tick > f.sampledTick || r.nowUs > f.monotonicUs ||
+        q.sampledTick > r.tick || q.sampledUs > r.nowUs || q.sampledUs > f.monotonicUs)
+        return;
+    const bool sameEntry = d.originDiagLastEntryUs == q.enteredUs;
+    if (sameEntry && (d.originDiagLastLogUs == f.monotonicUs ||
+        (!force && (f.monotonicUs < d.originDiagLastLogUs ||
+            f.monotonicUs - d.originDiagLastLogUs < 1000000ULL)))) return;
+    d.originDiagLastEntryUs = q.enteredUs; d.originDiagLastLogUs = f.monotonicUs;
+    const char* build = physicalEndurance ? "EDM76" : physicalBidirectionalFlush ? "EDM75" : physicalBidirectional ? "EDM74-FIX2" :
+        EDM28::IsGapServoFlushProfile(s.config.profile) ? "EDM65" : "EDM59-FIX2";
+    char line[640]{};
+    int n = std::snprintf(line, sizeof(line),
+        "[%s] event=ORIGIN_SETTLE detail=%.16s part=GATES session=%llu gen=%llu tick=%llu phase=%u active=%u rtReason=%u cycles=%u enteredUs=%llu sampleTick=%llu sampleUs=%llu sampleAgeUs=%llu waitUs=%llu mask=0x%X stableUs=%u stableTicks=%u bestUs=%u bestTicks=%u observationOnly=1 discharge=0\n",
+        build, event ? event : "UNKNOWN", static_cast<unsigned long long>(r.session),
+        static_cast<unsigned long long>(r.generation), static_cast<unsigned long long>(f.sampledTick),
+        r.phase, r.active ? 1U : 0U, static_cast<unsigned>(r.reason), r.cycles,
+        static_cast<unsigned long long>(q.enteredUs), static_cast<unsigned long long>(q.sampledTick),
+        static_cast<unsigned long long>(q.sampledUs),
+        static_cast<unsigned long long>(f.monotonicUs - q.sampledUs),
+        static_cast<unsigned long long>(q.sampledUs - q.enteredUs), q.blockerMask,
+        q.stableUs, q.stableTicks, q.bestStableUs, q.bestStableTicks);
+    if (n >= 0 && static_cast<std::size_t>(n) < sizeof(line)) RtPrintf("%s", line);
+    else RtPrintf("[%s] event=LOG_FORMAT part=GATES discharge=0\n", build);
+    n = std::snprintf(line, sizeof(line),
+        "[%s] event=ORIGIN_SETTLE detail=%.16s part=VALUES session=%llu gen=%llu sampleTick=%llu errorMm=%.9g pdoMmS=%.9g windowRangeMm=%.9g minErrorMm=%.9g maxErrorMm=%.9g maxAbsPdoMmS=%.9g samples=%u refReject=%u positionReject=%u pdoHigh=%u rangeReset=%u observationOnly=1 discharge=0\n",
+        build, event ? event : "UNKNOWN", static_cast<unsigned long long>(r.session),
+        static_cast<unsigned long long>(r.generation), static_cast<unsigned long long>(q.sampledTick),
+        q.errorMm, q.pdoMmS, q.windowRangeMm, q.errorMinMm, q.errorMaxMm, q.maxAbsPdoMmS,
+        q.observations, q.referenceRejectTicks, q.positionRejectTicks, q.pdoHighTicks, q.rangeResetCount);
+    if (n >= 0 && static_cast<std::size_t>(n) < sizeof(line)) RtPrintf("%s", line);
+    else RtPrintf("[%s] event=LOG_FORMAT part=VALUES discharge=0\n", build);
+    if (physicalBidirectional && f.physical.session == r.session && f.physical.generation == r.generation)
+    {
+        const auto& c = f.physical.originControl;
+        n = std::snprintf(line, sizeof(line), "[%s] event=ORIGIN_CONTROL session=%llu gen=%llu sampleTick=%llu samples=%u idleGainMatch=%u motionGainMatch=%u otherGain=%u clamped=%u invalid=%u Kp=%.9g Ki=%.9g Kvff=%.9g pMmS=%.9g iMmS=%.9g imageHardwareMmS=%.9g image=LOCAL_PRE_SERIALIZATION driveAck=0 observationOnly=1 discharge=0\n",
+            build, static_cast<unsigned long long>(r.session), static_cast<unsigned long long>(r.generation),
+            static_cast<unsigned long long>(c.sampleTick), c.samples, c.idleGainTicks, c.motionGainTicks,
+            c.otherGainTicks, c.clampedTicks, c.invalidTicks, c.kp, c.ki, c.kvff,
+            c.proportionalMmS, c.integralMmS, c.guardedHardwareMmS);
+        if (n >= 0 && static_cast<std::size_t>(n) < sizeof(line)) RtPrintf("%s", line);
+        else RtPrintf("[%s] event=LOG_FORMAT part=CONTROL discharge=0\n", build);
+        if (physicalBidirectionalFlush)
+            n = std::snprintf(line, sizeof(line), "[%s] event=SETTLE_HANDOFF session=%llu gen=%llu applied=%u count=%u tick=%llu enteredUs=%llu settlePhase=%u priorIMmS=%.9g action=RESET_ACTIVE_I_ONCE_PER_SETTLE_ENTRY receipt=LOCAL_CONTROLLER driveAck=0 discharge=0\n",
+                build, static_cast<unsigned long long>(r.session), static_cast<unsigned long long>(r.generation),
+                c.handoffTick ? 1U : 0U, c.handoffCount, static_cast<unsigned long long>(c.handoffTick),
+                static_cast<unsigned long long>(c.handoffEntryUs), c.handoffPhase, c.handoffIntegralMmS);
+        else
+            n = std::snprintf(line, sizeof(line), "[EDM74-FIX2] event=ORIGIN_HANDOFF session=%llu gen=%llu applied=%u tick=%llu priorIMmS=%.9g action=RESET_ACTIVE_I_ONCE receipt=LOCAL_CONTROLLER driveAck=0 discharge=0\n",
+            static_cast<unsigned long long>(r.session), static_cast<unsigned long long>(r.generation),
+            c.handoffTick ? 1U : 0U, static_cast<unsigned long long>(c.handoffTick), c.handoffIntegralMmS);
+        if (n >= 0 && static_cast<std::size_t>(n) < sizeof(line)) RtPrintf("%s", line);
+        else RtPrintf("[%s] event=LOG_FORMAT part=HANDOFF discharge=0\n", build);
+    }
+}
+
+
+void NCManager::LogEDMGapFlushSameThread(const char* event) noexcept
+{
+    const auto& s = m_edmZFixture; const auto& r = s.feedback.dynamic; const auto& f = r.flush;
+    if (EDM28::IsGapServoFlushProfile(s.config.profile) &&
+        m_gapDryRun.active && !m_gapDryRun.paused && !s.failureAlarmPending) return;
+    if (EDM28::IsGapServoFlushProfile(s.config.profile) &&
+        (!m_edmGapDynamic.generation || r.session != s.scope.session ||
+            r.generation != m_edmGapDynamic.generation || r.profile != static_cast<std::uint8_t>(s.config.profile)))
+        return;
+    const auto& recipe = s.config.flush;
+    const char* build = EDM28::IsGapServoFlushProfile(s.config.profile) ? "EDM65" : EDM57::IsBoundProfile(static_cast<unsigned>(s.config.profile)) ? "EDM58" : "EDM57";
+    char line[480]{};
+    const int n = std::snprintf(line, sizeof(line),
+        "[%s] event=FLUSH detail=%.16s gen=%llu phase=%.24s cycles=%u deep=%u blocked=%u resumed=%u slow=%u dwell=%u inhibit=%u persistent=%u work=%.6f top=%.6f destination=%.6f height=%.6f anchor=FIRST_ARM recipe=%u E5us=%llu E6=%.6f E7=%.6f E21=%u E22=%.6f source=SIM discharge=0\n",
+        build, event ? event : "UNKNOWN", static_cast<unsigned long long>(r.generation),
+        EDM57::PhaseName(static_cast<EDM57::Phase>(f.phase)), f.cycles, f.deepCycles, f.blockedCount,
+        f.resumedReturnCount, f.slowApproachCount, f.topDwellCount, f.returnBlocked ? 1U : 0U,
+        f.persistentLatched ? 1U : 0U, f.workPointMm, f.topMm, f.destinationMm, f.liftHeightMm,
+        recipe.revision, static_cast<unsigned long long>(recipe.workTimeUs), recipe.baseHeightMm,
+        recipe.jumpSpeedOverridePercent, recipe.deepInterval, recipe.deepMultiplier);
+    if (n >= 0 && static_cast<std::size_t>(n) < sizeof(line)) RtPrintf("%s", line);
+    else RtPrintf("[%s] event=FLUSH result=FAIL reason=LOG_FORMAT discharge=0\n", build);
+}
+
+bool NCManager::IsEDMPhysicalSequenceReleaseCurrentSameThread(NCBlockDispatchId nextDispatch,
+    std::uint64_t& receiptAgeUs) noexcept
+{
+    receiptAgeUs = 0ULL;
+    auto& s = m_edmZFixture; const auto& d = m_edmGapDynamic;
+    // A released segment is historical evidence, not permission to change the
+    // current observer scope. Recipe edits are allowed only after this release.
+    if (!d.sequenceMode || !d.active || !d.terminalObserved || !d.armIssued ||
+        !EDM28::IsPhysicalBidirectionalFlushFamilyProfile(s.config.profile) ||
+        m_gapDryRun.active || m_gapDryRun.paused || m_gapDryRun.result != 1U ||
+        s.phase != EDMZFixturePhase::Finished || s.cleanupPending || s.resetPending ||
+        s.failureAlarmPending || !s.originPinned || !s.motionApplied ||
+        !d.sequenceReceiptPublication || !d.sequenceReceiptTick || !d.sequenceReceiptUs ||
+        !m_gapDryRun.run || m_gapDryRun.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        m_gapDryRun.cache != GetBaseProgramCache().GetGeneration() ||
+        m_gapDryRun.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !m_gapDryRun.lease.Matches(m_programMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_gapDryRun.lease) ||
+        nextDispatch == NC_BLOCK_DISPATCH_ID_INVALID ||
+        nextDispatch <= m_gapDryRun.dispatch ||
+        !IsEDMShortFlushRunReadySameThread() || m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        !ReadEDMZFixtureFeedbackSameThread(false)) return false;
+    const auto& f = s.feedback;
+    std::uint64_t nowUs = 0ULL;
+    if (!ReadEDMGapServoClockSameThread(nowUs) || f.monotonicUs > nowUs ||
+        nowUs - f.monotonicUs > 5000ULL ||
+        f.publicationSequence < d.sequenceReceiptPublication ||
+        f.sampledTick < d.sequenceReceiptTick || f.monotonicUs < d.sequenceReceiptUs ||
+        (f.sampledTick == d.sequenceReceiptTick && f.monotonicUs != d.sequenceReceiptUs) ||
+        (f.sampledTick > d.sequenceReceiptTick && f.monotonicUs <= d.sequenceReceiptUs) ||
+        f.currentEpoch != m_gapDryRun.epoch ||
+        f.currentOwner != static_cast<std::uint8_t>(m_gapDryRun.lease.owner) ||
+        f.currentOwnerGeneration != m_gapDryRun.lease.generation ||
+        !IsEDMGapDynamicConfigValidSameThread(true) || !IsEDMGapDynamicTerminalSameThread() ||
+        !IsEDMZFixtureAppliedSameThread(EDM28::RequestKind::Disarm) ||
+        !EvaluateEDMGapDynamicCompletionSameThread(EDM49::Stage::FreshReleased).Ready()) return false;
+    receiptAgeUs = nowUs - f.monotonicUs;
+    return true;
+}
+
+bool NCManager::IsEDMPhysicalSequenceBoundarySameThread() noexcept
+{
+    std::uint64_t receiptAgeUs = 0ULL;
+    if (!IsEDMPhysicalSequenceReleaseCurrentSameThread(m_currentExecutingBlockDispatchId, receiptAgeUs))
+        return false;
+    const auto& s = m_edmZFixture; const auto& f = s.feedback;
+    RtPrintf("[EDM77] event=SEQUENCE_BOUNDARY result=PROVEN previousSession=%llu previousDispatch=%llu nextDispatch=%llu run=%llu stopSeq=%llu disarmSeq=%llu receiptPub=%llu receiptTick=%llu receiptAgeUs=%llu axis=Z origin=FIRST_ARM discharge=0\n",
+        static_cast<unsigned long long>(s.scope.session), static_cast<unsigned long long>(m_gapDryRun.dispatch),
+        static_cast<unsigned long long>(m_currentExecutingBlockDispatchId), static_cast<unsigned long long>(m_gapDryRun.run),
+        static_cast<unsigned long long>(s.terminalStopAppliedSequence), static_cast<unsigned long long>(s.pendingSequence),
+        static_cast<unsigned long long>(f.publicationSequence), static_cast<unsigned long long>(f.sampledTick),
+        static_cast<unsigned long long>(receiptAgeUs));
+    return true;
+}
+
+// EDM80 closes the pinned Q2 plan at the authored M30. The existing program
+// end gate and idle-hold handoff remain authoritative; this adds no motion.
+bool NCManager::ValidateEDMPhysicalSequenceEndSameThread(NCProgramEndCause cause,
+    int sourcePC, int sourceLineNumber, NCBlockDispatchId markerDispatchId,
+    bool finalCheck) noexcept
+{
+    auto& plan = m_edmPhysicalSequencePlan;
+    const auto run = m_pathCoreLiveBookkeeping.currentRunToken;
+    const bool required = plan.plan.valid || plan.run != 0ULL ||
+        (run != 0ULL && m_gapDryRun.run == run && m_edmGapDynamic.strictSequenceMode);
+    if (!required) return true; // Q1 and legacy programs retain their end rules.
+    const auto reject = [this, sourceLineNumber, markerDispatchId, finalCheck](const char* reason) noexcept -> bool
+    {
+        CancelProgramEndBoundary();
+        // A finished, disarmed fixture is not an active session to stop again.
+        // Contain genuinely busy work before any new terminal diagnostic IO.
+        RejectEDMGapAdmissionSameThread(AlarmManager::PROGRAM_END_GATE_ERROR,
+            sourceLineNumber, "EDM80_PLAN_END_REJECTED");
+        RtPrintf("[EDM80] event=PLAN_END_REJECT result=REJECT phase=%s reason=%s run=%llu dispatch=%llu armIssued=0 discharge=0\n",
+            finalCheck ? "FINALIZE" : "REQUEST", reason,
+            static_cast<unsigned long long>(m_pathCoreLiveBookkeeping.currentRunToken),
+            static_cast<unsigned long long>(markerDispatchId));
+        return false;
+    };
+    if (!plan.plan.valid || !plan.plan.count || plan.plan.count > EDM77::MaximumFixtures ||
+        plan.next != plan.plan.count || plan.legPending || !run || plan.run != run ||
+        plan.cache != GetBaseProgramCache().GetGeneration() ||
+        plan.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        !plan.lease.Matches(m_programMotionLease) || !m_motion.IsMotionOwnerLeaseCurrent(plan.lease) ||
+        !m_edmGapDynamic.strictSequenceMode || !m_edmGapDynamic.sequenceMode ||
+        m_gapDryRun.run != plan.run || m_gapDryRun.cache != plan.cache ||
+        m_gapDryRun.epoch != plan.epoch || !m_gapDryRun.lease.Matches(plan.lease) ||
+        plan.dispatch != m_gapDryRun.dispatch || plan.dispatch == NC_BLOCK_DISPATCH_ID_INVALID ||
+        m_isG66Active || !m_macroStack.empty()) return reject("PLAN_SCOPE");
+    if (cause != NCProgramEndCause::M30 || plan.firstPC < 0 ||
+        plan.firstPC > (std::numeric_limits<int>::max)() - static_cast<int>(EDM77::MaximumPhysicalLines) ||
+        !plan.plan.terminalOffset || plan.plan.terminalOffset > EDM77::MaximumPhysicalLines ||
+        sourcePC != plan.firstPC + static_cast<int>(plan.plan.terminalOffset)) return reject("END_SOURCE");
+    const NCProgramCacheLine* terminal = GetBaseProgramCache().TryGetLine(sourcePC);
+    if (!terminal || sourceLineNumber != terminal->sourceLineNumber ||
+        !EDM77::Detail::Clean(terminal->parsedBlock) ||
+        !EDM77::Detail::Terminal(terminal->parsedBlock)) return reject("END_LITERAL");
+    if (markerDispatchId == NC_BLOCK_DISPATCH_ID_INVALID || markerDispatchId <= plan.dispatch ||
+        (plan.terminalDispatch != NC_BLOCK_DISPATCH_ID_INVALID &&
+            (plan.terminalDispatch != markerDispatchId || plan.terminalPC != sourcePC)) ||
+        (finalCheck && plan.terminalDispatch == NC_BLOCK_DISPATCH_ID_INVALID)) return reject("END_MARKER");
+    const auto& last = plan.plan.checkpoints[plan.plan.count - 1U];
+    if (last.sourceOffset >= plan.plan.terminalOffset ||
+        last.profile != static_cast<unsigned>(m_edmZFixture.config.profile)) return reject("LAST_FIXTURE");
+    const NCProgramCacheLine* fixture = GetBaseProgramCache().TryGetLine(
+        plan.firstPC + static_cast<int>(last.sourceOffset));
+    if (!fixture || fixture->sourceLineNumber != m_gapDryRun.sourceLine ||
+        EDM77::SequenceMode(fixture->parsedBlock) != 2U ||
+        !EDM77::Detail::EqualLiteral(fixture->parsedBlock.expression('P'), last.profile))
+        return reject("LAST_LITERAL");
+    if (!m_edmProcessReady || m_recipeRecoveryDisplayOnly || m_recipeIdleSelection || m_recipeHoldSeen ||
+        m_recipeRun != plan.run || m_recipeCache != plan.cache || m_recipeEpoch != plan.epoch ||
+        !m_recipeLease.Matches(plan.lease)) return reject("RECIPE_AUTHORITY");
+    const auto match = EDM79::MatchCheckpoint(last, last.sourceOffset, last.profile,
+        m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+    if (match != EDM79::MatchError::None) return reject(EDM79::MatchErrorName(match));
+    if (!EDM57::SameRecipe(last.flush, m_edmZFixture.config.flush) ||
+        !EDM59::SameRecipe(last.servo, m_edmZFixture.config.servoRecipe)) return reject("FROZEN_RECIPE");
+    std::uint64_t receiptAgeUs = 0ULL;
+    if (!IsEDMPhysicalSequenceReleaseCurrentSameThread(markerDispatchId, receiptAgeUs))
+        return reject("RELEASE_PROOF");
+    if (!finalCheck && plan.terminalDispatch == NC_BLOCK_DISPATCH_ID_INVALID)
+    {
+        plan.terminalDispatch = markerDispatchId; plan.terminalPC = sourcePC;
+        RtPrintf("[EDM80] event=PLAN_END_REQUEST result=ACCEPT count=%u run=%llu cache=%llu dispatch=%llu terminalPC=%d generation=%llu proof=FRESH_RELEASED consumed=0 discharge=0\n",
+            plan.plan.count, static_cast<unsigned long long>(plan.run),
+            static_cast<unsigned long long>(plan.cache), static_cast<unsigned long long>(markerDispatchId),
+            sourcePC, static_cast<unsigned long long>(last.key.generation));
+    }
+    return true;
+}
+
+// Called only after the original program-end gate, idle handoff, MarkFinalized
+// and final NC state CAS succeeded. Old Program ownership is consumed already;
+// do not try to recreate or revalidate that lease after the handoff.
+void NCManager::CommitEDMPhysicalSequenceEndSameThread() noexcept
+{
+    const auto& plan = m_edmPhysicalSequencePlan;
+    if (plan.plan.valid && plan.terminalDispatch != NC_BLOCK_DISPATCH_ID_INVALID)
+    {
+        RtPrintf("[EDM80] event=PLAN_END_PASS result=PASS count=%u run=%llu cache=%llu dispatch=%llu terminalPC=%d consumed=1 next=NEW_RUN_REQUIRED discharge=0\n",
+            plan.plan.count, static_cast<unsigned long long>(plan.run),
+            static_cast<unsigned long long>(plan.cache), static_cast<unsigned long long>(plan.terminalDispatch),
+            plan.terminalPC);
+        m_edmGapDynamic.strictSequenceMode = false;
+    }
+    InvalidateEDMPhysicalSequencePlanSameThread();
+}
+
+
+bool NCManager::IsEDMGapDynamicConfigValidSameThread(bool requireFrozen) const noexcept
+{
+    const auto& s = m_edmZFixture; const auto& c = s.config;
+    const auto same = [](const EDM28::Config& a, const EDM28::Config& b) noexcept
+    {
+        return a.profile == b.profile && a.axisIndex == b.axisIndex && a.pulsePerMm == b.pulsePerMm &&
+            a.referenceOffsetPulse == b.referenceOffsetPulse && a.hardwareSign == b.hardwareSign &&
+            a.outerHalfMm == b.outerHalfMm && a.targetHalfMm == b.targetHalfMm &&
+            a.feedMmMin == b.feedMmMin && a.pdoCapMmS == b.pdoCapMmS &&
+            a.accelerationTimeSec == b.accelerationTimeSec && a.decelerationTimeSec == b.decelerationTimeSec &&
+            a.followingLimitMm == b.followingLimitMm && a.positionToleranceMm == b.positionToleranceMm &&
+            a.excursionToleranceMm == b.excursionToleranceMm && a.heartbeatTicks == b.heartbeatTicks &&
+            a.maximumIssueAgeTicks == b.maximumIssueAgeTicks && a.stopTimeoutTicks == b.stopTimeoutTicks && a.settleCycles == b.settleCycles &&
+            EDM57::SameRecipe(a.flush, b.flush) && EDM59::SameRecipe(a.servoRecipe, b.servoRecipe) &&
+            EDM69::SameRequest(a.physicalInput, b.physicalInput);
+    };
+    return m_edmGapDynamic.active && EDM28::IsGapDynamicProfile(c.profile) && c.axisIndex == 2U &&
+        std::isfinite(c.pulsePerMm) && c.pulsePerMm >= 1000.0 && c.pulsePerMm <= 1000000000.0 &&
+        std::isfinite(c.referenceOffsetPulse) && (c.hardwareSign == 1 || c.hardwareSign == -1) &&
+        (EDM28::IsPhysicalServoProfile(c.profile) ? (EDM70::ValidConfig(c) && EDM70::MatchesScope(c.physicalInput, s.scope)) :
+            (c.outerHalfMm == .4 && c.targetHalfMm == .25 && c.feedMmMin == 30.0 && c.pdoCapMmS == .5 &&
+                EDM69::SameRequest(c.physicalInput, EDM69::Request{}))) &&
+        c.accelerationTimeSec == .3 && c.decelerationTimeSec == .3 && c.followingLimitMm == .02 &&
+        c.positionToleranceMm == .001 && c.excursionToleranceMm == .001 && c.heartbeatTicks == 200U &&
+        c.maximumIssueAgeTicks == 80U && c.stopTimeoutTicks == 4000U && c.settleCycles == 200U &&
+        (EDM28::IsPhysicalBidirectionalFlushFamilyProfile(c.profile) ?
+            (EDM75::ValidateRecipe(c.flush) && EDM71::SameAdmission(c.flush, c.servoRecipe)) :
+            EDM28::IsPhysicalServoFlushProfile(c.profile) ?
+            (EDM71::ValidateRecipe(c.flush) && EDM71::SameAdmission(c.flush, c.servoRecipe)) :
+            EDM28::IsGapFlushProfile(c.profile) ? EDM57::ValidateRecipeForProfile(c.flush, static_cast<unsigned>(c.profile)) :
+            EDM57::SameRecipe(c.flush, EDM57::Recipe{})) &&
+        ((EDM28::IsPhysicalBidirectionalProfile(c.profile) || EDM28::IsPhysicalBidirectionalFlushFamilyProfile(c.profile)) ? EDM74::ValidateRecipe(c.servoRecipe) :
+            EDM28::IsPhysicalNegativeProfile(c.profile) ? EDM72::ValidateRecipe(c.servoRecipe) :
+            EDM28::IsGapConditionServoProfile(c.profile) ? EDM59::ValidateRecipe(c.servoRecipe) : EDM59::IsEmptyRecipe(c.servoRecipe)) &&
+        (!EDM28::IsGapServoFlushProfile(c.profile) || EDM28::ValidateGapServoFlushConfig(c)) &&
+        same(c, m_edmGapDynamic.frozenConfig) && (!requireFrozen || same(c, s.feedback.frozenConfig));
+}
+
+bool NCManager::IsEDMGapDynamicRetiredFaultSameThread() const noexcept
+{
+    const auto& s = m_edmZFixture; const auto& f = s.feedback; const auto& d = m_edmGapDynamic;
+    // Disarm retains the previous fault for diagnostics. It is not a fault of
+    // this new session until a first Arm has actually acquired its own cap.
+    // Classify only that historical Stop/Disarm receipt here. A new idle
+    // proof can be renewing after Disarm; PreArm waits within its existing
+    // admission deadline instead of calling that old latch a new fault.
+    // Never clear RT state here: RT Arm still validates current authority,
+    // source, configuration and 200 new idle cycles before clearing its latch.
+    const bool firstArmPending = s.phase == EDMZFixturePhase::ArmPending && s.pending &&
+        s.pendingKind == EDM28::RequestKind::Arm && d.armIssued && s.pendingSequence == d.armSequence &&
+        s.pendingSequence > f.lastAppliedSequence;
+    const bool cancelledFirstArm = m_gapDryRun.paused && s.phase == EDMZFixturePhase::ShortStop &&
+        d.armIssued && s.curvePreArmHold && s.curvePreArmSequence == d.armSequence;
+    if (!IsEDMGapDynamicConfigValidSameThread(false) || s.originPinned || s.motionApplied || s.windowStartMs ||
+        s.cleanupPending || s.failureAlarmPending || s.resetPending || d.generation || d.acknowledged || d.terminalObserved ||
+        !((s.phase == EDMZFixturePhase::PreArm && !s.pending && !d.armIssued) || firstArmPending || cancelledFirstArm) ||
+        !f.latchedFault || f.reason == EDM28::Reason::None || f.state != EDM28::State::Disarmed || f.capHeld || f.stopLatched || f.forceZeroOutput || f.originValid ||
+        !EDM28::ValidScope(f.scope) || f.scope.session > s.scope.session ||
+        !f.publicationSequence || !f.sampledTick || !f.monotonicUs || !f.sourceFresh || !f.pdoValid || !f.contiguous || !f.clockValid ||
+        !f.axisExists || !f.linear || !f.servoReady || !f.modeReady || f.modeValue != 9 || (f.statusWord & 0x006FU) != 0x0027U ||
+        f.fault || f.hardPositive || f.hardNegative || !f.axisIdle || !f.frameCurrent ||
+        f.axisMapGeneration != s.scope.axisMapGeneration || f.configGeneration != s.scope.configGeneration ||
+        f.scope.axisMapGeneration != s.scope.axisMapGeneration || f.scope.configGeneration != s.scope.configGeneration ||
+        f.pulsePerMm != s.config.pulsePerMm || f.referenceOffsetPulse != s.config.referenceOffsetPulse || f.hardwareSign != s.config.hardwareSign ||
+        !std::isfinite(f.actualPulse) || !std::isfinite(f.commandPulse) || !std::isfinite(f.planningPulse) ||
+        !std::isfinite(f.cmdSpeedMmS) || !std::isfinite(f.pdoSpeedMmS) ||
+        // PDO velocity is the outgoing PID correction, not measured motion.
+        // Keep it finite; physical settling is proved by RT below PreArm.
+        std::fabs(f.cmdSpeedMmS) > 1.0 / s.config.pulsePerMm ||
+        std::fabs(f.actualPulse - f.commandPulse) > s.config.positionToleranceMm * s.config.pulsePerMm ||
+        std::fabs(f.actualPulse - f.planningPulse) > s.config.positionToleranceMm * s.config.pulsePerMm ||
+        f.lastAppliedKind != EDM28::RequestKind::Disarm || !f.stopAppliedSequence || !f.stopAppliedTick || !f.stopAppliedMonotonicUs ||
+        f.lastAppliedSequence <= f.stopAppliedSequence || f.lastAppliedTick <= f.stopAppliedTick ||
+        f.lastAppliedMonotonicUs <= f.stopAppliedMonotonicUs || f.sampledTick <= f.lastAppliedTick || f.monotonicUs <= f.lastAppliedMonotonicUs ||
+        f.sampledTick - f.stopAppliedTick < s.config.settleCycles ||
+        f.monotonicUs - f.stopAppliedMonotonicUs < s.config.settleCycles * EDM28::CycleUs || !f.proofSequence)
+        return false;
+    const bool sameRetiredReceipt = f.lastAppliedSequence == s.replanRetiredFaultDisarmSequence &&
+        f.lastAppliedTick == s.replanRetiredFaultDisarmTick && f.lastAppliedMonotonicUs == s.replanRetiredFaultDisarmUs &&
+        f.stopAppliedSequence == s.replanRetiredFaultStopSequence && f.stopAppliedTick == s.replanRetiredFaultStopTick &&
+        f.stopAppliedMonotonicUs == s.replanRetiredFaultStopUs && f.reason == s.replanRetiredFaultReason;
+    if (!f.queuedCancellation)
+        return f.scope.session < s.scope.session && f.lastRequestSequence == f.lastAppliedSequence &&
+            (!s.replanRetiredFaultSession || (f.scope.session == s.replanRetiredFaultSession && sameRetiredReceipt));
+    // HOLD can cancel a queued first Arm before it applies. RT then changes
+    // the cancellation scope but deliberately retains the prior fault and
+    // Disarm stamps. Require that exact receipt, previously proved here, plus
+    // a fresh idle window; a current-session applied fault cannot use this path.
+    const bool exactRetired = s.replanRetiredFaultSession && s.replanRetiredFaultSession < f.scope.session &&
+        sameRetiredReceipt && f.armReady && f.lastRequestSequence > f.lastAppliedSequence;
+    const bool exactCancellation = s.curvePreArmHold && s.curvePreArmSequence &&
+        f.lastRequestSequence == s.curvePreArmSequence &&
+        (f.scope.session < s.scope.session || (cancelledFirstArm && EDM28::SameScope(f.scope, s.scope)));
+    return exactRetired && exactCancellation;
+}
+
+bool NCManager::ObserveEDMGapDynamicRetiredFaultSameThread() noexcept
+{
+    if (!IsEDMGapDynamicRetiredFaultSameThread()) return false;
+    auto& s = m_edmZFixture; const auto& f = s.feedback;
+    if (!f.queuedCancellation)
+    {
+        s.replanRetiredFaultSession = f.scope.session;
+        s.replanRetiredFaultDisarmSequence = f.lastAppliedSequence; s.replanRetiredFaultDisarmTick = f.lastAppliedTick;
+        s.replanRetiredFaultDisarmUs = f.lastAppliedMonotonicUs;
+        s.replanRetiredFaultStopSequence = f.stopAppliedSequence; s.replanRetiredFaultStopTick = f.stopAppliedTick;
+        s.replanRetiredFaultStopUs = f.stopAppliedMonotonicUs; s.replanRetiredFaultReason = f.reason;
+    }
+    return true;
+}
+
+bool NCManager::IsEDMGapDynamicStoppedSameThread() const noexcept
+{
+    const auto& s = m_edmZFixture; const auto& f = s.feedback;
+    if (!IsEDMGapDynamicConfigValidSameThread(s.originPinned) || !f.sourceFresh || !f.pdoValid || !f.contiguous ||
+        !f.clockValid || !f.axisIdle || (!s.cleanupPending && (f.forceZeroOutput ||
+            (f.latchedFault && !IsEDMGapDynamicRetiredFaultSameThread()))) ||
+        f.axisMapGeneration != s.scope.axisMapGeneration || f.configGeneration != s.scope.configGeneration ||
+        f.pulsePerMm != s.config.pulsePerMm || f.referenceOffsetPulse != s.config.referenceOffsetPulse ||
+        f.hardwareSign != s.config.hardwareSign || !std::isfinite(f.cmdSpeedMmS) ||
+        std::fabs(f.cmdSpeedMmS) > 1.0 / s.config.pulsePerMm) return false;
+    if (!s.cleanupPending && m_edmGapDynamic.generation && f.dynamic.session == s.scope.session &&
+        f.dynamic.generation == m_edmGapDynamic.generation && f.dynamic.reason != EDM56::Reason::None &&
+        f.dynamic.reason != EDM56::Reason::Cancelled) return false;
+    if (!s.originPinned && !f.capHeld && !f.originValid && !s.motionApplied && f.armReady)
+        return !m_edmGapDynamic.armIssued || (EDM28::SameScope(f.scope, s.scope) && f.queuedCancellation &&
+            f.state == EDM28::State::Disarmed && f.lastRequestSequence == m_edmGapDynamic.armSequence);
+    return EDM28::SameScope(f.scope, s.scope) && f.state == EDM28::State::Held && f.capHeld && f.frameCurrent &&
+        f.originValid && f.stopLatched && f.stopProven && f.proofSequence &&
+        f.lastAppliedKind == EDM28::RequestKind::Stop && f.stopAppliedSequence && f.stopAppliedTick && f.stopAppliedMonotonicUs &&
+        f.lastAppliedSequence == f.stopAppliedSequence && f.lastAppliedTick == f.stopAppliedTick &&
+        f.lastAppliedMonotonicUs == f.stopAppliedMonotonicUs && f.sampledTick >= f.stopAppliedTick &&
+        f.sampledTick - f.stopAppliedTick >= s.config.settleCycles && f.monotonicUs >= f.stopAppliedMonotonicUs &&
+        f.monotonicUs - f.stopAppliedMonotonicUs >= s.config.settleCycles * EDM28::CycleUs &&
+        f.stableCycles >= s.config.settleCycles && (!s.originPinned || f.outerOriginPulse == s.originPulse) &&
+        std::fabs(f.actualPulse - f.outerOriginPulse) <= s.config.outerHalfMm * s.config.pulsePerMm &&
+        std::fabs(f.commandPulse - f.outerOriginPulse) <= s.config.outerHalfMm * s.config.pulsePerMm &&
+        std::fabs(f.planningPulse - f.outerOriginPulse) <= s.config.outerHalfMm * s.config.pulsePerMm;
+}
+
+bool NCManager::IsEDMGapDynamicTerminalSameThread() const noexcept
+{
+    const auto& s = m_edmZFixture; const auto& r = s.feedback.dynamic; const auto& d = m_edmGapDynamic;
+    if (!d.generation || r.session != s.scope.session || r.generation != d.generation ||
+        r.profile != static_cast<std::uint8_t>(s.config.profile) || !r.terminal || r.active || !r.needFormalStop ||
+        !r.startedTick || !r.startedUs || !r.steps || !r.tick || !r.nowUs || r.tick < r.startedTick || r.nowUs < r.startedUs ||
+        !r.sourceSequence || !r.sourceCapturedAtUs || r.sourceCapturedAtUs > r.nowUs ||
+        !r.appliedSequence || r.appliedSequence > r.candidateSequence || r.originPulse != s.originPulse ||
+        !std::isfinite(r.rawVoltageV) || !std::isfinite(r.filteredVoltageV) || !std::isfinite(r.commandPulse) ||
+        !std::isfinite(r.nativeVelocityPps) || !std::isfinite(r.targetMmMin) || !std::isfinite(r.servoMmMin) ||
+        !std::isfinite(r.appliedMmMin)) return false;
+    if (d.terminalObserved && (r.tick != d.terminal.tick || r.nowUs != d.terminal.nowUs ||
+        r.sourceSequence != d.terminal.sourceSequence || r.sourceCapturedAtUs != d.terminal.sourceCapturedAtUs ||
+        r.reason != d.terminal.reason || r.cycles != d.terminal.cycles || r.steps != d.terminal.steps ||
+        r.appliedSequence != d.terminal.appliedSequence)) return false;
+    const std::uint64_t sourceAgeUs = r.nowUs - r.sourceCapturedAtUs;
+    const bool neutralOrigin = r.kernelFault == EDM55::Fault::None && r.nativeVelocityPps == 0.0 &&
+        r.appliedMmMin == 0.0 && r.commandPulse == s.originPulse && sourceAgeUs <= 5000ULL;
+    if (EDM28::IsPhysicalServoProfile(s.config.profile))
+    {
+        const auto& p = s.feedback.physical;
+        const bool physicalFlush = EDM28::IsPhysicalServoFlushProfile(s.config.profile);
+        const bool physicalRetreat = EDM28::IsPhysicalRetreatProfile(s.config.profile);
+        const bool physicalRetreatCycle = EDM28::IsPhysicalRetreatCycleProfile(s.config.profile);
+        const bool physicalBidirectionalFlush = EDM28::IsPhysicalBidirectionalFlushFamilyProfile(s.config.profile);
+        const bool physicalBidirectional = EDM28::IsPhysicalBidirectionalProfile(s.config.profile) || physicalBidirectionalFlush;
+        const bool physicalNegative = EDM28::IsPhysicalNegativeProfile(s.config.profile);
+        if ((physicalBidirectional || physicalRetreatCycle) && (!EDM70::ValidConfig(s.config) ||
+            !EDM70::MatchesScope(s.config.physicalInput, s.scope))) return false;
+        // EDM76 must carry both a continuous source window and a matching
+        // controller lifetime. A legacy-duration receipt cannot prove endurance.
+        if (EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(s.config.profile) &&
+            (r.nowUs - r.startedUs < EDM69::DurationUsFor(s.config.physicalInput.recipeFamily) ||
+             r.nowUs - r.startedUs >= EDM69::TotalDeadlineUsFor(s.config.physicalInput.recipeFamily) ||
+             p.runtimeSteps > EDM69::MaximumRuntimeStepsFor(s.config.physicalInput.recipeFamily))) return false;
+        const double endpointPulse = s.originPulse + EDM72::RetreatDepthMm * s.config.pulsePerMm;
+        const bool neutralEndpoint = r.kernelFault == EDM55::Fault::None && r.nativeVelocityPps == 0.0 &&
+            r.appliedMmMin == 0.0 && r.commandPulse == endpointPulse && sourceAgeUs <= 5000ULL;
+        if (physicalBidirectional && (r.phase != static_cast<std::uint32_t>(EDM56::Phase::Terminal) ||
+            (physicalBidirectionalFlush ? r.cycles < EDM70::MinimumSignedFlushCyclesFor(static_cast<unsigned>(s.config.profile)) : r.cycles != 0U) || r.shortActive || !EDM74::InputAllowed(s.config.servoRecipe, r.rawVoltageV) ||
+            !p.workTicks || p.workTicks > r.steps || p.positiveTargetTicks > p.workTicks ||
+            p.negativeTargetTicks > p.workTicks - p.positiveTargetTicks ||
+            p.positiveAppliedTicks > p.workTicks || p.negativeAppliedTicks > p.workTicks - p.positiveAppliedTicks ||
+            p.workReversals > p.workTicks || p.fixtureReturnTicks > r.steps ||
+            p.bidirectionalObserved != (p.positiveAppliedTicks > 0ULL && p.negativeAppliedTicks > 0ULL && p.workReversals > 0U) ||
+            !std::isfinite(p.minimumFilteredV) || !std::isfinite(p.maximumFilteredV) ||
+            p.minimumFilteredV < 0.0 || p.maximumFilteredV > 300.0 || p.minimumFilteredV > p.maximumFilteredV ||
+            !std::isfinite(p.maximumWorkCommandDepthMm) || !std::isfinite(p.maximumWorkCommandRetreatMm) ||
+            p.maximumWorkCommandDepthMm < 0.0 || p.maximumWorkCommandRetreatMm < 0.0 ||
+            p.maximumWorkCommandDepthMm > EDM70::DepthMm || p.maximumWorkCommandRetreatMm > EDM70::DepthMm ||
+            (d.terminalObserved && (r.phase != d.terminal.phase || r.commandPulse != d.terminal.commandPulse ||
+                r.originPulse != d.terminal.originPulse || r.kernelFault != d.terminal.kernelFault ||
+                r.nativeVelocityPps != d.terminal.nativeVelocityPps || r.appliedMmMin != d.terminal.appliedMmMin ||
+                r.candidateSequence != d.terminal.candidateSequence || r.completed != d.terminal.completed ||
+                r.shortActive != d.terminal.shortActive || r.feedInhibited != d.terminal.feedInhibited)))) return false;
+        if (physicalNegative && (r.phase != static_cast<std::uint32_t>(EDM56::Phase::Terminal) ||
+            (physicalRetreat ? r.cycles != 1U : r.cycles < 2U) ||
+            !std::isfinite(endpointPulse) || r.shortActive ||
+            !EDM72::NegativeInputAllowed(s.config.servoRecipe, r.rawVoltageV) ||
+            // The completed EDM69 source neutralizes its kernel and sets
+            // feedInhibited. That terminal state is sealed, not live input.
+            (d.terminalObserved && (r.phase != d.terminal.phase || r.commandPulse != d.terminal.commandPulse ||
+                r.originPulse != d.terminal.originPulse || r.kernelFault != d.terminal.kernelFault ||
+                r.nativeVelocityPps != d.terminal.nativeVelocityPps || r.appliedMmMin != d.terminal.appliedMmMin ||
+                r.candidateSequence != d.terminal.candidateSequence || r.completed != d.terminal.completed ||
+                r.shortActive != d.terminal.shortActive || r.feedInhibited != d.terminal.feedInhibited)))) return false;
+        if (physicalBidirectionalFlush && (!EDM75::CompletionValid(r.flush, s.config.flush) ||
+            r.flush.cycles != r.cycles || r.flush.phaseSinceUs > r.nowUs ||
+            r.flush.stableSinceUs > r.nowUs ||
+            (d.terminalObserved && !EDM71::SameCompletion(r.flush, d.terminal.flush)))) return false;
+        if (physicalFlush && (!EDM71::CompletionValid(r.flush, s.config.flush) ||
+            r.flush.cycles != r.cycles || r.flush.phaseSinceUs > r.nowUs ||
+            r.flush.stableSinceUs > r.nowUs ||
+            (d.terminalObserved && !EDM71::SameCompletion(r.flush, d.terminal.flush)))) return false;
+        return (physicalRetreat ? neutralEndpoint : neutralOrigin) && r.completed && r.reason == EDM56::Reason::Complete && !r.persistentShort &&
+            !r.expectedStale && (physicalBidirectionalFlush ? r.cycles >= EDM70::MinimumSignedFlushCyclesFor(static_cast<unsigned>(s.config.profile)) : physicalBidirectional ? r.cycles == 0U : r.cycles > 0U) && p.session == s.scope.session && p.generation == d.generation &&
+            p.completedWindow && !p.lowInput && p.inputReason == EDM69::Reason::None &&
+            p.windowUs >= EDM69::DurationUsFor(s.config.physicalInput.recipeFamily) && p.runtimeSteps >= p.freshSamples && p.freshSamples >= 2ULL &&
+            p.firstSequence > s.config.physicalInput.baselineSequence && p.lastSequence >= p.firstSequence &&
+            p.maximumSourceAgeUs <= 5000ULL && p.maximumStepUs && p.maximumStepUs <= 2000ULL &&
+            std::isfinite(p.maximumTargetError) && p.maximumTargetError <= 1e-8 &&
+            (physicalBidirectional ? (std::isfinite(p.maximumActualDepthMm) && std::isfinite(p.maximumActualRetreatMm) &&
+                p.maximumActualDepthMm >= 0.0 && p.maximumActualDepthMm <= EDM70::OuterMm &&
+                p.maximumActualRetreatMm >= 0.0 && p.maximumActualRetreatMm <= EDM70::OuterMm) :
+            physicalNegative ? (std::isfinite(p.maximumActualRetreatMm) &&
+                p.maximumActualRetreatMm >= EDM72::RetreatDepthMm-.001 && p.maximumActualRetreatMm <= EDM70::OuterMm &&
+                p.negativeTargetTicks > 0ULL && p.negativeTargetTicks <= r.steps &&
+                p.negativeAppliedTicks > 0ULL && p.negativeAppliedTicks <= r.steps &&
+                (!physicalRetreatCycle || (p.fixtureReturnTicks > 0ULL && p.fixtureReturnTicks <= r.steps &&
+                    p.retreatEndpointCount == r.cycles))) :
+                (std::isfinite(p.maximumActualDepthMm) &&
+                 (physicalFlush ? p.maximumActualDepthMm > 0.0 : p.maximumActualDepthMm >= EDM70::DepthMm-.001) &&
+                 p.maximumActualDepthMm <= EDM70::OuterMm));
+    }
+    if (EDM28::IsGapFlushProfile(s.config.profile))
+    {
+        const auto& f = r.flush; const auto& saved = d.terminal.flush;
+        if (!EDM57::ValidateRecipeForProfile(s.config.flush, static_cast<unsigned>(s.config.profile)) || !std::isfinite(f.workPointMm) ||
+            !std::isfinite(f.topMm) || !std::isfinite(f.destinationMm) || !std::isfinite(f.liftHeightMm) ||
+            !f.phaseSinceUs || f.phaseSinceUs > r.nowUs || f.stableSinceUs > r.nowUs ||
+            f.blockedSinceUs > r.nowUs || f.cycles != r.cycles || f.cycles > s.config.flush.cycleCount ||
+            f.deepCycles > EDM57::ExpectedDeepCycles(s.config.flush, f.cycles) ||
+            std::fabs(f.workPointMm) > s.config.outerHalfMm || std::fabs(f.topMm) > s.config.outerHalfMm ||
+            std::fabs(f.destinationMm) > s.config.outerHalfMm || f.liftHeightMm < 0.0 ||
+            f.liftHeightMm > EDM57::MaximumLiftHeight(s.config.flush)) return false;
+        // Completion telemetry is sealed once RT terminates. Physical proof
+        // still comes exclusively from the Stop/Disarm/fresh receipt chain.
+        if (d.terminalObserved && (f.phase != saved.phase || f.cycles != saved.cycles ||
+            f.deepCycles != saved.deepCycles || f.blockedCount != saved.blockedCount ||
+            f.resumedReturnCount != saved.resumedReturnCount || f.slowApproachCount != saved.slowApproachCount ||
+            f.topDwellCount != saved.topDwellCount || f.phaseSinceUs != saved.phaseSinceUs ||
+            f.stableSinceUs != saved.stableSinceUs || f.blockedSinceUs != saved.blockedSinceUs ||
+            f.blockedSequence != saved.blockedSequence || f.workPointMm != saved.workPointMm ||
+            f.topMm != saved.topMm || f.destinationMm != saved.destinationMm || f.liftHeightMm != saved.liftHeightMm ||
+            f.returnBlocked != saved.returnBlocked || f.persistentLatched != saved.persistentLatched ||
+            f.complete != saved.complete)) return false;
+        if (EDM57::IsStaleProfile(static_cast<unsigned>(s.config.profile)))
+            return !r.completed && !r.persistentShort && r.expectedStale && !f.complete && !f.persistentLatched &&
+                r.reason == EDM56::Reason::ExpectedStale && r.kernelFault == EDM55::Fault::Stale &&
+                sourceAgeUs > 5000ULL && f.phase == static_cast<std::uint32_t>(EDM57::Phase::Lift) &&
+                f.cycles == 0U;
+        if (!neutralOrigin || f.phase != static_cast<std::uint32_t>(EDM57::Phase::Terminal) ||
+            f.destinationMm != 0.0 || r.expectedStale) return false;
+        if (EDM57::IsPersistentProfile(static_cast<unsigned>(s.config.profile)))
+            return !r.completed && r.persistentShort && !f.complete && f.persistentLatched &&
+                r.reason == EDM56::Reason::PersistentShort && r.shortActive && r.feedInhibited &&
+                r.rawVoltageV == 20.0 && f.cycles == 0U;
+        const bool gateProven = EDM57::IsBlockedProfile(static_cast<unsigned>(s.config.profile)) ?
+            (f.blockedCount == 1U && f.resumedReturnCount == 1U && f.blockedSinceUs && f.blockedSequence) :
+            (f.blockedCount == 0U && f.resumedReturnCount == 0U);
+        return gateProven && r.completed && !r.persistentShort && r.reason == EDM56::Reason::Complete &&
+            f.complete && !f.persistentLatched && !f.returnBlocked && f.cycles == s.config.flush.cycleCount &&
+            f.deepCycles == EDM57::ExpectedDeepCycles(s.config.flush, s.config.flush.cycleCount) &&
+            f.slowApproachCount == s.config.flush.cycleCount && f.topDwellCount == s.config.flush.cycleCount;
+    }
+    if (s.config.profile == EDM28::Profile::P35GapDynamic || s.config.profile == EDM28::Profile::P46GapServoRecipe)
+        return neutralOrigin && r.completed && !r.persistentShort && !r.expectedStale && r.reason == EDM56::Reason::Complete && r.cycles == 6U;
+    if (s.config.profile == EDM28::Profile::P36GapDynamicPersistent || s.config.profile == EDM28::Profile::P47GapServoRecipePersistent)
+        return neutralOrigin && !r.completed && r.persistentShort && !r.expectedStale && r.reason == EDM56::Reason::PersistentShort &&
+            r.shortActive && r.feedInhibited && r.rawVoltageV == 20.0;
+    return (s.config.profile == EDM28::Profile::P37GapDynamicStale || s.config.profile == EDM28::Profile::P48GapServoRecipeStale) && !r.completed && !r.persistentShort &&
+        r.expectedStale && r.reason == EDM56::Reason::ExpectedStale &&
+        r.kernelFault == EDM55::Fault::Stale && sourceAgeUs > 5000ULL;
+}
+
+void NCManager::PauseEDMGapDynamicSameThread(const char* reason) noexcept
+{
+    if (EDM28::IsPhysicalServoProfile(m_edmZFixture.config.profile))
+    { EndEDMZFixtureSameThread("CANCELLED", reason ? reason :
+        EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(m_edmZFixture.config.profile) ? "EDM76_HOLD_RESET_REQUIRED" : EDM28::IsPhysicalBidirectionalFlushFamilyProfile(m_edmZFixture.config.profile) ? "EDM75_HOLD_RESET_REQUIRED" : EDM28::IsPhysicalBidirectionalProfile(m_edmZFixture.config.profile) ? "EDM74_HOLD_RESET_REQUIRED" :
+        EDM28::IsPhysicalRetreatCycleProfile(m_edmZFixture.config.profile) ? "EDM73_HOLD_RESET_REQUIRED" :
+        EDM28::IsPhysicalRetreatProfile(m_edmZFixture.config.profile) ? "EDM72_HOLD_RESET_REQUIRED" :
+        EDM28::IsPhysicalServoFlushProfile(m_edmZFixture.config.profile) ? "EDM71_HOLD_RESET_REQUIRED" :
+        "EDM70_HOLD_RESET_REQUIRED"); return; }
+    auto& s = m_edmZFixture; auto& d = m_edmGapDynamic;
+    if (!m_gapDryRun.active)
+    {
+        if (m_gapDryRun.result == 1U)
+        {
+            // Completion has not yet left the NC receipt lifecycle. A HOLD
+            // cannot turn that old receipt into a later START/M30 success.
+            s.phase = EDMZFixturePhase::Receipt;
+            EndEDMZFixtureSameThread("FAIL", "EDM56_TERMINAL_HOLD_RESET_REQUIRED");
+        }
+        return;
+    }
+    // A released stream has only historical SIM data. HOLD revokes its
+    // completion instead of treating the frozen source as a new observation.
+    if (d.terminalObserved || s.phase == EDMZFixturePhase::FinalStop ||
+        s.phase == EDMZFixturePhase::Disarm || s.phase == EDMZFixturePhase::Receipt ||
+        (ReadEDMZFixtureFeedbackSameThread(false) && d.generation &&
+            s.feedback.dynamic.session == s.scope.session && s.feedback.dynamic.generation == d.generation &&
+            s.feedback.dynamic.reason != EDM56::Reason::None && s.feedback.dynamic.reason != EDM56::Reason::Cancelled))
+    { EndEDMZFixtureSameThread("FAIL", "EDM56_TERMINAL_HOLD_RESET_REQUIRED"); return; }
+    if (m_gapDryRun.paused) return;
+    // Preserve the old Disarm receipt before a queued first Arm is cancelled.
+    // An applied current-session fault can never satisfy this classification.
+    (void)ObserveEDMGapDynamicRetiredFaultSameThread();
+    if (!s.originPinned && d.armIssued)
+    { s.curvePreArmHold = true; s.curvePreArmSequence = d.armSequence; }
+    if (d.armIssued) m_motion.RequestEDMZFixtureStop(s.scope.session);
+    m_gapDryRun.paused = true; s.pending = false; s.resumeStartMs = 0ULL; d.authorityWaitMs = 0ULL;
+    if (d.armIssued) s.phase = EDMZFixturePhase::ShortStop;
+    LogEDMGapDynamicSameThread("HOLD", "WAIT", reason ? reason : "STOP_THEN_FRESH_CONTROLLER");
+}
+
+void NCManager::ValidateEDMGapDynamicSameThread()
+{
+    auto& s = m_edmZFixture; auto& d = m_edmGapDynamic;
+    if (s.cleanupPending) ServiceEDMZFixtureCleanupSameThread();
+    ServiceEDMZFixtureFailureAlarmSameThread();
+    // Single-block and interlock HOLD may enter directly after a completed
+    // wait. Keep that seam from reusing the preceding successful Q1 receipt.
+    if (d.sequenceMode && m_gapDryRun.result == 1U &&
+        (m_state == NCState::HOLD || m_edmState == EDMState::HOLD))
+    { EndEDMZFixtureSameThread("CANCELLED", "EDM77_BOUNDARY_HOLD_RESET_REQUIRED"); return; }
+    if (!m_gapDryRun.active) return;
+    if (m_state == NCState::HOLD || m_edmState == EDMState::HOLD)
+    { PauseEDMGapDynamicSameThread("HOLD"); return; }
+    if (AlarmManager::GetInstance().HasAlarm() || m_state == NCState::ALARM || m_edmState == EDMState::ALARM ||
+        Close_System_Com_flag || m_state == NCState::RESET_STATE || m_mode != NCOperationMode::MEMORY ||
+        m_gapDryRun.run != m_pathCoreLiveBookkeeping.currentRunToken || m_gapDryRun.cache != GetBaseProgramCache().GetGeneration() ||
+        m_gapDryRun.dispatch != m_waitingBlockDispatchId)
+    { EndEDMZFixtureSameThread("CANCELLED", "EDM56_SCOPE_REVOKED"); return; }
+    std::uint64_t now = 0ULL;
+    if (!ReadGapDryRunClockSameThread(now) || now < s.lastClockMs)
+    { EndEDMZFixtureSameThread("FAIL", "EDM56_CLOCK_INVALID"); return; }
+    if (m_gapDryRun.paused)
+    {
+        if (ReadEDMZFixtureFeedbackSameThread(false) && s.feedback.dynamic.session == s.scope.session &&
+            s.feedback.dynamic.generation == d.generation && d.generation &&
+            s.feedback.dynamic.reason != EDM56::Reason::None && s.feedback.dynamic.reason != EDM56::Reason::Cancelled)
+            EndEDMZFixtureSameThread("FAIL", "EDM56_HELD_CONTROLLER_RESET_REQUIRED");
+        return; // START callback owns fresh authority/rearm.
+    }
+    if (now == d.validationClockMs)
+    { if (++d.validationStalled >= 4096U) { EndEDMZFixtureSameThread("FAIL", "EDM56_CLOCK_NOT_ADVANCING"); return; } }
+    else { d.validationClockMs = now; d.validationStalled = 0U; }
+    if (!IsEDMZFixtureAuthorityCurrentSameThread(false))
+    {
+        // RT may revoke authority before this scan observes HOLD/RESET.
+        // Contain immediately, but retain a bounded NC classification window.
+        if (d.armIssued) m_motion.RequestEDMZFixtureStop(s.scope.session);
+        if (!d.authorityWaitMs) d.authorityWaitMs = now;
+        if (now - d.authorityWaitMs >= 250ULL || (d.admissionPending && now - d.admissionStartMs >= 1000ULL))
+            EndEDMZFixtureSameThread("FAIL", "EDM56_AUTHORITY_TIMEOUT");
+        return;
+    }
+    d.authorityWaitMs = 0ULL;
+    if (EDM28::IsPhysicalServoProfile(s.config.profile))
+    {
+        const bool physicalRetreat = EDM28::IsPhysicalRetreatProfile(s.config.profile);
+        const bool physicalRetreatCycle = EDM28::IsPhysicalRetreatCycleProfile(s.config.profile);
+        const bool physicalEndurance = EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(s.config.profile);
+        const bool physicalBidirectionalFlush = EDM28::IsPhysicalBidirectionalFlushFamilyProfile(s.config.profile);
+        const bool physicalBidirectional = EDM28::IsPhysicalBidirectionalProfile(s.config.profile) || physicalBidirectionalFlush;
+        const bool physicalNegative = EDM28::IsPhysicalNegativeProfile(s.config.profile);
+        const auto binding = physicalBidirectional ? EDM74::BindPhysicalBidirectionalRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration) :
+            physicalNegative ? EDM72::BindPhysicalRetreatRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration) :
+            EDM59::BindPhysicalServoRecipe(m_recipe, m_edmProcessProfile, m_edmProcessTuningGeneration);
+        if (!m_edmProcessReady || m_recipeRecoveryDisplayOnly || m_recipeIdleSelection || m_recipeHoldSeen ||
+            m_recipeRun != m_gapDryRun.run || m_recipeCache != m_gapDryRun.cache || m_recipeEpoch != m_gapDryRun.epoch ||
+            !m_recipeLease.Matches(m_gapDryRun.lease) || !binding.ready || !EDM59::SameRecipe(binding.recipe, s.config.servoRecipe))
+        { EndEDMZFixtureSameThread("FAIL", physicalEndurance ? "EDM76_LIVE_RECIPE_CHANGED" : physicalBidirectionalFlush ? "EDM75_LIVE_RECIPE_CHANGED" : physicalBidirectional ? "EDM74_LIVE_RECIPE_CHANGED" : physicalRetreatCycle ? "EDM73_LIVE_RECIPE_CHANGED" : physicalRetreat ? "EDM72_LIVE_RECIPE_CHANGED" : EDM28::IsPhysicalServoFlushProfile(s.config.profile) ?
+            "EDM71_LIVE_RECIPE_CHANGED" : "EDM70_LIVE_RECIPE_CHANGED"); return; }
+        if (physicalBidirectionalFlush)
+        {
+            const auto flush = EDM75::BindPhysicalBidirectionalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+            if (!flush.ready || !EDM57::SameRecipe(flush.recipe, s.config.flush) ||
+                !EDM71::SameAdmission(flush.recipe, binding.recipe))
+            { EndEDMZFixtureSameThread("FAIL", physicalEndurance ? "EDM76_LIVE_RECIPE_CHANGED" : "EDM75_LIVE_RECIPE_CHANGED"); return; }
+        }
+        if (EDM28::IsPhysicalServoFlushProfile(s.config.profile))
+        {
+            const auto flush = EDM71::BindPhysicalFlushRecipe(m_recipe, m_edmProcessProfile.machineProfileId);
+            if (!flush.ready || !EDM57::SameRecipe(flush.recipe, s.config.flush) ||
+                !EDM71::SameAdmission(flush.recipe, binding.recipe))
+            { EndEDMZFixtureSameThread("FAIL", "EDM71_LIVE_RECIPE_CHANGED"); return; }
+        }
+    }
+    if (d.admissionPending && now - d.admissionStartMs >= 1000ULL)
+    {
+        std::uint64_t mask = 0ULL; MotionStopSettleSnapshot raw{};
+        (void)IsEDMGapServoRunReadySameThread(&mask, &raw);
+        LogEDMGapDynamicAdmissionSameThread(mask, raw, "TIMEOUT");
+        EndEDMZFixtureSameThread("FAIL", "EDM56_ADMISSION_TIMEOUT");
+    }
+}
+
+bool NCManager::ProcessEDMGapDynamicSameThread()
+{
+    auto& s = m_edmZFixture; auto& d = m_edmGapDynamic;
+    if (EDM28::IsPhysicalServoProfile(s.config.profile) && !m_gapDryRun.active && m_gapDryRun.result == 2U &&
+        m_state == NCState::RUN && !AlarmManager::GetInstance().HasAlarm() && m_resetContinuationPhase == ResetContinuationPhase::IDLE)
+    { EndEDMZFixtureSameThread("FAIL", EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(s.config.profile) ? "EDM76_CANCELLED_CALLBACK_RESET_REQUIRED" : EDM28::IsPhysicalBidirectionalFlushFamilyProfile(s.config.profile) ? "EDM75_CANCELLED_CALLBACK_RESET_REQUIRED" : EDM28::IsPhysicalBidirectionalProfile(s.config.profile) ? "EDM74_CANCELLED_CALLBACK_RESET_REQUIRED" :
+        EDM28::IsPhysicalRetreatCycleProfile(s.config.profile) ? "EDM73_CANCELLED_CALLBACK_RESET_REQUIRED" :
+        EDM28::IsPhysicalRetreatProfile(s.config.profile) ? "EDM72_CANCELLED_CALLBACK_RESET_REQUIRED" :
+        EDM28::IsPhysicalServoFlushProfile(s.config.profile) ? "EDM71_CANCELLED_CALLBACK_RESET_REQUIRED" : "EDM70_CANCELLED_CALLBACK_RESET_REQUIRED"); return false; }
+    if (s.phase == EDMZFixturePhase::Finished || !m_gapDryRun.active) return false;
+    if (m_state == NCState::HOLD || m_edmState == EDMState::HOLD)
+    { PauseEDMGapDynamicSameThread("HOLD"); return false; }
+    std::uint64_t now = 0ULL;
+    if (!ReadGapDryRunClockSameThread(now) || now < s.lastClockMs)
+    { EndEDMZFixtureSameThread("FAIL", "EDM56_CLOCK_INVALID"); return false; }
+    if (!m_gapDryRun.paused && !d.admissionPending && now - s.lastClockMs >= 50ULL)
+    { EndEDMZFixtureSameThread("FAIL", "CONTROL_DEADMAN_50MS"); return false; }
+    if (now == s.lastClockMs)
+    { if (++s.stalledCalls >= 4096U) { EndEDMZFixtureSameThread("FAIL", "EDM56_CLOCK_NOT_ADVANCING"); return false; } }
+    else s.stalledCalls = 0U;
+    s.lastClockMs = m_gapDryRun.lastServiceMs = now;
+    if (!ReadEDMZFixtureFeedbackSameThread(false))
+    { EndEDMZFixtureSameThread("FAIL", "EDM56_INVALID_RT_SOURCE"); return false; }
+    const auto& f = s.feedback;
+    if (!IsEDMGapDynamicConfigValidSameThread(s.originPinned) ||
+        f.axisMapGeneration != s.scope.axisMapGeneration || f.configGeneration != s.scope.configGeneration ||
+        f.pulsePerMm != s.config.pulsePerMm || f.referenceOffsetPulse != s.config.referenceOffsetPulse || f.hardwareSign != s.config.hardwareSign)
+    { EndEDMZFixtureSameThread("FAIL", "EDM56_FROZEN_FRAME_CHANGED"); return false; }
+    if (f.publicationSequence < s.publicationFloor || f.sampledTick < s.tickFloor ||
+        (f.sampledTick == d.lastSourceTick && f.monotonicUs != d.lastSourceUs) ||
+        (f.sampledTick > d.lastSourceTick && f.monotonicUs <= d.lastSourceUs))
+    { EndEDMZFixtureSameThread("FAIL", "EDM56_RT_SOURCE_REGRESSED"); return false; }
+    if (f.publicationSequence == s.publicationFloor || f.sampledTick == s.tickFloor)
+    {
+        if (!m_gapDryRun.paused && now - s.lastFreshMs >= 50ULL)
+            EndEDMZFixtureSameThread("FAIL", "EDM56_RT_SOURCE_STALLED");
+        return false;
+    }
+    s.publicationFloor = f.publicationSequence; s.tickFloor = f.sampledTick;
+    d.lastSourceTick = f.sampledTick; d.lastSourceUs = f.monotonicUs; s.lastFreshMs = now;
+    const bool retiredFault = ObserveEDMGapDynamicRetiredFaultSameThread();
+    if (f.forceZeroOutput || (f.latchedFault && !retiredFault) || f.state == EDM28::State::Fault)
+    { EndEDMZFixtureSameThread("FAIL", "EDM56_RT_LATCHED_FAULT"); return false; }
+    if (m_gapDryRun.paused)
+    {
+        if (d.generation && f.dynamic.session == s.scope.session && f.dynamic.generation == d.generation &&
+            f.dynamic.reason != EDM56::Reason::None && f.dynamic.reason != EDM56::Reason::Cancelled)
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_HELD_CONTROLLER_RESET_REQUIRED"); return false; }
+        if (!s.resumeStartMs) s.resumeStartMs = now;
+        if (now - s.resumeStartMs >= 1000ULL)
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_HELD_STOP_TIMEOUT"); return false; }
+        if (!IsEDMGapDynamicStoppedSameThread()) return false;
+        const auto epoch = m_motion.GetCurrentExecutionEpoch(); const auto lease = m_programMotionLease;
+        if (!IsEDMZFixtureAuthorityCurrentSameThread(true) || f.currentEpoch != epoch ||
+            f.currentOwner != static_cast<std::uint8_t>(lease.owner) || f.currentOwnerGeneration != lease.generation) return false;
+        if (m_gapDryRunSerial == (std::numeric_limits<std::uint64_t>::max)() ||
+            m_gapDryRun.restarts == (std::numeric_limits<std::uint32_t>::max)())
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_RESTART_EXHAUSTED"); return false; }
+        if (f.capHeld && !s.originPinned)
+        { s.originPulse = f.outerOriginPulse; s.originPinned = true; }
+        if (!s.originPinned && d.armIssued)
+        {
+            if (m_edmZFixtureSessionSerial == (std::numeric_limits<std::uint64_t>::max)())
+            { EndEDMZFixtureSameThread("FAIL", "EDM56_SESSION_EXHAUSTED"); return false; }
+            s.scope.session = ++m_edmZFixtureSessionSerial; d.armIssued = false; d.armSequence = 0ULL;
+        }
+        if (epoch != m_motion.GetCurrentExecutionEpoch() || !m_motion.IsMotionOwnerLeaseCurrent(lease)) return false;
+        // Only explicit START changes observer authority. The original
+        // physical session and FIRST_ARM anchor survive an applied Arm.
+        m_gapDryRun.epoch = epoch; m_gapDryRun.lease = lease; ++m_gapDryRun.restarts;
+        m_gapDryRun.test = ++m_gapDryRunSerial; s.scope.executionEpoch = epoch;
+        s.scope.owner = static_cast<std::uint8_t>(lease.owner); s.scope.ownerGeneration = lease.generation;
+        d.generation = 0ULL; d.acknowledged = d.terminalObserved = false; d.terminal = EDM56::Feedback{};
+        d.loggedPhase = d.loggedFlushPhase = (std::numeric_limits<std::uint32_t>::max)();
+        d.loggedFlushBlocked = false; d.authorityWaitMs = 0ULL;
+        s.windowStartMs = 0ULL; s.phaseStartMs = now; m_gapDryRun.paused = false;
+        if (!s.originPinned)
+        { d.admissionPending = true; d.admissionStartMs = now; s.phase = EDMZFixturePhase::PreArm; }
+        else
+        {
+            d.admissionPending = false;
+            if (!SubmitEDMZFixtureSameThread(EDM28::RequestKind::Arm))
+            { EndEDMZFixtureSameThread("FAIL", "EDM56_REARM_SUBMIT_FAILED"); return false; }
+            d.armIssued = true; d.armSequence = s.pendingSequence; s.phase = EDMZFixturePhase::ArmPending;
+        }
+        LogEDMGapDynamicSameThread("RESTART", "WAIT", "FRESH_RT_CONTROLLER_FIRST_ORIGIN"); return false;
+    }
+    if (!IsEDMZFixtureAuthorityCurrentSameThread(false)) return false; // Validate bounds the HOLD race.
+    if (f.currentEpoch != s.scope.executionEpoch || f.currentOwner != s.scope.owner || f.currentOwnerGeneration != s.scope.ownerGeneration)
+    {
+        if (!d.rtAuthorityWaitMs) d.rtAuthorityWaitMs = now;
+        if (now - d.rtAuthorityWaitMs >= 250ULL) EndEDMZFixtureSameThread("FAIL", "EDM56_RT_AUTHORITY_TIMEOUT");
+        return false;
+    }
+    d.rtAuthorityWaitMs = 0ULL;
+    if (s.originPinned && (f.outerOriginPulse != s.originPulse ||
+        std::fabs(f.actualPulse - s.originPulse) > s.config.outerHalfMm * s.config.pulsePerMm ||
+        std::fabs(f.commandPulse - s.originPulse) > s.config.outerHalfMm * s.config.pulsePerMm ||
+        std::fabs(f.planningPulse - s.originPulse) > s.config.outerHalfMm * s.config.pulsePerMm))
+    { EndEDMZFixtureSameThread("FAIL", "EDM56_FIRST_ORIGIN_BOUNDARY"); return false; }
+    if (s.phase == EDMZFixturePhase::PreArm)
+    {
+        std::uint64_t mask = 0ULL; MotionStopSettleSnapshot raw{};
+        (void)IsEDMGapServoRunReadySameThread(&mask, &raw);
+        if (mask & ~(1ULL << 9U))
+        { LogEDMGapDynamicAdmissionSameThread(mask, raw, "REJECT_WAIT"); EndEDMZFixtureSameThread("FAIL", "EDM56_ADMISSION_REVOKED"); return false; }
+        // A recognized retired fault is not permission to move. Require a
+        // fresh physical proof as well as RT's 200-cycle idle admission;
+        // transient proof renewal remains bounded by admissionStartMs. A
+        // cancelled first Arm never moved and cannot renew StopProof: its
+        // exact previously saved Disarm plus fresh armReady were checked
+        // by the retired-fault classifier instead.
+        if (mask || !f.armReady || (retiredFault && !f.queuedCancellation &&
+            (!f.stopProven || f.stableCycles < s.config.settleCycles))) return false;
+        if (s.scope.executionEpoch != m_motion.GetCurrentExecutionEpoch() ||
+            !m_motion.IsMotionOwnerLeaseCurrent(m_gapDryRun.lease)) return false;
+        if (!SubmitEDMZFixtureSameThread(EDM28::RequestKind::Arm))
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_ARM_SUBMIT_FAILED"); return false; }
+        d.armIssued = true; d.armSequence = s.pendingSequence; d.admissionPending = false;
+        s.phase = EDMZFixturePhase::ArmPending; s.phaseStartMs = now;
+        LogEDMGapDynamicAdmissionSameThread(0ULL, raw, "ARM_SUBMITTED"); return false;
+    }
+    if (!EDM28::SameScope(f.scope, s.scope))
+    {
+        if (s.phase != EDMZFixturePhase::ArmPending || now - s.phaseStartMs >= 50ULL)
+            EndEDMZFixtureSameThread("FAIL", "EDM56_RT_SCOPE_MISMATCH");
+        return false;
+    }
+    if (s.phase == EDMZFixturePhase::ArmPending)
+    {
+        if (!IsEDMZFixtureAppliedSameThread(EDM28::RequestKind::Arm))
+        { if (now - s.phaseStartMs >= 50ULL) EndEDMZFixtureSameThread("FAIL", "EDM56_ARM_APPLICATION_TIMEOUT"); return false; }
+        if (!IsEDMGapDynamicConfigValidSameThread(true) || !f.capHeld || !f.originValid || !f.frameCurrent ||
+            !f.axisIdle || f.state != EDM28::State::Armed || !std::isfinite(f.outerOriginPulse) ||
+            (s.originPinned && f.outerOriginPulse != s.originPulse))
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_ARM_RECEIPT_INVALID"); return false; }
+        if (!s.originPinned) { s.originPulse = f.outerOriginPulse; s.originPinned = true; }
+        s.curveBoundaryProof = f.proofSequence;
+        if (!SubmitEDMZFixtureSameThread(EDM28::RequestKind::ServoStart))
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_SERVO_START_SUBMIT_FAILED"); return false; }
+        d.generation = s.pendingSequence; s.phase = EDMZFixturePhase::Positive; s.phaseStartMs = now;
+        LogEDMGapDynamicSameThread("ARM", "APPLIED", "SERVO_START_SUBMITTED"); return false;
+    }
+    if (s.phase == EDMZFixturePhase::Positive)
+    {
+        const auto& r = f.dynamic;
+        if (!d.acknowledged)
+        {
+            if (!IsEDMZFixtureAppliedSameThread(EDM28::RequestKind::ServoStart) ||
+                r.session != s.scope.session || r.generation != d.generation || !r.startedTick || !r.startedUs)
+            { if (now - s.phaseStartMs >= 50ULL) EndEDMZFixtureSameThread("FAIL", "EDM56_SERVO_START_TIMEOUT"); return false; }
+            d.acknowledged = true; s.motionApplied = true; s.pending = false;
+            s.windowStartMs = now; d.startedTick = r.startedTick; d.startedUs = r.startedUs;
+            LogEDMGapDynamicSameThread("BEGIN", "RUNNING", "RT_CONTINUOUS_SERVO");
+        }
+        if (r.session != s.scope.session || r.generation != d.generation ||
+            r.profile != static_cast<std::uint8_t>(s.config.profile) || r.originPulse != s.originPulse ||
+            r.startedTick != d.startedTick || r.startedUs != d.startedUs || r.tick > f.sampledTick || r.nowUs > f.monotonicUs)
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_CONTROLLER_IDENTITY_CHANGED"); return false; }
+        if (r.active && r.phase == static_cast<std::uint32_t>(EDM56::Phase::OriginSettle))
+            LogEDMGapOriginSettleSameThread("WAIT", false);
+        if (r.terminal)
+        {
+            if (!IsEDMGapDynamicTerminalSameThread())
+            { EndEDMZFixtureSameThread("FAIL", "EDM56_CONTROLLER_TERMINAL_INVALID"); return false; }
+            d.terminal = r; d.terminalObserved = true;
+            if (r.expectedStale)
+            {
+                LogEDMGapDynamicSameThread("EXPECTED_FAULT", "AL2020", "STALE_PHYSICAL_STOP_RESET_REQUIRED");
+                EndEDMZFixtureSameThread("FAIL", "EDM56_EXPECTED_STALE_RESET_REQUIRED"); return false;
+            }
+            s.phase = EDMZFixturePhase::FinalStop; s.phaseStartMs = now;
+            LogEDMGapDynamicSameThread("RT_TERMINAL", "WAIT", EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(s.config.profile) ? "LIVE_AD_BIDIRECTIONAL_FLUSH_60S_ORIGIN_COMPLETE" : EDM28::IsPhysicalBidirectionalFlushFamilyProfile(s.config.profile) ? "LIVE_AD_BIDIRECTIONAL_FLUSH_10S_ORIGIN_COMPLETE" : EDM28::IsPhysicalBidirectionalProfile(s.config.profile) ?
+                "LIVE_AD_BIDIRECTIONAL_10S_ORIGIN_COMPLETE" : EDM28::IsPhysicalRetreatCycleProfile(s.config.profile) ?
+                "REAL_AD_RETREAT_CYCLES_10S_ORIGIN_COMPLETE" : EDM28::IsPhysicalRetreatProfile(s.config.profile) ?
+                "REAL_AD_RETREAT_10S_ENDPOINT_COMPLETE" : r.persistentShort ? "SHORT_RETURN_FIRST_ORIGIN" : "SIX_RT_CYCLES_COMPLETE");
+            return false;
+        }
+        if (!r.active || r.needFormalStop || f.stopLatched || now - s.windowStartMs >=
+            (EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(s.config.profile) ? 65000ULL : 30000ULL))
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_CONTROLLER_STOP_OR_TIMEOUT"); return false; }
+        if (r.phase != d.loggedPhase || (EDM28::IsGapFlushProfile(s.config.profile) &&
+            (r.flush.phase != d.loggedFlushPhase || r.flush.returnBlocked != d.loggedFlushBlocked)))
+        {
+            d.loggedPhase = r.phase; d.loggedFlushPhase = r.flush.phase; d.loggedFlushBlocked = r.flush.returnBlocked;
+            LogEDMGapDynamicSameThread("PHASE", "RUNNING", "RT_SOURCE_AND_PHYSICAL_READBACK");
+        }
+        if (!SubmitEDMZFixtureSameThread(EDM28::RequestKind::Heartbeat))
+            EndEDMZFixtureSameThread("FAIL", "EDM56_HEARTBEAT_SUBMIT_FAILED");
+        return false;
+    }
+    if (!IsEDMGapDynamicTerminalSameThread())
+    { EndEDMZFixtureSameThread("FAIL", "EDM56_TERMINAL_IDENTITY_CHANGED"); return false; }
+    if (s.phase == EDMZFixturePhase::FinalStop)
+    {
+        const auto completion = EvaluateEDMGapDynamicCompletionSameThread(EDM49::Stage::StopSettled);
+        if (completion.status == EDM49::Status::Wait)
+        { if (now - s.phaseStartMs >= 1000ULL) EndEDMZFixtureSameThread("FAIL", "EDM56_STOP_SETTLE_TIMEOUT"); return false; }
+        if (!completion.Ready())
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_STOP_RECEIPT_INVALID"); return false; }
+        s.terminalStopAppliedSequence = f.stopAppliedSequence; s.terminalStopAppliedTick = f.stopAppliedTick;
+        s.terminalStopAppliedMonotonicUs = f.stopAppliedMonotonicUs; s.receiptProof = f.proofSequence;
+        LogEDMGapDynamicSameThread("STOP_SETTLED", "PROVEN", EDM28::IsPhysicalRetreatProfile(s.config.profile) ?
+            "GENUINE_PHYSICAL_ENDPOINT_STOP" : "GENUINE_PHYSICAL_ORIGIN_STOP");
+        if (!SubmitEDMZFixtureSameThread(EDM28::RequestKind::Disarm))
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_DISARM_SUBMIT_FAILED"); return false; }
+        s.phase = EDMZFixturePhase::Disarm; s.phaseStartMs = now; return false;
+    }
+    if (s.phase == EDMZFixturePhase::Disarm || s.phase == EDMZFixturePhase::Receipt)
+    {
+        if (!IsEDMZFixtureAppliedSameThread(EDM28::RequestKind::Disarm))
+        { if (now - s.phaseStartMs >= 50ULL) EndEDMZFixtureSameThread("FAIL", "EDM56_DISARM_APPLICATION_TIMEOUT"); return false; }
+        const auto stage = s.phase == EDMZFixturePhase::Disarm ? EDM49::Stage::Released : EDM49::Stage::FreshReleased;
+        const auto completion = EvaluateEDMGapDynamicCompletionSameThread(stage);
+        if (completion.status == EDM49::Status::Invalid)
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_RELEASE_RECEIPT_INVALID"); return false; }
+        if (s.phase == EDMZFixturePhase::Disarm)
+        {
+            if (!completion.Ready()) return false;
+            s.receiptPublication = f.publicationSequence; s.receiptTick = f.sampledTick; s.receiptUs = f.monotonicUs;
+            s.phase = EDMZFixturePhase::Receipt; s.phaseStartMs = now;
+            LogEDMGapDynamicSameThread("RELEASED", "WAIT", "AWAIT_STRICTLY_NEWER_PHYSICAL_RECEIPT"); return false;
+        }
+        if (now - s.phaseStartMs >= 50ULL)
+        { EndEDMZFixtureSameThread("FAIL", "EDM56_FRESH_RELEASE_TIMEOUT"); return false; }
+        if (!completion.Ready()) return false;
+        if (d.terminal.persistentShort)
+        {
+            LogEDMGapDynamicSameThread("FRESH_RELEASED", "AL4001", "PERSISTENT_SHORT_AT_ORIGIN");
+            s.pending = false;
+            RejectGapDryRunSameThread(AlarmManager::SHORT_CIRCUIT, m_gapDryRun.sourceLine, "PERSISTENT_SHORT_AT_ORIGIN");
+            return false;
+        }
+        if (d.strictSequenceMode)
+        {
+            auto& plan = m_edmPhysicalSequencePlan;
+            const int pc = GetActiveDispatchPC();
+            if (!plan.plan.valid || !plan.legPending || !plan.plan.count ||
+                plan.plan.count > EDM77::MaximumFixtures || plan.next >= plan.plan.count ||
+                plan.run != m_gapDryRun.run || plan.cache != m_gapDryRun.cache ||
+                plan.epoch != m_gapDryRun.epoch || !plan.lease.Matches(m_gapDryRun.lease) ||
+                plan.dispatch != m_gapDryRun.dispatch || plan.firstPC < 0 || pc < plan.firstPC ||
+                plan.plan.checkpoints[plan.next].sourceOffset != static_cast<unsigned>(pc-plan.firstPC) ||
+                plan.plan.checkpoints[plan.next].profile != static_cast<unsigned>(s.config.profile) ||
+                !EDM57::SameRecipe(plan.plan.checkpoints[plan.next].flush, s.config.flush) ||
+                !EDM59::SameRecipe(plan.plan.checkpoints[plan.next].servo, s.config.servoRecipe))
+            { EndEDMZFixtureSameThread("FAIL", "EDM79_PLAN_COMPLETION_SCOPE"); return false; }
+            ++plan.next; plan.legPending = false;
+            RtPrintf("[EDM79] event=%s result=PASS completed=%u count=%u session=%llu run=%llu dispatch=%llu proof=FRESH_RELEASED discharge=0\n",
+                plan.next == plan.plan.count ? "PLAN_COMPLETE" : "PLAN_ADVANCE", plan.next, plan.plan.count,
+                static_cast<unsigned long long>(s.scope.session), static_cast<unsigned long long>(plan.run),
+                static_cast<unsigned long long>(plan.dispatch));
+        }
+        s.phase = EDMZFixturePhase::Finished; m_gapDryRun.active = false; m_gapDryRun.result = 1U;
+        if (d.sequenceMode)
+        {
+            d.sequenceReceiptPublication = f.publicationSequence;
+            d.sequenceReceiptTick = f.sampledTick; d.sequenceReceiptUs = f.monotonicUs;
+            RtPrintf("[EDM77] event=SEGMENT_RELEASE result=PASS session=%llu run=%llu dispatch=%llu stopSeq=%llu disarmSeq=%llu receiptPub=%llu receiptTick=%llu receiptUs=%llu next=FRESH_BOUNDARY_REQUIRED discharge=0\n",
+                static_cast<unsigned long long>(s.scope.session), static_cast<unsigned long long>(m_gapDryRun.run),
+                static_cast<unsigned long long>(m_gapDryRun.dispatch), static_cast<unsigned long long>(s.terminalStopAppliedSequence),
+                static_cast<unsigned long long>(s.pendingSequence), static_cast<unsigned long long>(f.publicationSequence),
+                static_cast<unsigned long long>(f.sampledTick), static_cast<unsigned long long>(f.monotonicUs));
+        }
+        LogEDMGapDynamicSameThread("PASS", "PASS", EDM28::IsPhysicalServoProfile(s.config.profile) ?
+            (EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(s.config.profile) ? "PHYSICAL_PN_FLUSH_60S_FRESH_ORIGIN_RELEASE" : EDM28::IsPhysicalBidirectionalFlushFamilyProfile(s.config.profile) ? "PHYSICAL_PN_FLUSH_10S_FRESH_ORIGIN_RELEASE" : EDM28::IsPhysicalBidirectionalProfile(s.config.profile) ? "PHYSICAL_PN_10S_FRESH_ORIGIN_RELEASE" :
+                EDM28::IsPhysicalRetreatCycleProfile(s.config.profile) ? "PHYSICAL_RETREAT_CYCLES_10S_FRESH_ORIGIN_RELEASE" :
+                EDM28::IsPhysicalRetreatProfile(s.config.profile) ? "PHYSICAL_AD_RETREAT_10S_FRESH_ENDPOINT_RELEASE" :
+                EDM28::IsPhysicalServoFlushProfile(s.config.profile) ? "PHYSICAL_AD_FLUSH_10S_FRESH_ORIGIN_RELEASE" :
+                "PHYSICAL_AD_10S_FRESH_ORIGIN_RELEASE") : "SIX_CYCLES_FRESH_PHYSICAL_RELEASE"); return true;
+    }
+    EndEDMZFixtureSameThread("FAIL", "EDM56_INVALID_NC_PHASE"); return false;
+}
+
+EDM49::Result NCManager::EvaluateEDMGapDynamicCompletionSameThread(EDM49::Stage stage) const noexcept
+{
+    const auto& s = m_edmZFixture; const auto& f = s.feedback;
+    EDM49::Result invalid{}; invalid.selectedMask = 1U << 2U;
+    if (!IsEDMGapDynamicConfigValidSameThread(true)) { invalid.reason = EDM49::Reason::InvalidRule; return invalid; }
+    if (!s.originPinned) { invalid.reason = EDM49::Reason::Origin; return invalid; }
+    const auto scope = [](const EDM28::Scope& source) noexcept -> EDM49::Scope
+    {
+        EDM49::Scope out{};
+        out.session = source.session; out.run = source.runGeneration; out.cache = source.cacheGeneration;
+        out.dispatch = source.dispatchGeneration; out.axisMap = source.axisMapGeneration; out.config = source.configGeneration;
+        out.epoch = source.executionEpoch;
+        out.ownerLease = (static_cast<std::uint64_t>(source.owner) << 32U) | source.ownerGeneration;
+        return out;
+    };
+    EDM49::Request request{}; EDM49::Evidence evidence{};
+    request.backend = evidence.backend = EDM49::Backend::LocalRTMotion;
+    request.stage = stage; request.scope = scope(s.scope); evidence.scope = scope(f.scope);
+    request.selectedAxisMask = 1U << 2U; // Existing unloaded physical adapter: Z only.
+    auto& rule = request.axes[2]; auto& axis = evidence.axes[2];
+    rule.origin = s.originPulse; rule.positionTolerance = s.config.positionToleranceMm * s.config.pulsePerMm;
+    if (EDM28::IsPhysicalRetreatProfile(s.config.profile))
+    {
+        // P58 stops at its retreat endpoint. Preserve both original anchor
+        // identities for EDM49, bound them by the known .03 mm excursion,
+        // and independently demand the unchanged .001 mm endpoint tolerance.
+        // No other profile uses this endpoint criterion or anchor envelope.
+        rule.positionTolerance = (EDM72::RetreatDepthMm + s.config.positionToleranceMm) * s.config.pulsePerMm;
+    }
+    // Preserve the original mm/s comparison, including its rounding. No PDO-zero condition.
+    rule.maximumCommandRate = 1.0 / s.config.pulsePerMm;
+    rule.settleTicks = s.config.settleCycles; rule.settleUs = s.config.settleCycles * EDM28::CycleUs;
+    rule.proofFloor = s.curveBoundaryProof; rule.stopSourceTickFloor = m_edmGapDynamic.startedTick;
+    rule.expectedStop = { s.terminalStopAppliedSequence, s.terminalStopAppliedTick, s.terminalStopAppliedMonotonicUs };
+    rule.disarmSequence = s.pending && s.pendingKind == EDM28::RequestKind::Disarm ? s.pendingSequence : 0ULL;
+    rule.releasedProof = s.receiptProof;
+    rule.requireTargetAtOrigin = false; // Continuous servo has no finite Position endpoint.
+    request.freshFloor = { s.receiptPublication, s.receiptTick, s.receiptUs };
+    evidence.publication = f.publicationSequence; evidence.tick = f.sampledTick; evidence.timeUs = f.monotonicUs;
+    axis.present = true; axis.axisIndex = 2U;
+    // The released execution scope is immutable. Current observer owner/epoch is
+    // checked by the NC lifecycle, and must not overwrite that historical scope.
+    axis.sourceCurrent = EDM28::ValidScope(s.scope) && f.sourceFresh && f.pdoValid && f.contiguous && f.clockValid &&
+        f.axisExists && f.linear && f.servoReady && f.modeReady && f.modeValue == 9 && (f.statusWord & 0x006FU) == 0x0027U &&
+        !f.fault && !f.hardPositive && !f.hardNegative && f.axisMapGeneration == s.scope.axisMapGeneration &&
+        f.configGeneration == s.scope.configGeneration && f.pulsePerMm == s.config.pulsePerMm &&
+        f.referenceOffsetPulse == s.config.referenceOffsetPulse && f.hardwareSign == s.config.hardwareSign;
+    axis.state = f.state == EDM28::State::Held ? EDM49::AxisState::Held :
+        f.state == EDM28::State::Disarmed ? EDM49::AxisState::Disarmed : EDM49::AxisState::Other;
+    axis.appliedKind = f.lastAppliedKind == EDM28::RequestKind::Stop ? EDM49::AppliedKind::Stop :
+        f.lastAppliedKind == EDM28::RequestKind::Disarm ? EDM49::AppliedKind::Disarm : EDM49::AppliedKind::Other;
+    axis.capHeld = f.capHeld; axis.stopLatched = f.stopLatched; axis.latchedFault = f.latchedFault;
+    axis.forceZeroOutput = f.forceZeroOutput; axis.stopProven = f.stopProven; axis.frameCurrent = f.frameCurrent;
+    axis.originValid = f.originValid; axis.idle = f.axisIdle; axis.stableTicks = f.stableCycles;
+    axis.origin = f.outerOriginPulse; axis.target = f.targetPulse; axis.actual = f.actualPulse;
+    axis.commanded = f.commandPulse; axis.planned = f.planningPulse; axis.commandRate = f.cmdSpeedMmS;
+    axis.stop = { f.stopAppliedSequence, f.stopAppliedTick, f.stopAppliedMonotonicUs };
+    axis.applied = { f.lastAppliedSequence, f.lastAppliedTick, f.lastAppliedMonotonicUs };
+    axis.proof = f.proofSequence;
+    auto result = EDM49::Evaluate(request, evidence);
+    if (result.Ready() && EDM28::IsPhysicalRetreatProfile(s.config.profile))
+    {
+        // Preserve EDM49's AwaitStop/settling Wait. Once its physical receipt
+        // is ready, the P58 endpoint must also satisfy the original tolerance
+        // before this method can return Ready at any lifecycle stage.
+        const double endpointPulse = s.originPulse + EDM72::RetreatDepthMm * s.config.pulsePerMm;
+        const double endpointTolerance = s.config.positionToleranceMm * s.config.pulsePerMm;
+        if (!std::isfinite(endpointPulse) || !std::isfinite(f.actualPulse) ||
+            !std::isfinite(f.commandPulse) || !std::isfinite(f.planningPulse) ||
+            std::fabs(f.actualPulse - endpointPulse) > endpointTolerance ||
+            std::fabs(f.commandPulse - endpointPulse) > endpointTolerance ||
+            std::fabs(f.planningPulse - endpointPulse) > endpointTolerance)
+        { result.status = EDM49::Status::Invalid; result.reason = EDM49::Reason::Position; }
+    }
+    // A terminal generated earlier in this same RT tick may cause Stop.
+    // Require that actual application to follow the terminal cause without
+    // pretending it must occur on a strictly later callback.
+    if (result.Ready() && (!m_edmGapDynamic.terminalObserved ||
+        f.stopAppliedTick < m_edmGapDynamic.terminal.tick ||
+        f.stopAppliedMonotonicUs < m_edmGapDynamic.terminal.nowUs))
+    { result.status = EDM49::Status::Invalid; result.reason = EDM49::Reason::StopStamp; }
+    return result;
+}
+
+
 bool NCManager::IsEDMZFixtureM30ContinuationSameThread() const noexcept
 {
     const int pc = GetActiveDispatchPC();
@@ -2499,6 +7055,9 @@ bool NCManager::IsEDMZFixtureM30ContinuationSameThread() const noexcept
 
 WaitConditionFunc NCManager::StartEDMZFixtureSameThread(const NCBlock& block)
 {
+    ServiceEDMPhysicalServoRetirementSameThread();
+    if (m_edmPhysicalServoRT.retirePending)
+    { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, m_gapDryRun.sourceLine, "EDM69_RETIREMENT_PENDING"); return nullptr; }
     const int line = m_gapDryRun.sourceLine;
     const bool speedStep = block.has('P') && block.val('P') == 14.0;
     const bool repeatedShort = block.has('P') && block.val('P') == 15.0;
@@ -2793,6 +7352,7 @@ bool NCManager::IsEDMPersistentShortReleasedSameThread() const noexcept
 
 bool NCManager::IsEDMZFixtureStoppedSameThread() const noexcept
 {
+    if (EDM28::IsGapDynamicProfile(m_edmZFixture.config.profile)) return IsEDMGapDynamicStoppedSameThread();
     // CycleStart consults this proof before changing HOLD to RUN. P23's
     // never-applied Arm and already-released terminal are stopped states too;
     // the process callback still owns fresh authority, source restart and the
@@ -2847,6 +7407,8 @@ bool NCManager::IsEDMZFixtureStoppedSameThread() const noexcept
 
 void NCManager::LogEDMZFixtureSameThread(const char* event, const char* result, const char* reason) noexcept
 {
+    if (EDM28::IsGapDynamicProfile(m_edmZFixture.config.profile))
+    { LogEDMGapDynamicSameThread(event, result, reason); return; }
     const auto& state = m_edmZFixture; const auto& feedback = state.feedback;
     // P24 snapshots all events, including RT_STOP, before the legacy formatter.
     // These event diagnostics never block armed fixture service observations.
@@ -3222,6 +7784,8 @@ void NCManager::LogEDMZFixtureSameThread(const char* event, const char* result, 
 
 void NCManager::PauseEDMZFixtureSameThread(const char* reason) noexcept
 {
+    if (EDM28::IsGapDynamicProfile(m_edmZFixture.config.profile))
+    { PauseEDMGapDynamicSameThread(reason); return; }
     if (m_edmZFixture.gapCurveProfile && (m_gapDryRun.active || m_gapDryRun.result == 1U) &&
         (m_edmZFixture.phase == EDMZFixturePhase::Disarm || m_edmZFixture.phase == EDMZFixturePhase::Receipt))
     {
@@ -3263,15 +7827,56 @@ void NCManager::PauseEDMZFixtureSameThread(const char* reason) noexcept
 
 void NCManager::EndEDMZFixtureSameThread(const char* result, const char* reason) noexcept
 {
+    InvalidateEDMPhysicalSequencePlanSameThread();
+    if (EDM28::IsPhysicalServoProfile(m_edmZFixture.config.profile) && !m_gapDryRun.active && m_gapDryRun.result == 3U) return;
     if (m_edmZFixture.phase == EDMZFixturePhase::Finished)
-    { m_gapDryRun.result = 2U; return; }
+    {
+        if (m_edmGapDynamic.sequenceMode)
+        {
+            // No cap remains after PASS, but a boundary cancellation must
+            // invalidate the chain and engage the existing RESET-only guard.
+            m_edmZFixture.phase = EDMZFixturePhase::Cancelled;
+            m_edmGapDynamic.sequenceReceiptPublication = 0ULL;
+            m_edmGapDynamic.sequenceReceiptTick = m_edmGapDynamic.sequenceReceiptUs = 0ULL;
+            m_gapDryRun.active = m_gapDryRun.paused = false;
+            m_gapDryRun.result = result && std::strcmp(result, "FAIL") == 0 ? 3U : 2U;
+            RtPrintf("[EDM77] event=SEQUENCE_BOUNDARY result=CANCELLED session=%llu reason=%s resetRequired=1 discharge=0\n",
+                static_cast<unsigned long long>(m_edmZFixture.scope.session), reason ? reason : "UNKNOWN");
+            return;
+        }
+        m_gapDryRun.result = 2U; return;
+    }
+    // A never-issued EDM56 admission owns no physical output and needs no
+    // fictitious Stop/Disarm acknowledgement. Failures still use the bounded
+    // existing deferred alarm service; cancellation does not create an alarm.
+    if (EDM28::IsGapDynamicProfile(m_edmZFixture.config.profile) && !m_edmGapDynamic.armIssued)
+    {
+        const bool failed = result && std::strcmp(result, "FAIL") == 0;
+        if (failed && !m_edmZFixture.failureAlarmPending)
+        {
+            m_edmZFixture.failureAlarmPending = true;
+            m_edmZFixture.failureRtReason = static_cast<std::uint8_t>(m_edmZFixture.feedback.reason);
+            std::uint64_t now = m_edmZFixture.lastClockMs;
+            (void)ReadGapDryRunClockSameThread(now); m_edmZFixture.failureStartMs = now;
+            (void)std::snprintf(m_edmZFixture.failureReason, sizeof(m_edmZFixture.failureReason), "%.47s", reason ? reason : "UNKNOWN");
+        }
+        m_gapDryRun.active = m_gapDryRun.paused = false; m_gapDryRun.result = failed ? 3U : 2U;
+        m_edmZFixture.pending = m_edmZFixture.cleanupPending = false;
+        m_edmZFixture.phase = EDMZFixturePhase::Cancelled;
+        LogEDMGapDynamicSameThread("SUMMARY", result, reason); return;
+    }
+    // Preserve the last motion-service log cost before fault logging replaces
+    // it. A subsequent CONTROL_GAP diagnostic must describe the earlier batch.
+    const std::uint64_t precedingLogEndMs = m_edmZFixture.lastDynamicLogEndMs;
+    const std::uint64_t precedingLogDurationMs = m_edmZFixture.lastDynamicLogDurationMs;
     // Publish the priority Stop before any failure diagnostic can block NC.
     m_motion.RequestEDMZFixtureStop(m_edmZFixture.scope.session);
     const bool failed = result && std::strcmp(result, "FAIL") == 0;
     const bool expectedShortAlarm = failed && (m_edmZFixture.config.profile == EDM28::Profile::P17PersistentShort || m_edmZFixture.config.profile == EDM28::Profile::P22GapPersistentShort ||
         (m_edmGapShortReplan.active && m_edmGapShortReplan.terminalAlarm) ||
         (m_edmGapFeedUpdate.shortState.active && m_edmGapFeedUpdate.shortState.terminalAlarm) ||
-        (m_edmGapRapid.shortState.active && m_edmGapRapid.shortState.terminalAlarm)) &&
+        (m_edmGapRapid.shortState.active && m_edmGapRapid.shortState.terminalAlarm) ||
+        (EDM28::IsGapDynamicProfile(m_edmZFixture.config.profile) && m_edmGapDynamic.terminalObserved && m_edmGapDynamic.terminal.persistentShort)) &&
         reason && std::strcmp(reason, "PERSISTENT_SHORT_AT_ORIGIN") == 0;
     const bool captureFailure = failed && !expectedShortAlarm && !m_edmZFixture.failureAlarmPending;
     const bool controlGap = failed && reason && std::strcmp(reason, "CONTROL_DEADMAN_50MS") == 0;
@@ -3320,6 +7925,19 @@ void NCManager::EndEDMZFixtureSameThread(const char* result, const char* reason)
             cachedAgeValid ? 1U : 0U);
         if (length >= 0 && static_cast<std::size_t>(length) < sizeof(line)) RtPrintf("%s", line);
         else RtPrintf("[EDM35-FIX2] event=CONTROL_GAP reason=LOG_FORMAT action=PRIORITY_STOP_REQUESTED\n");
+        if (EDM28::IsGapServoFlushProfile(m_edmZFixture.config.profile))
+        {
+            const bool costValid = failureClockValid && precedingLogEndMs != 0ULL &&
+                failureNow >= precedingLogEndMs && precedingLogDurationMs <= precedingLogEndMs;
+            const int costLength = std::snprintf(line, sizeof(line),
+                "[EDM60-FIX1] event=CONTROL_GAP_LOG_COST diagnosticEndMs=%llu durationMs=%llu ageMs=%llu valid=%u observationOnly=1 stopRequested=1 discharge=0\n",
+                static_cast<unsigned long long>(precedingLogEndMs),
+                static_cast<unsigned long long>(precedingLogDurationMs),
+                static_cast<unsigned long long>(costValid ? failureNow - precedingLogEndMs : 0ULL),
+                costValid ? 1U : 0U);
+            if (costLength >= 0 && static_cast<std::size_t>(costLength) < sizeof(line)) RtPrintf("%s", line);
+            else RtPrintf("[EDM60-FIX1] event=CONTROL_GAP_LOG_COST reason=LOG_FORMAT stopRequested=1 discharge=0\n");
+        }
     }
     const bool mayBeArmed = m_edmZFixture.feedback.capHeld ||
         (m_edmZFixture.originPinned && m_edmZFixture.feedback.state != EDM28::State::Disarmed) ||
@@ -8218,6 +12836,7 @@ bool NCManager::ProcessEDMGapReplanFixtureSameThread()
 
 bool NCManager::ProcessEDMZFixtureSameThread()
 {
+    if (EDM28::IsGapDynamicProfile(m_edmZFixture.config.profile)) return ProcessEDMGapDynamicSameThread();
     if (!m_edmZFixture.cleanupPending &&
         (m_edmGapRapid.shortState.active || EDM28::IsGapRapidProfile(m_edmZFixture.config.profile) ||
             (m_edmZFixture.originPinned && EDM28::IsGapRapidProfile(m_edmZFixture.feedback.frozenConfig.profile))) &&
@@ -10486,4 +15105,2017 @@ bool NCManager::ProcessEDMLiveProcessSameThread(std::uint64_t nowMs)
         m_edmLiveProcessLoggedCycles = snapshot.cycle.completedCycles;
     }
     return false;
+}
+
+// EDM94 FIX1: definitions live in this established translation unit.
+// Keep NCManager_EDM94.cpp as an empty compatibility unit for prior projects.
+// EDM94_FIX1_IMPLEMENTATION_BEGIN
+namespace
+{
+    // Native RtPrintf records are limited to 511 bytes. Each stage99/100/102/104
+    // evidence part is formatted locally and bounded to 480 including newline.
+    // session/tick plus result correlate parts from one copied Feedback.
+    void LogEDM99SegmentRecords(const char* stage, const char* event,
+        const EDM96::Feedback& gap, bool tuningCurrent) noexcept
+    {
+        char record[481]{};
+        const auto session = static_cast<unsigned long long>(gap.session);
+        const auto tick = static_cast<unsigned long long>(gap.tick);
+        const char* result = event ? event : "UNKNOWN";
+        const auto emit = [&](int length, const char* part) noexcept
+        {
+            if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+                RtPrintf("%s", record);
+            else RtPrintf("[%.6s] event=LOG_FORMAT_ERROR part=%.16s session=%llu tick=%llu output=NONE\n",
+                stage, part, session, tick);
+        };
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=%.32s part=SEGMENT session=%llu tick=%llu epoch=%llu ownerGen=%u step=%u phase=%u direction=%s voltage=%.9g accepted=%llu completed=%llu active=%u segmentActive=%u segmentCompleted=%u faulted=%u reason=%.32s proofScope=COMMAND_SCALAR_ONLY\n",
+            stage, result, session, tick, static_cast<unsigned long long>(gap.epoch),
+            static_cast<unsigned>(gap.ownerGeneration), gap.expectedStep, gap.phase,
+            gap.direction > 0 ? "FORWARD" : gap.direction < 0 ? "RETREAT" : "QUALIFYING", gap.voltageV,
+            static_cast<unsigned long long>(gap.acceptedSegments), static_cast<unsigned long long>(gap.completedSegments),
+            gap.active ? 1U : 0U, gap.segmentActive ? 1U : 0U, gap.segmentCompleted ? 1U : 0U,
+            gap.faulted ? 1U : 0U, EDM96::ReasonName(gap.reason)), "SEGMENT");
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=TRAJECTORY_EVIDENCE result=%.32s part=SCALAR session=%llu tick=%llu qPulse=%.12g vPulsePerSec=%.12g lengthPulse=%.12g reverseSegments=%llu reverseTicks=%llu returnForwardTicks=%llu encoderZeroProven=0 proofScope=COMMAND_SCALAR_ONLY\n",
+            stage, result, session, tick, gap.q, gap.v, gap.length,
+            static_cast<unsigned long long>(gap.reverseSegments), static_cast<unsigned long long>(gap.reverseTicks),
+            static_cast<unsigned long long>(gap.returnForwardTicks)), "SCALAR");
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=SOURCE_EVIDENCE result=%.32s part=SOURCE session=%llu tick=%llu sourceSequence=%llu sourceUs=%llu freshFrames=%llu heldFrames=%llu maxAgeUs=%llu output=GUARDED_CSV dischargeCommand=NONE\n",
+            stage, result, session, tick, static_cast<unsigned long long>(gap.sourceSequence),
+            static_cast<unsigned long long>(gap.sourceCapturedUs), static_cast<unsigned long long>(gap.freshFrames),
+            static_cast<unsigned long long>(gap.heldFrames), static_cast<unsigned long long>(gap.maximumAgeUs)), "SOURCE");
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=GAIN_EVIDENCE result=%.32s part=SPEED session=%llu tick=%llu phase=%u voltage=%.9g referenceV=35 errorV=%.9g rawSpeedMmMin=%.12g limitedSpeedMmMin=%.12g targetRatio=%.12g proofScope=COMMAND_SCALAR_ONLY\n",
+            stage, result, session, tick, gap.phase, gap.voltageV, gap.errorV,
+            gap.rawSpeedMmMin, gap.limitedSpeedMmMin, gap.targetRatio), "SPEED");
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=GAIN_EVIDENCE result=%.32s part=CONFIG session=%llu tick=%llu Q=%.9g R=%.9g S=%.9g configHash=%llu saturationFreshFrames=%llu freshFrames=%llu tunedMode=%u burstMode=%u continuousMode=%u enduranceMode=%u pairedMode=%u tuningCurrent=%u gainUnit=DIRECT_CURVE\n",
+            stage, result, session, tick, gap.tuning.positiveGain, gap.tuning.negativeGain, gap.tuning.deadbandV,
+            static_cast<unsigned long long>(gap.configHash), static_cast<unsigned long long>(gap.saturationFrames),
+            static_cast<unsigned long long>(gap.freshFrames), gap.tunedMode ? 1U : 0U, gap.burstMode ? 1U : 0U,
+            gap.continuousMode ? 1U : 0U, gap.enduranceMode ? 1U : 0U, gap.pairedMode ? 1U : 0U, tuningCurrent ? 1U : 0U), "CONFIG");
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=BURST_EVIDENCE result=%.32s part=COUNTS session=%llu tick=%llu pulseLowFreshFrames=%llu suppressedPulseWindows=%llu qualifiedRetreatWindows=%llu reverseEpisodes=%llu zeroCrossings=%llu proofScope=COMMAND_SCALAR_ONLY\n",
+            stage, result, session, tick, static_cast<unsigned long long>(gap.pulseLowFreshFrames),
+            static_cast<unsigned long long>(gap.suppressedPulseWindows), static_cast<unsigned long long>(gap.qualifiedRetreatWindows),
+            static_cast<unsigned long long>(gap.reverseEpisodes), static_cast<unsigned long long>(gap.zeroCrossings)), "COUNTS");
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=BURST_EVIDENCE result=%.32s part=POLICY session=%llu tick=%llu shortPulseUs=5000 captureDwellUs=20000 suppressedRequiredPerSegment=4 qualifiedRequiredPerSegment=2 reverseEpisodesRequiredPerSegment=2 zeroCrossingsRequiredPerSegment=4 maxSteps=%u pairedPairs=%u midSegmentReverse=1 proofScope=COMMAND_SCALAR_ONLY dischargeCommand=NONE\n",
+            stage, result, session, tick, gap.enduranceMode ? EDM102::MaximumSteps : gap.continuousMode ? EDM100::MaximumSteps : 4U,
+            gap.pairedMode ? EDM104::MaximumSteps / 2U : 0U), "POLICY");
+    }
+
+    void LogEDM99GapSource(const char* stage, std::uint64_t value,
+        const EDM97::Tuning& tuning, unsigned moves, bool continuous, bool endurance = false, bool paired = false) noexcept
+    {
+        char record[481]{};
+        const auto session = static_cast<unsigned long long>(value);
+        const auto emit = [&](int length, const char* part) noexcept
+        {
+            if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+                RtPrintf("%s", record);
+            else RtPrintf("[%.6s] event=LOG_FORMAT_ERROR part=%.16s session=%llu tick=0 output=NONE\n",
+                stage, part, session);
+        };
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=GAP_SOURCE part=PROFILE session=%llu tick=0 source=RT_SYNTHETIC producerUs=1000 captureDwellUs=20000 segmentDeadlineUs=10000000 steps=%u maxSteps=%u continuousMode=%u pairedMode=%u pairedPairs=%u mode=CAPTURE_DWELL_BURST_SERVO midSegmentReverse=1 proofScope=COMMAND_SCALAR_ONLY encoderZeroProven=0 dischargeCommand=NONE\n",
+            stage, session, moves, endurance ? EDM102::MaximumSteps : continuous ? EDM100::MaximumSteps : 4U,
+            continuous ? 1U : 0U, paired ? 1U : 0U, paired ? EDM104::MaximumSteps / 2U : 0U), "PROFILE");
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=GAP_SOURCE part=PLAN session=%llu tick=0 voltagePlan=50_200ms_4x20_5ms_50_45ms_50_200ms_20_700ms_50_300ms_20_700ms_50_STEADY shortPulseUs=5000 shortPulseWindowsPerSegment=4 sustainedRetreatWindowsPerSegment=2 commandReverseEpisodesPerSegment=2 commandZeroCrossingsPerSegment=4 proofScope=COMMAND_SCALAR_ONLY\n",
+            stage, session), "PLAN");
+        emit(std::snprintf(record, sizeof(record),
+            "[%.6s] event=GAP_SOURCE part=CONFIG session=%llu tick=0 referenceV=35 scale=0.001 Q=%.9g R=%.9g S=%.9g configHash=%llu immutablePerArm=1 gainUnit=DIRECT_CURVE hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
+            stage, session, tuning.positiveGain, tuning.negativeGain, tuning.deadbandV,
+            static_cast<unsigned long long>(EDM97::ConfigHash(tuning))), "CONFIG");
+    }
+
+    bool E94Number(const std::string& text, double& value) noexcept
+    {
+        if (text.empty() || text.size() > 32U) return false;
+        unsigned digits = 0U, dots = 0U;
+        for (std::size_t i = 0U; i < text.size(); ++i)
+        {
+            const char c = text[i];
+            if (i == 0U && (c == '+' || c == '-')) continue;
+            if (c == '.' && ++dots == 1U) continue;
+            if (c < '0' || c > '9') return false;
+            ++digits;
+        }
+        if (!digits) return false;
+        char* end = nullptr;
+        value = std::strtod(text.c_str(), &end);
+        return end == text.c_str() + text.size() && std::isfinite(value);
+    }
+    bool E94Profile(const NCParsedBlock& b, unsigned p) noexcept
+    {
+        return EDM77::Detail::Clean(b) && !b.isEmpty && b.gCount == 1 && b.mCount == 0 &&
+            EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) &&
+            EDM77::Detail::OnlyAddresses(b, "NP") && b.has('P') &&
+            EDM77::Detail::EqualLiteral(b.expression('P'), p);
+    }
+    bool E97ProfileOnlyNPQRS(const NCParsedBlock& b, EDM97::Tuning& tuning) noexcept
+    {
+        if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRS") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), 91U) ||
+            !b.has('Q') || !b.has('R') || !b.has('S')) return false;
+        EDM97::Tuning parsed{};
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) || !EDM97::ValidTuning(parsed)) return false;
+        tuning = parsed;
+        return true;
+    }
+    bool E98ProfileOnlyNPQRS(const NCParsedBlock& b, EDM97::Tuning& tuning) noexcept
+    {
+        if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRS") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), 93U) ||
+            !b.has('Q') || !b.has('R') || !b.has('S')) return false;
+        EDM97::Tuning parsed{};
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) || !EDM98::ValidTuning(parsed)) return false;
+        tuning = parsed;
+        return true;
+    }
+    bool E99ProfileOnlyNPQRS(const NCParsedBlock& b, EDM97::Tuning& tuning) noexcept
+    {
+        if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRS") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), 95U) ||
+            !b.has('Q') || !b.has('R') || !b.has('S')) return false;
+        EDM97::Tuning parsed{};
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) || !EDM97::ValidTuning(parsed)) return false;
+        tuning = parsed;
+        return true;
+    }
+    bool E100ProfileOnlyNPQRS(const NCParsedBlock& b, EDM97::Tuning& tuning) noexcept
+    {
+        if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRS") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), 97U) ||
+            !b.has('Q') || !b.has('R') || !b.has('S')) return false;
+        EDM97::Tuning parsed{};
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) || !EDM97::ValidTuning(parsed)) return false;
+        tuning = parsed;
+        return true;
+    }
+    bool E102ProfileOnlyNPQRS(const NCParsedBlock& b, EDM97::Tuning& tuning) noexcept
+    {
+        if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRS") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), 99U) ||
+            !b.has('Q') || !b.has('R') || !b.has('S')) return false;
+        EDM97::Tuning parsed{};
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) || !EDM97::ValidTuning(parsed)) return false;
+        tuning = parsed;
+        return true;
+    }
+    bool E104ProfileOnlyNPQRS(const NCParsedBlock& b, EDM97::Tuning& tuning) noexcept
+    {
+        if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRS") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), 101U) ||
+            !b.has('Q') || !b.has('R') || !b.has('S')) return false;
+        EDM97::Tuning parsed{};
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) || !EDM97::ValidTuning(parsed)) return false;
+        tuning = parsed;
+        return true;
+    }
+    bool E105ProfileOnlyNPQRS(const NCParsedBlock& b, EDM97::Tuning& tuning) noexcept
+    {
+        if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRS") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), 103U) ||
+            !b.has('Q') || !b.has('R') || !b.has('S')) return false;
+        EDM97::Tuning parsed{};
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) || !EDM105::ValidTuning(parsed)) return false;
+        tuning = parsed;
+        return true;
+    }
+    bool E94Preamble(const NCParsedBlock& b) noexcept
+    {
+        if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::OnlyAddresses(b, "N")) return false;
+        const unsigned codes[] = {21U, 17U, 91U, 15U, 40U, 49U, 69U, 169U, 50U, 163U};
+        for (unsigned code : codes)
+            if (EDM77::Detail::EqualLiteral(b.gExpressions[0], code)) return true;
+        return false;
+    }
+    bool E94Move(const NCParsedBlock& b, std::array<double, 6U>& delta, double& feed) noexcept
+    {
+        if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0], 1U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NXYZCUVF") || !b.has('F') ||
+            !E94Number(b.expression('F'), feed) || feed <= 0.0 || feed > .12) return false;
+        for (unsigned axis = 0U; axis < 6U; ++axis)
+            if (!b.has("XYZCUV"[axis]) || !E94Number(b.expression("XYZCUV"[axis]), delta[axis]) || delta[axis] == 0.0)
+                return false;
+        const double length = std::hypot(std::hypot(delta[0], delta[1]), delta[2]);
+        if (!std::isfinite(length) || length <= 0.0) return false;
+        const double seconds = length * 60.0 / feed;
+        if (!std::isfinite(seconds) || seconds <= 0.0 || seconds > 120.0) return false;
+        for (unsigned axis = 0U; axis < 6U; ++axis)
+            if (std::fabs(delta[axis]) / seconds > (axis < 3U ? .002 : .05)) return false;
+        return true;
+    }
+    bool E94Matches(const NCParsedBlock& parsed, const NCBlock& b) noexcept
+    {
+        if (!EDM77::Detail::Clean(parsed) || b.isEmpty != parsed.isEmpty || b.isGoto || b.isBlockSkip ||
+            b.gCount != parsed.gCount || b.mCount != parsed.mCount) return false;
+        for (int i = 0; i < b.gCount; ++i)
+            if (!EDM77::Detail::EqualLiteral(parsed.gExpressions[i], static_cast<unsigned>(b.gCodes[i]))) return false;
+        for (int i = 0; i < b.mCount; ++i)
+            if (!EDM77::Detail::EqualLiteral(parsed.mExpressions[i], static_cast<unsigned>(b.mCode[i]))) return false;
+        for (char a = 'A'; a <= 'Z'; ++a)
+        {
+            if (b.has(a) != parsed.has(a)) return false;
+            if (!b.has(a)) continue;
+            double value = 0.0;
+            if (!E94Number(parsed.expression(a), value) || value != b.val(a)) return false;
+        }
+        return true;
+    }
+}
+
+bool NCManager::IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block) noexcept
+{
+    if (block.isEmpty || block.isGoto || block.isBlockSkip || !block.hasG || block.gCode != 180 ||
+        block.gCount != 1 || block.gCodes[0] != 180 || block.mCount != 0 || !block.has('P') ||
+        (block.val('P') != 85.0 && block.val('P') != 86.0 &&
+            block.val('P') != 87.0 && block.val('P') != 88.0 &&
+            block.val('P') != 89.0 && block.val('P') != 90.0 &&
+            block.val('P') != 91.0 && block.val('P') != 92.0 &&
+            block.val('P') != 93.0 && block.val('P') != 94.0 &&
+            block.val('P') != 95.0 && block.val('P') != 96.0 &&
+            block.val('P') != 97.0 && block.val('P') != 98.0 &&
+            block.val('P') != 99.0 && block.val('P') != 100.0 &&
+            block.val('P') != 101.0 && block.val('P') != 102.0 &&
+            block.val('P') != 103.0 && block.val('P') != 104.0) || m_mode != NCOperationMode::MEMORY ||
+        m_state != NCState::RUN || !m_macroStack.empty() || m_isG66Active || Homing.IsActive() ||
+        !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
+        CoordSys.GetTranslationSnapshot().distanceMode != 91 || !m_motion.IsGroupDone() ||
+        m_motion.HasPendingSafetyOrRecoveryRequests()) return false;
+    const bool noiseArm = block.val('P') == 93.0;
+    const bool burstArm = block.val('P') == 95.0;
+    const bool continuousArm = block.val('P') == 97.0;
+    const bool enduranceArm = block.val('P') == 99.0;
+    const bool pairedArm = block.val('P') == 101.0;
+    const bool flushArm = block.val('P') == 103.0;
+    const bool tuningArm = block.val('P') == 91.0 || noiseArm || burstArm || continuousArm || enduranceArm || pairedArm || flushArm;
+    for (char a = 'A'; a <= 'Z'; ++a)
+        if (block.has(a) && ((a != 'N' && a != 'P' &&
+            (!tuningArm || (a != 'Q' && a != 'R' && a != 'S'))) ||
+            !std::isfinite(block.val(a)))) return false;
+    const int pc = GetActiveDispatchPC();
+    const auto* authored = GetBaseProgramCache().TryGetLine(pc);
+    EDM97::Tuning tuning{};
+    if (!authored || !E94Matches(authored->parsedBlock, block) ||
+        !(flushArm ? E105ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
+            pairedArm ? E104ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
+            enduranceArm ? E102ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
+            continuousArm ? E100ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
+            burstArm ? E99ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
+            noiseArm ? E98ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
+            tuningArm ? E97ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
+            E94Profile(authored->parsedBlock, static_cast<unsigned>(block.val('P')))) ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread() ||
+        !m_pathCoreLiveBookkeeping.currentRunToken || !GetBaseProgramCache().GetGeneration() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
+        (CoordSys.IsTranslationRunFrozen() && (!CoordSys.IsTranslationRunCurrent() ||
+            !IsFixedTranslationTravelCurrentSameThread() || !IsXYZCUVFeedProfileCurrentSameThread() ||
+            !m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot())))) return false;
+    const bool arm = block.val('P') == 85.0 || block.val('P') == 87.0 ||
+        block.val('P') == 89.0 || tuningArm;
+    return arm ? !m_edm94.latched :
+        m_edm94.latched && m_edm94.ready && !m_edm94.cancelled &&
+        block.val('P') == (m_edm94.gapFlushProfile ? 104.0 : m_edm94.gapPairedProfile ? 102.0 : m_edm94.gapEnduranceProfile ? 100.0 : m_edm94.gapContinuousProfile ? 98.0 : m_edm94.gapBurstProfile ? 96.0 : m_edm94.gapNoiseProfile ? 94.0 : m_edm94.gapGainProfile ? 92.0 : m_edm94.gapSegmentProfile ? 90.0 :
+            m_edm94.gapBoundaryProfile ? 88.0 : 86.0) &&
+        pc == m_edm94.pc[m_edm94.moves] &&
+        m_edm94.cache == GetBaseProgramCache().GetGeneration() &&
+        m_edm94.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        m_motion.IsMotionOwnerLeaseCurrent(m_edm94.lease);
+}
+
+bool NCManager::InspectEDM94ProgramSameThread() noexcept
+{
+    const auto& cache = GetBaseProgramCache();
+    if (m_edm94.inspectedCache == cache.GetGeneration()) return m_edm94.program;
+    if (m_edm94.latched) return true; // Live scope is never overwritten by a new image.
+    m_edm94.inspectedCache = cache.GetGeneration();
+    m_edm94.program = false;
+    // NC-only once per cache generation. Inspect expressions conservatively:
+    // A dynamic G180 selector may select either physical bracket.
+    for (std::size_t i = 0U; i < cache.Size(); ++i)
+    {
+        const auto* line = cache.TryGetLine(static_cast<int>(i));
+        if (!line) continue;
+        const auto& p = line->parsedBlock;
+        if (!p.has('P')) continue;
+        double selector = 0.0;
+        const bool fixedSelector = E94Number(p.expression('P'), selector);
+        const bool selected = fixedSelector &&
+            (selector == 85.0 || selector == 86.0 || selector == 87.0 || selector == 88.0 ||
+                selector == 89.0 || selector == 90.0 || selector == 91.0 || selector == 92.0 ||
+                selector == 93.0 || selector == 94.0 || selector == 95.0 || selector == 96.0 ||
+                selector == 97.0 || selector == 98.0 || selector == 99.0 || selector == 100.0 ||
+                selector == 101.0 || selector == 102.0 || selector == 103.0 || selector == 104.0);
+        bool g180 = false;
+        for (int j = 0; j < p.gCount && j < NC_MAX_G_CODES_PER_BLOCK; ++j)
+        {
+            double code = 0.0;
+            const bool fixedG = E94Number(p.gExpressions[j], code);
+            g180 = g180 || (fixedG && code == 180.0) || (!fixedG && selected);
+        }
+        if (g180 && (!fixedSelector || selected))
+        { m_edm94.program = true; break; }
+    }
+    return m_edm94.program;
+}
+
+bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
+{
+    const auto& cache = GetBaseProgramCache();
+    if (armPC < 0 || cache.Size() == 0U || cache.Size() > 128U) return false;
+    m_edm94.moves = m_edm94.next = 0U;
+    m_edm94.gapBoundaryProfile = false;
+    m_edm94.gapSegmentProfile = false;
+    m_edm94.gapGainProfile = false;
+    m_edm94.gapNoiseProfile = false;
+    m_edm94.gapBurstProfile = false;
+    m_edm94.gapContinuousProfile = false;
+    m_edm94.gapEnduranceProfile = false;
+    m_edm94.gapPairedProfile = false;
+    m_edm94.gapFlushProfile = false;
+    m_edm94.gapTuning = EDM97::Tuning{};
+    std::array<double, 6U> total{};
+    unsigned phase = 0U;
+    double nominalSeconds = 0.0;
+    for (std::size_t i = 0U; i < cache.Size(); ++i)
+    {
+        const auto* line = cache.TryGetLine(static_cast<int>(i));
+        if (!line || !EDM77::Detail::Clean(line->parsedBlock)) return false;
+        const auto& b = line->parsedBlock;
+        if (EDM77::Detail::Empty(b)) continue;
+        if (phase == 0U)
+        {
+            EDM97::Tuning tuning{};
+            const bool flushArm = E105ProfileOnlyNPQRS(b, tuning);
+            const bool pairedArm = E104ProfileOnlyNPQRS(b, tuning);
+            const bool enduranceArm = E102ProfileOnlyNPQRS(b, tuning);
+            const bool continuousArm = E100ProfileOnlyNPQRS(b, tuning);
+            const bool burstArm = E99ProfileOnlyNPQRS(b, tuning);
+            const bool noiseArm = E98ProfileOnlyNPQRS(b, tuning);
+            const bool tuningArm = flushArm || pairedArm || enduranceArm || continuousArm || burstArm || noiseArm || E97ProfileOnlyNPQRS(b, tuning);
+            if (E94Profile(b, 85U) || E94Profile(b, 87U) || E94Profile(b, 89U) || tuningArm)
+            {
+                if (static_cast<int>(i) != armPC) return false;
+                m_edm94.gapBoundaryProfile = E94Profile(b, 87U);
+                m_edm94.gapSegmentProfile = E94Profile(b, 89U) || tuningArm;
+                m_edm94.gapGainProfile = tuningArm;
+                m_edm94.gapNoiseProfile = noiseArm;
+                m_edm94.gapBurstProfile = burstArm || continuousArm || enduranceArm || pairedArm || flushArm;
+                m_edm94.gapContinuousProfile = continuousArm || enduranceArm || pairedArm || flushArm;
+                m_edm94.gapEnduranceProfile = enduranceArm || pairedArm || flushArm;
+                m_edm94.gapPairedProfile = pairedArm || flushArm;
+                m_edm94.gapFlushProfile = flushArm;
+                if (tuningArm) m_edm94.gapTuning = tuning;
+                phase = 1U;
+            }
+            else if (!E94Preamble(b)) return false;
+        }
+        else if (phase == 1U)
+        {
+            if (E94Profile(b, m_edm94.gapFlushProfile ? 104U : m_edm94.gapPairedProfile ? 102U : m_edm94.gapEnduranceProfile ? 100U : m_edm94.gapContinuousProfile ? 98U : m_edm94.gapBurstProfile ? 96U : m_edm94.gapNoiseProfile ? 94U : m_edm94.gapGainProfile ? 92U : m_edm94.gapSegmentProfile ? 90U :
+                m_edm94.gapBoundaryProfile ? 88U : 86U))
+            {
+                if (m_edm94.moves == 0U) return false;
+                m_edm94.pc[m_edm94.moves] = static_cast<int>(i); phase = 2U;
+                continue;
+            }
+            const unsigned step = m_edm94.moves;
+            if (step >= (m_edm94.gapEnduranceProfile ? EDM102::MaximumSteps : 8U) ||
+                !E94Move(b, m_edm94.increment[step], m_edm94.feed[step])) return false;
+            if (m_edm94.gapBoundaryProfile)
+            {
+                // The simulated GAP chooses a boundary direction for one
+                // small authored segment. It does not synthesize geometry.
+                if (step >= 4U || m_edm94.feed[step] != 0.12) return false;
+                for (unsigned a = 0U; a < 6U; ++a)
+                {
+                    const double value = m_edm94.increment[step][a];
+                    if (std::fabs(value) > (a < 3U ? 0.002 : 0.04) ||
+                        (step != 0U && value != ((step & 1U) ?
+                            -m_edm94.increment[0U][a] : m_edm94.increment[0U][a]))) return false;
+                }
+            }
+            if (m_edm94.gapSegmentProfile)
+            {
+                if (step >= (m_edm94.gapEnduranceProfile ? EDM102::MaximumSteps : m_edm94.gapContinuousProfile ? EDM100::MaximumSteps : 4U) ||
+                    m_edm94.feed[step] != 0.12) return false;
+                for (unsigned a = 0U; a < 6U; ++a)
+                {
+                    const double value = m_edm94.increment[step][a];
+                    const double magnitude = std::fabs(value);
+                    if (magnitude < (a < 3U ? 0.001 : 0.02) ||
+                        magnitude > (a < 3U ? 0.002 : 0.04)) return false;
+                    if (m_edm94.gapPairedProfile)
+                    {
+                        if ((step & 1U) && value != -m_edm94.increment[step - 1U][a]) return false;
+                    }
+                    else if (step != 0U && value != ((step & 1U) ?
+                        -m_edm94.increment[0U][a] : m_edm94.increment[0U][a])) return false;
+                }
+            }
+            for (unsigned a = 0U; a < 6U; ++a)
+            {
+                total[a] += m_edm94.increment[step][a];
+                if (!std::isfinite(total[a]) || std::fabs(total[a]) > (a < 3U ? .025 : .5)) return false;
+            }
+            const auto& d = m_edm94.increment[step];
+            nominalSeconds += std::hypot(std::hypot(d[0], d[1]), d[2]) * 60.0 / m_edm94.feed[step] + 2.0;
+            // Admission allowance only; RT segment/session deadlines are unchanged.
+            if (m_edm94.gapFlushProfile && (step & 1U) == 0U) nominalSeconds += 2.5;
+            if (!std::isfinite(nominalSeconds) || nominalSeconds > 90.0) return false;
+            m_edm94.pc[step] = static_cast<int>(i); ++m_edm94.moves;
+        }
+        else if (phase == 2U)
+        {
+            if (!EDM77::Detail::Terminal(b)) return false;
+            // This bracket requires an actual M30, not M2/EOF.
+            if (!EDM77::Detail::EqualLiteral(b.mExpressions[0], 30U)) return false;
+            m_edm94.pc[m_edm94.moves + 1U] = static_cast<int>(i); phase = 3U;
+        }
+        else return false;
+    }
+    if (phase != 3U) return false;
+    if (m_edm94.gapBoundaryProfile && m_edm94.moves != 2U && m_edm94.moves != 4U) return false;
+    if (m_edm94.gapFlushProfile)
+    { if (m_edm94.moves != EDM105::MaximumSteps) return false; }
+    else if (m_edm94.gapPairedProfile)
+    { if (m_edm94.moves != EDM104::MaximumSteps) return false; }
+    else if (m_edm94.gapEnduranceProfile)
+    { if (m_edm94.moves != EDM102::MaximumSteps) return false; }
+    else if (m_edm94.gapSegmentProfile && m_edm94.moves != 2U && m_edm94.moves != 4U &&
+        (!m_edm94.gapContinuousProfile || m_edm94.moves != EDM100::MaximumSteps)) return false;
+    for (double offset : total) if (std::fabs(offset) > 1.0e-12) return false;
+    return true;
+}
+
+// EDM103_20261014: bounded process-lifetime NC observations, never authority.
+// Only exact existing event sites call this recorder; replay cannot count events.
+void NCManager::ObserveEDM103LifecycleSameThread(const char* event, const char* reason) const noexcept
+{
+    const auto& s = m_edm94;
+    if (!s.gapEnduranceProfile || !s.session || !event) return;
+    unsigned index = 8U;
+    if (std::strcmp(event, "ARM_REQUEST") == 0) index = 0U;
+    else if (std::strcmp(event, "CANCEL_REQUEST") == 0 && reason &&
+        std::strcmp(reason, "MANUAL_HOLD") == 0) index = 1U;
+    else if (std::strcmp(event, "START_BLOCKED") == 0 && reason)
+    {
+        if (std::strcmp(reason, "RESET_REQUIRED") == 0) index = 2U;
+        else if (std::strcmp(reason, "RESET_RELEASE_PENDING") == 0) index = 3U;
+    }
+    else if (std::strcmp(event, "NORMAL_RELEASED") == 0) index = 4U;
+    else if (std::strcmp(event, "RELEASED") == 0) index = 5U;
+    if (index == 8U) return;
+    auto& audit = m_edm103Audit;
+    auto& r = audit.record[index];
+    // Lifecycle events count once per session; START rejections once per core
+    // received edge. A periodic diagnostic cannot manufacture a button press.
+    if (r.count && r.session == s.session &&
+        ((index != 2U && index != 3U) || r.rx == m_startDiagnosticRequests)) return;
+    const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+    if (r.count != maximum) ++r.count;
+    if (audit.sequence != maximum) ++audit.sequence;
+    r.sequence = audit.sequence; r.rx = m_startDiagnosticRequests;
+    r.session = s.session; r.run = s.run; r.cache = s.cache;
+    r.tick = s.feedback.lastTick; r.epoch = s.armEpoch;
+    r.ownerGeneration = s.lease.generation;
+    r.state = static_cast<unsigned>(static_cast<NCState>(m_state));
+    // Snapshotted NC reset flags only; physical release remains in EDM94 proof.
+    r.flags = (s.resetSeen ? 1U : 0U) | (s.resetCommitted ? 2U : 0U) |
+        (s.releaseRequested ? 4U : 0U);
+}
+
+void NCManager::ObserveEDM103RunSameThread(bool load, unsigned originState) noexcept
+{
+    // These two hooks run only after existing LOAD / fresh START commits.
+    // Scope is every NC program, not a claim that a new EDM arm was accepted.
+    auto& audit = m_edm103Audit;
+    auto& r = audit.record[load ? 6U : 7U];
+    const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+    if (r.count != maximum) ++r.count;
+    if (audit.sequence != maximum) ++audit.sequence;
+    const auto owner = m_motion.GetMotionOwnerLease();
+    r.sequence = audit.sequence; r.rx = m_startDiagnosticRequests;
+    r.session = m_edm94.session; r.run = m_pathCoreLiveBookkeeping.currentRunToken;
+    r.cache = GetBaseProgramCache().GetGeneration(); r.tick = 0ULL;
+    r.epoch = m_motion.GetCurrentExecutionEpoch(); r.ownerGeneration = owner.generation;
+    r.state = static_cast<unsigned>(static_cast<NCState>(m_state));
+    r.flags = originState;
+}
+
+void NCManager::LogEDM103AcceptanceSameThread() const noexcept
+{
+    const auto& audit = m_edm103Audit;
+    if (!audit.record[0U].count) return;
+    static const char* const parts[8U] = { "ARM_REQUEST", "MANUAL_HOLD", "BLOCKED_BEFORE_RESET",
+        "BLOCKED_RELEASE_PENDING", "NORMAL_RELEASE", "RESET_RELEASE", "LOAD", "START" };
+    char record[481]{};
+    for (unsigned i = 0U; i < 8U; ++i)
+    {
+        const auto& r = audit.record[i];
+        if (!r.count) continue;
+        const bool saturated = r.count == (std::numeric_limits<std::uint64_t>::max)() ||
+            audit.sequence == (std::numeric_limits<std::uint64_t>::max)();
+        int length = 0;
+        if (i < 6U)
+            length = std::snprintf(record, sizeof(record),
+                "[EDM103] event=ACCEPTANCE_HISTORY part=%s count=%llu seq=%llu rx=%llu session=%llu run=%llu cache=%llu tick=%llu armEpoch=%u ownerGen=%u nc=%u resetSeen=%u resetCommitted=%u releaseRequested=%u consumedStart=%u saturated=%u scope=SIX_AXIS_ENDURANCE_NC_EVENTS historical=1 authority=NONE\n",
+                parts[i], static_cast<unsigned long long>(r.count), static_cast<unsigned long long>(r.sequence),
+                static_cast<unsigned long long>(r.rx), static_cast<unsigned long long>(r.session),
+                static_cast<unsigned long long>(r.run), static_cast<unsigned long long>(r.cache),
+                static_cast<unsigned long long>(r.tick), r.epoch, r.ownerGeneration, r.state,
+                (r.flags & 1U) ? 1U : 0U, (r.flags & 2U) ? 1U : 0U, (r.flags & 4U) ? 1U : 0U,
+                (i == 2U || i == 3U) ? 1U : 0U, saturated ? 1U : 0U);
+        else
+            length = std::snprintf(record, sizeof(record),
+                "[EDM103] event=ACCEPTANCE_HISTORY part=%s count=%llu seq=%llu rx=%llu priorSession=%llu run=%llu cache=%llu epoch=%u ownerGen=%u origin=%u nc=%u saturated=%u scope=NC_CORE_ALL_PROGRAMS historical=1 armProof=0 authority=NONE\n",
+                parts[i], static_cast<unsigned long long>(r.count), static_cast<unsigned long long>(r.sequence),
+                static_cast<unsigned long long>(r.rx), static_cast<unsigned long long>(r.session),
+                static_cast<unsigned long long>(r.run), static_cast<unsigned long long>(r.cache),
+                r.epoch, r.ownerGeneration, r.flags, r.state, saturated ? 1U : 0U);
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+            RtPrintf("%s", record);
+        else RtPrintf("[EDM103] event=LOG_FORMAT_ERROR part=%s authority=NONE\n", parts[i]);
+    }
+}
+
+// EDM101_20261013: NC prints existing cached observations; this grants no readiness.
+void NCManager::LogEDM101RecoverySameThread(const char* event, const char* reason) const noexcept
+{
+    const auto& s = m_edm94; const auto& f = s.feedback;
+    char record[481]{};
+    const char* const result = event ? event : "UNKNOWN";
+    const auto session = static_cast<unsigned long long>(s.session);
+    const auto tick = static_cast<unsigned long long>(f.lastTick);
+    const bool identityMatch = s.session != 0ULL && s.armEpoch != MOTION_EXECUTION_EPOCH_INVALID &&
+        s.lease.generation != MOTION_OWNER_GENERATION_INVALID && f.identity.session == s.session &&
+        f.identity.epoch == s.armEpoch && f.identity.ownerGeneration == s.lease.generation;
+    const bool tickCurrent = f.lastTick != 0ULL && f.lastTick >= s.lastTick;
+    const bool emptyAdmission = std::strcmp(result, "EMPTY_ADMISSION_RELEASED") == 0;
+    const auto emit = [&](int length, const char* part) noexcept
+    {
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+            RtPrintf("%s", record);
+        else RtPrintf("[EDM101] event=LOG_FORMAT_ERROR part=%.16s session=%llu tick=%llu output=NONE\n",
+            part, session, tick);
+    };
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM101] event=RECOVERY_SNAPSHOT result=%.32s part=NC session=%llu tick=%llu reason=%.64s ncState=%u resetContinuationPhase=%u latched=%u cancelled=%u resetSeen=%u resetCommitted=%u releaseRequested=%u normalEndCommitted=%u completionReleaseRequested=%u everArmed=%u complete=%u\n",
+        result, session, tick, reason ? reason : "UNKNOWN",
+        static_cast<unsigned>(static_cast<NCState>(m_state)), static_cast<unsigned>(m_resetContinuationPhase),
+        s.latched ? 1U : 0U, s.cancelled ? 1U : 0U, s.resetSeen ? 1U : 0U,
+        s.resetCommitted ? 1U : 0U, s.releaseRequested ? 1U : 0U,
+        s.normalEndCommitted ? 1U : 0U, s.completionReleaseRequested ? 1U : 0U,
+        s.everArmed ? 1U : 0U, s.complete ? 1U : 0U), "NC");
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM101] event=RECOVERY_SNAPSHOT result=%.32s part=RT session=%llu tick=%llu state=%s rtReason=%s forceZero=%u stopped=%u stable=%u required=%u faulted=%u cancelled=%u released=%u active=%u armAccepted=%u completionReleased=%u completionPhase=%u identityMatch=%u tickCurrent=%u cachedTick=%llu\n",
+        result, session, tick, EDM94::StateName(f.state), EDM94::ReasonName(f.reason),
+        f.forceZero ? 1U : 0U, f.stopped ? 1U : 0U, f.settledCycles, f.requiredCycles,
+        f.faulted ? 1U : 0U, f.cancelled ? 1U : 0U, f.released ? 1U : 0U,
+        f.active ? 1U : 0U, f.armAccepted ? 1U : 0U, f.completionReleased ? 1U : 0U,
+        static_cast<unsigned>(f.completionPhase), identityMatch ? 1U : 0U, tickCurrent ? 1U : 0U,
+        static_cast<unsigned long long>(s.lastTick)), "RT");
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM101] event=RECOVERY_SNAPSHOT result=%.32s part=IDENTITY session=%llu tick=%llu ncArmEpoch=%llu ncOwnerGen=%u rtSession=%llu rtArmEpoch=%llu rtOwnerGen=%u currentSession=%llu currentEpoch=%llu currentOwnerGen=%u completionEpoch=%llu idleGen=%u noneGen=%u\n",
+        result, session, tick, static_cast<unsigned long long>(s.armEpoch),
+        static_cast<unsigned>(s.lease.generation), static_cast<unsigned long long>(f.identity.session),
+        static_cast<unsigned long long>(f.identity.epoch), static_cast<unsigned>(f.identity.ownerGeneration),
+        static_cast<unsigned long long>(f.currentIdentity.session), static_cast<unsigned long long>(f.currentIdentity.epoch),
+        static_cast<unsigned>(f.currentIdentity.ownerGeneration), static_cast<unsigned long long>(s.completionEpoch),
+        static_cast<unsigned>(s.completionIdleLease.generation), static_cast<unsigned>(s.completionNoneGeneration)), "IDENTITY");
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM101] event=RECOVERY_SNAPSHOT result=%.32s part=COMPLETION session=%llu tick=%llu ncCompletionEpoch=%llu ncIdleGen=%u ncNoneGen=%u rtCompletionEpoch=%llu rtIdleGen=%u rtNoneGen=%u proofScope=CACHED_RECEIPT_IDENTITY_ONLY\n",
+        result, session, tick, static_cast<unsigned long long>(s.completionEpoch),
+        static_cast<unsigned>(s.completionIdleLease.generation), static_cast<unsigned>(s.completionNoneGeneration),
+        static_cast<unsigned long long>(f.completionEpoch), static_cast<unsigned>(f.completionIdleOwnerGeneration),
+        static_cast<unsigned>(f.completionNoneOwnerGeneration)), "COMPLETION");
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM101] event=RECOVERY_SNAPSHOT result=%.32s part=POLICY session=%llu tick=%llu run=%llu cache=%llu armDispatch=%llu step=%u moves=%u hold=CANCEL_RESET_REQUIRED start=START_TOP_AFTER_RESET emptyAdmission=%u noStopProof=%u proofScope=SNAPSHOT_ONLY output=GUARDED_CSV dischargeCommand=NONE\n",
+        result, session, tick, static_cast<unsigned long long>(s.run), static_cast<unsigned long long>(s.cache),
+        static_cast<unsigned long long>(s.armDispatch), s.next, s.moves,
+        emptyAdmission ? 1U : 0U, emptyAdmission ? 1U : 0U), "POLICY");
+}
+
+void NCManager::LogEDM94SameThread(const char* event, const char* reason) const noexcept
+{
+    ObserveEDM103LifecycleSameThread(event, reason);
+    const auto& s = m_edm94; const auto& f = s.feedback;
+    // EDM101_20261013: retain every bracket field without native 511-byte clipping.
+    // Each part includes the original event, session and cached RT tick.
+    char record[481]{};
+    const char* const result = event ? event : "UNKNOWN";
+    const auto session = static_cast<unsigned long long>(s.session);
+    const auto tick = static_cast<unsigned long long>(f.lastTick);
+    const auto emit = [&](int length, const char* part) noexcept
+    {
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+            RtPrintf("%s", record);
+        else RtPrintf("[EDM94] event=LOG_FORMAT_ERROR part=%.16s session=%llu tick=%llu output=NONE\n",
+            part, session, tick);
+    };
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM94] event=%.32s reason=%.64s part=STATE session=%llu tick=%llu state=%s rtReason=%s stable=%u required=%u armed=%u zero=%u stopped=%u pass=%u cancelled=%u faulted=%u released=%u\n",
+        result, reason ? reason : "UNKNOWN", session, tick,
+        EDM94::StateName(f.state), EDM94::ReasonName(f.reason), f.settledCycles, f.requiredCycles,
+        f.armedReady ? 1U : 0U, f.forceZero ? 1U : 0U, f.stopped ? 1U : 0U,
+        f.pass ? 1U : 0U, f.cancelled ? 1U : 0U, f.faulted ? 1U : 0U, f.released ? 1U : 0U), "STATE");
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM94] event=BRACKET_EVIDENCE result=%.32s part=IDENTITY session=%llu tick=%llu run=%llu cache=%llu armDispatch=%llu step=%u moves=%u sentTick=%llu\n",
+        result, session, tick, static_cast<unsigned long long>(s.run),
+        static_cast<unsigned long long>(s.cache), static_cast<unsigned long long>(s.armDispatch),
+        s.next, s.moves, static_cast<unsigned long long>(f.lastSentTick)), "IDENTITY");
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM94] event=BRACKET_EVIDENCE result=%.32s part=OUTPUT session=%llu tick=%llu nonzeroSentMask=%u actualMovedMask=%u commandMovedMask=%u sentFrames=%llu handoffZero=%u handoffStarted=%u handoffCompleted=%u source=FIXED_NC gapControl=%s actualOutput=GUARDED_CSV dischargeCommand=NONE\n",
+        result, session, tick, f.nonzeroSentMask, f.actualMovedMask, f.commandMovedMask,
+        static_cast<unsigned long long>(f.sentFrames), f.handoffZero ? 1U : 0U,
+        f.handoffStarted, f.handoffCompleted, s.gapFlushProfile ? "SIM_PAIRED_FLUSH_BURST_SERVO" :
+            s.gapPairedProfile ? "SIM_PAIRED_CAPTURE_DWELL_BURST_SERVO" :
+            s.gapEnduranceProfile ? "SIM_ENDURANCE_CAPTURE_DWELL_BURST_SERVO" :
+            s.gapContinuousProfile ? "SIM_CONTINUOUS_CAPTURE_DWELL_BURST_SERVO" :
+            s.gapBurstProfile ? "SIM_CAPTURE_DWELL_BURST_SERVO" : s.gapNoiseProfile ? "SIM_DEADBAND_NOISE_SERVO" : s.gapGainProfile ? "SIM_GAIN_SERVO" : s.gapSegmentProfile ? "SIM_SEGMENT_SERVO" :
+            s.gapBoundaryProfile ? "SIM_BOUNDARY_DIRECTION" : "NOT_CONNECTED"), "OUTPUT");
+    if (s.gapContinuousProfile &&
+        (std::strcmp(result, "CANCEL_REQUEST") == 0 || std::strcmp(result, "CANCEL_STOPPED") == 0 ||
+            std::strcmp(result, "START_BLOCKED") == 0 || std::strcmp(result, "RELEASE_REQUEST") == 0 ||
+            std::strcmp(result, "RELEASED") == 0 || std::strcmp(result, "EMPTY_ADMISSION_RELEASED") == 0 ||
+            std::strcmp(result, "NORMAL_RELEASE_REQUEST") == 0 || std::strcmp(result, "NORMAL_RELEASED") == 0 ||
+            std::strcmp(result, "RT_FAULT") == 0 || std::strcmp(result, "REJECT") == 0))
+        LogEDM101RecoverySameThread(result, reason);
+    if (s.gapSegmentProfile)
+    {
+        EDM96::Feedback gap{};
+        if (m_motion.ReadEDM96Feedback(gap) && gap.session == s.session)
+            LogEDM96SameThread(event, gap);
+    }
+    if (s.gapBoundaryProfile)
+    {
+        EDM95::Feedback gap{};
+        if (m_motion.ReadEDM95Feedback(gap) && gap.session == s.session)
+            RtPrintf("[EDM95] event=BOUNDARY_EVIDENCE result=%s session=%llu expectedStep=%u accepted=%llu forward=%llu retreat=%llu tick=%llu sourceSequence=%llu freshFrames=%llu heldFrames=%llu maxAgeUs=%llu faulted=%u reason=%s output=GUARDED_CSV midSegmentReverse=0 physicalStopProof=EDM94 dischargeCommand=NONE\n",
+                event, static_cast<unsigned long long>(gap.session), gap.expectedStep,
+                static_cast<unsigned long long>(gap.acceptedSegments), static_cast<unsigned long long>(gap.forwardSegments),
+                static_cast<unsigned long long>(gap.retreatSegments), static_cast<unsigned long long>(gap.tick),
+                static_cast<unsigned long long>(gap.sourceSequence), static_cast<unsigned long long>(gap.freshFrames),
+                static_cast<unsigned long long>(gap.heldFrames), static_cast<unsigned long long>(gap.maximumAgeUs),
+                gap.faulted ? 1U : 0U, EDM95::ReasonName(gap.reason));
+    }
+    if (s.normalEndCommitted || s.completionReleaseRequested)
+    {
+        RtPrintf("[EDM94] event=COMPLETION_RELEASE build=FIX16 result=%s session=%llu phase=%u requested=%u completed=%u endEpoch=%llu idleGen=%u noneGen=%u source=M30_ZERO_RETIREMENT\n",
+            event, static_cast<unsigned long long>(s.session), static_cast<unsigned>(f.completionPhase),
+            s.completionReleaseRequested ? 1U : 0U, f.completionReleased ? 1U : 0U,
+            static_cast<unsigned long long>(s.completionEpoch), static_cast<unsigned>(s.completionIdleLease.generation),
+            static_cast<unsigned>(s.completionNoneGeneration));
+    }
+    // The first RT fault remains frozen; FIX5 reports it even when owner loss
+    // has already cancelled the NC bracket. All output remains NC-thread only.
+    // stop fields describe the latest published RT observation. NC prints them.
+    const bool runtime = std::strcmp(event, "REJECT") == 0 || std::strcmp(event, "RT_FAULT") == 0 ||
+        std::strcmp(event, "RELEASE_REQUEST") == 0 || std::strcmp(event, "START_BLOCKED") == 0 ||
+        std::strcmp(event, "CANCEL_STOPPED") == 0 || std::strcmp(event, "RELEASED") == 0 ||
+        std::strcmp(event, "PASS") == 0 || std::strcmp(event, "NORMAL_RELEASE_REQUEST") == 0 ||
+        std::strcmp(event, "NORMAL_RELEASED") == 0;
+    if (runtime && f.armAccepted)
+    {
+        const auto& d = f.firstFault;
+        if (d.site != 0U)
+        {
+            RtPrintf("[EDM94] event=RUNTIME_FAULT build=FIX16 result=%s session=%llu site=%s faultReason=%s faultAxis=%c tripAxisMask=%02X observeOnlyAxisMask=%02X faultTick=%llu frameUs=%llu frameSession=%llu frameEpoch=%llu frameOwnerGen=%u flags=%08X evidence=FIRST_FAULT_ONLY\n",
+                event, static_cast<unsigned long long>(s.session), EDM94::FaultSiteName(d.site),
+                EDM94::ReasonName(static_cast<EDM94::Reason>(d.reason)),
+                f.rejectedAxis < 6U ? "XYZCUV"[f.rejectedAxis] : '-',
+                static_cast<unsigned>(EDM94::FollowingTripAxisMask), static_cast<unsigned>(EDM94::FollowingObserveOnlyAxisMask),
+                static_cast<unsigned long long>(d.tick), static_cast<unsigned long long>(d.nowUs),
+                static_cast<unsigned long long>(d.frameIdentity.session), static_cast<unsigned long long>(d.frameIdentity.epoch),
+                static_cast<unsigned>(d.frameIdentity.ownerGeneration), static_cast<unsigned>(d.flags));
+            RtPrintf("[EDM94] event=RUNTIME_SEND session=%llu proofTick=%llu proofGeneration=%llu proofOwner=%016llX proofExecution=%016llX liveOwner=%016llX liveExecution=%016llX reservedBaseOwner=%016llX reservedBaseExecution=%016llX evidence=FIRST_FAULT_ONLY\n",
+                static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(d.proofTick),
+                static_cast<unsigned long long>(d.proofGeneration), static_cast<unsigned long long>(d.proofOwnerState),
+                static_cast<unsigned long long>(d.proofExecutionPublication), static_cast<unsigned long long>(d.liveOwnerState),
+                static_cast<unsigned long long>(d.liveExecutionPublication), static_cast<unsigned long long>(d.reservationOwnerState),
+                static_cast<unsigned long long>(d.reservationExecutionPublication));
+            RtPrintf("[EDM94] event=RUNTIME_GATES session=%llu authority=%08X sharedHealth=%08X source=%08X group=%08X inputMask=%02X configChangedMask=%02X mappingChangedMask=%02X healthX=%08X healthY=%08X healthZ=%08X healthC=%08X healthU=%08X healthV=%08X evidence=FIRST_FAULT_ONLY\n",
+                static_cast<unsigned long long>(s.session), static_cast<unsigned>(d.authorityFailures),
+                static_cast<unsigned>(d.sharedHealthFailures), static_cast<unsigned>(d.sourceFailures),
+                static_cast<unsigned>(d.groupFailures), static_cast<unsigned>(d.inputMask),
+                static_cast<unsigned>(d.configChangedMask), static_cast<unsigned>(d.mappingChangedMask),
+                static_cast<unsigned>(d.healthFailures[0]), static_cast<unsigned>(d.healthFailures[1]),
+                static_cast<unsigned>(d.healthFailures[2]), static_cast<unsigned>(d.healthFailures[3]),
+                static_cast<unsigned>(d.healthFailures[4]), static_cast<unsigned>(d.healthFailures[5]));
+        }
+        const auto& stop = f.stop;
+        RtPrintf("[EDM94] event=STOP_CHECK build=FIX16 result=%s session=%llu sampledTick=%llu blocked=%08X firstBlock=%s releaseBlocked=%08X stable=%u required=%u stopped=%u evidence=LATEST_RT_SNAPSHOT\n",
+            event, static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(stop.sampledTick),
+            static_cast<unsigned>(stop.blockedMask), EDM94::StopBlockName(stop.blockedMask),
+            static_cast<unsigned>(stop.releaseBlockedMask), f.settledCycles, f.requiredCycles, f.stopped ? 1U : 0U);
+        RtPrintf("[EDM94] event=STOP_GATES session=%llu configChangedMask=%02X mappingChangedMask=%02X unhealthyMask=%02X normalAuthority=%08X sharedHealth=%08X source=%08X group=%08X evidence=LATEST_RT_SNAPSHOT\n",
+            static_cast<unsigned long long>(s.session), static_cast<unsigned>(stop.configChangedMask),
+            static_cast<unsigned>(stop.mappingChangedMask), static_cast<unsigned>(stop.unhealthyMask),
+            static_cast<unsigned>(stop.authorityFailures), static_cast<unsigned>(stop.sharedHealthFailures),
+            static_cast<unsigned>(stop.sourceFailures), static_cast<unsigned>(stop.groupFailures));
+        char record[640]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM94] event=STOP_RANGE session=%llu rangeExceededMask=%02X rangeResetCount=%u lastRangeResetTick=%llu X=%.12g Y=%.12g Z=%.12g C=%.12g U=%.12g V=%.12g limitPolicy=FROZEN_AXIS_WINDOW unit=ENCODER_PULSE evidence=LAST_RANGE_RESET\n",
+            static_cast<unsigned long long>(s.session), static_cast<unsigned>(stop.rangeExceededMask),
+            static_cast<unsigned>(stop.rangeResetCount), static_cast<unsigned long long>(stop.lastRangeResetTick),
+            stop.rangePulse[0], stop.rangePulse[1], stop.rangePulse[2], stop.rangePulse[3], stop.rangePulse[4], stop.rangePulse[5]);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM94] event=LOG_FORMAT_ERROR scope=STOP_RANGE\n");
+        const int limitLength = std::snprintf(record, sizeof(record),
+            "[EDM94] event=STOP_LIMITS build=FIX16 session=%llu X=%.12g Y=%.12g Z=%.12g C=%.12g U=%.12g V=%.12g unit=ENCODER_PULSE policy=NC_SETTLE_FROZEN_WINDOW span=WHOLE_DWELL required=%u allAxes=1 evidence=FROZEN_CONFIG\n",
+            static_cast<unsigned long long>(s.session),
+            EDM94::StopRangeLimitPulse(0U, f.config.axis[0]), EDM94::StopRangeLimitPulse(1U, f.config.axis[1]),
+            EDM94::StopRangeLimitPulse(2U, f.config.axis[2]), EDM94::StopRangeLimitPulse(3U, f.config.axis[3]),
+            EDM94::StopRangeLimitPulse(4U, f.config.axis[4]), EDM94::StopRangeLimitPulse(5U, f.config.axis[5]),
+            EDM94::RequiredStableCycles);
+        if (limitLength > 0 && static_cast<std::size_t>(limitLength) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM94] event=LOG_FORMAT_ERROR scope=STOP_LIMITS\n");
+    }
+    const bool config = std::strcmp(event, "ARMED") == 0;
+    const bool terminal = std::strcmp(event, "PASS") == 0 || std::strcmp(event, "CANCEL_STOPPED") == 0 ||
+        ((std::strcmp(event, "REJECT") == 0 || std::strcmp(event, "RT_FAULT") == 0) && f.faulted);
+    if (!config && !terminal) return;
+    // FIX2: this is the frozen attempted-Arm snapshot, not current motion or
+    // stop evidence. Print from NC only, once at the admission result.
+    const bool admission = config ||
+        ((std::strcmp(event, "REJECT") == 0 || std::strcmp(event, "RT_FAULT") == 0) && f.faulted && !f.armAccepted);
+    if (admission)
+    {
+        RtPrintf("[EDM94] event=FOLLOWING_POLICY build=FIX16 session=%llu rotaryRuntimeTrip=%s tripAxisMask=%02X observeOnlyAxisMask=%02X armFollowing=ALL_SIX completionFollowing=ALL_SIX stopProof=FROZEN_WINDOW_SPAN resetRelease=EXPLICIT_RESET_AND_STOP genericLagCheck=UNCHANGED scope=EDM94_BUILD_ONLY endpointIntegral=KI_OUTPUT_CONTINUITY pidGains=CONFIGURED\n",
+            static_cast<unsigned long long>(s.session),
+            EDM94::IgnoreRotaryFollowingTripForEmptyLoad ? "IGNORED_EMPTY_LOAD" : "ENFORCED",
+            static_cast<unsigned>(EDM94::FollowingTripAxisMask),
+            static_cast<unsigned>(EDM94::FollowingObserveOnlyAxisMask));
+        const auto& d = f.admission;
+        RtPrintf("[EDM94] event=ARM_CHECK build=FIX16 result=%s session=%llu sampledTick=%llu sampledUs=%llu gates=%08X firstGate=%s accepted=%u rejectedAxis=%c evidence=ADMISSION_ONLY\n",
+            event, static_cast<unsigned long long>(s.session),
+            static_cast<unsigned long long>(d.tick), static_cast<unsigned long long>(d.nowUs),
+            static_cast<unsigned>(d.failedGates), EDM94::AdmissionGateName(d.failedGates), f.armAccepted ? 1U : 0U,
+            f.rejectedAxis < 6U ? "XYZCUV"[f.rejectedAxis] : '-');
+        RtPrintf("[EDM94] event=ARM_SOURCE session=%llu sourceFailures=%08X firstSource=%s authorityFailures=%08X firstAuthority=%s sharedHealthFailures=%08X firstShared=%s groupFailures=%08X firstGroup=%s requestFailures=%08X firstRequest=%s inputMask=%08X pendingSource=%d\n",
+            static_cast<unsigned long long>(s.session),
+            static_cast<unsigned>(d.sourceFailures), EDM94::AdmissionSourceName(d.sourceFailures),
+            static_cast<unsigned>(d.authorityFailures), EDM94::AdmissionAuthorityName(d.authorityFailures),
+            static_cast<unsigned>(d.sharedHealthFailures), EDM94::AdmissionSharedHealthName(d.sharedHealthFailures),
+            static_cast<unsigned>(d.groupFailures), EDM94::AdmissionGroupName(d.groupFailures),
+            static_cast<unsigned>(d.requestFailures), EDM94::AdmissionRequestName(d.requestFailures),
+            static_cast<unsigned>(d.inputMask), static_cast<int>(d.pendingSource));
+        for (unsigned a = 0U; a < 6U; ++a)
+        {
+            const auto& observed = d.axis[a]; const auto& c = f.config.axis[a];
+            char record[640]{};
+            const int length = std::snprintf(record, sizeof(record),
+                "[EDM94] event=ARM_AXIS_CHECK session=%llu axis=%c healthFailures=%08X firstHealth=%s state=%d statusWord=%04X mode=%d commandVel=%.12g logicalVel=%.12g targetVel=%.12g errorPulse=%.12g windowPulse=%.12g commandAnchor=%.12g actualAnchor=%.12g pulsePerUnit=%.12g hardwareSign=%d evidence=ADMISSION_ONLY\n",
+                static_cast<unsigned long long>(s.session), "XYZCUV"[a],
+                static_cast<unsigned>(observed.healthFailures), EDM94::AdmissionAxisHealthName(observed.healthFailures),
+                static_cast<int>(observed.state), static_cast<unsigned>(observed.statusWord), static_cast<int>(observed.mode),
+                observed.commandVelocity, observed.logicalVelocity, observed.targetVelocity, observed.followingError,
+                c.followingWindowPulse, c.commandAnchor, c.actualAnchor, c.pulsePerUnit, c.hardwareSign);
+            if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+            else RtPrintf("[EDM94] event=LOG_FORMAT_ERROR scope=ARM_CHECK axis=%u\n", a);
+        }
+    }
+    RtPrintf("[EDM94] event=TRANSPORT result=%s session=%llu tick=%llu sealed=%llu nicAttempted=%llu nicAccepted=%llu acceptedZero=%llu lastSealed=%u lastAttempted=%u lastAccepted=%u lastAllZero=%u driveAck=0\n",
+        event, static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(f.lastTransportTick),
+        static_cast<unsigned long long>(f.sealedFrames), static_cast<unsigned long long>(f.nicAttemptedFrames),
+        static_cast<unsigned long long>(f.nicAcceptedFrames), static_cast<unsigned long long>(f.acceptedZeroFrames),
+        f.lastTransportSealed ? 1U : 0U, f.lastTransportAttempted ? 1U : 0U,
+        f.lastTransportAccepted ? 1U : 0U, f.lastTransportAllZero ? 1U : 0U);
+    for (unsigned a = 0U; a < 6U; ++a)
+    {
+        char record[640]{}; const auto& c = f.config.axis[a]; const auto& e = f.axis[a];
+        const int length = config ? std::snprintf(record, sizeof(record),
+            "[EDM94] event=AXIS_CONFIG session=%llu axis=%c pulsePerUnit=%.12g commandAnchor=%.12g actualAnchor=%.12g followingWindowPulse=%.12g hardwareSign=%d fixtureMaxUnitPerSec=%.12g maxExcursionNative=%.12g configFingerprint=%llu mappingFingerprint=%llu stopRangePulse=%.12g stopRangeNative=%.12g\n",
+            static_cast<unsigned long long>(s.session), "XYZCUV"[a], c.pulsePerUnit, c.commandAnchor, c.actualAnchor,
+            c.followingWindowPulse, c.hardwareSign, EDM94::NativeVelocityLimit(a), EDM94::NativeExcursionLimit(a),
+            static_cast<unsigned long long>(c.configFingerprint), static_cast<unsigned long long>(c.mappingFingerprint),
+            EDM94::StopRangeLimitPulse(a, c), c.pulsePerUnit > 0.0 ? EDM94::StopRangeLimitPulse(a, c) / c.pulsePerUnit : 0.0) :
+            std::snprintf(record, sizeof(record),
+            "[EDM94] event=AXIS_EVIDENCE result=%s session=%llu axis=%c commandMinPulse=%.12g commandMaxPulse=%.12g actualMinPulse=%.12g actualMaxPulse=%.12g currentCommandPulse=%.12g currentActualPulse=%.12g nonzeroSentCount=%llu peakCsv=%u peakPreGuardCsvPps=%.12g capClampCount=%llu stopped=%u\n",
+            event, static_cast<unsigned long long>(s.session), "XYZCUV"[a], e.commandMinPulse, e.commandMaxPulse,
+            e.actualMinPulse, e.actualMaxPulse, e.currentCommandPulse, e.currentActualPulse,
+            static_cast<unsigned long long>(e.nonzeroSentCount), e.peakCsv, e.peakPreGuardCsvPps,
+            static_cast<unsigned long long>(e.capClampCount), f.stopped ? 1U : 0U);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM94] event=LOG_FORMAT_ERROR axis=%u\n", a);
+    }
+}
+
+void NCManager::CancelEDM94SameThread(const char* reason) noexcept
+{
+    m_edm94.boundary = EDM94NCState::FeedBoundary{};
+    m_edm94.gapWaiting = m_edm94.gapPermitReady = false;
+    // RT may have completed normal retirement immediately before HOLD/RESET.
+    // Retire that exact receipt even though NC has not sampled it yet; the
+    // caller still performs its full ordinary HOLD/RESET transaction.
+    if (m_edm94.latched && m_edm94.completionReleaseRequested)
+    {
+        EDM94::Feedback observed{};
+        if (m_motion.ReadEDM94Feedback(observed) && ConsumeEDM94CompletionReleaseSameThread(observed)) return;
+    }
+    m_edm94.normalEndCommitted = false;
+    if (!m_edm94.latched || m_edm94.releaseRequested) return;
+    m_motion.RequestEDM94Cancel(m_edm94.session, m_edm94.resetSeen);
+    if (m_edm94.cancelled) return;
+    m_edm94.cancelled = true; m_edm94.ready = false; m_edm94.complete = false;
+    LogEDM94SameThread("CANCEL_REQUEST", reason ? reason : "UNKNOWN");
+}
+
+void NCManager::RejectEDM94SameThread(const char* reason, int line)
+{
+    CancelEDM94SameThread(reason);
+    LogEDM94SameThread("REJECT", reason);
+    AlarmManager::GetInstance().Trigger(AlarmManager::GAP_INPUT_TEST_FAILED, line);
+    ChangeState(NCState::ALARM);
+}
+
+bool NCManager::GuardEDM94BlockSameThread(const NCBlock& block, int pc, int line)
+{
+    if (!InspectEDM94ProgramSameThread() && !m_edm94.latched) return true;
+    const auto* authored = GetBaseProgramCache().TryGetLine(pc);
+    if (!authored || !E94Matches(authored->parsedBlock, block))
+    { RejectEDM94SameThread("LITERAL_OR_CACHE", line); return false; }
+    if (block.isEmpty) return true;
+    if (!m_edm94.latched)
+    {
+        EDM97::Tuning tuning{};
+        if (E94Preamble(authored->parsedBlock) || E94Profile(authored->parsedBlock, 85U) ||
+            E94Profile(authored->parsedBlock, 87U) || E94Profile(authored->parsedBlock, 89U) ||
+            E97ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
+            E98ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
+            E99ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
+            E100ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
+            E102ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
+            E104ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
+            E105ProfileOnlyNPQRS(authored->parsedBlock, tuning)) return true;
+        RejectEDM94SameThread("ARM_REQUIRED_START_TOP", line); return false;
+    }
+    if (m_edm94.cancelled || m_edm94.armPending || m_edm94.releaseRequested ||
+        m_edm94.cache != GetBaseProgramCache().GetGeneration() ||
+        m_edm94.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        m_edm94.next >= m_edm94.moves + 2U || pc != m_edm94.pc[m_edm94.next] ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_edm94.lease) ||
+        (m_edm94.next < m_edm94.moves && !m_edm94.ready) ||
+        (m_edm94.next == m_edm94.moves + 1U && !m_edm94.complete))
+    { RejectEDM94SameThread("BLOCK_SCOPE_OR_ORDER", line); return false; }
+    m_edm94.boundary = EDM94NCState::FeedBoundary{};
+    ++m_edm94.next;
+    return true;
+}
+
+bool NCManager::GuardEDM94FeedSameThread(const NCBlock& block) noexcept
+{
+    if (!m_edm94.latched) return !m_edm94.program;
+    if (!m_edm94.ready || m_edm94.cancelled || m_edm94.finishPending || m_edm94.next == 0U ||
+        m_edm94.next > m_edm94.moves || m_edm94.cache != GetBaseProgramCache().GetGeneration() ||
+        m_edm94.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_edm94.lease)) return false;
+    const unsigned step = m_edm94.next - 1U;
+    const int pc = GetActiveDispatchPC();
+    if (pc != m_edm94.pc[step] || m_currentExecutingBlockDispatchId == 0ULL ||
+        block.val('F') != m_edm94.feed[step]) return false;
+    std::array<double, 6U> target{};
+    for (unsigned a = 0U; a < 6U; ++a)
+    {
+        if (!block.has("XYZCUV"[a]) || block.val("XYZCUV"[a]) != m_edm94.increment[step][a]) return false;
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(a));
+        target[a] = axis.logicalCmdPos.Load() + block.val("XYZCUV"[a]) * m_edm94.feedback.config.axis[a].pulsePerUnit;
+    }
+    const MotionExecutionEpoch epoch = m_motion.GetCurrentExecutionEpoch();
+    if (!m_motion.CheckEDM94Endpoint(target, epoch, m_edm94.lease)) return false;
+    if (m_edm94.gapSegmentProfile)
+    {
+        if (m_isSingleBlockEnabled || m_edm94.gapWaiting) return false;
+        if (m_edm94.gapGainProfile)
+        {
+            if (!(m_edm94.gapNoiseProfile ? EDM98::ValidTuning(m_edm94.gapTuning) :
+                EDM97::ValidTuning(m_edm94.gapTuning))) return false;
+            EDM96::Feedback gap{};
+            if (!m_motion.ReadEDM96Feedback(gap) || gap.session != m_edm94.session ||
+                gap.epoch != epoch || gap.ownerGeneration != m_edm94.lease.generation ||
+                gap.expectedStep != step || !gap.active || gap.faulted ||
+                gap.reason != EDM96::Reason::None || !IsEDM97TuningCurrentSameThread(gap)) return false;
+            if (m_edm94.gapNoiseProfile)
+                return m_motion.AuthorizeEDM98Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+                    m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+                    m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning);
+            if (m_edm94.gapFlushProfile)
+                return m_motion.AuthorizeEDM105Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+                    m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+                    m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning);
+            if (m_edm94.gapPairedProfile)
+                return m_motion.AuthorizeEDM104Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+                    m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+                    m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning);
+            if (m_edm94.gapEnduranceProfile)
+                return m_motion.AuthorizeEDM102Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+                    m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+                    m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning);
+            if (m_edm94.gapContinuousProfile)
+                return m_motion.AuthorizeEDM100Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+                    m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+                    m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning);
+            if (m_edm94.gapBurstProfile)
+                return m_motion.AuthorizeEDM99Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+                    m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+                    m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning);
+            return m_motion.AuthorizeEDM97Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+                m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+                m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning);
+        }
+        return m_motion.AuthorizeEDM96Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+            m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+            m_edm94.feed[step], epoch, m_edm94.lease);
+    }
+    if (m_edm94.gapBoundaryProfile)
+    {
+        if (m_isSingleBlockEnabled || !m_edm94.gapPermitReady ||
+            m_edm94.gapWaitStep != step) return false;
+        m_edm94.gapPermitReady = false; // The attempted authored block owns this copied offer.
+        return m_motion.AuthorizeEDM95Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+            m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+            m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapFeedback.token);
+    }
+    // One-use authority for this already inspected literal G1. The producer
+    // validates its final geometry before publishing the exact epoch handoff.
+    return m_motion.AuthorizeEDM94Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+        m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
+        m_edm94.feed[step], epoch, m_edm94.lease);
+}
+
+WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
+{
+    const int pc = GetActiveDispatchPC();
+    if (block.val('P') == 86.0 || block.val('P') == 88.0 || block.val('P') == 90.0 ||
+        block.val('P') == 92.0 || block.val('P') == 94.0 || block.val('P') == 96.0 || block.val('P') == 98.0 || block.val('P') == 100.0 || block.val('P') == 102.0 || block.val('P') == 104.0)
+    {
+        if (m_edm94.gapGainProfile)
+        {
+            const auto* authored = GetBaseProgramCache().TryGetLine(pc);
+            if (!authored || !E94Profile(authored->parsedBlock, m_edm94.gapFlushProfile ? 104U : m_edm94.gapPairedProfile ? 102U : m_edm94.gapEnduranceProfile ? 100U : m_edm94.gapContinuousProfile ? 98U : m_edm94.gapBurstProfile ? 96U : m_edm94.gapNoiseProfile ? 94U : 92U) ||
+                !E94Matches(authored->parsedBlock, block) || !IsGapDryRunBlockShapeValid(block))
+            { RejectEDM94SameThread(m_edm94.gapFlushProfile ? "EDM105_FINISH_LITERAL_SCOPE" : m_edm94.gapPairedProfile ? "EDM104_FINISH_LITERAL_SCOPE" : m_edm94.gapEnduranceProfile ? "EDM102_FINISH_LITERAL_SCOPE" : m_edm94.gapContinuousProfile ? "EDM100_FINISH_LITERAL_SCOPE" : m_edm94.gapBurstProfile ? "EDM99_FINISH_LITERAL_SCOPE" : m_edm94.gapNoiseProfile ? "EDM98_FINISH_LITERAL_SCOPE" :
+                "EDM97_FINISH_LITERAL_SCOPE", m_gapDryRun.sourceLine); return nullptr; }
+        }
+        if (!m_edm94.latched || !m_edm94.ready || m_edm94.cancelled ||
+            block.val('P') != (m_edm94.gapFlushProfile ? 104.0 : m_edm94.gapPairedProfile ? 102.0 : m_edm94.gapEnduranceProfile ? 100.0 : m_edm94.gapContinuousProfile ? 98.0 : m_edm94.gapBurstProfile ? 96.0 : m_edm94.gapNoiseProfile ? 94.0 : m_edm94.gapGainProfile ? 92.0 : m_edm94.gapSegmentProfile ? 90.0 :
+                m_edm94.gapBoundaryProfile ? 88.0 : 86.0) ||
+            m_edm94.next != m_edm94.moves + 1U || pc != m_edm94.pc[m_edm94.moves] ||
+            m_pathFeed.pending || !m_motion.IsGroupDone() ||
+            (m_edm94.gapSegmentProfile && !ReadEDM96CompletedSegmentsSameThread(m_edm94.moves)))
+        { RejectEDM94SameThread("FINISH_SCOPE", m_gapDryRun.sourceLine); return nullptr; }
+        m_edm94.ready = false; m_edm94.finishPending = true; m_edm94.polls = 0U;
+        m_motion.RequestEDM94Finish(m_edm94.session);
+        LogEDM94SameThread("FINISH_REQUEST", "AWAIT_PHYSICAL_ZERO_STABILITY");
+        return [](NCManager* nc) { return nc->WaitEDM94SameThread(); };
+    }
+    if (m_edm94.latched || !PreflightEDM94ProgramSameThread(pc) || m_mode != NCOperationMode::MEMORY ||
+        m_state != NCState::RUN || Close_System_Com_flag || !m_macroStack.empty() || m_isG66Active || Homing.IsActive() ||
+        !m_externalReadyInterlock || AlarmManager::GetInstance().HasAlarm() ||
+        !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) || CoordSys.GetTranslationSnapshot().distanceMode != 91 ||
+        (CoordSys.IsTranslationRunFrozen() && (!m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot()) ||
+            !IsXYZCUVFeedProfileCurrentSameThread())) ||
+        !m_programMotionLease.IsValid() || m_programMotionLease.owner != MotionOwner::AUTO ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) || m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        !m_motion.IsGroupDone() || m_motion.GetCommandIngressSize() || m_motion.GetCommandReplaySize() ||
+        m_motion.GetAxisCommandMailboxDepth() || m_gapDryRun.active || m_gapPath.active || m_gapWindow.active ||
+        m_pathFeed.pending || m_pathArc.pending || m_pathReplay.pending || m_pathHold.armed || m_pathHold.bound ||
+        m_edmZFixture.cleanupPending || m_edmZFixture.resetPending || m_edmZFixture.failureAlarmPending ||
+        m_edmCoordinatedRT.retirePending || (m_edmCoordinatedRT.submitted && !m_edmCoordinatedRT.retired) ||
+        m_edm94Serial == (std::numeric_limits<std::uint64_t>::max)())
+    { RejectEDM94SameThread("PREFLIGHT_OR_NOT_READY", m_gapDryRun.sourceLine); return nullptr; }
+    if (m_edm94.gapGainProfile)
+    {
+        const auto* authored = GetBaseProgramCache().TryGetLine(pc);
+        EDM97::Tuning parsed{};
+        const EDM97::Tuning decoded{ block.val('Q'), block.val('R'), block.val('S') };
+        if (!authored || !(m_edm94.gapFlushProfile ? E105ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
+                m_edm94.gapPairedProfile ? E104ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
+                m_edm94.gapEnduranceProfile ? E102ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
+                m_edm94.gapContinuousProfile ? E100ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
+                m_edm94.gapBurstProfile ? E99ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
+                m_edm94.gapNoiseProfile ? E98ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
+                E97ProfileOnlyNPQRS(authored->parsedBlock, parsed)) ||
+            !E94Matches(authored->parsedBlock, block) || !IsGapDryRunBlockShapeValid(block) ||
+            !EDM97::SameTuning(parsed, m_edm94.gapTuning) || !EDM97::SameTuning(decoded, m_edm94.gapTuning))
+        { RejectEDM94SameThread(m_edm94.gapFlushProfile ? "EDM105_ARM_LITERAL_TUNING" : m_edm94.gapPairedProfile ? "EDM104_ARM_LITERAL_TUNING" : m_edm94.gapEnduranceProfile ? "EDM102_ARM_LITERAL_TUNING" : m_edm94.gapContinuousProfile ? "EDM100_ARM_LITERAL_TUNING" : m_edm94.gapBurstProfile ? "EDM99_ARM_LITERAL_TUNING" : m_edm94.gapNoiseProfile ? "EDM98_ARM_LITERAL_TUNING" :
+            "EDM97_ARM_LITERAL_TUNING", m_gapDryRun.sourceLine); return nullptr; }
+    }
+    if (m_edm94.gapBoundaryProfile && m_isSingleBlockEnabled)
+    { RejectEDM94SameThread("EDM95_CONTINUOUS_MODE_REQUIRED", m_gapDryRun.sourceLine); return nullptr; }
+    if (m_edm94.gapSegmentProfile && m_isSingleBlockEnabled)
+    { RejectEDM94SameThread("EDM96_CONTINUOUS_MODE_REQUIRED", m_gapDryRun.sourceLine); return nullptr; }
+    m_edm94.boundary = EDM94NCState::FeedBoundary{};
+    m_edm94.session = ++m_edm94Serial;
+    m_edm94.run = m_pathCoreLiveBookkeeping.currentRunToken;
+    m_edm94.cache = GetBaseProgramCache().GetGeneration();
+    m_edm94.armDispatch = m_currentExecutingBlockDispatchId; m_edm94.armPC = pc;
+    m_edm94.lease = m_programMotionLease; m_edm94.armEpoch = m_motion.GetCurrentExecutionEpoch(); m_edm94.feedback = EDM94::Feedback{};
+    m_edm94.ready = m_edm94.finishPending = m_edm94.complete = m_edm94.cancelled = false;
+    m_edm94.resetSeen = m_edm94.resetCommitted = m_edm94.everArmed = false;
+    m_edm94.releaseRequested = m_edm94.terminalLogged = m_edm94.rtFaultReported = false;
+    m_edm94.normalEndCommitted = m_edm94.completionReleaseRequested = false;
+    m_edm94.completionIdleLease = MotionOwnerLease{};
+    m_edm94.completionEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    m_edm94.completionNoneGeneration = MOTION_OWNER_GENERATION_INVALID;
+    m_edm94.completionSafetyProvenance = m_edm94.completionAlarmSafetyIntent = 0ULL;
+    m_edm94.completionAlarmUpdate = 0U;
+    m_edm94.polls = 0U; m_edm94.lastTick = 0ULL;
+    m_edm94.gapFeedback = EDM95::Feedback{};
+    m_edm94.gapWaitEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    m_edm94.gapWaitFirstUs = m_edm94.gapWaitLastUs = m_edm94.gapWaitLastTick = 0ULL;
+    m_edm94.gapLoggedAccepted = m_edm94.gapLoggedPhase = 0ULL;
+    m_edm94.gapWaitStep = m_edm94.gapWaitPolls = 0U;
+    m_edm94.gapWaiting = m_edm94.gapPermitReady = false;
+    const bool submitted = m_edm94.gapFlushProfile ?
+        m_motion.SubmitEDM105Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapPairedProfile ?
+        m_motion.SubmitEDM104Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapEnduranceProfile ?
+        m_motion.SubmitEDM102Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapContinuousProfile ?
+        m_motion.SubmitEDM100Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapBurstProfile ?
+        m_motion.SubmitEDM99Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapNoiseProfile ?
+        m_motion.SubmitEDM98Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapGainProfile ?
+        m_motion.SubmitEDM97Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapSegmentProfile ?
+        m_motion.SubmitEDM96Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease) : m_edm94.gapBoundaryProfile ?
+        m_motion.SubmitEDM95Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease) :
+        m_motion.SubmitEDM94Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease);
+    if (!submitted)
+    { RejectEDM94SameThread("ARM_PUBLICATION", m_gapDryRun.sourceLine); return nullptr; }
+    m_edm94.latched = m_edm94.armPending = true;
+    LogEDM94SameThread("ARM_REQUEST", "ACTUAL_MOTORS_FIXED_G91_G1");
+    if (m_edm94.gapBoundaryProfile)
+        RtPrintf("[EDM95] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltageHigh=50 voltageLow=20 referenceV=35 phaseUs=2000000 producerUs=1000 dwellUs=20000 offerWindowUs=1000000 permitUs=200000 mode=BOUNDARY_DIRECTION_ONLY midSegmentReverse=0 steps=%u hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session), m_edm94.moves);
+    if (m_edm94.gapSegmentProfile && !m_edm94.gapGainProfile)
+        RtPrintf("[EDM96] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltagePlan=50_600ms_20_600ms_50_STEADY producerUs=1000 dwellUs=20000 segmentDeadlineUs=10000000 mode=WITHIN_SEGMENT_SERVO midSegmentReverse=1 steps=%u hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session), m_edm94.moves);
+    if (m_edm94.gapGainProfile && !m_edm94.gapNoiseProfile && !m_edm94.gapBurstProfile)
+    {
+        char record[768]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM97] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltagePlan=50_45_20_25_50 phaseUs=300000 producerUs=1000 dwellUs=20000 segmentDeadlineUs=10000000 referenceV=35 scale=0.001 Q=%.9g R=%.9g S=%.9g configHash=%llu mode=VOLTAGE_ERROR_GAIN_SERVO midSegmentReverse=1 steps=%u immutablePerArm=1 gainUnit=DIRECT_CURVE hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session), m_edm94.gapTuning.positiveGain,
+            m_edm94.gapTuning.negativeGain, m_edm94.gapTuning.deadbandV,
+            static_cast<unsigned long long>(EDM97::ConfigHash(m_edm94.gapTuning)), m_edm94.moves);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM97] event=LOG_FORMAT_ERROR scope=GAP_SOURCE output=NONE\n");
+    }
+    if (m_edm94.gapNoiseProfile)
+    {
+        char record[896]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM98] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltagePlan=50_600ms_NOISE_800ms_20_600ms_NOISE_800ms_50_STEADY noiseV=34.5_35.5 producerUs=1000 noiseFreshUs=1000 dwellUs=20000 quietRequiredTicks=800 quietRequiredUs=200000 quietScope=COMMAND_SCALAR_ONLY segmentDeadlineUs=10000000 referenceV=35 scale=0.001 Q=%.9g R=%.9g S=%.9g configHash=%llu mode=DEADBAND_NOISE_SERVO midSegmentReverse=1 steps=%u immutablePerArm=1 gainUnit=DIRECT_CURVE hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session), m_edm94.gapTuning.positiveGain,
+            m_edm94.gapTuning.negativeGain, m_edm94.gapTuning.deadbandV,
+            static_cast<unsigned long long>(EDM97::ConfigHash(m_edm94.gapTuning)), m_edm94.moves);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM98] event=LOG_FORMAT_ERROR scope=GAP_SOURCE output=NONE\n");
+    }
+    if (m_edm94.gapBurstProfile)
+        LogEDM99GapSource(m_edm94.gapFlushProfile ? "EDM105" : m_edm94.gapPairedProfile ? "EDM104" : m_edm94.gapEnduranceProfile ? "EDM102" : m_edm94.gapContinuousProfile ? "EDM100" : "EDM99", m_edm94.session,
+            m_edm94.gapTuning, m_edm94.moves, m_edm94.gapContinuousProfile, m_edm94.gapEnduranceProfile, m_edm94.gapPairedProfile);
+    return [](NCManager* nc) { return nc->WaitEDM94SameThread(); };
+}
+
+bool NCManager::IsEDM94CompletionOwnerSameThread(const MotionOwnerLease& owner) const noexcept
+{
+    const auto& s = m_edm94;
+    return s.normalEndCommitted && s.completionReleaseRequested &&
+        s.completionEpoch != MOTION_EXECUTION_EPOCH_INVALID &&
+        s.completionIdleLease.owner == MotionOwner::IDLE_HOLD && s.completionIdleLease.IsValid() &&
+        s.completionNoneGeneration != MOTION_OWNER_GENERATION_INVALID &&
+        (owner.Matches(s.completionIdleLease) ||
+            (owner.owner == MotionOwner::NONE && owner.generation == s.completionNoneGeneration));
+}
+
+bool NCManager::HasEDM94CompletionReleaseAcknowledgementSameThread(const EDM94::Feedback& f) const noexcept
+{
+    const auto& s = m_edm94;
+    // Deliberately independent of current NC state/reset flags. An already
+    // completed old transaction can be consumed after a newer RESET intent.
+    return s.completionReleaseRequested && s.session != 0ULL &&
+        f.identity.session == s.session && f.identity.epoch == s.armEpoch &&
+        f.identity.ownerGeneration == s.lease.generation &&
+        f.lastTick != 0ULL && f.lastTick >= s.lastTick &&
+        f.completionPhase == EDM94::CompletionReleasePhase::Released &&
+        f.completionReleased && f.released && !f.active && !f.faulted && !f.cancelled &&
+        f.completionEpoch == s.completionEpoch &&
+        f.completionIdleOwnerGeneration == s.completionIdleLease.generation &&
+        f.completionNoneOwnerGeneration == s.completionNoneGeneration &&
+        f.currentIdentity.session == s.session && f.currentIdentity.epoch == s.completionEpoch &&
+        f.currentIdentity.ownerGeneration == s.completionNoneGeneration;
+}
+
+bool NCManager::ConsumeEDM94CompletionReleaseSameThread(const EDM94::Feedback& f) noexcept
+{
+    if (!m_edm94.latched || !HasEDM94CompletionReleaseAcknowledgementSameThread(f)) return false;
+    m_edm94.feedback = f;
+    m_edm94.lastTick = f.lastTick;
+    LogEDM94SameThread("NORMAL_RELEASED", "M30_AND_EXACT_NONE_PHYSICAL_ZERO");
+    m_edm94.latched = m_edm94.armPending = m_edm94.ready = m_edm94.finishPending = false;
+    return true;
+}
+
+bool NCManager::IsEDM94CompletionSelectionCurrentSameThread() const noexcept
+{
+    const auto& s = m_edm94;
+    if (!s.normalEndCommitted || !s.completionReleaseRequested || !s.complete ||
+        !s.everArmed || !s.terminalLogged || s.armPending || s.ready || s.finishPending ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.moves == 0U || s.next != s.moves + 2U || m_mode != NCOperationMode::MEMORY ||
+        (m_state != NCState::P_END && m_state != NCState::READY) || Close_System_Com_flag ||
+        !m_externalReadyInterlock || m_edmState == EDMState::NOT_READY) return false;
+    const auto& alarms = AlarmManager::GetInstance();
+    const auto current = [&]() noexcept -> bool
+    {
+        return m_motion.GetCurrentExecutionEpoch() == s.completionEpoch &&
+            IsEDM94CompletionOwnerSameThread(m_motion.GetMotionOwnerLease()) &&
+            m_motion.GetSafetyProvenanceGeneration() == s.completionSafetyProvenance &&
+            !m_motion.HasPendingSafetyOrRecoveryRequests() && !alarms.HasAlarm() &&
+            alarms.GetUpdateCount() == s.completionAlarmUpdate &&
+            AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState()) == s.completionAlarmSafetyIntent;
+    };
+    if (!current()) return false;
+    EDM94::Feedback f{};
+    if (!m_motion.ReadEDM94Feedback(f) || f.identity.session != s.session ||
+        f.identity.epoch != s.armEpoch || f.identity.ownerGeneration != s.lease.generation ||
+        f.lastTick == 0ULL || f.lastTick < s.lastTick || f.faulted || f.cancelled ||
+        f.completionPhase == EDM94::CompletionReleasePhase::Revoked) return false;
+    if (f.completionPhase != EDM94::CompletionReleasePhase::None &&
+        (f.completionEpoch != s.completionEpoch ||
+            f.completionIdleOwnerGeneration != s.completionIdleLease.generation ||
+            f.completionNoneOwnerGeneration != s.completionNoneGeneration)) return false;
+    const bool guardOrReceipt = HasEDM94CompletionReleaseAcknowledgementSameThread(f) ||
+        (f.active && f.armAccepted && f.finishRequested && f.forceZero && !f.released);
+    return guardOrReceipt && current();
+}
+
+bool NCManager::IsEDM94CompletionStartIdentityCurrentSameThread() const noexcept
+{
+    const auto& s = m_edm94;
+    const auto& alarms = AlarmManager::GetInstance();
+    return s.normalEndCommitted && s.completionReleaseRequested && s.complete &&
+        !s.cancelled && !s.resetSeen && !s.resetCommitted && !s.releaseRequested && !s.rtFaultReported &&
+        s.feedback.completionPhase != EDM94::CompletionReleasePhase::Revoked &&
+        m_pendingProgramRunEDM94Session != 0ULL && m_pendingProgramRunEDM94Session == s.session &&
+        m_pendingProgramRunEDM94Epoch == s.completionEpoch &&
+        m_pendingProgramRunEDM94IdleLease.Matches(s.completionIdleLease) &&
+        m_pendingProgramRunEDM94NoneGeneration == s.completionNoneGeneration &&
+        m_motion.GetCurrentExecutionEpoch() == m_pendingProgramRunEDM94Epoch &&
+        IsEDM94CompletionOwnerSameThread(m_motion.GetMotionOwnerLease()) &&
+        m_motion.GetSafetyProvenanceGeneration() == s.completionSafetyProvenance &&
+        !m_motion.HasPendingSafetyIntent() && !alarms.HasAlarm() &&
+        alarms.GetUpdateCount() == s.completionAlarmUpdate &&
+        AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState()) == s.completionAlarmSafetyIntent &&
+        !Close_System_Com_flag && m_externalReadyInterlock && m_edmState != EDMState::NOT_READY;
+}
+
+void NCManager::CompleteEDM94ProgramEndSameThread(const NCProgramEndGateSnapshot& end,
+    MotionExecutionEpoch executionEpoch) noexcept
+{
+    auto& s = m_edm94;
+    if (!s.latched || s.normalEndCommitted || end.cause != NCProgramEndCause::M30 ||
+        m_state != NCState::P_END || m_mode != NCOperationMode::MEMORY ||
+        !s.complete || !s.everArmed || !s.terminalLogged || s.armPending || s.ready || s.finishPending ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.moves == 0U || s.next != s.moves + 2U || end.sourcePC != s.pc[s.moves + 1U] ||
+        s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        Close_System_Com_flag || !m_externalReadyInterlock || m_edmState == EDMState::NOT_READY) return;
+    auto& alarms = AlarmManager::GetInstance();
+    const MotionOwnerLease idleLease = m_motion.GetMotionOwnerLease();
+    const std::uint64_t safety = m_motion.GetSafetyProvenanceGeneration();
+    const std::uint32_t alarmUpdate = alarms.GetUpdateCount();
+    const std::uint64_t alarmIntent = AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState());
+    if (idleLease.owner != MotionOwner::IDLE_HOLD || !idleLease.IsValid() ||
+        executionEpoch == MOTION_EXECUTION_EPOCH_INVALID || executionEpoch != m_motion.GetCurrentExecutionEpoch() ||
+        alarms.HasAlarm() || m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        safety != m_motion.GetSafetyProvenanceGeneration() || alarmUpdate != alarms.GetUpdateCount() ||
+        alarmIntent != AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState())) return;
+    s.normalEndCommitted = true;
+    s.completionIdleLease = idleLease;
+    s.completionEpoch = executionEpoch;
+    s.completionSafetyProvenance = safety;
+    s.completionAlarmUpdate = alarmUpdate;
+    s.completionAlarmSafetyIntent = alarmIntent;
+    s.completionReleaseRequested = m_motion.RequestEDM94CompletionRelease(s.session, s.armEpoch,
+        s.lease, executionEpoch, idleLease, s.completionNoneGeneration);
+    LogEDM94SameThread(s.completionReleaseRequested ? "NORMAL_RELEASE_REQUEST" : "NORMAL_RELEASE_REJECTED",
+        s.completionReleaseRequested ? "M30_COMMITTED_WAIT_NONE_PHYSICAL_ZERO" : "RESET_REQUIRED");
+}
+
+void NCManager::ServiceEDM94SameThread()
+{
+    if (!m_edm94.latched) return;
+    auto& s = m_edm94;
+    // Sample before cancellation side effects. An RT fault may already have
+    // revoked AUTO; logging the previous scan here would hide its first cause.
+    EDM94::Feedback observed{};
+    const bool feedbackRead = m_motion.ReadEDM94Feedback(observed);
+    const bool sameSession = feedbackRead && observed.identity.session == s.session;
+    const bool feedbackCurrent = sameSession && observed.lastTick >= s.lastTick &&
+        observed.identity.epoch == s.armEpoch && observed.identity.ownerGeneration == s.lease.generation;
+    if (feedbackCurrent)
+    {
+        s.feedback = observed;
+        s.lastTick = observed.lastTick;
+    }
+    if (feedbackCurrent && ConsumeEDM94CompletionReleaseSameThread(observed)) return;
+    if (feedbackCurrent && observed.completionPhase == EDM94::CompletionReleasePhase::Revoked &&
+        s.normalEndCommitted && !s.cancelled)
+        CancelEDM94SameThread("NORMAL_RELEASE_REVOKED_RESET_REQUIRED");
+    const bool preserveStop = s.resetSeen || s.resetCommitted || s.releaseRequested || s.complete ||
+        m_state == NCState::HOLD || m_state == NCState::RESET_STATE ||
+        m_resetContinuationPhase != ResetContinuationPhase::IDLE;
+    if (!s.releaseRequested && !s.complete && !s.cancelled)
+    {
+        if (s.gapSegmentProfile)
+        {
+            if (m_isSingleBlockEnabled)
+            { RejectEDM94SameThread("EDM96_CONTINUOUS_MODE_REQUIRED", m_gapDryRun.sourceLine); return; }
+            if (s.gapWaiting && ++s.gapWaitPolls >= 500U)
+            { RejectEDM94SameThread("EDM96_SOURCE_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return; }
+            EDM96::Feedback gap{};
+            if (m_motion.ReadEDM96Feedback(gap) && gap.session == s.session)
+            {
+                if (!IsEDM97TuningCurrentSameThread(gap))
+                {
+                    if (m_state == NCState::RUN && !preserveStop)
+                        RejectEDM94SameThread(s.gapFlushProfile ? "EDM105_TUNING_IDENTITY" : s.gapPairedProfile ? "EDM104_TUNING_IDENTITY" : s.gapEnduranceProfile ? "EDM102_TUNING_IDENTITY" : s.gapContinuousProfile ? "EDM100_TUNING_IDENTITY" : s.gapBurstProfile ? "EDM99_TUNING_IDENTITY" : s.gapNoiseProfile ? "EDM98_TUNING_IDENTITY" :
+                            "EDM97_TUNING_IDENTITY", m_gapDryRun.sourceLine);
+                    else CancelEDM94SameThread(s.gapFlushProfile ? "EDM105_TUNING_IDENTITY_DURING_STOP" : s.gapPairedProfile ? "EDM104_TUNING_IDENTITY_DURING_STOP" : s.gapEnduranceProfile ? "EDM102_TUNING_IDENTITY_DURING_STOP" : s.gapContinuousProfile ? "EDM100_TUNING_IDENTITY_DURING_STOP" : s.gapBurstProfile ? "EDM99_TUNING_IDENTITY_DURING_STOP" : s.gapNoiseProfile ? "EDM98_TUNING_IDENTITY_DURING_STOP" :
+                        "EDM97_TUNING_IDENTITY_DURING_STOP");
+                    return;
+                }
+                if (gap.faulted)
+                {
+                    LogEDM96SameThread("SOURCE_OR_SEGMENT_FAULT", gap);
+                    if (m_state == NCState::RUN && !preserveStop)
+                        RejectEDM94SameThread("EDM96_RT_SOURCE_OR_SEGMENT_FAULT", m_gapDryRun.sourceLine);
+                    else CancelEDM94SameThread("EDM96_RT_FAULT_DURING_STOP");
+                    return;
+                }
+                if (s.gapWaiting && s.gapWaitFirstUs != 0ULL && gap.nowUs >= s.gapWaitFirstUs &&
+                    gap.nowUs - s.gapWaitFirstUs >= 5000000ULL)
+                { RejectEDM94SameThread("EDM96_SOURCE_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return; }
+                const std::uint64_t phaseMark = s.gapFlushProfile ?
+                    gap.acceptedSegments * 64ULL + gap.phase * 8ULL + static_cast<unsigned>(gap.flushPhase) :
+                    gap.acceptedSegments * (s.gapGainProfile ? 8ULL : 4ULL) + gap.phase;
+                if (phaseMark != s.gapLoggedPhase || gap.completedSegments != s.gapLoggedAccepted)
+                {
+                    LogEDM96SameThread("SEGMENT_PROGRESS", gap);
+                    s.gapLoggedPhase = phaseMark; s.gapLoggedAccepted = gap.completedSegments;
+                }
+            }
+        }
+        if (s.gapBoundaryProfile && m_isSingleBlockEnabled)
+        { RejectEDM94SameThread("EDM95_CONTINUOUS_MODE_REQUIRED", m_gapDryRun.sourceLine); return; }
+        if (s.gapBoundaryProfile)
+        {
+            // Once a direction wait begins, its deadline is serviced on
+            // every NC scan, including scans blocked by physical readiness.
+            if (s.gapWaiting && ++s.gapWaitPolls >= 500U)
+            { RejectEDM94SameThread("EDM95_GAP_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return; }
+            EDM95::Feedback gap{};
+            if (m_motion.ReadEDM95Feedback(gap) && gap.session == s.session)
+            {
+                if (s.gapWaiting && s.gapWaitFirstUs != 0ULL && gap.nowUs >= s.gapWaitFirstUs &&
+                    gap.nowUs - s.gapWaitFirstUs >= 5000000ULL)
+                { RejectEDM94SameThread("EDM95_GAP_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return; }
+                if (gap.phaseGeneration != s.gapLoggedPhase)
+                {
+                    RtPrintf("[EDM95] event=GAP_SOURCE_PHASE session=%llu phase=%llu sourceSequence=%llu sourceUs=%llu voltage=%u direction=%s expectedStep=%u nextBoundaryOnly=1\n",
+                        static_cast<unsigned long long>(gap.session), static_cast<unsigned long long>(gap.phaseGeneration),
+                        static_cast<unsigned long long>(gap.sourceSequence), static_cast<unsigned long long>(gap.sourceCapturedUs),
+                        gap.voltageV == 50.0 ? 50U : gap.voltageV == 20.0 ? 20U : 0U,
+                        gap.direction > 0 ? "FORWARD" : gap.direction < 0 ? "RETREAT" : "QUALIFYING", gap.expectedStep);
+                    s.gapLoggedPhase = gap.phaseGeneration;
+                }
+                if (gap.acceptedSegments != s.gapLoggedAccepted)
+                {
+                    RtPrintf("[EDM95] event=GAP_CONSUMED session=%llu accepted=%llu forward=%llu retreat=%llu expectedStep=%u epoch=%llu tick=%llu oneUse=1 output=AUTHORED_G1\n",
+                        static_cast<unsigned long long>(gap.session), static_cast<unsigned long long>(gap.acceptedSegments),
+                        static_cast<unsigned long long>(gap.forwardSegments), static_cast<unsigned long long>(gap.retreatSegments),
+                        gap.expectedStep, static_cast<unsigned long long>(gap.epoch), static_cast<unsigned long long>(gap.tick));
+                    s.gapLoggedAccepted = gap.acceptedSegments;
+                }
+            }
+        }
+        // Fixed diagnostic mask: close, mode, state, alarm, ready, cache, run, owner.
+        const unsigned scopeFailures = (Close_System_Com_flag ? 1U : 0U) |
+            (m_mode != NCOperationMode::MEMORY ? 2U : 0U) |
+            (m_state != NCState::RUN ? 4U : 0U) |
+            (AlarmManager::GetInstance().HasAlarm() ? 8U : 0U) |
+            (!m_externalReadyInterlock ? 16U : 0U) |
+            (s.cache != GetBaseProgramCache().GetGeneration() ? 32U : 0U) |
+            (s.run != m_pathCoreLiveBookkeeping.currentRunToken ? 64U : 0U) |
+            (!m_motion.IsMotionOwnerLeaseCurrent(s.lease) ? 128U : 0U);
+        if (scopeFailures != 0U)
+        {
+            RtPrintf("[EDM94] event=CANCEL_SCOPE build=FIX16 session=%llu failures=%02X feedbackRead=%u sameSession=%u feedbackCurrent=%u observedTick=%llu cachedTick=%llu ncState=%u resetSeen=%u releaseRequested=%u\n",
+                static_cast<unsigned long long>(s.session), scopeFailures, feedbackRead ? 1U : 0U,
+                sameSession ? 1U : 0U, feedbackCurrent ? 1U : 0U,
+                static_cast<unsigned long long>(observed.lastTick),
+                static_cast<unsigned long long>(s.feedback.lastTick), static_cast<unsigned>(static_cast<NCState>(m_state)),
+                s.resetSeen ? 1U : 0U, s.releaseRequested ? 1U : 0U);
+            CancelEDM94SameThread("LIFECYCLE_OR_SCOPE");
+        }
+    }
+    // A failed read must not suppress lifecycle cancellation.
+    if (!feedbackRead) return;
+    if (!sameSession)
+    {
+        if (!s.armPending && !s.cancelled && !preserveStop)
+            RejectEDM94SameThread("FEEDBACK_SESSION", m_gapDryRun.sourceLine);
+        return;
+    }
+    if (!feedbackCurrent)
+    {
+        // A stopped/recovering bracket cannot resume from rejected feedback.
+        // Keep its existing stop transaction; an old sample must not relatch ALARM.
+        if (!preserveStop) RejectEDM94SameThread("FEEDBACK_IDENTITY", m_gapDryRun.sourceLine);
+        return;
+    }
+    const auto& f = s.feedback;
+    s.everArmed = s.everArmed || f.armAccepted;
+    if (f.faulted && !s.rtFaultReported)
+    {
+        // Cancellation is not acknowledgement of an RT fault. Report once even
+        // if the preceding owner/lifecycle check (or an earlier scan) cancelled.
+        s.rtFaultReported = true;
+        const bool raiseAlarm = m_state == NCState::RUN && !preserveStop;
+        if (!s.cancelled && !s.releaseRequested) CancelEDM94SameThread("RT_GUARD_FAULT");
+        LogEDM94SameThread("RT_FAULT", raiseAlarm ? "RT_GUARD_FAULT_ALARM" : "RT_GUARD_FAULT_DURING_STOP");
+        if (raiseAlarm)
+        {
+            AlarmManager::GetInstance().Trigger(AlarmManager::GAP_INPUT_TEST_FAILED, m_gapDryRun.sourceLine);
+            ChangeState(NCState::ALARM);
+            return;
+        }
+    }
+    if (s.resetCommitted && !s.everArmed && !f.active && f.faulted)
+    { ReleaseEDM94AfterResetSameThread(); return; }
+    if (f.released && s.releaseRequested && s.resetCommitted && f.identity.epoch == s.armEpoch &&
+        f.identity.ownerGeneration == s.lease.generation && f.lastTick >= s.lastTick)
+    {
+        LogEDM94SameThread("RELEASED", "EXACT_RESET_AND_PHYSICAL_ZERO");
+        s.latched = s.armPending = s.ready = s.finishPending = false;
+        return;
+    }
+    if (f.cancelled && !s.cancelled) CancelEDM94SameThread("RT_CANCELLED");
+    if (s.cancelled && f.stopped && f.forceZero && !s.terminalLogged)
+    { s.terminalLogged = true; LogEDM94SameThread("CANCEL_STOPPED", "PHYSICAL_ZERO_WINDOW"); }
+}
+
+bool NCManager::WaitEDM94FeedBoundarySameThread()
+{
+    auto& s = m_edm94; auto& b = s.boundary;
+    const auto& p = m_pathFeed; const auto& r = m_pathFeedMotion.receipt;
+    const bool stepValid = s.next > 0U && s.next <= s.moves;
+    const unsigned step = stepValid ? s.next - 1U : 0U;
+    // This wait keeps the completed G1's Epoch/AUTO correction authority.
+    // It publishes no handoff, new segment, finish request or PDO command.
+    if (!s.latched || !s.ready || s.armPending || s.cancelled || s.finishPending || s.complete ||
+        s.resetSeen || s.resetCommitted || s.releaseRequested || m_state != NCState::RUN ||
+        m_mode != NCOperationMode::MEMORY || Close_System_Com_flag ||
+        !m_externalReadyInterlock || AlarmManager::GetInstance().HasAlarm())
+    { b = EDM94NCState::FeedBoundary{}; return false; }
+    bool scope = stepValid && p.armed && p.pending && p.bound && p.completed &&
+        p.consumerAccepted && p.consumerStarted && p.dispatch != 0ULL && p.commit != 0ULL && p.lastSequence != 0ULL &&
+        p.run == s.run && p.cache == s.cache && s.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        // ExecuteBlock's dispatch field is cleared before asynchronous waits.
+        // The completion binding retains the exact dispatch until callback retirement.
+        s.cache == GetBaseProgramCache().GetGeneration() && p.dispatch == m_waitingBlockDispatchId &&
+        p.sourcePC == GetActiveDispatchPC() && p.sourcePC == s.pc[step] &&
+        r.valid && r.commandAccepted && r.tailCommitted && r.captureBound && r.xyzcuvFeed &&
+        !r.eccentricFeed && !r.rotaryFeed && !r.zcFeed && !r.xyzcFeed &&
+        r.xyzcuv.valid && !r.xyzcuv.absolute && r.xyzcuv.axisMask == 63U && (r.validAxisMask & 63U) == 63U &&
+        r.identity.IsAssigned() && r.identity.source == MotionCommandSource::NC_MEMORY &&
+        r.identity.sourceBlockId == static_cast<MotionSourceBlockId>(p.sourcePC) &&
+        r.identity.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        r.ownerLease.Matches(s.lease) && r.ownerLease.Matches(m_programMotionLease) &&
+        m_motion.IsMotionOwnerLeaseCurrent(r.ownerLease) && r.translationGeneration != 0ULL &&
+        CoordSys.IsTranslationRunFrozen() && CoordSys.IsTranslationRunCurrent() &&
+        CoordSys.GetTranslationSnapshot().generation == r.translationGeneration &&
+        IsXYZCUVFeedProfileCurrentSameThread() && IsFixedTranslationTravelCurrentSameThread() &&
+        IsPathCoreLiveNativeConfigCurrentSameThread() && r.xyzcuv.feedMMMin == s.feed[step];
+    for (unsigned a = 0U; a < 6U; ++a)
+        scope = scope && std::isfinite(r.xyzcuv.endPulse[a]) &&
+            r.xyzcuv.deltaNative[a] == s.increment[step][a] &&
+            r.xyzcuv.pulsePerUnit[a] == s.feedback.config.axis[a].pulsePerUnit;
+    if (scope && b.dispatch != 0ULL)
+    {
+        scope = b.dispatch == p.dispatch && b.commit == p.commit && b.sequence == p.lastSequence &&
+            b.translation == r.translationGeneration && b.identity.epoch == r.identity.epoch &&
+            b.identity.segmentId == r.identity.segmentId && b.identity.sourceBlockId == r.identity.sourceBlockId &&
+            b.identity.source == r.identity.source;
+        for (unsigned a = 0U; a < 6U; ++a) scope = scope && b.endPulse[a] == r.xyzcuv.endPulse[a];
+    }
+    if (!scope)
+    {
+        char record[640]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM94] event=BOUNDARY_SCOPE_CHECK build=FIX16 session=%llu dispatch=%llu waitingDispatch=%llu executingDispatch=%llu sourcePC=%d activePC=%d expectedPC=%d commit=%llu sequence=%llu epoch=%llu currentEpoch=%llu segment=%llu ownerGen=%u expectedOwnerGen=%u step=%u moves=%u pathFlags=%02X\n",
+            static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(p.dispatch),
+            static_cast<unsigned long long>(m_waitingBlockDispatchId), static_cast<unsigned long long>(m_currentExecutingBlockDispatchId),
+            p.sourcePC, GetActiveDispatchPC(), stepValid ? s.pc[step] : -1,
+            static_cast<unsigned long long>(p.commit), static_cast<unsigned long long>(p.lastSequence),
+            static_cast<unsigned long long>(r.identity.epoch), static_cast<unsigned long long>(m_motion.GetCurrentExecutionEpoch()),
+            static_cast<unsigned long long>(r.identity.segmentId), r.ownerLease.generation, s.lease.generation, step, s.moves,
+            (p.armed ? 1U : 0U) | (p.pending ? 2U : 0U) | (p.bound ? 4U : 0U) | (p.completed ? 8U : 0U) |
+            (p.consumerAccepted ? 16U : 0U) | (p.consumerStarted ? 32U : 0U));
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM94] event=LOG_FORMAT_ERROR scope=BOUNDARY_SCOPE_CHECK\n");
+        b = EDM94NCState::FeedBoundary{}; RejectEDM94SameThread("BOUNDARY_SCOPE", p.sourceLine); return false;
+    }
+    if (b.dispatch == 0ULL)
+    {
+        b.identity = r.identity; b.dispatch = p.dispatch; b.commit = p.commit;
+        b.sequence = p.lastSequence; b.translation = r.translationGeneration;
+        for (unsigned a = 0U; a < 6U; ++a) b.endPulse[a] = r.xyzcuv.endPulse[a];
+    }
+    ++b.polls;
+    // Flags: read, frozen/current identity, active RT state, clock, new tick,
+    // canonical incoming readiness, continuous RT dwell, command endpoint, lag.
+    unsigned flags = 0U, lagMask = 0U;
+    EDM94::Feedback observed{};
+    const bool read = m_motion.ReadEDM94Feedback(observed);
+    const bool identity = read && observed.identity.session == s.session &&
+        observed.identity.epoch == s.armEpoch && observed.identity.ownerGeneration == s.lease.generation &&
+        observed.currentIdentity.session == s.session && observed.currentIdentity.epoch == r.identity.epoch &&
+        observed.currentIdentity.ownerGeneration == r.ownerLease.generation;
+    if (!read) flags |= 1U;
+    if (!identity) flags |= 2U;
+    if (!read || !observed.active || !observed.armAccepted || !observed.armedReady || observed.forceZero ||
+        observed.handoffZero || observed.faulted || observed.cancelled || observed.finishRequested || observed.released) flags |= 4U;
+    const bool clock = identity && observed.lastNowUs != 0ULL &&
+        (b.lastNowUs == 0ULL || observed.lastNowUs > b.lastNowUs);
+    const bool fresh = identity && observed.lastTick != 0ULL && observed.lastTick > b.lastTick &&
+        observed.lastTick >= s.lastTick;
+    if (!clock) flags |= 8U;
+    if (!fresh) flags |= 16U;
+    if (!m_motion.HasExactProgramStartQuiescenceAcknowledgement(r.identity.epoch, r.ownerLease)) flags |= 32U;
+    if (!read || observed.boundaryReadyCycles < EDM94::BoundaryReadyCycles || observed.boundaryNotReadyMask != 0U) flags |= 64U;
+    for (unsigned a = 0U; a < 6U; ++a)
+    {
+        const auto& c = s.feedback.config.axis[a]; const auto& seen = observed.config.axis[a];
+        const auto& e = observed.axis[a];
+        const double maxWindow = (a < 3U ? 0.001 : 0.005) * c.pulsePerUnit;
+        const bool config = std::isfinite(c.pulsePerUnit) && c.pulsePerUnit > 0.0 &&
+            std::isfinite(c.followingWindowPulse) && c.followingWindowPulse > 0.0 &&
+            std::isfinite(maxWindow) && c.followingWindowPulse <= maxWindow &&
+            seen.pulsePerUnit == c.pulsePerUnit && seen.followingWindowPulse == c.followingWindowPulse &&
+            seen.commandAnchor == c.commandAnchor && seen.actualAnchor == c.actualAnchor &&
+            seen.hardwareSign == c.hardwareSign && seen.configFingerprint == c.configFingerprint &&
+            seen.mappingFingerprint == c.mappingFingerprint;
+        if (!read || !config || !std::isfinite(e.currentCommandPulse) ||
+            e.currentCommandPulse != b.endPulse[a]) flags |= 128U;
+        if (!read || !config || !std::isfinite(e.currentActualPulse) || !std::isfinite(e.currentCommandPulse) ||
+            std::fabs(e.currentCommandPulse - e.currentActualPulse) > c.followingWindowPulse ||
+            std::fabs(b.endPulse[a] - e.currentActualPulse) > c.followingWindowPulse) lagMask |= 1U << a;
+    }
+    if (lagMask != 0U) flags |= 256U;
+    if (s.gapSegmentProfile && !ReadEDM96CompletedSegmentsSameThread(s.next)) flags |= 512U;
+    if (clock && fresh)
+    {
+        if (b.firstNowUs == 0ULL) b.firstNowUs = observed.lastNowUs;
+        b.lastNowUs = observed.lastNowUs; b.lastTick = observed.lastTick;
+    }
+    const std::uint64_t elapsed = b.firstNowUs != 0ULL && b.lastNowUs >= b.firstNowUs ?
+        b.lastNowUs - b.firstNowUs : 0ULL;
+    const bool timeout = b.polls >= 500U || elapsed >= 5000000ULL;
+    const bool ready = flags == 0U && !timeout;
+    if ((b.polls == 1U || ready || timeout) &&
+        !(s.gapBoundaryProfile && s.gapWaiting && ready))
+        RtPrintf("[EDM94] event=BOUNDARY_%s build=FIX16 session=%llu dispatch=%llu epoch=%llu segment=%llu step=%u flags=%03X lagMask=%02X polls=%u tick=%llu elapsedUs=%llu rtReadyCycles=%u required=%u rtNotReadyMask=%08X witness=RT_INCOMING_READINESS_DWELL stopProof=0\n",
+            timeout ? "TIMEOUT" : ready ? "READY" : "WAIT", static_cast<unsigned long long>(s.session),
+            static_cast<unsigned long long>(b.dispatch), static_cast<unsigned long long>(b.identity.epoch),
+            static_cast<unsigned long long>(b.identity.segmentId), step, flags, lagMask, b.polls,
+            static_cast<unsigned long long>(observed.lastTick), static_cast<unsigned long long>(elapsed),
+            observed.boundaryReadyCycles, EDM94::BoundaryReadyCycles, observed.boundaryNotReadyMask);
+    if (timeout)
+    { RejectEDM94SameThread("BOUNDARY_SETTLE_TIMEOUT", p.sourceLine); return false; }
+    if (!ready) return false;
+    if (s.gapBoundaryProfile && !s.gapWaiting)
+        RtPrintf("[EDM95] event=PHYSICAL_BOUNDARY_READY session=%llu step=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY\n",
+            static_cast<unsigned long long>(s.session), step, static_cast<unsigned long long>(b.identity.epoch),
+            static_cast<unsigned long long>(b.lastTick), s.next == s.moves ? "P88_FINISH" : "WAIT_GAP_DIRECTION");
+    if (s.gapFlushProfile)
+        RtPrintf("[EDM105] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u closedPairs=%u flushCycles=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM105_SEGMENT_COMPLETE proofScope=COMMAND_SCALAR_ONLY\n",
+            static_cast<unsigned long long>(s.session), s.next, s.next / 2U, (s.next + 1U) / 2U,
+            static_cast<unsigned long long>(b.identity.epoch), static_cast<unsigned long long>(b.lastTick),
+            s.next == s.moves ? "FINISH_P104" : "NEXT_AUTHORED_G1");
+    else if (s.gapPairedProfile)
+        RtPrintf("[EDM104] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u closedPairs=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM104_SEGMENT_COMPLETE proofScope=COMMAND_SCALAR_ONLY\n",
+            static_cast<unsigned long long>(s.session), s.next, s.next / 2U, static_cast<unsigned long long>(b.identity.epoch),
+            static_cast<unsigned long long>(b.lastTick),
+            s.next == s.moves ? "FINISH_P102" : "NEXT_AUTHORED_G1");
+    else if (s.gapEnduranceProfile)
+        RtPrintf("[EDM102] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM102_SEGMENT_COMPLETE proofScope=COMMAND_SCALAR_ONLY\n",
+            static_cast<unsigned long long>(s.session), s.next, static_cast<unsigned long long>(b.identity.epoch),
+            static_cast<unsigned long long>(b.lastTick),
+            s.next == s.moves ? "FINISH_P100" : "NEXT_AUTHORED_G1");
+    else if (s.gapContinuousProfile)
+        RtPrintf("[EDM100] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM100_SEGMENT_COMPLETE proofScope=COMMAND_SCALAR_ONLY\n",
+            static_cast<unsigned long long>(s.session), s.next, static_cast<unsigned long long>(b.identity.epoch),
+            static_cast<unsigned long long>(b.lastTick),
+            s.next == s.moves ? "FINISH_P98" : "NEXT_AUTHORED_G1");
+    else if (s.gapBurstProfile)
+        RtPrintf("[EDM99] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM99_SEGMENT_COMPLETE proofScope=COMMAND_SCALAR_ONLY\n",
+            static_cast<unsigned long long>(s.session), s.next, static_cast<unsigned long long>(b.identity.epoch),
+            static_cast<unsigned long long>(b.lastTick),
+            s.next == s.moves ? "FINISH_P96" : "NEXT_AUTHORED_G1");
+    else if (s.gapNoiseProfile)
+        RtPrintf("[EDM98] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM98_SEGMENT_COMPLETE quietScope=COMMAND_SCALAR_ONLY\n",
+            static_cast<unsigned long long>(s.session), s.next, static_cast<unsigned long long>(b.identity.epoch),
+            static_cast<unsigned long long>(b.lastTick),
+            s.next == s.moves ? "FINISH_P94" : "NEXT_AUTHORED_G1");
+    else if (s.gapGainProfile)
+        RtPrintf("[EDM97] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM97_SEGMENT_COMPLETE\n",
+            static_cast<unsigned long long>(s.session), s.next, static_cast<unsigned long long>(b.identity.epoch),
+            static_cast<unsigned long long>(b.lastTick),
+            s.next == s.moves ? "FINISH_P92" : "NEXT_AUTHORED_G1");
+    else if (s.gapSegmentProfile)
+        RtPrintf("[EDM96] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM96_SEGMENT_COMPLETE\n",
+            static_cast<unsigned long long>(s.session), s.next, static_cast<unsigned long long>(b.identity.epoch),
+            static_cast<unsigned long long>(b.lastTick), s.next == s.moves ? "P90_FINISH" : "NEXT_AUTHORED_G1");
+    b = EDM94NCState::FeedBoundary{};
+    // Recheck the complete physical-boundary proof on every NC scan while
+    // waiting for GAP. Its own immutable deadline never resets with b.
+    return !s.gapBoundaryProfile || s.next == s.moves || WaitEDM95BoundarySameThread(s.next);
+}
+
+bool NCManager::WaitEDM95BoundarySameThread(unsigned step)
+{
+    auto& s = m_edm94;
+    const MotionExecutionEpoch epoch = m_motion.GetCurrentExecutionEpoch();
+    if (!s.gapBoundaryProfile || !s.latched || !s.ready || s.armPending || s.cancelled ||
+        s.finishPending || s.complete || s.resetSeen || s.resetCommitted || s.releaseRequested ||
+        step >= s.moves || step != s.next || m_state != NCState::RUN ||
+        m_mode != NCOperationMode::MEMORY || m_isSingleBlockEnabled || Close_System_Com_flag ||
+        !m_externalReadyInterlock || AlarmManager::GetInstance().HasAlarm() ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || !m_motion.IsGroupDone() ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        (s.gapWaiting && (s.gapWaitStep != step || s.gapWaitEpoch != epoch)))
+    { RejectEDM94SameThread("EDM95_GAP_WAIT_SCOPE", m_gapDryRun.sourceLine); return false; }
+    if (!s.gapWaiting)
+    {
+        s.gapWaiting = true; s.gapPermitReady = false;
+        s.gapWaitStep = step; s.gapWaitEpoch = epoch;
+        s.gapWaitFirstUs = s.gapWaitLastUs = s.gapWaitLastTick = 0ULL;
+        s.gapWaitPolls = 1U;
+        RtPrintf("[EDM95] event=WAIT_GAP_DIRECTION session=%llu step=%u direction=%s epoch=%llu budgetUs=5000000 source=RT_SYNTHETIC geometry=AUTHORED_G1 nextMotionSubmitted=0\n",
+            static_cast<unsigned long long>(s.session), step, (step & 1U) ? "RETREAT" : "FORWARD",
+            static_cast<unsigned long long>(epoch));
+    }
+    EDM95::Feedback seen{};
+    const bool read = m_motion.ReadEDM95Feedback(seen);
+    const bool identity = read && seen.session == s.session && seen.epoch == epoch &&
+        seen.ownerGeneration == s.lease.generation && seen.expectedStep == step;
+    if (read && seen.session == s.session && seen.faulted)
+    { RejectEDM94SameThread("EDM95_GAP_SOURCE_FAULT", m_gapDryRun.sourceLine); return false; }
+    const bool fresh = identity && seen.tick != 0ULL && seen.tick > s.gapWaitLastTick &&
+        seen.nowUs != 0ULL && seen.nowUs > s.gapWaitLastUs;
+    if (fresh)
+    {
+        if (s.gapWaitFirstUs == 0ULL) s.gapWaitFirstUs = seen.nowUs;
+        s.gapWaitLastUs = seen.nowUs; s.gapWaitLastTick = seen.tick;
+    }
+    const bool timeout = s.gapWaitPolls >= 500U ||
+        (s.gapWaitFirstUs != 0ULL && s.gapWaitLastUs >= s.gapWaitFirstUs &&
+            s.gapWaitLastUs - s.gapWaitFirstUs >= 5000000ULL);
+    if (timeout)
+    { RejectEDM94SameThread("EDM95_GAP_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return false; }
+    const auto& permit = seen.token;
+    const bool permitCurrent = fresh && seen.active && !seen.faulted && seen.gateReady &&
+        seen.direction == ((step & 1U) ? -1 : 1) &&
+        seen.sourceSequence != 0ULL && seen.sourceCapturedUs != 0ULL &&
+        seen.nowUs >= seen.sourceCapturedUs && seen.nowUs - seen.sourceCapturedUs <= EDM95::MaximumSourceAgeUs &&
+        permit.session == s.session && permit.epoch == epoch && permit.ownerGeneration == s.lease.generation &&
+        permit.step == step && permit.phaseGeneration == seen.phaseGeneration &&
+        permit.sourceSequence != 0ULL && permit.sourceSequence <= seen.sourceSequence &&
+        permit.sourceCapturedUs != 0ULL && permit.sourceCapturedUs <= seen.sourceCapturedUs &&
+        permit.issuedUs >= permit.sourceCapturedUs && permit.issuedUs <= seen.nowUs &&
+        seen.nowUs - permit.issuedUs <= EDM95::PermitLifetimeUs / 2ULL &&
+        permit.tick != 0ULL && permit.tick <= seen.tick;
+    if (!permitCurrent) return false;
+    s.gapFeedback = seen; s.gapPermitReady = true; s.gapWaiting = false;
+    RtPrintf("[EDM95] event=GAP_GRANT session=%llu step=%u direction=%s phase=%llu sourceSequence=%llu sourceUs=%llu issuedUs=%llu tick=%llu epoch=%llu polls=%u oneUse=1 source=RT_SYNTHETIC midSegmentReverse=0\n",
+        static_cast<unsigned long long>(s.session), step, (step & 1U) ? "RETREAT" : "FORWARD",
+        static_cast<unsigned long long>(permit.phaseGeneration), static_cast<unsigned long long>(permit.sourceSequence),
+        static_cast<unsigned long long>(permit.sourceCapturedUs), static_cast<unsigned long long>(permit.issuedUs),
+        static_cast<unsigned long long>(permit.tick), static_cast<unsigned long long>(permit.epoch), s.gapWaitPolls);
+    return true;
+}
+
+bool NCManager::IsEDM97TuningCurrentSameThread(const EDM96::Feedback& gap) const noexcept
+{
+    const auto& s = m_edm94;
+    if (gap.flushMode != s.gapFlushProfile ||
+        (s.gapFlushProfile && (!s.gapPairedProfile || !s.gapEnduranceProfile || !s.gapContinuousProfile ||
+            !s.gapBurstProfile || !s.gapGainProfile || !s.gapSegmentProfile || s.gapNoiseProfile ||
+            s.gapBoundaryProfile || s.moves != EDM105::MaximumSteps ||
+            static_cast<unsigned>(gap.flushPhase) > static_cast<unsigned>(EDM105::Phase::Complete) ||
+            gap.flushStarted > EDM105::ExpectedFlushCycles || gap.flushCompleted > gap.flushStarted ||
+            gap.flushStarted - gap.flushCompleted > 1ULL ||
+            gap.flushStarted > (gap.acceptedSegments + 1ULL) / 2ULL ||
+            gap.flushCompleted < (gap.completedSegments + 1ULL) / 2ULL || gap.flushZeroTicks > gap.tick ||
+            !std::isfinite(gap.flushAnchor) || !std::isfinite(gap.flushRetreat) || !std::isfinite(gap.flushReturned) ||
+            gap.flushAnchor < 0.0 || gap.flushRetreat < 0.0 || gap.flushReturned < 0.0)) ||
+        (!s.gapFlushProfile && (gap.flushPhase != EDM105::Phase::None || gap.flushStarted != 0ULL ||
+            gap.flushCompleted != 0ULL || gap.flushZeroTicks != 0ULL || gap.flushAnchor != 0.0 ||
+            gap.flushRetreat != 0.0 || gap.flushReturned != 0.0))) return false;
+    if (gap.pairedMode != s.gapPairedProfile ||
+        (s.gapPairedProfile && (!s.gapEnduranceProfile || !s.gapContinuousProfile || !s.gapBurstProfile ||
+            !s.gapGainProfile || !s.gapSegmentProfile || s.gapNoiseProfile || s.gapBoundaryProfile ||
+            s.moves != EDM104::MaximumSteps))) return false;
+    if (gap.enduranceMode != s.gapEnduranceProfile ||
+        (s.gapEnduranceProfile && (!s.gapContinuousProfile || !s.gapBurstProfile || !s.gapGainProfile ||
+            !s.gapSegmentProfile || s.gapNoiseProfile || s.gapBoundaryProfile || s.moves != EDM102::MaximumSteps))) return false;
+    if (gap.continuousMode != s.gapContinuousProfile ||
+        (s.gapContinuousProfile && (!s.gapBurstProfile || !s.gapGainProfile ||
+            !s.gapSegmentProfile || s.gapNoiseProfile || s.gapBoundaryProfile))) return false;
+    if (gap.burstMode != s.gapBurstProfile ||
+        (s.gapBurstProfile && (!s.gapGainProfile || !s.gapSegmentProfile || s.gapNoiseProfile || s.gapBoundaryProfile ||
+            gap.acceptedSegments > (s.gapEnduranceProfile ? EDM102::MaximumSteps : s.gapContinuousProfile ? EDM100::MaximumSteps : 4ULL) ||
+            gap.completedSegments > gap.acceptedSegments || gap.phase > 7U ||
+            gap.freshFrames > gap.tick || gap.pulseLowFreshFrames > gap.freshFrames ||
+            gap.suppressedPulseWindows > gap.pulseLowFreshFrames ||
+            gap.suppressedPulseWindows > 4ULL * gap.acceptedSegments ||
+            gap.qualifiedRetreatWindows > gap.freshFrames ||
+            gap.qualifiedRetreatWindows > 2ULL * gap.acceptedSegments ||
+            gap.reverseEpisodes > gap.qualifiedRetreatWindows ||
+            gap.reverseEpisodes > 2ULL * gap.acceptedSegments ||
+            gap.reverseSegments > gap.acceptedSegments || gap.zeroCrossings > gap.tick ||
+            gap.zeroCrossings > 4ULL * gap.acceptedSegments ||
+            gap.reverseTicks > gap.tick || gap.returnForwardTicks > gap.tick)) ||
+        (!s.gapBurstProfile && (gap.pulseLowFreshFrames != 0ULL || gap.suppressedPulseWindows != 0ULL ||
+            gap.qualifiedRetreatWindows != 0ULL || gap.reverseEpisodes != 0ULL))) return false;
+    if (gap.noiseMode != s.gapNoiseProfile ||
+        (s.gapNoiseProfile && (!s.gapGainProfile || !s.gapSegmentProfile ||
+            !EDM98::ValidTuning(s.gapTuning) || !EDM98::ValidTuning(gap.tuning) ||
+            gap.acceptedSegments > 4ULL || gap.completedSegments > gap.acceptedSegments ||
+            gap.noiseFreshFrames > gap.freshFrames || gap.quietZeroTicks > gap.tick ||
+            gap.quietWindows > 2ULL * gap.acceptedSegments || gap.quietSignChanges != 0ULL)) ||
+        (!s.gapNoiseProfile && (gap.noiseFreshFrames != 0ULL || gap.quietZeroTicks != 0ULL ||
+            gap.quietWindows != 0ULL || gap.quietSignChanges != 0ULL))) return false;
+    if (!s.gapGainProfile)
+        return !gap.tunedMode && EDM97::EmptyTuning(gap.tuning) && gap.configHash == 0ULL;
+    return gap.tunedMode && EDM97::ValidTuning(s.gapTuning) && EDM97::ValidTuning(gap.tuning) &&
+        EDM97::SameTuning(gap.tuning, s.gapTuning) && gap.configHash == EDM97::ConfigHash(s.gapTuning) &&
+        std::isfinite(gap.errorV) && std::isfinite(gap.rawSpeedMmMin) &&
+        std::isfinite(gap.limitedSpeedMmMin) && std::isfinite(gap.targetRatio) &&
+        gap.limitedSpeedMmMin >= -EDM97::MaximumRetreatMmMin &&
+        gap.limitedSpeedMmMin <= EDM97::MaximumFeedMmMin &&
+        gap.targetRatio >= -EDM97::MaximumRetreatMmMin / EDM97::MaximumFeedMmMin && gap.targetRatio <= 1.0 &&
+        gap.saturationFrames <= gap.freshFrames;
+}
+
+void NCManager::LogEDM97SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
+{
+    char record[1024]{};
+    int length = std::snprintf(record, sizeof(record),
+        "[EDM97] event=%.32s session=%llu epoch=%llu ownerGen=%u step=%u phase=%u direction=%s voltage=%.9g qPulse=%.12g vPulsePerSec=%.12g lengthPulse=%.12g accepted=%llu completed=%llu reverseSegments=%llu zeroCrossings=%llu reverseTicks=%llu returnForwardTicks=%llu tick=%llu sourceSequence=%llu sourceUs=%llu freshFrames=%llu heldFrames=%llu maxAgeUs=%llu active=%u segmentActive=%u segmentCompleted=%u faulted=%u reason=%s midSegmentReverse=1 output=GUARDED_CSV dischargeCommand=NONE\n",
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(gap.session),
+        static_cast<unsigned long long>(gap.epoch), static_cast<unsigned>(gap.ownerGeneration), gap.expectedStep,
+        gap.phase, gap.direction > 0 ? "FORWARD" : gap.direction < 0 ? "RETREAT" : "QUALIFYING",
+        gap.voltageV, gap.q, gap.v, gap.length, static_cast<unsigned long long>(gap.acceptedSegments),
+        static_cast<unsigned long long>(gap.completedSegments), static_cast<unsigned long long>(gap.reverseSegments),
+        static_cast<unsigned long long>(gap.zeroCrossings), static_cast<unsigned long long>(gap.reverseTicks),
+        static_cast<unsigned long long>(gap.returnForwardTicks), static_cast<unsigned long long>(gap.tick),
+        static_cast<unsigned long long>(gap.sourceSequence), static_cast<unsigned long long>(gap.sourceCapturedUs),
+        static_cast<unsigned long long>(gap.freshFrames), static_cast<unsigned long long>(gap.heldFrames),
+        static_cast<unsigned long long>(gap.maximumAgeUs), gap.active ? 1U : 0U, gap.segmentActive ? 1U : 0U,
+        gap.segmentCompleted ? 1U : 0U, gap.faulted ? 1U : 0U, EDM96::ReasonName(gap.reason));
+    if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM97] event=LOG_FORMAT_ERROR scope=SEGMENT output=NONE\n");
+    length = std::snprintf(record, sizeof(record),
+        "[EDM97] event=GAIN_EVIDENCE result=%.32s session=%llu tick=%llu phase=%u voltage=%.9g referenceV=35 errorV=%.9g rawSpeedMmMin=%.12g limitedSpeedMmMin=%.12g targetRatio=%.12g Q=%.9g R=%.9g S=%.9g configHash=%llu saturationFreshFrames=%llu freshFrames=%llu tunedMode=%u tuningCurrent=%u scalarTrajectory=1 gainUnit=DIRECT_CURVE dischargeCommand=NONE\n",
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(gap.session),
+        static_cast<unsigned long long>(gap.tick), gap.phase, gap.voltageV, gap.errorV,
+        gap.rawSpeedMmMin, gap.limitedSpeedMmMin, gap.targetRatio, gap.tuning.positiveGain,
+        gap.tuning.negativeGain, gap.tuning.deadbandV, static_cast<unsigned long long>(gap.configHash),
+        static_cast<unsigned long long>(gap.saturationFrames), static_cast<unsigned long long>(gap.freshFrames),
+        gap.tunedMode ? 1U : 0U, IsEDM97TuningCurrentSameThread(gap) ? 1U : 0U);
+    if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM97] event=LOG_FORMAT_ERROR scope=GAIN_EVIDENCE output=NONE\n");
+}
+
+void NCManager::LogEDM98SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
+{
+    char record[1024]{};
+    int length = std::snprintf(record, sizeof(record),
+        "[EDM98] event=%.32s session=%llu epoch=%llu ownerGen=%u step=%u phase=%u direction=%s voltage=%.9g qPulse=%.12g vPulsePerSec=%.12g lengthPulse=%.12g accepted=%llu completed=%llu reverseSegments=%llu zeroCrossings=%llu reverseTicks=%llu returnForwardTicks=%llu tick=%llu sourceSequence=%llu sourceUs=%llu freshFrames=%llu heldFrames=%llu maxAgeUs=%llu active=%u segmentActive=%u segmentCompleted=%u faulted=%u reason=%s midSegmentReverse=1 output=GUARDED_CSV dischargeCommand=NONE\n",
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(gap.session),
+        static_cast<unsigned long long>(gap.epoch), static_cast<unsigned>(gap.ownerGeneration), gap.expectedStep,
+        gap.phase, gap.direction > 0 ? "FORWARD" : gap.direction < 0 ? "RETREAT" : "QUALIFYING_OR_QUIET",
+        gap.voltageV, gap.q, gap.v, gap.length, static_cast<unsigned long long>(gap.acceptedSegments),
+        static_cast<unsigned long long>(gap.completedSegments), static_cast<unsigned long long>(gap.reverseSegments),
+        static_cast<unsigned long long>(gap.zeroCrossings), static_cast<unsigned long long>(gap.reverseTicks),
+        static_cast<unsigned long long>(gap.returnForwardTicks), static_cast<unsigned long long>(gap.tick),
+        static_cast<unsigned long long>(gap.sourceSequence), static_cast<unsigned long long>(gap.sourceCapturedUs),
+        static_cast<unsigned long long>(gap.freshFrames), static_cast<unsigned long long>(gap.heldFrames),
+        static_cast<unsigned long long>(gap.maximumAgeUs), gap.active ? 1U : 0U, gap.segmentActive ? 1U : 0U,
+        gap.segmentCompleted ? 1U : 0U, gap.faulted ? 1U : 0U, EDM96::ReasonName(gap.reason));
+    if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM98] event=LOG_FORMAT_ERROR scope=SEGMENT output=NONE\n");
+    length = std::snprintf(record, sizeof(record),
+        "[EDM98] event=GAIN_EVIDENCE result=%.32s session=%llu tick=%llu phase=%u voltage=%.9g referenceV=35 errorV=%.9g rawSpeedMmMin=%.12g limitedSpeedMmMin=%.12g targetRatio=%.12g Q=%.9g R=%.9g S=%.9g configHash=%llu saturationFreshFrames=%llu freshFrames=%llu tunedMode=%u noiseMode=%u tuningCurrent=%u scalarTrajectory=1 gainUnit=DIRECT_CURVE dischargeCommand=NONE\n",
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(gap.session),
+        static_cast<unsigned long long>(gap.tick), gap.phase, gap.voltageV, gap.errorV,
+        gap.rawSpeedMmMin, gap.limitedSpeedMmMin, gap.targetRatio, gap.tuning.positiveGain,
+        gap.tuning.negativeGain, gap.tuning.deadbandV, static_cast<unsigned long long>(gap.configHash),
+        static_cast<unsigned long long>(gap.saturationFrames), static_cast<unsigned long long>(gap.freshFrames),
+        gap.tunedMode ? 1U : 0U, gap.noiseMode ? 1U : 0U, IsEDM97TuningCurrentSameThread(gap) ? 1U : 0U);
+    if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM98] event=LOG_FORMAT_ERROR scope=GAIN_EVIDENCE output=NONE\n");
+    length = std::snprintf(record, sizeof(record),
+        "[EDM98] event=DEADBAND_EVIDENCE result=%.32s session=%llu tick=%llu phase=%u voltage=%.9g S=%.9g noiseFreshFrames=%llu quietZeroTicks=%llu quietWindows=%llu quietSignChanges=%llu quietRequiredTicks=800 quietRequiredUs=200000 quietScope=COMMAND_SCALAR_ONLY qPulse=%.12g vPulsePerSec=%.12g encoderZeroProven=0 noiseMode=%u tuningCurrent=%u dischargeCommand=NONE\n",
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(gap.session),
+        static_cast<unsigned long long>(gap.tick), gap.phase, gap.voltageV, gap.tuning.deadbandV,
+        static_cast<unsigned long long>(gap.noiseFreshFrames), static_cast<unsigned long long>(gap.quietZeroTicks),
+        static_cast<unsigned long long>(gap.quietWindows), static_cast<unsigned long long>(gap.quietSignChanges),
+        gap.q, gap.v, gap.noiseMode ? 1U : 0U, IsEDM97TuningCurrentSameThread(gap) ? 1U : 0U);
+    if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM98] event=LOG_FORMAT_ERROR scope=DEADBAND_EVIDENCE output=NONE\n");
+}
+
+void NCManager::LogEDM99SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
+{
+    LogEDM99SegmentRecords("EDM99", event, gap, IsEDM97TuningCurrentSameThread(gap));
+}
+
+void NCManager::LogEDM100SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
+{
+    LogEDM99SegmentRecords("EDM100", event, gap, IsEDM97TuningCurrentSameThread(gap));
+}
+
+void NCManager::LogEDM102SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
+{
+    LogEDM99SegmentRecords("EDM102", event, gap, IsEDM97TuningCurrentSameThread(gap));
+}
+
+void NCManager::LogEDM104SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
+{
+    LogEDM99SegmentRecords("EDM104", event, gap, IsEDM97TuningCurrentSameThread(gap));
+}
+
+void NCManager::LogEDM105SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
+{
+    LogEDM99SegmentRecords("EDM105", event, gap, IsEDM97TuningCurrentSameThread(gap));
+    char record[481]{};
+    const auto session = static_cast<unsigned long long>(gap.session);
+    const auto tick = static_cast<unsigned long long>(gap.tick);
+    const char* result = event ? event : "UNKNOWN";
+    const auto emit = [&](int length, const char* part) noexcept
+    {
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+            RtPrintf("%s", record);
+        else RtPrintf("[EDM105] event=LOG_FORMAT_ERROR part=%.16s session=%llu tick=%llu output=NONE\n",
+            part, session, tick);
+    };
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM105] event=FLUSH_EVIDENCE result=%.32s part=STATE session=%llu tick=%llu step=%u flushMode=%u flushPhase=%s flushStarted=%llu flushCompleted=%llu flushZeroTicks=%llu expectedCycles=8 proofScope=COMMAND_SCALAR_ONLY dischargeCommand=NONE\n",
+        result, session, tick, gap.expectedStep, gap.flushMode ? 1U : 0U, EDM105::PhaseName(gap.flushPhase),
+        static_cast<unsigned long long>(gap.flushStarted), static_cast<unsigned long long>(gap.flushCompleted),
+        static_cast<unsigned long long>(gap.flushZeroTicks)), "FLUSH_STATE");
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM105] event=FLUSH_EVIDENCE result=%.32s part=GEOMETRY session=%llu tick=%llu anchorPulse=%.12g retreatPulse=%.12g returnedPulse=%.12g qPulse=%.12g vPulsePerSec=%.12g encoderZeroProven=0 proofScope=COMMAND_SCALAR_ONLY dischargeCommand=NONE\n",
+        result, session, tick, gap.flushAnchor, gap.flushRetreat, gap.flushReturned, gap.q, gap.v), "FLUSH_GEOMETRY");
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM105] event=FLUSH_EVIDENCE result=%.32s part=POLICY session=%llu tick=%llu outwardOnly=1 triggerProgress=0.5 strokeRatio=0.1 speedRatio=0.5 speedCapMmMin=0.06 commandDwellUs=50000 commandDwellTicks=200 dwellSites=2 source=RT_SYNTHETIC hold=CANCEL_RESET_REQUIRED proofScope=COMMAND_SCALAR_ONLY dischargeCommand=NONE\n",
+        result, session, tick), "FLUSH_POLICY");
+}
+
+void NCManager::LogEDM96SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
+{
+    if (m_edm94.gapFlushProfile)
+    { LogEDM105SameThread(event, gap); return; }
+    if (m_edm94.gapPairedProfile)
+    { LogEDM104SameThread(event, gap); return; }
+    if (m_edm94.gapEnduranceProfile)
+    { LogEDM102SameThread(event, gap); return; }
+    if (m_edm94.gapContinuousProfile)
+    { LogEDM100SameThread(event, gap); return; }
+    if (m_edm94.gapBurstProfile)
+    { LogEDM99SameThread(event, gap); return; }
+    if (m_edm94.gapNoiseProfile)
+    { LogEDM98SameThread(event, gap); return; }
+    if (m_edm94.gapGainProfile)
+    { LogEDM97SameThread(event, gap); return; }
+    char record[1024]{};
+    const int length = std::snprintf(record, sizeof(record),
+        "[EDM96] event=%.32s session=%llu epoch=%llu ownerGen=%u step=%u phase=%u direction=%s voltage=%.9g qPulse=%.12g vPulsePerSec=%.12g lengthPulse=%.12g accepted=%llu completed=%llu reverseSegments=%llu zeroCrossings=%llu reverseTicks=%llu returnForwardTicks=%llu tick=%llu sourceSequence=%llu sourceUs=%llu freshFrames=%llu heldFrames=%llu maxAgeUs=%llu active=%u segmentActive=%u segmentCompleted=%u faulted=%u reason=%s midSegmentReverse=1 output=GUARDED_CSV dischargeCommand=NONE\n",
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(gap.session),
+        static_cast<unsigned long long>(gap.epoch), static_cast<unsigned>(gap.ownerGeneration), gap.expectedStep,
+        gap.phase, gap.direction > 0 ? "FORWARD" : gap.direction < 0 ? "RETREAT" : "QUALIFYING",
+        gap.voltageV, gap.q, gap.v, gap.length, static_cast<unsigned long long>(gap.acceptedSegments),
+        static_cast<unsigned long long>(gap.completedSegments), static_cast<unsigned long long>(gap.reverseSegments),
+        static_cast<unsigned long long>(gap.zeroCrossings), static_cast<unsigned long long>(gap.reverseTicks),
+        static_cast<unsigned long long>(gap.returnForwardTicks), static_cast<unsigned long long>(gap.tick),
+        static_cast<unsigned long long>(gap.sourceSequence), static_cast<unsigned long long>(gap.sourceCapturedUs),
+        static_cast<unsigned long long>(gap.freshFrames), static_cast<unsigned long long>(gap.heldFrames),
+        static_cast<unsigned long long>(gap.maximumAgeUs), gap.active ? 1U : 0U, gap.segmentActive ? 1U : 0U,
+        gap.segmentCompleted ? 1U : 0U, gap.faulted ? 1U : 0U, EDM96::ReasonName(gap.reason));
+    if (length > 0 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM96] event=LOG_FORMAT_ERROR output=NONE\n");
+}
+
+bool NCManager::ReadEDM96CompletedSegmentsSameThread(unsigned completed) const noexcept
+{
+    const auto& s = m_edm94;
+    EDM96::Feedback gap{};
+    if (!s.gapSegmentProfile || completed == 0U || completed > s.moves || completed > (s.gapEnduranceProfile ? EDM102::MaximumSteps : s.gapContinuousProfile ? EDM100::MaximumSteps : 4U) ||
+        !m_motion.ReadEDM96Feedback(gap) || gap.session != s.session ||
+        !IsEDM97TuningCurrentSameThread(gap) ||
+        gap.epoch != m_motion.GetCurrentExecutionEpoch() || gap.ownerGeneration != s.lease.generation ||
+        gap.faulted || gap.reason != EDM96::Reason::None || gap.segmentActive ||
+        ((!s.finishPending && !s.complete) && (!gap.active || !gap.segmentCompleted)) ||
+        gap.expectedStep != completed || gap.acceptedSegments != completed || gap.completedSegments != completed ||
+        gap.reverseSegments != completed || gap.zeroCrossings != (s.gapBurstProfile ? 4ULL : 2ULL) * completed ||
+        gap.reverseTicks < (s.gapBurstProfile ? 2ULL : 1ULL) * completed ||
+        gap.returnForwardTicks < (s.gapBurstProfile ? 2ULL : 1ULL) * completed ||
+        gap.tick == 0ULL || gap.nowUs == 0ULL || gap.sourceSequence == 0ULL || gap.sourceCapturedUs == 0ULL ||
+        gap.nowUs < gap.sourceCapturedUs || gap.nowUs - gap.sourceCapturedUs > EDM96::MaximumSourceAgeUs ||
+        !std::isfinite(gap.q) || !std::isfinite(gap.v) || !std::isfinite(gap.length) ||
+        gap.length <= 0.0 || gap.q != gap.length || gap.v != 0.0) return false;
+    if (s.gapFlushProfile && (gap.flushStarted != (completed + 1ULL) / 2ULL ||
+        gap.flushCompleted != (completed + 1ULL) / 2ULL ||
+        gap.flushZeroTicks < 2ULL * EDM105::CommandDwellTicks * gap.flushCompleted ||
+        gap.flushPhase != ((completed & 1U) ? EDM105::Phase::Complete : EDM105::Phase::None) ||
+        ((completed & 1U) ? (gap.flushAnchor <= 0.0 || gap.flushAnchor > gap.length ||
+            gap.flushRetreat >= gap.flushAnchor || gap.flushReturned != gap.flushAnchor) :
+            (gap.flushAnchor != 0.0 || gap.flushRetreat != 0.0 || gap.flushReturned != 0.0)))) return false;
+    if (s.gapNoiseProfile && (gap.quietWindows != 2ULL * completed ||
+        gap.quietZeroTicks < 1600ULL * completed || gap.quietSignChanges != 0ULL ||
+        gap.noiseFreshFrames < 2ULL * completed)) return false;
+    if (s.gapBurstProfile && (gap.suppressedPulseWindows != 4ULL * completed ||
+        gap.qualifiedRetreatWindows != 2ULL * completed || gap.reverseEpisodes != 2ULL * completed ||
+        gap.pulseLowFreshFrames < 4ULL * completed)) return false;
+    return true;
+}
+
+bool NCManager::WaitEDM96InitialSourceSameThread()
+{
+    auto& s = m_edm94;
+    const MotionExecutionEpoch epoch = m_motion.GetCurrentExecutionEpoch();
+    if (!s.gapSegmentProfile || !s.latched || !s.ready || s.armPending || s.cancelled ||
+        s.finishPending || s.complete || s.resetSeen || s.resetCommitted || s.releaseRequested || s.next != 0U ||
+        m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY || m_isSingleBlockEnabled ||
+        Close_System_Com_flag || !m_externalReadyInterlock || AlarmManager::GetInstance().HasAlarm() ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || !m_motion.IsGroupDone() ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        (s.gapWaiting && s.gapWaitEpoch != epoch))
+    { RejectEDM94SameThread("EDM96_SOURCE_WAIT_SCOPE", m_gapDryRun.sourceLine); return false; }
+    if (!s.gapWaiting)
+    {
+        s.gapWaiting = true; s.gapWaitEpoch = epoch;
+        s.gapWaitFirstUs = s.gapWaitLastUs = s.gapWaitLastTick = 0ULL; s.gapWaitPolls = 1U;
+        RtPrintf("[%s] event=WAIT_QUALIFIED_SOURCE session=%llu epoch=%llu budgetUs=5000000 nextMotionSubmitted=0\n",
+            s.gapFlushProfile ? "EDM105" : s.gapPairedProfile ? "EDM104" : s.gapEnduranceProfile ? "EDM102" : s.gapContinuousProfile ? "EDM100" : s.gapBurstProfile ? "EDM99" : s.gapNoiseProfile ? "EDM98" : s.gapGainProfile ? "EDM97" : "EDM96",
+            static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(epoch));
+    }
+    EDM96::Feedback gap{};
+    const bool read = m_motion.ReadEDM96Feedback(gap);
+    if (read && gap.session == s.session && !IsEDM97TuningCurrentSameThread(gap))
+    { RejectEDM94SameThread(s.gapFlushProfile ? "EDM105_TUNING_IDENTITY" : s.gapPairedProfile ? "EDM104_TUNING_IDENTITY" : s.gapEnduranceProfile ? "EDM102_TUNING_IDENTITY" : s.gapContinuousProfile ? "EDM100_TUNING_IDENTITY" : s.gapBurstProfile ? "EDM99_TUNING_IDENTITY" : s.gapNoiseProfile ? "EDM98_TUNING_IDENTITY" :
+        "EDM97_TUNING_IDENTITY", m_gapDryRun.sourceLine); return false; }
+    if (read && gap.session == s.session && gap.faulted)
+    { LogEDM96SameThread("SOURCE_FAULT", gap); RejectEDM94SameThread("EDM96_GAP_SOURCE_FAULT", m_gapDryRun.sourceLine); return false; }
+    const bool identity = read && gap.session == s.session && gap.epoch == epoch &&
+        gap.ownerGeneration == s.lease.generation && gap.expectedStep == 0U;
+    const bool fresh = identity && gap.tick != 0ULL && gap.tick > s.gapWaitLastTick &&
+        gap.nowUs != 0ULL && gap.nowUs > s.gapWaitLastUs;
+    if (fresh)
+    {
+        if (s.gapWaitFirstUs == 0ULL) s.gapWaitFirstUs = gap.nowUs;
+        s.gapWaitLastUs = gap.nowUs; s.gapWaitLastTick = gap.tick;
+    }
+    if (s.gapWaitPolls >= 500U || (s.gapWaitFirstUs != 0ULL &&
+        s.gapWaitLastUs >= s.gapWaitFirstUs && s.gapWaitLastUs - s.gapWaitFirstUs >= 5000000ULL))
+    { RejectEDM94SameThread("EDM96_SOURCE_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return false; }
+    if (!fresh || !gap.active || gap.faulted || gap.reason != EDM96::Reason::None ||
+        gap.segmentActive || gap.segmentCompleted || !gap.gateReady || gap.direction != 1 ||
+        gap.acceptedSegments != 0ULL || gap.completedSegments != 0ULL || gap.reverseSegments != 0ULL ||
+        gap.zeroCrossings != 0ULL || gap.reverseTicks != 0ULL || gap.returnForwardTicks != 0ULL ||
+        (s.gapNoiseProfile && (gap.noiseFreshFrames != 0ULL || gap.quietZeroTicks != 0ULL ||
+            gap.quietWindows != 0ULL || gap.quietSignChanges != 0ULL)) ||
+        (s.gapBurstProfile && (gap.pulseLowFreshFrames != 0ULL || gap.suppressedPulseWindows != 0ULL ||
+            gap.qualifiedRetreatWindows != 0ULL || gap.reverseEpisodes != 0ULL)) ||
+        (s.gapFlushProfile && (gap.flushPhase != EDM105::Phase::None || gap.flushStarted != 0ULL ||
+            gap.flushCompleted != 0ULL || gap.flushZeroTicks != 0ULL || gap.flushAnchor != 0.0 ||
+            gap.flushRetreat != 0.0 || gap.flushReturned != 0.0)) ||
+        gap.sourceSequence == 0ULL || gap.sourceCapturedUs == 0ULL ||
+        gap.nowUs < gap.sourceCapturedUs || gap.nowUs - gap.sourceCapturedUs > EDM96::MaximumSourceAgeUs)
+        return false;
+    s.gapWaiting = false;
+    LogEDM96SameThread("SOURCE_QUALIFIED", gap);
+    return true;
+}
+
+bool NCManager::WaitEDM94SameThread()
+{
+    // ProcessTask services an active GAP deadline before calling this wait.
+    // Avoid counting that same scan twice; the legacy P85/P86 path is intact.
+    if ((!m_edm94.gapBoundaryProfile && !m_edm94.gapSegmentProfile) || !m_edm94.gapWaiting)
+        ServiceEDM94SameThread();
+    auto& s = m_edm94; const auto& f = s.feedback;
+    if (!s.latched || s.cancelled || s.releaseRequested || m_state != NCState::RUN) return false;
+    if (f.identity.session == s.session && f.identity.ownerGeneration == s.lease.generation)
+    {
+        if (s.armPending && f.armAccepted && f.armedReady && f.active && !f.forceZero && !f.faulted && !f.cancelled)
+        {
+            s.armPending = false; s.ready = true;
+            LogEDM94SameThread("ARMED", "FROZEN_SIX_AXIS_PHYSICAL_GUARD");
+            if (s.gapSegmentProfile) return WaitEDM96InitialSourceSameThread();
+            return !s.gapBoundaryProfile || WaitEDM95BoundarySameThread(0U);
+        }
+        if (s.gapSegmentProfile && s.ready && !s.finishPending && s.next == 0U)
+            return WaitEDM96InitialSourceSameThread();
+        if (s.gapBoundaryProfile && s.ready && !s.finishPending && s.next == 0U)
+            return WaitEDM95BoundarySameThread(0U);
+        EDM95::Feedback gapEnd{};
+        const bool gapComplete = !s.gapBoundaryProfile || (m_motion.ReadEDM95Feedback(gapEnd) &&
+            gapEnd.session == s.session && gapEnd.epoch == m_motion.GetCurrentExecutionEpoch() &&
+            gapEnd.ownerGeneration == s.lease.generation && !gapEnd.faulted &&
+            gapEnd.expectedStep == s.moves && gapEnd.acceptedSegments == s.moves &&
+            gapEnd.forwardSegments == s.moves / 2U && gapEnd.retreatSegments == s.moves / 2U);
+        const bool segmentComplete = !s.gapSegmentProfile || ReadEDM96CompletedSegmentsSameThread(s.moves);
+        if (s.finishPending && gapComplete && segmentComplete && f.active && !f.released && f.pass && f.stopped && f.forceZero && f.finishRequested && !f.faulted && !f.cancelled &&
+            f.nonzeroSentMask == 63U && f.actualMovedMask == 63U && f.commandMovedMask == 63U && f.sentFrames >= 200ULL &&
+            f.settledCycles >= f.requiredCycles && f.requiredCycles >= 200U && f.lastSentTick != 0ULL &&
+            f.lastSentTick <= f.lastTick && m_motion.IsGroupDone())
+        {
+            s.finishPending = false; s.complete = true; s.terminalLogged = true;
+            LogEDM94SameThread("PASS", "PHYSICAL_ZERO_WINDOW_WAIT_M30_RETIREMENT"); return true;
+        }
+    }
+    if (++s.polls > 1000U) RejectEDM94SameThread("WAIT_LIMIT", m_gapDryRun.sourceLine);
+    return false;
+}
+
+void NCManager::ResetEDM94SameThread() noexcept
+{
+    if (!m_edm94.latched) return;
+    m_edm94.resetSeen = true;
+    CancelEDM94SameThread("RESET");
+}
+
+void NCManager::ReleaseEDM94AfterResetSameThread() noexcept
+{
+    if (!m_edm94.latched || !m_edm94.resetSeen) return;
+    // This flag is set only by the existing successful Reset/rebase commit.
+    // A later matching rejected-Arm receipt can retire this empty admission.
+    m_edm94.resetCommitted = true;
+    const auto& f = m_edm94.feedback;
+    if (f.identity.session == m_edm94.session && f.identity.epoch == m_edm94.armEpoch &&
+        f.identity.ownerGeneration == m_edm94.lease.generation &&
+        !m_edm94.everArmed && !f.armAccepted && !f.active && f.faulted &&
+        f.sentFrames == 0ULL && f.nonzeroSentMask == 0U && f.actualMovedMask == 0U && f.commandMovedMask == 0U)
+    {
+        LogEDM94SameThread("EMPTY_ADMISSION_RELEASED", "RESET_COMMITTED_NEVER_ARMED_NO_STOP_PROOF");
+        m_edm94.latched = m_edm94.armPending = m_edm94.ready = m_edm94.finishPending = false;
+        return;
+    }
+    if (m_edm94.releaseRequested) return;
+    // The active RT guard independently requires its fresh physical zero window.
+    m_edm94.releaseRequested = true;
+    m_motion.RequestEDM94Release(m_edm94.session);
+    LogEDM94SameThread("RELEASE_REQUEST", "EXISTING_RESET_REBASE_COMMITTED");
 }

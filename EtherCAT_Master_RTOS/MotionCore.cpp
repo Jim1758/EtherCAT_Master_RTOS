@@ -12,6 +12,7 @@
 #include "MotionRetainedInterval.h" // CA canonical interval transport and evaluation
 #include "MotionEccentricCBinding.h" // BASE79D pre-start binding
 #include "MotionEccentricCConsumer.h" // BASE79F caller-owned heap consumer
+#include "EDMServoPI.h" // EDM93 shared scalar law; no output permission
 
 namespace
 {
@@ -1868,6 +1869,88 @@ bool MotionCore::ReadEDMGapServoRT(EDM55RT::Feedback& feedback) const noexcept
     return m_edmGapServoRT.ControlRead(feedback);
 }
 
+bool MotionCore::StartEDMCNCRetainedRT(const EDM83RT::Request& request) noexcept
+{
+    return m_edmCNCRetainedRT.ControlStart(request);
+}
+
+bool MotionCore::TouchEDMCNCRetainedRT(std::uint64_t session, std::uint64_t nowUs) noexcept
+{
+    return m_edmCNCRetainedRT.ControlTouch(session, nowUs);
+}
+
+void MotionCore::CancelEDMCNCRetainedRT(std::uint64_t session) noexcept
+{
+    m_edmCNCRetainedRT.ControlCancel(session);
+}
+
+bool MotionCore::ReadEDMCNCRetainedRT(EDM83RT::Feedback& feedback) const noexcept
+{
+    return m_edmCNCRetainedRT.ControlRead(feedback);
+}
+
+std::uint64_t MotionCore::ReadEDMCNCRetainedRTLatestSession() const noexcept
+{
+    return m_edmCNCRetainedRT.ControlLatestSession();
+}
+
+bool MotionCore::StartEDMCoordinatedRT(const EDM84RT::Request& request) noexcept
+{
+    return m_edmCoordinatedRT.ControlStart(request);
+}
+
+bool MotionCore::TouchEDMCoordinatedRT(std::uint64_t session, std::uint64_t nowUs) noexcept
+{
+    return m_edmCoordinatedRT.ControlTouch(session, nowUs);
+}
+
+void MotionCore::CancelEDMCoordinatedRT(std::uint64_t session) noexcept
+{
+    m_edmCoordinatedRT.ControlCancel(session);
+}
+
+bool MotionCore::ReadEDMCoordinatedRT(EDM84RT::Feedback& feedback) const noexcept
+{
+    return m_edmCoordinatedRT.ControlRead(feedback);
+}
+
+std::uint64_t MotionCore::ReadEDMCoordinatedRTLatestSession() const noexcept
+{
+    return m_edmCoordinatedRT.ControlLatestSession();
+}
+
+bool MotionCore::BindEDMPhysicalSourceBeforeStart(EtherCatMaster* master) noexcept
+{
+    if (master == nullptr || m_pEDMPhysicalSourceMaster != nullptr) return false;
+    m_pEDMPhysicalSourceMaster = master;
+    return true;
+}
+
+bool MotionCore::StartEDMPhysicalServoRT(const EDM69::Request& request) noexcept
+{
+    return m_edmPhysicalServoRT.ControlStart(request);
+}
+
+bool MotionCore::TouchEDMPhysicalServoRT(std::uint64_t session, std::uint64_t nowUs) noexcept
+{
+    return m_edmPhysicalServoRT.ControlTouch(session, nowUs);
+}
+
+void MotionCore::CancelEDMPhysicalServoRT(std::uint64_t session) noexcept
+{
+    m_edmPhysicalServoRT.ControlCancel(session);
+}
+
+bool MotionCore::ReadEDMPhysicalServoRT(EDM69::Feedback& feedback) const noexcept
+{
+    return m_edmPhysicalServoRT.ControlRead(feedback);
+}
+
+std::uint64_t MotionCore::ReadEDMPhysicalServoRTLatestSession() const noexcept
+{
+    return m_edmPhysicalServoRT.ControlLatestSession();
+}
+
 void MotionCore::ObserveEDMGapServoRTRuntimeCycle(const EDM48::Facts& observed) noexcept
 {
     // Reuse the actual callback's clock/PDO/authority observation. No second
@@ -1878,10 +1961,1915 @@ void MotionCore::ObserveEDMGapServoRTRuntimeCycle(const EDM48::Facts& observed) 
     facts.clockValid = observed.clockValid; facts.pdoValid = observed.pdoValid;
     facts.contiguous = observed.contiguous; facts.authorityReady = observed.authorityReady;
     m_edmGapServoRT.RuntimeCycle(facts);
+    m_edmCNCRetainedRT.RuntimeCycle(facts, m_edmZClockFrequency);
+    m_edmCoordinatedRT.RuntimeCycle(facts, m_edmZClockFrequency);
+}
+
+// EDM94 physical fixture. One NC producer publishes requests; only the Motion
+// callback mutates the scope, configuration, evidence or physical guard.
+bool MotionCore::SubmitEDM94Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease) noexcept
+{
+    if (session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+bool MotionCore::SubmitEDM95Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease) noexcept
+{
+    if (session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    request.gapBoundary = true;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+bool MotionCore::ReadEDM95Feedback(EDM95::Feedback& feedback) const noexcept
+{ return m_edm95Feedback.Read(feedback).Ready(); }
+
+bool MotionCore::SubmitEDM96Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease) noexcept
+{
+    if (session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    request.gapSegment = true;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+bool MotionCore::ReadEDM96Feedback(EDM96::Feedback& feedback) const noexcept
+{ return m_edm96Feedback.Read(feedback).Ready(); }
+
+bool MotionCore::SubmitEDM97Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept
+{
+    // Validate the value before acquiring the existing physical guard claim.
+    // The RT arm queue carries this configuration by value for the whole run.
+    if (!EDM97::ValidTuning(tuning) || session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    request.gapSegment = true; request.proportional = true; request.tuning = tuning;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+bool MotionCore::SubmitEDM98Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept
+{
+    // This distinct immutable profile exercises noisy deadband observations;
+    // it uses the same scalar path and physical guard as the retained profiles.
+    if (!EDM98::ValidTuning(tuning) || session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    request.gapSegment = true; request.proportional = true; request.noise = true; request.tuning = tuning;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+bool MotionCore::SubmitEDM99Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept
+{
+    // This immutable profile qualifies short low-voltage bursts before retreat;
+    // it retains the same scalar path, limits and physical guard.
+    if (!EDM99::ValidTuning(tuning) || session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    request.gapSegment = true; request.proportional = true; request.burst = true; request.tuning = tuning;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+bool MotionCore::SubmitEDM100Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept
+{
+    // One immutable burst configuration brackets a bounded eight-segment run.
+    if (!EDM100::ValidTuning(tuning) || session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    request.gapSegment = true; request.proportional = true; request.burst = true;
+    request.continuous = true; request.tuning = tuning;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+bool MotionCore::SubmitEDM102Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept
+{
+    // One immutable burst configuration brackets a bounded sixteen-segment run.
+    if (!EDM102::ValidTuning(tuning) || session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    request.gapSegment = true; request.proportional = true; request.burst = true;
+    request.continuous = true; request.endurance = true; request.tuning = tuning;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+bool MotionCore::SubmitEDM104Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept
+{
+    // One immutable burst configuration brackets a bounded sixteen-segment paired path.
+    if (!EDM104::ValidTuning(tuning) || session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    request.gapSegment = true; request.proportional = true; request.burst = true;
+    request.continuous = true; request.endurance = true; request.paired = true; request.tuning = tuning;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+bool MotionCore::SubmitEDM105Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept
+{
+    // One immutable burst configuration brackets a bounded sixteen-segment paired path with bounded flush cycles.
+    if (!EDM105::ValidTuning(tuning) || session == 0ULL || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch != GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty = 0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty, session,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U, std::memory_order_release);
+    EDM94ArmRequest request{};
+    request.session = session; request.epoch = epoch; request.lease = lease;
+    request.gapSegment = true; request.proportional = true; request.burst = true;
+    request.continuous = true; request.endurance = true; request.paired = true; request.flush = true; request.tuning = tuning;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL, std::memory_order_release);
+    return false;
+}
+
+namespace
+{
+void EDM94PublishSession(std::atomic<std::uint64_t>& target, std::uint64_t session) noexcept
+{
+    std::uint64_t current = target.load(std::memory_order_acquire);
+    while (current < session && !target.compare_exchange_weak(current, session,
+        std::memory_order_release, std::memory_order_acquire)) {}
+}
+}
+void MotionCore::RequestEDM94Finish(std::uint64_t session) noexcept
+{ EDM94PublishSession(m_edm94FinishSession, session); }
+void MotionCore::RequestEDM94Cancel(std::uint64_t session, bool externalStop) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    if (m_edm94Claim.load(std::memory_order_acquire) == session)
+    {
+        unsigned open = 0U;
+        (void)m_edm94CompletionDecision.compare_exchange_strong(open, 1U,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    // HOLD/RESET already owns its formal stop transaction. Publish that
+    // intent first so a preempting RT callback cannot supersede its ticket.
+    if (externalStop) EDM94PublishSession(m_edm94ExternalStopSession, session);
+    EDM94PublishSession(m_edm94CancelSession, session);
+}
+void MotionCore::RequestEDM94Release(std::uint64_t session) noexcept
+{ EDM94PublishSession(m_edm94ReleaseSession, session); }
+
+bool MotionCore::RequestEDM94CompletionRelease(std::uint64_t session,
+    MotionExecutionEpoch armEpoch, const MotionOwnerLease& armLease,
+    MotionExecutionEpoch completionEpoch, const MotionOwnerLease& idleLease,
+    MotionOwnerGeneration& expectedNoneGeneration) noexcept
+{
+    expectedNoneGeneration = MOTION_OWNER_GENERATION_INVALID;
+    // One immutable M30 transaction. Busy PDO reservations do not reject it;
+    // the RT owner waits for their retirement without refreshing these fences.
+    if (!session || armEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        completionEpoch == MOTION_EXECUTION_EPOCH_INVALID || !armLease.IsValid() ||
+        armLease.owner != MotionOwner::AUTO || !idleLease.IsValid() ||
+        idleLease.owner != MotionOwner::IDLE_HOLD ||
+        idleLease.generation != NextMotionOwnerGeneration(armLease.generation) ||
+        m_edm94Claim.load(std::memory_order_acquire) != session)
+    {
+        RtPrintf("[EDM94] event=COMPLETION_REQUEST_REJECT reason=IDENTITY session=%llu\n",
+            static_cast<unsigned long long>(session));
+        return false;
+    }
+    EDM94CompletionReleaseRequest request{};
+    request.armIdentity.session = session;
+    request.armIdentity.epoch = static_cast<std::uint64_t>(armEpoch);
+    request.armIdentity.ownerGeneration = armLease.generation;
+    request.idleLease = idleLease; request.epoch = completionEpoch;
+    request.idleGrant = (static_cast<std::uint64_t>(idleLease.generation) << 32U) |
+        static_cast<std::uint64_t>(completionEpoch);
+    request.safetyIntent = m_frameSafetyIntentState.load(std::memory_order_acquire);
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    request.alarmIntent = AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState());
+    request.alarmRevision = alarms.GetUpdateCount();
+    if (!m_edm94CompletionRequests.ProducerTryPush(request))
+    {
+        RtPrintf("[EDM94] event=COMPLETION_REQUEST_REJECT reason=QUEUE_FULL session=%llu\n",
+            static_cast<unsigned long long>(session));
+        return false;
+    }
+    expectedNoneGeneration = NextMotionOwnerGeneration(idleLease.generation);
+    return true;
+}
+
+bool MotionCore::ReadEDM94Feedback(EDM94::Feedback& feedback) const noexcept
+{ return m_edm94Feedback.Read(feedback).Ready(); }
+
+bool MotionCore::CheckEDM94Endpoint(const std::array<double, 6U>& nativePulse,
+    MotionExecutionEpoch epoch, const MotionOwnerLease& lease) const noexcept
+{
+    EDM94::Feedback feedback{};
+    if (!ReadEDM94Feedback(feedback) || !feedback.active || feedback.forceZero ||
+        feedback.identity.session == 0ULL ||
+        feedback.identity.ownerGeneration != static_cast<std::uint32_t>(lease.generation) ||
+        lease.owner != MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) ||
+        epoch == MOTION_EXECUTION_EPOCH_INVALID || epoch != GetCurrentExecutionEpoch() ||
+        m_edm94CancelSession.load(std::memory_order_acquire) >= feedback.identity.session)
+        return false;
+    for (std::size_t i = 0U; i < 6U; ++i)
+    {
+        const auto& axis = feedback.config.axis[i];
+        const double span = axis.pulsePerUnit * (i < 3U ? 0.025 : 0.5);
+        if (!std::isfinite(nativePulse[i]) || !std::isfinite(span) || span <= 0.0 ||
+            std::fabs(nativePulse[i] - axis.commandAnchor) > span) return false;
+    }
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM94Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease) noexcept
+{
+    return AuthorizeEDM94FeedScoped(session, run, cache, dispatch, sourcePC, step,
+        increment, feedMMMin, epoch, lease, false);
+}
+
+bool MotionCore::AuthorizeEDM94FeedScoped(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease, bool endurance, bool paired, bool flush) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM94::Feedback feedback{};
+    // An ordinary authorization retains its eight-step physical bracket.
+    // The private larger bracket requires the exact active EDM102, EDM104 or EDM105 profile.
+    EDM96::Feedback gap{};
+    const bool gapRead = ReadEDM96Feedback(gap);
+    if ((flush && !paired) || (paired && !endurance) ||
+        (endurance && (!gapRead || gap.flushMode != flush || gap.pairedMode != paired || !gap.enduranceMode || !gap.continuousMode ||
+            !gap.burstMode || !gap.tunedMode || gap.noiseMode || !gap.active || gap.faulted ||
+            gap.session != session || gap.epoch != epoch || gap.ownerGeneration != lease.generation ||
+            gap.expectedStep != step || gap.segmentActive || !gap.gateReady || !EDM102::ValidTuning(gap.tuning))) ||
+        (!endurance && gapRead && gap.session == session && (gap.enduranceMode || gap.pairedMode || gap.flushMode))) return false;
+    if (!session || !run || !cache || !dispatch || sourcePC < 0 ||
+        step >= (endurance ? EDM102::MaximumSteps : 8U) ||
+        !std::isfinite(feedMMMin) || feedMMMin <= 0.0 || feedMMMin > 0.12 || !ReadEDM94Feedback(feedback) ||
+        feedback.identity.session != session || !feedback.active || !feedback.armAccepted || feedback.forceZero ||
+        feedback.faulted || feedback.cancelled || feedback.finishRequested || feedback.released || feedback.handoffZero ||
+        feedback.identity.ownerGeneration != lease.generation || lease.owner != MotionOwner::AUTO ||
+        !IsMotionOwnerLeaseCurrent(lease) || epoch == MOTION_EXECUTION_EPOCH_INVALID ||
+        epoch != GetCurrentExecutionEpoch() || m_edm94Claim.load(std::memory_order_acquire) != session ||
+        m_edm94CancelSession.load(std::memory_order_acquire) >= session ||
+        m_edm94FinishSession.load(std::memory_order_acquire) >= session ||
+        m_edm94ReleaseSession.load(std::memory_order_acquire) >= session ||
+        m_pendingTranslation.runToken != run || m_pendingSourcePC != sourcePC) return false;
+    for (double value : increment) if (!std::isfinite(value) || value == 0.0) return false;
+    auto& a = m_edm94FeedAuthorization;
+    a.session = session; a.run = run; a.cache = cache; a.dispatch = dispatch;
+    a.sourcePC = sourcePC; a.step = step; a.increment = increment; a.feedMMMin = feedMMMin;
+    a.epoch = epoch; a.lease = lease; a.endurance = endurance; a.paired = paired; a.flush = flush;
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM95Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+    const EDM95::Permit& permit) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM95::Feedback feedback{};
+    if (!ReadEDM95Feedback(feedback) || !feedback.active || feedback.faulted ||
+        feedback.session != session || feedback.epoch != epoch ||
+        feedback.ownerGeneration != lease.generation || feedback.expectedStep != step ||
+        !EDM95::ValidIncrement(increment, feedMMMin) || step >= EDM95::MaximumSteps ||
+        permit.session != session || permit.epoch != epoch ||
+        permit.ownerGeneration != lease.generation || permit.step != step ||
+        permit.phaseGeneration != feedback.phaseGeneration || !permit.issuedUs ||
+        permit.issuedUs > feedback.nowUs || feedback.nowUs - permit.issuedUs > EDM95::PermitAgeUs ||
+        !AuthorizeEDM94Feed(session, run, cache, dispatch, sourcePC, step,
+            increment, feedMMMin, epoch, lease)) return false;
+    m_edm94FeedAuthorization.gapPermit = permit;
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM96Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM96::Feedback feedback{};
+    if (!ReadEDM96Feedback(feedback) || !feedback.active || feedback.faulted || feedback.flushMode || feedback.pairedMode || feedback.enduranceMode || feedback.continuousMode || feedback.burstMode || feedback.tunedMode || feedback.noiseMode ||
+        feedback.session != session || feedback.epoch != epoch ||
+        feedback.ownerGeneration != lease.generation || feedback.expectedStep != step ||
+        feedback.segmentActive || !feedback.gateReady ||
+        !EDM96::ValidIncrement(increment, feedMMMin) || step >= EDM96::MaximumSteps ||
+        !AuthorizeEDM94Feed(session, run, cache, dispatch, sourcePC, step,
+            increment, feedMMMin, epoch, lease)) return false;
+    m_edm94FeedAuthorization.gapSegment = true;
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM97Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+    const EDM97::Tuning& tuning) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM96::Feedback feedback{};
+    if (!EDM97::ValidTuning(tuning) || !ReadEDM96Feedback(feedback) ||
+        !feedback.active || feedback.faulted || feedback.flushMode || feedback.pairedMode || feedback.enduranceMode || feedback.continuousMode || feedback.burstMode || !feedback.tunedMode || feedback.noiseMode ||
+        !EDM97::SameTuning(feedback.tuning, tuning) ||
+        feedback.session != session || feedback.epoch != epoch ||
+        feedback.ownerGeneration != lease.generation || feedback.expectedStep != step ||
+        feedback.segmentActive || !feedback.gateReady ||
+        !EDM96::ValidIncrement(increment, feedMMMin) || step >= EDM96::MaximumSteps ||
+        !AuthorizeEDM94Feed(session, run, cache, dispatch, sourcePC, step,
+            increment, feedMMMin, epoch, lease)) return false;
+    m_edm94FeedAuthorization.gapSegment = true;
+    m_edm94FeedAuthorization.proportional = true;
+    m_edm94FeedAuthorization.tuning = tuning;
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM98Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+    const EDM97::Tuning& tuning) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM96::Feedback feedback{};
+    if (!EDM98::ValidTuning(tuning) || !ReadEDM96Feedback(feedback) ||
+        !feedback.active || feedback.faulted || feedback.flushMode || feedback.pairedMode || feedback.enduranceMode || feedback.continuousMode || feedback.burstMode || !feedback.tunedMode || !feedback.noiseMode ||
+        !EDM97::SameTuning(feedback.tuning, tuning) ||
+        feedback.session != session || feedback.epoch != epoch ||
+        feedback.ownerGeneration != lease.generation || feedback.expectedStep != step ||
+        feedback.segmentActive || !feedback.gateReady ||
+        !EDM96::ValidIncrement(increment, feedMMMin) || step >= EDM96::MaximumSteps ||
+        !AuthorizeEDM94Feed(session, run, cache, dispatch, sourcePC, step,
+            increment, feedMMMin, epoch, lease)) return false;
+    m_edm94FeedAuthorization.gapSegment = true;
+    m_edm94FeedAuthorization.proportional = true;
+    m_edm94FeedAuthorization.noise = true;
+    m_edm94FeedAuthorization.tuning = tuning;
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM99Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+    const EDM97::Tuning& tuning) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM96::Feedback feedback{};
+    if (!EDM99::ValidTuning(tuning) || !ReadEDM96Feedback(feedback) ||
+        !feedback.active || feedback.faulted || feedback.flushMode || feedback.pairedMode || feedback.enduranceMode || feedback.continuousMode || !feedback.burstMode || !feedback.tunedMode || feedback.noiseMode ||
+        !EDM97::SameTuning(feedback.tuning, tuning) ||
+        feedback.session != session || feedback.epoch != epoch ||
+        feedback.ownerGeneration != lease.generation || feedback.expectedStep != step ||
+        feedback.segmentActive || !feedback.gateReady ||
+        !EDM96::ValidIncrement(increment, feedMMMin) || step >= EDM96::MaximumSteps ||
+        !AuthorizeEDM94Feed(session, run, cache, dispatch, sourcePC, step,
+            increment, feedMMMin, epoch, lease)) return false;
+    m_edm94FeedAuthorization.gapSegment = true;
+    m_edm94FeedAuthorization.proportional = true;
+    m_edm94FeedAuthorization.burst = true;
+    m_edm94FeedAuthorization.tuning = tuning;
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM100Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+    const EDM97::Tuning& tuning) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM96::Feedback feedback{};
+    if (!EDM100::ValidTuning(tuning) || !ReadEDM96Feedback(feedback) ||
+        !feedback.active || feedback.faulted || feedback.flushMode || feedback.pairedMode || feedback.enduranceMode || !feedback.continuousMode ||
+        !feedback.burstMode || !feedback.tunedMode || feedback.noiseMode ||
+        !EDM97::SameTuning(feedback.tuning, tuning) ||
+        feedback.session != session || feedback.epoch != epoch ||
+        feedback.ownerGeneration != lease.generation || feedback.expectedStep != step ||
+        feedback.segmentActive || !feedback.gateReady ||
+        !EDM96::ValidIncrement(increment, feedMMMin) || step >= EDM100::MaximumSteps ||
+        !AuthorizeEDM94Feed(session, run, cache, dispatch, sourcePC, step,
+            increment, feedMMMin, epoch, lease)) return false;
+    m_edm94FeedAuthorization.gapSegment = true;
+    m_edm94FeedAuthorization.proportional = true;
+    m_edm94FeedAuthorization.burst = true;
+    m_edm94FeedAuthorization.continuous = true;
+    m_edm94FeedAuthorization.tuning = tuning;
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM102Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+    const EDM97::Tuning& tuning) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM96::Feedback feedback{};
+    if (!EDM102::ValidTuning(tuning) || !ReadEDM96Feedback(feedback) ||
+        !feedback.active || feedback.faulted || feedback.flushMode || feedback.pairedMode || !feedback.enduranceMode || !feedback.continuousMode ||
+        !feedback.burstMode || !feedback.tunedMode || feedback.noiseMode ||
+        !EDM97::SameTuning(feedback.tuning, tuning) ||
+        feedback.session != session || feedback.epoch != epoch ||
+        feedback.ownerGeneration != lease.generation || feedback.expectedStep != step ||
+        feedback.segmentActive || !feedback.gateReady ||
+        !EDM96::ValidIncrement(increment, feedMMMin) || step >= EDM102::MaximumSteps ||
+        !AuthorizeEDM94FeedScoped(session, run, cache, dispatch, sourcePC, step,
+            increment, feedMMMin, epoch, lease, true)) return false;
+    m_edm94FeedAuthorization.gapSegment = true;
+    m_edm94FeedAuthorization.proportional = true;
+    m_edm94FeedAuthorization.burst = true;
+    m_edm94FeedAuthorization.continuous = true;
+    m_edm94FeedAuthorization.tuning = tuning;
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM104Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+    const EDM97::Tuning& tuning) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM96::Feedback feedback{};
+    if (!EDM104::ValidTuning(tuning) || !ReadEDM96Feedback(feedback) ||
+        !feedback.active || feedback.faulted || feedback.flushMode || !feedback.pairedMode || !feedback.enduranceMode || !feedback.continuousMode ||
+        !feedback.burstMode || !feedback.tunedMode || feedback.noiseMode ||
+        !EDM97::SameTuning(feedback.tuning, tuning) ||
+        feedback.session != session || feedback.epoch != epoch ||
+        feedback.ownerGeneration != lease.generation || feedback.expectedStep != step ||
+        feedback.segmentActive || !feedback.gateReady ||
+        !EDM96::ValidIncrement(increment, feedMMMin) || step >= EDM104::MaximumSteps ||
+        !AuthorizeEDM94FeedScoped(session, run, cache, dispatch, sourcePC, step,
+            increment, feedMMMin, epoch, lease, true, true)) return false;
+    m_edm94FeedAuthorization.gapSegment = true;
+    m_edm94FeedAuthorization.proportional = true;
+    m_edm94FeedAuthorization.burst = true;
+    m_edm94FeedAuthorization.continuous = true;
+    m_edm94FeedAuthorization.tuning = tuning;
+    return true;
+}
+
+bool MotionCore::AuthorizeEDM105Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+    std::uint64_t dispatch, int sourcePC, unsigned step, const std::array<double, 6U>& increment,
+    double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+    const EDM97::Tuning& tuning) noexcept
+{
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{};
+    EDM96::Feedback feedback{};
+    if (!EDM105::ValidTuning(tuning) || !ReadEDM96Feedback(feedback) ||
+        !feedback.active || feedback.faulted || !feedback.flushMode || !feedback.pairedMode || !feedback.enduranceMode || !feedback.continuousMode ||
+        !feedback.burstMode || !feedback.tunedMode || feedback.noiseMode ||
+        !EDM97::SameTuning(feedback.tuning, tuning) ||
+        feedback.session != session || feedback.epoch != epoch ||
+        feedback.ownerGeneration != lease.generation || feedback.expectedStep != step ||
+        feedback.segmentActive || !feedback.gateReady ||
+        !EDM96::ValidIncrement(increment, feedMMMin) || step >= EDM105::MaximumSteps ||
+        !AuthorizeEDM94FeedScoped(session, run, cache, dispatch, sourcePC, step,
+            increment, feedMMMin, epoch, lease, true, true, true)) return false;
+    m_edm94FeedAuthorization.gapSegment = true;
+    m_edm94FeedAuthorization.proportional = true;
+    m_edm94FeedAuthorization.burst = true;
+    m_edm94FeedAuthorization.continuous = true;
+    m_edm94FeedAuthorization.tuning = tuning;
+    return true;
+}
+
+bool MotionCore::IsEDM102FeedProfileCurrent(const EDM94FeedAuthorization& a) const noexcept
+{
+    EDM96::Feedback gap{};
+    const bool gapRead = ReadEDM96Feedback(gap);
+    // Retained callers do not depend on a GAP snapshot unless it identifies EDM102/104/105.
+    // False flags cannot downgrade an active larger bracket to an older profile.
+    if (!a.endurance && !a.paired && !a.flush &&
+        (!gapRead || gap.session != a.session || (!gap.enduranceMode && !gap.pairedMode && !gap.flushMode))) return true;
+    return (!a.flush || a.paired) && a.endurance && a.continuous && a.burst && a.proportional && a.gapSegment &&
+        !a.noise && EDM95::EmptyPermit(a.gapPermit) && EDM102::ValidTuning(a.tuning) &&
+        gapRead && gap.flushMode == a.flush && gap.pairedMode == a.paired && gap.enduranceMode && gap.continuousMode && gap.burstMode && gap.tunedMode &&
+        !gap.noiseMode && gap.active && !gap.faulted && gap.session == a.session &&
+        gap.epoch == a.epoch && gap.ownerGeneration == a.lease.generation &&
+        gap.expectedStep == a.step && !gap.segmentActive && gap.gateReady && EDM102::ValidTuning(gap.tuning) &&
+        EDM97::SameTuning(a.tuning, gap.tuning);
+}
+
+bool MotionCore::TakeEDM94FeedAuthorization(const std::array<double, 6U>& increment,
+    double feedMMMin, EDM94FeedAuthorization& result) noexcept
+{
+    result = m_edm94FeedAuthorization;
+    m_edm94FeedAuthorization = EDM94FeedAuthorization{}; // consume even a rejected attempt
+    const std::uint64_t session = m_edm94Claim.load(std::memory_order_acquire);
+    if (!session) { result = EDM94FeedAuthorization{}; return true; }
+    return result.session == session && result.run == m_pendingTranslation.runToken &&
+        result.sourcePC == m_pendingSourcePC && result.cache && result.dispatch &&
+        result.step < (result.endurance ? EDM102::MaximumSteps : 8U) && IsEDM102FeedProfileCurrent(result) &&
+        result.epoch == GetCurrentExecutionEpoch() && result.lease.owner == MotionOwner::AUTO &&
+        IsMotionOwnerLeaseCurrent(result.lease) &&
+        m_edm94CancelSession.load(std::memory_order_acquire) < session &&
+        (!result.gapSegment || EDM95::EmptyPermit(result.gapPermit)) &&
+        (!result.continuous || (result.burst && result.proportional && result.gapSegment &&
+            !result.noise && EDM95::EmptyPermit(result.gapPermit) && EDM100::ValidTuning(result.tuning))) &&
+        (!result.burst || (result.proportional && result.gapSegment && !result.noise &&
+            EDM99::ValidTuning(result.tuning))) &&
+        (!result.noise || (result.proportional && result.gapSegment && !result.burst && EDM98::ValidTuning(result.tuning))) &&
+        (result.proportional ? result.gapSegment && EDM97::ValidTuning(result.tuning) :
+            EDM97::SameTuning(result.tuning, EDM97::Tuning{0.0, 0.0, 0.0})) &&
+        std::memcmp(result.increment.data(), increment.data(), sizeof(double) * 6U) == 0 &&
+        std::memcmp(&result.feedMMMin, &feedMMMin, sizeof(double)) == 0;
+}
+
+bool MotionCore::PublishEDM94Handoff(const EDM94FeedAuthorization& a,
+    const MotionCommand& command, EDM94HandoffMessage& message) noexcept
+{
+    message = EDM94HandoffMessage{};
+    const std::uint64_t owner = m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t epoch = m_executionEpochPublication.load(std::memory_order_acquire);
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    const std::uint64_t safety = m_frameSafetyIntentState.load(std::memory_order_acquire);
+    const std::uint64_t alarmSafety = alarms.GetMotionSafetyIntentState();
+    const std::uint32_t alarmRevision = alarms.GetUpdateCount();
+    if (!a.session || a.session != m_edm94Claim.load(std::memory_order_acquire) ||
+        m_edm94CancelSession.load(std::memory_order_acquire) >= a.session ||
+        a.run != m_pendingTranslation.runToken || a.sourcePC != m_pendingSourcePC ||
+        !a.run || !a.cache || !a.dispatch || a.step >= (a.endurance ? EDM102::MaximumSteps : 8U) ||
+        !IsEDM102FeedProfileCurrent(a) || a.lease.owner != MotionOwner::AUTO ||
+        !UnpackMotionOwnerState(owner).Matches(a.lease) ||
+        (owner & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        UnpackMotionOwnerSafetyHandshake(owner) || UnpackMotionOwnerSafetyActionPending(owner) ||
+        epoch != PackExecutionEpochPublication(a.epoch, MotionCommandSource::NC_MEMORY, false, false) ||
+        static_cast<std::uint32_t>(safety) != 0U || static_cast<std::uint32_t>(alarmSafety) != 0U ||
+        alarms.HasAlarm() || HasPendingSafetyOrRecoveryRequests() || HasUnacknowledgedSafetyMotionRequest() ||
+        command.mode != InterpolationMode::LINEAR || command.axisCount != 6 ||
+        !command.pathCoreXYZCUVFeedExactStop || command.commandPathMode != MotionCommandPathMode::EXACT_STOP ||
+        command.sourceTranslation.runToken != a.run || command.sourceIsAbsoluteMode ||
+        command.sourceLinePC != a.sourcePC ||
+        (a.gapSegment && !EDM95::EmptyPermit(a.gapPermit)) ||
+        (a.continuous && (!a.burst || !a.proportional || !a.gapSegment || a.noise ||
+            !EDM95::EmptyPermit(a.gapPermit) || !EDM100::ValidTuning(a.tuning))) ||
+        (a.burst && (!a.proportional || !a.gapSegment || a.noise || !EDM99::ValidTuning(a.tuning))) ||
+        (a.noise && (!a.proportional || !a.gapSegment || a.burst || !EDM98::ValidTuning(a.tuning))) ||
+        (a.proportional ? !a.gapSegment || !EDM97::ValidTuning(a.tuning) :
+            !EDM97::SameTuning(a.tuning, EDM97::Tuning{0.0, 0.0, 0.0}))) return false;
+    std::array<double, 6U> target{};
+    for (unsigned i = 0U; i < 6U; ++i)
+    {
+        if (command.axisIndices[i] != static_cast<int>(i)) return false;
+        target[i] = command.targetPos[i];
+    }
+    if (!CheckEDM94Endpoint(target, a.epoch, a.lease)) return false;
+    message.authorization = a;
+    message.nextEpoch = a.epoch == (std::numeric_limits<MotionExecutionEpoch>::max)() ? 1U : a.epoch + 1U;
+    message.targetPulse = target; message.targetVelocity = command.targetVel;
+    if (a.gapSegment)
+        for (unsigned i = 0U; i < 6U; ++i)
+        {
+            if (!std::isfinite(command.mem_startPos[i])) return false;
+            message.gapSegmentStartPulse[i] = command.mem_startPos[i];
+        }
+    message.acceleration = command.accTime; message.deceleration = command.decTime;
+    message.ownerWord = owner; message.executionWord = epoch;
+    message.safetyWord = safety; message.alarmSafetyWord = alarmSafety; message.alarmRevision = alarmRevision;
+    if (m_motionOwnerState.load(std::memory_order_acquire) != owner ||
+        m_executionEpochPublication.load(std::memory_order_acquire) != epoch ||
+        m_frameSafetyIntentState.load(std::memory_order_acquire) != safety ||
+        alarms.GetMotionSafetyIntentState() != alarmSafety || alarms.GetUpdateCount() != alarmRevision)
+        return false;
+    return m_edm94HandoffMessages.ProducerTryPush(message);
+}
+
+bool MotionCore::IsEDM94HandoffAuthorityCurrent() const noexcept
+{
+    if (!m_edm94HandoffPending || !m_edm94.HandoffZero()) return false;
+    const auto& h = m_edm94Handoff;
+    const std::uint64_t owner = m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t epoch = m_executionEpochPublication.load(std::memory_order_acquire);
+    const bool exactEpoch = epoch == h.executionWord ||
+        epoch == PackExecutionEpochPublication(h.nextEpoch, MotionCommandSource::NC_MEMORY, true, true) ||
+        epoch == PackExecutionEpochPublication(h.nextEpoch, MotionCommandSource::NC_MEMORY, false, false);
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    return exactEpoch && (owner == h.ownerWord || owner == (h.ownerWord | MOTION_OWNER_EPOCH_COMMIT_RESERVED)) &&
+        h.authorization.session == m_edm94.Current().identity.session &&
+        h.authorization.endurance == m_edm102Profile &&
+        h.authorization.flush == m_edm105Profile &&
+        (!m_edm96Profile || (m_edm96.IsFlushBurstTuned() == m_edm105Profile &&
+            m_edm96.Current().flushMode == m_edm105Profile)) &&
+        (!m_edm105Profile || (m_edm104Profile && m_edm96Profile && h.authorization.paired &&
+            EDM105::ValidTuning(h.authorization.tuning))) &&
+        h.authorization.paired == m_edm104Profile &&
+        (!m_edm96Profile || (m_edm96.IsPairedBurstTuned() == m_edm104Profile &&
+            m_edm96.Current().pairedMode == m_edm104Profile)) &&
+        (!m_edm104Profile || (m_edm102Profile && m_edm100Profile && m_edm99Profile && m_edm97Profile &&
+            m_edm96Profile && !m_edm98Profile && !m_edm95Profile && h.authorization.continuous &&
+            h.authorization.burst && h.authorization.proportional && h.authorization.gapSegment &&
+            !h.authorization.noise && EDM95::EmptyPermit(h.authorization.gapPermit) &&
+            m_edm96.IsContinuousBurstTuned() && m_edm96.IsBurstTuned() && m_edm96.IsTuned() &&
+            !m_edm96.IsNoiseTuned() && EDM104::ValidTuning(h.authorization.tuning) &&
+            EDM97::SameTuning(h.authorization.tuning, m_edm96.FrozenTuning()) &&
+            EDM97::SameTuning(m_edm96.Current().tuning, m_edm96.FrozenTuning()))) &&
+        (!m_edm96Profile || m_edm96.IsEnduranceBurstTuned() == m_edm102Profile) &&
+        m_edm94CancelSession.load(std::memory_order_acquire) < h.authorization.session &&
+        m_frameSafetyIntentState.load(std::memory_order_acquire) == h.safetyWord &&
+        alarms.GetMotionSafetyIntentState() == h.alarmSafetyWord && alarms.GetUpdateCount() == h.alarmRevision &&
+        !alarms.HasAlarm() && !HasPendingSafetyIntent() && !HasUnacknowledgedSafetyMotionRequest() &&
+        m_pendingCommandSource.load(std::memory_order_acquire) == MotionCommandSource::NC_MEMORY;
+}
+
+bool MotionCore::IsEDM94HandoffCommandCurrent() const noexcept
+{
+    if (!m_edm94HandoffCommitted || !m_Group.isActive) return false;
+    const auto& h = m_edm94Handoff; const auto& c = m_Group.currentCmd;
+    if (h.authorization.flush != m_edm105Profile ||
+        (m_edm96Profile && (m_edm96.IsFlushBurstTuned() != m_edm105Profile ||
+            m_edm96.Current().flushMode != m_edm105Profile)) ||
+        (m_edm105Profile && (!m_edm104Profile || !m_edm96Profile || !h.authorization.paired ||
+            !EDM105::ValidTuning(h.authorization.tuning))) ||
+        h.authorization.paired != m_edm104Profile ||
+        (m_edm96Profile && (m_edm96.IsPairedBurstTuned() != m_edm104Profile ||
+            m_edm96.Current().pairedMode != m_edm104Profile)) ||
+        (m_edm104Profile && (!m_edm102Profile || !m_edm100Profile || !m_edm99Profile || !m_edm97Profile ||
+            !m_edm96Profile || m_edm98Profile || m_edm95Profile || !h.authorization.continuous ||
+            !h.authorization.burst || !h.authorization.proportional || !h.authorization.gapSegment ||
+            h.authorization.noise || !EDM95::EmptyPermit(h.authorization.gapPermit) ||
+            !m_edm96.IsContinuousBurstTuned() || !m_edm96.IsBurstTuned() || !m_edm96.IsTuned() ||
+            m_edm96.IsNoiseTuned() || !EDM104::ValidTuning(h.authorization.tuning) ||
+            !EDM97::SameTuning(h.authorization.tuning, m_edm96.FrozenTuning()) ||
+            !EDM97::SameTuning(m_edm96.Current().tuning, m_edm96.FrozenTuning()))) ||
+        h.authorization.endurance != m_edm102Profile ||
+        (m_edm96Profile && m_edm96.IsEnduranceBurstTuned() != m_edm102Profile) ||
+        !MotionExecutionIdentityExactlyMatches(c.execution, h.command) ||
+        !c.ownerLease.Matches(h.authorization.lease) || c.mode != InterpolationMode::LINEAR ||
+        c.axisCount != 6 || !c.pathCoreXYZCUVFeedExactStop ||
+        c.commandPathMode != MotionCommandPathMode::EXACT_STOP || m_Group.pathMode != PathMode::EXACT_STOP ||
+        c.sourceTranslation.runToken != h.authorization.run || c.sourceLinePC != h.authorization.sourcePC ||
+        c.sourceIsAbsoluteMode || c.targetVel != h.targetVelocity ||
+        c.accTime != h.acceleration || c.decTime != h.deceleration) return false;
+    for (unsigned i = 0U; i < 6U; ++i)
+        if (c.axisIndices[i] != static_cast<int>(i) || m_Group.axisIndices[i] != static_cast<int>(i) ||
+            c.targetPos[i] != h.targetPulse[i]) return false;
+    return GetCommandAuthorizationFailure(c) == MotionRejectReason::NONE;
+}
+
+void MotionCore::ObserveEDM94Handoff(bool freshMotionFrame) noexcept
+{
+    if (!m_edm94.Active()) return;
+    // Acquire the epoch BEFORE polling the prepare channel. A prepare is
+    // release-published before its epoch CAS, so a newly observed epoch can
+    // never be mistaken for an absent ticket merely because it raced a poll.
+    const MotionExecutionEpoch observedEpoch = GetCurrentExecutionEpoch();
+    EDM94HandoffMessage message{};
+    if (m_edm94.ForceZero())
+    {
+        for (unsigned count = 0U; count < 2U && m_edm94HandoffMessages.ConsumerTryPop(message); ++count) {}
+        return;
+    }
+    // One prepare and one commit are sufficient. No RT spin or allocation.
+    for (unsigned count = 0U; count < 2U && m_edm94HandoffMessages.ConsumerTryPop(message); ++count)
+    {
+        const auto& a = message.authorization;
+        const bool scope = a.session == m_edm94.Current().identity.session && a.session && a.run && a.cache &&
+            a.dispatch > m_edm94LastHandoffDispatch && a.step == m_edm94NextHandoffStep &&
+            a.step < (m_edm102Profile ? EDM102::MaximumSteps : 8U) &&
+            a.sourcePC >= 0 && a.epoch == m_edm94ExpectedEpoch && a.lease.owner == MotionOwner::AUTO &&
+            a.lease.generation == m_edm94.Current().identity.ownerGeneration &&
+            message.nextEpoch == (a.epoch == (std::numeric_limits<MotionExecutionEpoch>::max)() ? 1U : a.epoch + 1U) &&
+            m_edm95Profile == !EDM95::EmptyPermit(a.gapPermit) &&
+            m_edm96Profile == a.gapSegment && !(a.gapSegment && !EDM95::EmptyPermit(a.gapPermit)) &&
+            m_edm97Profile == a.proportional && (!m_edm96Profile || m_edm97Profile == m_edm96.IsTuned()) &&
+            m_edm98Profile == a.noise && (!m_edm96Profile || m_edm98Profile == m_edm96.IsNoiseTuned()) &&
+            m_edm99Profile == a.burst && (!m_edm96Profile || m_edm99Profile == m_edm96.IsBurstTuned()) &&
+            m_edm100Profile == a.continuous &&
+            (!m_edm96Profile || m_edm100Profile == m_edm96.IsContinuousBurstTuned()) &&
+            m_edm105Profile == a.flush &&
+            (!m_edm96Profile || (m_edm105Profile == m_edm96.IsFlushBurstTuned() &&
+                m_edm105Profile == m_edm96.Current().flushMode)) &&
+            (!a.flush || (a.paired && a.endurance && a.continuous && a.burst && a.proportional &&
+                a.gapSegment && !a.noise && EDM95::EmptyPermit(a.gapPermit) && EDM105::ValidTuning(a.tuning))) &&
+            m_edm104Profile == a.paired &&
+            (!m_edm96Profile || (m_edm104Profile == m_edm96.IsPairedBurstTuned() &&
+                m_edm104Profile == m_edm96.Current().pairedMode)) &&
+            (!a.paired || (a.endurance && a.continuous && a.burst && a.proportional && a.gapSegment &&
+                !a.noise && EDM95::EmptyPermit(a.gapPermit) && EDM104::ValidTuning(a.tuning))) &&
+            m_edm102Profile == a.endurance &&
+            (!m_edm96Profile || m_edm102Profile == m_edm96.IsEnduranceBurstTuned()) &&
+            (!a.endurance || (a.continuous && a.burst && a.proportional && a.gapSegment && !a.noise &&
+                EDM95::EmptyPermit(a.gapPermit) && EDM102::ValidTuning(a.tuning))) &&
+            (!a.continuous || (a.burst && a.proportional && a.gapSegment && !a.noise &&
+                EDM95::EmptyPermit(a.gapPermit) && EDM100::ValidTuning(a.tuning))) &&
+            (!a.burst || (a.proportional && a.gapSegment && !a.noise && EDM99::ValidTuning(a.tuning))) &&
+            (!a.noise || (a.proportional && a.gapSegment && !a.burst && EDM98::ValidTuning(a.tuning))) &&
+            (a.proportional ? a.gapSegment && EDM97::ValidTuning(a.tuning) &&
+                EDM97::SameTuning(a.tuning, m_edm96.FrozenTuning()) :
+                EDM97::SameTuning(a.tuning, EDM97::Tuning{0.0, 0.0, 0.0}));
+        if (!scope) { TripEDM94(EDM94::Reason::Identity); return; }
+        if (!message.committed)
+        {
+            if (m_edm94HandoffPending || (m_edm94NextHandoffStep != 0U &&
+                (a.run != m_edm94Handoff.authorization.run || a.cache != m_edm94Handoff.authorization.cache)))
+            { TripEDM94(EDM94::Reason::Identity); return; }
+            m_edm94Handoff = message; m_edm94HandoffPending = true; m_edm94HandoffCommitted = false;
+            m_edm94HandoffStartedUs = m_edmZMonotonicUs;
+            m_edm94.BeginHandoffZero();
+        }
+        else
+        {
+            const auto& original = m_edm94Handoff; const auto& b = original.authorization;
+            if (!m_edm94HandoffPending || m_edm94HandoffCommitted || a.dispatch != b.dispatch ||
+                a.run != b.run || a.cache != b.cache || a.sourcePC != b.sourcePC ||
+                std::memcmp(a.increment.data(), b.increment.data(), sizeof(double) * 6U) != 0 ||
+                std::memcmp(&a.feedMMMin, &b.feedMMMin, sizeof(double)) != 0 ||
+                !a.lease.Matches(b.lease) || !EDM95::SamePermit(a.gapPermit, b.gapPermit) ||
+                a.gapSegment != b.gapSegment || a.proportional != b.proportional ||
+                a.noise != b.noise || a.burst != b.burst || a.continuous != b.continuous ||
+                a.endurance != b.endurance || a.paired != b.paired || a.flush != b.flush ||
+                !EDM97::SameTuning(a.tuning, b.tuning) ||
+                message.ownerWord != original.ownerWord ||
+                message.executionWord != original.executionWord || message.safetyWord != original.safetyWord ||
+                message.alarmSafetyWord != original.alarmSafetyWord || message.alarmRevision != original.alarmRevision ||
+                message.targetPulse != original.targetPulse || message.targetVelocity != original.targetVelocity ||
+                std::memcmp(message.gapSegmentStartPulse.data(), original.gapSegmentStartPulse.data(),
+                    sizeof(double) * 6U) != 0 ||
+                message.acceleration != original.acceleration || message.deceleration != original.deceleration ||
+                !message.command.IsAssigned() || message.command.epoch != message.nextEpoch ||
+                message.command.source != MotionCommandSource::NC_MEMORY || message.command.sourceBlockId != a.sourcePC)
+            { TripEDM94(EDM94::Reason::Identity); return; }
+            m_edm94Handoff.command = message.command; m_edm94HandoffCommitted = true;
+        }
+    }
+    if (!m_edm94HandoffPending)
+    {
+        if (observedEpoch != m_edm94ExpectedEpoch) TripEDM94(EDM94::Reason::Identity);
+        return;
+    }
+    if (!IsEDM94HandoffAuthorityCurrent()) { TripEDM94(EDM94::Reason::Identity); return; }
+    if (!m_edmZClockValid || m_edmZMonotonicUs < m_edm94HandoffStartedUs)
+    { TripEDM94(EDM94::Reason::Clock, EDM94::FaultSite::HandoffClock); return; }
+    if (m_edmZMonotonicUs - m_edm94HandoffStartedUs > 100000ULL)
+    { TripEDM94(EDM94::Reason::Clock, EDM94::FaultSite::HandoffDeadline); return; }
+    if (freshMotionFrame && m_edm94HandoffCommitted && m_edm94Frame.clockValid &&
+        m_edm94Frame.pdoValid && m_edm94Frame.sourceFresh && m_edm94Frame.healthy &&
+        m_edm94Frame.authorityCurrent && m_edm94Frame.identity.epoch == m_edm94Handoff.nextEpoch &&
+        m_executionEpochPublication.load(std::memory_order_acquire) ==
+            PackExecutionEpochPublication(m_edm94Handoff.nextEpoch, MotionCommandSource::NC_MEMORY, false, false) &&
+        IsEDM94HandoffCommandCurrent())
+    {
+        // GAP chooses a whole exact-stop segment only here, using this RT
+        // pass's qualified conversion. It never changes a running G1's path.
+        if (m_edm95Profile && !m_edm95.Accept(m_edm94Handoff.authorization.gapPermit,
+            m_edm94Handoff.nextEpoch, m_edm94Handoff.authorization.increment,
+            m_edm94Handoff.authorization.feedMMMin))
+        {
+            TripEDM94(EDM94::Reason::Source);
+            PublishEDM95Feedback();
+            return;
+        }
+        if (m_edm96Profile && !BeginEDM96Segment())
+        {
+            TripEDM94(EDM94::Reason::Source);
+            PublishEDM96Feedback();
+            return;
+        }
+        m_edm94ExpectedEpoch = m_edm94Handoff.nextEpoch;
+        m_edm94LastHandoffDispatch = m_edm94Handoff.authorization.dispatch;
+        ++m_edm94NextHandoffStep; m_edm94HandoffPending = false;
+        m_edm94.CompleteHandoffZero();
+        if (m_edm95Profile) PublishEDM95Feedback();
+        if (m_edm96Profile) PublishEDM96Feedback();
+    }
+}
+
+EDM94::Frame MotionCore::CaptureEDM94Frame(bool complete) noexcept
+{
+    EDM94::Frame frame{};
+    frame.tick = m_ncSettleRuntimeCycleTick;
+    frame.nowUs = m_edmZMonotonicUs;
+    frame.clockValid = m_edmZClockValid;
+    auto& admission = frame.admission;
+    admission.tick = frame.tick; admission.nowUs = frame.nowUs;
+    admission.inputMask = m_servoSourceInputMask;
+    frame.identity.session = m_edm94.Active() ? m_edm94.Current().identity.session :
+        m_edm94Claim.load(std::memory_order_acquire);
+    const std::uint64_t ownerWord = m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t execution = m_executionEpochPublication.load(std::memory_order_acquire);
+    const MotionOwnerLease lease = UnpackMotionOwnerState(ownerWord);
+    frame.identity.epoch = static_cast<std::uint64_t>(UnpackExecutionEpochPublication(execution));
+    frame.identity.ownerGeneration = static_cast<std::uint32_t>(lease.generation);
+    const MotionCommandSource commandSource = m_pendingCommandSource.load(std::memory_order_acquire);
+    admission.pendingSource = static_cast<std::int32_t>(commandSource);
+    const bool pendingSafety = HasPendingSafetyOrRecoveryRequests();
+    const bool unacknowledgedSafety = HasUnacknowledgedSafetyMotionRequest();
+    const bool alarmPresent = AlarmManager::GetInstance().HasAlarm();
+    admission.authorityFailures =
+        (lease.owner == MotionOwner::AUTO && lease.IsValid() ? 0U : EDM94::AdmissionAuthority_OWNER) |
+        (UnpackMotionOwnerSafetyHandshake(ownerWord) ? EDM94::AdmissionAuthority_HANDSHAKE : 0U) |
+        (UnpackMotionOwnerSafetyActionPending(ownerWord) ? EDM94::AdmissionAuthority_SAFETY_ACTION : 0U) |
+        ((ownerWord & MOTION_OWNER_ANY_OUTPUT_RESERVATION) ? EDM94::AdmissionAuthority_OUTPUT_RESERVED : 0U) |
+        ((execution & EXECUTION_EPOCH_PUBLICATION_PENDING) ? EDM94::AdmissionAuthority_EPOCH_PENDING : 0U) |
+        ((execution & EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) ? EDM94::AdmissionAuthority_EPOCH_RESERVED : 0U) |
+        (commandSource == MotionCommandSource::NC_MEMORY ? 0U : EDM94::AdmissionAuthority_COMMAND_SOURCE) |
+        (pendingSafety ? EDM94::AdmissionAuthority_PENDING_SAFETY : 0U) |
+        (unacknowledgedSafety ? EDM94::AdmissionAuthority_UNACKNOWLEDGED_SAFETY : 0U) |
+        (alarmPresent ? EDM94::AdmissionAuthority_ALARM : 0U);
+    frame.authorityCurrent = admission.authorityFailures == 0U;
+    const bool mapping = m_pContexts != nullptr && m_pDrives != nullptr &&
+        m_pContexts->size() == 6U && m_pDrives->size() == 6U;
+    frame.pdoValid = mapping && complete && m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid;
+    frame.sourceFresh = frame.pdoValid && m_ncSettleRuntimeCycleContiguous &&
+        (m_servoSourceInputMask & 0x3fU) == 0x3fU;
+    const bool groupActive = m_Group.isActive;
+    const bool groupQueueEmpty = m_Group.cmdQueue.empty();
+    const bool axisMailboxEmpty = m_axisCommandChannel.command_size() == 0U;
+    const bool holdSource = m_pathHold.sourceSeen;
+    const bool holdStart = m_pathHold.startPending;
+    const bool holdAdmission = m_pathHold.status.admissionPending;
+    frame.groupIdle = !groupActive && groupQueueEmpty && axisMailboxEmpty &&
+        !holdSource && !holdStart && !holdAdmission;
+    frame.allCommandZero = mapping;
+    const bool zFixture = m_edmZPolicy.Snapshot().capHeld;
+    const bool gapPhysical = m_edmGapPhysical.Active();
+    const bool physicalMotion = m_edmPhysicalMotion.Active();
+    const bool coordinatedSession = m_edmCoordinatedRT.RequiresMachineFrame();
+    frame.healthy = mapping && !zFixture && !gapPhysical && !physicalMotion && !coordinatedSession;
+    admission.sourceFailures =
+        (mapping ? 0U : EDM94::AdmissionSource_MAPPING) |
+        (complete ? 0U : EDM94::AdmissionSource_INCOMPLETE) |
+        (m_ncSettleRuntimeObserved ? 0U : EDM94::AdmissionSource_UNOBSERVED) |
+        (m_ncSettleRuntimeCycleValid ? 0U : EDM94::AdmissionSource_INVALID_PDO) |
+        (m_ncSettleRuntimeCycleContiguous ? 0U : EDM94::AdmissionSource_NONCONTIGUOUS) |
+        ((m_servoSourceInputMask & 0x3fU) == 0x3fU ? 0U : EDM94::AdmissionSource_MISSING_AXIS);
+    admission.groupFailures =
+        (groupActive ? EDM94::AdmissionGroup_ACTIVE : 0U) |
+        (groupQueueEmpty ? 0U : EDM94::AdmissionGroup_QUEUE) |
+        (axisMailboxEmpty ? 0U : EDM94::AdmissionGroup_AXIS_MAILBOX) |
+        (holdSource ? EDM94::AdmissionGroup_HOLD_SOURCE : 0U) |
+        (holdStart ? EDM94::AdmissionGroup_HOLD_START : 0U) |
+        (holdAdmission ? EDM94::AdmissionGroup_HOLD_ADMISSION : 0U);
+    admission.sharedHealthFailures =
+        (mapping ? 0U : EDM94::AdmissionSharedHealth_MAPPING) |
+        (zFixture ? EDM94::AdmissionSharedHealth_Z_FIXTURE : 0U) |
+        (gapPhysical ? EDM94::AdmissionSharedHealth_GAP_PHYSICAL : 0U) |
+        (physicalMotion ? EDM94::AdmissionSharedHealth_PHYSICAL_MOTION : 0U) |
+        (coordinatedSession ? EDM94::AdmissionSharedHealth_COORDINATED_SESSION : 0U);
+    if (m_Group.isActive)
+    {
+        const MotionCommand& command = m_Group.currentCmd;
+        bool supported = command.execution.source == MotionCommandSource::NC_MEMORY &&
+            command.mode == InterpolationMode::LINEAR && command.axisCount == 6 &&
+            command.pathCoreXYZCUVFeedExactStop &&
+            command.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+            m_Group.pathMode == PathMode::EXACT_STOP && m_Group.jumpManager.state == JumpState::IDLE;
+        for (std::size_t i = 0U; supported && i < 6U; ++i)
+            supported = command.axisIndices[i] == static_cast<int>(i) && m_Group.axisIndices[i] == static_cast<int>(i);
+        // A SAFETY stop retains the former group geometry; force-zero scopes
+        // still collect real feedback but never gain a new movement permit.
+        frame.healthy = frame.healthy && supported;
+        if (!supported) admission.sharedHealthFailures |= EDM94::AdmissionSharedHealth_GROUP_GEOMETRY;
+        if (!m_edm94.ForceZero())
+        {
+            const bool authorized = GetCommandAuthorizationFailure(command) == MotionRejectReason::NONE;
+            frame.authorityCurrent = frame.authorityCurrent && authorized;
+            if (!authorized) admission.authorityFailures |= EDM94::AdmissionAuthority_GROUP_AUTHORIZATION;
+        }
+    }
+    if (!mapping) return frame;
+    EDM94Serialized::Mapping observedMap{};
+    std::array<std::uint64_t, 64U> mapWords{};
+    mapWords[0] = reinterpret_cast<std::uintptr_t>(m_pStructuredServoReadShadowMaster);
+    mapWords[1] = 6U;
+    for (std::size_t i = 0U; i < 6U; ++i)
+    {
+        const AxisContext& axis = (*m_pContexts)[i];
+        const ENI_ServoDrive& drive = (*m_pDrives)[i];
+        if (IsIncomingPhysicalAxisReadyForGroup(axis)) frame.boundaryReadyMask |= 1U << static_cast<unsigned>(i);
+        auto& observed = frame.axis[i];
+        auto& config = m_edm94ObservedConfig.axis[i];
+        const double pulsePerUnit = std::isfinite(axis.resolution_PPR) && axis.resolution_PPR > 0.0 &&
+            std::isfinite(axis.finalLead) && axis.finalLead > 0.0 ? axis.resolution_PPR / axis.finalLead : 0.0;
+        config.pulsePerUnit = pulsePerUnit;
+        config.commandAnchor = axis.currentCmdPos;
+        config.actualAnchor = axis.currentActPos;
+        config.followingWindowPulse = (std::min)(axis.inPositionWindow_Pulse,
+            (std::min)(axis.pid.MaxLag, pulsePerUnit * (i < 3U ? 0.001 : 0.005)));
+        config.hardwareSign = axis.isReverse != axis.Axis_Reverse ? -1 : 1;
+        observed.commandPulse = axis.currentCmdPos;
+        observed.actualPulse = axis.currentActPos;
+        observed.followingErrorPulse = axis.currentCmdPos - axis.currentActPos;
+        observed.inPositionWindowPulse = config.followingWindowPulse;
+        observed.hardwareSign = config.hardwareSign;
+        observed.writable = drive.pOutput != nullptr && drive.pInput != nullptr;
+        auto& diagnostic = admission.axis[i];
+        diagnostic.commandVelocity = axis.currentCmdVel;
+        diagnostic.logicalVelocity = axis.logicalCmdVel;
+        diagnostic.targetVelocity = axis.targetVelocity;
+        diagnostic.followingError = observed.followingErrorPulse;
+        diagnostic.state = static_cast<std::int16_t>(axis.state);
+        diagnostic.statusWord = static_cast<std::uint16_t>(m_servoSourceStatusWord[i]);
+        diagnostic.mode = static_cast<std::int32_t>(m_servoSourceMode[i]);
+        if (axis.state != MotionState::MotionState_IDLE) admission.groupFailures |= EDM94::AdmissionGroup_AXIS_NOT_IDLE;
+        frame.groupIdle = frame.groupIdle && axis.state == MotionState::MotionState_IDLE;
+        frame.allCommandZero = frame.allCommandZero && axis.currentCmdVel == 0.0 &&
+            axis.logicalCmdVel == 0.0 && axis.targetVelocity == 0.0;
+        if (!(axis.axisIndex == static_cast<int>(i)))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_INDEX;
+        if (!(axis.isExist && !axis.isVirtualAxis))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_EXISTENCE;
+        if (!(axis.axisType == (i < 3U ? AxisType::LINEAR : AxisType::ROTARY)))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_TYPE;
+        if (!(axis.fbMode == FeedbackSource::MOTOR_ENCODER))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_FEEDBACK;
+        if (!(axis.startupLagMonitorArmed))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_STARTUP_LAG;
+        if (!(!axis.isFault && !axis.isLagAlarm))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_FAULT;
+        if (!(!axis.homeRuntime.active))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_HOME_ACTIVE;
+        if (!(axis.state != MotionState::MotionState_ERROR && axis.state != MotionState::MotionState_ESTOP &&
+            (axis.state == MotionState::MotionState_IDLE || (m_Group.isActive &&
+            (axis.state == MotionState::MotionState_INTERPOLATING || axis.state == MotionState::MotionState_STOPPING)))))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_STATE;
+        if (!(!axis.hardLimitPositive && !axis.hardLimitNegative && !axis.positiveTravelBlocked && !axis.negativeTravelBlocked))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_TRAVEL_BLOCK;
+        if (!(!axis.enablePitch && !axis.enableBacklash && axis.currentCompOffset_unit == 0.0))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_COMPENSATION;
+        if (!((m_servoSourceStatusWord[i] & 0x006fU) == 0x0027U))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_STATUS_WORD;
+        if (!(m_servoSourceMode[i] == 9))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_MODE;
+        if (!(std::isfinite(pulsePerUnit) && pulsePerUnit > 0.0))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_PULSE_CONVERSION;
+        if (!(std::isfinite(axis.inPositionWindow_Pulse) && axis.inPositionWindow_Pulse > 0.0))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_POSITION_WINDOW;
+        if (!(std::isfinite(axis.pid.MaxLag) && axis.pid.MaxLag > 0.0))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_MAX_LAG;
+        if (!(axis.pid.EnableLagCheck))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_LAG_DISABLED;
+        if (!(std::isfinite(axis.maxVel_PPS) && axis.maxVel_PPS >= 1.0))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_MAX_VELOCITY;
+        if (!(std::isfinite(axis.Pid_G00.Kp) && std::isfinite(axis.Pid_G00.Ki) && std::isfinite(axis.Pid_G00.Kd) && std::isfinite(axis.Pid_G00.Kvff)))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_G00_GAIN_FINITE;
+        if (!(std::isfinite(axis.Pid_IDLE.Kp) && std::isfinite(axis.Pid_IDLE.Ki) && std::isfinite(axis.Pid_IDLE.Kd) && std::isfinite(axis.Pid_IDLE.Kvff)))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_IDLE_GAIN_FINITE;
+        if (!(axis.Pid_G00.Kp > 0.0 && axis.Pid_G00.Ki >= 0.0 && axis.Pid_G00.Kd >= 0.0 && axis.Pid_G00.Kvff >= 0.0))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_G00_GAIN_SIGN;
+        if (!(axis.Pid_IDLE.Kp >= 0.0 && axis.Pid_IDLE.Ki >= 0.0 && axis.Pid_IDLE.Kd >= 0.0 && axis.Pid_IDLE.Kvff >= 0.0))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_IDLE_GAIN_SIGN;
+        if (!(std::isfinite(axis.pid.MaxIntegral) && axis.pid.MaxIntegral >= 0.0))
+            diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_MAX_INTEGRAL;
+        frame.healthy = frame.healthy && diagnostic.healthFailures == 0U;
+        if (!observed.writable) diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_WRITABLE;
+        std::array<std::uint64_t, 64U> words{};
+        std::size_t n = 0U;
+        const auto add = [&words, &n](double value) noexcept
+        { std::memcpy(&words[n++], &value, sizeof(value)); };
+        words[n++] = static_cast<std::uint64_t>(axis.axisIndex);
+        words[n++] = static_cast<std::uint64_t>(axis.axisType);
+        words[n++] = static_cast<std::uint64_t>(axis.fbMode);
+        words[n++] = static_cast<std::uint64_t>(axis.isExist) |
+            (static_cast<std::uint64_t>(axis.isVirtualAxis) << 1U) |
+            (static_cast<std::uint64_t>(axis.isReverse) << 2U) |
+            (static_cast<std::uint64_t>(axis.Axis_Reverse) << 3U) |
+            (static_cast<std::uint64_t>(axis.enablePitch) << 4U) |
+            (static_cast<std::uint64_t>(axis.enableBacklash) << 5U) |
+            (static_cast<std::uint64_t>(axis.isHomed) << 6U) |
+            (static_cast<std::uint64_t>(axis.useShortestPath) << 7U);
+        add(axis.resolution_PPR); add(axis.finalLead); add(axis.machineCoordinateOffsetPulse);
+        add(axis.currentCompOffset_unit); add(axis.rotaryModulo); add(axis.maxVel_PPS);
+        add(axis.feedrateOverride); add(axis.smoothTime_ms); add(axis.G00_acc_time);
+        add(axis.G00_dec_time); add(axis.Stop_dec_time); add(axis.inPositionWindow_Pulse);
+        add(axis.Pid_G00.Kp); add(axis.Pid_G00.Ki); add(axis.Pid_G00.Kd); add(axis.Pid_G00.Kvff);
+        add(axis.Pid_IDLE.Kp); add(axis.Pid_IDLE.Ki); add(axis.Pid_IDLE.Kd); add(axis.Pid_IDLE.Kvff);
+        add(axis.pid.MaxIntegral); add(axis.pid.MaxLag); words[n++] = axis.pid.EnableLagCheck ? 1U : 0U;
+        words[n++] = static_cast<std::uint64_t>(axis.velBuffer.size());
+        const bool enabled[3] = {axis.travelLimit1Enable, axis.travelLimit2Enable, axis.travelLimit3Enable};
+        const double low[3] = {axis.travelLimit1Negative_unit, axis.travelLimit2Negative_unit, axis.travelLimit3Negative_unit};
+        const double high[3] = {axis.travelLimit1Positive_unit, axis.travelLimit2Positive_unit, axis.travelLimit3Positive_unit};
+        for (std::size_t j = 0U; j < 3U; ++j)
+        {
+            words[n++] = enabled[j] ? 1U : 0U; add(low[j]); add(high[j]);
+            if (enabled[j])
+            {
+                const double commandUnits = observed.commandPulse / pulsePerUnit;
+                const double actualUnits = observed.actualPulse / pulsePerUnit;
+                const bool rangeHealthy = std::isfinite(low[j]) && std::isfinite(high[j]) &&
+                    low[j] < high[j] && std::isfinite(commandUnits) && std::isfinite(actualUnits) &&
+                    commandUnits >= low[j] && commandUnits <= high[j] && actualUnits >= low[j] && actualUnits <= high[j];
+                frame.healthy = frame.healthy && rangeHealthy;
+                if (!rangeHealthy) diagnostic.healthFailures |= EDM94::AdmissionAxisHealth_TRAVEL_RANGE;
+            }
+        }
+        observed.healthy = frame.healthy;
+        const auto stamp = m_edm94ConfigIdentity[i].Observe(words);
+        config.configFingerprint = observed.configFingerprint = stamp.Ready() ? stamp.generation : 0ULL;
+        observedMap.output[i] = reinterpret_cast<std::uintptr_t>(drive.pOutput);
+        observedMap.input[i] = reinterpret_cast<std::uintptr_t>(drive.pInput);
+        observedMap.slave[i] = drive.slaveIndex;
+        const double cap = std::floor((std::min)(axis.maxVel_PPS, pulsePerUnit * EDM94::NativeVelocityLimit(static_cast<unsigned>(i))));
+        observedMap.cap[i] = std::isfinite(cap) && cap >= 1.0 && cap <= 2147483647.0 ? static_cast<std::int32_t>(cap) : 0;
+        mapWords[2U+i*6U] = static_cast<std::uint64_t>(axis.axisIndex);
+        mapWords[3U+i*6U] = static_cast<std::uint64_t>(drive.slaveIndex);
+        mapWords[4U+i*6U] = observedMap.output[i]; mapWords[5U+i*6U] = observedMap.input[i];
+        mapWords[6U+i*6U] = drive.vendorId; mapWords[7U+i*6U] = drive.productCode;
+    }
+    const auto map = m_edm94MapIdentity.Observe(mapWords);
+    for (std::size_t i = 0U; i < 6U; ++i)
+        m_edm94ObservedConfig.axis[i].mappingFingerprint = frame.axis[i].mappingFingerprint = map.Ready() && map.generation <= (std::numeric_limits<std::uint64_t>::max)() / 8ULL ? map.generation * 8ULL + i + 1ULL : 0ULL;
+    const bool serializedMappingValid = EDM94Serialized::ValidMapping(observedMap);
+    frame.healthy = frame.healthy && serializedMappingValid;
+    if (!serializedMappingValid) admission.sharedHealthFailures |= EDM94::AdmissionSharedHealth_SERIALIZED_MAPPING;
+    if (m_edm94.ForceZero())
+    {
+        // Zero-only cancellation proof follows current safety/idle identity;
+        // it confers no authority to resume any AUTO command.
+        frame.authorityCurrent = frame.identity.epoch != 0ULL && frame.identity.ownerGeneration != 0U &&
+            !UnpackMotionOwnerSafetyHandshake(ownerWord) && !UnpackMotionOwnerSafetyActionPending(ownerWord) &&
+            (execution & EXECUTION_EPOCH_PUBLICATION_PENDING) == 0ULL;
+    }
+    const bool ownerUnchanged = m_motionOwnerState.load(std::memory_order_acquire) == ownerWord;
+    const bool epochUnchanged = m_executionEpochPublication.load(std::memory_order_acquire) == execution;
+    frame.authorityCurrent = frame.authorityCurrent && ownerUnchanged && epochUnchanged;
+    if (!ownerUnchanged) admission.authorityFailures |= EDM94::AdmissionAuthority_OWNER_CHANGED;
+    if (!epochUnchanged) admission.authorityFailures |= EDM94::AdmissionAuthority_EPOCH_CHANGED;
+    return frame;
+}
+
+void MotionCore::PublishEDM94Feedback() noexcept
+{
+    if (!m_edm94Feedback.Publish(m_edm94.Current()) && m_edm94.Active())
+    {
+        m_edm94.Fault(EDM94::Reason::Output);
+        EnsureEDM94FormalStop();
+        (void)ZeroAllServoTargetVelocityForFrame();
+    }
+}
+
+void MotionCore::TripEDM94(EDM94::Reason reason, EDM94::FaultSite site) noexcept
+{
+    if (!m_edm94.Active()) return;
+    m_edm94.Fault(reason, EDM94::AxisCount, site);
+    EnsureEDM94FormalStop();
+    (void)ZeroAllServoTargetVelocityForFrame();
+    PublishEDM94Feedback();
+}
+
+void MotionCore::EnsureEDM94FormalStop() noexcept
+{
+    if (!m_edm94.Active() || m_edm94FormalStopRequested) return;
+    m_edm94FormalStopRequested = true;
+    const ResetControlledStopPhase reset = GetResetControlledStopPhase();
+    const bool existingStop =
+        m_edm94ExternalStopSession.load(std::memory_order_acquire) >= m_edm94.Current().identity.session ||
+        reset == ResetControlledStopPhase::PENDING || reset == ResetControlledStopPhase::APPLYING ||
+        reset == ResetControlledStopPhase::ACTIVE || reset == ResetControlledStopPhase::COMPLETED ||
+        GetMotionOwnerLease().owner == MotionOwner::SAFETY || HasPendingSafetyOrRecoveryRequests();
+    if (!existingStop) RequestStopGroup();
+}
+
+void MotionCore::ObserveEDM94Cancellation() noexcept
+{
+    if (!m_edm94.Active()) return;
+    if (!m_edm94.Current().cancelled &&
+        m_edm94CancelSession.load(std::memory_order_acquire) >= m_edm94.Current().identity.session)
+    {
+        m_edm94.Cancel();
+        EnsureEDM94FormalStop();
+    }
+}
+
+double MotionCore::GuardEDM94Velocity(int axisIndex, double value) noexcept
+{
+    if (!m_edm94.Active()) return value;
+    ObserveEDM94Cancellation();
+    ObserveEDM94Handoff(false);
+    if (m_edm94.ForceZero() || m_edm94.HandoffZero()) return 0.0;
+    if (axisIndex < 0 || axisIndex >= 6 || !std::isfinite(value))
+    { TripEDM94(EDM94::Reason::Output); return 0.0; }
+    if (m_edm94.ForceZero()) return 0.0;
+    const double cap = static_cast<double>(m_edm94FrozenSerializedMapping.cap[static_cast<std::size_t>(axisIndex)]);
+    if (!std::isfinite(cap) || cap < 1.0 || cap > 2147483647.0)
+    { TripEDM94(EDM94::Reason::Output); return 0.0; }
+    m_edm94.ObserveVelocityRequest(static_cast<unsigned>(axisIndex), value, cap);
+    return (std::max)(-cap, (std::min)(cap, value));
+}
+
+bool MotionCore::GuardEDM94OutputImage() noexcept
+{
+    if (!m_edm94.Active()) return true;
+    ObserveEDM94Cancellation();
+    if (m_pDrives == nullptr || m_pContexts == nullptr ||
+        m_pDrives->size() != 6U || m_pContexts->size() != 6U)
+    { TripEDM94(EDM94::Reason::ConfigurationChanged); return false; }
+    bool exact = true;
+    for (std::size_t i = 0U; i < 6U; ++i)
+    {
+        ServoOutput* output = (*m_pDrives)[i].pOutput;
+        if (output == nullptr) { exact = false; continue; }
+        const double guarded = GuardEDM94Velocity(static_cast<int>(i), static_cast<double>(output->TargetVelocity));
+        if (guarded != static_cast<double>(output->TargetVelocity))
+            WriteServoTargetVelocityCommand(output, static_cast<int>(i), static_cast<std::int32_t>(guarded));
+        // The physical controller already applied hardware reversal exactly
+        // once. Convert back only for the pure expected-image recorder.
+        double logical = static_cast<double>(output->TargetVelocity) *
+            static_cast<double>(m_edm94.FrozenConfig().axis[i].hardwareSign);
+        if (!m_edm94.ForceZero() && !m_edm94.GuardVelocity(static_cast<unsigned>(i), logical)) exact = false;
+    }
+    if (!exact) TripEDM94(EDM94::Reason::ConfigurationChanged);
+    return exact;
+}
+
+bool MotionCore::EDM94ConfigurationCurrent() noexcept
+{
+    if (!m_edm94.Active()) return true;
+    const EDM94::Frame observed = CaptureEDM94Frame(false);
+    for (std::size_t i = 0U; i < 6U; ++i)
+        if (observed.axis[i].configFingerprint != m_edm94.FrozenConfig().axis[i].configFingerprint ||
+            observed.axis[i].mappingFingerprint != m_edm94.FrozenConfig().axis[i].mappingFingerprint ||
+            observed.axis[i].hardwareSign != m_edm94.FrozenConfig().axis[i].hardwareSign)
+            return false;
+    return true;
+}
+
+bool MotionCore::ValidateEDM94SendClock() noexcept
+{
+    if (!m_edm94.Active()) return true;
+    LARGE_INTEGER counter{};
+    const std::uint64_t maximum = (std::numeric_limits<std::uint64_t>::max)();
+    bool valid = m_edmZClockFrequency != 0ULL && RtQueryPerformanceCounter(&counter) && counter.QuadPart >= 0;
+    std::uint64_t nowUs = 0ULL;
+    if (valid)
+    {
+        const std::uint64_t current = static_cast<std::uint64_t>(counter.QuadPart);
+        const std::uint64_t whole = current / m_edmZClockFrequency;
+        const std::uint64_t fraction = current % m_edmZClockFrequency;
+        valid = current >= m_edm94ClockCounter && whole <= maximum / 1000000ULL && fraction <= maximum / 1000000ULL;
+        if (valid)
+        {
+            const std::uint64_t base = whole * 1000000ULL;
+            const std::uint64_t partial = fraction * 1000000ULL / m_edmZClockFrequency;
+            valid = partial <= maximum - base;
+            if (valid) { nowUs = base + partial; m_edm94ClockCounter = current; }
+        }
+    }
+    valid = valid && nowUs >= m_edm94Frame.nowUs && nowUs - m_edm94Frame.nowUs <= m_edm94.FrozenConfig().maxSourceGapUs;
+    if (!valid) TripEDM94(EDM94::Reason::Clock, EDM94::FaultSite::SendClock);
+    if (valid && m_edm95Profile && !m_edm94.ForceZero())
+    {
+        // The send clock is later than the source observer. Held conversion
+        // age is measured from its original capture, never from this pass.
+        const auto& gap = m_edm95.Current();
+        const bool sourceCurrent = gap.active && !gap.faulted && gap.session == m_edm94.Current().identity.session &&
+            gap.epoch == m_edm94ExpectedEpoch && gap.ownerGeneration == m_edm94.Current().identity.ownerGeneration &&
+            gap.tick == m_edm94Frame.tick && gap.nowUs == m_edm94Frame.nowUs &&
+            gap.sourceSequence != 0ULL && gap.sourceCapturedUs != 0ULL &&
+            nowUs >= gap.sourceCapturedUs && nowUs - gap.sourceCapturedUs <= EDM95::MaximumSourceAgeUs;
+        if (!sourceCurrent)
+        {
+            m_edm95.Fault(EDM95::Reason::Source);
+            TripEDM94(EDM94::Reason::Source, EDM94::FaultSite::SendClock);
+            PublishEDM95Feedback();
+            return false;
+        }
+    }
+    if (valid && (m_edm96Profile || m_edm104Profile || m_edm105Profile) && !m_edm94.ForceZero())
+    {
+        const auto& gap = m_edm96.Current();
+        const bool sourceCurrent = m_edm96Profile && gap.active && !gap.faulted && !m_edm95Profile &&
+            gap.session == m_edm94.Current().identity.session && gap.epoch == m_edm94ExpectedEpoch &&
+            gap.ownerGeneration == m_edm94.Current().identity.ownerGeneration &&
+            gap.tunedMode == m_edm97Profile && m_edm96.IsTuned() == m_edm97Profile &&
+            gap.noiseMode == m_edm98Profile && m_edm96.IsNoiseTuned() == m_edm98Profile &&
+            gap.burstMode == m_edm99Profile && m_edm96.IsBurstTuned() == m_edm99Profile &&
+            gap.continuousMode == m_edm100Profile && m_edm96.IsContinuousBurstTuned() == m_edm100Profile &&
+            gap.flushMode == m_edm105Profile && m_edm96.IsFlushBurstTuned() == m_edm105Profile &&
+            (!m_edm105Profile || (m_edm104Profile && EDM105::ValidTuning(gap.tuning))) &&
+            gap.pairedMode == m_edm104Profile && m_edm96.IsPairedBurstTuned() == m_edm104Profile &&
+            (!m_edm104Profile || (m_edm102Profile && m_edm100Profile && m_edm99Profile && m_edm97Profile &&
+                !m_edm98Profile && EDM104::ValidTuning(gap.tuning))) &&
+            gap.enduranceMode == m_edm102Profile && m_edm96.IsEnduranceBurstTuned() == m_edm102Profile &&
+            (!m_edm102Profile || (m_edm100Profile && m_edm99Profile && m_edm97Profile && !m_edm98Profile &&
+                EDM102::ValidTuning(gap.tuning))) &&
+            (!m_edm100Profile || (m_edm99Profile && m_edm97Profile && !m_edm98Profile &&
+                EDM100::ValidTuning(gap.tuning))) &&
+            (!m_edm99Profile || (m_edm97Profile && !m_edm98Profile && EDM99::ValidTuning(gap.tuning))) &&
+            (!m_edm98Profile || (m_edm97Profile && !m_edm99Profile && EDM98::ValidTuning(gap.tuning))) &&
+            (!m_edm97Profile || EDM97::SameTuning(gap.tuning, m_edm96.FrozenTuning())) &&
+            (!m_edm94HandoffCommitted ||
+                (EDM95::EmptyPermit(m_edm94Handoff.authorization.gapPermit) &&
+                    m_edm94Handoff.authorization.gapSegment == m_edm96Profile &&
+                    m_edm94Handoff.authorization.proportional == m_edm97Profile &&
+                    m_edm94Handoff.authorization.noise == m_edm98Profile &&
+                    m_edm94Handoff.authorization.burst == m_edm99Profile &&
+                    m_edm94Handoff.authorization.continuous == m_edm100Profile &&
+                    m_edm94Handoff.authorization.endurance == m_edm102Profile &&
+                    m_edm94Handoff.authorization.flush == m_edm105Profile &&
+                    m_edm94Handoff.authorization.paired == m_edm104Profile &&
+                    (!m_edm97Profile || EDM97::SameTuning(m_edm94Handoff.authorization.tuning,
+                        m_edm96.FrozenTuning())))) &&
+            gap.tick == m_edm94Frame.tick && gap.nowUs == m_edm94Frame.nowUs &&
+            gap.sourceSequence != 0ULL && gap.sourceCapturedUs != 0ULL &&
+            nowUs >= gap.sourceCapturedUs && nowUs - gap.sourceCapturedUs <= EDM96::MaximumSourceAgeUs;
+        if (!sourceCurrent)
+        {
+            m_edm96.Fault(EDM96::Reason::Source);
+            TripEDM94(EDM94::Reason::Source, EDM94::FaultSite::SendClock);
+            PublishEDM96Feedback();
+            return false;
+        }
+    }
+    return valid;
+}
+
+void MotionCore::PublishEDM96Feedback() noexcept
+{
+    if (!m_edm96Profile) return;
+    if (!m_edm96Feedback.Publish(m_edm96.Current()))
+    {
+        m_edm96.Fault(EDM96::Reason::Output);
+        TripEDM94(EDM94::Reason::Output);
+    }
+}
+
+void MotionCore::ServiceEDM96Source() noexcept
+{
+    if (!m_edm96Profile && !m_edm104Profile && !m_edm105Profile) return;
+    const std::uint64_t session = m_edm94.Current().identity.session;
+    if (!m_edm94.Active() || m_edm94.ForceZero() ||
+        m_edm94CancelSession.load(std::memory_order_acquire) >= session ||
+        m_edm94FinishSession.load(std::memory_order_acquire) >= session)
+    {
+        if (m_edm96.Current().active)
+        {
+            m_edm96.Stop();
+            PublishEDM96Feedback();
+        }
+        return;
+    }
+    if (!m_edm96Profile || m_edm96.IsFlushBurstTuned() != m_edm105Profile ||
+        m_edm96.Current().flushMode != m_edm105Profile ||
+        (m_edm105Profile && (!m_edm104Profile || !EDM105::ValidTuning(m_edm96.FrozenTuning()))) ||
+        m_edm96.IsPairedBurstTuned() != m_edm104Profile ||
+        m_edm96.Current().pairedMode != m_edm104Profile ||
+        (m_edm104Profile && (!m_edm102Profile || !m_edm100Profile || !m_edm99Profile || !m_edm97Profile ||
+            m_edm98Profile || m_edm95Profile || !m_edm96.IsContinuousBurstTuned() ||
+            !m_edm96.IsBurstTuned() || !m_edm96.IsTuned() || m_edm96.IsNoiseTuned() ||
+            !EDM104::ValidTuning(m_edm96.FrozenTuning()) ||
+            !EDM97::SameTuning(m_edm96.Current().tuning, m_edm96.FrozenTuning()))) ||
+        m_edm96.IsEnduranceBurstTuned() != m_edm102Profile ||
+        m_edm96.Current().enduranceMode != m_edm102Profile ||
+        (m_edm102Profile && (!m_edm100Profile || !m_edm99Profile || !m_edm97Profile || m_edm98Profile ||
+            m_edm95Profile || !EDM102::ValidTuning(m_edm96.FrozenTuning()))))
+    {
+        m_edm96.Fault(EDM96::Reason::Identity);
+        TripEDM94(EDM94::Reason::Identity);
+        PublishEDM96Feedback();
+        return;
+    }
+    // ObserveNCSettleRuntimeCycle obtains this pass's clock before planning.
+    // This is the sole source observer; physical/send checks retain its stamp.
+    if (!m_edm96.ObserveSource(m_ncSettleRuntimeCycleTick, m_edmZMonotonicUs,
+        m_edmZClockValid && m_ncSettleRuntimeCycleValid && m_ncSettleRuntimeCycleContiguous))
+        TripEDM94(EDM94::Reason::Source);
+    PublishEDM96Feedback();
+}
+
+bool MotionCore::BeginEDM96Segment() noexcept
+{
+    if (!m_edm96Profile || !m_edm94.Active() || m_edm94.ForceZero() ||
+        !m_edm94.HandoffZero() || !IsEDM94HandoffCommandCurrent()) return false;
+    const auto& h = m_edm94Handoff;
+    if (m_edm95Profile || !EDM95::EmptyPermit(h.authorization.gapPermit) ||
+        !h.authorization.gapSegment || h.authorization.proportional != m_edm97Profile ||
+        h.authorization.noise != m_edm98Profile || m_edm96.IsNoiseTuned() != m_edm98Profile ||
+        h.authorization.burst != m_edm99Profile || m_edm96.IsBurstTuned() != m_edm99Profile ||
+        h.authorization.continuous != m_edm100Profile || m_edm96.IsContinuousBurstTuned() != m_edm100Profile ||
+        h.authorization.flush != m_edm105Profile || m_edm96.IsFlushBurstTuned() != m_edm105Profile ||
+        m_edm96.Current().flushMode != m_edm105Profile ||
+        (m_edm105Profile && (!m_edm104Profile || !h.authorization.paired || !EDM105::ValidTuning(h.authorization.tuning))) ||
+        h.authorization.paired != m_edm104Profile || m_edm96.IsPairedBurstTuned() != m_edm104Profile ||
+        m_edm96.Current().pairedMode != m_edm104Profile ||
+        (m_edm104Profile && (!m_edm102Profile || !m_edm100Profile || !m_edm99Profile || !m_edm97Profile ||
+            m_edm98Profile || !EDM104::ValidTuning(h.authorization.tuning))) ||
+        h.authorization.endurance != m_edm102Profile || m_edm96.IsEnduranceBurstTuned() != m_edm102Profile ||
+        (m_edm102Profile && (!m_edm100Profile || !m_edm99Profile || !m_edm97Profile || m_edm98Profile ||
+            !EDM102::ValidTuning(h.authorization.tuning))) ||
+        (m_edm100Profile && (!m_edm99Profile || !m_edm97Profile || m_edm98Profile ||
+            !EDM100::ValidTuning(h.authorization.tuning))) ||
+        (m_edm99Profile && (!m_edm97Profile || m_edm98Profile || !EDM99::ValidTuning(h.authorization.tuning))) ||
+        (m_edm98Profile && (!m_edm97Profile || m_edm99Profile || !EDM98::ValidTuning(h.authorization.tuning))) ||
+        m_edm96.IsTuned() != m_edm97Profile ||
+        (m_edm97Profile ? !EDM97::ValidTuning(h.authorization.tuning) ||
+            !EDM97::SameTuning(h.authorization.tuning, m_edm96.FrozenTuning()) :
+            !EDM97::SameTuning(h.authorization.tuning, EDM97::Tuning{0.0, 0.0, 0.0})))
+    {
+        m_edm96.Fault(EDM96::Reason::Identity);
+        return false;
+    }
+    const AxisContext& v = m_Group.virtualAxis;
+    double length = 0.0;
+    bool valid = !m_Group.enableHistory && !m_Group.enableTransform &&
+        !m_pathHold.sourceSeen && !IsPathCoreHoldExcursionDriving() &&
+        m_Group.jumpManager.state == JumpState::IDLE && m_Group.feedrateOverride == 1.0 &&
+        v.isVirtualAxis && v.state == MotionState::MotionState_MOVING && !v.inPosition &&
+        !v.isFault && !v.isLagAlarm && v.currentCmdPos == 0.0 && v.planningPos == 0.0 &&
+        v.currentCmdVel == 0.0 && v.logicalCmdVel == 0.0 && v.targetEndVel == 0.0 &&
+        v.bufferSum == 0.0 && v.bufferIndex == 0 &&
+        std::all_of(v.velBuffer.begin(), v.velBuffer.end(), [](double value) { return value == 0.0; });
+    for (unsigned i = 0U; valid && i < 6U; ++i)
+    {
+        const double delta = h.targetPulse[i] - m_Group.startPos[i];
+        valid = std::isfinite(delta) && delta != 0.0 &&
+            NCRotaryFeedDetail::SameBits(m_Group.startPos[i], h.gapSegmentStartPulse[i]) &&
+            NCRotaryFeedDetail::SameBits(m_Group.currentCmd.mem_startPos[i], h.gapSegmentStartPulse[i]);
+        length = std::hypot(length, delta);
+    }
+    valid = valid && std::isfinite(length) && length > 0.0 && v.finalTargetPos == length &&
+        v.maxVel_PPS == h.targetVelocity && std::isfinite(v.acc_PPS2) && v.acc_PPS2 > 0.0 &&
+        std::isfinite(v.dec_PPS2) && v.dec_PPS2 > 0.0;
+    const double decTime = h.deceleration < 0.0 ? h.acceleration : h.deceleration;
+    valid = valid && v.acc_PPS2 == (h.acceleration < 0.0001 ? 1e10 : h.targetVelocity / h.acceleration) &&
+        v.dec_PPS2 == (decTime < 0.0001 ? 1e10 : h.targetVelocity / decTime);
+    for (unsigned i = 0U; valid && i < 6U; ++i)
+        valid = m_Group.ratio[i] == (h.targetPulse[i] - m_Group.startPos[i]) / length;
+    if (!valid)
+    {
+        m_edm96.Fault(EDM96::Reason::Geometry);
+        return false;
+    }
+    return m_edm96.BeginSegment(h.authorization.session, h.authorization.epoch,
+        h.authorization.lease.generation, h.authorization.step, h.nextEpoch,
+        h.authorization.increment, h.authorization.feedMMMin, length, v.maxVel_PPS,
+        v.acc_PPS2, v.dec_PPS2, m_ncSettleRuntimeCycleTick, m_edmZMonotonicUs);
+}
+
+bool MotionCore::StepEDM96Segment(AxisCommand& command) noexcept
+{
+    ObserveEDM94Cancellation();
+    ObserveEDM94Handoff(false);
+    AxisContext& v = m_Group.virtualAxis;
+    command.instantCmdPos = v.currentCmdPos;
+    command.instantCmdVel = 0.0;
+    if (m_edm94.ForceZero()) return true;
+    if (m_edm94.HandoffZero())
+    {
+        // The ordinary loader has started the exact command, but its new
+        // epoch still needs this pass's physical zero/identity handoff proof.
+        if (v.currentCmdPos == 0.0 && v.planningPos == 0.0 &&
+            v.currentCmdVel == 0.0 && v.logicalCmdVel == 0.0) return true;
+        m_edm96.Fault(EDM96::Reason::Geometry);
+        TripEDM94(EDM94::Reason::Identity);
+        PublishEDM96Feedback();
+        return false;
+    }
+    const auto& before = m_edm96.Current();
+    const auto& h = m_edm94Handoff;
+    const double decTime = h.deceleration < 0.0 ? h.acceleration : h.deceleration;
+    bool geometryCurrent = std::isfinite(before.length) && before.length > 0.0 &&
+        v.maxVel_PPS == h.targetVelocity &&
+        v.acc_PPS2 == (h.acceleration < 0.0001 ? 1e10 : h.targetVelocity / h.acceleration) &&
+        v.dec_PPS2 == (decTime < 0.0001 ? 1e10 : h.targetVelocity / decTime);
+    for (unsigned i = 0U; geometryCurrent && i < 6U; ++i)
+        geometryCurrent = NCRotaryFeedDetail::SameBits(m_Group.startPos[i], h.gapSegmentStartPulse[i]) &&
+            NCRotaryFeedDetail::SameBits(m_Group.currentCmd.mem_startPos[i], h.gapSegmentStartPulse[i]) &&
+            m_Group.ratio[i] == (h.targetPulse[i] - m_Group.startPos[i]) / before.length;
+    if (!m_edm96Profile || m_edm95Profile || !EDM95::EmptyPermit(h.authorization.gapPermit) ||
+        !m_edm94.Active() || !IsEDM94HandoffCommandCurrent() ||
+        !h.authorization.gapSegment || h.authorization.proportional != m_edm97Profile ||
+        h.authorization.noise != m_edm98Profile || before.noiseMode != m_edm98Profile ||
+        m_edm96.IsNoiseTuned() != m_edm98Profile ||
+        h.authorization.burst != m_edm99Profile || before.burstMode != m_edm99Profile ||
+        m_edm96.IsBurstTuned() != m_edm99Profile ||
+        h.authorization.continuous != m_edm100Profile || before.continuousMode != m_edm100Profile ||
+        m_edm96.IsContinuousBurstTuned() != m_edm100Profile ||
+        h.authorization.flush != m_edm105Profile || before.flushMode != m_edm105Profile ||
+        m_edm96.IsFlushBurstTuned() != m_edm105Profile ||
+        (m_edm105Profile && (!m_edm104Profile || !h.authorization.paired || !EDM105::ValidTuning(h.authorization.tuning))) ||
+        h.authorization.paired != m_edm104Profile || before.pairedMode != m_edm104Profile ||
+        m_edm96.IsPairedBurstTuned() != m_edm104Profile ||
+        (m_edm104Profile && (!m_edm102Profile || !m_edm100Profile || !m_edm99Profile || !m_edm97Profile ||
+            m_edm98Profile || !EDM104::ValidTuning(h.authorization.tuning))) ||
+        h.authorization.endurance != m_edm102Profile || before.enduranceMode != m_edm102Profile ||
+        m_edm96.IsEnduranceBurstTuned() != m_edm102Profile ||
+        (m_edm102Profile && (!m_edm100Profile || !m_edm99Profile || !m_edm97Profile || m_edm98Profile ||
+            !EDM102::ValidTuning(h.authorization.tuning))) ||
+        (m_edm100Profile && (!m_edm99Profile || !m_edm97Profile || m_edm98Profile ||
+            !EDM100::ValidTuning(h.authorization.tuning))) ||
+        (m_edm99Profile && (!m_edm97Profile || m_edm98Profile || !EDM99::ValidTuning(h.authorization.tuning))) ||
+        (m_edm98Profile && (!m_edm97Profile || m_edm99Profile || !EDM98::ValidTuning(h.authorization.tuning))) ||
+        before.tunedMode != m_edm97Profile || m_edm96.IsTuned() != m_edm97Profile ||
+        (m_edm97Profile ? !EDM97::ValidTuning(h.authorization.tuning) ||
+            !EDM97::SameTuning(h.authorization.tuning, m_edm96.FrozenTuning()) ||
+            !EDM97::SameTuning(before.tuning, m_edm96.FrozenTuning()) :
+            !EDM97::SameTuning(h.authorization.tuning, EDM97::Tuning{0.0, 0.0, 0.0})) ||
+        !geometryCurrent ||
+        !before.active || before.faulted || before.session != m_edm94.Current().identity.session ||
+        before.epoch != m_edm94ExpectedEpoch || before.epoch != GetCurrentExecutionEpoch() ||
+        before.ownerGeneration != m_edm94.Current().identity.ownerGeneration ||
+        before.tick != m_ncSettleRuntimeCycleTick || before.nowUs != m_edmZMonotonicUs ||
+        m_Group.feedrateOverride != 1.0 || m_Group.enableHistory || m_Group.enableTransform ||
+        m_Group.jumpManager.state != JumpState::IDLE || m_pathHold.sourceSeen ||
+        IsPathCoreHoldExcursionDriving() || !m_ncSettleRuntimeCycleValid ||
+        !m_ncSettleRuntimeCycleContiguous || !m_edmZClockValid ||
+        v.bufferSum != 0.0 || v.bufferIndex != 0 || v.finalTargetPos != before.length ||
+        v.currentCmdPos != before.q || v.planningPos != before.q || v.currentCmdVel != before.v)
+    {
+        m_edm96.Fault(EDM96::Reason::Identity);
+        TripEDM94(EDM94::Reason::Identity);
+        PublishEDM96Feedback();
+        return false;
+    }
+    if (before.segmentCompleted)
+    {
+        if (before.q != before.length || before.v != 0.0)
+        {
+            m_edm96.Fault(EDM96::Reason::Geometry);
+            TripEDM94(EDM94::Reason::Identity);
+            PublishEDM96Feedback();
+            return false;
+        }
+        command.instantCmdPos = before.q;
+        return true;
+    }
+    LifecycleCommitReservationGuard scalarCommit(*this, m_Group.currentCmd.execution);
+    if (!scalarCommit.IsAcquired() || HasPendingSafetyOrRecoveryRequests() ||
+        GetCommandAuthorizationFailure(m_Group.currentCmd) != MotionRejectReason::NONE) return false;
+    if (!m_edm96.Step(m_ncSettleRuntimeCycleTick, m_edmZMonotonicUs))
+    {
+        scalarCommit.Release();
+        m_edm96.Fault(EDM96::Reason::Source);
+        TripEDM94(EDM94::Reason::Source);
+        PublishEDM96Feedback();
+        return false;
+    }
+    const auto& after = m_edm96.Current();
+    if (HasPendingSafetyOrRecoveryRequests() ||
+        GetCommandAuthorizationFailure(m_Group.currentCmd) != MotionRejectReason::NONE) return false;
+    // Preserve the immutable loaded geometry. Only this scalar is replaced;
+    // common LINEAR distribution, mechanical compensation and PI remain live.
+    v.currentCmdPos = v.planningPos = after.q;
+    v.currentCmdVel = v.logicalCmdVel = after.v;
+    v.targetVelocity = 0.0;
+    v.state = after.segmentCompleted ? MotionState::MotionState_IDLE : MotionState::MotionState_MOVING;
+    v.inPosition = after.segmentCompleted;
+    command.instantCmdPos = after.q;
+    command.instantCmdVel = after.v;
+    PublishEDM96Feedback();
+    return true;
+}
+
+void MotionCore::PublishEDM95Feedback() noexcept
+{
+    if (!m_edm95Profile) return;
+    if (!m_edm95Feedback.Publish(m_edm95.Current()))
+    {
+        m_edm95.Fault();
+        TripEDM94(EDM94::Reason::Output);
+    }
+}
+
+void MotionCore::ServiceEDM95Boundary(bool complete) noexcept
+{
+    if (!m_edm95Profile) return;
+    const std::uint64_t session = m_edm94.Current().identity.session;
+    if (!m_edm94.Active() || m_edm94.ForceZero() ||
+        m_edm94CancelSession.load(std::memory_order_acquire) >= session)
+    {
+        m_edm95.Stop();
+        PublishEDM95Feedback();
+        return;
+    }
+    // Exactly one conversion/held-read observation per complete Motion pass.
+    // The per-axis and send guards must never advance this source clock.
+    const auto& guard = m_edm94.Current();
+    bool offerAllowed = guard.boundaryReadyCycles >= EDM94::BoundaryReadyCycles &&
+        guard.boundaryNotReadyMask == 0U && !m_edm94.HandoffZero() &&
+        m_edm94Frame.healthy && m_edm94Frame.authorityCurrent &&
+        m_edm94Frame.groupIdle && m_edm94Frame.allCommandZero &&
+        m_edm94Frame.boundaryReadyMask == EDM94::AllAxes &&
+        m_edm94Frame.identity.epoch == m_edm94ExpectedEpoch;
+    for (unsigned i = 0U; offerAllowed && i < EDM94::AxisCount; ++i)
+        offerAllowed = std::isfinite(m_edm94Frame.axis[i].followingErrorPulse) &&
+            std::fabs(m_edm94Frame.axis[i].followingErrorPulse) <=
+                m_edm94.FrozenConfig().axis[i].followingWindowPulse;
+    if (!m_edm95.Observe(m_edm94Frame.tick, m_edm94Frame.nowUs,
+        complete && m_edm94Frame.clockValid && m_edm94Frame.pdoValid && m_edm94Frame.sourceFresh,
+        offerAllowed))
+        TripEDM94(EDM94::Reason::Source);
+    PublishEDM95Feedback();
+}
+
+void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
+{
+    if (!m_edm94.Active() && m_edm94Claim.load(std::memory_order_acquire) == 0ULL) return;
+    ObserveEDM94Cancellation();
+    m_edm94Frame = CaptureEDM94Frame(complete);
+    EDM94ArmRequest arm{};
+    if (!m_edm94.Active() && m_edm94ArmRequests.ConsumerTryPop(arm))
+    {
+        if ((arm.gapBoundary && arm.gapSegment) ||
+            (arm.flush && (!arm.paired || !arm.endurance || !arm.continuous || !arm.burst || !arm.proportional ||
+                !arm.gapSegment || arm.gapBoundary || arm.noise || !EDM105::ValidTuning(arm.tuning))) ||
+            (arm.paired && (!arm.endurance || !arm.continuous || !arm.burst || !arm.proportional ||
+                !arm.gapSegment || arm.gapBoundary || arm.noise || !EDM104::ValidTuning(arm.tuning))) ||
+            (arm.endurance && (!arm.continuous || !arm.burst || !arm.proportional || !arm.gapSegment ||
+                arm.gapBoundary || arm.noise || !EDM102::ValidTuning(arm.tuning))) ||
+            (arm.continuous && (!arm.burst || !arm.proportional || !arm.gapSegment ||
+                arm.gapBoundary || arm.noise || !EDM100::ValidTuning(arm.tuning))) ||
+            (arm.burst && (!arm.proportional || !arm.gapSegment || arm.gapBoundary ||
+                arm.noise || !EDM99::ValidTuning(arm.tuning))) ||
+            (arm.noise && (!arm.proportional || !arm.gapSegment || arm.burst || !EDM98::ValidTuning(arm.tuning))) ||
+            (arm.proportional ? !arm.gapSegment || arm.gapBoundary || !EDM97::ValidTuning(arm.tuning) :
+                !EDM97::SameTuning(arm.tuning, EDM97::Tuning{0.0, 0.0, 0.0})))
+        {
+            m_edm94Claim.store(0ULL, std::memory_order_release);
+            return; // One arm request can select only one GAP execution profile.
+        }
+        EDM94::Identity identity{};
+        identity.session = arm.session; identity.epoch = static_cast<std::uint64_t>(arm.epoch);
+        identity.ownerGeneration = static_cast<std::uint32_t>(arm.lease.generation);
+        const bool requestSessionNew = arm.session > m_edm94LastSession;
+        const bool requestEpochCurrent = arm.epoch == GetCurrentExecutionEpoch();
+        const bool requestLeaseCurrent = IsMotionOwnerLeaseCurrent(arm.lease);
+        const bool requestNotCancelled = m_edm94CancelSession.load(std::memory_order_acquire) < arm.session;
+        m_edm94Frame.admission.requestFailures =
+            (requestSessionNew ? 0U : EDM94::AdmissionRequest_SESSION_REUSED) |
+            (requestEpochCurrent ? 0U : EDM94::AdmissionRequest_EPOCH_CHANGED) |
+            (requestLeaseCurrent ? 0U : EDM94::AdmissionRequest_LEASE_CHANGED) |
+            (requestNotCancelled ? 0U : EDM94::AdmissionRequest_CANCELLED);
+        m_edm94Frame.authorityCurrent = m_edm94Frame.authorityCurrent &&
+            m_edm94Frame.admission.requestFailures == 0U;
+        if (arm.session > m_edm94LastSession) m_edm94LastSession = arm.session;
+        m_edm94FormalStopRequested = false;
+        if (m_edm94.Arm(identity, m_edm94ObservedConfig, m_edm94Frame))
+        {
+            m_edm94ExpectedEpoch = arm.epoch;
+            m_edm94HandoffPending = m_edm94HandoffCommitted = false;
+            m_edm94HandoffStartedUs = m_edm94LastHandoffDispatch = 0ULL;
+            m_edm94NextHandoffStep = 0U;
+            m_edm94ArmUs = m_edm94Frame.nowUs;
+            m_edm94ClockCounter = m_edmZClockCounter;
+            m_edm94ResetFloor = m_ncResetRebaseAckProducer.requestSequence;
+            for (std::size_t i = 0U; i < 6U; ++i)
+            {
+                m_edm94FrozenOutput[i] = (*m_pDrives)[i].pOutput;
+                m_edm94FrozenInput[i] = (*m_pDrives)[i].pInput;
+                m_edm94FrozenSerializedMapping.output[i] = reinterpret_cast<std::uintptr_t>(m_edm94FrozenOutput[i]);
+                m_edm94FrozenSerializedMapping.input[i] = reinterpret_cast<std::uintptr_t>(m_edm94FrozenInput[i]);
+                m_edm94FrozenSerializedMapping.slave[i] = (*m_pDrives)[i].slaveIndex;
+                m_edm94FrozenSerializedMapping.cap[i] = static_cast<std::int32_t>(std::floor(
+                    (std::min)((*m_pContexts)[i].maxVel_PPS,
+                        m_edm94.FrozenConfig().axis[i].pulsePerUnit * EDM94::NativeVelocityLimit(static_cast<unsigned>(i)))));
+            }
+            m_edm95Profile = arm.gapBoundary;
+            m_edm95.Stop();
+            m_edm96Profile = arm.gapSegment;
+            m_edm97Profile = arm.proportional;
+            m_edm98Profile = arm.noise;
+            m_edm99Profile = arm.burst;
+            m_edm100Profile = arm.continuous;
+            m_edm102Profile = arm.endurance;
+            m_edm104Profile = arm.paired;
+            m_edm105Profile = arm.flush;
+            m_edm96.Stop();
+            if (m_edm95Profile)
+            {
+                if (!m_edm95.Begin(arm.session, arm.epoch, arm.lease.generation,
+                    m_edm94Frame.tick, m_edm94Frame.nowUs))
+                    TripEDM94(EDM94::Reason::Source);
+                PublishEDM95Feedback();
+            }
+            if (m_edm96Profile)
+            {
+                const bool began = m_edm105Profile ?
+                    m_edm96.BeginFlushBurstTuned(arm.session, arm.epoch, arm.lease.generation,
+                        m_edm94Frame.tick, m_edm94Frame.nowUs, arm.tuning) : m_edm104Profile ?
+                    m_edm96.BeginPairedBurstTuned(arm.session, arm.epoch, arm.lease.generation,
+                        m_edm94Frame.tick, m_edm94Frame.nowUs, arm.tuning) : m_edm102Profile ?
+                    m_edm96.BeginEnduranceBurstTuned(arm.session, arm.epoch, arm.lease.generation,
+                        m_edm94Frame.tick, m_edm94Frame.nowUs, arm.tuning) : m_edm100Profile ?
+                    m_edm96.BeginContinuousBurstTuned(arm.session, arm.epoch, arm.lease.generation,
+                        m_edm94Frame.tick, m_edm94Frame.nowUs, arm.tuning) : m_edm99Profile ?
+                    m_edm96.BeginBurstTuned(arm.session, arm.epoch, arm.lease.generation,
+                        m_edm94Frame.tick, m_edm94Frame.nowUs, arm.tuning) : m_edm98Profile ?
+                    m_edm96.BeginNoiseTuned(arm.session, arm.epoch, arm.lease.generation,
+                        m_edm94Frame.tick, m_edm94Frame.nowUs, arm.tuning) : m_edm97Profile ?
+                    m_edm96.BeginTuned(arm.session, arm.epoch, arm.lease.generation,
+                        m_edm94Frame.tick, m_edm94Frame.nowUs, arm.tuning) :
+                    m_edm96.Begin(arm.session, arm.epoch, arm.lease.generation,
+                        m_edm94Frame.tick, m_edm94Frame.nowUs);
+                if (!began)
+                    TripEDM94(EDM94::Reason::Source);
+                PublishEDM96Feedback();
+            }
+        }
+        else m_edm94Claim.store(0ULL, std::memory_order_release);
+        (void)GuardEDM94OutputImage();
+        PublishEDM94Feedback();
+        return;
+    }
+    ObserveEDM94Cancellation();
+    if (!m_edm94.Active()) return;
+    const std::uint64_t session = m_edm94.Current().identity.session;
+    ServiceEDM95Boundary(complete);
+    ObserveEDM94Handoff(true);
+    if (m_edm94FinishSession.load(std::memory_order_acquire) >= session) m_edm94.Finish();
+    if (!m_edm94.ForceZero() && !m_edm94.HandoffZero() && (!m_edm94Frame.authorityCurrent ||
+        m_edm94Frame.identity.ownerGeneration != m_edm94.Current().identity.ownerGeneration))
+    {
+        m_edm94.Cancel();
+        EnsureEDM94FormalStop();
+        m_edm94Frame = CaptureEDM94Frame(complete);
+    }
+    // FIX13: release is evaluated only after this frame's sealed zero image
+    // has a successful receipt. Tick first incorporates its fresh encoder
+    // sample into the existing all-six-axis bounded-range stop candidate.
+    m_edm94.Tick(m_edm94Frame);
+    if (m_edm94.Current().faulted) EnsureEDM94FormalStop();
+    if (m_edm96Profile && m_edm94.ForceZero() && m_edm96.Current().active)
+    {
+        m_edm96.Stop();
+        PublishEDM96Feedback();
+    }
+    if (m_edm94.Active() && !m_edm94.ForceZero() &&
+        (m_edm94Frame.nowUs < m_edm94ArmUs || m_edm94Frame.nowUs - m_edm94ArmUs > EDM94::MaximumDurationUs))
+        TripEDM94(EDM94::Reason::Clock, EDM94::FaultSite::SessionClock);
+    (void)GuardEDM94OutputImage();
+    PublishEDM94Feedback();
+}
+
+// EDM90: this observer runs after every selected axis consumed the current
+// PDO feedback. It publishes only to the numerical preview session. No axis,
+// planner, PID, servo command, output image or discharge field is modified.
+void MotionCore::ObserveEDMMultiAxisMachineRuntime(bool complete) noexcept
+{
+    if (!m_edmCoordinatedRT.RequiresMachineFrame()) return;
+    EDM90::MachineSnapshot frame{};
+    EDM93::ControlSnapshot controller{};
+    EDM84RT::Facts facts{};
+    facts.tick = frame.tick = m_ncSettleRuntimeCycleTick;
+    controller.tick = facts.tick;
+    facts.nowUs = frame.nowUs = m_edmZMonotonicUs;
+    facts.clockValid = m_edmZClockValid;
+    facts.contiguous = m_ncSettleRuntimeCycleContiguous;
+    const bool mappingComplete = m_pContexts != nullptr && m_pDrives != nullptr &&
+        m_pContexts->size() == 6U && m_pDrives->size() == 6U;
+    facts.pdoValid = complete && mappingComplete && m_ncSettleRuntimeObserved &&
+        m_ncSettleRuntimeCycleValid && (m_servoSourceInputMask & 0x3fU) == 0x3fU;
+
+    const std::uint64_t ownerState = m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t execution = m_executionEpochPublication.load(std::memory_order_acquire);
+    const std::uint64_t safety = m_frameSafetyIntentState.load(std::memory_order_acquire);
+    const MotionOwnerLease lease = UnpackMotionOwnerState(ownerState);
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    const std::uint64_t alarmIntent = alarms.GetMotionSafetyIntentState();
+    const std::uint32_t alarmUpdate = alarms.GetUpdateCount();
+    facts.executionEpoch = frame.executionEpoch =
+        static_cast<std::uint64_t>(UnpackExecutionEpochPublication(execution));
+    facts.ownerLease = frame.ownerLease = (static_cast<std::uint64_t>(lease.owner) << 32U) |
+        static_cast<std::uint64_t>(lease.generation);
+    const bool authorityEntry = lease.IsValid() && lease.owner == MotionOwner::AUTO &&
+        facts.executionEpoch != static_cast<std::uint64_t>(MOTION_EXECUTION_EPOCH_INVALID) &&
+        !UnpackMotionOwnerSafetyHandshake(ownerState) &&
+        !UnpackMotionOwnerSafetyActionPending(ownerState) &&
+        (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL &&
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) ==
+            m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire) &&
+        (execution & (EXECUTION_EPOCH_PUBLICATION_PENDING |
+            EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL &&
+        static_cast<std::uint32_t>(safety) == 0U &&
+        static_cast<std::uint32_t>(AlarmManager::MotionAdmissionBaseState(alarmIntent)) == 0U &&
+        !HasPendingSafetyOrRecoveryRequests() && !alarms.HasAlarm();
+    frame.current = facts.pdoValid && facts.clockValid && facts.contiguous;
+    frame.axisCount = mappingComplete ? 6U : 0U;
+    frame.groupQuiet = !m_Group.isActive && m_Group.cmdQueue.empty() &&
+        !m_pathHold.sourceSeen && !m_pathHold.startPending && !m_pathHold.status.admissionPending;
+    frame.mailboxQuiet = m_axisCommandChannel.command_size() == 0U;
+    frame.otherEDMQuiet = !m_edmZPolicy.Snapshot().capHeld &&
+        !m_edmGapPhysical.Active() && !m_edmPhysicalMotion.Active();
+
+    std::array<std::uint64_t, 64U> map{};
+    // EDM93 owns a separate admission contract. These extra facts do not
+    // narrow the legacy numerical-preview profiles' machine readiness.
+    controller.uniqueMapping = mappingComplete;
+    std::array<std::uintptr_t, 12U> rangeBegin{}, rangeEnd{};
+    if (mappingComplete)
+    {
+        map[0] = 6U;
+        map[1] = reinterpret_cast<std::uintptr_t>(m_pStructuredServoReadShadowMaster);
+        for (std::size_t i = 0U; i < 6U; ++i)
+        {
+            const AxisContext& axis = (*m_pContexts)[i];
+            const auto& drive = (*m_pDrives)[i];
+            auto& out = frame.axes[i];
+            auto& control = controller.axes[i];
+            control.gains.kp = axis.Pid_G00.Kp;
+            control.gains.ki = axis.Pid_G00.Ki;
+            control.gains.kd = axis.Pid_G00.Kd;
+            control.gains.kvff = axis.Pid_G00.Kvff;
+            control.gains.maxIntegral = axis.pid.MaxIntegral;
+            control.maxLag = axis.pid.MaxLag;
+            control.enableLagCheck = axis.pid.EnableLagCheck;
+            control.motorEncoder = axis.fbMode == FeedbackSource::MOTOR_ENCODER;
+
+            // Check whole native ranges, including input/output cross-aliases.
+            // Merely hashing pointer identities cannot reject overlapping PDOs.
+            rangeBegin[i * 2U] = reinterpret_cast<std::uintptr_t>(drive.pOutput);
+            rangeBegin[i * 2U + 1U] = reinterpret_cast<std::uintptr_t>(drive.pInput);
+            const std::size_t sizes[2] = {sizeof(ServoOutput), sizeof(ServoInput)};
+            if (drive.slaveIndex < 0) controller.uniqueMapping = false;
+            for (unsigned k = 0U; k < 2U; ++k)
+            {
+                const std::size_t index = i * 2U + k;
+                const auto address = rangeBegin[index];
+                if (!address || address > (std::numeric_limits<std::uintptr_t>::max)() - sizes[k])
+                { controller.uniqueMapping = false; continue; }
+                rangeEnd[index] = address + sizes[k];
+                for (std::size_t prior = 0U; prior < index; ++prior)
+                    if (rangeEnd[prior] && address < rangeEnd[prior] && rangeBegin[prior] < rangeEnd[index])
+                        controller.uniqueMapping = false;
+            }
+            for (std::size_t prior = 0U; prior < i; ++prior)
+                if ((*m_pDrives)[prior].slaveIndex == drive.slaveIndex)
+                    controller.uniqueMapping = false;
+            out.axisId = static_cast<unsigned>(axis.axisIndex);
+            out.exists = axis.isExist;
+            out.rotary = axis.axisType == AxisType::ROTARY;
+            out.virtualAxis = axis.isVirtualAxis;
+            out.servoReady = axis.startupLagMonitorArmed &&
+                (m_servoSourceStatusWord[i] & 0x006fU) == 0x0027U && m_servoSourceMode[i] == 9;
+            out.idle = axis.state == MotionState::MotionState_IDLE;
+            out.fault = axis.isFault || axis.isLagAlarm ||
+                (m_servoSourceStatusWord[i] & 0x0008U) != 0U ||
+                axis.state == MotionState::MotionState_ERROR || axis.state == MotionState::MotionState_ESTOP;
+            out.hardLimit = axis.hardLimitPositive || axis.hardLimitNegative ||
+                axis.positiveTravelBlocked || axis.negativeTravelBlocked;
+            out.noCompensation = !axis.enablePitch && !axis.enableBacklash && axis.currentCompOffset_unit == 0.0;
+            out.hardwareSign = axis.isReverse != axis.Axis_Reverse ? -1 : 1;
+            out.pulsesPerUnit = (std::isfinite(axis.resolution_PPR) && axis.resolution_PPR > 0.0 &&
+                std::isfinite(axis.finalLead) && axis.finalLead > 0.0) ? axis.resolution_PPR / axis.finalLead : 0.0;
+            out.anchorNativePulse = axis.currentCmdPos;
+            out.actualNativePulse = axis.currentActPos;
+            out.commandVelocityPps = axis.currentCmdVel;
+            out.logicalVelocityPps = axis.logicalCmdVel;
+            out.targetVelocityPps = axis.targetVelocity;
+            out.referenceOffsetPulse = axis.machineCoordinateOffsetPulse;
+            out.maxVelocityUnitsPerMin = out.pulsesPerUnit > 0.0 ?
+                axis.maxVel_PPS / out.pulsesPerUnit * 60.0 : 0.0;
+            out.minNativePulse = -(std::numeric_limits<double>::max)();
+            out.maxNativePulse = (std::numeric_limits<double>::max)();
+            const bool enabled[3] = {axis.travelLimit1Enable,axis.travelLimit2Enable,axis.travelLimit3Enable};
+            const double low[3] = {axis.travelLimit1Negative_unit,axis.travelLimit2Negative_unit,axis.travelLimit3Negative_unit};
+            const double high[3] = {axis.travelLimit1Positive_unit,axis.travelLimit2Positive_unit,axis.travelLimit3Positive_unit};
+            for (unsigned j = 0U; j < 3U; ++j)
+            {
+                if (!enabled[j]) continue;
+                // Conservative preflight checks every configured range, even
+                // when G23 disables the first runtime range. It grants no permit.
+                const double nativeLow = low[j] * out.pulsesPerUnit;
+                const double nativeHigh = high[j] * out.pulsesPerUnit;
+                if (!std::isfinite(low[j]) || !std::isfinite(high[j]) || low[j] >= high[j] ||
+                    !std::isfinite(nativeLow) || !std::isfinite(nativeHigh) || nativeLow >= nativeHigh)
+                { frame.current = false; continue; }
+                out.hasMinLimit = out.hasMaxLimit = true;
+                if (nativeLow > out.minNativePulse) out.minNativePulse = nativeLow;
+                if (nativeHigh < out.maxNativePulse) out.maxNativePulse = nativeHigh;
+            }
+            if (out.minNativePulse > out.maxNativePulse || axis.axisIndex != static_cast<int>(i) ||
+                axis.axisType != (i < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
+                drive.pOutput == nullptr || drive.pInput == nullptr) frame.current = false;
+
+            // Identity excludes live position/velocity. Exact configuration
+            // words include native conversion, direction, all limit groups,
+            // controller gains and coordinate reference; returning to an old
+            // configuration still advances the generation.
+            std::array<std::uint64_t, 64U> config{};
+            std::size_t word = 0U;
+            const auto addDouble = [&config, &word](double value) noexcept
+            { std::memcpy(&config[word++], &value, sizeof(value)); };
+            config[word++] = static_cast<std::uint64_t>(axis.axisIndex);
+            config[word++] = static_cast<std::uint64_t>(axis.axisType);
+            config[word++] = static_cast<std::uint64_t>(axis.fbMode);
+            config[word++] = static_cast<std::uint64_t>(axis.isExist) |
+                (static_cast<std::uint64_t>(axis.isVirtualAxis) << 1U) |
+                (static_cast<std::uint64_t>(axis.isReverse) << 2U) |
+                (static_cast<std::uint64_t>(axis.Axis_Reverse) << 3U) |
+                (static_cast<std::uint64_t>(axis.enablePitch) << 4U) |
+                (static_cast<std::uint64_t>(axis.enableBacklash) << 5U) |
+                (static_cast<std::uint64_t>(axis.isHomed) << 6U) |
+                (static_cast<std::uint64_t>(axis.useShortestPath) << 7U);
+            addDouble(axis.resolution_PPR); addDouble(axis.finalLead); addDouble(axis.machineCoordinateOffsetPulse);
+            addDouble(axis.maxVel_PPS); addDouble(axis.feedrateOverride); addDouble(axis.smoothTime_ms);
+            addDouble(axis.currentCompOffset_unit); addDouble(axis.rotaryModulo);
+            addDouble(axis.G00_acc_time); addDouble(axis.G00_dec_time); addDouble(axis.Stop_dec_time);
+            config[word++] = static_cast<std::uint64_t>(axis.velBuffer.size());
+            addDouble(axis.Pid_IDLE.Kp); addDouble(axis.Pid_IDLE.Ki); addDouble(axis.Pid_IDLE.Kd); addDouble(axis.Pid_IDLE.Kvff);
+            addDouble(axis.Pid_G00.Kp); addDouble(axis.Pid_G00.Ki); addDouble(axis.Pid_G00.Kd); addDouble(axis.Pid_G00.Kvff);
+            addDouble(axis.pid.MaxLag); addDouble(axis.pid.MaxIntegral);
+            config[word++] = static_cast<std::uint64_t>(axis.pid.EnableLagCheck);
+            for (unsigned j = 0U; j < 3U; ++j)
+            { config[word++] = enabled[j] ? 1U : 0U; addDouble(low[j]); addDouble(high[j]); }
+            const auto identity = m_edmMultiAxisConfigIdentity[i].Observe(config);
+            out.configGeneration = identity.generation;
+            if (!identity.Ready()) frame.current = false;
+            map[2U+i*6U] = static_cast<std::uint64_t>(axis.axisIndex);
+            map[3U+i*6U] = static_cast<std::uint64_t>(drive.slaveIndex);
+            map[4U+i*6U] = reinterpret_cast<std::uintptr_t>(drive.pOutput);
+            map[5U+i*6U] = reinterpret_cast<std::uintptr_t>(drive.pInput);
+            map[6U+i*6U] = drive.vendorId;
+            map[7U+i*6U] = drive.productCode;
+        }
+        const auto identity = m_edmMultiAxisMapIdentity.Observe(map);
+        frame.mapGeneration = identity.generation;
+        if (!identity.Ready()) frame.current = false;
+    }
+    // A takeover or alarm arriving during the batch invalidates the whole
+    // six-axis observation. It cannot become a partly authorized preview.
+    facts.authorityReady = frame.authorityReady = authorityEntry &&
+        m_motionOwnerState.load(std::memory_order_acquire) == ownerState &&
+        m_executionEpochPublication.load(std::memory_order_acquire) == execution &&
+        m_frameSafetyIntentState.load(std::memory_order_acquire) == safety &&
+        alarms.GetMotionSafetyIntentState() == alarmIntent &&
+        alarms.GetUpdateCount() == alarmUpdate &&
+        !HasPendingSafetyOrRecoveryRequests() && !alarms.HasAlarm();
+    // Private simulation braking may finish after AUTO ownership is revoked.
+    // RuntimeCycle separately requires authority for every running profile;
+    // this capture certifies fresh input/configuration, never output authority.
+    controller.valid = frame.current;
+    m_edmCoordinatedRT.RuntimeCycle(facts, m_edmZClockFrequency, &frame, &controller);
 }
 
 void MotionCore::ObserveEDMRTShadowRuntimeCycle(std::uint64_t tick,
-    bool pdoCycleValid, bool contiguous) noexcept
+    bool pdoCycleValid, bool contiguous, bool servicePhysical,
+    const EDM64::Snapshot& physical, const EDM53::Stamp& physicalStamp) noexcept
 {
     // Reuse this cycle's EDM28 QPC observation. No clock read, blocking call,
     // diagnostic output or physical motion operation belongs in this seam.
@@ -1928,6 +3916,19 @@ void MotionCore::ObserveEDMRTShadowRuntimeCycle(std::uint64_t tick,
     // must see revocation even when UpdateAllMotion is deliberately skipped.
     m_edmRTShadow.RuntimeCycle(facts);
     ObserveEDMGapServoRTRuntimeCycle(facts);
+    if (servicePhysical)
+    {
+        // Reuse the same stable authority observation and the source copy
+        // obtained before this callback's QPC sample. No additional clock,
+        // output operation or formatting is part of this advisory consumer.
+        EDM69::Facts physicalFacts{};
+        physicalFacts.tick = facts.tick; physicalFacts.nowUs = facts.nowUs;
+        physicalFacts.executionEpoch = facts.executionEpoch; physicalFacts.ownerLease = facts.ownerLease;
+        physicalFacts.clockValid = facts.clockValid; physicalFacts.pdoValid = facts.pdoValid;
+        physicalFacts.contiguous = facts.contiguous; physicalFacts.authorityReady = facts.authorityReady;
+        m_edmPhysicalServoRT.RuntimeCycle(physicalFacts, physical, physicalStamp, m_edmZClockFrequency);
+        m_edmPhysicalMotion.ObserveRuntime(physicalFacts, physical, physicalStamp, m_edmZClockFrequency);
+    }
 }
 
 // EDM28: fixed-channel transport. Only the NC thread produces requests and
@@ -1963,6 +3964,10 @@ bool MotionCore::ReadEDMZFixtureFeedback(EDM28::Feedback& feedback) const noexce
 void MotionCore::PublishEDMZFixtureFeedback() noexcept
 {
     EDM28::Feedback feedback = m_edmZPolicy.Snapshot();
+    feedback.dynamic = EDM28::IsPhysicalServoProfile(feedback.frozenConfig.profile) ?
+        m_edmPhysicalMotion.Snapshot() : m_edmGapPhysical.Snapshot();
+    if (EDM28::IsPhysicalServoProfile(feedback.frozenConfig.profile))
+        feedback.physical = m_edmPhysicalMotion.SourceProof();
     if (!m_edmZClockValid)
     {
         feedback.clockValid = feedback.sourceFresh = feedback.pdoValid = false;
@@ -1993,7 +3998,7 @@ void MotionCore::ApplyEDMZFixtureDecision(const EDM28::Decision& supplied) noexc
         // An unavailable publication establishes no scoped cancellation. The
         // existing local application may finish; every PDO/send gate zeros it.
         if (request.kind == EDM28::RequestKind::Arm || request.kind == EDM28::RequestKind::Position ||
-            request.kind == EDM28::RequestKind::FeedUpdate)
+            request.kind == EDM28::RequestKind::FeedUpdate || request.kind == EDM28::RequestKind::ServoStart)
         {
             if (m_edmZFeedback.Current().status == EDM53::Status::Closed)
                 decision = m_edmZPolicy.PriorityStop(m_edmZPolicy.Snapshot().scope.session, m_edmZObservation);
@@ -2013,7 +4018,47 @@ void MotionCore::ApplyEDMZFixtureDecision(const EDM28::Decision& supplied) noexc
     if (applied)
     {
         AxisContext& axis = (*m_pContexts)[2];
-        if (decision.action == EDM28::Action::Move)
+        if (decision.action == EDM28::Action::ServoStart)
+        {
+            const EDM28::Feedback& feedback = m_edmZPolicy.Snapshot();
+            const EDM61::Binding sourceBinding = EDM61::MakeBinding(feedback.scope,
+                static_cast<unsigned>(feedback.frozenConfig.profile), pending.sequence,
+                m_edmZObservation.tick, m_edmZObservation.monotonicUs);
+            applied = decision.accepted && decision.requiresCommit &&
+                pending.kind == EDM28::RequestKind::ServoStart &&
+                EDM28::IsGapDynamicProfile(feedback.frozenConfig.profile) &&
+                feedback.capHeld && feedback.originValid && !feedback.stopLatched && !feedback.latchedFault &&
+                axis.state == MotionState::MotionState_IDLE &&
+                axis.axisType == AxisType::LINEAR && !axis.isVirtualAxis && !axis.isFault &&
+                axis.currentCmdVel == 0.0 && axis.logicalCmdVel == 0.0 && axis.targetVelocity == 0.0 &&
+                !m_edmGapPhysical.Active() && !m_edmPhysicalMotion.Active();
+            if (applied && EDM28::IsPhysicalServoProfile(feedback.frozenConfig.profile))
+                applied = m_edmPhysicalMotion.Begin(feedback.scope, feedback.frozenConfig,
+                    feedback.outerOriginPulse, pending.sequence, m_edmZObservation);
+            else if (applied)
+                applied = m_edmGapRTSource.Begin(sourceBinding) &&
+                    m_edmGapPhysical.Begin(feedback.scope, feedback.frozenConfig,
+                        feedback.outerOriginPulse, pending.sequence, m_edmZObservation, sourceBinding);
+            if (!applied) m_edmGapRTSource.Cancel();
+            if (applied)
+            {
+                // The RT controller already shapes speed. Begin only from
+                // genuine stopped state; no inherited FIR tail owns motion.
+                std::fill(axis.velBuffer.begin(), axis.velBuffer.end(), 0.0);
+                axis.bufferIndex = 0; axis.bufferSum = 0.0;
+                axis.planningPos = axis.logicalCmdPos = axis.currentCmdPos;
+                axis.finalTargetPos = feedback.outerOriginPulse;
+                axis.targetEndVel = 0.0;
+                axis.programmedVel_PPS = axis.cruiseVel_PPS = 0.0;
+                axis.acc_PPS2 = axis.dec_PPS2 =
+                    feedback.frozenConfig.pdoCapMmS * feedback.frozenConfig.pulsePerMm /
+                    feedback.frozenConfig.decelerationTimeSec;
+                axis.VelocityMove_Acc = axis.acc_PPS2;
+                axis.inPosition = false;
+                axis.state = MotionState::MotionState_VELOCITY;
+            }
+        }
+        else if (decision.action == EDM28::Action::Move)
         {
             // The historical leaf otherwise promotes <=1 PPS and <=10 PPS^2
             // to unrelated defaults. Neither promotion belongs to P13.
@@ -2101,6 +4146,9 @@ void MotionCore::ApplyEDMZFixtureDecision(const EDM28::Decision& supplied) noexc
         else if (decision.action == EDM28::Action::Stop || decision.action == EDM28::Action::Fault)
         {
             const EDM28::Feedback& feedback = m_edmZPolicy.Snapshot();
+            m_edmGapPhysical.Cancel();
+            m_edmPhysicalMotion.Cancel();
+            m_edmGapRTSource.Cancel();
             if (EDM28::IsGapRapidProfile(feedback.frozenConfig.profile))
             {
                 // EDM43 keeps a late operator Stop inside the current finite
@@ -2142,7 +4190,19 @@ void MotionCore::ApplyEDMZFixtureDecision(const EDM28::Decision& supplied) noexc
                     axis.dec_PPS2 = (std::max)(previousDeceleration, axis.dec_PPS2);
                 }
             }
-            else StopMove(axis, decision.decelerationTimeSec);
+            else
+            {
+                StopMove(axis, decision.decelerationTimeSec);
+                if (EDM28::IsGapDynamicProfile(feedback.frozenConfig.profile) &&
+                    feedback.capHeld && axis.state == MotionState::MotionState_STOPPING)
+                {
+                    // Same slope used by the dynamic controller's braking
+                    // reserve. The ordinary stop still owns state/settle.
+                    axis.dec_PPS2 = feedback.frozenConfig.pdoCapMmS *
+                        feedback.frozenConfig.pulsePerMm / feedback.frozenConfig.decelerationTimeSec;
+                    axis.targetVelocity = 0.0;
+                }
+            }
         }
         else
             applied = decision.action == EDM28::Action::None && decision.requiresCommit &&
@@ -2171,6 +4231,9 @@ void MotionCore::ApplyEDMZFixtureDecision(const EDM28::Decision& supplied) noexc
 
 void MotionCore::StopEDMZFixtureFromRuntime() noexcept
 {
+    m_edmGapPhysical.Cancel();
+    m_edmPhysicalMotion.Cancel();
+    m_edmGapRTSource.Cancel();
     const std::uint64_t session = m_edmZPolicy.Snapshot().scope.session;
     ApplyEDMZFixtureDecision(m_edmZPolicy.PriorityStop(session, m_edmZObservation));
 }
@@ -2412,10 +4475,96 @@ void MotionCore::ProcessEDMZFixtureAxis(AxisContext& axis,
             const EDM28::Decision decision = m_edmZPolicy.OnRequest(queued.request, m_edmZObservation);
             if (decision.accepted && (queued.request.kind == EDM28::RequestKind::Arm ||
                 queued.request.kind == EDM28::RequestKind::Heartbeat))
+            {
                 m_edmZHeartbeatDeadlineUs = queued.request.issueMonotonicUs + 50000ULL;
+                if (EDM28::IsPhysicalServoProfile(m_edmZPolicy.Snapshot().frozenConfig.profile) &&
+                    !m_edmPhysicalMotion.Touch(queued.request.issueMonotonicUs))
+                { StopEDMZFixtureFromRuntime(); return; }
+            }
             ApplyEDMZFixtureDecision(decision);
         }
     }
+}
+
+bool MotionCore::GenerateEDMGapPhysicalCommand(AxisContext& axis, AxisCommand& command) noexcept
+{
+    if (axis.axisIndex != 2 || (!m_edmGapPhysical.Active() && !m_edmPhysicalMotion.Active())) return false;
+    const EDM28::Feedback& feedback = m_edmZPolicy.Snapshot();
+    const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+    m_edmZObservation = BuildEDMZFixtureObservation(axis, nullptr,
+        m_edmZSourceTick == m_ncSettleRuntimeCycleTick && (m_servoSourceInputMask & 4U) != 0U);
+    if (!EDM28::IsGapDynamicProfile(feedback.frozenConfig.profile) ||
+        !feedback.capHeld || feedback.stopLatched || feedback.latchedFault ||
+        axis.state != MotionState::MotionState_VELOCITY ||
+        m_edmZFeedback.Current().status == EDM53::Status::Closed ||
+        !EDM52::Valid(stop) ||
+        EDM52::AffectsSince(stop, feedback.scope.session, m_edmZObservedStopTicket) ||
+        EDM52::RetiresSession(stop, feedback.scope.session) ||
+        !m_edmZHeartbeatDeadlineUs || m_edmZMonotonicUs >= m_edmZHeartbeatDeadlineUs)
+    {
+        StopEDMZFixtureFromRuntime();
+        return false;
+    }
+    const bool physicalInput = EDM28::IsPhysicalServoProfile(feedback.frozenConfig.profile);
+    if (physicalInput ? !m_edmPhysicalMotion.Active() : !m_edmGapPhysical.Active())
+    { StopEDMZFixtureFromRuntime(); return false; }
+    const EDM56::Candidate candidate = physicalInput ? m_edmPhysicalMotion.Step(m_edmZObservation) :
+        m_edmGapPhysical.Step(m_edmZObservation, m_edmGapRTSource);
+    if (candidate.needFormalStop || !candidate.valid)
+    {
+        StopEDMZFixtureFromRuntime();
+        return false;
+    }
+    const double cap = feedback.frozenConfig.pdoCapMmS * feedback.frozenConfig.pulsePerMm;
+    const bool finite = std::isfinite(candidate.nativeTargetPulse) &&
+        std::isfinite(candidate.nativeVelocityPps) && std::isfinite(cap) && cap >= 1.0 &&
+        candidate.nativeTargetPulse >= -2147483648.0 && candidate.nativeTargetPulse <= 2147483647.0 &&
+        std::fabs(candidate.nativeVelocityPps) <= cap &&
+        std::fabs(candidate.nativeVelocityPps) <= axis.maxVel_PPS;
+    if (!finite)
+    {
+        if (physicalInput) (void)m_edmPhysicalMotion.Commit(candidate, false, m_edmZObservation);
+        else (void)m_edmGapPhysical.Commit(candidate, false, m_edmZObservation);
+        StopEDMZFixtureFromRuntime();
+        return false;
+    }
+    const auto cancelled = [&]() noexcept
+    {
+        const EDM52::Snapshot current = m_edmZCancelFence.Read();
+        return !EDM52::Valid(current) || current.revision < stop.revision ||
+            EDM52::AffectsSince(current, feedback.scope.session, stop.revision) ||
+            EDM52::RetiresSession(current, feedback.scope.session) ||
+            m_edmZFeedback.Current().status == EDM53::Status::Closed;
+    };
+    if (cancelled())
+    {
+        StopEDMZFixtureFromRuntime();
+        return false;
+    }
+    // This is the sole local trajectory application. Hardware reversal,
+    // compensation, PID and the final guarded PDO image stay downstream.
+    axis.currentCmdPos = axis.logicalCmdPos = axis.planningPos = candidate.nativeTargetPulse;
+    axis.currentCmdVel = axis.logicalCmdVel = axis.targetVelocity = candidate.nativeVelocityPps;
+    axis.programmedVel_PPS = axis.cruiseVel_PPS = std::fabs(candidate.nativeVelocityPps);
+    axis.inPosition = false;
+    m_edmZObservation = BuildEDMZFixtureObservation(axis, nullptr,
+        m_edmZSourceTick == m_ncSettleRuntimeCycleTick && (m_servoSourceInputMask & 4U) != 0U);
+    if (cancelled())
+    {
+        // Local setters already ran, so Stop consumes those real fields;
+        // cancellation grants no successful stream candidate receipt.
+        StopEDMZFixtureFromRuntime();
+        return false;
+    }
+    if (!(physicalInput ? m_edmPhysicalMotion.Commit(candidate, true, m_edmZObservation) :
+        m_edmGapPhysical.Commit(candidate, true, m_edmZObservation)))
+    {
+        StopEDMZFixtureFromRuntime();
+        return false;
+    }
+    command.instantCmdPos = candidate.nativeTargetPulse;
+    command.instantCmdVel = candidate.nativeVelocityPps;
+    return true;
 }
 
 double MotionCore::GuardEDMZFixtureVelocity(int axisIndex, double value) noexcept
@@ -2472,6 +4621,16 @@ void MotionCore::FinishEDMZFixtureMotionPass() noexcept
         m_edmZObservation.monotonicUs = m_edmZMonotonicUs;
         m_edmZObservation.clockValid = m_edmZClockValid;
     }
+    // An early exit before the trajectory seam cannot carry a live stream
+    // into a later callback. ObserveClock separately covers skipped PDO passes.
+    if (m_edmGapPhysical.Active() &&
+        (m_edmGapPhysical.Snapshot().steps == 0ULL ||
+            m_edmGapPhysical.Snapshot().tick != m_ncSettleRuntimeCycleTick))
+        StopEDMZFixtureFromRuntime();
+    if (m_edmPhysicalMotion.Active() &&
+        (m_edmPhysicalMotion.Snapshot().steps == 0ULL ||
+            m_edmPhysicalMotion.Snapshot().tick != m_ncSettleRuntimeCycleTick))
+        StopEDMZFixtureFromRuntime();
     ApplyEDMZFixtureDecision(m_edmZPolicy.OnCycle(m_edmZObservation));
     const EDM28::Feedback& frameFeedback = m_edmZPolicy.Snapshot();
     if (frameFeedback.capHeld &&
@@ -2615,8 +4774,20 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
 
     m_ncSettlePreviousRuntimeCycleTick = runtimeCycleTick;
     m_ncSettlePreviousRuntimeCycleValid = pdoCycleValid;
+    // Freeze service eligibility before reading the source. A Start racing
+    // this check waits for the next callback, rather than seeing a deliberate
+    // empty sample as a source fault. Missing Master remains an empty receipt.
+    const bool servicePhysical = m_edmPhysicalServoRT.NeedsRuntimeService() ||
+        m_edmPhysicalMotion.NeedsRuntimeService() ||
+        (EDM28::IsPhysicalServoProfile(m_edmZPolicy.Snapshot().frozenConfig.profile) && m_edmZPolicy.Snapshot().capHeld);
+    EDM64::Snapshot physical{};
+    EDM53::Stamp physicalStamp{};
+    if (servicePhysical && m_pEDMPhysicalSourceMaster != nullptr)
+        physicalStamp = m_pEDMPhysicalSourceMaster->ReadGapPhysicalRTShadow(physical);
     ObserveEDMZFixtureRuntimeClock(runtimeCycleTick, pdoCycleValid, adjacentToPrevious);
-    ObserveEDMRTShadowRuntimeCycle(runtimeCycleTick, pdoCycleValid, adjacentToPrevious);
+    ServiceEDM96Source();
+    ObserveEDMRTShadowRuntimeCycle(runtimeCycleTick, pdoCycleValid, adjacentToPrevious,
+        servicePhysical, physical, physicalStamp);
 
     // HOME proof cannot survive a skipped/invalid/duplicate runtime pass.
     // This runs even when the runtime deliberately skips UpdateAllMotion.
@@ -2634,6 +4805,8 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
     // survive until a later valid Motion pass.
     if (!pdoCycleValid)
     {
+        ObserveEDMMultiAxisMachineRuntime(false);
+        ServiceEDM94MotionPass(false);
         m_pbcXFeedbackTick = 0ULL;
         m_pbcResetPreproofTick = 0ULL;
         InvalidateServoOutputImageProof();
@@ -3246,6 +5419,8 @@ bool MotionCore::SealPbcXHomeProbeSerializedImage(ServoOutputFrameReservation& r
     const std::uint8_t* ioMapBase, std::size_t ioMapSize,
     const std::uint8_t* serializedPayload, std::size_t payloadSize) noexcept
 {
+    if (!SealEDM94SerializedImage(reservation, ioMapBase, ioMapSize,
+        serializedPayload, payloadSize)) return false;
     if (!SealEDMZFixtureSerializedImage(reservation, ioMapBase, ioMapSize,
         serializedPayload, payloadSize)) return false;
     if (!m_pbcXHomeProbeSendPending) return !reservation.homeProbe.pending;
@@ -11150,6 +13325,8 @@ void MotionCore::WriteServoTargetVelocityCommand(
     }
     if (m_edmZPolicy.Snapshot().capHeld)
         value = static_cast<std::int32_t>(GuardEDMZFixtureVelocity(axisIndex, static_cast<double>(value)));
+    if (m_edm94.Active())
+        value = static_cast<std::int32_t>(GuardEDM94Velocity(axisIndex, static_cast<double>(value)));
 
     const auto writeTarget =
         [&](int32_t exactValue)
@@ -12921,6 +15098,505 @@ bool MotionCore::PublishServoOutputImageProof(
 }
 
 
+// EDM94 is a guard around the ordinary group writer.  These receipts bind
+// that writer's previous completed Motion pass to the final LRW bytes.
+bool MotionCore::BeginEDM94Send(ServoOutputFrameReservation& reservation) noexcept
+{
+    // Preserve the proposal before the generic sender may scrub/invalidate
+    // its proof. Fault snapshots never relabel the replacement zero image.
+    m_edm94.ObserveSendProof(m_servoOutputImageProof.sourceRuntimeTick,
+        m_servoOutputImageProof.generation, m_servoOutputImageProof.ownerState,
+        m_servoOutputImageProof.executionPublication);
+    const auto faultIdentity = [this, &reservation](EDM94::FaultSite site) noexcept
+    {
+        EDM94::RuntimeDiagnostic diagnostic = m_edm94.CurrentRuntimeDiagnostic();
+        diagnostic.site = static_cast<std::uint32_t>(site);
+        diagnostic.flags |= EDM94::RuntimeFlag_SEND_CONTEXT_VALID |
+            (reservation.handoff.scrubbed ? EDM94::RuntimeFlag_SCRUBBED : 0U) |
+            (reservation.acquired ? EDM94::RuntimeFlag_ACQUIRED : 0U) |
+            (reservation.handoff.finalChecked ? EDM94::RuntimeFlag_FINAL_CHECKED : 0U) |
+            (reservation.edm94.normalEligible ? EDM94::RuntimeFlag_NORMAL_ELIGIBLE : 0U);
+        diagnostic.liveOwnerState = m_motionOwnerState.load(std::memory_order_acquire);
+        diagnostic.liveExecutionPublication = m_executionEpochPublication.load(std::memory_order_acquire);
+        diagnostic.reservationOwnerState = reservation.baseOwnerState;
+        diagnostic.reservationExecutionPublication = reservation.baseExecutionPublication;
+        m_edm94.SetFaultContext(diagnostic);
+        TripEDM94(EDM94::Reason::Identity);
+    };
+    reservation.edm94 = EDM94Serialized::Receipt{};
+    if (!m_edm94.Active()) return true;
+    reservation.edm94.held = true;
+    reservation.edm94.session = m_edm94.Current().identity.session;
+    reservation.edm94.sourceTick = m_servoOutputImageProof.sourceRuntimeTick;
+    reservation.edm94.frameGeneration = m_servoOutputImageProof.generation;
+    ObserveEDM94Cancellation();
+    ObserveEDM94Handoff(false);
+    (void)ValidateEDM94SendClock();
+    if (!EDM94ConfigurationCurrent())
+    {
+        TripEDM94(EDM94::Reason::ConfigurationChanged);
+        (void)GuardEDM94OutputImage();
+        return false;
+    }
+    if (!GuardEDM94OutputImage()) return false;
+    if (reservation.edm94.sourceTick == 0ULL && m_edm94.ForceZero() &&
+        m_edm94.Current().outputTick != 0ULL &&
+        m_edm94.Current().outputTick == m_edm94.Current().lastTick &&
+        m_edm94.Current().outputTick == m_ncSettleRuntimeCycleTick)
+    {
+        // An invalid RX deliberately skips the Motion pass and invalidates
+        // its generic proof.  The guarded engine still prepared a zero-only
+        // image for that exact runtime callback.  Sending this whole-zero
+        // image lets LRW obtain fresh RX again; the engine's invalid-source
+        // cycle cannot count toward the physical-stop window.
+        if (!ZeroAllServoTargetVelocityForFrame()) return false;
+        reservation.edm94.sourceTick = m_edm94.Current().outputTick;
+    }
+    if (m_pDrives == nullptr || m_pDrives->size() != EDM94Serialized::AxisCount ||
+        reservation.edm94.sourceTick == 0ULL ||
+        reservation.edm94.sourceTick != m_edm94.Current().outputTick ||
+        reservation.edm94.frameGeneration == 0ULL)
+    {
+        faultIdentity(EDM94::FaultSite::BeginFrameIdentity);
+        (void)GuardEDM94OutputImage();
+        return false;
+    }
+    reservation.edm94.normalEligible = !m_edm94.ForceZero() && !m_edm94.HandoffZero();
+    if (reservation.edm94.normalEligible)
+    {
+        const MotionOwnerLease source = UnpackMotionOwnerState(m_servoOutputImageProof.ownerState);
+        const EDM94::Identity& identity = m_edm94.Current().currentIdentity;
+        if (source.owner != MotionOwner::AUTO || source.generation != identity.ownerGeneration ||
+            static_cast<std::uint64_t>(UnpackExecutionEpochPublication(
+                m_servoOutputImageProof.executionPublication)) != identity.epoch)
+        {
+            faultIdentity(EDM94::FaultSite::BeginProofIdentity);
+            (void)GuardEDM94OutputImage();
+            return false;
+        }
+    }
+    for (std::size_t axis = 0U; axis < EDM94Serialized::AxisCount; ++axis)
+    {
+        const ServoOutput* out = (*m_pDrives)[axis].pOutput;
+        if (out == nullptr || reinterpret_cast<std::uintptr_t>(out) !=
+            m_edm94FrozenSerializedMapping.output[axis])
+        {
+            TripEDM94(EDM94::Reason::ConfigurationChanged);
+            (void)GuardEDM94OutputImage();
+            return false;
+        }
+        auto& expected = reservation.edm94.expected[axis];
+        expected.velocity = out->TargetVelocity;
+        expected.control = out->ControlWord;
+        expected.probe = out->TouchProbeFunc;
+        expected.mode = out->ModesOfOperation;
+    }
+    // A handoff is a whole-zero transport bridge, including when a legacy
+    // zero-valued PBC control proposal would otherwise acquire a reservation.
+    // Preserve the original EDM receipt above; generic Begin will scrub its
+    // invalidated proof through its unchanged zero-only path.
+    if (m_edm94.HandoffZero()) InvalidateServoOutputImageProof();
+    return true;
+}
+
+bool MotionCore::FinalizeEDM94Send(ServoOutputFrameReservation& reservation) noexcept
+{
+    if (!reservation.edm94.held) return !m_edm94.Active();
+    if (!m_edm94.Active() || reservation.edm94.session != m_edm94.Current().identity.session)
+        return false;
+    ObserveEDM94Cancellation();
+    ObserveEDM94Handoff(false);
+    (void)ValidateEDM94SendClock();
+    if (!EDM94ConfigurationCurrent())
+    {
+        TripEDM94(EDM94::Reason::ConfigurationChanged);
+        (void)GuardEDM94OutputImage();
+        return false;
+    }
+    if (!GuardEDM94OutputImage()) return false;
+    if (m_edm94.ForceZero() || m_edm94.HandoffZero())
+    {
+        // Finalize is before the transport's last optional copy.  Every axis
+        // is scrubbed together; the old nonzero proposal is never receipted.
+        reservation.edm94.normalEligible = false;
+        if (!ZeroAllServoTargetVelocityForFrame()) return false;
+        reservation.recopyRequired = true;
+    }
+    return true;
+}
+
+bool MotionCore::SealEDM94SerializedImage(ServoOutputFrameReservation& reservation,
+    const std::uint8_t* ioMapBase, std::size_t ioMapSize,
+    const std::uint8_t* payload, std::size_t payloadSize) noexcept
+{
+    const auto faultIdentity = [this, &reservation](EDM94::FaultSite site) noexcept
+    {
+        EDM94::RuntimeDiagnostic diagnostic = m_edm94.CurrentRuntimeDiagnostic();
+        diagnostic.site = static_cast<std::uint32_t>(site);
+        diagnostic.flags |= EDM94::RuntimeFlag_SEND_CONTEXT_VALID |
+            (reservation.handoff.scrubbed ? EDM94::RuntimeFlag_SCRUBBED : 0U) |
+            (reservation.acquired ? EDM94::RuntimeFlag_ACQUIRED : 0U) |
+            (reservation.handoff.finalChecked ? EDM94::RuntimeFlag_FINAL_CHECKED : 0U) |
+            (reservation.edm94.normalEligible ? EDM94::RuntimeFlag_NORMAL_ELIGIBLE : 0U);
+        diagnostic.liveOwnerState = m_motionOwnerState.load(std::memory_order_acquire);
+        diagnostic.liveExecutionPublication = m_executionEpochPublication.load(std::memory_order_acquire);
+        diagnostic.reservationOwnerState = reservation.baseOwnerState;
+        diagnostic.reservationExecutionPublication = reservation.baseExecutionPublication;
+        m_edm94.SetFaultContext(diagnostic);
+        TripEDM94(EDM94::Reason::Identity);
+    };
+    if (!reservation.edm94.held) return !m_edm94.Active();
+    auto& receipt = reservation.edm94;
+    receipt.sealed = false;
+    if (!m_edm94.Active() || receipt.session != m_edm94.Current().identity.session)
+        return false;
+    EDM94Serialized::Mapping current{};
+    const bool mappingAvailable = m_pDrives != nullptr &&
+        m_pDrives->size() == EDM94Serialized::AxisCount;
+    if (mappingAvailable)
+    {
+        for (std::size_t axis = 0U; axis < EDM94Serialized::AxisCount; ++axis)
+        {
+            current.output[axis] = reinterpret_cast<std::uintptr_t>((*m_pDrives)[axis].pOutput);
+            current.input[axis] = reinterpret_cast<std::uintptr_t>((*m_pDrives)[axis].pInput);
+            current.slave[axis] = static_cast<std::int32_t>((*m_pDrives)[axis].slaveIndex);
+            current.cap[axis] = m_edm94FrozenSerializedMapping.cap[axis];
+        }
+    }
+    const bool cancellableProposal = receipt.normalEligible && !m_edm94.Current().cancelled;
+    EDM94Serialized::Receipt beforeCancel = receipt;
+    const bool exactCancelledProposal = cancellableProposal && mappingAvailable &&
+        EDM94Serialized::Seal(beforeCancel, m_edm94FrozenSerializedMapping, current,
+            ioMapBase, ioMapSize, payload, payloadSize) == EDM94Serialized::Result::None;
+    // This is the last scoped cancellation check before the reserved NIC
+    // call.  A cancellation after this commit can leave one frame in flight;
+    // End records that fact without granting successful normal completion.
+    ObserveEDM94Cancellation();
+    ObserveEDM94Handoff(false);
+    const bool clockCurrent = ValidateEDM94SendClock();
+    if (!EDM94ConfigurationCurrent())
+    {
+        TripEDM94(EDM94::Reason::ConfigurationChanged);
+        (void)GuardEDM94OutputImage();
+        return false;
+    }
+    if (reservation.handoff.scrubbed && !m_edm94.ForceZero() && !m_edm94.HandoffZero())
+        faultIdentity(EDM94::FaultSite::SealGenericScrub);
+    if (!GuardEDM94OutputImage()) return false;
+    if (m_pDrives == nullptr || m_pDrives->size() != EDM94Serialized::AxisCount ||
+        receipt.sourceTick != m_edm94.Current().outputTick ||
+        receipt.sourceTick != m_edm94.Current().lastTick ||
+        !reservation.handoff.finalChecked)
+    {
+        faultIdentity(EDM94::FaultSite::SealFrameIdentity);
+        (void)GuardEDM94OutputImage();
+        return false;
+    }
+    if (exactCancelledProposal && clockCurrent && m_edm94.Current().cancelled &&
+        !m_edm94.Current().faulted && !reservation.handoff.scrubbed)
+    {
+        receipt.normalEligible = false;
+        receipt.cancelDiscard = true;
+        // No NIC call occurs for this packet.  It must not count toward the
+        // consecutive successful-zero window, and is not a transport fault.
+        return false;
+    }
+    bool anyNonzero = false;
+    if (m_edm94.ForceZero() || m_edm94.HandoffZero()) receipt.normalEligible = false;
+    for (std::size_t axis = 0U; axis < EDM94Serialized::AxisCount; ++axis)
+    {
+        const ENI_ServoDrive& drive = (*m_pDrives)[axis];
+        current.output[axis] = reinterpret_cast<std::uintptr_t>(drive.pOutput);
+        current.input[axis] = reinterpret_cast<std::uintptr_t>(drive.pInput);
+        current.slave[axis] = static_cast<std::int32_t>(drive.slaveIndex);
+        current.cap[axis] = m_edm94FrozenSerializedMapping.cap[axis];
+        if (drive.pOutput == nullptr || current.output[axis] !=
+            m_edm94FrozenSerializedMapping.output[axis])
+        {
+            TripEDM94(EDM94::Reason::ConfigurationChanged);
+            (void)GuardEDM94OutputImage();
+            return false;
+        }
+        const ServoOutput& output = *drive.pOutput;
+        anyNonzero = anyNonzero || output.TargetVelocity != 0;
+        if (!receipt.normalEligible)
+        {
+            // Containment may carry a changed disable/control word.  Only a
+            // whole-zero image may adopt this final local image after recopy.
+            if (output.TargetVelocity != 0)
+            {
+                TripEDM94(EDM94::Reason::Serialized);
+                (void)GuardEDM94OutputImage();
+                return false;
+            }
+            receipt.expected[axis].velocity = 0;
+            receipt.expected[axis].control = output.ControlWord;
+            receipt.expected[axis].probe = output.TouchProbeFunc;
+            receipt.expected[axis].mode = output.ModesOfOperation;
+        }
+    }
+    if (anyNonzero && (!receipt.normalEligible || !reservation.acquired ||
+        reservation.handoff.scrubbed ||
+        receipt.frameGeneration != m_servoOutputImageProof.generation))
+    {
+        faultIdentity(EDM94::FaultSite::SealProposalIdentity);
+        (void)GuardEDM94OutputImage();
+        return false;
+    }
+    if (anyNonzero)
+    {
+        const MotionOwnerLease source = UnpackMotionOwnerState(reservation.baseOwnerState);
+        const EDM94::Identity& identity = m_edm94.Current().currentIdentity;
+        if (source.owner != MotionOwner::AUTO || source.generation != identity.ownerGeneration ||
+            static_cast<std::uint64_t>(UnpackExecutionEpochPublication(
+                reservation.baseExecutionPublication)) != identity.epoch)
+        {
+            faultIdentity(EDM94::FaultSite::SealAuthorityIdentity);
+            (void)GuardEDM94OutputImage();
+            return false;
+        }
+    }
+    const auto result = EDM94Serialized::Seal(receipt, m_edm94FrozenSerializedMapping,
+        current, ioMapBase, ioMapSize, payload, payloadSize);
+    std::int32_t csv[EDM94::AxisCount]{};
+    for (unsigned axis = 0U; axis < EDM94::AxisCount; ++axis)
+        csv[axis] = receipt.expected[axis].velocity;
+    if (result != EDM94Serialized::Result::None ||
+        !m_edm94.SealOutput(receipt.sourceTick, csv))
+    {
+        receipt.sealed = false;
+        TripEDM94(result == EDM94Serialized::Result::Mapping ?
+            EDM94::Reason::ConfigurationChanged : EDM94::Reason::Serialized);
+        (void)GuardEDM94OutputImage();
+        PublishEDM94Feedback();
+        // The payload may contain stale nonzero bytes.  Refuse this packet;
+        // the next transport pass sends the complete zero image.
+        return false;
+    }
+    return true;
+}
+
+void MotionCore::FinishEDM94Send(ServoOutputFrameReservation& reservation,
+    bool attempted, bool succeeded) noexcept
+{
+    auto& receipt = reservation.edm94;
+    if (!receipt.held) return;
+    if (m_edm94.Active() && receipt.session == m_edm94.Current().identity.session)
+    {
+        ObserveEDM94Cancellation();
+        if (m_edm94.ForceZero()) receipt.normalEligible = false;
+        if (!m_edm94.ObserveTransport(receipt.sourceTick, receipt.sealed,
+            attempted, attempted && succeeded, receipt.allZero))
+            TripEDM94(EDM94::Reason::Send);
+        if (receipt.cancelDiscard && !attempted && !succeeded)
+        {
+            if (!m_edm94.DiscardCancelledFrame(receipt.sourceTick))
+                TripEDM94(EDM94::Reason::Send);
+            (void)ZeroAllServoTargetVelocityForFrame();
+            PublishEDM94Feedback();
+            receipt.held = false;
+            return;
+        }
+        std::int32_t csv[EDM94::AxisCount]{};
+        for (unsigned axis = 0U; axis < EDM94::AxisCount; ++axis)
+            csv[axis] = receipt.expected[axis].velocity;
+        // Keep a truthful receipt for a previously committed in-flight frame.
+        // Cancel already revoked PASS and any nonzero frame cannot contribute
+        // to the encoder-stability plus exact-zero stop window.
+        const bool handedOff = attempted && succeeded && receipt.sealed;
+        const bool exactSent = m_edm94.ObserveSent(receipt.sourceTick, csv, handedOff);
+        if (!exactSent)
+            TripEDM94(EDM94::Reason::Send);
+        if (m_edm94.ForceZero()) (void)ZeroAllServoTargetVelocityForFrame();
+        FinishEDM94CompletionRelease(reservation, exactSent, handedOff);
+        // FIX13_RELEASE_BEGIN
+        // EndServoOutputFrameAfterSend retired the generic reservations.
+        // Inspect this same completed Motion sample, never a new RX sample or
+        // the next unsent frame. Bounded encoder range is proven by Tick plus
+        // 200 successful whole-zero receipts, not equality across two ticks.
+        if (m_edm94ReleaseSession.load(std::memory_order_acquire) >= receipt.session)
+        {
+            const std::uint64_t ownerState = m_motionOwnerState.load(std::memory_order_acquire);
+            const std::uint64_t execution = m_executionEpochPublication.load(std::memory_order_acquire);
+            const std::uint64_t safety = m_frameSafetyIntentState.load(std::memory_order_acquire);
+            AlarmManager& alarms = AlarmManager::GetInstance();
+            const std::uint64_t alarmIntent = alarms.GetMotionSafetyIntentState();
+            const std::uint32_t alarmRevision = alarms.GetUpdateCount();
+            const bool sendClockCurrent = exactSent && handedOff && receipt.allZero &&
+                ValidateEDM94SendClock();
+            const EDM94::Frame completed = CaptureEDM94Frame(m_ncSettleMotionPassCompleted);
+            const auto& ack = m_ncResetRebaseAckProducer;
+            const bool resetComplete = ack.requestSequence > m_edm94ResetFloor &&
+                ack.phase == MotionNCResetRebasePhase::ACKNOWLEDGED && ack.requestAccepted &&
+                ack.rebaseApplied && ack.postVerifyPassed && ack.acknowledged && ack.acked &&
+                !ack.blocked && !ack.superseded && (ack.appliedAxisMask & 0x3fU) == 0x3fU &&
+                ack.executionEpoch == GetCurrentExecutionEpoch() &&
+                static_cast<std::uint64_t>(ack.executionEpoch) == completed.identity.epoch &&
+                !HasPendingSafetyOrRecoveryRequests() && !HasUnacknowledgedSafetyMotionRequest() &&
+                static_cast<std::uint32_t>(safety) == 0U && static_cast<std::uint32_t>(alarmIntent) == 0U &&
+                !alarms.HasAlarm() && !reservation.acquired &&
+                (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL &&
+                (execution & (EXECUTION_EPOCH_PUBLICATION_PENDING |
+                    EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL;
+            bool completedFrameCurrent = resetComplete && sendClockCurrent &&
+                m_ncSettleMotionPassCompleted && receipt.sourceTick == m_ncSettleRuntimeCycleTick &&
+                completed.tick == receipt.sourceTick && completed.tick == m_edm94.LastFrame().tick &&
+                completed.tick == m_edm94.Current().lastSentTick &&
+                completed.groupIdle && completed.allCommandZero && completed.healthy &&
+                completed.clockValid && completed.pdoValid && completed.sourceFresh && completed.authorityCurrent &&
+                EDM94::SameIdentity(completed.identity, m_edm94.LastFrame().identity);
+            for (std::size_t i = 0U; completedFrameCurrent && i < 6U; ++i)
+                completedFrameCurrent = completed.axis[i].actualPulse == m_edm94.LastFrame().axis[i].actualPulse &&
+                    completed.axis[i].commandPulse == m_edm94.LastFrame().axis[i].commandPulse &&
+                    completed.axis[i].configFingerprint == m_edm94.FrozenConfig().axis[i].configFingerprint &&
+                    completed.axis[i].mappingFingerprint == m_edm94.FrozenConfig().axis[i].mappingFingerprint &&
+                    std::fabs(completed.axis[i].followingErrorPulse) <= m_edm94.FrozenConfig().axis[i].followingWindowPulse;
+            completedFrameCurrent = completedFrameCurrent &&
+                m_motionOwnerState.load(std::memory_order_acquire) == ownerState &&
+                m_executionEpochPublication.load(std::memory_order_acquire) == execution &&
+                m_frameSafetyIntentState.load(std::memory_order_acquire) == safety &&
+                alarms.GetMotionSafetyIntentState() == alarmIntent && alarms.GetUpdateCount() == alarmRevision &&
+                !alarms.HasAlarm() &&
+                !HasPendingSafetyOrRecoveryRequests() && !HasUnacknowledgedSafetyMotionRequest();
+            m_edm94.ObserveReleasePrecheck(resetComplete, completedFrameCurrent);
+            if (m_edm94.Release(completed.identity, completed, completedFrameCurrent))
+            {
+                m_edm94Claim.store(0ULL, std::memory_order_release);
+                m_edm94FormalStopRequested = false;
+            }
+        }
+        // FIX13_RELEASE_END
+        PublishEDM94Feedback();
+    }
+    receipt.held = false;
+}
+
+void MotionCore::FinishEDM94CompletionRelease(ServoOutputFrameReservation& reservation,
+    bool exactSent, bool handedOff) noexcept
+{
+    if (!m_edm94.Active()) return;
+    const auto& receipt = reservation.edm94;
+    const auto& feedback = m_edm94.Current();
+    if (m_edm94CompletionRequest.armIdentity.session != receipt.session)
+    {
+        m_edm94CompletionRequest = EDM94CompletionReleaseRequest{};
+        m_edm94CompletionPending = m_edm94CompletionRevoked = false;
+        m_edm94CompletionOwnerReleased = false;
+        m_edm94CompletionOwnerReleaseTick = 0ULL;
+    }
+    EDM94CompletionReleaseRequest request{};
+    if (m_edm94CompletionRequests.ConsumerTryPop(request) &&
+        request.armIdentity.session == receipt.session && !m_edm94CompletionPending)
+    {
+        m_edm94CompletionRequest = request;
+        m_edm94CompletionPending = true;
+        m_edm94.ObserveCompletionRelease(EDM94::CompletionReleasePhase::Requested,
+            request.epoch, request.idleLease.generation,
+            NextMotionOwnerGeneration(request.idleLease.generation));
+        // Publish the exact internal transition before its CAS. NC may use it
+        // only for inert LOAD identity continuity, never as a released ACK.
+        PublishEDM94Feedback();
+    }
+    if (!m_edm94CompletionPending || m_edm94CompletionRevoked) return;
+    const auto& pending = m_edm94CompletionRequest;
+    const MotionOwnerGeneration noneGeneration = NextMotionOwnerGeneration(pending.idleLease.generation);
+    const auto revoke = [&]() noexcept
+    {
+        m_edm94CompletionRevoked = true;
+        unsigned open = 0U;
+        (void)m_edm94CompletionDecision.compare_exchange_strong(open, 1U,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        m_edm94.ObserveCompletionRelease(EDM94::CompletionReleasePhase::Revoked,
+            pending.epoch, pending.idleLease.generation, noneGeneration);
+    };
+    AlarmManager& alarms = AlarmManager::GetInstance();
+    const std::uint64_t ownerState = m_motionOwnerState.load(std::memory_order_acquire);
+    const std::uint64_t execution = m_executionEpochPublication.load(std::memory_order_acquire);
+    const MotionOwnerLease owner = UnpackMotionOwnerState(ownerState);
+    const auto safetyCurrent = [&]() noexcept -> bool
+    {
+        return m_frameSafetyIntentState.load(std::memory_order_acquire) == pending.safetyIntent &&
+            AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState()) == pending.alarmIntent &&
+            alarms.GetUpdateCount() == pending.alarmRevision &&
+            static_cast<std::uint32_t>(pending.safetyIntent) == 0U &&
+            static_cast<std::uint32_t>(pending.alarmIntent) == 0U && !alarms.HasAlarm() &&
+            !HasPendingSafetyOrRecoveryRequests() && !HasUnacknowledgedSafetyMotionRequest() &&
+            m_edm94CancelSession.load(std::memory_order_acquire) < receipt.session &&
+            m_edm94ReleaseSession.load(std::memory_order_acquire) < receipt.session;
+    };
+    const bool expectedOwner = m_edm94CompletionOwnerReleased ?
+        owner.owner == MotionOwner::NONE && owner.generation == noneGeneration :
+        owner.Matches(pending.idleLease);
+    if (!EDM94::SameIdentity(feedback.identity, pending.armIdentity) ||
+        m_edm94Claim.load(std::memory_order_acquire) != receipt.session ||
+        !feedback.armAccepted || !feedback.finishRequested || !feedback.forceZero ||
+        feedback.cancelled || feedback.faulted || !expectedOwner ||
+        m_edm94CompletionDecision.load(std::memory_order_acquire) != 0U ||
+        UnpackExecutionEpochPublication(execution) != pending.epoch ||
+        (execution & EXECUTION_EPOCH_PUBLICATION_PENDING) != 0ULL ||
+        UnpackMotionOwnerSafetyHandshake(ownerState) ||
+        UnpackMotionOwnerSafetyActionPending(ownerState) ||
+        UnpackMotionOwnerSafetyRequestTicket(ownerState) !=
+            m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire) ||
+        m_programEndIdleHoldGrant.load(std::memory_order_acquire) != pending.idleGrant ||
+        !safetyCurrent())
+    { revoke(); return; }
+    if (reservation.acquired || (ownerState & MOTION_OWNER_ANY_OUTPUT_RESERVATION) != 0ULL ||
+        (execution & EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL ||
+        alarms.GetMotionSafetyIntentState() != pending.alarmIntent) return;
+    const bool sentCurrent = exactSent && handedOff && receipt.allZero && ValidateEDM94SendClock();
+    const EDM94::Frame completed = CaptureEDM94Frame(m_ncSettleMotionPassCompleted);
+    bool frameCurrent = sentCurrent && m_ncSettleMotionPassCompleted &&
+        receipt.sourceTick == m_ncSettleRuntimeCycleTick && completed.tick == receipt.sourceTick &&
+        completed.tick == m_edm94.LastFrame().tick && completed.tick == feedback.lastSentTick &&
+        completed.groupIdle && completed.allCommandZero && completed.healthy &&
+        completed.clockValid && completed.pdoValid && completed.sourceFresh && completed.authorityCurrent &&
+        EDM94::SameIdentity(completed.identity, m_edm94.LastFrame().identity);
+    for (std::size_t axis = 0U; frameCurrent && axis < 6U; ++axis)
+        frameCurrent = completed.axis[axis].actualPulse == m_edm94.LastFrame().axis[axis].actualPulse &&
+            completed.axis[axis].commandPulse == m_edm94.LastFrame().axis[axis].commandPulse &&
+            completed.axis[axis].configFingerprint == m_edm94.FrozenConfig().axis[axis].configFingerprint &&
+            completed.axis[axis].mappingFingerprint == m_edm94.FrozenConfig().axis[axis].mappingFingerprint &&
+            completed.axis[axis].healthy &&
+            std::fabs(completed.axis[axis].followingErrorPulse) <= m_edm94.FrozenConfig().axis[axis].followingWindowPulse;
+    if (!safetyCurrent()) { revoke(); return; }
+    if (m_motionOwnerState.load(std::memory_order_acquire) != ownerState ||
+        m_executionEpochPublication.load(std::memory_order_acquire) != execution ||
+        alarms.GetMotionSafetyIntentState() != pending.alarmIntent || !frameCurrent) return;
+    if (!m_edm94CompletionOwnerReleased)
+    {
+        // Revoke only our finalized M30 holding lease while the six-axis guard
+        // remains active. No reference rebase or PID/controller change occurs.
+        std::uint64_t expected = ownerState;
+        const std::uint64_t noneState = PackMotionOwnerState(MotionOwner::NONE, noneGeneration,
+            UnpackMotionOwnerSafetyRequestTicket(ownerState), false);
+        if (!m_motionOwnerState.compare_exchange_strong(expected, noneState,
+            std::memory_order_acq_rel, std::memory_order_acquire)) return;
+        m_edm94CompletionOwnerReleased = true;
+        m_edm94CompletionOwnerReleaseTick = receipt.sourceTick;
+        m_edm94.ObserveCompletionRelease(EDM94::CompletionReleasePhase::AwaitingZero,
+            pending.epoch, pending.idleLease.generation, noneGeneration);
+        // The next Tick resets dwell on the new identity. Never release with
+        // the preceding IDLE_HOLD's historical PASS, even in this same callback.
+        return;
+    }
+    if (completed.tick <= m_edm94CompletionOwnerReleaseTick ||
+        completed.identity.epoch != pending.epoch ||
+        completed.identity.ownerGeneration != noneGeneration) return;
+    if (!m_edm94.CanReleaseCompleted(completed.identity, completed, true)) return;
+    unsigned open = 0U;
+    if (!m_edm94CompletionDecision.compare_exchange_strong(open, 2U,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+    { revoke(); return; }
+    // This CAS is the cancellation ordering point. A later HOLD/RESET may
+    // consume an already completed receipt but still runs its own lifecycle.
+    if (m_edm94.ReleaseCompleted(completed.identity, completed, true))
+    {
+        m_edm94Claim.store(0ULL, std::memory_order_release);
+        m_edm94FormalStopRequested = false;
+    }
+}
+
 bool MotionCore::BeginServoOutputFrameAtSendPoint(
     ServoOutputFrameReservation& reservation) noexcept
 {
@@ -12934,6 +15610,7 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
     reservation.edmZStopTicket = stop.revision;
     (void)ValidateEDMZFixtureSendClock();
     if (!GuardEDMZFixtureOutputImage()) return false;
+    if (!BeginEDM94Send(reservation)) return false;
     const EDM53::Stamp feedbackStamp = m_edmZFeedback.Current();
     reservation.edmZFeedbackPublication = feedbackStamp.Ready() ? feedbackStamp.publication : 0ULL;
     // A nested Begin cannot replace the canonical owner of an in-flight probe.
@@ -13216,6 +15893,7 @@ bool MotionCore::BeginServoOutputFrameAtSendPoint(
 bool MotionCore::FinalizeServoOutputFrameAtSendPoint(
     ServoOutputFrameReservation& reservation) noexcept
 {
+    if (!FinalizeEDM94Send(reservation)) return false;
     if (reservation.edmZGuardHeld)
     {
         const EDM52::Snapshot stop = m_edmZCancelFence.Read();
@@ -13370,7 +16048,11 @@ void MotionCore::EndServoOutputFrameAfterSend(
     {
         const ServoOutputFrameReservation canonical = m_pbcXHomeProbeCanonicalSend;
         // An old completion must not release a newer transaction's packed bits.
-        if (reservation.handoff.sequence != canonical.handoff.sequence) return;
+        if (reservation.handoff.sequence != canonical.handoff.sequence)
+        {
+            FinishEDM94Send(reservation, false, false);
+            return;
+        }
         const bool exact = reservation.homeProbe.pending &&
             reservation.homeProbe.sequence == canonical.homeProbe.sequence &&
             reservation.homeProbe.tick == canonical.homeProbe.tick &&
@@ -13421,7 +16103,11 @@ void MotionCore::EndServoOutputFrameAfterSend(
         const bool ownsOrdinaryCycle =
             (m_pbcXCycle.prepared && m_pbcXCycleSendSequence == reservation.handoff.sequence) ||
             (m_pbcXSendTicket != 0ULL && m_pbcXSendSequence == reservation.handoff.sequence);
-        if (!ownsOrdinaryCycle) return; // retired/duplicate probe receipt
+        if (!ownsOrdinaryCycle)
+        {
+            FinishEDM94Send(reservation, false, false);
+            return; // retired/duplicate probe receipt
+        }
         // A spurious public flag cannot orphan an ordinary canonical cycle.
         reservation.homeProbe.pending = false;
         reservation.homeProbeSerializedExact = false;
@@ -13577,6 +16263,7 @@ void MotionCore::EndServoOutputFrameAfterSend(
         m_pbcXSendAudit.Observe(reservation.pbcX);
         reservation.handoffPending = false;
     }
+    FinishEDM94Send(reservation, sendAttempted, sendSucceeded);
 }
 
 
@@ -13625,6 +16312,8 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                 motionAlarms.GetUpdateCount(),
                 ServoOutputImageProofMode::ZERO_ONLY);
         }
+        ObserveEDMMultiAxisMachineRuntime(false);
+        ServiceEDM94MotionPass(false);
         FinishEDMZFixtureMotionPass();
         PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
@@ -13652,6 +16341,8 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                 motionAlarms.GetUpdateCount(),
                 ServoOutputImageProofMode::ZERO_ONLY);
         }
+        ObserveEDMMultiAxisMachineRuntime(false);
+        ServiceEDM94MotionPass(false);
         FinishEDMZFixtureMotionPass();
         PublishStartupLagArmingEvidence();
         PublishStopSettleEvidence();
@@ -13899,6 +16590,9 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
         }
     }
 
+
+    ObserveEDMMultiAxisMachineRuntime(motionInputComplete);
+    ServiceEDM94MotionPass(motionInputComplete);
 
     if (!motionInputComplete || (m_servoSourceInputMask & 1U) == 0U)
     {
@@ -16822,7 +19516,10 @@ void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd
     // =========================================================
     double finalOutputVel = axis.currentCmdVel;
 
-    if (axis.velBuffer.size() > 1) {
+    const bool dynamicStop = axis.axisIndex == 2 && m_edmZPolicy.Snapshot().capHeld &&
+        EDM28::IsGapDynamicProfile(m_edmZPolicy.Snapshot().frozenConfig.profile) &&
+        axis.state == MotionState::MotionState_STOPPING;
+    if (!dynamicStop && axis.velBuffer.size() > 1) {
         axis.bufferSum -= axis.velBuffer[axis.bufferIndex];
         axis.velBuffer[axis.bufferIndex] = axis.currentCmdVel;
         axis.bufferSum += axis.currentCmdVel;
@@ -16839,6 +19536,14 @@ void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd
 
     outCmd.instantCmdVel = finalOutputVel;
     outCmd.instantCmdPos = axis.currentCmdPos;
+
+    if (dynamicStop)
+    {
+        // Streaming has already applied the bounded ramp and kept the FIR
+        // empty. Preserve its exact command reference during formal Stop.
+        axis.logicalCmdPos = axis.currentCmdPos;
+        axis.logicalCmdVel = axis.currentCmdVel;
+    }
 
     // =========================================================
     // 4. [完全停止判斷] 
@@ -16866,8 +19571,9 @@ void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd
 
 
 
-void MotionCore::DetermineActiveGainSet(AxisContext& axis)// PID 依照狀態切換
+void MotionCore::DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold)// PID 依照狀態切換
 {
+    if (physicalFixtureIntegralHold != nullptr) *physicalFixtureIntegralHold = false;
     // =========================================================
     // G81 HOME Dedicated Gain
     //
@@ -16952,6 +19658,215 @@ void MotionCore::DetermineActiveGainSet(AxisContext& axis)// PID 依照狀態切
 
         default:
             break;
+        }
+    }
+
+
+    // EDM59 FIX2: qualify a bound SIM return using the same existing hold
+    // gains that the following formal Stop/IDLE will use. A PDO correction
+    // request is not measured motion; physical position/range/time remain
+    // the controller's qualification evidence. Do not change PID history.
+    if (axis.axisIndex == 2 && axis.isExist && !axis.isVirtualAxis &&
+        axis.axisType == AxisType::LINEAR && !axis.isFault &&
+        !axis.homeRuntime.active && axis.state == MotionState::MotionState_VELOCITY)
+    {
+        const EDM28::Feedback& feedback = m_edmZPolicy.Snapshot();
+        const bool physicalInput = EDM28::IsPhysicalServoProfile(feedback.frozenConfig.profile);
+        const EDM56::Feedback& dynamic = physicalInput ? m_edmPhysicalMotion.Snapshot() : m_edmGapPhysical.Snapshot();
+        const EDM28::Observation& observed = m_edmZObservation;
+        const EDM52::Snapshot stop = m_edmZCancelFence.Read();
+        const bool physicalNegative = EDM28::IsPhysicalNegativeProfile(feedback.frozenConfig.profile);
+        const bool physicalBidirectional = EDM28::IsPhysicalBidirectionalProfile(feedback.frozenConfig.profile);
+        const bool physicalBidirectionalFlush = EDM28::IsPhysicalBidirectionalFlushFamilyProfile(feedback.frozenConfig.profile);
+        const auto physicalBidirectionalFlushFamily = EDM28::IsPhysicalBidirectionalFlushEnduranceProfile(feedback.frozenConfig.profile) ?
+            EDM69::RecipeFamily::PhysicalBidirectionalEndurance : EDM69::RecipeFamily::PhysicalBidirectional;
+        const bool originHold = !physicalNegative && !physicalBidirectional && !physicalBidirectionalFlush &&
+            (dynamic.phase == static_cast<std::uint32_t>(EDM56::Phase::OriginSettle) ||
+             dynamic.phase == static_cast<std::uint32_t>(EDM56::Phase::OriginDwell));
+        // EDM71: the committed zero-speed fixture reference may also hold
+        // at a flush endpoint. The original finalTargetPos remains the outer
+        // origin: Generate updates only current/logical/planning references.
+        // Select existing IDLE gains only; do not reset any PID history.
+        bool physicalFlushHold = false;
+        double holdPulse = dynamic.originPulse;
+        if (EDM28::IsPhysicalServoFlushProfile(feedback.frozenConfig.profile) &&
+            dynamic.phase == static_cast<std::uint32_t>(EDM56::Phase::Advance) &&
+            dynamic.nativeVelocityPps == 0.0 &&
+            EDM71::ValidateRecipe(feedback.frozenConfig.flush) &&
+            EDM71::SameAdmission(feedback.frozenConfig.flush, feedback.frozenConfig.servoRecipe) &&
+            std::isfinite(dynamic.originPulse) && std::isfinite(feedback.frozenConfig.pulsePerMm) &&
+            feedback.frozenConfig.pulsePerMm >= 1000.0 && feedback.frozenConfig.pulsePerMm <= 1000000000.0)
+        {
+            const auto& flush = dynamic.flush; const auto& recipe = feedback.frozenConfig.flush;
+            const auto phase = static_cast<EDM57::Phase>(flush.phase);
+            const bool capturedGeometry = std::isfinite(flush.workPointMm) &&
+                flush.workPointMm >= 0.0 && flush.workPointMm <= recipe.workDepthMm &&
+                std::isfinite(flush.liftHeightMm) && flush.liftHeightMm > 0.0 &&
+                flush.liftHeightMm <= EDM71::MaximumLiftHeight(recipe) &&
+                (flush.liftHeightMm == recipe.baseHeightMm ||
+                    (recipe.deepInterval && flush.liftHeightMm == EDM71::LiftHeight(recipe, true))) &&
+                std::isfinite(flush.topMm) && flush.topMm >= -.06 &&
+                flush.topMm == flush.workPointMm - flush.liftHeightMm;
+            const bool endpoint = phase == EDM57::Phase::CaptureWorkPoint ?
+                (flush.destinationMm >= 0.0 && flush.destinationMm <= recipe.workDepthMm) :
+                capturedGeometry &&
+                (((phase == EDM57::Phase::TopSettle || phase == EDM57::Phase::TopDwell) &&
+                    flush.destinationMm == flush.topMm) ||
+                 (phase == EDM57::Phase::ApproachBoundarySettle &&
+                    flush.destinationMm == flush.workPointMm - recipe.finalApproachMm) ||
+                 (phase == EDM57::Phase::ReturnSettle && flush.destinationMm == flush.workPointMm));
+            if (endpoint && !flush.complete && flush.phaseSinceUs && flush.phaseSinceUs <= dynamic.nowUs &&
+                std::isfinite(flush.destinationMm) && flush.destinationMm >= -.06 && flush.destinationMm <= .03)
+            {
+                const double target = dynamic.originPulse - flush.destinationMm * feedback.frozenConfig.pulsePerMm;
+                physicalFlushHold = std::isfinite(target) && target >= -2147483648.0 && target <= 2147483647.0 &&
+                    dynamic.commandPulse == target;
+                if (physicalFlushHold) holdPulse = target;
+            }
+        }
+        // EDM72/73: P58 holds its retreat endpoint; P59 also qualifies a
+        // settled return at the first-arm origin. Both stops require the
+        // same frozen negative-curve recipe. PID values/history are unchanged.
+        const bool retreatEndpoint = dynamic.phase == EDM72::HoldPhase;
+        const bool retreatCycleOrigin = EDM28::IsPhysicalRetreatCycleProfile(feedback.frozenConfig.profile) &&
+            dynamic.phase == static_cast<std::uint32_t>(EDM56::Phase::OriginSettle);
+        bool physicalRetreatHold = false;
+        if (physicalNegative && (retreatEndpoint || retreatCycleOrigin) && dynamic.nativeVelocityPps == 0.0 &&
+            feedback.frozenConfig.physicalInput.recipeFamily == EDM69::RecipeFamily::PhysicalRetreat &&
+            EDM72::ValidateRecipe(feedback.frozenConfig.servoRecipe) &&
+            EDM59::SameRecipe(feedback.frozenConfig.servoRecipe, feedback.frozenConfig.physicalInput.capture.recipe) &&
+            EDM57::SameRecipe(feedback.frozenConfig.flush, EDM57::Recipe{}) &&
+            EDM71::SameCompletion(dynamic.flush, EDM57::Feedback{}) &&
+            std::isfinite(dynamic.originPulse) && std::isfinite(feedback.frozenConfig.pulsePerMm) &&
+            feedback.frozenConfig.pulsePerMm >= 1000.0 && feedback.frozenConfig.pulsePerMm <= 1000000000.0)
+        {
+            const double target = retreatEndpoint ?
+                dynamic.originPulse + EDM72::RetreatDepthMm * feedback.frozenConfig.pulsePerMm : dynamic.originPulse;
+            physicalRetreatHold = std::isfinite(target) && target >= -2147483648.0 && target <= 2147483647.0 &&
+                dynamic.commandPulse == target;
+            if (physicalRetreatHold) holdPulse = target;
+        }
+        // EDM74: live signed work may hold only at one of its two exact
+        // bounded endpoints. The expiry return qualifies the first-arm origin.
+        // Interior zero/deadband and braking retain the ordinary motion gains.
+        bool physicalBidirectionalHold = false;
+        const bool bidirectionalWork = dynamic.phase == EDM74::WorkPhase;
+        const bool bidirectionalOrigin = dynamic.phase == static_cast<std::uint32_t>(EDM56::Phase::OriginSettle);
+        if (physicalBidirectional && (bidirectionalWork || bidirectionalOrigin) && dynamic.nativeVelocityPps == 0.0 &&
+            feedback.frozenConfig.physicalInput.recipeFamily == EDM69::RecipeFamily::PhysicalBidirectional &&
+            EDM74::ValidateRecipe(feedback.frozenConfig.servoRecipe) &&
+            EDM59::SameRecipe(feedback.frozenConfig.servoRecipe, feedback.frozenConfig.physicalInput.capture.recipe) &&
+            EDM57::SameRecipe(feedback.frozenConfig.flush, EDM57::Recipe{}) &&
+            EDM71::SameCompletion(dynamic.flush, EDM57::Feedback{}) &&
+            std::isfinite(dynamic.originPulse) && std::isfinite(feedback.frozenConfig.pulsePerMm) &&
+            feedback.frozenConfig.pulsePerMm >= 1000.0 && feedback.frozenConfig.pulsePerMm <= 1000000000.0)
+        {
+            const double positiveBound = dynamic.originPulse + EDM70::DepthMm * feedback.frozenConfig.pulsePerMm;
+            const double negativeBound = dynamic.originPulse - EDM70::DepthMm * feedback.frozenConfig.pulsePerMm;
+            const double target = dynamic.commandPulse;
+            const bool endpoint = bidirectionalWork ? (target == positiveBound || target == negativeBound) :
+                target == dynamic.originPulse;
+            physicalBidirectionalHold = endpoint && std::isfinite(target) &&
+                target >= -2147483648.0 && target <= 2147483647.0;
+            if (physicalBidirectionalHold) holdPulse = target;
+        }
+        // EDM75/76: P61/P62 hold signed work bounds and exact frozen flush targets.
+        // The endurance profile must retain its own frozen physical-source family.
+        // Only settled-entry phases may hand off I; live work, expiry braking,
+        // jump/return travel and top dwell never obtain a new integral history.
+        bool physicalBidirectionalFlushHold = false;
+        bool physicalBidirectionalFlushIntegralHold = false;
+        if (physicalBidirectionalFlush && dynamic.nativeVelocityPps == 0.0 &&
+            feedback.frozenConfig.physicalInput.recipeFamily == physicalBidirectionalFlushFamily &&
+            EDM74::ValidateRecipe(feedback.frozenConfig.servoRecipe) &&
+            EDM59::SameRecipe(feedback.frozenConfig.servoRecipe, feedback.frozenConfig.physicalInput.capture.recipe) &&
+            EDM75::ValidateRecipe(feedback.frozenConfig.flush) &&
+            EDM71::SameAdmission(feedback.frozenConfig.flush, feedback.frozenConfig.servoRecipe) &&
+            std::isfinite(dynamic.originPulse) && std::isfinite(feedback.frozenConfig.pulsePerMm) &&
+            feedback.frozenConfig.pulsePerMm >= 1000.0 && feedback.frozenConfig.pulsePerMm <= 1000000000.0)
+        {
+            const auto phase = static_cast<EDM57::Phase>(dynamic.flush.phase);
+            const bool work = phase == EDM57::Phase::Work &&
+                dynamic.phase == static_cast<std::uint32_t>(EDM56::Phase::Advance);
+            const bool origin = phase == EDM57::Phase::OriginSettle &&
+                dynamic.phase == static_cast<std::uint32_t>(EDM56::Phase::OriginSettle);
+            const bool phaseCurrent = origin || (phase != EDM57::Phase::OriginSettle &&
+                dynamic.phase == static_cast<std::uint32_t>(EDM56::Phase::Advance));
+            double destination = 0.0;
+            const bool settledTarget = phaseCurrent &&
+                EDM75::HoldDestination(dynamic.flush, feedback.frozenConfig.flush, destination);
+            if (work)
+            {
+                const double positiveBound = dynamic.originPulse + EDM70::DepthMm * feedback.frozenConfig.pulsePerMm;
+                const double negativeBound = dynamic.originPulse - EDM70::DepthMm * feedback.frozenConfig.pulsePerMm;
+                physicalBidirectionalFlushHold = !dynamic.flush.complete && dynamic.flush.phaseSinceUs &&
+                    dynamic.flush.phaseSinceUs <= dynamic.nowUs &&
+                    (dynamic.commandPulse == positiveBound || dynamic.commandPulse == negativeBound);
+            }
+            else if (settledTarget && dynamic.flush.phaseSinceUs && dynamic.flush.phaseSinceUs <= dynamic.nowUs)
+            {
+                const double target = dynamic.originPulse - destination * feedback.frozenConfig.pulsePerMm;
+                physicalBidirectionalFlushHold = dynamic.commandPulse == target;
+                physicalBidirectionalFlushIntegralHold = physicalBidirectionalFlushHold && phase != EDM57::Phase::TopDwell;
+            }
+            if (physicalBidirectionalFlushHold)
+            {
+                holdPulse = dynamic.commandPulse;
+                physicalBidirectionalFlushHold = std::isfinite(holdPulse) &&
+                    holdPulse >= -2147483648.0 && holdPulse <= 2147483647.0;
+                physicalBidirectionalFlushIntegralHold = physicalBidirectionalFlushIntegralHold && physicalBidirectionalFlushHold;
+            }
+        }
+        if (EDM28::IsGapConditionServoProfile(feedback.frozenConfig.profile) &&
+            feedback.capHeld && feedback.originValid && feedback.frameCurrent &&
+            !feedback.stopLatched && !feedback.latchedFault && !feedback.forceZeroOutput &&
+            (physicalInput ? (m_edmPhysicalMotion.Active() && !m_edmPhysicalMotion.HasPendingCandidate()) :
+                (m_edmGapPhysical.Active() && !m_edmGapPhysical.HasPendingCandidate())) &&
+            (originHold || physicalFlushHold || physicalRetreatHold || physicalBidirectionalHold || physicalBidirectionalFlushHold) &&
+            (!EDM28::IsGapServoFlushProfile(feedback.frozenConfig.profile) ||
+                (dynamic.phase == static_cast<std::uint32_t>(EDM56::Phase::OriginSettle) &&
+                 dynamic.flush.phase == static_cast<std::uint32_t>(EDM57::Phase::OriginSettle))) &&
+            dynamic.active && !dynamic.terminal && !dynamic.needFormalStop &&
+            dynamic.session == feedback.scope.session && dynamic.generation != 0ULL &&
+            dynamic.profile == static_cast<std::uint8_t>(feedback.frozenConfig.profile) &&
+            dynamic.candidateSequence != 0ULL && dynamic.candidateSequence == dynamic.appliedSequence &&
+            dynamic.tick == m_ncSettleRuntimeCycleTick && dynamic.nowUs == m_edmZMonotonicUs &&
+            dynamic.originPulse == feedback.outerOriginPulse && dynamic.commandPulse == holdPulse &&
+            dynamic.nativeVelocityPps == 0.0 &&
+            m_edmZClockValid && m_ncSettleRuntimeCycleValid && m_ncSettleRuntimeCycleContiguous &&
+            m_edmZSourceTick == m_ncSettleRuntimeCycleTick && (m_servoSourceInputMask & 4U) != 0U &&
+            m_edmZFeedback.Current().status != EDM53::Status::Closed &&
+            m_edmZConfigIdentity.Current().Ready() && m_edmZMapIdentity.Current().Ready() &&
+            observed.tick == dynamic.tick && observed.monotonicUs == dynamic.nowUs &&
+            observed.clockValid && observed.pdoValid && observed.contiguous &&
+            observed.axisMapGeneration == feedback.scope.axisMapGeneration &&
+            observed.configGeneration == feedback.scope.configGeneration &&
+            observed.currentEpoch == feedback.scope.executionEpoch &&
+            observed.currentOwner == feedback.scope.owner &&
+            observed.currentOwnerGeneration == feedback.scope.ownerGeneration &&
+            observed.pulsePerMm == feedback.frozenConfig.pulsePerMm &&
+            observed.referenceOffsetPulse == feedback.frozenConfig.referenceOffsetPulse &&
+            observed.hardwareSign == feedback.frozenConfig.hardwareSign &&
+            observed.servoReady && observed.modeReady && !observed.fault &&
+            !observed.hardPositive && !observed.hardNegative &&
+            axis.currentCmdPos == holdPulse && axis.logicalCmdPos == holdPulse &&
+            axis.planningPos == holdPulse && axis.finalTargetPos == dynamic.originPulse &&
+            axis.currentCmdVel == 0.0 && axis.logicalCmdVel == 0.0 &&
+            axis.targetVelocity == 0.0 && axis.targetEndVel == 0.0 &&
+            EDM52::Valid(stop) &&
+            !EDM52::AffectsSince(stop, feedback.scope.session, m_edmZObservedStopTicket) &&
+            !EDM52::RetiresSession(stop, feedback.scope.session) &&
+            m_edmZHeartbeatDeadlineUs != 0ULL && m_edmZMonotonicUs < m_edmZHeartbeatDeadlineUs)
+        {
+            axis.pid.Kp = axis.Pid_IDLE.Kp;
+            axis.pid.Ki = axis.Pid_IDLE.Ki;
+            axis.pid.Kd = axis.Pid_IDLE.Kd;
+            axis.pid.Kvff = axis.Pid_IDLE.Kvff;
+            // Qualification only: no PID-history change before the servo
+            // loop validates its current owner, input and prepared command.
+            if (physicalFixtureIntegralHold != nullptr)
+                *physicalFixtureIntegralHold = (physicalBidirectional && bidirectionalOrigin) || physicalBidirectionalFlushIntegralHold;
+            return;
         }
     }
 
@@ -17131,7 +20046,14 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     const MotionServoInputSnapshot& input)
 {
 
-    DetermineActiveGainSet(axis); // PID 依照狀態切換
+    // FIX10_GAIN_EDGE_BEGIN: capture before the configured gain selector.
+    const double edm94KiBefore = axis.pid.Ki;
+    const bool edm94HadMotionGains = m_edm94.Active() &&
+        axis.pid.Kp == axis.Pid_G00.Kp && axis.pid.Ki == axis.Pid_G00.Ki &&
+        axis.pid.Kd == axis.Pid_G00.Kd && axis.pid.Kvff == axis.Pid_G00.Kvff;
+    // FIX10_GAIN_EDGE_END
+    bool edmPhysicalIntegralHold = false;
+    DetermineActiveGainSet(axis, &edmPhysicalIntegralHold); // PID 依照狀態切換
 
         // =========================================================
         // 🌟 1. [Feedback Selection] 雙回授處理
@@ -17342,8 +20264,117 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     }
 
 
-    // CU_FIX1: only the exact live queued-source wait discards prior motion I.
-    // Every other owner/state retains its existing PI calculation.
+    // FIX10_ENDPOINT_INTEGRAL_BEGIN
+    // Preserve only the old I output at the authored G1 -> IDLE endpoint.
+    // P/FF gain selection, physical following windows and every output guard
+    // remain unchanged. The selected Ki edge makes this a one-time transfer.
+    if (edm94HadMotionGains && edm94KiBefore != axis.pid.Ki &&
+        m_edm94.Active() && m_edm94.Current().state == EDM94::State::Running &&
+        !m_edm94.ForceZero() && !m_edm94.HandoffZero() &&
+        axis.state == MotionState::MotionState_IDLE &&
+        axis.pid.Kp == axis.Pid_IDLE.Kp && axis.pid.Ki == axis.Pid_IDLE.Ki &&
+        axis.pid.Kd == axis.Pid_IDLE.Kd && axis.pid.Kvff == axis.Pid_IDLE.Kvff)
+    {
+        const auto& feedback = m_edm94.Current();
+        const auto& previous = m_edm94.LastFrame();
+        const auto& completed = m_Group.currentCmd;
+        const bool sourceCurrent = m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
+            m_ncSettleRuntimeCycleContiguous && m_edmZClockValid &&
+            previous.clockValid && previous.pdoValid && previous.sourceFresh && previous.healthy &&
+            previous.tick != (std::numeric_limits<std::uint64_t>::max)() &&
+            previous.tick + 1ULL == m_ncSettleRuntimeCycleTick &&
+            m_edmZMonotonicUs > previous.nowUs &&
+            m_edmZMonotonicUs - previous.nowUs <= m_edm94.FrozenConfig().maxSourceGapUs &&
+            axis.axisIndex >= 0 && axis.axisIndex < 6 &&
+            (m_servoSourceInputMask & (1U << static_cast<unsigned>(axis.axisIndex))) != 0U &&
+            (input.StatusWord & 0x006fU) == 0x0027U && input.ModesOfOperationDisplay == 9;
+        bool scope = sourceCurrent && feedback.armAccepted && feedback.handoffCompleted != 0U &&
+            !feedback.finishRequested && !feedback.cancelled && !feedback.faulted &&
+            m_edm94CancelSession.load(std::memory_order_acquire) < feedback.identity.session &&
+            m_edm94FinishSession.load(std::memory_order_acquire) < feedback.identity.session &&
+            !m_edm94HandoffPending && !m_edm94FormalStopRequested &&
+            servoLoopOwnerLease.owner == MotionOwner::AUTO &&
+            servoLoopOwnerLease.generation == feedback.identity.ownerGeneration &&
+            IsMotionOwnerLeaseCurrent(servoLoopOwnerLease) &&
+            !HasPendingExecutionEpochChange() && !HasPendingSafetyOrRecoveryRequests() &&
+            !HasUnacknowledgedSafetyMotionRequest() && !AlarmManager::GetInstance().HasAlarm() &&
+            m_pendingCommandSource.load(std::memory_order_acquire) == MotionCommandSource::NC_MEMORY &&
+            GetCurrentExecutionEpoch() == m_edm94ExpectedEpoch &&
+            previous.identity.session == feedback.identity.session &&
+            previous.identity.epoch == m_edm94ExpectedEpoch &&
+            previous.identity.ownerGeneration == feedback.identity.ownerGeneration &&
+            !m_Group.isActive && m_Group.cmdQueue.empty() && m_axisCommandChannel.command_size() == 0U &&
+            !m_pathHold.sourceSeen && !m_pathHold.startPending && !m_pathHold.status.admissionPending &&
+            m_pContexts != nullptr && m_pDrives != nullptr && m_pContexts->size() == 6U && m_pDrives->size() == 6U &&
+            completed.execution.IsAssigned() && completed.execution.epoch == m_edm94ExpectedEpoch &&
+            completed.execution.source == MotionCommandSource::NC_MEMORY && completed.ownerLease.Matches(servoLoopOwnerLease) &&
+            completed.mode == InterpolationMode::LINEAR && completed.axisCount == 6 &&
+            completed.pathCoreXYZCUVFeedExactStop && completed.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
+            m_Group.pathMode == PathMode::EXACT_STOP &&
+            admissionCorrection == MotionPathCoreAdmissionCorrectionDecision::NOT_APPLICABLE &&
+            cmd.instantCmdPos == axis.currentCmdPos && cmd.instantCmdVel == 0.0 &&
+            control.servoCommandPulse == axis.currentCmdPos && control.servoVelocityPPS == 0.0;
+        for (unsigned i = 0U; scope && i < 6U; ++i)
+        {
+            const auto& member = (*m_pContexts)[i];
+            scope = completed.axisIndices[i] == static_cast<int>(i) && m_Group.axisIndices[i] == static_cast<int>(i) &&
+                member.axisIndex == static_cast<int>(i) && member.isExist && !member.isVirtualAxis &&
+                member.axisType == (i < 3U ? AxisType::LINEAR : AxisType::ROTARY) &&
+                member.fbMode == FeedbackSource::MOTOR_ENCODER && member.isServoOn && !member.homeRuntime.active &&
+                !member.isFault && !member.isLagAlarm && member.state == MotionState::MotionState_IDLE &&
+                !member.hardLimitPositive && !member.hardLimitNegative && !member.positiveTravelBlocked && !member.negativeTravelBlocked &&
+                !member.enablePitch && !member.enableBacklash && member.currentCompOffset_unit == 0.0 &&
+                std::isfinite(member.currentCmdPos) && member.currentCmdPos == completed.targetPos[i] &&
+                member.planningPos == member.currentCmdPos && member.finalTargetPos == member.currentCmdPos &&
+                member.currentCmdVel == 0.0 && member.logicalCmdVel == 0.0 &&
+                member.targetVelocity == 0.0 && member.targetEndVel == 0.0;
+        }
+        double transferred = axis.pid.integralAcc;
+        if (!scope || !EDM94::TransferEndpointIntegral(edm94KiBefore, axis.pid.Ki,
+            axis.pid.integralAcc, axis.pid.MaxIntegral, transferred))
+        {
+            TripEDM94(!sourceCurrent ? EDM94::Reason::Source : !scope ? EDM94::Reason::Identity : EDM94::Reason::Output);
+            WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
+            return;
+        }
+        axis.pid.integralAcc = transferred;
+    }
+    // FIX10_ENDPOINT_INTEGRAL_END
+
+    // EDM74 FIX2 / EDM75/76: the exact committed P60 origin or P61/P62 settled
+    // target may start fresh I history. The controller limits this to one
+    // handoff per eligible entry. Recheck authority and the prepared target;
+    // work/endpoints/braking/travel/dwell and ordinary motion keep history.
+    if (edmPhysicalIntegralHold && admissionCorrection == MotionPathCoreAdmissionCorrectionDecision::NOT_APPLICABLE &&
+        axis.fbMode == FeedbackSource::MOTOR_ENCODER && axis.isServoOn && axis.targetMode == 9 &&
+        (input.StatusWord & 0x006FU) == 0x0027U && input.ModesOfOperationDisplay == 9 &&
+        servoLoopOwnerLease.owner == MotionOwner::AUTO && IsMotionOwnerLeaseCurrent(servoLoopOwnerLease) &&
+        !HasPendingExecutionEpochChange() && !HasPendingSafetyOrRecoveryRequests() &&
+        !AlarmManager::GetInstance().HasAlarm())
+    {
+        const auto& held = m_edmZPolicy.Snapshot();
+        const auto& heldDynamic = m_edmPhysicalMotion.Snapshot();
+        const double heldTarget = EDM28::IsPhysicalBidirectionalFlushFamilyProfile(held.frozenConfig.profile) ?
+            heldDynamic.commandPulse : held.outerOriginPulse;
+        const auto stop = m_edmZCancelFence.Read();
+        if (static_cast<std::uint8_t>(servoLoopOwnerLease.owner) == held.scope.owner &&
+            servoLoopOwnerLease.generation == held.scope.ownerGeneration &&
+            GetCurrentExecutionEpoch() == held.scope.executionEpoch && EDM52::Valid(stop) &&
+            !EDM52::AffectsSince(stop, held.scope.session, m_edmZObservedStopTicket) &&
+            !EDM52::RetiresSession(stop, held.scope.session) &&
+            cmd.instantCmdPos == heldTarget && cmd.instantCmdVel == 0.0 &&
+            control.servoCommandPulse == heldTarget && control.servoVelocityPPS == 0.0 &&
+            axis.currentActPos == m_edmZObservation.actualPulse && std::isfinite(error) &&
+            control.followingErrorPulse == cmd.instantCmdPos - axis.currentActPos &&
+            std::isfinite(axis.pid.Kp) && axis.pid.Kp > 0.0 &&
+            std::isfinite(axis.pid.Kd) && std::isfinite(axis.pid.Kvff) &&
+            std::isfinite(axis.pid.MaxIntegral) && axis.pid.MaxIntegral >= 0.0)
+            m_edmPhysicalMotion.HandoffOriginIntegral(m_ncSettleRuntimeCycleTick,
+                m_edmZMonotonicUs, axis.pid.Ki, axis.pid.integralAcc);
+    }
+
+    // CU_FIX1 queued-source correction remains separate. The ordinary PI
+    // calculation and anti-windup snapshot use the post-handoff I history.
     double p_term = error * axis.pid.Kp;
     const double edmZIntegralBefore = axis.pid.integralAcc;
     double i_term = 0.0;
@@ -17356,12 +20387,13 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     }
     else
     {
-        axis.pid.integralAcc += error * CYCLE_TIME_SEC;
-        if (axis.pid.integralAcc > axis.pid.MaxIntegral) axis.pid.integralAcc = axis.pid.MaxIntegral;
-        if (axis.pid.integralAcc < -axis.pid.MaxIntegral) axis.pid.integralAcc = -axis.pid.MaxIntegral;
-        i_term = axis.pid.integralAcc * axis.pid.Ki;
-        const double d_term = 0.0;
-        finalVel = (control.servoVelocityPPS * axis.pid.Kvff) + (p_term + i_term + d_term);
+        const EDM93PI::Gains gains{axis.pid.Kp, axis.pid.Ki, axis.pid.Kd,
+            axis.pid.Kvff, axis.pid.MaxIntegral};
+        const EDM93PI::Result evaluated = EDM93PI::Evaluate(gains,
+            axis.pid.integralAcc, error, control.servoVelocityPPS, CYCLE_TIME_SEC);
+        axis.pid.integralAcc = evaluated.integralAcc;
+        i_term = evaluated.iTerm;
+        finalVel = evaluated.velocityPps;
     }
 
     // =======================================================
@@ -17400,6 +20432,14 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
 
 
 
+    // EDM94 rejects nonfinite controller results before the legacy clamp
+    // could turn infinity into a seemingly valid maximum-speed command.
+    if (m_edm94.Active() && (!std::isfinite(finalVel) || !std::isfinite(axis.pid.integralAcc)))
+    {
+        axis.pid.integralAcc = edmZIntegralBefore;
+        TripEDM94(EDM94::Reason::Output);
+        finalVel = 0.0;
+    }
     // 5. [Output Clamp] 輸出限速保護
     // 限制不超過最大速度的 1.2 倍
     double limit = axis.maxVel_PPS * 1.2;
@@ -17587,12 +20627,32 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
 
     // Scope cap and finite validation precede the int32 conversion. Undo
     // integral accumulation on saturation or a zero fence; gains are unchanged.
+    const double edmZHardwareBeforeGuard = finalVel;
     if (m_edmZPolicy.Snapshot().capHeld)
     {
         const double guardedVelocity = GuardEDMZFixtureVelocity(axis.axisIndex, finalVel);
         if (guardedVelocity != finalVel || !std::isfinite(finalVel))
             axis.pid.integralAcc = edmZIntegralBefore;
         finalVel = guardedVelocity;
+    }
+    if (m_edm94.Active())
+    {
+        const double guarded = GuardEDM94Velocity(axis.axisIndex, finalVel);
+        if (guarded != finalVel || !std::isfinite(finalVel)) axis.pid.integralAcc = edmZIntegralBefore;
+        finalVel = guarded;
+    }
+    // EDM74 FIX1: retain the actual selected gains and pre-serialization
+    // local image at origin settle. No logging, clock read or output mutation.
+    // The image is not an acknowledgement from the drive.
+    if (axis.axisIndex == 2)
+    {
+        const bool idleGains = axis.pid.Kp == axis.Pid_IDLE.Kp && axis.pid.Ki == axis.Pid_IDLE.Ki &&
+            axis.pid.Kd == axis.Pid_IDLE.Kd && axis.pid.Kvff == axis.Pid_IDLE.Kvff;
+        const bool motionGains = axis.pid.Kp == axis.Pid_G00.Kp && axis.pid.Ki == axis.Pid_G00.Ki &&
+            axis.pid.Kd == axis.Pid_G00.Kd && axis.pid.Kvff == axis.Pid_G00.Kvff;
+        m_edmPhysicalMotion.ObserveOriginControl(m_ncSettleRuntimeCycleTick,
+            axis.pid.Kp, axis.pid.Ki, axis.pid.Kvff, p_term, i_term, finalVel,
+            idleGains, motionGains, finalVel != edmZHardwareBeforeGuard);
     }
     // 6. [Write PDO] 寫入 EtherCAT
     WriteServoTargetVelocityCommand(
@@ -17827,6 +20887,9 @@ void MotionCore::UpdateMotion(
     }
 
 
+    // EDM56_DYNAMIC_ROUTING_BEGIN: fresh single-Z tracking is an explicit
+    // alternative to the ordinary planner, after the same authority fences.
+    if (!GenerateEDMGapPhysicalCommand(axis, cmd))
     switch (axis.state)
     {
     case MotionState::MotionState_MOVING:
@@ -17959,6 +21022,7 @@ void MotionCore::UpdateMotion(
 
 
     // ==========================================
+    // EDM56_DYNAMIC_ROUTING_END
     // 🌟 2. [Layer 2.5] 進入補償層 (動態加入螺距與背隙誤差)
     // ==========================================
     // PBC-3J: this seam admits OFF or sealed physical-X zero calibration.
@@ -18170,7 +21234,8 @@ bool MotionCore::TryLineMove(
     bool pathCoreXYZCFeedExactStop,
     const NCXYZCFeedLineValue* xyzcGeometry,
     bool pathCoreXYZCUVFeedExactStop,
-    const NCXYZCUVFeedLineValue* xyzcuvGeometry) noexcept
+    const NCXYZCUVFeedLineValue* xyzcuvGeometry,
+    const EDM94FeedAuthorization* edm94Authorization) noexcept
 {
     if (preparedCommand != nullptr) *preparedCommand = MotionCommand{};
     if (producedIdentity != nullptr)
@@ -18655,6 +21720,17 @@ bool MotionCore::TryLineMove(
         return true;
     }
 
+    EDM94HandoffMessage edm94Handoff{};
+    const bool edm94Scoped = edm94Authorization != nullptr && edm94Authorization->session != 0ULL;
+    if (edm94Scoped && (mode != BufferMode::ABORTING || !xyzcuvScope ||
+        !PublishEDM94Handoff(*edm94Authorization, cmd, edm94Handoff)))
+    {
+        RequestEDM94Cancel(edm94Authorization->session);
+        RejectNonGeometryProducerMotionCommand(invalidCommand, commandEpoch, commandSource,
+            commandOwnerLease, MotionRejectReason::NOT_READY, producedIdentity, producedOwnerLease);
+        return false;
+    }
+
     // 2. 判斷是「乖乖排隊」還是「緊急覆寫」？
     if (mode == BufferMode::ABORTING)
     {
@@ -18680,6 +21756,7 @@ bool MotionCore::TryLineMove(
                 expectedOwnerLease,
                 publishedEpoch))
         {
+            if (edm94Scoped) RequestEDM94Cancel(edm94Authorization->session);
             const bool ownerStillCurrent =
                 IsMotionOwnerLeaseCurrent(expectedOwnerLease);
             const MotionExecutionEpoch currentEpoch =
@@ -18727,7 +21804,18 @@ bool MotionCore::TryLineMove(
         *producedOwnerLease = cmd.ownerLease;
     }
 
-    return TryEnqueueMotionCommand(cmd);
+    const bool accepted = TryEnqueueMotionCommand(cmd);
+    if (edm94Scoped)
+    {
+        edm94Handoff.command = cmd.execution; edm94Handoff.committed = true;
+        if (!accepted || cmd.execution.epoch != edm94Handoff.nextEpoch ||
+            !m_edm94HandoffMessages.ProducerTryPush(edm94Handoff))
+        {
+            RequestEDM94Cancel(edm94Authorization->session);
+            return false;
+        }
+    }
+    return accepted;
 }
 // =========================================================
 // Spiral / Variable Radius Arc Helpers
@@ -24199,6 +27287,12 @@ void MotionCore::UpdateInterpolation()
         }
         else if (!cncBoundaryFrameReady)
         {
+            if (m_edm96Profile && m_edm94.Active())
+            {
+                if (!StepEDM96Segment(vCmd)) return;
+            }
+            else
+            {
             vAxis.cruiseVel_PPS = vAxis.maxVel_PPS * m_Group.feedrateOverride;
             RefreshCncP1LateJunction();
             if (m_Group.currentCmd.cncFeedLookahead)
@@ -24212,6 +27306,7 @@ void MotionCore::UpdateInterpolation()
             else
             {
                 Calc_Trajectory_Trapezoidal(vAxis, vCmd);
+            }
             }
             if (m_Group.currentCmd.cncFeedLookahead && vAxis.inPosition &&
                 vAxis.targetEndVel > 0.1 && !m_safetyControlledStopInProgress &&
@@ -25661,7 +28756,51 @@ void MotionCore::UpdateInterpolation()
     last_log_VelX = current_log_VelX;
 }
 
+// FIX15: legacy callers retain their signatures; fresh START distinguishes
+// busy coherent sampling from a real axis/configuration conversion failure.
 void MotionCore::SyncVirtualEndPosition()
+{
+    (void)SyncVirtualEndPositionResult();
+}
+
+bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
+    double(&outputMCS)[MAX_AXES]) const noexcept
+{
+    return GetSynchronizedG00QueueTailMCSResult(outputMCS) ==
+        MotionQueueTailSyncResult::Ready;
+}
+
+MotionQueueTailSyncResult MotionCore::TrySynchronizeProgramStartQueueTailMCS(
+    MotionExecutionEpoch expectedEpoch,
+    const MotionOwnerLease& expectedLease,
+    double(&outputMCS)[MAX_AXES]) noexcept
+{
+    std::fill_n(outputMCS, MAX_AXES, 0.0);
+    const auto identityCurrent = [this, expectedEpoch, &expectedLease]() noexcept
+    {
+        const std::uint64_t epoch = m_executionEpochPublication.load(std::memory_order_acquire);
+        const std::uint64_t owner = m_motionOwnerState.load(std::memory_order_acquire);
+        return expectedEpoch != MOTION_EXECUTION_EPOCH_INVALID && expectedLease.IsValid() &&
+            UnpackExecutionEpochPublication(epoch) == expectedEpoch &&
+            (epoch & (EXECUTION_EPOCH_PUBLICATION_PENDING |
+                EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED)) == 0ULL &&
+            UnpackMotionOwnerState(owner).Matches(expectedLease) &&
+            (owner & MOTION_OWNER_ANY_OUTPUT_RESERVATION) == 0ULL;
+    };
+    if (!identityCurrent()) return MotionQueueTailSyncResult::Retry;
+    const MotionQueueTailSyncResult synchronized = SyncVirtualEndPositionResult();
+    if (!identityCurrent()) return MotionQueueTailSyncResult::Retry;
+    if (synchronized != MotionQueueTailSyncResult::Ready) return synchronized;
+    const MotionQueueTailSyncResult converted = GetSynchronizedG00QueueTailMCSResult(outputMCS);
+    if (!identityCurrent())
+    {
+        std::fill_n(outputMCS, MAX_AXES, 0.0);
+        return MotionQueueTailSyncResult::Retry;
+    }
+    return converted;
+}
+
+MotionQueueTailSyncResult MotionCore::SyncVirtualEndPositionResult() noexcept
 {
     // Invalidate the identity tag first.  Pulses and the valid mask are only
     // producer-owned staging data until a coherent Epoch/Owner sample is
@@ -25673,7 +28812,7 @@ void MotionCore::SyncVirtualEndPosition()
 
     if (m_pContexts == nullptr || m_pContexts->empty())
     {
-        return;
+        return MotionQueueTailSyncResult::InvalidMapping;
     }
 
     // Sample each packed identity word exactly once at entry.  Reading the
@@ -25688,7 +28827,7 @@ void MotionCore::SyncVirtualEndPosition()
         (entryExecutionPublication &
             EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL)
     {
-        return;
+        return MotionQueueTailSyncResult::Retry;
     }
 
     const MotionExecutionEpoch entryEpoch =
@@ -25698,7 +28837,7 @@ void MotionCore::SyncVirtualEndPosition()
     if (entryEpoch == MOTION_EXECUTION_EPOCH_INVALID ||
         !entryOwnerLease.IsValid())
     {
-        return;
+        return MotionQueueTailSyncResult::Retry;
     }
 
     std::array<double, MAX_AXES> stagedTailPulse{};
@@ -25717,7 +28856,7 @@ void MotionCore::SyncVirtualEndPosition()
         // sidecar makes the entire baseline unusable.
         if (axisSlot >= static_cast<std::size_t>(MAX_AXES))
         {
-            return;
+            return MotionQueueTailSyncResult::InvalidMapping;
         }
 
         // logicalCmdPos is written by the RT owner.  At this drained lifecycle
@@ -25726,7 +28865,7 @@ void MotionCore::SyncVirtualEndPosition()
         const double referencePulse = axis.logicalCmdPos.Load();
         if (!std::isfinite(referencePulse))
         {
-            return;
+            return MotionQueueTailSyncResult::InvalidMapping;
         }
 
         stagedTailPulse[axisSlot] = referencePulse;
@@ -25749,7 +28888,7 @@ void MotionCore::SyncVirtualEndPosition()
         exitExecutionPublication != entryExecutionPublication ||
         exitOwnerState != entryOwnerState)
     {
-        return;
+        return MotionQueueTailSyncResult::Retry;
     }
 
     // Commit only the coherent staged sample.  The legacy per-axis atomic
@@ -25768,10 +28907,11 @@ void MotionCore::SyncVirtualEndPosition()
     m_g00ProducerQueueTailValidMask = validMask;
     m_g00ProducerQueueTailOwnerLease = entryOwnerLease;
     m_g00ProducerQueueTailEpoch = entryEpoch;
+    return MotionQueueTailSyncResult::Ready;
 }
 
 
-bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
+MotionQueueTailSyncResult MotionCore::GetSynchronizedG00QueueTailMCSResult(
     double(&outputMCS)[MAX_AXES]) const noexcept
 {
     std::fill_n(outputMCS, MAX_AXES, 0.0);
@@ -25779,7 +28919,7 @@ bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
 
     if (m_pContexts == nullptr || m_pContexts->empty())
     {
-        return false;
+        return MotionQueueTailSyncResult::InvalidMapping;
     }
 
     const std::uint64_t entryExecutionPublication =
@@ -25791,7 +28931,7 @@ bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
         (entryExecutionPublication &
             EXECUTION_EPOCH_PUBLICATION_COMMIT_RESERVED) != 0ULL)
     {
-        return false;
+        return MotionQueueTailSyncResult::Retry;
     }
 
     const MotionExecutionEpoch entryEpoch =
@@ -25804,7 +28944,7 @@ bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
         !m_g00ProducerQueueTailOwnerLease.IsValid() ||
         !m_g00ProducerQueueTailOwnerLease.Matches(entryOwnerLease))
     {
-        return false;
+        return MotionQueueTailSyncResult::Retry;
     }
 
     const std::array<double, MAX_AXES> stagedTailPulse =
@@ -25820,7 +28960,7 @@ bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
     {
         if (!std::isfinite(tailPulse))
         {
-            return false;
+            return MotionQueueTailSyncResult::InvalidMapping;
         }
     }
 
@@ -25846,14 +28986,14 @@ bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
             !std::isfinite(axis.finalLead) ||
             axis.resolution_PPR == 0.0)
         {
-            return false;
+            return MotionQueueTailSyncResult::InvalidMapping;
         }
 
         double mcsUnit =
             tailPulse * axis.finalLead / axis.resolution_PPR;
         if (!std::isfinite(mcsUnit))
         {
-            return false;
+            return MotionQueueTailSyncResult::InvalidMapping;
         }
 
         // Match Reset rebase semantics: modulo-normalize only a configured
@@ -25870,7 +29010,7 @@ bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
         }
         if (!std::isfinite(mcsUnit))
         {
-            return false;
+            return MotionQueueTailSyncResult::InvalidMapping;
         }
 
         convertedMCS[axisSlot] = mcsUnit;
@@ -25882,7 +29022,7 @@ bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
     {
         if ((*m_pContexts)[axisSlot].isExist)
         {
-            return false;
+            return MotionQueueTailSyncResult::InvalidMapping;
         }
     }
 
@@ -25907,14 +29047,14 @@ bool MotionCore::TryGetSynchronizedG00QueueTailMCS(
         !stagedTailOwnerLease.Matches(entryOwnerLease) ||
         m_g00ProducerQueueTailValidMask != stagedValidMask)
     {
-        return false;
+        return MotionQueueTailSyncResult::Retry;
     }
 
     std::copy(
         convertedMCS.begin(),
         convertedMCS.end(),
         outputMCS);
-    return true;
+    return MotionQueueTailSyncResult::Ready;
 }
 bool MotionCore::IsGroupStandstill() const
 {

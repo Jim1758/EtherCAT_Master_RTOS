@@ -1511,6 +1511,12 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
     workspace.targetPulse.clear();
     workspace.rotaryAxes.clear();
     workspace.xyzcuvInput = NCXYZCUVFeedLineInput{};
+    EDM94FeedAuthorization edm94Authorization{};
+    if (!TakeEDM94FeedAuthorization(programmedValues, feedMMMin, edm94Authorization))
+    {
+        result.code = MotionFeedLineCode::NOT_READY;
+        return false;
+    }
     const bool absolute = m_pendingTranslation.distanceMode == 90;
     const MotionExecutionEpoch plannedEpoch = GetCurrentExecutionEpoch();
     const MotionOwnerLease plannedOwner = GetMotionOwnerLease();
@@ -1706,7 +1712,8 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
         result.xyzcuv.velocityPPS, workspace.accTime, workspace.decTime,
         BufferMode::ABORTING, MotionCommandPathMode::EXACT_STOP,
         &result.identity, &result.ownerLease, plannedEpoch, &plannedOwner,
-        false, nullptr, 0.0, false, nullptr, false, nullptr, false, nullptr, false, nullptr, true, &result.xyzcuv);
+        false, nullptr, 0.0, false, nullptr, false, nullptr, false, nullptr, false, nullptr, true, &result.xyzcuv,
+        edm94Authorization.session ? &edm94Authorization : nullptr);
     result.translationGeneration = m_pendingTranslation.generation;
     result.commandAccepted = accepted;
     if (!accepted)

@@ -186,9 +186,6 @@
     <ClCompile Include="EtherCAT_Function.cpp">
       <Filter>Source Files\EtherCAT_Master\EtherCAT_Function</Filter>
     </ClCompile>
-    <ClCompile Include="GCodeParser.cpp">
-      <Filter>Source Files\NC</Filter>
-    </ClCompile>
     <ClCompile Include="AlarmManager.cpp">
       <Filter>Source Files\Alarm</Filter>
     </ClCompile>
@@ -486,6 +483,18 @@
     <ClCompile Include="NCManager_Gap.cpp">
       <Filter>Source Files\NC\EDM</Filter>
     </ClCompile>
+    <ClCompile Include="EDMConditionService.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClCompile>
+    <ClCompile Include="EDMProcessTuningService.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClCompile>
+    <ClCompile Include="NCManager_EDMServo.cpp">
+      <Filter>Source Files\NC\EDM</Filter>
+    </ClCompile>
+    <ClCompile Include="GCodeParser.cpp">
+      <Filter>Source Files\NC\GM_Code</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="EtherCAT_Master_RTOS.h">
@@ -529,9 +538,6 @@
     </ClInclude>
     <ClInclude Include="tinyxml2.h">
       <Filter>Header Files\Function</Filter>
-    </ClInclude>
-    <ClInclude Include="GCodeParser.h">
-      <Filter>Header Files\NC</Filter>
     </ClInclude>
     <ClInclude Include="AlarmManager.h">
       <Filter>Header Files\Alarm</Filter>
@@ -577,12 +583,6 @@
     </ClInclude>
     <ClInclude Include="NC_Types.h">
       <Filter>Header Files\NC\NC</Filter>
-    </ClInclude>
-    <ClInclude Include="NCPathCoreCutterContour.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="NCPathCoreCutterLine.h">
-      <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="NCManager.h">
       <Filter>Header Files\NC\NC</Filter>
@@ -973,6 +973,75 @@
     </ClInclude>
     <ClInclude Include="MotionPbcXSendAudit.h">
       <Filter>Header Files\Motion</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMFlushPhysicalRuntime.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMGapServoPhysicalRuntime.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMAnalogInput.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMAxisGainProfiles.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMConditionCommandContract.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMConditionDefaults.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMConditionService.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMConditionStartupIO.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMDataDiagContract.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMFlushPlan.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMGapInput.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMGapInputConfigIO.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMGapServo.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMProcessConfigIO.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMProcessProfile.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMProcessTuningCodec.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMProcessTuningContract.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMProcessTuningService.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="EDMToolHeadKinematics.h">
+      <Filter>Header Files\EDM</Filter>
+    </ClInclude>
+    <ClInclude Include="NCMainThreadStackPolicy.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCutterContour.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="NCPathCoreCutterLine.h">
+      <Filter>Header Files\NC\NC</Filter>
+    </ClInclude>
+    <ClInclude Include="GCodeParser.h">
+      <Filter>Header Files\NC\GM_Code</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

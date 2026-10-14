@@ -30,10 +30,43 @@
 #include "EDMRecipeConfigIO.h"
 #include "EDMConditionStartupIO.h"
 #include "EDMProcessConfigIO.h"
+#include "EDMToolHeadProfileIO.h"
 
 
 namespace
 {
+    // EDM87: optional diagnostic catalog, loaded before NC starts. Never read
+    // files from admission or the Motion callback. Invalid/missing input only
+    // disables explicit Q4 R selection; legacy Q4 and normal CNC stay available.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__)
+    __attribute__((noinline))
+#endif
+    void LoadEDM87ToolHeadCatalogBeforeStart(NCManager& nc,
+        const std::string& parameterDirectory) noexcept
+    {
+        EDM87::Catalog catalog{};
+        EDM87::Diagnostic diagnostic{};
+        std::string path;
+        bool loaded = false, exception = false;
+        try
+        {
+            path = parameterDirectory + "EDMToolHeadProfiles.ini";
+            loaded = EDM87::LoadFile(path.c_str(), catalog, diagnostic);
+        }
+        catch (...) { exception = true; }
+        if (!loaded) catalog = EDM87::Catalog{};
+        // An invalid empty catalog records a disabled one-shot installation.
+        const bool installed = nc.InstallEDMToolHeadCatalogBeforeStart(catalog);
+        RtPrintf("[EDM87] event=TOOL_HEAD_CATALOG result=%s catalogRev=%llu count=%u file=%.160s line=%u reason=%s calibration=REFERENCE_ONLY load=BOOT freeze=ADMISSION reload=RESTART output=NONE motion=0 physicalPermit=0 discharge=0\n",
+            loaded && installed ? "READY" : "DISABLED",
+            static_cast<unsigned long long>(loaded && installed ? catalog.revision : 0ULL),
+            loaded && installed ? catalog.count : 0U, path.c_str(),
+            static_cast<unsigned>(diagnostic.line),
+            exception ? "EXCEPTION" : loaded ? (installed ? "OK" : "INSTALL") : EDM87::ErrorName(diagnostic.error));
+    }
+
     bool PbcBootFailure(int alarm, const pbc::Diagnostic& d, const char* source)
     {
         DEBUG_PRINT("[PBC-1][AL%d] source=%s axis=%d reason=%s lineOrRow=%u column=%u\n",
@@ -1547,6 +1580,8 @@ bool GlobalConfig::InitSystemParameters(EtherCatMaster& master)
                 static_cast<unsigned>(processProfile.revision), static_cast<unsigned>(processProfile.machineProfileId),
                 static_cast<unsigned>(master.m_Axes.size()));
     }
+
+    LoadEDM87ToolHeadCatalogBeforeStart(*master.m_NC, GlobalConfig::GetInstance().ParameterDir);
 
     PrintCNCStartupStackCheckpoint("NC_CONFIG_EXIT");
     //載入Home設定

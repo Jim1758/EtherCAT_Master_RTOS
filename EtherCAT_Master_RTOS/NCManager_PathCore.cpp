@@ -3571,6 +3571,9 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
 
 bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
 {
+    // EDM94 is a separately preflighted, stopped-only G91 physical bracket.
+    // Only its exact P85/P86 scope may bypass the generic retained/GAP ban.
+    if (IsEDM94TranslationBracketAllowedSameThread(block)) return true;
     // This pure shape gate may run before dispatch for a frozen frame. Exact
     // authored-source preflight still precedes every ExecuteBlock side effect.
     if (IsEDMRecipeEditRequest(block))

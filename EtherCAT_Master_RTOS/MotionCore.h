@@ -64,6 +64,15 @@ struct MotionEccentricCProducerWorkspace;
 #include "EDMSixAxisPhysicalGuard.h"
 #include "EDMSixAxisGapBoundary.h"
 #include "EDMSixAxisGapSegment.h"
+#include "EDMSixAxisCommonPath.h"
+#include "EDMSixAxisB2Excursion.h"
+#include "EDMSixAxisCurveRuntime.h"
+#include "EDMSixAxisArcExecution.h"
+#include "EDMSixAxisCurveB2Excursion.h"
+#include "EDMSixAxisModeFlush.h"
+#include "EDMSixAxisModeInterruption.h"
+#include "EDMSixAxisGapTraversal.h"
+#include "EDMSixAxisGapTraversalFixture.h"
 #include "EDMSixAxisGapTuning.h"
 #include "EDMSixAxisGapContinuous.h"
 #include "EDMSixAxisGapEndurance.h"
@@ -71,6 +80,107 @@ struct MotionEccentricCProducerWorkspace;
 #include "EDMSixAxisGapFlushPath.h"
 #include "EDMSixAxisSerializedGuard.h"
 #include "AlarmManager.h"
+
+// EDM126 supplementary evidence; only live authority grants physical output.
+namespace EDM126
+{
+    struct MotionFeedback
+    {
+        Feedback traversal{};
+        Source authorizedSource{};
+        std::uint64_t session=0ULL, armEpoch=0ULL, ownerGeneration=0ULL, liveEpoch=0ULL;
+        std::uint64_t tick=0ULL, nowUs=0ULL, lastMappingTick=0ULL, lastMappingUs=0ULL;
+        std::uint64_t sourceSequence=0ULL, sourceCapturedUs=0ULL;
+        unsigned fixture=0U, authorizedRows=0U, completedRows=0U;
+        bool enabled=false, active=false, sourceReady=false, rowActive=false, rowCompleted=false, faulted=false;
+        double voltage=0.0, targetRatio=0.0;
+        EDM88::Reason sourceReason=EDM88::Reason::None;
+        Reason reason=Reason::None;
+    };
+    static_assert(sizeof(MotionFeedback)<=1024U && std::is_trivially_copyable<MotionFeedback>::value,
+        "EDM126 feedback must be fixed size.");
+}
+
+// EDM109 records only geometry actually admitted and mapped by the existing
+// six-axis guard. This value is evidence, never a cross-segment motion permit.
+namespace EDM109
+{
+    struct Feedback
+    {
+        std::uint64_t session = 0ULL, armEpoch = 0ULL, epoch = 0ULL;
+        std::uint64_t ownerGeneration = 0ULL, run = 0ULL, cache = 0ULL, dispatch = 0ULL;
+        std::uint64_t segmentId = 0ULL, translationGeneration = 0ULL;
+        std::uint64_t mappedSamples = 0ULL, lastMappingTick = 0ULL, lastMappingUs = 0ULL;
+        std::array<double, 6U> startPulse{}, endPulse{}, pulsePerUnit{};
+        std::array<std::uint64_t, 6U> configFingerprint{}, mappingFingerprint{};
+        double pulseLength = 0.0;
+        int sourcePC = -1;
+        unsigned step = 0U, begunSegments = 0U, mappedSegments = 0U;
+        bool enabled = false, lineValid = false, mappedOutput = false, completed = false;
+    };
+    static_assert(sizeof(Feedback) <= 512U && std::is_trivially_copyable<Feedback>::value,
+        "EDM109 feedback must remain a small fixed RT publication.");
+}
+
+namespace EDM110
+{
+    struct MotionFeedback
+    {
+        Feedback excursion{};
+        EDM109::Source trigger{};
+        std::uint64_t session = 0ULL, armEpoch = 0ULL, ownerGeneration = 0ULL;
+        std::uint64_t previousBoundaryTick = 0ULL, previousCommit = 0ULL, lastPhysicalTick = 0ULL;
+        unsigned rangeResets = 0U, eventsStarted = 0U, eventsCompleted = 0U;
+        bool enabled = false, tokenValidated = false, geometryCurrent = false, repeat = false;
+    };
+    static_assert(sizeof(MotionFeedback) <= 512U && std::is_trivially_copyable<MotionFeedback>::value,
+        "EDM110 motion evidence must remain bounded.");
+}
+
+namespace EDM115
+{
+    struct MotionFeedback
+    {
+        Feedback excursion{};
+        EDM109::Source trigger{};
+        CompletionToken previous{};
+        Point anchorPulse{}, returnedPulse{};
+        double anchorQ = 0.0;
+        std::uint64_t session = 0ULL, armEpoch = 0ULL, ownerGeneration = 0ULL;
+        std::uint64_t previousBoundaryTick = 0ULL, previousCommit = 0ULL, lastPhysicalTick = 0ULL;
+        unsigned rangeResets = 0U, eventsStarted = 0U, eventsCompleted = 0U;
+        unsigned completedDwellsTotal = 0U, anchorReturnsTotal = 0U;
+        EDM114::Kind currentKind = EDM114::Kind::None, previousKind = EDM114::Kind::None;
+        bool enabled = false, tokenValidated = false, geometryCurrent = false;
+    };
+    static_assert(sizeof(MotionFeedback) <= 1024U && std::is_trivially_copyable<MotionFeedback>::value,
+        "EDM115 motion evidence must remain bounded.");
+}
+
+namespace EDM116
+{
+    struct MotionFeedback
+    {
+        Feedback excursion{};
+        EDM109::Source trigger{}, rowSource{};
+        Policy policy{}, rowPolicy{};
+        EDM115::CompletionToken previous{};
+        Point anchorPulse{}, returnedPulse{}, retreatPulse{};
+        double anchorQ=0.0, strokeNativeMm=0.0;
+        std::uint64_t deadlineUs=0ULL, session=0ULL, armEpoch=0ULL, ownerGeneration=0ULL;
+        std::uint64_t previousBoundaryTick=0ULL, previousCommit=0ULL, lastPhysicalTick=0ULL;
+        std::array<unsigned,3U> modeStarted{}, modeCompleted{};
+        std::uint64_t topDwellTicks=0ULL,topDwellUs=0ULL,returnDwellTicks=0ULL,returnDwellUs=0ULL;
+        unsigned topSettledCycles=0U,returnSettledCycles=0U;
+        unsigned rangeResets=0U, eventsStarted=0U, eventsCompleted=0U;
+        unsigned completedDwellsTotal=0U, anchorReturnsTotal=0U, authorizedRows=0U, completedRows=0U;
+        EDM114::Kind currentKind=EDM114::Kind::None, previousKind=EDM114::Kind::None;
+        Fixture fixture=Fixture::Canonical116; // independently frozen by RT arm
+        bool enabled=false, tokenValidated=false, geometryCurrent=false;
+    };
+    static_assert(sizeof(MotionFeedback)<=1024U && std::is_trivially_copyable<MotionFeedback>::value,
+        "EDM116 fixed mode and source evidence");
+}
 
 class EtherCatMaster;
 constexpr int MAX_AXES = 8;//最大軸數宣告
@@ -2329,8 +2439,55 @@ public:
     bool SubmitEDM104Arm(std::uint64_t session, MotionExecutionEpoch epoch,
         const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
     bool SubmitEDM105Arm(std::uint64_t session, MotionExecutionEpoch epoch,
-        const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+        const EDM107::FlushProfile& flushProfile = EDM107::FlushProfile{},
+        bool commonPath = false, bool b2CrossSegment = false, bool b2Repeat = false,
+        bool curveRuntime = false, bool physicalCurve = false, bool curveB2 = false, bool modeFlush = false,
+        EDM116::Fixture modeFixture = EDM116::Fixture::Canonical116) noexcept;
+    bool SubmitEDM114Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+        const EDM107::FlushProfile& flushProfile) noexcept;
+    bool AuthorizeEDM114Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
+        const std::array<double, 6U>& increment, const std::array<double, 2U>& center,
+        double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+        const EDM97::Tuning& tuning, const EDM107::FlushProfile& flushProfile) noexcept;
+    bool SubmitEDM115Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+        const EDM107::FlushProfile& flushProfile) noexcept;
+    bool AuthorizeEDM115Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
+        const std::array<double, 6U>& increment, const std::array<double, 2U>& center,
+        double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+        const EDM97::Tuning& tuning, const EDM107::FlushProfile& flushProfile,
+        const EDM115::CompletionToken& previous) noexcept;
+    bool SubmitEDM116Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+        const EDM107::FlushProfile& flushProfile,
+        EDM116::Fixture fixture = EDM116::Fixture::Canonical116) noexcept;
+    bool AuthorizeEDM116Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
+        const std::array<double,6U>& increment, const std::array<double,2U>& center,
+        double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+        const EDM97::Tuning& tuning, const EDM107::FlushProfile& flushProfile,
+        const EDM116::Policy& policy, const EDM115::CompletionToken& previous) noexcept;
+    bool ReadEDM116Feedback(EDM116::MotionFeedback& feedback) const noexcept;
+    bool ReadEDM118Feedback(EDM118::Feedback& feedback) const noexcept;
+    bool ReadEDM115Feedback(EDM115::MotionFeedback& feedback) const noexcept;
+    bool ReadEDM114Feedback(EDM114::Feedback& feedback) const noexcept;
+    bool SubmitEDM126Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning, unsigned fixture) noexcept;
+    bool AuthorizeEDM126Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
+        const std::array<double,6U>& increment, const std::array<double,2U>& center,
+        double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+        const EDM97::Tuning& tuning, const EDM114::Source& previousSource,
+        std::uint64_t completionCommit, std::uint64_t completionTick) noexcept;
+    bool ReadEDM126Feedback(EDM126::MotionFeedback& feedback) const noexcept;
     bool ReadEDM96Feedback(EDM96::Feedback& feedback) const noexcept;
+    bool ReadEDM109Feedback(EDM109::Feedback& feedback) const noexcept;
+    bool ReadEDM113Feedback(EDM113::Feedback& feedback) const noexcept;
+    bool ReadEDM110Feedback(EDM110::MotionFeedback& feedback) const noexcept;
     void RequestEDM94Finish(std::uint64_t session) noexcept;
     void RequestEDM94Cancel(std::uint64_t session, bool externalStop = false) noexcept;
     void RequestEDM94Release(std::uint64_t session) noexcept;
@@ -2378,7 +2535,11 @@ public:
     bool AuthorizeEDM105Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
         std::uint64_t dispatch, int sourcePC, unsigned step,
         const std::array<double, 6U>& increment, double feedMMMin,
-        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM97::Tuning& tuning) noexcept;
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+        const EDM107::FlushProfile& flushProfile = EDM107::FlushProfile{},
+        bool commonPath = false, bool b2CrossSegment = false,
+        const EDM110::CompletionToken& previous = EDM110::CompletionToken{}, bool b2Repeat = false,
+        bool curveRuntime = false) noexcept;
     bool CheckEDM94Endpoint(const std::array<double, 6U>& nativePulse,
         MotionExecutionEpoch epoch, const MotionOwnerLease& lease) const noexcept;
     // EDM69 routes real A/D into a scoped RT calculation only. It owns no
@@ -3405,7 +3566,18 @@ private:
         bool endurance = false;
         bool paired = false;
         bool flush = false;
+        bool commonPath = false; // EDM109 explicit opt-in; frozen at arm
+        bool b2CrossSegment = false; // EDM110 bounded physical previous-row excursion
+        bool b2Repeat = false; // EDM111 immutable second event at step 4
+        bool curveRuntime = false; // EDM113 scratch-only RT curve observation
+        bool physicalCurve = false; // EDM114 explicit physical LINEAR6 / ARC2 profile
+        bool curveB2 = false; // EDM115 explicit frozen LINEAR6 / ARC2 excursion
+        bool modeFlush = false; // EDM116 actual B0/B1/B2 flush selector
+        bool historyServo = false; // EDM126 distinct signal-driven retained-curve profile
+        unsigned historyFixture = 0U;
+        EDM116::Fixture modeFixture = EDM116::Fixture::Canonical116; // fixed at arm; never row-selected
         EDM97::Tuning tuning{0.0, 0.0, 0.0};
+        EDM107::FlushProfile flushProfile{}; // copied NC -> RT; immutable for this session
     };
     // FIX4: NC is the sole authorization/message producer; the serialized
     // Motion/send owner alone consumes and mutates the transient zero bridge.
@@ -3418,7 +3590,14 @@ private:
         double feedMMMin = 0.0;
         MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
         MotionOwnerLease lease{};
+        int gCode = 1;
+        std::array<double, 2U> arcCenter{};
         EDM95::Permit gapPermit{};
+        EDM110::CompletionToken previous{};
+        EDM115::CompletionToken previousCurve{};
+        EDM116::Policy modePolicy{};
+        std::uint64_t historyBoundaryTick=0ULL, historyCommit=0ULL;
+        EDM126::Source historyPrevious{};
         bool gapSegment = false;
         bool proportional = false;
         bool noise = false;
@@ -3427,7 +3606,17 @@ private:
         bool endurance = false;
         bool paired = false;
         bool flush = false;
+        bool commonPath = false; // EDM109 explicit opt-in; frozen at arm
+        bool b2CrossSegment = false; // EDM110 bounded physical previous-row excursion
+        bool b2Repeat = false; // EDM111 immutable second event at step 4
+        bool curveRuntime = false; // EDM113 scratch-only RT curve observation
+        bool physicalCurve = false; // EDM114 explicit physical LINEAR6 / ARC2 profile
+        bool curveB2 = false; // EDM115 explicit frozen LINEAR6 / ARC2 excursion
+        bool modeFlush = false; // EDM116 actual B0/B1/B2 flush selector
+        bool historyServo = false; // EDM126 distinct signal-driven retained-curve profile
+        unsigned historyFixture = 0U;
         EDM97::Tuning tuning{0.0, 0.0, 0.0};
+        EDM107::FlushProfile flushProfile{}; // copied NC -> RT; immutable for this session
     };
     struct EDM94HandoffMessage
     {
@@ -3437,6 +3626,9 @@ private:
         std::array<double, 6U> targetPulse{};
         std::array<double, 6U> gapSegmentStartPulse{};
         double targetVelocity = 0.0, acceleration = 0.0, deceleration = 0.0;
+        std::array<double, 6U> arcPulsePerNative{};
+        std::array<double, 2U> arcCenterPulse{};
+        double arcRadius = 0.0, arcStartAngle = 0.0, arcSweep = 0.0, arcLength = 0.0;
         std::uint64_t ownerWord = 0ULL, executionWord = 0ULL;
         std::uint64_t safetyWord = 0ULL, alarmSafetyWord = 0ULL;
         std::uint32_t alarmRevision = 0U;
@@ -3466,6 +3658,55 @@ private:
     bool m_edm102Profile = false;
     bool m_edm104Profile = false;
     bool m_edm105Profile = false;
+    EDM107::FlushProfile m_edm107ArmFlushProfile{}; // RT-owned frozen arm value; never read from NC state
+    bool m_edm109Profile = false;
+    EDM109::Mapping m_edm109Mapping{}; // retained through the existing formal stop
+    MotionExecutionIdentity m_edm109Command{};
+    EDM109::Feedback m_edm109Current{}; // RT writer only
+    EDM53::Channel<EDM109::Feedback, 512U> m_edm109Feedback{};
+    bool IsEDM109PublishedProfile(std::uint64_t session, bool commonPath) const noexcept;
+    bool IsEDM109ProfileCurrent(bool commonPath) const noexcept;
+    bool IsEDM109MappingCurrent() const noexcept;
+    bool MapEDM109Line(AxisCommand& command) noexcept;
+    void PublishEDM109Feedback() noexcept;
+    static_assert(sizeof(EDM113::Observer) <= 4096U, "EDM113 fixed RT observation state budget");
+    bool m_edm113Profile = false;
+    EDM113::Observer m_edm113{}; // RT-owned scratch only; never controls mapped output
+    EDM53::Channel<EDM113::Feedback, 512U> m_edm113Feedback{};
+    bool IsEDM113PublishedProfile(std::uint64_t session, bool enabled) const noexcept;
+    bool IsEDM113ProfileCurrent(bool enabled) const noexcept;
+    bool CaptureEDM113Source(EDM109::Source& source) const noexcept;
+    void BindEDM113Curve() noexcept;
+    void ObserveEDM113Line(const AxisCommand& command) noexcept;
+    void SuspendEDM113Curve() noexcept;
+    void PublishEDM113Feedback() noexcept;
+    bool m_edm110Profile = false, m_edm110Driving = false, m_edm111Repeat = false;
+    EDM110::Excursion m_edm110{};
+    EDM110::MotionFeedback m_edm110Current{};
+    EDM53::Channel<EDM110::MotionFeedback, 512U> m_edm110Feedback{};
+    EDM109::Line m_edm110PreviousLine{}, m_edm110OriginalLine{};
+    double m_edm110LastAccelTime = 0.0, m_edm110LastDecelTime = 0.0;
+    double m_edm110PreviousAccelTime = 0.0, m_edm110PreviousDecelTime = 0.0;
+    double m_edm110OriginalMaxVelocity = 0.0, m_edm110OriginalAcceleration = 0.0, m_edm110OriginalDeceleration = 0.0;
+    std::array<double, 6U> m_edm110StopTime{}, m_edm110Reference{}, m_edm110ActualMin{}, m_edm110ActualMax{};
+    std::uint64_t m_edm110PhysicalTick = 0ULL;
+    unsigned m_edm110PhysicalSpan = 0U;
+    EDM109::Point m_edm110MappedReference{};
+    std::uint64_t m_edm110MappedTick = 0ULL;
+    unsigned m_edm110MappedSpan = 0U;
+    bool m_edm110MappedZero = false, m_edm110SameReferencePriorTick = false;
+    bool m_edm110PhysicalQualified = false, m_edm110RangeValid = false;
+    bool IsEDM110PublishedProfile(std::uint64_t session, bool enabled, bool repeat = false) const noexcept;
+    bool IsEDM110ProfileCurrent(bool enabled) const noexcept;
+    bool ValidateEDM110Previous(const EDM94FeedAuthorization& authorization) noexcept;
+    bool IsEDM110GeometryCurrent() const noexcept;
+    bool IsEDM110VirtualCurrent() const noexcept;
+    void ObserveEDM110PhysicalSettle(bool complete, const EDM94::RuntimeDiagnostic& priorSendProof) noexcept;
+    bool BeginEDM110Excursion(AxisCommand& command) noexcept;
+    bool StepEDM110Excursion(AxisCommand& command, bool stopping) noexcept;
+    void ApplyEDM110Scalar(AxisCommand& command, bool stopping) noexcept;
+    bool MapEDM110Excursion() noexcept;
+    void PublishEDM110Feedback() noexcept;
     void ServiceEDM96Source() noexcept;
     void PublishEDM96Feedback() noexcept;
     bool BeginEDM96Segment() noexcept;
@@ -3473,7 +3714,145 @@ private:
     bool AuthorizeEDM94FeedScoped(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
         std::uint64_t dispatch, int sourcePC, unsigned step,
         const std::array<double, 6U>& increment, double feedMMMin,
-        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, bool endurance, bool paired = false, bool flush = false) noexcept;
+        MotionExecutionEpoch epoch, const MotionOwnerLease& lease, bool endurance, bool paired = false, bool flush = false,
+        const EDM107::FlushProfile& flushProfile = EDM107::FlushProfile{},
+        bool commonPath = false, bool b2CrossSegment = false,
+        const EDM110::CompletionToken& previous = EDM110::CompletionToken{}, bool b2Repeat = false,
+        bool curveRuntime = false, bool physicalCurve = false, int gCode = 1,
+        const std::array<double, 2U>& center = std::array<double, 2U>{}, bool curveB2 = false,
+        const EDM115::CompletionToken& previousCurve = EDM115::CompletionToken{}, bool modeFlush = false,
+        const EDM116::Policy& modePolicy = EDM116::Policy{}) noexcept;
+    bool TakeEDM114ArcAuthorization(const std::array<double, 6U>& increment,
+        const std::array<double, 6U>& startNative, const std::array<double, 2U>& center, int gCode, double feedMMMin,
+        EDM94FeedAuthorization& result) noexcept;
+    bool PublishEDM114ArcHandoff(const EDM94FeedAuthorization& authorization,
+        const MotionCommand& command, const std::array<double, 6U>& startPulse,
+        const std::array<double, 6U>& endPulse, const std::array<double, 6U>& pulsePerNative,
+        double startAngle, double sweepRadians, double length,
+        EDM94HandoffMessage& message) noexcept;
+    // EDM126 bounded traversal state (no NC rewind or historical side-effect replay).
+    bool m_edm126Profile=false, m_edm126Participating=false, m_edm126PhysicalSettled=false;
+    EDM126::Traversal m_edm126{};
+    EDM126::MotionFeedback m_edm126Current{};
+    EDM53::Channel<EDM126::MotionFeedback,1024U> m_edm126Feedback{};
+    EDM96::Feedback m_edm126Gap{};
+    EDM88::Qualifier m_edm126Source{};
+    EDM88::SourceConfig m_edm126SourceConfig{};
+    EDM88::Frame m_edm126Raw{};
+    EDM89::Decision m_edm126Decision{};
+    EDM97::Tuning m_edm126Tuning{};
+    EDM126::TestVoltage m_edm126Voltage{};
+    EDM112::Curve m_edm126Curve{};
+    EDM126::Limits m_edm126Limits{};
+    EDM126::Point m_edm126PhysicalMin{}, m_edm126PhysicalMax{}, m_edm126PhysicalReference{};
+    bool m_edm126MappedZero=false, m_edm126SameReferencePriorTick=false;
+    std::uint64_t m_edm126PhysicalTick=0ULL;
+    bool m_edm126PhysicalRange=false;
+    bool BeginEDM126Arm(const EDM94ArmRequest& arm) noexcept;
+    bool IsEDM126ProfileCurrent() const noexcept;
+    bool IsEDM126FeedCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
+    bool IsEDM126ParticipationCurrent() const noexcept;
+    bool IsEDM126Current() const noexcept;
+    bool IsEDM126SourceCurrent(std::uint64_t nowUs) const noexcept;
+    void ObserveEDM126Source(bool complete) noexcept;
+    void ObserveEDM126PhysicalSettle(bool complete, const EDM94::RuntimeDiagnostic& priorSendProof) noexcept;
+    bool BeginEDM126Segment() noexcept;
+    bool StepEDM126Segment(AxisCommand& command) noexcept;
+    bool MapEDM126Traversal(AxisCommand& command) noexcept;
+    bool BeginEDM126Stop(MotionExecutionEpoch previousEpoch, const MotionOwnerLease& previousLease,
+        std::uint32_t previousTicket) noexcept;
+    bool StepEDM126Stop(AxisCommand& command) noexcept;
+    void ApplyEDM126Scalar(AxisCommand& command, bool stopping) noexcept;
+    void PublishEDM126Feedback() noexcept;
+    bool m_edm114Profile = false;
+    EDM114::Mapping m_edm114Mapping{};
+    EDM114::Feedback m_edm114Current{};
+    EDM53::Channel<EDM114::Feedback, 512U> m_edm114Feedback{};
+    MotionExecutionIdentity m_edm114Command{};
+    EDM114::StopScalar m_edm114Stop{};
+    MotionOwnerLease m_edm114StopLease{};
+    MotionExecutionEpoch m_edm114StopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    std::uint32_t m_edm114StopTicket = 0U;
+    std::uint64_t m_edm114StopTick = 0ULL, m_edm114MappedTick = 0ULL;
+    double m_edm114LastVelocity = 0.0, m_edm114LastPosition = 0.0;
+    EDM114::Point m_edm114MappedPosition{}, m_edm114MappedVelocity{};
+    std::array<std::uint64_t, 6U> m_edm114ConfigFingerprint{}, m_edm114MappingFingerprint{};
+    bool IsEDM114PublishedProfile(std::uint64_t session, bool enabled) const noexcept;
+    bool IsEDM114ProfileCurrent(bool enabled) const noexcept;
+    bool IsEDM114ArcCommand(const MotionCommand& command) const noexcept;
+    bool IsEDM114MappingCurrent() const noexcept;
+    bool BindEDM114Mapping(double length) noexcept;
+    bool MapEDM114Curve(AxisCommand& command) noexcept;
+    bool BeginEDM114Stop(MotionExecutionEpoch previousEpoch,
+        const MotionOwnerLease& previousLease, std::uint32_t previousTicket) noexcept;
+    bool StepEDM114Stop(AxisCommand& command) noexcept;
+    void PublishEDM114Feedback() noexcept;
+    bool m_edm115Profile = false, m_edm115Driving = false, m_edm115Participating = false;
+    bool m_edm115ResumeMap = false;
+    EDM115::Excursion m_edm115{}, m_edm115Committed{};
+    bool m_edm115UnmappedStep = false;
+    EDM115::MotionFeedback m_edm115Current{};
+    EDM53::Channel<EDM115::MotionFeedback, 1024U> m_edm115Feedback{};
+    EDM114::Mapping m_edm115Previous{}, m_edm115Original{};
+    EDM114::Feedback m_edm115PreviousProof{};
+    double m_edm115LastAccelTime = 0.0, m_edm115LastDecelTime = 0.0;
+    double m_edm115PreviousAccelTime = 0.0, m_edm115PreviousDecelTime = 0.0;
+    double m_edm115OriginalMaxVelocity = 0.0, m_edm115OriginalAcceleration = 0.0, m_edm115OriginalDeceleration = 0.0;
+    EDM115::Point m_edm115StopTime{}, m_edm115Reference{}, m_edm115ActualMin{}, m_edm115ActualMax{};
+    EDM115::Point m_edm115MappedReference{}, m_edm115MappedVelocity{};
+    double m_edm115MappedQ = 0.0, m_edm115MappedV = 0.0;
+    std::uint64_t m_edm115PhysicalTick = 0ULL, m_edm115MappedTick = 0ULL;
+    unsigned m_edm115PhysicalSpan = 0U, m_edm115MappedSpan = 0U;
+    bool m_edm115MappedZero = false, m_edm115SameReferencePriorTick = false;
+    bool m_edm115PhysicalQualified = false, m_edm115RangeValid = false;
+    MotionOwnerLease m_edm115StopLease{};
+    MotionExecutionEpoch m_edm115StopEpoch = MOTION_EXECUTION_EPOCH_INVALID;
+    std::uint32_t m_edm115StopTicket = 0U;
+    bool IsEDM115PublishedProfile(std::uint64_t session, bool enabled) const noexcept;
+    bool IsEDM115ProfileCurrent(bool enabled) const noexcept;
+    bool ValidateEDM115Previous(const EDM94FeedAuthorization& authorization) noexcept;
+    bool IsEDM115ParticipationCurrent() const noexcept;
+    bool IsEDM115GeometryCurrent() const noexcept;
+    bool IsEDM115VirtualCurrent() const noexcept;
+    void ObserveEDM115PhysicalSettle(bool complete, const EDM94::RuntimeDiagnostic& priorSendProof) noexcept;
+    bool BeginEDM115Excursion(AxisCommand& command) noexcept;
+    bool StepEDM115Excursion(AxisCommand& command, bool stopping) noexcept;
+    void ApplyEDM115Scalar(AxisCommand& command, bool stopping) noexcept;
+    bool MapEDM115Excursion() noexcept;
+    bool BeginEDM115Stop(MotionExecutionEpoch previousEpoch,
+        const MotionOwnerLease& previousLease, std::uint32_t previousTicket) noexcept;
+    void PublishEDM115Feedback() noexcept;
+    bool m_edm116Profile=false;
+    EDM116::Fixture m_edm116ArmFixture=EDM116::Fixture::Canonical116;
+    EDM116::Excursion m_edm116{}, m_edm116Committed{};
+    EDM116::MotionFeedback m_edm116Current{};
+    EDM53::Channel<EDM116::MotionFeedback,1024U> m_edm116Feedback{};
+    EDM116::Policy m_edm116RowPolicy{};
+    std::uint64_t m_edm116PreviousCommit=0ULL;
+    bool IsEDM116PublishedProfile(std::uint64_t session,bool enabled,
+        EDM116::Fixture fixture=EDM116::Fixture::Canonical116) const noexcept;
+    bool IsEDM116ProfileCurrent(bool enabled) const noexcept;
+    bool ValidateEDM116Feed(const EDM94FeedAuthorization& authorization) noexcept;
+    bool BeginEDM116Excursion(AxisCommand& command) noexcept;
+    void PublishEDM116Feedback() noexcept;
+    // Diagnostic-only stop evidence. It cannot permit output, continue a row,
+    // release a session or replace the independent EDM94 physical zero proof.
+    EDM118::Feedback m_edm118Current{};
+    EDM53::Channel<EDM118::Feedback,1024U> m_edm118Feedback{};
+    void ClearEDM118StopObservation() noexcept;
+    void CaptureEDM118StopObservation() noexcept;
+    void ObserveEDM118MappedStop() noexcept;
+    void PublishEDM118Feedback() noexcept;
+    bool FailEDM118StopObservation() noexcept;
+    const EDM115::Feedback& ModeExcursionCurrent(bool committed=false) const noexcept;
+    const EDM114::Mapping& ModeExcursionMapping(unsigned which=0U,bool committed=false) const noexcept;
+    const EDM115::CompletionToken& ModeExcursionToken(bool committed=false) const noexcept;
+    const EDM115::Point& ModeExcursionAnchor() const noexcept;
+    double ModeExcursionAnchorQ() const noexcept;
+    bool ModeExcursionMap(EDM115::Point& position,EDM115::Point& velocity) const noexcept;
+    void ModeExcursionCommit() noexcept;
+    void ModeExcursionRestore() noexcept;
+    bool IsEDM107FlushProfileCurrent(const EDM107::FlushProfile& flushProfile) const noexcept;
     bool IsEDM102FeedProfileCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
     bool TakeEDM94FeedAuthorization(const std::array<double, 6U>& increment,
         double feedMMMin, EDM94FeedAuthorization& result) noexcept;

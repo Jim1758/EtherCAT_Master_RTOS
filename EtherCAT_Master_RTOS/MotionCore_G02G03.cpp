@@ -268,6 +268,37 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     static_assert(MAX_AXES == 8, "BY fixed workspace must match Motion axes.");
     MotionFeedArcReceipt& result = workspace.receipt;
     result.Clear();
+    // EDM114 consumes the literal NC permit before any geometry rejection.
+    // Ordinary CNC arcs receive an empty permit and retain their existing path.
+    std::array<double, 6U> edm114Increment{}, edm114StartNative{};
+    for (unsigned i = 0U; i < 6U; ++i)
+    {
+        edm114StartNative[i] = commandedMCSTail[i];
+        edm114Increment[i] = targetMCS[i] - commandedMCSTail[i];
+    }
+    EDM94FeedAuthorization edm114Authorization{};
+    const bool edm114Authorized = TakeEDM114ArcAuthorization(edm114Increment, edm114StartNative,
+        centerOffsetMM, direction == -1 ? 2 : direction == 1 ? 3 : 0,
+        feedMMMin, edm114Authorization);
+    bool edm114Succeeded = false;
+    struct EDM114CancelOnFailure
+    {
+        MotionCore& motion;
+        std::uint64_t session;
+        const bool& succeeded;
+        ~EDM114CancelOnFailure() noexcept
+        { if (session != 0ULL && !succeeded) motion.RequestEDM94Cancel(session); }
+    } edm114Cancel{ *this, edm114Authorization.session, edm114Succeeded };
+    if (!edm114Authorized)
+    { result.code = MotionFeedArcCode::NOT_READY; return false; }
+    const bool edm114Scoped = edm114Authorization.session != 0ULL;
+    if (edm114Scoped && (fullCircle || cncFeedLookahead || predecessor != nullptr ||
+        preparedCutterArc || endpointAxisMask != 3U || m_pendingPlaneMode != 17))
+    { result.code = MotionFeedArcCode::INVALID_INPUT; return false; }
+    if (edm114Scoped)
+        for (unsigned i = 2U; i < 6U; ++i)
+            if (!std::isfinite(targetMCS[i]) || targetMCS[i] != commandedMCSTail[i])
+            { result.code = MotionFeedArcCode::INVALID_INPUT; return false; }
     NCArcPlaneAxes plane{};
     if (!TryGetNCArcPlaneAxes(m_pendingPlaneMode, plane))
     {
@@ -448,7 +479,7 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     cmd.decTime = workspace.decTime;
     cmd.commandPathMode = cncFeedLookahead ? MotionCommandPathMode::CONTINUOUS : MotionCommandPathMode::EXACT_STOP;
     cmd.cncFeedLookahead = cncFeedLookahead;
-    if (cncFeedLookahead || cutterActive)
+    if (cncFeedLookahead || cutterActive || edm114Scoped)
     {
         // Prepared cutter circles freeze PHYSICAL XYZ start pulses as a
         // read-only proof. Targets/centres are canonical packet u/v slots;
@@ -481,6 +512,29 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     cmd.sourceG162Active = m_pendingG162Active;
     cmd.sourcePlaneMode = m_pendingPlaneMode;
 
+    EDM94HandoffMessage edm114Handoff{};
+    if (edm114Scoped)
+    {
+        std::array<double, 6U> startPulse{}, endPulse{}, pulsePerNative{};
+        if (m_pContexts == nullptr || m_pContexts->size() != 6U || result.validAxisMask != 63U)
+        { result.code = MotionFeedArcCode::NOT_READY; return false; }
+        for (unsigned i = 0U; i < 6U; ++i)
+        {
+            const auto& axis = (*m_pContexts)[i];
+            startPulse[i] = result.arc.startPulse[i];
+            endPulse[i] = result.arc.endPulse[i];
+            pulsePerNative[i] = axis.resolution_PPR / axis.finalLead;
+            if (!std::isfinite(pulsePerNative[i]) || pulsePerNative[i] <= 0.0 ||
+                (i >= 2U && startPulse[i] != endPulse[i]))
+            { result.code = MotionFeedArcCode::GEOMETRY_REJECTED; return false; }
+        }
+        // Prepare under the old epoch. The packet remains a genuine ARC2;
+        // stationary axes belong to the separate full-axis handoff receipt.
+        if (!PublishEDM114ArcHandoff(edm114Authorization, cmd, startPulse,
+            endPulse, pulsePerNative, result.arc.startAngle, result.arc.sweepRadians,
+            result.arc.lengthPulse, edm114Handoff))
+        { result.code = MotionFeedArcCode::NOT_READY; return false; }
+    }
     MotionExecutionEpoch publishedEpoch = plannedEpoch;
     if (!buffered && !TryPublishOwnerAuthorizedAbortingExecutionEpoch(
         source, plannedEpoch, plannedOwner, publishedEpoch))
@@ -498,6 +552,18 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     {
         result.code = MotionFeedArcCode::PRODUCER_REJECTED;
         return false; // Existing enqueue owns formal rejection feedback/capture.
+    }
+
+    if (edm114Scoped)
+    {
+        edm114Handoff.command = cmd.execution;
+        edm114Handoff.committed = true;
+        if (cmd.execution.epoch != edm114Handoff.nextEpoch ||
+            !m_edm94HandoffMessages.ProducerTryPush(edm114Handoff))
+        {
+            result.code = MotionFeedArcCode::PRODUCER_REJECTED;
+            return false; // The cancellation guard contains this accepted packet.
+        }
     }
 
     const auto tupleStable = [&]() -> bool
@@ -580,6 +646,7 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     }
     result.code = MotionFeedArcCode::COMMITTED;
     result.valid = true;
+    edm114Succeeded = true;
     return true;
 }
 

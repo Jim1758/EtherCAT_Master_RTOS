@@ -1,4 +1,4 @@
-﻿// CG / EDM01 / EDM02: NC-owned simulation tests. No Motion or IO writes.
+// CG / EDM01 / EDM02: NC-owned simulation tests. No Motion or IO writes.
 #include "NCManager.h"
 #include "NCXYZCUVFeedScope.h"
 #include "EDMCNCRetainedRTFixture.h"
@@ -25,6 +25,30 @@
 
 namespace
 {
+    // NC-owner diagnostics only. Format locally, then use the same one-string
+    // console route as the existing bounded EDM evidence records.
+    void EmitEDM113Diagnostic(const char* event, const char* part, int code, int length) noexcept
+    {
+        char record[192]{};
+        const int formatted = std::snprintf(record, sizeof(record),
+            "[EDM113] event=%.24s logger=FIX1 part=%.32s rc=%d length=%d\n", event, part, code, length);
+        if (formatted > 0 && static_cast<std::size_t>(formatted) < sizeof(record))
+            RtPrintf("%s", record);
+        else
+            RtPrintf("%s", "[EDM113] event=LOG_FORMAT_ERROR logger=FIX1 part=LOGGER_DIAGNOSTIC\n");
+    }
+    void EmitEDM113Record(const char* record, int length, const char* part) noexcept
+    {
+        if (length <= 0 || length > 480)
+        {
+            EmitEDM113Diagnostic("LOG_FORMAT_ERROR", part, length, length);
+            return;
+        }
+        const int written = RtPrintf("%s", record);
+        if (written < 0)
+            EmitEDM113Diagnostic("LOG_OUTPUT_ERROR", part, written, length);
+    }
+
     // Each part is one bounded native console record. Shared keys identify one
     // copied bank; captured scope describes provenance, never current NC state.
     void LogEDM65PhysicalRecipeShadow(const EDM65::Snapshot& value) noexcept
@@ -1113,6 +1137,29 @@ EDMVoltage::Snapshot NCManager::ReadEDMVoltageSnapshotSameThread() noexcept
 
 bool NCManager::IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept
 {
+    if (block.has('P') && (block.val('P') == 158.0 || block.val('P') == 159.0 ||
+        block.val('P') == 160.0 || block.val('P') == 161.0))
+    {
+        const bool arm = block.val('P') == 158.0 || block.val('P') == 160.0;
+        if (block.isEmpty || block.isGoto || block.isBlockSkip || !block.hasG || block.gCode != 180 ||
+            block.gCount != 1 || block.gCodes[0] != 180 || block.mCount) return false;
+        for (char a = 'A'; a <= 'Z'; ++a)
+            if (block.has(a) && ((a != 'N' && a != 'P' && (!arm || (a != 'Q' && a != 'R' && a != 'S'))) ||
+                !std::isfinite(block.val(a)))) return false;
+        return !arm || (block.has('Q') && block.has('R') && block.has('S') &&
+            block.val('Q') == 8.0 && block.val('R') == 1.0 && block.val('S') == 1.0);
+    }
+
+    if (block.has('P') && block.val('P') == 131.0)
+    {
+        if (block.isEmpty || block.isGoto || block.isBlockSkip || !block.hasG || block.gCode != 180 ||
+            block.gCount != 1 || block.gCodes[0] != 180 || block.mCount || !block.has('B')) return false;
+        EDM116::Mode mode{};
+        if (!EDM116::ParseMode(block.val('B'), mode)) return false;
+        for (char a = 'A'; a <= 'Z'; ++a)
+            if (block.has(a) && ((a != 'N' && a != 'P' && a != 'B') || !std::isfinite(block.val(a)))) return false;
+        return true;
+    }
     if (block.has('P') && (block.val('P') == 85.0 || block.val('P') == 86.0 ||
         block.val('P') == 87.0 || block.val('P') == 88.0 ||
         block.val('P') == 89.0 || block.val('P') == 90.0 ||
@@ -1122,7 +1169,12 @@ bool NCManager::IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept
         block.val('P') == 97.0 || block.val('P') == 98.0 ||
         block.val('P') == 99.0 || block.val('P') == 100.0 ||
         block.val('P') == 101.0 || block.val('P') == 102.0 ||
-        block.val('P') == 103.0 || block.val('P') == 104.0))
+        block.val('P') == 103.0 || block.val('P') == 104.0 ||
+        block.val('P') == 105.0 || block.val('P') == 106.0 ||
+        block.val('P') == 107.0 || block.val('P') == 108.0 ||
+        block.val('P') == 109.0 || block.val('P') == 110.0 ||
+        block.val('P') == 111.0 || block.val('P') == 112.0 ||
+        block.val('P') == 113.0 || block.val('P') == 114.0 || block.val('P') == 115.0 || block.val('P') == 116.0 || block.val('P') == 117.0 || block.val('P') == 118.0 || block.val('P') == 119.0 || block.val('P') == 120.0 || block.val('P') == 121.0 || block.val('P') == 122.0 || block.val('P') == 123.0 || block.val('P') == 124.0 || block.val('P') == 125.0 || block.val('P') == 126.0 || block.val('P') == 127.0 || block.val('P') == 128.0 || block.val('P') == 129.0 || block.val('P') == 130.0 || block.val('P') == 131.0 || block.val('P') == 132.0 || block.val('P') == 133.0 || block.val('P') == 134.0 || block.val('P') == 135.0 || block.val('P') == 136.0 || block.val('P') == 137.0 || block.val('P') == 138.0 || block.val('P') == 139.0 || block.val('P') == 140.0 || block.val('P') == 141.0 || block.val('P') == 142.0 || block.val('P') == 143.0 || block.val('P') == 144.0 || block.val('P') == 145.0 || block.val('P') == 146.0 || block.val('P') == 147.0 || block.val('P') == 148.0 || block.val('P') == 149.0 || block.val('P') == 150.0 || block.val('P') == 151.0 || block.val('P') == 152.0 || block.val('P') == 153.0 || block.val('P') == 154.0 || block.val('P') == 155.0 || block.val('P') == 156.0 || block.val('P') == 157.0))
     {
         if (block.isEmpty || block.isGoto || block.isBlockSkip || !block.hasG || block.gCode != 180 ||
             block.gCount != 1 || block.gCodes[0] != 180 || block.mCount != 0) return false;
@@ -1131,17 +1183,25 @@ bool NCManager::IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept
         const bool continuousArm = block.val('P') == 97.0;
         const bool enduranceArm = block.val('P') == 99.0;
         const bool pairedArm = block.val('P') == 101.0;
-        const bool flushArm = block.val('P') == 103.0;
+        const bool parameterizedArm = block.val('P') == 109.0 || block.val('P') == 111.0 || block.val('P') == 113.0 || block.val('P') == 115.0 || block.val('P') == 117.0 || block.val('P') == 119.0 || block.val('P') == 121.0 || block.val('P') == 123.0 || block.val('P') == 125.0 || block.val('P') == 127.0 || block.val('P') == 129.0 || block.val('P') == 132.0 || block.val('P') == 134.0 || block.val('P') == 136.0 || block.val('P') == 138.0 || block.val('P') == 140.0 || block.val('P') == 142.0 || block.val('P') == 144.0 || block.val('P') == 146.0 || block.val('P') == 148.0 || block.val('P') == 150.0 || block.val('P') == 152.0 || block.val('P') == 154.0 || block.val('P') == 156.0;
+        const bool flushArm = block.val('P') == 103.0 || block.val('P') == 105.0 || block.val('P') == 107.0 || parameterizedArm;
         const bool tuningArm = block.val('P') == 91.0 || noiseArm || burstArm || continuousArm || enduranceArm || pairedArm || flushArm;
         for (char a = 'A'; a <= 'Z'; ++a)
             if (block.has(a) && ((a != 'N' && a != 'P' &&
-                (!tuningArm || (a != 'Q' && a != 'R' && a != 'S'))) ||
+                (!tuningArm || (a != 'Q' && a != 'R' && a != 'S' &&
+                    (!parameterizedArm || (a != 'I' && a != 'J' && a != 'K'))))) ||
                 !std::isfinite(block.val(a)))) return false;
         if (tuningArm)
         {
             if (!block.has('Q') || !block.has('R') || !block.has('S')) return false;
             const EDM97::Tuning tuning{ block.val('Q'), block.val('R'), block.val('S') };
             if (!(noiseArm ? EDM98::ValidTuning(tuning) : EDM97::ValidTuning(tuning))) return false;
+            if (parameterizedArm)
+            {
+                EDM107::FlushProfile profile{};
+                if (!block.has('I') || !block.has('J') || !block.has('K') ||
+                    !EDM107::ParseFlushProfile(block.val('I'), block.val('J'), block.val('K'), profile)) return false;
+            }
         }
         return true;
     }
@@ -1667,7 +1727,12 @@ WaitConditionFunc NCManager::StartGapDryRunSameThread(const NCBlock& block)
         block.val('P') == 97.0 || block.val('P') == 98.0 ||
         block.val('P') == 99.0 || block.val('P') == 100.0 ||
         block.val('P') == 101.0 || block.val('P') == 102.0 ||
-        block.val('P') == 103.0 || block.val('P') == 104.0)) return StartEDM94SameThread(block);
+        block.val('P') == 103.0 || block.val('P') == 104.0 ||
+        block.val('P') == 105.0 || block.val('P') == 106.0 ||
+        block.val('P') == 107.0 || block.val('P') == 108.0 ||
+        block.val('P') == 109.0 || block.val('P') == 110.0 ||
+        block.val('P') == 111.0 || block.val('P') == 112.0 ||
+        block.val('P') == 113.0 || block.val('P') == 114.0 || block.val('P') == 115.0 || block.val('P') == 116.0 || block.val('P') == 117.0 || block.val('P') == 118.0 || block.val('P') == 119.0 || block.val('P') == 120.0 || block.val('P') == 121.0 || block.val('P') == 122.0 || block.val('P') == 123.0 || block.val('P') == 124.0 || block.val('P') == 125.0 || block.val('P') == 126.0 || block.val('P') == 127.0 || block.val('P') == 128.0 || block.val('P') == 129.0 || block.val('P') == 130.0 || block.val('P') == 131.0 || block.val('P') == 132.0 || block.val('P') == 133.0 || block.val('P') == 134.0 || block.val('P') == 135.0 || block.val('P') == 136.0 || block.val('P') == 137.0 || block.val('P') == 138.0 || block.val('P') == 139.0 || block.val('P') == 140.0 || block.val('P') == 141.0 || block.val('P') == 142.0 || block.val('P') == 143.0 || block.val('P') == 144.0 || block.val('P') == 145.0 || block.val('P') == 146.0 || block.val('P') == 147.0 || block.val('P') == 148.0 || block.val('P') == 149.0 || block.val('P') == 150.0 || block.val('P') == 151.0 || block.val('P') == 152.0 || block.val('P') == 153.0 || block.val('P') == 154.0 || block.val('P') == 155.0 || block.val('P') == 156.0 || block.val('P') == 157.0 || block.val('P') == 158.0 || block.val('P') == 159.0 || block.val('P') == 160.0 || block.val('P') == 161.0)) return StartEDM94SameThread(block);
     ServiceEDMCoordinatedRTRetirementSameThread();
     if (m_edmCoordinatedRT.retirePending || (m_edmCoordinatedRT.submitted && !m_edmCoordinatedRT.retired))
     { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, m_gapDryRun.sourceLine, "EDM84_PREVIOUS_SESSION_BUSY"); return nullptr; }
@@ -15147,6 +15212,12 @@ namespace
             stage, result, session, tick, static_cast<unsigned long long>(gap.sourceSequence),
             static_cast<unsigned long long>(gap.sourceCapturedUs), static_cast<unsigned long long>(gap.freshFrames),
             static_cast<unsigned long long>(gap.heldFrames), static_cast<unsigned long long>(gap.maximumAgeUs)), "SOURCE");
+        if (gap.sourceReason != EDM88::Reason::None)
+            emit(std::snprintf(record, sizeof(record),
+                "[%.6s] event=SOURCE_REJECT result=%.32s part=SOURCE session=%llu tick=%llu observerUs=%llu acceptedSourceUs=%llu rejectedMaxAgeUs=%llu sourceReason=%.24s sourceLimitUs=1500 acquisition=RT_SYNTHETIC output=NONE dischargeCommand=NONE\n",
+                stage, result, session, tick, static_cast<unsigned long long>(gap.nowUs),
+                static_cast<unsigned long long>(gap.sourceCapturedUs), static_cast<unsigned long long>(gap.maximumAgeUs),
+                EDM88::ReasonName(gap.sourceReason)), "SOURCE_REJECT");
         emit(std::snprintf(record, sizeof(record),
             "[%.6s] event=GAIN_EVIDENCE result=%.32s part=SPEED session=%llu tick=%llu phase=%u voltage=%.9g referenceV=35 errorV=%.9g rawSpeedMmMin=%.12g limitedSpeedMmMin=%.12g targetRatio=%.12g proofScope=COMMAND_SCALAR_ONLY\n",
             stage, result, session, tick, gap.phase, gap.voltageV, gap.errorV,
@@ -15181,7 +15252,7 @@ namespace
                 stage, part, session);
         };
         emit(std::snprintf(record, sizeof(record),
-            "[%.6s] event=GAP_SOURCE part=PROFILE session=%llu tick=0 source=RT_SYNTHETIC producerUs=1000 captureDwellUs=20000 segmentDeadlineUs=10000000 steps=%u maxSteps=%u continuousMode=%u pairedMode=%u pairedPairs=%u mode=CAPTURE_DWELL_BURST_SERVO midSegmentReverse=1 proofScope=COMMAND_SCALAR_ONLY encoderZeroProven=0 dischargeCommand=NONE\n",
+            "[%.6s] event=GAP_SOURCE part=PROFILE session=%llu tick=0 source=RT_SYNTHETIC producerUs=250 captureDwellUs=20000 segmentDeadlineUs=10000000 steps=%u maxSteps=%u continuousMode=%u pairedMode=%u pairedPairs=%u mode=CAPTURE_DWELL_BURST_SERVO midSegmentReverse=1 proofScope=COMMAND_SCALAR_ONLY encoderZeroProven=0 dischargeCommand=NONE\n",
             stage, session, moves, endurance ? EDM102::MaximumSteps : continuous ? EDM100::MaximumSteps : 4U,
             continuous ? 1U : 0U, paired ? 1U : 0U, paired ? EDM104::MaximumSteps / 2U : 0U), "PROFILE");
         emit(std::snprintf(record, sizeof(record),
@@ -15216,6 +15287,20 @@ namespace
             EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) &&
             EDM77::Detail::OnlyAddresses(b, "NP") && b.has('P') &&
             EDM77::Detail::EqualLiteral(b.expression('P'), p);
+    }
+    bool E126Profile(const NCParsedBlock& b, unsigned arm, EDM97::Tuning& tuning) noexcept
+    {
+        if ((arm != 158U && arm != 160U) || !EDM77::Detail::Clean(b) || b.isEmpty ||
+            b.gCount != 1 || b.mCount || !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRS") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), arm) || !b.has('Q') || !b.has('R') || !b.has('S')) return false;
+        EDM97::Tuning parsed{};
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) ||
+            parsed.positiveGain != 8.0 || parsed.negativeGain != 1.0 || parsed.deadbandV != 1.0 ||
+            !EDM97::ValidTuning(parsed)) return false;
+        tuning = parsed; return true;
     }
     bool E97ProfileOnlyNPQRS(const NCParsedBlock& b, EDM97::Tuning& tuning) noexcept
     {
@@ -15315,6 +15400,47 @@ namespace
         tuning = parsed;
         return true;
     }
+    bool E106ProfileOnlyNPQRS(const NCParsedBlock& b, unsigned selector, EDM97::Tuning& tuning) noexcept
+    {
+        if ((selector != 105U && selector != 107U) || !EDM77::Detail::Clean(b) || b.isEmpty ||
+            b.gCount != 1 || b.mCount != 0 || !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRS") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), selector) ||
+            !b.has('Q') || !b.has('R') || !b.has('S')) return false;
+        EDM97::Tuning parsed{};
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) || !EDM105::ValidTuning(parsed)) return false;
+        tuning = parsed;
+        return true;
+    }
+    bool E106FlushProfile(const NCParsedBlock& b, unsigned interruptArm, EDM97::Tuning& tuning) noexcept
+    {
+        return interruptArm ? E106ProfileOnlyNPQRS(b, interruptArm, tuning) : E105ProfileOnlyNPQRS(b, tuning);
+    }
+    bool E108ProfileOnlyNPQRSIJK(const NCParsedBlock& b, unsigned selector, EDM97::Tuning& tuning,
+        EDM107::FlushProfile& profile) noexcept
+    {
+        if ((selector != 109U && selector != 111U && selector != 113U && selector != 115U && selector != 117U && selector != 119U && selector != 121U && selector != 123U && selector != 125U && selector != 127U && selector != 129U && selector != 132U && selector != 134U && selector != 136U && selector != 138U && selector != 140U && selector != 142U && selector != 144U && selector != 146U && selector != 148U && selector != 150U && selector != 152U && selector != 154U && selector != 156U) || !EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+            !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
+            !EDM77::Detail::OnlyAddresses(b, "NPQRSIJK") || !b.has('P') ||
+            !EDM77::Detail::EqualLiteral(b.expression('P'), selector) ||
+            !b.has('Q') || !b.has('R') || !b.has('S') || !b.has('I') || !b.has('J') || !b.has('K')) return false;
+        EDM97::Tuning parsed{};
+        EDM107::FlushProfile parsedProfile{};
+        double stroke = 0.0, speed = 0.0, dwell = 0.0;
+        if (!E94Number(b.expression('Q'), parsed.positiveGain) ||
+            !E94Number(b.expression('R'), parsed.negativeGain) ||
+            !E94Number(b.expression('S'), parsed.deadbandV) || !EDM105::ValidTuning(parsed) ||
+            !E94Number(b.expression('I'), stroke) || !E94Number(b.expression('J'), speed) ||
+            !E94Number(b.expression('K'), dwell) ||
+            !EDM107::ParseFlushProfile(stroke, speed, dwell, parsedProfile)) return false;
+        tuning = parsed; profile = parsedProfile;
+        return true;
+    }
+    bool E107ProfileOnlyNPQRSIJK(const NCParsedBlock& b, EDM97::Tuning& tuning,
+        EDM107::FlushProfile& profile) noexcept
+    { return E108ProfileOnlyNPQRSIJK(b, 109U, tuning, profile); }
     bool E94Preamble(const NCParsedBlock& b) noexcept
     {
         if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
@@ -15341,6 +15467,264 @@ namespace
             if (std::fabs(delta[axis]) / seconds > (axis < 3U ? .002 : .05)) return false;
         return true;
     }
+    unsigned E116ArmP(EDM116::Fixture fixture) noexcept
+    {
+        return fixture == EDM116::Fixture::ArcPair124 ? 150U :
+            fixture == EDM116::Fixture::ArcPairComplement124 ? 152U :
+            fixture == EDM116::Fixture::Complement117 ? 132U : 129U;
+    }
+    unsigned E116FinishP(EDM116::Fixture fixture) noexcept
+    {
+        return E116ArmP(fixture) + 1U;
+    }
+    bool E116Selector(const NCParsedBlock& b, EDM116::Mode& mode) noexcept
+    {
+        double value = 0.0;
+        return EDM77::Detail::Clean(b) && !b.isEmpty && b.gCount == 1 && b.mCount == 0 &&
+            EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) &&
+            EDM77::Detail::OnlyAddresses(b, "NPB") && b.has('P') && b.has('B') &&
+            EDM77::Detail::EqualLiteral(b.expression('P'), 131U) &&
+            E94Number(b.expression('B'), value) && EDM116::ParseMode(value, mode);
+    }
+    bool E114Move(const NCParsedBlock& b, unsigned step, std::array<double, 6U>& delta, double& feed,
+        EDM116::Fixture fixture = EDM116::Fixture::Canonical116) noexcept
+    {
+        if (!EDM116::ValidFixture(fixture) || step >= EDM114::RequiredRows) return false;
+        if (!EDM116::IsArcStep(step, fixture))
+        {
+            if (!E94Move(b, delta, feed) || feed != 0.12) return false;
+            for (unsigned a = 0U; a < 6U; ++a)
+                if (delta[a] != ((step & 1U) ? -1.0 : 1.0) * (a < 3U ? 0.001 : 0.020)) return false;
+            return true;
+        }
+        delta.fill(0.0);
+        std::array<double, 2U> center{};
+        return EDM77::Detail::Clean(b) && !b.isEmpty && b.gCount == 1 && b.mCount == 0 &&
+            EDM77::Detail::EqualLiteral(b.gExpressions[0], static_cast<unsigned>(EDM116::ExpectedGCode(step, fixture))) &&
+            EDM77::Detail::OnlyAddresses(b, "NXYIJF") && b.has('X') && b.has('Y') && b.has('I') && b.has('J') && b.has('F') &&
+            E94Number(b.expression('X'), delta[0]) && E94Number(b.expression('Y'), delta[1]) &&
+            E94Number(b.expression('I'), center[0]) && E94Number(b.expression('J'), center[1]) &&
+            E94Number(b.expression('F'), feed) &&
+            EDM116::ValidArcRecipe(EDM116::ExpectedGCode(step, fixture), step, delta, center, feed, fixture);
+    }
+    bool E115SameExcursion(const EDM115::Feedback& a, const EDM115::Feedback& b) noexcept
+    {
+        return a.tick == b.tick &&
+            a.nowUs == b.nowUs &&
+            a.startTick == b.startTick &&
+            a.startUs == b.startUs &&
+            a.started == b.started &&
+            a.completed == b.completed &&
+            a.backwardCrossings == b.backwardCrossings &&
+            a.forwardCrossings == b.forwardCrossings &&
+            a.anchorReturned == b.anchorReturned &&
+            a.span == b.span &&
+            a.settledCycles == b.settledCycles &&
+            a.completedDwells == b.completedDwells &&
+            a.direction == b.direction &&
+            a.rowKind == b.rowKind &&
+            a.phase == b.phase &&
+            a.reason == b.reason &&
+            a.geometryValid == b.geometryValid &&
+            a.active == b.active &&
+            a.moving == b.moving &&
+            a.endpointReady == b.endpointReady &&
+            a.stopRequested == b.stopRequested &&
+            a.stopped == b.stopped &&
+            a.faulted == b.faulted &&
+            a.complete == b.complete &&
+            EDM109::SameDouble(a.q, b.q) &&
+            EDM109::SameDouble(a.v, b.v) &&
+            EDM109::SameDouble(a.a, b.a) &&
+            EDM109::SameDouble(a.progress, b.progress) &&
+            EDM109::SameDouble(a.length, b.length) &&
+            EDM109::SameDouble(a.maximumVelocity, b.maximumVelocity) &&
+            EDM109::SameDouble(a.acceleration, b.acceleration) &&
+            EDM109::SameDouble(a.deceleration, b.deceleration);
+    }
+    bool E115SameFeedback(const EDM115::MotionFeedback& a, const EDM115::MotionFeedback& b) noexcept
+    {
+        return a.session == b.session &&
+            a.armEpoch == b.armEpoch &&
+            a.ownerGeneration == b.ownerGeneration &&
+            a.previousBoundaryTick == b.previousBoundaryTick &&
+            a.previousCommit == b.previousCommit &&
+            a.lastPhysicalTick == b.lastPhysicalTick &&
+            a.rangeResets == b.rangeResets &&
+            a.eventsStarted == b.eventsStarted &&
+            a.eventsCompleted == b.eventsCompleted &&
+            a.completedDwellsTotal == b.completedDwellsTotal &&
+            a.anchorReturnsTotal == b.anchorReturnsTotal &&
+            a.currentKind == b.currentKind &&
+            a.previousKind == b.previousKind &&
+            a.enabled == b.enabled &&
+            a.tokenValidated == b.tokenValidated &&
+            a.geometryCurrent == b.geometryCurrent &&
+            EDM109::SameDouble(a.anchorQ, b.anchorQ) &&
+            E115SameExcursion(a.excursion, b.excursion) &&
+            EDM114::SameSource(a.trigger, b.trigger) &&
+            EDM115::SameToken(a.previous, b.previous) &&
+            EDM109::SamePulse(a.anchorPulse, b.anchorPulse) &&
+            EDM109::SamePulse(a.returnedPulse, b.returnedPulse);
+    }
+    bool E116SameEvent(const EDM116::MotionFeedback& a, const EDM116::MotionFeedback& b) noexcept
+    {
+        return a.fixture == b.fixture && EDM116::SamePolicy(a.policy, b.policy) &&
+            a.modeStarted == b.modeStarted && a.modeCompleted == b.modeCompleted &&
+            a.deadlineUs == b.deadlineUs && EDM109::SameDouble(a.strokeNativeMm, b.strokeNativeMm) &&
+            EDM109::SamePulse(a.retreatPulse, b.retreatPulse) &&
+            a.topDwellTicks == b.topDwellTicks && a.topDwellUs == b.topDwellUs &&
+            a.returnDwellTicks == b.returnDwellTicks && a.returnDwellUs == b.returnDwellUs &&
+            a.topSettledCycles == b.topSettledCycles && a.returnSettledCycles == b.returnSettledCycles &&
+            a.session == b.session &&
+            a.armEpoch == b.armEpoch &&
+            a.ownerGeneration == b.ownerGeneration &&
+            a.previousBoundaryTick == b.previousBoundaryTick &&
+            a.previousCommit == b.previousCommit &&
+            a.lastPhysicalTick == b.lastPhysicalTick &&
+            a.rangeResets == b.rangeResets &&
+            a.eventsStarted == b.eventsStarted &&
+            a.eventsCompleted == b.eventsCompleted &&
+            a.completedDwellsTotal == b.completedDwellsTotal &&
+            a.anchorReturnsTotal == b.anchorReturnsTotal &&
+            a.currentKind == b.currentKind &&
+            a.previousKind == b.previousKind &&
+            a.enabled == b.enabled &&
+            a.tokenValidated == b.tokenValidated &&
+            a.geometryCurrent == b.geometryCurrent &&
+            EDM109::SameDouble(a.anchorQ, b.anchorQ) &&
+            E115SameExcursion(a.excursion, b.excursion) &&
+            EDM114::SameSource(a.trigger, b.trigger) &&
+            EDM115::SameToken(a.previous, b.previous) &&
+            EDM109::SamePulse(a.anchorPulse, b.anchorPulse) &&
+            EDM109::SamePulse(a.returnedPulse, b.returnedPulse);
+    }
+    bool E115AnchorMatches(const EDM114::Feedback& row, double q, const EDM115::Point& anchor) noexcept
+    {
+        if (!row.geometryValid || !std::isfinite(q) || !std::isfinite(row.pulseLength) ||
+            row.pulseLength <= 0.0 || q < row.pulseLength * 0.5 || q >= row.pulseLength) return false;
+        EDM115::Point point = row.startPulse;
+        if (row.kind == EDM114::Kind::Line)
+        {
+            // This exact ratio/order is checked by BeginEDM96Segment before
+            // binding the original normal mapping. It is never chordified from an arc.
+            for (unsigned a = 0U; a < 6U; ++a)
+                point[a] = row.startPulse[a] + q * ((row.endPulse[a] - row.startPulse[a]) / row.pulseLength);
+        }
+        else if (row.kind == EDM114::Kind::Arc)
+        {
+            if (!std::isfinite(row.radiusPulse) || row.radiusPulse <= 0.0 ||
+                !std::isfinite(row.startAngle) || !std::isfinite(row.sweepRadians)) return false;
+            const double angle = row.startAngle + (q / row.pulseLength) * row.sweepRadians;
+            point[0] = row.centerPulse[0] + row.radiusPulse * std::cos(angle);
+            point[1] = row.centerPulse[1] + row.radiusPulse * std::sin(angle);
+        }
+        else return false;
+        for (unsigned a = 0U; a < 6U; ++a)
+            if (!std::isfinite(point[a]) || !std::isfinite(anchor[a]) ||
+                !EDM109::SameDouble(point[a], anchor[a])) return false;
+        return true;
+    }
+    bool E114SameFeedback(const EDM114::Feedback& a, const EDM114::Feedback& b) noexcept
+    {
+        return EDM114::SameSource(a.source, b.source) &&
+            a.session == b.session &&
+            a.armEpoch == b.armEpoch &&
+            a.ownerGeneration == b.ownerGeneration &&
+            a.lastTick == b.lastTick &&
+            a.lastMappingTick == b.lastMappingTick &&
+            a.lastMappingUs == b.lastMappingUs &&
+            a.samples == b.samples &&
+            a.forwardSamples == b.forwardSamples &&
+            a.reverseSamples == b.reverseSamples &&
+            a.flushSamples == b.flushSamples &&
+            a.rowSamples == b.rowSamples &&
+            a.rowForward == b.rowForward &&
+            a.rowReverse == b.rowReverse &&
+            a.rowFlush == b.rowFlush &&
+            a.begunRows == b.begunRows &&
+            a.completedRows == b.completedRows &&
+            a.lineRows == b.lineRows &&
+            a.arcRows == b.arcRows &&
+            a.cwRows == b.cwRows &&
+            a.ccwRows == b.ccwRows &&
+            a.endpointRows == b.endpointRows &&
+            a.kind == b.kind &&
+            a.reason == b.reason &&
+            a.enabled == b.enabled &&
+            a.geometryValid == b.geometryValid &&
+            a.mappedOutput == b.mappedOutput &&
+            a.failed == b.failed &&
+            a.rowComplete == b.rowComplete &&
+            a.completed == b.completed &&
+            a.stopActive == b.stopActive &&
+            a.stopped == b.stopped &&
+            EDM109::SameDouble(a.radiusPulse, b.radiusPulse) &&
+            EDM109::SameDouble(a.startAngle, b.startAngle) &&
+            EDM109::SameDouble(a.sweepRadians, b.sweepRadians) &&
+            EDM109::SameDouble(a.pulseLength, b.pulseLength) &&
+            EDM109::SameDouble(a.centerPulse[0], b.centerPulse[0]) &&
+            EDM109::SameDouble(a.centerPulse[1], b.centerPulse[1]) &&
+            EDM109::SamePulse(a.startPulse, b.startPulse) &&
+            EDM109::SamePulse(a.endPulse, b.endPulse) &&
+            EDM109::SamePulse(a.pulsePerNative, b.pulsePerNative);
+    }
+    bool E114Counts(const EDM114::Feedback& f, unsigned completed,
+        EDM116::Fixture fixture = EDM116::Fixture::Canonical116) noexcept
+    {
+        if (!EDM116::ValidFixture(fixture) || completed > EDM114::RequiredRows || !f.enabled || f.failed || f.reason != EDM114::Reason::None ||
+            f.stopActive || f.stopped || f.begunRows != completed || f.completedRows != completed ||
+            f.endpointRows != completed || f.completed != (completed == EDM114::RequiredRows) ||
+            f.rowComplete != (completed != 0U) || f.geometryValid != (completed != 0U) ||
+            f.mappedOutput != (completed != 0U)) return false;
+        unsigned lines = 0U, arcs = 0U, cw = 0U, ccw = 0U;
+        for (unsigned i = 0U; i < completed; ++i)
+            if (EDM116::IsArcStep(i, fixture)) { ++arcs; if (EDM116::ExpectedGCode(i, fixture) == 2) ++cw; else ++ccw; }
+            else ++lines;
+        if (f.lineRows != lines || f.arcRows != arcs || f.cwRows != cw || f.ccwRows != ccw) return false;
+        if (completed == 0U) return f.kind == EDM114::Kind::None;
+        if (f.kind != (EDM116::IsArcStep(completed - 1U, fixture) ? EDM114::Kind::Arc : EDM114::Kind::Line) ||
+            !f.lastMappingTick || f.lastTick != f.lastMappingTick || !f.lastMappingUs ||
+            !f.rowSamples || !f.rowForward || !f.rowReverse ||
+            f.rowForward > f.rowSamples || f.rowReverse > f.rowSamples - f.rowForward ||
+            f.rowFlush > f.rowSamples || (!(completed & 1U) ? f.rowFlush != 0ULL : f.rowFlush == 0ULL) ||
+            f.samples < f.rowSamples || f.forwardSamples < f.rowForward ||
+            f.reverseSamples < f.rowReverse || f.flushSamples < f.rowFlush ||
+            f.forwardSamples > f.samples || f.reverseSamples > f.samples - f.forwardSamples ||
+            f.flushSamples > f.samples || !std::isfinite(f.pulseLength) || f.pulseLength <= 0.0) return false;
+        for (unsigned a = 0U; a < 6U; ++a)
+            if (!std::isfinite(f.startPulse[a]) || !std::isfinite(f.endPulse[a]) ||
+                !std::isfinite(f.pulsePerNative[a]) || f.pulsePerNative[a] <= 0.0) return false;
+        return true;
+    }
+    bool E126Counts(const EDM114::Feedback& f, unsigned completed,
+        EDM116::Fixture fixture = EDM116::Fixture::Canonical116) noexcept
+    {
+        if ((fixture != EDM116::Fixture::ArcPair124 && fixture != EDM116::Fixture::ArcPairComplement124) || completed > EDM114::RequiredRows || !f.enabled || f.failed || f.reason != EDM114::Reason::None ||
+            f.stopActive || f.stopped || f.begunRows != completed || f.completedRows != completed ||
+            f.endpointRows != completed || f.completed != (completed == EDM114::RequiredRows) ||
+            f.rowComplete != (completed != 0U) || f.geometryValid != (completed != 0U) ||
+            f.mappedOutput != (completed != 0U)) return false;
+        unsigned lines = 0U, arcs = 0U, cw = 0U, ccw = 0U;
+        for (unsigned i = 0U; i < completed; ++i)
+            if (EDM116::IsArcStep(i, fixture)) { ++arcs; if (EDM116::ExpectedGCode(i, fixture) == 2) ++cw; else ++ccw; }
+            else ++lines;
+        if (f.lineRows != lines || f.arcRows != arcs || f.cwRows != cw || f.ccwRows != ccw) return false;
+        if (completed == 0U) return f.kind == EDM114::Kind::None;
+        if (f.kind != (EDM116::IsArcStep(completed - 1U, fixture) ? EDM114::Kind::Arc : EDM114::Kind::Line) ||
+            !f.lastMappingTick || f.lastTick != f.lastMappingTick || !f.lastMappingUs ||
+            !f.rowSamples || !f.rowForward ||
+            f.rowForward > f.rowSamples || f.rowReverse > f.rowSamples - f.rowForward ||
+            f.rowFlush != 0ULL || f.flushSamples != 0ULL ||
+            f.samples < f.rowSamples || f.forwardSamples < f.rowForward ||
+            f.reverseSamples < f.rowReverse || f.flushSamples < f.rowFlush ||
+            f.forwardSamples > f.samples || f.reverseSamples > f.samples - f.forwardSamples ||
+            f.flushSamples > f.samples || !std::isfinite(f.pulseLength) || f.pulseLength <= 0.0) return false;
+        for (unsigned a = 0U; a < 6U; ++a)
+            if (!std::isfinite(f.startPulse[a]) || !std::isfinite(f.endPulse[a]) ||
+                !std::isfinite(f.pulsePerNative[a]) || f.pulsePerNative[a] <= 0.0) return false;
+        return true;
+    }
     bool E94Matches(const NCParsedBlock& parsed, const NCBlock& b) noexcept
     {
         if (!EDM77::Detail::Clean(parsed) || b.isEmpty != parsed.isEmpty || b.isGoto || b.isBlockSkip ||
@@ -15362,6 +15746,8 @@ namespace
 
 bool NCManager::IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block) noexcept
 {
+    if (block.has('P') && block.val('P') == 131.0)
+        return IsEDM116SelectorCurrentSameThread(block);
     if (block.isEmpty || block.isGoto || block.isBlockSkip || !block.hasG || block.gCode != 180 ||
         block.gCount != 1 || block.gCodes[0] != 180 || block.mCount != 0 || !block.has('P') ||
         (block.val('P') != 85.0 && block.val('P') != 86.0 &&
@@ -15373,27 +15759,38 @@ bool NCManager::IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block)
             block.val('P') != 97.0 && block.val('P') != 98.0 &&
             block.val('P') != 99.0 && block.val('P') != 100.0 &&
             block.val('P') != 101.0 && block.val('P') != 102.0 &&
-            block.val('P') != 103.0 && block.val('P') != 104.0) || m_mode != NCOperationMode::MEMORY ||
+            block.val('P') != 103.0 && block.val('P') != 104.0 &&
+            block.val('P') != 105.0 && block.val('P') != 106.0 &&
+            block.val('P') != 107.0 && block.val('P') != 108.0 &&
+            block.val('P') != 109.0 && block.val('P') != 110.0 &&
+            block.val('P') != 111.0 && block.val('P') != 112.0 &&
+            block.val('P') != 113.0 && block.val('P') != 114.0 && block.val('P') != 115.0 && block.val('P') != 116.0 && block.val('P') != 117.0 && block.val('P') != 118.0 && block.val('P') != 119.0 && block.val('P') != 120.0 && block.val('P') != 121.0 && block.val('P') != 122.0 && block.val('P') != 123.0 && block.val('P') != 124.0 && block.val('P') != 125.0 && block.val('P') != 126.0 && block.val('P') != 127.0 && block.val('P') != 128.0 && block.val('P') != 129.0 && block.val('P') != 130.0 && block.val('P') != 132.0 && block.val('P') != 133.0 && block.val('P') != 134.0 && block.val('P') != 135.0 && block.val('P') != 136.0 && block.val('P') != 137.0 && block.val('P') != 138.0 && block.val('P') != 139.0 && block.val('P') != 140.0 && block.val('P') != 141.0 && block.val('P') != 142.0 && block.val('P') != 143.0 && block.val('P') != 144.0 && block.val('P') != 145.0 && block.val('P') != 146.0 && block.val('P') != 147.0 && block.val('P') != 148.0 && block.val('P') != 149.0 && block.val('P') != 150.0 && block.val('P') != 151.0 && block.val('P') != 152.0 && block.val('P') != 153.0 && block.val('P') != 154.0 && block.val('P') != 155.0 && block.val('P') != 156.0 && block.val('P') != 157.0 && block.val('P') != 158.0 && block.val('P') != 159.0 && block.val('P') != 160.0 && block.val('P') != 161.0) || m_mode != NCOperationMode::MEMORY ||
         m_state != NCState::RUN || !m_macroStack.empty() || m_isG66Active || Homing.IsActive() ||
         !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
         CoordSys.GetTranslationSnapshot().distanceMode != 91 || !m_motion.IsGroupDone() ||
         m_motion.HasPendingSafetyOrRecoveryRequests()) return false;
+    const bool historyArm = block.val('P') == 158.0 || block.val('P') == 160.0;
     const bool noiseArm = block.val('P') == 93.0;
     const bool burstArm = block.val('P') == 95.0;
     const bool continuousArm = block.val('P') == 97.0;
     const bool enduranceArm = block.val('P') == 99.0;
     const bool pairedArm = block.val('P') == 101.0;
-    const bool flushArm = block.val('P') == 103.0;
-    const bool tuningArm = block.val('P') == 91.0 || noiseArm || burstArm || continuousArm || enduranceArm || pairedArm || flushArm;
+    const bool parameterizedArm = block.val('P') == 109.0 || block.val('P') == 111.0 || block.val('P') == 113.0 || block.val('P') == 115.0 || block.val('P') == 117.0 || block.val('P') == 119.0 || block.val('P') == 121.0 || block.val('P') == 123.0 || block.val('P') == 125.0 || block.val('P') == 127.0 || block.val('P') == 129.0 || block.val('P') == 132.0 || block.val('P') == 134.0 || block.val('P') == 136.0 || block.val('P') == 138.0 || block.val('P') == 140.0 || block.val('P') == 142.0 || block.val('P') == 144.0 || block.val('P') == 146.0 || block.val('P') == 148.0 || block.val('P') == 150.0 || block.val('P') == 152.0 || block.val('P') == 154.0 || block.val('P') == 156.0;
+    const bool flushArm = block.val('P') == 103.0 || block.val('P') == 105.0 || block.val('P') == 107.0 || parameterizedArm;
+    const bool tuningArm = historyArm || block.val('P') == 91.0 || noiseArm || burstArm || continuousArm || enduranceArm || pairedArm || flushArm;
     for (char a = 'A'; a <= 'Z'; ++a)
         if (block.has(a) && ((a != 'N' && a != 'P' &&
-            (!tuningArm || (a != 'Q' && a != 'R' && a != 'S'))) ||
+            (!tuningArm || (a != 'Q' && a != 'R' && a != 'S' &&
+                    (!parameterizedArm || (a != 'I' && a != 'J' && a != 'K'))))) ||
             !std::isfinite(block.val(a)))) return false;
     const int pc = GetActiveDispatchPC();
     const auto* authored = GetBaseProgramCache().TryGetLine(pc);
     EDM97::Tuning tuning{};
+    EDM107::FlushProfile parameters{};
     if (!authored || !E94Matches(authored->parsedBlock, block) ||
-        !(flushArm ? E105ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
+        !(historyArm ? E126Profile(authored->parsedBlock, static_cast<unsigned>(block.val('P')), tuning) : parameterizedArm ? E108ProfileOnlyNPQRSIJK(authored->parsedBlock, static_cast<unsigned>(block.val('P')), tuning, parameters) :
+            flushArm ? E106FlushProfile(authored->parsedBlock,
+                block.val('P') == 105.0 ? 105U : block.val('P') == 107.0 ? 107U : 0U, tuning) :
             pairedArm ? E104ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
             enduranceArm ? E102ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
             continuousArm ? E100ProfileOnlyNPQRS(authored->parsedBlock, tuning) :
@@ -15411,7 +15808,7 @@ bool NCManager::IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block)
         block.val('P') == 89.0 || tuningArm;
     return arm ? !m_edm94.latched :
         m_edm94.latched && m_edm94.ready && !m_edm94.cancelled &&
-        block.val('P') == (m_edm94.gapFlushProfile ? 104.0 : m_edm94.gapPairedProfile ? 102.0 : m_edm94.gapEnduranceProfile ? 100.0 : m_edm94.gapContinuousProfile ? 98.0 : m_edm94.gapBurstProfile ? 96.0 : m_edm94.gapNoiseProfile ? 94.0 : m_edm94.gapGainProfile ? 92.0 : m_edm94.gapSegmentProfile ? 90.0 :
+        block.val('P') == (m_edm94.gapHistoryServo ? m_edm94.gapHistoryArm + 1U : m_edm94.gapFlushProfile ? (m_edm94.gapFlushInterruptArm ? static_cast<double>(m_edm94.gapFlushInterruptArm + 1U) : m_edm94.gapModeFlush ? (m_edm94.gapModeInterruption ? static_cast<double>(m_edm94.gapModeInterruptionArm + 1U) : E116FinishP(m_edm94.gapModeFixture)) : m_edm94.gapCurveB2 ? 128.0 : m_edm94.gapPhysicalCurve ? 126.0 : m_edm94.gapCurveRuntime ? 124.0 : m_edm94.gapCurveGeometry ? 122.0 : m_edm94.gapB2Repeat ? 120.0 : m_edm94.gapB2CrossSegment ? 118.0 : m_edm94.gapCommonPath ? 116.0 : m_edm94.gapFlushParameterized ? 110.0 : 104.0) : m_edm94.gapPairedProfile ? 102.0 : m_edm94.gapEnduranceProfile ? 100.0 : m_edm94.gapContinuousProfile ? 98.0 : m_edm94.gapBurstProfile ? 96.0 : m_edm94.gapNoiseProfile ? 94.0 : m_edm94.gapGainProfile ? 92.0 : m_edm94.gapSegmentProfile ? 90.0 :
             m_edm94.gapBoundaryProfile ? 88.0 : 86.0) &&
         pc == m_edm94.pc[m_edm94.moves] &&
         m_edm94.cache == GetBaseProgramCache().GetGeneration() &&
@@ -15441,7 +15838,10 @@ bool NCManager::InspectEDM94ProgramSameThread() noexcept
                 selector == 89.0 || selector == 90.0 || selector == 91.0 || selector == 92.0 ||
                 selector == 93.0 || selector == 94.0 || selector == 95.0 || selector == 96.0 ||
                 selector == 97.0 || selector == 98.0 || selector == 99.0 || selector == 100.0 ||
-                selector == 101.0 || selector == 102.0 || selector == 103.0 || selector == 104.0);
+                selector == 101.0 || selector == 102.0 || selector == 103.0 || selector == 104.0 ||
+                selector == 105.0 || selector == 106.0 || selector == 107.0 || selector == 108.0 ||
+                selector == 109.0 || selector == 110.0 ||
+                selector == 111.0 || selector == 112.0 || selector == 113.0 || selector == 114.0 || selector == 115.0 || selector == 116.0 || selector == 117.0 || selector == 118.0 || selector == 119.0 || selector == 120.0 || selector == 121.0 || selector == 122.0 || selector == 123.0 || selector == 124.0 || selector == 125.0 || selector == 126.0 || selector == 127.0 || selector == 128.0 || selector == 129.0 || selector == 130.0 || selector == 131.0 || selector == 132.0 || selector == 133.0 || selector == 134.0 || selector == 135.0 || selector == 136.0 || selector == 137.0 || selector == 138.0 || selector == 139.0 || selector == 140.0 || selector == 141.0 || selector == 142.0 || selector == 143.0 || selector == 144.0 || selector == 145.0 || selector == 146.0 || selector == 147.0 || selector == 148.0 || selector == 149.0 || selector == 150.0 || selector == 151.0 || selector == 152.0 || selector == 153.0 || selector == 154.0 || selector == 155.0 || selector == 156.0 || selector == 157.0 || selector == 158.0 || selector == 159.0 || selector == 160.0 || selector == 161.0);
         bool g180 = false;
         for (int j = 0; j < p.gCount && j < NC_MAX_G_CODES_PER_BLOCK; ++j)
         {
@@ -15460,6 +15860,7 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
     const auto& cache = GetBaseProgramCache();
     if (armPC < 0 || cache.Size() == 0U || cache.Size() > 128U) return false;
     m_edm94.moves = m_edm94.next = 0U;
+    m_edm94.gapHistoryServo = false; m_edm94.gapHistoryArm = 0U;
     m_edm94.gapBoundaryProfile = false;
     m_edm94.gapSegmentProfile = false;
     m_edm94.gapGainProfile = false;
@@ -15469,9 +15870,25 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
     m_edm94.gapEnduranceProfile = false;
     m_edm94.gapPairedProfile = false;
     m_edm94.gapFlushProfile = false;
+    m_edm94.gapFlushParameterized = false;
+    m_edm94.gapCommonPath = false;
+    m_edm94.gapB2CrossSegment = false;
+    m_edm94.gapB2Repeat = false;
+    m_edm94.gapCurveGeometry = false;
+    m_edm94.gapCurveRuntime = false;
+    m_edm94.gapPhysicalCurve = false; m_edm94.gapCurveB2 = false; m_edm94.gapModeFlush = false;
+    m_edm94.gapModeFixture = EDM116::Fixture::Canonical116;
+    m_edm94.gapModeInterruption = false;
+    m_edm94.gapModeInterruptionArm = 0U;
+    m_edm94.selectorPC.fill(-1);
+    m_edm94.gapFlushParameters = EDM107::FlushProfile{};
+    m_edm94.gapFlushInterruptArm = 0U;
+    m_edm94.gapFlushInterruptRequested = false;
+    m_edm94.gapFlushInterruptSampleTick = m_edm94.gapFlushInterruptEpoch = 0ULL;
     m_edm94.gapTuning = EDM97::Tuning{};
     std::array<double, 6U> total{};
     unsigned phase = 0U;
+    bool modePending = false;
     double nominalSeconds = 0.0;
     for (std::size_t i = 0U; i < cache.Size(); ++i)
     {
@@ -15482,7 +15899,44 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
         if (phase == 0U)
         {
             EDM97::Tuning tuning{};
-            const bool flushArm = E105ProfileOnlyNPQRS(b, tuning);
+            EDM107::FlushProfile parameters{};
+            const unsigned historyArm = E126Profile(b, 158U, tuning) ? 158U : E126Profile(b, 160U, tuning) ? 160U : 0U;
+            if (historyArm)
+            {
+                if (static_cast<int>(i) != armPC) return false;
+                m_edm94.gapHistoryServo = true; m_edm94.gapHistoryArm = historyArm;
+                m_edm94.gapSegmentProfile = m_edm94.gapGainProfile = m_edm94.gapPhysicalCurve = true;
+                m_edm94.gapModeFixture = historyArm == 158U ? EDM116::Fixture::ArcPair124 : EDM116::Fixture::ArcPairComplement124;
+                m_edm94.gapTuning = tuning; phase = 1U; continue;
+            }
+            const unsigned parameterizedInterrupt = E108ProfileOnlyNPQRSIJK(b, 111U, tuning, parameters) ? 111U :
+                E108ProfileOnlyNPQRSIJK(b, 113U, tuning, parameters) ? 113U : 0U;
+            const unsigned interruptionArm = E108ProfileOnlyNPQRSIJK(b, 134U, tuning, parameters) ? 134U :
+                E108ProfileOnlyNPQRSIJK(b, 136U, tuning, parameters) ? 136U :
+                E108ProfileOnlyNPQRSIJK(b, 138U, tuning, parameters) ? 138U :
+                E108ProfileOnlyNPQRSIJK(b, 140U, tuning, parameters) ? 140U :
+                E108ProfileOnlyNPQRSIJK(b, EDM122::B0ArmP, tuning, parameters) ? EDM122::B0ArmP :
+                E108ProfileOnlyNPQRSIJK(b, EDM122::B1ArmP, tuning, parameters) ? EDM122::B1ArmP :
+                E108ProfileOnlyNPQRSIJK(b, EDM123::B0ArmP, tuning, parameters) ? EDM123::B0ArmP :
+                E108ProfileOnlyNPQRSIJK(b, EDM123::B1ArmP, tuning, parameters) ? EDM123::B1ArmP :
+                E108ProfileOnlyNPQRSIJK(b, EDM125::RetreatArmP, tuning, parameters) ? EDM125::RetreatArmP :
+                E108ProfileOnlyNPQRSIJK(b, EDM125::ReturnArmP, tuning, parameters) ? EDM125::ReturnArmP : 0U;
+            const bool arcPairArm = E108ProfileOnlyNPQRSIJK(b, 150U, tuning, parameters);
+            const bool arcPairComplementArm = E108ProfileOnlyNPQRSIJK(b, 152U, tuning, parameters);
+            const bool complementArm = interruptionArm == 134U || E108ProfileOnlyNPQRSIJK(b, 132U, tuning, parameters);
+            const bool modeFlushArm = interruptionArm != 0U || arcPairArm || arcPairComplementArm ||
+                complementArm || E108ProfileOnlyNPQRSIJK(b, 129U, tuning, parameters);
+            const bool curveB2Arm = E108ProfileOnlyNPQRSIJK(b, 127U, tuning, parameters);
+            const bool physicalCurveArm = modeFlushArm || curveB2Arm || E108ProfileOnlyNPQRSIJK(b, 125U, tuning, parameters);
+            const bool curveRuntimeArm = E108ProfileOnlyNPQRSIJK(b, 123U, tuning, parameters);
+            const bool curveGeometryArm = curveRuntimeArm || E108ProfileOnlyNPQRSIJK(b, 121U, tuning, parameters);
+            const bool b2RepeatArm = curveGeometryArm || E108ProfileOnlyNPQRSIJK(b, 119U, tuning, parameters);
+            const bool b2CrossSegmentArm = b2RepeatArm || E108ProfileOnlyNPQRSIJK(b, 117U, tuning, parameters);
+            const bool commonPathArm = b2CrossSegmentArm || E108ProfileOnlyNPQRSIJK(b, 115U, tuning, parameters);
+            const bool parameterizedArm = physicalCurveArm || commonPathArm || parameterizedInterrupt != 0U || E107ProfileOnlyNPQRSIJK(b, tuning, parameters);
+            const unsigned interruptArm = parameterizedInterrupt ? parameterizedInterrupt :
+                E106ProfileOnlyNPQRS(b, 105U, tuning) ? 105U : E106ProfileOnlyNPQRS(b, 107U, tuning) ? 107U : 0U;
+            const bool flushArm = parameterizedArm || interruptArm != 0U || E105ProfileOnlyNPQRS(b, tuning);
             const bool pairedArm = E104ProfileOnlyNPQRS(b, tuning);
             const bool enduranceArm = E102ProfileOnlyNPQRS(b, tuning);
             const bool continuousArm = E100ProfileOnlyNPQRS(b, tuning);
@@ -15501,6 +15955,23 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                 m_edm94.gapEnduranceProfile = enduranceArm || pairedArm || flushArm;
                 m_edm94.gapPairedProfile = pairedArm || flushArm;
                 m_edm94.gapFlushProfile = flushArm;
+                m_edm94.gapFlushParameterized = parameterizedArm;
+                m_edm94.gapCommonPath = commonPathArm;
+                m_edm94.gapB2CrossSegment = b2CrossSegmentArm;
+                m_edm94.gapB2Repeat = b2RepeatArm;
+                m_edm94.gapCurveGeometry = curveGeometryArm;
+                m_edm94.gapCurveRuntime = curveRuntimeArm;
+                m_edm94.gapPhysicalCurve = physicalCurveArm;
+                m_edm94.gapCurveB2 = curveB2Arm;
+                m_edm94.gapModeFlush = modeFlushArm;
+                m_edm94.gapModeInterruption = interruptionArm != 0U;
+                m_edm94.gapModeInterruptionArm = interruptionArm;
+                m_edm94.gapModeFixture = EDM125::ValidProfile(EDM125::ProfileForArm(interruptionArm)) ?
+                    EDM125::TargetFixture(EDM125::ProfileForArm(interruptionArm)) : arcPairArm ? EDM116::Fixture::ArcPair124 :
+                    arcPairComplementArm ? EDM116::Fixture::ArcPairComplement124 :
+                    complementArm ? EDM116::Fixture::Complement117 : EDM116::Fixture::Canonical116;
+                m_edm94.gapFlushParameters = parameters;
+                m_edm94.gapFlushInterruptArm = interruptArm;
                 if (tuningArm) m_edm94.gapTuning = tuning;
                 phase = 1U;
             }
@@ -15508,16 +15979,24 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
         }
         else if (phase == 1U)
         {
-            if (E94Profile(b, m_edm94.gapFlushProfile ? 104U : m_edm94.gapPairedProfile ? 102U : m_edm94.gapEnduranceProfile ? 100U : m_edm94.gapContinuousProfile ? 98U : m_edm94.gapBurstProfile ? 96U : m_edm94.gapNoiseProfile ? 94U : m_edm94.gapGainProfile ? 92U : m_edm94.gapSegmentProfile ? 90U :
+            if (E94Profile(b, m_edm94.gapHistoryServo ? m_edm94.gapHistoryArm + 1U : m_edm94.gapFlushProfile ? (m_edm94.gapFlushInterruptArm ? m_edm94.gapFlushInterruptArm + 1U : m_edm94.gapModeFlush ? (m_edm94.gapModeInterruption ? m_edm94.gapModeInterruptionArm + 1U : E116FinishP(m_edm94.gapModeFixture)) : m_edm94.gapCurveB2 ? 128U : m_edm94.gapPhysicalCurve ? 126U : m_edm94.gapCurveRuntime ? 124U : m_edm94.gapCurveGeometry ? 122U : m_edm94.gapB2Repeat ? 120U : m_edm94.gapB2CrossSegment ? 118U : m_edm94.gapCommonPath ? 116U : m_edm94.gapFlushParameterized ? 110U : 104U) : m_edm94.gapPairedProfile ? 102U : m_edm94.gapEnduranceProfile ? 100U : m_edm94.gapContinuousProfile ? 98U : m_edm94.gapBurstProfile ? 96U : m_edm94.gapNoiseProfile ? 94U : m_edm94.gapGainProfile ? 92U : m_edm94.gapSegmentProfile ? 90U :
                 m_edm94.gapBoundaryProfile ? 88U : 86U))
             {
-                if (m_edm94.moves == 0U) return false;
+                if (m_edm94.moves == 0U || modePending) return false;
                 m_edm94.pc[m_edm94.moves] = static_cast<int>(i); phase = 2U;
                 continue;
             }
             const unsigned step = m_edm94.moves;
-            if (step >= (m_edm94.gapEnduranceProfile ? EDM102::MaximumSteps : 8U) ||
-                !E94Move(b, m_edm94.increment[step], m_edm94.feed[step])) return false;
+            if (m_edm94.gapModeFlush && !modePending)
+            {
+                EDM116::Mode mode{};
+                if (step >= EDM114::RequiredRows || !E116Selector(b, mode) || mode != EDM116::ExpectedMode(step)) return false;
+                m_edm94.selectorPC[step] = static_cast<int>(i); modePending = true;
+                continue;
+            }
+            if (step >= ((m_edm94.gapHistoryServo || m_edm94.gapEnduranceProfile) ? EDM102::MaximumSteps : 8U) ||
+                !(m_edm94.gapPhysicalCurve ? E114Move(b, step, m_edm94.increment[step], m_edm94.feed[step], m_edm94.gapModeFixture) :
+                    E94Move(b, m_edm94.increment[step], m_edm94.feed[step]))) return false;
             if (m_edm94.gapBoundaryProfile)
             {
                 // The simulated GAP chooses a boundary direction for one
@@ -15531,7 +16010,7 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                             -m_edm94.increment[0U][a] : m_edm94.increment[0U][a]))) return false;
                 }
             }
-            if (m_edm94.gapSegmentProfile)
+            if (m_edm94.gapSegmentProfile && !m_edm94.gapPhysicalCurve)
             {
                 if (step >= (m_edm94.gapEnduranceProfile ? EDM102::MaximumSteps : m_edm94.gapContinuousProfile ? EDM100::MaximumSteps : 4U) ||
                     m_edm94.feed[step] != 0.12) return false;
@@ -15549,17 +16028,26 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                         -m_edm94.increment[0U][a] : m_edm94.increment[0U][a])) return false;
                 }
             }
+            if (m_edm94.gapPhysicalCurve && EDM116::IsArcStep(step, m_edm94.gapModeFixture))
+            {
+                // Include both cardinal extrema of the fixed small circle,
+                // not merely its endpoint chord, in the arm-relative budget.
+                const double centerX = total[0] + ((step & 1U) ? -0.001 : 0.001);
+                if (std::fabs(centerX) + 0.001 > 0.025 || std::fabs(total[1]) + 0.001 > 0.025) return false;
+            }
             for (unsigned a = 0U; a < 6U; ++a)
             {
                 total[a] += m_edm94.increment[step][a];
                 if (!std::isfinite(total[a]) || std::fabs(total[a]) > (a < 3U ? .025 : .5)) return false;
             }
             const auto& d = m_edm94.increment[step];
-            nominalSeconds += std::hypot(std::hypot(d[0], d[1]), d[2]) * 60.0 / m_edm94.feed[step] + 2.0;
+            const double lengthMm = m_edm94.gapPhysicalCurve && EDM116::IsArcStep(step, m_edm94.gapModeFixture) ?
+                0.001 * EDM114::Pi : std::hypot(std::hypot(d[0], d[1]), d[2]);
+            nominalSeconds += lengthMm * 60.0 / m_edm94.feed[step] + 2.0;
             // Admission allowance only; RT segment/session deadlines are unchanged.
-            if (m_edm94.gapFlushProfile && (step & 1U) == 0U) nominalSeconds += 2.5;
+            if (m_edm94.gapFlushProfile && !m_edm94.gapModeFlush && (step & 1U) == 0U) nominalSeconds += 2.5;
             if (!std::isfinite(nominalSeconds) || nominalSeconds > 90.0) return false;
-            m_edm94.pc[step] = static_cast<int>(i); ++m_edm94.moves;
+            m_edm94.pc[step] = static_cast<int>(i); ++m_edm94.moves; modePending = false;
         }
         else if (phase == 2U)
         {
@@ -15571,8 +16059,17 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
         else return false;
     }
     if (phase != 3U) return false;
+    if (m_edm94.gapModeFlush && nominalSeconds + 6.0 * 3.0 + 2.0 * 20.0 > 115.0) return false;
+    // P127 reserves two independent 20-second curve B2 budgets. Its explicit
+    // 115-second admission ceiling leaves the unchanged 120-second RT guard intact.
+    if (m_edm94.gapCurveB2 && nominalSeconds + 40.0 > 115.0) return false;
+    // Each explicit B2 event reserves 20 seconds inside the unchanged 120-second RT session.
+    if (m_edm94.gapB2CrossSegment &&
+        nominalSeconds + (m_edm94.gapB2Repeat ? 40.0 : 20.0) > 110.0) return false;
     if (m_edm94.gapBoundaryProfile && m_edm94.moves != 2U && m_edm94.moves != 4U) return false;
-    if (m_edm94.gapFlushProfile)
+    if (m_edm94.gapHistoryServo)
+    { if (m_edm94.moves != EDM114::RequiredRows) return false; }
+    else if (m_edm94.gapFlushProfile)
     { if (m_edm94.moves != EDM105::MaximumSteps) return false; }
     else if (m_edm94.gapPairedProfile)
     { if (m_edm94.moves != EDM104::MaximumSteps) return false; }
@@ -15764,7 +16261,7 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
         "[EDM94] event=BRACKET_EVIDENCE result=%.32s part=OUTPUT session=%llu tick=%llu nonzeroSentMask=%u actualMovedMask=%u commandMovedMask=%u sentFrames=%llu handoffZero=%u handoffStarted=%u handoffCompleted=%u source=FIXED_NC gapControl=%s actualOutput=GUARDED_CSV dischargeCommand=NONE\n",
         result, session, tick, f.nonzeroSentMask, f.actualMovedMask, f.commandMovedMask,
         static_cast<unsigned long long>(f.sentFrames), f.handoffZero ? 1U : 0U,
-        f.handoffStarted, f.handoffCompleted, s.gapFlushProfile ? "SIM_PAIRED_FLUSH_BURST_SERVO" :
+        f.handoffStarted, f.handoffCompleted, s.gapHistoryServo ? "SIM_HISTORY_GAP_SERVO" : s.gapFlushProfile ? "SIM_PAIRED_FLUSH_BURST_SERVO" :
             s.gapPairedProfile ? "SIM_PAIRED_CAPTURE_DWELL_BURST_SERVO" :
             s.gapEnduranceProfile ? "SIM_ENDURANCE_CAPTURE_DWELL_BURST_SERVO" :
             s.gapContinuousProfile ? "SIM_CONTINUOUS_CAPTURE_DWELL_BURST_SERVO" :
@@ -15777,6 +16274,25 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
             std::strcmp(result, "NORMAL_RELEASE_REQUEST") == 0 || std::strcmp(result, "NORMAL_RELEASED") == 0 ||
             std::strcmp(result, "RT_FAULT") == 0 || std::strcmp(result, "REJECT") == 0))
         LogEDM101RecoverySameThread(result, reason);
+    if (s.gapModeInterruption &&
+        (std::strcmp(result, "ARM_REQUEST") == 0 || std::strcmp(result, "START_BLOCKED") == 0 ||
+            std::strcmp(result, "RELEASE_REQUEST") == 0 || std::strcmp(result, "RT_FAULT") == 0 ||
+            std::strcmp(result, "REJECT") == 0))
+        LogEDM118SameThread(result, reason);
+    if (s.gapFlushProfile && !s.gapModeInterruption &&
+        (std::strcmp(result, "ARM_REQUEST") == 0 || std::strcmp(result, "CANCEL_REQUEST") == 0 ||
+            std::strcmp(result, "CANCEL_STOPPED") == 0 || std::strcmp(result, "START_BLOCKED") == 0 ||
+            std::strcmp(result, "RELEASE_REQUEST") == 0 || std::strcmp(result, "RELEASED") == 0 ||
+            std::strcmp(result, "EMPTY_ADMISSION_RELEASED") == 0 ||
+            std::strcmp(result, "NORMAL_RELEASE_REQUEST") == 0 || std::strcmp(result, "NORMAL_RELEASED") == 0 ||
+            std::strcmp(result, "RT_FAULT") == 0 || std::strcmp(result, "REJECT") == 0))
+        LogEDM106InterruptionSameThread(result, reason);
+    if (s.gapB2CrossSegment &&
+        (std::strcmp(result, "CANCEL_REQUEST") == 0 || std::strcmp(result, "CANCEL_STOPPED") == 0 ||
+            std::strcmp(result, "RT_FAULT") == 0 || std::strcmp(result, "REJECT") == 0 ||
+            std::strcmp(result, "PASS") == 0 || std::strcmp(result, "NORMAL_RELEASED") == 0 ||
+            std::strcmp(result, "RELEASED") == 0 || std::strcmp(result, "START_BLOCKED") == 0))
+        LogEDM110SameThread(result);
     if (s.gapSegmentProfile)
     {
         EDM96::Feedback gap{};
@@ -15939,6 +16455,24 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
 
 void NCManager::CancelEDM94SameThread(const char* reason) noexcept
 {
+    // Capture the independent excursion cause before cancellation clears its NC receipt.
+    if (m_edm94.gapModeFlush && !m_edm94.cancelled && !m_edm116.failureLogged &&
+        m_motion.ReadEDM116Feedback(m_edm116.feedback) && m_edm116.feedback.excursion.faulted &&
+        m_edm116.feedback.session == m_edm94.session && m_edm116.feedback.armEpoch == m_edm94.armEpoch &&
+        m_edm116.feedback.ownerGeneration == m_edm94.lease.generation)
+    { m_edm116.failureLogged = true; LogEDM116SameThread("MODE_FLUSH_FAIL"); }
+    if (m_edm94.gapCurveB2 && !m_edm94.cancelled && !m_edm115.failureLogged &&
+        m_motion.ReadEDM115Feedback(m_edm115.feedback) && m_edm115.feedback.excursion.faulted &&
+        m_edm115.feedback.session == m_edm94.session && m_edm115.feedback.armEpoch == m_edm94.armEpoch &&
+        m_edm115.feedback.ownerGeneration == m_edm94.lease.generation)
+    { m_edm115.failureLogged = true; LogEDM115SameThread("CURVE_B2_FAIL"); }
+    // Capture the independent mapper cause before normal cancellation clears its NC receipt.
+    if (m_edm94.gapPhysicalCurve && !m_edm94.cancelled && !m_edm114.failureLogged &&
+        m_motion.ReadEDM114Feedback(m_edm114.feedback) && m_edm114.feedback.failed &&
+        m_edm114.feedback.session == m_edm94.session && m_edm114.feedback.armEpoch == m_edm94.armEpoch &&
+        m_edm114.feedback.ownerGeneration == m_edm94.lease.generation)
+    { m_edm114.failureLogged = true; LogEDM114SameThread("PHYSICAL_CURVE_FAIL"); }
+    InvalidateEDM109CommonPathSameThread(reason ? reason : "CANCEL");
     m_edm94.boundary = EDM94NCState::FeedBoundary{};
     m_edm94.gapWaiting = m_edm94.gapPermitReady = false;
     // RT may have completed normal retirement immediately before HOLD/RESET.
@@ -15975,17 +16509,71 @@ bool NCManager::GuardEDM94BlockSameThread(const NCBlock& block, int pc, int line
     if (!m_edm94.latched)
     {
         EDM97::Tuning tuning{};
+        EDM107::FlushProfile parameters{};
         if (E94Preamble(authored->parsedBlock) || E94Profile(authored->parsedBlock, 85U) ||
             E94Profile(authored->parsedBlock, 87U) || E94Profile(authored->parsedBlock, 89U) ||
+            E126Profile(authored->parsedBlock, 158U, tuning) || E126Profile(authored->parsedBlock, 160U, tuning) ||
             E97ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
             E98ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
             E99ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
             E100ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
             E102ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
             E104ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
-            E105ProfileOnlyNPQRS(authored->parsedBlock, tuning)) return true;
+            E105ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
+            E106ProfileOnlyNPQRS(authored->parsedBlock, 105U, tuning) ||
+            E106ProfileOnlyNPQRS(authored->parsedBlock, 107U, tuning) ||
+            E107ProfileOnlyNPQRSIJK(authored->parsedBlock, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 111U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 113U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 115U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 117U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 119U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 121U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 123U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 125U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 127U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 129U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 132U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 134U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 136U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 138U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 140U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, EDM122::B0ArmP, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, EDM122::B1ArmP, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, EDM123::B0ArmP, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, EDM123::B1ArmP, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 150U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 152U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, EDM125::RetreatArmP, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, EDM125::ReturnArmP, tuning, parameters)) return true;
         RejectEDM94SameThread("ARM_REQUIRED_START_TOP", line); return false;
     }
+    if (m_edm94.gapModeInterruption && (m_edm94.gapModeInterruptionArm != m_edm118.armP ||
+        m_edm94.next > (EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? EDM125::TargetStep : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? EDM123::TargetStep(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? EDM122::TargetStep(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) : EDM118::TargetStep)))
+    {
+        RequestEDM118HoldSameThread(false, "NEXT_BLOCK_FORBIDDEN_TARGET_MISSED");
+        return false;
+    }
+    if (m_edm94.gapModeFlush && block.has('P') && block.val('P') == 131.0)
+    {
+        if (pc != GetActiveDispatchPC() || !IsEDM116SelectorCurrentSameThread(block))
+        { RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_SELECTOR_SCOPE" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_SELECTOR_SCOPE" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_SELECTOR_SCOPE" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_SELECTOR_SCOPE" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_SELECTOR_SCOPE" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_SELECTOR_SCOPE" : m_edm94.gapModeInterruption ? "EDM118_SELECTOR_SCOPE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_SELECTOR_SCOPE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_SELECTOR_SCOPE" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_SELECTOR_SCOPE" : "EDM116_SELECTOR_SCOPE"), line); return false; }
+        return true; // Setting blocks never advance the physical row cursor.
+    }
+    if (m_edm94.gapModeFlush && m_edm94.next < m_edm94.moves &&
+        (!m_edm116.pending || m_edm116.selected != m_edm94.next + 1U || m_edm116.consumed != m_edm94.next))
+    { RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_SELECTOR_REQUIRED" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_SELECTOR_REQUIRED" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_SELECTOR_REQUIRED" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_SELECTOR_REQUIRED" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_SELECTOR_REQUIRED" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_SELECTOR_REQUIRED" : m_edm94.gapModeInterruption ? "EDM118_SELECTOR_REQUIRED" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_SELECTOR_REQUIRED" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_SELECTOR_REQUIRED" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_SELECTOR_REQUIRED" : "EDM116_SELECTOR_REQUIRED"), line); return false; }
+    if (m_edm94.gapModeFlush && m_edm94.next >= m_edm94.moves &&
+        (m_edm116.pending || m_edm116.selected != m_edm94.moves || m_edm116.consumed != m_edm94.moves))
+    { RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_ORPHAN_SELECTOR" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_ORPHAN_SELECTOR" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_ORPHAN_SELECTOR" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_ORPHAN_SELECTOR" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_ORPHAN_SELECTOR" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_ORPHAN_SELECTOR" : m_edm94.gapModeInterruption ? "EDM118_ORPHAN_SELECTOR" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_ORPHAN_SELECTOR" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_ORPHAN_SELECTOR" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_ORPHAN_SELECTOR" : "EDM116_ORPHAN_SELECTOR"), line); return false; }
+    if (m_edm94.gapModeFlush && m_edm94.next == 0U &&
+        (!m_edm116.initialTranslationValid ||
+            !SameNCTranslationSnapshot(m_edm116.initialTranslation, CoordSys.GetTranslationSnapshot())))
+    { RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_INITIAL_FRAME_CHANGED" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_INITIAL_FRAME_CHANGED" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_INITIAL_FRAME_CHANGED" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_INITIAL_FRAME_CHANGED" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_INITIAL_FRAME_CHANGED" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_INITIAL_FRAME_CHANGED" : m_edm94.gapModeInterruption ? "EDM118_INITIAL_FRAME_CHANGED" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_INITIAL_FRAME_CHANGED" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_INITIAL_FRAME_CHANGED" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_INITIAL_FRAME_CHANGED" : "EDM116_INITIAL_FRAME_CHANGED"), line); return false; }
+    if (m_edm94.gapHistoryServo && m_edm94.next == 0U &&
+        (!m_edm126.initialBoundaryReady || !m_edm126.initialTranslationValid ||
+            !SameNCTranslationSnapshot(m_edm126.initialTranslation, CoordSys.GetTranslationSnapshot())))
+    { RejectEDM94SameThread("EDM126_INITIAL_FRAME_OR_BOUNDARY", line); return false; }
     if (m_edm94.cancelled || m_edm94.armPending || m_edm94.releaseRequested ||
         m_edm94.cache != GetBaseProgramCache().GetGeneration() ||
         m_edm94.run != m_pathCoreLiveBookkeeping.currentRunToken ||
@@ -16002,11 +16590,15 @@ bool NCManager::GuardEDM94BlockSameThread(const NCBlock& block, int pc, int line
 bool NCManager::GuardEDM94FeedSameThread(const NCBlock& block) noexcept
 {
     if (!m_edm94.latched) return !m_edm94.program;
+    if (m_edm94.gapCurveGeometry && !IsEDM112GeometryCurrentSameThread(false)) return false;
     if (!m_edm94.ready || m_edm94.cancelled || m_edm94.finishPending || m_edm94.next == 0U ||
         m_edm94.next > m_edm94.moves || m_edm94.cache != GetBaseProgramCache().GetGeneration() ||
         m_edm94.run != m_pathCoreLiveBookkeeping.currentRunToken ||
         !m_motion.IsMotionOwnerLeaseCurrent(m_edm94.lease)) return false;
     const unsigned step = m_edm94.next - 1U;
+    if (m_edm94.gapPhysicalCurve && (EDM116::IsArcStep(step, m_edm94.gapModeFixture) || !IsEDM114CurrentSameThread(step))) return false;
+    if (m_edm94.gapCurveB2 && !IsEDM115CurrentSameThread(step)) return false;
+    if (m_edm94.gapCurveRuntime && !IsEDM113RuntimeCurrentSameThread(step)) return false;
     const int pc = GetActiveDispatchPC();
     if (pc != m_edm94.pc[step] || m_currentExecutingBlockDispatchId == 0ULL ||
         block.val('F') != m_edm94.feed[step]) return false;
@@ -16031,14 +16623,39 @@ bool NCManager::GuardEDM94FeedSameThread(const NCBlock& block) noexcept
                 gap.epoch != epoch || gap.ownerGeneration != m_edm94.lease.generation ||
                 gap.expectedStep != step || !gap.active || gap.faulted ||
                 gap.reason != EDM96::Reason::None || !IsEDM97TuningCurrentSameThread(gap)) return false;
+            if (m_edm94.gapHistoryServo)
+                return IsEDM126CurrentSameThread(step) && m_motion.AuthorizeEDM126Feed(m_edm94.session,
+                    m_edm94.run, m_edm94.cache, m_currentExecutingBlockDispatchId, pc, step, 1,
+                    m_edm94.increment[step], std::array<double, 2U>{}, m_edm94.feed[step],
+                    epoch, m_edm94.lease, m_edm94.gapTuning, m_edm114.retained.source,
+                    m_edm114.completionCommit, m_edm114.completionTick);
             if (m_edm94.gapNoiseProfile)
                 return m_motion.AuthorizeEDM98Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
                     m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
                     m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning);
             if (m_edm94.gapFlushProfile)
+            {
+                if (m_edm94.gapModeFlush)
+                    return AuthorizeEDM116SameThread(block, 1, std::array<double, 2U>{});
+                if (m_edm94.gapCurveB2)
+                {
+                    if (!BuildEDM115CompletionTokenSameThread(step)) return false;
+                    return m_motion.AuthorizeEDM115Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+                        m_currentExecutingBlockDispatchId, pc, step, 1, m_edm94.increment[step],
+                        std::array<double, 2U>{}, m_edm94.feed[step], epoch, m_edm94.lease,
+                        m_edm94.gapTuning, m_edm94.gapFlushParameters, m_edm115.token);
+                }
+                if (m_edm94.gapPhysicalCurve)
+                    return m_motion.AuthorizeEDM114Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
+                        m_currentExecutingBlockDispatchId, pc, step, 1, m_edm94.increment[step],
+                        std::array<double, 2U>{}, m_edm94.feed[step], epoch, m_edm94.lease,
+                        m_edm94.gapTuning, m_edm94.gapFlushParameters);
+                if (!BuildEDM110CompletionTokenSameThread(step)) return false;
                 return m_motion.AuthorizeEDM105Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
                     m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
-                    m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning);
+                    m_edm94.feed[step], epoch, m_edm94.lease, m_edm94.gapTuning, m_edm94.gapFlushParameters,
+                    m_edm94.gapCommonPath, m_edm94.gapB2CrossSegment, m_edm110.token, m_edm94.gapB2Repeat, m_edm94.gapCurveRuntime);
+            }
             if (m_edm94.gapPairedProfile)
                 return m_motion.AuthorizeEDM104Feed(m_edm94.session, m_edm94.run, m_edm94.cache,
                     m_currentExecutingBlockDispatchId, pc, step, m_edm94.increment[step],
@@ -16082,24 +16699,95 @@ bool NCManager::GuardEDM94FeedSameThread(const NCBlock& block) noexcept
 WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
 {
     const int pc = GetActiveDispatchPC();
+    if (block.val('P') == EDM125::RetreatFinishP || block.val('P') == EDM125::ReturnFinishP)
+    {
+        const unsigned arm = block.val('P') == EDM125::RetreatFinishP ? EDM125::RetreatArmP : EDM125::ReturnArmP;
+        if (m_edm94.gapModeInterruption && m_edm94.latched && m_edm94.gapModeInterruptionArm == arm)
+            RequestEDM118HoldSameThread(false, arm == EDM125::RetreatArmP ? "P155_TARGET_MISSED" : "P157_TARGET_MISSED");
+        else RejectEDM94SameThread("EDM125_FINISH_SCOPE", m_gapDryRun.sourceLine);
+        return nullptr;
+    }
+    if (block.val('P') == 135.0 || block.val('P') == 137.0 || block.val('P') == 139.0 || block.val('P') == 141.0 || block.val('P') == 143.0 || block.val('P') == 145.0 || block.val('P') == 147.0 || block.val('P') == 149.0)
+    {
+        const bool b0Return = block.val('P') == 147.0;
+        const bool b1Return = block.val('P') == 149.0;
+        const bool b0Local = block.val('P') == 143.0;
+        const bool b1Local = block.val('P') == 145.0;
+        const bool previousReturn = block.val('P') == 141.0;
+        const bool arcRetreat = block.val('P') == 139.0;
+        const bool retreat = block.val('P') == 137.0;
+        if (m_edm94.gapModeInterruption && m_edm94.latched &&
+            m_edm94.gapModeInterruptionArm == (b0Return ? EDM123::B0ArmP : b1Return ? EDM123::B1ArmP : b0Local ? EDM122::B0ArmP : b1Local ? EDM122::B1ArmP : previousReturn ? EDM121::ArmP : arcRetreat ? EDM120::ArmP : retreat ? EDM119::ArmP : EDM118::ArmP))
+            RequestEDM118HoldSameThread(false, b0Return ? "P147_TARGET_MISSED" : b1Return ? "P149_TARGET_MISSED" : b0Local ? "P143_TARGET_MISSED" : b1Local ? "P145_TARGET_MISSED" : previousReturn ? "P141_TARGET_MISSED" : arcRetreat ? "P139_TARGET_MISSED" : retreat ? "P137_TARGET_MISSED" : "P135_TARGET_MISSED");
+        else RejectEDM94SameThread(b0Return || b1Return ? "EDM123_FINISH_SCOPE" : b0Local || b1Local ? "EDM122_FINISH_SCOPE" : previousReturn ? "EDM121_FINISH_SCOPE" : arcRetreat ? "EDM120_FINISH_SCOPE" : retreat ? "EDM119_FINISH_SCOPE" : "EDM118_FINISH_SCOPE", m_gapDryRun.sourceLine);
+        return nullptr;
+    }
+    if (block.val('P') == 131.0)
+    {
+        if (!CommitEDM116ModeSameThread(block)) RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_SELECTOR_COMMIT" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_SELECTOR_COMMIT" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_SELECTOR_COMMIT" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_SELECTOR_COMMIT" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_SELECTOR_COMMIT" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_SELECTOR_COMMIT" : m_edm94.gapModeInterruption ? "EDM118_SELECTOR_COMMIT" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_SELECTOR_COMMIT" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_SELECTOR_COMMIT" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_SELECTOR_COMMIT" : "EDM116_SELECTOR_COMMIT"), m_gapDryRun.sourceLine);
+        return nullptr;
+    }
     if (block.val('P') == 86.0 || block.val('P') == 88.0 || block.val('P') == 90.0 ||
-        block.val('P') == 92.0 || block.val('P') == 94.0 || block.val('P') == 96.0 || block.val('P') == 98.0 || block.val('P') == 100.0 || block.val('P') == 102.0 || block.val('P') == 104.0)
+        block.val('P') == 92.0 || block.val('P') == 94.0 || block.val('P') == 96.0 || block.val('P') == 98.0 || block.val('P') == 100.0 || block.val('P') == 102.0 || block.val('P') == 104.0 || block.val('P') == 106.0 || block.val('P') == 108.0 || block.val('P') == 110.0 || block.val('P') == 112.0 || block.val('P') == 114.0 || block.val('P') == 116.0 || block.val('P') == 118.0 || block.val('P') == 120.0 || block.val('P') == 122.0 || block.val('P') == 124.0 || block.val('P') == 126.0 || block.val('P') == 128.0 || block.val('P') == 130.0 || block.val('P') == 133.0 || block.val('P') == 151.0 || block.val('P') == 153.0 || block.val('P') == 159.0 || block.val('P') == 161.0)
     {
         if (m_edm94.gapGainProfile)
         {
             const auto* authored = GetBaseProgramCache().TryGetLine(pc);
-            if (!authored || !E94Profile(authored->parsedBlock, m_edm94.gapFlushProfile ? 104U : m_edm94.gapPairedProfile ? 102U : m_edm94.gapEnduranceProfile ? 100U : m_edm94.gapContinuousProfile ? 98U : m_edm94.gapBurstProfile ? 96U : m_edm94.gapNoiseProfile ? 94U : 92U) ||
+            if (!authored || !E94Profile(authored->parsedBlock, m_edm94.gapHistoryServo ? m_edm94.gapHistoryArm + 1U : m_edm94.gapFlushProfile ? (m_edm94.gapFlushInterruptArm ? m_edm94.gapFlushInterruptArm + 1U : m_edm94.gapModeFlush ? (m_edm94.gapModeInterruption ? m_edm94.gapModeInterruptionArm + 1U : E116FinishP(m_edm94.gapModeFixture)) : m_edm94.gapCurveB2 ? 128U : m_edm94.gapPhysicalCurve ? 126U : m_edm94.gapCurveRuntime ? 124U : m_edm94.gapCurveGeometry ? 122U : m_edm94.gapB2Repeat ? 120U : m_edm94.gapB2CrossSegment ? 118U : m_edm94.gapCommonPath ? 116U : m_edm94.gapFlushParameterized ? 110U : 104U) : m_edm94.gapPairedProfile ? 102U : m_edm94.gapEnduranceProfile ? 100U : m_edm94.gapContinuousProfile ? 98U : m_edm94.gapBurstProfile ? 96U : m_edm94.gapNoiseProfile ? 94U : 92U) ||
                 !E94Matches(authored->parsedBlock, block) || !IsGapDryRunBlockShapeValid(block))
             { RejectEDM94SameThread(m_edm94.gapFlushProfile ? "EDM105_FINISH_LITERAL_SCOPE" : m_edm94.gapPairedProfile ? "EDM104_FINISH_LITERAL_SCOPE" : m_edm94.gapEnduranceProfile ? "EDM102_FINISH_LITERAL_SCOPE" : m_edm94.gapContinuousProfile ? "EDM100_FINISH_LITERAL_SCOPE" : m_edm94.gapBurstProfile ? "EDM99_FINISH_LITERAL_SCOPE" : m_edm94.gapNoiseProfile ? "EDM98_FINISH_LITERAL_SCOPE" :
                 "EDM97_FINISH_LITERAL_SCOPE", m_gapDryRun.sourceLine); return nullptr; }
         }
         if (!m_edm94.latched || !m_edm94.ready || m_edm94.cancelled ||
-            block.val('P') != (m_edm94.gapFlushProfile ? 104.0 : m_edm94.gapPairedProfile ? 102.0 : m_edm94.gapEnduranceProfile ? 100.0 : m_edm94.gapContinuousProfile ? 98.0 : m_edm94.gapBurstProfile ? 96.0 : m_edm94.gapNoiseProfile ? 94.0 : m_edm94.gapGainProfile ? 92.0 : m_edm94.gapSegmentProfile ? 90.0 :
+            block.val('P') != (m_edm94.gapHistoryServo ? m_edm94.gapHistoryArm + 1U : m_edm94.gapFlushProfile ? (m_edm94.gapFlushInterruptArm ? static_cast<double>(m_edm94.gapFlushInterruptArm + 1U) : m_edm94.gapModeFlush ? (m_edm94.gapModeInterruption ? static_cast<double>(m_edm94.gapModeInterruptionArm + 1U) : E116FinishP(m_edm94.gapModeFixture)) : m_edm94.gapCurveB2 ? 128.0 : m_edm94.gapPhysicalCurve ? 126.0 : m_edm94.gapCurveRuntime ? 124.0 : m_edm94.gapCurveGeometry ? 122.0 : m_edm94.gapB2Repeat ? 120.0 : m_edm94.gapB2CrossSegment ? 118.0 : m_edm94.gapCommonPath ? 116.0 : m_edm94.gapFlushParameterized ? 110.0 : 104.0) : m_edm94.gapPairedProfile ? 102.0 : m_edm94.gapEnduranceProfile ? 100.0 : m_edm94.gapContinuousProfile ? 98.0 : m_edm94.gapBurstProfile ? 96.0 : m_edm94.gapNoiseProfile ? 94.0 : m_edm94.gapGainProfile ? 92.0 : m_edm94.gapSegmentProfile ? 90.0 :
                 m_edm94.gapBoundaryProfile ? 88.0 : 86.0) ||
             m_edm94.next != m_edm94.moves + 1U || pc != m_edm94.pc[m_edm94.moves] ||
-            m_pathFeed.pending || !m_motion.IsGroupDone() ||
+            m_pathFeed.pending || (m_edm94.gapPhysicalCurve && m_pathArc.pending) || !m_motion.IsGroupDone() ||
             (m_edm94.gapSegmentProfile && !ReadEDM96CompletedSegmentsSameThread(m_edm94.moves)))
         { RejectEDM94SameThread("FINISH_SCOPE", m_gapDryRun.sourceLine); return nullptr; }
+        // An interruption fixture must never retire as a normal full-cycle PASS.
+        // This terminal fence also covers a missed sample or unavailable service gate.
+        if (m_edm94.gapFlushInterruptArm)
+        {
+            m_edm94.gapFlushInterruptRequested = true;
+            EDM96::Feedback gap{};
+            if (m_motion.ReadEDM96Feedback(gap) && gap.session == m_edm94.session &&
+                gap.epoch == m_motion.GetCurrentExecutionEpoch() && gap.ownerGeneration == m_edm94.lease.generation)
+            {
+                m_edm94.gapFlushInterruptSampleTick = gap.tick;
+                m_edm94.gapFlushInterruptEpoch = gap.epoch;
+            }
+            const bool fixture108 = m_edm94.gapFlushParameterized &&
+                (m_edm94.gapFlushInterruptArm == 111U || m_edm94.gapFlushInterruptArm == 113U);
+            CancelEDM94SameThread(fixture108 ? "EDM108_TARGET_MISSED" : "EDM106_TARGET_MISSED");
+            RtPrintf("[%s] event=TARGET_MISSED arm=%u session=%llu scope=FINISH_WITHOUT_INTERRUPT action=CANCEL_THEN_HOLD restart=RESET_REQUIRED\n",
+                fixture108 ? "EDM108" : "EDM106", m_edm94.gapFlushInterruptArm, static_cast<unsigned long long>(m_edm94.session));
+            FeedHold();
+            return nullptr;
+        }
+        if (m_edm94.gapCommonPath && !IsEDM109CompleteSameThread())
+        { RejectEDM94SameThread("EDM109_COMMON_PATH_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
+        if (m_edm94.gapB2CrossSegment && !IsEDM110CompleteSameThread(true))
+        { RejectEDM94SameThread("EDM110_PHYSICAL_B2_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
+        if (m_edm94.gapCurveGeometry && !IsEDM112GeometryCurrentSameThread(true))
+        { RejectEDM94SameThread("EDM112_CURVE_EVIDENCE_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
+        if (m_edm94.gapCurveRuntime && !IsEDM113RuntimeCurrentSameThread(EDM109::Capacity))
+        { RejectEDM94SameThread("EDM113_RUNTIME_CURVE_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
+        if (m_edm94.gapHistoryServo && !IsEDM126CurrentSameThread(EDM114::RequiredRows))
+        { RejectEDM94SameThread("EDM126_HISTORY_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
+        if (m_edm94.gapPhysicalCurve && !IsEDM114CurrentSameThread(EDM114::RequiredRows))
+        { RejectEDM94SameThread("EDM114_PHYSICAL_CURVE_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
+        if (m_edm94.gapCurveB2 && !IsEDM115CurrentSameThread(EDM114::RequiredRows))
+        { RejectEDM94SameThread("EDM115_CURVE_B2_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
+        if (m_edm94.gapModeFlush && !IsEDM116CurrentSameThread(EDM114::RequiredRows))
+        { RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_MODE_FLUSH_INCOMPLETE" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_MODE_FLUSH_INCOMPLETE" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_MODE_FLUSH_INCOMPLETE" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_MODE_FLUSH_INCOMPLETE" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_MODE_FLUSH_INCOMPLETE" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_MODE_FLUSH_INCOMPLETE" : m_edm94.gapModeInterruption ? "EDM118_MODE_FLUSH_INCOMPLETE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_MODE_FLUSH_INCOMPLETE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_MODE_FLUSH_INCOMPLETE" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_MODE_FLUSH_INCOMPLETE" : "EDM116_MODE_FLUSH_INCOMPLETE"), m_gapDryRun.sourceLine); return nullptr; }
+        if (m_edm94.gapModeFlush) LogEDM116SameThread("MODE_FLUSH_COMPLETE");
+        if (m_edm94.gapCurveB2) LogEDM115SameThread("CURVE_B2_COMPLETE");
+        if (m_edm94.gapPhysicalCurve) LogEDM114SameThread("PHYSICAL_CURVE_COMPLETE");
+        if (m_edm94.gapCurveRuntime) LogEDM113RuntimeSameThread();
+        if (m_edm94.gapCurveGeometry)
+            RtPrintf("[EDM112] event=COMMON_CURVE_STAGE_COMPLETE build=EDM112 session=%llu physicalG01=16 physicalB2=2 shadowG01=16 physicalArc=0 numeric=1 applyToMotion=0 dischargeCommand=NONE\n",
+                static_cast<unsigned long long>(m_edm94.session));
         m_edm94.ready = false; m_edm94.finishPending = true; m_edm94.polls = 0U;
         m_motion.RequestEDM94Finish(m_edm94.session);
         LogEDM94SameThread("FINISH_REQUEST", "AWAIT_PHYSICAL_ZERO_STABILITY");
@@ -16125,7 +16813,14 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
         const auto* authored = GetBaseProgramCache().TryGetLine(pc);
         EDM97::Tuning parsed{};
         const EDM97::Tuning decoded{ block.val('Q'), block.val('R'), block.val('S') };
-        if (!authored || !(m_edm94.gapFlushProfile ? E105ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
+        EDM107::FlushProfile parsedParameters{}, decodedParameters{};
+        if (m_edm94.gapFlushParameterized &&
+            (!EDM107::ParseFlushProfile(block.val('I'), block.val('J'), block.val('K'), decodedParameters) ||
+                !EDM107::SameFlushProfile(decodedParameters, m_edm94.gapFlushParameters)))
+        { RejectEDM94SameThread("EDM107_ARM_DECODED_PARAMETERS", m_gapDryRun.sourceLine); return nullptr; }
+        if (!authored || !(m_edm94.gapHistoryServo ? E126Profile(authored->parsedBlock, m_edm94.gapHistoryArm, parsed) : m_edm94.gapFlushParameterized ? E108ProfileOnlyNPQRSIJK(authored->parsedBlock,
+                m_edm94.gapFlushInterruptArm ? m_edm94.gapFlushInterruptArm : m_edm94.gapModeFlush ? (m_edm94.gapModeInterruption ? m_edm94.gapModeInterruptionArm : E116ArmP(m_edm94.gapModeFixture)) : m_edm94.gapCurveB2 ? 127U : m_edm94.gapPhysicalCurve ? 125U : m_edm94.gapCurveRuntime ? 123U : m_edm94.gapCurveGeometry ? 121U : m_edm94.gapB2Repeat ? 119U : m_edm94.gapB2CrossSegment ? 117U : m_edm94.gapCommonPath ? 115U : 109U, parsed, parsedParameters) :
+                m_edm94.gapFlushProfile ? E106FlushProfile(authored->parsedBlock, m_edm94.gapFlushInterruptArm, parsed) :
                 m_edm94.gapPairedProfile ? E104ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
                 m_edm94.gapEnduranceProfile ? E102ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
                 m_edm94.gapContinuousProfile ? E100ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
@@ -16133,7 +16828,8 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
                 m_edm94.gapNoiseProfile ? E98ProfileOnlyNPQRS(authored->parsedBlock, parsed) :
                 E97ProfileOnlyNPQRS(authored->parsedBlock, parsed)) ||
             !E94Matches(authored->parsedBlock, block) || !IsGapDryRunBlockShapeValid(block) ||
-            !EDM97::SameTuning(parsed, m_edm94.gapTuning) || !EDM97::SameTuning(decoded, m_edm94.gapTuning))
+            !EDM97::SameTuning(parsed, m_edm94.gapTuning) || !EDM97::SameTuning(decoded, m_edm94.gapTuning) ||
+            !EDM107::SameFlushProfile(parsedParameters, m_edm94.gapFlushParameters))
         { RejectEDM94SameThread(m_edm94.gapFlushProfile ? "EDM105_ARM_LITERAL_TUNING" : m_edm94.gapPairedProfile ? "EDM104_ARM_LITERAL_TUNING" : m_edm94.gapEnduranceProfile ? "EDM102_ARM_LITERAL_TUNING" : m_edm94.gapContinuousProfile ? "EDM100_ARM_LITERAL_TUNING" : m_edm94.gapBurstProfile ? "EDM99_ARM_LITERAL_TUNING" : m_edm94.gapNoiseProfile ? "EDM98_ARM_LITERAL_TUNING" :
             "EDM97_ARM_LITERAL_TUNING", m_gapDryRun.sourceLine); return nullptr; }
     }
@@ -16141,12 +16837,23 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
     { RejectEDM94SameThread("EDM95_CONTINUOUS_MODE_REQUIRED", m_gapDryRun.sourceLine); return nullptr; }
     if (m_edm94.gapSegmentProfile && m_isSingleBlockEnabled)
     { RejectEDM94SameThread("EDM96_CONTINUOUS_MODE_REQUIRED", m_gapDryRun.sourceLine); return nullptr; }
+    // The preceding bracket is already released before a new arm is admitted.
+    // HOLD/RESET ledger invalidation deliberately does not erase this separate evidence.
+    m_edm118 = EDM118NCState{};
+    InvalidateEDM109CommonPathSameThread("NEW_ARM");
+    m_edm109.plans = m_edm109.mappedSegments = m_edm109.lastMappingTick = 0ULL;
     m_edm94.boundary = EDM94NCState::FeedBoundary{};
     m_edm94.session = ++m_edm94Serial;
     m_edm94.run = m_pathCoreLiveBookkeeping.currentRunToken;
     m_edm94.cache = GetBaseProgramCache().GetGeneration();
     m_edm94.armDispatch = m_currentExecutingBlockDispatchId; m_edm94.armPC = pc;
     m_edm94.lease = m_programMotionLease; m_edm94.armEpoch = m_motion.GetCurrentExecutionEpoch(); m_edm94.feedback = EDM94::Feedback{};
+    if (m_edm94.gapModeInterruption)
+    {
+        m_edm118.armP = m_edm94.gapModeInterruptionArm;
+        m_edm118.session = m_edm94.session; m_edm118.run = m_edm94.run; m_edm118.cache = m_edm94.cache;
+        m_edm118.armEpoch = m_edm94.armEpoch; m_edm118.ownerGeneration = m_edm94.lease.generation;
+    }
     m_edm94.ready = m_edm94.finishPending = m_edm94.complete = m_edm94.cancelled = false;
     m_edm94.resetSeen = m_edm94.resetCommitted = m_edm94.everArmed = false;
     m_edm94.releaseRequested = m_edm94.terminalLogged = m_edm94.rtFaultReported = false;
@@ -16163,8 +16870,19 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
     m_edm94.gapLoggedAccepted = m_edm94.gapLoggedPhase = 0ULL;
     m_edm94.gapWaitStep = m_edm94.gapWaitPolls = 0U;
     m_edm94.gapWaiting = m_edm94.gapPermitReady = false;
-    const bool submitted = m_edm94.gapFlushProfile ?
-        m_motion.SubmitEDM105Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapPairedProfile ?
+    m_edm94.gapFlushInterruptRequested = false;
+    m_edm94.gapFlushInterruptSampleTick = m_edm94.gapFlushInterruptEpoch = 0ULL;
+    if (m_edm94.gapCurveGeometry && !RunEDM112GeometrySameThread())
+    { RejectEDM94SameThread("EDM112_GEOMETRY_FIXTURE", m_gapDryRun.sourceLine); return nullptr; }
+    const bool submitted = m_edm94.gapHistoryServo ?
+        m_motion.SubmitEDM126Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease,
+            m_edm94.gapTuning, m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? 0U : 1U) : m_edm94.gapModeFlush ?
+        m_motion.SubmitEDM116Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease,
+            m_edm94.gapTuning, m_edm94.gapFlushParameters, m_edm94.gapModeFixture) : m_edm94.gapCurveB2 ?
+        m_motion.SubmitEDM115Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease,
+            m_edm94.gapTuning, m_edm94.gapFlushParameters) : m_edm94.gapPhysicalCurve ?
+        m_motion.SubmitEDM114Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning, m_edm94.gapFlushParameters) : m_edm94.gapFlushProfile ?
+        m_motion.SubmitEDM105Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning, m_edm94.gapFlushParameters, m_edm94.gapCommonPath, m_edm94.gapB2CrossSegment, m_edm94.gapB2Repeat, m_edm94.gapCurveRuntime) : m_edm94.gapPairedProfile ?
         m_motion.SubmitEDM104Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapEnduranceProfile ?
         m_motion.SubmitEDM102Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapContinuousProfile ?
         m_motion.SubmitEDM100Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease, m_edm94.gapTuning) : m_edm94.gapBurstProfile ?
@@ -16177,18 +16895,54 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
     if (!submitted)
     { RejectEDM94SameThread("ARM_PUBLICATION", m_gapDryRun.sourceLine); return nullptr; }
     m_edm94.latched = m_edm94.armPending = true;
-    LogEDM94SameThread("ARM_REQUEST", "ACTUAL_MOTORS_FIXED_G91_G1");
+    LogEDM94SameThread("ARM_REQUEST", m_edm94.gapPhysicalCurve ? "ACTUAL_MOTORS_G91_G01_ARC2" : "ACTUAL_MOTORS_FIXED_G91_G1");
+    if (m_edm94.gapModeFlush) LogEDM116SameThread("ARM_REQUEST");
+    if (m_edm94.gapCurveB2) LogEDM115SameThread("ARM_REQUEST");
+    if (m_edm94.gapPhysicalCurve) LogEDM114SameThread("ARM_REQUEST");
+    else if (m_edm94.gapCurveRuntime)
+    {
+        char record[481]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM113] event=ARM_REQUEST build=EDM113 logger=FIX1 session=%llu P=123 finishP=124 expectedG01=16 expectedPhysicalB2=2 runtimeCurve=OBSERVATION physicalArc=0 applyToMotion=0 pauseDuringB2=1 dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session));
+        EmitEDM113Record(record, length, "ARM_REQUEST");
+    }
+    else if (m_edm94.gapCurveGeometry)
+        RtPrintf("[EDM112] event=ARM_REQUEST build=EDM112 session=%llu P=121 finishP=122 expectedG01=16 expectedPhysicalB2=2 expectedShadowG01=16 physicalArc=0 arcScope=NUMERIC_ONLY applyCurveToMotion=0 dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session));
+    else if (m_edm94.gapB2Repeat)
+        RtPrintf("[EDM111] event=ARM_REQUEST build=EDM111 session=%llu P=119 finishP=120 triggerSteps=2,4 trigger=DWELL_RETURN previousDepthRatio=0.1 physicalB2=REQUESTED proof=NONE expectedB2=2 expectedDwells=10 expectedSegments=16 expectedFlushCycles=8 numericLedger=SEPARATE dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session));
+    else if (m_edm94.gapB2CrossSegment)
+        RtPrintf("[EDM110] event=ARM_REQUEST session=%llu P=117 finishP=118 triggerStep=2 trigger=DWELL_RETURN previousDepthRatio=0.1 physicalB2=REQUESTED proof=NONE expectedB2=1 expectedSegments=16 expectedFlushCycles=8 numericLedger=SEPARATE dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session));
+    else if (m_edm94.gapCommonPath)
+        RtPrintf("[EDM109] event=ARM_REQUEST session=%llu P=115 finishP=116 source=COMPLETED_G01_ONLY physicalCommonMap=1 physicalB2=0 numericB2=1 historyCapacity=16 expectedPlans=15 dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session));
+    if (m_edm94.gapFlushParameterized)
+    {
+        char record[481]{}; const auto& parameters = m_edm94.gapFlushParameters;
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM107] event=PARAMETERS_FROZEN session=%llu P=%u I=%.12g J=%.12g K=%llu strokeRatio=%.12g speedRatio=%.12g dwellUs=%llu dwellTicks=%llu apply=NEXT_ARM motion=REAL_SIX_AXIS gap=RT_SYNTHETIC dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session), m_edm94.gapFlushInterruptArm ? m_edm94.gapFlushInterruptArm : m_edm94.gapModeFlush ? (m_edm94.gapModeInterruption ? m_edm94.gapModeInterruptionArm : E116ArmP(m_edm94.gapModeFixture)) : m_edm94.gapCurveB2 ? 127U : m_edm94.gapPhysicalCurve ? 125U : m_edm94.gapCurveRuntime ? 123U : m_edm94.gapCurveGeometry ? 121U : m_edm94.gapB2Repeat ? 119U : m_edm94.gapB2CrossSegment ? 117U : m_edm94.gapCommonPath ? 115U : 109U,
+            parameters.strokeRatio * 100.0,
+            parameters.speedRatio * 100.0, static_cast<unsigned long long>(parameters.dwellUs / 1000ULL),
+            parameters.strokeRatio, parameters.speedRatio, static_cast<unsigned long long>(parameters.dwellUs),
+            static_cast<unsigned long long>(EDM107::FlushDwellTicks(parameters)));
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM107] event=LOG_FORMAT_ERROR scope=PARAMETERS_FROZEN\n");
+    }
     if (m_edm94.gapBoundaryProfile)
         RtPrintf("[EDM95] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltageHigh=50 voltageLow=20 referenceV=35 phaseUs=2000000 producerUs=1000 dwellUs=20000 offerWindowUs=1000000 permitUs=200000 mode=BOUNDARY_DIRECTION_ONLY midSegmentReverse=0 steps=%u hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.moves);
     if (m_edm94.gapSegmentProfile && !m_edm94.gapGainProfile)
-        RtPrintf("[EDM96] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltagePlan=50_600ms_20_600ms_50_STEADY producerUs=1000 dwellUs=20000 segmentDeadlineUs=10000000 mode=WITHIN_SEGMENT_SERVO midSegmentReverse=1 steps=%u hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
+        RtPrintf("[EDM96] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltagePlan=50_600ms_20_600ms_50_STEADY producerUs=250 dwellUs=20000 segmentDeadlineUs=10000000 mode=WITHIN_SEGMENT_SERVO midSegmentReverse=1 steps=%u hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.moves);
-    if (m_edm94.gapGainProfile && !m_edm94.gapNoiseProfile && !m_edm94.gapBurstProfile)
+    if (m_edm94.gapGainProfile && !m_edm94.gapHistoryServo && !m_edm94.gapNoiseProfile && !m_edm94.gapBurstProfile)
     {
         char record[768]{};
         const int length = std::snprintf(record, sizeof(record),
-            "[EDM97] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltagePlan=50_45_20_25_50 phaseUs=300000 producerUs=1000 dwellUs=20000 segmentDeadlineUs=10000000 referenceV=35 scale=0.001 Q=%.9g R=%.9g S=%.9g configHash=%llu mode=VOLTAGE_ERROR_GAIN_SERVO midSegmentReverse=1 steps=%u immutablePerArm=1 gainUnit=DIRECT_CURVE hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
+            "[EDM97] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltagePlan=50_45_20_25_50 phaseUs=300000 producerUs=250 dwellUs=20000 segmentDeadlineUs=10000000 referenceV=35 scale=0.001 Q=%.9g R=%.9g S=%.9g configHash=%llu mode=VOLTAGE_ERROR_GAIN_SERVO midSegmentReverse=1 steps=%u immutablePerArm=1 gainUnit=DIRECT_CURVE hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapTuning.positiveGain,
             m_edm94.gapTuning.negativeGain, m_edm94.gapTuning.deadbandV,
             static_cast<unsigned long long>(EDM97::ConfigHash(m_edm94.gapTuning)), m_edm94.moves);
@@ -16199,7 +16953,7 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
     {
         char record[896]{};
         const int length = std::snprintf(record, sizeof(record),
-            "[EDM98] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltagePlan=50_600ms_NOISE_800ms_20_600ms_NOISE_800ms_50_STEADY noiseV=34.5_35.5 producerUs=1000 noiseFreshUs=1000 dwellUs=20000 quietRequiredTicks=800 quietRequiredUs=200000 quietScope=COMMAND_SCALAR_ONLY segmentDeadlineUs=10000000 referenceV=35 scale=0.001 Q=%.9g R=%.9g S=%.9g configHash=%llu mode=DEADBAND_NOISE_SERVO midSegmentReverse=1 steps=%u immutablePerArm=1 gainUnit=DIRECT_CURVE hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
+            "[EDM98] event=GAP_SOURCE session=%llu source=RT_SYNTHETIC voltagePlan=50_600ms_NOISE_800ms_20_600ms_NOISE_800ms_50_STEADY noiseV=34.5_35.5 producerUs=250 noiseFreshUs=250 dwellUs=20000 quietRequiredTicks=800 quietRequiredUs=200000 quietScope=COMMAND_SCALAR_ONLY segmentDeadlineUs=10000000 referenceV=35 scale=0.001 Q=%.9g R=%.9g S=%.9g configHash=%llu mode=DEADBAND_NOISE_SERVO midSegmentReverse=1 steps=%u immutablePerArm=1 gainUnit=DIRECT_CURVE hold=CANCEL_RESET_REQUIRED dischargeCommand=NONE\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapTuning.positiveGain,
             m_edm94.gapTuning.negativeGain, m_edm94.gapTuning.deadbandV,
             static_cast<unsigned long long>(EDM97::ConfigHash(m_edm94.gapTuning)), m_edm94.moves);
@@ -16247,6 +17001,27 @@ bool NCManager::ConsumeEDM94CompletionReleaseSameThread(const EDM94::Feedback& f
     m_edm94.feedback = f;
     m_edm94.lastTick = f.lastTick;
     LogEDM94SameThread("NORMAL_RELEASED", "M30_AND_EXACT_NONE_PHYSICAL_ZERO");
+    // Repeat the already accepted observation at the normal-release snapshot.
+    // Cancellation can consume an old release after clearing this evidence;
+    // it must not print a completion from an empty/retired observer record.
+    const auto& runtime = m_edm113.retained;
+    if (m_edm94.gapCurveRuntime && m_edm113.acknowledgedRows == EDM109::Capacity &&
+        runtime.completed && !runtime.failed && runtime.completedRows == EDM109::Capacity &&
+        runtime.session == m_edm94.session && runtime.armEpoch == m_edm94.armEpoch &&
+        runtime.ownerGeneration == m_edm94.lease.generation)
+        LogEDM113RuntimeSameThread();
+    if (m_edm94.gapPhysicalCurve && m_edm114.acknowledgedRows == EDM114::RequiredRows &&
+        m_edm114.retained.completed && !m_edm114.retained.failed &&
+        m_edm114.retained.session == m_edm94.session && m_edm114.retained.armEpoch == m_edm94.armEpoch &&
+        m_edm114.retained.ownerGeneration == m_edm94.lease.generation)
+        LogEDM114SameThread("NORMAL_RELEASED");
+    if (m_edm94.gapCurveB2 && m_edm115.retainedEvents == EDM115::ExpectedEvents &&
+        m_edm115.receipts[1].eventsCompleted == EDM115::ExpectedEvents &&
+        m_edm115.receipts[1].session == m_edm94.session && m_edm115.receipts[1].armEpoch == m_edm94.armEpoch &&
+        m_edm115.receipts[1].ownerGeneration == m_edm94.lease.generation && !m_edm115.receipts[1].excursion.faulted)
+        LogEDM115SameThread("NORMAL_RELEASED");
+    if (m_edm94.gapModeFlush && IsEDM116CurrentSameThread(EDM114::RequiredRows))
+        LogEDM116SameThread("NORMAL_RELEASED");
     m_edm94.latched = m_edm94.armPending = m_edm94.ready = m_edm94.finishPending = false;
     return true;
 }
@@ -16309,13 +17084,27 @@ void NCManager::CompleteEDM94ProgramEndSameThread(const NCProgramEndGateSnapshot
     MotionExecutionEpoch executionEpoch) noexcept
 {
     auto& s = m_edm94;
+    if (s.gapModeInterruption) return; // Interruption profiles have no normal M30/restart completion authority.
     if (!s.latched || s.normalEndCommitted || end.cause != NCProgramEndCause::M30 ||
         m_state != NCState::P_END || m_mode != NCOperationMode::MEMORY ||
         !s.complete || !s.everArmed || !s.terminalLogged || s.armPending || s.ready || s.finishPending ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
         s.moves == 0U || s.next != s.moves + 2U || end.sourcePC != s.pc[s.moves + 1U] ||
         s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
-        Close_System_Com_flag || !m_externalReadyInterlock || m_edmState == EDMState::NOT_READY) return;
+        Close_System_Com_flag || !m_externalReadyInterlock || m_edmState == EDMState::NOT_READY ||
+        (s.gapCurveGeometry && !IsEDM112GeometryCurrentSameThread(true))) return;
+    // The completed observer receipt survives the AUTO -> IDLE_HOLD -> NONE
+    // retirement. Validate its frozen row identity, not the current owner/epoch.
+    if (s.gapCurveRuntime && !IsEDM113RuntimeCurrentSameThread(EDM109::Capacity))
+    { CancelEDM94SameThread("EDM113_M30_RUNTIME_EVIDENCE"); return; }
+    if (s.gapHistoryServo && !IsEDM126CurrentSameThread(EDM114::RequiredRows))
+    { CancelEDM94SameThread("EDM126_M30_HISTORY_INCOMPLETE"); return; }
+    if (s.gapPhysicalCurve && !IsEDM114CurrentSameThread(EDM114::RequiredRows))
+    { CancelEDM94SameThread("EDM114_M30_CURVE_EVIDENCE"); return; }
+    if (s.gapCurveB2 && !IsEDM115CurrentSameThread(EDM114::RequiredRows))
+    { CancelEDM94SameThread("EDM115_M30_B2_EVIDENCE"); return; }
+    if (s.gapModeFlush && !IsEDM116CurrentSameThread(EDM114::RequiredRows))
+    { CancelEDM94SameThread("EDM116_M30_MODE_EVIDENCE"); return; }
     auto& alarms = AlarmManager::GetInstance();
     const MotionOwnerLease idleLease = m_motion.GetMotionOwnerLease();
     const std::uint64_t safety = m_motion.GetSafetyProvenanceGeneration();
@@ -16338,6 +17127,356 @@ void NCManager::CompleteEDM94ProgramEndSameThread(const NCProgramEndGateSnapshot
         s.completionReleaseRequested ? "M30_COMMITTED_WAIT_NONE_PHYSICAL_ZERO" : "RESET_REQUIRED");
 }
 
+void NCManager::RequestEDM118HoldSameThread(bool targetReached, const char* reason) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm118;
+    if (!s.gapModeInterruption || !s.latched || c.requested) return;
+    c.requested = true; c.targetMissed = !targetReached;
+    c.session = s.session; c.run = s.run; c.cache = s.cache;
+    c.armEpoch = s.armEpoch; c.ownerGeneration = s.lease.generation;
+    c.polls = 0U; c.lastFeedbackTick = 0ULL;
+    // The separate request survives CancelEDM94's ordinary ledger invalidation.
+    // Cancellation publishes ForceZero before diagnostic formatting or HOLD.
+    const bool previousReturn = c.armP == EDM121::ArmP;
+    const bool arcRetreat = c.armP == EDM120::ArmP;
+    const bool retreat = c.armP == EDM119::ArmP;
+    CancelEDM94SameThread(c.armP == EDM125::RetreatArmP ? (targetReached ? "EDM125_B2_PREVIOUS_ARC_RETREAT_HOLD" : "EDM125_TARGET_MISSED") :
+        c.armP == EDM125::ReturnArmP ? (targetReached ? "EDM125_B2_PREVIOUS_ARC_RETURN_HOLD" : "EDM125_TARGET_MISSED") :
+        c.armP == EDM123::B0ArmP ? (targetReached ? "EDM123_B0_TANGENT_RETURN_HOLD" : "EDM123_TARGET_MISSED") :
+        c.armP == EDM123::B1ArmP ? (targetReached ? "EDM123_B1_Z_RETURN_HOLD" : "EDM123_TARGET_MISSED") :
+        c.armP == EDM122::B0ArmP ? (targetReached ? "EDM122_B0_TANGENT_RETREAT_HOLD" : "EDM122_TARGET_MISSED") :
+        c.armP == EDM122::B1ArmP ? (targetReached ? "EDM122_B1_Z_RETREAT_HOLD" : "EDM122_TARGET_MISSED") :
+        previousReturn ? (targetReached ? "EDM121_B2_PREVIOUS_RETURN_HOLD" : "EDM121_TARGET_MISSED") :
+        arcRetreat ? (targetReached ? "EDM120_B2_ARC_RETREAT_HOLD" : "EDM120_TARGET_MISSED") :
+        retreat ? (targetReached ? "EDM119_B2_RETREAT_HOLD" : "EDM119_TARGET_MISSED") :
+        (targetReached ? "EDM118_B2_RETURN_HOLD" : "EDM118_TARGET_MISSED"));
+    FeedHold();
+    LogEDM118SameThread(targetReached ? "HOLD_REQUEST" : "TARGET_MISSED", reason);
+    if (!targetReached)
+    {
+        c.terminalLogged = true;
+        LogEDM118SameThread("STOP_UNPROVEN_RESET_REQUIRED", "TARGET_NOT_OBSERVED");
+    }
+}
+
+bool NCManager::ServiceEDM118InterruptionSameThread(bool freshPhysical) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm118;
+    if (!s.gapModeInterruption || !s.latched) return false;
+    const auto arcProfile = EDM125::ProfileForArm(s.gapModeInterruptionArm);
+    const bool previousArc = EDM125::ValidProfile(arcProfile);
+    const auto localReturnProfile = EDM123::ProfileForArm(s.gapModeInterruptionArm);
+    const bool localReturn = EDM123::ValidProfile(localReturnProfile);
+    const auto localProfile = EDM122::ProfileForArm(s.gapModeInterruptionArm);
+    const bool localRetreat = EDM122::ValidProfile(localProfile);
+    const bool previousReturn = s.gapModeInterruptionArm == EDM121::ArmP;
+    const bool arcRetreat = s.gapModeInterruptionArm == EDM120::ArmP;
+    const bool retreat = s.gapModeInterruptionArm == EDM119::ArmP;
+    const unsigned targetStep = previousArc ? EDM125::TargetStep : localReturn ? EDM123::TargetStep(localReturnProfile) : localRetreat ? EDM122::TargetStep(localProfile) : previousReturn ? EDM121::TargetStep : arcRetreat ? EDM120::TargetStep : retreat ? EDM119::TargetStep : EDM118::TargetStep;
+    const unsigned targetSpan = previousArc ? EDM125::TargetSpan(arcProfile) : localReturn ? EDM123::TargetSpan : localRetreat ? EDM122::TargetSpan : previousReturn ? EDM121::TargetSpan : arcRetreat ? EDM120::TargetSpan : retreat ? EDM119::TargetSpan : EDM118::TargetSpan;
+    const auto targetFixture = previousArc ? EDM125::TargetFixture(arcProfile) : localReturn ? EDM123::TargetFixture : localRetreat ? EDM122::TargetFixture : previousReturn ? EDM121::TargetFixture : arcRetreat ? EDM120::TargetFixture : retreat ? EDM119::TargetFixture : EDM118::TargetFixture;
+    const bool profileCurrent = (previousArc || localReturn || localRetreat || previousReturn || arcRetreat || retreat || s.gapModeInterruptionArm == EDM118::ArmP) &&
+        s.gapModeFixture == targetFixture;
+    const auto& guard = s.feedback;
+    // Only the two authored B2 trigger steps can index retained tokens.
+    const unsigned tokenOrdinal = EDM115::EventOrdinal(targetStep);
+    const bool targetTokenValid = (targetStep == 2U || targetStep == 4U) &&
+        tokenOrdinal > 0U && tokenOrdinal <= m_edm116.tokens.size();
+    const unsigned tokenIndex = targetTokenValid ? tokenOrdinal - 1U : 0U;
+    // RESET release remains the existing exact successful Reset/rebase transaction.
+    if (freshPhysical && profileCurrent && s.gapModeInterruptionArm == c.armP && !c.releasedLogged && s.resetSeen && s.resetCommitted && s.releaseRequested &&
+        guard.identity.session == c.session && guard.identity.epoch == c.armEpoch &&
+        guard.identity.ownerGeneration == c.ownerGeneration && guard.lastTick && guard.lastTick >= s.lastTick &&
+        guard.released && !guard.active && guard.cancelled && guard.stopped && guard.forceZero && !guard.faulted &&
+        guard.settledCycles >= EDM94::RequiredStableCycles && guard.settledCycles >= guard.requiredCycles)
+    {
+        c.releasedLogged = true;
+        LogEDM118SameThread("RESET_RELEASED", c.stopPassed ? "EXACT_RESET_RELEASE_AFTER_STOP_PASS" : "EXACT_RESET_RELEASE_TARGET_UNPROVEN");
+    }
+    if (!c.requested)
+    {
+        if (c.terminalLogged || s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested) return false;
+        const bool live = freshPhysical && profileCurrent && s.gapModeInterruptionArm == c.armP && s.gapModeFlush && s.gapPhysicalCurve && !s.gapCurveB2 &&
+            s.gapModeFixture == targetFixture && s.ready && s.everArmed && !s.armPending &&
+            !s.finishPending && !s.complete && !s.rtFaultReported && !s.normalEndCommitted &&
+            !s.completionReleaseRequested && !s.gapWaiting && m_state == NCState::RUN &&
+            m_mode == NCOperationMode::MEMORY && !m_isSingleBlockEnabled && !Close_System_Com_flag &&
+            m_externalReadyInterlock && m_edmState != EDMState::NOT_READY &&
+            !AlarmManager::GetInstance().HasAlarm() && !Homing.IsActive() && !m_isG66Active && m_macroStack.empty() &&
+            m_resetContinuationPhase == ResetContinuationPhase::IDLE &&
+            s.run == m_pathCoreLiveBookkeeping.currentRunToken && s.cache == GetBaseProgramCache().GetGeneration() &&
+            s.lease.Matches(m_programMotionLease) && m_motion.IsMotionOwnerLeaseCurrent(s.lease) &&
+            !m_motion.HasPendingSafetyOrRecoveryRequests() &&
+            CoordSys.IsTranslationRunFrozen() && CoordSys.IsTranslationRunCurrent() &&
+            IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) &&
+            CoordSys.GetTranslationSnapshot().distanceMode == 91 && CoordSys.activePlane == 17 &&
+            IsXYZCUVFeedProfileCurrentSameThread() && IsFixedTranslationTravelCurrentSameThread() &&
+            IsPathCoreLiveNativeConfigCurrentSameThread() &&
+            s.feedback.active && s.feedback.armAccepted && !s.feedback.faulted && !s.feedback.cancelled &&
+            !s.feedback.forceZero && !s.feedback.released;
+        if (!live) return false; // Ordinary lifecycle guards retain stop/ALARM authority.
+        if (s.next > targetStep + 1U)
+        { RequestEDM118HoldSameThread(false, "TARGET_ROW_PASSED"); return true; }
+        if (s.next != targetStep + 1U) return false;
+        EDM116::MotionFeedback mode{}; EDM96::Feedback gap{};
+        if (!m_motion.ReadEDM116Feedback(mode) || !m_motion.ReadEDM96Feedback(gap)) return false;
+        const auto& policy = m_edm116.policies[targetStep];
+        const auto& source = mode.trigger; const auto& sample = mode.excursion;
+        const bool sourceCurrent = mode.enabled && mode.fixture == targetFixture &&
+            mode.session == s.session && mode.armEpoch == s.armEpoch && mode.ownerGeneration == s.lease.generation &&
+            mode.authorizedRows == targetStep + 1U && mode.completedRows == targetStep &&
+            mode.eventsStarted == EDM116::EventOrdinal(targetStep) &&
+            mode.eventsCompleted + 1U == mode.eventsStarted &&
+            EDM116::SamePolicy(mode.policy, policy) && EDM116::SamePolicy(mode.rowPolicy, policy) &&
+            EDM116::PolicyMatchesSource(policy, source) && EDM114::SameSource(mode.rowSource, source) &&
+            source.scope.session == s.session && source.scope.run == s.run && source.scope.cache == s.cache &&
+            source.scope.ownerGeneration == s.lease.generation && source.step == targetStep &&
+            source.sourcePC == s.pc[targetStep] && source.dispatch == m_edm116.issuedDispatch[targetStep] &&
+            source.epoch == m_edm116.issuedEpoch[targetStep] && source.epoch == m_motion.GetCurrentExecutionEpoch() &&
+            source.scope.translationGeneration == CoordSys.GetTranslationSnapshot().generation &&
+            ((localReturn || localRetreat) ? (EDM114::SameSource(mode.previous.previous, EDM109::Source{}) &&
+                EDM116::EmptyToken(mode.previous)) :
+                (targetTokenValid && EDM114::SameSource(mode.previous.previous, m_edm114.retained.source) &&
+                    EDM115::SameToken(mode.previous, m_edm116.tokens[tokenIndex]) &&
+                    (!previousArc || (mode.tokenValidated && mode.geometryCurrent &&
+                        mode.currentKind == EDM114::Kind::Arc && mode.previousKind == EDM114::Kind::Arc &&
+                        m_edm114.retained.kind == EDM114::Kind::Arc &&
+                        m_edm116.previousRows[tokenIndex].kind == EDM114::Kind::Arc &&
+                        EDM114::SameSource(m_edm116.previousRows[tokenIndex].source, mode.previous.previous) &&
+                        mode.previousBoundaryTick == m_edm116.tokens[tokenIndex].completion.tick &&
+                        mode.previousCommit == m_edm116.tokens[tokenIndex].completion.commit)))) &&
+            m_edm116.selected == targetStep + 1U && m_edm116.consumed == targetStep + 1U && !m_edm116.pending &&
+            m_edm116.acknowledgedRows == targetStep && m_edm114.acknowledgedRows == targetStep &&
+            gap.session == s.session && gap.epoch == source.epoch && gap.ownerGeneration == s.lease.generation &&
+            gap.expectedStep == targetStep + 1U && gap.acceptedSegments == targetStep + 1ULL &&
+            gap.completedSegments == targetStep && gap.segmentActive && !gap.segmentCompleted &&
+            gap.active && !gap.faulted && gap.reason == EDM96::Reason::None && IsEDM97TuningCurrentSameThread(gap);
+        // The mode event has not begun during the first half of this ordinary row.
+        // Do not treat the preceding event's retained record as this event's target.
+        if (!sourceCurrent)
+        {
+            if (mode.completedRows > targetStep || mode.authorizedRows > targetStep + 1U ||
+                (mode.trigger.step == targetStep && mode.eventsStarted == EDM116::EventOrdinal(targetStep) && mode.excursion.geometryValid))
+            { RequestEDM118HoldSameThread(false, "TARGET_SOURCE_OR_COUNTS"); return true; }
+            return false;
+        }
+        if (previousArc ? EDM125::RequestWindow(arcProfile, policy, source, sample) : localReturn ? EDM123::RequestWindow(localReturnProfile, policy, source, sample) : localRetreat ? EDM122::RequestWindow(localProfile, policy, source, sample) :
+            previousReturn ? EDM121::RequestWindow(policy, source, sample) :
+            arcRetreat ? EDM120::RequestWindow(policy, source, sample) :
+            retreat ? EDM119::RequestWindow(policy, source, sample) : EDM118::RequestWindow(policy, source, sample))
+        {
+            c.requestedPolicy = policy; c.requestedSource = source;
+            c.requestedPrevious = mode.previous.previous; c.requestSample = sample;
+            RequestEDM118HoldSameThread(true, previousArc ? (arcProfile == EDM125::Profile::PreviousArcRetreat ?
+                "B2_PREVIOUS_G03_ARC_RETREAT_SPAN1_PROGRESS_25_50" : "B2_PREVIOUS_G02_ARC_RETURN_SPAN2_PROGRESS_25_50") : localReturnProfile == EDM123::Profile::B0TangentReturn ? "B0_G03_LOCAL_RETURN_PROGRESS_25_50" :
+                localReturnProfile == EDM123::Profile::B1ZReturn ? "B1_G02_Z_RETURN_PROGRESS_25_50" : localProfile == EDM122::Profile::B0TangentRetreat ? "B0_G03_LOCAL_RETREAT_PROGRESS_25_50" :
+                localProfile == EDM122::Profile::B1ZRetreat ? "B1_G02_Z_RETREAT_PROGRESS_25_50" : previousReturn ? "B2_G02_PREVIOUS_RETURN_SPAN2_PROGRESS_25_50" : arcRetreat ? "B2_G02_RETREAT_SPAN0_PROGRESS_25_50" :
+                retreat ? "B2_G02_RETREAT_SPAN1_PROGRESS_25_50" : "B2_G03_RETURN_SPAN3_PROGRESS_25_50");
+            return true;
+        }
+        const bool missed = sample.faulted || sample.stopRequested || sample.stopped || sample.complete ||
+            sample.span > targetSpan ||
+            (sample.span == targetSpan &&
+                (!std::isfinite(sample.progress) || !std::isfinite(sample.length) || sample.length <= 0.0 ||
+                    sample.progress > sample.length * (previousArc ? EDM125::RequestProgressEnd : localReturn ? EDM123::RequestProgressEnd : localRetreat ? EDM122::RequestProgressEnd : previousReturn ? EDM121::RequestProgressEnd : arcRetreat ? EDM120::RequestProgressEnd : retreat ? EDM119::RequestProgressEnd : EDM118::RequestProgressEnd) ||
+                    sample.phase == EDM115::Phase::EndpointSettle || sample.phase == EDM115::Phase::Complete));
+        if (missed) { RequestEDM118HoldSameThread(false, previousArc ? "PREVIOUS_ARC_WINDOW_PASSED" : localReturn ? "LOCAL_RETURN_WINDOW_PASSED" : localRetreat ? "LOCAL_RETREAT_WINDOW_PASSED" : previousReturn ? "PREVIOUS_RETURN_WINDOW_PASSED" : arcRetreat ? "ARC_RETREAT_WINDOW_PASSED" : retreat ? "RETREAT_WINDOW_PASSED" : "RETURN_WINDOW_PASSED"); return true; }
+        return false;
+    }
+
+    if (c.terminalLogged) return false;
+    const auto fail = [&](const char* reason) noexcept
+    {
+        c.terminalLogged = true; c.stopPassed = false;
+        LogEDM118SameThread("STOP_UNPROVEN_RESET_REQUIRED", reason);
+    };
+    if (!profileCurrent || s.gapModeInterruptionArm != c.armP || c.targetMissed || c.resetInterrupted || s.resetSeen || s.resetCommitted || s.releaseRequested ||
+        s.session != c.session || s.armEpoch != c.armEpoch || s.lease.generation != c.ownerGeneration ||
+        s.run != c.run || s.cache != c.cache || s.next != targetStep + 1U ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !s.cancelled || s.ready || s.complete || m_state != NCState::HOLD || m_mode != NCOperationMode::MEMORY ||
+        Close_System_Com_flag || !m_externalReadyInterlock || m_edmState == EDMState::NOT_READY ||
+        Homing.IsActive() || m_isG66Active || !m_macroStack.empty() || m_isSingleBlockEnabled ||
+        AlarmManager::GetInstance().HasAlarm() || s.rtFaultReported)
+    { fail("LIFECYCLE_CHANGED_BEFORE_STOP_PROOF"); return false; }
+    if (++c.polls > 1000U) { fail("STOP_PROOF_WAIT_LIMIT"); return false; }
+    EDM118::Feedback observed{};
+    if (!m_motion.ReadEDM118Feedback(observed)) return false;
+    if (observed.publishedFailure || (observed.lastTick && observed.lastTick < c.lastFeedbackTick))
+    { c.feedback = observed; fail("RT_CAPTURE_OR_CLOCK_FAILURE"); return false; }
+    if (!observed.first.captured) return false;
+    if (c.feedback.first.captured)
+    {
+        const auto& before = c.feedback.first; const auto& after = observed.first;
+        if (!EDM116::SamePolicy(before.policy, after.policy) ||
+            !EDM114::SameSource(before.trigger, after.trigger) || !EDM114::SameSource(before.previous, after.previous) ||
+            !E115SameExcursion(before.initial, after.initial) || before.commandPulse != after.commandPulse ||
+            before.commandVelocity != after.commandVelocity || before.armEpoch != after.armEpoch ||
+            before.mappedTick != after.mappedTick || before.captureTick != after.captureTick || before.captureUs != after.captureUs ||
+            before.safetyEpoch != after.safetyEpoch || before.safetyOwnerGeneration != after.safetyOwnerGeneration ||
+            before.safetyTicket != after.safetyTicket || before.authorizedRows != after.authorizedRows ||
+            before.completedRows != after.completedRows || before.eventsStarted != after.eventsStarted ||
+            before.eventsCompleted != after.eventsCompleted)
+        { fail("FIRST_COMMITTED_RECEIPT_CHANGED"); return false; }
+    }
+    c.feedback = observed;
+    c.lastFeedbackTick = observed.lastTick;
+    const auto& f = c.feedback; const auto& first = f.first;
+    if (!(previousArc ? EDM125::TargetReceipt(arcProfile, first) : localReturn ? EDM123::TargetReceipt(localReturnProfile, first) : localRetreat ? EDM122::TargetReceipt(localProfile, first) : previousReturn ? EDM121::TargetReceipt(first) : arcRetreat ? EDM120::TargetReceipt(first) : retreat ? EDM119::TargetReceipt(first) : EDM118::TargetReceipt(first)) ||
+        !(previousArc ? EDM125::RequestWindow(arcProfile, c.requestedPolicy, c.requestedSource, c.requestSample) : localReturn ? EDM123::RequestWindow(localReturnProfile, c.requestedPolicy, c.requestedSource, c.requestSample) : localRetreat ? EDM122::RequestWindow(localProfile, c.requestedPolicy, c.requestedSource, c.requestSample) :
+            previousReturn ? EDM121::RequestWindow(c.requestedPolicy, c.requestedSource, c.requestSample) :
+            arcRetreat ? EDM120::RequestWindow(c.requestedPolicy, c.requestedSource, c.requestSample) :
+            retreat ? EDM119::RequestWindow(c.requestedPolicy, c.requestedSource, c.requestSample) :
+            EDM118::RequestWindow(c.requestedPolicy, c.requestedSource, c.requestSample)) ||
+        !EDM116::SamePolicy(first.policy, c.requestedPolicy) ||
+        !EDM114::SameSource(first.trigger, c.requestedSource) || !EDM114::SameSource(first.previous, c.requestedPrevious) ||
+        f.session != c.session || f.armEpoch != c.armEpoch || f.ownerGeneration != c.ownerGeneration ||
+        first.armEpoch != c.armEpoch || first.mappedTick < c.requestSample.tick ||
+        first.captureTick < first.mappedTick || first.captureUs < c.requestSample.nowUs ||
+        first.initial.nowUs < c.requestSample.nowUs || first.initial.startTick != c.requestSample.startTick ||
+        first.initial.startUs != c.requestSample.startUs || first.initial.progress < c.requestSample.progress ||
+        (previousArc ? !EDM125::ProgressContinues(arcProfile, c.requestSample, first.initial) : localReturn ? !EDM123::ProgressContinues(c.requestSample, first.initial) : localRetreat ? !EDM122::ProgressContinues(c.requestSample, first.initial) :
+            previousReturn ? !EDM121::ProgressContinues(c.requestSample, first.initial) :
+            arcRetreat ? !EDM120::ProgressContinues(c.requestSample, first.initial) :
+            retreat ? !EDM119::ProgressContinues(c.requestSample, first.initial) : first.initial.q < c.requestSample.q) ||
+        !EDM109::SameDouble(first.initial.length, c.requestSample.length) ||
+        !EDM109::SameDouble(first.initial.maximumVelocity, c.requestSample.maximumVelocity) ||
+        !EDM109::SameDouble(first.initial.acceleration, c.requestSample.acceleration) ||
+        !EDM109::SameDouble(first.initial.deceleration, c.requestSample.deceleration) ||
+        f.lastTick < first.captureTick || f.safetyEpoch != first.safetyEpoch ||
+        f.safetyOwnerGeneration != first.safetyOwnerGeneration || f.safetyTicket != first.safetyTicket)
+    { fail("FIRST_COMMITTED_TARGET_NOT_PROVEN"); return false; }
+    if (!f.stopAccepted || !f.stopped) return false;
+    const auto& final = f.final;
+    if (!final.geometryValid || !final.stopRequested || !final.stopped || final.faulted || final.active || final.moving ||
+        final.complete || (previousArc && (final.endpointReady || final.progress <= 0.0 || final.progress >= final.length)) || (localReturn && (final.endpointReady || final.progress >= final.length || final.q <= 0.0)) ||
+        final.phase != EDM115::Phase::Stopped || final.reason != EDM115::Reason::None ||
+        final.span != targetSpan || final.direction != (previousArc ? EDM125::TargetDirection(arcProfile) : localReturn ? EDM123::TargetDirection : localRetreat ? EDM122::TargetDirection : previousReturn ? EDM121::TargetDirection : arcRetreat ? EDM120::TargetDirection : retreat ? EDM119::TargetDirection : 1) ||
+        final.rowKind != (previousArc ? EDM125::TargetRowKind : localReturn ? EDM123::TargetRowKind : localRetreat ? EDM122::TargetRowKind : previousReturn ? EDM121::TargetRowKind : arcRetreat ? EDM120::TargetRowKind : retreat ? EDM119::TargetRowKind : EDM114::Kind::Arc) ||
+        final.v != 0.0 || !std::isfinite(final.a) || final.completed != 0ULL || final.anchorReturned != 0ULL ||
+        final.started != 1ULL || final.completedDwells != (previousArc ? EDM125::TargetDwells(arcProfile) : localReturn ? EDM123::TargetDwells : localRetreat ? EDM122::TargetDwells : previousReturn ? EDM121::TargetDwells : arcRetreat ? EDM120::TargetDwells : retreat ? EDM119::TargetDwells : 4U) ||
+        final.startTick != first.initial.startTick || final.startUs != first.initial.startUs ||
+        final.nowUs < first.captureUs || !std::isfinite(final.q) ||
+        (previousArc ? !EDM125::ProgressContinues(arcProfile, first.initial, final) : localReturn ? !EDM123::ProgressContinues(first.initial, final) : localRetreat ? !EDM122::ProgressContinues(first.initial, final) :
+            previousReturn ? !EDM121::ProgressContinues(first.initial, final) :
+            arcRetreat ? !EDM120::ProgressContinues(first.initial, final) :
+            retreat ? !EDM119::ProgressContinues(first.initial, final) : final.q < first.initial.q) ||
+        !std::isfinite(final.progress) || final.progress < first.initial.progress || final.progress > final.length ||
+        !EDM109::SameDouble(final.length, first.initial.length) ||
+        (!previousArc && !localReturn && !previousReturn && !arcRetreat && !retreat && !EDM109::SameDouble(final.q, final.progress)) ||
+        !EDM109::SameDouble(final.maximumVelocity, first.initial.maximumVelocity) ||
+        !EDM109::SameDouble(final.acceleration, first.initial.acceleration) ||
+        !EDM109::SameDouble(final.deceleration, first.initial.deceleration) ||
+        final.backwardCrossings != (previousArc ? EDM125::TargetBackwardCrossings : localReturn ? EDM123::TargetBackwardCrossings : localRetreat ? EDM122::TargetBackwardCrossings : previousReturn ? EDM121::TargetBackwardCrossings : arcRetreat ? EDM120::TargetBackwardCrossings : retreat ? EDM119::TargetBackwardCrossings : 1ULL) ||
+        final.forwardCrossings != (previousArc ? EDM125::TargetForwardCrossings : localReturn ? EDM123::TargetForwardCrossings : localRetreat ? EDM122::TargetForwardCrossings : previousReturn ? EDM121::TargetForwardCrossings : arcRetreat ? EDM120::TargetForwardCrossings : retreat ? EDM119::TargetForwardCrossings : 1ULL) ||
+        !f.stoppedTick || f.stoppedTick != final.tick || f.stoppedTick < first.captureTick || f.lastTick < f.stoppedTick ||
+        !EDM118::FinitePoint(f.stoppedPulse) || f.stoppedVelocity != EDM118::Point{})
+    { fail("COMMITTED_EXECUTOR_STOP_NOT_PROVEN"); return false; }
+    if (guard.faulted) { fail("PHYSICAL_GUARD_FAULT"); return false; }
+    const auto owner = m_motion.GetMotionOwnerLease();
+    const bool physical = freshPhysical && guard.identity.session == c.session && guard.identity.epoch == c.armEpoch &&
+        guard.identity.ownerGeneration == c.ownerGeneration && guard.currentIdentity.session == c.session &&
+        guard.currentIdentity.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        guard.currentIdentity.ownerGeneration == owner.generation && guard.active && guard.armAccepted &&
+        guard.cancelled && guard.forceZero && guard.stopped && !guard.pass && !guard.finishRequested && !guard.released &&
+        guard.lastTick >= s.lastTick && guard.lastTick >= f.stoppedTick &&
+        guard.requiredCycles >= EDM94::RequiredStableCycles && guard.settledCycles >= guard.requiredCycles &&
+        guard.lastTransportSealed && guard.lastTransportAttempted && guard.lastTransportAccepted && guard.lastTransportAllZero &&
+        guard.lastTransportTick == guard.lastSentTick && guard.lastSentTick == guard.lastTick &&
+        m_motion.IsGroupDone() && !m_motion.HasPendingSafetyOrRecoveryRequests();
+    if (!physical) return false;
+    c.stopPassed = c.terminalLogged = true;
+    LogEDM118SameThread("STOP_PASS_RESET_REQUIRED", "FIRST_COMMITTED_TARGET_AND_PHYSICAL_ZERO_200");
+    return false;
+}
+
+void NCManager::LogEDM118SameThread(const char* event, const char* reason) const noexcept
+{
+    const auto& s = m_edm94; const auto& c = m_edm118; const auto& f = c.feedback; const auto& r = f.first;
+    const unsigned profileArm = s.latched ? c.armP : s.gapModeInterruptionArm;
+    const bool previousReturn = profileArm == EDM121::ArmP;
+    const bool arcRetreat = profileArm == EDM120::ArmP;
+    const bool retreat = profileArm == EDM119::ArmP;
+    char record[481]{};
+    const auto emit = [&](int length) noexcept
+    {
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("%s", (profileArm == EDM125::RetreatArmP ? "[EDM125] event=LOG_FORMAT_ERROR profile=PREVIOUS_ARC_RETREAT armP=154\n" : profileArm == EDM125::ReturnArmP ? "[EDM125] event=LOG_FORMAT_ERROR profile=PREVIOUS_ARC_RETURN armP=156\n" : profileArm == EDM123::B0ArmP ? "[EDM123] event=LOG_FORMAT_ERROR profile=B0 armP=146\n" : profileArm == EDM122::B0ArmP ? "[EDM122] event=LOG_FORMAT_ERROR profile=B0 armP=142\n" : profileArm == EDM123::B1ArmP ? "[EDM123] event=LOG_FORMAT_ERROR profile=B1 armP=148\n" : profileArm == EDM122::B1ArmP ? "[EDM122] event=LOG_FORMAT_ERROR profile=B1 armP=144\n" : previousReturn ? "[EDM121] event=LOG_FORMAT_ERROR\n" : arcRetreat ? "[EDM120] event=LOG_FORMAT_ERROR\n" : retreat ? "[EDM119] event=LOG_FORMAT_ERROR\n" : "[EDM118] event=LOG_FORMAT_ERROR\n"));
+    };
+    emit(std::snprintf(record, sizeof(record),
+        (profileArm == EDM125::RetreatArmP ? "[EDM125] event=%.32s reason=%.48s session=%llu P=154 finishP=155 targetStep=4 targetSpan=1 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE profile=PREVIOUS_ARC_RETREAT armP=154\n" : profileArm == EDM125::ReturnArmP ? "[EDM125] event=%.32s reason=%.48s session=%llu P=156 finishP=157 targetStep=4 targetSpan=2 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE profile=PREVIOUS_ARC_RETURN armP=156\n" : profileArm == EDM123::B0ArmP ? "[EDM123] event=%.32s reason=%.48s session=%llu P=146 finishP=147 targetStep=6 targetSpan=1 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE profile=B0 armP=146\n" : profileArm == EDM122::B0ArmP ? "[EDM122] event=%.32s reason=%.48s session=%llu P=142 finishP=143 targetStep=6 targetSpan=0 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE profile=B0 armP=142\n" : profileArm == EDM123::B1ArmP ? "[EDM123] event=%.32s reason=%.48s session=%llu P=148 finishP=149 targetStep=10 targetSpan=1 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE profile=B1 armP=148\n" : profileArm == EDM122::B1ArmP ? "[EDM122] event=%.32s reason=%.48s session=%llu P=144 finishP=145 targetStep=10 targetSpan=0 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE profile=B1 armP=144\n" : previousReturn ? "[EDM121] event=%.32s reason=%.48s session=%llu P=140 finishP=141 targetStep=2 targetSpan=2 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE\n" : arcRetreat ? "[EDM120] event=%.32s reason=%.48s session=%llu P=138 finishP=139 targetStep=2 targetSpan=0 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE\n" : retreat ? "[EDM119] event=%.32s reason=%.48s session=%llu P=136 finishP=137 targetStep=2 targetSpan=1 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE\n" : "[EDM118] event=%.32s reason=%.48s session=%llu P=134 finishP=135 targetStep=2 targetSpan=3 requested=%u missed=%u stopPass=%u ncState=%u autoReset=0 autoStart=0 autoReturn=0 dischargeCommand=NONE\n"),
+        event ? event : "UNKNOWN", reason ? reason : "NONE", static_cast<unsigned long long>(s.session),
+        c.requested ? 1U : 0U, c.targetMissed ? 1U : 0U, c.stopPassed ? 1U : 0U,
+        static_cast<unsigned>(static_cast<NCState>(m_state))));
+    emit(std::snprintf(record, sizeof(record),
+        (profileArm == EDM125::RetreatArmP ? "[EDM125] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g profile=PREVIOUS_ARC_RETREAT armP=154\n" : profileArm == EDM125::ReturnArmP ? "[EDM125] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g profile=PREVIOUS_ARC_RETURN armP=156\n" : profileArm == EDM123::B0ArmP ? "[EDM123] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g profile=B0 armP=146\n" : profileArm == EDM122::B0ArmP ? "[EDM122] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g profile=B0 armP=142\n" : profileArm == EDM123::B1ArmP ? "[EDM123] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g profile=B1 armP=148\n" : profileArm == EDM122::B1ArmP ? "[EDM122] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g profile=B1 armP=144\n" : previousReturn ? "[EDM121] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g\n" : arcRetreat ? "[EDM120] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g\n" : retreat ? "[EDM119] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g\n" : "[EDM118] event=HOLD_SOURCE session=%llu requestTick=%llu requestEpoch=%llu requestDispatch=%llu mappedTick=%llu captureTick=%llu stopTick=%llu captured=%u stopAccepted=%u captureFailure=%u actualSpan=%u actualDirection=%d actualV=%.12g\n"),
+        static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(c.requestSample.tick),
+        static_cast<unsigned long long>(c.requestedSource.epoch), static_cast<unsigned long long>(c.requestedSource.dispatch),
+        static_cast<unsigned long long>(r.mappedTick), static_cast<unsigned long long>(r.captureTick),
+        static_cast<unsigned long long>(f.stoppedTick), r.captured ? 1U : 0U, f.stopAccepted ? 1U : 0U,
+        f.publishedFailure ? 1U : 0U, r.initial.span, r.initial.direction, r.initial.v));
+    emit(std::snprintf(record, sizeof(record),
+        (profileArm == EDM125::RetreatArmP ? "[EDM125] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0 profile=PREVIOUS_ARC_RETREAT armP=154\n" : profileArm == EDM125::ReturnArmP ? "[EDM125] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0 profile=PREVIOUS_ARC_RETURN armP=156\n" : profileArm == EDM123::B0ArmP ? "[EDM123] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0 profile=B0 armP=146\n" : profileArm == EDM122::B0ArmP ? "[EDM122] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0 profile=B0 armP=142\n" : profileArm == EDM123::B1ArmP ? "[EDM123] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0 profile=B1 armP=148\n" : profileArm == EDM122::B1ArmP ? "[EDM122] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0 profile=B1 armP=144\n" : previousReturn ? "[EDM121] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0\n" : arcRetreat ? "[EDM120] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0\n" : retreat ? "[EDM119] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0\n" : "[EDM118] event=HOLD_PROOF session=%llu executorStopped=%u physicalStopped=%u zero=%u stable=%u required=%u guardTick=%llu transportZero=%u faulted=%u resetSeen=%u resetCommitted=%u released=%u proofScope=COMMITTED_EXECUTOR_AND_PHYSICAL_ZERO_ONLY physicalDecelProven=0\n"),
+        static_cast<unsigned long long>(s.session), f.stopped ? 1U : 0U, s.feedback.stopped ? 1U : 0U,
+        s.feedback.forceZero ? 1U : 0U, s.feedback.settledCycles, s.feedback.requiredCycles,
+        static_cast<unsigned long long>(s.feedback.lastTick), s.feedback.lastTransportAllZero ? 1U : 0U,
+        s.feedback.faulted ? 1U : 0U, s.resetSeen ? 1U : 0U, s.resetCommitted ? 1U : 0U,
+        s.feedback.released ? 1U : 0U));
+}
+
+bool NCManager::ServiceEDM106PhaseHoldSameThread(const EDM96::Feedback& gap) noexcept
+{
+    auto& s = m_edm94;
+    if (!s.gapFlushInterruptArm || s.gapFlushInterruptRequested) return false;
+    const bool fixture108 = s.gapFlushParameterized && (s.gapFlushInterruptArm == 111U || s.gapFlushInterruptArm == 113U);
+    const bool selected = fixture108 || (!s.gapFlushParameterized &&
+        (s.gapFlushInterruptArm == 105U || s.gapFlushInterruptArm == 107U));
+    const bool live = selected && s.gapFlushProfile && s.latched && s.ready && s.everArmed &&
+        !s.armPending && !s.finishPending && !s.complete && !s.cancelled && !s.resetSeen &&
+        !s.resetCommitted && !s.releaseRequested && !s.rtFaultReported && !s.normalEndCommitted &&
+        !s.completionReleaseRequested && !s.gapWaiting && m_state == NCState::RUN &&
+        m_mode == NCOperationMode::MEMORY && !m_isSingleBlockEnabled && !Close_System_Com_flag &&
+        m_externalReadyInterlock && m_edmState != EDMState::NOT_READY &&
+        !AlarmManager::GetInstance().HasAlarm() && !Homing.IsActive() && !m_isG66Active && m_macroStack.empty() &&
+        m_resetContinuationPhase == ResetContinuationPhase::IDLE &&
+        s.run == m_pathCoreLiveBookkeeping.currentRunToken && s.cache == GetBaseProgramCache().GetGeneration() &&
+        s.lease.Matches(m_programMotionLease) && m_motion.IsMotionOwnerLeaseCurrent(s.lease) &&
+        !m_motion.HasPendingSafetyOrRecoveryRequests() &&
+        s.feedback.active && s.feedback.armAccepted && !s.feedback.faulted && !s.feedback.cancelled &&
+        !s.feedback.forceZero && !s.feedback.released &&
+        gap.session == s.session && gap.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        gap.ownerGeneration == s.lease.generation && gap.tick != 0ULL && gap.nowUs != 0ULL &&
+        gap.active && !gap.faulted && gap.reason == EDM96::Reason::None && IsEDM97TuningCurrentSameThread(gap);
+    if (!live) return false; // Ordinary EDM94 guards retain all stop/ALARM authority.
+    const EDM105::Phase target = (s.gapFlushInterruptArm == 105U || s.gapFlushInterruptArm == 111U) ?
+        EDM105::Phase::Retreat : EDM105::Phase::Return;
+    const bool missed = gap.expectedStep > 1U || gap.acceptedSegments > 1ULL || gap.completedSegments > 0ULL ||
+        (gap.acceptedSegments == 1ULL && static_cast<unsigned>(gap.flushPhase) > static_cast<unsigned>(target));
+    const bool moving = target == EDM105::Phase::Retreat ? gap.v < 0.0 : gap.v > 0.0;
+    const bool reached = !missed && gap.expectedStep == 1U && gap.acceptedSegments == 1ULL &&
+        gap.completedSegments == 0ULL && gap.segmentActive && !gap.segmentCompleted &&
+        s.next == 1U && gap.flushStarted == 1ULL && gap.flushCompleted == 0ULL &&
+        gap.flushPhase == target && std::isfinite(gap.q) && std::isfinite(gap.v) && moving;
+    if (!missed && !reached) return false;
+    s.gapFlushInterruptRequested = true;
+    s.gapFlushInterruptSampleTick = gap.tick; s.gapFlushInterruptEpoch = gap.epoch;
+    // Publish cancellation before diagnostic output can delay the target phase.
+    // Cancel first also keeps FeedHold's MANUAL_HOLD path from counting a synthetic edge.
+    CancelEDM94SameThread(fixture108 ? (reached ? "EDM108_PHASE_HOLD" : "EDM108_TARGET_MISSED") :
+        (reached ? "EDM106_PHASE_HOLD" : "EDM106_TARGET_MISSED"));
+    char record[481]{};
+    const int length = std::snprintf(record, sizeof(record),
+        "[%s] event=%s arm=%u session=%llu tick=%llu epoch=%llu step=%u target=%s sampledPhase=%s qPulse=%.12g vPulsePerSec=%.12g sampleOnly=1 consumeProof=RETAINED_RT_INTERRUPTION action=CANCEL_THEN_HOLD restart=RESET_REQUIRED dischargeCommand=NONE\n",
+        fixture108 ? "EDM108" : "EDM106", reached ? "PHASE_HOLD_REQUEST" : "TARGET_MISSED", s.gapFlushInterruptArm,
+        static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(gap.tick),
+        static_cast<unsigned long long>(gap.epoch), gap.expectedStep, EDM105::PhaseName(target),
+        EDM105::PhaseName(gap.flushPhase), gap.q, gap.v);
+    if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[%s] event=LOG_FORMAT_ERROR scope=PHASE_HOLD_REQUEST\n", fixture108 ? "EDM108" : "EDM106");
+    FeedHold();
+    return true;
+}
+
 void NCManager::ServiceEDM94SameThread()
 {
     if (!m_edm94.latched) return;
@@ -16349,11 +17488,15 @@ void NCManager::ServiceEDM94SameThread()
     const bool sameSession = feedbackRead && observed.identity.session == s.session;
     const bool feedbackCurrent = sameSession && observed.lastTick >= s.lastTick &&
         observed.identity.epoch == s.armEpoch && observed.identity.ownerGeneration == s.lease.generation;
+    // EDM118 never promotes a failed, rejected or repeated read to a new zero proof.
+    // Preserve the general bracket's existing >= observer semantics below.
+    const bool freshPhysical = feedbackCurrent && observed.lastTick > s.lastTick;
     if (feedbackCurrent)
     {
         s.feedback = observed;
         s.lastTick = observed.lastTick;
     }
+    if (ServiceEDM118InterruptionSameThread(freshPhysical)) return;
     if (feedbackCurrent && ConsumeEDM94CompletionReleaseSameThread(observed)) return;
     if (feedbackCurrent && observed.completionPhase == EDM94::CompletionReleasePhase::Revoked &&
         s.normalEndCommitted && !s.cancelled)
@@ -16389,6 +17532,7 @@ void NCManager::ServiceEDM94SameThread()
                     else CancelEDM94SameThread("EDM96_RT_FAULT_DURING_STOP");
                     return;
                 }
+                if (ServiceEDM106PhaseHoldSameThread(gap)) return;
                 if (s.gapWaiting && s.gapWaitFirstUs != 0ULL && gap.nowUs >= s.gapWaitFirstUs &&
                     gap.nowUs - s.gapWaitFirstUs >= 5000000ULL)
                 { RejectEDM94SameThread("EDM96_SOURCE_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return; }
@@ -16489,7 +17633,8 @@ void NCManager::ServiceEDM94SameThread()
     }
     if (s.resetCommitted && !s.everArmed && !f.active && f.faulted)
     { ReleaseEDM94AfterResetSameThread(); return; }
-    if (f.released && s.releaseRequested && s.resetCommitted && f.identity.epoch == s.armEpoch &&
+    if ((!s.gapModeInterruption || freshPhysical) &&
+        f.released && s.releaseRequested && s.resetCommitted && f.identity.epoch == s.armEpoch &&
         f.identity.ownerGeneration == s.lease.generation && f.lastTick >= s.lastTick)
     {
         LogEDM94SameThread("RELEASED", "EXACT_RESET_AND_PHYSICAL_ZERO");
@@ -16499,6 +17644,1748 @@ void NCManager::ServiceEDM94SameThread()
     if (f.cancelled && !s.cancelled) CancelEDM94SameThread("RT_CANCELLED");
     if (s.cancelled && f.stopped && f.forceZero && !s.terminalLogged)
     { s.terminalLogged = true; LogEDM94SameThread("CANCEL_STOPPED", "PHYSICAL_ZERO_WINDOW"); }
+}
+
+// Bounded NC-owner numerical work. This runs before publishing the physical arm,
+// and its workspace/result never enters Motion, the PDO path or the RT servo loop.
+bool NCManager::RunEDM112GeometrySameThread() noexcept
+{
+    const auto& s = m_edm94; auto& c = m_edm112;
+    if (!s.gapCurveGeometry || !s.gapB2Repeat || !s.gapB2CrossSegment || !s.gapCommonPath ||
+        !s.gapFlushProfile || !s.gapFlushParameterized || s.gapFlushInterruptArm != 0U ||
+        !s.session || !s.run || !s.cache || !s.lease.IsValid() || s.lease.owner != MotionOwner::AUTO ||
+        s.latched || s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || c.valid) return false;
+    if (!EDM112::RunFixture(c.workspace, c.result) || !EDM112::IsFixtureResultCurrent(c.result) ||
+        c.result.completedLines != 0U)
+    {
+        RtPrintf("[EDM112] event=CURVE_GEOMETRY_FAIL reason=%s failedCase=%u physicalArc=0 numeric=1 applyToMotion=0 authority=NONE\n",
+            EDM112::ReasonName(c.result.reason), c.result.failedCase);
+        return false;
+    }
+    c.session = s.session; c.run = s.run; c.cache = s.cache; c.ownerGeneration = s.lease.generation;
+    c.valid = true;
+    const auto& r = c.result;
+    RtPrintf("[EDM112] event=CURVE_GEOMETRY_PASS build=EDM112 session=%llu cases=%u lineSamples=%u cwSamples=%u ccwSamples=%u planeMask=%u helixRotaryCases=%u physicalArc=0 numeric=1 applyToMotion=0 authority=NONE\n",
+        static_cast<unsigned long long>(s.session), r.cases, r.lineSamples, r.cwSamples, r.ccwSamples,
+        r.planeMask, r.helixRotaryCases);
+    RtPrintf("[EDM112] event=CURVE_GEOMETRY_CHECKS session=%llu reverseSpans=%u b2Plans=%u endpointChecks=%u derivativeChecks=%u boundsChecks=%u negativeCases=%u physicalArc=0 numeric=1 applyToMotion=0 authority=NONE\n",
+        static_cast<unsigned long long>(s.session), r.reverseSpans, r.b2Plans, r.endpointChecks,
+        r.derivativeChecks, r.boundsChecks, r.negativeCases);
+    return IsEDM112GeometryCurrentSameThread(false);
+}
+
+bool NCManager::IsEDM112GeometryCurrentSameThread(bool requireComplete) const noexcept
+{
+    const auto& s = m_edm94; const auto& c = m_edm112;
+    if (!s.gapCurveGeometry || !s.gapB2Repeat || !s.gapB2CrossSegment || !s.gapCommonPath ||
+        !s.gapFlushProfile || !s.gapFlushParameterized || s.gapFlushInterruptArm != 0U ||
+        !c.valid || !c.session || c.session != s.session || c.run != s.run || c.cache != s.cache ||
+        !c.ownerGeneration || c.ownerGeneration != s.lease.generation ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !EDM112::IsFixtureResultCurrent(c.result)) return false;
+    if (!requireComplete) return true;
+    const auto& ledger = m_edm109.ledger;
+    return c.result.completedLines == EDM112::ExpectedCompletedLines &&
+        c.result.completedLines == EDM109::Capacity && ledger.Valid() && ledger.Count() == EDM109::Capacity &&
+        m_edm109.mappedSegments == EDM109::Capacity && m_edm109.plans == EDM109::Capacity - 1U &&
+        ledger.FrozenScope().session == c.session && ledger.FrozenScope().run == c.run &&
+        ledger.FrozenScope().cache == c.cache && ledger.FrozenScope().ownerGeneration == c.ownerGeneration;
+}
+
+// NC consumes a separate RT observation receipt only after the actual G01
+// boundary is retained. Neither this receipt nor its hypothetical curve owns
+// motion. Completed receipts remain valid through normal owner retirement.
+bool NCManager::IsEDM113RuntimeCurrentSameThread(unsigned completed,
+    std::uint64_t mappingTick) noexcept
+{
+    const auto& s = m_edm94; auto& c = m_edm113;
+    const auto& ledger = m_edm109.ledger;
+    if (!s.gapCurveRuntime || !s.gapCurveGeometry || !s.gapB2Repeat ||
+        !s.latched || s.armPending || !s.everArmed || s.moves != EDM109::Capacity ||
+        !s.armEpoch || completed > EDM109::Capacity || c.acknowledgedRows > completed ||
+        !IsEDM112GeometryCurrentSameThread(false) || !m_motion.ReadEDM113Feedback(c.feedback)) return false;
+    const auto& f = c.feedback; const auto& prior = c.retained;
+    if (f.failed && !c.failureLogged)
+    {
+        c.failureLogged = true;
+        char record[481]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM113] event=RUNTIME_CURVE_FAIL logger=FIX1 session=%llu reason=%u step=%u tick=%llu lastSample=%llu begun=%u completed=%u expected=%u physicalArc=0 applyToMotion=0 action=NC_REJECT\n",
+            static_cast<unsigned long long>(f.session), static_cast<unsigned>(f.reason), f.source.step,
+            static_cast<unsigned long long>(f.lastTick), static_cast<unsigned long long>(f.lastSampleTick),
+            f.begunRows, f.completedRows, completed);
+        EmitEDM113Record(record, length, "RUNTIME_CURVE_FAIL");
+    }
+    if (!f.enabled || f.failed || f.reason != EDM113::Reason::None || f.PhysicalPermit() || f.suspended ||
+        f.session != s.session || f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
+        f.begunRows != completed || f.completedRows != completed || f.endpointRows != completed ||
+        f.cwRows != (completed + 1U) / 2U || f.ccwRows != completed / 2U ||
+        f.completed != (completed == EDM109::Capacity) || f.rowComplete != (completed != 0U)) return false;
+    const unsigned pauses = completed >= 5U ? 2U : completed >= 3U ? 1U : 0U;
+    if (f.suspensions != pauses || f.resumptions != pauses) return false;
+    if (completed == 0U)
+    {
+        // SubmitArm has no row/run/cache source yet. Do not demand a future Bind.
+        if (mappingTick || c.acknowledgedRows || ledger.Valid() || ledger.Count() ||
+            !EDM113::SameSource(f.source, EDM109::Source{}) ||
+            f.bindTick || f.lastTick || f.lastSampleTick || f.lastCompletedMappingTick ||
+            f.samples || f.forwardSamples || f.reverseSamples || f.flushSamples || f.suspendedTicks ||
+            f.rowSamples || f.rowForwardSamples || f.rowReverseSamples || f.rowFlushSamples || f.rowSuspendedTicks ||
+            f.sourcePulseLength != 0.0 || f.unitSpeedLimit != 0.0 || f.unitAccelerationLimit != 0.0 ||
+            f.maxUnitSpeed != 0.0 || f.maxUnitAcceleration != 0.0) return false;
+        for (unsigned axis = 0U; axis < EDM109::AxisCount; ++axis)
+            if (f.maxAbsVelocityPps[axis] != 0.0 || f.maxAbsAccelerationPps2[axis] != 0.0) return false;
+        c.retained = f; return true;
+    }
+    const bool fresh = c.acknowledgedRows + 1U == completed;
+    if ((!fresh && c.acknowledgedRows != completed) || (fresh && !mappingTick) ||
+        !ledger.Valid() || ledger.Count() != completed || m_edm112.result.completedLines != completed) return false;
+    const auto* row = ledger.Row(completed - 1U);
+    const std::uint64_t expectedMappingTick = mappingTick ? mappingTick : m_edm109.lastMappingTick;
+    if (!row || !EDM113::ValidSource(f.source) || !EDM113::SameSource(f.source, row->source) ||
+        !EDM109::SameScope(f.source.scope, ledger.FrozenScope()) ||
+        f.source.scope.session != s.session || f.source.scope.run != s.run || f.source.scope.cache != s.cache ||
+        f.source.scope.ownerGeneration != s.lease.generation || f.source.step != completed - 1U ||
+        f.source.sourcePC != s.pc[completed - 1U] || !row->completion.boundaryValidated ||
+        !row->completion.commit || !row->completion.tick || !expectedMappingTick ||
+        f.lastCompletedMappingTick != expectedMappingTick || expectedMappingTick > row->completion.tick ||
+        !f.bindTick || f.bindTick > expectedMappingTick ||
+        f.lastSampleTick != expectedMappingTick || f.lastTick != expectedMappingTick ||
+        !EDM109::SameDouble(f.sourcePulseLength, row->line.pulseLength) ||
+        !std::isfinite(f.unitSpeedLimit) || f.unitSpeedLimit <= 0.0 ||
+        !std::isfinite(f.unitAccelerationLimit) || f.unitAccelerationLimit <= 0.0 ||
+        !std::isfinite(f.maxUnitSpeed) || f.maxUnitSpeed <= 0.0 ||
+        !std::isfinite(f.maxUnitAcceleration) || f.maxUnitAcceleration <= 0.0 ||
+        !f.rowSamples || !f.rowForwardSamples || !f.rowReverseSamples ||
+        f.rowForwardSamples > f.rowSamples || f.rowReverseSamples > f.rowSamples - f.rowForwardSamples ||
+        f.rowFlushSamples > f.rowSamples || f.rowSamples > expectedMappingTick - f.bindTick + 1ULL ||
+        (!(f.source.step & 1U) && !f.rowFlushSamples) ||
+        ((f.source.step == 2U || f.source.step == 4U) != (f.rowSuspendedTicks != 0ULL))) return false;
+    for (unsigned axis = 0U; axis < EDM109::AxisCount; ++axis)
+        if (!std::isfinite(f.maxAbsVelocityPps[axis]) || f.maxAbsVelocityPps[axis] <= 0.0 ||
+            !std::isfinite(f.maxAbsAccelerationPps2[axis]) || f.maxAbsAccelerationPps2[axis] <= 0.0 ||
+            f.maxAbsVelocityPps[axis] < prior.maxAbsVelocityPps[axis] ||
+            f.maxAbsAccelerationPps2[axis] < prior.maxAbsAccelerationPps2[axis]) return false;
+    if (fresh)
+    {
+        if (!prior.enabled || prior.failed || prior.session != s.session || prior.armEpoch != s.armEpoch ||
+            prior.ownerGeneration != s.lease.generation || prior.completedRows != c.acknowledgedRows ||
+            f.bindTick <= prior.lastCompletedMappingTick ||
+            f.samples < prior.samples || f.samples - prior.samples != f.rowSamples ||
+            f.forwardSamples < prior.forwardSamples || f.forwardSamples - prior.forwardSamples != f.rowForwardSamples ||
+            f.reverseSamples < prior.reverseSamples || f.reverseSamples - prior.reverseSamples != f.rowReverseSamples ||
+            f.flushSamples < prior.flushSamples || f.flushSamples - prior.flushSamples != f.rowFlushSamples ||
+            f.suspendedTicks < prior.suspendedTicks || f.suspendedTicks - prior.suspendedTicks != f.rowSuspendedTicks ||
+            f.maxUnitSpeed < prior.maxUnitSpeed || f.maxUnitAcceleration < prior.maxUnitAcceleration) return false;
+        c.retained = f; c.acknowledgedRows = completed;
+    }
+    else
+    {
+        // Polling a completed boundary may re-read it, but can never add credit.
+        if (!EDM113::SameSource(f.source, prior.source) || f.bindTick != prior.bindTick ||
+            f.lastCompletedMappingTick != prior.lastCompletedMappingTick ||
+            f.samples != prior.samples || f.forwardSamples != prior.forwardSamples ||
+            f.reverseSamples != prior.reverseSamples || f.flushSamples != prior.flushSamples ||
+            f.suspendedTicks != prior.suspendedTicks || f.rowSamples != prior.rowSamples ||
+            f.rowForwardSamples != prior.rowForwardSamples || f.rowReverseSamples != prior.rowReverseSamples ||
+            f.rowFlushSamples != prior.rowFlushSamples || f.rowSuspendedTicks != prior.rowSuspendedTicks ||
+            !EDM109::SameDouble(f.unitSpeedLimit, prior.unitSpeedLimit) ||
+            !EDM109::SameDouble(f.unitAccelerationLimit, prior.unitAccelerationLimit) ||
+            !EDM109::SameDouble(f.maxUnitSpeed, prior.maxUnitSpeed) ||
+            !EDM109::SameDouble(f.maxUnitAcceleration, prior.maxUnitAcceleration) ||
+            !EDM109::SamePulse(f.maxAbsVelocityPps, prior.maxAbsVelocityPps) ||
+            !EDM109::SamePulse(f.maxAbsAccelerationPps2, prior.maxAbsAccelerationPps2)) return false;
+    }
+    return true;
+}
+
+void NCManager::LogEDM113RuntimeSameThread() const noexcept
+{
+    const auto& f = m_edm113.retained;
+    char record[481]{};
+    int length = std::snprintf(record, sizeof(record),
+        "[EDM113] event=RUNTIME_CURVE_COMPLETE build=EDM113 logger=FIX1 session=%llu rows=%u cw=%u ccw=%u endpoints=%u physicalG01=16 physicalB2=2 physicalArc=0 applyToMotion=0 reverseEveryRow=1 complete=1 pauseDuringB2=1 suspensions=%u resumptions=%u dischargeCommand=NONE\n",
+        static_cast<unsigned long long>(f.session), f.completedRows, f.cwRows, f.ccwRows,
+        f.endpointRows, f.suspensions, f.resumptions);
+    EmitEDM113Record(record, length, "RUNTIME_CURVE_COMPLETE");
+    length = std::snprintf(record, sizeof(record),
+        "[EDM113] event=RUNTIME_CURVE_SAMPLES logger=FIX1 session=%llu total=%llu forward=%llu reverse=%llu flush=%llu suspendedTicks=%llu mappingTick=%llu dynamics=CHECKED softwareLimits=1 physicalArc=0 applyToMotion=0\n",
+        static_cast<unsigned long long>(f.session), static_cast<unsigned long long>(f.samples),
+        static_cast<unsigned long long>(f.forwardSamples), static_cast<unsigned long long>(f.reverseSamples),
+        static_cast<unsigned long long>(f.flushSamples), static_cast<unsigned long long>(f.suspendedTicks),
+        static_cast<unsigned long long>(f.lastCompletedMappingTick));
+    EmitEDM113Record(record, length, "RUNTIME_CURVE_SAMPLES");
+}
+
+void NCManager::InvalidateEDM109CommonPathSameThread(const char* reason) noexcept
+{
+    m_edm126 = EDM126NCState{};
+    m_edm110.token = EDM110::CompletionToken{};
+    m_edm110.feedback = EDM110::MotionFeedback{};
+    m_edm110.first = EDM110::MotionFeedback{};
+    m_edm110.complete = m_edm110.firstRetained = false;
+    m_edm112.valid = false; m_edm112.result = EDM112::Result{};
+    m_edm112.session = m_edm112.run = m_edm112.cache = m_edm112.ownerGeneration = 0ULL;
+    m_edm113.feedback = EDM113::Feedback{}; m_edm113.retained = EDM113::Feedback{};
+    m_edm113.acknowledgedRows = 0U; m_edm113.failureLogged = false;
+    m_edm115.token = EDM115::CompletionToken{}; m_edm115.feedback = EDM115::MotionFeedback{};
+    for (unsigned event = 0U; event < 2U; ++event)
+    {
+        m_edm115.tokens[event] = EDM115::CompletionToken{};
+        m_edm115.previousRows[event] = EDM114::Feedback{}; m_edm115.triggerRows[event] = EDM114::Feedback{};
+        m_edm115.receipts[event] = EDM115::MotionFeedback{};
+        m_edm115.completionTick[event] = m_edm115.completionUs[event] = m_edm115.completionCommit[event] = 0ULL;
+    }
+    m_edm115.retainedEvents = 0U; m_edm115.failureLogged = false;
+    m_edm116.token = EDM115::CompletionToken{}; m_edm116.feedback = EDM116::MotionFeedback{};
+    for (auto& policy : m_edm116.policies) policy = EDM116::Policy{};
+    for (auto& policy : m_edm116.completedPolicies) policy = EDM116::Policy{};
+    for (auto& source : m_edm116.completedSources) source = EDM114::Source{};
+    m_edm116.issuedDispatch.fill(0ULL); m_edm116.issuedEpoch.fill(0ULL);
+    for (unsigned event = 0U; event < 8U; ++event)
+    {
+        m_edm116.triggerRows[event] = EDM114::Feedback{};
+        m_edm116.receipts[event] = EDM116::MotionFeedback{};
+        m_edm116.completionTick[event] = m_edm116.completionUs[event] = m_edm116.completionCommit[event] = 0ULL;
+    }
+    for (unsigned event = 0U; event < 2U; ++event)
+    { m_edm116.tokens[event] = EDM115::CompletionToken{}; m_edm116.previousRows[event] = EDM114::Feedback{}; }
+    m_edm116.selected = m_edm116.consumed = m_edm116.acknowledgedRows = m_edm116.retainedEvents = 0U;
+    m_edm116.pending = m_edm116.failureLogged = false;
+    m_edm116.initialBoundaryTick = m_edm116.initialBoundaryUs = 0ULL;
+    m_edm116.initialBoundaryReady = m_edm116.initialTranslationValid = m_edm116.initialBoundaryLogged = false;
+    m_edm114.feedback = EDM114::Feedback{}; m_edm114.retained = EDM114::Feedback{};
+    m_edm114.completionTick = m_edm114.completionCommit = 0ULL;
+    m_edm114.acknowledgedRows = m_edm114.arcFlushRows = 0U; m_edm114.failureLogged = false;
+    auto& c = m_edm109;
+    if (c.ledger.Valid())
+        RtPrintf("[EDM109] event=HISTORY_INVALIDATED session=%llu retained=%u plans=%llu reason=%.64s physicalB2=0 numeric=1 dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(c.ledger.FrozenScope().session), c.ledger.Count(),
+            static_cast<unsigned long long>(c.plans), reason ? reason : "UNKNOWN");
+    c.ledger.Invalidate(); c.plan.valid = false; c.plan.count = 0U; c.line.valid = false;
+    c.plans = c.mappedSegments = c.lastMappingTick = 0ULL;
+}
+
+bool NCManager::RetainEDM109CompletedSameThread(const EDM94::Feedback& observed) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm109;
+    const auto& p = m_pathFeed; const auto& r = m_pathFeedMotion.receipt;
+    if (!s.gapCommonPath || !s.gapFlushProfile || !s.gapFlushParameterized || s.gapFlushInterruptArm != 0U ||
+        !s.latched || !s.ready || s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested ||
+        s.rtFaultReported || s.finishPending || s.complete || s.next == 0U || s.next > s.moves ||
+        s.moves != EDM109::Capacity || !m_motion.ReadEDM109Feedback(c.feedback)) return false;
+    const auto& f = c.feedback;
+    if (!f.enabled || !f.lineValid || !f.mappedOutput || !f.completed ||
+        f.session != s.session || f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
+        f.run != s.run || f.cache != s.cache || f.dispatch != p.dispatch || f.sourcePC != p.sourcePC ||
+        f.epoch != r.identity.epoch || f.segmentId != r.identity.segmentId ||
+        f.translationGeneration != r.translationGeneration || f.step != s.next - 1U ||
+        f.begunSegments != s.next || f.mappedSegments != s.next || f.mappedSamples < f.mappedSegments ||
+        f.lastMappingTick == 0ULL || f.lastMappingTick > observed.lastTick ||
+        f.lastMappingUs == 0ULL || f.lastMappingUs > observed.lastNowUs ||
+        observed.faulted || observed.cancelled || observed.forceZero || !observed.active ||
+        !observed.armedReady || observed.handoffZero || observed.boundaryNotReadyMask != 0U ||
+        observed.boundaryReadyCycles < EDM94::BoundaryReadyCycles) return false;
+    std::uint64_t configTag = 1469598103934665603ULL, mappingTag = configTag;
+    for (unsigned axis = 0U; axis < EDM109::AxisCount; ++axis)
+    {
+        const auto& config = observed.config.axis[axis];
+        if (!EDM109::SameDouble(f.startPulse[axis], r.xyzcuv.startPulse[axis]) ||
+            !EDM109::SameDouble(f.endPulse[axis], r.xyzcuv.endPulse[axis]) ||
+            !EDM109::SameDouble(f.pulsePerUnit[axis], r.xyzcuv.pulsePerUnit[axis]) ||
+            !EDM109::SameDouble(f.pulsePerUnit[axis], config.pulsePerUnit) ||
+            f.configFingerprint[axis] != config.configFingerprint ||
+            f.mappingFingerprint[axis] != config.mappingFingerprint ||
+            (c.ledger.Valid() && (f.configFingerprint[axis] != c.configFingerprint[axis] ||
+                f.mappingFingerprint[axis] != c.mappingFingerprint[axis]))) return false;
+        configTag = (configTag ^ f.configFingerprint[axis]) * 1099511628211ULL;
+        mappingTag = (mappingTag ^ f.mappingFingerprint[axis]) * 1099511628211ULL;
+    }
+    // Tags summarize the exact per-axis comparisons above; they do not replace them.
+    c.source.scope = EDM109::Scope{s.session, s.run, s.cache, s.lease.generation,
+        configTag ? configTag : 1ULL, mappingTag ? mappingTag : 1ULL, r.translationGeneration};
+    c.source.dispatch = p.dispatch; c.source.epoch = r.identity.epoch;
+    c.source.segment = r.identity.segmentId; c.source.sourcePC = p.sourcePC; c.source.step = s.next - 1U;
+    c.completion.tick = observed.lastTick; c.completion.commit = p.commit; c.completion.boundaryValidated = true;
+    if (!EDM109::BuildLine(f.startPulse, f.endPulse, f.pulsePerUnit, c.line) ||
+        !EDM109::SameDouble(c.line.pulseLength, f.pulseLength)) return false;
+    if (c.ledger.Valid() && c.ledger.Count() == s.next)
+    {
+        // A repeated asynchronous wait may observe the same completed receipt.
+        // It must never append or plan that source twice.
+        const auto* row = c.ledger.Row(s.next - 1U);
+        return row && EDM109::SameScope(row->source.scope, c.source.scope) &&
+            row->source.dispatch == c.source.dispatch && row->source.epoch == c.source.epoch &&
+            row->source.segment == c.source.segment && row->source.sourcePC == c.source.sourcePC &&
+            row->source.step == c.source.step && row->completion.commit == p.commit &&
+            row->completion.tick <= observed.lastTick && c.lastMappingTick == f.lastMappingTick &&
+            EDM109::SamePulse(row->line.startPulse, c.line.startPulse) &&
+            EDM109::SamePulse(row->line.endPulse, c.line.endPulse) &&
+            EDM109::SamePulse(row->line.pulsePerNative, c.line.pulsePerNative) &&
+            (!s.gapCurveGeometry || (IsEDM112GeometryCurrentSameThread(false) &&
+                m_edm112.result.completedLines == c.ledger.Count())) &&
+            (!s.gapCurveRuntime || IsEDM113RuntimeCurrentSameThread(s.next, f.lastMappingTick));
+    }
+    if (s.next == 1U && !c.ledger.Valid())
+    {
+        if (!c.ledger.Begin(c.source.scope)) return false;
+        c.configFingerprint = f.configFingerprint; c.mappingFingerprint = f.mappingFingerprint;
+    }
+    if (!c.ledger.Valid() || c.ledger.Count() != s.next - 1U ||
+        f.lastMappingTick <= c.lastMappingTick || !c.ledger.Append(c.line, c.source, c.completion)) return false;
+    if (s.gapCurveGeometry &&
+        (!IsEDM112GeometryCurrentSameThread(false) || m_edm112.result.completedLines + 1U != s.next ||
+            !EDM112::CompareCompletedLine(c.line, m_edm112.workspace, m_edm112.result) ||
+            m_edm112.result.completedLines != s.next))
+    {
+        m_edm112.valid = false;
+        RtPrintf("[EDM112] event=COMPLETED_LINE_FAIL session=%llu step=%u compared=%u reason=%s failedCase=%u physicalArc=0 numeric=1 applyToMotion=0 authority=NONE\n",
+            static_cast<unsigned long long>(s.session), f.step, m_edm112.result.completedLines,
+            EDM112::ReasonName(m_edm112.result.reason), m_edm112.result.failedCase);
+        return false;
+    }
+    // The actual G01 receipt is retained first. The observer can acknowledge
+    // only that same completed row and its latched final mapping tick.
+    if (s.gapCurveRuntime && !IsEDM113RuntimeCurrentSameThread(s.next, f.lastMappingTick)) return false;
+    c.mappedSegments = f.mappedSegments; c.lastMappingTick = f.lastMappingTick;
+    char record[481]{};
+    const auto emit = [&](int length, const char* part) noexcept
+    {
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM109] event=LOG_FORMAT_ERROR part=%.24s physicalB2=0\n", part);
+    };
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM109] event=COMPLETED_RETAINED session=%llu retained=%u step=%u dispatch=%llu commit=%llu epoch=%llu segment=%llu completionTick=%llu mappingTick=%llu mappedSegments=%llu source=ACTUAL_COMMON_G01 completedOnly=1 physicalB2=0 dischargeCommand=NONE\n",
+        static_cast<unsigned long long>(s.session), c.ledger.Count(), f.step,
+        static_cast<unsigned long long>(p.dispatch), static_cast<unsigned long long>(p.commit),
+        static_cast<unsigned long long>(r.identity.epoch), static_cast<unsigned long long>(r.identity.segmentId),
+        static_cast<unsigned long long>(observed.lastTick), static_cast<unsigned long long>(f.lastMappingTick),
+        static_cast<unsigned long long>(c.mappedSegments)), "COMPLETED_RETAINED");
+    if (c.ledger.Count() < 2U) return true;
+    if (!EDM109::BuildB2Plan(c.ledger, c.plan) || !c.plan.valid || c.plan.PhysicalPermit() ||
+        c.plan.count != 4U || c.plan.anchorOrdinal != c.ledger.Count() - 1U ||
+        c.plan.targetOrdinal + 1U != c.plan.anchorOrdinal ||
+        !EDM109::SamePulse(c.plan.anchorPulse, c.plan.returnedPulse)) return false;
+    ++c.plans;
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM109] event=B2_PLAN session=%llu plan=%llu retained=%u spans=%u anchorOrdinal=%u targetOrdinal=%u anchorMm=%.12g targetMm=%.12g anchorEndpointEqual=1 backwardCrossings=1 forwardCrossings=1 numeric=1 physicalB2=0 applyToMotion=0 stopEachSpan=1 dischargeCommand=NONE\n",
+        static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(c.plans), c.ledger.Count(),
+        c.plan.count, c.plan.anchorOrdinal, c.plan.targetOrdinal, c.plan.anchorMm, c.plan.targetMm), "B2_PLAN");
+    for (unsigned span = 0U; span < c.plan.count; ++span)
+    {
+        const auto& part = c.plan.spans[span];
+        if (!part.stopRequired) return false;
+        emit(std::snprintf(record, sizeof(record),
+            "[EDM109] event=B2_SPAN session=%llu plan=%llu span=%u ordinal=%u fromMm=%.12g toMm=%.12g distanceFrame=ROW_LOCAL direction=%s stopRequired=1 numeric=1 physicalB2=0 applyToMotion=0\n",
+            static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(c.plans), span,
+            part.ordinal, part.startMm, part.endMm, part.endMm < part.startMm ? "REVERSE" : "FORWARD"), "B2_SPAN");
+    }
+    return true;
+}
+
+// This token retires one independently completed NC row; it never supplies geometry or output.
+bool NCManager::BuildEDM110CompletionTokenSameThread(unsigned step) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm109;
+    m_edm110.token = EDM110::CompletionToken{};
+    if (!s.gapB2CrossSegment) return !s.gapB2Repeat;
+    if (!s.gapCommonPath || !s.gapFlushProfile || !s.gapFlushParameterized || s.gapFlushInterruptArm != 0U ||
+        !s.latched || !s.ready || s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested ||
+        s.rtFaultReported || s.finishPending || s.complete || m_state != NCState::RUN ||
+        m_mode != NCOperationMode::MEMORY || step >= EDM109::Capacity || s.next != step + 1U ||
+        s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease)) return false;
+    // Each explicit event consumes a different immediately preceding completed row.
+    if (!EDM110::IsTriggerStep(step, s.gapB2Repeat)) return true;
+    if (m_edm110.firstRetained) return false; // A retained first event cannot authorize another second event.
+    const auto* previous = c.ledger.Row(step - 1U);
+    EDM94::Feedback guard{};
+    if (!c.ledger.Valid() || c.ledger.Count() != step || !previous ||
+        !m_motion.ReadEDM109Feedback(c.feedback) || !m_motion.ReadEDM94Feedback(guard)) return false;
+    const auto& f = c.feedback; const auto& source = previous->source;
+    const auto& completion = previous->completion;
+    if (!EDM109::SameScope(source.scope, c.ledger.FrozenScope()) ||
+        source.scope.session != s.session || source.scope.run != s.run || source.scope.cache != s.cache ||
+        source.scope.ownerGeneration != s.lease.generation || source.step != step - 1U || source.sourcePC != s.pc[step - 1U] ||
+        !completion.boundaryValidated || !completion.tick || !completion.commit ||
+        !f.enabled || !f.lineValid || !f.mappedOutput || !f.completed ||
+        f.session != s.session || f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
+        f.run != s.run || f.cache != s.cache || f.dispatch != source.dispatch || f.sourcePC != source.sourcePC ||
+        f.epoch != source.epoch || f.epoch != m_motion.GetCurrentExecutionEpoch() || f.segmentId != source.segment ||
+        f.translationGeneration != source.scope.translationGeneration || f.step != step - 1U ||
+        f.begunSegments != step || f.mappedSegments != step || f.mappedSamples < step ||
+        !f.lastMappingTick || f.lastMappingTick != c.lastMappingTick || f.lastMappingTick > completion.tick ||
+        !f.lastMappingUs || f.lastMappingUs > guard.lastNowUs ||
+        guard.identity.session != s.session || guard.identity.epoch != s.armEpoch ||
+        guard.identity.ownerGeneration != s.lease.generation || guard.currentIdentity.session != s.session ||
+        guard.currentIdentity.epoch != source.epoch || guard.currentIdentity.ownerGeneration != s.lease.generation ||
+        guard.lastTick < completion.tick || guard.lastTick < s.lastTick || !guard.active || !guard.armAccepted ||
+        !guard.armedReady || guard.forceZero || guard.faulted || guard.cancelled || guard.finishRequested ||
+        guard.released || guard.handoffZero || guard.boundaryNotReadyMask != 0U ||
+        guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles ||
+        !CoordSys.IsTranslationRunFrozen() || !CoordSys.IsTranslationRunCurrent() ||
+        CoordSys.GetTranslationSnapshot().generation != source.scope.translationGeneration ||
+        !IsXYZCUVFeedProfileCurrentSameThread() || !IsFixedTranslationTravelCurrentSameThread() ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread() ||
+        !EDM109::SameDouble(f.pulseLength, previous->line.pulseLength) ||
+        !EDM109::SamePulse(f.startPulse, previous->line.startPulse) ||
+        !EDM109::SamePulse(f.endPulse, previous->line.endPulse) ||
+        !EDM109::SamePulse(f.pulsePerUnit, previous->line.pulsePerNative)) return false;
+    for (unsigned axis = 0U; axis < EDM109::AxisCount; ++axis)
+    {
+        const auto& config = guard.config.axis[axis];
+        if (f.configFingerprint[axis] != c.configFingerprint[axis] ||
+            f.mappingFingerprint[axis] != c.mappingFingerprint[axis] ||
+            f.configFingerprint[axis] != config.configFingerprint ||
+            f.mappingFingerprint[axis] != config.mappingFingerprint ||
+            !EDM109::SameDouble(f.pulsePerUnit[axis], config.pulsePerUnit)) return false;
+    }
+    if (step == 4U)
+    {
+        // Copy the first immutable completion before RT retires its geometry for the fresh event.
+        if (!s.gapB2Repeat || !m_motion.ReadEDM110Feedback(m_edm110.feedback) ||
+            !IsEDM110ReceiptSameThread(m_edm110.feedback, 2U, guard) ||
+            m_edm110.feedback.excursion.tick >= completion.tick ||
+            m_edm110.feedback.trigger.dispatch >= source.dispatch ||
+            m_edm110.feedback.trigger.epoch >= source.epoch ||
+            m_edm110.feedback.trigger.segment >= source.segment ||
+            m_edm110.feedback.previousCommit >= completion.commit) return false;
+        m_edm110.first = m_edm110.feedback; m_edm110.firstRetained = true;
+        RtPrintf("[EDM111] event=FIRST_B2_RETAINED session=%llu triggerStep=2 nextTriggerStep=4 eventsStarted=1 eventsCompleted=1 dwells=5 proof=FOLLOWING_WINDOW_200\n",
+            static_cast<unsigned long long>(s.session));
+    }
+    m_edm110.token.previous = source; m_edm110.token.completion = completion;
+    m_edm110.token.mappingTick = f.lastMappingTick; m_edm110.token.valid = true;
+    return true;
+}
+
+bool NCManager::IsEDM109CompleteSameThread() noexcept
+{
+    const auto& s = m_edm94; auto& c = m_edm109;
+    if (!s.gapCommonPath || !c.ledger.Valid() || c.ledger.Count() != EDM109::Capacity ||
+        c.plans != EDM109::Capacity - 1U || c.mappedSegments != EDM109::Capacity ||
+        !c.plan.valid || c.plan.PhysicalPermit() || c.plan.count != 4U ||
+        !EDM109::SamePulse(c.plan.anchorPulse, c.plan.returnedPulse) ||
+        c.ledger.FrozenScope().session != s.session || c.ledger.FrozenScope().run != s.run ||
+        c.ledger.FrozenScope().cache != s.cache || c.ledger.FrozenScope().ownerGeneration != s.lease.generation ||
+        !m_motion.ReadEDM109Feedback(c.feedback)) return false;
+    const auto& f = c.feedback; const auto* last = c.ledger.Row(EDM109::Capacity - 1U);
+    bool current = last && f.enabled && f.lineValid && f.mappedOutput && f.completed &&
+        f.session == s.session && f.armEpoch == s.armEpoch && f.ownerGeneration == s.lease.generation &&
+        f.run == s.run && f.cache == s.cache && f.dispatch == last->source.dispatch &&
+        f.sourcePC == last->source.sourcePC && f.epoch == last->source.epoch &&
+        f.epoch == m_motion.GetCurrentExecutionEpoch() && f.segmentId == last->source.segment &&
+        f.translationGeneration == last->source.scope.translationGeneration &&
+        f.step + 1U == EDM109::Capacity && f.begunSegments == EDM109::Capacity &&
+        f.mappedSegments == EDM109::Capacity && f.mappedSamples >= f.mappedSegments &&
+        f.lastMappingTick == c.lastMappingTick && f.lastMappingTick != 0ULL && f.lastMappingUs != 0ULL &&
+        EDM109::SameDouble(f.pulseLength, last->line.pulseLength) &&
+        EDM109::SamePulse(f.startPulse, last->line.startPulse) && EDM109::SamePulse(f.endPulse, last->line.endPulse) &&
+        EDM109::SamePulse(f.pulsePerUnit, last->line.pulsePerNative);
+    for (unsigned axis = 0U; current && axis < EDM109::AxisCount; ++axis)
+        current = f.configFingerprint[axis] == c.configFingerprint[axis] &&
+            f.mappingFingerprint[axis] == c.mappingFingerprint[axis];
+    if (current)
+        RtPrintf("[EDM109] event=COMMON_PATH_COMPLETE session=%llu retained=16 mappedSegments=16 numericalB2Plans=15 anchorEndpointEqual=1 physicalCommonMap=1 physicalB2=0 numeric=1 next=%s dischargeCommand=NONE\n",
+            static_cast<unsigned long long>(s.session), s.gapCurveRuntime ? "RUNTIME_CURVE_CHECK_P124" : s.gapCurveGeometry ? "CURVE_GEOMETRY_CHECK_P122" : s.gapB2Repeat ? "PHYSICAL_B2_CHECK_P120" : s.gapB2CrossSegment ? "PHYSICAL_B2_CHECK_P118" : "PHYSICAL_FINISH_P116");
+    return current;
+}
+
+// A retained per-event receipt is evidence only. Recheck its exact completed ledger rows,
+// frozen scope, physical zero proof and current guard before permitting a later event/finish.
+bool NCManager::IsEDM110ReceiptSameThread(const EDM110::MotionFeedback& f, unsigned step,
+    const EDM94::Feedback& guard) const noexcept
+{
+    const auto& s = m_edm94; const auto& c = m_edm109; const auto& e = f.excursion;
+    if (!s.gapB2CrossSegment || !EDM110::IsTriggerStep(step, s.gapB2Repeat) ||
+        !c.ledger.Valid() || c.ledger.Count() <= step || f.repeat != s.gapB2Repeat ||
+        f.eventsStarted != EDM110::EventOrdinal(step) || f.eventsCompleted != EDM110::EventOrdinal(step)) return false;
+    const auto* previous = c.ledger.Row(step - 1U); const auto* trigger = c.ledger.Row(step);
+    if (!previous || !trigger || !f.enabled || !f.tokenValidated || !f.geometryCurrent ||
+        f.session != s.session || f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
+        !EDM109::SameScope(f.trigger.scope, trigger->source.scope) ||
+        !EDM109::SameScope(f.trigger.scope, c.ledger.FrozenScope()) ||
+        f.trigger.scope.session != s.session || f.trigger.scope.run != s.run ||
+        f.trigger.scope.cache != s.cache || f.trigger.scope.ownerGeneration != s.lease.generation ||
+        f.trigger.dispatch != trigger->source.dispatch || f.trigger.epoch != trigger->source.epoch ||
+        f.trigger.segment != trigger->source.segment || f.trigger.sourcePC != trigger->source.sourcePC ||
+        f.trigger.step != step || trigger->source.step != step || f.trigger.sourcePC != s.pc[step] ||
+        f.previousBoundaryTick != previous->completion.tick || f.previousCommit != previous->completion.commit ||
+        !previous->completion.boundaryValidated || !trigger->completion.boundaryValidated ||
+        !f.previousBoundaryTick || !f.previousCommit || !f.lastPhysicalTick ||
+        f.lastPhysicalTick <= f.previousBoundaryTick || f.lastPhysicalTick > guard.lastTick ||
+        f.lastPhysicalTick >= e.tick || e.tick - f.lastPhysicalTick != 1ULL ||
+        !e.geometryValid || !e.complete || e.phase != EDM110::Phase::Complete ||
+        e.reason != EDM110::Reason::None || !e.endpointReady || e.span != 3U ||
+        e.active || e.moving || e.faulted || e.stopRequested || e.stopped ||
+        e.started != 1ULL || e.completed != 1ULL || e.backwardCrossings != 1ULL ||
+        e.forwardCrossings != 1ULL || e.anchorReturned != 1ULL || e.completedDwells != 5U ||
+        e.settledCycles < EDM94::BoundaryReadyCycles || e.v != 0.0 || !std::isfinite(e.q) ||
+        !e.tick || e.tick > guard.lastTick || e.tick > trigger->completion.tick ||
+        !e.nowUs || e.nowUs > guard.lastNowUs ||
+        !e.startTick || e.startTick <= f.previousBoundaryTick || e.startTick > e.tick ||
+        !e.startUs || e.startUs > e.nowUs ||
+        guard.identity.session != s.session || guard.identity.epoch != s.armEpoch ||
+        guard.identity.ownerGeneration != s.lease.generation || guard.currentIdentity.session != s.session ||
+        guard.currentIdentity.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        guard.currentIdentity.ownerGeneration != s.lease.generation || guard.lastTick < s.lastTick ||
+        !guard.active || !guard.armAccepted || guard.faulted || guard.cancelled || guard.released) return false;
+    for (unsigned axis = 0U; axis < EDM109::AxisCount; ++axis)
+    {
+        const auto& config = guard.config.axis[axis];
+        if (config.configFingerprint != c.configFingerprint[axis] ||
+            config.mappingFingerprint != c.mappingFingerprint[axis] ||
+            !EDM109::SameDouble(config.pulsePerUnit, trigger->line.pulsePerNative[axis])) return false;
+    }
+    return true;
+}
+
+void NCManager::LogEDM110ReceiptSameThread(const EDM110::MotionFeedback& f) const noexcept
+{
+    char record[481]{};
+    const int length = std::snprintf(record, sizeof(record),
+        "[EDM110] event=PHYSICAL_B2_COMPLETE session=%llu triggerStep=%u epoch=%llu segment=%llu dispatch=%llu started=1 completed=1 backwardCrossings=1 forwardCrossings=1 anchorReturned=1 dwells=5 physicalTick=%llu physicalB2=1 anchorProof=COMMAND_EXACT physicalProof=FOLLOWING_WINDOW_200 numericLedger=SEPARATE dischargeCommand=NONE\n",
+        static_cast<unsigned long long>(m_edm94.session), f.trigger.step,
+        static_cast<unsigned long long>(f.trigger.epoch), static_cast<unsigned long long>(f.trigger.segment),
+        static_cast<unsigned long long>(f.trigger.dispatch), static_cast<unsigned long long>(f.lastPhysicalTick));
+    if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM110] event=LOG_FORMAT_ERROR part=PHYSICAL_B2_COMPLETE\n");
+}
+
+bool NCManager::IsEDM110CompleteSameThread(bool log) noexcept
+{
+    const auto& s = m_edm94; auto& c = m_edm109; auto& b = m_edm110;
+    EDM94::Feedback guard{}; EDM96::Feedback gap{};
+    if (!s.gapB2CrossSegment || !s.gapCommonPath || !s.gapFlushProfile || !s.gapFlushParameterized ||
+        s.gapFlushInterruptArm != 0U || !s.latched || s.cancelled || s.resetSeen || s.resetCommitted ||
+        s.releaseRequested || s.rtFaultReported || m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY ||
+        !c.ledger.Valid() || c.ledger.Count() != EDM109::Capacity || c.mappedSegments != EDM109::Capacity ||
+        c.plans != EDM109::Capacity - 1U || c.ledger.FrozenScope().session != s.session ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || !m_motion.ReadEDM110Feedback(b.feedback) ||
+        !m_motion.ReadEDM94Feedback(guard) || !m_motion.ReadEDM96Feedback(gap) ||
+        !IsEDM110ReceiptSameThread(b.feedback, s.gapB2Repeat ? 4U : 2U, guard) ||
+        gap.session != s.session || gap.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        gap.ownerGeneration != s.lease.generation || gap.faulted || gap.reason != EDM96::Reason::None ||
+        !IsEDM97TuningCurrentSameThread(gap) || gap.acceptedSegments != EDM109::Capacity ||
+        gap.completedSegments != EDM109::Capacity || gap.flushStarted != EDM105::ExpectedFlushCycles ||
+        gap.flushCompleted != EDM105::ExpectedFlushCycles) return false;
+    if (s.gapB2Repeat)
+    {
+        const auto& first = b.first; const auto& last = b.feedback;
+        if (!b.firstRetained || !IsEDM110ReceiptSameThread(first, 2U, guard) ||
+            !EDM109::SameScope(first.trigger.scope, last.trigger.scope) ||
+            first.trigger.dispatch >= last.trigger.dispatch || first.trigger.epoch >= last.trigger.epoch ||
+            first.trigger.segment >= last.trigger.segment || first.trigger.sourcePC >= last.trigger.sourcePC ||
+            first.previousCommit >= last.previousCommit ||
+            first.excursion.tick >= last.previousBoundaryTick || first.excursion.tick >= last.excursion.startTick ||
+            first.excursion.nowUs >= last.excursion.startUs ||
+            first.lastPhysicalTick >= last.lastPhysicalTick) return false;
+    }
+    else if (b.firstRetained) return false;
+    b.complete = true;
+    if (log)
+    {
+        if (s.gapB2Repeat) LogEDM110ReceiptSameThread(b.first);
+        LogEDM110ReceiptSameThread(b.feedback);
+        if (s.gapB2Repeat)
+            RtPrintf("[EDM111] event=TWO_B2_COMPLETE build=EDM111 session=%llu triggerSteps=2,4 eventsStarted=2 eventsCompleted=2 dwells=10 distinctCompletedRows=1 physicalProof=FOLLOWING_WINDOW_200 expectedSegments=16 expectedFlushCycles=8 dischargeCommand=NONE\n",
+                static_cast<unsigned long long>(s.session));
+    }
+    return true;
+}
+
+void NCManager::LogEDM110SameThread(const char* event) const noexcept
+{
+    EDM110::MotionFeedback f{};
+    const auto session = static_cast<unsigned long long>(m_edm94.session);
+    if (!m_motion.ReadEDM110Feedback(f) || f.session != m_edm94.session ||
+        f.armEpoch != m_edm94.armEpoch || f.ownerGeneration != m_edm94.lease.generation)
+    {
+        RtPrintf("[EDM110] event=B2_SNAPSHOT result=%.24s session=%llu evidence=UNAVAILABLE authority=NONE\n",
+            event ? event : "UNKNOWN", session);
+        return;
+    }
+    const auto& e = f.excursion; char record[481]{};
+    const int length = std::snprintf(record, sizeof(record),
+        "[EDM110] event=B2_SNAPSHOT result=%.24s session=%llu tick=%llu phase=%s span=%u started=%llu completed=%llu back=%llu forward=%llu anchor=%llu dwells=%u stable=%u fault=%u stopRequested=%u geometryCurrent=%u physicalB2=SNAPSHOT_ONLY authority=NONE\n",
+        event ? event : "UNKNOWN", session, static_cast<unsigned long long>(e.tick), EDM110::PhaseName(e.phase), e.span,
+        static_cast<unsigned long long>(e.started), static_cast<unsigned long long>(e.completed),
+        static_cast<unsigned long long>(e.backwardCrossings), static_cast<unsigned long long>(e.forwardCrossings),
+        static_cast<unsigned long long>(e.anchorReturned), e.completedDwells, e.settledCycles,
+        e.faulted ? 1U : 0U, e.stopRequested ? 1U : 0U, f.geometryCurrent ? 1U : 0U);
+    if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM110] event=LOG_FORMAT_ERROR part=B2_SNAPSHOT\n");
+    const char* reason = "INVALID";
+    switch (e.reason)
+    {
+    case EDM110::Reason::None: reason = "NONE"; break;
+    case EDM110::Reason::Geometry: reason = "GEOMETRY"; break;
+    case EDM110::Reason::Dynamics: reason = "DYNAMICS"; break;
+    case EDM110::Reason::Clock: reason = "CLOCK"; break;
+    case EDM110::Reason::Deadline: reason = "DEADLINE"; break;
+    case EDM110::Reason::Dwell: reason = "DWELL"; break;
+    case EDM110::Reason::Lifecycle: reason = "LIFECYCLE"; break;
+    case EDM110::Reason::StopEnvelope: reason = "STOP_ENVELOPE"; break;
+    }
+    // Separate bounded record: preserve the core cause after cancellation
+    // changes the phase to STOPPED; generic guard IDENTITY is insufficient.
+    const int detailLength = std::snprintf(record, sizeof(record),
+        "[EDM110] event=B2_DETAIL build=FIX1 result=%.24s session=%llu tick=%llu reason=%s startTick=%llu physicalTick=%llu rangeResets=%u authority=NONE\n",
+        event ? event : "UNKNOWN", session, static_cast<unsigned long long>(e.tick), reason,
+        static_cast<unsigned long long>(e.startTick), static_cast<unsigned long long>(f.lastPhysicalTick),
+        f.rangeResets);
+    if (detailLength > 0 && detailLength <= 480 && static_cast<std::size_t>(detailLength) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM110] event=LOG_FORMAT_ERROR part=B2_DETAIL\n");
+    if (m_edm94.gapB2Repeat)
+        RtPrintf("[EDM111] event=B2_PROGRESS build=EDM111 result=%.24s session=%llu repeat=%u triggerStep=%u eventsStarted=%u eventsCompleted=%u firstRetained=%u authority=NONE\n",
+            event ? event : "UNKNOWN", session, f.repeat ? 1U : 0U, f.trigger.step,
+            f.eventsStarted, f.eventsCompleted, m_edm110.firstRetained ? 1U : 0U);
+}
+
+bool NCManager::IsEDM126CurrentSameThread(unsigned completed) const noexcept
+{
+    const auto& s = m_edm94;
+    EDM126::MotionFeedback f{};
+    if (!s.gapHistoryServo || !s.gapPhysicalCurve || !s.gapSegmentProfile || !s.gapGainProfile ||
+        s.gapBoundaryProfile || s.gapNoiseProfile || s.gapBurstProfile || s.gapContinuousProfile ||
+        s.gapEnduranceProfile || s.gapPairedProfile || s.gapFlushProfile || s.gapFlushParameterized ||
+        s.gapCommonPath || s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime ||
+        s.gapCurveB2 || s.gapModeFlush || s.gapModeInterruption || s.gapModeInterruptionArm || s.gapFlushInterruptArm ||
+        s.gapTuning.positiveGain != 8.0 || s.gapTuning.negativeGain != 1.0 || s.gapTuning.deadbandV != 1.0 ||
+        !s.latched || s.armPending || !s.everArmed ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.moves != EDM114::RequiredRows || completed > s.moves ||
+        (s.gapHistoryArm != 158U && s.gapHistoryArm != 160U) ||
+        s.gapModeFixture != (s.gapHistoryArm == 158U ? EDM116::Fixture::ArcPair124 : EDM116::Fixture::ArcPairComplement124) ||
+        s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        !m_motion.ReadEDM126Feedback(f) || !f.enabled || f.faulted || f.reason != EDM126::Reason::None ||
+        f.session != s.session || f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
+        (!s.complete && f.liveEpoch != m_motion.GetCurrentExecutionEpoch()) || f.fixture != (s.gapHistoryArm == 158U ? 0U : 1U) ||
+        f.authorizedRows != completed || f.completedRows != completed || f.rowActive ||
+        f.rowCompleted != (completed != 0U) || !f.tick || !f.nowUs ||
+        !f.sourceReady || f.sourceReason != EDM88::Reason::None || !f.sourceSequence || !f.sourceCapturedUs ||
+        f.nowUs < f.sourceCapturedUs || f.nowUs - f.sourceCapturedUs > EDM126::MaximumSourceAgeUs ||
+        !std::isfinite(f.voltage) || !std::isfinite(f.targetRatio)) return false;
+    const auto& t = f.traversal;
+    if (t.faulted || t.reason != EDM126::Reason::None || t.stopRequested || t.stopped ||
+        t.historyCount > EDM126::HistoryCapacity || t.historyDepth || t.maximumHistoryDepth > EDM126::HistoryCapacity ||
+        t.forwardCrossings > t.backwardCrossings || t.velocityMmSec != 0.0 ||
+        !std::isfinite(t.localMm) || !std::isfinite(t.lengthMm) || !std::isfinite(t.stationMm)) return false;
+    if (!completed)
+        return EDM126::SameSource(f.authorizedSource, EDM126::Source{}) &&
+            EDM126::SameSource(t.authorizedSource, EDM126::Source{}) &&
+            EDM126::SameSource(t.cursorSource, EDM126::Source{}) && !t.historyCount && !t.completedRows &&
+            !t.maximumHistoryDepth && !t.backwardCrossings && !t.forwardCrossings &&
+            !f.lastMappingTick && !f.lastMappingUs;
+    EDM114::Feedback row{};
+    if (!m_motion.ReadEDM114Feedback(row) || !E126Counts(row, completed, s.gapModeFixture) ||
+        row.session != s.session || row.armEpoch != s.armEpoch || row.ownerGeneration != s.lease.generation ||
+        !EDM126::ValidSource(f.authorizedSource) || !EDM114::ValidSource(row.source) ||
+        !EDM109::SameScope(f.authorizedSource.scope, row.source.scope) ||
+        f.authorizedSource.ordinal != completed - 1U || f.authorizedSource.sourcePC != s.pc[completed - 1U] ||
+        f.authorizedSource.dispatch != row.source.dispatch || f.authorizedSource.epoch != row.source.epoch ||
+        f.authorizedSource.segment != row.source.segment || row.source.step != completed - 1U ||
+        row.source.sourcePC != f.authorizedSource.sourcePC || row.source.scope.session != s.session ||
+        row.source.scope.run != s.run || row.source.scope.cache != s.cache ||
+        row.source.scope.ownerGeneration != s.lease.generation ||
+        !EDM126::SameSource(f.authorizedSource, t.authorizedSource) ||
+        !EDM126::SameSource(t.cursorSource, f.authorizedSource) ||
+        !f.lastMappingTick || f.lastMappingTick != row.lastMappingTick ||
+        !f.lastMappingUs || f.lastMappingUs != row.lastMappingUs ||
+        f.lastMappingTick > f.tick || f.lastMappingUs > f.nowUs ||
+        f.authorizedSource.epoch != f.liveEpoch ||
+        t.completedRows != completed - 1U || t.historyCount != completed - 1U ||
+        t.maximumHistoryDepth > completed - 1U || !t.active || t.awaitingCurrent || t.awaitingSeam ||
+        !t.completeReady || t.tick != f.lastMappingTick || t.nowUs != f.lastMappingUs ||
+        t.localMm != t.lengthMm || t.lengthMm <= 0.0 || !t.atCurrentEnd ||
+        !EDM109::SamePulse(t.positionPulse, row.endPulse)) return false;
+    std::uint64_t configTag = 1469598103934665603ULL, mappingTag = configTag;
+    for (unsigned a = 0U; a < 6U; ++a)
+    {
+        const auto& frozen = s.feedback.config.axis[a];
+        if (!EDM109::SameDouble(row.pulsePerNative[a], frozen.pulsePerUnit)) return false;
+        configTag = (configTag ^ frozen.configFingerprint) * 1099511628211ULL;
+        mappingTag = (mappingTag ^ frozen.mappingFingerprint) * 1099511628211ULL;
+    }
+    if (row.source.scope.configTag != (configTag ? configTag : 1ULL) ||
+        row.source.scope.mappingTag != (mappingTag ? mappingTag : 1ULL) ||
+        (!s.complete && (!CoordSys.IsTranslationRunFrozen() || !CoordSys.IsTranslationRunCurrent() ||
+            row.source.scope.translationGeneration != CoordSys.GetTranslationSnapshot().generation))) return false;
+    // M30 deliberately changes the live epoch and releases the frozen frame.
+    // Only the already acknowledged sixteen-row receipt can survive retirement.
+    if (s.complete && (completed != s.moves || m_edm114.acknowledgedRows != completed ||
+        !m_edm114.completionCommit || m_edm114.completionTick < f.lastMappingTick ||
+        !E114SameFeedback(row, m_edm114.retained))) return false;
+    for (unsigned a = 0U; a < 6U; ++a)
+        if (t.velocityPps[a] != 0.0) return false;
+    // The opt-in smoke source requests two history seams on rows 2, 4 and 8.
+    // These are observed crossings, never an NC instruction replay or a motion schedule.
+    const std::uint64_t expectedCrossings = 2ULL * ((completed > 2U ? 1U : 0U) +
+        (completed > 4U ? 1U : 0U) + (completed > 8U ? 1U : 0U));
+    return t.backwardCrossings == expectedCrossings && t.forwardCrossings == expectedCrossings &&
+        t.maximumHistoryDepth == (expectedCrossings ? 2U : 0U);
+}
+
+void NCManager::LogEDM126SameThread(const char* event) const noexcept
+{
+    const auto& s = m_edm94;
+    if (!s.gapHistoryServo) return;
+    EDM126::MotionFeedback f{};
+    const bool read = m_motion.ReadEDM126Feedback(f);
+    char record[481]{};
+    const int length = std::snprintf(record, sizeof(record),
+        "[EDM126] event=%.32s session=%llu armP=%u tick=%llu read=%u authorized=%u completed=%u back=%llu forward=%llu depth=%u maxDepth=%u fault=%u reason=%u dispatchReplay=0 flush=0 nativeArc=G17_XY sixAxis=G01 source=RT_SYNTHETIC dischargeCommand=NONE\n",
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), s.gapHistoryArm,
+        static_cast<unsigned long long>(f.tick), read ? 1U : 0U, f.authorizedRows, f.completedRows,
+        static_cast<unsigned long long>(f.traversal.backwardCrossings), static_cast<unsigned long long>(f.traversal.forwardCrossings),
+        f.traversal.historyDepth, f.traversal.maximumHistoryDepth, f.faulted ? 1U : 0U, static_cast<unsigned>(f.reason));
+    if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM126] event=LOG_FORMAT_ERROR part=HISTORY\n");
+}
+
+bool NCManager::WaitEDM126InitialBoundarySameThread() noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm126;
+    const auto epoch = m_motion.GetCurrentExecutionEpoch();
+    if (!s.gapHistoryServo || !s.gapPhysicalCurve || !s.latched || !s.ready || s.armPending || !s.everArmed ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.finishPending || s.complete || s.next ||
+        m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        epoch != s.armEpoch || !m_motion.IsMotionOwnerLeaseCurrent(s.lease))
+    { RejectEDM94SameThread("EDM126_INITIAL_SCOPE", m_gapDryRun.sourceLine); return false; }
+    EDM94::Feedback guard{};
+    const bool read = m_motion.ReadEDM94Feedback(guard);
+    unsigned flags = 0U;
+    // Publication may be temporarily busy; keep the same bounded wait rather
+    // than treating a missing observer read as a new authorization.
+    if (!IsEDM114CurrentSameThread(0U) || !IsEDM126CurrentSameThread(0U)) flags |= 128U;
+    const bool identity = read && guard.identity.session == s.session && guard.identity.epoch == s.armEpoch &&
+        guard.identity.ownerGeneration == s.lease.generation && guard.currentIdentity.session == s.session &&
+        guard.currentIdentity.epoch == epoch && guard.currentIdentity.ownerGeneration == s.lease.generation;
+    if (!identity) flags |= 1U;
+    if (!read || !guard.active || !guard.armAccepted || !guard.armedReady || guard.forceZero || guard.handoffZero ||
+        guard.faulted || guard.cancelled || guard.finishRequested || guard.released) flags |= 2U;
+    const bool fresh = identity && guard.lastTick != 0ULL && guard.lastTick >= s.lastTick &&
+        guard.lastTick > c.initialBoundaryTick && guard.lastNowUs != 0ULL && guard.lastNowUs > c.initialBoundaryUs;
+    if (!fresh) flags |= 4U;
+    if (!read || guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles || guard.boundaryNotReadyMask) flags |= 8U;
+    if (!m_motion.IsGroupDone() || m_motion.GetCommandIngressSize() || m_motion.GetCommandReplaySize() ||
+        m_motion.GetAxisCommandMailboxDepth() || m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(epoch, s.lease)) flags |= 16U;
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const auto& frozen = s.feedback.config.axis[axis]; const auto& current = guard.config.axis[axis];
+        const auto& observed = guard.axis[axis];
+        const double maxWindow = (axis < 3U ? 0.001 : 0.005) * frozen.pulsePerUnit;
+        const bool config = read && std::isfinite(frozen.pulsePerUnit) && frozen.pulsePerUnit > 0.0 &&
+            std::isfinite(frozen.followingWindowPulse) && frozen.followingWindowPulse > 0.0 &&
+            std::isfinite(maxWindow) && frozen.followingWindowPulse <= maxWindow &&
+            current.pulsePerUnit == frozen.pulsePerUnit && current.followingWindowPulse == frozen.followingWindowPulse &&
+            current.commandAnchor == frozen.commandAnchor && current.actualAnchor == frozen.actualAnchor &&
+            current.hardwareSign == frozen.hardwareSign && current.configFingerprint == frozen.configFingerprint &&
+            current.mappingFingerprint == frozen.mappingFingerprint;
+        if (!config || !std::isfinite(observed.currentCommandPulse) ||
+            !EDM109::SameDouble(observed.currentCommandPulse, frozen.commandAnchor)) flags |= 32U;
+        if (!config || !std::isfinite(observed.currentActualPulse) ||
+            std::fabs(observed.currentActualPulse - frozen.commandAnchor) > frozen.followingWindowPulse) flags |= 64U;
+    }
+    if (fresh) { c.initialBoundaryTick = guard.lastTick; c.initialBoundaryUs = guard.lastNowUs; }
+    const bool ready = flags == 0U;
+    if (!c.initialBoundaryLogged || ready)
+    {
+        RtPrintf("[EDM126] event=INITIAL_BOUNDARY_%s session=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u nextMotionSubmitted=0\n",
+            ready ? "READY" : "WAIT", static_cast<unsigned long long>(s.session),
+            static_cast<unsigned long long>(guard.lastTick), flags, guard.boundaryReadyCycles, EDM94::BoundaryReadyCycles);
+        c.initialBoundaryLogged = true;
+    }
+    if (ready) { c.initialTranslation = CoordSys.GetTranslationSnapshot(); c.initialTranslationValid = true; }
+    c.initialBoundaryReady = ready;
+    return ready;
+}
+
+bool NCManager::WaitEDM116InitialBoundarySameThread() noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm116;
+    const auto epoch = m_motion.GetCurrentExecutionEpoch();
+    if (!s.gapModeFlush || !s.gapPhysicalCurve || !s.latched || !s.ready || s.armPending || !s.everArmed ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.finishPending || s.complete || s.next || c.selected || c.consumed || c.pending ||
+        m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        epoch != s.armEpoch || !m_motion.IsMotionOwnerLeaseCurrent(s.lease))
+    { RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_INITIAL_SCOPE" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_INITIAL_SCOPE" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_INITIAL_SCOPE" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_INITIAL_SCOPE" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_INITIAL_SCOPE" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_INITIAL_SCOPE" : m_edm94.gapModeInterruption ? "EDM118_INITIAL_SCOPE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_INITIAL_SCOPE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_INITIAL_SCOPE" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_INITIAL_SCOPE" : "EDM116_INITIAL_SCOPE"), m_gapDryRun.sourceLine); return false; }
+    // P129/P132 remains the waiting block. A qualified synthetic source alone
+    // cannot authorize the first P131 before the genuine RT incoming dwell.
+    EDM94::Feedback guard{};
+    const bool read = m_motion.ReadEDM94Feedback(guard);
+    unsigned flags = 0U;
+    // Publication may be temporarily busy; keep the same bounded wait rather
+    // than treating a missing observer read as a new authorization.
+    if (!IsEDM114CurrentSameThread(0U) || !IsEDM116CurrentSameThread(0U)) flags |= 128U;
+    const bool identity = read && guard.identity.session == s.session && guard.identity.epoch == s.armEpoch &&
+        guard.identity.ownerGeneration == s.lease.generation && guard.currentIdentity.session == s.session &&
+        guard.currentIdentity.epoch == epoch && guard.currentIdentity.ownerGeneration == s.lease.generation;
+    if (!identity) flags |= 1U;
+    if (!read || !guard.active || !guard.armAccepted || !guard.armedReady || guard.forceZero || guard.handoffZero ||
+        guard.faulted || guard.cancelled || guard.finishRequested || guard.released) flags |= 2U;
+    const bool fresh = identity && guard.lastTick != 0ULL && guard.lastTick >= s.lastTick &&
+        guard.lastTick > c.initialBoundaryTick && guard.lastNowUs != 0ULL && guard.lastNowUs > c.initialBoundaryUs;
+    if (!fresh) flags |= 4U;
+    if (!read || guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles || guard.boundaryNotReadyMask) flags |= 8U;
+    if (!m_motion.IsGroupDone() || m_motion.GetCommandIngressSize() || m_motion.GetCommandReplaySize() ||
+        m_motion.GetAxisCommandMailboxDepth() || m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(epoch, s.lease)) flags |= 16U;
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const auto& frozen = s.feedback.config.axis[axis]; const auto& current = guard.config.axis[axis];
+        const auto& observed = guard.axis[axis];
+        const double maxWindow = (axis < 3U ? 0.001 : 0.005) * frozen.pulsePerUnit;
+        const bool config = read && std::isfinite(frozen.pulsePerUnit) && frozen.pulsePerUnit > 0.0 &&
+            std::isfinite(frozen.followingWindowPulse) && frozen.followingWindowPulse > 0.0 &&
+            std::isfinite(maxWindow) && frozen.followingWindowPulse <= maxWindow &&
+            current.pulsePerUnit == frozen.pulsePerUnit && current.followingWindowPulse == frozen.followingWindowPulse &&
+            current.commandAnchor == frozen.commandAnchor && current.actualAnchor == frozen.actualAnchor &&
+            current.hardwareSign == frozen.hardwareSign && current.configFingerprint == frozen.configFingerprint &&
+            current.mappingFingerprint == frozen.mappingFingerprint;
+        if (!config || !std::isfinite(observed.currentCommandPulse) ||
+            !EDM109::SameDouble(observed.currentCommandPulse, frozen.commandAnchor)) flags |= 32U;
+        if (!config || !std::isfinite(observed.currentActualPulse) ||
+            std::fabs(observed.currentActualPulse - frozen.commandAnchor) > frozen.followingWindowPulse) flags |= 64U;
+    }
+    if (fresh) { c.initialBoundaryTick = guard.lastTick; c.initialBoundaryUs = guard.lastNowUs; }
+    const bool ready = flags == 0U;
+    if (!c.initialBoundaryLogged || ready)
+    {
+        char record[481]{};
+        const int length = std::snprintf(record, sizeof(record),
+            (s.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE profile=PREVIOUS_ARC_RETREAT armP=154\n" : s.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE profile=PREVIOUS_ARC_RETURN armP=156\n" : s.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE profile=B0 armP=146\n" : s.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE profile=B0 armP=142\n" : s.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE profile=B1 armP=148\n" : s.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE profile=B1 armP=144\n" : s.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE\n" : s.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE\n" : s.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE\n" : s.gapModeInterruption ? "[EDM118] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE\n" : s.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE fixture=2\n" : s.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE fixture=3\n" : s.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE\n" : "[EDM116] event=INITIAL_BOUNDARY_%s build=FIX1 session=%llu epoch=%llu tick=%llu flags=%02X rtReadyCycles=%u required=%u rtNotReadyMask=%08X frameFrozen=%u selected=0 consumed=0 nextMotionSubmitted=0 dischargeCommand=NONE\n"),
+            ready ? "READY" : "WAIT", static_cast<unsigned long long>(s.session),
+            static_cast<unsigned long long>(epoch), static_cast<unsigned long long>(guard.lastTick), flags,
+            guard.boundaryReadyCycles, EDM94::BoundaryReadyCycles, guard.boundaryNotReadyMask,
+            CoordSys.IsTranslationRunFrozen() ? 1U : 0U);
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("%s", (s.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY profile=PREVIOUS_ARC_RETREAT armP=154\n" : s.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY profile=PREVIOUS_ARC_RETURN armP=156\n" : s.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY profile=B0 armP=146\n" : s.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY profile=B0 armP=142\n" : s.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY profile=B1 armP=148\n" : s.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY profile=B1 armP=144\n" : s.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY\n" : s.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY\n" : s.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY\n" : s.gapModeInterruption ? "[EDM118] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY\n" : s.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY fixture=2\n" : s.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY fixture=3\n" : s.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY\n" : "[EDM116] event=LOG_FORMAT_ERROR build=FIX1 part=INITIAL_BOUNDARY\n"));
+        c.initialBoundaryLogged = true;
+    }
+    c.initialBoundaryReady = ready;
+    return ready;
+}
+
+bool NCManager::IsEDM116SelectorCurrentSameThread(const NCBlock& block) noexcept
+{
+    const auto& s = m_edm94; const auto& c = m_edm116;
+    const unsigned step = s.next;
+    const int pc = GetActiveDispatchPC();
+    const auto* authored = GetBaseProgramCache().TryGetLine(pc);
+    EDM116::Mode mode{};
+    const NCTranslationSnapshot source = CoordSys.GetTranslationSnapshot();
+    // The first selector precedes the first G01, which alone freezes and
+    // publishes the frame. Admit only this bound, current, unpublished source;
+    // subsequent selectors still require the completed row's frozen frame.
+    const bool translationCurrent = CoordSys.IsTranslationRunFrozen() ?
+        (CoordSys.IsTranslationRunCurrent() && IsFixedTranslationTravelCurrentSameThread() &&
+            IsXYZCUVFeedProfileCurrentSameThread() && m_motion.MatchesNCTranslation(source) &&
+            (!step || source.generation == m_edm114.retained.source.scope.translationGeneration)) :
+        (step == 0U && c.initialBoundaryReady && CoordSys.IsTranslationRunBound() &&
+            CoordSys.IsTranslationAxisIdentityCurrent() && IsNCTranslationSnapshotValid(source) &&
+            source.runToken == s.run && IsNCXYZCUVFeedNeutralFrame(source) && source.distanceMode == 91 &&
+            m_motion.GetActiveTranslationGeneration() == 0ULL);
+    return s.gapModeFlush && EDM116::ValidFixture(s.gapModeFixture) && s.gapPhysicalCurve && !s.gapCurveB2 && s.latched && s.ready &&
+        !s.armPending && s.everArmed && !s.cancelled && !s.resetSeen && !s.resetCommitted &&
+        !s.finishPending && !s.complete && !s.releaseRequested && !s.rtFaultReported &&
+        m_state == NCState::RUN && m_mode == NCOperationMode::MEMORY && !m_isSingleBlockEnabled &&
+        !Close_System_Com_flag && m_externalReadyInterlock &&
+        m_macroStack.empty() && !m_isG66Active && !Homing.IsActive() && !AlarmManager::GetInstance().HasAlarm() &&
+        s.cache == GetBaseProgramCache().GetGeneration() && s.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        step < s.moves && step < EDM114::RequiredRows && pc == s.selectorPC[step] &&
+        (!s.gapModeInterruption || (s.gapModeInterruptionArm == m_edm118.armP &&
+            step <= (EDM125::ValidProfile(EDM125::ProfileForArm(s.gapModeInterruptionArm)) ? EDM125::TargetStep : EDM123::ValidProfile(EDM123::ProfileForArm(s.gapModeInterruptionArm)) ? EDM123::TargetStep(EDM123::ProfileForArm(s.gapModeInterruptionArm)) : EDM122::ValidProfile(EDM122::ProfileForArm(s.gapModeInterruptionArm)) ? EDM122::TargetStep(EDM122::ProfileForArm(s.gapModeInterruptionArm)) : EDM118::TargetStep))) &&
+        c.selected == step && c.consumed == step && !c.pending &&
+        authored && E94Matches(authored->parsedBlock, block) && E116Selector(authored->parsedBlock, mode) &&
+        mode == EDM116::ExpectedMode(step) && IsGapDryRunBlockShapeValid(block) &&
+        !m_pathFeed.pending && !m_pathArc.pending && m_motion.IsGroupDone() &&
+        !m_motion.GetCommandIngressSize() && !m_motion.GetCommandReplaySize() && !m_motion.GetAxisCommandMailboxDepth() &&
+        m_motion.IsMotionOwnerLeaseCurrent(s.lease) && !m_motion.HasPendingSafetyOrRecoveryRequests() &&
+        translationCurrent && (step || c.initialBoundaryReady) && IsPathCoreLiveNativeConfigCurrentSameThread();
+}
+
+bool NCManager::CommitEDM116ModeSameThread(const NCBlock& block) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm116;
+    if (!IsEDM116SelectorCurrentSameThread(block) || !IsEDM114CurrentSameThread(s.next) ||
+        !IsEDM116CurrentSameThread(s.next)) return false;
+    const unsigned step = s.next;
+    EDM94::Feedback guard{};
+    const auto epoch = m_motion.GetCurrentExecutionEpoch();
+    if (!m_currentExecutingBlockDispatchId || m_currentExecutingBlockDispatchId <= s.armDispatch ||
+        (step && (m_currentExecutingBlockDispatchId <= m_edm114.retained.source.dispatch ||
+            !ReadEDM96CompletedSegmentsSameThread(step))) ||
+        !m_motion.ReadEDM94Feedback(guard) || guard.identity.session != s.session ||
+        guard.identity.epoch != s.armEpoch || guard.identity.ownerGeneration != s.lease.generation ||
+        guard.currentIdentity.session != s.session || guard.currentIdentity.epoch != epoch ||
+        guard.currentIdentity.ownerGeneration != s.lease.generation || !guard.active || !guard.armAccepted ||
+        !guard.armedReady || guard.forceZero || guard.handoffZero || guard.faulted || guard.cancelled ||
+        guard.finishRequested || guard.released || !guard.lastTick || !guard.lastNowUs ||
+        guard.lastTick < s.lastTick || guard.lastTick < m_edm114.completionTick ||
+        guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles || guard.boundaryNotReadyMask ||
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(epoch, s.lease)) return false;
+    for (unsigned a = 0U; a < 6U; ++a)
+    {
+        const auto& frozen = s.feedback.config.axis[a]; const auto& current = guard.config.axis[a];
+        const double target = step ? m_edm114.retained.endPulse[a] : frozen.commandAnchor;
+        if (current.configFingerprint != frozen.configFingerprint || current.mappingFingerprint != frozen.mappingFingerprint ||
+            !EDM109::SameDouble(current.pulsePerUnit, frozen.pulsePerUnit) ||
+            !EDM109::SameDouble(guard.axis[a].currentCommandPulse, target)) return false;
+    }
+    EDM116::Policy policy{};
+    if (!EDM116::ParseMode(block.val('B'), policy.mode)) return false;
+    policy.fixture = s.gapModeFixture;
+    policy.profile = s.gapFlushParameters; policy.selectorPC = GetActiveDispatchPC();
+    policy.selectorDispatch = m_currentExecutingBlockDispatchId; policy.revision = step + 1ULL;
+    if (!EDM116::ValidPolicy(policy)) return false;
+    if (!step)
+    {
+        c.initialTranslation = CoordSys.GetTranslationSnapshot();
+        c.initialTranslationValid = true;
+    }
+    c.policies[step] = policy; c.selected = step + 1U; c.pending = true;
+    return true;
+}
+
+bool NCManager::AuthorizeEDM116SameThread(const NCBlock& block, int gcode,
+    const std::array<double, 2U>& center) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm116;
+    if (!s.gapModeFlush || !s.gapPhysicalCurve || s.gapCurveB2 || !s.next || s.next > s.moves) return false;
+    const unsigned step = s.next - 1U; const auto& policy = c.policies[step];
+    if (s.gapModeInterruption && (s.gapModeInterruptionArm != m_edm118.armP ||
+        step > (EDM125::ValidProfile(EDM125::ProfileForArm(s.gapModeInterruptionArm)) ? EDM125::TargetStep : EDM123::ValidProfile(EDM123::ProfileForArm(s.gapModeInterruptionArm)) ? EDM123::TargetStep(EDM123::ProfileForArm(s.gapModeInterruptionArm)) : EDM122::ValidProfile(EDM122::ProfileForArm(s.gapModeInterruptionArm)) ? EDM122::TargetStep(EDM122::ProfileForArm(s.gapModeInterruptionArm)) : EDM118::TargetStep))) return false;
+    if (!c.pending || c.selected != step + 1U || c.consumed != step ||
+        !EDM116::ValidPolicy(policy) || policy.fixture != s.gapModeFixture || policy.mode != EDM116::ExpectedMode(step) ||
+        policy.revision != step + 1ULL || policy.selectorPC != s.selectorPC[step] ||
+        policy.selectorPC >= GetActiveDispatchPC() || policy.selectorDispatch >= m_currentExecutingBlockDispatchId ||
+        !EDM107::SameFlushProfile(policy.profile, s.gapFlushParameters) ||
+        !IsEDM116CurrentSameThread(step) || !BuildEDM116CompletionTokenSameThread(step)) return false;
+    // The ordinary first-feed producer has now frozen/published exactly the
+    // candidate observed by P131. Settings never publish motion authority.
+    if (!step && (!c.initialTranslationValid || !CoordSys.IsTranslationRunFrozen() ||
+        !CoordSys.IsTranslationRunCurrent() || !IsFixedTranslationTravelCurrentSameThread() ||
+        !IsXYZCUVFeedProfileCurrentSameThread() ||
+        !SameNCTranslationSnapshot(c.initialTranslation, CoordSys.GetTranslationSnapshot()) ||
+        !m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot()))) return false;
+    const auto epoch = m_motion.GetCurrentExecutionEpoch();
+    if (!m_motion.AuthorizeEDM116Feed(s.session, s.run, s.cache, m_currentExecutingBlockDispatchId,
+        GetActiveDispatchPC(), step, gcode, s.increment[step], center, block.val('F'),
+        epoch, s.lease, s.gapTuning, s.gapFlushParameters, policy, c.token)) return false;
+    c.issuedDispatch[step] = m_currentExecutingBlockDispatchId;
+    c.issuedEpoch[step] = epoch == (std::numeric_limits<std::uint32_t>::max)() ? 1ULL : epoch + 1ULL;
+    c.pending = false; c.consumed = step + 1U;
+    return true;
+}
+
+bool NCManager::BuildEDM116CompletionTokenSameThread(unsigned step) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm116;
+    c.token = EDM115::CompletionToken{};
+    if (!s.gapModeFlush || !s.gapPhysicalCurve || !s.latched || !s.ready || s.armPending ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.finishPending || s.complete || step >= EDM114::RequiredRows || s.next != step + 1U ||
+        m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || !IsEDM114CurrentSameThread(step) ||
+        !IsEDM116CurrentSameThread(step)) return false;
+    if (!EDM115::IsTriggerStep(step)) return true;
+    const unsigned ordinal = EDM115::EventOrdinal(step), index = ordinal - 1U;
+    const auto& prior = m_edm114.retained;
+    EDM94::Feedback guard{};
+    if (c.retainedEvents != step / 2U || !EDM115::EmptyToken(c.tokens[index]) ||
+        !m_motion.ReadEDM94Feedback(guard) || !ReadEDM96CompletedSegmentsSameThread(step) ||
+        m_edm114.acknowledgedRows != step || !m_edm114.completionTick || !m_edm114.completionCommit ||
+        prior.source.step != step - 1U || prior.source.sourcePC != s.pc[step - 1U] ||
+        prior.source.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        guard.identity.session != s.session || guard.identity.epoch != s.armEpoch ||
+        guard.identity.ownerGeneration != s.lease.generation || guard.currentIdentity.session != s.session ||
+        guard.currentIdentity.epoch != prior.source.epoch || guard.currentIdentity.ownerGeneration != s.lease.generation ||
+        !guard.active || !guard.armAccepted || !guard.armedReady || guard.forceZero || guard.handoffZero ||
+        guard.faulted || guard.cancelled || guard.finishRequested || guard.released ||
+        guard.lastTick < m_edm114.completionTick || guard.lastTick < s.lastTick ||
+        !guard.lastNowUs || guard.lastNowUs < prior.lastMappingUs ||
+        guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles || guard.boundaryNotReadyMask ||
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(prior.source.epoch, s.lease) ||
+        !CoordSys.IsTranslationRunFrozen() || !CoordSys.IsTranslationRunCurrent() ||
+        CoordSys.GetTranslationSnapshot().generation != prior.source.scope.translationGeneration ||
+        !IsXYZCUVFeedProfileCurrentSameThread() || !IsFixedTranslationTravelCurrentSameThread() ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
+    std::uint64_t configTag = 1469598103934665603ULL, mappingTag = configTag;
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const auto& frozen = s.feedback.config.axis[axis]; const auto& observed = guard.config.axis[axis];
+        if (observed.configFingerprint != frozen.configFingerprint || observed.mappingFingerprint != frozen.mappingFingerprint ||
+            !EDM109::SameDouble(observed.pulsePerUnit, prior.pulsePerNative[axis]) ||
+            !EDM109::SameDouble(observed.pulsePerUnit, frozen.pulsePerUnit) ||
+            !EDM109::SameDouble(guard.axis[axis].currentCommandPulse, prior.endPulse[axis])) return false;
+        configTag = (configTag ^ observed.configFingerprint) * 1099511628211ULL;
+        mappingTag = (mappingTag ^ observed.mappingFingerprint) * 1099511628211ULL;
+    }
+    if (prior.source.scope.configTag != (configTag ? configTag : 1ULL) ||
+        prior.source.scope.mappingTag != (mappingTag ? mappingTag : 1ULL)) return false;
+    c.token.previous = prior.source;
+    c.token.completion = EDM109::Completion{m_edm114.completionTick, m_edm114.completionCommit, true};
+    c.token.mappingTick = prior.lastMappingTick; c.token.valid = true;
+    if (!EDM115::ValidToken(c.token, step)) { c.token = EDM115::CompletionToken{}; return false; }
+    c.tokens[index] = c.token; c.previousRows[index] = prior;
+    return true;
+}
+
+bool NCManager::IsEDM116ReceiptSameThread(const EDM116::MotionFeedback& f, unsigned ordinal,
+    const EDM114::Feedback& trigger, std::uint64_t completionTick, std::uint64_t completionUs) const noexcept
+{
+    const auto& s = m_edm94; const auto& c = m_edm116; const auto& e = f.excursion;
+    if (!s.gapModeFlush || !s.gapPhysicalCurve || ordinal == 0U || ordinal > EDM116::ExpectedEvents) return false;
+    const unsigned index = ordinal - 1U, step = index * 2U;
+    const auto& policy = c.policies[step]; const auto mode = EDM116::ExpectedMode(step);
+    const bool b2 = mode == EDM116::Mode::B2;
+    unsigned dwells = 0U; std::array<unsigned, 3U> counts{};
+    for (unsigned row = 0U; row <= step; row += 2U)
+    { const auto selected = EDM116::ExpectedMode(row); ++counts[static_cast<unsigned>(selected)]; dwells += EDM116::DwellCount(selected); }
+    if (!EDM116::ValidPolicy(policy) || policy.fixture != s.gapModeFixture || f.fixture != s.gapModeFixture ||
+        policy.mode != mode || !EDM116::SamePolicy(f.policy, policy) ||
+        !EDM116::SamePolicy(f.rowPolicy, policy) || !EDM116::PolicyMatchesSource(policy, f.trigger) ||
+        policy.selectorPC != s.selectorPC[step] || !EDM107::SameFlushProfile(policy.profile, s.gapFlushParameters) ||
+        !E114Counts(trigger, step + 1U, s.gapModeFixture) || !EDM114::SameSource(f.trigger, trigger.source) ||
+        !EDM114::SameSource(f.rowSource, trigger.source) ||
+        f.trigger.scope.session != s.session || f.trigger.scope.run != s.run || f.trigger.scope.cache != s.cache ||
+        f.trigger.scope.ownerGeneration != s.lease.generation || f.trigger.step != step || f.trigger.sourcePC != s.pc[step] ||
+        !f.enabled || !f.tokenValidated || !f.geometryCurrent || f.session != s.session ||
+        f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
+        f.authorizedRows != step + 1U || f.completedRows != step + 1U ||
+        f.eventsStarted != ordinal || f.eventsCompleted != ordinal || f.completedDwellsTotal != dwells ||
+        f.anchorReturnsTotal != ordinal || f.modeStarted != counts || f.modeCompleted != counts ||
+        f.currentKind != trigger.kind || !E115AnchorMatches(trigger, f.anchorQ, f.anchorPulse) ||
+        !EDM109::SamePulse(f.anchorPulse, f.returnedPulse) ||
+        !e.geometryValid || !e.complete || e.phase != EDM116::Phase::Complete || e.reason != EDM116::Reason::None ||
+        !e.endpointReady || e.active || e.moving || e.faulted || e.stopRequested || e.stopped ||
+        e.started != 1ULL || e.completed != 1ULL || e.anchorReturned != 1ULL ||
+        e.completedDwells != EDM116::DwellCount(mode) || e.settledCycles < EDM116::RequiredSettledCycles ||
+        !EDM109::SameDouble(e.progress, e.length) || !std::isfinite(e.length) || e.length <= 0.0 || e.v != 0.0 || e.a != 0.0 ||
+        !std::isfinite(e.maximumVelocity) || e.maximumVelocity <= 0.0 ||
+        !std::isfinite(e.acceleration) || e.acceleration <= 0.0 || !std::isfinite(e.deceleration) || e.deceleration <= 0.0 ||
+        f.deadlineUs != EDM116::DeadlineUs(mode) || !e.startTick || !e.startUs ||
+        e.tick <= e.startTick || e.nowUs <= e.startUs || e.nowUs - e.startUs >= f.deadlineUs ||
+        e.tick - e.startTick >= f.deadlineUs / 250ULL || !f.lastPhysicalTick ||
+        f.lastPhysicalTick < e.startTick || f.lastPhysicalTick >= e.tick || e.tick - f.lastPhysicalTick != 1ULL ||
+        trigger.lastMappingTick <= e.tick || trigger.lastMappingUs <= e.nowUs ||
+        completionTick < trigger.lastMappingTick || completionUs < trigger.lastMappingUs) return false;
+    if (b2)
+    {
+        const unsigned b2Index = EDM115::EventOrdinal(step) - 1U;
+        if (b2Index >= 2U) return false;
+        const auto& token = c.tokens[b2Index]; const auto& previous = c.previousRows[b2Index];
+        if (!EDM115::ValidToken(token, step) || !EDM115::SameToken(f.previous, token) ||
+            !E114Counts(previous, step, s.gapModeFixture) || !EDM114::SameSource(token.previous, previous.source) ||
+            !EDM109::SameScope(previous.source.scope, trigger.source.scope) ||
+            previous.source.sourcePC != s.pc[step - 1U] ||
+            f.trigger.dispatch <= previous.source.dispatch || f.trigger.epoch <= previous.source.epoch ||
+            f.trigger.segment <= previous.source.segment || f.trigger.sourcePC <= previous.source.sourcePC ||
+            token.mappingTick != previous.lastMappingTick || token.completion.tick < previous.lastMappingTick ||
+            f.previousBoundaryTick != token.completion.tick || f.previousCommit != token.completion.commit ||
+            f.previousKind != previous.kind ||
+            (f.currentKind == f.previousKind && !(EDM116::IsArcPairFixture(s.gapModeFixture) &&
+                step == 4U && f.currentKind == EDM114::Kind::Arc && f.previousKind == EDM114::Kind::Arc)) ||
+            !EDM109::SamePulse(previous.endPulse, trigger.startPulse) ||
+            !EDM109::SamePulse(previous.pulsePerNative, trigger.pulsePerNative) ||
+            e.span != 3U || e.direction != 1 || e.rowKind != trigger.kind ||
+            e.backwardCrossings != 1ULL || e.forwardCrossings != 1ULL ||
+            !EDM109::SameDouble(e.q, f.anchorQ) || !EDM109::SameDouble(e.length, f.anchorQ) ||
+            e.startTick <= token.completion.tick || e.startUs <= previous.lastMappingUs ||
+            f.lastPhysicalTick <= token.completion.tick ||
+            !E115AnchorMatches(previous, previous.pulseLength * (1.0 - EDM115::PreviousRetreatFraction), f.retreatPulse)) return false;
+        double nativeLength = 0.0;
+        if (previous.kind == EDM114::Kind::Arc) nativeLength = previous.pulseLength / previous.pulsePerNative[0];
+        else for (unsigned a = 0U; a < 3U; ++a)
+            nativeLength = std::hypot(nativeLength, (previous.endPulse[a] - previous.startPulse[a]) / previous.pulsePerNative[a]);
+        if (!EDM109::SameDouble(f.strokeNativeMm, nativeLength * EDM115::PreviousRetreatFraction) ||
+            f.topDwellTicks || f.topDwellUs || f.returnDwellTicks || f.returnDwellUs ||
+            f.topSettledCycles || f.returnSettledCycles) return false;
+    }
+    else
+    {
+        EDM116::Point retreat{}; double stroke = 0.0;
+        if (!EDM115::EmptyToken(f.previous) || f.previousBoundaryTick || f.previousCommit || f.previousKind != EDM114::Kind::None ||
+            e.span != 1U || e.direction != -1 || e.rowKind != EDM114::Kind::Line || e.q != 0.0 ||
+            e.backwardCrossings || e.forwardCrossings ||
+            !EDM116::ComputeRetreat(trigger, f.anchorPulse, f.anchorQ, mode, policy.profile.strokeRatio, retreat, stroke) ||
+            !EDM109::SameDouble(stroke, f.strokeNativeMm) || !EDM109::SamePulse(retreat, f.retreatPulse) ||
+            f.topDwellTicks < EDM107::FlushDwellTicks(policy.profile) || f.topDwellUs < policy.profile.dwellUs ||
+            f.returnDwellTicks < EDM107::FlushDwellTicks(policy.profile) || f.returnDwellUs < policy.profile.dwellUs ||
+            f.topDwellTicks >= e.tick - e.startTick || f.returnDwellTicks >= e.tick - e.startTick ||
+            f.topDwellUs >= e.nowUs - e.startUs || f.returnDwellUs >= e.nowUs - e.startUs ||
+            f.topSettledCycles < EDM116::RequiredSettledCycles || f.returnSettledCycles < EDM116::RequiredSettledCycles)
+            return false;
+    }
+    return true;
+}
+
+bool NCManager::IsEDM116CurrentSameThread(unsigned completed) noexcept
+{
+    const auto& s = m_edm94; auto& c = m_edm116;
+    if (!s.gapModeFlush || !s.gapPhysicalCurve || s.gapCurveB2 || !s.gapFlushProfile || !s.gapFlushParameterized ||
+        s.gapCommonPath || s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime ||
+        s.gapFlushInterruptArm || !s.latched || s.armPending || !s.everArmed || !s.armEpoch ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.moves != EDM114::RequiredRows || completed > s.moves || m_edm114.acknowledgedRows != completed ||
+        c.acknowledgedRows != completed || c.consumed != completed || c.selected != completed + (c.pending ? 1U : 0U) || c.selected > s.moves ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !m_motion.ReadEDM116Feedback(c.feedback)) return false;
+    const auto& f = c.feedback; const auto& e = f.excursion;
+    if (e.faulted && !c.failureLogged) { c.failureLogged = true; LogEDM116SameThread("MODE_FLUSH_FAIL"); }
+    const unsigned expected = (completed + 1U) / 2U;
+    unsigned dwells = 0U; std::array<unsigned, 3U> counts{};
+    for (unsigned row = 0U; row < completed; row += 2U)
+    { const auto mode = EDM116::ExpectedMode(row); ++counts[static_cast<unsigned>(mode)]; dwells += EDM116::DwellCount(mode); }
+    if (!EDM116::ValidFixture(s.gapModeFixture) || f.fixture != s.gapModeFixture ||
+        !f.enabled || f.session != s.session || f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
+        e.faulted || e.stopRequested || e.stopped || e.active || e.moving || e.reason != EDM116::Reason::None ||
+        c.retainedEvents != expected || f.eventsStarted != expected || f.eventsCompleted != expected ||
+        f.authorizedRows != completed || f.completedRows != completed ||
+        f.completedDwellsTotal != dwells || f.anchorReturnsTotal != expected || f.modeStarted != counts || f.modeCompleted != counts)
+        return false;
+    for (unsigned row = 0U; row < c.selected; ++row)
+    {
+        const auto& policy = c.policies[row];
+        if (!EDM116::ValidPolicy(policy) || policy.fixture != s.gapModeFixture || policy.mode != EDM116::ExpectedMode(row) || policy.revision != row + 1ULL ||
+            policy.selectorPC != s.selectorPC[row] || policy.selectorPC >= s.pc[row] || policy.selectorDispatch <= s.armDispatch ||
+            !EDM107::SameFlushProfile(policy.profile, s.gapFlushParameters) ||
+            (row && policy.selectorDispatch <= c.policies[row - 1U].selectorDispatch)) return false;
+    }
+    if (completed == 0U)
+    {
+        if (!EDM115::EmptyToken(f.previous) || !EDM114::SameSource(f.trigger, EDM114::Source{}) ||
+            !EDM114::SameSource(f.rowSource, EDM114::Source{}) || !E115SameExcursion(e, EDM116::Feedback{}) ||
+            !EDM116::SamePolicy(f.policy, EDM116::Policy{}) || !EDM116::SamePolicy(f.rowPolicy, EDM116::Policy{}) ||
+            f.tokenValidated || f.geometryCurrent || f.currentKind != EDM114::Kind::None || f.previousKind != EDM114::Kind::None ||
+            f.anchorQ != 0.0 || f.strokeNativeMm != 0.0 || f.deadlineUs || f.previousBoundaryTick || f.previousCommit ||
+            f.lastPhysicalTick || f.rangeResets || f.topDwellTicks || f.topDwellUs || f.returnDwellTicks || f.returnDwellUs ||
+            f.topSettledCycles || f.returnSettledCycles) return false;
+        for (unsigned a = 0U; a < 6U; ++a)
+            if (f.anchorPulse[a] != 0.0 || f.returnedPulse[a] != 0.0 || f.retreatPulse[a] != 0.0) return false;
+        return true;
+    }
+    for (unsigned row = 0U; row < completed; ++row)
+    {
+        const auto& source = c.completedSources[row];
+        if (!EDM116::SamePolicy(c.completedPolicies[row], c.policies[row]) ||
+            !EDM116::PolicyMatchesSource(c.completedPolicies[row], source) || source.step != row ||
+            source.sourcePC != s.pc[row] || !c.issuedDispatch[row] || !c.issuedEpoch[row] ||
+            source.dispatch != c.issuedDispatch[row] || source.epoch != c.issuedEpoch[row] ||
+            !EDM109::SameScope(source.scope, m_edm114.retained.source.scope) ||
+            (row && (source.dispatch <= c.completedSources[row - 1U].dispatch ||
+                source.epoch <= c.completedSources[row - 1U].epoch || source.segment <= c.completedSources[row - 1U].segment ||
+                c.completedPolicies[row].selectorDispatch <= c.completedSources[row - 1U].dispatch)) ||
+            (!(row & 1U) && !EDM114::SameSource(source, c.receipts[row / 2U].trigger))) return false;
+    }
+    if (!EDM114::SameSource(f.rowSource, m_edm114.retained.source) ||
+        !EDM114::SameSource(f.rowSource, c.completedSources[completed - 1U]) ||
+        !EDM116::SamePolicy(f.rowPolicy, c.policies[completed - 1U]) ||
+        !EDM116::PolicyMatchesSource(f.rowPolicy, f.rowSource) ||
+        !E116SameEvent(f, c.receipts[expected - 1U])) return false;
+    for (unsigned index = 0U; index < expected; ++index)
+    {
+        if (!c.completionCommit[index] || !IsEDM116ReceiptSameThread(c.receipts[index], index + 1U,
+                c.triggerRows[index], c.completionTick[index], c.completionUs[index]) ||
+            !EDM109::SameScope(m_edm114.retained.source.scope, c.triggerRows[index].source.scope)) return false;
+        if (index)
+        {
+            const auto& prior = c.receipts[index - 1U]; const auto& current = c.receipts[index];
+            if (prior.trigger.dispatch >= current.policy.selectorDispatch || prior.trigger.epoch >= current.trigger.epoch ||
+                prior.trigger.segment >= current.trigger.segment || prior.trigger.sourcePC >= current.policy.selectorPC ||
+                c.completionCommit[index - 1U] >= c.completionCommit[index] ||
+                c.completionTick[index - 1U] >= current.excursion.startTick ||
+                c.completionUs[index - 1U] >= current.excursion.startUs ||
+                prior.excursion.tick >= current.excursion.startTick || prior.lastPhysicalTick >= current.lastPhysicalTick)
+                return false;
+        }
+    }
+    return true;
+}
+
+bool NCManager::RetainEDM116CompletedSameThread(const EDM94::Feedback& guard) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm116;
+    if (!s.gapModeFlush || !s.gapPhysicalCurve || !s.latched || !s.ready || s.armPending || s.cancelled ||
+        s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported || s.finishPending || s.complete ||
+        s.next == 0U || s.next > s.moves || c.pending || c.selected != s.next || c.consumed != s.next ||
+        !IsEDM114CurrentSameThread(s.next)) return false;
+    if (c.acknowledgedRows == s.next) return IsEDM116CurrentSameThread(s.next);
+    const unsigned step = s.next - 1U; const bool event = EDM116::IsTriggerStep(step);
+    const unsigned ordinal = (step + 2U) / 2U, index = ordinal - 1U;
+    EDM96::Feedback gap{};
+    if (c.acknowledgedRows + 1U != s.next || c.retainedEvents != (event ? index : ordinal) ||
+        !m_motion.ReadEDM116Feedback(c.feedback) || c.feedback.fixture != s.gapModeFixture ||
+        !m_motion.ReadEDM96Feedback(gap) || !ReadEDM96CompletedSegmentsSameThread(s.next) ||
+        !EDM114::SameSource(c.feedback.rowSource, m_edm114.retained.source) ||
+        !EDM116::SamePolicy(c.feedback.rowPolicy, c.policies[step]) ||
+        !EDM116::PolicyMatchesSource(c.feedback.rowPolicy, c.feedback.rowSource) ||
+        c.feedback.authorizedRows != s.next || c.feedback.completedRows != s.next ||
+        guard.identity.session != s.session || guard.identity.epoch != s.armEpoch ||
+        guard.identity.ownerGeneration != s.lease.generation || guard.currentIdentity.session != s.session ||
+        guard.currentIdentity.epoch != m_edm114.retained.source.epoch || guard.currentIdentity.ownerGeneration != s.lease.generation ||
+        guard.lastTick != m_edm114.completionTick || guard.lastNowUs < m_edm114.retained.lastMappingUs ||
+        guard.faulted || guard.cancelled || guard.forceZero || guard.handoffZero || !guard.active ||
+        !guard.armAccepted || !guard.armedReady || guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles ||
+        guard.boundaryNotReadyMask || gap.session != s.session || gap.ownerGeneration != s.lease.generation ||
+        gap.epoch != m_edm114.retained.source.epoch || gap.expectedStep != s.next) return false;
+    if (event)
+    {
+        if (gap.flushAnchor != c.feedback.anchorQ || gap.flushReturned != c.feedback.anchorQ ||
+            !IsEDM116ReceiptSameThread(c.feedback, ordinal, m_edm114.retained, guard.lastTick, guard.lastNowUs)) return false;
+        c.receipts[index] = c.feedback; c.triggerRows[index] = m_edm114.retained;
+        c.completionTick[index] = m_edm114.completionTick; c.completionCommit[index] = m_edm114.completionCommit;
+        c.completionUs[index] = guard.lastNowUs; c.retainedEvents = ordinal;
+    }
+    c.completedPolicies[step] = c.feedback.rowPolicy; c.completedSources[step] = c.feedback.rowSource;
+    c.acknowledgedRows = s.next;
+    if (!IsEDM116CurrentSameThread(s.next)) return false;
+    if (event) LogEDM116SameThread("MODE_EVENT_RETAINED");
+    return true;
+}
+
+void NCManager::LogEDM116SameThread(const char* event) const noexcept
+{
+    const auto& s = m_edm94; const auto& c = m_edm116;
+    const bool failure = event && std::strcmp(event, "MODE_FLUSH_FAIL") == 0;
+    const auto& f = failure || !c.retainedEvents ? c.feedback : c.receipts[(std::min)(c.retainedEvents, 8U) - 1U];
+    char record[481]{};
+    const auto emit = [&](int length) noexcept
+    {
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+        { if (RtPrintf("%s", record) < 0) RtPrintf("%s", (s.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=LOG_WRITE_ERROR profile=PREVIOUS_ARC_RETREAT armP=154\n" : s.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=LOG_WRITE_ERROR profile=PREVIOUS_ARC_RETURN armP=156\n" : s.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=LOG_WRITE_ERROR profile=B0 armP=146\n" : s.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=LOG_WRITE_ERROR profile=B0 armP=142\n" : s.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=LOG_WRITE_ERROR profile=B1 armP=148\n" : s.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=LOG_WRITE_ERROR profile=B1 armP=144\n" : s.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=LOG_WRITE_ERROR\n" : s.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=LOG_WRITE_ERROR\n" : s.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=LOG_WRITE_ERROR\n" : s.gapModeInterruption ? "[EDM118] event=LOG_WRITE_ERROR\n" : s.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=LOG_WRITE_ERROR fixture=2\n" : s.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=LOG_WRITE_ERROR fixture=3\n" : s.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=LOG_WRITE_ERROR\n" : "[EDM116] event=LOG_WRITE_ERROR\n")); }
+        else RtPrintf("%s", (s.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=LOG_FORMAT_ERROR profile=PREVIOUS_ARC_RETREAT armP=154\n" : s.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=LOG_FORMAT_ERROR profile=PREVIOUS_ARC_RETURN armP=156\n" : s.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=LOG_FORMAT_ERROR profile=B0 armP=146\n" : s.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=LOG_FORMAT_ERROR profile=B0 armP=142\n" : s.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=LOG_FORMAT_ERROR profile=B1 armP=148\n" : s.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=LOG_FORMAT_ERROR profile=B1 armP=144\n" : s.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=LOG_FORMAT_ERROR\n" : s.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=LOG_FORMAT_ERROR\n" : s.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=LOG_FORMAT_ERROR\n" : s.gapModeInterruption ? "[EDM118] event=LOG_FORMAT_ERROR\n" : s.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=LOG_FORMAT_ERROR fixture=2\n" : s.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=LOG_FORMAT_ERROR fixture=3\n" : s.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=LOG_FORMAT_ERROR\n" : "[EDM116] event=LOG_FORMAT_ERROR\n"));
+    };
+    emit(std::snprintf(record, sizeof(record),
+        (s.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=%.28s session=%llu P=154 finishP=155 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE profile=PREVIOUS_ARC_RETREAT armP=154\n" : s.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=%.28s session=%llu P=156 finishP=157 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE profile=PREVIOUS_ARC_RETURN armP=156\n" : s.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=%.28s session=%llu P=146 finishP=147 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE profile=B0 armP=146\n" : s.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=%.28s session=%llu P=142 finishP=143 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE profile=B0 armP=142\n" : s.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=%.28s session=%llu P=148 finishP=149 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE profile=B1 armP=148\n" : s.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=%.28s session=%llu P=144 finishP=145 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE profile=B1 armP=144\n" : s.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=%.28s session=%llu P=140 finishP=141 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE\n" : s.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=%.28s session=%llu P=138 finishP=139 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE\n" : s.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=%.28s session=%llu P=136 finishP=137 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE\n" : s.gapModeInterruption ? "[EDM118] event=%.28s session=%llu P=134 finishP=135 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE\n" : s.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=%.28s session=%llu P=150 finishP=151 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE fixture=2\n" : s.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=%.28s session=%llu P=152 finishP=153 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE fixture=3\n" : s.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=%.28s session=%llu P=132 finishP=133 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE\n" : "[EDM116] event=%.28s session=%llu P=129 finishP=130 selected=%u consumed=%u events=%u/%u B0=%u B1=%u B2=%u dwells=%u anchors=%u normalRows=%u line=%u arc=%u CW=%u CCW=%u expectedEvents=8 expectedDwells=28 gap=RT_SYNTHETIC dischargeCommand=NONE\n"),
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), c.selected, c.consumed,
+        f.eventsStarted, f.eventsCompleted, f.modeCompleted[0], f.modeCompleted[1], f.modeCompleted[2],
+        f.completedDwellsTotal, f.anchorReturnsTotal, m_edm114.acknowledgedRows,
+        m_edm114.retained.lineRows, m_edm114.retained.arcRows, m_edm114.retained.cwRows, m_edm114.retained.ccwRows));
+    const unsigned count = failure ? 1U : (std::min)(c.retainedEvents, 8U);
+    for (unsigned i = 0U; i < count; ++i)
+    {
+        const auto& r = failure ? c.feedback : c.receipts[i]; const auto& e = r.excursion;
+        emit(std::snprintf(record, sizeof(record),
+            (s.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu profile=PREVIOUS_ARC_RETREAT armP=154\n" : s.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu profile=PREVIOUS_ARC_RETURN armP=156\n" : s.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu profile=B0 armP=146\n" : s.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu profile=B0 armP=142\n" : s.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu profile=B1 armP=148\n" : s.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu profile=B1 armP=144\n" : s.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu\n" : s.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu\n" : s.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu\n" : s.gapModeInterruption ? "[EDM118] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu\n" : s.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu fixture=2\n" : s.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu fixture=3\n" : s.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu\n" : "[EDM116] event=MODE_SOURCE result=%.28s session=%llu step=%u mode=%u selectorPC=%d selectorDispatch=%llu revision=%llu sourcePC=%d dispatch=%llu epoch=%llu currentKind=%u previousKind=%u previousCommit=%llu\n"),
+            event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), r.trigger.step, static_cast<unsigned>(r.policy.mode),
+            r.policy.selectorPC, static_cast<unsigned long long>(r.policy.selectorDispatch), static_cast<unsigned long long>(r.policy.revision),
+            r.trigger.sourcePC, static_cast<unsigned long long>(r.trigger.dispatch), static_cast<unsigned long long>(r.trigger.epoch),
+            static_cast<unsigned>(r.currentKind), static_cast<unsigned>(r.previousKind), static_cast<unsigned long long>(r.previousCommit)));
+        emit(std::snprintf(record, sizeof(record),
+            (s.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s profile=PREVIOUS_ARC_RETREAT armP=154\n" : s.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s profile=PREVIOUS_ARC_RETURN armP=156\n" : s.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s profile=B0 armP=146\n" : s.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s profile=B0 armP=142\n" : s.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s profile=B1 armP=148\n" : s.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s profile=B1 armP=144\n" : s.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s\n" : s.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s\n" : s.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s\n" : s.gapModeInterruption ? "[EDM118] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s\n" : s.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s fixture=2\n" : s.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s fixture=3\n" : s.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s\n" : "[EDM116] event=MODE_PROOF session=%llu step=%u mode=%u dwells=%u settled=%u back=%llu forward=%llu returned=%llu anchorQ=%.12g strokeMm=%.12g topDwellUs=%llu returnDwellUs=%llu phase=%u reason=%u physicalTick=%llu endTick=%llu proof=%s\n"),
+            static_cast<unsigned long long>(s.session), r.trigger.step, static_cast<unsigned>(r.policy.mode), e.completedDwells, e.settledCycles,
+            static_cast<unsigned long long>(e.backwardCrossings), static_cast<unsigned long long>(e.forwardCrossings),
+            static_cast<unsigned long long>(e.anchorReturned), r.anchorQ, r.strokeNativeMm,
+            static_cast<unsigned long long>(r.topDwellUs), static_cast<unsigned long long>(r.returnDwellUs),
+            static_cast<unsigned>(e.phase), static_cast<unsigned>(e.reason), static_cast<unsigned long long>(r.lastPhysicalTick),
+            static_cast<unsigned long long>(e.tick), failure ? "INCOMPLETE" : "CANONICAL_ANCHOR_AND_FOLLOWING_200"));
+    }
+}
+
+bool NCManager::BuildEDM115CompletionTokenSameThread(unsigned step) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm115;
+    c.token = EDM115::CompletionToken{};
+    if (!s.gapCurveB2 || !s.gapPhysicalCurve || !s.latched || !s.ready || s.armPending ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.finishPending || s.complete || step >= EDM114::RequiredRows || s.next != step + 1U ||
+        m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || !IsEDM114CurrentSameThread(step) ||
+        !IsEDM115CurrentSameThread(step)) return false;
+    if (!EDM115::IsTriggerStep(step)) return true;
+    const unsigned ordinal = EDM115::EventOrdinal(step), index = ordinal - 1U;
+    const auto& prior = m_edm114.retained;
+    EDM94::Feedback guard{};
+    if (c.retainedEvents != index || !EDM115::EmptyToken(c.tokens[index]) ||
+        !m_motion.ReadEDM94Feedback(guard) || !ReadEDM96CompletedSegmentsSameThread(step) ||
+        m_edm114.acknowledgedRows != step || !m_edm114.completionTick || !m_edm114.completionCommit ||
+        prior.source.step != step - 1U || prior.source.sourcePC != s.pc[step - 1U] ||
+        prior.source.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        guard.identity.session != s.session || guard.identity.epoch != s.armEpoch ||
+        guard.identity.ownerGeneration != s.lease.generation || guard.currentIdentity.session != s.session ||
+        guard.currentIdentity.epoch != prior.source.epoch || guard.currentIdentity.ownerGeneration != s.lease.generation ||
+        !guard.active || !guard.armAccepted || !guard.armedReady || guard.forceZero || guard.handoffZero ||
+        guard.faulted || guard.cancelled || guard.finishRequested || guard.released ||
+        guard.lastTick < m_edm114.completionTick || guard.lastTick < s.lastTick ||
+        !guard.lastNowUs || guard.lastNowUs < prior.lastMappingUs ||
+        guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles || guard.boundaryNotReadyMask ||
+        !m_motion.HasExactProgramStartQuiescenceAcknowledgement(prior.source.epoch, s.lease) ||
+        !CoordSys.IsTranslationRunFrozen() || !CoordSys.IsTranslationRunCurrent() ||
+        CoordSys.GetTranslationSnapshot().generation != prior.source.scope.translationGeneration ||
+        !IsXYZCUVFeedProfileCurrentSameThread() || !IsFixedTranslationTravelCurrentSameThread() ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
+    std::uint64_t configTag = 1469598103934665603ULL, mappingTag = configTag;
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const auto& frozen = s.feedback.config.axis[axis]; const auto& observed = guard.config.axis[axis];
+        if (observed.configFingerprint != frozen.configFingerprint || observed.mappingFingerprint != frozen.mappingFingerprint ||
+            !EDM109::SameDouble(observed.pulsePerUnit, prior.pulsePerNative[axis]) ||
+            !EDM109::SameDouble(observed.pulsePerUnit, frozen.pulsePerUnit) ||
+            !EDM109::SameDouble(guard.axis[axis].currentCommandPulse, prior.endPulse[axis])) return false;
+        configTag = (configTag ^ observed.configFingerprint) * 1099511628211ULL;
+        mappingTag = (mappingTag ^ observed.mappingFingerprint) * 1099511628211ULL;
+    }
+    if (prior.source.scope.configTag != (configTag ? configTag : 1ULL) ||
+        prior.source.scope.mappingTag != (mappingTag ? mappingTag : 1ULL)) return false;
+    c.token.previous = prior.source;
+    c.token.completion = EDM109::Completion{m_edm114.completionTick, m_edm114.completionCommit, true};
+    c.token.mappingTick = prior.lastMappingTick; c.token.valid = true;
+    if (!EDM115::ValidToken(c.token, step)) { c.token = EDM115::CompletionToken{}; return false; }
+    c.tokens[index] = c.token; c.previousRows[index] = prior;
+    return true;
+}
+
+bool NCManager::IsEDM115ReceiptSameThread(const EDM115::MotionFeedback& f, unsigned ordinal,
+    const EDM114::Feedback& trigger, std::uint64_t completionTick, std::uint64_t completionUs) const noexcept
+{
+    const auto& s = m_edm94; const auto& c = m_edm115; const auto& e = f.excursion;
+    if (!s.gapCurveB2 || !s.gapPhysicalCurve || ordinal == 0U || ordinal > EDM115::ExpectedEvents) return false;
+    const unsigned index = ordinal - 1U, step = ordinal == 1U ? 2U : 4U;
+    const auto& token = c.tokens[index]; const auto& previous = c.previousRows[index];
+    if (!EDM115::ValidToken(token, step) || !EDM115::SameToken(f.previous, token) ||
+        !E114Counts(previous, step) || !E114Counts(trigger, step + 1U) ||
+        !EDM114::SameSource(token.previous, previous.source) || !EDM114::SameSource(f.trigger, trigger.source) ||
+        !EDM114::ValidSource(f.trigger) || !EDM109::SameScope(previous.source.scope, trigger.source.scope) ||
+        f.trigger.scope.session != s.session || f.trigger.scope.run != s.run || f.trigger.scope.cache != s.cache ||
+        f.trigger.scope.ownerGeneration != s.lease.generation || f.trigger.step != step ||
+        f.trigger.sourcePC != s.pc[step] || previous.source.sourcePC != s.pc[step - 1U] ||
+        f.trigger.dispatch <= previous.source.dispatch || f.trigger.epoch <= previous.source.epoch ||
+        f.trigger.segment <= previous.source.segment || f.trigger.sourcePC <= previous.source.sourcePC ||
+        token.mappingTick != previous.lastMappingTick || token.completion.tick < previous.lastMappingTick ||
+        !f.enabled || !f.tokenValidated || !f.geometryCurrent ||
+        f.session != s.session || f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
+        f.previousBoundaryTick != token.completion.tick || f.previousCommit != token.completion.commit ||
+        f.eventsStarted != ordinal || f.eventsCompleted != ordinal ||
+        f.completedDwellsTotal != 5U * ordinal || f.anchorReturnsTotal != ordinal ||
+        f.currentKind != trigger.kind || f.previousKind != previous.kind ||
+        f.currentKind != (ordinal == 1U ? EDM114::Kind::Arc : EDM114::Kind::Line) ||
+        f.previousKind != (ordinal == 1U ? EDM114::Kind::Line : EDM114::Kind::Arc) ||
+        !EDM109::SamePulse(previous.endPulse, trigger.startPulse) ||
+        !EDM109::SamePulse(previous.pulsePerNative, trigger.pulsePerNative) ||
+        !E115AnchorMatches(trigger, f.anchorQ, f.anchorPulse) || !EDM109::SamePulse(f.anchorPulse, f.returnedPulse) ||
+        !e.geometryValid || !e.complete || e.phase != EDM115::Phase::Complete || e.reason != EDM115::Reason::None ||
+        !e.endpointReady || e.span != 3U || e.active || e.moving || e.faulted || e.stopRequested || e.stopped ||
+        e.started != 1ULL || e.completed != 1ULL || e.backwardCrossings != 1ULL ||
+        e.forwardCrossings != 1ULL || e.anchorReturned != 1ULL || e.completedDwells != 5U ||
+        e.settledCycles < EDM115::RequiredSettledCycles || e.rowKind != f.currentKind || e.direction != 1 ||
+        !EDM109::SameDouble(e.q, f.anchorQ) || !EDM109::SameDouble(e.progress, e.length) ||
+        !EDM109::SameDouble(e.length, f.anchorQ) || e.v != 0.0 || e.a != 0.0 ||
+        !std::isfinite(e.maximumVelocity) || e.maximumVelocity <= 0.0 ||
+        !std::isfinite(e.acceleration) || e.acceleration <= 0.0 || !std::isfinite(e.deceleration) || e.deceleration <= 0.0 ||
+        !e.startTick || e.startTick <= token.completion.tick || !e.tick || e.tick <= e.startTick ||
+        e.tick - e.startTick >= EDM115::MaximumDurationTicks || !e.startUs || e.startUs <= previous.lastMappingUs ||
+        !e.nowUs || e.nowUs <= e.startUs || e.nowUs - e.startUs >= EDM115::MaximumDurationUs ||
+        !f.lastPhysicalTick || f.lastPhysicalTick <= token.completion.tick || f.lastPhysicalTick >= e.tick ||
+        e.tick - f.lastPhysicalTick != 1ULL || trigger.lastMappingTick <= e.tick || trigger.lastMappingUs <= e.nowUs ||
+        completionTick < trigger.lastMappingTick || completionUs < trigger.lastMappingUs) return false;
+    return true;
+}
+
+bool NCManager::IsEDM115CurrentSameThread(unsigned completed) noexcept
+{
+    const auto& s = m_edm94; auto& c = m_edm115;
+    if (!s.gapCurveB2 || !s.gapPhysicalCurve || !s.gapFlushProfile || !s.gapFlushParameterized ||
+        s.gapCommonPath || s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime ||
+        s.gapFlushInterruptArm || !s.latched || s.armPending || !s.everArmed || !s.armEpoch ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.moves != EDM114::RequiredRows || completed > s.moves || m_edm114.acknowledgedRows != completed ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !m_motion.ReadEDM115Feedback(c.feedback)) return false;
+    const auto& f = c.feedback; const auto& e = f.excursion;
+    if (e.faulted && !c.failureLogged) { c.failureLogged = true; LogEDM115SameThread("CURVE_B2_FAIL"); }
+    const unsigned expected = completed >= 5U ? 2U : completed >= 3U ? 1U : 0U;
+    if (!f.enabled || f.session != s.session || f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
+        e.faulted || e.stopRequested || e.stopped || e.active || e.moving || e.reason != EDM115::Reason::None ||
+        c.retainedEvents != expected || f.eventsStarted != expected || f.eventsCompleted != expected ||
+        f.completedDwellsTotal != 5U * expected || f.anchorReturnsTotal != expected) return false;
+    if (expected == 0U)
+    {
+        if (!EDM115::EmptyToken(f.previous) || !EDM114::SameSource(f.trigger, EDM114::Source{}) ||
+            !E115SameExcursion(e, EDM115::Feedback{}) || f.tokenValidated || f.geometryCurrent ||
+            f.currentKind != EDM114::Kind::None || f.previousKind != EDM114::Kind::None ||
+            f.anchorQ != 0.0 || f.previousBoundaryTick || f.previousCommit || f.lastPhysicalTick || f.rangeResets)
+            return false;
+        for (unsigned a = 0U; a < 6U; ++a) if (f.anchorPulse[a] != 0.0 || f.returnedPulse[a] != 0.0) return false;
+        return true;
+    }
+    if (!E115SameFeedback(f, c.receipts[expected - 1U])) return false;
+    for (unsigned index = 0U; index < expected; ++index)
+        if (!c.completionCommit[index] ||
+            !IsEDM115ReceiptSameThread(c.receipts[index], index + 1U, c.triggerRows[index],
+                c.completionTick[index], c.completionUs[index]) ||
+            !EDM109::SameScope(m_edm114.retained.source.scope, c.triggerRows[index].source.scope)) return false;
+    if (expected == 2U)
+    {
+        const auto& first = c.receipts[0]; const auto& last = c.receipts[1];
+        if (first.trigger.dispatch >= last.trigger.dispatch || first.trigger.epoch >= last.trigger.epoch ||
+            first.trigger.segment >= last.trigger.segment || first.trigger.sourcePC >= last.trigger.sourcePC ||
+            c.completionCommit[0] >= c.tokens[1].completion.commit || c.tokens[1].completion.commit >= c.completionCommit[1] ||
+            c.completionTick[0] >= c.tokens[1].completion.tick || c.tokens[1].completion.tick >= c.completionTick[1] ||
+            first.excursion.tick >= last.excursion.startTick || first.excursion.nowUs >= last.excursion.startUs ||
+            first.lastPhysicalTick >= last.lastPhysicalTick) return false;
+    }
+    return true;
+}
+
+bool NCManager::RetainEDM115CompletedSameThread(const EDM94::Feedback& guard) noexcept
+{
+    auto& s = m_edm94; auto& c = m_edm115;
+    if (!s.gapCurveB2 || !s.gapPhysicalCurve || !s.latched || !s.ready || s.armPending || s.cancelled ||
+        s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported || s.finishPending || s.complete ||
+        s.next == 0U || s.next > s.moves || !IsEDM114CurrentSameThread(s.next)) return false;
+    const unsigned step = s.next - 1U;
+    if (!EDM115::IsTriggerStep(step)) return IsEDM115CurrentSameThread(s.next);
+    const unsigned ordinal = EDM115::EventOrdinal(step), index = ordinal - 1U;
+    if (c.retainedEvents == ordinal) return IsEDM115CurrentSameThread(s.next);
+    EDM96::Feedback gap{};
+    if (c.retainedEvents != index || !m_motion.ReadEDM115Feedback(c.feedback) ||
+        !m_motion.ReadEDM96Feedback(gap) || !ReadEDM96CompletedSegmentsSameThread(s.next) ||
+        guard.identity.session != s.session || guard.identity.epoch != s.armEpoch ||
+        guard.identity.ownerGeneration != s.lease.generation || guard.currentIdentity.session != s.session ||
+        guard.currentIdentity.epoch != m_edm114.retained.source.epoch || guard.currentIdentity.ownerGeneration != s.lease.generation ||
+        guard.lastTick != m_edm114.completionTick || guard.lastNowUs < m_edm114.retained.lastMappingUs ||
+        guard.faulted || guard.cancelled || guard.forceZero || guard.handoffZero || !guard.active ||
+        !guard.armAccepted || !guard.armedReady || guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles ||
+        guard.boundaryNotReadyMask || gap.session != s.session || gap.ownerGeneration != s.lease.generation ||
+        gap.epoch != m_edm114.retained.source.epoch || gap.expectedStep != s.next ||
+        gap.flushAnchor != c.feedback.anchorQ || gap.flushReturned != c.feedback.anchorQ ||
+        !IsEDM115ReceiptSameThread(c.feedback, ordinal, m_edm114.retained, guard.lastTick, guard.lastNowUs)) return false;
+    c.receipts[index] = c.feedback; c.triggerRows[index] = m_edm114.retained;
+    c.completionTick[index] = m_edm114.completionTick; c.completionCommit[index] = m_edm114.completionCommit;
+    c.completionUs[index] = guard.lastNowUs; c.retainedEvents = ordinal;
+    if (!IsEDM115CurrentSameThread(s.next)) return false;
+    LogEDM115SameThread("CURVE_B2_RETAINED");
+    return true;
+}
+
+void NCManager::LogEDM115SameThread(const char* event) const noexcept
+{
+    const auto& s = m_edm94; const auto& c = m_edm115;
+    const bool failure = event && std::strcmp(event, "CURVE_B2_FAIL") == 0;
+    char record[481]{};
+    const auto emit = [&](int length) noexcept
+    {
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+        { if (RtPrintf("%s", record) < 0) RtPrintf("%s", "[EDM115] event=LOG_WRITE_ERROR\n"); }
+        else RtPrintf("%s", "[EDM115] event=LOG_FORMAT_ERROR\n");
+    };
+    const auto& total = failure ? c.feedback : c.retainedEvents ? c.receipts[(std::min)(c.retainedEvents, 2U) - 1U] : c.feedback;
+    emit(std::snprintf(record, sizeof(record),
+        "[EDM115] event=%.32s session=%llu P=127 finishP=128 eventsStarted=%u eventsCompleted=%u dwells=%u anchorReturns=%u normalRows=%u normalLine=%u normalArc=%u physicalB2=1 triggerSteps=2,4 previousDepthRatio=0.1 expectedEvents=2 expectedDwells=10 requiredDwell=200 gap=RT_SYNTHETIC dischargeCommand=NONE\n",
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), total.eventsStarted, total.eventsCompleted,
+        total.completedDwellsTotal, total.anchorReturnsTotal, m_edm114.acknowledgedRows,
+        m_edm114.retained.lineRows, m_edm114.retained.arcRows));
+    const unsigned count = failure ? 1U : (std::min)(c.retainedEvents, 2U);
+    for (unsigned i = 0U; i < count; ++i)
+    {
+        const auto& f = failure ? c.feedback : c.receipts[i]; const auto& e = f.excursion;
+        emit(std::snprintf(record, sizeof(record),
+            "[EDM115] event=B2_EVENT result=%.32s session=%llu step=%u currentKind=%u previousKind=%u epoch=%llu dispatch=%llu previousCommit=%llu mappingTick=%llu physicalTick=%llu endTick=%llu physicalB2=1\n",
+            event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), f.trigger.step,
+            static_cast<unsigned>(f.currentKind), static_cast<unsigned>(f.previousKind),
+            static_cast<unsigned long long>(f.trigger.epoch), static_cast<unsigned long long>(f.trigger.dispatch),
+            static_cast<unsigned long long>(f.previousCommit), static_cast<unsigned long long>(f.previous.mappingTick),
+            static_cast<unsigned long long>(f.lastPhysicalTick), static_cast<unsigned long long>(e.tick)));
+        emit(std::snprintf(record, sizeof(record),
+            "[EDM115] event=B2_PROOF result=%.32s session=%llu step=%u dwells=%u settled=%u backward=%llu forward=%llu anchorReturned=%llu anchorQ=%.12g phase=%u reason=%u physicalB2=1 anchor=%s proof=%s dischargeCommand=NONE\n",
+            event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), f.trigger.step, e.completedDwells,
+            e.settledCycles, static_cast<unsigned long long>(e.backwardCrossings), static_cast<unsigned long long>(e.forwardCrossings),
+            static_cast<unsigned long long>(e.anchorReturned), f.anchorQ, static_cast<unsigned>(e.phase), static_cast<unsigned>(e.reason),
+            failure ? "UNPROVEN" : "CANONICAL_ROW_EXACT", failure ? "INCOMPLETE" : "FOLLOWING_WINDOW_200"));
+    }
+}
+
+bool NCManager::GuardEDM114ArcSameThread(const NCBlock& block) noexcept
+{
+    auto& s = m_edm94;
+    if (!s.latched) return !s.program;
+    if (!s.gapPhysicalCurve || !s.ready || s.armPending || s.cancelled || s.finishPending || s.complete ||
+        s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported || s.gapWaiting ||
+        s.next == 0U || s.next > s.moves || m_isSingleBlockEnabled ||
+        s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) ||
+        !CoordSys.IsTranslationRunFrozen() || !CoordSys.IsTranslationRunCurrent() ||
+        !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
+        CoordSys.GetTranslationSnapshot().distanceMode != 91 || CoordSys.activePlane != 17 ||
+        !IsXYZCUVFeedProfileCurrentSameThread() || !IsFixedTranslationTravelCurrentSameThread() ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
+    const unsigned step = s.next - 1U;
+    const int pc = GetActiveDispatchPC();
+    if (!EDM116::IsArcStep(step, s.gapModeFixture) || !IsEDM114CurrentSameThread(step) ||
+        pc != s.pc[step] || !m_currentExecutingBlockDispatchId ||
+        block.gCode != EDM116::ExpectedGCode(step, s.gapModeFixture) || !block.has('X') || !block.has('Y') ||
+        !block.has('I') || !block.has('J') || !block.has('F') || block.val('F') != s.feed[step]) return false;
+    if (s.gapCurveB2 && !IsEDM115CurrentSameThread(step)) return false;
+    const std::array<double, 2U> center{block.val('I'), block.val('J')};
+    if (!EDM116::ValidArcRecipe(block.gCode, step, s.increment[step], center, block.val('F'), s.gapModeFixture) ||
+        block.val('X') != s.increment[step][0] || block.val('Y') != s.increment[step][1] ||
+        center != m_pathArcCenterOffset) return false;
+    std::array<double, 6U> target{};
+    for (unsigned a = 0U; a < 6U; ++a)
+    {
+        if (a >= 2U && block.has("XYZCUV"[a])) return false;
+        target[a] = m_motion.GetAxisContext(static_cast<int>(a)).logicalCmdPos.Load() +
+            s.increment[step][a] * s.feedback.config.axis[a].pulsePerUnit;
+    }
+    const MotionExecutionEpoch epoch = m_motion.GetCurrentExecutionEpoch();
+    EDM96::Feedback gap{};
+    if (!m_motion.CheckEDM94Endpoint(target, epoch, s.lease) || !m_motion.ReadEDM96Feedback(gap) ||
+        gap.session != s.session || gap.epoch != epoch || gap.ownerGeneration != s.lease.generation ||
+        gap.expectedStep != step || !gap.active || gap.faulted || gap.reason != EDM96::Reason::None ||
+        !IsEDM97TuningCurrentSameThread(gap)) return false;
+    if (s.gapHistoryServo)
+        return IsEDM126CurrentSameThread(step) && m_motion.AuthorizeEDM126Feed(s.session, s.run, s.cache,
+            m_currentExecutingBlockDispatchId, pc, step, block.gCode, s.increment[step], center,
+            s.feed[step], epoch, s.lease, s.gapTuning, m_edm114.retained.source,
+            m_edm114.completionCommit, m_edm114.completionTick);
+    if (s.gapModeFlush) return AuthorizeEDM116SameThread(block, block.gCode, center);
+    if (s.gapCurveB2)
+    {
+        if (!BuildEDM115CompletionTokenSameThread(step)) return false;
+        return m_motion.AuthorizeEDM115Feed(s.session, s.run, s.cache, m_currentExecutingBlockDispatchId,
+            pc, step, block.gCode, s.increment[step], center, s.feed[step], epoch, s.lease,
+            s.gapTuning, s.gapFlushParameters, m_edm115.token);
+    }
+    return m_motion.AuthorizeEDM114Feed(s.session, s.run, s.cache, m_currentExecutingBlockDispatchId,
+        pc, step, block.gCode, s.increment[step], center, s.feed[step], epoch, s.lease,
+        s.gapTuning, s.gapFlushParameters);
+}
+
+bool NCManager::IsEDM114CurrentSameThread(unsigned completed) noexcept
+{
+    const auto& s = m_edm94; auto& c = m_edm114;
+    if (!s.gapPhysicalCurve || (!s.gapHistoryServo && (!s.gapFlushProfile || !s.gapFlushParameterized)) || s.gapCommonPath || s.gapB2CrossSegment ||
+        s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime || s.gapFlushInterruptArm ||
+        !s.latched || s.armPending || !s.everArmed || !s.armEpoch || s.moves != EDM114::RequiredRows ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        completed > EDM114::RequiredRows || c.acknowledgedRows != completed ||
+        s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        !m_motion.ReadEDM114Feedback(c.feedback)) return false;
+    const auto& f = c.feedback;
+    if (f.failed && !c.failureLogged)
+    { c.failureLogged = true; LogEDM114SameThread("PHYSICAL_CURVE_FAIL"); }
+    if (!(s.gapHistoryServo ? E126Counts(f, completed, s.gapModeFixture) : E114Counts(f, completed, s.gapModeFixture)) || f.session != s.session || f.armEpoch != s.armEpoch ||
+        f.ownerGeneration != s.lease.generation) return false;
+    if (completed == 0U)
+    {
+        if (!EDM114::SameSource(f.source, EDM114::Source{}) || f.lastTick || f.lastMappingTick || f.lastMappingUs ||
+            f.samples || f.forwardSamples || f.reverseSamples || f.flushSamples ||
+            f.rowSamples || f.rowForward || f.rowReverse || f.rowFlush ||
+            f.pulseLength != 0.0 || f.radiusPulse != 0.0 || f.startAngle != 0.0 || f.sweepRadians != 0.0 ||
+            f.centerPulse[0] != 0.0 || f.centerPulse[1] != 0.0 || c.completionTick || c.completionCommit || c.arcFlushRows)
+            return false;
+        for (unsigned a = 0U; a < 6U; ++a)
+            if (f.startPulse[a] != 0.0 || f.endPulse[a] != 0.0 || f.pulsePerNative[a] != 0.0) return false;
+        c.retained = f; return true;
+    }
+    if (!EDM114::ValidSource(f.source) || f.source.scope.session != s.session ||
+        f.source.scope.run != s.run || f.source.scope.cache != s.cache ||
+        f.source.scope.ownerGeneration != s.lease.generation || f.source.step != completed - 1U ||
+        f.source.sourcePC != s.pc[completed - 1U] || !c.completionTick || !c.completionCommit ||
+        f.lastMappingTick > c.completionTick || c.arcFlushRows != (s.gapHistoryServo ? 0U : EDM116::ExpectedArcFlushRows(completed, s.gapModeFixture)) ||
+        !E114SameFeedback(f, c.retained)) return false;
+    return true;
+}
+
+bool NCManager::RetainEDM114CompletedSameThread(const EDM94::Feedback& guard) noexcept
+{
+    const auto& s = m_edm94; auto& c = m_edm114; const auto& b = s.boundary;
+    if (!s.gapPhysicalCurve || (!s.gapHistoryServo && (!s.gapFlushProfile || !s.gapFlushParameterized)) || s.gapCommonPath ||
+        s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime || s.gapFlushInterruptArm ||
+        !s.latched || !s.ready || s.armPending || s.cancelled || s.resetSeen ||
+        s.resetCommitted || s.releaseRequested || s.rtFaultReported || s.finishPending || s.complete ||
+        s.next == 0U || s.next > EDM114::RequiredRows || s.moves != EDM114::RequiredRows ||
+        !b.dispatch || !b.commit || !b.sequence || !b.identity.IsAssigned() ||
+        b.identity.source != MotionCommandSource::NC_MEMORY ||
+        b.identity.sourceBlockId != static_cast<MotionSourceBlockId>(s.pc[s.next - 1U]) ||
+        !m_motion.ReadEDM114Feedback(c.feedback)) return false;
+    const auto& f = c.feedback; const auto& prior = c.retained;
+    const unsigned step = s.next - 1U;
+    if (f.failed && !c.failureLogged)
+    { c.failureLogged = true; LogEDM114SameThread("PHYSICAL_CURVE_FAIL"); }
+    if (!(s.gapHistoryServo ? E126Counts(f, s.next, s.gapModeFixture) : E114Counts(f, s.next, s.gapModeFixture)) || f.session != s.session || f.armEpoch != s.armEpoch ||
+        f.ownerGeneration != s.lease.generation || !EDM114::ValidSource(f.source) ||
+        f.source.scope.session != s.session || f.source.scope.run != s.run || f.source.scope.cache != s.cache ||
+        f.source.scope.ownerGeneration != s.lease.generation || f.source.scope.translationGeneration != b.translation ||
+        f.source.dispatch != b.dispatch || f.source.epoch != b.identity.epoch || f.source.segment != b.identity.segmentId ||
+        f.source.sourcePC != s.pc[step] || f.source.step != step ||
+        guard.identity.session != s.session || guard.identity.epoch != s.armEpoch ||
+        guard.identity.ownerGeneration != s.lease.generation || guard.currentIdentity.session != s.session ||
+        guard.currentIdentity.epoch != f.source.epoch || guard.currentIdentity.ownerGeneration != s.lease.generation ||
+        !guard.active || !guard.armAccepted || !guard.armedReady || guard.forceZero || guard.handoffZero ||
+        guard.faulted || guard.cancelled || guard.finishRequested || guard.released ||
+        guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles || guard.boundaryNotReadyMask ||
+        f.lastMappingTick > guard.lastTick || f.lastMappingUs > guard.lastNowUs) return false;
+    std::uint64_t configTag = 1469598103934665603ULL, mappingTag = configTag;
+    for (unsigned a = 0U; a < 6U; ++a)
+    {
+        const auto& frozen = s.feedback.config.axis[a]; const auto& seen = guard.config.axis[a];
+        if (!EDM109::SameDouble(f.pulsePerNative[a], frozen.pulsePerUnit) ||
+            !EDM109::SameDouble(f.pulsePerNative[a], seen.pulsePerUnit) ||
+            !EDM109::SameDouble(f.endPulse[a], b.endPulse[a]) ||
+            seen.configFingerprint != frozen.configFingerprint || seen.mappingFingerprint != frozen.mappingFingerprint)
+            return false;
+        configTag = (configTag ^ seen.configFingerprint) * 1099511628211ULL;
+        mappingTag = (mappingTag ^ seen.mappingFingerprint) * 1099511628211ULL;
+    }
+    if (f.source.scope.configTag != (configTag ? configTag : 1ULL) ||
+        f.source.scope.mappingTag != (mappingTag ? mappingTag : 1ULL)) return false;
+    if (EDM116::IsArcStep(step, s.gapModeFixture))
+    {
+        const auto& r = m_pathArcMotion.receipt;
+        if (f.kind != EDM114::Kind::Arc || m_pathArc.dispatch != b.dispatch || m_pathArc.commit != b.commit ||
+            r.identity.epoch != f.source.epoch || r.identity.segmentId != f.source.segment ||
+            !r.valid || !r.arc.valid || r.arc.axisMask != 3U || r.arc.plane != 17U || r.arc.fullCircle ||
+            r.arc.direction != (EDM116::ExpectedGCode(step, s.gapModeFixture) == 2 ? -1 : 1) ||
+            !EDM109::SameDouble(f.pulseLength, r.arc.lengthPulse) ||
+            !EDM109::SameDouble(f.radiusPulse, r.arc.radiusPulse) ||
+            !EDM109::SameDouble(f.startAngle, r.arc.startAngle) ||
+            !EDM109::SameDouble(f.sweepRadians, r.arc.sweepRadians) ||
+            !EDM109::SameDouble(f.centerPulse[0], r.arc.centerPulse[0]) ||
+            !EDM109::SameDouble(f.centerPulse[1], r.arc.centerPulse[1])) return false;
+        for (unsigned a = 0U; a < 6U; ++a)
+            if (!EDM109::SameDouble(f.startPulse[a], r.arc.startPulse[a]) ||
+                !EDM109::SameDouble(f.endPulse[a], r.arc.endPulse[a])) return false;
+    }
+    else
+    {
+        const auto& r = m_pathFeedMotion.receipt;
+        if (f.kind != EDM114::Kind::Line || m_pathFeed.dispatch != b.dispatch || m_pathFeed.commit != b.commit ||
+            r.identity.epoch != f.source.epoch || r.identity.segmentId != f.source.segment ||
+            !r.valid || !r.xyzcuvFeed || !r.xyzcuv.valid || r.xyzcuv.axisMask != 63U ||
+            !EDM109::SameDouble(f.pulseLength, r.xyzcuv.lengthPulse) || f.radiusPulse != 0.0 ||
+            f.startAngle != 0.0 || f.sweepRadians != 0.0 || f.centerPulse[0] != 0.0 || f.centerPulse[1] != 0.0) return false;
+        for (unsigned a = 0U; a < 6U; ++a)
+            if (!EDM109::SameDouble(f.startPulse[a], r.xyzcuv.startPulse[a]) ||
+                !EDM109::SameDouble(f.endPulse[a], r.xyzcuv.endPulse[a]) ||
+                !EDM109::SameDouble(f.pulsePerNative[a], r.xyzcuv.pulsePerUnit[a])) return false;
+    }
+    if (c.acknowledgedRows == s.next)
+        return c.completionCommit == b.commit && c.completionTick <= guard.lastTick && IsEDM114CurrentSameThread(s.next);
+    if (c.acknowledgedRows + 1U != s.next || !prior.enabled || prior.failed ||
+        prior.session != s.session || prior.armEpoch != s.armEpoch || prior.ownerGeneration != s.lease.generation ||
+        prior.completedRows != c.acknowledgedRows || f.lastMappingTick <= prior.lastMappingTick ||
+        f.lastMappingUs <= prior.lastMappingUs || b.commit <= c.completionCommit || guard.lastTick <= c.completionTick ||
+        f.samples < prior.samples || f.samples - prior.samples != f.rowSamples ||
+        f.forwardSamples < prior.forwardSamples || f.forwardSamples - prior.forwardSamples != f.rowForward ||
+        f.reverseSamples < prior.reverseSamples || f.reverseSamples - prior.reverseSamples != f.rowReverse ||
+        f.flushSamples < prior.flushSamples || f.flushSamples - prior.flushSamples != f.rowFlush) return false;
+    if (c.acknowledgedRows != 0U && (!EDM109::SameScope(f.source.scope, prior.source.scope) ||
+        f.source.dispatch <= prior.source.dispatch || f.source.epoch <= prior.source.epoch ||
+        f.source.segment <= prior.source.segment || f.source.sourcePC <= prior.source.sourcePC ||
+        !EDM109::SamePulse(f.startPulse, prior.endPulse))) return false;
+    if (!s.gapHistoryServo && EDM116::IsArcStep(step, s.gapModeFixture) && !(step & 1U)) ++c.arcFlushRows;
+    c.retained = f; c.acknowledgedRows = s.next;
+    c.completionTick = guard.lastTick; c.completionCommit = b.commit;
+    LogEDM114SameThread("PHYSICAL_CURVE_ROW");
+    return true;
+}
+
+void NCManager::LogEDM114SameThread(const char* event) const noexcept
+{
+    if (m_edm94.gapHistoryServo) { LogEDM126SameThread(event); return; }
+    const auto& f = event && std::strcmp(event, "PHYSICAL_CURVE_FAIL") == 0 ? m_edm114.feedback : m_edm114.retained;
+    char record[481]{};
+    const char* format = m_edm94.gapModeFlush ?
+        (m_edm94.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=%.32s session=%llu P=154 finishP=155 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE profile=PREVIOUS_ARC_RETREAT armP=154\n" : m_edm94.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=%.32s session=%llu P=156 finishP=157 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE profile=PREVIOUS_ARC_RETURN armP=156\n" : m_edm94.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=%.32s session=%llu P=146 finishP=147 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE profile=B0 armP=146\n" : m_edm94.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=%.32s session=%llu P=142 finishP=143 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE profile=B0 armP=142\n" : m_edm94.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=%.32s session=%llu P=148 finishP=149 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE profile=B1 armP=148\n" : m_edm94.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=%.32s session=%llu P=144 finishP=145 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE profile=B1 armP=144\n" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=%.32s session=%llu P=140 finishP=141 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE\n" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=%.32s session=%llu P=138 finishP=139 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE\n" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=%.32s session=%llu P=136 finishP=137 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE\n" : m_edm94.gapModeInterruption ? "[EDM118] event=%.32s session=%llu P=134 finishP=135 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE\n" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=%.32s session=%llu P=150 finishP=151 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE fixture=2\n" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=%.32s session=%llu P=152 finishP=153 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE fixture=3\n" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=%.32s session=%llu P=132 finishP=133 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE\n" : "[EDM116] event=%.32s session=%llu P=129 finishP=130 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 modeFlush=1 dischargeCommand=NONE\n") : m_edm94.gapCurveB2 ?
+        "[EDM115] event=%.32s session=%llu P=127 finishP=128 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 crossRowB2=1 dischargeCommand=NONE\n" :
+        "[EDM114] event=%.32s session=%llu P=125 finishP=126 rows=%u line=%u arc=%u cw=%u ccw=%u endpoints=%u flushCycles=%u arcFlush=%u step=%u reason=%u tick=%llu samples=%llu forward=%llu reverse=%llu flush=%llu physicalArc=1 packet=ARC2 crossRowB2=0 dischargeCommand=NONE\n";
+    const int length = std::snprintf(record, sizeof(record), format,
+        event ? event : "UNKNOWN", static_cast<unsigned long long>(m_edm94.session), f.completedRows,
+        f.lineRows, f.arcRows, f.cwRows, f.ccwRows, f.endpointRows, (m_edm114.acknowledgedRows + 1U) / 2U, m_edm114.arcFlushRows,
+        f.source.step, static_cast<unsigned>(f.reason), static_cast<unsigned long long>(f.lastMappingTick),
+        static_cast<unsigned long long>(f.samples), static_cast<unsigned long long>(f.forwardSamples),
+        static_cast<unsigned long long>(f.reverseSamples), static_cast<unsigned long long>(f.flushSamples));
+    if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+    {
+        if (RtPrintf("%s", record) < 0) RtPrintf("%s", m_edm94.gapModeFlush ? (m_edm94.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=LOG_WRITE_ERROR profile=PREVIOUS_ARC_RETREAT armP=154\n" : m_edm94.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=LOG_WRITE_ERROR profile=PREVIOUS_ARC_RETURN armP=156\n" : m_edm94.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=LOG_WRITE_ERROR profile=B0 armP=146\n" : m_edm94.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=LOG_WRITE_ERROR profile=B0 armP=142\n" : m_edm94.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=LOG_WRITE_ERROR profile=B1 armP=148\n" : m_edm94.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=LOG_WRITE_ERROR profile=B1 armP=144\n" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=LOG_WRITE_ERROR\n" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=LOG_WRITE_ERROR\n" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=LOG_WRITE_ERROR\n" : m_edm94.gapModeInterruption ? "[EDM118] event=LOG_WRITE_ERROR\n" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=LOG_WRITE_ERROR fixture=2\n" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=LOG_WRITE_ERROR fixture=3\n" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=LOG_WRITE_ERROR\n" : "[EDM116] event=LOG_WRITE_ERROR\n") : m_edm94.gapCurveB2 ? "[EDM115] event=LOG_WRITE_ERROR\n" : "[EDM114] event=LOG_WRITE_ERROR\n");
+    }
+    else RtPrintf("%s", m_edm94.gapModeFlush ? (m_edm94.gapModeInterruptionArm == EDM125::RetreatArmP ? "[EDM125] event=LOG_FORMAT_ERROR profile=PREVIOUS_ARC_RETREAT armP=154\n" : m_edm94.gapModeInterruptionArm == EDM125::ReturnArmP ? "[EDM125] event=LOG_FORMAT_ERROR profile=PREVIOUS_ARC_RETURN armP=156\n" : m_edm94.gapModeInterruptionArm == EDM123::B0ArmP ? "[EDM123] event=LOG_FORMAT_ERROR profile=B0 armP=146\n" : m_edm94.gapModeInterruptionArm == EDM122::B0ArmP ? "[EDM122] event=LOG_FORMAT_ERROR profile=B0 armP=142\n" : m_edm94.gapModeInterruptionArm == EDM123::B1ArmP ? "[EDM123] event=LOG_FORMAT_ERROR profile=B1 armP=148\n" : m_edm94.gapModeInterruptionArm == EDM122::B1ArmP ? "[EDM122] event=LOG_FORMAT_ERROR profile=B1 armP=144\n" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "[EDM121] event=LOG_FORMAT_ERROR\n" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "[EDM120] event=LOG_FORMAT_ERROR\n" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "[EDM119] event=LOG_FORMAT_ERROR\n" : m_edm94.gapModeInterruption ? "[EDM118] event=LOG_FORMAT_ERROR\n" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "[EDM124] event=LOG_FORMAT_ERROR fixture=2\n" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "[EDM124] event=LOG_FORMAT_ERROR fixture=3\n" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "[EDM117] event=LOG_FORMAT_ERROR\n" : "[EDM116] event=LOG_FORMAT_ERROR\n") : m_edm94.gapCurveB2 ? "[EDM115] event=LOG_FORMAT_ERROR\n" : "[EDM114] event=LOG_FORMAT_ERROR\n");
+}
+
+bool NCManager::WaitEDM114ArcBoundarySameThread()
+{
+    auto& s = m_edm94; auto& b = s.boundary;
+    const auto& p = m_pathArc; const auto& r = m_pathArcMotion.receipt;
+    if (!s.gapPhysicalCurve || !s.latched || !s.ready || s.armPending || s.cancelled || s.finishPending || s.complete ||
+        s.resetSeen || s.resetCommitted || s.releaseRequested || m_state != NCState::RUN ||
+        m_mode != NCOperationMode::MEMORY || Close_System_Com_flag ||
+        !m_externalReadyInterlock || AlarmManager::GetInstance().HasAlarm())
+    { b = EDM94NCState::FeedBoundary{}; return false; }
+    const bool stepValid = s.next > 0U && s.next <= s.moves;
+    const unsigned step = stepValid ? s.next - 1U : 0U;
+    bool scope = stepValid && EDM116::IsArcStep(step, s.gapModeFixture) && p.armed && p.pending && p.bound && p.completed &&
+        p.consumerAccepted && p.consumerStarted && p.dispatch && p.commit && p.lastSequence &&
+        p.run == s.run && p.cache == s.cache && s.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        s.cache == GetBaseProgramCache().GetGeneration() && p.dispatch == m_waitingBlockDispatchId &&
+        p.sourcePC == GetActiveDispatchPC() && p.sourcePC == s.pc[step] &&
+        r.valid && r.commandAccepted && r.tailCommitted && r.captureBound && !r.travelLimitRejected &&
+        r.code == MotionFeedArcCode::COMMITTED &&
+        r.geometryCode == static_cast<std::uint32_t>(NCPathCoreFeedArcCode::BUILT_ARC) && r.arc.valid &&
+        r.arc.axisMask == 3U && r.validAxisMask == 63U && r.arc.plane == 17U && !r.arc.fullCircle &&
+        r.arc.direction == (EDM116::ExpectedGCode(step, s.gapModeFixture) == 2 ? -1 : 1) && r.arc.feedMMMin == s.feed[step] &&
+        r.identity.IsAssigned() && r.identity.source == MotionCommandSource::NC_MEMORY &&
+        r.identity.sourceBlockId == static_cast<MotionSourceBlockId>(p.sourcePC) &&
+        r.identity.epoch == m_motion.GetCurrentExecutionEpoch() &&
+        r.ownerLease.Matches(s.lease) && r.ownerLease.Matches(m_programMotionLease) &&
+        m_motion.IsMotionOwnerLeaseCurrent(r.ownerLease) && r.translationGeneration &&
+        CoordSys.IsTranslationRunFrozen() && CoordSys.IsTranslationRunCurrent() &&
+        CoordSys.GetTranslationSnapshot().generation == r.translationGeneration &&
+        IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) &&
+        CoordSys.GetTranslationSnapshot().distanceMode == 91 && CoordSys.activePlane == 17 &&
+        IsXYZCUVFeedProfileCurrentSameThread() && IsFixedTranslationTravelCurrentSameThread() &&
+        IsPathCoreLiveNativeConfigCurrentSameThread();
+    for (unsigned a = 0U; a < 6U; ++a)
+    {
+        scope = scope && std::isfinite(r.arc.startPulse[a]) && std::isfinite(r.arc.endPulse[a]) &&
+            std::isfinite(r.arc.startMCS[a]) && std::isfinite(r.arc.endMCS[a]);
+        if (a < 2U)
+        {
+            // The native start may be reconstructed from the accepted pulse.
+            // Bound only this derived subtraction; authored literals and the
+            // actual pulse receipt retained below remain exact.
+            const double scale = (std::max)(1.0, (std::max)(std::fabs(s.increment[step][a]),
+                (std::max)(std::fabs(r.arc.startMCS[a]), std::fabs(r.arc.endMCS[a]))));
+            const double tolerance = 64.0 * std::numeric_limits<double>::epsilon() * scale;
+            scope = scope && std::isfinite(tolerance) && tolerance <= 5.0e-8 &&
+                std::fabs((r.arc.endMCS[a] - r.arc.startMCS[a]) - s.increment[step][a]) <= tolerance;
+        }
+        else scope = scope && EDM109::SameDouble(r.arc.startMCS[a], r.arc.endMCS[a]) &&
+            EDM109::SameDouble(r.arc.startPulse[a], r.arc.endPulse[a]);
+    }
+    scope = scope && r.arc.centerMCS[0] == r.arc.startMCS[0] + ((step & 1U) ? -0.001 : 0.001) &&
+        r.arc.centerMCS[1] == r.arc.startMCS[1] && std::isfinite(r.arc.radiusPulse) && r.arc.radiusPulse > 0.0 &&
+        std::isfinite(r.arc.lengthPulse) && r.arc.lengthPulse > 0.0 &&
+        std::isfinite(r.arc.sweepRadians) && std::fabs(r.arc.sweepRadians) <= 2.0 * EDM114::Pi;
+    if (scope && b.dispatch)
+    {
+        scope = b.dispatch == p.dispatch && b.commit == p.commit && b.sequence == p.lastSequence &&
+            b.translation == r.translationGeneration && b.identity.epoch == r.identity.epoch &&
+            b.identity.segmentId == r.identity.segmentId && b.identity.sourceBlockId == r.identity.sourceBlockId &&
+            b.identity.source == r.identity.source;
+        for (unsigned a = 0U; a < 6U; ++a) scope = scope && EDM109::SameDouble(b.endPulse[a], r.arc.endPulse[a]);
+    }
+    if (!scope)
+    { b = EDM94NCState::FeedBoundary{}; RejectEDM94SameThread("EDM114_ARC_BOUNDARY_SCOPE", p.sourceLine); return false; }
+    if (!b.dispatch)
+    {
+        b.identity = r.identity; b.dispatch = p.dispatch; b.commit = p.commit;
+        b.sequence = p.lastSequence; b.translation = r.translationGeneration;
+        for (unsigned a = 0U; a < 6U; ++a) b.endPulse[a] = r.arc.endPulse[a];
+    }
+    return WaitEDM94BoundaryProofSameThread(p.sourceLine);
 }
 
 bool NCManager::WaitEDM94FeedBoundarySameThread()
@@ -16568,6 +19455,13 @@ bool NCManager::WaitEDM94FeedBoundarySameThread()
         b.sequence = p.lastSequence; b.translation = r.translationGeneration;
         for (unsigned a = 0U; a < 6U; ++a) b.endPulse[a] = r.xyzcuv.endPulse[a];
     }
+    return WaitEDM94BoundaryProofSameThread(p.sourceLine);
+}
+
+bool NCManager::WaitEDM94BoundaryProofSameThread(int sourceLine)
+{
+    auto& s = m_edm94; auto& b = s.boundary;
+    const unsigned step = s.next - 1U;
     ++b.polls;
     // Flags: read, frozen/current identity, active RT state, clock, new tick,
     // canonical incoming readiness, continuous RT dwell, command endpoint, lag.
@@ -16576,8 +19470,8 @@ bool NCManager::WaitEDM94FeedBoundarySameThread()
     const bool read = m_motion.ReadEDM94Feedback(observed);
     const bool identity = read && observed.identity.session == s.session &&
         observed.identity.epoch == s.armEpoch && observed.identity.ownerGeneration == s.lease.generation &&
-        observed.currentIdentity.session == s.session && observed.currentIdentity.epoch == r.identity.epoch &&
-        observed.currentIdentity.ownerGeneration == r.ownerLease.generation;
+        observed.currentIdentity.session == s.session && observed.currentIdentity.epoch == b.identity.epoch &&
+        observed.currentIdentity.ownerGeneration == s.lease.generation;
     if (!read) flags |= 1U;
     if (!identity) flags |= 2U;
     if (!read || !observed.active || !observed.armAccepted || !observed.armedReady || observed.forceZero ||
@@ -16588,7 +19482,7 @@ bool NCManager::WaitEDM94FeedBoundarySameThread()
         observed.lastTick >= s.lastTick;
     if (!clock) flags |= 8U;
     if (!fresh) flags |= 16U;
-    if (!m_motion.HasExactProgramStartQuiescenceAcknowledgement(r.identity.epoch, r.ownerLease)) flags |= 32U;
+    if (!m_motion.HasExactProgramStartQuiescenceAcknowledgement(b.identity.epoch, s.lease)) flags |= 32U;
     if (!read || observed.boundaryReadyCycles < EDM94::BoundaryReadyCycles || observed.boundaryNotReadyMask != 0U) flags |= 64U;
     for (unsigned a = 0U; a < 6U; ++a)
     {
@@ -16628,8 +19522,18 @@ bool NCManager::WaitEDM94FeedBoundarySameThread()
             static_cast<unsigned long long>(observed.lastTick), static_cast<unsigned long long>(elapsed),
             observed.boundaryReadyCycles, EDM94::BoundaryReadyCycles, observed.boundaryNotReadyMask);
     if (timeout)
-    { RejectEDM94SameThread("BOUNDARY_SETTLE_TIMEOUT", p.sourceLine); return false; }
+    { RejectEDM94SameThread("BOUNDARY_SETTLE_TIMEOUT", sourceLine); return false; }
     if (!ready) return false;
+    if (s.gapPhysicalCurve && !RetainEDM114CompletedSameThread(observed))
+    { RejectEDM94SameThread("EDM114_COMPLETED_PATH_PROOF", sourceLine); return false; }
+    if (s.gapHistoryServo && !IsEDM126CurrentSameThread(s.next))
+    { RejectEDM94SameThread("EDM126_COMPLETED_HISTORY_PROOF", sourceLine); return false; }
+    if (s.gapModeFlush && !RetainEDM116CompletedSameThread(observed))
+    { RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_COMPLETED_MODE_PROOF" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_COMPLETED_MODE_PROOF" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_COMPLETED_MODE_PROOF" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_COMPLETED_MODE_PROOF" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_COMPLETED_MODE_PROOF" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_COMPLETED_MODE_PROOF" : m_edm94.gapModeInterruption ? "EDM118_COMPLETED_MODE_PROOF" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_COMPLETED_MODE_PROOF" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_COMPLETED_MODE_PROOF" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_COMPLETED_MODE_PROOF" : "EDM116_COMPLETED_MODE_PROOF"), sourceLine); return false; }
+    if (s.gapCurveB2 && !RetainEDM115CompletedSameThread(observed))
+    { RejectEDM94SameThread("EDM115_COMPLETED_B2_PROOF", sourceLine); return false; }
+    if (s.gapCommonPath && !RetainEDM109CompletedSameThread(observed))
+    { RejectEDM94SameThread("EDM109_COMPLETED_PATH_PROOF", sourceLine); return false; }
     if (s.gapBoundaryProfile && !s.gapWaiting)
         RtPrintf("[EDM95] event=PHYSICAL_BOUNDARY_READY session=%llu step=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY\n",
             static_cast<unsigned long long>(s.session), step, static_cast<unsigned long long>(b.identity.epoch),
@@ -16638,7 +19542,9 @@ bool NCManager::WaitEDM94FeedBoundarySameThread()
         RtPrintf("[EDM105] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u closedPairs=%u flushCycles=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM105_SEGMENT_COMPLETE proofScope=COMMAND_SCALAR_ONLY\n",
             static_cast<unsigned long long>(s.session), s.next, s.next / 2U, (s.next + 1U) / 2U,
             static_cast<unsigned long long>(b.identity.epoch), static_cast<unsigned long long>(b.lastTick),
-            s.next == s.moves ? "FINISH_P104" : "NEXT_AUTHORED_G1");
+            s.next == s.moves ? (s.gapFlushInterruptArm == 111U ? "FINISH_P112" : s.gapFlushInterruptArm == 113U ? "FINISH_P114" :
+                s.gapFlushInterruptArm == 105U ? "FINISH_P106" : s.gapFlushInterruptArm == 107U ? "FINISH_P108" :
+                s.gapModeFlush ? (s.gapModeInterruption ? "STOP_ONLY_NO_FINISH" : s.gapModeFixture == EDM116::Fixture::ArcPair124 ? "FINISH_P151" : s.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "FINISH_P153" : s.gapModeFixture == EDM116::Fixture::Complement117 ? "FINISH_P133" : "FINISH_P130") : s.gapCurveB2 ? "FINISH_P128" : s.gapPhysicalCurve ? "FINISH_P126" : s.gapCurveRuntime ? "FINISH_P124" : s.gapCurveGeometry ? "FINISH_P122" : s.gapB2Repeat ? "FINISH_P120" : s.gapB2CrossSegment ? "FINISH_P118" : s.gapCommonPath ? "FINISH_P116" : s.gapFlushParameterized ? "FINISH_P110" : "FINISH_P104") : "NEXT_AUTHORED_G1");
     else if (s.gapPairedProfile)
         RtPrintf("[EDM104] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u closedPairs=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM104_SEGMENT_COMPLETE proofScope=COMMAND_SCALAR_ONLY\n",
             static_cast<unsigned long long>(s.session), s.next, s.next / 2U, static_cast<unsigned long long>(b.identity.epoch),
@@ -16746,6 +19652,65 @@ bool NCManager::WaitEDM95BoundarySameThread(unsigned step)
 bool NCManager::IsEDM97TuningCurrentSameThread(const EDM96::Feedback& gap) const noexcept
 {
     const auto& s = m_edm94;
+    if (s.gapHistoryServo)
+    {
+        if ((s.gapHistoryArm != 158U && s.gapHistoryArm != 160U) ||
+            s.gapModeFixture != (s.gapHistoryArm == 158U ? EDM116::Fixture::ArcPair124 : EDM116::Fixture::ArcPairComplement124) ||
+            !s.gapPhysicalCurve || !s.gapSegmentProfile || !s.gapGainProfile || s.moves != EDM114::RequiredRows ||
+            s.gapBoundaryProfile || s.gapNoiseProfile || s.gapBurstProfile || s.gapContinuousProfile ||
+            s.gapEnduranceProfile || s.gapPairedProfile || s.gapFlushProfile || s.gapFlushParameterized ||
+            s.gapCommonPath || s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime ||
+            s.gapCurveB2 || s.gapModeFlush || s.gapModeInterruption || s.gapModeInterruptionArm || s.gapFlushInterruptArm ||
+            !gap.tunedMode || gap.noiseMode || gap.burstMode || gap.continuousMode || gap.enduranceMode ||
+            gap.pairedMode || gap.flushMode || gap.flushPhase != EDM105::Phase::None ||
+            gap.flushStarted || gap.flushCompleted || gap.flushZeroTicks || gap.flushAnchor != 0.0 ||
+            gap.flushRetreat != 0.0 || gap.flushReturned != 0.0 ||
+            !EDM97::ValidTuning(s.gapTuning) || s.gapTuning.positiveGain != 8.0 ||
+            s.gapTuning.negativeGain != 1.0 || s.gapTuning.deadbandV != 1.0 ||
+            !EDM97::SameTuning(s.gapTuning, gap.tuning) || gap.configHash != EDM97::ConfigHash(s.gapTuning) ||
+            !std::isfinite(gap.errorV) || !std::isfinite(gap.rawSpeedMmMin) ||
+            !std::isfinite(gap.limitedSpeedMmMin) || !std::isfinite(gap.targetRatio) ||
+            gap.limitedSpeedMmMin < -EDM97::MaximumRetreatMmMin || gap.limitedSpeedMmMin > EDM97::MaximumFeedMmMin ||
+            gap.targetRatio < -EDM97::MaximumRetreatMmMin / EDM97::MaximumFeedMmMin || gap.targetRatio > 1.0 ||
+            gap.acceptedSegments > s.moves || gap.completedSegments > gap.acceptedSegments ||
+            gap.acceptedSegments - gap.completedSegments > 1ULL || gap.expectedStep != gap.completedSegments)
+            return false;
+        EDM126::MotionFeedback f{};
+        return m_motion.ReadEDM126Feedback(f) && f.enabled && !f.faulted && f.reason == EDM126::Reason::None &&
+            // These observer channels may straddle an RT completion/handoff.
+            // Exact live epoch and N/N counts are checked by the admission and boundary callers.
+            f.session == s.session && f.armEpoch == s.armEpoch && f.liveEpoch != 0ULL &&
+            f.ownerGeneration == s.lease.generation && f.session == gap.session && f.ownerGeneration == gap.ownerGeneration &&
+            f.fixture == (s.gapHistoryArm == 158U ? 0U : 1U) &&
+            f.authorizedRows <= s.moves && f.completedRows <= f.authorizedRows &&
+            f.authorizedRows - f.completedRows <= 1U;
+    }
+    if (s.gapHistoryArm) return false;
+    const bool interruptionProfile = s.gapModeInterruptionArm == EDM118::ArmP ||
+        s.gapModeInterruptionArm == EDM119::ArmP || s.gapModeInterruptionArm == EDM120::ArmP ||
+        s.gapModeInterruptionArm == EDM121::ArmP ||
+        EDM122::ValidProfile(EDM122::ProfileForArm(s.gapModeInterruptionArm)) ||
+        EDM123::ValidProfile(EDM123::ProfileForArm(s.gapModeInterruptionArm)) ||
+        EDM125::ValidProfile(EDM125::ProfileForArm(s.gapModeInterruptionArm));
+    if (s.gapModeInterruption != interruptionProfile ||
+        (s.gapModeInterruption && (!s.gapModeFlush ||
+            s.gapModeFixture != (EDM125::ValidProfile(EDM125::ProfileForArm(s.gapModeInterruptionArm)) ? EDM125::TargetFixture(EDM125::ProfileForArm(s.gapModeInterruptionArm)) :
+                EDM123::ValidProfile(EDM123::ProfileForArm(s.gapModeInterruptionArm)) ? EDM123::TargetFixture :
+                EDM122::ValidProfile(EDM122::ProfileForArm(s.gapModeInterruptionArm)) ? EDM122::TargetFixture :
+                s.gapModeInterruptionArm == EDM121::ArmP ? EDM121::TargetFixture :
+                s.gapModeInterruptionArm == EDM120::ArmP ? EDM120::TargetFixture :
+                s.gapModeInterruptionArm == EDM119::ArmP ? EDM119::TargetFixture : EDM118::TargetFixture)))) return false;
+    if ((s.gapModeFlush && (!s.gapPhysicalCurve || s.gapCurveB2)) || (s.gapCurveB2 && !s.gapPhysicalCurve) || (s.gapPhysicalCurve && (!s.gapFlushProfile || !s.gapFlushParameterized || s.gapFlushInterruptArm != 0U ||
+            s.gapCommonPath || s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime)) ||
+        (s.gapCurveRuntime && !s.gapCurveGeometry) || (s.gapCurveGeometry && !s.gapB2Repeat) || (s.gapB2Repeat && !s.gapB2CrossSegment) || (s.gapB2CrossSegment && !s.gapCommonPath) ||
+        (s.gapCommonPath && (!s.gapFlushProfile || !s.gapFlushParameterized || s.gapFlushInterruptArm != 0U)) ||
+        !EDM107::ValidFlushProfile(s.gapFlushParameters) || !EDM107::ValidFlushProfile(gap.flushProfile) ||
+        !EDM107::SameFlushProfile(s.gapFlushParameters, gap.flushProfile) ||
+        (s.gapFlushInterruptArm != 0U && !s.gapFlushProfile) ||
+        (!s.gapFlushParameterized && (!EDM107::IsDefaultFlushProfile(s.gapFlushParameters) ||
+            (s.gapFlushInterruptArm != 0U && s.gapFlushInterruptArm != 105U && s.gapFlushInterruptArm != 107U))) ||
+        (s.gapFlushParameterized && (!s.gapFlushProfile ||
+            (s.gapFlushInterruptArm != 0U && s.gapFlushInterruptArm != 111U && s.gapFlushInterruptArm != 113U)))) return false;
     if (gap.flushMode != s.gapFlushProfile ||
         (s.gapFlushProfile && (!s.gapPairedProfile || !s.gapEnduranceProfile || !s.gapContinuousProfile ||
             !s.gapBurstProfile || !s.gapGainProfile || !s.gapSegmentProfile || s.gapNoiseProfile ||
@@ -16895,6 +19860,131 @@ void NCManager::LogEDM104SameThread(const char* event, const EDM96::Feedback& ga
     LogEDM99SegmentRecords("EDM104", event, gap, IsEDM97TuningCurrentSameThread(gap));
 }
 
+void NCManager::LogEDM106InterruptionSameThread(const char* event, const char* reason) const noexcept
+{
+    const auto& s = m_edm94;
+    if (!s.gapFlushProfile || !s.session) return;
+    EDM96::Feedback gap{};
+    const bool read = m_motion.ReadEDM96Feedback(gap);
+    const bool identity = read && gap.session == s.session &&
+        gap.ownerGeneration == s.lease.generation && gap.epoch != 0ULL;
+    const bool tuning = identity && IsEDM97TuningCurrentSameThread(gap);
+    const auto& r = gap.interruption;
+    const bool fixture108 = s.gapFlushParameterized && (s.gapFlushInterruptArm == 111U || s.gapFlushInterruptArm == 113U);
+    const char* const stage = fixture108 ? "EDM108" : "EDM106";
+    const EDM105::Phase target = (s.gapFlushInterruptArm == 105U || s.gapFlushInterruptArm == 111U) ? EDM105::Phase::Retreat :
+        (s.gapFlushInterruptArm == 107U || s.gapFlushInterruptArm == 113U) ? EDM105::Phase::Return : EDM105::Phase::None;
+    const bool frozen = identity && !gap.active && !gap.segmentActive &&
+        !gap.segmentCompleted && !gap.gateReady && gap.v == 0.0;
+    const bool valid = tuning && frozen && r.captured && r.sourceTick != 0ULL &&
+        r.plannerTick != 0ULL && r.plannerTick <= r.sourceTick && r.sourceTick <= gap.tick &&
+        r.nowUs != 0ULL && r.nowUs <= gap.nowUs &&
+        static_cast<unsigned>(r.phase) <= static_cast<unsigned>(EDM105::Phase::Complete) &&
+        std::isfinite(r.q) && std::isfinite(r.v) && r.q >= 0.0 && r.q <= gap.length &&
+        gap.acceptedSegments > gap.completedSegments;
+    // NC request phase and RT-latched phase are distinct observations. Only a
+    // matching moving planner state in that exact requested segment is coverage.
+    const bool requestedSegment = valid && s.gapFlushInterruptRequested &&
+        s.gapFlushInterruptSampleTick != 0ULL && gap.epoch == s.gapFlushInterruptEpoch &&
+        r.sourceTick >= s.gapFlushInterruptSampleTick &&
+        gap.acceptedSegments == 1ULL && gap.completedSegments == 0ULL && gap.expectedStep == 1U;
+    const bool targetMatch = requestedSegment && target != EDM105::Phase::None &&
+        r.phase == target && (target == EDM105::Phase::Retreat ? r.v < 0.0 : r.v > 0.0);
+    const auto& guard = s.feedback;
+    const bool cachedStop = valid && guard.identity.session == s.session &&
+        guard.identity.epoch == s.armEpoch && guard.identity.ownerGeneration == s.lease.generation &&
+        guard.lastTick >= r.sourceTick && guard.stopped && guard.forceZero;
+    const char* const coverage = !s.gapFlushInterruptArm ? "NOT_REQUESTED" :
+        !s.gapFlushInterruptRequested ? "NOT_TRIGGERED" : !valid ? "AWAIT_VALID_RT_RECORD" :
+        targetMatch ? "TARGET_PHASE_OBSERVED" : "TARGET_NOT_PROVEN";
+    char record[481]{};
+    const char* const result = event ? event : "UNKNOWN";
+    const auto session = static_cast<unsigned long long>(s.session);
+    const auto emit = [&](int length, const char* part) noexcept
+    {
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record))
+            RtPrintf("%s", record);
+        else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=%.16s session=%llu output=NONE\n", stage, part, session);
+    };
+    emit(std::snprintf(record, sizeof(record),
+        "[%s] event=FLUSH_INTERRUPTION stage=%.32s part=STATE session=%llu armP=%u target=%s requested=%u read=%u identity=%u tuning=%u captured=%u valid=%u phase=%s plannerFault=%u coverage=%s\n",
+        stage, result, session, s.gapFlushInterruptArm, EDM105::PhaseName(target),
+        s.gapFlushInterruptRequested ? 1U : 0U, read ? 1U : 0U, identity ? 1U : 0U,
+        tuning ? 1U : 0U, identity && r.captured ? 1U : 0U, valid ? 1U : 0U,
+        identity && r.captured ? EDM105::PhaseName(r.phase) : "UNAVAILABLE",
+        identity && r.captured && r.fault ? 1U : 0U, coverage), "STATE");
+    if (fixture108)
+    {
+        // Guidance observes existing event sites only. It grants no motion or recovery authority.
+        EDM94::Feedback currentGuard{};
+        const bool guardRead = m_motion.ReadEDM94Feedback(currentGuard);
+        const bool physicalStopped = cachedStop && guardRead && !r.fault && !gap.faulted && !s.rtFaultReported &&
+            gap.reason == EDM96::Reason::None && currentGuard.identity.session == s.session &&
+            currentGuard.identity.epoch == s.armEpoch && currentGuard.identity.ownerGeneration == s.lease.generation &&
+            !currentGuard.faulted && currentGuard.cancelled && currentGuard.armAccepted &&
+            currentGuard.stopped && currentGuard.forceZero && currentGuard.lastTick >= guard.lastTick &&
+            currentGuard.lastTick >= s.lastTick && currentGuard.lastTick >= r.sourceTick &&
+            currentGuard.requiredCycles >= EDM94::RequiredStableCycles &&
+            currentGuard.settledCycles >= currentGuard.requiredCycles && s.cancelled && s.latched;
+        const bool targetStopped = targetMatch && physicalStopped;
+        const bool resetPending = s.resetSeen || s.resetCommitted || s.releaseRequested;
+        const bool resetReleased = s.resetSeen && s.resetCommitted && s.releaseRequested &&
+            currentGuard.released && !currentGuard.active && physicalStopped;
+        const char* outcome = nullptr; const char* next = nullptr;
+        bool observedStartBlocked = false;
+        if (std::strcmp(result, "ARM_REQUEST") == 0)
+        { outcome = "ARM_REQUESTED"; next = "WAIT_FOR_AUTO_HOLD"; }
+        else if (std::strcmp(result, "CANCEL_STOPPED") == 0)
+        {
+            outcome = targetStopped ? "TARGET_STOPPED" : "TARGET_NOT_PROVEN";
+            next = resetPending ? "WAIT_RESET_RELEASE" : targetStopped ?
+                "PRESS_START_ONCE_TO_CHECK_RESET_GATE" : "PRESS_RESET_AND_SEND_LOG";
+        }
+        else if (std::strcmp(result, "START_BLOCKED") == 0)
+        {
+            observedStartBlocked = true; // Only the real CycleStart rejection calls this event.
+            if (reason && std::strcmp(reason, "RESET_RELEASE_PENDING") == 0)
+            { outcome = "RESET_RELEASE_PENDING"; next = "WAIT_RESET_RELEASE"; }
+            else if (reason && std::strcmp(reason, "RESET_REQUIRED") == 0 && !resetPending && m_state == NCState::HOLD)
+            {
+                outcome = "START_BLOCKED_OBSERVED";
+                next = targetStopped ? "PRESS_RESET_THEN_LOAD_NEXT_TEST" : "PRESS_RESET_AND_SEND_LOG";
+            }
+            else { outcome = "START_BLOCKED_STATE_UNPROVEN"; next = "SEND_LOG_CHECK_RESET_STATE"; }
+        }
+        else if (std::strcmp(result, "RELEASED") == 0)
+        {
+            outcome = resetReleased ? "RESET_RELEASED" : "RESET_RELEASE_NOT_PROVEN";
+            next = !resetReleased ? "SEND_LOG_CHECK_RESET_STATE" : targetStopped ?
+                "LOAD_NEXT_TEST_THEN_PRESS_START" : "SEND_LOG_TARGET_NOT_PROVEN";
+        }
+        if (outcome)
+            emit(std::snprintf(record, sizeof(record),
+                "[EDM108] event=OPERATOR_GUIDE stage=%.32s result=%s session=%llu armP=%u target=%s targetMatched=%u physicalStopped=%u targetStopped=%u stable=%u required=%u observedStartBlocked=%u next=%s autoStart=0 autoReset=0 dischargeCommand=NONE\n",
+                result, outcome, session, s.gapFlushInterruptArm, EDM105::PhaseName(target),
+                targetMatch ? 1U : 0U, physicalStopped ? 1U : 0U, targetStopped ? 1U : 0U, currentGuard.settledCycles, currentGuard.requiredCycles,
+                observedStartBlocked ? 1U : 0U, next), "OPERATOR_GUIDE");
+    }
+    if (!identity) return;
+    emit(std::snprintf(record, sizeof(record),
+        "[%s] event=FLUSH_INTERRUPTION stage=%.32s part=FRAME session=%llu epoch=%llu ownerGen=%u requestEpoch=%llu requestTick=%llu sourceTick=%llu plannerTick=%llu sourceNowUs=%llu scalarFrozen=%u cachedGuardTick=%llu cachedPhysicalStop=%u\n",
+        stage, result, session, static_cast<unsigned long long>(gap.epoch), static_cast<unsigned>(gap.ownerGeneration),
+        static_cast<unsigned long long>(s.gapFlushInterruptEpoch),
+        static_cast<unsigned long long>(s.gapFlushInterruptSampleTick),
+        static_cast<unsigned long long>(r.sourceTick), static_cast<unsigned long long>(r.plannerTick),
+        static_cast<unsigned long long>(r.nowUs), frozen ? 1U : 0U,
+        static_cast<unsigned long long>(guard.lastTick), cachedStop ? 1U : 0U), "FRAME");
+    emit(std::snprintf(record, sizeof(record),
+        "[%s] event=FLUSH_INTERRUPTION stage=%.32s part=COUNTS session=%llu step=%u accepted=%llu completed=%llu flushStarted=%llu flushCompleted=%llu currentPhase=%s proofScope=RETAINED_PLANNER_ONLY appliedCommandProven=0 encoderZeroProven=0\n",
+        stage, result, session, gap.expectedStep, static_cast<unsigned long long>(gap.acceptedSegments),
+        static_cast<unsigned long long>(gap.completedSegments), static_cast<unsigned long long>(gap.flushStarted),
+        static_cast<unsigned long long>(gap.flushCompleted), EDM105::PhaseName(gap.flushPhase)), "COUNTS");
+    if (!r.captured) return;
+    emit(std::snprintf(record, sizeof(record),
+        "[%s] event=FLUSH_INTERRUPTION stage=%.32s part=GEOMETRY session=%llu plannerQPulse=%.12g plannerVPulsePerSec=%.12g anchorPulse=%.12g retreatPulse=%.12g returnedPulse=%.12g firstRecordRetained=1 autoReturn=0 resumeFlush=0 restart=RESET_THEN_START_TOP dischargeCommand=NONE\n",
+        stage, result, session, r.q, r.v, gap.flushAnchor, gap.flushRetreat, gap.flushReturned), "GEOMETRY");
+}
+
 void NCManager::LogEDM105SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
 {
     LogEDM99SegmentRecords("EDM105", event, gap, IsEDM97TuningCurrentSameThread(gap));
@@ -16918,12 +20008,24 @@ void NCManager::LogEDM105SameThread(const char* event, const EDM96::Feedback& ga
         "[EDM105] event=FLUSH_EVIDENCE result=%.32s part=GEOMETRY session=%llu tick=%llu anchorPulse=%.12g retreatPulse=%.12g returnedPulse=%.12g qPulse=%.12g vPulsePerSec=%.12g encoderZeroProven=0 proofScope=COMMAND_SCALAR_ONLY dischargeCommand=NONE\n",
         result, session, tick, gap.flushAnchor, gap.flushRetreat, gap.flushReturned, gap.q, gap.v), "FLUSH_GEOMETRY");
     emit(std::snprintf(record, sizeof(record),
-        "[EDM105] event=FLUSH_EVIDENCE result=%.32s part=POLICY session=%llu tick=%llu outwardOnly=1 triggerProgress=0.5 strokeRatio=0.1 speedRatio=0.5 speedCapMmMin=0.06 commandDwellUs=50000 commandDwellTicks=200 dwellSites=2 source=RT_SYNTHETIC hold=CANCEL_RESET_REQUIRED proofScope=COMMAND_SCALAR_ONLY dischargeCommand=NONE\n",
-        result, session, tick), "FLUSH_POLICY");
+        "[EDM105] event=FLUSH_EVIDENCE result=%.32s part=POLICY session=%llu tick=%llu outwardOnly=1 triggerProgress=0.5 strokeRatio=%.12g speedRatio=%.12g speedCapMmMin=%.12g commandDwellUs=%llu commandDwellTicks=%llu dwellSites=2 source=RT_SYNTHETIC hold=CANCEL_RESET_REQUIRED proofScope=COMMAND_SCALAR_ONLY dischargeCommand=NONE\n",
+        result, session, tick, gap.flushProfile.strokeRatio, gap.flushProfile.speedRatio,
+        EDM97::MaximumFeedMmMin * gap.flushProfile.speedRatio,
+        static_cast<unsigned long long>(gap.flushProfile.dwellUs),
+        static_cast<unsigned long long>(EDM107::FlushDwellTicks(gap.flushProfile))), "FLUSH_POLICY");
+    if (m_edm94.gapFlushParameterized)
+        emit(std::snprintf(record, sizeof(record),
+            "[EDM107] event=PARAMETER_EVIDENCE result=%.32s session=%llu tick=%llu I=%.12g J=%.12g K=%llu frozenI=%.12g frozenJ=%.12g frozenK=%llu parametersCurrent=%u freeze=ADMISSION apply=NEXT_ARM proofScope=COMMAND_SCALAR_ONLY dischargeCommand=NONE\n",
+            result, session, tick, gap.flushProfile.strokeRatio * 100.0, gap.flushProfile.speedRatio * 100.0,
+            static_cast<unsigned long long>(gap.flushProfile.dwellUs / 1000ULL),
+            m_edm94.gapFlushParameters.strokeRatio * 100.0, m_edm94.gapFlushParameters.speedRatio * 100.0,
+            static_cast<unsigned long long>(m_edm94.gapFlushParameters.dwellUs / 1000ULL),
+            EDM107::SameFlushProfile(m_edm94.gapFlushParameters, gap.flushProfile) ? 1U : 0U), "FLUSH_PARAMETERS");
 }
 
 void NCManager::LogEDM96SameThread(const char* event, const EDM96::Feedback& gap) const noexcept
 {
+    if (m_edm94.gapHistoryServo) { LogEDM126SameThread(event); return; }
     if (m_edm94.gapFlushProfile)
     { LogEDM105SameThread(event, gap); return; }
     if (m_edm94.gapPairedProfile)
@@ -16960,6 +20062,17 @@ bool NCManager::ReadEDM96CompletedSegmentsSameThread(unsigned completed) const n
 {
     const auto& s = m_edm94;
     EDM96::Feedback gap{};
+    if (s.gapHistoryServo)
+        return completed > 0U && completed <= s.moves && m_motion.ReadEDM96Feedback(gap) &&
+            IsEDM97TuningCurrentSameThread(gap) && IsEDM126CurrentSameThread(completed) &&
+            gap.session == s.session && gap.epoch == m_motion.GetCurrentExecutionEpoch() &&
+            gap.ownerGeneration == s.lease.generation && !gap.faulted && gap.reason == EDM96::Reason::None &&
+            !gap.segmentActive && ((!s.finishPending && !s.complete) ? gap.active && gap.segmentCompleted : true) &&
+            gap.expectedStep == completed && gap.acceptedSegments == completed && gap.completedSegments == completed &&
+            gap.tick && gap.nowUs && gap.sourceSequence && gap.sourceCapturedUs &&
+            gap.nowUs >= gap.sourceCapturedUs && gap.nowUs - gap.sourceCapturedUs <= EDM96::MaximumSourceAgeUs &&
+            std::isfinite(gap.q) && std::isfinite(gap.v) && std::isfinite(gap.length) &&
+            gap.length > 0.0 && gap.q == gap.length && gap.v == 0.0;
     if (!s.gapSegmentProfile || completed == 0U || completed > s.moves || completed > (s.gapEnduranceProfile ? EDM102::MaximumSteps : s.gapContinuousProfile ? EDM100::MaximumSteps : 4U) ||
         !m_motion.ReadEDM96Feedback(gap) || gap.session != s.session ||
         !IsEDM97TuningCurrentSameThread(gap) ||
@@ -16974,12 +20087,13 @@ bool NCManager::ReadEDM96CompletedSegmentsSameThread(unsigned completed) const n
         gap.nowUs < gap.sourceCapturedUs || gap.nowUs - gap.sourceCapturedUs > EDM96::MaximumSourceAgeUs ||
         !std::isfinite(gap.q) || !std::isfinite(gap.v) || !std::isfinite(gap.length) ||
         gap.length <= 0.0 || gap.q != gap.length || gap.v != 0.0) return false;
+    if (s.gapModeFlush && (gap.flushZeroTicks != 0ULL || ((completed & 1U) && gap.flushRetreat != gap.flushAnchor))) return false;
     if (s.gapFlushProfile && (gap.flushStarted != (completed + 1ULL) / 2ULL ||
         gap.flushCompleted != (completed + 1ULL) / 2ULL ||
-        gap.flushZeroTicks < 2ULL * EDM105::CommandDwellTicks * gap.flushCompleted ||
+        (!s.gapModeFlush && gap.flushZeroTicks < 2ULL * EDM107::FlushDwellTicks(gap.flushProfile) * gap.flushCompleted) ||
         gap.flushPhase != ((completed & 1U) ? EDM105::Phase::Complete : EDM105::Phase::None) ||
         ((completed & 1U) ? (gap.flushAnchor <= 0.0 || gap.flushAnchor > gap.length ||
-            gap.flushRetreat >= gap.flushAnchor || gap.flushReturned != gap.flushAnchor) :
+            (!s.gapModeFlush && gap.flushRetreat >= gap.flushAnchor) || gap.flushReturned != gap.flushAnchor) :
             (gap.flushAnchor != 0.0 || gap.flushRetreat != 0.0 || gap.flushReturned != 0.0)))) return false;
     if (s.gapNoiseProfile && (gap.quietWindows != 2ULL * completed ||
         gap.quietZeroTicks < 1600ULL * completed || gap.quietSignChanges != 0ULL ||
@@ -17044,6 +20158,8 @@ bool NCManager::WaitEDM96InitialSourceSameThread()
         gap.sourceSequence == 0ULL || gap.sourceCapturedUs == 0ULL ||
         gap.nowUs < gap.sourceCapturedUs || gap.nowUs - gap.sourceCapturedUs > EDM96::MaximumSourceAgeUs)
         return false;
+    if (s.gapHistoryServo && !WaitEDM126InitialBoundarySameThread()) return false;
+    if (s.gapModeFlush && !WaitEDM116InitialBoundarySameThread()) return false;
     s.gapWaiting = false;
     LogEDM96SameThread("SOURCE_QUALIFIED", gap);
     return true;
@@ -17057,6 +20173,8 @@ bool NCManager::WaitEDM94SameThread()
         ServiceEDM94SameThread();
     auto& s = m_edm94; const auto& f = s.feedback;
     if (!s.latched || s.cancelled || s.releaseRequested || m_state != NCState::RUN) return false;
+    if (s.gapModeInterruption && s.finishPending)
+    { RequestEDM118HoldSameThread(false, "NORMAL_FINISH_FORBIDDEN"); return false; }
     if (f.identity.session == s.session && f.identity.ownerGeneration == s.lease.generation)
     {
         if (s.armPending && f.armAccepted && f.armedReady && f.active && !f.forceZero && !f.faulted && !f.cancelled)
@@ -17077,7 +20195,19 @@ bool NCManager::WaitEDM94SameThread()
             gapEnd.expectedStep == s.moves && gapEnd.acceptedSegments == s.moves &&
             gapEnd.forwardSegments == s.moves / 2U && gapEnd.retreatSegments == s.moves / 2U);
         const bool segmentComplete = !s.gapSegmentProfile || ReadEDM96CompletedSegmentsSameThread(s.moves);
-        if (s.finishPending && gapComplete && segmentComplete && f.active && !f.released && f.pass && f.stopped && f.forceZero && f.finishRequested && !f.faulted && !f.cancelled &&
+        if (s.finishPending && s.gapModeFlush && !IsEDM116CurrentSameThread(EDM114::RequiredRows))
+        { RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_FINAL_MODE_EVIDENCE" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_FINAL_MODE_EVIDENCE" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_FINAL_MODE_EVIDENCE" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_FINAL_MODE_EVIDENCE" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_FINAL_MODE_EVIDENCE" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_FINAL_MODE_EVIDENCE" : m_edm94.gapModeInterruption ? "EDM118_FINAL_MODE_EVIDENCE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_FINAL_MODE_EVIDENCE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_FINAL_MODE_EVIDENCE" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_FINAL_MODE_EVIDENCE" : "EDM116_FINAL_MODE_EVIDENCE"), m_gapDryRun.sourceLine); return false; }
+        if (s.finishPending && s.gapCurveB2 && !IsEDM115CurrentSameThread(EDM114::RequiredRows))
+        { RejectEDM94SameThread("EDM115_FINAL_B2_EVIDENCE", m_gapDryRun.sourceLine); return false; }
+        if (s.finishPending && s.gapPhysicalCurve && !IsEDM114CurrentSameThread(EDM114::RequiredRows))
+        { RejectEDM94SameThread("EDM114_FINAL_CURVE_EVIDENCE", m_gapDryRun.sourceLine); return false; }
+        if (s.finishPending && s.gapCurveRuntime && !IsEDM113RuntimeCurrentSameThread(EDM109::Capacity))
+        { RejectEDM94SameThread("EDM113_FINAL_RUNTIME_EVIDENCE", m_gapDryRun.sourceLine); return false; }
+        if (s.finishPending && gapComplete && segmentComplete &&
+            (!s.gapCurveGeometry || IsEDM112GeometryCurrentSameThread(true)) &&
+            (!s.gapB2CrossSegment || (m_edm110.complete && IsEDM110CompleteSameThread(false))) &&
+            (!s.gapCommonPath || (m_edm109.ledger.Valid() && m_edm109.ledger.Count() == EDM109::Capacity &&
+                m_edm109.plans == EDM109::Capacity - 1U && m_edm109.mappedSegments == EDM109::Capacity)) && f.active && !f.released && f.pass && f.stopped && f.forceZero && f.finishRequested && !f.faulted && !f.cancelled &&
             f.nonzeroSentMask == 63U && f.actualMovedMask == 63U && f.commandMovedMask == 63U && f.sentFrames >= 200ULL &&
             f.settledCycles >= f.requiredCycles && f.requiredCycles >= 200U && f.lastSentTick != 0ULL &&
             f.lastSentTick <= f.lastTick && m_motion.IsGroupDone())
@@ -17092,7 +20222,13 @@ bool NCManager::WaitEDM94SameThread()
 
 void NCManager::ResetEDM94SameThread() noexcept
 {
+    InvalidateEDM109CommonPathSameThread("RESET");
     if (!m_edm94.latched) return;
+    if (m_edm94.gapModeInterruption && !m_edm118.terminalLogged)
+    {
+        m_edm118.resetInterrupted = m_edm118.terminalLogged = true;
+        LogEDM118SameThread("STOP_UNPROVEN_RESET_REQUIRED", "RESET_BEFORE_STOP_PROOF");
+    }
     m_edm94.resetSeen = true;
     CancelEDM94SameThread("RESET");
 }

@@ -515,6 +515,8 @@ WaitConditionFunc NCManager::StartPathCoreArcSameThread(const NCBlock& block)
         return axisIndex >= 0 && axisIndex < 3 &&
             nc->CoordSys.IsTargetWithinSoftwareTravelLimit(nc->m_motion.GetAxisContext(axisIndex), target);
     };
+    if (!GuardEDM114ArcSameThread(block))
+    { RejectEDM94SameThread("EDM114_ARC_AUTHORIZATION", m_pathArc.sourceLine); return nullptr; }
     const bool accepted = m_motion.TryG02G03MoveTransactionalCncTail(m_pathArcCandidate,
         m_pathArcCenterOffset, direction, fullCircle, effectiveFeed, travelGuard,
         CoordSys.commandedMCS, m_pathArcMotion, m_pathArcCommand,
@@ -714,6 +716,7 @@ bool NCManager::CompletePathCoreArcSameThread()
     if (!m_pathArc.bound || !m_pathArc.completed || m_motion.HasPendingSafetyOrRecoveryRequests() ||
         !m_motion.IsGroupDone()) return false;
     if (m_gapWindow.active && m_gapWindow.normalSource && !m_gapWindow.normalProven) return false;
+    if (m_edm94.gapPhysicalCurve && !WaitEDM114ArcBoundarySameThread()) return false;
     if (CoordSys.toolRadiusMode == 40 && CoordSys.activePlane == 17)
         RetainPathCoreArcSameThread(); // Cutter and G18/G19 replay remain a later stage.
     m_pathArc.pending = false;

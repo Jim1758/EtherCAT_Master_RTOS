@@ -41,7 +41,7 @@ static bool ValidateNCMainThreadStackBeforeInitialization() noexcept
         &base, &limit, &top);
     const DWORD error = queried ? 0U : GetLastError();
     const auto result = NCMainStack::Evaluate(queried, bytes, available, base, limit, top);
-    RtPrintf("[EDM105] event=MAIN_STACK build=EDM105_20261014 result=%s reason=%s threadId=%lu requiredBytes=%llu requiredStartupFreeBytes=%llu stackBytes=%lu availableBytes=%lu base=%llu limit=%llu top=%llu topInRange=%u error=%lu phase=BEFORE_RUNTIME_INIT\n",
+    RtPrintf("[EDM110] event=MAIN_STACK build=EDM110_20261014 result=%s reason=%s threadId=%lu requiredBytes=%llu requiredStartupFreeBytes=%llu stackBytes=%lu availableBytes=%lu base=%llu limit=%llu top=%llu topInRange=%u error=%lu phase=BEFORE_RUNTIME_INIT\n",
         result == NCMainStack::Result::Ready ? "PASS" : "BLOCKED", NCMainStack::Name(result),
         static_cast<unsigned long>(GetCurrentThreadId()),
         static_cast<unsigned long long>(NCMainStack::RequiredBytes),

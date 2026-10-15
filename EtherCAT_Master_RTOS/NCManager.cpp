@@ -1180,6 +1180,30 @@ void NCManager::FeedHoldInternal()
     }
 
 
+    // EDM107: an EDM94 HOLD cancels its bracket and requires RESET. The RT
+    // guard owns the formal stop; a second resumable PROGRAM-HOLD request
+    // would carry the retired AUTO lease and falsely fail the J.5 observer.
+    // This branch grants no stop proof, output permission or release.
+    if (m_edm94.latched && m_edm94.cancelled &&
+        (m_state == NCState::RUN || m_state == NCState::HOLD))
+    {
+        const bool enteringHold = m_state == NCState::RUN;
+        if (enteringHold && !GCodeHandlers::Pause_G04(this)) return;
+        CancelPathCoreHoldAutomaticSameThread("EDM94_CANCEL_HOLD");
+        CancelFeedHoldBoundaryShadow(true);
+        m_feedHoldNCSettleRequestSequence =
+            MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+        if (m_programRunStartPending) ClearPendingProgramRunStart(true);
+        if (enteringHold) PausePathCoreLiveRetentionSameThread();
+        m_state = NCState::HOLD;
+        m_pauseAfterBlock = false;
+        FenceEDMRecipeHoldSameThread();
+        if (enteringHold)
+            RtPrintf("[EDM107] event=CANCEL_HOLD session=%llu stopOwner=EDM94_CANCEL_GUARD ordinaryHoldRequest=0 resume=RESET_REQUIRED physicalStopProven=0 authorityReleased=0 dischargeCommand=NONE\n",
+                static_cast<unsigned long long>(m_edm94.session));
+        return;
+    }
+
     if (m_state == NCState::RUN)
     {
         if (!GCodeHandlers::Pause_G04(this)) return;

@@ -44,6 +44,12 @@ class EtherCatMaster;
 #include "EDMZFixtureSession.h" // EDM28/29: explicit unloaded local Z finite-position diagnostics.
 #include "EDMAutomaticFlushRecipe.h" // EDM23: read-only actual recipe binding.
 #include "MotionCore.h"
+#include "EDMSixAxisCurveFixture.h" // EDM112 NC-only curve fixture; no physical arc output.
+#include "EDMSixAxisCurveRuntime.h" // EDM113 independent RT observation receipts; no arc authority.
+#include "EDMSixAxisArcExecution.h"
+#include "EDMSixAxisModeFlush.h"
+#include "EDMSixAxisModeInterruption.h" // EDM118/119 requested B2 return/retreat HOLD evidence; no resume authority.
+#include "EDMSixAxisCurveB2Excursion.h" // EDM114 actual LINEAR6/ARC2 execution proof.
 #include "HomingManager.h"
 #include "CoordinateManager.h"
 #include "MacroEngine.h"       // 必須要有
@@ -2587,6 +2593,7 @@ private:
         std::array<std::array<double, 6U>, 16U> increment{};
         std::array<double, 16U> feed{};
         std::array<int, 18U> pc{};
+        std::array<int, 16U> selectorPC{}; // P129: one explicit P131 before each physical row.
         std::uint64_t session = 0ULL, run = 0ULL, cache = 0ULL, armDispatch = 0ULL;
         std::uint64_t inspectedCache = 0ULL, lastTick = 0ULL;
         unsigned moves = 0U, next = 0U, polls = 0U;
@@ -2628,8 +2635,164 @@ private:
         bool gapPairedProfile = false;
         // EDM105: P103/P104 adds a bounded command-scalar flush to each outward segment.
         bool gapFlushProfile = false;
+        // EDM107-115: P109/P111/P113/P115/P117/P119/P121/P123/P125/P127 freeze bounded flush parameters for this arm.
+        EDM107::FlushProfile gapFlushParameters{};
+        bool gapFlushParameterized = false;
+        bool gapCommonPath = false; // P115/P117/P119/P121/P123 use actual common G01 mapping.
+        bool gapB2CrossSegment = false; // P117/P118: one B2; P119 through P124: two via gapB2Repeat.
+        bool gapB2Repeat = false; // P119 through P124: two events on the third/fifth G01.
+        bool gapCurveGeometry = false; // P121 through P124: numerical curve fixture and actual G01 shadows.
+        bool gapCurveRuntime = false; // P123/P124: RT curve observation only; no physical arc authority.
+        bool gapHistoryServo = false; // P158/P160: GAP-driven retained geometry; NC dispatch never reverses.
+        unsigned gapHistoryArm = 0U;
+        bool gapPhysicalCurve = false; // P125/P126 and P127/P128: explicit physical G17 ARC2 and six-axis G01.
+        bool gapModeFlush = false; // P129/P130 and P132/P133: independent B0/B1/B2 per row.
+        bool gapModeInterruption = false; // P134/P135 return or P136/P137 retreat HOLD; RESET required.
+        unsigned gapModeInterruptionArm = 0U; // Explicit profile selector; never inferred from parity.
+        EDM116::Fixture gapModeFixture = EDM116::Fixture::Canonical116; // Frozen by arm preflight; survives ledger reset.
+        bool gapCurveB2 = false; // P127/P128 only: two physical ARC2/LINEAR6 B2 excursions.
+        // First-flush cancellation: default P105/P107 or parameterized P111/P113; zero selects full cycle.
+        unsigned gapFlushInterruptArm = 0U;
+        std::uint64_t gapFlushInterruptSampleTick = 0ULL, gapFlushInterruptEpoch = 0ULL;
+        bool gapFlushInterruptRequested = false;
     } m_edm94{};
     static_assert(sizeof(EDM94NCState) <= 3584U, "EDM102 bounded NC bracket retains sixteen authored increments and eighteen PCs.");
+    // Persistent NC workspace; never construct/copy the retained ledger on the RTSS stack.
+    struct EDM109NCState
+    {
+        EDM109::CompletedLedger ledger{};
+        EDM109::B2Plan plan{};
+        EDM109::Line line{};
+        EDM109::Source source{};
+        EDM109::Completion completion{};
+        EDM109::Feedback feedback{};
+        std::array<std::uint64_t, 6U> configFingerprint{}, mappingFingerprint{};
+        std::uint64_t plans = 0ULL, mappedSegments = 0ULL, lastMappingTick = 0ULL;
+    } m_edm109{};
+    static_assert(sizeof(EDM109NCState) <= 12288U, "EDM109 NC completed-path workspace remains fixed and off-stack.");
+    struct EDM110NCState
+    {
+        EDM110::CompletionToken token{};
+        EDM110::MotionFeedback feedback{}, first{};
+        bool complete = false, firstRetained = false;
+    } m_edm110{};
+    static_assert(sizeof(EDM110NCState) <= 1024U, "EDM110 NC token and evidence stay small and off-stack.");
+    struct EDM112NCState
+    {
+        EDM112::Workspace workspace{};
+        EDM112::Result result{};
+        std::uint64_t session = 0ULL, run = 0ULL, cache = 0ULL, ownerGeneration = 0ULL;
+        bool valid = false;
+    } m_edm112{};
+    static_assert(sizeof(EDM112NCState) <= 8192U, "EDM112 curve fixture storage remains fixed and off-stack.");
+    struct EDM113NCState
+    {
+        EDM113::Feedback feedback{}, retained{};
+        unsigned acknowledgedRows = 0U;
+        bool failureLogged = false; // Diagnostic only; reset with the session evidence.
+    } m_edm113{};
+    static_assert(sizeof(EDM113NCState) <= 1536U, "EDM113 RT evidence remains fixed and off-stack.");
+    bool IsEDM113RuntimeCurrentSameThread(unsigned completed,
+        std::uint64_t mappingTick = 0ULL) noexcept;
+    void LogEDM113RuntimeSameThread() const noexcept;
+    struct EDM114NCState
+    {
+        EDM114::Feedback feedback{}, retained{};
+        std::uint64_t completionTick = 0ULL, completionCommit = 0ULL;
+        unsigned acknowledgedRows = 0U, arcFlushRows = 0U;
+        bool failureLogged = false;
+    } m_edm114{};
+    static_assert(sizeof(EDM114NCState) <= 1280U, "EDM114 completed execution evidence remains fixed and off-stack.");
+    struct EDM126NCState
+    {
+        NCTranslationSnapshot initialTranslation{};
+        std::uint64_t initialBoundaryTick = 0ULL, initialBoundaryUs = 0ULL;
+        bool initialBoundaryReady = false, initialTranslationValid = false, initialBoundaryLogged = false;
+    } m_edm126{};
+    static_assert(sizeof(EDM126NCState) <= 1024U, "EDM126 bounded NC readiness evidence; trajectory stays in RT.");
+    bool WaitEDM126InitialBoundarySameThread() noexcept;
+    bool IsEDM126CurrentSameThread(unsigned completed) const noexcept;
+    void LogEDM126SameThread(const char* event) const noexcept;
+    struct EDM115NCState
+    {
+        EDM115::CompletionToken token{};
+        std::array<EDM115::CompletionToken, 2U> tokens{};
+        std::array<EDM114::Feedback, 2U> previousRows{}, triggerRows{};
+        EDM115::MotionFeedback feedback{};
+        std::array<EDM115::MotionFeedback, 2U> receipts{};
+        std::array<std::uint64_t, 2U> completionTick{}, completionUs{}, completionCommit{};
+        unsigned retainedEvents = 0U;
+        bool failureLogged = false;
+    } m_edm115{};
+    static_assert(sizeof(EDM115NCState) <= 8192U, "EDM115 two completed event receipts remain fixed and off-stack.");
+    struct EDM116NCState
+    {
+        std::array<EDM116::Policy, 16U> policies{}, completedPolicies{};
+        std::array<EDM114::Source, 16U> completedSources{};
+        std::array<std::uint64_t, 16U> issuedDispatch{}, issuedEpoch{};
+        EDM115::CompletionToken token{};
+        std::array<EDM115::CompletionToken, 2U> tokens{};
+        std::array<EDM114::Feedback, 2U> previousRows{};
+        std::array<EDM114::Feedback, 8U> triggerRows{};
+        EDM116::MotionFeedback feedback{};
+        std::array<EDM116::MotionFeedback, 8U> receipts{};
+        std::array<std::uint64_t, 8U> completionTick{}, completionUs{}, completionCommit{};
+        NCTranslationSnapshot initialTranslation{};
+        std::uint64_t initialBoundaryTick = 0ULL, initialBoundaryUs = 0ULL;
+        unsigned selected = 0U, consumed = 0U, acknowledgedRows = 0U, retainedEvents = 0U;
+        bool pending = false, failureLogged = false;
+        bool initialBoundaryReady = false, initialTranslationValid = false, initialBoundaryLogged = false;
+    } m_edm116{};
+    static_assert(sizeof(EDM116NCState) <= 18432U, "EDM116 sixteen source/policy readbacks and eight physical receipts remain fixed and off-stack.");
+    bool WaitEDM116InitialBoundarySameThread() noexcept;
+    bool IsEDM116SelectorCurrentSameThread(const NCBlock& block) noexcept;
+    bool CommitEDM116ModeSameThread(const NCBlock& block) noexcept;
+    bool BuildEDM116CompletionTokenSameThread(unsigned step) noexcept;
+    bool AuthorizeEDM116SameThread(const NCBlock& block, int gcode, const std::array<double, 2U>& center) noexcept;
+    bool IsEDM116CurrentSameThread(unsigned completed) noexcept;
+    bool IsEDM116ReceiptSameThread(const EDM116::MotionFeedback& feedback, unsigned ordinal,
+        const EDM114::Feedback& trigger, std::uint64_t completionTick, std::uint64_t completionUs) const noexcept;
+    bool RetainEDM116CompletedSameThread(const EDM94::Feedback& guard) noexcept;
+    void LogEDM116SameThread(const char* event) const noexcept;
+    struct EDM118NCState
+    {
+        EDM116::Policy requestedPolicy{};
+        EDM114::Source requestedSource{}, requestedPrevious{};
+        EDM115::Feedback requestSample{};
+        EDM118::Feedback feedback{};
+        std::uint64_t session = 0ULL, run = 0ULL, cache = 0ULL, armEpoch = 0ULL, ownerGeneration = 0ULL;
+        std::uint64_t lastFeedbackTick = 0ULL;
+        unsigned polls = 0U, armP = 0U;
+        bool requested = false, targetMissed = false, terminalLogged = false, stopPassed = false;
+        bool resetInterrupted = false, releasedLogged = false;
+    } m_edm118{};
+    static_assert(sizeof(EDM118NCState) <= 4096U, "EDM118 bounded retained HOLD evidence; survives cancellation and reset ledger invalidation.");
+    bool ServiceEDM118InterruptionSameThread(bool freshPhysical) noexcept;
+    void RequestEDM118HoldSameThread(bool targetReached, const char* reason) noexcept;
+    void LogEDM118SameThread(const char* event, const char* reason) const noexcept;
+    bool BuildEDM115CompletionTokenSameThread(unsigned step) noexcept;
+    bool IsEDM115CurrentSameThread(unsigned completed) noexcept;
+    bool IsEDM115ReceiptSameThread(const EDM115::MotionFeedback& feedback, unsigned ordinal,
+        const EDM114::Feedback& trigger, std::uint64_t completionTick, std::uint64_t completionUs) const noexcept;
+    bool RetainEDM115CompletedSameThread(const EDM94::Feedback& guard) noexcept;
+    void LogEDM115SameThread(const char* event) const noexcept;
+    bool GuardEDM114ArcSameThread(const NCBlock& block) noexcept;
+    bool IsEDM114CurrentSameThread(unsigned completed) noexcept;
+    bool RetainEDM114CompletedSameThread(const EDM94::Feedback& guard) noexcept;
+    void LogEDM114SameThread(const char* event) const noexcept;
+    bool WaitEDM114ArcBoundarySameThread();
+    bool WaitEDM94BoundaryProofSameThread(int sourceLine);
+    bool RunEDM112GeometrySameThread() noexcept;
+    bool IsEDM112GeometryCurrentSameThread(bool requireComplete) const noexcept;
+    bool BuildEDM110CompletionTokenSameThread(unsigned step) noexcept;
+    bool IsEDM110ReceiptSameThread(const EDM110::MotionFeedback& feedback, unsigned step,
+        const EDM94::Feedback& guard) const noexcept;
+    void LogEDM110ReceiptSameThread(const EDM110::MotionFeedback& feedback) const noexcept;
+    bool IsEDM110CompleteSameThread(bool log) noexcept;
+    void LogEDM110SameThread(const char* event) const noexcept;
+    void InvalidateEDM109CommonPathSameThread(const char* reason) noexcept;
+    bool RetainEDM109CompletedSameThread(const EDM94::Feedback& observed) noexcept;
+    bool IsEDM109CompleteSameThread() noexcept;
     std::uint64_t m_edm94Serial = 0ULL;
     bool IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block) noexcept;
     bool InspectEDM94ProgramSameThread() noexcept;
@@ -2650,6 +2813,8 @@ private:
     void LogEDM102SameThread(const char* event, const EDM96::Feedback& feedback) const noexcept;
     void LogEDM104SameThread(const char* event, const EDM96::Feedback& feedback) const noexcept;
     void LogEDM105SameThread(const char* event, const EDM96::Feedback& feedback) const noexcept;
+    bool ServiceEDM106PhaseHoldSameThread(const EDM96::Feedback& feedback) noexcept;
+    void LogEDM106InterruptionSameThread(const char* event, const char* reason) const noexcept;
     bool IsEDM97TuningCurrentSameThread(const EDM96::Feedback& feedback) const noexcept;
     void ServiceEDM94SameThread();
     void CompleteEDM94ProgramEndSameThread(const NCProgramEndGateSnapshot& end,

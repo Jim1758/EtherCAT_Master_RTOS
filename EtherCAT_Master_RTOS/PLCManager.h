@@ -1,6 +1,9 @@
 ﻿#pragma once
 #include <vector>
 #include <cstdint>
+#include <atomic>
+#include "EDMPLCOutputState.h"
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "EDM137 PLC image requires lock-free atomic unsigned");
 #include <string>
 #include <unordered_map>
 #include <algorithm> // 包含演算法標頭檔
@@ -292,6 +295,10 @@ public:
     PLCScanHealth GetScanHealth() const;
 
 private:
+    friend class NCManager;
+    // Only the NC owner can publish these three reserved S points.
+    void PublishEDMOutputs(unsigned word) noexcept;
+    std::atomic<unsigned> m_edmOutputWord{0U};
 
     // 🌟 移除 std::mutex，改用 RTX64 支援的臨界區段
     mutable CRITICAL_SECTION m_logicCS;

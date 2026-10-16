@@ -52,6 +52,12 @@ struct Feedback
     Reason reason = Reason::None;
 };
 
+// A target is an exact retained geometry identity and local canonical coordinate.
+// It contains no output authority and cannot create a history entry.
+struct Cursor { Source source{}; double localMm = 0.0; };
+inline bool SameCursor(const Cursor& a, const Cursor& b) noexcept
+{ return SameSource(a.source,b.source) && a.localMm == b.localMm; }
+
 inline bool Positive(double x) noexcept { return std::isfinite(x) && x > 0.0; }
 inline int Sign(double x) noexcept { return x > 0.0 ? 1 : x < 0.0 ? -1 : 0; }
 inline double Roundoff(double scale) noexcept
@@ -122,17 +128,42 @@ public:
         }
         p = candidate; velocity = cv; acceleration = ca; return true;
     }
+    // Raw cached tangent, normalized by XYZ native distance. Rotary axes
+    // share that same parameter; no geometry builder or motion limit is run.
+    bool TangentPulsePerMm(double q, Point& tangent) const noexcept
+    {
+        if (!valid_ || !std::isfinite(q) || q < 0.0 || q > curve_.lengthMm) return false;
+        Point d1{};
+        for (unsigned i=0U;i<6U;++i) d1[i]=(curve_.line.endPulse[i]-curve_.line.startPulse[i])/curve_.lengthMm;
+        if (curve_.kind==EDM112::Kind::Arc) {
+            const double u=q==curve_.lengthMm?1.0:q/curve_.lengthMm;
+            const double angle=curve_.startAngle+u*curve_.sweepRadians;
+            const double c=std::cos(angle),s=std::sin(angle);
+            d1[axes_.u]=-s*curve_.radiusMm*curve_.sweepRadians*curve_.line.pulsePerNative[axes_.u]/curve_.lengthMm;
+            d1[axes_.v]= c*curve_.radiusMm*curve_.sweepRadians*curve_.line.pulsePerNative[axes_.v]/curve_.lengthMm;
+        }
+        double norm=0.0;
+        for (unsigned i=0U;i<3U;++i) norm=std::hypot(norm,d1[i]/curve_.line.pulsePerNative[i]);
+        if (!Positive(norm)) return false;
+        for (unsigned i=0U;i<6U;++i) {
+            d1[i]/=norm;
+            if (!std::isfinite(d1[i])) return false;
+        }
+        tangent=d1;return true;
+    }
     const EDM112::Curve& Geometry() const noexcept { return curve_; }
     double MaximumSpeed() const noexcept { return speed_; }
     double Acceleration() const noexcept { return acceleration_; }
     double Deceleration() const noexcept { return deceleration_; }
+    const Limits& FrozenLimits() const noexcept { return limits_; }
 private:
     EDM112::Curve curve_{}; Limits limits_{}; NCArcPlaneAxes axes_{};
     double speed_ = 0.0, acceleration_ = 0.0, deceleration_ = 0.0; bool valid_ = false;
 };
 
-class Traversal
+template<unsigned Capacity> class BasicTraversal
 {
+    static_assert(Capacity >= 1U && Capacity <= HistoryCapacity, "bounded history storage");
 public:
     bool Begin(const EDM109::Scope& scope, const Settings& settings) noexcept
     {
@@ -172,10 +203,14 @@ public:
         frontierMm_ = (std::max)(frontierMm_, row.beginMm);
         committedFrontierMm_ = frontierMm_; firstSample_ = true; return true;
     }
-    bool Step(std::uint64_t tick, std::uint64_t nowUs, double signedTargetMmSec, bool physicalSettled) noexcept
+    bool Step(std::uint64_t tick, std::uint64_t nowUs, double signedTargetMmSec, bool physicalSettled, const Cursor* target = nullptr) noexcept
     {
-        if (!currentValid_ || stop_ || feedback_.faulted) return Fail(Reason::State);
+        if (!currentValid_ || suspended_ || stop_ || feedback_.faulted) return Fail(Reason::State);
         if (!std::isfinite(signedTargetMmSec)) return Fail(Reason::Dynamics);
+        unsigned targetIndex = 0U;
+        if (target && (!Locate(*target,targetIndex) || !Positive(signedTargetMmSec))) return Fail(Reason::Source);
+        if (target) signedTargetMmSec *= targetIndex < cursor_ ? -1.0 : targetIndex > cursor_ ? 1.0 :
+            static_cast<double>(Sign(target->localMm-feedback_.localMm));
         if (!Clock(tick, nowUs)) return false;
         lastTarget_ = signedTargetMmSec;
         feedback_.completeReady = feedback_.awaitingSeam = false;
@@ -203,8 +238,8 @@ public:
             }
         }
         feedback_.seamStableCycles = 0U;
-        if (!Integrate(signedTargetMmSec, false)) return false;
-        feedback_.completeReady = cursor_ == count_ && feedback_.localMm == length &&
+        if (!Integrate(signedTargetMmSec, false, target && targetIndex == cursor_ ? target : nullptr)) return false;
+        feedback_.completeReady = !target && cursor_ == count_ && feedback_.localMm == length &&
             feedback_.velocityMmSec == 0.0 && direction > 0;
         return Propose();
     }
@@ -217,13 +252,13 @@ public:
     }
     bool AppendCompleted(std::uint64_t boundaryTick, std::uint64_t commitId) noexcept
     {
-        if (!currentValid_ || pending_ || stop_ || feedback_.faulted || cursor_ != count_ ||
+        if (!currentValid_ || suspended_ || pending_ || stop_ || feedback_.faulted || cursor_ != count_ ||
             !committedValid_ || !committed_.completeReady || committed_.velocityMmSec != 0.0 ||
             committed_.localMm != current_.mapping.Geometry().lengthMm ||
             boundaryTick < committed_.tick || !commitId || commitId <= lastBoundaryCommit_) return Fail(Reason::State);
         if (feedback_.completedRows == (std::numeric_limits<std::uint64_t>::max)()) return Fail(Reason::Overflow);
-        if (count_ == HistoryCapacity) { head_ = (head_ + 1U) % HistoryCapacity; --count_; }
-        history_[(head_ + count_) % HistoryCapacity] = current_; ++count_;
+        if (count_ == Capacity) { head_ = (head_ + 1U) % Capacity; --count_; }
+        history_[(head_ + count_) % Capacity] = current_; ++count_;
         cursor_ = count_ - 1U; currentValid_ = false; lastBoundaryCommit_ = commitId;
         ++feedback_.completedRows; feedback_.historyCount = count_;
         feedback_.completeReady = feedback_.active = false; feedback_.awaitingCurrent = true;
@@ -237,7 +272,7 @@ public:
         // Retain the bounded capture age: a long physical zero fence must
         // not restart an old nonzero reference. The caller additionally
         // proves the fresh physical clock and SAFETY tuple.
-        if (!committedValid_ || !currentValid_ || tick < committed_.tick || nowUs < committed_.nowUs ||
+        if (!committedValid_ || !currentValid_ || suspended_ || tick < committed_.tick || nowUs < committed_.nowUs ||
             nowUs - committed_.nowUs > MaximumSourceAgeUs)
             return Fail(Reason::Clock);
         feedback_ = committed_; cursor_ = committedCursor_; frontierMm_ = committedFrontierMm_;
@@ -253,6 +288,88 @@ public:
         feedback_.stopped = feedback_.velocityMmSec == 0.0;
         feedback_.completeReady = false; return Propose();
     }
+    bool StepTo(std::uint64_t tick, std::uint64_t nowUs, double speedMmSec,
+        const Cursor& target, bool physicalSettled) noexcept
+    { return Step(tick,nowUs,speedMmSec,physicalSettled,&target); }
+    bool CaptureCursor(Cursor& result) const noexcept
+    {
+        if (!currentValid_ || pending_ || !committedValid_ || feedback_.faulted) return false;
+        result.source=committed_.cursorSource; result.localMm=committed_.localMm; return true;
+    }
+    bool ResolveStation(double station, Cursor& result) const noexcept
+    {
+        if (!currentValid_ || !std::isfinite(station) || station < RetreatFloor() ||
+            station > current_.beginMm+current_.mapping.Geometry().lengthMm) return false;
+        for (unsigned i=0U;i<=count_;++i) {
+            const Row& row=i==count_?current_:History(i);
+            if (station >= row.beginMm && station <= row.beginMm+row.mapping.Geometry().lengthMm) {
+                result.source=row.source; result.localMm=station-row.beginMm;
+                if (result.localMm>row.mapping.Geometry().lengthMm) result.localMm=row.mapping.Geometry().lengthMm;
+                return true;
+            }
+        }
+        return false;
+    }
+    // EDM132 absolute retreat resolves a seam to its newer row at local zero.
+    // This remains reachable when the seam itself is the retreat floor;
+    // entering the older row there would require crossing below that floor.
+    // The legacy resolver above deliberately retains its original identity.
+    bool ResolveRetreatStation(double station, Cursor& result) const noexcept
+    {
+        if (!currentValid_ || !std::isfinite(station) || station < RetreatFloor() ||
+            station > current_.beginMm+current_.mapping.Geometry().lengthMm) return false;
+        for (unsigned slot=count_+1U;slot>0U;--slot) {
+            const unsigned i=slot-1U;
+            const Row& row=i==count_?current_:History(i);
+            const double end=row.beginMm+row.mapping.Geometry().lengthMm;
+            if (station>=row.beginMm && station<=end) {
+                result.source=row.source;result.localMm=station-row.beginMm;
+                if (station==end) result.localMm=row.mapping.Geometry().lengthMm;
+                return true;
+            }
+        }
+        return false;
+    }
+    bool EvaluateCursorAtRest(const Cursor& target, Point& position, double* station=nullptr) const noexcept
+    {
+        unsigned index=0U;if (!Locate(target,index)) return false;
+        const Row& row=index==count_?current_:History(index);
+        Point velocity{},acceleration{};
+        if (!row.mapping.Evaluate(target.localMm,0.0,0.0,position,velocity,acceleration)) return false;
+        if (station) *station=row.beginMm+target.localMm;
+        return true;
+    }
+    bool PreviousCursorTarget(double fraction, Cursor& result) const noexcept
+    {
+        if (!currentValid_ || pending_ || !cursor_ || !std::isfinite(fraction) || fraction<0.0 || fraction>1.0) return false;
+        const Row& row=History(cursor_-1U); result.source=row.source;
+        result.localMm=row.mapping.Geometry().lengthMm*fraction;
+        return row.beginMm+result.localMm>=RetreatFloor();
+    }
+    const CachedMapping& CursorMapping() const noexcept { return CursorRow().mapping; }
+    double MinimumStationMm() const noexcept { return RetreatFloor(); }
+    bool Suspended() const noexcept { return suspended_; }
+    bool SuspendAtRest(const Cursor& anchor) noexcept
+    {
+        Cursor current{};
+        if (suspended_ || stop_ || !CaptureCursor(current) || !SameCursor(current,anchor) ||
+            committed_.velocityMmSec!=0.0 || feedback_.tick!=committed_.tick) return Fail(Reason::State);
+        suspended_=true; return true;
+    }
+    bool ResumeAtRest(const Cursor& anchor, const Point& mappedPulse, unsigned physicalStable,
+        std::uint64_t tick, std::uint64_t nowUs) noexcept
+    {
+        Cursor current{};
+        if (!suspended_ || stop_ || !CaptureCursor(current) || !SameCursor(current,anchor) ||
+            committed_.velocityMmSec!=0.0 || !EDM109::SamePulse(mappedPulse,committed_.positionPulse) ||
+            physicalStable<RequiredSeamStableCycles || tick<committed_.tick || nowUs<committed_.nowUs)
+            return Fail(Reason::State);
+        // Only a frozen zero cursor can be rebased after a separately mapped
+        // excursion. The first proposal remains exactly zero at the anchor.
+        feedback_=committed_; feedback_.tick=tick; feedback_.nowUs=nowUs;
+        feedback_.completeReady=false; feedback_.seamStableCycles=0U;
+        firstSample_=true; suspended_=false; return true;
+    }
     const Feedback& Current() const noexcept { return feedback_; }
     const Feedback& Committed() const noexcept { return committed_; }
     void Clear() noexcept
@@ -262,19 +379,28 @@ public:
         feedback_ = Feedback{}; committed_ = Feedback{};
         head_ = count_ = cursor_ = committedCursor_ = 0U;
         lastBoundaryCommit_ = 0ULL; frontierMm_ = committedFrontierMm_ = lastTarget_ = 0.0;
-        begun_ = currentValid_ = committedValid_ = pending_ = stop_ = firstSample_ = sameTick_ = false;
+        begun_ = currentValid_ = committedValid_ = pending_ = stop_ = firstSample_ = sameTick_ = suspended_ = false;
     }
 private:
     struct Row { CachedMapping mapping{}; Source source{}; double beginMm = 0.0; };
-    Row history_[HistoryCapacity]{}, current_{};
+    Row history_[Capacity]{}, current_{};
     EDM109::Scope scope_{}; Settings settings_{}; Feedback feedback_{}, committed_{};
     unsigned head_ = 0U, count_ = 0U, cursor_ = 0U, committedCursor_ = 0U;
     std::uint64_t lastBoundaryCommit_ = 0ULL;
     double frontierMm_ = 0.0, committedFrontierMm_ = 0.0, lastTarget_ = 0.0;
     bool begun_ = false, currentValid_ = false, committedValid_ = false, pending_ = false;
-    bool stop_ = false, firstSample_ = false, sameTick_ = false;
-    const Row& History(unsigned index) const noexcept { return history_[(head_ + index) % HistoryCapacity]; }
+    bool stop_ = false, firstSample_ = false, sameTick_ = false, suspended_ = false;
+    const Row& History(unsigned index) const noexcept { return history_[(head_ + index) % Capacity]; }
     const Row& CursorRow() const noexcept { return cursor_ == count_ ? current_ : History(cursor_); }
+    bool Locate(const Cursor& target, unsigned& index) const noexcept
+    {
+        if (!ValidSource(target.source) || !std::isfinite(target.localMm) || !currentValid_ ||
+            target.source.ordinal>current_.source.ordinal || current_.source.ordinal-target.source.ordinal>count_) return false;
+        index=count_-static_cast<unsigned>(current_.source.ordinal-target.source.ordinal);
+        const Row& row=index==count_?current_:History(index);
+        return SameSource(target.source,row.source) && target.localMm>=0.0 && target.localMm<=row.mapping.Geometry().lengthMm &&
+            row.beginMm+target.localMm>=RetreatFloor();
+    }
     double RetreatFloor() const noexcept
     { return (std::max)(count_ ? History(0U).beginMm : current_.beginMm, frontierMm_ - settings_.maximumRetreatMm); }
     bool Fail(Reason reason) noexcept
@@ -294,7 +420,7 @@ private:
         const double drop = decel * SampleSeconds, residual = std::fmod(speed, drop);
         return 0.5 * speed * (speed / decel) + 0.5 * SampleSeconds * residual * (1.0 - residual / drop);
     }
-    bool Integrate(double target, bool stopping) noexcept
+    bool Integrate(double target, bool stopping, const Cursor* destination = nullptr) noexcept
     {
         if (sameTick_) { feedback_.accelerationMmSec2 = 0.0; return true; }
         const Row& row = CursorRow(); const CachedMapping& map = row.mapping;
@@ -307,9 +433,15 @@ private:
         if (std::fabs(target - old) <= rate * SampleSeconds) next = target;
         const int direction = Sign(old) ? Sign(old) : Sign(next);
         const double floor = (std::max)(0.0, RetreatFloor() - row.beginMm);
-        const double lower = (std::min)(length, floor), tolerance = Roundoff(length);
+        double lower = (std::min)(length, floor), upper = length;
+        if (destination) {
+            if (destination->localMm < feedback_.localMm) lower=(std::max)(lower,destination->localMm);
+            else if (destination->localMm > feedback_.localMm) upper=destination->localMm;
+            else lower=upper=destination->localMm;
+        }
+        const double tolerance = Roundoff(length);
         if (direction) {
-            const double distance = direction > 0 ? length - feedback_.localMm : feedback_.localMm - lower;
+            const double distance = direction > 0 ? upper - feedback_.localMm : feedback_.localMm - lower;
             const double speed = std::fabs(old), minimum = (std::max)(0.0, speed - map.Deceleration() * SampleSeconds);
             double candidate = std::fabs(next);
             if (distance < -tolerance || StopDistance(speed, map.Deceleration()) > distance + tolerance) return Fail(Reason::Bounds);
@@ -324,15 +456,23 @@ private:
                 candidate = (std::max)(minimum, (std::min)(std::fabs(next), candidate));
                 next = direction * candidate;
             }
+            // A rounded braking speed can retain a sub-roundoff residual
+            // after its final deceleration sample. Permit zero only when
+            // that residual's entire sample displacement is below the
+            // endpoint roundoff budget; Evaluate still enforces every axis
+            // acceleration limit on the resulting exact-zero sample.
+            if (std::fabs(next)*SampleSeconds <= tolerance &&
+                minimum*SampleSeconds <= tolerance &&
+                std::fabs(distance-0.5*speed*SampleSeconds) <= tolerance) next=0.0;
         }
         double q = feedback_.localMm + 0.5 * (old + next) * SampleSeconds;
         if (next == 0.0) {
-            if (std::fabs(q - length) <= tolerance) q = length;
+            if (std::fabs(q - upper) <= tolerance) q = upper;
             else if (std::fabs(q - lower) <= tolerance) q = lower;
         }
-        if (!std::isfinite(q) || q < lower - tolerance || q > length + tolerance) return Fail(Reason::Bounds);
+        if (!std::isfinite(q) || q < lower - tolerance || q > upper + tolerance) return Fail(Reason::Bounds);
         // Only zero-speed sub-roundoff endpoint correction is permitted.
-        if (q < lower || q > length) return Fail(Reason::Bounds);
+        if (q < lower || q > upper) return Fail(Reason::Bounds);
         feedback_.localMm = q; feedback_.velocityMmSec = next;
         feedback_.accelerationMmSec2 = (next - old) / SampleSeconds; return true;
     }
@@ -351,5 +491,6 @@ private:
     }
     bool Propose() noexcept { if (!Refresh()) return false; pending_ = true; return true; }
 };
+using Traversal = BasicTraversal<HistoryCapacity>;
 static_assert(sizeof(Feedback) <= 1024U, "EDM126 feedback stays bounded");
 }

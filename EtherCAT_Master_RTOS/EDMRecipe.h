@@ -407,6 +407,7 @@ namespace EDMRecipe
                 return false;
             }
             m_active = source.m_active;
+            m_explicitActualSinceSelection = source.m_explicitActualSinceSelection;
             m_store = source.m_store;
             m_tableIndex = source.m_tableIndex;
             m_boundAttempted = source.m_boundAttempted;
@@ -443,6 +444,18 @@ namespace EDMRecipe
         }
         bool Ready() const noexcept { return m_boundGood && !m_exhausted && m_store != nullptr && m_store->Ready(); }
         const Catalog* GetCatalog() const noexcept { return Ready() ? m_store->Get() : nullptr; }
+        // Owner-thread provenance, separate from persisted cell overrides. An
+        // explicit actual entry is valid only for the current row selection.
+        // This records no engineering-unit conversion and grants no motion.
+        bool HasExplicitActualSinceSelection(std::uint16_t fieldId) const noexcept
+        {
+            if (!Ready() || !m_active.summary.rowSelected) return false;
+            const Catalog& catalog = *GetCatalog();
+            for (std::size_t i = 0U; i < catalog.fields.size(); ++i)
+                if (catalog.fields[i].id == fieldId)
+                    return m_active.fields[i].configured && m_explicitActualSinceSelection[i];
+            return false;
+        }
         Summary Current() const noexcept
         {
             if (Ready()) return m_active.summary;
@@ -569,6 +582,7 @@ namespace EDMRecipe
             target.actualValue = value;
             target.modified = modified;
             target.overridePresent = GetCatalog()->schemaVersion == 2U || modified;
+            m_explicitActualSinceSelection[index] = true;
             m_active.summary.lastError = Error::None;
             return true;
         }
@@ -591,6 +605,7 @@ namespace EDMRecipe
             if (!target.modified && modified) ++m_active.summary.modifiedCount;
             target.stageId = stageId; target.baseValue = base; target.actualValue = value;
             target.modified = modified; target.overridePresent = true;
+            m_explicitActualSinceSelection[index] = true;
             m_active.summary.lastError = Error::None;
             return true;
         }
@@ -640,6 +655,7 @@ namespace EDMRecipe
             if (target.modified) --m_active.summary.modifiedCount;
             target.actualValue = target.baseValue;
             target.overridePresent = target.modified = false;
+            m_explicitActualSinceSelection[index] = false;
             m_active.summary.lastError = Error::None;
             return true;
         }
@@ -666,7 +682,11 @@ namespace EDMRecipe
         }
 
     private:
-        void ClearFields() noexcept { for (auto& field : m_active.fields) field = ParameterSnapshot{}; }
+        void ClearFields() noexcept
+        {
+            for (auto& field : m_active.fields) field = ParameterSnapshot{};
+            m_explicitActualSinceSelection.fill(false);
+        }
         void ClearActive(Error error) noexcept
         {
             const std::uint64_t generation = m_active.summary.generation;
@@ -728,10 +748,13 @@ namespace EDMRecipe
             target.stageId = stage.id;
             target.baseValue = target.actualValue = stage.value;
             target.overridePresent = target.modified = false;
+            m_explicitActualSinceSelection[fieldIndex] = false;
             m_active.summary.lastError = Error::None;
             return true;
         }
         ActiveSnapshot m_active{};
+        // Fixed owner RAM; never serialized or exposed through SDK snapshots.
+        std::array<bool, MaximumFields> m_explicitActualSinceSelection{};
         const CatalogStore* m_store = nullptr;
         std::size_t m_tableIndex = MaximumTables;
         bool m_boundAttempted = false, m_boundGood = false, m_exhausted = false;

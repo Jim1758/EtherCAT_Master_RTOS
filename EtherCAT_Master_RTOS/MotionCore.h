@@ -73,8 +73,12 @@ struct MotionEccentricCProducerWorkspace;
 #include "EDMSixAxisModeInterruption.h"
 #include "EDMSixAxisGapTraversal.h"
 #include "EDMSixAxisGapTraversalFixture.h"
+#include "EDMSixAxisGapModeCoordinator.h"
+#include "EDMSixAxisGapModeFixture.h"
 #include "EDMSixAxisGapTuning.h"
 #include "EDMSixAxisGapContinuous.h"
+#include "EDM129PhysicalSource.h"
+#include "EDM130WorkTimer.h"
 #include "EDMSixAxisGapEndurance.h"
 #include "EDMSixAxisGapPairedPath.h"
 #include "EDMSixAxisGapFlushPath.h"
@@ -84,6 +88,41 @@ struct MotionEccentricCProducerWorkspace;
 // EDM126 supplementary evidence; only live authority grants physical output.
 namespace EDM126
 {
+    // EDM133 FIX1 observations never participate in an authority decision.
+    enum class FirstCauseSite : std::uint8_t { None, SourcePrecheck, PerAxisOrphan, GroupPrescan, GuardSource };
+    enum FirstCauseGate : std::uint32_t {
+        FirstCauseCurrent=1U, FirstCauseSource=2U, FirstCauseEpoch=4U,
+        FirstCauseLease=8U, FirstCauseCommand=16U, FirstCauseMember=32U,
+        FirstCauseMapping=64U, FirstCauseOrphan=128U
+    };
+    enum FirstCauseFlag : std::uint32_t {
+        FirstCauseTimingCurrent=1U, FirstCauseProfileCurrent=2U, FirstCauseParticipationCurrent=4U,
+        FirstCauseGuardFaulted=8U, FirstCauseGroupActive=16U, FirstCauseEpochMatches=32U,
+        FirstCauseLeaseCurrent=64U, FirstCauseIdentityMatches=128U, FirstCauseGuardForceZero=256U,
+        FirstCauseProposalDiffers=512U, FirstCausePrivateHeightCurrent=1024U,
+        FirstCauseCommittedHeightValid=2048U, FirstCausePublicHeightValid=4096U,
+        FirstCauseWorkValid=8192U
+    };
+    struct FirstCauseRecord
+    {
+        std::uint64_t tick=0ULL, nowUs=0ULL, executionEpoch=0ULL, ownerGeneration=0ULL;
+        std::uint64_t expectedEpoch=0ULL, liveEpoch=0ULL, committedTick=0ULL, publishedTick=0ULL;
+        std::uint64_t eventIndex=0ULL, privateTriggered=0ULL, privateCompleted=0ULL;
+        std::uint64_t publicTriggered=0ULL, publicCompleted=0ULL;
+        std::uint32_t evaluatedGates=0U, failedGates=0U, flags=0U;
+        std::uint32_t orderedGroupAxes=0xffffffU, orderedCommandAxes=0xffffffU;
+        std::uint16_t statusWord[6U]{};
+        std::int8_t modes[6U]{};
+        FirstCauseSite site=FirstCauseSite::None;
+        std::int8_t axis=-1, groupAxisCount=0, commandAxisCount=0;
+        std::uint8_t memberMask=0U, interpolatingMask=0U, inputMask=0U;
+        std::uint8_t committedPhase=0U, proposedPhase=0U, publishedPhase=0U;
+        std::uint8_t guardReason=0U, commandFailure=0U, owner=0U;
+        std::uint8_t existMask=0U, configMatchMask=0U, mappingMatchMask=0U;
+        std::uint8_t faultMask=0U, servoOnMask=0U, axisIndexMatchMask=0U;
+    };
+    static_assert(sizeof(FirstCauseRecord)<=176U && std::is_trivially_copyable<FirstCauseRecord>::value,
+        "EDM133 FIX1 first-cause evidence stays bounded.");
     struct MotionFeedback
     {
         Feedback traversal{};
@@ -93,12 +132,47 @@ namespace EDM126
         std::uint64_t sourceSequence=0ULL, sourceCapturedUs=0ULL;
         unsigned fixture=0U, authorizedRows=0U, completedRows=0U;
         bool enabled=false, active=false, sourceReady=false, rowActive=false, rowCompleted=false, faulted=false;
+        bool physicalAd=false;
         double voltage=0.0, targetRatio=0.0;
         EDM88::Reason sourceReason=EDM88::Reason::None;
         Reason reason=Reason::None;
+        FirstCauseRecord firstSource{}, firstOrphan{};
     };
     static_assert(sizeof(MotionFeedback)<=1024U && std::is_trivially_copyable<MotionFeedback>::value,
         "EDM126 feedback must be fixed size.");
+}
+
+namespace EDM128
+{
+    struct MotionFeedback
+    {
+        Feedback coordinator{};
+        EDM116::Policy rowPolicy{};
+        EDM107::FlushProfile flushProfile{};
+        std::uint64_t session=0ULL, armEpoch=0ULL, liveEpoch=0ULL, ownerGeneration=0ULL;
+        std::uint64_t tick=0ULL, nowUs=0ULL, lastMappingTick=0ULL, lastMappingUs=0ULL;
+        unsigned fixture=0U, authorizedRows=0U, completedRows=0U;
+        bool enabled=false, active=false, faulted=false;
+        bool physicalAd=false;
+        bool workTimeFlush=false;
+        EDM130::Recipe timerRecipe{};
+    };
+    static_assert(sizeof(MotionFeedback)<=1496U && std::is_trivially_copyable<MotionFeedback>::value,
+        "EDM128 coordination evidence must stay bounded.");
+}
+
+namespace EDM129
+{
+    struct MotionFeedback
+    {
+        Binding binding{};
+        SourceEvidence source{};
+        std::uint64_t session=0ULL, armEpoch=0ULL, liveEpoch=0ULL, ownerGeneration=0ULL;
+        std::uint64_t tick=0ULL, nowUs=0ULL;
+        bool enabled=false, active=false, sourceReady=false, faulted=false;
+    };
+    static_assert(sizeof(MotionFeedback)<=1024U && std::is_trivially_copyable<MotionFeedback>::value,
+        "EDM129 physical source evidence must stay bounded.");
 }
 
 // EDM109 records only geometry actually admitted and mapped by the existing
@@ -2484,6 +2558,37 @@ public:
         const EDM97::Tuning& tuning, const EDM114::Source& previousSource,
         std::uint64_t completionCommit, std::uint64_t completionTick) noexcept;
     bool ReadEDM126Feedback(EDM126::MotionFeedback& feedback) const noexcept;
+    bool SubmitEDM128Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+        const EDM107::FlushProfile& flushProfile, unsigned fixture) noexcept;
+    bool AuthorizeEDM128Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
+        const std::array<double,6U>& increment, const std::array<double,2U>& center,
+        double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+        const EDM97::Tuning& tuning, const EDM114::Source& previousSource,
+        std::uint64_t completionCommit, std::uint64_t completionTick, const EDM116::Policy& policy) noexcept;
+    bool ReadEDM128Feedback(EDM128::MotionFeedback& feedback) const noexcept;
+    bool SubmitEDM129Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+        const EDM107::FlushProfile& flushProfile, unsigned fixture) noexcept;
+    bool AuthorizeEDM129Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
+        const std::array<double,6U>& increment, const std::array<double,2U>& center,
+        double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+        const EDM97::Tuning& tuning, const EDM114::Source& previousSource,
+        std::uint64_t completionCommit, std::uint64_t completionTick, const EDM116::Policy& policy) noexcept;
+    bool ReadEDM129Feedback(EDM129::MotionFeedback& feedback) const noexcept;
+    bool SubmitEDM130Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+        const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+        const EDM107::FlushProfile& flushProfile, unsigned fixture, const EDM130::Recipe& recipe) noexcept;
+    bool AuthorizeEDM130Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
+        const std::array<double,6U>& increment, const std::array<double,2U>& center,
+        double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+        const EDM97::Tuning& tuning, const EDM114::Source& previousSource,
+        std::uint64_t completionCommit, std::uint64_t completionTick, const EDM116::Policy& policy,
+        const EDM130::Recipe& recipe) noexcept;
+    bool ReadEDM130Feedback(EDM128::MotionFeedback& feedback) const noexcept;
     bool ReadEDM96Feedback(EDM96::Feedback& feedback) const noexcept;
     bool ReadEDM109Feedback(EDM109::Feedback& feedback) const noexcept;
     bool ReadEDM113Feedback(EDM113::Feedback& feedback) const noexcept;
@@ -3574,6 +3679,10 @@ private:
         bool curveB2 = false; // EDM115 explicit frozen LINEAR6 / ARC2 excursion
         bool modeFlush = false; // EDM116 actual B0/B1/B2 flush selector
         bool historyServo = false; // EDM126 distinct signal-driven retained-curve profile
+        bool historyModeFlush = false; // EDM128 frozen coordination opt-in
+        bool physicalAd = false; // EDM129 independent real-source selection
+        bool workTimeFlush = false; // EDM130 E-recipe committed machining-time opt-in
+        EDM130::Recipe timerRecipe{}; // immutable NC -> RT admission and each handoff
         unsigned historyFixture = 0U;
         EDM116::Fixture modeFixture = EDM116::Fixture::Canonical116; // fixed at arm; never row-selected
         EDM97::Tuning tuning{0.0, 0.0, 0.0};
@@ -3598,6 +3707,7 @@ private:
         EDM116::Policy modePolicy{};
         std::uint64_t historyBoundaryTick=0ULL, historyCommit=0ULL;
         EDM126::Source historyPrevious{};
+        EDM129::Binding physicalBinding{}; // Independently published ARM source binding
         bool gapSegment = false;
         bool proportional = false;
         bool noise = false;
@@ -3614,6 +3724,10 @@ private:
         bool curveB2 = false; // EDM115 explicit frozen LINEAR6 / ARC2 excursion
         bool modeFlush = false; // EDM116 actual B0/B1/B2 flush selector
         bool historyServo = false; // EDM126 distinct signal-driven retained-curve profile
+        bool historyModeFlush = false; // EDM128 frozen coordination opt-in
+        bool physicalAd = false; // EDM129 independent real-source selection
+        bool workTimeFlush = false; // EDM130 E-recipe committed machining-time opt-in
+        EDM130::Recipe timerRecipe{}; // immutable NC -> RT admission and each handoff
         unsigned historyFixture = 0U;
         EDM97::Tuning tuning{0.0, 0.0, 0.0};
         EDM107::FlushProfile flushProfile{}; // copied NC -> RT; immutable for this session
@@ -3730,10 +3844,39 @@ private:
         const std::array<double, 6U>& endPulse, const std::array<double, 6U>& pulsePerNative,
         double startAngle, double sweepRadians, double length,
         EDM94HandoffMessage& message) noexcept;
+    bool AuthorizeEDM126FeedScoped(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
+        std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
+        const std::array<double,6U>& increment, const std::array<double,2U>& center,
+        double feedMMMin, MotionExecutionEpoch epoch, const MotionOwnerLease& lease,
+        const EDM97::Tuning& tuning, const EDM114::Source& previousSource,
+        std::uint64_t completionCommit, std::uint64_t completionTick,
+        bool modeFlush, const EDM116::Policy& policy, bool physicalAd=false,
+        bool workTimeFlush=false, const EDM130::Recipe& recipe=EDM130::Recipe{}) noexcept;
+    bool IsEDM128FeedPolicyCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
+    bool IsEDM129FeedSourceCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
+    bool IsEDM129AwaitFreshZeroCurrent(std::uint64_t nowUs) const noexcept;
+    bool IsEDM130FeedTimingCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
+    bool IsEDM130TimingCurrent() const noexcept;
+    bool m_edm130Profile=false;
+    EDM130::Recipe m_edm130ArmRecipe{};
+    bool m_edm129Profile=false;
+    EDM129::PhysicalSource m_edm129Source{};
+    EDM129::MotionFeedback m_edm129Current{};
+    EDM53::Channel<EDM129::MotionFeedback,1024U> m_edm129Feedback{};
+    EDM64::Snapshot m_edm129Physical{}; // Captured before the observer's QPC read.
+    EDM53::Stamp m_edm129PhysicalStamp{};
+    const EDM126::Feedback& EDM126CurrentImage() const noexcept;
+    const EDM126::Feedback& EDM126CommittedImage() const noexcept;
+    bool m_edm128Profile=false;
+    EDM128::Coordinator m_edm128{};
+    EDM128::TestVoltage m_edm128Voltage{};
+    EDM128::MotionFeedback m_edm128Current{};
+    EDM53::Channel<EDM128::MotionFeedback,1496U> m_edm128Feedback{};
     // EDM126 bounded traversal state (no NC rewind or historical side-effect replay).
     bool m_edm126Profile=false, m_edm126Participating=false, m_edm126PhysicalSettled=false;
     EDM126::Traversal m_edm126{};
     EDM126::MotionFeedback m_edm126Current{};
+    EDM126::FirstCauseRecord m_edm133FirstSource{}, m_edm133FirstOrphan{};
     EDM53::Channel<EDM126::MotionFeedback,1024U> m_edm126Feedback{};
     EDM96::Feedback m_edm126Gap{};
     EDM88::Qualifier m_edm126Source{};
@@ -3764,6 +3907,8 @@ private:
     bool StepEDM126Stop(AxisCommand& command) noexcept;
     void ApplyEDM126Scalar(AxisCommand& command, bool stopping) noexcept;
     void PublishEDM126Feedback() noexcept;
+    void CaptureEDM133FirstCause(EDM126::FirstCauseSite site, int axis,
+        std::uint32_t evaluatedGates, std::uint32_t failedGates) noexcept;
     bool m_edm114Profile = false;
     EDM114::Mapping m_edm114Mapping{};
     EDM114::Feedback m_edm114Current{};

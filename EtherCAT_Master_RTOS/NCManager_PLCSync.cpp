@@ -8,6 +8,7 @@
 #include "PLCManager.h"
 #include "NCPLCMap.h"
 #include "AlarmManager.h"
+#include <rtapi.h>
 
 extern PLCManager* g_PLC; // 引入 PLC 大腦
 
@@ -154,4 +155,109 @@ void NCManager::SyncNCStateToPLC()
                 false);
         }
     }
+}
+// EDM137: these points are a coherent NC-owned image. A diagnostic fixture
+// may move all six axes but never admits the discharge power supply.
+void NCManager::ForceEDMPLCOutputsOffSameThread(const char* reason) noexcept
+{
+    const auto old=m_edm137PLC.Current();
+    const auto session=m_edm137PLC.Session();
+    m_edm137PLC.Clear();
+    if(g_PLC)g_PLC->PublishEDMOutputs(0U);
+    if(old.word||old.requested)
+        RtPrintf("[EDM137] event=PLC_OUTPUT session=%llu reason=%s S80=0 S92=0 S93=0 requested=0 inhibited=1 production=0\n",
+            static_cast<unsigned long long>(session),reason?reason:"STOP");
+}
+
+void NCManager::SyncEDMPLCOutputsSameThread() noexcept
+{
+    EDM137PLC::Input input{};
+    const auto& s=m_edm94;
+    const auto& guard=s.feedback;
+    const auto& rows=m_edm116;
+    const auto executionEpoch=m_motion.GetCurrentExecutionEpoch();
+    // armEpoch identifies the frozen session. Each accepted G01/G02/G03
+    // advances executionEpoch through the NC-authorized row ledger.
+    const bool rowCounts=rows.consumed<=16U&&rows.acknowledgedRows<=rows.consumed&&
+        rows.consumed-rows.acknowledgedRows<=1U;
+    const auto issuedEpoch=rowCounts&&rows.consumed?rows.issuedEpoch[rows.consumed-1U]:s.armEpoch;
+    const auto previousEpoch=rowCounts&&rows.consumed>1U?rows.issuedEpoch[rows.consumed-2U]:s.armEpoch;
+    const bool issued=rowCounts&&(!rows.consumed||
+        (rows.issuedDispatch[rows.consumed-1U]&&issuedEpoch&&previousEpoch&&
+            issuedEpoch==(previousEpoch==0xFFFFFFFFULL?1ULL:previousEpoch+1ULL)));
+    const bool handoff=issued&&rows.consumed>rows.acknowledgedRows;
+    const bool epochCurrent=issued&&(executionEpoch==issuedEpoch||
+        (handoff&&executionEpoch==previousEpoch));
+    // Only the explicit new fixture binds E12. Earlier diagnostics and all
+    // ordinary CNC programs retain an all-OFF image; RUN alone is no permit.
+    const bool fixture=s.gapHistoryArm==202U||s.gapHistoryArm==204U||s.gapHistoryArm==206U||s.gapHistoryArm==208U;
+    const bool live=fixture&&m_state==NCState::RUN&&m_mode==NCOperationMode::MEMORY&&
+        !Close_System_Com_flag&&m_externalReadyInterlock&&!AlarmManager::GetInstance().HasAlarm()&&
+        m_resetContinuationPhase==ResetContinuationPhase::IDLE&&s.latched&&s.ready&&s.everArmed&&
+        !s.armPending&&!s.complete&&!s.cancelled&&!s.resetSeen&&!s.resetCommitted&&
+        !s.releaseRequested&&!s.rtFaultReported&&s.gapWorkTime&&m_edm130.bound&&
+        s.run==m_pathCoreLiveBookkeeping.currentRunToken&&s.cache==GetBaseProgramCache().GetGeneration()&&
+        EDM130::HasBoundFlushStages(m_edm130.recipe)&&EDM130::ValidRecipe(m_edm130.recipe)&&
+        epochCurrent&&m_motion.IsMotionOwnerLeaseCurrent(s.lease)&&
+        !m_motion.HasPendingSafetyOrRecoveryRequests()&&guard.lastTick&&
+        guard.identity.session==s.session&&guard.identity.epoch==s.armEpoch&&
+        guard.identity.ownerGeneration==s.lease.generation&&guard.active&&guard.armAccepted&&
+        !guard.cancelled&&!guard.faulted&&!guard.released;
+    EDM128::Phase phase=EDM128::Phase::Gap;
+    if(live) {
+        input.session=s.session;input.epoch=s.armEpoch;input.owner=s.lease.generation;
+        input.recipe=m_edm130.recipe.generation;input.admitted=true;
+        input.polarity=EDM130::FrozenPolarity(m_edm130.recipe.flushStages)!=0U;
+        EDM128::MotionFeedback mode{};
+        const bool read=m_motion.ReadEDM130Feedback(mode);
+        const bool timely=mode.tick&&guard.lastTick&&
+            (mode.tick>=guard.lastTick||guard.lastTick-mode.tick<=4ULL);
+        const bool receiptRows=mode.authorizedRows<=rows.consumed&&
+            rows.consumed-mode.authorizedRows<=1U&&mode.completedRows<=mode.authorizedRows&&
+            mode.authorizedRows-mode.completedRows<=1U;
+        const auto receiptEpoch=receiptRows&&mode.authorizedRows?
+            rows.issuedEpoch[mode.authorizedRows-1U]:s.armEpoch;
+        const bool receiptHandoff=handoff&&receiptRows&&mode.authorizedRows+1U==rows.consumed&&
+            mode.completedRows==mode.authorizedRows&&mode.coordinator.phase==EDM128::Phase::Gap;
+        const bool receiptIdentity=receiptRows&&mode.liveEpoch==receiptEpoch&&
+            (mode.authorizedRows==rows.consumed||receiptHandoff);
+        const bool validReceipt=read&&receiptIdentity&&mode.enabled&&mode.active&&!mode.faulted&&
+            mode.physicalAd&&mode.workTimeFlush&&mode.fixture==((s.gapHistoryArm==204U||s.gapHistoryArm==208U)?1U:0U)&&mode.session==s.session&&mode.armEpoch==s.armEpoch&&
+            mode.ownerGeneration==s.lease.generation&&guard.identity.session==s.session&&
+            guard.identity.epoch==s.armEpoch&&guard.identity.ownerGeneration==s.lease.generation&&
+            guard.active&&guard.armAccepted&&!guard.cancelled&&!guard.faulted&&!guard.released&&
+            EDM130::SameRecipe(mode.timerRecipe,m_edm130.recipe)&&!mode.coordinator.faulted&&
+            !mode.coordinator.stopped&&mode.authorizedRows<=16U&&mode.completedRows<=mode.authorizedRows;
+        // Authorization, epoch publication and RT feedback are separate
+        // bounded publications. During that one recorded handoff keep the
+        // last coherent image; a foreign or unissued epoch still retires it.
+        input.unavailable=!read||(validReceipt&&(!timely||mode.liveEpoch!=executionEpoch));
+        const bool current=validReceipt&&timely&&mode.liveEpoch==executionEpoch;
+        if(!current&&!input.unavailable)input.stop=true;
+        if(current) {
+            input.machiningAccepted=mode.authorizedRows!=0U;
+            phase=mode.coordinator.phase;
+            switch(phase) {
+            case EDM128::Phase::Brake:case EDM128::Phase::AnchorDwell:
+            case EDM128::Phase::Outbound:case EDM128::Phase::TopDwell:
+            case EDM128::Phase::Returning:case EDM128::Phase::ReturnDwell:
+            case EDM128::Phase::Resume:input.flushActive=true;break;
+            case EDM128::Phase::Gap:break;
+            default:input.stop=true;break;
+            }
+        }
+    }
+    const auto previous=m_edm137PLC.Current();
+    const auto previousSession=m_edm137PLC.Session();
+    const auto output=m_edm137PLC.Observe(input);
+    // The PLC publication masks S92 again even if an unexpected caller were
+    // to corrupt a logical request. No hardware discharge enable exists here.
+    if(g_PLC)g_PLC->PublishEDMOutputs(output.word);
+    if(previous.word!=output.word||previous.requested!=output.requested||
+        previousSession!=m_edm137PLC.Session())
+        RtPrintf("[EDM137] event=PLC_OUTPUT session=%llu phase=%s S80=%u S92=%u S93=%u requested=%u inhibited=1 production=0\n",
+            static_cast<unsigned long long>(input.session?input.session:previousSession),
+            input.unavailable?"UNAVAILABLE":EDM128::PhaseName(phase),
+            (output.word&EDM137PLC::FlushBit)?1U:0U,(output.word&EDM137PLC::DischargeBit)?1U:0U,
+            (output.word&EDM137PLC::PolarityBit)?1U:0U,output.requested?1U:0U);
 }

@@ -2023,15 +2023,123 @@ bool MotionCore::SubmitEDM126Arm(std::uint64_t session, MotionExecutionEpoch epo
 bool MotionCore::ReadEDM126Feedback(EDM126::MotionFeedback& feedback) const noexcept
 { return m_edm126Feedback.Read(feedback).Ready(); }
 
+bool MotionCore::SubmitEDM128Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+    const EDM107::FlushProfile& flushProfile, unsigned fixture) noexcept
+{
+    if (!EDM97::ValidTuning(tuning) || !EDM107::ValidFlushProfile(flushProfile) || fixture>1U || !session || !epoch ||
+        lease.owner!=MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) || epoch!=GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty=0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty,session,std::memory_order_acq_rel,std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U,std::memory_order_release);
+    EDM94ArmRequest request{}; request.session=session; request.epoch=epoch; request.lease=lease;
+    request.gapSegment=request.proportional=request.physicalCurve=request.historyServo=request.historyModeFlush=true;
+    request.tuning=tuning; request.flushProfile=flushProfile; request.historyFixture=fixture;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL,std::memory_order_release); return false;
+}
+
+bool MotionCore::SubmitEDM129Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+    const EDM107::FlushProfile& flushProfile, unsigned fixture) noexcept
+{
+    if (!EDM97::ValidTuning(tuning) || !EDM107::ValidFlushProfile(flushProfile) || fixture>1U || !session || !epoch ||
+        lease.owner!=MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) || epoch!=GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty=0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty,session,std::memory_order_acq_rel,std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U,std::memory_order_release);
+    EDM94ArmRequest request{}; request.session=session; request.epoch=epoch; request.lease=lease;
+    request.gapSegment=request.proportional=request.physicalCurve=request.historyServo=request.historyModeFlush=request.physicalAd=true;
+    request.tuning=tuning; request.flushProfile=flushProfile; request.historyFixture=fixture;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL,std::memory_order_release); return false;
+}
+
+bool MotionCore::SubmitEDM130Arm(std::uint64_t session, MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
+    const EDM107::FlushProfile& flushProfile, unsigned fixture, const EDM130::Recipe& recipe) noexcept
+{
+    if (!(EDM130::MatchesFlushSpeed(recipe,flushProfile.speedRatio) &&
+            EDM130::MatchesFlushHeight(recipe,flushProfile.strokeRatio,flushProfile.dwellUs)) || !EDM97::ValidTuning(tuning) || !EDM107::ValidFlushProfile(flushProfile) || fixture>1U || !session || !epoch ||
+        lease.owner!=MotionOwner::AUTO || !IsMotionOwnerLeaseCurrent(lease) || epoch!=GetCurrentExecutionEpoch()) return false;
+    std::uint64_t empty=0ULL;
+    if (!m_edm94Claim.compare_exchange_strong(empty,session,std::memory_order_acq_rel,std::memory_order_acquire)) return false;
+    m_edm94CompletionDecision.store(0U,std::memory_order_release);
+    EDM94ArmRequest request{}; request.session=session; request.epoch=epoch; request.lease=lease;
+    request.gapSegment=request.proportional=request.physicalCurve=request.historyServo=request.historyModeFlush=request.physicalAd=true;
+    request.workTimeFlush=true; request.timerRecipe=recipe;
+    request.tuning=tuning; request.flushProfile=flushProfile; request.historyFixture=fixture;
+    if (m_edm94ArmRequests.ProducerTryPush(request)) return true;
+    m_edm94Claim.store(0ULL,std::memory_order_release); return false;
+}
+
+bool MotionCore::ReadEDM129Feedback(EDM129::MotionFeedback& feedback) const noexcept
+{ return m_edm129Feedback.Read(feedback).Ready(); }
+
+bool MotionCore::ReadEDM128Feedback(EDM128::MotionFeedback& feedback) const noexcept
+{ return m_edm128Feedback.Read(feedback).Ready(); }
+
+bool MotionCore::ReadEDM130Feedback(EDM128::MotionFeedback& feedback) const noexcept
+{ return m_edm128Feedback.Read(feedback).Ready(); }
+
+const EDM126::Feedback& MotionCore::EDM126CurrentImage() const noexcept
+{ return m_edm128Profile ? m_edm128.Current() : m_edm126.Current(); }
+const EDM126::Feedback& MotionCore::EDM126CommittedImage() const noexcept
+{ return m_edm128Profile ? m_edm128.Committed() : m_edm126.Committed(); }
+
+
 bool MotionCore::AuthorizeEDM126Feed(std::uint64_t session,std::uint64_t run,std::uint64_t cache,
     std::uint64_t dispatch,int sourcePC,unsigned step,int gCode,const std::array<double,6U>& increment,
     const std::array<double,2U>& center,double feedMMMin,MotionExecutionEpoch epoch,
     const MotionOwnerLease& lease,const EDM97::Tuning& tuning,const EDM114::Source& previousSource,
     std::uint64_t completionCommit,std::uint64_t completionTick) noexcept
 {
+    return AuthorizeEDM126FeedScoped(session,run,cache,dispatch,sourcePC,step,gCode,increment,center,feedMMMin,epoch,lease,
+        tuning,previousSource,completionCommit,completionTick,false,EDM116::Policy{});
+}
+
+bool MotionCore::AuthorizeEDM128Feed(std::uint64_t session,std::uint64_t run,std::uint64_t cache,
+    std::uint64_t dispatch,int sourcePC,unsigned step,int gCode,const std::array<double,6U>& increment,
+    const std::array<double,2U>& center,double feedMMMin,MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease,const EDM97::Tuning& tuning,const EDM114::Source& previousSource,
+    std::uint64_t completionCommit,std::uint64_t completionTick,const EDM116::Policy& policy) noexcept
+{
+    return AuthorizeEDM126FeedScoped(session,run,cache,dispatch,sourcePC,step,gCode,increment,center,feedMMMin,epoch,lease,
+        tuning,previousSource,completionCommit,completionTick,true,policy);
+}
+
+bool MotionCore::AuthorizeEDM129Feed(std::uint64_t session,std::uint64_t run,std::uint64_t cache,
+    std::uint64_t dispatch,int sourcePC,unsigned step,int gCode,const std::array<double,6U>& increment,
+    const std::array<double,2U>& center,double feedMMMin,MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease,const EDM97::Tuning& tuning,const EDM114::Source& previousSource,
+    std::uint64_t completionCommit,std::uint64_t completionTick,const EDM116::Policy& policy) noexcept
+{
+    return AuthorizeEDM126FeedScoped(session,run,cache,dispatch,sourcePC,step,gCode,increment,center,feedMMMin,epoch,lease,
+        tuning,previousSource,completionCommit,completionTick,true,policy,true);
+}
+
+bool MotionCore::AuthorizeEDM130Feed(std::uint64_t session,std::uint64_t run,std::uint64_t cache,
+    std::uint64_t dispatch,int sourcePC,unsigned step,int gCode,const std::array<double,6U>& increment,
+    const std::array<double,2U>& center,double feedMMMin,MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease,const EDM97::Tuning& tuning,const EDM114::Source& previousSource,
+    std::uint64_t completionCommit,std::uint64_t completionTick,const EDM116::Policy& policy,const EDM130::Recipe& recipe) noexcept
+{
+    return AuthorizeEDM126FeedScoped(session,run,cache,dispatch,sourcePC,step,gCode,increment,center,feedMMMin,epoch,lease,
+        tuning,previousSource,completionCommit,completionTick,true,policy,true,true,recipe);
+}
+
+bool MotionCore::AuthorizeEDM126FeedScoped(std::uint64_t session,std::uint64_t run,std::uint64_t cache,
+    std::uint64_t dispatch,int sourcePC,unsigned step,int gCode,const std::array<double,6U>& increment,
+    const std::array<double,2U>& center,double feedMMMin,MotionExecutionEpoch epoch,
+    const MotionOwnerLease& lease,const EDM97::Tuning& tuning,const EDM114::Source& previousSource,
+    std::uint64_t completionCommit,std::uint64_t completionTick,
+    bool modeFlush,const EDM116::Policy& policy,bool physicalAd,bool workTimeFlush,const EDM130::Recipe& recipe) noexcept
+{
     m_edm94FeedAuthorization=EDM94FeedAuthorization{};
+    if(workTimeFlush && !(EDM130::MatchesFlushSpeed(recipe,policy.profile.speedRatio) &&
+            EDM130::MatchesFlushHeight(recipe,policy.profile.strokeRatio,policy.profile.dwellUs))) return false;
     EDM126::MotionFeedback p{}; EDM94::Feedback boundary{}; EDM114::Feedback row{};
-    if (!ReadEDM126Feedback(p) || !p.enabled || !p.active || p.faulted || !p.sourceReady ||
+    if (!ReadEDM126Feedback(p) || p.physicalAd!=physicalAd || !p.enabled || !p.active || p.faulted || !p.sourceReady ||
         p.session!=session || p.liveEpoch!=epoch || p.ownerGeneration!=lease.generation ||
         p.authorizedRows!=step || p.completedRows!=step || p.rowActive || p.fixture>1U ||
         !ReadEDM94Feedback(boundary) || !boundary.active || !boundary.armedReady || boundary.forceZero ||
@@ -2047,6 +2155,14 @@ bool MotionCore::AuthorizeEDM126Feed(std::uint64_t session,std::uint64_t run,std
     a.sourcePC=sourcePC; a.step=step; a.gCode=gCode; a.increment=increment; a.arcCenter=center;
     a.feedMMMin=feedMMMin; a.epoch=epoch; a.lease=lease; a.tuning=tuning;
     a.gapSegment=a.proportional=a.physicalCurve=a.historyServo=true; a.historyFixture=p.fixture;
+    a.historyModeFlush=modeFlush; a.modePolicy=policy; a.physicalAd=physicalAd;
+    a.workTimeFlush=workTimeFlush; a.timerRecipe=recipe;
+    if(physicalAd) {
+        EDM129::MotionFeedback physical{};
+        if(!ReadEDM129Feedback(physical) || !physical.enabled) return false;
+        a.physicalBinding=physical.binding;
+    }
+    if(modeFlush) a.flushProfile=policy.profile;
     if (step) {
         if (!ReadEDM114Feedback(row) || !row.enabled || row.failed || !row.geometryValid || !row.rowComplete ||
             !p.rowCompleted || !p.traversal.completeReady || !p.lastMappingTick ||
@@ -2073,10 +2189,10 @@ bool MotionCore::IsEDM126FeedCurrent(const EDM94FeedAuthorization& a) const noex
         !a.noise && !a.burst && !a.continuous && !a.endurance && !a.paired && !a.flush && !a.commonPath &&
         !a.b2CrossSegment && !a.b2Repeat && !a.curveRuntime && !a.curveB2 && !a.modeFlush &&
         EDM95::EmptyPermit(a.gapPermit) && EDM110::EmptyToken(a.previous) && EDM115::EmptyToken(a.previousCurve) &&
-        EDM116::SamePolicy(a.modePolicy,EDM116::Policy{}) && EDM107::IsDefaultFlushProfile(a.flushProfile) &&
+        IsEDM128FeedPolicyCurrent(a) && IsEDM129FeedSourceCurrent(a) && IsEDM130FeedTimingCurrent(a) &&
         (arc?EDM116::ValidArcRecipe(a.gCode,a.step,a.increment,a.arcCenter,a.feedMMMin,fixture):
             (a.gCode==1 && a.arcCenter==std::array<double,2U>{} && EDM96::ValidIncrement(a.increment,a.feedMMMin))) &&
-        ReadEDM126Feedback(p) && p.enabled && p.active && !p.faulted && p.sourceReady && p.fixture==a.historyFixture &&
+        ReadEDM126Feedback(p) && p.physicalAd==a.physicalAd && p.enabled && p.active && !p.faulted && p.sourceReady && p.fixture==a.historyFixture &&
         p.session==a.session && p.liveEpoch==a.epoch && p.ownerGeneration==a.lease.generation &&
         p.authorizedRows==a.step && p.completedRows==a.step && !p.rowActive &&
         ReadEDM96Feedback(gap) && gap.active && !gap.faulted && gap.tunedMode && !gap.noiseMode &&
@@ -2088,10 +2204,200 @@ bool MotionCore::IsEDM126FeedCurrent(const EDM94FeedAuthorization& a) const noex
             (!a.historyCommit && !a.historyBoundaryTick && EDM126::SameSource(a.historyPrevious,EDM126::Source{})));
 }
 
+bool MotionCore::IsEDM129FeedSourceCurrent(const EDM94FeedAuthorization& a) const noexcept
+{
+    EDM129::MotionFeedback physical{};
+    const bool read=ReadEDM129Feedback(physical);
+    if(!a.physicalAd) return (!read || !physical.enabled) && EDM129::SameBinding(a.physicalBinding,EDM129::Binding{});
+    if(!a.historyServo || !a.historyModeFlush || !read || !physical.enabled || !physical.active ||
+        !physical.sourceReady || physical.faulted || !physical.source.ready || !physical.source.active || physical.source.faulted ||
+        physical.source.session!=a.session || physical.source.reason!=EDM129::SourceReason::None ||
+        physical.session!=a.session || physical.liveEpoch!=a.epoch || physical.ownerGeneration!=a.lease.generation ||
+        !EDM129::SameBinding(a.physicalBinding,physical.binding) || !physical.tick || !physical.nowUs) return false;
+    const auto& frame=physical.source.frame;
+    return EDM129::ValidBinding(physical.binding) && frame.valid &&
+        EDM88::SameIdentity(frame.identity,EDM129::SourceConfig(physical.binding).identity) &&
+        frame.identity.kind==EDM88::SourceKind::Physical && std::isfinite(frame.voltageV) && frame.voltageV>=0.0 && frame.voltageV<=300.0 &&
+        physical.source.freshFrames && physical.source.sourcePublication>physical.binding.baselinePublication &&
+        physical.source.sourceCycle>physical.binding.baselineCycle && physical.source.nowUs==physical.nowUs &&
+        frame.sequence>physical.binding.baselineSequence && frame.capturedAtUs>physical.binding.admittedUs &&
+        physical.nowUs>=frame.capturedAtUs && physical.nowUs-frame.capturedAtUs<=EDM126::MaximumSourceAgeUs &&
+        physical.nowUs-frame.capturedAtUs<=physical.binding.shadowMaxAgeUs &&
+        physical.source.maximumAgeUs<=EDM126::MaximumSourceAgeUs &&
+        physical.source.firstSourceCapturedUs>physical.binding.admittedUs && physical.source.firstSourceCapturedUs<=frame.capturedAtUs;
+}
+
+bool MotionCore::IsEDM130FeedTimingCurrent(const EDM94FeedAuthorization& a) const noexcept
+{
+    EDM128::MotionFeedback mode{};
+    const bool read=ReadEDM128Feedback(mode);
+    bool heightScaleCurrent=true;
+    if(read && a.workTimeFlush && EDM130::HasBoundHeight(a.timerRecipe) && mode.coordinator.targetCaptured) {
+        EDM114::Feedback geometry{};
+        heightScaleCurrent=ReadEDM114Feedback(geometry) && geometry.geometryValid && geometry.session==mode.session;
+        for(unsigned axis=0U;heightScaleCurrent && axis<6U;++axis)
+            heightScaleCurrent=geometry.pulsePerNative[axis]==mode.coordinator.heightPulsePerNative[axis];
+    }
+    if(!a.workTimeFlush) return EDM130::EmptyRecipe(a.timerRecipe) && (!read ||
+        (!mode.workTimeFlush && EDM130::EmptyRecipe(mode.timerRecipe) &&
+            EDM130::ValidWorkEvidence(mode.coordinator.work) && mode.coordinator.work.workTimeUs==0ULL &&
+            EDM128::ValidHeightProof(mode.coordinator,0.0)&&
+            EDM128::ValidSpeedProof(mode.coordinator,EDM130::FlushStages{})));
+    return a.physicalAd && a.historyServo && a.historyModeFlush && read && heightScaleCurrent && mode.enabled && mode.active &&
+        !mode.faulted && mode.workTimeFlush && mode.physicalAd && mode.session==a.session &&
+        mode.liveEpoch==a.epoch && mode.ownerGeneration==a.lease.generation &&
+        (EDM130::MatchesFlushSpeed(a.timerRecipe,a.flushProfile.speedRatio) &&
+            EDM130::MatchesFlushHeight(a.timerRecipe,a.flushProfile.strokeRatio,a.flushProfile.dwellUs)) &&
+        (EDM130::MatchesFlushSpeed(a.timerRecipe,a.modePolicy.profile.speedRatio) &&
+            EDM130::MatchesFlushHeight(a.timerRecipe,a.modePolicy.profile.strokeRatio,a.modePolicy.profile.dwellUs)) &&
+        (EDM130::MatchesFlushSpeed(mode.timerRecipe,mode.flushProfile.speedRatio) &&
+            EDM130::MatchesFlushHeight(mode.timerRecipe,mode.flushProfile.strokeRatio,mode.flushProfile.dwellUs)) &&
+        (!mode.authorizedRows || ((EDM130::MatchesFlushSpeed(mode.timerRecipe,mode.rowPolicy.profile.speedRatio) &&
+            EDM130::MatchesFlushHeight(mode.timerRecipe,mode.rowPolicy.profile.strokeRatio,mode.rowPolicy.profile.dwellUs)) &&
+            (EDM130::MatchesFlushSpeed(mode.timerRecipe,mode.coordinator.policy.profile.speedRatio) &&
+            EDM130::MatchesFlushHeight(mode.timerRecipe,mode.coordinator.policy.profile.strokeRatio,mode.coordinator.policy.profile.dwellUs)))) &&
+        EDM130::SameRecipe(a.timerRecipe,mode.timerRecipe) && EDM130::ValidWorkEvidence(mode.coordinator.work) &&
+        EDM128::ValidSpeedProof(mode.coordinator,a.timerRecipe.flushStages) &&
+        EDM128::ValidHeightProof(mode.coordinator,mode.authorizedRows?EDM130::FrozenJumpHeightMm(a.timerRecipe):0.0,
+            mode.authorizedRows?a.timerRecipe.deepFlushCycleInterval:0U,
+            mode.authorizedRows?EDM130::FrozenDeepMultiplier(a.timerRecipe):0.0,
+            mode.authorizedRows && EDM130::HasBoundDeep(a.timerRecipe)) &&
+        (a.step ? mode.coordinator.work.workTimeUs==a.timerRecipe.workTimeUs : mode.coordinator.work.workTimeUs==0ULL);
+}
+
+bool MotionCore::IsEDM130TimingCurrent() const noexcept
+{
+    const auto& mode=m_edm128Current; const auto& event=m_edm128.Evidence(); const auto& work=event.work;
+    if(mode.workTimeFlush!=m_edm130Profile || !EDM130::SameRecipe(mode.timerRecipe,m_edm130ArmRecipe) ||
+        !EDM130::ValidWorkEvidence(work) ||
+        !EDM128::ValidSpeedProof(event,m_edm130ArmRecipe.flushStages) ||
+        !EDM128::ValidSpeedProof(mode.coordinator,m_edm130ArmRecipe.flushStages) ||
+        (mode.authorizedRows==m_edm126Current.authorizedRows&&
+            !EDM128::SameSpeedProof(event,mode.coordinator)) ||
+        (m_edm128.Active()&&!m_edm128.IsFlushStagesCurrent(m_edm130ArmRecipe.flushStages)) ||
+        (m_edm126Participating && (m_edm94Handoff.authorization.workTimeFlush!=m_edm130Profile ||
+            !EDM130::SameRecipe(m_edm94Handoff.authorization.timerRecipe,m_edm130ArmRecipe)))) return false;
+    if(!m_edm130Profile) return EDM130::EmptyRecipe(m_edm130ArmRecipe) && work.workTimeUs==0ULL &&
+        EDM128::ValidHeightProof(event,0.0) && (!m_edm128.Active() || m_edm128.IsHeightCurrent(0.0));
+    if(!m_edm129Profile || !m_edm128Profile ||
+        !(EDM130::MatchesFlushSpeed(m_edm130ArmRecipe,m_edm107ArmFlushProfile.speedRatio) &&
+            EDM130::MatchesFlushHeight(m_edm130ArmRecipe,m_edm107ArmFlushProfile.strokeRatio,m_edm107ArmFlushProfile.dwellUs)) ||
+        !(EDM130::MatchesFlushSpeed(m_edm130ArmRecipe,mode.flushProfile.speedRatio) &&
+            EDM130::MatchesFlushHeight(m_edm130ArmRecipe,mode.flushProfile.strokeRatio,mode.flushProfile.dwellUs)) ||
+        (m_edm126Participating && (!(EDM130::MatchesFlushSpeed(m_edm130ArmRecipe,m_edm94Handoff.authorization.flushProfile.speedRatio) &&
+            EDM130::MatchesFlushHeight(m_edm130ArmRecipe,m_edm94Handoff.authorization.flushProfile.strokeRatio,m_edm94Handoff.authorization.flushProfile.dwellUs)) ||
+            !(EDM130::MatchesFlushSpeed(m_edm130ArmRecipe,m_edm94Handoff.authorization.modePolicy.profile.speedRatio) &&
+            EDM130::MatchesFlushHeight(m_edm130ArmRecipe,m_edm94Handoff.authorization.modePolicy.profile.strokeRatio,m_edm94Handoff.authorization.modePolicy.profile.dwellUs))))) return false;
+    if(!m_edm128.Active()) return work.workTimeUs==0ULL && EDM128::ValidHeightProof(event,0.0);
+    const double heightMm=EDM130::FrozenJumpHeightMm(m_edm130ArmRecipe);
+    if(!EDM128::ValidHeightProof(mode.coordinator,mode.authorizedRows?heightMm:0.0,
+            mode.authorizedRows?m_edm130ArmRecipe.deepFlushCycleInterval:0U,
+            mode.authorizedRows?EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe):0.0,
+            mode.authorizedRows && EDM130::HasBoundDeep(m_edm130ArmRecipe)) ||
+        !EDM128::ValidHeightProof(event,heightMm,m_edm130ArmRecipe.deepFlushCycleInterval,
+            EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe),EDM130::HasBoundDeep(m_edm130ArmRecipe)) ||
+        !m_edm128.IsHeightCurrent(heightMm,m_edm130ArmRecipe.deepFlushCycleInterval,
+            EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe),EDM130::HasBoundDeep(m_edm130ArmRecipe))) return false;
+    if(!(EDM130::MatchesFlushSpeed(m_edm130ArmRecipe,mode.rowPolicy.profile.speedRatio) &&
+            EDM130::MatchesFlushHeight(m_edm130ArmRecipe,mode.rowPolicy.profile.strokeRatio,mode.rowPolicy.profile.dwellUs)) ||
+        !(EDM130::MatchesFlushSpeed(m_edm130ArmRecipe,event.policy.profile.speedRatio) &&
+            EDM130::MatchesFlushHeight(m_edm130ArmRecipe,event.policy.profile.strokeRatio,event.policy.profile.dwellUs))) return false;
+    if(work.workTimeUs!=m_edm130ArmRecipe.workTimeUs || event.eventCount!=work.completedEvents ||
+        static_cast<std::uint64_t>(event.modeEvents[0U])+event.modeEvents[1U]+event.modeEvents[2U]!=work.completedEvents ||
+        work.triggeredEvents>(std::numeric_limits<unsigned>::max)()/3U ||
+        event.qualifiedDwells<3ULL*work.completedEvents || event.qualifiedDwells>3ULL*work.triggeredEvents ||
+        work.lastTriggerTick>m_edm128.Committed().tick || work.lastTriggerUs>m_edm128.Committed().nowUs ||
+        work.lastCompleteTick>m_edm128.Committed().tick || work.lastCompleteUs>m_edm128.Committed().nowUs) return false;
+    // A formal STOP may retire an in-flight event without inventing its return.
+    if(event.phase==EDM128::Phase::Stopping || event.phase==EDM128::Phase::Stopped || event.phase==EDM128::Phase::Fault) return true;
+    const bool inFlight=work.triggeredEvents==work.completedEvents+1ULL;
+    return inFlight==(event.phase!=EDM128::Phase::Gap) &&
+        (!inFlight || !work.previousEligible) &&
+        (event.phase!=EDM128::Phase::Gap || (!event.detached && event.anchorCaptured==event.exactReturn &&
+            event.anchorCaptured==event.rowEventComplete));
+}
+
+bool MotionCore::IsEDM128FeedPolicyCurrent(const EDM94FeedAuthorization& a) const noexcept
+{
+    EDM128::MotionFeedback mode{};
+    if (!ReadEDM128Feedback(mode)) return !a.historyModeFlush && !a.workTimeFlush && EDM130::EmptyRecipe(a.timerRecipe) &&
+        EDM116::SamePolicy(a.modePolicy,EDM116::Policy{}) && EDM107::IsDefaultFlushProfile(a.flushProfile);
+    if (!a.historyModeFlush) return !mode.enabled && !a.workTimeFlush && EDM130::EmptyRecipe(a.timerRecipe) &&
+        EDM116::SamePolicy(a.modePolicy,EDM116::Policy{}) && EDM107::IsDefaultFlushProfile(a.flushProfile);
+    const auto& policy=a.modePolicy;
+    const auto fixture=a.historyFixture?EDM116::Fixture::ModalComplement127:EDM116::Fixture::Modal127;
+    if (!a.historyServo || mode.workTimeFlush!=a.workTimeFlush || !IsEDM130FeedTimingCurrent(a) || mode.physicalAd!=a.physicalAd || !mode.enabled || !mode.active || mode.faulted || mode.fixture!=a.historyFixture ||
+        mode.session!=a.session || mode.liveEpoch!=a.epoch || mode.ownerGeneration!=a.lease.generation ||
+        mode.authorizedRows!=a.step || mode.completedRows!=a.step || policy.fixture!=fixture ||
+        !EDM116::PolicyMatchesBinding(policy,a.step,a.sourcePC,a.dispatch) ||
+        // Timed sessions use the authored NC modal policy bound below to its
+        // source and predecessor; untimed fixtures retain their fixed B sequence.
+        (!a.workTimeFlush && policy.mode!=EDM116::ExpectedMode(a.step)) ||
+        !EDM107::SameFlushProfile(policy.profile,a.flushProfile) ||
+        !EDM107::SameFlushProfile(a.flushProfile,mode.flushProfile)) return false;
+    const auto& event=mode.coordinator;
+    if(event.liveAnchor!=(a.physicalAd && a.step!=0U) || event.faulted || event.stopped || event.detached ||
+        event.phase!=EDM128::Phase::Gap || event.stableCycles || event.stableStartUs) return false;
+    bool previousHadEvent=false;
+    if(a.workTimeFlush) {
+        const auto& work=event.work;
+        if(!EDM130::ValidWorkEvidence(work) || work.triggeredEvents!=work.completedEvents ||
+            event.eventCount!=work.completedEvents || event.qualifiedDwells!=3ULL*work.completedEvents ||
+            static_cast<std::uint64_t>(event.modeEvents[0U])+event.modeEvents[1U]+event.modeEvents[2U]!=work.completedEvents ||
+            event.anchorCaptured!=event.exactReturn || event.anchorCaptured!=event.rowEventComplete) return false;
+        previousHadEvent=event.rowEventComplete;
+    } else {
+        const unsigned expectedEvents=(a.step+1U)/2U;
+        if(event.eventCount!=expectedEvents || event.qualifiedDwells!=3U*expectedEvents) return false;
+        unsigned expectedModes[3U]{};
+        for(unsigned row=0U;row<a.step;row+=2U) ++expectedModes[static_cast<unsigned>(EDM116::ExpectedMode(row))];
+        for(unsigned modeIndex=0U;modeIndex<3U;++modeIndex) if(event.modeEvents[modeIndex]!=expectedModes[modeIndex]) return false;
+        previousHadEvent=(a.step&1U)!=0U;
+        if(event.anchorCaptured!=previousHadEvent || event.exactReturn!=previousHadEvent || event.rowEventComplete!=previousHadEvent) return false;
+    }
+    if(!a.step) return EDM116::SamePolicy(mode.rowPolicy,EDM116::Policy{}) &&
+        EDM116::SamePolicy(event.policy,EDM116::Policy{}) && !event.anchorCaptured && !event.exactReturn && !event.rowEventComplete;
+    if(!EDM116::SamePolicy(event.policy,mode.rowPolicy)) return false;
+    if(previousHadEvent) {
+        const auto& anchor=event.anchor;
+        if(a.workTimeFlush && (event.work.lastTriggerTick>=anchor.tick || event.work.lastTriggerUs>=anchor.nowUs ||
+            anchor.tick>=event.work.lastCompleteTick || anchor.nowUs>=event.work.lastCompleteUs ||
+            event.work.lastCompleteTick>mode.lastMappingTick || event.work.lastCompleteUs>mode.lastMappingUs)) return false;
+        const bool historical=a.workTimeFlush ? anchor.historyDepth!=0U : !a.physicalAd && a.step>1U;
+        const unsigned expectedDepth=a.workTimeFlush?anchor.historyDepth:(historical?1U:0U);
+        if(!EDM126::SameSource(anchor.authorizedSource,a.historyPrevious) ||
+            !EDM126::ValidSource(anchor.cursorSource) || !EDM109::SameScope(anchor.cursorSource.scope,a.historyPrevious.scope) ||
+            anchor.historyDepth!=expectedDepth || expectedDepth>a.historyPrevious.ordinal ||
+            anchor.cursorSource.ordinal!=a.historyPrevious.ordinal-expectedDepth ||
+            !anchor.active || anchor.faulted || anchor.stopRequested || anchor.stopped || anchor.awaitingSeam ||
+            anchor.velocityMmSec!=0.0 || anchor.accelerationMmSec2!=0.0 ||
+            anchor.velocityPps!=EDM126::Point{} || anchor.accelerationPps2!=EDM126::Point{} ||
+            !std::isfinite(anchor.localMm) || !std::isfinite(anchor.lengthMm) || anchor.lengthMm<=0.0 ||
+            (a.workTimeFlush ? (anchor.localMm<0.0 || anchor.localMm>anchor.lengthMm ||
+                (anchor.completeReady && (anchor.historyDepth || !anchor.atCurrentEnd || anchor.localMm!=anchor.lengthMm))) :
+                (anchor.completeReady || anchor.localMm<=0.0 || anchor.localMm>=anchor.lengthMm)) ||
+            !anchor.tick || !anchor.nowUs || anchor.tick>=mode.lastMappingTick || anchor.nowUs>=mode.lastMappingUs) return false;
+        for(unsigned axis=0U;axis<6U;++axis) if(!std::isfinite(anchor.positionPulse[axis])) return false;
+        if(historical ? (anchor.cursorSource.dispatch>=a.historyPrevious.dispatch || anchor.cursorSource.epoch>=a.historyPrevious.epoch ||
+            anchor.cursorSource.segment>=a.historyPrevious.segment || anchor.cursorSource.sourcePC>=a.historyPrevious.sourcePC) :
+            !EDM126::SameSource(anchor.cursorSource,a.historyPrevious)) return false;
+    }
+    EDM114::Source previous{}; previous.scope=a.historyPrevious.scope; previous.step=static_cast<unsigned>(a.historyPrevious.ordinal);
+    previous.dispatch=a.historyPrevious.dispatch; previous.epoch=a.historyPrevious.epoch;
+    previous.segment=a.historyPrevious.segment; previous.sourcePC=a.historyPrevious.sourcePC;
+    return EDM116::PolicyFollowsCompleted(policy,mode.rowPolicy,previous);
+}
+
 bool MotionCore::IsEDM126ProfileCurrent() const noexcept
 {
     const auto& p=m_edm126Current; const auto& id=m_edm94.Current().identity;
-    return m_edm126Profile && p.enabled && p.fixture<2U && m_edm96Profile && m_edm97Profile && m_edm114Profile &&
+    return m_edm126Profile && IsEDM130TimingCurrent() && p.physicalAd==m_edm129Profile && m_edm128Current.physicalAd==m_edm129Profile &&
+        m_edm129Current.enabled==m_edm129Profile && (!m_edm129Profile ||
+            (m_edm128Profile && m_edm129Current.session==p.session && m_edm129Current.armEpoch==p.armEpoch &&
+            m_edm129Current.ownerGeneration==p.ownerGeneration && m_edm129Source.Current().session==p.session &&
+            EDM129::SameBinding(m_edm129Current.binding,m_edm129Source.FrozenBinding()) &&
+            EDM88::SameConfig(m_edm126SourceConfig,m_edm129Source.FrozenConfig()))) &&
+        m_edm128Current.enabled==m_edm128Profile && p.enabled && p.fixture<2U && m_edm96Profile && m_edm97Profile && m_edm114Profile &&
         !m_edm95Profile && !m_edm98Profile && !m_edm99Profile && !m_edm100Profile && !m_edm102Profile &&
         !m_edm104Profile && !m_edm105Profile && !m_edm109Profile && !m_edm110Profile && !m_edm111Repeat &&
         !m_edm113Profile && !m_edm115Profile && !m_edm116Profile &&
@@ -2100,36 +2406,88 @@ bool MotionCore::IsEDM126ProfileCurrent() const noexcept
         m_edm114Current.ownerGeneration==p.ownerGeneration && EDM97::ValidTuning(m_edm126Tuning) &&
         EDM97::SameTuning(m_edm126Gap.tuning,m_edm126Tuning) &&
         EDM88::SameConfig(m_edm126SourceConfig,m_edm126Source.FrozenConfig()) &&
-        EDM107::IsDefaultFlushProfile(m_edm107ArmFlushProfile);
+        (m_edm128Profile ? (m_edm128Current.enabled && m_edm128Current.session==p.session &&
+            m_edm128Current.armEpoch==p.armEpoch && m_edm128Current.ownerGeneration==p.ownerGeneration &&
+            m_edm128Current.fixture==p.fixture && EDM107::ValidFlushProfile(m_edm107ArmFlushProfile) &&
+            EDM107::SameFlushProfile(m_edm128Current.flushProfile,m_edm107ArmFlushProfile)) :
+            EDM107::IsDefaultFlushProfile(m_edm107ArmFlushProfile));
 }
 
 bool MotionCore::BeginEDM126Arm(const EDM94ArmRequest& arm) noexcept
 {
-    m_edm126.Clear(); m_edm126Current=EDM126::MotionFeedback{}; m_edm126Gap=EDM96::Feedback{};
+    m_edm133FirstSource=EDM126::FirstCauseRecord{};
+    m_edm133FirstOrphan=EDM126::FirstCauseRecord{};
+    m_edm126.Clear(); m_edm126Source.Cancel(); m_edm126Current=EDM126::MotionFeedback{}; m_edm126Gap=EDM96::Feedback{};
     m_edm126Raw=EDM88::Frame{}; m_edm126Curve=EDM112::Curve{}; m_edm126Limits=EDM126::Limits{};
     m_edm126PhysicalRange=m_edm126PhysicalSettled=m_edm126Participating=false; m_edm126PhysicalTick=0ULL;
     m_edm126MappedZero=m_edm126SameReferencePriorTick=false;
     m_edm126Profile=arm.historyServo; m_edm126Tuning=arm.tuning;
+    m_edm128.Clear(); m_edm128Profile=arm.historyModeFlush; m_edm128Current=EDM128::MotionFeedback{};
+    m_edm128Current.enabled=m_edm128Current.active=m_edm128Profile;
+    m_edm128Current.session=arm.session; m_edm128Current.armEpoch=m_edm128Current.liveEpoch=arm.epoch;
+    m_edm128Current.ownerGeneration=arm.lease.generation; m_edm128Current.fixture=arm.historyFixture;
+    m_edm128Current.flushProfile=arm.flushProfile; m_edm128Current.physicalAd=arm.physicalAd;
+    m_edm130Profile=arm.workTimeFlush; m_edm130ArmRecipe=arm.timerRecipe;
+    m_edm128Current.workTimeFlush=arm.workTimeFlush; m_edm128Current.timerRecipe=arm.timerRecipe;
+    m_edm129Source.Cancel(); m_edm129Profile=arm.physicalAd; m_edm129Current=EDM129::MotionFeedback{};
+    m_edm129Current.enabled=m_edm129Current.active=m_edm129Profile;
+    m_edm129Current.session=arm.session; m_edm129Current.armEpoch=m_edm129Current.liveEpoch=arm.epoch;
+    m_edm129Current.ownerGeneration=arm.lease.generation;
     auto& p=m_edm126Current; p.enabled=p.active=true; p.session=arm.session; p.armEpoch=p.liveEpoch=arm.epoch;
-    p.ownerGeneration=arm.lease.generation; p.fixture=arm.historyFixture;
+    p.ownerGeneration=arm.lease.generation; p.fixture=arm.historyFixture; p.physicalAd=m_edm129Profile;
     auto& gap=m_edm126Gap; gap.session=arm.session; gap.epoch=arm.epoch; gap.ownerGeneration=arm.lease.generation;
     gap.active=gap.tunedMode=true; gap.tuning=arm.tuning; gap.configHash=EDM97::ConfigHash(arm.tuning);
-    m_edm126SourceConfig=EDM88::SimulatedSource(arm.session); m_edm126SourceConfig.samplePeriodUs=250ULL;
-    m_edm126SourceConfig.maxAgeUs=EDM126::MaximumSourceAgeUs;
-    if (!m_edm126Voltage.Begin(arm.historyFixture) || !m_edm126Source.Begin(m_edm126SourceConfig) ||
-        !m_edm126Decision.Begin(EDM97::MakeProfile(arm.tuning)) || !IsEDM126ProfileCurrent()) return false;
-    ObserveEDM126Source(true); return !p.faulted && p.sourceReady;
+    if(m_edm129Profile) {
+        EDM129::Binding binding{};
+        if(!m_edm128Profile || !EDM129::MakeBinding(m_edm129Physical,m_edm129PhysicalStamp,
+            m_edmZMonotonicUs,m_edmZClockValid,m_edmZClockFrequency,binding) ||
+            !m_edm129Source.Begin(binding,arm.session)) return false;
+        m_edm129Current.binding=binding; m_edm126SourceConfig=m_edm129Source.FrozenConfig();
+        if(!m_edm126Source.BeginPhysical(m_edm126SourceConfig,arm.session) ||
+            !m_edm126Decision.BeginPhysical(EDM97::MakeProfile(arm.tuning,arm.timerRecipe))) return false;
+    } else {
+        m_edm126SourceConfig=EDM88::SimulatedSource(arm.session); m_edm126SourceConfig.samplePeriodUs=250ULL;
+        m_edm126SourceConfig.maxAgeUs=EDM126::MaximumSourceAgeUs;
+        if (!(m_edm128Profile ? m_edm128Voltage.Begin(arm.historyFixture) : m_edm126Voltage.Begin(arm.historyFixture)) ||
+            !m_edm126Source.Begin(m_edm126SourceConfig) || !m_edm126Decision.Begin(EDM97::MakeProfile(arm.tuning,arm.timerRecipe))) return false;
+    }
+    if(!IsEDM126ProfileCurrent()) return false;
+    ObserveEDM126Source(true); return !p.faulted && (m_edm129Profile || p.sourceReady);
+}
+
+bool MotionCore::IsEDM129AwaitFreshZeroCurrent(std::uint64_t nowUs) const noexcept
+{
+    const auto& p=m_edm126Current; const auto& source=m_edm129Source.Current();
+    const auto& binding=m_edm129Source.FrozenBinding();
+    if(!m_edm129Profile || !IsEDM126ProfileCurrent() || !p.active || p.faulted || p.sourceReady ||
+        p.authorizedRows || p.completedRows || p.rowActive || p.rowCompleted || m_edm126Participating ||
+        m_edm94HandoffPending || m_edm94HandoffCommitted || m_edm94.HandoffZero() || m_Group.isActive ||
+        !m_edm94Frame.allCommandZero || !m_edm94Frame.groupIdle || !m_edm94Frame.authorityCurrent ||
+        p.liveEpoch!=m_edm94ExpectedEpoch || GetCurrentExecutionEpoch()!=p.liveEpoch ||
+        !source.active || source.ready || source.faulted || source.reason!=EDM129::SourceReason::AwaitFresh ||
+        source.session!=p.session || source.freshFrames || source.frame.valid || source.nowUs!=p.nowUs ||
+        p.tick!=m_ncSettleRuntimeCycleTick || p.nowUs!=m_edmZMonotonicUs ||
+        !EDM129::ValidBinding(binding) || binding.qpcFrequency!=m_edmZClockFrequency ||
+        nowUs<p.nowUs || nowUs<binding.admittedUs || nowUs<binding.baselineCapturedUs ||
+        nowUs-binding.baselineCapturedUs>EDM126::MaximumSourceAgeUs ||
+        nowUs-binding.baselineCapturedUs>binding.shadowMaxAgeUs ||
+        nowUs<binding.baselineObservedUs || nowUs-binding.baselineObservedUs>binding.shadowMaxTickGapUs ||
+        m_pContexts==nullptr || m_pContexts->size()!=6U) return false;
+    for(unsigned axis=0U;axis<6U;++axis) if((*m_pContexts)[axis].logicalCmdVel!=0.0 ||
+        (*m_pContexts)[axis].logicalCmdPos!=m_edm94Frame.axis[axis].commandPulse) return false;
+    return true;
 }
 
 bool MotionCore::IsEDM126SourceCurrent(std::uint64_t nowUs) const noexcept
 {
     const auto& p=m_edm126Current; const auto& e=m_edm126Source.Current(); const auto& d=m_edm126Decision.Current();
     const auto& raw=e.lastFrame;
-    const auto curve=EDMGapServo::Evaluate(EDM97::MakeProfile(m_edm126Tuning),raw.voltageV,EDM97::ReferenceVoltageV,100.0);
+    const auto curve=EDMGapServo::Evaluate(EDM97::MakeProfile(m_edm126Tuning,m_edm130ArmRecipe),raw.voltageV,EDM130::FrozenGapReferenceVoltageV(m_edm130ArmRecipe),
+        EDM130::FrozenMachiningOverridePercent(m_edm130ArmRecipe));
     const int direction=d.state==EDMGapServo::ShortState::Clear?1:d.state==EDMGapServo::ShortState::Active?-1:0;
     const double ratio=curve.valid && ((direction>0 && curve.limitedSpeedMmPerMin>=0.0) ||
         (direction<0 && curve.limitedSpeedMmPerMin<=0.0))?curve.limitedSpeedMmPerMin/EDM97::MaximumFeedMmMin:0.0;
-    const auto& h=m_edm94Handoff; const auto& cursor=m_edm126.Current();
+    const auto& h=m_edm94Handoff; const auto& cursor=EDM126CurrentImage();
     bool zeroSeed=m_edm94HandoffPending && m_edm94HandoffCommitted && m_edm94.HandoffZero() &&
         h.authorization.historyServo && h.authorization.session==p.session && h.nextEpoch==p.liveEpoch &&
         IsEDM94HandoffAuthorityCurrent() && GetCurrentExecutionEpoch()==h.nextEpoch &&
@@ -2143,8 +2501,12 @@ bool MotionCore::IsEDM126SourceCurrent(std::uint64_t nowUs) const noexcept
         m_pContexts!=nullptr && m_pContexts->size()==6U;
     for(unsigned i=0U;zeroSeed && i<6U;++i) zeroSeed=(*m_pContexts)[i].logicalCmdPos==h.gapSegmentStartPulse[i] &&
         (*m_pContexts)[i].logicalCmdVel==0.0;
-    return curve.valid && EDM89::SameConfig(d.config,EDM89::FrozenConfig(EDM97::MakeProfile(m_edm126Tuning))) &&
-        IsEDM126ProfileCurrent() && p.active && !p.faulted && p.sourceReady && !e.faulted && !d.faulted &&
+    return curve.valid && EDM89::SameConfig(d.config,EDM89::FrozenConfig(EDM97::MakeProfile(m_edm126Tuning,m_edm130ArmRecipe))) &&
+        IsEDM126ProfileCurrent() && (!m_edm129Profile ||
+            (m_edm129Source.CurrentAt(nowUs,m_edmZClockFrequency) &&
+            m_edm129Source.Current().nowUs==p.nowUs && m_edm129Source.Current().freshFrames==e.freshFrames &&
+            m_edm129Source.Current().heldFrames==e.heldFrames && EDM88::SameFrame(raw,m_edm129Source.CurrentFrame()))) &&
+        p.active && !p.faulted && p.sourceReady && !e.faulted && !d.faulted &&
         e.reason==EDM88::Reason::None && d.reason==EDM89::Reason::None && e.freshFrames &&
         EDM88::SameFrame(raw,d.lastFrame) && EDM88::SameFrame(raw,m_edm126Raw) &&
         EDM88::SameIdentity(raw.identity,m_edm126SourceConfig.identity) && raw.valid &&
@@ -2163,21 +2525,35 @@ void MotionCore::ObserveEDM126Source(bool complete) noexcept
     const auto& guard=m_edm94.Current();
     const bool normalFinish=guard.finishRequested && !guard.cancelled && !guard.faulted;
     if (!m_edm94.Active() || (m_edm94.ForceZero() && !normalFinish) || m_edm94CancelSession.load(std::memory_order_acquire)>=p.session) {
-        p.active=gap.active=false; p.sourceReady=false; PublishEDM126Feedback(); return;
+        p.active=gap.active=false; p.sourceReady=false; if(m_edm129Profile) { m_edm129Source.Cancel(); }
+        PublishEDM126Feedback(); return;
     }
     bool valid=complete && m_ncSettleRuntimeCycleValid && m_ncSettleRuntimeCycleContiguous && m_edmZClockValid &&
         IsEDM126ProfileCurrent() && (!p.tick || m_ncSettleRuntimeCycleTick==p.tick+1ULL) &&
         (!p.nowUs || m_edmZMonotonicUs>p.nowUs);
-    // Simulation acquires at every actual RT pass; jitter never invents held samples.
-    if (valid) {
+    // The physical branch keeps the PDO's actual identity, sequence, voltage
+    // and receipt time. Polling, handoff and flush never synthesize a sample.
+    if(valid && m_edm129Profile) {
+        valid=m_edm129Source.Observe(m_edm129Physical,m_edm129PhysicalStamp,m_edmZMonotonicUs,
+            m_edmZClockValid,m_edmZClockFrequency);
+        if(valid && !m_edm129Source.Current().ready) {
+            p.tick=gap.tick=m_ncSettleRuntimeCycleTick; p.nowUs=gap.nowUs=m_edmZMonotonicUs;
+            p.sourceReady=gap.gateReady=false; p.targetRatio=gap.targetRatio=0.0;
+            PublishEDM126Feedback(); return;
+        }
+        if(valid)m_edm126Raw=m_edm129Source.CurrentFrame();
+    } else if(valid) {
+        // Simulation alone acquires at every actual RT pass.
         if (m_edm126Raw.sequence==(std::numeric_limits<std::uint64_t>::max)()) valid=false;
         else { m_edm126Raw.identity=m_edm126SourceConfig.identity; ++m_edm126Raw.sequence;
             m_edm126Raw.capturedAtUs=m_edmZMonotonicUs; m_edm126Raw.valid=true;
-            m_edm126Raw.voltageV=m_edm126Voltage.Voltage(m_edm126.Committed()); }
+            m_edm126Raw.voltageV=m_edm128Profile ? m_edm128Voltage.Voltage(m_edm126.Committed(),m_edm128.Evidence()) :
+                m_edm126Voltage.Voltage(m_edm126.Committed()); }
     }
     valid=valid && m_edm126Source.Observe(m_edm126Raw,m_edmZMonotonicUs) && m_edm126Decision.Observe(m_edm126Raw);
     const auto& e=m_edm126Source.Current(); const auto& d=m_edm126Decision.Current();
-    const auto curve=EDMGapServo::Evaluate(EDM97::MakeProfile(m_edm126Tuning),m_edm126Raw.voltageV,EDM97::ReferenceVoltageV,100.0);
+    const auto curve=EDMGapServo::Evaluate(EDM97::MakeProfile(m_edm126Tuning,m_edm130ArmRecipe),m_edm126Raw.voltageV,EDM130::FrozenGapReferenceVoltageV(m_edm130ArmRecipe),
+        EDM130::FrozenMachiningOverridePercent(m_edm130ArmRecipe));
     valid=valid && curve.valid;
     p.tick=gap.tick=m_ncSettleRuntimeCycleTick; p.nowUs=gap.nowUs=m_edmZMonotonicUs;
     p.sourceSequence=gap.sourceSequence=e.lastFrame.sequence; p.sourceCapturedUs=gap.sourceCapturedUs=e.lastFrame.capturedAtUs;
@@ -2194,9 +2570,112 @@ void MotionCore::ObserveEDM126Source(bool complete) noexcept
     PublishEDM126Feedback();
 }
 
+void MotionCore::CaptureEDM133FirstCause(EDM126::FirstCauseSite site, int axis,
+    std::uint32_t evaluatedGates, std::uint32_t failedGates) noexcept
+{
+    if(!m_edm126Profile || !m_edm126Current.enabled || site==EDM126::FirstCauseSite::None)return;
+    auto& first=(site==EDM126::FirstCauseSite::SourcePrecheck ||
+        site==EDM126::FirstCauseSite::GuardSource)?m_edm133FirstSource:m_edm133FirstOrphan;
+    if(first.site!=EDM126::FirstCauseSite::None)return;
+    EDM126::FirstCauseRecord record{};
+    record.site=site;record.axis=static_cast<std::int8_t>(axis);
+    record.tick=m_ncSettleRuntimeCycleTick;record.nowUs=m_edmZMonotonicUs;
+    record.evaluatedGates=evaluatedGates;record.failedGates=failedGates;
+    const auto lease=GetMotionOwnerLease();
+    record.owner=static_cast<std::uint8_t>(lease.owner);record.ownerGeneration=lease.generation;
+    record.executionEpoch=GetCurrentExecutionEpoch();record.expectedEpoch=m_edm94ExpectedEpoch;
+    record.liveEpoch=m_edm126Current.liveEpoch;
+    record.groupAxisCount=static_cast<std::int8_t>(m_Group.axisCount);
+    record.commandAxisCount=static_cast<std::int8_t>(m_Group.currentCmd.axisCount);
+    record.inputMask=static_cast<std::uint8_t>(m_servoSourceInputMask&0x3fU);
+    record.commandFailure=static_cast<std::uint8_t>(GetCommandAuthorizationFailure(m_Group.currentCmd));
+    // These are separately labelled observations. Only evaluatedGates and
+    // failedGates describe the original short-circuited decision above.
+    record.flags=(IsEDM130TimingCurrent()?EDM126::FirstCauseTimingCurrent:0U)|
+        (IsEDM126ProfileCurrent()?EDM126::FirstCauseProfileCurrent:0U)|
+        (IsEDM126ParticipationCurrent()?EDM126::FirstCauseParticipationCurrent:0U)|
+        (m_edm94.Current().faulted?EDM126::FirstCauseGuardFaulted:0U)|
+        (m_Group.isActive?EDM126::FirstCauseGroupActive:0U)|
+        (record.executionEpoch==record.liveEpoch?EDM126::FirstCauseEpochMatches:0U)|
+        (IsMotionOwnerLeaseCurrent(m_Group.currentCmd.ownerLease)?EDM126::FirstCauseLeaseCurrent:0U)|
+        (MotionExecutionIdentityExactlyMatches(m_Group.currentCmd.execution,m_edm114Command)&&
+            MotionExecutionIdentityExactlyMatches(m_Group.currentCmd.execution,m_edm94Handoff.command)?EDM126::FirstCauseIdentityMatches:0U)|
+        (m_edm94.ForceZero()?EDM126::FirstCauseGuardForceZero:0U);
+    record.guardReason=static_cast<std::uint8_t>(m_edm94.Current().reason);
+    const auto& committed=m_edm128.Evidence();const auto& proposed=m_edm128.ProposedEvidence();
+    const auto& published=m_edm128Current.coordinator;
+    const double height=m_edm130Profile?EDM130::FrozenJumpHeightMm(m_edm130ArmRecipe):0.0;
+    const std::uint32_t interval=m_edm130Profile?m_edm130ArmRecipe.deepFlushCycleInterval:0U;
+    const double multiplier=m_edm130Profile?EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe):0.0;
+    const bool bound=m_edm130Profile&&EDM130::HasBoundDeep(m_edm130ArmRecipe);
+    record.flags|=(m_edm128.IsHeightCurrent(height,interval,multiplier,bound)?EDM126::FirstCausePrivateHeightCurrent:0U)|
+        (EDM128::ValidHeightProof(committed,height,interval,multiplier,bound)?EDM126::FirstCauseCommittedHeightValid:0U)|
+        (EDM128::ValidHeightProof(published,height,interval,multiplier,bound)?EDM126::FirstCausePublicHeightValid:0U)|
+        (EDM130::ValidWorkEvidence(committed.work)?EDM126::FirstCauseWorkValid:0U);
+    record.committedTick=m_edm128.Committed().tick;record.publishedTick=m_edm128Current.tick;
+    record.committedPhase=static_cast<std::uint8_t>(committed.phase);
+    record.proposedPhase=static_cast<std::uint8_t>(proposed.phase);
+    record.publishedPhase=static_cast<std::uint8_t>(published.phase);
+    record.eventIndex=committed.eventIndex;
+    record.privateTriggered=committed.work.triggeredEvents;record.privateCompleted=committed.work.completedEvents;
+    record.publicTriggered=published.work.triggeredEvents;record.publicCompleted=published.work.completedEvents;
+    if(m_edm128.Current().tick!=m_edm128.Committed().tick || proposed.phase!=committed.phase ||
+        proposed.work.triggeredEvents!=committed.work.triggeredEvents || proposed.work.completedEvents!=committed.work.completedEvents)
+        record.flags|=EDM126::FirstCauseProposalDiffers;
+    const int count=ClampMotionAxisCount(m_Group.axisCount);
+    const int commandCount=ClampMotionAxisCount(m_Group.currentCmd.axisCount);
+    for(unsigned i=0U;i<6U;++i) {
+        record.statusWord[i]=m_servoSourceStatusWord[i];record.modes[i]=m_servoSourceMode[i];
+        const int groupAxis=static_cast<int>(i)<count?m_Group.axisIndices[i]:-1;
+        const int commandAxis=static_cast<int>(i)<commandCount?m_Group.currentCmd.axisIndices[i]:-1;
+        const std::uint32_t groupCode=groupAxis>=0&&groupAxis<6?static_cast<std::uint32_t>(groupAxis):15U;
+        const std::uint32_t commandCode=commandAxis>=0&&commandAxis<6?static_cast<std::uint32_t>(commandAxis):15U;
+        record.orderedGroupAxes=(record.orderedGroupAxes&~(15U<<(i*4U)))|(groupCode<<(i*4U));
+        record.orderedCommandAxes=(record.orderedCommandAxes&~(15U<<(i*4U)))|(commandCode<<(i*4U));
+        const auto bit=static_cast<std::uint8_t>(1U<<i);
+        if(m_edm114ConfigFingerprint[i]==m_edm94.FrozenConfig().axis[i].configFingerprint)record.configMatchMask|=bit;
+        if(m_edm114MappingFingerprint[i]==m_edm94.FrozenConfig().axis[i].mappingFingerprint)record.mappingMatchMask|=bit;
+        for(int slot=0;slot<count;++slot)if(m_Group.axisIndices[slot]==static_cast<int>(i))
+            record.memberMask|=bit;
+        if(m_pContexts!=nullptr && i<m_pContexts->size()) {
+            const auto& member=(*m_pContexts)[i];
+            if(member.isExist)record.existMask|=bit;
+            if(member.axisIndex==static_cast<int>(i))record.axisIndexMatchMask|=bit;
+            if(member.isFault||member.isLagAlarm)record.faultMask|=bit;
+            if(member.isServoOn)record.servoOnMask|=bit;
+            if(member.isExist&&member.state==MotionState::MotionState_INTERPOLATING)record.interpolatingMask|=bit;
+        }
+    }
+    first=record;
+    m_edm126Current.firstSource=m_edm133FirstSource;
+    m_edm126Current.firstOrphan=m_edm133FirstOrphan;
+    // Publish the immutable observation before containment can replace live
+    // state. Failure grants nothing; the existing later publication retries
+    // the retained sidecars and keeps its original failure handling.
+    (void)m_edm126Feedback.Publish(m_edm126Current);
+}
+
 void MotionCore::PublishEDM126Feedback() noexcept
 {
-    m_edm126Current.traversal=m_edm126.Committed();
+    m_edm126Current.firstSource=m_edm133FirstSource;
+    m_edm126Current.firstOrphan=m_edm133FirstOrphan;
+    m_edm126Current.traversal=EDM126CommittedImage();
+    if(m_edm129Profile) {
+        const auto& common=m_edm126Current; auto& physical=m_edm129Current;
+        physical.source=m_edm129Source.Current(); physical.active=common.active;
+        physical.faulted=common.faulted || physical.source.faulted;
+        physical.sourceReady=common.sourceReady && physical.source.ready;
+        physical.liveEpoch=common.liveEpoch; physical.tick=common.tick; physical.nowUs=common.nowUs;
+        if(!m_edm129Feedback.Publish(physical)) { m_edm126Current.faulted=m_edm126Gap.faulted=true; TripEDM94(EDM94::Reason::Output); }
+    }
+    if(m_edm128Profile) {
+        const auto& common=m_edm126Current; auto& mode=m_edm128Current;
+        mode.coordinator=m_edm128.Evidence(); mode.active=common.active; mode.faulted=common.faulted || mode.coordinator.faulted;
+        mode.liveEpoch=common.liveEpoch; mode.tick=common.tick; mode.nowUs=common.nowUs;
+        mode.lastMappingTick=common.lastMappingTick; mode.lastMappingUs=common.lastMappingUs;
+        mode.authorizedRows=common.authorizedRows; mode.completedRows=common.completedRows;
+        if(!m_edm128Feedback.Publish(mode)) { m_edm126Current.faulted=m_edm126Gap.faulted=true; TripEDM94(EDM94::Reason::Output); }
+    }
     if (!m_edm126Feedback.Publish(m_edm126Current) || !m_edm96Feedback.Publish(m_edm126Gap)) {
         m_edm126Current.faulted=m_edm126Gap.faulted=true; TripEDM94(EDM94::Reason::Output);
     }
@@ -2205,7 +2684,11 @@ void MotionCore::PublishEDM126Feedback() noexcept
 bool MotionCore::IsEDM126ParticipationCurrent() const noexcept
 {
     if (!m_edm126Participating || !IsEDM126ProfileCurrent() || !m_edm114Current.geometryValid ||
-        !m_edm94Handoff.authorization.historyServo || m_edm94Handoff.authorization.historyFixture!=m_edm126Current.fixture ||
+        !m_edm94Handoff.authorization.historyServo || m_edm94Handoff.authorization.historyModeFlush!=m_edm128Profile ||
+        m_edm94Handoff.authorization.physicalAd!=m_edm129Profile ||
+        m_edm94Handoff.authorization.workTimeFlush!=m_edm130Profile ||
+        !EDM130::SameRecipe(m_edm94Handoff.authorization.timerRecipe,m_edm130ArmRecipe) ||
+        m_edm94Handoff.authorization.historyFixture!=m_edm126Current.fixture ||
         m_pContexts==nullptr || m_pContexts->size()!=6U || m_Group.axisCount!=6 ||
         !MotionExecutionIdentityExactlyMatches(m_Group.currentCmd.execution,m_edm114Command) ||
         !MotionExecutionIdentityExactlyMatches(m_Group.currentCmd.execution,m_edm94Handoff.command)) return false;
@@ -2219,9 +2702,14 @@ bool MotionCore::IsEDM126ParticipationCurrent() const noexcept
 bool MotionCore::IsEDM126Current() const noexcept
 {
     const auto& h=m_edm94Handoff; const auto& a=h.authorization; const auto& c=m_Group.currentCmd;
-    const auto& p=m_edm114Current; const auto& f=m_edm126.Current(); const auto& s=m_edm126Current.authorizedSource;
+    const auto& p=m_edm114Current; const auto& f=EDM126CurrentImage(); const auto& s=m_edm126Current.authorizedSource;
     const auto& g=m_edm114Mapping.GetGeometry(); const bool arc=p.kind==EDM114::Kind::Arc;
-    if (!IsEDM126ParticipationCurrent() || !g.valid || !m_edm126Curve.valid ||
+    if (!IsEDM126ParticipationCurrent() ||
+        a.physicalAd!=m_edm129Profile || a.workTimeFlush!=m_edm130Profile ||
+        !EDM130::SameRecipe(a.timerRecipe,m_edm130ArmRecipe) ||
+        (m_edm129Profile && !EDM129::SameBinding(a.physicalBinding,m_edm129Source.FrozenBinding())) ||
+        (m_edm128Profile && (m_edm128.Evidence().liveAnchor!=m_edm129Profile || !a.historyModeFlush || !EDM116::SamePolicy(a.modePolicy,m_edm128Current.rowPolicy) ||
+            !EDM116::SamePolicy(a.modePolicy,m_edm128.Evidence().policy))) || !g.valid || !m_edm126Curve.valid ||
         !EDM126::SameSource(s,f.authorizedSource) || s.scope.session!=a.session || s.scope.run!=a.run ||
         s.scope.cache!=a.cache || s.scope.ownerGeneration!=a.lease.generation || s.dispatch!=a.dispatch ||
         s.ordinal!=a.step || s.sourcePC!=a.sourcePC || s.epoch!=h.nextEpoch || s.epoch!=c.execution.epoch ||
@@ -2254,7 +2742,10 @@ bool MotionCore::BeginEDM126Segment() noexcept
 {
     const auto& h=m_edm94Handoff; const auto& a=h.authorization; auto& v=m_Group.virtualAxis;
     if (!IsEDM126ProfileCurrent() || !m_edm94.Active() || m_edm94.ForceZero() || !m_edm94.HandoffZero() ||
-        !IsEDM94HandoffCommandCurrent() || !a.historyServo || a.historyFixture!=m_edm126Current.fixture ||
+        !IsEDM94HandoffCommandCurrent() || !a.historyServo || a.historyModeFlush!=m_edm128Profile || a.physicalAd!=m_edm129Profile ||
+        a.workTimeFlush!=m_edm130Profile || !EDM130::SameRecipe(a.timerRecipe,m_edm130ArmRecipe) ||
+        (m_edm129Profile && !EDM129::SameBinding(a.physicalBinding,m_edm129Source.FrozenBinding())) ||
+        !IsEDM128FeedPolicyCurrent(a) || a.historyFixture!=m_edm126Current.fixture ||
         !EDM97::SameTuning(a.tuning,m_edm126Tuning) || m_edm126Current.authorizedRows!=a.step ||
         m_edm126Current.completedRows!=a.step || !m_edm126Current.sourceReady ||
         !v.isVirtualAxis || v.state!=MotionState::MotionState_MOVING || v.inPosition || v.isFault || v.isLagAlarm ||
@@ -2279,9 +2770,11 @@ bool MotionCore::BeginEDM126Segment() noexcept
     if (!built) return false;
     EDM112::Bounds bounds{};
     if (!EDM112::WholeCurveBounds(curve,bounds) || !bounds.valid) return false;
+    EDM126::Point excursionLow{},excursionHigh{};
     for (unsigned i=0U;i<6U;++i) {
         const auto& axis=(*m_pContexts)[i]; const auto& frozen=m_edm94.FrozenConfig().axis[i];
         const double envelope=frozen.pulsePerUnit*(i<3U?0.025:0.5);
+        excursionLow[i]=frozen.commandAnchor-envelope; excursionHigh[i]=frozen.commandAnchor+envelope;
         if (!std::isfinite(envelope) || envelope<=0.0 ||
             bounds.minPulse[i]<frozen.commandAnchor-envelope || bounds.maxPulse[i]>frozen.commandAnchor+envelope) return false;
         const bool enabled[3]={axis.travelLimit1Enable,axis.travelLimit2Enable,axis.travelLimit3Enable};
@@ -2289,6 +2782,11 @@ bool MotionCore::BeginEDM126Segment() noexcept
         const double high[3]={axis.travelLimit1Positive_unit,axis.travelLimit2Positive_unit,axis.travelLimit3Positive_unit};
         for(unsigned k=0U;k<3U;++k) if(enabled[k] && (!std::isfinite(low[k]) || !std::isfinite(high[k]) ||
             low[k]>=high[k] || bounds.minNative[i]<low[k] || bounds.maxNative[i]>high[k])) return false;
+        for(unsigned k=0U;k<3U;++k) if(enabled[k]) {
+            excursionLow[i]=(std::max)(excursionLow[i],low[k]*frozen.pulsePerUnit);
+            excursionHigh[i]=(std::min)(excursionHigh[i],high[k]*frozen.pulsePerUnit);
+        }
+        if(!std::isfinite(excursionLow[i]) || !std::isfinite(excursionHigh[i]) || excursionLow[i]>=excursionHigh[i]) return false;
     }
     EDM126::Limits limits{};
     const double speed=a.feedMMMin/60.0;
@@ -2305,13 +2803,22 @@ bool MotionCore::BeginEDM126Segment() noexcept
     source.epoch=h.nextEpoch; source.segment=p.source.segment; source.sourcePC=a.sourcePC;
     if ((!a.step && !m_edm126.Begin(source.scope,EDM126::Settings{0.025,200U})) ||
         !m_edm126.BindCurrent(curve,source,limits,m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs)) return false;
+    if(m_edm128Profile) {
+        if(!m_edm128.BeginRow(m_edm126,a.modePolicy,excursionLow,excursionHigh,m_edm129Profile,
+            m_edm130Profile?m_edm130ArmRecipe.workTimeUs:0ULL,
+            m_edm130Profile?EDM130::FrozenJumpHeightMm(m_edm130ArmRecipe):0.0,
+            m_edm130Profile?m_edm130ArmRecipe.deepFlushCycleInterval:0U,
+            m_edm130Profile?EDM130::FrozenDeepMultiplier(m_edm130ArmRecipe):0.0,
+            m_edm130Profile && EDM130::HasBoundDeep(m_edm130ArmRecipe),m_edm130ArmRecipe.flushStages)) return false;
+        m_edm128Current.rowPolicy=a.modePolicy;
+    }
     m_edm126Curve=curve; m_edm126Limits=limits; m_edm126Current.authorizedSource=source;
     m_edm126Current.liveEpoch=h.nextEpoch; ++m_edm126Current.authorizedRows;
     m_edm126Current.rowActive=true; m_edm126Current.rowCompleted=false;
     m_edm126Gap.epoch=h.nextEpoch; m_edm126Gap.acceptedSegments=m_edm126Current.authorizedRows;
     m_edm126Gap.segmentActive=true; m_edm126Gap.segmentCompleted=m_edm126Gap.gateReady=false;
     m_edm126Gap.length=length; m_edm126Gap.q=m_edm126Gap.v=0.0;
-    if (!m_edm126Voltage.BeginRow(a.step)) return false;
+    if (!m_edm129Profile && !(m_edm128Profile ? m_edm128Voltage.BeginRow(a.step) : m_edm126Voltage.BeginRow(a.step))) return false;
     m_edm126Participating=true;
     m_Group.axisCount=6;
     for(unsigned i=0U;i<6U;++i) {
@@ -2323,14 +2830,16 @@ bool MotionCore::BeginEDM126Segment() noexcept
     m_edm126MappedZero=m_edm126SameReferencePriorTick=false;
     // Bind's stationary seed gains mapping evidence only after all six
     // logical outputs are explicitly written and the kernel commits it.
-    if (!IsEDM126Current() || !m_edm126.Step(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs,0.0,false)) return false;
+    if (!IsEDM126Current() || !(m_edm128Profile ?
+        m_edm128.Step(m_edm126,m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs,0.0,false) :
+        m_edm126.Step(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs,0.0,false))) return false;
     AxisCommand held{}; ApplyEDM126Scalar(held,false);
     return MapEDM126Traversal(held);
 }
 
 void MotionCore::ApplyEDM126Scalar(AxisCommand& command,bool stopping) noexcept
 {
-    const auto& f=m_edm126.Current(); auto& v=m_Group.virtualAxis;
+    const auto& f=EDM126CurrentImage(); auto& v=m_Group.virtualAxis;
     const double scale=m_edm114Current.pulseLength/m_edm126Curve.lengthMm;
     const double q=f.completeReady?m_edm114Current.pulseLength:f.localMm*scale, speed=f.velocityMmSec*scale;
     v.currentCmdPos=v.planningPos=q; v.currentCmdVel=v.logicalCmdVel=speed;
@@ -2347,22 +2856,34 @@ bool MotionCore::StepEDM126Segment(AxisCommand& command) noexcept
     command.instantCmdPos=m_Group.virtualAxis.currentCmdPos; command.instantCmdVel=0.0;
     if (m_edm94.ForceZero()) return false;
     if (m_edm94.HandoffZero()) return true;
-    if (!IsEDM126Current() || !IsEDM126SourceCurrent(m_edmZMonotonicUs) ||
-        GetCurrentExecutionEpoch()!=m_edm126Current.liveEpoch || !IsMotionOwnerLeaseCurrent(m_Group.currentCmd.ownerLease) ||
-        GetCommandAuthorizationFailure(m_Group.currentCmd)!=MotionRejectReason::NONE) {
+    std::uint32_t evaluatedSourceGates=0U,failedSourceGates=0U;
+    const auto sourceGate=[&](std::uint32_t gate,bool passed) noexcept {
+        evaluatedSourceGates|=gate;if(!passed)failedSourceGates|=gate;return passed;
+    };
+    if (!sourceGate(EDM126::FirstCauseCurrent,IsEDM126Current()) ||
+        !sourceGate(EDM126::FirstCauseSource,IsEDM126SourceCurrent(m_edmZMonotonicUs)) ||
+        !sourceGate(EDM126::FirstCauseEpoch,GetCurrentExecutionEpoch()==m_edm126Current.liveEpoch) ||
+        !sourceGate(EDM126::FirstCauseLease,IsMotionOwnerLeaseCurrent(m_Group.currentCmd.ownerLease)) ||
+        !sourceGate(EDM126::FirstCauseCommand,GetCommandAuthorizationFailure(m_Group.currentCmd)==MotionRejectReason::NONE)) {
+        CaptureEDM133FirstCause(EDM126::FirstCauseSite::SourcePrecheck,-1,evaluatedSourceGates,failedSourceGates);
         m_edm126Current.faulted=true; TripEDM94(EDM94::Reason::Source); PublishEDM126Feedback(); return false;
     }
     LifecycleCommitReservationGuard scalarCommit(*this,m_Group.currentCmd.execution);
     if (!scalarCommit.IsAcquired() || HasPendingSafetyOrRecoveryRequests() || m_edm94.ForceZero()) return false;
     if (m_edm114Current.rowComplete) {
-        const auto& done=m_edm126.Committed();
+        const auto& done=EDM126CommittedImage();
         if (!done.completeReady || done.historyDepth || done.positionPulse!=m_edm114Current.endPulse ||
             done.velocityPps!=EDM126::Point{}) return false;
         command.instantCmdPos=m_edm114Current.pulseLength; command.instantCmdVel=0.0; return true;
     }
     const double target=m_edm126Current.targetRatio*EDM97::MaximumFeedMmMin/60.0;
     const bool settled=m_edm126PhysicalSettled && m_edm126PhysicalTick+1ULL==m_ncSettleRuntimeCycleTick;
-    if (!m_edm126.Step(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs,target,settled)) {
+    const auto& decision=m_edm126Decision.Current();
+    const bool workEligible=m_edm130Profile && m_edm129Profile && target>0.0 &&
+        !decision.faulted && !decision.feedInhibited && !decision.shortActive &&
+        decision.state==EDMGapServo::ShortState::Clear;
+    if (!(m_edm128Profile ? m_edm128.Step(m_edm126,m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs,target,settled,workEligible) :
+        m_edm126.Step(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs,target,settled))) {
         scalarCommit.Release(); m_edm126Current.faulted=true; TripEDM94(EDM94::Reason::Identity); PublishEDM126Feedback(); return false;
     }
     if (HasPendingSafetyOrRecoveryRequests() || GetCommandAuthorizationFailure(m_Group.currentCmd)!=MotionRejectReason::NONE) return false;
@@ -2371,7 +2892,7 @@ bool MotionCore::StepEDM126Segment(AxisCommand& command) noexcept
 
 bool MotionCore::MapEDM126Traversal(AxisCommand& command) noexcept
 {
-    const auto& f=m_edm126.Current(); auto& p=m_edm114Current; auto& proof=m_edm126Current;
+    const auto& f=EDM126CurrentImage(); auto& p=m_edm114Current; auto& proof=m_edm126Current;
     const bool stopping=m_safetyControlledStopInProgress;
     // A normally completed row retains its one endpoint receipt while the
     // independent fresh physical boundary settles. It cannot restart GAP.
@@ -2409,23 +2930,32 @@ bool MotionCore::MapEDM126Traversal(AxisCommand& command) noexcept
         GetCommandAuthorizationFailure(m_Group.currentCmd)!=MotionRejectReason::NONE)) {
         ReleaseLifecycleCommitReservation(reservation); return false;
     }
-    m_edm126SameReferencePriorTick=f.velocityMmSec==0.0 && m_edm126MappedZero &&
+    m_edm126SameReferencePriorTick=f.velocityPps==EDM126::Point{} && m_edm126MappedZero &&
         m_edm114MappedTick+1ULL==f.tick && m_edm114MappedPosition==f.positionPulse;
     for (unsigned i=0U;i<6U;++i) { (*m_pContexts)[i].logicalCmdPos=f.positionPulse[i]; (*m_pContexts)[i].logicalCmdVel=f.velocityPps[i]; }
-    const bool committed=m_edm126.CommitMapped(m_ncSettleRuntimeCycleTick);
+    const bool committed=m_edm128Profile ? m_edm128.CommitMapped(m_edm126,m_ncSettleRuntimeCycleTick) :
+        m_edm126.CommitMapped(m_ncSettleRuntimeCycleTick);
     if (!stopping) ReleaseLifecycleCommitReservation(reservation);
     if (!committed) { proof.faulted=true; TripEDM94(EDM94::Reason::Output); return false; }
-    m_edm126MappedZero=f.velocityMmSec==0.0;
+    m_edm126MappedZero=f.velocityPps==EDM126::Point{};
     m_edm114LastPosition=command.instantCmdPos; m_edm114LastVelocity=command.instantCmdVel;
     m_edm114MappedPosition=f.positionPulse; m_edm114MappedVelocity=f.velocityPps; m_edm114MappedTick=f.tick;
     proof.lastMappingTick=f.tick; proof.lastMappingUs=f.nowUs; p.lastTick=f.tick;
     if (stopping) { p.stopActive=true; p.stopped=f.stopped; p.completed=false; PublishEDM114Feedback(); PublishEDM126Feedback(); return true; }
     if (!p.rowComplete) {
         ++p.samples; ++p.rowSamples; p.mappedOutput=true; p.lastMappingTick=f.tick; p.lastMappingUs=f.nowUs;
+        if(m_edm128Profile && m_edm128.Evidence().anchorCaptured && !m_edm128.Evidence().rowEventComplete) {
+            ++p.flushSamples; ++p.rowFlush;
+        }
         if(f.velocityMmSec>0.0) {++p.forwardSamples;++p.rowForward;}
         if(f.velocityMmSec<0.0) {++p.reverseSamples;++p.rowReverse;}
         if(f.completeReady) {
-            if(f.historyDepth || f.positionPulse!=p.endPulse || f.velocityPps!=EDM126::Point{} || !p.rowForward) {
+            const auto& mode=m_edm128.Evidence();
+            if((m_edm130Profile && (!IsEDM130TimingCurrent() || mode.phase!=EDM128::Phase::Gap ||
+                mode.detached || mode.work.triggeredEvents!=mode.work.completedEvents ||
+                mode.qualifiedDwells!=3ULL*mode.work.completedEvents)) ||
+                (m_edm128Profile && !m_edm130Profile && EDM116::IsTriggerStep(static_cast<unsigned>(f.authorizedSource.ordinal)) &&
+                !mode.rowEventComplete) || f.historyDepth || f.positionPulse!=p.endPulse || f.velocityPps!=EDM126::Point{} || !p.rowForward) {
                 proof.faulted=p.failed=true; TripEDM94(EDM94::Reason::Identity); return false;
             }
             p.rowComplete=true; ++p.completedRows; ++p.endpointRows;
@@ -2445,19 +2975,21 @@ bool MotionCore::BeginEDM126Stop(MotionExecutionEpoch previousEpoch,const Motion
         !IsMotionOwnerLeaseCurrent(m_safetyControlledStopOwnerLease) || GetCurrentExecutionEpoch()!=m_safetyControlledStopEpoch ||
         !m_safetyControlledStopRequestTicket || !m_ncSettleRuntimeCycleValid || !m_ncSettleRuntimeCycleContiguous || !m_edmZClockValid)
         return false;
-    const auto& committed=m_edm126.Committed();
+    const auto& committed=EDM126CommittedImage();
     for(unsigned i=0U;i<6U;++i) if((*m_pContexts)[i].logicalCmdPos!=committed.positionPulse[i] ||
         (*m_pContexts)[i].logicalCmdVel!=committed.velocityPps[i]) return false;
-    if (m_edm126.Current().stopRequested) {
+    if (EDM126CurrentImage().stopRequested) {
         const bool same=m_edm114StopLease.Matches(m_safetyControlledStopOwnerLease) && m_edm114StopEpoch==m_safetyControlledStopEpoch && m_edm114StopTicket==m_safetyControlledStopRequestTicket;
         const bool replacement=m_edm114StopLease.Matches(previousLease) && m_edm114StopEpoch==previousEpoch && m_edm114StopTicket==previousTicket;
         if (!same && !replacement) return false;
     }
-    if (!m_edm126.BeginStop(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs)) return false;
+    if (!(m_edm128Profile ? m_edm128.BeginStop(m_edm126,m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs) :
+        m_edm126.BeginStop(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs))) return false;
     m_edm114StopLease=m_safetyControlledStopOwnerLease; m_edm114StopEpoch=m_safetyControlledStopEpoch;
     m_edm114StopTicket=m_safetyControlledStopRequestTicket; m_edm114StopTick=m_ncSettleRuntimeCycleTick;
     m_edm114Current.stopActive=true; m_edm114Current.completed=false;
     m_edm126Current.active=m_edm126Gap.active=false; m_edm126Current.sourceReady=false;
+    if(m_edm129Profile) { m_edm129Source.Cancel(); }
     AxisCommand held{}; ApplyEDM126Scalar(held,true); PublishEDM114Feedback(); PublishEDM126Feedback(); return true;
 }
 
@@ -2468,14 +3000,15 @@ bool MotionCore::StepEDM126Stop(AxisCommand& command) noexcept
         GetCurrentExecutionEpoch()!=m_edm114StopEpoch || m_edm114StopEpoch!=m_safetyControlledStopEpoch ||
         m_edm114StopTicket!=m_safetyControlledStopRequestTicket || !IsSafetyControlledStopAuthorized(0) ||
         !m_ncSettleRuntimeCycleValid || !m_ncSettleRuntimeCycleContiguous || !m_edmZClockValid ||
-        !m_edm126.StepStop(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs)) return false;
+        !(m_edm128Profile ? m_edm128.StepStop(m_edm126,m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs) :
+            m_edm126.StepStop(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs))) return false;
     m_edm114StopTick=m_ncSettleRuntimeCycleTick; ApplyEDM126Scalar(command,true); return true;
 }
 
 void MotionCore::ObserveEDM126PhysicalSettle(bool complete,const EDM94::RuntimeDiagnostic& proof) noexcept
 {
     if (!m_edm126Profile || !m_edm126Participating) {m_edm126PhysicalSettled=m_edm126PhysicalRange=false;return;}
-    const auto& frame=m_edm94Frame; const auto& sent=m_edm94.Current(); const auto& f=m_edm126.Committed();
+    const auto& frame=m_edm94Frame; const auto& sent=m_edm94.Current(); const auto& f=EDM126CommittedImage();
     bool valid=complete && frame.clockValid && frame.pdoValid && frame.sourceFresh && frame.healthy && frame.authorityCurrent &&
         frame.allCommandZero && !m_safetyControlledStopInProgress && !m_edm94.ForceZero() && !m_edm94.HandoffZero() &&
         !sent.faulted && sent.lastTick==frame.tick && frame.tick>1ULL && sent.lastSentTick==frame.tick-1ULL &&
@@ -2790,9 +3323,8 @@ bool MotionCore::AuthorizeEDM94FeedScoped(std::uint64_t session, std::uint64_t r
     EDM96::Feedback gap{};
     const bool gapRead = ReadEDM96Feedback(gap);
     if (!IsEDM116PublishedProfile(session,modeFlush,modePolicy.fixture) ||
-        (modeFlush ? (!physicalCurve || curveB2 || !EDM116::ValidPolicy(modePolicy) ||
-            modePolicy.mode!=EDM116::ExpectedMode(step) || modePolicy.revision!=step+1ULL ||
-            modePolicy.selectorPC>=sourcePC || modePolicy.selectorDispatch>=dispatch ||
+        (modeFlush ? (!physicalCurve || curveB2 || !EDM116::PolicyMatchesBinding(modePolicy,step,sourcePC,dispatch) ||
+            modePolicy.mode!=EDM116::ExpectedMode(step) ||
             !EDM107::SameFlushProfile(modePolicy.profile,flushProfile)) :
             !EDM116::SamePolicy(modePolicy,EDM116::Policy{})) ||
         !IsEDM115PublishedProfile(session, curveB2) || (curveB2 && !physicalCurve) ||
@@ -3053,14 +3585,15 @@ bool MotionCore::AuthorizeEDM105Feed(std::uint64_t session, std::uint64_t run, s
 bool MotionCore::IsEDM102FeedProfileCurrent(const EDM94FeedAuthorization& a) const noexcept
 {
     if (a.historyServo) return IsEDM126FeedCurrent(a);
+    if (a.historyModeFlush || a.physicalAd || a.workTimeFlush || !EDM130::EmptyRecipe(a.timerRecipe) ||
+        !EDM129::SameBinding(a.physicalBinding,EDM129::Binding{})) return false;
     EDM126::MotionFeedback history{};
     if (ReadEDM126Feedback(history) && history.enabled && history.session==a.session) return false;
     EDM96::Feedback gap{};
     const bool gapRead = ReadEDM96Feedback(gap);
     if (!IsEDM116PublishedProfile(a.session,a.modeFlush,a.modePolicy.fixture) ||
-        (a.modeFlush ? (!a.physicalCurve || a.curveB2 || !EDM116::ValidPolicy(a.modePolicy) ||
-            a.modePolicy.mode!=EDM116::ExpectedMode(a.step) || a.modePolicy.revision!=a.step+1ULL ||
-            a.modePolicy.selectorPC>=a.sourcePC || a.modePolicy.selectorDispatch>=a.dispatch ||
+        (a.modeFlush ? (!a.physicalCurve || a.curveB2 || !EDM116::PolicyMatchesBinding(a.modePolicy,a.step,a.sourcePC,a.dispatch) ||
+            a.modePolicy.mode!=EDM116::ExpectedMode(a.step) ||
             !EDM107::SameFlushProfile(a.modePolicy.profile,a.flushProfile)) :
             !EDM116::SamePolicy(a.modePolicy,EDM116::Policy{})) ||
         !IsEDM115PublishedProfile(a.session, a.curveB2) || (a.curveB2 && !a.physicalCurve) ||
@@ -3181,6 +3714,8 @@ bool MotionCore::PublishEDM94Handoff(const EDM94FeedAuthorization& a,
 
 bool MotionCore::IsEDM107FlushProfileCurrent(const EDM107::FlushProfile& flushProfile) const noexcept
 {
+    if(m_edm128Profile) return IsEDM126ProfileCurrent() && EDM107::ValidFlushProfile(flushProfile) &&
+        EDM107::SameFlushProfile(flushProfile,m_edm107ArmFlushProfile);
     if (m_edm126Profile) return IsEDM126ProfileCurrent() && EDM107::IsDefaultFlushProfile(flushProfile);
     if (!IsEDM116ProfileCurrent(m_edm116Profile) ||
         !IsEDM115ProfileCurrent(m_edm115Profile) ||
@@ -3212,7 +3747,10 @@ bool MotionCore::IsEDM94HandoffAuthorityCurrent() const noexcept
     AlarmManager& alarms = AlarmManager::GetInstance();
     return exactEpoch && (owner == h.ownerWord || owner == (h.ownerWord | MOTION_OWNER_EPOCH_COMMIT_RESERVED)) &&
         h.authorization.session == m_edm94.Current().identity.session &&
-        h.authorization.historyServo == m_edm126Profile &&
+        h.authorization.historyServo == m_edm126Profile && h.authorization.historyModeFlush == m_edm128Profile &&
+        h.authorization.physicalAd == m_edm129Profile && h.authorization.workTimeFlush == m_edm130Profile &&
+        EDM130::SameRecipe(h.authorization.timerRecipe,m_edm130ArmRecipe) && (!m_edm129Profile ||
+            EDM129::SameBinding(h.authorization.physicalBinding,m_edm129Source.FrozenBinding())) &&
         (!m_edm126Profile || h.authorization.historyFixture==m_edm126Current.fixture) &&
         h.authorization.endurance == m_edm102Profile &&
         h.authorization.b2CrossSegment == m_edm110Profile &&
@@ -3253,7 +3791,10 @@ bool MotionCore::IsEDM94HandoffCommandCurrent() const noexcept
     const bool arc = h.authorization.physicalCurve && (h.authorization.historyServo ?
         EDM116::IsArcStep(h.authorization.step,h.authorization.historyFixture?EDM116::Fixture::ArcPairComplement124:EDM116::Fixture::ArcPair124) : h.authorization.modeFlush ?
         EDM116::IsArcStep(h.authorization.step,h.authorization.modePolicy.fixture) : EDM114::IsArcStep(h.authorization.step));
-    if (h.authorization.historyServo!=m_edm126Profile ||
+    if (h.authorization.historyServo!=m_edm126Profile || h.authorization.historyModeFlush!=m_edm128Profile ||
+        h.authorization.physicalAd!=m_edm129Profile || h.authorization.workTimeFlush!=m_edm130Profile ||
+        !EDM130::SameRecipe(h.authorization.timerRecipe,m_edm130ArmRecipe) || (m_edm129Profile &&
+            !EDM129::SameBinding(h.authorization.physicalBinding,m_edm129Source.FrozenBinding())) ||
         (m_edm126Profile && h.authorization.historyFixture!=m_edm126Current.fixture) ||
         !IsEDM107FlushProfileCurrent(h.authorization.flushProfile) ||
         h.authorization.b2CrossSegment != m_edm110Profile ||
@@ -3336,7 +3877,9 @@ void MotionCore::ObserveEDM94Handoff(bool freshMotionFrame) noexcept
             a.lease.generation == m_edm94.Current().identity.ownerGeneration &&
             message.nextEpoch == (a.epoch == (std::numeric_limits<MotionExecutionEpoch>::max)() ? 1U : a.epoch + 1U) &&
             m_edm95Profile == !EDM95::EmptyPermit(a.gapPermit) &&
-            m_edm126Profile == a.historyServo && (!m_edm126Profile || a.historyFixture==m_edm126Current.fixture) &&
+            m_edm126Profile == a.historyServo && m_edm128Profile == a.historyModeFlush && m_edm129Profile == a.physicalAd &&
+            m_edm130Profile == a.workTimeFlush && EDM130::SameRecipe(a.timerRecipe,m_edm130ArmRecipe) &&
+            (!m_edm129Profile || EDM129::SameBinding(a.physicalBinding,m_edm129Source.FrozenBinding())) && (!m_edm126Profile || a.historyFixture==m_edm126Current.fixture) &&
             m_edm96Profile == a.gapSegment && !(a.gapSegment && !EDM95::EmptyPermit(a.gapPermit)) &&
             m_edm97Profile == a.proportional && (!m_edm96Profile || m_edm126Profile || m_edm97Profile == m_edm96.IsTuned()) &&
             m_edm98Profile == a.noise && (!m_edm96Profile || m_edm126Profile || m_edm98Profile == m_edm96.IsNoiseTuned()) &&
@@ -3375,7 +3918,7 @@ void MotionCore::ObserveEDM94Handoff(bool freshMotionFrame) noexcept
         {
             if (a.historyServo) {
                 const auto& boundary=m_edm94.Current();
-                if (!IsEDM126ProfileCurrent() || m_edm126Current.authorizedRows!=a.step ||
+                if (!IsEDM126ProfileCurrent() || !IsEDM128FeedPolicyCurrent(a) || m_edm126Current.authorizedRows!=a.step ||
                     m_edm126Current.completedRows!=a.step || !boundary.armedReady || boundary.forceZero ||
                     boundary.faulted || boundary.cancelled || boundary.handoffZero ||
                     boundary.boundaryReadyCycles<EDM94::BoundaryReadyCycles || boundary.boundaryNotReadyMask ||
@@ -3417,7 +3960,9 @@ void MotionCore::ObserveEDM94Handoff(bool freshMotionFrame) noexcept
                 std::memcmp(a.increment.data(), b.increment.data(), sizeof(double) * 6U) != 0 ||
                 std::memcmp(&a.feedMMMin, &b.feedMMMin, sizeof(double)) != 0 ||
                 !a.lease.Matches(b.lease) || !EDM95::SamePermit(a.gapPermit, b.gapPermit) ||
-                a.historyServo!=b.historyServo || a.historyFixture!=b.historyFixture ||
+                a.historyServo!=b.historyServo || a.historyModeFlush!=b.historyModeFlush || a.physicalAd!=b.physicalAd ||
+                a.workTimeFlush!=b.workTimeFlush || !EDM130::SameRecipe(a.timerRecipe,b.timerRecipe) ||
+                !EDM129::SameBinding(a.physicalBinding,b.physicalBinding) || a.historyFixture!=b.historyFixture ||
                 a.historyBoundaryTick!=b.historyBoundaryTick || a.historyCommit!=b.historyCommit ||
                 !EDM126::SameSource(a.historyPrevious,b.historyPrevious) ||
                 a.gapSegment != b.gapSegment || a.proportional != b.proportional ||
@@ -3889,14 +4434,14 @@ bool MotionCore::ValidateEDM94SendClock() noexcept
     if (valid && m_edm126Profile && !m_edm94.ForceZero()) {
         bool mapped=true;
         if (!m_edm94.HandoffZero() && m_edm126Current.rowActive) {
-            const auto& committed=m_edm126.Committed();
+            const auto& committed=EDM126CommittedImage();
             mapped=IsEDM126Current() && !committed.faulted && committed.tick==m_ncSettleRuntimeCycleTick &&
                 committed.nowUs==m_edmZMonotonicUs && m_edm126Current.lastMappingTick==committed.tick &&
                 m_edm126Current.lastMappingUs==committed.nowUs && m_edm114MappedTick==committed.tick;
             for(unsigned i=0U;mapped && i<6U;++i) mapped=(*m_pContexts)[i].logicalCmdPos==committed.positionPulse[i] &&
                 (*m_pContexts)[i].logicalCmdVel==committed.velocityPps[i];
         }
-        if (!IsEDM126SourceCurrent(nowUs) || !mapped) {
+        if ((!IsEDM126SourceCurrent(nowUs) && !IsEDM129AwaitFreshZeroCurrent(nowUs)) || !mapped) {
             m_edm126Current.faulted=m_edm126Gap.faulted=true;
             TripEDM94(EDM94::Reason::Source,EDM94::FaultSite::SendClock); PublishEDM126Feedback(); return false;
         }
@@ -4458,9 +5003,8 @@ bool MotionCore::ValidateEDM116Feed(const EDM94FeedAuthorization& a) noexcept
     const auto& p=m_edm114Current; const auto& policy=a.modePolicy;
     const unsigned previousEvents=(a.step+1U)/2U;
     if(!IsEDM116ProfileCurrent(true) || !a.modeFlush || a.curveB2 || !a.physicalCurve ||
-        !EDM116::ValidPolicy(policy) || policy.fixture!=m_edm116ArmFixture ||
+        !EDM116::PolicyMatchesBinding(policy,a.step,a.sourcePC,a.dispatch) || policy.fixture!=m_edm116ArmFixture ||
         a.gCode!=EDM116::ExpectedGCode(a.step,m_edm116ArmFixture) || policy.mode!=EDM116::ExpectedMode(a.step) ||
-        policy.revision!=a.step+1ULL || policy.selectorPC>=a.sourcePC || policy.selectorDispatch>=a.dispatch ||
         !EDM107::SameFlushProfile(policy.profile,m_edm107ArmFlushProfile) ||
         m_edm116Current.authorizedRows!=a.step || m_edm116Current.completedRows!=a.step ||
         m_edm115Driving || m_edm96.ModeFlushActive() || m_safetyControlledStopInProgress ||
@@ -4470,7 +5014,7 @@ bool MotionCore::ValidateEDM116Feed(const EDM94FeedAuthorization& a) noexcept
         (a.step && (!p.rowComplete || p.failed || p.stopActive || !p.geometryValid ||
           !EDM114::SameSource(m_edm116Current.rowSource,p.source) ||
           !EDM116::SamePolicy(m_edm116Current.rowPolicy,m_edm116RowPolicy) ||
-          policy.selectorPC<=p.source.sourcePC || policy.selectorDispatch<=p.source.dispatch)))return false;
+          !EDM116::PolicyFollowsCompleted(policy,m_edm116Current.rowPolicy,p.source))))return false;
     const bool cross=EDM116::IsTriggerStep(a.step)&&policy.mode==EDM116::Mode::B2;
     const auto& token=a.previousCurve;
     if(cross ? !EDM116::ValidToken(token,a.step):!EDM116::EmptyToken(token))return false;
@@ -6279,8 +6823,10 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
     if (m_edm114Profile && m_edm114Current.geometryValid && !m_Group.isActive &&
         !m_safetyControlledStopInProgress && m_ncResetRebaseAckProducer.requestSequence > m_edm94ResetFloor)
     {
-        if (m_edm126Profile) { m_edm126.Clear(); m_edm126Participating=false;
-            m_edm126Current.active=m_edm126Current.sourceReady=m_edm126Current.rowActive=false; PublishEDM126Feedback(); }
+        if (m_edm126Profile) { m_edm126.Clear(); m_edm128.Clear(); m_edm126Participating=false;
+            m_edm126Current.active=m_edm126Current.sourceReady=m_edm126Current.rowActive=false;
+            if(m_edm129Profile) { m_edm129Source.Cancel(); }
+            PublishEDM126Feedback(); }
         m_edm114Mapping.Clear(); m_edm114Stop.Clear(); m_edm114Command = MotionExecutionIdentity{};
         m_edm114Current.geometryValid = false; PublishEDM114Feedback();
         m_edm115.Clear(); m_edm115Committed.Clear(); m_edm116.Clear(); m_edm116Committed.Clear();
@@ -6295,6 +6841,11 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
     {
         ClearEDM118StopObservation();
         m_edm126.Clear(); m_edm126Profile=m_edm126Participating=false; m_edm126Current=EDM126::MotionFeedback{};
+        m_edm128.Clear(); m_edm128Profile=false; m_edm128Current=EDM128::MotionFeedback{};
+        m_edm130Profile=false; m_edm130ArmRecipe=EDM130::Recipe{};
+        m_edm128Feedback.Publish(m_edm128Current);
+        m_edm129Source.Cancel(); m_edm129Profile=false; m_edm129Current=EDM129::MotionFeedback{};
+        m_edm129Feedback.Publish(m_edm129Current);
         m_edm109Mapping.Clear(); m_edm109Command = MotionExecutionIdentity{};
         m_edm109Current = EDM109::Feedback{}; m_edm109Profile = false;
         m_edm114Mapping.Clear(); m_edm114Stop.Clear(); m_edm114Command = MotionExecutionIdentity{};
@@ -6324,14 +6875,17 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
         if ((arm.historyServo && (arm.historyFixture>1U || !arm.gapSegment || !arm.proportional || !arm.physicalCurve ||
             arm.gapBoundary || arm.noise || arm.burst || arm.continuous || arm.endurance || arm.paired || arm.flush ||
             arm.commonPath || arm.b2CrossSegment || arm.b2Repeat || arm.curveRuntime || arm.curveB2 || arm.modeFlush)) ||
-            (!arm.historyServo && arm.historyFixture!=0U) || !EDM116::ValidFixture(arm.modeFixture) ||
+            (!arm.historyServo && (arm.historyFixture!=0U || arm.historyModeFlush || arm.physicalAd || arm.workTimeFlush)) ||
+            (arm.workTimeFlush ? (!arm.physicalAd || !(EDM130::MatchesFlushSpeed(arm.timerRecipe,arm.flushProfile.speedRatio) &&
+            EDM130::MatchesFlushHeight(arm.timerRecipe,arm.flushProfile.strokeRatio,arm.flushProfile.dwellUs))) : !EDM130::EmptyRecipe(arm.timerRecipe)) ||
+            (arm.physicalAd && !arm.historyModeFlush) || !EDM116::ValidFixture(arm.modeFixture) ||
             (!arm.modeFlush && arm.modeFixture!=EDM116::Fixture::Canonical116) ||
             (arm.modeFlush && (!arm.physicalCurve || arm.curveB2)) ||
             (arm.curveB2 && !arm.physicalCurve) ||
             (arm.physicalCurve && !arm.historyServo && (arm.commonPath || arm.b2CrossSegment || arm.b2Repeat || arm.curveRuntime || !arm.flush)) ||
             (arm.curveRuntime && (!arm.commonPath || !arm.b2CrossSegment || !arm.b2Repeat || !arm.flush)) ||
             (arm.b2Repeat && !arm.b2CrossSegment) || (arm.b2CrossSegment && !arm.commonPath) || (arm.commonPath && !arm.flush) || !EDM107::ValidFlushProfile(arm.flushProfile) ||
-            (!arm.flush && !EDM107::IsDefaultFlushProfile(arm.flushProfile)) ||
+            (!arm.flush && !arm.historyModeFlush && !EDM107::IsDefaultFlushProfile(arm.flushProfile)) ||
             (arm.gapBoundary && arm.gapSegment) ||
             (arm.flush && (!arm.paired || !arm.endurance || !arm.continuous || !arm.burst || !arm.proportional ||
                 !arm.gapSegment || arm.gapBoundary || arm.noise || !EDM105::ValidTuning(arm.tuning))) ||
@@ -6486,13 +7040,25 @@ void MotionCore::ServiceEDM94MotionPass(bool complete) noexcept
     // physical settling only after Tick has validated the current frame.
     const EDM94::RuntimeDiagnostic edm110PriorSendProof = m_edm94.CurrentRuntimeDiagnostic();
     m_edm94.Tick(m_edm94Frame);
+    // EDM137 FIX1: retain this exact SOURCE-fault input image before formal
+    // containment changes owner/group state. The existing immutable SOURCE
+    // sidecar is observation only; no new PDO, send, or motion authority.
+    const auto& firstGuardFault=m_edm94.Current().firstFault;
+    if(m_edm94.Current().faulted &&
+        firstGuardFault.site==static_cast<std::uint32_t>(EDM94::FaultSite::EngineFault) &&
+        firstGuardFault.reason==static_cast<std::uint32_t>(EDM94::Reason::Source) &&
+        firstGuardFault.tick==m_ncSettleRuntimeCycleTick && firstGuardFault.nowUs==m_edmZMonotonicUs &&
+        firstGuardFault.frameIdentity.session==m_edm126Current.session)
+        CaptureEDM133FirstCause(EDM126::FirstCauseSite::GuardSource,-1,0U,0U);
     ObserveEDM110PhysicalSettle(complete, edm110PriorSendProof);
     ObserveEDM115PhysicalSettle(complete, edm110PriorSendProof);
     ObserveEDM126PhysicalSettle(complete,edm110PriorSendProof);
     if (m_edm94.Current().faulted) EnsureEDM94FormalStop();
     if (m_edm126Profile && m_edm94.ForceZero() && (!m_edm94.Current().finishRequested ||
         m_edm94.Current().faulted || m_edm94.Current().cancelled)) { m_edm126Current.active=m_edm126Gap.active=false;
-        m_edm126Current.sourceReady=false; PublishEDM126Feedback(); }
+        m_edm126Current.sourceReady=false;
+        if(m_edm129Profile) { m_edm129Source.Cancel(); }
+        PublishEDM126Feedback(); }
     if (!m_edm126Profile && m_edm96Profile && m_edm94.ForceZero() && m_edm96.Current().active)
     {
         m_edm96.Stop();
@@ -7621,8 +8187,11 @@ void MotionCore::ObserveNCSettleRuntimeCycle(
         (EDM28::IsPhysicalServoProfile(m_edmZPolicy.Snapshot().frozenConfig.profile) && m_edmZPolicy.Snapshot().capHeld);
     EDM64::Snapshot physical{};
     EDM53::Stamp physicalStamp{};
-    if (servicePhysical && m_pEDMPhysicalSourceMaster != nullptr)
+    // Capture before QPC on every bound callback. An ARM queued after this
+    // eligibility snapshot still uses this same callback's coherent receipt.
+    if (m_pEDMPhysicalSourceMaster != nullptr)
         physicalStamp = m_pEDMPhysicalSourceMaster->ReadGapPhysicalRTShadow(physical);
+    m_edm129Physical=physical; m_edm129PhysicalStamp=physicalStamp;
     ObserveEDMZFixtureRuntimeClock(runtimeCycleTick, pdoCycleValid, adjacentToPrevious);
     ServiceEDM96Source();
     ObserveEDMRTShadowRuntimeCycle(runtimeCycleTick, pdoCycleValid, adjacentToPrevious,
@@ -23798,6 +24367,8 @@ void MotionCore::UpdateMotion(
             // Independent backstop for any future path that bypasses the
             // UpdateInterpolation pre-scan.  Stop every existing axis in
             // this same RT pass; never integrate the stale orphan speed.
+            CaptureEDM133FirstCause(EDM126::FirstCauseSite::PerAxisOrphan,axis.axisIndex,
+                EDM126::FirstCauseMember,EDM126::FirstCauseMember);
             m_p1OrphanAxisContainmentCount.fetch_add(
                 1ULL,
                 std::memory_order_relaxed);
@@ -29673,6 +30244,9 @@ void MotionCore::UpdateInterpolation()
 
     if (!currentGroupMappingValid || orphanAxisIndex >= 0)
     {
+        CaptureEDM133FirstCause(EDM126::FirstCauseSite::GroupPrescan,orphanAxisIndex,
+            EDM126::FirstCauseMapping|(currentGroupMappingValid?EDM126::FirstCauseOrphan:0U),
+            currentGroupMappingValid?EDM126::FirstCauseOrphan:EDM126::FirstCauseMapping);
         m_p1OrphanAxisContainmentCount.fetch_add(
             1ULL,
             std::memory_order_relaxed);

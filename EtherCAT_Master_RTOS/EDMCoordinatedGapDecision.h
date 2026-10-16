@@ -97,6 +97,12 @@ inline bool ValidFrameIdentity(const EDM88::Identity& identity) noexcept
     return identity.kind==EDM88::SourceKind::Simulation && identity.producerGeneration &&
         identity.deviceId && identity.channelId<=65535U && identity.configRevision && identity.calibrationRevision;
 }
+inline bool ValidPhysicalFrameIdentity(const EDM88::Identity& identity) noexcept
+{
+    return identity.kind==EDM88::SourceKind::Physical && identity.producerGeneration &&
+        identity.deviceId && identity.deviceId<=65535U && identity.channelId && identity.channelId<=64U &&
+        identity.configRevision && identity.calibrationRevision;
+}
 inline bool ValidPair(const Mark& start,const Mark& confirm,std::uint64_t count,
     std::uint64_t dwellUs,const EDM88::Frame& last) noexcept
 {
@@ -140,11 +146,13 @@ class Decision
 public:
     bool Begin(const EDMGapServo::Profile& profile) noexcept
     {
-        evidence_=Evidence{}; active_=false;
+        evidence_=Evidence{}; active_=false; physical_=false;
         if(!EDMGapServo::ValidateProfile(profile)) return Fail(Reason::Configuration);
         evidence_.config=FrozenConfig(profile); evidence_.state=EDMGapServo::ShortState::Clear;
         evidence_.feedInhibited=false; evidence_.reason=Reason::None; active_=true; return true;
     }
+    bool BeginPhysical(const EDMGapServo::Profile& profile) noexcept
+    { if(!Begin(profile)) return false; physical_=true; return true; }
     const Evidence& Current() const noexcept { return evidence_; }
     EDMGapServo::ShortResult Result() const noexcept
     {
@@ -160,7 +168,7 @@ public:
     {
         if(evidence_.faulted) return false;
         if(!active_) return Fail(Reason::Lifecycle);
-        if(!ValidFrameIdentity(frame.identity) ||
+        if(!(physical_ ? ValidPhysicalFrameIdentity(frame.identity) : ValidFrameIdentity(frame.identity)) ||
             (evidence_.processedFrames && !EDM88::SameIdentity(frame.identity,evidence_.lastFrame.identity)))
             return Fail(Reason::Identity);
         if(!frame.valid) return Fail(Reason::Invalid);
@@ -174,9 +182,10 @@ public:
             return true;
         }
         const auto maximum=(std::numeric_limits<std::uint64_t>::max)();
-        if((!evidence_.processedFrames && frame.sequence!=1U) ||
+        if((!physical_ && !evidence_.processedFrames && frame.sequence!=1U) ||
             (evidence_.processedFrames && (evidence_.lastFrame.sequence==maximum ||
-                frame.sequence!=evidence_.lastFrame.sequence+1U))) return Fail(Reason::Sequence);
+                (physical_ ? frame.sequence<=evidence_.lastFrame.sequence :
+                    frame.sequence!=evidence_.lastFrame.sequence+1U)))) return Fail(Reason::Sequence);
         if(!frame.capturedAtUs || (evidence_.processedFrames &&
             frame.capturedAtUs<=evidence_.lastFrame.capturedAtUs)) return Fail(Reason::SourceClock);
         // Every transition counter is bounded by processedFrames. Preflight all
@@ -246,7 +255,7 @@ private:
         active_=false; return false;
     }
     Evidence evidence_{};
-    bool active_=false;
+    bool active_=false,physical_=false;
 };
 static_assert(std::is_trivially_copyable<Evidence>::value,"EDM89 evidence must remain a copied value");
 static_assert(sizeof(Decision)<=384U,"EDM89 bounded decision storage exceeded");

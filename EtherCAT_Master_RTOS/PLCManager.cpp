@@ -756,6 +756,7 @@ void PLCManager::Init()
     std::memset(m_I, 0, sizeof(m_I));
     std::memset(m_O, 0, sizeof(m_O));
     std::memset(m_A, 0, sizeof(m_A));
+    m_edmOutputWord.store(0U, std::memory_order_release);
     std::memset(m_S, 0, sizeof(m_S));
     std::memset(m_C, 0, sizeof(m_C));
     std::memset(m_R, 0, sizeof(m_R));
@@ -793,6 +794,7 @@ void PLCManager::Close_PLC()
     std::memset(m_I, 0, sizeof(m_I));
     std::memset(m_O, 0, sizeof(m_O));
     std::memset(m_A, 0, sizeof(m_A));
+    m_edmOutputWord.store(0U, std::memory_order_release);
     std::memset(m_S, 0, sizeof(m_S));
     std::memset(m_C, 0, sizeof(m_C));
     std::memset(m_R, 0, sizeof(m_R));
@@ -965,7 +967,7 @@ double PLCManager::GetOperandAsDouble(const PLCOperand& op) {
     case 0: return m_I[addr];
     case 1: return m_O[addr];
     case 2: return m_C[addr];
-    case 3: return m_S[addr]; // V7.4.3: restore S as readable operand.
+    case 3: return Get_S(addr); // V7.4.3: restore S as readable operand.
     case 4: return m_A[addr]; // V7.4.3: restore A as readable operand.
     case 5: return m_T[addr].done ? 1.0 : 0.0;
     case 6: return m_R[addr];
@@ -1051,7 +1053,7 @@ void PLCManager::SetOperandFromDouble(const PLCOperand& op, double val) {
         break;
     case 1: m_O[addr] = (val != 0); break;
     case 2: m_C[addr] = (val != 0); break;
-    case 3: m_S[addr] = (val != 0); break;
+    case 3: Set_S(addr, val != 0); break;
     case 4: m_A[addr] = (val != 0); break;
     case 0:
     case 5:
@@ -2486,13 +2488,21 @@ bool PLCManager::Get_A(int index) const {
     return false;
 }
 
+void PLCManager::PublishEDMOutputs(unsigned word) noexcept {
+    // Diagnostic policy is enforced again at the publication boundary.
+    m_edmOutputWord.store(word & (EDM137PLC::FlushBit | EDM137PLC::PolarityBit), std::memory_order_release);
+}
+
 void PLCManager::Set_S(int index, bool value) {
+    if (EDM137PLC::ReservedPoint(index)) return;
     if (index >= 0 && index < MAX_PLC_S) {
         m_S[index] = value ? 1 : 0;
     }
 }
 
 bool PLCManager::Get_S(int index) const {
+    if (EDM137PLC::ReservedPoint(index))
+        return (m_edmOutputWord.load(std::memory_order_acquire) & EDM137PLC::PointBit(index)) != 0U;
     if (index >= 0 && index < MAX_PLC_S) {
         return m_S[index] != 0;
     }
@@ -2521,7 +2531,7 @@ double PLCManager::GetMemory(const std::string& prefix, int index) const {
     if (prefix == "I" && index >= 0 && index < MAX_PLC_I) return m_I[index];
     if (prefix == "O" && index >= 0 && index < MAX_PLC_O) return m_O[index];
     if (prefix == "A" && index >= 0 && index < MAX_PLC_A) return m_A[index]; // 🌟 A 點
-    if (prefix == "S" && index >= 0 && index < MAX_PLC_S) return m_S[index]; // 🌟 S 點
+    if (prefix == "S" && index >= 0 && index < MAX_PLC_S) return Get_S(index); // 🌟 S 點
     if (prefix == "C" && index >= 0 && index < MAX_PLC_C) return m_C[index];
     if (prefix == "R" && index >= 0 && index < MAX_PLC_R) return m_R[index];
     if (prefix == "DR" && index >= 0 && index < MAX_PLC_DR) return m_DR[index];
@@ -2536,7 +2546,7 @@ void PLCManager::SetMemory(const std::string& prefix, int index, double value) {
     if (prefix == "I" && index >= 0 && index < MAX_PLC_I) m_I[index] = (value != 0);
     else if (prefix == "O" && index >= 0 && index < MAX_PLC_O) m_O[index] = (value != 0);
     else if (prefix == "A" && index >= 0 && index < MAX_PLC_A) m_A[index] = (value != 0); // 🌟 A 點
-    else if (prefix == "S" && index >= 0 && index < MAX_PLC_S) m_S[index] = (value != 0); // 🌟 S 點
+    else if (prefix == "S" && index >= 0 && index < MAX_PLC_S) Set_S(index, value != 0); // 🌟 S 點
     else if (prefix == "C" && index >= 0 && index < MAX_PLC_C) m_C[index] = (value != 0);
     else if (prefix == "R" && index >= 0 && index < MAX_PLC_R) m_R[index] = ClampDoubleToInt32(value);
     else if (prefix == "DR" && index >= 0 && index < MAX_PLC_DR) m_DR[index] = ClampDoubleToInt32(value);
@@ -2657,6 +2667,10 @@ void PLCManager::ExportPLCStatus(SHM_PLC_Status* pStatus) const
     std::memcpy(pStatus->O, m_O, sizeof(m_O));
     std::memcpy(pStatus->A, m_A, sizeof(m_A));
     std::memcpy(pStatus->S, m_S, sizeof(m_S));
+    const unsigned edmWord = m_edmOutputWord.load(std::memory_order_acquire);
+    pStatus->S[80] = (edmWord & EDM137PLC::FlushBit) != 0U;
+    pStatus->S[92] = (edmWord & EDM137PLC::DischargeBit) != 0U;
+    pStatus->S[93] = (edmWord & EDM137PLC::PolarityBit) != 0U;
     std::memcpy(pStatus->C, m_C, sizeof(m_C));
     std::memcpy(pStatus->R, m_R, sizeof(m_R));
     std::memcpy(pStatus->DR, m_DR, sizeof(m_DR));

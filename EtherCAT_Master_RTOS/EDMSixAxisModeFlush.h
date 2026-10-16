@@ -20,14 +20,18 @@ enum class Mode : std::uint8_t { B0 = 0U, B1 = 1U, B2 = 2U, Invalid = 255U };
 // EDM124 opts in to one additional authored arc pair at rows 4/5. Earlier
 // fixtures retain their original geometry, B modes and token checkpoints.
 enum class Fixture : std::uint8_t
-{ Canonical116 = 0U, Complement117 = 1U, ArcPair124 = 2U, ArcPairComplement124 = 3U };
+{ Canonical116 = 0U, Complement117 = 1U, ArcPair124 = 2U, ArcPairComplement124 = 3U,
+  Modal127 = 4U, ModalComplement127 = 5U };
+inline bool IsModalFixture(Fixture fixture) noexcept
+{ return fixture == Fixture::Modal127 || fixture == Fixture::ModalComplement127; }
 inline bool ValidFixture(Fixture fixture) noexcept
 { return fixture == Fixture::Canonical116 || fixture == Fixture::Complement117 ||
-    fixture == Fixture::ArcPair124 || fixture == Fixture::ArcPairComplement124; }
+    fixture == Fixture::ArcPair124 || fixture == Fixture::ArcPairComplement124 || IsModalFixture(fixture); }
 inline bool IsArcPairFixture(Fixture fixture) noexcept
-{ return fixture == Fixture::ArcPair124 || fixture == Fixture::ArcPairComplement124; }
+{ return fixture == Fixture::ArcPair124 || fixture == Fixture::ArcPairComplement124 || IsModalFixture(fixture); }
 inline bool IsComplementFixture(Fixture fixture) noexcept
-{ return fixture == Fixture::Complement117 || fixture == Fixture::ArcPairComplement124; }
+{ return fixture == Fixture::Complement117 || fixture == Fixture::ArcPairComplement124 ||
+    fixture == Fixture::ModalComplement127; }
 inline bool IsArcStep(unsigned step, Fixture fixture = Fixture::Canonical116) noexcept
 {
     return ValidFixture(fixture) && (EDM114::IsArcStep(step) ||
@@ -77,21 +81,51 @@ struct Policy
     EDM107::FlushProfile profile{};
     int selectorPC = -1;
     std::uint64_t selectorDispatch = 0ULL, revision = 0ULL;
+    // EDM127: the modal origin survives omitted B words. selectorPC/Dispatch
+    // bind this immutable policy to its own motion row; they are never a
+    // fabricated B dispatch. Legacy explicit-P131 policies keep origin empty.
+    int modeOriginPC = -1;
+    std::uint64_t modeOriginDispatch = 0ULL, modeOriginRevision = 0ULL;
 };
 inline bool ValidPolicy(const Policy& policy) noexcept
 {
-    return ValidMode(policy.mode) && ValidFixture(policy.fixture) && EDM107::ValidFlushProfile(policy.profile) && policy.selectorPC >= 0 &&
-        policy.selectorDispatch != 0ULL && policy.revision >= 1ULL && policy.revision <= EDM114::RequiredRows;
+    if (!ValidMode(policy.mode) || !ValidFixture(policy.fixture) || !EDM107::ValidFlushProfile(policy.profile) || policy.selectorPC < 0 ||
+        !policy.selectorDispatch || policy.revision < 1ULL || policy.revision > EDM114::RequiredRows) return false;
+    if (!IsModalFixture(policy.fixture)) return policy.modeOriginPC == -1 && !policy.modeOriginDispatch && !policy.modeOriginRevision;
+    return policy.modeOriginPC >= 0 && policy.modeOriginDispatch && policy.modeOriginRevision &&
+        policy.modeOriginPC <= policy.selectorPC && policy.modeOriginDispatch <= policy.selectorDispatch &&
+        ((policy.modeOriginPC == policy.selectorPC) == (policy.modeOriginDispatch == policy.selectorDispatch));
 }
 inline bool SamePolicy(const Policy& a, const Policy& b) noexcept
 {
     return a.mode == b.mode && a.fixture == b.fixture && EDM107::SameFlushProfile(a.profile,b.profile) && a.selectorPC == b.selectorPC &&
-        a.selectorDispatch == b.selectorDispatch && a.revision == b.revision;
+        a.selectorDispatch == b.selectorDispatch && a.revision == b.revision &&
+        a.modeOriginPC == b.modeOriginPC && a.modeOriginDispatch == b.modeOriginDispatch && a.modeOriginRevision == b.modeOriginRevision;
+}
+inline bool PolicyMatchesBinding(const Policy& policy, unsigned step, int sourcePC, std::uint64_t dispatch) noexcept
+{
+    return ValidPolicy(policy) && step < EDM114::RequiredRows && sourcePC >= 0 && dispatch &&
+        policy.revision == static_cast<std::uint64_t>(step)+1ULL &&
+        (IsModalFixture(policy.fixture) ? (policy.selectorPC == sourcePC && policy.selectorDispatch == dispatch) :
+            (policy.selectorPC < sourcePC && policy.selectorDispatch < dispatch));
 }
 inline bool PolicyMatchesSource(const Policy& policy, const Source& source) noexcept
 {
-    return ValidPolicy(policy) && EDM114::ValidSource(source) && policy.revision == static_cast<std::uint64_t>(source.step)+1ULL &&
-        policy.selectorPC < source.sourcePC && policy.selectorDispatch < source.dispatch;
+    return EDM114::ValidSource(source) && PolicyMatchesBinding(policy,source.step,source.sourcePC,source.dispatch);
+}
+inline bool PolicyFollowsCompleted(const Policy& policy, const Policy& previous, const Source& source) noexcept
+{
+    if (!ValidPolicy(policy) || !PolicyMatchesSource(previous,source) || policy.fixture != previous.fixture ||
+        policy.revision != previous.revision+1ULL || policy.selectorPC <= source.sourcePC ||
+        policy.selectorDispatch <= source.dispatch) return false;
+    if (!IsModalFixture(policy.fixture)) return true;
+    const bool sameOrigin = policy.modeOriginPC == previous.modeOriginPC &&
+        policy.modeOriginDispatch == previous.modeOriginDispatch && policy.modeOriginRevision == previous.modeOriginRevision;
+    if (sameOrigin) return policy.mode == previous.mode;
+    // A genuine later B block may be standalone or inline. More than one
+    // standalone selection between rows advances the origin revision again.
+    return policy.modeOriginPC > source.sourcePC && policy.modeOriginDispatch > source.dispatch &&
+        policy.modeOriginRevision > previous.modeOriginRevision;
 }
 inline bool EmptyToken(const CompletionToken& token) noexcept { return EDM115::EmptyToken(token); }
 inline bool SameToken(const CompletionToken& a,const CompletionToken& b) noexcept { return EDM115::SameToken(a,b); }

@@ -197,6 +197,11 @@ namespace NCPLC
         // Axis 0~7
         // --------------------------------------------------------
 
+        // EDM137: NC-owned process outputs. S141 remains Y HOME search.
+        constexpr int EDM_FLUSH_ACTIVE = 80;
+        constexpr int EDM_DISCHARGE_ENABLE = 92;
+        constexpr int EDM_POLARITY = 93;
+
         constexpr int SERVO_ON_BASE = 100;                         // S100~107 Servo ON
         constexpr int HOMED_BASE = 110;                            // S110~117 HOME งนฆจ
 

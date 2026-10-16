@@ -1,5 +1,8 @@
 ﻿#pragma once
 #include "NC_Types.h"
+#include "EDM127ModalB.h"
+#include "EDMPLCOutputState.h"
+#include "EDM130WorkTimeBinding.h"
 #include "EDMGapSignal.h"
 #include "EDMGapInput.h"
 #include "EDMPhysicalRecipeCapture.h" // EDM67: no-axis frozen physical recipe receipt.
@@ -1280,6 +1283,10 @@ public:
     bool AdoptProgramMotionLease(
         const MotionOwnerLease& lease) noexcept;
 private:
+    void SyncEDMPLCOutputsSameThread() noexcept;
+    void ForceEDMPLCOutputsOffSameThread(const char* reason) noexcept;
+    EDM137PLC::State m_edm137PLC{};
+
     // Stage NC-0.1E：NC Program Owner Lease 生命週期。
     bool AcquireProgramMotionOwner() noexcept;
     void ReleaseProgramMotionOwner() noexcept;
@@ -2644,6 +2651,9 @@ private:
         bool gapCurveGeometry = false; // P121 through P124: numerical curve fixture and actual G01 shadows.
         bool gapCurveRuntime = false; // P123/P124: RT curve observation only; no physical arc authority.
         bool gapHistoryServo = false; // P158/P160: GAP-driven retained geometry; NC dispatch never reverses.
+        bool gapWorkTime = false; // P174/P176: frozen E5 controls the shared flush clock.
+        bool gapPhysicalAd = false; // P170/P172: actual AD drives the guarded shared GAP history.
+        bool gapHistoryMode = false; // P166/P168: shared GAP history with coordinated modal B excursions.
         unsigned gapHistoryArm = 0U;
         bool gapPhysicalCurve = false; // P125/P126 and P127/P128: explicit physical G17 ARC2 and six-axis G01.
         bool gapModeFlush = false; // P129/P130 and P132/P133: independent B0/B1/B2 per row.
@@ -2713,6 +2723,34 @@ private:
     bool WaitEDM126InitialBoundarySameThread() noexcept;
     bool IsEDM126CurrentSameThread(unsigned completed) const noexcept;
     void LogEDM126SameThread(const char* event) const noexcept;
+    struct EDM130NCState
+    {
+        EDM130::Recipe recipe{};
+        EDM130::WorkEvidence retainedWork{};
+        std::array<unsigned, 3U> retainedModeEvents{};
+        std::uint64_t loggedTriggers = 0ULL, loggedCompletions = 0ULL;
+        std::uint32_t loggedFlushPhase = 0U, loggedSpeedStage = 0U; // EDM137 observer only.
+        bool bound = false, retainedRowEvent = false;
+    } m_edm130{};
+    bool BindEDM130WorkTimeSameThread() noexcept;
+    bool IsEDM130RecipePreambleSameThread(const NCParsedBlock& block, int pc) const noexcept;
+    bool IsEDM130CurrentSameThread(unsigned completed) const noexcept;
+    void LogEDM130SameThread(const char* event, unsigned step) const noexcept;
+    struct EDM129NCState
+    {
+        EDM129::Binding sourceBinding{};
+        bool sourceBound = false;
+    } m_edm129{};
+    static_assert(sizeof(EDM129NCState) <= 384U, "EDM129 immutable physical source admission evidence.");
+    bool IsEDM129SourceCurrentSameThread(const EDM126::MotionFeedback* history = nullptr) const noexcept;
+    bool IsEDM129CurrentSameThread(unsigned completed) const noexcept;
+    bool AuthorizeEDM129SameThread(const NCBlock& block, int gcode, const std::array<double, 2U>& center) noexcept;
+    bool RetainEDM129CompletedSameThread(const EDM94::Feedback& guard) noexcept;
+    void LogEDM129SameThread(const char* event, unsigned step) const noexcept;
+    bool IsEDM128CurrentSameThread(unsigned completed) const noexcept;
+    bool AuthorizeEDM128SameThread(const NCBlock& block, int gcode, const std::array<double, 2U>& center) noexcept;
+    bool RetainEDM128CompletedSameThread(const EDM94::Feedback& guard) noexcept;
+    void LogEDM128SameThread(const char* event, unsigned step) const noexcept;
     struct EDM115NCState
     {
         EDM115::CompletionToken token{};
@@ -2725,6 +2763,22 @@ private:
         bool failureLogged = false;
     } m_edm115{};
     static_assert(sizeof(EDM115NCState) <= 8192U, "EDM115 two completed event receipts remain fixed and off-stack.");
+    struct EDM127NCState
+    {
+        std::array<EDM116::Mode, 16U> expectedMode{};
+        std::array<int, 16U> expectedOriginPC{};
+        std::array<std::uint64_t, 16U> expectedOriginRevision{};
+        std::array<bool, 16U> authoredInline{};
+        EDM127::Selection current{}, pending{};
+        int lastPC = -1;
+        std::uint64_t lastDispatch = 0ULL;
+        unsigned explicitRows = 0U, inheritedRows = 0U, standaloneSelections = 0U;
+    } m_edm127{};
+    static_assert(sizeof(EDM127NCState) <= 384U, "EDM127 bounded NC modal plan and committed selection.");
+    bool IsEDM127SelectionBoundarySameThread(int pc) noexcept;
+    bool PrepareEDM127RowSameThread(const NCBlock& block) noexcept;
+    bool ProcessEDM127BlockSameThread(const NCBlock& input, NCBlock& geometry, bool& settingOnly) noexcept;
+    void LogEDM127SameThread(const char* event, unsigned step) const noexcept;
     struct EDM116NCState
     {
         std::array<EDM116::Policy, 16U> policies{}, completedPolicies{};

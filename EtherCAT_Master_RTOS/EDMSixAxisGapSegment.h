@@ -1105,5 +1105,5 @@ private:
         return false;
     }
 };
-static_assert(sizeof(Segment) <= 1480U, "EDM116 frozen per-row mode; feedback ABI unchanged");
+static_assert(sizeof(Segment) <= 1504U, "EDM127 modal origin and frozen per-row mode; feedback ABI unchanged");
 }

@@ -763,6 +763,7 @@ void NCManager::ChangeMode(NCOperationMode newMode)
 }
 
 void NCManager::ChangeState(NCState newState) {
+    if (newState != NCState::RUN) ForceEDMPLCOutputsOffSameThread("STATE_CHANGE");
     // A clock fault must keep ALARM instead of being overwritten by HOLD.
     if (newState == NCState::HOLD && !GCodeHandlers::Pause_G04(this)) return;
     if (newState != NCState::RUN && newState != NCState::HOLD)
@@ -1145,6 +1146,7 @@ void NCManager::FeedHold()
 
 void NCManager::FeedHoldInternal()
 {
+    ForceEDMPLCOutputsOffSameThread("HOLD");
     // =========================================================
     // G81 HOME Feed Hold
     //
@@ -1234,6 +1236,7 @@ void NCManager::FeedHoldInternal()
 
 void NCManager::Reset()
 {
+    ForceEDMPLCOutputsOffSameThread("RESET");
     ResetEDM94SameThread();
     // EDM28 only: retain AUTO authority for bounded physical stop/Disarm
     // before entering the existing Reset safety batch. Never wait here.
@@ -2646,6 +2649,7 @@ void NCManager::BeginLifecycleInterruptionShadow(
     bool expectsEpochChange,
     bool preserveCompletedEDM94) noexcept
 {
+    ForceEDMPLCOutputsOffSameThread("LIFECYCLE");
     // BASE79H: AL2014 may reach NC before or after the RT emergency action.
     // Capture the exact NC-owned execution identity before invalidating its
     // receipt below. This seeds only the observer's expected old Epoch; the
@@ -3617,6 +3621,12 @@ void NCManager::ObserveBootstrapSafetyHandoff() noexcept
 // 🌟 放在 RTOS 迴圈的核心任務
 void NCManager::ProcessTask()
 {
+    // Refresh before service and after every early return (Reset, Alarm, wait).
+    struct EDM137PLCExitSync {
+        NCManager& nc;
+        ~EDM137PLCExitSync() noexcept { nc.SyncEDMPLCOutputsSameThread(); }
+    } edm137PLCExitSync{*this};
+    SyncEDMPLCOutputsSameThread();
     ServiceEDM94SameThread(); // Independent physical bracket service before early returns.
     // EDM28 priority stop continues in RT while this nonblocking poll owns
     // RESET_STATE. A 1 s / 100 poll limit falls through to legacy safety.
@@ -6601,6 +6611,12 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
     }
     block.gCodes[0] = gCode;
 
+    NCGCodeDescriptor edm137Descriptor{};
+    if (gCode != 1 && gCode != 2 && gCode != 3 && gCode != 180 && gCode != 38 && gCode != 39 &&
+        NCGCodeSemantics::TryGetDescriptor(gCode, edm137Descriptor) &&
+        edm137Descriptor.role == NCGCodeRole::PRIMARY_ACTION)
+        ForceEDMPLCOutputsOffSameThread("NON_EDM_ACTION_DISPATCH");
+
     switch (gCode)
     {
     case 0:
@@ -6721,13 +6737,18 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
 }
 
 void NCManager::ExecuteBlock(
-    const NCBlock& block,
+    const NCBlock& inputBlock,
     int sourcePC,
     int sourceLineNumber,
     NCBlockDispatchId dispatchId)
 {
     m_waitCallback = nullptr;
-    if (!GuardEDM94BlockSameThread(block, sourcePC, sourceLineNumber)) return;
+    if (!GuardEDM94BlockSameThread(inputBlock, sourcePC, sourceLineNumber)) return;
+    NCBlock edm127Geometry{}; bool edm127SettingOnly = false;
+    if (!ProcessEDM127BlockSameThread(inputBlock, edm127Geometry, edm127SettingOnly))
+    { RejectEDM94SameThread("EDM127_BLOCK_BINDING", sourceLineNumber); return; }
+    if (edm127SettingOnly) return;
+    const NCBlock& block = EDM116::IsModalFixture(m_edm94.gapModeFixture) && m_edm94.latched ? edm127Geometry : inputBlock;
     // EDM17 validates the complete literal command before any setting/T/M/frame.
     if (IsEDMRecipeEditRequest(block) &&
         !PrepareEDMRecipeEditSameThread(block, sourcePC, sourceLineNumber, dispatchId)) return;
@@ -8456,6 +8477,7 @@ void NCManager::FinalizeProgramEnd()
         return;
     }
 
+    ForceEDMPLCOutputsOffSameThread("PROGRAM_END_FINALIZED");
     RetainEDMRecipeSelectionSameThread(); // Finalized M02/M30/EOF: retain operator values, not the run receipt.
     // BP-BEGIN
     PublishPathCoreCompletedSnapshotSameThread();

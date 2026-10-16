@@ -45,6 +45,16 @@ inline bool Valid(const SourceConfig& c) noexcept
         c.identity.calibrationRevision && c.samplePeriodUs>=250U && c.samplePeriodUs<=5000U &&
         c.maxAgeUs>=c.samplePeriodUs && c.maxAgeUs<=5000U;
 }
+// Explicit physical admission only. Legacy Begin/Valid keep their SIM-only
+// contract; a real PDO receipt is never relabelled or assigned a synthetic ID.
+inline bool ValidPhysical(const SourceConfig& c) noexcept
+{
+    return c.enabled && c.identity.kind==SourceKind::Physical && c.identity.producerGeneration &&
+        c.identity.deviceId && c.identity.deviceId<=65535U && c.identity.channelId &&
+        c.identity.channelId<=64U && c.identity.configRevision && c.identity.calibrationRevision &&
+        c.samplePeriodUs>=250U && c.samplePeriodUs<=5000U &&
+        c.maxAgeUs>=c.samplePeriodUs && c.maxAgeUs<=5000U;
+}
 inline SourceConfig SimulatedSource(std::uint64_t generation) noexcept
 {
     SourceConfig c{}; c.enabled=true; c.identity.kind=SourceKind::Simulation;
@@ -101,7 +111,7 @@ class Qualifier
 public:
     bool Begin(const SourceConfig& config) noexcept
     {
-        evidence_=Evidence{}; active_=false; lastObserverUs_=0U;
+        evidence_=Evidence{}; active_=false; physical_=false; lastObserverUs_=0U;
         config_=SourceConfig{};
         if(IsDisabled(config)) return true;
         const auto generation=config.identity.producerGeneration;
@@ -111,6 +121,16 @@ public:
         if(!config.enabled || !Valid(config)) return Fail(Reason::Configuration);
         config_=config; evidence_.reason=Reason::None; active_=true; return true;
     }
+    bool BeginPhysical(const SourceConfig& config,std::uint64_t session) noexcept
+    {
+        const bool wasActive=active_;
+        evidence_=Evidence{}; active_=false; physical_=false; lastObserverUs_=0U; config_=SourceConfig{};
+        if(!session || session<=generationHighWater_) return Fail(Reason::Lifecycle);
+        generationHighWater_=session;
+        if(wasActive || !ValidPhysical(config)) return Fail(Reason::Configuration);
+        config_=config; evidence_.reason=Reason::None; active_=physical_=true; return true;
+    }
+    void Cancel() noexcept { active_=false; }
     bool Observe(const Frame& frame,std::uint64_t sourceNowUs) noexcept
     {
         if(evidence_.faulted) return false;
@@ -135,9 +155,9 @@ public:
             ++evidence_.heldFrames; return true;
         }
         const auto previous=evidence_.lastFrame.sequence;
-        if((!evidence_.freshFrames && frame.sequence!=1U) ||
+        if((!physical_ && !evidence_.freshFrames && frame.sequence!=1U) ||
             (evidence_.freshFrames && (previous==(std::numeric_limits<std::uint64_t>::max)() ||
-                frame.sequence!=previous+1U))) return Fail(Reason::Sequence);
+                (physical_ ? frame.sequence<=previous : frame.sequence!=previous+1U)))) return Fail(Reason::Sequence);
         if(evidence_.freshFrames && frame.capturedAtUs<=evidence_.lastFrame.capturedAtUs)
             return Fail(Reason::SourceClock);
         if(!AcceptAge(frame.capturedAtUs,sourceNowUs)) return false;
@@ -169,7 +189,7 @@ private:
     SourceConfig config_{};
     Evidence evidence_{};
     std::uint64_t lastObserverUs_=0U,generationHighWater_=0U;
-    bool active_=false;
+    bool active_=false,physical_=false;
 };
 static_assert(std::is_trivially_copyable<SourceConfig>::value,"EDM88 source is a frozen value");
 static_assert(std::is_trivially_copyable<Frame>::value,"EDM88 frame is an immutable copied value");

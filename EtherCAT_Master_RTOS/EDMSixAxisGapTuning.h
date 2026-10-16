@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EDMGapServo.h"
+#include "EDM130WorkTimer.h"
 #include <cstring>
 #include <type_traits>
 
@@ -63,7 +64,7 @@ inline std::uint64_t ConfigHash(const Tuning& tuning) noexcept
     return hash;
 }
 
-inline EDMGapServo::Profile MakeProfile(const Tuning& tuning) noexcept
+inline EDMGapServo::Profile MakeProfile(const Tuning& tuning, double referenceV = ReferenceVoltageV) noexcept
 {
     EDMGapServo::Profile profile{};
     for (unsigned i = 0U; i < 3U; ++i) {
@@ -74,10 +75,18 @@ inline EDMGapServo::Profile MakeProfile(const Tuning& tuning) noexcept
     profile.maxFeedMmPerMin = MaximumFeedMmMin;
     profile.maxRetreatMmPerMin = MaximumRetreatMmMin;
     profile.deadbandV = tuning.deadbandV;
-    profile.shortMachiningV = ReferenceVoltageV;
+    profile.shortMachiningV = referenceV;
     profile.shortHysteresisV = 5.0;
     profile.shortEnterMs = profile.shortExitMs = 20U;
     profile.shortRetreatMmPerMin = 0.0;
+    return profile;
+}
+// The installed process contributes curve shape only. The bounded six-axis
+// scale, speed caps and E9 decision policy are retained from the legacy path.
+inline EDMGapServo::Profile MakeProfile(const Tuning& tuning,const EDM130::Recipe& recipe) noexcept
+{
+    auto profile=MakeProfile(tuning,EDM130::FrozenGapReferenceVoltageV(recipe));
+    if(EDM130::HasBoundCurve(recipe))EDM130::ApplyCurveShape(profile,recipe.curve);
     return profile;
 }
 }

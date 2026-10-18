@@ -2917,9 +2917,13 @@ namespace HMI_Bridge
 
 
         // --- HMI 控制指令交握 ---
-        if (pShm->varCmd.writeReq)
+        const bool variableWriteRequested = pShm->varCmd.writeReq;
+        const char variableWritePrefix = pShm->varCmd.prefix;
+        const int variableWriteIndex = pShm->varCmd.index;
+        const double variableWriteValue = pShm->varCmd.writeValue;
+        if (variableWriteRequested)
         {
-            nc->MacroSys.SetVar(pShm->varCmd.prefix, pShm->varCmd.index, pShm->varCmd.writeValue);
+            nc->MacroSys.SetVar(variableWritePrefix, variableWriteIndex, variableWriteValue);
             pShm->varCmd.writeReq = false;
         }
         // CJ LOAD FIX1: consume the request group before dispatching START.
@@ -3009,6 +3013,13 @@ namespace HMI_Bridge
                 pShm->NC_Command.feedHold ? 1U : 0U, pShm->NC_Command.reqChangeMode ? 1U : 0U,
                 pShm->NC_Command.loadProgramReq ? 1U : 0U);
         }
+        // EDM169: consume only this fresh HMI write event. Lifecycle priority
+        // discards its voltage meaning; the generic macro write above remains.
+        if (variableWriteRequested && variableWritePrefix == '@' && variableWriteIndex == 990 &&
+            !closeRequested && !resetRequested && !holdRequested && !modeRequested && !loadRequested &&
+            !pShm->NC_Command.Close_System && !pShm->NC_Command.reset && !pShm->NC_Command.feedHold &&
+            !pShm->NC_Command.reqChangeMode && !pShm->NC_Command.loadProgramReq)
+            (void)nc->SetEDM169ManualVoltageSameThread(variableWriteValue);
         // CJ LOAD FIX1: end of ordered control request dispatch.
 
 
@@ -3658,6 +3669,9 @@ namespace HMI_Bridge
     void ProcessTask_1000ms(NCManager* nc)
     {
         if (nc == nullptr) return;
+        // FIX8: defer only passive P50 diagnostics during healthy G76 GAP.
+        // Existing diagnostic paths resume when this scope ends.
+        if (nc->IsEDM173DiagnosticQuietSameThread()) return;
         MotionCore& motion = nc->GetMotion();
         // CO_FIX1: defer bulk output while GAP needs fresh supervisory service.
         // Early return preserves all ordinary diagnostic event tokens.

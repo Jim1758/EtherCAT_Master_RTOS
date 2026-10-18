@@ -6,6 +6,8 @@
 #include "EtherCatPdoSafetyStopDebounce.h"
 #include "EtherCatRxForensics.h"
 #include "EtherCatP64DeferredDiagnostics.h"
+#include "EDM144RuntimeTiming.h"
+#include "EDMExecutionFeedbackChannel.h"
 #include "AlarmManager.h"
 #include <windows.h> 
 #include <rtapi.h> 
@@ -25,6 +27,29 @@
 #else
 #define OSCARMAX_P64_DIAG_NOINLINE
 #endif
+
+namespace
+{
+    // EDM144: one PDO writer; the P50 reader only sees atomic snapshots.
+    // These diagnostic values never grant motion authority or set control timing.
+    EDM144::Collector g_edm144TimingCollector{};
+    EDM144::Sample g_edm144TimingSample{};
+    EDM144::Snapshot g_edm144TimingCompleted{};
+    EDM53::Channel<EDM144::Snapshot> g_edm144TimingChannel{};
+
+    OSCARMAX_P64_DIAG_NOINLINE void CompleteEDM144TimingSample() noexcept
+    {
+        if (g_edm144TimingCollector.Record(g_edm144TimingSample, g_edm144TimingCompleted))
+            (void)g_edm144TimingChannel.Publish(g_edm144TimingCompleted);
+    }
+}
+
+bool EDM144::ReadRuntimeTiming(Snapshot& snapshot, std::uint64_t& publication) noexcept
+{
+    const EDM53::Stamp stamp=g_edm144TimingChannel.Read(snapshot);
+    publication=stamp.publication;
+    return stamp.Ready();
+}
 
 // ============================================================================
 // EtherCatMaster_DC_Runtime.cpp
@@ -5594,6 +5619,18 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
     uint64_t pdoCycleStartMasterNs =
         pMaster->GetCurrentMasterTimeNs();
+
+    // EDM144: stride 65 rotates through the four PDO service slots. Only
+    // sampled callbacks read extra clocks; no logging/allocation in P64.
+    const bool edm144Sampling=g_edm144TimingCollector.Due();
+    if (edm144Sampling)
+    {
+        g_edm144TimingSample=EDM144::Sample{};
+        g_edm144TimingSample.at[0]=pdoCycleStartMasterNs;
+        g_edm144TimingSample.cycle=pMaster->tickCount_PDO+1ULL;
+        g_edm144TimingSample.ownerBegin=static_cast<std::uint32_t>(
+            pMaster->m_Motion.GetMotionOwnerLease().owner);
+    }
 
     // =============================================================
 // Fine Scheduler V1
@@ -12555,6 +12592,11 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 // 下一階段會再量 Frame Build -> SendPacket。
 // =============================================================
 
+    // Keep the new clock reads outside the existing DC/QPC estimator
+    // envelope. Wire includes the original transaction timestamp overhead.
+    if (edm144Sampling)
+        g_edm144TimingSample.at[1]=pMaster->GetCurrentMasterTimeNs();
+
     LARGE_INTEGER qpcBeforeEcat = {};
 
     bool qpcBeforeEcatValid =
@@ -12652,6 +12694,11 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
             }
         }
     }
+
+    // Sample only after the original qpcDcAfter capture. The legacy
+    // combinedCommEndNs below retains its existing post-RX boundary.
+    if (edm144Sampling)
+        g_edm144TimingSample.at[2]=pMaster->GetCurrentMasterTimeNs();
 
     // ---------------------------------------------------------
     // DC-RX.3F logical transport/sample overrides
@@ -19040,6 +19087,9 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             // first-cycle path intentionally skips Motion, so
                             // ObserveNCSettleRuntimeCycle() also revokes stale
                             // drain proof immediately for that case.
+                            if (edm144Sampling)
+                                g_edm144TimingSample.at[3]=pMaster->GetCurrentMasterTimeNs();
+
                             pMaster->
                                 m_Motion.
                                 ObserveNCSettleRuntimeCycle(
@@ -19060,6 +19110,13 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                 pMaster->
                                 GetCurrentMasterTimeNs();
 
+                            if (edm144Sampling)
+                            {
+                                g_edm144TimingSample.at[4]=stageMotionStartNs;
+                                // No interpolation runs on an invalid PDO cycle.
+                                g_edm144TimingSample.at[5]=stageMotionStartNs;
+                            }
+
                             bool pdoSafetyStopAppliedThisCycle =
                                 false;
 
@@ -19070,6 +19127,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                     m_Motion.
                                     UpdateInterpolation();
 
+                                if (edm144Sampling)
+                                    g_edm144TimingSample.at[5]=pMaster->GetCurrentMasterTimeNs();
 
                                 pMaster->
                                     m_Motion.
@@ -20214,9 +20273,20 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                             // The diagnostic publisher above is now measured.
                             // =========================================================
 
+                            if (edm144Sampling)
+                            {
+                                g_edm144TimingSample.at[6]=stageMotionEndNs;
+                                g_edm144TimingSample.processValid=processDataValid;
+                                g_edm144TimingSample.ownerEnd=static_cast<std::uint32_t>(
+                                    pMaster->m_Motion.GetMotionOwnerLease().owner);
+                            }
+
                             uint64_t pdoHandlerEndNs =
                                 pMaster->
                                 GetCurrentMasterTimeNs();
+
+                            if (edm144Sampling)
+                                g_edm144TimingSample.at[7]=pdoHandlerEndNs;
 
 
                             if (pdoHandlerEndNs >=
@@ -20357,4 +20427,8 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
                                         0;
                                 }
                             }
+    // Fixed numeric accounting/publication only, after all original motion
+    // and safety work. This small collector tail is outside its own timestamps
+    // and the legacy callback measurement; full-cycle counters stay unchanged.
+    if (edm144Sampling) CompleteEDM144TimingSample();
 }

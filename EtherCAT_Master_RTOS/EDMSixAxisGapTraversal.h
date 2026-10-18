@@ -175,6 +175,7 @@ public:
     bool BindCurrent(const EDM112::Curve& curve, const Source& source, const Limits& limits,
         std::uint64_t tick, std::uint64_t nowUs) noexcept
     {
+        if (compound_) return Fail(Reason::Source);
         if (!begun_ || currentValid_ || pending_ || stop_ || feedback_.faulted || !tick || !nowUs) return Fail(Reason::State);
         if (!ValidSource(source) || !EDM109::SameScope(scope_, source.scope)) return Fail(Reason::Source);
         Row row{};
@@ -202,6 +203,62 @@ public:
         committed_ = feedback_; committedCursor_ = cursor_; committedValid_ = true;
         frontierMm_ = (std::max)(frontierMm_, row.beginMm);
         committedFrontierMm_ = frontierMm_; firstSample_ = true; return true;
+    }
+    // EDM173 only. A compound plan retains one real NC parent and epoch;
+    // the Motion owner additionally proves every Source against its sealed
+    // genuine child identity. The fingerprint never grants Motion authority.
+    bool BeginCompound(const EDM109::Scope& scope, const Settings& settings,
+        std::uint64_t fingerprint, std::uint64_t parentDispatch, std::uint64_t epoch,
+        int sourcePC, unsigned count) noexcept
+    {
+        if (!fingerprint || !parentDispatch || !epoch || sourcePC < 0 || count != 25U)
+            return Fail(Reason::Source);
+        if (!Begin(scope,settings)) return false;
+        compound_ = true; compoundFingerprint_ = fingerprint; compoundDispatch_ = parentDispatch;
+        compoundEpoch_ = epoch; compoundPC_ = sourcePC; compoundCount_ = count;
+        return true;
+    }
+    bool BindCompoundCurrent(const EDM112::Curve& curve, const Source& source, const Limits& limits,
+        std::uint64_t tick, std::uint64_t nowUs, std::uint64_t fingerprint,
+        unsigned childOrdinal, unsigned count) noexcept
+    {
+        if (!compound_ || !begun_ || currentValid_ || pending_ || stop_ || feedback_.faulted || !tick || !nowUs)
+            return Fail(Reason::State);
+        if (!fingerprint || fingerprint != compoundFingerprint_ || count != compoundCount_ ||
+            count != 25U || childOrdinal >= count || childOrdinal != compoundBound_ ||
+            compoundAppended_ != childOrdinal || !ValidSource(source) ||
+            !EDM109::SameScope(scope_,source.scope) || source.dispatch != compoundDispatch_ ||
+            source.epoch != compoundEpoch_ || source.sourcePC != compoundPC_ || source.ordinal != childOrdinal ||
+            source.segment <= compoundLastSegment_) return Fail(Reason::Source);
+        Row row{};
+        if (!row.mapping.Bind(curve,limits)) return Fail(Reason::Geometry);
+        row.source = source;
+        if (childOrdinal != 0U)
+        {
+            if (!count_ || !committedValid_ || committed_.velocityMmSec != 0.0 ||
+                committed_.velocityPps != Point{} || committed_.positionPulse != curve.line.startPulse ||
+                tick < committed_.tick || nowUs < committed_.nowUs) return Fail(Reason::Seam);
+            const Row& previous = History(count_-1U);
+            if (previous.source.ordinal+1ULL != source.ordinal || previous.source.dispatch != source.dispatch ||
+                previous.source.epoch != source.epoch || previous.source.sourcePC != source.sourcePC ||
+                !EDM109::SamePulse(previous.mapping.Geometry().line.endPulse,curve.line.startPulse) ||
+                !EDM109::SamePulse(previous.mapping.Geometry().line.pulsePerNative,curve.line.pulsePerNative))
+                return Fail(Reason::Seam);
+            row.beginMm = previous.beginMm + previous.mapping.Geometry().lengthMm;
+        }
+        if (!std::isfinite(row.beginMm+curve.lengthMm) || row.beginMm+curve.lengthMm <= row.beginMm)
+            return Fail(Reason::Bounds);
+        current_ = row; currentValid_ = true; cursor_ = count_;
+        feedback_.authorizedSource = source; feedback_.localMm = 0.0;
+        feedback_.velocityMmSec = feedback_.accelerationMmSec2 = 0.0;
+        feedback_.tick = tick; feedback_.nowUs = nowUs;
+        feedback_.active = true; feedback_.awaitingCurrent = false; feedback_.seamStableCycles = 0U;
+        lastTarget_ = 0.0;
+        if (!Refresh()) return false;
+        committed_ = feedback_; committedCursor_ = cursor_; committedValid_ = true;
+        frontierMm_ = (std::max)(frontierMm_,row.beginMm); committedFrontierMm_ = frontierMm_;
+        firstSample_ = true; compoundLastSegment_ = source.segment; ++compoundBound_;
+        return true;
     }
     bool Step(std::uint64_t tick, std::uint64_t nowUs, double signedTargetMmSec, bool physicalSettled, const Cursor* target = nullptr) noexcept
     {
@@ -252,6 +309,7 @@ public:
     }
     bool AppendCompleted(std::uint64_t boundaryTick, std::uint64_t commitId) noexcept
     {
+        if (compound_) return Fail(Reason::Source);
         if (!currentValid_ || suspended_ || pending_ || stop_ || feedback_.faulted || cursor_ != count_ ||
             !committedValid_ || !committed_.completeReady || committed_.velocityMmSec != 0.0 ||
             committed_.localMm != current_.mapping.Geometry().lengthMm ||
@@ -264,6 +322,32 @@ public:
         feedback_.completeReady = feedback_.active = false; feedback_.awaitingCurrent = true;
         committed_ = feedback_; committedCursor_ = cursor_; return true;
     }
+    bool AppendCompoundCompleted(std::uint64_t boundaryTick, std::uint64_t fingerprint,
+        unsigned completedChildOrdinal) noexcept
+    {
+        if (!compound_ || !fingerprint || fingerprint != compoundFingerprint_ ||
+            completedChildOrdinal >= compoundCount_ || completedChildOrdinal != compoundAppended_ ||
+            completedChildOrdinal+1U != compoundBound_ || !currentValid_ || suspended_ || pending_ || stop_ ||
+            feedback_.faulted || cursor_ != count_ || !committedValid_ || !committed_.completeReady ||
+            committed_.velocityMmSec != 0.0 || committed_.velocityPps != Point{} ||
+            committed_.localMm != current_.mapping.Geometry().lengthMm ||
+            committed_.positionPulse != current_.mapping.Geometry().line.endPulse ||
+            current_.source.ordinal != completedChildOrdinal || current_.source.dispatch != compoundDispatch_ ||
+            current_.source.epoch != compoundEpoch_ || current_.source.sourcePC != compoundPC_ ||
+            boundaryTick < committed_.tick) return Fail(Reason::State);
+        if (feedback_.completedRows == (std::numeric_limits<std::uint64_t>::max)()) return Fail(Reason::Overflow);
+        if (count_ == Capacity) { head_ = (head_+1U)%Capacity; --count_; }
+        history_[(head_+count_)%Capacity] = current_; ++count_;
+        cursor_ = count_-1U; currentValid_ = false; ++compoundAppended_;
+        ++feedback_.completedRows; feedback_.historyCount = count_;
+        feedback_.completeReady = feedback_.active = false; feedback_.awaitingCurrent = true;
+        committed_ = feedback_; committedCursor_ = cursor_;
+        return true;
+    }
+    bool IsCompound() const noexcept { return compound_; }
+    std::uint64_t CompoundFingerprint() const noexcept { return compoundFingerprint_; }
+    unsigned CompoundBoundRows() const noexcept { return compoundBound_; }
+    unsigned CompoundCompletedRows() const noexcept { return compoundAppended_; }
     bool BeginStop(std::uint64_t tick, std::uint64_t nowUs) noexcept
     {
         // An authenticated SAFETY request may follow fenced, unmapped cycles
@@ -380,6 +464,8 @@ public:
         head_ = count_ = cursor_ = committedCursor_ = 0U;
         lastBoundaryCommit_ = 0ULL; frontierMm_ = committedFrontierMm_ = lastTarget_ = 0.0;
         begun_ = currentValid_ = committedValid_ = pending_ = stop_ = firstSample_ = sameTick_ = suspended_ = false;
+        compound_ = false; compoundFingerprint_ = compoundDispatch_ = compoundEpoch_ = compoundLastSegment_ = 0ULL;
+        compoundPC_ = -1; compoundCount_ = compoundBound_ = compoundAppended_ = 0U;
     }
 private:
     struct Row { CachedMapping mapping{}; Source source{}; double beginMm = 0.0; };
@@ -390,6 +476,10 @@ private:
     double frontierMm_ = 0.0, committedFrontierMm_ = 0.0, lastTarget_ = 0.0;
     bool begun_ = false, currentValid_ = false, committedValid_ = false, pending_ = false;
     bool stop_ = false, firstSample_ = false, sameTick_ = false, suspended_ = false;
+    bool compound_ = false;
+    std::uint64_t compoundFingerprint_ = 0ULL, compoundDispatch_ = 0ULL, compoundEpoch_ = 0ULL, compoundLastSegment_ = 0ULL;
+    int compoundPC_ = -1;
+    unsigned compoundCount_ = 0U, compoundBound_ = 0U, compoundAppended_ = 0U;
     const Row& History(unsigned index) const noexcept { return history_[(head_ + index) % Capacity]; }
     const Row& CursorRow() const noexcept { return cursor_ == count_ ? current_ : History(cursor_); }
     bool Locate(const Cursor& target, unsigned& index) const noexcept

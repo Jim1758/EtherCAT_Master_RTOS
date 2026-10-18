@@ -410,3 +410,231 @@ bool MotionCore::TryReferencePositionPairTransactionalTail(
         static_cast<unsigned long long>(second.execution.segmentId));
     return true;
 }
+
+bool MotionCore::TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
+    double* commandedMCSTail, MotionG76OrbitReceipt& result)
+{
+    result.Clear();
+    auto& receipt=result.tail;
+    const auto plannedEpoch=GetCurrentExecutionEpoch();
+    const auto plannedOwner=GetMotionOwnerLease();
+    const auto source=m_pendingCommandSource.load(std::memory_order_acquire);
+    const double rapidOverride=G00_overrideRatio;
+    receipt.transactionSequence=AllocateQueueTailTransactionSequence();
+    receipt.attempted=true;
+    receipt.beforeFingerprint=ReferencePairTailFingerprint(m_g00ProducerQueueTailPulse,commandedMCSTail,rapidOverride);
+    receipt.committedFingerprint=receipt.beforeFingerprint;
+    const auto reject=[&](bool invalid,bool formal,MotionRejectReason reason,
+        MotionG76AdmissionGate gate,int axis=-1,int segment=-1)->bool {
+        result.rejectionGate=gate; result.rejectionAxis=axis; result.rejectionSegment=segment;
+        result.rejectionReason=reason;
+        if (formal) {
+            MotionCommand command{}; command.mode=InterpolationMode::LINEAR;
+            command.sourceLinePC=m_pendingSourcePC; command.commandPathMode=MotionCommandPathMode::EXACT_STOP;
+            if (invalid) RejectInvalidProducerMotionCommand(command,GetCurrentExecutionEpoch(),source,
+                GetMotionOwnerLease(),&receipt.identity,&receipt.ownerLease);
+            else RejectNonGeometryProducerMotionCommand(command,GetCurrentExecutionEpoch(),source,
+                GetMotionOwnerLease(),reason,&receipt.identity,&receipt.ownerLease);
+        }
+        receipt.committedFingerprint=ReferencePairTailFingerprint(m_g00ProducerQueueTailPulse,commandedMCSTail,G00_overrideRatio);
+        receipt.preservedOnReject=receipt.committedFingerprint==receipt.beforeFingerprint;
+        receipt.accountingValid=receipt.preservedOnReject;
+        PublishQueueTailTransactionReceipt(receipt,invalid);
+        return false;
+    };
+    if (!NCG76::ValidNative(plan) || !m_g76OrbitProducer || m_pContexts==nullptr || m_pCoordMgr==nullptr ||
+        commandedMCSTail==nullptr || m_pContexts->size()<3U || m_pContexts->size()>MAX_AXES ||
+        !std::isfinite(rapidOverride) || rapidOverride<0.0)
+        return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::PLAN_INPUT);
+    if (!plannedOwner.IsValid() || plannedOwner.owner!=MotionOwner::AUTO || source!=MotionCommandSource::NC_MEMORY ||
+        !plannedEpoch || m_pendingSourcePC<0 || !IsMotionOwnerLeaseCurrent(plannedOwner))
+        return reject(false,true,MotionRejectReason::OWNER_CONFLICT,MotionG76AdmissionGate::OWNER_SCOPE);
+    const auto hold=GetFeedHoldStopSnapshot();
+    if (!IsPendingFixedTranslationSourceAllowed() || !IsNCTranslationSnapshotValid(m_pendingTranslation) ||
+        plan.translationGeneration!=m_pendingTranslation.generation ||
+        !SameNCTranslationSnapshot(plan.translation,m_pendingTranslation) || !MatchesNCTranslation(m_pendingTranslation) ||
+        m_pendingPlaneMode!=17 || m_pendingTranslation.rotationPlane!=17 || m_pendingToolRadMode!=40 ||
+        m_pendingG16Active || m_pendingTranslation.polarMode!=15 ||
+        (m_pendingG162Active && m_pendingToolMode!=49))
+        return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::SOURCE_FRAME);
+    if (HasPendingSafetyOrRecoveryRequests() || m_edm94.Active() || m_edm94Claim.load(std::memory_order_acquire)!=0ULL ||
+        !IsGroupDone() || GetQueueSize()!=0U || GetCommandIngressSize()!=0U || GetCommandReplaySize()!=0U ||
+        !HasExactExecutionDrainAcknowledgement(plannedEpoch,plannedOwner) ||
+        !hold.groupDone || hold.groupActive || !hold.commandStopped || hold.groupFaulted || hold.groupEmergencyStopped ||
+        hold.safetyOrRecoveryPending || hold.faultedAxes || hold.overrideZero ||
+        !std::isfinite(hold.feedrateOverride) || hold.feedrateOverride!=1.0)
+        return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::RUNTIME_READY);
+    if (!m_programBlockMotionCaptureActive || m_programBlockMotionCapture.overflow || m_programBlockMotionCapture.count!=0U)
+        return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::CAPTURE_SCOPE);
+    auto& workspace=*m_g76OrbitProducer;
+    workspace.startPulse.fill(0.0); workspace.stagedPulse.fill(0.0);
+    result.startMCS=plan.startMCS; result.translationGeneration=plan.translationGeneration;
+    result.count=plan.count; result.axisMask=7U;
+    double groupAcc=0.0,groupDec=0.0;
+    std::uint32_t enabledMask=0U;
+    for (unsigned index=0U; index<MAX_AXES; ++index) {
+        const auto slot=static_cast<std::size_t>(index);
+        if (std::memcmp(&plan.startMCS[slot],&commandedMCSTail[index],sizeof(double))!=0)
+            return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::START_MCS,static_cast<int>(index));
+        workspace.stagedMCS[slot]=commandedMCSTail[index];
+        if (slot>=m_pContexts->size() || !(*m_pContexts)[slot].isExist) continue;
+        const auto& axis=(*m_pContexts)[slot];
+        if (axis.axisIndex!=static_cast<int>(index) || (index<3U && axis.axisType!=AxisType::LINEAR) ||
+            !std::isfinite(axis.finalLead) || axis.finalLead<=0.0 ||
+            !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR<=0.0)
+            return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_MAPPING,static_cast<int>(index));
+        // Same native-feed HOME policy as existing G01: the normal CNC
+        // hardware/software limit and safety gates remain authoritative.
+        enabledMask|=1U<<index;
+        const double sampled=axis.logicalCmdPos.Load();
+        const double ppu=axis.resolution_PPR/axis.finalLead;
+        if (!std::isfinite(sampled) || !std::isfinite(ppu) || ppu<=0.0)
+            return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_SCALE,static_cast<int>(index));
+        const bool acceptedNative=m_g00ProducerQueueTailEpoch==plannedEpoch &&
+            m_g00ProducerQueueTailOwnerLease.Matches(plannedOwner) && (m_g00ProducerQueueTailValidMask&(1U<<index))!=0U &&
+            m_g00ProducerQueueTailPulse[slot]==sampled;
+        // Match the existing G01/START native basis contract in both exact
+        // conversion directions. A legitimate inverse conversion need not
+        // round-trip through multiplication to the identical pulse double.
+        double sampledNative=sampled*axis.finalLead/axis.resolution_PPR;
+        if (axis.axisType==AxisType::ROTARY && std::isfinite(axis.rotaryModulo) && axis.rotaryModulo>0.0) {
+            sampledNative=std::fmod(sampledNative,axis.rotaryModulo);
+            if (sampledNative<0.0) sampledNative+=axis.rotaryModulo;
+        }
+        if (plan.startMCS[slot]*ppu!=sampled && !acceptedNative &&
+            !(std::isfinite(sampledNative) && sampledNative==plan.startMCS[slot]))
+            return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::NATIVE_BASELINE,static_cast<int>(index));
+        if (m_pCoordMgr->GetInvalidSoftwareTravelLimitMask(axis)!=0U) {
+            AlarmManager::GetInstance().Trigger(AlarmManager::SOFTWARE_TRAVEL_LIMIT_INVALID_CONFIG,m_pendingSourcePC,static_cast<int>(index));
+            return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_CONFIG,static_cast<int>(index));
+        }
+        if (!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,plan.startMCS[slot])) {
+            AlarmManager::GetInstance().Trigger(m_pCoordMgr->GetSoftwareTravelLimitAlarmCode(axis,
+                AlarmManager::PROGRAMMED_OVER_TRAVEL),m_pendingSourcePC,static_cast<int>(index));
+            return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_START,static_cast<int>(index));
+        }
+        workspace.startPulse[slot]=workspace.stagedPulse[slot]=sampled;
+        result.pulsePerUnit[slot]=ppu;
+        if (index<3U) {
+            if (!std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS<=0.0 ||
+                !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time<0.0 ||
+                !std::isfinite(axis.G00_dec_time) || axis.G00_dec_time<0.0)
+                return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_DYNAMICS,static_cast<int>(index));
+            groupAcc=(std::max)(groupAcc,axis.G00_acc_time); groupDec=(std::max)(groupDec,axis.G00_dec_time);
+        }
+    }
+    if ((enabledMask&7U)!=7U) return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_MAPPING);
+    if (groupAcc<0.001) groupAcc=0.2;
+    if (groupDec<0.001) groupDec=0.2;
+    result.startPulse=workspace.startPulse; result.validAxisMask=enabledMask; receipt.axisMask=enabledMask;
+    for (unsigned segment=0U; segment<plan.count; ++segment) {
+        double lengthMM=0.0,lengthPulse=0.0,maxTime=0.0;
+        for (unsigned axisIndex=0U; axisIndex<MAX_AXES; ++axisIndex) {
+            const auto slot=static_cast<std::size_t>(axisIndex);
+            const auto& endpoint=plan.pointsMCS[segment];
+            if (slot>=m_pContexts->size() || !(*m_pContexts)[slot].isExist) continue;
+            const auto& axis=(*m_pContexts)[slot];
+            if (!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,endpoint[slot])) {
+                AlarmManager::GetInstance().Trigger(m_pCoordMgr->GetSoftwareTravelLimitAlarmCode(axis,
+                    AlarmManager::PROGRAMMED_OVER_TRAVEL),m_pendingSourcePC,static_cast<int>(axisIndex));
+                return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_ENDPOINT,static_cast<int>(axisIndex),static_cast<int>(segment));
+            }
+            if (axisIndex>=3U) continue;
+            const double previous=segment?plan.pointsMCS[segment-1U][slot]:plan.startMCS[slot];
+            const double target=endpoint[slot]==previous?workspace.stagedPulse[slot]:
+                endpoint[slot]==plan.startMCS[slot]?workspace.startPulse[slot]:endpoint[slot]*result.pulsePerUnit[slot];
+            if (!std::isfinite(target)) return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_CONVERSION,static_cast<int>(axisIndex),static_cast<int>(segment));
+            const double deltaPulse=target-workspace.stagedPulse[slot];
+            lengthMM=std::hypot(lengthMM,deltaPulse/result.pulsePerUnit[slot]);
+            lengthPulse=std::hypot(lengthPulse,deltaPulse);
+            maxTime=(std::max)(maxTime,std::fabs(deltaPulse)/axis.maxVel_PPS);
+            workspace.targetPulse[slot]=target;
+        }
+        const double seconds=lengthMM/(plan.feedMmMin[segment]/60.0);
+        const double duration=(std::max)(seconds,maxTime);
+        const double velocity=lengthPulse/duration;
+        if (!(lengthMM>0.0) || !std::isfinite(lengthMM) || !std::isfinite(lengthPulse) ||
+            !std::isfinite(duration) || duration<=0.0 || !std::isfinite(velocity) || velocity<1.0 ||
+            !std::isfinite(velocity/groupAcc) || !std::isfinite(velocity/groupDec))
+            return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_DYNAMICS,-1,static_cast<int>(segment));
+        if (!TryLineMove(workspace.axes,workspace.targetPulse,velocity,groupAcc,groupDec,
+            BufferMode::ABORTING,MotionCommandPathMode::EXACT_STOP,&receipt.identity,&receipt.ownerLease,
+            plannedEpoch,&plannedOwner,false,nullptr,0.0,false,&workspace.commands[segment]))
+            return reject(false,false,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::LINE_STAGE,-1,static_cast<int>(segment));
+        for (unsigned axis=0U; axis<3U; ++axis) workspace.stagedPulse[axis]=workspace.targetPulse[axis];
+        result.legEndPulse[segment]=workspace.stagedPulse;
+        result.legEndMCS[segment]=plan.pointsMCS[segment];
+    }
+    workspace.stagedMCS=plan.pointsMCS[plan.count-1U];
+    result.endMCS=workspace.stagedMCS; result.endPulse=workspace.stagedPulse;
+    const auto stagedFingerprint=ReferencePairTailFingerprint(workspace.stagedPulse,workspace.stagedMCS.data(),rapidOverride);
+    if (!m_Group.cmdQueue.ProducerHasCapacity(plan.count)) return reject(false,true,MotionRejectReason::QUEUE_FULL,MotionG76AdmissionGate::QUEUE_CAPACITY);
+    MotionExecutionEpoch publishedEpoch=MOTION_EXECUTION_EPOCH_INVALID;
+    if (!TryPublishOwnerAuthorizedAbortingExecutionEpoch(source,plannedEpoch,plannedOwner,publishedEpoch))
+        return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::EPOCH_COMMIT);
+    for (unsigned index=0U; index<plan.count; ++index) {
+        AssignExecutionIdentity(workspace.commands[index],publishedEpoch,source,plannedOwner);
+        result.identities[index]=workspace.commands[index].execution;
+    }
+    receipt.identity=result.identities[plan.count-1U]; receipt.ownerLease=result.ownerLease=plannedOwner;
+    if (!TryEnqueueMotionCommandBatch(workspace.commands.data(),plan.count))
+        return reject(false,false,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::QUEUE_PUBLISH);
+    result.commandAccepted=receipt.commandAccepted=true;
+    const auto tupleStable=[&]()->bool {
+        const auto ownerState1=m_motionOwnerState.load(std::memory_order_acquire);
+        const auto epoch1=GetCurrentExecutionEpoch();
+        const auto owner1=UnpackMotionOwnerState(ownerState1);
+        const auto epoch2=GetCurrentExecutionEpoch();
+        const auto ownerState2=m_motionOwnerState.load(std::memory_order_acquire);
+        const auto owner2=UnpackMotionOwnerState(ownerState2);
+        return epoch1==publishedEpoch && epoch2==publishedEpoch && ownerState1==ownerState2 &&
+            owner1.IsValid() && owner1.Matches(plannedOwner) && owner2.IsValid() && owner2.Matches(plannedOwner) &&
+            !UnpackMotionOwnerSafetyHandshake(ownerState2) && UnpackMotionOwnerSafetyRequestTicket(ownerState2)==
+                m_safetyRequestAcknowledgedTicket.load(std::memory_order_acquire);
+    };
+    const auto failAccepted=[&](bool committed,MotionG76AdmissionGate gate)->bool {
+        result.rejectionGate=gate; result.rejectionReason=MotionRejectReason::NOT_READY;
+        m_g00ProducerQueueTailEpoch=MOTION_EXECUTION_EPOCH_INVALID;
+        m_g00ProducerQueueTailOwnerLease=MotionOwnerLease{}; m_g00ProducerQueueTailValidMask=0U;
+        receipt.commandedMCSCommitted=receipt.lastQueuedPulseCommitted=committed;
+        receipt.rapidOverrideCommitted=committed; receipt.preservedOnReject=false;
+        receipt.endpointExact=receipt.accountingValid=false;
+        receipt.committedFingerprint=committed?stagedFingerprint:receipt.beforeFingerprint;
+        PublishQueueTailTransactionReceipt(receipt,false);
+        (void)TryPublishGroupMappingIntegrityAlarmRequest(GetCurrentExecutionEpoch()); RequestEmergencyStopAllAxes();
+        return false;
+    };
+    bool captureMatches=tupleStable() && m_programBlockMotionCaptureActive && !m_programBlockMotionCapture.overflow &&
+        m_programBlockMotionCapture.count==plan.count;
+    for (unsigned index=0U; captureMatches && index<plan.count; ++index) {
+        const auto& command=workspace.commands[index]; const auto& captured=m_programBlockMotionCapture.submissions[index];
+        captureMatches=command.execution.IsAssigned() && command.execution.epoch==publishedEpoch &&
+            command.execution.source==source && command.execution.sourceBlockId==static_cast<MotionSourceBlockId>(m_pendingSourcePC) &&
+            command.ownerLease.Matches(plannedOwner) && captured.producerAccepted &&
+            captured.immediateRejectReason==MotionRejectReason::NONE && captured.commandPathMode==MotionCommandPathMode::EXACT_STOP &&
+            captured.translationGeneration==plan.translationGeneration &&
+            captured.identity.epoch==command.execution.epoch && captured.identity.segmentId==command.execution.segmentId &&
+            captured.identity.sourceBlockId==command.execution.sourceBlockId && captured.identity.source==command.execution.source;
+        for (unsigned prior=0U; captureMatches && prior<index; ++prior)
+            captureMatches=result.identities[prior].segmentId!=command.execution.segmentId;
+    }
+    if (!captureMatches || !IsPendingFixedTranslationSourceAllowed() ||
+        !SameNCTranslationSnapshot(plan.translation,m_pendingTranslation) || !MatchesNCTranslation(m_pendingTranslation))
+        return failAccepted(false,MotionG76AdmissionGate::CAPTURE_BIND);
+    result.captureBound=true;
+    m_g00ProducerQueueTailPulse=workspace.stagedPulse;
+    for (unsigned index=0U; index<MAX_AXES; ++index) {
+        if ((enabledMask&(1U<<index))!=0U) (*m_pContexts)[index].lastQueuedPulse.Store(workspace.stagedPulse[index]);
+        commandedMCSTail[index]=workspace.stagedMCS[index];
+    }
+    m_g00ProducerQueueTailValidMask=enabledMask; G00_overrideRatio=rapidOverride;
+    if (!tupleStable()) return failAccepted(true,MotionG76AdmissionGate::POST_ACCEPT_TUPLE);
+    m_g00ProducerQueueTailEpoch=publishedEpoch; m_g00ProducerQueueTailOwnerLease=plannedOwner;
+    if (!tupleStable()) return failAccepted(true,MotionG76AdmissionGate::POST_ACCEPT_TUPLE);
+    receipt.commandedMCSCommitted=receipt.lastQueuedPulseCommitted=receipt.rapidOverrideCommitted=true;
+    receipt.endpointExact=receipt.accountingValid=true; receipt.preservedOnReject=false;
+    receipt.committedFingerprint=stagedFingerprint;
+    result.valid=result.tailCommitted=true;
+    PublishQueueTailTransactionReceipt(receipt,false);
+    return true;
+}

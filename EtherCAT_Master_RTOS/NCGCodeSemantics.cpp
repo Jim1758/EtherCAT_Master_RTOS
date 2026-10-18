@@ -82,6 +82,10 @@ namespace NCGCodeSemantics
             // ---------------------------------------------------------
             // Primary motion / machine actions
             // ---------------------------------------------------------
+        case 76: // P11 bounded growing-orbit cycle; no modal-motion inheritance.
+            descriptor = MakeDescriptor(code, NCGCodeModalGroup::NONE,
+                NCGCodeRole::PRIMARY_ACTION, 200, true, true, true);
+            return true;
         case 53: // Standalone, non-modal machine positioning.
             descriptor = MakeDescriptor(code, NCGCodeModalGroup::NONE,
                 NCGCodeRole::PRIMARY_ACTION, 200, true, true, true);

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 // ============================================================================
@@ -123,6 +124,23 @@ public:
         m_storage[static_cast<std::size_t>(
             (writeSequence + 1ULL) % static_cast<std::uint64_t>(Capacity))] = second;
         m_writeSequence.store(writeSequence + 2ULL, std::memory_order_release);
+        return true;
+    }
+
+    // Native compounds become visible at one release publication.
+    bool ProducerTryPushBatch(const T* values, std::size_t count) noexcept
+    {
+        if (values == nullptr || count == 0U || count > 128U || count > Capacity) return false;
+        const std::uint64_t writeSequence = m_writeSequence.load(std::memory_order_relaxed);
+        const std::uint64_t readSequence = m_readSequence.load(std::memory_order_acquire);
+        const std::uint64_t occupied = writeSequence - readSequence;
+        if (occupied > static_cast<std::uint64_t>(Capacity) ||
+            static_cast<std::uint64_t>(count) > static_cast<std::uint64_t>(Capacity) - occupied ||
+            writeSequence > (std::numeric_limits<std::uint64_t>::max)() - static_cast<std::uint64_t>(count)) return false;
+        for (std::size_t index = 0U; index < count; ++index)
+            m_storage[static_cast<std::size_t>((writeSequence + static_cast<std::uint64_t>(index)) %
+                static_cast<std::uint64_t>(Capacity))] = values[index];
+        m_writeSequence.store(writeSequence + static_cast<std::uint64_t>(count), std::memory_order_release);
         return true;
     }
 
@@ -389,6 +407,11 @@ public:
     bool ProducerTryPushPair(const T& first, const T& second) noexcept
     {
         return m_ingress.ProducerTryPushPair(first, second);
+    }
+
+    bool ProducerTryPushBatch(const T* values, std::size_t count) noexcept
+    {
+        return m_ingress.ProducerTryPushBatch(values, count);
     }
 
     // 250 us Motion consumer only.  Replay commands always have priority,

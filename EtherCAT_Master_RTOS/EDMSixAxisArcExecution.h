@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EDMSixAxisCommonPath.h"
+#include "EDMSixAxisCommonCurve.h"
 #include <algorithm>
 
 #if defined(__FAST_MATH__) || defined(_M_FP_FAST)
@@ -90,7 +91,8 @@ class Mapping
 public:
     bool BindArc(const Point& start, const Point& end, const Point& ppu,
         const std::array<double, 2U>& centerPulse, double radiusPulse,
-        double startAngle, double sweepRadians, double length, const Limits& limits) noexcept;
+        double startAngle, double sweepRadians, double length, const Limits& limits,
+        bool boundedAuthoredArc = false) noexcept;
     bool BindLine(const Point& start, const Point& end, const Point& ppu,
         double length, const Point& ratio, const Limits& limits) noexcept;
     bool Eval(double q, double v, double a, Point& position, Point& velocity, Point& acceleration) const noexcept;
@@ -147,6 +149,69 @@ inline bool HalfCircleSweepFits(const Point& start, const Point& end, const Poin
     return std::isfinite(budget) && std::isfinite(error) &&
         budget / ppu[0] <= 5.0e-8 && budget / ppu[1] <= 5.0e-8 && error <= budget;
 }
+// EDM152 accepts a bounded authored G17 arc only through an explicit caller
+// opt-in. Rebuild with the existing CNC circle resolver; these values own no
+// epoch, owner, Motion command, output channel, or physical settlement proof.
+constexpr double MaximumBoundedArcNativeError = 5.0e-8;
+inline bool BoundedArcDimensionsFit(double radiusMm, double sweep, double nativeError) noexcept
+{
+    if (!Positive(radiusMm) || !std::isfinite(sweep) || sweep == 0.0 ||
+        !std::isfinite(nativeError) || nativeError < 0.0 || nativeError > MaximumBoundedArcNativeError) return false;
+    const double angleError = nativeError / radiusMm;
+    return std::isfinite(angleError) && radiusMm + nativeError >= 0.0005 &&
+        radiusMm - nativeError <= 0.002 && std::fabs(sweep) + angleError >= Pi / 4.0 &&
+        std::fabs(sweep) - angleError <= Pi;
+}
+inline bool BuildBoundedXYArc(int code, const Point& increment,
+    const std::array<double, 2U>& center, double feed, EDM112::Curve& curve) noexcept
+{
+    curve = EDM112::Curve{};
+    if ((code != 2 && code != 3) || feed != 0.12) return false;
+    Point start{}, end{}, ppu{}; ppu.fill(1000000.0);
+    for (unsigned i = 0U; i < 6U; ++i) {
+        if (!std::isfinite(increment[i]) || (i >= 2U && increment[i] != 0.0)) return false;
+        end[i] = increment[i] * ppu[i];
+        if (!std::isfinite(end[i])) return false;
+    }
+    if ((increment[0] == 0.0 && increment[1] == 0.0) ||
+        !std::isfinite(center[0]) || !std::isfinite(center[1])) return false;
+    EDM112::Curve candidate{};
+    if (!EDM112::BuildArc(start, end, ppu, 17U, center, code == 2 ? -1 : 1, false, candidate) ||
+        !candidate.valid || candidate.fullCircle ||
+        !BoundedArcDimensionsFit(candidate.radiusMm, candidate.sweepRadians, candidate.precisionBudgetMm)) return false;
+    curve = candidate; return true;
+}
+inline bool BoundedArcSweepFits(const Point& start, const Point& end, const Point& ppu,
+    const std::array<double, 2U>& center, double radius, double sweep) noexcept
+{
+    if (!Positive(radius) || !std::isfinite(sweep) || sweep == 0.0 ||
+        !Positive(ppu[0]) || ppu[0] != ppu[1]) return false;
+    double scale = radius;
+    for (unsigned i = 0U; i < 6U; ++i) {
+        if (!std::isfinite(start[i]) || !std::isfinite(end[i]) || !Positive(ppu[i]) ||
+            (i >= 2U && !EDM109::SameDouble(start[i], end[i]))) return false;
+        if (i < 2U) {
+            if (!std::isfinite(center[i])) return false;
+            scale = (std::max)(scale, (std::max)(std::fabs(center[i]),
+                (std::max)(std::fabs(start[i]), std::fabs(end[i]))));
+        }
+    }
+    const double pulseBudget = 4.0 * Roundoff(scale);
+    const double nativeBudget = pulseBudget / ppu[0];
+    if (!std::isfinite(pulseBudget) || !BoundedArcDimensionsFit(radius / ppu[0], sweep, nativeBudget)) return false;
+    const std::array<double, 2U> offset{{(center[0] - start[0]) / ppu[0],
+        (center[1] - start[1]) / ppu[1]}};
+    EDM112::Curve rebuilt{};
+    if (!EDM112::BuildArc(start, end, ppu, 17U, offset, sweep < 0.0 ? -1 : 1, false, rebuilt) ||
+        !rebuilt.valid || rebuilt.fullCircle || rebuilt.precisionBudgetMm > MaximumBoundedArcNativeError ||
+        !BoundedArcDimensionsFit(rebuilt.radiusMm, rebuilt.sweepRadians, nativeBudget)) return false;
+    // Radius controls the acceleration/curvature bound. A different center,
+    // endpoint or direction cannot pass by supplying an in-range angle alone.
+    const double radiusError = std::fabs(rebuilt.radiusMm * ppu[0] - radius);
+    const double sweepError = std::fabs(rebuilt.sweepRadians - sweep) * radius;
+    return std::isfinite(radiusError) && std::isfinite(sweepError) &&
+        radiusError <= pulseBudget && sweepError <= pulseBudget;
+}
 inline bool Within(double value, double limit) noexcept
 { return std::isfinite(value) && Positive(limit) && value <= limit + Roundoff(limit); }
 inline double DiscreteStopDistance(double speed, double deceleration) noexcept
@@ -197,12 +262,14 @@ inline bool Mapping::BindLine(const Point& start, const Point& end, const Point&
 }
 inline bool Mapping::BindArc(const Point& start, const Point& end, const Point& ppu,
     const std::array<double, 2U>& centerPulse, double radiusPulse,
-    double startAngle, double sweepRadians, double length, const Limits& limits) noexcept
+    double startAngle, double sweepRadians, double length, const Limits& limits,
+    bool boundedAuthoredArc) noexcept
 {
     Clear();
     if (!Positive(radiusPulse) || !Positive(length) || !std::isfinite(startAngle) ||
         !std::isfinite(sweepRadians) || std::fabs(startAngle) > Pi ||
-        !HalfCircleSweepFits(start, end, ppu, centerPulse, radiusPulse, sweepRadians) ||
+        !(boundedAuthoredArc ? BoundedArcSweepFits(start, end, ppu, centerPulse, radiusPulse, sweepRadians) :
+            HalfCircleSweepFits(start, end, ppu, centerPulse, radiusPulse, sweepRadians)) ||
         length != radiusPulse * std::fabs(sweepRadians)) return false;
     for (unsigned i = 0U; i < 6U; ++i)
         if (!std::isfinite(start[i]) || !std::isfinite(end[i]) || !Positive(ppu[i]) ||

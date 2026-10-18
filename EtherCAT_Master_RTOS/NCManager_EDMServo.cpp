@@ -351,7 +351,7 @@ void NCManager::ObserveEDMProcessShadowSameThread(const EDMGapInput::Snapshot& g
     EDM21LogShadowGateTransition(m_edmProcessShadow, next);
     m_edmProcessShadow = next;
     if (firstObservation) RtPrintf("[EDM20_FIX1][BOOT] phase=SHADOW_FIRST_EXIT reason=%u\n", static_cast<unsigned>(next.reason));
-    if (!IsEDMZFixtureDiagnosticQuietSameThread() &&
+    if (!IsEDMZFixtureDiagnosticQuietSameThread() && !IsEDM173DiagnosticQuietSameThread() &&
         (!m_edmProcessLogSeen || (next.observedAtMs >= m_edmProcessLastLogMs &&
             next.observedAtMs - m_edmProcessLastLogMs >= 1000ULL)))
         EDM23LogAutomaticRecipe(m_recipe, next.machineProfileId, next.configRevision);
@@ -360,7 +360,7 @@ void NCManager::ObserveEDMProcessShadowSameThread(const EDMGapInput::Snapshot& g
 
 void NCManager::LogEDMProcessShadowSameThread() noexcept
 {
-    if (IsEDMZFixtureDiagnosticQuietSameThread()) return;
+    if (IsEDMZFixtureDiagnosticQuietSameThread() || IsEDM173DiagnosticQuietSameThread()) return;
     const EDMProcessShadowSnapshot& s = m_edmProcessShadow;
     if (m_edmProcessLogSeen && (s.observedAtMs < m_edmProcessLastLogMs ||
         s.observedAtMs - m_edmProcessLastLogMs < 1000ULL)) return;

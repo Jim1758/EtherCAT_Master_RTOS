@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <vector>
 #include <memory>
+#include <new>
 #include "EtherCatTypes.h" // 必須包含這個，才能認識 ServoDrive
 #include "HomeTypes.h"
 #include <cmath>
@@ -27,6 +28,11 @@ struct NCEccentricCProfilePoint;
 #include "MotionQueueTailTransaction.h"
 #include "MotionRotaryTarget.h"
 #include "MotionCommandedEndpointReceipt.h" // BQ producer-only data export
+#include "NCG76OrbitPlan.h"
+#include "NCG76MixedPlan.h"
+#include "EDM173G76Gap.h"
+#include "EDM173ServoInputDiagnostic.h"
+#include "MotionG76OrbitReceipt.h"
 #include "NCRotaryFeedScope.h" // BASE68 pure rotary admission
 #include "NCZCFeedLine.h" // BASE70 common-time Z/C geometry
 #include "NCXYZCFeedLine.h"
@@ -79,6 +85,10 @@ struct MotionEccentricCProducerWorkspace;
 #include "EDMSixAxisGapContinuous.h"
 #include "EDM129PhysicalSource.h"
 #include "EDM130WorkTimer.h"
+#include "EDM139GapStimulus.h"
+#include "EDM149VoltageMotion.h"
+#include "EDM169ManualVoltage.h"
+#include "EDM157GapPause.h"
 #include "EDMSixAxisGapEndurance.h"
 #include "EDMSixAxisGapPairedPath.h"
 #include "EDMSixAxisGapFlushPath.h"
@@ -134,11 +144,13 @@ namespace EDM126
         bool enabled=false, active=false, sourceReady=false, rowActive=false, rowCompleted=false, faulted=false;
         bool physicalAd=false;
         double voltage=0.0, targetRatio=0.0;
+        double controlVoltageV=0.0;
+        std::uint64_t controlSequence=0ULL,controlCapturedUs=0ULL;
         EDM88::Reason sourceReason=EDM88::Reason::None;
         Reason reason=Reason::None;
         FirstCauseRecord firstSource{}, firstOrphan{};
     };
-    static_assert(sizeof(MotionFeedback)<=1024U && std::is_trivially_copyable<MotionFeedback>::value,
+    static_assert(sizeof(MotionFeedback)<=1056U && std::is_trivially_copyable<MotionFeedback>::value,
         "EDM126 feedback must be fixed size.");
 }
 
@@ -167,6 +179,7 @@ namespace EDM129
     {
         Binding binding{};
         SourceEvidence source{};
+        EDM139::Evidence diagnostic{};
         std::uint64_t session=0ULL, armEpoch=0ULL, liveEpoch=0ULL, ownerGeneration=0ULL;
         std::uint64_t tick=0ULL, nowUs=0ULL;
         bool enabled=false, active=false, sourceReady=false, faulted=false;
@@ -565,6 +578,9 @@ struct AxisContext//軸參數與狀態
     // 🌟 新增：兩組獨立的 PID 參數
     PidConfig Pid_IDLE;//閒置狀態PID
     PidConfig Pid_G00;      // 專屬：定位移動專用 (G00, G01)
+    // EDM165: a separate gain bank, sharing the existing servo loop/history.
+    PidConfig Pid_FLUSH;
+    bool edmFlushGainSelected = false; // RT selector: previous-cycle bank only.
 
 
 
@@ -879,6 +895,11 @@ struct MotionCommand//運動指令包裹 (使用在塞進佇列)
     // 時光機專用：記憶當時的空間旋轉狀態
     bool mem_enableTransform = false;
     bool pathCoreEccentricCFeedExactStop = false; // BASE79B: existing padding byte 385; live admission closed.
+    bool edm149ZOnlyCommissioning = false; // EDM149: padding byte 386, bound dry commissioning source only.
+    bool edm150XYZOnlyCommissioning = false; // EDM150: padding byte 387, fixed C/U/V references.
+    bool edm154SparseCommissioning = false; // EDM154: padding byte 388, bound sparse dry commissioning geometry.
+    bool edm173G76Gap = false; // Explicit sealed common-GAP compound, existing padding389.
+    std::uint8_t edm173ChildOrdinal = 0U, edm173ChildCount = 0U; // padding390/391; no output authority.
     double mem_transformOrigin[3] = { 0.0, 0.0, 0.0 };
     double mem_transformMatrix[3][3] = {
         { 1.0, 0.0, 0.0 },
@@ -1241,10 +1262,29 @@ inline bool TryResolveMotionXYZCAbsoluteTarget(const MotionCommand& command,
 }
 
 
+// Check raw bytes before any commissioning bool load. Invalid transport bytes
+// cannot invoke undefined behavior through a typed bool read or borrow a scope.
+inline bool IsMotionEDMCommissioningMarkerEncodingValid(const MotionCommand& command) noexcept
+{
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&command);
+    unsigned selected = 0U;
+    const std::size_t offsets[4U] = { offsetof(MotionCommand, edm149ZOnlyCommissioning),
+        offsetof(MotionCommand, edm150XYZOnlyCommissioning), offsetof(MotionCommand, edm154SparseCommissioning), offsetof(MotionCommand, edm173G76Gap) };
+    for (unsigned index = 0U; index < 4U; ++index)
+    {
+        const unsigned char value = bytes[offsets[index]];
+        if (value > 1U) return false;
+        selected += value;
+    }
+    return selected <= 1U && (bytes[offsetof(MotionCommand, edm173G76Gap)] ?
+        command.edm173ChildCount==25U && command.edm173ChildOrdinal<25U :
+        command.edm173ChildCount==0U && command.edm173ChildOrdinal==0U);
+}
+
 // BASE74 exact G90/G91 XYZ/C/U/V mapping; physical units remain separate.
 inline bool IsMotionXYZCUVFeedSourceAllowed(const MotionCommand& command) noexcept
 {
-    if (command.pathCoreEccentricCFeedExactStop) return false;
+    if (!IsMotionEDMCommissioningMarkerEncodingValid(command) || command.pathCoreEccentricCFeedExactStop) return false;
     const NCTranslationSnapshot& source = command.sourceTranslation;
     return command.pathCoreXYZCUVFeedExactStop && !command.pathCoreXYZCFeedExactStop &&
         !command.pathCoreZCFeedExactStop && !command.pathCoreFeedExactStop &&
@@ -1341,8 +1381,47 @@ inline double MotionXYZCUVEndMCS(const MotionCommand& command, unsigned slot) no
         resolved.endMCS[slot] : (std::numeric_limits<double>::quiet_NaN)();
 }
 
+// EDM171: an explicit finite native LINE/ARC compound may retain its
+// frozen G90/G91, scale and mirror source. Marker 0/1 keep their old gates.
+inline bool IsMotionG76MixedRetainedSourceAllowed(const MotionCommand& command) noexcept
+{
+    const auto& frame=command.sourceTranslation;
+    if (!command.pathCoreRetainedTraversal || command.mem_transformOrigin[2]!=2.0 ||
+        !command.execution.IsAssigned() || command.execution.source!=MotionCommandSource::NC_MEMORY ||
+        !command.ownerLease.IsValid() || command.ownerLease.owner!=MotionOwner::AUTO ||
+        command.sourceLinePC<0 || command.execution.sourceBlockId!=static_cast<MotionSourceBlockId>(command.sourceLinePC) ||
+        !NCG76::FrameSupported(frame) || command.sourcePlaneMode!=17 || command.sourceToolRadiusMode!=40 ||
+        command.sourceG16Active || command.sourceG162Active || command.sourceG168Active || command.sourceWCode!=0 ||
+        command.sourceIsAbsoluteMode!=(frame.distanceMode==90) ||
+        command.commandPathMode!=MotionCommandPathMode::EXACT_STOP || command.cncFeedLookahead || command.cncCornerBlend ||
+        command.pathCoreFeedExactStop || command.pathCoreRotaryFeedExactStop || command.pathCoreZCFeedExactStop ||
+        command.pathCoreXYZCFeedExactStop || command.pathCoreXYZCUVFeedExactStop || command.pathCoreEccentricCFeedExactStop ||
+        command.edm149ZOnlyCommissioning || command.edm150XYZOnlyCommissioning || command.edm154SparseCommissioning ||
+        command.replayTerminalAlreadyPublished || command.mem_enableTransform ||
+        !IsNCTranslationSourceAllowed(command.sourceWCS,frame) ||
+        !IsMotionFixedTranslationToolSourceAllowed(command) || !IsMotionFixedTranslationCutterSourceAllowed(command) ||
+        !IsMotionFixedTranslationRotationSourceAllowed(command) || !IsMotionFixedTranslationWorkSourceAllowed(command) ||
+        !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) || !IsMotionFixedTranslationPolarSourceAllowed(command) ||
+        command.axisCount<1 || command.axisCount>3) return false;
+    int previous=-1;
+    for (int slot=0;slot<command.axisCount;++slot) {
+        const int axis=command.axisIndices[slot];
+        if (axis<=previous || axis<0 || axis>2) return false;
+        previous=axis;
+    }
+    if (command.pathCorePlanarCircle)
+        return command.axisCount==2 && command.axisIndices[0]==0 && command.axisIndices[1]==1 &&
+            ((command.mode==InterpolationMode::CIRCULAR_CW && command.dir==-1) ||
+                (command.mode==InterpolationMode::CIRCULAR_CCW && command.dir==1));
+    return command.mode==InterpolationMode::LINEAR && !command.pathCoreFullCircle && command.dir==0;
+}
+
 inline bool IsMotionFixedTranslationSourceAllowed(const MotionCommand& command) noexcept
 {
+    if(!IsMotionEDMCommissioningMarkerEncodingValid(command))return false;
+    if(command.edm173G76Gap)return command.pathCoreRetainedTraversal && !command.pathCoreRetainedReverse && !command.pathCorePlanarCircle && command.mode==InterpolationMode::LINEAR && command.mem_transformOrigin[0]==0.0 && command.mem_transformOrigin[1]==1.0 && IsMotionG76MixedRetainedSourceAllowed(command);
+    if (command.pathCoreRetainedTraversal && command.mem_transformOrigin[2]==2.0)
+        return IsMotionG76MixedRetainedSourceAllowed(command);
     if (command.pathCoreEccentricCFeedExactStop) return false;
     if (command.pathCoreXYZCUVFeedExactStop) return IsMotionXYZCUVFeedSourceAllowed(command);
     if (command.pathCoreXYZCFeedExactStop) return IsMotionXYZCFeedSourceAllowed(command);
@@ -1415,12 +1494,19 @@ static_assert(offsetof(MotionCommand, pathCoreXYZCUVFeedExactStop) == 207U,
     "BASE73 must preserve the 1064-byte command transport.");
 static_assert(offsetof(MotionCommand, pathCoreEccentricCFeedExactStop) == 385U,
     "BASE79B must preserve the 1064-byte command and every existing offset.");
+static_assert(offsetof(MotionCommand, edm173G76Gap)==389U && offsetof(MotionCommand, edm173ChildOrdinal)==390U && offsetof(MotionCommand, edm173ChildCount)==391U,"EDM173 must only consume the three existing padding bytes.");
+static_assert(offsetof(MotionCommand, edm154SparseCommissioning) == 388U,
+    "EDM154 must consume padding and preserve the command transport ABI");
+static_assert(offsetof(MotionCommand, edm150XYZOnlyCommissioning) == 387U,
+    "EDM150 commissioning marker must retain the MotionCommand ABI");
+static_assert(offsetof(MotionCommand, edm149ZOnlyCommissioning) == 386U,
+    "EDM149 must preserve all command transport offsets.");
 #endif
 
 // Stage NC-0.2D：NC Producer 在單一 Program Block 派送期間，
 // 固定容量收集該 Block 建立的 Segment Identity。它只存在 Producer
 // 執行緒，不進入 250 us Runtime，也不改變 Command / Feedback ABI。
-constexpr std::size_t MOTION_PROGRAM_BLOCK_CAPTURE_CAPACITY = 32U;
+constexpr std::size_t MOTION_PROGRAM_BLOCK_CAPTURE_CAPACITY = 128U;
 
 struct MotionProgramBlockSubmission
 {
@@ -2355,6 +2441,57 @@ enum class MotionNCTranslationTransitionResult : std::uint8_t
 // FIX15: transient lifecycle sampling never substitutes for mapping validity.
 enum class MotionQueueTailSyncResult { Ready, Retry, InvalidMapping };
 
+// One NC producer owns this reusable staging storage. Commands stay private
+// until the existing Motion ingress publishes the whole bounded compound.
+struct MotionG76OrbitProducerWorkspace
+{
+    std::array<MotionCommand,128U> commands{};
+    NCG76Mixed::NominalSource rebuiltNominal{};
+    std::array<double,8U> startPulse{},stagedPulse{},stagedMCS{};
+    std::vector<int> axes=std::vector<int>{0,1,2};
+    std::vector<double> targetPulse=std::vector<double>(3U,0.0);
+};
+
+// Startup-owned separate NC staging and RT immutable copies. Only the SPSC
+// publication crosses threads; neither side resets the shared ring.
+struct MotionEDM173Seal
+{
+    EDM173::Plan plan{};
+    std::array<MotionExecutionIdentity,25U> identities{};
+    std::array<std::array<double,8U>,25U> endPulse{};
+    std::array<double,8U> startPulse{},pulsePerUnit{};
+    MotionExecutionEpoch epoch=MOTION_EXECUTION_EPOCH_INVALID;
+};
+struct MotionEDM173Storage
+{
+    // C++14 does not guarantee cache-line alignment for ordinary heap new.
+    static void* operator new(std::size_t size)
+    {
+        void* allocation=::operator new(size+alignof(MotionEDM173Seal)+128U);
+        const auto raw=reinterpret_cast<std::uintptr_t>(allocation)+sizeof(void*);
+        const auto aligned=(raw+63U)&~static_cast<std::uintptr_t>(63U);
+        void* output=reinterpret_cast<void*>(aligned);
+        reinterpret_cast<void**>(output)[-1]=allocation;return output;
+    }
+    static void operator delete(void* value) noexcept
+    { if(value)::operator delete(reinterpret_cast<void**>(value)[-1]); }
+
+    FixedCapacitySpscRing<MotionEDM173Seal,2U> messages{};
+    MotionEDM173Seal producer{}, current{};
+    EDM173::ValidationScratch validation{}; // Startup-owned; only the RT seal consumer writes it.
+    std::atomic<std::uint64_t> publishedSession{0ULL};
+    EDM53::Channel<EDM173::Feedback,2048U> feedback{};
+    EDM173::Feedback currentFeedback{};
+    // FIX7: RT-owned, observation-only source evidence. No control authority.
+    EDM173InputDiag::Recorder inputDiagnostic{};
+    EDM53::Channel<EDM173InputDiag::Evidence,2048U> inputDiagnosticFeedback{};
+    std::uint64_t inputDiagnosticPublishedSession=0ULL;
+    std::uint32_t terminalMask=0U;
+    bool sealed=false,handshaking=false;
+    unsigned nextChild=0U;
+    std::uint64_t handshakeUs=0ULL;
+};
+
 class MotionCore
 {
 public:
@@ -2568,6 +2705,13 @@ public:
         const EDM97::Tuning& tuning, const EDM114::Source& previousSource,
         std::uint64_t completionCommit, std::uint64_t completionTick, const EDM116::Policy& policy) noexcept;
     bool ReadEDM128Feedback(EDM128::MotionFeedback& feedback) const noexcept;
+    bool RequestEDM157Hold(const EDM157::Scope& scope, std::uint64_t holdSequence,
+        std::uint64_t startFloor) noexcept;
+    bool RequestEDM157Resume(const EDM157::Scope& scope, std::uint64_t holdSequence,
+        std::uint64_t startSequence) noexcept;
+    bool ReadEDM157Feedback(EDM157::Feedback& feedback) const noexcept;
+    bool SubmitEDM169ManualVoltage(const EDM169::Request& request) noexcept;
+    bool ReadEDM169ManualVoltageFeedback(EDM169::Feedback& feedback) const noexcept;
     bool SubmitEDM129Arm(std::uint64_t session, MotionExecutionEpoch epoch,
         const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
         const EDM107::FlushProfile& flushProfile, unsigned fixture) noexcept;
@@ -2578,9 +2722,15 @@ public:
         const EDM97::Tuning& tuning, const EDM114::Source& previousSource,
         std::uint64_t completionCommit, std::uint64_t completionTick, const EDM116::Policy& policy) noexcept;
     bool ReadEDM129Feedback(EDM129::MotionFeedback& feedback) const noexcept;
+    bool ReadEDM173Feedback(EDM173::Feedback& out) const noexcept;
+    bool ReadEDM173InputDiagnostic(EDM173InputDiag::Evidence& out) const noexcept;
+    std::uint32_t GetEDM173ImplementationRevision() const noexcept;
+    bool SubmitEDM173Arm(std::uint64_t session,MotionExecutionEpoch epoch,const MotionOwnerLease& lease,
+        const EDM97::Tuning& tuning,const EDM107::FlushProfile& flush,const EDM130::Recipe& recipe) noexcept;
     bool SubmitEDM130Arm(std::uint64_t session, MotionExecutionEpoch epoch,
         const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
-        const EDM107::FlushProfile& flushProfile, unsigned fixture, const EDM130::Recipe& recipe) noexcept;
+        const EDM107::FlushProfile& flushProfile, unsigned fixture, const EDM130::Recipe& recipe,
+        std::uint64_t manualRun = 0ULL, std::uint64_t manualCache = 0ULL) noexcept;
     bool AuthorizeEDM130Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
         std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
         const std::array<double,6U>& increment, const std::array<double,2U>& center,
@@ -3226,6 +3376,7 @@ public:
 
     void BeginProgramBlockMotionCapture() noexcept;
     MotionProgramBlockCapture EndProgramBlockMotionCapture() noexcept;
+    void EndProgramBlockMotionCapture(MotionProgramBlockCapture& output) noexcept;
 
     //設定空間座標旋轉 (參數：開關, 旋轉中心X,Y,Z, 繞Z軸旋轉角度, 繞Y軸旋轉角度, 繞X軸旋轉角度)
     void SetCoordinateTransform(bool enable, double ox, double oy, double oz, double yaw_deg, double pitch_deg, double roll_deg);
@@ -3648,6 +3799,15 @@ public:
 
 
 private:
+    std::unique_ptr<MotionG76OrbitProducerWorkspace> m_g76OrbitProducer;
+    std::unique_ptr<MotionEDM173Storage> m_edm173;
+    bool IsEDM173Profile() const noexcept;
+    bool IsEDM173CommandCurrent(bool bound) const noexcept;
+    bool IsEDM173HandoffCurrent() const noexcept;
+    bool IsEDM173GroupGeometrySupported() const noexcept;
+    bool PreserveEDM173PendingHandoffZero(const AxisCommand& command) const noexcept;
+    void ServiceEDM173Handoff(bool freshMotionFrame) noexcept;
+
     MotionQueueTailSyncResult SyncVirtualEndPositionResult() noexcept;
     MotionQueueTailSyncResult GetSynchronizedG00QueueTailMCSResult(
         double(&outputMCS)[MAX_AXES]) const noexcept;
@@ -3660,6 +3820,7 @@ private:
     struct EDM94ArmRequest
     {
         std::uint64_t session = 0ULL;
+        std::uint64_t manualRun = 0ULL, manualCache = 0ULL;
         MotionExecutionEpoch epoch = MOTION_EXECUTION_EPOCH_INVALID;
         MotionOwnerLease lease{};
         bool gapBoundary = false;
@@ -3854,9 +4015,19 @@ private:
         bool workTimeFlush=false, const EDM130::Recipe& recipe=EDM130::Recipe{}) noexcept;
     bool IsEDM128FeedPolicyCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
     bool IsEDM129FeedSourceCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
-    bool IsEDM129AwaitFreshZeroCurrent(std::uint64_t nowUs) const noexcept;
+    bool IsEDM129AwaitFreshZeroCurrent(std::uint64_t nowUs,
+        std::uint32_t* failedGate = nullptr) const noexcept;
     bool IsEDM130FeedTimingCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
     bool IsEDM130TimingCurrent() const noexcept;
+    EDM139::Stimulus m_edm139Stimulus{};
+    EDM149::Source m_edm149Voltage{}; // Separate simulated control; never overwrites physical AD.
+    // One NC publisher supplies values only. RT owns admission, lease and
+    // sample production; these channels never carry an axis/PDO command.
+    EDM53::Channel<EDM169::Request,512U> m_edm169ManualRequests{};
+    EDM53::Channel<EDM169::Feedback,512U> m_edm169ManualFeedback{};
+    EDM169::Receiver m_edm169Manual{};
+    void ClearEDM169ManualVoltage() noexcept;
+    bool ServiceEDM169ManualVoltage() noexcept;
     bool m_edm130Profile=false;
     EDM130::Recipe m_edm130ArmRecipe{};
     bool m_edm129Profile=false;
@@ -3872,12 +4043,33 @@ private:
     EDM128::TestVoltage m_edm128Voltage{};
     EDM128::MotionFeedback m_edm128Current{};
     EDM53::Channel<EDM128::MotionFeedback,1496U> m_edm128Feedback{};
+    // EDM157: one NC producer, one serialized Motion/send consumer. Requests
+    // carry values only; the existing committed traversal remains the cursor.
+    struct EDM157Request
+    {
+        EDM157::Scope scope{};
+        std::uint64_t holdSequence=0ULL, startSequence=0ULL, issuedTick=0ULL, issuedUs=0ULL;
+        bool hold=false;
+    };
+    FixedCapacitySpscRing<EDM157Request,4U> m_edm157Requests{};
+    EDM157Request m_edm157Incoming{},m_edm157HoldRequest{},m_edm157ResumeRequest{};
+    EDM157::Transaction m_edm157Pause{};
+    EDM53::Channel<EDM157::Feedback,1024U> m_edm157Feedback{};
+    std::uint64_t m_edm157ZeroOutputTick=0ULL,m_edm157QualifySeedTick=0ULL;
+    EDM157::Scope CurrentEDM157Scope() const noexcept;
+    bool IsEDM157ScopeCurrent(const EDM157::Scope& scope) const noexcept;
+    bool IsEDM157PublishedScopeCurrent(const EDM157::Scope& scope, std::uint64_t& tick,
+        std::uint64_t& nowUs) const noexcept;
+    bool ServiceEDM157Requests() noexcept;
+    void ObserveEDM157PauseProof(bool complete,const EDM94::RuntimeDiagnostic& priorSendProof) noexcept;
+    void RejectEDM157Pause() noexcept;
+    void PublishEDM157Feedback() noexcept;
     // EDM126 bounded traversal state (no NC rewind or historical side-effect replay).
     bool m_edm126Profile=false, m_edm126Participating=false, m_edm126PhysicalSettled=false;
     EDM126::Traversal m_edm126{};
     EDM126::MotionFeedback m_edm126Current{};
     EDM126::FirstCauseRecord m_edm133FirstSource{}, m_edm133FirstOrphan{};
-    EDM53::Channel<EDM126::MotionFeedback,1024U> m_edm126Feedback{};
+    EDM53::Channel<EDM126::MotionFeedback,1056U> m_edm126Feedback{};
     EDM96::Feedback m_edm126Gap{};
     EDM88::Qualifier m_edm126Source{};
     EDM88::SourceConfig m_edm126SourceConfig{};
@@ -5018,6 +5210,8 @@ private:
     bool TryEnqueueMotionCommand(const MotionCommand& command) noexcept;
     bool TryEnqueueMotionCommandPair(
         const MotionCommand& first, const MotionCommand& second) noexcept;
+    bool TryEnqueueMotionCommandBatch(const MotionCommand* commands, std::size_t count) noexcept;
+    bool IsG76MixedPreparedCommandGeometryValid(const MotionCommand& command) const noexcept;
     bool TryPeekNextMotionCommand(MotionCommand& command) const noexcept;
     bool TryPeekQueuedMotionCommandAt(
         std::size_t offset,
@@ -5159,6 +5353,7 @@ private:
     void Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd,
         const MotionServoInputSnapshot& input);
     void DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold = nullptr);
+    bool IsEDM165FlushGainActive(const AxisContext& axis) const noexcept;
 
     double PlanTrapezoidal(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
     double PlanTrapezoidal_B2(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
@@ -5574,7 +5769,8 @@ public:
     // First array is raw programmed WCS in G90; second is requested MCS.
     bool TryG01XYZCUVMoveTransactionalTail(const std::array<double, 6U>& programmedDelta,
         const std::array<double, 6U>& targetMCS, double feedMMMin,
-        double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace);
+        double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace,
+        bool sparseCommissioning = false);
     // DD: a non-null predecessor selects BUFFERED/EXACT_STOP, same tuple/mapping.
     bool TryG01MoveTransactionalTail(
         const std::vector<int>& axes,
@@ -5658,6 +5854,11 @@ public:
         const std::vector<double>& intermediateNativeTargets,
         const std::vector<double>& finalNativeTargets, std::uint32_t intermediateMask,
         int profileCode, double* commandedMCSTail);
+    bool TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,double* commandedMCSTail,MotionG76OrbitReceipt& receipt);
+    bool TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
+        double* commandedMCSTail, MotionG76OrbitReceipt& receipt);
+    bool TryG76MixedMoveTransactionalTail(const NCG76Mixed::Plan& plan,
+        double* commandedMCSTail, MotionG76OrbitReceipt& receipt);
     void G07_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G07 快速定位 API
     void G161_Move(const std::vector<int>& axes, const std::vector<double>& targetPos, BufferMode mode = BufferMode::ABORTING);// G161 快速定位 API
     // Native mm/degrees, absolute exact-stop. Commits MCS/pulse tails only

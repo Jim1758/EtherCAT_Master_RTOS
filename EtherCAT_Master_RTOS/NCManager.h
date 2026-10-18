@@ -1,8 +1,13 @@
 ﻿#pragma once
 #include "NC_Types.h"
 #include "EDM127ModalB.h"
+#include "EDM140LocalAssignment.h"
+#include "EDM141MotionWords.h"
+#include "EDM146BoundaryObservation.h"
 #include "EDMPLCOutputState.h"
 #include "EDM130WorkTimeBinding.h"
+#include "EDM157GapPause.h"
+#include "EDM169ManualVoltage.h" // Scoped operator voltage intent only; existing CNC Motion owns axes.
 #include "EDMGapSignal.h"
 #include "EDMGapInput.h"
 #include "EDMPhysicalRecipeCapture.h" // EDM67: no-axis frozen physical recipe receipt.
@@ -12,6 +17,7 @@
 #include "EDMProcessProfile.h"
 #include "EDMProcessTuningContract.h" // EDM20 owner-thread shadow calculations only.
 class EtherCatMaster;
+struct NCMacroAssignmentCommit;
 #include "EDMProcessSimulationTest.h" // EDM01: no physical output or motion.
 #include "EDMFeedRetreatSimulationTest.h" // EDM02: simulated consumer only.
 #include "EDMGapAcquisitionSimulationTest.h" // EDM14: synthetic ADC shadow only.
@@ -47,6 +53,11 @@ class EtherCatMaster;
 #include "EDMZFixtureSession.h" // EDM28/29: explicit unloaded local Z finite-position diagnostics.
 #include "EDMAutomaticFlushRecipe.h" // EDM23: read-only actual recipe binding.
 #include "MotionCore.h"
+#include "NCG76OrbitPlan.h"
+#include "NCG76MixedPlan.h"
+#include "EDM173G76Gap.h"
+#include "EDM171G76Config.h"
+#include "MotionG76OrbitReceipt.h"
 #include "EDMSixAxisCurveFixture.h" // EDM112 NC-only curve fixture; no physical arc output.
 #include "EDMSixAxisCurveRuntime.h" // EDM113 independent RT observation receipts; no arc authority.
 #include "EDMSixAxisArcExecution.h"
@@ -378,6 +389,8 @@ public:
     void ReadEDMRecipeDisplaySameThread(EDMRecipe::ActiveSnapshot& output) noexcept;
     const EDMRecipe::Catalog* ReadEDMRecipeCatalogSameThread() const noexcept { return m_recipe.GetCatalog(); }
     bool InstallEDMVoltageProfileBeforeStart(const EDMVoltage::Profile& profile) noexcept;
+    // Existing HMI @990 write event only. Never reads a persistent variable as a new command.
+    bool SetEDM169ManualVoltageSameThread(double voltageV) noexcept;
     // Called exactly once during boot, including an empty invalid catalog when
     // the optional file is unavailable. No runtime reload or shared ABI.
     bool InstallEDMToolHeadCatalogBeforeStart(const EDM87::Catalog& catalog) noexcept;
@@ -501,6 +514,8 @@ public:
     bool IsEDMDiagnosticQuietSameThread() const noexcept;
     // EDM35 FIX2: defer passive console IO while the physical fixture needs NC service.
     bool IsEDMZFixtureDiagnosticQuietSameThread() const noexcept;
+    // FIX8: same-thread P50 bulk diagnostics only; never a motion/safety gate.
+    bool IsEDM173DiagnosticQuietSameThread() const noexcept;
     void DrainEDMDiagnosticsSameThread() noexcept;
     // EDM40 FIX1: at most one deferred console line after fresh RT release.
     bool DrainEDMGapReplanDiagnosticsSameThread() noexcept;
@@ -2535,6 +2550,127 @@ private:
     void CommitCncModalFeedSameThread(const CncFeedValueSnapshot& snapshot,
         NCBlockDispatchId dispatch, std::uint64_t commit, int pc, int line) noexcept;
 
+    // G76 P11 finite air-run prototype; one original NC block owns all children.
+    struct G76OrbitState
+    {
+        NCG76::ProgramPlan program{};
+        NCG76::NativePlan native{};
+        MotionG76OrbitReceipt receipt{};
+        CncFeedValueSnapshot feed{};
+        std::uint64_t run=0ULL,cache=0ULL,dispatch=0ULL,commit=0ULL;
+        int pc=-1,line=0;
+        unsigned loggedChildren=0U;
+        std::array<MotionFeedbackSequence,128U> lastFeedback{};
+        std::array<bool,128U> accepted{},started{},done{};
+        bool active=false,bound=false,completed=false,inheritedB=false,mixed=false;
+        unsigned mode=0U; int sourceG=76;
+    };
+    std::unique_ptr<G76OrbitState> m_g76Orbit{new G76OrbitState{}};
+    struct G76ModalState
+    {
+        MotionOwnerLease lease{};
+        std::uint64_t run=0ULL,cache=0ULL,commit=0ULL;
+        unsigned mode=0U;
+        bool valid=false;
+    } m_g76Modal{};
+    struct G76Confirmation
+    {
+        std::uint64_t run=0ULL,cache=0ULL,dispatch=0ULL,startRequests=0ULL;
+        int firstPC=-1;
+        bool waiting=false,confirmed=false;
+    } m_g76Confirmation{};
+    bool m_g76PowerInhibited=false;
+    struct EDM171AirWorkspace
+    {
+        NCG76Mixed::RollingHistory history{};
+        NCG76Mixed::HistorySnapshot historySnapshot{};
+        NCG76Mixed::Input input{};
+        NCG76Mixed::Plan plan{};
+        NCPathCoreFeedLineInput lineInput{};
+        NCPathCoreFeedLineV2 line{};
+        NCPathCoreFeedArcInput arcInput{};
+        NCPathCoreFeedArcV2 arc{};
+        NCPathCoreRetainedGeometry geometry{};
+        NCBlock literal{},normalized{};
+        EDM171Config::G76CenterReturnSpeeds speeds{};
+        // Authorized at fresh M00 START; ordinary owned motion epochs may advance.
+        EDMRecipe::ParameterSnapshot e6{};
+        EDMRecipe::Summary e6Recipe{};
+        const EDMRecipe::Catalog* e6Catalog=nullptr;
+        MotionExecutionEpoch e6Epoch=MOTION_EXECUTION_EPOCH_INVALID;
+        bool e6Ready=false;
+        NCBlockLifecycleSnapshot ledger{};
+        std::uint64_t run=0ULL,cache=0ULL,dispatch=0ULL,translationGeneration=0ULL;
+        MotionOwnerLease lease{};
+        unsigned mode=0U;
+        int pc=-1,lineNumber=0;
+        bool selected=false,bound=false,configured=false,inherited=false;
+    };
+    std::unique_ptr<EDM171AirWorkspace> m_edm171Air{new EDM171AirWorkspace{}};
+    struct NCDispatchScratch
+    {
+        MotionProgramBlockCapture capture{};
+        NCBlockLifecycleSnapshot readAheadLedger{},bypassLedger{},commitLedger{};
+    };
+    std::unique_ptr<NCDispatchScratch> m_ncDispatchScratch{new NCDispatchScratch{}};
+    bool IsEDM171AirProgramSameThread(int firstPC) const noexcept;
+    bool IsEDM171AirGrantCurrentSameThread() const noexcept;
+    void CaptureEDM171AirE6SameThread() noexcept;
+    bool ReadEDM171AirE6SameThread(EDMRecipe::ParameterSnapshot&) const noexcept;
+    bool NormalizeEDM171AirBlockSameThread(const NCBlock&,NCBlock&,int,int,NCBlockDispatchId);
+    void CommitEDM171AirBlockSameThread(NCBlockDispatchId,const MotionProgramBlockCapture&,
+        const NCProgramCommitSnapshot&,bool,bool,const NCBlockLifecycleSnapshot&,int,int);
+    WaitConditionFunc StartEDM171MixedMotionSameThread(const NCBlock&);
+    bool BuildEDM171NominalSameThread(const NCBlock&,bool orbit);
+    bool BuildEDM171LineSameThread(const std::array<double,8U>&,const std::array<double,8U>&,
+        const std::array<double,8U>&,const std::array<double,8U>&,double,NCPathCoreRetainedGeometry&);
+    void ObserveEDM171NominalFeedbackSameThread(const MotionFeedbackEvent&,bool);
+    void AppendEDM171HistorySameThread(const NCPathCoreRetainedGeometry&,const MotionExecutionIdentity&,
+        std::uint64_t,std::uint64_t,int,int,unsigned);
+    void ResetG76OrbitStateSameThread() noexcept;
+
+    static bool IsG76OrbitBlockShapeValid(const NCBlock& block,bool allowMissingFeed=true,int unitsMode=21) noexcept;
+    bool IsG76OrbitFrameCurrentSameThread() const noexcept;
+    bool IsG76OrbitBlockAllowedSameThread(const NCBlock& block) noexcept;
+    bool PrepareG76OrbitTranslationSameThread(const NCBlock& block);
+    WaitConditionFunc StartG76OrbitSameThread(const NCBlock& block);
+    void CommitG76OrbitCaptureSameThread(NCBlockDispatchId dispatch,const MotionProgramBlockCapture& capture,
+        const NCProgramCommitSnapshot& commit,bool committed,bool ledgerFound,const NCBlockLifecycleSnapshot& ledger,
+        int pc,int line);
+    void ObserveG76OrbitFeedbackSameThread(const MotionFeedbackEvent&,bool ledgerAccepted);
+    bool CompleteG76OrbitSameThread();
+    void ServiceG76OrbitSameThread();
+    void RejectG76OrbitSameThread(const char* reason,int alarm);
+    void CaptureG76OrbitConfirmationSameThread(int pc,NCBlockDispatchId dispatch) noexcept;
+    void CommitG76OrbitConfirmationResumeSameThread() noexcept;
+
+    // One NC parent owns all 25 genuine GAP-controlled nominal children.
+    struct EDM173NCState
+    {
+        EDM173::Plan plan{};
+        NCG76::NativePlan nominal{};
+        NCG76Mixed::NominalSource canonical{};
+        NCBlock authored{};
+        EDM173::Feedback retained{};
+        std::uint64_t loggedTriggers=0ULL,loggedCompletions=0ULL;
+        unsigned loggedPhase=0U;
+        bool prepared=false,published=false,parentCommitted=false,completed=false;
+    };
+    std::unique_ptr<EDM173NCState> m_edm173{};
+    static bool IsEDM173BracketShapeValid(const NCBlock&) noexcept;
+    static bool IsEDM173OrbitBlockShapeValid(const NCBlock&) noexcept;
+    bool IsEDM173BracketBlockSameThread(const NCBlock&) const noexcept;
+    bool IsEDM173OrbitAllowedSameThread(const NCBlock&) noexcept;
+    bool FreezeEDM173TranslationSameThread();
+    bool PreflightEDM173ProgramSameThread(int) noexcept;
+    bool BindEDM173RecipeSameThread() noexcept;
+    bool GuardEDM173BlockSameThread(const NCBlock&,int,int);
+    WaitConditionFunc StartEDM173SameThread(const NCBlock&);
+    WaitConditionFunc StartEDM173OrbitSameThread(const NCBlock&);
+    bool WaitEDM173SameThread();
+    bool IsEDM173RuntimeCompleteSameThread() noexcept;
+    void ServiceEDM173SameThread() noexcept;
+
     // Cutter nominal contour is distinct from the accepted physical tool centre.
     // Only a validated program/ledger commit advances this tail. HOLD retains it;
     // invalidation/RESET retires it, so an interrupted contour cannot be resumed.
@@ -2599,6 +2735,7 @@ private:
         MotionExecutionEpoch armEpoch = MOTION_EXECUTION_EPOCH_INVALID;
         std::array<std::array<double, 6U>, 16U> increment{};
         std::array<double, 16U> feed{};
+        std::array<std::uint8_t, 16U> authoredGCode{}; // EDM153: immutable accepted row kind; no inferred fixed schedule.
         std::array<int, 18U> pc{};
         std::array<int, 16U> selectorPC{}; // P129: one explicit P131 before each physical row.
         std::uint64_t session = 0ULL, run = 0ULL, cache = 0ULL, armDispatch = 0ULL;
@@ -2666,7 +2803,19 @@ private:
         std::uint64_t gapFlushInterruptSampleTick = 0ULL, gapFlushInterruptEpoch = 0ULL;
         bool gapFlushInterruptRequested = false;
     } m_edm94{};
-    static_assert(sizeof(EDM94NCState) <= 3584U, "EDM102 bounded NC bracket retains sixteen authored increments and eighteen PCs.");
+    // FIX3: FIX2 adds one 224-byte first-fault snapshot to cached Feedback.
+    // Preserve the original bracket budget and its fixed authored capacities.
+    static_assert(sizeof(EDM94::FaultAxisDiagnostic) <= 224U,
+        "EDM158 first-fault axis snapshot remains within its fixed storage budget.");
+    static_assert(sizeof(EDM94NCState) <= 3584U + sizeof(EDM94::FaultAxisDiagnostic),
+        "EDM102 bounded NC bracket plus one bounded first-fault snapshot.");
+    static_assert(std::tuple_size<decltype(EDM94NCState::increment)>::value == 16U &&
+        sizeof(EDM94NCState::increment) == 16U * 6U * sizeof(double) &&
+        std::tuple_size<decltype(EDM94NCState::feed)>::value == 16U &&
+        std::tuple_size<decltype(EDM94NCState::authoredGCode)>::value == 16U &&
+        std::tuple_size<decltype(EDM94NCState::pc)>::value == 18U &&
+        std::tuple_size<decltype(EDM94NCState::selectorPC)>::value == 16U,
+        "EDM102 bounded NC bracket retains sixteen authored increments and eighteen PCs.");
     // Persistent NC workspace; never construct/copy the retained ledger on the RTSS stack.
     struct EDM109NCState
     {
@@ -2732,17 +2881,56 @@ private:
         std::uint32_t loggedFlushPhase = 0U, loggedSpeedStage = 0U; // EDM137 observer only.
         bool bound = false, retainedRowEvent = false;
     } m_edm130{};
+    bool PreflightEDM158VisibleTravelSameThread() noexcept;
+    bool PreflightEDM159XYZVisibleTravelSameThread() noexcept;
+    bool PreflightEDM167SixVisibleTravelSameThread() noexcept;
+    bool PreflightEDM160BoundedTravelSameThread() noexcept;
     bool BindEDM130WorkTimeSameThread() noexcept;
     bool IsEDM130RecipePreambleSameThread(const NCParsedBlock& block, int pc) const noexcept;
-    bool IsEDM130CurrentSameThread(unsigned completed) const noexcept;
+    bool IsEDM130CurrentSameThread(unsigned completed, EDM146::Failure* observation = nullptr) const noexcept;
     void LogEDM130SameThread(const char* event, unsigned step) const noexcept;
+    struct EDM147NCState
+    {
+        std::uint64_t session=0ULL,started=0ULL,completed=0ULL,qualified=0ULL,interrupted=0ULL;
+        bool lowPrompted=false,restorePrompted=false,invalidLogged=false;
+    } m_edm147{};
+    void ServiceEDM147PhysicalGapSameThread() noexcept;
+    void LogEDM147PhysicalGapSameThread(const char* event) const noexcept;
+    // EDM140: NC-only exact local bookkeeping plan; no RT geometry authority.
+    struct EDM140NCState
+    {
+        std::array<EDM140::Specification, EDM140::AssignmentCapacity> specifications{};
+        std::array<int, EDM140::AssignmentCapacity> pc{};
+        std::array<unsigned, EDM140::AssignmentCapacity> afterRows{};
+        std::array<double, 2U> values{};
+        std::uint64_t session = 0ULL, run = 0ULL, cache = 0ULL;
+        std::uint64_t armEpoch = 0ULL, ownerGeneration = 0ULL, lastCommit = 0ULL;
+        unsigned count = 0U, next = 0U, definedMask = 0U;
+        bool sealed = false;
+    } m_edm140{};
+    static_assert(sizeof(EDM140NCState) <= 768U, "EDM140 bounded NC local bookkeeping plan.");
+    bool IsEDM140AssignmentCandidateSameThread(const NCParsedBlock& block, int pc) const noexcept;
+    bool AuthorizeEDM140AssignmentSameThread(const NCParsedBlock& block, int pc) noexcept;
+    bool ValidateEDM140AssignmentSameThread(const NCParsedBlock& block, int pc,
+        const NCMacroAssignmentCommit& assignment) const noexcept;
+    bool CompleteEDM140AssignmentSameThread(const NCParsedBlock& block, int pc,
+        const NCMacroAssignmentCommit& assignment, const NCProgramCommitSnapshot& commit) noexcept;
+    struct EDM141NCState
+    {
+        std::array<EDM141::Row, EDM141::RowCapacity> rows{};
+        std::array<double, EDM140::AssignmentCapacity> assignmentValues{};
+        unsigned plannedRows = 0U, expressionRows = 0U, verifiedRows = 0U;
+    } m_edm141{};
+    static_assert(sizeof(EDM141NCState) <= 16384U, "EDM141 bounded NC frozen geometry provenance.");
+    bool IsEDM141MotionCandidateSameThread(const NCParsedBlock& block, int pc) noexcept;
+    bool MatchesEDM141MotionSameThread(const NCParsedBlock& parsed, const NCBlock& resolved, int pc) noexcept;
     struct EDM129NCState
     {
         EDM129::Binding sourceBinding{};
         bool sourceBound = false;
     } m_edm129{};
     static_assert(sizeof(EDM129NCState) <= 384U, "EDM129 immutable physical source admission evidence.");
-    bool IsEDM129SourceCurrentSameThread(const EDM126::MotionFeedback* history = nullptr) const noexcept;
+    bool IsEDM129SourceCurrentSameThread(const EDM126::MotionFeedback* history = nullptr, EDM146::Failure* observation = nullptr) const noexcept;
     bool IsEDM129CurrentSameThread(unsigned completed) const noexcept;
     bool AuthorizeEDM129SameThread(const NCBlock& block, int gcode, const std::array<double, 2U>& center) noexcept;
     bool RetainEDM129CompletedSameThread(const EDM94::Feedback& guard) noexcept;
@@ -2776,6 +2964,7 @@ private:
     } m_edm127{};
     static_assert(sizeof(EDM127NCState) <= 384U, "EDM127 bounded NC modal plan and committed selection.");
     bool IsEDM127SelectionBoundarySameThread(int pc) noexcept;
+    bool CheckEDM146SelectionBoundarySameThread(int pc, EDM146::Failure& observation) noexcept;
     bool PrepareEDM127RowSameThread(const NCBlock& block) noexcept;
     bool ProcessEDM127BlockSameThread(const NCBlock& input, NCBlock& geometry, bool& settingOnly) noexcept;
     void LogEDM127SameThread(const char* event, unsigned step) const noexcept;
@@ -2847,6 +3036,17 @@ private:
     void InvalidateEDM109CommonPathSameThread(const char* reason) noexcept;
     bool RetainEDM109CompletedSameThread(const EDM94::Feedback& observed) noexcept;
     bool IsEDM109CompleteSameThread() noexcept;
+    struct EDM149Confirmation
+    {
+        std::uint64_t run=0ULL,cache=0ULL,dispatch=0ULL,startRequests=0ULL;
+        int armPC=-1;
+        unsigned arm=0U;
+        bool waiting=false,confirmed=false;
+    } m_edm149Confirmation{};
+    bool IsEDM149ConfirmationBlockSameThread(const NCParsedBlock& block, int pc) const noexcept;
+    void CaptureEDM149ConfirmationSameThread(int pc, NCBlockDispatchId dispatch) noexcept;
+    void CommitEDM149ConfirmationResumeSameThread() noexcept;
+    bool ConsumeEDM149ConfirmationSameThread(int armPC) noexcept;
     std::uint64_t m_edm94Serial = 0ULL;
     bool IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block) noexcept;
     bool InspectEDM94ProgramSameThread() noexcept;
@@ -2870,6 +3070,37 @@ private:
     bool ServiceEDM106PhaseHoldSameThread(const EDM96::Feedback& feedback) noexcept;
     void LogEDM106InterruptionSameThread(const char* event, const char* reason) const noexcept;
     bool IsEDM97TuningCurrentSameThread(const EDM96::Feedback& feedback) const noexcept;
+    struct EDM157NCState
+    {
+        EDM157::Scope scope{};
+        EDM157::Feedback feedback{};
+        std::uint64_t holdSequence=0ULL, startFloor=0ULL, resumeStartSequence=0ULL;
+        std::uint64_t requestTick=0ULL, lastTick=0ULL;
+        std::uint64_t safetyProvenance=0ULL, alarmIntent=0ULL;
+        std::uint32_t alarmUpdate=0U;
+        int pc=-1;
+        bool active=false, resumePending=false, readyLogged=false;
+    } m_edm157{};
+    std::uint64_t m_edm157HoldSerial=0ULL;
+    std::uint64_t m_edm165AutoHoldSession=0ULL;
+    std::uint64_t m_edm168AutoHoldResumedSession=0ULL;
+    struct EDM169NCState
+    {
+        std::uint64_t session=0ULL,requestSequence=0ULL,inputSequence=0ULL,loggedInputSequence=0ULL;
+        double voltageV=0.0;
+        bool appliedLogged=false;
+    } m_edm169{};
+    bool IsEDM169ManualScopeCurrentSameThread() const noexcept;
+    bool QueueEDM169ManualVoltageSameThread(double voltageV,std::uint64_t inputSequence) noexcept;
+    void ServiceEDM169ManualVoltageSameThread(bool feedbackCurrent) noexcept;
+    bool IsEDM157ScopeCurrentSameThread(const EDM157::Scope& scope) noexcept;
+    bool CaptureEDM157ScopeSameThread(EDM157::Scope& scope) noexcept;
+    bool TryHoldEDM157SameThread() noexcept;
+    bool TryResumeEDM157SameThread() noexcept;
+    bool ServiceEDM157SameThread(bool feedbackCurrent);
+    void ServiceEDM165AutoFlushHoldSameThread(bool feedbackCurrent);
+    bool IsEDM168AutoHoldCheckpointCompleteSameThread() const noexcept;
+    void LogEDM157SameThread(const char* event, const char* reason) const noexcept;
     void ServiceEDM94SameThread();
     void CompleteEDM94ProgramEndSameThread(const NCProgramEndGateSnapshot& end,
         MotionExecutionEpoch executionEpoch) noexcept;
@@ -2948,6 +3179,12 @@ private:
     bool IsXYZCFeedProfileCurrentSameThread() const noexcept;
     bool IsEccentricCFeedProfileCurrentSameThread() const noexcept;
     bool IsEccentricCFeedReceiptCurrentSameThread() const noexcept;
+    bool IsEDM149ZFeedSameThread() const noexcept;
+    bool IsEDM149ZFeedBlockSameThread(const NCBlock& block) const noexcept;
+    bool IsEDM150XYZFeedSameThread() const noexcept;
+    bool IsEDM150XYZFeedBlockSameThread(const NCBlock& block) const noexcept;
+    bool IsEDM154SparseFeedSameThread() const noexcept;
+    bool IsEDM154SparseFeedBlockSameThread(const NCBlock& block) const noexcept;
     WaitConditionFunc StartPathCoreXYZCUVFeedSameThread(const NCBlock& block);
     bool IsXYZCUVFeedProfileCurrentSameThread() const noexcept;
     void CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId,

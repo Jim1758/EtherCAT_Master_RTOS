@@ -13,6 +13,7 @@
 #include "EtherCatRxForensics.h" // DC-RX.4A - owner-safe incident/ESC snapshots
 #include "EtherCatRxForensicsDiagContract.h" // DC-RX.4B - Windows read-only SHM bridge
 #include "EtherCatP64DeferredDiagnostics.h" // DC-DIAG.2 - P64 numeric event handoff
+#include "EDM144RuntimeTiming.h"
 #include "HMI_Bridge.h"    // 🌟 1. 引入橋接器
 #include "AlarmManager.h"
 #include "PLCManager.h" // 🌟 1. 引入 PLC 管理器標頭檔
@@ -5280,6 +5281,111 @@ namespace
     }
 
 
+    // EDM144: sampled elapsed time, grouped by owner at the two callback
+    // endpoints. Owner changes and invalid PDOs have separate buckets. Each
+    // phase maximum is independent; maxima must not be added or treated as WCET.
+    OSCARMAX_DIAG_NOINLINE void PrintEDM144RuntimeTiming()
+    {
+        static EDM144::Snapshot snapshot{};
+        static std::uint64_t lastPublication=0ULL;
+        std::uint64_t publication=0ULL;
+        if (!EDM144::ReadRuntimeTiming(snapshot, publication) || !publication ||
+            publication==lastPublication) return;
+        lastPublication=publication;
+        RtPrintf("[EDM144] event=PHASE_WINDOW window=%llu pub=%llu firstCycle=%llu lastCycle=%llu attempted=%u accepted=%u rejected=%u stride=%u elapsedNotCpu=1 sampledMaxOnly=1 collectorTailExcluded=1\n",
+            static_cast<unsigned long long>(snapshot.windowId),
+            static_cast<unsigned long long>(publication),
+            static_cast<unsigned long long>(snapshot.firstCycle),
+            static_cast<unsigned long long>(snapshot.lastCycle),
+            static_cast<unsigned>(snapshot.attempted), static_cast<unsigned>(snapshot.accepted),
+            static_cast<unsigned>(snapshot.rejected), static_cast<unsigned>(EDM144::Stride));
+        for (unsigned bucket=0U; bucket<EDM144::BucketCount; ++bucket)
+        {
+            const auto& s=snapshot.buckets[bucket];
+            if (!s.count) continue;
+            const auto mean=[&s](unsigned phase) noexcept {
+                return static_cast<unsigned long long>(s.sumNs[phase]/s.count);
+            };
+            RtPrintf("[EDM144] event=PHASE_AVG window=%llu bucket=%s samples=%u preWireNs=%llu wireNs=%llu postRxNs=%llu observeNs=%llu interpNs=%llu axesNs=%llu tailNs=%llu totalNs=%llu over250=%u\n",
+                static_cast<unsigned long long>(snapshot.windowId), EDM144::BucketName(bucket),
+                static_cast<unsigned>(s.count), mean(EDM144::PreWire), mean(EDM144::Wire),
+                mean(EDM144::PostRx), mean(EDM144::Observe), mean(EDM144::Interpolation),
+                mean(EDM144::Axes), mean(EDM144::Tail), mean(EDM144::Total),
+                static_cast<unsigned>(s.over250));
+            RtPrintf("[EDM144] event=PHASE_MAX window=%llu bucket=%s samples=%u preWireNs=%llu wireNs=%llu postRxNs=%llu observeNs=%llu interpNs=%llu axesNs=%llu tailNs=%llu totalNs=%llu\n",
+                static_cast<unsigned long long>(snapshot.windowId), EDM144::BucketName(bucket),
+                static_cast<unsigned>(s.count),
+                static_cast<unsigned long long>(s.maxNs[EDM144::PreWire]),
+                static_cast<unsigned long long>(s.maxNs[EDM144::Wire]),
+                static_cast<unsigned long long>(s.maxNs[EDM144::PostRx]),
+                static_cast<unsigned long long>(s.maxNs[EDM144::Observe]),
+                static_cast<unsigned long long>(s.maxNs[EDM144::Interpolation]),
+                static_cast<unsigned long long>(s.maxNs[EDM144::Axes]),
+                static_cast<unsigned long long>(s.maxNs[EDM144::Tail]),
+                static_cast<unsigned long long>(s.maxNs[EDM144::Total]));
+        }
+    }
+
+    // EDM142: one small P50 record from the existing published PDO window.
+    // These are elapsed callback times (including waits), not OS CPU usage.
+    // The runtime completes exactly 4000 valid timestamp samples per Exec
+    // window. NC/owner values below are observations now, not window labels.
+    OSCARMAX_DIAG_NOINLINE void PrintEDM142PdoTiming(
+        const NCManager* nc, const MotionCore* motion)
+    {
+        if (nc == nullptr || motion == nullptr) return;
+        static LONG lastPrintedSequence = 0;
+        const LONG sequenceBefore = g_pdoRtDiagSequence;
+        if (sequenceBefore == 0 || (sequenceBefore & 1) != 0 ||
+            sequenceBefore == lastPrintedSequence) return;
+
+        static uint64_t frequency = 0ULL;
+        if (frequency == 0ULL)
+        {
+            LARGE_INTEGER value{};
+            if (!RtQueryPerformanceFrequency(&value) || value.QuadPart <= 0) return;
+            frequency = static_cast<uint64_t>(value.QuadPart);
+        }
+        LARGE_INTEGER counter{};
+        if (!RtQueryPerformanceCounter(&counter) || counter.QuadPart < 0) return;
+        const uint64_t now = static_cast<uint64_t>(counter.QuadPart);
+        static uint64_t lastPrintedTicks = 0ULL;
+        static bool havePrinted = false;
+        if (havePrinted)
+        {
+            if (now < lastPrintedTicks)
+            {
+                lastPrintedTicks = now;
+                return;
+            }
+            if (now - lastPrintedTicks < frequency) return;
+        }
+
+        // One bounded copy, no retry and no writes to RT-owned statistics.
+        MemoryBarrier();
+        const LONGLONG timerAvgNs = g_pdoRtTimerAvgNs;
+        const LONGLONG execAvgNs = g_pdoRtExecAvgNs;
+        const LONGLONG execMaxNs = g_pdoRtExecMaxNs;
+        const LONG over250 = g_pdoRtExecOver250Count;
+        const LONG over300 = g_pdoRtExecOver300Count;
+        const LONG over400 = g_pdoRtExecOver400Count;
+        MemoryBarrier();
+        const LONG sequenceAfter = g_pdoRtDiagSequence;
+        if (sequenceBefore != sequenceAfter || (sequenceAfter & 1) != 0) return;
+
+        const unsigned ncNow = static_cast<unsigned>(nc->GetState());
+        const auto ownerNow = motion->GetMotionOwnerLease();
+        lastPrintedSequence = sequenceAfter;
+        lastPrintedTicks = now;
+        havePrinted = true;
+        RtPrintf("[EDM142] event=PDO_TIMING seq=%ld execSamples=4000 timerAvgNs=%lld execAvgNs=%lld execMaxNs=%lld over250=%ld over300=%ld over400=%ld ncNow=%u ownerNow=%u elapsedNotCpu=1\n",
+            static_cast<long>(sequenceAfter), static_cast<long long>(timerAvgNs),
+            static_cast<long long>(execAvgNs), static_cast<long long>(execMaxNs),
+            static_cast<long>(over250), static_cast<long>(over300), static_cast<long>(over400),
+            ncNow, static_cast<unsigned>(ownerNow.owner));
+    }
+
+
     OSCARMAX_DIAG_NOINLINE void RunEtherCatDiagnosticPublishers(
         EtherCatMaster* masterCore)
     {
@@ -5589,7 +5695,10 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         // DC-DIAG.1 - bounded, staggered Priority-50 diagnostic publishing.
         // The scheduler performs no EtherCAT transaction and keeps every
         // diagnostic family behind an explicit non-inline call boundary.
-        RunEtherCatDiagnosticPublishers(this);
+        // EDM173 FIX8: pause optional diagnostic mirrors/text for the A/B run.
+        // Engineering service, HMI/NC/PLC and timing evidence continue below.
+        if (!m_NC->IsEDM173DiagnosticQuietSameThread())
+            RunEtherCatDiagnosticPublishers(this);
 
         // Stage 12F.3B.3 - non-blocking CoE/SDO engineering service bridge.
         // It only submits/polls the existing PDO-owner async command slot.
@@ -5649,6 +5758,8 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         {
             timer_1000ms = 0; // 執行完立刻歸零
             timer_1000ms_Count += 1;
+            PrintEDM142PdoTiming(m_NC, &m_Motion);
+            PrintEDM144RuntimeTiming();
             HMI_Bridge::ProcessTask_1000ms(m_NC); // 呼叫 1000ms 任務
 
             // HOME 成功時 HomingManager 只 Queue 記憶體資料。

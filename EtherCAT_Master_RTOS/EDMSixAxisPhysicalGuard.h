@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -33,6 +34,20 @@ namespace EDM94
     // Admission at a completed endpoint, not the zero-output physical stop proof.
     static constexpr std::uint32_t BoundaryReadyCycles = 200U;
     static constexpr std::uint64_t MaximumDurationUs = 120000000ULL;
+    // Only the explicitly bound five-millimetre commissioning profile uses
+    // this longer window. Ordinary GAP/motion retains the original deadline.
+    static constexpr double VisibleFlushReferenceMmSec = 0.065;
+    static constexpr double VisibleXYZMachiningReferenceMmSec = 0.002;
+    static constexpr double VisibleSixRotaryReferenceNativeSec = 0.1;
+    static constexpr double VisibleFlushAdmissionSeconds = 175.0;
+    static constexpr std::uint64_t VisibleFlushMaximumDurationUs = 180000000ULL;
+    // Explicit frozen identity, not the duration, selects an extended lift.
+    inline double VisibleFlushHeightMm(unsigned profile) noexcept
+    { return profile == 1U ? 5.0 : (profile == 2U || profile == 3U || profile == 4U) ? 2.0 : 0.0; }
+    inline std::uint64_t VisibleFlushDurationUs(unsigned profile) noexcept
+    { return profile == 1U ? VisibleFlushMaximumDurationUs : (profile == 2U || profile == 3U || profile == 4U) ? MaximumDurationUs : 0ULL; }
+    inline unsigned VisibleFlushRequiredMask(unsigned profile) noexcept
+    { return profile == 1U ? 4U : profile == 2U ? 7U : profile == 3U ? AllAxes : profile == 4U ? 7U : 0U; }
 
     enum class State : std::uint8_t
     { Idle, Armed, Running, Finishing, Zeroing, Stopped, Cancelled, Faulted, Released };
@@ -246,7 +261,9 @@ namespace EDM94
         AdmissionAxisHealth_IDLE_GAIN_SIGN = 1U << 20U,
         AdmissionAxisHealth_MAX_INTEGRAL = 1U << 21U,
         AdmissionAxisHealth_TRAVEL_RANGE = 1U << 22U,
-        AdmissionAxisHealth_WRITABLE = 1U << 23U
+        AdmissionAxisHealth_WRITABLE = 1U << 23U,
+        AdmissionAxisHealth_FLUSH_GAIN_FINITE = 1U << 24U,
+        AdmissionAxisHealth_FLUSH_GAIN_SIGN = 1U << 25U
     };
     inline const char* AdmissionAxisHealthName(std::uint32_t failures) noexcept
     {
@@ -274,6 +291,8 @@ namespace EDM94
         if (failures & AdmissionAxisHealth_MAX_INTEGRAL) return "MAX_INTEGRAL";
         if (failures & AdmissionAxisHealth_TRAVEL_RANGE) return "TRAVEL_RANGE";
         if (failures & AdmissionAxisHealth_WRITABLE) return "WRITABLE";
+        if (failures & AdmissionAxisHealth_FLUSH_GAIN_FINITE) return "FLUSH_GAIN_FINITE";
+        if (failures & AdmissionAxisHealth_FLUSH_GAIN_SIGN) return "FLUSH_GAIN_SIGN";
         return failures ? "UNKNOWN" : "NONE";
     }
     struct AxisAdmissionDiagnostic
@@ -406,6 +425,34 @@ namespace EDM94
     };
     static_assert(sizeof(RuntimeDiagnostic) + sizeof(StopDiagnostic) <= 300U, "FIX3 diagnostic budget.");
 
+    // FIX2 observation only. The controller sample is a local, pre-guard
+    // proposal; the separately dated accepted image is not a drive ACK.
+    struct AxisControlSample
+    {
+        Identity identity{};
+        std::uint64_t tick = 0ULL, nowUs = 0ULL;
+        double commandPulse = 0.0, actualPulse = 0.0, referenceVelocityPps = 0.0;
+        double kp = 0.0, ki = 0.0, kvff = 0.0;
+        // Candidate integral after Evaluate; a later output clamp may roll it back.
+        double integralBefore = 0.0, integralAfter = 0.0;
+        double pTerm = 0.0, iTerm = 0.0, logicalOutputVelocityPps = 0.0;
+    };
+    enum FaultAxisFlag : std::uint32_t
+    {
+        FaultAxis_FRAME = 1U, FaultAxis_CONTROL = 2U,
+        FaultAxis_ACCEPTED_IMAGE = 4U, FaultAxis_CONTROL_PRIOR = 8U
+    };
+    struct FaultAxisDiagnostic
+    {
+        AxisControlSample control{};
+        Identity acceptedIdentity{};
+        std::uint64_t acceptedTick = 0ULL, acceptedSourceNowUs = 0ULL;
+        double commandPulse = 0.0, actualPulse = 0.0, followingErrorPulse = 0.0;
+        double windowPulse = 0.0, pulsePerUnit = 0.0;
+        std::int32_t acceptedCsv = 0, hardwareSign = 0;
+        std::uint32_t flags = 0U, axis = AxisCount;
+    };
+
     struct AxisConfig
     {
         double pulsePerUnit = 0.0;
@@ -416,6 +463,100 @@ namespace EDM94
         std::uint64_t mappingFingerprint = 0ULL;
         std::int32_t hardwareSign = 0;
     };
+    // Budget the configured PI's complete frozen following window and
+    // integral bound before admitting the visible profile. This grants no
+    // output: the existing serialized cap and following trip remain active.
+    inline bool VisibleServoHeadroomFits(double pulsePerUnit, double serializedCapPps,
+        double followingWindowPulse, double kp, double ki, double kvff, double maxIntegral,
+        double referenceMmSec = VisibleFlushReferenceMmSec) noexcept
+    {
+        if (!std::isfinite(pulsePerUnit) || pulsePerUnit <= 0.0 ||
+            !std::isfinite(serializedCapPps) || serializedCapPps < 1.0 ||
+            serializedCapPps > static_cast<double>((std::numeric_limits<std::int32_t>::max)()) ||
+            std::floor(serializedCapPps) != serializedCapPps ||
+            !std::isfinite(followingWindowPulse) || followingWindowPulse <= 0.0 ||
+            !std::isfinite(kp) || kp < 0.0 || !std::isfinite(ki) || ki < 0.0 ||
+            !std::isfinite(kvff) || kvff < 0.0 ||
+            !std::isfinite(maxIntegral) || maxIntegral < 0.0 ||
+            !std::isfinite(referenceMmSec) || referenceMmSec <= 0.0 ||
+            referenceMmSec > VisibleFlushReferenceMmSec) return false;
+        const double nativeCap = pulsePerUnit * NativeVelocityLimit(2U);
+        const double feedforward = referenceMmSec * pulsePerUnit * kvff;
+        const double proportional = kp * followingWindowPulse;
+        const double integral = ki * maxIntegral;
+        const double reserve = 0.004 * pulsePerUnit;
+        const double required = feedforward + proportional + integral;
+        const double available = serializedCapPps - reserve;
+        return std::isfinite(nativeCap) && serializedCapPps <= nativeCap &&
+            std::isfinite(feedforward) && std::isfinite(proportional) && std::isfinite(integral) &&
+            std::isfinite(reserve) && std::isfinite(required) && std::isfinite(available) &&
+            available > 0.0 && required <= available;
+    }
+
+    // Only the bound two-mm XYZ profile's machining X/Y axes use the
+    // configured CNC PI with its existing post-PI cap and I rollback.
+    // The complete P/I bound must be arithmetically finite; it is not an
+    // assertion that every allowed following error avoids saturation.
+    inline bool BoundedXYMachiningServoFits(double pulsePerUnit, double serializedCapPps,
+        double followingWindowPulse, double kp, double ki, double kd,
+        double kvff, double maxIntegral) noexcept
+    {
+        if (!std::isfinite(pulsePerUnit) || pulsePerUnit <= 0.0 ||
+            !std::isfinite(serializedCapPps) || serializedCapPps < 1.0 ||
+            serializedCapPps > static_cast<double>((std::numeric_limits<std::int32_t>::max)()) ||
+            std::floor(serializedCapPps) != serializedCapPps ||
+            !std::isfinite(followingWindowPulse) || followingWindowPulse <= 0.0 ||
+            !std::isfinite(kp) || kp <= 0.0 || !std::isfinite(ki) || ki < 0.0 ||
+            !std::isfinite(kd) || kd < 0.0 || !std::isfinite(kvff) || kvff < 0.0 ||
+            !std::isfinite(maxIntegral) || maxIntegral < 0.0) return false;
+        const double nativeCap = pulsePerUnit * NativeVelocityLimit(2U);
+        const double nativeWindow = 0.001 * pulsePerUnit;
+        const double feedforward = VisibleXYZMachiningReferenceMmSec * pulsePerUnit * kvff;
+        const double proportional = kp * followingWindowPulse;
+        const double integral = ki * maxIntegral;
+        const double worstSum = feedforward + proportional + integral;
+        const double reserve = 0.004 * pulsePerUnit;
+        const double available = serializedCapPps - reserve;
+        return std::isfinite(nativeCap) && serializedCapPps <= nativeCap &&
+            std::isfinite(nativeWindow) && followingWindowPulse <= nativeWindow &&
+            std::isfinite(feedforward) && std::isfinite(proportional) && std::isfinite(integral) &&
+            std::isfinite(worstSum) && std::isfinite(reserve) && std::isfinite(available) &&
+            available > 0.0 && feedforward <= available;
+    }
+
+    // The explicit six-axis two-mm profile keeps the ordinary rotary CSV
+    // cap and post-PI rollback. Its fixed XYZCUV line is below 0.1 native
+    // units/s on each rotary component; C/U/V stay fixed during the B1 lift.
+    // Finite PI bounds validate configuration without assuming an unloaded
+    // rotary following window can always avoid saturation.
+    inline bool BoundedRotaryMachiningServoFits(unsigned axis, double pulsePerUnit,
+        double serializedCapPps, double followingWindowPulse, double kp, double ki,
+        double kd, double kvff, double maxIntegral) noexcept
+    {
+        if (axis < 3U || axis >= AxisCount ||
+            !std::isfinite(pulsePerUnit) || pulsePerUnit <= 0.0 ||
+            !std::isfinite(serializedCapPps) || serializedCapPps < 1.0 ||
+            serializedCapPps > static_cast<double>((std::numeric_limits<std::int32_t>::max)()) ||
+            std::floor(serializedCapPps) != serializedCapPps ||
+            !std::isfinite(followingWindowPulse) || followingWindowPulse <= 0.0 ||
+            !std::isfinite(kp) || kp <= 0.0 || !std::isfinite(ki) || ki < 0.0 ||
+            !std::isfinite(kd) || kd < 0.0 || !std::isfinite(kvff) || kvff < 0.0 ||
+            !std::isfinite(maxIntegral) || maxIntegral < 0.0) return false;
+        const double nativeCap = pulsePerUnit * NativeVelocityLimit(axis);
+        const double nativeWindow = 0.005 * pulsePerUnit;
+        const double feedforward = VisibleSixRotaryReferenceNativeSec * pulsePerUnit * kvff;
+        const double proportional = kp * followingWindowPulse;
+        const double integral = ki * maxIntegral;
+        const double worstSum = feedforward + proportional + integral;
+        const double reserve = 0.004 * pulsePerUnit;
+        const double available = serializedCapPps - reserve;
+        return std::isfinite(nativeCap) && serializedCapPps <= nativeCap &&
+            std::isfinite(nativeWindow) && followingWindowPulse <= nativeWindow &&
+            std::isfinite(feedforward) && std::isfinite(proportional) && std::isfinite(integral) &&
+            std::isfinite(worstSum) && std::isfinite(reserve) && std::isfinite(available) &&
+            available > 0.0 && feedforward <= available;
+    }
+
     // FIX12: reuse the formal NC settle range policy on the tighter frozen
     // EDM94 following window. This is bounded encoder motion over the dwell,
     // not proof of mathematically zero velocity or a following-trip bypass.
@@ -436,6 +577,8 @@ namespace EDM94
         AxisConfig axis[AxisCount]{};
         std::uint64_t maxDurationUs = MaximumDurationUs;
         std::uint64_t maxSourceGapUs = 2000ULL;
+        bool visibleZFlush158 = false; // Frozen B1 commissioning-family permission; ABI retained.
+        std::uint8_t commissioningProfile = 0U; // Existing padding: 0 ordinary, 1 five-mm Z, 2 two-mm XYZ, 3 two-mm XYZCUV, 4 G76 two-mm B1.
     };
     struct AxisFrame
     {
@@ -462,11 +605,13 @@ namespace EDM94
         bool sourceFresh = false;
         bool groupIdle = false;
         bool allCommandZero = false;
+        bool visibleZFlushActive158 = false; // Current mapped B1 flush only; never a GAP permit.
         // The caller proves exact current owner/epoch authority. During normal
         // G01 only the frozen AUTO generation and legitimate NC_MEMORY epochs
         // are allowed. Cancellation/release are zero-only safety lifecycles.
         bool authorityCurrent = false;
         bool healthy = false;
+        std::uint8_t mappedFlushProfile = 0U; // Existing padding; current mapped family identity, or zero.
     };
     struct AxisEvidence
     {
@@ -486,6 +631,7 @@ namespace EDM94
     struct Feedback
     {
         RuntimeDiagnostic firstFault{};
+        FaultAxisDiagnostic firstFaultAxis{};
         StopDiagnostic stop{};
         AdmissionDiagnostic admission{};
         Identity identity{};
@@ -520,6 +666,9 @@ namespace EDM94
         std::uint32_t nonzeroSentMask = 0U;
         std::uint32_t actualMovedMask = 0U;
         std::uint32_t commandMovedMask = 0U;
+        // Frozen at admission. All six axes remain in every source, health,
+        // output, following and physical zero/settlement check.
+        std::uint32_t requiredMovementMask = AllAxes;
         std::uint32_t settledCycles = 0U;
         std::uint32_t requiredCycles = RequiredStableCycles;
         unsigned rejectedAxis = AxisCount;
@@ -541,9 +690,34 @@ namespace EDM94
         bool lastTransportAllZero = false;
         bool handoffZero = false;
         std::uint32_t handoffStarted = 0U, handoffCompleted = 0U;
+        // EDM156: the original admission anchors still define the envelope.
+        // Only the last accepted NC row may seal a different finish target.
+        std::array<double, AxisCount> finishTargetPulse{};
+        bool boundedProgram = false;
+        bool finishTargetBound = false;
     };
     static_assert(std::is_trivially_copyable<Feedback>::value, "EDM94 feedback must be POD.");
     static_assert(sizeof(Feedback) <= 4096U, "EDM94 feedback publication budget.");
+
+    // Movement evidence concerns the admitted authored axes. Stationary axes
+    // can still receive ordinary holding PI output and encoder corrections.
+    // That activity cannot substitute for the commanded axis's real motion.
+    inline bool MovementProven(const Feedback& feedback, unsigned expectedMask) noexcept
+    {
+        const bool validMask = feedback.boundedProgram ?
+            (expectedMask <= AllAxes && (expectedMask & 7U) != 0U) :
+            (expectedMask == AllAxes || expectedMask == (1U << 2U) || expectedMask == 7U);
+        // A B1 excursion can move Z even when no nominal NC row moves Z.
+        // It cannot replace evidence for any admitted nominal moving axis.
+        const unsigned allowedMask = feedback.boundedProgram ? expectedMask | 4U : expectedMask;
+        return validMask &&
+            feedback.requiredMovementMask == expectedMask &&
+            ((feedback.nonzeroSentMask | feedback.actualMovedMask | feedback.commandMovedMask) & ~AllAxes) == 0U &&
+            (feedback.nonzeroSentMask & expectedMask) == expectedMask &&
+            (feedback.actualMovedMask & expectedMask) == expectedMask &&
+            (feedback.commandMovedMask & expectedMask) == expectedMask &&
+            (feedback.commandMovedMask & ~allowedMask) == 0U;
+    }
 
     inline const char* StateName(State value) noexcept
     {
@@ -615,10 +789,20 @@ namespace EDM94
                 (m_feedback.stopped && m_feedback.settledCycles >= RequiredStableCycles ? 0U : ReleaseBlock_STOP_NOT_PROVEN);
         }
 
-        bool Arm(const Identity& identity, const Config& config, const Frame& frame) noexcept
+        bool Arm(const Identity& identity, const Config& config, const Frame& frame,
+            unsigned requiredMovementMask = AllAxes, bool boundedProgram = false, bool visibleZFlush158 = false) noexcept
         {
             if (Active()) return false;
             m_feedback = Feedback{};
+            for (unsigned axis = 0U; axis < AxisCount; ++axis)
+            { m_axisControl[axis] = AxisControlSample{}; m_acceptedCsv[axis] = 0; }
+            m_acceptedIdentity = Identity{}; m_acceptedTick = m_acceptedSourceNowUs = 0ULL;
+            const bool validMovementMask = (config.visibleZFlush158 == visibleZFlush158) &&
+                (!visibleZFlush158 || (boundedProgram && requiredMovementMask == VisibleFlushRequiredMask(config.commissioningProfile))) &&
+                !frame.visibleZFlushActive158 && !frame.mappedFlushProfile &&
+                (boundedProgram ? (requiredMovementMask <= AllAxes && (requiredMovementMask & 7U) != 0U) :
+                (requiredMovementMask == AllAxes || requiredMovementMask == (1U << 2U) || requiredMovementMask == 7U));
+            m_feedback.boundedProgram = boundedProgram;
             // Snapshot only this admission attempt. Tick/Send/Cancel/Release
             // never replace it; accepted-session evidence below is unchanged.
             AdmissionDiagnostic admission = frame.admission;
@@ -632,7 +816,7 @@ namespace EDM94
                 (frame.allCommandZero ? 0U : AdmissionGate_COMMAND_ZERO) |
                 (frame.clockValid && frame.tick && frame.nowUs ? 0U : AdmissionGate_CLOCK) |
                 (ValidIdentity(identity) && SameIdentity(identity, frame.identity) ? 0U : AdmissionGate_IDENTITY) |
-                (ValidConfig(config) ? 0U : AdmissionGate_CONFIGURATION);
+                (ValidConfig(config) && validMovementMask ? 0U : AdmissionGate_CONFIGURATION);
             m_feedback.admission = admission;
             m_feedback.identity = identity;
             m_feedback.currentIdentity = frame.identity;
@@ -645,7 +829,8 @@ namespace EDM94
             m_haveStableRange = false;
             if (!ValidIdentity(identity) || !SameIdentity(identity, frame.identity))
                 return RejectArm(Reason::Identity);
-            if (!ValidConfig(config)) return RejectArm(Reason::Configuration);
+            if (!ValidConfig(config) || !validMovementMask) return RejectArm(Reason::Configuration);
+            m_feedback.requiredMovementMask = requiredMovementMask;
             if (!frame.clockValid || frame.tick == 0ULL || frame.nowUs == 0ULL)
                 return RejectArm(Reason::Clock);
             if (!frame.pdoValid || !frame.sourceFresh || !frame.authorityCurrent || !frame.healthy ||
@@ -755,8 +940,17 @@ namespace EDM94
                 const AxisConfig& c = m_feedback.config.axis[axis];
                 const AxisFrame& a = frame.axis[axis];
                 const double limit = NativeExcursionLimit(axis) * c.pulsePerUnit;
-                if (std::abs(a.commandPulse - c.commandAnchor) > limit ||
-                    std::abs(a.actualPulse - c.actualAnchor) > limit)
+                const bool mappedProfile = frame.visibleZFlushActive158 &&
+                    frame.mappedFlushProfile == m_feedback.config.commissioningProfile;
+                const bool visible = axis == 2U && m_feedback.config.visibleZFlush158 &&
+                    mappedProfile && !m_feedback.finishRequested;
+                const double upper = visible ?
+                    (VisibleFlushHeightMm(m_feedback.config.commissioningProfile) + NativeExcursionLimit(axis)) * c.pulsePerUnit : limit;
+                const double commandDelta = a.commandPulse - c.commandAnchor;
+                const double actualDelta = a.actualPulse - c.actualAnchor;
+                if (commandDelta < -limit || commandDelta > upper || actualDelta < -limit || actualDelta > upper ||
+                    (frame.visibleZFlushActive158 && (!m_feedback.config.visibleZFlush158 || !mappedProfile)) ||
+                    (!frame.visibleZFlushActive158 && frame.mappedFlushProfile != 0U))
                 { inEnvelope = false; Fault(Reason::Excursion, axis); }
                 if (HandoffZero()) continue; // A temporary zero bridge earns no movement evidence.
                 AxisEvidence& e = m_feedback.axis[axis];
@@ -782,8 +976,10 @@ namespace EDM94
                     for (unsigned axis = 0U; axis < AxisCount; ++axis)
                     {
                         const AxisConfig& c = m_feedback.config.axis[axis];
-                        returned = returned && std::abs(frame.axis[axis].commandPulse - c.commandAnchor) <= c.followingWindowPulse &&
-                            std::abs(frame.axis[axis].actualPulse - c.commandAnchor) <= c.followingWindowPulse;
+                        const double target = m_feedback.boundedProgram ? m_feedback.finishTargetPulse[axis] : c.commandAnchor;
+                        returned = returned && (!m_feedback.boundedProgram || m_feedback.finishTargetBound) &&
+                            std::abs(frame.axis[axis].commandPulse - target) <= c.followingWindowPulse &&
+                            std::abs(frame.axis[axis].actualPulse - target) <= c.followingWindowPulse;
                     }
                     if (!returned) Fault(Reason::Excursion);
                     else { m_feedback.forceZero = true; m_feedback.state = State::Zeroing; }
@@ -838,6 +1034,15 @@ namespace EDM94
                 evidence.peakPreGuardCsvPps = requestMagnitude;
             if (requestMagnitude > cap && evidence.capClampCount != (std::numeric_limits<std::uint64_t>::max)())
                 ++evidence.capClampCount;
+        }
+
+        // No output, authority or following/settle policy is changed here.
+        void ObserveAxisControlSample(unsigned axis, const AxisControlSample& sample) noexcept
+        {
+            if (!Active() || m_feedback.faulted || axis >= AxisCount ||
+                !ValidIdentity(sample.identity) || sample.identity.session != m_feedback.identity.session ||
+                sample.tick == 0ULL || sample.nowUs == 0ULL) return;
+            m_axisControl[axis] = sample;
         }
 
         bool GuardVelocity(unsigned axis, double& logicalVelocity) noexcept
@@ -909,6 +1114,16 @@ namespace EDM94
                     if (e.nonzeroSentCount != (std::numeric_limits<std::uint64_t>::max)()) ++e.nonzeroSentCount;
                 }
             }
+            // Preserve only a complete exact image whose same-tick transport
+            // was sealed, attempted and NIC-accepted. Source time is RX/image
+            // time, not the NIC completion time and never a drive ACK.
+            if (m_feedback.lastTransportTick == tick && m_feedback.lastTransportSealed &&
+                m_feedback.lastTransportAttempted && m_feedback.lastTransportAccepted)
+            {
+                m_acceptedIdentity = m_sealedIdentity; m_acceptedTick = tick;
+                m_acceptedSourceNowUs = m_feedback.lastNowUs;
+                for (unsigned axis = 0U; axis < AxisCount; ++axis) m_acceptedCsv[axis] = csv[axis];
+            }
             m_feedback.lastSentTick = tick;
             if (m_feedback.sentFrames != (std::numeric_limits<std::uint64_t>::max)()) ++m_feedback.sentFrames;
             if (allZero && m_stopEligible && m_haveStableRange)
@@ -969,9 +1184,27 @@ namespace EDM94
             return true;
         }
 
+        bool BindFinishTarget(const std::array<double, AxisCount>& target) noexcept
+        {
+            if (!Active() || !m_feedback.boundedProgram || m_feedback.finishTargetBound ||
+                m_feedback.finishRequested || m_feedback.forceZero || m_feedback.cancelled || m_feedback.faulted) return false;
+            for (unsigned axis = 0U; axis < AxisCount; ++axis)
+            {
+                const AxisConfig& config = m_feedback.config.axis[axis];
+                const double limit = NativeExcursionLimit(axis) * config.pulsePerUnit;
+                if (!std::isfinite(target[axis]) || !std::isfinite(limit) ||
+                    std::abs(target[axis] - config.commandAnchor) > limit) return false;
+            }
+            m_feedback.finishTargetPulse = target;
+            m_feedback.finishTargetBound = true;
+            return true;
+        }
+
         void Finish() noexcept
         {
             if (!Active() || m_feedback.forceZero) return;
+            if (m_feedback.boundedProgram && !m_feedback.finishTargetBound)
+            { Fault(Reason::Identity); return; }
             ResetBoundaryReadiness();
             m_feedback.finishRequested = true;
             m_feedback.armedReady = false;
@@ -996,6 +1229,7 @@ namespace EDM94
             if (!m_feedback.faulted)
             {
                 m_feedback.firstFault = m_runtimeDiagnostic;
+                CaptureFirstFaultAxis(axis);
                 m_feedback.firstFault.reason = static_cast<std::uint32_t>(reason);
                 if (m_feedback.firstFault.site == 0U) m_feedback.firstFault.site = static_cast<std::uint32_t>(site);
                 if (m_feedback.forceZero) m_feedback.firstFault.flags |= RuntimeFlag_FORCE_ZERO_BEFORE_FAULT;
@@ -1085,6 +1319,8 @@ namespace EDM94
                 !SameIdentity(m_sealedIdentity, frame.identity) ||
                 !SameIdentity(frame.identity, m_lastFrame.identity) ||
                 frame.nowUs != m_feedback.lastNowUs || m_feedback.lastSentTick != frame.tick ||
+                frame.visibleZFlushActive158 != m_lastFrame.visibleZFlushActive158 ||
+                frame.mappedFlushProfile != m_lastFrame.mappedFlushProfile ||
                 !frame.clockValid || !frame.pdoValid || !frame.sourceFresh || !frame.authorityCurrent ||
                 !frame.groupIdle || !frame.allCommandZero || !frame.healthy ||
                 !m_lastFrame.clockValid || !m_lastFrame.pdoValid || !m_lastFrame.sourceFresh ||
@@ -1108,7 +1344,11 @@ namespace EDM94
         }
         static bool ValidConfig(const Config& config) noexcept
         {
-            if (config.maxDurationUs == 0ULL || config.maxDurationUs > MaximumDurationUs ||
+            if (config.commissioningProfile > 4U ||
+                config.visibleZFlush158 != (config.commissioningProfile != 0U) ||
+                config.maxDurationUs == 0ULL ||
+                (config.visibleZFlush158 ? config.maxDurationUs != VisibleFlushDurationUs(config.commissioningProfile) :
+                    config.maxDurationUs > MaximumDurationUs) ||
                 config.maxSourceGapUs == 0ULL || config.maxSourceGapUs > 2000ULL) return false;
             for (unsigned axis = 0U; axis < AxisCount; ++axis)
             {
@@ -1147,7 +1387,7 @@ namespace EDM94
                 std::abs(a.commandPulse - a.actualPulse) <= c.followingWindowPulse;
         }
         bool MovementProven() const noexcept
-        { return m_feedback.nonzeroSentMask == AllAxes && m_feedback.actualMovedMask == AllAxes && m_feedback.commandMovedMask == AllAxes; }
+        { return EDM94::MovementProven(m_feedback, m_feedback.requiredMovementMask); }
         void ObserveFrameDiagnostic(const Frame& frame) noexcept
         {
             m_runtimeDiagnostic = RuntimeDiagnostic{};
@@ -1182,6 +1422,45 @@ namespace EDM94
             stop.configChangedMask = d.configChangedMask; stop.mappingChangedMask = d.mappingChangedMask;
             if (stop.configChangedMask || stop.mappingChangedMask) stop.blockedMask |= StopBlock_CONFIGURATION;
             if (stop.unhealthyMask) stop.blockedMask |= StopBlock_HEALTH;
+        }
+        void CaptureFirstFaultAxis(unsigned axis) noexcept
+        {
+            auto& d = m_feedback.firstFaultAxis;
+            d = FaultAxisDiagnostic{}; d.axis = axis;
+            if (axis >= AxisCount) return;
+            const auto& fault = m_feedback.firstFault;
+            if (m_lastFrame.tick != fault.tick || m_lastFrame.nowUs != fault.nowUs ||
+                !SameIdentity(m_lastFrame.identity, fault.frameIdentity)) return;
+            const auto& a = m_lastFrame.axis[axis]; const auto& c = m_feedback.config.axis[axis];
+            d.commandPulse = a.commandPulse; d.actualPulse = a.actualPulse;
+            d.followingErrorPulse = a.followingErrorPulse; d.windowPulse = c.followingWindowPulse;
+            d.pulsePerUnit = c.pulsePerUnit; d.hardwareSign = c.hardwareSign;
+            d.flags = FaultAxis_FRAME;
+            const auto& control = m_axisControl[axis];
+            const bool sameTick = control.tick == fault.tick && control.nowUs == fault.nowUs &&
+                control.commandPulse == a.commandPulse && control.actualPulse == a.actualPulse;
+            const bool priorTick = control.tick != (std::numeric_limits<std::uint64_t>::max)() &&
+                control.tick + 1ULL == fault.tick && control.nowUs < fault.nowUs &&
+                fault.nowUs - control.nowUs <= m_feedback.config.maxSourceGapUs;
+            const bool finite = std::isfinite(control.commandPulse) && std::isfinite(control.actualPulse) &&
+                std::isfinite(control.referenceVelocityPps) && std::isfinite(control.kp) &&
+                std::isfinite(control.ki) && std::isfinite(control.kvff) &&
+                std::isfinite(control.integralBefore) && std::isfinite(control.integralAfter) &&
+                std::isfinite(control.pTerm) && std::isfinite(control.iTerm) &&
+                std::isfinite(control.logicalOutputVelocityPps);
+            if (finite && control.tick != 0ULL && control.nowUs != 0ULL &&
+                SameIdentity(control.identity, fault.frameIdentity) && (sameTick || priorTick))
+            {
+                d.control = control; d.flags |= FaultAxis_CONTROL;
+                if (!sameTick) d.flags |= FaultAxis_CONTROL_PRIOR;
+            }
+            if (m_acceptedTick != 0ULL && m_acceptedTick <= fault.tick &&
+                m_acceptedSourceNowUs <= fault.nowUs && SameIdentity(m_acceptedIdentity, fault.frameIdentity))
+            {
+                d.acceptedIdentity = m_acceptedIdentity; d.acceptedTick = m_acceptedTick;
+                d.acceptedSourceNowUs = m_acceptedSourceNowUs; d.acceptedCsv = m_acceptedCsv[axis];
+                d.flags |= FaultAxis_ACCEPTED_IMAGE;
+            }
         }
         bool RejectArm(Reason reason) noexcept
         { m_feedback.reason = reason; m_feedback.faulted = true; m_feedback.state = State::Faulted; return false; }
@@ -1229,6 +1508,10 @@ namespace EDM94
             m_haveStableRange = true;
         }
 
+        AxisControlSample m_axisControl[AxisCount]{};
+        Identity m_acceptedIdentity{};
+        std::uint64_t m_acceptedTick = 0ULL, m_acceptedSourceNowUs = 0ULL;
+        std::int32_t m_acceptedCsv[AxisCount]{};
         RuntimeDiagnostic m_runtimeDiagnostic{};
         Feedback m_feedback{};
         Frame m_lastFrame{};

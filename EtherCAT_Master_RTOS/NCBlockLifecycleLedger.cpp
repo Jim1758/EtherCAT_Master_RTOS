@@ -3,6 +3,54 @@
 #include <algorithm>
 #include <limits>
 
+// Only this implementation unit sees the large backing arrays. Array-new
+// default-initializes one bounded element at a time; there is no multi-megabyte
+// aggregate-zero expression in this constructor or any public header.
+struct NCBlockLifecycleLedger::Storage
+{
+    std::unique_ptr<NCBlockLifecycleSnapshot[]> blocks;
+    std::unique_ptr<SegmentIndexEntry[]> segmentIndex;
+
+    Storage() :
+        blocks(new NCBlockLifecycleSnapshot[NC_BLOCK_LIFECYCLE_CAPACITY]),
+        segmentIndex(new SegmentIndexEntry[NC_BLOCK_SEGMENT_INDEX_CAPACITY])
+    {
+    }
+};
+
+NCBlockLifecycleLedger::NCBlockLifecycleLedger() noexcept :
+    m_storage(new Storage)
+{
+}
+
+NCBlockLifecycleLedger::~NCBlockLifecycleLedger() noexcept = default;
+
+// Preserve the former independent value-copy behavior. Production NC owns one
+// ledger and never copies it; these definitions keep even copy initialization
+// out of NCManager's header constructor. Assignment allocates no storage.
+NCBlockLifecycleLedger::NCBlockLifecycleLedger(
+    const NCBlockLifecycleLedger& other) noexcept : NCBlockLifecycleLedger()
+{
+    *this = other;
+}
+
+NCBlockLifecycleLedger& NCBlockLifecycleLedger::operator=(
+    const NCBlockLifecycleLedger& other) noexcept
+{
+    if (this == &other) return *this;
+    for (std::size_t i = 0U; i < NC_BLOCK_LIFECYCLE_CAPACITY; ++i)
+        m_storage->blocks[i] = other.m_storage->blocks[i];
+    for (std::size_t i = 0U; i < NC_BLOCK_SEGMENT_INDEX_CAPACITY; ++i)
+        m_storage->segmentIndex[i] = other.m_storage->segmentIndex[i];
+    m_nextDispatchId = other.m_nextDispatchId;
+    m_lastDispatchedId = other.m_lastDispatchedId;
+    m_lastProgramCommittedId = other.m_lastProgramCommittedId;
+    m_lastMotionCompletedId = other.m_lastMotionCompletedId;
+    m_lastTerminalId = other.m_lastTerminalId;
+    m_counters = other.m_counters;
+    return *this;
+}
+
 namespace
 {
     double ClampBlockProgress(double value) noexcept
@@ -72,7 +120,7 @@ NCBlockLifecycleSnapshot* NCBlockLifecycleLedger::FindMutable(
     }
 
     NCBlockLifecycleSnapshot& snapshot =
-        m_blocks[BlockSlotIndex(dispatchId)];
+        m_storage->blocks[BlockSlotIndex(dispatchId)];
     return snapshot.dispatchId == dispatchId ? &snapshot : nullptr;
 }
 
@@ -85,7 +133,7 @@ const NCBlockLifecycleSnapshot* NCBlockLifecycleLedger::Find(
     }
 
     const NCBlockLifecycleSnapshot& snapshot =
-        m_blocks[BlockSlotIndex(dispatchId)];
+        m_storage->blocks[BlockSlotIndex(dispatchId)];
     return snapshot.dispatchId == dispatchId ? &snapshot : nullptr;
 }
 
@@ -105,7 +153,7 @@ void NCBlockLifecycleLedger::ClearSegmentBindings(
         }
 
         SegmentIndexEntry& index =
-            m_segmentIndex[SegmentSlotIndex(identity.segmentId)];
+            m_storage->segmentIndex[SegmentSlotIndex(identity.segmentId)];
         if (index.valid &&
             index.dispatchId == snapshot.dispatchId &&
             SameMotionIdentity(index.identity, identity))
@@ -126,7 +174,7 @@ NCBlockDispatchId NCBlockLifecycleLedger::BeginBlock(
 
     const NCBlockDispatchId dispatchId = AllocateDispatchId();
     NCBlockLifecycleSnapshot& slot =
-        m_blocks[BlockSlotIndex(dispatchId)];
+        m_storage->blocks[BlockSlotIndex(dispatchId)];
 
     if (slot.IsValid())
     {
@@ -181,7 +229,7 @@ void NCBlockLifecycleLedger::IndexMotionSegment(
     const MotionExecutionIdentity& identity) noexcept
 {
     SegmentIndexEntry& slot =
-        m_segmentIndex[SegmentSlotIndex(identity.segmentId)];
+        m_storage->segmentIndex[SegmentSlotIndex(identity.segmentId)];
 
     if (slot.valid &&
         (!SameMotionIdentity(slot.identity, identity) ||
@@ -318,7 +366,7 @@ NCBlockMotionSegmentSnapshot* NCBlockLifecycleLedger::FindMotionSegment(
     }
 
     SegmentIndexEntry& index =
-        m_segmentIndex[SegmentSlotIndex(identity.segmentId)];
+        m_storage->segmentIndex[SegmentSlotIndex(identity.segmentId)];
     if (!index.valid ||
         !SameMotionIdentity(index.identity, identity))
     {

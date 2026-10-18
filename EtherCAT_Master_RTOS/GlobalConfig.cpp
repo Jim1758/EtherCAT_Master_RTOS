@@ -31,6 +31,7 @@
 #include "EDMConditionStartupIO.h"
 #include "EDMProcessConfigIO.h"
 #include "EDMToolHeadProfileIO.h"
+#include "EDM165FlushPidConfig.h"
 
 
 namespace
@@ -335,6 +336,20 @@ bool GlobalConfig::LoadAxisConfig(const std::string& filePath, std::vector<AxisC
 
 bool GlobalConfig::LoadPIDConfig(const std::string& filePath, std::vector<AxisContext>& axis, MotionCore& motion)
 {
+    EDM171Config::G76CenterReturnSpeeds centerReturn{};
+    std::string centerReturnError="G76_CENTER_RETURN_CONFIG";
+    bool centerReturnLoaded=false;
+    try
+    {
+        centerReturnLoaded=EDM171Config::LoadG76CenterReturnSpeeds(filePath,centerReturn,centerReturnError);
+    }
+    catch(...) { centerReturnLoaded=false; }
+    if (!centerReturnLoaded)
+    {
+        RtPrintf("[EDM171] event=G76_CENTER_RETURN_CONFIG result=REJECT field=%s reason=INVALID_VALUE_OR_READ_ERROR\n",
+            centerReturnError.c_str());
+        return false;
+    }
     //讀取參數確定軸數量-----------------------------------------------------------------
     int axisCount = System_axisCount;
     DEBUG_PRINT("LoadPIDConfig Axis Count>>%d\n", axisCount);
@@ -369,9 +384,37 @@ bool GlobalConfig::LoadPIDConfig(const std::string& filePath, std::vector<AxisCo
             //axis[i].Pid_G00.Ki = 10;
             axis[i].Pid_G00.Kd = ConfigUtil::ReadParam(filePath, prefix + "Kd_G00", 0.0);
             axis[i].Pid_G00.Kvff = ConfigUtil::ReadParam(filePath, prefix + "Kvff_G00", 1.0);
+
+            // EDM165: missing FLUSH fields inherit this axis's CNC gains.
+            // Commit only the four gains; existing PID history/limits stay owned
+            // by the ordinary servo loop and the existing safety configuration.
+            EDM165Config::FlushGains fallback{};
+            fallback.Kp=axis[i].Pid_G00.Kp; fallback.Ki=axis[i].Pid_G00.Ki;
+            fallback.Kd=axis[i].Pid_G00.Kd; fallback.Kvff=axis[i].Pid_G00.Kvff;
+            EDM165Config::FlushGains flush{};
+            std::string flushErrorKey=prefix+"FLUSH_CONFIG";
+            bool flushLoaded=false;
+            try
+            {
+                flushLoaded=EDM165Config::LoadAxisFlushGains(filePath,prefix,fallback,flush,flushErrorKey);
+            }
+            catch(...) { flushLoaded=false; }
+            if(!flushLoaded)
+            {
+                DEBUG_PRINT("[EDM165] event=FLUSH_PID_CONFIG result=REJECT axis=%d field=%s reason=INVALID_VALUE_OR_READ_ERROR\n",
+                    i,flushErrorKey.c_str());
+                return false;
+            }
+            axis[i].Pid_FLUSH.Kp=flush.Kp; axis[i].Pid_FLUSH.Ki=flush.Ki;
+            axis[i].Pid_FLUSH.Kd=flush.Kd; axis[i].Pid_FLUSH.Kvff=flush.Kvff;
+            axis[i].edmFlushGainSelected=false;
         }
     }
 
+
+    m_g76CenterReturnSpeeds=centerReturn;
+    RtPrintf("[EDM171] event=G76_CENTER_RETURN_CONFIG result=READY B3mmMin=%.9g B4mmMin=%.9g zero=INHERIT_F phases=TO_CENTER_AND_FINISH_CENTER units=PHYSICAL_MM_MIN load=BOOT reload=RESTART output=NONE\n",
+        centerReturn.b3MmMin,centerReturn.b4MmMin);
 
     return true;
 }

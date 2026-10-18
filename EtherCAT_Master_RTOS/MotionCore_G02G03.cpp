@@ -292,8 +292,26 @@ bool MotionCore::TryG02G03MoveTransactionalCncTail(
     if (!edm114Authorized)
     { result.code = MotionFeedArcCode::NOT_READY; return false; }
     const bool edm114Scoped = edm114Authorization.session != 0ULL;
+    // EDM155 keeps the ordinary ARC2 producer and full-axis handoff. Only
+    // this independently authorized dry fixture accepts a sparse XY seam;
+    // an omitted endpoint component must have an exact zero authored delta.
+    const bool edm155SparseArc = edm114Scoped && edm114Authorization.historyServo &&
+        edm114Authorization.historyModeFlush && edm114Authorization.workTimeFlush &&
+        (edm114Authorization.historyFixture == EDM149::SparseArcHistoryFixture ||
+            EDM149::IsProgramHistoryFixture(edm114Authorization.historyFixture)) &&
+        edm114Authorization.modePolicy.fixture == (edm114Authorization.historyFixture == EDM149::PauseHistoryFixture ? EDM116::Fixture::ModalPause157 :
+            edm114Authorization.historyFixture == EDM149::XYZVisibleFlushHistoryFixture ? EDM116::Fixture::ModalXYZVisibleFlush159 :
+            edm114Authorization.historyFixture == EDM149::SixVisibleFlushHistoryFixture ? EDM116::Fixture::ModalSixVisibleFlush167 :
+            EDM149::IsProgramHistoryFixture(edm114Authorization.historyFixture) ? EDM116::Fixture::ModalProgram156 :
+            EDM116::Fixture::ModalSparseArc155) &&
+        EDM130::IsMotionTest(edm114Authorization.timerRecipe) &&
+        EDM130::ValidHistoryRecipeBinding(edm114Authorization.historyFixture,edm114Authorization.timerRecipe);
     if (edm114Scoped && (fullCircle || cncFeedLookahead || predecessor != nullptr ||
-        preparedCutterArc || endpointAxisMask != 3U || m_pendingPlaneMode != 17))
+        preparedCutterArc || m_pendingPlaneMode != 17 ||
+        (edm155SparseArc ? (endpointAxisMask == 0U || (endpointAxisMask & ~3U) != 0U ||
+            ((endpointAxisMask & 1U) == 0U && edm114Authorization.increment[0] != 0.0) ||
+            ((endpointAxisMask & 2U) == 0U && edm114Authorization.increment[1] != 0.0)) :
+            endpointAxisMask != 3U)))
     { result.code = MotionFeedArcCode::INVALID_INPUT; return false; }
     if (edm114Scoped)
         for (unsigned i = 2U; i < 6U; ++i)

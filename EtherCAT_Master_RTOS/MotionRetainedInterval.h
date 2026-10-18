@@ -37,8 +37,10 @@ inline bool GetMotionRetainedInterval(const Command& command,
         startU = command.pathCoreRetainedReverse ? 1.0 : 0.0;
         endU = command.pathCoreRetainedReverse ? 0.0 : 1.0;
     }
-    else if (marker == 1.0)
+    else if (marker == 1.0 || marker == 2.0)
     {
+        // Marker 2 is the new finite native compound. Its source/frame
+        // authority is checked separately by the producer and consumer.
         startU = command.mem_transformOrigin[0];
         endU = command.mem_transformOrigin[1];
     }

@@ -2736,6 +2736,7 @@ bool NCManager::IsEDMPathXYZTranslationBlockAllowedSameThread(const NCBlock& blo
 
 bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, int gCode)
 {
+    if (gCode==76 || (m_edm171Air->selected && (gCode==1 || gCode==2 || gCode==3))) return PrepareG76OrbitTranslationSameThread(block);
     // BASE58-BEGIN: repeatable side-effect-free extra-axis XYZ feed policy.
     std::uint32_t xyzFeedPresentMask = 0U;
     for (int axis = 0; axis < 8; ++axis)
@@ -2763,7 +2764,7 @@ bool NCManager::PrepareFixedTranslationMotionSameThread(const NCBlock& block, in
         IsNCXYZCFeedBlockAllowed(xyzFeedSource, block);
     const bool xyzcuvFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
         xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
-        IsNCXYZCUVFeedBlockAllowed(xyzFeedSource, block);
+        (IsNCXYZCUVFeedBlockAllowed(xyzFeedSource, block) || IsEDM149ZFeedBlockSameThread(block) || IsEDM150XYZFeedBlockSameThread(block) || IsEDM154SparseFeedBlockSameThread(block));
     const bool eccentricFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
         xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
         IsNCEccentricCFeedBlockAllowed(xyzFeedSource, block);
@@ -3571,6 +3572,20 @@ bool NCManager::TransitionFixedTranslationSelectionSameThread(const NCBlock& blo
 
 bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
 {
+    if (m_edm171Air->selected && (NCGCodeSemantics::Contains(block,1) || NCGCodeSemantics::Contains(block,2) || NCGCodeSemantics::Contains(block,3)))
+        return IsEDM171AirGrantCurrentSameThread() && IsG76OrbitFrameCurrentSameThread() && !m_g76Orbit->active && IsPathCoreLiveNativeConfigCurrentSameThread();
+    if (NCGCodeSemantics::Contains(block,76)) return IsG76OrbitBlockAllowedSameThread(block);
+    if (m_g76Orbit->active)
+    {
+        RejectG76OrbitSameThread("NEXT_BLOCK_BEFORE_CYCLE_COMPLETION",AlarmManager::PATH_EXECUTION_NOT_READY);
+        return false;
+    }
+    if (m_g76PowerInhibited && NCGCodeSemantics::Contains(block,180)
+        && !IsEDM173BracketBlockSameThread(block))
+    {
+        RejectG76OrbitSameThread("EDM_BRACKET_DURING_AIR_RUN",AlarmManager::G_Code_Invalid_parameter);
+        return false;
+    }
     // EDM94 is a separately preflighted, stopped-only G91 physical bracket.
     // Only its exact P85/P86 scope may bypass the generic retained/GAP ban.
     if (IsEDM94TranslationBracketAllowedSameThread(block)) return true;
@@ -3617,7 +3632,7 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         IsNCXYZCFeedBlockAllowed(xyzFeedSource, block);
     const bool xyzcuvFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
         xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
-        IsNCXYZCUVFeedBlockAllowed(xyzFeedSource, block);
+        (IsNCXYZCUVFeedBlockAllowed(xyzFeedSource, block) || IsEDM149ZFeedBlockSameThread(block) || IsEDM150XYZFeedBlockSameThread(block) || IsEDM154SparseFeedBlockSameThread(block));
     const bool eccentricFeedAllowed = xyzFeedMemoryBound && xyzFeedRuntimeClear &&
         xyzFeedPresentMask == NCXYZFeedPresentMask(xyzFeedSource.axisIdentity) &&
         IsNCEccentricCFeedBlockAllowed(xyzFeedSource, block);

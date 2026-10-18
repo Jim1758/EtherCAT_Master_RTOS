@@ -7,6 +7,7 @@
 #include "MotionCore.h"
 #include "PLCManager.h"
 #include "NCPLCMap.h"
+#include "EDM149VoltageMotion.h"
 #include "AlarmManager.h"
 #include <rtapi.h>
 
@@ -156,21 +157,31 @@ void NCManager::SyncNCStateToPLC()
         }
     }
 }
-// EDM137: these points are a coherent NC-owned image. A diagnostic fixture
-// may move all six axes but never admits the discharge power supply.
+// EDM139: these points are a coherent NC-owned image. S92 follows the
+// admitted machining session until a lifecycle or positioning fence retires it.
 void NCManager::ForceEDMPLCOutputsOffSameThread(const char* reason) noexcept
 {
     const auto old=m_edm137PLC.Current();
     const auto session=m_edm137PLC.Session();
+    const bool powerInhibited=m_edm137PLC.PowerInhibited();
     m_edm137PLC.Clear();
     if(g_PLC)g_PLC->PublishEDMOutputs(0U);
     if(old.word||old.requested)
-        RtPrintf("[EDM137] event=PLC_OUTPUT session=%llu reason=%s S80=0 S92=0 S93=0 requested=0 inhibited=1 production=0\n",
-            static_cast<unsigned long long>(session),reason?reason:"STOP");
+        RtPrintf("[EDM139] event=PLC_OUTPUT session=%llu reason=%s S80=0 S92=0 S93=0 requested=0 policy=%s\n",
+            static_cast<unsigned long long>(session),reason?reason:"STOP",
+            powerInhibited?"MOTION_ONLY_POWER_INHIBITED":"NORMAL_EDM");
 }
 
 void NCManager::SyncEDMPLCOutputsSameThread() noexcept
 {
+    // EDM173 is motion-only from arm through release, independently of the
+    // AIR latch. Stop before the legacy per-row/epoch arrays are inspected.
+    if (m_g76PowerInhibited || m_edm94.gapHistoryArm == 292U)
+    {
+        ForceEDMPLCOutputsOffSameThread(m_edm94.gapHistoryArm == 292U ?
+            "EDM173_G76_GAP_INHIBITED" : "G76_AIR_RUN_INHIBITED");
+        return;
+    }
     EDM137PLC::Input input{};
     const auto& s=m_edm94;
     const auto& guard=s.feedback;
@@ -188,10 +199,82 @@ void NCManager::SyncEDMPLCOutputsSameThread() noexcept
     const bool handoff=issued&&rows.consumed>rows.acknowledgedRows;
     const bool epochCurrent=issued&&(executionEpoch==issuedEpoch||
         (handoff&&executionEpoch==previousEpoch));
-    // Only the explicit new fixture binds E12. Earlier diagnostics and all
-    // ordinary CNC programs retain an all-OFF image; RUN alone is no permit.
-    const bool fixture=s.gapHistoryArm==202U||s.gapHistoryArm==204U||s.gapHistoryArm==206U||s.gapHistoryArm==208U;
-    const bool live=fixture&&m_state==NCState::RUN&&m_mode==NCOperationMode::MEMORY&&
+    // Only these explicitly admitted EDM profiles bind the power and E12
+    // output image. Other diagnostics and ordinary CNC do not gain a permit.
+    const bool motionOnly=EDM149::IsTestArm(s.gapHistoryArm);
+    const bool fixture=motionOnly||s.gapHistoryArm==202U||s.gapHistoryArm==204U||s.gapHistoryArm==206U||s.gapHistoryArm==208U||
+        s.gapHistoryArm==210U||s.gapHistoryArm==212U||s.gapHistoryArm==214U||s.gapHistoryArm==216U||s.gapHistoryArm==218U||s.gapHistoryArm==220U||s.gapHistoryArm==222U||s.gapHistoryArm==224U||s.gapHistoryArm==226U||s.gapHistoryArm==228U;
+    const bool diagnosticControl=s.gapHistoryArm==210U||s.gapHistoryArm==212U||s.gapHistoryArm==214U||s.gapHistoryArm==216U||s.gapHistoryArm==218U||s.gapHistoryArm==220U||s.gapHistoryArm==226U||s.gapHistoryArm==228U;
+    const bool sourceBound=motionOnly?
+        (EDM130::IsMotionTest(m_edm130.recipe)&&
+            m_edm130.recipe.diagnosticControlSource==EDM149::SourceForArm(s.gapHistoryArm)):
+        m_edm130.recipe.diagnosticControlSource==(diagnosticControl?1U:0U);
+    const unsigned expectedFixture=motionOnly?(EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm)?EDM149::SixVisibleFlushHistoryFixture:EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm)?EDM149::XYZVisibleFlushHistoryFixture:EDM149::IsVisibleFlushTestArm(s.gapHistoryArm)?EDM149::VisibleFlushHistoryFixture:EDM149::IsPauseTestArm(s.gapHistoryArm)?EDM149::PauseHistoryFixture:EDM149::IsProgramTestArm(s.gapHistoryArm)?EDM149::ProgramHistoryFixture:EDM149::IsSparseArcTestArm(s.gapHistoryArm)?EDM149::SparseArcHistoryFixture:EDM149::IsSparseTestArm(s.gapHistoryArm)?EDM149::SparseHistoryFixture:EDM149::IsOrderTestArm(s.gapHistoryArm)?EDM149::OrderHistoryFixture:EDM149::IsArcTestArm(s.gapHistoryArm)?EDM149::ArcHistoryFixture:EDM149::IsSixTestArm(s.gapHistoryArm)?EDM149::SixHistoryFixture:EDM149::IsXYZTestArm(s.gapHistoryArm)?EDM149::XYZHistoryFixture:EDM149::ZHistoryFixture):
+        ((s.gapHistoryArm==204U||s.gapHistoryArm==208U||s.gapHistoryArm==212U||
+            s.gapHistoryArm==216U||s.gapHistoryArm==220U||s.gapHistoryArm==224U||s.gapHistoryArm==228U)?1U:0U);
+    unsigned nominalMovementMask=0U;
+    if(EDM149::IsBoundedProgramTestArm(s.gapHistoryArm)&&s.moves&&s.moves<=16U) {
+        for(unsigned row=0U;row<s.moves;++row) {
+            if(s.authoredGCode[row]==1U) {
+                if(!EDM149::ValidSparseIncrement(s.increment[row],s.feed[row])) {nominalMovementMask=0U;break;}
+                for(unsigned axis=0U;axis<6U;++axis)if(s.increment[row][axis]!=0.0)nominalMovementMask|=1U<<axis;
+            } else if(s.authoredGCode[row]==2U||s.authoredGCode[row]==3U) {
+                bool valid=s.feed[row]==0.12&&(s.increment[row][0]!=0.0||s.increment[row][1]!=0.0);
+                for(unsigned axis=0U;axis<6U;++axis)
+                    valid=valid&&std::isfinite(s.increment[row][axis])&&(axis<2U||s.increment[row][axis]==0.0);
+                if(!valid) {nominalMovementMask=0U;break;}
+                nominalMovementMask|=3U;
+            }
+            else {nominalMovementMask=0U;break;}
+        }
+    }
+    const bool visiblePlan=!EDM149::IsVisibleFlushTestArm(s.gapHistoryArm)||
+        (s.gapModeFixture==EDM116::Fixture::ModalVisibleFlush158&&s.moves==1U&&nominalMovementMask==4U&&
+            s.authoredGCode[0]==1U&&s.feed[0]==0.12&&s.increment[0][2]==-0.0015&&
+            m_edm127.authoredInline[0]&&m_edm127.expectedMode[0]==EDM116::Mode::B1);
+    bool xyzVisiblePlan=true;
+    if(EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm)) {
+        xyzVisiblePlan=s.gapModeFixture==EDM116::Fixture::ModalXYZVisibleFlush159&&s.moves==3U&&
+            nominalMovementMask==7U&&EDM130::IsVisibleFlush159(m_edm130.recipe)&&
+            guard.config.commissioningProfile==2U&&guard.config.visibleZFlush158&&
+            m_edm127.expectedOriginPC[0]==s.pc[0];
+        for(unsigned row=0U;row<3U&&xyzVisiblePlan;++row) {
+            xyzVisiblePlan=s.authoredGCode[row]==row+1U&&s.feed[row]==0.12&&
+                m_edm127.expectedMode[row]==EDM116::Mode::B1&&m_edm127.authoredInline[row]==(row==0U)&&
+                m_edm127.expectedOriginPC[row]==m_edm127.expectedOriginPC[0]&&
+                m_edm127.expectedOriginRevision[row]==m_edm127.expectedOriginRevision[0];
+            for(unsigned axis=0U;axis<6U;++axis) {
+                const double expected=row==0U?(axis==0U?0.0015:axis<3U?-0.0015:0.0):
+                    (axis==0U?(row==1U?0.002:-0.002):0.0);
+                xyzVisiblePlan=xyzVisiblePlan&&s.increment[row][axis]==expected;
+            }
+        }
+    }
+    bool sixVisiblePlan=true;
+    if(EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm)) {
+        sixVisiblePlan=s.gapModeFixture==EDM116::Fixture::ModalSixVisibleFlush167&&s.moves==3U&&
+            nominalMovementMask==63U&&EDM130::IsVisibleFlush167(m_edm130.recipe)&&
+            guard.config.commissioningProfile==3U&&guard.config.visibleZFlush158&&
+            m_edm127.expectedOriginPC[0]==s.pc[0];
+        for(unsigned row=0U;row<3U&&sixVisiblePlan;++row) {
+            sixVisiblePlan=s.authoredGCode[row]==row+1U&&s.feed[row]==0.12&&
+                m_edm127.expectedMode[row]==EDM116::Mode::B1&&m_edm127.authoredInline[row]==(row==0U)&&
+                m_edm127.expectedOriginPC[row]==m_edm127.expectedOriginPC[0]&&
+                m_edm127.expectedOriginRevision[row]==m_edm127.expectedOriginRevision[0];
+            for(unsigned axis=0U;axis<6U;++axis) {
+                const double expected=row==0U?(axis==0U?0.0015:axis<3U?-0.0015:axis==4U?-0.020:0.020):
+                    (axis==0U?(row==1U?0.002:-0.002):0.0);
+                sixVisiblePlan=sixVisiblePlan&&s.increment[row][axis]==expected;
+            }
+        }
+    }
+    const bool programPlan=EDM149::IsBoundedProgramTestArm(s.gapHistoryArm)?
+        (visiblePlan&&xyzVisiblePlan&&sixVisiblePlan&&EDM130::ValidHistoryRecipeBinding(expectedFixture,m_edm130.recipe)&&
+            EDM130::HasBoundProgramPlan(m_edm130.recipe)&&EDM130::ProgramRows(m_edm130.recipe)==s.moves&&
+            EDM130::ProgramMovementMask(m_edm130.recipe)==nominalMovementMask&&
+            guard.boundedProgram&&guard.requiredMovementMask==nominalMovementMask):
+        (!m_edm130.recipe.planRows&&!m_edm130.recipe.planMovementMask&&!m_edm130.recipe.commissioningProfile);
+    const bool live=fixture&&sourceBound&&programPlan&&m_state==NCState::RUN&&m_mode==NCOperationMode::MEMORY&&
         !Close_System_Com_flag&&m_externalReadyInterlock&&!AlarmManager::GetInstance().HasAlarm()&&
         m_resetContinuationPhase==ResetContinuationPhase::IDLE&&s.latched&&s.ready&&s.everArmed&&
         !s.armPending&&!s.complete&&!s.cancelled&&!s.resetSeen&&!s.resetCommitted&&
@@ -207,6 +290,7 @@ void NCManager::SyncEDMPLCOutputsSameThread() noexcept
     if(live) {
         input.session=s.session;input.epoch=s.armEpoch;input.owner=s.lease.generation;
         input.recipe=m_edm130.recipe.generation;input.admitted=true;
+        input.powerInhibited=motionOnly;
         input.polarity=EDM130::FrozenPolarity(m_edm130.recipe.flushStages)!=0U;
         EDM128::MotionFeedback mode{};
         const bool read=m_motion.ReadEDM130Feedback(mode);
@@ -222,12 +306,13 @@ void NCManager::SyncEDMPLCOutputsSameThread() noexcept
         const bool receiptIdentity=receiptRows&&mode.liveEpoch==receiptEpoch&&
             (mode.authorizedRows==rows.consumed||receiptHandoff);
         const bool validReceipt=read&&receiptIdentity&&mode.enabled&&mode.active&&!mode.faulted&&
-            mode.physicalAd&&mode.workTimeFlush&&mode.fixture==((s.gapHistoryArm==204U||s.gapHistoryArm==208U)?1U:0U)&&mode.session==s.session&&mode.armEpoch==s.armEpoch&&
+            mode.physicalAd==!EDM130::UsesSoftwareVoltage(m_edm130.recipe)&&
+            mode.workTimeFlush&&mode.fixture==expectedFixture&&mode.session==s.session&&mode.armEpoch==s.armEpoch&&
             mode.ownerGeneration==s.lease.generation&&guard.identity.session==s.session&&
             guard.identity.epoch==s.armEpoch&&guard.identity.ownerGeneration==s.lease.generation&&
             guard.active&&guard.armAccepted&&!guard.cancelled&&!guard.faulted&&!guard.released&&
             EDM130::SameRecipe(mode.timerRecipe,m_edm130.recipe)&&!mode.coordinator.faulted&&
-            !mode.coordinator.stopped&&mode.authorizedRows<=16U&&mode.completedRows<=mode.authorizedRows;
+            !mode.coordinator.stopped&&mode.authorizedRows<=EDM130::ProgramRows(m_edm130.recipe)&&mode.completedRows<=mode.authorizedRows;
         // Authorization, epoch publication and RT feedback are separate
         // bounded publications. During that one recorded handoff keep the
         // last coherent image; a foreign or unissued epoch still retires it.
@@ -250,14 +335,16 @@ void NCManager::SyncEDMPLCOutputsSameThread() noexcept
     const auto previous=m_edm137PLC.Current();
     const auto previousSession=m_edm137PLC.Session();
     const auto output=m_edm137PLC.Observe(input);
-    // The PLC publication masks S92 again even if an unexpected caller were
-    // to corrupt a logical request. No hardware discharge enable exists here.
+    // Publish one session-owned image. Motion tests retain flush status while
+    // the frozen PLC state prohibits discharge and polarity in every phase.
+    // Generic PLC writes cannot modify these reserved outputs.
     if(g_PLC)g_PLC->PublishEDMOutputs(output.word);
     if(previous.word!=output.word||previous.requested!=output.requested||
         previousSession!=m_edm137PLC.Session())
-        RtPrintf("[EDM137] event=PLC_OUTPUT session=%llu phase=%s S80=%u S92=%u S93=%u requested=%u inhibited=1 production=0\n",
+        RtPrintf("[EDM139] event=PLC_OUTPUT session=%llu phase=%s S80=%u S92=%u S93=%u requested=%u policy=%s\n",
             static_cast<unsigned long long>(input.session?input.session:previousSession),
             input.unavailable?"UNAVAILABLE":EDM128::PhaseName(phase),
             (output.word&EDM137PLC::FlushBit)?1U:0U,(output.word&EDM137PLC::DischargeBit)?1U:0U,
-            (output.word&EDM137PLC::PolarityBit)?1U:0U,output.requested?1U:0U);
+            (output.word&EDM137PLC::PolarityBit)?1U:0U,output.requested?1U:0U,
+            input.powerInhibited?"MOTION_ONLY_POWER_INHIBITED":"NORMAL_EDM");
 }

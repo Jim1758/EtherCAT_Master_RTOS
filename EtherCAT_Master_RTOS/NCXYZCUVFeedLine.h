@@ -1,4 +1,5 @@
 #pragma once
+#include "EDM149VoltageMotion.h"
 
 #include "NCAxisIdentitySnapshot.h"
 #include "NCXYZCUVAbsoluteFeedTarget.h"
@@ -57,6 +58,9 @@ struct NCXYZCUVFeedLineInput
     std::array<double, 3U> rotaryModulo{};
     std::array<bool, 3U> rotaryShortestPath{};
     bool absolute = false;
+    bool zOnlyCommissioning = false;
+    bool xyzOnlyCommissioning = false;
+    bool sparseCommissioning = false;
 };
 
 struct NCXYZCUVFeedLineValue
@@ -74,6 +78,9 @@ struct NCXYZCUVFeedLineValue
     std::array<double, 3U> rotaryModulo{};
     std::array<bool, 3U> rotaryShortestPath{};
     bool absolute = false;
+    bool zOnlyCommissioning = false;
+    bool xyzOnlyCommissioning = false;
+    bool sparseCommissioning = false;
     bool valid = false;
 
     void Clear() noexcept
@@ -86,6 +93,9 @@ struct NCXYZCUVFeedLineValue
         rotaryFeedDegMin.fill(0.0); accTime = decTime = 0.0;
         absoluteTargetWCS.fill(0.0); absoluteTargetMCS.fill(0.0);
         rotaryModulo.fill(0.0); rotaryShortestPath.fill(false); absolute = false;
+        zOnlyCommissioning = false;
+        xyzOnlyCommissioning = false;
+        sparseCommissioning = false;
         valid = false;
     }
 };
@@ -158,7 +168,8 @@ namespace NCXYZCUVFeedDetail
 }
 
 // Disjoint caller-owned input/output; every rejection clears the entire value.
-// No point form, sparse-axis form, or allocation is provided.
+// Sparse references are admitted only by a disjoint dry commissioning flag.
+// The default six-axis G90/G91 contract remains strict; no allocation is used.
 inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     const NCXYZCUVFeedLineInput& input, NCXYZCUVFeedLineValue& output) noexcept
 {
@@ -171,11 +182,20 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
             identity.nativeUnit[axis] != (axis >= 3U ? 2U : 1U) || identity.address[axis] != "XYZCUV"[axis])
             return Code::INVALID_AXIS_IDENTITY;
     if (input.axisMask != 0x3fU) return Code::INVALID_AXIS_MASK;
+    if ((static_cast<unsigned>(input.zOnlyCommissioning) + static_cast<unsigned>(input.xyzOnlyCommissioning) +
+        static_cast<unsigned>(input.sparseCommissioning) > 1U) ||
+        (input.sparseCommissioning && (input.absolute ||
+            !EDM149::ValidSparseIncrement(input.deltaNative,input.feedMMMin))) ||
+        (input.xyzOnlyCommissioning && (input.absolute ||
+            !EDM149::ValidXYZIncrement(input.deltaNative,input.feedMMMin)))) return Code::INVALID_AUTHORED_DELTA;
+    if (input.zOnlyCommissioning && (input.absolute ||
+        !EDM149::ValidZIncrement(input.deltaNative,input.feedMMMin))) return Code::INVALID_AUTHORED_DELTA;
     if (!std::isfinite(input.feedMMMin) || input.feedMMMin <= 0.0 || input.feedMMMin > 100.0)
         return Code::INVALID_FEED;
     for (unsigned axis = 0U; axis < 6U; ++axis)
     {
-        if (!std::isfinite(input.deltaNative[axis]) || input.deltaNative[axis] == 0.0)
+        if (!std::isfinite(input.deltaNative[axis]) ||
+            (input.deltaNative[axis] == 0.0 && !input.zOnlyCommissioning && !input.xyzOnlyCommissioning && !input.sparseCommissioning))
             return Code::INVALID_AUTHORED_DELTA;
         if (!std::isfinite(input.pulsePerUnit[axis]) || input.pulsePerUnit[axis] <= 0.0 ||
             !std::isfinite(input.maxVelocityPPS[axis]) || input.maxVelocityPPS[axis] <= 0.0 ||
@@ -220,8 +240,12 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
         }
         const double authored = input.deltaNative[axis], ppu = input.pulsePerUnit[axis];
         const double authoredPulse = authored * ppu;
-        const double expectedNative = input.absolute ? resolved.endMCS[axis] : input.startMCS[axis] + authored;
-        const double expectedPulse = input.absolute ? resolved.endPulse[axis] : input.startPulse[axis] + authoredPulse;
+        const bool staticAxis = (EDM149::StaticAxis(input.zOnlyCommissioning,input.xyzOnlyCommissioning,axis) ||
+            (input.sparseCommissioning && input.deltaNative[axis] == 0.0));
+        const double expectedNative = staticAxis ? input.startMCS[axis] :
+            (input.absolute ? resolved.endMCS[axis] : input.startMCS[axis] + authored);
+        const double expectedPulse = staticAxis ? input.startPulse[axis] :
+            (input.absolute ? resolved.endPulse[axis] : input.startPulse[axis] + authoredPulse);
         if (!std::isfinite(authoredPulse) || !std::isfinite(expectedNative) || !std::isfinite(expectedPulse))
             return Code::NONFINITE_GEOMETRY;
         if (!NCXYZCUVFeedDetail::SameBits(input.endMCS[axis], expectedNative) ||
@@ -229,6 +253,14 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
         const double deltaNative = input.endMCS[axis] - input.startMCS[axis];
         deltaPulse[axis] = input.endPulse[axis] - input.startPulse[axis];
         if (!std::isfinite(deltaNative) || !std::isfinite(deltaPulse[axis])) return Code::NONFINITE_GEOMETRY;
+        if ((EDM149::StaticAxis(input.zOnlyCommissioning,input.xyzOnlyCommissioning,axis) ||
+            (input.sparseCommissioning && input.deltaNative[axis] == 0.0)))
+        {
+            if (authored != 0.0 || deltaNative != 0.0 || deltaPulse[axis] != 0.0 ||
+                !NCXYZCUVFeedDetail::SameBits(input.startMCS[axis],input.endMCS[axis]) ||
+                !NCXYZCUVFeedDetail::SameBits(input.startPulse[axis],input.endPulse[axis])) return Code::OUTSIDE_AXIS_CHANGED;
+            continue;
+        }
         if (deltaNative == 0.0 || std::fabs(deltaPulse[axis]) < 1.0e-5)
             return Code::BELOW_CONSUMER_RESOLUTION;
         if ((authored < 0.0) != (deltaNative < 0.0) || (authored < 0.0) != (deltaPulse[axis] < 0.0))
@@ -255,6 +287,8 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     std::array<double, 3U> rotaryFeed{};
     for (unsigned rotary = 0U; rotary < 3U; ++rotary)
     {
+        if (input.zOnlyCommissioning || input.xyzOnlyCommissioning ||
+            (input.sparseCommissioning && input.deltaNative[rotary + 3U] == 0.0)) continue;
         rotaryFeed[rotary] = NCXYZCUVFeedDetail::ProductRatio(
             std::fabs(input.deltaNative[rotary + 3U]), 60.0, seconds);
         if (!std::isfinite(rotaryFeed[rotary]) || rotaryFeed[rotary] <= 0.0)
@@ -264,6 +298,8 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     std::array<double, 6U> projectedVelocity{};
     for (unsigned axis = 0U; axis < 6U; ++axis)
     {
+        if ((EDM149::StaticAxis(input.zOnlyCommissioning,input.xyzOnlyCommissioning,axis) ||
+            (input.sparseCommissioning && input.deltaNative[axis] == 0.0))) continue;
         const double directVelocity = NCXYZCUVFeedDetail::ProductRatio(std::fabs(deltaPulse[axis]), 1.0, seconds);
         const double ratio = deltaPulse[axis] / length;
         projectedVelocity[axis] = std::fabs(velocity * ratio);
@@ -277,6 +313,8 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     const double eps64 = 64.0 * (std::numeric_limits<double>::epsilon)();
     for (unsigned axis = 3U; axis < 6U; ++axis)
     {
+        if (input.zOnlyCommissioning || input.xyzOnlyCommissioning ||
+            (input.sparseCommissioning && input.deltaNative[axis] == 0.0)) continue;
         const double mappedRotaryFeed = NCXYZCUVFeedDetail::ProductRatio(
             projectedVelocity[axis], 60.0, input.pulsePerUnit[axis]);
         if (!std::isfinite(mappedRotaryFeed) || mappedRotaryFeed <= 0.0)
@@ -305,6 +343,9 @@ inline NCXYZCUVFeedLineCode BuildNCXYZCUVFeedLine(
     output.startMCS = input.startMCS; output.endMCS = input.endMCS;
     output.startPulse = input.startPulse; output.endPulse = input.endPulse;
     output.axisMask = input.axisMask; output.feedMMMin = input.feedMMMin;
+    output.zOnlyCommissioning = input.zOnlyCommissioning;
+    output.xyzOnlyCommissioning = input.xyzOnlyCommissioning;
+    output.sparseCommissioning = input.sparseCommissioning;
     output.deltaNative = input.deltaNative; output.pulsePerUnit = input.pulsePerUnit;
     output.axisVelocityPPS = projectedVelocity;
     output.linearLengthMM = linearLength; output.nominalSeconds = seconds;

@@ -1,5 +1,8 @@
 // CG / EDM01 / EDM02: NC-owned simulation tests. No Motion or IO writes.
 #include "NCManager.h"
+#include "EDM147PhysicalGapEvidence.h"
+#include "EDM149VoltageMotion.h"
+#include "NCExpressionResolver.h"
 #include "NCXYZCUVFeedScope.h"
 #include "EDMCNCRetainedRTFixture.h"
 #include "EDMCoordinatedRTFixture.h"
@@ -15,6 +18,7 @@
 #include "EDMPhysicalRecipeSequence.h"
 #include "EDMPhysicalRecipePreflight.h"
 #include "EDM137ConfirmedUnits.h"
+#include "EDM145SourceDiagnostics.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -26,10 +30,96 @@
 
 namespace
 {
+    // FIX7: NC prints the RT-owned immutable input comparison after a fault.
+    // Raw means mapped host process-image bytes, never a drive alarm readback.
+    void PrintEDM173InputFailure(const MotionCore& motion,std::uint64_t session,
+        std::uint64_t guardTick) noexcept
+    {
+        EDM173InputDiag::Evidence evidence{};
+        if (!motion.ReadEDM173InputDiagnostic(evidence) || !evidence.haveFirst ||
+            evidence.session!=session || evidence.first.tick>guardTick)
+        {
+            RtPrintf("[EDM173_FIX7] event=SERVO_INPUT_FIRST session=%llu guardTick=%llu evidence=UNAVAILABLE authority=NONE\n",
+                static_cast<unsigned long long>(session),static_cast<unsigned long long>(guardTick));
+            return;
+        }
+        char record[481]{};
+        const auto u=[](std::uint64_t value) noexcept {return static_cast<unsigned long long>(value);};
+        const auto emit=[&record](int length) noexcept {
+            if (length>0 && length<=480 && static_cast<std::size_t>(length)<sizeof(record)) RtPrintf("%s",record);
+            else RtPrintf("[EDM173_FIX7] event=LOG_FORMAT_ERROR scope=SERVO_INPUT\n");
+        };
+        emit(std::snprintf(record,sizeof(record),
+            "[EDM173_FIX7] event=SERVO_INPUT_FIRST session=%llu inputTick=%llu guardTick=%llu previousTick=%llu frames=%llu raw=HOST_PROCESS_IMAGE capture=AROUND_AXIS_UPDATE authority=NONE driveAck=0 flags=SERVO_ON1_FAULT2_LAG4_RESET8\n",
+            u(session),u(evidence.first.tick),u(guardTick),u(evidence.havePrevious?evidence.previous.tick:0ULL),u(evidence.frames)));
+        const EDM173InputDiag::Frame* frames[2]={&evidence.previous,&evidence.first};
+        for (unsigned index=evidence.havePrevious?0U:1U;index<2U;++index)
+        {
+            const auto& frame=*frames[index];
+            const char* phase=index?"FIRST":"PREVIOUS";
+            emit(std::snprintf(record,sizeof(record),
+                "[EDM173_FIX7] event=SERVO_INPUT_FRAME session=%llu frame=%s tick=%llu nowUs=%llu epoch=%llu complete=%u input=%02X raw=%02X semantic=%02X mismatch=%02X notReady=%02X internal=%02X trigger=%02X\n",
+                u(session),phase,u(frame.tick),u(frame.nowUs),u(frame.epoch),frame.complete?1U:0U,
+                frame.inputMask,frame.rawMask,frame.semanticMask,frame.rawMismatchMask,frame.notReadyMask,frame.internalFaultMask,frame.triggerMask));
+            for (unsigned axis=0U;axis<6U;++axis)
+            {
+                if (!(frame.inputMask&(1U<<axis))) continue;
+                const auto& a=frame.axis[axis];
+                emit(std::snprintf(record,sizeof(record),
+                    "[EDM173_FIX7] event=SERVO_INPUT_AXIS session=%llu frame=%s tick=%llu axis=%c usedSW=%04X rawSW=%04X usedMode=%d rawMode=%d usedPos=%d rawPos=%d rawValid=%u semantic=%u outputValid=%u beforeState=%d afterState=%d beforeFlags=%02X afterFlags=%02X cwBefore=%04X cwAfter=%04X\n",
+                    u(session),phase,u(frame.tick),"XYZCUV"[axis],static_cast<unsigned>(a.consumedStatus),static_cast<unsigned>(a.rawStatus),
+                    static_cast<int>(a.consumedMode),static_cast<int>(a.rawMode),static_cast<int>(a.consumedPosition),static_cast<int>(a.rawPosition),
+                    a.rawValid?1U:0U,a.semantic?1U:0U,a.outputValid?1U:0U,static_cast<int>(a.stateBefore),static_cast<int>(a.stateAfter),
+                    static_cast<unsigned>(a.flagsBefore),static_cast<unsigned>(a.flagsAfter),static_cast<unsigned>(a.controlBefore),static_cast<unsigned>(a.controlAfter)));
+            }
+        }
+    }
+
+    void PrintEDM145SourceFailure(std::uint64_t session) noexcept
+    {
+        static std::uint64_t lastSession=0ULL;
+        if(!session || session==lastSession)return;
+        EDM145::SourceFailure r{};
+        if(!EDM145::ReadSourceFailure(r) || r.session!=session)return;
+        lastSession=session;
+        char record[481]{};
+        const auto u=[](std::uint64_t value) noexcept {return static_cast<unsigned long long>(value);};
+        const auto emit=[&record](int length) noexcept {
+            if(length>0 && length<=480 && static_cast<std::size_t>(length)<sizeof(record))RtPrintf("%s",record);
+            else RtPrintf("[EDM145] event=LOG_FORMAT_ERROR scope=SOURCE_FIRST\n");
+        };
+        emit(std::snprintf(record,sizeof(record),
+            "[EDM145] event=SOURCE_FIRST part=DECISION session=%llu tick=%llu sourceCurrent=%u awaitEvaluated=%u awaitCurrent=%u mapped=%u awaitGate=%s snapshot=PRE_TRIP authority=NONE\n",
+            u(r.session),u(r.tick),(r.decisionFlags&EDM145::SourceCurrent)?1U:0U,
+            (r.decisionFlags&EDM145::AwaitEvaluated)?1U:0U,(r.decisionFlags&EDM145::AwaitCurrent)?1U:0U,
+            (r.decisionFlags&EDM145::MappingCurrent)?1U:0U,EDM145::AwaitGateName(r.awaitFailure)));
+        emit(std::snprintf(record,sizeof(record),
+            "[EDM145] event=SOURCE_FIRST part=CLOCK session=%llu tick=%llu sendUs=%llu frameUs=%llu physicalUs=%llu sourceCaptureUs=%llu baselineCaptureUs=%llu baselineObserveUs=%llu admittedUs=%llu\n",
+            u(r.session),u(r.tick),u(r.sendNowUs),u(r.frameNowUs),u(r.physicalNowUs),u(r.sourceCapturedUs),
+            u(r.baselineCapturedUs),u(r.baselineObservedUs),u(r.admittedUs)));
+        emit(std::snprintf(record,sizeof(record),
+            "[EDM145] event=SOURCE_FIRST part=AGE session=%llu tick=%llu frameAgeUs=%llu sourceAgeUs=%llu baselineAgeUs=%llu baselineObserveAgeUs=%llu sourceMaxUs=%llu baselineMaxUs=%llu shadowMaxUs=%llu shadowTickMaxUs=%llu unknownAge=UINT64_MAX\n",
+            u(r.session),u(r.tick),u(EDM145::AgeUs(r.sendNowUs,r.frameNowUs)),
+            u(EDM145::AgeUs(r.sendNowUs,r.sourceCapturedUs)),u(EDM145::AgeUs(r.sendNowUs,r.baselineCapturedUs)),
+            u(EDM145::AgeUs(r.sendNowUs,r.baselineObservedUs)),u(r.sourceMaxAgeUs),u(r.baselineMaxAgeUs),
+            u(r.shadowMaxAgeUs),u(r.shadowMaxTickGapUs)));
+        emit(std::snprintf(record,sizeof(record),
+            "[EDM145] event=SOURCE_FIRST part=STATE session=%llu tick=%llu physicalReason=%s flags=%08X positionMismatch=%02X velocityMismatch=%02X expectedEpoch=%llu liveEpoch=%llu observedEpoch=%llu publication=%llu cycle=%llu fresh=%llu held=%llu\n",
+            u(r.session),u(r.tick),EDM129::SourceReasonName(static_cast<EDM129::SourceReason>(r.physicalReason)),
+            static_cast<unsigned>(r.stateFlags),static_cast<unsigned>(r.positionMismatchMask),
+            static_cast<unsigned>(r.velocityMismatchMask),u(r.expectedEpoch),u(r.liveEpoch),u(r.observedEpoch),
+            u(r.sourcePublication),u(r.sourceCycle),u(r.sourceFresh),u(r.sourceHeld)));
+    }
+
     // Explicit opt-ins preserve the older timed physical-AD profiles.
     // EDM132 freezes E6 in millimetres; its I10 remains a fixed envelope only.
-    bool E137FlushStageArm(unsigned arm) noexcept { return arm == 202U || arm == 204U || arm == 206U || arm == 208U; }
-    bool E138CrossSegmentArm(unsigned arm) noexcept { return arm == 206U || arm == 208U; }
+    bool E148AuthoredLineArm(unsigned arm) noexcept { return arm == 226U || arm == 228U; }
+    bool E146PhysicalMotionArm(unsigned arm) noexcept { return arm == 222U || arm == 224U; }
+    bool E141MotionArm(unsigned arm) noexcept { return arm == 218U || arm == 220U || E146PhysicalMotionArm(arm) || E148AuthoredLineArm(arm); }
+    bool E139DiagnosticArm(unsigned arm) noexcept { return arm == 210U || arm == 212U || arm == 214U || arm == 216U || arm == 218U || arm == 220U || E148AuthoredLineArm(arm); }
+    bool E140AssignmentArm(unsigned arm) noexcept { return arm == 214U || arm == 216U || E141MotionArm(arm); }
+    bool E137FlushStageArm(unsigned arm) noexcept { return arm==292U || EDM149::IsTestArm(arm) || arm == 202U || arm == 204U || arm == 206U || arm == 208U || E139DiagnosticArm(arm) || E146PhysicalMotionArm(arm); }
+    bool E138CrossSegmentArm(unsigned arm) noexcept { return EDM149::IsTestArm(arm) || arm == 206U || arm == 208U || E139DiagnosticArm(arm) || E146PhysicalMotionArm(arm); }
     bool E136CurveArm(unsigned arm) noexcept { return arm == 198U || arm == 200U || E137FlushStageArm(arm); }
     bool E135ReferenceArm(unsigned arm) noexcept { return arm == 194U || arm == 196U || E136CurveArm(arm); }
     bool E134MachiningArm(unsigned arm) noexcept { return arm == 190U || arm == 192U || E135ReferenceArm(arm); }
@@ -39,14 +129,57 @@ namespace
     bool E131SpeedArm(unsigned arm) noexcept { return arm == 178U || arm == 180U || E132HeightArm(arm); }
     bool E130TimedArm(unsigned arm) noexcept
     { return arm == 174U || arm == 176U || E131SpeedArm(arm); }
-    bool E130CanonicalArm(unsigned arm) noexcept { return arm == 174U || arm == 178U || arm == 182U || arm == 186U || arm == 190U || arm == 194U || arm == 198U || arm == 202U || arm == 206U; }
+    bool E130CanonicalArm(unsigned arm) noexcept { return arm == 174U || arm == 178U || arm == 182U || arm == 186U || arm == 190U || arm == 194U || arm == 198U || arm == 202U || arm == 206U || arm == 210U || arm == 214U || arm == 218U || arm == 222U || arm == 226U; }
+    unsigned E149HistoryFixture(unsigned arm) noexcept
+    { return EDM149::IsSixVisibleFlushTestArm(arm) ? EDM149::SixVisibleFlushHistoryFixture : EDM149::IsXYZVisibleFlushTestArm(arm) ? EDM149::XYZVisibleFlushHistoryFixture : EDM149::IsVisibleFlushTestArm(arm) ? EDM149::VisibleFlushHistoryFixture : EDM149::IsPauseTestArm(arm) ? EDM149::PauseHistoryFixture : EDM149::IsProgramTestArm(arm) ? EDM149::ProgramHistoryFixture : EDM149::IsSparseArcTestArm(arm) ? EDM149::SparseArcHistoryFixture : EDM149::IsSparseTestArm(arm) ? EDM149::SparseHistoryFixture : EDM149::IsOrderTestArm(arm) ? EDM149::OrderHistoryFixture : EDM149::IsArcTestArm(arm) ? EDM149::ArcHistoryFixture : EDM149::IsSixTestArm(arm) ? EDM149::SixHistoryFixture : EDM149::IsXYZTestArm(arm) ? EDM149::XYZHistoryFixture : EDM149::IsZTestArm(arm) ? EDM149::ZHistoryFixture : (arm == 158U || arm == 166U || arm == 170U || E130CanonicalArm(arm)) ? 0U : 1U; }
+    EDM116::Fixture E149ModalFixture(unsigned fixture) noexcept
+    { return fixture == EDM149::SixVisibleFlushHistoryFixture ? EDM116::Fixture::ModalSixVisibleFlush167 : fixture == EDM149::XYZVisibleFlushHistoryFixture ? EDM116::Fixture::ModalXYZVisibleFlush159 : fixture == EDM149::VisibleFlushHistoryFixture ? EDM116::Fixture::ModalVisibleFlush158 : fixture == EDM149::PauseHistoryFixture ? EDM116::Fixture::ModalPause157 : fixture == EDM149::ProgramHistoryFixture ? EDM116::Fixture::ModalProgram156 : fixture == EDM149::SparseArcHistoryFixture ? EDM116::Fixture::ModalSparseArc155 : fixture == EDM149::SparseHistoryFixture ? EDM116::Fixture::ModalSparse154 : fixture == EDM149::OrderHistoryFixture ? EDM116::Fixture::ModalOrder153 : fixture == EDM149::ArcHistoryFixture ? EDM116::Fixture::ModalArc152 : fixture == EDM149::SixHistoryFixture ? EDM116::Fixture::ModalSix151 : fixture == EDM149::XYZHistoryFixture ? EDM116::Fixture::ModalXYZ150 : fixture == EDM149::ZHistoryFixture ? EDM116::Fixture::ModalZ149 : fixture ? EDM116::Fixture::ModalComplement127 : EDM116::Fixture::Modal127; }
+    unsigned E149ControlSource(unsigned arm) noexcept
+    { return EDM149::IsTestArm(arm) ? EDM149::SourceForArm(arm) : E139DiagnosticArm(arm) ? 1U : 0U; }
+    bool E149PhysicalExpected(unsigned arm) noexcept
+    { return !EDM149::IsSoftwareSource(EDM149::SourceForArm(arm)); }
+    // A per-event observation of the real B2 cursor excursion. General GAP
+    // traversal counters also include voltage retreats, so they cannot prove
+    // that an E5 flush itself crossed an NC seam.
+    void EmitEDM161B2History(std::uint64_t session, const EDM128::MotionFeedback& timed,
+        const EDM130::Recipe& expected, const char* event, bool identityMatch,
+        unsigned anchorG, unsigned targetG) noexcept
+    {
+        const auto& e = timed.coordinator;
+        if (!identityMatch || !timed.enabled || !timed.workTimeFlush || timed.session != session ||
+            e.policy.mode != EDM116::Mode::B2 || !e.eventIndex) return;
+        const bool recipeMatches = EDM130::SameRecipe(timed.timerRecipe, expected);
+        const bool sourcesMatch = EDM126::ValidSource(e.anchor.cursorSource) && EDM126::ValidSource(e.targetSource) &&
+            e.anchor.cursorSource.scope.session == session && e.targetSource.scope.session == session &&
+            EDM109::SameScope(e.anchor.cursorSource.scope, e.targetSource.scope);
+        const bool planned = e.anchorCaptured && e.targetCaptured && sourcesMatch &&
+            e.targetSource.ordinal < e.anchor.cursorSource.ordinal;
+        const bool proof = recipeMatches && EDM130::ValidRecipe(expected) &&
+            EDM116::SamePolicy(timed.rowPolicy, e.policy) &&
+            EDM128::ValidHeightProof(e, EDM130::FrozenJumpHeightMm(expected), expected.deepFlushCycleInterval,
+                EDM130::FrozenDeepMultiplier(expected), EDM130::HasBoundDeep(expected));
+        const bool verified = planned && proof && e.topCaptured && e.exactReturn && e.rowEventComplete &&
+            e.work.completedEvents >= e.eventIndex;
+        char record[481]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM161] event=B2_HISTORY result=%.24s session=%llu eventIndex=%llu phase=%s anchorRow=%llu anchorPC=%d anchorG=%u targetRow=%llu targetPC=%d targetG=%u planned=%u top=%u exactReturn=%u complete=%u recipeMatches=%u proofValid=%u verifiedCross=%u authority=NONE\n",
+            event ? event : "UNKNOWN", static_cast<unsigned long long>(session),
+            static_cast<unsigned long long>(e.eventIndex), EDM128::PhaseName(e.phase),
+            static_cast<unsigned long long>(e.anchor.cursorSource.ordinal), e.anchor.cursorSource.sourcePC, anchorG,
+            static_cast<unsigned long long>(e.targetSource.ordinal), e.targetSource.sourcePC, targetG,
+            planned ? 1U : 0U, e.topCaptured ? 1U : 0U, e.exactReturn ? 1U : 0U, e.rowEventComplete ? 1U : 0U,
+            recipeMatches ? 1U : 0U, proof ? 1U : 0U, verified ? 1U : 0U);
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM161] event=LOG_FORMAT_ERROR part=B2_HISTORY\n");
+    }
+
     void EmitEDM137FlushStage(std::uint64_t session, const EDM128::MotionFeedback& timed,
         const char* event, bool recipeMatches) noexcept
     {
         char record[481]{};
         const auto& e = timed.coordinator;
         const int length = std::snprintf(record, sizeof(record),
-            "[EDM137] event=FLUSH_STAGE result=%.24s session=%llu row=%u B=%u eventIndex=%llu phase=%s stage=%s distanceMm=%.9g targetMmMin=%.9g initialMm=%.9g finalMm=%.9g heightMm=%.9g proofValid=%u recipeMatches=%u dischargeInhibited=1\n",
+            "[EDM137] event=FLUSH_STAGE result=%.24s session=%llu row=%u B=%u eventIndex=%llu phase=%s stage=%s distanceMm=%.9g targetMmMin=%.9g initialMm=%.9g finalMm=%.9g heightMm=%.9g proofValid=%u recipeMatches=%u powerControl=NC_PLC_S92\n",
             event ? event : "UNKNOWN", static_cast<unsigned long long>(session), timed.completedRows,
             static_cast<unsigned>(timed.rowPolicy.mode), static_cast<unsigned long long>(e.eventIndex),
             EDM128::PhaseName(e.phase), EDM128::SpeedStageName(e.speedStage), e.stageDistanceMm,
@@ -55,6 +188,26 @@ namespace
             recipeMatches ? 1U : 0U);
         if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
         else RtPrintf("[EDM137] event=LOG_FORMAT_ERROR part=FLUSH_STAGE\n");
+        if (EDM130::IsVisibleFlush(timed.timerRecipe))
+            RtPrintf("[EDM158] event=VISIBLE_FLUSH_STAGE result=%s session=%llu phase=%s stage=%s triggered=%llu completed=%llu exactReturn=%u rowEventComplete=%u anchorZBits=%llu topZBits=%llu distanceBits=%llu targetMmSecBits=%llu recipeMatches=%u cycles=EXACTLY_ONE then=REMAINING_NC hold=CANCEL_RESET_REQUIRED S92=INHIBITED S93=INHIBITED\n",
+                event ? event : "UNKNOWN", static_cast<unsigned long long>(session),
+                EDM128::PhaseName(e.phase), EDM128::SpeedStageName(e.speedStage),
+                static_cast<unsigned long long>(e.work.triggeredEvents), static_cast<unsigned long long>(e.work.completedEvents),
+                e.exactReturn ? 1U : 0U, e.rowEventComplete ? 1U : 0U,
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(e.anchor.positionPulse[2])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(e.topPositionPulse[2])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(e.stageDistanceMm)),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(e.stageTargetMmSec)), recipeMatches ? 1U : 0U);
+        if (EDM130::IsVisibleFlush159(timed.timerRecipe))
+            RtPrintf("[EDM159] event=VISIBLE_FLUSH_STAGE result=%s session=%llu phase=%s stage=%s triggered=%llu completed=%llu exactReturn=%u rowEventComplete=%u anchorZBits=%llu topZBits=%llu distanceBits=%llu targetMmSecBits=%llu recipeMatches=%u cycles=EXACTLY_ONE then=REMAINING_NC hold=CANCEL_RESET_REQUIRED S92=INHIBITED S93=INHIBITED\n",
+                event ? event : "UNKNOWN", static_cast<unsigned long long>(session),
+                EDM128::PhaseName(e.phase), EDM128::SpeedStageName(e.speedStage),
+                static_cast<unsigned long long>(e.work.triggeredEvents), static_cast<unsigned long long>(e.work.completedEvents),
+                e.exactReturn ? 1U : 0U, e.rowEventComplete ? 1U : 0U,
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(e.anchor.positionPulse[2])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(e.topPositionPulse[2])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(e.stageDistanceMm)),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(e.stageTargetMmSec)), recipeMatches ? 1U : 0U);
     }
 
 
@@ -985,6 +1138,18 @@ bool NCManager::InstallEDMGapInputBeforeStart(const EDMGapInput::Profile& profil
     return initialized;
 }
 
+bool NCManager::IsEDM173DiagnosticQuietSameThread() const noexcept
+{
+    // Use only NC-owned cached state. No RT channel read, publication, or
+    // control mutation is introduced by asking whether passive IO may wait.
+    const auto& s = m_edm94;
+    return m_state.load(std::memory_order_relaxed) == NCState::RUN &&
+        s.program && s.latched && s.gapHistoryArm == 292U &&
+        !s.complete && !s.cancelled && !s.resetSeen && !s.resetCommitted &&
+        !s.releaseRequested && !s.rtFaultReported &&
+        !s.feedback.faulted && !s.feedback.cancelled;
+}
+
 bool NCManager::IsEDMZFixtureDiagnosticQuietSameThread() const noexcept
 {
     if ((m_gapDryRun.physicalRecipeCaptureTest || m_gapDryRun.physicalServoRTTest) && m_gapDryRun.active) return true;
@@ -1033,7 +1198,7 @@ EDMGapInput::Snapshot NCManager::ReadEDMGapInputSnapshotSameThread() noexcept
     const EDMGapInput::Snapshot value = m_edmGapChannel.Observe(input, nowMs, clockValid);
     if (!m_edmGapLogSeen || (clockValid && nowMs >= m_edmGapLastLogMs && nowMs - m_edmGapLastLogMs >= 1000ULL))
     {
-        if (!IsEDMZFixtureDiagnosticQuietSameThread())
+        if (!IsEDMZFixtureDiagnosticQuietSameThread() && !IsEDM173DiagnosticQuietSameThread())
             RtPrintf("[EDM18] event=GAP_INPUT source=%s AD=%u device=%u raw=%d rawAvailable=%u boardMv=%d boardValid=%u zeroClamped=%u gapMv=%d liveValid=%u calibration=%u status=%s quality=%s band=%s seq=%llu ageMs=%llu physicalPermit=0 discharge=0\n",
                 EDMGap::SourceName(value.configuredSource), static_cast<unsigned>(value.adIndex), static_cast<unsigned>(value.deviceId),
                 static_cast<int>(value.rawCode), value.rawAvailable ? 1U : 0U, static_cast<int>(value.boardVoltageMv), value.boardVoltageValid ? 1U : 0U,
@@ -1170,6 +1335,7 @@ EDMVoltage::Snapshot NCManager::ReadEDMVoltageSnapshotSameThread() noexcept
 
 bool NCManager::IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept
 {
+    if (block.has('P') && (block.val('P')==292.0 || block.val('P')==293.0)) return IsEDM173BracketShapeValid(block);
     if (block.has('P') && (block.val('P') == 158.0 || block.val('P') == 159.0 ||
         block.val('P') == 160.0 || block.val('P') == 161.0))
     {
@@ -1207,7 +1373,7 @@ bool NCManager::IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept
         block.val('P') == 107.0 || block.val('P') == 108.0 ||
         block.val('P') == 109.0 || block.val('P') == 110.0 ||
         block.val('P') == 111.0 || block.val('P') == 112.0 ||
-        block.val('P') == 113.0 || block.val('P') == 114.0 || block.val('P') == 115.0 || block.val('P') == 116.0 || block.val('P') == 117.0 || block.val('P') == 118.0 || block.val('P') == 119.0 || block.val('P') == 120.0 || block.val('P') == 121.0 || block.val('P') == 122.0 || block.val('P') == 123.0 || block.val('P') == 124.0 || block.val('P') == 125.0 || block.val('P') == 126.0 || block.val('P') == 127.0 || block.val('P') == 128.0 || block.val('P') == 129.0 || block.val('P') == 130.0 || block.val('P') == 131.0 || block.val('P') == 132.0 || block.val('P') == 133.0 || block.val('P') == 134.0 || block.val('P') == 135.0 || block.val('P') == 136.0 || block.val('P') == 137.0 || block.val('P') == 138.0 || block.val('P') == 139.0 || block.val('P') == 140.0 || block.val('P') == 141.0 || block.val('P') == 142.0 || block.val('P') == 143.0 || block.val('P') == 144.0 || block.val('P') == 145.0 || block.val('P') == 146.0 || block.val('P') == 147.0 || block.val('P') == 148.0 || block.val('P') == 149.0 || block.val('P') == 150.0 || block.val('P') == 151.0 || block.val('P') == 152.0 || block.val('P') == 153.0 || block.val('P') == 154.0 || block.val('P') == 155.0 || block.val('P') == 156.0 || block.val('P') == 157.0 || block.val('P') == 162.0 || block.val('P') == 163.0 || block.val('P') == 164.0 || block.val('P') == 165.0 || block.val('P') == 166.0 || block.val('P') == 167.0 || block.val('P') == 168.0 || block.val('P') == 169.0 || block.val('P') == 170.0 || block.val('P') == 171.0 || block.val('P') == 172.0 || block.val('P') == 173.0 || block.val('P') == 174.0 || block.val('P') == 175.0 || block.val('P') == 176.0 || block.val('P') == 177.0 || block.val('P') == 178.0 || block.val('P') == 179.0 || block.val('P') == 180.0 || block.val('P') == 181.0 || block.val('P') == 182.0 || block.val('P') == 183.0 || block.val('P') == 184.0 || block.val('P') == 185.0 || block.val('P') == 186.0 || block.val('P') == 187.0 || block.val('P') == 188.0 || block.val('P') == 189.0 || block.val('P') == 190.0 || block.val('P') == 191.0 || block.val('P') == 192.0 || block.val('P') == 193.0 || block.val('P') == 194.0 || block.val('P') == 195.0 || block.val('P') == 196.0 || block.val('P') == 197.0 || block.val('P') == 198.0 || block.val('P') == 199.0 || block.val('P') == 200.0 || block.val('P') == 201.0 || block.val('P') == 202.0 || block.val('P') == 203.0 || block.val('P') == 204.0 || block.val('P') == 205.0 || block.val('P') == 206.0 || block.val('P') == 207.0 || block.val('P') == 208.0 || block.val('P') == 209.0))
+        block.val('P') == 113.0 || block.val('P') == 114.0 || block.val('P') == 115.0 || block.val('P') == 116.0 || block.val('P') == 117.0 || block.val('P') == 118.0 || block.val('P') == 119.0 || block.val('P') == 120.0 || block.val('P') == 121.0 || block.val('P') == 122.0 || block.val('P') == 123.0 || block.val('P') == 124.0 || block.val('P') == 125.0 || block.val('P') == 126.0 || block.val('P') == 127.0 || block.val('P') == 128.0 || block.val('P') == 129.0 || block.val('P') == 130.0 || block.val('P') == 131.0 || block.val('P') == 132.0 || block.val('P') == 133.0 || block.val('P') == 134.0 || block.val('P') == 135.0 || block.val('P') == 136.0 || block.val('P') == 137.0 || block.val('P') == 138.0 || block.val('P') == 139.0 || block.val('P') == 140.0 || block.val('P') == 141.0 || block.val('P') == 142.0 || block.val('P') == 143.0 || block.val('P') == 144.0 || block.val('P') == 145.0 || block.val('P') == 146.0 || block.val('P') == 147.0 || block.val('P') == 148.0 || block.val('P') == 149.0 || block.val('P') == 150.0 || block.val('P') == 151.0 || block.val('P') == 152.0 || block.val('P') == 153.0 || block.val('P') == 154.0 || block.val('P') == 155.0 || block.val('P') == 156.0 || block.val('P') == 157.0 || block.val('P') == 162.0 || block.val('P') == 163.0 || block.val('P') == 164.0 || block.val('P') == 165.0 || block.val('P') == 166.0 || block.val('P') == 167.0 || block.val('P') == 168.0 || block.val('P') == 169.0 || block.val('P') == 170.0 || block.val('P') == 171.0 || block.val('P') == 172.0 || block.val('P') == 173.0 || block.val('P') == 174.0 || block.val('P') == 175.0 || block.val('P') == 176.0 || block.val('P') == 177.0 || block.val('P') == 178.0 || block.val('P') == 179.0 || block.val('P') == 180.0 || block.val('P') == 181.0 || block.val('P') == 182.0 || block.val('P') == 183.0 || block.val('P') == 184.0 || block.val('P') == 185.0 || block.val('P') == 186.0 || block.val('P') == 187.0 || block.val('P') == 188.0 || block.val('P') == 189.0 || block.val('P') == 190.0 || block.val('P') == 191.0 || block.val('P') == 192.0 || block.val('P') == 193.0 || block.val('P') == 194.0 || block.val('P') == 195.0 || block.val('P') == 196.0 || block.val('P') == 197.0 || block.val('P') == 198.0 || block.val('P') == 199.0 || block.val('P') == 200.0 || block.val('P') == 201.0 || block.val('P') == 202.0 || block.val('P') == 203.0 || block.val('P') == 204.0 || block.val('P') == 205.0 || block.val('P') == 206.0 || block.val('P') == 207.0 || block.val('P') == 208.0 || block.val('P') == 209.0 || block.val('P') == 210.0 || block.val('P') == 211.0 || block.val('P') == 212.0 || block.val('P') == 213.0 || block.val('P') == 214.0 || block.val('P') == 215.0 || block.val('P') == 216.0 || block.val('P') == 217.0 || block.val('P') == 218.0 || block.val('P') == 219.0 || block.val('P') == 220.0 || block.val('P') == 221.0 || block.val('P') == 222.0 || block.val('P') == 223.0 || block.val('P') == 224.0 || block.val('P') == 225.0 || block.val('P') == 226.0 || block.val('P') == 227.0 || block.val('P') == 228.0 || block.val('P') == 229.0 || block.val('P') == 230.0 || block.val('P') == 231.0 || block.val('P') == 232.0 || block.val('P') == 233.0 || block.val('P') == 234.0 || block.val('P') == 236.0 || block.val('P') == 238.0 || block.val('P') == 240.0 || block.val('P') == 242.0 || block.val('P') == 244.0 || block.val('P') == 246.0 || block.val('P') == 248.0 || block.val('P') == 250.0 || block.val('P') == 252.0 || block.val('P') == 235.0 || block.val('P') == 237.0 || block.val('P') == 239.0 || block.val('P') == 241.0 || block.val('P') == 243.0 || block.val('P') == 245.0 || block.val('P') == 247.0 || block.val('P') == 249.0 || block.val('P') == 251.0 || block.val('P') == 253.0 || block.val('P') == 254.0 || block.val('P') == 255.0 || block.val('P') == 256.0 || block.val('P') == 257.0 || block.val('P') == 258.0 || block.val('P') == 259.0 || block.val('P') == 260.0 || block.val('P') == 261.0 || block.val('P') == 262.0 || block.val('P') == 263.0 || block.val('P') == 264.0 || block.val('P') == 265.0 || block.val('P') == 266.0 || block.val('P') == 267.0 || block.val('P') == 268.0 || block.val('P') == 269.0 || block.val('P') == 270.0 || block.val('P') == 271.0 || block.val('P') == 272.0 || block.val('P') == 273.0 || block.val('P') == 274.0 || block.val('P') == 275.0 || block.val('P') == 276.0 || block.val('P') == 277.0 || block.val('P') == 278.0 || block.val('P') == 279.0 || block.val('P') == 280.0 || block.val('P') == 281.0 || block.val('P') == 282.0 || block.val('P') == 283.0 || block.val('P') == 284.0 || (block.val('P') == 286.0 || block.val('P') == 288.0 || block.val('P') == 290.0) || block.val('P') == 285.0 || (block.val('P') == 287.0 || block.val('P') == 289.0 || block.val('P') == 291.0)))
     {
         if (block.isEmpty || block.isGoto || block.isBlockSkip || !block.hasG || block.gCode != 180 ||
             block.gCount != 1 || block.gCodes[0] != 180 || block.mCount != 0) return false;
@@ -1216,11 +1382,17 @@ bool NCManager::IsGapDryRunBlockShapeValid(const NCBlock& block) noexcept
         const bool continuousArm = block.val('P') == 97.0;
         const bool enduranceArm = block.val('P') == 99.0;
         const bool pairedArm = block.val('P') == 101.0;
-        const bool parameterizedArm = block.val('P') == 109.0 || block.val('P') == 111.0 || block.val('P') == 113.0 || block.val('P') == 115.0 || block.val('P') == 117.0 || block.val('P') == 119.0 || block.val('P') == 121.0 || block.val('P') == 123.0 || block.val('P') == 125.0 || block.val('P') == 127.0 || block.val('P') == 129.0 || block.val('P') == 132.0 || block.val('P') == 134.0 || block.val('P') == 136.0 || block.val('P') == 138.0 || block.val('P') == 140.0 || block.val('P') == 142.0 || block.val('P') == 144.0 || block.val('P') == 146.0 || block.val('P') == 148.0 || block.val('P') == 150.0 || block.val('P') == 152.0 || block.val('P') == 154.0 || block.val('P') == 156.0 || block.val('P') == 162.0 || block.val('P') == 164.0 || block.val('P') == 166.0 || block.val('P') == 168.0 || block.val('P') == 170.0 || block.val('P') == 172.0 || block.val('P') == 174.0 || block.val('P') == 176.0 || block.val('P') == 178.0 || block.val('P') == 180.0 || block.val('P') == 182.0 || block.val('P') == 184.0 || block.val('P') == 186.0 || block.val('P') == 188.0 || block.val('P') == 190.0 || block.val('P') == 192.0 || block.val('P') == 194.0 || block.val('P') == 196.0 || block.val('P') == 198.0 || block.val('P') == 200.0 || block.val('P') == 202.0 || block.val('P') == 204.0 || block.val('P') == 206.0 || block.val('P') == 208.0;
+        const bool holdPathArm = EDM149::IsFlushHoldTestArm(static_cast<unsigned>(block.val('P'))) ||
+            EDM149::IsManualVoltageTestArm(static_cast<unsigned>(block.val('P')));
+        if (block.has('H') && (!holdPathArm || block.val('H') != 1.0)) return false;
+        if (block.has('L') && (!holdPathArm || !block.has('H') || block.val('H') != 1.0 ||
+            (block.val('L') != 1.0 && block.val('L') != 2.0 && block.val('L') != 3.0) ||
+            !EDM130::ValidFlushHoldSelection(static_cast<unsigned>(block.val('P')), static_cast<unsigned>(block.val('L'))))) return false;
+        const bool parameterizedArm = block.val('P') == 109.0 || block.val('P') == 111.0 || block.val('P') == 113.0 || block.val('P') == 115.0 || block.val('P') == 117.0 || block.val('P') == 119.0 || block.val('P') == 121.0 || block.val('P') == 123.0 || block.val('P') == 125.0 || block.val('P') == 127.0 || block.val('P') == 129.0 || block.val('P') == 132.0 || block.val('P') == 134.0 || block.val('P') == 136.0 || block.val('P') == 138.0 || block.val('P') == 140.0 || block.val('P') == 142.0 || block.val('P') == 144.0 || block.val('P') == 146.0 || block.val('P') == 148.0 || block.val('P') == 150.0 || block.val('P') == 152.0 || block.val('P') == 154.0 || block.val('P') == 156.0 || block.val('P') == 162.0 || block.val('P') == 164.0 || block.val('P') == 166.0 || block.val('P') == 168.0 || block.val('P') == 170.0 || block.val('P') == 172.0 || block.val('P') == 174.0 || block.val('P') == 176.0 || block.val('P') == 178.0 || block.val('P') == 180.0 || block.val('P') == 182.0 || block.val('P') == 184.0 || block.val('P') == 186.0 || block.val('P') == 188.0 || block.val('P') == 190.0 || block.val('P') == 192.0 || block.val('P') == 194.0 || block.val('P') == 196.0 || block.val('P') == 198.0 || block.val('P') == 200.0 || block.val('P') == 202.0 || block.val('P') == 204.0 || block.val('P') == 206.0 || block.val('P') == 208.0 || block.val('P') == 210.0 || block.val('P') == 212.0 || block.val('P') == 214.0 || block.val('P') == 216.0 || block.val('P') == 218.0 || block.val('P') == 220.0 || block.val('P') == 222.0 || block.val('P') == 224.0 || block.val('P') == 226.0 || block.val('P') == 228.0 || block.val('P') == 230.0 || block.val('P') == 232.0 || block.val('P') == 234.0 || block.val('P') == 236.0 || block.val('P') == 238.0 || block.val('P') == 240.0 || block.val('P') == 242.0 || block.val('P') == 244.0 || block.val('P') == 246.0 || block.val('P') == 248.0 || block.val('P') == 250.0 || block.val('P') == 252.0 || block.val('P') == 254.0 || block.val('P') == 256.0 || block.val('P') == 258.0 || block.val('P') == 260.0 || block.val('P') == 262.0 || block.val('P') == 264.0 || block.val('P') == 266.0 || block.val('P') == 268.0 || block.val('P') == 270.0 || block.val('P') == 272.0 || block.val('P') == 274.0 || block.val('P') == 276.0 || block.val('P') == 278.0 || block.val('P') == 280.0 || block.val('P') == 282.0 || block.val('P') == 284.0 || (block.val('P') == 286.0 || block.val('P') == 288.0 || block.val('P') == 290.0);
         const bool flushArm = block.val('P') == 103.0 || block.val('P') == 105.0 || block.val('P') == 107.0 || parameterizedArm;
         const bool tuningArm = block.val('P') == 91.0 || noiseArm || burstArm || continuousArm || enduranceArm || pairedArm || flushArm;
         for (char a = 'A'; a <= 'Z'; ++a)
-            if (block.has(a) && ((a != 'N' && a != 'P' &&
+            if (block.has(a) && ((a != 'N' && a != 'P' && ((a != 'H' && a != 'L') || !holdPathArm) &&
                 (!tuningArm || (a != 'Q' && a != 'R' && a != 'S' &&
                     (!parameterizedArm || (a != 'I' && a != 'J' && a != 'K'))))) ||
                 !std::isfinite(block.val(a)))) return false;
@@ -1753,6 +1925,7 @@ bool NCManager::RestartGapDryRunSameThread()
 
 WaitConditionFunc NCManager::StartGapDryRunSameThread(const NCBlock& block)
 {
+    if (block.has('P') && (block.val('P')==292.0 || block.val('P')==293.0)) return StartEDM173SameThread(block);
     if (block.has('P') && (block.val('P') == 85.0 || block.val('P') == 86.0 ||
         block.val('P') == 87.0 || block.val('P') == 88.0 ||
         block.val('P') == 89.0 || block.val('P') == 90.0 ||
@@ -1767,7 +1940,7 @@ WaitConditionFunc NCManager::StartGapDryRunSameThread(const NCBlock& block)
         block.val('P') == 107.0 || block.val('P') == 108.0 ||
         block.val('P') == 109.0 || block.val('P') == 110.0 ||
         block.val('P') == 111.0 || block.val('P') == 112.0 ||
-        block.val('P') == 113.0 || block.val('P') == 114.0 || block.val('P') == 115.0 || block.val('P') == 116.0 || block.val('P') == 117.0 || block.val('P') == 118.0 || block.val('P') == 119.0 || block.val('P') == 120.0 || block.val('P') == 121.0 || block.val('P') == 122.0 || block.val('P') == 123.0 || block.val('P') == 124.0 || block.val('P') == 125.0 || block.val('P') == 126.0 || block.val('P') == 127.0 || block.val('P') == 128.0 || block.val('P') == 129.0 || block.val('P') == 130.0 || block.val('P') == 131.0 || block.val('P') == 132.0 || block.val('P') == 133.0 || block.val('P') == 134.0 || block.val('P') == 135.0 || block.val('P') == 136.0 || block.val('P') == 137.0 || block.val('P') == 138.0 || block.val('P') == 139.0 || block.val('P') == 140.0 || block.val('P') == 141.0 || block.val('P') == 142.0 || block.val('P') == 143.0 || block.val('P') == 144.0 || block.val('P') == 145.0 || block.val('P') == 146.0 || block.val('P') == 147.0 || block.val('P') == 148.0 || block.val('P') == 149.0 || block.val('P') == 150.0 || block.val('P') == 151.0 || block.val('P') == 152.0 || block.val('P') == 153.0 || block.val('P') == 154.0 || block.val('P') == 155.0 || block.val('P') == 156.0 || block.val('P') == 157.0 || block.val('P') == 158.0 || block.val('P') == 159.0 || block.val('P') == 160.0 || block.val('P') == 161.0 || block.val('P') == 162.0 || block.val('P') == 163.0 || block.val('P') == 164.0 || block.val('P') == 165.0 || block.val('P') == 166.0 || block.val('P') == 167.0 || block.val('P') == 168.0 || block.val('P') == 169.0 || block.val('P') == 170.0 || block.val('P') == 171.0 || block.val('P') == 172.0 || block.val('P') == 173.0 || block.val('P') == 174.0 || block.val('P') == 175.0 || block.val('P') == 176.0 || block.val('P') == 177.0 || block.val('P') == 178.0 || block.val('P') == 179.0 || block.val('P') == 180.0 || block.val('P') == 181.0 || block.val('P') == 182.0 || block.val('P') == 183.0 || block.val('P') == 184.0 || block.val('P') == 185.0 || block.val('P') == 186.0 || block.val('P') == 187.0 || block.val('P') == 188.0 || block.val('P') == 189.0 || block.val('P') == 190.0 || block.val('P') == 191.0 || block.val('P') == 192.0 || block.val('P') == 193.0 || block.val('P') == 194.0 || block.val('P') == 195.0 || block.val('P') == 196.0 || block.val('P') == 197.0 || block.val('P') == 198.0 || block.val('P') == 199.0 || block.val('P') == 200.0 || block.val('P') == 201.0 || block.val('P') == 202.0 || block.val('P') == 203.0 || block.val('P') == 204.0 || block.val('P') == 205.0 || block.val('P') == 206.0 || block.val('P') == 207.0 || block.val('P') == 208.0 || block.val('P') == 209.0)) return StartEDM94SameThread(block);
+        block.val('P') == 113.0 || block.val('P') == 114.0 || block.val('P') == 115.0 || block.val('P') == 116.0 || block.val('P') == 117.0 || block.val('P') == 118.0 || block.val('P') == 119.0 || block.val('P') == 120.0 || block.val('P') == 121.0 || block.val('P') == 122.0 || block.val('P') == 123.0 || block.val('P') == 124.0 || block.val('P') == 125.0 || block.val('P') == 126.0 || block.val('P') == 127.0 || block.val('P') == 128.0 || block.val('P') == 129.0 || block.val('P') == 130.0 || block.val('P') == 131.0 || block.val('P') == 132.0 || block.val('P') == 133.0 || block.val('P') == 134.0 || block.val('P') == 135.0 || block.val('P') == 136.0 || block.val('P') == 137.0 || block.val('P') == 138.0 || block.val('P') == 139.0 || block.val('P') == 140.0 || block.val('P') == 141.0 || block.val('P') == 142.0 || block.val('P') == 143.0 || block.val('P') == 144.0 || block.val('P') == 145.0 || block.val('P') == 146.0 || block.val('P') == 147.0 || block.val('P') == 148.0 || block.val('P') == 149.0 || block.val('P') == 150.0 || block.val('P') == 151.0 || block.val('P') == 152.0 || block.val('P') == 153.0 || block.val('P') == 154.0 || block.val('P') == 155.0 || block.val('P') == 156.0 || block.val('P') == 157.0 || block.val('P') == 158.0 || block.val('P') == 159.0 || block.val('P') == 160.0 || block.val('P') == 161.0 || block.val('P') == 162.0 || block.val('P') == 163.0 || block.val('P') == 164.0 || block.val('P') == 165.0 || block.val('P') == 166.0 || block.val('P') == 167.0 || block.val('P') == 168.0 || block.val('P') == 169.0 || block.val('P') == 170.0 || block.val('P') == 171.0 || block.val('P') == 172.0 || block.val('P') == 173.0 || block.val('P') == 174.0 || block.val('P') == 175.0 || block.val('P') == 176.0 || block.val('P') == 177.0 || block.val('P') == 178.0 || block.val('P') == 179.0 || block.val('P') == 180.0 || block.val('P') == 181.0 || block.val('P') == 182.0 || block.val('P') == 183.0 || block.val('P') == 184.0 || block.val('P') == 185.0 || block.val('P') == 186.0 || block.val('P') == 187.0 || block.val('P') == 188.0 || block.val('P') == 189.0 || block.val('P') == 190.0 || block.val('P') == 191.0 || block.val('P') == 192.0 || block.val('P') == 193.0 || block.val('P') == 194.0 || block.val('P') == 195.0 || block.val('P') == 196.0 || block.val('P') == 197.0 || block.val('P') == 198.0 || block.val('P') == 199.0 || block.val('P') == 200.0 || block.val('P') == 201.0 || block.val('P') == 202.0 || block.val('P') == 203.0 || block.val('P') == 204.0 || block.val('P') == 205.0 || block.val('P') == 206.0 || block.val('P') == 207.0 || block.val('P') == 208.0 || block.val('P') == 209.0 || block.val('P') == 210.0 || block.val('P') == 211.0 || block.val('P') == 212.0 || block.val('P') == 213.0 || block.val('P') == 214.0 || block.val('P') == 215.0 || block.val('P') == 216.0 || block.val('P') == 217.0 || block.val('P') == 218.0 || block.val('P') == 219.0 || block.val('P') == 220.0 || block.val('P') == 221.0 || block.val('P') == 222.0 || block.val('P') == 223.0 || block.val('P') == 224.0 || block.val('P') == 225.0 || block.val('P') == 226.0 || block.val('P') == 227.0 || block.val('P') == 228.0 || block.val('P') == 229.0 || block.val('P') == 230.0 || block.val('P') == 231.0 || block.val('P') == 232.0 || block.val('P') == 233.0 || block.val('P') == 234.0 || block.val('P') == 236.0 || block.val('P') == 238.0 || block.val('P') == 240.0 || block.val('P') == 242.0 || block.val('P') == 244.0 || block.val('P') == 246.0 || block.val('P') == 248.0 || block.val('P') == 250.0 || block.val('P') == 252.0 || block.val('P') == 235.0 || block.val('P') == 237.0 || block.val('P') == 239.0 || block.val('P') == 241.0 || block.val('P') == 243.0 || block.val('P') == 245.0 || block.val('P') == 247.0 || block.val('P') == 249.0 || block.val('P') == 251.0 || block.val('P') == 253.0 || block.val('P') == 254.0 || block.val('P') == 255.0 || block.val('P') == 256.0 || block.val('P') == 257.0 || block.val('P') == 258.0 || block.val('P') == 259.0 || block.val('P') == 260.0 || block.val('P') == 261.0 || block.val('P') == 262.0 || block.val('P') == 263.0 || block.val('P') == 264.0 || block.val('P') == 265.0 || block.val('P') == 266.0 || block.val('P') == 267.0 || block.val('P') == 268.0 || block.val('P') == 269.0 || block.val('P') == 270.0 || block.val('P') == 271.0 || block.val('P') == 272.0 || block.val('P') == 273.0 || block.val('P') == 274.0 || block.val('P') == 275.0 || block.val('P') == 276.0 || block.val('P') == 277.0 || block.val('P') == 278.0 || block.val('P') == 279.0 || block.val('P') == 280.0 || block.val('P') == 281.0 || block.val('P') == 282.0 || block.val('P') == 283.0 || block.val('P') == 284.0 || (block.val('P') == 286.0 || block.val('P') == 288.0 || block.val('P') == 290.0) || block.val('P') == 285.0 || (block.val('P') == 287.0 || block.val('P') == 289.0 || block.val('P') == 291.0))) return StartEDM94SameThread(block);
     ServiceEDMCoordinatedRTRetirementSameThread();
     if (m_edmCoordinatedRT.retirePending || (m_edmCoordinatedRT.submitted && !m_edmCoordinatedRT.retired))
     { RejectGapDryRunSameThread(AlarmManager::PATH_EXECUTION_NOT_READY, m_gapDryRun.sourceLine, "EDM84_PREVIOUS_SESSION_BUSY"); return nullptr; }
@@ -15456,10 +15629,19 @@ namespace
     bool E108ProfileOnlyNPQRSIJK(const NCParsedBlock& b, unsigned selector, EDM97::Tuning& tuning,
         EDM107::FlushProfile& profile) noexcept
     {
-        if ((selector != 109U && selector != 111U && selector != 113U && selector != 115U && selector != 117U && selector != 119U && selector != 121U && selector != 123U && selector != 125U && selector != 127U && selector != 129U && selector != 132U && selector != 134U && selector != 136U && selector != 138U && selector != 140U && selector != 142U && selector != 144U && selector != 146U && selector != 148U && selector != 150U && selector != 152U && selector != 154U && selector != 156U && selector != 162U && selector != 164U && selector != 166U && selector != 168U && selector != 170U && selector != 172U && selector != 174U && selector != 176U && selector != 178U && selector != 180U && selector != 182U && selector != 184U && selector != 186U && selector != 188U && selector != 190U && selector != 192U && selector != 194U && selector != 196U && selector != 198U && selector != 200U && selector != 202U && selector != 204U && selector != 206U && selector != 208U) || !EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+        if (b.has('L'))
+        {
+            unsigned selection = 0U;
+            for (unsigned value = 1U; value <= 3U; ++value)
+                if (EDM77::Detail::EqualLiteral(b.expression('L'), value)) selection = value;
+            if (!b.has('H') || !EDM130::ValidFlushHoldSelection(selector, selection)) return false;
+        }
+        if ((selector != 109U && selector != 111U && selector != 113U && selector != 115U && selector != 117U && selector != 119U && selector != 121U && selector != 123U && selector != 125U && selector != 127U && selector != 129U && selector != 132U && selector != 134U && selector != 136U && selector != 138U && selector != 140U && selector != 142U && selector != 144U && selector != 146U && selector != 148U && selector != 150U && selector != 152U && selector != 154U && selector != 156U && selector != 162U && selector != 164U && selector != 166U && selector != 168U && selector != 170U && selector != 172U && selector != 174U && selector != 176U && selector != 178U && selector != 180U && selector != 182U && selector != 184U && selector != 186U && selector != 188U && selector != 190U && selector != 192U && selector != 194U && selector != 196U && selector != 198U && selector != 200U && selector != 202U && selector != 204U && selector != 206U && selector != 208U && selector != 210U && selector != 212U && selector != 214U && selector != 216U && selector != 218U && selector != 220U && selector != 222U && selector != 224U && selector != 226U && selector != 228U && selector != 230U && selector != 232U && selector != 234U && selector != 236U && selector != 238U && selector != 240U && selector != 242U && selector != 244U && selector != 246U && selector != 248U && selector != 250U && selector != 252U && selector != 254U && selector != 256U && selector != 258U && selector != 260U && selector != 262U && selector != 264U && selector != 266U && selector != 268U && selector != 270U && selector != 272U && selector != 274U && selector != 276U && selector != 278U && selector != 280U && selector != 282U && selector != 284U && selector != 286U && selector != 288U && selector != 290U && selector != 292U) || !EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
             !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
-            !EDM77::Detail::OnlyAddresses(b, "NPQRSIJK") || !b.has('P') ||
+            !EDM77::Detail::OnlyAddresses(b, EDM149::IsFlushHoldTestArm(selector) ? "NPQRSIJKHL" :
+                EDM149::IsManualVoltageTestArm(selector) ? "NPQRSIJKH" : "NPQRSIJK") || !b.has('P') ||
             !EDM77::Detail::EqualLiteral(b.expression('P'), selector) ||
+            (b.has('H') && !EDM77::Detail::EqualLiteral(b.expression('H'), 1U)) ||
             !b.has('Q') || !b.has('R') || !b.has('S') || !b.has('I') || !b.has('J') || !b.has('K')) return false;
         EDM97::Tuning parsed{};
         EDM107::FlushProfile parsedProfile{};
@@ -15478,6 +15660,11 @@ namespace
     bool E107ProfileOnlyNPQRSIJK(const NCParsedBlock& b, EDM97::Tuning& tuning,
         EDM107::FlushProfile& profile) noexcept
     { return E108ProfileOnlyNPQRSIJK(b, 109U, tuning, profile); }
+    bool E149M00Shape(const NCParsedBlock& block) noexcept
+    {
+        return EDM77::Detail::Clean(block) && !block.isEmpty && block.gCount == 0 && block.mCount == 1 &&
+            EDM77::Detail::EqualLiteral(block.mExpressions[0], 0U) && EDM77::Detail::OnlyAddresses(block, "N");
+    }
     bool E94Preamble(const NCParsedBlock& b) noexcept
     {
         if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
@@ -15531,26 +15718,109 @@ namespace
             EDM77::Detail::OnlyAddresses(b, "NB") && b.has('B') &&
             E94Number(b.expression('B'), value) && EDM116::ParseMode(value, mode);
     }
+    // EDM155 omitted center components are this literal's +0, never modal state.
+    // Earlier fixtures still require both authored I and J words.
+    bool E155ArcCenter(const NCParsedBlock& b, std::array<double, 2U>& center,
+        EDM116::Fixture fixture) noexcept
+    {
+        center.fill(0.0);
+        const bool sparse = fixture == EDM116::Fixture::ModalSparseArc155 || fixture == EDM116::Fixture::ModalProgram156 || fixture == EDM116::Fixture::ModalPause157 || fixture == EDM116::Fixture::ModalXYZVisibleFlush159 || fixture == EDM116::Fixture::ModalSixVisibleFlush167;
+        if (sparse ? (!b.has('I') && !b.has('J')) : (!b.has('I') || !b.has('J'))) return false;
+        return (!b.has('I') || E94Number(b.expression('I'), center[0])) &&
+            (!b.has('J') || E94Number(b.expression('J'), center[1]));
+    }
     bool E114Move(const NCParsedBlock& b, unsigned step, std::array<double, 6U>& delta, double& feed,
-        EDM116::Fixture fixture = EDM116::Fixture::Canonical116) noexcept
+        EDM116::Fixture fixture = EDM116::Fixture::Canonical116, bool authoredLine = false) noexcept
     {
         if (!EDM116::ValidFixture(fixture) || step >= EDM114::RequiredRows) return false;
-        if (!EDM116::IsArcStep(step, fixture))
+        if (fixture == EDM116::Fixture::ModalVisibleFlush158)
         {
+            delta.fill(0.0);
+            return step == 0U && EDM77::Detail::Clean(b) && !b.isEmpty && b.gCount == 1 && b.mCount == 0 &&
+                EDM77::Detail::EqualLiteral(b.gExpressions[0], 1U) &&
+                EDM77::Detail::OnlyAddresses(b, "NZF") && b.has('Z') && b.has('F') &&
+                E94Number(b.expression('Z'), delta[2]) && E94Number(b.expression('F'), feed) &&
+                delta[2] == -0.0015 && feed == 0.12;
+        }
+        int authoredCode = 0;
+        if (EDM116::IsAuthoredOrderFixture(fixture))
+        {
+            double literalCode = 0.0;
+            if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+                !E94Number(b.gExpressions[0], literalCode) ||
+                (literalCode != 1.0 && literalCode != 2.0 && literalCode != 3.0)) return false;
+            authoredCode = static_cast<int>(literalCode);
+        }
+        if (fixture == EDM116::Fixture::ModalZ149 ||
+            (fixture == EDM116::Fixture::ModalXYZ150 && !EDM116::IsArcStep(step,fixture)))
+        {
+            delta.fill(0.0);
+            if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+                !EDM77::Detail::EqualLiteral(b.gExpressions[0], 1U) ||
+                !EDM77::Detail::OnlyAddresses(b, "NXYZCUVF") || !b.has('Z') || !b.has('F') ||
+                (fixture == EDM116::Fixture::ModalXYZ150 && (!b.has('X') || !b.has('Y'))) ||
+                !E94Number(b.expression('F'), feed)) return false;
+            for (unsigned axis = 0U; axis < 6U; ++axis)
+                if (b.has("XYZCUV"[axis]) && !E94Number(b.expression("XYZCUV"[axis]), delta[axis])) return false;
+            return fixture == EDM116::Fixture::ModalXYZ150 ? EDM149::ValidXYZIncrement(delta,feed) : EDM149::ValidZIncrement(delta,feed);
+        }
+        if (!EDM116::IsArcStep(step, fixture, authoredCode))
+        {
+            if (fixture == EDM116::Fixture::ModalSparse154 || fixture == EDM116::Fixture::ModalSparseArc155 || fixture == EDM116::Fixture::ModalProgram156 || fixture == EDM116::Fixture::ModalPause157 || fixture == EDM116::Fixture::ModalXYZVisibleFlush159 || fixture == EDM116::Fixture::ModalSixVisibleFlush167)
+            {
+                delta.fill(0.0);
+                if (!EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
+                    !EDM77::Detail::EqualLiteral(b.gExpressions[0], 1U) ||
+                    !EDM77::Detail::OnlyAddresses(b, "NXYZCUVF") || !b.has('F') ||
+                    !E94Number(b.expression('F'), feed)) return false;
+                for (unsigned axis = 0U; axis < 6U; ++axis)
+                    if (b.has("XYZCUV"[axis]) && !E94Number(b.expression("XYZCUV"[axis]), delta[axis])) return false;
+                return EDM149::ValidSparseIncrement(delta, feed);
+            }
             if (!E94Move(b, delta, feed) || feed != 0.12) return false;
+            if (authoredLine || fixture == EDM116::Fixture::ModalSix151 || EDM116::IsBoundedArcFixture(fixture)) return EDM96::ValidIncrement(delta, feed);
             for (unsigned a = 0U; a < 6U; ++a)
                 if (delta[a] != ((step & 1U) ? -1.0 : 1.0) * (a < 3U ? 0.001 : 0.020)) return false;
             return true;
         }
         delta.fill(0.0);
         std::array<double, 2U> center{};
+        const bool sparse = fixture == EDM116::Fixture::ModalSparseArc155 || fixture == EDM116::Fixture::ModalProgram156 || fixture == EDM116::Fixture::ModalPause157 || fixture == EDM116::Fixture::ModalXYZVisibleFlush159 || fixture == EDM116::Fixture::ModalSixVisibleFlush167;
         return EDM77::Detail::Clean(b) && !b.isEmpty && b.gCount == 1 && b.mCount == 0 &&
-            EDM77::Detail::EqualLiteral(b.gExpressions[0], static_cast<unsigned>(EDM116::ExpectedGCode(step, fixture))) &&
-            EDM77::Detail::OnlyAddresses(b, "NXYIJF") && b.has('X') && b.has('Y') && b.has('I') && b.has('J') && b.has('F') &&
-            E94Number(b.expression('X'), delta[0]) && E94Number(b.expression('Y'), delta[1]) &&
-            E94Number(b.expression('I'), center[0]) && E94Number(b.expression('J'), center[1]) &&
+            EDM77::Detail::EqualLiteral(b.gExpressions[0], static_cast<unsigned>(EDM116::ExpectedGCode(step, fixture, authoredCode))) &&
+            EDM77::Detail::OnlyAddresses(b, "NXYIJF") && b.has('F') &&
+            (sparse ? (b.has('X') || b.has('Y')) : (b.has('X') && b.has('Y'))) &&
+            (!b.has('X') || E94Number(b.expression('X'), delta[0])) &&
+            (!b.has('Y') || E94Number(b.expression('Y'), delta[1])) && E155ArcCenter(b, center, fixture) &&
             E94Number(b.expression('F'), feed) &&
-            EDM116::ValidArcRecipe(EDM116::ExpectedGCode(step, fixture), step, delta, center, feed, fixture);
+            EDM116::ValidArcRecipe(EDM116::ExpectedGCode(step, fixture, authoredCode), step, delta, center, feed, fixture);
+    }
+    bool E152ArcAdmission(const NCParsedBlock& geometry, unsigned step,
+        const std::array<double, 6U>& increment, double feed,
+        const std::array<double, 6U>& origin, double& lengthMm,
+        EDM116::Fixture fixture = EDM116::Fixture::ModalArc152) noexcept
+    {
+        lengthMm = 0.0;
+        std::array<double, 6U> literalIncrement{}; double literalFeed = 0.0;
+        std::array<double, 2U> center{}; EDM112::Curve curve{}; EDM112::Bounds bounds{};
+        double literalCode = 0.0;
+        if (!EDM116::IsBoundedArcFixture(fixture) || !E94Number(geometry.gExpressions[0], literalCode) || !E114Move(geometry, step, literalIncrement, literalFeed, fixture) ||
+            literalIncrement != increment || literalFeed != feed ||
+            !E155ArcCenter(geometry, center, fixture) ||
+            !EDM114::BuildBoundedXYArc(EDM116::ExpectedGCode(step, fixture, static_cast<int>(literalCode)),
+                increment, center, feed, curve) || !EDM112::WholeCurveBounds(curve, bounds) || !bounds.valid) return false;
+        // The builder uses a synthetic pulse scale. Only its native bounds
+        // can be translated into this arm-relative millimetre/degree frame.
+        for (unsigned axis = 0U; axis < 6U; ++axis)
+        {
+            const double low = origin[axis] + bounds.minNative[axis];
+            const double high = origin[axis] + bounds.maxNative[axis];
+            const double limit = axis < 3U ? 0.025 : 0.5;
+            if (!std::isfinite(origin[axis]) || !std::isfinite(low) || !std::isfinite(high) ||
+                low < -limit || high > limit) return false;
+        }
+        if (!std::isfinite(curve.lengthMm) || curve.lengthMm <= 0.0) return false;
+        lengthMm = curve.lengthMm; return true;
     }
     bool E115SameExcursion(const EDM115::Feedback& a, const EDM115::Feedback& b) noexcept
     {
@@ -15771,24 +16041,36 @@ namespace
         return true;
     }
     bool E128Counts(const EDM114::Feedback& f, unsigned completed,
-        EDM116::Fixture fixture = EDM116::Fixture::Canonical116, bool workTime = false) noexcept
+        EDM116::Fixture fixture = EDM116::Fixture::Canonical116, bool workTime = false,
+        const std::array<std::uint8_t, EDM114::RequiredRows>* authoredCodes = nullptr,
+        unsigned expectedRows = EDM114::RequiredRows) noexcept
     {
-        if (!EDM116::IsModalFixture(fixture) || completed > EDM114::RequiredRows || !f.enabled || f.failed || f.reason != EDM114::Reason::None ||
+        if (!expectedRows || expectedRows > EDM114::RequiredRows ||
+            (fixture != EDM116::Fixture::ModalProgram156 && fixture != EDM116::Fixture::ModalPause157 && fixture != EDM116::Fixture::ModalVisibleFlush158 && fixture != EDM116::Fixture::ModalXYZVisibleFlush159 && fixture != EDM116::Fixture::ModalSixVisibleFlush167 && expectedRows != EDM114::RequiredRows) ||
+            !EDM116::IsModalFixture(fixture) || completed > expectedRows || !f.enabled || f.failed || f.reason != EDM114::Reason::None ||
             f.stopActive || f.stopped || f.begunRows != completed || f.completedRows != completed ||
-            f.endpointRows != completed || f.completed != (completed == EDM114::RequiredRows) ||
+            f.endpointRows != completed || f.completed != (completed == expectedRows) ||
             f.rowComplete != (completed != 0U) || f.geometryValid != (completed != 0U) ||
             f.mappedOutput != (completed != 0U)) return false;
+        if (EDM116::IsAuthoredOrderFixture(fixture) && !authoredCodes) return false;
+        const auto codeAt = [&](unsigned row) noexcept -> int {
+            return EDM116::ExpectedGCode(row, fixture, authoredCodes ? (*authoredCodes)[row] : 0);
+        };
         unsigned lines = 0U, arcs = 0U, cw = 0U, ccw = 0U;
         for (unsigned i = 0U; i < completed; ++i)
-            if (EDM116::IsArcStep(i, fixture)) { ++arcs; if (EDM116::ExpectedGCode(i, fixture) == 2) ++cw; else ++ccw; }
-            else ++lines;
+        {
+            const int code = codeAt(i);
+            if (code == 2 || code == 3) { ++arcs; if (code == 2) ++cw; else ++ccw; }
+            else if (code == 1) ++lines;
+            else return false;
+        }
         if (f.lineRows != lines || f.arcRows != arcs || f.cwRows != cw || f.ccwRows != ccw) return false;
         if (completed == 0U) return f.kind == EDM114::Kind::None;
         // EDM130 triggers by committed work time, so either row parity may have
         // zero or multiple flush events. IsEDM130CurrentSameThread checks their
         // timer, modal B, dwell and exact-return receipts independently.
         // Keep EDM128/129 fixed-row flush checks and all sample budgets intact.
-        if (f.kind != (EDM116::IsArcStep(completed - 1U, fixture) ? EDM114::Kind::Arc : EDM114::Kind::Line) ||
+        if (f.kind != ((codeAt(completed - 1U) == 2 || codeAt(completed - 1U) == 3) ? EDM114::Kind::Arc : EDM114::Kind::Line) ||
             !f.lastMappingTick || f.lastTick != f.lastMappingTick || !f.lastMappingUs ||
             !f.rowSamples || !f.rowForward ||
             f.rowForward > f.rowSamples || f.rowReverse > f.rowSamples - f.rowForward ||
@@ -15801,6 +16083,124 @@ namespace
             if (!std::isfinite(f.startPulse[a]) || !std::isfinite(f.endPulse[a]) ||
                 !std::isfinite(f.pulsePerNative[a]) || f.pulsePerNative[a] <= 0.0) return false;
         return true;
+    }
+    template<class State>
+    unsigned E156NominalMovementMask(const State& s) noexcept
+    {
+        if (!s.moves || s.moves > EDM114::RequiredRows) return 0U;
+        unsigned mask = 0U;
+        for (unsigned row = 0U; row < s.moves; ++row)
+        {
+            const auto& delta = s.increment[row];
+            if (s.authoredGCode[row] == 1U)
+            {
+                if (!EDM149::ValidSparseIncrement(delta, s.feed[row])) return 0U;
+                for (unsigned axis = 0U; axis < 6U; ++axis) if (delta[axis] != 0.0) mask |= 1U << axis;
+            }
+            else if (s.authoredGCode[row] == 2U || s.authoredGCode[row] == 3U)
+            {
+                if (s.feed[row] != 0.12 || (delta[0] == 0.0 && delta[1] == 0.0)) return 0U;
+                for (unsigned axis = 0U; axis < 6U; ++axis)
+                    if (!std::isfinite(delta[axis]) || (axis >= 2U && delta[axis] != 0.0)) return 0U;
+                // Even an omitted/zero endpoint component moves inside a valid XY arc.
+                mask |= 3U;
+            }
+            else return 0U;
+        }
+        return mask;
+    }
+    template<class State>
+    bool E158VisiblePlan(const State& s) noexcept
+    {
+        if (!EDM149::IsVisibleFlushTestArm(s.gapHistoryArm) ||
+            s.gapModeFixture != EDM116::Fixture::ModalVisibleFlush158 || s.moves != 1U ||
+            s.authoredGCode[0] != 1U || s.feed[0] != 0.12 || s.increment[0][2] != -0.0015) return false;
+        for (unsigned axis = 0U; axis < 6U; ++axis)
+            if (axis != 2U && s.increment[0][axis] != 0.0) return false;
+        return true;
+    }
+    template<class State>
+    bool E159VisiblePlan(const State& s) noexcept
+    {
+        if (!EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm) ||
+            s.gapModeFixture != EDM116::Fixture::ModalXYZVisibleFlush159 || s.moves != 3U) return false;
+        const unsigned codes[3] = {1U, 2U, 3U};
+        const double increments[3][6] = {{0.0015,-0.0015,-0.0015,0.0,0.0,0.0},
+            {0.002,0.0,0.0,0.0,0.0,0.0},{-0.002,0.0,0.0,0.0,0.0,0.0}};
+        for (unsigned row = 0U; row < 3U; ++row)
+        {
+            if (s.authoredGCode[row] != codes[row] || s.feed[row] != 0.12) return false;
+            for (unsigned axis = 0U; axis < 6U; ++axis)
+                if (s.increment[row][axis] != increments[row][axis]) return false;
+        }
+        return E156NominalMovementMask(s) == 7U;
+    }
+    template<class State>
+    bool E167VisiblePlan(const State& s) noexcept
+    {
+        if (!EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm) ||
+            s.gapModeFixture != EDM116::Fixture::ModalSixVisibleFlush167 || s.moves != 3U) return false;
+        const unsigned codes[3] = {1U, 2U, 3U};
+        const double increments[3][6] = {{0.0015,-0.0015,-0.0015,0.020,-0.020,0.020},
+            {0.002,0.0,0.0,0.0,0.0,0.0},{-0.002,0.0,0.0,0.0,0.0,0.0}};
+        for (unsigned row = 0U; row < 3U; ++row)
+        {
+            if (s.authoredGCode[row] != codes[row] || s.feed[row] != 0.12) return false;
+            for (unsigned axis = 0U; axis < 6U; ++axis)
+                if (s.increment[row][axis] != increments[row][axis]) return false;
+        }
+        return E156NominalMovementMask(s) == 63U;
+    }
+    template<class State>
+    bool E156BoundPlanCurrent(const State& s, const EDM130::Recipe& recipe) noexcept
+    {
+        if (s.gapHistoryArm==292U) return s.moves==1U && recipe.planRows==25U && recipe.planMovementMask==7U &&
+            recipe.commissioningProfile==4U && EDM130::ValidRecipe(recipe);
+        if (!EDM149::IsBoundedProgramTestArm(s.gapHistoryArm))
+            return s.moves == EDM114::RequiredRows && !recipe.planRows && !recipe.planMovementMask &&
+                !recipe.commissioningProfile && !recipe.holdRetreatMode && !recipe.flushHoldTest;
+        const unsigned fixture = E149HistoryFixture(s.gapHistoryArm);
+        return (EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm) ?
+            (E167VisiblePlan(s) && EDM130::IsVisibleFlush167(recipe)) :
+            EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm) ?
+            (E159VisiblePlan(s) && EDM130::IsVisibleFlush159(recipe)) :
+            EDM149::IsVisibleFlushTestArm(s.gapHistoryArm) ?
+            (E158VisiblePlan(s) && recipe.flushStages.finalSpeedPercentScaled == 10000000U &&
+                recipe.flushStages.approachDistanceScaled == 100ULL &&
+                recipe.flushStages.initialSpeedPercentScaled == 1000000U && !recipe.flushStages.initialDistanceScaled) :
+            !recipe.commissioningProfile) &&
+            EDM149::IsProgramHistoryFixture(fixture) && s.gapModeFixture == E149ModalFixture(fixture) &&
+            EDM130::HasBoundProgramPlan(recipe) && EDM130::ValidHistoryRecipeBinding(fixture, recipe) &&
+            EDM130::ProgramRows(recipe) == s.moves &&
+            EDM130::ProgramMovementMask(recipe) == E156NominalMovementMask(s);
+    }
+    template<class State>
+    unsigned E156RequiredMovementMask(const State& s, const EDM130::Recipe& recipe) noexcept
+    {
+        if (s.gapHistoryArm==292U) return E156BoundPlanCurrent(s,recipe)?7U:64U;
+        return EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) ?
+            (E156BoundPlanCurrent(s, recipe) ? EDM130::ProgramMovementMask(recipe) : 64U) :
+            EDM149::MovementMaskForArm(s.gapHistoryArm);
+    }
+    template<class State>
+    bool E156FinishTargetMatches(const State& s, const EDM130::Recipe& recipe,
+        const EDM94::Feedback& guard, const EDM114::Feedback& last) noexcept
+    {
+        if (s.gapHistoryArm==292U) return E156BoundPlanCurrent(s,recipe) && guard.boundedProgram && guard.finishTargetBound &&
+            guard.requiredMovementMask==7U && last.session==s.session && last.armEpoch==s.armEpoch &&
+            last.ownerGeneration==s.lease.generation && last.completed && !last.failed && last.rowComplete &&
+            last.completedRows==25U && last.source.step==24U && last.source.scope.session==s.session &&
+            last.source.scope.run==s.run && last.source.scope.cache==s.cache && last.source.sourcePC==s.pc[0U] &&
+            guard.finishTargetPulse==last.endPulse;
+        if (!EDM149::IsBoundedProgramTestArm(s.gapHistoryArm)) return true;
+        return E156BoundPlanCurrent(s, recipe) && guard.boundedProgram && guard.finishTargetBound &&
+            guard.requiredMovementMask == EDM130::ProgramMovementMask(recipe) &&
+            last.session == s.session && last.armEpoch == s.armEpoch &&
+            last.ownerGeneration == s.lease.generation && last.completed && !last.failed && last.rowComplete &&
+            last.completedRows == s.moves && last.source.step + 1U == s.moves &&
+            last.source.scope.session == s.session && last.source.scope.run == s.run &&
+            last.source.scope.cache == s.cache && last.source.sourcePC == s.pc[s.moves - 1U] &&
+            guard.finishTargetPulse == last.endPulse;
     }
     bool E94Matches(const NCParsedBlock& parsed, const NCBlock& b) noexcept
     {
@@ -15830,7 +16230,7 @@ namespace
     // creates retained history, or grants mapping/output authority.
     template<class State, class Cache>
     bool E132GeometryProof(const State& s, const Cache& cache, const EDM128::Feedback& e,
-        unsigned completed) noexcept
+        unsigned completed, const std::array<EDM141::Row, EDM141::RowCapacity>* frozenRows = nullptr) noexcept
     {
         if (!completed || completed > EDM114::RequiredRows || !e.anchorCaptured || !e.targetCaptured || !e.topCaptured ||
             e.anchor.cursorSource.ordinal >= completed) return false;
@@ -15861,10 +16261,15 @@ namespace
         for (unsigned row = 0U; row < completed; ++row)
         {
             const auto* line = cache.TryGetLine(s.pc[row]);
-            if (!line || !EDM77::Detail::Clean(line->parsedBlock)) return false;
-            const auto& b = line->parsedBlock;
+            if (!line) return false;
+            NCParsedBlock literal{};
+            if (frozenRows && (!EDM141::MakeLiteral(line->parsedBlock, (*frozenRows)[row], literal) ||
+                (*frozenRows)[row].pc != s.pc[row])) return false;
+            const auto& b = frozenRows ? literal : line->parsedBlock;
+            if (!EDM77::Detail::Clean(b)) return false;
             double g = 0.0;
-            if (b.gCount != 1 || !E94Number(b.gExpressions[0], g) || (g != 1.0 && g != 2.0 && g != 3.0)) return false;
+            if (b.gCount != 1 || !E94Number(b.gExpressions[0], g) || (g != 1.0 && g != 2.0 && g != 3.0) ||
+                (EDM116::IsAuthoredOrderFixture(s.gapModeFixture) && g != s.authoredGCode[row])) return false;
             EDM112::Point end{};
             for (unsigned axis = 0U; axis < 6U; ++axis)
             {
@@ -15879,8 +16284,7 @@ namespace
             else
             {
                 std::array<double, 2U> center{};
-                if (!b.has('I') || !b.has('J') || !E94Number(b.expression('I'), center[0]) ||
-                    !E94Number(b.expression('J'), center[1]) ||
+                if (!E155ArcCenter(b, center, s.gapModeFixture) ||
                     !EDM112::BuildArc(start, end, scale, 17U, center, g == 2.0 ? -1 : 1, false, curve)) return false;
             }
             if (row == e.anchor.cursorSource.ordinal)
@@ -15935,6 +16339,7 @@ namespace
 
 bool NCManager::IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block) noexcept
 {
+    if (block.has('P') && (block.val('P')==292.0 || block.val('P')==293.0)) return IsEDM173BracketBlockSameThread(block);
     if (block.has('P') && block.val('P') == 131.0)
         return IsEDM116SelectorCurrentSameThread(block);
     if (block.isEmpty || block.isGoto || block.isBlockSkip || !block.hasG || block.gCode != 180 ||
@@ -15953,7 +16358,7 @@ bool NCManager::IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block)
             block.val('P') != 107.0 && block.val('P') != 108.0 &&
             block.val('P') != 109.0 && block.val('P') != 110.0 &&
             block.val('P') != 111.0 && block.val('P') != 112.0 &&
-            block.val('P') != 113.0 && block.val('P') != 114.0 && block.val('P') != 115.0 && block.val('P') != 116.0 && block.val('P') != 117.0 && block.val('P') != 118.0 && block.val('P') != 119.0 && block.val('P') != 120.0 && block.val('P') != 121.0 && block.val('P') != 122.0 && block.val('P') != 123.0 && block.val('P') != 124.0 && block.val('P') != 125.0 && block.val('P') != 126.0 && block.val('P') != 127.0 && block.val('P') != 128.0 && block.val('P') != 129.0 && block.val('P') != 130.0 && block.val('P') != 132.0 && block.val('P') != 133.0 && block.val('P') != 134.0 && block.val('P') != 135.0 && block.val('P') != 136.0 && block.val('P') != 137.0 && block.val('P') != 138.0 && block.val('P') != 139.0 && block.val('P') != 140.0 && block.val('P') != 141.0 && block.val('P') != 142.0 && block.val('P') != 143.0 && block.val('P') != 144.0 && block.val('P') != 145.0 && block.val('P') != 146.0 && block.val('P') != 147.0 && block.val('P') != 148.0 && block.val('P') != 149.0 && block.val('P') != 150.0 && block.val('P') != 151.0 && block.val('P') != 152.0 && block.val('P') != 153.0 && block.val('P') != 154.0 && block.val('P') != 155.0 && block.val('P') != 156.0 && block.val('P') != 157.0 && block.val('P') != 158.0 && block.val('P') != 159.0 && block.val('P') != 160.0 && block.val('P') != 161.0 && block.val('P') != 162.0 && block.val('P') != 163.0 && block.val('P') != 164.0 && block.val('P') != 165.0 && block.val('P') != 166.0 && block.val('P') != 167.0 && block.val('P') != 168.0 && block.val('P') != 169.0 && block.val('P') != 170.0 && block.val('P') != 171.0 && block.val('P') != 172.0 && block.val('P') != 173.0 && block.val('P') != 174.0 && block.val('P') != 175.0 && block.val('P') != 176.0 && block.val('P') != 177.0 && block.val('P') != 178.0 && block.val('P') != 179.0 && block.val('P') != 180.0 && block.val('P') != 181.0 && block.val('P') != 182.0 && block.val('P') != 183.0 && block.val('P') != 184.0 && block.val('P') != 185.0 && block.val('P') != 186.0 && block.val('P') != 187.0 && block.val('P') != 188.0 && block.val('P') != 189.0 && block.val('P') != 190.0 && block.val('P') != 191.0 && block.val('P') != 192.0 && block.val('P') != 193.0 && block.val('P') != 194.0 && block.val('P') != 195.0 && block.val('P') != 196.0 && block.val('P') != 197.0 && block.val('P') != 198.0 && block.val('P') != 199.0 && block.val('P') != 200.0 && block.val('P') != 201.0 && block.val('P') != 202.0 && block.val('P') != 203.0 && block.val('P') != 204.0 && block.val('P') != 205.0 && block.val('P') != 206.0 && block.val('P') != 207.0 && block.val('P') != 208.0 && block.val('P') != 209.0) || m_mode != NCOperationMode::MEMORY ||
+            block.val('P') != 113.0 && block.val('P') != 114.0 && block.val('P') != 115.0 && block.val('P') != 116.0 && block.val('P') != 117.0 && block.val('P') != 118.0 && block.val('P') != 119.0 && block.val('P') != 120.0 && block.val('P') != 121.0 && block.val('P') != 122.0 && block.val('P') != 123.0 && block.val('P') != 124.0 && block.val('P') != 125.0 && block.val('P') != 126.0 && block.val('P') != 127.0 && block.val('P') != 128.0 && block.val('P') != 129.0 && block.val('P') != 130.0 && block.val('P') != 132.0 && block.val('P') != 133.0 && block.val('P') != 134.0 && block.val('P') != 135.0 && block.val('P') != 136.0 && block.val('P') != 137.0 && block.val('P') != 138.0 && block.val('P') != 139.0 && block.val('P') != 140.0 && block.val('P') != 141.0 && block.val('P') != 142.0 && block.val('P') != 143.0 && block.val('P') != 144.0 && block.val('P') != 145.0 && block.val('P') != 146.0 && block.val('P') != 147.0 && block.val('P') != 148.0 && block.val('P') != 149.0 && block.val('P') != 150.0 && block.val('P') != 151.0 && block.val('P') != 152.0 && block.val('P') != 153.0 && block.val('P') != 154.0 && block.val('P') != 155.0 && block.val('P') != 156.0 && block.val('P') != 157.0 && block.val('P') != 158.0 && block.val('P') != 159.0 && block.val('P') != 160.0 && block.val('P') != 161.0 && block.val('P') != 162.0 && block.val('P') != 163.0 && block.val('P') != 164.0 && block.val('P') != 165.0 && block.val('P') != 166.0 && block.val('P') != 167.0 && block.val('P') != 168.0 && block.val('P') != 169.0 && block.val('P') != 170.0 && block.val('P') != 171.0 && block.val('P') != 172.0 && block.val('P') != 173.0 && block.val('P') != 174.0 && block.val('P') != 175.0 && block.val('P') != 176.0 && block.val('P') != 177.0 && block.val('P') != 178.0 && block.val('P') != 179.0 && block.val('P') != 180.0 && block.val('P') != 181.0 && block.val('P') != 182.0 && block.val('P') != 183.0 && block.val('P') != 184.0 && block.val('P') != 185.0 && block.val('P') != 186.0 && block.val('P') != 187.0 && block.val('P') != 188.0 && block.val('P') != 189.0 && block.val('P') != 190.0 && block.val('P') != 191.0 && block.val('P') != 192.0 && block.val('P') != 193.0 && block.val('P') != 194.0 && block.val('P') != 195.0 && block.val('P') != 196.0 && block.val('P') != 197.0 && block.val('P') != 198.0 && block.val('P') != 199.0 && block.val('P') != 200.0 && block.val('P') != 201.0 && block.val('P') != 202.0 && block.val('P') != 203.0 && block.val('P') != 204.0 && block.val('P') != 205.0 && block.val('P') != 206.0 && block.val('P') != 207.0 && block.val('P') != 208.0 && block.val('P') != 209.0 && block.val('P') != 210.0 && block.val('P') != 211.0 && block.val('P') != 212.0 && block.val('P') != 213.0 && block.val('P') != 214.0 && block.val('P') != 215.0 && block.val('P') != 216.0 && block.val('P') != 217.0 && block.val('P') != 218.0 && block.val('P') != 219.0 && block.val('P') != 220.0 && block.val('P') != 221.0 && block.val('P') != 222.0 && block.val('P') != 223.0 && block.val('P') != 224.0 && block.val('P') != 225.0 && block.val('P') != 226.0 && block.val('P') != 227.0 && block.val('P') != 228.0 && block.val('P') != 229.0 && block.val('P') != 230.0 && block.val('P') != 231.0 && block.val('P') != 232.0 && block.val('P') != 233.0 && block.val('P') != 234.0 && block.val('P') != 236.0 && block.val('P') != 238.0 && block.val('P') != 240.0 && block.val('P') != 242.0 && block.val('P') != 244.0 && block.val('P') != 246.0 && block.val('P') != 248.0 && block.val('P') != 250.0 && block.val('P') != 252.0 && block.val('P') != 235.0 && block.val('P') != 237.0 && block.val('P') != 239.0 && block.val('P') != 241.0 && block.val('P') != 243.0 && block.val('P') != 245.0 && block.val('P') != 247.0 && block.val('P') != 249.0 && block.val('P') != 251.0 && block.val('P') != 253.0 && block.val('P') != 254.0 && block.val('P') != 255.0 && block.val('P') != 256.0 && block.val('P') != 257.0 && block.val('P') != 258.0 && block.val('P') != 259.0 && block.val('P') != 260.0 && block.val('P') != 261.0 && block.val('P') != 262.0 && block.val('P') != 263.0 && block.val('P') != 264.0 && block.val('P') != 265.0 && block.val('P') != 266.0 && block.val('P') != 267.0 && block.val('P') != 268.0 && block.val('P') != 269.0 && block.val('P') != 270.0 && block.val('P') != 271.0 && block.val('P') != 272.0 && block.val('P') != 273.0 && block.val('P') != 274.0 && block.val('P') != 275.0 && block.val('P') != 276.0 && block.val('P') != 277.0 && block.val('P') != 278.0 && block.val('P') != 279.0 && block.val('P') != 280.0 && block.val('P') != 281.0 && block.val('P') != 282.0 && block.val('P') != 283.0 && block.val('P') != 284.0 && block.val('P') != 286.0 && block.val('P') != 288.0 && block.val('P') != 290.0 && block.val('P') != 285.0 && block.val('P') != 287.0 && block.val('P') != 289.0 && block.val('P') != 291.0) || m_mode != NCOperationMode::MEMORY ||
         m_state != NCState::RUN || !m_macroStack.empty() || m_isG66Active || Homing.IsActive() ||
         !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
         CoordSys.GetTranslationSnapshot().distanceMode != 91 || !m_motion.IsGroupDone() ||
@@ -15964,11 +16369,19 @@ bool NCManager::IsEDM94TranslationBracketAllowedSameThread(const NCBlock& block)
     const bool continuousArm = block.val('P') == 97.0;
     const bool enduranceArm = block.val('P') == 99.0;
     const bool pairedArm = block.val('P') == 101.0;
-    const bool parameterizedArm = block.val('P') == 109.0 || block.val('P') == 111.0 || block.val('P') == 113.0 || block.val('P') == 115.0 || block.val('P') == 117.0 || block.val('P') == 119.0 || block.val('P') == 121.0 || block.val('P') == 123.0 || block.val('P') == 125.0 || block.val('P') == 127.0 || block.val('P') == 129.0 || block.val('P') == 132.0 || block.val('P') == 134.0 || block.val('P') == 136.0 || block.val('P') == 138.0 || block.val('P') == 140.0 || block.val('P') == 142.0 || block.val('P') == 144.0 || block.val('P') == 146.0 || block.val('P') == 148.0 || block.val('P') == 150.0 || block.val('P') == 152.0 || block.val('P') == 154.0 || block.val('P') == 156.0 || block.val('P') == 162.0 || block.val('P') == 164.0 || block.val('P') == 166.0 || block.val('P') == 168.0 || block.val('P') == 170.0 || block.val('P') == 172.0 || block.val('P') == 174.0 || block.val('P') == 176.0 || block.val('P') == 178.0 || block.val('P') == 180.0 || block.val('P') == 182.0 || block.val('P') == 184.0 || block.val('P') == 186.0 || block.val('P') == 188.0 || block.val('P') == 190.0 || block.val('P') == 192.0 || block.val('P') == 194.0 || block.val('P') == 196.0 || block.val('P') == 198.0 || block.val('P') == 200.0 || block.val('P') == 202.0 || block.val('P') == 204.0 || block.val('P') == 206.0 || block.val('P') == 208.0;
+    const bool parameterizedArm = block.val('P') == 109.0 || block.val('P') == 111.0 || block.val('P') == 113.0 || block.val('P') == 115.0 || block.val('P') == 117.0 || block.val('P') == 119.0 || block.val('P') == 121.0 || block.val('P') == 123.0 || block.val('P') == 125.0 || block.val('P') == 127.0 || block.val('P') == 129.0 || block.val('P') == 132.0 || block.val('P') == 134.0 || block.val('P') == 136.0 || block.val('P') == 138.0 || block.val('P') == 140.0 || block.val('P') == 142.0 || block.val('P') == 144.0 || block.val('P') == 146.0 || block.val('P') == 148.0 || block.val('P') == 150.0 || block.val('P') == 152.0 || block.val('P') == 154.0 || block.val('P') == 156.0 || block.val('P') == 162.0 || block.val('P') == 164.0 || block.val('P') == 166.0 || block.val('P') == 168.0 || block.val('P') == 170.0 || block.val('P') == 172.0 || block.val('P') == 174.0 || block.val('P') == 176.0 || block.val('P') == 178.0 || block.val('P') == 180.0 || block.val('P') == 182.0 || block.val('P') == 184.0 || block.val('P') == 186.0 || block.val('P') == 188.0 || block.val('P') == 190.0 || block.val('P') == 192.0 || block.val('P') == 194.0 || block.val('P') == 196.0 || block.val('P') == 198.0 || block.val('P') == 200.0 || block.val('P') == 202.0 || block.val('P') == 204.0 || block.val('P') == 206.0 || block.val('P') == 208.0 || block.val('P') == 210.0 || block.val('P') == 212.0 || block.val('P') == 214.0 || block.val('P') == 216.0 || block.val('P') == 218.0 || block.val('P') == 220.0 || block.val('P') == 222.0 || block.val('P') == 224.0 || block.val('P') == 226.0 || block.val('P') == 228.0 || block.val('P') == 230.0 || block.val('P') == 232.0 || block.val('P') == 234.0 || block.val('P') == 236.0 || block.val('P') == 238.0 || block.val('P') == 240.0 || block.val('P') == 242.0 || block.val('P') == 244.0 || block.val('P') == 246.0 || block.val('P') == 248.0 || block.val('P') == 250.0 || block.val('P') == 252.0 || block.val('P') == 254.0 || block.val('P') == 256.0 || block.val('P') == 258.0 || block.val('P') == 260.0 || block.val('P') == 262.0 || block.val('P') == 264.0 || block.val('P') == 266.0 || block.val('P') == 268.0 || block.val('P') == 270.0 || block.val('P') == 272.0 || block.val('P') == 274.0 || block.val('P') == 276.0 || block.val('P') == 278.0 || block.val('P') == 280.0 || block.val('P') == 282.0 || block.val('P') == 284.0 || (block.val('P') == 286.0 || block.val('P') == 288.0 || block.val('P') == 290.0);
     const bool flushArm = block.val('P') == 103.0 || block.val('P') == 105.0 || block.val('P') == 107.0 || parameterizedArm;
     const bool tuningArm = historyArm || block.val('P') == 91.0 || noiseArm || burstArm || continuousArm || enduranceArm || pairedArm || flushArm;
+    // EDM163 FIX1: this outer G91 bracket runs before the G180 handler.
+    // H1 also admits the exact XYZ 2 mm visible-flush profile; 5 mm stays excluded.
+    const bool holdPathArm = EDM149::IsFlushHoldTestArm(static_cast<unsigned>(block.val('P'))) ||
+            EDM149::IsManualVoltageTestArm(static_cast<unsigned>(block.val('P')));
+    if (block.has('H') && (!holdPathArm || block.val('H') != 1.0)) return false;
+    if (block.has('L') && (!holdPathArm || !block.has('H') || block.val('H') != 1.0 ||
+            (block.val('L') != 1.0 && block.val('L') != 2.0 && block.val('L') != 3.0) ||
+            !EDM130::ValidFlushHoldSelection(static_cast<unsigned>(block.val('P')), static_cast<unsigned>(block.val('L'))))) return false;
     for (char a = 'A'; a <= 'Z'; ++a)
-        if (block.has(a) && ((a != 'N' && a != 'P' &&
+        if (block.has(a) && ((a != 'N' && a != 'P' && ((a != 'H' && a != 'L') || !holdPathArm) &&
             (!tuningArm || (a != 'Q' && a != 'R' && a != 'S' &&
                     (!parameterizedArm || (a != 'I' && a != 'J' && a != 'K'))))) ||
             !std::isfinite(block.val(a)))) return false;
@@ -16030,7 +16443,7 @@ bool NCManager::InspectEDM94ProgramSameThread() noexcept
                 selector == 101.0 || selector == 102.0 || selector == 103.0 || selector == 104.0 ||
                 selector == 105.0 || selector == 106.0 || selector == 107.0 || selector == 108.0 ||
                 selector == 109.0 || selector == 110.0 ||
-                selector == 111.0 || selector == 112.0 || selector == 113.0 || selector == 114.0 || selector == 115.0 || selector == 116.0 || selector == 117.0 || selector == 118.0 || selector == 119.0 || selector == 120.0 || selector == 121.0 || selector == 122.0 || selector == 123.0 || selector == 124.0 || selector == 125.0 || selector == 126.0 || selector == 127.0 || selector == 128.0 || selector == 129.0 || selector == 130.0 || selector == 131.0 || selector == 132.0 || selector == 133.0 || selector == 134.0 || selector == 135.0 || selector == 136.0 || selector == 137.0 || selector == 138.0 || selector == 139.0 || selector == 140.0 || selector == 141.0 || selector == 142.0 || selector == 143.0 || selector == 144.0 || selector == 145.0 || selector == 146.0 || selector == 147.0 || selector == 148.0 || selector == 149.0 || selector == 150.0 || selector == 151.0 || selector == 152.0 || selector == 153.0 || selector == 154.0 || selector == 155.0 || selector == 156.0 || selector == 157.0 || selector == 158.0 || selector == 159.0 || selector == 160.0 || selector == 161.0 || selector == 162.0 || selector == 163.0 || selector == 164.0 || selector == 165.0 || selector == 166.0 || selector == 167.0 || selector == 168.0 || selector == 169.0 || selector == 170.0 || selector == 171.0 || selector == 172.0 || selector == 173.0 || selector == 174.0 || selector == 175.0 || selector == 176.0 || selector == 177.0 || selector == 178.0 || selector == 179.0 || selector == 180.0 || selector == 181.0 || selector == 182.0 || selector == 183.0 || selector == 184.0 || selector == 185.0 || selector == 186.0 || selector == 187.0 || selector == 188.0 || selector == 189.0 || selector == 190.0 || selector == 191.0 || selector == 192.0 || selector == 193.0 || selector == 194.0 || selector == 195.0 || selector == 196.0 || selector == 197.0 || selector == 198.0 || selector == 199.0 || selector == 200.0 || selector == 201.0 || selector == 202.0 || selector == 203.0 || selector == 204.0 || selector == 205.0 || selector == 206.0 || selector == 207.0 || selector == 208.0 || selector == 209.0);
+                selector == 111.0 || selector == 112.0 || selector == 113.0 || selector == 114.0 || selector == 115.0 || selector == 116.0 || selector == 117.0 || selector == 118.0 || selector == 119.0 || selector == 120.0 || selector == 121.0 || selector == 122.0 || selector == 123.0 || selector == 124.0 || selector == 125.0 || selector == 126.0 || selector == 127.0 || selector == 128.0 || selector == 129.0 || selector == 130.0 || selector == 131.0 || selector == 132.0 || selector == 133.0 || selector == 134.0 || selector == 135.0 || selector == 136.0 || selector == 137.0 || selector == 138.0 || selector == 139.0 || selector == 140.0 || selector == 141.0 || selector == 142.0 || selector == 143.0 || selector == 144.0 || selector == 145.0 || selector == 146.0 || selector == 147.0 || selector == 148.0 || selector == 149.0 || selector == 150.0 || selector == 151.0 || selector == 152.0 || selector == 153.0 || selector == 154.0 || selector == 155.0 || selector == 156.0 || selector == 157.0 || selector == 158.0 || selector == 159.0 || selector == 160.0 || selector == 161.0 || selector == 162.0 || selector == 163.0 || selector == 164.0 || selector == 165.0 || selector == 166.0 || selector == 167.0 || selector == 168.0 || selector == 169.0 || selector == 170.0 || selector == 171.0 || selector == 172.0 || selector == 173.0 || selector == 174.0 || selector == 175.0 || selector == 176.0 || selector == 177.0 || selector == 178.0 || selector == 179.0 || selector == 180.0 || selector == 181.0 || selector == 182.0 || selector == 183.0 || selector == 184.0 || selector == 185.0 || selector == 186.0 || selector == 187.0 || selector == 188.0 || selector == 189.0 || selector == 190.0 || selector == 191.0 || selector == 192.0 || selector == 193.0 || selector == 194.0 || selector == 195.0 || selector == 196.0 || selector == 197.0 || selector == 198.0 || selector == 199.0 || selector == 200.0 || selector == 201.0 || selector == 202.0 || selector == 203.0 || selector == 204.0 || selector == 205.0 || selector == 206.0 || selector == 207.0 || selector == 208.0 || selector == 209.0 || selector == 210.0 || selector == 211.0 || selector == 212.0 || selector == 213.0 || selector == 214.0 || selector == 215.0 || selector == 216.0 || selector == 217.0 || selector == 218.0 || selector == 219.0 || selector == 220.0 || selector == 221.0 || selector == 222.0 || selector == 223.0 || selector == 224.0 || selector == 225.0 || selector == 226.0 || selector == 227.0 || selector == 228.0 || selector == 229.0 || selector == 230.0 || selector == 231.0 || selector == 232.0 || selector == 233.0 || selector == 234.0 || selector == 236.0 || selector == 238.0 || selector == 240.0 || selector == 242.0 || selector == 244.0 || selector == 246.0 || selector == 248.0 || selector == 250.0 || selector == 252.0 || selector == 235.0 || selector == 237.0 || selector == 239.0 || selector == 241.0 || selector == 243.0 || selector == 245.0 || selector == 247.0 || selector == 249.0 || selector == 251.0 || selector == 253.0 || selector == 254.0 || selector == 255.0 || selector == 256.0 || selector == 257.0 || selector == 258.0 || selector == 259.0 || selector == 260.0 || selector == 261.0 || selector == 262.0 || selector == 263.0 || selector == 264.0 || selector == 265.0 || selector == 266.0 || selector == 267.0 || selector == 268.0 || selector == 269.0 || selector == 270.0 || selector == 271.0 || selector == 272.0 || selector == 273.0 || selector == 274.0 || selector == 275.0 || selector == 276.0 || selector == 277.0 || selector == 278.0 || selector == 279.0 || selector == 280.0 || selector == 281.0 || selector == 282.0 || selector == 283.0 || selector == 284.0 || selector == 285.0 || selector == 286.0 || selector == 287.0 || selector == 288.0 || selector == 289.0 || selector == 290.0 || selector == 291.0 || selector == 292.0 || selector == 293.0);
         bool g180 = false;
         for (int j = 0; j < p.gCount && j < NC_MAX_G_CODES_PER_BLOCK; ++j)
         {
@@ -16049,9 +16462,17 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
     const auto& cache = GetBaseProgramCache();
     if (armPC < 0 || cache.Size() == 0U || cache.Size() > 128U) return false;
     m_edm94.moves = m_edm94.next = 0U;
+    m_edm94.authoredGCode.fill(0U);
     m_edm127 = EDM127NCState{};
     m_edm129 = EDM129NCState{};
     m_edm130 = EDM130NCState{};
+    m_edm140 = EDM140NCState{};
+    m_edm140.pc.fill(-1);
+    for (auto& row : m_edm141.rows) row = EDM141::Row{};
+    m_edm141.assignmentValues.fill(0.0);
+    m_edm141.plannedRows = m_edm141.expressionRows = m_edm141.verifiedRows = 0U;
+    MacroEngine edm141Shadow; MacroParser edm141Evaluator(edm141Shadow);
+    std::array<double, 2U> edm141Locals{}; unsigned edm141Defined = 0U;
     m_edm94.gapHistoryServo = false; m_edm94.gapHistoryMode = false; m_edm94.gapPhysicalAd = false; m_edm94.gapWorkTime = false; m_edm94.gapHistoryArm = 0U;
     m_edm94.gapBoundaryProfile = false;
     m_edm94.gapSegmentProfile = false;
@@ -16087,8 +16508,37 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
     for (std::size_t i = 0U; i < cache.Size(); ++i)
     {
         const auto* line = cache.TryGetLine(static_cast<int>(i));
-        if (!line || !EDM77::Detail::Clean(line->parsedBlock)) return false;
+        if (!line) return false;
         const auto& b = line->parsedBlock;
+        if (!EDM77::Detail::Clean(b) &&
+            !(phase == 1U && E141MotionArm(m_edm94.gapHistoryArm) && EDM141::Shape(b)))
+        {
+            EDM140::Specification specification{};
+            if (phase != 1U || !E140AssignmentArm(m_edm94.gapHistoryArm) ||
+                !EDM140::Parse(b, specification) || !m_edm94.moves ||
+                m_edm94.moves >= EDM114::RequiredRows || m_edm140.count >= EDM140::AssignmentCapacity)
+                return false;
+            unsigned defined = 0U;
+            for (unsigned prior = 0U; prior < m_edm140.count; ++prior)
+                defined |= 1U << (m_edm140.specifications[prior].target - 1U);
+            if ((specification.readMask & ~defined) != 0U) return false;
+            const unsigned slot = m_edm140.count++;
+            if (E141MotionArm(m_edm94.gapHistoryArm))
+            {
+                NCMacroAssignmentCommit assignment{}; NCExpressionResolveError error{};
+                if (!NCExpressionResolver::ResolveAssignment(b, edm141Evaluator, assignment, error) ||
+                    !EDM140::ValidResult(specification, assignment.prefix, assignment.index, assignment.value)) return false;
+                // This private shadow never aliases the live MacroSys state.
+                edm141Shadow.SetVar(assignment.prefix, assignment.index, assignment.value);
+                edm141Locals[static_cast<unsigned>(assignment.index - 1)] = assignment.value;
+                edm141Defined |= 1U << static_cast<unsigned>(assignment.index - 1);
+                m_edm141.assignmentValues[slot] = assignment.value;
+            }
+            m_edm140.specifications[slot] = specification;
+            m_edm140.pc[slot] = static_cast<int>(i);
+            m_edm140.afterRows[slot] = m_edm94.moves;
+            continue;
+        }
         if (EDM77::Detail::Empty(b)) continue;
         if (phase == 0U)
         {
@@ -16115,7 +16565,48 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                 E108ProfileOnlyNPQRSIJK(b, 202U, tuning, parameters) ? 202U :
                 E108ProfileOnlyNPQRSIJK(b, 204U, tuning, parameters) ? 204U :
                 E108ProfileOnlyNPQRSIJK(b, 206U, tuning, parameters) ? 206U :
-                E108ProfileOnlyNPQRSIJK(b, 208U, tuning, parameters) ? 208U : 0U;
+                E108ProfileOnlyNPQRSIJK(b, 208U, tuning, parameters) ? 208U :
+                E108ProfileOnlyNPQRSIJK(b, 210U, tuning, parameters) ? 210U :
+                E108ProfileOnlyNPQRSIJK(b, 212U, tuning, parameters) ? 212U :
+                E108ProfileOnlyNPQRSIJK(b, 214U, tuning, parameters) ? 214U :
+                E108ProfileOnlyNPQRSIJK(b, 216U, tuning, parameters) ? 216U :
+                E108ProfileOnlyNPQRSIJK(b, 218U, tuning, parameters) ? 218U :
+                E108ProfileOnlyNPQRSIJK(b, 220U, tuning, parameters) ? 220U :
+                E108ProfileOnlyNPQRSIJK(b, 222U, tuning, parameters) ? 222U :
+                E108ProfileOnlyNPQRSIJK(b, 224U, tuning, parameters) ? 224U :
+                E108ProfileOnlyNPQRSIJK(b, 226U, tuning, parameters) ? 226U :
+                E108ProfileOnlyNPQRSIJK(b, 228U, tuning, parameters) ? 228U :
+                E108ProfileOnlyNPQRSIJK(b, 230U, tuning, parameters) ? 230U :
+                E108ProfileOnlyNPQRSIJK(b, 232U, tuning, parameters) ? 232U :
+                E108ProfileOnlyNPQRSIJK(b, 234U, tuning, parameters) ? 234U :
+                E108ProfileOnlyNPQRSIJK(b, 236U, tuning, parameters) ? 236U :
+                E108ProfileOnlyNPQRSIJK(b, 238U, tuning, parameters) ? 238U :
+                E108ProfileOnlyNPQRSIJK(b, 240U, tuning, parameters) ? 240U :
+                E108ProfileOnlyNPQRSIJK(b, 242U, tuning, parameters) ? 242U :
+                E108ProfileOnlyNPQRSIJK(b, 244U, tuning, parameters) ? 244U :
+                E108ProfileOnlyNPQRSIJK(b, 246U, tuning, parameters) ? 246U :
+                E108ProfileOnlyNPQRSIJK(b, 248U, tuning, parameters) ? 248U :
+                E108ProfileOnlyNPQRSIJK(b, 250U, tuning, parameters) ? 250U :
+                E108ProfileOnlyNPQRSIJK(b, 252U, tuning, parameters) ? 252U :
+                E108ProfileOnlyNPQRSIJK(b, 254U, tuning, parameters) ? 254U :
+                E108ProfileOnlyNPQRSIJK(b, 256U, tuning, parameters) ? 256U :
+                E108ProfileOnlyNPQRSIJK(b, 258U, tuning, parameters) ? 258U :
+                E108ProfileOnlyNPQRSIJK(b, 260U, tuning, parameters) ? 260U :
+                E108ProfileOnlyNPQRSIJK(b, 262U, tuning, parameters) ? 262U :
+                E108ProfileOnlyNPQRSIJK(b, 264U, tuning, parameters) ? 264U :
+                E108ProfileOnlyNPQRSIJK(b, 266U, tuning, parameters) ? 266U :
+                E108ProfileOnlyNPQRSIJK(b, 268U, tuning, parameters) ? 268U :
+                E108ProfileOnlyNPQRSIJK(b, 270U, tuning, parameters) ? 270U :
+                E108ProfileOnlyNPQRSIJK(b, 272U, tuning, parameters) ? 272U :
+                E108ProfileOnlyNPQRSIJK(b, 274U, tuning, parameters) ? 274U :
+                E108ProfileOnlyNPQRSIJK(b, 276U, tuning, parameters) ? 276U :
+                E108ProfileOnlyNPQRSIJK(b, 278U, tuning, parameters) ? 278U :
+                E108ProfileOnlyNPQRSIJK(b, 280U, tuning, parameters) ? 280U :
+                E108ProfileOnlyNPQRSIJK(b, 282U, tuning, parameters) ? 282U :
+                E108ProfileOnlyNPQRSIJK(b, 284U, tuning, parameters) ? 284U :
+                E108ProfileOnlyNPQRSIJK(b, 286U, tuning, parameters) ? 286U :
+                E108ProfileOnlyNPQRSIJK(b, 288U, tuning, parameters) ? 288U :
+                E108ProfileOnlyNPQRSIJK(b, 290U, tuning, parameters) ? 290U : 0U;
             if (historyModeArm)
             {
                 if (static_cast<int>(i) != armPC || tuning.positiveGain != 8.0 ||
@@ -16158,9 +16649,9 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                 m_edm94.gapHistoryServo = m_edm94.gapHistoryMode = true;
                 m_edm94.gapHistoryArm = historyModeArm;
                 m_edm94.gapWorkTime = E130TimedArm(historyModeArm);
-                m_edm94.gapPhysicalAd = m_edm94.gapWorkTime || historyModeArm == 170U || historyModeArm == 172U;
+                m_edm94.gapPhysicalAd = (m_edm94.gapWorkTime && E149PhysicalExpected(historyModeArm)) || historyModeArm == 170U || historyModeArm == 172U;
                 m_edm94.gapSegmentProfile = m_edm94.gapGainProfile = m_edm94.gapPhysicalCurve = true;
-                m_edm94.gapModeFixture = (historyModeArm == 166U || historyModeArm == 170U || E130CanonicalArm(historyModeArm)) ? EDM116::Fixture::Modal127 : EDM116::Fixture::ModalComplement127;
+                m_edm94.gapModeFixture = E149ModalFixture(E149HistoryFixture(historyModeArm));
                 m_edm94.gapTuning = tuning; m_edm94.gapFlushParameters = parameters;
                 phase = 1U; continue;
             }
@@ -16241,7 +16732,8 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                 if (tuningArm) m_edm94.gapTuning = tuning;
                 phase = 1U;
             }
-            else if (!E94Preamble(b) && !IsEDM130RecipePreambleSameThread(b, static_cast<int>(i))) return false;
+            else if (!E94Preamble(b) && !IsEDM130RecipePreambleSameThread(b, static_cast<int>(i)) &&
+                !IsEDM149ConfirmationBlockSameThread(b, static_cast<int>(i))) return false;
         }
         else if (phase == 1U)
         {
@@ -16253,13 +16745,30 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                 continue;
             }
             const unsigned step = m_edm94.moves;
+            NCParsedBlock edm141Literal{};
+            const NCParsedBlock* admitted = &b;
+            if (E141MotionArm(m_edm94.gapHistoryArm) && EDM141::Shape(b))
+            {
+                if (step >= EDM141::RowCapacity) return false;
+                NCBlock resolved{}; NCExpressionResolveError error{};
+                if (!NCExpressionResolver::ResolveBlock(b, edm141Evaluator, resolved, error) ||
+                    !EDM141::Capture(b, resolved, edm141Locals, edm141Defined, m_edm140.count,
+                        static_cast<int>(i), m_edm141.rows[step]) ||
+                    !EDM141::MakeLiteral(b, m_edm141.rows[step], edm141Literal)) return false;
+                ++m_edm141.plannedRows;
+                if (m_edm141.rows[step].readMask) ++m_edm141.expressionRows;
+                admitted = &edm141Literal;
+            }
             NCParsedBlock modalGeometry{};
-            const NCParsedBlock* geometry = &b;
+            const NCParsedBlock* geometry = admitted;
             if (EDM116::IsModalFixture(m_edm94.gapModeFixture))
             {
                 EDM116::Mode authoredMode{};
                 if (E127Standalone(b, authoredMode))
                 {
+                    if (EDM149::IsVisibleFlushTestArm(m_edm94.gapHistoryArm) ||
+                        EDM149::IsXYZVisibleFlushTestArm(m_edm94.gapHistoryArm) ||
+                        EDM149::IsSixVisibleFlushTestArm(m_edm94.gapHistoryArm)) return false;
                     if (step >= EDM114::RequiredRows || modalRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
                     modal.mode = authoredMode; modalOriginPC = static_cast<int>(i); ++modalRevision;
                     continue;
@@ -16270,7 +16779,7 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                     if (!E94Number(b.expression('B'), value) || !EDM116::ParseMode(value, authoredMode) ||
                         modalRevision == (std::numeric_limits<std::uint64_t>::max)()) return false;
                     modal.mode = authoredMode; modalOriginPC = static_cast<int>(i); ++modalRevision;
-                    modalGeometry = b; modalGeometry.hasParam['B'-'A'] = false;
+                    modalGeometry = *admitted; modalGeometry.hasParam['B'-'A'] = false;
                     modalGeometry.paramExpressions['B'-'A'].clear(); geometry = &modalGeometry;
                 }
                 // EDM138 retains the same bounded sixteen-row geometry but lets
@@ -16279,6 +16788,10 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                 // their exact historical B sequence.
                 if (step >= EDM114::RequiredRows || !EDM116::ValidMode(modal.mode) ||
                     (!E138CrossSegmentArm(m_edm94.gapHistoryArm) && modal.mode != EDM116::ExpectedMode(step))) return false;
+                if (EDM149::IsVisibleFlushTestArm(m_edm94.gapHistoryArm) &&
+                    (step != 0U || !b.has('B') || modal.mode != EDM116::Mode::B1)) return false;
+                if ((EDM149::IsXYZVisibleFlushTestArm(m_edm94.gapHistoryArm) || EDM149::IsSixVisibleFlushTestArm(m_edm94.gapHistoryArm)) &&
+                    (step >= 3U || b.has('B') != (step == 0U) || modal.mode != EDM116::Mode::B1)) return false;
                 m_edm127.expectedMode[step] = modal.mode; m_edm127.expectedOriginPC[step] = modalOriginPC;
                 m_edm127.expectedOriginRevision[step] = modalRevision;
                 m_edm127.authoredInline[step] = b.has('B');
@@ -16292,8 +16805,16 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                 continue;
             }
             if (step >= ((m_edm94.gapHistoryServo || m_edm94.gapEnduranceProfile) ? EDM102::MaximumSteps : 8U) ||
-                !(m_edm94.gapPhysicalCurve ? E114Move(*geometry, step, m_edm94.increment[step], m_edm94.feed[step], m_edm94.gapModeFixture) :
+                !(m_edm94.gapPhysicalCurve ? E114Move(*geometry, step, m_edm94.increment[step], m_edm94.feed[step], m_edm94.gapModeFixture,
+                    E148AuthoredLineArm(m_edm94.gapHistoryArm)) :
                     E94Move(b, m_edm94.increment[step], m_edm94.feed[step]))) return false;
+            if (m_edm94.gapPhysicalCurve)
+            {
+                double code = 0.0;
+                if (!E94Number(geometry->gExpressions[0], code) ||
+                    (code != 1.0 && code != 2.0 && code != 3.0)) return false;
+                m_edm94.authoredGCode[step] = static_cast<std::uint8_t>(code);
+            }
             if (m_edm94.gapBoundaryProfile)
             {
                 // The simulated GAP chooses a boundary direction for one
@@ -16325,12 +16846,21 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                         -m_edm94.increment[0U][a] : m_edm94.increment[0U][a])) return false;
                 }
             }
-            if (m_edm94.gapPhysicalCurve && EDM116::IsArcStep(step, m_edm94.gapModeFixture))
+            double authoredArcLengthMm = 0.0;
+            if (m_edm94.gapPhysicalCurve && EDM116::IsArcStep(step, m_edm94.gapModeFixture, m_edm94.authoredGCode[step]))
             {
-                // Include both cardinal extrema of the fixed small circle,
-                // not merely its endpoint chord, in the arm-relative budget.
-                const double centerX = total[0] + ((step & 1U) ? -0.001 : 0.001);
-                if (std::fabs(centerX) + 0.001 > 0.025 || std::fabs(total[1]) + 0.001 > 0.025) return false;
+                if (EDM116::IsBoundedArcFixture(m_edm94.gapModeFixture))
+                {
+                    if (!E152ArcAdmission(*geometry, step, m_edm94.increment[step], m_edm94.feed[step],
+                        total, authoredArcLengthMm, m_edm94.gapModeFixture)) return false;
+                }
+                else
+                {
+                    // Include both cardinal extrema of the fixed small circle,
+                    // not merely its endpoint chord, in the arm-relative budget.
+                    const double centerX = total[0] + ((step & 1U) ? -0.001 : 0.001);
+                    if (std::fabs(centerX) + 0.001 > 0.025 || std::fabs(total[1]) + 0.001 > 0.025) return false;
+                }
             }
             for (unsigned a = 0U; a < 6U; ++a)
             {
@@ -16338,8 +16868,9 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
                 if (!std::isfinite(total[a]) || std::fabs(total[a]) > (a < 3U ? .025 : .5)) return false;
             }
             const auto& d = m_edm94.increment[step];
-            const double lengthMm = m_edm94.gapPhysicalCurve && EDM116::IsArcStep(step, m_edm94.gapModeFixture) ?
-                0.001 * EDM114::Pi : std::hypot(std::hypot(d[0], d[1]), d[2]);
+            const double lengthMm = m_edm94.gapPhysicalCurve && EDM116::IsArcStep(step, m_edm94.gapModeFixture, m_edm94.authoredGCode[step]) ?
+                (EDM116::IsBoundedArcFixture(m_edm94.gapModeFixture) ? authoredArcLengthMm : 0.001 * EDM114::Pi) :
+                std::hypot(std::hypot(d[0], d[1]), d[2]);
             nominalSeconds += lengthMm * 60.0 / m_edm94.feed[step] + 2.0;
             // Admission allowance only; RT segment/session deadlines are unchanged.
             if (m_edm94.gapFlushProfile && !m_edm94.gapModeFlush && (step & 1U) == 0U) nominalSeconds += 2.5;
@@ -16355,7 +16886,11 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
         }
         else return false;
     }
-    if (phase != 3U) return false;
+    if (phase != 3U || (E140AssignmentArm(m_edm94.gapHistoryArm) && !m_edm140.count)) return false;
+    if (EDM149::IsVisibleFlushTestArm(m_edm94.gapHistoryArm) && !E158VisiblePlan(m_edm94)) return false;
+    if (EDM149::IsXYZVisibleFlushTestArm(m_edm94.gapHistoryArm) && !E159VisiblePlan(m_edm94)) return false;
+    if (E141MotionArm(m_edm94.gapHistoryArm) &&
+        (m_edm141.plannedRows != EDM141::RowCapacity || !m_edm141.expressionRows)) return false;
     if (m_edm94.gapModeFlush && nominalSeconds + 6.0 * 3.0 + 2.0 * 20.0 > 115.0) return false;
     // P127 reserves two independent 20-second curve B2 budgets. Its explicit
     // 115-second admission ceiling leaves the unchanged 120-second RT guard intact.
@@ -16365,7 +16900,11 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
         nominalSeconds + (m_edm94.gapB2Repeat ? 40.0 : 20.0) > 110.0) return false;
     if (m_edm94.gapBoundaryProfile && m_edm94.moves != 2U && m_edm94.moves != 4U) return false;
     if (m_edm94.gapHistoryServo)
-    { if (m_edm94.moves != EDM114::RequiredRows) return false; }
+    {
+        if (EDM149::IsBoundedProgramTestArm(m_edm94.gapHistoryArm))
+        { if (!m_edm94.moves || m_edm94.moves > EDM114::RequiredRows || !E156NominalMovementMask(m_edm94)) return false; }
+        else if (m_edm94.moves != EDM114::RequiredRows) return false;
+    }
     else if (m_edm94.gapFlushProfile)
     { if (m_edm94.moves != EDM105::MaximumSteps) return false; }
     else if (m_edm94.gapPairedProfile)
@@ -16374,7 +16913,8 @@ bool NCManager::PreflightEDM94ProgramSameThread(int armPC) noexcept
     { if (m_edm94.moves != EDM102::MaximumSteps) return false; }
     else if (m_edm94.gapSegmentProfile && m_edm94.moves != 2U && m_edm94.moves != 4U &&
         (!m_edm94.gapContinuousProfile || m_edm94.moves != EDM100::MaximumSteps)) return false;
-    for (double offset : total) if (std::fabs(offset) > 1.0e-12) return false;
+    if (!EDM149::IsBoundedProgramTestArm(m_edm94.gapHistoryArm))
+        for (double offset : total) if (std::fabs(offset) > 1.0e-12) return false;
     return true;
 }
 
@@ -16530,6 +17070,7 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
 {
     ObserveEDM103LifecycleSameThread(event, reason);
     const auto& s = m_edm94; const auto& f = s.feedback;
+    PrintEDM145SourceFailure(s.session);
     // EDM101_20261013: retain every bracket field without native 511-byte clipping.
     // Each part includes the original event, session and cached RT tick.
     char record[481]{};
@@ -16555,15 +17096,22 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
         static_cast<unsigned long long>(s.cache), static_cast<unsigned long long>(s.armDispatch),
         s.next, s.moves, static_cast<unsigned long long>(f.lastSentTick)), "IDENTITY");
     emit(std::snprintf(record, sizeof(record),
-        "[EDM94] event=BRACKET_EVIDENCE result=%.32s part=OUTPUT session=%llu tick=%llu nonzeroSentMask=%u actualMovedMask=%u commandMovedMask=%u sentFrames=%llu handoffZero=%u handoffStarted=%u handoffCompleted=%u source=FIXED_NC gapControl=%s actualOutput=GUARDED_CSV dischargeCommand=NONE\n",
+        "[EDM94] event=BRACKET_EVIDENCE result=%.32s part=OUTPUT session=%llu tick=%llu nonzeroSentMask=%u actualMovedMask=%u commandMovedMask=%u sentFrames=%llu handoffZero=%u handoffStarted=%u handoffCompleted=%u source=FIXED_NC gapControl=%s actualOutput=GUARDED_CSV powerControl=NC_PLC_S92\n",
         result, session, tick, f.nonzeroSentMask, f.actualMovedMask, f.commandMovedMask,
         static_cast<unsigned long long>(f.sentFrames), f.handoffZero ? 1U : 0U,
-        f.handoffStarted, f.handoffCompleted, s.gapWorkTime ? (E137FlushStageArm(s.gapHistoryArm) ? "PHYSICAL_AD_STAGED_FLUSH_TIMED_HISTORY_GAP_SERVO" : E136CurveArm(s.gapHistoryArm) ? "PHYSICAL_AD_PROCESS_CURVE_TIMED_HISTORY_GAP_SERVO" : E135ReferenceArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E6_E7_E8_E9_E21_E22_TIMED_HISTORY_GAP_SERVO" : E134MachiningArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E6_E7_E8_E21_E22_TIMED_HISTORY_GAP_SERVO" : E133DeepArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E6_E7_E21_E22_TIMED_HISTORY_GAP_SERVO" : E132HeightArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E6_E7_TIMED_HISTORY_GAP_SERVO" : E131SpeedArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E7_TIMED_HISTORY_GAP_SERVO" : "PHYSICAL_AD_E5_TIMED_HISTORY_GAP_SERVO") : s.gapPhysicalAd ? "PHYSICAL_AD_HISTORY_GAP_SERVO" : s.gapHistoryServo ? "SIM_HISTORY_GAP_SERVO" : s.gapFlushProfile ? "SIM_PAIRED_FLUSH_BURST_SERVO" :
+        f.handoffStarted, f.handoffCompleted, s.gapWorkTime ? (EDM149::IsTestArm(s.gapHistoryArm) ? ((EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) || EDM149::IsSparseArcTestArm(s.gapHistoryArm) || EDM149::IsSparseTestArm(s.gapHistoryArm) || EDM149::IsOrderTestArm(s.gapHistoryArm) || EDM149::IsArcTestArm(s.gapHistoryArm) || EDM149::IsSixTestArm(s.gapHistoryArm)) ? "XYZCUV_VOLTAGE_REAL_MOTION" : EDM149::IsXYZTestArm(s.gapHistoryArm) ? "XYZ_VOLTAGE_REAL_MOTION" : "Z_VOLTAGE_REAL_MOTION") : E137FlushStageArm(s.gapHistoryArm) ? (E139DiagnosticArm(s.gapHistoryArm) ? "SIMULATED_AD_STAGED_FLUSH_TIMED_HISTORY_GAP_SERVO" : "PHYSICAL_AD_STAGED_FLUSH_TIMED_HISTORY_GAP_SERVO") : E136CurveArm(s.gapHistoryArm) ? "PHYSICAL_AD_PROCESS_CURVE_TIMED_HISTORY_GAP_SERVO" : E135ReferenceArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E6_E7_E8_E9_E21_E22_TIMED_HISTORY_GAP_SERVO" : E134MachiningArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E6_E7_E8_E21_E22_TIMED_HISTORY_GAP_SERVO" : E133DeepArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E6_E7_E21_E22_TIMED_HISTORY_GAP_SERVO" : E132HeightArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E6_E7_TIMED_HISTORY_GAP_SERVO" : E131SpeedArm(s.gapHistoryArm) ? "PHYSICAL_AD_E5_E7_TIMED_HISTORY_GAP_SERVO" : "PHYSICAL_AD_E5_TIMED_HISTORY_GAP_SERVO") : s.gapPhysicalAd ? "PHYSICAL_AD_HISTORY_GAP_SERVO" : s.gapHistoryServo ? "SIM_HISTORY_GAP_SERVO" : s.gapFlushProfile ? "SIM_PAIRED_FLUSH_BURST_SERVO" :
             s.gapPairedProfile ? "SIM_PAIRED_CAPTURE_DWELL_BURST_SERVO" :
             s.gapEnduranceProfile ? "SIM_ENDURANCE_CAPTURE_DWELL_BURST_SERVO" :
             s.gapContinuousProfile ? "SIM_CONTINUOUS_CAPTURE_DWELL_BURST_SERVO" :
             s.gapBurstProfile ? "SIM_CAPTURE_DWELL_BURST_SERVO" : s.gapNoiseProfile ? "SIM_DEADBAND_NOISE_SERVO" : s.gapGainProfile ? "SIM_GAIN_SERVO" : s.gapSegmentProfile ? "SIM_SEGMENT_SERVO" :
             s.gapBoundaryProfile ? "SIM_BOUNDARY_DIRECTION" : "NOT_CONNECTED"), "OUTPUT");
+    if (EDM149::IsTestArm(s.gapHistoryArm) && f.armAccepted && f.identity.session == s.session &&
+        (std::strcmp(result, "ARMED") == 0 || std::strcmp(result, "FINISH_REQUEST") == 0 ||
+            std::strcmp(result, "PASS") == 0 || std::strcmp(result, "RT_FAULT") == 0))
+        emit(std::snprintf(record, sizeof(record),
+            "[%s] event=MOVEMENT_PROOF result=%.32s session=%llu requiredMask=%u nonzeroSentMask=%u actualMovedMask=%u commandMovedMask=%u proof=%u safetyAxes=63 zeroStableRequired=%u\n",
+            EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm) ? "EDM167" : EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm) ? "EDM159" : EDM149::IsVisibleFlushTestArm(s.gapHistoryArm) ? "EDM158" : EDM149::IsPauseTestArm(s.gapHistoryArm) ? "EDM157" : EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) ? "EDM156" : EDM149::IsSparseArcTestArm(s.gapHistoryArm) ? "EDM155" : EDM149::IsSparseTestArm(s.gapHistoryArm) ? "EDM154" : EDM149::IsOrderTestArm(s.gapHistoryArm) ? "EDM153" : EDM149::IsArcTestArm(s.gapHistoryArm) ? "EDM152" : EDM149::IsSixTestArm(s.gapHistoryArm) ? "EDM151" : EDM149::IsXYZTestArm(s.gapHistoryArm) ? "EDM150" : "EDM149-FIX1", result, session, f.requiredMovementMask, f.nonzeroSentMask, f.actualMovedMask, f.commandMovedMask,
+            EDM94::MovementProven(f, E156RequiredMovementMask(s, m_edm130.recipe)) ? 1U : 0U, f.requiredCycles), (EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) || EDM149::IsSparseArcTestArm(s.gapHistoryArm) || EDM149::IsSparseTestArm(s.gapHistoryArm) || EDM149::IsOrderTestArm(s.gapHistoryArm) || EDM149::IsArcTestArm(s.gapHistoryArm) || EDM149::IsSixTestArm(s.gapHistoryArm)) ? "XYZCUV_MOVEMENT" : "Z_MOVEMENT");
     if (s.gapContinuousProfile &&
         (std::strcmp(result, "CANCEL_REQUEST") == 0 || std::strcmp(result, "CANCEL_STOPPED") == 0 ||
             std::strcmp(result, "START_BLOCKED") == 0 || std::strcmp(result, "RELEASE_REQUEST") == 0 ||
@@ -16600,7 +17148,7 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
     {
         EDM95::Feedback gap{};
         if (m_motion.ReadEDM95Feedback(gap) && gap.session == s.session)
-            RtPrintf("[EDM95] event=BOUNDARY_EVIDENCE result=%s session=%llu expectedStep=%u accepted=%llu forward=%llu retreat=%llu tick=%llu sourceSequence=%llu freshFrames=%llu heldFrames=%llu maxAgeUs=%llu faulted=%u reason=%s output=GUARDED_CSV midSegmentReverse=0 physicalStopProof=EDM94 dischargeCommand=NONE\n",
+            RtPrintf("[EDM95] event=BOUNDARY_EVIDENCE result=%s session=%llu expectedStep=%u accepted=%llu forward=%llu retreat=%llu tick=%llu sourceSequence=%llu freshFrames=%llu heldFrames=%llu maxAgeUs=%llu faulted=%u reason=%s output=GUARDED_CSV midSegmentReverse=0 physicalStopProof=EDM94 powerControl=NC_PLC_S92\n",
                 event, static_cast<unsigned long long>(gap.session), gap.expectedStep,
                 static_cast<unsigned long long>(gap.acceptedSegments), static_cast<unsigned long long>(gap.forwardSegments),
                 static_cast<unsigned long long>(gap.retreatSegments), static_cast<unsigned long long>(gap.tick),
@@ -16629,6 +17177,8 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
         const auto& d = f.firstFault;
         if (d.site != 0U)
         {
+            if (s.gapHistoryArm==EDM173::ArmP)
+                PrintEDM173InputFailure(m_motion,s.session,d.tick);
             RtPrintf("[EDM94] event=RUNTIME_FAULT build=FIX16 result=%s session=%llu site=%s faultReason=%s faultAxis=%c tripAxisMask=%02X observeOnlyAxisMask=%02X faultTick=%llu frameUs=%llu frameSession=%llu frameEpoch=%llu frameOwnerGen=%u flags=%08X evidence=FIRST_FAULT_ONLY\n",
                 event, static_cast<unsigned long long>(s.session), EDM94::FaultSiteName(d.site),
                 EDM94::ReasonName(static_cast<EDM94::Reason>(d.reason)),
@@ -16651,6 +17201,37 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
                 static_cast<unsigned>(d.healthFailures[0]), static_cast<unsigned>(d.healthFailures[1]),
                 static_cast<unsigned>(d.healthFailures[2]), static_cast<unsigned>(d.healthFailures[3]),
                 static_cast<unsigned>(d.healthFailures[4]), static_cast<unsigned>(d.healthFailures[5]));
+            // FIX2: these values are frozen by RT at the FIRST fault. Local
+            // PI and the prior NIC-accepted image retain their own timestamps.
+            const auto& a = f.firstFaultAxis;
+            const auto bits = [](double value) noexcept -> unsigned long long
+            { return static_cast<unsigned long long>(EDM130::CurveDoubleBits(value)); };
+            RtPrintf("[EDM94] event=FIRST_AXIS build=EDM158_FIX2 session=%llu faultTick=%llu axis=%c flags=%u sign=%d evidence=FIRST_FAULT_ONLY driveAck=0\n",
+                static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(d.tick),
+                a.axis < 6U ? "XYZCUV"[a.axis] : '-', static_cast<unsigned>(a.flags), static_cast<int>(a.hardwareSign));
+            if ((a.flags & EDM94::FaultAxis_FRAME) != 0U)
+                RtPrintf("[EDM94] event=FIRST_AXIS_FRAME session=%llu tick=%llu cmdBits=%llu actBits=%llu errorBits=%llu windowBits=%llu ppuBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(d.tick),
+                    bits(a.commandPulse), bits(a.actualPulse), bits(a.followingErrorPulse), bits(a.windowPulse), bits(a.pulsePerUnit));
+            if ((a.flags & EDM94::FaultAxis_CONTROL) != 0U)
+            {
+                const auto& c = a.control;
+                RtPrintf("[EDM94] event=FIRST_AXIS_GAIN session=%llu controlTick=%llu sourceUs=%llu priorTick=%u kpBits=%llu kiBits=%llu kvffBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(c.tick),
+                    static_cast<unsigned long long>(c.nowUs), (a.flags & EDM94::FaultAxis_CONTROL_PRIOR) != 0U ? 1U : 0U,
+                    bits(c.kp), bits(c.ki), bits(c.kvff));
+                RtPrintf("[EDM94] event=FIRST_AXIS_PI session=%llu controlTick=%llu cmdBits=%llu actBits=%llu refPpsBits=%llu pBits=%llu iBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(c.tick),
+                    bits(c.commandPulse), bits(c.actualPulse), bits(c.referenceVelocityPps), bits(c.pTerm), bits(c.iTerm));
+                RtPrintf("[EDM94] event=FIRST_AXIS_LOCAL session=%llu controlTick=%llu integralBeforeBits=%llu integralCandidateBits=%llu outputPpsBits=%llu image=LOCAL_PRE_GUARD_PI driveAck=0\n",
+                    static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(c.tick),
+                    bits(c.integralBefore), bits(c.integralAfter), bits(c.logicalOutputVelocityPps));
+            }
+            if ((a.flags & EDM94::FaultAxis_ACCEPTED_IMAGE) != 0U)
+                RtPrintf("[EDM94] event=FIRST_AXIS_ACCEPTED session=%llu imageTick=%llu sourceUs=%llu epoch=%llu ownerGen=%u csv=%d image=NIC_ACCEPTED driveAck=0\n",
+                    static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(a.acceptedTick),
+                    static_cast<unsigned long long>(a.acceptedSourceNowUs), static_cast<unsigned long long>(a.acceptedIdentity.epoch),
+                    static_cast<unsigned>(a.acceptedIdentity.ownerGeneration), static_cast<int>(a.acceptedCsv));
         }
         const auto& stop = f.stop;
         RtPrintf("[EDM94] event=STOP_CHECK build=FIX16 result=%s session=%llu sampledTick=%llu blocked=%08X firstBlock=%s releaseBlocked=%08X stable=%u required=%u stopped=%u evidence=LATEST_RT_SNAPSHOT\n",
@@ -16750,8 +17331,471 @@ void NCManager::LogEDM94SameThread(const char* event, const char* reason) const 
     }
 }
 
+bool NCManager::IsEDM157ScopeCurrentSameThread(const EDM157::Scope& scope) noexcept
+{
+    const auto& s = m_edm94;
+    if (!EDM157::ValidScope(scope) || !EDM157::SupportsArm(s.gapHistoryArm) ||
+        !EDM157::SupportsFixture(E149HistoryFixture(s.gapHistoryArm), s.gapModeFixture) ||
+        !s.latched || !s.ready || !s.everArmed ||
+        s.armPending || s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.finishPending || s.complete || !s.gapHistoryServo || !s.gapHistoryMode || !s.gapWorkTime ||
+        !s.gapPhysicalCurve || s.gapWaiting || !s.next || s.next > s.moves || !m_edm130.bound ||
+        !E156BoundPlanCurrent(s, m_edm130.recipe) || scope.historyFixture != E149HistoryFixture(s.gapHistoryArm) ||
+        scope.policy.fixture != s.gapModeFixture ||
+        scope.recipe.diagnosticControlSource != EDM149::SourceForArm(s.gapHistoryArm) ||
+        !EDM130::SameRecipe(scope.recipe, m_edm130.recipe) ||
+        scope.ownerGeneration != s.lease.generation || !s.lease.Matches(m_programMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        scope.authorizedSource.epoch != m_motion.GetCurrentExecutionEpoch() ||
+        m_mode != NCOperationMode::MEMORY || (m_state != NCState::RUN && m_state != NCState::HOLD) ||
+        Close_System_Com_flag || !m_externalReadyInterlock || m_edmState == EDMState::NOT_READY ||
+        AlarmManager::GetInstance().HasAlarm() || m_isSingleBlockEnabled || m_isG66Active ||
+        !m_macroStack.empty() || Homing.IsActive() || !m_waitCallback ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
+        !CoordSys.IsTranslationRunFrozen() || !CoordSys.IsTranslationRunCurrent() ||
+        scope.authorizedSource.scope.translationGeneration != CoordSys.GetTranslationSnapshot().generation ||
+        !IsXYZCUVFeedProfileCurrentSameThread() || !IsFixedTranslationTravelCurrentSameThread() ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
+    const unsigned step = s.next - 1U;
+    const auto& source = scope.authorizedSource;
+    if (source.scope.session != s.session || source.scope.run != s.run || source.scope.cache != s.cache ||
+        source.ordinal != step || source.sourcePC != s.pc[step] ||
+        source.dispatch != m_waitingBlockDispatchId ||
+        !EDM116::SamePolicy(scope.policy, m_edm116.policies[step]) ||
+        m_edm116.consumed != s.next || m_edm116.selected != s.next || m_edm116.pending) return false;
+    const bool arc = s.authoredGCode[step] == 2U || s.authoredGCode[step] == 3U;
+    const auto& identity = arc ? m_pathArcMotion.receipt.identity : m_pathFeedMotion.receipt.identity;
+    const auto& lease = arc ? m_pathArcMotion.receipt.ownerLease : m_pathFeedMotion.receipt.ownerLease;
+    const bool pending = arc ? (m_pathArc.pending && m_pathArc.bound && m_pathArc.consumerAccepted &&
+        m_pathArc.consumerStarted && !m_pathArc.completed && m_pathArc.sourcePC == source.sourcePC &&
+        m_pathArc.dispatch == source.dispatch) :
+        (m_pathFeed.pending && m_pathFeed.bound && m_pathFeed.consumerAccepted &&
+            m_pathFeed.consumerStarted && !m_pathFeed.completed && m_pathFeed.sourcePC == source.sourcePC &&
+            m_pathFeed.dispatch == source.dispatch);
+    return pending && lease.Matches(s.lease) && identity.IsAssigned() &&
+        identity.source == MotionCommandSource::NC_MEMORY && identity.epoch == source.epoch &&
+        identity.segmentId == source.segment && identity.sourceBlockId == static_cast<MotionSourceBlockId>(source.sourcePC);
+}
+
+bool NCManager::CaptureEDM157ScopeSameThread(EDM157::Scope& scope) noexcept
+{
+    scope = EDM157::Scope{};
+    EDM126::MotionFeedback history{}; EDM128::MotionFeedback mode{};
+    const auto& s = m_edm94;
+    if (!m_motion.ReadEDM126Feedback(history) || !m_motion.ReadEDM130Feedback(mode) ||
+        !history.enabled || !history.active || history.faulted || !history.sourceReady ||
+        !history.rowActive || history.rowCompleted || history.completedRows + 1U != history.authorizedRows ||
+        history.authorizedRows != s.next || !history.tick || !history.nowUs ||
+        history.session != s.session || history.armEpoch != s.armEpoch || history.ownerGeneration != s.lease.generation ||
+        !mode.enabled || !mode.active || mode.faulted || !mode.workTimeFlush ||
+        mode.fixture != E149HistoryFixture(s.gapHistoryArm) || history.fixture != mode.fixture ||
+        mode.session != s.session || mode.armEpoch != s.armEpoch ||
+        mode.ownerGeneration != s.lease.generation || mode.liveEpoch != history.liveEpoch ||
+        mode.authorizedRows != history.authorizedRows || mode.completedRows != history.completedRows ||
+        !EDM130::SameRecipe(mode.timerRecipe, m_edm130.recipe)) return false;
+    scope.authorizedSource = history.authorizedSource;
+    scope.ownerGeneration = history.ownerGeneration; scope.historyFixture = history.fixture;
+    scope.recipe = mode.timerRecipe; scope.policy = mode.rowPolicy;
+    return EDM157::PauseModeAllowed(scope, mode.coordinator) && IsEDM157ScopeCurrentSameThread(scope);
+}
+
+void NCManager::LogEDM157SameThread(const char* event, const char* reason) const noexcept
+{
+    const auto& p = m_edm157;
+    const bool mainline = EDM149::IsFlushHoldTestArm(m_edm94.gapHistoryArm);
+    const bool flushPause = p.feedback.flushPause;
+    const bool pathReturn = !flushPause && p.scope.recipe.holdRetreatMode == 1U &&
+        !p.scope.recipe.commissioningProfile;
+    const char* tag = flushPause ? "EDM164" : pathReturn ? "EDM163" : "EDM162";
+    // Observation only: use the existing timer snapshot and never make a
+    // diagnostic read a motion/START grant. Held receipts expose E5 totals;
+    // source samples continue advancing while machining time is inhibited.
+    if (mainline)
+    {
+        EDM128::MotionFeedback timed{};
+        const bool read = m_motion.ReadEDM130Feedback(timed);
+        const bool identity = read && timed.enabled && timed.active && !timed.faulted && timed.workTimeFlush &&
+            timed.session == m_edm94.session && timed.armEpoch == m_edm94.armEpoch &&
+            timed.ownerGeneration == p.scope.ownerGeneration && timed.fixture == p.scope.historyFixture &&
+            timed.liveEpoch == p.scope.authorizedSource.epoch &&
+            timed.authorizedRows == p.scope.authorizedSource.ordinal + 1ULL &&
+            EDM130::SameRecipe(timed.timerRecipe, p.scope.recipe) &&
+            EDM116::SamePolicy(timed.rowPolicy, p.scope.policy) &&
+            EDM116::SamePolicy(timed.coordinator.policy, p.scope.policy) &&
+            EDM157::PauseModeAllowed(p.scope, timed.coordinator) && timed.tick && p.feedback.tick &&
+            (timed.tick > p.feedback.tick ? timed.tick - p.feedback.tick : p.feedback.tick - timed.tick) <= 8ULL;
+        const auto& work = timed.coordinator.work;
+        char record[481]{};
+        int length = std::snprintf(record, sizeof(record),
+            "[%s] event=PAUSE_TIMER result=%.24s session=%llu hold=%llu read=%u identityMatch=%u tick=%llu pauseTick=%llu workUs=%llu elapsedUs=%llu triggered=%llu completed=%llu eligible=%u row=%llu B=%u authority=NONE\n",
+            tag, event ? event : "UNKNOWN", static_cast<unsigned long long>(m_edm94.session),
+            static_cast<unsigned long long>(p.holdSequence), read ? 1U : 0U, identity ? 1U : 0U,
+            static_cast<unsigned long long>(timed.tick), static_cast<unsigned long long>(p.feedback.tick),
+            static_cast<unsigned long long>(work.totalWorkUs), static_cast<unsigned long long>(work.elapsedUs),
+            static_cast<unsigned long long>(work.triggeredEvents), static_cast<unsigned long long>(work.completedEvents),
+            work.previousEligible ? 1U : 0U, static_cast<unsigned long long>(p.scope.authorizedSource.ordinal),
+            static_cast<unsigned>(p.scope.policy.mode));
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=PAUSE_TIMER\n", tag);
+        length = std::snprintf(record, sizeof(record),
+            "[%s] event=%.24s reason=%.48s session=%llu hold=%llu startFloor=%llu resumeStart=%llu phase=%s stable=%u row=%llu B=%u pc=%d NCstate=%u callbacksRetained=1 pausedJog=0 S92=0 S93=0\n",
+            tag, event ? event : "UNKNOWN", reason ? reason : "NONE",
+            static_cast<unsigned long long>(m_edm94.session), static_cast<unsigned long long>(p.holdSequence),
+            static_cast<unsigned long long>(p.startFloor), static_cast<unsigned long long>(p.resumeStartSequence),
+            EDM157::PhaseName(p.feedback.phase), p.feedback.stableCycles,
+            static_cast<unsigned long long>(p.scope.authorizedSource.ordinal), static_cast<unsigned>(p.scope.policy.mode),
+            p.pc, static_cast<unsigned>(static_cast<NCState>(m_state)));
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=PAUSE_STATE\n", tag);
+        length = std::snprintf(record, sizeof(record),
+            "[%s] event=%s result=%.24s session=%llu hold=%llu tick=%llu cursorRow=%llu historyDepth=%u localMmBits=%llu stationMmBits=%llu positionBits=%llu,%llu,%llu,%llu,%llu,%llu authority=NONE\n",
+            tag, flushPause ? "FLUSH_PAUSE_POSE" : pathReturn ? "MACHINING_ANCHOR" : "PAUSE_POSE", event ? event : "UNKNOWN",
+            static_cast<unsigned long long>(m_edm94.session),
+            static_cast<unsigned long long>(p.holdSequence), static_cast<unsigned long long>(p.feedback.tick),
+            static_cast<unsigned long long>(p.feedback.cursorSource.ordinal), p.feedback.historyDepth,
+            static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.localMm)),
+            static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.stationMm)),
+            static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[0])),
+            static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[1])),
+            static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[2])),
+            static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[3])),
+            static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[4])),
+            static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[5])));
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=PAUSE_POSE\n", tag);
+        if (flushPause)
+        {
+            length = std::snprintf(record, sizeof(record),
+                "[EDM164] event=FLUSH_HOLD result=%.24s session=%llu hold=%llu flushPhase=%s eventIndex=%llu livePhase=%s anchor=%u exactE5Return=%u dwell=%u detached=%u workUs=%llu elapsedUs=%llu triggered=%llu completed=%llu authority=NONE\n",
+                event ? event : "UNKNOWN", static_cast<unsigned long long>(m_edm94.session),
+                static_cast<unsigned long long>(p.holdSequence), EDM128::PhaseName(p.feedback.flushPhase),
+                static_cast<unsigned long long>(p.feedback.flushEventIndex), EDM128::PhaseName(timed.coordinator.phase),
+                p.feedback.anchorCaptured ? 1U : 0U, timed.coordinator.exactReturn ? 1U : 0U,
+                timed.coordinator.stableCycles, timed.coordinator.detached ? 1U : 0U,
+                static_cast<unsigned long long>(work.totalWorkUs), static_cast<unsigned long long>(work.elapsedUs),
+                static_cast<unsigned long long>(work.triggeredEvents), static_cast<unsigned long long>(work.completedEvents));
+            if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+            else RtPrintf("[EDM164] event=LOG_FORMAT_ERROR part=FLUSH_HOLD\n");
+        }
+        if (pathReturn)
+        {
+            EDM126::MotionFeedback live{};
+            const bool liveRead = m_motion.ReadEDM126Feedback(live);
+            const bool liveIdentity = liveRead && live.enabled && live.active && !live.faulted && live.rowActive &&
+                !live.rowCompleted && live.session == m_edm94.session && live.armEpoch == m_edm94.armEpoch &&
+                live.ownerGeneration == p.scope.ownerGeneration && live.fixture == p.scope.historyFixture &&
+                live.liveEpoch == p.scope.authorizedSource.epoch &&
+                EDM126::SameSource(live.authorizedSource, p.scope.authorizedSource) &&
+                EDM157::ValidMapped(p.scope, live.traversal) && p.feedback.tick &&
+                (live.traversal.tick > p.feedback.tick ? live.traversal.tick - p.feedback.tick :
+                    p.feedback.tick - live.traversal.tick) <= 8ULL;
+            const auto& f = p.feedback;
+            length = std::snprintf(record, sizeof(record),
+                "[EDM163] event=HOLD_PATH result=%.24s session=%llu hold=%llu anchor=%u planned=%u unavailable=%u topZero=%u exactReturn=%u interrupted=%u anchorRow=%llu targetRow=%llu targetLocalBits=%llu targetStationBits=%llu read=%u identityMatch=%u liveRow=%llu liveDepth=%u liveStationBits=%llu liveTick=%llu authority=NONE\n",
+                event ? event : "UNKNOWN", static_cast<unsigned long long>(m_edm94.session),
+                static_cast<unsigned long long>(p.holdSequence), f.anchorCaptured ? 1U : 0U,
+                f.retreatPlanned ? 1U : 0U, f.retreatUnavailable ? 1U : 0U, f.topCaptured ? 1U : 0U,
+                f.exactReturn ? 1U : 0U, f.interrupted ? 1U : 0U,
+                static_cast<unsigned long long>(f.cursorSource.ordinal),
+                static_cast<unsigned long long>(f.retreatTarget.source.ordinal),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(f.retreatTarget.localMm)),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(f.retreatStationMm)),
+                liveRead ? 1U : 0U, liveIdentity ? 1U : 0U,
+                static_cast<unsigned long long>(live.traversal.cursorSource.ordinal), live.traversal.historyDepth,
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(live.traversal.stationMm)),
+                static_cast<unsigned long long>(live.traversal.tick));
+            if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+            else RtPrintf("[EDM163] event=LOG_FORMAT_ERROR part=HOLD_PATH\n");
+        }
+        return;
+    }
+    RtPrintf("[EDM157] event=%s reason=%s session=%llu hold=%llu startFloor=%llu resumeStart=%llu phase=%u stable=%u row=%llu pc=%d NCstate=%u cursorRow=%llu historyDepth=%u localMmBits=%llu stationMmBits=%llu positionBits=%llu,%llu,%llu,%llu,%llu,%llu callbacksRetained=1 pausedJog=0 S92=0 S93=0\n",
+        event ? event : "UNKNOWN", reason ? reason : "NONE",
+        static_cast<unsigned long long>(m_edm94.session), static_cast<unsigned long long>(p.holdSequence),
+        static_cast<unsigned long long>(p.startFloor), static_cast<unsigned long long>(p.resumeStartSequence),
+        static_cast<unsigned>(p.feedback.phase), p.feedback.stableCycles,
+        static_cast<unsigned long long>(p.scope.authorizedSource.ordinal), p.pc, static_cast<unsigned>(static_cast<NCState>(m_state)),
+        static_cast<unsigned long long>(p.feedback.cursorSource.ordinal), p.feedback.historyDepth,
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.localMm)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.stationMm)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[0])),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[1])),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[2])),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[3])),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[4])),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(p.feedback.positionPulse[5])));
+}
+
+bool NCManager::TryHoldEDM157SameThread() noexcept
+{
+    if (!EDM157::SupportsArm(m_edm94.gapHistoryArm) || !m_edm94.latched ||
+        m_edm94.cancelled || m_edm94.releaseRequested || m_edm94.complete) return false;
+    EDM157::Scope scope{};
+    if (m_edm157.active)
+    {
+        scope = m_edm157.scope;
+        if (!IsEDM157ScopeCurrentSameThread(scope)) return false;
+    }
+    else if (m_state != NCState::RUN || !CaptureEDM157ScopeSameThread(scope)) return false;
+    if (m_edm157HoldSerial == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    const std::uint64_t sequence = ++m_edm157HoldSerial;
+    if (!m_motion.RequestEDM157Hold(scope, sequence, m_startDiagnosticRequests)) return false;
+    const bool entering = m_state == NCState::RUN;
+    m_edm157 = EDM157NCState{}; auto& p = m_edm157;
+    p.active = true; p.scope = scope; p.holdSequence = sequence; p.startFloor = m_startDiagnosticRequests;
+    p.requestTick = m_edm94.feedback.lastTick; p.pc = GetActiveDispatchPC();
+    ForceEDMPLCOutputsOffSameThread("EDM157_HOLD");
+    CancelPathCoreHoldAutomaticSameThread("EDM157_HOLD");
+    CancelFeedHoldBoundaryShadow(true);
+    m_feedHoldResumeGate.Cancel(true);
+    ClearHoldResumeAlarmAdmission(HoldResumeAdmissionKind::PROGRAM_HOLD);
+    m_feedHoldNCSettleRequestSequence = MOTION_NC_SETTLE_REQUEST_SEQUENCE_INVALID;
+    if (entering) PausePathCoreLiveRetentionSameThread();
+    m_state = NCState::HOLD; m_pauseAfterBlock = false;
+    FenceEDMRecipeHoldSameThread();
+    LogEDM157SameThread("HOLD_REQUEST", entering ? "RETAIN_ACTIVE_CNC_ROW" : "NEW_HOLD_REVOKES_PENDING_START");
+    return true;
+}
+
+void NCManager::ServiceEDM165AutoFlushHoldSameThread(bool feedbackCurrent)
+{
+    // NC selects a checkpoint; the existing HOLD transaction retains all
+    // trajectory, mapping, physical-zero and fresh-START authority.
+    const auto& s = m_edm94;
+    const auto& recipe = m_edm130.recipe;
+    const unsigned selection = recipe.flushHoldTest;
+    const unsigned target = EDM130::FlushHoldTargetMode(selection);
+    const bool targeted = selection >= 2U;
+    if (!feedbackCurrent || !m_edm130.bound || !EDM130::ValidFlushHoldSelection(s.gapHistoryArm, selection) ||
+        recipe.holdRetreatMode != 1U || !EDM130::ValidRecipe(recipe) ||
+        !EDM149::IsFlushHoldTestArm(s.gapHistoryArm) || !s.session ||
+        m_edm165AutoHoldSession == s.session || m_edm157.active || m_state != NCState::RUN ||
+        !s.latched || !s.ready || !s.everArmed || s.armPending || s.cancelled ||
+        s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        s.finishPending || s.complete || m_resetContinuationPhase != ResetContinuationPhase::IDLE ||
+        !s.feedback.active || s.feedback.faulted || s.feedback.forceZero ||
+        AlarmManager::GetInstance().HasAlarm()) return;
+    if (targeted && (s.gapHistoryArm != 274U || recipe.diagnosticControlSource != 3U ||
+        recipe.commissioningProfile || s.gapModeFixture != EDM116::Fixture::ModalProgram156 ||
+        E149HistoryFixture(s.gapHistoryArm) != EDM149::ProgramHistoryFixture)) return;
+    const double height = EDM130::FrozenJumpHeightMm(recipe);
+    EDM128::MotionFeedback mode{};
+    if (!m_motion.ReadEDM130Feedback(mode) || !mode.enabled || !mode.active || mode.faulted ||
+        !mode.workTimeFlush || mode.fixture != E149HistoryFixture(s.gapHistoryArm) ||
+        mode.session != s.session || mode.armEpoch != s.armEpoch ||
+        mode.ownerGeneration != s.lease.generation || mode.liveEpoch != m_motion.GetCurrentExecutionEpoch() ||
+        mode.authorizedRows != s.next || mode.completedRows + 1U != mode.authorizedRows ||
+        !mode.tick || !mode.nowUs || !s.feedback.lastTick ||
+        (mode.tick > s.feedback.lastTick ? mode.tick - s.feedback.lastTick : s.feedback.lastTick - mode.tick) > 8ULL ||
+        !EDM130::SameRecipe(mode.timerRecipe, recipe) ||
+        !EDM116::SamePolicy(mode.rowPolicy, mode.coordinator.policy) ||
+        mode.coordinator.phase != EDM128::Phase::Outbound ||
+        !std::isfinite(mode.coordinator.stageDistanceMm) || mode.coordinator.stageDistanceMm < height * 0.25 ||
+        mode.coordinator.stageDistanceMm > height + EDM126::Roundoff(height) ||
+        (mode.coordinator.policy.mode != EDM116::Mode::B2 && !mode.coordinator.detached) ||
+        !mode.coordinator.anchorCaptured || !EDM130::ValidWorkEvidence(mode.coordinator.work) ||
+        mode.coordinator.faulted || mode.coordinator.stopped) return;
+    const auto& event = mode.coordinator;
+    if (!targeted)
+    {
+        // L1 remains the global first E5 event, regardless of B policy.
+        if (event.eventIndex != 1ULL || event.work.triggeredEvents != 1ULL || event.work.completedEvents != 0ULL) return;
+    }
+    else if (target >= 3U || static_cast<unsigned>(event.policy.mode) != target ||
+        event.eventIndex != event.work.triggeredEvents ||
+        event.work.triggeredEvents <= event.work.completedEvents ||
+        event.work.triggeredEvents - event.work.completedEvents != 1ULL ||
+        (selection == 2U && event.modeEvents[1U] != 0U) ||
+        !EDM128::ValidHeightProof(event, height, recipe.deepFlushCycleInterval,
+            EDM130::FrozenDeepMultiplier(recipe), EDM130::HasBoundDeep(recipe)) ||
+        !EDM128::ValidSpeedProof(event, recipe.flushStages)) return;
+    EDM157::Scope scope{};
+    if (!CaptureEDM157ScopeSameThread(scope) || !EDM157::PauseModeAllowed(scope, event) ||
+        !EDM130::SameRecipe(scope.recipe, mode.timerRecipe) || !EDM116::SamePolicy(scope.policy, mode.rowPolicy) ||
+        !EDM126::SameSource(scope.authorizedSource, event.anchor.authorizedSource)) return;
+    EDM126::MotionFeedback history{};
+    if (targeted)
+    {
+        if (!m_motion.ReadEDM126Feedback(history) || !history.enabled || !history.active || history.faulted ||
+            !history.sourceReady || !history.rowActive || history.rowCompleted ||
+            history.fixture != mode.fixture || history.session != mode.session || history.armEpoch != mode.armEpoch ||
+            history.ownerGeneration != mode.ownerGeneration || history.liveEpoch != mode.liveEpoch ||
+            history.authorizedRows != mode.authorizedRows || history.completedRows != mode.completedRows ||
+            history.tick != mode.tick || history.nowUs != mode.nowUs ||
+            history.lastMappingTick != history.tick || history.lastMappingUs != history.nowUs ||
+            mode.lastMappingTick != history.lastMappingTick || mode.lastMappingUs != history.lastMappingUs ||
+            history.traversal.tick != history.tick || history.traversal.nowUs != history.nowUs ||
+            !EDM126::SameSource(history.authorizedSource, scope.authorizedSource) ||
+            !EDM157::ValidMapped(scope, history.traversal)) return;
+        // L3 pauses only a committed B2 excursion that already crossed into
+        // an older retained row. Earlier non-crossing B2 events do not consume
+        // this one-shot checkpoint; no future target or anchor substitutes.
+        if (selection == 3U && (!EDM157::ValidMapped(scope, event.anchor) ||
+            history.traversal.cursorSource.ordinal >= event.anchor.cursorSource.ordinal)) return;
+    }
+    const bool accepted = TryHoldEDM157SameThread();
+    if (accepted) m_edm165AutoHoldSession = s.session;
+    char record[481]{};
+    const char* trigger = selection == 1U ? "FIRST_E5_OUTBOUND_25PCT" : selection == 2U ?
+        "FIRST_B1_E5_OUTBOUND_25PCT" : "FIRST_CROSSED_B2_E5_OUTBOUND_25PCT";
+    const int length = std::snprintf(record, sizeof(record),
+        "[%s] event=AUTO_HOLD_REQUEST result=%s session=%llu L=%u B=%u eventIndex=%llu trigger=%s phase=OUTBOUND tick=%llu hold=%llu startFloor=%llu cursorRow=%llu anchorRow=%llu resume=MANUAL_FRESH_START S92=0 S93=0\n",
+        targeted ? "EDM168" : "EDM165", accepted ? "QUEUED" : "REJECTED", static_cast<unsigned long long>(s.session),
+        selection, static_cast<unsigned>(event.policy.mode), static_cast<unsigned long long>(event.eventIndex), trigger,
+        static_cast<unsigned long long>(mode.tick), static_cast<unsigned long long>(m_edm157.holdSequence),
+        static_cast<unsigned long long>(m_edm157.startFloor),
+        static_cast<unsigned long long>(targeted ? history.traversal.cursorSource.ordinal : event.anchor.cursorSource.ordinal),
+        static_cast<unsigned long long>(event.anchor.cursorSource.ordinal));
+    if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM165] event=LOG_FORMAT_ERROR part=AUTO_HOLD_REQUEST\n");
+    if (!accepted) RejectEDM94SameThread("EDM165_AUTO_HOLD_REQUEST_REJECTED", m_gapDryRun.sourceLine);
+}
+
+bool NCManager::IsEDM168AutoHoldCheckpointCompleteSameThread() const noexcept
+{
+    const auto& s = m_edm94; const auto& recipe = m_edm130.recipe;
+    if (recipe.flushHoldTest < 2U) return true;
+    const unsigned target = EDM130::FlushHoldTargetMode(recipe.flushHoldTest);
+    return m_edm130.bound && EDM130::ValidRecipe(recipe) &&
+        EDM130::ValidFlushHoldSelection(s.gapHistoryArm, recipe.flushHoldTest) &&
+        s.gapHistoryArm == 274U && recipe.diagnosticControlSource == 3U && !recipe.commissioningProfile &&
+        s.gapModeFixture == EDM116::Fixture::ModalProgram156 && E156BoundPlanCurrent(s, recipe) &&
+        recipe.holdRetreatMode == 1U && target < 3U && s.session &&
+        m_edm165AutoHoldSession == s.session && m_edm168AutoHoldResumedSession == s.session &&
+        s.next == s.moves + (s.finishPending ? 1U : 0U) && m_edm116.acknowledgedRows == s.moves &&
+        m_edm130.retainedModeEvents[target] != 0U;
+}
+
+bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
+{
+    auto& p = m_edm157;
+    if (!p.active) return false;
+    if (!IsEDM157ScopeCurrentSameThread(p.scope) || GetActiveDispatchPC() != p.pc ||
+        (p.resumePending && (AlarmManager::GetInstance().GetUpdateCount() != p.alarmUpdate ||
+            AlarmManager::MotionAdmissionBaseState(AlarmManager::GetInstance().GetMotionSafetyIntentState()) != p.alarmIntent ||
+            m_motion.GetSafetyProvenanceGeneration() != p.safetyProvenance)))
+    { LogEDM157SameThread("CANCEL", "PAUSE_SCOPE_CHANGED"); CancelEDM94SameThread("EDM157_PAUSE_SCOPE_CHANGED"); return false; }
+    if (feedbackCurrent && (m_edm94.feedback.faulted || m_edm94.feedback.cancelled || m_edm94.feedback.forceZero ||
+        !m_edm94.feedback.active || !m_edm94.feedback.armAccepted))
+    { LogEDM157SameThread("CANCEL", "GUARD_REVOKED"); CancelEDM94SameThread("EDM157_GUARD_REVOKED"); return false; }
+    EDM157::Feedback observed{};
+    if (!m_motion.ReadEDM157Feedback(observed) || observed.holdSequence < p.holdSequence)
+    {
+        if (feedbackCurrent && m_edm94.feedback.lastTick > p.requestTick &&
+            m_edm94.feedback.lastTick - p.requestTick > 4000ULL)
+        { LogEDM157SameThread("CANCEL", "HOLD_ACK_TIMEOUT"); CancelEDM94SameThread("EDM157_HOLD_ACK_TIMEOUT"); return false; }
+        return true;
+    }
+    if (observed.holdSequence != p.holdSequence || !EDM157::SameScope(observed.scope, p.scope) ||
+        !EDM157::ValidPauseContext(observed) || (p.feedback.phase != EDM157::Phase::Idle &&
+            !EDM157::SamePauseContext(observed, p.feedback)) ||
+        observed.startFloor != p.startFloor || !observed.tick || !observed.nowUs || observed.tick < p.lastTick ||
+        (feedbackCurrent && m_edm94.feedback.lastTick > observed.tick &&
+            m_edm94.feedback.lastTick - observed.tick >
+                (observed.phase == EDM157::Phase::Running ? 4000ULL : 8ULL)) ||
+        observed.phase == EDM157::Phase::Rejected || observed.phase == EDM157::Phase::Idle)
+    { LogEDM157SameThread("CANCEL", "RT_PAUSE_IDENTITY_OR_PHASE"); CancelEDM94SameThread("EDM157_RT_PAUSE_REJECTED"); return false; }
+    // RUNNING is the one retained completion receipt of the requested START.
+    // RT stops publishing it after the final zero proof; the 10 ms NC scan
+    // can arrive after the normal eight-tick live-proof freshness window.
+    // Require a current, healthy guard at or after that completion, keeping
+    // the existing one-second ACK bound and every identity/START check below.
+    // HELD admission and all in-progress physical proofs still use eight ticks.
+    if (observed.phase == EDM157::Phase::Running &&
+        (!feedbackCurrent || m_edm94.feedback.lastTick < observed.tick)) return true;
+    const auto priorPhase = p.feedback.phase;
+    p.feedback = observed; p.lastTick = observed.tick;
+    if (p.scope.recipe.holdRetreatMode && priorPhase != observed.phase)
+        LogEDM157SameThread(observed.flushPause ? "FLUSH_PHASE" : "PATH_PHASE", "EXISTING_CNC_COMMITTED_PATH");
+    const bool ready = observed.phase == EDM157::Phase::Held &&
+        observed.stableCycles >= EDM157::RequiredStableCycles;
+    if (ready && !p.readyLogged) LogEDM157SameThread("HOLD_READY",
+        observed.flushPause ? "FLUSH_STOPPED_ZERO_200_FRESH_START_REQUIRED" :
+        !p.scope.recipe.holdRetreatMode ? "PHYSICAL_ZERO_200_FRESH_START_REQUIRED" :
+        observed.retreatUnavailable ? "RETREAT_UNAVAILABLE_FRESH_START_REQUIRED" :
+        observed.interrupted ? "INTERRUPTED_STOP_FRESH_START_TO_ANCHOR" : "RETRACTED_ZERO_200_FRESH_START_REQUIRED");
+    p.readyLogged = ready;
+    if (p.resumePending && observed.rejectedStartSequence == p.resumeStartSequence)
+    {
+        p.resumePending = false; p.resumeStartSequence = 0ULL;
+        LogEDM157SameThread("START_BLOCKED", "RT_PROOF_CHANGED_FRESH_START_REQUIRED");
+    }
+    if (observed.phase == EDM157::Phase::Running)
+    {
+        if (!p.resumePending || observed.resumeStartSequence != p.resumeStartSequence ||
+            observed.resumeStartSequence <= p.startFloor || m_state != NCState::HOLD ||
+            (p.scope.recipe.holdRetreatMode && (!observed.anchorCaptured || (!observed.flushPause && !observed.exactReturn) ||
+                observed.stableCycles < EDM157::RequiredStableCycles)))
+        { LogEDM157SameThread("CANCEL", "UNREQUESTED_RESUME_ACK"); CancelEDM94SameThread("EDM157_UNREQUESTED_RESUME_ACK"); return false; }
+        m_state = NCState::RUN; m_pauseAfterBlock = false;
+        ResumePathCoreLiveRetentionSameThread();
+        LogEDM157SameThread("RESUMED", observed.flushPause ? "RT_ACK_FLUSH_SAME_POSE_RESUME_E5" : p.scope.recipe.holdRetreatMode ?
+            "RT_ACK_EXACT_ANCHOR_AND_ZERO_200" : "RT_ACK_SAME_CURSOR_SCOPE");
+        const unsigned selection = p.scope.recipe.flushHoldTest;
+        const unsigned target = EDM130::FlushHoldTargetMode(selection);
+        if (selection >= 2U && observed.flushPause && target < 3U &&
+            EDM130::ValidFlushHoldSelection(m_edm94.gapHistoryArm, selection) &&
+            m_edm165AutoHoldSession == m_edm94.session &&
+            static_cast<unsigned>(p.scope.policy.mode) == target)
+        {
+            m_edm168AutoHoldResumedSession = m_edm94.session;
+            RtPrintf("[EDM168] event=CHECKPOINT_RESUMED session=%llu L=%u B=%u eventIndex=%llu hold=%llu start=%llu proof=VALIDATED_RT_RUNNING S92=0 S93=0\n",
+                static_cast<unsigned long long>(m_edm94.session), selection, target,
+                static_cast<unsigned long long>(observed.flushEventIndex),
+                static_cast<unsigned long long>(p.holdSequence), static_cast<unsigned long long>(p.resumeStartSequence));
+        }
+        p = EDM157NCState{};
+        return false;
+    }
+    return true;
+}
+
+bool NCManager::TryResumeEDM157SameThread() noexcept
+{
+    auto& p = m_edm157;
+    if (!p.active) return false;
+    if (m_state != NCState::HOLD || !IsEDM157ScopeCurrentSameThread(p.scope))
+    { CancelEDM94SameThread("EDM157_START_SCOPE_CHANGED"); return true; }
+    if (p.resumePending)
+    { LogEDM157SameThread("START_BLOCKED", "RESUME_ACK_PENDING"); return true; }
+    EDM157::Feedback observed{};
+    if (!m_motion.ReadEDM157Feedback(observed) || !EDM157::SameScope(observed.scope, p.scope) ||
+        !EDM157::ValidPauseContext(observed) || (p.feedback.phase != EDM157::Phase::Idle &&
+            !EDM157::SamePauseContext(observed, p.feedback)) ||
+        observed.holdSequence != p.holdSequence || observed.startFloor != p.startFloor ||
+        observed.phase != EDM157::Phase::Held || observed.stableCycles < EDM157::RequiredStableCycles ||
+        !observed.tick || observed.tick < p.lastTick || !observed.nowUs ||
+        (m_edm94.feedback.lastTick > observed.tick && m_edm94.feedback.lastTick - observed.tick > 8ULL) ||
+        m_startDiagnosticRequests <= p.startFloor)
+    { LogEDM157SameThread("START_BLOCKED", "WAIT_FRESH_PHYSICAL_ZERO_200"); return true; }
+    auto& alarms = AlarmManager::GetInstance();
+    const auto update = alarms.GetUpdateCount();
+    const auto intent = AlarmManager::MotionAdmissionBaseState(alarms.GetMotionSafetyIntentState());
+    const auto safety = m_motion.GetSafetyProvenanceGeneration();
+    AlarmManager::MotionAdmissionReservation admission{};
+    const auto result = alarms.TryBeginMotionAdmission(update, intent, admission, true);
+    if (result != AlarmManager::MotionAdmissionResult::ACQUIRED)
+    { LogEDM157SameThread("START_BLOCKED", "ALARM_ADMISSION_NOT_ACQUIRED"); return true; }
+    const bool current = IsEDM157ScopeCurrentSameThread(p.scope) && GetActiveDispatchPC() == p.pc &&
+        safety == m_motion.GetSafetyProvenanceGeneration() && !alarms.HasAlarm();
+    const bool submitted = current && m_motion.RequestEDM157Resume(p.scope, p.holdSequence, m_startDiagnosticRequests);
+    const bool ended = alarms.EndMotionAdmission(admission);
+    if (!ended)
+    { CancelEDM94SameThread("EDM157_RESUME_ALARM_ADMISSION_REVOKED"); return true; }
+    if (!submitted)
+    { LogEDM157SameThread("START_BLOCKED", "RESUME_NOT_QUEUED_FRESH_START_REQUIRED"); return true; }
+    p.resumePending = true; p.resumeStartSequence = m_startDiagnosticRequests;
+    p.alarmUpdate = update; p.alarmIntent = intent; p.safetyProvenance = safety;
+    p.feedback = observed; p.lastTick = observed.tick;
+    LogEDM157SameThread("RESUME_REQUEST", observed.flushPause ? "FRESH_START_CONTINUE_SAME_E5_EVENT" : p.scope.recipe.holdRetreatMode ?
+        "FRESH_START_RETURN_ORIGINAL_ANCHOR" : "FRESH_START_AFTER_PHYSICAL_ZERO_200");
+    return true;
+}
+
 void NCManager::CancelEDM94SameThread(const char* reason) noexcept
 {
+    m_edm157 = EDM157NCState{};
+    m_edm149Confirmation = EDM149Confirmation{};
     // Capture the independent excursion cause before cancellation clears its NC receipt.
     if (m_edm94.gapModeFlush && !m_edm94.cancelled && !m_edm116.failureLogged &&
         m_motion.ReadEDM116Feedback(m_edm116.feedback) && m_edm116.feedback.excursion.faulted &&
@@ -16798,16 +17842,18 @@ void NCManager::RejectEDM94SameThread(const char* reason, int line)
 
 bool NCManager::GuardEDM94BlockSameThread(const NCBlock& block, int pc, int line)
 {
+    if (m_edm94.latched && m_edm94.gapHistoryArm==292U) return GuardEDM173BlockSameThread(block,pc,line);
     if (!InspectEDM94ProgramSameThread() && !m_edm94.latched) return true;
     const auto* authored = GetBaseProgramCache().TryGetLine(pc);
-    if (!authored || !E94Matches(authored->parsedBlock, block))
+    if (!authored || !(E94Matches(authored->parsedBlock, block) ||
+        MatchesEDM141MotionSameThread(authored->parsedBlock, block, pc)))
     { RejectEDM94SameThread("LITERAL_OR_CACHE", line); return false; }
     if (block.isEmpty) return true;
     if (!m_edm94.latched)
     {
         EDM97::Tuning tuning{};
         EDM107::FlushProfile parameters{};
-        if (IsEDM130RecipePreambleSameThread(authored->parsedBlock, pc) || E94Preamble(authored->parsedBlock) || E94Profile(authored->parsedBlock, 85U) ||
+        if (IsEDM149ConfirmationBlockSameThread(authored->parsedBlock, pc) || IsEDM130RecipePreambleSameThread(authored->parsedBlock, pc) || E94Preamble(authored->parsedBlock) || E94Profile(authored->parsedBlock, 85U) ||
             E94Profile(authored->parsedBlock, 87U) || E94Profile(authored->parsedBlock, 89U) ||
             E126Profile(authored->parsedBlock, 158U, tuning) || E126Profile(authored->parsedBlock, 160U, tuning) ||
             E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 162U, tuning, parameters) ||
@@ -16834,6 +17880,48 @@ bool NCManager::GuardEDM94BlockSameThread(const NCBlock& block, int pc, int line
             E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 204U, tuning, parameters) ||
             E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 206U, tuning, parameters) ||
             E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 208U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 210U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 212U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 214U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 216U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 218U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 220U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 222U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 224U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 226U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 228U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 230U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 232U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 234U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 236U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 238U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 240U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 242U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 244U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 246U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 248U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 250U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 252U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 254U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 256U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 258U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 260U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 262U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 264U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 266U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 268U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 270U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 272U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 274U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 276U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 278U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 280U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 282U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 284U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 286U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 288U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 290U, tuning, parameters) ||
+            E108ProfileOnlyNPQRSIJK(authored->parsedBlock, 292U, tuning, parameters) ||
             E97ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
             E98ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
             E99ProfileOnlyNPQRS(authored->parsedBlock, tuning) ||
@@ -16919,8 +18007,90 @@ bool NCManager::GuardEDM94BlockSameThread(const NCBlock& block, int pc, int line
         (m_edm94.next < m_edm94.moves && !m_edm94.ready) ||
         (m_edm94.next == m_edm94.moves + 1U && !m_edm94.complete))
     { RejectEDM94SameThread("BLOCK_SCOPE_OR_ORDER", line); return false; }
+    if (E141MotionArm(m_edm94.gapHistoryArm) && m_edm94.next < m_edm94.moves)
+    {
+        if (m_edm141.verifiedRows != m_edm94.next ||
+            !MatchesEDM141MotionSameThread(authored->parsedBlock, block, pc))
+        { RejectEDM94SameThread("EDM141_RESOLVED_ROW_ORDER", line); return false; }
+        ++m_edm141.verifiedRows;
+        const auto& row = m_edm141.rows[m_edm94.next];
+        char record[481]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM141] event=MOTION_RESOLVED session=%llu row=%u pc=%d G=%d readMask=%u assignments=%u local1=%.9g local2=%.9g B=%u powerControl=NC_PLC_S92\n",
+            static_cast<unsigned long long>(m_edm94.session), m_edm94.next, pc, row.gcode,
+            row.readMask, row.assignmentCount, row.localValues[0], row.localValues[1],
+            static_cast<unsigned>(m_edm127.pending.mode));
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM141] event=LOG_FORMAT_ERROR part=MOTION_RESOLVED\n");
+    }
     m_edm94.boundary = EDM94NCState::FeedBoundary{};
     ++m_edm94.next;
+    return true;
+}
+
+// EDM154 classifies only the already admitted current literal row. It grants
+// no Motion permission; GuardEDM94FeedSameThread still consumes its exact token.
+bool NCManager::IsEDM154SparseFeedSameThread() const noexcept
+{
+    const auto& s = m_edm94;
+    if (!s.latched || !s.ready || !s.everArmed || s.armPending || s.cancelled || s.resetSeen ||
+        s.resetCommitted || s.releaseRequested || s.rtFaultReported || s.finishPending || s.complete ||
+        !s.gapHistoryServo || !s.gapHistoryMode || !s.gapWorkTime ||
+        !((s.gapModeFixture == EDM116::Fixture::ModalSparse154 && EDM149::IsSparseTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::SparseHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalSparseArc155 && EDM149::IsSparseArcTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::SparseArcHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalProgram156 && EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::ProgramHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalPause157 && EDM149::IsPauseTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::PauseHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalSixVisibleFlush167 && EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::SixVisibleFlushHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalXYZVisibleFlush159 && EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::XYZVisibleFlushHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalVisibleFlush158 && EDM149::IsVisibleFlushTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::VisibleFlushHistoryFixture &&
+                m_edm127.authoredInline[0] && m_edm127.expectedMode[0] == EDM116::Mode::B1)) ||
+        !m_edm130.bound || !EDM130::IsMotionTest(m_edm130.recipe) || !EDM130::ValidRecipe(m_edm130.recipe) ||
+        m_edm130.recipe.diagnosticControlSource != EDM149::SourceForArm(s.gapHistoryArm) ||
+        s.gapPhysicalAd != EDM130::RequiresPhysicalVoltage(m_edm130.recipe) ||
+        !E156BoundPlanCurrent(s, m_edm130.recipe) || s.next == 0U || s.next > s.moves ||
+        s.cache != GetBaseProgramCache().GetGeneration() ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || !s.session || !s.run || !s.cache ||
+        !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || !s.lease.Matches(m_programMotionLease)) return false;
+    const unsigned step = s.next - 1U;
+    return GetActiveDispatchPC() == s.pc[step] && s.authoredGCode[step] == 1U &&
+        EDM149::ValidSparseIncrement(s.increment[step], s.feed[step]);
+}
+
+bool NCManager::IsEDM154SparseFeedBlockSameThread(const NCBlock& block) const noexcept
+{
+    const auto& source = CoordSys.GetTranslationSnapshot();
+    if (!IsEDM154SparseFeedSameThread() || source.distanceMode != 91 || !IsNCXYZCUVFeedNeutralFrame(source) ||
+        !IsNCXYZFeedSingleGBlock(block, 1) || !block.has('F')) return false;
+    const unsigned step = m_edm94.next - 1U;
+    const auto* authored = GetBaseProgramCache().TryGetLine(m_edm94.pc[step]);
+    if (!authored) return false;
+    NCParsedBlock geometry = authored->parsedBlock;
+    if (geometry.has('B') != m_edm127.authoredInline[step]) return false;
+    if (geometry.has('B'))
+    {
+        double value = 0.0; EDM116::Mode mode = EDM116::Mode::Invalid;
+        if (!E94Number(geometry.expression('B'), value) || !EDM116::ParseMode(value, mode) ||
+            mode != m_edm127.expectedMode[step]) return false;
+        geometry.hasParam['B'-'A'] = false; geometry.paramExpressions['B'-'A'].clear();
+    }
+    std::array<double, 6U> literal{}; double feed = 0.0;
+    if (!E114Move(geometry, step, literal, feed, m_edm94.gapModeFixture) ||
+        literal != m_edm94.increment[step] || feed != m_edm94.feed[step] || block.val('F') != feed) return false;
+    for (char letter = 'A'; letter <= 'Z'; ++letter)
+        if (block.has(letter) && (std::strchr("NXYZCUVF", letter) == nullptr || !std::isfinite(block.val(letter)))) return false;
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const char letter = "XYZCUV"[axis];
+        if (block.has(letter) != geometry.has(letter) ||
+            (block.has(letter) ? block.val(letter) != literal[axis] : literal[axis] != 0.0)) return false;
+    }
     return true;
 }
 
@@ -16933,7 +18103,9 @@ bool NCManager::GuardEDM94FeedSameThread(const NCBlock& block) noexcept
         m_edm94.run != m_pathCoreLiveBookkeeping.currentRunToken ||
         !m_motion.IsMotionOwnerLeaseCurrent(m_edm94.lease)) return false;
     const unsigned step = m_edm94.next - 1U;
-    if (m_edm94.gapPhysicalCurve && (EDM116::IsArcStep(step, m_edm94.gapModeFixture) || !IsEDM114CurrentSameThread(step))) return false;
+    if (m_edm94.gapPhysicalCurve && (EDM116::IsArcStep(step, m_edm94.gapModeFixture, m_edm94.authoredGCode[step]) ||
+        (EDM116::IsAuthoredOrderFixture(m_edm94.gapModeFixture) && block.gCode != m_edm94.authoredGCode[step]) ||
+        !IsEDM114CurrentSameThread(step))) return false;
     if (m_edm94.gapCurveB2 && !IsEDM115CurrentSameThread(step)) return false;
     if (m_edm94.gapCurveRuntime && !IsEDM113RuntimeCurrentSameThread(step)) return false;
     const int pc = GetActiveDispatchPC();
@@ -16942,9 +18114,11 @@ bool NCManager::GuardEDM94FeedSameThread(const NCBlock& block) noexcept
     std::array<double, 6U> target{};
     for (unsigned a = 0U; a < 6U; ++a)
     {
-        if (!block.has("XYZCUV"[a]) || block.val("XYZCUV"[a]) != m_edm94.increment[step][a]) return false;
+        const bool present = block.has("XYZCUV"[a]);
+        if ((!present && (!EDM149::IsTestArm(m_edm94.gapHistoryArm) || m_edm94.increment[step][a] != 0.0)) ||
+            (present && block.val("XYZCUV"[a]) != m_edm94.increment[step][a])) return false;
         const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(a));
-        target[a] = axis.logicalCmdPos.Load() + block.val("XYZCUV"[a]) * m_edm94.feedback.config.axis[a].pulsePerUnit;
+        target[a] = axis.logicalCmdPos.Load() + m_edm94.increment[step][a] * m_edm94.feedback.config.axis[a].pulsePerUnit;
     }
     const MotionExecutionEpoch epoch = m_motion.GetCurrentExecutionEpoch();
     if (!m_motion.CheckEDM94Endpoint(target, epoch, m_edm94.lease)) return false;
@@ -17036,6 +18210,7 @@ bool NCManager::GuardEDM94FeedSameThread(const NCBlock& block) noexcept
 
 WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
 {
+    if (block.val('P')==292.0 || block.val('P')==293.0) return StartEDM173SameThread(block);
     const int pc = GetActiveDispatchPC();
     if (block.val('P') == EDM125::RetreatFinishP || block.val('P') == EDM125::ReturnFinishP)
     {
@@ -17066,7 +18241,7 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
         return nullptr;
     }
     if (block.val('P') == 86.0 || block.val('P') == 88.0 || block.val('P') == 90.0 ||
-        block.val('P') == 92.0 || block.val('P') == 94.0 || block.val('P') == 96.0 || block.val('P') == 98.0 || block.val('P') == 100.0 || block.val('P') == 102.0 || block.val('P') == 104.0 || block.val('P') == 106.0 || block.val('P') == 108.0 || block.val('P') == 110.0 || block.val('P') == 112.0 || block.val('P') == 114.0 || block.val('P') == 116.0 || block.val('P') == 118.0 || block.val('P') == 120.0 || block.val('P') == 122.0 || block.val('P') == 124.0 || block.val('P') == 126.0 || block.val('P') == 128.0 || block.val('P') == 130.0 || block.val('P') == 133.0 || block.val('P') == 151.0 || block.val('P') == 153.0 || block.val('P') == 159.0 || block.val('P') == 161.0 || block.val('P') == 163.0 || block.val('P') == 165.0 || block.val('P') == 167.0 || block.val('P') == 169.0 || block.val('P') == 171.0 || block.val('P') == 173.0 || block.val('P') == 175.0 || block.val('P') == 177.0 || block.val('P') == 179.0 || block.val('P') == 181.0 || block.val('P') == 183.0 || block.val('P') == 185.0 || block.val('P') == 187.0 || block.val('P') == 189.0 || block.val('P') == 191.0 || block.val('P') == 193.0 || block.val('P') == 195.0 || block.val('P') == 197.0 || block.val('P') == 199.0 || block.val('P') == 201.0 || block.val('P') == 203.0 || block.val('P') == 205.0 || block.val('P') == 207.0 || block.val('P') == 209.0)
+        block.val('P') == 92.0 || block.val('P') == 94.0 || block.val('P') == 96.0 || block.val('P') == 98.0 || block.val('P') == 100.0 || block.val('P') == 102.0 || block.val('P') == 104.0 || block.val('P') == 106.0 || block.val('P') == 108.0 || block.val('P') == 110.0 || block.val('P') == 112.0 || block.val('P') == 114.0 || block.val('P') == 116.0 || block.val('P') == 118.0 || block.val('P') == 120.0 || block.val('P') == 122.0 || block.val('P') == 124.0 || block.val('P') == 126.0 || block.val('P') == 128.0 || block.val('P') == 130.0 || block.val('P') == 133.0 || block.val('P') == 151.0 || block.val('P') == 153.0 || block.val('P') == 159.0 || block.val('P') == 161.0 || block.val('P') == 163.0 || block.val('P') == 165.0 || block.val('P') == 167.0 || block.val('P') == 169.0 || block.val('P') == 171.0 || block.val('P') == 173.0 || block.val('P') == 175.0 || block.val('P') == 177.0 || block.val('P') == 179.0 || block.val('P') == 181.0 || block.val('P') == 183.0 || block.val('P') == 185.0 || block.val('P') == 187.0 || block.val('P') == 189.0 || block.val('P') == 191.0 || block.val('P') == 193.0 || block.val('P') == 195.0 || block.val('P') == 197.0 || block.val('P') == 199.0 || block.val('P') == 201.0 || block.val('P') == 203.0 || block.val('P') == 205.0 || block.val('P') == 207.0 || block.val('P') == 209.0 || block.val('P') == 211.0 || block.val('P') == 213.0 || block.val('P') == 215.0 || block.val('P') == 217.0 || block.val('P') == 219.0 || block.val('P') == 221.0 || block.val('P') == 223.0 || block.val('P') == 225.0 || block.val('P') == 227.0 || block.val('P') == 229.0 || block.val('P') == 231.0 || block.val('P') == 233.0 || block.val('P') == 235.0 || block.val('P') == 237.0 || block.val('P') == 239.0 || block.val('P') == 241.0 || block.val('P') == 243.0 || block.val('P') == 245.0 || block.val('P') == 247.0 || block.val('P') == 249.0 || block.val('P') == 251.0 || block.val('P') == 253.0 || block.val('P') == 255.0 || block.val('P') == 257.0 || block.val('P') == 259.0 || block.val('P') == 261.0 || block.val('P') == 263.0 || block.val('P') == 265.0 || block.val('P') == 267.0 || block.val('P') == 269.0 || block.val('P') == 271.0 || block.val('P') == 273.0 || block.val('P') == 275.0 || block.val('P') == 277.0 || block.val('P') == 279.0 || block.val('P') == 281.0 || block.val('P') == 283.0 || block.val('P') == 285.0 || (block.val('P') == 287.0 || block.val('P') == 289.0 || block.val('P') == 291.0))
     {
         if (m_edm94.gapGainProfile)
         {
@@ -17111,9 +18286,9 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
         { RejectEDM94SameThread("EDM112_CURVE_EVIDENCE_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
         if (m_edm94.gapCurveRuntime && !IsEDM113RuntimeCurrentSameThread(EDM109::Capacity))
         { RejectEDM94SameThread("EDM113_RUNTIME_CURVE_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
-        if (m_edm94.gapHistoryServo && !IsEDM126CurrentSameThread(EDM114::RequiredRows))
+        if (m_edm94.gapHistoryServo && !IsEDM126CurrentSameThread(m_edm94.moves))
         { RejectEDM94SameThread("EDM126_HISTORY_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
-        if (m_edm94.gapPhysicalCurve && !IsEDM114CurrentSameThread(EDM114::RequiredRows))
+        if (m_edm94.gapPhysicalCurve && !IsEDM114CurrentSameThread(m_edm94.moves))
         { RejectEDM94SameThread("EDM114_PHYSICAL_CURVE_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
         if (m_edm94.gapCurveB2 && !IsEDM115CurrentSameThread(EDM114::RequiredRows))
         { RejectEDM94SameThread("EDM115_CURVE_B2_INCOMPLETE", m_gapDryRun.sourceLine); return nullptr; }
@@ -17126,6 +18301,8 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
         if (m_edm94.gapCurveGeometry)
             RtPrintf("[EDM112] event=COMMON_CURVE_STAGE_COMPLETE build=EDM112 session=%llu physicalG01=16 physicalB2=2 shadowG01=16 physicalArc=0 numeric=1 applyToMotion=0 dischargeCommand=NONE\n",
                 static_cast<unsigned long long>(m_edm94.session));
+        if (!E156FinishTargetMatches(m_edm94, m_edm130.recipe, m_edm94.feedback, m_edm114.retained))
+        { RejectEDM94SameThread("EDM156_FINISH_TARGET_RECEIPT", m_gapDryRun.sourceLine); return nullptr; }
         m_edm94.ready = false; m_edm94.finishPending = true; m_edm94.polls = 0U;
         m_motion.RequestEDM94Finish(m_edm94.session);
         LogEDM94SameThread("FINISH_REQUEST", "AWAIT_PHYSICAL_ZERO_STABILITY");
@@ -17219,9 +18396,32 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
     { RejectEDM94SameThread("EDM112_GEOMETRY_FIXTURE", m_gapDryRun.sourceLine); return nullptr; }
     if (m_edm94.gapWorkTime && !BindEDM130WorkTimeSameThread())
     { RejectEDM94SameThread("EDM130_WORK_TIME_BIND", m_gapDryRun.sourceLine); return nullptr; }
+    if (EDM149::IsBoundedProgramTestArm(m_edm94.gapHistoryArm) && m_edm130.recipe.commissioningProfile == 0U &&
+        !PreflightEDM160BoundedTravelSameThread())
+    { RejectEDM94SameThread("EDM160_BOUNDED_TRAVEL_PREFLIGHT", m_gapDryRun.sourceLine); return nullptr; }
+    if (EDM149::IsVisibleFlushTestArm(m_edm94.gapHistoryArm) && !PreflightEDM158VisibleTravelSameThread())
+    { RejectEDM94SameThread("EDM158_FULL_LIFT_TRAVEL_PREFLIGHT", m_gapDryRun.sourceLine); return nullptr; }
+    if (EDM149::IsXYZVisibleFlushTestArm(m_edm94.gapHistoryArm) && !PreflightEDM159XYZVisibleTravelSameThread())
+    { RejectEDM94SameThread("EDM159_XYZ_LIFT_TRAVEL_PREFLIGHT", m_gapDryRun.sourceLine); return nullptr; }
+    if (EDM149::IsSixVisibleFlushTestArm(m_edm94.gapHistoryArm) && !PreflightEDM167SixVisibleTravelSameThread())
+    { RejectEDM94SameThread("EDM167_SIX_LIFT_TRAVEL_PREFLIGHT", m_gapDryRun.sourceLine); return nullptr; }
+    if (E140AssignmentArm(m_edm94.gapHistoryArm))
+    {
+        if (!m_edm140.count || m_edm140.count > EDM140::AssignmentCapacity ||
+            m_edm140.next || !m_edm130.bound ||
+            m_edm130.recipe.diagnosticControlSource != E149ControlSource(m_edm94.gapHistoryArm))
+        { RejectEDM94SameThread("EDM140_PLAN_BIND", m_gapDryRun.sourceLine); return nullptr; }
+        m_edm140.session = m_edm94.session; m_edm140.run = m_edm94.run;
+        m_edm140.cache = m_edm94.cache; m_edm140.armEpoch = m_edm94.armEpoch;
+        m_edm140.ownerGeneration = m_edm94.lease.generation; m_edm140.sealed = true;
+    }
+    if (EDM149::IsTestArm(m_edm94.gapHistoryArm) && !ConsumeEDM149ConfirmationSameThread(pc))
+    { RejectEDM94SameThread("EDM149_M00_START_CONFIRMATION_REQUIRED", m_gapDryRun.sourceLine); return nullptr; }
     const bool submitted = m_edm94.gapWorkTime ?
         m_motion.SubmitEDM130Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease,
-            m_edm94.gapTuning, m_edm94.gapFlushParameters, E130CanonicalArm(m_edm94.gapHistoryArm) ? 0U : 1U, m_edm130.recipe) : m_edm94.gapPhysicalAd ?
+            m_edm94.gapTuning, m_edm94.gapFlushParameters, E149HistoryFixture(m_edm94.gapHistoryArm), m_edm130.recipe,
+            EDM149::IsManualVoltageTestArm(m_edm94.gapHistoryArm) ? m_edm94.run : 0ULL,
+            EDM149::IsManualVoltageTestArm(m_edm94.gapHistoryArm) ? m_edm94.cache : 0ULL) : m_edm94.gapPhysicalAd ?
         m_motion.SubmitEDM129Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease,
             m_edm94.gapTuning, m_edm94.gapFlushParameters, m_edm94.gapHistoryArm == 170U ? 0U : 1U) : m_edm94.gapHistoryMode ?
         m_motion.SubmitEDM128Arm(m_edm94.session, m_edm94.armEpoch, m_edm94.lease,
@@ -17246,6 +18446,22 @@ WaitConditionFunc NCManager::StartEDM94SameThread(const NCBlock& block)
     if (!submitted)
     { RejectEDM94SameThread("ARM_PUBLICATION", m_gapDryRun.sourceLine); return nullptr; }
     m_edm94.latched = m_edm94.armPending = true;
+    if(m_edm94.gapHistoryServo)
+        RtPrintf("[EDM145] event=BUILD scope=SOURCE_STARTUP_AND_LOCAL_PROOF_REUSE session=%llu thread=NC phase=ARM_REQUEST rtBuildPrint=0 noCrossTickCache=1\n",
+            static_cast<unsigned long long>(m_edm94.session));
+    if (E146PhysicalMotionArm(m_edm94.gapHistoryArm))
+        RtPrintf("[EDM146] event=BUILD scope=PHYSICAL_AD_MACRO_MOTION session=%llu armP=%u finishP=%u thread=NC source=PHYSICAL_AD stimulus=OFF rows=16 expressions=FROZEN_AND_LIVE_CHECKED physicalReversalCoverage=OBSERVED_ONLY powerControl=NC_PLC_S92\n",
+            static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm, m_edm94.gapHistoryArm + 1U);
+    if (E146PhysicalMotionArm(m_edm94.gapHistoryArm))
+        RtPrintf("[EDM147] event=BUILD scope=PHYSICAL_AD_CROSS_ROW_RETURN session=%llu armP=%u source=PHYSICAL_AD stimulus=OFF requiredCycles=%u cues=LOW_NOW_RESTORE_HIGH_CYCLE_COMPLETE coverage=COMMITTED_MAPPING authority=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            m_edm94.gapHistoryArm==224U?2U:1U);
+    if (EDM149::IsTestArm(m_edm94.gapHistoryArm))
+        RtPrintf("[%s] event=BUILD armP=%u finishP=%u source=%s ADrequired=%u motion=REAL_ETHERCAT_%s rows=%u requiredMovementMask=%u feedMmMin=0.12 confirmation=M00_AND_FRESH_START physicalInterlock=0 S92=INHIBITED S93=INHIBITED discharge=0\n",
+            EDM149::IsSixVisibleFlushTestArm(m_edm94.gapHistoryArm) ? "EDM167" : EDM149::IsXYZVisibleFlushTestArm(m_edm94.gapHistoryArm) ? "EDM159" : EDM149::IsVisibleFlushTestArm(m_edm94.gapHistoryArm) ? "EDM158" : EDM149::IsPauseTestArm(m_edm94.gapHistoryArm) ? "EDM157" : EDM149::IsBoundedProgramTestArm(m_edm94.gapHistoryArm) ? "EDM156" : EDM149::IsSparseArcTestArm(m_edm94.gapHistoryArm) ? "EDM155" : EDM149::IsSparseTestArm(m_edm94.gapHistoryArm) ? "EDM154" : EDM149::IsOrderTestArm(m_edm94.gapHistoryArm) ? "EDM153" : EDM149::IsArcTestArm(m_edm94.gapHistoryArm) ? "EDM152" : EDM149::IsSixTestArm(m_edm94.gapHistoryArm) ? "EDM151" : EDM149::IsXYZTestArm(m_edm94.gapHistoryArm) ? "EDM150" : "EDM149", m_edm94.gapHistoryArm,m_edm94.gapHistoryArm+1U,EDM149::SourceName(E149ControlSource(m_edm94.gapHistoryArm)),m_edm94.gapPhysicalAd ? 1U : 0U, (EDM149::IsBoundedProgramTestArm(m_edm94.gapHistoryArm) || EDM149::IsSparseArcTestArm(m_edm94.gapHistoryArm) || EDM149::IsSparseTestArm(m_edm94.gapHistoryArm) || EDM149::IsOrderTestArm(m_edm94.gapHistoryArm) || EDM149::IsArcTestArm(m_edm94.gapHistoryArm) || EDM149::IsSixTestArm(m_edm94.gapHistoryArm)) ? "XYZCUV" : EDM149::IsXYZTestArm(m_edm94.gapHistoryArm) ? "XYZ" : "Z", m_edm94.moves, E156RequiredMovementMask(m_edm94, m_edm130.recipe));
+    if (E148AuthoredLineArm(m_edm94.gapHistoryArm))
+        RtPrintf("[EDM148] event=BUILD scope=AUTHORED_SIX_AXIS_LINE session=%llu armP=%u finishP=%u thread=NC source=SIMULATED_CONTROL physicalMonitor=1 rows=16 lineXYZAbsMm=0.001..0.002 lineCUVAbsDeg=0.020..0.040 feedMmMin=0.12 arcRecipe=UNCHANGED expressions=FROZEN_AND_LIVE_CHECKED powerControl=NC_PLC_S92\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,m_edm94.gapHistoryArm+1U);
     LogEDM94SameThread("ARM_REQUEST", m_edm94.gapPhysicalCurve ? "ACTUAL_MOTORS_G91_G01_ARC2" : "ACTUAL_MOTORS_FIXED_G91_G1");
     if (m_edm94.gapModeFlush) LogEDM116SameThread("ARM_REQUEST");
     if (m_edm94.gapCurveB2) LogEDM115SameThread("ARM_REQUEST");
@@ -17333,7 +18549,8 @@ bool NCManager::HasEDM94CompletionReleaseAcknowledgementSameThread(const EDM94::
     const auto& s = m_edm94;
     // Deliberately independent of current NC state/reset flags. An already
     // completed old transaction can be consumed after a newer RESET intent.
-    return s.completionReleaseRequested && s.session != 0ULL &&
+    return E156FinishTargetMatches(s, m_edm130.recipe, f, m_edm114.retained) &&
+        s.completionReleaseRequested && s.session != 0ULL &&
         f.identity.session == s.session && f.identity.epoch == s.armEpoch &&
         f.identity.ownerGeneration == s.lease.generation &&
         f.lastTick != 0ULL && f.lastTick >= s.lastTick &&
@@ -17361,7 +18578,7 @@ bool NCManager::ConsumeEDM94CompletionReleaseSameThread(const EDM94::Feedback& f
         runtime.session == m_edm94.session && runtime.armEpoch == m_edm94.armEpoch &&
         runtime.ownerGeneration == m_edm94.lease.generation)
         LogEDM113RuntimeSameThread();
-    if (m_edm94.gapPhysicalCurve && m_edm114.acknowledgedRows == EDM114::RequiredRows &&
+    if (m_edm94.gapPhysicalCurve && m_edm114.acknowledgedRows == m_edm94.moves &&
         m_edm114.retained.completed && !m_edm114.retained.failed &&
         m_edm114.retained.session == m_edm94.session && m_edm114.retained.armEpoch == m_edm94.armEpoch &&
         m_edm114.retained.ownerGeneration == m_edm94.lease.generation)
@@ -17406,6 +18623,7 @@ bool NCManager::IsEDM94CompletionSelectionCurrentSameThread() const noexcept
         (f.completionEpoch != s.completionEpoch ||
             f.completionIdleOwnerGeneration != s.completionIdleLease.generation ||
             f.completionNoneOwnerGeneration != s.completionNoneGeneration)) return false;
+    if (!E156FinishTargetMatches(s, m_edm130.recipe, f, m_edm114.retained)) return false;
     const bool guardOrReceipt = HasEDM94CompletionReleaseAcknowledgementSameThread(f) ||
         (f.active && f.armAccepted && f.finishRequested && f.forceZero && !f.released);
     return guardOrReceipt && current();
@@ -17448,14 +18666,16 @@ void NCManager::CompleteEDM94ProgramEndSameThread(const NCProgramEndGateSnapshot
     // retirement. Validate its frozen row identity, not the current owner/epoch.
     if (s.gapCurveRuntime && !IsEDM113RuntimeCurrentSameThread(EDM109::Capacity))
     { CancelEDM94SameThread("EDM113_M30_RUNTIME_EVIDENCE"); return; }
-    if (s.gapHistoryServo && !IsEDM126CurrentSameThread(EDM114::RequiredRows))
+    if (s.gapHistoryServo && !IsEDM126CurrentSameThread(m_edm94.moves))
     { CancelEDM94SameThread("EDM126_M30_HISTORY_INCOMPLETE"); return; }
-    if (s.gapPhysicalCurve && !IsEDM114CurrentSameThread(EDM114::RequiredRows))
+    if (s.gapPhysicalCurve && !IsEDM114CurrentSameThread(m_edm94.moves))
     { CancelEDM94SameThread("EDM114_M30_CURVE_EVIDENCE"); return; }
     if (s.gapCurveB2 && !IsEDM115CurrentSameThread(EDM114::RequiredRows))
     { CancelEDM94SameThread("EDM115_M30_B2_EVIDENCE"); return; }
     if (s.gapModeFlush && !IsEDM116CurrentSameThread(EDM114::RequiredRows))
     { CancelEDM94SameThread("EDM116_M30_MODE_EVIDENCE"); return; }
+    if (!E156FinishTargetMatches(s, m_edm130.recipe, s.feedback, m_edm114.retained))
+    { CancelEDM94SameThread("EDM156_M30_TARGET_RECEIPT"); return; }
     auto& alarms = AlarmManager::GetInstance();
     const MotionOwnerLease idleLease = m_motion.GetMotionOwnerLease();
     const std::uint64_t safety = m_motion.GetSafetyProvenanceGeneration();
@@ -17828,6 +19048,98 @@ bool NCManager::ServiceEDM106PhaseHoldSameThread(const EDM96::Feedback& gap) noe
     return true;
 }
 
+// The existing HMI variable transport carries only an explicitly scoped
+// voltage write. No persistent @ value, START edge or axis command is polled.
+bool NCManager::IsEDM169ManualScopeCurrentSameThread() const noexcept
+{
+    const auto& s = m_edm94;
+    // After the frozen PASS, M30 retires AUTO through authenticated IDLE_HOLD
+    // and NONE zero windows. A voltage heartbeat grants no new motion there.
+    const bool completion = EDM149::IsManualVoltageTestArm(s.gapHistoryArm) && s.complete &&
+        IsEDM94CompletionSelectionCurrentSameThread();
+    const bool liveOwner = (m_state == NCState::RUN || m_state == NCState::HOLD) &&
+        s.lease.Matches(m_programMotionLease) && m_motion.IsMotionOwnerLeaseCurrent(s.lease);
+    return EDM149::IsManualVoltageTestArm(s.gapHistoryArm) && s.latched && s.session &&
+        m_edm169.session == s.session && m_edm130.bound &&
+        s.gapHistoryServo && s.gapHistoryMode && s.gapWorkTime && !s.gapPhysicalAd &&
+        s.gapModeFixture == EDM116::Fixture::ModalProgram156 &&
+        m_edm130.recipe.diagnosticControlSource == 5U && E156BoundPlanCurrent(s, m_edm130.recipe) &&
+        !s.cancelled && !s.resetSeen && !s.resetCommitted && !s.releaseRequested && !s.rtFaultReported &&
+        (liveOwner || completion) && m_mode == NCOperationMode::MEMORY &&
+        !Close_System_Com_flag && m_externalReadyInterlock && !AlarmManager::GetInstance().HasAlarm() &&
+        m_resetContinuationPhase == ResetContinuationPhase::IDLE &&
+        s.run == m_pathCoreLiveBookkeeping.currentRunToken && s.cache == GetBaseProgramCache().GetGeneration() &&
+        !m_motion.HasPendingSafetyOrRecoveryRequests() && s.feedback.identity.session == s.session &&
+        s.feedback.identity.epoch == s.armEpoch && s.feedback.identity.ownerGeneration == s.lease.generation &&
+        s.feedback.lastTick && s.feedback.lastNowUs && s.feedback.armAccepted &&
+        !s.feedback.faulted && !s.feedback.cancelled && !s.feedback.released;
+}
+
+bool NCManager::QueueEDM169ManualVoltageSameThread(double voltageV, std::uint64_t inputSequence) noexcept
+{
+    if (!IsEDM169ManualScopeCurrentSameThread() || !EDM169::ValidVoltageV(voltageV) ||
+        m_edm169.requestSequence == (std::numeric_limits<std::uint64_t>::max)()) return false;
+    const auto& s = m_edm94;
+    EDM169::Request request{};
+    request.scope.session = s.session; request.scope.run = s.run; request.scope.cache = s.cache;
+    request.scope.armEpoch = s.armEpoch; request.scope.ownerGeneration = s.lease.generation;
+    request.scope.recipe = m_edm130.recipe;
+    request.requestSequence = m_edm169.requestSequence + 1ULL;
+    request.inputSequence = inputSequence; request.voltageV = voltageV;
+    request.issuedTick = s.feedback.lastTick; request.issuedUs = s.feedback.lastNowUs;
+    if (!EDM169::ValidRequest(request) || !m_motion.SubmitEDM169ManualVoltage(request)) return false;
+    m_edm169.requestSequence = request.requestSequence;
+    return true;
+}
+
+bool NCManager::SetEDM169ManualVoltageSameThread(double voltageV) noexcept
+{
+    const auto& s = m_edm94;
+    if (!EDM149::IsManualVoltageTestArm(s.gapHistoryArm) || !s.latched) return false;
+    const bool scope = IsEDM169ManualScopeCurrentSameThread() && s.ready && !s.armPending &&
+        !s.finishPending && !s.complete;
+    if (!scope || !EDM169::ValidVoltageV(voltageV) ||
+        m_edm169.inputSequence == (std::numeric_limits<std::uint64_t>::max)())
+    {
+        RtPrintf("[EDM169] event=INPUT_REJECTED session=%llu variable=@990 voltageV=%.9g reason=%s previousValidV=%.9g inputSequence=%llu alarmRaised=0 motionAuthority=NONE\n",
+            static_cast<unsigned long long>(s.session), voltageV,
+            !scope ? "SCOPE_OR_LIFECYCLE" : "VOLTAGE_RANGE_OR_SEQUENCE", m_edm169.voltageV,
+            static_cast<unsigned long long>(m_edm169.inputSequence));
+        return false;
+    }
+    const auto inputSequence = m_edm169.inputSequence + 1ULL;
+    if (!QueueEDM169ManualVoltageSameThread(voltageV, inputSequence)) return false;
+    m_edm169.voltageV = voltageV; m_edm169.inputSequence = inputSequence;
+    RtPrintf("[EDM169] event=INPUT_QUEUED session=%llu run=%llu cache=%llu epoch=%llu owner=%llu requestSequence=%llu inputSequence=%llu variable=@990 voltageV=%.9g source=SOFTWARE_MANUAL startAuthority=NONE S92=0 S93=0\n",
+        static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(s.run),
+        static_cast<unsigned long long>(s.cache), static_cast<unsigned long long>(s.armEpoch),
+        static_cast<unsigned long long>(s.lease.generation), static_cast<unsigned long long>(m_edm169.requestSequence),
+        static_cast<unsigned long long>(inputSequence), voltageV);
+    return true;
+}
+
+void NCManager::ServiceEDM169ManualVoltageSameThread(bool feedbackCurrent) noexcept
+{
+    // A constant human value does not expire. The NC publisher heartbeat does,
+    // and it remains required during HOLD and normal finish/M30 zero dwell.
+    if (!feedbackCurrent || !QueueEDM169ManualVoltageSameThread(m_edm169.voltageV, m_edm169.inputSequence)) return;
+    EDM169::Feedback applied{};
+    const auto& s = m_edm94;
+    if (!m_motion.ReadEDM169ManualVoltageFeedback(applied) || !applied.enabled || !applied.active || applied.faulted ||
+        applied.scope.session != s.session || applied.scope.run != s.run || applied.scope.cache != s.cache ||
+        applied.scope.armEpoch != s.armEpoch || applied.scope.ownerGeneration != s.lease.generation ||
+        !EDM130::SameRecipe(applied.scope.recipe, m_edm130.recipe) || !applied.tick || !applied.nowUs ||
+        !EDM169::ValidVoltageV(applied.voltageV) || applied.inputSequence > m_edm169.inputSequence ||
+        (m_edm169.appliedLogged && applied.inputSequence <= m_edm169.loggedInputSequence)) return;
+    m_edm169.appliedLogged = true; m_edm169.loggedInputSequence = applied.inputSequence;
+    RtPrintf("[EDM169] event=INPUT_APPLIED session=%llu run=%llu cache=%llu epoch=%llu owner=%llu requestSequence=%llu inputSequence=%llu tick=%llu voltageV=%.9g publisherAgeUs=%llu source=RT_RECEIVER motion=EXISTING_CNC_GAP_SERVO S92=0 S93=0\n",
+        static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(s.run),
+        static_cast<unsigned long long>(s.cache), static_cast<unsigned long long>(s.armEpoch),
+        static_cast<unsigned long long>(s.lease.generation), static_cast<unsigned long long>(applied.requestSequence),
+        static_cast<unsigned long long>(applied.inputSequence), static_cast<unsigned long long>(applied.tick),
+        applied.voltageV, static_cast<unsigned long long>(applied.publisherAgeUs));
+}
+
 void NCManager::ServiceEDM94SameThread()
 {
     if (!m_edm94.latched) return;
@@ -17847,7 +19159,9 @@ void NCManager::ServiceEDM94SameThread()
         s.feedback = observed;
         s.lastTick = observed.lastTick;
     }
-    if (s.gapWorkTime && feedbackCurrent)
+    ServiceEDM169ManualVoltageSameThread(feedbackCurrent);
+    if (s.gapHistoryArm==292U && feedbackCurrent) ServiceEDM173SameThread();
+    if (s.gapWorkTime && s.gapHistoryArm!=292U && feedbackCurrent)
     {
         EDM128::MotionFeedback timed{};
         if (m_motion.ReadEDM130Feedback(timed) && timed.enabled && timed.workTimeFlush &&
@@ -17869,11 +19183,14 @@ void NCManager::ServiceEDM94SameThread()
             m_edm130.loggedSpeedStage = static_cast<std::uint32_t>(timed.coordinator.speedStage);
         }
     }
+    if (feedbackCurrent) ServiceEDM147PhysicalGapSameThread();
     if (ServiceEDM118InterruptionSameThread(freshPhysical)) return;
     if (feedbackCurrent && ConsumeEDM94CompletionReleaseSameThread(observed)) return;
     if (feedbackCurrent && observed.completionPhase == EDM94::CompletionReleasePhase::Revoked &&
         s.normalEndCommitted && !s.cancelled)
         CancelEDM94SameThread("NORMAL_RELEASE_REVOKED_RESET_REQUIRED");
+    ServiceEDM165AutoFlushHoldSameThread(feedbackCurrent);
+    const bool resumablePause = ServiceEDM157SameThread(feedbackCurrent);
     const bool preserveStop = s.resetSeen || s.resetCommitted || s.releaseRequested || s.complete ||
         m_state == NCState::HOLD || m_state == NCState::RESET_STATE ||
         m_resetContinuationPhase != ResetContinuationPhase::IDLE;
@@ -17883,11 +19200,22 @@ void NCManager::ServiceEDM94SameThread()
         {
             if (m_isSingleBlockEnabled)
             { RejectEDM94SameThread("EDM96_CONTINUOUS_MODE_REQUIRED", m_gapDryRun.sourceLine); return; }
-            if (s.gapWaiting && ++s.gapWaitPolls >= 500U)
+            if (s.gapWaiting && ++s.gapWaitPolls >=
+                (EDM149::IsManualVoltageTestArm(s.gapHistoryArm) ? 3000U : 500U))
             { RejectEDM94SameThread("EDM96_SOURCE_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return; }
             EDM96::Feedback gap{};
             if (m_motion.ReadEDM96Feedback(gap) && gap.session == s.session)
             {
+                // EDM145: report the retained RT fault before a dependent
+                // tuning validator rejects that already-faulted source.
+                if (gap.faulted)
+                {
+                    LogEDM96SameThread("SOURCE_OR_SEGMENT_FAULT", gap);
+                    if (m_state == NCState::RUN && !preserveStop)
+                        RejectEDM94SameThread("EDM96_RT_SOURCE_OR_SEGMENT_FAULT", m_gapDryRun.sourceLine);
+                    else CancelEDM94SameThread("EDM96_RT_FAULT_DURING_STOP");
+                    return;
+                }
                 if (!IsEDM97TuningCurrentSameThread(gap))
                 {
                     if (m_state == NCState::RUN && !preserveStop)
@@ -17897,17 +19225,10 @@ void NCManager::ServiceEDM94SameThread()
                         "EDM97_TUNING_IDENTITY_DURING_STOP");
                     return;
                 }
-                if (gap.faulted)
-                {
-                    LogEDM96SameThread("SOURCE_OR_SEGMENT_FAULT", gap);
-                    if (m_state == NCState::RUN && !preserveStop)
-                        RejectEDM94SameThread("EDM96_RT_SOURCE_OR_SEGMENT_FAULT", m_gapDryRun.sourceLine);
-                    else CancelEDM94SameThread("EDM96_RT_FAULT_DURING_STOP");
-                    return;
-                }
                 if (ServiceEDM106PhaseHoldSameThread(gap)) return;
                 if (s.gapWaiting && s.gapWaitFirstUs != 0ULL && gap.nowUs >= s.gapWaitFirstUs &&
-                    gap.nowUs - s.gapWaitFirstUs >= 5000000ULL)
+                    gap.nowUs - s.gapWaitFirstUs >=
+                        (EDM149::IsManualVoltageTestArm(s.gapHistoryArm) ? 30000000ULL : 5000000ULL))
                 { RejectEDM94SameThread("EDM96_SOURCE_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return; }
                 const std::uint64_t phaseMark = s.gapFlushProfile ?
                     gap.acceptedSegments * 64ULL + gap.phase * 8ULL + static_cast<unsigned>(gap.flushPhase) :
@@ -17955,7 +19276,7 @@ void NCManager::ServiceEDM94SameThread()
         // Fixed diagnostic mask: close, mode, state, alarm, ready, cache, run, owner.
         const unsigned scopeFailures = (Close_System_Com_flag ? 1U : 0U) |
             (m_mode != NCOperationMode::MEMORY ? 2U : 0U) |
-            (m_state != NCState::RUN ? 4U : 0U) |
+            ((m_state != NCState::RUN && !(m_state == NCState::HOLD && resumablePause)) ? 4U : 0U) |
             (AlarmManager::GetInstance().HasAlarm() ? 8U : 0U) |
             (!m_externalReadyInterlock ? 16U : 0U) |
             (s.cache != GetBaseProgramCache().GetGeneration() ? 32U : 0U) |
@@ -18199,6 +19520,7 @@ void NCManager::InvalidateEDM109CommonPathSameThread(const char* reason) noexcep
     m_edm126 = EDM126NCState{};
     m_edm129 = EDM129NCState{};
     m_edm130 = EDM130NCState{};
+    m_edm169 = EDM169NCState{};
     m_edm127.current = m_edm127.pending = EDM127::Selection{};
     m_edm127.lastPC = -1; m_edm127.lastDispatch = 0ULL;
     m_edm127.explicitRows = m_edm127.inheritedRows = m_edm127.standaloneSelections = 0U;
@@ -18651,7 +19973,7 @@ bool NCManager::IsEDM130RecipePreambleSameThread(const NCParsedBlock& block, int
         const auto* line = cache.TryGetLine(static_cast<int>(i));
         EDM97::Tuning tuning{}; EDM107::FlushProfile profile{};
         if (!line) continue;
-        const unsigned candidates[] = {174U, 176U, 178U, 180U, 182U, 184U, 186U, 188U, 190U, 192U, 194U, 196U, 198U, 200U, 202U, 204U, 206U, 208U};
+        const unsigned candidates[] = {174U, 176U, 178U, 180U, 182U, 184U, 186U, 188U, 190U, 192U, 194U, 196U, 198U, 200U, 202U, 204U, 206U, 208U, 210U, 212U, 214U, 216U, 218U, 220U, 222U, 224U, 226U, 228U, 230U, 232U, 234U, 236U, 238U, 240U, 242U, 244U, 246U, 248U, 250U, 252U, 254U, 256U, 258U, 260U, 262U, 264U, 266U, 268U, 270U, 272U, 274U, 276U, 278U, 280U, 282U, 284U, 286U, 288U, 290U, 292U};
         for (unsigned arm : candidates)
         {
             if (!E108ProfileOnlyNPQRSIJK(line->parsedBlock, arm, tuning, profile)) continue;
@@ -18700,11 +20022,1162 @@ bool NCManager::IsEDM130RecipePreambleSameThread(const NCParsedBlock& block, int
     return true;
 }
 
+// EDM141: frozen expressions and actual resolved numbers share the same local
+// commit receipts and MEMORY scope. No result here grants an RT permit.
+bool NCManager::MatchesEDM141MotionSameThread(const NCParsedBlock& parsed,
+    const NCBlock& resolved, int pc) noexcept
+{
+    const auto& s = m_edm94; const auto& p = m_edm140;
+    if (!E141MotionArm(s.gapHistoryArm) || !p.sealed ||
+        m_edm141.plannedRows != EDM141::RowCapacity || !m_edm141.expressionRows ||
+        !s.latched || !s.ready || !s.everArmed || s.armPending || s.finishPending || s.complete ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        !s.gapHistoryMode || !s.gapWorkTime || !s.gapPhysicalAd ||
+        p.session != s.session || p.run != s.run || p.cache != s.cache || p.armEpoch != s.armEpoch ||
+        p.ownerGeneration != s.lease.generation || m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY ||
+        m_isSingleBlockEnabled || Close_System_Com_flag || !m_externalReadyInterlock ||
+        !m_macroStack.empty() || m_isG66Active || Homing.IsActive() || AlarmManager::GetInstance().HasAlarm() ||
+        s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        !m_programMotionLease.Matches(s.lease) || !m_motion.IsMotionOwnerLeaseCurrent(s.lease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !m_edm130.bound ||
+        !EDM130::ValidRecipe(m_edm130.recipe) ||
+        m_edm130.recipe.diagnosticControlSource != E149ControlSource(s.gapHistoryArm) ||
+        pc < 0 || GetBasePCValue() != pc || p.next > p.count || p.count > EDM140::AssignmentCapacity) return false;
+    unsigned row = 0U;
+    while (row < m_edm141.plannedRows && m_edm141.rows[row].pc != pc) ++row;
+    if (row >= m_edm141.plannedRows || s.pc[row] != pc ||
+        (s.next != row && !(s.next == row + 1U && m_edm116.pending && m_edm116.selected == s.next))) return false;
+    const auto& frozen = m_edm141.rows[row];
+    if (frozen.assignmentCount != p.next || frozen.definedMask != p.definedMask ||
+        (p.next && (!p.lastCommit || m_programCommittedPC < p.pc[p.next - 1U])) ||
+        !EDM141::MatchesResolved(parsed, resolved, frozen)) return false;
+    const auto* cached = GetBaseProgramCache().TryGetLine(pc);
+    if (!cached || !EDM141::Matches(cached->parsedBlock, frozen)) return false;
+    for (unsigned local = 0U; local < 2U; ++local)
+        if ((p.definedMask & (1U << local)) && (p.values[local] != frozen.localValues[local] ||
+            MacroSys.GetVar('#', static_cast<int>(local + 1U)) != p.values[local])) return false;
+    return true;
+}
+
+bool NCManager::IsEDM141MotionCandidateSameThread(const NCParsedBlock& parsed, int pc) noexcept
+{
+    const auto& s = m_edm94;
+    if (!E141MotionArm(s.gapHistoryArm) || s.next >= m_edm141.plannedRows ||
+        s.next >= EDM141::RowCapacity || m_edm141.verifiedRows != s.next || s.pc[s.next] != pc) return false;
+    const auto& frozen = m_edm141.rows[s.next];
+    // Build a numeric comparison image only. The existing runtime Resolver
+    // must independently produce the same values after its drain barrier.
+    NCBlock expected{}; expected.isEmpty = false; expected.hasG = true;
+    expected.gCode = frozen.gcode; expected.gCount = 1; expected.gCodes[0] = frozen.gcode;
+    for (unsigned word = 0U; word < EDM141::WordCount; ++word)
+        if (frozen.presentMask & (1U << word))
+        {
+            const unsigned address = EDM141::Words[word] - 'A';
+            expected.hasParam[address] = true; expected.param[address] = frozen.values[word];
+        }
+    return MatchesEDM141MotionSameThread(parsed, expected, pc);
+}
+
+// EDM140: a stopped scalar bookkeeping row cannot advance or replace an EDM path.
+bool NCManager::IsEDM140AssignmentCandidateSameThread(const NCParsedBlock& block, int pc) const noexcept
+{
+    const auto& s = m_edm94; const auto& p = m_edm140;
+    if (!E140AssignmentArm(s.gapHistoryArm) || !p.sealed || !p.count ||
+        p.count > EDM140::AssignmentCapacity || p.next >= p.count || pc < 0 ||
+        p.pc[p.next] != pc || GetBasePCValue() != pc || !EDM140::Matches(block, p.specifications[p.next]) ||
+        p.session != s.session || p.run != s.run || p.cache != s.cache ||
+        p.armEpoch != s.armEpoch || p.ownerGeneration != s.lease.generation ||
+        !s.latched || !s.ready || !s.everArmed || s.armPending || s.finishPending || s.complete ||
+        s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
+        !s.gapHistoryMode || !s.gapWorkTime || !s.gapPhysicalAd ||
+        m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY || m_isSingleBlockEnabled ||
+        Close_System_Com_flag || !m_externalReadyInterlock || !m_macroStack.empty() ||
+        m_isG66Active || Homing.IsActive() || AlarmManager::GetInstance().HasAlarm() ||
+        s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        !m_programMotionLease.Matches(s.lease) || !m_motion.IsMotionOwnerLeaseCurrent(s.lease) ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !CoordSys.IsTranslationRunFrozen() ||
+        !CoordSys.IsTranslationRunCurrent() || !IsFixedTranslationTravelCurrentSameThread() ||
+        !IsXYZCUVFeedProfileCurrentSameThread() || !m_edm116.initialTranslationValid ||
+        !SameNCTranslationSnapshot(m_edm116.initialTranslation, CoordSys.GetTranslationSnapshot()) ||
+        !m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot()) ||
+        !m_edm130.bound || !EDM130::ValidRecipe(m_edm130.recipe) ||
+        m_edm130.recipe.diagnosticControlSource != E149ControlSource(s.gapHistoryArm))
+        return false;
+    const auto* cached = GetBaseProgramCache().TryGetLine(pc);
+    return cached && EDM140::Matches(cached->parsedBlock, p.specifications[p.next]);
+}
+
+bool NCManager::AuthorizeEDM140AssignmentSameThread(const NCParsedBlock& block, int pc) noexcept
+{
+    if (!IsEDM140AssignmentCandidateSameThread(block, pc)) return false;
+    const auto& s = m_edm94; const auto& p = m_edm140; const auto& rows = m_edm116;
+    if (!s.next || s.next >= s.moves || s.next != p.afterRows[p.next] || rows.pending ||
+        m_pathFeed.pending || m_pathArc.pending ||
+        rows.selected != s.next || rows.consumed != s.next || rows.acknowledgedRows != s.next ||
+        (p.specifications[p.next].readMask & ~p.definedMask) != 0U ||
+        m_motion.GetQueueSize() || !m_motion.IsGroupNCDrained() ||
+        !IsEDM114CurrentSameThread(s.next) || !IsEDM130CurrentSameThread(s.next)) return false;
+    for (unsigned local = 0U; local < 2U; ++local)
+        if ((p.definedMask & (1U << local)) && MacroSys.GetVar('#', static_cast<int>(local + 1U)) != p.values[local])
+            return false;
+    return true;
+}
+
+bool NCManager::ValidateEDM140AssignmentSameThread(const NCParsedBlock& block, int pc,
+    const NCMacroAssignmentCommit& assignment) const noexcept
+{
+    return IsEDM140AssignmentCandidateSameThread(block, pc) &&
+        EDM140::ValidResult(m_edm140.specifications[m_edm140.next],
+            assignment.prefix, assignment.index, assignment.value) &&
+        (!E141MotionArm(m_edm94.gapHistoryArm) ||
+            assignment.value == m_edm141.assignmentValues[m_edm140.next]);
+}
+
+bool NCManager::CompleteEDM140AssignmentSameThread(const NCParsedBlock& block, int pc,
+    const NCMacroAssignmentCommit& assignment, const NCProgramCommitSnapshot& commit) noexcept
+{
+    auto& p = m_edm140; const auto& s = m_edm94;
+    // CommitProgramBlock records the exact row; dispatch PC advances later
+    // through the existing shared path. Bind its actual committed snapshot.
+    if (!E140AssignmentArm(s.gapHistoryArm) || !p.sealed || !p.count ||
+        p.count > EDM140::AssignmentCapacity || p.next >= p.count || p.pc[p.next] != pc ||
+        GetBasePCValue() != pc || m_programCommittedPC != pc ||
+        !EDM140::Matches(block, p.specifications[p.next]) ||
+        !EDM140::ValidResult(p.specifications[p.next], assignment.prefix, assignment.index, assignment.value) ||
+        (E141MotionArm(s.gapHistoryArm) && assignment.value != m_edm141.assignmentValues[p.next]) ||
+        !commit.IsValid() || commit.scope != NCProgramScope::MEMORY || commit.cacheGeneration != p.cache ||
+        commit.sourcePC != pc || commit.sequence <= p.lastCommit ||
+        m_lastProgramCommit.scope != commit.scope || m_lastProgramCommit.cacheGeneration != commit.cacheGeneration ||
+        m_lastProgramCommit.frameId != commit.frameId || m_lastProgramCommit.sourcePC != commit.sourcePC ||
+        m_lastProgramCommit.sequence != commit.sequence || p.session != s.session ||
+        p.run != s.run || p.cache != s.cache || p.armEpoch != s.armEpoch ||
+        p.ownerGeneration != s.lease.generation || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
+        s.cache != GetBaseProgramCache().GetGeneration() || m_state != NCState::RUN ||
+        m_mode != NCOperationMode::MEMORY || s.cancelled || s.resetSeen || s.resetCommitted ||
+        s.releaseRequested || s.rtFaultReported || !m_motion.IsMotionOwnerLeaseCurrent(s.lease) ||
+        MacroSys.GetVar(assignment.prefix, assignment.index) != assignment.value) return false;
+    p.values[static_cast<unsigned>(assignment.index - 1)] = assignment.value;
+    p.definedMask |= 1U << static_cast<unsigned>(assignment.index - 1);
+    p.lastCommit = commit.sequence; ++p.next;
+    char record[481]{};
+    const int length = std::snprintf(record, sizeof(record),
+        "[EDM140] event=LOCAL_COMMITTED session=%llu index=%u/%u pc=%d afterRows=%u target=%d value=%.9g commit=%llu B=%u retainedRows=%u powerControl=NC_PLC_S92\n",
+        static_cast<unsigned long long>(s.session), p.next, p.count, pc, s.next,
+        assignment.index, assignment.value, static_cast<unsigned long long>(commit.sequence),
+        static_cast<unsigned>(m_edm127.current.mode), m_edm116.acknowledgedRows);
+    if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+    else RtPrintf("[EDM140] event=LOG_FORMAT_ERROR part=LOCAL_COMMITTED\n");
+    return true;
+}
+
+bool NCManager::PreflightEDM158VisibleTravelSameThread() noexcept
+{
+    const auto& s = m_edm94; const auto& r = m_edm130.recipe;
+    if (!EDM149::IsVisibleFlushTestArm(s.gapHistoryArm) || !m_edm130.bound ||
+        !E158VisiblePlan(s) || !E156BoundPlanCurrent(s, r) || !EDM130::IsVisibleFlush(r) ||
+        !EDM130::ValidRecipe(r) || !m_edm127.authoredInline[0] ||
+        m_edm127.expectedMode[0] != EDM116::Mode::B1 ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
+    // The detached B1 leg uses the existing coordinator and CNC mapper. Its
+    // dedicated reference speed leaves post-PI correction headroom. The
+    // hardware CSV cap stays 0.1 mm/s; the final stage still obeys E11/E13.
+    const double approach = EDM130::FrozenApproachDistanceMm(r);
+    const double reference = EDM130::FrozenGapReferenceVoltageV(r);
+    const auto forward = EDMGapServo::Evaluate(EDM97::MakeProfile(s.gapTuning, r), reference + 38.0,
+        reference, EDM130::FrozenMachiningOverridePercent(r));
+    const double machiningSpeed = (std::min)(0.12, forward.limitedSpeedMmPerMin) / 60.0;
+    if (!std::isfinite(approach) || approach < 0.0 || !forward.valid ||
+        !std::isfinite(machiningSpeed) || machiningSpeed <= 0.0) return false;
+    double normalSpeed = 0.0, acceleration = 0.0, maximumStopTime = 0.2;
+    double csvCap = 0.0, followingWindow = 0.0, worstPiPps = 0.0, sparePps = 0.0;
+    std::array<double, 6U> origin{}, end{}, top{};
+    for (unsigned axisIndex = 0U; axisIndex < 6U; ++axisIndex)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(axisIndex));
+        const double scale = axis.resolution_PPR / axis.finalLead;
+        if (!axis.isExist || axis.axisIndex != static_cast<int>(axisIndex) ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ||
+            !std::isfinite(scale) || scale <= 0.0 || !std::isfinite(axis.currentCmdPos)) return false;
+        if (!std::isfinite(axis.Stop_dec_time) || axis.Stop_dec_time < 0.0 ||
+            !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ||
+            !std::isfinite(axis.G00_dec_time) || axis.G00_dec_time < 0.0) return false;
+        maximumStopTime = (std::max)(maximumStopTime, axis.Stop_dec_time < 0.001 ? 0.2 : axis.Stop_dec_time);
+        maximumStopTime = (std::max)(maximumStopTime, axis.G00_acc_time < 0.001 ? 0.2 : axis.G00_acc_time);
+        maximumStopTime = (std::max)(maximumStopTime, axis.G00_dec_time < 0.001 ? 0.2 : axis.G00_dec_time);
+        if (axisIndex == 2U)
+        {
+            if (!std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0) return false;
+            // Match the frozen serialized integer CSV cap and BindEDM114Mapping
+            // per-axis acceleration budget; never override a configured limit.
+            const double cap = std::floor((std::min)(axis.maxVel_PPS, scale * 0.1));
+            const double accTime = axis.G00_acc_time < 0.001 ? 0.2 : axis.G00_acc_time;
+            const double decTime = axis.G00_dec_time < 0.001 ? 0.2 : axis.G00_dec_time;
+            if (!std::isfinite(axis.inPositionWindow_Pulse) || axis.inPositionWindow_Pulse <= 0.0 ||
+                !std::isfinite(axis.pid.MaxLag) || axis.pid.MaxLag <= 0.0) return false;
+            followingWindow = (std::min)(axis.inPositionWindow_Pulse,
+                (std::min)(axis.pid.MaxLag, scale * 0.001));
+            if (!EDM94::VisibleServoHeadroomFits(scale, cap, followingWindow,
+                axis.Pid_G00.Kp, axis.Pid_G00.Ki, axis.Pid_G00.Kvff, axis.pid.MaxIntegral)) return false;
+            if (!EDM94::VisibleServoHeadroomFits(scale, cap, followingWindow,
+                axis.Pid_FLUSH.Kp, axis.Pid_FLUSH.Ki, axis.Pid_FLUSH.Kvff, axis.pid.MaxIntegral))
+            {
+                RtPrintf("[EDM165] event=ADMISSION_REJECT session=%llu reason=FLUSH_SERVO_HEADROOM axis=%u profile=158 kpBits=%llu kiBits=%llu kdBits=%llu kvffBits=%llu armIssued=0\n",
+                    static_cast<unsigned long long>(s.session), axisIndex,
+                    static_cast<unsigned long long>(EDM130::CurveDoubleBits(axis.Pid_FLUSH.Kp)),
+                    static_cast<unsigned long long>(EDM130::CurveDoubleBits(axis.Pid_FLUSH.Ki)),
+                    static_cast<unsigned long long>(EDM130::CurveDoubleBits(axis.Pid_FLUSH.Kd)),
+                    static_cast<unsigned long long>(EDM130::CurveDoubleBits(axis.Pid_FLUSH.Kvff)));
+                return false;
+            }
+            csvCap = cap;
+            normalSpeed = (std::min)(EDM94::VisibleFlushReferenceMmSec, cap / scale);
+            worstPiPps = normalSpeed * scale * axis.Pid_G00.Kvff + followingWindow * axis.Pid_G00.Kp +
+                axis.pid.MaxIntegral * axis.Pid_G00.Ki;
+            sparePps = cap - worstPiPps;
+            acceleration = EDM128::ReservedVisibleAcceleration158(normalSpeed, (std::min)(cap / accTime, cap / decTime) / scale);
+            if (cap < 1.0 || !std::isfinite(normalSpeed) || normalSpeed <= 0.0 ||
+                !std::isfinite(acceleration) || acceleration <= 0.0) return false;
+        }
+        origin[axisIndex] = axis.currentCmdPos / scale;
+        end[axisIndex] = (axis.currentCmdPos + s.increment[0][axisIndex] * scale) / scale;
+        top[axisIndex] = (axis.currentCmdPos + (axisIndex == 2U ? 5.0 * scale : 0.0)) / scale;
+        const double actual = axis.GetNominalActualPositionPulse() / scale;
+        const double actualEnd = actual + s.increment[0][axisIndex];
+        const double actualTop = actual + (axisIndex == 2U ? 5.0 : 0.0);
+        if (!std::isfinite(origin[axisIndex]) || !std::isfinite(end[axisIndex]) ||
+            !std::isfinite(top[axisIndex]) || !std::isfinite(actual) || !std::isfinite(actualEnd) || !std::isfinite(actualTop) ||
+            CoordSys.GetInvalidSoftwareTravelLimitMask(axis) != 0U ||
+            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, origin[axisIndex]) ||
+            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, end[axisIndex]) ||
+            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, top[axisIndex]) ||
+            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, actual) ||
+            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, actualEnd) ||
+            !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, actualTop)) return false;
+        // Match the existing physical guard's enabled range checks even before
+        // HOME or when a programmable stroke check is disabled in the NC frame.
+        const bool enabled[3] = {axis.travelLimit1Enable, axis.travelLimit2Enable, axis.travelLimit3Enable};
+        const double low[3] = {axis.travelLimit1Negative_unit, axis.travelLimit2Negative_unit, axis.travelLimit3Negative_unit};
+        const double high[3] = {axis.travelLimit1Positive_unit, axis.travelLimit2Positive_unit, axis.travelLimit3Positive_unit};
+        for (unsigned limit = 0U; limit < 3U; ++limit)
+            if (enabled[limit] && (!std::isfinite(low[limit]) || !std::isfinite(high[limit]) ||
+                low[limit] >= high[limit] || origin[axisIndex] < low[limit] || origin[axisIndex] > high[limit] ||
+                end[axisIndex] < low[limit] || end[axisIndex] > high[limit] ||
+                top[axisIndex] < low[limit] || top[axisIndex] > high[limit] ||
+                actual < low[limit] || actual > high[limit] || actualEnd < low[limit] || actualEnd > high[limit] ||
+                actualTop < low[limit] || actualTop > high[limit])) return false;
+    }
+    const double finalSpeed = (std::min)(normalSpeed, EDM130::FrozenFinalApproachSpeedMmMin(r) / 60.0);
+    if (!std::isfinite(finalSpeed) || finalSpeed <= 0.0) return false;
+    const double budget = 2.0 * EDM130::FrozenJumpHeightMm(r) / normalSpeed +
+        4.0 * normalSpeed / acceleration + 2.0 * approach / finalSpeed + 3.0 * 0.1 +
+        2.0 * maximumStopTime + 0.0015 / machiningSpeed + 5.0;
+    if (!std::isfinite(budget) || budget > EDM94::VisibleFlushAdmissionSeconds) return false;
+    RtPrintf("[EDM158] event=FULL_LIFT_PREFLIGHT build=FIX4 session=%llu profile=1 rows=1 B=1 source=SOFTWARE_AUTO_WAVE E5us=500000 liftMicrometres=5000 normalMicrometresPerSec=65 hardDeadlineSeconds=180 admissionBudgetSeconds=175 originZBits=%llu endZBits=%llu topZBits=%llu budgetSecondsBits=%llu normalMmSecBits=%llu accelerationMmSec2Bits=%llu cycles=EXACTLY_ONE resumeAfterReturn=REMAINING_NC hold=CANCEL_RESET_REQUIRED S92=INHIBITED S93=INHIBITED\n",
+        static_cast<unsigned long long>(s.session),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(origin[2])),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(end[2])),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(top[2])),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(budget)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(normalSpeed)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(acceleration)));
+    RtPrintf("[EDM158] event=SERVO_HEADROOM build=FIX4 session=%llu capPpsBits=%llu windowBits=%llu worstPiPpsBits=%llu sparePpsBits=%llu proof=FULL_FROZEN_FOLLOWING_WINDOW gains=CONFIGURED discharge=0\n",
+        static_cast<unsigned long long>(s.session),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(csvCap)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(followingWindow)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(worstPiPps)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(sparePps)));
+    return true;
+}
+
+bool NCManager::PreflightEDM160BoundedTravelSameThread() noexcept
+{
+    const auto& s = m_edm94; const auto& r = m_edm130.recipe;
+    const auto bits = [](double value) noexcept
+    { return static_cast<unsigned long long>(EDM130::CurveDoubleBits(value)); };
+    const auto reject = [&](const char* reason, int row, int axis, int limit) noexcept
+    {
+        RtPrintf("[EDM160] event=TRAVEL_PREFLIGHT_REJECT session=%llu reason=%s row=%d axis=%d limit=%d phase=PRE_ARM armIssued=0 authority=NONE\n",
+            static_cast<unsigned long long>(s.session), reason, row, axis, limit);
+        return false;
+    };
+    if (!EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) || r.commissioningProfile != 0U ||
+        !m_edm130.bound || !s.moves || s.moves > EDM114::RequiredRows ||
+        !E156BoundPlanCurrent(s, r) || !EDM130::ValidRecipe(r) || !EDM130::HasBoundHeight(r) ||
+        !EDM130::HasBoundDeep(r) || r.deepFlushCycleInterval != 0U ||
+        r.diagnosticControlSource != EDM149::SourceForArm(s.gapHistoryArm) ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread()) return reject("SCOPE_OR_RECIPE", -1, -1, -1);
+    const double height = EDM130::EffectiveJumpHeightMm(r, 1ULL);
+    if (!std::isfinite(height) || height <= 0.0) return reject("EFFECTIVE_HEIGHT", -1, -1, -1);
+    bool anyB0 = false, anyB1 = false;
+    for (unsigned row = 0U; row < s.moves; ++row)
+    {
+        const auto mode = m_edm127.expectedMode[row];
+        if (!EDM116::ValidMode(mode)) return reject("MODAL_MODE", static_cast<int>(row), -1, -1);
+        anyB0 = anyB0 || mode == EDM116::Mode::B0;
+        anyB1 = anyB1 || mode == EDM116::Mode::B1;
+    }
+    // The active row's B policy may flush at a cursor in an older retained
+    // curve after GAP recovery. Apply every admitted local mode to every
+    // curve, not only to the B word originally authored on that curve.
+    std::array<double, 6U> cumulative{}, nominalLow{}, nominalHigh{}, travelLow{}, travelHigh{};
+    for (unsigned row = 0U; row < s.moves; ++row)
+    {
+        const auto* authored = GetBaseProgramCache().TryGetLine(s.pc[row]);
+        if (!authored) return reject("CACHE_PC", static_cast<int>(row), -1, -1);
+        NCParsedBlock geometry = authored->parsedBlock;
+        if (geometry.has('B') != m_edm127.authoredInline[row]) return reject("RAW_B_PRESENCE", static_cast<int>(row), -1, -1);
+        if (geometry.has('B'))
+        {
+            double word = 0.0; EDM116::Mode mode{};
+            if (!E94Number(geometry.expression('B'), word) || !EDM116::ParseMode(word, mode) ||
+                mode != m_edm127.expectedMode[row]) return reject("RAW_B_MODE", static_cast<int>(row), -1, -1);
+            geometry.hasParam['B'-'A'] = false; geometry.paramExpressions['B'-'A'].clear();
+        }
+        std::array<double, 6U> delta{}; double feed = 0.0, code = 0.0;
+        if (!E114Move(geometry, row, delta, feed, s.gapModeFixture) ||
+            !E94Number(geometry.gExpressions[0], code) || code != s.authoredGCode[row] ||
+            delta != s.increment[row] || feed != s.feed[row]) return reject("ROW_LITERAL", static_cast<int>(row), -1, -1);
+        EDM112::Curve curve{}; EDM112::Bounds bounds{};
+        if (code == 1.0)
+        {
+            EDM109::Point start{}, end{}, scale{};
+            for (unsigned axis = 0U; axis < 6U; ++axis)
+            { scale[axis] = 1000000.0; end[axis] = delta[axis] * scale[axis]; }
+            EDM109::Line line{};
+            if (!EDM109::BuildLine(start, end, scale, line) || !EDM112::BuildLine(line, curve))
+                return reject("LINE_CURVE", static_cast<int>(row), -1, -1);
+        }
+        else
+        {
+            std::array<double, 2U> center{};
+            if (!E155ArcCenter(geometry, center, s.gapModeFixture) ||
+                !EDM114::BuildBoundedXYArc(static_cast<int>(code), delta, center, feed, curve))
+                return reject("ARC_CURVE", static_cast<int>(row), -1, -1);
+        }
+        if (!EDM112::WholeCurveBounds(curve, bounds) || !bounds.valid ||
+            !std::isfinite(curve.lengthMm) || curve.lengthMm <= 0.0)
+            return reject("WHOLE_CURVE_BOUNDS", static_cast<int>(row), -1, -1);
+        for (unsigned axis = 0U; axis < 6U; ++axis)
+        {
+            const double low = cumulative[axis] + bounds.minNative[axis];
+            const double high = cumulative[axis] + bounds.maxNative[axis];
+            if (!std::isfinite(low) || !std::isfinite(high) || low > high)
+                return reject("NATIVE_BOUNDS", static_cast<int>(row), static_cast<int>(axis), -1);
+            nominalLow[axis] = (std::min)(nominalLow[axis], low);
+            nominalHigh[axis] = (std::max)(nominalHigh[axis], high);
+            double flushLow = low, flushHigh = high;
+            if (anyB0)
+            {
+                if (code == 1.0)
+                {
+                    // Native XYZ displacement defines millimetres of path;
+                    // C/U/V keep their own degrees per millimetre of tangent.
+                    const double shift = -height * delta[axis] / curve.lengthMm;
+                    if (!std::isfinite(shift)) return reject("B0_TANGENT", static_cast<int>(row), static_cast<int>(axis), -1);
+                    flushLow = (std::min)(flushLow, low + shift);
+                    flushHigh = (std::max)(flushHigh, high + shift);
+                }
+                else if (axis < 2U)
+                { flushLow -= height; flushHigh += height; }
+            }
+            if (anyB1 && axis == 2U) flushHigh = (std::max)(flushHigh, high + height);
+            // B2 remains inside this same complete retained curve union.
+            travelLow[axis] = (std::min)(travelLow[axis], flushLow);
+            travelHigh[axis] = (std::max)(travelHigh[axis], flushHigh);
+            cumulative[axis] += delta[axis];
+            const double limit = axis < 3U ? 0.025 : 0.5;
+            if (!std::isfinite(cumulative[axis]) || !std::isfinite(travelLow[axis]) || !std::isfinite(travelHigh[axis]) ||
+                nominalLow[axis] < -limit || nominalHigh[axis] > limit ||
+                travelLow[axis] < -limit || travelHigh[axis] > limit)
+            {
+                reject("FROZEN_GUARD_ENVELOPE", static_cast<int>(row), static_cast<int>(axis), -1);
+                RtPrintf("[EDM160] event=TRAVEL_DETAIL session=%llu part=GUARD_ENVELOPE row=%u axis=%u nominalLowBits=%llu nominalHighBits=%llu motionLowBits=%llu motionHighBits=%llu limitBits=%llu heightBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), row, axis, bits(nominalLow[axis]), bits(nominalHigh[axis]),
+                    bits(travelLow[axis]), bits(travelHigh[axis]), bits(limit), bits(height));
+                return false;
+            }
+        }
+    }
+    for (unsigned axisIndex = 0U; axisIndex < 6U; ++axisIndex)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(axisIndex));
+        const double scale = axis.resolution_PPR / axis.finalLead;
+        if (!axis.isExist || axis.axisIndex != static_cast<int>(axisIndex) ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 || !std::isfinite(scale) || scale <= 0.0 ||
+            !std::isfinite(axis.currentCmdPos)) return reject("AXIS_NATIVE_CONFIG", -1, static_cast<int>(axisIndex), -1);
+        const double command = axis.currentCmdPos / scale;
+        const double actual = axis.GetNominalActualPositionPulse() / scale;
+        const bool enabled[3] = {axis.travelLimit1Enable, axis.travelLimit2Enable, axis.travelLimit3Enable};
+        const double lower[3] = {axis.travelLimit1Negative_unit, axis.travelLimit2Negative_unit, axis.travelLimit3Negative_unit};
+        const double upper[3] = {axis.travelLimit1Positive_unit, axis.travelLimit2Positive_unit, axis.travelLimit3Positive_unit};
+        const unsigned invalidMask = CoordSys.GetInvalidSoftwareTravelLimitMask(axis);
+        if (invalidMask != 0U)
+        {
+            reject("COORD_LIMIT_CONFIG", -1, static_cast<int>(axisIndex), -1);
+            RtPrintf("[EDM160] event=TRAVEL_DETAIL session=%llu part=LIMIT_CONFIG axis=%u invalidMask=%u commandBits=%llu actualBits=%llu low1Bits=%llu high1Bits=%llu low2Bits=%llu high2Bits=%llu low3Bits=%llu high3Bits=%llu\n",
+                static_cast<unsigned long long>(s.session), axisIndex, invalidMask, bits(command), bits(actual),
+                bits(lower[0]), bits(upper[0]), bits(lower[1]), bits(upper[1]), bits(lower[2]), bits(upper[2]));
+            return false;
+        }
+        const double points[6] = {command, actual, command + travelLow[axisIndex], command + travelHigh[axisIndex],
+            actual + travelLow[axisIndex], actual + travelHigh[axisIndex]};
+        const char* sources[6] = {"COMMAND_ORIGIN", "ACTUAL_ORIGIN", "COMMAND_LOW", "COMMAND_HIGH", "ACTUAL_LOW", "ACTUAL_HIGH"};
+        for (unsigned pointIndex = 0U; pointIndex < 6U; ++pointIndex)
+        {
+            const double point = points[pointIndex];
+            if (!std::isfinite(point) || !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, point))
+            {
+                reject(!std::isfinite(point) ? "TRAVEL_POINT_NONFINITE" : "COORD_TARGET_LIMIT", -1, static_cast<int>(axisIndex), -1);
+                RtPrintf("[EDM160] event=TRAVEL_DETAIL session=%llu part=TARGET axis=%u pointIndex=%u source=%s commandBits=%llu actualBits=%llu pointBits=%llu motionLowBits=%llu motionHighBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, pointIndex, sources[pointIndex], bits(command), bits(actual),
+                    bits(point), bits(travelLow[axisIndex]), bits(travelHigh[axisIndex]));
+                return false;
+            }
+            for (unsigned limit = 0U; limit < 3U; ++limit)
+                if (enabled[limit] && (!std::isfinite(lower[limit]) || !std::isfinite(upper[limit]) ||
+                    lower[limit] >= upper[limit] || point < lower[limit] || point > upper[limit]))
+                {
+                    reject("ENABLED_TARGET_LIMIT", -1, static_cast<int>(axisIndex), static_cast<int>(limit));
+                    RtPrintf("[EDM160] event=TRAVEL_DETAIL session=%llu part=ENABLED_TARGET axis=%u limit=%u pointIndex=%u source=%s commandBits=%llu actualBits=%llu pointBits=%llu lowBits=%llu highBits=%llu\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, limit, pointIndex, sources[pointIndex], bits(command), bits(actual),
+                        bits(point), bits(lower[limit]), bits(upper[limit]));
+                    return false;
+                }
+        }
+    }
+    RtPrintf("[EDM160] event=TRAVEL_PREFLIGHT session=%llu rows=%u requiredMask=%u heightBits=%llu anyB0=%u anyB1=%u geometry=WHOLE_CURVE bounds=ALL_PLAN_HISTORY_POLICY_UNION origins=COMMAND_AND_ACTUAL limits=ALL_ENABLED phase=PRE_ARM authority=NONE\n",
+        static_cast<unsigned long long>(s.session), s.moves, EDM130::ProgramMovementMask(r), bits(height), anyB0 ? 1U : 0U, anyB1 ? 1U : 0U);
+    return true;
+}
+
+bool NCManager::PreflightEDM159XYZVisibleTravelSameThread() noexcept
+{
+    const auto& s = m_edm94; const auto& r = m_edm130.recipe;
+    // FIX1: one first-failure report per NC admission call. These observations
+    // neither consume the M00 ticket nor issue an arm or movement permission.
+    const auto bits = [](double value) noexcept
+    { return static_cast<unsigned long long>(EDM130::CurveDoubleBits(value)); };
+    const auto reject = [&](const char* reason, int row, int axis, int limit) noexcept
+    {
+        RtPrintf("[EDM159] event=ADMISSION_REJECT build=FIX2 session=%llu reason=%s row=%d axis=%d limit=%d phase=PRE_ARM armIssued=0 motionPermission=NOT_GRANTED dischargePermission=NOT_GRANTED\n",
+            static_cast<unsigned long long>(s.session), reason, row, axis, limit);
+        return false;
+    };
+    if (!EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm)) return reject("ARM_SCOPE", -1, -1, -1);
+    if (!m_edm130.bound) return reject("RECIPE_UNBOUND", -1, -1, -1);
+    if (!E159VisiblePlan(s)) return reject("EXACT_THREE_ROW_PLAN", -1, -1, -1);
+    if (!E156BoundPlanCurrent(s, r)) return reject("BOUND_PLAN", -1, -1, -1);
+    if (!EDM130::IsVisibleFlush159(r)) return reject("COMMISSIONING_PROFILE", -1, -1, -1);
+    if (!EDM130::ValidRecipe(r)) return reject("RECIPE_VALIDITY", -1, -1, -1);
+    if (!IsPathCoreLiveNativeConfigCurrentSameThread()) return reject("NATIVE_CONFIG_CURRENT", -1, -1, -1);
+    for (unsigned row = 0U; row < 3U; ++row)
+        if (m_edm127.authoredInline[row] != (row == 0U) ||
+            m_edm127.expectedMode[row] != EDM116::Mode::B1 ||
+            m_edm127.expectedOriginPC[row] != m_edm127.expectedOriginPC[0] ||
+            m_edm127.expectedOriginRevision[row] != m_edm127.expectedOriginRevision[0])
+        {
+            const char* reason = m_edm127.authoredInline[row] != (row == 0U) ? "MODAL_INLINE" :
+                m_edm127.expectedMode[row] != EDM116::Mode::B1 ? "MODAL_B1" :
+                m_edm127.expectedOriginPC[row] != m_edm127.expectedOriginPC[0] ? "MODAL_ORIGIN_PC" : "MODAL_ORIGIN_REVISION";
+            reject(reason, static_cast<int>(row), -1, -1);
+            RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=MODAL row=%u inlineB=%u mode=%u originPC=%d firstOriginPC=%d originRevision=%llu firstOriginRevision=%llu\n",
+                static_cast<unsigned long long>(s.session), row, m_edm127.authoredInline[row] ? 1U : 0U,
+                static_cast<unsigned>(m_edm127.expectedMode[row]), m_edm127.expectedOriginPC[row], m_edm127.expectedOriginPC[0],
+                static_cast<unsigned long long>(m_edm127.expectedOriginRevision[row]),
+                static_cast<unsigned long long>(m_edm127.expectedOriginRevision[0]));
+            return false;
+        }
+    // Rebuild every frozen literal with the existing common LINEAR6/ARC2
+    // geometry. Whole-arc extrema, including omitted endpoint components,
+    // define the envelope; an endpoint chord is not an arc travel proof.
+    std::array<double, 6U> cumulative{}, low{}, high{};
+    std::array<double, 3U> lengths{};
+    double nominalLength = 0.0;
+    for (unsigned row = 0U; row < 3U; ++row)
+    {
+        const auto* authored = GetBaseProgramCache().TryGetLine(s.pc[row]);
+        if (!authored)
+        {
+            reject("CACHE_PC", static_cast<int>(row), -1, -1);
+            RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=CACHE row=%u sourcePC=%d\n",
+                static_cast<unsigned long long>(s.session), row, s.pc[row]);
+            return false;
+        }
+        NCParsedBlock geometry = authored->parsedBlock;
+        if (geometry.has('B') != m_edm127.authoredInline[row]) return reject("RAW_B_PRESENCE", static_cast<int>(row), -1, -1);
+        if (geometry.has('B'))
+        {
+            double word = 0.0;
+            if (!E94Number(geometry.expression('B'), word) || word != 1.0) return reject("RAW_B1_LITERAL", static_cast<int>(row), -1, -1);
+            geometry.hasParam['B'-'A'] = false; geometry.paramExpressions['B'-'A'].clear();
+        }
+        std::array<double, 6U> delta{}; double feed = 0.0;
+        if (!E114Move(geometry, row, delta, feed, s.gapModeFixture)) return reject("ROW_LITERAL", static_cast<int>(row), -1, -1);
+        if (delta != s.increment[row]) return reject("ROW_INCREMENT", static_cast<int>(row), -1, -1);
+        if (feed != s.feed[row]) return reject("ROW_FEED", static_cast<int>(row), -1, -1);
+        EDM112::Curve curve{}; EDM112::Bounds bounds{};
+        if (row == 0U)
+        {
+            EDM109::Point start{}, end{}, scale{};
+            for (unsigned axis = 0U; axis < 6U; ++axis)
+            { scale[axis] = 1000000.0; end[axis] = delta[axis] * scale[axis]; }
+            EDM109::Line line{};
+            if (!EDM109::BuildLine(start, end, scale, line) || !EDM112::BuildLine(line, curve))
+                return reject("LINE_CURVE", static_cast<int>(row), -1, -1);
+        }
+        else
+        {
+            std::array<double, 2U> center{};
+            if (!E155ArcCenter(geometry, center, s.gapModeFixture) ||
+                center[0] != (row == 1U ? 0.001 : -0.001) || center[1] != 0.0 ||
+                !EDM114::BuildBoundedXYArc(static_cast<int>(s.authoredGCode[row]), delta, center, feed, curve))
+                return reject("ARC_CURVE", static_cast<int>(row), -1, -1);
+        }
+        if (!EDM112::WholeCurveBounds(curve, bounds) || !bounds.valid ||
+            !std::isfinite(curve.lengthMm) || curve.lengthMm <= 0.0)
+            return reject("WHOLE_CURVE_BOUNDS", static_cast<int>(row), -1, -1);
+        lengths[row] = curve.lengthMm; nominalLength += curve.lengthMm;
+        for (unsigned axis = 0U; axis < 6U; ++axis)
+        {
+            const double rowLow = cumulative[axis] + bounds.minNative[axis];
+            const double rowHigh = cumulative[axis] + bounds.maxNative[axis];
+            if (!std::isfinite(rowLow) || !std::isfinite(rowHigh) || rowLow > rowHigh)
+                return reject("ROW_NATIVE_BOUNDS", static_cast<int>(row), static_cast<int>(axis), -1);
+            low[axis] = (std::min)(low[axis], rowLow); high[axis] = (std::max)(high[axis], rowHigh);
+            cumulative[axis] += delta[axis];
+            if (!std::isfinite(cumulative[axis]) ||
+                low[axis] < (axis < 3U ? -0.025 : -0.5) ||
+                high[axis] > (axis < 3U ? 0.025 : 0.5))
+            {
+                reject("NOMINAL_ENVELOPE", static_cast<int>(row), static_cast<int>(axis), -1);
+                RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=NOMINAL_ENVELOPE row=%u axis=%u cumulativeBits=%llu lowBits=%llu highBits=%llu limitBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), row, axis, bits(cumulative[axis]), bits(low[axis]), bits(high[axis]), bits(axis < 3U ? 0.025 : 0.5));
+                return false;
+            }
+        }
+    }
+    const double reference = EDM130::FrozenGapReferenceVoltageV(r);
+    const auto profile = EDM97::MakeProfile(s.gapTuning, r);
+    const auto forward = EDMGapServo::Evaluate(profile, reference + 38.0, reference,
+        EDM130::FrozenMachiningOverridePercent(r));
+    // AUTO_WAVE's low phase is ref-20V with at most +1V noise. Budget the
+    // slower -19V case; the initial 160 zero samples use the same short path.
+    const auto backward = EDMGapServo::Evaluate(profile, reference - 19.0, reference,
+        EDM130::FrozenMachiningOverridePercent(r));
+    const double forwardSpeed = (std::min)(0.12, forward.limitedSpeedMmPerMin) / 60.0;
+    const double backwardSpeed = (std::min)(0.03, -backward.limitedSpeedMmPerMin) / 60.0;
+    if (!forward.valid || !backward.valid || !std::isfinite(nominalLength) || nominalLength <= 0.0 ||
+        !std::isfinite(forwardSpeed) || forwardSpeed <= 0.0 ||
+        !std::isfinite(backwardSpeed) || backwardSpeed <= 0.0)
+    {
+        reject("GAP_CURVE_SPEED", -1, -1, -1);
+        RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=GAP_SPEED forwardValid=%u backwardValid=%u nominalLengthBits=%llu forwardBits=%llu backwardBits=%llu referenceBits=%llu\n",
+            static_cast<unsigned long long>(s.session), forward.valid ? 1U : 0U, backward.valid ? 1U : 0U,
+            bits(nominalLength), bits(forwardSpeed), bits(backwardSpeed), bits(reference));
+        return false;
+    }
+    double normalSpeed = 0.0, acceleration = 0.0, maximumConfiguredTime = 0.2;
+    double capPps[3]{}, windowPulse[3]{}, worstPiPps[3]{}, sparePps[3]{};
+    double feedforwardPps[3]{}, availablePps[3]{};
+    for (unsigned axisIndex = 0U; axisIndex < 6U; ++axisIndex)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(axisIndex));
+        const double scale = axis.resolution_PPR / axis.finalLead;
+        if (!axis.isExist || axis.axisIndex != static_cast<int>(axisIndex) ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 || !std::isfinite(scale) || scale <= 0.0 ||
+            !std::isfinite(axis.currentCmdPos) || !std::isfinite(axis.Stop_dec_time) || axis.Stop_dec_time < 0.0 ||
+            !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ||
+            !std::isfinite(axis.G00_dec_time) || axis.G00_dec_time < 0.0)
+        {
+            const char* reason = !axis.isExist ? "AXIS_ABSENT" : axis.axisIndex != static_cast<int>(axisIndex) ? "AXIS_IDENTITY" :
+                !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ? "AXIS_LEAD" :
+                !std::isfinite(scale) || scale <= 0.0 ? "AXIS_PPU" : !std::isfinite(axis.currentCmdPos) ? "AXIS_COMMAND" :
+                !std::isfinite(axis.Stop_dec_time) || axis.Stop_dec_time < 0.0 ? "AXIS_STOP_TIME" :
+                !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ? "AXIS_ACCEL_TIME" : "AXIS_DECEL_TIME";
+            reject(reason, -1, static_cast<int>(axisIndex), -1);
+            RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=AXIS_CONFIG axis=%u exists=%u configuredAxis=%d leadBits=%llu pprBits=%llu ppuBits=%llu commandPulseBits=%llu stopBits=%llu accBits=%llu decBits=%llu\n",
+                static_cast<unsigned long long>(s.session), axisIndex, axis.isExist ? 1U : 0U, axis.axisIndex,
+                bits(axis.finalLead), bits(axis.resolution_PPR), bits(scale), bits(axis.currentCmdPos),
+                bits(axis.Stop_dec_time), bits(axis.G00_acc_time), bits(axis.G00_dec_time));
+            return false;
+        }
+        const double accTime = axis.G00_acc_time < 0.001 ? 0.2 : axis.G00_acc_time;
+        const double decTime = axis.G00_dec_time < 0.001 ? 0.2 : axis.G00_dec_time;
+        maximumConfiguredTime = (std::max)(maximumConfiguredTime, axis.Stop_dec_time < 0.001 ? 0.2 : axis.Stop_dec_time);
+        maximumConfiguredTime = (std::max)(maximumConfiguredTime, (std::max)(accTime, decTime));
+        if (axisIndex < 3U)
+        {
+            if (!std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ||
+                !std::isfinite(axis.inPositionWindow_Pulse) || axis.inPositionWindow_Pulse <= 0.0 ||
+                !std::isfinite(axis.pid.MaxLag) || axis.pid.MaxLag <= 0.0)
+            {
+                const char* reason = !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ? "AXIS_VELOCITY_CAP" :
+                    !std::isfinite(axis.inPositionWindow_Pulse) || axis.inPositionWindow_Pulse <= 0.0 ? "RAW_POSITION_WINDOW" : "RAW_MAX_LAG";
+                reject(reason, -1, static_cast<int>(axisIndex), -1);
+                RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=RAW_WINDOW axis=%u maxVelBits=%llu inPositionBits=%llu maxLagBits=%llu ppuBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, bits(axis.maxVel_PPS), bits(axis.inPositionWindow_Pulse), bits(axis.pid.MaxLag), bits(scale));
+                return false;
+            }
+            const double cap = std::floor((std::min)(axis.maxVel_PPS, scale * EDM94::NativeVelocityLimit(axisIndex)));
+            const double window = (std::min)(axis.inPositionWindow_Pulse, (std::min)(axis.pid.MaxLag, scale * 0.001));
+            const double referenceSpeed = axisIndex == 2U ? EDM94::VisibleFlushReferenceMmSec :
+                EDM94::VisibleXYZMachiningReferenceMmSec;
+            // FIX2: normal low-feed XY keeps configured PI and the existing
+            // per-tick following/output guards. The Z lift retains its complete
+            // frozen-window headroom requirement below.
+            if (axisIndex < 2U)
+            {
+                if (!EDM94::BoundedXYMachiningServoFits(scale, cap, window, axis.Pid_G00.Kp,
+                    axis.Pid_G00.Ki, axis.Pid_G00.Kd, axis.Pid_G00.Kvff, axis.pid.MaxIntegral))
+                {
+                    reject("XY_CONFIGURED_SERVO_ADMISSION", -1, static_cast<int>(axisIndex), -1);
+                    const double ff = referenceSpeed * scale * axis.Pid_G00.Kvff;
+                    const double p = window * axis.Pid_G00.Kp, i = axis.pid.MaxIntegral * axis.Pid_G00.Ki;
+                    const double reserve = 0.004 * scale, available = cap - reserve;
+                    RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=XY_SERVO_CONFIG axis=%u ppuBits=%llu rawCapBits=%llu integerCapBits=%llu referenceBits=%llu rawInPositionBits=%llu rawMaxLagBits=%llu windowBits=%llu\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, bits(scale), bits(axis.maxVel_PPS), bits(cap), bits(referenceSpeed),
+                        bits(axis.inPositionWindow_Pulse), bits(axis.pid.MaxLag), bits(window));
+                    RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=XY_SERVO_GAINS axis=%u kpBits=%llu kiBits=%llu kdBits=%llu kvffBits=%llu maxIntegralBits=%llu values=CURRENT_NATIVE_CHECKED gainWrite=NONE\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, bits(axis.Pid_G00.Kp), bits(axis.Pid_G00.Ki), bits(axis.Pid_G00.Kd), bits(axis.Pid_G00.Kvff), bits(axis.pid.MaxIntegral));
+                    RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=XY_SERVO_SUM axis=%u ffBits=%llu pBits=%llu iBits=%llu theoreticalSumBits=%llu reserveBits=%llu availableBits=%llu sumRole=OBSERVATION_ONLY admissionBound=FEEDFORWARD_ONLY\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, bits(ff), bits(p), bits(i), bits(ff + p + i), bits(reserve), bits(available));
+                    return false;
+                }
+            }
+            else if (!EDM94::VisibleServoHeadroomFits(scale, cap, window, axis.Pid_G00.Kp, axis.Pid_G00.Ki,
+                axis.Pid_G00.Kvff, axis.pid.MaxIntegral, referenceSpeed))
+            {
+                reject("SERVO_HEADROOM", -1, static_cast<int>(axisIndex), -1);
+                const double ff = referenceSpeed * scale * axis.Pid_G00.Kvff;
+                const double p = window * axis.Pid_G00.Kp, i = axis.pid.MaxIntegral * axis.Pid_G00.Ki;
+                const double reserve = 0.004 * scale, available = cap - reserve;
+                RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=HEADROOM_CONFIG axis=%u ppuBits=%llu rawCapBits=%llu integerCapBits=%llu referenceBits=%llu rawInPositionBits=%llu rawMaxLagBits=%llu windowBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, bits(scale), bits(axis.maxVel_PPS), bits(cap), bits(referenceSpeed),
+                    bits(axis.inPositionWindow_Pulse), bits(axis.pid.MaxLag), bits(window));
+                RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=HEADROOM_GAINS axis=%u kpBits=%llu kiBits=%llu kvffBits=%llu maxIntegralBits=%llu values=CURRENT_NATIVE_CHECKED gainWrite=NONE\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, bits(axis.Pid_G00.Kp), bits(axis.Pid_G00.Ki), bits(axis.Pid_G00.Kvff), bits(axis.pid.MaxIntegral));
+                RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=HEADROOM_SUM axis=%u ffBits=%llu pBits=%llu iBits=%llu requiredBits=%llu reserveBits=%llu availableBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, bits(ff), bits(p), bits(i), bits(ff + p + i), bits(reserve), bits(available));
+                return false;
+            }
+            const bool flushHeadroom = axisIndex < 2U ?
+                EDM94::BoundedXYMachiningServoFits(scale, cap, window, axis.Pid_FLUSH.Kp,
+                    axis.Pid_FLUSH.Ki, axis.Pid_FLUSH.Kd, axis.Pid_FLUSH.Kvff, axis.pid.MaxIntegral) :
+                EDM94::VisibleServoHeadroomFits(scale, cap, window, axis.Pid_FLUSH.Kp,
+                    axis.Pid_FLUSH.Ki, axis.Pid_FLUSH.Kvff, axis.pid.MaxIntegral, referenceSpeed);
+            if (!flushHeadroom)
+            {
+                reject("FLUSH_SERVO_HEADROOM", -1, static_cast<int>(axisIndex), -1);
+                RtPrintf("[EDM165] event=ADMISSION_DETAIL session=%llu part=FLUSH_SERVO_GAINS axis=%u profile=159 kpBits=%llu kiBits=%llu kdBits=%llu kvffBits=%llu values=CONFIGURED gainWrite=NONE\n",
+                    static_cast<unsigned long long>(s.session), axisIndex,
+                    bits(axis.Pid_FLUSH.Kp), bits(axis.Pid_FLUSH.Ki), bits(axis.Pid_FLUSH.Kd), bits(axis.Pid_FLUSH.Kvff));
+                return false;
+            }
+            capPps[axisIndex] = cap; windowPulse[axisIndex] = window;
+            feedforwardPps[axisIndex] = referenceSpeed * scale * axis.Pid_G00.Kvff;
+            availablePps[axisIndex] = cap - 0.004 * scale;
+            worstPiPps[axisIndex] = referenceSpeed * scale * axis.Pid_G00.Kvff +
+                window * axis.Pid_G00.Kp + axis.pid.MaxIntegral * axis.Pid_G00.Ki;
+            sparePps[axisIndex] = cap - worstPiPps[axisIndex];
+            if (axisIndex == 2U)
+            {
+                normalSpeed = (std::min)(EDM94::VisibleFlushReferenceMmSec, cap / scale);
+                acceleration = EDM128::ReservedVisibleAcceleration(normalSpeed,
+                    (std::min)(cap / accTime, cap / decTime) / scale, 2.0);
+                if (!std::isfinite(normalSpeed) || normalSpeed <= 0.0 ||
+                    !std::isfinite(acceleration) || acceleration <= 0.0)
+                {
+                    reject("Z_LIFT_DYNAMICS", -1, static_cast<int>(axisIndex), -1);
+                    RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=Z_DYNAMICS speedBits=%llu accelerationBits=%llu capBits=%llu ppuBits=%llu accTimeBits=%llu decTimeBits=%llu\n",
+                        static_cast<unsigned long long>(s.session), bits(normalSpeed), bits(acceleration), bits(cap), bits(scale), bits(accTime), bits(decTime));
+                    return false;
+                }
+            }
+        }
+        const double command = axis.currentCmdPos / scale;
+        const double actual = axis.GetNominalActualPositionPulse() / scale;
+        // E5 may pause only committed path geometry. Include a 2mm positive-Z
+        // lift at every admitted position, for both command and actual origin.
+        const double lift = axisIndex == 2U ? 2.0 : 0.0;
+        const double points[6] = {command, actual, command + low[axisIndex], command + high[axisIndex] + lift,
+            actual + low[axisIndex], actual + high[axisIndex] + lift};
+        const unsigned invalidLimitMask = CoordSys.GetInvalidSoftwareTravelLimitMask(axis);
+        if (invalidLimitMask != 0U)
+        {
+            reject("COORD_LIMIT_CONFIG", -1, static_cast<int>(axisIndex), -1);
+            RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=COORD_LIMIT_CONFIG axis=%u invalidMask=%u commandBits=%llu actualBits=%llu nominalLowBits=%llu nominalHighBits=%llu liftBits=%llu\n",
+                static_cast<unsigned long long>(s.session), axisIndex, invalidLimitMask, bits(command), bits(actual), bits(low[axisIndex]), bits(high[axisIndex]), bits(lift));
+            RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=INVALID_LIMIT_RANGES axis=%u enabledMask=%u low1Bits=%llu high1Bits=%llu low2Bits=%llu high2Bits=%llu low3Bits=%llu high3Bits=%llu\n",
+                static_cast<unsigned long long>(s.session), axisIndex,
+                (axis.travelLimit1Enable ? 1U : 0U) | (axis.travelLimit2Enable ? 2U : 0U) | (axis.travelLimit3Enable ? 4U : 0U),
+                bits(axis.travelLimit1Negative_unit), bits(axis.travelLimit1Positive_unit), bits(axis.travelLimit2Negative_unit),
+                bits(axis.travelLimit2Positive_unit), bits(axis.travelLimit3Negative_unit), bits(axis.travelLimit3Positive_unit));
+            return false;
+        }
+        const bool enabled[3] = {axis.travelLimit1Enable, axis.travelLimit2Enable, axis.travelLimit3Enable};
+        const double lower[3] = {axis.travelLimit1Negative_unit, axis.travelLimit2Negative_unit, axis.travelLimit3Negative_unit};
+        const double upper[3] = {axis.travelLimit1Positive_unit, axis.travelLimit2Positive_unit, axis.travelLimit3Positive_unit};
+        const char* pointSources[6] = {"COMMAND_ORIGIN", "ACTUAL_ORIGIN", "COMMAND_PATH_LOW", "COMMAND_PATH_HIGH_LIFT", "ACTUAL_PATH_LOW", "ACTUAL_PATH_HIGH_LIFT"};
+        for (unsigned pointIndex = 0U; pointIndex < 6U; ++pointIndex)
+        {
+            const double point = points[pointIndex];
+            if (!std::isfinite(point) || !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, point))
+            {
+                reject(!std::isfinite(point) ? "TRAVEL_POINT_NONFINITE" : "COORD_TARGET_LIMIT", -1, static_cast<int>(axisIndex), -1);
+                RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=TRAVEL_POINT axis=%u pointIndex=%u source=%s commandBits=%llu actualBits=%llu pointBits=%llu nominalLowBits=%llu nominalHighBits=%llu liftBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, pointIndex, pointSources[pointIndex], bits(command), bits(actual), bits(point), bits(low[axisIndex]), bits(high[axisIndex]), bits(lift));
+                for (unsigned limit = 0U; limit < 3U; ++limit)
+                    RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=COORD_TARGET_LIMIT axis=%u limit=%u enabled=%u lowBits=%llu highBits=%llu\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, limit, enabled[limit] ? 1U : 0U, bits(lower[limit]), bits(upper[limit]));
+                return false;
+            }
+            for (unsigned limit = 0U; limit < 3U; ++limit)
+                if (enabled[limit] && (!std::isfinite(lower[limit]) || !std::isfinite(upper[limit]) ||
+                    lower[limit] >= upper[limit] || point < lower[limit] || point > upper[limit]))
+                {
+                    reject("ENABLED_TARGET_LIMIT", -1, static_cast<int>(axisIndex), static_cast<int>(limit));
+                    RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=ENABLED_TARGET_LIMIT axis=%u limit=%u pointIndex=%u source=%s commandBits=%llu actualBits=%llu pointBits=%llu lowBits=%llu highBits=%llu\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, limit, pointIndex, pointSources[pointIndex], bits(command), bits(actual), bits(point), bits(lower[limit]), bits(upper[limit]));
+                    return false;
+                }
+        }
+    }
+    const double approach = EDM130::FrozenApproachDistanceMm(r);
+    const double finalSpeed = (std::min)(normalSpeed, EDM130::FrozenFinalApproachSpeedMmMin(r) / 60.0);
+    if (!std::isfinite(approach) || approach < 0.0 || !std::isfinite(finalSpeed) || finalSpeed <= 0.0)
+    {
+        reject("FINAL_APPROACH", -1, 2, -1);
+        RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=FINAL_APPROACH approachBits=%llu finalSpeedBits=%llu normalSpeedBits=%llu configuredFinalMmMinBits=%llu\n",
+            static_cast<unsigned long long>(s.session), bits(approach), bits(finalSpeed), bits(normalSpeed), bits(EDM130::FrozenFinalApproachSpeedMmMin(r)));
+        return false;
+    }
+    // Row index2's existing source can visit at most its current arc and the
+    // immediately preceding arc. Charge both complete arcs in each direction,
+    // plus all authored forward geometry and every group acceleration/stop.
+    const double historyLength = lengths[1] + lengths[2];
+    const double budget = 2.0 * EDM130::FrozenJumpHeightMm(r) / normalSpeed + 4.0 * normalSpeed / acceleration +
+        2.0 * approach / finalSpeed + 3.0 * 0.1 + 10.0 * maximumConfiguredTime +
+        nominalLength / forwardSpeed + historyLength / backwardSpeed + historyLength / forwardSpeed + 0.04 + 5.0;
+    if (!std::isfinite(historyLength) || historyLength <= 0.0 || !std::isfinite(budget) || budget > 115.0)
+    {
+        reject("SESSION_BUDGET", -1, -1, -1);
+        RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=BUDGET_LENGTH row0Bits=%llu row1Bits=%llu row2Bits=%llu nominalBits=%llu historyBits=%llu heightBits=%llu approachBits=%llu\n",
+            static_cast<unsigned long long>(s.session), bits(lengths[0]), bits(lengths[1]), bits(lengths[2]), bits(nominalLength), bits(historyLength), bits(EDM130::FrozenJumpHeightMm(r)), bits(approach));
+        RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=BUDGET_DYNAMICS forwardBits=%llu backwardBits=%llu finalBits=%llu liftSpeedBits=%llu accelerationBits=%llu maxConfiguredTimeBits=%llu\n",
+            static_cast<unsigned long long>(s.session), bits(forwardSpeed), bits(backwardSpeed), bits(finalSpeed), bits(normalSpeed), bits(acceleration), bits(maximumConfiguredTime));
+        RtPrintf("[EDM159] event=ADMISSION_DETAIL build=FIX2 session=%llu part=BUDGET_TOTAL computedBits=%llu ceilingBits=%llu admissionCeilingSeconds=115 hardDeadlineSeconds=120\n",
+            static_cast<unsigned long long>(s.session), bits(budget), bits(115.0));
+        return false;
+    }
+    RtPrintf("[EDM159] event=PLAN_PREFLIGHT session=%llu rows=3 mask=7 source=SOFTWARE_WAVE heightMicrometres=2000 referenceMicrometresPerSec=65 hardDeadlineSeconds=120 admissionBudgetSeconds=115 nominalLengthBits=%llu historyLengthBits=%llu budgetSecondsBits=%llu accelerationBits=%llu discharge=0\n",
+        static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(EDM130::CurveDoubleBits(nominalLength)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(historyLength)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(budget)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(acceleration)));
+    for (unsigned axis = 0U; axis < 3U; ++axis)
+    {
+        if (axis < 2U)
+        {
+            RtPrintf("[EDM159] event=XY_SERVO_ADMISSION build=FIX2 session=%llu axis=%c capPpsBits=%llu windowBits=%llu ffBits=%llu availableBits=%llu policy=CONFIGURED_PI_RUNTIME_GUARDED protection=POST_PI_CAP_AND_I_ROLLBACK gainWrite=NONE discharge=0\n",
+                static_cast<unsigned long long>(s.session), "XYZ"[axis], bits(capPps[axis]), bits(windowPulse[axis]), bits(feedforwardPps[axis]), bits(availablePps[axis]));
+            RtPrintf("[EDM159] event=XY_SERVO_OBSERVATION build=FIX2 session=%llu axis=%c theoreticalSumBits=%llu theoreticalCapDifferenceBits=%llu sumRole=OBSERVATION_ONLY admissionBound=FEEDFORWARD_ONLY\n",
+                static_cast<unsigned long long>(s.session), "XYZ"[axis], bits(worstPiPps[axis]), bits(sparePps[axis]));
+        }
+        else
+            RtPrintf("[EDM159] event=SERVO_HEADROOM session=%llu axis=%c capPpsBits=%llu windowBits=%llu worstPiPpsBits=%llu sparePpsBits=%llu proof=FULL_FROZEN_FOLLOWING_WINDOW gains=CONFIGURED discharge=0\n",
+                static_cast<unsigned long long>(s.session), "XYZ"[axis],
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(capPps[axis])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(windowPulse[axis])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(worstPiPps[axis])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(sparePps[axis])));
+    }
+    return true;
+}
+
+
+bool NCManager::PreflightEDM167SixVisibleTravelSameThread() noexcept
+{
+    const auto& s = m_edm94; const auto& r = m_edm130.recipe;
+    // FIX1: one first-failure report per NC admission call. These observations
+    // neither consume the M00 ticket nor issue an arm or movement permission.
+    const auto bits = [](double value) noexcept
+    { return static_cast<unsigned long long>(EDM130::CurveDoubleBits(value)); };
+    const auto reject = [&](const char* reason, int row, int axis, int limit) noexcept
+    {
+        RtPrintf("[EDM167] event=ADMISSION_REJECT build=SIX_AXIS session=%llu reason=%s row=%d axis=%d limit=%d phase=PRE_ARM armIssued=0 motionPermission=NOT_GRANTED dischargePermission=NOT_GRANTED\n",
+            static_cast<unsigned long long>(s.session), reason, row, axis, limit);
+        return false;
+    };
+    if (!EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm)) return reject("ARM_SCOPE", -1, -1, -1);
+    if (!m_edm130.bound) return reject("RECIPE_UNBOUND", -1, -1, -1);
+    if (!E167VisiblePlan(s)) return reject("EXACT_THREE_ROW_PLAN", -1, -1, -1);
+    if (!E156BoundPlanCurrent(s, r)) return reject("BOUND_PLAN", -1, -1, -1);
+    if (!EDM130::IsVisibleFlush167(r)) return reject("COMMISSIONING_PROFILE", -1, -1, -1);
+    if (!EDM130::ValidRecipe(r)) return reject("RECIPE_VALIDITY", -1, -1, -1);
+    if (!IsPathCoreLiveNativeConfigCurrentSameThread()) return reject("NATIVE_CONFIG_CURRENT", -1, -1, -1);
+    for (unsigned row = 0U; row < 3U; ++row)
+        if (m_edm127.authoredInline[row] != (row == 0U) ||
+            m_edm127.expectedMode[row] != EDM116::Mode::B1 ||
+            m_edm127.expectedOriginPC[row] != m_edm127.expectedOriginPC[0] ||
+            m_edm127.expectedOriginRevision[row] != m_edm127.expectedOriginRevision[0])
+        {
+            const char* reason = m_edm127.authoredInline[row] != (row == 0U) ? "MODAL_INLINE" :
+                m_edm127.expectedMode[row] != EDM116::Mode::B1 ? "MODAL_B1" :
+                m_edm127.expectedOriginPC[row] != m_edm127.expectedOriginPC[0] ? "MODAL_ORIGIN_PC" : "MODAL_ORIGIN_REVISION";
+            reject(reason, static_cast<int>(row), -1, -1);
+            RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=MODAL row=%u inlineB=%u mode=%u originPC=%d firstOriginPC=%d originRevision=%llu firstOriginRevision=%llu\n",
+                static_cast<unsigned long long>(s.session), row, m_edm127.authoredInline[row] ? 1U : 0U,
+                static_cast<unsigned>(m_edm127.expectedMode[row]), m_edm127.expectedOriginPC[row], m_edm127.expectedOriginPC[0],
+                static_cast<unsigned long long>(m_edm127.expectedOriginRevision[row]),
+                static_cast<unsigned long long>(m_edm127.expectedOriginRevision[0]));
+            return false;
+        }
+    // Rebuild every frozen literal with the existing common LINEAR6/ARC2
+    // geometry. Whole-arc extrema, including omitted endpoint components,
+    // define the envelope; an endpoint chord is not an arc travel proof.
+    std::array<double, 6U> cumulative{}, low{}, high{}, maximumNativeReference{};
+    std::array<double, 3U> lengths{};
+    double nominalLength = 0.0;
+    for (unsigned row = 0U; row < 3U; ++row)
+    {
+        const auto* authored = GetBaseProgramCache().TryGetLine(s.pc[row]);
+        if (!authored)
+        {
+            reject("CACHE_PC", static_cast<int>(row), -1, -1);
+            RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=CACHE row=%u sourcePC=%d\n",
+                static_cast<unsigned long long>(s.session), row, s.pc[row]);
+            return false;
+        }
+        NCParsedBlock geometry = authored->parsedBlock;
+        if (geometry.has('B') != m_edm127.authoredInline[row]) return reject("RAW_B_PRESENCE", static_cast<int>(row), -1, -1);
+        if (geometry.has('B'))
+        {
+            double word = 0.0;
+            if (!E94Number(geometry.expression('B'), word) || word != 1.0) return reject("RAW_B1_LITERAL", static_cast<int>(row), -1, -1);
+            geometry.hasParam['B'-'A'] = false; geometry.paramExpressions['B'-'A'].clear();
+        }
+        std::array<double, 6U> delta{}; double feed = 0.0;
+        if (!E114Move(geometry, row, delta, feed, s.gapModeFixture)) return reject("ROW_LITERAL", static_cast<int>(row), -1, -1);
+        if (delta != s.increment[row]) return reject("ROW_INCREMENT", static_cast<int>(row), -1, -1);
+        if (feed != s.feed[row]) return reject("ROW_FEED", static_cast<int>(row), -1, -1);
+        EDM112::Curve curve{}; EDM112::Bounds bounds{};
+        if (row == 0U)
+        {
+            EDM109::Point start{}, end{}, scale{};
+            for (unsigned axis = 0U; axis < 6U; ++axis)
+            { scale[axis] = 1000000.0; end[axis] = delta[axis] * scale[axis]; }
+            EDM109::Line line{};
+            if (!EDM109::BuildLine(start, end, scale, line) || !EDM112::BuildLine(line, curve))
+                return reject("LINE_CURVE", static_cast<int>(row), -1, -1);
+        }
+        else
+        {
+            std::array<double, 2U> center{};
+            if (!E155ArcCenter(geometry, center, s.gapModeFixture) ||
+                center[0] != (row == 1U ? 0.001 : -0.001) || center[1] != 0.0 ||
+                !EDM114::BuildBoundedXYArc(static_cast<int>(s.authoredGCode[row]), delta, center, feed, curve))
+                return reject("ARC_CURVE", static_cast<int>(row), -1, -1);
+        }
+        if (!EDM112::WholeCurveBounds(curve, bounds) || !bounds.valid ||
+            !std::isfinite(curve.lengthMm) || curve.lengthMm <= 0.0)
+            return reject("WHOLE_CURVE_BOUNDS", static_cast<int>(row), -1, -1);
+        lengths[row] = curve.lengthMm; nominalLength += curve.lengthMm;
+        for (unsigned axis = 0U; axis < 6U; ++axis)
+        {
+            const double rowLow = cumulative[axis] + bounds.minNative[axis];
+            const double rowHigh = cumulative[axis] + bounds.maxNative[axis];
+            if (!std::isfinite(rowLow) || !std::isfinite(rowHigh) || rowLow > rowHigh)
+                return reject("ROW_NATIVE_BOUNDS", static_cast<int>(row), static_cast<int>(axis), -1);
+            low[axis] = (std::min)(low[axis], rowLow); high[axis] = (std::max)(high[axis], rowHigh);
+            // LINEAR6 length is XYZ millimetres. Rotary degrees retain
+            // their own derivative; they must not inherit a .002 deg/s bound.
+            const double referenceNative = row == 0U ?
+                std::fabs(delta[axis]) / curve.lengthMm * EDM94::VisibleXYZMachiningReferenceMmSec :
+                (axis < 2U ? EDM94::VisibleXYZMachiningReferenceMmSec : 0.0);
+            const double referenceCeiling = axis < 3U ? EDM94::VisibleXYZMachiningReferenceMmSec :
+                EDM94::VisibleSixRotaryReferenceNativeSec;
+            if (!std::isfinite(referenceNative) || referenceNative < 0.0 || referenceNative > referenceCeiling)
+                return reject("NATIVE_TANGENT_SPEED", static_cast<int>(row), static_cast<int>(axis), -1);
+            maximumNativeReference[axis] = (std::max)(maximumNativeReference[axis], referenceNative);
+            cumulative[axis] += delta[axis];
+            if (!std::isfinite(cumulative[axis]) ||
+                low[axis] < (axis < 3U ? -0.025 : -0.5) ||
+                high[axis] > (axis < 3U ? 0.025 : 0.5))
+            {
+                reject("NOMINAL_ENVELOPE", static_cast<int>(row), static_cast<int>(axis), -1);
+                RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=NOMINAL_ENVELOPE row=%u axis=%u cumulativeBits=%llu lowBits=%llu highBits=%llu limitBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), row, axis, bits(cumulative[axis]), bits(low[axis]), bits(high[axis]), bits(axis < 3U ? 0.025 : 0.5));
+                return false;
+            }
+        }
+    }
+    const double reference = EDM130::FrozenGapReferenceVoltageV(r);
+    const auto profile = EDM97::MakeProfile(s.gapTuning, r);
+    const auto forward = EDMGapServo::Evaluate(profile, reference + 38.0, reference,
+        EDM130::FrozenMachiningOverridePercent(r));
+    // AUTO_WAVE's low phase is ref-20V with at most +1V noise. Budget the
+    // slower -19V case; the initial 160 zero samples use the same short path.
+    const auto backward = EDMGapServo::Evaluate(profile, reference - 19.0, reference,
+        EDM130::FrozenMachiningOverridePercent(r));
+    const double forwardSpeed = (std::min)(0.12, forward.limitedSpeedMmPerMin) / 60.0;
+    const double backwardSpeed = (std::min)(0.03, -backward.limitedSpeedMmPerMin) / 60.0;
+    if (!forward.valid || !backward.valid || !std::isfinite(nominalLength) || nominalLength <= 0.0 ||
+        !std::isfinite(forwardSpeed) || forwardSpeed <= 0.0 ||
+        !std::isfinite(backwardSpeed) || backwardSpeed <= 0.0)
+    {
+        reject("GAP_CURVE_SPEED", -1, -1, -1);
+        RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=GAP_SPEED forwardValid=%u backwardValid=%u nominalLengthBits=%llu forwardBits=%llu backwardBits=%llu referenceBits=%llu\n",
+            static_cast<unsigned long long>(s.session), forward.valid ? 1U : 0U, backward.valid ? 1U : 0U,
+            bits(nominalLength), bits(forwardSpeed), bits(backwardSpeed), bits(reference));
+        return false;
+    }
+    double normalSpeed = 0.0, acceleration = 0.0, maximumConfiguredTime = 0.2;
+    double capPps[6]{}, windowPulse[6]{}, worstPiPps[6]{}, sparePps[6]{};
+    double feedforwardPps[6]{}, availablePps[6]{};
+    for (unsigned axisIndex = 0U; axisIndex < 6U; ++axisIndex)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(axisIndex));
+        const double scale = axis.resolution_PPR / axis.finalLead;
+        if (axis.axisType != (axisIndex < 3U ? AxisType::LINEAR : AxisType::ROTARY) || axis.isVirtualAxis)
+            return reject("AXIS_NATIVE_KIND", -1, static_cast<int>(axisIndex), -1);
+        if (!std::isfinite(axis.Pid_G00.Kd) || axis.Pid_G00.Kd < 0.0 ||
+            !std::isfinite(axis.Pid_FLUSH.Kd) || axis.Pid_FLUSH.Kd < 0.0)
+            return reject("AXIS_DERIVATIVE_GAIN", -1, static_cast<int>(axisIndex), -1);
+        if (!axis.isExist || axis.axisIndex != static_cast<int>(axisIndex) ||
+            !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 || !std::isfinite(scale) || scale <= 0.0 ||
+            !std::isfinite(axis.currentCmdPos) || !std::isfinite(axis.Stop_dec_time) || axis.Stop_dec_time < 0.0 ||
+            !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ||
+            !std::isfinite(axis.G00_dec_time) || axis.G00_dec_time < 0.0)
+        {
+            const char* reason = !axis.isExist ? "AXIS_ABSENT" : axis.axisIndex != static_cast<int>(axisIndex) ? "AXIS_IDENTITY" :
+                !std::isfinite(axis.finalLead) || axis.finalLead <= 0.0 ? "AXIS_LEAD" :
+                !std::isfinite(scale) || scale <= 0.0 ? "AXIS_PPU" : !std::isfinite(axis.currentCmdPos) ? "AXIS_COMMAND" :
+                !std::isfinite(axis.Stop_dec_time) || axis.Stop_dec_time < 0.0 ? "AXIS_STOP_TIME" :
+                !std::isfinite(axis.G00_acc_time) || axis.G00_acc_time < 0.0 ? "AXIS_ACCEL_TIME" : "AXIS_DECEL_TIME";
+            reject(reason, -1, static_cast<int>(axisIndex), -1);
+            RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=AXIS_CONFIG axis=%u exists=%u configuredAxis=%d leadBits=%llu pprBits=%llu ppuBits=%llu commandPulseBits=%llu stopBits=%llu accBits=%llu decBits=%llu\n",
+                static_cast<unsigned long long>(s.session), axisIndex, axis.isExist ? 1U : 0U, axis.axisIndex,
+                bits(axis.finalLead), bits(axis.resolution_PPR), bits(scale), bits(axis.currentCmdPos),
+                bits(axis.Stop_dec_time), bits(axis.G00_acc_time), bits(axis.G00_dec_time));
+            return false;
+        }
+        const double accTime = axis.G00_acc_time < 0.001 ? 0.2 : axis.G00_acc_time;
+        const double decTime = axis.G00_dec_time < 0.001 ? 0.2 : axis.G00_dec_time;
+        maximumConfiguredTime = (std::max)(maximumConfiguredTime, axis.Stop_dec_time < 0.001 ? 0.2 : axis.Stop_dec_time);
+        maximumConfiguredTime = (std::max)(maximumConfiguredTime, (std::max)(accTime, decTime));
+        {
+            // Every moving axis uses its own integer CSV cap and native
+            // following window; the Z leg retains the complete PI headroom.
+            if (!std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ||
+                !std::isfinite(axis.inPositionWindow_Pulse) || axis.inPositionWindow_Pulse <= 0.0 ||
+                !std::isfinite(axis.pid.MaxLag) || axis.pid.MaxLag <= 0.0)
+            {
+                const char* reason = !std::isfinite(axis.maxVel_PPS) || axis.maxVel_PPS <= 0.0 ? "AXIS_VELOCITY_CAP" :
+                    !std::isfinite(axis.inPositionWindow_Pulse) || axis.inPositionWindow_Pulse <= 0.0 ? "RAW_POSITION_WINDOW" : "RAW_MAX_LAG";
+                reject(reason, -1, static_cast<int>(axisIndex), -1);
+                RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=RAW_WINDOW axis=%u maxVelBits=%llu inPositionBits=%llu maxLagBits=%llu ppuBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, bits(axis.maxVel_PPS), bits(axis.inPositionWindow_Pulse), bits(axis.pid.MaxLag), bits(scale));
+                return false;
+            }
+            const double cap = std::floor((std::min)(axis.maxVel_PPS, scale * EDM94::NativeVelocityLimit(axisIndex)));
+            const double window = (std::min)(axis.inPositionWindow_Pulse, (std::min)(axis.pid.MaxLag, scale * (axisIndex < 3U ? 0.001 : 0.005)));
+            const double referenceSpeed = axisIndex == 2U ? EDM94::VisibleFlushReferenceMmSec :
+                axisIndex < 3U ? EDM94::VisibleXYZMachiningReferenceMmSec : EDM94::VisibleSixRotaryReferenceNativeSec;
+            // FIX2: normal low-feed XY keeps configured PI and the existing
+            // per-tick following/output guards. The Z lift retains its complete
+            // frozen-window headroom requirement below.
+            if (axisIndex < 2U)
+            {
+                if (!EDM94::BoundedXYMachiningServoFits(scale, cap, window, axis.Pid_G00.Kp,
+                    axis.Pid_G00.Ki, axis.Pid_G00.Kd, axis.Pid_G00.Kvff, axis.pid.MaxIntegral))
+                {
+                    reject("XY_CONFIGURED_SERVO_ADMISSION", -1, static_cast<int>(axisIndex), -1);
+                    const double ff = referenceSpeed * scale * axis.Pid_G00.Kvff;
+                    const double p = window * axis.Pid_G00.Kp, i = axis.pid.MaxIntegral * axis.Pid_G00.Ki;
+                    const double reserve = 0.004 * scale, available = cap - reserve;
+                    RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=XY_SERVO_CONFIG axis=%u ppuBits=%llu rawCapBits=%llu integerCapBits=%llu referenceBits=%llu rawInPositionBits=%llu rawMaxLagBits=%llu windowBits=%llu\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, bits(scale), bits(axis.maxVel_PPS), bits(cap), bits(referenceSpeed),
+                        bits(axis.inPositionWindow_Pulse), bits(axis.pid.MaxLag), bits(window));
+                    RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=XY_SERVO_GAINS axis=%u kpBits=%llu kiBits=%llu kdBits=%llu kvffBits=%llu maxIntegralBits=%llu values=CURRENT_NATIVE_CHECKED gainWrite=NONE\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, bits(axis.Pid_G00.Kp), bits(axis.Pid_G00.Ki), bits(axis.Pid_G00.Kd), bits(axis.Pid_G00.Kvff), bits(axis.pid.MaxIntegral));
+                    RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=XY_SERVO_SUM axis=%u ffBits=%llu pBits=%llu iBits=%llu theoreticalSumBits=%llu reserveBits=%llu availableBits=%llu sumRole=OBSERVATION_ONLY admissionBound=FEEDFORWARD_ONLY\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, bits(ff), bits(p), bits(i), bits(ff + p + i), bits(reserve), bits(available));
+                    return false;
+                }
+            }
+            else if (axisIndex >= 3U)
+            {
+                if (!EDM94::BoundedRotaryMachiningServoFits(axisIndex, scale, cap, window,
+                    axis.Pid_G00.Kp, axis.Pid_G00.Ki, axis.Pid_G00.Kd, axis.Pid_G00.Kvff, axis.pid.MaxIntegral))
+                    return reject("ROTARY_CONFIGURED_SERVO_ADMISSION", -1, static_cast<int>(axisIndex), -1);
+            }
+            else if (!EDM94::VisibleServoHeadroomFits(scale, cap, window, axis.Pid_G00.Kp, axis.Pid_G00.Ki,
+                axis.Pid_G00.Kvff, axis.pid.MaxIntegral, referenceSpeed))
+            {
+                reject("SERVO_HEADROOM", -1, static_cast<int>(axisIndex), -1);
+                const double ff = referenceSpeed * scale * axis.Pid_G00.Kvff;
+                const double p = window * axis.Pid_G00.Kp, i = axis.pid.MaxIntegral * axis.Pid_G00.Ki;
+                const double reserve = 0.004 * scale, available = cap - reserve;
+                RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=HEADROOM_CONFIG axis=%u ppuBits=%llu rawCapBits=%llu integerCapBits=%llu referenceBits=%llu rawInPositionBits=%llu rawMaxLagBits=%llu windowBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, bits(scale), bits(axis.maxVel_PPS), bits(cap), bits(referenceSpeed),
+                    bits(axis.inPositionWindow_Pulse), bits(axis.pid.MaxLag), bits(window));
+                RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=HEADROOM_GAINS axis=%u kpBits=%llu kiBits=%llu kvffBits=%llu maxIntegralBits=%llu values=CURRENT_NATIVE_CHECKED gainWrite=NONE\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, bits(axis.Pid_G00.Kp), bits(axis.Pid_G00.Ki), bits(axis.Pid_G00.Kvff), bits(axis.pid.MaxIntegral));
+                RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=HEADROOM_SUM axis=%u ffBits=%llu pBits=%llu iBits=%llu requiredBits=%llu reserveBits=%llu availableBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, bits(ff), bits(p), bits(i), bits(ff + p + i), bits(reserve), bits(available));
+                return false;
+            }
+            const bool flushHeadroom = axisIndex < 2U ?
+                EDM94::BoundedXYMachiningServoFits(scale, cap, window, axis.Pid_FLUSH.Kp,
+                    axis.Pid_FLUSH.Ki, axis.Pid_FLUSH.Kd, axis.Pid_FLUSH.Kvff, axis.pid.MaxIntegral) :
+                axisIndex >= 3U ? EDM94::BoundedRotaryMachiningServoFits(axisIndex, scale, cap, window,
+                    axis.Pid_FLUSH.Kp, axis.Pid_FLUSH.Ki, axis.Pid_FLUSH.Kd, axis.Pid_FLUSH.Kvff, axis.pid.MaxIntegral) :
+                EDM94::VisibleServoHeadroomFits(scale, cap, window, axis.Pid_FLUSH.Kp,
+                    axis.Pid_FLUSH.Ki, axis.Pid_FLUSH.Kvff, axis.pid.MaxIntegral, referenceSpeed);
+            if (!flushHeadroom)
+            {
+                reject("FLUSH_SERVO_HEADROOM", -1, static_cast<int>(axisIndex), -1);
+                RtPrintf("[EDM165] event=ADMISSION_DETAIL session=%llu part=FLUSH_SERVO_GAINS axis=%u profile=167 kpBits=%llu kiBits=%llu kdBits=%llu kvffBits=%llu values=CONFIGURED gainWrite=NONE\n",
+                    static_cast<unsigned long long>(s.session), axisIndex,
+                    bits(axis.Pid_FLUSH.Kp), bits(axis.Pid_FLUSH.Ki), bits(axis.Pid_FLUSH.Kd), bits(axis.Pid_FLUSH.Kvff));
+                return false;
+            }
+            capPps[axisIndex] = cap; windowPulse[axisIndex] = window;
+            feedforwardPps[axisIndex] = referenceSpeed * scale * axis.Pid_G00.Kvff;
+            availablePps[axisIndex] = cap - 0.004 * scale;
+            worstPiPps[axisIndex] = referenceSpeed * scale * axis.Pid_G00.Kvff +
+                window * axis.Pid_G00.Kp + axis.pid.MaxIntegral * axis.Pid_G00.Ki;
+            sparePps[axisIndex] = cap - worstPiPps[axisIndex];
+            if (axisIndex == 2U)
+            {
+                normalSpeed = (std::min)(EDM94::VisibleFlushReferenceMmSec, cap / scale);
+                acceleration = EDM128::ReservedVisibleAcceleration(normalSpeed,
+                    (std::min)(cap / accTime, cap / decTime) / scale, 2.0);
+                if (!std::isfinite(normalSpeed) || normalSpeed <= 0.0 ||
+                    !std::isfinite(acceleration) || acceleration <= 0.0)
+                {
+                    reject("Z_LIFT_DYNAMICS", -1, static_cast<int>(axisIndex), -1);
+                    RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=Z_DYNAMICS speedBits=%llu accelerationBits=%llu capBits=%llu ppuBits=%llu accTimeBits=%llu decTimeBits=%llu\n",
+                        static_cast<unsigned long long>(s.session), bits(normalSpeed), bits(acceleration), bits(cap), bits(scale), bits(accTime), bits(decTime));
+                    return false;
+                }
+            }
+        }
+        const double command = axis.currentCmdPos / scale;
+        const double actual = axis.GetNominalActualPositionPulse() / scale;
+        // E5 may pause only committed path geometry. Include a 2mm positive-Z
+        // lift at every admitted position, for both command and actual origin.
+        const double lift = axisIndex == 2U ? 2.0 : 0.0;
+        // Rotary following is observed under the existing empty-load policy.
+        // Reserve the full existing native guard excursion once around every
+        // nominal angular point, for command and nominal actual origins.
+        const double nativeMargin = axisIndex < 3U ? 0.0 : EDM94::NativeExcursionLimit(axisIndex);
+        const double points[6] = {command, actual, command + low[axisIndex] - nativeMargin,
+            command + high[axisIndex] + lift + nativeMargin,
+            actual + low[axisIndex] - nativeMargin, actual + high[axisIndex] + lift + nativeMargin};
+        const unsigned invalidLimitMask = CoordSys.GetInvalidSoftwareTravelLimitMask(axis);
+        if (invalidLimitMask != 0U)
+        {
+            reject("COORD_LIMIT_CONFIG", -1, static_cast<int>(axisIndex), -1);
+            RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=COORD_LIMIT_CONFIG axis=%u invalidMask=%u commandBits=%llu actualBits=%llu nominalLowBits=%llu nominalHighBits=%llu liftBits=%llu\n",
+                static_cast<unsigned long long>(s.session), axisIndex, invalidLimitMask, bits(command), bits(actual), bits(low[axisIndex]), bits(high[axisIndex]), bits(lift));
+            RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=INVALID_LIMIT_RANGES axis=%u enabledMask=%u low1Bits=%llu high1Bits=%llu low2Bits=%llu high2Bits=%llu low3Bits=%llu high3Bits=%llu\n",
+                static_cast<unsigned long long>(s.session), axisIndex,
+                (axis.travelLimit1Enable ? 1U : 0U) | (axis.travelLimit2Enable ? 2U : 0U) | (axis.travelLimit3Enable ? 4U : 0U),
+                bits(axis.travelLimit1Negative_unit), bits(axis.travelLimit1Positive_unit), bits(axis.travelLimit2Negative_unit),
+                bits(axis.travelLimit2Positive_unit), bits(axis.travelLimit3Negative_unit), bits(axis.travelLimit3Positive_unit));
+            return false;
+        }
+        const bool enabled[3] = {axis.travelLimit1Enable, axis.travelLimit2Enable, axis.travelLimit3Enable};
+        const double lower[3] = {axis.travelLimit1Negative_unit, axis.travelLimit2Negative_unit, axis.travelLimit3Negative_unit};
+        const double upper[3] = {axis.travelLimit1Positive_unit, axis.travelLimit2Positive_unit, axis.travelLimit3Positive_unit};
+        const char* pointSources[6] = {"COMMAND_ORIGIN", "ACTUAL_ORIGIN", "COMMAND_PATH_LOW", "COMMAND_PATH_HIGH_LIFT", "ACTUAL_PATH_LOW", "ACTUAL_PATH_HIGH_LIFT"};
+        for (unsigned pointIndex = 0U; pointIndex < 6U; ++pointIndex)
+        {
+            const double point = points[pointIndex];
+            if (!std::isfinite(point) || !CoordSys.IsTargetWithinSoftwareTravelLimit(axis, point))
+            {
+                reject(!std::isfinite(point) ? "TRAVEL_POINT_NONFINITE" : "COORD_TARGET_LIMIT", -1, static_cast<int>(axisIndex), -1);
+                RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=TRAVEL_POINT axis=%u pointIndex=%u source=%s commandBits=%llu actualBits=%llu pointBits=%llu nominalLowBits=%llu nominalHighBits=%llu liftBits=%llu\n",
+                    static_cast<unsigned long long>(s.session), axisIndex, pointIndex, pointSources[pointIndex], bits(command), bits(actual), bits(point), bits(low[axisIndex]), bits(high[axisIndex]), bits(lift));
+                for (unsigned limit = 0U; limit < 3U; ++limit)
+                    RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=COORD_TARGET_LIMIT axis=%u limit=%u enabled=%u lowBits=%llu highBits=%llu\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, limit, enabled[limit] ? 1U : 0U, bits(lower[limit]), bits(upper[limit]));
+                return false;
+            }
+            for (unsigned limit = 0U; limit < 3U; ++limit)
+                if (enabled[limit] && (!std::isfinite(lower[limit]) || !std::isfinite(upper[limit]) ||
+                    lower[limit] >= upper[limit] || point < lower[limit] || point > upper[limit]))
+                {
+                    reject("ENABLED_TARGET_LIMIT", -1, static_cast<int>(axisIndex), static_cast<int>(limit));
+                    RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=ENABLED_TARGET_LIMIT axis=%u limit=%u pointIndex=%u source=%s commandBits=%llu actualBits=%llu pointBits=%llu lowBits=%llu highBits=%llu\n",
+                        static_cast<unsigned long long>(s.session), axisIndex, limit, pointIndex, pointSources[pointIndex], bits(command), bits(actual), bits(point), bits(lower[limit]), bits(upper[limit]));
+                    return false;
+                }
+        }
+    }
+    const double approach = EDM130::FrozenApproachDistanceMm(r);
+    const double finalSpeed = (std::min)(normalSpeed, EDM130::FrozenFinalApproachSpeedMmMin(r) / 60.0);
+    if (!std::isfinite(approach) || approach < 0.0 || !std::isfinite(finalSpeed) || finalSpeed <= 0.0)
+    {
+        reject("FINAL_APPROACH", -1, 2, -1);
+        RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=FINAL_APPROACH approachBits=%llu finalSpeedBits=%llu normalSpeedBits=%llu configuredFinalMmMinBits=%llu\n",
+            static_cast<unsigned long long>(s.session), bits(approach), bits(finalSpeed), bits(normalSpeed), bits(EDM130::FrozenFinalApproachSpeedMmMin(r)));
+        return false;
+    }
+    // Row index2's existing source can visit at most its current arc and the
+    // immediately preceding arc. Charge both complete arcs in each direction,
+    // plus all authored forward geometry and every group acceleration/stop.
+    const double historyLength = lengths[1] + lengths[2];
+    const double budget = 2.0 * EDM130::FrozenJumpHeightMm(r) / normalSpeed + 4.0 * normalSpeed / acceleration +
+        2.0 * approach / finalSpeed + 3.0 * 0.1 + 10.0 * maximumConfiguredTime +
+        nominalLength / forwardSpeed + historyLength / backwardSpeed + historyLength / forwardSpeed + 0.04 + 5.0;
+    if (!std::isfinite(historyLength) || historyLength <= 0.0 || !std::isfinite(budget) || budget > 115.0)
+    {
+        reject("SESSION_BUDGET", -1, -1, -1);
+        RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=BUDGET_LENGTH row0Bits=%llu row1Bits=%llu row2Bits=%llu nominalBits=%llu historyBits=%llu heightBits=%llu approachBits=%llu\n",
+            static_cast<unsigned long long>(s.session), bits(lengths[0]), bits(lengths[1]), bits(lengths[2]), bits(nominalLength), bits(historyLength), bits(EDM130::FrozenJumpHeightMm(r)), bits(approach));
+        RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=BUDGET_DYNAMICS forwardBits=%llu backwardBits=%llu finalBits=%llu liftSpeedBits=%llu accelerationBits=%llu maxConfiguredTimeBits=%llu\n",
+            static_cast<unsigned long long>(s.session), bits(forwardSpeed), bits(backwardSpeed), bits(finalSpeed), bits(normalSpeed), bits(acceleration), bits(maximumConfiguredTime));
+        RtPrintf("[EDM167] event=ADMISSION_DETAIL build=SIX_AXIS session=%llu part=BUDGET_TOTAL computedBits=%llu ceilingBits=%llu admissionCeilingSeconds=115 hardDeadlineSeconds=120\n",
+            static_cast<unsigned long long>(s.session), bits(budget), bits(115.0));
+        return false;
+    }
+    RtPrintf("[EDM167] event=PLAN_PREFLIGHT session=%llu rows=3 mask=63 source=SOFTWARE_WAVE heightMicrometres=2000 referenceMicrometresPerSec=65 hardDeadlineSeconds=120 admissionBudgetSeconds=115 nominalLengthBits=%llu historyLengthBits=%llu budgetSecondsBits=%llu accelerationBits=%llu discharge=0\n",
+        static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(EDM130::CurveDoubleBits(nominalLength)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(historyLength)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(budget)),
+        static_cast<unsigned long long>(EDM130::CurveDoubleBits(acceleration)));
+    for (unsigned axis = 0U; axis < 6U; ++axis)
+    {
+        const auto& configured = m_motion.GetAxisContext(static_cast<int>(axis));
+        RtPrintf("[EDM167] event=NATIVE_MOTION_PREFLIGHT session=%llu axis=%c tangentNativeSecBits=%llu referenceNativeSecBits=%llu hardwareSign=%d unit=%s gains=G00_AND_FLUSH discharge=0\n",
+            static_cast<unsigned long long>(s.session), "XYZCUV"[axis], bits(maximumNativeReference[axis]),
+            bits(axis == 2U ? EDM94::VisibleFlushReferenceMmSec : axis < 3U ? EDM94::VisibleXYZMachiningReferenceMmSec : EDM94::VisibleSixRotaryReferenceNativeSec),
+            configured.isReverse != configured.Axis_Reverse ? -1 : 1, axis < 3U ? "MM" : "DEG");
+        if (axis != 2U)
+        {
+            RtPrintf("[EDM167] event=MACHINING_SERVO_ADMISSION build=SIX_AXIS session=%llu axis=%c capPpsBits=%llu windowBits=%llu ffBits=%llu availableBits=%llu policy=CONFIGURED_PI_RUNTIME_GUARDED protection=POST_PI_CAP_AND_I_ROLLBACK gainWrite=NONE discharge=0\n",
+                static_cast<unsigned long long>(s.session), "XYZCUV"[axis], bits(capPps[axis]), bits(windowPulse[axis]), bits(feedforwardPps[axis]), bits(availablePps[axis]));
+            RtPrintf("[EDM167] event=MACHINING_SERVO_OBSERVATION build=SIX_AXIS session=%llu axis=%c theoreticalSumBits=%llu theoreticalCapDifferenceBits=%llu sumRole=OBSERVATION_ONLY admissionBound=FEEDFORWARD_ONLY\n",
+                static_cast<unsigned long long>(s.session), "XYZCUV"[axis], bits(worstPiPps[axis]), bits(sparePps[axis]));
+        }
+        else
+            RtPrintf("[EDM167] event=SERVO_HEADROOM session=%llu axis=%c capPpsBits=%llu windowBits=%llu worstPiPpsBits=%llu sparePpsBits=%llu proof=FULL_FROZEN_FOLLOWING_WINDOW gains=CONFIGURED discharge=0\n",
+                static_cast<unsigned long long>(s.session), "XYZCUV"[axis],
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(capPps[axis])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(windowPulse[axis])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(worstPiPps[axis])),
+                static_cast<unsigned long long>(EDM130::CurveDoubleBits(sparePps[axis])));
+    }
+    return true;
+}
+
 bool NCManager::BindEDM130WorkTimeSameThread() noexcept
 {
     m_edm130 = EDM130NCState{};
     EDMRecipe::Summary summary{};
-    if (!m_edm94.gapWorkTime || !m_edm94.gapPhysicalAd || !m_edmProcessReady ||
+    if (!m_edm94.gapWorkTime || m_edm94.gapPhysicalAd != E149PhysicalExpected(m_edm94.gapHistoryArm) || !m_edmProcessReady ||
         !ReadEDMRecipeSummarySameThread(summary)) return false;
     const bool speed = E131SpeedArm(m_edm94.gapHistoryArm);
     const bool height = E132HeightArm(m_edm94.gapHistoryArm);
@@ -18717,7 +21190,10 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
         (speed && m_edm94.gapFlushParameters.speedRatio != 0.5) ||
         (height && (m_edm94.gapFlushParameters.strokeRatio != 0.1 || m_edm94.gapFlushParameters.dwellUs != 100000ULL))) return false;
     const auto binding = flushStages ? EDM130::BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(
-        m_recipe, m_edmProcessProfile.machineProfileId, m_edmProcessProfile, m_edmProcessTuningGeneration) :
+        m_recipe, m_edmProcessProfile.machineProfileId, m_edmProcessProfile, m_edmProcessTuningGeneration,
+        (EDM149::IsSixVisibleFlushTestArm(m_edm94.gapHistoryArm) ? EDM130::VisibleFlushProfile167 :
+            EDM149::IsXYZVisibleFlushTestArm(m_edm94.gapHistoryArm) ? EDM130::VisibleFlushProfile159 :
+            EDM149::IsVisibleFlushTestArm(m_edm94.gapHistoryArm) ? EDM130::VisibleFlushProfile158 : 0U)) :
         processCurve ? EDM130::BindWorkTimeHeightSpeedDeepMachiningReferenceAndCurve(
         m_recipe, m_edmProcessProfile.machineProfileId, m_edmProcessProfile, m_edmProcessTuningGeneration) :
         reference ? EDM130::BindWorkTimeHeightSpeedDeepMachiningAndReference(m_recipe, m_edmProcessProfile.machineProfileId) :
@@ -18733,20 +21209,112 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
         EDM130::HasBoundCurve(binding.recipe) != processCurve ||
         EDM130::HasBoundFlushStages(binding.recipe) != flushStages)
     {
-        RtPrintf("[EDM130] event=RECIPE_BIND result=REJECT reason=%s field=%u armIssued=0 dischargeCommand=NONE\n",
+        RtPrintf("[EDM130] event=RECIPE_BIND result=REJECT reason=%s field=%u armIssued=0 powerControl=NC_PLC_S92\n",
             EDM58::BindingErrorName(binding.error), static_cast<unsigned>(binding.failedFieldId));
         return false;
     }
     // No mutable catalog pointer crosses the RT boundary. An HMI edit after
     // this admission affects the next explicit G180, never an active clock.
     m_edm130.recipe = binding.recipe;
+    m_edm130.recipe.diagnosticControlSource = static_cast<std::uint16_t>(E149ControlSource(m_edm94.gapHistoryArm));
+    if (EDM149::IsBoundedProgramTestArm(m_edm94.gapHistoryArm))
+    {
+        m_edm130.recipe.planRows = static_cast<std::uint16_t>(m_edm94.moves);
+        m_edm130.recipe.planMovementMask = static_cast<std::uint16_t>(E156NominalMovementMask(m_edm94));
+    }
+    if (EDM149::IsFlushHoldTestArm(m_edm94.gapHistoryArm) ||
+        EDM149::IsManualVoltageTestArm(m_edm94.gapHistoryArm))
+    {
+        const auto& cache = GetBaseProgramCache();
+        const auto* arm = cache.TryGetLine(m_edm94.armPC);
+        EDM97::Tuning tuning{}; EDM107::FlushProfile profile{};
+        if (cache.GetGeneration() != m_edm94.cache || !arm ||
+            !E108ProfileOnlyNPQRSIJK(arm->parsedBlock, m_edm94.gapHistoryArm, tuning, profile) ||
+            !EDM97::SameTuning(tuning, m_edm94.gapTuning) ||
+            !EDM107::SameFlushProfile(profile, m_edm94.gapFlushParameters)) return false;
+        m_edm130.recipe.holdRetreatMode = arm->parsedBlock.has('H') ? 1U : 0U;
+        double selection = 0.0;
+        if (arm->parsedBlock.has('L') && (!E94Number(arm->parsedBlock.expression('L'), selection) ||
+            (selection != 1.0 && selection != 2.0 && selection != 3.0) ||
+            !EDM130::ValidFlushHoldSelection(m_edm94.gapHistoryArm, static_cast<unsigned>(selection)))) return false;
+        m_edm130.recipe.flushHoldTest = static_cast<std::uint16_t>(selection);
+        if (m_edm130.recipe.flushHoldTest >= 2U)
+        {
+            // The immutable admitted modal plan must contain the requested
+            // B checkpoint. No live selector or later NC edit may supply it.
+            const unsigned target = EDM130::FlushHoldTargetMode(m_edm130.recipe.flushHoldTest);
+            if (target >= 3U || !m_edm94.moves || m_edm94.moves > m_edm127.expectedMode.size()) return false;
+            bool present = false;
+            for (unsigned row = 0U; row < m_edm94.moves; ++row)
+                present = present || static_cast<unsigned>(m_edm127.expectedMode[row]) == target;
+            if (!present) return false;
+        }
+    }
+    if (!E156BoundPlanCurrent(m_edm94, m_edm130.recipe) || !EDM130::ValidRecipe(m_edm130.recipe) ||
+        (EDM149::IsTestArm(m_edm94.gapHistoryArm) &&
+            (m_edm130.recipe.workTimeUs > 2000000ULL ||
+                (!EDM130::IsOneShotCommissioning(m_edm130.recipe) && m_edm130.recipe.jumpHeightScaled > 1000ULL) ||
+                m_edm130.recipe.deepFlushCycleInterval != 0U))) return false;
+    if (!EDM97::ValidMotionTestCurve(m_edm94.gapTuning,m_edm130.recipe)) return false;
     if (speed) m_edm94.gapFlushParameters.speedRatio = EDM130::FrozenSpeedRatio(m_edm130.recipe);
     if (!EDM107::ValidFlushProfile(m_edm94.gapFlushParameters) ||
         !EDM130::MatchesFlushSpeed(m_edm130.recipe, m_edm94.gapFlushParameters.speedRatio) ||
         !EDM130::MatchesFlushHeight(m_edm130.recipe, m_edm94.gapFlushParameters.strokeRatio, m_edm94.gapFlushParameters.dwellUs)) return false;
     m_edm130.bound = true;
     const auto& r = m_edm130.recipe;
-    RtPrintf("[EDM130] event=RECIPE_FROZEN session=%llu table=%u E=%u field=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu E5us=%llu freeze=ADMISSION apply=NEXT_G180 clock=COMMITTED_GAP_ONLY dischargeCommand=NONE\n",
+    m_edm169 = EDM169NCState{};
+    if (EDM149::IsManualVoltageTestArm(m_edm94.gapHistoryArm))
+    {
+        m_edm169.session = m_edm94.session;
+        m_edm169.voltageV = EDM130::FrozenGapReferenceVoltageV(r);
+        if (!EDM169::ValidVoltageV(m_edm169.voltageV)) return false;
+        MacroSys.SetVar('@', 990, m_edm169.voltageV);
+        RtPrintf("[EDM169] event=MANUAL_VOLTAGE_ARMED session=%llu run=%llu cache=%llu epoch=%llu owner=%llu variable=@990 seededV=%.9g inputSequence=0 source=SOFTWARE_MANUAL initialWaitUs=30000000 sessionLimitUs=120000000 write=FRESH_HMI_EVENT_ONLY S92=0 S93=0\n",
+            static_cast<unsigned long long>(m_edm94.session), static_cast<unsigned long long>(m_edm94.run),
+            static_cast<unsigned long long>(m_edm94.cache), static_cast<unsigned long long>(m_edm94.armEpoch),
+            static_cast<unsigned long long>(m_edm94.lease.generation), m_edm169.voltageV);
+    }
+    // Static configured banks only; transient servo state stays RT-owned.
+    for (unsigned axisIndex = 0U; axisIndex < 6U; ++axisIndex)
+    {
+        const auto& gain = m_motion.GetAxisContext(static_cast<int>(axisIndex)).Pid_FLUSH;
+        char record[481]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM165] event=FLUSH_PID_ARMED session=%llu axis=%c bank=FLUSH kp=%.9g ki=%.9g kd=%.9g kvff=%.9g configured=STATIC select=E5_OR_H1_EXCURSION actuator=EXISTING_SERVO_LOOP movementProof=NONE\n",
+            static_cast<unsigned long long>(m_edm94.session), "XYZCUV"[axisIndex],
+            gain.Kp, gain.Ki, gain.Kd, gain.Kvff);
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM165] event=LOG_FORMAT_ERROR part=FLUSH_PID_ARMED\n");
+    }
+    if (r.holdRetreatMode && (EDM130::IsVisibleFlush159(r) || EDM130::IsVisibleFlush167(r)))
+    {
+        RtPrintf("[EDM166] event=VISIBLE_FLUSH_HOLD_ARMED session=%llu armP=%u H=1 L=%u heightMicrometres=2000 trigger=FIRST_E5_OUTBOUND_25PCT resume=MANUAL_FRESH_START return=SAME_FLUSH_THEN_ORIGINAL_E5_ANCHOR gapHold=CANCEL pausedJog=0 S92=0 S93=0\n",
+            static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm, static_cast<unsigned>(r.flushHoldTest));
+    }
+    else if (r.holdRetreatMode)
+    {
+        char record[481]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM163] event=HOLD_PATH_ARMED session=%llu armP=%u H=%u source=%s E6mm=%.6f freeze=ADMISSION apply=NEXT_G180 confirmation=M00_FRESH_START_REQUIRED return=EXACT_PATH pausedJog=0 S92=0 S93=0\n",
+            static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm,
+            static_cast<unsigned>(r.holdRetreatMode), EDM149::SourceName(r.diagnosticControlSource),
+            EDM130::FrozenJumpHeightMm(r));
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM163] event=LOG_FORMAT_ERROR part=HOLD_PATH_ARMED\n");
+    }
+    if (r.flushHoldTest)
+    {
+        char record[481]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[%s] event=AUTO_HOLD_ARMED session=%llu armP=%u H=1 L=%u targetB=%u trigger=%s confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START S92=0 S93=0\n",
+            r.flushHoldTest >= 2U ? "EDM168" : "EDM165", static_cast<unsigned long long>(m_edm94.session),
+            m_edm94.gapHistoryArm, static_cast<unsigned>(r.flushHoldTest), EDM130::FlushHoldTargetMode(r.flushHoldTest),
+            r.flushHoldTest == 1U ? "FIRST_E5_OUTBOUND_25PCT" : r.flushHoldTest == 2U ?
+                "FIRST_B1_E5_OUTBOUND_25PCT" : "FIRST_CROSSED_B2_E5_OUTBOUND_25PCT");
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM165] event=LOG_FORMAT_ERROR part=AUTO_HOLD_ARMED\n");
+    }
+    RtPrintf("[EDM130] event=RECIPE_FROZEN session=%llu table=%u E=%u field=%u catalog=%u tableRev=%u profile=%u definition=%u generation=%llu E5us=%llu freeze=ADMISSION apply=NEXT_G180 clock=COMMITTED_GAP_ONLY powerControl=NC_PLC_S92\n",
         static_cast<unsigned long long>(m_edm94.session), r.tableId, static_cast<unsigned>(r.eCode),
         static_cast<unsigned>(r.fieldId), r.catalogRevision, r.tableRevision, r.profileId, r.definitionRevision,
         static_cast<unsigned long long>(r.generation), static_cast<unsigned long long>(r.workTimeUs));
@@ -18755,7 +21323,7 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
         // RTX RtPrintf does not render these precision-qualified floats.
         // Format through the C runtime, then pass the bounded string to RTX.
         char record[481]{};
-        const int length = std::snprintf(record, sizeof(record), "[EDM131] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E5field=%u E7field=%u generation=%llu E5us=%llu E7pct=%.6f baseJpct=50 effectiveJpct=%.6f ratio=%.9f freeze=ADMISSION apply=NEXT_G180 speedScope=FLUSH_ONLY dischargeCommand=NONE build=FIX1\n",
+        const int length = std::snprintf(record, sizeof(record), "[EDM131] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E5field=%u E7field=%u generation=%llu E5us=%llu E7pct=%.6f baseJpct=50 effectiveJpct=%.6f ratio=%.9f freeze=ADMISSION apply=NEXT_G180 speedScope=FLUSH_ONLY powerControl=NC_PLC_S92 build=FIX1\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm, r.tableId,
             static_cast<unsigned>(r.eCode), static_cast<unsigned>(r.fieldId), static_cast<unsigned>(r.speedFieldId),
             static_cast<unsigned long long>(r.generation), static_cast<unsigned long long>(r.workTimeUs),
@@ -18768,7 +21336,7 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
     {
         char record[481]{};
         const int length = std::snprintf(record, sizeof(record),
-            "[EDM132] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E5field=%u E6field=%u E7field=%u generation=%llu E5us=%llu E6mm=%.6f E7pct=%.6f baseJpct=50 effectiveJpct=%.6f freeze=ADMISSION apply=NEXT_G180 heightScope=FLUSH_ONLY geometry=ABSOLUTE_MM dischargeCommand=NONE\n",
+            "[EDM132] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E5field=%u E6field=%u E7field=%u generation=%llu E5us=%llu E6mm=%.6f E7pct=%.6f baseJpct=50 effectiveJpct=%.6f freeze=ADMISSION apply=NEXT_G180 heightScope=FLUSH_ONLY geometry=ABSOLUTE_MM powerControl=NC_PLC_S92\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm, r.tableId,
             static_cast<unsigned>(r.eCode), static_cast<unsigned>(r.fieldId), static_cast<unsigned>(r.heightFieldId),
             static_cast<unsigned>(r.speedFieldId), static_cast<unsigned long long>(r.generation),
@@ -18782,7 +21350,7 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
     {
         char record[481]{};
         const int length = std::snprintf(record, sizeof(record),
-            "[EDM133] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E5field=%u E6field=%u E7field=%u E21field=%u E22field=%u generation=%llu E5us=%llu baseMm=%.6f E7pct=%.6f everyN=%u multiplier=%.6f freeze=ADMISSION apply=NEXT_G180 count=COMPLETED_GLOBAL dischargeCommand=NONE\n",
+            "[EDM133] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E5field=%u E6field=%u E7field=%u E21field=%u E22field=%u generation=%llu E5us=%llu baseMm=%.6f E7pct=%.6f everyN=%u multiplier=%.6f freeze=ADMISSION apply=NEXT_G180 count=COMPLETED_GLOBAL powerControl=NC_PLC_S92\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm, r.tableId,
             static_cast<unsigned>(r.eCode), static_cast<unsigned>(r.fieldId), static_cast<unsigned>(r.heightFieldId),
             static_cast<unsigned>(r.speedFieldId), static_cast<unsigned>(r.intervalFieldId), static_cast<unsigned>(r.multiplierFieldId),
@@ -18791,14 +21359,14 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
             static_cast<unsigned>(r.deepFlushCycleInterval), EDM130::FrozenDeepMultiplier(r));
         if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
         else RtPrintf("[EDM133] event=LOG_FORMAT_ERROR part=RECIPE_FROZEN\n");
-        RtPrintf("[EDM133-FIX1] event=CAUSE_CAPTURE_READY session=%llu sourceSite=1 orphanSites=2/3 observationOnly=1 controlChanges=0 dischargeCommand=NONE\n",
+        RtPrintf("[EDM133-FIX1] event=CAUSE_CAPTURE_READY session=%llu sourceSite=1 orphanSites=2/3 observationOnly=1 controlChanges=0 powerControl=NC_PLC_S92\n",
             static_cast<unsigned long long>(m_edm94.session));
     }
     if (machining)
     {
         char record[481]{};
         const int length = std::snprintf(record, sizeof(record),
-            "[EDM134] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E8field=%u E8pct=%.6f generation=%llu freeze=ADMISSION apply=NEXT_G180 scope=GAP_CURVE_PRELIMIT E7scope=FLUSH_ONLY dischargeCommand=NONE\n",
+            "[EDM134] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E8field=%u E8pct=%.6f generation=%llu freeze=ADMISSION apply=NEXT_G180 scope=GAP_CURVE_PRELIMIT E7scope=FLUSH_ONLY powerControl=NC_PLC_S92\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm, r.tableId,
             static_cast<unsigned>(r.eCode), static_cast<unsigned>(r.machiningFieldId),
             EDM130::FrozenMachiningOverridePercent(r), static_cast<unsigned long long>(r.generation));
@@ -18809,7 +21377,7 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
     {
         char record[481]{};
         const int length = std::snprintf(record, sizeof(record),
-            "[EDM135] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E9field=%u referenceV=%.6f E8pct=%.6f generation=%llu freeze=ADMISSION apply=NEXT_G180 scope=GAP_CURVE_AND_DECISION thresholdScope=FROZEN_CONFIG dischargeCommand=NONE\n",
+            "[EDM135] event=RECIPE_FROZEN session=%llu armP=%u table=%u E=%u E9field=%u referenceV=%.6f E8pct=%.6f generation=%llu freeze=ADMISSION apply=NEXT_G180 scope=GAP_CURVE_AND_DECISION thresholdScope=FROZEN_CONFIG powerControl=NC_PLC_S92\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm, r.tableId,
             static_cast<unsigned>(r.eCode), static_cast<unsigned>(r.referenceFieldId),
             EDM130::FrozenGapReferenceVoltageV(r), EDM130::FrozenMachiningOverridePercent(r),
@@ -18824,7 +21392,7 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
         const auto& c = r.curve;
         char record[481]{};
         int length = std::snprintf(record, sizeof(record),
-            "[EDM136] event=CURVE_FROZEN part=IDENTITY session=%llu armP=%u processRev=%u machineProfile=%u tuningGen=%llu recipeGen=%llu shapeSource=PROCESS_PROFILE freeze=ADMISSION apply=NEXT_G180 QRS=LEGACY_FIXTURE_ONLY scale=0.001 feedCap=0.12 retreatCap=0.03 dischargeCommand=NONE\n",
+            "[EDM136] event=CURVE_FROZEN part=IDENTITY session=%llu armP=%u processRev=%u machineProfile=%u tuningGen=%llu recipeGen=%llu shapeSource=PROCESS_PROFILE freeze=ADMISSION apply=NEXT_G180 QRS=LEGACY_FIXTURE_ONLY scale=0.001 feedCap=0.12 retreatCap=0.03 powerControl=NC_PLC_S92\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm,
             c.processRevision, c.machineProfileId, static_cast<unsigned long long>(c.tuningGeneration),
             static_cast<unsigned long long>(r.generation));
@@ -18843,14 +21411,14 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
         const auto& f = r.flushStages;
         char record[481]{};
         int length = std::snprintf(record, sizeof(record),
-            "[EDM137] event=FLUSH_STAGES_FROZEN part=RETURN session=%llu armP=%u E11pct=%.6f E13mm=%.6f pumpStgMmMin=%.9g finalMmMin=%.9g freeze=ADMISSION apply=NEXT_G180 speedCap=E7_BOUNDED_RETURN distanceClamp=EVENT_HEIGHT dischargeInhibited=1\n",
+            "[EDM137] event=FLUSH_STAGES_FROZEN part=RETURN session=%llu armP=%u E11pct=%.6f E13mm=%.6f pumpStgMmMin=%.9g finalMmMin=%.9g freeze=ADMISSION apply=NEXT_G180 speedCap=E7_BOUNDED_RETURN distanceClamp=EVENT_HEIGHT powerControl=NC_PLC_S92\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm,
             static_cast<double>(f.finalSpeedPercentScaled) / 1000000.0, EDM130::FrozenApproachDistanceMm(r),
             f.finalApproachMmPerMin, EDM130::FrozenFinalApproachSpeedMmMin(r));
         if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
         else RtPrintf("[EDM137] event=LOG_FORMAT_ERROR part=FLUSH_STAGES_RETURN\n");
         length = std::snprintf(record, sizeof(record),
-            "[EDM137] event=FLUSH_STAGES_FROZEN part=RETRACT session=%llu armP=%u E19pct=%.6f E20mm=%.6f pumpLowMmMin=%.9g initialMmMin=%.9g initialEnabled=%u E12=%u polarityS=93 E15=EXTERNAL_CIRCUIT speedCap=E7_BOUNDED_RETURN distanceClamp=EVENT_HEIGHT dischargeInhibited=1\n",
+            "[EDM137] event=FLUSH_STAGES_FROZEN part=RETRACT session=%llu armP=%u E19pct=%.6f E20mm=%.6f pumpLowMmMin=%.9g initialMmMin=%.9g initialEnabled=%u E12=%u polarityS=93 E15=EXTERNAL_CIRCUIT speedCap=E7_BOUNDED_RETURN distanceClamp=EVENT_HEIGHT powerControl=NC_PLC_S92\n",
             static_cast<unsigned long long>(m_edm94.session), m_edm94.gapHistoryArm,
             static_cast<double>(f.initialSpeedPercentScaled) / 1000000.0, EDM130::FrozenInitialSlowDistanceMm(r),
             f.initialSlowMmPerMin, EDM130::FrozenInitialSlowSpeedMmMin(r), f.initialDistanceScaled ? 1U : 0U,
@@ -18861,13 +21429,30 @@ bool NCManager::BindEDM130WorkTimeSameThread() noexcept
     return true;
 }
 
-bool NCManager::IsEDM129SourceCurrentSameThread(const EDM126::MotionFeedback* history) const noexcept
+bool NCManager::IsEDM129SourceCurrentSameThread(const EDM126::MotionFeedback* history, EDM146::Failure* observation) const noexcept
 {
+    (void)EDM146::Fail(observation, EDM146::Gate::PhysicalProof);
     const auto& s = m_edm94;
+    if (m_edm130.bound && EDM130::UsesSoftwareVoltage(m_edm130.recipe))
+    {
+        EDM126::MotionFeedback sample{};
+        if (!history && !m_motion.ReadEDM126Feedback(sample)) return false;
+        const auto& h = history ? *history : sample;
+        return EDM149::IsTestArm(s.gapHistoryArm) && E149ControlSource(s.gapHistoryArm) == m_edm130.recipe.diagnosticControlSource &&
+            !s.gapPhysicalAd && h.enabled && !h.physicalAd && !h.faulted && h.reason == EDM126::Reason::None &&
+            h.session == s.session && h.armEpoch == s.armEpoch && h.ownerGeneration == s.lease.generation &&
+            (s.complete || (h.active && h.liveEpoch == m_motion.GetCurrentExecutionEpoch())) &&
+            h.sourceReady && h.sourceReason == EDM88::Reason::None && h.tick && h.nowUs &&
+            h.sourceSequence && h.sourceCapturedUs && h.nowUs >= h.sourceCapturedUs &&
+            h.nowUs - h.sourceCapturedUs <= EDM126::MaximumSourceAgeUs &&
+            std::isfinite(h.voltage) && h.voltage >= 0.0 && h.voltage <= 300.0 &&
+            h.controlSequence == h.sourceSequence && h.controlCapturedUs == h.sourceCapturedUs && h.controlVoltageV == h.voltage;
+    }
     EDM129::MotionFeedback f{};
     if (!s.gapPhysicalAd || !s.gapHistoryServo || !s.gapHistoryMode ||
-        (s.gapWorkTime ? !E130TimedArm(s.gapHistoryArm) : (s.gapHistoryArm != 170U && s.gapHistoryArm != 172U)) ||
-        !m_motion.ReadEDM129Feedback(f) || !f.enabled || f.faulted || !f.sourceReady ||
+        (s.gapWorkTime ? !E130TimedArm(s.gapHistoryArm) : (s.gapHistoryArm != 170U && s.gapHistoryArm != 172U))) return false;
+    if (!m_motion.ReadEDM129Feedback(f)) return EDM146::Fail(observation, EDM146::Gate::PhysicalRead);
+    if (!f.enabled || f.faulted || !f.sourceReady ||
         f.session != s.session || f.armEpoch != s.armEpoch || f.ownerGeneration != s.lease.generation ||
         !f.tick || !f.nowUs || (!s.complete && (!f.active || f.liveEpoch != m_motion.GetCurrentExecutionEpoch())) ||
         !EDM129::ValidBinding(f.binding) ||
@@ -18886,7 +21471,30 @@ bool NCManager::IsEDM129SourceCurrentSameThread(const EDM126::MotionFeedback* hi
         sample.capturedAtUs <= e.nowUs && sample.capturedAtUs <= f.nowUs &&
         f.nowUs - sample.capturedAtUs <= config.maxAgeUs &&
         std::isfinite(sample.voltageV) && sample.voltageV >= 0.0 && sample.voltageV <= 300.0;
-    if (!valid || !history) return valid;
+    if (!valid) return false;
+    const bool diagnostic = E139DiagnosticArm(s.gapHistoryArm);
+    if (diagnostic)
+    {
+        const auto& d = f.diagnostic;
+        if (!m_edm130.bound || m_edm130.recipe.diagnosticControlSource != 1U ||
+            !EDM139::ValidEvidence(d, s.session, EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe)) ||
+            d.tick != f.tick || d.controlFrame.capturedAtUs > f.nowUs ||
+            f.nowUs - d.controlFrame.capturedAtUs > config.maxAgeUs) return false;
+        if (history)
+        {
+            const auto& h = *history;
+            if (!h.controlSequence || !h.controlCapturedUs ||
+                (h.controlVoltageV != EDM139::HighVoltage(EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe)) &&
+                    h.controlVoltageV != EDM139::LowVoltage(EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe))) ||
+                h.nowUs < h.controlCapturedUs || h.nowUs - h.controlCapturedUs > config.maxAgeUs ||
+                (h.controlSequence == d.controlFrame.sequence ?
+                    (h.controlCapturedUs != d.controlFrame.capturedAtUs || h.controlVoltageV != d.controlFrame.voltageV) :
+                    (h.controlSequence < d.controlFrame.sequence ? h.controlCapturedUs >= d.controlFrame.capturedAtUs :
+                        h.controlCapturedUs <= d.controlFrame.capturedAtUs))) return false;
+        }
+    }
+    else if (f.diagnostic.enabled) return false;
+    if (!history) return true;
     // Observer channels may straddle one RT publication. Equal producer
     // sequences must have exactly the same payload; different sequences must
     // preserve producer time ordering and remain within the same age budget.
@@ -18894,19 +21502,26 @@ bool NCManager::IsEDM129SourceCurrentSameThread(const EDM126::MotionFeedback* hi
     if (!h.physicalAd || h.session != f.session || h.armEpoch != f.armEpoch || h.liveEpoch != f.liveEpoch ||
         h.ownerGeneration != f.ownerGeneration || h.sourceSequence <= f.binding.baselineSequence ||
         h.sourceCapturedUs <= f.binding.admittedUs || h.nowUs < h.sourceCapturedUs ||
-        h.nowUs - h.sourceCapturedUs > config.maxAgeUs ||
-        (h.nowUs > f.nowUs ? h.nowUs - f.nowUs : f.nowUs - h.nowUs) > config.maxAgeUs) return false;
-    if (h.sourceSequence == sample.sequence)
-        return h.sourceCapturedUs == sample.capturedAtUs && h.voltage == sample.voltageV;
-    return h.sourceSequence < sample.sequence ? h.sourceCapturedUs < sample.capturedAtUs :
-        h.sourceCapturedUs > sample.capturedAtUs;
+        h.nowUs - h.sourceCapturedUs > config.maxAgeUs) return false;
+    const bool payload = h.sourceSequence == sample.sequence ?
+        h.sourceCapturedUs == sample.capturedAtUs && h.voltage == sample.voltageV :
+        h.sourceSequence < sample.sequence ? h.sourceCapturedUs < sample.capturedAtUs :
+            h.sourceCapturedUs > sample.capturedAtUs;
+    if (!payload) return EDM146::Fail(observation, EDM146::Gate::SourcePayload,
+        h.tick, f.tick, h.nowUs, f.nowUs);
+    // Own-source validity and payload ordering passed. A scheduler pause
+    // between reads may leave only observer-to-observer age inconsistent.
+    if ((h.nowUs > f.nowUs ? h.nowUs - f.nowUs : f.nowUs - h.nowUs) > config.maxAgeUs)
+        return EDM146::Fail(observation, EDM146::Gate::SourceSkew, h.tick, f.tick, h.nowUs, f.nowUs);
+    return true;
 }
 
-bool NCManager::IsEDM130CurrentSameThread(unsigned completed) const noexcept
+bool NCManager::IsEDM130CurrentSameThread(unsigned completed, EDM146::Failure* observation) const noexcept
 {
+    (void)EDM146::Fail(observation, EDM146::Gate::HistoryProof);
     const auto& s = m_edm94; const auto& c = m_edm116;
     EDM128::MotionFeedback f{}; EDM126::MotionFeedback h{};
-    const unsigned fixture = E130CanonicalArm(s.gapHistoryArm) ? 0U : 1U;
+    const unsigned fixture = E149HistoryFixture(s.gapHistoryArm);
     if (!s.gapWorkTime || !m_edm130.bound || !EDM130::ValidRecipe(m_edm130.recipe) ||
         EDM130::HasBoundSpeed(m_edm130.recipe) != E131SpeedArm(s.gapHistoryArm) ||
         EDM130::HasBoundHeight(m_edm130.recipe) != E132HeightArm(s.gapHistoryArm) ||
@@ -18915,10 +21530,11 @@ bool NCManager::IsEDM130CurrentSameThread(unsigned completed) const noexcept
         EDM130::HasBoundReferenceVoltage(m_edm130.recipe) != E135ReferenceArm(s.gapHistoryArm) ||
         EDM130::HasBoundCurve(m_edm130.recipe) != E136CurveArm(s.gapHistoryArm) ||
         EDM130::HasBoundFlushStages(m_edm130.recipe) != E137FlushStageArm(s.gapHistoryArm) ||
+        m_edm130.recipe.diagnosticControlSource != E149ControlSource(s.gapHistoryArm) ||
         (E132HeightArm(s.gapHistoryArm) && (s.gapFlushParameters.strokeRatio != 0.1 ||
             s.gapFlushParameters.dwellUs != 100000ULL)) ||
         !EDM130::MatchesFlushSpeed(m_edm130.recipe, s.gapFlushParameters.speedRatio) ||
-        !EDM130::MatchesFlushHeight(m_edm130.recipe, s.gapFlushParameters.strokeRatio, s.gapFlushParameters.dwellUs) || !s.gapPhysicalAd || !s.gapHistoryMode || !s.gapHistoryServo || !s.gapPhysicalCurve || !s.gapSegmentProfile ||
+        !EDM130::MatchesFlushHeight(m_edm130.recipe, s.gapFlushParameters.strokeRatio, s.gapFlushParameters.dwellUs) || s.gapPhysicalAd != E149PhysicalExpected(s.gapHistoryArm) || !s.gapHistoryMode || !s.gapHistoryServo || !s.gapPhysicalCurve || !s.gapSegmentProfile ||
         !s.gapGainProfile || s.gapBoundaryProfile || s.gapNoiseProfile || s.gapBurstProfile ||
         s.gapContinuousProfile || s.gapEnduranceProfile || s.gapPairedProfile || s.gapCommonPath ||
         s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime ||
@@ -18926,50 +21542,97 @@ bool NCManager::IsEDM130CurrentSameThread(unsigned completed) const noexcept
         s.gapModeFlush || s.gapFlushProfile || s.gapFlushParameterized ||
         s.gapModeInterruption || s.gapModeInterruptionArm || s.gapCurveB2 || s.gapFlushInterruptArm ||
         !E130TimedArm(s.gapHistoryArm) ||
-        s.gapModeFixture != (fixture ? EDM116::Fixture::ModalComplement127 : EDM116::Fixture::Modal127) ||
+        s.gapModeFixture != E149ModalFixture(fixture) ||
         !EDM107::ValidFlushProfile(s.gapFlushParameters) || !s.latched || s.armPending || !s.everArmed ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
-        s.moves != EDM114::RequiredRows || completed > s.moves ||
+        !E156BoundPlanCurrent(s, m_edm130.recipe) || completed > s.moves ||
         c.consumed != completed || c.selected != completed + (c.pending ? 1U : 0U) || c.selected > s.moves ||
         c.acknowledgedRows > completed || completed - c.acknowledgedRows > 1U ||
-        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
-        !m_motion.ReadEDM130Feedback(f) || !m_motion.ReadEDM126Feedback(h) ||
-        !f.enabled || !f.workTimeFlush || !EDM130::SameRecipe(f.timerRecipe, m_edm130.recipe) ||
+        s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration()) return false;
+    if (!m_motion.ReadEDM130Feedback(f)) return EDM146::Fail(observation, EDM146::Gate::TimingRead);
+    if (!f.enabled || !f.workTimeFlush || !EDM130::SameRecipe(f.timerRecipe, m_edm130.recipe) ||
         !EDM130::MatchesFlushSpeed(f.timerRecipe, f.flushProfile.speedRatio) ||
-        !EDM130::MatchesFlushHeight(f.timerRecipe, f.flushProfile.strokeRatio, f.flushProfile.dwellUs) || !f.physicalAd || f.faulted || f.fixture != fixture || !EDM107::SameFlushProfile(f.flushProfile, s.gapFlushParameters) ||
+        !EDM130::MatchesFlushHeight(f.timerRecipe, f.flushProfile.strokeRatio, f.flushProfile.dwellUs) || f.physicalAd != s.gapPhysicalAd || f.faulted || f.fixture != fixture || !EDM107::SameFlushProfile(f.flushProfile, s.gapFlushParameters) ||
         f.session != s.session || f.armEpoch != s.armEpoch ||
         f.ownerGeneration != s.lease.generation || f.authorizedRows != completed || f.completedRows != completed ||
-        !f.tick || !f.nowUs || (!s.complete && f.liveEpoch != m_motion.GetCurrentExecutionEpoch()) ||
-        !h.enabled || !h.physicalAd || h.faulted || h.reason != EDM126::Reason::None || h.fixture != fixture ||
+        !f.tick || !f.nowUs || (!s.complete && f.liveEpoch != m_motion.GetCurrentExecutionEpoch())) return false;
+    // Never retry over an invalid first snapshot merely because the next
+    // publication was unavailable. Its own live state/identity passed above.
+    if (!m_motion.ReadEDM126Feedback(h)) return EDM146::Fail(observation, EDM146::Gate::HistoryRead);
+    if (!h.enabled || h.physicalAd != s.gapPhysicalAd || h.faulted || h.reason != EDM126::Reason::None || h.fixture != fixture ||
         h.session != f.session || h.armEpoch != f.armEpoch || h.liveEpoch != f.liveEpoch ||
         h.ownerGeneration != f.ownerGeneration || h.authorizedRows != completed || h.completedRows != completed ||
         h.rowActive || h.rowCompleted != (completed != 0U) ||
         !h.sourceReady || h.sourceReason != EDM88::Reason::None || !h.sourceSequence || !h.sourceCapturedUs ||
         h.nowUs < h.sourceCapturedUs || h.nowUs - h.sourceCapturedUs > EDM126::MaximumSourceAgeUs ||
         f.lastMappingTick != h.lastMappingTick || f.lastMappingUs != h.lastMappingUs) return false;
-    if (!IsEDM129SourceCurrentSameThread(&h)) return false;
     if (E134MachiningArm(s.gapHistoryArm))
     {
+        const bool diagnostic = E139DiagnosticArm(s.gapHistoryArm);
+        const double controlVoltage = diagnostic ? h.controlVoltageV : h.voltage;
+        const auto controlSequence = diagnostic ? h.controlSequence : h.sourceSequence;
+        const auto controlCapturedUs = diagnostic ? h.controlCapturedUs : h.sourceCapturedUs;
         // Each curve is checked against its own producer sample. Hysteretic
         // short decisions can request zero; equal samples must agree exactly.
-        const auto curve = EDMGapServo::Evaluate(EDM97::MakeProfile(s.gapTuning, m_edm130.recipe), h.voltage,
+        const auto curve = EDMGapServo::Evaluate(EDM97::MakeProfile(s.gapTuning, m_edm130.recipe), controlVoltage,
             EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe), EDM130::FrozenMachiningOverridePercent(m_edm130.recipe));
         const double ratio = curve.valid ? curve.limitedSpeedMmPerMin / EDM97::MaximumFeedMmMin : 0.0;
         EDM96::Feedback gap{};
-        if (!curve.valid || !std::isfinite(h.targetRatio) || (h.targetRatio != 0.0 && h.targetRatio != ratio) ||
-            !m_motion.ReadEDM96Feedback(gap) || !IsEDM97TuningCurrentSameThread(gap) ||
+        (void)EDM146::Fail(observation, EDM146::Gate::GapProof);
+        if (!curve.valid || !std::isfinite(h.targetRatio) || (h.targetRatio != 0.0 && h.targetRatio != ratio)) return false;
+        // Validate the already observed curve before a different channel can
+        // report a retryable read/skew condition.
+        if (!IsEDM129SourceCurrentSameThread(&h, observation)) return false;
+        (void)EDM146::Fail(observation, EDM146::Gate::GapProof);
+        if (!m_motion.ReadEDM96Feedback(gap)) return EDM146::Fail(observation, EDM146::Gate::GapRead);
+        if (!IsEDM97TuningCurrentSameThread(gap) ||
             gap.session != s.session || gap.ownerGeneration != s.lease.generation ||
             !gap.tick || !gap.nowUs || gap.epoch != h.liveEpoch ||
-            gap.sourceSequence <= m_edm129.sourceBinding.baselineSequence ||
-            gap.sourceCapturedUs <= m_edm129.sourceBinding.admittedUs ||
-            gap.nowUs < gap.sourceCapturedUs || gap.nowUs - gap.sourceCapturedUs > EDM126::MaximumSourceAgeUs ||
-            (h.nowUs > gap.nowUs ? h.nowUs - gap.nowUs : gap.nowUs - h.nowUs) > EDM126::MaximumSourceAgeUs ||
-            (h.sourceSequence == gap.sourceSequence ? (h.sourceCapturedUs != gap.sourceCapturedUs ||
-                h.voltage != gap.voltageV || h.targetRatio != gap.targetRatio) :
-                (h.sourceSequence < gap.sourceSequence ? h.sourceCapturedUs >= gap.sourceCapturedUs :
-                    h.sourceCapturedUs <= gap.sourceCapturedUs))) return false;
+            (diagnostic && gap.voltageV != EDM139::HighVoltage(EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe)) &&
+                gap.voltageV != EDM139::LowVoltage(EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe))) ||
+            !gap.sourceSequence || (!diagnostic && s.gapPhysicalAd && gap.sourceSequence <= m_edm129.sourceBinding.baselineSequence) ||
+            (s.gapPhysicalAd && gap.sourceCapturedUs <= m_edm129.sourceBinding.admittedUs) ||
+            gap.nowUs < gap.sourceCapturedUs || gap.nowUs - gap.sourceCapturedUs > EDM126::MaximumSourceAgeUs) return false;
+        const bool payloadMismatch = controlSequence == gap.sourceSequence ?
+            (controlCapturedUs != gap.sourceCapturedUs || controlVoltage != gap.voltageV || h.targetRatio != gap.targetRatio) :
+            (controlSequence < gap.sourceSequence ? controlCapturedUs >= gap.sourceCapturedUs :
+                controlCapturedUs <= gap.sourceCapturedUs);
+        if (payloadMismatch) return EDM146::Fail(observation, EDM146::Gate::GapPayload,
+            h.tick, gap.tick, h.nowUs, gap.nowUs);
+        if ((h.nowUs > gap.nowUs ? h.nowUs - gap.nowUs : gap.nowUs - h.nowUs) > EDM126::MaximumSourceAgeUs)
+            return EDM146::Fail(observation, EDM146::Gate::GapSkew, h.tick, gap.tick, h.nowUs, gap.nowUs);
+    }
+    else if (!IsEDM129SourceCurrentSameThread(&h, observation)) return false;
+    (void)EDM146::Fail(observation, EDM146::Gate::HistoryProof);
+    if (E141MotionArm(s.gapHistoryArm) && completed == s.moves &&
+        (m_edm141.plannedRows != s.moves || m_edm141.verifiedRows != s.moves || !m_edm141.expressionRows)) return false;
+    if (E140AssignmentArm(s.gapHistoryArm) && completed == s.moves &&
+        (!m_edm140.sealed || !m_edm140.count || m_edm140.count > EDM140::AssignmentCapacity ||
+            m_edm140.next != m_edm140.count || m_edm140.session != s.session ||
+            m_edm140.run != s.run || m_edm140.cache != s.cache || m_edm140.armEpoch != s.armEpoch ||
+            m_edm140.ownerGeneration != s.lease.generation || !m_edm140.lastCommit)) return false;
+    if (E139DiagnosticArm(s.gapHistoryArm) && completed == s.moves)
+    {
+        EDM129::MotionFeedback source{};
+        if (!m_motion.ReadEDM129Feedback(source) || !source.enabled || source.faulted || !source.sourceReady ||
+            source.session != s.session ||
+            source.armEpoch != s.armEpoch || source.ownerGeneration != s.lease.generation ||
+            !EDM139::ValidEvidence(source.diagnostic, s.session, EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe))) return false;
+        const auto& d = source.diagnostic;
+        if (!d.rowValid || d.row + 1U != completed || !d.observedCommitTick ||
+            d.observedCommitTick > d.tick || d.tick != source.tick ||
+            d.controlFrame.capturedAtUs > source.nowUs ||
+            source.nowUs - d.controlFrame.capturedAtUs > EDM126::MaximumSourceAgeUs ||
+            d.startedMask != EDM139::SelectedRowsMask || d.restoredMask != EDM139::SelectedRowsMask ||
+            d.completedMask != EDM139::SelectedRowsMask || d.backwardMask != EDM139::SelectedRowsMask ||
+            d.forwardMask != EDM139::SelectedRowsMask || d.backwardCrossings != 4U || d.forwardCrossings != 4U ||
+            d.retreatAxisMask != 63U || d.returnAxisMask != 63U) return false;
     }
     const auto& e = f.coordinator; const auto& t = h.traversal;
+    const unsigned requiredRetreats = EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) ? EDM149::SelectedRetreatCount(s.moves) : 4U;
+    if (completed == s.moves && EDM130::UsesSoftwareVoltage(m_edm130.recipe) &&
+        !EDM149::IsManualVoltageTestArm(s.gapHistoryArm) &&
+        (t.backwardCrossings < requiredRetreats || t.forwardCrossings < requiredRetreats)) return false;
     if (!EDM128::ValidSpeedProof(e, completed ? m_edm130.recipe.flushStages : EDM130::FlushStages{})) return false;
     // No height proof exists before a row is authorized. Legacy profiles must
     // retain zero E6 evidence; EDM132 rows bind proof to the frozen actual E6.
@@ -18982,9 +21645,20 @@ bool NCManager::IsEDM130CurrentSameThread(unsigned completed) const noexcept
         (e.effectiveJumpHeightMm != EDM130::EffectiveJumpHeightMm(m_edm130.recipe, e.eventIndex) ||
             e.deepCycle != EDM130::IsDeepFlushEvent(m_edm130.recipe, e.eventIndex))) return false;
     const std::uint64_t events = w.completedEvents;
+    if (EDM149::IsVisibleFlushTestArm(s.gapHistoryArm) && completed == s.moves &&
+        (w.triggeredEvents != 1ULL || events != 1ULL || e.eventCount != 1U ||
+            e.modeEvents[0] != 0U || e.modeEvents[1] != 1U || e.modeEvents[2] != 0U ||
+            !e.exactReturn || !e.rowEventComplete)) return false;
+    // Earlier row anchors correctly reset at BeginRow. The retained timer and
+    // coordinator counters prove the completed first-row excursion cumulatively.
+    if ((EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm) || EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm)) && completed == s.moves &&
+        (w.triggeredEvents != 1ULL || events != 1ULL || e.eventCount != 1U || e.qualifiedDwells != 3ULL ||
+            e.modeEvents[0] != 0U || e.modeEvents[1] != 1U || e.modeEvents[2] != 0U)) return false;
     if (!EDM130::ValidWorkEvidence(w) || (completed ? w.workTimeUs != m_edm130.recipe.workTimeUs : EDM130::IsTimed(w)) ||
         e.phase != EDM128::Phase::Gap || e.stableCycles || e.stableStartUs || e.faulted || e.stopped || e.detached ||
-        (completed == s.moves && events == 0ULL) || w.triggeredEvents != events || e.eventCount != events || e.qualifiedDwells != 3ULL * events ||
+        (completed == s.moves && events == 0ULL &&
+            !(EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) && EDM130::HasBoundProgramPlan(m_edm130.recipe) &&
+                w.totalWorkUs < w.workTimeUs && !w.triggeredEvents)) || w.triggeredEvents != events || e.eventCount != events || e.qualifiedDwells != 3ULL * events ||
         static_cast<std::uint64_t>(e.modeEvents[0]) + e.modeEvents[1] + e.modeEvents[2] != events ||
         t.faulted || t.stopRequested || t.stopped || t.reason != EDM126::Reason::None ||
         t.historyDepth || t.backwardCrossings != t.forwardCrossings ||
@@ -19080,7 +21754,7 @@ bool NCManager::IsEDM130CurrentSameThread(unsigned completed) const noexcept
         }
     }
     if (event && E132HeightArm(s.gapHistoryArm) &&
-        !E132GeometryProof(s, GetBaseProgramCache(), e, completed)) return false;
+        !E132GeometryProof(s, GetBaseProgramCache(), e, completed, E141MotionArm(s.gapHistoryArm) ? &m_edm141.rows : nullptr)) return false;
     if (event && E132HeightArm(s.gapHistoryArm) && policy.mode == EDM116::Mode::B2)
     {
         // The B2 target must name admitted geometry in this exact retained NC
@@ -19126,10 +21800,10 @@ bool NCManager::IsEDM129CurrentSameThread(unsigned completed) const noexcept
         s.gapModeFlush || s.gapFlushProfile || s.gapFlushParameterized ||
         s.gapModeInterruption || s.gapModeInterruptionArm || s.gapCurveB2 || s.gapFlushInterruptArm ||
         (s.gapWorkTime ? !E130TimedArm(s.gapHistoryArm) : (s.gapHistoryArm != 170U && s.gapHistoryArm != 172U)) ||
-        s.gapModeFixture != (fixture ? EDM116::Fixture::ModalComplement127 : EDM116::Fixture::Modal127) ||
+        s.gapModeFixture != E149ModalFixture(fixture) ||
         !EDM107::ValidFlushProfile(s.gapFlushParameters) || !s.latched || s.armPending || !s.everArmed ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
-        s.moves != EDM114::RequiredRows || completed > s.moves ||
+        !E156BoundPlanCurrent(s, m_edm130.recipe) || completed > s.moves ||
         c.consumed != completed || c.selected != completed + (c.pending ? 1U : 0U) || c.selected > s.moves ||
         c.acknowledgedRows > completed || completed - c.acknowledgedRows > 1U ||
         s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
@@ -19218,18 +21892,179 @@ bool NCManager::IsEDM129CurrentSameThread(unsigned completed) const noexcept
     return true;
 }
 
+namespace
+{
+    void E147OperatorCue(const char* action, const EDM147::Snapshot& e,
+        unsigned required, double requestedV) noexcept
+    {
+        char record[481]{};
+        const int length=std::snprintf(record,sizeof(record),
+            "[EDM147] event=OPERATOR action=%s session=%llu row=%u cursor=%u depth=%u ADdisplayV=%.3f referenceV=%.3f requestedV=%.1f completed=%llu qualified=%llu required=%u gapBack=%llu gapForward=%llu retreatAxes=%02X returnAxes=%02X retreatKinds=%X returnKinds=%X tick=%llu authority=NONE\n",
+            action,static_cast<unsigned long long>(e.session),e.row+1U,e.cursorRow+1U,e.historyDepth,
+            e.voltageV,e.referenceV,requestedV,static_cast<unsigned long long>(e.cyclesCompleted),
+            static_cast<unsigned long long>(e.qualifiedCycles),required,
+            static_cast<unsigned long long>(e.gapBackwardCrossings),static_cast<unsigned long long>(e.gapForwardCrossings),
+            e.cycleRetreatAxisMask,e.cycleReturnAxisMask,e.cycleRetreatKindMask,e.cycleReturnKindMask,
+            static_cast<unsigned long long>(e.tick));
+        if(length>0&&length<=480&&static_cast<std::size_t>(length)<sizeof(record))RtPrintf("%s",record);
+        else RtPrintf("[EDM147] event=LOG_FORMAT_ERROR part=OPERATOR\n");
+    }
+}
+
+void NCManager::ServiceEDM147PhysicalGapSameThread() noexcept
+{
+    const auto& s=m_edm94;
+    if(!E146PhysicalMotionArm(s.gapHistoryArm)||!s.latched||!s.ready||s.armPending||
+        s.finishPending||s.complete||s.cancelled||s.resetSeen||s.resetCommitted||
+        s.releaseRequested||s.rtFaultReported||m_state!=NCState::RUN||
+        m_mode!=NCOperationMode::MEMORY||s.feedback.faulted||s.feedback.cancelled||
+        s.feedback.forceZero||s.feedback.released)return;
+    EDM147::Snapshot e{};
+    if(!EDM147::ReadEvidence(e)||!e.begun||e.session!=s.session||!e.tick||
+        (s.feedback.lastTick>=e.tick&&s.feedback.lastTick-e.tick>400ULL))return;
+    auto& observer=m_edm147;
+    if(observer.session!=s.session) {observer=EDM147NCState{};observer.session=s.session;}
+    const unsigned required=s.gapHistoryArm==224U?2U:1U;
+    if(!e.valid) {
+        if(!observer.invalidLogged) {E147OperatorCue("EVIDENCE_INVALID",e,required,75.0);observer.invalidLogged=true;}
+        return;
+    }
+    if(e.cyclesStarted!=observer.started) {
+        observer.started=e.cyclesStarted;observer.lowPrompted=true;observer.restorePrompted=false;
+        E147OperatorCue("LOW_CONFIRMED",e,required,20.0);
+    }
+    if(e.interruptedCycles!=observer.interrupted) {
+        observer.interrupted=e.interruptedCycles;observer.lowPrompted=false;observer.restorePrompted=false;
+        E147OperatorCue("RESTORE_HIGH_INTERRUPTED",e,required,75.0);
+    }
+    if(e.cyclesCompleted!=observer.completed) {
+        const bool qualified=e.qualifiedCycles>observer.qualified;
+        observer.completed=e.cyclesCompleted;observer.qualified=e.qualifiedCycles;
+        observer.lowPrompted=false;observer.restorePrompted=false;
+        E147OperatorCue(qualified?"CYCLE_COMPLETE":"PARTIAL_RETURN",e,required,75.0);
+    }
+    if(e.cycleActive&&e.restoreReady&&!observer.restorePrompted) {
+        observer.restorePrompted=true;E147OperatorCue("RESTORE_HIGH",e,required,75.0);
+    }
+    const bool activeRow=e.row+1U==s.next&&m_edm116.consumed==s.next&&
+        m_edm116.acknowledgedRows+1U==m_edm116.consumed;
+    if(activeRow&&!e.cycleActive&&e.historyReady&&e.phase==EDM128::Phase::Gap&&
+        e.direction==1&&e.targetMmSec>0.0&&e.row>=2U&&e.row<=13U&&
+        e.qualifiedCycles<required&&!observer.lowPrompted) {
+        observer.lowPrompted=true;
+        E147OperatorCue(e.cyclesCompleted?"LOW_AGAIN":"LOW_NOW",e,required,20.0);
+    }
+}
+
+void NCManager::LogEDM147PhysicalGapSameThread(const char* event) const noexcept
+{
+    const auto& s=m_edm94;
+    if(!E146PhysicalMotionArm(s.gapHistoryArm)||!event||
+        (std::strcmp(event,"PASS")&&std::strcmp(event,"NORMAL_RELEASE_REQUEST")&&
+            std::strcmp(event,"NORMAL_RELEASED")&&std::strcmp(event,"REJECT")&&
+            std::strcmp(event,"CANCEL_REQUEST")))return;
+    EDM147::Snapshot e{};
+    const bool read=EDM147::ReadEvidence(e)&&e.begun&&e.session==s.session;
+    if(!read)e=EDM147::Snapshot{};
+    const unsigned required=s.gapHistoryArm==224U?2U:1U;
+    const bool runFailed=!std::strcmp(event,"REJECT")||!std::strcmp(event,"CANCEL_REQUEST")||
+        s.rtFaultReported||s.resetSeen||s.resetCommitted;
+    const char* result=runFailed?"RUN_FAILED":!read?"UNAVAILABLE":!e.valid?"INVALID":
+        !e.cyclesStarted?"NOT_EXERCISED":
+        (e.cycleActive||e.qualifiedCycles<required)?"INCOMPLETE":"VERIFIED";
+    char record[481]{};
+    int length=std::snprintf(record,sizeof(record),
+        "[EDM147] event=PHYSICAL_GAP result=%s motion=%.24s session=%llu read=%u started=%llu completed=%llu qualified=%llu required=%u interrupted=%llu gapBack=%llu gapForward=%llu reverseSamples=%llu forwardSamples=%llu source=PHYSICAL_AD phaseFilter=GAP_ONLY scope=COMMITTED_MAPPING authority=NONE\n",
+        result,event,static_cast<unsigned long long>(s.session),read?1U:0U,
+        static_cast<unsigned long long>(e.cyclesStarted),static_cast<unsigned long long>(e.cyclesCompleted),
+        static_cast<unsigned long long>(e.qualifiedCycles),required,static_cast<unsigned long long>(e.interruptedCycles),
+        static_cast<unsigned long long>(e.gapBackwardCrossings),static_cast<unsigned long long>(e.gapForwardCrossings),
+        static_cast<unsigned long long>(e.reverseMappedSamples),static_cast<unsigned long long>(e.forwardMappedSamples));
+    if(length>0&&length<=480&&static_cast<std::size_t>(length)<sizeof(record))RtPrintf("%s",record);
+    else RtPrintf("[EDM147] event=LOG_FORMAT_ERROR part=PHYSICAL_GAP\n");
+    length=std::snprintf(record,sizeof(record),
+        "[EDM147] event=PHYSICAL_GAP_STATE motion=%.24s session=%llu valid=%u reason=%s activeCycle=%u row=%u cursor=%u depth=%u maxGapDepth=%u retreatAxes=%02X returnAxes=%02X retreatKinds=%X returnKinds=%X ADdisplayV=%.3f referenceV=%.3f anchorMm=%.9g stationMm=%.9g sourceSeq=%llu captureUs=%llu tick=%llu authority=NONE\n",
+        event,static_cast<unsigned long long>(s.session),e.valid?1U:0U,EDM147::ReasonName(e.reason),e.cycleActive?1U:0U,
+        e.row+1U,e.cursorRow+1U,e.historyDepth,e.maximumGapDepth,e.retreatAxisMask,e.returnAxisMask,
+        e.retreatKindMask,e.returnKindMask,e.voltageV,e.referenceV,e.anchorStationMm,e.stationMm,
+        static_cast<unsigned long long>(e.sourceSequence),static_cast<unsigned long long>(e.sourceCapturedUs),
+        static_cast<unsigned long long>(e.tick));
+    if(length>0&&length<=480&&static_cast<std::size_t>(length)<sizeof(record))RtPrintf("%s",record);
+    else RtPrintf("[EDM147] event=LOG_FORMAT_ERROR part=PHYSICAL_GAP_STATE\n");
+}
+
 void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noexcept
 {
     const auto& s = m_edm94; const auto& c = m_edm116;
-    if (!s.gapWorkTime || !s.gapPhysicalAd || !s.gapHistoryMode) return;
+    if (!s.gapWorkTime || !s.gapHistoryMode) return;
+    if (EDM149::IsTestArm(s.gapHistoryArm))
+    {
+        EDM128::MotionFeedback timed{}; EDM126::MotionFeedback history{};
+        const bool read = m_motion.ReadEDM130Feedback(timed) && m_motion.ReadEDM126Feedback(history);
+        char record[481]{};
+        const int length = std::snprintf(record,sizeof(record),"[%s] event=%.24s session=%llu mode=%s ADrequired=%u read=%u rows=%u/%u phase=%s workUs=%llu triggered=%llu completed=%llu exactReturn=%u voltageV=%.6f targetRatio=%.6f motionAxes=%s S92=INHIBITED S93=INHIBITED discharge=0\n",
+            EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm) ? "EDM167" : EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm) ? "EDM159" : EDM149::IsVisibleFlushTestArm(s.gapHistoryArm) ? "EDM158" : EDM149::IsPauseTestArm(s.gapHistoryArm) ? "EDM157" : EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) ? "EDM156" : EDM149::IsSparseArcTestArm(s.gapHistoryArm) ? "EDM155" : EDM149::IsSparseTestArm(s.gapHistoryArm) ? "EDM154" : EDM149::IsOrderTestArm(s.gapHistoryArm) ? "EDM153" : EDM149::IsArcTestArm(s.gapHistoryArm) ? "EDM152" : EDM149::IsSixTestArm(s.gapHistoryArm) ? "EDM151" : EDM149::IsXYZTestArm(s.gapHistoryArm) ? "EDM150" : "EDM149", event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), EDM149::SourceName(E149ControlSource(s.gapHistoryArm)), s.gapPhysicalAd ? 1U : 0U, read ? 1U : 0U,
+            c.consumed,c.acknowledgedRows,EDM128::PhaseName(timed.coordinator.phase),
+            static_cast<unsigned long long>(timed.coordinator.work.totalWorkUs),
+            static_cast<unsigned long long>(timed.coordinator.work.triggeredEvents),
+            static_cast<unsigned long long>(timed.coordinator.work.completedEvents),timed.coordinator.exactReturn ? 1U : 0U,
+            history.voltage,history.targetRatio,(EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) || EDM149::IsSparseArcTestArm(s.gapHistoryArm) || EDM149::IsSparseTestArm(s.gapHistoryArm) || EDM149::IsOrderTestArm(s.gapHistoryArm) || EDM149::IsArcTestArm(s.gapHistoryArm) || EDM149::IsSixTestArm(s.gapHistoryArm)) ? "XYZCUV" : EDM149::IsXYZTestArm(s.gapHistoryArm) ? "XYZ" : "Z");
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s",record);
+        else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=%s\n", EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm) ? "EDM167" : EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm) ? "EDM159" : EDM149::IsVisibleFlushTestArm(s.gapHistoryArm) ? "EDM158" : EDM149::IsPauseTestArm(s.gapHistoryArm) ? "EDM157" : EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) ? "EDM156" : EDM149::IsSparseArcTestArm(s.gapHistoryArm) ? "EDM155" : EDM149::IsSparseTestArm(s.gapHistoryArm) ? "EDM154" : EDM149::IsOrderTestArm(s.gapHistoryArm) ? "EDM153" : EDM149::IsArcTestArm(s.gapHistoryArm) ? "EDM152" : EDM149::IsSixTestArm(s.gapHistoryArm) ? "EDM151" : "EDM149", (EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) || EDM149::IsSparseArcTestArm(s.gapHistoryArm) || EDM149::IsSparseTestArm(s.gapHistoryArm) || EDM149::IsOrderTestArm(s.gapHistoryArm) || EDM149::IsArcTestArm(s.gapHistoryArm) || EDM149::IsSixTestArm(s.gapHistoryArm)) ? "XYZCUV_MOTION" : "Z_MOTION");
+        // Observations from the two already read RT snapshots. A newly issued
+        // row can precede its RT application, so report the actual RT policy's
+        // revision/PC instead of relabelling it as the requested NC step.
+        const bool identityMatch = read && timed.enabled && history.enabled &&
+            timed.session == s.session && history.session == s.session &&
+            timed.armEpoch == s.armEpoch && history.armEpoch == s.armEpoch &&
+            timed.ownerGeneration == s.lease.generation && history.ownerGeneration == s.lease.generation;
+        const auto& policy = timed.rowPolicy;
+        if (identityMatch && EDM116::ValidPolicy(policy) && policy.revision <= s.moves)
+        {
+            const unsigned row = static_cast<unsigned>(policy.revision - 1ULL);
+            const bool planMatch = policy.fixture == s.gapModeFixture && policy.selectorPC == s.pc[row] &&
+                policy.mode == m_edm127.expectedMode[row] && policy.modeOriginPC == m_edm127.expectedOriginPC[row] &&
+                policy.modeOriginRevision == m_edm127.expectedOriginRevision[row];
+            const int rowLength = std::snprintf(record, sizeof(record),
+                "[EDM160] event=MODE_ROW motion=%.24s session=%llu row=%u requestStep=%u G=%u B=%u input=%s sourcePC=%d dispatch=%llu originPC=%d originDispatch=%llu originRevision=%llu rowRevision=%llu planMatch=%u source=RT_ROW_POLICY authority=NONE\n",
+                event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), row, step,
+                static_cast<unsigned>(s.authoredGCode[row]), static_cast<unsigned>(policy.mode),
+                m_edm127.authoredInline[row] ? "EXPLICIT" : "INHERITED", policy.selectorPC,
+                static_cast<unsigned long long>(policy.selectorDispatch), policy.modeOriginPC,
+                static_cast<unsigned long long>(policy.modeOriginDispatch), static_cast<unsigned long long>(policy.modeOriginRevision),
+                static_cast<unsigned long long>(policy.revision), planMatch ? 1U : 0U);
+            if (rowLength > 0 && rowLength <= 480 && static_cast<std::size_t>(rowLength) < sizeof(record)) RtPrintf("%s", record);
+            else RtPrintf("[EDM160] event=LOG_FORMAT_ERROR part=MODE_ROW\n");
+        }
+        const auto& mode = timed.coordinator; const auto& traversal = history.traversal;
+        const int totalsLength = std::snprintf(record, sizeof(record),
+            "[EDM160] event=MODE_TOTALS motion=%.24s session=%llu read=%u identityMatch=%u timerTick=%llu historyTick=%llu B0=%u B1=%u B2=%u triggered=%llu completed=%llu events=%u dwells=%u back=%llu forward=%llu depth=%u maxDepth=%u source=RT_SNAPSHOTS authority=NONE\n",
+            event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), read ? 1U : 0U, identityMatch ? 1U : 0U,
+            static_cast<unsigned long long>(timed.tick), static_cast<unsigned long long>(history.tick),
+            static_cast<unsigned>(mode.modeEvents[0]), static_cast<unsigned>(mode.modeEvents[1]), static_cast<unsigned>(mode.modeEvents[2]),
+            static_cast<unsigned long long>(mode.work.triggeredEvents), static_cast<unsigned long long>(mode.work.completedEvents),
+            static_cast<unsigned>(mode.eventCount), static_cast<unsigned>(mode.qualifiedDwells),
+            static_cast<unsigned long long>(traversal.backwardCrossings), static_cast<unsigned long long>(traversal.forwardCrossings),
+            traversal.historyDepth, traversal.maximumHistoryDepth);
+        if (totalsLength > 0 && totalsLength <= 480 && static_cast<std::size_t>(totalsLength) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM160] event=LOG_FORMAT_ERROR part=MODE_TOTALS\n");
+        const auto anchorRow = mode.anchor.cursorSource.ordinal, targetRow = mode.targetSource.ordinal;
+        EmitEDM161B2History(s.session, timed, m_edm130.recipe, event, identityMatch,
+            anchorRow < s.moves ? static_cast<unsigned>(s.authoredGCode[static_cast<unsigned>(anchorRow)]) : 0U,
+            targetRow < s.moves ? static_cast<unsigned>(s.authoredGCode[static_cast<unsigned>(targetRow)]) : 0U);
+        if (read && EDM130::HasBoundFlushStages(timed.timerRecipe)) EmitEDM137FlushStage(s.session,timed,event,
+            EDM130::SameRecipe(timed.timerRecipe,m_edm130.recipe));
+        return;
+    }
+    LogEDM147PhysicalGapSameThread(event);
     char record[481]{}; int length = 0;
     if (step < EDM114::RequiredRows)
     {
         const auto& p = c.policies[step];
         length = std::snprintf(record, sizeof(record),
-            "[EDM130] event=%.24s session=%llu row=%u G=%d B=%u input=%s sourcePC=%d dispatch=%llu originPC=%d originDispatch=%llu originRevision=%llu rowRevision=%llu replay=0 dischargeCommand=NONE\n",
+            "[EDM130] event=%.24s session=%llu row=%u G=%d B=%u input=%s sourcePC=%d dispatch=%llu originPC=%d originDispatch=%llu originRevision=%llu rowRevision=%llu replay=0 powerControl=NC_PLC_S92\n",
             event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), step,
-            EDM116::ExpectedGCode(step, s.gapModeFixture), static_cast<unsigned>(p.mode),
+            EDM116::ExpectedGCode(step, s.gapModeFixture, s.authoredGCode[step]), static_cast<unsigned>(p.mode),
             m_edm127.authoredInline[step] ? "EXPLICIT" : "INHERITED", p.selectorPC,
             static_cast<unsigned long long>(p.selectorDispatch), p.modeOriginPC,
             static_cast<unsigned long long>(p.modeOriginDispatch), static_cast<unsigned long long>(p.modeOriginRevision),
@@ -19240,7 +22075,7 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
         EDM128::MotionFeedback f{}; EDM126::MotionFeedback h{};
         const bool read = m_motion.ReadEDM130Feedback(f) && m_motion.ReadEDM126Feedback(h);
         length = std::snprintf(record, sizeof(record),
-            "[EDM130] event=%.24s session=%llu armP=%u read=%u rows=%u/%u explicitRows=%u inheritedRows=%u standaloneB=%u line=%u arc=%u B0=%u B1=%u B2=%u events=%u dwells=%u back=%llu forward=%llu depth=%u maxDepth=%u fault=%u replay=0 source=PHYSICAL_AD dischargeCommand=NONE\n",
+            "[EDM130] event=%.24s session=%llu armP=%u read=%u rows=%u/%u explicitRows=%u inheritedRows=%u standaloneB=%u line=%u arc=%u B0=%u B1=%u B2=%u events=%u dwells=%u back=%llu forward=%llu depth=%u maxDepth=%u fault=%u replay=0 source=%s powerControl=NC_PLC_S92\n",
             event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), s.gapHistoryArm, read ? 1U : 0U,
             c.consumed, c.acknowledgedRows, m_edm127.explicitRows, m_edm127.inheritedRows, m_edm127.standaloneSelections,
             m_edm114.retained.lineRows, m_edm114.retained.arcRows,
@@ -19248,7 +22083,8 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
             static_cast<unsigned>(f.coordinator.modeEvents[2]), static_cast<unsigned>(f.coordinator.eventCount),
             static_cast<unsigned>(f.coordinator.qualifiedDwells),
             static_cast<unsigned long long>(h.traversal.backwardCrossings), static_cast<unsigned long long>(h.traversal.forwardCrossings),
-            h.traversal.historyDepth, h.traversal.maximumHistoryDepth, (f.faulted || h.faulted) ? 1U : 0U);
+            h.traversal.historyDepth, h.traversal.maximumHistoryDepth, (f.faulted || h.faulted) ? 1U : 0U,
+            E139DiagnosticArm(s.gapHistoryArm) ? "SIMULATED_AD" : "PHYSICAL_AD");
     }
     if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
     else RtPrintf("[EDM130] event=LOG_FORMAT_ERROR\n");
@@ -19268,7 +22104,7 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
             (std::numeric_limits<double>::quiet_NaN)();
     }
     length = std::snprintf(record, sizeof(record),
-        "[EDM130] event=AD_SOURCE result=%.24s session=%llu read=%u source=PHYSICAL_AD receipt=%s ready=%u reason=%s AD=%u device=%u channel=%u seq=%llu captureUs=%llu ageKnown=%u ageUs=%llu V=%.3f refV=%.3f target=%.6f gapRead=%u sourceTick=%llu gapTick=%llu fresh=%llu held=%llu maxAgeUs=%llu dischargeCommand=NONE\n",
+        "[EDM130] event=AD_SOURCE result=%.24s session=%llu read=%u source=PHYSICAL_AD receipt=%s ready=%u reason=%s AD=%u device=%u channel=%u seq=%llu captureUs=%llu ageKnown=%u ageUs=%llu V=%.3f refV=%.3f target=%.6f gapRead=%u sourceTick=%llu gapTick=%llu fresh=%llu held=%llu maxAgeUs=%llu powerControl=NC_PLC_S92\n",
         event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), sourceRead ? 1U : 0U,
         physical.active ? "LIVE" : "RETIRED", physical.sourceReady ? 1U : 0U, EDM129::SourceReasonName(physical.source.reason),
         physical.binding.route.adIndex, physical.binding.route.deviceId, physical.binding.route.channelId,
@@ -19281,8 +22117,44 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
     if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
     else RtPrintf("[EDM130] event=LOG_FORMAT_ERROR part=AD_SOURCE\n");
 
+    if (E141MotionArm(s.gapHistoryArm))
+    {
+        length = std::snprintf(record, sizeof(record),
+            "[EDM141] event=MOTION_SUMMARY result=%.24s session=%llu planned=%u verified=%u expressionRows=%u assignments=%u local1=%.9g local2=%.9g powerControl=NC_PLC_S92\n",
+            event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), m_edm141.plannedRows,
+            m_edm141.verifiedRows, m_edm141.expressionRows, m_edm140.next, m_edm140.values[0], m_edm140.values[1]);
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM141] event=LOG_FORMAT_ERROR part=MOTION_SUMMARY\n");
+    }
+    if (E140AssignmentArm(s.gapHistoryArm))
+    {
+        length = std::snprintf(record, sizeof(record),
+            "[EDM140] event=LOCAL_SUMMARY result=%.24s session=%llu planned=%u committed=%u defined=%u value1=%.9g value2=%.9g lastCommit=%llu modalB=%u powerControl=NC_PLC_S92\n",
+            event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), m_edm140.count,
+            m_edm140.next, m_edm140.definedMask, m_edm140.values[0], m_edm140.values[1],
+            static_cast<unsigned long long>(m_edm140.lastCommit), static_cast<unsigned>(m_edm127.current.mode));
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM140] event=LOG_FORMAT_ERROR part=LOCAL_SUMMARY\n");
+    }
+    if (E139DiagnosticArm(s.gapHistoryArm))
+    {
+        const auto& d = physical.diagnostic;
+        length = std::snprintf(record, sizeof(record),
+            "[EDM139] event=GAP_DIAGNOSTIC result=%.24s session=%llu source=SIMULATED_AD physicalMonitor=PHYSICAL_AD row=%u phase=%u controlV=%.3f physicalV=%.3f seq=%llu tick=%llu started=%u restored=%u completed=%u backMask=%u forwardMask=%u back=%u forward=%u retreatAxes=%u returnAxes=%u powerControl=NC_PLC_S92\n",
+            event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), d.row,
+            static_cast<unsigned>(d.phase), d.controlFrame.voltageV, sample.voltageV,
+            static_cast<unsigned long long>(d.controlFrame.sequence), static_cast<unsigned long long>(d.tick),
+            d.startedMask, d.restoredMask, d.completedMask, d.backwardMask, d.forwardMask,
+            d.backwardCrossings, d.forwardCrossings, d.retreatAxisMask, d.returnAxisMask);
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM139] event=LOG_FORMAT_ERROR part=GAP_DIAGNOSTIC\n");
+    }
     if (E134MachiningArm(s.gapHistoryArm))
     {
+        const bool diagnostic = E139DiagnosticArm(s.gapHistoryArm);
+        const double controlVoltage = diagnostic ? gap.controlVoltageV : gap.voltage;
+        const auto controlSequence = diagnostic ? gap.controlSequence : gap.sourceSequence;
+        const auto controlCapturedUs = diagnostic ? gap.controlCapturedUs : gap.sourceCapturedUs;
         EDM128::MotionFeedback timed{}; EDM96::Feedback curve{};
         const bool current = m_edm130.bound && EDM130::ValidRecipe(m_edm130.recipe) &&
             EDM130::HasBoundMachiningSpeed(m_edm130.recipe) && m_motion.ReadEDM130Feedback(timed) &&
@@ -19290,21 +22162,21 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
             timed.ownerGeneration == s.lease.generation && EDM130::SameRecipe(timed.timerRecipe, m_edm130.recipe) &&
             gapRead && m_motion.ReadEDM96Feedback(curve) && curve.session == s.session &&
             curve.ownerGeneration == s.lease.generation && curve.epoch == gap.liveEpoch && curve.tick && curve.nowUs &&
-            curve.sourceSequence > physical.binding.baselineSequence &&
+            curve.sourceSequence && (diagnostic || curve.sourceSequence > physical.binding.baselineSequence) &&
             curve.sourceCapturedUs > physical.binding.admittedUs && curve.nowUs >= curve.sourceCapturedUs &&
             curve.nowUs - curve.sourceCapturedUs <= EDM126::MaximumSourceAgeUs &&
             (gap.nowUs > curve.nowUs ? gap.nowUs - curve.nowUs : curve.nowUs - gap.nowUs) <= EDM126::MaximumSourceAgeUs &&
-            (gap.sourceSequence == curve.sourceSequence ? (gap.sourceCapturedUs == curve.sourceCapturedUs &&
-                gap.voltage == curve.voltageV && gap.targetRatio == curve.targetRatio) :
-                (gap.sourceSequence < curve.sourceSequence ? gap.sourceCapturedUs < curve.sourceCapturedUs :
-                    gap.sourceCapturedUs > curve.sourceCapturedUs)) &&
+            (controlSequence == curve.sourceSequence ? (controlCapturedUs == curve.sourceCapturedUs &&
+                controlVoltage == curve.voltageV && gap.targetRatio == curve.targetRatio) :
+                (controlSequence < curve.sourceSequence ? controlCapturedUs < curve.sourceCapturedUs :
+                    controlCapturedUs > curve.sourceCapturedUs)) &&
             IsEDM97TuningCurrentSameThread(curve) && IsEDM129SourceCurrentSameThread(&gap);
         if (current)
         {
             length = std::snprintf(record, sizeof(record),
                 E136CurveArm(s.gapHistoryArm) ?
-                "[EDM134] event=GAP_CURVE result=%.24s session=%llu row=%u tick=%llu sourceSeq=%llu E8field=%u E8pct=%.6f voltageV=%.6f rawMmMin=%.12g limitedMmMin=%.9f targetRatio=%.9f proof=FROZEN_PRELIMIT scope=OBSERVER authority=NONE dischargeCommand=NONE\n" :
-                "[EDM134] event=GAP_CURVE result=%.24s session=%llu row=%u tick=%llu sourceSeq=%llu E8field=%u E8pct=%.6f voltageV=%.6f rawMmMin=%.9f limitedMmMin=%.9f targetRatio=%.9f proof=FROZEN_PRELIMIT scope=OBSERVER authority=NONE dischargeCommand=NONE\n",
+                "[EDM134] event=GAP_CURVE result=%.24s session=%llu row=%u tick=%llu sourceSeq=%llu E8field=%u E8pct=%.6f voltageV=%.6f rawMmMin=%.12g limitedMmMin=%.9f targetRatio=%.9f proof=FROZEN_PRELIMIT scope=OBSERVER authority=NONE powerControl=NC_PLC_S92\n" :
+                "[EDM134] event=GAP_CURVE result=%.24s session=%llu row=%u tick=%llu sourceSeq=%llu E8field=%u E8pct=%.6f voltageV=%.6f rawMmMin=%.9f limitedMmMin=%.9f targetRatio=%.9f proof=FROZEN_PRELIMIT scope=OBSERVER authority=NONE powerControl=NC_PLC_S92\n",
                 event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), timed.completedRows,
                 static_cast<unsigned long long>(curve.tick), static_cast<unsigned long long>(curve.sourceSequence),
                 static_cast<unsigned>(timed.timerRecipe.machiningFieldId), EDM130::FrozenMachiningOverridePercent(timed.timerRecipe),
@@ -19432,7 +22304,7 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
         {
             const auto& recipe = timed.timerRecipe;
             length = std::snprintf(record, sizeof(record),
-                "[EDM131] event=FLUSH_SPEED result=%.24s session=%llu row=%u rowBound=%u B=%u phase=%s E7field=%u E7pct=%.6f baseJpct=50 armRatio=%.9f rowRatio=%.9f profileMatches=%u recipeMatches=%u speedScope=FLUSH_ONLY dischargeCommand=NONE\n",
+                "[EDM131] event=FLUSH_SPEED result=%.24s session=%llu row=%u rowBound=%u B=%u phase=%s E7field=%u E7pct=%.6f baseJpct=50 armRatio=%.9f rowRatio=%.9f profileMatches=%u recipeMatches=%u speedScope=FLUSH_ONLY powerControl=NC_PLC_S92\n",
                 event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), timed.completedRows,
                 timed.authorizedRows ? 1U : 0U, static_cast<unsigned>(timed.rowPolicy.mode), EDM128::PhaseName(timed.coordinator.phase),
                 static_cast<unsigned>(recipe.speedFieldId), static_cast<double>(recipe.jumpSpeedPercentScaled) / 1000000.0,
@@ -19447,7 +22319,7 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
             const auto& e = timed.coordinator;
             const double heightMm = E133DeepArm(s.gapHistoryArm) && e.eventIndex ? e.effectiveJumpHeightMm : EDM130::FrozenJumpHeightMm(timed.timerRecipe);
             length = std::snprintf(record, sizeof(record),
-                "[EDM132] event=FLUSH_HEIGHT result=%.24s session=%llu row=%u B=%u phase=%s E6field=%u requestedMm=%.6f actualMm=%.9f targetCaptured=%u topCaptured=%u targetRow=%llu targetPC=%d targetLocalMm=%.9f targetStationMm=%.9f anchorStationMm=%.9f exactReturn=%u proofValid=%u distanceSource=MAPPED dischargeCommand=NONE\n",
+                "[EDM132] event=FLUSH_HEIGHT result=%.24s session=%llu row=%u B=%u phase=%s E6field=%u requestedMm=%.6f actualMm=%.9f targetCaptured=%u topCaptured=%u targetRow=%llu targetPC=%d targetLocalMm=%.9f targetStationMm=%.9f anchorStationMm=%.9f exactReturn=%u proofValid=%u distanceSource=MAPPED powerControl=NC_PLC_S92\n",
                 event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), timed.completedRows,
                 static_cast<unsigned>(timed.rowPolicy.mode), EDM128::PhaseName(e.phase),
                 static_cast<unsigned>(timed.timerRecipe.heightFieldId), heightMm, e.actualJumpHeightMm,
@@ -19461,7 +22333,7 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
             if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
             else RtPrintf("[EDM132] event=LOG_FORMAT_ERROR part=FLUSH_HEIGHT\n");
             length = std::snprintf(record, sizeof(record),
-                "[EDM132] event=HEIGHT_TOP result=%.24s session=%llu row=%u B=%u topPulse=%.9f/%.9f/%.9f/%.9f/%.9f/%.9f tangentPulsePerMm=%.9f/%.9f/%.9f/%.9f/%.9f/%.9f dischargeCommand=NONE\n",
+                "[EDM132] event=HEIGHT_TOP result=%.24s session=%llu row=%u B=%u topPulse=%.9f/%.9f/%.9f/%.9f/%.9f/%.9f tangentPulsePerMm=%.9f/%.9f/%.9f/%.9f/%.9f/%.9f powerControl=NC_PLC_S92\n",
                 event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), timed.completedRows,
                 static_cast<unsigned>(timed.rowPolicy.mode), e.topPositionPulse[0], e.topPositionPulse[1],
                 e.topPositionPulse[2], e.topPositionPulse[3], e.topPositionPulse[4], e.topPositionPulse[5],
@@ -19474,7 +22346,7 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
         {
             const auto& e = timed.coordinator; const auto& recipe = timed.timerRecipe;
             length = std::snprintf(record, sizeof(record),
-                "[EDM133] event=FLUSH_SCHEDULE result=%.24s session=%llu row=%u B=%u phase=%s bound=%u baseMm=%.6f everyN=%u multiplier=%.6f eventIndex=%llu deep=%u effectiveMm=%.9f completedDeep=%llu triggered=%llu completed=%llu targetCaptured=%u topCaptured=%u exactReturn=%u dischargeCommand=NONE\n",
+                "[EDM133] event=FLUSH_SCHEDULE result=%.24s session=%llu row=%u B=%u phase=%s bound=%u baseMm=%.6f everyN=%u multiplier=%.6f eventIndex=%llu deep=%u effectiveMm=%.9f completedDeep=%llu triggered=%llu completed=%llu targetCaptured=%u topCaptured=%u exactReturn=%u powerControl=NC_PLC_S92\n",
                 event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), timed.completedRows,
                 static_cast<unsigned>(timed.rowPolicy.mode), EDM128::PhaseName(e.phase), e.deepBound ? 1U : 0U,
                 EDM130::FrozenJumpHeightMm(recipe), static_cast<unsigned>(recipe.deepFlushCycleInterval),
@@ -19487,7 +22359,7 @@ void NCManager::LogEDM130SameThread(const char* event, unsigned step) const noex
         }
         const auto& w = timed.coordinator.work;
         length = std::snprintf(record, sizeof(record),
-            "[EDM130] event=WORK_TIME build=FIX1 result=%.24s session=%llu row=%u B=%u phase=%s E5us=%llu elapsedUs=%llu totalWorkUs=%llu triggered=%llu completed=%llu due=%u triggerElapsedUs=%llu triggerTotalUs=%llu triggerTick=%llu triggerUs=%llu completeTick=%llu completeUs=%llu clock=COMMITTED_GAP_ONLY dischargeCommand=NONE\n",
+            "[EDM130] event=WORK_TIME build=FIX1 result=%.24s session=%llu row=%u B=%u phase=%s E5us=%llu elapsedUs=%llu totalWorkUs=%llu triggered=%llu completed=%llu due=%u triggerElapsedUs=%llu triggerTotalUs=%llu triggerTick=%llu triggerUs=%llu completeTick=%llu completeUs=%llu clock=COMMITTED_GAP_ONLY powerControl=NC_PLC_S92\n",
             event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), timed.completedRows,
             static_cast<unsigned>(timed.rowPolicy.mode), EDM128::PhaseName(timed.coordinator.phase),
             static_cast<unsigned long long>(timed.timerRecipe.workTimeUs), static_cast<unsigned long long>(w.elapsedUs),
@@ -19514,7 +22386,7 @@ void NCManager::LogEDM129SameThread(const char* event, unsigned step) const noex
         length = std::snprintf(record, sizeof(record),
             "[EDM129] event=%.24s session=%llu row=%u G=%d B=%u input=%s sourcePC=%d dispatch=%llu originPC=%d originDispatch=%llu originRevision=%llu rowRevision=%llu replay=0 dischargeCommand=NONE\n",
             event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), step,
-            EDM116::ExpectedGCode(step, s.gapModeFixture), static_cast<unsigned>(p.mode),
+            EDM116::ExpectedGCode(step, s.gapModeFixture, s.authoredGCode[step]), static_cast<unsigned>(p.mode),
             m_edm127.authoredInline[step] ? "EXPLICIT" : "INHERITED", p.selectorPC,
             static_cast<unsigned long long>(p.selectorDispatch), p.modeOriginPC,
             static_cast<unsigned long long>(p.modeOriginDispatch), static_cast<unsigned long long>(p.modeOriginRevision),
@@ -19562,7 +22434,7 @@ bool NCManager::AuthorizeEDM129SameThread(const NCBlock& block, int gcode,
     const std::array<double, 2U>& center) noexcept
 {
     auto& s = m_edm94; auto& c = m_edm116;
-    if (!s.gapPhysicalAd || !s.gapHistoryMode || !s.gapHistoryServo || s.gapModeFlush || !s.gapPhysicalCurve ||
+    if ((!s.gapPhysicalAd && !s.gapWorkTime) || !s.gapHistoryMode || !s.gapHistoryServo || s.gapModeFlush || !s.gapPhysicalCurve ||
         !s.next || s.next > s.moves || !s.latched || !s.ready || s.armPending || s.cancelled ||
         s.resetSeen || s.resetCommitted || s.finishPending || s.complete || s.releaseRequested || s.rtFaultReported)
         return false;
@@ -19613,7 +22485,7 @@ bool NCManager::AuthorizeEDM129SameThread(const NCBlock& block, int gcode,
 bool NCManager::RetainEDM129CompletedSameThread(const EDM94::Feedback& guard) noexcept
 {
     const auto& s = m_edm94; auto& c = m_edm116;
-    if (!s.gapPhysicalAd || !s.gapHistoryMode || !s.gapHistoryServo || !s.latched || !s.ready || s.armPending ||
+    if ((!s.gapPhysicalAd && !s.gapWorkTime) || !s.gapHistoryMode || !s.gapHistoryServo || !s.latched || !s.ready || s.armPending ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
         s.finishPending || s.complete || !s.next || s.next > s.moves || c.pending ||
         c.selected != s.next || c.consumed != s.next || !IsEDM114CurrentSameThread(s.next) ||
@@ -19649,6 +22521,7 @@ bool NCManager::RetainEDM129CompletedSameThread(const EDM94::Feedback& guard) no
 
 bool NCManager::IsEDM128CurrentSameThread(unsigned completed) const noexcept
 {
+    if (m_edm94.gapWorkTime) return IsEDM130CurrentSameThread(completed);
     if (m_edm94.gapPhysicalAd) return IsEDM129CurrentSameThread(completed);
     const auto& s = m_edm94; const auto& c = m_edm116;
     EDM128::MotionFeedback f{}; EDM126::MotionFeedback h{};
@@ -19661,10 +22534,10 @@ bool NCManager::IsEDM128CurrentSameThread(unsigned completed) const noexcept
         s.gapModeFlush || s.gapFlushProfile || s.gapFlushParameterized ||
         s.gapModeInterruption || s.gapModeInterruptionArm || s.gapCurveB2 || s.gapFlushInterruptArm ||
         (s.gapHistoryArm != 166U && s.gapHistoryArm != 168U) ||
-        s.gapModeFixture != (fixture ? EDM116::Fixture::ModalComplement127 : EDM116::Fixture::Modal127) ||
+        s.gapModeFixture != E149ModalFixture(fixture) ||
         !EDM107::ValidFlushProfile(s.gapFlushParameters) || !s.latched || s.armPending || !s.everArmed ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
-        s.moves != EDM114::RequiredRows || completed > s.moves ||
+        !E156BoundPlanCurrent(s, m_edm130.recipe) || completed > s.moves ||
         c.consumed != completed || c.selected != completed + (c.pending ? 1U : 0U) || c.selected > s.moves ||
         c.acknowledgedRows > completed || completed - c.acknowledgedRows > 1U ||
         s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
@@ -19759,6 +22632,7 @@ bool NCManager::IsEDM128CurrentSameThread(unsigned completed) const noexcept
 
 void NCManager::LogEDM128SameThread(const char* event, unsigned step) const noexcept
 {
+    if (m_edm94.gapWorkTime) { LogEDM130SameThread(event, step); return; }
     if (m_edm94.gapPhysicalAd) { LogEDM129SameThread(event, step); return; }
     const auto& s = m_edm94; const auto& c = m_edm116;
     if (!s.gapHistoryMode) return;
@@ -19769,7 +22643,7 @@ void NCManager::LogEDM128SameThread(const char* event, unsigned step) const noex
         length = std::snprintf(record, sizeof(record),
             "[EDM128] event=%.24s session=%llu row=%u G=%d B=%u input=%s sourcePC=%d dispatch=%llu originPC=%d originDispatch=%llu originRevision=%llu rowRevision=%llu replay=0 dischargeCommand=NONE\n",
             event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), step,
-            EDM116::ExpectedGCode(step, s.gapModeFixture), static_cast<unsigned>(p.mode),
+            EDM116::ExpectedGCode(step, s.gapModeFixture, s.authoredGCode[step]), static_cast<unsigned>(p.mode),
             m_edm127.authoredInline[step] ? "EXPLICIT" : "INHERITED", p.selectorPC,
             static_cast<unsigned long long>(p.selectorDispatch), p.modeOriginPC,
             static_cast<unsigned long long>(p.modeOriginDispatch), static_cast<unsigned long long>(p.modeOriginRevision),
@@ -19797,7 +22671,7 @@ void NCManager::LogEDM128SameThread(const char* event, unsigned step) const noex
 bool NCManager::AuthorizeEDM128SameThread(const NCBlock& block, int gcode,
     const std::array<double, 2U>& center) noexcept
 {
-    if (m_edm94.gapPhysicalAd) return AuthorizeEDM129SameThread(block, gcode, center);
+    if (m_edm94.gapWorkTime || m_edm94.gapPhysicalAd) return AuthorizeEDM129SameThread(block, gcode, center);
     auto& s = m_edm94; auto& c = m_edm116;
     if (!s.gapHistoryMode || !s.gapHistoryServo || s.gapModeFlush || !s.gapPhysicalCurve ||
         !s.next || s.next > s.moves || !s.latched || !s.ready || s.armPending || s.cancelled ||
@@ -19844,7 +22718,7 @@ bool NCManager::AuthorizeEDM128SameThread(const NCBlock& block, int gcode,
 
 bool NCManager::RetainEDM128CompletedSameThread(const EDM94::Feedback& guard) noexcept
 {
-    if (m_edm94.gapPhysicalAd) return RetainEDM129CompletedSameThread(guard);
+    if (m_edm94.gapWorkTime || m_edm94.gapPhysicalAd) return RetainEDM129CompletedSameThread(guard);
     const auto& s = m_edm94; auto& c = m_edm116;
     if (!s.gapHistoryMode || !s.gapHistoryServo || !s.latched || !s.ready || s.armPending ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
@@ -19874,11 +22748,12 @@ bool NCManager::IsEDM126CurrentSameThread(unsigned completed) const noexcept
     const auto& s = m_edm94;
     EDM126::MotionFeedback f{};
     const bool combined = s.gapHistoryMode;
-    const unsigned fixture = (s.gapHistoryArm == 158U || s.gapHistoryArm == 166U || s.gapHistoryArm == 170U || E130CanonicalArm(s.gapHistoryArm)) ? 0U : 1U;
+    const unsigned fixture = E149HistoryFixture(s.gapHistoryArm);
     const bool profile = combined ?
-        (s.gapPhysicalAd ? (s.gapWorkTime ? E130TimedArm(s.gapHistoryArm) : (s.gapHistoryArm == 170U || s.gapHistoryArm == 172U)) :
+        (s.gapWorkTime ? (E130TimedArm(s.gapHistoryArm) && s.gapPhysicalAd == E149PhysicalExpected(s.gapHistoryArm)) :
+            s.gapPhysicalAd ? (s.gapHistoryArm == 170U || s.gapHistoryArm == 172U) :
             (s.gapHistoryArm == 166U || s.gapHistoryArm == 168U)) &&
-            s.gapModeFixture == (fixture ? EDM116::Fixture::ModalComplement127 : EDM116::Fixture::Modal127) &&
+            s.gapModeFixture == E149ModalFixture(fixture) &&
             EDM107::ValidFlushProfile(s.gapFlushParameters) :
         !s.gapPhysicalAd && (s.gapHistoryArm == 158U || s.gapHistoryArm == 160U) &&
             s.gapModeFixture == (fixture ? EDM116::Fixture::ArcPairComplement124 : EDM116::Fixture::ArcPair124) &&
@@ -19891,7 +22766,7 @@ bool NCManager::IsEDM126CurrentSameThread(unsigned completed) const noexcept
         s.gapTuning.positiveGain != 8.0 || s.gapTuning.negativeGain != 1.0 || s.gapTuning.deadbandV != 1.0 ||
         !s.latched || s.armPending || !s.everArmed ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
-        s.moves != EDM114::RequiredRows || completed > s.moves ||
+        !E156BoundPlanCurrent(s, m_edm130.recipe) || completed > s.moves ||
         !profile ||
         s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
         !m_motion.ReadEDM126Feedback(f) || !f.enabled || f.physicalAd != s.gapPhysicalAd || f.faulted || f.reason != EDM126::Reason::None ||
@@ -19914,7 +22789,7 @@ bool NCManager::IsEDM126CurrentSameThread(unsigned completed) const noexcept
             !t.maximumHistoryDepth && !t.backwardCrossings && !t.forwardCrossings &&
             !f.lastMappingTick && !f.lastMappingUs && (!combined || IsEDM128CurrentSameThread(0U));
     EDM114::Feedback row{};
-    if (!m_motion.ReadEDM114Feedback(row) || !(combined ? E128Counts(row, completed, s.gapModeFixture, s.gapWorkTime) : E126Counts(row, completed, s.gapModeFixture)) ||
+    if (!m_motion.ReadEDM114Feedback(row) || !(combined ? E128Counts(row, completed, s.gapModeFixture, s.gapWorkTime, &s.authoredGCode, s.moves) : E126Counts(row, completed, s.gapModeFixture)) ||
         row.session != s.session || row.armEpoch != s.armEpoch || row.ownerGeneration != s.lease.generation ||
         !EDM126::ValidSource(f.authorizedSource) || !EDM114::ValidSource(row.source) ||
         !EDM109::SameScope(f.authorizedSource.scope, row.source.scope) ||
@@ -19993,6 +22868,7 @@ bool NCManager::WaitEDM126InitialBoundarySameThread() noexcept
         s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
         epoch != s.armEpoch || !m_motion.IsMotionOwnerLeaseCurrent(s.lease))
     { RejectEDM94SameThread("EDM126_INITIAL_SCOPE", m_gapDryRun.sourceLine); return false; }
+    if (s.gapWorkTime && EDM149::IsTestArm(s.gapHistoryArm) && !s.gapPhysicalAd && !IsEDM129SourceCurrentSameThread()) return false;
     if (s.gapPhysicalAd && !m_edm129.sourceBound)
     {
         EDM129::MotionFeedback source{};
@@ -20125,8 +23001,47 @@ bool NCManager::WaitEDM116InitialBoundarySameThread() noexcept
     return ready;
 }
 
+namespace
+{
+    void E146LogBoundary(const char* phase, std::uint64_t session, unsigned step, int pc,
+        std::uint64_t dispatch, bool ready, unsigned attempts,
+        const EDM146::Failure& first, const EDM146::Failure& last) noexcept
+    {
+        char record[481]{};
+        const int length = std::snprintf(record, sizeof(record),
+            "[EDM146] event=BOUNDARY_OBSERVATION phase=%s result=%s session=%llu row=%u PC=%d dispatch=%llu attempts=%u first=%s last=%s tickA=%llu tickB=%llu nowA=%llu nowB=%llu authority=NONE\n",
+            phase, ready ? "RECOVERED" : "REJECT", static_cast<unsigned long long>(session), step, pc,
+            static_cast<unsigned long long>(dispatch), attempts, EDM146::Name(first.gate), EDM146::Name(last.gate),
+            static_cast<unsigned long long>(first.tickA), static_cast<unsigned long long>(first.tickB),
+            static_cast<unsigned long long>(first.nowA), static_cast<unsigned long long>(first.nowB));
+        if (length > 0 && length <= 480 && static_cast<std::size_t>(length) < sizeof(record)) RtPrintf("%s", record);
+        else RtPrintf("[EDM146] event=LOG_FORMAT_ERROR part=BOUNDARY_OBSERVATION\n");
+    }
+}
+
 bool NCManager::IsEDM127SelectionBoundarySameThread(int pc) noexcept
 {
+    const auto check = [this, pc](EDM146::Failure& failure) noexcept {
+        return CheckEDM146SelectionBoundarySameThread(pc, failure);
+    };
+    const auto report = [this, pc](bool ready, unsigned attempts,
+        const EDM146::Failure& first, const EDM146::Failure& last) noexcept {
+        E146LogBoundary("SELECTION", m_edm94.session, m_edm94.next, pc,
+            m_currentExecutingBlockDispatchId, ready, attempts, first, last);
+    };
+    // Only the physical timed-history lane may retry explicitly unavailable
+    // or independently valid but time-skewed observations. Every attempt
+    // starts the full original live proof; no sleep, dispatch or retained permit.
+    if (m_edm94.gapWorkTime) return EDM146::FreshBoundary(check, report);
+    EDM146::Failure failure{};
+    const bool ready = check(failure);
+    if (!ready) report(false, 1U, failure, failure);
+    return ready;
+}
+
+bool NCManager::CheckEDM146SelectionBoundarySameThread(int pc, EDM146::Failure& observation) noexcept
+{
+    (void)EDM146::Fail(&observation, EDM146::Gate::BoundaryState);
     const auto& s = m_edm94; const auto& c = m_edm116;
     const unsigned step = s.next;
     if (!EDM116::IsModalFixture(s.gapModeFixture) || (!s.gapModeFlush && !s.gapHistoryMode) || !s.gapPhysicalCurve ||
@@ -20139,13 +23054,17 @@ bool NCManager::IsEDM127SelectionBoundarySameThread(int pc) noexcept
         step >= s.moves || step >= EDM114::RequiredRows || pc > s.pc[step] || pc <= m_edm127.lastPC ||
         !m_currentExecutingBlockDispatchId || m_currentExecutingBlockDispatchId <= m_edm127.lastDispatch ||
         !EDM127::Valid(m_edm127.current) || c.pending || c.selected != step || c.consumed != step ||
-        (s.gapHistoryMode && c.acknowledgedRows != step) ||
-        !IsEDM114CurrentSameThread(step) ||
-        !(s.gapHistoryMode ? IsEDM128CurrentSameThread(step) : IsEDM116CurrentSameThread(step)) ||
-        m_pathFeed.pending || m_pathArc.pending || !m_motion.IsGroupDone() ||
+        (s.gapHistoryMode && c.acknowledgedRows != step)) return false;
+    if (!IsEDM114CurrentSameThread(step)) return EDM146::Fail(&observation, EDM146::Gate::PathProof);
+    (void)EDM146::Fail(&observation, EDM146::Gate::HistoryProof);
+    if (!(s.gapWorkTime ? IsEDM130CurrentSameThread(step, &observation) :
+        s.gapHistoryMode ? IsEDM128CurrentSameThread(step) : IsEDM116CurrentSameThread(step))) return false;
+    (void)EDM146::Fail(&observation, EDM146::Gate::BoundaryState);
+    if (m_pathFeed.pending || m_pathArc.pending || !m_motion.IsGroupDone() ||
         m_motion.GetCommandIngressSize() || m_motion.GetCommandReplaySize() || m_motion.GetAxisCommandMailboxDepth() ||
         !m_motion.IsMotionOwnerLeaseCurrent(s.lease) || m_motion.HasPendingSafetyOrRecoveryRequests() ||
         !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
+    (void)EDM146::Fail(&observation, EDM146::Gate::Selection);
     // Validate the committed selection before an inline B can replace it.
     // The latest executed block is either the completed row, the arm, or an
     // authenticated standalone B; none may lend a different origin/revision.
@@ -20176,8 +23095,12 @@ bool NCManager::IsEDM127SelectionBoundarySameThread(int pc) noexcept
             source.runToken == s.run && IsNCXYZCUVFeedNeutralFrame(source) && source.distanceMode == 91 &&
             m_motion.GetActiveTranslationGeneration() == 0ULL;
     EDM94::Feedback guard{}; const auto epoch = m_motion.GetCurrentExecutionEpoch();
-    if (!translation || (!step && !(s.gapHistoryMode ? m_edm126.initialBoundaryReady : c.initialBoundaryReady)) ||
-        !m_motion.ReadEDM94Feedback(guard) || guard.identity.session != s.session ||
+    if (!translation || (!step && !(s.gapHistoryMode ? m_edm126.initialBoundaryReady : c.initialBoundaryReady)))
+        return EDM146::Fail(&observation, EDM146::Gate::Translation);
+    if (!m_motion.ReadEDM94Feedback(guard)) return EDM146::Fail(&observation, EDM146::Gate::BoundaryRead);
+    (void)EDM146::Fail(&observation, EDM146::Gate::BoundaryProof, guard.lastTick, s.lastTick,
+        guard.lastNowUs, 0ULL);
+    if (guard.identity.session != s.session ||
         guard.identity.epoch != s.armEpoch || guard.identity.ownerGeneration != s.lease.generation ||
         guard.currentIdentity.session != s.session || guard.currentIdentity.epoch != epoch ||
         guard.currentIdentity.ownerGeneration != s.lease.generation || !guard.active || !guard.armAccepted ||
@@ -20186,6 +23109,8 @@ bool NCManager::IsEDM127SelectionBoundarySameThread(int pc) noexcept
         guard.lastTick < s.lastTick || guard.lastTick < m_edm114.completionTick ||
         guard.boundaryReadyCycles < EDM94::BoundaryReadyCycles || guard.boundaryNotReadyMask ||
         !m_motion.HasExactProgramStartQuiescenceAcknowledgement(epoch, s.lease)) return false;
+    (void)EDM146::Fail(&observation, EDM146::Gate::AxisProof, guard.lastTick, s.lastTick,
+        guard.lastNowUs, 0ULL);
     for (unsigned axis = 0U; axis < 6U; ++axis)
     {
         const auto& frozen = s.feedback.config.axis[axis]; const auto& current = guard.config.axis[axis];
@@ -20201,24 +23126,35 @@ bool NCManager::PrepareEDM127RowSameThread(const NCBlock& block) noexcept
 {
     auto& s = m_edm94; auto& c = m_edm116; const unsigned step = s.next;
     const int pc = GetActiveDispatchPC(); const auto* authored = GetBaseProgramCache().TryGetLine(pc);
-    if (!IsEDM127SelectionBoundarySameThread(pc) || pc != s.pc[step] || !authored ||
-        !E94Matches(authored->parsedBlock, block) || block.has('B') != m_edm127.authoredInline[step]) return false;
+    const auto reject = [&](EDM146::Gate gate) noexcept {
+        EDM146::Failure failure{}; (void)EDM146::Fail(&failure, gate);
+        E146LogBoundary("ROW", s.session, step, pc, m_currentExecutingBlockDispatchId,
+            false, 1U, failure, failure);
+        return false;
+    };
+    if (!IsEDM127SelectionBoundarySameThread(pc)) return false;
+    if (pc != s.pc[step] || !authored ||
+        !(E94Matches(authored->parsedBlock, block) || MatchesEDM141MotionSameThread(authored->parsedBlock, block, pc)) || block.has('B') != m_edm127.authoredInline[step]) return reject(EDM146::Gate::RowBinding);
     NCParsedBlock geometry = authored->parsedBlock;
+    if (E141MotionArm(s.gapHistoryArm) &&
+        !EDM141::MakeLiteral(authored->parsedBlock, m_edm141.rows[step], geometry)) return reject(EDM146::Gate::Geometry);
     geometry.hasParam['B'-'A'] = false; geometry.paramExpressions['B'-'A'].clear();
     std::array<double, 6U> delta{}; double feed = 0.0;
-    if (!E114Move(geometry, step, delta, feed, s.gapModeFixture) || delta != s.increment[step] || feed != s.feed[step]) return false;
+    if (!E114Move(geometry, step, delta, feed, s.gapModeFixture, E148AuthoredLineArm(s.gapHistoryArm)) ||
+        delta != s.increment[step] || feed != s.feed[step] ||
+        (EDM116::IsAuthoredOrderFixture(s.gapModeFixture) && block.gCode != s.authoredGCode[step])) return reject(EDM146::Gate::Geometry);
     EDM127::Selection candidate = m_edm127.current;
     if (block.has('B') && !EDM127::Select(m_edm127.current, block.val('B'), pc,
-        m_currentExecutingBlockDispatchId, candidate)) return false;
+        m_currentExecutingBlockDispatchId, candidate)) return reject(EDM146::Gate::ModeOrigin);
     if (candidate.mode != m_edm127.expectedMode[step] || candidate.pc != m_edm127.expectedOriginPC[step] ||
-        candidate.revision != m_edm127.expectedOriginRevision[step]) return false;
+        candidate.revision != m_edm127.expectedOriginRevision[step]) return reject(EDM146::Gate::ModeOrigin);
     EDM116::Policy policy{}; policy.mode = candidate.mode; policy.fixture = s.gapModeFixture;
     policy.profile = s.gapFlushParameters; policy.selectorPC = pc;
     policy.selectorDispatch = m_currentExecutingBlockDispatchId; policy.revision = step + 1ULL;
     policy.modeOriginPC = candidate.pc; policy.modeOriginDispatch = candidate.dispatch;
     policy.modeOriginRevision = candidate.revision;
     if (!EDM116::PolicyMatchesBinding(policy, step, pc, m_currentExecutingBlockDispatchId) ||
-        (step && !EDM116::PolicyFollowsCompleted(policy, c.policies[step - 1U], c.completedSources[step - 1U]))) return false;
+        (step && !EDM116::PolicyFollowsCompleted(policy, c.policies[step - 1U], c.completedSources[step - 1U]))) return reject(EDM146::Gate::Policy);
     if (!step)
     { c.initialTranslation = CoordSys.GetTranslationSnapshot(); c.initialTranslationValid = true; }
     m_edm127.pending = candidate;
@@ -20232,7 +23168,8 @@ bool NCManager::ProcessEDM127BlockSameThread(const NCBlock& input, NCBlock& geom
     const auto& s = m_edm94;
     if (!s.latched || !EDM116::IsModalFixture(s.gapModeFixture)) return true;
     const int pc = GetActiveDispatchPC(); const auto* authored = GetBaseProgramCache().TryGetLine(pc);
-    if (!authored || !E94Matches(authored->parsedBlock, input)) return false;
+    if (!authored || !(E94Matches(authored->parsedBlock, input) ||
+        MatchesEDM141MotionSameThread(authored->parsedBlock, input, pc))) return false;
     EDM116::Mode mode{};
     if (E127Standalone(authored->parsedBlock, mode))
     {
@@ -20267,7 +23204,7 @@ void NCManager::LogEDM127SameThread(const char* event, unsigned step) const noex
         length = std::snprintf(record, sizeof(record),
             "[EDM127] event=%.24s session=%llu row=%u G=%d B=%u input=%s sourcePC=%d dispatch=%llu originPC=%d originDispatch=%llu originRevision=%llu rowRevision=%llu replay=0 dischargeCommand=NONE\n",
             event ? event : "UNKNOWN", static_cast<unsigned long long>(s.session), step,
-            EDM116::ExpectedGCode(step,s.gapModeFixture), static_cast<unsigned>(p.mode),
+            EDM116::ExpectedGCode(step, s.gapModeFixture, s.authoredGCode[step]), static_cast<unsigned>(p.mode),
             m_edm127.authoredInline[step] ? "EXPLICIT" : "INHERITED", p.selectorPC,
             static_cast<unsigned long long>(p.selectorDispatch), p.modeOriginPC,
             static_cast<unsigned long long>(p.modeOriginDispatch), static_cast<unsigned long long>(p.modeOriginRevision),
@@ -20572,7 +23509,7 @@ bool NCManager::IsEDM116CurrentSameThread(unsigned completed) noexcept
         s.gapCommonPath || s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime ||
         s.gapFlushInterruptArm || !s.latched || s.armPending || !s.everArmed || !s.armEpoch ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
-        s.moves != EDM114::RequiredRows || completed > s.moves || m_edm114.acknowledgedRows != completed ||
+        !E156BoundPlanCurrent(s, m_edm130.recipe) || completed > s.moves || m_edm114.acknowledgedRows != completed ||
         c.acknowledgedRows != completed || c.consumed != completed || c.selected != completed + (c.pending ? 1U : 0U) || c.selected > s.moves ||
         s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
         !m_motion.ReadEDM116Feedback(c.feedback)) return false;
@@ -20842,7 +23779,7 @@ bool NCManager::IsEDM115CurrentSameThread(unsigned completed) noexcept
         s.gapCommonPath || s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime ||
         s.gapFlushInterruptArm || !s.latched || s.armPending || !s.everArmed || !s.armEpoch ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
-        s.moves != EDM114::RequiredRows || completed > s.moves || m_edm114.acknowledgedRows != completed ||
+        !E156BoundPlanCurrent(s, m_edm130.recipe) || completed > s.moves || m_edm114.acknowledgedRows != completed ||
         s.run != m_pathCoreLiveBookkeeping.currentRunToken || s.cache != GetBaseProgramCache().GetGeneration() ||
         !m_motion.ReadEDM115Feedback(c.feedback)) return false;
     const auto& f = c.feedback; const auto& e = f.excursion;
@@ -20965,14 +23902,48 @@ bool NCManager::GuardEDM114ArcSameThread(const NCBlock& block) noexcept
         !IsPathCoreLiveNativeConfigCurrentSameThread()) return false;
     const unsigned step = s.next - 1U;
     const int pc = GetActiveDispatchPC();
-    if (!EDM116::IsArcStep(step, s.gapModeFixture) || !IsEDM114CurrentSameThread(step) ||
+    if (!EDM116::IsArcStep(step, s.gapModeFixture, s.authoredGCode[step]) || !IsEDM114CurrentSameThread(step) ||
         pc != s.pc[step] || !m_currentExecutingBlockDispatchId ||
-        block.gCode != EDM116::ExpectedGCode(step, s.gapModeFixture) || !block.has('X') || !block.has('Y') ||
-        !block.has('I') || !block.has('J') || !block.has('F') || block.val('F') != s.feed[step]) return false;
+        block.gCode != EDM116::ExpectedGCode(step, s.gapModeFixture, s.authoredGCode[step]) ||
+        !block.has('F') || block.val('F') != s.feed[step]) return false;
     if (s.gapCurveB2 && !IsEDM115CurrentSameThread(step)) return false;
-    const std::array<double, 2U> center{block.val('I'), block.val('J')};
+    const bool sparse = s.gapModeFixture == EDM116::Fixture::ModalSparseArc155 || s.gapModeFixture == EDM116::Fixture::ModalProgram156 || s.gapModeFixture == EDM116::Fixture::ModalPause157 || s.gapModeFixture == EDM116::Fixture::ModalXYZVisibleFlush159 || s.gapModeFixture == EDM116::Fixture::ModalSixVisibleFlush167;
+    std::array<double, 2U> center{};
+    if (sparse)
+    {
+        const auto* authored = GetBaseProgramCache().TryGetLine(pc);
+        if (!((s.gapModeFixture == EDM116::Fixture::ModalSparseArc155 && EDM149::IsSparseArcTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::SparseArcHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalProgram156 && EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::ProgramHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalPause157 && EDM149::IsPauseTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::PauseHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalSixVisibleFlush167 && EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::SixVisibleFlushHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalXYZVisibleFlush159 && EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::XYZVisibleFlushHistoryFixture)) || !authored) return false;
+        NCParsedBlock geometry = authored->parsedBlock;
+        if (geometry.has('B') != m_edm127.authoredInline[step]) return false;
+        if (geometry.has('B'))
+        {
+            double value = 0.0; EDM116::Mode mode = EDM116::Mode::Invalid;
+            if (!E94Number(geometry.expression('B'), value) || !EDM116::ParseMode(value, mode) ||
+                mode != m_edm127.expectedMode[step]) return false;
+            geometry.hasParam['B'-'A'] = false; geometry.paramExpressions['B'-'A'].clear();
+        }
+        std::array<double, 6U> literalIncrement{}; double literalFeed = 0.0;
+        if (!E94Matches(geometry, block) || !E114Move(geometry, step, literalIncrement, literalFeed, s.gapModeFixture) ||
+            literalIncrement != s.increment[step] || literalFeed != s.feed[step] ||
+            !E155ArcCenter(geometry, center, s.gapModeFixture)) return false;
+    }
+    else
+    {
+        if (!block.has('X') || !block.has('Y') || !block.has('I') || !block.has('J')) return false;
+        center = {block.val('I'), block.val('J')};
+    }
     if (!EDM116::ValidArcRecipe(block.gCode, step, s.increment[step], center, block.val('F'), s.gapModeFixture) ||
-        block.val('X') != s.increment[step][0] || block.val('Y') != s.increment[step][1] ||
+        (block.has('X') ? block.val('X') != s.increment[step][0] : s.increment[step][0] != 0.0) ||
+        (block.has('Y') ? block.val('Y') != s.increment[step][1] : s.increment[step][1] != 0.0) ||
         center != m_pathArcCenterOffset) return false;
     std::array<double, 6U> target{};
     for (unsigned a = 0U; a < 6U; ++a)
@@ -21011,15 +23982,15 @@ bool NCManager::IsEDM114CurrentSameThread(unsigned completed) noexcept
     const auto& s = m_edm94; auto& c = m_edm114;
     if (!s.gapPhysicalCurve || (!s.gapHistoryServo && (!s.gapFlushProfile || !s.gapFlushParameterized)) || s.gapCommonPath || s.gapB2CrossSegment ||
         s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime || s.gapFlushInterruptArm ||
-        !s.latched || s.armPending || !s.everArmed || !s.armEpoch || s.moves != EDM114::RequiredRows ||
+        !s.latched || s.armPending || !s.everArmed || !s.armEpoch || !E156BoundPlanCurrent(s, m_edm130.recipe) ||
         s.cancelled || s.resetSeen || s.resetCommitted || s.releaseRequested || s.rtFaultReported ||
-        completed > EDM114::RequiredRows || c.acknowledgedRows != completed ||
+        completed > s.moves || c.acknowledgedRows != completed ||
         s.cache != GetBaseProgramCache().GetGeneration() || s.run != m_pathCoreLiveBookkeeping.currentRunToken ||
         !m_motion.ReadEDM114Feedback(c.feedback)) return false;
     const auto& f = c.feedback;
     if (f.failed && !c.failureLogged)
     { c.failureLogged = true; LogEDM114SameThread("PHYSICAL_CURVE_FAIL"); }
-    if (!(s.gapHistoryMode ? E128Counts(f, completed, s.gapModeFixture, s.gapWorkTime) : s.gapHistoryServo ? E126Counts(f, completed, s.gapModeFixture) : E114Counts(f, completed, s.gapModeFixture)) || f.session != s.session || f.armEpoch != s.armEpoch ||
+    if (!(s.gapHistoryMode ? E128Counts(f, completed, s.gapModeFixture, s.gapWorkTime, &s.authoredGCode, s.moves) : s.gapHistoryServo ? E126Counts(f, completed, s.gapModeFixture) : E114Counts(f, completed, s.gapModeFixture)) || f.session != s.session || f.armEpoch != s.armEpoch ||
         f.ownerGeneration != s.lease.generation) return false;
     if (completed == 0U)
     {
@@ -21049,7 +24020,7 @@ bool NCManager::RetainEDM114CompletedSameThread(const EDM94::Feedback& guard) no
         s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime || s.gapFlushInterruptArm ||
         !s.latched || !s.ready || s.armPending || s.cancelled || s.resetSeen ||
         s.resetCommitted || s.releaseRequested || s.rtFaultReported || s.finishPending || s.complete ||
-        s.next == 0U || s.next > EDM114::RequiredRows || s.moves != EDM114::RequiredRows ||
+        s.next == 0U || s.next > s.moves || !E156BoundPlanCurrent(s, m_edm130.recipe) ||
         !b.dispatch || !b.commit || !b.sequence || !b.identity.IsAssigned() ||
         b.identity.source != MotionCommandSource::NC_MEMORY ||
         b.identity.sourceBlockId != static_cast<MotionSourceBlockId>(s.pc[s.next - 1U]) ||
@@ -21058,7 +24029,7 @@ bool NCManager::RetainEDM114CompletedSameThread(const EDM94::Feedback& guard) no
     const unsigned step = s.next - 1U;
     if (f.failed && !c.failureLogged)
     { c.failureLogged = true; LogEDM114SameThread("PHYSICAL_CURVE_FAIL"); }
-    if (!(s.gapHistoryMode ? E128Counts(f, s.next, s.gapModeFixture, s.gapWorkTime) : s.gapHistoryServo ? E126Counts(f, s.next, s.gapModeFixture) : E114Counts(f, s.next, s.gapModeFixture)) || f.session != s.session || f.armEpoch != s.armEpoch ||
+    if (!(s.gapHistoryMode ? E128Counts(f, s.next, s.gapModeFixture, s.gapWorkTime, &s.authoredGCode, s.moves) : s.gapHistoryServo ? E126Counts(f, s.next, s.gapModeFixture) : E114Counts(f, s.next, s.gapModeFixture)) || f.session != s.session || f.armEpoch != s.armEpoch ||
         f.ownerGeneration != s.lease.generation || !EDM114::ValidSource(f.source) ||
         f.source.scope.session != s.session || f.source.scope.run != s.run || f.source.scope.cache != s.cache ||
         f.source.scope.ownerGeneration != s.lease.generation || f.source.scope.translationGeneration != b.translation ||
@@ -21085,13 +24056,13 @@ bool NCManager::RetainEDM114CompletedSameThread(const EDM94::Feedback& guard) no
     }
     if (f.source.scope.configTag != (configTag ? configTag : 1ULL) ||
         f.source.scope.mappingTag != (mappingTag ? mappingTag : 1ULL)) return false;
-    if (EDM116::IsArcStep(step, s.gapModeFixture))
+    if (EDM116::IsArcStep(step, s.gapModeFixture, s.authoredGCode[step]))
     {
         const auto& r = m_pathArcMotion.receipt;
         if (f.kind != EDM114::Kind::Arc || m_pathArc.dispatch != b.dispatch || m_pathArc.commit != b.commit ||
             r.identity.epoch != f.source.epoch || r.identity.segmentId != f.source.segment ||
             !r.valid || !r.arc.valid || r.arc.axisMask != 3U || r.arc.plane != 17U || r.arc.fullCircle ||
-            r.arc.direction != (EDM116::ExpectedGCode(step, s.gapModeFixture) == 2 ? -1 : 1) ||
+            r.arc.direction != (EDM116::ExpectedGCode(step, s.gapModeFixture, s.authoredGCode[step]) == 2 ? -1 : 1) ||
             !EDM109::SameDouble(f.pulseLength, r.arc.lengthPulse) ||
             !EDM109::SameDouble(f.radiusPulse, r.arc.radiusPulse) ||
             !EDM109::SameDouble(f.startAngle, r.arc.startAngle) ||
@@ -21129,7 +24100,7 @@ bool NCManager::RetainEDM114CompletedSameThread(const EDM94::Feedback& guard) no
         f.source.dispatch <= prior.source.dispatch || f.source.epoch <= prior.source.epoch ||
         f.source.segment <= prior.source.segment || f.source.sourcePC <= prior.source.sourcePC ||
         !EDM109::SamePulse(f.startPulse, prior.endPulse))) return false;
-    if (!s.gapHistoryServo && EDM116::IsArcStep(step, s.gapModeFixture) && !(step & 1U)) ++c.arcFlushRows;
+    if (!s.gapHistoryServo && EDM116::IsArcStep(step, s.gapModeFixture, s.authoredGCode[step]) && !(step & 1U)) ++c.arcFlushRows;
     c.retained = f; c.acknowledgedRows = s.next;
     c.completionTick = guard.lastTick; c.completionCommit = b.commit;
     LogEDM114SameThread("PHYSICAL_CURVE_ROW");
@@ -21170,7 +24141,7 @@ bool NCManager::WaitEDM114ArcBoundarySameThread()
     { b = EDM94NCState::FeedBoundary{}; return false; }
     const bool stepValid = s.next > 0U && s.next <= s.moves;
     const unsigned step = stepValid ? s.next - 1U : 0U;
-    bool scope = stepValid && EDM116::IsArcStep(step, s.gapModeFixture) && p.armed && p.pending && p.bound && p.completed &&
+    bool scope = stepValid && EDM116::IsArcStep(step, s.gapModeFixture, s.authoredGCode[step]) && p.armed && p.pending && p.bound && p.completed &&
         p.consumerAccepted && p.consumerStarted && p.dispatch && p.commit && p.lastSequence &&
         p.run == s.run && p.cache == s.cache && s.run == m_pathCoreLiveBookkeeping.currentRunToken &&
         s.cache == GetBaseProgramCache().GetGeneration() && p.dispatch == m_waitingBlockDispatchId &&
@@ -21179,7 +24150,7 @@ bool NCManager::WaitEDM114ArcBoundarySameThread()
         r.code == MotionFeedArcCode::COMMITTED &&
         r.geometryCode == static_cast<std::uint32_t>(NCPathCoreFeedArcCode::BUILT_ARC) && r.arc.valid &&
         r.arc.axisMask == 3U && r.validAxisMask == 63U && r.arc.plane == 17U && !r.arc.fullCircle &&
-        r.arc.direction == (EDM116::ExpectedGCode(step, s.gapModeFixture) == 2 ? -1 : 1) && r.arc.feedMMMin == s.feed[step] &&
+        r.arc.direction == (EDM116::ExpectedGCode(step, s.gapModeFixture, s.authoredGCode[step]) == 2 ? -1 : 1) && r.arc.feedMMMin == s.feed[step] &&
         r.identity.IsAssigned() && r.identity.source == MotionCommandSource::NC_MEMORY &&
         r.identity.sourceBlockId == static_cast<MotionSourceBlockId>(p.sourcePC) &&
         r.identity.epoch == m_motion.GetCurrentExecutionEpoch() &&
@@ -21209,8 +24180,55 @@ bool NCManager::WaitEDM114ArcBoundarySameThread()
         else scope = scope && EDM109::SameDouble(r.arc.startMCS[a], r.arc.endMCS[a]) &&
             EDM109::SameDouble(r.arc.startPulse[a], r.arc.endPulse[a]);
     }
-    scope = scope && r.arc.centerMCS[0] == r.arc.startMCS[0] + ((step & 1U) ? -0.001 : 0.001) &&
-        r.arc.centerMCS[1] == r.arc.startMCS[1] && std::isfinite(r.arc.radiusPulse) && r.arc.radiusPulse > 0.0 &&
+    if (EDM116::IsBoundedArcFixture(s.gapModeFixture))
+    {
+        // Re-read only this immutable admitted cache row. Neither a later NC
+        // selection nor a merely valid arc may replace the frozen literal IJ.
+        const auto* authored = GetBaseProgramCache().TryGetLine(p.sourcePC);
+        std::array<double, 6U> literalIncrement{}; std::array<double, 2U> literalCenter{};
+        double literalFeed = 0.0;
+        bool literalScope = scope && s.gapHistoryServo && s.gapHistoryMode && s.gapWorkTime &&
+            ((s.gapModeFixture == EDM116::Fixture::ModalArc152 && EDM149::IsArcTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::ArcHistoryFixture) ||
+                (s.gapModeFixture != EDM116::Fixture::ModalXYZVisibleFlush159 && s.gapModeFixture != EDM116::Fixture::ModalSixVisibleFlush167 &&
+                    EDM116::IsAuthoredOrderFixture(s.gapModeFixture) && EDM149::IsOrderTestArm(s.gapHistoryArm) &&
+                    E149HistoryFixture(s.gapHistoryArm) == EDM149::OrderHistoryFixture) ||
+                (s.gapModeFixture == EDM116::Fixture::ModalSparse154 && EDM149::IsSparseTestArm(s.gapHistoryArm) &&
+                    E149HistoryFixture(s.gapHistoryArm) == EDM149::SparseHistoryFixture) ||
+                (s.gapModeFixture == EDM116::Fixture::ModalSparseArc155 && EDM149::IsSparseArcTestArm(s.gapHistoryArm) &&
+                    E149HistoryFixture(s.gapHistoryArm) == EDM149::SparseArcHistoryFixture) ||
+                (s.gapModeFixture == EDM116::Fixture::ModalProgram156 && EDM149::IsBoundedProgramTestArm(s.gapHistoryArm) &&
+                    E149HistoryFixture(s.gapHistoryArm) == EDM149::ProgramHistoryFixture) ||
+                (s.gapModeFixture == EDM116::Fixture::ModalPause157 && EDM149::IsPauseTestArm(s.gapHistoryArm) &&
+                    E149HistoryFixture(s.gapHistoryArm) == EDM149::PauseHistoryFixture) ||
+                (s.gapModeFixture == EDM116::Fixture::ModalSixVisibleFlush167 && EDM149::IsSixVisibleFlushTestArm(s.gapHistoryArm) &&
+                E149HistoryFixture(s.gapHistoryArm) == EDM149::SixVisibleFlushHistoryFixture) ||
+            (s.gapModeFixture == EDM116::Fixture::ModalXYZVisibleFlush159 && EDM149::IsXYZVisibleFlushTestArm(s.gapHistoryArm) &&
+                    E149HistoryFixture(s.gapHistoryArm) == EDM149::XYZVisibleFlushHistoryFixture)) &&
+            s.cache == GetBaseProgramCache().GetGeneration() && p.sourcePC == s.pc[step] && authored;
+        if (literalScope)
+        {
+            NCParsedBlock geometry = authored->parsedBlock;
+            literalScope = geometry.has('B') == m_edm127.authoredInline[step];
+            if (geometry.has('B'))
+            {
+                double value = 0.0; EDM116::Mode mode = EDM116::Mode::Invalid;
+                literalScope = literalScope && E94Number(geometry.expression('B'), value) &&
+                    EDM116::ParseMode(value, mode) && mode == m_edm127.expectedMode[step];
+                geometry.hasParam['B'-'A'] = false; geometry.paramExpressions['B'-'A'].clear();
+            }
+            literalScope = literalScope && E114Move(geometry, step, literalIncrement, literalFeed, s.gapModeFixture) &&
+                literalIncrement == s.increment[step] && literalFeed == s.feed[step] &&
+                (!EDM116::IsAuthoredOrderFixture(s.gapModeFixture) ||
+                    EDM77::Detail::EqualLiteral(geometry.gExpressions[0], s.authoredGCode[step])) &&
+                E155ArcCenter(geometry, literalCenter, s.gapModeFixture);
+        }
+        scope = literalScope && r.arc.centerMCS[0] == r.arc.startMCS[0] + literalCenter[0] &&
+            r.arc.centerMCS[1] == r.arc.startMCS[1] + literalCenter[1];
+    }
+    else scope = scope && r.arc.centerMCS[0] == r.arc.startMCS[0] + ((step & 1U) ? -0.001 : 0.001) &&
+        r.arc.centerMCS[1] == r.arc.startMCS[1];
+    scope = scope && std::isfinite(r.arc.radiusPulse) && r.arc.radiusPulse > 0.0 &&
         std::isfinite(r.arc.lengthPulse) && r.arc.lengthPulse > 0.0 &&
         std::isfinite(r.arc.sweepRadians) && std::fabs(r.arc.sweepRadians) <= 2.0 * EDM114::Pi;
     if (scope && b.dispatch)
@@ -21380,6 +24398,13 @@ bool NCManager::WaitEDM94BoundaryProofSameThread(int sourceLine)
     { RejectEDM94SameThread("EDM115_COMPLETED_B2_PROOF", sourceLine); return false; }
     if (s.gapCommonPath && !RetainEDM109CompletedSameThread(observed))
     { RejectEDM94SameThread("EDM109_COMPLETED_PATH_PROOF", sourceLine); return false; }
+    if (s.next == s.moves && !IsEDM168AutoHoldCheckpointCompleteSameThread())
+    { RejectEDM94SameThread("EDM168_CHECKPOINT_NOT_COMPLETED", sourceLine); return false; }
+    if (s.next == s.moves && m_edm130.recipe.flushHoldTest >= 2U)
+        RtPrintf("[EDM168] event=CHECKPOINT_VERIFIED session=%llu L=%u B=%u completedModeEvents=%u queued=1 resumed=1 rows=%u proof=RETAINED_FINAL_BOUNDARY S92=0 S93=0\n",
+            static_cast<unsigned long long>(s.session), static_cast<unsigned>(m_edm130.recipe.flushHoldTest),
+            EDM130::FlushHoldTargetMode(m_edm130.recipe.flushHoldTest),
+            m_edm130.retainedModeEvents[EDM130::FlushHoldTargetMode(m_edm130.recipe.flushHoldTest)], s.moves);
     if (s.gapBoundaryProfile && !s.gapWaiting)
         RtPrintf("[EDM95] event=PHYSICAL_BOUNDARY_READY session=%llu step=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY\n",
             static_cast<unsigned long long>(s.session), step, static_cast<unsigned long long>(b.identity.epoch),
@@ -21420,7 +24445,7 @@ bool NCManager::WaitEDM94BoundaryProofSameThread(int sourceLine)
         RtPrintf("[EDM97] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM97_SEGMENT_COMPLETE\n",
             static_cast<unsigned long long>(s.session), s.next, static_cast<unsigned long long>(b.identity.epoch),
             static_cast<unsigned long long>(b.lastTick),
-            s.gapHistoryMode ? (s.next == s.moves ? (s.gapWorkTime ? (s.gapHistoryArm == 206U ? "FINISH_P207" : s.gapHistoryArm == 208U ? "FINISH_P209" : s.gapHistoryArm == 202U ? "FINISH_P203" : s.gapHistoryArm == 204U ? "FINISH_P205" : s.gapHistoryArm == 198U ? "FINISH_P199" : s.gapHistoryArm == 200U ? "FINISH_P201" : s.gapHistoryArm == 194U ? "FINISH_P195" : s.gapHistoryArm == 196U ? "FINISH_P197" : s.gapHistoryArm == 190U ? "FINISH_P191" : s.gapHistoryArm == 192U ? "FINISH_P193" : s.gapHistoryArm == 186U ? "FINISH_P187" : s.gapHistoryArm == 188U ? "FINISH_P189" : s.gapHistoryArm == 182U ? "FINISH_P183" : s.gapHistoryArm == 184U ? "FINISH_P185" : s.gapHistoryArm == 178U ? "FINISH_P179" : s.gapHistoryArm == 180U ? "FINISH_P181" : s.gapHistoryArm == 174U ? "FINISH_P175" : "FINISH_P177") : s.gapPhysicalAd ? (s.gapHistoryArm == 170U ? "FINISH_P171" : "FINISH_P173") : s.gapHistoryArm == 166U ? "FINISH_P167" : "FINISH_P169") : "NEXT_AUTHORED_CURVE") :
+            s.gapHistoryMode ? (s.next == s.moves ? (s.gapWorkTime ? (s.gapHistoryArm == 290U ? "FINISH_P291" : s.gapHistoryArm == 288U ? "FINISH_P289" : s.gapHistoryArm == 286U ? "FINISH_P287" : s.gapHistoryArm == 284U ? "FINISH_P285" : s.gapHistoryArm == 278U ? "FINISH_P279" : s.gapHistoryArm == 280U ? "FINISH_P281" : s.gapHistoryArm == 282U ? "FINISH_P283" : s.gapHistoryArm == 272U ? "FINISH_P273" : s.gapHistoryArm == 274U ? "FINISH_P275" : s.gapHistoryArm == 276U ? "FINISH_P277" : s.gapHistoryArm == 266U ? "FINISH_P267" : s.gapHistoryArm == 268U ? "FINISH_P269" : s.gapHistoryArm == 270U ? "FINISH_P271" : s.gapHistoryArm == 260U ? "FINISH_P261" : s.gapHistoryArm == 262U ? "FINISH_P263" : s.gapHistoryArm == 264U ? "FINISH_P265" : s.gapHistoryArm == 254U ? "FINISH_P255" : s.gapHistoryArm == 256U ? "FINISH_P257" : s.gapHistoryArm == 258U ? "FINISH_P259" : s.gapHistoryArm == 248U ? "FINISH_P249" : s.gapHistoryArm == 250U ? "FINISH_P251" : s.gapHistoryArm == 252U ? "FINISH_P253" : s.gapHistoryArm == 242U ? "FINISH_P243" : s.gapHistoryArm == 244U ? "FINISH_P245" : s.gapHistoryArm == 246U ? "FINISH_P247" : s.gapHistoryArm == 236U ? "FINISH_P237" : s.gapHistoryArm == 238U ? "FINISH_P239" : s.gapHistoryArm == 240U ? "FINISH_P241" : s.gapHistoryArm == 230U ? "FINISH_P231" : s.gapHistoryArm == 232U ? "FINISH_P233" : s.gapHistoryArm == 234U ? "FINISH_P235" : s.gapHistoryArm == 226U ? "FINISH_P227" : s.gapHistoryArm == 228U ? "FINISH_P229" : s.gapHistoryArm == 222U ? "FINISH_P223" : s.gapHistoryArm == 224U ? "FINISH_P225" : s.gapHistoryArm == 218U ? "FINISH_P219" : s.gapHistoryArm == 220U ? "FINISH_P221" : s.gapHistoryArm == 214U ? "FINISH_P215" : s.gapHistoryArm == 216U ? "FINISH_P217" : s.gapHistoryArm == 210U ? "FINISH_P211" : s.gapHistoryArm == 212U ? "FINISH_P213" : s.gapHistoryArm == 206U ? "FINISH_P207" : s.gapHistoryArm == 208U ? "FINISH_P209" : s.gapHistoryArm == 202U ? "FINISH_P203" : s.gapHistoryArm == 204U ? "FINISH_P205" : s.gapHistoryArm == 198U ? "FINISH_P199" : s.gapHistoryArm == 200U ? "FINISH_P201" : s.gapHistoryArm == 194U ? "FINISH_P195" : s.gapHistoryArm == 196U ? "FINISH_P197" : s.gapHistoryArm == 190U ? "FINISH_P191" : s.gapHistoryArm == 192U ? "FINISH_P193" : s.gapHistoryArm == 186U ? "FINISH_P187" : s.gapHistoryArm == 188U ? "FINISH_P189" : s.gapHistoryArm == 182U ? "FINISH_P183" : s.gapHistoryArm == 184U ? "FINISH_P185" : s.gapHistoryArm == 178U ? "FINISH_P179" : s.gapHistoryArm == 180U ? "FINISH_P181" : s.gapHistoryArm == 174U ? "FINISH_P175" : "FINISH_P177") : s.gapPhysicalAd ? (s.gapHistoryArm == 170U ? "FINISH_P171" : "FINISH_P173") : s.gapHistoryArm == 166U ? "FINISH_P167" : "FINISH_P169") : "NEXT_AUTHORED_CURVE") :
                 s.next == s.moves ? "FINISH_P92" : "NEXT_AUTHORED_G1");
     else if (s.gapSegmentProfile)
         RtPrintf("[EDM96] event=PHYSICAL_BOUNDARY_READY session=%llu completed=%u epoch=%llu tick=%llu next=%s witness=EDM94_CURRENT_BOUNDARY_AND_EDM96_SEGMENT_COMPLETE\n",
@@ -21502,17 +24527,18 @@ bool NCManager::IsEDM97TuningCurrentSameThread(const EDM96::Feedback& gap) const
     if (s.gapHistoryServo)
     {
         const bool combined = s.gapHistoryMode;
-        const unsigned fixture = (s.gapHistoryArm == 158U || s.gapHistoryArm == 166U || s.gapHistoryArm == 170U || E130CanonicalArm(s.gapHistoryArm)) ? 0U : 1U;
+        const unsigned fixture = E149HistoryFixture(s.gapHistoryArm);
         const bool profile = combined ?
-            (s.gapPhysicalAd ? (s.gapWorkTime ? E130TimedArm(s.gapHistoryArm) : (s.gapHistoryArm == 170U || s.gapHistoryArm == 172U)) :
+            (s.gapWorkTime ? (E130TimedArm(s.gapHistoryArm) && s.gapPhysicalAd == E149PhysicalExpected(s.gapHistoryArm)) :
+            s.gapPhysicalAd ? (s.gapHistoryArm == 170U || s.gapHistoryArm == 172U) :
             (s.gapHistoryArm == 166U || s.gapHistoryArm == 168U)) &&
-                s.gapModeFixture == (fixture ? EDM116::Fixture::ModalComplement127 : EDM116::Fixture::Modal127) &&
+                s.gapModeFixture == E149ModalFixture(fixture) &&
                 EDM107::ValidFlushProfile(s.gapFlushParameters) :
             !s.gapPhysicalAd && (s.gapHistoryArm == 158U || s.gapHistoryArm == 160U) &&
                 s.gapModeFixture == (fixture ? EDM116::Fixture::ArcPairComplement124 : EDM116::Fixture::ArcPair124) &&
                 EDM107::IsDefaultFlushProfile(s.gapFlushParameters);
         if (!profile ||
-            !s.gapPhysicalCurve || !s.gapSegmentProfile || !s.gapGainProfile || s.moves != EDM114::RequiredRows ||
+            !s.gapPhysicalCurve || !s.gapSegmentProfile || !s.gapGainProfile || !E156BoundPlanCurrent(s, m_edm130.recipe) ||
             s.gapBoundaryProfile || s.gapNoiseProfile || s.gapBurstProfile || s.gapContinuousProfile ||
             s.gapEnduranceProfile || s.gapPairedProfile || s.gapFlushProfile || s.gapFlushParameterized ||
             s.gapCommonPath || s.gapB2CrossSegment || s.gapB2Repeat || s.gapCurveGeometry || s.gapCurveRuntime ||
@@ -21537,7 +24563,11 @@ bool NCManager::IsEDM97TuningCurrentSameThread(const EDM96::Feedback& gap) const
                 !EDM130::HasBoundMachiningSpeed(m_edm130.recipe) ||
                 EDM130::HasBoundReferenceVoltage(m_edm130.recipe) != E135ReferenceArm(s.gapHistoryArm) ||
                 EDM130::HasBoundCurve(m_edm130.recipe) != E136CurveArm(s.gapHistoryArm) ||
-                EDM130::HasBoundFlushStages(m_edm130.recipe) != E137FlushStageArm(s.gapHistoryArm)) return false;
+                EDM130::HasBoundFlushStages(m_edm130.recipe) != E137FlushStageArm(s.gapHistoryArm) ||
+                m_edm130.recipe.diagnosticControlSource != E149ControlSource(s.gapHistoryArm) ||
+                (E139DiagnosticArm(s.gapHistoryArm) &&
+                    gap.voltageV != EDM139::HighVoltage(EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe)) &&
+                    gap.voltageV != EDM139::LowVoltage(EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe)))) return false;
             const auto curve = EDMGapServo::Evaluate(EDM97::MakeProfile(s.gapTuning, m_edm130.recipe), gap.voltageV,
                 EDM130::FrozenGapReferenceVoltageV(m_edm130.recipe), EDM130::FrozenMachiningOverridePercent(m_edm130.recipe));
             const double ratio = curve.valid && ((gap.direction > 0 && curve.limitedSpeedMmPerMin >= 0.0) ||
@@ -21993,17 +25023,18 @@ bool NCManager::WaitEDM96InitialSourceSameThread()
     {
         s.gapWaiting = true; s.gapWaitEpoch = epoch;
         s.gapWaitFirstUs = s.gapWaitLastUs = s.gapWaitLastTick = 0ULL; s.gapWaitPolls = 1U;
-        RtPrintf("[%s] event=WAIT_QUALIFIED_SOURCE session=%llu epoch=%llu budgetUs=5000000 nextMotionSubmitted=0\n",
+        RtPrintf("[%s] event=WAIT_QUALIFIED_SOURCE session=%llu epoch=%llu budgetUs=%llu nextMotionSubmitted=0\n",
             s.gapWorkTime ? (E137FlushStageArm(s.gapHistoryArm) ? "EDM137" : E136CurveArm(s.gapHistoryArm) ? "EDM136" : E135ReferenceArm(s.gapHistoryArm) ? "EDM135" : E134MachiningArm(s.gapHistoryArm) ? "EDM134" : E133DeepArm(s.gapHistoryArm) ? "EDM133" : E132HeightArm(s.gapHistoryArm) ? "EDM132" : E131SpeedArm(s.gapHistoryArm) ? "EDM131" : "EDM130") : s.gapPhysicalAd ? "EDM129" : s.gapFlushProfile ? "EDM105" : s.gapPairedProfile ? "EDM104" : s.gapEnduranceProfile ? "EDM102" : s.gapContinuousProfile ? "EDM100" : s.gapBurstProfile ? "EDM99" : s.gapNoiseProfile ? "EDM98" : s.gapGainProfile ? "EDM97" : "EDM96",
-            static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(epoch));
+            static_cast<unsigned long long>(s.session), static_cast<unsigned long long>(epoch),
+            EDM149::IsManualVoltageTestArm(s.gapHistoryArm) ? 30000000ULL : 5000000ULL);
     }
     EDM96::Feedback gap{};
     const bool read = m_motion.ReadEDM96Feedback(gap);
+    if (read && gap.session == s.session && gap.faulted)
+    { LogEDM96SameThread("SOURCE_FAULT", gap); RejectEDM94SameThread("EDM96_GAP_SOURCE_FAULT", m_gapDryRun.sourceLine); return false; }
     if (read && gap.session == s.session && !IsEDM97TuningCurrentSameThread(gap))
     { RejectEDM94SameThread(s.gapFlushProfile ? "EDM105_TUNING_IDENTITY" : s.gapPairedProfile ? "EDM104_TUNING_IDENTITY" : s.gapEnduranceProfile ? "EDM102_TUNING_IDENTITY" : s.gapContinuousProfile ? "EDM100_TUNING_IDENTITY" : s.gapBurstProfile ? "EDM99_TUNING_IDENTITY" : s.gapNoiseProfile ? "EDM98_TUNING_IDENTITY" :
         "EDM97_TUNING_IDENTITY", m_gapDryRun.sourceLine); return false; }
-    if (read && gap.session == s.session && gap.faulted)
-    { LogEDM96SameThread("SOURCE_FAULT", gap); RejectEDM94SameThread("EDM96_GAP_SOURCE_FAULT", m_gapDryRun.sourceLine); return false; }
     const bool identity = read && gap.session == s.session && gap.epoch == epoch &&
         gap.ownerGeneration == s.lease.generation && gap.expectedStep == 0U;
     const bool fresh = identity && gap.tick != 0ULL && gap.tick > s.gapWaitLastTick &&
@@ -22013,8 +25044,10 @@ bool NCManager::WaitEDM96InitialSourceSameThread()
         if (s.gapWaitFirstUs == 0ULL) s.gapWaitFirstUs = gap.nowUs;
         s.gapWaitLastUs = gap.nowUs; s.gapWaitLastTick = gap.tick;
     }
-    if (s.gapWaitPolls >= 500U || (s.gapWaitFirstUs != 0ULL &&
-        s.gapWaitLastUs >= s.gapWaitFirstUs && s.gapWaitLastUs - s.gapWaitFirstUs >= 5000000ULL))
+    const bool manualVoltage = EDM149::IsManualVoltageTestArm(s.gapHistoryArm);
+    if (s.gapWaitPolls >= (manualVoltage ? 3000U : 500U) || (s.gapWaitFirstUs != 0ULL &&
+        s.gapWaitLastUs >= s.gapWaitFirstUs && s.gapWaitLastUs - s.gapWaitFirstUs >=
+            (manualVoltage ? 30000000ULL : 5000000ULL)))
     { RejectEDM94SameThread("EDM96_SOURCE_WAIT_TIMEOUT", m_gapDryRun.sourceLine); return false; }
     if (!fresh || !gap.active || gap.faulted || gap.reason != EDM96::Reason::None ||
         gap.segmentActive || gap.segmentCompleted || !gap.gateReady || gap.direction != 1 ||
@@ -22071,16 +25104,20 @@ bool NCManager::WaitEDM94SameThread()
         { RejectEDM94SameThread((EDM125::ValidProfile(EDM125::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM125_FINAL_MODE_EVIDENCE" : EDM123::ValidProfile(EDM123::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM123_FINAL_MODE_EVIDENCE" : EDM122::ValidProfile(EDM122::ProfileForArm(m_edm94.gapModeInterruptionArm)) ? "EDM122_FINAL_MODE_EVIDENCE" : m_edm94.gapModeInterruptionArm == EDM121::ArmP ? "EDM121_FINAL_MODE_EVIDENCE" : m_edm94.gapModeInterruptionArm == EDM120::ArmP ? "EDM120_FINAL_MODE_EVIDENCE" : m_edm94.gapModeInterruptionArm == EDM119::ArmP ? "EDM119_FINAL_MODE_EVIDENCE" : m_edm94.gapModeInterruption ? "EDM118_FINAL_MODE_EVIDENCE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPair124 ? "EDM124_FINAL_MODE_EVIDENCE" : m_edm94.gapModeFixture == EDM116::Fixture::ArcPairComplement124 ? "EDM124_FINAL_MODE_EVIDENCE" : m_edm94.gapModeFixture == EDM116::Fixture::Complement117 ? "EDM117_FINAL_MODE_EVIDENCE" : "EDM116_FINAL_MODE_EVIDENCE"), m_gapDryRun.sourceLine); return false; }
         if (s.finishPending && s.gapCurveB2 && !IsEDM115CurrentSameThread(EDM114::RequiredRows))
         { RejectEDM94SameThread("EDM115_FINAL_B2_EVIDENCE", m_gapDryRun.sourceLine); return false; }
-        if (s.finishPending && s.gapPhysicalCurve && !IsEDM114CurrentSameThread(EDM114::RequiredRows))
+        if (s.finishPending && s.gapPhysicalCurve && !IsEDM114CurrentSameThread(m_edm94.moves))
         { RejectEDM94SameThread("EDM114_FINAL_CURVE_EVIDENCE", m_gapDryRun.sourceLine); return false; }
         if (s.finishPending && s.gapCurveRuntime && !IsEDM113RuntimeCurrentSameThread(EDM109::Capacity))
         { RejectEDM94SameThread("EDM113_FINAL_RUNTIME_EVIDENCE", m_gapDryRun.sourceLine); return false; }
+        if (s.finishPending && !IsEDM168AutoHoldCheckpointCompleteSameThread())
+        { RejectEDM94SameThread("EDM168_FINAL_CHECKPOINT_NOT_COMPLETED", m_gapDryRun.sourceLine); return false; }
+        if (s.finishPending && !E156FinishTargetMatches(s, m_edm130.recipe, f, m_edm114.retained))
+        { RejectEDM94SameThread("EDM156_FINAL_TARGET_RECEIPT", m_gapDryRun.sourceLine); return false; }
         if (s.finishPending && gapComplete && segmentComplete &&
             (!s.gapCurveGeometry || IsEDM112GeometryCurrentSameThread(true)) &&
             (!s.gapB2CrossSegment || (m_edm110.complete && IsEDM110CompleteSameThread(false))) &&
             (!s.gapCommonPath || (m_edm109.ledger.Valid() && m_edm109.ledger.Count() == EDM109::Capacity &&
                 m_edm109.plans == EDM109::Capacity - 1U && m_edm109.mappedSegments == EDM109::Capacity)) && f.active && !f.released && f.pass && f.stopped && f.forceZero && f.finishRequested && !f.faulted && !f.cancelled &&
-            f.nonzeroSentMask == 63U && f.actualMovedMask == 63U && f.commandMovedMask == 63U && f.sentFrames >= 200ULL &&
+            EDM94::MovementProven(f, E156RequiredMovementMask(s, m_edm130.recipe)) && f.sentFrames >= 200ULL &&
             f.settledCycles >= f.requiredCycles && f.requiredCycles >= 200U && f.lastSentTick != 0ULL &&
             f.lastSentTick <= f.lastTick && m_motion.IsGroupDone())
         {
@@ -22126,4 +25163,466 @@ void NCManager::ReleaseEDM94AfterResetSameThread() noexcept
     m_edm94.releaseRequested = true;
     m_motion.RequestEDM94Release(m_edm94.session);
     LogEDM94SameThread("RELEASE_REQUEST", "EXISTING_RESET_REBASE_COMMITTED");
+}
+
+// A completed authored M00 plus a later successful explicit Cycle Start is an
+// operator confirmation only. It is not proof of physical on-site presence.
+bool NCManager::IsEDM149ConfirmationBlockSameThread(const NCParsedBlock& block, int pc) const noexcept
+{
+    if (pc < 0 || pc == (std::numeric_limits<int>::max)() || !E149M00Shape(block)) return false;
+    const auto* next = GetBaseProgramCache().TryGetLine(pc + 1);
+    if (!next) return false;
+    EDM97::Tuning tuning{}; EDM107::FlushProfile profile{};
+    return E108ProfileOnlyNPQRSIJK(next->parsedBlock,230U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,232U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,234U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,236U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,238U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,240U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,242U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,244U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,246U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,248U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,250U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,252U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,254U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,256U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,258U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,260U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,262U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,264U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,266U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,268U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,270U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,272U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,274U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,276U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,278U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,280U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,282U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,284U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,286U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,288U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,290U,tuning,profile) ||
+        E108ProfileOnlyNPQRSIJK(next->parsedBlock,292U,tuning,profile);
+}
+
+void NCManager::CaptureEDM149ConfirmationSameThread(int pc, NCBlockDispatchId dispatch) noexcept
+{
+    m_edm149Confirmation = EDM149Confirmation{};
+    const auto* authored = GetBaseProgramCache().TryGetLine(pc);
+    const auto& transaction = m_gmBlockTransaction.snapshot;
+    if (!transaction.active || !transaction.fromMainProgram || transaction.sourcePC != pc ||
+        transaction.dispatchId != dispatch || transaction.phase != NCGMBlockTransactionPhase::READY_TO_FINALIZE ||
+        transaction.postAction != NCGMBlockPostAction::PROGRAM_STOP_M00 ||
+        m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY || !m_macroStack.empty() ||
+        m_edm94.latched || !authored || !IsEDM149ConfirmationBlockSameThread(authored->parsedBlock,pc) ||
+        !dispatch || !m_pathCoreLiveBookkeeping.currentRunToken ||
+        !GetBaseProgramCache().GetGeneration() || m_isSingleBlockEnabled || AlarmManager::GetInstance().HasAlarm()) return;
+    auto& c = m_edm149Confirmation;
+    c.run = m_pathCoreLiveBookkeeping.currentRunToken; c.cache = GetBaseProgramCache().GetGeneration();
+    c.dispatch = dispatch; c.armPC = pc + 1; c.startRequests = m_startDiagnosticRequests;
+    const auto* arm = GetBaseProgramCache().TryGetLine(c.armPC);
+    std::uint32_t selected = 0U;
+    if (!arm || !EDM77::Detail::UnsignedLiteral(arm->parsedBlock.expression('P'),292U,selected) ||
+        (!EDM149::IsTestArm(selected) && selected!=292U)) { c=EDM149Confirmation{}; return; }
+    c.arm = selected; c.waiting = true;
+    RtPrintf("[%s] event=OPERATOR_CONFIRMATION result=WAIT_M00_START armPC=%d run=%llu cache=%llu M00dispatch=%llu motionEnabled=0 physicalInterlock=0 discharge=0\n",
+        EDM149::IsSixVisibleFlushTestArm(c.arm) ? "EDM167" : EDM149::IsXYZVisibleFlushTestArm(c.arm) ? "EDM159" : EDM149::IsVisibleFlushTestArm(c.arm) ? "EDM158" : EDM149::IsPauseTestArm(c.arm) ? "EDM157" : EDM149::IsBoundedProgramTestArm(c.arm) ? "EDM156" : EDM149::IsSparseArcTestArm(c.arm) ? "EDM155" : EDM149::IsSparseTestArm(c.arm) ? "EDM154" : EDM149::IsOrderTestArm(c.arm) ? "EDM153" : EDM149::IsArcTestArm(c.arm) ? "EDM152" : EDM149::IsSixTestArm(c.arm) ? "EDM151" : "EDM149", c.armPC,static_cast<unsigned long long>(c.run),static_cast<unsigned long long>(c.cache),static_cast<unsigned long long>(c.dispatch));
+}
+
+void NCManager::CommitEDM149ConfirmationResumeSameThread() noexcept
+{
+    auto& c = m_edm149Confirmation;
+    if (!c.waiting) return;
+    if (m_state != NCState::RUN || m_mode != NCOperationMode::MEMORY || !m_macroStack.empty() ||
+        c.run != m_pathCoreLiveBookkeeping.currentRunToken || c.cache != GetBaseProgramCache().GetGeneration() ||
+        GetBasePC() != c.armPC || m_startDiagnosticRequests <= c.startRequests || m_isSingleBlockEnabled ||
+        m_waitCallback != WaitForCycleStartCallback || AlarmManager::GetInstance().HasAlarm() ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))
+    { c = EDM149Confirmation{}; return; }
+    const auto* arm = GetBaseProgramCache().TryGetLine(c.armPC);
+    if (!arm || !EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('P'),c.arm))
+    { c = EDM149Confirmation{}; return; }
+    c.waiting = false; c.confirmed = true; c.startRequests = m_startDiagnosticRequests;
+    if (c.arm==292U) { m_g76PowerInhibited=true; ForceEDMPLCOutputsOffSameThread("EDM173_CONFIRMED"); }
+    RtPrintf("[%s] event=OPERATOR_CONFIRMATION result=START_CONFIRMED armPC=%d run=%llu cache=%llu M00dispatch=%llu physicalInterlock=0 discharge=0\n",
+        EDM149::IsSixVisibleFlushTestArm(c.arm) ? "EDM167" : EDM149::IsXYZVisibleFlushTestArm(c.arm) ? "EDM159" : EDM149::IsVisibleFlushTestArm(c.arm) ? "EDM158" : EDM149::IsPauseTestArm(c.arm) ? "EDM157" : EDM149::IsBoundedProgramTestArm(c.arm) ? "EDM156" : EDM149::IsSparseArcTestArm(c.arm) ? "EDM155" : EDM149::IsSparseTestArm(c.arm) ? "EDM154" : EDM149::IsOrderTestArm(c.arm) ? "EDM153" : EDM149::IsArcTestArm(c.arm) ? "EDM152" : EDM149::IsSixTestArm(c.arm) ? "EDM151" : "EDM149", c.armPC,static_cast<unsigned long long>(c.run),static_cast<unsigned long long>(c.cache),static_cast<unsigned long long>(c.dispatch));
+}
+
+bool NCManager::ConsumeEDM149ConfirmationSameThread(int armPC) noexcept
+{
+    const auto c = m_edm149Confirmation;
+    m_edm149Confirmation = EDM149Confirmation{};
+    return c.confirmed && !c.waiting && c.run && c.run == m_pathCoreLiveBookkeeping.currentRunToken &&
+        c.cache && c.cache == GetBaseProgramCache().GetGeneration() && c.armPC == armPC && armPC > 0 &&
+        c.arm == m_edm94.gapHistoryArm && (EDM149::IsTestArm(c.arm) || c.arm==292U) &&
+        GetBasePC() == armPC && m_mode == NCOperationMode::MEMORY && m_state == NCState::RUN &&
+        c.dispatch && m_currentExecutingBlockDispatchId > c.dispatch && c.startRequests == m_startDiagnosticRequests &&
+        m_macroStack.empty() && !m_isSingleBlockEnabled && !AlarmManager::GetInstance().HasAlarm();
+}
+
+// EDM173 is one authored compound instruction. These NC receipts authorize no
+// output by themselves; the existing RT GAP/coordinator/guard owns each sample.
+bool NCManager::IsEDM173BracketShapeValid(const NCBlock& b) noexcept
+{
+    if (b.isEmpty || b.isGoto || b.isBlockSkip || !b.hasG || b.gCode!=180 || b.gCount!=1 ||
+        b.gCodes[0]!=180 || b.mCount || !b.has('P') || (b.val('P')!=292.0 && b.val('P')!=293.0)) return false;
+    const bool arm=b.val('P')==292.0;
+    for(char word='A';word<='Z';++word)
+        if(b.has(word) && (!std::isfinite(b.val(word)) ||
+            (word!='N' && word!='P' && (!arm || (word!='Q' && word!='R' && word!='S' && word!='I' && word!='J' && word!='K'))))) return false;
+    return !arm || (b.has('Q')&&b.has('R')&&b.has('S')&&b.has('I')&&b.has('J')&&b.has('K')&&
+        b.val('Q')==8.0&&b.val('R')==1.0&&b.val('S')==1.0&&b.val('I')==10.0&&b.val('J')==50.0&&b.val('K')==100.0);
+}
+
+bool NCManager::IsEDM173OrbitBlockShapeValid(const NCBlock& b) noexcept
+{
+    if(b.isEmpty||b.isGoto||b.isBlockSkip||!b.hasG||b.gCode!=76||b.gCount!=1||b.gCodes[0]!=76||b.mCount||
+        !b.has('P')||b.val('P')!=11.0||!b.has('R')||!b.has('F')||b.val('F')!=0.12||
+        !b.has('B')||b.val('B')!=1.0||!(b.has('X')||b.has('Y')||b.has('Z'))) return false;
+    double travel=0.0;
+    for(char word='A';word<='Z';++word) if(b.has(word))
+    {
+        if(!std::isfinite(b.val(word))||(word!='N'&&word!='P'&&word!='R'&&word!='F'&&word!='B'&&word!='X'&&word!='Y'&&word!='Z')) return false;
+        if(word=='X'||word=='Y'||word=='Z') travel=std::hypot(travel,b.val(word));
+    }
+    return b.val('R')>0.0&&b.val('R')<=0.005&&std::isfinite(travel)&&travel<=0.005;
+}
+
+bool NCManager::IsEDM173BracketBlockSameThread(const NCBlock& b) const noexcept
+{
+    if(!IsEDM173BracketShapeValid(b)||m_mode!=NCOperationMode::MEMORY||m_state!=NCState::RUN||Close_System_Com_flag||
+        !m_externalReadyInterlock||m_isSingleBlockEnabled||m_isG66Active||!m_macroStack.empty()||Homing.IsActive()||
+        AlarmManager::GetInstance().HasAlarm()||m_motion.HasPendingSafetyOrRecoveryRequests()||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease)) return false;
+    const auto& s=m_edm94; const int pc=GetActiveDispatchPC();
+    if(b.val('P')==292.0)
+    {
+        const auto& c=m_edm149Confirmation;
+        return !s.latched&&c.confirmed&&!c.waiting&&c.arm==292U&&c.armPC==pc&&
+            c.run==m_pathCoreLiveBookkeeping.currentRunToken&&c.cache==GetBaseProgramCache().GetGeneration()&&
+            c.startRequests==m_startDiagnosticRequests&&c.dispatch&&m_currentExecutingBlockDispatchId>c.dispatch;
+    }
+    return s.latched&&s.gapHistoryArm==292U&&s.ready&&!s.cancelled&&!s.armPending&&!s.finishPending&&!s.complete&&
+        s.run==m_pathCoreLiveBookkeeping.currentRunToken&&s.cache==GetBaseProgramCache().GetGeneration()&&
+        s.lease.Matches(m_programMotionLease)&&s.moves==1U&&pc==s.pc[1U]&&m_edm173->completed;
+}
+
+bool NCManager::FreezeEDM173TranslationSameThread()
+{
+    if(!IsG76OrbitFrameCurrentSameThread()||!IsPathCoreLiveNativeConfigCurrentSameThread()||
+        !IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot())||CoordSys.GetTranslationSnapshot().distanceMode!=91||
+        CoordSys.GetTranslationSnapshot().unitsMode!=21) return false;
+    if(CoordSys.IsTranslationRunFrozen())
+        return IsFixedTranslationTravelCurrentSameThread()&&m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot());
+    const auto candidate=CoordSys.GetTranslationSnapshot();
+    if(!CoordSys.FreezeTranslationRun()) return false;
+    for(unsigned axisIndex=0U;axisIndex<8U;++axisIndex)
+    {
+        const auto& axis=m_motion.GetAxisContext(static_cast<int>(axisIndex));auto& captured=m_fixedTranslationTravel[axisIndex];
+        captured.minimum[0]=axis.travelLimit1Negative_unit;captured.minimum[1]=axis.travelLimit2Negative_unit;captured.minimum[2]=axis.travelLimit3Negative_unit;
+        captured.maximum[0]=axis.travelLimit1Positive_unit;captured.maximum[1]=axis.travelLimit2Positive_unit;captured.maximum[2]=axis.travelLimit3Positive_unit;
+        captured.enabled[0]=axis.travelLimit1Enable;captured.enabled[1]=axis.travelLimit2Enable;captured.enabled[2]=axis.travelLimit3Enable;
+        captured.homed=axis.isHomed;captured.positionalRotary=axis.isExist&&axis.axisType==AxisType::ROTARY;
+        captured.shortestPath=axis.useShortestPath;captured.rotaryModulo=axis.rotaryModulo;captured.maximumVelocity=axis.maxVel_PPS;
+        captured.accelerationTime=axis.G00_acc_time;captured.decelerationTime=axis.G00_dec_time;captured.stopDecelerationTime=axis.Stop_dec_time;
+    }
+    const auto frozen=CoordSys.GetTranslationSnapshot();m_fixedTranslationTravelGeneration=frozen.generation;
+    return SameNCTranslationSnapshot(candidate,frozen)&&m_motion.PublishNCTranslation(frozen);
+}
+
+bool NCManager::PreflightEDM173ProgramSameThread(int armPC) noexcept
+{
+    const auto& cache=GetBaseProgramCache();
+    if(armPC<1||cache.Size()>128U||static_cast<std::size_t>(armPC)+3U>=cache.Size()) return false;
+    NCBlock orbit{},finish{},end{};
+    const auto* a=cache.TryGetLine(armPC+1);const auto* b=cache.TryGetLine(armPC+2);const auto* c=cache.TryGetLine(armPC+3);
+    if(!a||!b||!c||!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(a->parsedBlock,orbit)||
+        !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(b->parsedBlock,finish)||
+        !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(c->parsedBlock,end)||!IsEDM173OrbitBlockShapeValid(orbit)||
+        !IsEDM173BracketShapeValid(finish)||finish.val('P')!=293.0||end.gCount||end.mCount!=1||end.mCode[0]!=30||
+        end.isGoto||end.isBlockSkip) return false;
+    for(char word='A';word<='Z';++word) if(end.has(word)&&(word!='N'||!std::isfinite(end.val(word)))) return false;
+    for(std::size_t pc=static_cast<std::size_t>(armPC)+4U;pc<cache.Size();++pc)
+    {const auto* line=cache.TryGetLine(static_cast<int>(pc));if(!line||!line->parsedBlock.isEmpty) return false;}
+    m_edm173->authored=orbit; m_edm173->prepared=true;m_edm173->published=m_edm173->parentCommitted=m_edm173->completed=false;
+    return true;
+}
+
+bool NCManager::BindEDM173RecipeSameThread() noexcept
+{
+    m_edm130=EDM130NCState{};EDMRecipe::Summary summary{};
+    if(!m_edmProcessReady||!ReadEDMRecipeSummarySameThread(summary)) return false;
+    const auto binding=EDM130::BindG76Gap173(m_recipe,
+        m_edmProcessProfile.machineProfileId,m_edmProcessProfile,m_edmProcessTuningGeneration);
+    if(!binding.ready) return false;
+    auto& recipe=m_edm130.recipe;recipe=binding.recipe;recipe.diagnosticControlSource=3U;recipe.planRows=25U;recipe.planMovementMask=7U;
+    if(!EDM130::ValidRecipe(recipe)||recipe.commissioningProfile!=4U||recipe.jumpHeightScaled!=2000000ULL||
+        recipe.jumpSpeedPercentScaled!=100000000ULL||recipe.workTimeUs<250000ULL||recipe.workTimeUs>2000000ULL||
+        recipe.deepFlushCycleInterval||recipe.holdRetreatMode||recipe.flushHoldTest||
+        !EDM97::ValidMotionTestCurve(m_edm94.gapTuning,recipe)) return false;
+    m_edm94.gapFlushParameters.speedRatio=EDM130::FrozenSpeedRatio(recipe);
+    if(!EDM130::MatchesFlushSpeed(recipe,m_edm94.gapFlushParameters.speedRatio)||
+        !EDM130::MatchesFlushHeight(recipe,m_edm94.gapFlushParameters.strokeRatio,m_edm94.gapFlushParameters.dwellUs)) return false;
+    m_edm130.bound=true;return true;
+}
+
+bool NCManager::IsEDM173OrbitAllowedSameThread(const NCBlock& b) noexcept
+{
+    const auto& s=m_edm94;const auto& w=*m_edm173;const int pc=GetActiveDispatchPC();
+    bool valid=IsEDM173OrbitBlockShapeValid(b)&&s.latched&&s.gapHistoryArm==292U&&s.ready&&s.everArmed&&
+        !s.armPending&&!s.cancelled&&!s.resetSeen&&!s.releaseRequested&&!s.finishPending&&!s.complete&&!s.rtFaultReported&&
+        s.moves==1U&&s.next==1U&&pc==s.pc[0U]&&s.run==m_pathCoreLiveBookkeeping.currentRunToken&&
+        s.cache==GetBaseProgramCache().GetGeneration()&&s.lease.Matches(m_programMotionLease)&&w.prepared&&!w.published&&
+        m_state==NCState::RUN&&m_mode==NCOperationMode::MEMORY&&!Close_System_Com_flag&&m_externalReadyInterlock&&
+        !m_isSingleBlockEnabled&&!m_isG66Active&&m_macroStack.empty()&&!Homing.IsActive()&&!AlarmManager::GetInstance().HasAlarm()&&
+        m_motion.IsMotionOwnerLeaseCurrent(s.lease)&&!m_motion.HasPendingSafetyOrRecoveryRequests()&&
+        !m_g76Orbit->active&&!m_pathFeed.pending&&!m_pathArc.pending&&!m_pathReplay.pending&&!m_pathHold.armed&&!m_pathHold.bound&&
+        IsG76OrbitFrameCurrentSameThread()&&IsPathCoreLiveNativeConfigCurrentSameThread();
+    const auto* authored=GetBaseProgramCache().TryGetLine(pc);
+    valid=valid&&authored&&E94Matches(authored->parsedBlock,b);
+    for(char word='A';word<='Z'&&valid;++word)
+        valid=b.has(word)==w.authored.has(word)&&(!b.has(word)||EDM109::SameDouble(b.val(word),w.authored.val(word)));
+    return valid;
+}
+
+bool NCManager::GuardEDM173BlockSameThread(const NCBlock& b,int pc,int line)
+{
+    auto& s=m_edm94;const auto* source=GetBaseProgramCache().TryGetLine(pc);
+    if(!source||!E94Matches(source->parsedBlock,b)) {RejectEDM94SameThread("EDM173_LITERAL_SCOPE",line);return false;}
+    if(b.isEmpty) return true;
+    bool valid=s.latched&&s.gapHistoryArm==292U&&!s.cancelled&&!s.armPending&&!s.releaseRequested&&
+        s.moves==1U&&s.next<3U&&s.run==m_pathCoreLiveBookkeeping.currentRunToken&&s.cache==GetBaseProgramCache().GetGeneration()&&
+        s.lease.Matches(m_programMotionLease)&&m_motion.IsMotionOwnerLeaseCurrent(s.lease)&&pc==s.pc[s.next]&&(s.next<2U?s.ready:s.complete);
+    if(valid&&s.next==0U) valid=IsEDM173OrbitBlockShapeValid(b)&&m_edm173->prepared&&!m_edm173->published;
+    else if(valid&&s.next==1U) valid=IsEDM173BracketShapeValid(b)&&b.val('P')==293.0&&m_edm173->completed&&!m_g76Orbit->active;
+    else if(valid) valid=s.complete&&s.terminalLogged&&b.gCount==0&&b.mCount==1&&b.mCode[0]==30;
+    if(!valid){RejectEDM94SameThread("EDM173_BLOCK_ORDER_OR_COMPLETION",line);return false;}
+    ++s.next;return true;
+}
+
+WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
+{
+    const int pc=GetActiveDispatchPC();const auto* authored=GetBaseProgramCache().TryGetLine(pc);
+    if(!authored||!E94Matches(authored->parsedBlock,b)||!IsEDM173BracketBlockSameThread(b))
+    {RejectEDM94SameThread("EDM173_BRACKET_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    if(b.val('P')==293.0)
+    {
+        auto& s=m_edm94;
+        if(s.next!=2U||!m_edm173->completed||!E156FinishTargetMatches(s,m_edm130.recipe,s.feedback,m_edm114.retained)||
+            !m_motion.IsGroupDone()||!m_motion.IsGroupNCDrained()||m_g76Orbit->active)
+        {RejectEDM94SameThread("EDM173_FINAL_PARENT_OR_TARGET",m_gapDryRun.sourceLine);return nullptr;}
+        s.ready=false;s.finishPending=true;s.polls=0U;m_motion.RequestEDM94Finish(s.session);
+        RtPrintf("[EDM173] event=FINISH_REQUEST session=%llu children=25 E5completed=1 await=PHYSICAL_ZERO_200 discharge=0\n",static_cast<unsigned long long>(s.session));
+        return [](NCManager* n){return n->WaitEDM173SameThread();};
+    }
+    if(m_edm94.latched||!m_pathFeed.armed||m_pathFeed.run!=m_pathCoreLiveBookkeeping.currentRunToken||
+        m_pathFeed.cache!=GetBaseProgramCache().GetGeneration()||!PreflightEDM173ProgramSameThread(pc)||
+        !m_programMotionLease.IsValid()||m_programMotionLease.owner!=MotionOwner::AUTO||
+        !m_motion.IsGroupDone()||!m_motion.IsGroupNCDrained()||m_motion.GetCommandIngressSize()||m_motion.GetCommandReplaySize()||
+        m_motion.GetAxisCommandMailboxDepth()||m_gapDryRun.active||m_gapPath.active||m_gapWindow.active||
+        m_pathFeed.pending||m_pathArc.pending||m_pathReplay.pending||m_pathHold.armed||m_pathHold.bound||
+        m_cncFeed.active||m_cncFeed.selected||m_cncFeed.count||m_cutterLine.leadOutRequired||
+        m_edm94Serial==(std::numeric_limits<std::uint64_t>::max)()||!FreezeEDM173TranslationSameThread())
+    {RejectEDM94SameThread("EDM173_ARM_NOT_READY",m_gapDryRun.sourceLine);return nullptr;}
+    const auto inspected=GetBaseProgramCache().GetGeneration();m_edm94=EDM94NCState{};auto& s=m_edm94;
+    s.program=true;s.inspectedCache=inspected;s.gapHistoryArm=292U;s.gapWorkTime=true;s.moves=1U;s.authoredGCode[0U]=76U;s.feed[0U]=0.12;
+    s.pc[0U]=pc+1;s.pc[1U]=pc+2;s.pc[2U]=pc+3;s.armPC=pc;s.armDispatch=m_currentExecutingBlockDispatchId;
+    s.session=++m_edm94Serial;s.run=m_pathCoreLiveBookkeeping.currentRunToken;s.cache=inspected;
+    s.armEpoch=m_motion.GetCurrentExecutionEpoch();s.lease=m_programMotionLease;s.gapTuning={8.0,1.0,1.0};
+    if(!EDM107::ParseFlushProfile(10.0,50.0,100.0,s.gapFlushParameters)||!BindEDM173RecipeSameThread()||!ConsumeEDM149ConfirmationSameThread(pc))
+    {RejectEDM94SameThread("EDM173_RECIPE_OR_CONFIRMATION",m_gapDryRun.sourceLine);return nullptr;}
+    auto& w=*m_edm173;NCG76::PlanInput input{};input.radiusMm=w.authored.val('R');input.feedMmMin=0.12;
+    for(unsigned axis=0U;axis<3U;++axis)input.end[axis]=w.authored.has("XYZ"[axis])?w.authored.val("XYZ"[axis]):0.0;
+    NCG76::Point8 start{};for(unsigned axis=0U;axis<8U;++axis)start[axis]=CoordSys.commandedMCS[axis];
+    NCG76::ProgramPlan& program=m_g76Orbit->program;
+    if(!NCG76::Build(input,program)||!NCG76::BuildNative(program,CoordSys.GetTranslationSnapshot(),start,w.nominal)||w.nominal.count!=25U)
+    {RejectEDM94SameThread("EDM173_NOMINAL_PLAN",m_gapDryRun.sourceLine);return nullptr;}
+    w.loggedTriggers=w.loggedCompletions=0ULL;w.loggedPhase=0U;w.retained=EDM173::Feedback{};
+    m_g76PowerInhibited=true;ForceEDMPLCOutputsOffSameThread("EDM173_ARM");
+    if(!m_motion.SubmitEDM173Arm(s.session,s.armEpoch,s.lease,s.gapTuning,s.gapFlushParameters,m_edm130.recipe))
+    {RejectEDM94SameThread("EDM173_ARM_PUBLICATION",m_gapDryRun.sourceLine);return nullptr;}
+    s.latched=s.armPending=true;
+    RtPrintf("[EDM173] event=ARM_REQUEST session=%llu run=%llu cache=%llu armEpoch=%llu source=AUTO_WAVE ADrequired=0 parentPC=%d children=25 E5us=%llu E6microMm=2000000 motion=REAL_ETHERCAT S92=0 S93=0 coreBuild=%u p50Bulk=QUIET timing=ON rtEvidence=ON\n",
+        static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.run),static_cast<unsigned long long>(s.cache),
+        static_cast<unsigned long long>(s.armEpoch),s.pc[0U],static_cast<unsigned long long>(m_edm130.recipe.workTimeUs),
+        static_cast<unsigned>(m_motion.GetEDM173ImplementationRevision()));
+    return [](NCManager* n){return n->WaitEDM173SameThread();};
+}
+
+WaitConditionFunc NCManager::StartEDM173OrbitSameThread(const NCBlock& b)
+{
+    if(m_currentExecutingBlockDispatchId<=m_edm94.armDispatch||!IsEDM173OrbitAllowedSameThread(b)||!FreezeEDM173TranslationSameThread()||!IsPathCoreFeedConfigurationValid()||
+        !IsFixedTranslationTravelCurrentSameThread()||!m_motion.IsGroupDone()||!m_motion.IsGroupNCDrained()||
+        m_motion.GetCommandIngressSize()||m_motion.GetCommandReplaySize())
+    {RejectEDM94SameThread("EDM173_PARENT_ADMISSION",m_gapDryRun.sourceLine);return nullptr;}
+    ResetG76OrbitStateSameThread();auto& g=*m_g76Orbit;auto& w=*m_edm173;const auto& s=m_edm94;
+    g.run=s.run;g.cache=s.cache;g.dispatch=m_currentExecutingBlockDispatchId;g.pc=GetActiveDispatchPC();
+    const auto* source=GetBaseProgramCache().TryGetLine(g.pc);g.line=source?source->sourceLineNumber:0;g.mode=1U;g.sourceG=76;
+    if(!CaptureCncFeedValueSameThread(b,g.feed)||g.feed.feedMMMin!=0.12)
+    {RejectEDM94SameThread("EDM173_FEED_SCOPE",g.line);return nullptr;}
+    g.native=w.nominal;g.program=w.nominal.program;
+    EDM173::Scope scope{};scope.session=s.session;scope.run=s.run;scope.cache=s.cache;scope.dispatch=g.dispatch;
+    scope.sourcePC=g.pc;scope.line=g.line;scope.armEpoch=s.armEpoch;scope.owner=s.lease;
+    if(!EDM173::Build(scope,w.nominal,m_edm130.recipe,s.gapTuning,w.plan))
+    {RejectEDM94SameThread("EDM173_PLAN_SCOPE",g.line);return nullptr;}
+    const bool accepted=m_motion.TryG76GapMoveTransactionalTail(w.plan,CoordSys.commandedMCS,g.receipt);const auto& r=g.receipt;
+    bool valid=accepted&&r.valid&&r.commandAccepted&&r.captureBound&&r.tailCommitted&&r.count==25U&&r.axisMask==7U&&
+        r.ownerLease.Matches(s.lease)&&r.translationGeneration==w.nominal.translationGeneration&&
+        r.tail.IsCommitted()&&r.tail.captureBound&&r.tail.endpointExact&&r.tail.accountingValid&&
+        r.tail.axisMask==r.validAxisMask&&r.tail.ownerLease.Matches(r.ownerLease)&&
+        r.validAxisMask!=0U&&(r.validAxisMask&7U)==7U;
+    for(unsigned k=0U;k<25U&&valid;++k)
+    {
+        const auto& id=r.identities[k];valid=id.IsAssigned()&&id.epoch==m_motion.GetCurrentExecutionEpoch()&&
+            id.source==MotionCommandSource::NC_MEMORY&&id.sourceBlockId==static_cast<MotionSourceBlockId>(g.pc)&&
+            (!k||id.segmentId>r.identities[k-1U].segmentId);
+        for(unsigned axis=0U;axis<8U&&valid;++axis)valid=EDM109::SameDouble(r.legEndMCS[k][axis],w.nominal.pointsMCS[k][axis]);
+    }
+    valid=valid&&EDM173::BuildNominal(w.plan,r.startPulse,r.pulsePerUnit,w.canonical)&&w.canonical.count==25U;
+    for(unsigned k=0U;k<25U&&valid;++k)
+        for(unsigned axis=0U;axis<8U&&valid;++axis)
+            valid=EDM109::SameDouble(r.legEndPulse[k][axis],w.canonical.geometry[k].endPulse[axis]);
+    valid=valid&&r.tail.identity.Matches(r.identities[24U])&&r.tail.identity.source==r.identities[24U].source&&
+        r.tail.identity.sourceBlockId==r.identities[24U].sourceBlockId;
+    for(unsigned axis=0U;axis<8U&&valid;++axis)
+        valid=EDM109::SameDouble(r.startMCS[axis],w.nominal.startMCS[axis])&&
+            EDM109::SameDouble(r.endMCS[axis],w.nominal.pointsMCS[24U][axis])&&
+            EDM109::SameDouble(CoordSys.commandedMCS[axis],r.endMCS[axis])&&
+            EDM109::SameDouble(r.endPulse[axis],w.canonical.geometry[24U].endPulse[axis]);
+    if(!valid)
+    {
+        RtPrintf("[EDM173_FIX1] event=PARENT_REJECT session=%llu parentPC=%d accepted=%u gate=%s reason=%u axis=%d segment=%d discharge=0\n",
+            static_cast<unsigned long long>(s.session),g.pc,accepted?1U:0U,MotionG76AdmissionGateName(r.rejectionGate),
+            static_cast<unsigned>(r.rejectionReason),r.rejectionAxis,r.rejectionSegment);
+        RejectG76OrbitSameThread("EDM173_NATIVE_RECEIPT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);return nullptr;
+    }
+    g.active=true;w.published=true;
+    RtPrintf("[EDM173] event=PARENT_PUBLISHED session=%llu parentPC=%d dispatch=%llu children=25 fingerprint=%llu trigger=E5_COMMITTED_MACHINING_TIME discharge=0\n",
+        static_cast<unsigned long long>(s.session),g.pc,static_cast<unsigned long long>(g.dispatch),static_cast<unsigned long long>(w.plan.fingerprint));
+    return [](NCManager* n){return n->CompleteG76OrbitSameThread();};
+}
+
+bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
+{
+    auto& w=*m_edm173;const auto& s=m_edm94;const auto& g=*m_g76Orbit;
+    if(!w.published||!w.parentCommitted||!EDM173::Valid(w.plan)||!s.latched||s.gapHistoryArm!=292U||s.cancelled||
+        s.resetSeen||s.releaseRequested||s.rtFaultReported||s.run!=g.run||s.cache!=g.cache||!s.lease.Matches(g.receipt.ownerLease)) return false;
+    EDM173::Feedback feedback{};EDM126::MotionFeedback history{};EDM128::MotionFeedback timed{};EDM114::Feedback geometry{};
+    if(!m_motion.ReadEDM173Feedback(feedback)||!m_motion.ReadEDM126Feedback(history)||!m_motion.ReadEDM130Feedback(timed)||
+        !m_motion.ReadEDM114Feedback(geometry)) return false;
+    const auto& scope=feedback.scope;const auto& plan=w.plan;const auto& e=feedback.completedEvent;
+    const bool identity=scope.session==s.session&&scope.run==s.run&&scope.cache==s.cache&&scope.dispatch==g.dispatch&&
+        scope.sourcePC==g.pc&&scope.line==g.line&&scope.armEpoch==s.armEpoch&&scope.owner.Matches(s.lease)&&
+        feedback.fingerprint==plan.fingerprint&&feedback.liveEpoch==m_motion.GetCurrentExecutionEpoch();
+    if(!identity||!feedback.enabled||!feedback.active||feedback.faulted||!feedback.tick||!feedback.eventRetained||
+        feedback.authorizedChildren!=25U||feedback.completedChildren!=25U||!history.enabled||history.faulted||history.physicalAd||
+        history.session!=s.session||history.armEpoch!=s.armEpoch||history.liveEpoch!=feedback.liveEpoch||history.ownerGeneration!=s.lease.generation||
+        history.fixture!=14U||history.reason!=EDM126::Reason::None||!history.tick||!history.nowUs||!history.sourceSequence||history.authorizedRows!=25U||history.completedRows!=25U||history.rowActive||!history.rowCompleted||
+        !history.sourceReady||history.sourceReason!=EDM88::Reason::None||!history.sourceCapturedUs||
+        history.nowUs<history.sourceCapturedUs||history.nowUs-history.sourceCapturedUs>EDM126::MaximumSourceAgeUs||
+        !timed.enabled||timed.faulted||!timed.workTimeFlush||timed.physicalAd||timed.session!=s.session||timed.armEpoch!=s.armEpoch||
+        timed.liveEpoch!=feedback.liveEpoch||timed.ownerGeneration!=s.lease.generation||timed.fixture!=14U||
+        timed.authorizedRows!=25U||timed.completedRows!=25U||!EDM130::SameRecipe(timed.timerRecipe,m_edm130.recipe)) return false;
+    const auto& cursor=history.traversal;const auto& last=g.receipt.identities[24U];
+    if(cursor.faulted||cursor.stopRequested||cursor.stopped||!cursor.completeReady||cursor.historyDepth||cursor.velocityMmSec!=0.0||
+        cursor.authorizedSource.ordinal!=24U||cursor.authorizedSource.dispatch!=g.dispatch||cursor.authorizedSource.sourcePC!=g.pc||
+        cursor.authorizedSource.segment!=last.segmentId||cursor.authorizedSource.epoch!=last.epoch||
+        !EDM126::SameSource(cursor.authorizedSource,cursor.cursorSource)||
+        e.policy.mode!=EDM116::Mode::B1||e.policy.fixture!=EDM116::Fixture::ModalG76Gap173||
+        e.eventCount!=1U||e.modeEvents[1U]!=1U||e.modeEvents[0U]||e.modeEvents[2U]||
+        e.work.triggeredEvents!=1ULL||e.work.completedEvents!=1ULL||!e.exactReturn||!e.rowEventComplete||
+        !EDM128::ValidHeightProof(e,2.0,0U,1.0,true)||!EDM128::ValidSpeedProof(e,m_edm130.recipe.flushStages)||
+        timed.coordinator.work.triggeredEvents!=1ULL||timed.coordinator.work.completedEvents!=1ULL||
+        timed.coordinator.eventCount!=1U||timed.coordinator.modeEvents[1U]!=1U) return false;
+    const auto& work=e.work;const auto& finalWork=timed.coordinator.work;
+    if(work.workTimeUs!=plan.recipe.workTimeUs||finalWork.workTimeUs!=plan.recipe.workTimeUs||
+        work.lastTriggerElapsedUs!=finalWork.lastTriggerElapsedUs||work.lastTriggerTotalUs!=finalWork.lastTriggerTotalUs||
+        work.lastTriggerTick!=finalWork.lastTriggerTick||work.lastTriggerUs!=finalWork.lastTriggerUs||
+        work.lastCompleteTick!=finalWork.lastCompleteTick||work.lastCompleteUs!=finalWork.lastCompleteUs||
+        work.lastCompleteTick>feedback.tick||work.lastCompleteTick>history.tick||work.lastCompleteUs>history.nowUs||
+        !EDM130::ValidWorkEvidence(finalWork)) return false;
+    const auto& anchor=e.anchor.authorizedSource;const auto& anchorCursor=e.anchor.cursorSource;
+    const unsigned authorizedChild=static_cast<unsigned>(anchor.ordinal),child=static_cast<unsigned>(anchorCursor.ordinal);
+    const auto sourceFits=[&](const EDM126::Source& source,unsigned ordinal) noexcept {
+        return ordinal<25U&&source.ordinal==ordinal&&source.scope.session==s.session&&source.scope.run==s.run&&
+            source.scope.cache==s.cache&&source.scope.ownerGeneration==s.lease.generation&&
+            source.scope.translationGeneration==plan.nominal.translationGeneration&&source.scope.configTag&&source.scope.mappingTag&&
+            source.dispatch==g.dispatch&&source.sourcePC==g.pc&&source.epoch==g.receipt.identities[ordinal].epoch&&
+            source.segment==g.receipt.identities[ordinal].segmentId;
+    };
+    if(!sourceFits(cursor.authorizedSource,24U)||!sourceFits(anchor,authorizedChild)||!sourceFits(anchorCursor,child)||
+        child>authorizedChild||!EDM109::SameScope(anchor.scope,anchorCursor.scope)||
+        !EDM109::SameScope(anchor.scope,cursor.authorizedSource.scope)||
+        !EDM116::PolicyMatchesBinding(e.policy,authorizedChild,g.pc,g.dispatch)) return false;
+    EDM126::Point anchorStart{},anchorEnd{},anchorScale{},expectedAnchor{};
+    for(unsigned axis=0U;axis<6U;++axis)
+    {
+        anchorStart[axis]=child?g.receipt.legEndPulse[child-1U][axis]:g.receipt.startPulse[axis];
+        anchorEnd[axis]=g.receipt.legEndPulse[child][axis];anchorScale[axis]=g.receipt.pulsePerUnit[axis];
+    }
+    EDM109::Line anchorLine{};EDM112::Curve anchorCurve{};
+    if(!EDM109::BuildLine(anchorStart,anchorEnd,anchorScale,anchorLine)||!EDM112::BuildLine(anchorLine,anchorCurve)||
+        !std::isfinite(e.anchor.localMm)||e.anchor.localMm<0.0||e.anchor.localMm>anchorCurve.lengthMm||
+        !EDM112::EvaluateUnit(anchorCurve,e.anchor.localMm/anchorCurve.lengthMm,expectedAnchor)) return false;
+    for(unsigned axis=0U;axis<6U;++axis)
+    {
+        const double budget=64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(expectedAnchor[axis]));
+        if(!std::isfinite(e.anchor.positionPulse[axis])||std::fabs(e.anchor.positionPulse[axis]-expectedAnchor[axis])>budget) return false;
+    }
+    for(unsigned axis=0U;axis<6U;++axis)
+        if(!EDM109::SameDouble(cursor.positionPulse[axis],g.receipt.endPulse[axis])||
+            e.heightPulsePerNative[axis]!=g.receipt.pulsePerUnit[axis]) return false;
+    if(!geometry.enabled||geometry.failed||!geometry.completed||!geometry.rowComplete||geometry.completedRows!=25U||
+        geometry.session!=s.session||geometry.armEpoch!=s.armEpoch||geometry.ownerGeneration!=s.lease.generation||
+        geometry.source.scope.run!=s.run||geometry.source.scope.cache!=s.cache||geometry.source.dispatch!=g.dispatch||
+        geometry.source.sourcePC!=g.pc||geometry.source.step!=24U||geometry.source.segment!=last.segmentId||geometry.source.epoch!=last.epoch||
+        !geometry.geometryValid||!EDM109::SameScope(geometry.source.scope,cursor.authorizedSource.scope)) return false;
+    for(unsigned axis=0U;axis<6U;++axis)if(!EDM109::SameDouble(geometry.endPulse[axis],g.receipt.endPulse[axis])) return false;
+    w.retained=feedback;w.completed=true;m_edm114.retained=geometry;
+    RtPrintf("[EDM173] event=GAP_E5_VERIFIED session=%llu parentPC=%d children=25 triggered=1 completed=1 B1events=1 heightMicroMm=2000000 exactReturn=1 discharge=0\n",
+        static_cast<unsigned long long>(s.session),g.pc);
+    return true;
+}
+
+void NCManager::ServiceEDM173SameThread() noexcept
+{
+    auto& w=*m_edm173;EDM128::MotionFeedback f{};
+    if(!m_motion.ReadEDM130Feedback(f)||f.session!=m_edm94.session||f.armEpoch!=m_edm94.armEpoch||
+        f.ownerGeneration!=m_edm94.lease.generation||!EDM130::SameRecipe(f.timerRecipe,m_edm130.recipe)) return;
+    const auto& event=f.coordinator;
+    if(w.loggedTriggers==event.work.triggeredEvents&&w.loggedCompletions==event.work.completedEvents&&
+        w.loggedPhase==static_cast<unsigned>(event.phase)) return;
+    w.loggedTriggers=event.work.triggeredEvents;w.loggedCompletions=event.work.completedEvents;w.loggedPhase=static_cast<unsigned>(event.phase);
+    RtPrintf("[EDM173] event=E5_PROGRESS session=%llu child=%u phase=%s triggered=%llu completed=%llu retained=REAL_RT_MAPPING discharge=0\n",
+        static_cast<unsigned long long>(f.session),f.authorizedRows,EDM128::PhaseName(event.phase),
+        static_cast<unsigned long long>(event.work.triggeredEvents),static_cast<unsigned long long>(event.work.completedEvents));
+}
+
+bool NCManager::WaitEDM173SameThread()
+{
+    ServiceEDM94SameThread();auto& s=m_edm94;const auto& guard=s.feedback;
+    if(!s.latched||s.gapHistoryArm!=292U||s.cancelled||s.releaseRequested||m_state!=NCState::RUN) return false;
+    if(s.armPending)
+    {
+        EDM126::MotionFeedback source{};
+        if(guard.identity.session==s.session&&guard.identity.epoch==s.armEpoch&&guard.identity.ownerGeneration==s.lease.generation&&
+            guard.currentIdentity.session==s.session&&guard.currentIdentity.epoch==s.armEpoch&&
+            guard.currentIdentity.epoch==m_motion.GetCurrentExecutionEpoch()&&guard.currentIdentity.ownerGeneration==s.lease.generation&&
+            guard.active&&guard.armAccepted&&guard.armedReady&&!guard.forceZero&&!guard.faulted&&!guard.cancelled&&!guard.handoffZero&&
+            guard.boundaryReadyCycles>=EDM94::BoundaryReadyCycles&&!guard.boundaryNotReadyMask&&
+            m_motion.ReadEDM126Feedback(source)&&source.enabled&&source.active&&!source.faulted&&source.fixture==14U&&
+            source.session==s.session&&source.armEpoch==s.armEpoch&&source.liveEpoch==s.armEpoch&&source.ownerGeneration==s.lease.generation&&source.sourceReady&&
+            source.sourceReason==EDM88::Reason::None&&!source.authorizedRows&&!source.completedRows&&!source.rowActive)
+        {s.armPending=false;s.ready=s.everArmed=true;s.polls=0U;RtPrintf("[EDM173] event=ARMED session=%llu source=AUTO_WAVE commonGAP=1 E5=1 discharge=0\n",static_cast<unsigned long long>(s.session));return true;}
+    }
+    else if(s.finishPending&&m_edm173->completed&&E156FinishTargetMatches(s,m_edm130.recipe,guard,m_edm114.retained)&&
+        guard.identity.session==s.session&&guard.identity.epoch==s.armEpoch&&guard.identity.ownerGeneration==s.lease.generation&&
+        guard.active&&guard.pass&&guard.stopped&&guard.forceZero&&guard.finishRequested&&!guard.faulted&&!guard.cancelled&&
+        EDM94::MovementProven(guard,7U)&&guard.sentFrames>=200ULL&&guard.requiredCycles>=200U&&
+        guard.settledCycles>=guard.requiredCycles&&guard.lastSentTick&&guard.lastSentTick<=guard.lastTick&&m_motion.IsGroupDone())
+    {s.finishPending=false;s.complete=s.terminalLogged=true;LogEDM94SameThread("PASS","EDM173_G76_GAP_E5_ONE_EVENT_WAIT_M30");return true;}
+    if(++s.polls>1000U) RejectEDM94SameThread("EDM173_WAIT_TIMEOUT",m_gapDryRun.sourceLine);
+    return false;
 }

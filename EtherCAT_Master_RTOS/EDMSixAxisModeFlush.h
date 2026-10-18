@@ -21,25 +21,42 @@ enum class Mode : std::uint8_t { B0 = 0U, B1 = 1U, B2 = 2U, Invalid = 255U };
 // fixtures retain their original geometry, B modes and token checkpoints.
 enum class Fixture : std::uint8_t
 { Canonical116 = 0U, Complement117 = 1U, ArcPair124 = 2U, ArcPairComplement124 = 3U,
-  Modal127 = 4U, ModalComplement127 = 5U };
+  Modal127 = 4U, ModalComplement127 = 5U, ModalZ149 = 6U, ModalXYZ150 = 7U, ModalSix151 = 8U, ModalArc152 = 9U, ModalOrder153 = 10U, ModalSparse154 = 11U, ModalSparseArc155 = 12U, ModalProgram156 = 13U, ModalPause157 = 14U, ModalVisibleFlush158 = 15U, ModalXYZVisibleFlush159 = 16U, ModalSixVisibleFlush167 = 17U, ModalG76Gap173 = 18U };
+constexpr unsigned G76GapRows173 = 25U;
+inline unsigned PolicyRows(Fixture fixture) noexcept
+{ return fixture == Fixture::ModalG76Gap173 ? G76GapRows173 : EDM114::RequiredRows; }
 inline bool IsModalFixture(Fixture fixture) noexcept
-{ return fixture == Fixture::Modal127 || fixture == Fixture::ModalComplement127; }
+{ return fixture == Fixture::Modal127 || fixture == Fixture::ModalComplement127 || fixture == Fixture::ModalZ149 || fixture == Fixture::ModalXYZ150 || fixture == Fixture::ModalSix151 || fixture == Fixture::ModalArc152 || fixture == Fixture::ModalOrder153 || fixture == Fixture::ModalSparse154 || fixture == Fixture::ModalSparseArc155 || fixture == Fixture::ModalProgram156 || fixture == Fixture::ModalPause157 || fixture == Fixture::ModalVisibleFlush158 || fixture == Fixture::ModalXYZVisibleFlush159 || fixture == Fixture::ModalSixVisibleFlush167 || fixture == Fixture::ModalG76Gap173; }
+inline bool IsMotionTestFixture(Fixture fixture) noexcept
+{ return fixture == Fixture::ModalZ149 || fixture == Fixture::ModalXYZ150 || fixture == Fixture::ModalSix151 || fixture == Fixture::ModalArc152 || fixture == Fixture::ModalOrder153 || fixture == Fixture::ModalSparse154 || fixture == Fixture::ModalSparseArc155 || fixture == Fixture::ModalProgram156 || fixture == Fixture::ModalPause157 || fixture == Fixture::ModalVisibleFlush158 || fixture == Fixture::ModalXYZVisibleFlush159 || fixture == Fixture::ModalSixVisibleFlush167 || fixture == Fixture::ModalG76Gap173; }
+inline bool IsAuthoredOrderFixture(Fixture fixture) noexcept
+{ return fixture == Fixture::ModalOrder153 || fixture == Fixture::ModalSparse154 || fixture == Fixture::ModalSparseArc155 || fixture == Fixture::ModalProgram156 || fixture == Fixture::ModalPause157 || fixture == Fixture::ModalVisibleFlush158 || fixture == Fixture::ModalXYZVisibleFlush159 || fixture == Fixture::ModalSixVisibleFlush167; }
+inline bool IsBoundedArcFixture(Fixture fixture) noexcept
+{ return fixture == Fixture::ModalArc152 || IsAuthoredOrderFixture(fixture); }
 inline bool ValidFixture(Fixture fixture) noexcept
 { return fixture == Fixture::Canonical116 || fixture == Fixture::Complement117 ||
     fixture == Fixture::ArcPair124 || fixture == Fixture::ArcPairComplement124 || IsModalFixture(fixture); }
 inline bool IsArcPairFixture(Fixture fixture) noexcept
-{ return fixture == Fixture::ArcPair124 || fixture == Fixture::ArcPairComplement124 || IsModalFixture(fixture); }
+{ return fixture == Fixture::ArcPair124 || fixture == Fixture::ArcPairComplement124 ||
+    (IsModalFixture(fixture) && fixture != Fixture::ModalG76Gap173); }
 inline bool IsComplementFixture(Fixture fixture) noexcept
 { return fixture == Fixture::Complement117 || fixture == Fixture::ArcPairComplement124 ||
     fixture == Fixture::ModalComplement127; }
-inline bool IsArcStep(unsigned step, Fixture fixture = Fixture::Canonical116) noexcept
+inline bool IsArcStep(unsigned step, Fixture fixture = Fixture::Canonical116, int authoredCode = 0) noexcept
 {
-    return ValidFixture(fixture) && (EDM114::IsArcStep(step) ||
+    if (fixture == Fixture::ModalG76Gap173) return false;
+    if (IsAuthoredOrderFixture(fixture)) return step < EDM114::RequiredRows && (authoredCode == 2 || authoredCode == 3);
+    return ValidFixture(fixture) && fixture != Fixture::ModalZ149 && (EDM114::IsArcStep(step) ||
         (IsArcPairFixture(fixture) && (step == 4U || step == 5U)));
 }
-inline int ExpectedGCode(unsigned step, Fixture fixture = Fixture::Canonical116) noexcept
+inline int ExpectedGCode(unsigned step, Fixture fixture = Fixture::Canonical116, int authoredCode = 0) noexcept
 {
     if (!ValidFixture(fixture)) return 0;
+    if (fixture == Fixture::ModalG76Gap173) return step < G76GapRows173 ? 1 : 0;
+    // An authored-order row has no implicit fallback to a historical fixture.
+    if (IsAuthoredOrderFixture(fixture)) return step < EDM114::RequiredRows &&
+        authoredCode >= 1 && authoredCode <= 3 ? authoredCode : 0;
+    if (fixture == Fixture::ModalZ149) return step < EDM114::RequiredRows ? 1 : 0;
     const int code = IsArcPairFixture(fixture) && (step == 4U || step == 5U) ?
         ((step & 1U) ? 3 : 2) : EDM114::ExpectedGCode(step);
     return IsComplementFixture(fixture) && IsArcStep(step,fixture) ? 5 - code : code;
@@ -47,13 +64,19 @@ inline int ExpectedGCode(unsigned step, Fixture fixture = Fixture::Canonical116)
 inline bool ValidArcRecipe(int code, unsigned step, const Point& increment,
     const std::array<double, 2U>& center, double feed, Fixture fixture = Fixture::Canonical116) noexcept
 {
+    if (IsBoundedArcFixture(fixture)) {
+        EDM112::Curve curve{};
+        return IsArcStep(step,fixture,code) && code == ExpectedGCode(step,fixture,code) &&
+            EDM114::BuildBoundedXYArc(code,increment,center,feed,curve);
+    }
     const unsigned recipeStep = IsArcPairFixture(fixture) && (step == 4U || step == 5U) ? step - 2U : step;
     return ValidFixture(fixture) && IsArcStep(step,fixture) && code == ExpectedGCode(step, fixture) &&
         EDM114::ValidArcRecipe(EDM114::ExpectedGCode(recipeStep), recipeStep, increment, center, feed);
 }
 inline unsigned ExpectedArcFlushRows(unsigned completed, Fixture fixture = Fixture::Canonical116) noexcept
 {
-    if (!ValidFixture(fixture) || completed > EDM114::RequiredRows) return 0U;
+    if (!ValidFixture(fixture) || completed > EDM114::RequiredRows || fixture == Fixture::ModalZ149 ||
+        fixture == Fixture::ModalG76Gap173) return 0U;
     return (completed + 1U) / 4U + (IsArcPairFixture(fixture) && completed >= 5U ? 1U : 0U);
 }
 inline bool ValidMode(Mode mode) noexcept { return mode == Mode::B0 || mode == Mode::B1 || mode == Mode::B2; }
@@ -89,8 +112,12 @@ struct Policy
 };
 inline bool ValidPolicy(const Policy& policy) noexcept
 {
-    if (!ValidMode(policy.mode) || !ValidFixture(policy.fixture) || !EDM107::ValidFlushProfile(policy.profile) || policy.selectorPC < 0 ||
-        !policy.selectorDispatch || policy.revision < 1ULL || policy.revision > EDM114::RequiredRows) return false;
+    if ((policy.fixture == Fixture::ModalVisibleFlush158 && (policy.mode != Mode::B1 || policy.revision != 1ULL)) ||
+        ((policy.fixture == Fixture::ModalXYZVisibleFlush159 || policy.fixture == Fixture::ModalSixVisibleFlush167) &&
+            (policy.mode != Mode::B1 || policy.revision > 3ULL)) ||
+        (policy.fixture == Fixture::ModalG76Gap173 && policy.mode != Mode::B1) ||
+        !ValidMode(policy.mode) || !ValidFixture(policy.fixture) || !EDM107::ValidFlushProfile(policy.profile) || policy.selectorPC < 0 ||
+        !policy.selectorDispatch || policy.revision < 1ULL || policy.revision > PolicyRows(policy.fixture)) return false;
     if (!IsModalFixture(policy.fixture)) return policy.modeOriginPC == -1 && !policy.modeOriginDispatch && !policy.modeOriginRevision;
     return policy.modeOriginPC >= 0 && policy.modeOriginDispatch && policy.modeOriginRevision &&
         policy.modeOriginPC <= policy.selectorPC && policy.modeOriginDispatch <= policy.selectorDispatch &&
@@ -104,17 +131,29 @@ inline bool SamePolicy(const Policy& a, const Policy& b) noexcept
 }
 inline bool PolicyMatchesBinding(const Policy& policy, unsigned step, int sourcePC, std::uint64_t dispatch) noexcept
 {
-    return ValidPolicy(policy) && step < EDM114::RequiredRows && sourcePC >= 0 && dispatch &&
+    return ValidPolicy(policy) && step < PolicyRows(policy.fixture) && sourcePC >= 0 && dispatch &&
         policy.revision == static_cast<std::uint64_t>(step)+1ULL &&
         (IsModalFixture(policy.fixture) ? (policy.selectorPC == sourcePC && policy.selectorDispatch == dispatch) :
             (policy.selectorPC < sourcePC && policy.selectorDispatch < dispatch));
 }
 inline bool PolicyMatchesSource(const Policy& policy, const Source& source) noexcept
 {
-    return EDM114::ValidSource(source) && PolicyMatchesBinding(policy,source.step,source.sourcePC,source.dispatch);
+    const bool validSource = policy.fixture == Fixture::ModalG76Gap173 ?
+        (EDM109::ValidScope(source.scope) && source.dispatch && source.epoch &&
+            source.epoch <= (std::numeric_limits<std::uint32_t>::max)() && source.segment &&
+            source.sourcePC >= 0 && source.step < G76GapRows173) : EDM114::ValidSource(source);
+    return validSource && PolicyMatchesBinding(policy,source.step,source.sourcePC,source.dispatch);
 }
 inline bool PolicyFollowsCompleted(const Policy& policy, const Policy& previous, const Source& source) noexcept
 {
+    // A compound G76 retains one real NC dispatch. Only its canonical child
+    // ordinal advances; neither the selector nor its modal origin is invented.
+    if (policy.fixture == Fixture::ModalG76Gap173)
+        return ValidPolicy(policy) && PolicyMatchesSource(previous,source) && policy.fixture == previous.fixture &&
+            policy.revision == previous.revision+1ULL && policy.selectorPC == source.sourcePC &&
+            policy.selectorDispatch == source.dispatch && policy.modeOriginPC == previous.modeOriginPC &&
+            policy.modeOriginDispatch == previous.modeOriginDispatch && policy.modeOriginRevision == previous.modeOriginRevision &&
+            EDM107::SameFlushProfile(policy.profile,previous.profile);
     if (!ValidPolicy(policy) || !PolicyMatchesSource(previous,source) || policy.fixture != previous.fixture ||
         policy.revision != previous.revision+1ULL || policy.selectorPC <= source.sourcePC ||
         policy.selectorDispatch <= source.dispatch) return false;

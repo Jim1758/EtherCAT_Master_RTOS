@@ -1,11 +1,15 @@
 // BX / Path Core V2-01. G01 is a distinct feed producer, not a G00 override.
 #include "NCManager.h"
 #include "AlarmManager.h"
+#include "GlobalConfig.h"
+#include "NCPathCoreRadiusArc.h"
+#include "NCTranslationArcPrecision.h"
 #include "NCExpressionResolver.h"
 #include "NCRotaryFeedScope.h"
 #include "NCZCFeedScope.h"
 #include "NCXYZCFeedScope.h"
 #include "NCXYZCUVFeedScope.h"
+#include "EDM149VoltageMotion.h"
 #include "NCEccentricCFeedScope.h"
 #include <cerrno>
 #include <cmath>
@@ -539,6 +543,10 @@ bool NCManager::IsPathCoreFeedConfigurationValid() noexcept
 NC_PATH_FEED_NOINLINE
 void NCManager::ArmPathCoreFeedSameThread() noexcept
 {
+    m_g76Orbit->active=false; m_g76Orbit->bound=false; m_g76Orbit->completed=false;
+    m_g76Modal=G76ModalState{}; m_g76Confirmation=G76Confirmation{};
+    m_edm171Air->history.Clear(); m_edm171Air->configured=m_edm171Air->selected=m_edm171Air->bound=false;
+    m_edm171Air->e6Ready=false; m_edm171Air->e6Catalog=nullptr;
     ClearCncModalFeedSameThread();
     m_cncFeed.Clear();
     m_pathFeed = PathFeedState{};
@@ -554,6 +562,8 @@ void NCManager::ArmPathCoreFeedSameThread() noexcept
 NC_PATH_FEED_NOINLINE
 void NCManager::InvalidatePathCoreFeedSameThread(bool byGoto) noexcept
 {
+    // Keep the separate power latch until the old physical work retires.
+    m_g76Orbit->active=false; m_g76Orbit->bound=false; m_g76Orbit->completed=false;
     m_cutterLine = CutterLineState{};
     ClearCncModalFeedSameThread();
     InvalidateCncFeedSameThread();
@@ -605,6 +615,9 @@ void NCManager::ValidatePathCoreFeedSameThread()
     if ((receipt.rotaryFeed || receipt.zcFeed || receipt.xyzcFeed || receipt.xyzcuvFeed) &&
         ((receipt.xyzcuvFeed ? (!IsNCXYZCUVFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
             receipt.xyzcuv.absolute != (CoordSys.GetTranslationSnapshot().distanceMode == 90) ||
+            receipt.xyzcuv.zOnlyCommissioning != IsEDM149ZFeedSameThread() ||
+            receipt.xyzcuv.xyzOnlyCommissioning != IsEDM150XYZFeedSameThread() ||
+            receipt.xyzcuv.sparseCommissioning != IsEDM154SparseFeedSameThread() ||
             !IsXYZCUVFeedProfileCurrentSameThread()) : receipt.xyzcFeed ? (!IsNCXYZCFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
             receipt.xyzc.absolute != (CoordSys.GetTranslationSnapshot().distanceMode == 90) ||
             !IsXYZCFeedProfileCurrentSameThread()) : receipt.zcFeed ? (!IsNCZCFeedNeutralFrame(CoordSys.GetTranslationSnapshot()) ||
@@ -1477,11 +1490,61 @@ WaitConditionFunc NCManager::StartPathCoreXYZCFeedSameThread(const NCBlock& bloc
     return [](NCManager* nc) { return nc->CompletePathCoreFeedSameThread(); };
 }
 
+bool NCManager::IsEDM149ZFeedSameThread() const noexcept
+{
+    return m_edm94.latched && m_edm94.ready && m_edm94.everArmed && !m_edm94.armPending &&
+        !m_edm94.cancelled && !m_edm94.resetSeen && !m_edm94.resetCommitted && !m_edm94.releaseRequested &&
+        !m_edm94.rtFaultReported && m_edm94.gapHistoryServo && m_edm94.gapHistoryMode && m_edm94.gapWorkTime &&
+        m_edm94.gapModeFixture == EDM116::Fixture::ModalZ149 && EDM149::IsZTestArm(m_edm94.gapHistoryArm) &&
+        m_edm130.bound && EDM130::IsMotionTest(m_edm130.recipe) &&
+        m_edm130.recipe.diagnosticControlSource == EDM149::SourceForArm(m_edm94.gapHistoryArm);
+}
+
+bool NCManager::IsEDM149ZFeedBlockSameThread(const NCBlock& block) const noexcept
+{
+    const auto& source = CoordSys.GetTranslationSnapshot();
+    if (!IsEDM149ZFeedSameThread() || source.distanceMode != 91 || !IsNCXYZCUVFeedNeutralFrame(source) ||
+        !IsNCXYZFeedSingleGBlock(block,1) || !block.has('Z') || !block.has('F')) return false;
+    for (char letter='A';letter<='Z';++letter)
+        if (block.has(letter) && (std::strchr("NXYZCUVF",letter) == nullptr || !std::isfinite(block.val(letter)))) return false;
+    std::array<double,6U> words{};
+    for (unsigned axis=0U;axis<6U;++axis) if(block.has("XYZCUV"[axis])) words[axis]=block.val("XYZCUV"[axis]);
+    return EDM149::ValidZIncrement(words,block.val('F'));
+}
+
+bool NCManager::IsEDM150XYZFeedSameThread() const noexcept
+{
+    return m_edm94.latched && m_edm94.ready && m_edm94.everArmed && !m_edm94.armPending &&
+        !m_edm94.cancelled && !m_edm94.resetSeen && !m_edm94.resetCommitted && !m_edm94.releaseRequested &&
+        !m_edm94.rtFaultReported && m_edm94.gapHistoryServo && m_edm94.gapHistoryMode && m_edm94.gapWorkTime &&
+        m_edm94.gapModeFixture == EDM116::Fixture::ModalXYZ150 && EDM149::IsXYZTestArm(m_edm94.gapHistoryArm) &&
+        m_edm130.bound && EDM130::IsMotionTest(m_edm130.recipe) &&
+        m_edm130.recipe.diagnosticControlSource == EDM149::SourceForArm(m_edm94.gapHistoryArm);
+}
+
+bool NCManager::IsEDM150XYZFeedBlockSameThread(const NCBlock& block) const noexcept
+{
+    const auto& source = CoordSys.GetTranslationSnapshot();
+    if (!IsEDM150XYZFeedSameThread() || source.distanceMode != 91 || !IsNCXYZCUVFeedNeutralFrame(source) ||
+        !IsNCXYZFeedSingleGBlock(block,1) || !block.has('X') || !block.has('Y') || !block.has('Z') || !block.has('F')) return false;
+    for (char letter='A';letter<='Z';++letter)
+        if (block.has(letter) && (std::strchr("NXYZCUVF",letter) == nullptr || !std::isfinite(block.val(letter)))) return false;
+    std::array<double,6U> words{};
+    for (unsigned axis=0U;axis<6U;++axis) if(block.has("XYZCUV"[axis])) words[axis]=block.val("XYZCUV"[axis]);
+    return EDM149::ValidXYZIncrement(words,block.val('F'));
+}
+
 NC_PATH_FEED_NOINLINE
 WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& block)
 {
     const NCTranslationSnapshot& source = CoordSys.GetTranslationSnapshot();
-    if (!IsNCXYZCUVFeedBlockAllowed(source, block))
+    const bool zOnlyCommissioning = IsEDM149ZFeedSameThread();
+    const bool xyzOnlyCommissioning = IsEDM150XYZFeedSameThread();
+    const bool sparseCommissioning = IsEDM154SparseFeedSameThread();
+    std::array<double,6U> zWords{};
+    if (zOnlyCommissioning || xyzOnlyCommissioning || sparseCommissioning)
+        for (unsigned axis=0U;axis<6U;++axis) if(block.has("XYZCUV"[axis])) zWords[axis]=block.val("XYZCUV"[axis]);
+    if (!(zOnlyCommissioning ? IsEDM149ZFeedBlockSameThread(block) : xyzOnlyCommissioning ? IsEDM150XYZFeedBlockSameThread(block) : sparseCommissioning ? IsEDM154SparseFeedBlockSameThread(block) : IsNCXYZCUVFeedBlockAllowed(source, block)))
     {
         RejectPathCoreFeedSameThread(2U, AlarmManager::G_Code_Invalid_parameter);
         return nullptr;
@@ -1546,7 +1609,7 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
     std::array<double, 6U> programmedWords{}, targetMCS{};
     for (unsigned i = 0U; i < 6U; ++i)
     {
-        programmedWords[i] = block.val("XYZCUV"[i]);
+        programmedWords[i] = (zOnlyCommissioning || xyzOnlyCommissioning || sparseCommissioning) ? zWords[i] : block.val("XYZCUV"[i]);
         m_pathFeedProgrammed[i] = true;
         m_pathFeedWCS[i] = programmedWords[i];
     }
@@ -1556,8 +1619,11 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
     for (unsigned i = 0U; i < 8U; ++i)
     {
         authoredStart[i] = CoordSys.commandedMCS[i];
-        const double expected = i < 6U ? (absolute ? programmedWords[i] + NCTranslationAxisOffsetMM(source, i) :
-            authoredStart[i] + programmedWords[i]) : authoredStart[i];
+        const bool sparseStatic = sparseCommissioning && i < 6U && programmedWords[i] == 0.0;
+        const double expected = sparseStatic ? authoredStart[i] : i < 6U ?
+            (absolute ? programmedWords[i] + NCTranslationAxisOffsetMM(source, i) :
+                authoredStart[i] + programmedWords[i]) : authoredStart[i];
+        if (sparseStatic && m_pathFeedCandidate[i] == authoredStart[i]) m_pathFeedCandidate[i] = authoredStart[i];
         if (!std::isfinite(authoredStart[i]) || !std::isfinite(expected) ||
             FeedDoubleBits(m_pathFeedCandidate[i]) != FeedDoubleBits(expected))
         {
@@ -1584,7 +1650,7 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
         return nullptr;
     }
     const bool accepted = m_motion.TryG01XYZCUVMoveTransactionalTail(programmedWords, targetMCS,
-        feedMMMin, CoordSys.commandedMCS, m_pathFeedMotion);
+        feedMMMin, CoordSys.commandedMCS, m_pathFeedMotion, sparseCommissioning);
     if (!accepted)
     {
         RejectPathCoreFeedSameThread(6U, m_pathFeedMotion.receipt.commandAccepted ?
@@ -1594,6 +1660,12 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
     }
     const MotionFeedLineReceipt& receipt = m_pathFeedMotion.receipt;
     const NCXYZCUVFeedLineValue& geometry = receipt.xyzcuv;
+    if (geometry.zOnlyCommissioning != zOnlyCommissioning || geometry.xyzOnlyCommissioning != xyzOnlyCommissioning ||
+        geometry.sparseCommissioning != sparseCommissioning)
+    {
+        RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        return nullptr;
+    }
     // Re-resolve independently from the immutable continuous pulse anchor.
     // The three positional rotaries each apply their own modulo/shortest policy.
     std::array<double, 6U> startNative{}, startPulse{}, pulsePerUnit{};
@@ -1651,8 +1723,11 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
     for (unsigned i = 0U; i < 8U; ++i)
     {
         const double ppu = i < 6U ? pulsePerUnit[i] : 0.0;
-        const double expectedNative = absolute && i < 6U ? resolved.endMCS[i] : m_pathFeedCandidate[i];
-        const double expectedPulse = i < 6U ? (absolute ? resolved.endPulse[i] :
+        const bool sparseStatic = sparseCommissioning && i < 6U && effectiveDelta[i] == 0.0;
+        const bool staticAxis = i < 6U && (EDM149::StaticAxis(zOnlyCommissioning,xyzOnlyCommissioning,i) || sparseStatic);
+        const double expectedNative = sparseStatic ? authoredStart[i] :
+            absolute && i < 6U ? resolved.endMCS[i] : m_pathFeedCandidate[i];
+        const double expectedPulse = sparseStatic ? geometry.startPulse[i] : i < 6U ? (absolute ? resolved.endPulse[i] :
             geometry.startPulse[i] + effectiveDelta[i] * ppu) : geometry.startPulse[i];
         if (!std::isfinite(geometry.startMCS[i]) || !std::isfinite(geometry.endMCS[i]) ||
             !std::isfinite(geometry.startPulse[i]) || !std::isfinite(geometry.endPulse[i]) ||
@@ -1683,7 +1758,7 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
                 if (FeedDoubleBits(geometry.rotaryModulo[i - 3U]) != FeedDoubleBits(absolute ? modulo[i - 3U] : 0.0) ||
                     geometry.rotaryShortestPath[i - 3U] != (absolute && shortest[i - 3U]) ||
                     FeedDoubleBits(geometry.rotaryFeedDegMin[i - 3U]) != FeedDoubleBits(rotaryFeedDegMin) ||
-                    !std::isfinite(rotaryFeedDegMin) || rotaryFeedDegMin <= 0.0 || rotaryFeedDegMin > 100.0)
+                    !std::isfinite(rotaryFeedDegMin) || (staticAxis ? rotaryFeedDegMin != 0.0 : rotaryFeedDegMin <= 0.0) || rotaryFeedDegMin > 100.0)
                 {
                     RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
                     return nullptr;
@@ -1692,9 +1767,10 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
             if (FeedDoubleBits(geometry.deltaNative[i]) != FeedDoubleBits(effectiveDelta[i]) ||
                 FeedDoubleBits(geometry.pulsePerUnit[i]) != FeedDoubleBits(ppu) ||
                 FeedDoubleBits(geometry.axisVelocityPPS[i]) != FeedDoubleBits(axisVelocity) ||
-                !std::isfinite(deltaPulse) || std::fabs(deltaPulse) < 1.0e-5 ||
-                !std::isfinite(directVelocity) || directVelocity <= 0.0 || directVelocity > axis.maxVel_PPS ||
-                !std::isfinite(axisVelocity) || axisVelocity <= 0.0 || axisVelocity > axis.maxVel_PPS)
+                !std::isfinite(deltaPulse) ||
+                (staticAxis ? deltaPulse != 0.0 : std::fabs(deltaPulse) < 1.0e-5) ||
+                !std::isfinite(directVelocity) || (staticAxis ? directVelocity != 0.0 : directVelocity <= 0.0) || directVelocity > axis.maxVel_PPS ||
+                !std::isfinite(axisVelocity) || (staticAxis ? axisVelocity != 0.0 : axisVelocity <= 0.0) || axisVelocity > axis.maxVel_PPS)
             {
                 RejectPathCoreFeedSameThread(8U, AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
                 return nullptr;
@@ -1713,6 +1789,8 @@ WaitConditionFunc NCManager::StartPathCoreXYZCUVFeedSameThread(const NCBlock& bl
 NC_PATH_FEED_NOINLINE
 WaitConditionFunc NCManager::StartPathCoreFeedSameThread(const NCBlock& block)
 {
+    // EDM149/150 share the six-axis producer with explicitly frozen static axes.
+    if (IsEDM149ZFeedSameThread() || IsEDM150XYZFeedSameThread() || IsEDM154SparseFeedSameThread()) return StartPathCoreXYZCUVFeedSameThread(block);
     // Classify any addressed extra physical slot before XYZ admission, so a
     // mixed, multi-rotary or omitted-F candidate cannot fall into another lane.
     const NCAxisIdentitySnapshot& nativeAxes = CoordSys.GetTranslationSnapshot().axisIdentity;
@@ -2075,7 +2153,9 @@ void NCManager::CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId
     if (r.xyzcuvFeed)
     {
         const bool absolute = CoordSys.GetTranslationSnapshot().distanceMode == 90;
-        if (r.xyzcuv.absolute != absolute) sixAuthorshipCurrent = false;
+        if (r.xyzcuv.absolute != absolute || r.xyzcuv.zOnlyCommissioning != IsEDM149ZFeedSameThread() ||
+            r.xyzcuv.xyzOnlyCommissioning != IsEDM150XYZFeedSameThread() ||
+            r.xyzcuv.sparseCommissioning != IsEDM154SparseFeedSameThread()) sixAuthorshipCurrent = false;
         for (unsigned i = 0U; i < 6U; ++i)
         {
             if (FeedDoubleBits(r.xyzcuv.absoluteTargetWCS[i]) != FeedDoubleBits(absolute ? m_pathFeedWCS[i] : 0.0) ||
@@ -2085,7 +2165,10 @@ void NCManager::CommitPathCoreFeedCaptureSameThread(NCBlockDispatchId dispatchId
             const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(i));
             if (FeedDoubleBits(r.xyzcuv.rotaryModulo[i - 3U]) != FeedDoubleBits(absolute ? axis.rotaryModulo : 0.0) ||
                 r.xyzcuv.rotaryShortestPath[i - 3U] != (absolute && axis.useShortestPath)) sixAuthorshipCurrent = false;
-            if (!std::isfinite(r.xyzcuv.rotaryFeedDegMin[i - 3U]) || r.xyzcuv.rotaryFeedDegMin[i - 3U] <= 0.0 ||
+            if (!std::isfinite(r.xyzcuv.rotaryFeedDegMin[i - 3U]) ||
+                ((EDM149::StaticAxis(r.xyzcuv.zOnlyCommissioning,r.xyzcuv.xyzOnlyCommissioning,i) ||
+                    (r.xyzcuv.sparseCommissioning && r.xyzcuv.deltaNative[i] == 0.0)) ?
+                r.xyzcuv.rotaryFeedDegMin[i - 3U] != 0.0 : r.xyzcuv.rotaryFeedDegMin[i - 3U] <= 0.0) ||
                 r.xyzcuv.rotaryFeedDegMin[i - 3U] > 100.0) sixRatesValid = false;
         }
     }
@@ -2186,6 +2269,7 @@ NC_PATH_FEED_NOINLINE
 void NCManager::ObservePathCoreFeedFeedbackSameThread(const MotionFeedbackEvent& event,
     bool ledgerAccepted)
 {
+    ObserveG76OrbitFeedbackSameThread(event, ledgerAccepted);
     ObserveCncFeedFeedbackSameThread(event, ledgerAccepted);
     if (!m_pathFeed.pending || !m_pathFeed.bound ||
         !FeedFullIdentity(event.identity, m_pathFeedMotion.receipt.identity)) return;
@@ -2548,6 +2632,7 @@ bool NCManager::IsCncPathQueuedBlockShapeValid(const NCBlock& block, int unitsMo
 NC_PATH_FEED_NOINLINE
 bool NCManager::IsCncFeedScopeSameThread() noexcept
 {
+    if (IsEDM171AirGrantCurrentSameThread()) return false;
     // BASE58 keeps auxiliary-axis configurations on the explicit XYZ
     // exact-stop lane. Consecutive G01 rows must not opt in automatically.
     for (int axis = 3; axis < 8; ++axis)
@@ -2982,6 +3067,944 @@ void NCManager::LogCncFeedSameThread(const char* phase, const CncFeedFlight* row
         static_cast<unsigned int>(m_cncFeed.submitted), static_cast<unsigned int>(m_cncFeed.accepted),
         static_cast<unsigned int>(m_cncFeed.started), static_cast<unsigned int>(m_cncFeed.done),
         static_cast<unsigned int>(m_cncFeed.revoked), static_cast<unsigned int>(m_cncFeed.failures), row == nullptr ? "TAIL" : row->arc ? "ARC" : row->receipt.blendGeometry.valid ? "BLEND" : "LINE");
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::IsG76OrbitBlockShapeValid(const NCBlock& block, bool allowMissingFeed, int unitsMode) noexcept
+{
+    if ((unitsMode != 20 && unitsMode != 21) || block.isEmpty || block.isGoto || block.isBlockSkip ||
+        !block.hasG || block.gCode != 76 || block.gCount != 1 || block.gCodes[0] != 76 || block.mCount != 0 ||
+        !block.has('P') || block.val('P') != 11.0 || !block.has('R') ||
+        !(block.has('X') || block.has('Y') || block.has('Z')) || (!allowMissingFeed && !block.has('F'))) return false;
+    for (char word = 'A'; word <= 'Z'; ++word)
+    {
+        if (!block.has(word)) continue;
+        if ((word != 'N' && word != 'X' && word != 'Y' && word != 'Z' && word != 'R' &&
+             word != 'P' && word != 'F' && word != 'B') || !std::isfinite(block.val(word))) return false;
+        if ((word == 'X' || word == 'Y' || word == 'Z') &&
+            !std::isfinite(NCTranslationLengthToMM(block.val(word),unitsMode))) return false;
+    }
+    const double radius = NCTranslationLengthToMM(block.val('R'),unitsMode);
+    const double feed = block.has('F') ? NCTranslationLengthToMM(block.val('F'),unitsMode) : 0.0;
+    return std::isfinite(radius) && radius > 0.0 && radius <= NCG76::MaximumRadiusMm &&
+        (!block.has('F') || (std::isfinite(feed) && feed > 0.0 && feed <= NCG76::MaximumFeedMmMin)) &&
+        (!block.has('B') || block.val('B') == 0.0 || block.val('B') == 2.0 || block.val('B') == 3.0 || block.val('B') == 4.0);
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::IsG76OrbitFrameCurrentSameThread() const noexcept
+{
+    if (!CoordSys.IsTranslationRunBound() || !CoordSys.IsTranslationRunCurrent()) return false;
+    const NCTranslationSnapshot& source = CoordSys.GetTranslationSnapshot();
+    if (!NCG76::FrameSupported(source) || source.runToken == 0ULL ||
+        source.runToken != m_pathCoreLiveBookkeeping.currentRunToken ||
+        source.distanceMode != (CoordSys.isAbsoluteMode ? 90 : 91) ||
+        source.unitsMode != (CoordSys.isInchMode ? 20 : 21) || CoordSys.activePlane != 17 ||
+        CoordSys.toolRadiusMode != 40 || CoordSys.isPolarCoordinateActive || CoordSys.isCAxisOffsetRotationEnabled)
+        return false;
+    for (unsigned a = 0U; a < 3U; ++a)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(a));
+        if (m_axisNames[a] != static_cast<char>('X'+a) || source.axisIdentity.address[a] != m_axisNames[a] ||
+            !axis.isExist || axis.axisType != AxisType::LINEAR) return false;
+    }
+    return true;
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::IsG76OrbitBlockAllowedSameThread(const NCBlock& block) noexcept
+{
+    if (m_edm94.latched && m_edm94.gapHistoryArm==292U) return IsEDM173OrbitAllowedSameThread(block);
+    bool valid = IsG76OrbitBlockShapeValid(block,true,CoordSys.isInchMode ? 20 : 21) &&
+        IsG76OrbitFrameCurrentSameThread() && IsPathCoreLiveNativeConfigCurrentSameThread() &&
+        m_state == NCState::RUN && m_mode == NCOperationMode::MEMORY && !Close_System_Com_flag &&
+        m_externalReadyInterlock && !m_isG66Active && m_macroStack.empty() && !Homing.IsActive() &&
+        !m_isSingleBlockEnabled && !AlarmManager::GetInstance().HasAlarm() && !m_edm94.latched &&
+        !m_g76Orbit->active && !m_pathFeed.pending && !m_pathArc.pending && !m_pathReplay.pending &&
+        !m_pathHold.armed && !m_pathHold.bound && !m_gapDryRun.active && !m_gapPath.active &&
+        !m_gapWindow.active && !m_cncFeed.selected && !m_cncFeed.active && m_cncFeed.count == 0U &&
+        !m_cutterLine.leadOutRequired && !m_motion.HasPendingSafetyOrRecoveryRequests();
+    const auto* authored = GetBaseProgramCache().TryGetLine(GetActiveDispatchPC());
+    NCBlock literal{};
+    valid = valid && authored && authored->parsedBlock.error == NCParseError::NONE &&
+        authored->parsedBlock.duplicateAddressMask == 0U && !authored->parsedBlock.dependsOnMacroState &&
+        authored->parsedBlock.controlType == NCParsedControlType::NONE &&
+        NCPreparedBlockQueueShadow::TryBuildLiteralBlock(authored->parsedBlock,literal) &&
+        IsG76OrbitBlockShapeValid(literal,true,CoordSys.isInchMode ? 20 : 21);
+    if (valid)
+        for (char word = 'A'; word <= 'Z'; ++word)
+            if (literal.has(word) != block.has(word) ||
+                (literal.has(word) && FeedDoubleBits(literal.val(word)) != FeedDoubleBits(block.val(word)))) valid = false;
+    if (!valid) RejectG76OrbitSameThread("LITERAL_FRAME_OR_EXECUTION_SCOPE",AlarmManager::G_Code_Invalid_parameter);
+    return valid;
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::PrepareG76OrbitTranslationSameThread(const NCBlock& block)
+{
+    if (m_edm94.latched && m_edm94.gapHistoryArm==292U)
+        return IsEDM173OrbitAllowedSameThread(block) && FreezeEDM173TranslationSameThread();
+    if (block.gCode==76 ? !IsG76OrbitBlockAllowedSameThread(block) :
+        (!m_edm171Air->selected || !IsEDM171AirGrantCurrentSameThread() || !IsG76OrbitFrameCurrentSameThread() ||
+         !IsPathCoreLiveNativeConfigCurrentSameThread() || m_g76Orbit->active)) return false;
+    if (CoordSys.IsTranslationRunFrozen())
+        return IsFixedTranslationTravelCurrentSameThread() && m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot());
+    const NCTranslationSnapshot candidate = CoordSys.GetTranslationSnapshot();
+    if (!CoordSys.FreezeTranslationRun())
+    { RejectG76OrbitSameThread("FRAME_FREEZE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return false; }
+    for (unsigned a = 0U; a < 8U; ++a)
+    {
+        const AxisContext& axis = m_motion.GetAxisContext(static_cast<int>(a));
+        FixedTranslationTravelPolicy& captured = m_fixedTranslationTravel[a];
+        captured.minimum[0]=axis.travelLimit1Negative_unit; captured.minimum[1]=axis.travelLimit2Negative_unit; captured.minimum[2]=axis.travelLimit3Negative_unit;
+        captured.maximum[0]=axis.travelLimit1Positive_unit; captured.maximum[1]=axis.travelLimit2Positive_unit; captured.maximum[2]=axis.travelLimit3Positive_unit;
+        captured.enabled[0]=axis.travelLimit1Enable; captured.enabled[1]=axis.travelLimit2Enable; captured.enabled[2]=axis.travelLimit3Enable;
+        captured.homed=axis.isHomed; captured.positionalRotary=axis.isExist && axis.axisType==AxisType::ROTARY;
+        captured.shortestPath=axis.useShortestPath; captured.rotaryModulo=axis.rotaryModulo;
+        captured.maximumVelocity=axis.maxVel_PPS; captured.accelerationTime=axis.G00_acc_time;
+        captured.decelerationTime=axis.G00_dec_time; captured.stopDecelerationTime=axis.Stop_dec_time;
+    }
+    const NCTranslationSnapshot frozen=CoordSys.GetTranslationSnapshot();
+    m_fixedTranslationTravelGeneration=frozen.generation;
+    if (!SameNCTranslationSnapshot(candidate,frozen) || !m_motion.PublishNCTranslation(frozen))
+    { RejectG76OrbitSameThread("FRAME_PUBLICATION",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return false; }
+    if (frozen.rotationMode==68) m_motion.SetCoordinateTransform(false,0.0,0.0,0.0,0.0,0.0,0.0);
+    RtPrintf("[EDM170] event=FRAME_FROZEN run=%llu generation=%llu distance=%d units=%d discharge=0\n",
+        static_cast<unsigned long long>(frozen.runToken),static_cast<unsigned long long>(frozen.generation),frozen.distanceMode,frozen.unitsMode);
+    return true;
+}
+
+NC_PATH_FEED_NOINLINE
+WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
+{
+    if (m_edm94.latched && m_edm94.gapHistoryArm==292U) return StartEDM173OrbitSameThread(block);
+    if (!IsG76OrbitBlockAllowedSameThread(block)) return nullptr;
+    const auto& confirm=m_g76Confirmation;
+    const int pc=GetActiveDispatchPC();
+    const auto* source=GetBaseProgramCache().TryGetLine(pc);
+    if (!m_pathFeed.armed || m_pathFeed.run!=m_pathCoreLiveBookkeeping.currentRunToken ||
+        m_pathFeed.cache!=GetBaseProgramCache().GetGeneration() || !source || !CoordSys.IsTranslationRunFrozen() ||
+        !IsPathCoreFeedConfigurationValid() || !IsFixedTranslationTravelCurrentSameThread() ||
+        !m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot()) ||
+        !m_programMotionLease.IsValid() || m_programMotionLease.owner!=MotionOwner::AUTO ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) || !m_motion.IsGroupNCDrained() ||
+        !m_motion.IsGroupDone() || m_motion.GetCommandIngressSize()!=0U || m_motion.GetCommandReplaySize()!=0U ||
+        m_motion.GetMotionFeedbackOverflowCount()!=0ULL || m_motion.GetMotionFeedbackProducerNoticeOverflowCount()!=0ULL ||
+        m_motionFeedbackSequenceGapCount!=0ULL || !FeedLedgerTransportHealthy(m_blockLifecycleLedger) ||
+        !confirm.confirmed || confirm.waiting || confirm.run!=m_pathCoreLiveBookkeeping.currentRunToken ||
+        confirm.cache!=GetBaseProgramCache().GetGeneration() || !confirm.dispatch ||
+        m_currentExecutingBlockDispatchId<=confirm.dispatch || pc<confirm.firstPC ||
+        !m_currentExecutingBlockDispatchId)
+    { RejectG76OrbitSameThread("CONFIRMATION_OR_STOPPED_ADMISSION",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    ResetG76OrbitStateSameThread();
+    auto& s=*m_g76Orbit;
+    s.run=m_pathCoreLiveBookkeeping.currentRunToken; s.cache=GetBaseProgramCache().GetGeneration();
+    s.dispatch=m_currentExecutingBlockDispatchId; s.pc=pc; s.line=source->sourceLineNumber;
+    if (!CaptureCncFeedValueSameThread(block,s.feed) || s.feed.feedMMMin>NCG76::MaximumFeedMmMin)
+    { RejectG76OrbitSameThread("FEED_PROVENANCE",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    unsigned mode=0U;
+    if (block.has('B')) mode=static_cast<unsigned>(block.val('B'));
+    else if (m_g76Modal.valid)
+    {
+        if (m_g76Modal.run!=s.run || m_g76Modal.cache!=s.cache || !m_g76Modal.commit ||
+            !m_g76Modal.lease.Matches(m_programMotionLease))
+        { RejectG76OrbitSameThread("INHERITED_B_SCOPE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return nullptr; }
+        mode=m_g76Modal.mode; s.inheritedB=true;
+    }
+    NCG76::PlanInput input{};
+    input.flushMode=mode; input.feedMmMin=s.feed.feedMMMin;
+    const NCTranslationSnapshot frozen=CoordSys.GetTranslationSnapshot();
+    input.radiusMm=NCTranslationLengthToMM(block.val('R'),frozen.unitsMode);
+    s.mode=mode; s.sourceG=76;
+    if (mode==3U || mode==4U)
+    {
+        input.centerReturnFeedMmMin=mode==3U ? m_edm171Air->speeds.b3MmMin : m_edm171Air->speeds.b4MmMin;
+        EDMRecipe::ParameterSnapshot height{};
+        if (!ReadEDM171AirE6SameThread(height))
+        { RejectG76OrbitSameThread("E6_HEIGHT_SNAPSHOT",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+        input.heightMm=static_cast<double>(height.actualValue)/static_cast<double>(EDMRecipe::Scale);
+    }
+    NCG76::Point8 start{};
+    for (unsigned a=0U;a<8U;++a) start[a]=CoordSys.commandedMCS[a];
+    double programStart[8]={};
+    NCTranslationInversePoint(frozen,start.data(),programStart);
+    for (unsigned a=0U;a<3U;++a)
+    {
+        if (!std::isfinite(programStart[a]))
+        { RejectG76OrbitSameThread("ACCEPTED_NATIVE_BASELINE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return nullptr; }
+        const char word=static_cast<char>('X'+a);
+        input.start[a]=frozen.distanceMode==90 ? programStart[a] : 0.0;
+        input.end[a]=block.has(word) ? NCTranslationLengthToMM(block.val(word),frozen.unitsMode) : input.start[a];
+    }
+    if (!NCG76::Build(input,s.program) || !(mode==2U ? NCG76::BuildNativeBase(s.program,frozen,start,s.native) : NCG76::BuildNative(s.program,frozen,start,s.native)))
+    { RejectG76OrbitSameThread("PROGRAM_OR_TRANSFORMED_ENVELOPE",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    bool xyz[8]={true,true,true,false,false,false,false,false};
+    for (unsigned k=0U;k<s.native.count;++k)
+    {
+        double words[8]={},preview[8]={};
+        for (unsigned a=0U;a<3U;++a) words[a]=s.program.points[k].position[a];
+        CoordSys.Preview_WCS_to_MCS(words,xyz,preview);
+        for (unsigned a=0U;a<8U;++a)
+        {
+            if (FeedDoubleBits(preview[a])!=FeedDoubleBits(s.native.pointsMCS[k][a]))
+            { RejectG76OrbitSameThread("FROZEN_PREVIEW_MISMATCH",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return nullptr; }
+            const AxisContext& axis=m_motion.GetAxisContext(static_cast<int>(a));
+            if (!axis.isExist) continue;
+            const double low[3]={axis.travelLimit1Negative_unit,axis.travelLimit2Negative_unit,axis.travelLimit3Negative_unit};
+            const double high[3]={axis.travelLimit1Positive_unit,axis.travelLimit2Positive_unit,axis.travelLimit3Positive_unit};
+            const bool enabled[3]={axis.travelLimit1Enable,axis.travelLimit2Enable,axis.travelLimit3Enable};
+            for (unsigned limit=0U;limit<3U;++limit)
+                if (enabled[limit] && (!std::isfinite(low[limit]) || !std::isfinite(high[limit]) || low[limit]>high[limit] ||
+                    start[a]<low[limit] || start[a]>high[limit] || preview[a]<low[limit] || preview[a]>high[limit]))
+                { RejectG76OrbitSameThread("SOFTWARE_TRAVEL",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+        }
+    }
+    if (mode==2U) return StartEDM171MixedMotionSameThread(block);
+    // This latch precedes the one atomic Motion publication and survives any
+    // subsequent NC invalidation until old physical work has actually retired.
+    m_g76PowerInhibited=true;
+    ForceEDMPLCOutputsOffSameThread("G76_AIR_RUN_ADMISSION");
+    const bool accepted=m_motion.TryG76MoveTransactionalTail(s.native,CoordSys.commandedMCS,s.receipt);
+    const auto& r=s.receipt;
+    bool receipt=accepted && r.valid && r.commandAccepted && r.captureBound && r.tailCommitted &&
+        r.count==s.native.count && r.count>0U && r.count<=NCG76::MaximumPoints && r.axisMask==7U &&
+        (r.validAxisMask&7U)==7U && r.tail.axisMask==r.validAxisMask &&
+        r.translationGeneration==frozen.generation && r.ownerLease.Matches(m_programMotionLease) &&
+        r.tail.IsCommitted() && r.tail.captureBound && r.tail.ownerLease.Matches(r.ownerLease) &&
+        FeedFullIdentity(r.tail.identity,r.identities[r.count-1U]);
+    for (unsigned a=0U;a<8U && receipt;++a)
+        receipt=FeedDoubleBits(r.startMCS[a])==FeedDoubleBits(start[a]) &&
+            FeedDoubleBits(r.endMCS[a])==FeedDoubleBits(s.native.pointsMCS[s.native.count-1U][a]) &&
+            FeedDoubleBits(CoordSys.commandedMCS[a])==FeedDoubleBits(r.endMCS[a]);
+    for (unsigned k=0U;k<r.count && k<NCG76::MaximumPoints && receipt;++k)
+    {
+        const auto& id=r.identities[k];
+        receipt=id.IsAssigned() && id.epoch==m_motion.GetCurrentExecutionEpoch() &&
+            id.source==MotionCommandSource::NC_MEMORY && id.sourceBlockId==static_cast<MotionSourceBlockId>(pc);
+        for (unsigned j=0U;j<k;++j) if (id.Matches(r.identities[j])) receipt=false;
+    }
+    if (!receipt)
+    {
+        RtPrintf("[EDM171] event=NATIVE_REJECT gate=%s axis=%d leg=%d accepted=%u\n",
+            MotionG76AdmissionGateName(r.rejectionGate),r.rejectionAxis,r.rejectionSegment,r.commandAccepted?1U:0U);
+        if (!r.commandAccepted && AlarmManager::GetInstance().HasAlarm()) { ChangeState(NCState::ALARM); return nullptr; }
+        RejectG76OrbitSameThread("NATIVE_BATCH_RECEIPT",r.commandAccepted ? AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY : AlarmManager::PATH_MOTION_NOT_ADMITTED); return nullptr;
+    }
+    s.active=true;
+    RtPrintf("[EDM170] event=AIR_RUN_BEGIN run=%llu cache=%llu dispatch=%llu pc=%d B=%u inheritedB=%u count=%u grow=%u R=%.6f F=%.6f H=%.6f centerReturnF=%.6f trigger=%s chordError=%.9f discharge=0\n",
+        static_cast<unsigned long long>(s.run),static_cast<unsigned long long>(s.cache),static_cast<unsigned long long>(s.dispatch),s.pc,
+        mode,s.inheritedB?1U:0U,s.native.count,NCG76::GrowSegments,input.radiusMm,input.feedMmMin,input.heightMm,
+        input.centerReturnFeedMmMin>0.0 ? input.centerReturnFeedMmMin : input.feedMmMin,mode ? "DEMO_HALF_TURN" : "NONE",s.program.chordErrorBoundMm);
+    return [](NCManager* n) { return n->CompleteG76OrbitSameThread(); };
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::CommitG76OrbitCaptureSameThread(NCBlockDispatchId dispatch,const MotionProgramBlockCapture& capture,
+    const NCProgramCommitSnapshot& commit,bool committed,bool ledgerFound,const NCBlockLifecycleSnapshot& ledger,int pc,int line)
+{
+    auto& s=*m_g76Orbit;
+    if (!s.active || s.dispatch!=dispatch) return;
+    const auto& r=s.receipt;
+    bool valid=committed && commit.IsValid() && ledgerFound && s.pc==pc && s.line==line &&
+        commit.scope==NCProgramScope::MEMORY && commit.frameId==NC_PROGRAM_FRAME_ID_INVALID &&
+        commit.sourcePC==pc && commit.cacheGeneration==s.cache && ledger.dispatchId==dispatch &&
+        ledger.programCommitted && !ledger.ncDispatchFailed && !ledger.motionCaptureOverflow &&
+        ledger.sourceLineNumber==line && FeedSameSource(commit,ledger.programTarget) && FeedSameSource(commit,ledger.programCommit) &&
+        commit.sequence==ledger.programCommit.sequence && capture.count==r.count && !capture.overflow &&
+        r.count>0U && r.count<=128U && ledger.motionSegmentCount==r.count &&
+        IsCncFeedValueCurrentSameThread(s.feed) && FeedTranslationCurrent(CoordSys,r.translationGeneration) &&
+        m_motion.MatchesNCTranslation(s.mixed ? m_edm171Air->plan.input.translation : s.native.translation) && r.ownerLease.Matches(m_programMotionLease) &&
+        m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) && r.tail.IsCommitted() && r.tail.captureBound;
+    valid=valid && r.count==(s.mixed ? m_edm171Air->plan.count : s.native.count);
+    for (unsigned k=0U;k<r.count && k<128U && valid;++k)
+    {
+        const auto& sub=capture.submissions[k]; const auto& seg=ledger.motionSegments[k];
+        valid=sub.producerAccepted && sub.immediateRejectReason==MotionRejectReason::NONE &&
+            sub.commandPathMode==MotionCommandPathMode::EXACT_STOP && sub.translationGeneration==r.translationGeneration &&
+            seg.producerAccepted && seg.immediateRejectReason==MotionRejectReason::NONE &&
+            FeedFullIdentity(sub.identity,r.identities[k]) && FeedFullIdentity(seg.identity,r.identities[k]) &&
+            r.identities[k].epoch==m_motion.GetCurrentExecutionEpoch() &&
+            r.identities[k].sourceBlockId==static_cast<MotionSourceBlockId>(pc) && r.identities[k].source==MotionCommandSource::NC_MEMORY;
+    }
+    if (valid)
+    {
+        const auto& tail=capture.submissions[r.count-1U].queueTailReceipt;
+        valid=tail.IsCommitted() && tail.captureBound && tail.transactionSequence==r.tail.transactionSequence &&
+            FeedFullIdentity(tail.identity,r.tail.identity) && tail.ownerLease.Matches(r.ownerLease);
+    }
+    if (!valid)
+    { RejectG76OrbitSameThread("AGGREGATE_COMMIT_BINDING",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
+    s.commit=commit.sequence; s.bound=true;
+    if (m_edm94.gapHistoryArm==292U && m_edm94.latched)
+    {
+        m_edm173->parentCommitted=true;
+        RtPrintf("[EDM173] event=PARENT_BOUND session=%llu dispatch=%llu commit=%llu children=%u discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(dispatch),
+            static_cast<unsigned long long>(commit.sequence),r.count);
+        return;
+    }
+    CommitCncModalFeedSameThread(s.feed,dispatch,commit.sequence,pc,line);
+    m_g76Modal.lease=r.ownerLease; m_g76Modal.run=s.run; m_g76Modal.cache=s.cache;
+    m_g76Modal.commit=commit.sequence; m_g76Modal.mode=s.mode; m_g76Modal.valid=true;
+    RtPrintf("[EDM170] event=BOUND dispatch=%llu commit=%llu count=%u B=%u inheritedB=%u discharge=0\n",
+        static_cast<unsigned long long>(dispatch),static_cast<unsigned long long>(commit.sequence),r.count,m_g76Modal.mode,s.inheritedB?1U:0U);
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::ObserveG76OrbitFeedbackSameThread(const MotionFeedbackEvent& event,bool ledgerAccepted)
+{
+    ObserveEDM171NominalFeedbackSameThread(event,ledgerAccepted);
+    auto& s=*m_g76Orbit;
+    if (!s.active || !s.bound) return;
+    for (unsigned k=0U;k<s.receipt.count && k<128U;++k)
+    {
+        const auto& id=s.receipt.identities[k];
+        if (!id.Matches(event.identity)) continue;
+        bool valid=FeedFullIdentity(id,event.identity) && ledgerAccepted && event.sequence!=0ULL &&
+            event.sequence>s.lastFeedback[k] && event.owner==s.receipt.ownerLease.owner &&
+            event.ownerGeneration==s.receipt.ownerLease.generation && event.errorCode==0U &&
+            event.rejectReason==MotionRejectReason::NONE;
+        if (valid)
+        {
+            switch(event.type)
+            {
+            case MotionFeedbackType::ACCEPTED: valid=!s.accepted[k]; s.accepted[k]=true; break;
+            case MotionFeedbackType::STARTED: valid=s.accepted[k] && !s.started[k] && (k==0U || s.done[k-1U]); s.started[k]=true; break;
+            case MotionFeedbackType::COMPLETED: valid=s.accepted[k] && s.started[k] && !s.done[k] && (k==0U || s.done[k-1U]); s.done[k]=true; break;
+            case MotionFeedbackType::PROGRESS:
+            case MotionFeedbackType::HELD:
+            case MotionFeedbackType::RESUMED: valid=s.accepted[k] && !s.done[k]; break;
+            default: valid=false; break;
+            }
+        }
+        if (!valid)
+        { RejectG76OrbitSameThread("CHILD_FEEDBACK_IDENTITY_OR_LIFECYCLE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
+        s.lastFeedback[k]=event.sequence;
+        if (event.type==MotionFeedbackType::COMPLETED && m_edm94.gapHistoryArm!=292U)
+        {
+            auto& a=*m_edm171Air;
+            if (s.mixed)
+            {
+                const auto& leg=a.plan.legs[k];
+                if (leg.phase==NCG76Mixed::Phase::Nominal)
+                    AppendEDM171HistorySameThread(leg.geometry,id,s.dispatch,s.commit,s.pc,s.line,leg.nominalOrdinal);
+            }
+            else if (k<s.program.count && (s.program.points[k].phase==NCG76::Phase::Grow || s.program.points[k].phase==NCG76::Phase::FinishCenter))
+            {
+                const auto& from=k ? s.native.pointsMCS[k-1U] : s.native.startMCS;
+                const auto& fromPulse=k ? s.receipt.legEndPulse[k-1U] : s.receipt.startPulse;
+                if (!BuildEDM171LineSameThread(from,s.native.pointsMCS[k],fromPulse,s.receipt.legEndPulse[k],s.native.feedMmMin[k],a.geometry))
+                { RejectG76OrbitSameThread("G76_NOMINAL_CANONICAL_GEOMETRY",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
+                AppendEDM171HistorySameThread(a.geometry,id,s.dispatch,s.commit,s.pc,s.line,s.program.points[k].phase==NCG76::Phase::FinishCenter ? 25U : s.program.points[k].growIndex);
+            }
+        }
+        return;
+    }
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::CompleteG76OrbitSameThread()
+{
+    auto& s=*m_g76Orbit;
+    if (!s.active) return s.completed;
+    if (IsFeedHoldActive() || m_state==NCState::HOLD) return false;
+    if (!s.bound || s.receipt.count==0U || s.receipt.count>128U || m_state!=NCState::RUN || m_mode!=NCOperationMode::MEMORY || Close_System_Com_flag ||
+        AlarmManager::GetInstance().HasAlarm() || s.run!=m_pathCoreLiveBookkeeping.currentRunToken ||
+        s.cache!=GetBaseProgramCache().GetGeneration() || !s.receipt.ownerLease.Matches(m_programMotionLease) ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) || !IsG76OrbitFrameCurrentSameThread() ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread() || !m_motion.MatchesNCTranslation(s.mixed ? m_edm171Air->plan.input.translation : s.native.translation) ||
+        s.receipt.identities[0U].epoch!=m_motion.GetCurrentExecutionEpoch() ||
+        m_motion.GetMotionFeedbackOverflowCount()!=0ULL || m_motion.GetMotionFeedbackProducerNoticeOverflowCount()!=0ULL ||
+        m_motionFeedbackSequenceGapCount!=0ULL || !FeedLedgerTransportHealthy(m_blockLifecycleLedger))
+    { RejectG76OrbitSameThread("COMPLETION_SCOPE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return false; }
+    NCBlockLifecycleSnapshot& ledger=m_edm171Air->ledger;
+    if (!m_blockLifecycleLedger.TryGetSnapshot(s.dispatch,ledger) || ledger.motionSegmentCount!=s.receipt.count ||
+        !ledger.programCommitted || ledger.programCommit.sequence!=s.commit || ledger.motionFailedCount!=0U || ledger.terminalFailure)
+    { RejectG76OrbitSameThread("COMPLETION_LEDGER",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return false; }
+    bool done=true;
+    for (unsigned k=0U;k<s.receipt.count;++k)
+    {
+        if (!FeedFullIdentity(ledger.motionSegments[k].identity,s.receipt.identities[k]))
+        { RejectG76OrbitSameThread("COMPLETION_CHILD_IDENTITY",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return false; }
+        done=done && s.done[k] && ledger.motionSegments[k].completed && ledger.motionSegments[k].terminal;
+    }
+    NCBlockMotionBoundarySnapshot boundary{};
+    if (!m_blockLifecycleLedger.GetMotionBoundarySnapshot(s.dispatch,boundary))
+    { RejectG76OrbitSameThread("COMPLETION_BOUNDARY",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return false; }
+    if (!done || boundary.state!=NCBlockMotionBoundaryState::SUCCEEDED || boundary.motionCompletedCount!=s.receipt.count ||
+        boundary.motionTerminalCount!=s.receipt.count || boundary.motionFailedCount!=0U ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !m_motion.IsGroupNCDrained() || !m_motion.IsGroupDone()) return false;
+    for (unsigned a=0U;a<8U;++a)
+        if (FeedDoubleBits(CoordSys.commandedMCS[a])!=FeedDoubleBits(s.receipt.endMCS[a]))
+        { RejectG76OrbitSameThread("FINAL_ACCEPTED_TAIL",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return false; }
+    if (m_edm94.gapHistoryArm==292U && !IsEDM173RuntimeCompleteSameThread()) return false;
+    ServiceG76OrbitSameThread();
+    s.active=false; s.completed=true;
+    if (m_edm94.gapHistoryArm==292U)
+    {
+        RtPrintf("[EDM173] event=PARENT_COMPLETE dispatch=%llu commit=%llu completed=25 children=25 E5completed=1 evidence=ALL_CHILDREN_GROUP_DRAIN_AND_SHARED_E5 discharge=0\n",
+            static_cast<unsigned long long>(s.dispatch),static_cast<unsigned long long>(s.commit));
+        return true;
+    }
+    RtPrintf("[EDM170] event=COMPLETE dispatch=%llu commit=%llu completed=%u count=%u finalX=%.9f finalY=%.9f finalZ=%.9f evidence=ALL_CHILDREN_AND_GROUP_DRAIN discharge=0\n",
+        static_cast<unsigned long long>(s.dispatch),static_cast<unsigned long long>(s.commit),ledger.motionCompletedCount,s.receipt.count,
+        s.receipt.endMCS[0],s.receipt.endMCS[1],s.receipt.endMCS[2]);
+    return true;
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::ServiceG76OrbitSameThread()
+{
+    if (m_g76PowerInhibited)
+    {
+        ForceEDMPLCOutputsOffSameThread("G76_AIR_RUN_LATCH");
+        if (!m_g76Orbit->active && m_motion.GetMotionOwnerLease().owner==MotionOwner::NONE &&
+            m_motion.IsGroupNCDrained() && m_motion.IsGroupDone() && !m_motion.HasPendingSafetyOrRecoveryRequests() &&
+            !(m_edm94.latched && m_edm94.gapHistoryArm==292U) &&
+            m_resetContinuationPhase==ResetContinuationPhase::IDLE) m_g76PowerInhibited=false;
+    }
+    auto& s=*m_g76Orbit;
+    if (!s.active || !s.bound) return;
+    NCBlockLifecycleSnapshot& ledger=m_edm171Air->ledger;
+    if (!m_blockLifecycleLedger.TryGetSnapshot(s.dispatch,ledger) || ledger.motionSegmentCount!=s.receipt.count) return;
+    while (s.loggedChildren<s.receipt.count)
+    {
+        const unsigned k=s.loggedChildren;
+        const auto& seg=ledger.motionSegments[k];
+        if (!seg.completed || !seg.terminal || !s.done[k] || !FeedFullIdentity(seg.identity,s.receipt.identities[k])) break;
+        if (s.mixed)
+        {
+            const auto& leg=m_edm171Air->plan.legs[k];
+            RtPrintf("[EDM171] event=CHILD_COMPLETED phase=%s pc=%d segment=%u count=%u sourceIndex=%u nominal=%u u0=%.9f u1=%.9f evidence=IDENTITY_MATCHED_FEEDBACK discharge=0\n",
+                leg.phase==NCG76Mixed::Phase::Nominal?"NOMINAL":leg.phase==NCG76Mixed::Phase::Retreat?"RETREAT":"RETURN",s.pc,k+1U,s.receipt.count,
+                leg.originalSourceIndex,leg.nominalOrdinal,leg.startU,leg.endU);
+            ++s.loggedChildren; continue;
+        }
+        if (m_edm94.gapHistoryArm==292U)
+        {
+            RtPrintf("[EDM173] event=CHILD_COMPLETED dispatch=%llu child=%u children=25 evidence=IDENTITY_MATCHED_LEDGER discharge=0\n",
+                static_cast<unsigned long long>(s.dispatch),k+1U);
+            ++s.loggedChildren; continue;
+        }
+        const auto& point=s.program.points[k];
+        const char* phase=point.phase==NCG76::Phase::Grow ? "GROW" : point.phase==NCG76::Phase::ToCenter ? "TO_CENTER" :
+            point.phase==NCG76::Phase::Lift ? "LIFT" : point.phase==NCG76::Phase::ReturnCenter ? "RETURN_CENTER" :
+            point.phase==NCG76::Phase::Resume ? "RESUME" : "FINISH_CENTER";
+        RtPrintf("[EDM170] event=CHILD_COMPLETED phase=%s dispatch=%llu segment=%u count=%u grow=%u centerX=%.6f centerY=%.6f centerZ=%.6f targetX=%.6f targetY=%.6f targetZ=%.6f evidence=IDENTITY_MATCHED_FEEDBACK discharge=0\n",
+            phase,static_cast<unsigned long long>(s.dispatch),k+1U,s.receipt.count,point.growIndex,
+            point.center[0],point.center[1],point.center[2],point.position[0],point.position[1],point.position[2]);
+        ++s.loggedChildren;
+    }
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::RejectG76OrbitSameThread(const char* reason,int alarm)
+{
+    if (m_edm94.latched && m_edm94.gapHistoryArm==292U) CancelEDM94SameThread(reason);
+    const bool accepted=m_g76Orbit->receipt.commandAccepted;
+    const int line=m_g76Orbit->line;
+    RtPrintf("[EDM170] event=REJECT reason=%s pc=%d accepted=%u discharge=0\n",reason,GetActiveDispatchPC(),accepted?1U:0U);
+    m_g76Orbit->active=false; m_g76Orbit->bound=false; m_g76Orbit->completed=false;
+    if (m_g76PowerInhibited) ForceEDMPLCOutputsOffSameThread("G76_AIR_RUN_REJECT");
+    AlarmManager::GetInstance().Trigger(alarm,line);
+    ChangeState(NCState::ALARM);
+    if (accepted) m_motion.RequestEmergencyStopAllAxes();
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::CaptureG76OrbitConfirmationSameThread(int pc,NCBlockDispatchId dispatch) noexcept
+{
+    // A committed confirmation authorizes this one immutable main-program run.
+    // Subsequent M00/HOLD stops do not consume or widen that run/cache grant.
+    if (m_g76Confirmation.confirmed && !m_g76Confirmation.waiting &&
+        m_g76Confirmation.run==m_pathCoreLiveBookkeeping.currentRunToken &&
+        m_g76Confirmation.cache==GetBaseProgramCache().GetGeneration()) return;
+    m_g76Confirmation=G76Confirmation{};
+    const auto& transaction=m_gmBlockTransaction.snapshot;
+    const auto* authored=GetBaseProgramCache().TryGetLine(pc);
+    const auto* next=GetBaseProgramCache().TryGetLine(pc+1);
+    NCBlock stop{},orbit{};
+    if (!transaction.active || !transaction.fromMainProgram || transaction.sourcePC!=pc || transaction.dispatchId!=dispatch ||
+        transaction.phase!=NCGMBlockTransactionPhase::READY_TO_FINALIZE || transaction.postAction!=NCGMBlockPostAction::PROGRAM_STOP_M00 ||
+        m_state!=NCState::RUN || m_mode!=NCOperationMode::MEMORY || !m_macroStack.empty() || m_isSingleBlockEnabled ||
+        m_edm94.latched || !dispatch || !m_pathCoreLiveBookkeeping.currentRunToken || AlarmManager::GetInstance().HasAlarm() ||
+        !authored || !next || authored->parsedBlock.duplicateAddressMask || next->parsedBlock.duplicateAddressMask ||
+        authored->parsedBlock.dependsOnMacroState || next->parsedBlock.dependsOnMacroState ||
+        !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(authored->parsedBlock,stop) ||
+        !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(next->parsedBlock,orbit) ||
+        stop.gCount!=0 || stop.mCount!=1 || stop.mCode[0]!=0 || stop.isGoto || stop.isBlockSkip ||
+        !IsEDM171AirProgramSameThread(pc+1)) return;
+    for (char word='A';word<='Z';++word) if (stop.has(word) && word!='N') return;
+    auto& c=m_g76Confirmation;
+    c.run=m_pathCoreLiveBookkeeping.currentRunToken; c.cache=GetBaseProgramCache().GetGeneration();
+    c.dispatch=dispatch; c.firstPC=pc+1; c.startRequests=m_startDiagnosticRequests; c.waiting=true;
+    RtPrintf("[EDM170] event=OPERATOR_CONFIRMATION result=WAIT_M00_START firstPC=%d run=%llu cache=%llu discharge=0\n",
+        c.firstPC,static_cast<unsigned long long>(c.run),static_cast<unsigned long long>(c.cache));
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::CommitG76OrbitConfirmationResumeSameThread() noexcept
+{
+    auto& c=m_g76Confirmation;
+    if (!c.waiting) return;
+    if (m_state!=NCState::RUN || m_mode!=NCOperationMode::MEMORY || !m_macroStack.empty() || m_isSingleBlockEnabled ||
+        c.run!=m_pathCoreLiveBookkeeping.currentRunToken || c.cache!=GetBaseProgramCache().GetGeneration() ||
+        GetBasePC()!=c.firstPC || m_startDiagnosticRequests<=c.startRequests || m_waitCallback!=WaitForCycleStartCallback ||
+        AlarmManager::GetInstance().HasAlarm() || m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease))
+    { c=G76Confirmation{}; return; }
+    const auto* next=GetBaseProgramCache().TryGetLine(c.firstPC);
+    NCBlock orbit{};
+    if (!next || next->parsedBlock.duplicateAddressMask || next->parsedBlock.dependsOnMacroState ||
+        !NCPreparedBlockQueueShadow::TryBuildLiteralBlock(next->parsedBlock,orbit) ||
+        !IsEDM171AirProgramSameThread(c.firstPC))
+    { c=G76Confirmation{}; return; }
+    const auto speeds=GlobalConfig::GetInstance().GetG76CenterReturnSpeeds();
+    if (!EDM171Config::ValidCenterReturnSpeeds(speeds)) {c=G76Confirmation{};return;}
+    auto& a=*m_edm171Air;
+    a.history.Clear(); a.speeds=speeds; a.run=c.run; a.cache=c.cache; a.lease=m_programMotionLease;
+    a.configured=true; a.selected=a.bound=false;
+    CaptureEDM171AirE6SameThread();
+    c.waiting=false; c.confirmed=true; c.startRequests=m_startDiagnosticRequests;
+    RtPrintf("[EDM170] event=OPERATOR_CONFIRMATION result=START_CONFIRMED firstPC=%d run=%llu cache=%llu discharge=0\n",
+        c.firstPC,static_cast<unsigned long long>(c.run),static_cast<unsigned long long>(c.cache));
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::ResetG76OrbitStateSameThread() noexcept
+{
+    auto& s=*m_g76Orbit;
+    s.run=s.cache=s.dispatch=s.commit=0ULL; s.pc=-1; s.line=0; s.loggedChildren=0U;
+    s.active=s.bound=s.completed=s.inheritedB=s.mixed=false; s.mode=0U; s.sourceG=76;
+    s.accepted.fill(false); s.started.fill(false); s.done.fill(false); s.lastFeedback.fill(0ULL);
+    s.receipt.Clear();
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::IsEDM171AirGrantCurrentSameThread() const noexcept
+{
+    const auto& c=m_g76Confirmation; const auto& a=*m_edm171Air;
+    return c.confirmed && !c.waiting && c.run!=0ULL && c.run==m_pathCoreLiveBookkeeping.currentRunToken &&
+        c.cache!=0ULL && c.cache==GetBaseProgramCache().GetGeneration() && a.configured && a.run==c.run && a.cache==c.cache &&
+        a.lease.Matches(m_programMotionLease) && m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) &&
+        !m_edm94.latched && m_mode==NCOperationMode::MEMORY && !Close_System_Com_flag && m_externalReadyInterlock &&
+        m_macroStack.empty() && !m_isG66Active && !m_isSingleBlockEnabled && !AlarmManager::GetInstance().HasAlarm();
+}
+
+// Capture only at the already validated fresh M00 START. This is an immutable
+// AIR-run receipt, not a rebinding of the global recipe's motion epoch authority.
+NC_PATH_FEED_NOINLINE
+void NCManager::CaptureEDM171AirE6SameThread() noexcept
+{
+    auto& a=*m_edm171Air;
+    a.e6Ready=false; a.e6Catalog=nullptr; a.e6Epoch=MOTION_EXECUTION_EPOCH_INVALID;
+    a.e6=EDMRecipe::ParameterSnapshot{}; a.e6Recipe=EDMRecipe::Summary{};
+    const auto* catalog=m_recipe.GetCatalog(); bool definition=false;
+    if (catalog && catalog->schemaVersion==2U)
+        for (const auto& field:catalog->fields)
+            if (field.id==6U) definition=field.enabled && field.unitConfirmed &&
+                std::strcmp(field.semanticKey,"JumpHeight")==0 && std::strcmp(field.unit,"mm")==0;
+    EDMRecipe::ParameterSnapshot height{};
+    if (definition && ReadEDMRecipeFieldSameThread(6U,height) && height.configured && height.fieldId==6U &&
+        height.actualValue>0LL && height.actualValue<=2000000LL)
+    {
+        a.e6=height; a.e6Recipe=m_recipe.Current(); a.e6Catalog=catalog;
+        a.e6Epoch=m_motion.GetCurrentExecutionEpoch(); a.e6Ready=true;
+    }
+    RtPrintf("[EDM171_FIX2] event=E6_SNAPSHOT result=%s run=%llu cache=%llu epoch=%llu owner=%u/%llu COND=%u E=%u generation=%llu E6microMm=%lld discharge=0\n",
+        a.e6Ready ? "FROZEN" : "UNAVAILABLE",static_cast<unsigned long long>(a.run),
+        static_cast<unsigned long long>(a.cache),static_cast<unsigned long long>(a.e6Epoch),
+        static_cast<unsigned>(a.lease.owner),static_cast<unsigned long long>(a.lease.generation),
+        static_cast<unsigned>(a.e6Recipe.tableId),static_cast<unsigned>(a.e6Recipe.eCode),
+        static_cast<unsigned long long>(a.e6Recipe.generation),static_cast<long long>(a.e6.actualValue));
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::ReadEDM171AirE6SameThread(EDMRecipe::ParameterSnapshot& output) const noexcept
+{
+    output=EDMRecipe::ParameterSnapshot{};
+    const auto& a=*m_edm171Air;
+    if (!IsEDM171AirGrantCurrentSameThread() || m_state!=NCState::RUN || m_recipeRecoveryDisplayOnly ||
+        m_motion.HasPendingSafetyOrRecoveryRequests() || !a.e6Ready || !a.e6Catalog ||
+        a.e6Epoch==MOTION_EXECUTION_EPOCH_INVALID || !a.e6.configured || a.e6.fieldId!=6U ||
+        a.e6.actualValue<=0LL || a.e6.actualValue>2000000LL) return false;
+    const auto* catalog=m_recipe.GetCatalog(); bool definition=false;
+    if (catalog!=a.e6Catalog || !catalog || catalog->schemaVersion!=2U) return false;
+    for (const auto& field:catalog->fields)
+        if (field.id==6U) definition=field.enabled && field.unitConfirmed &&
+            std::strcmp(field.semanticKey,"JumpHeight")==0 && std::strcmp(field.unit,"mm")==0;
+    const auto current=m_recipe.Current(); const auto& frozen=a.e6Recipe;
+    if (!definition || !current.catalogReady || !current.tableSelected || !current.rowSelected ||
+        !frozen.catalogReady || !frozen.tableSelected || !frozen.rowSelected || !frozen.generation ||
+        current.catalogRevision!=frozen.catalogRevision || current.tableId!=frozen.tableId ||
+        current.tableRevision!=frozen.tableRevision || current.profileId!=frozen.profileId ||
+        current.definitionRevision!=frozen.definitionRevision || current.eCode!=frozen.eCode ||
+        current.fieldCount!=frozen.fieldCount || current.configuredCount!=frozen.configuredCount ||
+        current.modifiedCount!=frozen.modifiedCount || current.generation!=frozen.generation) return false;
+    // Read the logical value only to detect edits. The original authorized value
+    // is returned; no global run/epoch/lease receipt is created or refreshed here.
+    EDMRecipe::ParameterSnapshot live{}; const auto& value=a.e6;
+    if (!m_recipe.ReadField(6U,live) || live.fieldId!=value.fieldId || live.configured!=value.configured ||
+        live.rowKind!=value.rowKind || live.rowStageId!=value.rowStageId || live.rowBaseValue!=value.rowBaseValue ||
+        live.stageId!=value.stageId || live.baseValue!=value.baseValue || live.actualValue!=value.actualValue ||
+        live.overridePresent!=value.overridePresent || live.modified!=value.modified) return false;
+    output=value;
+    return true;
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::NormalizeEDM171AirBlockSameThread(const NCBlock& input,NCBlock& output,
+    int pc,int line,NCBlockDispatchId dispatch)
+{
+    output=input;
+    auto& a=*m_edm171Air; a.selected=false; a.bound=false;
+    // The existing live EDM/G180 modal-B family owns its unchanged decoder.
+    if (m_edm94.latched) return true;
+    const bool motion=NCGCodeSemantics::Contains(input,1) || NCGCodeSemantics::Contains(input,2) ||
+        NCGCodeSemantics::Contains(input,3) || NCGCodeSemantics::Contains(input,76);
+    if (!motion || (!input.has('B') && !IsEDM171AirGrantCurrentSameThread())) return true;
+    const auto* authored=GetBaseProgramCache().TryGetLine(pc);
+    bool valid=IsEDM171AirGrantCurrentSameThread() && m_state==NCState::RUN && !m_g76Orbit->active &&
+        authored && authored->sourceLineNumber==line && !authored->parsedBlock.duplicateAddressMask &&
+        !authored->parsedBlock.dependsOnMacroState && authored->parsedBlock.controlType==NCParsedControlType::NONE &&
+        authored->parsedBlock.error==NCParseError::NONE &&
+        NCPreparedBlockQueueShadow::TryBuildLiteralBlock(authored->parsedBlock,a.literal) &&
+        input.gCount==1 && input.hasG && input.gCodes[0]==input.gCode && input.mCount==0 &&
+        a.literal.gCount==input.gCount && a.literal.gCode==input.gCode && a.literal.gCodes[0]==input.gCodes[0] &&
+        a.literal.hasG==input.hasG && a.literal.mCount==input.mCount && !input.isBlockSkip && !input.isGoto &&
+        !input.has('Q') && (input.gCode==76 || !input.has('P'));
+    for (char word='A';word<='Z' && valid;++word)
+        valid=input.has(word)==a.literal.has(word) && (!input.has(word) ||
+            (std::isfinite(input.val(word)) && FeedDoubleBits(input.val(word))==FeedDoubleBits(a.literal.val(word))));
+    unsigned mode=0U;
+    if (valid && input.has('B'))
+    {
+        const double b=input.val('B');
+        valid=b==0.0 || b==2.0 || (input.gCode==76 && (b==3.0 || b==4.0));
+        if (valid) mode=static_cast<unsigned>(b);
+    }
+    else if (valid && m_g76Modal.valid)
+    {
+        valid=m_g76Modal.run==a.run && m_g76Modal.cache==a.cache && m_g76Modal.commit!=0ULL &&
+            m_g76Modal.lease.Matches(a.lease);
+        mode=m_g76Modal.mode;
+    }
+    if (input.gCode!=76) { output.hasParam['B'-'A']=false; output.param['B'-'A']=0.0; }
+    if (valid)
+        valid=input.gCode==76 ? IsG76OrbitBlockShapeValid(output,true,CoordSys.isInchMode?20:21) :
+            input.gCode==1 ? IsPathCoreFeedBlockShapeValid(output,true,CoordSys.isInchMode?20:21,false,17) :
+            IsPathCoreArcBlockShapeValid(output,true,CoordSys.isInchMode?20:21,false,17);
+    if (!valid)
+    { RejectG76OrbitSameThread("AIR_LITERAL_OR_MODAL_SCOPE",AlarmManager::G_Code_Invalid_parameter); return false; }
+    a.selected=true; a.mode=mode; a.inherited=!input.has('B'); a.dispatch=dispatch; a.pc=pc; a.lineNumber=line;
+    a.normalized=output;
+    if (input.gCode!=76)
+    {
+        ResetG76OrbitStateSameThread();
+        auto& source=*m_g76Orbit; source.pc=pc; source.line=line; source.mode=mode; source.sourceG=input.gCode;
+        if (!CaptureCncFeedValueSameThread(output,source.feed) || source.feed.feedMMMin>30.0 ||
+            !PrepareG76OrbitTranslationSameThread(output) || !BuildEDM171NominalSameThread(output,false))
+        { RejectG76OrbitSameThread("AIR_FEED_OR_NATIVE_SOURCE",AlarmManager::G_Code_Invalid_parameter); return false; }
+        const auto& geometry=a.input.nominal.geometry[0U];
+        double displacement=0.0;
+        for (unsigned axis=0U;axis<3U;++axis) displacement=std::hypot(displacement,geometry.endMCS[axis]-geometry.startMCS[axis]);
+        if (!std::isfinite(displacement) || displacement>2.0 ||
+            (geometry.kind==NCPathCoreRetainedKind::ARC && geometry.radiusMM>1.0))
+        { RejectG76OrbitSameThread("AIR_SMALL_NATIVE_ENVELOPE",AlarmManager::G_Code_Invalid_parameter); return false; }
+    }
+    m_g76PowerInhibited=true; ForceEDMPLCOutputsOffSameThread("EDM171_AIR_MOTION");
+    return true;
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::CommitEDM171AirBlockSameThread(NCBlockDispatchId dispatch,const MotionProgramBlockCapture& capture,
+    const NCProgramCommitSnapshot& commit,bool committed,bool ledgerFound,const NCBlockLifecycleSnapshot& ledger,int pc,int line)
+{
+    auto& a=*m_edm171Air;
+    if (!a.selected || a.dispatch!=dispatch) return;
+    bool valid=IsEDM171AirGrantCurrentSameThread() && committed && commit.IsValid() && ledgerFound &&
+        commit.scope==NCProgramScope::MEMORY && commit.cacheGeneration==a.cache && commit.frameId==0ULL &&
+        commit.sourcePC==pc && pc==a.pc && line==a.lineNumber && ledger.sourceLineNumber==line &&
+        ledger.dispatchId==dispatch && ledger.programCommitted && !ledger.ncDispatchFailed && !ledger.motionCaptureOverflow &&
+        FeedSameSource(commit,ledger.programCommit) && commit.sequence==ledger.programCommit.sequence &&
+        capture.count>0U && capture.count<=128U && !capture.overflow && ledger.motionSegmentCount==capture.count;
+    if (a.normalized.gCode==76 || a.mode==2U)
+        valid=valid && m_g76Orbit->active && m_g76Orbit->bound && m_g76Orbit->dispatch==dispatch && m_g76Orbit->commit==commit.sequence;
+    else
+    {
+        const bool arc=a.normalized.gCode==2 || a.normalized.gCode==3;
+        const MotionExecutionIdentity& identity=arc ? m_pathArcMotion.receipt.identity : m_pathFeedMotion.receipt.identity;
+        valid=valid && capture.count==1U && (arc ? (m_pathArc.bound && m_pathArc.dispatch==dispatch && m_pathArc.commit==commit.sequence) :
+            (m_pathFeed.bound && m_pathFeed.dispatch==dispatch && m_pathFeed.commit==commit.sequence)) &&
+            capture.submissions[0U].producerAccepted && capture.submissions[0U].immediateRejectReason==MotionRejectReason::NONE &&
+            FeedFullIdentity(identity,capture.submissions[0U].identity) && FeedFullIdentity(identity,ledger.motionSegments[0U].identity);
+    }
+    if (!valid)
+    { RejectG76OrbitSameThread("AIR_MODAL_COMMIT_BINDING",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
+    m_g76Modal.run=a.run; m_g76Modal.cache=a.cache; m_g76Modal.lease=a.lease;
+    m_g76Modal.commit=commit.sequence; m_g76Modal.mode=a.mode; m_g76Modal.valid=true; a.bound=true;
+    RtPrintf("[EDM171] event=AIR_MODE_COMMITTED g=%d B=%u inherited=%u pc=%d dispatch=%llu commit=%llu discharge=0\n",
+        a.normalized.gCode,a.mode,a.inherited?1U:0U,pc,static_cast<unsigned long long>(dispatch),static_cast<unsigned long long>(commit.sequence));
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::BuildEDM171LineSameThread(const std::array<double,8U>& from,const std::array<double,8U>& to,
+    const std::array<double,8U>& fromPulse,const std::array<double,8U>& toPulse,double feed,NCPathCoreRetainedGeometry& geometry)
+{
+    auto& a=*m_edm171Air; auto& in=a.lineInput;
+    in.startMCS=from; in.endMCS=to; in.startPulse=fromPulse; in.endPulse=toPulse; in.axisMask=0U; in.feedMMMin=feed;
+    for (unsigned axis=0U;axis<3U;++axis) if (from[axis]!=to[axis] || fromPulse[axis]!=toPulse[axis]) in.axisMask|=1U<<axis;
+    for (unsigned axis=0U;axis<8U;++axis) in.maxVelocityPPS[axis]=m_motion.GetAxisContext(static_cast<int>(axis)).maxVel_PPS;
+    return BuildNCPathCoreFeedLine(in,a.line)==NCPathCoreFeedLineCode::BUILT_LINE && BuildNCPathCoreRetainedLine(a.line,geometry);
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::BuildEDM171NominalSameThread(const NCBlock& block,bool orbit)
+{
+    auto& a=*m_edm171Air; auto& n=a.input.nominal; auto& s=*m_g76Orbit;
+    auto& h=a.input.history;
+    h.count=0U; h.validAxisMask=0U;
+    for (unsigned axis=0U;axis<8U;++axis)
+    {
+        const AxisContext& context=m_motion.GetAxisContext(static_cast<int>(axis));
+        h.pulsePerUnit[axis]=context.isExist ? context.resolution_PPR/context.finalLead : 0.0;
+        if (context.isExist) h.validAxisMask|=1U<<axis;
+    }
+    if (a.history.Count()!=0U && !a.history.Snapshot(h)) return false;
+    NCG76Mixed::Point8 start{},pulse{};
+    for (unsigned axis=0U;axis<8U;++axis)
+    {
+        start[axis]=CoordSys.commandedMCS[axis];
+        pulse[axis]=m_motion.GetAxisContext(static_cast<int>(axis)).isExist ?
+            m_motion.GetAxisContext(static_cast<int>(axis)).logicalCmdPos.Load() : 0.0;
+    }
+    if (orbit) return NCG76Mixed::BuildG76Nominal(s.native,pulse,h.pulsePerUnit,s.pc,s.line,n);
+    n.count=0U; n.triggerAfter=1U; n.pc=s.pc; n.line=s.line;
+    n.kind=block.gCode==1 ? NCG76Mixed::Kind::LINE : NCG76Mixed::Kind::ARC;
+    double words[8]={},targetRaw[8]={}; bool selected[8]={};
+    for (unsigned axis=0U;axis<3U;++axis)
+        if (block.has(static_cast<char>('X'+axis)))
+        { selected[axis]=true; words[axis]=NCTranslationLengthToMM(block.val(static_cast<char>('X'+axis)),CoordSys.isInchMode?20:21); }
+    const bool arc=block.gCode!=1;
+    const bool fullCircle=arc && !selected[0] && !selected[1];
+    if (!CoordSys.CompleteFixedPlanarEndpoint(words,selected)) return false;
+    CoordSys.Preview_WCS_to_MCS(words,selected,targetRaw);
+    NCG76Mixed::Point8 target{},endPulse{};
+    for (unsigned axis=0U;axis<8U;++axis)
+    {
+        target[axis]=targetRaw[axis];
+        endPulse[axis]=target[axis]==start[axis] ? pulse[axis] : target[axis]*h.pulsePerUnit[axis];
+    }
+    if (!arc)
+    {
+        if (!BuildEDM171LineSameThread(start,target,pulse,endPulse,s.feed.feedMMMin,n.geometry[0U])) return false;
+    }
+    else
+    {
+        auto& in=a.arcInput;
+        in.startMCS=start; in.endMCS=target; in.startPulse=pulse; in.endPulse=endPulse;
+        in.feedMMMin=s.feed.feedMMMin; in.plane=17U; in.fullCircle=fullCircle;
+        const auto& frame=CoordSys.GetTranslationSnapshot();
+        in.direction=(block.gCode==2 ? -1 : 1)*(((frame.mirrorMask&1U)!=0U)!=((frame.mirrorMask&2U)!=0U) ? -1 : 1);
+        double i=block.has('I') ? NCTranslationLengthToMM(block.val('I'),frame.unitsMode) : 0.0;
+        double j=block.has('J') ? NCTranslationLengthToMM(block.val('J'),frame.unitsMode) : 0.0;
+        if (!NCTranslationRotateArcVector(frame,i,j,in.centerOffsetMM[0],in.centerOffsetMM[1])) return false;
+        if (block.has('R') && !TryResolveNCPathRadiusArcCenter(start[0],start[1],target[0],target[1],
+            NCTranslationLengthToMM(block.val('R'),frame.unitsMode)*(frame.scalingMode==51 ? frame.scalingFactor : 1.0),
+            in.direction,in.centerOffsetMM[0],in.centerOffsetMM[1])) return false;
+        in.pulsePerMM={{h.pulsePerUnit[0],h.pulsePerUnit[1]}};
+        in.maxVelocityPPS={{m_motion.GetAxisContext(0).maxVel_PPS,m_motion.GetAxisContext(1).maxVel_PPS}};
+        float roundoff=0.0F;
+        if (!TryGetNCTranslationArcRoundoffMM(frame,roundoff,fullCircle) ||
+            BuildNCPathCoreFeedArc(in,a.arc,roundoff)!=NCPathCoreFeedArcCode::BUILT_ARC ||
+            !BuildNCPathCoreRetainedArc(a.arc,n.geometry[0U])) return false;
+    }
+    n.count=1U; n.feedMmMin[0U]=s.feed.feedMMMin;
+    return true;
+}
+
+NC_PATH_FEED_NOINLINE
+WaitConditionFunc NCManager::StartEDM171MixedMotionSameThread(const NCBlock& block)
+{
+    auto& a=*m_edm171Air; auto& s=*m_g76Orbit;
+    const bool orbit=block.gCode==76;
+    bool sourceCurrent=block.hasG==a.normalized.hasG && block.gCode==a.normalized.gCode && block.gCount==a.normalized.gCount &&
+        block.gCodes[0]==a.normalized.gCodes[0] && block.mCount==a.normalized.mCount;
+    for (char word='A';word<='Z' && sourceCurrent;++word)
+        sourceCurrent=block.has(word)==a.normalized.has(word) && (!block.has(word) ||
+            FeedDoubleBits(block.val(word))==FeedDoubleBits(a.normalized.val(word)));
+    if (!sourceCurrent || !IsEDM171AirGrantCurrentSameThread() || !m_pathFeed.armed ||
+        m_pathFeed.run!=m_pathCoreLiveBookkeeping.currentRunToken || m_pathFeed.cache!=GetBaseProgramCache().GetGeneration() ||
+        !a.selected || a.mode!=2U ||
+        a.dispatch!=m_currentExecutingBlockDispatchId || m_state!=NCState::RUN || !IsG76OrbitFrameCurrentSameThread() ||
+        !IsPathCoreLiveNativeConfigCurrentSameThread() || !IsPathCoreFeedConfigurationValid() ||
+        !IsFixedTranslationTravelCurrentSameThread() || !m_motion.MatchesNCTranslation(CoordSys.GetTranslationSnapshot()) ||
+        !m_motion.IsGroupNCDrained() || !m_motion.IsGroupDone() || m_motion.HasPendingSafetyOrRecoveryRequests() ||
+        m_motion.GetCommandIngressSize()!=0U || m_motion.GetCommandReplaySize()!=0U ||
+        m_motion.GetMotionFeedbackOverflowCount()!=0ULL || m_motion.GetMotionFeedbackProducerNoticeOverflowCount()!=0ULL ||
+        m_motionFeedbackSequenceGapCount!=0ULL || !FeedLedgerTransportHealthy(m_blockLifecycleLedger))
+    { RejectG76OrbitSameThread("B2_SCOPE_OR_STOPPED_ADMISSION",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    if (!orbit)
+    {
+        ResetG76OrbitStateSameThread();
+        s.run=a.run; s.cache=a.cache; s.dispatch=a.dispatch; s.pc=a.pc; s.line=a.lineNumber;
+        if (!CaptureCncFeedValueSameThread(block,s.feed) || s.feed.feedMMMin>30.0)
+        { RejectG76OrbitSameThread("B2_FEED_PROVENANCE",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    }
+    s.sourceG=block.gCode; s.mode=2U; s.inheritedB=a.inherited; s.mixed=true;
+    EDMRecipe::ParameterSnapshot distance{};
+    if (!ReadEDM171AirE6SameThread(distance))
+    { RejectG76OrbitSameThread("B2_E6_SNAPSHOT",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    if (!BuildEDM171NominalSameThread(block,orbit))
+    { RejectG76OrbitSameThread("B2_NOMINAL_SOURCE",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    auto& input=a.input;
+    if (!orbit)
+    {
+        const auto& geometry=input.nominal.geometry[0U]; double displacement=0.0;
+        for (unsigned axis=0U;axis<3U;++axis) displacement=std::hypot(displacement,geometry.endMCS[axis]-geometry.startMCS[axis]);
+        if (!std::isfinite(displacement) || displacement>2.0 || (geometry.kind==NCPathCoreRetainedKind::ARC && geometry.radiusMM>1.0))
+        { RejectG76OrbitSameThread("B2_SMALL_NATIVE_ENVELOPE",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    }
+    input.scope.run=a.run; input.scope.cache=a.cache; input.scope.lease=a.lease;
+    input.scope.translationGeneration=CoordSys.GetTranslationSnapshot().generation;
+    input.translation=CoordSys.GetTranslationSnapshot();
+    input.retreatMm=static_cast<double>(distance.actualValue)/static_cast<double>(EDMRecipe::Scale);
+    input.outFeedMmMin=input.returnFeedMmMin=s.feed.feedMMMin;
+    if (!NCG76Mixed::Build(input,a.plan))
+    {
+        RtPrintf("[EDM171] event=B2_PLAN_REJECT status=%s E6=%.6f available=%.6f history=%u pc=%d beforePublish=1\n",
+            NCG76Mixed::StatusName(a.plan.status),input.retreatMm,a.plan.availableMm,input.history.count,s.pc);
+        RejectG76OrbitSameThread("B2_CANONICAL_HISTORY_PLAN",AlarmManager::G_Code_Invalid_parameter); return nullptr;
+    }
+    m_g76PowerInhibited=true; ForceEDMPLCOutputsOffSameThread("EDM171_B2_BATCH");
+    const bool accepted=m_motion.TryG76MixedMoveTransactionalTail(a.plan,CoordSys.commandedMCS,s.receipt);
+    const auto& r=s.receipt;
+    unsigned movedMask=0U;
+    for (unsigned k=0U;k<a.plan.count;++k) movedMask|=a.plan.legs[k].geometry.axisMask;
+    bool valid=accepted && r.valid && r.commandAccepted && r.captureBound && r.tailCommitted &&
+        r.count==a.plan.count && r.count>0U && r.count<=128U && movedMask!=0U && (movedMask&~7U)==0U &&
+        r.axisMask==movedMask && (r.validAxisMask&movedMask)==movedMask &&
+        r.translationGeneration==input.scope.translationGeneration && r.ownerLease.Matches(a.lease) &&
+        r.tail.axisMask==r.validAxisMask && r.tail.ownerLease.Matches(r.ownerLease) &&
+        r.tail.IsCommitted() && r.tail.captureBound && FeedFullIdentity(r.tail.identity,r.identities[r.count-1U]);
+    for (unsigned k=0U;k<r.count && k<128U && valid;++k)
+    {
+        const auto& leg=a.plan.legs[k];
+        valid=r.identities[k].IsAssigned() && r.identities[k].epoch==m_motion.GetCurrentExecutionEpoch() &&
+            r.identities[k].source==MotionCommandSource::NC_MEMORY && r.identities[k].sourceBlockId==static_cast<MotionSourceBlockId>(s.pc);
+        for (unsigned axis=0U;axis<8U && valid;++axis)
+        {
+            double end=0.0,endPulse=0.0;
+            valid=EvaluateNCPathCoreRetainedAxisCanonical(leg.geometry,axis,leg.endU,end) &&
+                EvaluateNCPathCoreRetainedPulseCanonical(leg.geometry,axis,leg.endU,endPulse) &&
+                FeedDoubleBits(end)==FeedDoubleBits(r.legEndMCS[k][axis]) && FeedDoubleBits(endPulse)==FeedDoubleBits(r.legEndPulse[k][axis]);
+        }
+        for (unsigned j=0U;j<k && valid;++j) valid=!r.identities[k].Matches(r.identities[j]);
+    }
+    for (unsigned axis=0U;axis<8U && valid;++axis)
+        valid=FeedDoubleBits(CoordSys.commandedMCS[axis])==FeedDoubleBits(r.endMCS[axis]) &&
+            FeedDoubleBits(r.endMCS[axis])==FeedDoubleBits(input.nominal.geometry[input.nominal.count-1U].endMCS[axis]);
+    if (!valid)
+    {
+        RtPrintf("[EDM171] event=B2_NATIVE_REJECT gate=%s axis=%d leg=%d accepted=%u\n",
+            MotionG76AdmissionGateName(r.rejectionGate),r.rejectionAxis,r.rejectionSegment,r.commandAccepted?1U:0U);
+        RejectG76OrbitSameThread("B2_NATIVE_BATCH_RECEIPT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return nullptr;
+    }
+    s.active=true;
+    RtPrintf("[EDM171] event=B2_BEGIN g=%d B=2 inherited=%u trigger=%s pc=%d count=%u reverse=%u E6=%.6f available=%.6f discharge=0\n",
+        block.gCode,s.inheritedB?1U:0U,orbit?"GROW12":"SOURCE_END",s.pc,r.count,a.plan.reverseCount,input.retreatMm,a.plan.availableMm);
+    return [](NCManager* nc){return nc->CompleteG76OrbitSameThread();};
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::AppendEDM171HistorySameThread(const NCPathCoreRetainedGeometry& geometry,
+    const MotionExecutionIdentity& identity,std::uint64_t dispatch,std::uint64_t commit,int pc,int line,unsigned child)
+{
+    auto& a=*m_edm171Air;
+    if (!IsEDM171AirGrantCurrentSameThread() || !IsPathCoreLiveNativeConfigCurrentSameThread() ||
+        !IsFixedTranslationTravelCurrentSameThread() || !identity.IsAssigned() || identity.source!=MotionCommandSource::NC_MEMORY ||
+        identity.sourceBlockId!=static_cast<MotionSourceBlockId>(pc) || !dispatch || !commit || pc<0 || line<=0 || !child)
+    { RejectG76OrbitSameThread("HISTORY_SOURCE_SCOPE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
+    NCG76Mixed::HistoryRow row{};
+    row.geometry=geometry; row.identity=identity; row.lease=a.lease; row.run=a.run; row.cache=a.cache;
+    row.dispatch=dispatch; row.commit=commit; row.translationGeneration=CoordSys.GetTranslationSnapshot().generation;
+    row.pc=pc; row.line=line; row.childOrdinal=child;
+    NCG76Mixed::Point8 ppu{}; unsigned mask=0U;
+    for (unsigned axis=0U;axis<8U;++axis)
+    {
+        const auto& context=m_motion.GetAxisContext(static_cast<int>(axis));
+        ppu[axis]=context.isExist ? context.resolution_PPR/context.finalLead : 0.0;
+        if (context.isExist) mask|=1U<<axis;
+    }
+    if (!a.history.Append(row,mask,ppu))
+    {
+        RtPrintf("[EDM171] event=HISTORY_REJECT status=%s pc=%d child=%u\n",NCG76Mixed::StatusName(a.history.Fault()),pc,child);
+        RejectG76OrbitSameThread("CANONICAL_HISTORY_APPEND",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return;
+    }
+    RtPrintf("[EDM171] event=NOMINAL_RETAINED pc=%d child=%u kind=%s history=%u dispatch=%llu commit=%llu discharge=0\n",
+        pc,child,geometry.kind==NCPathCoreRetainedKind::ARC?"ARC":"LINE",a.history.Count(),
+        static_cast<unsigned long long>(dispatch),static_cast<unsigned long long>(commit));
+}
+
+NC_PATH_FEED_NOINLINE
+void NCManager::ObserveEDM171NominalFeedbackSameThread(const MotionFeedbackEvent& event,bool ledgerAccepted)
+{
+    auto& a=*m_edm171Air;
+    if (!a.selected || !a.bound || a.mode==2U || a.normalized.gCode==76 || !IsEDM171AirGrantCurrentSameThread()) return;
+    const bool arc=a.normalized.gCode==2 || a.normalized.gCode==3;
+    const auto& identity=arc ? m_pathArcMotion.receipt.identity : m_pathFeedMotion.receipt.identity;
+    if (!identity.Matches(event.identity)) return;
+    if (!FeedFullIdentity(identity,event.identity) || !ledgerAccepted || event.owner!=a.lease.owner ||
+        event.ownerGeneration!=a.lease.generation || event.errorCode!=0U || event.rejectReason!=MotionRejectReason::NONE)
+    { RejectG76OrbitSameThread("NOMINAL_FEEDBACK_SOURCE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
+    if (event.type!=MotionFeedbackType::COMPLETED) return;
+    auto& ledger=a.ledger;
+    if (!m_blockLifecycleLedger.TryGetSnapshot(a.dispatch,ledger) || ledger.motionSegmentCount!=1U ||
+        !ledger.motionSegments[0U].completed || !ledger.motionSegments[0U].started || !ledger.motionSegments[0U].runtimeAccepted ||
+        !FeedFullIdentity(identity,ledger.motionSegments[0U].identity) || ledger.motionFailedCount || !ledger.programCommitted ||
+        !(arc ? BuildNCPathCoreRetainedArc(m_pathArcMotion.receipt.arc,a.geometry) :
+            BuildNCPathCoreRetainedLine(m_pathFeedMotion.receipt.line,a.geometry)))
+    { RejectG76OrbitSameThread("NOMINAL_COMPLETION_RECEIPT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
+    AppendEDM171HistorySameThread(a.geometry,identity,a.dispatch,ledger.programCommit.sequence,a.pc,a.lineNumber,1U);
+}
+
+NC_PATH_FEED_NOINLINE
+bool NCManager::IsEDM171AirProgramSameThread(int firstPC) const noexcept
+{
+    bool intent=false;
+    for (unsigned offset=0U;offset<96U;++offset)
+    {
+        const auto* row=GetBaseProgramCache().TryGetLine(firstPC+static_cast<int>(offset));
+        if (!row) return false;
+        const auto& parsed=row->parsedBlock;
+        if (parsed.error!=NCParseError::NONE || parsed.isBlockSkip || parsed.dependsOnMacroState ||
+            parsed.duplicateAddressMask || parsed.controlType!=NCParsedControlType::NONE) return false;
+        if (parsed.isEmpty) continue;
+        NCBlock b{};
+        if (!NCPreparedBlockQueueShadow::TryBuildLiteralBlock(parsed,b)) return false;
+        if (b.gCount==0 && b.mCount==1 && b.mCode[0]==30)
+        {
+            for (char word='A';word<='Z';++word) if (b.has(word) && word!='N') return false;
+            return offset!=0U && intent;
+        }
+        if (b.gCount!=1 || !b.hasG || b.mCount!=0 || b.isGoto || b.has('Q')) return false;
+        const bool orbit=b.gCode==76;
+        intent=intent || orbit || (b.has('B') && b.val('B')==2.0);
+        if (b.has('B'))
+        {
+            const double mode=b.val('B');
+            if (!std::isfinite(mode) || !(mode==0.0 || mode==2.0 || (orbit && (mode==3.0 || mode==4.0)))) return false;
+            if (!orbit) {b.hasParam['B'-'A']=false;b.param['B'-'A']=0.0;}
+        }
+        if (orbit)
+        { if (!IsG76OrbitBlockShapeValid(b,true,CoordSys.isInchMode?20:21)) return false; }
+        else if (b.gCode==1)
+        { if (!IsPathCoreFeedBlockShapeValid(b,true,CoordSys.isInchMode?20:21,false,17)) return false; }
+        else if (b.gCode==2 || b.gCode==3)
+        { if (b.has('P') || !IsPathCoreArcBlockShapeValid(b,true,CoordSys.isInchMode?20:21,false,17)) return false; }
+        else return false;
+    }
+    return false;
 }
 
 #undef NC_PATH_FEED_NOINLINE

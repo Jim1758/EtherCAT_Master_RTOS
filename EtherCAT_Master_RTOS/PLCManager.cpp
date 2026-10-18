@@ -2489,8 +2489,8 @@ bool PLCManager::Get_A(int index) const {
 }
 
 void PLCManager::PublishEDMOutputs(unsigned word) noexcept {
-    // Diagnostic policy is enforced again at the publication boundary.
-    m_edmOutputWord.store(word & (EDM137PLC::FlushBit | EDM137PLC::PolarityBit), std::memory_order_release);
+    // Only the NC owner can publish one coherent S80/S92/S93 image.
+    m_edmOutputWord.store(word & EDM137PLC::OutputMask, std::memory_order_release);
 }
 
 void PLCManager::Set_S(int index, bool value) {

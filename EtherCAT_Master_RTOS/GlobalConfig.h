@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "CompensationEngine.h"
+#include "EDM171G76Config.h"
 
 
 // ============================================================
@@ -140,6 +141,11 @@ public:
         std::vector<AxisContext>& axis,
         MotionCore& motion);
 
+    const EDM171Config::G76CenterReturnSpeeds& GetG76CenterReturnSpeeds() const noexcept
+    {
+        return m_g76CenterReturnSpeeds;
+    }
+
 
     // ========================================================
     // Speed Config
@@ -194,6 +200,9 @@ public:
 
 
 private:
+    // Loaded before NC startup; no runtime parameter or Motion callback I/O.
+    EDM171Config::G76CenterReturnSpeeds m_g76CenterReturnSpeeds{};
+
     // ========================================================
     // Singleton Protection
     // ========================================================

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <type_traits>
 
 // =============================================================================
@@ -28,7 +29,7 @@ using NCBlockDispatchId = std::uint64_t;
 
 constexpr NCBlockDispatchId NC_BLOCK_DISPATCH_ID_INVALID = 0ULL;
 constexpr std::size_t NC_BLOCK_LIFECYCLE_CAPACITY = 256U;
-constexpr std::size_t NC_BLOCK_MAX_MOTION_SEGMENTS = 32U;
+constexpr std::size_t NC_BLOCK_MAX_MOTION_SEGMENTS = 128U;
 constexpr std::size_t NC_BLOCK_SEGMENT_INDEX_CAPACITY =
 NC_BLOCK_LIFECYCLE_CAPACITY * NC_BLOCK_MAX_MOTION_SEGMENTS;
 
@@ -205,7 +206,13 @@ static_assert(
 class NCBlockLifecycleLedger
 {
 public:
-    NCBlockLifecycleLedger() noexcept = default;
+    // Fixed storage is initialized once by the out-of-line startup constructor.
+    // Keeping its large array initialization outside this header avoids repeating
+    // the 256 x 128-child constructor expansion in every NC translation unit.
+    NCBlockLifecycleLedger() noexcept;
+    ~NCBlockLifecycleLedger() noexcept;
+    NCBlockLifecycleLedger(const NCBlockLifecycleLedger& other) noexcept;
+    NCBlockLifecycleLedger& operator=(const NCBlockLifecycleLedger& other) noexcept;
 
     NCBlockDispatchId BeginBlock(
         const NCProgramCommitSnapshot& programTarget,
@@ -307,10 +314,8 @@ private:
         NCBlockLifecycleSnapshot& snapshot,
         bool& result) const noexcept;
 
-    std::array<NCBlockLifecycleSnapshot,
-        NC_BLOCK_LIFECYCLE_CAPACITY> m_blocks{};
-    std::array<SegmentIndexEntry,
-        NC_BLOCK_SEGMENT_INDEX_CAPACITY> m_segmentIndex{};
+    struct Storage;
+    std::unique_ptr<Storage> m_storage;
 
     NCBlockDispatchId m_nextDispatchId = 1ULL;
     NCBlockDispatchId m_lastDispatchedId = NC_BLOCK_DISPATCH_ID_INVALID;

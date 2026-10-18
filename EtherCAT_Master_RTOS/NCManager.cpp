@@ -22,6 +22,7 @@
 #include "NCEccentricCTransactionSelfCheck.h"
 #include "CNCStartupStackDiagnostic.h"
 #include "NCExpressionResolver.h"
+#include "EDM149VoltageMotion.h"
 #include "NCProgramCache.h"
 #include "NCBlockLifecycleLedger.h"
 #include "NCBlockCompletionBoundary.h"
@@ -275,6 +276,7 @@ bool NCManager::AdoptProgramMotionLease(
 NCManager::NCManager(MotionCore& motion) : m_motion(motion), MathParser(MacroSys), Parser(),
 m_pathCoreLiveRetention(AllocatePathCoreLiveOwnerTagStartup())
 {
+    m_edm173.reset(new EDM173NCState); // Startup only; no RT/lazy allocation.
     // =========================================================
     // G81 HOME Manager Link
     //
@@ -364,6 +366,8 @@ bool NCManager::RejectProgramLoad(
 
 bool NCManager::LoadProgram(const std::string& filepath)
 {
+    m_g76Confirmation = G76Confirmation{}; m_g76Modal = G76ModalState{};
+    m_edm149Confirmation = EDM149Confirmation{};
     // Selecting another image cancels a waiting explicit START, including a
     // failed selection. It must never start the old image after this intent.
     if (m_programRunStartPending && m_pendingProgramRunPhase == ProgramRunStartPhase::EDM94_RELEASE)
@@ -733,6 +737,11 @@ bool NCManager::LoadProgram(const std::string& filepath)
 
 void NCManager::ChangeMode(NCOperationMode newMode)
 {
+    if (newMode != m_mode)
+    {
+        m_edm149Confirmation = EDM149Confirmation{};
+        m_g76Confirmation = G76Confirmation{}; m_g76Modal = G76ModalState{};
+    }
     // 只有在 IDLE 或 READY 狀態才能切換模式
     if (m_state == NCState::IDLE || m_state == NCState::READY || m_state == NCState::P_END) {
         GCodeHandlers::Reset_G04(this);
@@ -763,6 +772,7 @@ void NCManager::ChangeMode(NCOperationMode newMode)
 }
 
 void NCManager::ChangeState(NCState newState) {
+    if (newState != NCState::RUN) m_edm149Confirmation = EDM149Confirmation{};
     if (newState != NCState::RUN) ForceEDMPLCOutputsOffSameThread("STATE_CHANGE");
     // A clock fault must keep ALARM instead of being overwritten by HOLD.
     if (newState == NCState::HOLD && !GCodeHandlers::Pause_G04(this)) return;
@@ -843,7 +853,9 @@ void NCManager::CycleStart()
     ++m_startDiagnosticRequests;
     m_startDiagnosticEvent = "RECEIVED";
     PrintProgramStartDiagnostic();
+    const bool edm157WasPaused = m_edm157.active;
     ServiceEDM94SameThread();
+    if (TryResumeEDM157SameThread() || (edm157WasPaused && !m_edm157.active && m_state == NCState::RUN)) return;
     const bool waitForEDM94Completion = m_edm94.latched &&
         m_edm94.normalEndCommitted && m_edm94.completionReleaseRequested &&
         m_edm94.complete && !m_edm94.cancelled && !m_edm94.rtFaultReported &&
@@ -1122,12 +1134,14 @@ void NCManager::CycleStart()
 
 void NCManager::FeedHold()
 {
+    m_edm149Confirmation = EDM149Confirmation{};
     // P_END HOLD need not change state. It still consumes a waiting button.
     if (m_programRunStartPending && m_pendingProgramRunPhase == ProgramRunStartPhase::EDM94_RELEASE)
     {
         m_startDiagnosticEvent = "EDM94_RETIRE_HOLD_CANCEL";
         ClearPendingProgramRunStart(true);
     }
+    if (TryHoldEDM157SameThread()) return;
     PauseGapDryRunSameThread("MANUAL_HOLD");
     // Operator Hold revokes an automatic resume even when already in HOLD.
     CancelPathCoreHoldAutomaticSameThread("MANUAL_HOLD");
@@ -1236,6 +1250,8 @@ void NCManager::FeedHoldInternal()
 
 void NCManager::Reset()
 {
+    m_g76Confirmation = G76Confirmation{}; m_g76Modal = G76ModalState{};
+    m_edm149Confirmation = EDM149Confirmation{};
     ForceEDMPLCOutputsOffSameThread("RESET");
     ResetEDM94SameThread();
     // EDM28 only: retain AUTO authority for bounded physical stop/Disarm
@@ -3640,6 +3656,7 @@ void NCManager::ProcessTask()
     const EDMGapInput::Snapshot edmGap = ReadEDMGapInputSnapshotSameThread();
     ObserveEDMProcessShadowSameThread(edmGap); // EDM20: 10 ms shadow preview, no Motion/IO writes.
     ValidateGapDryRunSameThread(); // CG: revoke/pause before early control returns.
+    ServiceG76OrbitSameThread(); // Power inhibition and actual child-ledger observations before early returns.
     ValidatePathCoreFeedSameThread(); // BX-FEED: observe lifecycle before early returns.
     ValidatePathCoreArcSameThread(); // BY-ARC
     ValidatePathCoreReplaySameThread(); // BZ-REPLAY
@@ -4758,11 +4775,61 @@ void NCManager::ProcessExecutionEngine()
             }
         }
 
+        // EDM149 commissioning programs are immutable literal Z paths.
+        if (m_edm94.latched && EDM149::IsTestArm(m_edm94.gapHistoryArm) &&
+            (parsedBlock.isBlockSkip || parsedBlock.dependsOnMacroState ||
+                parsedBlock.controlType != NCParsedControlType::NONE || EDM141::HasMacroSyntax(parsedBlock)))
+        {
+            markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+            RejectEDM94SameThread("EDM149_LITERAL_PATH_REQUIRED", sourceLineNumber);
+            return;
+        }
+
+        // EDM140: only the exact preflighted local bookkeeping row in the
+        // current MEMORY bracket can bypass the frozen parsed-control guard.
+        // This does not evaluate an expression or grant a motion permit.
+        const bool edm140AssignmentProfile = m_edm94.latched &&
+            (m_edm94.gapHistoryArm == 214U || m_edm94.gapHistoryArm == 216U ||
+                m_edm94.gapHistoryArm == 218U || m_edm94.gapHistoryArm == 220U ||
+                m_edm94.gapHistoryArm == 222U || m_edm94.gapHistoryArm == 224U ||
+                m_edm94.gapHistoryArm == 226U || m_edm94.gapHistoryArm == 228U);
+        const bool edm140AssignmentCandidate =
+            parsedBlock.controlType == NCParsedControlType::ASSIGNMENT &&
+            IsEDM140AssignmentCandidateSameThread(parsedBlock, currentPC);
+
+        // An active EDM140 bracket never inherits an optional skip or a
+        // control-flow side effect when its frozen source becomes invalid.
+        if (edm140AssignmentProfile && (parsedBlock.isBlockSkip ||
+            (parsedBlock.controlType != NCParsedControlType::NONE &&
+                parsedBlock.controlType != NCParsedControlType::ASSIGNMENT)))
+        {
+            markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+            RejectEDM94SameThread("EDM140_PARSED_CONTROL", sourceLineNumber);
+            return;
+        }
+
+        // EDM141-PRE-RESOLVE-BEGIN: validate immutable authorship before the
+        // ordinary resolver can read any macro variable for a motion row.
+        if (m_edm94.latched && (m_edm94.gapHistoryArm == 218U || m_edm94.gapHistoryArm == 220U ||
+                m_edm94.gapHistoryArm == 222U || m_edm94.gapHistoryArm == 224U ||
+                m_edm94.gapHistoryArm == 226U || m_edm94.gapHistoryArm == 228U) &&
+            parsedBlock.controlType == NCParsedControlType::NONE &&
+            ((m_edm94.next < m_edm94.moves && currentPC == m_edm94.pc[m_edm94.next]) ||
+                (parsedBlock.dependsOnMacroState || EDM141::HasMacroSyntax(parsedBlock))) &&
+            !IsEDM141MotionCandidateSameThread(parsedBlock, currentPC))
+        {
+            markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+            RejectEDM94SameThread("EDM141_PARSED_MOTION", sourceLineNumber);
+            return;
+        }
+        // EDM141-PRE-RESOLVE-END.
+
         // BASE58-PARSED-BEGIN: these branches never enter ExecuteBlock.
         // Reject before optional skip advances PC or control expressions are
         // evaluated. Variable reads inside allowed XYZ words remain supported.
         if (CoordSys.IsTranslationRunFrozen() &&
-            (parsedBlock.controlType != NCParsedControlType::NONE || parsedBlock.isBlockSkip))
+            (parsedBlock.controlType != NCParsedControlType::NONE || parsedBlock.isBlockSkip) &&
+            !edm140AssignmentCandidate)
         {
             const NCTranslationSnapshot controlSource = CoordSys.GetTranslationSnapshot();
             std::uint32_t controlPresentMask = NCXYZFeedPresentMask(controlSource.axisIdentity);
@@ -4816,6 +4883,17 @@ void NCManager::ProcessExecutionEngine()
             }
             ClearPreDispatchBarrier();
 
+            // Recheck the live bracket and its completed prior row after the
+            // drain. A stale preflight or source change cannot fall back to an
+            // ordinary assignment, even if the frozen flag was invalidated.
+            if (edm140AssignmentProfile && (!edm140AssignmentCandidate ||
+                !AuthorizeEDM140AssignmentSameThread(parsedBlock, currentPC)))
+            {
+                markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                RejectEDM94SameThread("EDM140_ASSIGNMENT_SCOPE", sourceLineNumber);
+                return;
+            }
+
             // BT-BEGIN
             // These control branches bypass ordinary NCBlock capture. Revoke
             // only an already chosen suffix, before evaluating side effects.
@@ -4849,11 +4927,37 @@ void NCManager::ProcessExecutionEngine()
                 return;
             }
 
+            if (edm140AssignmentCandidate)
+            {
+                if (!ValidateEDM140AssignmentSameThread(parsedBlock, currentPC, assignment))
+                {
+                    markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::MATH_ERROR));
+                    RejectEDM94SameThread("EDM140_ASSIGNMENT_RESULT", sourceLineNumber);
+                    return;
+                }
+                // The new opt-in path publishes no macro side effect when the
+                // exact cached-PC commit fails. The legacy ordering below is
+                // unchanged for every other profile.
+                commitCurrentLine();
+                if (!lineCommitSucceeded)
+                {
+                    RejectEDM94SameThread("EDM140_ASSIGNMENT_COMMIT", sourceLineNumber);
+                    return;
+                }
+            }
+
             // 唯一 Side Effect Commit 點。
             MacroSys.SetVar(
                 assignment.prefix,
                 assignment.index,
                 assignment.value);
+
+            if (edm140AssignmentCandidate &&
+                !CompleteEDM140AssignmentSameThread(parsedBlock, currentPC, assignment, lineCommitSnapshot))
+            {
+                RejectEDM94SameThread("EDM140_ASSIGNMENT_RECEIPT", sourceLineNumber);
+                return;
+            }
 
             singleBlockCandidateKind =
                 NCSingleBlockCandidateKind::PROGRAM_CONTROL;
@@ -5315,6 +5419,21 @@ void NCManager::ProcessExecutionEngine()
                 }
             }
 
+            // EDM141-POST-RESOLVE-BEGIN: actual MacroParser values must equal
+            // the frozen admission result before ExecuteBlock or any motion.
+            if (m_edm94.latched && (m_edm94.gapHistoryArm == 218U || m_edm94.gapHistoryArm == 220U ||
+                m_edm94.gapHistoryArm == 222U || m_edm94.gapHistoryArm == 224U ||
+                m_edm94.gapHistoryArm == 226U || m_edm94.gapHistoryArm == 228U) &&
+                ((m_edm94.next < m_edm94.moves && currentPC == m_edm94.pc[m_edm94.next]) ||
+                    (parsedBlock.dependsOnMacroState || EDM141::HasMacroSyntax(parsedBlock))) &&
+                !MatchesEDM141MotionSameThread(parsedBlock, block, currentPC))
+            {
+                markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+                RejectEDM94SameThread("EDM141_RESOLVED_MOTION", sourceLineNumber);
+                return;
+            }
+            // EDM141-POST-RESOLVE-END.
+
             singleBlockCandidateKind =
                 ClassifySingleBlockCandidate(block);
 
@@ -5546,7 +5665,7 @@ void NCManager::ProcessExecutionEngine()
             bool preparedEquivalenceDispatchBound = false;
             if (ordinaryReadAheadSelected)
             {
-                NCBlockLifecycleSnapshot readAheadLedger{};
+                NCBlockLifecycleSnapshot& readAheadLedger=m_ncDispatchScratch->readAheadLedger;
                 const bool readAheadLedgerFound =
                     m_blockLifecycleLedger.TryGetSnapshot(
                         dispatchId,
@@ -5575,7 +5694,7 @@ void NCManager::ProcessExecutionEngine()
             }
             else if (preparedResolverBypassed)
             {
-                NCBlockLifecycleSnapshot bypassLedger{};
+                NCBlockLifecycleSnapshot& bypassLedger=m_ncDispatchScratch->bypassLedger;
                 const bool bypassLedgerFound =
                     m_blockLifecycleLedger.TryGetSnapshot(
                         dispatchId,
@@ -5698,8 +5817,8 @@ void NCManager::ProcessExecutionEngine()
             m_currentExecutingBlockDispatchId =
                 NC_BLOCK_DISPATCH_ID_INVALID;
 
-            const MotionProgramBlockCapture motionCapture =
-                m_motion.EndProgramBlockMotionCapture();
+            MotionProgramBlockCapture& motionCapture=m_ncDispatchScratch->capture;
+            m_motion.EndProgramBlockMotionCapture(motionCapture);
             BindProgramBlockMotionCapture(
                 dispatchId,
                 motionCapture);
@@ -5822,7 +5941,7 @@ void NCManager::ProcessExecutionEngine()
                     lineCommitSucceeded);
             }
 
-            NCBlockLifecycleSnapshot resolverBypassCommitLedger{};
+            NCBlockLifecycleSnapshot& resolverBypassCommitLedger=m_ncDispatchScratch->commitLedger;
             const bool resolverBypassCommitLedgerFound =
                 m_blockLifecycleLedger.TryGetSnapshot(
                     dispatchId,
@@ -6115,12 +6234,17 @@ void NCManager::ProcessExecutionEngine()
             CommitPathCoreCommandedCaptureSameThread(dispatchId, motionCapture,
                 lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
                 resolverBypassCommitLedger, currentPC, sourceLineNumber);
+            CommitG76OrbitCaptureSameThread(dispatchId, motionCapture,
+                lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
+                resolverBypassCommitLedger, currentPC, sourceLineNumber);
             CommitPathCoreFeedCaptureSameThread(dispatchId, motionCapture,
                 lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
                 resolverBypassCommitLedger, currentPC, sourceLineNumber); // BX-FEED
             CommitPathCoreArcCaptureSameThread(dispatchId, motionCapture,
                 lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
                 resolverBypassCommitLedger, currentPC, sourceLineNumber); // BY-ARC
+            CommitEDM171AirBlockSameThread(dispatchId,motionCapture,lineCommitSnapshot,
+                lineCommitSucceeded,resolverBypassCommitLedgerFound,resolverBypassCommitLedger,currentPC,sourceLineNumber);
             CommitPathCoreReplayCaptureSameThread(dispatchId, motionCapture,
                 lineCommitSnapshot, lineCommitSucceeded, resolverBypassCommitLedgerFound,
                 resolverBypassCommitLedger, currentPC, sourceLineNumber); // BZ-REPLAY
@@ -6621,10 +6745,14 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
     {
     case 0:
         return GCodeHandlers::Handle_G00(block, this);
+    case 76: // One compound air-run block, ordinary CNC Motion and retirement.
+        return StartG76OrbitSameThread(block);
     case 1: // BX-FEED: explicit G01 uses its own feed producer.
+        if (m_edm171Air->selected && m_edm171Air->mode==2U) return StartEDM171MixedMotionSameThread(block);
         return StartPathCoreFeedSameThread(block);
     case 2: // BY-ARC: G17 XY circular interpolation, exact stop.
     case 3:
+        if (m_edm171Air->selected && m_edm171Air->mode==2U) return StartEDM171MixedMotionSameThread(block);
         return StartPathCoreArcSameThread(block);
     case 39: // EDM17: prevalidated owner-thread recipe operation.
         (void)CommitEDMRecipeEditSameThread(block);
@@ -6748,7 +6876,9 @@ void NCManager::ExecuteBlock(
     if (!ProcessEDM127BlockSameThread(inputBlock, edm127Geometry, edm127SettingOnly))
     { RejectEDM94SameThread("EDM127_BLOCK_BINDING", sourceLineNumber); return; }
     if (edm127SettingOnly) return;
-    const NCBlock& block = EDM116::IsModalFixture(m_edm94.gapModeFixture) && m_edm94.latched ? edm127Geometry : inputBlock;
+    NCBlock airGeometry{};
+    if (!NormalizeEDM171AirBlockSameThread(inputBlock,airGeometry,sourcePC,sourceLineNumber,dispatchId)) return;
+    const NCBlock& block = EDM116::IsModalFixture(m_edm94.gapModeFixture) && m_edm94.latched ? edm127Geometry : airGeometry;
     // EDM17 validates the complete literal command before any setting/T/M/frame.
     if (IsEDMRecipeEditRequest(block) &&
         !PrepareEDMRecipeEditSameThread(block, sourcePC, sourceLineNumber, dispatchId)) return;
@@ -6857,6 +6987,9 @@ void NCManager::ExecuteBlock(
         !IsNCZCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
         !IsNCXYZCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
         !IsNCXYZCUVFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block) &&
+        !IsEDM149ZFeedBlockSameThread(block) &&
+        !IsEDM150XYZFeedBlockSameThread(block) &&
+        !IsEDM154SparseFeedBlockSameThread(block) &&
         !IsNCEccentricCFeedBlockAllowed(CoordSys.GetTranslationSnapshot(), block)) ||
         IsPathCoreFeedInputOmission(block))
     {
@@ -9193,6 +9326,11 @@ bool NCManager::FinalizeGMBlockTransaction()
     switch (snapshot.postAction)
     {
     case NCGMBlockPostAction::PROGRAM_STOP_M00:
+        if (snapshot.fromMainProgram)
+        {
+            CaptureEDM149ConfirmationSameThread(snapshot.sourcePC,snapshot.dispatchId);
+            CaptureG76OrbitConfirmationSameThread(snapshot.sourcePC,snapshot.dispatchId);
+        }
         ++m_gmBlockTransactionCounters.m00Stops;
         m_pauseAfterBlock = true;
         snapshot.postActionApplied = true;
@@ -10280,6 +10418,8 @@ bool NCManager::ApplyProgramHoldResume(
     ClearHoldResumeAlarmAdmission(
         HoldResumeAdmissionKind::PROGRAM_HOLD);
     ResumePathCoreLiveRetentionSameThread();
+    CommitEDM149ConfirmationResumeSameThread();
+    CommitG76OrbitConfirmationResumeSameThread();
     return true;
 }
 

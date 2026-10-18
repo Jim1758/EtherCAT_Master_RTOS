@@ -1,5 +1,7 @@
 #pragma once
+#include "EDM149VoltageMotion.h"
 #include <cstdint>
+#include <cstddef>
 #include <cmath>
 #include <limits>
 #include <cstring>
@@ -11,6 +13,12 @@ namespace EDM130
 constexpr std::uint64_t MinimumWorkTimeUs=50000ULL, MaximumWorkTimeUs=10000000ULL;
 // EDM132 unloaded-fixture admission fence; the catalog retains its native range.
 constexpr std::uint64_t MinimumJumpHeightScaled=100ULL, MaximumJumpHeightScaled=5000ULL;
+constexpr std::uint16_t VisibleFlushProfile158=1U, VisibleFlushProfile159=2U, VisibleFlushProfile167=3U, VisibleFlushProfile173=4U;
+constexpr std::uint64_t VisibleFlushHeightScaled158=5000000ULL, VisibleFlushWorkUs158=500000ULL;
+constexpr std::uint64_t VisibleFlushHeightScaled159=2000000ULL, VisibleFlushWorkUs159=500000ULL;
+constexpr std::uint64_t VisibleFlushHeightScaled167=2000000ULL, VisibleFlushWorkUs167=500000ULL;
+constexpr std::uint64_t VisibleFlushHeightScaled173=2000000ULL;
+constexpr std::uint64_t VisibleFlushMinimumWorkUs173=250000ULL, VisibleFlushMaximumWorkUs173=2000000ULL;
 // EDM136 captures only the installed process curve shape. Bounded path speed,
 // voltage-reference policy and physical authorization remain separate contracts.
 struct Curve
@@ -116,9 +124,25 @@ struct Recipe
     std::uint64_t generation=0ULL,workTimeUs=0ULL;
     // EDM131: optional immutable E7 override. Both zero preserve EDM130.
     std::uint16_t speedFieldId=0U;
+    // EDM139: 0 = physical AD control, 1 = explicit simulated control stimulus.
+    // Legacy source 1 retains physical monitoring. Sources 2/3 use software
+    // steps/wave without AD; source 4 uses physical AD with discharge inhibited.
+    std::uint16_t diagnosticControlSource=0U;
+    // EDM156 seals the bounded admitted NC plan in existing alignment space.
+    // Both zero retain all earlier fixed fixtures; no process table field is added.
+    std::uint16_t planRows=0U,planMovementMask=0U;
     std::uint64_t jumpSpeedPercentScaled=0ULL; // Percent in recipe fixed-point units (1e6).
     // EDM132: optional absolute height in millimetres, captured with E5/E7.
     std::uint16_t heightFieldId=0U;
+    // Explicit commissioning opt-in in existing alignment space; old offsets stay fixed.
+    std::uint16_t commissioningProfile=0U;
+    // EDM163: literal G180 H1 opts the bounded mainline into path HOLD retreat.
+    // Zero preserves ordinary HOLD; this immutable value uses prior padding.
+    std::uint16_t holdRetreatMode=0U;
+    // EDM165/168: literal H1 L1 selects the first global E5; L2 selects the
+    // first B1 E5; L3 selects an eligible B2 E5 after crossing retained history.
+    // NC submits one existing HOLD transaction at >=25%; START remains operator-only.
+    std::uint16_t flushHoldTest=0U;
     std::uint64_t jumpHeightScaled=0ULL; // Millimetres in recipe fixed-point units (1e6).
     // EDM133: explicit E21/E22 binding, including a disabled zero interval.
     std::uint16_t intervalFieldId=0U,multiplierFieldId=0U;
@@ -134,13 +158,31 @@ struct Recipe
     Curve curve{};
     FlushStages flushStages{};
 };
+inline bool IsVisibleFlush(const Recipe& r) noexcept
+{return r.commissioningProfile==VisibleFlushProfile158;}
+inline bool IsVisibleFlush159(const Recipe& r) noexcept
+{return r.commissioningProfile==VisibleFlushProfile159;}
+inline bool IsVisibleFlush167(const Recipe& r) noexcept
+{return r.commissioningProfile==VisibleFlushProfile167;}
+inline bool IsVisibleFlush173(const Recipe& r) noexcept
+{return r.commissioningProfile==VisibleFlushProfile173;}
+inline bool IsOneShotCommissioning(const Recipe& r) noexcept
+{return IsVisibleFlush(r)||IsVisibleFlush159(r)||IsVisibleFlush167(r)||IsVisibleFlush173(r);}
+// Explicit L words remain opt-in: omitted L is stored as zero, never L0.
+inline bool ValidFlushHoldSelection(unsigned arm,unsigned value) noexcept
+{return value==1U?(EDM149::IsFlushHoldTestArm(arm)&&!EDM149::IsManualVoltageTestArm(arm)):
+    (arm==274U&&(value==2U||value==3U));}
+inline unsigned FlushHoldTargetMode(unsigned selector) noexcept
+{return selector==2U?1U:selector==3U?2U:3U;}
 inline bool SameRecipe(const Recipe& a,const Recipe& b) noexcept
 {
     return a.catalogRevision==b.catalogRevision&&a.definitionRevision==b.definitionRevision&&
         a.profileId==b.profileId&&a.tableId==b.tableId&&a.tableRevision==b.tableRevision&&
         a.eCode==b.eCode&&a.fieldId==b.fieldId&&a.generation==b.generation&&a.workTimeUs==b.workTimeUs&&
-        a.speedFieldId==b.speedFieldId&&a.jumpSpeedPercentScaled==b.jumpSpeedPercentScaled&&
-        a.heightFieldId==b.heightFieldId&&a.jumpHeightScaled==b.jumpHeightScaled&&
+        a.speedFieldId==b.speedFieldId&&a.diagnosticControlSource==b.diagnosticControlSource&&
+        a.planRows==b.planRows&&a.planMovementMask==b.planMovementMask&&a.jumpSpeedPercentScaled==b.jumpSpeedPercentScaled&&
+        a.heightFieldId==b.heightFieldId&&a.commissioningProfile==b.commissioningProfile&&
+        a.holdRetreatMode==b.holdRetreatMode&&a.flushHoldTest==b.flushHoldTest&&a.jumpHeightScaled==b.jumpHeightScaled&&
         a.intervalFieldId==b.intervalFieldId&&a.multiplierFieldId==b.multiplierFieldId&&
         a.deepFlushCycleInterval==b.deepFlushCycleInterval&&
         a.deepFlushHeightMultiplierScaled==b.deepFlushHeightMultiplierScaled&&
@@ -149,6 +191,29 @@ inline bool SameRecipe(const Recipe& a,const Recipe& b) noexcept
         a.referenceFieldId==b.referenceFieldId&&a.referenceVoltageScaled==b.referenceVoltageScaled&&
         SameCurve(a.curve,b.curve)&&SameFlushStages(a.flushStages,b.flushStages);
 }
+inline bool UsesDiagnosticControl(const Recipe& r) noexcept
+{return r.diagnosticControlSource==1U;}
+inline bool UsesSoftwareVoltage(const Recipe& r) noexcept
+{return EDM149::IsSoftwareSource(r.diagnosticControlSource);}
+inline bool IsMotionTest(const Recipe& r) noexcept
+{return EDM149::IsTestSource(r.diagnosticControlSource);}
+inline bool RequiresPhysicalVoltage(const Recipe& r) noexcept
+{return !UsesSoftwareVoltage(r);}
+inline bool HasBoundProgramPlan(const Recipe& r) noexcept
+{return r.planRows!=0U&&r.planMovementMask!=0U;}
+inline bool ValidProgramPlan(const Recipe& r) noexcept
+{
+    if(IsVisibleFlush173(r))return IsMotionTest(r)&&r.planRows==25U&&r.planMovementMask==7U;
+    return (!r.planRows&&!r.planMovementMask)||(IsMotionTest(r)&&r.planRows>=1U&&r.planRows<=16U&&
+        r.planMovementMask<=63U&&(r.planMovementMask&7U)!=0U&&
+        (!IsVisibleFlush(r)||(r.planRows==1U&&r.planMovementMask==4U))&&
+        (!IsVisibleFlush159(r)||(r.planRows==3U&&r.planMovementMask==7U))&&
+        (!IsVisibleFlush167(r)||(r.planRows==3U&&r.planMovementMask==63U)));
+}
+inline unsigned ProgramRows(const Recipe& r) noexcept
+{return HasBoundProgramPlan(r)?r.planRows:16U;}
+inline unsigned ProgramMovementMask(const Recipe& r) noexcept
+{return HasBoundProgramPlan(r)?r.planMovementMask:63U;}
 inline bool EmptyRecipe(const Recipe& r) noexcept {return SameRecipe(r,Recipe{});}
 inline bool ValidWorkTime(std::uint64_t us) noexcept
 {return us>=MinimumWorkTimeUs&&us<=MaximumWorkTimeUs;}
@@ -156,8 +221,12 @@ inline bool ValidSpeedPercent(std::uint64_t percentScaled) noexcept
 {return percentScaled>=50000000ULL&&percentScaled<=100000000ULL;}
 inline bool HasBoundSpeed(const Recipe& r) noexcept
 {return r.speedFieldId!=0U&&r.jumpSpeedPercentScaled!=0ULL;}
-inline bool ValidJumpHeight(std::uint64_t heightScaled) noexcept
-{return heightScaled>=MinimumJumpHeightScaled&&heightScaled<=MaximumJumpHeightScaled;}
+inline bool ValidJumpHeight(std::uint64_t heightScaled,unsigned commissioningProfile=0U) noexcept
+{return commissioningProfile<=VisibleFlushProfile173&&(commissioningProfile==VisibleFlushProfile173?heightScaled==VisibleFlushHeightScaled173:
+    commissioningProfile==VisibleFlushProfile167?heightScaled==VisibleFlushHeightScaled167:
+    commissioningProfile==VisibleFlushProfile159?heightScaled==VisibleFlushHeightScaled159:
+    commissioningProfile==VisibleFlushProfile158?heightScaled==VisibleFlushHeightScaled158:
+    heightScaled>=MinimumJumpHeightScaled&&heightScaled<=MaximumJumpHeightScaled);}
 inline bool HasBoundHeight(const Recipe& r) noexcept
 {return r.heightFieldId!=0U&&r.jumpHeightScaled!=0ULL;}
 inline bool HasBoundDeep(const Recipe& r) noexcept
@@ -199,8 +268,13 @@ inline bool ValidBoundFlushStages(const Recipe& r) noexcept
     return true;
 }
 inline bool ValidDeepFlushValues(std::uint64_t heightScaled,std::uint32_t interval,
-    std::uint64_t multiplierScaled) noexcept
+    std::uint64_t multiplierScaled,unsigned commissioningProfile=0U) noexcept
 {
+    if(commissioningProfile>VisibleFlushProfile173)return false;
+    if(commissioningProfile==VisibleFlushProfile173)return heightScaled==VisibleFlushHeightScaled173&&interval==0U&&multiplierScaled==1000000ULL;
+    if(commissioningProfile==VisibleFlushProfile167)return heightScaled==VisibleFlushHeightScaled167&&interval==0U&&multiplierScaled==1000000ULL;
+    if(commissioningProfile==VisibleFlushProfile159)return heightScaled==VisibleFlushHeightScaled159&&interval==0U&&multiplierScaled==1000000ULL;
+    if(commissioningProfile==VisibleFlushProfile158)return heightScaled==VisibleFlushHeightScaled158&&interval==0U&&multiplierScaled==1000000ULL;
     if(!ValidJumpHeight(heightScaled)||interval>20U||multiplierScaled>20000000ULL)return false;
     if(!interval)return true;
     if(!multiplierScaled||heightScaled>(std::numeric_limits<std::uint64_t>::max)()/multiplierScaled)return false;
@@ -209,9 +283,10 @@ inline bool ValidDeepFlushValues(std::uint64_t heightScaled,std::uint32_t interv
     return product>=MinimumJumpHeightScaled*1000000ULL&&product<=MaximumJumpHeightScaled*1000000ULL;
 }
 inline bool DeepFlushScaledValues(double baseHeightMm,double multiplier,
-    std::uint64_t& heightScaled,std::uint64_t& multiplierScaled) noexcept
+    std::uint64_t& heightScaled,std::uint64_t& multiplierScaled,unsigned commissioningProfile=0U) noexcept
 {
-    if(!std::isfinite(baseHeightMm)||baseHeightMm<0.0001||baseHeightMm>0.005||
+    if(commissioningProfile>VisibleFlushProfile173||!std::isfinite(baseHeightMm)||
+        ((commissioningProfile==VisibleFlushProfile159||commissioningProfile==VisibleFlushProfile167||commissioningProfile==VisibleFlushProfile173)?baseHeightMm!=2.0:commissioningProfile==VisibleFlushProfile158?baseHeightMm!=5.0:(baseHeightMm<0.0001||baseHeightMm>0.005))||
         !std::isfinite(multiplier)||multiplier<0.0||multiplier>20.0)return false;
     const auto height=static_cast<std::uint64_t>(std::llround(baseHeightMm*1000000.0));
     const auto factor=static_cast<std::uint64_t>(std::llround(multiplier*1000000.0));
@@ -219,11 +294,13 @@ inline bool DeepFlushScaledValues(double baseHeightMm,double multiplier,
         static_cast<double>(factor)/1000000.0!=multiplier)return false;
     heightScaled=height;multiplierScaled=factor;return true;
 }
-inline bool ValidDeepFlushConfig(double baseHeightMm,std::uint32_t interval,double multiplier,bool bound) noexcept
+inline bool ValidDeepFlushConfig(double baseHeightMm,std::uint32_t interval,double multiplier,bool bound,unsigned commissioningProfile=0U) noexcept
 {
+    if(commissioningProfile>VisibleFlushProfile173||(commissioningProfile&&!bound))return false;
     if(!bound)return interval==0U&&multiplier==0.0;
     std::uint64_t height=0ULL,factor=0ULL;
-    return DeepFlushScaledValues(baseHeightMm,multiplier,height,factor)&&ValidDeepFlushValues(height,interval,factor);
+    return DeepFlushScaledValues(baseHeightMm,multiplier,height,factor,commissioningProfile)&&
+        ValidDeepFlushValues(height,interval,factor,commissioningProfile);
 }
 inline double SelectedJumpHeightMm(double baseHeightMm,std::uint32_t interval,double multiplier,
     std::uint64_t oneBasedEventIndex) noexcept
@@ -237,18 +314,39 @@ inline double SelectedJumpHeightMm(double baseHeightMm,std::uint32_t interval,do
 }
 inline bool ValidRecipe(const Recipe& r) noexcept
 {
-    return r.catalogRevision&&r.definitionRevision&&r.profileId&&r.tableId&&r.tableId<=99999999U&&
+    return r.holdRetreatMode<=1U&&r.flushHoldTest<=3U&&
+        (r.flushHoldTest<=1U||(!r.commissioningProfile&&r.diagnosticControlSource==3U))&&
+        (!r.flushHoldTest||(r.holdRetreatMode==1U&&IsMotionTest(r)&&HasBoundProgramPlan(r)&&
+            (!r.commissioningProfile||IsVisibleFlush159(r)||IsVisibleFlush167(r))))&&
+        (!r.holdRetreatMode||(IsMotionTest(r)&&HasBoundProgramPlan(r)&&
+            (!r.commissioningProfile||IsVisibleFlush159(r)||IsVisibleFlush167(r))))&&
+        r.commissioningProfile<=VisibleFlushProfile173&&
+        (!IsVisibleFlush173(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==VisibleFlushHeightScaled173&&
+            r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
+            r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
+            !r.holdRetreatMode&&!r.flushHoldTest))&&
+        (!IsVisibleFlush(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==VisibleFlushHeightScaled158&&
+            r.workTimeUs==VisibleFlushWorkUs158&&r.jumpSpeedPercentScaled==100000000ULL&&
+            (!r.diagnosticControlSource||r.diagnosticControlSource==3U)))&&
+        (!IsVisibleFlush159(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==VisibleFlushHeightScaled159&&
+            r.workTimeUs==VisibleFlushWorkUs159&&r.jumpSpeedPercentScaled==100000000ULL&&
+            (!r.diagnosticControlSource||r.diagnosticControlSource==3U)))&&
+        (!IsVisibleFlush167(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==VisibleFlushHeightScaled167&&
+            r.workTimeUs==VisibleFlushWorkUs167&&r.jumpSpeedPercentScaled==100000000ULL&&
+            (!r.diagnosticControlSource||r.diagnosticControlSource==3U)))&&
+        (r.diagnosticControlSource!=5U||(!r.commissioningProfile&&!r.flushHoldTest&&HasBoundProgramPlan(r)))&&
+        r.catalogRevision&&r.definitionRevision&&r.profileId&&r.tableId&&r.tableId<=99999999U&&
         r.tableRevision&&r.eCode&&r.eCode<=1000U&&r.fieldId&&r.generation&&ValidWorkTime(r.workTimeUs)&&
         ((!r.speedFieldId&&!r.jumpSpeedPercentScaled)||
             (r.speedFieldId&&r.speedFieldId!=r.fieldId&&ValidSpeedPercent(r.jumpSpeedPercentScaled)))&&
         ((!r.heightFieldId&&!r.jumpHeightScaled)||
             (r.heightFieldId&&r.heightFieldId!=r.fieldId&&r.heightFieldId!=r.speedFieldId&&
-                HasBoundSpeed(r)&&ValidJumpHeight(r.jumpHeightScaled)))&&
+                HasBoundSpeed(r)&&ValidJumpHeight(r.jumpHeightScaled,r.commissioningProfile)))&&
         ((!r.intervalFieldId&&!r.multiplierFieldId&&!r.deepFlushCycleInterval&&!r.deepFlushHeightMultiplierScaled)||
             (HasBoundDeep(r)&&HasBoundHeight(r)&&r.intervalFieldId!=r.multiplierFieldId&&
                 r.intervalFieldId!=r.fieldId&&r.intervalFieldId!=r.heightFieldId&&r.intervalFieldId!=r.speedFieldId&&
                 r.multiplierFieldId!=r.fieldId&&r.multiplierFieldId!=r.heightFieldId&&r.multiplierFieldId!=r.speedFieldId&&
-                ValidDeepFlushValues(r.jumpHeightScaled,r.deepFlushCycleInterval,r.deepFlushHeightMultiplierScaled)))&&
+                ValidDeepFlushValues(r.jumpHeightScaled,r.deepFlushCycleInterval,r.deepFlushHeightMultiplierScaled,r.commissioningProfile)))&&
         ((!r.machiningFieldId&&!r.machiningSpeedPercentScaled)||
             (HasBoundMachiningSpeed(r)&&HasBoundDeep(r)&&ValidMachiningSpeedPercent(r.machiningSpeedPercentScaled)&&
                 r.machiningFieldId!=r.fieldId&&r.machiningFieldId!=r.speedFieldId&&
@@ -261,7 +359,29 @@ inline bool ValidRecipe(const Recipe& r) noexcept
                 r.referenceFieldId!=r.multiplierFieldId&&r.referenceFieldId!=r.machiningFieldId))&&
         (EmptyCurve(r.curve)||(HasBoundCurve(r)&&HasBoundReferenceVoltage(r)&&
             r.curve.machineProfileId==r.profileId&&ValidCurve(r.curve,FrozenGapReferenceVoltageV(r))))&&
-        ValidBoundFlushStages(r);
+        ValidBoundFlushStages(r)&&
+        (!IsOneShotCommissioning(r)||
+            ((!HasBoundMachiningSpeed(r)||r.machiningSpeedPercentScaled==40000000U)&&
+             (!HasBoundReferenceVoltage(r)||r.referenceVoltageScaled==55000000U)&&
+             (!HasBoundFlushStages(r)||(r.flushStages.finalSpeedPercentScaled==10000000U&&
+                r.flushStages.approachDistanceScaled==100ULL&&r.flushStages.initialSpeedPercentScaled==1000000U&&
+                r.flushStages.initialDistanceScaled==0ULL&&r.flushStages.polarity==0U))))&&
+        ValidProgramPlan(r)&&r.diagnosticControlSource<=5U&&
+        (!r.diagnosticControlSource||HasBoundFlushStages(r))&&
+        (!IsMotionTest(r)||(HasBoundCurve(r)&&HasBoundReferenceVoltage(r)&&HasBoundMachiningSpeed(r)&&
+            HasBoundHeight(r)&&r.jumpHeightScaled<=(IsVisibleFlush(r)?VisibleFlushHeightScaled158:IsVisibleFlush159(r)?VisibleFlushHeightScaled159:IsVisibleFlush167(r)?VisibleFlushHeightScaled167:IsVisibleFlush173(r)?VisibleFlushHeightScaled173:1000ULL)&&r.workTimeUs<=2000000ULL&&
+            HasBoundDeep(r)&&r.deepFlushCycleInterval==0U));
+}
+inline bool ValidHistoryRecipeBinding(unsigned fixture,const Recipe& r) noexcept
+{
+    return ValidRecipe(r)&&EDM149::ValidHistoryBinding(fixture,r.diagnosticControlSource)&&
+        (!r.holdRetreatMode||fixture==(IsVisibleFlush167(r)?EDM149::SixVisibleFlushHistoryFixture:IsVisibleFlush159(r)?EDM149::XYZVisibleFlushHistoryFixture:EDM149::ProgramHistoryFixture))&&
+        (!r.flushHoldTest||fixture==(IsVisibleFlush167(r)?EDM149::SixVisibleFlushHistoryFixture:IsVisibleFlush159(r)?EDM149::XYZVisibleFlushHistoryFixture:EDM149::ProgramHistoryFixture))&&
+        ((fixture==EDM149::VisibleFlushHistoryFixture)==IsVisibleFlush(r))&&
+        ((fixture==EDM149::XYZVisibleFlushHistoryFixture)==IsVisibleFlush159(r))&&
+        ((fixture==EDM149::SixVisibleFlushHistoryFixture)==IsVisibleFlush167(r))&&
+        ((fixture==EDM149::G76GapHistoryFixture)==IsVisibleFlush173(r))&&
+        (EDM149::IsProgramHistoryFixture(fixture)==HasBoundProgramPlan(r));
 }
 inline double FrozenJumpHeightMm(const Recipe& r) noexcept
 {return HasBoundHeight(r)?static_cast<double>(r.jumpHeightScaled)/1000000.0:0.0;}
@@ -350,4 +470,10 @@ inline bool CompleteWork(WorkEvidence& e,std::uint64_t tick,std::uint64_t nowUs)
     e.lastCompleteTick=tick;e.lastCompleteUs=nowUs;return ValidWorkEvidence(e);
 }
 static_assert(sizeof(Recipe)<=264U&&sizeof(WorkEvidence)<=128U,"EDM130 bounded immutable time evidence");
+static_assert(offsetof(Recipe,heightFieldId)==56U&&offsetof(Recipe,commissioningProfile)==58U&&
+    offsetof(Recipe,holdRetreatMode)==60U&&offsetof(Recipe,flushHoldTest)==62U&&offsetof(Recipe,jumpHeightScaled)==64U,
+    "EDM163/165 use only prior recipe padding without moving earlier fields");
+static_assert(sizeof(Recipe)==264U&&offsetof(Recipe,planRows)==44U&&
+    offsetof(Recipe,planMovementMask)==46U&&offsetof(Recipe,jumpSpeedPercentScaled)==48U,
+    "EDM156 plan uses existing Recipe padding without moving prior fields");
 }

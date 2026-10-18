@@ -74,7 +74,7 @@ inline Binding BindWorkTimeAndSpeed(const EDMRecipe::Controller& controller,std:
     if(!ValidRecipe(r)){out.error=EDM58::BindingError::InvalidRecipe;return out;}
     out.recipe=r;out.ready=true;out.error=EDM58::BindingError::None;return out;
 }
-inline Binding BindWorkTimeHeightAndSpeed(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId) noexcept
+inline Binding BindWorkTimeHeightAndSpeed(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,unsigned commissioningProfile=0U) noexcept
 {
     static_assert(EDMRecipe::Scale==1000000LL,"Fixed-point millimetres must preserve one nanometre.");
     Binding out{};const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
@@ -89,18 +89,18 @@ inline Binding BindWorkTimeHeightAndSpeed(const EDMRecipe::Controller& controlle
     EDMRecipe::Value value=0LL;std::uint16_t field=0U;EDM58::Binding semantic{};
     if(!EDM58::BindingDetail::Read(controller,*catalog,"JumpHeight","mm",value,field,semantic))
     {out.error=semantic.error;out.failedFieldId=semantic.failedFieldId;return out;}
-    if(value<0LL||!ValidJumpHeight(static_cast<std::uint64_t>(value)))
+    if(value<0LL||!ValidJumpHeight(static_cast<std::uint64_t>(value),commissioningProfile))
     {out.error=EDM58::BindingError::EngineeringRange;out.failedFieldId=field;return out;}
-    Recipe r=timedSpeed.recipe;r.heightFieldId=field;r.jumpHeightScaled=static_cast<std::uint64_t>(value);
+    Recipe r=timedSpeed.recipe;r.commissioningProfile=static_cast<std::uint16_t>(commissioningProfile);r.heightFieldId=field;r.jumpHeightScaled=static_cast<std::uint64_t>(value);
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current()))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
     if(!ValidRecipe(r)){out.error=EDM58::BindingError::InvalidRecipe;return out;}
     out.recipe=r;out.ready=true;out.error=EDM58::BindingError::None;return out;
 }
-inline Binding BindWorkTimeHeightSpeedAndDeepFlush(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId) noexcept
+inline Binding BindWorkTimeHeightSpeedAndDeepFlush(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,unsigned commissioningProfile=0U) noexcept
 {
     Binding out{};const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
-    const Binding base=BindWorkTimeHeightAndSpeed(controller,expectedProfileId);
+    const Binding base=BindWorkTimeHeightAndSpeed(controller,expectedProfileId,commissioningProfile);
     if(!base.ready)return base;
     if(!catalog||controller.GetCatalog()!=catalog||
         !EDM58::BindingDetail::SameSelection(before,controller.Current())||
@@ -124,17 +124,17 @@ inline Binding BindWorkTimeHeightSpeedAndDeepFlush(const EDMRecipe::Controller& 
     r.deepFlushHeightMultiplierScaled=static_cast<std::uint64_t>(multiplier);
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current()))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
-    if(!ValidDeepFlushValues(r.jumpHeightScaled,r.deepFlushCycleInterval,r.deepFlushHeightMultiplierScaled))
+    if(!ValidDeepFlushValues(r.jumpHeightScaled,r.deepFlushCycleInterval,r.deepFlushHeightMultiplierScaled,commissioningProfile))
     {out.error=EDM58::BindingError::EngineeringRange;out.failedFieldId=multiplierField;return out;}
     if(!ValidRecipe(r)){out.error=EDM58::BindingError::InvalidRecipe;return out;}
     out.recipe=r;out.ready=true;out.error=EDM58::BindingError::None;return out;
 }
 // EDM134 explicitly opts in to E8 without changing earlier binding adapters.
 inline Binding BindWorkTimeHeightSpeedDeepAndMachining(const EDMRecipe::Controller& controller,
-    std::uint32_t expectedProfileId) noexcept
+    std::uint32_t expectedProfileId,unsigned commissioningProfile=0U) noexcept
 {
     Binding out{};const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
-    const Binding base=BindWorkTimeHeightSpeedAndDeepFlush(controller,expectedProfileId);
+    const Binding base=BindWorkTimeHeightSpeedAndDeepFlush(controller,expectedProfileId,commissioningProfile);
     if(!base.ready)return base;
     if(!catalog||controller.GetCatalog()!=catalog||
         !EDM58::BindingDetail::SameSelection(before,controller.Current())||
@@ -156,10 +156,10 @@ inline Binding BindWorkTimeHeightSpeedDeepAndMachining(const EDMRecipe::Controll
 }
 // EDM135 explicitly opts in to E9 without changing earlier binding adapters.
 inline Binding BindWorkTimeHeightSpeedDeepMachiningAndReference(const EDMRecipe::Controller& controller,
-    std::uint32_t expectedProfileId) noexcept
+    std::uint32_t expectedProfileId,unsigned commissioningProfile=0U) noexcept
 {
     Binding out{};const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
-    const Binding base=BindWorkTimeHeightSpeedDeepAndMachining(controller,expectedProfileId);
+    const Binding base=BindWorkTimeHeightSpeedDeepAndMachining(controller,expectedProfileId,commissioningProfile);
     if(!base.ready)return base;
     if(!catalog||controller.GetCatalog()!=catalog||
         !EDM58::BindingDetail::SameSelection(before,controller.Current())||
@@ -182,7 +182,7 @@ inline Binding BindWorkTimeHeightSpeedDeepMachiningAndReference(const EDMRecipe:
 // EDM136: the owning NC scan captures one installed process shape alongside
 // the seven E fields. Later tuning edits take effect at the next explicit arm.
 inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceAndCurve(const EDMRecipe::Controller& controller,
-    std::uint32_t expectedProfileId,const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept
+    std::uint32_t expectedProfileId,const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration,unsigned commissioningProfile=0U) noexcept
 {
     Binding out{};const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
     if(!tuningGeneration||!EDM20::ValidateProcessProfile(process))
@@ -193,7 +193,7 @@ inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceAndCurve(const EDMRe
     curve.tuningGeneration=tuningGeneration;curve.deadbandV=process.servo.deadbandV;
     for(unsigned i=0U;i<3U;++i){curve.positiveGain[i]=process.servo.positiveGain[i];curve.negativeGain[i]=process.servo.negativeGain[i];}
     for(unsigned i=0U;i<2U;++i){curve.positiveBreakV[i]=process.servo.positiveBreakV[i];curve.negativeBreakV[i]=process.servo.negativeBreakV[i];}
-    const Binding base=BindWorkTimeHeightSpeedDeepMachiningAndReference(controller,expectedProfileId);
+    const Binding base=BindWorkTimeHeightSpeedDeepMachiningAndReference(controller,expectedProfileId,commissioningProfile);
     if(!base.ready)return base;
     if(!catalog||controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
         base.recipe.generation!=before.generation||base.recipe.tableId!=before.tableId||
@@ -222,12 +222,12 @@ inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceAndCurve(const EDMRe
 // E15 belongs to the discharge circuit and is deliberately not interpreted.
 inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(
     const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
-    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration,unsigned commissioningProfile=0U) noexcept
 {
     Binding out{};const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
     const double finalBase=process.flush.finalApproachMmPerMin,initialBase=process.flush.initialSlowMmPerMin;
     const Binding base=BindWorkTimeHeightSpeedDeepMachiningReferenceAndCurve(
-        controller,expectedProfileId,process,tuningGeneration);
+        controller,expectedProfileId,process,tuningGeneration,commissioningProfile);
     if(!base.ready)return base;
     if(!catalog||controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
         base.recipe.generation!=before.generation||base.recipe.tableId!=before.tableId||
@@ -266,6 +266,72 @@ inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(
     s.polarity=static_cast<std::uint32_t>(values[4]/EDMRecipe::Scale);
     s.finalApproachMmPerMin=finalBase;s.initialSlowMmPerMin=initialBase;
     if(!ValidRecipe(recipe)){out.error=EDM58::BindingError::InvalidRecipe;return out;}
+    out.recipe=recipe;out.ready=true;out.error=EDM58::BindingError::None;return out;
+}
+
+// EDM173 freezes the complete native G76 recipe atomically. The legacy
+// incremental visible-flush adapters cannot validate this profile halfway
+// through capture: source3 and the sealed 25-child plan are mandatory here.
+inline Binding BindG76Gap173(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept
+{
+    Binding out{};const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
+    if(!tuningGeneration||!EDM20::ValidateProcessProfile(process))
+    {out.error=EDM58::BindingError::InvalidRecipe;return out;}
+    if(!expectedProfileId||process.machineProfileId!=expectedProfileId)
+    {out.error=EDM58::BindingError::ProfileMismatch;return out;}
+    const double finalBase=process.flush.finalApproachMmPerMin,initialBase=process.flush.initialSlowMmPerMin;
+    Curve curve{};curve.processRevision=process.revision;curve.machineProfileId=process.machineProfileId;
+    curve.tuningGeneration=tuningGeneration;curve.deadbandV=process.servo.deadbandV;
+    for(unsigned i=0U;i<3U;++i){curve.positiveGain[i]=process.servo.positiveGain[i];curve.negativeGain[i]=process.servo.negativeGain[i];}
+    for(unsigned i=0U;i<2U;++i){curve.positiveBreakV[i]=process.servo.positiveBreakV[i];curve.negativeBreakV[i]=process.servo.negativeBreakV[i];}
+    const Binding base=BindWorkTimeAndSpeed(controller,expectedProfileId);
+    if(!base.ready)return base;
+    if(!catalog||controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current())||
+        base.recipe.generation!=before.generation||base.recipe.tableId!=before.tableId||
+        base.recipe.tableRevision!=before.tableRevision||base.recipe.eCode!=before.eCode)
+    {out.error=EDM58::BindingError::CaptureChanged;return out;}
+    if(base.recipe.workTimeUs<VisibleFlushMinimumWorkUs173||base.recipe.workTimeUs>VisibleFlushMaximumWorkUs173||
+        base.recipe.jumpSpeedPercentScaled!=100000000ULL)
+    {out.error=EDM58::BindingError::EngineeringRange;out.failedFieldId=
+        base.recipe.jumpSpeedPercentScaled!=100000000ULL?base.recipe.speedFieldId:base.recipe.fieldId;return out;}
+    const char* semantics[]={"JumpHeight","DeepFlushCycleInterval","DeepFlushHeightMultiplier","MachiningServoOverride","GapVoltageSetpoint",
+        "FinalApproachSpeed","DecelerationDistance","LargeAreaMachiningSpeed","LargeAreaFlushDistance","ElectrodePolarity"};
+    const char* units[]={"mm","cycle","x","%","V","%","mm","%","mm","code"};
+    const EDMRecipe::Value exact[]={2000000LL,0LL,1000000LL,40000000LL,55000000LL,10000000LL,100LL,1000000LL,0LL,0LL};
+    EDMRecipe::Value values[10]{};std::uint16_t fields[10]{};EDM58::Binding semantic{};
+    for(unsigned i=0U;i<10U;++i)
+    {
+        const bool read=i<5U?EDM58::BindingDetail::Read(controller,*catalog,semantics[i],units[i],values[i],fields[i],semantic):
+            EDM137Units::ReadExplicit(controller,*catalog,semantics[i],units[i],values[i],fields[i],semantic);
+        if(!read){out.error=semantic.error;out.failedFieldId=semantic.failedFieldId;return out;}
+        if(values[i]!=exact[i]){out.error=EDM58::BindingError::EngineeringRange;out.failedFieldId=fields[i];return out;}
+    }
+    if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current()))
+    {out.error=EDM58::BindingError::CaptureChanged;return out;}
+    Curve after{};after.processRevision=process.revision;after.machineProfileId=process.machineProfileId;
+    after.tuningGeneration=tuningGeneration;after.deadbandV=process.servo.deadbandV;
+    for(unsigned i=0U;i<3U;++i){after.positiveGain[i]=process.servo.positiveGain[i];after.negativeGain[i]=process.servo.negativeGain[i];}
+    for(unsigned i=0U;i<2U;++i){after.positiveBreakV[i]=process.servo.positiveBreakV[i];after.negativeBreakV[i]=process.servo.negativeBreakV[i];}
+    if(!EDM20::ValidateProcessProfile(process)||!SameCurve(after,curve)||
+        CurveDoubleBits(process.flush.finalApproachMmPerMin)!=CurveDoubleBits(finalBase)||
+        CurveDoubleBits(process.flush.initialSlowMmPerMin)!=CurveDoubleBits(initialBase))
+    {out.error=EDM58::BindingError::CaptureChanged;return out;}
+    Recipe recipe=base.recipe;
+    recipe.commissioningProfile=VisibleFlushProfile173;recipe.diagnosticControlSource=3U;recipe.planRows=25U;recipe.planMovementMask=7U;
+    recipe.heightFieldId=fields[0];recipe.jumpHeightScaled=static_cast<std::uint64_t>(values[0]);
+    recipe.intervalFieldId=fields[1];recipe.multiplierFieldId=fields[2];recipe.deepFlushCycleInterval=0U;
+    recipe.deepFlushHeightMultiplierScaled=static_cast<std::uint64_t>(values[2]);
+    recipe.machiningFieldId=fields[3];recipe.machiningSpeedPercentScaled=static_cast<std::uint32_t>(values[3]);
+    recipe.referenceFieldId=fields[4];recipe.referenceVoltageScaled=static_cast<std::uint32_t>(values[4]);recipe.curve=curve;
+    auto& stages=recipe.flushStages;
+    stages.finalSpeedFieldId=fields[5];stages.approachFieldId=fields[6];stages.initialSpeedFieldId=fields[7];
+    stages.initialDistanceFieldId=fields[8];stages.polarityFieldId=fields[9];
+    stages.finalSpeedPercentScaled=static_cast<std::uint32_t>(values[5]);stages.approachDistanceScaled=static_cast<std::uint64_t>(values[6]);
+    stages.initialSpeedPercentScaled=static_cast<std::uint32_t>(values[7]);stages.initialDistanceScaled=static_cast<std::uint64_t>(values[8]);
+    stages.polarity=static_cast<std::uint32_t>(values[9]);stages.finalApproachMmPerMin=finalBase;stages.initialSlowMmPerMin=initialBase;
+    if(!ValidHistoryRecipeBinding(EDM149::G76GapHistoryFixture,recipe))
+    {out.error=EDM58::BindingError::InvalidRecipe;return out;}
     out.recipe=recipe;out.ready=true;out.error=EDM58::BindingError::None;return out;
 }
 }

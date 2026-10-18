@@ -1503,7 +1503,8 @@ bool MotionCore::TryG01XYZCMoveTransactionalTail(
 bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
     const std::array<double, 6U>& programmedValues,
     const std::array<double, 6U>& targetMCS, double feedMMMin,
-    double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace)
+    double(&commandedMCSTail)[MAX_AXES], MotionFeedLineWorkspace& workspace,
+    bool sparseCommissioning)
 {
     MotionFeedLineReceipt& result = workspace.receipt;
     result.Clear();
@@ -1517,6 +1518,23 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
         result.code = MotionFeedLineCode::NOT_READY;
         return false;
     }
+    const bool zOnlyCommissioning = edm94Authorization.session && edm94Authorization.historyServo &&
+        edm94Authorization.historyModeFlush && edm94Authorization.workTimeFlush &&
+        edm94Authorization.historyFixture == EDM149::ZHistoryFixture && EDM130::IsMotionTest(edm94Authorization.timerRecipe);
+    const bool xyzOnlyCommissioning = edm94Authorization.session && edm94Authorization.historyServo &&
+        edm94Authorization.historyModeFlush && edm94Authorization.workTimeFlush &&
+        edm94Authorization.historyFixture == EDM149::XYZHistoryFixture && EDM130::IsMotionTest(edm94Authorization.timerRecipe);
+    const bool sparseAuthorization = edm94Authorization.session && edm94Authorization.historyServo &&
+        edm94Authorization.historyModeFlush && edm94Authorization.workTimeFlush &&
+        EDM149::IsSparseLineHistoryFixture(edm94Authorization.historyFixture) && EDM130::IsMotionTest(edm94Authorization.timerRecipe) &&
+        EDM130::ValidHistoryRecipeBinding(edm94Authorization.historyFixture,edm94Authorization.timerRecipe);
+    if (sparseCommissioning != sparseAuthorization)
+    { result.code = MotionFeedLineCode::NOT_READY; return false; }
+    if (sparseAuthorization && EDM130::HasBoundProgramPlan(edm94Authorization.timerRecipe))
+        for (unsigned axis=0U;axis<6U;++axis)
+            if (programmedValues[axis]!=0.0 &&
+                (EDM130::ProgramMovementMask(edm94Authorization.timerRecipe)&(1U<<axis))==0U)
+            { result.code = MotionFeedLineCode::NOT_READY; return false; }
     const bool absolute = m_pendingTranslation.distanceMode == 90;
     const MotionExecutionEpoch plannedEpoch = GetCurrentExecutionEpoch();
     const MotionOwnerLease plannedOwner = GetMotionOwnerLease();
@@ -1545,12 +1563,22 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
     input.axisMask = selectedMask;
     input.feedMMMin = feedMMMin;
     input.absolute = absolute;
+    input.zOnlyCommissioning = zOnlyCommissioning;
+    input.xyzOnlyCommissioning = xyzOnlyCommissioning;
+    input.sparseCommissioning = sparseCommissioning;
+    if (sparseCommissioning && (absolute || !EDM149::ValidSparseIncrement(programmedValues,feedMMMin)))
+    { result.code = MotionFeedLineCode::INVALID_INPUT; return false; }
+    if (xyzOnlyCommissioning && (absolute || !EDM149::ValidXYZIncrement(programmedValues,feedMMMin)))
+    { result.code = MotionFeedLineCode::INVALID_INPUT; return false; }
+    if (zOnlyCommissioning && (absolute || !EDM149::ValidZIncrement(programmedValues,feedMMMin)))
+    { result.code = MotionFeedLineCode::INVALID_INPUT; return false; }
     if (absolute) input.absoluteTargetMCS = targetMCS;
     else input.deltaNative = programmedValues;
     for (unsigned selected = 0U; selected < 6U; ++selected)
     {
         const AxisContext& axis = (*m_pContexts)[selected];
-        if (!std::isfinite(programmedValues[selected]) || (!absolute && programmedValues[selected] == 0.0) ||
+        if (!std::isfinite(programmedValues[selected]) ||
+            (!absolute && programmedValues[selected] == 0.0 && !zOnlyCommissioning && !xyzOnlyCommissioning && !sparseCommissioning) ||
             !std::isfinite(targetMCS[selected]) || !axis.isExist ||
             axis.axisIndex != static_cast<int>(selected) ||
             axis.axisType != (selected < 3U ? AxisType::LINEAR : AxisType::ROTARY) ||
@@ -1629,7 +1657,9 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
             if (moduloBaseline < 0.0) moduloBaseline += axis.rotaryModulo;
         }
         if (!std::isfinite(ppu) || ppu <= 0.0 || !std::isfinite(authoredTarget) ||
-            !NCXYZCUVFeedDetail::SameBits(target, authoredTarget) || (!absolute && target == commandedMCSTail[selected]))
+            !NCXYZCUVFeedDetail::SameBits(target, authoredTarget) ||
+            (!absolute && target == commandedMCSTail[selected] && !((EDM149::StaticAxis(zOnlyCommissioning,xyzOnlyCommissioning,selected) ||
+                (sparseCommissioning && programmedValues[selected] == 0.0)))))
         {
             result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
             return false;
@@ -1645,10 +1675,18 @@ bool MotionCore::TryG01XYZCUVMoveTransactionalTail(
         }
         if (!absolute)
         {
+            if ((EDM149::StaticAxis(zOnlyCommissioning,xyzOnlyCommissioning,selected) ||
+                (sparseCommissioning && programmedValues[selected] == 0.0)))
+            {
+                input.endMCS[selected] = input.startMCS[selected];
+                input.endPulse[selected] = startPulse;
+                continue;
+            }
             const double deltaPulse = programmed * ppu;
             const double targetPulse = startPulse + deltaPulse;
             if (!std::isfinite(deltaPulse) || !std::isfinite(targetPulse) ||
-                deltaPulse == 0.0 || targetPulse == startPulse)
+                ((deltaPulse == 0.0 || targetPulse == startPulse) && !((EDM149::StaticAxis(zOnlyCommissioning,xyzOnlyCommissioning,selected) ||
+                (sparseCommissioning && programmedValues[selected] == 0.0)))))
             {
                 result.code = MotionFeedLineCode::GEOMETRY_REJECTED;
                 return false;

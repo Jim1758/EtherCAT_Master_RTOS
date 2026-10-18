@@ -89,4 +89,19 @@ inline EDMGapServo::Profile MakeProfile(const Tuning& tuning,const EDM130::Recip
     if(EDM130::HasBoundCurve(recipe))EDM130::ApplyCurveShape(profile,recipe.curve);
     return profile;
 }
+// Reject a commissioning waveform that the installed curve cannot drive in
+// both directions. Ordinary and physical-AD recipes retain their own policy.
+inline bool ValidMotionTestCurve(const Tuning& tuning,const EDM130::Recipe& recipe) noexcept
+{
+    if(!EDM130::UsesSoftwareVoltage(recipe))return true;
+    if(!ValidTuning(tuning)||!EDM130::ValidRecipe(recipe))return false;
+    const auto profile=MakeProfile(tuning,recipe);
+    const double reference=EDM130::FrozenGapReferenceVoltageV(recipe);
+    const double percent=EDM130::FrozenMachiningOverridePercent(recipe);
+    const double high=reference+(recipe.diagnosticControlSource==3U?38.0:40.0);
+    const double low=reference>20.0?reference-20.0+(recipe.diagnosticControlSource==3U?1.0:0.0):0.0;
+    const auto forward=EDMGapServo::Evaluate(profile,high,reference,percent);
+    const auto reverse=EDMGapServo::Evaluate(profile,low,reference,percent);
+    return forward.valid&&reverse.valid&&forward.limitedSpeedMmPerMin>0.0&&reverse.limitedSpeedMmPerMin<0.0;
+}
 }

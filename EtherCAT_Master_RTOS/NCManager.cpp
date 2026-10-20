@@ -21,6 +21,8 @@
 #include "NCEccentricCBindingSelfCheck.h"
 #include "NCEccentricCTransactionSelfCheck.h"
 #include "CNCStartupStackDiagnostic.h"
+#include "NCG76StartDiagnostic.h"
+#include "NCG76DiagnosticPrint.h"
 #include "NCExpressionResolver.h"
 #include "EDM149VoltageMotion.h"
 #include "NCProgramCache.h"
@@ -851,6 +853,8 @@ void NCManager::CycleStart()
 {
     // FIX13: record every explicit START, including a consumed EDM94 rejection.
     ++m_startDiagnosticRequests;
+    // FIX16: identify this compiled NC component on each explicit START only.
+    RtPrintf("%s", "[EDM173_FIX16] event=G76_BUILD component=NCManager revision=FIX16 includes=FIX15_HOLD_TRACE phase=START_REQUEST discharge=0\n");
     m_startDiagnosticEvent = "RECEIVED";
     PrintProgramStartDiagnostic();
     const bool edm157WasPaused = m_edm157.active;
@@ -1245,6 +1249,17 @@ void NCManager::FeedHoldInternal()
             false;
 
         ObserveFeedHoldLegacyHoldShadow();
+        // FIX15: one NC-side observation per genuine running G76 B0 HOLD.
+        // A request is not an acknowledged physical stop.
+        if (m_g76Orbit->active && m_g76Orbit->bound && m_g76Orbit->sourceG==76 && m_g76Orbit->mode==0U)
+        {
+            const auto hold=m_feedHoldBoundaryShadow.GetSnapshot();
+            PrintNCG76DiagnosticLine("[EDM173_FIX15] event=G76_HOLD_REQUEST run=%llu dispatch=%llu count=%u ncLoggedChildren=%u boundary=%llu request=%llu epoch=%llu owner=%u/%u observation=NC_HOLD_REQUEST stopProven=0 discharge=0\n",
+                static_cast<unsigned long long>(m_g76Orbit->run),static_cast<unsigned long long>(m_g76Orbit->dispatch),
+                m_g76Orbit->receipt.count,m_g76Orbit->loggedChildren,static_cast<unsigned long long>(hold.sequence),
+                static_cast<unsigned long long>(hold.expectedSettleRequestSequence),static_cast<unsigned long long>(hold.requestExecutionEpoch),
+                static_cast<unsigned>(hold.requestOwner),static_cast<unsigned>(hold.requestOwnerGeneration));
+        }
     }
 }
 
@@ -6725,7 +6740,9 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
     const NCBlock& sourceBlock,
     int gCode)
 {
+    if (gCode == 76) PrintNCG76StartCheckpoint("DISPATCH_ENTRY", GetActiveDispatchPC());
     NCBlock block = sourceBlock;
+    if (gCode == 76) PrintNCG76StartCheckpoint("DISPATCH_BLOCK_COPIED", GetActiveDispatchPC());
     block.hasG = true;
     block.gCode = gCode;
     block.gCount = 1;
@@ -6741,6 +6758,7 @@ WaitConditionFunc NCManager::DispatchSingleGCode(
         edm137Descriptor.role == NCGCodeRole::PRIMARY_ACTION)
         ForceEDMPLCOutputsOffSameThread("NON_EDM_ACTION_DISPATCH");
 
+    if (gCode == 76) PrintNCG76StartCheckpoint("DISPATCH_OUTPUTS_CLEARED", GetActiveDispatchPC());
     switch (gCode)
     {
     case 0:
@@ -7153,8 +7171,11 @@ void NCManager::ExecuteBlock(
             // geometry. Keep pending-source capture for normal NC provenance.
             const bool edm94BracketControl = gCode == 180 &&
                 IsEDM94TranslationBracketAllowedSameThread(block);
+            if (gCode == 76) PrintNCG76StartCheckpoint("BEFORE_FRAME_PREPARE", sourcePC);
             if (!edm94BracketControl && !PrepareFixedTranslationMotionSameThread(block, gCode)) return;
+            if (gCode == 76) PrintNCG76StartCheckpoint("AFTER_FRAME_PREPARE", sourcePC);
             CapturePendingCommandState(sourcePC);
+            if (gCode == 76) PrintNCG76StartCheckpoint("AFTER_SOURCE_CAPTURE", sourcePC);
         }
 
         WaitConditionFunc callback =
@@ -10019,6 +10040,10 @@ void NCManager::ObserveFeedHoldBoundaryShadow() noexcept
 {
     if (m_feedHoldBoundaryShadow.IsActive())
     {
+        // FIX15: edge detection observes the existing NC boundary only.
+        const bool g76AwaitedAck=m_g76Orbit->active && m_g76Orbit->bound &&
+            m_g76Orbit->sourceG==76 && m_g76Orbit->mode==0U &&
+            !m_feedHoldBoundaryShadow.GetSnapshot().acknowledged;
         NCFeedHoldBoundarySample sample =
             BuildFeedHoldBoundarySample();
         m_feedHoldBoundaryShadow.Observe(sample);
@@ -10048,6 +10073,16 @@ void NCManager::ObserveFeedHoldBoundaryShadow() noexcept
         // observer about Request identity or stop completion.
         m_feedHoldResumeGate.ObserveBoundary(snapshot);
         ObserveOrdinaryG00FeedHoldCohortBoundary();
+        if (g76AwaitedAck && snapshot.source==NCFeedHoldSource::PROGRAM && snapshot.acknowledged &&
+            !snapshot.acknowledgeLost && !snapshot.failed && !snapshot.cancelled)
+        {
+            PrintNCG76DiagnosticLine("[EDM173_FIX15] event=G76_HOLD_ACK run=%llu dispatch=%llu boundary=%llu request=%llu proof=%llu settled=%u proofValid=%u scope=%u dwell=%u required=%u observation=BOUNDARY_SNAPSHOT discharge=0\n",
+                static_cast<unsigned long long>(m_g76Orbit->run),static_cast<unsigned long long>(m_g76Orbit->dispatch),
+                static_cast<unsigned long long>(snapshot.sequence),static_cast<unsigned long long>(snapshot.expectedSettleRequestSequence),
+                static_cast<unsigned long long>(snapshot.motion.settleProofSequence),snapshot.motion.ncSettled?1U:0U,
+                snapshot.motion.settleProofValid?1U:0U,static_cast<unsigned>(snapshot.motion.settleScopeMask),
+                static_cast<unsigned>(snapshot.motion.settleDwellCycles),static_cast<unsigned>(snapshot.motion.settleRequiredCycles));
+        }
         return;
     }
 
@@ -10420,6 +10455,16 @@ bool NCManager::ApplyProgramHoldResume(
     ResumePathCoreLiveRetentionSameThread();
     CommitEDM149ConfirmationResumeSameThread();
     CommitG76OrbitConfirmationResumeSameThread();
+    // FIX15: successful admission/override commit, never a button-receive log.
+    if (m_g76Orbit->active && m_g76Orbit->bound && m_g76Orbit->sourceG==76 && m_g76Orbit->mode==0U)
+    {
+        const auto hold=m_feedHoldBoundaryShadow.GetSnapshot();
+        PrintNCG76DiagnosticLine("[EDM173_FIX15] event=G76_RESUME_APPLIED run=%llu dispatch=%llu count=%u ncLoggedChildren=%u boundary=%llu request=%llu gateControlled=%u boundaryAck=%u boundaryApplied=%u observation=NC_RESUME_COMMIT discharge=0\n",
+            static_cast<unsigned long long>(m_g76Orbit->run),static_cast<unsigned long long>(m_g76Orbit->dispatch),
+            m_g76Orbit->receipt.count,m_g76Orbit->loggedChildren,static_cast<unsigned long long>(hold.sequence),
+            static_cast<unsigned long long>(resumeHoldRequest),gateControlled?1U:0U,
+            hold.acknowledged?1U:0U,hold.resumeApplied?1U:0U);
+    }
     return true;
 }
 

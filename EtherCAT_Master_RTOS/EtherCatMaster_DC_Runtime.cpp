@@ -7,6 +7,7 @@
 #include "EtherCatRxForensics.h"
 #include "EtherCatP64DeferredDiagnostics.h"
 #include "EDM144RuntimeTiming.h"
+#include "EDM174CommunicationTrace.h"
 #include "EDMExecutionFeedbackChannel.h"
 #include "AlarmManager.h"
 #include <windows.h> 
@@ -37,6 +38,26 @@ namespace
     EDM144::Snapshot g_edm144TimingCompleted{};
     EDM53::Channel<EDM144::Snapshot> g_edm144TimingChannel{};
 
+    // EDM174 FIX1: one PDO owner, no clocks, allocation, waits or text output.
+    // Existing boundary timestamps retain the lead-up to the first G76 fault.
+    EDM174Comm::Collector g_edm174CommunicationTrace{};
+    EDM53::Channel<EDM174Comm::Snapshot,4096U> g_edm174CommunicationChannel{};
+
+    OSCARMAX_P64_DIAG_NOINLINE void RecordEDM174CommunicationCycle(
+        const EDM174Comm::MotionObservation& observation,
+        const EDM174Comm::Cycle& cycle, std::uint64_t qpcFrequency) noexcept
+    {
+        (void)g_edm174CommunicationTrace.Record(observation.session, cycle,
+            observation.inputFaultTick, observation.guardFaultTick, qpcFrequency);
+    }
+
+    OSCARMAX_P64_DIAG_NOINLINE void PublishEDM174CommunicationTrace() noexcept
+    {
+        if (g_edm174CommunicationTrace.Pending() &&
+            g_edm174CommunicationChannel.Publish(g_edm174CommunicationTrace.Snapshot()))
+            g_edm174CommunicationTrace.MarkPublished();
+    }
+
     OSCARMAX_P64_DIAG_NOINLINE void CompleteEDM144TimingSample() noexcept
     {
         if (g_edm144TimingCollector.Record(g_edm144TimingSample, g_edm144TimingCompleted))
@@ -47,6 +68,13 @@ namespace
 bool EDM144::ReadRuntimeTiming(Snapshot& snapshot, std::uint64_t& publication) noexcept
 {
     const EDM53::Stamp stamp=g_edm144TimingChannel.Read(snapshot);
+    publication=stamp.publication;
+    return stamp.Ready();
+}
+
+bool EDM174Comm::Read(Snapshot& snapshot, std::uint64_t& publication) noexcept
+{
+    const EDM53::Stamp stamp=g_edm174CommunicationChannel.Read(snapshot);
     publication=stamp.publication;
     return stamp.Ready();
 }
@@ -5619,6 +5647,11 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
 
     uint64_t pdoCycleStartMasterNs =
         pMaster->GetCurrentMasterTimeNs();
+
+    // Same PDO owner as Motion; this small value observation never grants
+    // authority and does not read the cross-thread feedback publications.
+    const EDM174Comm::MotionObservation edm174Before=
+        pMaster->m_Motion.GetEDM174CommunicationObservation();
 
     // EDM144: stride 65 rotates through the four PDO service slots. Only
     // sampled callbacks read extra clocks; no logging/allocation in P64.
@@ -12699,6 +12732,10 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     // combinedCommEndNs below retains its existing post-RX boundary.
     if (edm144Sampling)
         g_edm144TimingSample.at[2]=pMaster->GetCurrentMasterTimeNs();
+
+    // Preserve the real matched software transaction before any diagnostic
+    // injection overrides. Missing timing is unavailable, never "not sent".
+    const EtherCatDcCycleTiming edm174ActualTiming=dcCycleTiming;
 
     // ---------------------------------------------------------
     // DC-RX.3F logical transport/sample overrides
@@ -20431,4 +20468,40 @@ void RTAPI GlobalTimerHandler_PDO(void* nContext)
     // and safety work. This small collector tail is outside its own timestamps
     // and the legacy callback measurement; full-cycle counters stay unchanged.
     if (edm144Sampling) CompleteEDM144TimingSample();
+
+    // The trace runs after all original Motion/safety/accounting. Its own
+    // bounded collector/publication tail is excluded from endNs. The next
+    // entry gap includes all unmeasured tail and scheduler time; it is not CPU
+    // usage or proof of physical wire delivery. No new clock is read here.
+    const EDM174Comm::MotionObservation edm174After=
+        pMaster->m_Motion.GetEDM174CommunicationObservation();
+    if (edm174After.session != 0ULL)
+    {
+        EDM174Comm::Cycle cycle{};
+        cycle.tick=pMaster->tickCount_PDO;
+        cycle.startNs=pdoCycleStartMasterNs;
+        cycle.commStartNs=combinedCommStartNs;
+        cycle.commEndNs=combinedCommEndNs;
+        cycle.motionStartNs=stageMotionStartNs;
+        cycle.motionEndNs=stageMotionEndNs;
+        cycle.endNs=pdoHandlerEndNs;
+        cycle.txBeforeQpc=edm174ActualTiming.txBeforeSendQpc;
+        cycle.txAfterQpc=edm174ActualTiming.txAfterSendQpc;
+        cycle.rxAfterQpc=edm174ActualTiming.rxAfterMatchQpc;
+        cycle.lrwWkc=static_cast<std::int32_t>(wkc);
+        cycle.dcWkc=static_cast<std::int32_t>(dcWkc);
+        cycle.expectedWkc=static_cast<std::int32_t>(pMaster->EXPECTED_WKC_PDO);
+        cycle.phaseBefore=edm174Before.session==edm174After.session?edm174Before.phase:0U;
+        cycle.phaseAfter=edm174After.phase;
+        cycle.childBefore=edm174Before.session==edm174After.session?edm174Before.child:0U;
+        cycle.childAfter=edm174After.child;
+        cycle.flags=(processDataValid?EDM174Comm::ProcessValid:0U) |
+            (edm174ActualTiming.valid!=0U && edm174ActualTiming.source==
+                static_cast<std::uint32_t>(EtherCatDcCycleTimingSource::ExactSoftwareTxRx)
+                ?EDM174Comm::MatchedTimingValid:0U) |
+            (dcRx3fInjectionAppliedThisCycle?EDM174Comm::Injected:0U);
+        RecordEDM174CommunicationCycle(edm174After,cycle,qpcFrequency);
+    }
+    // A retirement to session zero must not strand an unpublished capture.
+    PublishEDM174CommunicationTrace();
 }

@@ -3669,6 +3669,13 @@ namespace HMI_Bridge
     void ProcessTask_1000ms(NCManager* nc)
     {
         if (nc == nullptr) return;
+        // EDM173 FIX18: provenance of this supervisory output policy only.
+        static bool diagnosticPolicyPrinted = false;
+        if (!diagnosticPolicyPrinted)
+        {
+            diagnosticPolicyPrinted = true;
+            RtPrintf("%s", "[EDM173_FIX18] event=DIAG_POLICY component=HMI_Bridge revision=FIX18 families=GM,PREDISPATCH,FEED_HOLD pollCountersTrigger=0 heartbeatSamples=10\n");
+        }
         // FIX8: defer only passive P50 diagnostics during healthy G76 GAP.
         // Existing diagnostic paths resume when this scope ends.
         if (nc->IsEDM173DiagnosticQuietSameThread()) return;
@@ -3984,20 +3991,40 @@ namespace HMI_Bridge
             programEndCounters.cancelled +
             programEndCounters.failClosed;
 
-        const std::uint64_t gmTransactionChangeToken =
+        // EDM173 FIX18: polling these waits is not a new diagnostic event.
+        // Keep the binding identity, semantic progress and every existing
+        // outcome/error counter; their actual evaluation counters still run.
+        std::uint64_t gmTransactionStateBits =
+            static_cast<std::uint64_t>(gmTransactionSnapshot.phase);
+        gmTransactionStateBits |= static_cast<std::uint64_t>(gmTransactionSnapshot.postAction) << 8U;
+        gmTransactionStateBits |= gmTransactionSnapshot.active ? (1ULL << 16U) : 0ULL;
+        gmTransactionStateBits |= gmTransactionSnapshot.gWaitRequired ? (1ULL << 17U) : 0ULL;
+        gmTransactionStateBits |= gmTransactionSnapshot.gWaitComplete ? (1ULL << 18U) : 0ULL;
+        gmTransactionStateBits |= gmTransactionSnapshot.mWaitRequired ? (1ULL << 19U) : 0ULL;
+        gmTransactionStateBits |= gmTransactionSnapshot.mWaitComplete ? (1ULL << 20U) : 0ULL;
+        gmTransactionStateBits |= gmTransactionSnapshot.fromMainProgram ? (1ULL << 21U) : 0ULL;
+        gmTransactionStateBits |= gmTransactionSnapshot.postActionApplied ? (1ULL << 22U) : 0ULL;
+        const std::uint64_t gmTransactionChangeToken = FoldDiagnosticEventToken(
+            FoldDiagnosticEventToken(1469598103934665603ULL,
             gmTransactionSnapshot.sequence +
             gmTransactionCounters.started +
-            gmTransactionCounters.evaluations +
             gmTransactionCounters.readyTransitions +
             gmTransactionCounters.finalized +
             gmTransactionCounters.cancelled +
-            gmTransactionCounters.finalizeFailed;
+            gmTransactionCounters.finalizeFailed),
+            gmTransactionStateBits);
 
-        const std::uint64_t preDispatchBarrierChangeToken =
+        std::uint64_t preDispatchBarrierStateBits =
+            static_cast<std::uint64_t>(preDispatchBarrierSnapshot.kind);
+        preDispatchBarrierStateBits |= preDispatchBarrierSnapshot.active ? (1ULL << 8U) : 0ULL;
+        preDispatchBarrierStateBits |= preDispatchBarrierSnapshot.commandQueuePending ? (1ULL << 9U) : 0ULL;
+        preDispatchBarrierStateBits |= preDispatchBarrierSnapshot.groupStandstill ? (1ULL << 10U) : 0ULL;
+        const std::uint64_t preDispatchBarrierChangeToken = FoldDiagnosticEventToken(
+            FoldDiagnosticEventToken(1469598103934665603ULL,
             preDispatchBarrierSnapshot.sequence +
             preDispatchBarrierCounters.activations +
-            preDispatchBarrierCounters.evaluations +
-            preDispatchBarrierCounters.cleared;
+            preDispatchBarrierCounters.cleared),
+            preDispatchBarrierStateBits);
 
         // Exclude the observer's scan/publication counters from this token.
         // They advance by design; K.1 diagnostics should print when the
@@ -4105,11 +4132,39 @@ namespace HMI_Bridge
             singleBlockGateCounters.superseded +
             singleBlockGateCounters.rollbackDisabled;
 
-        const std::uint64_t feedHoldChangeToken =
+        // EDM173 FIX18: an acknowledged HOLD keeps evaluating its safety
+        // conditions every NC scan. Replaying that count is not a new edge.
+        // Preserve phase/decision/flags so progress or lost proof still logs.
+        std::uint64_t feedHoldStateBits =
+            static_cast<std::uint64_t>(feedHoldSnapshot.source);
+        feedHoldStateBits |= static_cast<std::uint64_t>(feedHoldSnapshot.phase) << 4U;
+        feedHoldStateBits |= static_cast<std::uint64_t>(feedHoldSnapshot.decision) << 8U;
+        feedHoldStateBits |= feedHoldSnapshot.active ? (1ULL << 16U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.requestLatched ? (1ULL << 17U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.legacyHoldEntered ? (1ULL << 18U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.legacyHoldWasEarly ? (1ULL << 19U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.legacyHoldAgreed ? (1ULL << 20U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.ownerLeaseValid ? (1ULL << 21U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.executionEpochValid ? (1ULL << 22U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.homeActive ? (1ULL << 23U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.homeHoldDecelerating ? (1ULL << 24U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.homePaused ? (1ULL << 25U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.homeResumeRequested ? (1ULL << 26U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.stopCandidate ? (1ULL << 27U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.acknowledgeReady ? (1ULL << 28U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.acknowledged ? (1ULL << 29U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.acknowledgeLost ? (1ULL << 30U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.resumeRequested ? (1ULL << 31U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.resumeBeforeAcknowledge ? (1ULL << 32U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.resumeAfterAcknowledge ? (1ULL << 33U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.resumeApplied ? (1ULL << 34U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.cancelled ? (1ULL << 35U) : 0ULL;
+        feedHoldStateBits |= feedHoldSnapshot.failed ? (1ULL << 36U) : 0ULL;
+        const std::uint64_t feedHoldChangeToken = FoldDiagnosticEventToken(
+            FoldDiagnosticEventToken(1469598103934665603ULL,
             feedHoldSnapshot.sequence +
             feedHoldCounters.requestAttempts +
             feedHoldCounters.requestsLatched +
-            feedHoldCounters.evaluations +
             feedHoldCounters.acknowledged +
             feedHoldCounters.legacyHolds +
             feedHoldCounters.legacyEarlyHolds +
@@ -4120,7 +4175,8 @@ namespace HMI_Bridge
             feedHoldCounters.motionFault +
             feedHoldCounters.acknowledgeLost +
             feedHoldCounters.cancelled +
-            feedHoldCounters.superseded;
+            feedHoldCounters.superseded),
+            feedHoldStateBits);
 
         const std::uint64_t feedHoldGateChangeToken =
             feedHoldGateSnapshot.sequence +

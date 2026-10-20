@@ -1,4 +1,5 @@
 ﻿#include "MotionCore.h"
+#include "NCG76StartDiagnostic.h"
 
 #include <algorithm>
 #include <array>
@@ -414,6 +415,8 @@ bool MotionCore::TryReferencePositionPairTransactionalTail(
 bool MotionCore::TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
     double* commandedMCSTail, MotionG76OrbitReceipt& result)
 {
+    // The only production caller is the NC G76 admission path, never the PDO callback.
+    PrintNCG76StartCheckpoint("PRODUCER_ENTRY", m_pendingSourcePC);
     result.Clear();
     auto& receipt=result.tail;
     const auto plannedEpoch=GetCurrentExecutionEpoch();
@@ -446,6 +449,7 @@ bool MotionCore::TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
         commandedMCSTail==nullptr || m_pContexts->size()<3U || m_pContexts->size()>MAX_AXES ||
         !std::isfinite(rapidOverride) || rapidOverride<0.0)
         return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::PLAN_INPUT);
+    PrintNCG76StartCheckpoint("PRODUCER_PLAN_READY", m_pendingSourcePC);
     if (!plannedOwner.IsValid() || plannedOwner.owner!=MotionOwner::AUTO || source!=MotionCommandSource::NC_MEMORY ||
         !plannedEpoch || m_pendingSourcePC<0 || !IsMotionOwnerLeaseCurrent(plannedOwner))
         return reject(false,true,MotionRejectReason::OWNER_CONFLICT,MotionG76AdmissionGate::OWNER_SCOPE);
@@ -466,6 +470,7 @@ bool MotionCore::TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
         return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::RUNTIME_READY);
     if (!m_programBlockMotionCaptureActive || m_programBlockMotionCapture.overflow || m_programBlockMotionCapture.count!=0U)
         return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::CAPTURE_SCOPE);
+    PrintNCG76StartCheckpoint("PRODUCER_SCOPE_READY", m_pendingSourcePC);
     auto& workspace=*m_g76OrbitProducer;
     workspace.startPulse.fill(0.0); workspace.stagedPulse.fill(0.0);
     result.startMCS=plan.startMCS; result.translationGeneration=plan.translationGeneration;
@@ -561,6 +566,21 @@ bool MotionCore::TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
             BufferMode::ABORTING,MotionCommandPathMode::EXACT_STOP,&receipt.identity,&receipt.ownerLease,
             plannedEpoch,&plannedOwner,false,nullptr,0.0,false,&workspace.commands[segment]))
             return reject(false,false,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::LINE_STAGE,-1,static_cast<int>(segment));
+        // FIX14: G76 is a contour feed, including legs inside the physical
+        // settling window. Reuse the existing immutable retained LINE
+        // transport so every nonzero leg interpolates at its admitted F.
+        // This is the same native-compound marker already used by G76 B2.
+        auto& command=workspace.commands[segment];
+        command.pathCoreRetainedTraversal=true;
+        command.pathCoreRetainedReverse=false;
+        command.mem_totalDist=lengthPulse;
+        command.mem_transformOrigin[0]=0.0;
+        command.mem_transformOrigin[1]=1.0;
+        command.mem_transformOrigin[2]=2.0;
+        for (unsigned axis=0U; axis<MAX_AXES; ++axis) {
+            command.mem_startPos[axis]=workspace.stagedPulse[axis];
+            command.mem_ratio[axis]=axis<3U?workspace.targetPulse[axis]:workspace.stagedPulse[axis];
+        }
         for (unsigned axis=0U; axis<3U; ++axis) workspace.stagedPulse[axis]=workspace.targetPulse[axis];
         result.legEndPulse[segment]=workspace.stagedPulse;
         result.legEndMCS[segment]=plan.pointsMCS[segment];
@@ -569,16 +589,28 @@ bool MotionCore::TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
     result.endMCS=workspace.stagedMCS; result.endPulse=workspace.stagedPulse;
     const auto stagedFingerprint=ReferencePairTailFingerprint(workspace.stagedPulse,workspace.stagedMCS.data(),rapidOverride);
     if (!m_Group.cmdQueue.ProducerHasCapacity(plan.count)) return reject(false,true,MotionRejectReason::QUEUE_FULL,MotionG76AdmissionGate::QUEUE_CAPACITY);
+    // Diagnostic stages bracket publication; they deliberately perturb admission timing.
+    PrintNCG76StartCheckpoint("PRODUCER_BATCH_STAGED", m_pendingSourcePC);
     MotionExecutionEpoch publishedEpoch=MOTION_EXECUTION_EPOCH_INVALID;
     if (!TryPublishOwnerAuthorizedAbortingExecutionEpoch(source,plannedEpoch,plannedOwner,publishedEpoch))
         return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::EPOCH_COMMIT);
+    PrintNCG76StartCheckpoint("PRODUCER_EPOCH_READY", m_pendingSourcePC);
     for (unsigned index=0U; index<plan.count; ++index) {
         AssignExecutionIdentity(workspace.commands[index],publishedEpoch,source,plannedOwner);
         result.identities[index]=workspace.commands[index].execution;
     }
     receipt.identity=result.identities[plan.count-1U]; receipt.ownerLease=result.ownerLease=plannedOwner;
-    if (!TryEnqueueMotionCommandBatch(workspace.commands.data(),plan.count))
+    PrintNCG76StartCheckpoint("PRODUCER_IDENTITIES_READY", m_pendingSourcePC);
+    // Qualify the exact assigned packets with the existing consumer checks
+    // before any child becomes visible to the RT queue.
+    for (unsigned segment=0U; segment<plan.count; ++segment)
+        if (!IsG76MixedPreparedCommandGeometryValid(workspace.commands[segment]))
+            return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::LINE_STAGE,-1,static_cast<int>(segment));
+    // FIX16: identify the compiled producer after retained geometry qualification.
+    RtPrintf("%s", "[EDM173_FIX16] event=G76_BUILD component=MotionCore_G28 revision=FIX16 includes=FIX14_RETAINED_LINEAR phase=BATCH_QUALIFIED discharge=0\n");
+    if (!TryEnqueueMotionCommandBatch(workspace.commands.data(),plan.count,true))
         return reject(false,false,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::QUEUE_PUBLISH);
+    PrintNCG76StartCheckpoint("PRODUCER_QUEUE_RETURNED", m_pendingSourcePC);
     result.commandAccepted=receipt.commandAccepted=true;
     const auto tupleStable=[&]()->bool {
         const auto ownerState1=m_motionOwnerState.load(std::memory_order_acquire);
@@ -621,6 +653,7 @@ bool MotionCore::TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
     if (!captureMatches || !IsPendingFixedTranslationSourceAllowed() ||
         !SameNCTranslationSnapshot(plan.translation,m_pendingTranslation) || !MatchesNCTranslation(m_pendingTranslation))
         return failAccepted(false,MotionG76AdmissionGate::CAPTURE_BIND);
+    PrintNCG76StartCheckpoint("PRODUCER_CAPTURE_VERIFIED", m_pendingSourcePC);
     result.captureBound=true;
     m_g00ProducerQueueTailPulse=workspace.stagedPulse;
     for (unsigned index=0U; index<MAX_AXES; ++index) {

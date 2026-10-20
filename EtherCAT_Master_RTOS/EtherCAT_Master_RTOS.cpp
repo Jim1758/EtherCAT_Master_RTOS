@@ -13,6 +13,8 @@
 #include "SHMManager.h"
 #include <RtssApi.h>
 #include "NCMainThreadStackPolicy.h"
+#include <atomic>
+#include <cstdint>
 
 // RTX64 Boilerplate (標準 RTX64 樣板)
 #ifndef NUM_REGISTERS
@@ -54,9 +56,69 @@ static bool ValidateNCMainThreadStackBeforeInitialization() noexcept
     return result == NCMainStack::Result::Ready;
 }
 
+// EDM173 FIX12: last-chance evidence only. Preserve the previous filter and
+// normal RTSS freeze/unload behavior. The observer itself requests no continuation;
+// any previous filter keeps its established return value.
+// This is best effort: debugger interception, disabled RTSS SEH or an invalid
+// fault stack can prevent this observer from running or printing.
+static LPTOP_LEVEL_EXCEPTION_FILTER g_edm173PreviousExceptionFilter = nullptr;
+static std::atomic_flag g_edm173ExceptionLogging = ATOMIC_FLAG_INIT;
+
+static LONG WINAPI ObserveEDM173UnhandledException(EXCEPTION_POINTERS* info) noexcept
+{
+    const DWORD incomingError = GetLastError();
+    if (g_edm173ExceptionLogging.test_and_set(std::memory_order_acquire))
+    {
+        SetLastError(incomingError);
+        return EXCEPTION_CONTINUE_SEARCH; // Do not re-enter a faulting logger or previous filter.
+    }
+    {
+        const EXCEPTION_RECORD* record = info != nullptr ? info->ExceptionRecord : nullptr;
+        const CONTEXT* context = info != nullptr ? info->ContextRecord : nullptr;
+        const unsigned long code = record != nullptr ? static_cast<unsigned long>(record->ExceptionCode) : 0UL;
+        const unsigned long parameters = record != nullptr ? static_cast<unsigned long>(record->NumberParameters) : 0UL;
+        const unsigned long long address = record != nullptr ? static_cast<unsigned long long>(
+            reinterpret_cast<std::uintptr_t>(record->ExceptionAddress)) : 0ULL;
+        const unsigned long long p0 = record != nullptr && parameters > 0UL ?
+            static_cast<unsigned long long>(record->ExceptionInformation[0U]) : 0ULL;
+        const unsigned long long p1 = record != nullptr && parameters > 1UL ?
+            static_cast<unsigned long long>(record->ExceptionInformation[1U]) : 0ULL;
+        unsigned long long ip = 0ULL, sp = 0ULL, ax = 0ULL, cx = 0ULL, dx = 0ULL, r8 = 0ULL, r9 = 0ULL;
+#if defined(_M_X64) || defined(__x86_64__)
+        if (context != nullptr)
+        {
+            ip = static_cast<unsigned long long>(context->Rip); sp = static_cast<unsigned long long>(context->Rsp);
+            ax = static_cast<unsigned long long>(context->Rax); cx = static_cast<unsigned long long>(context->Rcx);
+            dx = static_cast<unsigned long long>(context->Rdx); r8 = static_cast<unsigned long long>(context->R8);
+            r9 = static_cast<unsigned long long>(context->R9);
+        }
+#else
+        (void)context;
+#endif
+        RtPrintf("[EDM173_FIX12] event=UNHANDLED_EXCEPTION threadId=%lu code=0x%08lX exceptionAddress=0x%llX parameters=%lu parameter0=0x%llX parameter1=0x%llX ip=0x%llX sp=0x%llX ax=0x%llX cx=0x%llX dx=0x%llX r8=0x%llX r9=0x%llX action=NORMAL_EXCEPTION_HANDLING\n",
+            static_cast<unsigned long>(GetCurrentThreadId()), code, address, parameters, p0, p1, ip, sp, ax, cx, dx, r8, r9);
+    }
+    SetLastError(incomingError);
+    const auto previous = g_edm173PreviousExceptionFilter;
+    const LONG result = previous != nullptr && previous != ObserveEDM173UnhandledException ?
+        previous(info) : EXCEPTION_CONTINUE_SEARCH;
+    g_edm173ExceptionLogging.clear(std::memory_order_release);
+    return result;
+}
+
+static void InstallEDM173ExceptionObserverBeforeRuntime() noexcept
+{
+    const DWORD incomingError = GetLastError();
+    g_edm173PreviousExceptionFilter = SetUnhandledExceptionFilter(ObserveEDM173UnhandledException);
+    RtPrintf("[EDM173_FIX12] event=EXCEPTION_OBSERVER_INSTALL attempted=1 threadId=%lu previousFilter=%u action=NORMAL_EXCEPTION_HANDLING\n",
+        static_cast<unsigned long>(GetCurrentThreadId()), g_edm173PreviousExceptionFilter != nullptr ? 1U : 0U);
+    SetLastError(incomingError);
+}
+
 int _tmain(int argc, _TCHAR* argv[])//
 {
     if (!ValidateNCMainThreadStackBeforeInitialization()) return -1;
+    InstallEDM173ExceptionObserverBeforeRuntime();
 
     // ==============================================================
     // 🌟 1. 設定 CPU 核心親和性 (自動偵測安全版)

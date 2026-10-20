@@ -329,7 +329,9 @@ namespace EDM94
         None, EngineFault, TickIdentity, TickAuthority,
         BeginFrameIdentity, BeginProofIdentity, SealGenericScrub,
         SealFrameIdentity, SealProposalIdentity, SealAuthorityIdentity,
-        TickClock, HandoffClock, HandoffDeadline, SendClock, SessionClock
+        TickClock, HandoffClock, HandoffDeadline, SendClock, SessionClock,
+        G76Handoff, G76Predecessor, G76Step, G76EndpointHold,
+        G76Map, G76Endpoint, G76EndpointGain
     };
     inline const char* FaultSiteName(std::uint32_t site) noexcept
     {
@@ -350,6 +352,13 @@ namespace EDM94
         case FaultSite::HandoffDeadline: return "HANDOFF_DEADLINE";
         case FaultSite::SendClock: return "SEND_CLOCK";
         case FaultSite::SessionClock: return "SESSION_CLOCK";
+        case FaultSite::G76Handoff: return "G76_HANDOFF";
+        case FaultSite::G76Predecessor: return "G76_PREDECESSOR";
+        case FaultSite::G76Step: return "G76_STEP";
+        case FaultSite::G76EndpointHold: return "G76_ENDPOINT_HOLD";
+        case FaultSite::G76Map: return "G76_MAP";
+        case FaultSite::G76Endpoint: return "G76_ENDPOINT";
+        case FaultSite::G76EndpointGain: return "G76_ENDPOINT_GAIN";
         default: return "UNKNOWN";
         }
     }

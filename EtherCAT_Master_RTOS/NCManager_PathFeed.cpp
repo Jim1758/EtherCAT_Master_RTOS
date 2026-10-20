@@ -1,5 +1,7 @@
 // BX / Path Core V2-01. G01 is a distinct feed producer, not a G00 override.
 #include "NCManager.h"
+#include "NCG76StartDiagnostic.h"
+#include "NCG76DiagnosticPrint.h"
 #include "AlarmManager.h"
 #include "GlobalConfig.h"
 #include "NCPathCoreRadiusArc.h"
@@ -3177,6 +3179,9 @@ bool NCManager::PrepareG76OrbitTranslationSameThread(const NCBlock& block)
 NC_PATH_FEED_NOINLINE
 WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
 {
+    // FIX16: one admission-side version line; never emitted by the PDO loop.
+    RtPrintf("%s", "[EDM173_FIX16] event=G76_BUILD component=NCManager_PathFeed revision=FIX16 includes=FIX14_LIFECYCLE_DETAIL phase=G76_ENTRY discharge=0\n");
+    PrintNCG76StartCheckpoint("G76_START_ENTRY", GetActiveDispatchPC());
     if (m_edm94.latched && m_edm94.gapHistoryArm==292U) return StartEDM173OrbitSameThread(block);
     if (!IsG76OrbitBlockAllowedSameThread(block)) return nullptr;
     const auto& confirm=m_g76Confirmation;
@@ -3196,7 +3201,9 @@ WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
         m_currentExecutingBlockDispatchId<=confirm.dispatch || pc<confirm.firstPC ||
         !m_currentExecutingBlockDispatchId)
     { RejectG76OrbitSameThread("CONFIRMATION_OR_STOPPED_ADMISSION",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    PrintNCG76StartCheckpoint("G76_SCOPE_READY", pc);
     ResetG76OrbitStateSameThread();
+    PrintNCG76StartCheckpoint("G76_STATE_RESET", pc);
     auto& s=*m_g76Orbit;
     s.run=m_pathCoreLiveBookkeeping.currentRunToken; s.cache=GetBaseProgramCache().GetGeneration();
     s.dispatch=m_currentExecutingBlockDispatchId; s.pc=pc; s.line=source->sourceLineNumber;
@@ -3236,8 +3243,13 @@ WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
         input.start[a]=frozen.distanceMode==90 ? programStart[a] : 0.0;
         input.end[a]=block.has(word) ? NCTranslationLengthToMM(block.val(word),frozen.unitsMode) : input.start[a];
     }
-    if (!NCG76::Build(input,s.program) || !(mode==2U ? NCG76::BuildNativeBase(s.program,frozen,start,s.native) : NCG76::BuildNative(s.program,frozen,start,s.native)))
+    PrintNCG76StartCheckpoint("G76_INPUT_READY", pc);
+    if (!NCG76::Build(input,s.program))
     { RejectG76OrbitSameThread("PROGRAM_OR_TRANSFORMED_ENVELOPE",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    PrintNCG76StartCheckpoint("G76_PROGRAM_BUILT", pc);
+    if (!(mode==2U ? NCG76::BuildNativeBase(s.program,frozen,start,s.native) : NCG76::BuildNative(s.program,frozen,start,s.native)))
+    { RejectG76OrbitSameThread("PROGRAM_OR_TRANSFORMED_ENVELOPE",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
+    PrintNCG76StartCheckpoint("G76_NATIVE_BUILT", pc);
     bool xyz[8]={true,true,true,false,false,false,false,false};
     for (unsigned k=0U;k<s.native.count;++k)
     {
@@ -3259,11 +3271,13 @@ WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
                 { RejectG76OrbitSameThread("SOFTWARE_TRAVEL",AlarmManager::G_Code_Invalid_parameter); return nullptr; }
         }
     }
+    PrintNCG76StartCheckpoint("G76_PREVIEW_READY", pc);
     if (mode==2U) return StartEDM171MixedMotionSameThread(block);
     // This latch precedes the one atomic Motion publication and survives any
     // subsequent NC invalidation until old physical work has actually retired.
     m_g76PowerInhibited=true;
     ForceEDMPLCOutputsOffSameThread("G76_AIR_RUN_ADMISSION");
+    PrintNCG76StartCheckpoint("G76_BEFORE_PRODUCER", pc);
     const bool accepted=m_motion.TryG76MoveTransactionalTail(s.native,CoordSys.commandedMCS,s.receipt);
     const auto& r=s.receipt;
     bool receipt=accepted && r.valid && r.commandAccepted && r.captureBound && r.tailCommitted &&
@@ -3291,7 +3305,7 @@ WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
         RejectG76OrbitSameThread("NATIVE_BATCH_RECEIPT",r.commandAccepted ? AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY : AlarmManager::PATH_MOTION_NOT_ADMITTED); return nullptr;
     }
     s.active=true;
-    RtPrintf("[EDM170] event=AIR_RUN_BEGIN run=%llu cache=%llu dispatch=%llu pc=%d B=%u inheritedB=%u count=%u grow=%u R=%.6f F=%.6f H=%.6f centerReturnF=%.6f trigger=%s chordError=%.9f discharge=0\n",
+    PrintNCG76DiagnosticLine("[EDM170] event=AIR_RUN_BEGIN run=%llu cache=%llu dispatch=%llu pc=%d B=%u inheritedB=%u count=%u grow=%u R=%.6f F=%.6f H=%.6f centerReturnF=%.6f trigger=%s chordError=%.9f discharge=0\n",
         static_cast<unsigned long long>(s.run),static_cast<unsigned long long>(s.cache),static_cast<unsigned long long>(s.dispatch),s.pc,
         mode,s.inheritedB?1U:0U,s.native.count,NCG76::GrowSegments,input.radiusMm,input.feedMmMin,input.heightMm,
         input.centerReturnFeedMmMin>0.0 ? input.centerReturnFeedMmMin : input.feedMmMin,mode ? "DEMO_HALF_TURN" : "NONE",s.program.chordErrorBoundMm);
@@ -3305,40 +3319,74 @@ void NCManager::CommitG76OrbitCaptureSameThread(NCBlockDispatchId dispatch,const
     auto& s=*m_g76Orbit;
     if (!s.active || s.dispatch!=dispatch) return;
     const auto& r=s.receipt;
-    bool valid=committed && commit.IsValid() && ledgerFound && s.pc==pc && s.line==line &&
+    // Diagnostic labels wrap the original short-circuit predicates in their
+    // original order. No guard or live-authority read is skipped or repeated.
+    const char* rejectStage="NONE";
+    int rejectChild=-1; // Zero-based child index; -1 means a parent-level gate.
+    const auto check=[&](bool valid,const char* stage) noexcept {
+        if (!valid) rejectStage=stage;
+        return valid;
+    };
+    bool valid=check(committed && commit.IsValid() && ledgerFound && s.pc==pc && s.line==line &&
         commit.scope==NCProgramScope::MEMORY && commit.frameId==NC_PROGRAM_FRAME_ID_INVALID &&
-        commit.sourcePC==pc && commit.cacheGeneration==s.cache && ledger.dispatchId==dispatch &&
-        ledger.programCommitted && !ledger.ncDispatchFailed && !ledger.motionCaptureOverflow &&
+        commit.sourcePC==pc && commit.cacheGeneration==s.cache,"COMMIT_SCOPE") &&
+        check(ledger.dispatchId==dispatch && ledger.programCommitted && !ledger.ncDispatchFailed && !ledger.motionCaptureOverflow &&
         ledger.sourceLineNumber==line && FeedSameSource(commit,ledger.programTarget) && FeedSameSource(commit,ledger.programCommit) &&
-        commit.sequence==ledger.programCommit.sequence && capture.count==r.count && !capture.overflow &&
-        r.count>0U && r.count<=128U && ledger.motionSegmentCount==r.count &&
-        IsCncFeedValueCurrentSameThread(s.feed) && FeedTranslationCurrent(CoordSys,r.translationGeneration) &&
-        m_motion.MatchesNCTranslation(s.mixed ? m_edm171Air->plan.input.translation : s.native.translation) && r.ownerLease.Matches(m_programMotionLease) &&
-        m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) && r.tail.IsCommitted() && r.tail.captureBound;
-    valid=valid && r.count==(s.mixed ? m_edm171Air->plan.count : s.native.count);
+        commit.sequence==ledger.programCommit.sequence,"LEDGER") &&
+        check(capture.count==r.count && !capture.overflow && r.count>0U && r.count<=128U && ledger.motionSegmentCount==r.count,"CAPTURE_COUNT") &&
+        check(IsCncFeedValueCurrentSameThread(s.feed),"FEED_SCOPE_AND_OWNER") &&
+        check(FeedTranslationCurrent(CoordSys,r.translationGeneration),"TRANSLATION_CURRENT") &&
+        check(m_motion.MatchesNCTranslation(s.mixed ? m_edm171Air->plan.input.translation : s.native.translation),"MOTION_TRANSLATION") &&
+        check(r.ownerLease.Matches(m_programMotionLease),"LEASE_BINDING") &&
+        check(m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease),"OWNER_CURRENT") &&
+        check(r.tail.IsCommitted() && r.tail.captureBound,"RECEIPT_TAIL");
+    valid=valid && check(r.count==(s.mixed ? m_edm171Air->plan.count : s.native.count),"PLAN_COUNT");
     for (unsigned k=0U;k<r.count && k<128U && valid;++k)
     {
+        rejectChild=static_cast<int>(k);
         const auto& sub=capture.submissions[k]; const auto& seg=ledger.motionSegments[k];
-        valid=sub.producerAccepted && sub.immediateRejectReason==MotionRejectReason::NONE &&
-            sub.commandPathMode==MotionCommandPathMode::EXACT_STOP && sub.translationGeneration==r.translationGeneration &&
-            seg.producerAccepted && seg.immediateRejectReason==MotionRejectReason::NONE &&
-            FeedFullIdentity(sub.identity,r.identities[k]) && FeedFullIdentity(seg.identity,r.identities[k]) &&
-            r.identities[k].epoch==m_motion.GetCurrentExecutionEpoch() &&
-            r.identities[k].sourceBlockId==static_cast<MotionSourceBlockId>(pc) && r.identities[k].source==MotionCommandSource::NC_MEMORY;
+        valid=check(sub.producerAccepted && sub.immediateRejectReason==MotionRejectReason::NONE &&
+            sub.commandPathMode==MotionCommandPathMode::EXACT_STOP && sub.translationGeneration==r.translationGeneration,"CHILD_SUBMISSION") &&
+            check(seg.producerAccepted && seg.immediateRejectReason==MotionRejectReason::NONE,"CHILD_LEDGER") &&
+            check(FeedFullIdentity(sub.identity,r.identities[k]) && FeedFullIdentity(seg.identity,r.identities[k]),"CHILD_IDENTITY") &&
+            check(r.identities[k].epoch==m_motion.GetCurrentExecutionEpoch(),"CHILD_EPOCH_CURRENT") &&
+            check(r.identities[k].sourceBlockId==static_cast<MotionSourceBlockId>(pc) && r.identities[k].source==MotionCommandSource::NC_MEMORY,"CHILD_SOURCE");
     }
     if (valid)
     {
         const auto& tail=capture.submissions[r.count-1U].queueTailReceipt;
-        valid=tail.IsCommitted() && tail.captureBound && tail.transactionSequence==r.tail.transactionSequence &&
-            FeedFullIdentity(tail.identity,r.tail.identity) && tail.ownerLease.Matches(r.ownerLease);
+        valid=check(tail.IsCommitted() && tail.captureBound && tail.transactionSequence==r.tail.transactionSequence &&
+            FeedFullIdentity(tail.identity,r.tail.identity) && tail.ownerLease.Matches(r.ownerLease),"CAPTURE_TAIL");
     }
     if (!valid)
-    { RejectG76OrbitSameThread("AGGREGATE_COMMIT_BINDING",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
+    {
+        // These are separate observations made only after the failed guard;
+        // they do not identify the authority value at the earlier publication.
+        // The retained feedback tick is cached RT evidence, not this NC event's time.
+        const unsigned identityIndex=rejectChild>=0 && static_cast<unsigned>(rejectChild)<r.count && rejectChild<128 ?
+            static_cast<unsigned>(rejectChild) : 0U;
+        const auto receiptEpoch=r.count>0U && r.count<=128U ? r.identities[identityIndex].epoch : MOTION_EXECUTION_EPOCH_INVALID;
+        const auto receiptOwner=r.ownerLease;
+        const auto expectedOwner=m_programMotionLease;
+        const auto ownerObservedAtReject=m_motion.GetMotionOwnerLease();
+        const auto epochObservedAtReject=m_motion.GetCurrentExecutionEpoch();
+        const auto cachedFeedbackTick=m_edm94.feedback.lastTick;
+        const auto receiptCount=r.count;
+        RejectG76OrbitSameThread("AGGREGATE_COMMIT_BINDING",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+        RtPrintf("[EDM170] event=BIND_REJECT bindDiag=1 stage=%s child=%d dispatch=%llu pc=%d line=%d children=%u receiptEpoch=%llu epochObservedAtReject=%llu receiptOwner=%u receiptGeneration=%u expectedOwner=%u expectedGeneration=%u ownerObservedAtReject=%u generationObservedAtReject=%u cachedFeedbackTick=%llu observations=SEPARATE_SNAPSHOTS_CACHED_TICK_NOT_EVENT discharge=0\n",
+            rejectStage,rejectChild,static_cast<unsigned long long>(dispatch),pc,line,receiptCount,
+            static_cast<unsigned long long>(receiptEpoch),static_cast<unsigned long long>(epochObservedAtReject),
+            static_cast<unsigned>(receiptOwner.owner),static_cast<unsigned>(receiptOwner.generation),
+            static_cast<unsigned>(expectedOwner.owner),static_cast<unsigned>(expectedOwner.generation),
+            static_cast<unsigned>(ownerObservedAtReject.owner),static_cast<unsigned>(ownerObservedAtReject.generation),
+            static_cast<unsigned long long>(cachedFeedbackTick));
+        return;
+    }
     s.commit=commit.sequence; s.bound=true;
     if (m_edm94.gapHistoryArm==292U && m_edm94.latched)
     {
         m_edm173->parentCommitted=true;
-        RtPrintf("[EDM173] event=PARENT_BOUND session=%llu dispatch=%llu commit=%llu children=%u discharge=0\n",
+        RtPrintf("[EDM173] event=PARENT_BOUND session=%llu dispatch=%llu commit=%llu children=%u discharge=0 bindDiag=1\n",
             static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(dispatch),
             static_cast<unsigned long long>(commit.sequence),r.count);
         return;
@@ -3346,7 +3394,7 @@ void NCManager::CommitG76OrbitCaptureSameThread(NCBlockDispatchId dispatch,const
     CommitCncModalFeedSameThread(s.feed,dispatch,commit.sequence,pc,line);
     m_g76Modal.lease=r.ownerLease; m_g76Modal.run=s.run; m_g76Modal.cache=s.cache;
     m_g76Modal.commit=commit.sequence; m_g76Modal.mode=s.mode; m_g76Modal.valid=true;
-    RtPrintf("[EDM170] event=BOUND dispatch=%llu commit=%llu count=%u B=%u inheritedB=%u discharge=0\n",
+    RtPrintf("[EDM170] event=BOUND dispatch=%llu commit=%llu count=%u B=%u inheritedB=%u discharge=0 bindDiag=1\n",
         static_cast<unsigned long long>(dispatch),static_cast<unsigned long long>(commit.sequence),r.count,m_g76Modal.mode,s.inheritedB?1U:0U);
 }
 
@@ -3360,6 +3408,11 @@ void NCManager::ObserveG76OrbitFeedbackSameThread(const MotionFeedbackEvent& eve
     {
         const auto& id=s.receipt.identities[k];
         if (!id.Matches(event.identity)) continue;
+        // Snapshot before the switch: a rejected transition still writes its
+        // state slot below, so post-transition values would mislabel history.
+        const bool acceptedBefore=s.accepted[k],startedBefore=s.started[k],doneBefore=s.done[k];
+        const bool previousDone=k==0U || s.done[k-1U];
+        const auto previousSequence=s.lastFeedback[k];
         bool valid=FeedFullIdentity(id,event.identity) && ledgerAccepted && event.sequence!=0ULL &&
             event.sequence>s.lastFeedback[k] && event.owner==s.receipt.ownerLease.owner &&
             event.ownerGeneration==s.receipt.ownerLease.generation && event.errorCode==0U &&
@@ -3378,7 +3431,27 @@ void NCManager::ObserveG76OrbitFeedbackSameThread(const MotionFeedbackEvent& eve
             }
         }
         if (!valid)
-        { RejectG76OrbitSameThread("CHILD_FEEDBACK_IDENTITY_OR_LIFECYCLE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return; }
+        {
+            const auto expectedIdentity=id;
+            const auto expectedOwner=s.receipt.ownerLease;
+            const auto dispatch=s.dispatch;
+            const auto rejectedEvent=event;
+            RejectG76OrbitSameThread("CHILD_FEEDBACK_IDENTITY_OR_LIFECYCLE",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY);
+            PrintNCG76DiagnosticLine("[EDM173_FIX14] event=G76_FEEDBACK_REJECT dispatch=%llu child=%u type=%u ledger=%u seq=%llu prevSeq=%llu accepted=%u started=%u done=%u previousDone=%u owner=%u/%u expectedOwner=%u/%u error=%u reason=%u state=BEFORE_EVENT discharge=0\n",
+                static_cast<unsigned long long>(dispatch),k+1U,static_cast<unsigned>(rejectedEvent.type),ledgerAccepted?1U:0U,
+                static_cast<unsigned long long>(rejectedEvent.sequence),static_cast<unsigned long long>(previousSequence),
+                acceptedBefore?1U:0U,startedBefore?1U:0U,doneBefore?1U:0U,previousDone?1U:0U,
+                static_cast<unsigned>(rejectedEvent.owner),static_cast<unsigned>(rejectedEvent.ownerGeneration),
+                static_cast<unsigned>(expectedOwner.owner),static_cast<unsigned>(expectedOwner.generation),
+                static_cast<unsigned>(rejectedEvent.errorCode),static_cast<unsigned>(rejectedEvent.rejectReason));
+            PrintNCG76DiagnosticLine("[EDM173_FIX14] event=G76_FEEDBACK_IDENTITY dispatch=%llu child=%u epoch=%llu expectedEpoch=%llu segment=%llu expectedSegment=%llu block=%lld expectedBlock=%lld source=%u expectedSource=%u discharge=0\n",
+                static_cast<unsigned long long>(dispatch),k+1U,
+                static_cast<unsigned long long>(rejectedEvent.identity.epoch),static_cast<unsigned long long>(expectedIdentity.epoch),
+                static_cast<unsigned long long>(rejectedEvent.identity.segmentId),static_cast<unsigned long long>(expectedIdentity.segmentId),
+                static_cast<long long>(rejectedEvent.identity.sourceBlockId),static_cast<long long>(expectedIdentity.sourceBlockId),
+                static_cast<unsigned>(rejectedEvent.identity.source),static_cast<unsigned>(expectedIdentity.source));
+            return;
+        }
         s.lastFeedback[k]=event.sequence;
         if (event.type==MotionFeedbackType::COMPLETED && m_edm94.gapHistoryArm!=292U)
         {
@@ -3446,7 +3519,7 @@ bool NCManager::CompleteG76OrbitSameThread()
             static_cast<unsigned long long>(s.dispatch),static_cast<unsigned long long>(s.commit));
         return true;
     }
-    RtPrintf("[EDM170] event=COMPLETE dispatch=%llu commit=%llu completed=%u count=%u finalX=%.9f finalY=%.9f finalZ=%.9f evidence=ALL_CHILDREN_AND_GROUP_DRAIN discharge=0\n",
+    PrintNCG76DiagnosticLine("[EDM170] event=COMPLETE dispatch=%llu commit=%llu completed=%u count=%u finalX=%.9f finalY=%.9f finalZ=%.9f evidence=ALL_CHILDREN_AND_GROUP_DRAIN discharge=0\n",
         static_cast<unsigned long long>(s.dispatch),static_cast<unsigned long long>(s.commit),ledger.motionCompletedCount,s.receipt.count,
         s.receipt.endMCS[0],s.receipt.endMCS[1],s.receipt.endMCS[2]);
     return true;
@@ -3475,7 +3548,7 @@ void NCManager::ServiceG76OrbitSameThread()
         if (s.mixed)
         {
             const auto& leg=m_edm171Air->plan.legs[k];
-            RtPrintf("[EDM171] event=CHILD_COMPLETED phase=%s pc=%d segment=%u count=%u sourceIndex=%u nominal=%u u0=%.9f u1=%.9f evidence=IDENTITY_MATCHED_FEEDBACK discharge=0\n",
+            PrintNCG76DiagnosticLine("[EDM171] event=CHILD_COMPLETED phase=%s pc=%d segment=%u count=%u sourceIndex=%u nominal=%u u0=%.9f u1=%.9f evidence=IDENTITY_MATCHED_FEEDBACK discharge=0\n",
                 leg.phase==NCG76Mixed::Phase::Nominal?"NOMINAL":leg.phase==NCG76Mixed::Phase::Retreat?"RETREAT":"RETURN",s.pc,k+1U,s.receipt.count,
                 leg.originalSourceIndex,leg.nominalOrdinal,leg.startU,leg.endU);
             ++s.loggedChildren; continue;
@@ -3490,7 +3563,7 @@ void NCManager::ServiceG76OrbitSameThread()
         const char* phase=point.phase==NCG76::Phase::Grow ? "GROW" : point.phase==NCG76::Phase::ToCenter ? "TO_CENTER" :
             point.phase==NCG76::Phase::Lift ? "LIFT" : point.phase==NCG76::Phase::ReturnCenter ? "RETURN_CENTER" :
             point.phase==NCG76::Phase::Resume ? "RESUME" : "FINISH_CENTER";
-        RtPrintf("[EDM170] event=CHILD_COMPLETED phase=%s dispatch=%llu segment=%u count=%u grow=%u centerX=%.6f centerY=%.6f centerZ=%.6f targetX=%.6f targetY=%.6f targetZ=%.6f evidence=IDENTITY_MATCHED_FEEDBACK discharge=0\n",
+        PrintNCG76DiagnosticLine("[EDM170] event=CHILD_COMPLETED phase=%s dispatch=%llu segment=%u count=%u grow=%u centerX=%.6f centerY=%.6f centerZ=%.6f targetX=%.6f targetY=%.6f targetZ=%.6f evidence=IDENTITY_MATCHED_FEEDBACK discharge=0\n",
             phase,static_cast<unsigned long long>(s.dispatch),k+1U,s.receipt.count,point.growIndex,
             point.center[0],point.center[1],point.center[2],point.position[0],point.position[1],point.position[2]);
         ++s.loggedChildren;
@@ -3872,7 +3945,7 @@ WaitConditionFunc NCManager::StartEDM171MixedMotionSameThread(const NCBlock& blo
     input.outFeedMmMin=input.returnFeedMmMin=s.feed.feedMMMin;
     if (!NCG76Mixed::Build(input,a.plan))
     {
-        RtPrintf("[EDM171] event=B2_PLAN_REJECT status=%s E6=%.6f available=%.6f history=%u pc=%d beforePublish=1\n",
+        PrintNCG76DiagnosticLine("[EDM171] event=B2_PLAN_REJECT status=%s E6=%.6f available=%.6f history=%u pc=%d beforePublish=1\n",
             NCG76Mixed::StatusName(a.plan.status),input.retreatMm,a.plan.availableMm,input.history.count,s.pc);
         RejectG76OrbitSameThread("B2_CANONICAL_HISTORY_PLAN",AlarmManager::G_Code_Invalid_parameter); return nullptr;
     }
@@ -3911,7 +3984,7 @@ WaitConditionFunc NCManager::StartEDM171MixedMotionSameThread(const NCBlock& blo
         RejectG76OrbitSameThread("B2_NATIVE_BATCH_RECEIPT",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return nullptr;
     }
     s.active=true;
-    RtPrintf("[EDM171] event=B2_BEGIN g=%d B=2 inherited=%u trigger=%s pc=%d count=%u reverse=%u E6=%.6f available=%.6f discharge=0\n",
+    PrintNCG76DiagnosticLine("[EDM171] event=B2_BEGIN g=%d B=2 inherited=%u trigger=%s pc=%d count=%u reverse=%u E6=%.6f available=%.6f discharge=0\n",
         block.gCode,s.inheritedB?1U:0U,orbit?"GROW12":"SOURCE_END",s.pc,r.count,a.plan.reverseCount,input.retreatMm,a.plan.availableMm);
     return [](NCManager* nc){return nc->CompleteG76OrbitSameThread();};
 }

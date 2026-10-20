@@ -300,6 +300,21 @@ public:
             feedback_.velocityMmSec == 0.0 && direction > 0;
         return Propose();
     }
+    // Refresh only an already committed terminal endpoint. No integration,
+    // history crossing or new completion is permitted while hardware settles.
+    bool StepCompletedEndpoint(std::uint64_t tick, std::uint64_t nowUs) noexcept
+    {
+        if (!currentValid_ || suspended_ || stop_ || pending_ || !committedValid_ || feedback_.faulted ||
+            !committed_.completeReady || !feedback_.completeReady || cursor_ != count_ ||
+            committedCursor_ != cursor_ || feedback_.tick != committed_.tick ||
+            feedback_.localMm != current_.mapping.Geometry().lengthMm ||
+            feedback_.positionPulse != committed_.positionPulse || feedback_.velocityMmSec != 0.0 ||
+            feedback_.velocityPps != Point{} || feedback_.historyDepth || feedback_.awaitingSeam)
+            return Fail(Reason::State);
+        if (!Clock(tick, nowUs)) return false;
+        feedback_.accelerationMmSec2 = 0.0;
+        return Propose();
+    }
     bool CommitMapped(std::uint64_t tick) noexcept
     {
         if (!pending_ || tick != feedback_.tick || feedback_.faulted) return Fail(Reason::Uncommitted);

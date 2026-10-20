@@ -14,6 +14,8 @@
 #include "EtherCatRxForensicsDiagContract.h" // DC-RX.4B - Windows read-only SHM bridge
 #include "EtherCatP64DeferredDiagnostics.h" // DC-DIAG.2 - P64 numeric event handoff
 #include "EDM144RuntimeTiming.h"
+#include "EDM174CommunicationTrace.h"
+#include "EDM174G76LeafTiming.h"
 #include "HMI_Bridge.h"    // 🌟 1. 引入橋接器
 #include "AlarmManager.h"
 #include "PLCManager.h" // 🌟 1. 引入 PLC 管理器標頭檔
@@ -5326,6 +5328,254 @@ namespace
         }
     }
 
+    // FIX19: low-rate observation of the sampled local Motion pass and one
+    // physical axis slot. Global and selected-axis denominators are separate;
+    // an unvisited phase is visible in visits, never inferred as executed.
+    OSCARMAX_DIAG_NOINLINE void PrintEDM173Fix19AxesTiming()
+    {
+        static EDM144::AxesDetail::Snapshot snapshot{};
+        static std::uint64_t lastPublication = 0ULL;
+        std::uint64_t publication = 0ULL;
+        if (!EDM144::AxesDetail::Read(snapshot, publication) || !publication ||
+            publication == lastPublication) return;
+        lastPublication = publication;
+        RtPrintf("[EDM173_FIX19] event=AXES_WINDOW window=%llu pub=%llu firstCycle=%llu lastCycle=%llu attempted=%u accepted=%u rejected=%u slot=%u axis=%d slots=%u stride=65 maxClockReads=18 baseClockReads=12 leafClockBudgetExtra=6 elapsedNotCpu=1 sampledMaxOnly=1 collectorTailExcluded=1 clockOverheadIncluded=1\n",
+            static_cast<unsigned long long>(snapshot.windowId),
+            static_cast<unsigned long long>(publication),
+            static_cast<unsigned long long>(snapshot.firstCycle),
+            static_cast<unsigned long long>(snapshot.lastCycle),
+            static_cast<unsigned>(snapshot.attempted),
+            static_cast<unsigned>(snapshot.accepted),
+            static_cast<unsigned>(snapshot.rejected),
+            static_cast<unsigned>(snapshot.slot), static_cast<int>(snapshot.axisIndex),
+            static_cast<unsigned>(snapshot.slots));
+        static const char* const bucketNames[6] = {
+            "NO_OWNER", "AUTO", "AUTO_ZERO_OVERRIDE", "OTHER", "CHANGED", "INVALID_RUNTIME"};
+        for (unsigned bucket = 0U; bucket < 6U; ++bucket)
+        {
+            const auto& s = snapshot.buckets[bucket];
+            if (!s.count) continue;
+            const auto wholeMean = [&s](unsigned phase) noexcept {
+                return static_cast<unsigned long long>(s.wholeSumNs[phase] / s.count);
+            };
+            const auto axisMean = [&s](unsigned phase) noexcept {
+                return static_cast<unsigned long long>(s.slotCount ?
+                    s.axisSumNs[phase] / s.slotCount : 0ULL);
+            };
+            RtPrintf("[EDM173_FIX19] event=AXES_PASS window=%llu bucket=%s globalSamples=%u setupAvgNs=%llu loopAvgNs=%llu tailAvgNs=%llu totalAvgNs=%llu setupMaxNs=%llu loopMaxNs=%llu tailMaxNs=%llu totalMaxNs=%llu\n",
+                static_cast<unsigned long long>(snapshot.windowId), bucketNames[bucket],
+                static_cast<unsigned>(s.count), wholeMean(0U), wholeMean(1U),
+                wholeMean(2U), wholeMean(3U),
+                static_cast<unsigned long long>(s.wholeMaxNs[0]),
+                static_cast<unsigned long long>(s.wholeMaxNs[1]),
+                static_cast<unsigned long long>(s.wholeMaxNs[2]),
+                static_cast<unsigned long long>(s.wholeMaxNs[3]));
+            RtPrintf("[EDM173_FIX19] event=AXIS_AVG window=%llu bucket=%s selectedSamples=%u inputNs=%llu preludeNs=%llu servoPrepNs=%llu controlObserveNs=%llu guardWriteNs=%llu feedbackStateNs=%llu qualifyNs=%llu selectedNs=%llu visits=%u/%u/%u/%u/%u/%u/%u servo=%u complete=%u\n",
+                static_cast<unsigned long long>(snapshot.windowId), bucketNames[bucket],
+                static_cast<unsigned>(s.slotCount), axisMean(0U), axisMean(1U),
+                axisMean(2U), axisMean(3U), axisMean(4U), axisMean(5U),
+                axisMean(6U), axisMean(7U),
+                static_cast<unsigned>(s.phaseVisits[0]), static_cast<unsigned>(s.phaseVisits[1]),
+                static_cast<unsigned>(s.phaseVisits[2]), static_cast<unsigned>(s.phaseVisits[3]),
+                static_cast<unsigned>(s.phaseVisits[4]), static_cast<unsigned>(s.phaseVisits[5]),
+                static_cast<unsigned>(s.phaseVisits[6]), static_cast<unsigned>(s.servoCount),
+                static_cast<unsigned>(s.completeCount));
+            RtPrintf("[EDM173_FIX19] event=AXIS_MAX window=%llu bucket=%s selectedSamples=%u inputNs=%llu preludeNs=%llu servoPrepNs=%llu controlObserveNs=%llu guardWriteNs=%llu feedbackStateNs=%llu qualifyNs=%llu selectedNs=%llu\n",
+                static_cast<unsigned long long>(snapshot.windowId), bucketNames[bucket],
+                static_cast<unsigned>(s.slotCount),
+                static_cast<unsigned long long>(s.axisMaxNs[0]),
+                static_cast<unsigned long long>(s.axisMaxNs[1]),
+                static_cast<unsigned long long>(s.axisMaxNs[2]),
+                static_cast<unsigned long long>(s.axisMaxNs[3]),
+                static_cast<unsigned long long>(s.axisMaxNs[4]),
+                static_cast<unsigned long long>(s.axisMaxNs[5]),
+                static_cast<unsigned long long>(s.axisMaxNs[6]),
+                static_cast<unsigned long long>(s.axisMaxNs[7]));
+        }
+    }
+
+    // EDM174_FIX1_COMM_PRINTER_BEGIN
+    // P50 only. Finish one immutable capture before reading the next one.
+    // One RtPrintf per 10ms supervisory iteration; no retries or allocation.
+    OSCARMAX_DIAG_NOINLINE void PrintEDM174CommunicationTrace()
+    {
+        static bool readyLogged = false;
+        if (!readyLogged)
+        {
+            RtPrintf("[EDM174_FIX1] event=COMM_TRACE_READY history=20 clocks=EXISTING_ONLY mailbox=UNCHANGED authority=NONE\n");
+            readyLogged = true;
+            return;
+        }
+        static EDM174Comm::Snapshot snapshot{};
+        static const EDM174Comm::Cycle* rows[EDM174Comm::HistoryCapacity + 6U]{};
+        static const char* kinds[EDM174Comm::HistoryCapacity + 6U]{};
+        static std::uint64_t lastPublication = 0ULL, publication = 0ULL;
+        static unsigned count = 0U, cursor = 0U, history = 0U;
+        static bool pending = false;
+        if (!pending)
+        {
+            std::uint64_t fetched = 0ULL;
+            if (!EDM174Comm::Read(snapshot, fetched) || !fetched || fetched == lastPublication)
+                return;
+            lastPublication = publication = fetched;
+            history = snapshot.historyCount < EDM174Comm::HistoryCapacity ?
+                snapshot.historyCount : EDM174Comm::HistoryCapacity;
+            count = 0U;
+            for (unsigned i = 0U; i < history; ++i)
+            { rows[count] = &snapshot.history[i]; kinds[count++] = "H"; }
+            rows[count] = &snapshot.firstBad; kinds[count++] = "F";
+            if (snapshot.maxValid & EDM174Comm::CallbackMaximum)
+            { rows[count] = &snapshot.maxCallback; kinds[count++] = "C"; }
+            if (snapshot.maxValid & EDM174Comm::MotionMaximum)
+            { rows[count] = &snapshot.maxMotion; kinds[count++] = "M"; }
+            if (snapshot.maxValid & EDM174Comm::CommMaximum)
+            { rows[count] = &snapshot.maxComm; kinds[count++] = "E"; }
+            if (snapshot.maxValid & EDM174Comm::StartGapMaximum)
+            {
+                rows[count] = &snapshot.maxStartGap; kinds[count++] = "G";
+                rows[count] = &snapshot.maxStartGapPrevious; kinds[count++] = "P";
+            }
+            cursor = 0U;
+            pending = true;
+        }
+        if (cursor == 0U)
+        {
+            RtPrintf("[EDM174_FIX1] event=COMM_BEGIN session=%llu pub=%llu inputFaultTick=%llu guardFaultTick=%llu qpcHz=%llu captured=%llu firstTick=%llu lastTick=%llu history=%u printedHistory=%u historyCap=20 rows=%u maxValid=%x invalidTiming=%u authority=NONE elapsedNotCpu=1 wireAck=0 qpcUse=matched_flag_only\n",
+                static_cast<unsigned long long>(snapshot.session),
+                static_cast<unsigned long long>(publication),
+                static_cast<unsigned long long>(snapshot.inputFaultTick),
+                static_cast<unsigned long long>(snapshot.guardFaultTick),
+                static_cast<unsigned long long>(snapshot.qpcFrequency),
+                static_cast<unsigned long long>(snapshot.recorded),
+                static_cast<unsigned long long>(snapshot.firstTick),
+                static_cast<unsigned long long>(snapshot.lastTick),
+                static_cast<unsigned>(snapshot.historyCount), history, count,
+                static_cast<unsigned>(snapshot.maxValid),
+                static_cast<unsigned>(snapshot.invalidTimingCycles));
+            ++cursor;
+            return;
+        }
+        if (cursor == 1U)
+        {
+            RtPrintf("[EDM174_FIX1] event=COMM_SCHEMA session=%llu pub=%llu timeUnit=ns rawQpc=tx0,tx1,rx1 ph=before/after ch=before/after w=lrw/dc/expected f=hex:1pdoValid,2matched,4injected,+timeFlags v=pairValid_hex:01dt,02pre,04ec,08post,10mot,20tl,40cb,80out dt=start_interval pre=start_to_comm ec=comm_envelope post=comm_to_motion tl=motion_to_end out=prev_end_to_start k=H_history,F_firstBad,C_maxCallback,M_maxMotion,E_maxComm,G_maxStartGap,P_gapPrevious\n",
+                static_cast<unsigned long long>(snapshot.session),
+                static_cast<unsigned long long>(publication));
+            ++cursor;
+            return;
+        }
+        const unsigned index = cursor - 2U;
+        if (index < count)
+        {
+            const EDM174Comm::Cycle& cycle = *rows[index];
+            std::uint64_t dt = 0ULL, pre = 0ULL, comm = 0ULL, post = 0ULL;
+            std::uint64_t motion = 0ULL, tail = 0ULL, callback = 0ULL, outside = 0ULL;
+            unsigned valid = 0U;
+            if (EDM174Comm::SafeElapsed(cycle.prevStartNs, cycle.startNs, dt)) valid |= 0x01U;
+            if (EDM174Comm::SafeElapsed(cycle.startNs, cycle.commStartNs, pre)) valid |= 0x02U;
+            if (EDM174Comm::SafeElapsed(cycle.commStartNs, cycle.commEndNs, comm)) valid |= 0x04U;
+            if (EDM174Comm::SafeElapsed(cycle.commEndNs, cycle.motionStartNs, post)) valid |= 0x08U;
+            if (EDM174Comm::SafeElapsed(cycle.motionStartNs, cycle.motionEndNs, motion)) valid |= 0x10U;
+            if (EDM174Comm::SafeElapsed(cycle.motionEndNs, cycle.endNs, tail)) valid |= 0x20U;
+            if (EDM174Comm::SafeElapsed(cycle.startNs, cycle.endNs, callback)) valid |= 0x40U;
+            if (EDM174Comm::SafeElapsed(cycle.prevEndNs, cycle.startNs, outside)) valid |= 0x80U;
+            RtPrintf("[EDM174_FIX1] event=CROW s=%llu p=%llu k=%s i=%u t=%llu dt=%llu pre=%llu ec=%llu post=%llu mot=%llu tl=%llu cb=%llu out=%llu tx0=%llu tx1=%llu rx1=%llu ph=%u/%u ch=%u/%u w=%d/%d/%d f=%x v=%x\n",
+                static_cast<unsigned long long>(snapshot.session),
+                static_cast<unsigned long long>(publication), kinds[index], index,
+                static_cast<unsigned long long>(cycle.tick),
+                static_cast<unsigned long long>(dt), static_cast<unsigned long long>(pre),
+                static_cast<unsigned long long>(comm), static_cast<unsigned long long>(post),
+                static_cast<unsigned long long>(motion), static_cast<unsigned long long>(tail),
+                static_cast<unsigned long long>(callback), static_cast<unsigned long long>(outside),
+                static_cast<unsigned long long>(cycle.txBeforeQpc),
+                static_cast<unsigned long long>(cycle.txAfterQpc),
+                static_cast<unsigned long long>(cycle.rxAfterQpc),
+                static_cast<unsigned>(cycle.phaseBefore), static_cast<unsigned>(cycle.phaseAfter),
+                static_cast<unsigned>(cycle.childBefore), static_cast<unsigned>(cycle.childAfter),
+                static_cast<int>(cycle.lrwWkc), static_cast<int>(cycle.dcWkc),
+                static_cast<int>(cycle.expectedWkc), static_cast<unsigned>(cycle.flags), valid);
+            ++cursor;
+            return;
+        }
+        RtPrintf("[EDM174_FIX1] event=COMM_END session=%llu pub=%llu recordsPrinted=%u authority=NONE\n",
+            static_cast<unsigned long long>(snapshot.session),
+            static_cast<unsigned long long>(publication), count);
+        pending = false;
+    }
+    // EDM174_FIX1_COMM_PRINTER_END
+
+    // EDM174_FIX6_LEAF_PRINTER_BEGIN
+    // P50 owns this drain. Do not replace its immutable snapshot between rows.
+    // Each 10ms invocation emits at most one line; no RT output is added.
+    OSCARMAX_DIAG_NOINLINE void PrintEDM174G76LeafTiming()
+    {
+        static EDM174Leaf::Snapshot snapshot{};
+        static std::uint64_t lastPublication = 0ULL;
+        static std::uint64_t publication = 0ULL;
+        static unsigned stage = 0U;
+        if (stage == 0U)
+        {
+            std::uint64_t fetched = 0ULL;
+            if (!EDM174Leaf::Read(snapshot, fetched) || !fetched || fetched == lastPublication)
+                return;
+            publication = lastPublication = fetched;
+            stage = 1U;
+            RtPrintf("[EDM174_FIX6] event=LEAF_BEGIN window=%llu pub=%llu firstCycle=%llu lastCycle=%llu session=%llu phase=%u child=%u anchorCycle=%llu slot=%u axis=%d slots=%u attempted=%u enabled=%u valid=%u missing=%u invalid=%u phaseChanged=%u contextRejected=%u phaseMask=%x clockReads=%u maxClockReads=%u dropped=%llu stride=65 sitePolicy=ONE_PER_SELECTED_AXIS_PASS contextLock=SESSION_PHASE_CHILD phaseMaskScope=ENABLED_BEGIN phaseChangedIncludesSessionChild=1 metricOrder=TOTAL,READ128,FINAL_TRANSLATION,OTHER avgDenominator=VALID_SITE_COUNT unvisitedNested=ZERO_CONTRIBUTION maxContext=PER_METRIC totalMaxSample=ONE_TOTAL_MAX_RECEIPT unit=ns sampledMaxOnly=1 elapsedNotCpu=1 clockOverheadIncluded=1 clockBudgetExtra=6 combinedClockBudget=18 authority=NONE\n",
+                static_cast<unsigned long long>(snapshot.windowId),
+                static_cast<unsigned long long>(publication),
+                static_cast<unsigned long long>(snapshot.firstCycle),
+                static_cast<unsigned long long>(snapshot.lastCycle),
+                static_cast<unsigned long long>(snapshot.context.session),
+                static_cast<unsigned>(snapshot.context.phase),
+                static_cast<unsigned>(snapshot.context.child),
+                static_cast<unsigned long long>(snapshot.context.cycle),
+                static_cast<unsigned>(snapshot.slot), static_cast<int>(snapshot.axisIndex),
+                static_cast<unsigned>(snapshot.slots), static_cast<unsigned>(snapshot.attempted),
+                static_cast<unsigned>(snapshot.enabled), static_cast<unsigned>(snapshot.valid),
+                static_cast<unsigned>(snapshot.missing), static_cast<unsigned>(snapshot.invalid),
+                static_cast<unsigned>(snapshot.phaseChanged), static_cast<unsigned>(snapshot.contextRejected),
+                static_cast<unsigned>(snapshot.phaseMask), static_cast<unsigned>(snapshot.clockReads),
+                static_cast<unsigned>(snapshot.maxClockReads),
+                static_cast<unsigned long long>(snapshot.droppedPublications));
+            return;
+        }
+        if (stage <= static_cast<unsigned>(EDM174Leaf::SiteCount))
+        {
+            const unsigned site = stage++ - 1U;
+            const auto& stats = snapshot.stats[site];
+            const auto mean = [&stats](unsigned metric) noexcept {
+                return static_cast<unsigned long long>(stats.valid ?
+                    stats.sumNs[metric] / stats.valid : 0ULL);
+            };
+            RtPrintf("[EDM174_FIX6] event=LEAF_SITE window=%llu pub=%llu site=%s session=%llu phase=%u child=%u attempted=%u valid=%u missing=%u invalid=%u visits=%u/%u/%u/%u avgNs=%llu/%llu/%llu/%llu maxNs=%llu/%llu/%llu/%llu maxCycle=%llu/%llu/%llu/%llu maxSession=%llu/%llu/%llu/%llu maxPhase=%u/%u/%u/%u maxChild=%u/%u/%u/%u totalMaxSampleNs=%llu/%llu/%llu/%llu\n",
+                static_cast<unsigned long long>(snapshot.windowId),
+                static_cast<unsigned long long>(publication), EDM174Leaf::SiteName(site),
+                static_cast<unsigned long long>(snapshot.context.session),
+                static_cast<unsigned>(snapshot.context.phase), static_cast<unsigned>(snapshot.context.child),
+                static_cast<unsigned>(stats.attempted), static_cast<unsigned>(stats.valid),
+                static_cast<unsigned>(stats.missing), static_cast<unsigned>(stats.invalid),
+                static_cast<unsigned>(stats.metricVisits[0]), static_cast<unsigned>(stats.metricVisits[1]),
+                static_cast<unsigned>(stats.metricVisits[2]), static_cast<unsigned>(stats.metricVisits[3]),
+                mean(0U), mean(1U), mean(2U), mean(3U),
+                static_cast<unsigned long long>(stats.maxNs[0]), static_cast<unsigned long long>(stats.maxNs[1]),
+                static_cast<unsigned long long>(stats.maxNs[2]), static_cast<unsigned long long>(stats.maxNs[3]),
+                static_cast<unsigned long long>(stats.maxContext[0].cycle), static_cast<unsigned long long>(stats.maxContext[1].cycle),
+                static_cast<unsigned long long>(stats.maxContext[2].cycle), static_cast<unsigned long long>(stats.maxContext[3].cycle),
+                static_cast<unsigned long long>(stats.maxContext[0].session), static_cast<unsigned long long>(stats.maxContext[1].session),
+                static_cast<unsigned long long>(stats.maxContext[2].session), static_cast<unsigned long long>(stats.maxContext[3].session),
+                static_cast<unsigned>(stats.maxContext[0].phase), static_cast<unsigned>(stats.maxContext[1].phase),
+                static_cast<unsigned>(stats.maxContext[2].phase), static_cast<unsigned>(stats.maxContext[3].phase),
+                static_cast<unsigned>(stats.maxContext[0].child), static_cast<unsigned>(stats.maxContext[1].child),
+                static_cast<unsigned>(stats.maxContext[2].child), static_cast<unsigned>(stats.maxContext[3].child),
+                static_cast<unsigned long long>(stats.totalMaxSampleNs[0]), static_cast<unsigned long long>(stats.totalMaxSampleNs[1]),
+                static_cast<unsigned long long>(stats.totalMaxSampleNs[2]), static_cast<unsigned long long>(stats.totalMaxSampleNs[3]));
+            return;
+        }
+        RtPrintf("[EDM174_FIX6] event=LEAF_END window=%llu pub=%llu siteRows=4 snapshotComplete=1 authority=NONE\n",
+            static_cast<unsigned long long>(snapshot.windowId), static_cast<unsigned long long>(publication));
+        stage = 0U;
+    }
+    // EDM174_FIX6_LEAF_PRINTER_END
+
     // EDM142: one small P50 record from the existing published PDO window.
     // These are elapsed callback times (including waits), not OS CPU usage.
     // The runtime completes exactly 4000 valid timestamp samples per Exec
@@ -5703,6 +5953,8 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
         // Stage 12F.3B.3 - non-blocking CoE/SDO engineering service bridge.
         // It only submits/polls the existing PDO-owner async command slot.
         ProcessEtherCatEngineeringService(this);
+        PrintEDM174CommunicationTrace();
+        PrintEDM174G76LeafTiming();
 
         HMI_Bridge::ProcessTask(m_NC);//高速API共享記憶體作業任務
         ncPLCManager.Process();
@@ -5760,6 +6012,7 @@ int EtherCatMaster::RunRealTimeCycle_EDM_SINKER_MODE()//主要程式迴圈執行
             timer_1000ms_Count += 1;
             PrintEDM142PdoTiming(m_NC, &m_Motion);
             PrintEDM144RuntimeTiming();
+            PrintEDM173Fix19AxesTiming();
             HMI_Bridge::ProcessTask_1000ms(m_NC); // 呼叫 1000ms 任務
 
             // HOME 成功時 HomingManager 只 Queue 記憶體資料。

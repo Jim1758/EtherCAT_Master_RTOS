@@ -1,4 +1,5 @@
 ﻿#include "MotionCore.h"
+#include "NCG76StartDiagnostic.h"
 #include <algorithm> // for std::abs, std::sqrt, std::max, std::min
 #include <cstring>
 #include <iostream>  // for debug prints if needed
@@ -16,6 +17,47 @@
 #include "EDM145SourceDiagnostics.h"
 #include "EDM147PhysicalGapEvidence.h"
 #include "EDMExecutionFeedbackChannel.h"
+#include "EDM144RuntimeTiming.h"
+
+namespace
+{
+    // FIX19: one Motion writer; only the existing P50 diagnostic reader prints.
+    EDM53::Channel<EDM144::AxesDetail::Snapshot> g_fix19AxesChannel{};
+    bool PublishFix19Axes(void*, const EDM144::AxesDetail::Snapshot& snapshot) noexcept
+    { return g_fix19AxesChannel.Publish(snapshot); }
+    EDM144::AxesDetail::Recorder g_fix19AxesRecorder{PublishFix19Axes, nullptr};
+    // FIX6: only explicit PDO-pass pointers reach the leaf recorder.
+    EDM53::Channel<EDM174Leaf::Snapshot> g_fix6LeafChannel{};
+    bool PublishFix6Leaf(void*, const EDM174Leaf::Snapshot& snapshot) noexcept
+    { return g_fix6LeafChannel.Publish(snapshot); }
+    EDM174Leaf::Recorder g_fix6LeafRecorder{PublishFix6Leaf, nullptr};
+    std::uint64_t ReadFix19AxesClock(void*) noexcept
+    {
+        // FIX19_FIX1: the diagnostic clock must also work on legacy input.
+        // The optional structured-input master binding is not a clock permit.
+        LARGE_INTEGER currentTime{};
+        if (!RtGetClockTime(CLOCK_2, &currentTime) || currentTime.QuadPart <= 0)
+            return 0ULL;
+        const std::uint64_t ticks = static_cast<std::uint64_t>(currentTime.QuadPart);
+        if (ticks > (std::numeric_limits<std::uint64_t>::max)() / 100ULL)
+            return 0ULL;
+        return ticks * 100ULL;
+    }
+}
+
+bool EDM174Leaf::Read(Snapshot& snapshot, std::uint64_t& publication) noexcept
+{
+    const EDM53::Stamp stamp = g_fix6LeafChannel.Read(snapshot);
+    publication = stamp.publication;
+    return stamp.Ready();
+}
+
+bool EDM144::AxesDetail::Read(Snapshot& snapshot, std::uint64_t& publication) noexcept
+{
+    const EDM53::Stamp stamp = g_fix19AxesChannel.Read(snapshot);
+    publication = stamp.publication;
+    return stamp.Ready();
+}
 
 namespace
 {
@@ -2188,8 +2230,27 @@ bool MotionCore::ReadEDM173Feedback(EDM173::Feedback& out) const noexcept
 { return m_edm173 && m_edm173->feedback.Read(out).Ready(); }
 bool MotionCore::ReadEDM173InputDiagnostic(EDM173InputDiag::Evidence& out) const noexcept
 { return m_edm173 && m_edm173->inputDiagnosticFeedback.Read(out).Ready(); }
+EDM174Comm::MotionObservation MotionCore::GetEDM174CommunicationObservation() const noexcept
+{
+    EDM174Comm::MotionObservation observation{};
+    if (!m_edm173 || !IsEDM173Profile()) return observation;
+    const auto& guard = m_edm94.Current();
+    observation.session = guard.identity.session;
+    if (!observation.session) return observation;
+    const auto& input = m_edm173->inputDiagnostic.Snapshot();
+    if (input.session == observation.session && input.haveFirst &&
+        input.first.session == observation.session)
+        observation.inputFaultTick = input.first.tick;
+    const auto& firstFault = guard.firstFault;
+    if (guard.faulted && (firstFault.flags & EDM94::RuntimeFlag_SNAPSHOT_VALID) != 0U &&
+        firstFault.frameIdentity.session == observation.session)
+        observation.guardFaultTick = firstFault.tick;
+    observation.phase = static_cast<std::uint32_t>(m_edm128Current.coordinator.phase);
+    observation.child = m_edm126Current.authorizedRows;
+    return observation;
+}
 std::uint32_t MotionCore::GetEDM173ImplementationRevision() const noexcept
-{ return 9U; }
+{ return 14U; }
 
 bool MotionCore::IsEDM173HandoffCurrent() const noexcept
 {
@@ -2259,6 +2320,35 @@ bool MotionCore::IsEDM173CommandCurrent(bool bound) const noexcept
     return IsEDM126ProfileCurrent() && m_Group.axisCount==6;
 }
 
+// Membership only for the stopped bridge between genuine sealed children.
+// This does not qualify a bound curve or grant Step/Map movement authority.
+bool MotionCore::IsEDM173PendingHandoffMembershipCurrent() const noexcept
+{
+    if(!m_edm173 || !m_edm173->sealed || !m_edm173->handshaking ||
+        !m_edm94.HandoffZero() || m_edm94.ForceZero() || !m_edm94HandoffPending || !m_edm94HandoffCommitted ||
+        !m_Group.isActive || m_Group.axisCount!=6 || !m_pContexts || m_pContexts->size()!=6U ||
+        m_Group.currentCmd.axisCount<2 || m_Group.currentCmd.axisCount>3 ||
+        !IsEDM173HandoffCurrent() || !IsEDM173CommandCurrent(false))return false;
+    const auto& c=m_Group.currentCmd;const auto& h=m_edm94Handoff;const auto& seal=m_edm173->current;
+    if(!MotionExecutionIdentityExactlyMatches(c.execution,h.command) || h.nextEpoch!=seal.epoch ||
+        h.authorization.step!=c.edm173ChildOrdinal || h.authorization.session!=seal.plan.scope.session)return false;
+    const auto& v=m_Group.virtualAxis;
+    if(v.currentCmdPos!=0.0 || v.planningPos!=0.0 || v.currentCmdVel!=0.0 || v.logicalCmdVel!=0.0 ||
+        v.targetEndVel!=0.0 || v.finalTargetPos!=c.mem_totalDist || v.bufferSum!=0.0 || v.bufferIndex!=0 ||
+        !std::all_of(v.velBuffer.begin(),v.velBuffer.end(),[](double value){return value==0.0;}))return false;
+    for(unsigned axis=0U;axis<6U;++axis){
+        const auto& member=(*m_pContexts)[axis];
+        const double start=c.edm173ChildOrdinal?seal.endPulse[c.edm173ChildOrdinal-1U][axis]:seal.startPulse[axis];
+        const double ratio=(seal.endPulse[c.edm173ChildOrdinal][axis]-start)/c.mem_totalDist;
+        if(m_Group.axisIndices[axis]!=static_cast<int>(axis) || member.axisIndex!=static_cast<int>(axis) ||
+            !member.isExist || member.isVirtualAxis || h.gapSegmentStartPulse[axis]!=start || h.targetPulse[axis]!=seal.endPulse[c.edm173ChildOrdinal][axis] ||
+            m_Group.startPos[axis]!=start || m_Group.ratio[axis]!=ratio ||
+            member.currentCmdPos!=start || member.logicalCmdPos!=start ||
+            member.currentCmdVel!=0.0 || member.logicalCmdVel!=0.0 || member.targetVelocity!=0.0 || member.targetEndVel!=0.0)return false;
+    }
+    return true;
+}
+
 // Geometry classification only. A frozen genuine child may remain the
 // stop geometry after AUTO/epoch authority has been revoked; Capture keeps
 // that authority and all six fresh physical-axis checks independent.
@@ -2291,14 +2381,23 @@ bool MotionCore::IsEDM173GroupGeometrySupported() const noexcept
     const bool bound=state.nextChild==child+1U && m_edm114Current.geometryValid &&
         MotionExecutionIdentityExactlyMatches(m_edm114Command,c.execution);
     if(!bound && state.nextChild!=child) return false;
-    if(m_Group.axisCount!=(bound?6:c.axisCount)) return false;
+    // Frozen bridge geometry remains classifiable after Safety revokes the
+    // live tuple. Only the separate membership predicate grants the normal
+    // zero-hold membership; this classification grants no motion authority.
+    const auto& h=m_edm94Handoff;
+    const bool pendingSix=!bound && m_Group.axisCount==6 && state.handshaking &&
+        m_edm94HandoffPending && m_edm94HandoffCommitted &&
+        MotionExecutionIdentityExactlyMatches(h.command,c.execution) && h.nextEpoch==seal.epoch &&
+        h.authorization.step==child && h.authorization.session==plan.scope.session;
+    if(m_Group.axisCount!=(bound||pendingSix?6:c.axisCount)) return false;
     double length=0.0;
     for(unsigned axis=0U;axis<8U;++axis){
         const double start=child?seal.endPulse[child-1U][axis]:seal.startPulse[axis];
         if(c.mem_startPos[axis]!=start || c.mem_ratio[axis]!=seal.endPulse[child][axis] ||
             (axis>=3U && seal.endPulse[child][axis]!=seal.startPulse[axis])) return false;
         if(axis<3U)length=std::hypot(length,seal.endPulse[child][axis]-start);
-        if(axis<6U && seal.pulsePerUnit[axis]!=guard.config.axis[axis].pulsePerUnit) return false;
+        if(axis<6U && (seal.pulsePerUnit[axis]!=guard.config.axis[axis].pulsePerUnit ||
+            (pendingSix && (h.gapSegmentStartPulse[axis]!=start || h.targetPulse[axis]!=seal.endPulse[child][axis])))) return false;
     }
     if(!std::isfinite(length) || length<=0.0 || c.mem_totalDist!=length || m_Group.totalDist3D!=length) return false;
     for(int slot=0;slot<c.axisCount;++slot){
@@ -2306,7 +2405,7 @@ bool MotionCore::IsEDM173GroupGeometrySupported() const noexcept
         if(axis<0 || axis>2 || c.targetPos[slot]!=seal.endPulse[child][static_cast<unsigned>(axis)]) return false;
     }
     for(int slot=0;slot<m_Group.axisCount;++slot){
-        const int axis=bound?slot:c.axisIndices[slot];
+        const int axis=bound||pendingSix?slot:c.axisIndices[slot];
         const double start=c.mem_startPos[static_cast<unsigned>(axis)];
         const double ratio=(c.mem_ratio[static_cast<unsigned>(axis)]-start)/length;
         if(m_Group.axisIndices[slot]!=axis || m_Group.startPos[slot]!=start || m_Group.ratio[slot]!=ratio) return false;
@@ -2382,7 +2481,7 @@ void MotionCore::ServiceEDM173Handoff(bool freshMotionFrame) noexcept
         MotionExecutionIdentityExactlyMatches(c.execution,m_edm114Command) &&
         MotionExecutionIdentityExactlyMatches(c.execution,state.current.identities[c.edm173ChildOrdinal]) &&
         (m_Group.isActive || (state.terminalMask&(1U<<c.edm173ChildOrdinal))!=0U)) return;
-    if(!IsEDM173HandoffCurrent()){TripEDM94(EDM94::Reason::Identity);return;}
+    if(!IsEDM173HandoffCurrent()){TripEDM94(EDM94::Reason::Identity,EDM94::FaultSite::G76Handoff);return;}
     if(!m_Group.isActive){
         if(state.nextChild==25U)return;
         // A validated first prepare must hold a zero bridge before the
@@ -2392,13 +2491,13 @@ void MotionCore::ServiceEDM173Handoff(bool freshMotionFrame) noexcept
         if(m_edmZMonotonicUs<state.handshakeUs || m_edmZMonotonicUs-state.handshakeUs>100000ULL)TripEDM94(EDM94::Reason::Clock);
         return;
     }
-    if(!IsEDM173CommandCurrent(false)){TripEDM94(EDM94::Reason::Identity);return;}
+    if(!IsEDM173CommandCurrent(false)){TripEDM94(EDM94::Reason::Identity,EDM94::FaultSite::G76Handoff);return;}
     const unsigned ordinal=c.edm173ChildOrdinal;
     if(!state.handshaking){
         if(ordinal && (!m_edm114Current.rowComplete || !m_edm126Current.rowCompleted ||
             (state.terminalMask&(1U<<(ordinal-1U)))==0U || !EDM126CommittedImage().completeReady ||
             EDM126CommittedImage().velocityPps!=EDM126::Point{} || !m_edm126PhysicalSettled)){
-            TripEDM94(EDM94::Reason::Identity);return;
+            TripEDM94(EDM94::Reason::Identity,EDM94::FaultSite::G76Predecessor);return;
         }
         auto& h=m_edm94Handoff;h=EDM94HandoffMessage{};auto& a=h.authorization;const auto& plan=state.current.plan;
         a.session=plan.scope.session;a.run=plan.scope.run;a.cache=plan.scope.cache;a.dispatch=plan.scope.dispatch;
@@ -2848,7 +2947,11 @@ bool MotionCore::IsEDM126ProfileCurrent() const noexcept
             m_edm129Current.ownerGeneration==p.ownerGeneration && m_edm129Source.Current().session==p.session &&
             EDM129::SameBinding(m_edm129Current.binding,m_edm129Source.FrozenBinding()) &&
             EDM88::SameConfig(m_edm126SourceConfig,m_edm129Source.FrozenConfig()))) &&
-        m_edm128Current.enabled==m_edm128Profile && p.enabled && E156HistoryRecipeFits(p.fixture,m_edm130Profile,m_edm130ArmRecipe) &&
+        m_edm128Current.enabled==m_edm128Profile && p.enabled &&
+        // FIX2: the earlier successful IsEDM130TimingCurrent() call already
+        // validated this exact fixture/arm recipe for a timed profile. Reuse
+        // only that pure result within this const call; untimed stays original.
+        (m_edm130Profile || E156HistoryRecipeFits(p.fixture,m_edm130Profile,m_edm130ArmRecipe)) &&
         p.authorizedRows<=EDM130::ProgramRows(m_edm130ArmRecipe) && p.completedRows<=p.authorizedRows && m_edm96Profile && m_edm97Profile && m_edm114Profile &&
         !m_edm95Profile && !m_edm98Profile && !m_edm99Profile && !m_edm100Profile && !m_edm102Profile &&
         !m_edm104Profile && !m_edm105Profile && !m_edm109Profile && !m_edm110Profile && !m_edm111Repeat &&
@@ -2978,7 +3081,8 @@ bool MotionCore::IsEDM129AwaitFreshZeroCurrent(std::uint64_t nowUs,
     return true;
 }
 
-bool MotionCore::IsEDM126SourceCurrent(std::uint64_t nowUs) const noexcept
+bool MotionCore::IsEDM126SourceCurrent(std::uint64_t nowUs,
+    bool g76ProfileJustValidated) const noexcept
 {
     const auto& p=m_edm126Current; const auto& e=m_edm126Source.Current(); const auto& d=m_edm126Decision.Current();
     const auto& raw=e.lastFrame;
@@ -3011,7 +3115,10 @@ bool MotionCore::IsEDM126SourceCurrent(std::uint64_t nowUs) const noexcept
         (manual.enabled && manual.active && !manual.faulted && manual.tick==p.tick && manual.nowUs==p.nowUs &&
             manual.voltageV==raw.voltageV && manual.publisherAgeUs<=EDM169::MaximumPublisherAgeUs)) &&
         curve.valid && EDM89::SameConfig(d.config,EDM89::FrozenConfig(profile)) &&
-        IsEDM126ProfileCurrent() && (!m_edm129Profile ||
+        // FIX5: only an immediately preceding successful G76 Current check
+        // supplies this RT-owned profile proof. Source, age and live authority
+        // checks remain fresh; no result survives this Step/Map call.
+        (g76ProfileJustValidated || IsEDM126ProfileCurrent()) && (!m_edm129Profile ||
             (m_edm129Source.CurrentAt(nowUs,m_edmZClockFrequency) &&
             m_edm129Source.Current().nowUs==p.nowUs && m_edm129Source.Current().freshFrames==e.freshFrames &&
             m_edm129Source.Current().heldFrames==e.heldFrames && EDM88::SameFrame(raw,m_edm129Source.CurrentFrame()))) &&
@@ -3463,8 +3570,10 @@ bool MotionCore::StepEDM126Segment(AxisCommand& command) noexcept
     const auto sourceGate=[&](std::uint32_t gate,bool passed) noexcept {
         evaluatedSourceGates|=gate;if(!passed)failedSourceGates|=gate;return passed;
     };
+    // G76 Current includes the complete profile check. Before Source below,
+    // only local gate bits change; retain its pure result within this call.
     if (!sourceGate(EDM126::FirstCauseCurrent,IsEDM126Current()) ||
-        !sourceGate(EDM126::FirstCauseSource,IsEDM126SourceCurrent(m_edmZMonotonicUs)) ||
+        !sourceGate(EDM126::FirstCauseSource,IsEDM126SourceCurrent(m_edmZMonotonicUs,IsEDM173Profile())) ||
         !sourceGate(EDM126::FirstCauseEpoch,GetCurrentExecutionEpoch()==m_edm126Current.liveEpoch) ||
         !sourceGate(EDM126::FirstCauseLease,IsMotionOwnerLeaseCurrent(m_Group.currentCmd.ownerLease)) ||
         !sourceGate(EDM126::FirstCauseCommand,GetCommandAuthorizationFailure(m_Group.currentCmd)==MotionRejectReason::NONE)) {
@@ -3478,6 +3587,16 @@ bool MotionCore::StepEDM126Segment(AxisCommand& command) noexcept
         const auto& done=EDM126CommittedImage();
         if (!done.completeReady || done.historyDepth || done.positionPulse!=m_edm114Current.endPulse ||
             done.velocityPps!=EDM126::Point{}) return false;
+        if(IsEDM173Profile()) {
+            if(!m_edm128Profile || !m_edm128.StepCompletedEndpoint(m_edm126,
+                m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs)) {
+                scalarCommit.Release();m_edm126Current.faulted=true;
+                TripEDM94(EDM94::Reason::Identity,EDM94::FaultSite::G76EndpointHold);PublishEDM126Feedback();return false;
+            }
+            if(HasPendingSafetyOrRecoveryRequests() ||
+                GetCommandAuthorizationFailure(m_Group.currentCmd)!=MotionRejectReason::NONE)return false;
+            ApplyEDM126Scalar(command,false);return true;
+        }
         command.instantCmdPos=m_edm114Current.pulseLength; command.instantCmdVel=0.0; return true;
     }
     const bool pauseDemand=m_edm157Pause.DemandZero();
@@ -3498,7 +3617,9 @@ bool MotionCore::StepEDM126Segment(AxisCommand& command) noexcept
         (m_edm128Profile ? m_edm128.Step(m_edm126,m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs,target,settled,workEligible) :
             m_edm126.Step(m_ncSettleRuntimeCycleTick,m_edmZMonotonicUs,target,settled));
     if (!stepped) {
-        scalarCommit.Release(); m_edm126Current.faulted=true; TripEDM94(EDM94::Reason::Identity); PublishEDM126Feedback(); return false;
+        scalarCommit.Release(); m_edm126Current.faulted=true;
+        TripEDM94(EDM94::Reason::Identity,IsEDM173Profile()?EDM94::FaultSite::G76Step:EDM94::FaultSite::EngineFault);
+        PublishEDM126Feedback(); return false;
     }
     if (HasPendingSafetyOrRecoveryRequests() || GetCommandAuthorizationFailure(m_Group.currentCmd)!=MotionRejectReason::NONE) return false;
     ApplyEDM126Scalar(command,false); return true;
@@ -3508,24 +3629,29 @@ bool MotionCore::MapEDM126Traversal(AxisCommand& command) noexcept
 {
     const auto& f=EDM126CurrentImage(); auto& p=m_edm114Current; auto& proof=m_edm126Current;
     const bool stopping=m_safetyControlledStopInProgress;
+    // Each Source call below immediately follows a successful Current check;
+    // G76's RT-owned profile cannot change between those const checks.
     // A normally completed row retains its one endpoint receipt while the
     // independent fresh physical boundary settles. It cannot restart GAP.
     if (!stopping && p.rowComplete) {
-        if (!IsEDM126Current() || !IsEDM126SourceCurrent(m_edmZMonotonicUs) || m_edm94.ForceZero() ||
+        if (!IsEDM126Current() || !IsEDM126SourceCurrent(m_edmZMonotonicUs,IsEDM173Profile()) || m_edm94.ForceZero() ||
             HasPendingSafetyOrRecoveryRequests() || GetCommandAuthorizationFailure(m_Group.currentCmd)!=MotionRejectReason::NONE ||
             !f.completeReady || f.historyDepth || f.positionPulse!=p.endPulse || f.velocityPps!=EDM126::Point{} ||
             command.instantCmdPos!=p.pulseLength || command.instantCmdVel!=0.0) return false;
         for(unsigned i=0U;i<6U;++i) if((*m_pContexts)[i].logicalCmdPos!=p.endPulse[i] ||
             (*m_pContexts)[i].logicalCmdVel!=0.0) return false;
-        return true;
+        if(!IsEDM173Profile())return true;
+        // G76's terminal hold is a new proposal of the same exact endpoint.
+        // Commit it through the ordinary authority and six-axis output gates.
     }
     if (!IsEDM126Current() || f.tick!=m_ncSettleRuntimeCycleTick || f.nowUs!=m_edmZMonotonicUs ||
-        (!stopping && (!IsEDM126SourceCurrent(m_edmZMonotonicUs) || m_edm94.ForceZero())) ||
+        (!stopping && (!IsEDM126SourceCurrent(m_edmZMonotonicUs,IsEDM173Profile()) || m_edm94.ForceZero())) ||
         (stopping && (!m_edm114StopLease.Matches(m_safetyControlledStopOwnerLease) ||
             !IsMotionOwnerLeaseCurrent(m_edm114StopLease) || GetCurrentExecutionEpoch()!=m_edm114StopEpoch ||
             m_edm114StopTicket!=m_safetyControlledStopRequestTicket || !f.stopRequested)) ||
         command.instantCmdPos!=m_Group.virtualAxis.currentCmdPos || command.instantCmdVel!=m_Group.virtualAxis.currentCmdVel)
-    { proof.faulted=true; TripEDM94(EDM94::Reason::Identity); return false; }
+    { proof.faulted=true; TripEDM94(EDM94::Reason::Identity,
+        IsEDM173Profile()?EDM94::FaultSite::G76Map:EDM94::FaultSite::EngineFault); return false; }
     for (unsigned i=0U;i<6U;++i) {
         if(EDM149::StaticAxis(proof.fixture==EDM149::ZHistoryFixture,proof.fixture==EDM149::XYZHistoryFixture,i) &&
             (f.positionPulse[i]!=m_edm94.FrozenConfig().axis[i].commandAnchor ||
@@ -3605,7 +3731,8 @@ bool MotionCore::MapEDM126Traversal(AxisCommand& command) noexcept
                 mode.qualifiedDwells!=3ULL*mode.work.completedEvents)) ||
                 (m_edm128Profile && !m_edm130Profile && EDM116::IsTriggerStep(static_cast<unsigned>(f.authorizedSource.ordinal)) &&
                 !mode.rowEventComplete) || f.historyDepth || f.positionPulse!=p.endPulse || f.velocityPps!=EDM126::Point{} || !p.rowForward) {
-                proof.faulted=p.failed=true; TripEDM94(EDM94::Reason::Identity); return false;
+                proof.faulted=p.failed=true; TripEDM94(EDM94::Reason::Identity,
+                    IsEDM173Profile()?EDM94::FaultSite::G76Endpoint:EDM94::FaultSite::EngineFault); return false;
             }
             p.rowComplete=true; ++p.completedRows; ++p.endpointRows;
             if(p.kind==EDM114::Kind::Arc) {++p.arcRows;if(p.sweepRadians<0.0)++p.cwRows;else++p.ccwRows;} else ++p.lineRows;
@@ -16596,8 +16723,19 @@ bool MotionCore::IsEccentricCStartBindingCurrent(const MotionCommand& command,
 
 
 MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
-    const MotionCommand& command) const noexcept
+    const MotionCommand& command, EDM174Leaf::Sample* edm174Trace) const noexcept
 {
+    // FIX6_AUTH_OBSERVATION_BEGIN: null producer callers access no RT recorder.
+    EDM174Leaf::Scope edm174Total(edm174Trace);
+    const auto edm174Read128 = [this,edm174Trace](EDM128::MotionFeedback& mode) noexcept {
+        EDM174Leaf::Scope observation(edm174Trace,EDM174Leaf::Read128);
+        return ReadEDM128Feedback(mode);
+    };
+    const auto edm174Translation = [this,edm174Trace,&command]() noexcept {
+        EDM174Leaf::Scope observation(edm174Trace,EDM174Leaf::FinalTranslation);
+        return MatchesNCTranslation(command.sourceTranslation);
+    };
+    // FIX6_AUTH_OBSERVATION_END
     if (!IsMotionEDMCommissioningMarkerEncodingValid(command)) return MotionRejectReason::NOT_READY;
     if (m_pbcXRetainRecoveryRequired.load(std::memory_order_acquire) ||
         HasPbcXUnresolvedActiveOutput()) return MotionRejectReason::NOT_READY;
@@ -16616,13 +16754,28 @@ MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
         return MotionRejectReason::OWNER_CONFLICT;
     }
 
+    // FIX2: this predicate reads only this unchanged const command. Evaluate
+    // it lazily at the original first seam, then reuse it only in this call.
+    // Epoch, owner, feedback snapshots and final output fences remain live.
+    bool fixedTranslationSourceEvaluated = false;
+    bool fixedTranslationSourceAllowed = false;
+    const auto fixedTranslationSourceAllowedInThisCall = [&]() noexcept
+    {
+        if (!fixedTranslationSourceEvaluated)
+        {
+            fixedTranslationSourceAllowed = IsMotionFixedTranslationSourceAllowed(command);
+            fixedTranslationSourceEvaluated = true;
+        }
+        return fixedTranslationSourceAllowed;
+    };
+
     if(command.edm173G76Gap){
         EDM128::MotionFeedback mode{};
-        if(!ReadEDM128Feedback(mode) || !mode.enabled || !mode.active || mode.faulted || mode.fixture!=14U ||
+        if(!edm174Read128(mode) || !mode.enabled || !mode.active || mode.faulted || mode.fixture!=14U ||
             !mode.workTimeFlush || mode.physicalAd || !EDM130::IsVisibleFlush173(mode.timerRecipe) ||
             !EDM130::ValidHistoryRecipeBinding(14U,mode.timerRecipe) || !mode.session ||
             m_edm94Claim.load(std::memory_order_acquire)!=mode.session ||
-            mode.ownerGeneration!=command.ownerLease.generation || !IsMotionFixedTranslationSourceAllowed(command))
+            mode.ownerGeneration!=command.ownerLease.generation || !fixedTranslationSourceAllowedInThisCall())
             return MotionRejectReason::NOT_READY;
     }
     // The padding marker describes geometry only. A current, independently
@@ -16656,8 +16809,8 @@ MotionRejectReason MotionCore::GetCommandAuthorizationFailure(
     if ((!emptyTranslation && (command.execution.source != MotionCommandSource::NC_MEMORY ||
             command.ownerLease.owner != MotionOwner::AUTO ||
             !(command.pathCoreEccentricCFeedExactStop ? IsMotionEccentricCFeedSourceAllowed(command) :
-                IsMotionFixedTranslationSourceAllowed(command)) ||
-            !MatchesNCTranslation(command.sourceTranslation))) ||
+                fixedTranslationSourceAllowedInThisCall()) ||
+            !edm174Translation())) ||
         (emptyTranslation && command.execution.source == MotionCommandSource::NC_MEMORY &&
             (GetActiveTranslationGeneration() != 0ULL || command.sourceToolLengthMode != 49 ||
                 command.sourceG168Active || command.sourceWCode != 0 || command.sourceG68Active ||
@@ -17205,21 +17358,27 @@ bool MotionCore::IsG76MixedPreparedCommandGeometryValid(const MotionCommand& com
         MatchesNCTranslation(command.sourceTranslation);
 }
 
-bool MotionCore::TryEnqueueMotionCommandBatch(const MotionCommand* commands, std::size_t count) noexcept
+bool MotionCore::TryEnqueueMotionCommandBatch(const MotionCommand* commands, std::size_t count, bool traceG76Start) noexcept
 {
     if (commands==nullptr || count==0U || count>128U) return false;
+    // Ordinary G76 explicitly opts in; mixed/AIR callers keep the default quiet path.
+    if (traceG76Start) PrintNCG76StartCheckpoint("BATCH_ENQUEUE_ENTRY", commands[0U].sourceLinePC);
     MotionPbcIngressGate::Producer ingress(m_pbcReferenceIngress);
     if (!ingress.Entered()) return false;
+    if (traceG76Start) PrintNCG76StartCheckpoint("BATCH_INGRESS_READY", commands[0U].sourceLinePC);
     MotionRejectReason failure=MotionRejectReason::NONE;
     for (std::size_t index=0U; index<count; ++index) {
         const auto current=GetCommandAuthorizationFailure(commands[index]);
         if (failure==MotionRejectReason::NONE) failure=current;
     }
+    if (traceG76Start) PrintNCG76StartCheckpoint("BATCH_AUTH_RETURNED", commands[0U].sourceLinePC);
     if (failure==MotionRejectReason::NONE && m_Group.cmdQueue.ProducerTryPushBatch(commands,count)) {
+        if (traceG76Start) PrintNCG76StartCheckpoint("BATCH_QUEUE_PUBLISHED", commands[0U].sourceLinePC);
         for (std::size_t index=0U; index<count; ++index) {
             ObserveCommandPathModeProducer(commands[index],true);
             RecordProgramBlockMotionSubmission(commands[index],true,MotionRejectReason::NONE);
         }
+        if (traceG76Start) PrintNCG76StartCheckpoint("BATCH_CAPTURE_RECORDED", commands[0U].sourceLinePC);
         return true;
     }
     const auto reason=failure==MotionRejectReason::NONE?MotionRejectReason::QUEUE_FULL:failure;
@@ -17844,7 +18003,7 @@ void MotionCore::WriteServoControlWordCommand(
 void MotionCore::WriteServoTargetVelocityCommand(
     ServoOutput* output,
     int axisIndex,
-    int32_t value)
+    int32_t value, EDM174Leaf::Sample* edm174Trace)
 {
     if (output == nullptr)
     {
@@ -17906,7 +18065,7 @@ void MotionCore::WriteServoTargetVelocityCommand(
         IsSafetyControlledStopAuthorized(axisIndex);
     const bool entryGroupAuthorized =
         !m_Group.isActive ||
-        GetCommandAuthorizationFailure(m_Group.currentCmd) ==
+        GetCommandAuthorizationFailure(m_Group.currentCmd,edm174Trace) ==
         MotionRejectReason::NONE ||
         controlledStopAuthorized;
     if ((entryPublication &
@@ -20801,6 +20960,60 @@ void MotionCore::EndServoOutputFrameAfterSend(
 // 檔案：MotionCore.cpp
 void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
 {
+    // FIX19: observations are read only on sampled passes. This scope also
+    // closes both existing guard returns; no control decision uses the sample.
+    const auto observeAxes = [](void* context) noexcept -> EDM144::AxesDetail::Observation
+    {
+        const MotionCore* motion = static_cast<const MotionCore*>(context);
+        EDM144::AxesDetail::Observation observation{};
+        observation.cycle = motion->m_ncSettleRuntimeCycleTick;
+        observation.owner = static_cast<std::uint32_t>(motion->GetMotionOwnerLease().owner);
+        observation.overrideZero = motion->m_Group.feedrateOverride == 0.0;
+        const bool layoutValid = motion->m_pDrives != nullptr && motion->m_pContexts != nullptr &&
+            motion->m_pDrives->size() == motion->m_pContexts->size() &&
+            motion->m_pContexts->size() <= EDM144::AxesDetail::AxisCapacity;
+        observation.runtimeValid = layoutValid && motion->m_ncSettleRuntimeObserved &&
+            motion->m_ncSettleRuntimeCycleValid && motion->m_ncSettleRuntimeCycleContiguous;
+        observation.slots = layoutValid ? static_cast<std::uint32_t>(motion->m_pContexts->size()) : 0U;
+        observation.axisIndex = -1;
+        const std::uint32_t slot = g_fix19AxesRecorder.SelectedSlot(observation.slots);
+        if (slot < observation.slots)
+        {
+            const AxisContext& axis = (*motion->m_pContexts)[slot];
+            observation.axis = &axis;
+            observation.axisIndex = axis.axisIndex;
+        }
+        return observation;
+    };
+    EDM144::AxesDetail::PassScope axesPassScope(g_fix19AxesRecorder,
+        ReadFix19AxesClock, nullptr, observeAxes, this);
+    // FIX6_PASS_OBSERVATION_BEGIN: share FIX19's actual due decision and slot.
+    const auto observeLeaf = [](void* context) noexcept -> EDM174Leaf::Observation {
+        const MotionCore* motion=static_cast<const MotionCore*>(context);
+        EDM174Leaf::Observation observation{};
+        observation.context.cycle=motion->m_ncSettleRuntimeCycleTick;
+        observation.enabled=motion->IsEDM173Profile() && motion->m_edm173 && motion->m_edm94.Active() && !motion->m_edm94.ForceZero();
+        if(observation.enabled) {
+            observation.context.session=motion->m_edm94.Current().identity.session;
+            observation.context.phase=static_cast<std::uint32_t>(motion->m_edm128Current.coordinator.phase);
+            observation.context.child=motion->m_edm126Current.authorizedRows;
+        }
+        const bool layoutValid=motion->m_pDrives && motion->m_pContexts &&
+            motion->m_pDrives->size()==motion->m_pContexts->size() &&
+            motion->m_pContexts->size()<=EDM144::AxesDetail::AxisCapacity;
+        observation.runtimeValid=layoutValid && motion->m_ncSettleRuntimeObserved &&
+            motion->m_ncSettleRuntimeCycleValid && motion->m_ncSettleRuntimeCycleContiguous;
+        observation.slots=layoutValid?static_cast<std::uint32_t>(motion->m_pContexts->size()):0U;
+        observation.slot=g_fix19AxesRecorder.SelectedSlot(observation.slots);
+        if(observation.slot<observation.slots) {
+            const auto& axis=(*motion->m_pContexts)[observation.slot];
+            observation.axis=&axis;observation.axisIndex=axis.axisIndex;
+        }
+        return observation;
+    };
+    EDM174Leaf::PassScope leafPassScope(g_fix6LeafRecorder,g_fix19AxesRecorder.Active(),
+        ReadFix19AxesClock,nullptr,observeLeaf,this);
+    // FIX6_PASS_OBSERVATION_END
     m_edmZSourceTick = 0ULL;
     DiscardPbcXUnsentCycle();
     m_pbcXFeedbackTick = 0ULL;
@@ -20967,8 +21180,10 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
             axis.state==MotionState::MotionState_ESTOP;
     };
 
+    g_fix19AxesRecorder.MarkWhole(EDM144::AxesDetail::Loop);
     for (size_t i = 0; i < m_pDrives->size(); ++i)
     {
+        EDM144::AxesDetail::SlotScope axesSlotScope(g_fix19AxesRecorder, &(*m_pContexts)[i]);
         MotionServoInputSnapshot
             input;
         bool semanticInput = false;
@@ -21115,10 +21330,12 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
             edm173InputAxis.internalBadBefore=edm173InternalBad(axis);
         }
 
-        UpdateMotion(
+        g_fix19AxesRecorder.Mark(&(*m_pContexts)[i], EDM144::AxesDetail::MotionPrelude);
+        UpdateMotionObserved(
             (*m_pDrives)[i],
             (*m_pContexts)[i],
-            input);
+            input,g_fix6LeafRecorder.ForAxis(&(*m_pContexts)[i]));
+        g_fix19AxesRecorder.Mark(&(*m_pContexts)[i], EDM144::AxesDetail::FeedbackDriveState);
         if (i == 0U)
         {
             m_pbcXFeedbackTick = m_ncSettleRuntimeCycleTick;
@@ -21131,6 +21348,7 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
             (*m_pDrives)[i],
             (*m_pContexts)[i],
             input);
+        g_fix19AxesRecorder.Mark(&(*m_pContexts)[i], EDM144::AxesDetail::OutputQualification);
 
         if (edm173CaptureInput && i<6U)
         {
@@ -21173,7 +21391,9 @@ void MotionCore::UpdateAllMotion()//更新全部軸狀態 逐步激磁
                     commandServo.pOutput->TouchProbeFunc,
                     commandServo.pOutput->ModesOfOperation);
         }
+        axesSlotScope.Complete();
     }
+    g_fix19AxesRecorder.MarkWhole(EDM144::AxesDetail::Tail);
 
 
     if (edm173CaptureInput) m_edm173->inputDiagnostic.End(motionInputComplete);
@@ -23047,6 +23267,51 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     double dt = CYCLE_TIME_SEC;
 
+    // FIX17: compensate both raw and filtered integration for an admitted
+    // full, forward native retained LINE. Other planners keep their arithmetic.
+    const MotionCommand& numericCommand=m_Group.currentCmd;
+    const bool retainedSummation=axis.isVirtualAxis && &axis==&m_Group.virtualAxis &&
+        axis.state==MotionState::MotionState_MOVING && m_Group.isActive &&
+        numericCommand.pathCoreRetainedTraversal && !numericCommand.pathCoreRetainedReverse &&
+        !numericCommand.pathCorePlanarCircle && !numericCommand.pathCoreFullCircle &&
+        !numericCommand.edm173G76Gap && !numericCommand.cncFeedLookahead && !numericCommand.cncCornerBlend &&
+        numericCommand.mode==InterpolationMode::LINEAR && m_Group.mode==InterpolationMode::LINEAR &&
+        numericCommand.commandPathMode==MotionCommandPathMode::EXACT_STOP && m_Group.pathMode==PathMode::EXACT_STOP &&
+        numericCommand.mem_transformOrigin[0]==0.0 && numericCommand.mem_transformOrigin[1]==1.0 &&
+        numericCommand.mem_transformOrigin[2]==2.0 && numericCommand.execution.IsAssigned() &&
+        numericCommand.execution.source==MotionCommandSource::NC_MEMORY &&
+        numericCommand.ownerLease.IsValid() && numericCommand.ownerLease.owner==MotionOwner::AUTO &&
+        !m_Group.enableHistory && !m_Group.enableTransform && m_Group.jumpManager.state==JumpState::IDLE &&
+        !m_pathHold.sourceSeen && !IsPathCoreHoldExcursionDriving() && !m_safetyControlledStopInProgress;
+    auto& summation=m_retainedScalarSummation;
+    if (axis.isVirtualAxis && &axis==&m_Group.virtualAxis)
+    {
+        if (!retainedSummation || !summation.active ||
+            !MotionExecutionIdentityExactlyMatches(summation.identity,numericCommand.execution) ||
+            !summation.owner.Matches(numericCommand.ownerLease) ||
+            summation.expectedPlanning!=axis.planningPos || summation.expectedPosition!=axis.currentCmdPos ||
+            summation.expectedSum!=axis.bufferSum || summation.expectedTarget!=axis.finalTargetPos ||
+            summation.filterSize!=axis.velBuffer.size() || summation.filterIndex!=axis.bufferIndex)
+        {
+            summation=RetainedScalarSummation{};
+        }
+        if (retainedSummation)
+        {
+            summation.active=true;
+            summation.identity=numericCommand.execution;
+            summation.owner=numericCommand.ownerLease;
+        }
+    }
+    const auto compensatedAdd=[](double value,double delta,double& correction) noexcept -> double
+    {
+        // A zero-velocity HOLD must not consume a saved rounding correction.
+        if (delta==0.0) return value;
+        const double adjusted=delta-correction;
+        const double next=value+adjusted;
+        correction=(next-value)-adjusted;
+        return next;
+    };
+
     double planDistErr = axis.finalTargetPos - axis.planningPos;
 
     double dir = (planDistErr >= 0.0) ? 1.0 : -1.0;
@@ -23093,6 +23358,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     if (isPlanDone)
     {
         axis.planningPos = axis.finalTargetPos;
+        if (retainedSummation) summation.planCorrection=0.0;
 
 
         // -----------------------------------------------------
@@ -23340,7 +23606,9 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // =====================================================
         // 更新規劃位置
         // =====================================================
-        axis.planningPos += axis.currentCmdVel * dt;
+        if (retainedSummation)
+            axis.planningPos=compensatedAdd(axis.planningPos,axis.currentCmdVel*dt,summation.planCorrection);
+        else axis.planningPos += axis.currentCmdVel * dt;
     }
 
 
@@ -23352,10 +23620,26 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
 
     if (axis.velBuffer.size() > 1)
     {
-        axis.bufferSum -= axis.velBuffer[axis.bufferIndex];
+        if (retainedSummation)
+            axis.bufferSum=compensatedAdd(axis.bufferSum,-axis.velBuffer[axis.bufferIndex],summation.filterCorrection);
+        else axis.bufferSum -= axis.velBuffer[axis.bufferIndex];
         axis.velBuffer[axis.bufferIndex] = axis.currentCmdVel;
-        axis.bufferSum += axis.currentCmdVel;
+        if (retainedSummation)
+            axis.bufferSum=compensatedAdd(axis.bufferSum,axis.currentCmdVel,summation.filterCorrection);
+        else axis.bufferSum += axis.currentCmdVel;
         axis.bufferIndex = (axis.bufferIndex + 1) % (int)axis.velBuffer.size();
+        if (retainedSummation)
+        {
+            if (axis.currentCmdVel!=0.0) summation.zeroInputCycles=0U;
+            else if (summation.zeroInputCycles<axis.velBuffer.size()) ++summation.zeroInputCycles;
+            if (summation.zeroInputCycles>=axis.velBuffer.size())
+            {
+                // Every slot has received a fresh zero; retire only FIR sum
+                // residue. Position compensation survives a genuine HOLD.
+                axis.bufferSum=0.0;
+                summation.filterCorrection=0.0;
+            }
+        }
         // PBC-3J FIX2: a fully drained FIR has an exact zero sum. Remove only
         // floating accumulation residue after every retained sample is zero;
         // a real sub-PPS tail must still run through the normal integration.
@@ -23365,6 +23649,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
                 [](double velocity) { return velocity == 0.0; }))
         {
             axis.bufferSum = 0.0;
+            if (retainedSummation) summation.filterCorrection=0.0;
         }
 
         finalOutputVel = axis.bufferSum / (double)axis.velBuffer.size();
@@ -23389,6 +23674,9 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // 5. S-Curve Output Position 積分
     // =========================================================
     double stepPos = finalOutputVel * dt;
+    double nextOutputCorrection=summation.outputCorrection;
+    const double nextOutputPosition=retainedSummation ?
+        compensatedAdd(axis.currentCmdPos,stepPos,nextOutputCorrection) : axis.currentCmdPos+stepPos;
 
 
     // ---------------------------------------------------------
@@ -23401,7 +23689,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     // 6. 正方向終點 Clamp
     // =========================================================
-    if (isStopping && dir > 0.0 && (axis.currentCmdPos + stepPos) >= axis.finalTargetPos)
+    if (isStopping && dir > 0.0 && nextOutputPosition >= axis.finalTargetPos)
     {
         stepPos = axis.finalTargetPos - axis.currentCmdPos;
 
@@ -23417,13 +23705,14 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
             axis.velBuffer[i] = 0.0;
         }
         axis.bufferSum = 0.0;
+        if (retainedSummation) summation.outputCorrection=summation.filterCorrection=0.0;
     }
 
 
     // =========================================================
     // 7. 負方向終點 Clamp
     // =========================================================
-    else if (isStopping && dir < 0.0 && (axis.currentCmdPos + stepPos) <= axis.finalTargetPos)
+    else if (isStopping && dir < 0.0 && nextOutputPosition <= axis.finalTargetPos)
     {
         stepPos = axis.finalTargetPos - axis.currentCmdPos;
 
@@ -23442,6 +23731,7 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
 
         axis.bufferSum =
             0.0;
+        if (retainedSummation) summation.outputCorrection=summation.filterCorrection=0.0;
     }
 
 
@@ -23450,7 +23740,8 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
     // =========================================================
     else
     {
-        axis.currentCmdPos += stepPos;
+        axis.currentCmdPos=nextOutputPosition;
+        if (retainedSummation) summation.outputCorrection=nextOutputCorrection;
     }
 
 
@@ -23605,6 +23896,19 @@ void MotionCore::Calc_Trajectory_Trapezoidal(
         // P0 = 完成
         // P1 = 可以交下一段
         axis.inPosition = true;
+    }
+    if (retainedSummation)
+    {
+        if (axis.state==MotionState::MotionState_IDLE) summation=RetainedScalarSummation{};
+        else
+        {
+            summation.expectedPlanning=axis.planningPos;
+            summation.expectedPosition=axis.currentCmdPos;
+            summation.expectedSum=axis.bufferSum;
+            summation.expectedTarget=axis.finalTargetPos;
+            summation.filterSize=axis.velBuffer.size();
+            summation.filterIndex=axis.bufferIndex;
+        }
     }
 }
 
@@ -24169,7 +24473,7 @@ void MotionCore::Calc_Trajectory_Velocity(AxisContext& axis, AxisCommand& outCmd
 
 // EDM165 selects gains only after the same CNC output image was committed.
 // It grants no motion, output, START, following-window or ownership exception.
-bool MotionCore::IsEDM165FlushGainActive(const AxisContext& axis) const noexcept
+bool MotionCore::IsEDM165FlushGainActive(const AxisContext& axis, EDM174Leaf::Sample* edm174Trace) const noexcept
 {
     if(axis.axisIndex<0||axis.axisIndex>=6||!axis.isExist||axis.isVirtualAxis||axis.homeRuntime.active||
         !m_edm94.Active()||!m_edm126Profile||!m_edm128Profile||!m_edm130Profile)return false;
@@ -24203,13 +24507,13 @@ bool MotionCore::IsEDM165FlushGainActive(const AxisContext& axis) const noexcept
         !IsMotionOwnerLeaseCurrent(m_Group.currentCmd.ownerLease)||
         GetCurrentExecutionEpoch()!=m_edm126Current.liveEpoch||
         HasPendingSafetyOrRecoveryRequests()||
-        GetCommandAuthorizationFailure(m_Group.currentCmd)!=MotionRejectReason::NONE)return false;
+        GetCommandAuthorizationFailure(m_Group.currentCmd,edm174Trace)!=MotionRejectReason::NONE)return false;
     return true;
 }
 
-void MotionCore::DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold)// PID 依照狀態切換
+void MotionCore::DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold, EDM174Leaf::Sample* edm174Trace)// PID 依照狀態切換
 {
-    const bool edm165Flush=IsEDM165FlushGainActive(axis);
+    const bool edm165Flush=IsEDM165FlushGainActive(axis,edm174Trace);
     axis.edmFlushGainSelected=false;
     if (physicalFixtureIntegralHold != nullptr) *physicalFixtureIntegralHold = false;
     // =========================================================
@@ -24691,8 +24995,9 @@ MotionPathCoreAdmissionCorrectionDecision MotionCore::ResolvePathCoreAdmissionPo
 
 template <typename DriveType>
 void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd,
-    const MotionServoInputSnapshot& input)
+    const MotionServoInputSnapshot& input, EDM174Leaf::Sample* edm174Trace)
 {
+    g_fix19AxesRecorder.Mark(&axis, EDM144::AxesDetail::ServoPreparation);
 
     // FIX10_GAIN_EDGE_BEGIN: capture before the configured gain selector.
     const double edm94KiBefore = axis.pid.Ki;
@@ -24704,7 +25009,8 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
             axis.pid.Kd==axis.Pid_FLUSH.Kd&&axis.pid.Kvff==axis.Pid_FLUSH.Kvff));
     // FIX10_GAIN_EDGE_END
     bool edmPhysicalIntegralHold = false;
-    DetermineActiveGainSet(axis, &edmPhysicalIntegralHold); // PID 依照狀態切換
+    DetermineActiveGainSet(axis, &edmPhysicalIntegralHold,
+        edm174Trace?edm174Trace->ForSite(EDM174Leaf::GainAuth):nullptr); // PID 依照狀態切換
 
         // =========================================================
         // 🌟 1. [Feedback Selection] 雙回授處理
@@ -24808,26 +25114,9 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
     axis.currentActVel = (axis.currentActPos - axis.lastActPos) / CYCLE_TIME_SEC;
     axis.lastActPos = axis.currentActPos; // 記錄本次位置，供下 1ms 使用
 
-        // =========================================================
-    // Software Travel Limit Runtime Update
-    //
-    // 這裡已經完成 Feedback Selection：
-    //
-    // Motor Encoder
-    // 或
-    // Linear Scale
-    //
-    // 所以此時的 currentActPos 才是本 Cycle
-    // 真正採用的 Machine Position。
-    //
-    // Software Limit 1 / 2 / 3
-    // 全部由 CoordinateManager 統一判斷。
-    // =========================================================
-
-    if (m_pCoordMgr != nullptr)
-    {
-        m_pCoordMgr->UpdateSoftwareTravelLimitState(axis);
-    }
+    // FIX18: the post-feedback refresh above already observes this exact
+    // currentActPos. Velocity/history writes do not change travel-limit inputs;
+    // keep one fresh state update per servo pass, including while unowned.
 
 
     // =========================================================
@@ -24962,6 +25251,19 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         const bool edm114ArcEndpoint = m_edm114Profile && m_edm114Current.rowComplete &&
             !m_edm114Current.failed && !m_edm114Current.stopActive &&
             m_edm114Current.kind == EDM114::Kind::Arc && IsEDM114MappingCurrent();
+        // The sealed G76 parent's last child uses sparse canonical XYZ
+        // syntax, while its bound endpoint and outputs cover all six axes.
+        // Intermediate children never enter IDLE retirement.
+        const bool edm173FinalEndpoint = IsEDM173CommandCurrent(true) &&
+            completed.edm173ChildOrdinal==24U && m_edm173->nextChild==25U &&
+            m_edm173->terminalMask==0x01ffffffU && !m_edm173->handshaking &&
+            m_edm114Current.rowComplete && !m_edm114Current.failed && !m_edm114Current.stopActive &&
+            m_edm126Current.rowCompleted && !m_edm126Current.faulted &&
+            EDM126CommittedImage().completeReady && EDM126CommittedImage().historyDepth==0U &&
+            EDM126CommittedImage().positionPulse==m_edm114Current.endPulse &&
+            EDM126CommittedImage().velocityPps==EDM126::Point{} &&
+            EDM126CommittedImage().tick==m_ncSettleRuntimeCycleTick &&
+            m_edm114MappedTick==m_ncSettleRuntimeCycleTick;
         const bool sourceCurrent = m_ncSettleRuntimeObserved && m_ncSettleRuntimeCycleValid &&
             m_ncSettleRuntimeCycleContiguous && m_edmZClockValid &&
             previous.clockValid && previous.pdoValid && previous.sourceFresh && previous.healthy &&
@@ -24993,7 +25295,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
             completed.execution.IsAssigned() && completed.execution.epoch == m_edm94ExpectedEpoch &&
             completed.execution.source == MotionCommandSource::NC_MEMORY && completed.ownerLease.Matches(servoLoopOwnerLease) &&
             ((completed.mode == InterpolationMode::LINEAR && completed.axisCount == 6 &&
-                completed.pathCoreXYZCUVFeedExactStop) || edm114ArcEndpoint) &&
+                completed.pathCoreXYZCUVFeedExactStop) || edm114ArcEndpoint || edm173FinalEndpoint) &&
             completed.commandPathMode == MotionCommandPathMode::EXACT_STOP &&
             m_Group.pathMode == PathMode::EXACT_STOP &&
             admissionCorrection == MotionPathCoreAdmissionCorrectionDecision::NOT_APPLICABLE &&
@@ -25002,7 +25304,8 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         for (unsigned i = 0U; scope && i < 6U; ++i)
         {
             const auto& member = (*m_pContexts)[i];
-            scope = ((edm114ArcEndpoint && i >= 2U) ||
+            scope = ((edm173FinalEndpoint && m_Group.axisIndices[i]==static_cast<int>(i)) ||
+                (edm114ArcEndpoint && i >= 2U) ||
                 (completed.axisIndices[i] == static_cast<int>(i) && m_Group.axisIndices[i] == static_cast<int>(i))) &&
                 member.axisIndex == static_cast<int>(i) && member.isExist && !member.isVirtualAxis &&
                 member.axisType == (i < 3U ? AxisType::LINEAR : AxisType::ROTARY) &&
@@ -25010,7 +25313,8 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
                 !member.isFault && !member.isLagAlarm && member.state == MotionState::MotionState_IDLE &&
                 !member.hardLimitPositive && !member.hardLimitNegative && !member.positiveTravelBlocked && !member.negativeTravelBlocked &&
                 !member.enablePitch && !member.enableBacklash && member.currentCompOffset_unit == 0.0 &&
-                std::isfinite(member.currentCmdPos) && member.currentCmdPos == (edm114ArcEndpoint ? m_edm114Current.endPulse[i] : completed.targetPos[i]) &&
+                std::isfinite(member.currentCmdPos) && member.currentCmdPos ==
+                    ((edm114ArcEndpoint || edm173FinalEndpoint) ? m_edm114Current.endPulse[i] : completed.targetPos[i]) &&
                 member.planningPos == member.currentCmdPos && member.finalTargetPos == member.currentCmdPos &&
                 member.currentCmdVel == 0.0 && member.logicalCmdVel == 0.0 &&
                 member.targetVelocity == 0.0 && member.targetEndVel == 0.0;
@@ -25019,7 +25323,8 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         if (!scope || !EDM94::TransferEndpointIntegral(edm94KiBefore, axis.pid.Ki,
             axis.pid.integralAcc, axis.pid.MaxIntegral, transferred))
         {
-            TripEDM94(!sourceCurrent ? EDM94::Reason::Source : !scope ? EDM94::Reason::Identity : EDM94::Reason::Output);
+            TripEDM94(!sourceCurrent ? EDM94::Reason::Source : !scope ? EDM94::Reason::Identity : EDM94::Reason::Output,
+                completed.edm173G76Gap?EDM94::FaultSite::G76EndpointGain:EDM94::FaultSite::EngineFault);
             WriteServoTargetVelocityCommand(servo.pOutput, axis.axisIndex, 0);
             return;
         }
@@ -25061,6 +25366,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
 
     // CU_FIX1 queued-source correction remains separate. The ordinary PI
     // calculation and anti-windup snapshot use the post-handoff I history.
+    g_fix19AxesRecorder.Mark(&axis, EDM144::AxesDetail::ControllerObservation);
     double p_term = error * axis.pid.Kp;
     const double edmZIntegralBefore = axis.pid.integralAcc;
     double i_term = 0.0;
@@ -25140,6 +25446,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
 
 
 
+    g_fix19AxesRecorder.Mark(&axis, EDM144::AxesDetail::OutputGuardsWrite);
     // EDM94 rejects nonfinite controller results before the legacy clamp
     // could turn infinity into a seemingly valid maximum-speed command.
     if (m_edm94.Active() && (!std::isfinite(finalVel) || !std::isfinite(axis.pid.integralAcc)))
@@ -25178,20 +25485,15 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
 
     if (m_pCoordMgr != nullptr)
     {
-        const bool softwarePositiveAllowed =
-            m_pCoordMgr->CanMoveSoftwarePositive(axis);
-
-        const bool softwareNegativeAllowed =
-            m_pCoordMgr->CanMoveSoftwareNegative(axis);
-
-
+        // FIX18: these coordinate queries are pure. Evaluate the requested
+        // direction only; the earlier malformed-range fence remains mandatory.
         const bool blockedPositiveMotion =
             finalVel > 0.0 &&
-            !softwarePositiveAllowed;
+            !m_pCoordMgr->CanMoveSoftwarePositive(axis);
 
         const bool blockedNegativeMotion =
             finalVel < 0.0 &&
-            !softwareNegativeAllowed;
+            !m_pCoordMgr->CanMoveSoftwareNegative(axis);
 
 
         if (blockedPositiveMotion ||
@@ -25367,7 +25669,7 @@ void MotionCore::Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisC
         servo.pOutput,
         axis.axisIndex,
         static_cast<int32_t>(
-            finalVel));
+            finalVel),edm174Trace?edm174Trace->ForSite(EDM174Leaf::WriterAuth):nullptr);
     ReceiptPbcXControl(axis, cmd, static_cast<std::int32_t>(finalVel));
 }
 
@@ -25382,6 +25684,22 @@ void MotionCore::UpdateMotion(
     AxisContext& axis,
     const MotionServoInputSnapshot& input)
 {
+    // FIX6: the public entry remains untraced, including non-PDO callers.
+    UpdateMotionObserved(servo,axis,input,nullptr);
+}
+
+template <typename DriveType>
+void MotionCore::UpdateMotionObserved(
+    DriveType& servo,
+    AxisContext& axis,
+    const MotionServoInputSnapshot& input, EDM174Leaf::Sample* edm174Trace)
+{
+    // FIX6_PARTICIPATION_OBSERVATION_BEGIN: evaluated at the old || operand.
+    const auto edm174Participation = [this,edm174Trace]() noexcept {
+        EDM174Leaf::Scope observation(edm174Trace?edm174Trace->ForSite(EDM174Leaf::Participation):nullptr);
+        return IsEDM126ParticipationCurrent();
+    };
+    // FIX6_PARTICIPATION_OBSERVATION_END
 
     if (!axis.isExist)
     {
@@ -25564,7 +25882,8 @@ void MotionCore::UpdateMotion(
         IsSafetyControlledStopAuthorized(contextAxisSlot);
     const bool activeGroupUnauthorized =
         m_Group.isActive &&
-        GetCommandAuthorizationFailure(m_Group.currentCmd) !=
+        GetCommandAuthorizationFailure(m_Group.currentCmd,
+            edm174Trace?edm174Trace->ForSite(EDM174Leaf::PreludeAuth):nullptr) !=
         MotionRejectReason::NONE;
     if (!controlledStopAuthorized &&
         (HasUnacknowledgedSafetyMotionRequest() ||
@@ -25631,7 +25950,8 @@ void MotionCore::UpdateMotion(
     {
         bool exactCurrentMember = false;
         if (m_Group.isActive && (m_Group.axisCount==m_Group.currentCmd.axisCount ||
-            m_pathHold.unionActive || IsEDM115ParticipationCurrent() || IsEDM126ParticipationCurrent()))
+            m_pathHold.unionActive || IsEDM115ParticipationCurrent() || edm174Participation() ||
+            IsEDM173PendingHandoffMembershipCurrent()))
         {
             const int safeGroupAxisCount =
                 ClampMotionAxisCount(m_Group.axisCount);
@@ -25755,7 +26075,7 @@ void MotionCore::UpdateMotion(
 
 
 
-    Run_Servo_Loop(servo, axis, cmd, input);
+    Run_Servo_Loop(servo, axis, cmd, input, edm174Trace);
 }
 
 
@@ -27416,6 +27736,10 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
     // A marked outgoing segment always retires with both authority words
     // reserved. Never complete/clear it through the legacy native handoff.
     if (m_Group.isActive && m_Group.currentCmd.pathCoreEccentricCFeedExactStop) return;
+    // Keep the outgoing G76 identity and endpoint alive until a fresh sealed
+    // zero send and physical sample qualify it, before any Complete or Pop.
+    if(m_Group.isActive && m_Group.currentCmd.edm173G76Gap &&
+        !m_safetyControlledStopInProgress && !ArePhysicalGroupAxesReadyForTerminal())return;
     if (!m_Group.isActive) ClearEccentricCConsumer();
     // ======================================================
     // 1. 派單保護
@@ -29241,6 +29565,7 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
 
     // 新路徑 Virtual Position 從 0 開始
     vAxis.currentCmdPos = crossingDistance;
+    m_retainedScalarSummation=RetainedScalarSummation{};
 
 
     // EXACT_STOP 必須從 0 速度起跑
@@ -29572,6 +29897,15 @@ void MotionCore::LoadNextCommand(bool cncBoundaryCrossing)
     // Motion frame, and the existing Step/Map/send gates retain authority.
     if (cmd.edm173G76Gap)
     {
+        // The canonical child may name only XY/XYZ. Retain its complete
+        // sealed physical group while the fresh zero handoff is pending;
+        // C/U/V must not become orphaned INTERPOLATING axes between binds.
+        m_Group.axisCount=6;
+        for(unsigned axis=0U;axis<6U;++axis){
+            m_Group.axisIndices[axis]=static_cast<int>(axis);
+            m_Group.startPos[axis]=m_Group.currentCmd.mem_startPos[axis];
+            m_Group.ratio[axis]=(m_Group.currentCmd.mem_ratio[axis]-m_Group.startPos[axis])/m_Group.currentCmd.mem_totalDist;
+        }
         lifecycleCommit.Release();
         ServiceEDM173Handoff(false);
     }
@@ -31257,6 +31591,11 @@ double MotionCore::PlanTrapezoidal_B2(double currentPos, double targetPos, doubl
 }
 bool MotionCore::ArePhysicalGroupAxesReadyForTerminal() const noexcept
 {
+    if(m_Group.currentCmd.edm173G76Gap && !m_safetyControlledStopInProgress &&
+        (!IsEDM173Profile() || !m_edm114Current.rowComplete || !m_edm126PhysicalSettled ||
+            m_edm126PhysicalTick==(std::numeric_limits<std::uint64_t>::max)() ||
+            m_edm126PhysicalTick+1ULL!=m_ncSettleRuntimeCycleTick ||
+            m_edm126PhysicalReference!=m_edm114Current.endPulse))return false;
     if (m_Group.axisCount != m_Group.currentCmd.axisCount && !(IsEDM115ParticipationCurrent() || IsEDM126ParticipationCurrent()) &&
         !m_pathHold.unionActive) return false;
     if (m_pContexts == nullptr || m_Group.axisCount <= 0 || m_Group.axisCount > MAX_AXES)
@@ -31516,7 +31855,7 @@ void MotionCore::UpdateInterpolation()
             safeGroupAxisCount > 0 &&
             safeGroupAxisCount == m_Group.axisCount &&
             !m_pathHold.unionActive &&
-            (IsEDM115ParticipationCurrent() || IsEDM126ParticipationCurrent());
+            (IsEDM115ParticipationCurrent() || IsEDM126ParticipationCurrent() || IsEDM173PendingHandoffMembershipCurrent());
         currentGroupMappingValid =
             safeGroupAxisCount > 0 &&
             safeGroupAxisCount == m_Group.axisCount &&
@@ -33419,7 +33758,11 @@ void MotionCore::UpdateInterpolation()
     // 3. 結束檢查 (G00 / G01 實體馬達準停確認)
     // =========================================================
     if (vAxis.state == MotionState::MotionState_IDLE &&
-        (!IsPathCoreHoldExcursionDriving() || m_safetyControlledStopInProgress))
+        (!IsPathCoreHoldExcursionDriving() || m_safetyControlledStopInProgress) &&
+        // Intermediate G76 children hand off while the physical axes retain
+        // their interpolation gains. The final child uses normal retirement.
+        (m_safetyControlledStopInProgress || !m_Group.currentCmd.edm173G76Gap ||
+            m_Group.currentCmd.edm173ChildOrdinal==24U))
     {
         const bool allPhysicalInPos = ArePhysicalGroupAxesReadyForTerminal();
 
@@ -37038,7 +37381,7 @@ template void MotionCore::UpdateMotion<ENI_ServoDrive>(
     AxisContext&,
     const MotionServoInputSnapshot&);
 template void MotionCore::Run_Servo_Loop<ENI_ServoDrive>(ENI_ServoDrive&, AxisContext&, const AxisCommand&,
-    const MotionServoInputSnapshot&);
+    const MotionServoInputSnapshot&, EDM174Leaf::Sample*);
 
 // BASE79F definitions share this translation unit's existing authority seams.
 #include "MotionCore_EccentricCReservation.h"

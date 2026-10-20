@@ -476,6 +476,19 @@ public:
         if(!timed&&!evidence_.rowEventComplete&&(image_.authorizedSource.ordinal&1ULL)==0ULL)image_.completeReady=false;
         CaptureSpeedProof();return Propose();
     }
+    // A completed NC row still needs fresh mapped zero receipts before its
+    // physical endpoint may retire. This hold cannot accrue E5 work or flush.
+    bool StepCompletedEndpoint(EDM126::Traversal& main,std::uint64_t tick,std::uint64_t nowUs) noexcept
+    {
+        if(!rowValid_||stopping_||pending_||evidence_.faulted||committedEvidence_.faulted||
+            committedBackend_!=Backend::Main||committedEvidence_.phase!=Phase::Gap||
+            !committed_.completeReady||!Zero(committed_)||committed_.historyDepth||
+            !Clock(tick,nowUs))return Fail();
+        evidence_=committedEvidence_;backend_=committedBackend_;ClearSpeedSample();
+        if(!main.StepCompletedEndpoint(tick,nowUs))return Fail();
+        MainImage(main);evidence_.work.previousEligible=false;
+        CaptureSpeedProof();return Propose();
+    }
     // A retained-path HOLD excursion advances the same live traversal and
     // commit protocol. It cannot trigger or complete an E5 flush, accrue work,
     // detach from authored geometry, or complete the active NC instruction.

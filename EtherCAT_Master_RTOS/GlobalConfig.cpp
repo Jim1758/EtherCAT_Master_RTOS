@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <windows.h> 
 #include <rtapi.h>
+#include "NCG76DiagnosticPrint.h"
 #include "CompensationEngine.h" // 必須引入引擎結構
 #include <fstream>
 #include <sstream>
@@ -413,7 +414,7 @@ bool GlobalConfig::LoadPIDConfig(const std::string& filePath, std::vector<AxisCo
 
 
     m_g76CenterReturnSpeeds=centerReturn;
-    RtPrintf("[EDM171] event=G76_CENTER_RETURN_CONFIG result=READY B3mmMin=%.9g B4mmMin=%.9g zero=INHERIT_F phases=TO_CENTER_AND_FINISH_CENTER units=PHYSICAL_MM_MIN load=BOOT reload=RESTART output=NONE\n",
+    PrintNCG76DiagnosticLine("[EDM171] event=G76_CENTER_RETURN_CONFIG result=READY B3mmMin=%.9g B4mmMin=%.9g zero=INHERIT_F phases=TO_CENTER_AND_FINISH_CENTER units=PHYSICAL_MM_MIN load=BOOT reload=RESTART output=NONE\n",
         centerReturn.b3MmMin,centerReturn.b4MmMin);
 
     return true;

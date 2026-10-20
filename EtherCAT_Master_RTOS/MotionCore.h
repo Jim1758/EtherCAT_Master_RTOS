@@ -32,6 +32,8 @@ struct NCEccentricCProfilePoint;
 #include "NCG76MixedPlan.h"
 #include "EDM173G76Gap.h"
 #include "EDM173ServoInputDiagnostic.h"
+#include "EDM174CommunicationTrace.h"
+#include "EDM174G76LeafTiming.h"
 #include "MotionG76OrbitReceipt.h"
 #include "NCRotaryFeedScope.h" // BASE68 pure rotary admission
 #include "NCZCFeedLine.h" // BASE70 common-time Z/C geometry
@@ -2724,6 +2726,8 @@ public:
     bool ReadEDM129Feedback(EDM129::MotionFeedback& feedback) const noexcept;
     bool ReadEDM173Feedback(EDM173::Feedback& out) const noexcept;
     bool ReadEDM173InputDiagnostic(EDM173InputDiag::Evidence& out) const noexcept;
+    // Observation only; call from the PDO/Motion owner, never another thread.
+    EDM174Comm::MotionObservation GetEDM174CommunicationObservation() const noexcept;
     std::uint32_t GetEDM173ImplementationRevision() const noexcept;
     bool SubmitEDM173Arm(std::uint64_t session,MotionExecutionEpoch epoch,const MotionOwnerLease& lease,
         const EDM97::Tuning& tuning,const EDM107::FlushProfile& flush,const EDM130::Recipe& recipe) noexcept;
@@ -3803,6 +3807,7 @@ private:
     std::unique_ptr<MotionEDM173Storage> m_edm173;
     bool IsEDM173Profile() const noexcept;
     bool IsEDM173CommandCurrent(bool bound) const noexcept;
+    bool IsEDM173PendingHandoffMembershipCurrent() const noexcept;
     bool IsEDM173HandoffCurrent() const noexcept;
     bool IsEDM173GroupGeometrySupported() const noexcept;
     bool PreserveEDM173PendingHandoffZero(const AxisCommand& command) const noexcept;
@@ -4088,7 +4093,9 @@ private:
     bool IsEDM126FeedCurrent(const EDM94FeedAuthorization& authorization) const noexcept;
     bool IsEDM126ParticipationCurrent() const noexcept;
     bool IsEDM126Current() const noexcept;
-    bool IsEDM126SourceCurrent(std::uint64_t nowUs) const noexcept;
+    // Set the local proof only directly after successful G76 IsEDM126Current.
+    bool IsEDM126SourceCurrent(std::uint64_t nowUs,
+        bool g76ProfileJustValidated=false) const noexcept;
     void ObserveEDM126Source(bool complete) noexcept;
     void ObserveEDM126PhysicalSettle(bool complete, const EDM94::RuntimeDiagnostic& priorSendProof) noexcept;
     bool BeginEDM126Segment() noexcept;
@@ -5113,7 +5120,7 @@ private:
     bool IsEccentricCStartBindingCurrent(const MotionCommand& command,
         const NCEccentricCRuntimeValue& runtime) const noexcept;
     MotionRejectReason GetCommandAuthorizationFailure(
-        const MotionCommand& command) const noexcept;
+        const MotionCommand& command, EDM174Leaf::Sample* edm174Trace = nullptr) const noexcept;
 
     static std::uint64_t PackMotionOwnerState(
         MotionOwner owner,
@@ -5210,7 +5217,7 @@ private:
     bool TryEnqueueMotionCommand(const MotionCommand& command) noexcept;
     bool TryEnqueueMotionCommandPair(
         const MotionCommand& first, const MotionCommand& second) noexcept;
-    bool TryEnqueueMotionCommandBatch(const MotionCommand* commands, std::size_t count) noexcept;
+    bool TryEnqueueMotionCommandBatch(const MotionCommand* commands, std::size_t count, bool traceG76Start = false) noexcept;
     bool IsG76MixedPreparedCommandGeometryValid(const MotionCommand& command) const noexcept;
     bool TryPeekNextMotionCommand(MotionCommand& command) const noexcept;
     bool TryPeekQueuedMotionCommandAt(
@@ -5351,9 +5358,14 @@ private:
     template <typename DriveType>
 
     void Run_Servo_Loop(DriveType& servo, AxisContext& axis, const AxisCommand& cmd,
-        const MotionServoInputSnapshot& input);
-    void DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold = nullptr);
-    bool IsEDM165FlushGainActive(const AxisContext& axis) const noexcept;
+        const MotionServoInputSnapshot& input, EDM174Leaf::Sample* edm174Trace = nullptr);
+    // FIX6: the public three-argument template remains the untraced wrapper.
+    template <typename DriveType>
+    void UpdateMotionObserved(DriveType& servo, AxisContext& axis,
+        const MotionServoInputSnapshot& input, EDM174Leaf::Sample* edm174Trace);
+    void DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold = nullptr,
+        EDM174Leaf::Sample* edm174Trace = nullptr);
+    bool IsEDM165FlushGainActive(const AxisContext& axis, EDM174Leaf::Sample* edm174Trace = nullptr) const noexcept;
 
     double PlanTrapezoidal(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
     double PlanTrapezoidal_B2(double currentPos, double targetPos, double maxVel, double acc, double dec, double& currentVel, double dt);
@@ -5380,7 +5392,7 @@ private:
     void WriteServoTargetVelocityCommand(
         ServoOutput* output,
         int axisIndex,
-        int32_t value);
+        int32_t value, EDM174Leaf::Sample* edm174Trace = nullptr);
 
     enum class ServoOutputImageProofMode : std::uint8_t
     {
@@ -5703,6 +5715,21 @@ private:
 
     // 多軸插補管理器 (單一實體群組)--------------------------------------------------------------------
     InterpolationGroup m_Group;
+
+    // FIX17: Runtime-only arithmetic state; never changes command/axis ABI.
+    // Identity and observed anchors prevent compensation crossing a child or
+    // an external scalar rebase. No value here grants motion authority.
+    struct RetainedScalarSummation
+    {
+        MotionExecutionIdentity identity{};
+        MotionOwnerLease owner{};
+        double planCorrection=0.0, outputCorrection=0.0, filterCorrection=0.0;
+        double expectedPlanning=0.0, expectedPosition=0.0, expectedSum=0.0, expectedTarget=0.0;
+        std::size_t filterSize=0U, zeroInputCycles=0U;
+        int filterIndex=0;
+        bool active=false;
+    };
+    RetainedScalarSummation m_retainedScalarSummation{};
 
 
 

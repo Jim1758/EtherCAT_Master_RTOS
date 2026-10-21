@@ -4790,10 +4790,29 @@ void NCManager::ProcessExecutionEngine()
             }
         }
 
-        // EDM149 commissioning programs are immutable literal Z paths.
+        // EDM179-PRE-RESOLVE-BEGIN: immutable G90 coordinate expressions are
+        // checked before optional skip, control flow or the ordinary resolver.
+        const bool edm179Profile = m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm);
+        const bool edm179Source = edm179Profile &&
+            ((currentPC == m_edm94.pc[0U] && m_edm173->coordinateRow.source.expressionMask != 0U) ||
+                parsedBlock.isBlockSkip || parsedBlock.dependsOnMacroState ||
+                parsedBlock.controlType != NCParsedControlType::NONE || EDM141::HasMacroSyntax(parsedBlock));
+        const bool edm179CoordinateCandidate = edm179Source &&
+            IsEDM179CoordinateCandidateSameThread(parsedBlock,currentPC);
+        if (edm179Source && !edm179CoordinateCandidate)
+        {
+            markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
+            RejectEDM94SameThread("EDM179_PARSED_COORDINATE",sourceLineNumber);
+            return;
+        }
+        // EDM179-PRE-RESOLVE-END.
+
+        // Existing commissioning profiles retain literal-only admission. The
+        // sole exception is the exact frozen EDM179 coordinate row above.
         if (m_edm94.latched && EDM149::IsTestArm(m_edm94.gapHistoryArm) &&
             (parsedBlock.isBlockSkip || parsedBlock.dependsOnMacroState ||
-                parsedBlock.controlType != NCParsedControlType::NONE || EDM141::HasMacroSyntax(parsedBlock)))
+                parsedBlock.controlType != NCParsedControlType::NONE || EDM141::HasMacroSyntax(parsedBlock)) &&
+            !edm179CoordinateCandidate)
         {
             markDispatchFailed(static_cast<std::uint32_t>(AlarmManager::G_Code_Invalid_parameter));
             RejectEDM94SameThread("EDM149_LITERAL_PATH_REQUIRED", sourceLineNumber);

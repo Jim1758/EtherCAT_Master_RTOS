@@ -16,7 +16,9 @@ constexpr unsigned ExpectedEvents = 8U, ExpectedDwells = 28U;
 constexpr unsigned RequiredSettledCycles = EDM115::RequiredSettledCycles;
 constexpr double SampleSeconds = EDM114::SampleSeconds;
 constexpr std::uint64_t LocalDeadlineUs = 3000000ULL, LocalDeadlineTicks = 12000ULL;
-enum class Mode : std::uint8_t { B0 = 0U, B1 = 1U, B2 = 2U, Invalid = 255U };
+enum class Mode : std::uint8_t { B0 = 0U, B1 = 1U, B2 = 2U, B3 = 3U, B4 = 4U, Invalid = 255U };
+constexpr unsigned ModeCount = 5U;
+inline bool IsCenterMode(Mode mode) noexcept { return mode == Mode::B3 || mode == Mode::B4; }
 // EDM124 opts in to one additional authored arc pair at rows 4/5. Earlier
 // fixtures retain their original geometry, B modes and token checkpoints.
 enum class Fixture : std::uint8_t
@@ -79,9 +81,9 @@ inline unsigned ExpectedArcFlushRows(unsigned completed, Fixture fixture = Fixtu
         fixture == Fixture::ModalG76Gap173) return 0U;
     return (completed + 1U) / 4U + (IsArcPairFixture(fixture) && completed >= 5U ? 1U : 0U);
 }
-inline bool ValidMode(Mode mode) noexcept { return mode == Mode::B0 || mode == Mode::B1 || mode == Mode::B2; }
+inline bool ValidMode(Mode mode) noexcept { return mode == Mode::B0 || mode == Mode::B1 || mode == Mode::B2 || IsCenterMode(mode); }
 inline const char* ModeName(Mode mode) noexcept
-{ return mode == Mode::B0 ? "B0" : mode == Mode::B1 ? "B1" : mode == Mode::B2 ? "B2" : "INVALID"; }
+{ return mode == Mode::B0 ? "B0" : mode == Mode::B1 ? "B1" : mode == Mode::B2 ? "B2" : mode == Mode::B3 ? "B3" : mode == Mode::B4 ? "B4" : "INVALID"; }
 inline const char* PhaseName(Phase phase) noexcept { return EDM115::PhaseName(phase); }
 inline bool ParseMode(double value, Mode& mode) noexcept
 {
@@ -115,7 +117,8 @@ inline bool ValidPolicy(const Policy& policy) noexcept
     if ((policy.fixture == Fixture::ModalVisibleFlush158 && (policy.mode != Mode::B1 || policy.revision != 1ULL)) ||
         ((policy.fixture == Fixture::ModalXYZVisibleFlush159 || policy.fixture == Fixture::ModalSixVisibleFlush167) &&
             (policy.mode != Mode::B1 || policy.revision > 3ULL)) ||
-        (policy.fixture == Fixture::ModalG76Gap173 && policy.mode != Mode::B1) ||
+        (policy.fixture == Fixture::ModalG76Gap173 && policy.mode != Mode::B0 && policy.mode != Mode::B1 && policy.mode != Mode::B2 && !IsCenterMode(policy.mode)) ||
+        (IsCenterMode(policy.mode) && policy.fixture != Fixture::ModalG76Gap173) ||
         !ValidMode(policy.mode) || !ValidFixture(policy.fixture) || !EDM107::ValidFlushProfile(policy.profile) || policy.selectorPC < 0 ||
         !policy.selectorDispatch || policy.revision < 1ULL || policy.revision > PolicyRows(policy.fixture)) return false;
     if (!IsModalFixture(policy.fixture)) return policy.modeOriginPC == -1 && !policy.modeOriginDispatch && !policy.modeOriginRevision;
@@ -150,6 +153,7 @@ inline bool PolicyFollowsCompleted(const Policy& policy, const Policy& previous,
     // ordinal advances; neither the selector nor its modal origin is invented.
     if (policy.fixture == Fixture::ModalG76Gap173)
         return ValidPolicy(policy) && PolicyMatchesSource(previous,source) && policy.fixture == previous.fixture &&
+            policy.mode == previous.mode &&
             policy.revision == previous.revision+1ULL && policy.selectorPC == source.sourcePC &&
             policy.selectorDispatch == source.dispatch && policy.modeOriginPC == previous.modeOriginPC &&
             policy.modeOriginDispatch == previous.modeOriginDispatch && policy.modeOriginRevision == previous.modeOriginRevision &&
@@ -344,7 +348,7 @@ inline bool LocalExcursion::Begin(const EDM114::Mapping& original,const Source& 
 {
     if(feedback_.geometryValid||feedback_.faulted)return false;
     Clear();const auto& g=original.GetGeometry();
-    if(!PolicyMatchesSource(policy,source)||!IsTriggerStep(source.step)||policy.mode==Mode::B2)return Fail(Reason::Source);
+    if(!PolicyMatchesSource(policy,source)||!IsTriggerStep(source.step)||(policy.mode==Mode::B2||IsCenterMode(policy.mode)))return Fail(Reason::Source);
     const double nativeLength=NativeLength(original);
     if(!g.valid||!EDM114::Positive(nativeLength)||nativeLength>0.003464101617||!std::isfinite(anchorQ)||
         anchorQ<g.pulseLength*0.5||anchorQ>=g.pulseLength)return Fail(Reason::Geometry);
@@ -452,7 +456,7 @@ inline bool LocalExcursion::Map(Point& position,Point& velocity,Point* accelerat
 inline bool Excursion::Begin(const EDM114::Mapping& current,const EDM114::Mapping& previous,const Source& source,const CompletionToken& token,
     const Policy& policy,const Point& anchor,double q,double speed,double accel,double decel,std::uint64_t tick,std::uint64_t us) noexcept
 {
-    if(Current().geometryValid||Current().faulted||!PolicyMatchesSource(policy,source)||!IsTriggerStep(source.step))return false;
+    if(Current().geometryValid||Current().faulted||IsCenterMode(policy.mode)||!PolicyMatchesSource(policy,source)||!IsTriggerStep(source.step))return false;
     if(policy.mode==Mode::B2)
     {
         if(!EDM116::ValidToken(token,source.step)||speed!=0.12*policy.profile.speedRatio/60.0)return false;

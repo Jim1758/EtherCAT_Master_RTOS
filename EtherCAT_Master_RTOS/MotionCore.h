@@ -171,7 +171,7 @@ namespace EDM128
         bool workTimeFlush=false;
         EDM130::Recipe timerRecipe{};
     };
-    static_assert(sizeof(MotionFeedback)<=1496U && std::is_trivially_copyable<MotionFeedback>::value,
+    static_assert(sizeof(MotionFeedback)<=1600U && std::is_trivially_copyable<MotionFeedback>::value,
         "EDM128 coordination evidence must stay bounded.");
 }
 
@@ -258,7 +258,7 @@ namespace EDM116
         double anchorQ=0.0, strokeNativeMm=0.0;
         std::uint64_t deadlineUs=0ULL, session=0ULL, armEpoch=0ULL, ownerGeneration=0ULL;
         std::uint64_t previousBoundaryTick=0ULL, previousCommit=0ULL, lastPhysicalTick=0ULL;
-        std::array<unsigned,3U> modeStarted{}, modeCompleted{};
+        std::array<unsigned,EDM116::ModeCount> modeStarted{}, modeCompleted{};
         std::uint64_t topDwellTicks=0ULL,topDwellUs=0ULL,returnDwellTicks=0ULL,returnDwellUs=0ULL;
         unsigned topSettledCycles=0U,returnSettledCycles=0U;
         unsigned rangeResets=0U, eventsStarted=0U, eventsCompleted=0U;
@@ -1387,24 +1387,48 @@ inline double MotionXYZCUVEndMCS(const MotionCommand& command, unsigned slot) no
 // frozen G90/G91, scale and mirror source. Marker 0/1 keep their old gates.
 inline bool IsMotionG76MixedRetainedSourceAllowed(const MotionCommand& command) noexcept
 {
+    if (!IsMotionEDMCommissioningMarkerEncodingValid(command)) return false;
+    // Only the explicitly marked EDM173 child may carry fixed XYZ WORK and G17 yaw.
+    // Owner, source tags, retained geometry and runtime scope are still bound.
+    const bool allowFixedWorkTranslation=command.edm173G76Gap;
     const auto& frame=command.sourceTranslation;
     if (!command.pathCoreRetainedTraversal || command.mem_transformOrigin[2]!=2.0 ||
         !command.execution.IsAssigned() || command.execution.source!=MotionCommandSource::NC_MEMORY ||
         !command.ownerLease.IsValid() || command.ownerLease.owner!=MotionOwner::AUTO ||
         command.sourceLinePC<0 || command.execution.sourceBlockId!=static_cast<MotionSourceBlockId>(command.sourceLinePC) ||
-        !NCG76::FrameSupported(frame) || command.sourcePlaneMode!=17 || command.sourceToolRadiusMode!=40 ||
-        command.sourceG16Active || command.sourceG162Active || command.sourceG168Active || command.sourceWCode!=0 ||
+        !NCG76::FrameSupported(frame,allowFixedWorkTranslation,command.edm173G76Gap) || command.sourcePlaneMode!=17 || command.sourceToolRadiusMode!=40 ||
+        command.sourceG16Active || command.sourceG162Active ||
+        (!allowFixedWorkTranslation && (command.sourceG168Active || command.sourceWCode!=0)) ||
         command.sourceIsAbsoluteMode!=(frame.distanceMode==90) ||
         command.commandPathMode!=MotionCommandPathMode::EXACT_STOP || command.cncFeedLookahead || command.cncCornerBlend ||
         command.pathCoreFeedExactStop || command.pathCoreRotaryFeedExactStop || command.pathCoreZCFeedExactStop ||
         command.pathCoreXYZCFeedExactStop || command.pathCoreXYZCUVFeedExactStop || command.pathCoreEccentricCFeedExactStop ||
         command.edm149ZOnlyCommissioning || command.edm150XYZOnlyCommissioning || command.edm154SparseCommissioning ||
-        command.replayTerminalAlreadyPublished || command.mem_enableTransform ||
-        !IsNCTranslationSourceAllowed(command.sourceWCS,frame) ||
+        command.replayTerminalAlreadyPublished || command.mem_enableTransform) return false;
+    if (command.edm173G76Gap)
+    {
+        // EDM187: this invocation already validated the complete immutable
+        // frame above. Its G17/G40/G15, non-eccentric, exact-stop guards also
+        // prove the shared helpers' path prerequisites. Compare every source
+        // tag here without repeating that same full snapshot validation.
+        // This is no cache or live authority: callers still check the current
+        // epoch, owner, feedback and exact translation publication separately.
+        if (command.sourceWCS!=frame.wcsCode ||
+            command.sourceToolLengthMode!=frame.toolLengthMode || command.sourceHCode!=frame.toolHCode ||
+            command.sourceToolRadiusMode!=frame.cutterMode || command.sourceDCode!=frame.cutterD ||
+            (command.sourceG68Active?68:69)!=frame.rotationMode || command.sourcePlaneMode!=frame.rotationPlane ||
+            std::memcmp(&command.sourceG68Angle,&frame.rotationAngleDeg,sizeof(double))!=0 ||
+            (command.sourceG168Active?168:169)!=frame.workMode || command.sourceWCode!=frame.workWCode ||
+            command.sourceG51Active!=(frame.scalingMode==51) ||
+            std::memcmp(&command.sourceScaleRatio,&frame.scalingFactor,sizeof(double))!=0 ||
+            static_cast<std::uint32_t>(command.sourceMirrorMask)!=frame.mirrorMask ||
+            (command.sourceG16Active?16:15)!=frame.polarMode) return false;
+    }
+    else if (!IsNCTranslationSourceAllowed(command.sourceWCS,frame) ||
         !IsMotionFixedTranslationToolSourceAllowed(command) || !IsMotionFixedTranslationCutterSourceAllowed(command) ||
         !IsMotionFixedTranslationRotationSourceAllowed(command) || !IsMotionFixedTranslationWorkSourceAllowed(command) ||
-        !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) || !IsMotionFixedTranslationPolarSourceAllowed(command) ||
-        command.axisCount<1 || command.axisCount>3) return false;
+        !IsMotionFixedTranslationScaleMirrorSourceAllowed(command) || !IsMotionFixedTranslationPolarSourceAllowed(command)) return false;
+    if (command.axisCount<1 || command.axisCount>3) return false;
     int previous=-1;
     for (int slot=0;slot<command.axisCount;++slot) {
         const int axis=command.axisIndices[slot];
@@ -2481,6 +2505,7 @@ struct MotionEDM173Storage
     FixedCapacitySpscRing<MotionEDM173Seal,2U> messages{};
     MotionEDM173Seal producer{}, current{};
     EDM173::ValidationScratch validation{}; // Startup-owned; only the RT seal consumer writes it.
+    EDM128::B3Orbit b3Orbit{}; // B3/B4 center table: RT-owned, frozen at first child bind.
     std::atomic<std::uint64_t> publishedSession{0ULL};
     EDM53::Channel<EDM173::Feedback,2048U> feedback{};
     EDM173::Feedback currentFeedback{};
@@ -4047,7 +4072,7 @@ private:
     EDM128::Coordinator m_edm128{};
     EDM128::TestVoltage m_edm128Voltage{};
     EDM128::MotionFeedback m_edm128Current{};
-    EDM53::Channel<EDM128::MotionFeedback,1496U> m_edm128Feedback{};
+    EDM53::Channel<EDM128::MotionFeedback,1600U> m_edm128Feedback{};
     // EDM157: one NC producer, one serialized Motion/send consumer. Requests
     // carry values only; the existing committed traversal remains the cursor.
     struct EDM157Request
@@ -4207,6 +4232,7 @@ private:
     bool IsEDM94HandoffCommandCurrent() const noexcept;
     EDM94::Engine m_edm94{};
     EDM94::Frame m_edm94Frame{};
+    EDM94::TangentEnvelope m_edm192FrameEnvelope{};
     EDM94::Config m_edm94ObservedConfig{};
     EDM53::Channel<EDM94::Feedback, 4096U> m_edm94Feedback{};
     FixedCapacitySpscRing<EDM94ArmRequest, 2U> m_edm94ArmRequests{};
@@ -4245,6 +4271,7 @@ private:
     std::array<ServoOutput*, 6U> m_edm94FrozenOutput{};
     std::array<const ServoInput*, 6U> m_edm94FrozenInput{};
     EDM94Serialized::Mapping m_edm94FrozenSerializedMapping{};
+    bool CaptureEDM192TangentEnvelope(const EDM94::Frame& frame,EDM94::TangentEnvelope& output) const noexcept;
     EDM94::Frame CaptureEDM94Frame(bool complete) noexcept;
     void ServiceEDM94MotionPass(bool complete) noexcept;
     void ObserveEDM94Cancellation() noexcept;
@@ -5881,7 +5908,8 @@ public:
         const std::vector<double>& intermediateNativeTargets,
         const std::vector<double>& finalNativeTargets, std::uint32_t intermediateMask,
         int profileCode, double* commandedMCSTail);
-    bool TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,double* commandedMCSTail,MotionG76OrbitReceipt& receipt);
+    bool TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,double* commandedMCSTail,MotionG76OrbitReceipt& receipt,
+        const NCG76Mixed::Point8* stationaryRotaryModulo=nullptr);
     bool TryG76MoveTransactionalTail(const NCG76::NativePlan& plan,
         double* commandedMCSTail, MotionG76OrbitReceipt& receipt);
     bool TryG76MixedMoveTransactionalTail(const NCG76Mixed::Plan& plan,

@@ -3,6 +3,7 @@
 #include "EDM127ModalB.h"
 #include "EDM140LocalAssignment.h"
 #include "EDM141MotionWords.h"
+#include "EDM179G76Coordinates.h" // NC-only frozen G90 coordinate expressions.
 #include "EDM146BoundaryObservation.h"
 #include "EDMPLCOutputState.h"
 #include "EDM130WorkTimeBinding.h"
@@ -2630,7 +2631,7 @@ private:
     void ResetG76OrbitStateSameThread() noexcept;
 
     static bool IsG76OrbitBlockShapeValid(const NCBlock& block,bool allowMissingFeed=true,int unitsMode=21) noexcept;
-    bool IsG76OrbitFrameCurrentSameThread() const noexcept;
+    bool IsG76OrbitFrameCurrentSameThread(bool allowFixedWorkTranslation = false, bool allowWorkXYRotation = false) const noexcept;
     bool IsG76OrbitBlockAllowedSameThread(const NCBlock& block) noexcept;
     bool PrepareG76OrbitTranslationSameThread(const NCBlock& block);
     WaitConditionFunc StartG76OrbitSameThread(const NCBlock& block);
@@ -2651,6 +2652,8 @@ private:
         NCG76::NativePlan nominal{};
         NCG76Mixed::NominalSource canonical{};
         NCBlock authored{};
+        EDM179::Row coordinateRow{};
+        EDM173::Scope coordinateScope{};
         EDM173::Feedback retained{};
         std::uint64_t loggedTriggers=0ULL,loggedCompletions=0ULL;
         unsigned loggedPhase=0U;
@@ -2661,8 +2664,12 @@ private:
     static bool IsEDM173OrbitBlockShapeValid(const NCBlock&) noexcept;
     bool IsEDM173BracketBlockSameThread(const NCBlock&) const noexcept;
     bool IsEDM173OrbitAllowedSameThread(const NCBlock&) noexcept;
+    bool IsEDM173TerminalBlockAllowedSameThread(const NCBlock&) noexcept;
     bool FreezeEDM173TranslationSameThread();
     bool PreflightEDM173ProgramSameThread(int) noexcept;
+    bool FreezeEDM179CoordinatesSameThread();
+    bool IsEDM179CoordinateCandidateSameThread(const NCParsedBlock&,int) noexcept;
+    bool MatchesEDM179CoordinatesSameThread(const NCParsedBlock&,const NCBlock&,int) noexcept;
     bool BindEDM173RecipeSameThread() noexcept;
     bool GuardEDM173BlockSameThread(const NCBlock&,int,int);
     WaitConditionFunc StartEDM173SameThread(const NCBlock&);
@@ -2876,7 +2883,7 @@ private:
     {
         EDM130::Recipe recipe{};
         EDM130::WorkEvidence retainedWork{};
-        std::array<unsigned, 3U> retainedModeEvents{};
+        std::array<unsigned, EDM116::ModeCount> retainedModeEvents{};
         std::uint64_t loggedTriggers = 0ULL, loggedCompletions = 0ULL;
         std::uint32_t loggedFlushPhase = 0U, loggedSpeedStage = 0U; // EDM137 observer only.
         bool bound = false, retainedRowEvent = false;
@@ -3076,6 +3083,7 @@ private:
         EDM157::Feedback feedback{};
         std::uint64_t holdSequence=0ULL, startFloor=0ULL, resumeStartSequence=0ULL;
         std::uint64_t requestTick=0ULL, lastTick=0ULL;
+        std::uint64_t compoundCommit=0ULL; // EDM199 immutable NC parent commit.
         std::uint64_t safetyProvenance=0ULL, alarmIntent=0ULL;
         std::uint32_t alarmUpdate=0U;
         int pc=-1;
@@ -3084,6 +3092,13 @@ private:
     std::uint64_t m_edm157HoldSerial=0ULL;
     std::uint64_t m_edm165AutoHoldSession=0ULL;
     std::uint64_t m_edm168AutoHoldResumedSession=0ULL;
+    // EDM200 checkpoint belongs to the immutable G76 parent and requested HOLD.
+    struct EDM200AutoHoldState
+    {
+        EDM157::Scope scope{};
+        std::uint64_t compoundCommit=0ULL,holdSequence=0ULL,eventIndex=0ULL,resumeStartSequence=0ULL;
+        bool queued=false,resumed=false;
+    } m_edm200{};
     struct EDM169NCState
     {
         std::uint64_t session=0ULL,requestSequence=0ULL,inputSequence=0ULL,loggedInputSequence=0ULL;
@@ -3093,12 +3108,15 @@ private:
     bool IsEDM169ManualScopeCurrentSameThread() const noexcept;
     bool QueueEDM169ManualVoltageSameThread(double voltageV,std::uint64_t inputSequence) noexcept;
     void ServiceEDM169ManualVoltageSameThread(bool feedbackCurrent) noexcept;
+    bool IsEDM199G76PauseScopeCurrentSameThread(const EDM157::Scope& scope) noexcept;
     bool IsEDM157ScopeCurrentSameThread(const EDM157::Scope& scope) noexcept;
     bool CaptureEDM157ScopeSameThread(EDM157::Scope& scope) noexcept;
     bool TryHoldEDM157SameThread() noexcept;
     bool TryResumeEDM157SameThread() noexcept;
     bool ServiceEDM157SameThread(bool feedbackCurrent);
     void ServiceEDM165AutoFlushHoldSameThread(bool feedbackCurrent);
+    void ServiceEDM200AutoFlushHoldSameThread(bool feedbackCurrent);
+    bool IsEDM200AutoHoldCheckpointCompleteSameThread() const noexcept;
     bool IsEDM168AutoHoldCheckpointCompleteSameThread() const noexcept;
     void LogEDM157SameThread(const char* event, const char* reason) const noexcept;
     void ServiceEDM94SameThread();

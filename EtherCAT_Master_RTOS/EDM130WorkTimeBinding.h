@@ -272,10 +272,12 @@ inline Binding BindWorkTimeHeightSpeedDeepMachiningReferenceCurveAndFlushStages(
 // EDM173 freezes the complete native G76 recipe atomically. The legacy
 // incremental visible-flush adapters cannot validate this profile halfway
 // through capture: source3 and the sealed 25-child plan are mandatory here.
-inline Binding BindG76Gap173(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
-    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept
+inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration,unsigned commissioningProfile) noexcept
 {
     Binding out{};const auto before=controller.Current();const auto* catalog=controller.GetCatalog();
+    if(commissioningProfile!=VisibleFlushProfile173&&commissioningProfile!=G76B2Profile175&&commissioningProfile!=G76B3Profile176&&commissioningProfile!=G76B4Profile177&&commissioningProfile!=G76B0Profile192)
+    {out.error=EDM58::BindingError::InvalidRecipe;return out;}
     if(!tuningGeneration||!EDM20::ValidateProcessProfile(process))
     {out.error=EDM58::BindingError::InvalidRecipe;return out;}
     if(!expectedProfileId||process.machineProfileId!=expectedProfileId)
@@ -298,7 +300,8 @@ inline Binding BindG76Gap173(const EDMRecipe::Controller& controller,std::uint32
     const char* semantics[]={"JumpHeight","DeepFlushCycleInterval","DeepFlushHeightMultiplier","MachiningServoOverride","GapVoltageSetpoint",
         "FinalApproachSpeed","DecelerationDistance","LargeAreaMachiningSpeed","LargeAreaFlushDistance","ElectrodePolarity"};
     const char* units[]={"mm","cycle","x","%","V","%","mm","%","mm","code"};
-    const EDMRecipe::Value exact[]={2000000LL,0LL,1000000LL,40000000LL,55000000LL,10000000LL,100LL,1000000LL,0LL,0LL};
+    const EDMRecipe::Value exact[]={commissioningProfile==G76B2Profile175?1000LL:2000000LL,
+        0LL,1000000LL,40000000LL,55000000LL,10000000LL,100LL,1000000LL,0LL,0LL};
     EDMRecipe::Value values[10]{};std::uint16_t fields[10]{};EDM58::Binding semantic{};
     for(unsigned i=0U;i<10U;++i)
     {
@@ -318,7 +321,7 @@ inline Binding BindG76Gap173(const EDMRecipe::Controller& controller,std::uint32
         CurveDoubleBits(process.flush.initialSlowMmPerMin)!=CurveDoubleBits(initialBase))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
     Recipe recipe=base.recipe;
-    recipe.commissioningProfile=VisibleFlushProfile173;recipe.diagnosticControlSource=3U;recipe.planRows=25U;recipe.planMovementMask=7U;
+    recipe.commissioningProfile=static_cast<std::uint16_t>(commissioningProfile);recipe.diagnosticControlSource=3U;recipe.planRows=25U;recipe.planMovementMask=7U;
     recipe.heightFieldId=fields[0];recipe.jumpHeightScaled=static_cast<std::uint64_t>(values[0]);
     recipe.intervalFieldId=fields[1];recipe.multiplierFieldId=fields[2];recipe.deepFlushCycleInterval=0U;
     recipe.deepFlushHeightMultiplierScaled=static_cast<std::uint64_t>(values[2]);
@@ -334,4 +337,19 @@ inline Binding BindG76Gap173(const EDMRecipe::Controller& controller,std::uint32
     {out.error=EDM58::BindingError::InvalidRecipe;return out;}
     out.recipe=recipe;out.ready=true;out.error=EDM58::BindingError::None;return out;
 }
+inline Binding BindG76Gap173(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept
+{return BindG76GapProfile175(controller,expectedProfileId,process,tuningGeneration,VisibleFlushProfile173);}
+inline Binding BindG76B2Gap175(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept
+{return BindG76GapProfile175(controller,expectedProfileId,process,tuningGeneration,G76B2Profile175);}
+inline Binding BindG76B3Gap176(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept
+{return BindG76GapProfile175(controller,expectedProfileId,process,tuningGeneration,G76B3Profile176);}
+inline Binding BindG76B4Gap177(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept
+{return BindG76GapProfile175(controller,expectedProfileId,process,tuningGeneration,G76B4Profile177);}
+inline Binding BindG76B0Gap192(const EDMRecipe::Controller& controller,std::uint32_t expectedProfileId,
+    const EDM20::ProcessProfile& process,std::uint64_t tuningGeneration) noexcept
+{return BindG76GapProfile175(controller,expectedProfileId,process,tuningGeneration,G76B0Profile192);}
 }

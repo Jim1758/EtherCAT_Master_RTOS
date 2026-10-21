@@ -43,11 +43,11 @@ namespace EDM94
     static constexpr std::uint64_t VisibleFlushMaximumDurationUs = 180000000ULL;
     // Explicit frozen identity, not the duration, selects an extended lift.
     inline double VisibleFlushHeightMm(unsigned profile) noexcept
-    { return profile == 1U ? 5.0 : (profile == 2U || profile == 3U || profile == 4U) ? 2.0 : 0.0; }
+    { return profile == 1U ? 5.0 : (profile == 2U || profile == 3U || profile == 4U || profile == 6U || profile == 7U) ? 2.0 : 0.0; }
     inline std::uint64_t VisibleFlushDurationUs(unsigned profile) noexcept
-    { return profile == 1U ? VisibleFlushMaximumDurationUs : (profile == 2U || profile == 3U || profile == 4U) ? MaximumDurationUs : 0ULL; }
+    { return profile == 1U ? VisibleFlushMaximumDurationUs : (profile == 2U || profile == 3U || profile == 4U || profile == 6U || profile == 7U) ? MaximumDurationUs : 0ULL; }
     inline unsigned VisibleFlushRequiredMask(unsigned profile) noexcept
-    { return profile == 1U ? 4U : profile == 2U ? 7U : profile == 3U ? AllAxes : profile == 4U ? 7U : 0U; }
+    { return profile == 1U ? 4U : profile == 2U ? 7U : profile == 3U ? AllAxes : (profile == 4U || profile == 6U || profile == 7U) ? 7U : 0U; }
 
     enum class State : std::uint8_t
     { Idle, Armed, Running, Finishing, Zeroing, Stopped, Cancelled, Faulted, Released };
@@ -533,6 +533,26 @@ namespace EDM94
             available > 0.0 && feedforward <= available;
     }
 
+    // FIX2: profile8 XYZ tangent flush permits finite PI saturation under
+    // the existing post-PI serialized cap and integral rollback. This is a
+    // bounded admission policy, not a claim that the full P/I bound fits
+    // without saturation. Budget the complete 0.065 mm/s tangent reference;
+    // the machining-only 0.002 mm/s check is insufficient for this profile.
+    inline bool BoundedTangentFlushServoFits(unsigned axis, double pulsePerUnit,
+        double serializedCapPps, double followingWindowPulse, double kp,
+        double ki, double kd, double kvff, double maxIntegral) noexcept
+    {
+        if (axis >= 3U || !BoundedXYMachiningServoFits(pulsePerUnit,
+            serializedCapPps, followingWindowPulse, kp, ki, kd, kvff, maxIntegral)) return false;
+        const double feedforward = VisibleFlushReferenceMmSec * pulsePerUnit * kvff;
+        const double worstSum = feedforward + kp * followingWindowPulse + ki * maxIntegral;
+        const double reserve = 0.004 * pulsePerUnit;
+        const double available = serializedCapPps - reserve;
+        return std::isfinite(feedforward) && std::isfinite(worstSum) &&
+            std::isfinite(reserve) && std::isfinite(available) &&
+            available > 0.0 && feedforward <= available;
+    }
+
     // The explicit six-axis two-mm profile keeps the ordinary rotary CSV
     // cap and post-PI rollback. Its fixed XYZCUV line is below 0.1 native
     // units/s on each rotary component; C/U/V stay fixed during the B1 lift.
@@ -586,8 +606,8 @@ namespace EDM94
         AxisConfig axis[AxisCount]{};
         std::uint64_t maxDurationUs = MaximumDurationUs;
         std::uint64_t maxSourceGapUs = 2000ULL;
-        bool visibleZFlush158 = false; // Frozen B1 commissioning-family permission; ABI retained.
-        std::uint8_t commissioningProfile = 0U; // Existing padding: 0 ordinary, 1 five-mm Z, 2 two-mm XYZ, 3 two-mm XYZCUV, 4 G76 two-mm B1.
+        bool visibleZFlush158 = false; // Frozen visible-Z commissioning-family permission; ABI retained.
+        std::uint8_t commissioningProfile = 0U; // Existing padding: 0 ordinary, 1 five-mm Z, 2 two-mm XYZ, 3 two-mm XYZCUV, 4 G76 two-mm B1, 5 G76 bounded-path B2, 6 G76 center/Z B3, 7 G76 upper-center B4.
     };
     struct AxisFrame
     {
@@ -622,6 +642,65 @@ namespace EDM94
         bool healthy = false;
         std::uint8_t mappedFlushProfile = 0U; // Existing padding; current mapped family identity, or zero.
     };
+    // RT-local evidence only: shared Config/Frame/command layouts are unchanged.
+    // The motion owner derives this from the sealed child and stopped anchor.
+    // It describes a segment, not an expanded XYZ permission box.
+    struct TangentEnvelope
+    {
+        Identity identity{};
+        std::uint64_t tick=0ULL,nowUs=0ULL,liveEpoch=0ULL,run=0ULL,cache=0ULL,dispatch=0ULL;
+        std::uint64_t fingerprint=0ULL,sourceEpoch=0ULL,segment=0ULL;
+        unsigned child=0U;
+        int sourcePC=-1;
+        std::array<double,6U> anchorPulse{},topPulse{},tangentPulsePerMm{},pulsePerNative{};
+    };
+    inline bool SameTangentGeometry(const TangentEnvelope& a,const TangentEnvelope& b) noexcept
+    {
+        return SameIdentity(a.identity,b.identity)&&a.liveEpoch==b.liveEpoch&&a.run==b.run&&a.cache==b.cache&&
+            a.dispatch==b.dispatch&&a.fingerprint==b.fingerprint&&a.sourceEpoch==b.sourceEpoch&&
+            a.segment==b.segment&&a.child==b.child&&a.sourcePC==b.sourcePC&&
+            a.anchorPulse==b.anchorPulse&&a.topPulse==b.topPulse&&
+            a.tangentPulsePerMm==b.tangentPulsePerMm&&a.pulsePerNative==b.pulsePerNative;
+    }
+    inline bool ValidTangentEnvelope(const TangentEnvelope& e,const Config& c) noexcept
+    {
+        if(c.commissioningProfile!=8U||c.visibleZFlush158||!ValidIdentity(e.identity)||!e.tick||!e.nowUs||
+            !e.liveEpoch||!e.run||!e.cache||!e.dispatch||!e.fingerprint||!e.sourceEpoch||!e.segment||
+            e.child>=25U||e.sourcePC<0)return false;
+        double norm=0.0;
+        for(unsigned i=0U;i<6U;++i) {
+            const double a=e.anchorPulse[i],t=e.tangentPulsePerMm[i],p=e.pulsePerNative[i];
+            if(!std::isfinite(a)||!std::isfinite(t)||!std::isfinite(p)||p<=0.0||p!=c.axis[i].pulsePerUnit||
+                !std::isfinite(e.topPulse[i])||
+                std::fabs(a-c.axis[i].commandAnchor)>NativeExcursionLimit(i)*p||
+                e.topPulse[i]!=(t==0.0?a:a-2.0*t)||
+                (i>=3U&&(t!=0.0||a!=c.axis[i].commandAnchor)))return false;
+            if(i<3U)norm=std::hypot(norm,t/p);
+        }
+        return std::isfinite(norm)&&std::fabs(norm-1.0)<=128.0*(std::numeric_limits<double>::epsilon)();
+    }
+    inline bool TangentPositionFits(const TangentEnvelope& e,const Config& c,const Frame& f,bool actual) noexcept
+    {
+        double lo=0.0,hi=1.0;
+        for(unsigned i=0U;i<6U;++i) {
+            const double p=actual?f.axis[i].actualPulse:f.axis[i].commandPulse;
+            if(!std::isfinite(p))return false;
+            if(i>=3U) {if(!actual&&p!=e.anchorPulse[i])return false;continue;}
+            const double a=e.anchorPulse[i],b=e.topPulse[i],d=b-a;
+            double magnitude=std::fabs(a);if(std::fabs(b)>magnitude)magnitude=std::fabs(b);
+            if(std::fabs(p)>magnitude)magnitude=std::fabs(p);
+            if(magnitude<1.0)magnitude=1.0;
+            const double roundoff=128.0*(std::numeric_limits<double>::epsilon)()*magnitude;
+            const double window=roundoff+(actual?c.axis[i].followingWindowPulse:0.0);
+            if(d==0.0) {if(std::fabs(p-a)>window)return false;continue;}
+            double left=(p-a-window)/d,right=(p-a+window)/d;
+            if(left>right){const double swap=left;left=right;right=swap;}
+            if(left>lo)lo=left;
+            if(right<hi)hi=right;
+            if(!std::isfinite(lo)||!std::isfinite(hi)||lo>hi)return false;
+        }
+        return true;
+    }
     struct AxisEvidence
     {
         double actualMinPulse = 0.0;
@@ -711,14 +790,19 @@ namespace EDM94
     // Movement evidence concerns the admitted authored axes. Stationary axes
     // can still receive ordinary holding PI output and encoder corrections.
     // That activity cannot substitute for the commanded axis's real motion.
+    // EDM197: B2 retraces the sealed path; B0 extends its native tangent.
+    // Neither mode may invent an additional commanded Z axis for a planar path.
+    inline bool IsNominalMovementProfile(unsigned profile) noexcept
+    { return profile == 5U || profile == 8U; }
     inline bool MovementProven(const Feedback& feedback, unsigned expectedMask) noexcept
     {
-        const bool validMask = feedback.boundedProgram ?
+        const bool nominalProfile = IsNominalMovementProfile(feedback.config.commissioningProfile);
+        const bool validMask = (!nominalProfile || (expectedMask == 3U || expectedMask == 7U)) && (feedback.boundedProgram ?
             (expectedMask <= AllAxes && (expectedMask & 7U) != 0U) :
-            (expectedMask == AllAxes || expectedMask == (1U << 2U) || expectedMask == 7U);
+            (expectedMask == AllAxes || expectedMask == (1U << 2U) || expectedMask == 7U));
         // A B1 excursion can move Z even when no nominal NC row moves Z.
         // It cannot replace evidence for any admitted nominal moving axis.
-        const unsigned allowedMask = feedback.boundedProgram ? expectedMask | 4U : expectedMask;
+        const unsigned allowedMask = feedback.boundedProgram && !nominalProfile ? expectedMask | 4U : expectedMask;
         return validMask &&
             feedback.requiredMovementMask == expectedMask &&
             ((feedback.nonzeroSentMask | feedback.actualMovedMask | feedback.commandMovedMask) & ~AllAxes) == 0U &&
@@ -764,6 +848,8 @@ namespace EDM94
         const Frame& LastFrame() const noexcept { return m_lastFrame; }
         bool Active() const noexcept { return m_feedback.active; }
         bool ForceZero() const noexcept { return m_feedback.active && m_feedback.forceZero; }
+        bool HasTangentEnvelope() const noexcept
+        { return Active()&&m_feedback.config.commissioningProfile==8U&&m_haveTangent; }
         bool HandoffZero() const noexcept { return Active() && m_feedback.handoffZero && !m_feedback.forceZero; }
         void BeginHandoffZero() noexcept
         {
@@ -803,11 +889,14 @@ namespace EDM94
         {
             if (Active()) return false;
             m_feedback = Feedback{};
+            m_tangent=TangentEnvelope{};m_haveTangent=false;
             for (unsigned axis = 0U; axis < AxisCount; ++axis)
             { m_axisControl[axis] = AxisControlSample{}; m_acceptedCsv[axis] = 0; }
             m_acceptedIdentity = Identity{}; m_acceptedTick = m_acceptedSourceNowUs = 0ULL;
             const bool validMovementMask = (config.visibleZFlush158 == visibleZFlush158) &&
                 (!visibleZFlush158 || (boundedProgram && requiredMovementMask == VisibleFlushRequiredMask(config.commissioningProfile))) &&
+                (!IsNominalMovementProfile(config.commissioningProfile) ||
+                    (boundedProgram && (requiredMovementMask == 3U || requiredMovementMask == 7U))) &&
                 !frame.visibleZFlushActive158 && !frame.mappedFlushProfile &&
                 (boundedProgram ? (requiredMovementMask <= AllAxes && (requiredMovementMask & 7U) != 0U) :
                 (requiredMovementMask == AllAxes || requiredMovementMask == (1U << 2U) || requiredMovementMask == 7U));
@@ -864,7 +953,7 @@ namespace EDM94
             return BeginOutput(frame.tick);
         }
 
-        bool Tick(const Frame& frame) noexcept
+        bool Tick(const Frame& frame,const TangentEnvelope* tangent=nullptr) noexcept
         {
             if (!Active()) return false;
             const std::uint32_t boundaryCycles = m_feedback.boundaryReadyCycles;
@@ -930,6 +1019,36 @@ namespace EDM94
             if (!m_feedback.forceZero && (frame.nowUs < m_feedback.firstNowUs ||
                 frame.nowUs - m_feedback.firstNowUs > m_feedback.config.maxDurationUs)) Fault(Reason::Duration);
             bool allCurrent = true, allNear = true, allTripNear = true, allHealthy = frame.healthy, inEnvelope = true;
+            const bool tangentProfile=m_feedback.config.commissioningProfile==8U&&!m_feedback.config.visibleZFlush158;
+            const bool tangentMapped=tangentProfile&&frame.mappedFlushProfile==8U&&!frame.visibleZFlushActive158;
+            const bool planarTangent=tangentProfile&&m_feedback.requiredMovementMask==3U;
+            const bool planarNominal=IsNominalMovementProfile(m_feedback.config.commissioningProfile)&&
+                !m_feedback.config.visibleZFlush158&&m_feedback.requiredMovementMask==3U;
+            bool tangentFits=false;
+            if(tangentMapped) {
+                if(!m_feedback.forceZero) {
+                    const bool current=tangent&&!m_feedback.finishRequested&&frame.authorityCurrent&&
+                        tangent->tick==frame.tick&&tangent->nowUs==frame.nowUs&&tangent->liveEpoch==frame.identity.epoch&&
+                        SameIdentity(tangent->identity,m_feedback.identity)&&
+                        tangent->identity.session==frame.identity.session&&
+                        tangent->identity.ownerGeneration==frame.identity.ownerGeneration&&
+                        ValidTangentEnvelope(*tangent,m_feedback.config)&&
+                        (!planarTangent||(tangent->tangentPulsePerMm[2U]==0.0&&
+                            tangent->anchorPulse[2U]==m_feedback.config.axis[2U].commandAnchor&&
+                            tangent->topPulse[2U]==m_feedback.config.axis[2U].commandAnchor))&&
+                        (!m_haveTangent||SameTangentGeometry(*tangent,m_tangent));
+                    if(!current)Fault(Reason::Identity);
+                    else {m_tangent=*tangent;m_haveTangent=true;}
+                }
+                // Retained geometry after revocation grants only zero-output
+                // containment. Fresh source/identity/health checks above and
+                // physical stop qualification below remain independent.
+                tangentFits=m_haveTangent&&ValidTangentEnvelope(m_tangent,m_feedback.config)&&
+                    TangentPositionFits(m_tangent,m_feedback.config,frame,false)&&
+                    TangentPositionFits(m_tangent,m_feedback.config,frame,true);
+                if(!tangentFits){inEnvelope=false;Fault(Reason::Excursion);}
+            }
+            bool ordinaryEnvelope=true;
             unsigned firstFollowingAxis = AxisCount;
             std::uint32_t boundaryBlocked = (frame.boundaryReadyMask & ~AllAxes) != 0U ?
                 AllAxes : AllAxes & ~frame.boundaryReadyMask;
@@ -948,6 +1067,12 @@ namespace EDM94
                 }
                 const AxisConfig& c = m_feedback.config.axis[axis];
                 const AxisFrame& a = frame.axis[axis];
+                // Planar B0/B2 paths keep the commanded Z anchor through
+                // nominal motion and tangent/retained-path flush. Encoder
+                // holding corrections retain the existing following/envelope
+                // checks and cannot replace commanded movement evidence.
+                if(planarNominal&&axis==2U&&a.commandPulse!=c.commandAnchor)
+                { inEnvelope=false;Fault(Reason::Excursion,axis); }
                 const double limit = NativeExcursionLimit(axis) * c.pulsePerUnit;
                 const bool mappedProfile = frame.visibleZFlushActive158 &&
                     frame.mappedFlushProfile == m_feedback.config.commissioningProfile;
@@ -957,9 +1082,12 @@ namespace EDM94
                     (VisibleFlushHeightMm(m_feedback.config.commissioningProfile) + NativeExcursionLimit(axis)) * c.pulsePerUnit : limit;
                 const double commandDelta = a.commandPulse - c.commandAnchor;
                 const double actualDelta = a.actualPulse - c.actualAnchor;
-                if (commandDelta < -limit || commandDelta > upper || actualDelta < -limit || actualDelta > upper ||
+                const bool ordinary=commandDelta>=-limit&&commandDelta<=limit&&actualDelta>=-limit&&actualDelta<=limit;
+                ordinaryEnvelope=ordinaryEnvelope&&ordinary;
+                if ((!(tangentMapped&&tangentFits&&axis<3U)&&
+                    (commandDelta < -limit || commandDelta > upper || actualDelta < -limit || actualDelta > upper)) ||
                     (frame.visibleZFlushActive158 && (!m_feedback.config.visibleZFlush158 || !mappedProfile)) ||
-                    (!frame.visibleZFlushActive158 && frame.mappedFlushProfile != 0U))
+                    (!frame.visibleZFlushActive158 && frame.mappedFlushProfile != 0U&&!tangentMapped))
                 { inEnvelope = false; Fault(Reason::Excursion, axis); }
                 if (HandoffZero()) continue; // A temporary zero bridge earns no movement evidence.
                 AxisEvidence& e = m_feedback.axis[axis];
@@ -971,6 +1099,9 @@ namespace EDM94
                 if (a.commandPulse > e.commandMaxPulse) e.commandMaxPulse = a.commandPulse;
                 if (e.actualMaxPulse - e.actualMinPulse >= 1.0) m_feedback.actualMovedMask |= 1U << axis;
                 if (e.commandMaxPulse - e.commandMinPulse >= 1.0) m_feedback.commandMovedMask |= 1U << axis;
+            }
+            if(tangentProfile&&!m_feedback.forceZero&&frame.mappedFlushProfile==0U&&ordinaryEnvelope) {
+                m_tangent=TangentEnvelope{};m_haveTangent=false;
             }
             if (!allCurrent) { ResetStopEvidence(); (void)BeginOutput(frame.tick); return false; }
             if (!m_feedback.forceZero && !allHealthy) Fault(Reason::Source);
@@ -1202,7 +1333,9 @@ namespace EDM94
                 const AxisConfig& config = m_feedback.config.axis[axis];
                 const double limit = NativeExcursionLimit(axis) * config.pulsePerUnit;
                 if (!std::isfinite(target[axis]) || !std::isfinite(limit) ||
-                    std::abs(target[axis] - config.commandAnchor) > limit) return false;
+                    std::abs(target[axis] - config.commandAnchor) > limit ||
+                    (IsNominalMovementProfile(m_feedback.config.commissioningProfile)&&m_feedback.requiredMovementMask==3U&&
+                        axis==2U&&target[axis]!=config.commandAnchor)) return false;
             }
             m_feedback.finishTargetPulse = target;
             m_feedback.finishTargetBound = true;
@@ -1353,8 +1486,8 @@ namespace EDM94
         }
         static bool ValidConfig(const Config& config) noexcept
         {
-            if (config.commissioningProfile > 4U ||
-                config.visibleZFlush158 != (config.commissioningProfile != 0U) ||
+            if (config.commissioningProfile > 8U ||
+                config.visibleZFlush158 != ((config.commissioningProfile >= 1U && config.commissioningProfile <= 4U) || config.commissioningProfile == 6U || config.commissioningProfile == 7U) ||
                 config.maxDurationUs == 0ULL ||
                 (config.visibleZFlush158 ? config.maxDurationUs != VisibleFlushDurationUs(config.commissioningProfile) :
                     config.maxDurationUs > MaximumDurationUs) ||
@@ -1524,6 +1657,8 @@ namespace EDM94
         RuntimeDiagnostic m_runtimeDiagnostic{};
         Feedback m_feedback{};
         Frame m_lastFrame{};
+        TangentEnvelope m_tangent{};
+        bool m_haveTangent=false;
         Identity m_sealedIdentity{};
         std::int32_t m_sealedCsv[AxisCount]{};
         double m_stableMin[AxisCount]{};

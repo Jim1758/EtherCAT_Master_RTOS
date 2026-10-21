@@ -26,7 +26,7 @@ inline bool IsSparseArcTestArm(unsigned arm) noexcept
 inline bool IsSparseArcTestFinish(unsigned finish) noexcept
 { return finish == 267U || finish == 269U || finish == 271U; }
 inline bool IsG76GapTestArm(unsigned arm) noexcept
-{ return arm == 292U; }
+{ return arm == 292U || arm == 294U || arm == 296U || arm == 298U || arm == 300U; }
 inline bool IsManualVoltageTestArm(unsigned arm) noexcept
 { return arm == 290U; }
 inline bool IsProgramTestArm(unsigned arm) noexcept

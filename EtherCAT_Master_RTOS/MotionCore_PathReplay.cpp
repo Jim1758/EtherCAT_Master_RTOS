@@ -1,6 +1,7 @@
 #include "MotionCore.h"
 #include "MotionRetainedInterval.h"
 #include "NCTranslationArcPrecision.h"
+#include "NCG76DiagnosticPrint.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -685,9 +686,102 @@ bool MotionCore::TryG76MixedMoveTransactionalTail(const NCG76Mixed::Plan& plan,
     result.valid=result.tailCommitted=true; PublishQueueTailTransactionReceipt(receipt,false); return true;
 }
 
+// EDM183 FIX2: NC-thread rejection diagnostics only. These observations never
+// change admission, precision, coordinates or the producer/RT authority path.
+// Keep this out of the cyclic consumer and preserve caller scratch on failure.
+namespace
+{
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void PrintEDM183NominalInputFailure(const EDM173::Plan& plan,
+        const NCG76Mixed::Point8& initial,const NCG76Mixed::Point8& ppu,
+        const NCG76Mixed::Point8* stationaryRotaryModulo,bool built,unsigned count) noexcept
+    {
+        const bool planValid=EDM173::Valid(plan);
+        unsigned mask=0U;
+        for(unsigned a=0U;a<8U;++a)
+            if(plan.nominal.translation.axisIdentity.exists[a])mask|=1U<<a;
+        const char* cause=planValid?nullptr:"PLAN_VALID";
+        const auto unit=[&](unsigned axis,double pulse,double mcs) noexcept {
+            return stationaryRotaryModulo && axis>=3U && axis<6U?
+                EDM173::StationaryRotaryUnit(pulse,mcs,ppu[axis],(*stationaryRotaryModulo)[axis]):
+                NCG76Mixed::Detail::Unit(pulse,mcs,ppu[axis]);
+        };
+        if(!cause && stationaryRotaryModulo && !EDM173::ValidStationaryRotaryModulo(*stationaryRotaryModulo))
+            cause="ROTARY_MODULO";
+        int failedAxis=-1,failedChild=-1;
+        NCG76Mixed::Geometry previous{},row{};
+        NCG76Mixed::Point8 previousPulse=initial;
+        if(!cause && !NCG76Mixed::Detail::Calibration(mask,ppu))
+        {
+            cause="CALIBRATION";
+            for(unsigned a=0U;a<8U;++a)
+                if(!std::isfinite(ppu[a]) || ((mask&(1U<<a))!=0U?ppu[a]<=0.0:ppu[a]!=0.0))
+                {failedAxis=static_cast<int>(a);break;}
+        }
+        if(!cause)
+            for(unsigned a=0U;a<8U;++a)
+                if(!std::isfinite(initial[a]) || ((mask&(1U<<a))!=0U &&
+                    !unit(a,initial[a],plan.nominal.startMCS[a])))
+                {cause="INITIAL_UNIT";failedAxis=static_cast<int>(a);break;}
+        if(!cause)
+            for(unsigned k=0U;k<EDM173::NominalCount;++k)
+            {
+                if(!NCG76Mixed::Detail::CanonicalOrbitRow(plan.nominal,k,initial,ppu,previousPulse,row))
+                    cause="CANONICAL_ROW";
+                else if(!EDM173::StationaryAuxiliaryRowValid(row,plan.nominal.startMCS,initial))
+                {
+                    for(unsigned a=3U;a<8U;++a)
+                        if(std::memcmp(&row.startMCS[a],&plan.nominal.startMCS[a],sizeof(double))!=0 ||
+                            std::memcmp(&row.endMCS[a],&plan.nominal.startMCS[a],sizeof(double))!=0 ||
+                            std::memcmp(&row.startPulse[a],&initial[a],sizeof(double))!=0 ||
+                            std::memcmp(&row.endPulse[a],&initial[a],sizeof(double))!=0)
+                        {cause="STATIONARY_AXIS";failedAxis=static_cast<int>(a);break;}
+                }
+                else if(!NCG76Mixed::Detail::GeometryValid(row,stationaryRotaryModulo?7U:mask,ppu))
+                {
+                    cause="GEOMETRY_VALID";
+                    for(unsigned a=0U;a<8U;++a)
+                        if((mask&(1U<<a))!=0U &&
+                            (!unit(a,row.startPulse[a],row.startMCS[a]) ||
+                                !unit(a,row.endPulse[a],row.endMCS[a])))
+                        {failedAxis=static_cast<int>(a);break;}
+                }
+                if(!cause && k && !AreNCPathCoreRetainedEndpointsConnected(previous,row,mask,ppu))
+                    cause="CONTINUITY";
+                if(cause){failedChild=static_cast<int>(k);break;}
+                previousPulse=row.endPulse;previous=row;
+            }
+        if(!cause)cause=built?"COUNT":"REBUILD_NOT_REPRODUCED";
+        PrintNCG76DiagnosticLine("[EDM183_FIX2] event=PLAN_INPUT_REJECT stage=NOMINAL_REBUILD cause=%s child=%d axis=%d mask=%x rowMask=%x lengthMM=%.17g lengthPulse=%.17g built=%u count=%u planValid=%u session=%llu pc=%d discharge=0\n",
+            cause,failedChild,failedAxis,mask,row.axisMask,row.lengthMM,row.lengthPulse,built?1U:0U,count,planValid?1U:0U,
+            static_cast<unsigned long long>(plan.scope.session),plan.scope.sourcePC);
+        for(unsigned a=0U;a<6U;++a)
+        {
+            const double converted=std::isfinite(ppu[a])&&ppu[a]>0.0?initial[a]/ppu[a]:
+                (std::numeric_limits<double>::quiet_NaN)();
+            const double mcs=plan.nominal.startMCS[a];
+            const double scale=(std::max)(1.0,(std::max)(std::fabs(mcs),std::fabs(converted)));
+            if(failedChild<0)
+                PrintNCG76DiagnosticLine("[EDM183_FIX2] event=PLAN_INPUT_AXIS axis=%u exists=%u pulse=%.17g mcs=%.17g ppu=%.17g converted=%.17g error=%.17g epsilonLimit=%.17g absoluteLimit=1e-7 modulo=%.17g unit=%u discharge=0\n",
+                    a,(mask&(1U<<a))!=0U?1U:0U,initial[a],mcs,ppu[a],converted,
+                    std::fabs(converted-mcs),64.0*std::numeric_limits<double>::epsilon()*scale,
+                    stationaryRotaryModulo?(*stationaryRotaryModulo)[a]:0.0,unit(a,initial[a],mcs)?1U:0U);
+            else
+                PrintNCG76DiagnosticLine("[EDM183_FIX2] event=PLAN_INPUT_AXIS child=%d axis=%u pulse=%.17g mcs=%.17g ppu=%.17g startMCS=%.17g endMCS=%.17g startPulse=%.17g endPulse=%.17g previousEndMCS=%.17g previousEndPulse=%.17g discharge=0\n",
+                    failedChild,a,initial[a],mcs,ppu[a],row.startMCS[a],row.endMCS[a],
+                    row.startPulse[a],row.endPulse[a],previous.endMCS[a],previous.endPulse[a]);
+        }
+    }
+}
+
 // EDM173 explicit sealed common-GAP admission. Ordinary AIR171 stays above.
 bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
-    double* commandedMCSTail,MotionG76OrbitReceipt& result)
+    double* commandedMCSTail,MotionG76OrbitReceipt& result,
+    const NCG76Mixed::Point8* stationaryRotaryModulo)
 {
     result.Clear();
     auto& receipt=result.tail;
@@ -711,17 +805,32 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
         receipt.accountingValid=receipt.preservedOnReject;
         PublishQueueTailTransactionReceipt(receipt,invalid); return false;
     };
-    if (!EDM173::Valid(plan) || !m_edm173 || !m_g76OrbitProducer || !m_pContexts || !m_pCoordMgr ||
+    const bool planValid=EDM173::Valid(plan);
+    if (!planValid || !m_edm173 || !m_g76OrbitProducer || !m_pContexts || !m_pCoordMgr ||
         !commandedMCSTail || m_pContexts->size()!=6U ||
         !std::isfinite(rapidOverride) || rapidOverride<0.0)
+    {
+        const bool contexts=m_edm173 && m_g76OrbitProducer && m_pContexts && m_pCoordMgr &&
+            commandedMCSTail && m_pContexts->size()==6U;
+        const char* cause=!planValid?"PLAN_VALID":!contexts?"CONTEXT":"OVERRIDE";
+        PrintNCG76DiagnosticLine("[EDM183_FIX2] event=PLAN_INPUT_REJECT stage=ENTRY cause=%s planValid=%u edm173=%u workspace=%u axes=%u coord=%u tail=%u axisCount=%u override=%.17g session=%llu pc=%d discharge=0\n",
+            cause,planValid?1U:0U,m_edm173?1U:0U,m_g76OrbitProducer?1U:0U,m_pContexts?1U:0U,
+            m_pCoordMgr?1U:0U,commandedMCSTail?1U:0U,m_pContexts?static_cast<unsigned>(m_pContexts->size()):0U,
+            rapidOverride,static_cast<unsigned long long>(plan.scope.session),plan.scope.sourcePC);
         return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::PLAN_INPUT);
+    }
+    if(stationaryRotaryModulo && !EDM173::ValidStationaryRotaryModulo(*stationaryRotaryModulo))
+        return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_MAPPING);
     const auto& native=plan.nominal;
     EDM94::Feedback guard{};EDM126::MotionFeedback common{};EDM128::MotionFeedback mode{};
     if(!ReadEDM94Feedback(guard) || !ReadEDM126Feedback(common) || !ReadEDM128Feedback(mode) ||
         !guard.active || !guard.armedReady || guard.forceZero || guard.faulted || guard.cancelled || guard.handoffZero ||
         guard.boundaryReadyCycles<EDM94::BoundaryReadyCycles || guard.boundaryNotReadyMask ||
         guard.currentIdentity.session!=plan.scope.session || guard.currentIdentity.epoch!=epoch ||
-        guard.currentIdentity.ownerGeneration!=owner.generation || guard.config.commissioningProfile!=4U ||
+        guard.currentIdentity.ownerGeneration!=owner.generation || guard.config.commissioningProfile!=plan.recipe.commissioningProfile ||
+        guard.config.visibleZFlush158!=(!EDM173::IsB2Recipe(plan.recipe)&&!EDM173::IsB0Recipe(plan.recipe)) ||
+        (EDM173::UsesNominalMovementMask(plan.recipe)&&(!guard.boundedProgram||
+            guard.requiredMovementMask!=EDM130::ProgramMovementMask(plan.recipe))) ||
         !common.enabled || !common.active || common.faulted || !common.sourceReady || common.fixture!=14U ||
         common.session!=plan.scope.session || common.armEpoch!=epoch || common.liveEpoch!=epoch ||
         common.authorizedRows || common.completedRows || common.rowActive || !mode.enabled ||
@@ -732,7 +841,7 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
         m_pendingSourcePC<0 || plan.scope.sourcePC!=m_pendingSourcePC || plan.scope.armEpoch!=epoch ||
         plan.scope.run!=native.translation.runToken || plan.scope.session!=guard.identity.session)
         return reject(false,true,MotionRejectReason::OWNER_CONFLICT,MotionG76AdmissionGate::OWNER_SCOPE);
-    if (!IsPendingFixedTranslationSourceAllowed() || !NCG76Mixed::FrameSupported(m_pendingTranslation) ||
+    if (!IsPendingFixedTranslationSourceAllowed() || !EDM173::FrameSupported(m_pendingTranslation) ||
         !SameNCTranslationSnapshot(native.translation,m_pendingTranslation) ||
         native.translationGeneration!=m_pendingTranslation.generation ||
         !MatchesNCTranslation(m_pendingTranslation) || m_pendingPlaneMode!=17 || m_pendingToolRadMode!=40 ||
@@ -761,6 +870,12 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
         if (axis.axisIndex!=static_cast<int>(a) || (a<3U && axis.axisType!=AxisType::LINEAR) ||
             !std::isfinite(axis.resolution_PPR) || axis.resolution_PPR<=0.0 || !std::isfinite(axis.finalLead) || axis.finalLead<=0.0)
             return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_MAPPING,static_cast<int>(a));
+        if(stationaryRotaryModulo && a>=3U) {
+            if(axis.axisType!=AxisType::ROTARY || !std::isfinite(axis.rotaryModulo) || axis.rotaryModulo<=0.0)
+                return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_MAPPING,static_cast<int>(a));
+            if(std::memcmp(&axis.rotaryModulo,&(*stationaryRotaryModulo)[a],sizeof(double))!=0)
+                return reject(false,true,MotionRejectReason::NOT_READY,MotionG76AdmissionGate::SOURCE_FRAME,static_cast<int>(a));
+        }
         const double pulse=axis.logicalCmdPos.Load(),ppu=axis.resolution_PPR/axis.finalLead;
         if (!std::isfinite(pulse) || !std::isfinite(ppu) || ppu<=0.0 ||
             ppu!=guard.config.axis[a].pulsePerUnit)
@@ -779,18 +894,40 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
     if (enabled!=63U || m_pContexts->size()!=6U)
         return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_MAPPING);
     result.startPulse=work.startPulse; result.validAxisMask=enabled; receipt.axisMask=enabled;
-    if(!EDM173::BuildNominal(plan,work.startPulse,result.pulsePerUnit,work.rebuiltNominal) ||
-        work.rebuiltNominal.count!=25U)return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::PLAN_INPUT);
+    const bool nominalBuilt=EDM173::BuildNominal(plan,work.startPulse,result.pulsePerUnit,work.rebuiltNominal,stationaryRotaryModulo);
+    if(!nominalBuilt || work.rebuiltNominal.count!=25U)
+    {
+        PrintEDM183NominalInputFailure(plan,work.startPulse,result.pulsePerUnit,stationaryRotaryModulo,nominalBuilt,work.rebuiltNominal.count);
+        return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::PLAN_INPUT);
+    }
     unsigned movedMask=0U;
     for (unsigned k=0U;k<native.count;++k) {
         NCG76Mixed::Leg leg{};leg.geometry=work.rebuiltNominal.geometry[k];leg.startU=0.0;leg.endU=1.0;leg.feedPhysicalMmMin=0.12;
         const auto& g=leg.geometry;
+        NCG76::Point8 centerMCS{};
+        if(EDM173::IsCenterRecipe(plan.recipe) && !EDM173::CenterBoundary(plan,k+1U,centerMCS))
+            return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_CONVERSION,-1,static_cast<int>(k));
         const bool arc=g.kind==NCPathCoreRetainedKind::ARC,reverse=leg.endU<leg.startU;
         double intervalPulse=0.0,intervalMM=0.0;
         if (!IsNCPathCoreRetainedGeometryValid(g) || g.point || g.kind==NCPathCoreRetainedKind::LINE_ARC ||
             !IsMotionRetainedIntervalBoundsValid(leg.startU,leg.endU,g.lengthPulse,intervalPulse) ||
             !IsMotionRetainedIntervalBoundsValid(leg.startU,leg.endU,g.lengthMM,intervalMM))
             return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_CONVERSION,-1,static_cast<int>(k));
+        NCG76::Point8 tangentShift{};
+        if(EDM173::IsB0Recipe(plan.recipe)) {
+            // The nominal child already includes the compensation stack.
+            // Check its entire possible stopped-anchor interval after a
+            // native 2 mm negative chord-tangent translation, on every axis.
+            if(arc||g.kind!=NCPathCoreRetainedKind::LINE)return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_CONVERSION,-1,static_cast<int>(k));
+            double norm=0.0;
+            for(unsigned a=0U;a<6U;++a) {
+                tangentShift[a]=(g.endPulse[a]-g.startPulse[a])/g.lengthMM;
+                if(a<3U)norm=std::hypot(norm,tangentShift[a]/result.pulsePerUnit[a]);
+                else if(tangentShift[a]!=0.0)return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_CONVERSION,static_cast<int>(a),static_cast<int>(k));
+            }
+            if(!std::isfinite(norm)||norm<=0.0)return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_CONVERSION,-1,static_cast<int>(k));
+            for(unsigned a=0U;a<6U;++a)tangentShift[a]=-2.0*(tangentShift[a]/norm)/result.pulsePerUnit[a];
+        }
         double acc=0.0,dec=0.0;
         double velocity=(leg.feedPhysicalMmMin/60.0)*(g.lengthPulse/g.lengthMM);
         for (unsigned a=0U;a<8U;++a) {
@@ -810,7 +947,17 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
                 return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_CONVERSION,static_cast<int>(a),static_cast<int>(k));
             double low=(std::min)(g.startMCS[a],g.endMCS[a]),high=(std::max)(g.startMCS[a],g.endMCS[a]);
             if (arc && a<2U) { low=g.boundsMinMCS[a]; high=g.boundsMaxMCS[a]; }
-            if(a==2U && !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,high+2.0))
+            // B3/B4 reach center XY as well as the authored contour. Checking
+            // every center endpoint bounds the full interpolated center line.
+            if(EDM173::IsCenterRecipe(plan.recipe) && a<2U &&
+                !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,centerMCS[a]))
+                return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_ENDPOINT,static_cast<int>(a),static_cast<int>(k));
+            if(EDM173::IsB0Recipe(plan.recipe) &&
+                (!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,low+tangentShift[a])||
+                 !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,high+tangentShift[a])))
+                return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_ENDPOINT,static_cast<int>(a),static_cast<int>(k));
+            if(a==2U && !EDM173::IsB2Recipe(plan.recipe) && !EDM173::IsB0Recipe(plan.recipe) &&
+                !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,high+EDM173::FrozenHeightMm(plan.recipe)))
                 return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_ENDPOINT,2,static_cast<int>(k));
             if (!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,low) || !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,high) ||
                 !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,beginMCS) || !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,endMCS))

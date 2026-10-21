@@ -176,9 +176,9 @@ void NCManager::SyncEDMPLCOutputsSameThread() noexcept
 {
     // EDM173 is motion-only from arm through release, independently of the
     // AIR latch. Stop before the legacy per-row/epoch arrays are inspected.
-    if (m_g76PowerInhibited || m_edm94.gapHistoryArm == 292U)
+    if (m_g76PowerInhibited || EDM173::IsArm(m_edm94.gapHistoryArm))
     {
-        ForceEDMPLCOutputsOffSameThread(m_edm94.gapHistoryArm == 292U ?
+        ForceEDMPLCOutputsOffSameThread(EDM173::IsArm(m_edm94.gapHistoryArm) ?
             "EDM173_G76_GAP_INHIBITED" : "G76_AIR_RUN_INHIBITED");
         return;
     }

@@ -3094,11 +3094,11 @@ bool NCManager::IsG76OrbitBlockShapeValid(const NCBlock& block, bool allowMissin
 }
 
 NC_PATH_FEED_NOINLINE
-bool NCManager::IsG76OrbitFrameCurrentSameThread() const noexcept
+bool NCManager::IsG76OrbitFrameCurrentSameThread(bool allowFixedWorkTranslation, bool allowWorkXYRotation) const noexcept
 {
     if (!CoordSys.IsTranslationRunBound() || !CoordSys.IsTranslationRunCurrent()) return false;
     const NCTranslationSnapshot& source = CoordSys.GetTranslationSnapshot();
-    if (!NCG76::FrameSupported(source) || source.runToken == 0ULL ||
+    if (!NCG76::FrameSupported(source,allowFixedWorkTranslation,allowWorkXYRotation) || source.runToken == 0ULL ||
         source.runToken != m_pathCoreLiveBookkeeping.currentRunToken ||
         source.distanceMode != (CoordSys.isAbsoluteMode ? 90 : 91) ||
         source.unitsMode != (CoordSys.isInchMode ? 20 : 21) || CoordSys.activePlane != 17 ||
@@ -3116,7 +3116,7 @@ bool NCManager::IsG76OrbitFrameCurrentSameThread() const noexcept
 NC_PATH_FEED_NOINLINE
 bool NCManager::IsG76OrbitBlockAllowedSameThread(const NCBlock& block) noexcept
 {
-    if (m_edm94.latched && m_edm94.gapHistoryArm==292U) return IsEDM173OrbitAllowedSameThread(block);
+    if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm)) return IsEDM173OrbitAllowedSameThread(block);
     bool valid = IsG76OrbitBlockShapeValid(block,true,CoordSys.isInchMode ? 20 : 21) &&
         IsG76OrbitFrameCurrentSameThread() && IsPathCoreLiveNativeConfigCurrentSameThread() &&
         m_state == NCState::RUN && m_mode == NCOperationMode::MEMORY && !Close_System_Com_flag &&
@@ -3144,7 +3144,7 @@ bool NCManager::IsG76OrbitBlockAllowedSameThread(const NCBlock& block) noexcept
 NC_PATH_FEED_NOINLINE
 bool NCManager::PrepareG76OrbitTranslationSameThread(const NCBlock& block)
 {
-    if (m_edm94.latched && m_edm94.gapHistoryArm==292U)
+    if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm))
         return IsEDM173OrbitAllowedSameThread(block) && FreezeEDM173TranslationSameThread();
     if (block.gCode==76 ? !IsG76OrbitBlockAllowedSameThread(block) :
         (!m_edm171Air->selected || !IsEDM171AirGrantCurrentSameThread() || !IsG76OrbitFrameCurrentSameThread() ||
@@ -3182,7 +3182,7 @@ WaitConditionFunc NCManager::StartG76OrbitSameThread(const NCBlock& block)
     // FIX16: one admission-side version line; never emitted by the PDO loop.
     RtPrintf("%s", "[EDM173_FIX16] event=G76_BUILD component=NCManager_PathFeed revision=FIX16 includes=FIX14_LIFECYCLE_DETAIL phase=G76_ENTRY discharge=0\n");
     PrintNCG76StartCheckpoint("G76_START_ENTRY", GetActiveDispatchPC());
-    if (m_edm94.latched && m_edm94.gapHistoryArm==292U) return StartEDM173OrbitSameThread(block);
+    if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm)) return StartEDM173OrbitSameThread(block);
     if (!IsG76OrbitBlockAllowedSameThread(block)) return nullptr;
     const auto& confirm=m_g76Confirmation;
     const int pc=GetActiveDispatchPC();
@@ -3383,7 +3383,7 @@ void NCManager::CommitG76OrbitCaptureSameThread(NCBlockDispatchId dispatch,const
         return;
     }
     s.commit=commit.sequence; s.bound=true;
-    if (m_edm94.gapHistoryArm==292U && m_edm94.latched)
+    if (EDM173::IsArm(m_edm94.gapHistoryArm) && m_edm94.latched)
     {
         m_edm173->parentCommitted=true;
         RtPrintf("[EDM173] event=PARENT_BOUND session=%llu dispatch=%llu commit=%llu children=%u discharge=0 bindDiag=1\n",
@@ -3453,7 +3453,7 @@ void NCManager::ObserveG76OrbitFeedbackSameThread(const MotionFeedbackEvent& eve
             return;
         }
         s.lastFeedback[k]=event.sequence;
-        if (event.type==MotionFeedbackType::COMPLETED && m_edm94.gapHistoryArm!=292U)
+        if (event.type==MotionFeedbackType::COMPLETED && !EDM173::IsArm(m_edm94.gapHistoryArm))
         {
             auto& a=*m_edm171Air;
             if (s.mixed)
@@ -3481,10 +3481,12 @@ bool NCManager::CompleteG76OrbitSameThread()
     auto& s=*m_g76Orbit;
     if (!s.active) return s.completed;
     if (IsFeedHoldActive() || m_state==NCState::HOLD) return false;
+    const bool allowEDM173WorkFrame=m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm) && !s.mixed;
     if (!s.bound || s.receipt.count==0U || s.receipt.count>128U || m_state!=NCState::RUN || m_mode!=NCOperationMode::MEMORY || Close_System_Com_flag ||
         AlarmManager::GetInstance().HasAlarm() || s.run!=m_pathCoreLiveBookkeeping.currentRunToken ||
         s.cache!=GetBaseProgramCache().GetGeneration() || !s.receipt.ownerLease.Matches(m_programMotionLease) ||
-        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) || !IsG76OrbitFrameCurrentSameThread() ||
+        !m_motion.IsMotionOwnerLeaseCurrent(m_programMotionLease) ||
+        !IsG76OrbitFrameCurrentSameThread(allowEDM173WorkFrame,allowEDM173WorkFrame) ||
         !IsPathCoreLiveNativeConfigCurrentSameThread() || !m_motion.MatchesNCTranslation(s.mixed ? m_edm171Air->plan.input.translation : s.native.translation) ||
         s.receipt.identities[0U].epoch!=m_motion.GetCurrentExecutionEpoch() ||
         m_motion.GetMotionFeedbackOverflowCount()!=0ULL || m_motion.GetMotionFeedbackProducerNoticeOverflowCount()!=0ULL ||
@@ -3510,10 +3512,10 @@ bool NCManager::CompleteG76OrbitSameThread()
     for (unsigned a=0U;a<8U;++a)
         if (FeedDoubleBits(CoordSys.commandedMCS[a])!=FeedDoubleBits(s.receipt.endMCS[a]))
         { RejectG76OrbitSameThread("FINAL_ACCEPTED_TAIL",AlarmManager::MOTION_GROUP_MAPPING_INTEGRITY); return false; }
-    if (m_edm94.gapHistoryArm==292U && !IsEDM173RuntimeCompleteSameThread()) return false;
+    if (EDM173::IsArm(m_edm94.gapHistoryArm) && !IsEDM173RuntimeCompleteSameThread()) return false;
     ServiceG76OrbitSameThread();
     s.active=false; s.completed=true;
-    if (m_edm94.gapHistoryArm==292U)
+    if (EDM173::IsArm(m_edm94.gapHistoryArm))
     {
         RtPrintf("[EDM173] event=PARENT_COMPLETE dispatch=%llu commit=%llu completed=25 children=25 E5completed=1 evidence=ALL_CHILDREN_GROUP_DRAIN_AND_SHARED_E5 discharge=0\n",
             static_cast<unsigned long long>(s.dispatch),static_cast<unsigned long long>(s.commit));
@@ -3533,7 +3535,7 @@ void NCManager::ServiceG76OrbitSameThread()
         ForceEDMPLCOutputsOffSameThread("G76_AIR_RUN_LATCH");
         if (!m_g76Orbit->active && m_motion.GetMotionOwnerLease().owner==MotionOwner::NONE &&
             m_motion.IsGroupNCDrained() && m_motion.IsGroupDone() && !m_motion.HasPendingSafetyOrRecoveryRequests() &&
-            !(m_edm94.latched && m_edm94.gapHistoryArm==292U) &&
+            !(m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm)) &&
             m_resetContinuationPhase==ResetContinuationPhase::IDLE) m_g76PowerInhibited=false;
     }
     auto& s=*m_g76Orbit;
@@ -3553,7 +3555,7 @@ void NCManager::ServiceG76OrbitSameThread()
                 leg.originalSourceIndex,leg.nominalOrdinal,leg.startU,leg.endU);
             ++s.loggedChildren; continue;
         }
-        if (m_edm94.gapHistoryArm==292U)
+        if (EDM173::IsArm(m_edm94.gapHistoryArm))
         {
             RtPrintf("[EDM173] event=CHILD_COMPLETED dispatch=%llu child=%u children=25 evidence=IDENTITY_MATCHED_LEDGER discharge=0\n",
                 static_cast<unsigned long long>(s.dispatch),k+1U);
@@ -3573,7 +3575,7 @@ void NCManager::ServiceG76OrbitSameThread()
 NC_PATH_FEED_NOINLINE
 void NCManager::RejectG76OrbitSameThread(const char* reason,int alarm)
 {
-    if (m_edm94.latched && m_edm94.gapHistoryArm==292U) CancelEDM94SameThread(reason);
+    if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm)) CancelEDM94SameThread(reason);
     const bool accepted=m_g76Orbit->receipt.commandAccepted;
     const int line=m_g76Orbit->line;
     RtPrintf("[EDM170] event=REJECT reason=%s pc=%d accepted=%u discharge=0\n",reason,GetActiveDispatchPC(),accepted?1U:0U);

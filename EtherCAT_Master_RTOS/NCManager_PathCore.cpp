@@ -3580,6 +3580,32 @@ bool NCManager::IsFixedTranslationBlockAllowedSameThread(const NCBlock& block)
         RejectG76OrbitSameThread("NEXT_BLOCK_BEFORE_CYCLE_COMPLETION",AlarmManager::PATH_EXECUTION_NOT_READY);
         return false;
     }
+    // WCS selection belongs to stopped prearm setup. A frozen coordinate
+    // handoff runs before ExecuteBlock, so fence even an idle EDM173 arm here
+    // before its selected frame can change ahead of the authored-source guard.
+    if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm))
+    {
+        bool workCoordinateSelection = block.hasG && IsNCWorkCoordinateCode(block.gCode);
+        const int storedCount = block.gCount > 0 ?
+            (std::min)(block.gCount, NC_MAX_G_CODES_PER_BLOCK) : 0;
+        for (int i = 0; i < storedCount; ++i)
+            workCoordinateSelection = workCoordinateSelection || IsNCWorkCoordinateCode(block.gCodes[i]);
+        if (workCoordinateSelection)
+        {
+            RejectG76OrbitSameThread("EDM173_WCS_AFTER_ARM",AlarmManager::PATH_EXECUTION_NOT_READY);
+            return false;
+        }
+    }
+    // EDM184: the completed EDM173 bracket retains its frozen work rotation
+    // through M30. Its exact terminal source/stop/owner proof is independent
+    // of the generic XYZ feed frame; this grants no new motion authority.
+    if (m_edm94.latched && EDM173::IsArm(m_edm94.gapHistoryArm) &&
+        block.mCount == 1 && block.mCode[0] == 30)
+    {
+        if (IsEDM173TerminalBlockAllowedSameThread(block)) return true;
+        RejectG76OrbitSameThread("EDM173_TERMINAL_SCOPE",AlarmManager::PATH_EXECUTION_NOT_READY);
+        return false;
+    }
     if (m_g76PowerInhibited && NCGCodeSemantics::Contains(block,180)
         && !IsEDM173BracketBlockSameThread(block))
     {

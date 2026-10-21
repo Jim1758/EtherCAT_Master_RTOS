@@ -12,7 +12,8 @@
 // CNC line producer; this header owns no motion, GAP, power or I/O authority.
 // G90 inputs are absolute program XYZ. G91 uses a zero program origin and
 // literal canonical XYZ displacements, preserving small moves at large origins.
-// The growth is a polygonal approximation in program G17 XY, not an exact arc.
+// Growth is a polygonal approximation. Legacy callers use program G17 XY;
+// the sealed targetAxis caller uses the plane normal to start -> XYZ target.
 #if defined(__FAST_MATH__) || defined(_M_FP_FAST)
 #error G76_orbit_requires_precise_floating_point_semantics
 #endif
@@ -35,6 +36,13 @@ constexpr double MaximumCenterTravelMm = 2.0;
 constexpr double MaximumFeedMmMin = 30.0;
 constexpr double MaximumFlushHeightMm = 2.0;
 
+// K rotates only the local orbit, before the frozen coordinate transform.
+// It is a literal angle in degrees; do not normalize an out-of-range request.
+inline bool ValidShapeAngle(double angleDeg) noexcept
+{
+    return std::isfinite(angleDeg) && angleDeg >= -180.0 && angleDeg <= 180.0;
+}
+
 struct PlanInput
 {
     Point3 start{}, end{};
@@ -43,6 +51,8 @@ struct PlanInput
     unsigned flushMode = 0U; // 0: none; 2: mixed retained proof required; 3/4: geometric DEMO.
     double heightMm = 0.0;  // Total height above sample-12 center, not an addition.
     double centerReturnFeedMmMin = 0.0; // Physical mm/min; zero inherits F.
+    double shapeAngleDeg = 0.0; // K: local orbit orientation; center path is unchanged.
+    bool targetAxis = false; // Internal sealed-lane opt-in; no additional NC word.
 };
 
 enum class Phase : std::uint8_t
@@ -123,7 +133,71 @@ inline bool SameInput(const PlanInput& a, const PlanInput& b) noexcept
     return SamePoint(a.start,b.start) && SamePoint(a.end,b.end) &&
         a.radiusMm == b.radiusMm && a.feedMmMin == b.feedMmMin &&
         a.flushMode == b.flushMode && a.heightMm == b.heightMm &&
-        a.centerReturnFeedMmMin == b.centerReturnFeedMmMin;
+        a.centerReturnFeedMmMin == b.centerReturnFeedMmMin &&
+        std::memcmp(&a.shapeAngleDeg,&b.shapeAngleDeg,sizeof(double)) == 0 &&
+        a.targetAxis == b.targetAxis;
+}
+inline Point3 RotateOrbit(const Point3& orbit, double angleDeg) noexcept
+{
+    // Preserve all original operations and signed-zero bits when K is zero.
+    if (angleDeg == 0.0) return orbit;
+    if (angleDeg == 90.0) return {{-orbit[1],orbit[0],0.0}};
+    if (angleDeg == -90.0) return {{orbit[1],-orbit[0],0.0}};
+    if (angleDeg == 180.0 || angleDeg == -180.0) return {{-orbit[0],-orbit[1],0.0}};
+    constexpr double pi = 3.141592653589793238462643383279502884;
+    const double radians = angleDeg*(pi/180.0);
+    const double cosine = std::cos(radians), sine = std::sin(radians);
+    return {{orbit[0]*cosine-orbit[1]*sine,orbit[0]*sine+orbit[1]*cosine,0.0}};
+}
+struct OrbitBasis
+{
+    Point3 u{{1.0,0.0,0.0}}, v{{0.0,1.0,0.0}};
+    bool programXY = true;
+};
+inline bool BuildOrbitBasis(const PlanInput& in, const Point3& delta, OrbitBasis& out) noexcept
+{
+    out = OrbitBasis{};
+    if (!in.targetAxis) return true;
+    // Normalize after scaling, so a finite nonzero direction does not need
+    // squared lengths that can overflow or underflow. Zero has no target axis.
+    if (!FinitePoint(delta)) return false;
+    const double largest = (std::max)(std::fabs(delta[0]),
+        (std::max)(std::fabs(delta[1]),std::fabs(delta[2])));
+    if (!(largest > 0.0)) return false;
+    Point3 n{{delta[0]/largest,delta[1]/largest,delta[2]/largest}};
+    const double length = std::hypot(std::hypot(n[0],n[1]),n[2]);
+    if (!Finite(length) || !(length > 0.0)) return false;
+    for (unsigned j = 0U; j < 3U; ++j) n[j] /= length;
+    // A plane is undirected: choose positive Z, then positive Y, then X.
+    // This convention preserves the old K/winding for both +Z and -Z travel.
+    // The hemisphere boundary is a deterministic per-block orientation seam;
+    // the signed center delta still advances from the start to the target.
+    const bool reverse = n[2] < 0.0 || (n[2] == 0.0 &&
+        (n[1] < 0.0 || (n[1] == 0.0 && n[0] < 0.0)));
+    for (unsigned j = 0U; j < 3U; ++j)
+    {
+        if (reverse) n[j] = -n[j];
+        if (n[j] == 0.0) n[j] = 0.0; // Canonicalize axis signed zero only.
+    }
+    if (delta[0] == 0.0 && delta[1] == 0.0) return true;
+    // Rotate the +Z frame to the canonical normal. Since n.z >= 0, the
+    // denominator is >= 1: no near-antipodal cancellation or special pole.
+    const double inverse = 1.0/(1.0+n[2]);
+    const double cross = n[0]*n[1]*inverse;
+    out.u = {{1.0-n[0]*n[0]*inverse,-cross,-n[0]}};
+    out.v = {{-cross,1.0-n[1]*n[1]*inverse,-n[1]}};
+    out.programXY = false;
+    return FinitePoint(out.u) && FinitePoint(out.v);
+}
+inline Point3 OrbitOffset(const Point3& orbit, double angleDeg, const OrbitBasis& basis) noexcept
+{
+    const Point3 local = RotateOrbit(orbit,angleDeg);
+    // Preserve every legacy operation and signed-zero bit for pure +/-Z.
+    if (basis.programXY) return local;
+    Point3 result{};
+    for (unsigned j = 0U; j < 3U; ++j)
+        result[j] = local[0]*basis.u[j]+local[1]*basis.v[j];
+    return result;
 }
 inline bool SameEndpoint(const Endpoint& a, const Endpoint& b) noexcept
 {
@@ -159,10 +233,11 @@ inline bool ValidInput(const PlanInput& in, Point3& delta, double& coordinateSca
     if (!FinitePoint(in.start) || !FinitePoint(in.end) ||
         !Finite(in.radiusMm) || !(in.radiusMm > 0.0) || in.radiusMm > MaximumRadiusMm ||
         !Finite(in.feedMmMin) || !(in.feedMmMin > 0.0) || in.feedMmMin > MaximumFeedMmMin ||
-        !Finite(in.heightMm) || !Finite(in.centerReturnFeedMmMin) ||
+        !Finite(in.heightMm) || !Finite(in.centerReturnFeedMmMin) || !ValidShapeAngle(in.shapeAngleDeg) ||
         in.centerReturnFeedMmMin < 0.0 || in.centerReturnFeedMmMin > MaximumFeedMmMin ||
         (in.flushMode != 0U && in.flushMode != 2U && in.flushMode != 3U && in.flushMode != 4U))
         return false;
+    if (in.targetAxis && in.flushMode != 0U) return false;
     if (in.flushMode == 0U || in.flushMode == 2U)
     {
         if (in.heightMm != 0.0 || in.centerReturnFeedMmMin != 0.0) return false;
@@ -178,13 +253,15 @@ inline bool ValidInput(const PlanInput& in, Point3& delta, double& coordinateSca
         travel = std::hypot(travel,delta[j]);
         // A conservative envelope of the continuous growing curve and all
         // DEMO legs must remain finite, even between the generated endpoints.
-        const double low = (std::min)(in.start[j],in.end[j]) - (j < 2U ? in.radiusMm : 0.0);
+        const double low = (std::min)(in.start[j],in.end[j]) -
+            (j < 2U || in.targetAxis ? in.radiusMm : 0.0);
         const double high = (std::max)(in.start[j],in.end[j]) +
-            (j < 2U ? in.radiusMm : in.heightMm);
+            (j < 2U || in.targetAxis ? in.radiusMm : in.heightMm);
         if (!Finite(low) || !Finite(high) || !Finite(high-low)) return false;
         coordinateScale = (std::max)(coordinateScale,(std::max)(std::fabs(low),std::fabs(high)));
     }
-    return Finite(travel) && travel <= MaximumCenterTravelMm;
+    return Finite(travel) && travel <= MaximumCenterTravelMm &&
+        (!in.targetAxis || travel > 0.0);
 }
 } // namespace Detail
 
@@ -198,6 +275,8 @@ inline bool Build(const PlanInput& in, ProgramPlan& out) noexcept
     Point3 delta{};
     double coordinateScale = 0.0;
     if (!Detail::ValidInput(frozen,delta,coordinateScale)) return false;
+    Detail::OrbitBasis basis{};
+    if (!Detail::BuildOrbitBasis(frozen,delta,basis)) return false;
     ProgramPlan p{};
     p.version = Version; p.modeP = ModeP11; p.input = frozen;
     p.boundsMin = frozen.start; p.boundsMax = frozen.start;
@@ -224,7 +303,7 @@ inline bool Build(const PlanInput& in, ProgramPlan& out) noexcept
             const double angle = (2.0*pi)*t;
             cosine = std::cos(angle); sine = std::sin(angle);
         }
-        e.orbit = {{e.radiusMm*cosine,e.radiusMm*sine,0.0}};
+        e.orbit = Detail::OrbitOffset({{e.radiusMm*cosine,e.radiusMm*sine,0.0}},frozen.shapeAngleDeg,basis);
         for (unsigned j = 0U; j < 3U; ++j) e.position[j] = e.center[j]+e.orbit[j];
         if (!Detail::Append(p,e,false)) return false;
         ++p.growCount;
@@ -263,6 +342,7 @@ inline bool Build(const PlanInput& in, ProgramPlan& out) noexcept
     if (!Detail::Append(p,finish,false)) return false;
     // For q(t)=C(t)+Rt(cos(2*pi*t),sin(2*pi*t),0), C''=0 and
     // |q''| <= R*((2*pi)^2+4*pi) < 53R (pi<22/7).
+    // The fixed orthonormal target-axis basis preserves this norm bound.
     // Linear interpolation on h=1/24 has error <= max|q''|*h*h/8.
     // The additional epsilon budget covers endpoint arithmetic at this frame
     // scale; this is not a servo tracking or transformed-machine error bound.
@@ -291,11 +371,23 @@ inline bool Valid(const ProgramPlan& p) noexcept
     return true;
 }
 
-inline bool FrameSupported(const NCTranslationSnapshot& s) noexcept
+inline bool FrameSupported(const NCTranslationSnapshot& s, bool allowFixedWorkTranslation = false,
+    bool allowWorkXYRotation = false) noexcept
 {
     if (!(IsNCTranslationSnapshotValid(s) && s.rotationPlane == 17 &&
-        s.cutterMode == 40 && s.polarMode == 15 && s.workMode == 169 &&
-        s.workWCode == 0 && s.axisIdentity.eccentricEnabled == 0U)) return false;
+        s.cutterMode == 40 && s.polarMode == 15 &&
+        s.axisIdentity.eccentricEnabled == 0U)) return false;
+    // EDM183/184 opt in only the bounded EDM173 lane. Generic AIR/mixed callers
+    // retain G169/W0, even when an active W row happens to contain all zeros.
+    // The earlier translation-only opt-in still rejects a nonzero work yaw.
+    if (s.workMode != 169 || s.workWCode != 0)
+    {
+        if (!allowFixedWorkTranslation || s.workMode != 168 ||
+            s.workWCode < 1 || s.workWCode > 100) return false;
+        if (!allowWorkXYRotation && s.workOffset[3U] != 0.0) return false;
+        for (unsigned field = 4U; field < 8U; ++field)
+            if (s.workOffset[field] != 0.0) return false;
+    }
     for (unsigned a = 0U; a < 3U; ++a)
         if (s.axisIdentity.exists[a] != 1U || s.axisIdentity.axisType[a] != 0U ||
             s.axisIdentity.nativeUnit[a] != 1U) return false;
@@ -305,14 +397,15 @@ inline bool FrameSupported(const NCTranslationSnapshot& s) noexcept
 // Geometry-only B2 staging. It grants no permission for direct G76 execution;
 // NCG76Mixed owns the required retained-path reverse/return proof.
 inline bool BuildNativeBase(const ProgramPlan& program, const NCTranslationSnapshot& translation,
-    const Point8& startMCS, NativePlan& out) noexcept
+    const Point8& startMCS, NativePlan& out, bool allowFixedWorkTranslation = false,
+    bool allowWorkXYRotation = false, bool preserveG90StationaryZ = false) noexcept
 {
     // Locals also permit safe rebuild from fields of out itself.
     const ProgramPlan frozenProgram = program;
     const NCTranslationSnapshot frozenTranslation = translation;
     const Point8 frozenStart = startMCS;
     out = NativePlan{};
-    if (!Valid(frozenProgram) || !FrameSupported(frozenTranslation) ||
+    if (!Valid(frozenProgram) || !FrameSupported(frozenTranslation,allowFixedWorkTranslation,allowWorkXYRotation) ||
         ((frozenProgram.input.flushMode == 3U || frozenProgram.input.flushMode == 4U) &&
             (frozenTranslation.mirrorMask & 4U) != 0U)) return false;
     for (unsigned a = 0U; a < 8U; ++a)
@@ -346,6 +439,13 @@ inline bool BuildNativeBase(const ProgramPlan& program, const NCTranslationSnaps
     p.startMCS = frozenStart; p.count = frozenProgram.count;
     p.translationGeneration = frozenTranslation.generation;
     const bool hasXYZ[8] = {true,true,true,false,false,false,false,false};
+    // Commissioning callers opt in by recipe. FrameSupported proves G17 and no work
+    // pitch/roll, so program Z is separable from XY. Use the entire authored
+    // center-line delta, never a rounded endpoint, to retain a real Z move.
+    // Target-axis cross-sections can move Z even with zero center-line Z.
+    const bool stationaryZ = preserveG90StationaryZ && frozenTranslation.distanceMode == 90 &&
+        !frozenProgram.input.targetAxis && frozenProgram.input.flushMode == 0U &&
+        frozenProgram.input.start[2] == frozenProgram.input.end[2];
     Point3 previous{{frozenStart[0],frozenStart[1],frozenStart[2]}};
     for (unsigned i = 0U; i < p.count; ++i)
     {
@@ -363,6 +463,11 @@ inline bool BuildNativeBase(const ProgramPlan& program, const NCTranslationSnaps
             for (unsigned a = 0U; a < 3U; ++a) author[a] = frozenProgram.points[i].position[a];
             NCTranslationForwardPoint(frozenTranslation,author,machine);
         }
+        // Validate the raw absolute result before anchoring; an invalid
+        // transform must never be hidden by preserving the stationary axis.
+        for (unsigned a = 0U; a < 3U; ++a)
+            if (!Detail::Finite(machine[a])) return false;
+        if (stationaryZ) machine[2] = frozenStart[2];
         for (unsigned a = 0U; a < 8U; ++a)
         {
             p.pointsMCS[i][a] = a < 3U ? machine[a] : frozenStart[a];
@@ -377,10 +482,11 @@ inline bool BuildNativeBase(const ProgramPlan& program, const NCTranslationSnaps
     return true;
 }
 
-inline bool ValidNativeBase(const NativePlan& p) noexcept
+inline bool ValidNativeBase(const NativePlan& p, bool allowFixedWorkTranslation = false,
+    bool allowWorkXYRotation = false, bool preserveG90StationaryZ = false) noexcept
 {
     NativePlan expected{};
-    if (!BuildNativeBase(p.program,p.translation,p.startMCS,expected) ||
+    if (!BuildNativeBase(p.program,p.translation,p.startMCS,expected,allowFixedWorkTranslation,allowWorkXYRotation,preserveG90StationaryZ) ||
         p.version != expected.version || p.modeP != expected.modeP || p.count != expected.count ||
         p.translationGeneration != expected.translationGeneration) return false;
     for (unsigned a = 0U; a < 8U; ++a)
@@ -395,15 +501,17 @@ inline bool ValidNativeBase(const NativePlan& p) noexcept
 }
 
 inline bool BuildNative(const ProgramPlan& program, const NCTranslationSnapshot& translation,
-    const Point8& startMCS, NativePlan& out) noexcept
+    const Point8& startMCS, NativePlan& out, bool allowFixedWorkTranslation = false,
+    bool allowWorkXYRotation = false, bool preserveG90StationaryZ = false) noexcept
 {
     if (program.input.flushMode == 2U) { out = NativePlan{}; return false; }
-    return BuildNativeBase(program,translation,startMCS,out);
+    return BuildNativeBase(program,translation,startMCS,out,allowFixedWorkTranslation,allowWorkXYRotation,preserveG90StationaryZ);
 }
 
-inline bool ValidNative(const NativePlan& p) noexcept
+inline bool ValidNative(const NativePlan& p, bool allowFixedWorkTranslation = false,
+    bool allowWorkXYRotation = false, bool preserveG90StationaryZ = false) noexcept
 {
-    return p.program.input.flushMode != 2U && ValidNativeBase(p);
+    return p.program.input.flushMode != 2U && ValidNativeBase(p,allowFixedWorkTranslation,allowWorkXYRotation,preserveG90StationaryZ);
 }
 
 
@@ -444,6 +552,8 @@ inline bool BuildValidationProgram(const PlanInput& in, ProgramPlan& out) noexce
     Point3 delta{};
     double coordinateScale = 0.0;
     if (!Detail::ValidInput(frozen,delta,coordinateScale)) return ClearValidationProgramFalse(out);
+    Detail::OrbitBasis basis{};
+    if (!Detail::BuildOrbitBasis(frozen,delta,basis)) return ClearValidationProgramFalse(out);
     ProgramPlan& p = out;
     p.version = Version; p.modeP = ModeP11; p.input = frozen;
     p.boundsMin = frozen.start; p.boundsMax = frozen.start;
@@ -470,7 +580,7 @@ inline bool BuildValidationProgram(const PlanInput& in, ProgramPlan& out) noexce
             const double angle = (2.0*pi)*t;
             cosine = std::cos(angle); sine = std::sin(angle);
         }
-        e.orbit = {{e.radiusMm*cosine,e.radiusMm*sine,0.0}};
+        e.orbit = OrbitOffset({{e.radiusMm*cosine,e.radiusMm*sine,0.0}},frozen.shapeAngleDeg,basis);
         for (unsigned j = 0U; j < 3U; ++j) e.position[j] = e.center[j]+e.orbit[j];
         if (!Detail::Append(p,e,false)) return ClearValidationProgramFalse(out);
         ++p.growCount;
@@ -509,6 +619,7 @@ inline bool BuildValidationProgram(const PlanInput& in, ProgramPlan& out) noexce
     if (!Detail::Append(p,finish,false)) return ClearValidationProgramFalse(out);
     // For q(t)=C(t)+Rt(cos(2*pi*t),sin(2*pi*t),0), C''=0 and
     // |q''| <= R*((2*pi)^2+4*pi) < 53R (pi<22/7).
+    // The fixed orthonormal target-axis basis preserves this norm bound.
     // Linear interpolation on h=1/24 has error <= max|q''|*h*h/8.
     // The additional epsilon budget covers endpoint arithmetic at this frame
     // scale; this is not a servo tracking or transformed-machine error bound.
@@ -534,7 +645,8 @@ inline bool ValidateProgramWithStorage(const ProgramPlan& p,ProgramPlan& expecte
 }
 
 inline bool BuildValidationNative(const ProgramPlan& program, const NCTranslationSnapshot& translation,
-    const Point8& startMCS, NativePlan& out) noexcept
+    const Point8& startMCS, NativePlan& out, bool allowFixedWorkTranslation = false,
+    bool allowWorkXYRotation = false, bool preserveG90StationaryZ = false) noexcept
 {
     // Private validation builder: caller has rejected overlap and fully
     // validated program. Every native endpoint is regenerated independently.
@@ -542,7 +654,7 @@ inline bool BuildValidationNative(const ProgramPlan& program, const NCTranslatio
     const NCTranslationSnapshot& frozenTranslation = translation;
     const Point8& frozenStart = startMCS;
     ClearValidationNative(out);
-    if (!FrameSupported(frozenTranslation) ||
+    if (!FrameSupported(frozenTranslation,allowFixedWorkTranslation,allowWorkXYRotation) ||
         ((frozenProgram.input.flushMode == 3U || frozenProgram.input.flushMode == 4U) &&
             (frozenTranslation.mirrorMask & 4U) != 0U)) return ClearValidationNativeFalse(out);
     for (unsigned a = 0U; a < 8U; ++a)
@@ -576,6 +688,13 @@ inline bool BuildValidationNative(const ProgramPlan& program, const NCTranslatio
     p.startMCS = frozenStart; p.count = frozenProgram.count;
     p.translationGeneration = frozenTranslation.generation;
     const bool hasXYZ[8] = {true,true,true,false,false,false,false,false};
+    // Commissioning callers opt in by recipe. FrameSupported proves G17 and no work
+    // pitch/roll, so program Z is separable from XY. Use the entire authored
+    // center-line delta, never a rounded endpoint, to retain a real Z move.
+    // Target-axis cross-sections can move Z even with zero center-line Z.
+    const bool stationaryZ = preserveG90StationaryZ && frozenTranslation.distanceMode == 90 &&
+        !frozenProgram.input.targetAxis && frozenProgram.input.flushMode == 0U &&
+        frozenProgram.input.start[2] == frozenProgram.input.end[2];
     Point3 previous{{frozenStart[0],frozenStart[1],frozenStart[2]}};
     for (unsigned i = 0U; i < p.count; ++i)
     {
@@ -593,6 +712,11 @@ inline bool BuildValidationNative(const ProgramPlan& program, const NCTranslatio
             for (unsigned a = 0U; a < 3U; ++a) author[a] = frozenProgram.points[i].position[a];
             NCTranslationForwardPoint(frozenTranslation,author,machine);
         }
+        // Validate the raw absolute result before anchoring; an invalid
+        // transform must never be hidden by preserving the stationary axis.
+        for (unsigned a = 0U; a < 3U; ++a)
+            if (!Detail::Finite(machine[a])) return ClearValidationNativeFalse(out);
+        if (stationaryZ) machine[2] = frozenStart[2];
         for (unsigned a = 0U; a < 8U; ++a)
         {
             p.pointsMCS[i][a] = a < 3U ? machine[a] : frozenStart[a];
@@ -606,9 +730,10 @@ inline bool BuildValidationNative(const ProgramPlan& program, const NCTranslatio
     return true;
 }
 
-inline bool ValidateNativeWithStorage(const NativePlan& p,NativePlan& expected) noexcept
+inline bool ValidateNativeWithStorage(const NativePlan& p,NativePlan& expected, bool allowFixedWorkTranslation,
+    bool allowWorkXYRotation, bool preserveG90StationaryZ) noexcept
 {
-    if (!BuildValidationNative(p.program,p.translation,p.startMCS,expected) ||
+    if (!BuildValidationNative(p.program,p.translation,p.startMCS,expected,allowFixedWorkTranslation,allowWorkXYRotation,preserveG90StationaryZ) ||
         p.version != expected.version || p.modeP != expected.modeP || p.count != expected.count ||
         p.translationGeneration != expected.translationGeneration) return false;
     for (unsigned a = 0U; a < 8U; ++a)
@@ -632,18 +757,20 @@ inline bool Valid(const ProgramPlan& p,ValidationScratch& scratch) noexcept
     ClearValidationScratch(scratch);
     return Detail::ValidateProgramWithStorage(p,scratch.program) || ClearValidationScratchFalse(scratch);
 }
-inline bool ValidNativeBase(const NativePlan& p,ValidationScratch& scratch) noexcept
+inline bool ValidNativeBase(const NativePlan& p,ValidationScratch& scratch, bool allowFixedWorkTranslation = false,
+    bool allowWorkXYRotation = false, bool preserveG90StationaryZ = false) noexcept
 {
     if(Detail::ValidationStorageOverlaps(&p,sizeof(p),&scratch,sizeof(scratch)))return false;
     ClearValidationScratch(scratch);
     if(!Detail::ValidateProgramWithStorage(p.program,scratch.program) ||
-        !Detail::ValidateNativeWithStorage(p,scratch.native))return ClearValidationScratchFalse(scratch);
+        !Detail::ValidateNativeWithStorage(p,scratch.native,allowFixedWorkTranslation,allowWorkXYRotation,preserveG90StationaryZ))return ClearValidationScratchFalse(scratch);
     return true;
 }
-inline bool ValidNative(const NativePlan& p,ValidationScratch& scratch) noexcept
+inline bool ValidNative(const NativePlan& p,ValidationScratch& scratch, bool allowFixedWorkTranslation = false,
+    bool allowWorkXYRotation = false, bool preserveG90StationaryZ = false) noexcept
 {
     if(Detail::ValidationStorageOverlaps(&p,sizeof(p),&scratch,sizeof(scratch)))return false;
     if(p.program.input.flushMode==2U)return ClearValidationScratchFalse(scratch);
-    return ValidNativeBase(p,scratch);
+    return ValidNativeBase(p,scratch,allowFixedWorkTranslation,allowWorkXYRotation,preserveG90StationaryZ);
 }
 } // namespace NCG76

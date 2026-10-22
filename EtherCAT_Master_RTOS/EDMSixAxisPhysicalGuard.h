@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include "EDMG76AxisFlushGeometry.h"
 
 // FIX6 temporary unloaded-motor test policy. Set this to 0 for the whole
 // project, then Clean/Rebuild, to restore six-axis runtime FOLLOWING trips.
@@ -14,6 +15,16 @@
 #endif
 static_assert(EDM94_EMPTY_LOAD_IGNORE_ROTARY_FOLLOWING == 0 ||
     EDM94_EMPTY_LOAD_IGNORE_ROTARY_FOLLOWING == 1, "EDM94 following policy must be 0 or 1");
+
+// E212 unloaded B3/B4 commissioning policy: XYZ runtime FOLLOWING trips at
+// more than one mm, including zero-speed dwell/finish waits. A whole-project
+// value of 0 restores strict runtime trips. Command geometry, Arm, completion,
+// physical settling and stop/release retain their frozen precision windows.
+#ifndef EDM205_EMPTY_LOAD_CENTER_DYNAMIC_FOLLOWING
+#define EDM205_EMPTY_LOAD_CENTER_DYNAMIC_FOLLOWING 1
+#endif
+static_assert(EDM205_EMPTY_LOAD_CENTER_DYNAMIC_FOLLOWING == 0 ||
+    EDM205_EMPTY_LOAD_CENTER_DYNAMIC_FOLLOWING == 1, "EDM205 following policy must be 0 or 1");
 
 // EDM94: a bounded scope around authored ordinary XYZCUV G01 commands.
 // This guard creates no reference, owner, coordinate, PID reset or PDO write.
@@ -30,12 +41,15 @@ namespace EDM94
         IgnoreRotaryFollowingTripForEmptyLoad ? 0x07U : AllAxes;
     static constexpr std::uint32_t FollowingObserveOnlyAxisMask =
         AllAxes & ~FollowingTripAxisMask;
+    static constexpr bool EmptyLoadCenterDynamicFollowing =
+        EDM205_EMPTY_LOAD_CENTER_DYNAMIC_FOLLOWING != 0;
+    static constexpr double CenterDynamicFollowingMm = 1.0;
     static constexpr std::uint32_t RequiredStableCycles = 200U;
     // Admission at a completed endpoint, not the zero-output physical stop proof.
     static constexpr std::uint32_t BoundaryReadyCycles = 200U;
     static constexpr std::uint64_t MaximumDurationUs = 120000000ULL;
-    // Only the explicitly bound five-millimetre commissioning profile uses
-    // this longer window. Ordinary GAP/motion retains the original deadline.
+    // The five-mm fixture and E210 slowed two-mm B3/B4 fixtures use the
+    // longer window. Ordinary GAP/motion retains the original deadline.
     static constexpr double VisibleFlushReferenceMmSec = 0.065;
     static constexpr double VisibleXYZMachiningReferenceMmSec = 0.002;
     static constexpr double VisibleSixRotaryReferenceNativeSec = 0.1;
@@ -45,7 +59,7 @@ namespace EDM94
     inline double VisibleFlushHeightMm(unsigned profile) noexcept
     { return profile == 1U ? 5.0 : (profile == 2U || profile == 3U || profile == 4U || profile == 6U || profile == 7U) ? 2.0 : 0.0; }
     inline std::uint64_t VisibleFlushDurationUs(unsigned profile) noexcept
-    { return profile == 1U ? VisibleFlushMaximumDurationUs : (profile == 2U || profile == 3U || profile == 4U || profile == 6U || profile == 7U) ? MaximumDurationUs : 0ULL; }
+    { return (profile == 1U || profile == 6U || profile == 7U) ? VisibleFlushMaximumDurationUs : (profile == 2U || profile == 3U || profile == 4U) ? MaximumDurationUs : 0ULL; }
     inline unsigned VisibleFlushRequiredMask(unsigned profile) noexcept
     { return profile == 1U ? 4U : profile == 2U ? 7U : profile == 3U ? AllAxes : (profile == 4U || profile == 6U || profile == 7U) ? 7U : 0U; }
 
@@ -607,8 +621,13 @@ namespace EDM94
         std::uint64_t maxDurationUs = MaximumDurationUs;
         std::uint64_t maxSourceGapUs = 2000ULL;
         bool visibleZFlush158 = false; // Frozen visible-Z commissioning-family permission; ABI retained.
-        std::uint8_t commissioningProfile = 0U; // Existing padding: 0 ordinary, 1 five-mm Z, 2 two-mm XYZ, 3 two-mm XYZCUV, 4 G76 two-mm B1, 5 G76 bounded-path B2, 6 G76 center/Z B3, 7 G76 upper-center B4.
+        std::uint8_t commissioningProfile = 0U; // Existing padding: 0 ordinary, 1 five-mm Z, 2 two-mm XYZ, 3 two-mm XYZCUV, 4 G76 two-mm B1, 5 G76 bounded-path B2, 6 G76 axial-center B3, 7 G76 axial-upper-center B4.
     };
+    inline bool EmptyLoadCenterFollowingProfile(const Config& config) noexcept
+    {
+        return EmptyLoadCenterDynamicFollowing && config.visibleZFlush158 &&
+            (config.commissioningProfile == 6U || config.commissioningProfile == 7U);
+    }
     struct AxisFrame
     {
         double commandPulse = 0.0;
@@ -698,6 +717,146 @@ namespace EDM94
             if(left>lo)lo=left;
             if(right<hi)hi=right;
             if(!std::isfinite(lo)||!std::isfinite(hi)||lo>hi)return false;
+        }
+        return true;
+    }
+    // E204: the motion owner reconstructs these two segments from the sealed
+    // signed machining axis and the genuine stopped child. This is RT-local
+    // evidence; it grants neither a broad XYZ box nor native +Z permission.
+    enum class CenterMotion : std::uint8_t
+    { None, ToCenter, Outbound, Returning, ToAnchor };
+    struct CenterEnvelope
+    {
+        Identity identity{};
+        std::uint64_t tick=0ULL,nowUs=0ULL,liveEpoch=0ULL,run=0ULL,cache=0ULL,dispatch=0ULL;
+        std::uint64_t fingerprint=0ULL,sourceEpoch=0ULL,segment=0ULL;
+        unsigned child=0U;
+        int sourcePC=-1;
+        EDM204::Geometry geometry{};
+        unsigned leg=0U; // 0: anchor <-> center; 1: center <-> axial top.
+        // E205: fresh RT-local committed reference. None/zero never grants
+        // the moving trip window, including all dwells and zero-speed edges.
+        CenterMotion motion=CenterMotion::None;
+        double motionSpeedMmSec=0.0;
+        std::array<double,6U> motionCommandPulse{},motionVelocityPps{};
+    };
+    inline bool SameCenterGeometry(const CenterEnvelope& a,const CenterEnvelope& b) noexcept
+    {
+        return SameIdentity(a.identity,b.identity)&&a.liveEpoch==b.liveEpoch&&a.run==b.run&&a.cache==b.cache&&
+            a.dispatch==b.dispatch&&a.fingerprint==b.fingerprint&&a.sourceEpoch==b.sourceEpoch&&
+            a.segment==b.segment&&a.child==b.child&&a.sourcePC==b.sourcePC&&
+            EDM204::SameGeometry(a.geometry,b.geometry);
+    }
+    inline bool ValidCenterEnvelope(const CenterEnvelope& e,const Config& c) noexcept
+    {
+        const bool profile=c.commissioningProfile==6U||c.commissioningProfile==7U;
+        const auto& g=e.geometry;
+        if(!profile||!c.visibleZFlush158||!ValidIdentity(e.identity)||!e.tick||!e.nowUs||
+            !e.liveEpoch||!e.run||!e.cache||!e.dispatch||!e.fingerprint||!e.sourceEpoch||!e.segment||
+            e.child>=25U||e.sourcePC<0||e.leg>1U||g.mode!=c.commissioningProfile-3U||
+            !EDM204::ValidCommissioningHeightMm(g.heightMm)||!EDM204::ValidGeometry(g))return false;
+        for(unsigned i=0U;i<6U;++i) {
+            const double p=g.pulsePerNative[i],limit=NativeExcursionLimit(i)*p;
+            if(p!=c.axis[i].pulsePerUnit||
+                std::fabs(g.anchorPulse[i]-c.axis[i].commandAnchor)>limit||
+                std::fabs(g.nominalCenterPulse[i]-c.axis[i].commandAnchor)>limit||
+                std::fabs(g.centerPulse[i]-c.axis[i].commandAnchor)>limit||
+                (i>=3U&&g.anchorPulse[i]!=c.axis[i].commandAnchor))return false;
+        }
+        return true;
+    }
+    inline double CenterDynamicFollowingWindowPulse(const AxisConfig& c) noexcept
+    {
+        const double strictMax=0.001*c.pulsePerUnit;
+        const double maximum=CenterDynamicFollowingMm*c.pulsePerUnit;
+        if(!std::isfinite(c.pulsePerUnit)||c.pulsePerUnit<=0.0||
+            !std::isfinite(c.followingWindowPulse)||c.followingWindowPulse<=0.0||
+            !std::isfinite(strictMax)||c.followingWindowPulse>strictMax||
+            !std::isfinite(maximum)||maximum<=0.0)return 0.0;
+        return maximum;
+    }
+    inline bool CenterPositionFits(const CenterEnvelope& e,const Config& c,const Frame& f,bool actual,
+        bool emptyLoadRuntime=false) noexcept
+    {
+        const auto& g=e.geometry;
+        const auto& from=e.leg==0U?g.anchorPulse:g.centerPulse;
+        const auto& to=e.leg==0U?g.centerPulse:g.topPulse;
+        double lo=0.0,hi=1.0;
+        for(unsigned i=0U;i<6U;++i) {
+            const double p=actual?f.axis[i].actualPulse:f.axis[i].commandPulse;
+            if(!std::isfinite(p))return false;
+            if(i>=3U) {if(!actual&&p!=g.anchorPulse[i])return false;continue;}
+            const double a=from[i],b=to[i],d=b-a;
+            double magnitude=std::fabs(a);if(std::fabs(b)>magnitude)magnitude=std::fabs(b);
+            if(std::fabs(p)>magnitude)magnitude=std::fabs(p);
+            if(magnitude<1.0)magnitude=1.0;
+            const double roundoff=128.0*(std::numeric_limits<double>::epsilon)()*magnitude;
+            if(!std::isfinite(roundoff)||roundoff/g.pulsePerNative[i]>1.0e-8)return false;
+            // Only the encoder corridor follows the unloaded runtime alarm
+            // window. The authored command must still lie on the exact segment.
+            const double actualWindow=emptyLoadRuntime&&EmptyLoadCenterFollowingProfile(c)?
+                CenterDynamicFollowingWindowPulse(c.axis[i]):c.axis[i].followingWindowPulse;
+            if(actual&&(!std::isfinite(actualWindow)||actualWindow<=0.0))return false;
+            const double window=roundoff+(actual?actualWindow:0.0);
+            if(d==0.0) {if(std::fabs(p-a)>window)return false;continue;}
+            double left=(p-a-window)/d,right=(p-a+window)/d;
+            if(left>right){const double swap=left;left=right;right=swap;}
+            if(left>lo)lo=left;
+            if(right<hi)hi=right;
+            if(!std::isfinite(lo)||!std::isfinite(hi)||lo>hi)return false;
+        }
+        return true;
+    }
+    inline bool CenterDynamicMotionValid(const CenterEnvelope& e,const Config& c,const Frame& f) noexcept
+    {
+        if(!EmptyLoadCenterDynamicFollowing||!ValidCenterEnvelope(e,c)||
+            e.tick!=f.tick||e.nowUs!=f.nowUs||e.liveEpoch!=f.identity.epoch||
+            e.identity.session!=f.identity.session||e.identity.ownerGeneration!=f.identity.ownerGeneration||
+            !f.clockValid||!f.pdoValid||!f.sourceFresh||!f.authorityCurrent||!f.healthy||
+            f.allCommandZero||f.visibleZFlushActive158||f.mappedFlushProfile!=c.commissioningProfile||
+            !std::isfinite(e.motionSpeedMmSec)||e.motionSpeedMmSec<=0.0)return false;
+        const bool radial=e.motion==CenterMotion::ToCenter||e.motion==CenterMotion::ToAnchor;
+        const bool axial=e.motion==CenterMotion::Outbound||e.motion==CenterMotion::Returning;
+        if((!radial&&!axial)||e.leg!=(axial?1U:0U))return false;
+        const double cap=radial?VisibleXYZMachiningReferenceMmSec:VisibleFlushReferenceMmSec;
+        const double roundoff=64.0*(std::numeric_limits<double>::epsilon)();
+        if(e.motionSpeedMmSec>cap+roundoff)return false;
+        const auto& g=e.geometry;
+        const auto& from=radial?g.anchorPulse:g.centerPulse;
+        const auto& to=radial?g.centerPulse:g.topPulse;
+        double length=0.0;
+        for(unsigned i=0U;i<3U;++i) {
+            if(CenterDynamicFollowingWindowPulse(c.axis[i])<=0.0)return false;
+            length=std::hypot(length,(to[i]-from[i])/c.axis[i].pulsePerUnit);
+        }
+        if(!std::isfinite(length)||length<=0.0)return false;
+        const double sign=(e.motion==CenterMotion::Returning||e.motion==CenterMotion::ToAnchor)?-1.0:1.0;
+        for(unsigned i=0U;i<6U;++i) {
+            const double v=e.motionVelocityPps[i];
+            if(!std::isfinite(v)||!std::isfinite(e.motionCommandPulse[i])||
+                e.motionCommandPulse[i]!=f.axis[i].commandPulse||!f.axis[i].healthy||!f.axis[i].writable)return false;
+            if(i>=3U) {if(v!=0.0)return false;continue;}
+            const double delta=to[i]-from[i];
+            if(delta==0.0) {if(v!=0.0)return false;continue;}
+            const double expected=sign*(delta/length)*e.motionSpeedMmSec;
+            double magnitude=std::fabs(expected);if(std::fabs(v)>magnitude)magnitude=std::fabs(v);
+            if(magnitude<1.0)magnitude=1.0;
+            if(!std::isfinite(expected)||expected==0.0||v==0.0||(v>0.0)!=(expected>0.0)||
+                std::fabs(v-expected)>roundoff*magnitude||
+                std::fabs(v)/c.axis[i].pulsePerUnit>NativeVelocityLimit(i))return false;
+        }
+        return true;
+    }
+    inline bool CenterAtWaypoint(const CenterEnvelope& e,const std::array<double,6U>& command) noexcept
+    {
+        for(unsigned i=0U;i<6U;++i) {
+            const double expected=e.geometry.centerPulse[i],actual=command[i];
+            if(!std::isfinite(actual))return false;
+            if(i>=3U) {if(actual!=expected)return false;continue;}
+            double magnitude=std::fabs(expected);if(std::fabs(actual)>magnitude)magnitude=std::fabs(actual);
+            if(magnitude<1.0)magnitude=1.0;
+            const double tolerance=128.0*(std::numeric_limits<double>::epsilon)()*magnitude;
+            if(tolerance/e.geometry.pulsePerNative[i]>1.0e-8||std::fabs(actual-expected)>tolerance)return false;
         }
         return true;
     }
@@ -850,6 +1009,8 @@ namespace EDM94
         bool ForceZero() const noexcept { return m_feedback.active && m_feedback.forceZero; }
         bool HasTangentEnvelope() const noexcept
         { return Active()&&m_feedback.config.commissioningProfile==8U&&m_haveTangent; }
+        bool HasCenterEnvelope() const noexcept
+        { return Active()&&(m_feedback.config.commissioningProfile==6U||m_feedback.config.commissioningProfile==7U)&&m_haveCenter; }
         bool HandoffZero() const noexcept { return Active() && m_feedback.handoffZero && !m_feedback.forceZero; }
         void BeginHandoffZero() noexcept
         {
@@ -884,14 +1045,55 @@ namespace EDM94
                 (m_feedback.stopped && m_feedback.settledCycles >= RequiredStableCycles ? 0U : ReleaseBlock_STOP_NOT_PROVEN);
         }
 
+        // EDM215: the Motion owner can reject a consumed request before Arm
+        // is entered (request shape or PID headroom). Publish that exact empty
+        // admission so NC can retire it after its ordinary RESET/rebase commit.
+        // This creates no accepted output, standstill, pass or release proof.
+        bool RejectUnacceptedArm(const Identity& identity, const Frame& frame,
+            Reason reason, unsigned axis = AxisCount) noexcept
+        {
+            if (Active() || !ValidIdentity(identity) || identity.session <= m_feedback.identity.session ||
+                axis > AxisCount || (reason != Reason::Configuration && reason != Reason::Identity &&
+                    reason != Reason::Clock && reason != Reason::Source)) return false;
+            m_feedback = Feedback{};
+            m_lastFrame = Frame{};
+            m_runtimeDiagnostic = RuntimeDiagnostic{};
+            m_tangent = TangentEnvelope{}; m_haveTangent = false;
+            m_center = CenterEnvelope{}; m_haveCenter = false; m_centerCommand = {};
+            m_followingTripWindowPulse = {};
+            m_acceptedIdentity = Identity{}; m_acceptedTick = m_acceptedSourceNowUs = 0ULL;
+            m_sealedIdentity = Identity{};
+            for (unsigned i = 0U; i < AxisCount; ++i)
+            {
+                m_axisControl[i] = AxisControlSample{};
+                m_acceptedCsv[i] = m_sealedCsv[i] = 0;
+                m_stableMin[i] = m_stableMax[i] = 0.0;
+            }
+            m_pendingSeal = m_sealed = m_stopEligible = m_haveStableRange = false;
+            m_discardedTick = 0ULL;
+            m_feedback.identity = identity;
+            m_feedback.currentIdentity = frame.identity;
+            m_feedback.lastTick = frame.tick; m_feedback.lastNowUs = frame.nowUs;
+            m_feedback.admission = frame.admission;
+            m_feedback.admission.tick = frame.tick; m_feedback.admission.nowUs = frame.nowUs;
+            m_feedback.admission.failedGates |= reason == Reason::Configuration ? AdmissionGate_CONFIGURATION :
+                reason == Reason::Identity ? AdmissionGate_IDENTITY : reason == Reason::Clock ? AdmissionGate_CLOCK :
+                AdmissionGate_FRESH;
+            m_feedback.rejectedAxis = axis;
+            m_feedback.reason = reason; m_feedback.faulted = true; m_feedback.state = State::Faulted;
+            return true;
+        }
+
         bool Arm(const Identity& identity, const Config& config, const Frame& frame,
             unsigned requiredMovementMask = AllAxes, bool boundedProgram = false, bool visibleZFlush158 = false) noexcept
         {
             if (Active()) return false;
             m_feedback = Feedback{};
             m_tangent=TangentEnvelope{};m_haveTangent=false;
+            m_center=CenterEnvelope{};m_haveCenter=false;m_centerCommand={};
             for (unsigned axis = 0U; axis < AxisCount; ++axis)
-            { m_axisControl[axis] = AxisControlSample{}; m_acceptedCsv[axis] = 0; }
+            { m_axisControl[axis] = AxisControlSample{}; m_acceptedCsv[axis] = 0;
+                m_followingTripWindowPulse[axis]=config.axis[axis].followingWindowPulse; }
             m_acceptedIdentity = Identity{}; m_acceptedTick = m_acceptedSourceNowUs = 0ULL;
             const bool validMovementMask = (config.visibleZFlush158 == visibleZFlush158) &&
                 (!visibleZFlush158 || (boundedProgram && requiredMovementMask == VisibleFlushRequiredMask(config.commissioningProfile))) &&
@@ -953,9 +1155,11 @@ namespace EDM94
             return BeginOutput(frame.tick);
         }
 
-        bool Tick(const Frame& frame,const TangentEnvelope* tangent=nullptr) noexcept
+        bool Tick(const Frame& frame,const TangentEnvelope* tangent=nullptr,const CenterEnvelope* center=nullptr) noexcept
         {
             if (!Active()) return false;
+            for(unsigned axis=0U;axis<AxisCount;++axis)
+                m_followingTripWindowPulse[axis]=m_feedback.config.axis[axis].followingWindowPulse;
             const std::uint32_t boundaryCycles = m_feedback.boundaryReadyCycles;
             bool sameBoundaryReference = SameIdentity(frame.identity, m_lastFrame.identity);
             for (unsigned axis = 0U; axis < AxisCount; ++axis)
@@ -1048,6 +1252,63 @@ namespace EDM94
                     TangentPositionFits(m_tangent,m_feedback.config,frame,true);
                 if(!tangentFits){inEnvelope=false;Fault(Reason::Excursion);}
             }
+            const bool centerProfile=(m_feedback.config.commissioningProfile==6U||
+                m_feedback.config.commissioningProfile==7U)&&m_feedback.config.visibleZFlush158;
+            const bool centerMapped=centerProfile&&!frame.visibleZFlushActive158&&
+                frame.mappedFlushProfile==m_feedback.config.commissioningProfile;
+            // E209: explicit fault/cancel recovery can rebase command to the
+            // stopped encoder pose on all six axes. The retained machining
+            // segment (including its old C/U/V command anchor) remains
+            // diagnostic evidence, not a prerequisite for collecting fresh
+            // zero-output stop proof. Its identity/configuration must still
+            // be valid, and this scope never grants motion or release.
+            const bool centerZeroRecovery=centerMapped&&m_haveCenter&&
+                m_feedback.forceZero&&(m_feedback.faulted||m_feedback.cancelled)&&
+                ValidCenterEnvelope(m_center,m_feedback.config);
+            // Old B3/B4 native +Z activation is invalid even inside the small
+            // ordinary box. A missing/invalid axis never falls back to Z.
+            if(centerProfile&&frame.visibleZFlushActive158) {inEnvelope=false;Fault(Reason::Identity);}
+            // Runtime alarm tolerance is separate from allNear and the
+            // strict physical completion/stop witnesses below. It grants no
+            // command, geometry, source-health or output authority.
+            const bool emptyLoadCenterRuntime=EmptyLoadCenterFollowingProfile(m_feedback.config)&&
+                !m_feedback.forceZero&&!HandoffZero();
+            bool emptyLoadActualViolation=false;
+            bool centerFits=false,centerCommandFits=false;
+            bool centerAcceptedThisTick=false;
+            if(centerMapped) {
+                if(!m_feedback.forceZero) {
+                    const bool current=center&&!m_feedback.finishRequested&&frame.authorityCurrent&&
+                        center->tick==frame.tick&&center->nowUs==frame.nowUs&&center->liveEpoch==frame.identity.epoch&&
+                        SameIdentity(center->identity,m_feedback.identity)&&
+                        center->identity.session==frame.identity.session&&
+                        center->identity.ownerGeneration==frame.identity.ownerGeneration&&
+                        ValidCenterEnvelope(*center,m_feedback.config)&&
+                        (m_haveCenter?(SameCenterGeometry(*center,m_center)&&
+                            (center->leg==m_center.leg||CenterAtWaypoint(m_center,m_centerCommand))):center->leg==0U);
+                    if(!current)Fault(Reason::Identity);
+                    else {m_center=*center;m_haveCenter=true;centerAcceptedThisTick=true;}
+                }
+                // Revocation retains only the last accepted segment for
+                // zero-output containment. It cannot select another leg.
+                // E211: the just-accepted incoming image passed these same
+                // geometry/configuration checks above. Reuse that pure result
+                // only inside this Tick; revoked or rejected incoming samples
+                // still validate retained geometry before any stop evidence.
+                centerCommandFits=m_haveCenter&&(centerAcceptedThisTick||ValidCenterEnvelope(m_center,m_feedback.config))&&
+                    CenterPositionFits(m_center,m_feedback.config,frame,false);
+                centerFits=centerCommandFits&&CenterPositionFits(m_center,m_feedback.config,frame,true,emptyLoadCenterRuntime);
+                if(!centerFits) {
+                    inEnvelope=false;
+                    if(!centerZeroRecovery) {
+                        // A valid command plus an outlying encoder belongs to
+                        // FOLLOWING first; never fall back to the old um trip.
+                        if(emptyLoadCenterRuntime&&centerCommandFits)emptyLoadActualViolation=true;
+                        else Fault(Reason::Excursion);
+                    }
+                }
+                else if(!m_feedback.forceZero)for(unsigned i=0U;i<6U;++i)m_centerCommand[i]=frame.axis[i].commandPulse;
+            }
             bool ordinaryEnvelope=true;
             unsigned firstFollowingAxis = AxisCount;
             std::uint32_t boundaryBlocked = (frame.boundaryReadyMask & ~AllAxes) != 0U ?
@@ -1062,8 +1323,15 @@ namespace EDM94
                 allNear = allNear && axisWithinFollowingWindow; // All six axes still required for completion/stop.
                 if ((FollowingTripAxisMask & (1U << axis)) != 0U)
                 {
-                    if (!axisWithinFollowingWindow && firstFollowingAxis == AxisCount) firstFollowingAxis = axis;
-                    allTripNear = allTripNear && axisWithinFollowingWindow;
+                    bool axisWithinTripWindow=axisWithinFollowingWindow;
+                    if(emptyLoadCenterRuntime&&axis<3U) {
+                        const double window=CenterDynamicFollowingWindowPulse(m_feedback.config.axis[axis]);
+                        m_followingTripWindowPulse[axis]=window;
+                        axisWithinTripWindow=std::abs(frame.axis[axis].followingErrorPulse)<=window&&
+                            std::abs(frame.axis[axis].commandPulse-frame.axis[axis].actualPulse)<=window;
+                    }
+                    if (!axisWithinTripWindow && firstFollowingAxis == AxisCount) firstFollowingAxis = axis;
+                    allTripNear = allTripNear && axisWithinTripWindow;
                 }
                 const AxisConfig& c = m_feedback.config.axis[axis];
                 const AxisFrame& a = frame.axis[axis];
@@ -1076,19 +1344,40 @@ namespace EDM94
                 const double limit = NativeExcursionLimit(axis) * c.pulsePerUnit;
                 const bool mappedProfile = frame.visibleZFlushActive158 &&
                     frame.mappedFlushProfile == m_feedback.config.commissioningProfile;
-                const bool visible = axis == 2U && m_feedback.config.visibleZFlush158 &&
+                const bool visible = axis == 2U && !centerProfile && m_feedback.config.visibleZFlush158 &&
                     mappedProfile && !m_feedback.finishRequested;
                 const double upper = visible ?
                     (VisibleFlushHeightMm(m_feedback.config.commissioningProfile) + NativeExcursionLimit(axis)) * c.pulsePerUnit : limit;
                 const double commandDelta = a.commandPulse - c.commandAnchor;
                 const double actualDelta = a.actualPulse - c.actualAnchor;
-                const bool ordinary=commandDelta>=-limit&&commandDelta<=limit&&actualDelta>=-limit&&actualDelta<=limit;
+                const bool commandOutside=commandDelta < -limit || commandDelta > upper;
+                bool actualOutside=actualDelta < -limit || actualDelta > upper;
+                bool ordinary=commandDelta>=-limit&&commandDelta<=limit&&actualDelta>=-limit&&actualDelta<=limit;
+                if(emptyLoadCenterRuntime&&axis<3U) {
+                    const double window=CenterDynamicFollowingWindowPulse(c);
+                    const double relativeActual=a.actualPulse-c.commandAnchor;
+                    actualOutside=!std::isfinite(window)||window<=0.0||
+                        relativeActual < -limit-window || relativeActual > upper+window;
+                    ordinary=commandDelta>=-limit&&commandDelta<=limit&&!actualOutside;
+                }
                 ordinaryEnvelope=ordinaryEnvelope&&ordinary;
-                if ((!(tangentMapped&&tangentFits&&axis<3U)&&
-                    (commandDelta < -limit || commandDelta > upper || actualDelta < -limit || actualDelta > upper)) ||
+                const bool mappedCommand=centerMapped&&axis<3U&&
+                    (emptyLoadCenterRuntime?centerCommandFits:centerFits);
+                const bool outsideEnvelope=!((tangentMapped&&tangentFits&&axis<3U)||mappedCommand)&&
+                    (commandOutside||actualOutside);
+                const bool invalidMappedProfile=
                     (frame.visibleZFlushActive158 && (!m_feedback.config.visibleZFlush158 || !mappedProfile)) ||
-                    (!frame.visibleZFlushActive158 && frame.mappedFlushProfile != 0U&&!tangentMapped))
-                { inEnvelope = false; Fault(Reason::Excursion, axis); }
+                    (!frame.visibleZFlushActive158 && frame.mappedFlushProfile != 0U&&!tangentMapped&&!centerMapped);
+                if (outsideEnvelope||invalidMappedProfile)
+                {
+                    inEnvelope = false;
+                    // Only the obsolete XYZ travel envelope is waived here.
+                    // Rotary excursion limits and mapping fences still apply
+                    // after an all-six-axis Reset rebase.
+                    if(emptyLoadCenterRuntime&&axis<3U&&!commandOutside&&!invalidMappedProfile)
+                        emptyLoadActualViolation=true;
+                    else if(!centerZeroRecovery||axis>=3U||invalidMappedProfile)Fault(Reason::Excursion,axis);
+                }
                 if (HandoffZero()) continue; // A temporary zero bridge earns no movement evidence.
                 AxisEvidence& e = m_feedback.axis[axis];
                 e.currentActualPulse = a.actualPulse;
@@ -1103,9 +1392,13 @@ namespace EDM94
             if(tangentProfile&&!m_feedback.forceZero&&frame.mappedFlushProfile==0U&&ordinaryEnvelope) {
                 m_tangent=TangentEnvelope{};m_haveTangent=false;
             }
+            if(centerProfile&&!m_feedback.forceZero&&frame.mappedFlushProfile==0U&&ordinaryEnvelope) {
+                m_center=CenterEnvelope{};m_haveCenter=false;m_centerCommand={};
+            }
             if (!allCurrent) { ResetStopEvidence(); (void)BeginOutput(frame.tick); return false; }
             if (!m_feedback.forceZero && !allHealthy) Fault(Reason::Source);
             if (!m_feedback.forceZero && !allTripNear) Fault(Reason::Following, firstFollowingAxis);
+            if (!m_feedback.forceZero && emptyLoadActualViolation) Fault(Reason::Excursion);
             if (!m_feedback.forceZero && m_feedback.finishRequested && frame.groupIdle &&
                 frame.allCommandZero && allNear && allHealthy && inEnvelope)
             {
@@ -1371,7 +1664,7 @@ namespace EDM94
             if (!m_feedback.faulted)
             {
                 m_feedback.firstFault = m_runtimeDiagnostic;
-                CaptureFirstFaultAxis(axis);
+                CaptureFirstFaultAxis(axis,reason);
                 m_feedback.firstFault.reason = static_cast<std::uint32_t>(reason);
                 if (m_feedback.firstFault.site == 0U) m_feedback.firstFault.site = static_cast<std::uint32_t>(site);
                 if (m_feedback.forceZero) m_feedback.firstFault.flags |= RuntimeFlag_FORCE_ZERO_BEFORE_FAULT;
@@ -1565,7 +1858,7 @@ namespace EDM94
             if (stop.configChangedMask || stop.mappingChangedMask) stop.blockedMask |= StopBlock_CONFIGURATION;
             if (stop.unhealthyMask) stop.blockedMask |= StopBlock_HEALTH;
         }
-        void CaptureFirstFaultAxis(unsigned axis) noexcept
+        void CaptureFirstFaultAxis(unsigned axis,Reason reason) noexcept
         {
             auto& d = m_feedback.firstFaultAxis;
             d = FaultAxisDiagnostic{}; d.axis = axis;
@@ -1575,7 +1868,8 @@ namespace EDM94
                 !SameIdentity(m_lastFrame.identity, fault.frameIdentity)) return;
             const auto& a = m_lastFrame.axis[axis]; const auto& c = m_feedback.config.axis[axis];
             d.commandPulse = a.commandPulse; d.actualPulse = a.actualPulse;
-            d.followingErrorPulse = a.followingErrorPulse; d.windowPulse = c.followingWindowPulse;
+            d.followingErrorPulse = a.followingErrorPulse;
+            d.windowPulse = reason==Reason::Following?m_followingTripWindowPulse[axis]:c.followingWindowPulse;
             d.pulsePerUnit = c.pulsePerUnit; d.hardwareSign = c.hardwareSign;
             d.flags = FaultAxis_FRAME;
             const auto& control = m_axisControl[axis];
@@ -1659,6 +1953,10 @@ namespace EDM94
         Frame m_lastFrame{};
         TangentEnvelope m_tangent{};
         bool m_haveTangent=false;
+        CenterEnvelope m_center{};
+        std::array<double,6U> m_centerCommand{};
+        std::array<double,6U> m_followingTripWindowPulse{};
+        bool m_haveCenter=false;
         Identity m_sealedIdentity{};
         std::int32_t m_sealedCsv[AxisCount]{};
         double m_stableMin[AxisCount]{};

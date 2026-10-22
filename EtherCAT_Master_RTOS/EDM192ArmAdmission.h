@@ -10,7 +10,7 @@ namespace EDM192Arm
     enum class Stage : std::uint32_t
     { None=0U, Consumed=1U, RequestShapeRejected=2U, HeadroomRejected=3U, EngineRejected=4U, Accepted=5U };
     enum class Cause : std::uint32_t
-    { None=0U, RequestShape=1U, ContextUnavailable=2U, HeadroomCheck=3U, PhysicalGuard=4U };
+    { None=0U, RequestShape=1U, ContextUnavailable=2U, HeadroomCheck=3U, PhysicalGuard=4U, RecoveryProbe=5U };
     enum class Pid : std::uint32_t { None=0U, G00=1U, Flush=2U };
     static constexpr unsigned NoAxis = 6U;
 
@@ -67,6 +67,7 @@ namespace EDM192Arm
         case Cause::ContextUnavailable:return "CONTEXT_UNAVAILABLE";
         case Cause::HeadroomCheck:return "HEADROOM_CHECK";
         case Cause::PhysicalGuard:return "PHYSICAL_GUARD";
+        case Cause::RecoveryProbe:return "RECOVERY_PROBE";
         default:return "NONE";
         }
     }

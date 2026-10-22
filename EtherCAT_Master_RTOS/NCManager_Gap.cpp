@@ -22,6 +22,7 @@
 #include "EDM137ConfirmedUnits.h"
 #include "EDM145SourceDiagnostics.h"
 #include "EDM192ArmAdmission.h"
+#include "EDM206SyncHistory.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -33,7 +34,196 @@
 
 namespace
 {
-    // P300 only. NC owns this observer; it neither writes RT state nor grants
+    // EDM206_NC_HISTORY_BEGIN
+    // NC owns only this cursor and two copied rows. Reading ownership keeps
+    // the RT ring immutable until HISTORY_END; a new arm is never delayed.
+    struct EDM206NCObserver
+    {
+        EDM206::Header header{};
+        EDM206::Row row{}, previous{};
+        std::uint64_t frequency=0ULL,lastCounter=0ULL,lastLiveSample=0ULL;
+        unsigned index=0U,part=0U;
+        bool active=false,haveRow=false,havePrevious=false,clockSeen=false;
+    };
+    EDM206NCObserver g_edm206NCObserver{};
+
+    bool EDM206LiveCommandIdle(const MotionStopSettleSnapshot& sample) noexcept
+    {
+        // This is a logging gate, not standstill or physical stop proof.
+        return sample.publicationGeneration && sample.sampleSequence &&
+            !sample.groupActive && sample.existingAxisCount==6U &&
+            sample.pdoTargetVelocitySampledAxisCount==6U &&
+            sample.commandQueueDepth==0U && sample.commandIngressDepth==0U &&
+            sample.commandReplayDepth==0U && sample.commandMovingAxisCount==0U &&
+            sample.pdoTargetVelocityNonzeroAxisCount==0U;
+    }
+    bool EDM206LogPeriodReady(EDM206NCObserver& observer) noexcept
+    {
+        LARGE_INTEGER frequency{},counter{};
+        if(!observer.frequency) {
+            if(!RtQueryPerformanceFrequency(&frequency)||frequency.QuadPart<=0)return false;
+            observer.frequency=static_cast<std::uint64_t>(frequency.QuadPart);
+        }
+        if(!RtQueryPerformanceCounter(&counter)||counter.QuadPart<0)return false;
+        const auto now=static_cast<std::uint64_t>(counter.QuadPart);
+        const auto period=observer.frequency/100ULL+(observer.frequency%100ULL?1ULL:0ULL);
+        if(observer.clockSeen) {
+            if(now<observer.lastCounter){observer.lastCounter=now;return false;}
+            if(now-observer.lastCounter<period)return false;
+        }
+        observer.clockSeen=true;observer.lastCounter=now;return true;
+    }
+    bool EDM206ActualVelocity(const EDM206NCObserver& observer,unsigned axis,double& pps) noexcept
+    {
+        pps=0.0;
+        if(!observer.havePrevious||axis>=EDM206::AxisCount)return false;
+        const auto& row=observer.row;const auto& previous=observer.previous;
+        const unsigned required=EDM206::Complete|EDM206::FrameCurrent|EDM206::SourceFresh|EDM206::ClockValid;
+        if((row.flags&required)!=required||(previous.flags&required)!=required||
+            !(row.flags&EDM206::SourceIntervalValid)||
+            !(row.axis[axis].flags&EDM206::FrameAvailable)||
+            !(previous.axis[axis].flags&EDM206::FrameAvailable)||
+            previous.tick==(std::numeric_limits<std::uint64_t>::max)()||row.tick!=previous.tick+1ULL||
+            !row.session||row.session!=previous.session||!row.epoch||row.epoch!=previous.epoch||
+            !row.ownerGeneration||row.ownerGeneration!=previous.ownerGeneration||
+            row.sourceUs<=previous.sourceUs||row.sourceDeltaUs!=row.sourceUs-previous.sourceUs||
+            !std::isfinite(row.axis[axis].frameActualPulse)||!std::isfinite(previous.axis[axis].frameActualPulse))return false;
+        const double delta=row.axis[axis].frameActualPulse-previous.axis[axis].frameActualPulse;
+        if(!std::isfinite(delta))return false;
+        const double value=delta/(static_cast<double>(row.sourceDeltaUs)*0.000001);
+        if(!std::isfinite(value))return false;
+        pps=value;return true;
+    }
+    const char* EDM207InputSourceName(EDM206::InputSource source) noexcept
+    {
+        switch(source) {
+        case EDM206::InputSource::Legacy: return "LEGACY";
+        case EDM206::InputSource::ControlledSemantic: return "CONTROLLED";
+        case EDM206::InputSource::RetiredSemantic: return "RETIRED";
+        case EDM206::InputSource::EmergencyFallback: return "EMERGENCY";
+        default: return "UNKNOWN";
+        }
+    }
+    bool EDM207InputCurrent(const EDM206::Row& row,unsigned axis) noexcept
+    {
+        if(axis>=EDM206::AxisCount||!(row.inputMask&(1U<<axis)))return false;
+        const auto& input=row.axis[axis].input;
+        const unsigned required=EDM206::ConsumedValid|EDM206::Decoded;
+        return row.session&&input.session==row.session&&input.tick==row.tick&&
+            input.sourceUs==row.sourceUs&&(input.flags&required)==required&&
+            input.source!=EDM206::InputSource::Unknown&&
+            static_cast<unsigned>(input.source)<=static_cast<unsigned>(EDM206::InputSource::EmergencyFallback);
+    }
+    void EndEDM206History(MotionCore& motion,const char* result) noexcept
+    {
+        auto& observer=g_edm206NCObserver;
+        const auto session=observer.header.session;
+        PrintNCG76DiagnosticLine("[EDM207] event=HISTORY_END session=%llu result=%s rows=%u expected=%u firstTick=%llu lastTick=%llu driveAck=0 authority=NONE\n",
+            static_cast<unsigned long long>(session),result,observer.index,observer.header.count,
+            static_cast<unsigned long long>(observer.header.firstTick),static_cast<unsigned long long>(observer.header.lastTick));
+        // No row reference or RT pointer survives this release.
+        motion.EndReadEDM206History(session);
+        observer.active=observer.haveRow=observer.havePrevious=false;
+        observer.index=observer.part=0U;
+    }
+    void PollEDM206History(MotionCore& motion,NCState ncState) noexcept
+    {
+        // Run before the NC bracket's latched early return: RESET and a later
+        // session cannot erase a pending immutable fault. Pause for new motion.
+        if(ncState==NCState::RUN||ncState==NCState::HOLD)return;
+        const auto live=motion.GetStopSettleSnapshot();
+        if(!EDM206LiveCommandIdle(live))return;
+        auto& observer=g_edm206NCObserver;
+        if(!observer.active) {
+            if(!motion.BeginReadEDM206History(observer.header))return;
+            observer.active=true;observer.haveRow=observer.havePrevious=false;
+            observer.index=observer.part=0U;
+        }
+        if(live.sampleSequence<=observer.lastLiveSample||!EDM206LogPeriodReady(observer))return;
+        observer.lastLiveSample=live.sampleSequence;
+        const auto& header=observer.header;
+        if(!header.session||!header.count||header.count>EDM206::Capacity||header.capacity!=EDM206::Capacity||
+            (header.mode!=3U&&header.mode!=4U)||!header.faultTick||header.firstTick>header.lastTick||
+            header.lastTick!=header.faultTick||!header.zeroImageAccepted||header.containmentTick<header.faultTick) {
+            EndEDM206History(motion,"HEADER_INVALID");return;
+        }
+        const auto u=[](std::uint64_t value) noexcept {return static_cast<unsigned long long>(value);};
+        // At most two bounded lines per ten milliseconds, even when several
+        // wait callbacks call ServiceEDM94SameThread in the same NC scan.
+        for(unsigned budget=0U;budget<2U&&observer.active;++budget) {
+            if(observer.part==0U) {
+                PrintNCG76DiagnosticLine("[EDM207] event=HISTORY_BEGIN session=%llu count=%u capacity=%u totalRows=%llu firstTick=%llu lastTick=%llu faultTick=%llu faultUs=%llu reason=%u axis=%u mode=%u partial=%u clock=SOURCE_OBSERVATION callbackTiming=EXISTING_TICK_LOG driveAck=0\n",
+                    u(header.session),header.count,header.capacity,u(header.totalRows),u(header.firstTick),u(header.lastTick),
+                    u(header.faultTick),u(header.faultUs),header.reason,header.axis,header.mode,header.faultRowPartial?1U:0U);
+                ++observer.part;continue;
+            }
+            if(observer.part==1U) {
+                PrintNCG76DiagnosticLine("[EDM207] event=HISTORY_SCOPE session=%llu site=%u containmentTick=%llu containmentUs=%llu containment=ZERO_IMAGE_ACCEPTED liveCommandIdle=1 physicalStopProven=NOT_ASSERTED capture=XYZ_INPUT_TO_LOCAL inputValid=CONSUMED_DECODED csv=BEFORE_GROUP_GUARD local=PRE_GUARD_PI prior=NIC_ACCEPTED raw606CUnits=UNVERIFIED_NATIVE_RAW maxLinesPer10ms=2 authority=NONE\n",
+                    u(header.session),header.site,u(header.containmentTick),u(header.containmentSourceUs));
+                ++observer.part;continue;
+            }
+            if(observer.part<5U) {
+                const unsigned axis=observer.part-2U;
+                const auto& config=header.config[axis];
+                const bool valid=(header.configMask&(1U<<axis))&&
+                    config.sampleTick==header.faultTick&&config.sampleUs==header.faultUs;
+                PrintNCG76DiagnosticLine("[EDM207] event=HISTORY_CONFIG session=%llu axis=%c valid=%u sampleTick=%llu sampleUs=%llu slot=%d axisIndex=%d slaveIndex=%d fbMode=%d axisType=%d reverse=%u axisReverse=%u ppr=%.17g lead=%.17g offset=%.17g inputOffset=%d inputMap=%u outputOffset=%d outputMap=%u point=FAULT_SAMPLE\n",
+                    u(header.session),"XYZ"[axis],valid?1U:0U,u(config.sampleTick),u(config.sampleUs),
+                    static_cast<int>(config.slot),static_cast<int>(config.axisIndex),static_cast<int>(config.slaveIndex),
+                    static_cast<int>(config.fbMode),static_cast<int>(config.axisType),config.isReverse?1U:0U,config.axisReverse?1U:0U,
+                    config.resolutionPPR,config.finalLead,config.machineOffsetPulse,static_cast<int>(config.inputOffset),
+                    (valid&&(config.flags&EDM206::InputOffsetValid)&&config.inputOffset>=0)?1U:0U,static_cast<int>(config.outputOffset),
+                    (valid&&(config.flags&EDM206::OutputOffsetValid)&&config.outputOffset>=0)?1U:0U);
+                ++observer.part;continue;
+            }
+            if(observer.index>=header.count){EndEDM206History(motion,"COMPLETE");return;}
+            if(!observer.haveRow) {
+                if(!motion.ReadEDM206HistoryRow(header.session,observer.index,observer.row)) {
+                    EndEDM206History(motion,"ROW_UNAVAILABLE");return;
+                }
+                if(observer.row.session!=header.session||!observer.row.tick||
+                    observer.row.tick<header.firstTick||observer.row.tick>header.lastTick||
+                    (observer.havePrevious&&observer.row.tick<=observer.previous.tick)) {
+                    EndEDM206History(motion,"ROW_IDENTITY_INVALID");return;
+                }
+                observer.haveRow=true;
+            }
+            const auto& row=observer.row;
+            const unsigned part=observer.part-5U;
+            if(part==0U) {
+                const auto& accepted=row.priorAccepted;
+                PrintNCG76DiagnosticLine("[EDM207] event=HISTORY_ROW session=%llu row=%u tick=%llu sourceUs=%llu sourceDeltaUs=%llu epoch=%llu ownerGen=%u phase=%u child=%u mode=%u flags=%u controlMask=%u writtenMask=%u inputMask=%u priorValid=%u priorTick=%llu priorUs=%llu priorGen=%llu csvX=%d csvY=%d csvZ=%d zero=%u\n",
+                    u(row.session),observer.index,u(row.tick),u(row.sourceUs),u(row.sourceDeltaUs),u(row.epoch),
+                    row.ownerGeneration,row.phase,row.child,row.mode,row.flags,row.controlMask,row.writtenMask,row.inputMask,
+                    accepted.valid?1U:0U,u(accepted.tick),u(accepted.sourceUs),u(accepted.frameGeneration),
+                    static_cast<int>(accepted.csv[0]),static_cast<int>(accepted.csv[1]),static_cast<int>(accepted.csv[2]),accepted.allSixZero?1U:0U);
+            } else {
+                const unsigned axis=(part-1U)/2U;const auto& value=row.axis[axis];
+                if((part&1U)!=0U) {
+                    double actualPps=0.0;const bool velocityValid=EDM206ActualVelocity(observer,axis,actualPps);
+                    PrintNCG76DiagnosticLine("[EDM207] event=HISTORY_AXIS session=%llu row=%u axis=%c flags=%u cmd=%.17g act=%.17g err=%.17g ppu=%.17g strict=%.17g ref=%.17g actualPps=%.17g actualValid=%u writtenTick=%llu csv=%d local=%.17g\n",
+                        u(row.session),observer.index,"XYZ"[axis],value.flags,value.frameCommandPulse,value.frameActualPulse,
+                        value.followingErrorPulse,value.pulsePerUnit,value.strictWindowPulse,value.committedReferencePps,
+                        actualPps,velocityValid?1U:0U,u(value.writtenTick),static_cast<int>(value.writtenCsv),value.control.logicalOutputVelocityPps);
+                } else {
+                    const auto& input=value.input;
+                    PrintNCG76DiagnosticLine("[EDM207] event=HISTORY_INPUT session=%llu row=%u axis=%c valid=%u flags=%u source=%s inputTick=%llu inputUs=%llu raw6064=%d used6064=%d prevRaw=%u delta=%d unwrap=%.17g rawLogical=%.17g preFixture=%.17g raw606C=%d raw2510=%u\n",
+                        u(row.session),observer.index,"XYZ"[axis],EDM207InputCurrent(row,axis)?1U:0U,static_cast<unsigned>(input.flags),
+                        EDM207InputSourceName(input.source),u(input.tick),u(input.sourceUs),static_cast<int>(input.mappedRaw),
+                        static_cast<int>(input.consumedRaw),static_cast<unsigned>(input.previousRaw),static_cast<int>(input.pulseDelta),
+                        input.unwrappedPulse,input.rawLogicalPulse,input.preFixtureActualPulse,static_cast<int>(input.rawVelocity),static_cast<unsigned>(input.rawObject2510));
+                }
+            }
+            ++observer.part;
+            if(observer.part==12U) {
+                observer.previous=observer.row;observer.havePrevious=true;observer.haveRow=false;
+                ++observer.index;observer.part=5U;
+            }
+        }
+    }
+    // EDM206_NC_HISTORY_END
+
+    // All G76 profiles. NC owns this observer; it neither writes RT state nor grants
     // readiness. A failed pre-submit floor read permits logging only.
     struct EDM192AdmissionObserver
     {
@@ -15680,10 +15870,40 @@ namespace
     {
         return interruptArm ? E106ProfileOnlyNPQRS(b, interruptArm, tuning) : E105ProfileOnlyNPQRS(b, tuning);
     }
+    // Explicit commissioning metadata only: RT must reject this request before
+    // Engine::Arm. It is never a hold selection or a motion permission.
+    bool E216RejectBeforeArm(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),216U);
+    }
+    bool E217CenterNominalHold(const NCParsedBlock& b, unsigned selector) noexcept
+    {
+        return (selector==EDM173::B3ArmP||selector==EDM173::B4ArmP)&&
+            EDM77::Detail::Clean(b)&&b.has('L')&&!b.has('H')&&
+            EDM77::Detail::EqualLiteral(b.expression('L'),1U);
+    }
+    bool E217NominalCheckpointReceipt(const EDM157::Feedback& f) noexcept
+    {
+        return EDM130::IsG76CenterHold217(f.scope.recipe)&&EDM157::ValidNominalWorkReceipt(f)&&
+            !f.flushPause&&f.flushPhase==EDM128::Phase::Gap&&!f.flushEventIndex&&
+            !f.nominalWork.triggeredEvents&&!f.nominalWork.completedEvents&&
+            f.nominalWork.elapsedUs>=f.scope.recipe.workTimeUs/4ULL&&
+            f.nominalWork.elapsedUs<f.scope.recipe.workTimeUs;
+    }
+    bool E217SameNominalPose(const EDM157::Feedback& a,const EDM157::Feedback& b) noexcept
+    {
+        return EDM126::SameSource(a.cursorSource,b.cursorSource)&&a.historyDepth==b.historyDepth&&
+            EDM109::SameDouble(a.localMm,b.localMm)&&EDM109::SameDouble(a.stationMm,b.stationMm)&&
+            EDM109::SamePulse(a.positionPulse,b.positionPulse);
+    }
     bool E108ProfileOnlyNPQRSIJK(const NCParsedBlock& b, unsigned selector, EDM97::Tuning& tuning,
         EDM107::FlushProfile& profile) noexcept
     {
-        if (b.has('L'))
+        const bool rejectBeforeArm=E216RejectBeforeArm(b,selector);
+        const bool centerNominalHold=E217CenterNominalHold(b,selector);
+        if (b.has('L')&&!rejectBeforeArm&&!centerNominalHold)
         {
             unsigned selection = 0U;
             for (unsigned value = 1U; value <= 3U; ++value)
@@ -15695,7 +15915,7 @@ namespace
         }
         if ((selector != 109U && selector != 111U && selector != 113U && selector != 115U && selector != 117U && selector != 119U && selector != 121U && selector != 123U && selector != 125U && selector != 127U && selector != 129U && selector != 132U && selector != 134U && selector != 136U && selector != 138U && selector != 140U && selector != 142U && selector != 144U && selector != 146U && selector != 148U && selector != 150U && selector != 152U && selector != 154U && selector != 156U && selector != 162U && selector != 164U && selector != 166U && selector != 168U && selector != 170U && selector != 172U && selector != 174U && selector != 176U && selector != 178U && selector != 180U && selector != 182U && selector != 184U && selector != 186U && selector != 188U && selector != 190U && selector != 192U && selector != 194U && selector != 196U && selector != 198U && selector != 200U && selector != 202U && selector != 204U && selector != 206U && selector != 208U && selector != 210U && selector != 212U && selector != 214U && selector != 216U && selector != 218U && selector != 220U && selector != 222U && selector != 224U && selector != 226U && selector != 228U && selector != 230U && selector != 232U && selector != 234U && selector != 236U && selector != 238U && selector != 240U && selector != 242U && selector != 244U && selector != 246U && selector != 248U && selector != 250U && selector != 252U && selector != 254U && selector != 256U && selector != 258U && selector != 260U && selector != 262U && selector != 264U && selector != 266U && selector != 268U && selector != 270U && selector != 272U && selector != 274U && selector != 276U && selector != 278U && selector != 280U && selector != 282U && selector != 284U && selector != 286U && selector != 288U && selector != 290U && selector != 292U && selector != 294U && selector != 296U && selector != 298U && selector != 300U) || !EDM77::Detail::Clean(b) || b.isEmpty || b.gCount != 1 || b.mCount != 0 ||
             !EDM77::Detail::EqualLiteral(b.gExpressions[0], 180U) ||
-            !EDM77::Detail::OnlyAddresses(b, selector == EDM173::B2ArmP ? "NPQRSIJKL" :
+            !EDM77::Detail::OnlyAddresses(b, rejectBeforeArm||centerNominalHold||selector == EDM173::B2ArmP ? "NPQRSIJKL" :
                 EDM149::IsFlushHoldTestArm(selector) ? "NPQRSIJKHL" :
                 EDM149::IsManualVoltageTestArm(selector) ? "NPQRSIJKH" : "NPQRSIJK") || !b.has('P') ||
             !EDM77::Detail::EqualLiteral(b.expression('P'), selector) ||
@@ -17594,7 +17814,9 @@ bool NCManager::IsEDM199G76PauseScopeCurrentSameThread(const EDM157::Scope& scop
     // receipt are the parent lifetime fence; s.next is not a child ordinal.
     const auto& s=m_edm94;
     if(!EDM157::ValidScope(scope)||!EDM157::IsG76NominalPause(scope)||
-        s.gapHistoryArm!=EDM173::B2ArmP||!m_edm173||!m_g76Orbit||
+        (s.gapHistoryArm!=EDM173::B2ArmP&&s.gapHistoryArm!=EDM173::B3ArmP&&s.gapHistoryArm!=EDM173::B4ArmP)||
+        !EDM173::RecipeMatchesArm(s.gapHistoryArm,scope.recipe)||
+        static_cast<unsigned>(scope.policy.mode)!=EDM173::ModeForArm(s.gapHistoryArm)||!m_edm173||!m_g76Orbit||
         !s.program||!s.latched||!s.ready||!s.everArmed||!s.gapWorkTime||
         s.armPending||s.cancelled||s.resetSeen||s.resetCommitted||s.releaseRequested||
         s.rtFaultReported||s.finishPending||s.complete||s.gapWaiting||
@@ -17615,7 +17837,7 @@ bool NCManager::IsEDM199G76PauseScopeCurrentSameThread(const EDM157::Scope& scop
     const auto& w=*m_edm173;const auto& g=*m_g76Orbit;const auto& r=g.receipt;
     const auto& parent=w.plan.scope;const auto& source=scope.authorizedSource;
     if(!w.prepared||!w.published||!w.parentCommitted||w.completed||!g.active||!g.bound||g.completed||g.mixed||
-        !g.commit||g.mode!=2U||g.sourceG!=76||g.run!=s.run||g.cache!=s.cache||g.pc!=s.pc[0U]||
+        !g.commit||g.mode!=EDM173::ModeForArm(s.gapHistoryArm)||g.sourceG!=76||g.run!=s.run||g.cache!=s.cache||g.pc!=s.pc[0U]||
         g.pc!=GetActiveDispatchPC()||g.dispatch!=m_waitingBlockDispatchId||
         !r.valid||!r.commandAccepted||!r.captureBound||!r.tailCommitted||r.count!=25U||
         !r.ownerLease.Matches(s.lease)||!r.tail.IsCommitted()||!r.tail.captureBound||
@@ -17696,7 +17918,7 @@ bool NCManager::CaptureEDM157ScopeSameThread(EDM157::Scope& scope) noexcept
     scope = EDM157::Scope{};
     EDM126::MotionFeedback history{}; EDM128::MotionFeedback mode{};
     const auto& s = m_edm94;
-    const bool compound=s.gapHistoryArm==EDM173::B2ArmP;
+    const bool compound=s.gapHistoryArm==EDM173::B2ArmP||s.gapHistoryArm==EDM173::B3ArmP||s.gapHistoryArm==EDM173::B4ArmP;
     if (!m_motion.ReadEDM126Feedback(history) || !m_motion.ReadEDM130Feedback(mode) ||
         !history.enabled || !history.active || history.faulted || !history.sourceReady ||
         !history.rowActive || history.rowCompleted || history.completedRows + 1U != history.authorizedRows ||
@@ -17733,7 +17955,8 @@ void NCManager::LogEDM157SameThread(const char* event, const char* reason) const
     const auto& p = m_edm157;
     if(EDM157::IsG76NominalPause(p.scope))
     {
-        const char* tag=p.feedback.flushPause||EDM130::IsG76B2FlushHold200(p.scope.recipe)?"EDM200":"EDM199";
+        const char* tag=EDM157::IsG76CenterNominalPause(p.scope)?"EDM217":
+            p.feedback.flushPause||EDM130::IsG76B2FlushHold200(p.scope.recipe)?"EDM200":"EDM199";
         char record[481]{};
         const int length=std::snprintf(record,sizeof(record),
             "[%s] event=%.24s reason=%.48s session=%llu hold=%llu startFloor=%llu resumeStart=%llu phase=%s stable=%u parentPC=%d dispatch=%llu commit=%llu fingerprint=%llu child=%llu epoch=%llu segment=%llu callbackRetained=1 pausedJog=0 discharge=0\n",
@@ -17762,6 +17985,18 @@ void NCManager::LogEDM157SameThread(const char* event, const char* reason) const
                 static_cast<unsigned long long>(EDM130::CurveDoubleBits(f.positionPulse[5U])));
             if(poseLength>0&&poseLength<=480&&static_cast<std::size_t>(poseLength)<sizeof(record))RtPrintf("%s",record);
             else RtPrintf("[%s] event=LOG_FORMAT_ERROR part=PAUSE_POSE\n",tag);
+            if(EDM157::IsG76CenterNominalPause(p.scope))
+            {
+                const auto& work=f.nominalWork;
+                const int workLength=std::snprintf(record,sizeof(record),
+                    "[EDM217] event=NOMINAL_WORK_RECEIPT result=%.24s hold=%llu tick=%llu captured=%u elapsedUs=%llu totalWorkUs=%llu workTimeUs=%llu triggered=%llu completed=%llu evidence=RT_FROZEN_NOMINAL_GAP authority=NONE\n",
+                    event,static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(f.tick),
+                    f.nominalWorkCaptured?1U:0U,static_cast<unsigned long long>(work.elapsedUs),
+                    static_cast<unsigned long long>(work.totalWorkUs),static_cast<unsigned long long>(p.scope.recipe.workTimeUs),
+                    static_cast<unsigned long long>(work.triggeredEvents),static_cast<unsigned long long>(work.completedEvents));
+                if(workLength>0&&workLength<=480&&static_cast<std::size_t>(workLength)<sizeof(record))RtPrintf("%s",record);
+                else RtPrintf("[EDM217] event=LOG_FORMAT_ERROR part=NOMINAL_WORK_RECEIPT\n");
+            }
             if(f.flushPause)
             {
                 // These are the retained RT receipt, not a newer coordinator
@@ -17931,9 +18166,11 @@ bool NCManager::TryHoldEDM157SameThread() noexcept
         m_edm200.holdSequence==m_edm157.holdSequence&&m_edm200.compoundCommit==m_edm157.compoundCommit&&
         EDM157::SameScope(m_edm200.scope,scope);
     if(renewCheckpoint&&m_edm157.feedback.phase!=EDM157::Phase::Idle&&
-        (!EDM157::ValidPauseContext(m_edm157.feedback)||!m_edm157.feedback.flushPause||
-            m_edm157.feedback.flushPhase!=EDM128::Phase::Outbound||
-            m_edm157.feedback.flushEventIndex!=m_edm200.eventIndex))return false;
+        (!EDM157::ValidPauseContext(m_edm157.feedback)||
+            (EDM130::IsG76CenterHold217(scope.recipe)?
+                (!E217NominalCheckpointReceipt(m_edm157.feedback)||m_edm200.eventIndex):
+                (!m_edm157.feedback.flushPause||m_edm157.feedback.flushPhase!=EDM128::Phase::Outbound||
+                    m_edm157.feedback.flushEventIndex!=m_edm200.eventIndex))))return false;
     if (m_edm157HoldSerial == (std::numeric_limits<std::uint64_t>::max)()) return false;
     const std::uint64_t sequence = ++m_edm157HoldSerial;
     if (!m_motion.RequestEDM157Hold(scope, sequence, m_startDiagnosticRequests)) return false;
@@ -18019,14 +18256,70 @@ void NCManager::ServiceEDM200AutoFlushHoldSameThread(bool feedbackCurrent)
         static_cast<unsigned long long>(event.anchor.cursorSource.ordinal));
 }
 
+void NCManager::ServiceEDM217AutoNominalHoldSameThread(bool feedbackCurrent)
+{
+    // L1 selects a committed nominal-GAP work checkpoint. It requests the
+    // ordinary HOLD transaction; only a fresh operator START can resume it.
+    const auto& s=m_edm94;const auto& recipe=m_edm130.recipe;
+    if(!feedbackCurrent||!m_edm130.bound||!EDM130::IsG76CenterHold217(recipe)||
+        !EDM173::RecipeMatchesArm(s.gapHistoryArm,recipe)||!EDM130::ValidRecipe(recipe)||
+        !s.session||m_edm200.queued||m_edm157.active||m_state!=NCState::RUN||
+        !s.latched||!s.ready||!s.everArmed||s.armPending||s.cancelled||
+        s.resetSeen||s.resetCommitted||s.releaseRequested||s.rtFaultReported||
+        s.finishPending||s.complete||m_resetContinuationPhase!=ResetContinuationPhase::IDLE||
+        !s.feedback.active||s.feedback.faulted||s.feedback.forceZero||
+        AlarmManager::GetInstance().HasAlarm())return;
+    EDM128::MotionFeedback mode{};EDM126::MotionFeedback history{};
+    if(!m_motion.ReadEDM130Feedback(mode)||!mode.enabled||!mode.active||mode.faulted||
+        !mode.workTimeFlush||mode.fixture!=EDM173::HistoryFixture||
+        mode.session!=s.session||mode.armEpoch!=s.armEpoch||mode.ownerGeneration!=s.lease.generation||
+        mode.liveEpoch!=m_motion.GetCurrentExecutionEpoch()||!mode.authorizedRows||mode.authorizedRows>25U||
+        mode.completedRows+1U!=mode.authorizedRows||!mode.tick||!mode.nowUs||!s.feedback.lastTick||
+        (mode.tick>s.feedback.lastTick?mode.tick-s.feedback.lastTick:s.feedback.lastTick-mode.tick)>8ULL||
+        !EDM130::SameRecipe(mode.timerRecipe,recipe)||!EDM116::SamePolicy(mode.rowPolicy,mode.coordinator.policy))return;
+    const auto& event=mode.coordinator;const auto& work=event.work;
+    if(event.policy.fixture!=EDM116::Fixture::ModalG76Gap173||
+        static_cast<unsigned>(event.policy.mode)!=EDM173::ModeForArm(s.gapHistoryArm)||
+        event.phase!=EDM128::Phase::Gap||event.detached||event.faulted||event.stopped||
+        event.eventIndex||!EDM130::ValidWorkEvidence(work)||work.workTimeUs!=recipe.workTimeUs||
+        work.triggeredEvents||work.completedEvents||work.due||
+        work.elapsedUs<work.workTimeUs/4ULL||work.elapsedUs>=work.workTimeUs)return;
+    EDM157::Scope scope{};
+    if(!CaptureEDM157ScopeSameThread(scope)||!EDM157::PauseModeAllowed(scope,event)||
+        !EDM130::SameRecipe(scope.recipe,recipe)||!EDM116::SamePolicy(scope.policy,mode.rowPolicy)||
+        !m_motion.ReadEDM126Feedback(history)||!history.enabled||!history.active||history.faulted||
+        !history.sourceReady||!history.rowActive||history.rowCompleted||
+        history.fixture!=mode.fixture||history.session!=mode.session||history.armEpoch!=mode.armEpoch||
+        history.ownerGeneration!=mode.ownerGeneration||history.liveEpoch!=mode.liveEpoch||
+        history.authorizedRows!=mode.authorizedRows||history.completedRows!=mode.completedRows||
+        history.tick!=mode.tick||history.nowUs!=mode.nowUs||history.lastMappingTick!=history.tick||
+        history.lastMappingUs!=history.nowUs||mode.lastMappingTick!=history.lastMappingTick||
+        mode.lastMappingUs!=history.lastMappingUs||history.traversal.tick!=history.tick||
+        history.traversal.nowUs!=history.nowUs||!EDM126::SameSource(history.authorizedSource,scope.authorizedSource)||
+        !EDM157::ValidMapped(scope,history.traversal))return;
+    const bool accepted=TryHoldEDM157SameThread();
+    // TryHold recaptures the live child. A different child cannot consume
+    // this checkpoint even when both observations belong to the same parent.
+    if(!accepted||!EDM157::SameScope(m_edm157.scope,scope)||!m_edm157.compoundCommit)
+    {RejectEDM94SameThread("EDM217_AUTO_HOLD_REQUEST_REJECTED",m_gapDryRun.sourceLine);return;}
+    m_edm200.scope=scope;m_edm200.compoundCommit=m_edm157.compoundCommit;
+    m_edm200.holdSequence=m_edm157.holdSequence;m_edm200.eventIndex=0ULL;m_edm200.queued=true;
+    PrintNCG76DiagnosticLine("[EDM217] event=AUTO_HOLD_REQUEST result=QUEUED session=%llu L=1 B=%u eventIndex=0 phase=GAP tick=%llu hold=%llu startFloor=%llu child=%llu elapsedUs=%llu workTimeUs=%llu resume=MANUAL_FRESH_START discharge=0\n",
+        static_cast<unsigned long long>(s.session),EDM173::ModeForArm(s.gapHistoryArm),
+        static_cast<unsigned long long>(mode.tick),static_cast<unsigned long long>(m_edm157.holdSequence),
+        static_cast<unsigned long long>(m_edm157.startFloor),static_cast<unsigned long long>(scope.authorizedSource.ordinal+1ULL),
+        static_cast<unsigned long long>(work.elapsedUs),static_cast<unsigned long long>(work.workTimeUs));
+}
+
 bool NCManager::IsEDM200AutoHoldCheckpointCompleteSameThread() const noexcept
 {
     const auto& recipe=m_edm130.recipe;const auto& s=m_edm94;const auto& c=m_edm200;
     if(!recipe.flushHoldTest)return true;
-    if(s.gapHistoryArm!=EDM173::B2ArmP||!m_edm173||!m_g76Orbit||!m_edm130.bound||
-        !EDM130::IsG76B2FlushHold200(recipe)||!EDM130::ValidRecipe(recipe)||
+    const bool center=EDM130::IsG76CenterHold217(recipe);
+    if(!EDM173::RecipeMatchesArm(s.gapHistoryArm,recipe)||!m_edm173||!m_g76Orbit||!m_edm130.bound||
+        (!center&&!EDM130::IsG76B2FlushHold200(recipe))||!EDM130::ValidRecipe(recipe)||
         !EDM157::ValidScope(c.scope)||!c.queued||!c.resumed||!c.holdSequence||!c.resumeStartSequence||
-        c.eventIndex!=1ULL||c.scope.authorizedSource.scope.session!=s.session||
+        c.eventIndex!=(center?0ULL:1ULL)||c.scope.authorizedSource.scope.session!=s.session||
         !EDM130::SameRecipe(c.scope.recipe,recipe)||!EDM130::SameRecipe(m_edm173->plan.recipe,recipe)||
         c.scope.compoundFingerprint!=m_edm173->plan.fingerprint||c.scope.compoundArmEpoch!=s.armEpoch||
         c.compoundCommit!=m_g76Orbit->commit||c.scope.authorizedSource.dispatch!=m_g76Orbit->dispatch||
@@ -18186,6 +18479,11 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
             m_edm200.holdSequence!=p.holdSequence||m_edm200.compoundCommit!=p.compoundCommit||
             !EDM157::SameScope(m_edm200.scope,p.scope)))
     {LogEDM157SameThread("CANCEL","AUTO_CHECKPOINT_CHANGED");CancelEDM94SameThread("EDM200_AUTO_CHECKPOINT_CHANGED");return false;}
+    if(EDM130::IsG76CenterHold217(p.scope.recipe)&&m_edm200.queued&&!m_edm200.resumed&&
+        (!E217NominalCheckpointReceipt(observed)||m_edm200.eventIndex||
+            m_edm200.holdSequence!=p.holdSequence||m_edm200.compoundCommit!=p.compoundCommit||
+            !EDM157::SameScope(m_edm200.scope,p.scope)))
+    {LogEDM157SameThread("CANCEL","AUTO_CHECKPOINT_CHANGED");CancelEDM94SameThread("EDM217_AUTO_CHECKPOINT_CHANGED");return false;}
     // RUNNING is the one retained completion receipt of the requested START.
     // RT stops publishing it after the final zero proof; the 10 ms NC scan
     // can arrive after the normal eight-tick live-proof freshness window.
@@ -18194,6 +18492,19 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
     // HELD admission and all in-progress physical proofs still use eight ticks.
     if (observed.phase == EDM157::Phase::Running &&
         (!feedbackCurrent || m_edm94.feedback.lastTick < observed.tick)) return true;
+    // TryResume retained the actual Held receipt before queuing START. The
+    // Running acknowledgement must retain its nominal pose and frozen work.
+    if(EDM157::IsG76CenterNominalPause(p.scope)&&
+        (p.feedback.phase==EDM157::Phase::Held||p.feedback.phase==EDM157::Phase::Resuming)&&
+        (!E217SameNominalPose(observed,p.feedback)||
+            !EDM157::SameNominalWorkReceipt(observed.nominalWork,p.feedback.nominalWork)))
+    {LogEDM157SameThread("CANCEL","NOMINAL_RECEIPT_CHANGED");CancelEDM94SameThread("EDM217_NOMINAL_RECEIPT_CHANGED");return false;}
+    if(observed.phase==EDM157::Phase::Running&&EDM157::IsG76CenterNominalPause(p.scope)&&
+        ((p.feedback.phase!=EDM157::Phase::Held&&p.feedback.phase!=EDM157::Phase::Resuming)||
+            p.feedback.stableCycles<EDM157::RequiredStableCycles||observed.stableCycles<EDM157::RequiredStableCycles||
+            !E217SameNominalPose(observed,p.feedback)||
+            !EDM157::SameNominalWorkReceipt(observed.nominalWork,p.feedback.nominalWork)))
+    {LogEDM157SameThread("CANCEL","NOMINAL_RECEIPT_CHANGED");CancelEDM94SameThread("EDM217_NOMINAL_RECEIPT_CHANGED");return false;}
     const auto priorPhase = p.feedback.phase;
     p.feedback = observed; p.lastTick = observed.tick;
     if ((p.scope.recipe.holdRetreatMode || observed.flushPause) && priorPhase != observed.phase)
@@ -18234,6 +18545,15 @@ bool NCManager::ServiceEDM157SameThread(bool feedbackCurrent)
             m_edm200.resumed=true;m_edm200.resumeStartSequence=p.resumeStartSequence;
             RtPrintf("[EDM200] event=CHECKPOINT_RESUMED session=%llu L=3 B=2 eventIndex=%llu hold=%llu start=%llu proof=VALIDATED_RT_RUNNING discharge=0\n",
                 static_cast<unsigned long long>(m_edm94.session),static_cast<unsigned long long>(observed.flushEventIndex),
+                static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(p.resumeStartSequence));
+        }
+        if(EDM130::IsG76CenterHold217(p.scope.recipe)&&m_edm200.queued&&!m_edm200.resumed)
+        {
+            // Every scope, phase, pose, work and requested START check above
+            // has passed. A queued or Held request alone earns no credit.
+            m_edm200.resumed=true;m_edm200.resumeStartSequence=p.resumeStartSequence;
+            PrintNCG76DiagnosticLine("[EDM217] event=CHECKPOINT_RESUMED session=%llu L=1 B=%u eventIndex=0 hold=%llu start=%llu samePose=1 workFrozen=1 proof=VALIDATED_RT_RUNNING discharge=0\n",
+                static_cast<unsigned long long>(m_edm94.session),EDM173::ModeForArm(m_edm94.gapHistoryArm),
                 static_cast<unsigned long long>(p.holdSequence),static_cast<unsigned long long>(p.resumeStartSequence));
         }
         m_state = NCState::RUN; m_pauseAfterBlock = false;
@@ -19744,6 +20064,7 @@ void NCManager::ServiceEDM169ManualVoltageSameThread(bool feedbackCurrent) noexc
 
 void NCManager::ServiceEDM94SameThread()
 {
+    PollEDM206History(m_motion,static_cast<NCState>(m_state));
     if (!m_edm94.latched) return;
     auto& s = m_edm94;
     // Sample before cancellation side effects. An RT fault may already have
@@ -19760,6 +20081,17 @@ void NCManager::ServiceEDM94SameThread()
     {
         s.feedback = observed;
         s.lastTick = observed.lastTick;
+    }
+    // EDM215: observe admission before the general fault handler can cancel
+    // the scope. Readiness and RESET retirement still require guard receipts.
+    if(s.armPending&&!s.cancelled&&EDM173::IsArm(s.gapHistoryArm)&&m_motion.IsMotionOwnerLeaseCurrent(s.lease))
+    {
+        const EDM192Arm::Scope admissionScope{s.session,static_cast<std::uint64_t>(s.armEpoch),
+            static_cast<std::uint64_t>(m_motion.GetCurrentExecutionEpoch()),
+            static_cast<std::uint32_t>(s.lease.owner),static_cast<std::uint32_t>(s.lease.generation),
+            EDM173::HistoryFixture,m_edm130.recipe.commissioningProfile};
+        if(PollEDM192AdmissionObserver(admissionScope))
+        {RejectEDM94SameThread("EDM173_ARM_ADMISSION_REJECTED",m_gapDryRun.sourceLine);return;}
     }
     ServiceEDM169ManualVoltageSameThread(feedbackCurrent);
     if (EDM173::IsArm(s.gapHistoryArm) && feedbackCurrent) ServiceEDM173SameThread();
@@ -19792,6 +20124,7 @@ void NCManager::ServiceEDM94SameThread()
         s.normalEndCommitted && !s.cancelled)
         CancelEDM94SameThread("NORMAL_RELEASE_REVOKED_RESET_REQUIRED");
     ServiceEDM200AutoFlushHoldSameThread(feedbackCurrent);
+    ServiceEDM217AutoNominalHoldSameThread(feedbackCurrent);
     ServiceEDM165AutoFlushHoldSameThread(feedbackCurrent);
     const bool resumablePause = ServiceEDM157SameThread(feedbackCurrent);
     const bool preserveStop = s.resetSeen || s.resetCommitted || s.releaseRequested || s.complete ||
@@ -25880,9 +26213,11 @@ bool NCManager::IsEDM173BracketShapeValid(const NCBlock& b) noexcept
         (b.val('P')!=292.0 && b.val('P')!=293.0 && b.val('P')!=294.0 && b.val('P')!=295.0 && b.val('P')!=296.0 && b.val('P')!=297.0 && b.val('P')!=298.0 && b.val('P')!=299.0 && b.val('P')!=300.0 && b.val('P')!=301.0)) return false;
     const bool arm=b.val('P')==292.0||b.val('P')==294.0||b.val('P')==296.0||b.val('P')==298.0||b.val('P')==300.0;
     const bool autoB2=b.val('P')==294.0&&b.has('L')&&b.val('L')==3.0;
+    const bool rejectBeforeArm=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==216.0;
+    const bool centerNominalHold=(b.val('P')==296.0||b.val('P')==298.0)&&b.has('L')&&b.val('L')==1.0;
     for(char word='A';word<='Z';++word)
         if(b.has(word) && (!std::isfinite(b.val(word)) ||
-            (word!='N' && word!='P' && !(word=='L'&&autoB2) &&
+            (word!='N' && word!='P' && !(word=='L'&&(autoB2||rejectBeforeArm||centerNominalHold)) &&
                 (!arm || (word!='Q' && word!='R' && word!='S' && word!='I' && word!='J' && word!='K'))))) return false;
     return !arm || (b.has('Q')&&b.has('R')&&b.has('S')&&b.has('I')&&b.has('J')&&b.has('K')&&
         b.val('Q')==8.0&&b.val('R')==1.0&&b.val('S')==1.0&&b.val('I')==10.0&&b.val('J')==50.0&&b.val('K')==100.0);
@@ -25897,7 +26232,9 @@ bool NCManager::IsEDM173OrbitBlockShapeValid(const NCBlock& b) noexcept
     // builder proves the actual displacement before any arm publication.
     for(char word='A';word<='Z';++word) if(b.has(word))
         if(!std::isfinite(b.val(word))||(word!='N'&&word!='P'&&word!='R'&&word!='F'&&word!='B'&&word!='X'&&word!='Y'&&word!='Z'&&word!='K')) return false;
-    return b.val('R')>0.0&&b.val('R')<=EDM173::MaximumRadiusMm&&
+    const unsigned mode=E181EffectiveOrbitMode(b);
+    const double radiusLimit=mode==3U||mode==4U?EDM173::MaximumCenterRadiusMm:EDM173::MaximumRadiusMm;
+    return b.val('R')>0.0&&b.val('R')<=radiusLimit&&
         (!b.has('K')||NCG76::ValidShapeAngle(b.val('K')));
 }
 
@@ -26091,24 +26428,41 @@ bool NCManager::BindEDM173RecipeSameThread() noexcept
         !E108ProfileOnlyNPQRSIJK(arm->parsedBlock,m_edm94.gapHistoryArm,tuning,profile)||
         !EDM97::SameTuning(tuning,m_edm94.gapTuning)||
         !EDM107::SameFlushProfile(profile,m_edm94.gapFlushParameters))return false;
-    if(arm->parsedBlock.has('L'))
+    if(arm->parsedBlock.has('L')&&!E216RejectBeforeArm(arm->parsedBlock,m_edm94.gapHistoryArm))
     {
-        if(m_edm94.gapHistoryArm!=EDM173::B2ArmP||arm->parsedBlock.has('H')||
-            !EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),3U))return false;
-        recipe.flushHoldTest=3U;
+        if(E217CenterNominalHold(arm->parsedBlock,m_edm94.gapHistoryArm))recipe.flushHoldTest=1U;
+        else
+        {
+            if(m_edm94.gapHistoryArm!=EDM173::B2ArmP||arm->parsedBlock.has('H')||
+                !EDM77::Detail::EqualLiteral(arm->parsedBlock.expression('L'),3U))return false;
+            recipe.flushHoldTest=3U;
+        }
     }
     if(!EDM130::ValidRecipe(recipe)||!EDM173::RecipeMatchesArm(m_edm94.gapHistoryArm,recipe)||
-        recipe.jumpSpeedPercentScaled!=100000000ULL||recipe.workTimeUs<250000ULL||recipe.workTimeUs>2000000ULL||
+        !EDM130::ValidG76FlushSpeedPercent(recipe.commissioningProfile,recipe.jumpSpeedPercentScaled)||
+        recipe.workTimeUs<250000ULL||recipe.workTimeUs>2000000ULL||
         recipe.deepFlushCycleInterval||recipe.holdRetreatMode||
-        (recipe.flushHoldTest&&!EDM130::IsG76B2FlushHold200(recipe))||
+        (recipe.flushHoldTest&&!EDM130::IsG76B2FlushHold200(recipe)&&!EDM130::IsG76CenterHold217(recipe))||
         !EDM97::ValidMotionTestCurve(m_edm94.gapTuning,recipe)) return false;
     m_edm94.gapFlushParameters.speedRatio=EDM130::FrozenSpeedRatio(recipe);
     if(!EDM130::MatchesFlushSpeed(recipe,m_edm94.gapFlushParameters.speedRatio)||
         !EDM130::MatchesFlushHeight(recipe,m_edm94.gapFlushParameters.strokeRatio,m_edm94.gapFlushParameters.dwellUs)) return false;
     m_edm130.bound=true;
+    if(EDM173::IsCenterRecipe(recipe))
+        PrintNCG76DiagnosticLine("[EDM210] event=CENTER_FLUSH_RATE session=%llu mode=%u E7percent=%.9g axialScale=%.9g referenceCapMmSec=%.9g accelerationScale=%.9g hardDeadlineUs=%llu centerFeed=INDEPENDENT gains=CONFIGURED following=UNCHANGED discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),EDM173::ModeForArm(m_edm94.gapHistoryArm),
+            static_cast<double>(recipe.jumpSpeedPercentScaled)/1000000.0,
+            2.0*m_edm94.gapFlushParameters.speedRatio,
+            EDM94::VisibleFlushReferenceMmSec*(2.0*m_edm94.gapFlushParameters.speedRatio),
+            2.0*m_edm94.gapFlushParameters.speedRatio,
+            static_cast<unsigned long long>(EDM94::VisibleFlushDurationUs(recipe.commissioningProfile)));
     if(EDM130::IsG76B2FlushHold200(recipe))
         RtPrintf("[EDM200] event=AUTO_HOLD_ARMED session=%llu armP=294 L=3 B=2 trigger=FIRST_CROSSED_B2_E5_OUTBOUND_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START holdRetreat=0 discharge=0\n",
             static_cast<unsigned long long>(m_edm94.session));
+    if(EDM130::IsG76CenterHold217(recipe))
+        PrintNCG76DiagnosticLine("[EDM217] event=AUTO_HOLD_ARMED session=%llu armP=%u L=1 B=%u trigger=NOMINAL_GAP_WORK_25PCT confirmation=M00_FRESH_START_REQUIRED resume=MANUAL_FRESH_START holdRetreat=0 pausedJog=0 discharge=0\n",
+            static_cast<unsigned long long>(m_edm94.session),m_edm94.gapHistoryArm,
+            EDM173::ModeForArm(m_edm94.gapHistoryArm));
     return true;
 }
 
@@ -26234,7 +26588,7 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
     NCG76::Point8 start{};for(unsigned axis=0U;axis<8U;++axis)start[axis]=CoordSys.commandedMCS[axis];
     const auto frozen=CoordSys.GetTranslationSnapshot();
     if(!EDM173::BuildOrbitInput(frozen,start,authoredXYZ,authoredMask,w.authored.val('R'),w.authored.val('F'),input,
-        w.authored.has('K')?w.authored.val('K'):0.0,EDM173::UsesTargetAxis(m_edm130.recipe)))
+        w.authored.has('K')?w.authored.val('K'):0.0,EDM173::UsesTargetAxis(m_edm130.recipe),EDM173::IsCenterRecipe(m_edm130.recipe)))
     {RejectEDM94SameThread("EDM178_COORDINATE_INPUT",m_gapDryRun.sourceLine);return nullptr;}
     NCG76::ProgramPlan& program=m_g76Orbit->program;
     if(!NCG76::Build(input,program)||!NCG76::BuildNative(program,frozen,start,w.nominal,true,true,EDM173::PreservesG90StationaryZ(m_edm130.recipe))||w.nominal.count!=25U)
@@ -26269,23 +26623,23 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
             input.end[0U]-input.start[0U],input.end[1U]-input.start[1U],input.end[2U]-input.start[2U],
             input.shapeAngleDeg,movementMask);
     }
-    if(input.targetAxis&&!EDM173::IsB2Recipe(m_edm130.recipe)&&!EDM173::IsB3Recipe(m_edm130.recipe))
+    if(input.targetAxis&&!EDM173::IsB2Recipe(m_edm130.recipe)&&!EDM173::IsCenterRecipe(m_edm130.recipe))
         PrintNCG76DiagnosticLine("[EDM202] event=TARGET_AXIS_FROZEN session=%llu parentPC=%d frameGeneration=%llu mode=%u programDeltaX=%.17g programDeltaY=%.17g programDeltaZ=%.17g K=%.17g plane=PERPENDICULAR_XYZ_TARGET source=RESOLVED_PROGRAM_TARGET requiredMask=%u nominalChildren=25 flushAxis=%s discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(frozen.generation),
             E181EffectiveOrbitMode(w.authored),input.end[0U]-input.start[0U],input.end[1U]-input.start[1U],
             input.end[2U]-input.start[2U],input.shapeAngleDeg,static_cast<unsigned>(m_edm130.recipe.planMovementMask),
             EDM173::IsB0Recipe(m_edm130.recipe)?"NATIVE_TANGENT_REVERSE":"NATIVE_PLUS_Z");
-    if(EDM173::IsB3Recipe(m_edm130.recipe))
-        PrintNCG76DiagnosticLine("[EDM203] event=TARGET_AXIS_FROZEN session=%llu parentPC=%d frameGeneration=%llu mode=3 programDeltaX=%.17g programDeltaY=%.17g programDeltaZ=%.17g K=%.17g plane=PERPENDICULAR_XYZ_TARGET source=RESOLVED_PROGRAM_TARGET requiredMask=%u nominalChildren=25 center=XYZ flushAxis=NATIVE_PLUS_Z discharge=0\n",
+    if(EDM173::IsCenterRecipe(m_edm130.recipe))
+        PrintNCG76DiagnosticLine("[EDM204] event=TARGET_AXIS_FROZEN session=%llu parentPC=%d frameGeneration=%llu mode=%u programDeltaX=%.17g programDeltaY=%.17g programDeltaZ=%.17g K=%.17g plane=PERPENDICULAR_XYZ_TARGET source=RESOLVED_PROGRAM_TARGET nominalChildren=25 center=XYZ flushAxis=NEGATIVE_COMPENSATED_XYZ_TARGET discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(frozen.generation),
-            input.end[0U]-input.start[0U],input.end[1U]-input.start[1U],input.end[2U]-input.start[2U],
-            input.shapeAngleDeg,static_cast<unsigned>(m_edm130.recipe.planMovementMask));
+            E181EffectiveOrbitMode(w.authored),input.end[0U]-input.start[0U],input.end[1U]-input.start[1U],
+            input.end[2U]-input.start[2U],input.shapeAngleDeg);
     if(!EDM173::UsesNominalMovementMask(m_edm130.recipe)&&EDM173::PreservesG90StationaryZ(m_edm130.recipe)&&
         frozen.distanceMode==90&&input.start[2U]==input.end[2U])
-        PrintNCG76DiagnosticLine("[EDM196] event=G90_Z_ANCHOR session=%llu parentPC=%d frameGeneration=%llu mode=%u startNativeZ=%.17g finalNativeZ=%.17g authoredZStationary=1 nominalPoints=25 centerAnchored=%u requiredMovementMask=%u flushNativeZ=1 rule=EXACT_PROGRAM_Z discharge=0\n",
+        PrintNCG76DiagnosticLine("[EDM196] event=G90_Z_ANCHOR session=%llu parentPC=%d frameGeneration=%llu mode=%u startNativeZ=%.17g finalNativeZ=%.17g authoredZStationary=1 nominalPoints=25 centerAnchored=%u requiredMovementMask=%u flushNativeZ=%u rule=EXACT_PROGRAM_Z discharge=0\n",
             static_cast<unsigned long long>(s.session),s.pc[0U],static_cast<unsigned long long>(frozen.generation),
             E181EffectiveOrbitMode(w.authored),start[2U],w.nominal.pointsMCS[24U][2U],EDM173::IsCenterRecipe(m_edm130.recipe)?1U:0U,
-            static_cast<unsigned>(m_edm130.recipe.planMovementMask));
+            static_cast<unsigned>(m_edm130.recipe.planMovementMask),EDM173::IsCenterRecipe(m_edm130.recipe)?0U:1U);
     PrintNCG76DiagnosticLine("[EDM181] event=B_MODE_FROZEN session=%llu parentPC=%d source=%s authoredBPresent=%u mode=%u arm=P%u modalUnchanged=1 scope=G76_CURRENT_BLOCK discharge=0\n",
         static_cast<unsigned long long>(s.session),s.pc[0U],w.authored.has('B')?"EXPLICIT":"DEFAULT",
         w.authored.has('B')?1U:0U,E181EffectiveOrbitMode(w.authored),s.gapHistoryArm);
@@ -26333,16 +26687,43 @@ WaitConditionFunc NCManager::StartEDM173SameThread(const NCBlock& b)
             input.start[0U],input.start[1U],input.start[2U],input.end[0U],input.end[1U],input.end[2U]);
     w.loggedTriggers=w.loggedCompletions=0ULL;w.loggedPhase=0U;w.retained=EDM173::Feedback{};
     m_g76PowerInhibited=true;ForceEDMPLCOutputsOffSameThread("EDM173_ARM");
-    if(s.gapHistoryArm==EDM173::B0ArmP) {
+    if(EDM173::IsArm(s.gapHistoryArm)) {
         const EDM192Arm::Scope admissionScope{s.session,static_cast<std::uint64_t>(s.armEpoch),
             static_cast<std::uint64_t>(m_motion.GetCurrentExecutionEpoch()),
             static_cast<std::uint32_t>(s.lease.owner),static_cast<std::uint32_t>(s.lease.generation),
             EDM173::HistoryFixture,m_edm130.recipe.commissioningProfile};
         PrimeEDM192AdmissionObserver(admissionScope);
     }
-    if(!m_motion.SubmitEDM173Arm(s.session,s.armEpoch,s.lease,s.gapTuning,s.gapFlushParameters,m_edm130.recipe))
+    const auto* armSource=GetBaseProgramCache().TryGetLine(s.armPC);
+    const bool rejectBeforeArm=b.has('L')&&b.val('L')==216.0;
+    if(!armSource||rejectBeforeArm!=E216RejectBeforeArm(armSource->parsedBlock,s.gapHistoryArm))
+    {RejectEDM94SameThread("EDM216_PROBE_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    if((b.has('L')&&b.val('L')==1.0)!=E217CenterNominalHold(armSource->parsedBlock,s.gapHistoryArm))
+    {RejectEDM94SameThread("EDM217_HOLD_SOURCE_SCOPE",m_gapDryRun.sourceLine);return nullptr;}
+    if(!m_motion.SubmitEDM173Arm(s.session,s.armEpoch,s.lease,s.gapTuning,s.gapFlushParameters,m_edm130.recipe,rejectBeforeArm))
     {RejectEDM94SameThread("EDM173_ARM_PUBLICATION",m_gapDryRun.sourceLine);return nullptr;}
     s.latched=s.armPending=true;
+    if(rejectBeforeArm)
+        PrintNCG76DiagnosticLine("[EDM216] event=ARM_REJECT_PROBE_REQUEST session=%llu profile=%u B=%u expect=REQUEST_SHAPE_REJECTED cause=RECOVERY_PROBE phase=BEFORE_ENGINE_ARM output=NONE next=MANUAL_RESET_THEN_NORMAL_PROGRAM discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned>(m_edm130.recipe.commissioningProfile),
+            EDM173::ModeForArm(s.gapHistoryArm));
+    // E204 FIX1: observe configured banks once from the NC thread. No live
+    // integral/history is read here and no PID value is changed. Missing
+    // FLUSH configuration may legitimately inherit the G00 values.
+    // EDM204_FIX1_CENTER_PID_CONFIG_BEGIN
+    if(EDM173::IsCenterRecipe(m_edm130.recipe))
+    {
+        for(unsigned axisIndex=0U;axisIndex<3U;++axisIndex)
+        {
+            const auto& configured=m_motion.GetAxisContext(static_cast<int>(axisIndex));
+            const auto& g00=configured.Pid_G00;const auto& flush=configured.Pid_FLUSH;
+            const bool equal=g00.Kp==flush.Kp&&g00.Ki==flush.Ki&&g00.Kd==flush.Kd&&g00.Kvff==flush.Kvff;
+            PrintNCG76DiagnosticLine("[EDM204_FIX1] event=CENTER_PID_CONFIG session=%llu mode=%u axis=%c g00Kp=%.9g g00Ki=%.9g g00Kd=%.9g g00Kvff=%.9g flushKp=%.9g flushKi=%.9g flushKd=%.9g flushKvff=%.9g banksEqual=%u values=STATIC gainWrite=NONE selection=ACCEPTED_CENTER_EVENT discharge=0\n",
+                static_cast<unsigned long long>(s.session),EDM173::ModeForArm(s.gapHistoryArm),"XYZ"[axisIndex],
+                g00.Kp,g00.Ki,g00.Kd,g00.Kvff,flush.Kp,flush.Ki,flush.Kd,flush.Kvff,equal?1U:0U);
+        }
+    }
+    // EDM204_FIX1_CENTER_PID_CONFIG_END
     RtPrintf("[EDM173] event=ARM_REQUEST session=%llu run=%llu cache=%llu armEpoch=%llu source=AUTO_WAVE ADrequired=0 parentPC=%d children=25 E5us=%llu E6microMm=%llu motion=REAL_ETHERCAT S92=0 S93=0 coreBuild=%u p50Bulk=QUIET timing=ON rtEvidence=ON B=%u arm=P%u\n",
         static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(s.run),static_cast<unsigned long long>(s.cache),
         static_cast<unsigned long long>(s.armEpoch),s.pc[0U],static_cast<unsigned long long>(m_edm130.recipe.workTimeUs),
@@ -26366,17 +26747,25 @@ WaitConditionFunc NCManager::StartEDM173OrbitSameThread(const NCBlock& b)
     g.native=w.nominal;g.program=w.nominal.program;
     EDM173::Scope scope{};scope.session=s.session;scope.run=s.run;scope.cache=s.cache;scope.dispatch=g.dispatch;
     scope.sourcePC=g.pc;scope.line=g.line;scope.armEpoch=s.armEpoch;scope.owner=s.lease;
-    double centerReturnFeed=0.0;
+    double centerReturnFeed=0.0,configuredCenterReturnFeed=0.0;
     if(EDM173::IsCenterRecipe(m_edm130.recipe))
     {
         const auto speeds=GlobalConfig::GetInstance().GetG76CenterReturnSpeeds();
         if(!EDM171Config::ValidCenterReturnSpeeds(speeds))
         {RejectEDM94SameThread(EDM173::IsB4Recipe(m_edm130.recipe)?"EDM177_CENTER_SPEED_CONFIG":"EDM176_CENTER_SPEED_CONFIG",g.line);return nullptr;}
-        const double configured=EDM173::IsB4Recipe(m_edm130.recipe)?speeds.b4MmMin:speeds.b3MmMin;
-        centerReturnFeed=configured>0.0?configured:g.feed.feedMMMin;
+        configuredCenterReturnFeed=EDM173::IsB4Recipe(m_edm130.recipe)?speeds.b4MmMin:speeds.b3MmMin;
+        centerReturnFeed=configuredCenterReturnFeed>0.0?configuredCenterReturnFeed:g.feed.feedMMMin;
     }
     if(!EDM173::Build(scope,w.nominal,m_edm130.recipe,s.gapTuning,w.plan,centerReturnFeed))
     {RejectEDM94SameThread("EDM173_PLAN_SCOPE",g.line);return nullptr;}
+    // EDM213: one NC-thread observation of the exact speed frozen above.
+    // The controller's existing fixture/output caps remain independent.
+    if(EDM173::IsCenterRecipe(w.plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM213] event=CENTER_RETURN_SPEED_FROZEN session=%llu mode=%u parameter=%s selection=%s configuredMmMin=%.12g nominalFeedMmMin=%.12g frozenRequestedMmMin=%.12g discharge=0\n",
+            static_cast<unsigned long long>(s.session),EDM173::ModeForArm(s.gapHistoryArm),
+            EDM173::IsB4Recipe(w.plan.recipe)?"G76_B4_CENTER_RETURN_MM_MIN":"G76_B3_CENTER_RETURN_MM_MIN",
+            configuredCenterReturnFeed>0.0?"PARAMETER":"G76_F",configuredCenterReturnFeed,
+            g.feed.feedMMMin,w.plan.centerReturnFeedMmMin);
     NCG76Mixed::Point8 stationaryRotaryModulo{};
     for(unsigned axis=3U;axis<6U;++axis)
         stationaryRotaryModulo[axis]=m_fixedTranslationTravel[axis].rotaryModulo;
@@ -26582,16 +26971,17 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
             if(!std::isfinite(e.topPositionPulse[axis])||std::fabs(e.topPositionPulse[axis]-canonicalTop[axis])>budget)return false;
         }
     }
-    double centerRadiusMm=0.0,centerRiseMm=0.0;
+    EDM204::Geometry centerGeometry{};
     if(b3||b4)
     {
         NCG76::Point8 centerStartMCS{},centerEndMCS{};
-        EDM126::Point nominalCenter{};
+        EDM126::Point nominalCenter{},axisNative{},axisPulse{};
         if(!EDM128::ValidB3Proof(e)||!e.centerCaptured||e.centerLegsCompleted!=15U||
             e.qualifiedDwells!=5U||timed.coordinator.qualifiedDwells!=5U||
             !EDM109::SameDouble(e.centerReturnMmMin,plan.centerReturnFeedMmMin)||
             !EDM173::CenterBoundary(plan,child,centerStartMCS)||
-            !EDM173::CenterBoundary(plan,child+1U,centerEndMCS))return false;
+            !EDM173::CenterBoundary(plan,child+1U,centerEndMCS)||
+            !EDM173::MachiningAxisNative(plan,axisNative))return false;
         for(unsigned axis=0U;axis<6U;++axis)
         {
             const double from=axis>=3U||centerStartMCS[axis]==plan.nominal.startMCS[axis]?g.receipt.startPulse[axis]:
@@ -26600,29 +26990,25 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
                 centerEndMCS[axis]*g.receipt.pulsePerUnit[axis];
             const double ratio=e.anchor.localMm/anchorCurve.lengthMm;
             nominalCenter[axis]=ratio==0.0?from:ratio==1.0?to:from+(to-from)*ratio;
-            const double budget=64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(nominalCenter[axis]));
-            if(!std::isfinite(nominalCenter[axis])||
-                (axis>=(b3?3U:2U)&&std::fabs(nominalCenter[axis]-e.anchor.positionPulse[axis])>budget))return false;
-            if(axis<(b3?3U:2U))centerRadiusMm=std::hypot(centerRadiusMm,
-                (e.anchor.positionPulse[axis]-nominalCenter[axis])/g.receipt.pulsePerUnit[axis]);
+            axisPulse[axis]=axisNative[axis]*anchorScale[axis];
+            const double budget=EDM204::Roundoff(nominalCenter[axis]);
+            if(!std::isfinite(nominalCenter[axis])||!std::isfinite(e.nominalCenterPositionPulse[axis])||
+                std::fabs(e.nominalCenterPositionPulse[axis]-nominalCenter[axis])>budget||
+                e.tangentPulsePerMm[axis]!=axisPulse[axis]||
+                (axis>=3U&&(!EDM109::SameDouble(nominalCenter[axis],e.anchor.positionPulse[axis])||
+                    !EDM109::SameDouble(e.nominalCenterPositionPulse[axis],e.anchor.positionPulse[axis]))))return false;
         }
-        if(!std::isfinite(centerRadiusMm)||centerRadiusMm<0.0||
-            centerRadiusMm>EDM173::FrozenHeightMm(plan.recipe))return false;
-        centerRiseMm=b4?centerRadiusMm:0.0;
+        // Reconstruct from the sealed signed XYZ target, never the child tangent
+        // or the undirected orbit-plane normal. E6 is measured from nominal C.
+        if(!EDM204::Build(e.anchor.positionPulse,nominalCenter,axisPulse,anchorScale,
+            EDM173::FrozenHeightMm(plan.recipe),b3?3U:4U,centerGeometry))return false;
         for(unsigned axis=0U;axis<6U;++axis)
         {
-            // B3 returns to the genuine XYZ center at the stopped cursor.
-            // B4 keeps its native XY 45-degree upper-center construction.
-            // E6 remains the total apex height above the stopped anchor.
-            const double expectedCenter=axis<(b3?3U:2U)?nominalCenter[axis]:axis==2U?
-                e.anchor.positionPulse[axis]+centerRiseMm*g.receipt.pulsePerUnit[axis]:e.anchor.positionPulse[axis];
-            const double budget=64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(expectedCenter));
-            if(!std::isfinite(e.centerPositionPulse[axis])||std::fabs(e.centerPositionPulse[axis]-expectedCenter)>budget||
-                (axis>=3U&&!EDM109::SameDouble(e.centerPositionPulse[axis],e.anchor.positionPulse[axis])))return false;
-            const double expectedTop=axis==2U?e.anchor.positionPulse[axis]+
-                EDM173::FrozenHeightMm(plan.recipe)*g.receipt.pulsePerUnit[axis]:expectedCenter;
-            const double topBudget=64.0*(std::numeric_limits<double>::epsilon)()*(std::max)(1.0,std::fabs(expectedTop));
-            if(!std::isfinite(e.topPositionPulse[axis])||std::fabs(e.topPositionPulse[axis]-expectedTop)>topBudget)return false;
+            if(!std::isfinite(e.centerPositionPulse[axis])||!std::isfinite(e.topPositionPulse[axis])||
+                std::fabs(e.centerPositionPulse[axis]-centerGeometry.centerPulse[axis])>EDM204::Roundoff(centerGeometry.centerPulse[axis])||
+                std::fabs(e.topPositionPulse[axis]-centerGeometry.topPulse[axis])>EDM204::Roundoff(centerGeometry.topPulse[axis])||
+                (axis>=3U&&(!EDM109::SameDouble(e.centerPositionPulse[axis],e.anchor.positionPulse[axis])||
+                    !EDM109::SameDouble(e.topPositionPulse[axis],e.anchor.positionPulse[axis]))))return false;
         }
     }
     else if(!EDM128::EmptyB3Proof(e))return false;
@@ -26642,6 +27028,10 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
         RtPrintf("[EDM200] event=CHECKPOINT_COMPLETE session=%llu hold=%llu start=%llu eventIndex=1 children=25 B2events=1 exactReturn=1 proof=VALIDATED_PARENT_AND_RT_RUNNING discharge=0\n",
             static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(m_edm200.holdSequence),
             static_cast<unsigned long long>(m_edm200.resumeStartSequence));
+    if(EDM130::IsG76CenterHold217(plan.recipe))
+        PrintNCG76DiagnosticLine("[EDM217] event=CHECKPOINT_COMPLETE session=%llu hold=%llu start=%llu B=%u holdEventIndex=0 children=25 E5events=1 exactReturn=1 proof=VALIDATED_PARENT_AND_RT_RUNNING discharge=0\n",
+            static_cast<unsigned long long>(s.session),static_cast<unsigned long long>(m_edm200.holdSequence),
+            static_cast<unsigned long long>(m_edm200.resumeStartSequence),mode);
     RtPrintf("[EDM173] event=GAP_E5_VERIFIED session=%llu parentPC=%d children=25 triggered=1 completed=1 B%uevents=1 heightMicroMm=%llu exactReturn=1 discharge=0\n",
         static_cast<unsigned long long>(s.session),g.pc,mode,static_cast<unsigned long long>(plan.recipe.jumpHeightScaled));
     if(b0)
@@ -26654,24 +27044,20 @@ bool NCManager::IsEDM173RuntimeCompleteSameThread() noexcept
             static_cast<unsigned long long>(s.session),g.pc,child+1U,static_cast<unsigned>(e.targetSource.ordinal)+1U,
             e.anchor.stationMm,e.targetStationMm,e.actualJumpHeightMm,
             static_cast<unsigned long long>(feedback.eventBackwardCrossings),static_cast<unsigned long long>(feedback.eventForwardCrossings));
-    if(b3)
+    if(b3||b4)
     {
-        PrintNCG76DiagnosticLine("[EDM176] event=B3_CENTER_VERIFIED session=%llu parentPC=%d anchorChild=%u centerXpulse=%.12g centerYpulse=%.12g centerZpulse=%.12g centerRequestedF=%.12g centerCapF=%.12g liftMm=%.12g settledLegs=4 legMask=%u dwells=%u exactReturn=1 discharge=0\n",
-            static_cast<unsigned long long>(s.session),g.pc,child+1U,e.centerPositionPulse[0U],e.centerPositionPulse[1U],
-            e.centerPositionPulse[2U],e.centerReturnMmMin,(std::min)(e.centerReturnMmMin,EDM173::FeedMmMin),
-            e.actualJumpHeightMm,e.centerLegsCompleted,e.qualifiedDwells);
-        PrintNCG76DiagnosticLine("[EDM203] event=B3_AXIS_CENTER_VERIFIED session=%llu parentPC=%d anchorChild=%u anchorZpulse=%.12g centerZpulse=%.12g topZpulse=%.12g centerOffsetZmm=%.12g verticalSpanMm=%.12g radius3DMm=%.12g source=SEALED_CENTER_AT_STOPPED_CURSOR exactReturn=1 CUVfixed=1 discharge=0\n",
-            static_cast<unsigned long long>(s.session),g.pc,child+1U,e.anchor.positionPulse[2U],
-            e.centerPositionPulse[2U],e.topPositionPulse[2U],
-            (e.centerPositionPulse[2U]-e.anchor.positionPulse[2U])/anchorScale[2U],
-            EDM173::FrozenHeightMm(plan.recipe)+(e.anchor.positionPulse[2U]-e.centerPositionPulse[2U])/anchorScale[2U],
-            centerRadiusMm);
+        PrintNCG76DiagnosticLine("[EDM204] event=CENTER_AXIS_VERIFIED session=%llu parentPC=%d mode=%u anchorChild=%u machiningX=%.12g machiningY=%.12g machiningZ=%.12g radiusMm=%.12g axialSpanMm=%.12g withdrawalMm=%.12g centerF=%.12g settledLegs=4 dwells=%u exactReturn=1 CUVfixed=1 discharge=0\n",
+            static_cast<unsigned long long>(s.session),g.pc,mode,child+1U,
+            e.tangentPulsePerMm[0U]/anchorScale[0U],e.tangentPulsePerMm[1U]/anchorScale[1U],e.tangentPulsePerMm[2U]/anchorScale[2U],
+            centerGeometry.radiusMm,centerGeometry.axialSpanMm,centerGeometry.heightMm,
+            (std::min)(e.centerReturnMmMin,EDM173::FeedMmMin),e.qualifiedDwells);
+        PrintNCG76DiagnosticLine("[EDM204] event=CENTER_ORIGIN_POINTS session=%llu parentPC=%d mode=%u anchorXpulse=%.12g anchorYpulse=%.12g anchorZpulse=%.12g nominalCenterXpulse=%.12g nominalCenterYpulse=%.12g nominalCenterZpulse=%.12g discharge=0\n",
+            static_cast<unsigned long long>(s.session),g.pc,mode,e.anchor.positionPulse[0U],e.anchor.positionPulse[1U],e.anchor.positionPulse[2U],
+            e.nominalCenterPositionPulse[0U],e.nominalCenterPositionPulse[1U],e.nominalCenterPositionPulse[2U]);
+        PrintNCG76DiagnosticLine("[EDM204] event=CENTER_ROUTE_POINTS session=%llu parentPC=%d mode=%u waypointXpulse=%.12g waypointYpulse=%.12g waypointZpulse=%.12g topXpulse=%.12g topYpulse=%.12g topZpulse=%.12g discharge=0\n",
+            static_cast<unsigned long long>(s.session),g.pc,mode,e.centerPositionPulse[0U],e.centerPositionPulse[1U],e.centerPositionPulse[2U],
+            e.topPositionPulse[0U],e.topPositionPulse[1U],e.topPositionPulse[2U]);
     }
-    if(b4)
-        PrintNCG76DiagnosticLine("[EDM177] event=B4_UPPER_CENTER_VERIFIED session=%llu parentPC=%d anchorChild=%u upperXpulse=%.12g upperYpulse=%.12g upperZpulse=%.12g radiusMm=%.12g upperRiseMm=%.12g centerRequestedF=%.12g centerCapF=%.12g totalHeightMm=%.12g settledLegs=4 legMask=%u dwells=%u exactReturn=1 discharge=0\n",
-            static_cast<unsigned long long>(s.session),g.pc,child+1U,e.centerPositionPulse[0U],e.centerPositionPulse[1U],
-            e.centerPositionPulse[2U],centerRadiusMm,centerRiseMm,e.centerReturnMmMin,
-            (std::min)(e.centerReturnMmMin,EDM173::FeedMmMin),e.actualJumpHeightMm,e.centerLegsCompleted,e.qualifiedDwells);
     return true;
 }
 
@@ -26697,16 +27083,6 @@ bool NCManager::WaitEDM173SameThread()
     {RejectEDM94SameThread("EDM200_FINISH_CHECKPOINT_NOT_COMPLETED",m_gapDryRun.sourceLine);return false;}
     if(s.armPending)
     {
-        if(s.gapHistoryArm==EDM173::B0ArmP&&m_motion.IsMotionOwnerLeaseCurrent(s.lease)) {
-            const EDM192Arm::Scope admissionScope{s.session,static_cast<std::uint64_t>(s.armEpoch),
-                static_cast<std::uint64_t>(m_motion.GetCurrentExecutionEpoch()),
-                static_cast<std::uint32_t>(s.lease.owner),static_cast<std::uint32_t>(s.lease.generation),
-                EDM173::HistoryFixture,m_edm130.recipe.commissioningProfile};
-            if(PollEDM192AdmissionObserver(admissionScope)) {
-                RejectEDM94SameThread("EDM192_ARM_ADMISSION_REJECTED",m_gapDryRun.sourceLine);
-                return false;
-            }
-        }
         EDM126::MotionFeedback source{};
         if(guard.identity.session==s.session&&guard.identity.epoch==s.armEpoch&&guard.identity.ownerGeneration==s.lease.generation&&
             guard.currentIdentity.session==s.session&&guard.currentIdentity.epoch==s.armEpoch&&
@@ -26719,7 +27095,21 @@ bool NCManager::WaitEDM173SameThread()
             m_motion.ReadEDM126Feedback(source)&&source.enabled&&source.active&&!source.faulted&&source.fixture==14U&&
             source.session==s.session&&source.armEpoch==s.armEpoch&&source.liveEpoch==s.armEpoch&&source.ownerGeneration==s.lease.generation&&source.sourceReady&&
             source.sourceReason==EDM88::Reason::None&&!source.authorizedRows&&!source.completedRows&&!source.rowActive)
-        {s.armPending=false;s.ready=s.everArmed=true;s.polls=0U;RtPrintf("[EDM173] event=ARMED session=%llu source=AUTO_WAVE commonGAP=1 E5=1 discharge=0\n",static_cast<unsigned long long>(s.session));return true;}
+        {
+            s.armPending=false;s.ready=s.everArmed=true;s.polls=0U;
+            // EDM212_CENTER_FOLLOWING_POLICY_BEGIN
+            // NC-only, once after the actual RT arm receipt is accepted.
+            if(EDM173::IsCenterRecipe(m_edm130.recipe))
+            {
+                const bool enabled=EDM94::EmptyLoadCenterDynamicFollowing;
+                PrintNCG76DiagnosticLine("[EDM212] event=CENTER_FOLLOWING_POLICY session=%llu mode=%u enabled=%u runtimeTripMm=%.9g axes=XYZ phases=NOMINAL_MOVE_DWELL_FINISH commandCorridor=STRICT actualAllowance=RUNTIME_TRIP_MM arm=STRICT settle=STRICT stop=STRICT reset=STRICT source=UNCHANGED outputCap=UNCHANGED discharge=0\n",
+                    static_cast<unsigned long long>(s.session),EDM173::ModeForArm(s.gapHistoryArm),enabled?1U:0U,
+                    enabled?EDM94::CenterDynamicFollowingMm:0.0);
+            }
+            // EDM212_CENTER_FOLLOWING_POLICY_END
+            RtPrintf("[EDM173] event=ARMED session=%llu source=AUTO_WAVE commonGAP=1 E5=1 discharge=0\n",static_cast<unsigned long long>(s.session));
+            return true;
+        }
     }
     else if(s.finishPending&&m_edm173->completed&&E156FinishTargetMatches(s,m_edm130.recipe,guard,m_edm114.retained)&&
         guard.identity.session==s.session&&guard.identity.epoch==s.armEpoch&&guard.identity.ownerGeneration==s.lease.generation&&

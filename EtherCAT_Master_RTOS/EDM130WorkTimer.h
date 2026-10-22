@@ -21,6 +21,9 @@ constexpr std::uint16_t G76B3Profile176=6U;
 constexpr std::uint64_t G76B3HeightScaled176=2000000ULL;
 constexpr std::uint16_t G76B4Profile177=7U;
 constexpr std::uint64_t G76B4HeightScaled177=2000000ULL;
+// E214: center commissioning admits either the one-mm test stroke or the
+// retained two-mm stroke. The selected E6 stays part of the frozen recipe.
+constexpr std::uint64_t G76CenterShortHeightScaled214=1000000ULL;
 // EDM192 B0 is a bounded native tangent excursion, not a visible-Z grant.
 constexpr std::uint16_t G76B0Profile192=8U;
 constexpr std::uint64_t G76B0HeightScaled192=2000000ULL;
@@ -153,6 +156,7 @@ struct Recipe
     // EDM165/168: literal H1 L1 selects the first global E5; L2 selects the
     // first B1 E5; L3 selects an eligible B2 E5 after crossing retained history.
     // EDM200 also admits P294 L3 without H for the sealed G76 B2 test.
+    // EDM217 uses P296/P298 L1 without H for a nominal GAP work checkpoint.
     // NC submits one existing HOLD transaction at >=25%; START remains operator-only.
     std::uint16_t flushHoldTest=0U;
     std::uint64_t jumpHeightScaled=0ULL; // Millimetres in recipe fixed-point units (1e6).
@@ -188,6 +192,11 @@ inline bool IsG76B3Flush176(const Recipe& r) noexcept
 {return r.commissioningProfile==G76B3Profile176;}
 inline bool IsG76B4Flush177(const Recipe& r) noexcept
 {return r.commissioningProfile==G76B4Profile177;}
+// EDM217: one nominal GAP pause checkpoint, before the first E5 event.
+// This flag grants no in-flight center pause, retreat, JOG or auto-resume.
+inline bool IsG76CenterHold217(const Recipe& r) noexcept
+{return (IsG76B3Flush176(r)||IsG76B4Flush177(r))&&r.flushHoldTest==1U&&
+    !r.holdRetreatMode&&r.diagnosticControlSource==3U;}
 inline bool IsG76B0Flush192(const Recipe& r) noexcept
 {return r.commissioningProfile==G76B0Profile192;}
 inline bool IsG76Gap173(const Recipe& r) noexcept
@@ -196,7 +205,7 @@ inline bool IsOneShotCommissioning(const Recipe& r) noexcept
 {return IsVisibleFlush(r)||IsVisibleFlush159(r)||IsVisibleFlush167(r)||IsG76Gap173(r);}
 // Explicit L words remain opt-in: omitted L is stored as zero, never L0.
 inline bool ValidFlushHoldSelection(unsigned arm,unsigned value) noexcept
-{return value==1U?(EDM149::IsFlushHoldTestArm(arm)&&!EDM149::IsManualVoltageTestArm(arm)):
+{return value==1U?((EDM149::IsFlushHoldTestArm(arm)&&!EDM149::IsManualVoltageTestArm(arm))||arm==296U||arm==298U):
     (arm==274U&&(value==2U||value==3U))||(arm==294U&&value==3U);}
 inline unsigned FlushHoldTargetMode(unsigned selector) noexcept
 {return selector==2U?1U:selector==3U?2U:3U;}
@@ -248,12 +257,18 @@ inline bool ValidWorkTime(std::uint64_t us) noexcept
 {return us>=MinimumWorkTimeUs&&us<=MaximumWorkTimeUs;}
 inline bool ValidSpeedPercent(std::uint64_t percentScaled) noexcept
 {return percentScaled>=50000000ULL&&percentScaled<=100000000ULL;}
+// E210: only B3/B4 center commissioning accepts the frozen E7 override.
+// Other G76 modes retain their established exact-100-percent contract.
+inline bool ValidG76FlushSpeedPercent(unsigned commissioningProfile,std::uint64_t percentScaled) noexcept
+{return (commissioningProfile==G76B3Profile176||commissioningProfile==G76B4Profile177)?
+    ValidSpeedPercent(percentScaled):percentScaled==100000000ULL;}
 inline bool HasBoundSpeed(const Recipe& r) noexcept
 {return r.speedFieldId!=0U&&r.jumpSpeedPercentScaled!=0ULL;}
+inline bool ValidG76CenterHeightScaled(std::uint64_t heightScaled) noexcept
+{return heightScaled==G76CenterShortHeightScaled214||heightScaled==G76B3HeightScaled176;}
 inline bool ValidJumpHeight(std::uint64_t heightScaled,unsigned commissioningProfile=0U) noexcept
 {return commissioningProfile<=G76B0Profile192&&(commissioningProfile==G76B0Profile192?heightScaled==G76B0HeightScaled192:
-    commissioningProfile==G76B4Profile177?heightScaled==G76B4HeightScaled177:
-    commissioningProfile==G76B3Profile176?heightScaled==G76B3HeightScaled176:
+    (commissioningProfile==G76B4Profile177||commissioningProfile==G76B3Profile176)?ValidG76CenterHeightScaled(heightScaled):
     commissioningProfile==G76B2Profile175?heightScaled==G76B2HeightScaled175:
     commissioningProfile==VisibleFlushProfile173?heightScaled==VisibleFlushHeightScaled173:
     commissioningProfile==VisibleFlushProfile167?heightScaled==VisibleFlushHeightScaled167:
@@ -305,8 +320,8 @@ inline bool ValidDeepFlushValues(std::uint64_t heightScaled,std::uint32_t interv
 {
     if(commissioningProfile>G76B0Profile192)return false;
     if(commissioningProfile==G76B0Profile192)return heightScaled==G76B0HeightScaled192&&interval==0U&&multiplierScaled==1000000ULL;
-    if(commissioningProfile==G76B4Profile177)return heightScaled==G76B4HeightScaled177&&interval==0U&&multiplierScaled==1000000ULL;
-    if(commissioningProfile==G76B3Profile176)return heightScaled==G76B3HeightScaled176&&interval==0U&&multiplierScaled==1000000ULL;
+    if(commissioningProfile==G76B4Profile177||commissioningProfile==G76B3Profile176)
+        return ValidG76CenterHeightScaled(heightScaled)&&interval==0U&&multiplierScaled==1000000ULL;
     if(commissioningProfile==G76B2Profile175)return heightScaled==G76B2HeightScaled175&&interval==0U&&multiplierScaled==1000000ULL;
     if(commissioningProfile==VisibleFlushProfile173)return heightScaled==VisibleFlushHeightScaled173&&interval==0U&&multiplierScaled==1000000ULL;
     if(commissioningProfile==VisibleFlushProfile167)return heightScaled==VisibleFlushHeightScaled167&&interval==0U&&multiplierScaled==1000000ULL;
@@ -324,7 +339,8 @@ inline bool DeepFlushScaledValues(double baseHeightMm,double multiplier,
 {
     if(commissioningProfile>G76B0Profile192||!std::isfinite(baseHeightMm)||
         (commissioningProfile==G76B2Profile175?baseHeightMm!=0.001:
-        (commissioningProfile==VisibleFlushProfile159||commissioningProfile==VisibleFlushProfile167||commissioningProfile==VisibleFlushProfile173||commissioningProfile==G76B3Profile176||commissioningProfile==G76B4Profile177||commissioningProfile==G76B0Profile192)?baseHeightMm!=2.0:commissioningProfile==VisibleFlushProfile158?baseHeightMm!=5.0:(baseHeightMm<0.0001||baseHeightMm>0.005))||
+        (commissioningProfile==G76B3Profile176||commissioningProfile==G76B4Profile177)?(baseHeightMm!=1.0&&baseHeightMm!=2.0):
+        (commissioningProfile==VisibleFlushProfile159||commissioningProfile==VisibleFlushProfile167||commissioningProfile==VisibleFlushProfile173||commissioningProfile==G76B0Profile192)?baseHeightMm!=2.0:commissioningProfile==VisibleFlushProfile158?baseHeightMm!=5.0:(baseHeightMm<0.0001||baseHeightMm>0.005))||
         !std::isfinite(multiplier)||multiplier<0.0||multiplier>20.0)return false;
     const auto height=static_cast<std::uint64_t>(std::llround(baseHeightMm*1000000.0));
     const auto factor=static_cast<std::uint64_t>(std::llround(multiplier*1000000.0));
@@ -355,7 +371,7 @@ inline bool ValidRecipe(const Recipe& r) noexcept
     return r.holdRetreatMode<=1U&&r.flushHoldTest<=3U&&
         (r.flushHoldTest<=1U||((!r.commissioningProfile||IsG76B2FlushHold200(r))&&r.diagnosticControlSource==3U))&&
         (!r.flushHoldTest||(IsMotionTest(r)&&HasBoundProgramPlan(r)&&
-            (IsG76B2FlushHold200(r)||(r.holdRetreatMode==1U&&
+            (IsG76B2FlushHold200(r)||IsG76CenterHold217(r)||(r.holdRetreatMode==1U&&
              (!r.commissioningProfile||IsVisibleFlush159(r)||IsVisibleFlush167(r))))))&&
         (!r.holdRetreatMode||(IsMotionTest(r)&&HasBoundProgramPlan(r)&&
             (!r.commissioningProfile||IsVisibleFlush159(r)||IsVisibleFlush167(r))))&&
@@ -368,14 +384,14 @@ inline bool ValidRecipe(const Recipe& r) noexcept
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
             !r.holdRetreatMode&&!r.flushHoldTest))&&
-        (!IsG76B3Flush176(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==G76B3HeightScaled176&&
+        (!IsG76B3Flush176(r)||(HasBoundHeight(r)&&ValidG76CenterHeightScaled(r.jumpHeightScaled)&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
-            r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&!r.flushHoldTest))&&
-        (!IsG76B4Flush177(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==G76B4HeightScaled177&&
+            ValidG76FlushSpeedPercent(r.commissioningProfile,r.jumpSpeedPercentScaled)&&r.diagnosticControlSource==3U&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76CenterHold217(r))))&&
+        (!IsG76B4Flush177(r)||(HasBoundHeight(r)&&ValidG76CenterHeightScaled(r.jumpHeightScaled)&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
-            r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
-            !r.holdRetreatMode&&!r.flushHoldTest))&&
+            ValidG76FlushSpeedPercent(r.commissioningProfile,r.jumpSpeedPercentScaled)&&r.diagnosticControlSource==3U&&
+            !r.holdRetreatMode&&(!r.flushHoldTest||IsG76CenterHold217(r))))&&
         (!IsG76B2Flush175(r)||(HasBoundHeight(r)&&r.jumpHeightScaled==G76B2HeightScaled175&&
             r.workTimeUs>=VisibleFlushMinimumWorkUs173&&r.workTimeUs<=VisibleFlushMaximumWorkUs173&&
             r.jumpSpeedPercentScaled==100000000ULL&&r.diagnosticControlSource==3U&&
@@ -431,7 +447,7 @@ inline bool ValidHistoryRecipeBinding(unsigned fixture,const Recipe& r) noexcept
 {
     return ValidRecipe(r)&&EDM149::ValidHistoryBinding(fixture,r.diagnosticControlSource)&&
         (!r.holdRetreatMode||fixture==(IsVisibleFlush167(r)?EDM149::SixVisibleFlushHistoryFixture:IsVisibleFlush159(r)?EDM149::XYZVisibleFlushHistoryFixture:EDM149::ProgramHistoryFixture))&&
-        (!r.flushHoldTest||fixture==(IsG76B2FlushHold200(r)?EDM149::G76GapHistoryFixture:
+        (!r.flushHoldTest||fixture==((IsG76B2FlushHold200(r)||IsG76CenterHold217(r))?EDM149::G76GapHistoryFixture:
             IsVisibleFlush167(r)?EDM149::SixVisibleFlushHistoryFixture:IsVisibleFlush159(r)?EDM149::XYZVisibleFlushHistoryFixture:EDM149::ProgramHistoryFixture))&&
         ((fixture==EDM149::VisibleFlushHistoryFixture)==IsVisibleFlush(r))&&
         ((fixture==EDM149::XYZVisibleFlushHistoryFixture)==IsVisibleFlush159(r))&&

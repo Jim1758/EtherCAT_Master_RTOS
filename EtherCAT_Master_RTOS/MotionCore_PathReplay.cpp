@@ -822,6 +822,9 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
     if(stationaryRotaryModulo && !EDM173::ValidStationaryRotaryModulo(*stationaryRotaryModulo))
         return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::AXIS_MAPPING);
     const auto& native=plan.nominal;
+    EDM128::Point centerAxisNative{};
+    if(EDM173::IsCenterRecipe(plan.recipe)&&!EDM173::MachiningAxisNative(plan,centerAxisNative))
+        return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::PLAN_INPUT);
     EDM94::Feedback guard{};EDM126::MotionFeedback common{};EDM128::MotionFeedback mode{};
     if(!ReadEDM94Feedback(guard) || !ReadEDM126Feedback(common) || !ReadEDM128Feedback(mode) ||
         !guard.active || !guard.armedReady || guard.forceZero || guard.faulted || guard.cancelled || guard.handoffZero ||
@@ -904,8 +907,9 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
     for (unsigned k=0U;k<native.count;++k) {
         NCG76Mixed::Leg leg{};leg.geometry=work.rebuiltNominal.geometry[k];leg.startU=0.0;leg.endU=1.0;leg.feedPhysicalMmMin=0.12;
         const auto& g=leg.geometry;
-        NCG76::Point8 centerMCS{};
-        if(EDM173::IsCenterRecipe(plan.recipe) && !EDM173::CenterBoundary(plan,k+1U,centerMCS))
+        NCG76::Point8 centerStartMCS{},centerEndMCS{};
+        if(EDM173::IsCenterRecipe(plan.recipe) &&
+            (!EDM173::CenterBoundary(plan,k,centerStartMCS)||!EDM173::CenterBoundary(plan,k+1U,centerEndMCS)))
             return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_CONVERSION,-1,static_cast<int>(k));
         const bool arc=g.kind==NCPathCoreRetainedKind::ARC,reverse=leg.endU<leg.startU;
         double intervalPulse=0.0,intervalMM=0.0;
@@ -947,16 +951,26 @@ bool MotionCore::TryG76GapMoveTransactionalTail(const EDM173::Plan& plan,
                 return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::POINT_CONVERSION,static_cast<int>(a),static_cast<int>(k));
             double low=(std::min)(g.startMCS[a],g.endMCS[a]),high=(std::max)(g.startMCS[a],g.endMCS[a]);
             if (arc && a<2U) { low=g.boundsMinMCS[a]; high=g.boundsMaxMCS[a]; }
-            // B3/B4 reach center XY as well as the authored contour. Checking
-            // every center endpoint bounds the full interpolated center line.
-            if(EDM173::IsCenterRecipe(plan.recipe) && a<2U &&
-                !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,centerMCS[a]))
-                return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_ENDPOINT,static_cast<int>(a),static_cast<int>(k));
+            // Both endpoint centers and their signed axial tops bound the
+            // complete center line and withdrawal route, including B4's join.
+            // Use the same pulse conversion as the retained runtime geometry.
+            if(EDM173::IsCenterRecipe(plan.recipe)) {
+                for(unsigned endpoint=0U;endpoint<2U;++endpoint) {
+                    const auto& center=endpoint==0U?centerStartMCS:centerEndMCS;
+                    const double cp=a>=3U||center[a]==native.startMCS[a]?work.startPulse[a]:center[a]*ppu;
+                    const double tp=centerAxisNative[a]==0.0?cp:
+                        cp-EDM173::FrozenHeightMm(plan.recipe)*(centerAxisNative[a]*ppu);
+                    if(!std::isfinite(cp)||!std::isfinite(tp)||
+                        !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,cp/ppu)||
+                        !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,tp/ppu))
+                        return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_ENDPOINT,static_cast<int>(a),static_cast<int>(k));
+                }
+            }
             if(EDM173::IsB0Recipe(plan.recipe) &&
                 (!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,low+tangentShift[a])||
                  !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,high+tangentShift[a])))
                 return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_ENDPOINT,static_cast<int>(a),static_cast<int>(k));
-            if(a==2U && !EDM173::IsB2Recipe(plan.recipe) && !EDM173::IsB0Recipe(plan.recipe) &&
+            if(a==2U && !EDM173::IsB2Recipe(plan.recipe) && !EDM173::IsB0Recipe(plan.recipe) && !EDM173::IsCenterRecipe(plan.recipe) &&
                 !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,high+EDM173::FrozenHeightMm(plan.recipe)))
                 return reject(true,true,MotionRejectReason::INVALID_GEOMETRY,MotionG76AdmissionGate::TRAVEL_ENDPOINT,2,static_cast<int>(k));
             if (!m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,low) || !m_pCoordMgr->IsTargetWithinSoftwareTravelLimit(axis,high) ||

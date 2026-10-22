@@ -3,6 +3,7 @@
 #include "EDMSixAxisPhysicalGuard.h"
 #include "EDMSixAxisModeFlush.h"
 #include "EDM130WorkTimer.h"
+#include "EDMG76AxisFlushGeometry.h"
 
 // EDM128 coordinates one live GAP history and one bounded local line. The
 // history is suspended during B0/B1: only the selected actual output image is
@@ -111,9 +112,10 @@ struct Feedback
     SpeedStage speedStage=SpeedStage::None;
     double stageDistanceMm=0.0,stageTargetMmSec=0.0;
     double initialStageDistanceMm=0.0,finalStageDistanceMm=0.0;
-    // B3/B4 receipt: a frozen XYZ/upper center and four settled legs.
+    // B3/B4 receipt: true orbit center, on-axis waypoint and four settled legs.
+    // For these modes tangentPulsePerMm is the signed machining-axis vector.
     bool centerCaptured=false;
-    Point centerPositionPulse{};
+    Point centerPositionPulse{},nominalCenterPositionPulse{};
     double centerReturnMmMin=0.0;
     unsigned centerLegsCompleted=0U;
 };
@@ -160,12 +162,13 @@ inline bool VisibleFlush158(const Policy& policy) noexcept
 inline double ReservedVisibleAcceleration(double effectiveMaxSpeedMmSec,double axisAccelerationMmSec2,double heightMm) noexcept
 {
     if(!EDM126::Positive(effectiveMaxSpeedMmSec)||!EDM126::Positive(axisAccelerationMmSec2)||
-        (heightMm!=5.0&&heightMm!=2.0))return 0.0;
+        (heightMm!=5.0&&!EDM204::ValidCommissioningHeightMm(heightMm)))return 0.0;
     const double bound=(std::min)(0.04,axisAccelerationMmSec2);
     const double dt=EDM126::SampleSeconds;
     // Integrate's endpoint zero snap may consume up to Roundoff(length)/dt
     // of residual speed, hence Roundoff(length)/(dt*dt) of acceleration.
-    // Each explicitly authorized profile has a fixed two- or five-mm line.
+    // Profile admission separately binds the selected one-, two- or five-mm
+    // stroke; this numerical reserve never grants a profile or height.
     const double reserve=(std::max)(2.0*EDM126::Roundoff(effectiveMaxSpeedMmSec)/dt,
         2.0*EDM126::Roundoff(heightMm)/(dt*dt));
     const double acceleration=bound-reserve;
@@ -179,15 +182,16 @@ inline double ReservedB3VisibleAcceleration(double effectiveMaxSpeedMmSec,double
     if(!EDM126::Positive(actualLengthMm))return 0.0;
     const double base=ReservedVisibleAcceleration(effectiveMaxSpeedMmSec,axisAccelerationMmSec2,heightMm);
     if(!EDM126::Positive(base))return 0.0;
-    // A center below the anchor makes the real Z leg longer than E6. Add
-    // that endpoint-roundoff reserve; a shorter leg never raises acceleration.
+    // Absolute pulse subtraction can make an axial leg slightly longer than
+    // its authored span. A shorter B4 leg never raises the existing cap.
     const double extra=2.0*(EDM126::Roundoff((std::max)(heightMm,actualLengthMm))-
         EDM126::Roundoff(heightMm))/(EDM126::SampleSeconds*EDM126::SampleSeconds);
     const double acceleration=base-extra;
     return EDM126::Positive(acceleration)?acceleration:0.0;
 }
 inline bool ValidAbsoluteJumpHeightMm(double h,unsigned profile=0U) noexcept
-{return std::isfinite(h)&&profile<=8U&&(profile?h==CommissioningHeightMm(profile):(h>=0.0001&&h<=0.005));}
+{return std::isfinite(h)&&profile<=8U&&((profile==6U||profile==7U)?EDM204::ValidCommissioningHeightMm(h):
+    profile?h==CommissioningHeightMm(profile):(h>=0.0001&&h<=0.005));}
 inline bool HeightClose(double a,double b) noexcept
 {return std::isfinite(a)&&std::isfinite(b)&&std::fabs(a-b)<=EDM126::Roundoff((std::max)(std::fabs(a),std::fabs(b)));}
 // Local distance is measured by subtracting absolute pulse coordinates.
@@ -210,78 +214,45 @@ inline bool LocalHeightClose(double measured,double expected,const Point& anchor
 }
 inline bool EmptyB3Proof(const Feedback& e) noexcept
 {return !e.centerCaptured&&e.centerReturnMmMin==0.0&&e.centerLegsCompleted==0U&&
-    EDM109::SamePulse(e.centerPositionPulse,Point{});}
+    EDM109::SamePulse(e.centerPositionPulse,Point{})&&EDM109::SamePulse(e.nominalCenterPositionPulse,Point{});}
 inline bool SameB3Proof(const Feedback& a,const Feedback& b) noexcept
 {return a.centerCaptured==b.centerCaptured&&a.centerReturnMmMin==b.centerReturnMmMin&&
-    a.centerLegsCompleted==b.centerLegsCompleted&&EDM109::SamePulse(a.centerPositionPulse,b.centerPositionPulse);}
-// E6 is the total native +Z lift above the stopped anchor. B3 can reach a
-// center above or below it; B4 reaches an upper center. Neither center leg
-// nor the remaining center-to-apex distance is the E6 measurement.
+    a.centerLegsCompleted==b.centerLegsCompleted&&EDM109::SamePulse(a.centerPositionPulse,b.centerPositionPulse)&&
+    EDM109::SamePulse(a.nominalCenterPositionPulse,b.nominalCenterPositionPulse);}
+// E6 is measured opposite the signed compensated machining axis from the
+// true orbit center plane. B4's diagonal join contributes to that retreat.
 inline Point HeightOriginPulse(const Feedback& e) noexcept
+{return IsCenterMode(e.policy.mode)?e.nominalCenterPositionPulse:e.anchor.positionPulse;}
+constexpr double B3CenterRadiusLimitMm=EDM204::MaximumRadiusMm;
+inline bool CenterAxisGeometry(const Feedback& e,EDM204::Geometry& geometry) noexcept
 {
-    Point origin=e.anchor.positionPulse;
-    if(IsCenterMode(e.policy.mode)) {
-        origin[0U]=e.centerPositionPulse[0U];origin[1U]=e.centerPositionPulse[1U];
-    }
-    return origin;
+    geometry=EDM204::Geometry{};
+    if(!IsCenterMode(e.policy.mode)||e.policy.fixture!=EDM116::Fixture::ModalG76Gap173||
+        !e.centerCaptured||!e.anchorCaptured||
+        !EDM204::Build(e.anchor.positionPulse,e.nominalCenterPositionPulse,e.tangentPulsePerMm,
+            e.heightPulsePerNative,e.deepBound?e.effectiveJumpHeightMm:e.absoluteJumpHeightMm,
+            static_cast<unsigned>(e.policy.mode),geometry)||
+        !EDM109::SamePulse(e.centerPositionPulse,geometry.centerPulse)||
+        (e.topCaptured&&!EDM109::SamePulse(e.topPositionPulse,geometry.topPulse)))return false;
+    return true;
 }
-constexpr double B3CenterRadiusLimitMm=0.005;
-// The stopped child point and its interpolated sealed center differ by a
-// convex combination of the two orbit offsets, hence by at most the admitted
-// physical radius. Account only for bounded absolute-coordinate roundoff.
-inline bool TryB3CenterSpanMm(const Point& anchor,const Point& center,const Point& scale,
-    double height,double& span) noexcept
-{
-    span=0.0;
-    if(!ValidAbsoluteJumpHeightMm(height,6U))return false;
-    double radius=0.0,tolerance=EDM126::Roundoff(B3CenterRadiusLimitMm);
-    for(unsigned i=0U;i<6U;++i) {
-        if(!std::isfinite(anchor[i])||!std::isfinite(center[i])||!EDM126::Positive(scale[i]))return false;
-        if(i>=3U) {if(center[i]!=anchor[i])return false;continue;}
-        radius=std::hypot(radius,(center[i]-anchor[i])/scale[i]);
-        if(center[i]!=anchor[i]) {
-            const double axis=EDM126::Roundoff((std::max)(std::fabs(anchor[i]),std::fabs(center[i])))/scale[i];
-            if(!std::isfinite(axis))return false;
-            tolerance=std::hypot(tolerance,axis);
-        }
-    }
-    if(!std::isfinite(radius)||!std::isfinite(tolerance)||tolerance>1.0e-8||
-        radius>B3CenterRadiusLimitMm+tolerance)return false;
-    const double actual=center[2U]==anchor[2U]?height:height+(anchor[2U]-center[2U])/scale[2U];
-    if(!EDM126::Positive(actual))return false;
-    span=actual;return true;
-}
-// Only B3 stages measure the actual center-to-apex span. E6 and every other
-// mode retain their existing meaning, including B4's planar-center recipe.
+// Both center modes use their actual on-axis waypoint-to-top distance.
+// Non-center modes retain their prior stage distance and E6 conventions.
 inline bool TrySpeedStageSpanMm(const Feedback& e,double& span) noexcept
 {
     span=e.targetCaptured?(e.deepBound?e.effectiveJumpHeightMm:e.absoluteJumpHeightMm):0.0;
     if(!std::isfinite(span)||span<0.0)return false;
-    if(!e.targetCaptured||e.policy.mode!=Mode::B3)return true;
-    if(e.policy.fixture!=EDM116::Fixture::ModalG76Gap173||!e.centerCaptured||!e.anchorCaptured)return false;
-    return TryB3CenterSpanMm(e.anchor.positionPulse,e.centerPositionPulse,e.heightPulsePerNative,span,span);
+    if(!e.targetCaptured||!IsCenterMode(e.policy.mode))return true;
+    EDM204::Geometry geometry{};
+    if(!CenterAxisGeometry(e,geometry))return false;
+    span=geometry.axialSpanMm;return true;
 }
 inline bool ValidB3Proof(const Feedback& e) noexcept
 {
     if(!IsCenterMode(e.policy.mode))return EmptyB3Proof(e);
     if(!e.targetCaptured)return EmptyB3Proof(e);
-    if(e.policy.fixture!=EDM116::Fixture::ModalG76Gap173||!e.centerCaptured||
-        !e.anchorCaptured||!EDM126::Positive(e.centerReturnMmMin)||e.centerReturnMmMin>30.0)return false;
-    for(unsigned a=0U;a<6U;++a)if(!std::isfinite(e.centerPositionPulse[a])||
-        !std::isfinite(e.anchor.positionPulse[a])||!EDM126::Positive(e.heightPulsePerNative[a])||
-        (a>=3U&&e.centerPositionPulse[a]!=e.anchor.positionPulse[a]))return false;
-    if(e.policy.mode==Mode::B3) {
-        double span=0.0;
-        if(!TryB3CenterSpanMm(e.anchor.positionPulse,e.centerPositionPulse,e.heightPulsePerNative,
-            e.deepBound?e.effectiveJumpHeightMm:e.absoluteJumpHeightMm,span))return false;
-    } else {
-        const double radius=std::hypot((e.centerPositionPulse[0U]-e.anchor.positionPulse[0U])/e.heightPulsePerNative[0U],
-            (e.centerPositionPulse[1U]-e.anchor.positionPulse[1U])/e.heightPulsePerNative[1U]);
-        const double height=e.deepBound?e.effectiveJumpHeightMm:e.absoluteJumpHeightMm;
-        if(!std::isfinite(radius)||!EDM126::Positive(height)||radius>height)return false;
-        const double upperZ=radius==0.0?e.anchor.positionPulse[2U]:e.anchor.positionPulse[2U]+radius*e.heightPulsePerNative[2U];
-        if(!std::isfinite(upperZ)||!EDM109::SameDouble(e.centerPositionPulse[2U],upperZ))return false;
-    }
+    EDM204::Geometry geometry{};
+    if(!CenterAxisGeometry(e,geometry)||!EDM126::Positive(e.centerReturnMmMin)||e.centerReturnMmMin>30.0)return false;
     const unsigned n=e.centerLegsCompleted;
     if(n!=0U&&n!=1U&&n!=3U&&n!=7U&&n!=15U)return false;
     if(e.topCaptured!=(n>=3U))return false;
@@ -348,7 +319,7 @@ inline bool ValidHeightProof(const Feedback& e,double expectedBaseH,std::uint32_
 {
     const unsigned profile=VisibleFlushProfile(e.policy);const bool visible=profile!=0U;
     if(!ValidB3Proof(e))return false;
-    if((visible&&(e.policy.mode!=(profile==8U?Mode::B0:profile==7U?Mode::B4:profile==6U?Mode::B3:profile==5U?Mode::B2:Mode::B1)||expectedBaseH!=CommissioningHeightMm(profile)||expectedN||expectedM!=1.0||!expectedDeepBound))||
+    if((visible&&(e.policy.mode!=(profile==8U?Mode::B0:profile==7U?Mode::B4:profile==6U?Mode::B3:profile==5U?Mode::B2:Mode::B1)||!ValidAbsoluteJumpHeightMm(expectedBaseH,profile)||expectedN||expectedM!=1.0||!expectedDeepBound))||
         ((profile==4U||profile==5U||profile==6U||profile==7U||profile==8U)&&!ValidVisibleWorkTime(profile,e.work.workTimeUs))||
         !std::isfinite(expectedBaseH)||e.absoluteJumpHeightMm!=expectedBaseH||
         !EDM130::ValidDeepFlushConfig(expectedBaseH,expectedN,expectedM,expectedDeepBound,profile)||
@@ -399,7 +370,9 @@ inline bool ValidHeightProof(const Feedback& e,double expectedBaseH,std::uint32_
             double norm=0.0;
             for(unsigned i=0U;i<3U;++i)norm=std::hypot(norm,e.tangentPulsePerMm[i]/e.heightPulsePerNative[i]);
             if(!HeightClose(norm,1.0))return false;
-        } else if((e.policy.mode!=Mode::B1&&!IsCenterMode(e.policy.mode))||!EDM109::SamePulse(e.tangentPulsePerMm,Point{}))return false;
+        } else if(IsCenterMode(e.policy.mode)) {
+            Point axis{};if(!EDM204::AxisNative(e.tangentPulsePerMm,e.heightPulsePerNative,axis))return false;
+        } else if(e.policy.mode!=Mode::B1||!EDM109::SamePulse(e.tangentPulsePerMm,Point{}))return false;
     }
     if(!e.topCaptured) {
         if(e.actualJumpHeightMm!=0.0||!EDM109::SamePulse(e.topPositionPulse,Point{}))return false;
@@ -415,7 +388,10 @@ inline bool ValidHeightProof(const Feedback& e,double expectedBaseH,std::uint32_
             const double want=e.tangentPulsePerMm[i]==0.0?e.anchor.positionPulse[i]:
                 e.anchor.positionPulse[i]-expectedH*e.tangentPulsePerMm[i];
             if(!EDM109::SameDouble(e.topPositionPulse[i],want))return false;
-        } else if(e.policy.mode==Mode::B1||IsCenterMode(e.policy.mode)) {
+        } else if(IsCenterMode(e.policy.mode)) {
+            const double want=e.tangentPulsePerMm[i]==0.0?origin[i]:origin[i]-expectedH*e.tangentPulsePerMm[i];
+            if(!EDM109::SameDouble(e.topPositionPulse[i],want))return false;
+        } else if(e.policy.mode==Mode::B1) {
             const double want=i==2U?origin[i]+expectedH*e.heightPulsePerNative[i]:origin[i];
             if(!EDM109::SameDouble(e.topPositionPulse[i],want))return false;
         }
@@ -433,18 +409,21 @@ inline bool ValidHeightProof(const Feedback& e,double expectedBaseH,std::uint32_
 struct B3Orbit
 {
     Point centers[EDM116::G76GapRows173+1U]{};
+    Point machiningAxisNative{}; // Signed unit XYZ vector; C/U/V remain exactly zero.
     EDM109::Scope scope{};
     double centerReturnMmMin=0.0;
 };
 inline bool EmptyB3Orbit(const B3Orbit& b) noexcept
 {
-    if(!EDM109::SameScope(b.scope,EDM109::Scope{})||b.centerReturnMmMin!=0.0)return false;
+    if(!EDM109::SameScope(b.scope,EDM109::Scope{})||b.centerReturnMmMin!=0.0||
+        !EDM109::SamePulse(b.machiningAxisNative,Point{}))return false;
     for(const auto& p:b.centers)if(!EDM109::SamePulse(p,Point{}))return false;
     return true;
 }
 inline bool SameB3Orbit(const B3Orbit& a,const B3Orbit& b) noexcept
 {
-    if(!EDM109::SameScope(a.scope,b.scope)||a.centerReturnMmMin!=b.centerReturnMmMin)return false;
+    if(!EDM109::SameScope(a.scope,b.scope)||a.centerReturnMmMin!=b.centerReturnMmMin||
+        !EDM109::SamePulse(a.machiningAxisNative,b.machiningAxisNative))return false;
     for(unsigned k=0U;k<=EDM116::G76GapRows173;++k)
         if(!EDM109::SamePulse(a.centers[k],b.centers[k]))return false;
     return true;
@@ -453,10 +432,42 @@ inline bool ValidB3Orbit(const B3Orbit& b,const EDM109::Scope& scope) noexcept
 {
     if(!EDM109::ValidScope(scope)||!EDM109::SameScope(b.scope,scope)||
         !EDM126::Positive(b.centerReturnMmMin)||b.centerReturnMmMin>30.0)return false;
+    double norm=0.0;
+    for(unsigned a=0U;a<6U;++a) {
+        if(!std::isfinite(b.machiningAxisNative[a])||(a>=3U&&b.machiningAxisNative[a]!=0.0))return false;
+        if(a<3U)norm=std::hypot(norm,b.machiningAxisNative[a]);
+    }
+    if(!HeightClose(norm,1.0))return false;
     for(const auto& p:b.centers)for(unsigned a=0U;a<6U;++a)
         if(!std::isfinite(p[a])||(a>=3U&&p[a]!=b.centers[0U][a]))return false;
     return EDM109::SamePulse(b.centers[24U],b.centers[25U]);
 }
+// The signed vector must agree with the sealed center-line progression in
+// physical units. Reject unresolved or reversed directions before movement.
+inline bool ValidB3OrbitMapping(const B3Orbit& b,const EDM109::Scope& scope,const Point& scale) noexcept
+{
+    if(!ValidB3Orbit(b,scope))return false;
+    for(unsigned a=0U;a<6U;++a)if(!EDM126::Positive(scale[a]))return false;
+    double previous=0.0,lastBudget=0.0;
+    for(unsigned k=1U;k<=EDM116::G76GapRows173;++k) {
+        Point delta{};double projection=0.0,budget=EDM126::Roundoff(0.0);
+        for(unsigned a=0U;a<3U;++a) {
+            delta[a]=(b.centers[k][a]-b.centers[0U][a])/scale[a];
+            projection+=delta[a]*b.machiningAxisNative[a];
+            const double coordinate=EDM126::Roundoff((std::max)(std::fabs(b.centers[k][a]),
+                std::fabs(b.centers[0U][a])))/scale[a];
+            budget=std::hypot(budget,coordinate);
+        }
+        double residual=0.0;
+        for(unsigned a=0U;a<3U;++a)residual=std::hypot(residual,
+            delta[a]-projection*b.machiningAxisNative[a]);
+        if(!std::isfinite(projection)||!std::isfinite(residual)||!std::isfinite(budget)||
+            budget>1.0e-8||residual>budget||projection<previous-budget)return false;
+        previous=projection;lastBudget=budget;
+    }
+    return previous>lastBudget;
+}
+
 class Coordinator
 {
 public:
@@ -467,9 +478,9 @@ public:
     {
         const EDM126::Feedback& f=main.Committed();
         const unsigned profile=VisibleFlushProfile(policy);const bool visible=profile!=0U;
-        if((IsCenterMode(policy.mode)?(!b3Orbit||!ValidB3Orbit(*b3Orbit,f.authorizedSource.scope)):b3Orbit!=nullptr)||
+        if((IsCenterMode(policy.mode)?(!b3Orbit||!ValidB3OrbitMapping(*b3Orbit,f.authorizedSource.scope,main.CursorMapping().Geometry().line.pulsePerNative)):b3Orbit!=nullptr)||
             (rowValid_&&b3Orbit&&!SameB3Orbit(b3Orbit_,*b3Orbit))||
-            (visible&&(policy.mode!=(profile==8U?Mode::B0:profile==7U?Mode::B4:profile==6U?Mode::B3:profile==5U?Mode::B2:Mode::B1)||absoluteJumpHeightMm!=CommissioningHeightMm(profile)||!liveAnchor||!ValidVisibleWorkTime(profile,workTimeUs)||
+            (visible&&(policy.mode!=(profile==8U?Mode::B0:profile==7U?Mode::B4:profile==6U?Mode::B3:profile==5U?Mode::B2:Mode::B1)||!ValidAbsoluteJumpHeightMm(absoluteJumpHeightMm,profile)||!liveAnchor||!ValidVisibleWorkTime(profile,workTimeUs)||
                 !deepBound||deepFlushCycleInterval||deepFlushHeightMultiplier!=1.0))||
             (!EDM130::EmptyFlushStages(flushStages)&&(!EDM130::ValidFlushStages(flushStages)||
                 !absoluteJumpHeightMm||!liveAnchor||!workTimeUs))||
@@ -771,7 +782,7 @@ private:
     Point low_{},high_{};double localSpeed_=0.0;
     struct HeightCapture {
         double anchorStationMm=0.0,targetStationMm=0.0;
-        Point anchorPulse{},topPulse{},tangent{},scale{},centerPulse{};
+        Point anchorPulse{},topPulse{},tangent{},scale{},centerPulse{},nominalCenterPulse{};
         double centerReturnMmMin=0.0;
         unsigned centerLegsCompleted=0U;
         EDM126::Cursor anchor{},target{};
@@ -854,14 +865,15 @@ private:
         double height=0.0;if(!TrySpeedStageSpanMm(evidence_,height)||!EDM126::Positive(height))return false;
         double tolerance=EDM126::Roundoff(height);
         if(evidence_.policy.mode!=Mode::B2) {
-            // The detached line is built from absolute pulse endpoints. At
-            // a distant origin its XYZ length can differ from the stage span
-            // by bounded coordinate roundoff. B3 includes the center's Z in
-            // the bound because its vertical span can be longer than E6.
-            for(unsigned i=0U;i<3U;++i)if(height_.topPulse[i]!=height_.anchorPulse[i]) {
+            // The detached line uses absolute pulse endpoints. Include the
+            // true center and waypoint in each axis's bounded subtraction
+            // error; no global XYZ box or unbounded distance clipping.
+            for(unsigned i=0U;i<3U;++i)if(IsCenterMode(evidence_.policy.mode)||height_.topPulse[i]!=height_.anchorPulse[i]) {
                 double magnitude=(std::max)(std::fabs(height_.anchorPulse[i]),std::fabs(height_.topPulse[i]));
-                if(evidence_.policy.mode==Mode::B3&&i==2U)
+                if(IsCenterMode(evidence_.policy.mode)) {
                     magnitude=(std::max)(magnitude,std::fabs(height_.centerPulse[i]));
+                    magnitude=(std::max)(magnitude,std::fabs(height_.nominalCenterPulse[i]));
+                }
                 const double axis=EDM126::Roundoff(magnitude)/height_.scale[i];
                 tolerance=std::hypot(tolerance,axis);
             }
@@ -897,38 +909,31 @@ private:
     bool CaptureB3Center(const EDM126::Traversal& main) noexcept
     {
         const auto& a=evidence_.anchor;
-        if(!IsCenterMode(evidence_.policy.mode)||(VisibleFlushProfile(evidence_.policy)!=6U&&VisibleFlushProfile(evidence_.policy)!=7U)||!ValidB3Orbit(b3Orbit_,a.cursorSource.scope)||
+        const auto& scale=main.CursorMapping().Geometry().line.pulsePerNative;
+        if(!IsCenterMode(evidence_.policy.mode)||(VisibleFlushProfile(evidence_.policy)!=6U&&VisibleFlushProfile(evidence_.policy)!=7U)||
+            !ValidB3OrbitMapping(b3Orbit_,a.cursorSource.scope,scale)||
             a.cursorSource.ordinal>=EDM116::G76GapRows173||!EDM126::Positive(a.lengthMm)||
             a.localMm<0.0||a.localMm>a.lengthMm||!Zero(a))return false;
         const unsigned k=static_cast<unsigned>(a.cursorSource.ordinal);
         const double u=a.localMm==a.lengthMm?1.0:a.localMm/a.lengthMm;
-        const auto& scale=main.CursorMapping().Geometry().line.pulsePerNative;
-        Point center=a.positionPulse;
+        Point nominal=a.positionPulse,axisPulse{};
         for(unsigned j=0U;j<6U;++j) {
             const double v=u==1.0?b3Orbit_.centers[k+1U][j]:
                 b3Orbit_.centers[k][j]+(b3Orbit_.centers[k+1U][j]-b3Orbit_.centers[k][j])*u;
             if(!std::isfinite(v)||!EDM126::Positive(scale[j])||v<low_[j]||v>high_[j])return false;
-            if(j<2U||(j==2U&&evidence_.policy.mode==Mode::B3))center[j]=v;
-            // B3 uses the sealed XYZ center at the actual child ratio. B4
-            // retains its planar center; both keep the stopped C/U/V exact.
-            else if(std::fabs(v-a.positionPulse[j])/scale[j]>1.0e-10)return false;
+            if(j<3U)nominal[j]=v;
+            else if(v!=a.positionPulse[j])return false;
+            axisPulse[j]=b3Orbit_.machiningAxisNative[j]==0.0?0.0:b3Orbit_.machiningAxisNative[j]*scale[j];
         }
-        if(evidence_.policy.mode==Mode::B3) {
-            double span=0.0;
-            if(!TryB3CenterSpanMm(a.positionPulse,center,scale,EventHeight(),span))return false;
-        }
-        if(evidence_.policy.mode==Mode::B4) {
-            // The rest point can lie inside a polygonal chord. Use its actual
-            // radial separation from the interpolated center, rather than
-            // the authored boundary radius, to keep this diagonal at 45 deg.
-            const double radius=std::hypot((center[0U]-a.positionPulse[0U])/scale[0U],
-                (center[1U]-a.positionPulse[1U])/scale[1U]);
-            if(!std::isfinite(radius)||radius>EventHeight())return false;
-            center[2U]=radius==0.0?a.positionPulse[2U]:a.positionPulse[2U]+radius*scale[2U];
-            if(!std::isfinite(center[2U])||center[2U]<low_[2U]||center[2U]>high_[2U])return false;
-        }
-        height_.centerPulse=center;height_.centerReturnMmMin=b3Orbit_.centerReturnMmMin;
-        evidence_.centerCaptured=true;evidence_.centerPositionPulse=center;
+        EDM204::Geometry geometry{};
+        if(!EDM204::Build(a.positionPulse,nominal,axisPulse,scale,EventHeight(),
+            static_cast<unsigned>(evidence_.policy.mode),geometry))return false;
+        for(unsigned j=0U;j<6U;++j)if(geometry.centerPulse[j]<low_[j]||geometry.centerPulse[j]>high_[j]||
+            geometry.topPulse[j]<low_[j]||geometry.topPulse[j]>high_[j])return false;
+        height_.centerPulse=geometry.centerPulse;height_.nominalCenterPulse=nominal;
+        height_.centerReturnMmMin=b3Orbit_.centerReturnMmMin;
+        evidence_.centerCaptured=true;evidence_.centerPositionPulse=geometry.centerPulse;
+        evidence_.nominalCenterPositionPulse=nominal;evidence_.tangentPulsePerMm=axisPulse;
         evidence_.centerReturnMmMin=b3Orbit_.centerReturnMmMin;
         evidence_.centerLegsCompleted=height_.centerLegsCompleted=0U;
         return true;
@@ -944,19 +949,37 @@ private:
         if(!EDM109::BuildLine(from,to,height_.scale,line)||!EDM112::BuildLine(line,localCurve_))return false;
         localLimits_=main.CursorMapping().FrozenLimits();
         if(leg==Phase::Outbound) {
-            localLimits_.maxVelocityMmSec=EDM94::VisibleFlushReferenceMmSec;
-            const double dz=std::fabs((to[2U]-from[2U])/localCurve_.lengthMm);
-            if(!EDM126::Positive(dz))return false;
-            const double speed=(std::min)(localLimits_.maxVelocityMmSec,localLimits_.maxVelocityPps[2U]/dz);
-            const double acc=evidence_.policy.mode==Mode::B3&&height_.centerPulse[2U]!=height_.anchorPulse[2U]?
-                ReservedB3VisibleAcceleration(speed,localLimits_.maxAccelerationPps2[2U]/dz,EventHeight(),localCurve_.lengthMm):
-                ReservedVisibleAcceleration(speed,localLimits_.maxAccelerationPps2[2U]/dz,EventHeight());
+            // The machining axis can point anywhere in XYZ. Intersect every
+            // participating physical derivative before choosing the ramp.
+            double speed=EDM94::VisibleFlushReferenceMmSec;
+            double axisAcceleration=(std::numeric_limits<double>::max)();
+            bool participating=false;
+            for(unsigned i=0U;i<6U;++i) {
+                const double derivative=std::fabs((to[i]-from[i])/localCurve_.lengthMm);
+                if(!std::isfinite(derivative)||(i>=3U&&derivative!=0.0))return false;
+                if(derivative==0.0)continue;
+                participating=true;
+                speed=(std::min)(speed,localLimits_.maxVelocityPps[i]/derivative);
+                axisAcceleration=(std::min)(axisAcceleration,localLimits_.maxAccelerationPps2[i]/derivative);
+            }
+            if(!participating||!EDM126::Positive(speed)||!EDM126::Positive(axisAcceleration))return false;
+            // E210: profile.speedRatio encodes J50 * E7. Apply E7 once to
+            // the complete axial leg and both ramps; the independent radial
+            // center feed below remains unchanged. Returning reuses this line.
+            const double ratio=2.0*evidence_.policy.profile.speedRatio;
+            if(!std::isfinite(ratio)||ratio<0.5||ratio>1.0)return false;
+            speed*=ratio;
+            // Scale the physical bound before reserving numerical snap error.
+            // The full reserve is still required at a reduced E7 setting.
+            axisAcceleration=(std::min)(0.04,axisAcceleration)*ratio;
+            localLimits_.maxVelocityMmSec=speed;
+            const double acc=ReservedB3VisibleAcceleration(speed,axisAcceleration,EventHeight(),localCurve_.lengthMm);
             if(!EDM126::Positive(acc))return false;
             localLimits_.accelerationMmSec2=localLimits_.decelerationMmSec2=acc;
         } else {
             // The independent center setting is bounded by the ordinary XYZ
             // commissioning reference and frozen per-axis limits. The visible
-            // Z speed permission never raises the center-leg reference.
+            // axial flush permission never raises the center-leg reference.
             localLimits_.maxVelocityMmSec=(std::min)(height_.centerReturnMmMin/60.0,
                 EDM94::VisibleXYZMachiningReferenceMmSec);
             const double reserve=2.0*EDM126::Roundoff(localCurve_.lengthMm)/
@@ -981,7 +1004,7 @@ private:
         if(moving) {
             // Braking can stop at the finish-center endpoint. A coincident
             // radial leg still needs physical settlement, but has no distance
-            // to integrate. Use the stationary bottom of the real Z backend;
+            // to integrate. Use the stationary origin of the real axial backend;
             // never invent a tiny chord or claim movement for this leg.
             if((p==Phase::ToCenter||p==Phase::ToAnchor)&&
                 EDM109::SamePulse(height_.anchorPulse,height_.centerPulse)) {
@@ -992,7 +1015,7 @@ private:
                 evidence_.phase=p==Phase::ToCenter?Phase::CenterDwell:Phase::ReturnDwell;
                 ResetDwell();return true;
             }
-            // H==r leaves no vertical apex leg in B4. Retain the real
+            // A coincident center and apex has no axial leg. Retain the real
             // diagonal backend at its settled endpoint for both zero legs.
             if((p==Phase::Outbound||p==Phase::Returning)&&
                 EDM109::SamePulse(height_.centerPulse,height_.topPulse)) {
@@ -1100,7 +1123,7 @@ private:
         evidence_.topPositionPulse=evidence_.tangentPulsePerMm=evidence_.heightPulsePerNative=Point{};
         evidence_.eventIndex=0ULL;evidence_.deepCycle=false;evidence_.effectiveJumpHeightMm=0.0;
         ClearSpeedSample();evidence_.initialStageDistanceMm=evidence_.finalStageDistanceMm=0.0;
-        evidence_.centerCaptured=false;evidence_.centerPositionPulse=Point{};
+        evidence_.centerCaptured=false;evidence_.centerPositionPulse=evidence_.nominalCenterPositionPulse=Point{};
         evidence_.centerReturnMmMin=0.0;evidence_.centerLegsCompleted=0U;b3LocalLeg_=Phase::Gap;
         height_=HeightCapture{};height_.completedDeepEvents=evidence_.completedDeepEvents;
     }
@@ -1131,8 +1154,9 @@ private:
             evidence_.targetSource=topTarget_.source;evidence_.targetLocalMm=topTarget_.localMm;
             evidence_.targetStationMm=height_.targetStationMm;
         } else if(IsCenterMode(evidence_.policy.mode)) {
-            height_.topPulse=height_.centerPulse;
-            height_.topPulse[2U]=height_.anchorPulse[2U]+EventHeight()*height_.scale[2U];
+            EDM204::Geometry geometry{};
+            if(!CenterAxisGeometry(evidence_,geometry))return false;
+            height_.topPulse=geometry.topPulse;
         } else height_.topPulse=localCurve_.line.endPulse;
         for(unsigned i=0U;i<6U;++i)if(!std::isfinite(height_.topPulse[i])||
             height_.topPulse[i]<low_[i]||height_.topPulse[i]>high_[i])return false;
@@ -1167,7 +1191,8 @@ private:
             !EDM109::SamePulse(e.heightPulsePerNative,h.scale)||!EDM109::SamePulse(e.tangentPulsePerMm,h.tangent))return false;
         if(IsCenterMode(e.policy.mode)&&(!e.centerCaptured||e.centerReturnMmMin!=h.centerReturnMmMin||
             e.centerLegsCompleted!=h.centerLegsCompleted||
-            !EDM109::SamePulse(e.centerPositionPulse,h.centerPulse)))return false;
+            !EDM109::SamePulse(e.centerPositionPulse,h.centerPulse)||
+            !EDM109::SamePulse(e.nominalCenterPositionPulse,h.nominalCenterPulse)))return false;
         if(e.policy.mode==Mode::B2&&(!EDM126::SameSource(e.targetSource,h.target.source)||
             e.targetLocalMm!=h.target.localMm||e.targetStationMm!=h.targetStationMm))return false;
         return !e.topCaptured||EDM109::SamePulse(e.topPositionPulse,h.topPulse);
@@ -1205,5 +1230,5 @@ private:
         pending_=true;return true;
     }
 };
-static_assert(sizeof(Feedback)<=1152U,"EDM128 bounded immutable evidence");
+static_assert(sizeof(Feedback)<=1216U,"EDM128 bounded immutable axis-center evidence");
 }

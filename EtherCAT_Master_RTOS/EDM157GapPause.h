@@ -10,7 +10,7 @@ constexpr unsigned RequiredStableCycles = 200U;
 // EDM162 uses this same pause transaction for the bounded mainline program.
 // EDM166/167 admit only their existing 2 mm E5 lift, never visible GAP retreat.
 inline bool SupportsArm(unsigned arm) noexcept
-{ return EDM149::IsFlushHoldTestArm(arm) || EDM149::IsPauseTestArm(arm) || arm==294U; }
+{ return EDM149::IsFlushHoldTestArm(arm) || EDM149::IsPauseTestArm(arm) || arm==294U || arm==296U || arm==298U; }
 inline bool SupportsFixture(unsigned history, EDM116::Fixture policy) noexcept
 {
     return (history == EDM149::ProgramHistoryFixture && policy == EDM116::Fixture::ModalProgram156) ||
@@ -40,9 +40,20 @@ inline bool IsG76B2Pause(const Scope& s) noexcept
         s.policy.mode==EDM116::Mode::B2 && EDM130::IsG76B2Flush175(s.recipe) &&
         !s.recipe.holdRetreatMode && s.compoundFingerprint && s.compoundArmEpoch && s.compoundLine>0;
 }
-// Keep the E199 name for callers that identify the same sealed parent scope.
-// Nominal versus in-flight E5 is determined by the committed coordinator.
-inline bool IsG76NominalPause(const Scope& s) noexcept {return IsG76B2Pause(s);}
+// EDM217: center modes retain the same sealed parent while pausing only
+// its nominal GAP child. In-flight center E5 and paused JOG stay excluded.
+inline bool IsG76CenterNominalPause(const Scope& s) noexcept
+{
+    return s.historyFixture==EDM149::G76GapHistoryFixture && s.policy.fixture==EDM116::Fixture::ModalG76Gap173 &&
+        ((s.policy.mode==EDM116::Mode::B3 && EDM130::IsG76B3Flush176(s.recipe)) ||
+         (s.policy.mode==EDM116::Mode::B4 && EDM130::IsG76B4Flush177(s.recipe))) &&
+        s.recipe.diagnosticControlSource==3U && !s.recipe.holdRetreatMode &&
+        s.compoundFingerprint && s.compoundArmEpoch && s.compoundLine>0;
+}
+// Keep the E199 name for callers that identify a sealed compound parent.
+// Only B2 additionally permits its proven in-flight E5 pause transaction.
+inline bool IsG76NominalPause(const Scope& s) noexcept
+{return IsG76B2Pause(s)||IsG76CenterNominalPause(s);}
 inline bool SameScope(const Scope& a, const Scope& b) noexcept
 {
     return EDM126::SameSource(a.authorizedSource,b.authorizedSource) && a.ownerGeneration==b.ownerGeneration &&
@@ -130,11 +141,23 @@ inline bool SameFlushReceipt(const FlushReceipt& a,const FlushReceipt& b) noexce
         a.qualifiedDwells==b.qualifiedDwells&&a.anchorCaptured==b.anchorCaptured&&
         a.targetCaptured==b.targetCaptured&&a.topCaptured==b.topCaptured&&a.exactReturn==b.exactReturn;
 }
+// EDM217: frozen committed GAP work totals survive braking and the Running
+// acknowledgement; live coordinator observation clocks are not this receipt.
+struct NominalWorkReceipt
+{
+    std::uint64_t elapsedUs=0ULL,totalWorkUs=0ULL,triggeredEvents=0ULL,completedEvents=0ULL;
+};
+inline NominalWorkReceipt CaptureNominalWorkReceipt(const EDM130::WorkEvidence& w) noexcept
+{return {w.elapsedUs,w.totalWorkUs,w.triggeredEvents,w.completedEvents};}
+inline bool SameNominalWorkReceipt(const NominalWorkReceipt& a,const NominalWorkReceipt& b) noexcept
+{return a.elapsedUs==b.elapsedUs&&a.totalWorkUs==b.totalWorkUs&&
+    a.triggeredEvents==b.triggeredEvents&&a.completedEvents==b.completedEvents;}
 struct Feedback
 {
     Scope scope{};
     std::uint64_t holdSequence=0ULL, startFloor=0ULL, resumeStartSequence=0ULL, rejectedStartSequence=0ULL;
     Phase phase=Phase::Idle;
+    bool nominalWorkCaptured=false;
     unsigned stableCycles=0U;
     EDM126::Source cursorSource{};
     double localMm=0.0, stationMm=0.0;
@@ -154,10 +177,18 @@ struct Feedback
     EDM128::Phase flushPhase=EDM128::Phase::Gap;
     std::uint64_t flushEventIndex=0ULL;
     FlushReceipt flush{};
+    NominalWorkReceipt nominalWork{};
 };
 static_assert(std::is_trivially_copyable<Scope>::value && std::is_trivially_copyable<Feedback>::value,
     "EDM157 cross-thread receipts are fixed values.");
 static_assert(sizeof(Feedback)<=1024U,"EDM157 bounded pause publication.");
+inline bool ValidNominalWorkReceipt(const Feedback& f) noexcept
+{
+    const auto& w=f.nominalWork;const auto duration=f.scope.recipe.workTimeUs;
+    return f.nominalWorkCaptured&&!f.flushPause&&IsG76NominalPause(f.scope)&&ValidScope(f.scope)&&
+        EDM130::ValidWorkTime(duration)&&w.elapsedUs<=duration&&w.elapsedUs<=w.totalWorkUs&&
+        w.triggeredEvents==w.completedEvents&&w.triggeredEvents<=w.totalWorkUs/duration;
+}
 inline bool ValidG76FlushReceipt(const Feedback& f) noexcept
 {
     const auto& r=f.flush;
@@ -189,7 +220,10 @@ inline bool ValidPauseContext(const Feedback& f) noexcept
 {
     if(!f.flushPause)return (!EDM130::IsOneShotCommissioning(f.scope.recipe)||
         (IsG76NominalPause(f.scope)&&ValidScope(f.scope)))&&
+        (IsG76NominalPause(f.scope)?ValidNominalWorkReceipt(f):
+            (!f.nominalWorkCaptured&&SameNominalWorkReceipt(f.nominalWork,NominalWorkReceipt{})))&&
         f.flushPhase==EDM128::Phase::Gap&&!f.flushEventIndex&&SameFlushReceipt(f.flush,FlushReceipt{});
+    if(f.nominalWorkCaptured||!SameNominalWorkReceipt(f.nominalWork,NominalWorkReceipt{}))return false;
     if(IsG76B2Pause(f.scope))return ValidG76FlushReceipt(f)&&
         !f.retreatPlanned&&!f.retreatUnavailable&&!f.topCaptured&&!f.exactReturn;
     return ValidScope(f.scope)&&f.scope.recipe.holdRetreatMode==1U&&
@@ -200,7 +234,9 @@ inline bool ValidPauseContext(const Feedback& f) noexcept
         !f.retreatPlanned&&!f.retreatUnavailable&&!f.topCaptured&&!f.exactReturn&&SameFlushReceipt(f.flush,FlushReceipt{});
 }
 inline bool SamePauseContext(const Feedback& a,const Feedback& b) noexcept
-{return a.flushPause==b.flushPause&&a.flushPhase==b.flushPhase&&a.flushEventIndex==b.flushEventIndex&&SameFlushReceipt(a.flush,b.flush);}
+{return a.flushPause==b.flushPause&&a.flushPhase==b.flushPhase&&a.flushEventIndex==b.flushEventIndex&&
+    SameFlushReceipt(a.flush,b.flush)&&a.nominalWorkCaptured==b.nominalWorkCaptured&&
+    SameNominalWorkReceipt(a.nominalWork,b.nominalWork);}
 // Compare fixed values rather than object bytes: padding has no identity.
 // Dwell sample clocks and the current speed sample intentionally reset while
 // paused. Every canonical capture, completed dwell and E5 work clock stays.
@@ -278,10 +314,18 @@ public:
         feedback_.scope.recipe.holdRetreatMode==1U;}
     bool FlushContextCurrent(const EDM128::Feedback& e) const noexcept
     {
-        return !FlushPause()||(PauseModeAllowed(feedback_.scope,e)&&e.phase==feedback_.flushPhase&&
+        if(!FlushPause()) {
+            if(!IsG76NominalPause(feedback_.scope))return true;
+            auto frozen=e.work;frozen.previousEligible=frozenNominalWork_.previousEligible;
+            return ValidNominalWorkReceipt(feedback_)&&PauseModeAllowed(feedback_.scope,e)&&
+                EDM130::ValidWorkEvidence(e.work)&&e.work.workTimeUs==feedback_.scope.recipe.workTimeUs&&
+                SameNominalWorkReceipt(feedback_.nominalWork,CaptureNominalWorkReceipt(e.work))&&
+                EDM130::SameWorkEvidence(frozen,frozenNominalWork_);
+        }
+        return PauseModeAllowed(feedback_.scope,e)&&e.phase==feedback_.flushPhase&&
             e.work.triggeredEvents==feedback_.flushEventIndex&&(!IsG76B2Pause(feedback_.scope)||
                 (ValidG76FlushReceipt(feedback_)&&SameFlushReceipt(feedback_.flush,CaptureFlushReceipt(e))&&
-                    SameFrozenG76Flush(e,frozenFlush_))));
+                    SameFrozenG76Flush(e,frozenFlush_)));
     }
     bool ZeroOutput() const noexcept
     {return feedback_.phase==Phase::Qualifying||feedback_.phase==Phase::Held||feedback_.phase==Phase::Resuming||
@@ -313,11 +357,17 @@ public:
     }
     bool BeginHold(const Scope& scope,std::uint64_t holdSequence,std::uint64_t startFloor,
         std::uint64_t tick,std::uint64_t nowUs,const EDM126::Feedback& committed,
-        const EDM128::Feedback* flush=nullptr) noexcept
+        const EDM128::Feedback* flush=nullptr,const EDM128::Feedback* nominal=nullptr) noexcept
     {
         if((EDM130::IsOneShotCommissioning(scope.recipe)&&!flush&&!IsG76NominalPause(scope))||
             (Holding(feedback_.phase)&&!SameScope(scope,feedback_.scope))||
             (flush&&(!PauseModeAllowed(scope,*flush)||!EDM128::CanPauseTimedFlush(*flush)))||
+            (!flush&&IsG76NominalPause(scope)&&(!nominal||!PauseModeAllowed(scope,*nominal)||
+                nominal->phase!=EDM128::Phase::Gap||!EDM130::ValidWorkEvidence(nominal->work)||
+                nominal->work.workTimeUs!=scope.recipe.workTimeUs))||
+            (nominal&&(flush||!IsG76NominalPause(scope)))||
+            (DemandZero()&&!FlushPause()&&IsG76NominalPause(scope)&&
+                (!nominal||!FlushContextCurrent(*nominal)))||
             (DemandZero()&&FlushPause()&&(!flush||!FlushContextCurrent(*flush)))||
             (DemandZero()&&!FlushPause()&&flush)||
             startFloor<feedback_.startFloor||startFloor<feedback_.resumeStartSequence||startFloor<feedback_.rejectedStartSequence||
@@ -337,8 +387,12 @@ public:
         if(flush){feedback_.flushPause=true;feedback_.flushPhase=flush->phase;
             feedback_.flushEventIndex=flush->work.triggeredEvents;
             if(IsG76B2Pause(scope)){frozenFlush_=*flush;feedback_.flush=CaptureFlushReceipt(*flush);}}
+        frozenNominalWork_=EDM130::WorkEvidence{};
+        if(nominal){feedback_.nominalWorkCaptured=true;feedback_.nominalWork=CaptureNominalWorkReceipt(nominal->work);
+            frozenNominalWork_=nominal->work;}
         lastProofTick_=0ULL;Capture(committed);
-        return !flush||!IsG76B2Pause(scope)||ValidG76FlushReceipt(feedback_);
+        return (!flush||!IsG76B2Pause(scope)||ValidG76FlushReceipt(feedback_))&&
+            (!nominal||ValidNominalWorkReceipt(feedback_));
     }
     bool BeginResume(const Scope& scope,std::uint64_t holdSequence,std::uint64_t startSequence,
         std::uint64_t tick,std::uint64_t nowUs) noexcept
@@ -470,6 +524,7 @@ private:
     // RT-owned canonical snapshot. It is never an output authority and is
     // never sent through the bounded cross-thread publication channel.
     EDM128::Feedback frozenFlush_{};
+    EDM130::WorkEvidence frozenNominalWork_{};
     std::uint64_t lastProofTick_=0ULL;
     EDM126::Cursor anchorCursor_{},restCursor_{};
     EDM126::Point restPosition_{};

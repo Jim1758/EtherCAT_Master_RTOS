@@ -34,6 +34,7 @@ struct NCEccentricCProfilePoint;
 #include "EDM173ServoInputDiagnostic.h"
 #include "EDM174CommunicationTrace.h"
 #include "EDM174G76LeafTiming.h"
+#include "EDM206SyncHistory.h"
 #include "MotionG76OrbitReceipt.h"
 #include "NCRotaryFeedScope.h" // BASE68 pure rotary admission
 #include "NCZCFeedLine.h" // BASE70 common-time Z/C geometry
@@ -171,7 +172,7 @@ namespace EDM128
         bool workTimeFlush=false;
         EDM130::Recipe timerRecipe{};
     };
-    static_assert(sizeof(MotionFeedback)<=1600U && std::is_trivially_copyable<MotionFeedback>::value,
+    static_assert(sizeof(MotionFeedback)<=1664U && std::is_trivially_copyable<MotionFeedback>::value,
         "EDM128 coordination evidence must stay bounded.");
 }
 
@@ -2511,6 +2512,7 @@ struct MotionEDM173Storage
     EDM173::Feedback currentFeedback{};
     // FIX7: RT-owned, observation-only source evidence. No control authority.
     EDM173InputDiag::Recorder inputDiagnostic{};
+    EDM206::Recorder syncHistory{}; // Startup-owned bounded RT ring; immutable NC claim after containment.
     EDM53::Channel<EDM173InputDiag::Evidence,2048U> inputDiagnosticFeedback{};
     std::uint64_t inputDiagnosticPublishedSession=0ULL;
     std::uint32_t terminalMask=0U;
@@ -2751,15 +2753,20 @@ public:
     bool ReadEDM129Feedback(EDM129::MotionFeedback& feedback) const noexcept;
     bool ReadEDM173Feedback(EDM173::Feedback& out) const noexcept;
     bool ReadEDM173InputDiagnostic(EDM173InputDiag::Evidence& out) const noexcept;
+    bool BeginReadEDM206History(EDM206::Header& out) noexcept;
+    bool ReadEDM206HistoryRow(std::uint64_t session, unsigned index, EDM206::Row& out) const noexcept;
+    void EndReadEDM206History(std::uint64_t session) noexcept;
     // Observation only; call from the PDO/Motion owner, never another thread.
     EDM174Comm::MotionObservation GetEDM174CommunicationObservation() const noexcept;
     std::uint32_t GetEDM173ImplementationRevision() const noexcept;
     bool SubmitEDM173Arm(std::uint64_t session,MotionExecutionEpoch epoch,const MotionOwnerLease& lease,
-        const EDM97::Tuning& tuning,const EDM107::FlushProfile& flush,const EDM130::Recipe& recipe) noexcept;
+        const EDM97::Tuning& tuning,const EDM107::FlushProfile& flush,const EDM130::Recipe& recipe,
+        bool rejectBeforeArm = false) noexcept;
     bool SubmitEDM130Arm(std::uint64_t session, MotionExecutionEpoch epoch,
         const MotionOwnerLease& lease, const EDM97::Tuning& tuning,
         const EDM107::FlushProfile& flushProfile, unsigned fixture, const EDM130::Recipe& recipe,
-        std::uint64_t manualRun = 0ULL, std::uint64_t manualCache = 0ULL) noexcept;
+        std::uint64_t manualRun = 0ULL, std::uint64_t manualCache = 0ULL,
+        bool rejectBeforeArm = false) noexcept;
     bool AuthorizeEDM130Feed(std::uint64_t session, std::uint64_t run, std::uint64_t cache,
         std::uint64_t dispatch, int sourcePC, unsigned step, int gCode,
         const std::array<double,6U>& increment, const std::array<double,2U>& center,
@@ -3831,6 +3838,10 @@ private:
     std::unique_ptr<MotionG76OrbitProducerWorkspace> m_g76OrbitProducer;
     std::unique_ptr<MotionEDM173Storage> m_edm173;
     bool IsEDM173Profile() const noexcept;
+    void ObserveEDM206HistoryFrame(bool complete) noexcept;
+    void FreezeEDM206History() noexcept;
+    bool CaptureEDM207Input(unsigned slot, EDM206::InputSource source,
+        const MotionServoInputSnapshot& input, EDM206::InputCapture& out) const noexcept;
     bool IsEDM173CommandCurrent(bool bound) const noexcept;
     bool IsEDM173PendingHandoffMembershipCurrent() const noexcept;
     bool IsEDM173HandoffCurrent() const noexcept;
@@ -3873,6 +3884,7 @@ private:
         bool historyModeFlush = false; // EDM128 frozen coordination opt-in
         bool physicalAd = false; // EDM129 independent real-source selection
         bool workTimeFlush = false; // EDM130 E-recipe committed machining-time opt-in
+        bool rejectionProbe = false; // EDM216 explicit L216: reject before Engine::Arm, never an output permit.
         EDM130::Recipe timerRecipe{}; // immutable NC -> RT admission and each handoff
         unsigned historyFixture = 0U;
         EDM116::Fixture modeFixture = EDM116::Fixture::Canonical116; // fixed at arm; never row-selected
@@ -4072,7 +4084,7 @@ private:
     EDM128::Coordinator m_edm128{};
     EDM128::TestVoltage m_edm128Voltage{};
     EDM128::MotionFeedback m_edm128Current{};
-    EDM53::Channel<EDM128::MotionFeedback,1600U> m_edm128Feedback{};
+    EDM53::Channel<EDM128::MotionFeedback,1664U> m_edm128Feedback{};
     // EDM157: one NC producer, one serialized Motion/send consumer. Requests
     // carry values only; the existing committed traversal remains the cursor.
     struct EDM157Request
@@ -4233,6 +4245,7 @@ private:
     EDM94::Engine m_edm94{};
     EDM94::Frame m_edm94Frame{};
     EDM94::TangentEnvelope m_edm192FrameEnvelope{};
+    EDM94::CenterEnvelope m_edm204FrameEnvelope{};
     EDM94::Config m_edm94ObservedConfig{};
     EDM53::Channel<EDM94::Feedback, 4096U> m_edm94Feedback{};
     FixedCapacitySpscRing<EDM94ArmRequest, 2U> m_edm94ArmRequests{};
@@ -4272,7 +4285,8 @@ private:
     std::array<const ServoInput*, 6U> m_edm94FrozenInput{};
     EDM94Serialized::Mapping m_edm94FrozenSerializedMapping{};
     bool CaptureEDM192TangentEnvelope(const EDM94::Frame& frame,EDM94::TangentEnvelope& output) const noexcept;
-    EDM94::Frame CaptureEDM94Frame(bool complete) noexcept;
+    bool CaptureEDM204CenterEnvelope(const EDM94::Frame& frame,EDM94::CenterEnvelope& output) const noexcept;
+    EDM94::Frame CaptureEDM94Frame(bool complete, bool configurationOnly = false) noexcept;
     void ServiceEDM94MotionPass(bool complete) noexcept;
     void ObserveEDM94Cancellation() noexcept;
     void EnsureEDM94FormalStop() noexcept;
@@ -5389,7 +5403,8 @@ private:
     // FIX6: the public three-argument template remains the untraced wrapper.
     template <typename DriveType>
     void UpdateMotionObserved(DriveType& servo, AxisContext& axis,
-        const MotionServoInputSnapshot& input, EDM174Leaf::Sample* edm174Trace);
+        const MotionServoInputSnapshot& input, EDM174Leaf::Sample* edm174Trace,
+        EDM206::InputCapture* edm207Capture = nullptr);
     void DetermineActiveGainSet(AxisContext& axis, bool* physicalFixtureIntegralHold = nullptr,
         EDM174Leaf::Sample* edm174Trace = nullptr);
     bool IsEDM165FlushGainActive(const AxisContext& axis, EDM174Leaf::Sample* edm174Trace = nullptr) const noexcept;

@@ -293,10 +293,10 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
         base.recipe.generation!=before.generation||base.recipe.tableId!=before.tableId||
         base.recipe.tableRevision!=before.tableRevision||base.recipe.eCode!=before.eCode)
     {out.error=EDM58::BindingError::CaptureChanged;return out;}
-    if(base.recipe.workTimeUs<VisibleFlushMinimumWorkUs173||base.recipe.workTimeUs>VisibleFlushMaximumWorkUs173||
-        base.recipe.jumpSpeedPercentScaled!=100000000ULL)
+    const bool validSpeed=ValidG76FlushSpeedPercent(commissioningProfile,base.recipe.jumpSpeedPercentScaled);
+    if(base.recipe.workTimeUs<VisibleFlushMinimumWorkUs173||base.recipe.workTimeUs>VisibleFlushMaximumWorkUs173||!validSpeed)
     {out.error=EDM58::BindingError::EngineeringRange;out.failedFieldId=
-        base.recipe.jumpSpeedPercentScaled!=100000000ULL?base.recipe.speedFieldId:base.recipe.fieldId;return out;}
+        !validSpeed?base.recipe.speedFieldId:base.recipe.fieldId;return out;}
     const char* semantics[]={"JumpHeight","DeepFlushCycleInterval","DeepFlushHeightMultiplier","MachiningServoOverride","GapVoltageSetpoint",
         "FinalApproachSpeed","DecelerationDistance","LargeAreaMachiningSpeed","LargeAreaFlushDistance","ElectrodePolarity"};
     const char* units[]={"mm","cycle","x","%","V","%","mm","%","mm","code"};
@@ -308,7 +308,9 @@ inline Binding BindG76GapProfile175(const EDMRecipe::Controller& controller,std:
         const bool read=i<5U?EDM58::BindingDetail::Read(controller,*catalog,semantics[i],units[i],values[i],fields[i],semantic):
             EDM137Units::ReadExplicit(controller,*catalog,semantics[i],units[i],values[i],fields[i],semantic);
         if(!read){out.error=semantic.error;out.failedFieldId=semantic.failedFieldId;return out;}
-        if(values[i]!=exact[i]){out.error=EDM58::BindingError::EngineeringRange;out.failedFieldId=fields[i];return out;}
+        const bool centerHeight=i==0U&&(commissioningProfile==G76B3Profile176||commissioningProfile==G76B4Profile177);
+        if(centerHeight?(values[i]<0LL||!ValidG76CenterHeightScaled(static_cast<std::uint64_t>(values[i]))):values[i]!=exact[i])
+        {out.error=EDM58::BindingError::EngineeringRange;out.failedFieldId=fields[i];return out;}
     }
     if(controller.GetCatalog()!=catalog||!EDM58::BindingDetail::SameSelection(before,controller.Current()))
     {out.error=EDM58::BindingError::CaptureChanged;return out;}

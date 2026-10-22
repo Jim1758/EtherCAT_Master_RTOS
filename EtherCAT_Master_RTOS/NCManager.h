@@ -3116,6 +3116,7 @@ private:
     bool ServiceEDM157SameThread(bool feedbackCurrent);
     void ServiceEDM165AutoFlushHoldSameThread(bool feedbackCurrent);
     void ServiceEDM200AutoFlushHoldSameThread(bool feedbackCurrent);
+    void ServiceEDM217AutoNominalHoldSameThread(bool feedbackCurrent);
     bool IsEDM200AutoHoldCheckpointCompleteSameThread() const noexcept;
     bool IsEDM168AutoHoldCheckpointCompleteSameThread() const noexcept;
     void LogEDM157SameThread(const char* event, const char* reason) const noexcept;

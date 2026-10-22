@@ -18,7 +18,8 @@ constexpr unsigned B3ArmP=296U, B3FinishP=297U, B3CommissioningProfile=6U;
 constexpr unsigned B4ArmP=298U, B4FinishP=299U, B4CommissioningProfile=7U;
 constexpr unsigned B0ArmP=300U, B0FinishP=301U, B0CommissioningProfile=8U;
 constexpr double MaximumCenterReturnFeedMmMin=30.0;
-constexpr double MaximumRadiusMm=EDM128::B3CenterRadiusLimitMm, MaximumCenterTravelMm=0.005, MaximumNominalExcursionMm=0.025, FeedMmMin=0.12;
+constexpr double MaximumRadiusMm=0.005, MaximumCenterRadiusMm=EDM128::B3CenterRadiusLimitMm;
+constexpr double MaximumCenterTravelMm=0.005, MaximumNominalExcursionMm=0.025, FeedMmMin=0.12;
 constexpr double MaximumAbsoluteStartRoundTripErrorMm=1.e-9;
 // EDM182 admits the existing frozen fixed-XYZ H selection with rigid XY
 // rotation. EDM184 also admits the existing fixed G168 XY rotation. Snapshot
@@ -26,7 +27,8 @@ constexpr double MaximumAbsoluteStartRoundTripErrorMm=1.e-9;
 // EDM185 admits fixed X/Y mirrors before those rotations. EDM186 also
 // admits the existing positive uniform XYZ scale; both authored and physical
 // radius/travel remain bounded. EDM188 also admits fixed Z reflection for
-// the nominal orbit. B4 E6 stays a native +Z distance, unscaled/unmirrored.
+// the nominal orbit. E204 center-mode retreat follows the signed compensated
+// XYZ machining axis; E6 remains a physical native-mm distance.
 // Other feed lanes retain their existing frame contracts.
 inline bool FrameSupported(const NCTranslationSnapshot& source) noexcept
 {
@@ -75,12 +77,14 @@ inline bool RelativePointWithinPrecision(const NCTranslationSnapshot& translatio
     }
     return std::isfinite(error)&&error<=MaximumAbsoluteStartRoundTripErrorMm;
 }
-inline bool RadiusWithinLimit(double radiusMm,double scale) noexcept
+inline bool RadiusWithinLimit(double radiusMm,double scale,bool centerFamily=false) noexcept
 {
-    if(!std::isfinite(radiusMm)||radiusMm<=0.0||radiusMm>MaximumRadiusMm||
+    // EDM214: only B3/B4 admit the enlarged orbit, in authored and native mm.
+    const double limit=centerFamily?MaximumCenterRadiusMm:MaximumRadiusMm;
+    if(!std::isfinite(radiusMm)||radiusMm<=0.0||radiusMm>limit||
         !std::isfinite(scale)||scale<=0.0)return false;
     const double physical=radiusMm*scale;
-    return std::isfinite(physical)&&physical>0.0&&physical<=MaximumRadiusMm;
+    return std::isfinite(physical)&&physical>0.0&&physical<=limit;
 }
 inline bool CenterTravelWithinLimit(const NCG76::PlanInput& input,double scale=1.0) noexcept
 {
@@ -136,13 +140,13 @@ inline bool NominalPrecisionWithinLimit(const NCG76::NativePlan& nominal) noexce
 // A G91 omitted axis contributes zero. Failure always clears the output.
 inline bool BuildOrbitInput(const NCTranslationSnapshot& translation,const NCG76::Point8& startMCS,
     const NCG76::Point3& authoredXYZ,unsigned authoredMask,double radiusMm,double feedMmMin,
-    NCG76::PlanInput& out,double shapeAngleDeg=0.0,bool targetAxis=false) noexcept
+    NCG76::PlanInput& out,double shapeAngleDeg=0.0,bool targetAxis=false,bool centerFamily=false) noexcept
 {
     const NCG76::Point8 frozenStart=startMCS;
     const NCG76::Point3 frozenAuthored=authoredXYZ;
     out=NCG76::PlanInput{};
     if(!FrameSupported(translation)||!authoredMask||(authoredMask&~7U)!=0U||
-        !Detail::RadiusWithinLimit(radiusMm,translation.scalingFactor)||feedMmMin!=FeedMmMin||
+        !Detail::RadiusWithinLimit(radiusMm,translation.scalingFactor,centerFamily)||feedMmMin!=FeedMmMin||
         !NCG76::ValidShapeAngle(shapeAngleDeg))return false;
     for(double value:frozenAuthored)if(!std::isfinite(value))return false;
     NCG76::PlanInput input{};input.radiusMm=radiusMm;input.feedMmMin=feedMmMin;input.shapeAngleDeg=shapeAngleDeg;
@@ -175,16 +179,16 @@ inline bool IsB2Recipe(const EDM130::Recipe& recipe) noexcept {return EDM130::Is
 inline bool IsB3Recipe(const EDM130::Recipe& recipe) noexcept {return EDM130::IsG76B3Flush176(recipe);}
 inline bool IsB4Recipe(const EDM130::Recipe& recipe) noexcept {return EDM130::IsG76B4Flush177(recipe);}
 inline bool IsCenterRecipe(const EDM130::Recipe& recipe) noexcept {return IsB3Recipe(recipe)||IsB4Recipe(recipe);}
-// E203 extends the reviewed XYZ target-axis plane to B3's genuine 3D center.
-// B4 retains its existing planar upper-center contract.
+// E204 B3/B4 use the same XYZ target-axis plane as the sealed B0/B1/B2 lanes.
+// Their axial retreat direction is separately derived with its signed delta.
 inline bool UsesTargetAxis(const EDM130::Recipe& recipe) noexcept
-{return IsB0Recipe(recipe)||IsB2Recipe(recipe)||IsB3Recipe(recipe)||EDM130::IsVisibleFlush173(recipe);}
+{return IsB0Recipe(recipe)||IsB2Recipe(recipe)||IsCenterRecipe(recipe)||EDM130::IsVisibleFlush173(recipe);}
 // EDM197: B0 tangent and B2 retained-path motion use only the nominal axes.
-// B1/B3/B4 still require Z evidence for their independent native Z flush.
+// B1/B3/B4 retain complete XYZ movement evidence in these sealed profiles.
 inline bool UsesNominalMovementMask(const EDM130::Recipe& recipe) noexcept
 {return IsB0Recipe(recipe)||IsB2Recipe(recipe);}
 // A stationary center Z does not imply stationary target-axis orbit Z.
-// Keep the legacy fixed-Z rule only for the planar-center B4 lane.
+// Retain the helper's existing default for any non-target-axis family.
 inline bool PreservesG90StationaryZ(const EDM130::Recipe& recipe) noexcept
 {return EDM130::IsG76Gap173(recipe)&&!UsesTargetAxis(recipe);}
 inline unsigned ArmForRecipe(const EDM130::Recipe& recipe) noexcept
@@ -194,7 +198,7 @@ inline bool RecipeMatchesArm(unsigned p,const EDM130::Recipe& recipe) noexcept
 inline EDM116::Mode ExpectedMode(const EDM130::Recipe& recipe) noexcept
 {return IsB0Recipe(recipe)?EDM116::Mode::B0:IsB4Recipe(recipe)?EDM116::Mode::B4:IsB3Recipe(recipe)?EDM116::Mode::B3:IsB2Recipe(recipe)?EDM116::Mode::B2:EDM130::IsVisibleFlush173(recipe)?EDM116::Mode::B1:EDM116::Mode::Invalid;}
 inline double FrozenHeightMm(const EDM130::Recipe& recipe) noexcept
-{return (IsB0Recipe(recipe)||IsCenterRecipe(recipe))?2.0:IsB2Recipe(recipe)?0.001:EDM130::IsVisibleFlush173(recipe)?2.0:0.0;}
+{return IsCenterRecipe(recipe)?EDM130::FrozenJumpHeightMm(recipe):IsB0Recipe(recipe)?2.0:IsB2Recipe(recipe)?0.001:EDM130::IsVisibleFlush173(recipe)?2.0:0.0;}
 // EDM193 movement evidence is derived from the frozen compensated endpoints,
 // not the authored word mask or the producer's structural XYZ axis mask.
 // Exact numeric equality treats signed zero as stationary; no tolerance can
@@ -327,6 +331,9 @@ inline std::uint64_t Fingerprint(const Scope& s,const NCG76::NativePlan& n,
     // Preserve the entire legacy stream for false. Bind the target-axis
     // contract even for a pure Z target whose generated points can coincide.
     if(in.targetAxis){Word(h,0x4737364158323031ULL);Word(h,1U);} // G76AX201
+    // A geometrically identical vertical plan must not reuse the old native
+    // +Z center-flush contract. Other modes retain their complete old stream.
+    if(IsCenterRecipe(r))Word(h,0x4737364146323034ULL); // G76AF204
     return h?h:1ULL;
 }
 inline bool Inputs(const Scope& scope,const NCG76::NativePlan& nominal,
@@ -339,7 +346,7 @@ inline bool Inputs(const Scope& scope,const NCG76::NativePlan& nominal,
         nominal.translation.runToken!=scope.run||nominal.count!=NominalCount||nominal.program.count!=NominalCount||
         nominal.program.growCount!=24U||nominal.program.input.flushMode!=0U||nominal.program.flushLegCount!=0U||
         nominal.program.input.heightMm!=0.0||nominal.program.input.centerReturnFeedMmMin!=0.0||
-        !RadiusWithinLimit(nominal.program.input.radiusMm,nominal.translation.scalingFactor)||nominal.program.input.feedMmMin!=FeedMmMin||
+        !RadiusWithinLimit(nominal.program.input.radiusMm,nominal.translation.scalingFactor,IsCenterRecipe(recipe))||nominal.program.input.feedMmMin!=FeedMmMin||
         !CenterTravelWithinLimit(nominal.program.input,nominal.translation.scalingFactor)||!NominalPrecisionWithinLimit(nominal)||
         (UsesNominalMovementMask(recipe)&&recipe.planMovementMask!=NominalMovementMask(nominal)))return false;
     for(unsigned k=0U;k<NominalCount;++k)
@@ -370,6 +377,42 @@ inline bool Valid(const Plan& p) noexcept
 {
     return p.fingerprint&&ValidCenterReturnFeed(p.recipe,p.centerReturnFeedMmMin)&&Detail::Inputs(p.scope,p.nominal,p.recipe,p.tuning)&&
         p.fingerprint==Detail::Fingerprint(p.scope,p.nominal,p.recipe,p.tuning,p.centerReturnFeedMmMin);
+}
+// Signed machining direction, not the orbit plane's canonical hemisphere or
+// a circular child's tangent. Transform a bounded displacement vector before
+// normalization: translations never participate, and even distant origins do
+// not subtract nearly equal native endpoints. Positive uniform scaling is
+// included by the existing frozen vector transform and cancels in the norm.
+inline bool MachiningAxisNative(const Plan& plan,EDM128::Point& axis) noexcept
+{
+    axis=EDM128::Point{};
+    const auto& n=plan.nominal;const auto& in=n.program.input;
+    if(!IsCenterRecipe(plan.recipe)||!in.targetAxis||n.count!=NominalCount||
+        n.program.count!=NominalCount||!FrameSupported(n.translation)||
+        !Detail::CenterTravelWithinLimit(in,n.translation.scalingFactor))return false;
+    NCG76::Point3 delta{},native{};
+    for(unsigned i=0U;i<3U;++i) {
+        delta[i]=in.end[i]-in.start[i];
+        if(!std::isfinite(delta[i]))return false;
+    }
+    NCTranslationRotateXYVector(n.translation,delta[0U],delta[1U],native[0U],native[1U]);
+    native[2U]=NCTranslationScaleMirrorAxisVector(n.translation,delta[2U],2U);
+    double largest=0.0;
+    for(double value:native) {
+        if(!std::isfinite(value))return false;
+        largest=(std::max)(largest,std::fabs(value));
+    }
+    if(!(largest>0.0))return false;
+    double length=0.0;
+    for(double& value:native){value/=largest;length=std::hypot(length,value);}
+    if(!std::isfinite(length)||!(length>0.0))return false;
+    EDM128::Point candidate{};
+    for(unsigned i=0U;i<3U;++i) {
+        candidate[i]=native[i]/length;
+        if(!std::isfinite(candidate[i]))return false;
+        if(candidate[i]==0.0)candidate[i]=0.0;
+    }
+    axis=candidate;return true;
 }
 // Scalar boundary conversion uses exactly the native plan's frozen frame.
 // Callers retain the validated plan; no full-plan scratch or stack copy here.
@@ -424,10 +467,10 @@ inline bool CenterForCursor(const Plan& plan,unsigned child,double ratio,NCG76::
 inline void ClearB3Orbit(EDM128::B3Orbit& out) noexcept
 {
     for(auto& center:out.centers)for(auto& value:center)value=0.0;
-    out.scope=EDM109::Scope{};out.centerReturnMmMin=0.0;
+    out.scope=EDM109::Scope{};out.centerReturnMmMin=0.0;out.machiningAxisNative=EDM128::Point{};
 }
 // Shared B3/B4 table: centers stay on the nominal orbit plane. The coordinator
-// derives B4's upper center only after capturing the actual stopped anchor.
+// derives B4's retracted on-axis center after capturing the actual anchor.
 inline bool BuildB3Orbit(const Plan& plan,const NCG76::Point8& startPulse,const NCG76::Point8& pulsePerUnit,
     const EDM109::Scope& scope,EDM128::B3Orbit& out) noexcept
 {
@@ -437,6 +480,7 @@ inline bool BuildB3Orbit(const Plan& plan,const NCG76::Point8& startPulse,const 
         scope.cache!=plan.scope.cache||scope.ownerGeneration!=plan.scope.owner.generation||
         scope.translationGeneration!=plan.nominal.translationGeneration)return false;
     out.scope=scope;out.centerReturnMmMin=plan.centerReturnFeedMmMin;
+    if(!MachiningAxisNative(plan,out.machiningAxisNative)){ClearB3Orbit(out);return false;}
     for(unsigned axis=0U;axis<6U;++axis)
         if(!std::isfinite(startPulse[axis])||!std::isfinite(pulsePerUnit[axis])||pulsePerUnit[axis]<=0.0)
         {ClearB3Orbit(out);return false;}
@@ -451,7 +495,8 @@ inline bool BuildB3Orbit(const Plan& plan,const NCG76::Point8& startPulse,const 
             if(!std::isfinite(out.centers[boundary][axis])){ClearB3Orbit(out);return false;}
         }
     }
-    if(!EDM128::ValidB3Orbit(out,scope)){ClearB3Orbit(out);return false;}
+    EDM128::Point scale{};for(unsigned axis=0U;axis<6U;++axis)scale[axis]=pulsePerUnit[axis];
+    if(!EDM128::ValidB3OrbitMapping(out,scope,scale)){ClearB3Orbit(out);return false;}
     return true;
 }
 // Reuse the canonical retained LINE evaluator without claiming AIR B2 intent.
@@ -577,7 +622,7 @@ inline bool Inputs(const Scope& scope,const NCG76::NativePlan& nominal,
         nominal.translation.runToken!=scope.run||nominal.count!=NominalCount||nominal.program.count!=NominalCount||
         nominal.program.growCount!=24U||nominal.program.input.flushMode!=0U||nominal.program.flushLegCount!=0U||
         nominal.program.input.heightMm!=0.0||nominal.program.input.centerReturnFeedMmMin!=0.0||
-        !RadiusWithinLimit(nominal.program.input.radiusMm,nominal.translation.scalingFactor)||nominal.program.input.feedMmMin!=FeedMmMin||
+        !RadiusWithinLimit(nominal.program.input.radiusMm,nominal.translation.scalingFactor,IsCenterRecipe(recipe))||nominal.program.input.feedMmMin!=FeedMmMin||
         !CenterTravelWithinLimit(nominal.program.input,nominal.translation.scalingFactor)||!NominalPrecisionWithinLimit(nominal)||
         (UsesNominalMovementMask(recipe)&&recipe.planMovementMask!=NominalMovementMask(nominal)))return false;
     for(unsigned k=0U;k<NominalCount;++k)
